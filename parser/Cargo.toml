@@ -1,0 +1,11 @@
+[package]
+name = "qcode_parser"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+description = "Pest-based parser for the QCode text format"
+repository.workspace = true
+
+[dependencies]
+pest.workspace = true
+pest_derive.workspace = true

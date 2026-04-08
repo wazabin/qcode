@@ -1,0 +1,39 @@
+use super::mnemonic::MnemonicKind;
+use crate::{context::Context, value::ValueId};
+use jstd::Identifier;
+
+#[derive(Identifier)]
+pub struct PCodeOpId(usize);
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct PCodeOp {
+    pub id: PCodeOpId,
+    pub args: Vec<ValueId>,
+    pub dst: Option<ValueId>,
+}
+
+impl MnemonicKind for PCodeOp {
+    fn opcode(&self) -> &'static str {
+        "pcode_op"
+    }
+
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>, ctx: &Context<'_>) -> std::fmt::Result {
+        let op = ctx.pcode_ops[self.id];
+        let args = self
+            .args
+            .iter()
+            .map(|arg| ctx.get_value(*arg).to_string())
+            .collect::<Vec<_>>()
+            .join(", ");
+
+        if let Some(dst) = self.dst {
+            write!(f, "{} = {}({});", ctx.get_value(dst), op, args)
+        } else {
+            write!(f, "{}({});", op, args)
+        }
+    }
+
+    fn args(&self) -> Vec<ValueId> {
+        self.args.clone()
+    }
+}

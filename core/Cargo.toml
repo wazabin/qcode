@@ -1,0 +1,16 @@
+[package]
+name = "qcode"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+description = "Typed SSA-style p-code IR for binary analysis, modelled after Ghidra's p-code"
+repository.workspace = true
+
+[features]
+testing = []
+
+[dependencies]
+common.workspace = true
+jstd.workspace = true
+pest.workspace = true
+qcode_macro.workspace = true

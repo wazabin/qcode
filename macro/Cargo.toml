@@ -1,0 +1,17 @@
+[package]
+name = "qcode_macro"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+description = "Compile-time QCode DSL for constructing p-code IR in tests and examples"
+repository.workspace = true
+
+[lib]
+proc-macro = true
+
+[dependencies]
+proc-macro-crate = "3.4"
+proc-macro2 = "1.0"
+quote = "1.0"
+syn = { version = "2.0", features = ["full"] }
+qcode_parser.workspace = true

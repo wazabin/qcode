@@ -1,0 +1,14 @@
+[package]
+name = "qcode_analysis"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+description = "Optimization passes for the qcode IR: GVN, DCE, dead-store elimination, alias analysis"
+repository.workspace = true
+
+[dependencies]
+qcode.workspace = true
+
+[dev-dependencies]
+qcode = { workspace = true, features = ["testing"] }
+qcode_macro.workspace = true

@@ -1,0 +1,13 @@
+[package]
+name = "qcode_emulator"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+description = "Concrete interpreter and emulator for the qcode IR"
+repository.workspace = true
+
+[dependencies]
+qcode.workspace = true
+
+[dev-dependencies]
+qcode_macro.workspace = true
