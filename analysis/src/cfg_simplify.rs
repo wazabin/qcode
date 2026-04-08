@@ -1,6 +1,6 @@
 use qcode::{
     context::Context,
-    value::{BlockId, FunctionId, insn::Mnemonic},
+    value::{BasicBlock, FunctionId, insn::Mnemonic},
 };
 
 /// Merges basic blocks in `function_id` wherever the conditions allow:
@@ -15,50 +15,26 @@ pub fn simplify_cfg(ctx: &mut Context, function_id: FunctionId) {
         let mut merged = false;
 
         'outer: for a_id in blocks {
-            // Collect A's outgoing edges.
-            let a_children: Vec<(_, BlockId)> = {
-                let a_edge_ids: Vec<_> = ctx.values.basic_blocks[a_id]
-                    .edges
-                    .iter()
-                    .copied()
-                    .collect();
-                a_edge_ids
-                    .into_iter()
-                    .filter_map(|eid| {
-                        let e = &ctx.values.edges[eid];
-                        if e.from == a_id {
-                            Some((eid, e.to))
-                        } else {
-                            None
-                        }
-                    })
-                    .collect()
+            // Collect at most 2 successors to check the "exactly one" condition.
+            // Collecting eagerly releases the immutable borrow before any mutation.
+            let a_succs: Vec<_> = BasicBlock::from_id(&*ctx, a_id)
+                .successors()
+                .take(2)
+                .collect();
+
+            let Some(&(edge_ab, b_id)) = a_succs.first() else {
+                continue;
             };
 
-            if a_children.len() != 1 {
-                continue;
+            if a_succs.len() != 1 {
+                continue; // A has more than one successor
             }
-
-            let (edge_ab, b_id) = a_children[0];
 
             if b_id == a_id {
                 continue; // self-loop
             }
 
-            // Count B's incoming edges.
-            let b_parent_count = {
-                let b_edge_ids: Vec<_> = ctx.values.basic_blocks[b_id]
-                    .edges
-                    .iter()
-                    .copied()
-                    .collect();
-                b_edge_ids
-                    .iter()
-                    .filter(|&&eid| ctx.values.edges[eid].to == b_id)
-                    .count()
-            };
-
-            if b_parent_count != 1 {
+            if BasicBlock::from_id(&*ctx, b_id).predecessors().count() != 1 {
                 continue;
             }
 
@@ -77,66 +53,7 @@ pub fn simplify_cfg(ctx: &mut Context, function_id: FunctionId) {
                 continue;
             }
 
-            // Snapshot B's data before any mutation.
-            let b_insns: Vec<_> = ctx.values.basic_blocks[b_id].instructions.clone();
-            let b_address = ctx.values.basic_blocks[b_id].address;
-            let b_extra: Vec<u64> = ctx.values.basic_blocks[b_id].extra_addresses.clone();
-            let b_outgoing: Vec<(_, BlockId)> = {
-                let b_edge_ids: Vec<_> = ctx.values.basic_blocks[b_id]
-                    .edges
-                    .iter()
-                    .copied()
-                    .collect();
-                b_edge_ids
-                    .into_iter()
-                    .filter_map(|eid| {
-                        let e = &ctx.values.edges[eid];
-                        if e.from == b_id {
-                            Some((eid, e.to))
-                        } else {
-                            None
-                        }
-                    })
-                    .collect()
-            };
-
-            // 1. Remove A's terminal Branch.
-            ctx.values.basic_blocks[a_id].instructions.pop();
-
-            // 2. Append B's instructions to A.
-            for insn_id in b_insns {
-                ctx.values.basic_blocks[a_id].instructions.push(insn_id);
-            }
-
-            // 3. Remove the A→B edge from both blocks' edge sets.
-            ctx.values.basic_blocks[a_id].edges.remove(&edge_ab);
-            ctx.values.basic_blocks[b_id].edges.remove(&edge_ab);
-
-            // 4. Rehome B's outgoing edges to A.
-            for (edge_bc, _c_id) in &b_outgoing {
-                ctx.values.edges[*edge_bc].from = a_id;
-                ctx.values.basic_blocks[a_id].edges.insert(*edge_bc);
-                ctx.values.basic_blocks[b_id].edges.remove(edge_bc);
-            }
-
-            // 5. Remove B from the function's block list.
-            ctx.values.functions[function_id]
-                .blocks
-                .retain(|&id| id != b_id);
-
-            // 6. Clear B's parent.
-            ctx.values.basic_blocks[b_id].parent = None;
-
-            // 7. Remap B's address(es) to A.
-            if let Some(b_addr) = b_address {
-                todo!("handle address remapping in CFG simplification");
-                // ctx.block_addresses.insert(b_addr, a_id);
-                ctx.values.basic_blocks[a_id].extra_addresses.push(b_addr);
-            }
-            ctx.values.basic_blocks[a_id]
-                .extra_addresses
-                .extend(b_extra);
-
+            BasicBlock::from_id_mut(ctx, a_id).absorb_block(b_id, edge_ab, function_id);
             merged = true;
             break 'outer;
         }

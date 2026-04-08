@@ -12,6 +12,7 @@ use crate::{
     },
 };
 use core::slice;
+use jstd::graph::Graph;
 use std::{
     borrow::Cow,
     collections::HashSet,
@@ -119,6 +120,22 @@ where
 {
     fn inner(&'s self) -> &'ctx BasicBlock<'str> {
         &self.ctx().values.basic_blocks[self.id]
+    }
+
+    /// Iterates over outgoing `(edge_id, successor_block_id)` pairs.
+    pub fn successors(&'s self) -> impl Iterator<Item = (EdgeId, BlockId)> + 's {
+        use jstd::graph::Node;
+        BlockRef::new(self.ctx(), self.id)
+            .children()
+            .map(|item| (item.edge_id(), item.node_id()))
+    }
+
+    /// Iterates over incoming `(edge_id, predecessor_block_id)` pairs.
+    pub fn predecessors(&'s self) -> impl Iterator<Item = (EdgeId, BlockId)> + 's {
+        use jstd::graph::Node;
+        BlockRef::new(self.ctx(), self.id)
+            .parents()
+            .map(|item| (item.edge_id(), item.node_id()))
     }
 
     pub fn name(&'s self) -> Option<&'ctx str> {
@@ -325,6 +342,60 @@ impl<'str, 'ctx> BlockMutRef<'str, 'ctx> {
     /// Removes an edge from this block's edge set.
     pub fn remove_edge(&mut self, edge_id: EdgeId) {
         self.inner_mut().edges.remove(&edge_id);
+    }
+
+    /// Removes the last instruction from this block.
+    pub fn pop_insn(&mut self) -> Option<InstructionId> {
+        self.inner_mut().instructions.pop()
+    }
+
+    /// Appends a slice of instruction ids to this block.
+    pub fn extend_insns(&mut self, insns: &[InstructionId]) {
+        self.inner_mut().instructions.extend_from_slice(insns);
+    }
+
+    /// Removes this block from `function_id`'s block list and clears its parent.
+    pub fn delete(&mut self, function_id: FunctionId) {
+        let id = self.id;
+
+        Function::from_id_mut(self.ctx, function_id)
+            .inner_mut()
+            .blocks
+            .retain(|&b| b != id);
+
+        self.inner_mut().parent = None;
+    }
+
+    /// Absorbs `other` into this block: removes the terminal branch, appends
+    /// `other`'s instructions, rehomes `other`'s outgoing edges to this block,
+    /// removes `other` from `function_id`, and transfers `other`'s addresses.
+    ///
+    /// `edge_ab` must be the direct edge from this block to `other`.
+    pub fn absorb_block(&mut self, other: BlockId, edge_ab: EdgeId, function_id: FunctionId) {
+        // Remove terminal branch.
+        self.inner_mut().instructions.pop();
+
+        // Append other's instructions.
+        let b_insns = self.ctx.values.basic_blocks[other].instructions.clone();
+        self.inner_mut().instructions.extend(b_insns);
+
+        // Rehome other's edges to this block at the graph level.
+        self.ctx.merge_nodes(self.id, other, edge_ab);
+
+        // Remove other from function and clear its parent.
+        Function::from_id_mut(self.ctx, function_id)
+            .inner_mut()
+            .blocks
+            .retain(|&id| id != other);
+        self.ctx.values.basic_blocks[other].parent = None;
+
+        // Transfer other's addresses.
+        let b_addr = self.ctx.values.basic_blocks[other].address;
+        let b_extra = self.ctx.values.basic_blocks[other].extra_addresses.clone();
+        if let Some(addr) = b_addr {
+            self.inner_mut().extra_addresses.push(addr);
+        }
+        self.inner_mut().extra_addresses.extend(b_extra);
     }
 
     /// Associates this block with `addr` in the context address map.

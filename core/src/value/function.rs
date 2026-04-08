@@ -296,7 +296,7 @@ impl<'str, 'ctx> Renameable<'str, 'ctx> for FunctionMutRef<'str, 'ctx> {
 }
 
 impl<'str, 'ctx> FunctionMutRef<'str, 'ctx> {
-    fn inner_mut(&mut self) -> &mut Function<'str> {
+    pub(crate) fn inner_mut(&mut self) -> &mut Function<'str> {
         &mut self.ctx.values.functions[self.id]
     }
 

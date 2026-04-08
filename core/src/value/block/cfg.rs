@@ -114,6 +114,10 @@ impl<'str, 'ctx> EdgeMut<'ctx> for EdgeMutRef<'str, 'ctx> {
     fn to_id(&self) -> BlockId {
         self.inner().to
     }
+
+    fn set_from(&mut self, node: BlockId) {
+        self.inner_mut().from = node;
+    }
 }
 
 impl<'str, 'ctx> Node<'ctx> for BlockRef<'str, 'ctx> {
@@ -161,5 +165,13 @@ impl<'str, 'ctx> NodeMut<'ctx> for BlockMutRef<'str, 'ctx> {
 
     fn edge_count(&self) -> usize {
         self.ctx.values.basic_blocks[self.id].edges.len()
+    }
+
+    fn add_edge_id(&mut self, edge: EdgeId) {
+        self.ctx.values.basic_blocks[self.id].edges.insert(edge);
+    }
+
+    fn remove_edge_id(&mut self, edge: EdgeId) {
+        self.ctx.values.basic_blocks[self.id].edges.remove(&edge);
     }
 }
