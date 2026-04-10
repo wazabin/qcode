@@ -1,5 +1,5 @@
 // [AI Generated]
-use qcode_parser::ast::{Atom, CastOp, ExprNode, Statement, TypedAtom};
+use qcode_parser::ast::{Atom, CastOp, ExprNode, FnDecl, Label, Statement, TypedAtom};
 use quote::{format_ident, quote};
 use std::collections::HashMap;
 use syn::Expr;
@@ -23,6 +23,267 @@ fn all_local_decls(statements: &[Statement]) -> bool {
         .all(|statement| matches!(statement, Statement::LocalDecl { .. }))
 }
 
+/// Compile a function-level program (one or more `fn name: ...` declarations).
+pub(crate) fn compile_fn_program(
+    ctx: &Expr,
+    fns: &[FnDecl],
+    pcode_root: &proc_macro2::TokenStream,
+) -> syn::Result<proc_macro2::TokenStream> {
+    let mut all_predecls = Vec::new();
+    let mut all_bodies = Vec::new();
+
+    for fn_decl in fns {
+        let (predecls, body) = compile_single_fn(ctx, fn_decl, pcode_root)?;
+        all_predecls.extend(predecls);
+        all_bodies.push(body);
+    }
+
+    Ok(quote! {
+        #(#all_predecls)*
+        #(#all_bodies)*
+    })
+}
+
+fn compile_single_fn(
+    ctx: &Expr,
+    fn_decl: &FnDecl,
+    pcode_root: &proc_macro2::TokenStream,
+) -> syn::Result<(Vec<proc_macro2::TokenStream>, proc_macro2::TokenStream)> {
+    let fn_name_str = &fn_decl.name;
+    let fn_ident = format_ident!("{}", fn_name_str);
+    let statements = &fn_decl.statements;
+
+    // Require the first statement to be a named LabelDecl (entry block).
+    let first = statements.first().ok_or_else(|| {
+        syn::Error::new(
+            proc_macro2::Span::call_site(),
+            format!("fn `{fn_name_str}`: function body cannot be empty"),
+        )
+    })?;
+    let entry_name = match first {
+        Statement::LabelDecl {
+            label: Label::Named { name: n, .. },
+            ..
+        } => n.clone(),
+        _ => {
+            return Err(syn::Error::new(
+                proc_macro2::Span::call_site(),
+                format!("fn `{fn_name_str}`: first statement must be a named label like `<entry>`"),
+            ));
+        }
+    };
+    let entry_ident = format_ident!("{}", entry_name);
+
+    // Collect named-block labels and SSA variables for predecls.
+    let named_blocks: Vec<proc_macro2::Ident> = statements
+        .iter()
+        .filter_map(|s| {
+            if let Statement::LabelDecl {
+                label: Label::Named { name: n, .. },
+                ..
+            } = s
+            {
+                Some(format_ident!("{}", n))
+            } else {
+                None
+            }
+        })
+        .collect();
+
+    let exposed_ssas: Vec<proc_macro2::Ident> = statements
+        .iter()
+        .filter_map(|s| {
+            if let Statement::Assign {
+                name, expose: true, ..
+            } = s
+            {
+                Some(format_ident!("{}", name))
+            } else {
+                None
+            }
+        })
+        .collect();
+
+    let mut predecls: Vec<proc_macro2::TokenStream> = Vec::new();
+    predecls.push(quote! { let #fn_ident: #pcode_root::value::FunctionId; });
+    for block_ident in &named_blocks {
+        predecls.push(quote! { let #block_ident: #pcode_root::value::BlockId; });
+    }
+    for ssa_ident in &exposed_ssas {
+        predecls.push(quote! { let #ssa_ident: #pcode_root::value::InstructionId; });
+    }
+
+    // Build the statement emissions.
+    let mut locals: HashMap<String, proc_macro2::Ident> = HashMap::new();
+    let mut emitted: Vec<proc_macro2::TokenStream> = Vec::new();
+
+    // First statement is the entry LabelDecl — emit it to create the block.
+    emit_label_decl_fn(&entry_name, &mut emitted, pcode_root);
+
+    // Emit remaining statements (skip index 0, already handled).
+    for (index, stmt) in statements.iter().enumerate().skip(1) {
+        emit_statement_fn(stmt, index, &mut locals, &mut emitted, pcode_root)?;
+    }
+
+    let body = quote! {
+        {
+            use ::std::borrow::Cow;
+            use #pcode_root::value::Value as _;
+            use #pcode_root::value::Renameable as _;
+
+            // Create the function.
+            #fn_ident = {
+                let __qcode_fn_id = #pcode_root::value::Function::make(&mut (#ctx), Cow::Borrowed(#fn_name_str))
+                    .expect("qcode fn: function name conflict");
+                __qcode_fn_id.id
+            };
+
+            // Create the entry block and builder.
+            let __qcode_root_id = {
+                #pcode_root::value::BasicBlock::make(&mut (#ctx))
+                    .with_name(Cow::Borrowed(#entry_name))
+                    .expect("qcode fn: entry block name conflict")
+                    .id
+            };
+            #entry_ident = __qcode_root_id;
+
+            {
+                let mut __qcode_builder = #pcode_root::builder::Builder::from_block(
+                    #pcode_root::value::BasicBlock::from_id_mut(&mut (#ctx), __qcode_root_id)
+                );
+
+                #(#emitted)*
+            }
+
+            #pcode_root::value::Function::from_id_mut(&mut (#ctx), #fn_ident)
+                .set_root(__qcode_root_id)
+                .unwrap();
+        }
+    };
+
+    Ok((predecls, body))
+}
+
+/// Emit a named `LabelDecl` in function context (switch to existing or create block).
+fn emit_label_decl_fn(
+    name: &str,
+    emitted: &mut Vec<proc_macro2::TokenStream>,
+    _pcode_root: &proc_macro2::TokenStream,
+) {
+    // Entry block is already created before this is called; for non-entry named labels we
+    // get-or-make via the builder and expose as a BlockId.
+    // This function is only called for the ENTRY block (index 0), which is handled
+    // externally. Subsequent named labels go through emit_statement_fn.
+    let _ = (name, emitted); // entry handled in caller
+}
+
+fn emit_statement_fn(
+    statement: &Statement,
+    index: usize,
+    locals: &mut HashMap<String, proc_macro2::Ident>,
+    emitted: &mut Vec<proc_macro2::TokenStream>,
+    pcode_root: &proc_macro2::TokenStream,
+) -> syn::Result<()> {
+    emit_statement(statement, index, locals, emitted, pcode_root)
+}
+
+/// New context-based statement compilation.
+/// The program must start with a named label like `<block>` which creates the block.
+pub(crate) fn compile_qcode_from_statements_ctx(
+    ctx: &Expr,
+    statements: &[Statement],
+    pcode_root: &proc_macro2::TokenStream,
+) -> syn::Result<proc_macro2::TokenStream> {
+    if statements.is_empty() {
+        return Err(syn::Error::new(
+            proc_macro2::Span::call_site(),
+            "qcode program cannot be empty",
+        ));
+    }
+
+    let entry_name = match statements.first() {
+        Some(Statement::LabelDecl {
+            label: Label::Named { name: n, .. },
+            ..
+        }) => n.clone(),
+        _ => {
+            return Err(syn::Error::new(
+                proc_macro2::Span::call_site(),
+                "statement program must start with a named label, e.g. `<block>`",
+            ));
+        }
+    };
+    let entry_ident = format_ident!("{}", entry_name);
+
+    // Collect ALL named labels for predecls (including entry).
+    let named_labels: Vec<proc_macro2::Ident> = statements
+        .iter()
+        .filter_map(|s| {
+            if let Statement::LabelDecl {
+                label: Label::Named { name: n, .. },
+                ..
+            } = s
+            {
+                Some(format_ident!("{}", n))
+            } else {
+                None
+            }
+        })
+        .collect();
+
+    let exposed_ssas: Vec<proc_macro2::Ident> = statements
+        .iter()
+        .filter_map(|s| {
+            if let Statement::Assign {
+                name, expose: true, ..
+            } = s
+            {
+                Some(format_ident!("{}", name))
+            } else {
+                None
+            }
+        })
+        .collect();
+
+    let mut locals: HashMap<String, proc_macro2::Ident> = HashMap::new();
+    let mut emitted = Vec::new();
+
+    // Skip the entry label — the block is created explicitly below.
+    for (index, stmt) in statements.iter().enumerate().skip(1) {
+        emit_statement(stmt, index, &mut locals, &mut emitted, pcode_root)?;
+    }
+
+    let mut predecls: Vec<proc_macro2::TokenStream> = Vec::new();
+    for label in &named_labels {
+        predecls.push(quote! { let #label: #pcode_root::value::BlockId; });
+    }
+    for ssa in &exposed_ssas {
+        predecls.push(quote! { let #ssa: #pcode_root::value::InstructionId; });
+    }
+
+    Ok(quote! {
+        #(#predecls)*
+        {
+            use ::std::borrow::Cow;
+            use #pcode_root::value::Value as _;
+            use #pcode_root::value::Renameable as _;
+            let __qcode_entry_id = {
+                #pcode_root::value::BasicBlock::make(&mut (#ctx))
+                    .with_name(Cow::Borrowed(#entry_name))
+                    .expect("qcode: block name conflict")
+                    .id
+            };
+            #entry_ident = __qcode_entry_id;
+            let mut __qcode_builder = #pcode_root::builder::Builder::from_block(
+                #pcode_root::value::BasicBlock::from_id_mut(&mut (#ctx), __qcode_entry_id)
+            );
+            #(#emitted)*
+        }
+    })
+}
+
+/// Deprecated builder-based statement compilation.
+/// Prefer `compile_qcode_from_statements_ctx` instead.
 pub(crate) fn compile_qcode_from_statements(
     builder: &Expr,
     statements: &[Statement],
@@ -43,6 +304,7 @@ pub(crate) fn compile_qcode_from_statements(
                 name,
                 display_name,
                 size_bytes,
+                ..
             } = statement
             else {
                 unreachable!("checked above");
@@ -62,7 +324,7 @@ pub(crate) fn compile_qcode_from_statements(
     }
 
     // Collect all SSA names that need to be exposed to the outer scope.
-    let exposed: Vec<proc_macro2::Ident> = statements
+    let exposed_ssas: Vec<proc_macro2::Ident> = statements
         .iter()
         .filter_map(|s| {
             if let Statement::Assign {
@@ -86,6 +348,7 @@ pub(crate) fn compile_qcode_from_statements(
                 name,
                 display_name,
                 size_bytes,
+                ..
             } => {
                 let ident = format_ident!("__qcode_local_{}", name);
                 let size = *size_bytes;
@@ -97,7 +360,9 @@ pub(crate) fn compile_qcode_from_statements(
                 final_expr = None;
             }
 
-            Statement::Assign { name, expose, expr } => {
+            Statement::Assign {
+                name, expose, expr, ..
+            } => {
                 let ident = format_ident!("__qcode_local_{}", name);
                 let value_tokens = lower_expr(expr, &locals, pcode_root)?;
                 if *expose {
@@ -124,27 +389,19 @@ pub(crate) fn compile_qcode_from_statements(
                 final_expr = Some(ident);
             }
 
-            Statement::LabelDecl { name } => {
-                emitted.push(quote! {
-                    {
-                        let __qcode_label = __qcode_builder.get_or_make_local_label(Cow::Borrowed(#name));
-                        __qcode_builder.switch_to_block(__qcode_label);
-                    }
-                });
+            Statement::LabelDecl { label, .. } => {
+                let ts = emit_label_decl_stmt(label, pcode_root);
+                emitted.push(ts);
                 final_expr = None;
             }
 
-            Statement::Branch { target } => {
-                emitted.push(quote! {
-                    {
-                        let __qcode_target = __qcode_builder.get_or_make_local_label(Cow::Borrowed(#target));
-                        __qcode_builder.push_branch(__qcode_target);
-                    }
-                });
+            Statement::Branch { target, .. } => {
+                let ts = emit_branch_stmt(target, pcode_root);
+                emitted.push(ts);
                 final_expr = None;
             }
 
-            Statement::BranchInd { ptr } => {
+            Statement::BranchInd { ptr, .. } => {
                 let ptr_tokens = lower_atom(ptr, None, &locals, pcode_root)?;
                 emitted.push(quote! {
                     {
@@ -159,31 +416,42 @@ pub(crate) fn compile_qcode_from_statements(
                 condition,
                 target,
                 fallthrough,
+                ..
             } => {
                 let cond_tokens = lower_atom(condition, None, &locals, pcode_root)?;
+                let target_ts = label_to_block_id(target, pcode_root);
+                let fallthrough_ts = label_to_block_id(fallthrough, pcode_root);
                 emitted.push(quote! {
                     {
                         let __qcode_cond = #cond_tokens;
-                        let __qcode_target = __qcode_builder.get_or_make_local_label(Cow::Borrowed(#target));
-                        let __qcode_fallthrough = __qcode_builder.get_or_make_local_label(Cow::Borrowed(#fallthrough));
-                        __qcode_builder.push_cbranch(__qcode_cond, __qcode_target, __qcode_fallthrough, );
+                        let __qcode_target = #target_ts;
+                        let __qcode_fallthrough = #fallthrough_ts;
+                        __qcode_builder.push_cbranch(__qcode_cond, __qcode_target, __qcode_fallthrough);
                         __qcode_builder.switch_to_block(__qcode_fallthrough);
                     }
                 });
                 final_expr = None;
             }
 
-            Statement::Call { target } => {
+            Statement::Call { target, .. } => {
+                let target_ts = match target {
+                    Label::Named { name, .. } => quote! {
+                        __qcode_builder.get_or_make_local_function(Cow::Borrowed(#name))
+                    },
+                    Label::Address { .. } => quote! {
+                        compile_error!("call with address target not supported")
+                    },
+                };
                 emitted.push(quote! {
                     {
-                        let __qcode_target = __qcode_builder.get_or_make_local_function(Cow::Borrowed(#target));
+                        let __qcode_target = #target_ts;
                         __qcode_builder.push_call(__qcode_target);
                     }
                 });
                 final_expr = None;
             }
 
-            Statement::CallInd { ptr } => {
+            Statement::CallInd { ptr, .. } => {
                 let ptr_tokens = lower_atom(ptr, None, &locals, pcode_root)?;
                 emitted.push(quote! {
                     {
@@ -194,7 +462,7 @@ pub(crate) fn compile_qcode_from_statements(
                 final_expr = None;
             }
 
-            Statement::Return { ptr } => {
+            Statement::Return { ptr, .. } => {
                 let ptr_tokens = lower_atom(ptr, None, &locals, pcode_root)?;
                 emitted.push(quote! {
                     {
@@ -209,19 +477,30 @@ pub(crate) fn compile_qcode_from_statements(
 
     let last = statements.last().expect("non-empty checked above");
 
-    let predecls = exposed.iter().map(|ident| {
+    let predecls = exposed_ssas.iter().map(|ident| {
         quote! {
             let #ident: #pcode_root::value::InstructionId;
         }
     });
 
-    if is_terminator(last) || matches!(last, Statement::LabelDecl { .. }) {
-        // Program ends with a terminator or label — return ()
+    let returns_unit = is_terminator(last)
+        || matches!(last, Statement::LabelDecl { .. })
+        || matches!(last, Statement::Assign { .. });
+
+    let deprecation_warning = quote! {
+        #[deprecated(note = "pass a context and start with a label: qcode!(ctx, \"<block> ...\")")]
+        fn __qcode_deprecated_builder_form() {}
+        #[allow(deprecated)]
+        let _ = { __qcode_deprecated_builder_form() };
+    };
+
+    if returns_unit {
         Ok(quote! {
             #(#predecls)*
             {
                 use ::std::borrow::Cow;
                 use #pcode_root::value::Value as _;
+                #deprecation_warning
                 let __qcode_builder = &mut (#builder);
                 #(#emitted)*
             }
@@ -239,11 +518,220 @@ pub(crate) fn compile_qcode_from_statements(
             {
                 use ::std::borrow::Cow;
                 use #pcode_root::value::Value as _;
+                #deprecation_warning
                 let __qcode_builder = &mut (#builder);
                 #(#emitted)*
                 #final_ident
             }
         })
+    }
+}
+
+/// Shared statement emitter used by both statement-mode and function-mode.
+fn emit_statement(
+    statement: &Statement,
+    index: usize,
+    locals: &mut HashMap<String, proc_macro2::Ident>,
+    emitted: &mut Vec<proc_macro2::TokenStream>,
+    pcode_root: &proc_macro2::TokenStream,
+) -> syn::Result<()> {
+    match statement {
+        Statement::LocalDecl {
+            name,
+            display_name,
+            size_bytes,
+            ..
+        } => {
+            let ident = format_ident!("__qcode_local_{}", name);
+            let size = *size_bytes;
+            emitted.push(quote! {
+                let #ident = __qcode_builder
+                    .make_named_temp(Cow::Borrowed(#display_name), #size);
+            });
+            locals.insert(name.clone(), ident);
+        }
+
+        Statement::Assign {
+            name, expose, expr, ..
+        } => {
+            let ident = format_ident!("__qcode_local_{}", name);
+            let value_tokens = lower_expr(expr, locals, pcode_root)?;
+            if *expose {
+                let outer_ident = format_ident!("{}", name);
+                emitted.push(quote! {
+                    let #ident = #value_tokens;
+                    #outer_ident = #ident;
+                });
+            } else {
+                emitted.push(quote! {
+                    let #ident = #value_tokens;
+                });
+            }
+            locals.insert(name.clone(), ident);
+        }
+
+        Statement::Expr(expr) => {
+            let value_tokens = lower_expr(expr, locals, pcode_root)?;
+            let ident = format_ident!("__qcode_result_{}", index);
+            emitted.push(quote! {
+                let #ident = #value_tokens;
+            });
+        }
+
+        Statement::LabelDecl { label, .. } => match label {
+            Label::Named { name, .. } => {
+                let outer_ident = format_ident!("{}", name);
+                emitted.push(quote! {
+                    {
+                        let __qcode_blk = __qcode_builder
+                            .get_or_make_local_label(Cow::Borrowed(#name));
+                        __qcode_builder.switch_to_block(__qcode_blk);
+                        #outer_ident = __qcode_blk;
+                    }
+                });
+            }
+            Label::Address { value: addr, .. } => {
+                emitted.push(quote! {
+                    {
+                        let __qcode_blk = __qcode_builder.get_or_make_block(#addr);
+                        __qcode_builder.switch_to_block(__qcode_blk);
+                    }
+                });
+            }
+        },
+
+        Statement::Branch { target, .. } => {
+            let ts = emit_branch_stmt(target, pcode_root);
+            emitted.push(ts);
+        }
+
+        Statement::BranchInd { ptr, .. } => {
+            let ptr_tokens = lower_atom(ptr, None, locals, pcode_root)?;
+            emitted.push(quote! {
+                {
+                    let __qcode_ptr = #ptr_tokens;
+                    __qcode_builder.push_branchind(__qcode_ptr);
+                }
+            });
+        }
+
+        Statement::CBranch {
+            condition,
+            target,
+            fallthrough,
+            ..
+        } => {
+            let cond_tokens = lower_atom(condition, None, locals, pcode_root)?;
+            let target_ts = label_to_block_id(target, pcode_root);
+            let fallthrough_ts = label_to_block_id(fallthrough, pcode_root);
+            emitted.push(quote! {
+                {
+                    let __qcode_cond = #cond_tokens;
+                    let __qcode_target = #target_ts;
+                    let __qcode_fallthrough = #fallthrough_ts;
+                    __qcode_builder.push_cbranch(__qcode_cond, __qcode_target, __qcode_fallthrough);
+                    __qcode_builder.switch_to_block(__qcode_fallthrough);
+                }
+            });
+        }
+
+        Statement::Call { target, .. } => {
+            let target_ts = match target {
+                Label::Named { name, .. } => quote! {
+                    __qcode_builder.get_or_make_local_function(Cow::Borrowed(#name))
+                },
+                Label::Address { .. } => {
+                    return Err(syn::Error::new(
+                        proc_macro2::Span::call_site(),
+                        "call with address target is not supported",
+                    ));
+                }
+            };
+            emitted.push(quote! {
+                {
+                    let __qcode_target = #target_ts;
+                    __qcode_builder.push_call(__qcode_target);
+                }
+            });
+        }
+
+        Statement::CallInd { ptr, .. } => {
+            let ptr_tokens = lower_atom(ptr, None, locals, pcode_root)?;
+            emitted.push(quote! {
+                {
+                    let __qcode_ptr = #ptr_tokens;
+                    __qcode_builder.push_call_ind(__qcode_ptr);
+                }
+            });
+        }
+
+        Statement::Return { ptr, .. } => {
+            let ptr_tokens = lower_atom(ptr, None, locals, pcode_root)?;
+            emitted.push(quote! {
+                {
+                    let __qcode_ptr = #ptr_tokens;
+                    __qcode_builder.push_return(__qcode_ptr);
+                }
+            });
+        }
+    }
+    Ok(())
+}
+
+/// Emit code that obtains a `BlockId` from a `Label`, for use in branch targets.
+fn label_to_block_id(
+    label: &Label,
+    _pcode_root: &proc_macro2::TokenStream,
+) -> proc_macro2::TokenStream {
+    match label {
+        Label::Named { name, .. } => quote! {
+            __qcode_builder.get_or_make_local_label(Cow::Borrowed(#name))
+        },
+        Label::Address { value: addr, .. } => quote! {
+            __qcode_builder.get_or_make_block(#addr)
+        },
+    }
+}
+
+/// Emit a standalone label declaration in statement mode (no BlockId exposure).
+fn emit_label_decl_stmt(
+    label: &Label,
+    _pcode_root: &proc_macro2::TokenStream,
+) -> proc_macro2::TokenStream {
+    match label {
+        Label::Named { name, .. } => quote! {
+            {
+                let __qcode_label = __qcode_builder.get_or_make_local_label(Cow::Borrowed(#name));
+                __qcode_builder.switch_to_block(__qcode_label);
+            }
+        },
+        Label::Address { value: addr, .. } => quote! {
+            {
+                let __qcode_label = __qcode_builder.get_or_make_block(#addr);
+                __qcode_builder.switch_to_block(__qcode_label);
+            }
+        },
+    }
+}
+
+/// Emit a branch statement.
+fn emit_branch_stmt(
+    target: &Label,
+    _pcode_root: &proc_macro2::TokenStream,
+) -> proc_macro2::TokenStream {
+    match target {
+        Label::Named { name, .. } => quote! {
+            {
+                let __qcode_target = __qcode_builder.get_or_make_local_label(Cow::Borrowed(#name));
+                __qcode_builder.push_branch(__qcode_target);
+            }
+        },
+        Label::Address { value: addr, .. } => quote! {
+            {
+                let __qcode_target = __qcode_builder.get_or_make_block(#addr);
+                __qcode_builder.push_branch(__qcode_target);
+            }
+        },
     }
 }
 
@@ -540,32 +1028,39 @@ fn lower_atom(
     pcode_root: &proc_macro2::TokenStream,
 ) -> syn::Result<proc_macro2::TokenStream> {
     match &typed.atom {
+        // External capture `{name}` — resolve to local if declared in this call, else outer scope.
         Atom::External(name) => {
-            let ident = format_ident!("{}", name);
-            if let Some(expected_size) = typed.size_bytes {
-                Ok(quote! {
-                    {
-                        let __qcode_value_id: #pcode_root::value::ValueId = (#ident).into();
-                        let __qcode_expected_size = #expected_size;
-                        let __qcode_actual_size = __qcode_builder.context().get_value(__qcode_value_id).size();
-                        assert_eq!(
-                            __qcode_actual_size,
-                            __qcode_expected_size,
-                            "qcode size mismatch for value `{}`: expected {} bytes, got {} bytes",
-                            stringify!(#ident),
-                            __qcode_expected_size,
-                            __qcode_actual_size
-                        );
-                        __qcode_value_id
-                    }
-                })
+            if let Some(local_ident) = locals.get(name) {
+                // Resolve to the in-call local.
+                lower_local_ident(local_ident, typed.size_bytes, pcode_root)
             } else {
-                Ok(quote! {
-                    {
-                        let __qcode_value_id: #pcode_root::value::ValueId = (#ident).into();
-                        __qcode_value_id
-                    }
-                })
+                // Fall back to outer Rust scope.
+                let ident = format_ident!("{}", name);
+                if let Some(expected_size) = typed.size_bytes {
+                    Ok(quote! {
+                        {
+                            let __qcode_value_id: #pcode_root::value::ValueId = (#ident).into();
+                            let __qcode_expected_size = #expected_size;
+                            let __qcode_actual_size = __qcode_builder.context().get_value(__qcode_value_id).size();
+                            assert_eq!(
+                                __qcode_actual_size,
+                                __qcode_expected_size,
+                                "qcode size mismatch for value `{}`: expected {} bytes, got {} bytes",
+                                stringify!(#ident),
+                                __qcode_expected_size,
+                                __qcode_actual_size
+                            );
+                            __qcode_value_id
+                        }
+                    })
+                } else {
+                    Ok(quote! {
+                        {
+                            let __qcode_value_id: #pcode_root::value::ValueId = (#ident).into();
+                            __qcode_value_id
+                        }
+                    })
+                }
             }
         }
 
@@ -576,32 +1071,7 @@ fn lower_atom(
                     format!("unknown local identifier '{name}'"),
                 ));
             };
-
-            if let Some(expected_size) = typed.size_bytes {
-                Ok(quote! {
-                    {
-                        let __qcode_value_id: #pcode_root::value::ValueId = (#local_ident).into();
-                        let __qcode_expected_size = #expected_size;
-                        let __qcode_actual_size = __qcode_builder.context().get_value(__qcode_value_id).size();
-                        assert_eq!(
-                            __qcode_actual_size,
-                            __qcode_expected_size,
-                            "qcode size mismatch for local `{}`: expected {} bytes, got {} bytes",
-                            stringify!(#local_ident),
-                            __qcode_expected_size,
-                            __qcode_actual_size
-                        );
-                        __qcode_value_id
-                    }
-                })
-            } else {
-                Ok(quote! {
-                    {
-                        let __qcode_value_id: #pcode_root::value::ValueId = (#local_ident).into();
-                        __qcode_value_id
-                    }
-                })
-            }
+            lower_local_ident(local_ident, typed.size_bytes, pcode_root)
         }
 
         Atom::Int(value) => {
@@ -620,6 +1090,38 @@ fn lower_atom(
     }
 }
 
+fn lower_local_ident(
+    local_ident: &proc_macro2::Ident,
+    size_bytes: Option<usize>,
+    pcode_root: &proc_macro2::TokenStream,
+) -> syn::Result<proc_macro2::TokenStream> {
+    if let Some(expected_size) = size_bytes {
+        Ok(quote! {
+            {
+                let __qcode_value_id: #pcode_root::value::ValueId = (#local_ident).into();
+                let __qcode_expected_size = #expected_size;
+                let __qcode_actual_size = __qcode_builder.context().get_value(__qcode_value_id).size();
+                assert_eq!(
+                    __qcode_actual_size,
+                    __qcode_expected_size,
+                    "qcode size mismatch for local `{}`: expected {} bytes, got {} bytes",
+                    stringify!(#local_ident),
+                    __qcode_expected_size,
+                    __qcode_actual_size
+                );
+                __qcode_value_id
+            }
+        })
+    } else {
+        Ok(quote! {
+            {
+                let __qcode_value_id: #pcode_root::value::ValueId = (#local_ident).into();
+                __qcode_value_id
+            }
+        })
+    }
+}
+
 fn size_hint_tokens(
     typed: &TypedAtom,
     locals: &HashMap<String, proc_macro2::Ident>,
@@ -631,13 +1133,22 @@ fn size_hint_tokens(
 
     match &typed.atom {
         Atom::External(name) => {
-            let ident = format_ident!("{}", name);
-            Ok(Some(quote! {
-                {
-                    let __qcode_value_id: #pcode_root::value::ValueId = (#ident).into();
-                    __qcode_builder.context().get_value(__qcode_value_id).size()
-                }
-            }))
+            if let Some(local_ident) = locals.get(name) {
+                Ok(Some(quote! {
+                    {
+                        let __qcode_value_id: #pcode_root::value::ValueId = (#local_ident).into();
+                        __qcode_builder.context().get_value(__qcode_value_id).size()
+                    }
+                }))
+            } else {
+                let ident = format_ident!("{}", name);
+                Ok(Some(quote! {
+                    {
+                        let __qcode_value_id: #pcode_root::value::ValueId = (#ident).into();
+                        __qcode_builder.context().get_value(__qcode_value_id).size()
+                    }
+                }))
+            }
         }
 
         Atom::Local(name) => {

@@ -1,7 +1,8 @@
 WHITESPACE = _{ " " | "\t" | "\r" | "\n" }
 COMMENT    = _{ "#" ~ (!"\n" ~ ANY)* }
 
-program         =  { SOI ~ statement_list? ~ EOI }
+program         =  { SOI ~ (fn_decl+ | statement_list?) ~ EOI }
+fn_decl         =  { "fn" ~ ident ~ ":" ~ statement_list? }
 statement_list  =  { compound_stmt ~ (";" ~ compound_stmt)* ~ ";"* }
 compound_stmt   =  { label+ ~ inner_stmt? | inner_stmt }
 inner_stmt      =  { local_decl | assignment | terminator | expr }
@@ -10,7 +11,7 @@ assignment      =  { assignment_ssa | assignment_plain }
 assignment_ssa  =  { &(ty? ~ ssa_name ~ eq) ~ ty? ~ ssa_name ~ eq ~ expr }
 assignment_plain =  { &(ident ~ eq) ~ ident ~ eq ~ expr }
 assignment_stmt =  { SOI ~ assignment ~ EOI }
-label           =  { "<" ~ ident ~ ">" }
+label           =  { "<" ~ (ident | integer) ~ ">" }
 label_stmt      =  { SOI ~ label ~ EOI }
 terminator      =  { return_stmt | branchind_stmt | callind_stmt | cbranch_stmt | branch_stmt | call_stmt }
 terminator_stmt =  { SOI ~ terminator ~ EOI }

@@ -270,31 +270,30 @@ mod tests {
     use qcode_macro::qcode;
 
     use super::*;
-    use qcode::{
-        builder::Builder,
-        context::Context,
-        value::{BasicBlock, Function},
-    };
+    use qcode::{context::Context, value::BasicBlock};
 
     // 1. Same binop -> second is redundant, leader is first
     #[test]
     fn test_same_binop_redundant() {
         let mut ctx = Context::new();
-        let mut builder = Builder::from_context(&mut ctx, 0x1000);
-        let block_id = builder.block.id;
 
-        qcode!("local i64 a; local i64 b; v1 = {a} + {b}; v2 = {a} + {b}; goto 0x1001;");
-        // qcode!("local i64 a; local i64 b");
-        // let v1 = qcode!("{a} + {b}");
-        // let v2 = qcode!("{a} + {b}");
-        // builder.finalize(0x1001);
+        qcode!(
+            ctx,
+            "
+            <block>
+            local i64 a;
+            local i64 b;
+            %v1 = a + b;
+            %v2 = a + b;
+            goto <0x1001>;
+        "
+        );
 
-        let mut block = BasicBlock::from_id_mut(&mut ctx, block_id);
+        let mut block = BasicBlock::from_id_mut(&mut ctx, block);
 
         assert!(block.instruction_ids().contains(&v1));
         assert!(block.instruction_ids().contains(&v2));
 
-        // Simplify the block
         gvn(&mut block, None);
 
         assert!(block.instruction_ids().contains(&v1));
@@ -305,46 +304,51 @@ mod tests {
     #[test]
     fn test_commutative_normalization() {
         let mut ctx = Context::new();
-        let mut builder = Builder::from_context(&mut ctx, 0x1000);
-        let block_id = builder.block.id;
 
-        qcode!("local i64 a; local i64 b;");
-        let v1 = qcode!("{a} + {b}");
-        let v2 = qcode!("{b} + {a}");
+        qcode!(
+            ctx,
+            "
+        <block>
+        local i64 a;
+        local i64 b;
+        %v1 = a + b;
+        %v2 = b + a;
+        goto <0x1001>;"
+        );
 
-        builder.finalize(0x1001);
-
-        let mut block = BasicBlock::from_id_mut(&mut ctx, block_id);
+        let mut block = BasicBlock::from_id_mut(&mut ctx, block);
 
         assert!(block.instruction_ids().contains(&v1));
         assert!(block.instruction_ids().contains(&v2));
 
-        // Simplify the block
         gvn(&mut block, None);
 
         assert!(block.instruction_ids().contains(&v1));
         assert!(!block.instruction_ids().contains(&v2));
     }
 
-    // 3. Non-commutative not swapped: a - b ≠ b - a
+    // 3. Non-commutative not swapped: a - b != b - a
     #[test]
     fn test_non_commutative_not_swapped() {
         let mut ctx = Context::new();
-        let mut builder = Builder::from_context(&mut ctx, 0x1000);
-        let block_id = builder.block.id;
 
-        qcode!("local i64 a; local i64 b;");
-        let v1 = qcode!("{a} - {b}");
-        let v2 = qcode!("{b} - {a}");
+        qcode!(
+            ctx,
+            "
+            <block>
+            local i64 a;
+            local i64 b;
+            %v1 = a - b;
+            %v2 = b - a;
+            goto <0x1001>;
+        "
+        );
 
-        builder.finalize(0x1001);
-
-        let mut block = BasicBlock::from_id_mut(&mut ctx, block_id);
+        let mut block = BasicBlock::from_id_mut(&mut ctx, block);
 
         assert!(block.instruction_ids().contains(&v1));
         assert!(block.instruction_ids().contains(&v2));
 
-        // Simplify the block
         gvn(&mut block, None);
 
         assert!(block.instruction_ids().contains(&v1));
@@ -355,21 +359,24 @@ mod tests {
     #[test]
     fn test_different_ops_distinct() {
         let mut ctx = Context::new();
-        let mut builder = Builder::from_context(&mut ctx, 0x1000);
-        let block_id = builder.block.id;
 
-        qcode!("local i64 a; local i64 b;");
-        let v1 = qcode!("{a} + {b}");
-        let v2 = qcode!("{a} * {b}");
+        qcode!(
+            ctx,
+            "
+            <block>
+            local i64 a;
+            local i64 b;
+            %v1 = a + b;
+            %v2 = a * b;
+            goto <0x1001>;
+        "
+        );
 
-        builder.finalize(0x1001);
-
-        let mut block = BasicBlock::from_id_mut(&mut ctx, block_id);
+        let mut block = BasicBlock::from_id_mut(&mut ctx, block);
 
         assert!(block.instruction_ids().contains(&v1));
         assert!(block.instruction_ids().contains(&v2));
 
-        // Simplify the block
         gvn(&mut block, None);
 
         assert!(block.instruction_ids().contains(&v1));
@@ -383,35 +390,31 @@ mod tests {
         // entry: v1 = a + b
         // succ:  v2 = a + b  <- redundant, dominated by entry
         let mut ctx = Context::new();
-        let func_id = Function::make(&mut ctx, "f".into()).unwrap().id;
 
-        let mut builder = Builder::from_context(&mut ctx, 0x1000);
-        let entry_id = builder.block.id;
+        qcode!(
+            ctx,
+            "fn f:
+                <entry>
+                    local i64 a;
+                    local i64 b;
+                    %v1 = a + b;
+                    goto <succ>;
 
-        qcode!("local i64 a; local i64 b;");
-        let v1 = qcode!("{a} + {b}");
+                <succ>
+                    %v2 = a + b;
+                    return [0x1000];
+            "
+        );
 
-        let succ_id = builder.get_or_make_block(0x2000);
-        builder.push_branch(succ_id);
-
-        builder.switch_to_block(succ_id);
-        let v2 = qcode!("{a} + {b}");
-        unsafe { builder.dont_finalize() };
-        drop(builder);
-
-        Function::from_id_mut(&mut ctx, func_id)
-            .set_root(entry_id)
-            .unwrap();
-
-        gvn_function(&mut ctx, func_id, None);
+        gvn_function(&mut ctx, f, None);
 
         assert!(
-            BasicBlock::from_id(&ctx, entry_id)
+            BasicBlock::from_id(&ctx, entry)
                 .instruction_ids()
                 .contains(&v1)
         );
         assert!(
-            !BasicBlock::from_id(&ctx, succ_id)
+            !BasicBlock::from_id(&ctx, succ)
                 .instruction_ids()
                 .contains(&v2),
             "a+b in dominated successor should be eliminated"
@@ -426,43 +429,36 @@ mod tests {
         // right: (no a+b)
         // merge: v2 = a + b  <- NOT redundant; merge is dominated only by entry
         let mut ctx = Context::new();
-        let func_id = Function::make(&mut ctx, "g".into()).unwrap().id;
 
-        let mut builder = Builder::from_context(&mut ctx, 0x1000);
-        let entry_id = builder.block.id;
+        qcode!(
+            ctx,
+            "
+            fn g:
+                <entry>
+                    local i64 a;
+                    local i64 b;
+                    if i8 1 goto <left> else goto <right>;
 
-        qcode!("local i64 a; local i64 b;");
-        let cond = builder.context_mut().get_const(1u64, 1).id();
-        let left_id = builder.get_or_make_block(0x2000);
-        let right_id = builder.get_or_make_block(0x3000);
-        let merge_id = builder.get_or_make_block(0x4000);
-        builder.push_cbranch(cond, left_id, right_id);
+                <left>
+                    %v1 = a + b;
+                    goto <merge>;
 
-        builder.switch_to_block(left_id);
-        let v1 = qcode!("{a} + {b}");
-        builder.push_branch(merge_id);
+                <right>
+                    goto <merge>;
 
-        builder.switch_to_block(right_id);
-        builder.push_branch(merge_id);
+                <merge>
+                    %v2 = a + b;"
+        );
 
-        builder.switch_to_block(merge_id);
-        let v2 = qcode!("{a} + {b}");
-        unsafe { builder.dont_finalize() };
-        drop(builder);
-
-        Function::from_id_mut(&mut ctx, func_id)
-            .set_root(entry_id)
-            .unwrap();
-
-        gvn_function(&mut ctx, func_id, None);
+        gvn_function(&mut ctx, g, None);
 
         assert!(
-            BasicBlock::from_id(&ctx, left_id)
+            BasicBlock::from_id(&ctx, left)
                 .instruction_ids()
                 .contains(&v1)
         );
         assert!(
-            BasicBlock::from_id(&ctx, merge_id)
+            BasicBlock::from_id(&ctx, merge)
                 .instruction_ids()
                 .contains(&v2),
             "a+b at merge must NOT be eliminated: merge is not dominated by left"
@@ -474,19 +470,23 @@ mod tests {
     #[ignore = "WIP: constant folding not fully implemented yet"]
     fn test_constant_propagation() {
         let mut ctx = Context::new();
-        let mut builder = Builder::from_context(&mut ctx, 0x1000);
-        let block_id = builder.block.id;
 
-        qcode!("local i64 a; local i64 b;");
-        let v1 = qcode!("store({a}, i64 5); {a} + 2");
-        let v2 = qcode!("{v1} + 3");
-        qcode!("store({b}, {v2})");
-
-        builder.finalize(0x1001);
+        qcode!(
+            ctx,
+            "
+            <block>
+            local i64 a;
+            local i64 b;
+            store(a, i64 5);
+            %v1 = a + 2;
+            %v2 = v1 + 3;
+            store(b, v2);
+            goto <0x1001>;"
+        );
 
         let aliases = AliasResult::from_space_ids(&ctx);
 
-        let mut block = BasicBlock::from_id_mut(&mut ctx, block_id);
+        let mut block = BasicBlock::from_id_mut(&mut ctx, block);
 
         assert!(block.instruction_ids().contains(&v1));
         assert!(block.instruction_ids().contains(&v2));

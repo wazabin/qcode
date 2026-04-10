@@ -1,3 +1,22 @@
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SourcePosition {
+    pub offset: usize,
+    pub line: usize,
+    pub column: usize,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SourceSpan {
+    pub start: SourcePosition,
+    pub end: SourcePosition,
+}
+
+impl SourceSpan {
+    pub fn contains_offset(&self, offset: usize) -> bool {
+        self.start.offset <= offset && offset < self.end.offset
+    }
+}
+
 #[derive(Clone, Debug)]
 pub enum Atom {
     External(String),
@@ -9,6 +28,7 @@ pub enum Atom {
 pub struct TypedAtom {
     pub size_bytes: Option<usize>,
     pub atom: Atom,
+    pub span: SourceSpan,
 }
 
 #[derive(Clone, Debug)]
@@ -51,40 +71,91 @@ pub enum CastOp {
     Trunc,
 }
 
+/// A branch target or label declaration — either a named label or a block address.
+#[derive(Clone, Debug)]
+pub enum Label {
+    /// A named label such as `<entry>` or `<done>`. Generates a `BlockId` binding.
+    Named { name: String, span: SourceSpan },
+    /// A numeric address such as `<0x1001>`. Sets the block's address; no binding generated.
+    Address { value: u64, span: SourceSpan },
+}
+
+impl Label {
+    pub fn span(&self) -> &SourceSpan {
+        match self {
+            Self::Named { span, .. } | Self::Address { span, .. } => span,
+        }
+    }
+
+    pub fn name(&self) -> Option<&str> {
+        match self {
+            Self::Named { name, .. } => Some(name),
+            Self::Address { .. } => None,
+        }
+    }
+}
+
 #[derive(Clone, Debug)]
 pub enum Statement {
     LocalDecl {
         name: String,
+        name_span: SourceSpan,
         display_name: String,
         size_bytes: usize,
+        span: SourceSpan,
     },
     Assign {
         name: String,
+        name_span: SourceSpan,
         expose: bool,
         expr: ExprNode,
+        span: SourceSpan,
     },
     Expr(ExprNode),
     LabelDecl {
-        name: String,
+        label: Label,
+        span: SourceSpan,
     },
     Branch {
-        target: String,
+        target: Label,
+        span: SourceSpan,
     },
     BranchInd {
         ptr: TypedAtom,
+        span: SourceSpan,
     },
     CBranch {
         condition: TypedAtom,
-        target: String,
-        fallthrough: String,
+        target: Label,
+        fallthrough: Label,
+        span: SourceSpan,
     },
     Call {
-        target: String,
+        target: Label,
+        span: SourceSpan,
     },
     CallInd {
         ptr: TypedAtom,
+        span: SourceSpan,
     },
     Return {
         ptr: TypedAtom,
+        span: SourceSpan,
     },
+}
+
+/// A function declaration (`fn name: <entry> stmts...`).
+#[derive(Clone, Debug)]
+pub struct FnDecl {
+    pub name: String,
+    pub name_span: SourceSpan,
+    pub span: SourceSpan,
+    pub statements: Vec<Statement>,
+}
+
+/// Top-level program representation.
+#[derive(Clone, Debug)]
+pub enum Program {
+    Statements(Vec<Statement>),
+    Functions(Vec<FnDecl>),
 }
