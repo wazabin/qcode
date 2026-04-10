@@ -11,4 +11,4 @@ pub mod alias;
 pub use alias::{AliasResult, alias_analysis};
 
 pub mod gvn;
-pub use gvn::gvn;
+pub use gvn::{gvn, gvn_function};
