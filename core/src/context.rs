@@ -6,7 +6,7 @@ use crate::{
     error::{Error, ErrorTy, Result},
     space::{Space, SpaceId},
     value::{
-        BasicBlock, Function, FunctionId, Instruction, Renameable, ValueId, ValueRef,
+        BasicBlock, Function, FunctionId, Instruction, ValueId, ValueRef,
         block::{BlockId, BlockMutRef, BlockRef, EdgeData, EdgeId, EdgeMutRef, EdgeRef},
         insn::{InstructionId, InstructionRef, PCodeOpId},
         literal::{LiteralId, LiteralRef},

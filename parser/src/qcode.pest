@@ -2,7 +2,9 @@ WHITESPACE = _{ " " | "\t" | "\r" | "\n" }
 COMMENT    = _{ "#" ~ (!"\n" ~ ANY)* }
 
 program         =  { SOI ~ (fn_decl+ | statement_list?) ~ EOI }
-fn_decl         =  { "fn" ~ ident ~ ":" ~ statement_list? }
+fn_decl         =  { "fn" ~ ident ~ ":" ~ fn_body? }
+fn_body         =  { fn_stmt ~ (";" ~ fn_stmt)* ~ ";"* }
+fn_stmt         =  { !("fn" ~ ident ~ ":") ~ compound_stmt }
 statement_list  =  { compound_stmt ~ (";" ~ compound_stmt)* ~ ";"* }
 compound_stmt   =  { label+ ~ inner_stmt? | inner_stmt }
 inner_stmt      =  { local_decl | assignment | terminator | expr }

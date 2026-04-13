@@ -78,12 +78,17 @@ fn parse_fn_decl(pair: Pair<'_, Rule>) -> Result<FnDecl, ParseError> {
 
     let mut statements = Vec::new();
     for part in inner {
-        if part.as_rule() == Rule::statement_list {
-            for compound in part.into_inner() {
-                if compound.as_rule() != Rule::compound_stmt {
+        if part.as_rule() == Rule::fn_body {
+            for fn_stmt in part.into_inner() {
+                if fn_stmt.as_rule() != Rule::fn_stmt {
                     continue;
                 }
-                parse_compound(compound, &mut statements)?;
+                for compound in fn_stmt.into_inner() {
+                    if compound.as_rule() != Rule::compound_stmt {
+                        continue;
+                    }
+                    parse_compound(compound, &mut statements)?;
+                }
             }
         }
     }

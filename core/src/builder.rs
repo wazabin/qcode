@@ -34,7 +34,6 @@ use std::{borrow::Cow, collections::HashMap};
 
 use crate::{
     context::Context,
-    error::Result,
     space::{SPACE_CONST, SpaceId},
     value::{
         Function, Instruction, Renameable, Value, ValueId, ValueRef,
@@ -389,8 +388,11 @@ impl<'str, 'ctx> Builder<'str, 'ctx> {
                     ValueRef::Varnode(v) => v.space().id == space,
                     _ => true,
                 },
-                "push_load: ptr is a varnode but its space does not match the load space {:?}; \
+                "push_load: ptr is a varnode but its space {:?} does not match the load space {:?}; \
                  call ensure_local on the ptr first",
+                src.as_varnode()
+                    .map(|id| Varnode::from_id(self.context(), id).space().id)
+                    .unwrap(),
                 space,
             );
             let size = self.context().get_value(src).size();
@@ -880,12 +882,16 @@ mod tests {
     #[test]
     fn cfg_branch_adds_one_node_and_one_edge() {
         let mut ctx = Context::new();
-        {
-            let mut builder = Builder::from_context(&mut ctx, 0x1000);
-            qcode!(builder, "goto <done>; <done>");
-            builder.finalize(0x1001);
-        }
-        // entry (1000) + done + 1001 = 3 nodes; entry→done, done→1001 = 2 edges
+        qcode!(
+            ctx,
+            "
+            <entry>
+                goto <done>;
+            <done>
+                goto <0x1001>;
+        "
+        );
+        // entry + done + 1001 = 3 nodes; entry -> done, done -> 1001 = 2 edges
         assert_eq!(ctx.nodes().count(), 3);
         assert_eq!(ctx.edges().count(), 2);
     }
@@ -893,41 +899,36 @@ mod tests {
     #[test]
     fn cfg_cbranch_adds_two_edges() {
         let mut ctx = Context::new();
-        {
-            let mut builder = Builder::from_context(&mut ctx, 0x1000);
-            qcode!(builder, "local i8 cond");
-            qcode!(builder, "if {cond} goto <then_lbl> else goto <else_lbl>");
-            builder.finalize(0x1001);
-        }
+        qcode!(
+            ctx,
+            "
+            <entry>
+                local i8 cond;
+                if cond goto <then_lbl> else goto <else_lbl>;
+            <then_lbl>
+                goto <0x1001>;
+            <else_lbl>
+                goto <0x1001>;
+        "
+        );
         // entry + then_lbl + else_lbl + 1001 = 4 nodes
-        // entry→then_lbl, entry→else_lbl, else_lbl→1001 = 3 edges
+        // entry->then_lbl, entry->else_lbl, then_lbl->1001, else_lbl->1001 = 4 edges
         assert_eq!(ctx.nodes().count(), 4);
-        assert_eq!(ctx.edges().count(), 3);
+        assert_eq!(ctx.edges().count(), 4);
     }
-
-    // TODO:
-    // #[test]
-    // fn cfg_call_adds_one_edge() {
-    //     let mut ctx = Context::new();
-    //     {
-    //         let mut builder = Builder::from_context(&mut ctx, 0x1000);
-    //         qcode!(builder, "call <func>");
-    //     }
-    //     // entry + func + 1001 = 3 nodes; entry→func, func→1001 = 2 edges
-    //     assert_eq!(ctx.nodes().count(), 3);
-    //     assert_eq!(ctx.edges().count(), 2);
-    // }
 
     #[test]
     fn cfg_branchind_adds_node_but_no_outgoing_edge() {
         let mut ctx = Context::new();
-        let entry;
-        {
-            let mut builder = Builder::from_context(&mut ctx, 0x1000);
-            entry = builder.block.id;
-            qcode!(builder, "local i64 ptr");
-            qcode!(builder, "goto [{ptr}]");
-        }
+        qcode!(
+            ctx,
+            "
+            <entry>
+                local i64 ptr;
+                goto [ptr];
+        "
+        );
+
         assert_eq!(ctx.nodes().count(), 1);
         assert_eq!(ctx.edges().count(), 0);
 
@@ -937,13 +938,14 @@ mod tests {
     #[test]
     fn cfg_return_adds_node_but_no_outgoing_edge() {
         let mut ctx = Context::new();
-        let entry;
-        {
-            let mut builder = Builder::from_context(&mut ctx, 0x1000);
-            entry = builder.block.id;
-            qcode!(builder, "local i64 ptr");
-            qcode!(builder, "return [{ptr}]");
-        }
+        qcode!(
+            ctx,
+            "
+            <entry>
+                local i64 ptr;
+                return [ptr];
+        "
+        );
         assert_eq!(ctx.nodes().count(), 1);
         assert_eq!(ctx.edges().count(), 0);
         assert_eq!(BasicBlock::from_id(&ctx, entry).children().count(), 0);
@@ -952,13 +954,21 @@ mod tests {
     #[test]
     fn cfg_multi_block_qcode_program() {
         let mut ctx = Context::new();
-        let mut builder = Builder::from_context(&mut ctx, 0x1000);
-        qcode!(builder, "local i32 v");
-        qcode!(builder, "goto <body>; <body> {v} + 1");
-        builder.finalize(0x1001);
+        qcode!(
+            ctx,
+            "
+            <entry>
+                local i32 v;
+                goto <body>;
 
-        // entry (1000) + body + 1001 = 3 nodes
-        // entry→body, body→1001 = 2 edges
+            <body>
+                %v0 = v + 1;
+                goto <0x1001>;
+        "
+        );
+
+        // entry + body + 1001 = 3 nodes
+        // entry -> body, body -> 1001 = 2 edges
         assert_eq!(ctx.nodes().count(), 3);
         assert_eq!(ctx.edges().count(), 2);
     }
@@ -1011,15 +1021,10 @@ mod tests {
     #[test]
     fn qcode_local_decl_creates_named_temp() {
         let mut ctx = Context::new();
-        let ptr_id: VarnodeId;
-        {
-            let mut builder = Builder::from_context(&mut ctx, 0x1000);
-            qcode!(builder, "local i64 ptr");
-            ptr_id = ptr;
-            builder.finalize(0x1001);
-        }
 
-        let ptr = Varnode::from_id(&ctx, ptr_id);
+        qcode!(ctx, "<block> local i64 ptr; goto <0x1001>;");
+
+        let ptr = Varnode::from_id(&ctx, ptr);
 
         assert_eq!(ptr.size(), 8);
         assert_eq!(ptr.name(), Some("ptr"));
@@ -1029,14 +1034,9 @@ mod tests {
     fn qcode_standalone_local_decl_creates_named_temp() {
         let mut ctx = Context::new();
         let ptr_id: VarnodeId;
-        {
-            let mut builder = Builder::from_context(&mut ctx, 0x1000);
-            qcode!(builder, "local i64 ptr as PTR");
-            ptr_id = ptr;
-            builder.finalize(0x1001);
-        }
+        qcode!(ctx, "<block> local i64 ptr as PTR; goto <0x1001>;");
 
-        let ptr = Varnode::from_id(&ctx, ptr_id);
+        let ptr = Varnode::from_id(&ctx, ptr);
 
         assert_eq!(ptr.size(), 8);
         assert_eq!(ptr.name(), Some("PTR"));

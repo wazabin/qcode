@@ -178,7 +178,6 @@ mod tests {
     use qcode_macro::qcode;
 
     use crate::{
-        builder::Builder,
         context::Context,
         value::{BasicBlock, insn::Mnemonic},
     };
@@ -186,13 +185,17 @@ mod tests {
     #[test]
     fn qcode_emits_branch() {
         let mut ctx = Context::new();
-        {
-            let mut builder = Builder::from_context(&mut ctx, 0x1000);
-            qcode!(builder, "goto <done>");
-            // No finalize needed — goto terminates the block.
-        }
+        qcode!(
+            ctx,
+            "
+            <block>
+                goto <done>;
+            <done>
+                goto <0x1001>;
+            "
+        );
 
-        let block = BasicBlock::from_addr(&ctx, 0x1000).expect("block not found");
+        let block = BasicBlock::from_id(&ctx, block);
         let last = block.iter().last().expect("block has instructions");
         assert!(matches!(last.mnemonic(), Mnemonic::Branch(_)));
         assert_eq!(last.as_statement().to_string(), "goto <done>;");
@@ -201,14 +204,16 @@ mod tests {
     #[test]
     fn qcode_emits_branchind() {
         let mut ctx = Context::new();
-        {
-            let mut builder = Builder::from_context(&mut ctx, 0x1000);
-            qcode!(builder, "local i64 ptr");
-            qcode!(builder, "goto [{ptr}]");
-            // No finalize needed — goto terminates the block.
-        }
+        qcode!(
+            ctx,
+            "
+            <block>
+                local i64 ptr;
+                goto [%ptr];
+            "
+        );
 
-        let block = BasicBlock::from_addr(&ctx, 0x1000).expect("block not found");
+        let block = BasicBlock::from_id(&ctx, block);
         let last = block.iter().last().expect("block has instructions");
         assert!(matches!(last.mnemonic(), Mnemonic::BranchInd(_)));
     }
@@ -216,15 +221,20 @@ mod tests {
     #[test]
     fn qcode_emits_cbranch() {
         let mut ctx = Context::new();
-        {
-            let mut builder = Builder::from_context(&mut ctx, 0x1000);
-            qcode!(builder, "local i8 cond");
-            qcode!(builder, "if {cond} goto <then_lbl> else goto <else_lbl>");
-            // cbranch switches the builder to the (unterminated) else_lbl block.
-            builder.finalize(0x1001);
-        }
+        qcode!(
+            ctx,
+            "
+            <block>
+                local i8 cond;
+                if %cond goto <then_lbl> else goto <else_lbl>;
+            <then_lbl>
+                goto <0x1001>;
+            <else_lbl>
+                goto <0x1002>;
+            "
+        );
 
-        let block = BasicBlock::from_addr(&ctx, 0x1000).expect("block not found");
+        let block = BasicBlock::from_id(&ctx, block);
         let last = block.iter().last().expect("block has instructions");
         assert!(matches!(last.mnemonic(), Mnemonic::CBranch(_)));
     }
@@ -232,13 +242,15 @@ mod tests {
     #[test]
     fn qcode_emits_call() {
         let mut ctx = Context::new();
-        {
-            let mut builder = Builder::from_context(&mut ctx, 0x1000);
-            qcode!(builder, "call <target>");
-            // No finalize needed — call terminates the block.
-        }
+        qcode!(
+            ctx,
+            "
+            <block>
+                call <target>;
+            "
+        );
 
-        let block = BasicBlock::from_addr(&ctx, 0x1000).expect("block not found");
+        let block = BasicBlock::from_id(&ctx, block);
         let last = block.iter().last().expect("block has instructions");
         assert!(matches!(last.mnemonic(), Mnemonic::Call(_)));
     }
@@ -246,14 +258,16 @@ mod tests {
     #[test]
     fn qcode_emits_callind() {
         let mut ctx = Context::new();
-        {
-            let mut builder = Builder::from_context(&mut ctx, 0x1000);
-            qcode!(builder, "local i64 ptr");
-            qcode!(builder, "call [{ptr}]");
-            // No finalize needed — call terminates the block.
-        }
+        qcode!(
+            ctx,
+            "
+            <block>
+                local i64 ptr;
+                call [%ptr];
+            "
+        );
 
-        let block = BasicBlock::from_addr(&ctx, 0x1000).expect("block not found");
+        let block = BasicBlock::from_id(&ctx, block);
         let last = block.iter().last().expect("block has instructions");
         assert!(matches!(last.mnemonic(), Mnemonic::CallInd(_)));
     }
@@ -261,14 +275,16 @@ mod tests {
     #[test]
     fn qcode_emits_return() {
         let mut ctx = Context::new();
-        {
-            let mut builder = Builder::from_context(&mut ctx, 0x1000);
-            qcode!(builder, "local i64 ptr");
-            qcode!(builder, "return [{ptr}]");
-            // No finalize needed — return terminates the block.
-        }
+        qcode!(
+            ctx,
+            "
+            <block>
+                local i64 ptr;
+                return [%ptr];
+            "
+        );
 
-        let block = BasicBlock::from_addr(&ctx, 0x1000).expect("block not found");
+        let block = BasicBlock::from_id(&ctx, block);
         let last = block.iter().last().expect("block has instructions");
         assert!(matches!(last.mnemonic(), Mnemonic::Return(_)));
     }
@@ -276,14 +292,20 @@ mod tests {
     #[test]
     fn qcode_multi_block_with_label() {
         let mut ctx = Context::new();
-        let mut builder = Builder::from_context(&mut ctx, 0x1000);
-        qcode!(builder, "local i32 v");
-        // Emit into entry block, then declare a label and emit more there.
-        qcode!(builder, "goto <body>; <body> {v} + 1");
-        builder.finalize(0x1001);
+        qcode!(
+            ctx,
+            "
+            <block>
+                local i32 v;
+                goto <body>;
+            <body>
+                %sum = i32 %v + i32 0x1;
+                goto <0x1001>;
+            "
+        );
 
         // Entry block ends with a branch to "body".
-        let entry = BasicBlock::from_addr(&ctx, 0x1000).expect("block not found");
+        let entry = BasicBlock::from_id(&ctx, block);
         let entry_last = entry.iter().last().expect("entry has instructions");
         assert!(matches!(entry_last.mnemonic(), Mnemonic::Branch(_)));
 
@@ -298,12 +320,20 @@ mod tests {
     #[test]
     fn qcode_cbranch_target_and_fallthrough_are_distinct_blocks() {
         let mut ctx = Context::new();
-        let mut builder = Builder::from_context(&mut ctx, 0x1000);
-        qcode!(builder, "local i8 cond");
-        qcode!(builder, "if {cond} goto <then_lbl> else goto <else_lbl>");
-        builder.finalize(0x1001);
+        qcode!(
+            ctx,
+            "
+            <block>
+                local i8 cond;
+                if %cond goto <then_lbl> else goto <else_lbl>;
+            <then_lbl>
+                goto <0x1001>;
+            <else_lbl>
+                goto <0x1002>;
+            "
+        );
 
-        let block = BasicBlock::from_addr(&ctx, 0x1000).expect("block not found");
+        let block = BasicBlock::from_id(&ctx, block);
         let last = block.iter().last().expect("block has instructions");
         let Mnemonic::CBranch(cbranch) = last.mnemonic() else {
             panic!("expected cbranch");

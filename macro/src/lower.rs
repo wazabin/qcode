@@ -31,15 +31,26 @@ pub(crate) fn compile_fn_program(
 ) -> syn::Result<proc_macro2::TokenStream> {
     let mut all_predecls = Vec::new();
     let mut all_bodies = Vec::new();
+    // Block names are deduplicated across functions: two functions can share <entry> without
+    // conflicting. The `mut` binding lets the last function's assignment win, which is fine
+    // since users only reference blocks by the function they care about.
+    let mut seen_block_names = std::collections::HashSet::new();
+    let mut block_predecls: Vec<proc_macro2::TokenStream> = Vec::new();
 
     for fn_decl in fns {
-        let (predecls, body) = compile_single_fn(ctx, fn_decl, pcode_root)?;
+        let (predecls, fn_block_idents, body) = compile_single_fn(ctx, fn_decl, pcode_root)?;
         all_predecls.extend(predecls);
+        for b in fn_block_idents {
+            if seen_block_names.insert(b.to_string()) {
+                block_predecls.push(quote! { let mut #b: #pcode_root::value::BlockId; });
+            }
+        }
         all_bodies.push(body);
     }
 
     Ok(quote! {
         #(#all_predecls)*
+        #(#block_predecls)*
         #(#all_bodies)*
     })
 }
@@ -48,7 +59,7 @@ fn compile_single_fn(
     ctx: &Expr,
     fn_decl: &FnDecl,
     pcode_root: &proc_macro2::TokenStream,
-) -> syn::Result<(Vec<proc_macro2::TokenStream>, proc_macro2::TokenStream)> {
+) -> syn::Result<(Vec<proc_macro2::TokenStream>, Vec<proc_macro2::Ident>, proc_macro2::TokenStream)> {
     let fn_name_str = &fn_decl.name;
     let fn_ident = format_ident!("{}", fn_name_str);
     let statements = &fn_decl.statements;
@@ -104,13 +115,27 @@ fn compile_single_fn(
         })
         .collect();
 
+    let local_decls: Vec<proc_macro2::Ident> = statements
+        .iter()
+        .filter_map(|s| {
+            if let Statement::LocalDecl { name, .. } = s {
+                Some(format_ident!("{}", name))
+            } else {
+                None
+            }
+        })
+        .collect();
+
+    // Non-block predecls: FunctionId, exposed SSAs, VarnodeId locals.
+    // Block predecls are returned separately so compile_fn_program can deduplicate them
+    // across sibling functions that share block names (e.g. both have <entry>).
     let mut predecls: Vec<proc_macro2::TokenStream> = Vec::new();
     predecls.push(quote! { let #fn_ident: #pcode_root::value::FunctionId; });
-    for block_ident in &named_blocks {
-        predecls.push(quote! { let #block_ident: #pcode_root::value::BlockId; });
-    }
     for ssa_ident in &exposed_ssas {
         predecls.push(quote! { let #ssa_ident: #pcode_root::value::InstructionId; });
+    }
+    for local_ident in &local_decls {
+        predecls.push(quote! { let #local_ident: #pcode_root::value::VarnodeId; });
     }
 
     // Build the statement emissions.
@@ -161,7 +186,7 @@ fn compile_single_fn(
         }
     };
 
-    Ok((predecls, body))
+    Ok((predecls, named_blocks, body))
 }
 
 /// Emit a named `LabelDecl` in function context (switch to existing or create block).
@@ -245,6 +270,17 @@ pub(crate) fn compile_qcode_from_statements_ctx(
         })
         .collect();
 
+    let local_decls: Vec<proc_macro2::Ident> = statements
+        .iter()
+        .filter_map(|s| {
+            if let Statement::LocalDecl { name, .. } = s {
+                Some(format_ident!("{}", name))
+            } else {
+                None
+            }
+        })
+        .collect();
+
     let mut locals: HashMap<String, proc_macro2::Ident> = HashMap::new();
     let mut emitted = Vec::new();
 
@@ -259,6 +295,9 @@ pub(crate) fn compile_qcode_from_statements_ctx(
     }
     for ssa in &exposed_ssas {
         predecls.push(quote! { let #ssa: #pcode_root::value::InstructionId; });
+    }
+    for local_ident in &local_decls {
+        predecls.push(quote! { let #local_ident: #pcode_root::value::VarnodeId; });
     }
 
     Ok(quote! {
@@ -543,10 +582,12 @@ fn emit_statement(
             ..
         } => {
             let ident = format_ident!("__qcode_local_{}", name);
+            let outer_ident = format_ident!("{}", name);
             let size = *size_bytes;
             emitted.push(quote! {
                 let #ident = __qcode_builder
                     .make_named_temp(Cow::Borrowed(#display_name), #size);
+                #outer_ident = #ident;
             });
             locals.insert(name.clone(), ident);
         }
@@ -560,11 +601,17 @@ fn emit_statement(
                 let outer_ident = format_ident!("{}", name);
                 emitted.push(quote! {
                     let #ident = #value_tokens;
+                    let _ = #pcode_root::value::Instruction::from_id_mut(
+                        __qcode_builder.context_mut(), #ident
+                    ).rename(Cow::Borrowed(#name));
                     #outer_ident = #ident;
                 });
             } else {
                 emitted.push(quote! {
                     let #ident = #value_tokens;
+                    let _ = #pcode_root::value::Instruction::from_id_mut(
+                        __qcode_builder.context_mut(), #ident
+                    ).rename(Cow::Borrowed(#name));
                 });
             }
             locals.insert(name.clone(), ident);
@@ -877,11 +924,15 @@ fn lower_expr(
             Ok(quote! {
                 {
                     let __qcode_ptr = #ptr_tokens;
+                    let __qcode_load_space = match __qcode_builder.context().get_value(__qcode_ptr) {
+                        #pcode_root::value::ValueRef::Varnode(v) => v.space().id,
+                        _ => #pcode_root::space::SPACE_UNIQUE,
+                    };
                     let __qcode_value = __qcode_builder
-                        .push_load::<true>(
+                        .push_load::<false>(
                             __qcode_ptr,
                             #size,
-                            #pcode_root::space::SPACE_UNIQUE,
+                            __qcode_load_space,
                         )
                         .id();
 

@@ -231,248 +231,551 @@ impl Display for FloatBinop {
 mod tests {
     use qcode_macro::qcode;
 
-    use crate::{
-        builder::Builder,
-        value::insn::{Instruction, InstructionId, Mnemonic},
-    };
+    use crate::value::insn::{Instruction, Mnemonic};
 
     use super::*;
 
-    macro_rules! assert_int_binop {
-        ($expr:literal, $expected_op:expr, $size: literal, $expected_stmt:literal $(,)?) => {{
-            let mut ctx = Context::new();
-            let mut builder = Builder::from_context(&mut ctx, 0x1000);
-
-            qcode!(builder, "local i32 v0 as V0");
-            let v1: InstructionId = qcode!(builder, $expr);
-            builder.finalize(0x1001);
-
-            match ctx.values.instructions[v1].clone() {
-                Instruction {
-                    mnemonic:
-                        Mnemonic::Binop(Binary {
-                            op: Binop::Int(op), ..
-                        }),
-                    size: $size,
-                    ..
-                } => assert_eq!(op, $expected_op),
-
-                _ => panic!(
-                    "expected i32 integer binop instruction, found {}",
-                    ctx.get_insn(v1).as_statement()
-                ),
-            }
-
-            assert_eq!(ctx.get_insn(v1).as_statement().to_string(), $expected_stmt);
-        }};
-    }
-
-    macro_rules! assert_bool_binop {
-        ($expr:literal, $expected_op:expr $(,)?) => {{
-            let mut ctx = Context::new();
-            let mut builder = Builder::from_context(&mut ctx, 0x1000);
-
-            qcode!(builder, "local i8 v0 as V0; local i8 v1 as V1");
-            let v2: InstructionId = qcode!(builder, $expr);
-            builder.finalize(0x1001);
-
-            match ctx.values.instructions[v2].clone() {
-                Instruction {
-                    mnemonic:
-                        Mnemonic::Binop(Binary {
-                            op: Binop::Bool(op),
-                            ..
-                        }),
-                    ..
-                } => assert_eq!(op, $expected_op),
-
-                _ => panic!("expected boolean binop instruction"),
-            }
-        }};
-    }
-
     #[test]
     fn test_add_display() {
-        assert_int_binop!(
-            "i32 {v0} + i32 0x2",
-            IntBinop::Add,
-            4,
-            "i32 %tmp1 = i32 %v0 + 0x2;"
+        let mut ctx = Context::new();
+
+        qcode!(
+            ctx,
+            "
+            <block>
+                local i32 V0;
+                %v0 = load(i32, V0);
+                %v = i32 %v0 + i32 0x2;
+                goto <0x1001>;
+            "
         );
+
+        let v = Instruction::from_id(&ctx, v);
+
+        match v.mnemonic() {
+            Mnemonic::Binop(Binary {
+                op: Binop::Int(op), ..
+            }) => assert_eq!(*op, IntBinop::Add),
+            _ => panic!("expected i32 integer binop instruction, found {}", v),
+        }
+
+        assert_eq!(v.size(), 4);
+        assert_eq!(v.as_statement().to_string(), "i32 %v = i32 %v0 + 0x2;");
     }
 
     #[test]
     fn test_sub_display() {
-        assert_int_binop!(
-            "i32 {v0} - i32 0x2",
-            IntBinop::Sub,
-            4,
-            "i32 %tmp1 = i32 %v0 - 0x2;"
+        let mut ctx = Context::new();
+
+        qcode!(
+            ctx,
+            "
+            <block>
+                local i32 V0;
+                %v0 = load(i32, V0);
+                %v = i32 %v0 - i32 0x2;
+                goto <0x1001>;
+            "
         );
+
+        let v = Instruction::from_id(&ctx, v);
+
+        match v.mnemonic() {
+            Mnemonic::Binop(Binary {
+                op: Binop::Int(op), ..
+            }) => assert_eq!(*op, IntBinop::Sub),
+            _ => panic!("expected i32 integer binop instruction, found {}", v),
+        }
+
+        assert_eq!(v.size(), 4);
+        assert_eq!(v.as_statement().to_string(), "i32 %v = i32 %v0 - 0x2;");
     }
 
     #[test]
     fn test_mul_display() {
-        assert_int_binop!(
-            "i32 {v0} * i32 0x2",
-            IntBinop::Mul,
-            4,
-            "i32 %tmp1 = i32 %v0 * 0x2;"
+        let mut ctx = Context::new();
+
+        qcode!(
+            ctx,
+            "
+            <block>
+               local i32 V0;
+                %v0 = load(i32, V0);
+                %v = i32 %v0 * i32 0x2;
+                goto <0x1001>;
+            "
         );
+
+        let v = Instruction::from_id(&ctx, v);
+
+        match v.mnemonic() {
+            Mnemonic::Binop(Binary {
+                op: Binop::Int(op), ..
+            }) => assert_eq!(*op, IntBinop::Mul),
+            _ => panic!("expected i32 integer binop instruction, found {}", v),
+        }
+
+        assert_eq!(v.size(), 4);
+        assert_eq!(v.as_statement().to_string(), "i32 %v = i32 %v0 * 0x2;");
     }
 
     #[test]
     fn test_div_display() {
-        assert_int_binop!(
-            "i32 {v0} / i32 0x2",
-            IntBinop::Div,
-            4,
-            "i32 %tmp1 = i32 %v0 / 0x2;"
+        let mut ctx = Context::new();
+
+        qcode!(
+            ctx,
+            "
+            <block>
+                local i32 V0;
+                %v0 = load(i32, V0);
+                %v = i32 %v0 / i32 0x2;
+                goto <0x1001>;
+            "
         );
+
+        let v = Instruction::from_id(&ctx, v);
+
+        match v.mnemonic() {
+            Mnemonic::Binop(Binary {
+                op: Binop::Int(op), ..
+            }) => assert_eq!(*op, IntBinop::Div),
+            _ => panic!("expected i32 integer binop instruction, found {}", v),
+        }
+
+        assert_eq!(v.size(), 4);
+        assert_eq!(v.as_statement().to_string(), "i32 %v = i32 %v0 / 0x2;");
     }
 
     #[test]
     fn test_bit_and_display() {
-        assert_int_binop!(
-            "i32 {v0} & i32 0x2",
-            IntBinop::And,
-            4,
-            "i32 %tmp1 = i32 %v0 & 0x2;"
+        let mut ctx = Context::new();
+
+        qcode!(
+            ctx,
+            "
+            <block>
+                local i32 V0;
+                %v0 = load(i32, V0);
+                %v = i32 %v0 & i32 0x2;
+                goto <0x1001>;
+            "
         );
+
+        let v = Instruction::from_id(&ctx, v);
+
+        match v.mnemonic() {
+            Mnemonic::Binop(Binary {
+                op: Binop::Int(op), ..
+            }) => assert_eq!(*op, IntBinop::And),
+            _ => panic!("expected i32 integer binop instruction, found {}", v),
+        }
+
+        assert_eq!(v.size(), 4);
+        assert_eq!(v.as_statement().to_string(), "i32 %v = i32 %v0 & 0x2;");
     }
 
     #[test]
     fn test_bit_or_display() {
-        assert_int_binop!(
-            "i32 {v0} | i32 0x2",
-            IntBinop::Or,
-            4,
-            "i32 %tmp1 = i32 %v0 | 0x2;"
+        let mut ctx = Context::new();
+
+        qcode!(
+            ctx,
+            "
+            <block>
+                local i32 V0;
+                %v0 = load(i32, V0);
+                %v = i32 %v0 | i32 0x2;
+                goto <0x1001>;
+            "
         );
+
+        let v = Instruction::from_id(&ctx, v);
+
+        match v.mnemonic() {
+            Mnemonic::Binop(Binary {
+                op: Binop::Int(op), ..
+            }) => assert_eq!(*op, IntBinop::Or),
+            _ => panic!("expected i32 integer binop instruction, found {}", v),
+        }
+
+        assert_eq!(v.size(), 4);
+        assert_eq!(v.as_statement().to_string(), "i32 %v = i32 %v0 | 0x2;");
     }
 
     #[test]
     fn test_bit_xor_display() {
-        assert_int_binop!(
-            "i32 {v0} ^ i32 0x2",
-            IntBinop::Xor,
-            4,
-            "i32 %tmp1 = i32 %v0 ^ 0x2;"
+        let mut ctx = Context::new();
+
+        qcode!(
+            ctx,
+            "
+            <block>
+                local i32 V0;
+                %v0 = load(i32, V0);
+                %v = i32 %v0 ^ i32 0x2;
+                goto <0x1001>;
+            "
         );
+
+        let v = Instruction::from_id(&ctx, v);
+
+        match v.mnemonic() {
+            Mnemonic::Binop(Binary {
+                op: Binop::Int(op), ..
+            }) => assert_eq!(*op, IntBinop::Xor),
+            _ => panic!("expected i32 integer binop instruction, found {}", v),
+        }
+
+        assert_eq!(v.size(), 4);
+        assert_eq!(v.as_statement().to_string(), "i32 %v = i32 %v0 ^ 0x2;");
     }
 
     #[test]
     fn test_shl_display() {
-        assert_int_binop!(
-            "i32 {v0} << i32 0x2",
-            IntBinop::ShiftLeft,
-            4,
-            "i32 %tmp1 = i32 %v0 << 0x2;",
+        let mut ctx = Context::new();
+
+        qcode!(
+            ctx,
+            "
+            <block>
+                local i32 V0;
+                %v0 = load(i32, V0);
+                %v = i32 %v0 << i32 0x2;
+                goto <0x1001>;
+            "
         );
+
+        let v = Instruction::from_id(&ctx, v);
+
+        match v.mnemonic() {
+            Mnemonic::Binop(Binary {
+                op: Binop::Int(op), ..
+            }) => assert_eq!(*op, IntBinop::ShiftLeft),
+            _ => panic!("expected i32 integer binop instruction, found {}", v),
+        }
+
+        assert_eq!(v.size(), 4);
+        assert_eq!(v.as_statement().to_string(), "i32 %v = i32 %v0 << 0x2;");
     }
 
     #[test]
     fn test_shr_display() {
-        assert_int_binop!(
-            "i32 {v0} >> i32 0x2",
-            IntBinop::ShiftRight,
-            4,
-            "i32 %tmp1 = i32 %v0 >> 0x2;",
+        let mut ctx = Context::new();
+
+        qcode!(
+            ctx,
+            "
+            <block>
+                local i32 V0;
+                %v0 = load(i32, V0);
+                %v = i32 %v0 >> i32 0x2;
+                goto <0x1001>;
+            "
         );
+
+        let v = Instruction::from_id(&ctx, v);
+
+        match v.mnemonic() {
+            Mnemonic::Binop(Binary {
+                op: Binop::Int(op), ..
+            }) => assert_eq!(*op, IntBinop::ShiftRight),
+            _ => panic!("expected i32 integer binop instruction, found {}", v),
+        }
+
+        assert_eq!(v.size(), 4);
+        assert_eq!(v.as_statement().to_string(), "i32 %v = i32 %v0 >> 0x2;");
     }
 
     #[test]
     fn test_eq_display() {
-        assert_int_binop!(
-            "i32 {v0} == i32 0x2",
-            IntBinop::Equal,
-            1,
-            "i8 %tmp1 = i32 %v0 == 0x2;"
+        let mut ctx = Context::new();
+
+        qcode!(
+            ctx,
+            "
+            <block>
+                local i32 V0;
+                %v0 = load(i32, V0);
+                %v = i32 %v0 == i32 0x2;
+                goto <0x1001>;
+            "
         );
+
+        let v = Instruction::from_id(&ctx, v);
+
+        match v.mnemonic() {
+            Mnemonic::Binop(Binary {
+                op: Binop::Int(op), ..
+            }) => assert_eq!(*op, IntBinop::Equal),
+            _ => panic!("expected i32 integer binop instruction, found {}", v),
+        }
+
+        assert_eq!(v.size(), 1);
+        assert_eq!(v.as_statement().to_string(), "i8 %v = i32 %v0 == 0x2;");
     }
 
     #[test]
     fn test_ne_display() {
-        assert_int_binop!(
-            "i32 {v0} != i32 0x2",
-            IntBinop::NotEqual,
-            1,
-            "i8 %tmp1 = i32 %v0 != 0x2;"
+        let mut ctx = Context::new();
+
+        qcode!(
+            ctx,
+            "
+            <block>
+                local i32 V0;
+                %v0 = load(i32, V0);
+                %v = i32 %v0 != i32 0x2;
+                goto <0x1001>;
+            "
         );
+
+        let v = Instruction::from_id(&ctx, v);
+
+        match v.mnemonic() {
+            Mnemonic::Binop(Binary {
+                op: Binop::Int(op), ..
+            }) => assert_eq!(*op, IntBinop::NotEqual),
+            _ => panic!("expected i32 integer binop instruction, found {}", v),
+        }
+
+        assert_eq!(v.size(), 1);
+        assert_eq!(v.as_statement().to_string(), "i8 %v = i32 %v0 != 0x2;");
     }
 
     #[test]
     fn test_lt_display() {
-        assert_int_binop!(
-            "i32 {v0} < i32 0x2",
-            IntBinop::Less,
-            1,
-            "i8 %tmp1 = i32 %v0 < 0x2;"
+        let mut ctx = Context::new();
+
+        qcode!(
+            ctx,
+            "
+            <block>
+                local i32 V0;
+                %v0 = load(i32, V0);
+                %v = i32 %v0 < i32 0x2;
+                goto <0x1001>;
+            "
         );
+
+        let v = Instruction::from_id(&ctx, v);
+
+        match v.mnemonic() {
+            Mnemonic::Binop(Binary {
+                op: Binop::Int(op), ..
+            }) => assert_eq!(*op, IntBinop::Less),
+            _ => panic!("expected i32 integer binop instruction, found {}", v),
+        }
+
+        assert_eq!(v.size(), 1);
+        assert_eq!(v.as_statement().to_string(), "i8 %v = i32 %v0 < 0x2;");
     }
 
     #[test]
     fn test_le_display() {
-        assert_int_binop!(
-            "i32 {v0} <= i32 0x2",
-            IntBinop::LessEqual,
-            1,
-            "i8 %tmp1 = i32 %v0 <= 0x2;"
+        let mut ctx = Context::new();
+
+        qcode!(
+            ctx,
+            "
+            <block>
+                local i32 V0;
+                %v0 = load(i32, V0);
+                %v = i32 %v0 <= i32 0x2;
+                goto <0x1001>;
+            "
         );
+
+        let v = Instruction::from_id(&ctx, v);
+
+        match v.mnemonic() {
+            Mnemonic::Binop(Binary {
+                op: Binop::Int(op), ..
+            }) => assert_eq!(*op, IntBinop::LessEqual),
+            _ => panic!("expected i32 integer binop instruction, found {}", v),
+        }
+
+        assert_eq!(v.size(), 1);
+        assert_eq!(v.as_statement().to_string(), "i8 %v = i32 %v0 <= 0x2;");
     }
 
     #[test]
     fn test_gt_display() {
-        assert_int_binop!(
-            "i32 {v0} > i32 0x2",
-            IntBinop::Less,
-            1,
-            "i8 %tmp1 = 0x2 < i32 %v0;",
+        let mut ctx = Context::new();
+
+        qcode!(
+            ctx,
+            "
+            <block>
+                local i32 V0;
+                %v0 = load(i32, V0);
+                %v = i32 %v0 > i32 0x2;
+                goto <0x1001>;
+            "
         );
+
+        let v = Instruction::from_id(&ctx, v);
+
+        match v.mnemonic() {
+            Mnemonic::Binop(Binary {
+                op: Binop::Int(op), ..
+            }) => assert_eq!(*op, IntBinop::Less),
+            _ => panic!("expected i32 integer binop instruction, found {}", v),
+        }
+
+        assert_eq!(v.size(), 1);
+        assert_eq!(v.as_statement().to_string(), "i8 %v = 0x2 < i32 %v0;");
     }
 
     #[test]
     fn test_ge_display() {
-        assert_int_binop!(
-            "i32 {v0} >= i32 0x2",
-            IntBinop::LessEqual,
-            1,
-            "i8 %tmp1 = 0x2 <= i32 %v0;",
+        let mut ctx = Context::new();
+
+        qcode!(
+            ctx,
+            "
+            <block>
+                local i32 V0;
+                %v0 = load(i32, V0);
+                %v = i32 %v0 >= i32 0x2;
+                goto <0x1001>;
+            "
         );
+
+        let v = Instruction::from_id(&ctx, v);
+
+        match v.mnemonic() {
+            Mnemonic::Binop(Binary {
+                op: Binop::Int(op), ..
+            }) => assert_eq!(*op, IntBinop::LessEqual),
+            _ => panic!("expected i32 integer binop instruction, found {}", v),
+        }
+
+        assert_eq!(v.size(), 1);
+        assert_eq!(v.as_statement().to_string(), "i8 %v = 0x2 <= i32 %v0;");
     }
 
     #[test]
     fn test_bool_xor_from_qcode() {
-        assert_bool_binop!("{v0} ^^ {v1}", BoolBinop::Xor);
+        let mut ctx = Context::new();
+
+        qcode!(
+            ctx,
+            "
+            <block>
+                local i8 V0;
+                local i8 V1;
+                %v0 = load(i8, V0);
+                %v1 = load(i8, V1);
+                %v = %v0 ^^ %v1;
+                goto <0x1001>;
+            "
+        );
+
+        let v = Instruction::from_id(&ctx, v);
+
+        match v.mnemonic() {
+            Mnemonic::Binop(Binary {
+                op: Binop::Bool(op),
+                ..
+            }) => assert_eq!(*op, BoolBinop::Xor),
+            _ => panic!("expected boolean binop instruction"),
+        }
+
+        assert_eq!(v.size(), 1);
     }
 
     #[test]
     fn test_bool_and_from_qcode() {
-        assert_bool_binop!("{v0} && {v1}", BoolBinop::And);
+        let mut ctx = Context::new();
+
+        qcode!(
+            ctx,
+            "
+            <block>
+                local i8 V0;
+                local i8 V1;
+                %v0 = load(i8, V0);
+                %v1 = load(i8, V1);
+                %v = %v0 && %v1;
+                goto <0x1001>;
+            "
+        );
+
+        let v = Instruction::from_id(&ctx, v);
+
+        match v.mnemonic() {
+            Mnemonic::Binop(Binary {
+                op: Binop::Bool(op),
+                ..
+            }) => assert_eq!(*op, BoolBinop::And),
+            _ => panic!("expected boolean binop instruction"),
+        }
+
+        assert_eq!(v.size(), 1);
     }
 
     #[test]
     fn test_bool_or_from_qcode() {
-        assert_bool_binop!("{v0} || {v1}", BoolBinop::Or);
+        let mut ctx = Context::new();
+
+        qcode!(
+            ctx,
+            "
+            <block>
+                local i8 V0;
+                local i8 V1;
+                %v0 = load(i8, V0);
+                %v1 = load(i8, V1);
+                %v = %v0 || %v1;
+                goto <0x1001>;
+            "
+        );
+
+        let v = Instruction::from_id(&ctx, v);
+
+        match v.mnemonic() {
+            Mnemonic::Binop(Binary {
+                op: Binop::Bool(op),
+                ..
+            }) => assert_eq!(*op, BoolBinop::Or),
+            _ => panic!("expected boolean binop instruction"),
+        }
+
+        assert_eq!(v.size(), 1);
     }
 
     #[test]
-    #[should_panic(expected = "qcode size mismatch for value")]
+    #[should_panic(expected = "qcode size mismatch")]
     fn test_explicit_capture_size_mismatch_panics() {
         let mut ctx = Context::new();
-        let mut builder = Builder::from_context(&mut ctx, 0x1000);
 
-        qcode!(builder, "local i32 v0 as V0");
-        let _ = qcode!(builder, "i16 {v0} + i16 0x2");
+        qcode!(
+            ctx,
+            "
+            <block>
+                local i32 V0;
+                %v0 = load(i32, V0);
+                %v = i16 %v0 + i16 0x2;
+                goto <0x1001>;
+            "
+        );
     }
 
     #[test]
     #[should_panic(expected = "qcode size mismatch in binary expression: lhs=4 rhs=2")]
     fn test_binary_operand_size_mismatch_panics() {
         let mut ctx = Context::new();
-        let mut builder = Builder::from_context(&mut ctx, 0x1000);
 
-        qcode!(builder, "local i32 v0 as V0");
-        let _ = qcode!(builder, "i32 {v0} + i16 0x2");
+        qcode!(
+            ctx,
+            "
+            <block>
+                local i32 V0;
+                %v0 = load(i32, V0);
+                %v = i32 %v0 + i16 0x2;
+                goto <0x1001>;
+            "
+        );
     }
 }

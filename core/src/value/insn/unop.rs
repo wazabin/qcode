@@ -92,9 +92,8 @@ mod tests {
     use qcode_macro::qcode;
 
     use crate::{
-        builder::Builder,
         value::Value,
-        value::insn::{Instruction, InstructionId, Mnemonic},
+        value::insn::{Instruction, Mnemonic},
     };
 
     use super::*;
@@ -104,19 +103,22 @@ mod tests {
     #[test]
     fn test_bool_not_from_qcode() {
         let mut ctx = Context::new();
-        let mut builder = Builder::from_context(&mut ctx, 0x1000);
+        qcode!(
+            ctx,
+            "
+            <block>
+                local i32 v0;
+                %v = !%v0;
+                goto <0x1001>;
+            "
+        );
 
-        qcode!(builder, "local i32 v0 as V0");
-        let v1: InstructionId = qcode!(builder, "!{v0}");
-        builder.finalize(0x1001);
+        let v = Instruction::from_id(&ctx, v);
 
-        match ctx.values.instructions[v1].clone() {
-            Instruction {
-                mnemonic: Mnemonic::Unop(Unary { op, src }),
-                ..
-            } => {
-                assert_eq!(op, Unop::BoolNot);
-                assert_eq!(ctx.get_value(src).size(), 4);
+        match v.mnemonic() {
+            Mnemonic::Unop(Unary { op, src }) => {
+                assert_eq!(*op, Unop::BoolNot);
+                assert_eq!(ctx.get_value(*src).size(), 4);
             }
             _ => panic!("expected boolean unop instruction"),
         }
