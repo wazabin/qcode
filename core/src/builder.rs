@@ -67,6 +67,8 @@ pub struct Builder<'str, 'ctx> {
     /// If it is not the case, the block might be invalid
     pub(crate) is_terminated: bool,
 
+    pub built_instructions: Vec<InstructionId>,
+
     verify_terminated: bool,
 }
 
@@ -92,6 +94,7 @@ impl<'str, 'ctx> Builder<'str, 'ctx> {
             is_terminated: block.is_terminated(),
             verify_terminated: true,
             block,
+            built_instructions: Vec::new(),
             namespace: HashMap::new(),
             local_labels: HashMap::new(),
         }
@@ -243,6 +246,7 @@ impl<'str, 'ctx> Builder<'str, 'ctx> {
 
         let id = InstructionRef::from_mnemonic(self.context_mut(), mnemonic, size).id;
         self.block.push_insn(id);
+        self.built_instructions.push(id);
         self.context().get_insn(id)
     }
 
@@ -312,11 +316,14 @@ impl<'str, 'ctx> Builder<'str, 'ctx> {
 
     /// If this block is not terminated, add a jump to the given address as a terminator instruction.
     /// The builder is now safe to drop without panicking, and the block is properly terminated.
-    pub fn finalize(mut self, addr: u64) {
+    /// Returns the instructions built by the builder.
+    pub fn finalize(mut self, addr: u64) -> Vec<InstructionId> {
         if !self.block.is_terminated() {
             let target = self.get_or_make_block(addr);
             self.push_branch(target);
         }
+
+        self.built_instructions.clone()
     }
 
     /// Ensures an operand is not a varnode.
@@ -1040,5 +1047,23 @@ mod tests {
 
         assert_eq!(ptr.size(), 8);
         assert_eq!(ptr.name(), Some("PTR"));
+    }
+
+    #[test]
+    fn test_builder_adds_block_address_to_qcode() {
+        let mut ctx = Context::new();
+        let id_42 = ctx.get_const(42, 8).id();
+
+        let not_insn_id = {
+            let mut builder = Builder::from_context(&mut ctx, 0x1000);
+            let not_insn_id = builder.push_bool_not(id_42).id;
+            builder.finalize(0x1001);
+
+            not_insn_id
+        };
+
+        let insn = Instruction::from_id(&ctx, not_insn_id);
+
+        assert_eq!(insn.address().unwrap(), 0x1000);
     }
 }

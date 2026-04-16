@@ -58,6 +58,9 @@ pub struct Instruction<'str> {
     /// Instructions that are not part of any block (e.g. lifted from data sections) have `None` here.
     pub(crate) parent: Option<BlockId>,
 
+    // Address of the binary instruction
+    address: Option<u64>,
+
     _marker: std::marker::PhantomData<&'str ()>,
 }
 
@@ -68,6 +71,7 @@ impl<'str> Instruction<'str> {
             parent: None,
             size,
             mnemonic,
+            address: None,
             _marker: std::marker::PhantomData,
         }
     }
@@ -128,6 +132,11 @@ where
     /// The mnemonic of the instruction
     pub fn mnemonic(&'s self) -> &'ctx Mnemonic {
         &self.inner().mnemonic
+    }
+
+    /// The address of the corresponding instruction
+    pub fn address(&'s self) -> Option<u64> {
+        self.inner().address
     }
 
     /// The opcode for this instruction
@@ -204,6 +213,14 @@ impl<'str, 'ctx> InstructionMutRef<'str, 'ctx> {
 
     pub fn mnemonic_mut(&mut self) -> &mut Mnemonic {
         &mut self.inner_mut().mnemonic
+    }
+
+    pub fn address_mut(&mut self) -> &mut Option<u64> {
+        &mut self.inner_mut().address
+    }
+
+    pub fn set_address(&mut self, address: u64) {
+        *self.address_mut() = Some(address);
     }
 }
 
