@@ -345,7 +345,6 @@ pub(crate) fn compile_qcode_from_statements(
         for statement in statements {
             let Statement::LocalDecl {
                 name,
-                display_name,
                 size_bytes,
                 ..
             } = statement
@@ -357,7 +356,7 @@ pub(crate) fn compile_qcode_from_statements(
             let size = *size_bytes;
             emitted.push(quote! {
                 let #ident = (#builder)
-                    .make_named_temp(::std::borrow::Cow::Borrowed(#display_name), #size);
+                    .make_named_temp(::std::borrow::Cow::Borrowed(#name), #size);
             });
         }
 
@@ -389,7 +388,6 @@ pub(crate) fn compile_qcode_from_statements(
         match statement {
             Statement::LocalDecl {
                 name,
-                display_name,
                 size_bytes,
                 ..
             } => {
@@ -397,7 +395,7 @@ pub(crate) fn compile_qcode_from_statements(
                 let size = *size_bytes;
                 emitted.push(quote! {
                     let #ident = __qcode_builder
-                        .make_named_temp(Cow::Borrowed(#display_name), #size);
+                        .make_named_temp(Cow::Borrowed(#name), #size);
                 });
                 locals.insert(name.clone(), ident);
                 final_expr = None;
@@ -581,7 +579,6 @@ fn emit_statement(
     match statement {
         Statement::LocalDecl {
             name,
-            display_name,
             size_bytes,
             ..
         } => {
@@ -590,7 +587,7 @@ fn emit_statement(
             let size = *size_bytes;
             emitted.push(quote! {
                 let #ident = __qcode_builder
-                    .make_named_temp(Cow::Borrowed(#display_name), #size);
+                    .make_named_temp(Cow::Borrowed(#name), #size);
                 #outer_ident = #ident;
             });
             locals.insert(name.clone(), ident);

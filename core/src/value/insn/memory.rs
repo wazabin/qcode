@@ -27,6 +27,7 @@ impl MnemonicKind for Load {
             "*[{}]:{} {};",
             ctx.get_space(self.space)
                 .name
+                .as_deref()
                 .unwrap_or(&format!("space: {}", self.space)),
             self.size,
             ctx.get_value(self.ptr)
@@ -86,6 +87,7 @@ impl MnemonicKind for Store {
             "*[{}]:{} {} = {};",
             ctx.get_space(self.space)
                 .name
+                .as_deref()
                 .unwrap_or(&format!("space: {}", self.space)),
             self.size,
             ctx.get_value(self.ptr),
@@ -131,10 +133,7 @@ mod tests {
         }
 
         assert_eq!(v.size(), 4);
-        assert_eq!(
-            v.as_statement().to_string(),
-            "i32 %v = *[space: 1]:4 i32 %ptr;"
-        );
+        assert_eq!(v.as_statement().to_string(), "i32 %v = *[ram]:4 i32 %ptr;");
     }
 
     #[test]
@@ -161,10 +160,7 @@ mod tests {
         }
 
         assert_eq!(store.size(), 0);
-        assert_eq!(
-            store.as_statement().to_string(),
-            "*[space: 1]:4 i32 %ptr = 0x7;"
-        );
+        assert_eq!(store.as_statement().to_string(), "*[ram]:4 i32 %ptr = 0x7;");
     }
 
     #[test]

@@ -6,7 +6,7 @@
 //! The basic unit for a space is a byte. This can be changed by setting the
 //! space's *word size* (bytes per addressable unit)
 //! and *address size* (bytes needed to hold a pointer into the space).
-use std::fmt::Display;
+use std::{borrow::Cow, fmt::Display};
 
 use jstd::Identifier;
 
@@ -36,7 +36,7 @@ pub enum SpaceType {
 #[derive(Debug, Clone)]
 pub struct Space<'a> {
     /// Optional human-readable name (e.g. `"ram"`, `"register"`).
-    pub name: Option<&'a str>,
+    pub name: Option<Cow<'a, str>>,
 
     /// The size of a memory location with a single address in this space, in bytes.
     pub word_size: usize,
@@ -53,7 +53,7 @@ impl<'str> Space<'str> {
     /// word size, and address size.
     pub fn new(name: Option<&'str str>, word_size: usize, addr_size: usize) -> Self {
         Self {
-            name,
+            name: name.map(Cow::Borrowed),
             word_size,
             addr_size,
             ty: SpaceType::Ram,
@@ -63,7 +63,7 @@ impl<'str> Space<'str> {
 
 impl Display for Space<'_> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        if let Some(name) = self.name {
+        if let Some(name) = &self.name {
             write!(f, "{}", name)
         } else {
             write!(f, "space")

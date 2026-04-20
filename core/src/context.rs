@@ -79,7 +79,7 @@ impl<'str> Context<'str> {
         // SPACE_CONST = SpaceId(0): virtual space for constant/immediate values
         ctx.spaces.push(Space::new(Some("const"), 1, 8));
         // default RAM space (SpaceId(1)); temp spaces start at SpaceId(2)
-        let default_space = Space::new(None, 1, 8);
+        let default_space = Space::new(Some("ram"), 1, 8);
         ctx.default_space = ctx.spaces.push(default_space);
         ctx
     }

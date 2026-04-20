@@ -16,8 +16,8 @@ use std::borrow::Cow;
 use jstd::{Identifier, registry::Identified};
 
 use crate::{
-    error::Result,
     context::Context,
+    error::Result,
     space::{Space, SpaceId},
     value::{
         Value, ValueId,
@@ -206,5 +206,23 @@ impl<'str, 'ctx> Value<'str, 'ctx> for VarnodeMutRef<'str, 'ctx> {
 impl<'str, 'ctx> Renameable<'str, 'ctx> for VarnodeMutRef<'str, 'ctx> {
     fn rename(&mut self, name: Cow<'str, str>) -> Result<'str, ()> {
         self.rename(name)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use qcode_macro::qcode;
+
+    use super::*;
+    use crate::context::Context;
+
+    #[test]
+    fn varnode_name() {
+        let mut ctx = Context::new();
+        qcode!(ctx, "<block> local i64 ptr; goto <0x1001>;");
+
+        let varnode = Varnode::from_id(&ctx, ptr);
+        assert_eq!(varnode.name(), Some("ptr"));
+        assert_eq!(varnode.space().name.as_deref(), Some("ptr"));
     }
 }

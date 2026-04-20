@@ -301,11 +301,13 @@ impl<'str, 'ctx> Builder<'str, 'ctx> {
     /// This value is a memory value so does not need to follow any SSA rules.
     /// The name is deduplicated with a numeric suffix if already taken in the context.
     pub fn make_named_temp(&mut self, name: Cow<'str, str>, size: usize) -> VarnodeId {
-        let id = self.make_temp(size);
+        let space = self.context_mut().make_temp_space();
+        let id = Varnode::make(self.context_mut(), 0, size, space).id;
         let unique_name = self.context().get_unique_name(name);
         Varnode::from_id_mut(self.context_mut(), id)
-            .rename(unique_name)
+            .rename(unique_name.clone())
             .expect("This name was deduplicated");
+        self.context_mut().spaces[space].name = Some(unique_name);
         id
     }
 
@@ -1033,12 +1035,11 @@ mod tests {
     #[test]
     fn qcode_standalone_local_decl_creates_named_temp() {
         let mut ctx = Context::new();
-        let ptr_id: VarnodeId;
         qcode!(ctx, "<block> local i64 ptr as PTR; goto <0x1001>;");
 
         let ptr = Varnode::from_id(&ctx, ptr);
 
         assert_eq!(ptr.size(), 8);
-        assert_eq!(ptr.name(), Some("PTR"));
+        assert_eq!(ptr.name(), Some("ptr"));
     }
 }
