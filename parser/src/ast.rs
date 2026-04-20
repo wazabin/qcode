@@ -157,5 +157,8 @@ pub struct FnDecl {
 #[derive(Clone, Debug)]
 pub enum Program {
     Statements(Vec<Statement>),
-    Functions(Vec<FnDecl>),
+    Functions {
+        varnodes: Vec<Statement>,
+        fns: Vec<FnDecl>,
+    },
 }

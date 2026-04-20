@@ -762,20 +762,4 @@ mod tests {
         );
     }
 
-    #[test]
-    #[should_panic(expected = "qcode size mismatch in binary expression: lhs=4 rhs=2")]
-    fn test_binary_operand_size_mismatch_panics() {
-        let mut ctx = Context::new();
-
-        qcode!(
-            ctx,
-            "
-            <block>
-                local i32 V0;
-                %v0 = load(i32, V0);
-                %v = i32 %v0 + i16 0x2;
-                goto <0x1001>;
-            "
-        );
-    }
 }

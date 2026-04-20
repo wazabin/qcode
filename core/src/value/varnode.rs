@@ -219,7 +219,7 @@ mod tests {
     #[test]
     fn varnode_name() {
         let mut ctx = Context::new();
-        qcode!(ctx, "<block> local i64 ptr; goto <0x1001>;");
+        qcode!(ctx, "<block> varnode i64 ptr; goto <0x1001>;");
 
         let varnode = Varnode::from_id(&ctx, ptr);
         assert_eq!(varnode.name(), Some("ptr"));

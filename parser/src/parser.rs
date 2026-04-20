@@ -40,10 +40,18 @@ pub fn parse_program(program: &str) -> Result<Program, ParseError> {
 
     let mut fn_decls: Vec<FnDecl> = Vec::new();
     let mut statements: Vec<Statement> = Vec::new();
+    let mut top_varnodes: Vec<Statement> = Vec::new();
     let mut is_fn_program = false;
 
     for pair in root.into_inner() {
         match pair.as_rule() {
+            Rule::top_varnode_list => {
+                for part in pair.into_inner() {
+                    if part.as_rule() == Rule::local_decl {
+                        top_varnodes.push(parse_local_decl(part)?);
+                    }
+                }
+            }
             Rule::fn_decl => {
                 is_fn_program = true;
                 fn_decls.push(parse_fn_decl(pair)?);
@@ -61,7 +69,10 @@ pub fn parse_program(program: &str) -> Result<Program, ParseError> {
     }
 
     if is_fn_program {
-        Ok(Program::Functions(fn_decls))
+        Ok(Program::Functions {
+            varnodes: top_varnodes,
+            fns: fn_decls,
+        })
     } else {
         Ok(Program::Statements(statements))
     }
@@ -636,7 +647,7 @@ mod tests {
     fn stmts(program: &str) -> Vec<Statement> {
         match parse_program(program).expect("parse should succeed") {
             Program::Statements(s) => s,
-            Program::Functions(_) => panic!("expected statements, got functions"),
+            Program::Functions { .. } => panic!("expected statements, got functions"),
         }
     }
 
@@ -684,7 +695,7 @@ mod tests {
 
     #[test]
     fn parses_local_declaration() {
-        let statements = stmts("local i64 ptr; ptr");
+        let statements = stmts("varnode i64 ptr; ptr");
         assert_eq!(statements.len(), 2);
 
         match &statements[0] {
@@ -698,8 +709,8 @@ mod tests {
                 assert_eq!(name, "ptr");
                 assert_eq!(display_name, "ptr");
                 assert_eq!(*size_bytes, 8);
-                assert_eq!(name_span.start.column, 11);
-                assert_eq!(name_span.end.column, 14);
+                assert_eq!(name_span.start.column, 13);
+                assert_eq!(name_span.end.column, 16);
                 assert_eq!(span.start.column, 1);
             }
             _ => panic!("expected local declaration"),
@@ -716,7 +727,7 @@ mod tests {
 
     #[test]
     fn parses_local_declaration_with_display_name() {
-        let statements = stmts("local i64 ptr as PTR; ptr");
+        let statements = stmts("varnode i64 ptr as PTR; ptr");
         assert_eq!(statements.len(), 2);
 
         match &statements[0] {
@@ -1201,10 +1212,10 @@ mod tests {
 
     #[test]
     fn parses_fn_decl() {
-        let program = parse_program("fn f: <entry> local i64 a; goto <done>; <done> a + 1")
+        let program = parse_program("fn f: <entry> varnode i64 a; goto <done>; <done> a + 1")
             .expect("parse should succeed");
         match program {
-            Program::Functions(fns) => {
+            Program::Functions { fns, .. } => {
                 assert_eq!(fns.len(), 1);
                 let f = &fns[0];
                 assert_eq!(f.name, "f");
@@ -1232,10 +1243,10 @@ mod tests {
 
     #[test]
     fn parses_fn_decl_with_address_labels() {
-        let program = parse_program("fn f: <entry> local i64 a; goto <0x1001>")
+        let program = parse_program("fn f: <entry> varnode i64 a; goto <0x1001>")
             .expect("parse should succeed");
         match program {
-            Program::Functions(fns) => {
+            Program::Functions { fns, .. } => {
                 assert_eq!(fns.len(), 1);
                 let f = &fns[0];
                 assert!(matches!(
@@ -1245,6 +1256,20 @@ mod tests {
                         ..
                     }
                 ));
+            }
+            _ => panic!("expected function program"),
+        }
+    }
+
+    #[test]
+    fn parses_top_level_varnode_before_fn() {
+        let program = parse_program("varnode i64 ptr; fn f: <entry> return [ptr]")
+            .expect("parse should succeed");
+        match program {
+            Program::Functions { varnodes, fns } => {
+                assert_eq!(varnodes.len(), 1);
+                assert!(matches!(&varnodes[0], Statement::LocalDecl { name, size_bytes, .. } if name == "ptr" && *size_bytes == 8));
+                assert_eq!(fns.len(), 1);
             }
             _ => panic!("expected function program"),
         }

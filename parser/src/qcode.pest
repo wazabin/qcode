@@ -1,14 +1,15 @@
 WHITESPACE = _{ " " | "\t" | "\r" | "\n" }
 COMMENT    = _{ "#" ~ (!"\n" ~ ANY)* }
 
-program         =  { SOI ~ (fn_decl+ | statement_list?) ~ EOI }
+program         =  { SOI ~ (top_varnode_list? ~ fn_decl+ | statement_list?) ~ EOI }
+top_varnode_list =  { local_decl ~ (";" ~ local_decl)* ~ ";"* }
 fn_decl         =  { "fn" ~ ident ~ ":" ~ fn_body? }
 fn_body         =  { fn_stmt ~ (";" ~ fn_stmt)* ~ ";"* }
 fn_stmt         =  { !("fn" ~ ident ~ ":") ~ compound_stmt }
 statement_list  =  { compound_stmt ~ (";" ~ compound_stmt)* ~ ";"* }
 compound_stmt   =  { label+ ~ inner_stmt? | inner_stmt }
 inner_stmt      =  { local_decl | assignment | terminator | expr }
-local_decl      =  { "local" ~ ty ~ ident ~ ("as" ~ ident)? }
+local_decl      =  { ("varnode" | "local") ~ ty ~ ident ~ ("as" ~ ident)? }
 assignment      =  { assignment_ssa | assignment_plain }
 assignment_ssa  =  { &(ty? ~ ssa_name ~ eq) ~ ty? ~ ssa_name ~ eq ~ expr }
 assignment_plain =  { &(ident ~ eq) ~ ident ~ eq ~ expr }

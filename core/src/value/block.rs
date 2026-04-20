@@ -417,7 +417,6 @@ impl<'str, 'ctx> BlockMutRef<'str, 'ctx> {
 mod tests {
 
     use super::*;
-    use crate::builder::Builder;
     use jstd::graph::Node;
     use qcode_macro::qcode;
 
@@ -442,14 +441,14 @@ mod tests {
     #[test]
     fn test_block_child() {
         let mut ctx = Context::new();
-        let mut builder = Builder::from_context(&mut ctx, 0x1000);
         qcode!(
-            "<entry>
-                    goto <body>;
+            ctx,
+            "
+            <entry>
+                goto <body>;
             <body>
             "
         );
-        builder.finalize(0x1001);
         let entry = BasicBlock::from_name(&ctx, "entry").unwrap();
         let children: Vec<_> = entry
             .children()

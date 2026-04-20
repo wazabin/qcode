@@ -1024,7 +1024,7 @@ mod tests {
     fn qcode_local_decl_creates_named_temp() {
         let mut ctx = Context::new();
 
-        qcode!(ctx, "<block> local i64 ptr; goto <0x1001>;");
+        qcode!(ctx, "<block> varnode i64 ptr; goto <0x1001>;");
 
         let ptr = Varnode::from_id(&ctx, ptr);
 
@@ -1035,7 +1035,18 @@ mod tests {
     #[test]
     fn qcode_standalone_local_decl_creates_named_temp() {
         let mut ctx = Context::new();
-        qcode!(ctx, "<block> local i64 ptr as PTR; goto <0x1001>;");
+        qcode!(ctx, "<block> varnode i64 ptr as PTR; goto <0x1001>;");
+
+        let ptr = Varnode::from_id(&ctx, ptr);
+
+        assert_eq!(ptr.size(), 8);
+        assert_eq!(ptr.name(), Some("ptr"));
+    }
+
+    #[test]
+    fn qcode_varnode_decl_before_entry_block() {
+        let mut ctx = Context::new();
+        qcode!(ctx, "varnode i64 ptr; <block> goto <0x1001>;");
 
         let ptr = Varnode::from_id(&ctx, ptr);
 

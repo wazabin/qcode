@@ -203,15 +203,17 @@ mod tests {
     #[ignore = "WIP: analysis not fully implemented yet"]
     fn test_dead_store_overwritten() {
         // Store to r0 twice — first store is dead.
-        let (ctx, block_id) = build_block(|mut builder| {
-            let rax = builder
-                .context()
-                .get_named("r0")
-                .unwrap()
-                .as_varnode()
-                .unwrap();
-            qcode!("store({rax}, i64 1); store({rax}, i64 2);");
-        });
+        let mut ctx = TestContext::new().ctx;
+        let rax = ctx.get_named("r0").unwrap().as_varnode().unwrap();
+        qcode!(
+            ctx,
+            "
+            <block>
+            store({rax}, i64 1);
+            store({rax}, i64 2);
+            "
+        );
+        let block_id = block;
 
         let dead = dead_reg_insns(&ctx, block_id);
         let store_ids: Vec<_> = BasicBlock::from_id(&ctx, block_id)
@@ -228,15 +230,18 @@ mod tests {
     #[test]
     fn test_store_read_then_overwrite_not_dead() {
         // Store to r0, load r0, store r0 — first store is NOT dead.
-        let (ctx, block_id) = build_block(|mut builder| {
-            let rax = builder
-                .context()
-                .get_named("r0")
-                .unwrap()
-                .as_varnode()
-                .unwrap();
-            qcode!("store({rax}, i64 1); tmp = load(i64, {rax}); store({rax}, i64 2);");
-        });
+        let mut ctx = TestContext::new().ctx;
+        let rax = ctx.get_named("r0").unwrap().as_varnode().unwrap();
+        qcode!(
+            ctx,
+            "
+            <block>
+            store({rax}, i64 1);
+            %tmp = load(i64, {rax});
+            store({rax}, i64 2);
+            "
+        );
+        let block_id = block;
 
         let dead = dead_reg_insns(&ctx, block_id);
 
