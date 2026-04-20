@@ -127,20 +127,8 @@ impl IntBinop {
             IntBinop::Add => a.wrapping_add(b) & mask,
             IntBinop::Sub => a.wrapping_sub(b) & mask,
             IntBinop::Mul => a.wrapping_mul(b) & mask,
-            IntBinop::Div => {
-                if b == 0 {
-                    0
-                } else {
-                    a / b
-                }
-            }
-            IntBinop::Rem => {
-                if b == 0 {
-                    0
-                } else {
-                    a % b
-                }
-            }
+            IntBinop::Div => a.checked_div(b).unwrap_or(0),
+            IntBinop::Rem => a.checked_rem(b).unwrap_or(0),
             IntBinop::Sdiv => {
                 let l = signed_value(a, size);
                 let r = signed_value(b, size);

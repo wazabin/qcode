@@ -51,7 +51,7 @@ mod tests {
         context::Context,
         space::SpaceId,
         testing::TestContext,
-        value::{BlockId, Value, ValueId, insn::PCodeOpId},
+        value::{BlockId, ValueId, insn::PCodeOpId},
     };
 
     fn reg_space(ctx: &Context) -> SpaceId {

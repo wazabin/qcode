@@ -6,7 +6,7 @@ use crate::{
     context::Context,
     error::Result,
     value::{
-        BasicBlock, BlockId, BlockRef, Function, FunctionRef, Value, ValueId,
+        BasicBlock, BlockId, BlockRef, FunctionRef, Value, ValueId,
         util::{
             base_ref::{BaseRef, WithCtx, WithCtxMut},
             named::{Named, Renameable, update_context_name},

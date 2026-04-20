@@ -34,7 +34,6 @@ use std::{borrow::Cow, collections::HashMap};
 
 use crate::{
     context::Context,
-    error::Result,
     space::{SPACE_CONST, SpaceId},
     value::{
         Function, Instruction, Renameable, Value, ValueId, ValueRef,

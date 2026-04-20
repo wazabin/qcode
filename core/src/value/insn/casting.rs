@@ -264,7 +264,7 @@ mod tests {
     fn test_zext_eval() {
         // zero-extend preserves low bytes, masks off anything above dst_size
         assert_eq!(Zext::eval(0xFF, 4), 0xFF);
-        assert_eq!(Zext::eval(0xDEAD_BEEF_FF_FF_FF_FF, 4), 0xFFFF_FFFF);
+        assert_eq!(Zext::eval(0xDEAD_BEEF_FFFF_FFFF, 4), 0xFFFF_FFFF);
         assert_eq!(Zext::eval(0, 8), 0);
     }
 
