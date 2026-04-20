@@ -59,7 +59,11 @@ fn compile_single_fn(
     ctx: &Expr,
     fn_decl: &FnDecl,
     pcode_root: &proc_macro2::TokenStream,
-) -> syn::Result<(Vec<proc_macro2::TokenStream>, Vec<proc_macro2::Ident>, proc_macro2::TokenStream)> {
+) -> syn::Result<(
+    Vec<proc_macro2::TokenStream>,
+    Vec<proc_macro2::Ident>,
+    proc_macro2::TokenStream,
+)> {
     let fn_name_str = &fn_decl.name;
     let fn_ident = format_ident!("{}", fn_name_str);
     let statements = &fn_decl.statements;
@@ -926,7 +930,7 @@ fn lower_expr(
                     let __qcode_ptr = #ptr_tokens;
                     let __qcode_load_space = match __qcode_builder.context().get_value(__qcode_ptr) {
                         #pcode_root::value::ValueRef::Varnode(v) => v.space().id,
-                        _ => #pcode_root::space::SPACE_UNIQUE,
+                        _ => __qcode_builder.context().default_space,
                     };
                     let __qcode_value = __qcode_builder
                         .push_load::<false>(
@@ -955,7 +959,7 @@ fn lower_expr(
                     let __qcode_ptr = #ptr_tokens;
                     let __qcode_src = #src_tokens;
                     __qcode_builder
-                        .push_store(__qcode_src, __qcode_ptr, #pcode_root::space::SPACE_UNIQUE)
+                        .push_store(__qcode_src, __qcode_ptr, __qcode_builder.context().default_space)
                         .id
                 }
             })

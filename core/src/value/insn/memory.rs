@@ -133,7 +133,7 @@ mod tests {
         assert_eq!(v.size(), 4);
         assert_eq!(
             v.as_statement().to_string(),
-            "i32 %v = *[space: 2]:4 i32 %ptr;"
+            "i32 %v = *[space: 1]:4 i32 %ptr;"
         );
     }
 
@@ -163,7 +163,7 @@ mod tests {
         assert_eq!(store.size(), 0);
         assert_eq!(
             store.as_statement().to_string(),
-            "*[space: 2]:4 i32 %ptr = 0x7;"
+            "*[space: 1]:4 i32 %ptr = 0x7;"
         );
     }
 

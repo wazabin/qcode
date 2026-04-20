@@ -621,14 +621,13 @@ impl DomainMemory for EmulatedMemory {
         size: usize,
     ) -> Result<Self::V, EmulatorErrorKind> {
         let addr = addr.value()?;
-        let v = SizedValue::from_bits(
-            self.spaces
-                .get(&space)
-                .ok_or(EmulatorErrorKind::UnknownSpace(space))?
-                .read_u128(addr, size as u64)?,
-            size,
-        );
-        Ok(v)
+        let bits = match self.spaces.get(&space) {
+            Some(s) => s.read_u128(addr, size as u64)?,
+            // Temp spaces (SpaceId >= 2) are per-varnode; uninitialized reads return zero.
+            None if usize::from(space) >= 2 => 0,
+            None => return Err(EmulatorErrorKind::UnknownSpace(space)),
+        };
+        Ok(SizedValue::from_bits(bits, size))
     }
 
     fn write(

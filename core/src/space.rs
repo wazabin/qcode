@@ -17,9 +17,6 @@ pub struct SpaceId(usize);
 /// The const space is used for constant values such as immediate values
 pub const SPACE_CONST: SpaceId = SpaceId(0);
 
-/// The unique space is used for temporary values
-pub const SPACE_UNIQUE: SpaceId = SpaceId(1);
-
 /// The broad category of a memory space.
 #[derive(Debug, Clone)]
 pub enum SpaceType {
