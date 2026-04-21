@@ -231,7 +231,10 @@ mod tests {
 
         let v = Instruction::from_id(&ctx, v);
 
-        assert!(matches!(v.mnemonic(), Mnemonic::IsFloatNaN(IsFloatNaN { .. })));
+        assert!(matches!(
+            v.mnemonic(),
+            Mnemonic::IsFloatNaN(IsFloatNaN { .. })
+        ));
         assert_eq!(v.size(), 1);
         assert_eq!(v.as_statement().to_string(), "i8 %v = nan(i32 %v0);");
     }
@@ -301,7 +304,10 @@ mod tests {
 
         assert!(matches!(v.mnemonic(), Mnemonic::Carry(Carry { .. })));
         assert_eq!(v.size(), 1);
-        assert_eq!(v.as_statement().to_string(), "i8 %v = carry(i32 %v0, i32 %v1);");
+        assert_eq!(
+            v.as_statement().to_string(),
+            "i8 %v = carry(i32 %v0, i32 %v1);"
+        );
     }
 
     #[test]
@@ -325,7 +331,10 @@ mod tests {
 
         assert!(matches!(v.mnemonic(), Mnemonic::SCarry(SCarry { .. })));
         assert_eq!(v.size(), 1);
-        assert_eq!(v.as_statement().to_string(), "i8 %v = scarry(i32 %v0, i32 %v1);");
+        assert_eq!(
+            v.as_statement().to_string(),
+            "i8 %v = scarry(i32 %v0, i32 %v1);"
+        );
     }
 
     #[test]
@@ -349,6 +358,9 @@ mod tests {
 
         assert!(matches!(v.mnemonic(), Mnemonic::SBorrow(SBorrow { .. })));
         assert_eq!(v.size(), 1);
-        assert_eq!(v.as_statement().to_string(), "i8 %v = sborrow(i32 %v0, i32 %v1);");
+        assert_eq!(
+            v.as_statement().to_string(),
+            "i8 %v = sborrow(i32 %v0, i32 %v1);"
+        );
     }
 }

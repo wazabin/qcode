@@ -160,6 +160,13 @@ impl<'str> Context<'str> {
         self.functions()
     }
 
+    pub fn varnodes(&self) -> impl Iterator<Item = VarnodeRef<'str, '_>> + '_ {
+        self.values
+            .varnodes
+            .iter()
+            .map(|v| Varnode::from_id(self, v.id))
+    }
+
     /// Adds a directed edge in the CFG from `from` to `to`.
     pub fn add_cfg_edge(&mut self, from: BlockId, to: BlockId) {
         let edge_id = self.values.edges.push(EdgeData { from, to });

@@ -2,8 +2,8 @@ use crate::ast::{
     Atom, CastOp, ExprNode, FnDecl, Label, Program, SourcePosition, SourceSpan, Statement,
     TypedAtom,
 };
-use pest::iterators::Pair;
 use pest::Parser;
+use pest::iterators::Pair;
 use pest_derive::Parser;
 use std::fmt;
 
@@ -1277,7 +1277,9 @@ mod tests {
         match program {
             Program::Functions { varnodes, fns } => {
                 assert_eq!(varnodes.len(), 1);
-                assert!(matches!(&varnodes[0], Statement::LocalDecl { name, size_bytes, .. } if name == "ptr" && *size_bytes == 8));
+                assert!(
+                    matches!(&varnodes[0], Statement::LocalDecl { name, size_bytes, .. } if name == "ptr" && *size_bytes == 8)
+                );
                 assert_eq!(fns.len(), 1);
             }
             _ => panic!("expected function program"),

@@ -45,7 +45,10 @@ pub(crate) fn compile_fn_program(
     let mut global_locals: HashMap<String, LocalKind> = HashMap::new();
 
     for stmt in top_varnodes {
-        let Statement::LocalDecl { name, size_bytes, .. } = stmt else {
+        let Statement::LocalDecl {
+            name, size_bytes, ..
+        } = stmt
+        else {
             return Err(syn::Error::new(
                 proc_macro2::Span::call_site(),
                 "top-level varnode list may only contain varnode declarations",
@@ -279,7 +282,12 @@ pub(crate) fn compile_qcode_from_statements_ctx(
     let mut locals: HashMap<String, LocalKind> = HashMap::new();
 
     for stmt in preamble_varnodes {
-        let Statement::LocalDecl { name, size_bytes, .. } = stmt else { unreachable!() };
+        let Statement::LocalDecl {
+            name, size_bytes, ..
+        } = stmt
+        else {
+            unreachable!()
+        };
         let ident = format_ident!("__qcode_local_{}", name);
         let outer_ident = format_ident!("{}", name);
         let size = *size_bytes;
@@ -394,9 +402,7 @@ fn emit_statement(
 ) -> syn::Result<()> {
     match statement {
         Statement::LocalDecl {
-            name,
-            size_bytes,
-            ..
+            name, size_bytes, ..
         } => {
             let ident = format_ident!("__qcode_local_{}", name);
             let outer_ident = format_ident!("{}", name);
@@ -485,7 +491,8 @@ fn emit_statement(
             fallthrough,
             ..
         } => {
-            let cond_tokens = lower_atom(condition, None, AtomContext::Arithmetic, locals, pcode_root)?;
+            let cond_tokens =
+                lower_atom(condition, None, AtomContext::Arithmetic, locals, pcode_root)?;
             let target_ts = label_to_block_id(target, pcode_root);
             let fallthrough_ts = label_to_block_id(fallthrough, pcode_root);
             emitted.push(quote! {
@@ -622,9 +629,7 @@ fn lower_expr(
                     if ls != rs {
                         return Err(syn::Error::new(
                             proc_macro2::Span::call_site(),
-                            format!(
-                                "qcode size mismatch: lhs is {ls} bytes, rhs is {rs} bytes"
-                            ),
+                            format!("qcode size mismatch: lhs is {ls} bytes, rhs is {rs} bytes"),
                         ));
                     }
                     false
@@ -635,8 +640,20 @@ fn lower_expr(
             let lhs_size = size_hint_tokens(lhs, locals, pcode_root)?;
             let rhs_size = size_hint_tokens(rhs, locals, pcode_root)?;
 
-            let lhs_tokens = lower_atom(lhs, rhs_size.clone(), AtomContext::Arithmetic, locals, pcode_root)?;
-            let rhs_tokens = lower_atom(rhs, lhs_size.clone(), AtomContext::Arithmetic, locals, pcode_root)?;
+            let lhs_tokens = lower_atom(
+                lhs,
+                rhs_size.clone(),
+                AtomContext::Arithmetic,
+                locals,
+                pcode_root,
+            )?;
+            let rhs_tokens = lower_atom(
+                rhs,
+                lhs_size.clone(),
+                AtomContext::Arithmetic,
+                locals,
+                pcode_root,
+            )?;
 
             let call = match op.as_str() {
                 "+" => quote! { __qcode_builder.push_add(__qcode_lhs, __qcode_rhs).id },
@@ -768,7 +785,8 @@ fn lower_expr(
             let src_size = size_hint_tokens(src, locals, pcode_root)?;
 
             let ptr_tokens = lower_atom(ptr, None, AtomContext::Pointer, locals, pcode_root)?;
-            let src_tokens = lower_atom(src, src_size, AtomContext::Arithmetic, locals, pcode_root)?;
+            let src_tokens =
+                lower_atom(src, src_size, AtomContext::Arithmetic, locals, pcode_root)?;
 
             Ok(quote! {
                 {
@@ -928,7 +946,9 @@ fn lower_atom(
             if !kind.is_varnode() {
                 return Err(syn::Error::new(
                     proc_macro2::Span::call_site(),
-                    format!("'&{name}' is not valid: `&` (addressof) can only be applied to varnodes, but '{name}' is an SSA value"),
+                    format!(
+                        "'&{name}' is not valid: `&` (addressof) can only be applied to varnodes, but '{name}' is an SSA value"
+                    ),
                 ));
             }
             let local_ident = kind.ident();
