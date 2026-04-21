@@ -466,27 +466,63 @@ mod tests {
     #[test]
     fn iter_yields_all_instructions() {
         let mut ctx = Context::new();
-        {
-            let mut b = Builder::from_context(&mut ctx, 0x1000);
-            qcode!(b, "local i64 x");
-            qcode!(b, "local i64 y");
-            qcode!(b, "local i64 ptr");
-            qcode!(b, "return [{ptr}]");
-        }
-        let block = BasicBlock::from_addr(&ctx, 0x1000).unwrap();
+        qcode!(
+            ctx,
+            "
+            varnode i64 X;
+            varnode i64 Y;
+
+            <block>
+                %x = load(i64, &X);
+                %y = load(i64, &Y);
+                %sum = i64 %x + i64 %y;
+                return [i64 0];
+            "
+        );
+
+        let block = BasicBlock::from_id(&ctx, block);
         let count = block.iter().count();
-        assert!(count >= 1, "expected at least one instruction, got {count}");
+        assert_eq!(count, 4);
+
+        let mut iter = block.iter();
+
+        assert_eq!(
+            iter.next().unwrap().as_statement().to_string(),
+            "i64 %x = *[X]:8 X;"
+        );
+        assert_eq!(
+            iter.next().unwrap().as_statement().to_string(),
+            "i64 %y = *[Y]:8 Y;"
+        );
+        assert_eq!(
+            iter.next().unwrap().as_statement().to_string(),
+            "i64 %sum = i64 %x + i64 %y;"
+        );
+        assert_eq!(
+            iter.next().unwrap().as_statement().to_string(),
+            "return [0x0];"
+        );
     }
 
     #[test]
     fn into_iterator_for_block_ref_matches_iter() {
         let mut ctx = Context::new();
-        {
-            let mut b = Builder::from_context(&mut ctx, 0x2000);
-            qcode!(b, "local i64 ptr");
-            qcode!(b, "return [{ptr}]");
-        }
-        let block = BasicBlock::from_addr(&ctx, 0x2000).unwrap();
+
+        qcode!(
+            ctx,
+            "
+            varnode i64 X;
+            varnode i64 Y;
+
+            <block>
+                %x = load(i64, &X);
+                %y = load(i64, &Y);
+                %sum = i64 %x + i64 %y;
+                return [i64 0];
+            "
+        );
+
+        let block = BasicBlock::from_id(&ctx, block);
         let via_iter: Vec<_> = block.iter().map(|i| i.id).collect();
         let via_into: Vec<_> = (&block).into_iter().map(|i| i.id).collect();
         assert_eq!(via_iter, via_into);

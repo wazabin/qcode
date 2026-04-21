@@ -402,7 +402,6 @@ impl<'str, 'ctx> IntoIterator for &'ctx Context<'str> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::builder::Builder;
     use crate::value::{BasicBlock, Function};
     use qcode_macro::qcode;
 
@@ -450,11 +449,17 @@ mod tests {
     #[test]
     fn instructions_iter_yields_all_instructions() {
         let mut ctx = Context::new();
-        {
-            let mut b = Builder::from_context(&mut ctx, 0x1000);
-            qcode!(b, "local i64 ptr");
-            qcode!(b, "return [{ptr}]");
-        }
+
+        qcode!(
+            ctx,
+            "
+            varnode i64 ptr;
+
+            <block>
+                store(&ptr, i64 0x1234);
+                return [ptr];
+            "
+        );
 
         let count = ctx.instructions().count();
         assert!(count >= 1, "expected at least one instruction, got {count}");
