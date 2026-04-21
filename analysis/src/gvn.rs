@@ -108,7 +108,7 @@ fn constant_folding(ctx: &mut Context, m: &Mnemonic) -> Option<ValueId> {
 
                 Binop::Bool(BoolBinop::And) => ((l != 0 && r != 0) as u64, 1),
                 Binop::Bool(BoolBinop::Or) => ((l != 0 || r != 0) as u64, 1),
-                Binop::Bool(BoolBinop::Xor) => (((l != 0) as u64 ^ (r != 0) as u64) as u64, 1),
+                Binop::Bool(BoolBinop::Xor) => (((l != 0) as u64 ^ (r != 0) as u64), 1),
 
                 _ => {
                     return None;

@@ -60,11 +60,6 @@ impl EmulatedSpace {
 
         Ok(res)
     }
-
-    /// Reads a region as a byte vector
-    pub fn read_bytes(&self, addr: u64, size: usize) -> Result<Vec<u8>, EmulatorErrorKind> {
-        self.read(addr, size)
-    }
 }
 
 /// An exclusive region of an emulated space, used for reading/writing a contiguous range of addresses in a space.
@@ -82,19 +77,6 @@ impl<'space> EmulatedSpaceRegion<'space> {
     /// The size of the region in bytes
     pub fn size(&self) -> usize {
         (self.end - self.start) as usize
-    }
-
-    /// Reads a little-endian unsigned integer from the region
-    pub fn read_u128(&self) -> Result<u128, EmulatorErrorKind> {
-        let end = self.start + cmp::min(16, self.size()) as u64;
-        let mut res = 0u128;
-
-        for addr in self.start..end {
-            let byte = self.space.read_byte(addr)?;
-            res |= u128::from(byte) << ((addr - self.start) * 8);
-        }
-
-        Ok(res)
     }
 
     /// Reads a region as a byte vector
@@ -648,6 +630,9 @@ impl DomainMemory for EmulatedMemory {
     }
 }
 
+/// Type alias for an instruction hook function, which is called with the current instruction and emulator state after each instruction is executed.
+type InstructionHook = Box<dyn Fn(&InstructionRef<'_, '_>, &StandaloneEmulator) + Send + Sync>;
+
 /// A lifetime-free emulator that takes `&Context<'_>` explicitly on each call.
 /// Use this when you need to store an emulator without a lifetime (e.g., across an FFI boundary).
 pub struct StandaloneEmulator {
@@ -658,7 +643,7 @@ pub struct StandaloneEmulator {
     /// Call stack maintained by `run_function` (outermost function first).
     pub call_stack: Vec<FunctionId>,
 
-    pub instruction_hook: Option<Box<dyn Fn(&InstructionRef<'_, '_>, &Self) + Send + Sync>>,
+    pub instruction_hook: Option<InstructionHook>,
 }
 
 impl StandaloneEmulator {

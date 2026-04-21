@@ -6,7 +6,7 @@ use crate::{
     error::{Error, ErrorTy, Result},
     space::{Space, SpaceId},
     value::{
-        BasicBlock, Function, FunctionId, Instruction, ValueId, ValueRef,
+        BasicBlock, Function, FunctionId, FunctionRef, Instruction, ValueId, ValueRef,
         block::{BlockId, BlockMutRef, BlockRef, EdgeData, EdgeId, EdgeMutRef, EdgeRef},
         insn::{InstructionId, InstructionRef, PCodeOpId},
         literal::{LiteralId, LiteralRef},
@@ -14,7 +14,10 @@ use crate::{
         varnode::{Varnode, VarnodeId, VarnodeRef, register::RegisterId},
     },
 };
-use jstd::{graph::Graph, registry::Registry};
+use jstd::{
+    graph::Graph,
+    registry::{self, Registry},
+};
 
 /// The central arena that owns all IR state.
 ///
@@ -125,6 +128,36 @@ impl<'str> Context<'str> {
     /// Returns a list of all functions in the context
     pub fn function_ids(&self) -> Vec<FunctionId> {
         self.values.functions.iter().map(|f| f.id).collect()
+    }
+
+    /// Iterates over all the instructions in the context
+    pub fn instructions(&self) -> impl Iterator<Item = InstructionRef<'str, '_>> + '_ {
+        self.values
+            .instructions
+            .iter()
+            .map(|i| Instruction::from_id(self, i.id))
+    }
+
+    /// Iterates over all the blocks in the context
+    pub fn blocks(&self) -> impl Iterator<Item = BlockRef<'str, '_>> + '_ {
+        self.values
+            .basic_blocks
+            .iter()
+            .map(|b| BlockRef::from_id(self, b.id))
+    }
+
+    /// Iterates over all the functions in the context
+    pub fn functions(&self) -> FunctionIter<'str, '_> {
+        FunctionIter {
+            ctx: self,
+            inner: self.values.functions.iter(),
+        }
+    }
+
+    /// Iterates over all the functions in the context
+    /// alias for `functions()`
+    pub fn iter(&self) -> FunctionIter<'str, '_> {
+        self.functions()
     }
 
     /// Adds a directed edge in the CFG from `from` to `to`.
@@ -339,5 +372,91 @@ impl<'str> Graph for Context<'str> {
             .edges
             .iter()
             .map(|edge| EdgeRef::new(self, edge.id))
+    }
+}
+
+pub struct FunctionIter<'str, 'ctx> {
+    ctx: &'ctx Context<'str>,
+    inner: registry::Iter<'ctx, FunctionId, Function<'str>>,
+}
+
+impl<'str, 'ctx> Iterator for FunctionIter<'str, 'ctx> {
+    type Item = FunctionRef<'str, 'ctx>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        self.inner
+            .next()
+            .map(|f| FunctionRef::from_id(self.ctx, f.id))
+    }
+}
+
+impl<'str, 'ctx> IntoIterator for &'ctx Context<'str> {
+    type Item = FunctionRef<'str, 'ctx>;
+    type IntoIter = FunctionIter<'str, 'ctx>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        self.iter()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::builder::Builder;
+    use crate::value::{BasicBlock, Function};
+    use qcode_macro::qcode;
+
+    fn make_fn_with_blocks(ctx: &mut Context<'static>, name: &'static str, n: usize) -> FunctionId {
+        let block_ids: Vec<BlockId> = (0..n).map(|_| BasicBlock::make(ctx).id).collect();
+        let mut f = Function::make(ctx, name.into()).unwrap();
+        for id in block_ids {
+            f.add_block(id);
+        }
+        f.id
+    }
+
+    #[test]
+    fn functions_iter_yields_all_functions() {
+        let mut ctx = Context::new();
+        make_fn_with_blocks(&mut ctx, "alpha", 1);
+        make_fn_with_blocks(&mut ctx, "beta", 1);
+
+        let names: Vec<_> = ctx.functions().map(|f| f.name().to_string()).collect();
+        assert!(names.contains(&"alpha".to_string()));
+        assert!(names.contains(&"beta".to_string()));
+        assert_eq!(names.len(), 2);
+    }
+
+    #[test]
+    fn into_iterator_for_context_matches_functions() {
+        let mut ctx = Context::new();
+        make_fn_with_blocks(&mut ctx, "f1", 1);
+        make_fn_with_blocks(&mut ctx, "f2", 1);
+
+        let via_method: Vec<_> = ctx.functions().map(|f| f.id()).collect();
+        let via_into: Vec<_> = (&ctx).into_iter().map(|f| f.id()).collect();
+        assert_eq!(via_method, via_into);
+    }
+
+    #[test]
+    fn blocks_iter_yields_all_blocks() {
+        let mut ctx = Context::new();
+        make_fn_with_blocks(&mut ctx, "g", 3);
+
+        let count = ctx.blocks().count();
+        assert_eq!(count, 3);
+    }
+
+    #[test]
+    fn instructions_iter_yields_all_instructions() {
+        let mut ctx = Context::new();
+        {
+            let mut b = Builder::from_context(&mut ctx, 0x1000);
+            qcode!(b, "local i64 ptr");
+            qcode!(b, "return [{ptr}]");
+        }
+
+        let count = ctx.instructions().count();
+        assert!(count >= 1, "expected at least one instruction, got {count}");
     }
 }

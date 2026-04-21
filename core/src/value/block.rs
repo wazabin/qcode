@@ -98,21 +98,6 @@ impl<'str> BasicBlock<'str> {
     }
 }
 
-pub struct Iter<'str, 'ctx> {
-    ctx: &'ctx Context<'str>,
-    inner: slice::Iter<'ctx, InstructionId>,
-}
-
-impl<'str, 'ctx> Iterator for Iter<'str, 'ctx> {
-    type Item = InstructionRef<'str, 'ctx>;
-
-    fn next(&mut self) -> Option<Self::Item> {
-        self.inner
-            .next()
-            .map(|id| InstructionRef::new(self.ctx, *id))
-    }
-}
-
 // Shared read-only methods available on both BlockRef and BlockMutRef
 impl<'s, 'ctx: 's, 'str: 'ctx, Ctx> BaseRef<Ctx, BlockId>
 where
@@ -148,12 +133,18 @@ where
     }
 
     /// Iterates over the instructions in this block
-    pub fn iter(&'s self) -> Iter<'str, 'ctx> {
+    pub fn instructions(&'s self) -> InstructionIter<'str, 'ctx> {
         let inner = self.inner();
-        Iter {
+        InstructionIter {
             ctx: self.ctx(),
             inner: inner.instructions.iter(),
         }
+    }
+
+    /// Iterates over the instructions in this block
+    /// alias for `instructions()`
+    pub fn iter(&'s self) -> InstructionIter<'str, 'ctx> {
+        self.instructions()
     }
 
     pub fn instruction_ids(&'s self) -> &'ctx [InstructionId] {
@@ -225,6 +216,30 @@ impl<'str, 'ctx> Value<'str, 'ctx> for BlockRef<'str, 'ctx> {
     }
 }
 
+pub struct InstructionIter<'str, 'ctx> {
+    ctx: &'ctx Context<'str>,
+    inner: slice::Iter<'ctx, InstructionId>,
+}
+
+impl<'str, 'ctx> Iterator for InstructionIter<'str, 'ctx> {
+    type Item = InstructionRef<'str, 'ctx>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        self.inner
+            .next()
+            .map(|id| InstructionRef::new(self.ctx, *id))
+    }
+}
+
+impl<'str, 'ctx> IntoIterator for &BlockRef<'str, 'ctx> {
+    type Item = InstructionRef<'str, 'ctx>;
+    type IntoIter = InstructionIter<'str, 'ctx>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        self.iter()
+    }
+}
+
 pub type BlockMutRef<'str, 'ctx> = BaseRef<&'ctx mut Context<'str>, BlockId>;
 
 impl<'s, 'ctx: 's, 'str: 'ctx> WithCtx<'s, 's, 'str> for BlockMutRef<'str, 'ctx> {
@@ -271,15 +286,6 @@ impl<'str, 'ctx> Value<'str, 'ctx> for BlockMutRef<'str, 'ctx> {
 
     fn size(&self) -> usize {
         0
-    }
-}
-
-impl<'str, 'ctx, 'a> IntoIterator for &'a BlockRef<'str, 'ctx> {
-    type Item = InstructionRef<'str, 'a>;
-    type IntoIter = Iter<'str, 'a>;
-
-    fn into_iter(self) -> Self::IntoIter {
-        self.iter()
     }
 }
 
@@ -455,5 +461,34 @@ mod tests {
             .map(|b| b.node().name().unwrap_or("").to_string())
             .collect();
         assert_eq!(children, ["body"]);
+    }
+
+    #[test]
+    fn iter_yields_all_instructions() {
+        let mut ctx = Context::new();
+        {
+            let mut b = Builder::from_context(&mut ctx, 0x1000);
+            qcode!(b, "local i64 x");
+            qcode!(b, "local i64 y");
+            qcode!(b, "local i64 ptr");
+            qcode!(b, "return [{ptr}]");
+        }
+        let block = BasicBlock::from_addr(&ctx, 0x1000).unwrap();
+        let count = block.iter().count();
+        assert!(count >= 1, "expected at least one instruction, got {count}");
+    }
+
+    #[test]
+    fn into_iterator_for_block_ref_matches_iter() {
+        let mut ctx = Context::new();
+        {
+            let mut b = Builder::from_context(&mut ctx, 0x2000);
+            qcode!(b, "local i64 ptr");
+            qcode!(b, "return [{ptr}]");
+        }
+        let block = BasicBlock::from_addr(&ctx, 0x2000).unwrap();
+        let via_iter: Vec<_> = block.iter().map(|i| i.id).collect();
+        let via_into: Vec<_> = (&block).into_iter().map(|i| i.id).collect();
+        assert_eq!(via_iter, via_into);
     }
 }
