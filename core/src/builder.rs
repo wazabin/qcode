@@ -171,7 +171,7 @@ impl<'str, 'ctx> Builder<'str, 'ctx> {
                         size: range.len(),
                     }),
                     range.len(),
-                    self.value_space_id(src),
+                    ValueRef::from_id(self.context(), src).space().map(|s| s.id),
                 )
                 .into()
             }
@@ -261,12 +261,11 @@ impl<'str, 'ctx> Builder<'str, 'ctx> {
         self.context().get_value(id)
     }
 
-    fn value_space_id(&self, id: ValueId) -> Option<SpaceId> {
-        self.context().value_space_id(id)
-    }
-
     fn merge_space_ids(&self, lhs: ValueId, rhs: ValueId) -> Option<SpaceId> {
-        match (self.value_space_id(lhs), self.value_space_id(rhs)) {
+        match (
+            ValueRef::from_id(self.context(), lhs).space().map(|s| s.id),
+            ValueRef::from_id(self.context(), rhs).space().map(|s| s.id),
+        ) {
             (Some(lhs), Some(rhs)) if lhs == rhs => Some(lhs),
             (Some(space), None) | (None, Some(space)) => Some(space),
             _ => None,
@@ -409,27 +408,36 @@ impl<'str, 'ctx> Builder<'str, 'ctx> {
             // Invariant: if the ptr is a varnode, it must live in the same space as the load.
             // A cross-space access (e.g. *[ram]:8 RSP) requires ensure_local first so that
             // the varnode's *value* is used as the address, not the varnode itself.
-            debug_assert!(
-                match self.context().get_value(src) {
-                    ValueRef::Varnode(v) => v.space().id == space,
-                    _ => true,
-                },
-                "push_load: ptr is a varnode but its space {:?} does not match the load space {:?}; \
-                 call ensure_local on the ptr first",
-                src.as_varnode()
-                    .map(|id| Varnode::from_id(self.context(), id).space().id)
-                    .unwrap(),
-                space,
-            );
+
+            match src {
+                ValueId::Varnode(id) => {
+                    let varnode = Varnode::from_id(self.context(), id);
+                    if varnode.space().id != space {
+                        panic!(
+                            "push_load: ptr is a varnode but its space {:?} does not match the load space {:?}; \
+                             call ensure_local on the ptr first",
+                            varnode.space().id,
+                            space
+                        );
+                    }
+                }
+
+                ValueId::Instruction(id) => {
+                    let mut insn = Instruction::from_id_mut(self.context_mut(), id);
+                    insn.set_space(space);
+                }
+
+                _ => {}
+            }
+
             let size = self.context().get_value(src).size();
-            self.push_instruction_in_space(
+            self.push_instruction(
                 Mnemonic::Load(Load {
                     ptr: src,
                     space,
                     size,
                 }),
                 size,
-                Some(space),
             )
             .into()
         }
@@ -807,6 +815,7 @@ impl<'str, 'ctx> Builder<'str, 'ctx> {
         }
     }
 
+    #[track_caller]
     pub fn push_store(
         &mut self,
         src: ValueId,
@@ -815,7 +824,29 @@ impl<'str, 'ctx> Builder<'str, 'ctx> {
     ) -> InstructionRef<'str, '_> {
         let src = self.ensure_local(src);
         let size = self.context().get_value(src).size();
-        self.push_instruction_in_space(
+
+        match ptr {
+            ValueId::Varnode(id) => {
+                let varnode = Varnode::from_id(self.context(), id);
+                if varnode.space().id != space {
+                    panic!(
+                        "push_store: ptr is a varnode but its space {:?} does not match the store space {:?}; \
+                             call ensure_local on the ptr first",
+                        varnode.space().id,
+                        space
+                    );
+                }
+            }
+
+            ValueId::Instruction(id) => {
+                let mut insn = Instruction::from_id_mut(self.context_mut(), id);
+                insn.set_space(space);
+            }
+
+            _ => {}
+        }
+
+        self.push_instruction(
             Mnemonic::Store(Store {
                 src,
                 ptr,
@@ -823,7 +854,6 @@ impl<'str, 'ctx> Builder<'str, 'ctx> {
                 size,
             }),
             0,
-            Some(space),
         )
     }
 

@@ -20,7 +20,7 @@
 //! arbitrary values (e.g. use-def chains, operand lists) can do so without
 //! generics.
 
-use crate::context::Context;
+use crate::{context::Context, space::SpaceRef};
 use std::fmt::{Debug, Display, Formatter};
 
 pub use block::{BasicBlock, BlockId, BlockMutRef, BlockRef};
@@ -264,6 +264,14 @@ impl<'str, 'ctx> ValueRef<'str, 'ctx> {
 
     pub fn from_id(ctx: &'ctx Context<'str>, id: ValueId) -> Self {
         Self::new(id, ctx)
+    }
+
+    pub fn space(&self) -> Option<SpaceRef<'str, 'ctx>> {
+        match self {
+            ValueRef::Varnode(v) => Some(v.space()),
+            ValueRef::Instruction(i) => i.space(),
+            _ => None,
+        }
     }
 }
 

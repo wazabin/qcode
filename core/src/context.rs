@@ -50,7 +50,7 @@ pub struct Context<'str> {
     pub default_space: SpaceId,
 
     /// A mapping of space ids to their corresponding [`Space`]s.
-    pub spaces: Registry<SpaceId, Space<'str>>,
+    pub(crate) spaces: Registry<SpaceId, Space<'str>>,
 
     /// A mapping of pcode ops to their names
     pub pcode_ops: Registry<PCodeOpId, &'str str>,
@@ -102,6 +102,42 @@ impl<'str> Context<'str> {
             default_space.word_size,
             default_space.addr_size,
         ))
+    }
+
+    /// Adds a space to the context, registering its name if it is borrowed (`&'str str`),
+    /// and returns its ID.
+    pub fn add_space(&mut self, space: Space<'str>) -> SpaceId {
+        let name_key: Option<&'str str> = match &space.name {
+            Some(Cow::Borrowed(s)) => Some(s),
+            _ => None,
+        };
+        let id = self.spaces.push(space);
+        if let Some(name) = name_key {
+            self.named_spaces.insert(name, id);
+        }
+        id
+    }
+
+    /// Returns the number of spaces registered in this context.
+    pub fn space_count(&self) -> usize {
+        self.spaces.len()
+    }
+
+    /// Replaces the spaces registry wholesale. Intended for initialization from a pre-built spec.
+    pub fn load_spaces(&mut self, spaces: registry::Registry<SpaceId, Space<'str>>) {
+        self.spaces = spaces;
+    }
+
+    /// Creates a new named temporary address space and returns its ID.
+    pub fn make_named_temp_space(&mut self, name: Cow<'str, str>) -> SpaceId {
+        let default_space = &self.spaces[self.default_space];
+        let (word_size, addr_size) = (default_space.word_size, default_space.addr_size);
+        self.spaces.push(Space {
+            name: Some(name),
+            word_size,
+            addr_size,
+            ty: crate::space::SpaceType::Ram,
+        })
     }
 
     /// Returns the [`BlockId`] for a block at `addr`, creating one if needed.
@@ -195,20 +231,6 @@ impl<'str> Context<'str> {
     /// Panics if `id` does not correspond to a value stored in this context.
     pub fn get_value(&self, id: ValueId) -> ValueRef<'str, '_> {
         ValueRef::new(id, self)
-    }
-
-    /// Returns the address-space ID associated with a value, if known.
-    pub fn value_space_id(&self, id: ValueId) -> Option<SpaceId> {
-        match self.get_value(id) {
-            ValueRef::Varnode(v) => Some(v.space().id),
-            ValueRef::Instruction(i) => i.space_id(),
-            _ => None,
-        }
-    }
-
-    /// Returns the [`Space`] identified by `id`.
-    pub fn get_space(&self, id: SpaceId) -> &Space<'str> {
-        &self.spaces[id]
     }
 
     /// Creates a [`Value`] representing a constant value.

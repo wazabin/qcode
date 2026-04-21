@@ -62,13 +62,12 @@ pub(crate) fn compile_fn_program(
             let #ident = {
                 use ::std::borrow::Cow;
                 use #pcode_root::value::Renameable as _;
-                let __space = (#ctx).make_temp_space();
-                let __id = #pcode_root::value::Varnode::make(&mut (#ctx), 0, #size, __space).id;
                 let __name = (#ctx).get_unique_name(Cow::Borrowed(#name));
+                let __space = (#ctx).make_named_temp_space(__name.clone());
+                let __id = #pcode_root::value::Varnode::make(&mut (#ctx), 0, #size, __space).id;
                 #pcode_root::value::Varnode::from_id_mut(&mut (#ctx), __id)
-                    .rename(__name.clone())
+                    .rename(__name)
                     .expect("qcode: varnode name conflict");
-                (#ctx).spaces[__space].name = Some(__name);
                 __id
             };
             #outer_ident = #ident;
@@ -296,13 +295,12 @@ pub(crate) fn compile_qcode_from_statements_ctx(
             let #ident = {
                 use ::std::borrow::Cow;
                 use #pcode_root::value::Renameable as _;
-                let __space = (#ctx).make_temp_space();
-                let __id = #pcode_root::value::Varnode::make(&mut (#ctx), 0, #size, __space).id;
                 let __name = (#ctx).get_unique_name(Cow::Borrowed(#name));
+                let __space = (#ctx).make_named_temp_space(__name.clone());
+                let __id = #pcode_root::value::Varnode::make(&mut (#ctx), 0, #size, __space).id;
                 #pcode_root::value::Varnode::from_id_mut(&mut (#ctx), __id)
-                    .rename(__name.clone())
+                    .rename(__name)
                     .expect("qcode: varnode name conflict");
-                (#ctx).spaces[__space].name = Some(__name);
                 __id
             };
             #outer_ident = #ident;
@@ -761,9 +759,12 @@ fn lower_expr(
             Ok(quote! {
                 {
                     let __qcode_ptr = #ptr_tokens;
-                    let __qcode_load_space = __qcode_builder
-                        .context()
-                        .value_space_id(__qcode_ptr)
+                    let __qcode_load_space = #pcode_root::value::ValueRef::from_id(
+                            __qcode_builder.context(),
+                            __qcode_ptr,
+                        )
+                        .space()
+                        .map(|s| s.id)
                         .unwrap_or(__qcode_builder.context().default_space);
                     let __qcode_value = __qcode_builder
                         .push_load::<false>(
@@ -792,9 +793,12 @@ fn lower_expr(
                 {
                     let __qcode_ptr = #ptr_tokens;
                     let __qcode_src = #src_tokens;
-                    let __qcode_store_space = __qcode_builder
-                        .context()
-                        .value_space_id(__qcode_ptr)
+                    let __qcode_store_space = #pcode_root::value::ValueRef::from_id(
+                            __qcode_builder.context(),
+                            __qcode_ptr,
+                        )
+                        .space()
+                        .map(|s| s.id)
                         .unwrap_or(__qcode_builder.context().default_space);
                     __qcode_builder
                         .push_store(__qcode_src, __qcode_ptr, __qcode_store_space)

@@ -8,7 +8,9 @@
 //! and *address size* (bytes needed to hold a pointer into the space).
 use std::{borrow::Cow, fmt::Display};
 
-use jstd::Identifier;
+use jstd::{Identifier, registry::Identified};
+
+use crate::context::Context;
 
 /// A stable, context-unique identifier for a [`Space`].
 #[derive(Identifier)]
@@ -27,6 +29,8 @@ pub enum SpaceType {
     /// Processor registers
     Register,
 }
+
+pub type SpaceRef<'str, 'ctx> = Identified<SpaceId, &'ctx Space<'str>>;
 
 /// A named, uniformly-addressed memory region.
 ///
@@ -58,6 +62,11 @@ impl<'str> Space<'str> {
             addr_size,
             ty: SpaceType::Ram,
         }
+    }
+
+    /// Builds a space from an id
+    pub fn from_id<'ctx>(ctx: &'ctx Context<'str>, id: SpaceId) -> SpaceRef<'str, 'ctx> {
+        SpaceRef::new(id, &ctx.spaces[id])
     }
 }
 

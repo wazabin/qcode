@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 
-use qcode::value::ValueId;
+use qcode::{context::Context, value::ValueId};
 
 mod anderson;
 mod simple;
@@ -33,7 +33,16 @@ impl AliasResult {
     /// Returns `true` if `a` and `b` share a class, or if either is
     /// `NodeId::Unknown`. Returns `false` if either value was never
     /// involved in any constraint (isolated - no alias relationship).
-    pub fn may_alias(&self, a: ValueId, b: ValueId) -> bool {
+    pub fn may_alias(&self, ctx: &Context, a: ValueId, b: ValueId) -> bool {
+        // If a and b don't share the same address space they can't alias.
+        let a_space = ctx.get_value(a).space().map(|s| s.id);
+        let b_space = ctx.get_value(b).space().map(|s| s.id);
+        if let (Some(sa), Some(sb)) = (a_space, b_space)
+            && sa != sb
+        {
+            return false;
+        }
+
         match (self.alias_class(a), self.alias_class(b)) {
             (None, _) | (_, None) => false,
             (Some(NodeId::Unknown), _) | (_, Some(NodeId::Unknown)) => true,

@@ -5,7 +5,7 @@
 use crate::{
     context::Context,
     error::Result,
-    space::{Space, SpaceId},
+    space::{Space, SpaceId, SpaceRef, SpaceType},
     value::{
         BasicBlock, BlockId, BlockRef, FunctionRef, Value, ValueId,
         util::{
@@ -136,12 +136,8 @@ where
     }
 
     /// The address-space provenance for this instruction's result, if known.
-    pub fn space(&'s self) -> Option<&'ctx Space<'str>> {
-        self.inner().space.map(|id| self.ctx().get_space(id))
-    }
-
-    pub(crate) fn space_id(&'s self) -> Option<SpaceId> {
-        self.inner().space
+    pub fn space(&'s self) -> Option<SpaceRef<'str, 'ctx>> {
+        self.inner().space.map(|id| Space::from_id(self.ctx(), id))
     }
 
     /// The opcode for this instruction
@@ -173,12 +169,16 @@ impl<'str, 'ctx> InstructionRef<'str, 'ctx> {
         Self::from_mnemonic_with_space(ctx, mnemonic, size, None)
     }
 
+    // Pointer arithmetic is not allowed in the register space
     pub fn from_mnemonic_with_space(
         ctx: &'ctx mut Context<'str>,
         mnemonic: Mnemonic,
         size: usize,
         space: Option<SpaceId>,
     ) -> Self {
+        // Pointer arithmetic is not allowed in the register space
+        let space =
+            space.filter(|&space| !matches!(Space::from_id(ctx, space).ty, SpaceType::Register));
         let insn = Instruction::new(size, mnemonic, space);
         let id = ctx.values.push_insn(insn);
         Self::from_id(ctx, id)
@@ -227,6 +227,19 @@ impl<'str, 'ctx> InstructionMutRef<'str, 'ctx> {
 
     pub fn mnemonic_mut(&mut self) -> &mut Mnemonic {
         &mut self.inner_mut().mnemonic
+    }
+
+    pub fn set_space(&mut self, space: SpaceId) {
+        if self.inner().space.is_some_and(|s| s != space) {
+            panic!(
+                "Cannot change space of instruction {} from {:?} to {:?}",
+                self,
+                self.inner().space.map(|s| Space::from_id(self.ctx, s)),
+                Space::from_id(self.ctx, space)
+            );
+        }
+
+        self.inner_mut().space = Some(space);
     }
 }
 

@@ -184,7 +184,7 @@ fn gvn_block_inner(
                 let store_ptr = store.ptr;
                 table.retain(|k, _| {
                     if let Mnemonic::Load(load) = k {
-                        aliases.is_some_and(|aliases| !aliases.may_alias(store_ptr, load.ptr))
+                        aliases.is_some_and(|aliases| !aliases.may_alias(ctx, store_ptr, load.ptr))
                     } else {
                         true
                     }
@@ -507,7 +507,7 @@ mod tests {
                 goto <0x1001>;"
         );
 
-        let aliases = AliasResult::from_space_ids(&ctx);
+        let aliases = AliasResult::simple(&ctx);
 
         let mut block = BasicBlock::from_id_mut(&mut ctx, block);
 

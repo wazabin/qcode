@@ -2,29 +2,24 @@ use std::collections::HashMap;
 
 use qcode::{
     context::Context,
-    space::{SpaceId, SpaceType},
+    space::SpaceId,
     value::{
-        insn::{Binop, IntBinop, Mnemonic},
         ValueId, ValueRef, Varnode,
+        insn::{Binop, IntBinop, Mnemonic},
     },
 };
 
 use super::{AliasResult, NodeId};
 
 #[derive(Clone, Copy)]
-struct SizedVarnode {
+struct SizedNode {
     root: NodeId,
     start: u64,
     end: u64,
 }
 
-#[derive(Clone, Copy)]
-struct SizedRoot {
-    root: NodeId,
-    start: u64,
-    end: u64,
-}
-
+/// Union-find with union-by-rank and half-path-compression (path splitting).
+/// https://en.wikipedia.org/wiki/Disjoint-set_data_structure
 struct UnionFind {
     parent: Vec<usize>,
     rank: Vec<u8>,
@@ -56,6 +51,7 @@ impl UnionFind {
                 return NodeId::Id(idx);
             }
 
+            // Path splitting: point each node to its grandparent on the way up.
             let grandparent = self.parent[parent];
             self.parent[idx] = grandparent;
             idx = parent;
@@ -70,66 +66,180 @@ impl UnionFind {
             return ra;
         }
 
+        // Either operand being Unknown propagates: Unknown aliases everything.
         let (NodeId::Id(ra), NodeId::Id(rb)) = (ra, rb) else {
             return NodeId::Unknown;
         };
 
-        let (winner, loser) = if self.rank[ra] >= self.rank[rb] {
+        let (ra, rb) = if self.rank[ra] >= self.rank[rb] {
             (ra, rb)
         } else {
             (rb, ra)
         };
 
-        self.parent[loser] = winner;
-        if self.rank[winner] == self.rank[loser] {
-            self.rank[winner] += 1;
+        self.parent[rb] = ra;
+        if self.rank[ra] == self.rank[rb] {
+            self.rank[ra] += 1;
         }
 
-        NodeId::Id(winner)
+        NodeId::Id(ra)
+    }
+}
+
+/// Mutable scratch state threaded through the analysis passes.
+struct Analysis<'a> {
+    ctx: &'a Context<'a>,
+
+    /// Maps each tracked value to its equivalence-class root.
+    value_to_root: HashMap<ValueId, NodeId>,
+
+    /// All varnodes in each address space, sorted by address (populated once, then read-only).
+    by_space: HashMap<SpaceId, Vec<SizedNode>>,
+
+    /// Literal-pointer ranges encountered during pointer resolution; grows as loads/stores are processed.
+    literal_ranges: HashMap<SpaceId, Vec<SizedNode>>,
+
+    uf: UnionFind,
+}
+
+impl<'a> Analysis<'a> {
+    fn canonical_root(&mut self, root: NodeId) -> NodeId {
+        match root {
+            NodeId::Unknown => NodeId::Unknown,
+            NodeId::Id(_) => self.uf.find_mut(root),
+        }
+    }
+
+    fn lookup_root(&mut self, value: ValueId) -> Option<NodeId> {
+        let root = *self.value_to_root.get(&value)?;
+        Some(self.canonical_root(root))
+    }
+
+    fn set_value_root(&mut self, value: ValueId, root: NodeId) {
+        match self.value_to_root.get_mut(&value) {
+            // Merge with the existing class; either Unknown wins.
+            Some(existing) => {
+                let new_root = match (*existing, root) {
+                    (NodeId::Unknown, _) | (_, NodeId::Unknown) => NodeId::Unknown,
+                    (a, b) => self.uf.join(a, b),
+                };
+                *existing = new_root;
+            }
+            None => {
+                self.value_to_root.insert(value, root);
+            }
+        }
+    }
+
+    /// Assigns a union-find root to `literal` as a pointer into `space`, merging it
+    /// with any varnode or previously-seen literal range whose address interval overlaps.
+    fn assign_literal_root(&mut self, literal: ValueId, space: SpaceId, size: usize) -> NodeId {
+        let Some((start, end)) = literal_interval(self.ctx, literal, size) else {
+            return NodeId::Unknown;
+        };
+
+        let root_opt = self.lookup_root(literal);
+        let mut root = root_opt.unwrap_or_else(|| self.uf.alloc_node());
+
+        // Merge with any varnode whose range overlaps this literal's interval.
+        // We call self.uf.find_mut directly (rather than self.canonical_root) so
+        // the borrow checker can see that self.by_space and self.uf are disjoint fields.
+        if let Some(varnodes) = self.by_space.get(&space) {
+            for varnode in varnodes.iter().copied() {
+                if overlaps(start, end, varnode.start, varnode.end) {
+                    let varnode_root = self.uf.find_mut(varnode.root);
+                    root = self.uf.join(root, varnode_root);
+                }
+            }
+        }
+
+        // Merge with any previously-registered literal range that overlaps.
+        if let Some(ranges) = self.literal_ranges.get(&space) {
+            for range in ranges.iter().copied() {
+                if overlaps(start, end, range.start, range.end) {
+                    let range_root = self.uf.find_mut(range.root);
+                    root = self.uf.join(root, range_root);
+                }
+            }
+        }
+
+        self.literal_ranges
+            .entry(space)
+            .or_default()
+            .push(SizedNode { root, start, end });
+
+        root
+    }
+
+    /// Recursively resolves the alias root for a pointer value used in a load/store.
+    ///
+    /// * Varnode pointers look up their pre-seeded root.
+    /// * Literal pointers call `assign_literal_root` to track address ranges.
+    /// * Add/Sub instructions peel off the non-pointer operand and recurse on the
+    ///   pointer-typed side; anything else is unresolvable.
+    fn resolve_pointer_root(&mut self, value: ValueId, space: SpaceId, size: usize) -> NodeId {
+        match value {
+            ValueId::Varnode(id) => {
+                let varnode_space_id = Varnode::from_id(self.ctx, id).space().id;
+                assert_eq!(
+                    varnode_space_id, space,
+                    "load/store pointer varnodes must stay in the access space; \
+                     builder.rs::push_load documents this IR invariant"
+                );
+
+                let root = self.lookup_root(value);
+                root.unwrap_or(NodeId::Unknown)
+            }
+
+            ValueId::Literal(_) => self.assign_literal_root(value, space, size),
+
+            ValueId::Instruction(id) => {
+                // TODO: this should have the same invariant as the varnode case
+                if ValueRef::from_id(self.ctx, value).space().map(|s| s.id) != Some(space) {
+                    return NodeId::Unknown;
+                }
+
+                // Copy out lhs/rhs/op before any recursive &mut self call so the
+                // temporary borrow of self.ctx is released.
+                let binop = match self.ctx.get_insn(id).mnemonic() {
+                    Mnemonic::Binop(bin)
+                        if matches!(bin.op, Binop::Int(IntBinop::Add | IntBinop::Sub)) =>
+                    {
+                        Some((bin.op, bin.lhs, bin.rhs))
+                    }
+                    _ => None,
+                };
+
+                let Some((op, lhs, rhs)) = binop else {
+                    return NodeId::Unknown;
+                };
+
+                let lhs_space = ValueRef::from_id(self.ctx, lhs).space().map(|s| s.id);
+                let rhs_space = ValueRef::from_id(self.ctx, rhs).space().map(|s| s.id);
+
+                if lhs_space == Some(space) && rhs_space != Some(space) {
+                    self.resolve_pointer_root(lhs, space, size)
+                } else if matches!(op, Binop::Int(IntBinop::Add))
+                    && rhs_space == Some(space)
+                    && lhs_space != Some(space)
+                {
+                    self.resolve_pointer_root(rhs, space, size)
+                } else if lhs_space.is_none() && rhs_space.is_none() {
+                    NodeId::Unknown
+                } else {
+                    panic!(
+                        "Odd pointer arithmetic: {value} = {lhs} {op} {rhs} with mismatched spaces {lhs_space:?} vs {rhs_space:?}"
+                    );
+                }
+            }
+
+            _ => NodeId::Unknown,
+        }
     }
 }
 
 fn overlaps(start_a: u64, end_a: u64, start_b: u64, end_b: u64) -> bool {
     start_a < end_b && start_b < end_a
-}
-
-fn canonical_root(uf: &mut UnionFind, root: NodeId) -> NodeId {
-    match root {
-        NodeId::Unknown => NodeId::Unknown,
-        NodeId::Id(_) => uf.find_mut(root),
-    }
-}
-
-fn lookup_root(
-    value_to_root: &HashMap<ValueId, NodeId>,
-    uf: &mut UnionFind,
-    value: ValueId,
-) -> Option<NodeId> {
-    value_to_root
-        .get(&value)
-        .copied()
-        .map(|root| canonical_root(uf, root))
-}
-
-fn merge_roots(existing: NodeId, incoming: NodeId, uf: &mut UnionFind) -> NodeId {
-    match (existing, incoming) {
-        (NodeId::Unknown, _) | (_, NodeId::Unknown) => NodeId::Unknown,
-        _ => uf.join(existing, incoming),
-    }
-}
-
-fn record_value_root(
-    value_to_root: &mut HashMap<ValueId, NodeId>,
-    uf: &mut UnionFind,
-    value: ValueId,
-    root: NodeId,
-) {
-    match value_to_root.get_mut(&value) {
-        Some(existing) => *existing = merge_roots(*existing, root, uf),
-        None => {
-            value_to_root.insert(value, root);
-        }
-    }
 }
 
 fn literal_interval(ctx: &Context, literal: ValueId, size: usize) -> Option<(u64, u64)> {
@@ -143,157 +253,20 @@ fn literal_interval(ctx: &Context, literal: ValueId, size: usize) -> Option<(u64
     Some((start, end))
 }
 
-fn assign_literal_root(
-    ctx: &Context,
-    value_to_root: &HashMap<ValueId, NodeId>,
-    by_space: &HashMap<SpaceId, Vec<SizedVarnode>>,
-    literal_ranges: &mut HashMap<SpaceId, Vec<SizedRoot>>,
-    uf: &mut UnionFind,
-    literal: ValueId,
-    space: SpaceId,
-    size: usize,
-) -> NodeId {
-    let Some((start, end)) = literal_interval(ctx, literal, size) else {
-        return NodeId::Unknown;
-    };
-
-    let mut root = lookup_root(value_to_root, uf, literal).unwrap_or_else(|| uf.alloc_node());
-
-    if let Some(varnodes) = by_space.get(&space) {
-        for varnode in varnodes {
-            if overlaps(start, end, varnode.start, varnode.end) {
-                let varnode_root = canonical_root(uf, varnode.root);
-                root = uf.join(root, varnode_root);
-            }
-        }
-    }
-
-    if let Some(ranges) = literal_ranges.get(&space) {
-        for range in ranges.iter().copied() {
-            if overlaps(start, end, range.start, range.end) {
-                let range_root = canonical_root(uf, range.root);
-                root = uf.join(root, range_root);
-            }
-        }
-    }
-
-    literal_ranges
-        .entry(space)
-        .or_default()
-        .push(SizedRoot { root, start, end });
-
-    root
-}
-
-fn unresolved_pointer_root(
-    ctx: &Context,
-    value_to_root: &HashMap<ValueId, NodeId>,
-    uf: &mut UnionFind,
-    value: ValueId,
-    space: SpaceId,
-) -> NodeId {
-    if matches!(ctx.get_space(space).ty, SpaceType::Register) {
-        lookup_root(value_to_root, uf, value).unwrap_or_else(|| uf.alloc_node())
-    } else {
-        NodeId::Unknown
-    }
-}
-
-fn resolve_pointer_root(
-    ctx: &Context,
-    value: ValueId,
-    space: SpaceId,
-    size: usize,
-    value_to_root: &HashMap<ValueId, NodeId>,
-    by_space: &HashMap<SpaceId, Vec<SizedVarnode>>,
-    literal_ranges: &mut HashMap<SpaceId, Vec<SizedRoot>>,
-    uf: &mut UnionFind,
-) -> NodeId {
-    match value {
-        ValueId::Varnode(id) => {
-            let varnode = Varnode::from_id(ctx, id);
-            debug_assert_eq!(
-                varnode.space().id,
-                space,
-                "load/store pointer varnodes must stay in the access space; \
-                 builder.rs::push_load documents this IR invariant"
-            );
-
-            if varnode.space().id != space {
-                return unresolved_pointer_root(ctx, value_to_root, uf, value, space);
-            }
-
-            lookup_root(value_to_root, uf, value).unwrap_or(NodeId::Unknown)
-        }
-        ValueId::Literal(_) => assign_literal_root(
-            ctx,
-            value_to_root,
-            by_space,
-            literal_ranges,
-            uf,
-            value,
-            space,
-            size,
-        ),
-        ValueId::Instruction(id) => {
-            if ctx.value_space_id(value) != Some(space) {
-                // TODO(ir-invariant): require every load/store pointer to carry
-                // space provenance so this defensive Unknown path can go away.
-                return unresolved_pointer_root(ctx, value_to_root, uf, value, space);
-            }
-
-            match ctx.get_insn(id).mnemonic() {
-                Mnemonic::Binop(bin)
-                    if matches!(bin.op, Binop::Int(IntBinop::Add | IntBinop::Sub)) =>
-                {
-                    let lhs_space = ctx.value_space_id(bin.lhs);
-                    let rhs_space = ctx.value_space_id(bin.rhs);
-
-                    if lhs_space == Some(space) && rhs_space != Some(space) {
-                        resolve_pointer_root(
-                            ctx,
-                            bin.lhs,
-                            space,
-                            size,
-                            value_to_root,
-                            by_space,
-                            literal_ranges,
-                            uf,
-                        )
-                    } else if matches!(bin.op, Binop::Int(IntBinop::Add))
-                        && rhs_space == Some(space)
-                        && lhs_space != Some(space)
-                    {
-                        resolve_pointer_root(
-                            ctx,
-                            bin.rhs,
-                            space,
-                            size,
-                            value_to_root,
-                            by_space,
-                            literal_ranges,
-                            uf,
-                        )
-                    } else {
-                        unresolved_pointer_root(ctx, value_to_root, uf, value, space)
-                    }
-                }
-                _ => unresolved_pointer_root(ctx, value_to_root, uf, value, space),
-            }
-        }
-        _ => unresolved_pointer_root(ctx, value_to_root, uf, value, space),
-    }
-}
-
 impl AliasResult {
     /// A location-based aliasing result that only reasons about known varnode
     /// ranges. Overlapping varnodes in the same space are joined; only pointer
     /// values that actually participate in loads/stores are added.
     pub fn simple(ctx: &Context) -> Self {
-        let mut value_to_root = HashMap::new();
-        let mut by_space: HashMap<_, Vec<_>> = HashMap::new();
-        let mut uf = UnionFind::new();
+        let mut a = Analysis {
+            ctx,
+            value_to_root: HashMap::new(),
+            by_space: HashMap::new(),
+            literal_ranges: HashMap::new(),
+            uf: UnionFind::new(),
+        };
 
+        // Seed one union-find node per varnode and group by address space.
         for varnode in ctx.varnodes() {
             let address = varnode.address();
             debug_assert!(
@@ -305,16 +278,18 @@ impl AliasResult {
             let end = start
                 .checked_add(varnode.size() as u64)
                 .expect("varnode range must fit in u64");
-            let root = uf.alloc_node();
+            let root = a.uf.alloc_node();
 
-            value_to_root.insert(varnode.id.into(), root);
-            by_space
+            a.value_to_root.insert(varnode.id.into(), root);
+            a.by_space
                 .entry(varnode.space().id)
                 .or_default()
-                .push(SizedVarnode { root, start, end });
+                .push(SizedNode { root, start, end });
         }
 
-        for sized_nodes in by_space.values_mut() {
+        // Within each space, sort by address and sweep to merge overlapping varnodes
+        // (e.g. al/ax/eax/rax all fall into one equivalence class).
+        for sized_nodes in a.by_space.values_mut() {
             sized_nodes.sort_by_key(|node| (node.start, node.end));
 
             let Some(first) = sized_nodes.first().copied() else {
@@ -326,7 +301,7 @@ impl AliasResult {
 
             for node in sized_nodes.iter().skip(1).copied() {
                 if node.start < component_end {
-                    component_root = uf.join(component_root, node.root);
+                    component_root = a.uf.join(component_root, node.root);
                     component_end = component_end.max(node.end);
                 } else {
                     component_root = node.root;
@@ -335,6 +310,7 @@ impl AliasResult {
             }
         }
 
+        // Collect all pointer values from loads and stores, then resolve each one.
         let pointer_uses: Vec<(ValueId, SpaceId, usize)> = ctx
             .instructions()
             .filter_map(|insn| match insn.mnemonic() {
@@ -344,7 +320,8 @@ impl AliasResult {
             })
             .collect();
 
-        let mut literal_ranges: HashMap<SpaceId, Vec<SizedRoot>> = HashMap::new();
+        // pointer_spaces guards the invariant that a given pointer value always
+        // refers to the same address space across all uses.
         let mut pointer_spaces: HashMap<ValueId, SpaceId> = HashMap::new();
 
         for (ptr, space, size) in pointer_uses {
@@ -355,22 +332,15 @@ impl AliasResult {
                 );
             }
 
-            let root = resolve_pointer_root(
-                ctx,
-                ptr,
-                space,
-                size,
-                &value_to_root,
-                &by_space,
-                &mut literal_ranges,
-                &mut uf,
-            );
-            record_value_root(&mut value_to_root, &mut uf, ptr, root);
+            let root = a.resolve_pointer_root(ptr, space, size);
+            a.set_value_root(ptr, root);
         }
 
-        let value_to_root = value_to_root
+        // Canonicalize all roots before returning so callers see stable IDs.
+        let value_to_root = a
+            .value_to_root
             .into_iter()
-            .map(|(value, root)| (value, canonical_root(&mut uf, root)))
+            .map(|(value, root)| (value, a.uf.find_mut(root)))
             .collect();
 
         AliasResult { value_to_root }
@@ -378,469 +348,5 @@ impl AliasResult {
 }
 
 #[cfg(test)]
-mod tests {
-    use qcode::{
-        builder::Builder,
-        context::Context,
-        space::{Space, SpaceId, SpaceType},
-        testing::TestContext,
-        value::{BasicBlock, BlockId, Varnode},
-    };
-    use qcode_macro::qcode;
-
-    use crate::gvn::gvn;
-
-    use super::{AliasResult, NodeId};
-
-    fn make_space(ctx: &mut Context<'static>, name: &'static str) -> SpaceId {
-        let mut space = Space::new(Some(name), 1, 8);
-        space.ty = SpaceType::Register;
-        let id = ctx.spaces.push(space);
-        ctx.named_spaces.insert(name, id);
-        id
-    }
-
-    fn build_in_custom_space(
-        f: impl FnOnce(&mut Builder<'static, '_>, SpaceId),
-    ) -> (Context<'static>, BlockId, SpaceId) {
-        let mut ctx = Context::new();
-        let space = make_space(&mut ctx, "register");
-        let block_id = ctx.get_or_make_block(0x1000);
-        let mut builder = Builder::from_context(&mut ctx, 0x1000);
-        f(&mut builder, space);
-        unsafe { builder.dont_finalize() };
-        drop(builder);
-        (ctx, block_id, space)
-    }
-
-    #[test]
-    fn separate_varnodes_do_not_alias() {
-        let mut ctx = Context::new();
-
-        qcode!(
-            ctx,
-            "
-            varnode i32 A;
-            varnode i32 B;
-
-            <block>
-                %a = load(i32, &A);
-                %b = load(i32, &B);
-                return [0];
-        "
-        );
-
-        let result = AliasResult::simple(&ctx);
-        assert!(
-            !result.may_alias(A.into(), B.into()),
-            "distinct non-overlapping varnodes in the same space must not alias"
-        );
-    }
-
-    #[test]
-    fn complex_operations_in_same_space_become_may_alias() {
-        let mut ctx = Context::new();
-
-        qcode!(
-            ctx,
-            "
-            varnode i32 A;
-            varnode i32 B;
-
-            <block>
-                %ptr = &A + i32 4;
-                %a = load(i32, %ptr);
-                %b = load(i32, &A);
-                return [0];
-        "
-        );
-
-        let result = AliasResult::simple(&ctx);
-        assert!(
-            result.may_alias(ptr.into(), A.into()),
-            "IR-derived pointer expressions should conservatively become may-alias"
-        );
-    }
-
-    #[test]
-    fn complex_operations_in_other_space_do_not_alias() {
-        let mut ctx = Context::new();
-
-        qcode!(
-            ctx,
-            "
-            varnode i32 A;
-            varnode i32 B;
-
-            <block>
-                %ptr = &A + i32 4;
-                %a = load(i32, %ptr);
-                %b = load(i32, &A);
-                return [0];
-        "
-        );
-
-        let result = AliasResult::simple(&ctx);
-        assert!(
-            !result.may_alias(ptr.into(), B.into()),
-            "IR-derived pointer expressions in other spaces should not become may-alias"
-        );
-    }
-
-    #[test]
-    fn overlapping_registers_alias() {
-        let test_ctx = TestContext::new();
-
-        let r0 = test_ctx.r0;
-        let r0_lo32 = test_ctx.r0_lo32;
-
-        let ctx = test_ctx.ctx;
-
-        let result = AliasResult::simple(&ctx);
-        assert!(
-            result.may_alias(r0.into(), r0_lo32.into()),
-            "overlapping registers in the same space must alias"
-        );
-    }
-
-    #[test]
-    fn irrelevant_instructions_and_constants_do_not_appear() {
-        let mut ctx = Context::new();
-
-        qcode!(
-            ctx,
-            "
-            <block>
-                %sum = i32 1 + i32 2;
-                return [0];
-        "
-        );
-
-        let one = ctx.get_const(1, 4).id();
-
-        let result = AliasResult::simple(&ctx);
-
-        assert_eq!(
-            result.alias_class(one),
-            None,
-            "plain arithmetic constants should not appear in alias analysis"
-        );
-        assert_eq!(
-            result.alias_class(sum.into()),
-            None,
-            "non-pointer arithmetic instructions should not appear in alias analysis"
-        );
-        assert_eq!(
-            result.alias_class(block.into()),
-            None,
-            "basic block should not appear in alias analysis"
-        );
-    }
-
-    #[test]
-    fn pointer_literals_are_tracked() {
-        let test_ctx = TestContext::new();
-        let reg_space = test_ctx.reg_space;
-        let r0 = test_ctx.r0;
-        let mut ctx = test_ctx.ctx;
-
-        let _block_id = ctx.get_or_make_block(0x1000);
-        let mut builder = Builder::from_context(&mut ctx, 0x1000);
-        let literal_ptr = builder.context_mut().get_const(0, 8).id();
-        builder.push_load::<false>(literal_ptr, 8, reg_space);
-        unsafe { builder.dont_finalize() };
-        drop(builder);
-
-        let result = AliasResult::simple(&ctx);
-        assert!(
-            result.alias_class(literal_ptr).is_some(),
-            "pointer literals used for memory accesses should appear in alias analysis"
-        );
-        assert!(
-            result.may_alias(literal_ptr, r0.into()),
-            "literal register address should alias the overlapping register varnode"
-        );
-    }
-
-    #[test]
-    fn literal_straddles_two_disjoint_varnode_classes_joins_them() {
-        let mut a = None;
-        let mut b = None;
-        let mut literal_ptr = None;
-
-        let (ctx, _, _) = build_in_custom_space(|builder, space| {
-            let a_id = Varnode::make(builder.context_mut(), 0, 4, space).id;
-            let b_id = Varnode::make(builder.context_mut(), 8, 4, space).id;
-            let ptr = builder.context_mut().get_const(2, 8).id();
-
-            builder.push_load::<false>(ptr, 8, space);
-
-            a = Some(a_id);
-            b = Some(b_id);
-            literal_ptr = Some(ptr);
-        });
-
-        let a = a.unwrap();
-        let b = b.unwrap();
-        let literal_ptr = literal_ptr.unwrap();
-        let result = AliasResult::simple(&ctx);
-
-        assert!(result.may_alias(literal_ptr, a.into()));
-        assert!(result.may_alias(literal_ptr, b.into()));
-        assert!(result.may_alias(a.into(), b.into()));
-    }
-
-    #[test]
-    fn two_literal_pointers_same_addr_alias_without_varnode() {
-        let mut lit1 = None;
-        let mut lit2 = None;
-
-        let (ctx, _, _) = build_in_custom_space(|builder, space| {
-            let first = builder.context_mut().get_const(0x10, 8).id();
-            let second = builder
-                .context_mut()
-                .get_const(0xdead_beef_0000_0010, 4)
-                .id();
-
-            builder.push_load::<false>(first, 4, space);
-            builder.push_load::<false>(second, 4, space);
-
-            lit1 = Some(first);
-            lit2 = Some(second);
-        });
-
-        let result = AliasResult::simple(&ctx);
-        assert!(result.may_alias(lit1.unwrap(), lit2.unwrap()));
-    }
-
-    #[test]
-    fn two_literal_pointers_overlapping_ranges_alias() {
-        let mut lit1 = None;
-        let mut lit2 = None;
-
-        let (ctx, _, _) = build_in_custom_space(|builder, space| {
-            let first = builder.context_mut().get_const(0x100, 8).id();
-            let second = builder.context_mut().get_const(0x104, 8).id();
-
-            builder.push_load::<false>(first, 8, space);
-            builder.push_load::<false>(second, 4, space);
-
-            lit1 = Some(first);
-            lit2 = Some(second);
-        });
-
-        let result = AliasResult::simple(&ctx);
-        assert!(result.may_alias(lit1.unwrap(), lit2.unwrap()));
-    }
-
-    #[test]
-    fn two_literal_pointers_different_spaces_do_not_alias() {
-        let mut ctx = Context::new();
-        let reg_space = make_space(&mut ctx, "register");
-        let alt_space = make_space(&mut ctx, "other");
-        let _block_id = ctx.get_or_make_block(0x1000);
-        let mut builder = Builder::from_context(&mut ctx, 0x1000);
-
-        let lit1 = builder.context_mut().get_const(0x20, 8).id();
-        let lit2 = builder
-            .context_mut()
-            .get_const(0xfeed_face_0000_0020, 4)
-            .id();
-        builder.push_load::<false>(lit1, 4, reg_space);
-        builder.push_load::<false>(lit2, 4, alt_space);
-
-        unsafe { builder.dont_finalize() };
-        drop(builder);
-
-        let result = AliasResult::simple(&ctx);
-        assert!(!result.may_alias(lit1, lit2));
-    }
-
-    #[test]
-    #[should_panic(expected = "used in multiple spaces")]
-    fn same_pointer_used_in_multiple_spaces_panics() {
-        let mut ctx = Context::new();
-        let reg_space = make_space(&mut ctx, "register");
-        let alt_space = make_space(&mut ctx, "other");
-        let _block_id = ctx.get_or_make_block(0x1000);
-        let mut builder = Builder::from_context(&mut ctx, 0x1000);
-
-        let ptr = builder.context_mut().get_const(0x20, 8).id();
-        builder.push_load::<false>(ptr, 4, reg_space);
-        builder.push_load::<false>(ptr, 4, alt_space);
-
-        unsafe { builder.dont_finalize() };
-        drop(builder);
-
-        let _ = AliasResult::simple(&ctx);
-    }
-
-    #[test]
-    fn unresolvable_load_ptr_becomes_unknown_and_aliases_everything() {
-        let mut ctx = Context::new();
-
-        qcode!(
-            ctx,
-            "
-            varnode i64 A;
-
-            <block>
-                %ptr = i64 0x10 + i64 0x2;
-                %v = load(i64, %ptr);
-                return [0];
-        "
-        );
-
-        let result = AliasResult::simple(&ctx);
-        assert_eq!(result.alias_class(ptr.into()), Some(NodeId::Unknown));
-        assert!(result.may_alias(ptr.into(), A.into()));
-    }
-
-    #[test]
-    fn unresolvable_load_ptr_in_register_space_does_not_alias_registers() {
-        let test_ctx = TestContext::new();
-        let reg_space = test_ctx.reg_space;
-        let r0 = test_ctx.r0;
-        let mut ctx = test_ctx.ctx;
-
-        let _block_id = ctx.get_or_make_block(0x1000);
-        let mut builder = Builder::from_context(&mut ctx, 0x1000);
-        let lhs = builder.context_mut().get_const(0x10, 8).id();
-        let rhs = builder.context_mut().get_const(0x2, 8).id();
-        let ptr = builder.push_add(lhs, rhs).id();
-        builder.push_load::<false>(ptr, 8, reg_space);
-        unsafe { builder.dont_finalize() };
-        drop(builder);
-
-        let result = AliasResult::simple(&ctx);
-        let alias_class = result.alias_class(ptr);
-        assert!(matches!(alias_class, Some(NodeId::Id(_))));
-        assert!(
-            !result.may_alias(ptr, r0.into()),
-            "register-space built pointers must not alias register varnodes"
-        );
-    }
-
-    #[test]
-    fn store_then_load_invalidation_is_conservative_for_unknown_ptr() {
-        let mut ctx = Context::new();
-
-        qcode!(
-            ctx,
-            "
-            varnode i64 A;
-            varnode i64 B;
-
-            <block>
-                %before = load(i64, &A);
-                %base = load(i64, &B);
-                %ptr = base * 2;
-                store(%ptr, i64 0x7);
-                %after = load(i64, &A);
-                return [after];
-        "
-        );
-
-        let aliases = AliasResult::simple(&ctx);
-        assert_eq!(aliases.alias_class(ptr.into()), Some(NodeId::Unknown));
-
-        let mut block = BasicBlock::from_id_mut(&mut ctx, block);
-        assert!(block.instruction_ids().contains(&after));
-
-        gvn(&mut block, Some(&aliases));
-
-        assert!(
-            block.instruction_ids().contains(&after),
-            "unknown store pointers must conservatively invalidate cached loads"
-        );
-    }
-
-    #[test]
-    fn literal_with_high_bit_set_aliases_overlapping_literals() {
-        let mut lit1 = None;
-        let mut lit2 = None;
-
-        let (ctx, _, _) = build_in_custom_space(|builder, space| {
-            let first = builder
-                .context_mut()
-                .get_const(0x8000_0000_0000_0000, 8)
-                .id();
-            let second = builder
-                .context_mut()
-                .get_const(0x8000_0000_0000_0004, 8)
-                .id();
-
-            builder.push_load::<false>(first, 8, space);
-            builder.push_load::<false>(second, 4, space);
-
-            lit1 = Some(first);
-            lit2 = Some(second);
-        });
-
-        let result = AliasResult::simple(&ctx);
-        assert!(result.may_alias(lit1.unwrap(), lit2.unwrap()));
-    }
-
-    #[test]
-    fn literal_with_upper_junk_bits_is_masked_to_size() {
-        let mut a = None;
-        let mut literal_ptr = None;
-
-        let (ctx, _, _) = build_in_custom_space(|builder, space| {
-            let a_id = Varnode::make(builder.context_mut(), 0x10, 4, space).id;
-            let ptr = builder
-                .context_mut()
-                .get_const(0xdead_beef_0000_0010, 4)
-                .id();
-
-            builder.push_load::<false>(ptr, 4, space);
-
-            a = Some(a_id);
-            literal_ptr = Some(ptr);
-        });
-
-        let result = AliasResult::simple(&ctx);
-        assert!(result.may_alias(literal_ptr.unwrap(), a.unwrap().into()));
-    }
-
-    #[test]
-    fn many_overlapping_subregisters_still_join_in_one_class() {
-        let mut varnodes = Vec::new();
-
-        let (ctx, _, _) = build_in_custom_space(|builder, space| {
-            for size in (1..=32).rev() {
-                let id = Varnode::make(builder.context_mut(), 0, size, space).id;
-                varnodes.push(id);
-            }
-        });
-
-        let result = AliasResult::simple(&ctx);
-        let first = varnodes[0];
-
-        for &varnode in &varnodes[1..] {
-            assert!(result.may_alias(first.into(), varnode.into()));
-        }
-    }
-
-    #[test]
-    fn pointer_arithmetic_with_non_add_sub_returns_unknown() {
-        let mut ctx = Context::new();
-
-        qcode!(
-            ctx,
-            "
-            varnode i64 A;
-
-            <block>
-                %base = load(i64, &A);
-                %ptr = base * 2;
-                %v = load(i64, %ptr);
-                return [v];
-        "
-        );
-
-        let result = AliasResult::simple(&ctx);
-        assert_eq!(result.alias_class(ptr.into()), Some(NodeId::Unknown));
-        assert!(result.may_alias(ptr.into(), A.into()));
-    }
-}
+#[path = "simple_tests.rs"]
+mod tests;

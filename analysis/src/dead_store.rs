@@ -2,7 +2,7 @@ use std::collections::HashSet;
 
 use qcode::{
     context::Context,
-    space::{SpaceId, SpaceType},
+    space::{Space, SpaceId, SpaceType},
     value::{
         BasicBlock, BlockId, ValueId, Varnode,
         insn::{InstructionId, Mnemonic},
@@ -10,7 +10,7 @@ use qcode::{
 };
 
 fn is_reg_space(ctx: &Context, space_id: SpaceId) -> bool {
-    matches!(ctx.get_space(space_id).ty, SpaceType::Register)
+    matches!(Space::from_id(ctx, space_id).ty, SpaceType::Register)
 }
 
 fn ptr_offset(ctx: &Context, ptr: ValueId) -> Option<i64> {

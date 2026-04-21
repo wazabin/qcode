@@ -13,12 +13,12 @@
 
 use std::borrow::Cow;
 
-use jstd::{Identifier, registry::Identified};
+use jstd::Identifier;
 
 use crate::{
     context::Context,
     error::Result,
-    space::{Space, SpaceId},
+    space::{Space, SpaceId, SpaceRef},
     value::{
         Value, ValueId,
         util::{
@@ -106,9 +106,8 @@ where
     }
 
     /// The space this varnode belongs to.
-    pub fn space(&'s self) -> Identified<SpaceId, &'ctx Space<'str>> {
-        let space_id = self.inner().space;
-        Identified::new(space_id, self.ctx().get_space(space_id))
+    pub fn space(&'s self) -> SpaceRef<'str, 'ctx> {
+        Space::from_id(self.ctx(), self.inner().space)
     }
 
     /// The address at which this varnode begins

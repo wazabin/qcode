@@ -304,7 +304,7 @@ mod tests {
 
         let result = alias_analysis(&ctx);
         assert!(
-            result.may_alias(zext_cell.get(), src_cell.get()),
+            result.may_alias(&ctx, zext_cell.get(), src_cell.get()),
             "zext result must alias its source"
         );
     }
@@ -326,7 +326,7 @@ mod tests {
 
         let result = alias_analysis(&ctx);
         assert!(
-            result.may_alias(load_cell.get(), v_cell.get()),
+            result.may_alias(&ctx, load_cell.get(), v_cell.get()),
             "load through same pointer must alias the stored value"
         );
     }
@@ -345,7 +345,7 @@ mod tests {
 
         let result = alias_analysis(&ctx);
         assert!(
-            !result.may_alias(a_cell.get(), b_cell.get()),
+            !result.may_alias(&ctx, a_cell.get(), b_cell.get()),
             "unrelated constants must not alias"
         );
     }
@@ -365,7 +365,7 @@ mod tests {
 
         let result = alias_analysis(&ctx);
         assert!(
-            result.may_alias(add_cell.get(), ptr_cell.get()),
+            result.may_alias(&ctx, add_cell.get(), ptr_cell.get()),
             "binop result must alias its lhs operand"
         );
     }
@@ -385,7 +385,7 @@ mod tests {
 
         let result = alias_analysis(&ctx);
         assert!(
-            !result.may_alias(cond_cell.get(), a_cell.get()),
+            !result.may_alias(&ctx, cond_cell.get(), a_cell.get()),
             "comparison result must not alias its operands"
         );
     }
@@ -412,7 +412,7 @@ mod tests {
 
         let result = alias_analysis(&ctx);
         assert!(
-            result.may_alias(final_cell.get(), v_cell.get()),
+            result.may_alias(&ctx, final_cell.get(), v_cell.get()),
             "transitively chained load/store must alias original value"
         );
     }
@@ -515,7 +515,7 @@ mod tests {
 
         let result = alias_analysis(&ctx);
         assert!(
-            result.may_alias(r1_cell.get(), r2_cell.get()),
+            result.may_alias(&ctx, r1_cell.get(), r2_cell.get()),
             "two loads through the same pointer ValueId must alias each other"
         );
     }
