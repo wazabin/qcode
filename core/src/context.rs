@@ -157,6 +157,15 @@ impl<'str> Context<'str> {
         ValueRef::new(id, self)
     }
 
+    /// Returns the address-space ID associated with a value, if known.
+    pub fn value_space_id(&self, id: ValueId) -> Option<SpaceId> {
+        match self.get_value(id) {
+            ValueRef::Varnode(v) => Some(v.space().id),
+            ValueRef::Instruction(i) => i.space_id(),
+            _ => None,
+        }
+    }
+
     /// Returns the [`Space`] identified by `id`.
     pub fn get_space(&self, id: SpaceId) -> &Space<'str> {
         &self.spaces[id]

@@ -21,6 +21,7 @@ impl SourceSpan {
 pub enum Atom {
     External(String),
     Local(String),
+    AddressOf(String),
     Int(u64),
 }
 

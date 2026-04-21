@@ -102,6 +102,10 @@ impl ValueId {
         }
     }
 
+    pub fn is_varnode(self) -> bool {
+        matches!(self, ValueId::Varnode(_))
+    }
+
     pub fn as_varnode(self) -> Option<VarnodeId> {
         if let ValueId::Varnode(id) = self {
             Some(id)

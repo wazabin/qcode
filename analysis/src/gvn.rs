@@ -280,12 +280,17 @@ mod tests {
         qcode!(
             ctx,
             "
+            varnode i64 A;
+            varnode i64 B;
+
             <block>
-            local i64 a;
-            local i64 b;
-            %v1 = a + b;
-            %v2 = a + b;
-            goto <0x1001>;
+                %a = load(i64, &A);
+                %b = load(i64, &B);
+
+                %v1 = a + b;
+                %v2 = a + b;
+
+                goto <0x1001>;
         "
         );
 
@@ -308,12 +313,16 @@ mod tests {
         qcode!(
             ctx,
             "
-        <block>
-        local i64 a;
-        local i64 b;
-        %v1 = a + b;
-        %v2 = b + a;
-        goto <0x1001>;"
+            varnode i64 A;
+            varnode i64 B;
+
+            <block>
+                %a = load(i64, &A);
+                %b = load(i64, &B);
+                %v1 = %a + %b;
+                %v2 = %b + %a;
+                goto <0x1001>;
+        "
         );
 
         let mut block = BasicBlock::from_id_mut(&mut ctx, block);
@@ -335,12 +344,15 @@ mod tests {
         qcode!(
             ctx,
             "
+            varnode i64 A;
+            varnode i64 B;
+
             <block>
-            local i64 a;
-            local i64 b;
-            %v1 = a - b;
-            %v2 = b - a;
-            goto <0x1001>;
+                %a = load(i64, &A);
+                %b = load(i64, &B);
+                %v1 = %a - %b;
+                %v2 = %b - %a;
+                goto <0x1001>;
         "
         );
 
@@ -363,12 +375,15 @@ mod tests {
         qcode!(
             ctx,
             "
+            varnode i64 A;
+            varnode i64 B;
+
             <block>
-            local i64 a;
-            local i64 b;
-            %v1 = a + b;
-            %v2 = a * b;
-            goto <0x1001>;
+                %a = load(i64, &A);
+                %b = load(i64, &B);
+                %v1 = %a + %b;
+                %v2 = %a * %b;
+                goto <0x1001>;
         "
         );
 
@@ -393,15 +408,20 @@ mod tests {
 
         qcode!(
             ctx,
-            "fn f:
+            "
+            varnode i64 A;
+            varnode i64 B;
+
+            fn f:
                 <entry>
-                    local i64 a;
-                    local i64 b;
-                    %v1 = a + b;
+                    %a = load(i64, &A);
+                    %b = load(i64, &B);
+
+                    %v1 = %a + %b;
                     goto <succ>;
 
                 <succ>
-                    %v2 = a + b;
+                    %v2 = %a + %b;
                     return [0x1000];
             "
         );
@@ -433,10 +453,13 @@ mod tests {
         qcode!(
             ctx,
             "
+            varnode i64 A;
+            varnode i64 B;
+
             fn g:
                 <entry>
-                    local i64 a;
-                    local i64 b;
+                    %a = load(i64, &A);
+                    %b = load(i64, &B);
                     if i8 1 goto <left> else goto <right>;
 
                 <left>
@@ -467,21 +490,21 @@ mod tests {
 
     // 7. Constant propagation
     #[test]
-    #[ignore = "WIP: constant folding not fully implemented yet"]
     fn test_constant_propagation() {
         let mut ctx = Context::new();
 
         qcode!(
             ctx,
             "
+            varnode i64 A;
+            varnode i64 B;
             <block>
-            local i64 a;
-            local i64 b;
-            store(a, i64 5);
-            %v1 = a + 2;
-            %v2 = v1 + 3;
-            store(b, v2);
-            goto <0x1001>;"
+                store(&A, i64 5);
+                %a = load(i64, &A);
+                %v1 = a + 2;
+                %v2 = v1 + 3;
+                store(&B, v2);
+                goto <0x1001>;"
         );
 
         let aliases = AliasResult::from_space_ids(&ctx);
@@ -497,6 +520,6 @@ mod tests {
 
         assert!(!block.instruction_ids().contains(&v1));
         assert!(!block.instruction_ids().contains(&v2));
-        assert!(block.to_string().contains("b = 0xa"));
+        assert!(block.to_string().contains("B = 0xa"));
     }
 }

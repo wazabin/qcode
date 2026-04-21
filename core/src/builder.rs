@@ -164,13 +164,14 @@ impl<'str, 'ctx> Builder<'str, 'ctx> {
                     return None;
                 }
 
-                self.push_instruction(
+                self.push_instruction_in_space(
                     Mnemonic::Range(Range {
                         src,
                         start: range.start,
                         size: range.len(),
                     }),
                     range.len(),
+                    self.value_space_id(src),
                 )
                 .into()
             }
@@ -236,17 +237,40 @@ impl<'str, 'ctx> Builder<'str, 'ctx> {
     /// Panics if the block is already terminated (ends with a branch/call/return).
     #[track_caller]
     fn push_instruction(&mut self, mnemonic: Mnemonic, size: usize) -> InstructionRef<'str, '_> {
+        self.push_instruction_in_space(mnemonic, size, None)
+    }
+
+    #[track_caller]
+    fn push_instruction_in_space(
+        &mut self,
+        mnemonic: Mnemonic,
+        size: usize,
+        space: Option<SpaceId>,
+    ) -> InstructionRef<'str, '_> {
         if self.is_terminated {
             panic!("cannot push instruction to a terminated block");
         }
 
-        let id = InstructionRef::from_mnemonic(self.context_mut(), mnemonic, size).id;
+        let id =
+            InstructionRef::from_mnemonic_with_space(self.context_mut(), mnemonic, size, space).id;
         self.block.push_insn(id);
         self.context().get_insn(id)
     }
 
     fn get_value(&self, id: ValueId) -> ValueRef<'str, '_> {
         self.context().get_value(id)
+    }
+
+    fn value_space_id(&self, id: ValueId) -> Option<SpaceId> {
+        self.context().value_space_id(id)
+    }
+
+    fn merge_space_ids(&self, lhs: ValueId, rhs: ValueId) -> Option<SpaceId> {
+        match (self.value_space_id(lhs), self.value_space_id(rhs)) {
+            (Some(lhs), Some(rhs)) if lhs == rhs => Some(lhs),
+            (Some(space), None) | (None, Some(space)) => Some(space),
+            _ => None,
+        }
     }
 
     fn ensure_created_block_in_function(&mut self, block: BlockId) {
@@ -398,13 +422,14 @@ impl<'str, 'ctx> Builder<'str, 'ctx> {
                 space,
             );
             let size = self.context().get_value(src).size();
-            self.push_instruction(
+            self.push_instruction_in_space(
                 Mnemonic::Load(Load {
                     ptr: src,
                     space,
                     size,
                 }),
                 size,
+                Some(space),
             )
             .into()
         }
@@ -413,7 +438,10 @@ impl<'str, 'ctx> Builder<'str, 'ctx> {
     // --- Unary Ops ---
 
     fn push_unop(&mut self, op: Unop, src: ValueId) -> InstructionRef<'str, '_> {
-        let src = self.ensure_local(src);
+        assert!(
+            !src.is_varnode(),
+            "push_unop: varnode operand is not allowed; use ensure_local or &name addressof syntax"
+        );
         let size = self.context().get_value(src).size();
         self.push_instruction(Mnemonic::Unop(Unary { op, src }), size)
     }
@@ -446,9 +474,11 @@ impl<'str, 'ctx> Builder<'str, 'ctx> {
         size: Option<usize>,
     ) -> InstructionRef<'str, '_> {
         let size = size.unwrap_or_else(|| self.context().get_value(lhs).size());
-        let lhs = self.ensure_local(lhs);
-        let rhs = self.ensure_local(rhs);
-        self.push_instruction(Mnemonic::Binop(Binary { op, lhs, rhs }), size)
+        let space = match op {
+            Binop::Int(IntBinop::Add | IntBinop::Sub) => self.merge_space_ids(lhs, rhs),
+            _ => None,
+        };
+        self.push_instruction_in_space(Mnemonic::Binop(Binary { op, lhs, rhs }), size, space)
     }
 
     // --- Arithmetic ---
@@ -576,7 +606,10 @@ impl<'str, 'ctx> Builder<'str, 'ctx> {
     // --- Extensions & Conversions ---
 
     pub fn push_is_nan(&mut self, src: ValueId) -> InstructionRef<'str, '_> {
-        let src = self.ensure_local(src);
+        assert!(
+            !src.is_varnode(),
+            "push_is_nan: varnode operand not allowed"
+        );
         self.push_instruction(Mnemonic::IsFloatNaN(IsFloatNaN { src }), 1)
     }
 
@@ -601,55 +634,73 @@ impl<'str, 'ctx> Builder<'str, 'ctx> {
     }
 
     pub fn push_int_to_float(&mut self, src: ValueId, size: usize) -> InstructionRef<'str, '_> {
-        let src = self.ensure_local(src);
+        assert!(
+            !src.is_varnode(),
+            "push_int_to_float: varnode operand not allowed"
+        );
         self.push_instruction(Mnemonic::IntToFloat(IntToFloat { src, size }), size)
     }
 
     pub fn push_float_to_float(&mut self, src: ValueId, size: usize) -> InstructionRef<'str, '_> {
-        let src = self.ensure_local(src);
+        assert!(
+            !src.is_varnode(),
+            "push_float_to_float: varnode operand not allowed"
+        );
         self.push_instruction(Mnemonic::FloatToFloat(FloatToFloat { src, size }), size)
     }
 
     pub fn push_trunc(&mut self, src: ValueId, size: usize) -> InstructionRef<'str, '_> {
-        let src = self.ensure_local(src);
+        assert!(!src.is_varnode(), "push_trunc: varnode operand not allowed");
         self.push_instruction(Mnemonic::FloatToInt(FloatToInt { src, size }), size)
     }
 
     pub fn push_zext(&mut self, src: ValueId, size: usize) -> InstructionRef<'str, '_> {
-        let src = self.ensure_local(src);
+        assert!(!src.is_varnode(), "push_zext: varnode operand not allowed");
         self.push_instruction(Mnemonic::Zext(Zext { src, size }), size)
     }
 
     pub fn push_sext(&mut self, src: ValueId, size: usize) -> InstructionRef<'str, '_> {
-        let src = self.ensure_local(src);
+        assert!(!src.is_varnode(), "push_sext: varnode operand not allowed");
         self.push_instruction(Mnemonic::Sext(Sext { src, size }), size)
     }
 
     pub fn push_popcount(&mut self, src: ValueId, size: usize) -> InstructionRef<'str, '_> {
-        let src = self.ensure_local(src);
+        assert!(
+            !src.is_varnode(),
+            "push_popcount: varnode operand not allowed"
+        );
         self.push_instruction(Mnemonic::PopCount(PopCount { src }), size)
     }
 
     pub fn push_lzcount(&mut self, src: ValueId, size: usize) -> InstructionRef<'str, '_> {
-        let src = self.ensure_local(src);
+        assert!(
+            !src.is_varnode(),
+            "push_lzcount: varnode operand not allowed"
+        );
         self.push_instruction(Mnemonic::LzCount(LzCount { src }), size)
     }
 
     pub fn push_carry(&mut self, lhs: ValueId, rhs: ValueId) -> InstructionRef<'str, '_> {
-        let lhs = self.ensure_local(lhs);
-        let rhs = self.ensure_local(rhs);
+        assert!(
+            !lhs.is_varnode() && !rhs.is_varnode(),
+            "push_carry: varnode operand not allowed"
+        );
         self.push_instruction(Mnemonic::Carry(Carry { lhs, rhs }), 1)
     }
 
     pub fn push_scarry(&mut self, lhs: ValueId, rhs: ValueId) -> InstructionRef<'str, '_> {
-        let lhs = self.ensure_local(lhs);
-        let rhs = self.ensure_local(rhs);
+        assert!(
+            !lhs.is_varnode() && !rhs.is_varnode(),
+            "push_scarry: varnode operand not allowed"
+        );
         self.push_instruction(Mnemonic::SCarry(SCarry { lhs, rhs }), 1)
     }
 
     pub fn push_sborrow(&mut self, lhs: ValueId, rhs: ValueId) -> InstructionRef<'str, '_> {
-        let lhs = self.ensure_local(lhs);
-        let rhs = self.ensure_local(rhs);
+        assert!(
+            !lhs.is_varnode() && !rhs.is_varnode(),
+            "push_sborrow: varnode operand not allowed"
+        );
         self.push_instruction(Mnemonic::SBorrow(SBorrow { lhs, rhs }), 1)
     }
 
@@ -705,7 +756,7 @@ impl<'str, 'ctx> Builder<'str, 'ctx> {
                     .id();
 
                 let id = self
-                    .push_instruction(
+                    .push_instruction_in_space(
                         Mnemonic::Store(Store {
                             src: src_lane,
                             ptr: dst_lane,
@@ -713,6 +764,7 @@ impl<'str, 'ctx> Builder<'str, 'ctx> {
                             size: LANE_SIZE,
                         }),
                         0,
+                        Some(space),
                     )
                     .id;
 
@@ -729,7 +781,7 @@ impl<'str, 'ctx> Builder<'str, 'ctx> {
             let src = self.ensure_local(src);
             // If dst is a varnode, we need to emit a store from src to dst
             let id = self
-                .push_instruction(
+                .push_instruction_in_space(
                     Mnemonic::Store(Store {
                         src,
                         ptr: dst.into(),
@@ -737,6 +789,7 @@ impl<'str, 'ctx> Builder<'str, 'ctx> {
                         size,
                     }),
                     0,
+                    Some(space),
                 )
                 .id;
 
@@ -760,11 +813,9 @@ impl<'str, 'ctx> Builder<'str, 'ctx> {
         ptr: ValueId,
         space: SpaceId,
     ) -> InstructionRef<'str, '_> {
-        // TODO(fix store local):
-        let ptr = self.ensure_local(ptr);
         let src = self.ensure_local(src);
         let size = self.context().get_value(src).size();
-        self.push_instruction(
+        self.push_instruction_in_space(
             Mnemonic::Store(Store {
                 src,
                 ptr,
@@ -772,6 +823,7 @@ impl<'str, 'ctx> Builder<'str, 'ctx> {
                 size,
             }),
             0,
+            Some(space),
         )
     }
 
@@ -795,7 +847,10 @@ impl<'str, 'ctx> Builder<'str, 'ctx> {
         target: BlockId,
         fallthrough: BlockId,
     ) -> InstructionRef<'str, '_> {
-        let condition = self.ensure_local(condition);
+        assert!(
+            !condition.is_varnode(),
+            "push_cbranch: varnode condition not allowed; load the value first"
+        );
         let current = self.block.id;
         self.context_mut().add_cfg_edge(current, target);
         self.context_mut().add_cfg_edge(current, fallthrough);
@@ -814,7 +869,6 @@ impl<'str, 'ctx> Builder<'str, 'ctx> {
     }
 
     pub fn push_branchind(&mut self, ptr: ValueId) -> InstructionRef<'str, '_> {
-        let ptr = self.ensure_local(ptr);
         let id = self
             .push_instruction(Mnemonic::BranchInd(BranchInd { ptr }), 0)
             .id;
@@ -837,7 +891,6 @@ impl<'str, 'ctx> Builder<'str, 'ctx> {
     }
 
     pub fn push_call_ind(&mut self, ptr: ValueId) -> InstructionRef<'str, '_> {
-        let ptr = self.ensure_local(ptr);
         let id = self
             .push_instruction(Mnemonic::CallInd(CallInd { ptr, args: vec![] }), 0)
             .id;
@@ -846,7 +899,6 @@ impl<'str, 'ctx> Builder<'str, 'ctx> {
     }
 
     pub fn push_return(&mut self, ptr: ValueId) -> InstructionRef<'str, '_> {
-        let ptr = self.ensure_local(ptr);
         let id = self
             .push_instruction(Mnemonic::Return(Return { ptr, value: None }), 0)
             .id;
@@ -904,11 +956,15 @@ mod tests {
         qcode!(
             ctx,
             "
+            varnode i8 cond;
+
             <entry>
-                local i8 cond;
-                if cond goto <then_lbl> else goto <else_lbl>;
+                %c = load(i8, cond);
+                if %c goto <then_lbl> else goto <else_lbl>;
+
             <then_lbl>
                 goto <0x1001>;
+
             <else_lbl>
                 goto <0x1001>;
         "
@@ -959,12 +1015,13 @@ mod tests {
         qcode!(
             ctx,
             "
+            varnode i32 v;
+
             <entry>
-                local i32 v;
                 goto <body>;
 
             <body>
-                %v0 = v + 1;
+                i64 %v0 = i64 &v + i64 1;
                 goto <0x1001>;
         "
         );
@@ -1024,7 +1081,7 @@ mod tests {
     fn qcode_local_decl_creates_named_temp() {
         let mut ctx = Context::new();
 
-        qcode!(ctx, "<block> varnode i64 ptr; goto <0x1001>;");
+        qcode!(ctx, "varnode i64 ptr; <block> goto <0x1001>;");
 
         let ptr = Varnode::from_id(&ctx, ptr);
 
@@ -1035,7 +1092,7 @@ mod tests {
     #[test]
     fn qcode_standalone_local_decl_creates_named_temp() {
         let mut ctx = Context::new();
-        qcode!(ctx, "<block> varnode i64 ptr as PTR; goto <0x1001>;");
+        qcode!(ctx, "varnode i64 ptr; <block> goto <0x1001>;");
 
         let ptr = Varnode::from_id(&ctx, ptr);
 

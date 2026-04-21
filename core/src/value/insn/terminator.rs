@@ -224,11 +224,15 @@ mod tests {
         qcode!(
             ctx,
             "
+            varnode i8 cond;
+
             <block>
-                local i8 cond;
-                if %cond goto <then_lbl> else goto <else_lbl>;
+                %c = load(i8, &cond);
+                if %c goto <then_lbl> else goto <else_lbl>;
+
             <then_lbl>
                 goto <0x1001>;
+
             <else_lbl>
                 goto <0x1002>;
             "
@@ -295,11 +299,13 @@ mod tests {
         qcode!(
             ctx,
             "
+            varnode i32 V;
+
             <block>
-                local i32 v;
                 goto <body>;
+
             <body>
-                %sum = i32 %v + i32 0x1;
+                %sum = i64 &V + i64 0x1;
                 goto <0x1001>;
             "
         );
@@ -323,11 +329,15 @@ mod tests {
         qcode!(
             ctx,
             "
+            varnode i8 cond;
+
             <block>
-                local i8 cond;
-                if %cond goto <then_lbl> else goto <else_lbl>;
+                %c = load(i8, &cond);
+                if %c goto <then_lbl> else goto <else_lbl>;
+
             <then_lbl>
                 goto <0x1001>;
+
             <else_lbl>
                 goto <0x1002>;
             "

@@ -106,8 +106,10 @@ mod tests {
         qcode!(
             ctx,
             "
+            varnode i32 V0;
+
             <block>
-                local i32 v0;
+                %v0 = load(i32, &V0);
                 %v = !%v0;
                 goto <0x1001>;
             "

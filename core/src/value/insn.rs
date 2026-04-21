@@ -5,6 +5,7 @@
 use crate::{
     context::Context,
     error::Result,
+    space::{Space, SpaceId},
     value::{
         BasicBlock, BlockId, BlockRef, FunctionRef, Value, ValueId,
         util::{
@@ -54,6 +55,9 @@ pub struct Instruction<'str> {
     /// The instruction which defines this value.
     mnemonic: Mnemonic,
 
+    /// Optional address-space provenance for this instruction's result.
+    space: Option<SpaceId>,
+
     /// The block that this instruction belongs to, if any.
     /// Instructions that are not part of any block (e.g. lifted from data sections) have `None` here.
     pub(crate) parent: Option<BlockId>,
@@ -62,12 +66,13 @@ pub struct Instruction<'str> {
 }
 
 impl<'str> Instruction<'str> {
-    fn new(size: usize, mnemonic: Mnemonic) -> Self {
+    fn new(size: usize, mnemonic: Mnemonic, space: Option<SpaceId>) -> Self {
         Self {
             name: None,
             parent: None,
             size,
             mnemonic,
+            space,
             _marker: std::marker::PhantomData,
         }
     }
@@ -130,6 +135,15 @@ where
         &self.inner().mnemonic
     }
 
+    /// The address-space provenance for this instruction's result, if known.
+    pub fn space(&'s self) -> Option<&'ctx Space<'str>> {
+        self.inner().space.map(|id| self.ctx().get_space(id))
+    }
+
+    pub(crate) fn space_id(&'s self) -> Option<SpaceId> {
+        self.inner().space
+    }
+
     /// The opcode for this instruction
     pub fn opcode(&'s self) -> &'static str {
         self.mnemonic().opcode()
@@ -156,7 +170,16 @@ pub type InstructionRef<'str, 'ctx> = BaseRef<&'ctx Context<'str>, InstructionId
 
 impl<'str, 'ctx> InstructionRef<'str, 'ctx> {
     pub fn from_mnemonic(ctx: &'ctx mut Context<'str>, mnemonic: Mnemonic, size: usize) -> Self {
-        let insn = Instruction::new(size, mnemonic);
+        Self::from_mnemonic_with_space(ctx, mnemonic, size, None)
+    }
+
+    pub fn from_mnemonic_with_space(
+        ctx: &'ctx mut Context<'str>,
+        mnemonic: Mnemonic,
+        size: usize,
+        space: Option<SpaceId>,
+    ) -> Self {
+        let insn = Instruction::new(size, mnemonic, space);
         let id = ctx.values.push_insn(insn);
         Self::from_id(ctx, id)
     }

@@ -4,6 +4,34 @@ use quote::{format_ident, quote};
 use std::collections::HashMap;
 use syn::Expr;
 
+/// Tracks whether a local identifier is a varnode (pointer) or an SSA instruction value.
+#[derive(Clone)]
+enum LocalKind {
+    Varnode(proc_macro2::Ident),
+    Instruction(proc_macro2::Ident),
+}
+
+impl LocalKind {
+    fn ident(&self) -> &proc_macro2::Ident {
+        match self {
+            LocalKind::Varnode(i) | LocalKind::Instruction(i) => i,
+        }
+    }
+
+    fn is_varnode(&self) -> bool {
+        matches!(self, LocalKind::Varnode(_))
+    }
+}
+
+/// Context in which an atom is being used — controls whether bare varnodes are allowed.
+#[derive(Clone, Copy)]
+enum AtomContext {
+    /// Arithmetic / scalar-value position. Bare varnodes are rejected; use `&name` instead.
+    Arithmetic,
+    /// Pointer position (load ptr, store ptr, branch target). Bare varnodes are allowed.
+    Pointer,
+}
+
 /// Compile a function-level program (one or more `fn name: ...` declarations).
 pub(crate) fn compile_fn_program(
     ctx: &Expr,
@@ -14,7 +42,7 @@ pub(crate) fn compile_fn_program(
     // Emit top-level varnode declarations (no builder needed — use context directly).
     let mut global_varnode_predecls: Vec<proc_macro2::TokenStream> = Vec::new();
     let mut global_varnode_inits: Vec<proc_macro2::TokenStream> = Vec::new();
-    let mut global_locals: HashMap<String, proc_macro2::Ident> = HashMap::new();
+    let mut global_locals: HashMap<String, LocalKind> = HashMap::new();
 
     for stmt in top_varnodes {
         let Statement::LocalDecl { name, size_bytes, .. } = stmt else {
@@ -30,6 +58,7 @@ pub(crate) fn compile_fn_program(
         global_varnode_inits.push(quote! {
             let #ident = {
                 use ::std::borrow::Cow;
+                use #pcode_root::value::Renameable as _;
                 let __space = (#ctx).make_temp_space();
                 let __id = #pcode_root::value::Varnode::make(&mut (#ctx), 0, #size, __space).id;
                 let __name = (#ctx).get_unique_name(Cow::Borrowed(#name));
@@ -41,7 +70,7 @@ pub(crate) fn compile_fn_program(
             };
             #outer_ident = #ident;
         });
-        global_locals.insert(name.clone(), ident);
+        global_locals.insert(name.clone(), LocalKind::Varnode(ident));
     }
 
     let mut all_predecls = Vec::new();
@@ -76,7 +105,7 @@ pub(crate) fn compile_fn_program(
 fn compile_single_fn(
     ctx: &Expr,
     fn_decl: &FnDecl,
-    global_locals: &HashMap<String, proc_macro2::Ident>,
+    global_locals: &HashMap<String, LocalKind>,
     pcode_root: &proc_macro2::TokenStream,
 ) -> syn::Result<(
     Vec<proc_macro2::TokenStream>,
@@ -162,7 +191,7 @@ fn compile_single_fn(
     }
 
     // Build the statement emissions.
-    let mut locals: HashMap<String, proc_macro2::Ident> = global_locals.clone();
+    let mut locals: HashMap<String, LocalKind> = global_locals.clone();
     let mut emitted: Vec<proc_macro2::TokenStream> = Vec::new();
 
     // Emit statements (skip index 0 — the entry label is created explicitly below).
@@ -247,7 +276,7 @@ pub(crate) fn compile_qcode_from_statements_ctx(
     // Emit preamble varnode declarations against the context (no builder yet).
     let mut preamble_predecls: Vec<proc_macro2::TokenStream> = Vec::new();
     let mut preamble_inits: Vec<proc_macro2::TokenStream> = Vec::new();
-    let mut locals: HashMap<String, proc_macro2::Ident> = HashMap::new();
+    let mut locals: HashMap<String, LocalKind> = HashMap::new();
 
     for stmt in preamble_varnodes {
         let Statement::LocalDecl { name, size_bytes, .. } = stmt else { unreachable!() };
@@ -258,6 +287,7 @@ pub(crate) fn compile_qcode_from_statements_ctx(
         preamble_inits.push(quote! {
             let #ident = {
                 use ::std::borrow::Cow;
+                use #pcode_root::value::Renameable as _;
                 let __space = (#ctx).make_temp_space();
                 let __id = #pcode_root::value::Varnode::make(&mut (#ctx), 0, #size, __space).id;
                 let __name = (#ctx).get_unique_name(Cow::Borrowed(#name));
@@ -269,7 +299,7 @@ pub(crate) fn compile_qcode_from_statements_ctx(
             };
             #outer_ident = #ident;
         });
-        locals.insert(name.clone(), ident);
+        locals.insert(name.clone(), LocalKind::Varnode(ident));
     }
 
     // Collect ALL named labels for predecls (including entry).
@@ -358,7 +388,7 @@ pub(crate) fn compile_qcode_from_statements_ctx(
 fn emit_statement(
     statement: &Statement,
     index: usize,
-    locals: &mut HashMap<String, proc_macro2::Ident>,
+    locals: &mut HashMap<String, LocalKind>,
     emitted: &mut Vec<proc_macro2::TokenStream>,
     pcode_root: &proc_macro2::TokenStream,
 ) -> syn::Result<()> {
@@ -376,7 +406,7 @@ fn emit_statement(
                     .make_named_temp(Cow::Borrowed(#name), #size);
                 #outer_ident = #ident;
             });
-            locals.insert(name.clone(), ident);
+            locals.insert(name.clone(), LocalKind::Varnode(ident));
         }
 
         Statement::Assign {
@@ -401,7 +431,7 @@ fn emit_statement(
                     ).rename(Cow::Borrowed(#name));
                 });
             }
-            locals.insert(name.clone(), ident);
+            locals.insert(name.clone(), LocalKind::Instruction(ident));
         }
 
         Statement::Expr(expr) => {
@@ -440,7 +470,7 @@ fn emit_statement(
         }
 
         Statement::BranchInd { ptr, .. } => {
-            let ptr_tokens = lower_atom(ptr, None, locals, pcode_root)?;
+            let ptr_tokens = lower_atom(ptr, None, AtomContext::Pointer, locals, pcode_root)?;
             emitted.push(quote! {
                 {
                     let __qcode_ptr = #ptr_tokens;
@@ -455,7 +485,7 @@ fn emit_statement(
             fallthrough,
             ..
         } => {
-            let cond_tokens = lower_atom(condition, None, locals, pcode_root)?;
+            let cond_tokens = lower_atom(condition, None, AtomContext::Arithmetic, locals, pcode_root)?;
             let target_ts = label_to_block_id(target, pcode_root);
             let fallthrough_ts = label_to_block_id(fallthrough, pcode_root);
             emitted.push(quote! {
@@ -490,7 +520,7 @@ fn emit_statement(
         }
 
         Statement::CallInd { ptr, .. } => {
-            let ptr_tokens = lower_atom(ptr, None, locals, pcode_root)?;
+            let ptr_tokens = lower_atom(ptr, None, AtomContext::Pointer, locals, pcode_root)?;
             emitted.push(quote! {
                 {
                     let __qcode_ptr = #ptr_tokens;
@@ -500,7 +530,7 @@ fn emit_statement(
         }
 
         Statement::Return { ptr, .. } => {
-            let ptr_tokens = lower_atom(ptr, None, locals, pcode_root)?;
+            let ptr_tokens = lower_atom(ptr, None, AtomContext::Pointer, locals, pcode_root)?;
             emitted.push(quote! {
                 {
                     let __qcode_ptr = #ptr_tokens;
@@ -550,14 +580,14 @@ fn emit_branch_stmt(
 
 fn lower_expr(
     expr: &ExprNode,
-    locals: &HashMap<String, proc_macro2::Ident>,
+    locals: &HashMap<String, LocalKind>,
     pcode_root: &proc_macro2::TokenStream,
 ) -> syn::Result<proc_macro2::TokenStream> {
     match expr {
-        ExprNode::Atom(atom) => lower_atom(atom, None, locals, pcode_root),
+        ExprNode::Atom(atom) => lower_atom(atom, None, AtomContext::Arithmetic, locals, pcode_root),
 
         ExprNode::Unop { op, src } => {
-            let src_tokens = lower_atom(src, None, locals, pcode_root)?;
+            let src_tokens = lower_atom(src, None, AtomContext::Arithmetic, locals, pcode_root)?;
 
             let call = match op.as_str() {
                 "!" => quote! { __qcode_builder.push_bool_not(__qcode_src).id },
@@ -605,8 +635,8 @@ fn lower_expr(
             let lhs_size = size_hint_tokens(lhs, locals, pcode_root)?;
             let rhs_size = size_hint_tokens(rhs, locals, pcode_root)?;
 
-            let lhs_tokens = lower_atom(lhs, rhs_size.clone(), locals, pcode_root)?;
-            let rhs_tokens = lower_atom(rhs, lhs_size.clone(), locals, pcode_root)?;
+            let lhs_tokens = lower_atom(lhs, rhs_size.clone(), AtomContext::Arithmetic, locals, pcode_root)?;
+            let rhs_tokens = lower_atom(rhs, lhs_size.clone(), AtomContext::Arithmetic, locals, pcode_root)?;
 
             let call = match op.as_str() {
                 "+" => quote! { __qcode_builder.push_add(__qcode_lhs, __qcode_rhs).id },
@@ -684,7 +714,7 @@ fn lower_expr(
             size_bytes,
             src,
         } => {
-            let src_tokens = lower_atom(src, None, locals, pcode_root)?;
+            let src_tokens = lower_atom(src, None, AtomContext::Arithmetic, locals, pcode_root)?;
             let size = *size_bytes;
 
             let call = match op {
@@ -708,16 +738,16 @@ fn lower_expr(
         }
 
         ExprNode::Load { size_bytes, ptr } => {
-            let ptr_tokens = lower_atom(ptr, None, locals, pcode_root)?;
+            let ptr_tokens = lower_atom(ptr, None, AtomContext::Pointer, locals, pcode_root)?;
             let size = *size_bytes;
 
             Ok(quote! {
                 {
                     let __qcode_ptr = #ptr_tokens;
-                    let __qcode_load_space = match __qcode_builder.context().get_value(__qcode_ptr) {
-                        #pcode_root::value::ValueRef::Varnode(v) => v.space().id,
-                        _ => __qcode_builder.context().default_space,
-                    };
+                    let __qcode_load_space = __qcode_builder
+                        .context()
+                        .value_space_id(__qcode_ptr)
+                        .unwrap_or(__qcode_builder.context().default_space);
                     let __qcode_value = __qcode_builder
                         .push_load::<false>(
                             __qcode_ptr,
@@ -737,15 +767,19 @@ fn lower_expr(
         ExprNode::Store { ptr, src } => {
             let src_size = size_hint_tokens(src, locals, pcode_root)?;
 
-            let ptr_tokens = lower_atom(ptr, None, locals, pcode_root)?;
-            let src_tokens = lower_atom(src, src_size, locals, pcode_root)?;
+            let ptr_tokens = lower_atom(ptr, None, AtomContext::Pointer, locals, pcode_root)?;
+            let src_tokens = lower_atom(src, src_size, AtomContext::Arithmetic, locals, pcode_root)?;
 
             Ok(quote! {
                 {
                     let __qcode_ptr = #ptr_tokens;
                     let __qcode_src = #src_tokens;
+                    let __qcode_store_space = __qcode_builder
+                        .context()
+                        .value_space_id(__qcode_ptr)
+                        .unwrap_or(__qcode_builder.context().default_space);
                     __qcode_builder
-                        .push_store(__qcode_src, __qcode_ptr, __qcode_builder.context().default_space)
+                        .push_store(__qcode_src, __qcode_ptr, __qcode_store_space)
                         .id
                 }
             })
@@ -792,7 +826,7 @@ fn lower_expr(
 fn lower_func1(
     name: &str,
     args: &[TypedAtom],
-    locals: &HashMap<String, proc_macro2::Ident>,
+    locals: &HashMap<String, LocalKind>,
     pcode_root: &proc_macro2::TokenStream,
 ) -> syn::Result<proc_macro2::TokenStream> {
     if args.len() != 1 {
@@ -801,13 +835,13 @@ fn lower_func1(
             format!("{name} expects exactly 1 argument"),
         ));
     }
-    lower_atom(&args[0], None, locals, pcode_root)
+    lower_atom(&args[0], None, AtomContext::Arithmetic, locals, pcode_root)
 }
 
 fn lower_func2(
     name: &str,
     args: &[TypedAtom],
-    locals: &HashMap<String, proc_macro2::Ident>,
+    locals: &HashMap<String, LocalKind>,
     pcode_root: &proc_macro2::TokenStream,
 ) -> syn::Result<(proc_macro2::TokenStream, proc_macro2::TokenStream)> {
     if args.len() != 2 {
@@ -817,23 +851,24 @@ fn lower_func2(
         ));
     }
     Ok((
-        lower_atom(&args[0], None, locals, pcode_root)?,
-        lower_atom(&args[1], None, locals, pcode_root)?,
+        lower_atom(&args[0], None, AtomContext::Arithmetic, locals, pcode_root)?,
+        lower_atom(&args[1], None, AtomContext::Arithmetic, locals, pcode_root)?,
     ))
 }
 
 fn lower_atom(
     typed: &TypedAtom,
     size_hint: Option<proc_macro2::TokenStream>,
-    locals: &HashMap<String, proc_macro2::Ident>,
+    ctx: AtomContext,
+    locals: &HashMap<String, LocalKind>,
     pcode_root: &proc_macro2::TokenStream,
 ) -> syn::Result<proc_macro2::TokenStream> {
     match &typed.atom {
         // External capture `{name}` — resolve to local if declared in this call, else outer scope.
         Atom::External(name) => {
-            if let Some(local_ident) = locals.get(name) {
+            if let Some(kind) = locals.get(name) {
                 // Resolve to the in-call local.
-                lower_local_ident(local_ident, typed.size_bytes, pcode_root)
+                lower_local_ident(kind.ident(), typed.size_bytes, pcode_root)
             } else {
                 // Fall back to outer Rust scope.
                 let ident = format_ident!("{}", name);
@@ -866,13 +901,63 @@ fn lower_atom(
         }
 
         Atom::Local(name) => {
-            let Some(local_ident) = locals.get(name) else {
+            let Some(kind) = locals.get(name) else {
                 return Err(syn::Error::new(
                     proc_macro2::Span::call_site(),
                     format!("unknown local identifier '{name}'"),
                 ));
             };
-            lower_local_ident(local_ident, typed.size_bytes, pcode_root)
+            if matches!(ctx, AtomContext::Arithmetic) && kind.is_varnode() {
+                return Err(syn::Error::new(
+                    proc_macro2::Span::call_site(),
+                    format!(
+                        "'{name}' is a varnode (pointer); use `&{name}` for addressof or `load(sz, {name})` to dereference its value"
+                    ),
+                ));
+            }
+            lower_local_ident(kind.ident(), typed.size_bytes, pcode_root)
+        }
+
+        Atom::AddressOf(name) => {
+            let Some(kind) = locals.get(name) else {
+                return Err(syn::Error::new(
+                    proc_macro2::Span::call_site(),
+                    format!("unknown local identifier '{name}' in addressof expression"),
+                ));
+            };
+            if !kind.is_varnode() {
+                return Err(syn::Error::new(
+                    proc_macro2::Span::call_site(),
+                    format!("'&{name}' is not valid: `&` (addressof) can only be applied to varnodes, but '{name}' is an SSA value"),
+                ));
+            }
+            let local_ident = kind.ident();
+            if let Some(expected_size) = typed.size_bytes {
+                Ok(quote! {
+                    {
+                        let __qcode_addr_size = #pcode_root::value::Varnode::from_id(
+                            __qcode_builder.context(), #local_ident
+                        ).space().addr_size;
+                        assert_eq!(
+                            __qcode_addr_size,
+                            #expected_size,
+                            "qcode size mismatch for `&{}`: expected {} bytes, got {} bytes (space addr_size)",
+                            #name,
+                            #expected_size,
+                            __qcode_addr_size
+                        );
+                        let __qcode_value_id: #pcode_root::value::ValueId = (#local_ident).into();
+                        __qcode_value_id
+                    }
+                })
+            } else {
+                Ok(quote! {
+                    {
+                        let __qcode_value_id: #pcode_root::value::ValueId = (#local_ident).into();
+                        __qcode_value_id
+                    }
+                })
+            }
         }
 
         Atom::Int(value) => {
@@ -925,7 +1010,7 @@ fn lower_local_ident(
 
 fn size_hint_tokens(
     typed: &TypedAtom,
-    locals: &HashMap<String, proc_macro2::Ident>,
+    locals: &HashMap<String, LocalKind>,
     pcode_root: &proc_macro2::TokenStream,
 ) -> syn::Result<Option<proc_macro2::TokenStream>> {
     if let Some(explicit) = typed.size_bytes {
@@ -934,7 +1019,8 @@ fn size_hint_tokens(
 
     match &typed.atom {
         Atom::External(name) => {
-            if let Some(local_ident) = locals.get(name) {
+            if let Some(kind) = locals.get(name) {
+                let local_ident = kind.ident();
                 Ok(Some(quote! {
                     {
                         let __qcode_value_id: #pcode_root::value::ValueId = (#local_ident).into();
@@ -953,17 +1039,33 @@ fn size_hint_tokens(
         }
 
         Atom::Local(name) => {
-            let Some(local_ident) = locals.get(name) else {
+            let Some(kind) = locals.get(name) else {
                 return Err(syn::Error::new(
                     proc_macro2::Span::call_site(),
                     format!("unknown local identifier '{name}'"),
                 ));
             };
+            let local_ident = kind.ident();
             Ok(Some(quote! {
                 {
                     let __qcode_value_id: #pcode_root::value::ValueId = (#local_ident).into();
                     __qcode_builder.context().get_value(__qcode_value_id).size()
                 }
+            }))
+        }
+
+        Atom::AddressOf(name) => {
+            let Some(kind) = locals.get(name) else {
+                return Err(syn::Error::new(
+                    proc_macro2::Span::call_site(),
+                    format!("unknown local identifier '{name}'"),
+                ));
+            };
+            let local_ident = kind.ident();
+            Ok(Some(quote! {
+                #pcode_root::value::Varnode::from_id(
+                    __qcode_builder.context(), #local_ident
+                ).space().addr_size
             }))
         }
 

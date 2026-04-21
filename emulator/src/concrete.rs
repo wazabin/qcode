@@ -894,7 +894,7 @@ impl StandaloneEmulator {
                 target,
                 fallthrough,
             }) => {
-                let cond_val = self.get_value(ctx, *condition).unwrap_or(0);
+                let cond_val = self.get_value(ctx, *condition).unwrap();
                 if cond_val != 0 {
                     self.block = *target;
                 } else {
@@ -906,7 +906,7 @@ impl StandaloneEmulator {
             Mnemonic::BranchInd(BranchInd { ptr })
             | Mnemonic::CallInd(CallInd { ptr, .. })
             | Mnemonic::Return(Return { ptr, .. }) => {
-                let addr = self.get_value(ctx, *ptr).unwrap_or(0);
+                let addr = self.get_value(ctx, *ptr).unwrap();
                 let target = BasicBlock::from_addr(ctx, addr)
                     .ok_or_else(|| {
                         self.make_error(ctx, EmulatorErrorKind::InvalidBlockAddress(addr))
@@ -1257,7 +1257,7 @@ impl<'ctx> Interpreter for Emulator<'ctx> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use qcode::{builder::Builder, context::Context};
+    use qcode::context::Context;
     use qcode_macro::qcode;
 
     #[test]
@@ -1451,17 +1451,20 @@ mod tests {
         qcode!(
             ctx,
             "
+            varnode i64 V0;
+            varnode i64 V1;
+
         <block>
-            local i64 v0;
-            local i64 v1;
-            %res = v0 + v1;
+            %v0 = load(i64, &V0);
+            %v1 = load(i64, &V1);
+            %res = %v0 + %v1;
             goto <0x1001>;
         "
         );
 
         let mut emu = Emulator::from_block(&ctx, block);
-        emu.set_varnode(v0, 2).unwrap();
-        emu.set_varnode(v1, 3).unwrap();
+        emu.set_varnode(V0, 2).unwrap();
+        emu.set_varnode(V1, 3).unwrap();
         emu.run_block().unwrap();
 
         assert_eq!(
@@ -1476,9 +1479,13 @@ mod tests {
         qcode!(
             ctx,
             "
+            varnode i128 V0;
+            varnode i128 V1;
+
         <block>
-            local i128 v0;
-            local i128 v1;
+            %v0 = load(i128, &V0);
+            %v1 = load(i128, &V1);
+
             %res = v0 / v1;
             goto <0x1001>;
         "
@@ -1488,8 +1495,8 @@ mod tests {
         let v0_bits = u128::from(1u8) << 100;
         let v1_bits = u128::from(1u8) << 99;
 
-        emu.set_varnode_u128(v0, v0_bits).unwrap();
-        emu.set_varnode_u128(v1, v1_bits).unwrap();
+        emu.set_varnode_u128(V0, v0_bits).unwrap();
+        emu.set_varnode_u128(V1, v1_bits).unwrap();
         emu.run_block().unwrap();
 
         // Quotient is small enough to also be visible through legacy u64 extraction.
@@ -1552,18 +1559,21 @@ mod tests {
         qcode!(
             ctx,
             "
+            varnode i64 A;
+            varnode i64 B;
+
             fn function:
             <entry>
-                local i64 lhs;
-                local i64 rhs;
-                %sum = lhs + rhs;
+                %a = load(i64, &A);
+                %b = load(i64, &B);
+                %sum = %a + %b;
                 return [i64 0];
             "
         );
 
         let mut emu = Emulator::from_function(&ctx, function);
-        emu.set_varnode(lhs, 7).unwrap();
-        emu.set_varnode(rhs, 5).unwrap();
+        emu.set_varnode(A, 7).unwrap();
+        emu.set_varnode(B, 5).unwrap();
         emu.run_function(function).unwrap();
 
         assert_eq!(
@@ -1579,11 +1589,14 @@ mod tests {
         qcode!(
             ctx,
             "
+            varnode i64 A;
+            varnode i64 B;
+
             fn function:
             <entry>
-                local i64 lhs;
-                local i64 rhs;
-                %sum = lhs + rhs;
+                %a = load(i64, &A);
+                %b = load(i64, &B);
+                %sum = %a + %b;
                 return [i64 0];
             "
         );

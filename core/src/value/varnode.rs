@@ -165,14 +165,6 @@ impl<'str, 'ctx> VarnodeMutRef<'str, 'ctx> {
     fn inner_mut(&mut self) -> &mut Varnode<'str> {
         &mut self.ctx.values.varnodes[self.id]
     }
-
-    fn rename(&mut self, name: Cow<'str, str>) -> Result<'str, ()> {
-        let id = self.id.into();
-        let old_name = self.inner_mut().name.take();
-        update_context_name(id, self.ctx, name.clone(), old_name.as_deref())?;
-        self.ctx.values.varnodes[self.id].name = Some(name);
-        Ok(())
-    }
 }
 
 impl<'s, 'ctx: 's, 'str: 'ctx> WithCtx<'s, 's, 'str> for VarnodeMutRef<'str, 'ctx> {
@@ -205,7 +197,11 @@ impl<'str, 'ctx> Value<'str, 'ctx> for VarnodeMutRef<'str, 'ctx> {
 
 impl<'str, 'ctx> Renameable<'str, 'ctx> for VarnodeMutRef<'str, 'ctx> {
     fn rename(&mut self, name: Cow<'str, str>) -> Result<'str, ()> {
-        self.rename(name)
+        let id = self.id.into();
+        let old_name = self.inner_mut().name.take();
+        update_context_name(id, self.ctx, name.clone(), old_name.as_deref())?;
+        self.ctx.values.varnodes[self.id].name = Some(name);
+        Ok(())
     }
 }
 

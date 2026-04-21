@@ -565,6 +565,15 @@ fn parse_atom(pair: Pair<'_, Rule>) -> Result<Atom, ParseError> {
                 .to_owned(),
         )),
         Rule::ident => Ok(Atom::Local(inner.as_str().to_owned())),
+        Rule::addressof => {
+            let name = inner
+                .into_inner()
+                .next()
+                .ok_or_else(|| ParseError::new("invalid addressof: missing identifier"))?
+                .as_str()
+                .to_owned();
+            Ok(Atom::AddressOf(name))
+        }
         Rule::integer => parse_integer(inner.as_str()).map(Atom::Int),
         _ => Err(ParseError::new("invalid atom")),
     }

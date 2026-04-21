@@ -203,14 +203,14 @@ mod tests {
     #[ignore = "WIP: analysis not fully implemented yet"]
     fn test_dead_store_overwritten() {
         // Store to r0 twice — first store is dead.
-        let mut ctx = TestContext::new().ctx;
-        let rax = ctx.get_named("r0").unwrap().as_varnode().unwrap();
+        let mut ctx = Context::new();
         qcode!(
             ctx,
             "
+            varnode i32 A;
             <block>
-            store({rax}, i64 1);
-            store({rax}, i64 2);
+                store(&A, i64 1);
+                store(&A, i64 2);
             "
         );
         let block_id = block;
@@ -230,15 +230,15 @@ mod tests {
     #[test]
     fn test_store_read_then_overwrite_not_dead() {
         // Store to r0, load r0, store r0 — first store is NOT dead.
-        let mut ctx = TestContext::new().ctx;
-        let rax = ctx.get_named("r0").unwrap().as_varnode().unwrap();
+        let mut ctx = Context::new();
         qcode!(
             ctx,
             "
+            varnode i32 A;
             <block>
-            store({rax}, i64 1);
-            %tmp = load(i64, {rax});
-            store({rax}, i64 2);
+                store(&A, i64 1);
+                %tmp = load(i64, &A);
+                store(&A, i64 2);
             "
         );
         let block_id = block;
