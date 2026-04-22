@@ -844,9 +844,8 @@ mod tests {
 
     #[test]
     fn parses_ssa_assignment_chain() {
-        let statements =
-            parse_program("i64 %a = i64 1 + i64 2; i64 %b = i64 %a + i64 5")
-                .expect("parse should succeed");
+        let statements = parse_program("i64 %a = i64 1 + i64 2; i64 %b = i64 %a + i64 5")
+            .expect("parse should succeed");
         assert_eq!(statements.len(), 2);
 
         match &statements[0] {

@@ -16,8 +16,8 @@ use std::borrow::Cow;
 use jstd::{Identifier, registry::Identified};
 
 use crate::{
-    error::Result,
     context::Context,
+    error::Result,
     space::{Space, SpaceId},
     value::{
         Value, ValueId,
