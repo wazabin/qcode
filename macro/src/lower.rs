@@ -155,19 +155,26 @@ fn compile_single_fn(
         })
         .collect();
 
-    let exposed_ssas: Vec<proc_macro2::Ident> = statements
-        .iter()
-        .filter_map(|s| {
-            if let Statement::Assign {
-                name, expose: true, ..
-            } = s
-            {
-                Some(format_ident!("{}", name))
-            } else {
-                None
+    let mut seen_ssa_names = std::collections::HashSet::new();
+    let mut exposed_ssas: Vec<proc_macro2::Ident> = Vec::new();
+    for s in statements.iter() {
+        if let Statement::Assign {
+            name, expose: true, ..
+        } = s
+        {
+            if !seen_ssa_names.insert(name.clone()) {
+                return Err(syn::Error::new(
+                    proc_macro2::Span::call_site(),
+                    format!(
+                        "fn `{fn_name_str}`: duplicate SSA name `%{name}` — \
+                         each `%name` binding must be unique within the function body; \
+                         rename one of the conflicting `%{name}` assignments"
+                    ),
+                ));
             }
-        })
-        .collect();
+            exposed_ssas.push(format_ident!("{}", name));
+        }
+    }
 
     let local_decls: Vec<proc_macro2::Ident> = statements
         .iter()
@@ -324,19 +331,26 @@ pub(crate) fn compile_qcode_from_statements_ctx(
         })
         .collect();
 
-    let exposed_ssas: Vec<proc_macro2::Ident> = body_statements
-        .iter()
-        .filter_map(|s| {
-            if let Statement::Assign {
-                name, expose: true, ..
-            } = s
-            {
-                Some(format_ident!("{}", name))
-            } else {
-                None
+    let mut seen_ssa_names = std::collections::HashSet::new();
+    let mut exposed_ssas: Vec<proc_macro2::Ident> = Vec::new();
+    for s in body_statements.iter() {
+        if let Statement::Assign {
+            name, expose: true, ..
+        } = s
+        {
+            if !seen_ssa_names.insert(name.clone()) {
+                return Err(syn::Error::new(
+                    proc_macro2::Span::call_site(),
+                    format!(
+                        "duplicate SSA name `%{name}` — \
+                         each `%name` binding must be unique; \
+                         rename one of the conflicting `%{name}` assignments"
+                    ),
+                ));
             }
-        })
-        .collect();
+            exposed_ssas.push(format_ident!("{}", name));
+        }
+    }
 
     let local_decls: Vec<proc_macro2::Ident> = body_statements
         .iter()
