@@ -221,7 +221,7 @@ fn compile_single_fn(
                 __qcode_fn_id.id
             };
 
-            // Create the entry block and builder.
+            // Create the entry block.
             let __qcode_root_id = {
                 #pcode_root::value::BasicBlock::make(&mut (#ctx))
                     .with_name(Cow::Borrowed(#entry_name))
@@ -230,6 +230,14 @@ fn compile_single_fn(
             };
             #entry_ident = __qcode_root_id;
 
+            // Set the root before creating the builder so that the entry block
+            // has a parent function when get_or_make_local_label runs — otherwise
+            // ensure_created_block_in_function sees no parent and silently drops
+            // all non-entry blocks from the function's block list.
+            #pcode_root::value::Function::from_id_mut(&mut (#ctx), #fn_ident)
+                .set_root(__qcode_root_id)
+                .unwrap();
+
             {
                 let mut __qcode_builder = #pcode_root::builder::Builder::from_block(
                     #pcode_root::value::BasicBlock::from_id_mut(&mut (#ctx), __qcode_root_id)
@@ -237,10 +245,6 @@ fn compile_single_fn(
 
                 #(#emitted)*
             }
-
-            #pcode_root::value::Function::from_id_mut(&mut (#ctx), #fn_ident)
-                .set_root(__qcode_root_id)
-                .unwrap();
         }
     };
 
