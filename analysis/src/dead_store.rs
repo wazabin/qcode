@@ -132,9 +132,9 @@ pub fn remove_dead_reg_insns(ctx: &mut Context, block_id: BlockId) {
         return;
     }
 
-    BasicBlock::from_id_mut(ctx, block_id).retain_insns(|id| !dead.contains(id));
-
-    ctx.values.remove_instructions(&dead);
+    for id in &dead {
+        ctx.remove_instruction(*id);
+    }
 }
 
 #[cfg(test)]

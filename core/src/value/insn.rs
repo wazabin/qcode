@@ -47,7 +47,7 @@ pub struct InstructionId(usize);
 #[derive(Clone)]
 pub struct Instruction<'str> {
     /// The name of this instruction
-    name: Option<Cow<'str, str>>,
+    pub(crate) name: Option<Cow<'str, str>>,
 
     /// The size of this value in bytes
     size: usize,

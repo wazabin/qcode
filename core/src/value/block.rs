@@ -334,10 +334,21 @@ impl<'str, 'ctx> BlockMutRef<'str, 'ctx> {
         self.inner_mut().instructions.push(id);
     }
 
-    /// Retains only the instructions for which `f` returns true.
-    pub fn retain_insns(&mut self, f: impl FnMut(&InstructionId) -> bool) {
-        // TODO: unlink the instructions that are removed from the block (i.e. set their parent to None)
-        self.inner_mut().instructions.retain(f);
+    /// Retains only the instructions for which `f` returns true, deleting the
+    /// removed instructions.
+    pub fn retain_insns(&mut self, mut f: impl FnMut(&InstructionId) -> bool) {
+        let mut removed = Vec::new();
+        self.inner_mut().instructions.retain(|id| {
+            if f(id) {
+                true
+            } else {
+                removed.push(*id);
+                false
+            }
+        });
+        for id in removed {
+            self.ctx.remove_instruction(id);
+        }
     }
 
     /// Adds an edge to this block's edge set.

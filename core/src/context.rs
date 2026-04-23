@@ -1,6 +1,10 @@
 //! The central arena for all IR state: [`Context`].
 
-use std::{borrow::Cow, collections::HashMap, fmt::Display};
+use std::{
+    borrow::Cow,
+    collections::{HashMap, HashSet},
+    fmt::Display,
+};
 
 use crate::{
     error::{Error, ErrorTy, Result},
@@ -262,6 +266,32 @@ impl<'str> Context<'str> {
         self.values.users.remove(&old);
     }
 
+    /// Removes an instruction from its parent block and unlinks all associated state:
+    /// removes the instruction from the block's instruction list, clears `parent`,
+    /// removes its name from the name map, clears the name field, and prunes it from
+    /// the `users` reverse map for all its operands.
+    ///
+    /// If the instruction has no parent block the block-list and parent steps are
+    /// skipped, but name and users cleanup still runs.
+    pub fn remove_instruction(&mut self, id: InstructionId) {
+        let parent = self.values.instructions[id].parent;
+        let name = self.values.instructions[id].name.clone();
+
+        if let Some(block_id) = parent {
+            self.values.basic_blocks[block_id]
+                .instructions
+                .retain(|&i| i != id);
+        }
+        self.values.instructions[id].parent = None;
+
+        if let Some(ref n) = name {
+            self.name_map.remove(n.as_ref());
+        }
+        self.values.instructions[id].name = None;
+
+        self.values.remove_instructions(&HashSet::from([id]));
+    }
+
     /// Associates `addr` with `id` in the address map.
     ///
     /// Returns `Err(Error::DuplicateAddress(addr))` if the address is already
@@ -492,5 +522,168 @@ mod tests {
 
         let count = ctx.instructions().count();
         assert!(count >= 1, "expected at least one instruction, got {count}");
+    }
+
+    #[test]
+    fn remove_instruction_removes_from_block() {
+        let mut ctx = Context::new();
+        qcode!(
+            ctx,
+            "
+            varnode i64 x;
+            <block>
+                %a = load(i64, &x);
+                %b = load(i64, &x);
+                return [%a];
+            "
+        );
+        let block_ref = BasicBlock::from_id(&ctx, block);
+        let ids: Vec<_> = block_ref.instruction_ids().to_vec();
+        let load_a = ids[0];
+        let original_len = ids.len();
+
+        ctx.remove_instruction(load_a);
+
+        let remaining: Vec<_> = BasicBlock::from_id(&ctx, block).instruction_ids().to_vec();
+        assert_eq!(remaining.len(), original_len - 1);
+        assert!(!remaining.contains(&load_a));
+    }
+
+    #[test]
+    fn remove_instruction_clears_parent() {
+        let mut ctx = Context::new();
+        qcode!(
+            ctx,
+            "
+            varnode i64 x;
+            <block>
+                %a = load(i64, &x);
+                return [%a];
+            "
+        );
+        let load_id = BasicBlock::from_id(&ctx, block).instruction_ids()[0];
+
+        ctx.remove_instruction(load_id);
+
+        assert!(
+            ctx.get_insn(load_id).parent().is_none(),
+            "parent should be None after removal"
+        );
+    }
+
+    #[test]
+    fn remove_instruction_frees_name() {
+        let mut ctx = Context::new();
+        qcode!(
+            ctx,
+            "
+            varnode i64 x;
+            <block>
+                %a = load(i64, &x);
+                return [%a];
+            "
+        );
+        let load_id = BasicBlock::from_id(&ctx, block).instruction_ids()[0];
+        assert!(
+            ctx.get_named("a").is_some(),
+            "name should be in map before removal"
+        );
+
+        ctx.remove_instruction(load_id);
+
+        assert!(
+            ctx.get_named("a").is_none(),
+            "name should be gone after removal"
+        );
+        assert!(
+            ctx.get_insn(load_id).name().is_none(),
+            "instruction name field should be cleared"
+        );
+    }
+
+    #[test]
+    fn remove_instruction_frees_name_for_reuse() {
+        let mut ctx = Context::new();
+        qcode!(
+            ctx,
+            "
+            varnode i64 x;
+            <block>
+                %a = load(i64, &x);
+                return [%a];
+            "
+        );
+        let load_id = BasicBlock::from_id(&ctx, block).instruction_ids()[0];
+
+        ctx.remove_instruction(load_id);
+
+        // Building another instruction named %a should succeed now.
+        qcode!(
+            ctx,
+            "
+            varnode i64 y;
+            <block2>
+                %a = load(i64, &y);
+                return [%a];
+            "
+        );
+        assert!(
+            ctx.get_named("a").is_some(),
+            "name should be reusable after removal"
+        );
+    }
+
+    #[test]
+    fn remove_instruction_updates_users_map() {
+        let mut ctx = Context::new();
+        qcode!(
+            ctx,
+            "
+            varnode i64 x;
+            <block>
+                %a = load(i64, &x);
+                %b = %a + i64 1;
+                return [%b];
+            "
+        );
+        let ids: Vec<_> = BasicBlock::from_id(&ctx, block).instruction_ids().to_vec();
+        let load_id = ids[0];
+        let add_id = ids[1];
+
+        assert!(
+            ctx.users(load_id).contains(&add_id),
+            "add should be a user of load before removal"
+        );
+
+        ctx.remove_instruction(add_id);
+
+        assert!(
+            ctx.users(load_id).is_empty(),
+            "load should have no users after add is removed"
+        );
+    }
+
+    #[test]
+    fn remove_instruction_unparented_noop() {
+        let mut ctx = Context::new();
+        qcode!(
+            ctx,
+            "
+            varnode i64 x;
+            <block>
+                %a = load(i64, &x);
+                return [%a];
+            "
+        );
+        let load_id = BasicBlock::from_id(&ctx, block).instruction_ids()[0];
+
+        // Manually detach from block without using remove_instruction,
+        // simulating an instruction with no parent.
+        ctx.values.instructions[load_id].parent = None;
+
+        // Should not panic even though parent is None.
+        ctx.remove_instruction(load_id);
+
+        assert!(ctx.get_named("a").is_none());
     }
 }
