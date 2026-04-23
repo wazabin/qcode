@@ -113,8 +113,8 @@ impl MnemonicKind for CallInd {
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct CBranch {
     pub condition: ValueId,
-    pub target: BlockId,
-    pub fallthrough: BlockId,
+    pub success_block: BlockId,
+    pub failure_block: BlockId,
 }
 
 impl MnemonicKind for CBranch {
@@ -131,10 +131,10 @@ impl MnemonicKind for CBranch {
             f,
             "if {} goto <{}>; else goto <{}>;",
             ctx.get_value(self.condition),
-            BasicBlock::from_id(ctx, self.target)
+            BasicBlock::from_id(ctx, self.success_block)
                 .name()
                 .unwrap_or(&Cow::Borrowed("unnamed")),
-            BasicBlock::from_id(ctx, self.fallthrough)
+            BasicBlock::from_id(ctx, self.failure_block)
                 .name()
                 .unwrap_or(&Cow::Borrowed("unnamed"))
         )
@@ -349,7 +349,7 @@ mod tests {
             panic!("expected cbranch");
         };
         assert_ne!(
-            cbranch.target, cbranch.fallthrough,
+            cbranch.success_block, cbranch.failure_block,
             "target and fallthrough must be distinct"
         );
     }

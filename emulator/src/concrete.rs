@@ -876,8 +876,8 @@ impl StandaloneEmulator {
 
             Mnemonic::CBranch(CBranch {
                 condition,
-                target,
-                fallthrough,
+                success_block: target,
+                failure_block: fallthrough,
             }) => {
                 let cond_val = self.get_value(ctx, *condition).unwrap();
                 if cond_val != 0 {

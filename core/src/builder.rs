@@ -887,9 +887,9 @@ impl<'str, 'ctx> Builder<'str, 'ctx> {
         let id = self
             .push_instruction(
                 Mnemonic::CBranch(CBranch {
-                    target,
+                    success_block: target,
                     condition,
-                    fallthrough,
+                    failure_block: fallthrough,
                 }),
                 0,
             )
