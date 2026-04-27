@@ -3,6 +3,7 @@ use crate::{
     error::Result,
     value::{
         Function, Instruction, Value, ValueId,
+        block_param::{BlockParam, BlockParamId, BlockParamMutRef, BlockParamRef},
         function::{FunctionId, FunctionMutRef, FunctionRef},
         insn::{InstructionId, InstructionRef},
         util::{
@@ -29,6 +30,10 @@ pub mod cfg;
 pub struct BasicBlock<'str> {
     /// An optionnal name for this basic block
     name: Option<Cow<'str, str>>,
+
+    /// Typed parameters declared at block entry (block-argument style).
+    /// These are NOT part of `instructions`; use `params()` to iterate them.
+    pub params: Vec<BlockParamId>,
 
     /// The ids of the instructions in this block
     pub instructions: Vec<InstructionId>,
@@ -132,6 +137,19 @@ where
         self.inner().address
     }
 
+    /// Iterates over this block's parameters in declaration order.
+    pub fn params(&'s self) -> impl Iterator<Item = BlockParamRef<'str, 'ctx>> + 's {
+        self.inner()
+            .params
+            .iter()
+            .map(|&id| BlockParam::from_id(self.ctx(), id))
+    }
+
+    /// Returns the number of parameters declared on this block.
+    pub fn num_params(&'s self) -> usize {
+        self.inner().params.len()
+    }
+
     /// Iterates over the instructions in this block
     pub fn instructions(&'s self) -> InstructionIter<'str, 'ctx> {
         let inner = self.inner();
@@ -172,9 +190,12 @@ where
     }
 
     fn fmt(&'s self, f: &mut Formatter<'_>) -> std::fmt::Result {
-        if let Some(name) = self.name() {
-            writeln!(f, "<{}>", name)?;
+        let name = self.name().unwrap_or("unnamed");
+        write!(f, "<{name}")?;
+        for param in self.params() {
+            write!(f, " {param}")?;
         }
+        writeln!(f, ">")?;
 
         self.iter().try_for_each(|instr| {
             write!(f, "\t")?;
@@ -326,6 +347,24 @@ impl<'str, 'ctx> BlockMutRef<'str, 'ctx> {
 
     pub fn as_ref(&self) -> BlockRef<'str, '_> {
         BlockRef::new(self.ctx, self.id)
+    }
+
+    /// Declares a new parameter on this block with the given size in bytes.
+    ///
+    /// The parameter is appended to the block's `params` list and its `parent`
+    /// is set to this block. It does NOT appear in `instructions`.
+    /// Returns a mutable reference whose `ValueId` can be used as an operand.
+    pub fn push_param(&mut self, size: usize) -> BlockParamMutRef<'str, '_> {
+        let block_id = self.id;
+        let index = self.inner().params.len();
+        let id = self.ctx.values.block_params.push(BlockParam {
+            index,
+            size,
+            parent: Some(block_id),
+            name: None,
+        });
+        self.inner_mut().params.push(id);
+        BlockParamMutRef::from_id(self.ctx, id)
     }
 
     fn insert_insn(&mut self, index: usize, insn_id: InstructionId) {
@@ -573,5 +612,107 @@ mod tests {
         let via_iter: Vec<_> = block.iter().map(|i| i.id).collect();
         let via_into: Vec<_> = (&block).into_iter().map(|i| i.id).collect();
         assert_eq!(via_iter, via_into);
+    }
+
+    #[test]
+    fn push_param_adds_to_params_not_instructions() {
+        let mut ctx = Context::new();
+        let mut block = BasicBlock::make(&mut ctx);
+
+        assert_eq!(block.num_params(), 0);
+        assert_eq!(block.as_ref().instruction_ids().len(), 0);
+
+        block.push_param(8);
+        assert_eq!(block.num_params(), 1);
+        assert_eq!(block.as_ref().instruction_ids().len(), 0);
+
+        block.push_param(4);
+        assert_eq!(block.num_params(), 2);
+        assert_eq!(block.as_ref().instruction_ids().len(), 0);
+    }
+
+    #[test]
+    fn params_iter_yields_in_order() {
+        let mut ctx = Context::new();
+        let mut block = BasicBlock::make(&mut ctx);
+
+        let p0_id = block.push_param(8).id;
+        let p1_id = block.push_param(4).id;
+        let block_ref = block.as_ref();
+
+        let param_ids: Vec<_> = block_ref.params().map(|p| p.id).collect();
+        assert_eq!(param_ids, [p0_id, p1_id]);
+        assert_eq!(block_ref.params().next().unwrap().index(), 0);
+        assert_eq!(block_ref.params().nth(1).unwrap().index(), 1);
+    }
+
+    #[test]
+    fn qcode_macro_block_with_params() {
+        use crate::context::Context;
+        use qcode_macro::qcode;
+
+        let mut ctx = Context::new();
+        qcode!(
+            ctx,
+            "
+            <entry @v1 @v2>
+                goto <done @x=@v1 @y=@v2>;
+
+            <done @x @y>
+                goto <0x1001>;
+            "
+        );
+
+        let entry = BasicBlock::from_id(&ctx, entry);
+        assert_eq!(entry.num_params(), 2, "entry should have 2 params");
+
+        let params = entry.params().collect::<Vec<_>>();
+        assert_eq!(params[0].name(), Some("v1"));
+        assert_eq!(params[1].name(), Some("v2"));
+
+        let done_block = BasicBlock::from_id(&ctx, done);
+        assert_eq!(done_block.num_params(), 2, "done should have 2 params");
+
+        // The branch from entry should carry 2 args.
+        let branch_insn = entry.iter().last().expect("entry has instructions");
+        let crate::value::insn::Mnemonic::Branch(branch) = branch_insn.mnemonic() else {
+            panic!("expected branch");
+        };
+        assert_eq!(branch.args.len(), 2);
+    }
+
+    #[test]
+    fn block_display_uses_qcode_param_syntax() {
+        use crate::context::Context;
+        use qcode_macro::qcode;
+
+        let mut ctx = Context::new();
+        qcode!(
+            ctx,
+            "
+            <entry @a @b>
+                goto <0x1001>;
+            "
+        );
+
+        let entry = BasicBlock::from_id(&ctx, entry);
+        assert!(entry.to_string().starts_with("<entry @a @b>\n"));
+    }
+
+    #[test]
+    fn param_value_id_usable_in_instruction() {
+        use crate::{builder::Builder, value::ValueId};
+        let mut ctx = Context::new();
+        let block_id = BasicBlock::make(&mut ctx).id;
+
+        let param_id: ValueId = {
+            let mut block = BasicBlock::from_id_mut(&mut ctx, block_id);
+            block.push_param(8).id()
+        };
+
+        let mut builder = Builder::from_block(BasicBlock::from_id_mut(&mut ctx, block_id));
+        let sum = builder.push_add(param_id, param_id);
+        assert_eq!(sum.size(), 8);
+        unsafe { builder.dont_finalize() };
     }
 }

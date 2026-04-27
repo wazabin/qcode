@@ -115,12 +115,49 @@ fn parse_fn_decl(pair: Pair<'_, Rule>) -> Result<FnDecl, ParseError> {
 fn parse_compound(pair: Pair<'_, Rule>, out: &mut Vec<Statement>) -> Result<(), ParseError> {
     for part in pair.into_inner() {
         match part.as_rule() {
-            Rule::label => out.push(parse_label(part)?),
+            Rule::label_decl => out.push(parse_label_decl(part)?),
             Rule::inner_stmt => parse_inner_stmt(part, out)?,
             _ => return Err(ParseError::new("unexpected compound statement")),
         }
     }
     Ok(())
+}
+
+fn parse_label_decl(pair: Pair<'_, Rule>) -> Result<Statement, ParseError> {
+    let span = source_span(pair.as_span());
+    let mut inner = pair.into_inner();
+    let name_pair = inner
+        .next()
+        .ok_or_else(|| ParseError::new("missing label name"))?;
+    let label_span = source_span(name_pair.as_span());
+    let label = match name_pair.as_rule() {
+        Rule::ident => {
+            let name = name_pair.as_str().to_owned();
+            let params: Vec<String> = inner
+                .filter(|p| p.as_rule() == Rule::block_param_name)
+                .map(|p| {
+                    p.as_str()
+                        .strip_prefix('@')
+                        .unwrap_or(p.as_str())
+                        .to_owned()
+                })
+                .collect();
+            Label::Named {
+                name,
+                params,
+                span: label_span,
+            }
+        }
+        Rule::integer => {
+            let addr = parse_integer(name_pair.as_str())?;
+            Label::Address {
+                value: addr,
+                span: label_span,
+            }
+        }
+        _ => return Err(ParseError::new("invalid label declaration")),
+    };
+    Ok(Statement::LabelDecl { label, span })
 }
 
 fn parse_inner_stmt(pair: Pair<'_, Rule>, out: &mut Vec<Statement>) -> Result<(), ParseError> {
@@ -170,22 +207,13 @@ fn parse_local_decl(pair: Pair<'_, Rule>) -> Result<Statement, ParseError> {
     })
 }
 
-fn parse_label(pair: Pair<'_, Rule>) -> Result<Statement, ParseError> {
-    let span = source_span(pair.as_span());
-    let label = label_value(
-        pair.into_inner()
-            .next()
-            .ok_or_else(|| ParseError::new("missing label name"))?,
-    )?;
-    Ok(Statement::LabelDecl { label, span })
-}
-
 /// Parses the content of a `<...>` label into a `Label`.
 fn label_value(pair: Pair<'_, Rule>) -> Result<Label, ParseError> {
     let span = source_span(pair.as_span());
     match pair.as_rule() {
         Rule::ident => Ok(Label::Named {
             name: pair.as_str().to_owned(),
+            params: vec![],
             span,
         }),
         Rule::integer => {
@@ -194,6 +222,36 @@ fn label_value(pair: Pair<'_, Rule>) -> Result<Label, ParseError> {
         }
         _ => Err(ParseError::new("invalid label content")),
     }
+}
+
+/// Parses a `branch_label` rule (`<(ident|int) branch_arg*>`) into a `Label` and args.
+fn parse_branch_label(
+    pair: Pair<'_, Rule>,
+) -> Result<(Label, Vec<(String, TypedAtom)>), ParseError> {
+    let mut inner = pair.into_inner();
+    let target_pair = inner
+        .next()
+        .ok_or_else(|| ParseError::new("missing branch label target"))?;
+    let label = label_value(target_pair)?;
+    let mut args = Vec::new();
+    for part in inner {
+        if part.as_rule() == Rule::branch_arg {
+            let mut arg_inner = part.into_inner();
+            let name_pair = arg_inner
+                .next()
+                .ok_or_else(|| ParseError::new("missing branch arg name"))?;
+            let name = name_pair
+                .as_str()
+                .strip_prefix('@')
+                .unwrap_or(name_pair.as_str())
+                .to_owned();
+            let value_pair = arg_inner
+                .next()
+                .ok_or_else(|| ParseError::new("missing branch arg value"))?;
+            args.push((name, parse_typed_atom(value_pair)?));
+        }
+    }
+    Ok((label, args))
 }
 
 fn parse_terminator(pair: Pair<'_, Rule>) -> Result<Statement, ParseError> {
@@ -205,16 +263,12 @@ fn parse_terminator(pair: Pair<'_, Rule>) -> Result<Statement, ParseError> {
 
     match specific.as_rule() {
         Rule::branch_stmt => {
-            let mut inner = specific.into_inner();
-            let target = label_value(
-                inner
-                    .next()
-                    .ok_or_else(|| ParseError::new("missing branch target"))?
-                    .into_inner()
-                    .next()
-                    .ok_or_else(|| ParseError::new("missing label content"))?,
-            )?;
-            Ok(Statement::Branch { target, span })
+            let branch_label_pair = specific
+                .into_inner()
+                .next()
+                .ok_or_else(|| ParseError::new("missing branch label"))?;
+            let (target, args) = parse_branch_label(branch_label_pair)?;
+            Ok(Statement::Branch { target, args, span })
         }
 
         Rule::branchind_stmt => {
@@ -234,26 +288,20 @@ fn parse_terminator(pair: Pair<'_, Rule>) -> Result<Statement, ParseError> {
                     .next()
                     .ok_or_else(|| ParseError::new("missing cbranch condition"))?,
             )?;
-            let target = label_value(
-                inner
-                    .next()
-                    .ok_or_else(|| ParseError::new("missing cbranch target"))?
-                    .into_inner()
-                    .next()
-                    .ok_or_else(|| ParseError::new("missing cbranch target content"))?,
-            )?;
-            let fallthrough = label_value(
-                inner
-                    .next()
-                    .ok_or_else(|| ParseError::new("missing cbranch fallthrough"))?
-                    .into_inner()
-                    .next()
-                    .ok_or_else(|| ParseError::new("missing cbranch fallthrough content"))?,
-            )?;
+            let target_pair = inner
+                .next()
+                .ok_or_else(|| ParseError::new("missing cbranch target"))?;
+            let (target, target_args) = parse_branch_label(target_pair)?;
+            let fallthrough_pair = inner
+                .next()
+                .ok_or_else(|| ParseError::new("missing cbranch fallthrough"))?;
+            let (fallthrough, fallthrough_args) = parse_branch_label(fallthrough_pair)?;
             Ok(Statement::CBranch {
                 condition,
                 target,
+                target_args,
                 fallthrough,
+                fallthrough_args,
                 span,
             })
         }
@@ -557,6 +605,13 @@ fn parse_atom(pair: Pair<'_, Rule>) -> Result<Atom, ParseError> {
                 .to_owned();
             Ok(Atom::External(ident))
         }
+        Rule::block_param_name => Ok(Atom::Local(
+            inner
+                .as_str()
+                .strip_prefix('@')
+                .unwrap_or(inner.as_str())
+                .to_owned(),
+        )),
         Rule::ssa_name => Ok(Atom::Local(
             inner
                 .as_str()
@@ -1034,6 +1089,7 @@ mod tests {
                     Label::Named {
                         name,
                         span: label_span,
+                        ..
                     },
                 span,
             } => {
@@ -1067,7 +1123,7 @@ mod tests {
 
         match &statements[0] {
             Statement::Branch {
-                target: Label::Named { name, span },
+                target: Label::Named { name, span, .. },
                 ..
             } => {
                 assert_eq!(name, "done");
@@ -1267,6 +1323,68 @@ mod tests {
                 ));
             }
             _ => panic!("expected function program"),
+        }
+    }
+
+    #[test]
+    fn parses_label_decl_with_params() {
+        let statements = stmts("<entry @v1 @v2>");
+        assert_eq!(statements.len(), 1);
+        match &statements[0] {
+            Statement::LabelDecl {
+                label: Label::Named { name, params, .. },
+                ..
+            } => {
+                assert_eq!(name, "entry");
+                assert_eq!(params, &["v1", "v2"]);
+            }
+            _ => panic!("expected named label declaration with params"),
+        }
+    }
+
+    #[test]
+    fn parses_branch_with_args() {
+        let statements = stmts("goto <done @v1=1 @v2=%x>");
+        assert_eq!(statements.len(), 1);
+        match &statements[0] {
+            Statement::Branch {
+                target: Label::Named { name, .. },
+                args,
+                ..
+            } => {
+                assert_eq!(name, "done");
+                assert_eq!(args.len(), 2);
+                assert_eq!(args[0].0, "v1");
+                assert!(matches!(args[0].1.atom, Atom::Int(1)));
+                assert_eq!(args[1].0, "v2");
+                assert!(matches!(&args[1].1.atom, Atom::Local(n) if n == "x"));
+            }
+            _ => panic!("expected branch with args"),
+        }
+    }
+
+    #[test]
+    fn parses_cbranch_with_args() {
+        let statements = stmts("if %c goto <then_lbl @x=1> else goto <else_lbl @y=%v>");
+        assert_eq!(statements.len(), 1);
+        match &statements[0] {
+            Statement::CBranch {
+                target,
+                target_args,
+                fallthrough,
+                fallthrough_args,
+                ..
+            } => {
+                assert!(matches!(target, Label::Named { name, .. } if name == "then_lbl"));
+                assert_eq!(target_args.len(), 1);
+                assert_eq!(target_args[0].0, "x");
+                assert!(matches!(target_args[0].1.atom, Atom::Int(1)));
+                assert!(matches!(fallthrough, Label::Named { name, .. } if name == "else_lbl"));
+                assert_eq!(fallthrough_args.len(), 1);
+                assert_eq!(fallthrough_args[0].0, "y");
+                assert!(matches!(&fallthrough_args[0].1.atom, Atom::Local(n) if n == "v"));
+            }
+            _ => panic!("expected cbranch with args"),
         }
     }
 

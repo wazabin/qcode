@@ -3,8 +3,8 @@ use qcode::{
     context::Context,
     space::SpaceId,
     value::{
-        BasicBlock, BlockId, BlockRef, Function, FunctionId, Instruction, Value, ValueId, ValueRef,
-        Varnode,
+        BasicBlock, BlockId, BlockParamId, BlockRef, Function, FunctionId, Instruction, Value,
+        ValueId, ValueRef, Varnode,
         insn::{
             BoolBinop, Branch, BranchInd, CBranch, Call, CallInd, Carry, InstructionId,
             InstructionRef, IntBinop, LzCount, Mnemonic, PopCount, Range, Return, SBorrow, SCarry,
@@ -638,6 +638,7 @@ type InstructionHook = Box<dyn Fn(&InstructionRef<'_, '_>, &StandaloneEmulator) 
 pub struct StandaloneEmulator {
     pub memory: EmulatedMemory,
     pub insn_values: HashMap<InstructionId, SizedValue>,
+    pub block_param_values: HashMap<BlockParamId, SizedValue>,
     pub block: BlockId,
     pub idx: usize,
     /// Call stack maintained by `run_function` (outermost function first).
@@ -651,6 +652,7 @@ impl StandaloneEmulator {
         Self {
             memory: EmulatedMemory::default(),
             insn_values: HashMap::new(),
+            block_param_values: HashMap::new(),
             block: entry,
             idx: 0,
             call_stack: Vec::new(),
@@ -731,6 +733,7 @@ impl StandaloneEmulator {
         let mut tmp = TempInterpreter {
             memory: &mut self.memory,
             insn_values: &mut self.insn_values,
+            block_param_values: &mut self.block_param_values,
             ctx,
         };
         tmp.get_value(id).ok().and_then(|v| v.value().ok())
@@ -830,6 +833,7 @@ impl StandaloneEmulator {
         let mut tmp = TempInterpreter {
             memory: &mut self.memory,
             insn_values: &mut self.insn_values,
+            block_param_values: &mut self.block_param_values,
             ctx,
         };
         let sv = tmp.get_value(id).ok()?;
@@ -846,6 +850,40 @@ impl StandaloneEmulator {
         self.block
     }
 
+    fn collect_block_args(
+        &mut self,
+        ctx: &Context<'_>,
+        args: &[ValueId],
+    ) -> Result<Vec<SizedValue>, EmulatorErrorKind> {
+        let mut tmp = TempInterpreter {
+            memory: &mut self.memory,
+            insn_values: &mut self.insn_values,
+            block_param_values: &mut self.block_param_values,
+            ctx,
+        };
+        args.iter().map(|&arg| tmp.get_value(arg)).collect()
+    }
+
+    fn bind_block_args(
+        &mut self,
+        ctx: &Context<'_>,
+        target: BlockId,
+        args: &[ValueId],
+    ) -> Result<(), EmulatorErrorKind> {
+        let values = self.collect_block_args(ctx, args)?;
+        let params = BasicBlock::from_id(ctx, target)
+            .params()
+            .map(|param| param.id)
+            .collect::<Vec<_>>();
+        if values.len() != params.len() {
+            return Err(EmulatorErrorKind::ValueError(values.len() as u128));
+        }
+        for (param, value) in params.into_iter().zip(values) {
+            self.block_param_values.insert(param, value);
+        }
+        Ok(())
+    }
+
     pub fn step(&mut self, ctx: &Context<'_>) -> crate::Result<()> {
         let block = BasicBlock::from_id(ctx, self.block);
         let insn_ids = block.instruction_ids();
@@ -859,7 +897,9 @@ impl StandaloneEmulator {
         }
 
         match insn.mnemonic() {
-            Mnemonic::Branch(Branch { target }) => {
+            Mnemonic::Branch(Branch { target, args }) => {
+                self.bind_block_args(ctx, *target, args)
+                    .map_err(|kind| self.make_error(ctx, kind))?;
                 self.block = *target;
                 self.idx = 0;
             }
@@ -877,12 +917,18 @@ impl StandaloneEmulator {
             Mnemonic::CBranch(CBranch {
                 condition,
                 success_block: target,
+                success_args,
                 failure_block: fallthrough,
+                failure_args,
             }) => {
                 let cond_val = self.get_value(ctx, *condition).unwrap();
                 if cond_val != 0 {
+                    self.bind_block_args(ctx, *target, success_args)
+                        .map_err(|kind| self.make_error(ctx, kind))?;
                     self.block = *target;
                 } else {
+                    self.bind_block_args(ctx, *fallthrough, failure_args)
+                        .map_err(|kind| self.make_error(ctx, kind))?;
                     self.block = *fallthrough;
                 }
                 self.idx = 0;
@@ -905,6 +951,7 @@ impl StandaloneEmulator {
                 let mut tmp = TempInterpreter {
                     memory: &mut self.memory,
                     insn_values: &mut self.insn_values,
+                    block_param_values: &mut self.block_param_values,
                     ctx,
                 };
                 if let Some(value) = tmp.interpret(insn)? {
@@ -995,6 +1042,7 @@ impl StandaloneEmulator {
 struct TempInterpreter<'a, 'ctx> {
     memory: &'a mut EmulatedMemory,
     insn_values: &'a mut HashMap<InstructionId, SizedValue>,
+    block_param_values: &'a mut HashMap<BlockParamId, SizedValue>,
     ctx: &'ctx Context<'ctx>,
 }
 
@@ -1020,6 +1068,11 @@ impl<'ctx> Interpreter for TempInterpreter<'_, 'ctx> {
                 .ok_or(EmulatorErrorKind::ValueError(0)),
             ValueRef::Varnode(varnode) => Ok(SizedValue::new(varnode.address() as u64, 8)),
             ValueRef::BasicBlock(_) => panic!("Cannot get value of a block"),
+            ValueRef::BlockParam(param) => self
+                .block_param_values
+                .get(&param.id)
+                .copied()
+                .ok_or(EmulatorErrorKind::ValueError(0)),
             ValueRef::Function(f) => f
                 .address()
                 .map(SizedValue::from_u64)
@@ -1231,6 +1284,12 @@ impl<'ctx> Interpreter for Emulator<'ctx> {
                 .ok_or(EmulatorErrorKind::ValueError(0)),
             ValueRef::Varnode(varnode) => Ok(SizedValue::new(varnode.address() as u64, 8)),
             ValueRef::BasicBlock(_) => panic!("Cannot get value of a block"),
+            ValueRef::BlockParam(param) => self
+                .inner
+                .block_param_values
+                .get(&param.id)
+                .copied()
+                .ok_or(EmulatorErrorKind::ValueError(0)),
             ValueRef::Function(f) => f
                 .address()
                 .map(SizedValue::from_u64)
@@ -1264,6 +1323,27 @@ mod tests {
         assert_eq!(sum.size().unwrap(), 1);
         assert_eq!(carry.value().unwrap(), 1);
         assert_eq!(carry.size().unwrap(), 1);
+    }
+
+    #[test]
+    fn branch_args_bind_block_params() {
+        let mut ctx = Context::new();
+        qcode!(
+            ctx,
+            "
+            <src>
+                goto <dst @x=0x2>;
+            <dst @x>
+                %sum = i64 @x + 0x3;
+                goto <0x1001>;
+            "
+        );
+
+        let mut emu = StandaloneEmulator::new(src);
+        emu.step(&ctx).expect("branch binds block params");
+        emu.step(&ctx).expect("destination uses block param");
+
+        assert_eq!(emu.get_value(&ctx, sum.into()), Some(5));
     }
 
     #[test]

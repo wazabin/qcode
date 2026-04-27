@@ -38,6 +38,7 @@ use crate::{
     value::{
         Function, Instruction, Renameable, Value, ValueId, ValueRef,
         block::{BasicBlock, BlockId, BlockMutRef},
+        block_param::BlockParamMutRef,
         function::FunctionId,
         insn::{
             Binary, Binop, BoolBinop, Branch, BranchInd, CBranch, Call, CallInd, Carry, FloatBinop,
@@ -859,13 +860,30 @@ impl<'str, 'ctx> Builder<'str, 'ctx> {
 
     // --- Branches & Calls ---
 
+    /// Declares a new parameter on the current block.
+    ///
+    /// Returns a mutable reference whose `ValueId` can be used as an operand in
+    /// subsequent instructions. Parameters are NOT part of the instruction list.
+    pub fn push_param(&mut self, size: usize) -> BlockParamMutRef<'str, '_> {
+        self.block.push_param(size)
+    }
+
     /// Terminates this block with an unconditional jump to the given target block.
     /// The builder is now safe to drop without panicking, and the block is properly terminated.
     pub fn push_branch(&mut self, target: BlockId) -> InstructionRef<'str, '_> {
+        self.push_branch_with_args(target, vec![])
+    }
+
+    /// Unconditional branch passing `args` to the target block's parameters.
+    pub fn push_branch_with_args(
+        &mut self,
+        target: BlockId,
+        args: Vec<ValueId>,
+    ) -> InstructionRef<'str, '_> {
         let current = self.block.id;
         self.context_mut().add_cfg_edge(current, target);
         let id = self
-            .push_instruction(Mnemonic::Branch(Branch { target }), 0)
+            .push_instruction(Mnemonic::Branch(Branch { target, args }), 0)
             .id;
         self.is_terminated = true;
         self.context().get_insn(id)
@@ -876,6 +894,18 @@ impl<'str, 'ctx> Builder<'str, 'ctx> {
         condition: ValueId,
         target: BlockId,
         fallthrough: BlockId,
+    ) -> InstructionRef<'str, '_> {
+        self.push_cbranch_with_args(condition, target, vec![], fallthrough, vec![])
+    }
+
+    /// Conditional branch with per-target arguments.
+    pub fn push_cbranch_with_args(
+        &mut self,
+        condition: ValueId,
+        target: BlockId,
+        target_args: Vec<ValueId>,
+        fallthrough: BlockId,
+        fallthrough_args: Vec<ValueId>,
     ) -> InstructionRef<'str, '_> {
         assert!(
             !condition.is_varnode(),
@@ -888,8 +918,10 @@ impl<'str, 'ctx> Builder<'str, 'ctx> {
             .push_instruction(
                 Mnemonic::CBranch(CBranch {
                     success_block: target,
+                    success_args: target_args,
                     condition,
                     failure_block: fallthrough,
+                    failure_args: fallthrough_args,
                 }),
                 0,
             )
@@ -1139,5 +1171,49 @@ mod tests {
 
         assert_eq!(ptr.size(), 8);
         assert_eq!(ptr.name(), Some("ptr"));
+    }
+
+    #[test]
+    fn push_param_via_builder_visible_on_block() {
+        let mut ctx = Context::new();
+        let block_id = ctx.get_or_make_block(0x1000);
+        let mut builder = Builder::from_block(BasicBlock::from_id_mut(&mut ctx, block_id));
+
+        let p0 = builder.push_param(8);
+        let p0_id = p0.id;
+        let p1 = builder.push_param(4);
+        let p1_id = p1.id;
+
+        unsafe { builder.dont_finalize() };
+        drop(builder);
+
+        let block = BasicBlock::from_id(&ctx, block_id);
+        assert_eq!(block.num_params(), 2);
+        let param_ids: Vec<_> = block.params().map(|p| p.id).collect();
+        assert_eq!(param_ids, [p0_id, p1_id]);
+        assert_eq!(block.instruction_ids().len(), 0);
+    }
+
+    #[test]
+    fn push_branch_with_args_via_builder() {
+        let mut ctx = Context::new();
+        let src_id = ctx.get_or_make_block(0x1000);
+        let dst_id = ctx.get_or_make_block(0x2000);
+
+        let param_val = BasicBlock::from_id_mut(&mut ctx, dst_id).push_param(8).id();
+
+        {
+            let mut builder = Builder::from_block(BasicBlock::from_id_mut(&mut ctx, src_id));
+            builder.push_branch_with_args(dst_id, vec![param_val]);
+        }
+
+        let block = BasicBlock::from_id(&ctx, src_id);
+        let last = block.iter().last().expect("branch was added");
+        let crate::value::insn::Mnemonic::Branch(branch) = last.mnemonic() else {
+            panic!("expected branch");
+        };
+        assert_eq!(branch.target, dst_id);
+        assert_eq!(branch.args.len(), 1);
+        assert_eq!(branch.args[0], param_val);
     }
 }

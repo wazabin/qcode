@@ -1,6 +1,7 @@
 use crate::value::{
     ValueId,
     block::{BasicBlock, BlockId, EdgeData, EdgeId},
+    block_param::{BlockParam, BlockParamId},
     function::{Function, FunctionId},
     insn::{Instruction, InstructionId},
     literal::{Literal, LiteralId},
@@ -37,6 +38,9 @@ pub struct ValueRegistry<'str> {
 
     /// Basic block storage.
     pub basic_blocks: Registry<BlockId, BasicBlock<'str>>,
+
+    /// Block parameter storage.
+    pub block_params: Registry<BlockParamId, BlockParam<'str>>,
 
     /// Varnode storage.
     pub varnodes: Registry<VarnodeId, Varnode<'str>>,
@@ -135,6 +139,10 @@ impl<'str> ValueRegistry<'str> {
 
     pub fn push_block(&mut self, block: BasicBlock<'str>) -> BlockId {
         self.basic_blocks.push(block)
+    }
+
+    pub fn push_block_param(&mut self, param: BlockParam<'str>) -> BlockParamId {
+        self.block_params.push(param)
     }
 
     pub fn push_varnode(&mut self, varnode: Varnode<'str>) -> VarnodeId {

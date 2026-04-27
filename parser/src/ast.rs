@@ -75,8 +75,14 @@ pub enum CastOp {
 /// A branch target or label declaration — either a named label or a block address.
 #[derive(Clone, Debug)]
 pub enum Label {
-    /// A named label such as `<entry>` or `<done>`. Generates a `BlockId` binding.
-    Named { name: String, span: SourceSpan },
+    /// A named label such as `<entry>` or `<done @v1 @v2>`. Generates a `BlockId` binding.
+    Named {
+        name: String,
+        /// Block parameter names declared on this label (e.g. `@v1`, `@v2`).
+        /// Non-empty only when this `Label` appears inside a `LabelDecl`.
+        params: Vec<String>,
+        span: SourceSpan,
+    },
     /// A numeric address such as `<0x1001>`. Sets the block's address; no binding generated.
     Address { value: u64, span: SourceSpan },
 }
@@ -119,6 +125,9 @@ pub enum Statement {
     },
     Branch {
         target: Label,
+        /// Per-parameter arguments: `(param_name, value)` in declaration order.
+        /// Non-empty when the branch was written as `goto <block @v1=e1 @v2=e2>`.
+        args: Vec<(String, TypedAtom)>,
         span: SourceSpan,
     },
     BranchInd {
@@ -128,7 +137,9 @@ pub enum Statement {
     CBranch {
         condition: TypedAtom,
         target: Label,
+        target_args: Vec<(String, TypedAtom)>,
         fallthrough: Label,
+        fallthrough_args: Vec<(String, TypedAtom)>,
         span: SourceSpan,
     },
     Call {

@@ -84,8 +84,15 @@ mod tests {
     /// Push an unconditional Branch instruction into block `from` targeting `to`,
     /// and add a CFG edge from `from` to `to`.
     fn add_branch(ctx: &mut Context, from: qcode::value::BlockId, to: qcode::value::BlockId) {
-        let insn =
-            InstructionRef::from_mnemonic(ctx, Mnemonic::Branch(Branch { target: to }), 0).id;
+        let insn = InstructionRef::from_mnemonic(
+            ctx,
+            Mnemonic::Branch(Branch {
+                target: to,
+                args: vec![],
+            }),
+            0,
+        )
+        .id;
         ctx.values.basic_blocks[from].instructions.push(insn);
         ctx.add_cfg_edge(from, to);
     }
