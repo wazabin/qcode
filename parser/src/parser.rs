@@ -1,6 +1,6 @@
 use crate::ast::{
-    Atom, CastOp, ExprNode, FnDecl, Label, Program, SourcePosition, SourceSpan, Statement,
-    TypedAtom,
+    Atom, BlockParamDecl, CastOp, ExprNode, FnDecl, Label, Program, SourcePosition, SourceSpan,
+    Statement, TypedAtom,
 };
 use pest::Parser;
 use pest::iterators::Pair;
@@ -133,15 +133,10 @@ fn parse_label_decl(pair: Pair<'_, Rule>) -> Result<Statement, ParseError> {
     let label = match name_pair.as_rule() {
         Rule::ident => {
             let name = name_pair.as_str().to_owned();
-            let params: Vec<String> = inner
-                .filter(|p| p.as_rule() == Rule::block_param_name)
-                .map(|p| {
-                    p.as_str()
-                        .strip_prefix('@')
-                        .unwrap_or(p.as_str())
-                        .to_owned()
-                })
-                .collect();
+            let params: Vec<BlockParamDecl> = inner
+                .filter(|p| p.as_rule() == Rule::block_param_decl)
+                .map(parse_block_param_decl)
+                .collect::<Result<_, _>>()?;
             Label::Named {
                 name,
                 params,
@@ -158,6 +153,33 @@ fn parse_label_decl(pair: Pair<'_, Rule>) -> Result<Statement, ParseError> {
         _ => return Err(ParseError::new("invalid label declaration")),
     };
     Ok(Statement::LabelDecl { label, span })
+}
+
+fn parse_block_param_decl(pair: Pair<'_, Rule>) -> Result<BlockParamDecl, ParseError> {
+    let mut name = None;
+    let mut size_bytes = None;
+
+    for part in pair.into_inner() {
+        match part.as_rule() {
+            Rule::block_param_name => {
+                name = Some(
+                    part.as_str()
+                        .strip_prefix('@')
+                        .unwrap_or(part.as_str())
+                        .to_owned(),
+                );
+            }
+            Rule::ty => {
+                size_bytes = Some(parse_size_bytes(part.as_str(), "block parameter")?);
+            }
+            _ => {}
+        }
+    }
+
+    Ok(BlockParamDecl {
+        name: name.ok_or_else(|| ParseError::new("missing block parameter name"))?,
+        size_bytes,
+    })
 }
 
 fn parse_inner_stmt(pair: Pair<'_, Rule>, out: &mut Vec<Statement>) -> Result<(), ParseError> {
@@ -1336,9 +1358,31 @@ mod tests {
                 ..
             } => {
                 assert_eq!(name, "entry");
-                assert_eq!(params, &["v1", "v2"]);
+                assert_eq!(params[0].name, "v1");
+                assert_eq!(params[0].size_bytes, None);
+                assert_eq!(params[1].name, "v2");
+                assert_eq!(params[1].size_bytes, None);
             }
             _ => panic!("expected named label declaration with params"),
+        }
+    }
+
+    #[test]
+    fn parses_label_decl_with_typed_params() {
+        let statements = stmts("<entry @v1:i64 @v2:i32>");
+        assert_eq!(statements.len(), 1);
+        match &statements[0] {
+            Statement::LabelDecl {
+                label: Label::Named { name, params, .. },
+                ..
+            } => {
+                assert_eq!(name, "entry");
+                assert_eq!(params[0].name, "v1");
+                assert_eq!(params[0].size_bytes, Some(8));
+                assert_eq!(params[1].name, "v2");
+                assert_eq!(params[1].size_bytes, Some(4));
+            }
+            _ => panic!("expected named label declaration with typed params"),
         }
     }
 

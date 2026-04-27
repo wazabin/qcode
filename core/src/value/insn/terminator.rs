@@ -403,38 +403,28 @@ mod tests {
 
     #[test]
     fn cbranch_with_per_target_args_are_independent() {
-        use crate::{builder::Builder, value::ValueId};
+        use crate::value::ValueId;
 
         let mut ctx = Context::new();
-        // qcode macro sets up the blocks and exposes their params; cbranch-with-args
-        // isn't expressible in the grammar so the builder is used only for that one push.
         qcode!(
             ctx,
             "
-            <cond_block @cond>
-                goto <0x1003>;
-            <then_lbl @x>
+            <src @cond:i8 @then_arg:i64 @else_arg:i64>
+                if @cond goto <then_lbl @x=@then_arg> else goto <else_lbl @y=@else_arg>;
+            <then_lbl @x:i64>
                 goto <0x1001>;
-            <else_lbl @y>
+            <else_lbl @y:i64>
                 goto <0x1002>;
             "
         );
 
-        let src_id = BasicBlock::make(&mut ctx).id;
-        let mut builder = Builder::from_block(BasicBlock::from_id_mut(&mut ctx, src_id));
-        let insn = builder.push_cbranch_with_args(
-            cond.into(),
-            then_lbl,
-            vec![x.into()],
-            else_lbl,
-            vec![y.into()],
-        );
-
+        let src_block = BasicBlock::from_id(&ctx, src);
+        let insn = src_block.iter().last().expect("src has cbranch");
         let Mnemonic::CBranch(cbranch) = insn.mnemonic() else {
             panic!("expected cbranch");
         };
-        assert_eq!(cbranch.success_args, [ValueId::BlockParam(x)]);
-        assert_eq!(cbranch.failure_args, [ValueId::BlockParam(y)]);
+        assert_eq!(cbranch.success_args, [ValueId::BlockParam(then_arg)]);
+        assert_eq!(cbranch.failure_args, [ValueId::BlockParam(else_arg)]);
         assert_ne!(cbranch.success_block, cbranch.failure_block);
     }
 

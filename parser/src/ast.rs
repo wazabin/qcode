@@ -72,15 +72,21 @@ pub enum CastOp {
     Trunc,
 }
 
+#[derive(Clone, Debug)]
+pub struct BlockParamDecl {
+    pub name: String,
+    pub size_bytes: Option<usize>,
+}
+
 /// A branch target or label declaration — either a named label or a block address.
 #[derive(Clone, Debug)]
 pub enum Label {
     /// A named label such as `<entry>` or `<done @v1 @v2>`. Generates a `BlockId` binding.
     Named {
         name: String,
-        /// Block parameter names declared on this label (e.g. `@v1`, `@v2`).
+        /// Block parameters declared on this label (e.g. `@v1`, `@v2:i64`).
         /// Non-empty only when this `Label` appears inside a `LabelDecl`.
-        params: Vec<String>,
+        params: Vec<BlockParamDecl>,
         span: SourceSpan,
     },
     /// A numeric address such as `<0x1001>`. Sets the block's address; no binding generated.

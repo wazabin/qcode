@@ -1,5 +1,7 @@
 // [AI Generated]
-use qcode_parser::ast::{Atom, CastOp, ExprNode, FnDecl, Label, Statement, TypedAtom};
+use qcode_parser::ast::{
+    Atom, BlockParamDecl, CastOp, ExprNode, FnDecl, Label, Statement, TypedAtom,
+};
 use quote::{format_ident, quote};
 use std::collections::HashMap;
 use syn::Expr;
@@ -37,12 +39,23 @@ fn collect_block_param_names(statements: &[Statement]) -> HashMap<String, Vec<St
                 ..
             } = s
             {
-                Some((name.clone(), params.clone()))
+                Some((
+                    name.clone(),
+                    params.iter().map(|param| param.name.clone()).collect(),
+                ))
             } else {
                 None
             }
         })
         .collect()
+}
+
+fn block_param_name(param: &BlockParamDecl) -> &str {
+    &param.name
+}
+
+fn block_param_size(param: &BlockParamDecl) -> usize {
+    param.size_bytes.unwrap_or(0)
 }
 
 /// Context in which an atom is being used — controls whether bare varnodes are allowed.
@@ -220,7 +233,7 @@ fn compile_single_fn(
                 ..
             } = s
             {
-                Some(params.iter().map(|p| format_ident!("{}", p)))
+                Some(params.iter().map(|p| format_ident!("{}", p.name)))
             } else {
                 None
             }
@@ -246,9 +259,10 @@ fn compile_single_fn(
     // Build the statement emissions.
     let mut locals: HashMap<String, LocalKind> = global_locals.clone();
 
-    for param_name in &entry_params {
+    for param in &entry_params {
+        let param_name = block_param_name(param);
         let p_ident = format_ident!("{}", param_name);
-        locals.insert(param_name.clone(), LocalKind::BlockParam(p_ident));
+        locals.insert(param_name.to_owned(), LocalKind::BlockParam(p_ident));
     }
 
     let mut block_preinits: Vec<proc_macro2::TokenStream> = Vec::new();
@@ -269,13 +283,15 @@ fn compile_single_fn(
                         .add_block(#block_ident);
                 });
             }
-            for param_name in params {
+            for param in params {
+                let param_name = block_param_name(param);
+                let param_size = block_param_size(param);
                 let p_ident = format_ident!("{}", param_name);
                 block_preinits.push(quote! {
                     {
                         let __qcode_param = #pcode_root::value::BasicBlock::from_id_mut(
                             &mut (#ctx), #block_ident
-                        ).push_param(0).id;
+                        ).push_param(#param_size).id;
                         {
                             let _ = #pcode_root::value::BlockParam::from_id_mut(
                                 &mut (#ctx), __qcode_param
@@ -474,7 +490,7 @@ pub(crate) fn compile_qcode_from_statements_ctx(
                 ..
             } = s
             {
-                Some(params.iter().map(|p| format_ident!("{}", p)))
+                Some(params.iter().map(|p| format_ident!("{}", p.name)))
             } else {
                 None
             }
@@ -482,9 +498,10 @@ pub(crate) fn compile_qcode_from_statements_ctx(
         .flatten()
         .collect();
 
-    for param_name in &entry_params {
+    for param in &entry_params {
+        let param_name = block_param_name(param);
         let p_ident = format_ident!("{}", param_name);
-        locals.insert(param_name.clone(), LocalKind::BlockParam(p_ident));
+        locals.insert(param_name.to_owned(), LocalKind::BlockParam(p_ident));
     }
 
     let mut block_preinits: Vec<proc_macro2::TokenStream> = Vec::new();
@@ -501,13 +518,15 @@ pub(crate) fn compile_qcode_from_statements_ctx(
                     .expect("qcode: block name conflict")
                     .id;
             });
-            for param_name in params {
+            for param in params {
+                let param_name = block_param_name(param);
+                let param_size = block_param_size(param);
                 let p_ident = format_ident!("{}", param_name);
                 block_preinits.push(quote! {
                     {
                         let __qcode_param = #pcode_root::value::BasicBlock::from_id_mut(
                             &mut (#ctx), #block_ident
-                        ).push_param(0).id;
+                        ).push_param(#param_size).id;
                         {
                             let _ = #pcode_root::value::BlockParam::from_id_mut(
                                 &mut (#ctx), __qcode_param
@@ -631,9 +650,10 @@ fn emit_statement(
                         __qcode_builder.switch_to_block(#outer_ident);
                     }
                 });
-                for param_name in params {
+                for param in params {
+                    let param_name = block_param_name(param);
                     let p_ident = format_ident!("{}", param_name);
-                    locals.insert(param_name.clone(), LocalKind::BlockParam(p_ident));
+                    locals.insert(param_name.to_owned(), LocalKind::BlockParam(p_ident));
                 }
             }
             Label::Address { value: addr, .. } => {

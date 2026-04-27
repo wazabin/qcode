@@ -464,6 +464,31 @@ impl<'str, 'ctx> BlockMutRef<'str, 'ctx> {
     ///
     /// `edge_ab` must be the direct edge from this block to `other`.
     pub fn absorb_block(&mut self, other: BlockId, edge_ab: EdgeId, function_id: FunctionId) {
+        let branch_args = self
+            .inner()
+            .instructions
+            .last()
+            .and_then(|&id| match self.ctx.values.instructions[id].mnemonic() {
+                crate::value::insn::Mnemonic::Branch(branch) if branch.target == other => {
+                    Some(branch.args.clone())
+                }
+                _ => None,
+            })
+            .unwrap_or_default();
+        let other_params = self.ctx.values.basic_blocks[other].params.clone();
+        if !other_params.is_empty() {
+            assert_eq!(
+                other_params.len(),
+                branch_args.len(),
+                "cannot absorb block with {} params through branch with {} args",
+                other_params.len(),
+                branch_args.len()
+            );
+            for (param, arg) in other_params.into_iter().zip(branch_args) {
+                self.ctx.replace_all_uses_with(param, arg);
+            }
+        }
+
         // Remove terminal branch.
         self.inner_mut().instructions.pop();
 
@@ -655,10 +680,10 @@ mod tests {
         qcode!(
             ctx,
             "
-            <entry @v1 @v2>
+            <entry @v1:i64 @v2:i32>
                 goto <done @x=@v1 @y=@v2>;
 
-            <done @x @y>
+            <done @x:i64 @y:i32>
                 goto <0x1001>;
             "
         );
@@ -668,10 +693,15 @@ mod tests {
 
         let params = entry.params().collect::<Vec<_>>();
         assert_eq!(params[0].name(), Some("v1"));
+        assert_eq!(params[0].size(), 8);
         assert_eq!(params[1].name(), Some("v2"));
+        assert_eq!(params[1].size(), 4);
 
         let done_block = BasicBlock::from_id(&ctx, done);
         assert_eq!(done_block.num_params(), 2, "done should have 2 params");
+        let done_params = done_block.params().collect::<Vec<_>>();
+        assert_eq!(done_params[0].size(), 8);
+        assert_eq!(done_params[1].size(), 4);
 
         // The branch from entry should carry 2 args.
         let branch_insn = entry.iter().last().expect("entry has instructions");
