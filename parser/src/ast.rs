@@ -19,8 +19,15 @@ impl SourceSpan {
 
 #[derive(Clone, Debug)]
 pub enum Atom {
+    /// `{name}` — captures a Rust variable from the surrounding scope.
     External(String),
-    Local(String),
+    /// `%name` — references an SSA instruction result.
+    Ssa(String),
+    /// `@name` — references a block parameter.
+    BlockParam(String),
+    /// bare `name` — references a varnode (valid only in pointer positions).
+    Varnode(String),
+    /// `&name` — takes the address of a varnode.
     AddressOf(String),
     Int(u64),
 }
@@ -120,7 +127,6 @@ pub enum Statement {
     Assign {
         name: String,
         name_span: SourceSpan,
-        expose: bool,
         expr: ExprNode,
         span: SourceSpan,
     },

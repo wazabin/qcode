@@ -231,7 +231,7 @@ mod tests {
             "
             <block>
                 local i64 ptr;
-                goto [%ptr];
+                goto [ptr];
             "
         );
 
@@ -289,7 +289,7 @@ mod tests {
             "
             <block>
                 local i64 ptr;
-                call [%ptr];
+                call [ptr];
             "
         );
 
@@ -306,7 +306,7 @@ mod tests {
             "
             <block>
                 local i64 ptr;
-                return [%ptr];
+                return [ptr];
             "
         );
 

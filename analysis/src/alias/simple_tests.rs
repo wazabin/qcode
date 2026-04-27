@@ -324,9 +324,9 @@ fn unresolvable_load_ptr_in_register_space_does_not_alias_registers() {
         <block>
             %lhs = load(i64, {r0});
             %rhs = load(i64, {r0});
-            %ptr = lhs + rhs;
+            %ptr = %lhs + %rhs;
             %value = load(i64, %ptr);
-            return [value];
+            return [%value];
     "
     );
 
@@ -355,7 +355,7 @@ fn store_then_load_invalidation_is_conservative_for_unknown_ptr() {
             %ptr = &A + %base;
             store(%ptr, i64 0x7);
             %after = load(i64, &A);
-            return [after];
+            return [%after];
     "
     );
 

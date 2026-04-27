@@ -1551,7 +1551,7 @@ mod tests {
             %v0 = load(i128, &V0);
             %v1 = load(i128, &V1);
 
-            %res = v0 / v1;
+            %res = %v0 / %v1;
             goto <0x1001>;
         "
         );

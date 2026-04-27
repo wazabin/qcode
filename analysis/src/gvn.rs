@@ -287,8 +287,8 @@ mod tests {
                 %a = load(i64, &A);
                 %b = load(i64, &B);
 
-                %v1 = a + b;
-                %v2 = a + b;
+                %v1 = %a + %b;
+                %v2 = %a + %b;
 
                 goto <0x1001>;
         "
@@ -463,14 +463,14 @@ mod tests {
                     if i8 1 goto <left> else goto <right>;
 
                 <left>
-                    %v1 = a + b;
+                    %v1 = %a + %b;
                     goto <merge>;
 
                 <right>
                     goto <merge>;
 
                 <merge>
-                    %v2 = a + b;"
+                    %v2 = %a + %b;"
         );
 
         gvn_function(&mut ctx, g, None);
@@ -501,9 +501,9 @@ mod tests {
             <block>
                 store(&A, i64 5);
                 %a = load(i64, &A);
-                %v1 = a + 2;
-                %v2 = v1 + 3;
-                store(&B, v2);
+                %v1 = %a + 2;
+                %v2 = %v1 + 3;
+                store(&B, %v2);
                 goto <0x1001>;"
         );
 

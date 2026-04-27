@@ -190,7 +190,7 @@ fn parse_inner_stmt(pair: Pair<'_, Rule>, out: &mut Vec<Statement>) -> Result<()
 
     let stmt = match inner.as_rule() {
         Rule::local_decl => parse_local_decl(inner)?,
-        Rule::assignment => parse_assignment(inner)?,
+        Rule::assignment_ssa => parse_assignment_ssa(inner)?,
         Rule::terminator => parse_terminator(inner)?,
         Rule::expr => Statement::Expr(parse_expr(inner)?),
         _ => return Err(ParseError::new("unexpected inner statement")),
@@ -365,19 +365,6 @@ fn parse_terminator(pair: Pair<'_, Rule>) -> Result<Statement, ParseError> {
     }
 }
 
-fn parse_assignment(pair: Pair<'_, Rule>) -> Result<Statement, ParseError> {
-    let inner = pair
-        .into_inner()
-        .next()
-        .ok_or_else(|| ParseError::new("missing assignment variant"))?;
-
-    match inner.as_rule() {
-        Rule::assignment_ssa => parse_assignment_ssa(inner),
-        Rule::assignment_plain => parse_assignment_plain(inner),
-        _ => Err(ParseError::new("unexpected assignment rule")),
-    }
-}
-
 fn parse_assignment_ssa(pair: Pair<'_, Rule>) -> Result<Statement, ParseError> {
     let span = source_span(pair.as_span());
     let mut inner = pair.into_inner();
@@ -404,27 +391,6 @@ fn parse_assignment_ssa(pair: Pair<'_, Rule>) -> Result<Statement, ParseError> {
     Ok(Statement::Assign {
         name,
         name_span,
-        expose: true,
-        expr: parse_expr(expr_pair)?,
-        span,
-    })
-}
-
-fn parse_assignment_plain(pair: Pair<'_, Rule>) -> Result<Statement, ParseError> {
-    let span = source_span(pair.as_span());
-    let mut inner = pair.into_inner();
-    let name_pair = inner
-        .next()
-        .ok_or_else(|| ParseError::new("missing assignment name"))?;
-    let name_span = source_span(name_pair.as_span());
-    let name = name_pair.as_str().to_owned();
-    let expr_pair = inner
-        .find(|p| p.as_rule() == Rule::expr)
-        .ok_or_else(|| ParseError::new("missing assignment expression"))?;
-    Ok(Statement::Assign {
-        name,
-        name_span,
-        expose: false,
         expr: parse_expr(expr_pair)?,
         span,
     })
@@ -627,21 +593,21 @@ fn parse_atom(pair: Pair<'_, Rule>) -> Result<Atom, ParseError> {
                 .to_owned();
             Ok(Atom::External(ident))
         }
-        Rule::block_param_name => Ok(Atom::Local(
+        Rule::block_param_name => Ok(Atom::BlockParam(
             inner
                 .as_str()
                 .strip_prefix('@')
                 .unwrap_or(inner.as_str())
                 .to_owned(),
         )),
-        Rule::ssa_name => Ok(Atom::Local(
+        Rule::ssa_name => Ok(Atom::Ssa(
             inner
                 .as_str()
                 .strip_prefix('%')
                 .unwrap_or(inner.as_str())
                 .to_owned(),
         )),
-        Rule::ident => Ok(Atom::Local(inner.as_str().to_owned())),
+        Rule::ident => Ok(Atom::Varnode(inner.as_str().to_owned())),
         Rule::addressof => {
             let name = inner
                 .into_inner()
@@ -738,8 +704,8 @@ mod tests {
     }
 
     #[test]
-    fn parses_assignment_chain() {
-        let statements = stmts("tmp = {v1} + 3; tmp + 2");
+    fn parses_ssa_assignment_and_use() {
+        let statements = stmts("%tmp = {v1} + 3; %tmp + 2");
         assert_eq!(statements.len(), 2);
 
         match &statements[0] {
@@ -767,8 +733,8 @@ mod tests {
             Statement::Expr(ExprNode::Binary { lhs, op, rhs }) => {
                 assert_eq!(op, "+");
                 match &lhs.atom {
-                    Atom::Local(name) => assert_eq!(name, "tmp"),
-                    _ => panic!("expected local lhs"),
+                    Atom::Ssa(name) => assert_eq!(name, "tmp"),
+                    _ => panic!("expected ssa lhs"),
                 }
                 match &rhs.atom {
                     Atom::Int(value) => assert_eq!(*value, 2),
@@ -804,8 +770,8 @@ mod tests {
 
         match &statements[1] {
             Statement::Expr(ExprNode::Atom(atom)) => match &atom.atom {
-                Atom::Local(name) => assert_eq!(name, "ptr"),
-                _ => panic!("expected local atom"),
+                Atom::Varnode(name) => assert_eq!(name, "ptr"),
+                _ => panic!("expected varnode atom"),
             },
             _ => panic!("expected local expression"),
         }
@@ -1067,13 +1033,11 @@ mod tests {
         match &statements[0] {
             Statement::Assign {
                 name,
-                expose,
                 expr,
                 name_span,
                 span,
             } => {
                 assert_eq!(name, "a");
-                assert!(expose);
                 assert!(matches!(expr, ExprNode::Binary { .. }));
                 assert_eq!(name_span.start.column, 5);
                 assert_eq!(name_span.end.column, 7);
@@ -1083,15 +1047,12 @@ mod tests {
         }
 
         match &statements[1] {
-            Statement::Assign {
-                name, expose, expr, ..
-            } => {
+            Statement::Assign { name, expr, .. } => {
                 assert_eq!(name, "b");
-                assert!(expose);
                 match expr {
                     ExprNode::Binary { lhs, .. } => match &lhs.atom {
-                        Atom::Local(name) => assert_eq!(name, "a"),
-                        _ => panic!("expected local lhs referencing %a"),
+                        Atom::Ssa(name) => assert_eq!(name, "a"),
+                        _ => panic!("expected ssa lhs referencing %a"),
                     },
                     _ => panic!("expected binary expression"),
                 }
@@ -1251,15 +1212,12 @@ mod tests {
     #[test]
     fn parses_multi_block_program() {
         // Label prefixes the next statement without a `;` between them.
-        let program = "tmp = {v1} + 3; goto <done>; <done> tmp + 2";
+        let program = "%tmp = {v1} + 3; goto <done>; <done> %tmp + 2";
         let statements = stmts(program);
         assert_eq!(statements.len(), 4);
 
         match &statements[0] {
-            Statement::Assign { name, expose, .. } => {
-                assert_eq!(name, "tmp");
-                assert!(!expose);
-            }
+            Statement::Assign { name, .. } => assert_eq!(name, "tmp"),
             _ => panic!("expected assignment"),
         }
         match &statements[1] {
@@ -1401,7 +1359,7 @@ mod tests {
                 assert_eq!(args[0].0, "v1");
                 assert!(matches!(args[0].1.atom, Atom::Int(1)));
                 assert_eq!(args[1].0, "v2");
-                assert!(matches!(&args[1].1.atom, Atom::Local(n) if n == "x"));
+                assert!(matches!(&args[1].1.atom, Atom::Ssa(n) if n == "x"));
             }
             _ => panic!("expected branch with args"),
         }
@@ -1413,12 +1371,14 @@ mod tests {
         assert_eq!(statements.len(), 1);
         match &statements[0] {
             Statement::CBranch {
+                condition,
                 target,
                 target_args,
                 fallthrough,
                 fallthrough_args,
                 ..
             } => {
+                assert!(matches!(&condition.atom, Atom::Ssa(n) if n == "c"));
                 assert!(matches!(target, Label::Named { name, .. } if name == "then_lbl"));
                 assert_eq!(target_args.len(), 1);
                 assert_eq!(target_args[0].0, "x");
@@ -1426,7 +1386,7 @@ mod tests {
                 assert!(matches!(fallthrough, Label::Named { name, .. } if name == "else_lbl"));
                 assert_eq!(fallthrough_args.len(), 1);
                 assert_eq!(fallthrough_args[0].0, "y");
-                assert!(matches!(&fallthrough_args[0].1.atom, Atom::Local(n) if n == "v"));
+                assert!(matches!(&fallthrough_args[0].1.atom, Atom::Ssa(n) if n == "v"));
             }
             _ => panic!("expected cbranch with args"),
         }

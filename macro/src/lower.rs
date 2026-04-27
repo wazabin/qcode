@@ -1,4 +1,3 @@
-// [AI Generated]
 use qcode_parser::ast::{
     Atom, BlockParamDecl, CastOp, ExprNode, FnDecl, Label, Statement, TypedAtom,
 };
@@ -56,15 +55,6 @@ fn block_param_name(param: &BlockParamDecl) -> &str {
 
 fn block_param_size(param: &BlockParamDecl) -> usize {
     param.size_bytes.unwrap_or(0)
-}
-
-/// Context in which an atom is being used — controls whether bare varnodes are allowed.
-#[derive(Clone, Copy)]
-enum AtomContext {
-    /// Arithmetic / scalar-value position. Bare varnodes are rejected; use `&name` instead.
-    Arithmetic,
-    /// Pointer position (load ptr, store ptr, branch target). Bare varnodes are allowed.
-    Pointer,
 }
 
 /// Compile a function-level program (one or more `fn name: ...` declarations).
@@ -196,10 +186,7 @@ fn compile_single_fn(
     let mut seen_ssa_names = std::collections::HashSet::new();
     let mut exposed_ssas: Vec<proc_macro2::Ident> = Vec::new();
     for s in statements.iter() {
-        if let Statement::Assign {
-            name, expose: true, ..
-        } = s
-        {
+        if let Statement::Assign { name, .. } = s {
             if !seen_ssa_names.insert(name.clone()) {
                 return Err(syn::Error::new(
                     proc_macro2::Span::call_site(),
@@ -453,10 +440,7 @@ pub(crate) fn compile_qcode_from_statements_ctx(
     let mut seen_ssa_names = std::collections::HashSet::new();
     let mut exposed_ssas: Vec<proc_macro2::Ident> = Vec::new();
     for s in body_statements.iter() {
-        if let Statement::Assign {
-            name, expose: true, ..
-        } = s
-        {
+        if let Statement::Assign { name, .. } = s {
             if !seen_ssa_names.insert(name.clone()) {
                 return Err(syn::Error::new(
                     proc_macro2::Span::call_site(),
@@ -609,28 +593,17 @@ fn emit_statement(
             locals.insert(name.clone(), LocalKind::Varnode(ident));
         }
 
-        Statement::Assign {
-            name, expose, expr, ..
-        } => {
+        Statement::Assign { name, expr, .. } => {
             let ident = format_ident!("__qcode_local_{}", name);
+            let outer_ident = format_ident!("{}", name);
             let value_tokens = lower_expr(expr, locals, pcode_root)?;
-            if *expose {
-                let outer_ident = format_ident!("{}", name);
-                emitted.push(quote! {
-                    let #ident = #value_tokens;
-                    let _ = #pcode_root::value::Instruction::from_id_mut(
-                        __qcode_builder.context_mut(), #ident
-                    ).rename(Cow::Borrowed(#name));
-                    #outer_ident = #ident;
-                });
-            } else {
-                emitted.push(quote! {
-                    let #ident = #value_tokens;
-                    let _ = #pcode_root::value::Instruction::from_id_mut(
-                        __qcode_builder.context_mut(), #ident
-                    ).rename(Cow::Borrowed(#name));
-                });
-            }
+            emitted.push(quote! {
+                let #ident = #value_tokens;
+                let _ = #pcode_root::value::Instruction::from_id_mut(
+                    __qcode_builder.context_mut(), #ident
+                ).rename(Cow::Borrowed(#name));
+                #outer_ident = #ident;
+            });
             locals.insert(name.clone(), LocalKind::Instruction(ident));
         }
 
@@ -685,7 +658,7 @@ fn emit_statement(
         }
 
         Statement::BranchInd { ptr, .. } => {
-            let ptr_tokens = lower_atom(ptr, None, AtomContext::Pointer, locals, pcode_root)?;
+            let ptr_tokens = lower_ptr_atom(ptr, None, locals, pcode_root)?;
             emitted.push(quote! {
                 {
                     let __qcode_ptr = #ptr_tokens;
@@ -702,8 +675,7 @@ fn emit_statement(
             fallthrough_args,
             ..
         } => {
-            let cond_tokens =
-                lower_atom(condition, None, AtomContext::Arithmetic, locals, pcode_root)?;
+            let cond_tokens = lower_atom(condition, None, locals, pcode_root)?;
             let target_ts = label_to_block_id(target, pcode_root);
             let fallthrough_ts = label_to_block_id(fallthrough, pcode_root);
             let target_arg_tokens =
@@ -755,7 +727,7 @@ fn emit_statement(
         }
 
         Statement::CallInd { ptr, .. } => {
-            let ptr_tokens = lower_atom(ptr, None, AtomContext::Pointer, locals, pcode_root)?;
+            let ptr_tokens = lower_ptr_atom(ptr, None, locals, pcode_root)?;
             emitted.push(quote! {
                 {
                     let __qcode_ptr = #ptr_tokens;
@@ -765,7 +737,7 @@ fn emit_statement(
         }
 
         Statement::Return { ptr, .. } => {
-            let ptr_tokens = lower_atom(ptr, None, AtomContext::Pointer, locals, pcode_root)?;
+            let ptr_tokens = lower_ptr_atom(ptr, None, locals, pcode_root)?;
             emitted.push(quote! {
                 {
                     let __qcode_ptr = #ptr_tokens;
@@ -876,13 +848,7 @@ fn lower_branch_args(
             .map(|(_, value)| value)
             .expect("all params were checked above");
         let param_ident = format_ident!("{}", param_name);
-        let value_tokens = lower_atom(
-            value_atom,
-            None,
-            AtomContext::Arithmetic,
-            locals,
-            pcode_root,
-        )?;
+        let value_tokens = lower_atom(value_atom, None, locals, pcode_root)?;
         lowered.push(quote! {
             {
                 let __qcode_arg = #value_tokens;
@@ -908,10 +874,10 @@ fn lower_expr(
     pcode_root: &proc_macro2::TokenStream,
 ) -> syn::Result<proc_macro2::TokenStream> {
     match expr {
-        ExprNode::Atom(atom) => lower_atom(atom, None, AtomContext::Arithmetic, locals, pcode_root),
+        ExprNode::Atom(atom) => lower_atom(atom, None, locals, pcode_root),
 
         ExprNode::Unop { op, src } => {
-            let src_tokens = lower_atom(src, None, AtomContext::Arithmetic, locals, pcode_root)?;
+            let src_tokens = lower_atom(src, None, locals, pcode_root)?;
 
             let call = match op.as_str() {
                 "!" => quote! { __qcode_builder.push_bool_not(__qcode_src).id },
@@ -957,20 +923,8 @@ fn lower_expr(
             let lhs_size = size_hint_tokens(lhs, locals, pcode_root)?;
             let rhs_size = size_hint_tokens(rhs, locals, pcode_root)?;
 
-            let lhs_tokens = lower_atom(
-                lhs,
-                rhs_size.clone(),
-                AtomContext::Arithmetic,
-                locals,
-                pcode_root,
-            )?;
-            let rhs_tokens = lower_atom(
-                rhs,
-                lhs_size.clone(),
-                AtomContext::Arithmetic,
-                locals,
-                pcode_root,
-            )?;
+            let lhs_tokens = lower_atom(lhs, rhs_size.clone(), locals, pcode_root)?;
+            let rhs_tokens = lower_atom(rhs, lhs_size.clone(), locals, pcode_root)?;
 
             let call = match op.as_str() {
                 "+" => quote! { __qcode_builder.push_add(__qcode_lhs, __qcode_rhs).id },
@@ -1048,7 +1002,7 @@ fn lower_expr(
             size_bytes,
             src,
         } => {
-            let src_tokens = lower_atom(src, None, AtomContext::Arithmetic, locals, pcode_root)?;
+            let src_tokens = lower_atom(src, None, locals, pcode_root)?;
             let size = *size_bytes;
 
             let call = match op {
@@ -1072,7 +1026,7 @@ fn lower_expr(
         }
 
         ExprNode::Load { size_bytes, ptr } => {
-            let ptr_tokens = lower_atom(ptr, None, AtomContext::Pointer, locals, pcode_root)?;
+            let ptr_tokens = lower_ptr_atom(ptr, None, locals, pcode_root)?;
             let size = *size_bytes;
 
             Ok(quote! {
@@ -1104,9 +1058,8 @@ fn lower_expr(
         ExprNode::Store { ptr, src } => {
             let src_size = size_hint_tokens(src, locals, pcode_root)?;
 
-            let ptr_tokens = lower_atom(ptr, None, AtomContext::Pointer, locals, pcode_root)?;
-            let src_tokens =
-                lower_atom(src, src_size, AtomContext::Arithmetic, locals, pcode_root)?;
+            let ptr_tokens = lower_ptr_atom(ptr, None, locals, pcode_root)?;
+            let src_tokens = lower_atom(src, src_size, locals, pcode_root)?;
 
             Ok(quote! {
                 {
@@ -1176,7 +1129,7 @@ fn lower_func1(
             format!("{name} expects exactly 1 argument"),
         ));
     }
-    lower_atom(&args[0], None, AtomContext::Arithmetic, locals, pcode_root)
+    lower_atom(&args[0], None, locals, pcode_root)
 }
 
 fn lower_func2(
@@ -1192,15 +1145,16 @@ fn lower_func2(
         ));
     }
     Ok((
-        lower_atom(&args[0], None, AtomContext::Arithmetic, locals, pcode_root)?,
-        lower_atom(&args[1], None, AtomContext::Arithmetic, locals, pcode_root)?,
+        lower_atom(&args[0], None, locals, pcode_root)?,
+        lower_atom(&args[1], None, locals, pcode_root)?,
     ))
 }
 
+/// Lower an atom in a value (arithmetic) position.
+/// `Atom::Varnode` is rejected here — use `lower_ptr_atom` for pointer positions.
 fn lower_atom(
     typed: &TypedAtom,
     size_hint: Option<proc_macro2::TokenStream>,
-    ctx: AtomContext,
     locals: &HashMap<String, LocalKind>,
     pcode_root: &proc_macro2::TokenStream,
 ) -> syn::Result<proc_macro2::TokenStream> {
@@ -1208,7 +1162,6 @@ fn lower_atom(
         // External capture `{name}` — resolve to local if declared in this call, else outer scope.
         Atom::External(name) => {
             if let Some(kind) = locals.get(name) {
-                // Resolve to the in-call local.
                 lower_local_ident(
                     kind.ident(),
                     kind.is_block_param(),
@@ -1217,7 +1170,6 @@ fn lower_atom(
                     pcode_root,
                 )
             } else {
-                // Fall back to outer Rust scope.
                 let ident = format_ident!("{}", name);
                 if let Some(expected_size) = typed.size_bytes {
                     Ok(quote! {
@@ -1247,29 +1199,54 @@ fn lower_atom(
             }
         }
 
-        Atom::Local(name) => {
+        Atom::Ssa(name) => {
             let Some(kind) = locals.get(name) else {
                 return Err(syn::Error::new(
                     proc_macro2::Span::call_site(),
-                    format!("unknown local identifier '{name}'"),
+                    format!("unknown SSA value '%{name}'"),
                 ));
             };
-            if matches!(ctx, AtomContext::Arithmetic) && kind.is_varnode() {
+            if !matches!(kind, LocalKind::Instruction(_)) {
+                let got = if kind.is_varnode() {
+                    "a varnode"
+                } else {
+                    "a block param"
+                };
                 return Err(syn::Error::new(
                     proc_macro2::Span::call_site(),
-                    format!(
-                        "'{name}' is a varnode (pointer); use `&{name}` for addressof or `load(sz, {name})` to dereference its value"
-                    ),
+                    format!("'%{name}' is {got}, not an SSA value"),
                 ));
             }
-            lower_local_ident(
-                kind.ident(),
-                kind.is_block_param(),
-                typed.size_bytes,
-                size_hint,
-                pcode_root,
-            )
+            lower_local_ident(kind.ident(), false, typed.size_bytes, size_hint, pcode_root)
         }
+
+        Atom::BlockParam(name) => {
+            let Some(kind) = locals.get(name) else {
+                return Err(syn::Error::new(
+                    proc_macro2::Span::call_site(),
+                    format!("unknown block param '@{name}'"),
+                ));
+            };
+            if !kind.is_block_param() {
+                let got = if kind.is_varnode() {
+                    "a varnode"
+                } else {
+                    "an SSA value"
+                };
+                return Err(syn::Error::new(
+                    proc_macro2::Span::call_site(),
+                    format!("'@{name}' is {got}, not a block param"),
+                ));
+            }
+            lower_local_ident(kind.ident(), true, typed.size_bytes, size_hint, pcode_root)
+        }
+
+        Atom::Varnode(name) => Err(syn::Error::new(
+            proc_macro2::Span::call_site(),
+            format!(
+                "'{name}' is a varnode (pointer); use `&{name}` for addressof or `load(sz, {name})` to dereference its value"
+            ),
+        )),
 
         Atom::AddressOf(name) => {
             let Some(kind) = locals.get(name) else {
@@ -1397,6 +1374,40 @@ fn lower_local_ident(
     }
 }
 
+/// Lower an atom in a pointer position (load/store ptr, branchind, callind, return).
+/// `Atom::Varnode` is valid here; everything else delegates to `lower_atom`.
+fn lower_ptr_atom(
+    typed: &TypedAtom,
+    size_hint: Option<proc_macro2::TokenStream>,
+    locals: &HashMap<String, LocalKind>,
+    pcode_root: &proc_macro2::TokenStream,
+) -> syn::Result<proc_macro2::TokenStream> {
+    if let Atom::Varnode(name) = &typed.atom {
+        let Some(kind) = locals.get(name) else {
+            return Err(syn::Error::new(
+                proc_macro2::Span::call_site(),
+                format!("unknown varnode '{name}'"),
+            ));
+        };
+        if !kind.is_varnode() {
+            let got = if kind.is_block_param() {
+                "a block param"
+            } else {
+                "an SSA value"
+            };
+            return Err(syn::Error::new(
+                proc_macro2::Span::call_site(),
+                format!(
+                    "'{name}' is {got}, not a varnode; use `%{name}` for SSA values or `@{name}` for block params"
+                ),
+            ));
+        }
+        lower_local_ident(kind.ident(), false, typed.size_bytes, size_hint, pcode_root)
+    } else {
+        lower_atom(typed, size_hint, locals, pcode_root)
+    }
+}
+
 fn size_hint_tokens(
     typed: &TypedAtom,
     locals: &HashMap<String, LocalKind>,
@@ -1427,11 +1438,11 @@ fn size_hint_tokens(
             }
         }
 
-        Atom::Local(name) => {
+        Atom::Ssa(name) | Atom::BlockParam(name) => {
             let Some(kind) = locals.get(name) else {
                 return Err(syn::Error::new(
                     proc_macro2::Span::call_site(),
-                    format!("unknown local identifier '{name}'"),
+                    format!("unknown identifier '{name}'"),
                 ));
             };
             let local_ident = kind.ident();
@@ -1443,11 +1454,14 @@ fn size_hint_tokens(
             }))
         }
 
+        // Varnode in a binary expression: lower_atom will error; no useful hint to give.
+        Atom::Varnode(_) => Ok(None),
+
         Atom::AddressOf(name) => {
             let Some(kind) = locals.get(name) else {
                 return Err(syn::Error::new(
                     proc_macro2::Span::call_site(),
-                    format!("unknown local identifier '{name}'"),
+                    format!("unknown identifier '{name}'"),
                 ));
             };
             let local_ident = kind.ident();
