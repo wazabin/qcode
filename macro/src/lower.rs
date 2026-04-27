@@ -718,8 +718,8 @@ fn lower_expr(
 
             let size_assert = if needs_runtime_check {
                 quote! {
-                    let __qcode_lhs_size = __qcode_builder.context().get_value(__qcode_lhs).size();
-                    let __qcode_rhs_size = __qcode_builder.context().get_value(__qcode_rhs).size();
+                    let __qcode_lhs_size = #pcode_root::value::ValueRef::new(__qcode_lhs, __qcode_builder.context()).size();
+                    let __qcode_rhs_size = #pcode_root::value::ValueRef::new(__qcode_rhs, __qcode_builder.context()).size();
                     assert_eq!(
                         __qcode_lhs_size,
                         __qcode_rhs_size,
@@ -917,7 +917,7 @@ fn lower_atom(
                         {
                             let __qcode_value_id: #pcode_root::value::ValueId = (#ident).into();
                             let __qcode_expected_size = #expected_size;
-                            let __qcode_actual_size = __qcode_builder.context().get_value(__qcode_value_id).size();
+                            let __qcode_actual_size = #pcode_root::value::ValueRef::new(__qcode_value_id, __qcode_builder.context()).size();
                             assert_eq!(
                                 __qcode_actual_size,
                                 __qcode_expected_size,
@@ -1028,7 +1028,7 @@ fn lower_local_ident(
             {
                 let __qcode_value_id: #pcode_root::value::ValueId = (#local_ident).into();
                 let __qcode_expected_size = #expected_size;
-                let __qcode_actual_size = __qcode_builder.context().get_value(__qcode_value_id).size();
+                let __qcode_actual_size = #pcode_root::value::ValueRef::new(__qcode_value_id, __qcode_builder.context()).size();
                 assert_eq!(
                     __qcode_actual_size,
                     __qcode_expected_size,
@@ -1066,7 +1066,7 @@ fn size_hint_tokens(
                 Ok(Some(quote! {
                     {
                         let __qcode_value_id: #pcode_root::value::ValueId = (#local_ident).into();
-                        __qcode_builder.context().get_value(__qcode_value_id).size()
+                        #pcode_root::value::ValueRef::new(__qcode_value_id, __qcode_builder.context()).size()
                     }
                 }))
             } else {
@@ -1074,7 +1074,7 @@ fn size_hint_tokens(
                 Ok(Some(quote! {
                     {
                         let __qcode_value_id: #pcode_root::value::ValueId = (#ident).into();
-                        __qcode_builder.context().get_value(__qcode_value_id).size()
+                        #pcode_root::value::ValueRef::new(__qcode_value_id, __qcode_builder.context()).size()
                     }
                 }))
             }
@@ -1091,7 +1091,7 @@ fn size_hint_tokens(
             Ok(Some(quote! {
                 {
                     let __qcode_value_id: #pcode_root::value::ValueId = (#local_ident).into();
-                    __qcode_builder.context().get_value(__qcode_value_id).size()
+                    #pcode_root::value::ValueRef::new(__qcode_value_id, __qcode_builder.context()).size()
                 }
             }))
         }

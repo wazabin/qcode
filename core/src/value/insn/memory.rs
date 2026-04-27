@@ -1,7 +1,7 @@
 use crate::{
     context::Context,
     space::{Space, SpaceId},
-    value::ValueId,
+    value::{ValueId, ValueRef},
 };
 use std::fmt::Formatter;
 
@@ -34,7 +34,7 @@ impl MnemonicKind for Load {
                 .as_deref()
                 .unwrap_or(&format!("space: {}", self.space)),
             self.size,
-            ctx.get_value(self.ptr)
+            ValueRef::new(self.ptr, ctx)
         )
     }
 
@@ -94,8 +94,8 @@ impl MnemonicKind for Store {
                 .as_deref()
                 .unwrap_or(&format!("space: {}", self.space)),
             self.size,
-            ctx.get_value(self.ptr),
-            ctx.get_value(self.src)
+            ValueRef::new(self.ptr, ctx),
+            ValueRef::new(self.src, ctx)
         )
     }
 

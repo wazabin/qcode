@@ -328,10 +328,46 @@ impl<'str, 'ctx> BlockMutRef<'str, 'ctx> {
         BlockRef::new(self.ctx, self.id)
     }
 
+    fn insert_insn(&mut self, index: usize, insn_id: InstructionId) {
+        Instruction::from_id_mut(self.ctx, insn_id)
+            .inner_mut()
+            .parent = Some(self.id);
+
+        self.inner_mut().instructions.insert(index, insn_id);
+    }
+
+    /// Inserts an instruction at the start of this block, before all existing instructions.
+    pub fn insert_insn_at_start(&mut self, insn_id: InstructionId) {
+        self.insert_insn(0, insn_id);
+    }
+
+    /// Inserts an instruction before the instruction identified by `before_id` in this block.
+    /// Panics if `before_id` is not an instruction in this block.
+    pub fn insert_insn_before(&mut self, before_id: InstructionId, insn_id: InstructionId) {
+        let index = self
+            .inner()
+            .instructions
+            .iter()
+            .position(|&id| id == before_id)
+            .expect("before_id not found in block");
+        self.insert_insn(index, insn_id);
+    }
+
+    /// Inserts an instruction after the instruction identified by `after_id` in this block.
+    /// Panics if `after_id` is not an instruction in this block.
+    pub fn insert_insn_after(&mut self, after_id: InstructionId, insn_id: InstructionId) {
+        let index = self
+            .inner()
+            .instructions
+            .iter()
+            .position(|&id| id == after_id)
+            .expect("after_id not found in block");
+        self.insert_insn(index + 1, insn_id);
+    }
+
     /// Pushes an instruction to the end of this block.
     pub fn push_insn(&mut self, id: InstructionId) {
-        Instruction::from_id_mut(self.ctx, id).inner_mut().parent = Some(self.id);
-        self.inner_mut().instructions.push(id);
+        self.insert_insn(self.inner().instructions.len(), id);
     }
 
     /// Retains only the instructions for which `f` returns true, deleting the

@@ -1,6 +1,9 @@
 use std::fmt::{Display, Formatter};
 
-use crate::{context::Context, value::ValueId};
+use crate::{
+    context::Context,
+    value::{ValueId, ValueRef},
+};
 
 use super::mnemonic::MnemonicKind;
 
@@ -20,9 +23,9 @@ impl MnemonicKind for Binary {
         write!(
             f,
             "{} {} {};",
-            ctx.get_value(self.lhs),
+            ValueRef::new(self.lhs, ctx),
             self.op,
-            ctx.get_value(self.rhs)
+            ValueRef::new(self.rhs, ctx)
         )
     }
 

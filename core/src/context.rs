@@ -10,7 +10,7 @@ use crate::{
     error::{Error, ErrorTy, Result},
     space::{Space, SpaceId},
     value::{
-        BasicBlock, Function, FunctionId, FunctionRef, Instruction, ValueId, ValueRef,
+        BasicBlock, Function, FunctionId, FunctionRef, Instruction, ValueId,
         block::{BlockId, BlockMutRef, BlockRef, EdgeData, EdgeId, EdgeMutRef, EdgeRef},
         insn::{InstructionId, InstructionRef, PCodeOpId},
         literal::{LiteralId, LiteralRef},
@@ -228,13 +228,6 @@ impl<'str> Context<'str> {
     /// register `id`.
     pub fn get_register(&self, id: RegisterId) -> VarnodeRef<'str, '_> {
         Varnode::from_id(self, self.registers[&id])
-    }
-
-    /// Returns a type-erased view of the value identified by `id`.
-    ///
-    /// Panics if `id` does not correspond to a value stored in this context.
-    pub fn get_value(&self, id: ValueId) -> ValueRef<'str, '_> {
-        ValueRef::new(id, self)
     }
 
     /// Creates a [`Value`] representing a constant value.

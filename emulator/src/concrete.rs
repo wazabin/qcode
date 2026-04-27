@@ -1011,7 +1011,7 @@ impl<'ctx> Interpreter for TempInterpreter<'_, 'ctx> {
     }
 
     fn get_value(&mut self, id: ValueId) -> Result<Self::V, EmulatorErrorKind> {
-        match self.ctx.get_value(id) {
+        match ValueRef::new(id, self.ctx) {
             ValueRef::Literal(literal) => Ok(SizedValue::new(literal.value(), literal.size())),
             ValueRef::Instruction(insn) => self
                 .insn_values
@@ -1221,7 +1221,7 @@ impl<'ctx> Interpreter for Emulator<'ctx> {
     }
 
     fn get_value(&mut self, id: ValueId) -> Result<Self::V, EmulatorErrorKind> {
-        match self.ctx.get_value(id) {
+        match ValueRef::new(id, self.ctx) {
             ValueRef::Literal(literal) => Ok(SizedValue::new(literal.value(), literal.size())),
             ValueRef::Instruction(insn) => self
                 .inner

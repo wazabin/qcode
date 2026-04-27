@@ -218,7 +218,7 @@ impl<'str, 'ctx> Builder<'str, 'ctx> {
     pub fn try_get_value(&self, name: &str) -> Option<ValueRef<'str, '_>> {
         self.namespace
             .get(name)
-            .map(|&id| self.context().get_value(id))
+            .map(|&id| ValueRef::from_id(self.context(), id))
     }
 
     /// Returns the current context
@@ -258,7 +258,7 @@ impl<'str, 'ctx> Builder<'str, 'ctx> {
     }
 
     fn get_value(&self, id: ValueId) -> ValueRef<'str, '_> {
-        self.context().get_value(id)
+        ValueRef::from_id(self.context(), id)
     }
 
     fn merge_space_ids(&self, lhs: ValueId, rhs: ValueId) -> Option<SpaceId> {
@@ -430,7 +430,7 @@ impl<'str, 'ctx> Builder<'str, 'ctx> {
                 _ => {}
             }
 
-            let size = self.context().get_value(src).size();
+            let size = ValueRef::new(src, self.context()).size();
             self.push_instruction(
                 Mnemonic::Load(Load {
                     ptr: src,
@@ -450,7 +450,7 @@ impl<'str, 'ctx> Builder<'str, 'ctx> {
             !src.is_varnode(),
             "push_unop: varnode operand is not allowed; use ensure_local or &name addressof syntax"
         );
-        let size = self.context().get_value(src).size();
+        let size = ValueRef::new(src, self.context()).size();
         self.push_instruction(Mnemonic::Unop(Unary { op, src }), size)
     }
 
@@ -481,7 +481,7 @@ impl<'str, 'ctx> Builder<'str, 'ctx> {
         rhs: ValueId,
         size: Option<usize>,
     ) -> InstructionRef<'str, '_> {
-        let size = size.unwrap_or_else(|| self.context().get_value(lhs).size());
+        let size = size.unwrap_or_else(|| ValueRef::new(lhs, self.context()).size());
         let space = match op {
             Binop::Int(IntBinop::Add | IntBinop::Sub) => self.merge_space_ids(lhs, rhs),
             _ => None,
@@ -585,17 +585,17 @@ impl<'str, 'ctx> Builder<'str, 'ctx> {
     // --- Bitwise ---
 
     pub fn push_bool_xor(&mut self, lhs: ValueId, rhs: ValueId) -> InstructionRef<'str, '_> {
-        debug_assert_eq!(self.context().get_value(lhs).size(), 1);
+        debug_assert_eq!(ValueRef::new(lhs, self.context()).size(), 1);
         self.push_binop(Binop::Bool(BoolBinop::Xor), lhs, rhs, Some(1))
     }
 
     pub fn push_bool_and(&mut self, lhs: ValueId, rhs: ValueId) -> InstructionRef<'str, '_> {
-        debug_assert_eq!(self.context().get_value(lhs).size(), 1);
+        debug_assert_eq!(ValueRef::new(lhs, self.context()).size(), 1);
         self.push_binop(Binop::Bool(BoolBinop::And), lhs, rhs, Some(1))
     }
 
     pub fn push_bool_or(&mut self, lhs: ValueId, rhs: ValueId) -> InstructionRef<'str, '_> {
-        debug_assert_eq!(self.context().get_value(lhs).size(), 1);
+        debug_assert_eq!(ValueRef::new(lhs, self.context()).size(), 1);
         self.push_binop(Binop::Bool(BoolBinop::Or), lhs, rhs, Some(1))
     }
 
@@ -823,7 +823,7 @@ impl<'str, 'ctx> Builder<'str, 'ctx> {
         space: SpaceId,
     ) -> InstructionRef<'str, '_> {
         let src = self.ensure_local(src);
-        let size = self.context().get_value(src).size();
+        let size = ValueRef::new(src, self.context()).size();
 
         match ptr {
             ValueId::Varnode(id) => {

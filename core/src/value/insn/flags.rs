@@ -1,4 +1,7 @@
-use crate::{context::Context, value::ValueId};
+use crate::{
+    context::Context,
+    value::{ValueId, ValueRef},
+};
 use std::fmt::Formatter;
 
 use super::mnemonic::MnemonicKind;
@@ -14,7 +17,7 @@ impl MnemonicKind for IsFloatNaN {
     }
 
     fn fmt(&self, f: &mut Formatter<'_>, ctx: &Context<'_>) -> std::fmt::Result {
-        write!(f, "nan({});", ctx.get_value(self.src))
+        write!(f, "nan({});", ValueRef::new(self.src, ctx))
     }
 
     fn args(&self) -> Vec<ValueId> {
@@ -50,7 +53,7 @@ impl MnemonicKind for LzCount {
     }
 
     fn fmt(&self, f: &mut Formatter<'_>, ctx: &Context<'_>) -> std::fmt::Result {
-        write!(f, "lzcount({});", ctx.get_value(self.src))
+        write!(f, "lzcount({});", ValueRef::new(self.src, ctx))
     }
 
     fn args(&self) -> Vec<ValueId> {
@@ -77,7 +80,7 @@ impl MnemonicKind for PopCount {
     }
 
     fn fmt(&self, f: &mut Formatter<'_>, ctx: &Context<'_>) -> std::fmt::Result {
-        write!(f, "popcount({});", ctx.get_value(self.src))
+        write!(f, "popcount({});", ValueRef::new(self.src, ctx))
     }
 
     fn args(&self) -> Vec<ValueId> {
@@ -116,8 +119,8 @@ impl MnemonicKind for Carry {
         write!(
             f,
             "carry({}, {});",
-            ctx.get_value(self.lhs),
-            ctx.get_value(self.rhs)
+            ValueRef::new(self.lhs, ctx),
+            ValueRef::new(self.rhs, ctx)
         )
     }
 
@@ -156,8 +159,8 @@ impl MnemonicKind for SCarry {
         write!(
             f,
             "scarry({}, {});",
-            ctx.get_value(self.lhs),
-            ctx.get_value(self.rhs)
+            ValueRef::new(self.lhs, ctx),
+            ValueRef::new(self.rhs, ctx)
         )
     }
 
@@ -196,8 +199,8 @@ impl MnemonicKind for SBorrow {
         write!(
             f,
             "sborrow({}, {});",
-            ctx.get_value(self.lhs),
-            ctx.get_value(self.rhs)
+            ValueRef::new(self.lhs, ctx),
+            ValueRef::new(self.rhs, ctx)
         )
     }
 

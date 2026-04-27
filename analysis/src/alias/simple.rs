@@ -243,7 +243,7 @@ fn overlaps(start_a: u64, end_a: u64, start_b: u64, end_b: u64) -> bool {
 }
 
 fn literal_interval(ctx: &Context, literal: ValueId, size: usize) -> Option<(u64, u64)> {
-    let ValueRef::Literal(literal) = ctx.get_value(literal) else {
+    let ValueRef::Literal(literal) = ValueRef::new(literal, ctx) else {
         unreachable!("literal_interval must only be called for literals");
     };
 

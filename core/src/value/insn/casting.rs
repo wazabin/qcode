@@ -1,7 +1,7 @@
 use crate::{
     context::Context,
     value::{
-        ValueId,
+        ValueId, ValueRef,
         insn::bits::{mask_for_size, signed_value},
     },
 };
@@ -28,7 +28,12 @@ impl MnemonicKind for Zext {
     }
 
     fn fmt(&self, f: &mut Formatter<'_>, ctx: &Context<'_>) -> std::fmt::Result {
-        write!(f, "zext(i{}, {});", self.size * 8, ctx.get_value(self.src))
+        write!(
+            f,
+            "zext(i{}, {});",
+            self.size * 8,
+            ValueRef::new(self.src, ctx)
+        )
     }
 
     fn args(&self) -> Vec<ValueId> {
@@ -58,7 +63,12 @@ impl MnemonicKind for Sext {
     }
 
     fn fmt(&self, f: &mut Formatter<'_>, ctx: &Context<'_>) -> std::fmt::Result {
-        write!(f, "sext(i{}, {});", self.size * 8, ctx.get_value(self.src))
+        write!(
+            f,
+            "sext(i{}, {});",
+            self.size * 8,
+            ValueRef::new(self.src, ctx)
+        )
     }
 
     fn args(&self) -> Vec<ValueId> {
@@ -95,7 +105,7 @@ impl MnemonicKind for Range {
         write!(
             f,
             "{}[{}:{}];",
-            ctx.get_value(self.src),
+            ValueRef::new(self.src, ctx),
             self.start,
             self.start + self.size
         )
@@ -122,7 +132,7 @@ impl MnemonicKind for IntToFloat {
             f,
             "int2float(f{}, {});",
             self.size * 8,
-            ctx.get_value(self.src)
+            ValueRef::new(self.src, ctx)
         )
     }
 
@@ -147,7 +157,7 @@ impl MnemonicKind for FloatToFloat {
             f,
             "float2float(f{}, {});",
             self.size * 8,
-            ctx.get_value(self.src)
+            ValueRef::new(self.src, ctx)
         )
     }
 
@@ -168,7 +178,12 @@ impl MnemonicKind for FloatToInt {
     }
 
     fn fmt(&self, f: &mut Formatter<'_>, ctx: &Context<'_>) -> std::fmt::Result {
-        write!(f, "trunc(i{}, {});", self.size * 8, ctx.get_value(self.src))
+        write!(
+            f,
+            "trunc(i{}, {});",
+            self.size * 8,
+            ValueRef::new(self.src, ctx)
+        )
     }
 
     fn args(&self) -> Vec<ValueId> {

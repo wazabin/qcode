@@ -1,6 +1,9 @@
 use std::collections::HashMap;
 
-use qcode::{context::Context, value::ValueId};
+use qcode::{
+    context::Context,
+    value::{ValueId, ValueRef},
+};
 
 mod anderson;
 mod simple;
@@ -35,8 +38,8 @@ impl AliasResult {
     /// involved in any constraint (isolated - no alias relationship).
     pub fn may_alias(&self, ctx: &Context, a: ValueId, b: ValueId) -> bool {
         // If a and b don't share the same address space they can't alias.
-        let a_space = ctx.get_value(a).space().map(|s| s.id);
-        let b_space = ctx.get_value(b).space().map(|s| s.id);
+        let a_space = ValueRef::new(a, ctx).space().map(|s| s.id);
+        let b_space = ValueRef::new(b, ctx).space().map(|s| s.id);
         if let (Some(sa), Some(sb)) = (a_space, b_space)
             && sa != sb
         {

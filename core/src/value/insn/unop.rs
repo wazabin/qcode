@@ -2,7 +2,7 @@ use std::fmt::{Display, Formatter};
 
 use crate::{
     context::Context,
-    value::{ValueId, insn::mnemonic::MnemonicKind},
+    value::{ValueId, ValueRef, insn::mnemonic::MnemonicKind},
 };
 
 #[non_exhaustive]
@@ -69,7 +69,7 @@ impl MnemonicKind for Unary {
     fn fmt(&self, f: &mut Formatter<'_>, ctx: &Context<'_>) -> std::fmt::Result {
         match self.op {
             Unop::IntNegate | Unop::IntNot | Unop::BoolNot => {
-                write!(f, "{} {};", self.op, ctx.get_value(self.src))
+                write!(f, "{} {};", self.op, ValueRef::new(self.src, ctx))
             }
             Unop::FloatNegate
             | Unop::FloatAbs
@@ -77,7 +77,7 @@ impl MnemonicKind for Unary {
             | Unop::FloatCeil
             | Unop::FloatFloor
             | Unop::FloatRound => {
-                write!(f, "{}({});", self.op, ctx.get_value(self.src))
+                write!(f, "{}({});", self.op, ValueRef::new(self.src, ctx))
             }
         }
     }
@@ -120,7 +120,7 @@ mod tests {
         match v.mnemonic() {
             Mnemonic::Unop(Unary { op, src }) => {
                 assert_eq!(*op, Unop::BoolNot);
-                assert_eq!(ctx.get_value(*src).size(), 4);
+                assert_eq!(ValueRef::new(*src, &ctx).size(), 4);
             }
             _ => panic!("expected boolean unop instruction"),
         }

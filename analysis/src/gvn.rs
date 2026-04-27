@@ -66,7 +66,7 @@ fn normalize(m: &mut Mnemonic) {
 // ---------------------------------------------------------------------------
 
 fn get_const<'a>(ctx: &'a Context<'a>, v: ValueId) -> Option<LiteralRef<'a, 'a>> {
-    match ctx.get_value(v) {
+    match ValueRef::new(v, ctx) {
         ValueRef::Literal(c) => Some(c),
         _ => None,
     }

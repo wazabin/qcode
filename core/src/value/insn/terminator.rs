@@ -1,9 +1,8 @@
-use std::borrow::Cow;
 use std::fmt::Formatter;
 
 use crate::{
     context::Context,
-    value::{BasicBlock, Function, ValueId, block::BlockId, function::FunctionId},
+    value::{BasicBlock, Function, ValueId, ValueRef, block::BlockId, function::FunctionId},
 };
 
 use super::mnemonic::MnemonicKind;
@@ -28,7 +27,7 @@ impl MnemonicKind for Branch {
             "goto <{}>;",
             BasicBlock::from_id(ctx, self.target)
                 .name()
-                .unwrap_or(&Cow::Borrowed("unnamed"))
+                .unwrap_or("unnamed")
         )
     }
 
@@ -52,7 +51,7 @@ impl MnemonicKind for BranchInd {
     }
 
     fn fmt(&self, f: &mut Formatter<'_>, ctx: &Context<'_>) -> std::fmt::Result {
-        write!(f, "goto [{}];", ctx.get_value(self.ptr))
+        write!(f, "goto [{}];", ValueRef::new(self.ptr, ctx))
     }
 
     fn args(&self) -> Vec<ValueId> {
@@ -100,7 +99,7 @@ impl MnemonicKind for CallInd {
     }
 
     fn fmt(&self, f: &mut Formatter<'_>, ctx: &Context<'_>) -> std::fmt::Result {
-        write!(f, "call [{}];", ctx.get_value(self.ptr))
+        write!(f, "call [{}];", ValueRef::new(self.ptr, ctx))
     }
 
     fn args(&self) -> Vec<ValueId> {
@@ -130,13 +129,13 @@ impl MnemonicKind for CBranch {
         write!(
             f,
             "if {} goto <{}>; else goto <{}>;",
-            ctx.get_value(self.condition),
+            ValueRef::new(self.condition, ctx),
             BasicBlock::from_id(ctx, self.success_block)
                 .name()
-                .unwrap_or(&Cow::Borrowed("unnamed")),
+                .unwrap_or("unnamed"),
             BasicBlock::from_id(ctx, self.failure_block)
                 .name()
-                .unwrap_or(&Cow::Borrowed("unnamed"))
+                .unwrap_or("unnamed")
         )
     }
 
@@ -161,7 +160,7 @@ impl MnemonicKind for Return {
     }
 
     fn fmt(&self, f: &mut Formatter<'_>, ctx: &Context<'_>) -> std::fmt::Result {
-        write!(f, "return [{}];", ctx.get_value(self.ptr))
+        write!(f, "return [{}];", ValueRef::new(self.ptr, ctx))
     }
 
     fn args(&self) -> Vec<ValueId> {
