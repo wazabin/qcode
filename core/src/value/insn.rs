@@ -5,6 +5,7 @@
 use crate::{
     context::Context,
     error::Result,
+    space::{Space, SpaceId, SpaceRef, SpaceType},
     value::{
         BasicBlock, BlockId, BlockRef, FunctionRef, Value, ValueId,
         util::{
@@ -46,13 +47,16 @@ pub struct InstructionId(usize);
 #[derive(Clone)]
 pub struct Instruction<'str> {
     /// The name of this instruction
-    name: Option<Cow<'str, str>>,
+    pub(crate) name: Option<Cow<'str, str>>,
 
     /// The size of this value in bytes
     size: usize,
 
     /// The instruction which defines this value.
     mnemonic: Mnemonic,
+
+    /// Optional address-space provenance for this instruction's result.
+    space: Option<SpaceId>,
 
     /// The block that this instruction belongs to, if any.
     /// Instructions that are not part of any block (e.g. lifted from data sections) have `None` here.
@@ -62,12 +66,13 @@ pub struct Instruction<'str> {
 }
 
 impl<'str> Instruction<'str> {
-    fn new(size: usize, mnemonic: Mnemonic) -> Self {
+    fn new(size: usize, mnemonic: Mnemonic, space: Option<SpaceId>) -> Self {
         Self {
             name: None,
             parent: None,
             size,
             mnemonic,
+            space,
             _marker: std::marker::PhantomData,
         }
     }
@@ -130,6 +135,11 @@ where
         &self.inner().mnemonic
     }
 
+    /// The address-space provenance for this instruction's result, if known.
+    pub fn space(&'s self) -> Option<SpaceRef<'str, 'ctx>> {
+        self.inner().space.map(|id| Space::from_id(self.ctx(), id))
+    }
+
     /// The opcode for this instruction
     pub fn opcode(&'s self) -> &'static str {
         self.mnemonic().opcode()
@@ -156,7 +166,20 @@ pub type InstructionRef<'str, 'ctx> = BaseRef<&'ctx Context<'str>, InstructionId
 
 impl<'str, 'ctx> InstructionRef<'str, 'ctx> {
     pub fn from_mnemonic(ctx: &'ctx mut Context<'str>, mnemonic: Mnemonic, size: usize) -> Self {
-        let insn = Instruction::new(size, mnemonic);
+        Self::from_mnemonic_with_space(ctx, mnemonic, size, None)
+    }
+
+    // Pointer arithmetic is not allowed in the register space
+    pub fn from_mnemonic_with_space(
+        ctx: &'ctx mut Context<'str>,
+        mnemonic: Mnemonic,
+        size: usize,
+        space: Option<SpaceId>,
+    ) -> Self {
+        // Pointer arithmetic is not allowed in the register space
+        let space =
+            space.filter(|&space| !matches!(Space::from_id(ctx, space).ty, SpaceType::Register));
+        let insn = Instruction::new(size, mnemonic, space);
         let id = ctx.values.push_insn(insn);
         Self::from_id(ctx, id)
     }
@@ -204,6 +227,19 @@ impl<'str, 'ctx> InstructionMutRef<'str, 'ctx> {
 
     pub fn mnemonic_mut(&mut self) -> &mut Mnemonic {
         &mut self.inner_mut().mnemonic
+    }
+
+    pub fn set_space(&mut self, space: SpaceId) {
+        if self.inner().space.is_some_and(|s| s != space) {
+            panic!(
+                "Cannot change space of instruction {} from {:?} to {:?}",
+                self,
+                self.inner().space.map(|s| Space::from_id(self.ctx, s)),
+                Space::from_id(self.ctx, space)
+            );
+        }
+
+        self.inner_mut().space = Some(space);
     }
 }
 

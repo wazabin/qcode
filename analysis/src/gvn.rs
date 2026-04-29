@@ -1,15 +1,21 @@
 use std::collections::{HashMap, HashSet};
 
+use jstd::graph::analysis::{DominatorTree, compute_dominators};
+
 use crate::AliasResult;
 
 use qcode::{
     context::Context,
     value::{
-        Value, ValueId, ValueRef,
-        block::BlockMutRef,
-        insn::{Binary, Binop, BoolBinop, FloatBinop, InstructionId, IntBinop, Mnemonic, Unop},
+        BasicBlock, Value, ValueId, ValueRef,
+        block::{BlockId, BlockMutRef},
+        function::FunctionId,
+        insn::{
+            Binary, Binop, BoolBinop, FloatBinop, InstructionId, InstructionRef, IntBinop, Load,
+            Mnemonic, Range, Unop,
+        },
         literal::LiteralRef,
-        util::base_ref::{WithCtx, WithCtxMut},
+        util::base_ref::WithCtxMut,
     },
 };
 
@@ -63,12 +69,13 @@ fn normalize(m: &mut Mnemonic) {
 // ---------------------------------------------------------------------------
 
 fn get_const<'a>(ctx: &'a Context<'a>, v: ValueId) -> Option<LiteralRef<'a, 'a>> {
-    match ctx.get_value(v) {
+    match ValueRef::new(v, ctx) {
         ValueRef::Literal(c) => Some(c),
         _ => None,
     }
 }
 
+// TODO: use the existing `evaluate_const` machinery instead of re-implementing it here.
 fn constant_folding(ctx: &mut Context, m: &Mnemonic) -> Option<ValueId> {
     match m {
         &Mnemonic::Binop(Binary { lhs, rhs, op }) => {
@@ -152,44 +159,73 @@ fn constant_folding(ctx: &mut Context, m: &Mnemonic) -> Option<ValueId> {
 // GVN pass
 // ---------------------------------------------------------------------------
 
-/// Simple GVN pass over all instructions in `block`.
+/// Process all instructions in `block_id` with an inherited value table.
 ///
-/// Processes instructions in registry (insertion) order. Loads are GVN-able
-/// but are invalidated by intervening stores that may-alias the load pointer
-/// according to `aliases`. Pure instructions are always GVN-able.
-/// Terminators, calls, and `PCodeOp` are excluded.
-pub fn gvn(block: &mut BlockMutRef, aliases: Option<&AliasResult>) {
-    let mut table: HashMap<Mnemonic, ValueId> = HashMap::new();
+/// Returns the updated table (inherited entries plus new entries from this block)
+/// for descendants in the dominator tree to inherit.
+fn gvn_block_inner(
+    ctx: &mut Context,
+    block_id: BlockId,
+    inherited: &HashMap<Mnemonic, ValueId>,
+    aliases: Option<&AliasResult>,
+) -> HashMap<Mnemonic, ValueId> {
+    let mut table = inherited.clone();
+    // Maps a narrow-load mnemonic to (wide_src, byte_offset_within_wide, sub_size),
+    // populated when a wide store covers sub-register locations.
+    let mut range_table: HashMap<Mnemonic, (ValueId, usize, usize)> = HashMap::new();
     let mut redundant: HashSet<InstructionId> = HashSet::new();
 
-    let insns = block.instruction_ids().to_vec();
+    let insns = BasicBlock::from_id(ctx, block_id)
+        .instruction_ids()
+        .to_vec();
 
     for insn_id in insns {
-        let insn = block.ctx().get_insn(insn_id);
+        let insn = ctx.get_insn(insn_id);
         let id = insn.id();
-
+        let insn_size = insn.size();
         let mut mnemonic = insn.mnemonic().clone();
 
         match mnemonic {
             Mnemonic::Store(store) => {
                 let store_ptr = store.ptr;
-
                 table.retain(|k, _| {
                     if let Mnemonic::Load(load) = k {
-                        aliases.is_some_and(|aliases| !aliases.may_alias(store_ptr, load.ptr))
+                        aliases.is_some_and(|aliases| !aliases.may_alias(ctx, store_ptr, load.ptr))
+                    } else {
+                        true
+                    }
+                });
+                table.insert(Mnemonic::Load(store.get_matching_load()), store.src);
+
+                // Invalidate range_table entries for locations this store may overwrite.
+                range_table.retain(|k, _| {
+                    if let Mnemonic::Load(sub_load) = k {
+                        aliases
+                            .is_none_or(|aliases| !aliases.may_alias(ctx, store_ptr, sub_load.ptr))
                     } else {
                         true
                     }
                 });
 
-                table.insert(Mnemonic::Load(store.get_matching_load()), store.src);
+                // Forward sub-register loads from this wide store.
+                if let Some(aliases) = aliases {
+                    for (sub_ptr, byte_off, sub_size) in aliases.sub_intervals_of(store.ptr) {
+                        let sub_load = Load {
+                            space: store.space,
+                            ptr: sub_ptr,
+                            size: sub_size,
+                        };
+                        range_table
+                            .insert(Mnemonic::Load(sub_load), (store.src, byte_off, sub_size));
+                    }
+                }
             }
 
-            _ if mnemonic.is_terminator() || insn.size() == 0 => {}
+            _ if mnemonic.is_terminator() || insn_size == 0 => {}
 
             _ => {
-                if let Some(cst) = constant_folding(block.ctx_mut(), &mnemonic) {
-                    block.ctx_mut().replace_all_uses_with(id, cst);
+                if let Some(cst) = constant_folding(ctx, &mnemonic) {
+                    ctx.replace_all_uses_with(id, cst);
                     redundant.insert(insn_id);
                     continue;
                 }
@@ -198,11 +234,33 @@ pub fn gvn(block: &mut BlockMutRef, aliases: Option<&AliasResult>) {
 
                 match table.get(&mnemonic) {
                     Some(&leader) => {
-                        block.ctx_mut().replace_all_uses_with(id, leader);
+                        ctx.replace_all_uses_with(id, leader);
                         redundant.insert(insn_id);
                     }
-
                     None => {
+                        // For loads not in the main table, check whether a wider store
+                        // already covers this sub-register location.
+                        if let Mnemonic::Load(_) = &mnemonic
+                            && let Some(&(wide_src, byte_off, sub_size)) =
+                                range_table.get(&mnemonic)
+                        {
+                            let range_id = InstructionRef::from_mnemonic(
+                                ctx,
+                                Mnemonic::Range(Range {
+                                    src: wide_src,
+                                    start: byte_off,
+                                    size: sub_size,
+                                }),
+                                sub_size,
+                            )
+                            .id;
+                            BasicBlock::from_id_mut(ctx, block_id)
+                                .insert_insn_before(insn_id, range_id);
+                            ctx.replace_all_uses_with(id, range_id);
+                            table.insert(mnemonic, range_id.into());
+                            redundant.insert(insn_id);
+                            continue;
+                        }
                         table.insert(mnemonic, id);
                     }
                 }
@@ -210,7 +268,49 @@ pub fn gvn(block: &mut BlockMutRef, aliases: Option<&AliasResult>) {
         }
     }
 
-    block.retain_insns(|insn| !redundant.contains(insn));
+    BasicBlock::from_id_mut(ctx, block_id).retain_insns(|insn| !redundant.contains(insn));
+    table
+}
+
+/// Single-block GVN pass (preserved for backward compatibility).
+///
+/// Processes instructions in registry (insertion) order. Loads are GVN-able
+/// but are invalidated by intervening stores that may-alias the load pointer
+/// according to `aliases`. Pure instructions are always GVN-able.
+/// Terminators, calls, and `PCodeOp` are excluded.
+pub fn gvn(block: &mut BlockMutRef, aliases: Option<&AliasResult>) {
+    let block_id = block.id;
+    gvn_block_inner(block.ctx_mut(), block_id, &HashMap::new(), aliases);
+}
+
+fn gvn_block_rec(
+    ctx: &mut Context,
+    block_id: BlockId,
+    inherited: &HashMap<Mnemonic, ValueId>,
+    tree: &DominatorTree<BlockId>,
+    aliases: Option<&AliasResult>,
+) {
+    let updated = gvn_block_inner(ctx, block_id, inherited, aliases);
+    for &child in tree.children_of(block_id) {
+        gvn_block_rec(ctx, child, &updated, tree, aliases);
+    }
+}
+
+/// Dominator-tree GVN over an entire function.
+///
+/// Walks the dominator tree in pre-order, propagating the value table from each
+/// block to its dominated successors. A value computed in a dominator is always
+/// available to every descendant, so redundant recomputations across blocks are
+/// eliminated. Store/load invalidation follows the same alias-aware rules as the
+/// single-block pass.
+pub fn gvn_function(ctx: &mut Context, func_id: FunctionId, aliases: Option<&AliasResult>) {
+    let root = match ctx.values.functions[func_id].root {
+        Some(r) => r,
+        None => return,
+    };
+
+    let tree = compute_dominators(ctx, root);
+    gvn_block_rec(ctx, root, &HashMap::new(), &tree, aliases);
 }
 
 // ---------------------------------------------------------------------------
@@ -222,27 +322,35 @@ mod tests {
     use qcode_macro::qcode;
 
     use super::*;
-    use qcode::{builder::Builder, context::Context, value::BasicBlock};
+    use qcode::{context::Context, value::BasicBlock};
 
     // 1. Same binop -> second is redundant, leader is first
     #[test]
     fn test_same_binop_redundant() {
         let mut ctx = Context::new();
-        let mut builder = Builder::from_context(&mut ctx, 0x1000);
-        let block_id = builder.block.id;
 
-        qcode!("local i64 a; local i64 b;");
-        let v1 = qcode!("{a} + {b}");
-        let v2 = qcode!("{a} + {b}");
+        qcode!(
+            ctx,
+            "
+            varnode i64 A;
+            varnode i64 B;
 
-        builder.finalize(0x1001);
+            <block>
+                %a = load(i64, &A);
+                %b = load(i64, &B);
 
-        let mut block = BasicBlock::from_id_mut(&mut ctx, block_id);
+                %v1 = %a + %b;
+                %v2 = %a + %b;
+
+                goto <0x1001>;
+        "
+        );
+
+        let mut block = BasicBlock::from_id_mut(&mut ctx, block);
 
         assert!(block.instruction_ids().contains(&v1));
         assert!(block.instruction_ids().contains(&v2));
 
-        // Simplify the block
         gvn(&mut block, None);
 
         assert!(block.instruction_ids().contains(&v1));
@@ -253,46 +361,58 @@ mod tests {
     #[test]
     fn test_commutative_normalization() {
         let mut ctx = Context::new();
-        let mut builder = Builder::from_context(&mut ctx, 0x1000);
-        let block_id = builder.block.id;
 
-        qcode!("local i64 a; local i64 b;");
-        let v1 = qcode!("{a} + {b}");
-        let v2 = qcode!("{b} + {a}");
+        qcode!(
+            ctx,
+            "
+            varnode i64 A;
+            varnode i64 B;
 
-        builder.finalize(0x1001);
+            <block>
+                %a = load(i64, &A);
+                %b = load(i64, &B);
+                %v1 = %a + %b;
+                %v2 = %b + %a;
+                goto <0x1001>;
+        "
+        );
 
-        let mut block = BasicBlock::from_id_mut(&mut ctx, block_id);
+        let mut block = BasicBlock::from_id_mut(&mut ctx, block);
 
         assert!(block.instruction_ids().contains(&v1));
         assert!(block.instruction_ids().contains(&v2));
 
-        // Simplify the block
         gvn(&mut block, None);
 
         assert!(block.instruction_ids().contains(&v1));
         assert!(!block.instruction_ids().contains(&v2));
     }
 
-    // 3. Non-commutative not swapped: a - b ≠ b - a
+    // 3. Non-commutative not swapped: a - b != b - a
     #[test]
     fn test_non_commutative_not_swapped() {
         let mut ctx = Context::new();
-        let mut builder = Builder::from_context(&mut ctx, 0x1000);
-        let block_id = builder.block.id;
 
-        qcode!("local i64 a; local i64 b;");
-        let v1 = qcode!("{a} - {b}");
-        let v2 = qcode!("{b} - {a}");
+        qcode!(
+            ctx,
+            "
+            varnode i64 A;
+            varnode i64 B;
 
-        builder.finalize(0x1001);
+            <block>
+                %a = load(i64, &A);
+                %b = load(i64, &B);
+                %v1 = %a - %b;
+                %v2 = %b - %a;
+                goto <0x1001>;
+        "
+        );
 
-        let mut block = BasicBlock::from_id_mut(&mut ctx, block_id);
+        let mut block = BasicBlock::from_id_mut(&mut ctx, block);
 
         assert!(block.instruction_ids().contains(&v1));
         assert!(block.instruction_ids().contains(&v2));
 
-        // Simplify the block
         gvn(&mut block, None);
 
         assert!(block.instruction_ids().contains(&v1));
@@ -303,45 +423,145 @@ mod tests {
     #[test]
     fn test_different_ops_distinct() {
         let mut ctx = Context::new();
-        let mut builder = Builder::from_context(&mut ctx, 0x1000);
-        let block_id = builder.block.id;
 
-        qcode!("local i64 a; local i64 b;");
-        let v1 = qcode!("{a} + {b}");
-        let v2 = qcode!("{a} * {b}");
+        qcode!(
+            ctx,
+            "
+            varnode i64 A;
+            varnode i64 B;
 
-        builder.finalize(0x1001);
+            <block>
+                %a = load(i64, &A);
+                %b = load(i64, &B);
+                %v1 = %a + %b;
+                %v2 = %a * %b;
+                goto <0x1001>;
+        "
+        );
 
-        let mut block = BasicBlock::from_id_mut(&mut ctx, block_id);
+        let mut block = BasicBlock::from_id_mut(&mut ctx, block);
 
         assert!(block.instruction_ids().contains(&v1));
         assert!(block.instruction_ids().contains(&v2));
 
-        // Simplify the block
         gvn(&mut block, None);
 
         assert!(block.instruction_ids().contains(&v1));
         assert!(block.instruction_ids().contains(&v2));
     }
 
-    // 5. Constant propagation
+    // 5. Cross-block redundancy: a+b in entry propagates to dominated successor
     #[test]
-    #[ignore = "WIP: constant folding not fully implemented yet"]
+    fn test_gvn_function_cross_block_redundancy() {
+        // Layout: entry → succ (linear chain, succ dominated by entry)
+        // entry: v1 = a + b
+        // succ:  v2 = a + b  <- redundant, dominated by entry
+        let mut ctx = Context::new();
+
+        qcode!(
+            ctx,
+            "
+            varnode i64 A;
+            varnode i64 B;
+
+            fn f:
+                <entry>
+                    %a = load(i64, &A);
+                    %b = load(i64, &B);
+
+                    %v1 = %a + %b;
+                    goto <succ>;
+
+                <succ>
+                    %v2 = %a + %b;
+                    return [0x1000];
+            "
+        );
+
+        gvn_function(&mut ctx, f, None);
+
+        assert!(
+            BasicBlock::from_id(&ctx, entry)
+                .instruction_ids()
+                .contains(&v1)
+        );
+        assert!(
+            !BasicBlock::from_id(&ctx, succ)
+                .instruction_ids()
+                .contains(&v2),
+            "a+b in dominated successor should be eliminated"
+        );
+    }
+
+    // 6. Diamond CFG: a+b computed in one branch is NOT available at merge
+    #[test]
+    fn test_gvn_function_no_propagation_across_merge() {
+        // Layout: entry → left, entry → right, left → merge, right → merge
+        // left:  v1 = a + b
+        // right: (no a+b)
+        // merge: v2 = a + b  <- NOT redundant; merge is dominated only by entry
+        let mut ctx = Context::new();
+
+        qcode!(
+            ctx,
+            "
+            varnode i64 A;
+            varnode i64 B;
+
+            fn g:
+                <entry>
+                    %a = load(i64, &A);
+                    %b = load(i64, &B);
+                    if i8 1 goto <left> else goto <right>;
+
+                <left>
+                    %v1 = %a + %b;
+                    goto <merge>;
+
+                <right>
+                    goto <merge>;
+
+                <merge>
+                    %v2 = %a + %b;"
+        );
+
+        gvn_function(&mut ctx, g, None);
+
+        assert!(
+            BasicBlock::from_id(&ctx, left)
+                .instruction_ids()
+                .contains(&v1)
+        );
+        assert!(
+            BasicBlock::from_id(&ctx, merge)
+                .instruction_ids()
+                .contains(&v2),
+            "a+b at merge must NOT be eliminated: merge is not dominated by left"
+        );
+    }
+
+    // 7. Constant propagation
+    #[test]
     fn test_constant_propagation() {
         let mut ctx = Context::new();
-        let mut builder = Builder::from_context(&mut ctx, 0x1000);
-        let block_id = builder.block.id;
 
-        qcode!("local i64 a; local i64 b;");
-        let v1 = qcode!("store({a}, i64 5); {a} + 2");
-        let v2 = qcode!("{v1} + 3");
-        qcode!("store({b}, {v2})");
+        qcode!(
+            ctx,
+            "
+            varnode i64 A;
+            varnode i64 B;
+            <block>
+                store(&A, i64 5);
+                %a = load(i64, &A);
+                %v1 = %a + 2;
+                %v2 = %v1 + 3;
+                store(&B, %v2);
+                goto <0x1001>;"
+        );
 
-        builder.finalize(0x1001);
+        let aliases = AliasResult::simple(&ctx);
 
-        let aliases = AliasResult::from_space_ids(&ctx);
-
-        let mut block = BasicBlock::from_id_mut(&mut ctx, block_id);
+        let mut block = BasicBlock::from_id_mut(&mut ctx, block);
 
         assert!(block.instruction_ids().contains(&v1));
         assert!(block.instruction_ids().contains(&v2));
@@ -352,6 +572,6 @@ mod tests {
 
         assert!(!block.instruction_ids().contains(&v1));
         assert!(!block.instruction_ids().contains(&v2));
-        assert!(block.to_string().contains("b = 0xa"));
+        assert!(block.to_string().contains("B = 0xa"));
     }
 }

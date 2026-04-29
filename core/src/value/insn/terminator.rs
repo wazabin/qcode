@@ -1,16 +1,41 @@
-use std::borrow::Cow;
 use std::fmt::Formatter;
 
 use crate::{
     context::Context,
-    value::{BasicBlock, Function, ValueId, block::BlockId, function::FunctionId},
+    value::{BasicBlock, Function, ValueId, ValueRef, block::BlockId, function::FunctionId},
 };
 
 use super::mnemonic::MnemonicKind;
 
+fn fmt_branch_target(
+    f: &mut Formatter<'_>,
+    ctx: &Context<'_>,
+    target: BlockId,
+    args: &[ValueId],
+) -> std::fmt::Result {
+    let block = BasicBlock::from_id(ctx, target);
+    let name = block.name().unwrap_or("unnamed");
+    write!(f, "<{name}")?;
+
+    let params = block.params().collect::<Vec<_>>();
+    for (i, &arg) in args.iter().enumerate() {
+        write!(f, " ")?;
+        if let Some(param) = params.get(i) {
+            write!(f, "{param}")?;
+        } else {
+            write!(f, "@arg{i}")?;
+        }
+        write!(f, "={}", ValueRef::new(arg, ctx))?;
+    }
+
+    write!(f, ">")
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct Branch {
     pub target: BlockId,
+    /// Arguments passed to the target block's parameters.
+    pub args: Vec<ValueId>,
 }
 
 impl MnemonicKind for Branch {
@@ -23,17 +48,13 @@ impl MnemonicKind for Branch {
     }
 
     fn fmt(&self, f: &mut Formatter<'_>, ctx: &Context<'_>) -> std::fmt::Result {
-        write!(
-            f,
-            "goto <{}>;",
-            BasicBlock::from_id(ctx, self.target)
-                .name()
-                .unwrap_or(&Cow::Borrowed("unnamed"))
-        )
+        write!(f, "goto ")?;
+        fmt_branch_target(f, ctx, self.target, &self.args)?;
+        write!(f, ";")
     }
 
     fn args(&self) -> Vec<ValueId> {
-        vec![]
+        self.args.clone()
     }
 }
 
@@ -52,7 +73,7 @@ impl MnemonicKind for BranchInd {
     }
 
     fn fmt(&self, f: &mut Formatter<'_>, ctx: &Context<'_>) -> std::fmt::Result {
-        write!(f, "goto [{}];", ctx.get_value(self.ptr))
+        write!(f, "goto [{}];", ValueRef::new(self.ptr, ctx))
     }
 
     fn args(&self) -> Vec<ValueId> {
@@ -100,7 +121,7 @@ impl MnemonicKind for CallInd {
     }
 
     fn fmt(&self, f: &mut Formatter<'_>, ctx: &Context<'_>) -> std::fmt::Result {
-        write!(f, "call [{}];", ctx.get_value(self.ptr))
+        write!(f, "call [{}];", ValueRef::new(self.ptr, ctx))
     }
 
     fn args(&self) -> Vec<ValueId> {
@@ -113,8 +134,12 @@ impl MnemonicKind for CallInd {
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct CBranch {
     pub condition: ValueId,
-    pub target: BlockId,
-    pub fallthrough: BlockId,
+    pub success_block: BlockId,
+    /// Arguments passed to `success_block`'s parameters when the branch is taken.
+    pub success_args: Vec<ValueId>,
+    pub failure_block: BlockId,
+    /// Arguments passed to `failure_block`'s parameters when the branch falls through.
+    pub failure_args: Vec<ValueId>,
 }
 
 impl MnemonicKind for CBranch {
@@ -127,21 +152,18 @@ impl MnemonicKind for CBranch {
     }
 
     fn fmt(&self, f: &mut Formatter<'_>, ctx: &Context<'_>) -> std::fmt::Result {
-        write!(
-            f,
-            "if {} goto <{}>; else goto <{}>;",
-            ctx.get_value(self.condition),
-            BasicBlock::from_id(ctx, self.target)
-                .name()
-                .unwrap_or(&Cow::Borrowed("unnamed")),
-            BasicBlock::from_id(ctx, self.fallthrough)
-                .name()
-                .unwrap_or(&Cow::Borrowed("unnamed"))
-        )
+        write!(f, "if {} goto ", ValueRef::new(self.condition, ctx))?;
+        fmt_branch_target(f, ctx, self.success_block, &self.success_args)?;
+        write!(f, " else goto ")?;
+        fmt_branch_target(f, ctx, self.failure_block, &self.failure_args)?;
+        write!(f, ";")
     }
 
     fn args(&self) -> Vec<ValueId> {
-        vec![self.condition]
+        let mut args = vec![self.condition];
+        args.extend_from_slice(&self.success_args);
+        args.extend_from_slice(&self.failure_args);
+        args
     }
 }
 
@@ -161,7 +183,7 @@ impl MnemonicKind for Return {
     }
 
     fn fmt(&self, f: &mut Formatter<'_>, ctx: &Context<'_>) -> std::fmt::Result {
-        write!(f, "return [{}];", ctx.get_value(self.ptr))
+        write!(f, "return [{}];", ValueRef::new(self.ptr, ctx))
     }
 
     fn args(&self) -> Vec<ValueId> {
@@ -178,7 +200,6 @@ mod tests {
     use qcode_macro::qcode;
 
     use crate::{
-        builder::Builder,
         context::Context,
         value::{BasicBlock, insn::Mnemonic},
     };
@@ -186,13 +207,17 @@ mod tests {
     #[test]
     fn qcode_emits_branch() {
         let mut ctx = Context::new();
-        {
-            let mut builder = Builder::from_context(&mut ctx, 0x1000);
-            qcode!(builder, "goto <done>");
-            // No finalize needed — goto terminates the block.
-        }
+        qcode!(
+            ctx,
+            "
+            <block>
+                goto <done>;
+            <done>
+                goto <0x1001>;
+            "
+        );
 
-        let block = BasicBlock::from_addr(&ctx, 0x1000).expect("block not found");
+        let block = BasicBlock::from_id(&ctx, block);
         let last = block.iter().last().expect("block has instructions");
         assert!(matches!(last.mnemonic(), Mnemonic::Branch(_)));
         assert_eq!(last.as_statement().to_string(), "goto <done>;");
@@ -201,14 +226,16 @@ mod tests {
     #[test]
     fn qcode_emits_branchind() {
         let mut ctx = Context::new();
-        {
-            let mut builder = Builder::from_context(&mut ctx, 0x1000);
-            qcode!(builder, "local i64 ptr");
-            qcode!(builder, "goto [{ptr}]");
-            // No finalize needed — goto terminates the block.
-        }
+        qcode!(
+            ctx,
+            "
+            <block>
+                local i64 ptr;
+                goto [ptr];
+            "
+        );
 
-        let block = BasicBlock::from_addr(&ctx, 0x1000).expect("block not found");
+        let block = BasicBlock::from_id(&ctx, block);
         let last = block.iter().last().expect("block has instructions");
         assert!(matches!(last.mnemonic(), Mnemonic::BranchInd(_)));
     }
@@ -216,15 +243,24 @@ mod tests {
     #[test]
     fn qcode_emits_cbranch() {
         let mut ctx = Context::new();
-        {
-            let mut builder = Builder::from_context(&mut ctx, 0x1000);
-            qcode!(builder, "local i8 cond");
-            qcode!(builder, "if {cond} goto <then_lbl> else goto <else_lbl>");
-            // cbranch switches the builder to the (unterminated) else_lbl block.
-            builder.finalize(0x1001);
-        }
+        qcode!(
+            ctx,
+            "
+            varnode i8 cond;
 
-        let block = BasicBlock::from_addr(&ctx, 0x1000).expect("block not found");
+            <block>
+                %c = load(i8, &cond);
+                if %c goto <then_lbl> else goto <else_lbl>;
+
+            <then_lbl>
+                goto <0x1001>;
+
+            <else_lbl>
+                goto <0x1002>;
+            "
+        );
+
+        let block = BasicBlock::from_id(&ctx, block);
         let last = block.iter().last().expect("block has instructions");
         assert!(matches!(last.mnemonic(), Mnemonic::CBranch(_)));
     }
@@ -232,13 +268,15 @@ mod tests {
     #[test]
     fn qcode_emits_call() {
         let mut ctx = Context::new();
-        {
-            let mut builder = Builder::from_context(&mut ctx, 0x1000);
-            qcode!(builder, "call <target>");
-            // No finalize needed — call terminates the block.
-        }
+        qcode!(
+            ctx,
+            "
+            <block>
+                call <target>;
+            "
+        );
 
-        let block = BasicBlock::from_addr(&ctx, 0x1000).expect("block not found");
+        let block = BasicBlock::from_id(&ctx, block);
         let last = block.iter().last().expect("block has instructions");
         assert!(matches!(last.mnemonic(), Mnemonic::Call(_)));
     }
@@ -246,14 +284,16 @@ mod tests {
     #[test]
     fn qcode_emits_callind() {
         let mut ctx = Context::new();
-        {
-            let mut builder = Builder::from_context(&mut ctx, 0x1000);
-            qcode!(builder, "local i64 ptr");
-            qcode!(builder, "call [{ptr}]");
-            // No finalize needed — call terminates the block.
-        }
+        qcode!(
+            ctx,
+            "
+            <block>
+                local i64 ptr;
+                call [ptr];
+            "
+        );
 
-        let block = BasicBlock::from_addr(&ctx, 0x1000).expect("block not found");
+        let block = BasicBlock::from_id(&ctx, block);
         let last = block.iter().last().expect("block has instructions");
         assert!(matches!(last.mnemonic(), Mnemonic::CallInd(_)));
     }
@@ -261,14 +301,16 @@ mod tests {
     #[test]
     fn qcode_emits_return() {
         let mut ctx = Context::new();
-        {
-            let mut builder = Builder::from_context(&mut ctx, 0x1000);
-            qcode!(builder, "local i64 ptr");
-            qcode!(builder, "return [{ptr}]");
-            // No finalize needed — return terminates the block.
-        }
+        qcode!(
+            ctx,
+            "
+            <block>
+                local i64 ptr;
+                return [ptr];
+            "
+        );
 
-        let block = BasicBlock::from_addr(&ctx, 0x1000).expect("block not found");
+        let block = BasicBlock::from_id(&ctx, block);
         let last = block.iter().last().expect("block has instructions");
         assert!(matches!(last.mnemonic(), Mnemonic::Return(_)));
     }
@@ -276,14 +318,22 @@ mod tests {
     #[test]
     fn qcode_multi_block_with_label() {
         let mut ctx = Context::new();
-        let mut builder = Builder::from_context(&mut ctx, 0x1000);
-        qcode!(builder, "local i32 v");
-        // Emit into entry block, then declare a label and emit more there.
-        qcode!(builder, "goto <body>; <body> {v} + 1");
-        builder.finalize(0x1001);
+        qcode!(
+            ctx,
+            "
+            varnode i32 V;
+
+            <block>
+                goto <body>;
+
+            <body>
+                %sum = i64 &V + i64 0x1;
+                goto <0x1001>;
+            "
+        );
 
         // Entry block ends with a branch to "body".
-        let entry = BasicBlock::from_addr(&ctx, 0x1000).expect("block not found");
+        let entry = BasicBlock::from_id(&ctx, block);
         let entry_last = entry.iter().last().expect("entry has instructions");
         assert!(matches!(entry_last.mnemonic(), Mnemonic::Branch(_)));
 
@@ -298,19 +348,128 @@ mod tests {
     #[test]
     fn qcode_cbranch_target_and_fallthrough_are_distinct_blocks() {
         let mut ctx = Context::new();
-        let mut builder = Builder::from_context(&mut ctx, 0x1000);
-        qcode!(builder, "local i8 cond");
-        qcode!(builder, "if {cond} goto <then_lbl> else goto <else_lbl>");
-        builder.finalize(0x1001);
+        qcode!(
+            ctx,
+            "
+            varnode i8 cond;
 
-        let block = BasicBlock::from_addr(&ctx, 0x1000).expect("block not found");
+            <block>
+                %c = load(i8, &cond);
+                if %c goto <then_lbl> else goto <else_lbl>;
+
+            <then_lbl>
+                goto <0x1001>;
+
+            <else_lbl>
+                goto <0x1002>;
+            "
+        );
+
+        let block = BasicBlock::from_id(&ctx, block);
         let last = block.iter().last().expect("block has instructions");
         let Mnemonic::CBranch(cbranch) = last.mnemonic() else {
             panic!("expected cbranch");
         };
         assert_ne!(
-            cbranch.target, cbranch.fallthrough,
+            cbranch.success_block, cbranch.failure_block,
             "target and fallthrough must be distinct"
         );
+    }
+
+    #[test]
+    fn branch_with_args_stores_args() {
+        use crate::value::ValueId;
+
+        let mut ctx = Context::new();
+        qcode!(
+            ctx,
+            "
+            <src @a>
+                goto <dst @x=@a>;
+            <dst @x>
+                goto <0x1001>;
+            "
+        );
+
+        let src_block = BasicBlock::from_id(&ctx, src);
+        let last = src_block.iter().last().expect("block has instructions");
+        let Mnemonic::Branch(branch) = last.mnemonic() else {
+            panic!("expected branch");
+        };
+        assert_eq!(branch.target, dst);
+        assert_eq!(branch.args.len(), 1);
+        assert_eq!(branch.args[0], ValueId::BlockParam(a));
+    }
+
+    #[test]
+    fn cbranch_with_per_target_args_are_independent() {
+        use crate::value::ValueId;
+
+        let mut ctx = Context::new();
+        qcode!(
+            ctx,
+            "
+            <src @cond:i8 @then_arg:i64 @else_arg:i64>
+                if @cond goto <then_lbl @x=@then_arg> else goto <else_lbl @y=@else_arg>;
+            <then_lbl @x:i64>
+                goto <0x1001>;
+            <else_lbl @y:i64>
+                goto <0x1002>;
+            "
+        );
+
+        let src_block = BasicBlock::from_id(&ctx, src);
+        let insn = src_block.iter().last().expect("src has cbranch");
+        let Mnemonic::CBranch(cbranch) = insn.mnemonic() else {
+            panic!("expected cbranch");
+        };
+        assert_eq!(cbranch.success_args, [ValueId::BlockParam(then_arg)]);
+        assert_eq!(cbranch.failure_args, [ValueId::BlockParam(else_arg)]);
+        assert_ne!(cbranch.success_block, cbranch.failure_block);
+    }
+
+    #[test]
+    fn branch_args_display() {
+        let mut ctx = Context::new();
+        qcode!(
+            ctx,
+            "
+            <src @a>
+                goto <done @x=@a>;
+            <done @x>
+                goto <0x1001>;
+            "
+        );
+
+        let src_block = BasicBlock::from_id(&ctx, src);
+        let last = src_block.iter().last().expect("block has instructions");
+        assert_eq!(last.as_statement().to_string(), "goto <done @x=@a>;");
+    }
+
+    #[test]
+    fn branch_args_are_ordered_by_target_params() {
+        use crate::value::ValueId;
+
+        let mut ctx = Context::new();
+        qcode!(
+            ctx,
+            "
+            <src @a @b>
+                goto <done @y=@a @x=@b>;
+            <done @x @y>
+                goto <0x1001>;
+            "
+        );
+
+        let src_block = BasicBlock::from_id(&ctx, src);
+        let last = src_block.iter().last().expect("block has instructions");
+        let Mnemonic::Branch(branch) = last.mnemonic() else {
+            panic!("expected branch");
+        };
+        assert_eq!(
+            branch.args,
+            [ValueId::BlockParam(b), ValueId::BlockParam(a)]
+        );
+        assert_eq!(last.as_statement().to_string(), "goto <done @x=@b @y=@a>;");
     }
 }

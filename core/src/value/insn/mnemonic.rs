@@ -172,6 +172,16 @@ impl Mnemonic {
                 if m.condition == old {
                     m.condition = new;
                 }
+                m.success_args.iter_mut().for_each(|a| {
+                    if *a == old {
+                        *a = new;
+                    }
+                });
+                m.failure_args.iter_mut().for_each(|a| {
+                    if *a == old {
+                        *a = new;
+                    }
+                });
             }
             Mnemonic::BranchInd(m) => {
                 if m.ptr == old {
@@ -299,7 +309,13 @@ impl Mnemonic {
                     *v = new;
                 }
             }
-            Mnemonic::Branch(_) => {}
+            Mnemonic::Branch(m) => {
+                m.args.iter_mut().for_each(|a| {
+                    if *a == old {
+                        *a = new;
+                    }
+                });
+            }
         }
     }
 }

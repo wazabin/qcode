@@ -1,4 +1,8 @@
-use crate::{context::Context, space::SpaceId, value::ValueId};
+use crate::{
+    context::Context,
+    space::{Space, SpaceId},
+    value::{ValueId, ValueRef},
+};
 use std::fmt::Formatter;
 
 use super::mnemonic::MnemonicKind;
@@ -25,11 +29,12 @@ impl MnemonicKind for Load {
         write!(
             f,
             "*[{}]:{} {};",
-            ctx.get_space(self.space)
+            Space::from_id(ctx, self.space)
                 .name
+                .as_deref()
                 .unwrap_or(&format!("space: {}", self.space)),
             self.size,
-            ctx.get_value(self.ptr)
+            ValueRef::new(self.ptr, ctx)
         )
     }
 
@@ -84,12 +89,13 @@ impl MnemonicKind for Store {
         write!(
             f,
             "*[{}]:{} {} = {};",
-            ctx.get_space(self.space)
+            Space::from_id(ctx, self.space)
                 .name
+                .as_deref()
                 .unwrap_or(&format!("space: {}", self.space)),
             self.size,
-            ctx.get_value(self.ptr),
-            ctx.get_value(self.src)
+            ValueRef::new(self.ptr, ctx),
+            ValueRef::new(self.src, ctx)
         )
     }
 
@@ -102,56 +108,67 @@ impl MnemonicKind for Store {
 mod tests {
     use qcode_macro::qcode;
 
-    use crate::{
-        builder::Builder,
-        value::{
-            LiteralId, VarnodeId,
-            insn::{Instruction, InstructionId, Mnemonic},
-        },
+    use crate::value::{
+        BasicBlock, LiteralId, Varnode, VarnodeId,
+        insn::{Instruction, Mnemonic},
     };
 
     use super::*;
 
-    macro_rules! assert_memory {
-        ($expr:literal, $match_pat:pat, $expected_stmt:literal, $size:expr) => {{
-            let mut ctx = Context::new();
-            let mut builder = Builder::from_context(&mut ctx, 0x1000);
-
-            qcode!(builder, "local i32 v0 as V0");
-            let v1: InstructionId = qcode!(builder, $expr);
-            builder.finalize(0x1001);
-            match ctx.values.instructions[v1].clone() {
-                Instruction {
-                    mnemonic: $match_pat,
-                    size: $size,
-                    ..
-                } => {}
-
-                _ => panic!("expected memory instruction"),
-            }
-
-            assert_eq!(ctx.get_insn(v1).as_statement().to_string(), $expected_stmt);
-        }};
-    }
-
     #[test]
     fn test_load_display() {
-        assert_memory!(
-            "ptr = i32 {v0} + i32 0x2; load(i32, ptr)",
-            Mnemonic::Load(Load { .. }),
-            "i32 %tmp2 = *[space: 1]:4 i32 %tmp1;",
-            4
+        let mut ctx = Context::new();
+
+        qcode!(
+            ctx,
+            "
+            varnode i32 v0;
+
+            <block>
+                %ptr = i64 &v0 + i64 0x2;
+                %v = load(i32, %ptr);
+                goto <0x1001>;
+            "
         );
+
+        let v = Instruction::from_id(&ctx, v);
+
+        if !matches!(v.mnemonic(), Mnemonic::Load(Load { .. })) {
+            panic!("expected memory instruction");
+        }
+
+        assert_eq!(v.size(), 4);
+        assert!(v.space().is_none());
+        assert_eq!(v.as_statement().to_string(), "i32 %v = *[v0]:4 i32 %ptr;");
     }
 
     #[test]
     fn test_store_display() {
-        assert_memory!(
-            "ptr = i32 {v0} + i32 0x2; store(ptr, i32 0x7)",
-            Mnemonic::Store(Store { .. }),
-            "*[space: 1]:4 i32 %tmp1 = 0x7;",
-            0
+        let mut ctx = Context::new();
+
+        qcode!(
+            ctx,
+            "
+            varnode i32 V0;
+
+            <block>
+                %v0 = load(i32, V0);
+                %ptr = i32 %v0 + i32 0x2;
+                store(%ptr, i32 0x7);
+                goto <0x1001>;
+            "
         );
+
+        let block = BasicBlock::from_id(&ctx, block);
+        let store = block.iter().nth(2).expect("expected store instruction");
+
+        if !matches!(store.mnemonic(), Mnemonic::Store(Store { .. })) {
+            panic!("expected memory instruction");
+        }
+
+        assert_eq!(store.size(), 0);
+        assert!(store.space().is_none());
+        assert_eq!(store.as_statement().to_string(), "*[ram]:4 i32 %ptr = 0x7;");
     }
 
     #[test]
@@ -167,5 +184,98 @@ mod tests {
         assert_eq!(load.space, store.space);
         assert_eq!(load.ptr, store.ptr);
         assert_eq!(load.size, store.size);
+    }
+
+    #[test]
+    fn test_computed_pointer_load_inherits_instruction_space() {
+        let mut ctx = Context::new();
+
+        qcode!(
+            ctx,
+            "
+            varnode i64 A;
+
+            <block>
+                %ptr = i64 &A + i64 0x2;
+                %value = load(i64, %ptr);
+                goto <0x1001>;
+            "
+        );
+
+        let block = BasicBlock::from_id(&ctx, block);
+        let a = Varnode::from_id(&ctx, A);
+        let ptr = block.iter().next().expect("expected pointer arithmetic");
+        let value = Instruction::from_id(&ctx, value);
+
+        assert_eq!(ptr.space().and_then(|s| s.name.as_deref()), Some("A"));
+
+        let Mnemonic::Load(load) = value.mnemonic() else {
+            panic!("expected load instruction");
+        };
+        assert_eq!(load.space, a.space().id);
+        assert_eq!(
+            value.as_statement().to_string(),
+            "i64 %value = *[A]:8 i64 %ptr;"
+        );
+    }
+
+    #[test]
+    fn test_computed_pointer_store_inherits_instruction_space() {
+        let mut ctx = Context::new();
+
+        qcode!(
+            ctx,
+            "
+            varnode i64 A;
+
+            <block>
+                %ptr = i64 &A + i64 0x2;
+                store(%ptr, i64 0x7);
+                goto <0x1001>;
+            "
+        );
+
+        let block = BasicBlock::from_id(&ctx, block);
+        let a = Varnode::from_id(&ctx, A);
+        let store = block.iter().nth(1).expect("expected store instruction");
+
+        let Mnemonic::Store(store_mnemonic) = store.mnemonic() else {
+            panic!("expected store instruction");
+        };
+        assert_eq!(store_mnemonic.space, a.space().id);
+        assert_eq!(store.as_statement().to_string(), "*[A]:8 i64 %ptr = 0x7;");
+    }
+
+    #[test]
+    fn test_computed_pointer_without_provenance_falls_back_to_default_space() {
+        let mut ctx = Context::new();
+
+        qcode!(
+            ctx,
+            "
+            <block>
+                %ptr = i64 0x10 + i64 0x2;
+                %v = load(i64, %ptr);
+                goto <0x1001>;
+            "
+        );
+
+        let value = Instruction::from_id(&ctx, v);
+        let ptr = Instruction::from_id(&ctx, ptr);
+
+        assert_eq!(
+            ptr.space().map(|s| s.id),
+            Some(ctx.default_space),
+            "expected default space for pointer arithmetic without provenance"
+        );
+
+        let Mnemonic::Load(load) = value.mnemonic() else {
+            panic!("expected load instruction");
+        };
+        assert_eq!(load.space, ctx.default_space);
+        assert_eq!(
+            value.as_statement().to_string(),
+            "i64 %v = *[ram]:8 i64 %ptr;"
+        );
     }
 }

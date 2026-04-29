@@ -1,5 +1,8 @@
 use super::mnemonic::MnemonicKind;
-use crate::{context::Context, value::ValueId};
+use crate::{
+    context::Context,
+    value::{ValueId, ValueRef},
+};
 use jstd::Identifier;
 
 #[derive(Identifier)]
@@ -22,12 +25,12 @@ impl MnemonicKind for PCodeOp {
         let args = self
             .args
             .iter()
-            .map(|arg| ctx.get_value(*arg).to_string())
+            .map(|&arg| ValueRef::new(arg, ctx).to_string())
             .collect::<Vec<_>>()
             .join(", ");
 
         if let Some(dst) = self.dst {
-            write!(f, "{} = {}({});", ctx.get_value(dst), op, args)
+            write!(f, "{} = {}({});", ValueRef::new(dst, ctx), op, args)
         } else {
             write!(f, "{}({});", op, args)
         }

@@ -417,6 +417,8 @@ impl<'str, 'ctx> FunctionMutRef<'str, 'ctx> {
 
 #[cfg(test)]
 mod tests {
+    use qcode_macro::qcode;
+
     use super::*;
 
     #[test]
@@ -517,6 +519,68 @@ mod tests {
         via_iter.sort();
         via_into.sort();
         assert_eq!(via_iter, via_into);
+    }
+
+    #[test]
+    fn qcode_fn_single_block_populates_function() {
+        let mut ctx = Context::new();
+        qcode!(
+            ctx,
+            "
+            fn simple:
+                <entry>
+                    return [0];
+            "
+        );
+
+        let f = Function::from_name(&ctx, "simple").unwrap();
+        assert_eq!(f.name(), "simple");
+        assert!(f.root().is_some());
+        assert_eq!(f.root().unwrap().name().unwrap(), "entry");
+        assert_eq!(f.blocks().count(), 1);
+    }
+
+    #[test]
+    fn qcode_fn_multi_block_populates_all_blocks() {
+        let mut ctx = Context::new();
+        qcode!(
+            ctx,
+            "
+            fn multiblock:
+                <bb1>
+                    if i8 1 goto <bb2> else goto <bb3>;
+
+                <bb2>
+                    goto <bb3>;
+
+                <bb3>
+                    return [0];
+            "
+        );
+
+        let f = Function::from_name(&ctx, "multiblock").unwrap();
+        assert_eq!(f.root().unwrap().name().unwrap(), "bb1");
+        let block_names: Vec<_> = f.blocks().filter_map(|b| b.name()).collect();
+        assert!(block_names.contains(&"bb1"), "missing bb1");
+        assert!(block_names.contains(&"bb2"), "missing bb2");
+        assert!(block_names.contains(&"bb3"), "missing bb3");
+        assert_eq!(f.blocks().count(), 3);
+    }
+
+    #[test]
+    fn qcode_fn_id_variable_is_set() {
+        let mut ctx = Context::new();
+        qcode!(
+            ctx,
+            "
+            fn myfn:
+                <start>
+                    return [0];
+            "
+        );
+
+        let by_name = Function::from_name(&ctx, "myfn").unwrap();
+        assert_eq!(by_name.name(), "myfn");
     }
 
     #[test]

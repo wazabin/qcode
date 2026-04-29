@@ -3,8 +3,8 @@ use qcode::{
     context::Context,
     space::SpaceId,
     value::{
-        BasicBlock, BlockId, BlockRef, Function, FunctionId, Instruction, Value, ValueId, ValueRef,
-        Varnode,
+        BasicBlock, BlockId, BlockParamId, BlockRef, Function, FunctionId, Instruction, Value,
+        ValueId, ValueRef, Varnode,
         insn::{
             BoolBinop, Branch, BranchInd, CBranch, Call, CallInd, Carry, InstructionId,
             InstructionRef, IntBinop, LzCount, Mnemonic, PopCount, Range, Return, SBorrow, SCarry,
@@ -603,14 +603,13 @@ impl DomainMemory for EmulatedMemory {
         size: usize,
     ) -> Result<Self::V, EmulatorErrorKind> {
         let addr = addr.value()?;
-        let v = SizedValue::from_bits(
-            self.spaces
-                .get(&space)
-                .ok_or(EmulatorErrorKind::UnknownSpace(space))?
-                .read_u128(addr, size as u64)?,
-            size,
-        );
-        Ok(v)
+        let bits = match self.spaces.get(&space) {
+            Some(s) => s.read_u128(addr, size as u64)?,
+            // Temp spaces (SpaceId >= 2) are per-varnode; uninitialized reads return zero.
+            None if usize::from(space) >= 2 => 0,
+            None => return Err(EmulatorErrorKind::UnknownSpace(space)),
+        };
+        Ok(SizedValue::from_bits(bits, size))
     }
 
     fn write(
@@ -639,6 +638,7 @@ type InstructionHook = Box<dyn Fn(&InstructionRef<'_, '_>, &StandaloneEmulator) 
 pub struct StandaloneEmulator {
     pub memory: EmulatedMemory,
     pub insn_values: HashMap<InstructionId, SizedValue>,
+    pub block_param_values: HashMap<BlockParamId, SizedValue>,
     pub block: BlockId,
     pub idx: usize,
     /// Call stack maintained by `run_function` (outermost function first).
@@ -652,6 +652,7 @@ impl StandaloneEmulator {
         Self {
             memory: EmulatedMemory::default(),
             insn_values: HashMap::new(),
+            block_param_values: HashMap::new(),
             block: entry,
             idx: 0,
             call_stack: Vec::new(),
@@ -732,6 +733,7 @@ impl StandaloneEmulator {
         let mut tmp = TempInterpreter {
             memory: &mut self.memory,
             insn_values: &mut self.insn_values,
+            block_param_values: &mut self.block_param_values,
             ctx,
         };
         tmp.get_value(id).ok().and_then(|v| v.value().ok())
@@ -831,6 +833,7 @@ impl StandaloneEmulator {
         let mut tmp = TempInterpreter {
             memory: &mut self.memory,
             insn_values: &mut self.insn_values,
+            block_param_values: &mut self.block_param_values,
             ctx,
         };
         let sv = tmp.get_value(id).ok()?;
@@ -847,6 +850,40 @@ impl StandaloneEmulator {
         self.block
     }
 
+    fn collect_block_args(
+        &mut self,
+        ctx: &Context<'_>,
+        args: &[ValueId],
+    ) -> Result<Vec<SizedValue>, EmulatorErrorKind> {
+        let mut tmp = TempInterpreter {
+            memory: &mut self.memory,
+            insn_values: &mut self.insn_values,
+            block_param_values: &mut self.block_param_values,
+            ctx,
+        };
+        args.iter().map(|&arg| tmp.get_value(arg)).collect()
+    }
+
+    fn bind_block_args(
+        &mut self,
+        ctx: &Context<'_>,
+        target: BlockId,
+        args: &[ValueId],
+    ) -> Result<(), EmulatorErrorKind> {
+        let values = self.collect_block_args(ctx, args)?;
+        let params = BasicBlock::from_id(ctx, target)
+            .params()
+            .map(|param| param.id)
+            .collect::<Vec<_>>();
+        if values.len() != params.len() {
+            return Err(EmulatorErrorKind::ValueError(values.len() as u128));
+        }
+        for (param, value) in params.into_iter().zip(values) {
+            self.block_param_values.insert(param, value);
+        }
+        Ok(())
+    }
+
     pub fn step(&mut self, ctx: &Context<'_>) -> crate::Result<()> {
         let block = BasicBlock::from_id(ctx, self.block);
         let insn_ids = block.instruction_ids();
@@ -860,7 +897,9 @@ impl StandaloneEmulator {
         }
 
         match insn.mnemonic() {
-            Mnemonic::Branch(Branch { target }) => {
+            Mnemonic::Branch(Branch { target, args }) => {
+                self.bind_block_args(ctx, *target, args)
+                    .map_err(|kind| self.make_error(ctx, kind))?;
                 self.block = *target;
                 self.idx = 0;
             }
@@ -877,13 +916,19 @@ impl StandaloneEmulator {
 
             Mnemonic::CBranch(CBranch {
                 condition,
-                target,
-                fallthrough,
+                success_block: target,
+                success_args,
+                failure_block: fallthrough,
+                failure_args,
             }) => {
-                let cond_val = self.get_value(ctx, *condition).unwrap_or(0);
+                let cond_val = self.get_value(ctx, *condition).unwrap();
                 if cond_val != 0 {
+                    self.bind_block_args(ctx, *target, success_args)
+                        .map_err(|kind| self.make_error(ctx, kind))?;
                     self.block = *target;
                 } else {
+                    self.bind_block_args(ctx, *fallthrough, failure_args)
+                        .map_err(|kind| self.make_error(ctx, kind))?;
                     self.block = *fallthrough;
                 }
                 self.idx = 0;
@@ -892,7 +937,7 @@ impl StandaloneEmulator {
             Mnemonic::BranchInd(BranchInd { ptr })
             | Mnemonic::CallInd(CallInd { ptr, .. })
             | Mnemonic::Return(Return { ptr, .. }) => {
-                let addr = self.get_value(ctx, *ptr).unwrap_or(0);
+                let addr = self.get_value(ctx, *ptr).unwrap();
                 let target = BasicBlock::from_addr(ctx, addr)
                     .ok_or_else(|| {
                         self.make_error(ctx, EmulatorErrorKind::InvalidBlockAddress(addr))
@@ -906,6 +951,7 @@ impl StandaloneEmulator {
                 let mut tmp = TempInterpreter {
                     memory: &mut self.memory,
                     insn_values: &mut self.insn_values,
+                    block_param_values: &mut self.block_param_values,
                     ctx,
                 };
                 if let Some(value) = tmp.interpret(insn)? {
@@ -996,6 +1042,7 @@ impl StandaloneEmulator {
 struct TempInterpreter<'a, 'ctx> {
     memory: &'a mut EmulatedMemory,
     insn_values: &'a mut HashMap<InstructionId, SizedValue>,
+    block_param_values: &'a mut HashMap<BlockParamId, SizedValue>,
     ctx: &'ctx Context<'ctx>,
 }
 
@@ -1012,7 +1059,7 @@ impl<'ctx> Interpreter for TempInterpreter<'_, 'ctx> {
     }
 
     fn get_value(&mut self, id: ValueId) -> Result<Self::V, EmulatorErrorKind> {
-        match self.ctx.get_value(id) {
+        match ValueRef::new(id, self.ctx) {
             ValueRef::Literal(literal) => Ok(SizedValue::new(literal.value(), literal.size())),
             ValueRef::Instruction(insn) => self
                 .insn_values
@@ -1021,6 +1068,11 @@ impl<'ctx> Interpreter for TempInterpreter<'_, 'ctx> {
                 .ok_or(EmulatorErrorKind::ValueError(0)),
             ValueRef::Varnode(varnode) => Ok(SizedValue::new(varnode.address() as u64, 8)),
             ValueRef::BasicBlock(_) => panic!("Cannot get value of a block"),
+            ValueRef::BlockParam(param) => self
+                .block_param_values
+                .get(&param.id)
+                .copied()
+                .ok_or(EmulatorErrorKind::ValueError(0)),
             ValueRef::Function(f) => f
                 .address()
                 .map(SizedValue::from_u64)
@@ -1047,6 +1099,14 @@ impl<'ctx> Emulator<'ctx> {
         hook: impl Fn(&InstructionRef<'_, '_>, &StandaloneEmulator) + Send + Sync + 'static,
     ) {
         self.inner.instruction_hook = Some(Box::new(hook));
+    }
+
+    pub fn from_function(ctx: &'ctx Context<'ctx>, func: FunctionId) -> Self {
+        let entry = Function::from_id(ctx, func)
+            .root()
+            .expect("Cannot create emulator for function with empty root block")
+            .id;
+        Self::new(ctx, entry)
     }
 
     pub fn from_block(ctx: &'ctx Context<'ctx>, block: BlockId) -> Self {
@@ -1214,7 +1274,7 @@ impl<'ctx> Interpreter for Emulator<'ctx> {
     }
 
     fn get_value(&mut self, id: ValueId) -> Result<Self::V, EmulatorErrorKind> {
-        match self.ctx.get_value(id) {
+        match ValueRef::new(id, self.ctx) {
             ValueRef::Literal(literal) => Ok(SizedValue::new(literal.value(), literal.size())),
             ValueRef::Instruction(insn) => self
                 .inner
@@ -1224,6 +1284,12 @@ impl<'ctx> Interpreter for Emulator<'ctx> {
                 .ok_or(EmulatorErrorKind::ValueError(0)),
             ValueRef::Varnode(varnode) => Ok(SizedValue::new(varnode.address() as u64, 8)),
             ValueRef::BasicBlock(_) => panic!("Cannot get value of a block"),
+            ValueRef::BlockParam(param) => self
+                .inner
+                .block_param_values
+                .get(&param.id)
+                .copied()
+                .ok_or(EmulatorErrorKind::ValueError(0)),
             ValueRef::Function(f) => f
                 .address()
                 .map(SizedValue::from_u64)
@@ -1235,7 +1301,7 @@ impl<'ctx> Interpreter for Emulator<'ctx> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use qcode::{builder::Builder, context::Context};
+    use qcode::context::Context;
     use qcode_macro::qcode;
 
     #[test]
@@ -1257,6 +1323,27 @@ mod tests {
         assert_eq!(sum.size().unwrap(), 1);
         assert_eq!(carry.value().unwrap(), 1);
         assert_eq!(carry.size().unwrap(), 1);
+    }
+
+    #[test]
+    fn branch_args_bind_block_params() {
+        let mut ctx = Context::new();
+        qcode!(
+            ctx,
+            "
+            <src>
+                goto <dst @x=0x2>;
+            <dst @x>
+                %sum = i64 @x + 0x3;
+                goto <0x1001>;
+            "
+        );
+
+        let mut emu = StandaloneEmulator::new(src);
+        emu.step(&ctx).expect("branch binds block params");
+        emu.step(&ctx).expect("destination uses block param");
+
+        assert_eq!(emu.get_value(&ctx, sum.into()), Some(5));
     }
 
     #[test]
@@ -1425,16 +1512,24 @@ mod tests {
     #[test]
     fn simple_addition() {
         let mut ctx = Context::new();
-        let mut builder = Builder::from_context(&mut ctx, 0x1000);
 
-        qcode!(builder, "local i64 v0 as V0; local i64 v1 as V1");
+        qcode!(
+            ctx,
+            "
+            varnode i64 V0;
+            varnode i64 V1;
 
-        let res = qcode!(builder, "{v0} + {v1}");
-        builder.finalize(0x1001);
+        <block>
+            %v0 = load(i64, &V0);
+            %v1 = load(i64, &V1);
+            %res = %v0 + %v1;
+            goto <0x1001>;
+        "
+        );
 
-        let mut emu = Emulator::from_address(&ctx, 0x1000);
-        emu.set_varnode(v0, 2).unwrap();
-        emu.set_varnode(v1, 3).unwrap();
+        let mut emu = Emulator::from_block(&ctx, block);
+        emu.set_varnode(V0, 2).unwrap();
+        emu.set_varnode(V1, 3).unwrap();
         emu.run_block().unwrap();
 
         assert_eq!(
@@ -1446,44 +1541,34 @@ mod tests {
     #[test]
     fn emulator_int_div_works_with_128_bit_operands() {
         let mut ctx = Context::new();
-        let mut builder = Builder::from_context(&mut ctx, 0x2000);
+        qcode!(
+            ctx,
+            "
+            varnode i128 V0;
+            varnode i128 V1;
 
-        qcode!(builder, "local i128 lhs as LHS; local i128 rhs as RHS");
-        let out = qcode!(builder, "{lhs} / {rhs}");
-        builder.finalize(0x2001);
+        <block>
+            %v0 = load(i128, &V0);
+            %v1 = load(i128, &V1);
 
-        let mut emu = Emulator::from_address(&ctx, 0x2000);
-        let lhs_bits = u128::from(1u8) << 100;
-        let rhs_bits = u128::from(1u8) << 99;
+            %res = %v0 / %v1;
+            goto <0x1001>;
+        "
+        );
 
-        emu.set_varnode_u128(lhs, lhs_bits).unwrap();
-        emu.set_varnode_u128(rhs, rhs_bits).unwrap();
+        let mut emu = Emulator::from_block(&ctx, block);
+        let v0_bits = u128::from(1u8) << 100;
+        let v1_bits = u128::from(1u8) << 99;
+
+        emu.set_varnode_u128(V0, v0_bits).unwrap();
+        emu.set_varnode_u128(V1, v1_bits).unwrap();
         emu.run_block().unwrap();
 
         // Quotient is small enough to also be visible through legacy u64 extraction.
         assert_eq!(
-            emu.get_value(out.into()).and_then(|v| v.value()).unwrap(),
+            emu.get_value(res.into()).and_then(|v| v.value()).unwrap(),
             2
         );
-    }
-
-    // -----------------------------------------------------------------------
-    // Helper: build a one-block function in `ctx`.
-    // Calls `build` with a Builder positioned at the root block, then registers
-    // the block as the function root.  Returns the new FunctionId.
-    // -----------------------------------------------------------------------
-    fn make_function<'str>(
-        ctx: &mut Context<'str>,
-        name: &'str str,
-        addr: u64,
-    ) -> (FunctionId, BlockId) {
-        use std::borrow::Cow;
-        let func_id = Function::make(ctx, Cow::Borrowed(name)).unwrap().id;
-        let block_id = ctx.get_or_make_block(addr);
-        Function::from_id_mut(ctx, func_id)
-            .set_root(block_id)
-            .unwrap();
-        (func_id, block_id)
     }
 
     // -----------------------------------------------------------------------
@@ -1491,7 +1576,7 @@ mod tests {
     // -----------------------------------------------------------------------
 
     #[test]
-    fn uninitialized_memory_reads_as_zero() {
+    fn uninitialized_memory_reads_error() {
         let space = EmulatedSpace::default();
         assert!(matches!(
             space.read_byte(0xdead_beef),
@@ -1520,32 +1605,41 @@ mod tests {
     #[test]
     fn run_function_returns_ok_for_trivial_function() {
         let mut ctx = Context::new();
-        let (func_id, block_id) = make_function(&mut ctx, "trivial", 0x1000);
-        let ret_lit = ctx.values.get_or_make_literal(0, 8).into();
-        Builder::from_block(BasicBlock::from_id_mut(&mut ctx, block_id)).push_return(ret_lit);
+        qcode!(
+            ctx,
+            "
+            fn function:
+            <entry>
+                return [i64 0];
+            "
+        );
 
-        let mut emu = Emulator::from_address(&ctx, 0x1000);
-        assert!(emu.run_function(func_id).is_ok());
+        let mut emu = Emulator::from_function(&ctx, function);
+        assert!(emu.run_function(function).is_ok());
     }
 
     #[test]
     fn run_function_executes_instructions_before_return() {
         let mut ctx = Context::new();
-        let (func_id, block_id) = make_function(&mut ctx, "add_fn", 0x1000);
-        let ret_lit = ctx.values.get_or_make_literal(0, 8).into();
+        qcode!(
+            ctx,
+            "
+            varnode i64 A;
+            varnode i64 B;
 
-        let (lhs, rhs, sum) = {
-            let mut builder = Builder::from_block(BasicBlock::from_id_mut(&mut ctx, block_id));
-            qcode!(builder, "local i64 lhs; local i64 rhs");
-            let sum = qcode!(builder, "{lhs} + {rhs}");
-            builder.push_return(ret_lit);
-            (lhs, rhs, sum)
-        };
+            fn function:
+            <entry>
+                %a = load(i64, &A);
+                %b = load(i64, &B);
+                %sum = %a + %b;
+                return [i64 0];
+            "
+        );
 
-        let mut emu = Emulator::from_address(&ctx, 0x1000);
-        emu.set_varnode(lhs, 7).unwrap();
-        emu.set_varnode(rhs, 5).unwrap();
-        emu.run_function(func_id).unwrap();
+        let mut emu = Emulator::from_function(&ctx, function);
+        emu.set_varnode(A, 7).unwrap();
+        emu.set_varnode(B, 5).unwrap();
+        emu.run_function(function).unwrap();
 
         assert_eq!(
             emu.get_value(sum.into()).and_then(|v| v.value()).unwrap(),
@@ -1556,15 +1650,24 @@ mod tests {
     #[test]
     fn run_function_call_stack_empty_after_successful_return() {
         let mut ctx = Context::new();
-        let (func_id, block_id) = make_function(&mut ctx, "foo", 0x1000);
-        let ret_lit = ctx.values.get_or_make_literal(0, 8).into();
-        {
-            let mut builder = Builder::from_block(BasicBlock::from_id_mut(&mut ctx, block_id));
-            builder.push_return(ret_lit);
-        }
 
-        let mut emu = Emulator::from_address(&ctx, 0x1000);
-        emu.run_function(func_id).unwrap();
+        qcode!(
+            ctx,
+            "
+            varnode i64 A;
+            varnode i64 B;
+
+            fn function:
+            <entry>
+                %a = load(i64, &A);
+                %b = load(i64, &B);
+                %sum = %a + %b;
+                return [i64 0];
+            "
+        );
+
+        let mut emu = Emulator::from_function(&ctx, function);
+        emu.run_function(function).unwrap();
 
         assert!(emu.call_stack().is_empty());
     }
@@ -1576,16 +1679,18 @@ mod tests {
     #[test]
     fn branchind_to_unknown_address_returns_error() {
         let mut ctx = Context::new();
-        let (func_id, block_id) = make_function(&mut ctx, "bad", 0x1000);
-        // Branching to literal 0 — no block lives at address 0
-        let addr_zero = ctx.values.get_or_make_literal(0, 8).into();
-        {
-            let mut builder = Builder::from_block(BasicBlock::from_id_mut(&mut ctx, block_id));
-            builder.push_branchind(addr_zero);
-        }
+        qcode!(
+            ctx,
+            "
+            fn function:
+            <entry>
+                # Branching to literal 0 — no block lives at address 0
+                goto [i64 0];
+            "
+        );
 
-        let mut emu = Emulator::from_address(&ctx, 0x1000);
-        let err = emu.run_function(func_id).unwrap_err();
+        let mut emu = Emulator::from_function(&ctx, function);
+        let err = emu.run_function(function).unwrap_err();
         assert!(matches!(
             err.kind,
             EmulatorErrorKind::InvalidBlockAddress(0)
@@ -1595,19 +1700,23 @@ mod tests {
     #[test]
     fn error_includes_faulting_instruction_id() {
         let mut ctx = Context::new();
-        let (func_id, block_id) = make_function(&mut ctx, "bad", 0x2000);
-        let addr_zero = ctx.values.get_or_make_literal(0, 8).into();
-        let bad_insn_id = {
-            let mut builder = Builder::from_block(BasicBlock::from_id_mut(&mut ctx, block_id));
-            builder.push_branchind(addr_zero).id
-        };
+        qcode!(
+            ctx,
+            "
+            fn function:
+            <entry>
+                # Null pointer dereference
+                %bad_load = load(i64, i64 0);
+                return [i64 0];
+            "
+        );
 
-        let mut emu = Emulator::from_address(&ctx, 0x2000);
-        let err = emu.run_function(func_id).unwrap_err();
+        let mut emu = Emulator::from_function(&ctx, function);
+        let err = emu.run_function(function).unwrap_err();
 
         assert!(
             err.ctx.contains(
-                &Instruction::from_id(&ctx, bad_insn_id)
+                &Instruction::from_id(&ctx, bad_load)
                     .as_statement()
                     .to_string()
             )
@@ -1618,22 +1727,28 @@ mod tests {
     fn error_call_stack_reflects_active_frames_at_fault() {
         // Build callee: immediately does a BranchInd to address 0 (always fails)
         let mut ctx = Context::new();
-        let (callee_id, callee_block) = make_function(&mut ctx, "callee", 0x2000);
-        let addr_zero = ctx.values.get_or_make_literal(0, 8).into();
-        Builder::from_block(BasicBlock::from_id_mut(&mut ctx, callee_block))
-            .push_branchind(addr_zero);
+        qcode!(
+            ctx,
+            "
+            fn callee:
+            <entry1>
+                # Branching to literal 0 — no block lives at address 0
+                goto [i64 0];
+
+            fn caller:
+            <entry2>
+                call <callee>;
+            "
+        );
 
         // Build caller: calls callee
-        let (caller_id, caller_block) = make_function(&mut ctx, "caller", 0x1000);
-        Builder::from_block(BasicBlock::from_id_mut(&mut ctx, caller_block)).push_call(callee_id);
-
-        let mut emu = Emulator::from_address(&ctx, 0x1000);
-        let err = emu.run_function(caller_id).unwrap_err();
+        let mut emu = Emulator::from_function(&ctx, caller);
+        let err = emu.run_function(caller).unwrap_err();
 
         assert!(matches!(
             err.kind,
             EmulatorErrorKind::InvalidBlockAddress(0)
         ));
-        assert_eq!(emu.call_stack(), &[caller_id, callee_id]);
+        assert_eq!(emu.call_stack(), &[caller, callee]);
     }
 }

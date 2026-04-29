@@ -1,4 +1,7 @@
-use crate::{context::Context, value::ValueId};
+use crate::{
+    context::Context,
+    value::{ValueId, ValueRef},
+};
 use std::fmt::Formatter;
 
 use super::mnemonic::MnemonicKind;
@@ -14,7 +17,7 @@ impl MnemonicKind for IsFloatNaN {
     }
 
     fn fmt(&self, f: &mut Formatter<'_>, ctx: &Context<'_>) -> std::fmt::Result {
-        write!(f, "nan({});", ctx.get_value(self.src))
+        write!(f, "nan({});", ValueRef::new(self.src, ctx))
     }
 
     fn args(&self) -> Vec<ValueId> {
@@ -50,7 +53,7 @@ impl MnemonicKind for LzCount {
     }
 
     fn fmt(&self, f: &mut Formatter<'_>, ctx: &Context<'_>) -> std::fmt::Result {
-        write!(f, "lzcount({});", ctx.get_value(self.src))
+        write!(f, "lzcount({});", ValueRef::new(self.src, ctx))
     }
 
     fn args(&self) -> Vec<ValueId> {
@@ -77,7 +80,7 @@ impl MnemonicKind for PopCount {
     }
 
     fn fmt(&self, f: &mut Formatter<'_>, ctx: &Context<'_>) -> std::fmt::Result {
-        write!(f, "popcount({});", ctx.get_value(self.src))
+        write!(f, "popcount({});", ValueRef::new(self.src, ctx))
     }
 
     fn args(&self) -> Vec<ValueId> {
@@ -116,8 +119,8 @@ impl MnemonicKind for Carry {
         write!(
             f,
             "carry({}, {});",
-            ctx.get_value(self.lhs),
-            ctx.get_value(self.rhs)
+            ValueRef::new(self.lhs, ctx),
+            ValueRef::new(self.rhs, ctx)
         )
     }
 
@@ -156,8 +159,8 @@ impl MnemonicKind for SCarry {
         write!(
             f,
             "scarry({}, {});",
-            ctx.get_value(self.lhs),
-            ctx.get_value(self.rhs)
+            ValueRef::new(self.lhs, ctx),
+            ValueRef::new(self.rhs, ctx)
         )
     }
 
@@ -196,8 +199,8 @@ impl MnemonicKind for SBorrow {
         write!(
             f,
             "sborrow({}, {});",
-            ctx.get_value(self.lhs),
-            ctx.get_value(self.rhs)
+            ValueRef::new(self.lhs, ctx),
+            ValueRef::new(self.rhs, ctx)
         )
     }
 
@@ -210,116 +213,157 @@ impl MnemonicKind for SBorrow {
 mod tests {
     use qcode_macro::qcode;
 
-    use crate::{
-        builder::Builder,
-        value::insn::{Instruction, InstructionId, Mnemonic},
-    };
+    use crate::value::insn::{Instruction, Mnemonic};
 
     use super::*;
 
-    macro_rules! assert_unary_flag {
-        ($expr:literal, $match_pat:pat, $expected_stmt:literal, $size:expr) => {{
-            let mut ctx = Context::new();
-            let mut builder = Builder::from_context(&mut ctx, 0x1000);
-
-            qcode!(builder, "local i32 v0 as V0");
-            let v1: InstructionId = qcode!(builder, $expr);
-            builder.finalize(0x1001);
-
-            match ctx.values.instructions[v1].clone() {
-                Instruction {
-                    mnemonic: $match_pat,
-                    size: $size,
-                    ..
-                } => {}
-
-                _ => panic!("expected unary flag instruction"),
-            }
-
-            assert_eq!(ctx.get_insn(v1).as_statement().to_string(), $expected_stmt);
-        }};
-    }
-
-    macro_rules! assert_binary_flag {
-        ($expr:literal, $match_pat:pat, $expected_stmt:literal, $size:expr) => {{
-            let mut ctx = Context::new();
-            let mut builder = Builder::from_context(&mut ctx, 0x1000);
-
-            qcode!(builder, "local i32 v0 as V0; local i32 v1 as V1");
-            let v2: InstructionId = qcode!(builder, $expr);
-            builder.finalize(0x1001);
-
-            match ctx.values.instructions[v2].clone() {
-                Instruction {
-                    mnemonic: $match_pat,
-                    size: $size,
-                    ..
-                } => {}
-
-                _ => panic!("expected binary flag instruction"),
-            }
-
-            assert_eq!(ctx.get_insn(v2).as_statement().to_string(), $expected_stmt);
-        }};
-    }
-
     #[test]
     fn test_nan_display() {
-        assert_unary_flag!(
-            "nan({v0})",
-            Mnemonic::IsFloatNaN(IsFloatNaN { .. }),
-            "i8 %tmp1 = nan(i32 %v0);",
-            1
+        let mut ctx = Context::new();
+
+        qcode!(
+            ctx,
+            "
+            <block>
+                local i32 V0;
+                %v0 = load(i32, V0);
+                %v = nan(%v0);
+                goto <0x1001>;
+            "
         );
+
+        let v = Instruction::from_id(&ctx, v);
+
+        assert!(matches!(
+            v.mnemonic(),
+            Mnemonic::IsFloatNaN(IsFloatNaN { .. })
+        ));
+        assert_eq!(v.size(), 1);
+        assert_eq!(v.as_statement().to_string(), "i8 %v = nan(i32 %v0);");
     }
 
     #[test]
     fn test_popcount_display() {
-        assert_unary_flag!(
-            "popcount({v0})",
-            Mnemonic::PopCount(PopCount { .. }),
-            "i8 %tmp1 = popcount(i32 %v0);",
-            1
+        let mut ctx = Context::new();
+
+        qcode!(
+            ctx,
+            "
+            <block>
+                local i32 V0;
+                %v0 = load(i32, V0);
+                %v = popcount(%v0);
+                goto <0x1001>;
+            "
         );
+
+        let v = Instruction::from_id(&ctx, v);
+
+        assert!(matches!(v.mnemonic(), Mnemonic::PopCount(PopCount { .. })));
+        assert_eq!(v.size(), 1);
+        assert_eq!(v.as_statement().to_string(), "i8 %v = popcount(i32 %v0);");
     }
 
     #[test]
     fn test_lzcount_display() {
-        assert_unary_flag!(
-            "lzcount({v0})",
-            Mnemonic::LzCount(LzCount { .. }),
-            "i8 %tmp1 = lzcount(i32 %v0);",
-            1
+        let mut ctx = Context::new();
+
+        qcode!(
+            ctx,
+            "
+            <block>
+                local i32 V0;
+                %v0 = load(i32, V0);
+                %v = lzcount(%v0);
+                goto <0x1001>;
+            "
         );
+
+        let v = Instruction::from_id(&ctx, v);
+
+        assert!(matches!(v.mnemonic(), Mnemonic::LzCount(LzCount { .. })));
+        assert_eq!(v.size(), 1);
+        assert_eq!(v.as_statement().to_string(), "i8 %v = lzcount(i32 %v0);");
     }
 
     #[test]
     fn test_carry_display() {
-        assert_binary_flag!(
-            "carry({v0}, {v1})",
-            Mnemonic::Carry(Carry { .. }),
-            "i8 %tmp2 = carry(i32 %v0, i32 %v1);",
-            1
+        let mut ctx = Context::new();
+
+        qcode!(
+            ctx,
+            "
+            <block>
+                local i32 V0;
+                local i32 V1;
+                %v0 = load(i32, V0);
+                %v1 = load(i32, V1);
+                %v = carry(%v0, %v1);
+                goto <0x1001>;
+            "
+        );
+
+        let v = Instruction::from_id(&ctx, v);
+
+        assert!(matches!(v.mnemonic(), Mnemonic::Carry(Carry { .. })));
+        assert_eq!(v.size(), 1);
+        assert_eq!(
+            v.as_statement().to_string(),
+            "i8 %v = carry(i32 %v0, i32 %v1);"
         );
     }
 
     #[test]
     fn test_scarry_display() {
-        assert_binary_flag!(
-            "scarry({v0}, {v1})",
-            Mnemonic::SCarry(SCarry { .. }),
-            "i8 %tmp2 = scarry(i32 %v0, i32 %v1);",
-            1
+        let mut ctx = Context::new();
+
+        qcode!(
+            ctx,
+            "
+            <block>
+                local i32 V0;
+                local i32 V1;
+                %v0 = load(i32, V0);
+                %v1 = load(i32, V1);
+                %v = scarry(%v0, %v1);
+                goto <0x1001>;
+            "
+        );
+
+        let v = Instruction::from_id(&ctx, v);
+
+        assert!(matches!(v.mnemonic(), Mnemonic::SCarry(SCarry { .. })));
+        assert_eq!(v.size(), 1);
+        assert_eq!(
+            v.as_statement().to_string(),
+            "i8 %v = scarry(i32 %v0, i32 %v1);"
         );
     }
 
     #[test]
     fn test_sborrow_display() {
-        assert_binary_flag!(
-            "sborrow({v0}, {v1})",
-            Mnemonic::SBorrow(SBorrow { .. }),
-            "i8 %tmp2 = sborrow(i32 %v0, i32 %v1);",
-            1
+        let mut ctx = Context::new();
+
+        qcode!(
+            ctx,
+            "
+            <block>
+                local i32 V0;
+                local i32 V1;
+                %v0 = load(i32, V0);
+                %v1 = load(i32, V1);
+                %v = sborrow(%v0, %v1);
+                goto <0x1001>;
+            "
+        );
+
+        let v = Instruction::from_id(&ctx, v);
+
+        assert!(matches!(v.mnemonic(), Mnemonic::SBorrow(SBorrow { .. })));
+        assert_eq!(v.size(), 1);
+        assert_eq!(
+            v.as_statement().to_string(),
+            "i8 %v = sborrow(i32 %v0, i32 %v1);"
         );
     }
 }
