@@ -364,10 +364,11 @@ impl<'str> Context<'str> {
 
 impl Display for Context<'_> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        self.values
-            .basic_blocks
-            .iter()
-            .try_for_each(|block| BasicBlock::from_id(self, block.id).fmt(f))
+        self.functions().try_for_each(|fun| fun.fmt(f))?;
+
+        self.blocks()
+            .filter(|block| block.parent().is_none())
+            .try_for_each(|block| block.fmt(f))
     }
 }
 

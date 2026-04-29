@@ -2,6 +2,7 @@ use std::collections::HashMap;
 
 use qcode::{
     context::Context,
+    space::SpaceId,
     value::{ValueId, ValueRef},
 };
 
@@ -22,6 +23,10 @@ pub enum NodeId {
 
 pub struct AliasResult {
     pub(crate) value_to_root: HashMap<ValueId, NodeId>,
+    /// Exact byte intervals for pointer values whose location could be
+    /// statically resolved: `(space_id, byte_start, byte_end)`.
+    /// Populated by location-aware analyses (e.g. `simple`); empty otherwise.
+    pub(crate) value_to_interval: HashMap<ValueId, (SpaceId, u64, u64)>,
 }
 
 impl AliasResult {
@@ -29,6 +34,60 @@ impl AliasResult {
     /// involved in any constraint during analysis.
     pub fn alias_class(&self, a: ValueId) -> Option<NodeId> {
         self.value_to_root.get(&a).copied()
+    }
+
+    /// Conservative must-alias query.
+    ///
+    /// Returns `true` only when `a` and `b` are guaranteed to refer to the
+    /// exact same byte range (same address space, start, and end). Defaults
+    /// to `false` when precise location information is unavailable.
+    pub fn must_alias(&self, a: ValueId, b: ValueId) -> bool {
+        match (
+            self.value_to_interval.get(&a),
+            self.value_to_interval.get(&b),
+        ) {
+            (Some(ia), Some(ib)) => ia == ib,
+            _ => false,
+        }
+    }
+
+    /// Returns true if `b`'s byte interval fully contains `a`'s (same space,
+    /// `start_b <= start_a`, `end_b >= end_a`). Falls back to `false` when
+    /// precise interval information is unavailable for either value.
+    pub fn covers(&self, a: ValueId, b: ValueId) -> bool {
+        match (
+            self.value_to_interval.get(&a),
+            self.value_to_interval.get(&b),
+        ) {
+            (Some(&(sa, start_a, end_a)), Some(&(sb, start_b, end_b))) => {
+                sa == sb && start_b <= start_a && end_b >= end_a
+            }
+            _ => false,
+        }
+    }
+
+    /// Returns all tracked pointer values whose interval is strictly contained
+    /// within `ptr`'s interval in the same space, as
+    /// `(sub_ptr, byte_offset_within_ptr, sub_size)`.
+    pub fn sub_intervals_of(&self, ptr: ValueId) -> Vec<(ValueId, usize, usize)> {
+        let Some(&(ptr_space, ptr_start, ptr_end)) = self.value_to_interval.get(&ptr) else {
+            return Vec::new();
+        };
+        self.value_to_interval
+            .iter()
+            .filter_map(|(&other, &(space, start, end))| {
+                if other == ptr || space != ptr_space {
+                    return None;
+                }
+                if start >= ptr_start && end <= ptr_end {
+                    let byte_offset = usize::try_from(start - ptr_start).ok()?;
+                    let sub_size = usize::try_from(end - start).ok()?;
+                    Some((other, byte_offset, sub_size))
+                } else {
+                    None
+                }
+            })
+            .collect()
     }
 
     /// Conservative may-alias query.

@@ -10,7 +10,10 @@ use qcode::{
         BasicBlock, Value, ValueId, ValueRef,
         block::{BlockId, BlockMutRef},
         function::FunctionId,
-        insn::{Binary, Binop, BoolBinop, FloatBinop, InstructionId, IntBinop, Mnemonic, Unop},
+        insn::{
+            Binary, Binop, BoolBinop, FloatBinop, InstructionId, InstructionRef, IntBinop, Load,
+            Mnemonic, Range, Unop,
+        },
         literal::LiteralRef,
         util::base_ref::WithCtxMut,
     },
@@ -167,6 +170,9 @@ fn gvn_block_inner(
     aliases: Option<&AliasResult>,
 ) -> HashMap<Mnemonic, ValueId> {
     let mut table = inherited.clone();
+    // Maps a narrow-load mnemonic to (wide_src, byte_offset_within_wide, sub_size),
+    // populated when a wide store covers sub-register locations.
+    let mut range_table: HashMap<Mnemonic, (ValueId, usize, usize)> = HashMap::new();
     let mut redundant: HashSet<InstructionId> = HashSet::new();
 
     let insns = BasicBlock::from_id(ctx, block_id)
@@ -190,6 +196,29 @@ fn gvn_block_inner(
                     }
                 });
                 table.insert(Mnemonic::Load(store.get_matching_load()), store.src);
+
+                // Invalidate range_table entries for locations this store may overwrite.
+                range_table.retain(|k, _| {
+                    if let Mnemonic::Load(sub_load) = k {
+                        aliases
+                            .is_none_or(|aliases| !aliases.may_alias(ctx, store_ptr, sub_load.ptr))
+                    } else {
+                        true
+                    }
+                });
+
+                // Forward sub-register loads from this wide store.
+                if let Some(aliases) = aliases {
+                    for (sub_ptr, byte_off, sub_size) in aliases.sub_intervals_of(store.ptr) {
+                        let sub_load = Load {
+                            space: store.space,
+                            ptr: sub_ptr,
+                            size: sub_size,
+                        };
+                        range_table
+                            .insert(Mnemonic::Load(sub_load), (store.src, byte_off, sub_size));
+                    }
+                }
             }
 
             _ if mnemonic.is_terminator() || insn_size == 0 => {}
@@ -209,6 +238,29 @@ fn gvn_block_inner(
                         redundant.insert(insn_id);
                     }
                     None => {
+                        // For loads not in the main table, check whether a wider store
+                        // already covers this sub-register location.
+                        if let Mnemonic::Load(_) = &mnemonic
+                            && let Some(&(wide_src, byte_off, sub_size)) =
+                                range_table.get(&mnemonic)
+                        {
+                            let range_id = InstructionRef::from_mnemonic(
+                                ctx,
+                                Mnemonic::Range(Range {
+                                    src: wide_src,
+                                    start: byte_off,
+                                    size: sub_size,
+                                }),
+                                sub_size,
+                            )
+                            .id;
+                            BasicBlock::from_id_mut(ctx, block_id)
+                                .insert_insn_before(insn_id, range_id);
+                            ctx.replace_all_uses_with(id, range_id);
+                            table.insert(mnemonic, range_id.into());
+                            redundant.insert(insn_id);
+                            continue;
+                        }
                         table.insert(mnemonic, id);
                     }
                 }

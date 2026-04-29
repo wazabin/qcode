@@ -230,4 +230,32 @@ mod tests {
         };
         assert_eq!(*lhs, ValueId::BlockParam(input));
     }
+
+    #[test]
+    fn merged_instructions_have_correct_parent() {
+        let mut ctx = make_ctx();
+        qcode!(
+            ctx,
+            "
+            fn f:
+            <a>
+                %x = i64 1 + i64 1;
+                goto <b>;
+            <b>
+                %y = i64 2 + i64 2;
+                goto <0x1001>;
+            "
+        );
+
+        let y_insn = y;
+        simplify_cfg(&mut ctx, f);
+
+        let insn = ctx.get_insn(y_insn);
+        let parent_id = insn.parent().map(|b| b.id());
+        assert_eq!(
+            parent_id,
+            Some(ValueId::BasicBlock(a)),
+            "instruction from b should be reparented to a after merge"
+        );
+    }
 }

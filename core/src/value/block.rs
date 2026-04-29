@@ -492,8 +492,12 @@ impl<'str, 'ctx> BlockMutRef<'str, 'ctx> {
         // Remove terminal branch.
         self.inner_mut().instructions.pop();
 
-        // Append other's instructions.
+        // Append other's instructions, updating their parent to point to this block.
         let b_insns = self.ctx.values.basic_blocks[other].instructions.clone();
+        let self_id = self.id;
+        for &insn_id in &b_insns {
+            self.ctx.values.instructions[insn_id].parent = Some(self_id);
+        }
         self.inner_mut().instructions.extend(b_insns);
 
         // Rehome other's edges to this block at the graph level.

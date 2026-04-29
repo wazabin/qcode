@@ -99,6 +99,10 @@ struct Analysis<'a> {
     /// Literal-pointer ranges encountered during pointer resolution; grows as loads/stores are processed.
     literal_ranges: HashMap<SpaceId, Vec<SizedNode>>,
 
+    /// Exact `(space, byte_start, byte_end)` for pointer values whose location
+    /// was resolved to a concrete varnode or literal address.
+    value_to_interval: HashMap<ValueId, (SpaceId, u64, u64)>,
+
     uf: UnionFind,
 }
 
@@ -168,6 +172,8 @@ impl<'a> Analysis<'a> {
             .or_default()
             .push(SizedNode { root, start, end });
 
+        self.value_to_interval.insert(literal, (space, start, end));
+
         root
     }
 
@@ -180,13 +186,17 @@ impl<'a> Analysis<'a> {
     fn resolve_pointer_root(&mut self, value: ValueId, space: SpaceId, size: usize) -> NodeId {
         match value {
             ValueId::Varnode(id) => {
-                let varnode_space_id = Varnode::from_id(self.ctx, id).space().id;
+                let (varnode_space_id, start, vn_size) = {
+                    let vn = Varnode::from_id(self.ctx, id);
+                    (vn.space().id, vn.address() as u64, vn.size() as u64)
+                };
                 assert_eq!(
                     varnode_space_id, space,
                     "load/store pointer varnodes must stay in the access space; \
                      builder.rs::push_load documents this IR invariant"
                 );
-
+                self.value_to_interval
+                    .insert(value, (space, start, start + vn_size));
                 let root = self.lookup_root(value);
                 root.unwrap_or(NodeId::Unknown)
             }
@@ -263,6 +273,7 @@ impl AliasResult {
             value_to_root: HashMap::new(),
             by_space: HashMap::new(),
             literal_ranges: HashMap::new(),
+            value_to_interval: HashMap::new(),
             uf: UnionFind::new(),
         };
 
@@ -343,7 +354,10 @@ impl AliasResult {
             .map(|(value, root)| (value, a.uf.find_mut(root)))
             .collect();
 
-        AliasResult { value_to_root }
+        AliasResult {
+            value_to_root,
+            value_to_interval: a.value_to_interval,
+        }
     }
 }
 

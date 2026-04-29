@@ -141,7 +141,10 @@ impl SteensgaardState {
             .into_iter()
             .map(|(v, n)| (v, self.find_mut(n)))
             .collect();
-        AliasResult { value_to_root }
+        AliasResult {
+            value_to_root,
+            value_to_interval: HashMap::new(),
+        }
     }
 }
 
