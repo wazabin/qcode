@@ -431,7 +431,6 @@ impl<'str, 'ctx> Builder<'str, 'ctx> {
                 _ => {}
             }
 
-            let size = ValueRef::new(src, self.context()).size();
             self.push_instruction(
                 Mnemonic::Load(Load {
                     ptr: src,
