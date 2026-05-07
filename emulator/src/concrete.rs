@@ -669,16 +669,7 @@ impl StandaloneEmulator {
             .or_else(|| block.instruction_ids().last().copied())
             .expect("cannot construct EmulatorError for empty block");
 
-        let instruction = Instruction::from_id(ctx, instruction);
-        EmulatorError {
-            kind,
-            ctx: format!(
-                "instruction: {}\nblock: {:?}\nfunction: {:?}",
-                instruction.as_statement(),
-                instruction.parent().map(|b| b.name()),
-                instruction.function().map(|f| f.name())
-            ),
-        }
+        EmulatorError::new(kind, &Instruction::from_id(ctx, instruction))
     }
 
     pub fn from_address(ctx: &Context<'_>, addr: u64) -> Self {

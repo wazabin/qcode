@@ -23,6 +23,24 @@ pub struct EmulatorError {
     /// The context in which the error occurred
     /// Usually the instruction, it's address and function it belongs to
     pub ctx: String,
+
+    /// The address at which the error occurred, if applicable.
+    pub address: Option<u64>,
+}
+
+impl EmulatorError {
+    pub fn new(kind: EmulatorErrorKind, insn: &InstructionRef<'_, '_>) -> Self {
+        Self {
+            kind,
+            ctx: format!(
+                "Instruction: {}\nBlock: {:?}\nFunction: {:?}",
+                insn.as_statement(),
+                insn.parent().map(|b| b.name()),
+                insn.function().map(|f| f.name())
+            ),
+            address: insn.parent().and_then(|b| b.address()),
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -395,14 +413,7 @@ pub trait Interpreter {
     }
 
     fn interpret(&mut self, insn: InstructionRef<'_, '_>) -> Result<Option<Self::V>> {
-        self.interpret_(&insn).map_err(|kind| EmulatorError {
-            kind,
-            ctx: format!(
-                "Instruction: {}\nBlock: {:?}\nFunction: {:?}",
-                insn.as_statement(),
-                insn.parent().map(|b| b.name()),
-                insn.function().map(|f| f.name())
-            ),
-        })
+        self.interpret_(&insn)
+            .map_err(|kind| EmulatorError::new(kind, &insn))
     }
 }
