@@ -54,13 +54,13 @@ pub struct Context<'str> {
     pub default_space: SpaceId,
 
     /// A mapping of space ids to their corresponding [`Space`]s.
-    pub(crate) spaces: Registry<SpaceId, Space<'str>>,
+    pub(crate) spaces: Registry<SpaceId, Space>,
 
     /// A mapping of pcode ops to their names
-    pub pcode_ops: Registry<PCodeOpId, &'str str>,
+    pub pcode_ops: Registry<PCodeOpId, Box<str>>,
 
     /// A mapping of names to spaces
-    pub named_spaces: HashMap<&'str str, SpaceId>,
+    pub named_spaces: HashMap<Box<str>, SpaceId>,
 
     /// Reverse mapping of name hints to value IDs, used to ensure that name hints are unique
     name_map: HashMap<Cow<'str, str>, ValueId>,
@@ -108,13 +108,9 @@ impl<'str> Context<'str> {
         ))
     }
 
-    /// Adds a space to the context, registering its name if it is borrowed (`&'str str`),
-    /// and returns its ID.
-    pub fn add_space(&mut self, space: Space<'str>) -> SpaceId {
-        let name_key: Option<&'str str> = match &space.name {
-            Some(Cow::Borrowed(s)) => Some(s),
-            _ => None,
-        };
+    /// Adds a space to the context, registering its name, and returns its ID.
+    pub fn add_space(&mut self, space: Space) -> SpaceId {
+        let name_key: Option<Box<str>> = space.name.clone();
         let id = self.spaces.push(space);
         if let Some(name) = name_key {
             self.named_spaces.insert(name, id);
@@ -128,16 +124,16 @@ impl<'str> Context<'str> {
     }
 
     /// Replaces the spaces registry wholesale. Intended for initialization from a pre-built spec.
-    pub fn load_spaces(&mut self, spaces: registry::Registry<SpaceId, Space<'str>>) {
+    pub fn load_spaces(&mut self, spaces: registry::Registry<SpaceId, Space>) {
         self.spaces = spaces;
     }
 
     /// Creates a new named temporary address space and returns its ID.
-    pub fn make_named_temp_space(&mut self, name: Cow<'str, str>) -> SpaceId {
+    pub fn make_named_temp_space(&mut self, name: impl Into<Box<str>>) -> SpaceId {
         let default_space = &self.spaces[self.default_space];
         let (word_size, addr_size) = (default_space.word_size, default_space.addr_size);
         self.spaces.push(Space {
-            name: Some(name),
+            name: Some(name.into()),
             word_size,
             addr_size,
             ty: crate::space::SpaceType::Ram,
