@@ -1,4 +1,4 @@
-use common::parsing::Rule;
+use common::raw_parsing::Rule;
 use pest::Span;
 use std::{fmt::Display, ops::Range};
 
