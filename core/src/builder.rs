@@ -63,6 +63,9 @@ pub struct Builder<'str, 'ctx> {
     /// Names of local labels to their corresponding block IDs.
     local_labels: HashMap<Cow<'str, str>, BlockId>,
 
+    /// The address at which instructions are added
+    address: Option<u64>,
+
     /// Is the block terminated, i.e. does it end with a terminator
     /// If it is not the case, the block might be invalid
     pub(crate) is_terminated: bool,
@@ -94,19 +97,33 @@ impl<'str, 'ctx> Builder<'str, 'ctx> {
             block,
             namespace: HashMap::new(),
             local_labels: HashMap::new(),
+            address: None,
         }
     }
 
     /// Creates a builder positioned at the block for machine `address`,
     /// creating the block if it does not already exist.
+    /// This will emit instructions ate the given address
     pub fn from_context<'m>(ctx: &'m mut Context<'str>, address: u64) -> Builder<'str, 'm> {
         let block_id = ctx.get_or_make_block(address);
-        Builder::from_block(BasicBlock::from_id_mut(ctx, block_id))
+        let mut builder = Builder::from_block(BasicBlock::from_id_mut(ctx, block_id));
+        builder.set_address(address);
+        builder
     }
 
     /// Returns `true` if the current block ends with a terminator instruction.
     pub fn is_terminated(&self) -> bool {
         self.block.is_terminated()
+    }
+
+    /// Sets the current address for instructions added by this builder.
+    pub fn set_address(&mut self, addr: u64) {
+        self.address = Some(addr);
+    }
+
+    /// Remove the current address
+    pub fn clear_address(&mut self) {
+        self.address = None;
     }
 
     /// Disables the termination check that runs when the builder is dropped.
@@ -254,6 +271,11 @@ impl<'str, 'ctx> Builder<'str, 'ctx> {
 
         let id =
             InstructionRef::from_mnemonic_with_space(self.context_mut(), mnemonic, size, space).id;
+
+        if let Some(address) = self.address {
+            Instruction::from_id_mut(self.context_mut(), id).set_address(address);
+        }
+
         self.block.push_insn(id);
         self.context().get_insn(id)
     }
@@ -337,10 +359,17 @@ impl<'str, 'ctx> Builder<'str, 'ctx> {
 
     /// If this block is not terminated, add a jump to the given address as a terminator instruction.
     /// The builder is now safe to drop without panicking, and the block is properly terminated.
+    /// Returns the instructions built by the builder.
     pub fn finalize(mut self, addr: u64) {
         if !self.block.is_terminated() {
             let target = self.get_or_make_block(addr);
-            self.push_branch(target);
+
+            let branch = self.push_branch(target).id;
+
+            // Sets the address for the jump instruction
+            if let Some(addr) = self.address {
+                Instruction::from_id_mut(self.context_mut(), branch).set_address(addr);
+            }
         }
     }
 
@@ -1214,5 +1243,23 @@ mod tests {
         assert_eq!(branch.target, dst_id);
         assert_eq!(branch.args.len(), 1);
         assert_eq!(branch.args[0], param_val);
+    }
+
+    #[test]
+    fn test_builder_adds_address_to_qcode() {
+        let mut ctx = Context::new();
+        let id_42 = ctx.get_const(42, 8).id();
+
+        let not_insn_id = {
+            let mut builder = Builder::from_context(&mut ctx, 0x1000);
+            let not_insn_id = builder.push_bool_not(id_42).id;
+            builder.finalize(0x1001);
+
+            not_insn_id
+        };
+
+        let insn = Instruction::from_id(&ctx, not_insn_id);
+
+        assert_eq!(insn.address().unwrap(), 0x1000);
     }
 }
