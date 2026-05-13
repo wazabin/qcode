@@ -36,9 +36,9 @@ pub fn remove_dead_insns(ctx: &mut Context, block_id: BlockId) {
             return;
         }
 
-        BasicBlock::from_id_mut(ctx, block_id).retain_insns(|id| !dead.contains(id));
-
-        ctx.values.remove_instructions(&dead);
+        for id in &dead {
+            ctx.remove_instruction(*id);
+        }
     }
 }
 
@@ -51,7 +51,7 @@ mod tests {
         context::Context,
         space::SpaceId,
         testing::TestContext,
-        value::{BlockId, Value, ValueId, insn::PCodeOpId},
+        value::{BlockId, ValueId, insn::PCodeOpId},
     };
 
     fn reg_space(ctx: &Context) -> SpaceId {
@@ -166,7 +166,7 @@ mod tests {
     fn test_pcode_op_kept() {
         let dead = {
             let (ctx, block_id) = build_block(|b| {
-                let op_id: PCodeOpId = b.context_mut().pcode_ops.push("syscall");
+                let op_id: PCodeOpId = b.context_mut().pcode_ops.push(Box::from("syscall"));
                 b.push_pcode_op(op_id, vec![], None);
             });
             dead_insns(&ctx, block_id)

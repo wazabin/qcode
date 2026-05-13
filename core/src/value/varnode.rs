@@ -13,12 +13,12 @@
 
 use std::borrow::Cow;
 
-use jstd::{Identifier, registry::Identified};
+use jstd::Identifier;
 
 use crate::{
-    error::Result,
     context::Context,
-    space::{Space, SpaceId},
+    error::Result,
+    space::{Space, SpaceId, SpaceRef},
     value::{
         Value, ValueId,
         util::{
@@ -106,9 +106,8 @@ where
     }
 
     /// The space this varnode belongs to.
-    pub fn space(&'s self) -> Identified<SpaceId, &'ctx Space<'str>> {
-        let space_id = self.inner().space;
-        Identified::new(space_id, self.ctx().get_space(space_id))
+    pub fn space(&'s self) -> SpaceRef<'ctx> {
+        Space::from_id(self.ctx(), self.inner().space)
     }
 
     /// The address at which this varnode begins
@@ -165,14 +164,6 @@ impl<'str, 'ctx> VarnodeMutRef<'str, 'ctx> {
     fn inner_mut(&mut self) -> &mut Varnode<'str> {
         &mut self.ctx.values.varnodes[self.id]
     }
-
-    fn rename(&mut self, name: Cow<'str, str>) -> Result<'str, ()> {
-        let id = self.id.into();
-        let old_name = self.inner_mut().name.take();
-        update_context_name(id, self.ctx, name.clone(), old_name.as_deref())?;
-        self.ctx.values.varnodes[self.id].name = Some(name);
-        Ok(())
-    }
 }
 
 impl<'s, 'ctx: 's, 'str: 'ctx> WithCtx<'s, 's, 'str> for VarnodeMutRef<'str, 'ctx> {
@@ -205,6 +196,28 @@ impl<'str, 'ctx> Value<'str, 'ctx> for VarnodeMutRef<'str, 'ctx> {
 
 impl<'str, 'ctx> Renameable<'str, 'ctx> for VarnodeMutRef<'str, 'ctx> {
     fn rename(&mut self, name: Cow<'str, str>) -> Result<'str, ()> {
-        self.rename(name)
+        let id = self.id.into();
+        let old_name = self.inner_mut().name.take();
+        update_context_name(id, self.ctx, name.clone(), old_name.as_deref())?;
+        self.ctx.values.varnodes[self.id].name = Some(name);
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use qcode_macro::qcode;
+
+    use super::*;
+    use crate::context::Context;
+
+    #[test]
+    fn varnode_name() {
+        let mut ctx = Context::new();
+        qcode!(ctx, "<block> varnode i64 ptr; goto <0x1001>;");
+
+        let varnode = Varnode::from_id(&ctx, ptr);
+        assert_eq!(varnode.name(), Some("ptr"));
+        assert_eq!(varnode.space().name.as_deref(), Some("ptr"));
     }
 }

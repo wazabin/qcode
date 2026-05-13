@@ -1,7 +1,7 @@
 use jstd::Identifier;
 use std::{
     borrow::Cow,
-    collections::HashSet,
+    collections::{HashSet, hash_set},
     fmt::{Display, Formatter},
 };
 
@@ -207,6 +207,17 @@ where
         blocks.into_iter()
     }
 
+    /// Iterates over the blocks in this function
+    /// This is slightly different from `blocks()` as the blocks will be returned in an arbitrary order, not sorted by address.
+    pub fn iter(&'s self) -> BlockIter<'str, 'ctx> {
+        let inner = self.inner();
+
+        BlockIter {
+            ctx: self.ctx(),
+            inner: inner.blocks.iter(),
+        }
+    }
+
     fn fmt(&'s self, f: &mut Formatter<'_>) -> std::fmt::Result {
         if self.is_external() {
             return writeln!(f, "extern fn {};", self.name());
@@ -246,6 +257,28 @@ impl<'str, 'ctx> Value<'str, 'ctx> for FunctionRef<'str, 'ctx> {
 
     fn size(&self) -> usize {
         self.size()
+    }
+}
+
+pub struct BlockIter<'str, 'ctx> {
+    ctx: &'ctx Context<'str>,
+    inner: hash_set::Iter<'ctx, BlockId>,
+}
+
+impl<'str, 'ctx> Iterator for BlockIter<'str, 'ctx> {
+    type Item = BlockRef<'str, 'ctx>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        self.inner.next().map(|id| BlockRef::new(self.ctx, *id))
+    }
+}
+
+impl<'str, 'ctx> IntoIterator for &FunctionRef<'str, 'ctx> {
+    type Item = BlockRef<'str, 'ctx>;
+    type IntoIter = BlockIter<'str, 'ctx>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        self.iter()
     }
 }
 
@@ -384,6 +417,8 @@ impl<'str, 'ctx> FunctionMutRef<'str, 'ctx> {
 
 #[cfg(test)]
 mod tests {
+    use qcode_macro::qcode;
+
     use super::*;
 
     #[test]
@@ -454,6 +489,100 @@ mod tests {
     /// that address is registered (e.g. when Sleigh emits a branch target block
     /// ahead of the function being lifted).  `set_address` must allow this and
     /// must attribute the block as the function's root.
+    #[test]
+    fn iter_yields_all_blocks() {
+        let mut ctx = Context::new();
+        let root = BasicBlock::make(&mut ctx).id;
+        let extra = BasicBlock::make(&mut ctx).id;
+        let mut f = Function::make(&mut ctx, "iter_fn".into()).unwrap();
+        f.add_block(root);
+        f.add_block(extra);
+
+        let f = Function::from_name(&ctx, "iter_fn").unwrap();
+        let ids: Vec<_> = f.iter().map(|b| b.id).collect();
+        assert!(ids.contains(&root));
+        assert!(ids.contains(&extra));
+    }
+
+    #[test]
+    fn into_iterator_for_function_ref_matches_iter() {
+        let mut ctx = Context::new();
+        let b1 = BasicBlock::make(&mut ctx).id;
+        let b2 = BasicBlock::make(&mut ctx).id;
+        let mut f = Function::make(&mut ctx, "into_iter_fn".into()).unwrap();
+        f.add_block(b1);
+        f.add_block(b2);
+
+        let f = Function::from_name(&ctx, "into_iter_fn").unwrap();
+        let mut via_iter: Vec<usize> = f.iter().map(|b| b.id.into()).collect();
+        let mut via_into: Vec<usize> = (&f).into_iter().map(|b| b.id.into()).collect();
+        via_iter.sort();
+        via_into.sort();
+        assert_eq!(via_iter, via_into);
+    }
+
+    #[test]
+    fn qcode_fn_single_block_populates_function() {
+        let mut ctx = Context::new();
+        qcode!(
+            ctx,
+            "
+            fn simple:
+                <entry>
+                    return [0];
+            "
+        );
+
+        let f = Function::from_name(&ctx, "simple").unwrap();
+        assert_eq!(f.name(), "simple");
+        assert!(f.root().is_some());
+        assert_eq!(f.root().unwrap().name().unwrap(), "entry");
+        assert_eq!(f.blocks().count(), 1);
+    }
+
+    #[test]
+    fn qcode_fn_multi_block_populates_all_blocks() {
+        let mut ctx = Context::new();
+        qcode!(
+            ctx,
+            "
+            fn multiblock:
+                <bb1>
+                    if i8 1 goto <bb2> else goto <bb3>;
+
+                <bb2>
+                    goto <bb3>;
+
+                <bb3>
+                    return [0];
+            "
+        );
+
+        let f = Function::from_name(&ctx, "multiblock").unwrap();
+        assert_eq!(f.root().unwrap().name().unwrap(), "bb1");
+        let block_names: Vec<_> = f.blocks().filter_map(|b| b.name()).collect();
+        assert!(block_names.contains(&"bb1"), "missing bb1");
+        assert!(block_names.contains(&"bb2"), "missing bb2");
+        assert!(block_names.contains(&"bb3"), "missing bb3");
+        assert_eq!(f.blocks().count(), 3);
+    }
+
+    #[test]
+    fn qcode_fn_id_variable_is_set() {
+        let mut ctx = Context::new();
+        qcode!(
+            ctx,
+            "
+            fn myfn:
+                <start>
+                    return [0];
+            "
+        );
+
+        let by_name = Function::from_name(&ctx, "myfn").unwrap();
+        assert_eq!(by_name.name(), "myfn");
+    }
+
     #[test]
     fn set_address_allows_function_at_existing_block_address() {
         let mut ctx = Context::new();

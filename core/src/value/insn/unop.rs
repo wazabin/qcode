@@ -2,7 +2,7 @@ use std::fmt::{Display, Formatter};
 
 use crate::{
     context::Context,
-    value::{ValueId, insn::mnemonic::MnemonicKind},
+    value::{ValueId, ValueRef, insn::mnemonic::MnemonicKind},
 };
 
 #[non_exhaustive]
@@ -69,7 +69,7 @@ impl MnemonicKind for Unary {
     fn fmt(&self, f: &mut Formatter<'_>, ctx: &Context<'_>) -> std::fmt::Result {
         match self.op {
             Unop::IntNegate | Unop::IntNot | Unop::BoolNot => {
-                write!(f, "{} {};", self.op, ctx.get_value(self.src))
+                write!(f, "{} {};", self.op, ValueRef::new(self.src, ctx))
             }
             Unop::FloatNegate
             | Unop::FloatAbs
@@ -77,7 +77,7 @@ impl MnemonicKind for Unary {
             | Unop::FloatCeil
             | Unop::FloatFloor
             | Unop::FloatRound => {
-                write!(f, "{}({});", self.op, ctx.get_value(self.src))
+                write!(f, "{}({});", self.op, ValueRef::new(self.src, ctx))
             }
         }
     }
@@ -92,9 +92,8 @@ mod tests {
     use qcode_macro::qcode;
 
     use crate::{
-        builder::Builder,
         value::Value,
-        value::insn::{Instruction, InstructionId, Mnemonic},
+        value::insn::{Instruction, Mnemonic},
     };
 
     use super::*;
@@ -104,19 +103,24 @@ mod tests {
     #[test]
     fn test_bool_not_from_qcode() {
         let mut ctx = Context::new();
-        let mut builder = Builder::from_context(&mut ctx, 0x1000);
+        qcode!(
+            ctx,
+            "
+            varnode i32 V0;
 
-        qcode!(builder, "local i32 v0 as V0");
-        let v1: InstructionId = qcode!(builder, "!{v0}");
-        builder.finalize(0x1001);
+            <block>
+                %v0 = load(i32, &V0);
+                %v = !%v0;
+                goto <0x1001>;
+            "
+        );
 
-        match ctx.values.instructions[v1].clone() {
-            Instruction {
-                mnemonic: Mnemonic::Unop(Unary { op, src }),
-                ..
-            } => {
-                assert_eq!(op, Unop::BoolNot);
-                assert_eq!(ctx.get_value(src).size(), 4);
+        let v = Instruction::from_id(&ctx, v);
+
+        match v.mnemonic() {
+            Mnemonic::Unop(Unary { op, src }) => {
+                assert_eq!(*op, Unop::BoolNot);
+                assert_eq!(ValueRef::new(*src, &ctx).size(), 4);
             }
             _ => panic!("expected boolean unop instruction"),
         }

@@ -20,10 +20,12 @@
 //! arbitrary values (e.g. use-def chains, operand lists) can do so without
 //! generics.
 
-use crate::context::Context;
+use crate::{context::Context, space::SpaceRef};
+use serde::{Deserialize, Serialize};
 use std::fmt::{Debug, Display, Formatter};
 
 pub use block::{BasicBlock, BlockId, BlockMutRef, BlockRef};
+pub use block_param::{BlockParam, BlockParamId, BlockParamMutRef, BlockParamRef};
 pub use function::{Function, FunctionId, FunctionMutRef, FunctionRef};
 pub use insn::{Instruction, InstructionId, InstructionRef};
 pub use literal::{LiteralId, LiteralRef};
@@ -31,6 +33,7 @@ pub use util::named::{Named, Renameable};
 pub use varnode::{Varnode, VarnodeId, VarnodeRef, register::Register, register::RegisterId};
 
 pub mod block;
+pub mod block_param;
 pub mod function;
 pub mod insn;
 pub mod literal;
@@ -53,7 +56,7 @@ pub mod varnode;
 /// `ValueId` is `#[non_exhaustive]`; new variants may be added in future
 /// versions without a major semver bump.
 #[non_exhaustive]
-#[derive(Debug, Clone, Copy, Hash, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Hash, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ValueId {
     /// A compile-time integer constant, optionally carrying a symbolic label.
     Literal(LiteralId),
@@ -61,6 +64,8 @@ pub enum ValueId {
     Instruction(InstructionId),
     /// A control-flow node ([`BasicBlock`]).
     BasicBlock(BlockId),
+    /// A typed parameter declared at the entry of a basic block.
+    BlockParam(BlockParamId),
     /// A named memory location ([`Varnode`]) such as a register or global.
     Varnode(VarnodeId),
     /// A lifted or external [`Function`].
@@ -73,6 +78,7 @@ impl ValueId {
             ValueId::Literal(_) => "Literal",
             ValueId::Instruction(_) => "Instruction",
             ValueId::BasicBlock(_) => "BasicBlock",
+            ValueId::BlockParam(_) => "BlockParam",
             ValueId::Varnode(_) => "Varnode",
             ValueId::Function(_) => "Function",
         }
@@ -100,6 +106,18 @@ impl ValueId {
         } else {
             None
         }
+    }
+
+    pub fn as_block_param(self) -> Option<BlockParamId> {
+        if let ValueId::BlockParam(id) = self {
+            Some(id)
+        } else {
+            None
+        }
+    }
+
+    pub fn is_varnode(self) -> bool {
+        matches!(self, ValueId::Varnode(_))
     }
 
     pub fn as_varnode(self) -> Option<VarnodeId> {
@@ -137,6 +155,12 @@ impl From<BlockId> for ValueId {
     }
 }
 
+impl From<BlockParamId> for ValueId {
+    fn from(id: BlockParamId) -> Self {
+        ValueId::BlockParam(id)
+    }
+}
+
 impl From<VarnodeId> for ValueId {
     fn from(id: VarnodeId) -> Self {
         ValueId::Varnode(id)
@@ -155,6 +179,7 @@ impl From<ValueId> for usize {
             ValueId::Literal(lit_id) => lit_id.into(),
             ValueId::Instruction(insn_id) => insn_id.into(),
             ValueId::BasicBlock(bb_id) => bb_id.into(),
+            ValueId::BlockParam(param_id) => param_id.into(),
             ValueId::Varnode(var_id) => var_id.into(),
             ValueId::Function(fn_id) => fn_id.into(),
         }
@@ -189,6 +214,7 @@ pub enum ValueRef<'str, 'ctx> {
     Literal(LiteralRef<'str, 'ctx>),
     Instruction(InstructionRef<'str, 'ctx>),
     BasicBlock(BlockRef<'str, 'ctx>),
+    BlockParam(BlockParamRef<'str, 'ctx>),
     Varnode(VarnodeRef<'str, 'ctx>),
     Function(FunctionRef<'str, 'ctx>),
 }
@@ -199,6 +225,7 @@ impl Debug for ValueRef<'_, '_> {
             ValueRef::Literal(_) => f.write_str("Literal"),
             ValueRef::Instruction(_) => f.write_str("Instruction"),
             ValueRef::BasicBlock(_) => f.write_str("BasicBlock"),
+            ValueRef::BlockParam(_) => f.write_str("BlockParam"),
             ValueRef::Varnode(_) => f.write_str("Varnode"),
             ValueRef::Function(_) => f.write_str("Function"),
         }
@@ -223,6 +250,12 @@ impl<'str, 'ctx> From<BlockRef<'str, 'ctx>> for ValueRef<'str, 'ctx> {
     }
 }
 
+impl<'str, 'ctx> From<BlockParamRef<'str, 'ctx>> for ValueRef<'str, 'ctx> {
+    fn from(param_ref: BlockParamRef<'str, 'ctx>) -> Self {
+        ValueRef::BlockParam(param_ref)
+    }
+}
+
 impl<'str, 'ctx> From<VarnodeRef<'str, 'ctx>> for ValueRef<'str, 'ctx> {
     fn from(var_ref: VarnodeRef<'str, 'ctx>) -> Self {
         ValueRef::Varnode(var_ref)
@@ -241,6 +274,7 @@ impl<'str, 'ctx> ValueRef<'str, 'ctx> {
             ValueRef::Literal(lit_ref) => lit_ref,
             ValueRef::Instruction(insn_ref) => insn_ref,
             ValueRef::BasicBlock(bb_ref) => bb_ref,
+            ValueRef::BlockParam(param_ref) => param_ref,
             ValueRef::Varnode(var_ref) => var_ref,
             ValueRef::Function(fn_ref) => fn_ref,
         }
@@ -253,6 +287,9 @@ impl<'str, 'ctx> ValueRef<'str, 'ctx> {
                 ValueRef::Instruction(InstructionRef::new(ctx, insn_id))
             }
             ValueId::BasicBlock(bb_id) => ValueRef::BasicBlock(BasicBlock::from_id(ctx, bb_id)),
+            ValueId::BlockParam(param_id) => {
+                ValueRef::BlockParam(BlockParam::from_id(ctx, param_id))
+            }
             ValueId::Varnode(var_id) => ValueRef::Varnode(Varnode::from_id(ctx, var_id)),
             ValueId::Function(fn_id) => ValueRef::Function(Function::from_id(ctx, fn_id)),
         }
@@ -261,6 +298,17 @@ impl<'str, 'ctx> ValueRef<'str, 'ctx> {
     pub fn from_id(ctx: &'ctx Context<'str>, id: ValueId) -> Self {
         Self::new(id, ctx)
     }
+
+    pub fn space(&self) -> Option<SpaceRef<'ctx>> {
+        match self {
+            ValueRef::Varnode(v) => Some(v.space()),
+            ValueRef::Instruction(i) => i.space(),
+            ValueRef::Literal(_)
+            | ValueRef::BasicBlock(_)
+            | ValueRef::BlockParam(_)
+            | ValueRef::Function(_) => None,
+        }
+    }
 }
 
 impl Display for ValueRef<'_, '_> {
@@ -268,7 +316,11 @@ impl Display for ValueRef<'_, '_> {
         match self {
             // Display function as compact reference when used as a value operand.
             ValueRef::Function(fn_ref) => write!(f, "<{}>", fn_ref.name()),
-            _ => self.inner().fmt(f),
+            ValueRef::Literal(_)
+            | ValueRef::Instruction(_)
+            | ValueRef::BasicBlock(_)
+            | ValueRef::BlockParam(_)
+            | ValueRef::Varnode(_) => self.inner().fmt(f),
         }
     }
 }

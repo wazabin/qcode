@@ -70,10 +70,11 @@ mod tests {
     use qcode::{
         context::Context,
         value::{
-            BasicBlock, Function, InstructionRef,
-            insn::{Branch, Mnemonic},
+            BasicBlock, Function, ValueId,
+            insn::{Binary, Mnemonic},
         },
     };
+    use qcode_macro::qcode;
 
     use super::simplify_cfg;
 
@@ -81,31 +82,23 @@ mod tests {
         Context::new()
     }
 
-    /// Push an unconditional Branch instruction into block `from` targeting `to`,
-    /// and add a CFG edge from `from` to `to`.
-    fn add_branch(ctx: &mut Context, from: qcode::value::BlockId, to: qcode::value::BlockId) {
-        let insn =
-            InstructionRef::from_mnemonic(ctx, Mnemonic::Branch(Branch { target: to }), 0).id;
-        ctx.values.basic_blocks[from].instructions.push(insn);
-        ctx.add_cfg_edge(from, to);
-    }
-
     #[test]
     fn merges_two_block_chain() {
         let mut ctx = make_ctx();
+        qcode!(
+            ctx,
+            "
+            fn f:
+            <a>
+                goto <b>;
+            <b>
+                goto <0x1001>;
+            "
+        );
 
-        let func_id = Function::make(&mut ctx, "f".into()).unwrap().id;
+        simplify_cfg(&mut ctx, f);
 
-        let a = BasicBlock::make(&mut ctx).in_function(func_id).id;
-        let b = BasicBlock::make(&mut ctx).in_function(func_id).id;
-        add_branch(&mut ctx, a, b);
-
-        simplify_cfg(&mut ctx, func_id);
-
-        let blocks: Vec<_> = Function::from_id(&ctx, func_id)
-            .blocks()
-            .map(|b| b.id)
-            .collect();
+        let blocks: Vec<_> = Function::from_id(&ctx, f).blocks().map(|b| b.id).collect();
         assert_eq!(blocks.len(), 1, "two-block chain should merge into one");
         assert_eq!(blocks[0], a);
     }
@@ -113,81 +106,91 @@ mod tests {
     #[test]
     fn merges_three_block_chain() {
         let mut ctx = make_ctx();
+        qcode!(
+            ctx,
+            "
+            fn f:
+            <a>
+                goto <b>;
+            <b>
+                goto <c>;
+            <c>
+                goto <0x1001>;
+            "
+        );
 
-        let func_id = Function::make(&mut ctx, "f".into()).unwrap().id;
+        simplify_cfg(&mut ctx, f);
 
-        let a = BasicBlock::make(&mut ctx).in_function(func_id).id;
-        let b = BasicBlock::make(&mut ctx).in_function(func_id).id;
-        let c = BasicBlock::make(&mut ctx).in_function(func_id).id;
-
-        add_branch(&mut ctx, a, b);
-        add_branch(&mut ctx, b, c);
-
-        simplify_cfg(&mut ctx, func_id);
-
-        let blocks: Vec<_> = Function::from_id(&ctx, func_id)
-            .blocks()
-            .map(|b| b.id)
-            .collect();
+        let blocks: Vec<_> = Function::from_id(&ctx, f).blocks().map(|b| b.id).collect();
         assert_eq!(blocks.len(), 1, "three-block chain should collapse to one");
     }
 
     #[test]
     fn no_merge_when_a_has_two_successors() {
-        // A→B and A→C (diamond entry): A has two successors, no merge possible.
+        // A->B and A->C (diamond entry): A has two successors, no merge possible.
         let mut ctx = make_ctx();
-        let func_id = Function::make(&mut ctx, "f".into()).unwrap().id;
-        let a = BasicBlock::make(&mut ctx).in_function(func_id).id;
-        let b = BasicBlock::make(&mut ctx).in_function(func_id).id;
-        let c = BasicBlock::make(&mut ctx).in_function(func_id).id;
-        // Add a CBranch-like situation: two outgoing edges from A.
-        ctx.add_cfg_edge(a, b);
-        ctx.add_cfg_edge(a, c);
+        qcode!(
+            ctx,
+            "
+            fn f:
+            <a @cond:i8>
+                if @cond goto <b> else goto <c>;
+            <b>
+                goto <0x1001>;
+            <c>
+                goto <0x1002>;
+            "
+        );
 
-        simplify_cfg(&mut ctx, func_id);
+        simplify_cfg(&mut ctx, f);
 
-        let blocks: Vec<_> = Function::from_id(&ctx, func_id)
-            .blocks()
-            .map(|b| b.id)
-            .collect();
+        let blocks: Vec<_> = Function::from_id(&ctx, f).blocks().map(|b| b.id).collect();
         assert_eq!(blocks.len(), 3, "diamond entry should not be merged");
     }
 
     #[test]
     fn no_merge_when_b_has_two_predecessors() {
-        // A→B and D→B: B has two predecessors, no merge.
+        // A->B and D->B: B has two predecessors, no merge.
         let mut ctx = make_ctx();
-        let func_id = Function::make(&mut ctx, "f".into()).unwrap().id;
-        let a = BasicBlock::make(&mut ctx).in_function(func_id).id;
-        let b = BasicBlock::make(&mut ctx).in_function(func_id).id;
-        let d = BasicBlock::make(&mut ctx).in_function(func_id).id;
-        add_branch(&mut ctx, a, b);
-        ctx.add_cfg_edge(d, b);
+        qcode!(
+            ctx,
+            "
+            fn f:
+            <a>
+                goto <b>;
+            <d>
+                goto <b>;
+            <b>
+                goto <0x1001>;
+            "
+        );
 
-        simplify_cfg(&mut ctx, func_id);
+        simplify_cfg(&mut ctx, f);
 
-        let blocks: Vec<_> = Function::from_id(&ctx, func_id)
-            .blocks()
-            .map(|b| b.id)
-            .collect();
+        let blocks: Vec<_> = Function::from_id(&ctx, f).blocks().map(|b| b.id).collect();
         assert_eq!(blocks.len(), 3, "B has two predecessors, should not merge");
     }
 
     #[test]
     fn parent_cleared_on_merged_block() {
         let mut ctx = make_ctx();
-        let func_id = Function::make(&mut ctx, "f".into()).unwrap().id;
-        let a = BasicBlock::make(&mut ctx).in_function(func_id).id;
-        let b = BasicBlock::make(&mut ctx).in_function(func_id).id;
-
-        add_branch(&mut ctx, a, b);
+        qcode!(
+            ctx,
+            "
+            fn f:
+            <a>
+                goto <b>;
+            <b>
+                goto <0x1001>;
+            "
+        );
 
         {
             let b = BasicBlock::from_id(&ctx, b);
             assert!(b.parent().is_some(), "b should have parent before merge");
         }
 
-        simplify_cfg(&mut ctx, func_id);
+        simplify_cfg(&mut ctx, f);
 
         {
             let a = BasicBlock::from_id(&ctx, a);
@@ -198,5 +201,61 @@ mod tests {
             );
             assert!(a.parent().is_some(), "a should still have a parent");
         }
+    }
+
+    #[test]
+    fn merged_block_arguments_are_rewritten_to_branch_args() {
+        let mut ctx = make_ctx();
+        qcode!(
+            ctx,
+            "
+            fn f:
+            <a @input:i64>
+                goto <b @x=@input>;
+
+            <b @x:i64>
+                %sum = @x + 1;
+                goto <0x1001>;
+            "
+        );
+
+        simplify_cfg(&mut ctx, f);
+
+        let blocks: Vec<_> = Function::from_id(&ctx, f).blocks().map(|b| b.id).collect();
+        assert_eq!(blocks, [a], "branch-with-args chain should merge");
+        assert!(BasicBlock::from_id(&ctx, b).parent().is_none());
+
+        let Mnemonic::Binop(Binary { lhs, .. }) = ctx.values.instructions[sum].mnemonic() else {
+            panic!("expected merged sum to be a binop");
+        };
+        assert_eq!(*lhs, ValueId::BlockParam(input));
+    }
+
+    #[test]
+    fn merged_instructions_have_correct_parent() {
+        let mut ctx = make_ctx();
+        qcode!(
+            ctx,
+            "
+            fn f:
+            <a>
+                %x = i64 1 + i64 1;
+                goto <b>;
+            <b>
+                %y = i64 2 + i64 2;
+                goto <0x1001>;
+            "
+        );
+
+        let y_insn = y;
+        simplify_cfg(&mut ctx, f);
+
+        let insn = ctx.get_insn(y_insn);
+        let parent_id = insn.parent().map(|b| b.id());
+        assert_eq!(
+            parent_id,
+            Some(ValueId::BasicBlock(a)),
+            "instruction from b should be reparented to a after merge"
+        );
     }
 }

@@ -1,7 +1,7 @@
 use crate::{
     context::Context,
     value::{
-        ValueId,
+        ValueId, ValueRef,
         insn::bits::{mask_for_size, signed_value},
     },
 };
@@ -28,7 +28,12 @@ impl MnemonicKind for Zext {
     }
 
     fn fmt(&self, f: &mut Formatter<'_>, ctx: &Context<'_>) -> std::fmt::Result {
-        write!(f, "zext(i{}, {});", self.size * 8, ctx.get_value(self.src))
+        write!(
+            f,
+            "zext(i{}, {});",
+            self.size * 8,
+            ValueRef::new(self.src, ctx)
+        )
     }
 
     fn args(&self) -> Vec<ValueId> {
@@ -58,7 +63,12 @@ impl MnemonicKind for Sext {
     }
 
     fn fmt(&self, f: &mut Formatter<'_>, ctx: &Context<'_>) -> std::fmt::Result {
-        write!(f, "sext(i{}, {});", self.size * 8, ctx.get_value(self.src))
+        write!(
+            f,
+            "sext(i{}, {});",
+            self.size * 8,
+            ValueRef::new(self.src, ctx)
+        )
     }
 
     fn args(&self) -> Vec<ValueId> {
@@ -95,7 +105,7 @@ impl MnemonicKind for Range {
         write!(
             f,
             "{}[{}:{}];",
-            ctx.get_value(self.src),
+            ValueRef::new(self.src, ctx),
             self.start,
             self.start + self.size
         )
@@ -122,7 +132,7 @@ impl MnemonicKind for IntToFloat {
             f,
             "int2float(f{}, {});",
             self.size * 8,
-            ctx.get_value(self.src)
+            ValueRef::new(self.src, ctx)
         )
     }
 
@@ -147,7 +157,7 @@ impl MnemonicKind for FloatToFloat {
             f,
             "float2float(f{}, {});",
             self.size * 8,
-            ctx.get_value(self.src)
+            ValueRef::new(self.src, ctx)
         )
     }
 
@@ -168,7 +178,12 @@ impl MnemonicKind for FloatToInt {
     }
 
     fn fmt(&self, f: &mut Formatter<'_>, ctx: &Context<'_>) -> std::fmt::Result {
-        write!(f, "trunc(i{}, {});", self.size * 8, ctx.get_value(self.src))
+        write!(
+            f,
+            "trunc(i{}, {});",
+            self.size * 8,
+            ValueRef::new(self.src, ctx)
+        )
     }
 
     fn args(&self) -> Vec<ValueId> {
@@ -180,83 +195,145 @@ impl MnemonicKind for FloatToInt {
 mod tests {
     use qcode_macro::qcode;
 
-    use crate::{
-        builder::Builder,
-        value::insn::{Instruction, InstructionId, Mnemonic},
-    };
+    use crate::value::insn::{Instruction, Mnemonic};
 
     use super::*;
 
-    macro_rules! assert_cast {
-        ($expr:literal, $match_pat:pat, $expected_stmt:literal, $size:expr) => {{
-            let mut ctx = Context::new();
-            let mut builder = Builder::from_context(&mut ctx, 0x1000);
-
-            qcode!(builder, "local i32 v0 as V0");
-            let v1: InstructionId = qcode!(builder, $expr);
-            builder.finalize(0x1001);
-
-            match ctx.values.instructions[v1].clone() {
-                Instruction {
-                    mnemonic: $match_pat,
-                    size: $size,
-                    ..
-                } => {}
-
-                _ => panic!("expected cast instruction"),
-            }
-
-            assert_eq!(ctx.get_insn(v1).as_statement().to_string(), $expected_stmt);
-        }};
-    }
-
     #[test]
     fn test_zext_display() {
-        assert_cast!(
-            "zext(i64, i32 {v0})",
-            Mnemonic::Zext(Zext { size: 8, .. }),
-            "i64 %tmp1 = zext(i64, i32 %v0);",
-            8
+        let mut ctx = Context::new();
+
+        qcode!(
+            ctx,
+            "
+            <block>
+                local i32 V0;
+                %v0 = load(i32, V0);
+                i64 %v = zext(i64, i32 %v0);
+                goto <0x1001>;
+            "
         );
+
+        let v = Instruction::from_id(&ctx, v);
+
+        if !matches!(v.mnemonic(), Mnemonic::Zext(Zext { size: 8, .. })) {
+            panic!("expected zext instruction");
+        }
+
+        assert_eq!(v.as_statement().to_string(), "i64 %v = zext(i64, i32 %v0);");
     }
 
     #[test]
     fn test_sext_display() {
-        assert_cast!(
-            "sext(i64, i32 {v0})",
-            Mnemonic::Sext(Sext { size: 8, .. }),
-            "i64 %tmp1 = sext(i64, i32 %v0);",
-            8
+        let mut ctx = Context::new();
+
+        qcode!(
+            ctx,
+            "
+            <block>
+                local i32 V0;
+                %v0 = load(i32, V0);
+                i64 %v = sext(i64, i32 %v0);
+                goto <0x1001>;
+            "
         );
+
+        let v = Instruction::from_id(&ctx, v);
+
+        if !matches!(v.mnemonic(), Mnemonic::Sext(Sext { size: 8, .. })) {
+            panic!("expected sext instruction");
+        }
+
+        assert_eq!(v.as_statement().to_string(), "i64 %v = sext(i64, i32 %v0);");
     }
 
     #[test]
     fn test_int2float_display() {
-        assert_cast!(
-            "int2float(f32, i32 {v0})",
-            Mnemonic::IntToFloat(IntToFloat { size: 4, .. }),
-            "i32 %tmp1 = int2float(f32, i32 %v0);",
-            4
+        let mut ctx = Context::new();
+
+        qcode!(
+            ctx,
+            "
+            <block>
+                local i32 V0;
+                %v0 = load(i32, V0);
+                i64 %v = int2float(f32, i32 %v0);
+                goto <0x1001>;
+            "
+        );
+
+        let v = Instruction::from_id(&ctx, v);
+
+        if !matches!(
+            v.mnemonic(),
+            Mnemonic::IntToFloat(IntToFloat { size: 4, .. })
+        ) {
+            panic!("expected int2float instruction");
+        }
+
+        assert_eq!(
+            v.as_statement().to_string(),
+            "i32 %v = int2float(f32, i32 %v0);"
         );
     }
 
     #[test]
     fn test_float2float_display() {
-        assert_cast!(
-            "float2float(f64, i32 {v0})",
-            Mnemonic::FloatToFloat(FloatToFloat { size: 8, .. }),
-            "i64 %tmp1 = float2float(f64, i32 %v0);",
-            8
+        let mut ctx = Context::new();
+
+        qcode!(
+            ctx,
+            "
+            <block>
+                local i32 V0;
+                %v0 = load(i32, V0);
+                i64 %v = float2float(f64, i32 %v0);
+                goto <0x1001>;
+            "
+        );
+
+        let v = Instruction::from_id(&ctx, v);
+
+        if !matches!(
+            v.mnemonic(),
+            Mnemonic::FloatToFloat(FloatToFloat { size: 8, .. })
+        ) {
+            panic!("expected float2float instruction");
+        }
+
+        assert_eq!(
+            v.as_statement().to_string(),
+            "i64 %v = float2float(f64, i32 %v0);"
         );
     }
 
     #[test]
     fn test_trunc_display() {
-        assert_cast!(
-            "trunc(i16, i32 {v0})",
-            Mnemonic::FloatToInt(FloatToInt { size: 2, .. }),
-            "i16 %tmp1 = trunc(i16, i32 %v0);",
-            2
+        let mut ctx = Context::new();
+
+        qcode!(
+            ctx,
+            "
+            <block>
+                local i32 V0;
+                %v0 = load(i32, V0);
+                i16 %v = trunc(i16, i32 %v0);
+                goto <0x1001>;
+            "
+        );
+
+        let v = Instruction::from_id(&ctx, v);
+
+        if !matches!(
+            v.mnemonic(),
+            Mnemonic::FloatToInt(FloatToInt { size: 2, .. })
+        ) {
+            panic!("expected float2int instruction");
+        }
+
+        assert_eq!(
+            v.as_statement().to_string(),
+            "i16 %v = trunc(i16, i32 %v0);"
         );
     }
 
@@ -264,7 +341,7 @@ mod tests {
     fn test_zext_eval() {
         // zero-extend preserves low bytes, masks off anything above dst_size
         assert_eq!(Zext::eval(0xFF, 4), 0xFF);
-        assert_eq!(Zext::eval(0xDEAD_BEEF_FF_FF_FF_FF, 4), 0xFFFF_FFFF);
+        assert_eq!(Zext::eval(0xDEAD_BEEF_FFFF_FFFF, 4), 0xFFFF_FFFF);
         assert_eq!(Zext::eval(0, 8), 0);
     }
 

@@ -1,7 +1,10 @@
 use crate::{
     context::Context,
     space::{Space, SpaceId, SpaceType},
-    value::{Renameable, varnode::{Varnode, VarnodeId}},
+    value::{
+        Renameable,
+        varnode::{Varnode, VarnodeId},
+    },
 };
 
 /// A minimal [`Context`] with a register space and a small set of named varnodes,
@@ -35,7 +38,7 @@ pub struct TestContext {
     pub r3: VarnodeId,
 
     /// Sub-registers of `r0`, useful for testing partial-overlap scenarios.
-    pub r0_lo32: VarnodeId,  // 4 bytes at offset 0
+    pub r0_lo32: VarnodeId, // 4 bytes at offset 0
     pub r0_lo16: VarnodeId,  // 2 bytes at offset 0
     pub r0_byte0: VarnodeId, // 1 byte at offset 0
     pub r0_byte1: VarnodeId, // 1 byte at offset 1
@@ -48,7 +51,7 @@ impl TestContext {
         let mut reg_space_def = Space::new(Some("register"), 1, 4);
         reg_space_def.ty = SpaceType::Register;
         let reg_space = ctx.spaces.push(reg_space_def);
-        ctx.named_spaces.insert("register", reg_space);
+        ctx.named_spaces.insert(Box::from("register"), reg_space);
 
         let make = |ctx: &mut Context<'static>, offset: i64, size: usize, name: &'static str| {
             Varnode::make(ctx, offset, size, reg_space)

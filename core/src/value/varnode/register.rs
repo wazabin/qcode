@@ -1,12 +1,14 @@
 use crate::space::SpaceId;
 use jstd::{Identifier, registry::Identified};
+use serde::{Deserialize, Serialize};
 
 #[derive(Identifier)]
 pub struct RegisterId(usize);
 
 /// A PCode register
-pub struct Register<'a> {
-    pub name: &'a str,
+#[derive(Serialize, Deserialize)]
+pub struct Register {
+    pub name: Box<str>,
 
     /// The name of the space this register is a part of
     pub space: SpaceId,
@@ -18,6 +20,6 @@ pub struct Register<'a> {
     pub size: usize,
 }
 
-pub type RegisterRef<'a, 'b> = Identified<RegisterId, &'b Register<'a>>;
+pub type RegisterRef<'b> = Identified<RegisterId, &'b Register>;
 
-pub type RegisterMutRef<'a, 'b> = Identified<RegisterId, &'b mut Register<'a>>;
+pub type RegisterMutRef<'b> = Identified<RegisterId, &'b mut Register>;
