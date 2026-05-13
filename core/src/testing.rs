@@ -51,7 +51,7 @@ impl TestContext {
         let mut reg_space_def = Space::new(Some("register"), 1, 4);
         reg_space_def.ty = SpaceType::Register;
         let reg_space = ctx.spaces.push(reg_space_def);
-        ctx.named_spaces.insert("register", reg_space);
+        ctx.named_spaces.insert(Box::from("register"), reg_space);
 
         let make = |ctx: &mut Context<'static>, offset: i64, size: usize, name: &'static str| {
             Varnode::make(ctx, offset, size, reg_space)

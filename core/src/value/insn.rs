@@ -136,7 +136,7 @@ where
     }
 
     /// The address-space provenance for this instruction's result, if known.
-    pub fn space(&'s self) -> Option<SpaceRef<'str, 'ctx>> {
+    pub fn space(&'s self) -> Option<SpaceRef<'ctx>> {
         self.inner().space.map(|id| Space::from_id(self.ctx(), id))
     }
 

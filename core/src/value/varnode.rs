@@ -106,7 +106,7 @@ where
     }
 
     /// The space this varnode belongs to.
-    pub fn space(&'s self) -> SpaceRef<'str, 'ctx> {
+    pub fn space(&'s self) -> SpaceRef<'ctx> {
         Space::from_id(self.ctx(), self.inner().space)
     }
 

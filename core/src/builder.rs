@@ -331,7 +331,7 @@ impl<'str, 'ctx> Builder<'str, 'ctx> {
         Varnode::from_id_mut(self.context_mut(), id)
             .rename(unique_name.clone())
             .expect("This name was deduplicated");
-        self.context_mut().spaces[space].name = Some(unique_name);
+        self.context_mut().spaces[space].name = Some(unique_name.as_ref().into());
         id
     }
 
@@ -431,7 +431,6 @@ impl<'str, 'ctx> Builder<'str, 'ctx> {
                 _ => {}
             }
 
-            let size = ValueRef::new(src, self.context()).size();
             self.push_instruction(
                 Mnemonic::Load(Load {
                     ptr: src,

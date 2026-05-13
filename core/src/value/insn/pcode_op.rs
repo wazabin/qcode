@@ -4,11 +4,12 @@ use crate::{
     value::{ValueId, ValueRef},
 };
 use jstd::Identifier;
+use serde::{Deserialize, Serialize};
 
 #[derive(Identifier)]
 pub struct PCodeOpId(usize);
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct PCodeOp {
     pub id: PCodeOpId,
     pub args: Vec<ValueId>,
@@ -21,7 +22,7 @@ impl MnemonicKind for PCodeOp {
     }
 
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>, ctx: &Context<'_>) -> std::fmt::Result {
-        let op = ctx.pcode_ops[self.id];
+        let op = &ctx.pcode_ops[self.id];
         let args = self
             .args
             .iter()

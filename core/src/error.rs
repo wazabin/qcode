@@ -1,4 +1,4 @@
-use common::parsing::Rule;
+use common::raw_parsing::Rule;
 use pest::Span;
 use std::{fmt::Display, ops::Range};
 
@@ -33,7 +33,7 @@ pub enum ErrorTy<'str> {
     /// Attempted to set a name that already exists in the current scope
     NameAlreadyExists(&'str str),
 
-    UnknownMacro(&'str str),
+    UnknownMacro(Box<str>),
 
     UnknownAddress(u64),
 
@@ -139,7 +139,7 @@ impl<'str> Error<'str> {
     }
 
     pub fn unknown_macro(name: &'str str, span: Span<'str>) -> Self {
-        Self::new(ErrorTy::UnknownMacro(name), span)
+        Self::new(ErrorTy::UnknownMacro(name.into()), span)
     }
 
     pub fn multiple_exports(span: Span<'str>) -> Self {

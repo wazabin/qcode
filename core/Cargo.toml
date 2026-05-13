@@ -14,3 +14,4 @@ common.workspace = true
 jstd.workspace = true
 pest.workspace = true
 qcode_macro.workspace = true
+serde.workspace = true

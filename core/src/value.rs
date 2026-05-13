@@ -21,6 +21,7 @@
 //! generics.
 
 use crate::{context::Context, space::SpaceRef};
+use serde::{Deserialize, Serialize};
 use std::fmt::{Debug, Display, Formatter};
 
 pub use block::{BasicBlock, BlockId, BlockMutRef, BlockRef};
@@ -55,7 +56,7 @@ pub mod varnode;
 /// `ValueId` is `#[non_exhaustive]`; new variants may be added in future
 /// versions without a major semver bump.
 #[non_exhaustive]
-#[derive(Debug, Clone, Copy, Hash, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Hash, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ValueId {
     /// A compile-time integer constant, optionally carrying a symbolic label.
     Literal(LiteralId),
@@ -298,7 +299,7 @@ impl<'str, 'ctx> ValueRef<'str, 'ctx> {
         Self::new(id, ctx)
     }
 
-    pub fn space(&self) -> Option<SpaceRef<'str, 'ctx>> {
+    pub fn space(&self) -> Option<SpaceRef<'ctx>> {
         match self {
             ValueRef::Varnode(v) => Some(v.space()),
             ValueRef::Instruction(i) => i.space(),
