@@ -104,7 +104,7 @@ impl<'str> Function<'str> {
     pub fn make<'ctx>(
         ctx: &'ctx mut Context<'str>,
         name: Cow<'str, str>,
-    ) -> Result<'str, FunctionMutRef<'str, 'ctx>> {
+    ) -> Result<FunctionMutRef<'str, 'ctx>> {
         let id = ctx.values.push_function(Function::new(name.clone()));
         ctx.update_name(name, id.into(), None)?;
         Ok(Self::from_id_mut(ctx, id))
@@ -319,7 +319,7 @@ impl Named for FunctionMutRef<'_, '_> {
 }
 
 impl<'str, 'ctx> Renameable<'str, 'ctx> for FunctionMutRef<'str, 'ctx> {
-    fn rename(&mut self, name: Cow<'str, str>) -> Result<'str, ()> {
+    fn rename(&mut self, name: Cow<'str, str>) -> Result<()> {
         let id = self.id();
         let old_name = self.ctx.values.functions[self.id].name.as_ref().to_owned();
         update_context_name(id, self.ctx, name.clone(), Some(old_name.as_ref()))?;
@@ -333,12 +333,12 @@ impl<'str, 'ctx> FunctionMutRef<'str, 'ctx> {
         &mut self.ctx.values.functions[self.id]
     }
 
-    fn set_address(&mut self, address: u64) -> Result<'str, ()> {
+    fn set_address(&mut self, address: u64) -> Result<()> {
         self.inner_mut().address = Some(address);
         self.ctx.set_address(address, self.id.into())
     }
 
-    fn with_address(mut self, address: u64) -> Result<'str, Self> {
+    fn with_address(mut self, address: u64) -> Result<Self> {
         self.set_address(address)?;
         Ok(self)
     }
@@ -347,7 +347,7 @@ impl<'str, 'ctx> FunctionMutRef<'str, 'ctx> {
     /// This will also add the block to the function's block list if it's not already present.
     /// This will also set the address of the function/block to the address of the root block/function if both addresses are unset.
     /// Panics if the function already has an address that doesn't match the root block's address.
-    pub fn set_root(&mut self, id: BlockId) -> Result<'str, ()> {
+    pub fn set_root(&mut self, id: BlockId) -> Result<()> {
         self.add_block(id);
         self.inner_mut().root = Some(id);
 
@@ -381,7 +381,7 @@ impl<'str, 'ctx> FunctionMutRef<'str, 'ctx> {
         BlockRef::new(self.ctx, root)
     }
 
-    pub fn ensure_root(&mut self, id: BlockId) -> Result<'str, ()> {
+    pub fn ensure_root(&mut self, id: BlockId) -> Result<()> {
         if let Some(root) = self.inner().root {
             if root != id {
                 return Err(Error::spanless(ErrorTy::FunctionRootMismatch {

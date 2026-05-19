@@ -295,7 +295,7 @@ impl<'str, 'ctx> Value<'str, 'ctx> for InstructionMutRef<'str, 'ctx> {
 }
 
 impl<'str, 'ctx> Renameable<'str, 'ctx> for InstructionMutRef<'str, 'ctx> {
-    fn rename(&mut self, name: Cow<'str, str>) -> Result<'str, ()> {
+    fn rename(&mut self, name: Cow<'str, str>) -> Result<()> {
         let id = self.id();
         let old_name = self.inner_mut().name.take();
         update_context_name(id, self.ctx_mut(), name.clone(), old_name.as_deref())?;

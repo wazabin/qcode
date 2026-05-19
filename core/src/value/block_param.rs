@@ -209,7 +209,7 @@ impl<'str, 'ctx> Value<'str, 'ctx> for BlockParamMutRef<'str, 'ctx> {
 }
 
 impl<'str, 'ctx> Renameable<'str, 'ctx> for BlockParamMutRef<'str, 'ctx> {
-    fn rename(&mut self, name: Cow<'str, str>) -> Result<'str, ()> {
+    fn rename(&mut self, name: Cow<'str, str>) -> Result<()> {
         let id = self.id.into();
         let old_name = self.inner_mut().name.take();
         update_context_name(id, self.ctx, name.clone(), old_name.as_deref())?;

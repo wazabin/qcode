@@ -282,7 +282,7 @@ impl Named for BlockMutRef<'_, '_> {
 }
 
 impl<'str, 'ctx> Renameable<'str, 'ctx> for BlockMutRef<'str, 'ctx> {
-    fn rename(&mut self, name: Cow<'str, str>) -> Result<'str, ()> {
+    fn rename(&mut self, name: Cow<'str, str>) -> Result<()> {
         let id = self.id.into();
         let old_name = self.ctx.values.basic_blocks[self.id]
             .name
@@ -522,7 +522,7 @@ impl<'str, 'ctx> BlockMutRef<'str, 'ctx> {
     /// Associates this block with `addr` in the context address map.
     /// Names the block after `addr` if it doesn't already have a name.
     /// Returns `Err` if another value is already mapped to `addr`.
-    pub fn set_address(&mut self, addr: u64) -> Result<'str, ()> {
+    pub fn set_address(&mut self, addr: u64) -> Result<()> {
         self.inner_mut().address = Some(addr);
         self.ctx.set_address(addr, self.id.into())?;
 

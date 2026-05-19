@@ -16,7 +16,7 @@ pub fn update_context_name<'str>(
     ctx: &mut Context<'str>,
     name: Cow<'str, str>,
     old_name: Option<&str>,
-) -> Result<'str, ()> {
+) -> Result<()> {
     if let Some(existing_id) = ctx.get_named(&name) {
         if existing_id != id {
             Err(Error::spanless(ErrorTy::DuplicateName(name.to_string())))
@@ -29,9 +29,9 @@ pub fn update_context_name<'str>(
 }
 
 pub trait Renameable<'str, 'ctx>: Named {
-    fn rename(&mut self, name: Cow<'str, str>) -> Result<'str, ()>;
+    fn rename(&mut self, name: Cow<'str, str>) -> Result<()>;
 
-    fn with_name(mut self, name: Cow<'str, str>) -> Result<'str, Self>
+    fn with_name(mut self, name: Cow<'str, str>) -> Result<Self>
     where
         Self: Sized,
     {

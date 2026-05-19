@@ -286,7 +286,7 @@ impl<'str> Context<'str> {
     /// Returns `Err(Error::DuplicateAddress(addr))` if the address is already
     /// mapped. Callers that have already checked (e.g. via
     /// [`get_at_addr`](Self::get_at_addr)) may safely `.expect(...)` the result.
-    pub(crate) fn set_address(&mut self, addr: u64, id: ValueId) -> crate::error::Result<'str, ()> {
+    pub(crate) fn set_address(&mut self, addr: u64, id: ValueId) -> crate::error::Result<()> {
         if let Some(existing) = self.address_map.insert(addr, id) {
             // The only case where duplicates are allowed are for a function and its root block sharing an address
             // In that case, the function address should be kept.
@@ -319,7 +319,7 @@ impl<'str> Context<'str> {
         name: Cow<'str, str>,
         id: ValueId,
         old_name: Option<&str>,
-    ) -> Result<'str, ()> {
+    ) -> Result<()> {
         if let Some(old_name) = old_name {
             self.name_map.remove(old_name);
         }

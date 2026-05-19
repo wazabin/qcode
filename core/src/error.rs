@@ -1,11 +1,9 @@
-use common::raw_parsing::Rule;
-use pest::Span;
 use std::{fmt::Display, ops::Range};
 
 use crate::value::{BlockId, ValueId};
 
 #[derive(Debug, PartialEq, Eq)]
-pub enum ErrorTy<'str> {
+pub enum ErrorTy {
     RangeOutOfBounds {
         range: Range<usize>,
         available: usize,
@@ -20,7 +18,7 @@ pub enum ErrorTy<'str> {
     UnknownSize,
 
     /// Unknown name in an expression
-    UnknownIdentifier(&'str str, &'static str),
+    UnknownIdentifier(Box<str>, &'static str),
 
     SizeMismatch {
         expected: usize,
@@ -31,7 +29,7 @@ pub enum ErrorTy<'str> {
     TriedToNameLiteral,
 
     /// Attempted to set a name that already exists in the current scope
-    NameAlreadyExists(&'str str),
+    NameAlreadyExists(Box<str>),
 
     UnknownMacro(Box<str>),
 
@@ -49,7 +47,7 @@ pub enum ErrorTy<'str> {
     /// A macro argument is not const
     NonConstArgument,
 
-    MissingArgument(&'str str),
+    MissingArgument(Box<str>),
 
     /// A name was registered but a value with that name already exists
     DuplicateName(String),
@@ -70,41 +68,42 @@ pub enum ErrorTy<'str> {
 }
 
 #[derive(Debug)]
-pub struct Error<'str> {
-    pub ty: ErrorTy<'str>,
-    pub span: Option<Span<'str>>,
+pub struct Error {
+    pub ty: ErrorTy,
+    /// Byte range `(start, end)` into the prepared source, if available.
+    pub span: Option<(usize, usize)>,
 }
 
-pub type Result<'str, T> = std::result::Result<T, Error<'str>>;
+pub type Result<T> = std::result::Result<T, Error>;
 
-impl<'str> std::error::Error for Error<'str> {}
+impl std::error::Error for Error {}
 
-impl<'str> PartialEq for Error<'str> {
+impl PartialEq for Error {
     fn eq(&self, other: &Self) -> bool {
         self.ty == other.ty
     }
 }
 
-impl<'str> Eq for Error<'str> {}
+impl Eq for Error {}
 
-impl<'str> Error<'str> {
-    pub fn new(ty: ErrorTy<'str>, span: Span<'str>) -> Self {
+impl Error {
+    pub fn new(ty: ErrorTy, span: (usize, usize)) -> Self {
         Self {
             ty,
             span: Some(span),
         }
     }
 
-    pub fn with_span(mut self, span: Span<'str>) -> Self {
+    pub fn with_span(mut self, span: (usize, usize)) -> Self {
         self.span = Some(span);
         self
     }
 
-    pub fn spanless(ty: ErrorTy<'str>) -> Self {
+    pub fn spanless(ty: ErrorTy) -> Self {
         Self { ty, span: None }
     }
 
-    pub fn range_out_of_bounds(range: Range<usize>, span: Span<'str>) -> Self {
+    pub fn range_out_of_bounds(range: Range<usize>, span: (usize, usize)) -> Self {
         Self::new(
             ErrorTy::RangeOutOfBounds {
                 range,
@@ -114,56 +113,56 @@ impl<'str> Error<'str> {
         )
     }
 
-    pub fn argument_count_mismatch(expected: usize, actual: usize, span: Span<'str>) -> Self {
+    pub fn argument_count_mismatch(expected: usize, actual: usize, span: (usize, usize)) -> Self {
         Self::new(ErrorTy::ArgumentCountMismatch { expected, actual }, span)
     }
 
-    pub fn unknown_size(span: Span<'str>) -> Self {
+    pub fn unknown_size(span: (usize, usize)) -> Self {
         Self::new(ErrorTy::UnknownSize, span)
     }
 
-    pub fn unknown_identifier(name: &'str str, ty: &'static str, span: Span<'str>) -> Self {
-        Self::new(ErrorTy::UnknownIdentifier(name, ty), span)
+    pub fn unknown_identifier(name: &str, ty: &'static str, span: (usize, usize)) -> Self {
+        Self::new(ErrorTy::UnknownIdentifier(name.into(), ty), span)
     }
 
-    pub fn size_mismatch(expected: usize, actual: usize, span: Span<'str>) -> Self {
+    pub fn size_mismatch(expected: usize, actual: usize, span: (usize, usize)) -> Self {
         Self::new(ErrorTy::SizeMismatch { expected, actual }, span)
     }
 
-    pub fn tried_to_name_literal(span: Span<'str>) -> Self {
+    pub fn tried_to_name_literal(span: (usize, usize)) -> Self {
         Self::new(ErrorTy::TriedToNameLiteral, span)
     }
 
-    pub fn name_already_exists(name: &'str str, span: Span<'str>) -> Self {
-        Self::new(ErrorTy::NameAlreadyExists(name), span)
+    pub fn name_already_exists(name: &str, span: (usize, usize)) -> Self {
+        Self::new(ErrorTy::NameAlreadyExists(name.into()), span)
     }
 
-    pub fn unknown_macro(name: &'str str, span: Span<'str>) -> Self {
+    pub fn unknown_macro(name: &str, span: (usize, usize)) -> Self {
         Self::new(ErrorTy::UnknownMacro(name.into()), span)
     }
 
-    pub fn multiple_exports(span: Span<'str>) -> Self {
+    pub fn multiple_exports(span: (usize, usize)) -> Self {
         Self::new(ErrorTy::MultipleExports, span)
     }
 
-    pub fn export_not_last(span: Span<'str>) -> Self {
+    pub fn export_not_last(span: (usize, usize)) -> Self {
         Self::new(ErrorTy::ExportNotLast, span)
     }
 
-    pub fn function_is_a_statement(span: Span<'str>) -> Self {
+    pub fn function_is_a_statement(span: (usize, usize)) -> Self {
         Self::new(ErrorTy::FunctionStatement, span)
     }
 
-    pub fn missing_argument(name: &'str str, span: Span<'str>) -> Self {
-        Self::new(ErrorTy::MissingArgument(name), span)
+    pub fn missing_argument(name: &str, span: (usize, usize)) -> Self {
+        Self::new(ErrorTy::MissingArgument(name.into()), span)
     }
 
-    pub fn non_const_arg(span: Span<'str>) -> Self {
+    pub fn non_const_arg(span: (usize, usize)) -> Self {
         Self::new(ErrorTy::NonConstArgument, span)
     }
 }
 
-impl Display for Error<'_> {
+impl Display for Error {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let message = match &self.ty {
             ErrorTy::RangeOutOfBounds { range, available } => {
@@ -228,16 +227,10 @@ impl Display for Error<'_> {
             }
         };
 
-        match self.span {
-            Some(span) => write!(
-                f,
-                "{}",
-                pest::error::Error::<Rule>::new_from_span(
-                    pest::error::ErrorVariant::CustomError { message },
-                    span
-                )
-            ),
-            None => write!(f, "{message}"),
+        if let Some((start, end)) = self.span {
+            write!(f, "{message} (bytes {start}..{end})")
+        } else {
+            write!(f, "{message}")
         }
     }
 }
