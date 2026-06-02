@@ -43,7 +43,10 @@ impl LzCount {
         } else {
             (masked << (u128::BITS as usize - bits)).leading_zeros() as u64
         };
-        u128::from(count)
+        // A zero value has no set bit inside the window, so `leading_zeros` runs
+        // past the operand and reports the full u128 width. Clamp to the operand
+        // bit-width (a no-op for any non-zero value).
+        u128::from(count.min(bits as u64))
     }
 }
 

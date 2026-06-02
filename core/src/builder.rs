@@ -30,7 +30,7 @@
 //! the parser to resolve identifiers within a single block. Names in the
 //! namespace do not need to match the IR-level name hints stored on values.
 
-use std::{borrow::Cow, collections::HashMap};
+use std::{borrow::Cow, cmp, collections::HashMap};
 
 use crate::{
     context::Context,
@@ -746,13 +746,14 @@ impl<'str, 'ctx> Builder<'str, 'ctx> {
         id: PCodeOpId,
         args: Vec<ValueId>,
         dst: Option<ValueId>,
+        size: usize,
     ) -> InstructionRef<'str, '_> {
         let args = args
             .into_iter()
             .map(|arg| self.ensure_local(arg))
             .collect::<Vec<_>>();
 
-        self.push_instruction(Mnemonic::PCodeOp(PCodeOp { id, args, dst }), 0)
+        self.push_instruction(Mnemonic::PCodeOp(PCodeOp { id, args, dst }), size)
     }
 
     // --- Loads & Stores ---
@@ -770,25 +771,21 @@ impl<'str, 'ctx> Builder<'str, 'ctx> {
         const LANE_SIZE: usize = 8;
 
         if size > LANE_SIZE {
-            assert!(
-                size.is_multiple_of(LANE_SIZE),
-                "push_copy: value size {size} is not a multiple of {LANE_SIZE} bytes"
-            );
-
-            let num_lanes = size / LANE_SIZE;
+            let num_lanes = size.div_ceil(LANE_SIZE);
             let mut first_id = None;
 
             for lane in 0..num_lanes {
                 let offset = lane * LANE_SIZE;
+                let lane_size = cmp::min(LANE_SIZE, size - offset);
 
                 let src_lane = self
-                    .get_range(src, offset..offset + LANE_SIZE)
+                    .get_range(src, offset..offset + lane_size)
                     .expect("lane range in bounds")
                     .id();
                 let src_lane = self.ensure_local(src_lane);
 
                 let dst_lane = self
-                    .get_range(dst.into(), offset..offset + LANE_SIZE)
+                    .get_range(dst.into(), offset..offset + lane_size)
                     .expect("lane range in bounds")
                     .id();
 
@@ -798,7 +795,7 @@ impl<'str, 'ctx> Builder<'str, 'ctx> {
                             src: src_lane,
                             ptr: dst_lane,
                             space,
-                            size: LANE_SIZE,
+                            size: lane_size,
                         }),
                         0,
                         Some(space),
@@ -1261,5 +1258,28 @@ mod tests {
         let insn = Instruction::from_id(&ctx, not_insn_id);
 
         assert_eq!(insn.address().unwrap(), 0x1000);
+    }
+
+    #[test]
+    fn push_copy_supports_partial_final_lane() {
+        let mut ctx = Context::new();
+        let block_id = ctx.get_or_make_block(0x1000);
+
+        {
+            let mut builder = Builder::from_block(BasicBlock::from_id_mut(&mut ctx, block_id));
+            let src = builder.make_named_temp("src".into(), 9);
+            let dst = builder.make_named_temp("dst".into(), 9);
+            builder.push_copy(src.into(), dst);
+            builder.finalize(0x1001);
+        }
+
+        let store_sizes = BasicBlock::from_id(&ctx, block_id)
+            .iter()
+            .filter_map(|insn| match insn.mnemonic() {
+                Mnemonic::Store(store) => Some(store.size),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(store_sizes, [8, 1]);
     }
 }

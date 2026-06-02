@@ -63,6 +63,8 @@ pub enum EmulatorErrorKind {
     UnknownRegister(RegisterId),
     /// Attempted to read from a memory space that has not been initialised
     UnknownSpace(SpaceId),
+    /// Encountered an architecture-specific p-code operation without an emulator implementation
+    UnsupportedPCodeOp(Box<str>),
 }
 
 impl std::fmt::Display for EmulatorErrorKind {
@@ -79,6 +81,7 @@ impl std::fmt::Display for EmulatorErrorKind {
             Self::ValueError(value) => write!(f, "value {value} is too large to represent"),
             Self::UnknownRegister(reg) => write!(f, "register {reg:?} not found in context"),
             Self::UnknownSpace(space) => write!(f, "memory space {space:?} not initialised"),
+            Self::UnsupportedPCodeOp(op) => write!(f, "unsupported p-code operation `{op}`"),
         }
     }
 }
@@ -113,6 +116,7 @@ pub trait DomainValue: Clone + Copy {
     fn zext(&self, size: usize) -> std::result::Result<Self, EmulatorErrorKind>;
     fn sext(&self, size: usize) -> std::result::Result<Self, EmulatorErrorKind>;
     fn range(&self, start: usize, size: usize) -> std::result::Result<Self, EmulatorErrorKind>;
+    fn byte_swap(&self) -> std::result::Result<Self, EmulatorErrorKind>;
 
     fn pop_count(&self) -> std::result::Result<Self, EmulatorErrorKind>;
     fn lz_count(&self) -> std::result::Result<Self, EmulatorErrorKind>;
@@ -404,7 +408,13 @@ pub trait Interpreter {
             }
 
             // ===== Other operations =====
-            Mnemonic::PCodeOp(_) => None,
+            Mnemonic::PCodeOp(op) => {
+                let name = self.ctx().pcode_ops[op.id].clone();
+                match (name.as_ref(), op.args.as_slice()) {
+                    ("swap_bytes", [src]) => Some(self.get_value(*src)?.byte_swap()?),
+                    _ => return Err(EmulatorErrorKind::UnsupportedPCodeOp(name)),
+                }
+            }
 
             _ => todo!("unimplemented mnemonic: {:?}", insn.mnemonic()),
         };

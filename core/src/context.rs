@@ -100,12 +100,9 @@ impl<'str> Context<'str> {
     /// Creates a new temporary address space and returns its ID.
     pub fn make_temp_space(&mut self) -> SpaceId {
         let default_space = &self.spaces[self.default_space];
-
-        self.spaces.push(Space::new(
-            None,
-            default_space.word_size,
-            default_space.addr_size,
-        ))
+        let mut space = Space::new(None, default_space.word_size, default_space.addr_size);
+        space.ty = crate::space::SpaceType::Temporary;
+        self.spaces.push(space)
     }
 
     /// Adds a space to the context, registering its name, and returns its ID.
@@ -136,7 +133,7 @@ impl<'str> Context<'str> {
             name: Some(name.into()),
             word_size,
             addr_size,
-            ty: crate::space::SpaceType::Ram,
+            ty: crate::space::SpaceType::Temporary,
         })
     }
 

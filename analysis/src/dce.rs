@@ -167,7 +167,7 @@ mod tests {
         let dead = {
             let (ctx, block_id) = build_block(|b| {
                 let op_id: PCodeOpId = b.context_mut().pcode_ops.push(Box::from("syscall"));
-                b.push_pcode_op(op_id, vec![], None);
+                b.push_pcode_op(op_id, vec![], None, 0);
             });
             dead_insns(&ctx, block_id)
         };

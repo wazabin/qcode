@@ -1,7 +1,7 @@
 use crate::{DomainMemory, EmulatorError, EmulatorErrorKind, Interpreter};
 use qcode::{
     context::Context,
-    space::SpaceId,
+    space::{Space, SpaceId, SpaceType},
     value::{
         BasicBlock, BlockId, BlockParamId, BlockRef, Function, FunctionId, Instruction, Value,
         ValueId, ValueRef, Varnode,
@@ -13,7 +13,10 @@ use qcode::{
         varnode::{VarnodeId, register::RegisterId},
     },
 };
-use std::{cmp, collections::HashMap};
+use std::{
+    cmp,
+    collections::{HashMap, HashSet},
+};
 
 use super::DomainValue;
 
@@ -60,6 +63,18 @@ impl EmulatedSpace {
 
         Ok(res)
     }
+
+    /// Reads a little-endian unsigned integer, treating missing bytes as zero.
+    pub fn read_u128_zero_filled(&self, addr: u64, size: u64) -> u128 {
+        let mut res = 0u128;
+
+        for cur in addr..addr + cmp::min(size, 16) {
+            let byte = self.0.get(&cur).copied().unwrap_or(0);
+            res |= u128::from(byte) << ((cur - addr) * 8);
+        }
+
+        res
+    }
 }
 
 /// An exclusive region of an emulated space, used for reading/writing a contiguous range of addresses in a space.
@@ -98,9 +113,32 @@ impl<'space> EmulatedSpaceRegion<'space> {
 #[derive(Debug, Default, Clone)]
 pub struct EmulatedMemory {
     spaces: HashMap<SpaceId, EmulatedSpace>,
+    zero_filled_spaces: HashSet<SpaceId>,
+    /// Space count the zero-fill set was last built for. Spaces are append-only
+    /// and their type is fixed at creation, so an unchanged count means the set
+    /// is still valid — this keeps the per-step call O(1) instead of rescanning.
+    configured_space_count: Option<usize>,
 }
 
 impl EmulatedMemory {
+    fn configure_spaces(&mut self, ctx: &Context<'_>) {
+        let space_count = ctx.space_count();
+        if self.configured_space_count == Some(space_count) {
+            return;
+        }
+        self.zero_filled_spaces.clear();
+        for index in 0..space_count {
+            let id = SpaceId::from(index);
+            if matches!(
+                Space::from_id(ctx, id).ty,
+                SpaceType::Register | SpaceType::Temporary
+            ) {
+                self.zero_filled_spaces.insert(id);
+            }
+        }
+        self.configured_space_count = Some(space_count);
+    }
+
     fn read_raw(
         &self,
         space: SpaceId,
@@ -265,6 +303,16 @@ impl DomainValue for SizedValue {
             Range::eval(self.as_bits(), start, size),
             size,
         ))
+    }
+
+    fn byte_swap(&self) -> Result<Self, EmulatorErrorKind> {
+        let size = self.size as usize;
+        let mut value = 0u128;
+        for index in 0..size {
+            let byte = (self.as_bits() >> (index * 8)) & 0xff;
+            value |= byte << ((size - index - 1) * 8);
+        }
+        Ok(Self::from_bits(value, size))
     }
 
     fn pop_count(&self) -> Result<Self, EmulatorErrorKind> {
@@ -604,9 +652,11 @@ impl DomainMemory for EmulatedMemory {
     ) -> Result<Self::V, EmulatorErrorKind> {
         let addr = addr.value()?;
         let bits = match self.spaces.get(&space) {
+            Some(s) if self.zero_filled_spaces.contains(&space) => {
+                s.read_u128_zero_filled(addr, size as u64)
+            }
             Some(s) => s.read_u128(addr, size as u64)?,
-            // Temp spaces (SpaceId >= 2) are per-varnode; uninitialized reads return zero.
-            None if usize::from(space) >= 2 => 0,
+            None if self.zero_filled_spaces.contains(&space) => 0,
             None => return Err(EmulatorErrorKind::UnknownSpace(space)),
         };
         Ok(SizedValue::from_bits(bits, size))
@@ -674,7 +724,9 @@ impl StandaloneEmulator {
 
     pub fn from_address(ctx: &Context<'_>, addr: u64) -> Self {
         let entry = BasicBlock::from_addr(ctx, addr).expect("Invalid block address");
-        Self::new(entry.id)
+        let mut emulator = Self::new(entry.id);
+        emulator.memory.configure_spaces(ctx);
+        emulator
     }
 
     pub fn set_varnode(
@@ -692,6 +744,7 @@ impl StandaloneEmulator {
         id: VarnodeId,
         value: u128,
     ) -> Result<(), EmulatorErrorKind> {
+        self.memory.configure_spaces(ctx);
         let varnode = Varnode::from_id(ctx, id);
         let space = varnode.space().id;
         let addr = varnode.address() as u64;
@@ -876,6 +929,7 @@ impl StandaloneEmulator {
     }
 
     pub fn step(&mut self, ctx: &Context<'_>) -> crate::Result<()> {
+        self.memory.configure_spaces(ctx);
         let block = BasicBlock::from_id(ctx, self.block);
         let insn_ids = block.instruction_ids();
         assert!(self.idx < insn_ids.len(), "Reached end of block");
@@ -1079,10 +1133,9 @@ pub struct Emulator<'ctx> {
 
 impl<'ctx> Emulator<'ctx> {
     pub fn new(ctx: &'ctx Context<'ctx>, entry: BlockId) -> Self {
-        Self {
-            inner: StandaloneEmulator::new(entry),
-            ctx,
-        }
+        let mut inner = StandaloneEmulator::new(entry);
+        inner.memory.configure_spaces(ctx);
+        Self { inner, ctx }
     }
 
     pub fn set_instruction_hook(
@@ -1293,6 +1346,7 @@ impl<'ctx> Interpreter for Emulator<'ctx> {
 mod tests {
     use super::*;
     use qcode::context::Context;
+    use qcode::space::{Space, SpaceType};
     use qcode_macro::qcode;
 
     #[test]
@@ -1576,6 +1630,95 @@ mod tests {
         assert!(matches!(
             space.read(0x1000, 4),
             Err(EmulatorErrorKind::MemoryReadError(0x1000))
+        ));
+    }
+
+    #[test]
+    fn configured_register_and_temporary_spaces_zero_fill_missing_bytes() {
+        let mut ctx = Context::new();
+        let mut register = Space::new(Some("register"), 1, 8);
+        register.ty = SpaceType::Register;
+        let register = ctx.add_space(register);
+        let temporary = ctx.make_temp_space();
+        let mut memory = EmulatedMemory::default();
+        memory.configure_spaces(&ctx);
+
+        for space in [register, temporary] {
+            assert_eq!(
+                memory
+                    .read(space, SizedValue::from_u64(0x1000), 4)
+                    .unwrap()
+                    .value()
+                    .unwrap(),
+                0
+            );
+        }
+
+        memory
+            .write(
+                ctx.default_space,
+                SizedValue::from_u64(0x1000),
+                1,
+                SizedValue::new(0xaa, 1),
+            )
+            .unwrap();
+        assert!(matches!(
+            memory.read(ctx.default_space, SizedValue::from_u64(0x1001), 1),
+            Err(EmulatorErrorKind::MemoryReadError(0x1001))
+        ));
+    }
+
+    #[test]
+    fn sized_value_byte_swap_preserves_width() {
+        let value = SizedValue::new(0x1234, 2).byte_swap().unwrap();
+        assert_eq!(value.value().unwrap(), 0x3412);
+        assert_eq!(value.size().unwrap(), 2);
+    }
+
+    #[test]
+    fn swap_bytes_pcode_op_is_emulated() {
+        let mut ctx = Context::new();
+        let op = ctx.pcode_ops.push(Box::from("swap_bytes"));
+        let block_id = ctx.get_or_make_block(0x1000);
+        let result = {
+            let src = ctx.get_const(0x1234, 2).id();
+            let mut builder =
+                qcode::builder::Builder::from_block(BasicBlock::from_id_mut(&mut ctx, block_id));
+            let result = builder.push_pcode_op(op, vec![src], None, 2).id;
+            builder.finalize(0x1001);
+            result
+        };
+        let mut emulator = Emulator::from_block(&ctx, block_id);
+
+        emulator.step().unwrap();
+
+        assert_eq!(
+            emulator
+                .get_value(result.into())
+                .and_then(|value| value.value())
+                .unwrap(),
+            0x3412
+        );
+    }
+
+    #[test]
+    fn unknown_pcode_op_returns_typed_error() {
+        let mut ctx = Context::new();
+        let op = ctx.pcode_ops.push(Box::from("rdpmc"));
+        let block_id = ctx.get_or_make_block(0x1000);
+        {
+            let mut builder =
+                qcode::builder::Builder::from_block(BasicBlock::from_id_mut(&mut ctx, block_id));
+            builder.push_pcode_op(op, vec![], None, 0);
+            builder.finalize(0x1001);
+        }
+        let mut emulator = Emulator::from_block(&ctx, block_id);
+
+        let error = emulator.step().unwrap_err();
+
+        assert!(matches!(
+            error.kind,
+            EmulatorErrorKind::UnsupportedPCodeOp(operation) if operation.as_ref() == "rdpmc"
         ));
     }
 
