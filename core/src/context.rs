@@ -49,7 +49,7 @@ use jstd::{
 /// and space identifiers. When names are owned (e.g. generated names), they
 /// are stored as `Cow::Owned`; when they are borrowed from source data they are
 /// `Cow::Borrowed` and must outlive the context.
-#[derive(Default)]
+#[derive(Default, Clone)]
 pub struct Context<'str> {
     pub default_space: SpaceId,
 
