@@ -13,15 +13,14 @@ use qcode::{
         varnode::{VarnodeId, register::RegisterId},
     },
 };
-use std::{
-    cmp,
-    collections::{HashMap, HashSet},
-};
+use std::cmp;
+
+use rustc_hash::{FxHashMap, FxHashSet};
 
 use super::DomainValue;
 
 #[derive(Debug, Default, Clone)]
-pub struct EmulatedSpace(HashMap<u64, u8>);
+pub struct EmulatedSpace(FxHashMap<u64, u8>);
 
 impl EmulatedSpace {
     pub fn read_byte(&self, addr: u64) -> Result<u8, EmulatorErrorKind> {
@@ -37,6 +36,12 @@ impl EmulatedSpace {
 
     pub fn write_byte(&mut self, addr: u64, value: u8) {
         self.0.insert(addr, value);
+    }
+
+    /// Reserves capacity for at least `additional` more bytes, so a bulk write
+    /// allocates once instead of rehashing the table on the way up.
+    pub fn reserve(&mut self, additional: usize) {
+        self.0.reserve(additional);
     }
 
     /// Returns an editable region of this space for the given address and size.
@@ -112,8 +117,8 @@ impl<'space> EmulatedSpaceRegion<'space> {
 
 #[derive(Debug, Default, Clone)]
 pub struct EmulatedMemory {
-    spaces: HashMap<SpaceId, EmulatedSpace>,
-    zero_filled_spaces: HashSet<SpaceId>,
+    spaces: FxHashMap<SpaceId, EmulatedSpace>,
+    zero_filled_spaces: FxHashSet<SpaceId>,
     /// Space count the zero-fill set was last built for. Spaces are append-only
     /// and their type is fixed at creation, so an unchanged count means the set
     /// is still valid — this keeps the per-step call O(1) instead of rescanning.
@@ -220,11 +225,22 @@ impl SizedValue {
         extended as i128
     }
 
-    fn widen_size(&self, other: &Self) -> usize {
-        if self.size != other.size {
-            return self.size as usize;
-        }
-
+    /// Size, in bytes, at which a two-operand integer op (add/sub/and/.../carry/
+    /// scarry/sborrow) is evaluated.
+    ///
+    /// These p-code ops require both operands to share a size, so well-formed IR
+    /// always has `self.size == other.size`. When the lifter leaves them
+    /// mismatched it is the *left* operand that carries the operative width: it
+    /// is the destination/base that the right operand is being combined into
+    /// (e.g. address arithmetic `int_add(base:8, disp:4)` must stay 8 bytes, not
+    /// truncate to the displacement). The narrower side here is an immediate
+    /// whose value already fits, so taking the left width is correct.
+    ///
+    /// Cases where the *immediate* is on the left and wider than the real
+    /// operand — NEG's `OF = sborrow(0, AL)` — are instead fixed upstream, by
+    /// sizing the immediate to its sibling in the lifter, so this function never
+    /// sees that mismatch. See `emit_function_call` in `harbinger::emit`.
+    fn widen_size(&self, _other: &Self) -> usize {
         self.size as usize
     }
 
@@ -687,8 +703,8 @@ type InstructionHook = Box<dyn Fn(&InstructionRef<'_, '_>, &StandaloneEmulator) 
 /// Use this when you need to store an emulator without a lifetime (e.g., across an FFI boundary).
 pub struct StandaloneEmulator {
     pub memory: EmulatedMemory,
-    pub insn_values: HashMap<InstructionId, SizedValue>,
-    pub block_param_values: HashMap<BlockParamId, SizedValue>,
+    pub insn_values: FxHashMap<InstructionId, SizedValue>,
+    pub block_param_values: FxHashMap<BlockParamId, SizedValue>,
     pub block: BlockId,
     pub idx: usize,
     /// Call stack maintained by `run_function` (outermost function first).
@@ -701,8 +717,8 @@ impl StandaloneEmulator {
     pub fn new(entry: BlockId) -> Self {
         Self {
             memory: EmulatedMemory::default(),
-            insn_values: HashMap::new(),
-            block_param_values: HashMap::new(),
+            insn_values: FxHashMap::default(),
+            block_param_values: FxHashMap::default(),
             block: entry,
             idx: 0,
             call_stack: Vec::new(),
@@ -1086,8 +1102,8 @@ impl StandaloneEmulator {
 /// so the default `Interpreter::interpret()` impl can be reused.
 struct TempInterpreter<'a, 'ctx> {
     memory: &'a mut EmulatedMemory,
-    insn_values: &'a mut HashMap<InstructionId, SizedValue>,
-    block_param_values: &'a mut HashMap<BlockParamId, SizedValue>,
+    insn_values: &'a mut FxHashMap<InstructionId, SizedValue>,
+    block_param_values: &'a mut FxHashMap<BlockParamId, SizedValue>,
     ctx: &'ctx Context<'ctx>,
 }
 
@@ -1200,6 +1216,7 @@ impl<'ctx> Emulator<'ctx> {
         value: &[u8],
     ) -> Result<(), EmulatorErrorKind> {
         let space = self.inner.memory.spaces.entry(space).or_default();
+        space.reserve(value.len());
         for (i, byte) in value.iter().enumerate() {
             space.write_byte(addr + i as u64, *byte);
         }

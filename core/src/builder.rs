@@ -357,6 +357,22 @@ impl<'str, 'ctx> Builder<'str, 'ctx> {
         id
     }
 
+    /// Creates a new temporary value identified by an integer `label`, used to
+    /// derive its display name (`v{label}`) lazily.
+    ///
+    /// Unlike [`make_named_temp`](Self::make_named_temp), this does not allocate a
+    /// name `String`, probe for a unique name, or insert into the context's name
+    /// map — so it stays off the per-instruction hot path. The temporary's
+    /// identity is its [`VarnodeId`]; callers that need distinct temporaries are
+    /// responsible for using distinct varnodes (the emitter keys them by
+    /// `(size, local)`), so no name-uniqueness check is needed.
+    pub fn make_temp_labeled(&mut self, label: u32, size: usize) -> VarnodeId {
+        let space = self.context_mut().make_temp_space();
+        let id = Varnode::make(self.context_mut(), 0, size, space).id;
+        Varnode::from_id_mut(self.context_mut(), id).set_label(label);
+        id
+    }
+
     /// If this block is not terminated, add a jump to the given address as a terminator instruction.
     /// The builder is now safe to drop without panicking, and the block is properly terminated.
     /// Returns the instructions built by the builder.

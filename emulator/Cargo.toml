@@ -8,6 +8,10 @@ repository.workspace = true
 
 [dependencies]
 qcode.workspace = true
+# Fast, non-cryptographic hasher for the emulator's hot maps (memory is keyed
+# by u64 address; the std SipHash default dominated profiles). FxHash is the
+# right tradeoff for trusted, integer-keyed lookups.
+rustc-hash.workspace = true
 
 [dev-dependencies]
 qcode_macro.workspace = true

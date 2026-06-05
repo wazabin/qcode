@@ -44,6 +44,11 @@ pub struct VarnodeId(usize);
 pub struct Varnode<'str> {
     name: Option<Cow<'str, str>>,
 
+    /// An integer label for a generated temporary, used to derive a display name
+    /// (`v{label}`) lazily without allocating a `String` or touching the
+    /// context's name map. Only set when `name` is `None`.
+    label: Option<u32>,
+
     /// The address of this varnode, in the space it belongs to.
     address: i64,
 
@@ -58,6 +63,7 @@ impl<'str> Varnode<'str> {
     fn new(base: i64, size: usize, space: SpaceId) -> Self {
         Self {
             name: None,
+            label: None,
             address: base,
             size,
             space,
@@ -100,6 +106,9 @@ where
     fn fmt(&'s self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         if let Some(name) = self.name() {
             write!(f, "{}", name)
+        } else if let Some(label) = self.inner().label {
+            // Generated temporary: derive its name lazily, no allocation.
+            write!(f, "v{label}")
         } else {
             write!(f, "[{}]:{} {}", *self.space(), self.size(), self.address())
         }
@@ -125,6 +134,12 @@ where
     /// and renaming a varnode will update the context's name registry to maintain this invariant.
     pub fn name(&'s self) -> Option<&'ctx str> {
         self.inner().name.as_deref()
+    }
+
+    /// The integer label of a generated temporary, if any. Temporaries derive
+    /// their display name (`v{label}`) from this without an allocation.
+    pub fn label(&'s self) -> Option<u32> {
+        self.inner().label
     }
 }
 
@@ -163,6 +178,13 @@ pub type VarnodeMutRef<'str, 'ctx> = BaseRef<&'ctx mut Context<'str>, VarnodeId>
 impl<'str, 'ctx> VarnodeMutRef<'str, 'ctx> {
     fn inner_mut(&mut self) -> &mut Varnode<'str> {
         &mut self.ctx.values.varnodes[self.id]
+    }
+
+    /// Sets the integer label used to derive a generated temporary's display
+    /// name. Unlike [`Renameable::rename`], this neither allocates nor touches
+    /// the context name map, so it stays off the per-instruction hot path.
+    pub fn set_label(&mut self, label: u32) {
+        self.inner_mut().label = Some(label);
     }
 }
 
