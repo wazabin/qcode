@@ -238,6 +238,25 @@ impl<'str, 'ctx> InstructionMutRef<'str, 'ctx> {
         &mut self.inner_mut().mnemonic
     }
 
+    /// Replace this instruction's mnemonic while keeping the reverse use-def
+    /// map in sync.
+    pub fn set_mnemonic(&mut self, mnemonic: Mnemonic) {
+        let old_args = self.inner().mnemonic.args();
+        let new_args = mnemonic.args();
+
+        for arg in old_args {
+            if let Some(users) = self.ctx.values.users.get_mut(&arg) {
+                users.retain(|&user| user != self.id);
+            }
+        }
+
+        for arg in new_args {
+            self.ctx.values.users.entry(arg).or_default().push(self.id);
+        }
+
+        self.inner_mut().mnemonic = mnemonic;
+    }
+
     pub fn address_mut(&mut self) -> &mut Option<u64> {
         &mut self.inner_mut().address
     }
