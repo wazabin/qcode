@@ -92,10 +92,12 @@
 //! [`Varnode`]:                 crate::value::Varnode
 //! [`BasicBlock`]:              crate::value::BasicBlock
 
+pub mod assumption;
 pub mod builder;
 pub mod context;
 pub mod error;
 pub mod space;
+pub mod types;
 pub mod value;
 
 #[cfg(any(test, feature = "testing"))]

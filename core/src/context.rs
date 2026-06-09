@@ -7,12 +7,14 @@ use std::{
 };
 
 use crate::{
+    assumption::{Assumption, AssumptionId, AssumptionKind, AssumptionStatus},
     error::{Error, ErrorTy, Result},
     space::{Space, SpaceId},
+    types::TypeManager,
     value::{
         BasicBlock, Function, FunctionId, FunctionRef, Instruction, ValueId,
         block::{BlockId, BlockMutRef, BlockRef, EdgeData, EdgeId, EdgeMutRef, EdgeRef},
-        insn::{InstructionId, InstructionRef, PCodeOpId},
+        insn::{InstructionId, InstructionRef, Mnemonic, PCodeOpId},
         literal::{LiteralId, LiteralRef},
         registry::ValueRegistry,
         varnode::{Varnode, VarnodeId, VarnodeRef, register::RegisterId},
@@ -73,6 +75,9 @@ pub struct Context<'str> {
 
     /// The values available in the context, indexed by their ID
     pub values: ValueRegistry<'str>,
+
+    /// Type registry: owns all [`Type`] objects and hands out [`TypeId`]s.
+    pub types: TypeManager,
 }
 
 impl<'str> Context<'str> {
@@ -200,11 +205,66 @@ impl<'str> Context<'str> {
             .map(|v| Varnode::from_id(self, v.id))
     }
 
-    /// Adds a directed edge in the CFG from `from` to `to`.
-    pub fn add_cfg_edge(&mut self, from: BlockId, to: BlockId) {
+    /// Adds a directed edge in the CFG from `from` to `to`, returning its id.
+    pub fn add_cfg_edge(&mut self, from: BlockId, to: BlockId) -> EdgeId {
         let edge_id = self.values.edges.push(EdgeData { from, to });
         BasicBlock::from_id_mut(self, from).add_edge(edge_id);
         BasicBlock::from_id_mut(self, to).add_edge(edge_id);
+        edge_id
+    }
+
+    /// Removes a CFG edge, unlinking it from both incident blocks' edge sets.
+    ///
+    /// The backing [`EdgeData`] slot in the append-only registry is left in
+    /// place (dangling), consistent with how removed instructions are handled;
+    /// per-block traversal reads the block edge sets, which this updates.
+    pub fn remove_cfg_edge(&mut self, edge_id: EdgeId) {
+        let EdgeData { from, to } = self.values.edges[edge_id];
+        BasicBlock::from_id_mut(self, from).remove_edge(edge_id);
+        BasicBlock::from_id_mut(self, to).remove_edge(edge_id);
+    }
+
+    /// Records a heuristic [`Assumption`] and indexes it by the callee it
+    /// predicts. Returns the new [`AssumptionId`].
+    pub fn add_assumption(&mut self, kind: AssumptionKind) -> AssumptionId {
+        let assumption = Assumption::new(kind);
+        let callee = assumption.callee();
+        let id = self.values.assumptions.push(assumption);
+        if let Some(callee) = callee {
+            self.values
+                .assumptions_by_callee
+                .entry(callee)
+                .or_default()
+                .push(id);
+        }
+        id
+    }
+
+    /// Returns the [`Assumption`] with the given id.
+    pub fn assumption(&self, id: AssumptionId) -> &Assumption {
+        &self.values.assumptions[id]
+    }
+
+    /// Returns the assumptions predicting `callee`, in insertion order.
+    pub fn assumptions_for_callee(&self, callee: FunctionId) -> &[AssumptionId] {
+        self.values
+            .assumptions_by_callee
+            .get(&callee)
+            .map(Vec::as_slice)
+            .unwrap_or(&[])
+    }
+
+    /// Sets the verification status of an assumption.
+    pub fn set_assumption_status(&mut self, id: AssumptionId, status: AssumptionStatus) {
+        self.values.assumptions[id].status = status;
+    }
+
+    /// Iterates over all recorded assumptions.
+    pub fn assumptions(&self) -> impl Iterator<Item = (AssumptionId, &Assumption)> {
+        self.values
+            .assumptions
+            .iter()
+            .map(|item| (item.id, item.inner))
     }
 
     /// Returns the raw `u64` backing value of the literal `id`.
@@ -223,10 +283,43 @@ impl<'str> Context<'str> {
         Varnode::from_id(self, self.registers[&id])
     }
 
-    /// Creates a [`Value`] representing a constant value.
+    /// Creates a [`Value`] representing an integer constant of the given byte width.
     pub fn get_const(&mut self, value: u64, size: usize) -> LiteralRef<'str, '_> {
-        let id = self.values.get_or_make_literal(value, size);
+        let type_id = self.types.get_or_make_int(size);
+        let id = self.values.get_or_make_typed_literal(value, type_id, size);
         LiteralRef::new(self, id)
+    }
+
+    /// Creates a typed constant literal.
+    ///
+    /// Unlike [`get_const`](Self::get_const) this accepts an arbitrary [`TypeId`],
+    /// allowing StackAddress constants (e.g. the stack base) to preserve their
+    /// type through constant folding.
+    pub fn get_typed_const(
+        &mut self,
+        value: u64,
+        type_id: crate::types::TypeId,
+    ) -> LiteralRef<'str, '_> {
+        let size = self.types.size_of(type_id);
+        let id = self.values.get_or_make_typed_literal(value, type_id, size);
+        LiteralRef::new(self, id)
+    }
+
+    /// Returns the [`TypeId`] of any [`ValueId`] in this context.
+    ///
+    /// Varnodes are typed as `Int(varnode.size())`. Blocks, functions, and other
+    /// non-data values return `Int(0)`.
+    pub fn type_of(&mut self, id: ValueId) -> crate::types::TypeId {
+        match id {
+            ValueId::Literal(lid) => self.values.literals[lid].type_id,
+            ValueId::Instruction(iid) => self.values.instructions[iid].type_id,
+            ValueId::BlockParam(pid) => self.values.block_params[pid].type_id,
+            ValueId::Varnode(vid) => {
+                let size = self.values.varnodes[vid].size_bytes();
+                self.types.get_or_make_int(size)
+            }
+            _ => self.types.get_or_make_int(0),
+        }
     }
 
     /// Return all instructions that use `value` as an operand.
@@ -250,6 +343,30 @@ impl<'str> Context<'str> {
             self.values.users.entry(new).or_default().push(user_id);
         }
         self.values.users.remove(&old);
+    }
+
+    /// Replaces one instruction's mnemonic and keeps the reverse use map in sync.
+    ///
+    /// This is for transforms that change an instruction in place without
+    /// changing its identity, parent block, address, or result type.
+    pub fn replace_instruction_mnemonic(&mut self, id: InstructionId, mnemonic: Mnemonic) {
+        let old_args = self.values.instructions[id].mnemonic().args();
+        for arg in old_args {
+            let mut remove_arg = false;
+            if let Some(users) = self.values.users.get_mut(&arg) {
+                users.retain(|&user| user != id);
+                remove_arg = users.is_empty();
+            }
+            if remove_arg {
+                self.values.users.remove(&arg);
+            }
+        }
+
+        *Instruction::from_id_mut(self, id).mnemonic_mut() = mnemonic;
+
+        for arg in self.values.instructions[id].mnemonic().args() {
+            self.values.users.entry(arg).or_default().push(id);
+        }
     }
 
     /// Removes an instruction from its parent block and unlinks all associated state:
@@ -448,7 +565,10 @@ impl<'str, 'ctx> IntoIterator for &'ctx Context<'str> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::value::{BasicBlock, Function};
+    use crate::value::{
+        BasicBlock, Function, ValueId,
+        insn::{Binary, Binop, Call, IntBinop, Load, Mnemonic},
+    };
     use qcode_macro::qcode;
 
     fn make_fn_with_blocks(ctx: &mut Context<'static>, name: &'static str, n: usize) -> FunctionId {
@@ -651,6 +771,114 @@ mod tests {
     }
 
     #[test]
+    fn replace_instruction_mnemonic_rewrites_callind_users() {
+        let mut ctx = Context::new();
+        qcode!(
+            ctx,
+            "
+            varnode i64 ptr;
+            <block>
+                call [ptr];
+            "
+        );
+        let call_id = BasicBlock::from_id(&ctx, block).instruction_ids()[0];
+        let ptr = match ctx.get_insn(call_id).mnemonic() {
+            Mnemonic::CallInd(call) => call.ptr,
+            other => panic!("expected CallInd, got {other:?}"),
+        };
+        assert_eq!(ctx.users(ptr), &[call_id]);
+
+        let target = Function::make(&mut ctx, "target".into()).unwrap().id;
+        ctx.replace_instruction_mnemonic(
+            call_id,
+            Mnemonic::Call(Call {
+                target,
+                args: vec![],
+                clobbers: vec![],
+            }),
+        );
+
+        assert!(
+            ctx.users(ptr).is_empty(),
+            "old indirect pointer should no longer list the rewritten call"
+        );
+        assert!(matches!(
+            ctx.get_insn(call_id).mnemonic(),
+            Mnemonic::Call(Call {
+                target: actual,
+                args,
+                ..
+            }) if *actual == target && args.is_empty()
+        ));
+    }
+
+    #[test]
+    fn replace_instruction_mnemonic_moves_operand_users() {
+        let mut ctx = Context::new();
+        qcode!(
+            ctx,
+            "
+            varnode i64 x;
+            varnode i64 y;
+            <block>
+                %a = load(i64, x);
+                return [%a];
+            "
+        );
+        let load_id = BasicBlock::from_id(&ctx, block).instruction_ids()[0];
+        let old_ptr = ValueId::Varnode(x);
+        let new_ptr = ValueId::Varnode(y);
+        assert_eq!(ctx.users(old_ptr), &[load_id]);
+        assert!(ctx.users(new_ptr).is_empty());
+
+        ctx.replace_instruction_mnemonic(
+            load_id,
+            Mnemonic::Load(Load {
+                space: ctx.default_space,
+                ptr: new_ptr,
+                size: 8,
+            }),
+        );
+
+        assert!(ctx.users(old_ptr).is_empty());
+        assert_eq!(ctx.users(new_ptr), &[load_id]);
+    }
+
+    #[test]
+    fn replace_instruction_mnemonic_tracks_repeated_operands() {
+        let mut ctx = Context::new();
+        qcode!(
+            ctx,
+            "
+            varnode i64 x;
+            varnode i64 y;
+            <block>
+                %a = load(i64, x);
+                return [%a];
+            "
+        );
+        let load_id = BasicBlock::from_id(&ctx, block).instruction_ids()[0];
+        let old_ptr = ValueId::Varnode(x);
+        let new_arg = ValueId::Varnode(y);
+
+        ctx.replace_instruction_mnemonic(
+            load_id,
+            Mnemonic::Binop(Binary {
+                op: Binop::Int(IntBinop::Add),
+                lhs: new_arg,
+                rhs: new_arg,
+            }),
+        );
+
+        assert!(ctx.users(old_ptr).is_empty());
+        assert_eq!(
+            ctx.users(new_arg),
+            &[load_id, load_id],
+            "a mnemonic using the same operand twice should record both uses"
+        );
+    }
+
+    #[test]
     fn remove_instruction_unparented_noop() {
         let mut ctx = Context::new();
         qcode!(
@@ -672,5 +900,62 @@ mod tests {
         ctx.remove_instruction(load_id);
 
         assert!(ctx.get_named("a").is_none());
+    }
+
+    #[test]
+    fn add_cfg_edge_returns_id_and_remove_unlinks_both_blocks() {
+        let mut ctx = Context::new();
+        let a = BasicBlock::make(&mut ctx).id;
+        let b = BasicBlock::make(&mut ctx).id;
+
+        let edge = ctx.add_cfg_edge(a, b);
+        assert_eq!(
+            BasicBlock::from_id(&ctx, a)
+                .successors()
+                .collect::<Vec<_>>(),
+            vec![(edge, b)]
+        );
+        assert_eq!(
+            BasicBlock::from_id(&ctx, b)
+                .predecessors()
+                .collect::<Vec<_>>(),
+            vec![(edge, a)]
+        );
+
+        ctx.remove_cfg_edge(edge);
+        assert!(BasicBlock::from_id(&ctx, a).successors().next().is_none());
+        assert!(BasicBlock::from_id(&ctx, b).predecessors().next().is_none());
+    }
+
+    #[test]
+    fn assumption_ledger_indexes_by_callee_and_tracks_status() {
+        use crate::assumption::{AssumptionKind, AssumptionStatus, CallReturnsAssumption};
+        use crate::value::insn::InstructionId;
+
+        let mut ctx = Context::new();
+        let callee = Function::make(&mut ctx, "callee".into()).unwrap().id;
+        let call_block = BasicBlock::make(&mut ctx).id;
+        let continuation = BasicBlock::make(&mut ctx).id;
+        let edge = ctx.add_cfg_edge(call_block, continuation);
+
+        let id = ctx.add_assumption(AssumptionKind::CallReturns(CallReturnsAssumption {
+            callee,
+            call_site: InstructionId::from(0usize),
+            call_block,
+            continuation,
+            continuation_edge: edge,
+        }));
+
+        assert_eq!(ctx.assumptions_for_callee(callee), &[id]);
+        assert_eq!(ctx.assumption(id).status, AssumptionStatus::Unverified);
+
+        // The ledger is part of the arena, so it snapshots with a clone.
+        let snapshot = ctx.clone();
+        assert_eq!(snapshot.assumptions_for_callee(callee), &[id]);
+
+        ctx.set_assumption_status(id, AssumptionStatus::Violated);
+        assert_eq!(ctx.assumption(id).status, AssumptionStatus::Violated);
+        // The independent snapshot is unaffected.
+        assert_eq!(snapshot.assumption(id).status, AssumptionStatus::Unverified);
     }
 }

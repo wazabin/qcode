@@ -2157,7 +2157,7 @@ mod tests {
             err.kind,
             EmulatorErrorKind::InterceptError(message) if message.as_ref() == "model failed"
         ));
-        assert!(err.ctx.contains("call fn library;"));
+        assert!(err.ctx.contains("call fn library();"));
     }
 
     #[test]

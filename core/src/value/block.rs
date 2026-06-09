@@ -357,9 +357,10 @@ impl<'str, 'ctx> BlockMutRef<'str, 'ctx> {
     pub fn push_param(&mut self, size: usize) -> BlockParamMutRef<'str, '_> {
         let block_id = self.id;
         let index = self.inner().params.len();
+        let type_id = self.ctx.types.get_or_make_int(size);
         let id = self.ctx.values.block_params.push(BlockParam {
             index,
-            size,
+            type_id,
             parent: Some(block_id),
             name: None,
         });
@@ -378,6 +379,12 @@ impl<'str, 'ctx> BlockMutRef<'str, 'ctx> {
     /// Inserts an instruction at the start of this block, before all existing instructions.
     pub fn insert_insn_at_start(&mut self, insn_id: InstructionId) {
         self.insert_insn(0, insn_id);
+    }
+
+    /// Inserts an instruction at the given index, shifting later instructions right.
+    /// Panics if `index > len`.
+    pub fn insert_insn_at_index(&mut self, index: usize, insn_id: InstructionId) {
+        self.insert_insn(index, insn_id);
     }
 
     /// Inserts an instruction before the instruction identified by `before_id` in this block.
@@ -492,8 +499,13 @@ impl<'str, 'ctx> BlockMutRef<'str, 'ctx> {
         // Remove terminal branch.
         self.inner_mut().instructions.pop();
 
-        // Append other's instructions, updating their parent to point to this block.
-        let b_insns = self.ctx.values.basic_blocks[other].instructions.clone();
+        // Move other's instructions into this block, updating their parent. The
+        // source list must be drained, not just copied: leaving the ids in
+        // `other.instructions` would put every absorbed instruction in two
+        // blocks at once, so a later `remove_instruction` (which unlinks via the
+        // instruction's `parent`) clears it from one block while it lingers in
+        // the other — corrupting block membership.
+        let b_insns = std::mem::take(&mut self.ctx.values.basic_blocks[other].instructions);
         let self_id = self.id;
         for &insn_id in &b_insns {
             self.ctx.values.instructions[insn_id].parent = Some(self_id);

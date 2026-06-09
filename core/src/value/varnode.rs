@@ -60,6 +60,11 @@ pub struct Varnode<'str> {
 }
 
 impl<'str> Varnode<'str> {
+    /// Returns the size of this varnode in bytes, without requiring a context reference.
+    pub fn size_bytes(&self) -> usize {
+        self.size
+    }
+
     fn new(base: i64, size: usize, space: SpaceId) -> Self {
         Self {
             name: None,

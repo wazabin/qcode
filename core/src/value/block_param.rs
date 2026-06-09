@@ -1,6 +1,7 @@
 use crate::{
     context::Context,
     error::Result,
+    types::TypeId,
     value::{
         Value, ValueId,
         block::{BasicBlock, BlockId, BlockRef},
@@ -34,8 +35,8 @@ pub struct BlockParam<'str> {
     /// Position of this param in the owning block's param list.
     pub index: usize,
 
-    /// Size of the value in bytes.
-    pub size: usize,
+    /// The type of this parameter's value.
+    pub type_id: TypeId,
 
     /// The block this parameter belongs to.
     pub parent: Option<BlockId>,
@@ -53,10 +54,11 @@ impl<'str> BlockParam<'str> {
         block_id: BlockId,
         size: usize,
     ) -> BlockParamMutRef<'str, 'ctx> {
+        let type_id = ctx.types.get_or_make_int(size);
         let index = ctx.values.basic_blocks[block_id].params.len();
         let id = ctx.values.block_params.push(BlockParam {
             index,
-            size,
+            type_id,
             parent: Some(block_id),
             name: None,
         });
@@ -89,9 +91,14 @@ where
         self.inner().index
     }
 
+    /// The [`TypeId`] of this parameter's value.
+    pub fn type_id(&'s self) -> TypeId {
+        self.inner().type_id
+    }
+
     /// Size of this parameter's value in bytes.
     pub fn size(&'s self) -> usize {
-        self.inner().size
+        self.ctx().types.size_of(self.inner().type_id)
     }
 
     /// The block this parameter belongs to, if any.
@@ -153,7 +160,8 @@ impl<'str, 'ctx> BlockParamMutRef<'str, 'ctx> {
     }
 
     pub fn set_size(&mut self, size: usize) {
-        self.inner_mut().size = size;
+        let type_id = self.ctx.types.get_or_make_int(size);
+        self.inner_mut().type_id = type_id;
     }
 
     pub fn constrain_size(&mut self, size: usize) {

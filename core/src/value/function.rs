@@ -1,7 +1,7 @@
 use jstd::Identifier;
 use std::{
     borrow::Cow,
-    collections::{HashSet, hash_set},
+    collections::{BTreeSet, HashSet, hash_set},
     fmt::{Display, Formatter},
 };
 
@@ -12,7 +12,7 @@ use crate::{
     context::Context,
     error::{Error, ErrorTy, Result},
     value::{
-        BasicBlock, BlockId, BlockRef, Value, ValueId,
+        BasicBlock, BlockId, BlockRef, Value, ValueId, VarnodeId,
         util::{
             base_ref::{BaseRef, WithCtx, WithCtxMut},
             named::{Named, Renameable, update_context_name},
@@ -37,6 +37,12 @@ pub struct Function<'str> {
     /// All blocks belonging to this function (includes root).
     pub blocks: HashSet<BlockId>,
 
+    /// Addresses of every machine instruction lifted into this function, in
+    /// ascending order. Recorded during recursive disassembly and preserved
+    /// across optimization (which merges blocks and rewrites the IR), so the
+    /// raw disassembly view can be reconstructed regardless of CFG changes.
+    pub instruction_addrs: BTreeSet<u64>,
+
     /// Whether this is an external (imported) function.
     ///
     /// External functions have no lifted body — they are stubs for calls that
@@ -55,6 +61,7 @@ impl<'str> Function<'str> {
             address: None,
             root: None,
             blocks: HashSet::new(),
+            instruction_addrs: BTreeSet::new(),
             is_external: false,
             signature: None,
         }
@@ -183,9 +190,47 @@ where
         self.inner().signature.as_ref()
     }
 
+    /// Registers concretely written by this function, as set by analysis.
+    pub fn clobbered_regs(&'s self) -> Option<&'ctx [VarnodeId]> {
+        self.inner()
+            .signature
+            .as_ref()
+            .and_then(|s| s.clobbered.as_deref())
+    }
+
+    /// Registers read before written (function inputs), as inferred by analysis.
+    pub fn input_regs(&'s self) -> Option<&'ctx [VarnodeId]> {
+        self.inner()
+            .signature
+            .as_ref()
+            .and_then(|s| s.inputs.as_deref())
+    }
+
+    /// Registers saved and restored unchanged (preserved across calls), as
+    /// inferred by analysis.
+    pub fn saved_regs(&'s self) -> Option<&'ctx [VarnodeId]> {
+        self.inner()
+            .signature
+            .as_ref()
+            .and_then(|s| s.saved.as_deref())
+    }
+
+    /// The net change this function applies to the stack pointer between entry
+    /// and return, as inferred by analysis. See [`FunctionSignature::stack_delta`].
+    pub fn stack_delta(&'s self) -> Option<i64> {
+        self.inner().signature.as_ref().and_then(|s| s.stack_delta)
+    }
+
     /// The name of the inner `Function`.
     pub fn name(&'s self) -> &'ctx str {
         self.inner().name.as_ref()
+    }
+
+    /// The addresses of every machine instruction lifted into this function, in
+    /// ascending order. Unlike [`blocks`](Self::blocks), this is stable across
+    /// optimization, so it drives the raw disassembly view.
+    pub fn instruction_addrs(&'s self) -> impl Iterator<Item = u64> + 'ctx {
+        self.inner().instruction_addrs.iter().copied()
     }
 
     /// The root block of this function, if it exists.
@@ -405,6 +450,39 @@ impl<'str, 'ctx> FunctionMutRef<'str, 'ctx> {
 
     pub fn set_signature(&mut self, sig: FunctionSignature) {
         self.ctx.values.functions[self.id].signature = Some(sig);
+    }
+
+    /// Records the analysis-computed clobbered register set on this function.
+    pub fn set_clobbered_regs(&mut self, regs: Vec<VarnodeId>) {
+        self.inner_mut().signature.get_or_insert_default().clobbered = Some(regs);
+    }
+
+    /// Records the analysis-inferred input (live-in) register set on this function.
+    pub fn set_input_regs(&mut self, regs: Vec<VarnodeId>) {
+        self.inner_mut().signature.get_or_insert_default().inputs = Some(regs);
+    }
+
+    /// Records the analysis-inferred saved (preserved) register set on this function.
+    pub fn set_saved_regs(&mut self, regs: Vec<VarnodeId>) {
+        self.inner_mut().signature.get_or_insert_default().saved = Some(regs);
+    }
+
+    /// Records the output (return-value) register set on this function.
+    pub fn set_output_regs(&mut self, regs: Vec<VarnodeId>) {
+        self.inner_mut().signature.get_or_insert_default().outputs = Some(regs);
+    }
+
+    /// Records the analysis-inferred net stack-pointer delta on this function.
+    pub fn set_stack_delta(&mut self, delta: i64) {
+        self.inner_mut()
+            .signature
+            .get_or_insert_default()
+            .stack_delta = Some(delta);
+    }
+
+    /// Records the address of a machine instruction lifted into this function.
+    pub fn add_instruction_addr(&mut self, addr: u64) {
+        self.inner_mut().instruction_addrs.insert(addr);
     }
 
     /// Associates `block` with `function`: pushes it onto the function's block list

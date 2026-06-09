@@ -1,12 +1,18 @@
 //! Compile-time integer constants, optionally with symbolic labels.
 //!
 //! A [`Literal`] stores a raw `u64` value together with an optional
-//! [`SymbolicRef`] that gives it meaning beyond its numeric value - for example
+//! [`SymbolicRef`] that gives it meaning beyond its numeric value — for example
 //! the address of a known block or function. When a literal has a symbolic
 //! reference it is displayed as `&<name>` rather than `0x…`.
+//!
+//! Every literal carries a [`TypeId`] that encodes both its byte width and its
+//! semantic kind (plain integer vs. stack address). Type is preserved through
+//! constant folding: folding `@stack_base - 0x8` produces a literal whose
+//! `type_id` is still [`StackAddress`](crate::types::StackAddress).
 
 use crate::{
     context::Context,
+    types::TypeId,
     value::{
         Function, Value, ValueId,
         block::{BlockId, BlockRef},
@@ -24,6 +30,10 @@ pub struct LiteralId(usize);
 /// When the assembler/lifter knows that a numeric constant is actually the
 /// address of a block, a function, or a string, it stores a `SymbolicRef` so
 /// that the literal can be displayed and reasoned about symbolically.
+///
+/// Note: `Space(SpaceId)` has been removed. Stack base addresses are now
+/// represented as [`StackAddress`](crate::types::StackAddress)-typed literals;
+/// their display derives from the type, not from a symbolic annotation.
 #[derive(Debug, Clone, Hash, PartialEq, Eq)]
 pub enum SymbolicRef {
     /// The literal is the address of this basic block.
@@ -36,13 +46,14 @@ pub enum SymbolicRef {
 
 /// A compile-time integer constant stored in a [`Context`](crate::context::Context).
 ///
-/// The raw value is a `u64`; [`LiteralRef::value`] masks it to `size` bytes.
+/// The raw value is a `u64`; [`LiteralRef::value`] masks it to the width
+/// described by the literal's [`TypeId`].
 #[derive(Debug, Clone, Hash, PartialEq, Eq)]
 pub struct Literal {
-    /// Raw integer value (may be wider than `size` before masking).
+    /// Raw integer value (may be wider than the type's size before masking).
     pub value: u64,
-    /// Size of this constant in bytes.
-    pub size: usize,
+    /// The type of this constant (encodes size and semantic kind).
+    pub type_id: TypeId,
     /// Optional symbolic annotation (block address, function address, string).
     pub symbolic: Option<SymbolicRef>,
 }
@@ -64,7 +75,7 @@ where
     }
 
     pub fn mask(&'s self) -> u64 {
-        let size = self.inner().size;
+        let size = self.ctx().types.size_of(self.inner().type_id);
         if size >= 8 {
             u64::MAX
         } else {
@@ -74,6 +85,11 @@ where
 
     pub fn value(&'s self) -> u64 {
         self.inner().value & self.mask()
+    }
+
+    /// Returns the [`TypeId`] of this literal.
+    pub fn type_id(&'s self) -> TypeId {
+        self.inner().type_id
     }
 }
 
@@ -93,7 +109,21 @@ impl std::fmt::Display for LiteralRef<'_, '_> {
                 write!(f, "&<{}>", fn_ref.name())
             }
             Some(SymbolicRef::String(s)) => write!(f, "&{:?}", s),
-            None => write!(f, "0x{:x}", literal.value),
+            None => {
+                if self.ctx.types.is_stack_address(literal.type_id) {
+                    // The value is an absolute `stack_base + offset` address;
+                    // show the signed offset (negative for locals below entry).
+                    let base = crate::types::stack_base(self.ctx.types.size_of(literal.type_id));
+                    let offset = literal.value.wrapping_sub(base) as i64;
+                    if offset < 0 {
+                        write!(f, "@stack_base-0x{:x}", offset.unsigned_abs())
+                    } else {
+                        write!(f, "@stack_base+0x{:x}", offset)
+                    }
+                } else {
+                    write!(f, "0x{:x}", literal.value)
+                }
+            }
         }
     }
 }
@@ -104,6 +134,8 @@ impl<'str, 'ctx> Value<'str, 'ctx> for LiteralRef<'str, 'ctx> {
     }
 
     fn size(&self) -> usize {
-        self.ctx.values.literals[self.id].size
+        self.ctx
+            .types
+            .size_of(self.ctx.values.literals[self.id].type_id)
     }
 }
