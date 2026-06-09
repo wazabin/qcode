@@ -166,6 +166,21 @@ pub enum Statement {
         ptr: TypedAtom,
         span: SourceSpan,
     },
+    /// A comment attached to this statement, written as `# text` on the preceding line.
+    Commented {
+        comment: String,
+        inner: Box<Statement>,
+    },
+}
+
+impl Statement {
+    /// Strips any wrapping `Commented` variant and returns the inner statement.
+    pub fn inner(&self) -> &Statement {
+        match self {
+            Self::Commented { inner, .. } => inner.inner(),
+            other => other,
+        }
+    }
 }
 
 /// A function declaration (`fn name: <entry> stmts...`).

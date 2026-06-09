@@ -1,5 +1,5 @@
 WHITESPACE = _{ " " | "\t" | "\r" | "\n" }
-COMMENT    = _{ "#" ~ (!"\n" ~ ANY)* }
+COMMENT    =  { "#" ~ (!"\n" ~ ANY)* }
 
 program         =  { SOI ~ (top_varnode_list? ~ fn_decl+ | statement_list?) ~ EOI }
 top_varnode_list =  { local_decl ~ (";" ~ local_decl)* ~ ";"* }

@@ -43,8 +43,15 @@ pub fn parse_program(program: &str) -> Result<Program, ParseError> {
     let mut top_varnodes: Vec<Statement> = Vec::new();
     let mut is_fn_program = false;
 
+    // A comment may appear at the program level (before statement_list or fn_decl)
+    // or between elements inside those rules.
+    let mut pending_comment: Option<String> = None;
+
     for pair in root.into_inner() {
         match pair.as_rule() {
+            Rule::COMMENT => {
+                pending_comment = Some(comment_text(pair.as_str()));
+            }
             Rule::top_varnode_list => {
                 for part in pair.into_inner() {
                     if part.as_rule() == Rule::local_decl {
@@ -54,14 +61,26 @@ pub fn parse_program(program: &str) -> Result<Program, ParseError> {
             }
             Rule::fn_decl => {
                 is_fn_program = true;
+                pending_comment = None; // comments before fn_decl are not yet attached
                 fn_decls.push(parse_fn_decl(pair)?);
             }
             Rule::statement_list => {
-                for compound in pair.into_inner() {
-                    if compound.as_rule() != Rule::compound_stmt {
-                        continue;
+                // The pending_comment (if any) was outside statement_list; treat it as
+                // preceding the first compound_stmt.
+                let mut inner_comment = pending_comment.take();
+                for item in pair.into_inner() {
+                    match item.as_rule() {
+                        Rule::COMMENT => {
+                            inner_comment = Some(comment_text(item.as_str()));
+                        }
+                        Rule::compound_stmt => {
+                            let mut compound_stmts = Vec::new();
+                            parse_compound(item, &mut compound_stmts)?;
+                            attach_comment(&mut inner_comment, &mut compound_stmts);
+                            statements.extend(compound_stmts);
+                        }
+                        _ => {}
                     }
-                    parse_compound(compound, &mut statements)?;
                 }
             }
             _ => {}
@@ -90,15 +109,24 @@ fn parse_fn_decl(pair: Pair<'_, Rule>) -> Result<FnDecl, ParseError> {
     let mut statements = Vec::new();
     for part in inner {
         if part.as_rule() == Rule::fn_body {
+            let mut pending_comment: Option<String> = None;
             for fn_stmt in part.into_inner() {
-                if fn_stmt.as_rule() != Rule::fn_stmt {
-                    continue;
-                }
-                for compound in fn_stmt.into_inner() {
-                    if compound.as_rule() != Rule::compound_stmt {
-                        continue;
+                match fn_stmt.as_rule() {
+                    Rule::COMMENT => {
+                        pending_comment = Some(comment_text(fn_stmt.as_str()));
                     }
-                    parse_compound(compound, &mut statements)?;
+                    Rule::fn_stmt => {
+                        for compound in fn_stmt.into_inner() {
+                            if compound.as_rule() != Rule::compound_stmt {
+                                continue;
+                            }
+                            let mut compound_stmts = Vec::new();
+                            parse_compound(compound, &mut compound_stmts)?;
+                            attach_comment(&mut pending_comment, &mut compound_stmts);
+                            statements.extend(compound_stmts);
+                        }
+                    }
+                    _ => {}
                 }
             }
         }
@@ -113,10 +141,19 @@ fn parse_fn_decl(pair: Pair<'_, Rule>) -> Result<FnDecl, ParseError> {
 }
 
 fn parse_compound(pair: Pair<'_, Rule>, out: &mut Vec<Statement>) -> Result<(), ParseError> {
+    let mut pending_comment: Option<String> = None;
     for part in pair.into_inner() {
         match part.as_rule() {
             Rule::label_decl => out.push(parse_label_decl(part)?),
-            Rule::inner_stmt => parse_inner_stmt(part, out)?,
+            Rule::inner_stmt => {
+                let mut stmts = Vec::new();
+                parse_inner_stmt(part, &mut stmts)?;
+                attach_comment(&mut pending_comment, &mut stmts);
+                out.extend(stmts);
+            }
+            Rule::COMMENT => {
+                pending_comment = Some(comment_text(part.as_str()));
+            }
             _ => return Err(ParseError::new("unexpected compound statement")),
         }
     }
@@ -664,6 +701,25 @@ fn parse_size_bits(ident: &str) -> Option<usize> {
         bits.parse::<usize>().ok()
     } else {
         None
+    }
+}
+
+fn comment_text(raw: &str) -> String {
+    raw.strip_prefix('#').unwrap_or("").trim().to_owned()
+}
+
+fn attach_comment(pending: &mut Option<String>, stmts: &mut Vec<Statement>) {
+    if let Some(comment) = pending.take() {
+        if !stmts.is_empty() {
+            let first = stmts.remove(0);
+            stmts.insert(
+                0,
+                Statement::Commented {
+                    comment,
+                    inner: Box::new(first),
+                },
+            );
+        }
     }
 }
 
@@ -1389,6 +1445,56 @@ mod tests {
                 assert!(matches!(&fallthrough_args[0].1.atom, Atom::Ssa(n) if n == "v"));
             }
             _ => panic!("expected cbranch with args"),
+        }
+    }
+
+    #[test]
+    fn parses_comment_attached_to_next_statement() {
+        let statements = stmts("# add one\n%x = {v} + 1");
+        assert_eq!(statements.len(), 1);
+        match &statements[0] {
+            Statement::Commented { comment, inner } => {
+                assert_eq!(comment, "add one");
+                assert!(matches!(inner.as_ref(), Statement::Assign { name, .. } if name == "x"));
+            }
+            _ => panic!("expected commented statement"),
+        }
+    }
+
+    #[test]
+    fn parses_comment_stripped_for_standalone_expression() {
+        let statements = stmts("# first\n%a = 1; # second\n%b = 2");
+        assert_eq!(statements.len(), 2);
+        match &statements[0] {
+            Statement::Commented { comment, .. } => assert_eq!(comment, "first"),
+            _ => panic!("expected first statement to be commented"),
+        }
+        match &statements[1] {
+            Statement::Commented { comment, .. } => assert_eq!(comment, "second"),
+            _ => panic!("expected second statement to be commented"),
+        }
+    }
+
+    #[test]
+    fn parses_uncommented_statements_unaffected() {
+        let statements = stmts("%x = 1 + 2");
+        assert_eq!(statements.len(), 1);
+        assert!(matches!(&statements[0], Statement::Assign { name, .. } if name == "x"));
+    }
+
+    #[test]
+    fn parses_comment_in_fn_body() {
+        let program = parse_program("fn f: <entry> # load value\n%x = {v} + 1; return [%x]")
+            .expect("parse should succeed");
+        match program {
+            Program::Functions { fns, .. } => {
+                let stmts = &fns[0].statements;
+                // stmts[0] = LabelDecl <entry>, stmts[1] = Commented(%x = ...), stmts[2] = return
+                assert!(
+                    matches!(&stmts[1], Statement::Commented { comment, .. } if comment == "load value")
+                );
+            }
+            _ => panic!("expected function program"),
         }
     }
 
