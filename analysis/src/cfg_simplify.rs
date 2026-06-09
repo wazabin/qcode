@@ -53,6 +53,22 @@ pub fn simplify_cfg(ctx: &mut Context, function_id: FunctionId) {
                 continue;
             }
 
+            // Merging rewrites B's params to the branch's args, so the branch must
+            // supply one arg per param. A mismatch means a malformed edge — e.g. a
+            // CRT stub's tail `jmp` into another routine that mem2reg gave a param,
+            // lifted as an intra-function `goto` carrying no args. Leave such edges
+            // unmerged rather than absorbing an unsatisfiable param.
+            let b_params = ctx.values.basic_blocks[b_id].params.len();
+            let branch_args = a_terminal
+                .and_then(|id| match ctx.values.instructions[id].mnemonic() {
+                    Mnemonic::Branch(b) => Some(b.args.len()),
+                    _ => None,
+                })
+                .unwrap_or(0);
+            if b_params != branch_args {
+                continue;
+            }
+
             BasicBlock::from_id_mut(ctx, a_id).absorb_block(b_id, edge_ab, function_id);
             merged = true;
             break 'outer;
@@ -256,6 +272,112 @@ mod tests {
             parent_id,
             Some(ValueId::BasicBlock(a)),
             "instruction from b should be reparented to a after merge"
+        );
+    }
+
+    /// Regression: `absorb_block` must *drain* the absorbed block's instruction
+    /// list, not merely copy it. Leaving the ids in both blocks puts every merged
+    /// instruction in two blocks at once; a later `remove_instruction` (which
+    /// unlinks via the instruction's `parent`) then clears one copy while the
+    /// other lingers, corrupting block membership and spinning `remove_dead_insns`
+    /// forever.
+    #[test]
+    fn absorbed_block_instruction_list_is_drained() {
+        let mut ctx = make_ctx();
+        qcode!(
+            ctx,
+            "
+            fn f:
+            <a>
+                %x = i64 1 + i64 1;
+                goto <b>;
+            <b>
+                %y = i64 2 + i64 2;
+                goto <0x1001>;
+            "
+        );
+
+        simplify_cfg(&mut ctx, f);
+
+        assert!(
+            ctx.values.basic_blocks[b].instructions.is_empty(),
+            "absorbed block `b` must not retain its instructions after merge"
+        );
+    }
+
+    /// Regression (invariant): after CFG simplification no instruction id may
+    /// appear in more than one block's instruction list. This is the property the
+    /// `absorb_block` drain fix restores; its violation was the root cause of an
+    /// infinite loop in `remove_dead_insns`.
+    #[test]
+    fn no_instruction_belongs_to_two_blocks_after_simplify() {
+        let mut ctx = make_ctx();
+        qcode!(
+            ctx,
+            "
+            fn f:
+            <a>
+                %x = i64 1 + i64 1;
+                goto <b>;
+            <b>
+                %y = i64 2 + i64 2;
+                goto <c>;
+            <c>
+                %z = i64 3 + i64 3;
+                goto <0x1001>;
+            "
+        );
+
+        simplify_cfg(&mut ctx, f);
+
+        let mut seen = std::collections::HashSet::new();
+        for block in ctx.values.basic_blocks.iter() {
+            for &insn in &block.instructions {
+                assert!(
+                    seen.insert(insn),
+                    "instruction {insn:?} appears in more than one block after simplify_cfg"
+                );
+            }
+        }
+    }
+
+    /// Regression: `remove_dead_insns` must terminate (and actually remove the
+    /// dead instruction) after a merge. With the duplicate-membership bug a dead
+    /// instruction left in a stale block list was re-discovered every round, so
+    /// this loop never finished.
+    #[test]
+    fn remove_dead_insns_terminates_after_merge() {
+        use crate::remove_dead_insns;
+        use qcode::value::Function;
+
+        let mut ctx = make_ctx();
+        qcode!(
+            ctx,
+            "
+            fn f:
+            <a>
+                goto <b>;
+            <b>
+                %y = i64 2 + i64 2;
+                goto <0x1001>;
+            "
+        );
+
+        simplify_cfg(&mut ctx, f);
+
+        let blocks: Vec<_> = Function::from_id(&ctx, f)
+            .iter()
+            .map(|blk| blk.id)
+            .collect();
+        for bid in blocks {
+            remove_dead_insns(&mut ctx, bid);
+        }
+
+        assert!(
+            Function::from_id(&ctx, f)
+                .iter()
+                .all(|blk| !blk.instruction_ids().contains(&y)),
+            "dead merged instruction must be removed, not looped on"
         );
     }
 }

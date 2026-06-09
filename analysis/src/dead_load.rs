@@ -10,12 +10,53 @@ use qcode::{
     },
 };
 
-fn is_reg_space(ctx: &Context, space_id: SpaceId) -> bool {
+/// A memory location that may still be read before being overwritten.
+///
+/// `space` is the space the access reads from (not the pointer's derived
+/// space): a register store can only be observed by a register load, so
+/// `may_alias` checks are scoped to matching spaces.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+pub(crate) struct LiveLoc {
+    pub ptr: ValueId,
+    pub size: usize,
+    pub space: SpaceId,
+}
+
+/// A byte interval `[start, end)` overwritten by a covering store before any
+/// read.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+pub(crate) struct KilledInterval {
+    pub space: SpaceId,
+    pub start: u64,
+    pub end: u64,
+}
+
+impl KilledInterval {
+    fn from_alias(iv: (SpaceId, u64, u64)) -> Self {
+        let (space, start, end) = iv;
+        Self { space, start, end }
+    }
+}
+
+/// Locations that may still be read.
+pub(crate) type LiveSet = Vec<LiveLoc>;
+/// Byte intervals overwritten before any read.
+pub(crate) type KilledSet = Vec<KilledInterval>;
+
+pub(crate) fn is_reg_space(ctx: &Context, space_id: SpaceId) -> bool {
     matches!(Space::from_id(ctx, space_id).ty, SpaceType::Register)
 }
 
-fn is_temp_space(ctx: &Context, space_id: SpaceId) -> bool {
+pub(crate) fn is_temp_space(ctx: &Context, space_id: SpaceId) -> bool {
     !is_reg_space(ctx, space_id) && space_id != ctx.default_space
+}
+
+/// True for spaces whose stores are eligible for cross-block dead-store
+/// elimination: register space and function-scoped temp spaces. The default
+/// (RAM/global) space is excluded because such stores may be observed outside
+/// the function.
+pub(crate) fn is_tracked_space(ctx: &Context, space_id: SpaceId) -> bool {
+    is_reg_space(ctx, space_id) || is_temp_space(ctx, space_id)
 }
 
 fn ptr_offset(ctx: &Context, ptr: ValueId) -> Option<i64> {
@@ -79,60 +120,23 @@ fn remove_overlap(set: &mut Vec<(i64, i64)>, range: (i64, i64)) {
 /// live readers and `must_alias` to confirm a later store kills an earlier one.
 /// Without `aliases`, the scan falls back to interval arithmetic restricted to
 /// the register address space.
+/// `dead_regs` is a list of register varnodes (as `ValueId::Varnode`) whose
+/// live-out value is never observable — any store to them with no subsequent
+/// read in the block is unconditionally dead, even without a covering later store.
 pub fn dead_load_insns(
     ctx: &Context,
     block_id: BlockId,
     aliases: Option<&AliasResult>,
+    dead_regs: &[ValueId],
 ) -> HashSet<InstructionId> {
     let insns: Vec<InstructionId> = BasicBlock::from_id(ctx, block_id)
         .instruction_ids()
         .to_vec();
-    let mut dead = HashSet::new();
-
-    // Dead loads: no users (any address space).
-    for &id in &insns {
-        if let Mnemonic::Load(_) = ctx.get_insn(id).mnemonic()
-            && ctx.users(id).is_empty()
-        {
-            dead.insert(id);
-        }
-    }
+    let mut dead = block_dead_loads(ctx, block_id);
 
     if let Some(aliases) = aliases {
-        // Alias-aware backward scan.
-        // live: (ptr, access_size, access_space) of loads not yet satisfied.
-        // The access_space is the space the load reads from, NOT the pointer's
-        // derived space. A register store can only be observed by a register
-        // load, so we scope the may_alias check to matching spaces.
-        let mut live: Vec<(ValueId, usize, SpaceId)> = Vec::new();
-        // killed: (ptr, access_size) of stores seen later in program order.
-        let mut killed: Vec<(ValueId, usize)> = Vec::new();
-
-        for &id in insns.iter().rev() {
-            match ctx.get_insn(id).mnemonic() {
-                Mnemonic::Load(load) if !dead.contains(&id) => {
-                    live.push((load.ptr, load.size, load.space));
-                }
-                Mnemonic::Store(store) => {
-                    let ptr = store.ptr;
-                    let size = store.size;
-                    let no_live_reader = !live
-                        .iter()
-                        .any(|(lp, _, ls)| *ls == store.space && aliases.may_alias(ctx, ptr, *lp));
-                    // A later store kills this one when its interval fully covers ours.
-                    let is_killed = killed.iter().any(|(kp, _)| aliases.covers(ptr, *kp));
-                    if no_live_reader && is_killed {
-                        dead.insert(id);
-                    } else {
-                        // Remove loads whose interval is fully covered by this store
-                        // and whose access space matches.
-                        live.retain(|(lp, _, ls)| *ls != store.space || !aliases.covers(*lp, ptr));
-                        killed.push((ptr, size));
-                    }
-                }
-                _ => {}
-            }
-        }
+        // Alias-aware backward scan, seeded empty (single-block).
+        scan_block_aliased(ctx, block_id, aliases, dead_regs, &mut dead, &[], &[]);
     } else {
         // Interval-based backward scan (register space only).
         // Dead loads already in the set are skipped so they don't prevent
@@ -151,11 +155,15 @@ pub fn dead_load_insns(
                 Mnemonic::Store(store) if is_reg_space(ctx, store.space) => {
                     if let Some(offset) = ptr_offset(ctx, store.ptr) {
                         let range = (offset, offset + store.size as i64);
-                        if !any_overlap(&live, range) && fully_covered(&killed, range) {
+                        let is_dead_reg = dead_regs.iter().any(|r| *r == store.ptr);
+                        if !any_overlap(&live, range)
+                            && (fully_covered(&killed, range) || is_dead_reg)
+                        {
                             dead.insert(id);
+                        } else {
+                            remove_overlap(&mut live, range);
+                            killed.push(range);
                         }
-                        remove_overlap(&mut live, range);
-                        killed.push(range);
                     }
                 }
                 _ => {}
@@ -166,13 +174,177 @@ pub fn dead_load_insns(
     dead
 }
 
+/// Loads in `block_id` whose result has no users (dead in any address space).
+fn block_dead_loads(ctx: &Context, block_id: BlockId) -> HashSet<InstructionId> {
+    let mut dead = HashSet::new();
+    for &id in BasicBlock::from_id(ctx, block_id).instruction_ids() {
+        if let Mnemonic::Load(_) = ctx.get_insn(id).mnemonic()
+            && ctx.users(id).is_empty()
+        {
+            dead.insert(id);
+        }
+    }
+    dead
+}
+
+/// True when `iv` is fully covered by the union of same-space `killed`
+/// intervals.
+fn fully_covered_iv(killed: &[KilledInterval], iv: KilledInterval) -> bool {
+    let pieces: Vec<(i64, i64)> = killed
+        .iter()
+        .filter(|k| k.space == iv.space)
+        .map(|k| (k.start as i64, k.end as i64))
+        .collect();
+    fully_covered(&pieces, (iv.start as i64, iv.end as i64))
+}
+
+/// Remove the byte range `iv` from the same-space `killed` intervals: a read of
+/// `iv` means the location is no longer "overwritten before read" for earlier
+/// instructions.
+fn punch_killed(killed: &mut Vec<KilledInterval>, iv: KilledInterval) {
+    let mut same: Vec<(i64, i64)> = killed
+        .iter()
+        .filter(|k| k.space == iv.space)
+        .map(|k| (k.start as i64, k.end as i64))
+        .collect();
+    remove_overlap(&mut same, (iv.start as i64, iv.end as i64));
+    killed.retain(|k| k.space != iv.space);
+    killed.extend(same.into_iter().map(|(s, e)| KilledInterval {
+        space: iv.space,
+        start: s as u64,
+        end: e as u64,
+    }));
+}
+
+/// Shared alias-aware backward scan of a single block.
+///
+/// `dead` is extended with the dead stores found. Returns the block's
+/// upward-exposed live set (`live_in`) and the locations guaranteed overwritten
+/// before any read from block entry (`killed_in`), which the cross-block
+/// dataflow in [`crate::mem_liveness`] propagates to predecessors.
+///
+/// `live` tracks [`LiveLoc`]s of loads not yet satisfied; `killed` tracks
+/// [`KilledInterval`]s of locations overwritten by a covering store before any
+/// read.
+fn scan_block_aliased(
+    ctx: &Context,
+    block_id: BlockId,
+    aliases: &AliasResult,
+    dead_regs: &[ValueId],
+    dead: &mut HashSet<InstructionId>,
+    live_seed: &[LiveLoc],
+    killed_seed: &[KilledInterval],
+) -> (LiveSet, KilledSet) {
+    let insns: Vec<InstructionId> = BasicBlock::from_id(ctx, block_id)
+        .instruction_ids()
+        .to_vec();
+    let mut live = live_seed.to_vec();
+    let mut killed = killed_seed.to_vec();
+
+    for &id in insns.iter().rev() {
+        match ctx.get_insn(id).mnemonic() {
+            Mnemonic::Load(load) if !dead.contains(&id) => {
+                match aliases.interval(load.ptr) {
+                    Some(iv) => punch_killed(&mut killed, KilledInterval::from_alias(iv)),
+                    // Unknown read location: conservatively drop same-space kills.
+                    None => killed.retain(|k| k.space != load.space),
+                }
+                live.push(LiveLoc {
+                    ptr: load.ptr,
+                    size: load.size,
+                    space: load.space,
+                });
+            }
+            Mnemonic::Store(store) => {
+                let ptr = store.ptr;
+                let ptr_iv = aliases.interval(ptr).map(KilledInterval::from_alias);
+                let no_live_reader = !live
+                    .iter()
+                    .any(|l| l.space == store.space && aliases.may_alias(ctx, ptr, l.ptr));
+                let is_killed = ptr_iv.is_some_and(|iv| fully_covered_iv(&killed, iv));
+                let is_dead_reg = dead_regs.contains(&ptr);
+                if no_live_reader && (is_killed || is_dead_reg) {
+                    dead.insert(id);
+                } else {
+                    // This store overwrites its location: it satisfies covered
+                    // live loads and becomes a kill for earlier instructions.
+                    live.retain(|l| l.space != store.space || !aliases.covers(l.ptr, ptr));
+                    if let Some(iv) = ptr_iv {
+                        killed.push(iv);
+                    }
+                }
+            }
+            // A call may read any register before its continuation overwrites it,
+            // so a register store preceding the call cannot be proven dead by a
+            // later (post-call) covering store. Drop register-space kills at the
+            // call boundary; explicit `dead_reg` removals still apply (they do not
+            // depend on `killed`). This keeps the caller's pre-call stack-pointer
+            // decrement (see call_summary::decrement_stack_pointer) alive so the
+            // callee's entry stack pointer is seeded correctly.
+            Mnemonic::Call(_) | Mnemonic::CallInd(_) => {
+                killed.retain(|k| !is_reg_space(ctx, k.space));
+            }
+            _ => {}
+        }
+    }
+    (live, killed)
+}
+
+/// Backward transfer function for one block, used by the cross-block memory
+/// liveness fixpoint. Given the live-out / killed-out seeds (from successors),
+/// returns this block's `(live_in, killed_in)`.
+pub(crate) fn block_transfer(
+    ctx: &Context,
+    block_id: BlockId,
+    aliases: &AliasResult,
+    dead_regs: &[ValueId],
+    live_seed: &[LiveLoc],
+    killed_seed: &[KilledInterval],
+) -> (LiveSet, KilledSet) {
+    let mut dead = block_dead_loads(ctx, block_id);
+    scan_block_aliased(
+        ctx,
+        block_id,
+        aliases,
+        dead_regs,
+        &mut dead,
+        live_seed,
+        killed_seed,
+    )
+}
+
+/// Like [`dead_load_insns`] but seeds the backward scan with the block's
+/// live-out / killed-out sets so stores dead across basic-block boundaries are
+/// detected.
+pub(crate) fn dead_load_insns_seeded(
+    ctx: &Context,
+    block_id: BlockId,
+    aliases: &AliasResult,
+    dead_regs: &[ValueId],
+    live_seed: &[LiveLoc],
+    killed_seed: &[KilledInterval],
+) -> HashSet<InstructionId> {
+    let mut dead = block_dead_loads(ctx, block_id);
+    scan_block_aliased(
+        ctx,
+        block_id,
+        aliases,
+        dead_regs,
+        &mut dead,
+        live_seed,
+        killed_seed,
+    );
+    dead
+}
+
 /// Removes dead loads/stores from `block_id` in-place.
 pub fn remove_dead_load_insns_block(
     ctx: &mut Context,
     block_id: BlockId,
     aliases: Option<&AliasResult>,
+    dead_regs: &[ValueId],
 ) {
-    let dead = dead_load_insns(ctx, block_id, aliases);
+    let dead = dead_load_insns(ctx, block_id, aliases, dead_regs);
     if dead.is_empty() {
         return;
     }
@@ -184,19 +356,37 @@ pub fn remove_dead_load_insns_block(
 /// Returns stores to temp/mysave spaces (not Register, not default RAM) from
 /// which no load ever reads within `function_id`. These stores are dead because
 /// the temp spaces are function-scoped and not observable outside.
+///
+/// When a store's pointer is a known literal, the check is address-precise:
+/// the store is dead only if no load in the function reads from an overlapping
+/// byte range in the same space. When the pointer is not a literal, the check
+/// falls back to space-level coarseness (dead only if the space has no loads).
 fn unread_temp_space_stores(ctx: &Context, function_id: FunctionId) -> HashSet<InstructionId> {
     let fun = Function::from_id(ctx, function_id);
     let mut loaded_spaces: HashSet<SpaceId> = HashSet::new();
-    let mut candidate_stores: Vec<(InstructionId, SpaceId)> = Vec::new();
+    // (space_id, byte_start, byte_end) for loads with known literal addresses
+    let mut loaded_intervals: Vec<(SpaceId, i64, i64)> = Vec::new();
+    // (insn_id, space_id, Some(start, end) if address is a literal)
+    let mut candidate_stores: Vec<(InstructionId, SpaceId, Option<(i64, i64)>)> = Vec::new();
 
     for block in &fun {
         for &insn_id in block.instruction_ids() {
             match ctx.get_insn(insn_id).mnemonic() {
                 Mnemonic::Load(load) if is_temp_space(ctx, load.space) => {
                     loaded_spaces.insert(load.space);
+                    if let ValueId::Literal(lid) = load.ptr {
+                        let addr = ctx.values.literals[lid].value as i64;
+                        loaded_intervals.push((load.space, addr, addr + load.size as i64));
+                    }
                 }
                 Mnemonic::Store(store) if is_temp_space(ctx, store.space) => {
-                    candidate_stores.push((insn_id, store.space));
+                    let interval = if let ValueId::Literal(lid) = store.ptr {
+                        let addr = ctx.values.literals[lid].value as i64;
+                        Some((addr, addr + store.size as i64))
+                    } else {
+                        None
+                    };
+                    candidate_stores.push((insn_id, store.space, interval));
                 }
                 _ => {}
             }
@@ -205,23 +395,57 @@ fn unread_temp_space_stores(ctx: &Context, function_id: FunctionId) -> HashSet<I
 
     candidate_stores
         .into_iter()
-        .filter(|(_, space_id)| !loaded_spaces.contains(space_id))
-        .map(|(id, _)| id)
+        .filter(|(_, space_id, interval)| match interval {
+            Some((start, end)) => !loaded_intervals.iter().any(|(ls, ls_start, ls_end)| {
+                ls == space_id && *ls_start < *end && *start < *ls_end
+            }),
+            None => !loaded_spaces.contains(space_id),
+        })
+        .map(|(id, _, _)| id)
         .collect()
 }
 
 /// Removes dead loads/stores from `function_id` in-place.
+///
+/// When `aliases` is provided, a flow-sensitive memory-liveness dataflow
+/// ([`crate::mem_liveness`]) is run over the CFG so that register/temp-space
+/// stores that are dead *across* basic-block boundaries — overwritten before
+/// being read on every path, or written to a `dead_reg` and never read — are
+/// removed. Without `aliases` each block is treated independently.
 pub fn remove_dead_load_insns(
     ctx: &mut Context,
     function_id: FunctionId,
     aliases: Option<&AliasResult>,
+    dead_regs: &[ValueId],
 ) {
-    let fun = Function::from_id(ctx, function_id);
+    let block_ids: Vec<BlockId> = Function::from_id(ctx, function_id)
+        .iter()
+        .map(|block| block.id)
+        .collect();
 
     let mut dead = HashSet::new();
     dead.extend(unread_temp_space_stores(ctx, function_id));
-    for block in &fun {
-        dead.extend(dead_load_insns(ctx, block.id, aliases));
+
+    match aliases {
+        Some(aliases) => {
+            let liveness =
+                crate::mem_liveness::compute_memory_liveness(ctx, function_id, aliases, dead_regs);
+            for &block_id in &block_ids {
+                dead.extend(dead_load_insns_seeded(
+                    ctx,
+                    block_id,
+                    aliases,
+                    dead_regs,
+                    liveness.live_out(block_id),
+                    liveness.killed_out(block_id),
+                ));
+            }
+        }
+        None => {
+            for &block_id in &block_ids {
+                dead.extend(dead_load_insns(ctx, block_id, None, dead_regs));
+            }
+        }
     }
 
     for id in &dead {
@@ -261,7 +485,7 @@ mod tests {
             b.push_load::<false>(rax_ptr, 8, space);
         });
 
-        let dead = dead_load_insns(&ctx, block_id, None);
+        let dead = dead_load_insns(&ctx, block_id, None, &[]);
         assert!(!dead.is_empty(), "dead load should be detected");
     }
 
@@ -276,7 +500,7 @@ mod tests {
             b.push_add(loaded_id, one);
         });
 
-        let dead = dead_load_insns(&ctx, block_id, None);
+        let dead = dead_load_insns(&ctx, block_id, None, &[]);
         let load_ids: Vec<_> = BasicBlock::from_id(&ctx, block_id)
             .instruction_ids()
             .iter()
@@ -305,7 +529,7 @@ mod tests {
         );
         let block_id = block;
 
-        let dead = dead_load_insns(&ctx, block_id, None);
+        let dead = dead_load_insns(&ctx, block_id, None, &[]);
         let store_ids: Vec<_> = BasicBlock::from_id(&ctx, block_id)
             .instruction_ids()
             .iter()
@@ -332,7 +556,7 @@ mod tests {
         );
         let block_id = block;
 
-        let dead = dead_load_insns(&ctx, block_id, None);
+        let dead = dead_load_insns(&ctx, block_id, None, &[]);
 
         let store_ids: Vec<_> = BasicBlock::from_id(&ctx, block_id)
             .instruction_ids()
@@ -371,7 +595,7 @@ mod tests {
             b.push_add(loaded_id, zero);
         });
 
-        let dead = dead_load_insns(&ctx, block_id, None);
+        let dead = dead_load_insns(&ctx, block_id, None, &[]);
         let store_ids: Vec<_> = BasicBlock::from_id(&ctx, block_id)
             .instruction_ids()
             .iter()
@@ -400,7 +624,7 @@ mod tests {
         let block_id = block;
 
         let aliases = crate::AliasResult::simple(&ctx);
-        let dead = dead_load_insns(&ctx, block_id, Some(&aliases));
+        let dead = dead_load_insns(&ctx, block_id, Some(&aliases), &[]);
         let store_ids: Vec<_> = BasicBlock::from_id(&ctx, block_id)
             .instruction_ids()
             .iter()
@@ -432,7 +656,7 @@ mod tests {
         let block_id = block;
 
         let aliases = crate::AliasResult::simple(&ctx);
-        let dead = dead_load_insns(&ctx, block_id, Some(&aliases));
+        let dead = dead_load_insns(&ctx, block_id, Some(&aliases), &[]);
         let store_a_ids: Vec<_> = BasicBlock::from_id(&ctx, block_id)
             .instruction_ids()
             .iter()
@@ -476,7 +700,7 @@ mod tests {
         });
 
         let aliases = crate::AliasResult::simple(&ctx);
-        let dead = dead_load_insns(&ctx, block_id, Some(&aliases));
+        let dead = dead_load_insns(&ctx, block_id, Some(&aliases), &[]);
 
         let store_ids: Vec<_> = BasicBlock::from_id(&ctx, block_id)
             .instruction_ids()

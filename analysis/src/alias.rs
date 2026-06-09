@@ -36,6 +36,13 @@ impl AliasResult {
         self.value_to_root.get(&a).copied()
     }
 
+    /// The exact byte interval `(space, start, end)` of `a`, when a
+    /// location-aware analysis (e.g. [`AliasResult::simple`]) could statically
+    /// resolve it. Returns `None` for values with no precise location.
+    pub fn interval(&self, a: ValueId) -> Option<(SpaceId, u64, u64)> {
+        self.value_to_interval.get(&a).copied()
+    }
+
     /// Conservative must-alias query.
     ///
     /// Returns `true` only when `a` and `b` are guaranteed to refer to the
