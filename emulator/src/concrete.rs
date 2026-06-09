@@ -1212,6 +1212,43 @@ impl StandaloneEmulator {
     /// outermost `Return` is reached (without executing it).
     /// Nested calls are tracked via `call_depth` so inner returns are handled normally.
     /// The `call_stack` field is updated throughout execution.
+    /// Seed a function's entry-block params with the values of the registers
+    /// they were promoted from.
+    ///
+    /// `mem2reg` turns each register that is live-in to a function into a
+    /// root-block parameter named after that register — these are the function's
+    /// arguments. Entering the function (at the top level or via a call) binds
+    /// those params from the current register file, so the callee receives the
+    /// caller's register state through the calling convention. Params with no
+    /// matching register (e.g. promoted stack slots) are left unbound.
+    fn seed_entry_params(&mut self, ctx: &Context<'_>, func: FunctionId) {
+        let Some(root) = Function::from_id(ctx, func).root() else {
+            return;
+        };
+        let root_id = root.id;
+        let params: Vec<(BlockParamId, Option<VarnodeId>, usize)> =
+            BasicBlock::from_id(ctx, root_id)
+                .params()
+                .map(|param| {
+                    let src = param
+                        .name()
+                        .and_then(|name| ctx.get_named(name))
+                        .and_then(|value| match value {
+                            ValueId::Varnode(id) => Some(id),
+                            _ => None,
+                        });
+                    (param.id, src, param.size())
+                })
+                .collect();
+        for (param_id, src, size) in params {
+            let Some(varnode_id) = src else { continue };
+            if let Some(value) = self.read_varnode(ctx, varnode_id) {
+                self.block_param_values
+                    .insert(param_id, SizedValue::new(value, size));
+            }
+        }
+    }
+
     pub fn run_function(&mut self, ctx: &Context<'_>, func: FunctionId) -> crate::Result<()> {
         let root = Function::from_id(ctx, func)
             .root()
@@ -1220,6 +1257,7 @@ impl StandaloneEmulator {
         self.block = root;
         self.idx = 0;
         self.call_stack.push(func);
+        self.seed_entry_params(ctx, func);
 
         let mut call_depth: i32 = 0;
 
@@ -1237,12 +1275,17 @@ impl StandaloneEmulator {
                 StepEvent::DirectCallEntered(target) => {
                     call_depth += 1;
                     self.call_stack.push(target);
+                    // Pass arguments: bind the callee's entry params from the
+                    // registers the calling convention placed them in.
+                    self.seed_entry_params(ctx, target);
                 }
                 StepEvent::IndirectCallEntered => {
                     call_depth += 1;
                     // Infer the callee from the block we landed in.
                     if let Some(parent) = BasicBlock::from_id(ctx, self.block).parent() {
-                        self.call_stack.push(parent.id);
+                        let callee = parent.id;
+                        self.call_stack.push(callee);
+                        self.seed_entry_params(ctx, callee);
                     }
                 }
                 StepEvent::Return => {
