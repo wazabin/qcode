@@ -709,8 +709,8 @@ fn comment_text(raw: &str) -> String {
 }
 
 fn attach_comment(pending: &mut Option<String>, stmts: &mut Vec<Statement>) {
-    if let Some(comment) = pending.take() {
-        if !stmts.is_empty() {
+    if let Some(comment) = pending.take()
+        && !stmts.is_empty() {
             let first = stmts.remove(0);
             stmts.insert(
                 0,
@@ -720,7 +720,6 @@ fn attach_comment(pending: &mut Option<String>, stmts: &mut Vec<Statement>) {
                 },
             );
         }
-    }
 }
 
 fn to_parse_error(error: pest::error::Error<Rule>) -> ParseError {

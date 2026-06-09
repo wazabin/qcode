@@ -29,6 +29,7 @@ const NORETURN_NAMES: &[&str] = &[
     "exit",
     "_exit",
     "_Exit",
+    "quick_exit",
     "abort",
     "__stack_chk_fail",
     "_Unwind_Resume",
@@ -36,6 +37,10 @@ const NORETURN_NAMES: &[&str] = &[
     "siglongjmp",
     "__assert_fail",
     "pthread_exit",
+    "ExitProcess",
+    "ExitThread",
+    "RtlExitUserProcess",
+    "RtlExitUserThread",
 ];
 
 /// *Make* pass — record call-return assumptions across the whole program.
@@ -162,7 +167,7 @@ pub fn verify_assumptions(ctx: &mut Context) -> HashSet<FunctionId> {
 fn function_returns(ctx: &Context, f: FunctionId) -> bool {
     let func = Function::from_id(ctx, f);
 
-    if NORETURN_NAMES.contains(&func.name()) {
+    if is_noreturn_name(func.name()) {
         return false;
     }
     if func.is_external() {
@@ -174,6 +179,19 @@ fn function_returns(ctx: &Context, f: FunctionId) -> bool {
             .iter()
             .any(|insn| matches!(insn.mnemonic(), Mnemonic::Return(_)))
     })
+}
+
+fn is_noreturn_name(name: &str) -> bool {
+    let base = name
+        .rsplit("::")
+        .next()
+        .unwrap_or(name)
+        .split('@')
+        .next()
+        .unwrap_or(name);
+    NORETURN_NAMES
+        .iter()
+        .any(|known| known.eq_ignore_ascii_case(base))
 }
 
 /// Run assumption-dependent analysis to a fixpoint with whole-program
@@ -201,5 +219,18 @@ pub fn analyze_with_assumptions<'str>(
             return ctx;
         }
         knowledge.noreturn.extend(learned);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn noreturn_names_match_windows_import_display_names() {
+        assert!(is_noreturn_name("KERNEL32.DLL::ExitProcess"));
+        assert!(is_noreturn_name("kernel32.dll::exitthread@4"));
+        assert!(is_noreturn_name("LIBC::abort"));
+        assert!(!is_noreturn_name("KERNEL32.DLL::CreateFileW"));
     }
 }

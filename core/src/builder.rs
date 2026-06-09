@@ -338,6 +338,9 @@ impl<'str, 'ctx> Builder<'str, 'ctx> {
         type_id: TypeId,
     ) -> InstructionRef<'str, '_> {
         if self.is_terminated && self.insert_point.is_none() {
+            if let Some(address) = self.address.or_else(|| self.block.address()) {
+                panic!("cannot append instruction to a terminated block at {address:#x}");
+            }
             panic!("cannot append instruction to a terminated block");
         }
 
@@ -1442,6 +1445,32 @@ mod tests {
         let insn = Instruction::from_id(&ctx, not_insn_id);
 
         assert_eq!(insn.address().unwrap(), 0x1000);
+    }
+
+    #[test]
+    fn append_after_terminated_block_panic_includes_current_address() {
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let mut ctx = Context::new();
+            let value = ctx.get_const(0, 1).id();
+            let mut builder = Builder::from_context(&mut ctx, 0x4010);
+            let target = builder.get_or_make_block(0x4020);
+
+            builder.push_branch(target);
+            builder.set_address(0x4015);
+            builder.push_bool_not(value);
+        }));
+
+        let panic = result.expect_err("append should panic after a terminator");
+        let message = panic
+            .downcast_ref::<String>()
+            .map(String::as_str)
+            .or_else(|| panic.downcast_ref::<&'static str>().copied())
+            .expect("panic should carry a string message");
+
+        assert!(
+            message.contains("cannot append instruction to a terminated block at 0x4015"),
+            "unexpected panic message: {message}"
+        );
     }
 
     #[test]

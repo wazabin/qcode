@@ -10,15 +10,16 @@
 //! via [`ArchConfig`]. Callers build one with `harbinger::arch::arch_config`.
 
 use qcode::{
+    assumption::AssumptionKnowledge,
     context::Context,
     value::{FunctionId, FunctionRef, RegisterId, ValueId, VarnodeId},
 };
 
 use crate::{
-    AliasResult, analyze_with_assumptions, apply_all_external_signatures, bind_all_call_args,
+    AliasResult, apply_all_external_signatures, assume_call_returns, bind_all_call_args,
     brighten_stack, constant_fold_function, dead_load::remove_dead_load_insns, gvn_function,
     lower_stack, mem2reg, remove_dead_insns, set_all_call_clobbered_regs,
-    set_all_function_summaries, simplify_cfg,
+    set_all_function_summaries, simplify_cfg, verify_assumptions,
 };
 
 /// The architecture-specific registers the register-aware passes need.
@@ -87,6 +88,31 @@ pub enum Pass {
     DCE,
     Simplify,
     LowerStack,
+}
+
+#[derive(Clone, Debug)]
+pub enum PipelineProgress {
+    Started,
+    AssumptionRound {
+        round: usize,
+    },
+    AssumptionsRecorded {
+        round: usize,
+        count: usize,
+    },
+    WholeProgramPhase {
+        round: usize,
+        name: &'static str,
+    },
+    FunctionPass {
+        round: usize,
+        stage: &'static str,
+        function: String,
+        index: usize,
+        total: usize,
+        pass: Pass,
+    },
+    Finished,
 }
 
 /// Every selectable pass, in the order `opt --opt all` applies them (with the
@@ -232,7 +258,28 @@ pub fn run_passes(
     passes: &[Pass],
     cfg: &ArchConfig,
 ) -> Result<(), String> {
-    for pass in passes {
+    run_passes_with_progress(ctx, fun_id, passes, cfg, |_| {})
+}
+
+/// Run an ordered list of passes over a single function and report each pass.
+pub fn run_passes_with_progress(
+    ctx: &mut Context,
+    fun_id: FunctionId,
+    passes: &[Pass],
+    cfg: &ArchConfig,
+    mut progress: impl FnMut(PipelineProgress),
+) -> Result<(), String> {
+    let function = FunctionRef::from_id(ctx, fun_id).name().to_string();
+    let total = passes.len();
+    for (index, pass) in passes.iter().enumerate() {
+        progress(PipelineProgress::FunctionPass {
+            round: 0,
+            stage: "Pipeline",
+            function: function.clone(),
+            index: index + 1,
+            total,
+            pass: *pass,
+        });
         pass.run(ctx, fun_id, cfg)
             .map_err(|e| format!("{}: {}", pass.name(), e))?;
     }
@@ -244,11 +291,21 @@ pub fn run_passes(
 /// This is the "dependent" body wrapped by [`analyze_default`]: the passes the
 /// checkpoint+replay driver runs on the assumed call-return edges.
 pub fn run_default_all_functions(ctx: &mut Context, cfg: &ArchConfig) -> Result<(), String> {
+    run_default_all_functions_with_progress(ctx, cfg, 0, &mut |_| {})
+}
+
+pub fn run_default_all_functions_with_progress(
+    ctx: &mut Context,
+    cfg: &ArchConfig,
+    round: usize,
+    progress: &mut impl FnMut(PipelineProgress),
+) -> Result<(), String> {
     let fun_ids: Vec<FunctionId> = ctx
         .functions()
         .filter(|f| !f.is_external())
         .map(|f| f.id)
         .collect();
+    let total = fun_ids.len();
 
     // Seed each function's call-clobbered-register set from the lifted IR *before*
     // the value-producing passes run. mem2reg and GVN consult a callee's clobbers
@@ -257,11 +314,17 @@ pub fn run_default_all_functions(ctx: &mut Context, cfg: &ArchConfig) -> Result<
     // verified `written − read-before-written` set, which excludes a callee's
     // saved/restored frame pointer and incoming arg registers; the precise
     // summaries computed at binding (below) later overwrite it.
+    progress(PipelineProgress::WholeProgramPhase {
+        round,
+        name: "Seed call clobbers",
+    });
     set_all_call_clobbered_regs(ctx);
 
     // Value-producing passes first, on every function.
-    for fun_id in &fun_ids {
-        run_passes(ctx, *fun_id, PRE_BIND, cfg)?;
+    for (index, fun_id) in fun_ids.iter().enumerate() {
+        run_default_pass_group(
+            ctx, *fun_id, PRE_BIND, cfg, round, "Pre-bind", index, total, progress,
+        )?;
     }
 
     // Interprocedural binding, after every function is post-mem2reg/gvn but
@@ -273,21 +336,73 @@ pub fn run_default_all_functions(ctx: &mut Context, cfg: &ArchConfig) -> Result<
     // DeadStore/DCE keeps the arg-setup stores alive long enough for the binder to
     // forward them into the call's argument list.
     let sp_varnode = ctx.registers[&cfg.stack_pointer];
+    progress(PipelineProgress::WholeProgramPhase {
+        round,
+        name: "Apply external signatures",
+    });
     apply_all_external_signatures(ctx, &cfg.abi);
+    progress(PipelineProgress::WholeProgramPhase {
+        round,
+        name: "Set function summaries",
+    });
     set_all_function_summaries(ctx, sp_varnode);
+    progress(PipelineProgress::WholeProgramPhase {
+        round,
+        name: "Bind call arguments",
+    });
     bind_all_call_args(ctx, sp_varnode);
 
     // Eliminating passes: drop the now-dead arg-setup stores and the loads the
     // binder forwarded (the CFG was already simplified in PRE_BIND).
-    for fun_id in &fun_ids {
-        run_passes(ctx, *fun_id, POST_BIND, cfg)?;
+    for (index, fun_id) in fun_ids.iter().enumerate() {
+        run_default_pass_group(
+            ctx,
+            *fun_id,
+            POST_BIND,
+            cfg,
+            round,
+            "Post-bind",
+            index,
+            total,
+            progress,
+        )?;
     }
 
     // Lowering last: rewrite the surviving `@stack_base ± N` literals back onto
     // each function's real stack pointer. Runs after summaries/binding so the
     // `RSP = @stack_base + N` epilogue is still intact when the delta is read.
-    for fun_id in &fun_ids {
-        run_passes(ctx, *fun_id, LOWER, cfg)?;
+    for (index, fun_id) in fun_ids.iter().enumerate() {
+        run_default_pass_group(
+            ctx, *fun_id, LOWER, cfg, round, "Lowering", index, total, progress,
+        )?;
+    }
+    Ok(())
+}
+
+fn run_default_pass_group(
+    ctx: &mut Context,
+    fun_id: FunctionId,
+    passes: &[Pass],
+    cfg: &ArchConfig,
+    round: usize,
+    stage: &'static str,
+    index: usize,
+    total: usize,
+    progress: &mut impl FnMut(PipelineProgress),
+) -> Result<(), String> {
+    let function = FunctionRef::from_id(ctx, fun_id).name().to_string();
+    let total = total * passes.len();
+    for (pass_index, pass) in passes.iter().enumerate() {
+        progress(PipelineProgress::FunctionPass {
+            round,
+            stage,
+            function: function.clone(),
+            index: index * passes.len() + pass_index + 1,
+            total,
+            pass: *pass,
+        });
+        pass.run(ctx, fun_id, cfg)
+            .map_err(|e| format!("{}: {}", pass.name(), e))?;
     }
     Ok(())
 }
@@ -303,7 +418,39 @@ pub fn run_default_all_functions(ctx: &mut Context, cfg: &ArchConfig) -> Result<
 /// Pass errors abort the analysis and surface through the panicking driver; the
 /// passes only error on an unrecognised architecture, which `cfg` already pins.
 pub fn analyze_default<'s>(baseline: &Context<'s>, cfg: &ArchConfig) -> Context<'s> {
-    analyze_with_assumptions(baseline, |ctx| {
-        run_default_all_functions(ctx, cfg).expect("default pipeline pass failed");
-    })
+    analyze_default_with_progress(baseline, cfg, |_| {})
+}
+
+pub fn analyze_default_with_progress<'s>(
+    baseline: &Context<'s>,
+    cfg: &ArchConfig,
+    mut progress: impl FnMut(PipelineProgress),
+) -> Context<'s> {
+    let mut knowledge = AssumptionKnowledge::default();
+    let mut round = 0usize;
+
+    progress(PipelineProgress::Started);
+    loop {
+        round += 1;
+        progress(PipelineProgress::AssumptionRound { round });
+
+        let mut ctx = baseline.clone();
+        let count = assume_call_returns(&mut ctx, &knowledge);
+        progress(PipelineProgress::AssumptionsRecorded { round, count });
+
+        run_default_all_functions_with_progress(&mut ctx, cfg, round, &mut progress)
+            .expect("default pipeline pass failed");
+
+        progress(PipelineProgress::WholeProgramPhase {
+            round,
+            name: "Verify assumptions",
+        });
+        let learned = verify_assumptions(&mut ctx);
+
+        if learned.iter().all(|f| knowledge.noreturn.contains(f)) {
+            progress(PipelineProgress::Finished);
+            return ctx;
+        }
+        knowledge.noreturn.extend(learned);
+    }
 }

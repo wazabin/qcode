@@ -273,11 +273,10 @@ fn algebraic_identity(ctx: &mut Context, m: &Mnemonic, output_size: usize) -> Op
                 return Some(rhs);
             }
         }
-        IntBinop::Sub => {
-            if r == Some(0) {
+        IntBinop::Sub
+            if r == Some(0) => {
                 return Some(lhs);
             }
-        }
         // x | 0 = x ; x ^ 0 = x  (both commutative)
         IntBinop::Or | IntBinop::Xor => {
             if r == Some(0) {
@@ -312,11 +311,10 @@ fn algebraic_identity(ctx: &mut Context, m: &Mnemonic, output_size: usize) -> Op
             }
         }
         // x << 0 = x ; x >> 0 = x  (shift amount is the rhs)
-        IntBinop::ShiftLeft | IntBinop::ShiftRight | IntBinop::SShiftRight => {
-            if r == Some(0) {
+        IntBinop::ShiftLeft | IntBinop::ShiftRight | IntBinop::SShiftRight
+            if r == Some(0) => {
                 return Some(lhs);
             }
-        }
         _ => {}
     }
 

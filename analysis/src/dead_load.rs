@@ -155,7 +155,7 @@ pub fn dead_load_insns(
                 Mnemonic::Store(store) if is_reg_space(ctx, store.space) => {
                     if let Some(offset) = ptr_offset(ctx, store.ptr) {
                         let range = (offset, offset + store.size as i64);
-                        let is_dead_reg = dead_regs.iter().any(|r| *r == store.ptr);
+                        let is_dead_reg = dead_regs.contains(&store.ptr);
                         if !any_overlap(&live, range)
                             && (fully_covered(&killed, range) || is_dead_reg)
                         {
