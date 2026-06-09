@@ -1,4 +1,7 @@
-use crate::{DomainMemory, EmulatorError, EmulatorErrorKind, Interpreter};
+use crate::{
+    CallContinuation, CallInterception, CallSite, DomainMemory, EmulatorError, EmulatorErrorKind,
+    Interpreter,
+};
 use qcode::{
     context::Context,
     space::{Space, SpaceId, SpaceType},
@@ -698,6 +701,24 @@ impl DomainMemory for EmulatedMemory {
 
 /// Type alias for an instruction hook function, which is called with the current instruction and emulator state after each instruction is executed.
 type InstructionHook = Box<dyn Fn(&InstructionRef<'_, '_>, &StandaloneEmulator) + Send + Sync>;
+type CallInterceptor = Box<
+    dyn FnMut(
+            &Context<'_>,
+            &mut StandaloneEmulator,
+            &CallSite,
+        ) -> Result<CallInterception, Box<str>>
+        + Send
+        + Sync,
+>;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StepEvent {
+    Normal,
+    DirectCallEntered(FunctionId),
+    IndirectCallEntered,
+    Return,
+    InterceptedCall,
+}
 
 /// A lifetime-free emulator that takes `&Context<'_>` explicitly on each call.
 /// Use this when you need to store an emulator without a lifetime (e.g., across an FFI boundary).
@@ -711,6 +732,7 @@ pub struct StandaloneEmulator {
     pub call_stack: Vec<FunctionId>,
 
     pub instruction_hook: Option<InstructionHook>,
+    call_interceptor: Option<CallInterceptor>,
 }
 
 impl StandaloneEmulator {
@@ -723,6 +745,7 @@ impl StandaloneEmulator {
             idx: 0,
             call_stack: Vec::new(),
             instruction_hook: None,
+            call_interceptor: None,
         }
     }
 
@@ -735,6 +758,15 @@ impl StandaloneEmulator {
             .or_else(|| block.instruction_ids().last().copied())
             .expect("cannot construct EmulatorError for empty block");
 
+        EmulatorError::new(kind, &Instruction::from_id(ctx, instruction))
+    }
+
+    fn make_error_at(
+        &self,
+        ctx: &Context<'_>,
+        instruction: InstructionId,
+        kind: EmulatorErrorKind,
+    ) -> EmulatorError {
         EmulatorError::new(kind, &Instruction::from_id(ctx, instruction))
     }
 
@@ -910,6 +942,51 @@ impl StandaloneEmulator {
         self.block
     }
 
+    pub fn set_call_interceptor(
+        &mut self,
+        interceptor: impl FnMut(
+            &Context<'_>,
+            &mut StandaloneEmulator,
+            &CallSite,
+        ) -> Result<CallInterception, Box<str>>
+        + Send
+        + Sync
+        + 'static,
+    ) {
+        self.call_interceptor = Some(Box::new(interceptor));
+    }
+
+    pub fn clear_call_interceptor(&mut self) {
+        self.call_interceptor = None;
+    }
+
+    pub fn read_memory(
+        &mut self,
+        ctx: &Context<'_>,
+        space: SpaceId,
+        addr: u64,
+        size: usize,
+    ) -> Result<Vec<u8>, EmulatorErrorKind> {
+        self.memory.configure_spaces(ctx);
+        self.memory.read_raw(space, addr, size)
+    }
+
+    pub fn write_memory(
+        &mut self,
+        ctx: &Context<'_>,
+        space: SpaceId,
+        addr: u64,
+        value: &[u8],
+    ) -> Result<(), EmulatorErrorKind> {
+        self.memory.configure_spaces(ctx);
+        let space = self.memory.spaces.entry(space).or_default();
+        space.reserve(value.len());
+        for (i, byte) in value.iter().enumerate() {
+            space.write_byte(addr + i as u64, *byte);
+        }
+        Ok(())
+    }
+
     fn collect_block_args(
         &mut self,
         ctx: &Context<'_>,
@@ -944,9 +1021,63 @@ impl StandaloneEmulator {
         Ok(())
     }
 
-    pub fn step(&mut self, ctx: &Context<'_>) -> crate::Result<()> {
+    fn apply_call_continuation(
+        &mut self,
+        ctx: &Context<'_>,
+        continuation: CallContinuation,
+    ) -> Result<(), EmulatorErrorKind> {
+        let target = match continuation {
+            CallContinuation::Block(block) => block,
+            CallContinuation::Address(addr) => {
+                BasicBlock::from_addr(ctx, addr)
+                    .ok_or(EmulatorErrorKind::InvalidBlockAddress(addr))?
+                    .id
+            }
+        };
+        self.block = target;
+        self.idx = 0;
+        Ok(())
+    }
+
+    fn intercept_call(
+        &mut self,
+        ctx: &Context<'_>,
+        block: BlockId,
+        instruction: InstructionId,
+        call: &Call,
+    ) -> crate::Result<Option<StepEvent>> {
+        let Some(mut interceptor) = self.call_interceptor.take() else {
+            return Ok(None);
+        };
+
+        let site = CallSite {
+            instruction,
+            block,
+            target: call.target,
+            args: call.args.clone(),
+        };
+        let result = interceptor(ctx, self, &site);
+        self.call_interceptor = Some(interceptor);
+
+        match result {
+            Ok(CallInterception::PassThrough) => Ok(None),
+            Ok(CallInterception::Handled(continuation)) => {
+                self.apply_call_continuation(ctx, continuation)
+                    .map_err(|kind| self.make_error_at(ctx, instruction, kind))?;
+                Ok(Some(StepEvent::InterceptedCall))
+            }
+            Err(message) => Err(self.make_error_at(
+                ctx,
+                instruction,
+                EmulatorErrorKind::InterceptError(message),
+            )),
+        }
+    }
+
+    fn step_with_event(&mut self, ctx: &Context<'_>) -> crate::Result<StepEvent> {
         self.memory.configure_spaces(ctx);
-        let block = BasicBlock::from_id(ctx, self.block);
+        let block_id = self.block;
+        let block = BasicBlock::from_id(ctx, block_id);
         let insn_ids = block.instruction_ids();
         assert!(self.idx < insn_ids.len(), "Reached end of block");
         let insn_id = insn_ids[self.idx];
@@ -965,7 +1096,11 @@ impl StandaloneEmulator {
                 self.idx = 0;
             }
 
-            &Mnemonic::Call(Call { target, .. }) => {
+            Mnemonic::Call(call) => {
+                if let Some(event) = self.intercept_call(ctx, block_id, insn_id, call)? {
+                    return Ok(event);
+                }
+                let target = call.target;
                 self.block = Function::from_id(ctx, target)
                     .root()
                     .ok_or_else(|| {
@@ -973,6 +1108,7 @@ impl StandaloneEmulator {
                     })?
                     .id;
                 self.idx = 0;
+                return Ok(StepEvent::DirectCallEntered(target));
             }
 
             Mnemonic::CBranch(CBranch {
@@ -995,9 +1131,7 @@ impl StandaloneEmulator {
                 self.idx = 0;
             }
 
-            Mnemonic::BranchInd(BranchInd { ptr })
-            | Mnemonic::CallInd(CallInd { ptr, .. })
-            | Mnemonic::Return(Return { ptr, .. }) => {
+            Mnemonic::BranchInd(BranchInd { ptr }) => {
                 let addr = self.get_value(ctx, *ptr).unwrap();
                 let target = BasicBlock::from_addr(ctx, addr)
                     .ok_or_else(|| {
@@ -1006,6 +1140,30 @@ impl StandaloneEmulator {
                     .id;
                 self.block = target;
                 self.idx = 0;
+            }
+
+            Mnemonic::CallInd(CallInd { ptr, .. }) => {
+                let addr = self.get_value(ctx, *ptr).unwrap();
+                let target = BasicBlock::from_addr(ctx, addr)
+                    .ok_or_else(|| {
+                        self.make_error(ctx, EmulatorErrorKind::InvalidBlockAddress(addr))
+                    })?
+                    .id;
+                self.block = target;
+                self.idx = 0;
+                return Ok(StepEvent::IndirectCallEntered);
+            }
+
+            Mnemonic::Return(Return { ptr, .. }) => {
+                let addr = self.get_value(ctx, *ptr).unwrap();
+                let target = BasicBlock::from_addr(ctx, addr)
+                    .ok_or_else(|| {
+                        self.make_error(ctx, EmulatorErrorKind::InvalidBlockAddress(addr))
+                    })?
+                    .id;
+                self.block = target;
+                self.idx = 0;
+                return Ok(StepEvent::Return);
             }
 
             _ => {
@@ -1022,7 +1180,11 @@ impl StandaloneEmulator {
             }
         }
 
-        Ok(())
+        Ok(StepEvent::Normal)
+    }
+
+    pub fn step(&mut self, ctx: &Context<'_>) -> crate::Result<()> {
+        self.step_with_event(ctx).map(|_| ())
     }
 
     pub fn run_block(&mut self, ctx: &Context<'_>) -> crate::Result<()> {
@@ -1067,29 +1229,27 @@ impl StandaloneEmulator {
                 .to_vec();
             let insn = InstructionRef::new(ctx, insn_ids[self.idx]);
 
-            match insn.mnemonic() {
-                Mnemonic::Return(_) if call_depth == 0 => break Ok(()),
-                Mnemonic::Call(Call { target, .. }) => {
+            if matches!(insn.mnemonic(), Mnemonic::Return(_)) && call_depth == 0 {
+                break Ok(());
+            }
+
+            match self.step_with_event(ctx)? {
+                StepEvent::DirectCallEntered(target) => {
                     call_depth += 1;
-                    self.call_stack.push(*target);
-                    self.step(ctx)?;
+                    self.call_stack.push(target);
                 }
-                Mnemonic::CallInd(_) => {
+                StepEvent::IndirectCallEntered => {
                     call_depth += 1;
-                    self.step(ctx)?;
-                    // Infer the callee from the block we landed in
+                    // Infer the callee from the block we landed in.
                     if let Some(parent) = BasicBlock::from_id(ctx, self.block).parent() {
                         self.call_stack.push(parent.id);
                     }
                 }
-                Mnemonic::Return(_) => {
+                StepEvent::Return => {
                     self.call_stack.pop();
                     call_depth -= 1;
-                    self.step(ctx)?;
                 }
-                _ => {
-                    self.step(ctx)?;
-                }
+                StepEvent::Normal | StepEvent::InterceptedCall => {}
             }
         };
 
@@ -1161,6 +1321,24 @@ impl<'ctx> Emulator<'ctx> {
         self.inner.instruction_hook = Some(Box::new(hook));
     }
 
+    pub fn set_call_interceptor(
+        &mut self,
+        interceptor: impl FnMut(
+            &Context<'_>,
+            &mut StandaloneEmulator,
+            &CallSite,
+        ) -> Result<CallInterception, Box<str>>
+        + Send
+        + Sync
+        + 'static,
+    ) {
+        self.inner.set_call_interceptor(interceptor);
+    }
+
+    pub fn clear_call_interceptor(&mut self) {
+        self.inner.clear_call_interceptor();
+    }
+
     pub fn from_function(ctx: &'ctx Context<'ctx>, func: FunctionId) -> Self {
         let entry = Function::from_id(ctx, func)
             .root()
@@ -1215,12 +1393,16 @@ impl<'ctx> Emulator<'ctx> {
         addr: u64,
         value: &[u8],
     ) -> Result<(), EmulatorErrorKind> {
-        let space = self.inner.memory.spaces.entry(space).or_default();
-        space.reserve(value.len());
-        for (i, byte) in value.iter().enumerate() {
-            space.write_byte(addr + i as u64, *byte);
-        }
-        Ok(())
+        self.inner.write_memory(self.ctx, space, addr, value)
+    }
+
+    pub fn read_memory(
+        &mut self,
+        space: SpaceId,
+        addr: u64,
+        size: usize,
+    ) -> Result<Vec<u8>, EmulatorErrorKind> {
+        self.inner.read_memory(self.ctx, space, addr, size)
     }
 
     /// Sets the value of a register using full 128-bit precision.
@@ -1365,6 +1547,7 @@ mod tests {
     use qcode::context::Context;
     use qcode::space::{Space, SpaceType};
     use qcode_macro::qcode;
+    use std::sync::{Arc, Mutex};
 
     #[test]
     fn sized_value_masks_to_declared_width() {
@@ -1821,6 +2004,205 @@ mod tests {
         emu.run_function(function).unwrap();
 
         assert!(emu.call_stack().is_empty());
+    }
+
+    #[test]
+    fn unhandled_direct_call_still_enters_callee() {
+        let mut ctx = Context::new();
+        qcode!(
+            ctx,
+            "
+            fn callee:
+            <callee_entry>
+                return [i64 0];
+
+            <caller>
+                call <callee>;
+            "
+        );
+
+        let mut emu = Emulator::from_block(&ctx, caller);
+        emu.step().unwrap();
+
+        assert_eq!(emu.block().id, callee_entry);
+    }
+
+    #[test]
+    fn handled_direct_call_resumes_at_selected_block() {
+        let mut ctx = Context::new();
+        qcode!(
+            ctx,
+            "
+            varnode i64 RET;
+
+            fn library:
+            <library_entry>
+                return [i64 0];
+
+            fn function:
+            <entry>
+                call <library>;
+            <after_call>
+                %ret = load(i64, &RET);
+                return [i64 0];
+            "
+        );
+
+        let mut emu = Emulator::from_function(&ctx, function);
+        emu.set_call_interceptor(move |ctx, emu, site| {
+            if site.target == library {
+                emu.set_varnode(ctx, RET, 42)
+                    .map_err(|err| err.to_string().into_boxed_str())?;
+                Ok(CallInterception::Handled(CallContinuation::Block(
+                    after_call,
+                )))
+            } else {
+                Ok(CallInterception::PassThrough)
+            }
+        });
+
+        emu.run_function(function).unwrap();
+
+        assert_eq!(
+            emu.get_value(ret.into()).and_then(|v| v.value()).unwrap(),
+            42
+        );
+        assert!(emu.call_stack().is_empty());
+    }
+
+    #[test]
+    fn handled_direct_call_can_resume_by_address() {
+        let mut ctx = Context::new();
+        qcode!(
+            ctx,
+            "
+            fn library:
+            <library_entry>
+                return [i64 0];
+
+            <entry>
+                call <library>;
+            <0x2000>
+                return [i64 0];
+            "
+        );
+
+        let mut emu = Emulator::from_block(&ctx, entry);
+        emu.set_call_interceptor(move |_, _, site| {
+            if site.target == library {
+                Ok(CallInterception::Handled(CallContinuation::Address(0x2000)))
+            } else {
+                Ok(CallInterception::PassThrough)
+            }
+        });
+
+        emu.step().unwrap();
+
+        assert_eq!(emu.block().address(), Some(0x2000));
+    }
+
+    #[test]
+    fn handled_direct_call_reports_unknown_continuation_address() {
+        let mut ctx = Context::new();
+        qcode!(
+            ctx,
+            "
+            fn library:
+            <library_entry>
+                return [i64 0];
+
+            <entry>
+                call <library>;
+            "
+        );
+
+        let mut emu = Emulator::from_block(&ctx, entry);
+        emu.set_call_interceptor(move |_, _, site| {
+            if site.target == library {
+                Ok(CallInterception::Handled(CallContinuation::Address(0xdead)))
+            } else {
+                Ok(CallInterception::PassThrough)
+            }
+        });
+
+        let err = emu.step().unwrap_err();
+
+        assert!(matches!(
+            err.kind,
+            EmulatorErrorKind::InvalidBlockAddress(0xdead)
+        ));
+    }
+
+    #[test]
+    fn call_interceptor_errors_are_reported_at_call_site() {
+        let mut ctx = Context::new();
+        qcode!(
+            ctx,
+            "
+            fn library:
+            <library_entry>
+                return [i64 0];
+
+            <entry>
+                call <library>;
+            "
+        );
+
+        let mut emu = Emulator::from_block(&ctx, entry);
+        emu.set_call_interceptor(|_, _, _| Err("model failed".into()));
+
+        let err = emu.step().unwrap_err();
+
+        assert!(matches!(
+            err.kind,
+            EmulatorErrorKind::InterceptError(message) if message.as_ref() == "model failed"
+        ));
+        assert!(err.ctx.contains("call fn library;"));
+    }
+
+    #[test]
+    fn interceptor_can_model_state_across_calls() {
+        let mut ctx = Context::new();
+        qcode!(
+            ctx,
+            "
+            fn make_object:
+            <make_object_entry>
+                return [i64 0];
+
+            fn append_byte:
+            <append_byte_entry>
+                return [i64 0];
+
+            fn function:
+            <entry>
+                call <make_object>;
+            <append>
+                call <append_byte>;
+            <done>
+                return [i64 0];
+            "
+        );
+
+        let modeled = Arc::new(Mutex::new(Vec::<u8>::new()));
+        let modeled_for_hook = Arc::clone(&modeled);
+        let mut emu = Emulator::from_function(&ctx, function);
+        emu.set_call_interceptor(move |_, _, site| {
+            let mut model = modeled_for_hook.lock().unwrap();
+            if site.target == make_object {
+                model.clear();
+                Ok(CallInterception::Handled(CallContinuation::Block(append)))
+            } else if site.target == append_byte {
+                model.push(0x41);
+                Ok(CallInterception::Handled(CallContinuation::Block(done)))
+            } else {
+                Ok(CallInterception::PassThrough)
+            }
+        });
+
+        emu.run_function(function).unwrap();
+
+        assert_eq!(*modeled.lock().unwrap(), vec![0x41]);
     }
 
     // -----------------------------------------------------------------------

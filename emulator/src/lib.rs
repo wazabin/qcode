@@ -2,7 +2,7 @@ use qcode::{
     context::Context,
     space::SpaceId,
     value::{
-        FunctionId, ValueId, Varnode,
+        BlockId, FunctionId, InstructionId, ValueId, Varnode,
         insn::{
             Binary, Binop, BoolBinop, Carry, FloatBinop, FloatToFloat, FloatToInt, InstructionRef,
             IntBinop, IntToFloat, IsFloatNaN, Load, LzCount, Mnemonic, PopCount, Range, SBorrow,
@@ -15,6 +15,26 @@ use qcode::{
 mod concrete;
 
 pub use concrete::{Emulator, SizedValue, StandaloneEmulator};
+
+#[derive(Debug, Clone)]
+pub struct CallSite {
+    pub instruction: InstructionId,
+    pub block: BlockId,
+    pub target: FunctionId,
+    pub args: Vec<ValueId>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CallContinuation {
+    Block(BlockId),
+    Address(u64),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CallInterception {
+    PassThrough,
+    Handled(CallContinuation),
+}
 
 #[derive(Debug)]
 pub struct EmulatorError {
@@ -65,6 +85,8 @@ pub enum EmulatorErrorKind {
     UnknownSpace(SpaceId),
     /// Encountered an architecture-specific p-code operation without an emulator implementation
     UnsupportedPCodeOp(Box<str>),
+    /// A user-provided call interceptor failed while modeling a call
+    InterceptError(Box<str>),
 }
 
 impl std::fmt::Display for EmulatorErrorKind {
@@ -82,6 +104,7 @@ impl std::fmt::Display for EmulatorErrorKind {
             Self::UnknownRegister(reg) => write!(f, "register {reg:?} not found in context"),
             Self::UnknownSpace(space) => write!(f, "memory space {space:?} not initialised"),
             Self::UnsupportedPCodeOp(op) => write!(f, "unsupported p-code operation `{op}`"),
+            Self::InterceptError(message) => write!(f, "call interceptor failed: {message}"),
         }
     }
 }
