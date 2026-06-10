@@ -43,6 +43,6 @@ pub use mem2reg::mem2reg;
 
 pub mod pipeline;
 pub use pipeline::{
-    ArchConfig, CallingConvention, GpReg, Pass, analyze_default, run_default_all_functions,
-    run_passes,
+    ArchConfig, CallingConvention, DEFAULT_PIPELINE_TOML, FunctionPass, GpReg, Pass, Pipeline,
+    PipelineEnv, analyze_default, analyze_with_pipeline,
 };
