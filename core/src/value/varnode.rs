@@ -40,7 +40,7 @@ pub struct VarnodeId(usize);
 /// in the RAM space.
 ///
 /// [`Space`]: crate::space::Space
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct Varnode<'str> {
     name: Option<Cow<'str, str>>,
 

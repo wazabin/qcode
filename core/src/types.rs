@@ -33,7 +33,9 @@ use crate::{
 ///
 /// `TypeId` is `Copy + Hash + Eq` and carries no context borrow. Convert to a
 /// concrete [`Type`] via [`TypeManager::get`].
-#[derive(Copy, Clone, Hash, Eq, PartialEq, Debug, Ord, PartialOrd)]
+#[derive(
+    Copy, Clone, Hash, Eq, PartialEq, Debug, Ord, PartialOrd, serde::Serialize, serde::Deserialize,
+)]
 pub struct TypeId(u32);
 
 // ---------------------------------------------------------------------------
@@ -60,6 +62,27 @@ pub trait Type: Send + Sync {
     /// [`TypeManager`] and [`Context`](crate::context::Context)), which the GUI
     /// relies on to fork a context before running an analysis pipeline.
     fn clone_box(&self) -> Box<dyn Type>;
+
+    /// Describes this type in a flat, serializable form.
+    ///
+    /// Used to persist the [`TypeManager`] across a saved session: trait objects
+    /// cannot be serialized directly, so each type reports a [`TypeRepr`] from
+    /// which it can be reconstructed.
+    fn repr(&self) -> TypeRepr;
+}
+
+/// Serializable description of a concrete [`Type`].
+///
+/// There are only three concrete types, each fully described by a byte width and
+/// (for pointers) the memory space it points into. [`TypeManager`] serializes its
+/// type table as a `Vec<TypeRepr>` and replays the `get_or_make_*` constructors
+/// on load, which reproduces both the interned [`TypeId`] indices and the lookup
+/// maps exactly.
+#[derive(Clone, Copy, serde::Serialize, serde::Deserialize)]
+pub enum TypeRepr {
+    Int { size: usize },
+    StackAddress { size: usize, space: Option<SpaceId> },
+    SpaceAddress { size: usize, space: SpaceId },
 }
 
 impl Clone for Box<dyn Type> {
@@ -84,6 +107,10 @@ impl Type for IntType {
 
     fn clone_box(&self) -> Box<dyn Type> {
         Box::new(self.clone())
+    }
+
+    fn repr(&self) -> TypeRepr {
+        TypeRepr::Int { size: self.size }
     }
 }
 
@@ -149,6 +176,13 @@ impl Type for StackAddress {
     fn clone_box(&self) -> Box<dyn Type> {
         Box::new(self.clone())
     }
+
+    fn repr(&self) -> TypeRepr {
+        TypeRepr::StackAddress {
+            size: self.size,
+            space: self.space,
+        }
+    }
 }
 
 /// A pointer-typed value carrying the memory space it points into.
@@ -176,6 +210,13 @@ impl Type for SpaceAddress {
 
     fn clone_box(&self) -> Box<dyn Type> {
         Box::new(self.clone())
+    }
+
+    fn repr(&self) -> TypeRepr {
+        TypeRepr::SpaceAddress {
+            size: self.size,
+            space: self.space,
+        }
     }
 }
 
@@ -369,5 +410,44 @@ impl TypeManager {
                 }
             }
         }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Serialization
+// ---------------------------------------------------------------------------
+//
+// `TypeManager` owns `Box<dyn Type>` trait objects, which serde cannot derive
+// over. Instead we serialize the type table as a `Vec<TypeRepr>` (the flat
+// description each type reports via `Type::repr`) and replay the `get_or_make_*`
+// constructors on load. Replaying in order reproduces the interned `TypeId`
+// indices and rebuilds the lookup maps (`int_by_size`, `stack_address`,
+// `space_address`) exactly, so no other field needs to be persisted.
+
+impl serde::Serialize for TypeManager {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        let reprs: Vec<TypeRepr> = self.types.iter().map(|t| t.repr()).collect();
+        reprs.serialize(serializer)
+    }
+}
+
+impl<'de> serde::Deserialize<'de> for TypeManager {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let reprs = Vec::<TypeRepr>::deserialize(deserializer)?;
+        let mut manager = TypeManager::new();
+        for repr in reprs {
+            match repr {
+                TypeRepr::Int { size } => {
+                    manager.get_or_make_int(size);
+                }
+                TypeRepr::StackAddress { size, space } => {
+                    manager.get_or_make_stack_address(size, space);
+                }
+                TypeRepr::SpaceAddress { size, space } => {
+                    manager.get_or_make_space_address(size, space);
+                }
+            }
+        }
+        Ok(manager)
     }
 }

@@ -10,6 +10,7 @@ repository.workspace = true
 jstd.workspace = true
 qcode.workspace = true
 cabi.workspace = true
+serde.workspace = true
 
 [dev-dependencies]
 qcode = { workspace = true, features = ["testing"] }

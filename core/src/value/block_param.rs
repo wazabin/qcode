@@ -30,7 +30,7 @@ pub struct BlockParamId(usize);
 /// Unlike [`Instruction`](crate::value::Instruction) results, block params are
 /// not produced by any operation — they are value sources at block entry,
 /// analogous to function arguments in MLIR block-argument style.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct BlockParam<'str> {
     /// Position of this param in the owning block's param list.
     pub index: usize,

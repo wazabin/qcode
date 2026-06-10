@@ -23,7 +23,7 @@ use crate::{
 #[derive(Identifier)]
 pub struct FunctionId(usize);
 
-#[derive(Clone)]
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
 pub struct Function<'str> {
     /// The function's name.
     pub name: Cow<'str, str>,

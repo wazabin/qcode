@@ -21,7 +21,7 @@ pub struct BlockId(usize);
 #[derive(Identifier)]
 pub struct EdgeId(usize);
 
-#[derive(Debug, Default, Clone)]
+#[derive(Debug, Default, Clone, serde::Serialize, serde::Deserialize)]
 pub struct EdgeData {
     pub from: BlockId,
     pub to: BlockId,

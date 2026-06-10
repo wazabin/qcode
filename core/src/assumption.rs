@@ -29,7 +29,7 @@ use crate::value::{block::BlockId, block::EdgeId, function::FunctionId, insn::In
 pub struct AssumptionId(usize);
 
 /// Verification state of an [`Assumption`].
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum AssumptionStatus {
     /// Recorded but not yet checked against the predicted entity.
     Unverified,
@@ -45,7 +45,7 @@ pub enum AssumptionStatus {
 /// `#[non_exhaustive]` so adding future heuristics does not break exhaustive
 /// matches in downstream crates.
 #[non_exhaustive]
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub enum AssumptionKind {
     /// A called function returns normally to the fall-through after the call.
     CallReturns(CallReturnsAssumption),
@@ -55,7 +55,7 @@ pub enum AssumptionKind {
 ///
 /// Materialized as a real CFG edge `call_block -> continuation` so downstream
 /// dataflow can reason across the call.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct CallReturnsAssumption {
     /// The function we assume returns — the primary verification key.
     pub callee: FunctionId,
@@ -70,7 +70,7 @@ pub struct CallReturnsAssumption {
 }
 
 /// A recorded heuristic guess together with its verification [`AssumptionStatus`].
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct Assumption {
     pub kind: AssumptionKind,
     pub status: AssumptionStatus,

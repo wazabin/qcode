@@ -6,7 +6,7 @@ use std::fmt::Formatter;
 
 use super::mnemonic::MnemonicKind;
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub struct IsFloatNaN {
     pub src: ValueId,
 }
@@ -25,7 +25,7 @@ impl MnemonicKind for IsFloatNaN {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub struct LzCount {
     pub src: ValueId,
 }
@@ -64,7 +64,7 @@ impl MnemonicKind for LzCount {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub struct PopCount {
     pub src: ValueId,
 }
@@ -91,7 +91,7 @@ impl MnemonicKind for PopCount {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub struct Carry {
     pub lhs: ValueId,
     pub rhs: ValueId,
@@ -132,7 +132,7 @@ impl MnemonicKind for Carry {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub struct SCarry {
     pub lhs: ValueId,
     pub rhs: ValueId,
@@ -172,7 +172,7 @@ impl MnemonicKind for SCarry {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub struct SBorrow {
     pub lhs: ValueId,
     pub rhs: ValueId,

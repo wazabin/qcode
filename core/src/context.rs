@@ -51,7 +51,7 @@ use jstd::{
 /// and space identifiers. When names are owned (e.g. generated names), they
 /// are stored as `Cow::Owned`; when they are borrowed from source data they are
 /// `Cow::Borrowed` and must outlive the context.
-#[derive(Default, Clone)]
+#[derive(Default, Clone, serde::Serialize, serde::Deserialize)]
 pub struct Context<'str> {
     pub default_space: SpaceId,
 
@@ -957,5 +957,42 @@ mod tests {
         assert_eq!(ctx.assumption(id).status, AssumptionStatus::Violated);
         // The independent snapshot is unaffected.
         assert_eq!(snapshot.assumption(id).status, AssumptionStatus::Unverified);
+    }
+
+    #[test]
+    fn context_survives_bincode_round_trip() {
+        let mut ctx = Context::new();
+        qcode!(
+            ctx,
+            "
+            varnode i64 ptr;
+            <block>
+                %a = load(i64, &ptr);
+                %b = %a + i64 0x10;
+                store(&ptr, i64 0x1234);
+                return [%b];
+            "
+        );
+
+        // A StackAddress type exercises the custom TypeManager serialization.
+        let stack_space = ctx.make_named_temp_space("stack");
+        let sa = ctx.types.get_or_make_stack_address(8, Some(stack_space));
+        let sa_size = ctx.types.size_of(sa);
+
+        let blocks_before = ctx.block_ids().len();
+        let insns_before = ctx.instruction_ids().len();
+        let funcs_before = ctx.function_ids().len();
+
+        let config = bincode::config::standard();
+        let bytes = bincode::serde::encode_to_vec(&ctx, config).expect("encode");
+        let (restored, _): (Context<'static>, usize) =
+            bincode::serde::decode_from_slice(&bytes, config).expect("decode");
+
+        assert_eq!(restored.block_ids().len(), blocks_before);
+        assert_eq!(restored.instruction_ids().len(), insns_before);
+        assert_eq!(restored.function_ids().len(), funcs_before);
+        // The StackAddress type round-trips: same id, same size, still a stack address.
+        assert_eq!(restored.types.size_of(sa), sa_size);
+        assert!(restored.types.is_stack_address(sa));
     }
 }

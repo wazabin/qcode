@@ -31,7 +31,7 @@ fn fmt_branch_target(
     write!(f, ">")
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub struct Branch {
     pub target: BlockId,
     /// Arguments passed to the target block's parameters.
@@ -58,7 +58,7 @@ impl MnemonicKind for Branch {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub struct BranchInd {
     pub ptr: ValueId,
 }
@@ -81,7 +81,7 @@ impl MnemonicKind for BranchInd {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub struct Call {
     pub target: FunctionId,
     /// Values passed to the callee, one per inferred callee input, in order.
@@ -120,7 +120,7 @@ impl MnemonicKind for Call {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub struct CallInd {
     pub ptr: ValueId,
     pub args: Vec<ValueId>,
@@ -146,7 +146,7 @@ impl MnemonicKind for CallInd {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub struct CBranch {
     pub condition: ValueId,
     pub success_block: BlockId,
@@ -182,7 +182,7 @@ impl MnemonicKind for CBranch {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub struct Return {
     pub ptr: ValueId,
     pub value: Option<ValueId>,

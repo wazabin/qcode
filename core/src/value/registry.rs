@@ -32,7 +32,7 @@ use std::collections::{HashMap, HashSet};
 ///   directly. Use [`users_of`](Self::users_of) to read and
 ///   [`remove_instructions`](Self::remove_instructions) to remove dead
 ///   instructions from the map.
-#[derive(Clone, Default)]
+#[derive(Clone, Default, serde::Serialize, serde::Deserialize)]
 pub struct ValueRegistry<'str> {
     /// Literal (constant) storage.
     pub literals: Registry<LiteralId, Literal>,

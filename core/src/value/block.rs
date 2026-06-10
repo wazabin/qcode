@@ -26,7 +26,7 @@ pub mod cfg;
 
 /// A block of instructions.
 /// This is the basic unit of code in our IR.
-#[derive(Debug, Default, Clone)]
+#[derive(Debug, Default, Clone, serde::Serialize, serde::Deserialize)]
 pub struct BasicBlock<'str> {
     /// An optionnal name for this basic block
     name: Option<Cow<'str, str>>,

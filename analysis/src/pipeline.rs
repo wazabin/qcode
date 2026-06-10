@@ -78,7 +78,7 @@ pub struct CallingConvention {
 }
 
 /// A single selectable analysis/optimization pass.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug, serde::Serialize, serde::Deserialize)]
 pub enum Pass {
     BrightenStack,
     Mem2Reg,

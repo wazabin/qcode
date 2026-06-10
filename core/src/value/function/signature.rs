@@ -2,7 +2,7 @@ use crate::value::VarnodeId;
 
 /// Optional ABI description attached to a function.
 /// All fields are `Option` — only provided fields affect analysis.
-#[derive(Clone, Default)]
+#[derive(Clone, Default, serde::Serialize, serde::Deserialize)]
 pub struct FunctionSignature {
     /// Registers read as inputs (informational; reserved for future passes).
     pub inputs: Option<Vec<VarnodeId>>,

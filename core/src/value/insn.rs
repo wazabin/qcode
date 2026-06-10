@@ -45,7 +45,7 @@ pub struct InstructionId(usize);
 
 /// A local SSA value, which is a value that is defined by an instruction and can be used by other instructions.
 /// Local values are not associated with any particular memory location.
-#[derive(Clone)]
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
 pub struct Instruction<'str> {
     /// The name of this instruction
     pub(crate) name: Option<Cow<'str, str>>,

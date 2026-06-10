@@ -34,7 +34,7 @@ pub struct LiteralId(usize);
 /// Note: `Space(SpaceId)` has been removed. Stack base addresses are now
 /// represented as [`StackAddress`](crate::types::StackAddress)-typed literals;
 /// their display derives from the type, not from a symbolic annotation.
-#[derive(Debug, Clone, Hash, PartialEq, Eq)]
+#[derive(Debug, Clone, Hash, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum SymbolicRef {
     /// The literal is the address of this basic block.
     Block(BlockId),
@@ -48,7 +48,7 @@ pub enum SymbolicRef {
 ///
 /// The raw value is a `u64`; [`LiteralRef::value`] masks it to the width
 /// described by the literal's [`TypeId`].
-#[derive(Debug, Clone, Hash, PartialEq, Eq)]
+#[derive(Debug, Clone, Hash, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct Literal {
     /// Raw integer value (may be wider than the type's size before masking).
     pub value: u64,
