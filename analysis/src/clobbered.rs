@@ -18,11 +18,11 @@ pub fn compute_clobbered_regs(ctx: &Context, function_id: FunctionId) -> Vec<Var
         for insn in block.iter() {
             if let Mnemonic::Store(store) = insn.mnemonic()
                 && let ValueId::Varnode(vn_id) = store.ptr
-                    && matches!(Varnode::from_id(ctx, vn_id).space().ty, SpaceType::Register)
-                        && seen.insert(vn_id)
-                    {
-                        result.push(vn_id);
-                    }
+                && matches!(Varnode::from_id(ctx, vn_id).space().ty, SpaceType::Register)
+                && seen.insert(vn_id)
+            {
+                result.push(vn_id);
+            }
         }
     }
 

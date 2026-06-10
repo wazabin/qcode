@@ -710,16 +710,17 @@ fn comment_text(raw: &str) -> String {
 
 fn attach_comment(pending: &mut Option<String>, stmts: &mut Vec<Statement>) {
     if let Some(comment) = pending.take()
-        && !stmts.is_empty() {
-            let first = stmts.remove(0);
-            stmts.insert(
-                0,
-                Statement::Commented {
-                    comment,
-                    inner: Box::new(first),
-                },
-            );
-        }
+        && !stmts.is_empty()
+    {
+        let first = stmts.remove(0);
+        stmts.insert(
+            0,
+            Statement::Commented {
+                comment,
+                inner: Box::new(first),
+            },
+        );
+    }
 }
 
 fn to_parse_error(error: pest::error::Error<Rule>) -> ParseError {
