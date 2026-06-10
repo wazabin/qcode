@@ -361,13 +361,16 @@ pub fn remove_dead_load_insns_block(
 /// the store is dead only if no load in the function reads from an overlapping
 /// byte range in the same space. When the pointer is not a literal, the check
 /// falls back to space-level coarseness (dead only if the space has no loads).
+/// (insn_id, space_id, Some(start, end) if the store address is a literal).
+type CandidateStore = (InstructionId, SpaceId, Option<(i64, i64)>);
+
 fn unread_temp_space_stores(ctx: &Context, function_id: FunctionId) -> HashSet<InstructionId> {
     let fun = Function::from_id(ctx, function_id);
     let mut loaded_spaces: HashSet<SpaceId> = HashSet::new();
     // (space_id, byte_start, byte_end) for loads with known literal addresses
     let mut loaded_intervals: Vec<(SpaceId, i64, i64)> = Vec::new();
     // (insn_id, space_id, Some(start, end) if address is a literal)
-    let mut candidate_stores: Vec<(InstructionId, SpaceId, Option<(i64, i64)>)> = Vec::new();
+    let mut candidate_stores: Vec<CandidateStore> = Vec::new();
 
     for block in &fun {
         for &insn_id in block.instruction_ids() {

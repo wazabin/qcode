@@ -330,7 +330,17 @@ pub fn run_default_all_functions_with_progress(
     // Value-producing passes first, on every function.
     for (index, fun_id) in fun_ids.iter().enumerate() {
         run_default_pass_group(
-            ctx, *fun_id, PRE_BIND, cfg, round, "Pre-bind", index, total, progress,
+            ctx,
+            *fun_id,
+            PRE_BIND,
+            cfg,
+            PassGroupContext {
+                round,
+                stage: "Pre-bind",
+                index,
+                total,
+            },
+            progress,
         )?;
     }
 
@@ -367,10 +377,12 @@ pub fn run_default_all_functions_with_progress(
             *fun_id,
             POST_BIND,
             cfg,
-            round,
-            "Post-bind",
-            index,
-            total,
+            PassGroupContext {
+                round,
+                stage: "Post-bind",
+                index,
+                total,
+            },
             progress,
         )?;
     }
@@ -380,10 +392,30 @@ pub fn run_default_all_functions_with_progress(
     // `RSP = @stack_base + N` epilogue is still intact when the delta is read.
     for (index, fun_id) in fun_ids.iter().enumerate() {
         run_default_pass_group(
-            ctx, *fun_id, LOWER, cfg, round, "Lowering", index, total, progress,
+            ctx,
+            *fun_id,
+            LOWER,
+            cfg,
+            PassGroupContext {
+                round,
+                stage: "Lowering",
+                index,
+                total,
+            },
+            progress,
         )?;
     }
     Ok(())
+}
+
+/// Where a pass group sits within the overall pipeline run, for progress
+/// reporting: which `round`, which named `stage`, and this function's `index`
+/// among `total` functions.
+struct PassGroupContext {
+    round: usize,
+    stage: &'static str,
+    index: usize,
+    total: usize,
 }
 
 fn run_default_pass_group(
@@ -391,20 +423,17 @@ fn run_default_pass_group(
     fun_id: FunctionId,
     passes: &[Pass],
     cfg: &ArchConfig,
-    round: usize,
-    stage: &'static str,
-    index: usize,
-    total: usize,
+    at: PassGroupContext,
     progress: &mut impl FnMut(PipelineProgress),
 ) -> Result<(), String> {
     let function = FunctionRef::from_id(ctx, fun_id).name().to_string();
-    let total = total * passes.len();
+    let total = at.total * passes.len();
     for (pass_index, pass) in passes.iter().enumerate() {
         progress(PipelineProgress::FunctionPass {
-            round,
-            stage,
+            round: at.round,
+            stage: at.stage,
             function: function.clone(),
-            index: index * passes.len() + pass_index + 1,
+            index: at.index * passes.len() + pass_index + 1,
             total,
             pass: *pass,
         });

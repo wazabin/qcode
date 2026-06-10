@@ -70,9 +70,7 @@ fn map_prototype(
                     break;
                 };
                 next_int += 1;
-                let Some(vn) = gp64(gp) else {
-                    return None;
-                };
+                let vn = gp64(gp)?;
                 inputs.push(vn);
             }
             Class::Sse => {

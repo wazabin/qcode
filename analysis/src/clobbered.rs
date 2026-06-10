@@ -135,14 +135,13 @@ mod tests {
 
     #[test]
     fn preserves_existing_signature_fields() {
-        let r1_id: VarnodeId;
         let (mut tc, fun_id) = build_fn(|b| {
             let r0 = b.context().get_named("r0").unwrap().as_varnode().unwrap();
             let reg_space = b.context().try_get_space("register").unwrap();
             let val = b.context_mut().get_const(1u64, 8).id();
             b.push_store(val, ValueId::Varnode(r0), reg_space);
         });
-        r1_id = tc.r1;
+        let r1_id: VarnodeId = tc.r1;
         Function::from_id_mut(&mut tc.ctx, fun_id).set_signature(FunctionSignature {
             outputs: Some(vec![r1_id]),
             ..Default::default()
