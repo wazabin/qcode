@@ -711,7 +711,8 @@ mod tests {
             b.push_store(v, ValueId::Varnode(r1), reg);
         });
 
-        crate::mem2reg(&mut tc.ctx, fun);
+        let aliases = crate::AliasResult::simple(&tc.ctx);
+        crate::mem2reg(&mut tc.ctx, fun, &aliases);
         // The load is gone; r0 now flows in via a root param.
         assert!(
             compute_input_regs(&tc.ctx, fun).contains(&r0),
@@ -733,7 +734,8 @@ mod tests {
             b.push_store(v, ValueId::Varnode(r0), reg); // restore r0 unchanged
         });
 
-        crate::mem2reg(&mut tc.ctx, fun);
+        let aliases = crate::AliasResult::simple(&tc.ctx);
+        crate::mem2reg(&mut tc.ctx, fun, &aliases);
         assert!(
             compute_saved_regs(&tc.ctx, fun).contains(&r0),
             "a saved-and-restored register must be detected as saved"

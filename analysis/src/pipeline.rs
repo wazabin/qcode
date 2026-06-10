@@ -208,8 +208,15 @@ impl Pass {
                 // RBP) as the symbolic stack base; constant-folding then rewrites
                 // RBP/RSP-relative arithmetic into concrete stack-slot literals,
                 // which become promotable on the following round.
+                //
+                // mem2reg only queries register-vs-register aliasing, and the
+                // register varnode set (hence its alias classes) is fixed for the
+                // whole pass — folding only rewrites stack-pointer arithmetic into
+                // literals, never registers — so one oracle is valid across the
+                // entire fixpoint instead of being rebuilt each round.
+                let aliases = AliasResult::simple(ctx);
                 loop {
-                    let promoted = mem2reg(ctx, fun_id);
+                    let promoted = mem2reg(ctx, fun_id, &aliases);
                     let folded = constant_fold_function(ctx, fun_id);
                     if !promoted && !folded {
                         break;

@@ -43,6 +43,12 @@ pub struct BlockParam<'str> {
 
     /// Optional debug name (displayed as `%name`).
     pub name: Option<Cow<'str, str>>,
+
+    /// Optional source value this param was created to promote (the varnode or
+    /// stack-slot literal). Not displayed; it is a stable cross-run identity that
+    /// lets passes like mem2reg reuse an existing param instead of duplicating it,
+    /// even for varnodes that have no `name`.
+    pub origin: Option<ValueId>,
 }
 
 impl<'str> BlockParam<'str> {
@@ -61,6 +67,7 @@ impl<'str> BlockParam<'str> {
             type_id,
             parent: Some(block_id),
             name: None,
+            origin: None,
         });
         BlockParamMutRef::from_id(ctx, id)
     }
@@ -110,6 +117,11 @@ where
 
     pub fn name(&'s self) -> Option<&'ctx str> {
         self.inner().name.as_deref()
+    }
+
+    /// The source value this param was created to promote, if recorded.
+    pub fn origin(&'s self) -> Option<ValueId> {
+        self.inner().origin
     }
 
     fn fmt(&'s self, f: &mut Formatter<'_>) -> std::fmt::Result {
@@ -162,6 +174,11 @@ impl<'str, 'ctx> BlockParamMutRef<'str, 'ctx> {
     pub fn set_size(&mut self, size: usize) {
         let type_id = self.ctx.types.get_or_make_int(size);
         self.inner_mut().type_id = type_id;
+    }
+
+    /// Record the source value this param promotes (see [`BlockParam::origin`]).
+    pub fn set_origin(&mut self, origin: ValueId) {
+        self.inner_mut().origin = Some(origin);
     }
 
     pub fn constrain_size(&mut self, size: usize) {

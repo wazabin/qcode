@@ -363,6 +363,7 @@ impl<'str, 'ctx> BlockMutRef<'str, 'ctx> {
             type_id,
             parent: Some(block_id),
             name: None,
+            origin: None,
         });
         self.inner_mut().params.push(id);
         BlockParamMutRef::from_id(self.ctx, id)

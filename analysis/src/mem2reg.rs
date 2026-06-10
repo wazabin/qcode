@@ -13,24 +13,32 @@ use qcode::{
 use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
 
+use crate::AliasResult;
+
 /// Returns `true` if any variables were promoted.
-pub fn mem2reg(ctx: &mut Context, function_id: FunctionId) -> bool {
-    Mem2Reg::new(ctx, function_id).run()
+pub fn mem2reg(ctx: &mut Context, function_id: FunctionId, aliases: &AliasResult) -> bool {
+    Mem2Reg::new(ctx, function_id, aliases).run()
 }
 
 struct Mem2Reg<'ctx, 'str> {
     ctx: &'ctx mut Context<'str>,
     function_id: FunctionId,
     root_id: Option<BlockId>,
+    aliases: &'ctx AliasResult,
 }
 
 impl<'ctx, 'str> Mem2Reg<'ctx, 'str> {
-    fn new(ctx: &'ctx mut Context<'str>, function_id: FunctionId) -> Self {
+    fn new(
+        ctx: &'ctx mut Context<'str>,
+        function_id: FunctionId,
+        aliases: &'ctx AliasResult,
+    ) -> Self {
         let root_id = Function::from_id(&*ctx, function_id).root().map(|b| b.id);
         Self {
             ctx,
             function_id,
             root_id,
+            aliases,
         }
     }
 
@@ -47,17 +55,21 @@ impl<'ctx, 'str> Mem2Reg<'ctx, 'str> {
             by_block: var_params,
             changed,
         } = self.insert_block_params(&vars, &sizes, &frontier);
+        let register_clobbers =
+            register_clobber_index(self.ctx, self.function_id, &vars, self.aliases);
 
-        let mut state = RenameState::new(&var_params, &vars, changed);
+        let mut state = RenameState::new(&var_params, &vars, register_clobbers, changed);
         self.decide_values_start_from(root_id, &mut state);
 
         let RenameState {
             consumed_stores,
             dead_stores,
+            preserved_stores,
             changed,
             ..
         } = state;
-        changed | self.remove_promoted_stores(&vars, &consumed_stores, &dead_stores)
+        changed
+            | self.remove_promoted_stores(&vars, &consumed_stores, &dead_stores, &preserved_stores)
     }
 
     fn root_id(&self) -> BlockId {
@@ -89,16 +101,11 @@ fn is_stack_typed(ctx: &Context, v: ValueId) -> bool {
     ctx.types.is_stack_address(type_id)
 }
 
-/// True when register varnodes `a` and `b` occupy overlapping byte ranges in the
-/// same space (e.g. RAX/EAX/AX/AL all overlap).
-fn register_overlap(ctx: &Context, a: VarnodeId, b: VarnodeId) -> bool {
-    let (va, vb) = (Varnode::from_id(ctx, a), Varnode::from_id(ctx, b));
-    if va.space().id != vb.space().id {
-        return false;
-    }
-    let (a_start, a_end) = (va.address(), va.address() + va.size() as i64);
-    let (b_start, b_end) = (vb.address(), vb.address() + vb.size() as i64);
-    a_start < b_end && b_start < a_end
+fn register_varnode(ctx: &Context, value: ValueId) -> Option<VarnodeId> {
+    let ValueId::Varnode(vn_id) = value else {
+        return None;
+    };
+    matches!(Varnode::from_id(ctx, vn_id).space().ty, SpaceType::Register).then_some(vn_id)
 }
 
 /// Whether the call terminating `block` (if any) clobbers register `var`.
@@ -108,16 +115,10 @@ fn register_overlap(ctx: &Context, a: VarnodeId, b: VarnodeId) -> bool {
 /// `CallInd` has an unknown target and conservatively clobbers every register; a
 /// target with no recorded clobber set is likewise treated conservatively.
 /// Non-register vars (stack slots) are never clobbered by a call.
-fn call_clobbers_var(ctx: &Context, block: BlockId, var: ValueId) -> bool {
-    let ValueId::Varnode(var_vn) = var else {
+fn call_clobbers_var(ctx: &Context, block: BlockId, var: ValueId, aliases: &AliasResult) -> bool {
+    if register_varnode(ctx, var).is_none() {
         return false;
     };
-    if !matches!(
-        Varnode::from_id(ctx, var_vn).space().ty,
-        SpaceType::Register
-    ) {
-        return false;
-    }
     let term = BasicBlock::from_id(ctx, block)
         .iter()
         .last()
@@ -129,12 +130,62 @@ fn call_clobbers_var(ctx: &Context, block: BlockId, var: ValueId) -> bool {
                 .clobbered_regs()
                 .map(<[VarnodeId]>::to_vec);
             match clobbered {
-                Some(clobbered) => clobbered.iter().any(|&c| register_overlap(ctx, c, var_vn)),
+                Some(clobbered) => clobbered
+                    .iter()
+                    .any(|&c| aliases.may_alias(ctx, ValueId::Varnode(c), var)),
                 None => true,
             }
         }
         _ => false,
     }
+}
+
+/// For each register store-pointer in the function, the set of promoted register
+/// vars it may clobber (overlapping byte ranges in the same space).
+///
+/// Overlap is decided by [`AliasResult::may_alias`]. Note `simple` merges varnodes
+/// into equivalence classes by a transitive union-find sweep, so disjoint
+/// sub-registers that share a parent (e.g. `AL` and `AH`, both joined via `AX`)
+/// are reported as may-alias even though their bytes don't overlap. That only ever
+/// *over*-clobbers — it forces an extra reload / preserves an extra store — and can
+/// never yield wrong SSA, so the imprecision is intentional and safe.
+fn register_clobber_index(
+    ctx: &Context,
+    function_id: FunctionId,
+    vars: &HashSet<ValueId>,
+    aliases: &AliasResult,
+) -> HashMap<ValueId, Vec<ValueId>> {
+    let promoted_register_vars = vars
+        .iter()
+        .copied()
+        .filter(|&var| register_varnode(ctx, var).is_some())
+        .collect::<Vec<_>>();
+    if promoted_register_vars.is_empty() {
+        return HashMap::new();
+    }
+
+    let mut store_ptrs = HashSet::new();
+    for block in Function::from_id(ctx, function_id).blocks() {
+        for insn in block.iter() {
+            if let Mnemonic::Store(Store { ptr, .. }) = insn.mnemonic()
+                && register_varnode(ctx, *ptr).is_some()
+            {
+                store_ptrs.insert(*ptr);
+            }
+        }
+    }
+
+    store_ptrs
+        .into_iter()
+        .filter_map(|store_ptr| {
+            let clobbered = promoted_register_vars
+                .iter()
+                .copied()
+                .filter(|&var| var != store_ptr && aliases.may_alias(ctx, store_ptr, var))
+                .collect::<Vec<_>>();
+            (!clobbered.is_empty()).then_some((store_ptr, clobbered))
+        })
+        .collect()
 }
 
 /// The set of promotable locations, plus the access size for each promoted
@@ -209,6 +260,53 @@ struct InsertedBlockParams {
 }
 
 impl Mem2Reg<'_, '_> {
+    fn block_param_name_for_var(&self, var: ValueId) -> Option<String> {
+        match var {
+            ValueId::Varnode(varnode_id) => Varnode::from_id(self.ctx, varnode_id)
+                .name()
+                .map(|n| n.to_owned()),
+            _ => stack_slot_addr(self.ctx, var).map(|addr| format!("stack_{addr:x}")),
+        }
+    }
+
+    /// An existing param on `block_id` previously created to promote `var`,
+    /// identified by its recorded [`origin`](qcode::value::BlockParam::origin)
+    /// rather than its display name. `origin` is a stable cross-run identity, so
+    /// this finds the param even for varnodes that have no name (the name-based
+    /// match used to miss them, re-pushing a duplicate on every re-run).
+    fn existing_param_for_var(
+        &self,
+        block_id: BlockId,
+        size: usize,
+        var: ValueId,
+    ) -> Option<BlockParamId> {
+        BasicBlock::from_id(self.ctx, block_id)
+            .params()
+            .find(|param| param.size() == size && param.origin() == Some(var))
+            .map(|param| param.id)
+    }
+
+    fn get_or_insert_param_for_var(
+        &mut self,
+        block_id: BlockId,
+        size: usize,
+        var: ValueId,
+        name: Option<&str>,
+    ) -> (BlockParamId, bool) {
+        if let Some(param_id) = self.existing_param_for_var(block_id, size, var) {
+            return (param_id, false);
+        }
+
+        let param_id = BasicBlock::from_id_mut(self.ctx, block_id)
+            .push_param(size)
+            .id;
+        self.ctx.values.block_params[param_id].origin = Some(var);
+        if let Some(name) = name {
+            self.ctx.values.block_params[param_id].name = Some(Cow::Owned(name.to_owned()));
+        }
+        (param_id, true)
+    }
+
     fn collect_promotable_vars(&self) -> Promotable {
         let mut stored = HashSet::new();
         let mut loaded = HashSet::new();
@@ -358,6 +456,7 @@ impl Mem2Reg<'_, '_> {
                     None => continue,
                 },
             };
+            let var_name = self.block_param_name_for_var(var);
 
             let live_in = self.live_in_blocks(var);
             let phi_positions = {
@@ -366,10 +465,9 @@ impl Mem2Reg<'_, '_> {
             };
 
             for block_id in phi_positions {
-                let param_id = BasicBlock::from_id_mut(self.ctx, block_id)
-                    .push_param(size)
-                    .id;
-                changed = true;
+                let (param_id, inserted) =
+                    self.get_or_insert_param_for_var(block_id, size, var, var_name.as_deref());
+                changed |= inserted;
                 var_params
                     .entry(block_id)
                     .or_default()
@@ -383,19 +481,9 @@ impl Mem2Reg<'_, '_> {
                 .get(&root_id)
                 .is_some_and(|m| m.contains_key(&var));
             if !root_has_param && live_in.contains(&root_id) {
-                let var_name = match var {
-                    ValueId::Varnode(varnode_id) => Varnode::from_id(self.ctx, varnode_id)
-                        .name()
-                        .map(|n| n.to_owned()),
-                    _ => stack_slot_addr(self.ctx, var).map(|addr| format!("stack_{addr:x}")),
-                };
-                let param_id = BasicBlock::from_id_mut(self.ctx, root_id)
-                    .push_param(size)
-                    .id;
-                changed = true;
-                if let Some(name) = var_name {
-                    self.ctx.values.block_params[param_id].name = Some(Cow::Owned(name));
-                }
+                let (param_id, inserted) =
+                    self.get_or_insert_param_for_var(root_id, size, var, var_name.as_deref());
+                changed |= inserted;
                 var_params.entry(root_id).or_default().insert(var, param_id);
             }
         }
@@ -407,7 +495,7 @@ impl Mem2Reg<'_, '_> {
     }
 
     fn live_in_blocks(&self, var: ValueId) -> HashSet<BlockId> {
-        live_in_blocks(self.ctx, self.function_id, var)
+        live_in_blocks(self.ctx, self.function_id, var, self.aliases)
     }
 }
 
@@ -418,7 +506,12 @@ impl Mem2Reg<'_, '_> {
 /// in from the function entry. This keeps a post-call register read (e.g. a
 /// caller reading the callee's `RAX`/`EAX` result) from being treated as a
 /// function input and promoted to a spurious root parameter.
-fn live_in_blocks(ctx: &Context, function_id: FunctionId, var: ValueId) -> HashSet<BlockId> {
+fn live_in_blocks(
+    ctx: &Context,
+    function_id: FunctionId,
+    var: ValueId,
+    aliases: &AliasResult,
+) -> HashSet<BlockId> {
     let mut upward_exposed = HashSet::new();
     let mut defined = HashSet::new();
 
@@ -438,7 +531,7 @@ fn live_in_blocks(ctx: &Context, function_id: FunctionId, var: ValueId) -> HashS
             }
         }
 
-        if call_clobbers_var(ctx, block_id, var) {
+        if call_clobbers_var(ctx, block_id, var, aliases) {
             has_def = true;
         }
 
@@ -518,14 +611,17 @@ impl Mem2Reg<'_, '_> {
                     let ValueId::Varnode(vn_id) = var else {
                         unreachable!("is_register_var only matches varnodes");
                     };
-                    (
-                        self.load_register_before_branch(
-                            edge.source_block,
-                            edge.branch_insn,
-                            vn_id,
-                        ),
-                        None,
-                    )
+                    let existing = slots.get(index).and_then(|slot| *slot);
+                    let value = existing
+                        .filter(|&value| self.is_load_from_var(value, var, edge.source_block))
+                        .unwrap_or_else(|| {
+                            self.load_register_before_branch(
+                                edge.source_block,
+                                edge.branch_insn,
+                                vn_id,
+                            )
+                        });
+                    (value, None)
                 }
                 Some(FrameEntry::Clobbered) | None => panic!(
                     "variable {:?} undefined at branch to parameterized block",
@@ -565,11 +661,31 @@ impl Mem2Reg<'_, '_> {
             .id()
     }
 
+    /// Whether `value` is a `Load` of `var` that already sits in `block` — the
+    /// shape produced by a prior run's [`Self::load_register_before_branch`]. The
+    /// block check ensures we only reuse a reload that actually dominates the
+    /// branch we are wiring; a load from `var` living elsewhere must not be
+    /// silently adopted as the edge argument.
+    fn is_load_from_var(&self, value: ValueId, var: ValueId, block: BlockId) -> bool {
+        let ValueId::Instruction(insn_id) = value else {
+            return false;
+        };
+        let insn = Instruction::from_id(self.ctx, insn_id);
+        if insn.parent().map(|b| b.id) != Some(block) {
+            return false;
+        }
+        matches!(
+            insn.mnemonic(),
+            Mnemonic::Load(Load { ptr, .. }) if *ptr == var
+        )
+    }
+
     fn remove_promoted_stores(
         &mut self,
         vars: &HashSet<ValueId>,
         consumed_stores: &HashSet<InstructionId>,
         dead_stores: &HashSet<InstructionId>,
+        preserved_stores: &HashSet<InstructionId>,
     ) -> bool {
         let mut changed = false;
         let block_ids: Vec<BlockId> = Function::from_id(self.ctx, self.function_id)
@@ -600,8 +716,9 @@ impl Mem2Reg<'_, '_> {
                         SpaceType::Register
                     )
                 {
-                    let removable =
-                        consumed_stores.contains(&insn_id) || dead_stores.contains(&insn_id);
+                    let removable = (consumed_stores.contains(&insn_id)
+                        || dead_stores.contains(&insn_id))
+                        && !preserved_stores.contains(&insn_id);
                     if !removable {
                         continue;
                     }
@@ -614,14 +731,50 @@ impl Mem2Reg<'_, '_> {
     }
 
     fn is_register_var(&self, var: ValueId) -> bool {
-        matches!(
-            var,
-            ValueId::Varnode(vn_id)
-                if matches!(
-                    Varnode::from_id(self.ctx, vn_id).space().ty,
-                    SpaceType::Register
-                )
-        )
+        register_varnode(self.ctx, var).is_some()
+    }
+
+    /// A partial-register store (e.g. a write to `AL`) invalidates the promoted
+    /// SSA value of every overlapping full register (e.g. `EAX`): the in-register
+    /// bytes no longer match the promoted value, so later reads must reload.
+    ///
+    /// TODO: this is deliberately coarse — it drops the whole overlapping var to
+    /// `Clobbered` and forces a full reload. A more precise pass could model the
+    /// partial update (splice the stored bytes into the promoted value) and keep
+    /// the overlapping register promoted; mem2reg cannot represent sub-register
+    /// splicing today.
+    fn clobber_overlapping_register_vars(
+        &mut self,
+        stored_ptr: ValueId,
+        store_insn: InstructionId,
+        state: &mut RenameState<'_>,
+    ) {
+        let Some(clobbered_vars) = state.register_clobbers.get(&stored_ptr) else {
+            return;
+        };
+        let clobbered = clobbered_vars
+            .iter()
+            .copied()
+            .map(|var| {
+                let reaching_store = match decide_variable_value(var, &state.frames) {
+                    Some(FrameEntry::Defined(ReachingValue {
+                        store_insn: Some(id),
+                        ..
+                    })) => Some(id),
+                    _ => None,
+                };
+                (var, reaching_store)
+            })
+            .collect::<Vec<_>>();
+
+        let frame = state.frames.last_mut().unwrap();
+        state.preserved_stores.insert(store_insn);
+        for (var, reaching_store) in clobbered {
+            if let Some(id) = reaching_store {
+                state.preserved_stores.insert(id);
+            }
+            frame.insert(var, FrameEntry::Clobbered);
+        }
     }
 }
 
@@ -689,10 +842,12 @@ type Frame = HashMap<ValueId, FrameEntry>;
 struct RenameState<'a> {
     var_params: &'a BlockParamAssignments,
     vars: &'a HashSet<ValueId>,
+    register_clobbers: HashMap<ValueId, Vec<ValueId>>,
     visited: HashSet<BlockId>,
     frames: Vec<Frame>,
     consumed_stores: HashSet<InstructionId>,
     dead_stores: HashSet<InstructionId>,
+    preserved_stores: HashSet<InstructionId>,
     changed: bool,
 }
 
@@ -700,15 +855,18 @@ impl<'a> RenameState<'a> {
     fn new(
         var_params: &'a BlockParamAssignments,
         vars: &'a HashSet<ValueId>,
+        register_clobbers: HashMap<ValueId, Vec<ValueId>>,
         changed: bool,
     ) -> Self {
         Self {
             var_params,
             vars,
+            register_clobbers,
             visited: HashSet::new(),
             frames: vec![Frame::new()],
             consumed_stores: HashSet::new(),
             dead_stores: HashSet::new(),
+            preserved_stores: HashSet::new(),
             changed,
         }
     }
@@ -769,25 +927,28 @@ impl Mem2Reg<'_, '_> {
             let mnemonic = Instruction::from_id(self.ctx, insn_id).mnemonic().clone();
 
             match mnemonic {
-                Mnemonic::Store(Store { ptr, src, .. }) if state.vars.contains(&ptr) => {
-                    // If the current reaching definition for this var was never consumed,
-                    // it is being overwritten without being read — mark it as dead.
-                    if let Some(FrameEntry::Defined(ReachingValue {
-                        store_insn: Some(old_id),
-                        ..
-                    })) = decide_variable_value(ptr, &state.frames)
-                        && !state.consumed_stores.contains(&old_id)
-                    {
-                        state.dead_stores.insert(old_id);
+                Mnemonic::Store(Store { ptr, src, .. }) => {
+                    if state.vars.contains(&ptr) {
+                        // If the current reaching definition for this var was never consumed,
+                        // it is being overwritten without being read — mark it as dead.
+                        if let Some(FrameEntry::Defined(ReachingValue {
+                            store_insn: Some(old_id),
+                            ..
+                        })) = decide_variable_value(ptr, &state.frames)
+                            && !state.consumed_stores.contains(&old_id)
+                        {
+                            state.dead_stores.insert(old_id);
+                        }
+                        state.frames.last_mut().unwrap().insert(
+                            ptr,
+                            FrameEntry::Defined(ReachingValue {
+                                _defining_block: block,
+                                value: src,
+                                store_insn: Some(insn_id),
+                            }),
+                        );
                     }
-                    state.frames.last_mut().unwrap().insert(
-                        ptr,
-                        FrameEntry::Defined(ReachingValue {
-                            _defining_block: block,
-                            value: src,
-                            store_insn: Some(insn_id),
-                        }),
-                    );
+                    self.clobber_overlapping_register_vars(ptr, insn_id, state);
                 }
 
                 Mnemonic::Load(Load { ptr, .. }) if state.vars.contains(&ptr) => {
@@ -909,7 +1070,7 @@ impl Mem2Reg<'_, '_> {
                         .vars
                         .iter()
                         .copied()
-                        .filter(|&v| call_clobbers_var(self.ctx, block, v))
+                        .filter(|&v| call_clobbers_var(self.ctx, block, v, self.aliases))
                         .collect();
                     {
                         let frame = state.frames.last_mut().unwrap();
@@ -998,7 +1159,8 @@ mod tests {
         let function = Function::from_id(&ctx, test);
         let dom = compute_dominators(&ctx, function.root().unwrap().id);
         let frontier = dom.dominator_frontier();
-        let live_in = live_in_blocks(&ctx, test, A.into());
+        let aliases = AliasResult::simple(&ctx);
+        let live_in = live_in_blocks(&ctx, test, A.into(), &aliases);
 
         let result = find_phi_insert_positions(A.into(), &function, frontier, &live_in);
 
@@ -1046,7 +1208,8 @@ mod tests {
         "
         );
 
-        mem2reg(&mut ctx, test);
+        let aliases = AliasResult::simple(&ctx);
+        mem2reg(&mut ctx, test, &aliases);
 
         // exit block should have exactly one block param for A
         let exit_block = BasicBlock::from_id(&ctx, exit);
@@ -1133,7 +1296,8 @@ mod tests {
         "
         );
 
-        mem2reg(&mut ctx, test);
+        let aliases = AliasResult::simple(&ctx);
+        mem2reg(&mut ctx, test, &aliases);
 
         // No block params anywhere
         let function = Function::from_id(&ctx, test);
@@ -1209,7 +1373,8 @@ mod tests {
         let function = Function::from_id(&ctx, test);
         let dom = compute_dominators(&ctx, function.root().unwrap().id);
         let frontier = dom.dominator_frontier();
-        let live_in = live_in_blocks(&ctx, test, A.into());
+        let aliases = AliasResult::simple(&ctx);
+        let live_in = live_in_blocks(&ctx, test, A.into(), &aliases);
 
         let result = find_phi_insert_positions(A.into(), &function, frontier, &live_in);
 
@@ -1226,6 +1391,104 @@ mod tests {
         assert!(named_result.contains(&"bb2"), "bb2 should be in the result");
         assert!(named_result.contains(&"bb7"), "bb7 should be in the result");
         assert!(named_result.contains(&"bb8"), "bb8 should be in the result");
+    }
+
+    #[test]
+    fn partial_register_store_clobbers_promoted_full_register_value() {
+        use qcode::{builder::Builder, testing::TestContext};
+
+        let mut tc = TestContext::new();
+        let full = ValueId::Varnode(tc.r0_lo32);
+        let low_byte = ValueId::Varnode(tc.r0_byte0);
+        let pre_clobber_sink = ValueId::Varnode(tc.r1);
+        let post_clobber_sink = ValueId::Varnode(tc.r2);
+
+        let fun_id = Function::make(&mut tc.ctx, "test".into()).unwrap().id;
+        let block_id = tc.ctx.get_or_make_block(0x1000);
+        Function::from_id_mut(&mut tc.ctx, fun_id)
+            .set_root(block_id)
+            .unwrap();
+
+        let zero_store;
+        let full_load;
+        {
+            let mut b = Builder::from_context(&mut tc.ctx, 0x1000);
+            let zero = b.context_mut().get_const(0, 4).id();
+            let one = b.context_mut().get_const(1, 1).id();
+            zero_store = b.push_store(zero, full, tc.reg_space).id;
+            let pre_clobber_load = b.push_load::<false>(full, 4, tc.reg_space).id();
+            b.push_store(pre_clobber_load, pre_clobber_sink, tc.reg_space);
+            b.push_store(one, low_byte, tc.reg_space);
+            full_load = b.push_load::<false>(full, 4, tc.reg_space).id();
+            b.push_store(full_load, post_clobber_sink, tc.reg_space);
+            unsafe { b.dont_finalize() };
+        }
+
+        let aliases = AliasResult::simple(&tc.ctx);
+        mem2reg(&mut tc.ctx, fun_id, &aliases);
+
+        let ValueId::Instruction(full_load_id) = full_load else {
+            panic!("push_load should produce an instruction value");
+        };
+        let block = BasicBlock::from_id(&tc.ctx, block_id);
+        assert!(
+            block.instruction_ids().contains(&zero_store),
+            "the full-register zeroing store must survive because the later \
+             partial-register store does not overwrite the full value:\n{block}"
+        );
+        assert!(
+            block.instruction_ids().contains(&full_load_id),
+            "the full-register load after a low-byte write must not be promoted \
+             to the stale full-register SSA value:\n{block}"
+        );
+    }
+
+    #[test]
+    fn overlapping_store_survives_when_subregister_load_remains() {
+        use qcode::{builder::Builder, testing::TestContext};
+
+        let mut tc = TestContext::new();
+        let full = ValueId::Varnode(tc.r0_lo32);
+        let low_byte = ValueId::Varnode(tc.r0_byte0);
+        let full_sink = ValueId::Varnode(tc.r1);
+        let byte_sink = ValueId::Varnode(tc.r2);
+
+        let fun_id = Function::make(&mut tc.ctx, "test".into()).unwrap().id;
+        let block_id = tc.ctx.get_or_make_block(0x1000);
+        Function::from_id_mut(&mut tc.ctx, fun_id)
+            .set_root(block_id)
+            .unwrap();
+
+        let full_store;
+        let byte_load;
+        {
+            let mut b = Builder::from_context(&mut tc.ctx, 0x1000);
+            let value = b.context_mut().get_const(0x12345678, 4).id();
+            full_store = b.push_store(value, full, tc.reg_space).id;
+            let full_load = b.push_load::<false>(full, 4, tc.reg_space).id();
+            b.push_store(full_load, full_sink, tc.reg_space);
+            byte_load = b.push_load::<false>(low_byte, 1, tc.reg_space).id();
+            b.push_store(byte_load, byte_sink, tc.reg_space);
+            unsafe { b.dont_finalize() };
+        }
+
+        let aliases = AliasResult::simple(&tc.ctx);
+        mem2reg(&mut tc.ctx, fun_id, &aliases);
+
+        let ValueId::Instruction(byte_load_id) = byte_load else {
+            panic!("push_load should produce an instruction value");
+        };
+        let block = BasicBlock::from_id(&tc.ctx, block_id);
+        assert!(
+            block.instruction_ids().contains(&full_store),
+            "the full-register store must remain because the later byte load \
+             reads register state derived from it:\n{block}"
+        );
+        assert!(
+            block.instruction_ids().contains(&byte_load_id),
+            "the sub-register load should remain after the overlapping full \
+             register write clobbers its promoted entry value:\n{block}"
+        );
     }
 
     /// A register the caller writes before a call and reads after it must not be
@@ -1285,7 +1548,8 @@ mod tests {
         }
         tc.ctx.add_cfg_edge(entry, cont);
 
-        mem2reg(&mut tc.ctx, caller);
+        let aliases = AliasResult::simple(&tc.ctx);
+        mem2reg(&mut tc.ctx, caller, &aliases);
 
         let ValueId::Instruction(post_load_id) = post_load else {
             unreachable!()
@@ -1365,7 +1629,8 @@ mod tests {
             b.push_return(ret);
         }
 
-        mem2reg(&mut tc.ctx, caller);
+        let aliases = AliasResult::simple(&tc.ctx);
+        mem2reg(&mut tc.ctx, caller, &aliases);
 
         let left_cont_block = BasicBlock::from_id(&tc.ctx, left_cont);
         let load_before_branch = left_cont_block.iter().any(|insn| {
@@ -1385,6 +1650,208 @@ mod tests {
             matches!(branch.args[0], ValueId::Instruction(_)),
             "join branch should pass the inserted register load, got {:?}",
             branch.args[0]
+        );
+    }
+
+    #[test]
+    fn load_only_clobbered_register_rerun_reuses_entry_param() {
+        use qcode::testing::TestContext;
+
+        let mut tc = TestContext::new();
+        let (r0, r1) = (tc.r0, tc.r1);
+
+        qcode!(
+            tc.ctx,
+            "
+            fn callee:
+                <callee_entry>
+                    store({r0}, i64 0x99);
+                    return [i64 0];
+
+            fn caller:
+                <entry>
+                    if i8 1 goto <clobbered_path> else goto <live_in_path>;
+
+                <clobbered_path>
+                    call <callee>;
+
+                <clobbered_cont>
+                    goto <join>;
+
+                <live_in_path>
+                    goto <join>;
+
+                <join>
+                    %loaded = load(i64, {r0});
+                    store({r1}, %loaded);
+                    return [i64 0];
+            "
+        );
+        tc.ctx.add_cfg_edge(clobbered_path, clobbered_cont);
+        crate::set_all_call_clobbered_regs(&mut tc.ctx);
+
+        let aliases = AliasResult::simple(&tc.ctx);
+        assert!(mem2reg(&mut tc.ctx, caller, &aliases));
+        let entry_params_after_first = BasicBlock::from_id(&tc.ctx, entry).num_params();
+        assert_eq!(
+            entry_params_after_first, 1,
+            "the live-in r0 path should create exactly one entry param"
+        );
+
+        let aliases = AliasResult::simple(&tc.ctx);
+        assert!(
+            !mem2reg(&mut tc.ctx, caller, &aliases),
+            "the second run should converge instead of reporting a duplicate-param change"
+        );
+        assert_eq!(
+            BasicBlock::from_id(&tc.ctx, entry).num_params(),
+            entry_params_after_first,
+            "re-running mem2reg must reuse the existing r0 entry param"
+        );
+    }
+
+    #[test]
+    fn clobbered_register_branch_arg_rerun_reuses_edge_load() {
+        use qcode::testing::TestContext;
+
+        let mut tc = TestContext::new();
+        let (r0, r1) = (tc.r0, tc.r1);
+
+        qcode!(
+            tc.ctx,
+            "
+            fn callee:
+                <callee_entry>
+                    store({r0}, i64 0x99);
+                    return [i64 0];
+
+            fn caller:
+                <entry>
+                    store({r0}, i64 1);
+                    if i8 1 goto <clobbered_path> else goto <live_in_path>;
+
+                <clobbered_path>
+                    call <callee>;
+
+                <clobbered_cont>
+                    goto <join>;
+
+                <live_in_path>
+                    store({r0}, i64 2);
+                    goto <join>;
+
+                <join>
+                    %loaded = load(i64, {r0});
+                    store({r1}, %loaded);
+
+                    goto <exit>;
+
+                <exit>
+                    store({r0}, i64 7);
+                    return [i64 0];
+            "
+        );
+        tc.ctx.add_cfg_edge(clobbered_path, clobbered_cont);
+        crate::set_all_call_clobbered_regs(&mut tc.ctx);
+
+        let edge_reload_count = |ctx: &qcode::context::Context<'_>| {
+            BasicBlock::from_id(ctx, clobbered_cont)
+                .iter()
+                .filter(|insn| {
+                    matches!(
+                        insn.mnemonic(),
+                        Mnemonic::Load(Load { ptr, .. }) if *ptr == ValueId::Varnode(r0)
+                    )
+                })
+                .count()
+        };
+
+        let aliases = AliasResult::simple(&tc.ctx);
+        assert!(mem2reg(&mut tc.ctx, caller, &aliases));
+        assert_eq!(
+            edge_reload_count(&tc.ctx),
+            1,
+            "the clobbered edge should get one r0 reload before the join branch"
+        );
+
+        let aliases = AliasResult::simple(&tc.ctx);
+        assert!(
+            !mem2reg(&mut tc.ctx, caller, &aliases),
+            "the second run should converge instead of inserting another edge reload"
+        );
+        assert_eq!(
+            edge_reload_count(&tc.ctx),
+            1,
+            "re-running mem2reg must reuse the existing clobbered-edge r0 reload"
+        );
+    }
+
+    /// Same shape as `load_only_clobbered_register_rerun_reuses_entry_param`, but
+    /// the promoted register has no `name`. Param reuse keys on the param's
+    /// `origin` (the source varnode) rather than its display name, so an unnamed
+    /// register still converges on re-run instead of accumulating a duplicate
+    /// entry param each pass.
+    #[test]
+    fn load_only_unnamed_register_rerun_reuses_entry_param() {
+        use qcode::testing::TestContext;
+
+        let mut tc = TestContext::new();
+        // A register-space varnode with no name, at an offset clear of r0..r3 and
+        // the r0 sub-registers.
+        let unnamed = Varnode::make(&mut tc.ctx, 40, 8, tc.reg_space).id;
+        assert!(
+            Varnode::from_id(&tc.ctx, unnamed).name().is_none(),
+            "the test varnode must be unnamed to exercise origin-based reuse"
+        );
+        let r1 = tc.r1;
+
+        qcode!(
+            tc.ctx,
+            "
+            fn callee:
+                <callee_entry>
+                    store({unnamed}, i64 0x99);
+                    return [i64 0];
+
+            fn caller:
+                <entry>
+                    if i8 1 goto <clobbered_path> else goto <live_in_path>;
+
+                <clobbered_path>
+                    call <callee>;
+
+                <clobbered_cont>
+                    goto <join>;
+
+                <live_in_path>
+                    goto <join>;
+
+                <join>
+                    %loaded = load(i64, {unnamed});
+                    store({r1}, %loaded);
+                    return [i64 0];
+            "
+        );
+        tc.ctx.add_cfg_edge(clobbered_path, clobbered_cont);
+        crate::set_all_call_clobbered_regs(&mut tc.ctx);
+
+        let aliases = AliasResult::simple(&tc.ctx);
+        assert!(mem2reg(&mut tc.ctx, caller, &aliases));
+        let entry_params_after_first = BasicBlock::from_id(&tc.ctx, entry).num_params();
+        assert_eq!(
+            entry_params_after_first, 1,
+            "the live-in unnamed register should create exactly one entry param"
+        );
+
+        let aliases = AliasResult::simple(&tc.ctx);
+        assert!(
+            !mem2reg(&mut tc.ctx, caller, &aliases),
+            "the second run should converge instead of duplicating the unnamed entry param"
+        );
+        assert_eq!(
+            BasicBlock::from_id(&tc.ctx, entry).num_params(),
+            entry_params_after_first,
+            "re-running mem2reg must reuse the existing unnamed-register entry param"
         );
     }
 }
