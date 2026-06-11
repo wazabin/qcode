@@ -82,8 +82,6 @@ impl SubPass for MemoryForwarding {
 mod tests {
     use crate::AliasResult;
     use crate::gvn::{constant_fold_function, gvn, gvn_function};
-    use qcode::builder::Builder;
-    use qcode::value::{Function, Value};
     use qcode::{
         context::Context,
         testing::TestContext,
@@ -257,51 +255,34 @@ mod tests {
     #[test]
     fn test_register_store_load_forwarding() {
         let mut tc = TestContext::new();
-        let (fun_id, block_id) = single_block_fn(&mut tc);
+        let eax = tc.r0_lo32;
+        let other = tc.r1;
 
-        let reg_space = tc.reg_space;
-        let eax = ValueId::Varnode(tc.r0_lo32);
-        let other = ValueId::Varnode(tc.r1);
-
-        let load_id;
-        {
-            let mut b = Builder::from_context(&mut tc.ctx, 0x1000);
-            let c = b.context_mut().get_const(0x12345678, 4).id();
-            b.push_store(c, eax, reg_space); // EAX = c
-            let loaded = b.push_load::<false>(eax, 4, reg_space).id(); // %r = EAX
-            b.push_store(loaded, other, reg_space); // use %r (keeps it live)
-            load_id = loaded;
-            unsafe { b.dont_finalize() };
-        }
+        qcode!(
+            tc.ctx,
+            "
+                fn func:
+                    <block>
+                        store({eax}, i32 0x12345678); # EAX = c
+                        %r = load(i32, {eax});         # %r = EAX
+                        store({other}, %r);            # use %r (keeps it live)
+                        return [0x1000];
+                "
+        );
 
         let aliases = AliasResult::simple(&tc.ctx);
-        gvn_function(&mut tc.ctx, fun_id, Some(&aliases));
+        gvn_function(&mut tc.ctx, func, Some(&aliases));
 
-        let ValueId::Instruction(load_insn) = load_id else {
-            panic!("push_load should produce an instruction value");
-        };
         assert!(
-            !BasicBlock::from_id(&tc.ctx, block_id)
-                .instruction_ids()
-                .contains(&load_insn),
+            !block_contains(&tc.ctx, block, r),
             "register reload should be forwarded to the stored value, got:\n{}",
-            BasicBlock::from_id(&tc.ctx, block_id)
+            BasicBlock::from_id(&tc.ctx, block)
         );
     }
 
     // -----------------------------------------------------------------------
     // Memory coalesce: rebuilding a wide value from partial writes
     // -----------------------------------------------------------------------
-
-    /// A single-block function rooted at 0x1000.
-    fn single_block_fn(tc: &mut TestContext) -> (FunctionId, BlockId) {
-        let fun_id = Function::make(&mut tc.ctx, "test".into()).unwrap().id;
-        let block_id = tc.ctx.get_or_make_block(0x1000);
-        Function::from_id_mut(&mut tc.ctx, fun_id)
-            .set_root(block_id)
-            .unwrap();
-        (fun_id, block_id)
-    }
 
     /// Run const-fold + GVN to a fixpoint, as the real `Gvn` pass does.
     fn optimize(ctx: &mut Context, fun_id: FunctionId) {
@@ -355,44 +336,41 @@ mod tests {
     #[test]
     fn coalesce_motivating_idiom_symbolic_low_byte() {
         let mut tc = TestContext::new();
-        let (fun_id, block_id) = single_block_fn(&mut tc);
-        let reg = tc.reg_space;
+        let r0_byte0 = tc.r0_byte0;
+        let r0_byte1 = tc.r0_byte1;
+        let r0_lo32 = tc.r0_lo32;
+        let r1 = tc.r1;
 
-        let (cc, load_id, keep);
-        {
-            let mut b = Builder::from_context(&mut tc.ctx, 0x1000);
-            // A symbolic 1-byte value (the `setnz al` result), read before the zero.
-            cc = b
-                .push_load::<false>(ValueId::Varnode(tc.r0_byte1), 1, reg)
-                .id();
-            let zero = b.context_mut().get_const(0, 4).id();
-            b.push_store(zero, ValueId::Varnode(tc.r0_lo32), reg); // xor eax, eax
-            b.push_store(cc, ValueId::Varnode(tc.r0_byte0), reg); // setnz al
-            load_id = b
-                .push_load::<false>(ValueId::Varnode(tc.r0_lo32), 4, reg)
-                .id();
-            keep = b.push_store(load_id, ValueId::Varnode(tc.r1), reg).id(); // push eax (use)
-            unsafe { b.dont_finalize() };
-        }
+        qcode!(
+            tc.ctx,
+            "
+                fn func:
+                    <block>
+                        # A symbolic 1-byte value (the `setnz al` result), read before the zero.
+                        %cc = load(i8, {r0_byte1});
+                        store({r0_lo32}, i32 0); # xor eax, eax
+                        store({r0_byte0}, %cc);  # setnz al
+                        %load = load(i32, {r0_lo32});
+                        store({r1}, %load);      # push eax (use)
+                        return [0x1000];
+                "
+        );
 
-        optimize(&mut tc.ctx, fun_id);
+        optimize(&mut tc.ctx, func);
 
-        let ValueId::Instruction(load_insn) = load_id else {
-            panic!("load is an instruction");
-        };
         assert!(
-            !block_contains(&tc.ctx, block_id, load_insn),
+            !block_contains(&tc.ctx, block, load),
             "the wide EAX read should be coalesced away:\n{}",
-            BasicBlock::from_id(&tc.ctx, block_id)
+            BasicBlock::from_id(&tc.ctx, block)
         );
 
         // After folding, the rebuilt value is exactly `zext(%cc)`.
-        let src = store_src(&tc.ctx, keep);
+        let src = store_src(&tc.ctx, load_insn_use(&tc, block));
         let ValueId::Instruction(zid) = src else {
             panic!("expected the rebuilt value to be an instruction, got {src:?}");
         };
         match tc.ctx.get_insn(zid).mnemonic() {
-            Mnemonic::Zext(z) => assert_eq!(z.src, cc, "zext of the setnz byte"),
+            Mnemonic::Zext(z) => assert_eq!(z.src, ValueId::Instruction(cc), "zext of the setnz byte"),
             other => panic!("expected zext(%cc), got {other:?}"),
         }
     }
@@ -401,27 +379,27 @@ mod tests {
     #[test]
     fn coalesce_constant_idiom_folds_to_literal() {
         let mut tc = TestContext::new();
-        let (fun_id, _block) = single_block_fn(&mut tc);
-        let reg = tc.reg_space;
+        let r0_byte0 = tc.r0_byte0;
+        let r0_lo32 = tc.r0_lo32;
+        let r1 = tc.r1;
 
-        let keep;
-        {
-            let mut b = Builder::from_context(&mut tc.ctx, 0x1000);
-            let zero = b.context_mut().get_const(0, 4).id();
-            let one = b.context_mut().get_const(1, 1).id();
-            b.push_store(zero, ValueId::Varnode(tc.r0_lo32), reg);
-            b.push_store(one, ValueId::Varnode(tc.r0_byte0), reg);
-            let v = b
-                .push_load::<false>(ValueId::Varnode(tc.r0_lo32), 4, reg)
-                .id();
-            keep = b.push_store(v, ValueId::Varnode(tc.r1), reg).id();
-            unsafe { b.dont_finalize() };
-        }
+        qcode!(
+            tc.ctx,
+            "
+                fn func:
+                    <block>
+                        store({r0_lo32}, i32 0);
+                        store({r0_byte0}, i8 1);
+                        %v = load(i32, {r0_lo32});
+                        store({r1}, %v);
+                        return [0x1000];
+                "
+        );
 
-        optimize(&mut tc.ctx, fun_id);
+        optimize(&mut tc.ctx, func);
 
         assert_eq!(
-            literal_value(&tc.ctx, store_src(&tc.ctx, keep)),
+            literal_value(&tc.ctx, store_src(&tc.ctx, load_insn_use(&tc, block))),
             Some(1),
             "0x00000000 with low byte 1 folds to 1"
         );
@@ -431,32 +409,32 @@ mod tests {
     #[test]
     fn coalesce_constant_bytes_are_little_endian() {
         let mut tc = TestContext::new();
-        let (fun_id, _block) = single_block_fn(&mut tc);
-        let reg = tc.reg_space;
+        let r0_byte0 = tc.r0_byte0;
+        let r0_byte1 = tc.r0_byte1;
+        let r0_byte2 = tc.r0_byte2;
+        let r0_byte3 = tc.r0_byte3;
+        let r0_lo32 = tc.r0_lo32;
+        let r1 = tc.r1;
 
-        let keep;
-        {
-            let mut b = Builder::from_context(&mut tc.ctx, 0x1000);
-            for (byte_vn, val) in [
-                (tc.r0_byte0, 0xAA),
-                (tc.r0_byte1, 0xBB),
-                (tc.r0_byte2, 0xCC),
-                (tc.r0_byte3, 0xDD),
-            ] {
-                let c = b.context_mut().get_const(val, 1).id();
-                b.push_store(c, ValueId::Varnode(byte_vn), reg);
-            }
-            let v = b
-                .push_load::<false>(ValueId::Varnode(tc.r0_lo32), 4, reg)
-                .id();
-            keep = b.push_store(v, ValueId::Varnode(tc.r1), reg).id();
-            unsafe { b.dont_finalize() };
-        }
+        qcode!(
+            tc.ctx,
+            "
+                fn func:
+                    <block>
+                        store({r0_byte0}, i8 0xAA);
+                        store({r0_byte1}, i8 0xBB);
+                        store({r0_byte2}, i8 0xCC);
+                        store({r0_byte3}, i8 0xDD);
+                        %v = load(i32, {r0_lo32});
+                        store({r1}, %v);
+                        return [0x1000];
+                "
+        );
 
-        optimize(&mut tc.ctx, fun_id);
+        optimize(&mut tc.ctx, func);
 
         assert_eq!(
-            literal_value(&tc.ctx, store_src(&tc.ctx, keep)),
+            literal_value(&tc.ctx, store_src(&tc.ctx, load_insn_use(&tc, block))),
             Some(0xDDCC_BBAA),
             "byte 0 is least significant"
         );
@@ -466,41 +444,39 @@ mod tests {
     #[test]
     fn coalesce_two_symbolic_bytes_into_halfword() {
         let mut tc = TestContext::new();
-        let (fun_id, block_id) = single_block_fn(&mut tc);
-        let reg = tc.reg_space;
+        let r0_byte0 = tc.r0_byte0;
+        let r0_byte1 = tc.r0_byte1;
+        let r0_byte2 = tc.r0_byte2;
+        let r0_byte3 = tc.r0_byte3;
+        let r0_lo16 = tc.r0_lo16;
+        let r1 = tc.r1;
 
-        let load_id;
-        {
-            let mut b = Builder::from_context(&mut tc.ctx, 0x1000);
-            // Symbolic sources from non-overlapping bytes (offsets 2 and 3).
-            let x = b
-                .push_load::<false>(ValueId::Varnode(tc.r0_byte2), 1, reg)
-                .id();
-            let y = b
-                .push_load::<false>(ValueId::Varnode(tc.r0_byte3), 1, reg)
-                .id();
-            b.push_store(x, ValueId::Varnode(tc.r0_byte0), reg);
-            b.push_store(y, ValueId::Varnode(tc.r0_byte1), reg);
-            load_id = b
-                .push_load::<false>(ValueId::Varnode(tc.r0_lo16), 2, reg)
-                .id();
-            b.push_store(load_id, ValueId::Varnode(tc.r1), reg);
-            unsafe { b.dont_finalize() };
-        }
+        qcode!(
+            tc.ctx,
+            "
+                fn func:
+                    <block>
+                        # Symbolic sources from non-overlapping bytes (offsets 2 and 3).
+                        %x = load(i8, {r0_byte2});
+                        %y = load(i8, {r0_byte3});
+                        store({r0_byte0}, %x);
+                        store({r0_byte1}, %y);
+                        %load = load(i16, {r0_lo16});
+                        store({r1}, %load);
+                        return [0x1000];
+                "
+        );
 
-        optimize(&mut tc.ctx, fun_id);
+        optimize(&mut tc.ctx, func);
 
-        let ValueId::Instruction(load_insn) = load_id else {
-            panic!("load is an instruction");
-        };
         assert!(
-            !block_contains(&tc.ctx, block_id, load_insn),
+            !block_contains(&tc.ctx, block, load),
             "the halfword read should be coalesced:\n{}",
-            BasicBlock::from_id(&tc.ctx, block_id)
+            BasicBlock::from_id(&tc.ctx, block)
         );
         // The result must not collapse to a constant (both pieces are symbolic).
         assert!(
-            literal_value(&tc.ctx, store_src(&tc.ctx, load_insn_use(&tc, block_id))).is_none(),
+            literal_value(&tc.ctx, store_src(&tc.ctx, load_insn_use(&tc, block))).is_none(),
             "symbolic coalesce must not fold to a literal"
         );
     }
@@ -509,31 +485,34 @@ mod tests {
     #[test]
     fn coalesce_four_byte_reads_into_word() {
         let mut tc = TestContext::new();
-        let (fun_id, block_id) = single_block_fn(&mut tc);
-        let reg = tc.reg_space;
+        let r0_byte0 = tc.r0_byte0;
+        let r0_byte1 = tc.r0_byte1;
+        let r0_byte2 = tc.r0_byte2;
+        let r0_byte3 = tc.r0_byte3;
+        let r0_lo32 = tc.r0_lo32;
+        let r1 = tc.r1;
 
-        let load_id;
-        {
-            let mut b = Builder::from_context(&mut tc.ctx, 0x1000);
-            for byte_vn in [tc.r0_byte0, tc.r0_byte1, tc.r0_byte2, tc.r0_byte3] {
-                b.push_load::<false>(ValueId::Varnode(byte_vn), 1, reg);
-            }
-            load_id = b
-                .push_load::<false>(ValueId::Varnode(tc.r0_lo32), 4, reg)
-                .id();
-            b.push_store(load_id, ValueId::Varnode(tc.r1), reg);
-            unsafe { b.dont_finalize() };
-        }
+        qcode!(
+            tc.ctx,
+            "
+                fn func:
+                    <block>
+                        load(i8, {r0_byte0});
+                        load(i8, {r0_byte1});
+                        load(i8, {r0_byte2});
+                        load(i8, {r0_byte3});
+                        %load = load(i32, {r0_lo32});
+                        store({r1}, %load);
+                        return [0x1000];
+                "
+        );
 
-        optimize(&mut tc.ctx, fun_id);
+        optimize(&mut tc.ctx, func);
 
-        let ValueId::Instruction(load_insn) = load_id else {
-            panic!("load is an instruction");
-        };
         assert!(
-            !block_contains(&tc.ctx, block_id, load_insn),
+            !block_contains(&tc.ctx, block, load),
             "the word read should coalesce four byte reads:\n{}",
-            BasicBlock::from_id(&tc.ctx, block_id)
+            BasicBlock::from_id(&tc.ctx, block)
         );
     }
 
@@ -542,36 +521,35 @@ mod tests {
     #[test]
     fn coalesce_wide_store_with_one_byte_overwrite_uses_range() {
         let mut tc = TestContext::new();
-        let (fun_id, block_id) = single_block_fn(&mut tc);
-        let reg = tc.reg_space;
+        let r0_byte0 = tc.r0_byte0;
+        let r0_lo32 = tc.r0_lo32;
+        let r1 = tc.r1;
 
-        let w;
-        {
-            let mut b = Builder::from_context(&mut tc.ctx, 0x1000);
-            w = b
-                .push_load::<false>(ValueId::Varnode(tc.r0_lo32), 4, reg)
-                .id();
-            // Re-store it so the wide value is the live writer of bytes 1..4.
-            b.push_store(w, ValueId::Varnode(tc.r0_lo32), reg);
-            let lo = b.context_mut().get_const(0xAB, 1).id();
-            b.push_store(lo, ValueId::Varnode(tc.r0_byte0), reg);
-            let v = b
-                .push_load::<false>(ValueId::Varnode(tc.r0_lo32), 4, reg)
-                .id();
-            b.push_store(v, ValueId::Varnode(tc.r1), reg);
-            unsafe { b.dont_finalize() };
-        }
+        qcode!(
+            tc.ctx,
+            "
+                fn func:
+                    <block>
+                        %w = load(i32, {r0_lo32});
+                        store({r0_lo32}, %w); # re-store: %w is the live writer of bytes 1..4
+                        store({r0_byte0}, i8 0xAB);
+                        %v = load(i32, {r0_lo32});
+                        store({r1}, %v);
+                        return [0x1000];
+                "
+        );
 
-        optimize(&mut tc.ctx, fun_id);
+        optimize(&mut tc.ctx, func);
 
         // A Range(%w, 1, 3) must have been materialized for the upper three bytes.
-        let has_upper_range = BasicBlock::from_id(&tc.ctx, block_id).iter().any(|i| {
+        let w = ValueId::Instruction(w);
+        let has_upper_range = BasicBlock::from_id(&tc.ctx, block).iter().any(|i| {
             matches!(i.mnemonic(), Mnemonic::Range(Range { src, start: 1, size: 3 }) if *src == w)
         });
         assert!(
             has_upper_range,
             "expected Range(%w, 1, 3) for the untouched upper bytes:\n{}",
-            BasicBlock::from_id(&tc.ctx, block_id)
+            BasicBlock::from_id(&tc.ctx, block)
         );
     }
 
@@ -580,33 +558,31 @@ mod tests {
     #[test]
     fn narrow_read_of_wide_value_extracts_range() {
         let mut tc = TestContext::new();
-        let (fun_id, block_id) = single_block_fn(&mut tc);
-        let reg = tc.reg_space;
+        let r0_byte1 = tc.r0_byte1;
+        let r0_lo32 = tc.r0_lo32;
+        let r1 = tc.r1;
 
-        let (w, narrow);
-        {
-            let mut b = Builder::from_context(&mut tc.ctx, 0x1000);
-            w = b
-                .push_load::<false>(ValueId::Varnode(tc.r0_lo32), 4, reg)
-                .id();
-            b.push_store(w, ValueId::Varnode(tc.r0_lo32), reg);
-            narrow = b
-                .push_load::<false>(ValueId::Varnode(tc.r0_byte1), 1, reg)
-                .id();
-            b.push_store(narrow, ValueId::Varnode(tc.r1), reg);
-            unsafe { b.dont_finalize() };
-        }
+        qcode!(
+            tc.ctx,
+            "
+                fn func:
+                    <block>
+                        %w = load(i32, {r0_lo32});
+                        store({r0_lo32}, %w);
+                        %narrow = load(i8, {r0_byte1});
+                        store({r1}, %narrow);
+                        return [0x1000];
+                "
+        );
 
-        optimize(&mut tc.ctx, fun_id);
+        optimize(&mut tc.ctx, func);
 
-        let ValueId::Instruction(narrow_insn) = narrow else {
-            panic!("load is an instruction");
-        };
         assert!(
-            !block_contains(&tc.ctx, block_id, narrow_insn),
+            !block_contains(&tc.ctx, block, narrow),
             "the narrow read should be replaced by a Range"
         );
-        let has_range = BasicBlock::from_id(&tc.ctx, block_id).iter().any(|i| {
+        let w = ValueId::Instruction(w);
+        let has_range = BasicBlock::from_id(&tc.ctx, block).iter().any(|i| {
             matches!(i.mnemonic(), Mnemonic::Range(Range { src, start: 1, size: 1 }) if *src == w)
         });
         assert!(has_range, "expected Range(%w, 1, 1)");
@@ -616,30 +592,28 @@ mod tests {
     #[test]
     fn coalesce_bails_on_coverage_gap() {
         let mut tc = TestContext::new();
-        let (fun_id, block_id) = single_block_fn(&mut tc);
-        let reg = tc.reg_space;
+        let r0_byte0 = tc.r0_byte0;
+        let r0_byte2 = tc.r0_byte2;
+        let r0_lo32 = tc.r0_lo32;
+        let r1 = tc.r1;
 
-        let load_id;
-        {
-            let mut b = Builder::from_context(&mut tc.ctx, 0x1000);
-            let c0 = b.context_mut().get_const(1, 1).id();
-            let c2 = b.context_mut().get_const(2, 1).id();
-            b.push_store(c0, ValueId::Varnode(tc.r0_byte0), reg);
-            b.push_store(c2, ValueId::Varnode(tc.r0_byte2), reg); // byte 1 and 3 unwritten
-            load_id = b
-                .push_load::<false>(ValueId::Varnode(tc.r0_lo32), 4, reg)
-                .id();
-            b.push_store(load_id, ValueId::Varnode(tc.r1), reg);
-            unsafe { b.dont_finalize() };
-        }
+        qcode!(
+            tc.ctx,
+            "
+                fn func:
+                    <block>
+                        store({r0_byte0}, i8 1);
+                        store({r0_byte2}, i8 2); # byte 1 and 3 unwritten
+                        %load = load(i32, {r0_lo32});
+                        store({r1}, %load);
+                        return [0x1000];
+                "
+        );
 
-        optimize(&mut tc.ctx, fun_id);
+        optimize(&mut tc.ctx, func);
 
-        let ValueId::Instruction(load_insn) = load_id else {
-            panic!("load is an instruction");
-        };
         assert!(
-            block_contains(&tc.ctx, block_id, load_insn),
+            block_contains(&tc.ctx, block, load),
             "a partially-covered read must not be forwarded"
         );
     }
@@ -648,43 +622,31 @@ mod tests {
     #[test]
     fn coalesce_across_dominating_block() {
         let mut tc = TestContext::new();
-        let fun_id = Function::make(&mut tc.ctx, "test".into()).unwrap().id;
-        let entry = tc.ctx.get_or_make_block(0x1000);
-        let succ = tc.ctx.get_or_make_block(0x2000);
-        {
-            let mut f = Function::from_id_mut(&mut tc.ctx, fun_id);
-            f.set_root(entry).unwrap();
-            f.add_block(entry);
-            f.add_block(succ);
-        }
-        let reg = tc.reg_space;
+        let r0_byte0 = tc.r0_byte0;
+        let r0_byte1 = tc.r0_byte1;
+        let r0_lo16 = tc.r0_lo16;
+        let r1 = tc.r1;
 
-        {
-            let mut b = Builder::from_block(BasicBlock::from_id_mut(&mut tc.ctx, entry));
-            let c0 = b.context_mut().get_const(0xAA, 1).id();
-            let c1 = b.context_mut().get_const(0xBB, 1).id();
-            b.push_store(c0, ValueId::Varnode(tc.r0_byte0), reg);
-            b.push_store(c1, ValueId::Varnode(tc.r0_byte1), reg);
-            b.push_branch(succ);
-            unsafe { b.dont_finalize() };
-        }
-        let load_id;
-        {
-            let mut b = Builder::from_block(BasicBlock::from_id_mut(&mut tc.ctx, succ));
-            load_id = b
-                .push_load::<false>(ValueId::Varnode(tc.r0_lo16), 2, reg)
-                .id();
-            b.push_store(load_id, ValueId::Varnode(tc.r1), reg);
-            unsafe { b.dont_finalize() };
-        }
+        qcode!(
+            tc.ctx,
+            "
+                fn func:
+                    <entry>
+                        store({r0_byte0}, i8 0xAA);
+                        store({r0_byte1}, i8 0xBB);
+                        goto <succ>;
 
-        optimize(&mut tc.ctx, fun_id);
+                    <succ>
+                        %load = load(i16, {r0_lo16});
+                        store({r1}, %load);
+                        return [0x2000];
+                "
+        );
 
-        let ValueId::Instruction(load_insn) = load_id else {
-            panic!("load is an instruction");
-        };
+        optimize(&mut tc.ctx, func);
+
         assert!(
-            !block_contains(&tc.ctx, succ, load_insn),
+            !block_contains(&tc.ctx, succ, load),
             "partial writes in the dominator should coalesce into the successor read:\n{}",
             BasicBlock::from_id(&tc.ctx, succ)
         );
