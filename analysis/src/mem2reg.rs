@@ -43,7 +43,11 @@ impl<'ctx, 'str> Mem2Reg<'ctx, 'str> {
     }
 
     fn run(&mut self) -> bool {
-        let Promotable { vars, sizes } = self.collect_promotable_vars();
+        // `live_in_blocks` is an O(blocks × insns) fixpoint; cache it per var so
+        // the collection and block-param phases share a single computation.
+        let mut live_in_cache: HashMap<ValueId, HashSet<BlockId>> = HashMap::new();
+
+        let Promotable { vars, sizes } = self.collect_promotable_vars(&mut live_in_cache);
         if vars.is_empty() {
             return false;
         }
@@ -54,7 +58,21 @@ impl<'ctx, 'str> Mem2Reg<'ctx, 'str> {
         let InsertedBlockParams {
             by_block: var_params,
             changed,
-        } = self.insert_block_params(&vars, &sizes, &frontier);
+            excluded,
+        } = self.insert_block_params(&vars, &sizes, &frontier, &mut live_in_cache);
+
+        // Drop vars whose promotion was declined (implicit-edge join); their
+        // memory accesses stay in place, so renaming and store removal must not
+        // touch them.
+        let vars: HashSet<ValueId> = if excluded.is_empty() {
+            vars
+        } else {
+            vars.difference(&excluded).copied().collect()
+        };
+        if vars.is_empty() {
+            return changed;
+        }
+
         let register_clobbers =
             register_clobber_index(self.ctx, self.function_id, &vars, self.aliases);
 
@@ -295,12 +313,39 @@ impl StackAccessRange {
     }
 }
 
+/// The promotion access size for stack-slot literal `var`, or `None` if it fails
+/// the single-size or no-overlap guard: a slot accessed at conflicting sizes, or
+/// whose byte range is touched by any *other* stack access, cannot be promoted.
+fn promotable_stack_slot_size(
+    ctx: &Context,
+    var: ValueId,
+    stack_size: &HashMap<ValueId, usize>,
+    stack_size_conflict: &HashSet<ValueId>,
+    stack_intervals: &[StackAccessRange],
+) -> Option<usize> {
+    if stack_size_conflict.contains(&var) {
+        return None;
+    }
+    let size = stack_size[&var];
+    let addr = stack_slot_addr(ctx, var).expect("stack slot var is a stack literal");
+    let own = StackAccessRange::new(addr, size);
+    let overlapped = stack_intervals
+        .iter()
+        .any(|access| *access != own && access.overlaps_slot(addr, size));
+    (!overlapped).then_some(size)
+}
+
 type BlockParamsByVar = HashMap<ValueId, BlockParamId>;
 type BlockParamAssignments = HashMap<BlockId, BlockParamsByVar>;
 
 struct InsertedBlockParams {
     by_block: BlockParamAssignments,
     changed: bool,
+    /// Vars declined for promotion because a join they would parameterize is fed
+    /// by an implicit (argument-less) edge — see [`Mem2Reg::insert_block_params`].
+    /// The caller must drop these from the rename set so their loads/stores are
+    /// left in place.
+    excluded: HashSet<ValueId>,
 }
 
 impl Mem2Reg<'_, '_> {
@@ -351,7 +396,10 @@ impl Mem2Reg<'_, '_> {
         (param_id, true)
     }
 
-    fn collect_promotable_vars(&self) -> Promotable {
+    fn collect_promotable_vars(
+        &self,
+        live_in_cache: &mut HashMap<ValueId, HashSet<BlockId>>,
+    ) -> Promotable {
         let mut stored = HashSet::new();
         let mut loaded = HashSet::new();
         let mut store_counts: HashMap<ValueId, usize> = HashMap::new();
@@ -370,9 +418,12 @@ impl Mem2Reg<'_, '_> {
         // any slot, so none may be promoted across it.
         let mut dynamic_stack =
             Function::from_id(self.ctx, self.function_id).frame_escapes_to_unbounded();
-        // Locations with a store whose source is narrower than the access (e.g. the
-        // `MOV ESI, imm32` lift, an 8-byte RSI store of a 4-byte literal). Promoting
-        // them would forward the narrow value into a wider load.
+        // Locations disqualified because an access mis-sizes the stored value:
+        //   - a store whose source is narrower than the access (e.g. the
+        //     `MOV ESI, imm32` lift, an 8-byte RSI store of a 4-byte literal); or
+        //   - a varnode access whose width differs from the varnode's own width
+        //     (e.g. a 4-byte load of an 8-byte-stored register).
+        // Promoting either would forward a wrong-width value.
         let mut mixed_width: HashSet<ValueId> = HashSet::new();
 
         for block in Function::from_id(self.ctx, self.function_id).blocks() {
@@ -386,7 +437,10 @@ impl Mem2Reg<'_, '_> {
                     mixed_width.insert(access.ptr);
                 }
 
-                if access.ptr.is_varnode() {
+                if let ValueId::Varnode(vn_id) = access.ptr {
+                    if access.size != Varnode::from_id(self.ctx, vn_id).size() {
+                        mixed_width.insert(access.ptr);
+                    }
                     if access.is_store() {
                         stored.insert(access.ptr);
                         *store_counts.entry(access.ptr).or_insert(0) += 1;
@@ -441,10 +495,9 @@ impl Mem2Reg<'_, '_> {
                     // call is the call's output, not an input; leaving it as a
                     // register load lets emulation read the clobbered value rather
                     // than a spurious entry parameter.
-                    if self
-                        .root_id
-                        .is_some_and(|r| self.live_in_blocks(var).contains(&r))
-                    {
+                    if self.root_id.is_some_and(|r| {
+                        self.live_in_blocks_cached(var, live_in_cache).contains(&r)
+                    }) {
                         vars.insert(var);
                     }
                 } else if !is_store_only || count >= 2 {
@@ -460,21 +513,16 @@ impl Mem2Reg<'_, '_> {
         let mut sizes: HashMap<ValueId, usize> = HashMap::new();
         if !dynamic_stack {
             for &var in stack_stored.intersection(&stack_loaded) {
-                if stack_size_conflict.contains(&var) {
-                    continue;
+                if let Some(size) = promotable_stack_slot_size(
+                    self.ctx,
+                    var,
+                    &stack_size,
+                    &stack_size_conflict,
+                    &stack_intervals,
+                ) {
+                    vars.insert(var);
+                    sizes.insert(var, size);
                 }
-                let size = stack_size[&var];
-                let addr =
-                    stack_slot_addr(self.ctx, var).expect("stack slot var is a stack literal");
-                let own = StackAccessRange::new(addr, size);
-                let overlapped = stack_intervals
-                    .iter()
-                    .any(|access| *access != own && access.overlaps_slot(addr, size));
-                if overlapped {
-                    continue;
-                }
-                vars.insert(var);
-                sizes.insert(var, size);
             }
 
             // Incoming stack parameters: a caller-frame slot (offset >= ptr_width,
@@ -485,27 +533,22 @@ impl Mem2Reg<'_, '_> {
             // so `compute_inputs` can recover it. The same single-size and
             // no-overlap guards apply.
             for &var in stack_loaded.difference(&stack_stored) {
-                if stack_size_conflict.contains(&var) {
-                    continue;
-                }
                 let Some((offset, ptr_width)) = stack_slot_offset(self.ctx, var) else {
                     continue;
                 };
                 if offset < ptr_width as i64 {
                     continue;
                 }
-                let size = stack_size[&var];
-                let addr =
-                    stack_slot_addr(self.ctx, var).expect("stack slot var is a stack literal");
-                let own = StackAccessRange::new(addr, size);
-                let overlapped = stack_intervals
-                    .iter()
-                    .any(|access| *access != own && access.overlaps_slot(addr, size));
-                if overlapped {
-                    continue;
+                if let Some(size) = promotable_stack_slot_size(
+                    self.ctx,
+                    var,
+                    &stack_size,
+                    &stack_size_conflict,
+                    &stack_intervals,
+                ) {
+                    vars.insert(var);
+                    sizes.insert(var, size);
                 }
-                vars.insert(var);
-                sizes.insert(var, size);
             }
         }
 
@@ -522,9 +565,11 @@ impl Mem2Reg<'_, '_> {
         vars: &HashSet<ValueId>,
         sizes: &HashMap<ValueId, usize>,
         frontier: &HashMap<BlockId, HashSet<BlockId>>,
+        live_in_cache: &mut HashMap<ValueId, HashSet<BlockId>>,
     ) -> InsertedBlockParams {
         let mut var_params: BlockParamAssignments = HashMap::new();
         let mut changed = false;
+        let mut excluded: HashSet<ValueId> = HashSet::new();
 
         for &var in vars {
             // Block-param width: varnodes carry their own size; stack slots use the
@@ -538,11 +583,29 @@ impl Mem2Reg<'_, '_> {
             };
             let var_name = self.block_param_name_for_var(var);
 
-            let live_in = self.live_in_blocks(var);
+            let live_in = self.live_in_blocks_cached(var, live_in_cache);
             let phi_positions = {
                 let function = Function::from_id(self.ctx, self.function_id);
                 find_phi_insert_positions(var, &function, frontier, &live_in)
             };
+
+            // A block param is only meaningful if every incoming edge can supply
+            // its argument. Branch/CBranch edges are wired by `merge_branch_args`,
+            // but a `Call`/`CallInd` fall-through or a `BranchInd` jump-table edge
+            // carries no argument list. If any join we would parameterize is fed by
+            // such an implicit edge, that param would be left unbound on it. Rather
+            // than emit malformed IR — or, during renaming, forward a wrong value
+            // (register var) or panic (stack slot) — decline to promote this var at
+            // all, leaving its memory accesses in place. Conservative but correct;
+            // this is rare (it needs a jump-table/call successor that is also a
+            // multi-predecessor join for the var).
+            if phi_positions
+                .iter()
+                .any(|&b| self.has_implicit_edge_predecessor(b))
+            {
+                excluded.insert(var);
+                continue;
+            }
 
             for block_id in phi_positions {
                 let (param_id, inserted) =
@@ -571,11 +634,39 @@ impl Mem2Reg<'_, '_> {
         InsertedBlockParams {
             by_block: var_params,
             changed,
+            excluded,
         }
     }
 
-    fn live_in_blocks(&self, var: ValueId) -> HashSet<BlockId> {
-        live_in_blocks(self.ctx, self.function_id, var, self.aliases)
+    /// True if `block` has a predecessor reaching it through an edge that cannot
+    /// carry block-param arguments. Only `Branch`/`CBranch` terminators wire args
+    /// (via [`merge_branch_args`](Self::merge_branch_args)); a `Call`/`CallInd`
+    /// fall-through or a `BranchInd` jump-table edge is a bare CFG edge. A
+    /// predecessor with no terminator is treated as implicit (conservative).
+    fn has_implicit_edge_predecessor(&self, block: BlockId) -> bool {
+        BasicBlock::from_id(self.ctx, block)
+            .predecessors()
+            .any(|(_, pred)| {
+                let term = BasicBlock::from_id(self.ctx, pred)
+                    .iter()
+                    .last()
+                    .map(|i| i.mnemonic().clone());
+                !matches!(term, Some(Mnemonic::Branch(_)) | Some(Mnemonic::CBranch(_)))
+            })
+    }
+
+    /// Memoized [`live_in_blocks`]. The returned set is cloned from the cache so
+    /// the caller may freely take further `&mut self` borrows; the clone is cheap
+    /// relative to recomputing the liveness fixpoint.
+    fn live_in_blocks_cached(
+        &self,
+        var: ValueId,
+        cache: &mut HashMap<ValueId, HashSet<BlockId>>,
+    ) -> HashSet<BlockId> {
+        cache
+            .entry(var)
+            .or_insert_with(|| live_in_blocks(self.ctx, self.function_id, var, self.aliases))
+            .clone()
     }
 }
 
@@ -878,9 +969,9 @@ fn find_phi_insert_positions(
         .blocks()
         .filter(|b| block_contains_store_to_var(b, var))
         .map(|b| b.id)
-        .collect::<Vec<_>>();
+        .collect::<HashSet<_>>();
 
-    let mut worklist = block_containing_store.clone();
+    let mut worklist: Vec<BlockId> = block_containing_store.iter().copied().collect();
     let mut result = HashSet::new();
 
     while let Some(block) = worklist.pop() {
@@ -1011,13 +1102,18 @@ impl Mem2Reg<'_, '_> {
                     if state.vars.contains(&ptr) {
                         // If the current reaching definition for this var was never consumed,
                         // it is being overwritten without being read — mark it as dead.
+                        // Only look in the top frame: an overwrite on one CBranch/BranchInd
+                        // arm must not kill a store made in an ancestor frame that a sibling
+                        // path still relies on as a live-out value. Within one frame, blocks
+                        // are chained by unconditional edges, so the overwrite post-dominates
+                        // the old store (DFS order = path order).
                         if let Some(FrameEntry::Defined(ReachingValue {
                             store_insn: Some(old_id),
                             ..
-                        })) = decide_variable_value(ptr, &state.frames)
-                            && !state.consumed_stores.contains(&old_id)
+                        })) = state.frames.last().unwrap().get(&ptr)
+                            && !state.consumed_stores.contains(old_id)
                         {
-                            state.dead_stores.insert(old_id);
+                            state.dead_stores.insert(*old_id);
                         }
                         state.frames.last_mut().unwrap().insert(
                             ptr,
@@ -1141,17 +1237,12 @@ impl Mem2Reg<'_, '_> {
                     self.decide_values_start_from(target, state);
                 }
 
-                Mnemonic::Call(_) | Mnemonic::CallInd(_) => {
+                call_mnemonic @ (Mnemonic::Call(_) | Mnemonic::CallInd(_)) => {
                     // A call clobbers its callee's registers. Shadow each promoted
                     // register var it clobbers with a clobber marker so a read in the
                     // continuation sees the call's output (left as a register load),
                     // not the value the caller held before the call.
-                    let clobbered: Vec<ValueId> = state
-                        .vars
-                        .iter()
-                        .copied()
-                        .filter(|&v| call_clobbers_var(self.ctx, block, v, self.aliases))
-                        .collect();
+                    let clobbered = self.call_clobbered_register_vars(&call_mnemonic, state.vars);
                     {
                         let frame = state.frames.last_mut().unwrap();
                         for v in clobbered {
@@ -1175,8 +1266,51 @@ impl Mem2Reg<'_, '_> {
             .successors()
             .map(|(_, id)| id)
             .collect();
+        // Successors of a call fall-through / BranchInd jump table are mutually
+        // exclusive paths. Push a fresh frame per edge (like the CBranch arm) so a
+        // store made while visiting one successor's subtree is not visible when a
+        // sibling successor is visited.
         for successor in successors {
+            state.frames.push(Frame::new());
             self.decide_values_start_from(successor, state);
+            state.frames.pop();
+        }
+    }
+
+    /// The promoted register vars in `vars` clobbered by call terminator `call`.
+    ///
+    /// Computed once per call block: the callee's clobber set is fetched a single
+    /// time rather than re-derived per var (as a per-var [`call_clobbers_var`]
+    /// would). A `CallInd`, or a callee with no recorded clobber set, is treated
+    /// conservatively as clobbering every promoted register var.
+    fn call_clobbered_register_vars(
+        &self,
+        call: &Mnemonic,
+        vars: &HashSet<ValueId>,
+    ) -> Vec<ValueId> {
+        let register_vars = || {
+            vars.iter()
+                .copied()
+                .filter(|&v| register_varnode(self.ctx, v).is_some())
+        };
+        match call {
+            Mnemonic::CallInd(_) => register_vars().collect(),
+            Mnemonic::Call(call) => {
+                let clobbered = Function::from_id(self.ctx, call.target)
+                    .clobbered_regs()
+                    .map(<[VarnodeId]>::to_vec);
+                match clobbered {
+                    None => register_vars().collect(),
+                    Some(clobbered) => register_vars()
+                        .filter(|&v| {
+                            clobbered
+                                .iter()
+                                .any(|&c| self.aliases.may_alias(self.ctx, ValueId::Varnode(c), v))
+                        })
+                        .collect(),
+                }
+            }
+            _ => Vec::new(),
         }
     }
 }
@@ -1932,6 +2066,258 @@ mod tests {
             BasicBlock::from_id(&tc.ctx, entry).num_params(),
             entry_params_after_first,
             "re-running mem2reg must reuse the existing unnamed-register entry param"
+        );
+    }
+
+    /// A store overwritten on one branch arm must not be marked dead when a
+    /// sibling arm never overwrites it: that sibling relies on the store as its
+    /// live-out register value. (Bug 1: path-insensitive dead-store marking.)
+    #[test]
+    fn store_on_one_arm_does_not_kill_live_out_store_on_sibling() {
+        use qcode::{builder::Builder, testing::TestContext};
+
+        let mut tc = TestContext::new();
+        let (r0, reg) = (tc.r0, tc.reg_space);
+
+        let f = Function::make(&mut tc.ctx, "test".into()).unwrap().id;
+        let entry = tc.ctx.get_or_make_block(0x1000);
+        let left = tc.ctx.get_or_make_block(0x1100);
+        let right = tc.ctx.get_or_make_block(0x1200);
+        let join = tc.ctx.get_or_make_block(0x1300);
+        {
+            let mut fr = Function::from_id_mut(&mut tc.ctx, f);
+            fr.set_root(entry).unwrap();
+            fr.add_block(left);
+            fr.add_block(right);
+            fr.add_block(join);
+        }
+
+        let entry_store;
+        {
+            let mut b = Builder::from_block(BasicBlock::from_id_mut(&mut tc.ctx, entry));
+            let one = b.context_mut().get_const(1u64, 8).id();
+            let cond = b.context_mut().get_const(1u64, 1).id();
+            entry_store = b.push_store(one, ValueId::Varnode(r0), reg).id;
+            b.push_cbranch(cond, left, right);
+        }
+        {
+            // Left arm overwrites r0 before reading it.
+            let mut b = Builder::from_block(BasicBlock::from_id_mut(&mut tc.ctx, left));
+            let two = b.context_mut().get_const(2u64, 8).id();
+            b.push_store(two, ValueId::Varnode(r0), reg);
+            b.push_branch(join);
+        }
+        {
+            // Right arm never touches r0: it leaves the function with the entry value.
+            let mut b = Builder::from_block(BasicBlock::from_id_mut(&mut tc.ctx, right));
+            b.push_branch(join);
+        }
+        {
+            let mut b = Builder::from_block(BasicBlock::from_id_mut(&mut tc.ctx, join));
+            let ret = b.context_mut().get_const(0u64, 8).id();
+            b.push_return(ret);
+        }
+
+        let aliases = AliasResult::simple(&tc.ctx);
+        mem2reg(&mut tc.ctx, f, &aliases);
+
+        let entry_block = BasicBlock::from_id(&tc.ctx, entry);
+        assert!(
+            entry_block.instruction_ids().contains(&entry_store),
+            "entry store r0=1 must survive: the right arm never overwrites it, so \
+             an overwrite on the left arm must not mark it dead:\n{entry_block}"
+        );
+    }
+
+    /// Mutually-exclusive BranchInd successors must not share reaching values: a
+    /// store made while visiting one successor must be invisible to a sibling
+    /// successor. (Bug 2: visit_successors shared one frame across siblings.)
+    ///
+    /// Both successors load r0 (each dominated only by the entry def) and then
+    /// redefine it. Whichever sibling `successors()` happens to visit second is
+    /// the one that observes the leak, so asserting *both* loads resolve to the
+    /// entry value catches the bug regardless of the (nondeterministic) iteration
+    /// order.
+    #[test]
+    fn branchind_sibling_successors_do_not_share_reaching_value() {
+        use qcode::{builder::Builder, testing::TestContext};
+
+        let mut tc = TestContext::new();
+        let (r0, r1, r2, reg) = (tc.r0, tc.r1, tc.r2, tc.reg_space);
+
+        let f = Function::make(&mut tc.ctx, "test".into()).unwrap().id;
+        let entry = tc.ctx.get_or_make_block(0x1000);
+        let s1 = tc.ctx.get_or_make_block(0x1100);
+        let s2 = tc.ctx.get_or_make_block(0x1200);
+        let exit = tc.ctx.get_or_make_block(0x1300);
+        {
+            let mut fr = Function::from_id_mut(&mut tc.ctx, f);
+            fr.set_root(entry).unwrap();
+            fr.add_block(s1);
+            fr.add_block(s2);
+            fr.add_block(exit);
+        }
+
+        let zero;
+        {
+            let mut b = Builder::from_block(BasicBlock::from_id_mut(&mut tc.ctx, entry));
+            zero = b.context_mut().get_const(0u64, 8).id();
+            let target = b.context_mut().get_const(0x1100u64, 8).id();
+            b.push_store(zero, ValueId::Varnode(r0), reg);
+            b.push_branchind(target);
+        }
+        tc.ctx.add_cfg_edge(entry, s1);
+        tc.ctx.add_cfg_edge(entry, s2);
+
+        // Each sibling loads r0 (must see the entry def), sinks it, then
+        // redefines r0 to a distinct value that must not leak to its sibling.
+        let sink1;
+        {
+            let mut b = Builder::from_block(BasicBlock::from_id_mut(&mut tc.ctx, s1));
+            let loaded = b.push_load::<false>(ValueId::Varnode(r0), 8, reg).id();
+            sink1 = b.push_store(loaded, ValueId::Varnode(r1), reg).id;
+            let one = b.context_mut().get_const(1u64, 8).id();
+            b.push_store(one, ValueId::Varnode(r0), reg);
+            b.push_branch(exit);
+        }
+        let sink2;
+        {
+            let mut b = Builder::from_block(BasicBlock::from_id_mut(&mut tc.ctx, s2));
+            let loaded = b.push_load::<false>(ValueId::Varnode(r0), 8, reg).id();
+            sink2 = b.push_store(loaded, ValueId::Varnode(r2), reg).id;
+            let two = b.context_mut().get_const(2u64, 8).id();
+            b.push_store(two, ValueId::Varnode(r0), reg);
+            b.push_branch(exit);
+        }
+        {
+            let mut b = Builder::from_block(BasicBlock::from_id_mut(&mut tc.ctx, exit));
+            let ret = b.context_mut().get_const(0u64, 8).id();
+            b.push_return(ret);
+        }
+
+        let aliases = AliasResult::simple(&tc.ctx);
+        mem2reg(&mut tc.ctx, f, &aliases);
+
+        for (sink, name) in [(sink1, "s1"), (sink2, "s2")] {
+            let Mnemonic::Store(store) = Instruction::from_id(&tc.ctx, sink).mnemonic().clone()
+            else {
+                panic!("{name} sink should remain a store");
+            };
+            assert_eq!(
+                store.src, zero,
+                "{name}'s load of r0 must resolve to the entry def (0), not the \
+                 sibling successor's redefinition"
+            );
+        }
+    }
+
+    /// A varnode accessed at a width that differs from its own width must not be
+    /// promoted: forwarding the stored value into a differently-sized load would
+    /// mis-size the result. (Hardening: varnode access-size consistency.)
+    #[test]
+    fn varnode_access_size_mismatch_blocks_promotion() {
+        use qcode::{builder::Builder, testing::TestContext};
+
+        let mut tc = TestContext::new();
+        let (r0, r1, reg) = (tc.r0, tc.r1, tc.reg_space); // r0 is 8 bytes wide
+
+        let f = Function::make(&mut tc.ctx, "test".into()).unwrap().id;
+        let entry = tc.ctx.get_or_make_block(0x1000);
+        Function::from_id_mut(&mut tc.ctx, f)
+            .set_root(entry)
+            .unwrap();
+
+        let mismatched_load;
+        {
+            let mut b = Builder::from_block(BasicBlock::from_id_mut(&mut tc.ctx, entry));
+            let val = b.context_mut().get_const(0x1122_3344_5566_7788u64, 8).id();
+            b.push_store(val, ValueId::Varnode(r0), reg); // 8-byte store: matches r0
+            // 4-byte load through the 8-byte r0 — a width mismatch that must
+            // disqualify r0 from promotion.
+            mismatched_load = b.push_load::<false>(ValueId::Varnode(r0), 4, reg).id();
+            b.push_store(mismatched_load, ValueId::Varnode(r1), reg);
+            let ret = b.context_mut().get_const(0u64, 8).id();
+            b.push_return(ret);
+        }
+
+        let aliases = AliasResult::simple(&tc.ctx);
+        mem2reg(&mut tc.ctx, f, &aliases);
+
+        let ValueId::Instruction(load_id) = mismatched_load else {
+            unreachable!()
+        };
+        let entry_block = BasicBlock::from_id(&tc.ctx, entry);
+        assert!(
+            entry_block.instruction_ids().contains(&load_id),
+            "a 4-byte load of the 8-byte register r0 must not be promoted; the \
+             size mismatch disqualifies r0:\n{entry_block}"
+        );
+    }
+
+    /// A var live into a join that is also a direct `BranchInd` successor must
+    /// not be promoted: the implicit (argument-less) jump-table edge into the
+    /// join cannot supply the block-param argument, so the var stays in memory
+    /// rather than yielding a param with an unbound edge. (Gap 3.)
+    #[test]
+    fn var_live_into_implicit_edge_join_is_not_promoted() {
+        use qcode::{builder::Builder, testing::TestContext};
+
+        let mut tc = TestContext::new();
+        let (r0, r1, reg) = (tc.r0, tc.r1, tc.reg_space);
+
+        let f = Function::make(&mut tc.ctx, "test".into()).unwrap().id;
+        let entry = tc.ctx.get_or_make_block(0x1000);
+        let other = tc.ctx.get_or_make_block(0x1100);
+        let join = tc.ctx.get_or_make_block(0x1200);
+        {
+            let mut fr = Function::from_id_mut(&mut tc.ctx, f);
+            fr.set_root(entry).unwrap();
+            fr.add_block(other);
+            fr.add_block(join);
+        }
+
+        // entry stores r0, then an indirect jump that can land on `join` directly
+        // (an argument-less edge) or on `other`.
+        {
+            let mut b = Builder::from_block(BasicBlock::from_id_mut(&mut tc.ctx, entry));
+            let zero = b.context_mut().get_const(0u64, 8).id();
+            let target = b.context_mut().get_const(0x1200u64, 8).id();
+            b.push_store(zero, ValueId::Varnode(r0), reg);
+            b.push_branchind(target);
+        }
+        tc.ctx.add_cfg_edge(entry, join); // implicit (BranchInd) edge into the join
+        tc.ctx.add_cfg_edge(entry, other);
+        {
+            let mut b = Builder::from_block(BasicBlock::from_id_mut(&mut tc.ctx, other));
+            let one = b.context_mut().get_const(1u64, 8).id();
+            b.push_store(one, ValueId::Varnode(r0), reg);
+            b.push_branch(join); // arg-carrying edge into the join
+        }
+        let join_load;
+        {
+            let mut b = Builder::from_block(BasicBlock::from_id_mut(&mut tc.ctx, join));
+            join_load = b.push_load::<false>(ValueId::Varnode(r0), 8, reg).id();
+            b.push_store(join_load, ValueId::Varnode(r1), reg);
+            let ret = b.context_mut().get_const(0u64, 8).id();
+            b.push_return(ret);
+        }
+
+        let aliases = AliasResult::simple(&tc.ctx);
+        mem2reg(&mut tc.ctx, f, &aliases);
+
+        let ValueId::Instruction(load_id) = join_load else {
+            unreachable!()
+        };
+        let join_block = BasicBlock::from_id(&tc.ctx, join);
+        assert!(
+            join_block.instruction_ids().contains(&load_id),
+            "r0's load must remain: the join is reached by an argument-less \
+             BranchInd edge, so r0 cannot be safely promoted:\n{join_block}"
+        );
+        assert_eq!(
+            join_block.num_params(),
+            0,
+            "the implicit-edge join must not receive a block param:\n{join_block}"
         );
     }
 }
