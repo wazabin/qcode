@@ -1,259 +1,730 @@
-use std::collections::{HashMap, HashSet};
+//! Memory sub-pass: alias-aware store→load forwarding.
+//!
+//! A thin [`SubPass`] adapter over [`MemForward`], which holds the byte-level
+//! forwarding state. Unlike pure CSE state, forwarded memory does not flow
+//! freely down the dominator tree: it is pruned at loop headers (a loop-body
+//! store may overwrite it on a later iteration), after calls (clobbered
+//! registers), and cleared entirely for blocks shared between walk entries.
 
 use jstd::graph::analysis::DominatorTree;
 
 use crate::AliasResult;
 use qcode::{
     context::Context,
-    space::{Space, SpaceType},
-    value::{
-        BasicBlock, Function, Value, ValueId, ValueRef, VarnodeId,
-        block::BlockId,
-        insn::{InstructionId, InstructionRef, Load, Mnemonic, Range},
-    },
+    value::{block::BlockId, insn::Mnemonic},
 };
 
-use super::integer::{normalize, simplify_flag_idiom, try_fold};
+use super::mem_forward::MemForward;
+use super::walk::{Claim, Editor, InsnCtx, SubPass};
 
-// ---------------------------------------------------------------------------
-// GVN pass
-// ---------------------------------------------------------------------------
+pub(super) struct MemoryForwarding;
 
-/// Process all instructions in `block_id` with an inherited value table.
-///
-/// Returns the updated table (inherited entries plus new entries from this block)
-/// for descendants in the dominator tree to inherit, plus whether any
-/// instruction was rewritten.
-pub(super) fn gvn_block_inner(
-    ctx: &mut Context,
-    block_id: BlockId,
-    inherited: &HashMap<Mnemonic, ValueId>,
-    aliases: Option<&AliasResult>,
-) -> (HashMap<Mnemonic, ValueId>, bool) {
-    let mut table = inherited.clone();
-    // Maps a narrow-load mnemonic to (wide_src, byte_offset_within_wide, sub_size),
-    // populated when a wide store covers sub-register locations.
-    let mut range_table: HashMap<Mnemonic, (ValueId, usize, usize)> = HashMap::new();
-    let mut redundant: HashSet<InstructionId> = HashSet::new();
+impl SubPass for MemoryForwarding {
+    type State = MemForward;
 
-    let insns = BasicBlock::from_id(ctx, block_id)
-        .instruction_ids()
-        .to_vec();
+    fn on_block_entry(
+        &self,
+        ctx: &mut Context,
+        state: &mut MemForward,
+        block_id: BlockId,
+        tree: &DominatorTree<BlockId>,
+        aliases: Option<&AliasResult>,
+        is_shared: bool,
+    ) {
+        if is_shared {
+            state.clear();
+        }
+        state.prune_loop_carried(ctx, block_id, tree, aliases);
+    }
 
-    for insn_id in insns {
-        let insn = ctx.get_insn(insn_id);
-        let id = insn.id();
-        let insn_size = insn.size();
-        let mut mnemonic = insn.mnemonic().clone();
-
-        match mnemonic {
+    fn on_insn(
+        &self,
+        ctx: &mut Context,
+        state: &mut MemForward,
+        ic: &InsnCtx,
+        ed: &mut Editor,
+    ) -> Claim {
+        match ic.mnemonic {
             Mnemonic::Store(store) => {
-                let store_ptr = store.ptr;
-                table.retain(|k, _| {
-                    if let Mnemonic::Load(load) = k {
-                        aliases.is_some_and(|aliases| !aliases.may_alias(ctx, store_ptr, load.ptr))
-                    } else {
-                        true
-                    }
-                });
-                // Only forward when the stored value is exactly as wide as the
-                // location. Some lifts (e.g. `MOV ESI, imm32`, which zero-extends
-                // into the 8-byte RSI) emit a wide store of a narrower literal;
-                // forwarding that value straight into a full-width load would feed
-                // a mis-sized constant into later folding.
-                if ValueRef::new(store.src, ctx).size() == store.size {
-                    table.insert(Mnemonic::Load(store.get_matching_load()), store.src);
-                }
-
-                // Invalidate range_table entries for locations this store may
-                // overwrite. Like the main table above, drop everything when no
-                // alias oracle is available (currently unreachable: entries are
-                // only inserted when `aliases` is `Some`).
-                range_table.retain(|k, _| {
-                    if let Mnemonic::Load(sub_load) = k {
-                        aliases
-                            .is_some_and(|aliases| !aliases.may_alias(ctx, store_ptr, sub_load.ptr))
-                    } else {
-                        true
-                    }
-                });
-
-                // Forward sub-register loads from this wide store.
-                if let Some(aliases) = aliases {
-                    for (sub_ptr, byte_off, sub_size) in aliases.sub_intervals_of(store.ptr) {
-                        let sub_load = Load {
-                            space: store.space,
-                            ptr: sub_ptr,
-                            size: sub_size,
-                        };
-                        range_table
-                            .insert(Mnemonic::Load(sub_load), (store.src, byte_off, sub_size));
-                    }
-                }
+                state.record_store(ctx, store, ic.aliases);
+                Claim::Done
             }
-
-            _ if mnemonic.is_terminator() || insn_size == 0 => {}
-
-            _ => {
-                if let Some(folded) = try_fold(ctx, &mnemonic, insn_size) {
-                    ctx.replace_all_uses_with(id, folded);
-                    redundant.insert(insn_id);
-                    continue;
-                }
-
-                // Collapse the signed-compare flag idiom into a single `s<`,
-                // materializing the replacement before this instruction and
-                // forwarding its uses; the dead flag math falls to DCE.
-                if let Some(new_mnemonic) = simplify_flag_idiom(ctx, &mnemonic) {
-                    let new_id = InstructionRef::from_mnemonic(ctx, new_mnemonic, insn_size).id;
-                    BasicBlock::from_id_mut(ctx, block_id).insert_insn_before(insn_id, new_id);
-                    ctx.replace_all_uses_with(id, new_id);
-                    redundant.insert(insn_id);
-                    continue;
-                }
-
-                normalize(&mut mnemonic);
-
-                match table.get(&mnemonic) {
-                    Some(&leader) => {
-                        ctx.replace_all_uses_with(id, leader);
-                        redundant.insert(insn_id);
+            Mnemonic::Load(load) => {
+                match state.try_load(ctx, ic.block_id, ic.insn_id, load, ic.aliases) {
+                    Some(value) => {
+                        ed.replace(ctx, ic.insn_id, value);
+                        state.define_load(load, value, ic.aliases);
                     }
-                    None => {
-                        // For loads not in the main table, check whether a wider store
-                        // already covers this sub-register location.
-                        if let Mnemonic::Load(_) = &mnemonic
-                            && let Some(&(wide_src, byte_off, sub_size)) =
-                                range_table.get(&mnemonic)
-                        {
-                            let range_id = InstructionRef::from_mnemonic(
-                                ctx,
-                                Mnemonic::Range(Range {
-                                    src: wide_src,
-                                    start: byte_off,
-                                    size: sub_size,
-                                }),
-                                sub_size,
-                            )
-                            .id;
-                            BasicBlock::from_id_mut(ctx, block_id)
-                                .insert_insn_before(insn_id, range_id);
-                            ctx.replace_all_uses_with(id, range_id);
-                            table.insert(mnemonic, range_id.into());
-                            redundant.insert(insn_id);
-                            continue;
-                        }
-                        table.insert(mnemonic, id);
-                    }
+                    None => state.define_load(load, ic.id, ic.aliases),
                 }
+                Claim::Done
             }
+            _ => Claim::Pass,
         }
     }
 
-    let changed = !redundant.is_empty();
-    BasicBlock::from_id_mut(ctx, block_id).retain_insns(|insn| !redundant.contains(insn));
-    (table, changed)
+    // A block that ends in a call clobbers registers: its dominated children
+    // run after the call, so register values the call clobbers must not be
+    // forwarded into them (e.g. a caller's post-call `RAX` read is the
+    // callee's result, not a value computed before the call).
+    fn after_block(
+        &self,
+        ctx: &Context,
+        state: &mut MemForward,
+        block_id: BlockId,
+        aliases: Option<&AliasResult>,
+    ) {
+        state.prune_clobbered_by_call(ctx, block_id, aliases);
+    }
 }
 
-/// The registers a call may clobber, used to invalidate forwarded `Load` leaders.
-enum CallClobbers {
-    /// Unknown target (`CallInd`) or a target with no recorded clobber set:
-    /// conservatively every register.
-    AllRegisters,
-    /// A direct call's recorded per-callee clobber set.
-    Regs(Vec<VarnodeId>),
-}
-
-/// Drop register `Load` leaders from `table` that the call terminating `block_id`
-/// (if any) may clobber, so they are not forwarded into the call's continuation.
-/// Non-call blocks pass `table` through untouched.
-pub(super) fn prune_clobbered_by_call<'a>(
-    ctx: &Context,
-    block_id: BlockId,
-    table: &'a HashMap<Mnemonic, ValueId>,
-    aliases: Option<&AliasResult>,
-) -> std::borrow::Cow<'a, HashMap<Mnemonic, ValueId>> {
-    let term = BasicBlock::from_id(ctx, block_id)
-        .iter()
-        .last()
-        .map(|i| i.mnemonic().clone());
-    let clobbers = match term {
-        Some(Mnemonic::CallInd(_)) => CallClobbers::AllRegisters,
-        Some(Mnemonic::Call(call)) => match Function::from_id(ctx, call.target).clobbered_regs() {
-            Some(regs) => CallClobbers::Regs(regs.to_vec()),
-            None => CallClobbers::AllRegisters,
+#[cfg(test)]
+mod tests {
+    use crate::AliasResult;
+    use crate::gvn::{constant_fold_function, gvn, gvn_function};
+    use qcode::builder::Builder;
+    use qcode::value::{Function, Value};
+    use qcode::{
+        context::Context,
+        testing::TestContext,
+        value::{
+            BasicBlock, ValueId,
+            block::BlockId,
+            function::FunctionId,
+            insn::{InstructionId, Mnemonic, Range},
         },
-        _ => return std::borrow::Cow::Borrowed(table),
     };
+    use qcode_macro::qcode;
 
-    let is_reg = |space| matches!(Space::from_id(ctx, space).ty, SpaceType::Register);
-    let has_clobbered_reg_load = table
-        .keys()
-        .any(|m| matches!(m, Mnemonic::Load(load) if is_reg(load.space)));
-    if !has_clobbered_reg_load {
-        return std::borrow::Cow::Borrowed(table);
+    #[test]
+    fn test_gvn_function_does_not_forward_loads_across_loop_header() {
+        let mut ctx = Context::new();
+
+        qcode!(
+            ctx,
+            "
+                varnode i32 A;
+
+                fn loop_load:
+                    <entry>
+                        store(&A, i32 0);
+                        goto <header>;
+
+                    <header>
+                        %v = load(i32, &A);
+                        if i8 1 goto <body> else goto <exit>;
+
+                    <body>
+                        store(&A, i32 1);
+                        goto <header>;
+
+                    <exit>
+                        return [0x1000];
+                "
+        );
+
+        let aliases = AliasResult::simple(&ctx);
+        gvn_function(&mut ctx, loop_load, Some(&aliases));
+
+        assert!(
+            BasicBlock::from_id(&ctx, header)
+                .instruction_ids()
+                .contains(&v),
+            "header load must not be replaced by the entry store; the backedge may overwrite it"
+        );
     }
 
-    let mut pruned = table.clone();
-    pruned.retain(|m, _| {
-        let Mnemonic::Load(load) = m else { return true };
-        if !is_reg(load.space) {
-            return true;
-        }
-        match &clobbers {
-            CallClobbers::AllRegisters => false,
-            CallClobbers::Regs(regs) => !regs.iter().any(|&r| match aliases {
-                Some(a) => a.may_alias(ctx, load.ptr, ValueId::Varnode(r)),
-                None => true,
-            }),
-        }
-    });
-    std::borrow::Cow::Owned(pruned)
-}
+    #[test]
+    fn test_gvn_function_forwards_loads_across_loop_header_when_body_stores_do_not_alias() {
+        let mut ctx = Context::new();
 
-pub(super) fn prune_loop_carried_loads<'a>(
-    ctx: &Context,
-    block_id: BlockId,
-    inherited: &'a HashMap<Mnemonic, ValueId>,
-    tree: &DominatorTree<BlockId>,
-    aliases: Option<&AliasResult>,
-) -> std::borrow::Cow<'a, HashMap<Mnemonic, ValueId>> {
-    // `dominates` is reflexive, so a self-loop (pred == block_id) also counts.
-    let is_loop_header = BasicBlock::from_id(ctx, block_id)
-        .predecessors()
-        .any(|(_, pred)| tree.dominates(block_id, pred));
-    if !is_loop_header || !inherited.keys().any(|m| matches!(m, Mnemonic::Load(_))) {
-        return std::borrow::Cow::Borrowed(inherited);
+        qcode!(
+            ctx,
+            "
+                varnode i32 A;
+                varnode i32 B;
+
+                fn loop_load:
+                    <entry>
+                        store(&A, i32 7);
+                        goto <header>;
+
+                    <header>
+                        %v = load(i32, &A);
+                        if i8 1 goto <body> else goto <exit>;
+
+                    <body>
+                        store(&B, i32 1);
+                        goto <header>;
+
+                    <exit>
+                        return [0x1000];
+                "
+        );
+
+        let aliases = AliasResult::simple(&ctx);
+        gvn_function(&mut ctx, loop_load, Some(&aliases));
+
+        assert!(
+            !BasicBlock::from_id(&ctx, header)
+                .instruction_ids()
+                .contains(&v),
+            "header load should be replaced by the dominating store when loop stores do not alias"
+        );
     }
 
-    let mut pruned = inherited.clone();
-    pruned.retain(|mnemonic, _| {
-        let Mnemonic::Load(load) = mnemonic else {
-            return true;
-        };
-        let Some(aliases) = aliases else {
-            return false;
-        };
+    /// A header that is its own loop body: the header's own store (after the load,
+    /// before the back edge) clobbers the inherited value on iterations >= 2, so
+    /// the entry store must not be forwarded into the header's load.
+    #[test]
+    fn test_gvn_function_self_loop_header_store_blocks_forwarding() {
+        let mut ctx = Context::new();
 
-        // The header itself is included: a store in the header (e.g. after the
-        // load, before the back edge) clobbers the inherited value on every
-        // iteration after the first, so the preheader value must not be
-        // forwarded into the header's load.
-        !ctx.block_ids()
-            .into_iter()
-            .filter(|&candidate| tree.dominates(block_id, candidate))
-            .flat_map(|candidate| {
-                BasicBlock::from_id(ctx, candidate)
-                    .iter()
-                    .map(|insn| insn.mnemonic().clone())
-                    .collect::<Vec<_>>()
+        qcode!(
+            ctx,
+            "
+                varnode i32 A;
+
+                fn self_loop:
+                    <entry>
+                        store(&A, i32 0);
+                        goto <header>;
+
+                    <header>
+                        %v = load(i32, &A);
+                        store(&A, i32 1);
+                        if i8 1 goto <header> else goto <exit>;
+
+                    <exit>
+                        return [0x1000];
+                "
+        );
+
+        let aliases = AliasResult::simple(&ctx);
+        gvn_function(&mut ctx, self_loop, Some(&aliases));
+
+        assert!(
+            BasicBlock::from_id(&ctx, header)
+                .instruction_ids()
+                .contains(&v),
+            "header load must not be replaced by the entry store; the header's own store \
+             overwrites it before the back edge"
+        );
+    }
+
+    /// Constant propagation: store → load → fold chain collapses to a literal.
+    #[test]
+    fn test_constant_propagation() {
+        let mut ctx = Context::new();
+
+        qcode!(
+            ctx,
+            "
+                varnode i64 A;
+                varnode i64 B;
+                <block>
+                    store(&A, i64 5);
+                    %a = load(i64, &A);
+                    %v1 = %a + 2;
+                    %v2 = %v1 + 3;
+                    store(&B, %v2);
+                    goto <0x1001>;"
+        );
+
+        let aliases = AliasResult::simple(&ctx);
+
+        let mut block = BasicBlock::from_id_mut(&mut ctx, block);
+
+        assert!(block.instruction_ids().contains(&v1));
+        assert!(block.instruction_ids().contains(&v2));
+
+        gvn(&mut block, Some(&aliases));
+
+        assert!(!block.instruction_ids().contains(&v1));
+        assert!(!block.instruction_ids().contains(&v2));
+        assert!(block.to_string().contains("B = 0xa"));
+    }
+
+    // -----------------------------------------------------------------------
+    // Register store→load forwarding
+    // -----------------------------------------------------------------------
+
+    /// Storing to a register and reading it straight back must forward the
+    /// stored value, even when overlapping sub-registers (r0/r0_lo32/...) put
+    /// the location in a multi-member alias class. Mirrors the post-call
+    /// `*[register]:4 EAX = v; %r = *[register]:4 EAX` reload chains the lifter
+    /// emits across every fixture.
+    #[test]
+    fn test_register_store_load_forwarding() {
+        let mut tc = TestContext::new();
+        let (fun_id, block_id) = single_block_fn(&mut tc);
+
+        let reg_space = tc.reg_space;
+        let eax = ValueId::Varnode(tc.r0_lo32);
+        let other = ValueId::Varnode(tc.r1);
+
+        let load_id;
+        {
+            let mut b = Builder::from_context(&mut tc.ctx, 0x1000);
+            let c = b.context_mut().get_const(0x12345678, 4).id();
+            b.push_store(c, eax, reg_space); // EAX = c
+            let loaded = b.push_load::<false>(eax, 4, reg_space).id(); // %r = EAX
+            b.push_store(loaded, other, reg_space); // use %r (keeps it live)
+            load_id = loaded;
+            unsafe { b.dont_finalize() };
+        }
+
+        let aliases = AliasResult::simple(&tc.ctx);
+        gvn_function(&mut tc.ctx, fun_id, Some(&aliases));
+
+        let ValueId::Instruction(load_insn) = load_id else {
+            panic!("push_load should produce an instruction value");
+        };
+        assert!(
+            !BasicBlock::from_id(&tc.ctx, block_id)
+                .instruction_ids()
+                .contains(&load_insn),
+            "register reload should be forwarded to the stored value, got:\n{}",
+            BasicBlock::from_id(&tc.ctx, block_id)
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Memory coalesce: rebuilding a wide value from partial writes
+    // -----------------------------------------------------------------------
+
+    /// A single-block function rooted at 0x1000.
+    fn single_block_fn(tc: &mut TestContext) -> (FunctionId, BlockId) {
+        let fun_id = Function::make(&mut tc.ctx, "test".into()).unwrap().id;
+        let block_id = tc.ctx.get_or_make_block(0x1000);
+        Function::from_id_mut(&mut tc.ctx, fun_id)
+            .set_root(block_id)
+            .unwrap();
+        (fun_id, block_id)
+    }
+
+    /// Run const-fold + GVN to a fixpoint, as the real `Gvn` pass does.
+    fn optimize(ctx: &mut Context, fun_id: FunctionId) {
+        loop {
+            let mut changed = constant_fold_function(ctx, fun_id);
+            let aliases = AliasResult::simple(ctx);
+            changed |= gvn_function(ctx, fun_id, Some(&aliases));
+            if !changed {
+                break;
+            }
+        }
+    }
+
+    fn store_src(ctx: &Context, store: ValueId) -> ValueId {
+        let ValueId::Instruction(id) = store else {
+            panic!("expected an instruction value, got {store:?}");
+        };
+        match ctx.get_insn(id).mnemonic() {
+            Mnemonic::Store(s) => s.src,
+            other => panic!("expected a store, got {other:?}"),
+        }
+    }
+
+    fn block_contains(ctx: &Context, block: BlockId, id: InstructionId) -> bool {
+        BasicBlock::from_id(ctx, block)
+            .instruction_ids()
+            .contains(&id)
+    }
+
+    fn literal_value(ctx: &Context, v: ValueId) -> Option<u64> {
+        match v {
+            ValueId::Literal(lid) => Some(ctx.values.literals[lid].value),
+            _ => None,
+        }
+    }
+
+    /// Helper: the store-to-r1 instruction in `block` (used to read its src).
+    fn load_insn_use(tc: &TestContext, block: BlockId) -> ValueId {
+        BasicBlock::from_id(&tc.ctx, block)
+            .iter()
+            .find(|i| {
+                matches!(i.mnemonic(), Mnemonic::Store(s)
+                    if matches!(s.ptr, ValueId::Varnode(v) if v == tc.r1))
             })
-            .any(|mnemonic| {
-                matches!(
-                    mnemonic,
-                    Mnemonic::Store(store) if aliases.may_alias(ctx, store.ptr, load.ptr)
-                )
-            })
-    });
-    std::borrow::Cow::Owned(pruned)
+            .expect("store to r1")
+            .id()
+    }
+
+    /// `xor eax,eax; setnz al; push eax`: the wide read of EAX must be rebuilt as
+    /// `zext(%cc)` — low byte from the partial write, upper bytes from the zero.
+    #[test]
+    fn coalesce_motivating_idiom_symbolic_low_byte() {
+        let mut tc = TestContext::new();
+        let (fun_id, block_id) = single_block_fn(&mut tc);
+        let reg = tc.reg_space;
+
+        let (cc, load_id, keep);
+        {
+            let mut b = Builder::from_context(&mut tc.ctx, 0x1000);
+            // A symbolic 1-byte value (the `setnz al` result), read before the zero.
+            cc = b
+                .push_load::<false>(ValueId::Varnode(tc.r0_byte1), 1, reg)
+                .id();
+            let zero = b.context_mut().get_const(0, 4).id();
+            b.push_store(zero, ValueId::Varnode(tc.r0_lo32), reg); // xor eax, eax
+            b.push_store(cc, ValueId::Varnode(tc.r0_byte0), reg); // setnz al
+            load_id = b
+                .push_load::<false>(ValueId::Varnode(tc.r0_lo32), 4, reg)
+                .id();
+            keep = b.push_store(load_id, ValueId::Varnode(tc.r1), reg).id(); // push eax (use)
+            unsafe { b.dont_finalize() };
+        }
+
+        optimize(&mut tc.ctx, fun_id);
+
+        let ValueId::Instruction(load_insn) = load_id else {
+            panic!("load is an instruction");
+        };
+        assert!(
+            !block_contains(&tc.ctx, block_id, load_insn),
+            "the wide EAX read should be coalesced away:\n{}",
+            BasicBlock::from_id(&tc.ctx, block_id)
+        );
+
+        // After folding, the rebuilt value is exactly `zext(%cc)`.
+        let src = store_src(&tc.ctx, keep);
+        let ValueId::Instruction(zid) = src else {
+            panic!("expected the rebuilt value to be an instruction, got {src:?}");
+        };
+        match tc.ctx.get_insn(zid).mnemonic() {
+            Mnemonic::Zext(z) => assert_eq!(z.src, cc, "zext of the setnz byte"),
+            other => panic!("expected zext(%cc), got {other:?}"),
+        }
+    }
+
+    /// Same idiom but the low byte is a constant: the whole read folds to a literal.
+    #[test]
+    fn coalesce_constant_idiom_folds_to_literal() {
+        let mut tc = TestContext::new();
+        let (fun_id, _block) = single_block_fn(&mut tc);
+        let reg = tc.reg_space;
+
+        let keep;
+        {
+            let mut b = Builder::from_context(&mut tc.ctx, 0x1000);
+            let zero = b.context_mut().get_const(0, 4).id();
+            let one = b.context_mut().get_const(1, 1).id();
+            b.push_store(zero, ValueId::Varnode(tc.r0_lo32), reg);
+            b.push_store(one, ValueId::Varnode(tc.r0_byte0), reg);
+            let v = b
+                .push_load::<false>(ValueId::Varnode(tc.r0_lo32), 4, reg)
+                .id();
+            keep = b.push_store(v, ValueId::Varnode(tc.r1), reg).id();
+            unsafe { b.dont_finalize() };
+        }
+
+        optimize(&mut tc.ctx, fun_id);
+
+        assert_eq!(
+            literal_value(&tc.ctx, store_src(&tc.ctx, keep)),
+            Some(1),
+            "0x00000000 with low byte 1 folds to 1"
+        );
+    }
+
+    /// Four distinct constant byte writes coalesce in little-endian order.
+    #[test]
+    fn coalesce_constant_bytes_are_little_endian() {
+        let mut tc = TestContext::new();
+        let (fun_id, _block) = single_block_fn(&mut tc);
+        let reg = tc.reg_space;
+
+        let keep;
+        {
+            let mut b = Builder::from_context(&mut tc.ctx, 0x1000);
+            for (byte_vn, val) in [
+                (tc.r0_byte0, 0xAA),
+                (tc.r0_byte1, 0xBB),
+                (tc.r0_byte2, 0xCC),
+                (tc.r0_byte3, 0xDD),
+            ] {
+                let c = b.context_mut().get_const(val, 1).id();
+                b.push_store(c, ValueId::Varnode(byte_vn), reg);
+            }
+            let v = b
+                .push_load::<false>(ValueId::Varnode(tc.r0_lo32), 4, reg)
+                .id();
+            keep = b.push_store(v, ValueId::Varnode(tc.r1), reg).id();
+            unsafe { b.dont_finalize() };
+        }
+
+        optimize(&mut tc.ctx, fun_id);
+
+        assert_eq!(
+            literal_value(&tc.ctx, store_src(&tc.ctx, keep)),
+            Some(0xDDCC_BBAA),
+            "byte 0 is least significant"
+        );
+    }
+
+    /// Two symbolic byte reads coalesce into a halfword built with `zext`/`<<`/`|`.
+    #[test]
+    fn coalesce_two_symbolic_bytes_into_halfword() {
+        let mut tc = TestContext::new();
+        let (fun_id, block_id) = single_block_fn(&mut tc);
+        let reg = tc.reg_space;
+
+        let load_id;
+        {
+            let mut b = Builder::from_context(&mut tc.ctx, 0x1000);
+            // Symbolic sources from non-overlapping bytes (offsets 2 and 3).
+            let x = b
+                .push_load::<false>(ValueId::Varnode(tc.r0_byte2), 1, reg)
+                .id();
+            let y = b
+                .push_load::<false>(ValueId::Varnode(tc.r0_byte3), 1, reg)
+                .id();
+            b.push_store(x, ValueId::Varnode(tc.r0_byte0), reg);
+            b.push_store(y, ValueId::Varnode(tc.r0_byte1), reg);
+            load_id = b
+                .push_load::<false>(ValueId::Varnode(tc.r0_lo16), 2, reg)
+                .id();
+            b.push_store(load_id, ValueId::Varnode(tc.r1), reg);
+            unsafe { b.dont_finalize() };
+        }
+
+        optimize(&mut tc.ctx, fun_id);
+
+        let ValueId::Instruction(load_insn) = load_id else {
+            panic!("load is an instruction");
+        };
+        assert!(
+            !block_contains(&tc.ctx, block_id, load_insn),
+            "the halfword read should be coalesced:\n{}",
+            BasicBlock::from_id(&tc.ctx, block_id)
+        );
+        // The result must not collapse to a constant (both pieces are symbolic).
+        assert!(
+            literal_value(&tc.ctx, store_src(&tc.ctx, load_insn_use(&tc, block_id))).is_none(),
+            "symbolic coalesce must not fold to a literal"
+        );
+    }
+
+    /// Four sub-byte reads then a wide read: the wide read coalesces all four.
+    #[test]
+    fn coalesce_four_byte_reads_into_word() {
+        let mut tc = TestContext::new();
+        let (fun_id, block_id) = single_block_fn(&mut tc);
+        let reg = tc.reg_space;
+
+        let load_id;
+        {
+            let mut b = Builder::from_context(&mut tc.ctx, 0x1000);
+            for byte_vn in [tc.r0_byte0, tc.r0_byte1, tc.r0_byte2, tc.r0_byte3] {
+                b.push_load::<false>(ValueId::Varnode(byte_vn), 1, reg);
+            }
+            load_id = b
+                .push_load::<false>(ValueId::Varnode(tc.r0_lo32), 4, reg)
+                .id();
+            b.push_store(load_id, ValueId::Varnode(tc.r1), reg);
+            unsafe { b.dont_finalize() };
+        }
+
+        optimize(&mut tc.ctx, fun_id);
+
+        let ValueId::Instruction(load_insn) = load_id else {
+            panic!("load is an instruction");
+        };
+        assert!(
+            !block_contains(&tc.ctx, block_id, load_insn),
+            "the word read should coalesce four byte reads:\n{}",
+            BasicBlock::from_id(&tc.ctx, block_id)
+        );
+    }
+
+    /// A wide store then a one-byte overwrite: the wide read keeps a `Range` of the
+    /// wide store for the untouched upper bytes.
+    #[test]
+    fn coalesce_wide_store_with_one_byte_overwrite_uses_range() {
+        let mut tc = TestContext::new();
+        let (fun_id, block_id) = single_block_fn(&mut tc);
+        let reg = tc.reg_space;
+
+        let w;
+        {
+            let mut b = Builder::from_context(&mut tc.ctx, 0x1000);
+            w = b
+                .push_load::<false>(ValueId::Varnode(tc.r0_lo32), 4, reg)
+                .id();
+            // Re-store it so the wide value is the live writer of bytes 1..4.
+            b.push_store(w, ValueId::Varnode(tc.r0_lo32), reg);
+            let lo = b.context_mut().get_const(0xAB, 1).id();
+            b.push_store(lo, ValueId::Varnode(tc.r0_byte0), reg);
+            let v = b
+                .push_load::<false>(ValueId::Varnode(tc.r0_lo32), 4, reg)
+                .id();
+            b.push_store(v, ValueId::Varnode(tc.r1), reg);
+            unsafe { b.dont_finalize() };
+        }
+
+        optimize(&mut tc.ctx, fun_id);
+
+        // A Range(%w, 1, 3) must have been materialized for the upper three bytes.
+        let has_upper_range = BasicBlock::from_id(&tc.ctx, block_id).iter().any(|i| {
+            matches!(i.mnemonic(), Mnemonic::Range(Range { src, start: 1, size: 3 }) if *src == w)
+        });
+        assert!(
+            has_upper_range,
+            "expected Range(%w, 1, 3) for the untouched upper bytes:\n{}",
+            BasicBlock::from_id(&tc.ctx, block_id)
+        );
+    }
+
+    /// A wide write then a narrow read still works (the old `range_table` path):
+    /// reading byte 1 of a wide value yields `Range(%w, 1, 1)`.
+    #[test]
+    fn narrow_read_of_wide_value_extracts_range() {
+        let mut tc = TestContext::new();
+        let (fun_id, block_id) = single_block_fn(&mut tc);
+        let reg = tc.reg_space;
+
+        let (w, narrow);
+        {
+            let mut b = Builder::from_context(&mut tc.ctx, 0x1000);
+            w = b
+                .push_load::<false>(ValueId::Varnode(tc.r0_lo32), 4, reg)
+                .id();
+            b.push_store(w, ValueId::Varnode(tc.r0_lo32), reg);
+            narrow = b
+                .push_load::<false>(ValueId::Varnode(tc.r0_byte1), 1, reg)
+                .id();
+            b.push_store(narrow, ValueId::Varnode(tc.r1), reg);
+            unsafe { b.dont_finalize() };
+        }
+
+        optimize(&mut tc.ctx, fun_id);
+
+        let ValueId::Instruction(narrow_insn) = narrow else {
+            panic!("load is an instruction");
+        };
+        assert!(
+            !block_contains(&tc.ctx, block_id, narrow_insn),
+            "the narrow read should be replaced by a Range"
+        );
+        let has_range = BasicBlock::from_id(&tc.ctx, block_id).iter().any(|i| {
+            matches!(i.mnemonic(), Mnemonic::Range(Range { src, start: 1, size: 1 }) if *src == w)
+        });
+        assert!(has_range, "expected Range(%w, 1, 1)");
+    }
+
+    /// A gap in coverage (byte 1 never written) leaves the wide read intact.
+    #[test]
+    fn coalesce_bails_on_coverage_gap() {
+        let mut tc = TestContext::new();
+        let (fun_id, block_id) = single_block_fn(&mut tc);
+        let reg = tc.reg_space;
+
+        let load_id;
+        {
+            let mut b = Builder::from_context(&mut tc.ctx, 0x1000);
+            let c0 = b.context_mut().get_const(1, 1).id();
+            let c2 = b.context_mut().get_const(2, 1).id();
+            b.push_store(c0, ValueId::Varnode(tc.r0_byte0), reg);
+            b.push_store(c2, ValueId::Varnode(tc.r0_byte2), reg); // byte 1 and 3 unwritten
+            load_id = b
+                .push_load::<false>(ValueId::Varnode(tc.r0_lo32), 4, reg)
+                .id();
+            b.push_store(load_id, ValueId::Varnode(tc.r1), reg);
+            unsafe { b.dont_finalize() };
+        }
+
+        optimize(&mut tc.ctx, fun_id);
+
+        let ValueId::Instruction(load_insn) = load_id else {
+            panic!("load is an instruction");
+        };
+        assert!(
+            block_contains(&tc.ctx, block_id, load_insn),
+            "a partially-covered read must not be forwarded"
+        );
+    }
+
+    /// Partial writes in a dominating block forward into a dominated successor.
+    #[test]
+    fn coalesce_across_dominating_block() {
+        let mut tc = TestContext::new();
+        let fun_id = Function::make(&mut tc.ctx, "test".into()).unwrap().id;
+        let entry = tc.ctx.get_or_make_block(0x1000);
+        let succ = tc.ctx.get_or_make_block(0x2000);
+        {
+            let mut f = Function::from_id_mut(&mut tc.ctx, fun_id);
+            f.set_root(entry).unwrap();
+            f.add_block(entry);
+            f.add_block(succ);
+        }
+        let reg = tc.reg_space;
+
+        {
+            let mut b = Builder::from_block(BasicBlock::from_id_mut(&mut tc.ctx, entry));
+            let c0 = b.context_mut().get_const(0xAA, 1).id();
+            let c1 = b.context_mut().get_const(0xBB, 1).id();
+            b.push_store(c0, ValueId::Varnode(tc.r0_byte0), reg);
+            b.push_store(c1, ValueId::Varnode(tc.r0_byte1), reg);
+            b.push_branch(succ);
+            unsafe { b.dont_finalize() };
+        }
+        let load_id;
+        {
+            let mut b = Builder::from_block(BasicBlock::from_id_mut(&mut tc.ctx, succ));
+            load_id = b
+                .push_load::<false>(ValueId::Varnode(tc.r0_lo16), 2, reg)
+                .id();
+            b.push_store(load_id, ValueId::Varnode(tc.r1), reg);
+            unsafe { b.dont_finalize() };
+        }
+
+        optimize(&mut tc.ctx, fun_id);
+
+        let ValueId::Instruction(load_insn) = load_id else {
+            panic!("load is an instruction");
+        };
+        assert!(
+            !block_contains(&tc.ctx, succ, load_insn),
+            "partial writes in the dominator should coalesce into the successor read:\n{}",
+            BasicBlock::from_id(&tc.ctx, succ)
+        );
+        // Both bytes are constant, so the dominated read folds to 0xBBAA.
+        let keep = load_insn_use(&tc, succ);
+        assert_eq!(
+            literal_value(&tc.ctx, store_src(&tc.ctx, keep)),
+            Some(0xBBAA)
+        );
+    }
+
+    /// With no alias oracle the byte map is inert: only exact opaque matches forward,
+    /// so a coalesce-shaped read is left untouched.
+    #[test]
+    fn no_alias_oracle_disables_coalesce() {
+        let mut tc = TestContext::new();
+
+        let r0_byte0 = tc.r0_byte0;
+        let r0_byte1 = tc.r0_byte1;
+        let r0_lo16 = tc.r0_lo16;
+        let r0 = tc.r1;
+
+        qcode!(
+            tc.ctx,
+            "
+                <block>
+                    store({r0_byte0}, i32 0xAA);
+                    store({r0_byte1}, i32 0xBB);
+
+                    %load = load(i32, {r0_lo16});
+                    store(%load, {r0});
+                    goto <0x1000>;"
+        );
+
+        let mut bb = BasicBlock::from_id_mut(&mut tc.ctx, block);
+        gvn(&mut bb, None);
+
+        assert!(
+            block_contains(&tc.ctx, block, load),
+            "without an alias oracle the coalesce read must remain"
+        );
+    }
 }

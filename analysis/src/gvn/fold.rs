@@ -1,58 +1,32 @@
+//! Constant-folding sub-pass: arithmetic on literals and algebraic identities.
+
 use qcode::{
     context::Context,
     value::{
         Value, ValueId, ValueRef,
-        insn::{Binary, Binop, BoolBinop, FloatBinop, IntBinop, Mnemonic, Unop},
+        insn::{Binary, Binop, BoolBinop, IntBinop, Mnemonic, Unop},
         literal::LiteralRef,
     },
 };
 
-// ---------------------------------------------------------------------------
-// Normalization (used for commutative binops)
-// ---------------------------------------------------------------------------
+use super::walk::{Claim, Editor, InsnCtx, SubPass};
 
-/// Total order over `ValueId`s for commutative-operand canonicalization. The
-/// variant rank breaks ties between equal indices of different variants (e.g.
-/// `Literal(5)` vs `Instruction(5)`), which would otherwise leave `a + b` and
-/// `b + a` un-normalized.
-fn value_id_key(v: ValueId) -> (u8, usize) {
-    match v {
-        ValueId::Literal(x) => (0, x.into()),
-        ValueId::Instruction(x) => (1, x.into()),
-        ValueId::Varnode(x) => (2, x.into()),
-        ValueId::BasicBlock(x) => (3, x.into()),
-        ValueId::Function(x) => (4, x.into()),
-        ValueId::BlockParam(x) => (5, x.into()),
-        _ => todo!("unsupported value id type in value_id_key: {:?}", v),
-    }
-}
+/// Fold constant arithmetic and algebraic identities into interned literals.
+pub(super) struct Fold;
 
-fn is_commutative(op: &Binop) -> bool {
-    matches!(
-        op,
-        Binop::Int(
-            IntBinop::Add
-                | IntBinop::Mul
-                | IntBinop::And
-                | IntBinop::Or
-                | IntBinop::Xor
-                | IntBinop::Equal
-                | IntBinop::NotEqual
-        ) | Binop::Bool(BoolBinop::And | BoolBinop::Or | BoolBinop::Xor)
-            | Binop::Float(FloatBinop::Equal | FloatBinop::NotEqual)
-    )
-}
+impl SubPass for Fold {
+    type State = ();
 
-/// We want to canonicalize commutative binops so that e.g. a + b and b + a are
-/// represented by the same value number.
-pub(super) fn normalize(m: &mut Mnemonic) {
-    if let Mnemonic::Binop(b) = m
-        && is_commutative(&b.op)
-    {
-        let l = value_id_key(b.lhs);
-        let r = value_id_key(b.rhs);
-        if l > r {
-            std::mem::swap(&mut b.lhs, &mut b.rhs);
+    fn on_insn(&self, ctx: &mut Context, _state: &mut (), ic: &InsnCtx, ed: &mut Editor) -> Claim {
+        if ic.mnemonic.is_terminator() || ic.size == 0 {
+            return Claim::Pass;
+        }
+        match try_fold(ctx, ic.mnemonic, ic.size) {
+            Some(folded) => {
+                ed.replace(ctx, ic.insn_id, folded);
+                Claim::Done
+            }
+            None => Claim::Pass,
         }
     }
 }
@@ -255,13 +229,12 @@ fn all_ones(output_size: usize) -> u64 {
 }
 
 /// Concrete value of `v` when it is a non-symbolic literal, else `None`.
-fn const_value(ctx: &Context, v: ValueId) -> Option<u64> {
+pub(super) fn const_value(ctx: &Context, v: ValueId) -> Option<u64> {
     get_numeric_const(ctx, v).map(|c| c.value())
 }
 
 /// [`constant_folding`] then [`algebraic_identity`]: the value `m` collapses to
-/// when either rewrite applies. Shared by the standalone constant-folding pass
-/// and the GVN block walk so the two cannot drift.
+/// when either rewrite applies.
 pub(super) fn try_fold(ctx: &mut Context, m: &Mnemonic, output_size: usize) -> Option<ValueId> {
     constant_folding(ctx, m, output_size).or_else(|| algebraic_identity(ctx, m, output_size))
 }
@@ -352,73 +325,273 @@ pub(super) fn algebraic_identity(
     None
 }
 
-// ---------------------------------------------------------------------------
-// Flag-idiom recognition
-// ---------------------------------------------------------------------------
-
-/// If `v` is defined by an `IntBinop::want` binop, return its `(lhs, rhs)`.
-fn as_int_binop(ctx: &Context, v: ValueId, want: IntBinop) -> Option<(ValueId, ValueId)> {
-    let ValueId::Instruction(id) = v else {
-        return None;
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::AliasResult;
+    use crate::gvn::gvn;
+    use qcode::value::{
+        BasicBlock,
+        insn::{Sext, Zext},
     };
-    match ctx.get_insn(id).mnemonic() {
-        Mnemonic::Binop(Binary {
-            lhs,
-            rhs,
-            op: Binop::Int(op),
-        }) if *op == want => Some((*lhs, *rhs)),
-        _ => None,
+    use qcode_macro::qcode;
+
+    #[test]
+    #[should_panic(expected = "type error in binop constant folding")]
+    fn constant_folding_reports_mixed_size_literals() {
+        let mut ctx = Context::new();
+        let lhs = ctx.get_const(0xf0, 4).id();
+        let rhs = ctx.get_const(0xff, 1).id();
+
+        let _ = constant_folding(
+            &mut ctx,
+            &Mnemonic::Binop(Binary {
+                op: Binop::Int(IntBinop::And),
+                lhs,
+                rhs,
+            }),
+            4,
+        );
     }
-}
 
-/// If `v` is defined by an `sborrow`, return its `(lhs, rhs)`.
-fn as_sborrow(ctx: &Context, v: ValueId) -> Option<(ValueId, ValueId)> {
-    let ValueId::Instruction(id) = v else {
-        return None;
-    };
-    match ctx.get_insn(id).mnemonic() {
-        Mnemonic::SBorrow(sb) => Some((sb.lhs, sb.rhs)),
-        _ => None,
+    #[test]
+    fn constant_folding_preserves_stack_address_type_through_folding() {
+        let mut ctx = Context::new();
+        let stack = ctx.add_space(qcode::space::Space {
+            name: Some(Box::from("stack")),
+            word_size: 1,
+            addr_size: 8,
+            ty: qcode::space::SpaceType::Ram,
+        });
+        // StackAddress-typed literals carry provenance in their TypeId, not in a
+        // symbolic annotation. Constant folding must propagate that type so that
+        // alias analysis can still distinguish SA results from plain integers.
+        let sa_type = ctx.types.get_or_make_stack_address(8, Some(stack));
+        let base_lid = ctx
+            .values
+            .get_or_make_typed_literal(0x1000_0000_0000_0000, sa_type, 8);
+        let base = ValueId::Literal(base_lid);
+        let offset = ctx.get_const(8, 8).id();
+
+        let folded = constant_folding(
+            &mut ctx,
+            &Mnemonic::Binop(Binary {
+                op: Binop::Int(IntBinop::Sub),
+                lhs: base,
+                rhs: offset,
+            }),
+            8,
+        );
+
+        let folded_id = folded.expect("SA - Int should constant-fold to a SA-typed literal");
+        let ValueId::Literal(lid) = folded_id else {
+            panic!("folded result must be a literal");
+        };
+        assert_eq!(
+            ctx.values.literals[lid].type_id, sa_type,
+            "folded SA - Int must preserve the StackAddress TypeId for alias analysis"
+        );
     }
-}
 
-/// Recognize the x86 signed-less-than flag idiom and collapse it to `a s< b`.
-///
-/// A signed `cmp a, b` lowers to `OF != SF` of `a - b`:
-/// ```text
-///   %of  = sborrow(a, b)
-///   %sub = a - b
-///   %sf  = %sub s< 0
-///   %lt  = %of != %sf      // == (a s< b)
-/// ```
-/// Returns the rewritten `SLess(a, b)` mnemonic. The original `sborrow`/`sub`/
-/// `slt` instructions are left for DCE to remove once their last use is gone.
-pub(super) fn simplify_flag_idiom(ctx: &Context, m: &Mnemonic) -> Option<Mnemonic> {
-    let &Mnemonic::Binop(Binary {
-        lhs,
-        rhs,
-        op: Binop::Int(IntBinop::NotEqual),
-    }) = m
-    else {
-        return None;
-    };
+    // -----------------------------------------------------------------------
+    // Algebraic identities
+    // -----------------------------------------------------------------------
 
-    // The `!=` is commutative (and GVN may have normalized it), so try both
-    // assignments of which side is the sborrow and which is the `s< 0`.
-    let resolve = |sborrow_side: ValueId, slt_side: ValueId| -> Option<(ValueId, ValueId)> {
-        let (a, b) = as_sborrow(ctx, sborrow_side)?;
-        let (sub_v, zero) = as_int_binop(ctx, slt_side, IntBinop::SLess)?;
-        if const_value(ctx, zero) != Some(0) {
-            return None;
+    /// `x & x` is idempotent: the AND is replaced by `x` itself.
+    #[test]
+    fn test_algebraic_and_self_is_idempotent() {
+        let mut ctx = Context::new();
+        qcode!(
+            ctx,
+            "
+                varnode i64 A;
+                varnode i64 B;
+                <block>
+                    %a = load(i64, &A);
+                    %v = %a & %a;
+                    store(&B, %v);
+                    goto <0x1001>;
+            "
+        );
+
+        let aliases = AliasResult::simple(&ctx);
+        let mut block = BasicBlock::from_id_mut(&mut ctx, block);
+        assert!(block.instruction_ids().contains(&v));
+
+        gvn(&mut block, Some(&aliases));
+
+        assert!(
+            !block.instruction_ids().contains(&v),
+            "x & x should be eliminated"
+        );
+        assert!(
+            block.instruction_ids().contains(&a),
+            "the AND should be replaced by x itself, which stays live"
+        );
+    }
+
+    /// `x + 0` collapses to `x`.
+    #[test]
+    fn test_algebraic_add_zero_identity() {
+        let mut ctx = Context::new();
+        qcode!(
+            ctx,
+            "
+                varnode i64 A;
+                varnode i64 B;
+                <block>
+                    %a = load(i64, &A);
+                    %v = %a + 0x0;
+                    store(&B, %v);
+                    goto <0x1001>;
+            "
+        );
+
+        let aliases = AliasResult::simple(&ctx);
+        let mut block = BasicBlock::from_id_mut(&mut ctx, block);
+
+        gvn(&mut block, Some(&aliases));
+
+        assert!(
+            !block.instruction_ids().contains(&v),
+            "x + 0 should be eliminated"
+        );
+        assert!(block.instruction_ids().contains(&a));
+    }
+
+    /// `x ^ x` folds to the zero constant.
+    #[test]
+    fn test_algebraic_xor_self_is_zero() {
+        let mut ctx = Context::new();
+        qcode!(
+            ctx,
+            "
+                varnode i64 A;
+                varnode i64 B;
+                <block>
+                    %a = load(i64, &A);
+                    %v = %a ^ %a;
+                    store(&B, %v);
+                    goto <0x1001>;
+            "
+        );
+
+        let aliases = AliasResult::simple(&ctx);
+        let mut block = BasicBlock::from_id_mut(&mut ctx, block);
+
+        gvn(&mut block, Some(&aliases));
+
+        assert!(
+            !block.instruction_ids().contains(&v),
+            "x ^ x should be eliminated"
+        );
+        assert!(
+            block.to_string().contains("B = 0x0"),
+            "x ^ x should fold to the zero constant, got:\n{block}"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Constant-folding edge cases
+    // -----------------------------------------------------------------------
+
+    /// Sext must sign-extend from the *source* width; an earlier version shifted
+    /// by the destination width, computing `sext(x) << (dst_bits - src_bits)`.
+    #[test]
+    fn constant_folding_sext_extends_from_source_width() {
+        let mut ctx = Context::new();
+
+        let src = ctx.get_const(0x80, 1).id();
+        let folded = constant_folding(&mut ctx, &Mnemonic::Sext(Sext { src, size: 4 }), 4)
+            .expect("sext of a constant must fold");
+        let ValueId::Literal(lid) = folded else {
+            panic!("folded result must be a literal");
+        };
+        assert_eq!(ctx.values.literals[lid].value, 0xFFFF_FF80);
+
+        let src = ctx.get_const(0x7f, 1).id();
+        let folded = constant_folding(&mut ctx, &Mnemonic::Sext(Sext { src, size: 8 }), 8)
+            .expect("sext of a constant must fold");
+        let ValueId::Literal(lid) = folded else {
+            panic!("folded result must be a literal");
+        };
+        assert_eq!(ctx.values.literals[lid].value, 0x7f);
+    }
+
+    /// A constant zero divisor must not fold (and must not panic).
+    #[test]
+    fn constant_folding_leaves_division_by_zero_unfolded() {
+        for op in [IntBinop::Div, IntBinop::Rem] {
+            let mut ctx = Context::new();
+            let lhs = ctx.get_const(42, 4).id();
+            let rhs = ctx.get_const(0, 4).id();
+            let folded = constant_folding(
+                &mut ctx,
+                &Mnemonic::Binop(Binary {
+                    op: Binop::Int(op),
+                    lhs,
+                    rhs,
+                }),
+                4,
+            );
+            assert!(
+                folded.is_none(),
+                "{op:?} by constant 0 must be left unfolded"
+            );
         }
-        let (sa, sb) = as_int_binop(ctx, sub_v, IntBinop::Sub)?;
-        (sa == a && sb == b).then_some((a, b))
-    };
+    }
 
-    let (a, b) = resolve(lhs, rhs).or_else(|| resolve(rhs, lhs))?;
-    Some(Mnemonic::Binop(Binary {
-        lhs: a,
-        rhs: b,
-        op: Binop::Int(IntBinop::SLess),
-    }))
+    /// Logical shifts by >= the operand width fold to 0 (and must not panic on
+    /// counts >= 64, which overflow Rust's shift operators).
+    #[test]
+    fn constant_folding_oversized_shift_counts_fold_to_zero() {
+        for op in [IntBinop::ShiftLeft, IntBinop::ShiftRight] {
+            let mut ctx = Context::new();
+            let lhs = ctx.get_const(1, 8).id();
+            let rhs = ctx.get_const(64, 8).id();
+            let folded = constant_folding(
+                &mut ctx,
+                &Mnemonic::Binop(Binary {
+                    op: Binop::Int(op),
+                    lhs,
+                    rhs,
+                }),
+                8,
+            )
+            .expect("oversized shift must fold to 0");
+            let ValueId::Literal(lid) = folded else {
+                panic!("folded result must be a literal");
+            };
+            assert_eq!(ctx.values.literals[lid].value, 0, "{op:?} by 64 must be 0");
+        }
+    }
+
+    /// The symbolic-literal guard applies to cast/extract arms too, not just
+    /// binops: folding a symbolic literal would discard its annotation.
+    #[test]
+    fn constant_folding_does_not_fold_symbolic_literals_in_casts() {
+        let mut ctx = Context::new();
+        let type_id = ctx.types.get_or_make_int(4);
+        let lid = ctx.values.push_literal(qcode::value::literal::Literal {
+            value: 0x1000,
+            type_id,
+            symbolic: Some(qcode::value::literal::SymbolicRef::String("s".into())),
+        });
+        let src = ValueId::Literal(lid);
+
+        assert!(constant_folding(&mut ctx, &Mnemonic::Zext(Zext { src, size: 8 }), 8).is_none());
+        assert!(constant_folding(&mut ctx, &Mnemonic::Sext(Sext { src, size: 8 }), 8).is_none());
+        assert!(
+            constant_folding(
+                &mut ctx,
+                &Mnemonic::Range(qcode::value::insn::Range {
+                    src,
+                    start: 0,
+                    size: 2,
+                }),
+                2,
+            )
+            .is_none()
+        );
+    }
 }

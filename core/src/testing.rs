@@ -20,6 +20,8 @@ use crate::{
 ///         ├────────┤                                                           r0_lo16 (2 bytes)
 ///         ├───┤                                                                r0_byte0 (1 byte)
 ///                  ├───┤                                                       r0_byte1 (1 byte)
+///                           ├───┤                                              r0_byte2 (1 byte)
+///                                    ├───┤                                     r0_byte3 (1 byte)
 /// offset: 8       16       24
 ///         ├───────┤                                                            r1 (8 bytes)
 ///                  ├───────┤                                                   r2 (8 bytes)
@@ -42,6 +44,8 @@ pub struct TestContext {
     pub r0_lo16: VarnodeId,  // 2 bytes at offset 0
     pub r0_byte0: VarnodeId, // 1 byte at offset 0
     pub r0_byte1: VarnodeId, // 1 byte at offset 1
+    pub r0_byte2: VarnodeId, // 1 byte at offset 2
+    pub r0_byte3: VarnodeId, // 1 byte at offset 3
 }
 
 impl TestContext {
@@ -69,6 +73,8 @@ impl TestContext {
         let r0_lo16 = make(&mut ctx, 0, 2, "r0_lo16");
         let r0_byte0 = make(&mut ctx, 0, 1, "r0_byte0");
         let r0_byte1 = make(&mut ctx, 1, 1, "r0_byte1");
+        let r0_byte2 = make(&mut ctx, 2, 1, "r0_byte2");
+        let r0_byte3 = make(&mut ctx, 3, 1, "r0_byte3");
 
         Self {
             ctx,
@@ -81,6 +87,8 @@ impl TestContext {
             r0_lo16,
             r0_byte0,
             r0_byte1,
+            r0_byte2,
+            r0_byte3,
         }
     }
 }
