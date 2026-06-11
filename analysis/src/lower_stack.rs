@@ -298,3 +298,28 @@ mod tests {
         assert!(!has_stack_address(&tc.ctx, fun));
     }
 }
+
+// ----- pass ------------------------------------------------------------------
+
+use crate::{FunctionPass, PipelineEnv};
+
+#[derive(Default)]
+pub struct LowerStack;
+
+impl FunctionPass for LowerStack {
+    const NAME: &'static str = "lower_stack";
+    fn description(&self) -> &'static str {
+        "Rewrite @stack_base literals back onto the real stack pointer"
+    }
+    fn run(
+        &self,
+        ctx: &mut Context,
+        fun_id: FunctionId,
+        env: &PipelineEnv,
+    ) -> Result<bool, String> {
+        lower_stack(ctx, fun_id, env.sp_varnode);
+        Ok(false)
+    }
+}
+
+crate::register_function_pass!(LowerStack);

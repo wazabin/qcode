@@ -186,3 +186,36 @@ mod tests {
         assert!(dead.is_empty(), "terminator must not be marked dead");
     }
 }
+
+// ----- pass ------------------------------------------------------------------
+
+use qcode::value::{FunctionId, FunctionRef};
+
+use crate::{FunctionPass, PipelineEnv};
+
+#[derive(Default)]
+pub struct Dce;
+
+impl FunctionPass for Dce {
+    const NAME: &'static str = "dce";
+    fn description(&self) -> &'static str {
+        "Remove unused pure instructions"
+    }
+    fn run(
+        &self,
+        ctx: &mut Context,
+        fun_id: FunctionId,
+        _env: &PipelineEnv,
+    ) -> Result<bool, String> {
+        let block_ids: Vec<_> = FunctionRef::from_id(ctx, fun_id)
+            .blocks()
+            .map(|b| b.id)
+            .collect();
+        for block_id in block_ids {
+            remove_dead_insns(ctx, block_id);
+        }
+        Ok(false)
+    }
+}
+
+crate::register_function_pass!(Dce);

@@ -207,3 +207,23 @@ mod tests {
         assert!(Function::from_id(&tc.ctx, f).signature().is_none());
     }
 }
+
+// ----- pass ------------------------------------------------------------------
+
+use crate::{Pass, PipelineEnv};
+
+#[derive(Default)]
+pub struct ExternalSigs;
+
+impl Pass for ExternalSigs {
+    const NAME: &'static str = "external_sigs";
+    fn description(&self) -> &'static str {
+        "Give known external (libc) functions signatures from their C prototypes"
+    }
+    fn run(&self, ctx: &mut Context, env: &PipelineEnv) -> Result<bool, String> {
+        apply_all_external_signatures(ctx, &env.cfg.abi);
+        Ok(false)
+    }
+}
+
+crate::register_module_pass!(ExternalSigs);

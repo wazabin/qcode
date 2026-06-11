@@ -105,6 +105,17 @@ pub struct AssumptionKnowledge {
     /// Callees proven not to return (noreturn): `exit`/`abort`, infinite loops,
     /// or any function whose body contains no `Return`.
     pub noreturn: HashSet<FunctionId>,
+    /// Functions found to perform an unresolved/dynamic stack read, or to forward
+    /// a stack pointer into one. Learned after a pipeline round and re-seeded onto
+    /// each function's signature at the start of the next, so a caller's stack
+    /// promotion can account for a callee that reads its frame unboundedly. Like
+    /// [`noreturn`](Self::noreturn) the set only grows, so replay converges.
+    pub unbounded_stack_readers: HashSet<FunctionId>,
+    /// Functions that hand a pointer into their own frame to an unbounded-reading
+    /// callee. Learned at bind time (when `StackAddress` types still exist) and
+    /// re-seeded onto each function's signature next round so `mem2reg` keeps the
+    /// whole frame in memory. Monotonic, so replay converges.
+    pub frame_escaping_callers: HashSet<FunctionId>,
 }
 
 impl AssumptionKnowledge {

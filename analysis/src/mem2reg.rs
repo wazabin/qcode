@@ -101,6 +101,50 @@ fn is_stack_typed(ctx: &Context, v: ValueId) -> bool {
     ctx.types.is_stack_address(type_id)
 }
 
+/// The `(offset, ptr_width)` a stack-slot literal encodes, relative to the
+/// per-function stack base. `offset` is negative for locals below the entry SP
+/// and `>= ptr_width` for the caller's frame (the return-address slot sits at
+/// offset `0`, incoming parameters above it). Mirrors `compute_stack_delta`'s
+/// `value - stack_base` decode, deriving the pointer width from the literal's
+/// own `StackAddress` type so it needs no separate stack-pointer argument.
+pub(crate) fn stack_slot_offset(ctx: &Context, v: ValueId) -> Option<(i64, usize)> {
+    let ValueId::Literal(id) = v else {
+        return None;
+    };
+    let lit = &ctx.values.literals[id];
+    if !ctx.types.is_stack_address(lit.type_id) {
+        return None;
+    }
+    let ptr_width = ctx.types.size_of(lit.type_id);
+    let offset = lit.value.wrapping_sub(qcode::types::stack_base(ptr_width)) as i64;
+    Some((offset, ptr_width))
+}
+
+/// Whether `function_id` performs any load or store through a *computed* pointer
+/// — one that does not resolve to a fixed location (a register varnode, a stack
+/// slot, or a constant/global address literal). Such an access reads or writes a
+/// pointer the function cannot bound to a fixed byte range, so if that pointer is
+/// a parameter the caller handed in (e.g. a frame pointer), the callee may touch
+/// arbitrary bytes behind it. This is the broad "unresolved dynamic memory
+/// access" signal used to flag a function as an unbounded reader.
+pub(crate) fn has_dynamic_pointer_deref(ctx: &Context, function_id: FunctionId) -> bool {
+    for block in Function::from_id(ctx, function_id).blocks() {
+        for insn in block.iter() {
+            let Some(access) = MemoryAccess::from_mnemonic(insn.mnemonic()) else {
+                continue;
+            };
+            // A pointer is fixed only when it is a named location (varnode) or a
+            // constant address (literal, including a stack-slot literal). An
+            // instruction/block-param pointer is a computed — hence unbounded —
+            // address.
+            if !matches!(access.ptr, ValueId::Varnode(_) | ValueId::Literal(_)) {
+                return true;
+            }
+        }
+    }
+    false
+}
+
 fn register_varnode(ctx: &Context, value: ValueId) -> Option<VarnodeId> {
     let ValueId::Varnode(vn_id) = value else {
         return None;
@@ -319,8 +363,13 @@ impl Mem2Reg<'_, '_> {
         let mut stack_size_conflict: HashSet<ValueId> = HashSet::new();
         let mut stack_intervals: Vec<StackAccessRange> = Vec::new();
         // A stack-typed pointer we could not resolve to a fixed slot disables all
-        // stack promotion: it may alias any slot.
-        let mut dynamic_stack = false;
+        // stack promotion: it may alias any slot. The same applies when this
+        // function hands a pointer into its own frame to a callee that may read it
+        // unboundedly (`frame_escapes_to_unbounded`, a fact seeded by the driver
+        // from the previous checkpoint+replay round): that callee may have written
+        // any slot, so none may be promoted across it.
+        let mut dynamic_stack =
+            Function::from_id(self.ctx, self.function_id).frame_escapes_to_unbounded();
         // Locations with a store whose source is narrower than the access (e.g. the
         // `MOV ESI, imm32` lift, an 8-byte RSI store of a 4-byte literal). Promoting
         // them would forward the narrow value into a wider load.
@@ -412,6 +461,37 @@ impl Mem2Reg<'_, '_> {
         if !dynamic_stack {
             for &var in stack_stored.intersection(&stack_loaded) {
                 if stack_size_conflict.contains(&var) {
+                    continue;
+                }
+                let size = stack_size[&var];
+                let addr =
+                    stack_slot_addr(self.ctx, var).expect("stack slot var is a stack literal");
+                let own = StackAccessRange::new(addr, size);
+                let overlapped = stack_intervals
+                    .iter()
+                    .any(|access| *access != own && access.overlaps_slot(addr, size));
+                if overlapped {
+                    continue;
+                }
+                vars.insert(var);
+                sizes.insert(var, size);
+            }
+
+            // Incoming stack parameters: a caller-frame slot (offset >= ptr_width,
+            // above the return-address slot at offset 0) that is *loaded but never
+            // stored* is read before any definition — a function input passed on
+            // the stack (cdecl, or an x86-64 stack-overflow argument). Promote it
+            // to a root block param, mirroring the load-only register-input path,
+            // so `compute_inputs` can recover it. The same single-size and
+            // no-overlap guards apply.
+            for &var in stack_loaded.difference(&stack_stored) {
+                if stack_size_conflict.contains(&var) {
+                    continue;
+                }
+                let Some((offset, ptr_width)) = stack_slot_offset(self.ctx, var) else {
+                    continue;
+                };
+                if offset < ptr_width as i64 {
                     continue;
                 }
                 let size = stack_size[&var];
@@ -1855,3 +1935,28 @@ mod tests {
         );
     }
 }
+
+// ----- pass ------------------------------------------------------------------
+
+use crate::{FunctionPass, PipelineEnv};
+
+#[derive(Default)]
+pub struct Mem2RegPass;
+
+impl FunctionPass for Mem2RegPass {
+    const NAME: &'static str = "mem2reg";
+    fn description(&self) -> &'static str {
+        "Promote memory loads/stores to SSA block params"
+    }
+    fn run(
+        &self,
+        ctx: &mut Context,
+        fun_id: FunctionId,
+        _env: &PipelineEnv,
+    ) -> Result<bool, String> {
+        let aliases = AliasResult::simple(ctx);
+        Ok(mem2reg(ctx, fun_id, &aliases))
+    }
+}
+
+crate::register_function_pass!(Mem2RegPass);

@@ -164,3 +164,53 @@ pub fn gvn_function(ctx: &mut Context, func_id: FunctionId, aliases: Option<&Ali
         gvn_block_rec(ctx, block_id, &HashMap::new(), &subtree, aliases);
     }
 }
+
+// ----- passes ----------------------------------------------------------------
+
+use crate::{FunctionPass, PipelineEnv};
+
+#[derive(Default)]
+pub struct ConstFold;
+
+impl FunctionPass for ConstFold {
+    const NAME: &'static str = "const_fold";
+    fn description(&self) -> &'static str {
+        "Fold pointer/integer arithmetic into literals"
+    }
+    fn run(
+        &self,
+        ctx: &mut Context,
+        fun_id: FunctionId,
+        _env: &PipelineEnv,
+    ) -> Result<bool, String> {
+        Ok(constant_fold_function(ctx, fun_id))
+    }
+}
+
+crate::register_function_pass!(ConstFold);
+
+#[derive(Default)]
+pub struct Gvn;
+
+impl FunctionPass for Gvn {
+    const NAME: &'static str = "gvn";
+    fn description(&self) -> &'static str {
+        "Global value numbering and constant folding"
+    }
+    fn run(
+        &self,
+        ctx: &mut Context,
+        fun_id: FunctionId,
+        _env: &PipelineEnv,
+    ) -> Result<bool, String> {
+        // Canonicalize pointer arithmetic into literals *before* building the alias
+        // oracle, so it sees per-slot stack locations rather than collapsing them
+        // onto `stack_base`.
+        constant_fold_function(ctx, fun_id);
+        let aliases = AliasResult::simple(ctx);
+        gvn_function(ctx, fun_id, Some(&aliases));
+        Ok(false)
+    }
+}
+
+crate::register_function_pass!(Gvn);

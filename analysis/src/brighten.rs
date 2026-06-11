@@ -210,3 +210,28 @@ mod tests {
         );
     }
 }
+
+// ----- pass ------------------------------------------------------------------
+
+use crate::{FunctionPass, PipelineEnv};
+
+#[derive(Default)]
+pub struct Brighten;
+
+impl FunctionPass for Brighten {
+    const NAME: &'static str = "brighten";
+    fn description(&self) -> &'static str {
+        "Inject symbolic stack base store at function entry"
+    }
+    fn run(
+        &self,
+        ctx: &mut Context,
+        fun_id: FunctionId,
+        env: &PipelineEnv,
+    ) -> std::result::Result<bool, String> {
+        brighten_stack(ctx, fun_id, env.cfg.stack_pointer).map_err(|e| e.to_string())?;
+        Ok(false)
+    }
+}
+
+crate::register_function_pass!(Brighten);

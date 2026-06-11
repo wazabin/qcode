@@ -318,7 +318,9 @@ impl<'str> Context<'str> {
                 let size = self.values.varnodes[vid].size_bytes();
                 self.types.get_or_make_int(size)
             }
-            _ => self.types.get_or_make_int(0),
+            // Exhaustive on purpose: a new ValueId variant must decide its type
+            // here rather than silently inheriting the zero-width sentinel.
+            ValueId::BasicBlock(_) | ValueId::Function(_) => self.types.get_or_make_int(0),
         }
     }
 

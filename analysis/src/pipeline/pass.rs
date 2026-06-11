@@ -10,20 +10,29 @@
 //!   are these.
 //!
 //! Both pull their architecture-specific inputs from [`PipelineEnv`] at run time,
-//! so the registry can construct every pass as a zero-argument unit struct.
-//! Adding a pass means writing one `impl` and adding one arm to [`make_pass`].
+//! so the registry can construct every pass with no arguments.
+//!
+//! ## Adding a pass
+//!
+//! A pass lives entirely in its own module file: define the struct, implement
+//! [`FunctionPass`] (or [`Pass`]) for it, and register it with one
+//! [`inventory::submit!`] of a [`PassRegistration`]. Nothing in this file needs to
+//! change. See [`crate::naming::cpp_demangle::CppDemangle`] for the smallest
+//! possible example pass.
+//!
+//! [`FunctionPass`] requires [`Default`], so a pass can precompute and store
+//! expensive values once at construction (see the `CppDemangle` example, which
+//! builds its `DemangleOptions` in `Default`). Because a `Default` supertrait makes
+//! a trait non-object-safe, the registry stores passes behind the object-safe
+//! [`DynFunctionPass`] shim, which every `FunctionPass` gets for free via a blanket
+//! impl.
 
 use qcode::{
     context::Context,
-    value::{FunctionId, FunctionRef, VarnodeId},
+    value::{FunctionId, VarnodeId},
 };
 
 use super::ArchConfig;
-use crate::{
-    AliasResult, apply_all_external_signatures, bind_all_call_args, brighten_stack,
-    constant_fold_function, dead_load::remove_dead_load_insns, gvn_function, lower_stack, mem2reg,
-    remove_dead_insns, set_all_call_clobbered_regs, set_all_function_summaries, simplify_cfg,
-};
 
 /// The architecture-specific inputs the register-aware passes need, resolved once
 /// per pipeline run and shared by reference with every pass.
@@ -46,261 +55,78 @@ impl PipelineEnv {
 /// A pass over a single function. `run` returns `Ok(true)` if it changed the IR,
 /// so a function-scoped stage can loop it to a fixpoint. Passes that don't track
 /// change return `Ok(false)` and must not be placed in a `repeat_until` stage.
-pub trait FunctionPass {
+///
+/// The [`Default`] bound lets a pass precompute and store values once at
+/// construction; the registry builds every pass with `Default::default()`. [`NAME`]
+/// is the single source of truth for the pipeline name — `register_function_pass!`
+/// reads it, so it never needs repeating.
+///
+/// [`NAME`]: FunctionPass::NAME
+pub trait FunctionPass: Default {
+    const NAME: &'static str;
+    fn description(&self) -> &'static str;
+    fn run(&self, ctx: &mut Context, fun_id: FunctionId, env: &PipelineEnv)
+    -> Result<bool, String>;
+}
+
+/// Object-safe dispatch shim for [`FunctionPass`].
+///
+/// [`FunctionPass`] can't be made into a trait object — its [`Default`] supertrait
+/// and `NAME` associated const are both non-object-safe. This shim mirrors it as
+/// instance methods and is blanket-impl'd for every `FunctionPass`, so the registry
+/// can store `Box<dyn DynFunctionPass>`.
+pub trait DynFunctionPass {
     fn name(&self) -> &'static str;
     fn description(&self) -> &'static str;
     fn run(&self, ctx: &mut Context, fun_id: FunctionId, env: &PipelineEnv)
     -> Result<bool, String>;
 }
 
+impl<T: FunctionPass> DynFunctionPass for T {
+    fn name(&self) -> &'static str {
+        T::NAME
+    }
+    fn description(&self) -> &'static str {
+        FunctionPass::description(self)
+    }
+    fn run(
+        &self,
+        ctx: &mut Context,
+        fun_id: FunctionId,
+        env: &PipelineEnv,
+    ) -> Result<bool, String> {
+        FunctionPass::run(self, ctx, fun_id, env)
+    }
+}
+
 /// A whole-program pass (an interprocedural milestone). `run` returns `Ok(true)`
-/// if it changed anything; the only milestones today report `Ok(false)`.
-pub trait Pass {
+/// if it changed anything; the only milestones today report `Ok(false)`. Like
+/// [`FunctionPass`], its [`NAME`] is the single source of truth for the pipeline
+/// name.
+///
+/// [`NAME`]: Pass::NAME
+pub trait Pass: Default {
+    const NAME: &'static str;
+    fn description(&self) -> &'static str;
+    fn run(&self, ctx: &mut Context, env: &PipelineEnv) -> Result<bool, String>;
+}
+
+/// Object-safe dispatch shim for [`Pass`], mirroring [`DynFunctionPass`].
+pub trait DynPass {
     fn name(&self) -> &'static str;
     fn description(&self) -> &'static str;
     fn run(&self, ctx: &mut Context, env: &PipelineEnv) -> Result<bool, String>;
 }
 
-// ----- per-function passes ---------------------------------------------------
-
-pub struct Brighten;
-impl FunctionPass for Brighten {
+impl<T: Pass> DynPass for T {
     fn name(&self) -> &'static str {
-        "brighten"
+        T::NAME
     }
     fn description(&self) -> &'static str {
-        "Inject symbolic stack base store at function entry"
-    }
-    fn run(
-        &self,
-        ctx: &mut Context,
-        fun_id: FunctionId,
-        env: &PipelineEnv,
-    ) -> Result<bool, String> {
-        brighten_stack(ctx, fun_id, env.cfg.stack_pointer).map_err(|e| e.to_string())?;
-        Ok(false)
-    }
-}
-
-pub struct Mem2Reg;
-impl FunctionPass for Mem2Reg {
-    fn name(&self) -> &'static str {
-        "mem2reg"
-    }
-    fn description(&self) -> &'static str {
-        "Promote memory loads/stores to SSA block params"
-    }
-    fn run(
-        &self,
-        ctx: &mut Context,
-        fun_id: FunctionId,
-        _env: &PipelineEnv,
-    ) -> Result<bool, String> {
-        let aliases = AliasResult::simple(ctx);
-        Ok(mem2reg(ctx, fun_id, &aliases))
-    }
-}
-
-pub struct ConstFold;
-impl FunctionPass for ConstFold {
-    fn name(&self) -> &'static str {
-        "const_fold"
-    }
-    fn description(&self) -> &'static str {
-        "Fold pointer/integer arithmetic into literals"
-    }
-    fn run(
-        &self,
-        ctx: &mut Context,
-        fun_id: FunctionId,
-        _env: &PipelineEnv,
-    ) -> Result<bool, String> {
-        Ok(constant_fold_function(ctx, fun_id))
-    }
-}
-
-pub struct Gvn;
-impl FunctionPass for Gvn {
-    fn name(&self) -> &'static str {
-        "gvn"
-    }
-    fn description(&self) -> &'static str {
-        "Global value numbering and constant folding"
-    }
-    fn run(
-        &self,
-        ctx: &mut Context,
-        fun_id: FunctionId,
-        _env: &PipelineEnv,
-    ) -> Result<bool, String> {
-        // Canonicalize pointer arithmetic into literals *before* building the alias
-        // oracle, so it sees per-slot stack locations rather than collapsing them
-        // onto `stack_base`.
-        constant_fold_function(ctx, fun_id);
-        let aliases = AliasResult::simple(ctx);
-        gvn_function(ctx, fun_id, Some(&aliases));
-        Ok(false)
-    }
-}
-
-pub struct DeadStore;
-impl FunctionPass for DeadStore {
-    fn name(&self) -> &'static str {
-        "dead_store"
-    }
-    fn description(&self) -> &'static str {
-        "Remove dead register loads and overwritten flag stores"
-    }
-    fn run(
-        &self,
-        ctx: &mut Context,
-        fun_id: FunctionId,
-        env: &PipelineEnv,
-    ) -> Result<bool, String> {
-        let aliases = AliasResult::simple(ctx);
-        remove_dead_load_insns(ctx, fun_id, Some(&aliases), &env.cfg.dead_flag_regs);
-        Ok(false)
-    }
-}
-
-pub struct DeadLoad;
-impl FunctionPass for DeadLoad {
-    fn name(&self) -> &'static str {
-        "dead_load"
-    }
-    fn description(&self) -> &'static str {
-        "Remove dead memory loads"
-    }
-    fn run(
-        &self,
-        ctx: &mut Context,
-        fun_id: FunctionId,
-        _env: &PipelineEnv,
-    ) -> Result<bool, String> {
-        let aliases = AliasResult::simple(ctx);
-        remove_dead_load_insns(ctx, fun_id, Some(&aliases), &[]);
-        Ok(false)
-    }
-}
-
-pub struct Dce;
-impl FunctionPass for Dce {
-    fn name(&self) -> &'static str {
-        "dce"
-    }
-    fn description(&self) -> &'static str {
-        "Remove unused pure instructions"
-    }
-    fn run(
-        &self,
-        ctx: &mut Context,
-        fun_id: FunctionId,
-        _env: &PipelineEnv,
-    ) -> Result<bool, String> {
-        let block_ids: Vec<_> = FunctionRef::from_id(ctx, fun_id)
-            .blocks()
-            .map(|b| b.id)
-            .collect();
-        for block_id in block_ids {
-            remove_dead_insns(ctx, block_id);
-        }
-        Ok(false)
-    }
-}
-
-pub struct Simplify;
-impl FunctionPass for Simplify {
-    fn name(&self) -> &'static str {
-        "simplify"
-    }
-    fn description(&self) -> &'static str {
-        "Merge straight-line basic blocks"
-    }
-    fn run(
-        &self,
-        ctx: &mut Context,
-        fun_id: FunctionId,
-        _env: &PipelineEnv,
-    ) -> Result<bool, String> {
-        simplify_cfg(ctx, fun_id);
-        Ok(false)
-    }
-}
-
-pub struct LowerStack;
-impl FunctionPass for LowerStack {
-    fn name(&self) -> &'static str {
-        "lower_stack"
-    }
-    fn description(&self) -> &'static str {
-        "Rewrite @stack_base literals back onto the real stack pointer"
-    }
-    fn run(
-        &self,
-        ctx: &mut Context,
-        fun_id: FunctionId,
-        env: &PipelineEnv,
-    ) -> Result<bool, String> {
-        lower_stack(ctx, fun_id, env.sp_varnode);
-        Ok(false)
-    }
-}
-
-// ----- whole-program (module) milestones -------------------------------------
-
-pub struct SeedClobbers;
-impl Pass for SeedClobbers {
-    fn name(&self) -> &'static str {
-        "seed_clobbers"
-    }
-    fn description(&self) -> &'static str {
-        "Seed each function's call-clobbered-register set from the lifted IR"
-    }
-    fn run(&self, ctx: &mut Context, _env: &PipelineEnv) -> Result<bool, String> {
-        set_all_call_clobbered_regs(ctx);
-        Ok(false)
-    }
-}
-
-pub struct ExternalSigs;
-impl Pass for ExternalSigs {
-    fn name(&self) -> &'static str {
-        "external_sigs"
-    }
-    fn description(&self) -> &'static str {
-        "Give known external (libc) functions signatures from their C prototypes"
+        Pass::description(self)
     }
     fn run(&self, ctx: &mut Context, env: &PipelineEnv) -> Result<bool, String> {
-        apply_all_external_signatures(ctx, &env.cfg.abi);
-        Ok(false)
-    }
-}
-
-pub struct Summaries;
-impl Pass for Summaries {
-    fn name(&self) -> &'static str {
-        "summaries"
-    }
-    fn description(&self) -> &'static str {
-        "Infer each function's input/clobber/saved summary and stack delta"
-    }
-    fn run(&self, ctx: &mut Context, env: &PipelineEnv) -> Result<bool, String> {
-        set_all_function_summaries(ctx, env.sp_varnode);
-        Ok(false)
-    }
-}
-
-pub struct BindArgs;
-impl Pass for BindArgs {
-    fn name(&self) -> &'static str {
-        "bind_args"
-    }
-    fn description(&self) -> &'static str {
-        "Bind argument and per-call alias sets at every call site"
-    }
-    fn run(&self, ctx: &mut Context, env: &PipelineEnv) -> Result<bool, String> {
-        bind_all_call_args(ctx, env.sp_varnode);
-        Ok(false)
+        Pass::run(self, ctx, env)
     }
 }
 
@@ -308,47 +134,107 @@ impl Pass for BindArgs {
 
 /// A pass resolved from its TOML name, tagged by which scope it runs in.
 pub enum RegisteredPass {
-    Function(Box<dyn FunctionPass>),
-    Module(Box<dyn Pass>),
+    Function(Box<dyn DynFunctionPass>),
+    Module(Box<dyn DynPass>),
 }
+
+/// One pass's registration, submitted from the pass's own module via
+/// [`inventory::submit!`] and collected here. `make` constructs a fresh boxed pass.
+pub struct PassRegistration {
+    pub name: &'static str,
+    pub make: fn() -> RegisteredPass,
+}
+
+inventory::collect!(PassRegistration);
 
 /// Construct the pass registered under `name`, or `None` if unknown.
-///
-/// This `match` is the single place a new pass is registered.
 pub fn make_pass(name: &str) -> Option<RegisteredPass> {
-    use RegisteredPass::{Function as F, Module as M};
-    Some(match name {
-        "brighten" => F(Box::new(Brighten)),
-        "mem2reg" => F(Box::new(Mem2Reg)),
-        "const_fold" => F(Box::new(ConstFold)),
-        "gvn" => F(Box::new(Gvn)),
-        "dead_store" => F(Box::new(DeadStore)),
-        "dead_load" => F(Box::new(DeadLoad)),
-        "dce" => F(Box::new(Dce)),
-        "simplify" => F(Box::new(Simplify)),
-        "lower_stack" => F(Box::new(LowerStack)),
-        "seed_clobbers" => M(Box::new(SeedClobbers)),
-        "external_sigs" => M(Box::new(ExternalSigs)),
-        "summaries" => M(Box::new(Summaries)),
-        "bind_args" => M(Box::new(BindArgs)),
-        _ => return None,
-    })
+    inventory::iter::<PassRegistration>()
+        .find(|r| r.name == name)
+        .map(|r| (r.make)())
 }
 
-/// Every registered pass name, for error messages when a pipeline names an
-/// unknown pass.
-pub const PASS_NAMES: &[&str] = &[
-    "brighten",
-    "mem2reg",
-    "const_fold",
-    "gvn",
-    "dead_store",
-    "dead_load",
-    "dce",
-    "simplify",
-    "lower_stack",
-    "seed_clobbers",
-    "external_sigs",
-    "summaries",
-    "bind_args",
-];
+/// Register a per-function pass. Place one call in the pass's own module; the
+/// registry builds the pass with [`Default`] each time it resolves the name, which
+/// it reads from the pass's [`FunctionPass::NAME`].
+///
+/// ```ignore
+/// register_function_pass!(CppDemangle);
+/// ```
+#[macro_export]
+macro_rules! register_function_pass {
+    ($ty:ty) => {
+        inventory::submit! {
+            $crate::PassRegistration {
+                name: <$ty as $crate::FunctionPass>::NAME,
+                make: || $crate::RegisteredPass::Function(::std::boxed::Box::new(
+                    <$ty as ::core::default::Default>::default(),
+                )),
+            }
+        }
+    };
+}
+
+/// Register a whole-program ([`Pass`]) milestone. Like [`register_function_pass!`],
+/// but for module-scoped passes; reads the name from [`Pass::NAME`].
+#[macro_export]
+macro_rules! register_module_pass {
+    ($ty:ty) => {
+        inventory::submit! {
+            $crate::PassRegistration {
+                name: <$ty as $crate::Pass>::NAME,
+                make: || $crate::RegisteredPass::Module(::std::boxed::Box::new(
+                    <$ty as ::core::default::Default>::default(),
+                )),
+            }
+        }
+    };
+}
+
+/// Every registered pass name, sorted, joined for error messages when a pipeline
+/// names an unknown pass.
+pub fn known_pass_names() -> String {
+    let mut names: Vec<&'static str> = inventory::iter::<PassRegistration>()
+        .map(|r| r.name)
+        .collect();
+    names.sort_unstable();
+    names.join(", ")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn registered_names_are_unique() {
+        let mut names: Vec<&'static str> = inventory::iter::<PassRegistration>()
+            .map(|r| r.name)
+            .collect();
+        let total = names.len();
+        names.sort_unstable();
+        names.dedup();
+        assert_eq!(
+            total,
+            names.len(),
+            "duplicate pass registration; make_pass resolves whichever it finds first"
+        );
+    }
+
+    #[test]
+    fn every_registration_resolves_with_its_own_name() {
+        for reg in inventory::iter::<PassRegistration>() {
+            let pass = make_pass(reg.name).expect("registered name must resolve");
+            let (name, description) = match &pass {
+                RegisteredPass::Function(p) => (p.name(), p.description()),
+                RegisteredPass::Module(p) => (p.name(), p.description()),
+            };
+            assert_eq!(name, reg.name, "registration name must match the pass NAME");
+            assert!(!description.is_empty(), "{name} has an empty description");
+        }
+    }
+
+    #[test]
+    fn unknown_name_does_not_resolve() {
+        assert!(make_pass("not_a_registered_pass").is_none());
+    }
+}

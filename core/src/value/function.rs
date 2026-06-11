@@ -221,6 +221,26 @@ where
         self.inner().signature.as_ref().and_then(|s| s.stack_delta)
     }
 
+    /// Whether this function performs an unresolved/dynamic stack read (or
+    /// forwards a stack pointer into one). See
+    /// [`FunctionSignature::reads_unbounded_stack`].
+    pub fn reads_unbounded_stack(&'s self) -> bool {
+        self.inner()
+            .signature
+            .as_ref()
+            .is_some_and(|s| s.reads_unbounded_stack)
+    }
+
+    /// Whether this function hands a pointer into its own frame to a callee that
+    /// may read it unboundedly. See
+    /// [`FunctionSignature::frame_escapes_to_unbounded`].
+    pub fn frame_escapes_to_unbounded(&'s self) -> bool {
+        self.inner()
+            .signature
+            .as_ref()
+            .is_some_and(|s| s.frame_escapes_to_unbounded)
+    }
+
     /// The name of the inner `Function`.
     pub fn name(&'s self) -> &'ctx str {
         self.inner().name.as_ref()
@@ -478,6 +498,25 @@ impl<'str, 'ctx> FunctionMutRef<'str, 'ctx> {
             .signature
             .get_or_insert_default()
             .stack_delta = Some(delta);
+    }
+
+    /// Records whether this function performs an unresolved/dynamic stack read.
+    /// See [`FunctionSignature::reads_unbounded_stack`].
+    pub fn set_reads_unbounded_stack(&mut self, value: bool) {
+        self.inner_mut()
+            .signature
+            .get_or_insert_default()
+            .reads_unbounded_stack = value;
+    }
+
+    /// Records whether this function hands a pointer into its own frame to a
+    /// callee that may read it unboundedly. See
+    /// [`FunctionSignature::frame_escapes_to_unbounded`].
+    pub fn set_frame_escapes_to_unbounded(&mut self, value: bool) {
+        self.inner_mut()
+            .signature
+            .get_or_insert_default()
+            .frame_escapes_to_unbounded = value;
     }
 
     /// Records the address of a machine instruction lifted into this function.

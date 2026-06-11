@@ -68,3 +68,12 @@ passes = ["dead_store", "dce"]
 name = "lower"
 scope = "function"
 passes = ["lower_stack", "dce", "dead_store", "dce"]
+
+# Aesthetic changes. `include_external` so the demangler also reaches imported
+# library functions (PLT stubs like `_ZNSsixEj` -> `std::string::operator[]`),
+# which are bodyless and therefore skipped by function-scoped stages by default.
+[[stage]]
+name = "cleanup"
+scope = "function"
+passes = ["cpp_demangle"]
+include_external = true

@@ -381,3 +381,28 @@ mod tests {
         );
     }
 }
+
+// ----- pass ------------------------------------------------------------------
+
+use crate::{FunctionPass, PipelineEnv};
+
+#[derive(Default)]
+pub struct Simplify;
+
+impl FunctionPass for Simplify {
+    const NAME: &'static str = "simplify";
+    fn description(&self) -> &'static str {
+        "Merge straight-line basic blocks"
+    }
+    fn run(
+        &self,
+        ctx: &mut Context,
+        fun_id: FunctionId,
+        _env: &PipelineEnv,
+    ) -> Result<bool, String> {
+        simplify_cfg(ctx, fun_id);
+        Ok(false)
+    }
+}
+
+crate::register_function_pass!(Simplify);

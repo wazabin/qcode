@@ -13,9 +13,15 @@ pub use clobbered::{compute_clobbered_regs, set_clobbered_regs};
 pub mod call_summary;
 pub use call_summary::{
     bind_all_call_args, bind_call_args, compute_call_clobbered_regs, compute_input_regs,
-    compute_saved_regs, compute_stack_delta, resolve_arg_loads, set_all_call_clobbered_regs,
-    set_all_function_summaries, set_function_summaries,
+    compute_saved_regs, compute_stack_delta, learn_stack_facts, resolve_arg_loads,
+    seed_stack_facts, set_all_call_clobbered_regs, set_all_function_summaries,
+    set_function_summaries,
 };
+
+pub mod naming;
+
+#[cfg(test)]
+mod test_util;
 
 pub mod external_sig;
 pub use external_sig::{apply_all_external_signatures, apply_external_signature};
@@ -43,6 +49,7 @@ pub use mem2reg::mem2reg;
 
 pub mod pipeline;
 pub use pipeline::{
-    ArchConfig, CallingConvention, DEFAULT_PIPELINE_TOML, FunctionPass, GpReg, Pass, Pipeline,
-    PipelineEnv, analyze_default, analyze_with_pipeline,
+    ArchConfig, CallingConvention, DEFAULT_PIPELINE_TOML, DynFunctionPass, DynPass, FunctionPass,
+    GpReg, Pass, PassRegistration, Pipeline, PipelineEnv, RegisteredPass, analyze_default,
+    analyze_with_pipeline,
 };

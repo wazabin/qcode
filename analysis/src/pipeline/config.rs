@@ -15,7 +15,9 @@ use qcode::{
 };
 
 use super::PipelineProgress;
-use super::pass::{FunctionPass, PASS_NAMES, Pass, PipelineEnv, RegisteredPass, make_pass};
+use super::pass::{
+    DynFunctionPass, DynPass, PipelineEnv, RegisteredPass, known_pass_names, make_pass,
+};
 
 /// The canonical default pipeline, compiled into the binary. Used by
 /// `analyze_default` and as the GUI's starting pipeline.
@@ -37,6 +39,11 @@ struct StageConfig {
     passes: Vec<String>,
     #[serde(default)]
     repeat_until: Option<RepeatCond>,
+    /// Function-scoped stages skip external (bodyless) functions by default,
+    /// since the value-producing passes have nothing to chew on. Naming passes
+    /// like `cpp_demangle` want them too, so a stage can opt in.
+    #[serde(default)]
+    include_external: bool,
 }
 
 #[derive(Deserialize, Clone, Copy, PartialEq, Eq)]
@@ -55,14 +62,16 @@ enum RepeatCond {
 
 /// A stage's resolved passes, partitioned by scope.
 enum StagePasses {
-    Function(Vec<Box<dyn FunctionPass>>),
-    Module(Vec<Box<dyn Pass>>),
+    Function(Vec<Box<dyn DynFunctionPass>>),
+    Module(Vec<Box<dyn DynPass>>),
 }
 
 struct Stage {
     name: String,
     passes: StagePasses,
     repeat_until: Option<RepeatCond>,
+    /// Run function-scoped passes on external functions too (see [`StageConfig`]).
+    include_external: bool,
 }
 
 /// A parsed, name-resolved analysis pipeline ready to run.
@@ -96,6 +105,7 @@ impl Pipeline {
                 name: sc.name,
                 passes,
                 repeat_until: sc.repeat_until,
+                include_external: sc.include_external,
             });
         }
         Ok(Pipeline { stages })
@@ -111,12 +121,14 @@ impl Pipeline {
             scope: Scope::Function,
             passes: names.iter().map(|n| n.to_string()).collect(),
             repeat_until: None,
+            include_external: false,
         };
         Ok(Pipeline {
             stages: vec![Stage {
                 name: sc.name.clone(),
                 passes: StagePasses::Function(resolve_function_passes(&sc)?),
                 repeat_until: None,
+                include_external: sc.include_external,
             }],
         })
     }
@@ -145,7 +157,7 @@ impl Pipeline {
     }
 }
 
-fn resolve_function_passes(sc: &StageConfig) -> Result<Vec<Box<dyn FunctionPass>>, String> {
+fn resolve_function_passes(sc: &StageConfig) -> Result<Vec<Box<dyn DynFunctionPass>>, String> {
     let mut resolved = Vec::with_capacity(sc.passes.len());
     for name in &sc.passes {
         match make_pass(name) {
@@ -162,7 +174,7 @@ fn resolve_function_passes(sc: &StageConfig) -> Result<Vec<Box<dyn FunctionPass>
     Ok(resolved)
 }
 
-fn resolve_module_passes(sc: &StageConfig) -> Result<Vec<Box<dyn Pass>>, String> {
+fn resolve_module_passes(sc: &StageConfig) -> Result<Vec<Box<dyn DynPass>>, String> {
     let mut resolved = Vec::with_capacity(sc.passes.len());
     for name in &sc.passes {
         match make_pass(name) {
@@ -182,7 +194,7 @@ fn resolve_module_passes(sc: &StageConfig) -> Result<Vec<Box<dyn Pass>>, String>
 fn unknown_pass(name: &str, stage: &str) -> String {
     format!(
         "unknown pass \"{name}\" in stage \"{stage}\". Known passes: {}",
-        PASS_NAMES.join(", ")
+        known_pass_names()
     )
 }
 
@@ -192,17 +204,18 @@ fn run_module_stage(
     ctx: &mut Context,
     env: &PipelineEnv,
     stage: &Stage,
-    passes: &[Box<dyn Pass>],
+    passes: &[Box<dyn DynPass>],
     round: usize,
     progress: &mut impl FnMut(PipelineProgress),
 ) -> Result<(), String> {
+    let stage_name: std::sync::Arc<str> = stage.name.as_str().into();
     let mut iters = 0;
     loop {
         let mut changed = false;
         for p in passes {
             progress(PipelineProgress::WholeProgramPhase {
                 round,
-                stage: stage.name.clone(),
+                stage: stage_name.clone(),
                 pass: p.name(),
             });
             changed |= p.run(ctx, env).map_err(|e| format!("{}: {e}", p.name()))?;
@@ -227,26 +240,27 @@ fn run_function_stage(
     ctx: &mut Context,
     env: &PipelineEnv,
     stage: &Stage,
-    passes: &[Box<dyn FunctionPass>],
+    passes: &[Box<dyn DynFunctionPass>],
     round: usize,
     progress: &mut impl FnMut(PipelineProgress),
 ) -> Result<(), String> {
     let fun_ids: Vec<FunctionId> = ctx
         .functions()
-        .filter(|f| !f.is_external())
+        .filter(|f| stage.include_external || !f.is_external())
         .map(|f| f.id)
         .collect();
     let total = fun_ids.len();
+    let stage_name: std::sync::Arc<str> = stage.name.as_str().into();
 
     for (index, fun_id) in fun_ids.into_iter().enumerate() {
-        let function = FunctionRef::from_id(ctx, fun_id).name().to_string();
+        let function: std::sync::Arc<str> = FunctionRef::from_id(ctx, fun_id).name().into();
         let mut iters = 0;
         loop {
             let mut changed = false;
             for p in passes {
                 progress(PipelineProgress::FunctionPass {
                     round,
-                    stage: stage.name.clone(),
+                    stage: stage_name.clone(),
                     function: function.clone(),
                     index: index + 1,
                     total,

@@ -16,7 +16,9 @@ mod config;
 mod pass;
 
 pub use config::{DEFAULT_PIPELINE_TOML, Pipeline};
-pub use pass::{FunctionPass, Pass, PipelineEnv};
+pub use pass::{
+    DynFunctionPass, DynPass, FunctionPass, Pass, PassRegistration, PipelineEnv, RegisteredPass,
+};
 
 use qcode::{
     assumption::AssumptionKnowledge,
@@ -24,7 +26,7 @@ use qcode::{
     value::{RegisterId, ValueId, VarnodeId},
 };
 
-use crate::{assume_call_returns, verify_assumptions};
+use crate::{assume_call_returns, learn_stack_facts, seed_stack_facts, verify_assumptions};
 
 /// The architecture-specific registers the register-aware passes need.
 ///
@@ -82,6 +84,9 @@ pub struct CallingConvention {
 }
 
 /// Progress events emitted while a pipeline runs, for the GUI/loader to display.
+///
+/// `stage`/`function` are `Arc<str>` so the driver can emit one event per pass
+/// per fixpoint iteration without re-allocating the names each time.
 #[derive(Clone, Debug)]
 pub enum PipelineProgress {
     Started,
@@ -95,14 +100,14 @@ pub enum PipelineProgress {
     /// A whole-program (module-scoped) pass, or a driver phase like verification.
     WholeProgramPhase {
         round: usize,
-        stage: String,
+        stage: std::sync::Arc<str>,
         pass: &'static str,
     },
     /// A per-function pass running on `function` (`index` of `total`).
     FunctionPass {
         round: usize,
-        stage: String,
-        function: String,
+        stage: std::sync::Arc<str>,
+        function: std::sync::Arc<str>,
         index: usize,
         total: usize,
         pass: &'static str,
@@ -154,6 +159,9 @@ pub fn analyze_with_pipeline_with_progress<'s>(
 
         let mut ctx = baseline.clone();
         let count = assume_call_returns(&mut ctx, &knowledge);
+        // Re-apply the stack-escape facts learned in earlier rounds so this round's
+        // mem2reg/summary passes observe them (mirrors `assume_call_returns`).
+        seed_stack_facts(&mut ctx, &knowledge);
         progress(PipelineProgress::AssumptionsRecorded { round, count });
 
         pipeline
@@ -162,15 +170,24 @@ pub fn analyze_with_pipeline_with_progress<'s>(
 
         progress(PipelineProgress::WholeProgramPhase {
             round,
-            stage: "verify".to_string(),
+            stage: "verify".into(),
             pass: "verify_assumptions",
         });
         let learned = verify_assumptions(&mut ctx);
+        let (readers, escapers) = learn_stack_facts(&ctx);
 
-        if learned.iter().all(|f| knowledge.noreturn.contains(f)) {
+        // Converge only once no round produces a new noreturn fact *and* no new
+        // stack-escape fact — a newly-learned unbounded reader or frame-escaping
+        // caller changes how a later round promotes the stack, so it must replay.
+        let no_new_noreturn = learned.iter().all(|f| knowledge.noreturn.contains(f));
+        let no_new_readers = readers.is_subset(&knowledge.unbounded_stack_readers);
+        let no_new_escapers = escapers.is_subset(&knowledge.frame_escaping_callers);
+        if no_new_noreturn && no_new_readers && no_new_escapers {
             progress(PipelineProgress::Finished);
             return ctx;
         }
         knowledge.noreturn.extend(learned);
+        knowledge.unbounded_stack_readers.extend(readers);
+        knowledge.frame_escaping_callers.extend(escapers);
     }
 }

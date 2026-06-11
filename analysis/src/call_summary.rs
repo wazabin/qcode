@@ -17,17 +17,156 @@
 use std::collections::{HashMap, HashSet};
 
 use qcode::{
+    assumption::AssumptionKnowledge,
     builder::Builder,
     context::Context,
     space::SpaceType,
     value::{
-        BasicBlock, BlockId, Function, FunctionId, Value, ValueId, Varnode, VarnodeId,
+        BasicBlock, BlockId, Function, FunctionId, Instruction, Value, ValueId, Varnode, VarnodeId,
         insn::{InstructionId, Mnemonic},
         literal::{Literal, SymbolicRef},
     },
 };
 
-use crate::compute_clobbered_regs;
+use crate::{
+    compute_clobbered_regs,
+    mem2reg::{has_dynamic_pointer_deref, stack_slot_offset},
+};
+
+/// The maximum caller-frame span (bytes above the return-address slot) over which
+/// stack parameters are enumerated. A function reading beyond this is treated as
+/// reading its incoming arguments unboundedly (e.g. a variadic walk) rather than
+/// as having that many fixed parameters.
+const MAX_STACK_PARAM_BYTES: i64 = 64;
+
+/// True when `vn` is a stack-space varnode — how a stack-passed parameter is
+/// recorded in a function's `inputs`, distinguishing it from a register input.
+/// The `"stack"` space is created by `brighten_stack`.
+pub(crate) fn is_stack_input(ctx: &Context, vn: VarnodeId) -> bool {
+    ctx.try_get_space("stack") == Some(Varnode::from_id(ctx, vn).space().id)
+}
+
+/// Window around a stack base within which a bare integer is taken to be a frame
+/// pointer. Comfortably larger than any plausible stack frame, yet far smaller
+/// than the distance from a stack base to code/global/immediate constants.
+const FRAME_POINTER_WINDOW: u64 = 0x0100_0000;
+
+/// True when `v` addresses some function's stack frame.
+///
+/// A frame pointer keeps its `StackAddress` type while the symbolic stack base is
+/// live, but constant folding can collapse `@stack_base ± k` to a bare integer
+/// (losing the type) before this runs. So we accept either: an explicit
+/// `StackAddress` value, or a constant within [`FRAME_POINTER_WINDOW`] of a
+/// pointer-width stack base. Over-approximate by design — a false positive only
+/// keeps a caller's frame in memory, which is always sound.
+fn value_is_frame_pointer(ctx: &Context, v: ValueId) -> bool {
+    match v {
+        ValueId::Literal(id) => {
+            let lit = &ctx.values.literals[id];
+            if ctx.types.is_stack_address(lit.type_id) {
+                return true;
+            }
+            [qcode::types::stack_base(4), qcode::types::stack_base(8)]
+                .into_iter()
+                .any(|base| lit.value.abs_diff(base) < FRAME_POINTER_WINDOW)
+        }
+        ValueId::Instruction(id) => ctx
+            .types
+            .is_stack_address(Instruction::from_id(ctx, id).type_id()),
+        _ => false,
+    }
+}
+
+/// Incoming stack parameters of `function_id` as `(offset, size)` pairs relative
+/// to the entry stack pointer — offset `>= ptr_width`, above the return-address
+/// slot at offset `0`. Recovered from the root-block params `mem2reg` created for
+/// load-before-store caller-frame slots (keyed by their `origin` stack-slot
+/// literal). Gaps are filled contiguously up to the highest accessed offset.
+///
+/// Returns `(slots, unbounded)`: when the accessed span exceeds
+/// [`MAX_STACK_PARAM_BYTES`], `unbounded` is `true` and no slots are enumerated
+/// (the function reads its arguments unboundedly).
+fn compute_stack_inputs(ctx: &Context, function_id: FunctionId) -> (Vec<(i64, usize)>, bool) {
+    let Some(root) = Function::from_id(ctx, function_id).root().map(|b| b.id) else {
+        return (Vec::new(), false);
+    };
+
+    let mut real: Vec<(i64, usize)> = Vec::new();
+    let mut ptr_width = 0usize;
+    for param in BasicBlock::from_id(ctx, root).params() {
+        let Some(origin) = param.origin() else {
+            continue;
+        };
+        let Some((offset, pw)) = stack_slot_offset(ctx, origin) else {
+            continue;
+        };
+        if offset < pw as i64 {
+            continue;
+        }
+        ptr_width = pw;
+        real.push((offset, param.size()));
+    }
+    if real.is_empty() {
+        return (Vec::new(), false);
+    }
+    real.sort_by_key(|&(off, _)| off);
+
+    let max_end = real
+        .iter()
+        .map(|&(off, size)| off + size as i64)
+        .max()
+        .expect("real is non-empty");
+    if max_end - ptr_width as i64 > MAX_STACK_PARAM_BYTES {
+        return (Vec::new(), true);
+    }
+
+    // Walk a contiguous grid from the first parameter slot to the highest
+    // accessed offset, taking each real slot's size where one starts and assuming
+    // a pointer-width slot otherwise, so the parameter list has no holes.
+    let by_offset: HashMap<i64, usize> = real.into_iter().collect();
+    let mut slots = Vec::new();
+    let mut off = ptr_width as i64;
+    while off < max_end {
+        let size = by_offset.get(&off).copied().unwrap_or(ptr_width).max(1);
+        slots.push((off, size));
+        off += size as i64;
+    }
+    (slots, false)
+}
+
+/// True when `function_id` makes a call that could read a pointer argument
+/// unboundedly: an indirect call (unknown target), or a direct call to an
+/// external function or one already flagged [`Function::reads_unbounded_stack`].
+/// Such a function may forward a caller-supplied pointer into that read, so it is
+/// itself treated as an unbounded reader.
+/// The absolute (per-function) stack address a frame-pointer literal `v` encodes,
+/// or `None` if `v` is not one. Accepts an explicit `StackAddress` literal or a
+/// bare constant near a stack base (constant folding can strip the type). Used to
+/// read the caller-frame base a callee's stack arguments are measured from.
+fn stack_address_literal_value(ctx: &Context, v: ValueId) -> Option<u64> {
+    let ValueId::Literal(id) = v else {
+        return None;
+    };
+    value_is_frame_pointer(ctx, v).then(|| ctx.values.literals[id].value)
+}
+
+fn function_makes_unbounded_call(ctx: &Context, function_id: FunctionId) -> bool {
+    for block in Function::from_id(ctx, function_id).blocks() {
+        for insn in block.iter() {
+            match insn.mnemonic() {
+                Mnemonic::CallInd(_) => return true,
+                Mnemonic::Call(call) => {
+                    let target = Function::from_id(ctx, call.target);
+                    if target.is_external() || target.reads_unbounded_stack() {
+                        return true;
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    false
+}
 
 /// True when `vn` lives in a register address space.
 fn is_register(ctx: &Context, vn: VarnodeId) -> bool {
@@ -256,7 +395,9 @@ pub fn set_function_summaries(ctx: &mut Context, function_id: FunctionId, stack_
     let stack_delta = compute_stack_delta(ctx, function_id, stack_ptr);
 
     let saved_set: HashSet<VarnodeId> = compute_saved_regs(ctx, function_id).into_iter().collect();
-    let inputs: Vec<VarnodeId> = compute_input_regs(ctx, function_id)
+    // Register inputs (existing path). The saved/stack-pointer exclusions apply
+    // only to registers; stack-passed parameters are appended below untouched.
+    let mut inputs: Vec<VarnodeId> = compute_input_regs(ctx, function_id)
         .into_iter()
         .filter(|vn| !saved_set.contains(vn))
         .filter(|&vn| stack_delta.is_none() || vn != stack_ptr)
@@ -269,10 +410,33 @@ pub fn set_function_summaries(ctx: &mut Context, function_id: FunctionId, stack_
     let mut saved: Vec<VarnodeId> = saved_set.into_iter().collect();
     saved.sort_by_key(|&vn| usize::from(vn));
 
+    // Stack-passed parameters (cdecl / x86-64 overflow args).
+    let (stack_slots, stack_unbounded) = compute_stack_inputs(ctx, function_id);
+
+    // This function reads a passed pointer (or its own frame) unboundedly when it
+    // has a dynamic stack access, enumerates more stack args than the cap, or
+    // forwards into an unbounded/indirect/external call. Union with the seeded
+    // value so the fact only grows across checkpoint+replay rounds.
+    let reads_unbounded = Function::from_id(ctx, function_id).reads_unbounded_stack()
+        || stack_unbounded
+        || has_dynamic_pointer_deref(ctx, function_id)
+        || function_makes_unbounded_call(ctx, function_id);
+
+    // Append the stack parameters as stack-space varnodes (offset/size carriers,
+    // distinguished from register inputs by their space). `bind_call_args`
+    // translates each to the caller's frame.
+    if let Some(stack_space) = ctx.try_get_space("stack") {
+        for (offset, size) in stack_slots {
+            let vn = Varnode::make(ctx, offset, size, stack_space).id;
+            inputs.push(vn);
+        }
+    }
+
     let mut f = Function::from_id_mut(ctx, function_id);
     f.set_input_regs(inputs);
     f.set_clobbered_regs(clobbered);
     f.set_saved_regs(saved);
+    f.set_reads_unbounded_stack(reads_unbounded);
     if let Some(delta) = stack_delta {
         f.set_stack_delta(delta);
     }
@@ -379,6 +543,9 @@ fn relink_stack_pointer(
 
     let mut builder = Builder::from_block(BasicBlock::from_id_mut(ctx, continuation));
     builder.set_insert_point_to_start();
+    // SAFETY: `continuation` is an existing block that already ends in a
+    // terminator; we only prepend instructions, so the builder's
+    // must-terminate-before-drop check does not apply.
     unsafe { builder.dont_finalize() };
 
     let rsp = builder
@@ -485,12 +652,16 @@ pub fn bind_call_args(ctx: &mut Context, function_id: FunctionId, stack_ptr: Var
         // For a returning call: re-establish RSP across it when the callee's net
         // stack delta is known, link the pushed return address to the
         // continuation block, and decrement the stack-pointer register to the
-        // push slot so the callee's seeded entry RSP matches it.
+        // push slot so the callee's seeded entry RSP matches it. The push slot is
+        // the callee's entry stack pointer in the *caller's* coordinates — the
+        // base its stack arguments are measured from.
+        let mut frame_base: Option<u64> = None;
         if let Some(continuation) = continuation_of(ctx, block) {
             if let Some(delta) = Function::from_id(ctx, target).stack_delta() {
                 relink_stack_pointer(ctx, continuation, stack_ptr, delta);
             }
             if let Some(slot) = link_return_address(ctx, block, continuation) {
+                frame_base = stack_address_literal_value(ctx, slot);
                 decrement_stack_pointer(ctx, block, call_id, stack_ptr, slot);
             }
         }
@@ -504,20 +675,65 @@ pub fn bind_call_args(ctx: &mut Context, function_id: FunctionId, stack_ptr: Var
             .map(<[VarnodeId]>::to_vec)
             .unwrap_or_default();
 
-        let mut args = Vec::with_capacity(inputs.len());
+        // Resolve each input to how it loads in the caller: a register input
+        // reloads the register; a stack input (a stack-space varnode at callee
+        // offset N) reads the caller's frame at `frame_base + N`.
+        let ptr_width = Varnode::from_id(ctx, stack_ptr).size();
+        let default_space = ctx.default_space;
+        let stack_space = ctx.try_get_space("stack");
+        enum ArgLoad {
+            Reg(VarnodeId),
+            Stack { addr: u64, size: usize },
+        }
+        let plans: Vec<ArgLoad> = inputs
+            .iter()
+            .map(|&vn| {
+                if is_stack_input(ctx, vn) {
+                    let v = Varnode::from_id(ctx, vn);
+                    let (offset, size) = (v.address(), v.size());
+                    match frame_base {
+                        // Translate the callee offset into the caller's frame.
+                        Some(base) => ArgLoad::Stack {
+                            addr: base.wrapping_add(offset as u64),
+                            size,
+                        },
+                        // No resolvable push slot: fall back to a bare load that
+                        // keeps the argument list aligned with the callee inputs.
+                        None => ArgLoad::Reg(vn),
+                    }
+                } else {
+                    ArgLoad::Reg(vn)
+                }
+            })
+            .collect();
+
+        let mut args = Vec::with_capacity(plans.len());
         {
             let mut builder = Builder::from_block(BasicBlock::from_id_mut(ctx, block));
             builder.set_insert_point_before(call_id);
-            for vn in inputs {
-                let (space, size) = {
-                    let v = Varnode::from_id(builder.context(), vn);
-                    (v.space().id, v.size())
+            for plan in plans {
+                let value = match plan {
+                    ArgLoad::Reg(vn) => {
+                        let (space, size) = {
+                            let v = Varnode::from_id(builder.context(), vn);
+                            (v.space().id, v.size())
+                        };
+                        builder
+                            .push_load::<false>(ValueId::Varnode(vn), size, space)
+                            .id()
+                    }
+                    ArgLoad::Stack { addr, size } => {
+                        let ptr = {
+                            let sa = builder
+                                .context_mut()
+                                .types
+                                .get_or_make_stack_address(ptr_width, stack_space);
+                            builder.context_mut().get_typed_const(addr, sa).id()
+                        };
+                        builder.push_load::<false>(ptr, size, default_space).id()
+                    }
                 };
-                args.push(
-                    builder
-                        .push_load::<false>(ValueId::Varnode(vn), size, space)
-                        .id(),
-                );
+                args.push(value);
             }
         }
 
@@ -565,9 +781,70 @@ fn bind(ctx: &mut Context, call_id: InstructionId, args: Vec<ValueId>, clobbers:
     ctx.replace_instruction_mnemonic(call_id, new);
 }
 
+/// Flag `function_id` when it hands a pointer into its own frame to a callee that
+/// may read it unboundedly (see [`FunctionSignature::frame_escapes_to_unbounded`]).
+///
+/// Runs *after* [`resolve_arg_loads`], so a frame pointer passed in a register or
+/// a stack slot has been forwarded into `Call.args` as a `StackAddress` value:
+///   - a direct call carrying a `StackAddress` argument to an external or
+///     already-unbounded callee, or
+///   - an indirect call (whose args we do not bind) in a function that pushes a
+///     `StackAddress` into a stack slot (a cdecl stack argument).
+///
+/// The fact is monotonic — once set it is never cleared — so it converges under
+/// the checkpoint+replay driver, which seeds it back onto the signature each
+/// round for `mem2reg` to consume.
+///
+/// [`FunctionSignature::frame_escapes_to_unbounded`]:
+/// qcode::value::function::FunctionSignature::frame_escapes_to_unbounded
+fn mark_frame_escapes(ctx: &mut Context, function_id: FunctionId) {
+    if Function::from_id(ctx, function_id).frame_escapes_to_unbounded() {
+        return;
+    }
+
+    let block_ids: Vec<BlockId> = Function::from_id(ctx, function_id)
+        .iter()
+        .map(|b| b.id)
+        .collect();
+
+    let mut has_callind = false;
+    let mut pushes_frame_ptr_to_slot = false;
+    let mut escapes = false;
+
+    for block in &block_ids {
+        for insn in BasicBlock::from_id(ctx, *block).iter() {
+            match insn.mnemonic() {
+                Mnemonic::CallInd(_) => has_callind = true,
+                Mnemonic::Call(call) => {
+                    let target = Function::from_id(ctx, call.target);
+                    let unbounded = target.is_external() || target.reads_unbounded_stack();
+                    if unbounded && call.args.iter().any(|&a| value_is_frame_pointer(ctx, a)) {
+                        escapes = true;
+                    }
+                }
+                // A frame pointer written into a stack slot is an outgoing stack
+                // argument (the cdecl / indirect-call case, where args are not
+                // bound). Pair it with a `CallInd` below.
+                Mnemonic::Store(store)
+                    if value_is_frame_pointer(ctx, store.src)
+                        && stack_address_literal_value(ctx, store.ptr).is_some() =>
+                {
+                    pushes_frame_ptr_to_slot = true;
+                }
+                _ => {}
+            }
+        }
+    }
+
+    if escapes || (has_callind && pushes_frame_ptr_to_slot) {
+        Function::from_id_mut(ctx, function_id).set_frame_escapes_to_unbounded(true);
+    }
+}
+
 /// Runs [`bind_call_args`] then [`resolve_arg_loads`] over every non-external
 /// function: insert the argument loads at every call site, then forward them to
-/// the values reaching each call.
+/// the values reaching each call. Finally records which functions let a frame
+/// pointer escape into an unbounded-reading callee (see [`mark_frame_escapes`]).
 pub fn bind_all_call_args(ctx: &mut Context, stack_ptr: VarnodeId) {
     let ids: Vec<FunctionId> = ctx
         .functions()
@@ -580,6 +857,41 @@ pub fn bind_all_call_args(ctx: &mut Context, stack_ptr: VarnodeId) {
     for &id in &ids {
         resolve_arg_loads(ctx, id);
     }
+    for &id in &ids {
+        mark_frame_escapes(ctx, id);
+    }
+}
+
+/// Seed the stack-escape facts accumulated in earlier checkpoint+replay rounds
+/// back onto the freshly-cloned IR, before the pipeline runs. `mem2reg` consumes
+/// `frame_escapes_to_unbounded` (to keep an escaping caller's frame in memory)
+/// and the summary/bind passes union onto `reads_unbounded_stack`. Mirrors
+/// [`assume_call_returns`](crate::assume_call_returns) for these facts.
+pub fn seed_stack_facts(ctx: &mut Context, knowledge: &AssumptionKnowledge) {
+    for &id in &knowledge.unbounded_stack_readers {
+        Function::from_id_mut(ctx, id).set_reads_unbounded_stack(true);
+    }
+    for &id in &knowledge.frame_escaping_callers {
+        Function::from_id_mut(ctx, id).set_frame_escapes_to_unbounded(true);
+    }
+}
+
+/// Harvest the stack-escape facts the just-completed pipeline round established,
+/// for the checkpoint+replay driver to accumulate. Returns
+/// `(unbounded_stack_readers, frame_escaping_callers)`. Both sets only grow
+/// across rounds (the passes union onto the seeded values), so replay converges.
+pub fn learn_stack_facts(ctx: &Context) -> (HashSet<FunctionId>, HashSet<FunctionId>) {
+    let mut readers = HashSet::new();
+    let mut escapers = HashSet::new();
+    for f in ctx.functions() {
+        if f.reads_unbounded_stack() {
+            readers.insert(f.id);
+        }
+        if f.frame_escapes_to_unbounded() {
+            escapers.insert(f.id);
+        }
+    }
+    (readers, escapers)
 }
 
 #[cfg(test)]
@@ -1276,4 +1588,322 @@ mod tests {
             "no RSP relink should be emitted when the callee's stack delta is unknown:\n{cont_block}"
         );
     }
+
+    // -----------------------------------------------------------------------
+    // Stack-passed parameters + frame-escape safety
+    // -----------------------------------------------------------------------
+
+    /// The stack inputs of `fun`, as `(offset, size)` pairs.
+    fn stack_inputs_of(ctx: &Context, fun: FunctionId) -> Vec<(i64, usize)> {
+        Function::from_id(ctx, fun)
+            .input_regs()
+            .unwrap_or_default()
+            .iter()
+            .filter(|&&vn| is_stack_input(ctx, vn))
+            .map(|&vn| {
+                let v = Varnode::from_id(ctx, vn);
+                (v.address(), v.size())
+            })
+            .collect()
+    }
+
+    #[test]
+    fn caller_frame_slot_read_before_write_is_a_stack_input() {
+        // A callee that loads [entry_sp + 8] (above the return-address slot) before
+        // writing it reads a stack-passed parameter. After mem2reg promotes the
+        // load-only slot, the summary records it as a stack-space varnode input.
+        let mut tc = TestContext::new();
+        let sp = tc.r3;
+        let ram = tc.ctx.default_space;
+        crate::brighten::get_or_make_stack_space(&mut tc.ctx, 8);
+
+        let callee = build_fn(&mut tc, "callee", 0x2000, |b| {
+            let slot = stack_addr_lit(b.context_mut(), 8);
+            b.push_load::<false>(slot, 8, ram);
+            let ret = b.context_mut().get_const(0u64, 8).id();
+            b.push_return(ret);
+        });
+        let aliases = AliasResult::simple(&tc.ctx);
+        crate::mem2reg(&mut tc.ctx, callee, &aliases);
+        set_function_summaries(&mut tc.ctx, callee, sp);
+
+        assert_eq!(
+            stack_inputs_of(&tc.ctx, callee),
+            vec![(8, 8)],
+            "the load-before-store caller-frame slot must be a stack input"
+        );
+    }
+
+    #[test]
+    fn local_slot_below_entry_sp_is_not_a_stack_input() {
+        // A slot at a negative offset is a local, not an incoming parameter.
+        let mut tc = TestContext::new();
+        let sp = tc.r3;
+        let ram = tc.ctx.default_space;
+        crate::brighten::get_or_make_stack_space(&mut tc.ctx, 8);
+
+        let callee = build_fn(&mut tc, "callee", 0x2000, |b| {
+            let slot = stack_addr_lit(b.context_mut(), -8);
+            b.push_load::<false>(slot, 8, ram);
+            let ret = b.context_mut().get_const(0u64, 8).id();
+            b.push_return(ret);
+        });
+        let aliases = AliasResult::simple(&tc.ctx);
+        crate::mem2reg(&mut tc.ctx, callee, &aliases);
+        set_function_summaries(&mut tc.ctx, callee, sp);
+
+        assert!(
+            stack_inputs_of(&tc.ctx, callee).is_empty(),
+            "a slot below the entry stack pointer is a local, not a parameter"
+        );
+    }
+
+    #[test]
+    fn stack_param_gaps_are_filled_contiguously() {
+        // Reads at +8 and +24 (a hole at +16) yield a contiguous 3-slot list.
+        let mut tc = TestContext::new();
+        let sp = tc.r3;
+        let ram = tc.ctx.default_space;
+        crate::brighten::get_or_make_stack_space(&mut tc.ctx, 8);
+
+        let callee = build_fn(&mut tc, "callee", 0x2000, |b| {
+            let s1 = stack_addr_lit(b.context_mut(), 8);
+            b.push_load::<false>(s1, 8, ram);
+            let s2 = stack_addr_lit(b.context_mut(), 24);
+            b.push_load::<false>(s2, 8, ram);
+            let ret = b.context_mut().get_const(0u64, 8).id();
+            b.push_return(ret);
+        });
+        let aliases = AliasResult::simple(&tc.ctx);
+        crate::mem2reg(&mut tc.ctx, callee, &aliases);
+        set_function_summaries(&mut tc.ctx, callee, sp);
+
+        assert_eq!(
+            stack_inputs_of(&tc.ctx, callee),
+            vec![(8, 8), (16, 8), (24, 8)],
+            "the gap at +16 must be filled so the parameter list is contiguous"
+        );
+    }
+
+    #[test]
+    fn far_stack_read_is_unbounded_not_enumerated() {
+        // A read far above the frame exceeds the cap: treated as an unbounded
+        // argument read, not hundreds of fixed parameters.
+        let mut tc = TestContext::new();
+        let sp = tc.r3;
+        let ram = tc.ctx.default_space;
+        crate::brighten::get_or_make_stack_space(&mut tc.ctx, 8);
+
+        let callee = build_fn(&mut tc, "callee", 0x2000, |b| {
+            let slot = stack_addr_lit(b.context_mut(), MAX_STACK_PARAM_BYTES + 64);
+            b.push_load::<false>(slot, 8, ram);
+            let ret = b.context_mut().get_const(0u64, 8).id();
+            b.push_return(ret);
+        });
+        let aliases = AliasResult::simple(&tc.ctx);
+        crate::mem2reg(&mut tc.ctx, callee, &aliases);
+        set_function_summaries(&mut tc.ctx, callee, sp);
+
+        assert!(
+            stack_inputs_of(&tc.ctx, callee).is_empty(),
+            "a read beyond the cap must not enumerate stack parameters"
+        );
+        assert!(
+            Function::from_id(&tc.ctx, callee).reads_unbounded_stack(),
+            "a read beyond the cap must flag the function as an unbounded reader"
+        );
+    }
+
+    #[test]
+    fn stack_argument_binds_to_caller_push() {
+        // End-to-end: a callee reads its first stack parameter at [entry_sp + 8];
+        // the caller stores the argument at the matching frame slot and calls.
+        // Binding must resolve the argument to that stored value.
+        let mut tc = TestContext::new();
+        let sp = tc.r3;
+        let ram = tc.ctx.default_space;
+        crate::brighten::get_or_make_stack_space(&mut tc.ctx, 8);
+
+        let callee = build_fn(&mut tc, "callee", 0x2000, |b| {
+            let slot = stack_addr_lit(b.context_mut(), 8);
+            b.push_load::<false>(slot, 8, ram);
+            let ret = b.context_mut().get_const(0u64, 8).id();
+            b.push_return(ret);
+        });
+        let aliases = AliasResult::simple(&tc.ctx);
+        crate::mem2reg(&mut tc.ctx, callee, &aliases);
+        set_function_summaries(&mut tc.ctx, callee, sp);
+
+        let caller = Function::make(&mut tc.ctx, "caller".into()).unwrap().id;
+        let entry = tc.ctx.get_or_make_block(0x1000);
+        let cont = tc.ctx.get_or_make_block(0x1100);
+        Function::from_id_mut(&mut tc.ctx, caller)
+            .set_root(entry)
+            .unwrap();
+        Function::from_id_mut(&mut tc.ctx, caller).add_block(cont);
+
+        let arg_val;
+        {
+            let mut b = Builder::from_context(&mut tc.ctx, 0x1000);
+            // Return address pushed at slot -8; this is the callee's entry SP, so
+            // the parameter at callee offset +8 lives at caller slot 0.
+            let arg_slot = stack_addr_lit(b.context_mut(), 0);
+            arg_val = b.context_mut().get_const(0xABCDu64, 8).id();
+            b.push_store(arg_val, arg_slot, ram);
+            let push_slot = stack_addr_lit(b.context_mut(), -8);
+            let retaddr = b.context_mut().get_const(0x1100u64, 8).id();
+            b.push_store(retaddr, push_slot, ram);
+            b.push_call(callee);
+            b.switch_to_block(cont);
+            let ret = b.context_mut().get_const(0u64, 8).id();
+            b.push_return(ret);
+            unsafe { b.dont_finalize() };
+        }
+        tc.ctx.add_cfg_edge(entry, cont);
+
+        bind_and_resolve(&mut tc.ctx, caller, sp);
+
+        let Mnemonic::Call(call) = first_call(&tc.ctx, caller) else {
+            unreachable!()
+        };
+        assert_eq!(
+            call.args,
+            vec![arg_val],
+            "the stack argument must resolve to the caller's pushed value"
+        );
+    }
+
+    #[test]
+    fn frame_escape_flag_disables_stack_promotion() {
+        // A normally-promotable local (stored then loaded) must stay in memory once
+        // the function is flagged as letting a frame pointer escape unboundedly.
+        let mut tc = TestContext::new();
+        let ram = tc.ctx.default_space;
+        crate::brighten::get_or_make_stack_space(&mut tc.ctx, 8);
+
+        let stack_load_count = |ctx: &Context, fun: FunctionId| {
+            Function::from_id(ctx, fun)
+                .blocks()
+                .flat_map(|b| b.iter().collect::<Vec<_>>())
+                .filter(|i| {
+                    matches!(i.mnemonic(), Mnemonic::Load(l) if stack_address_literal_value(ctx, l.ptr).is_some())
+                })
+                .count()
+        };
+
+        let build_local_fn = |tc: &mut TestContext, name: &'static str, addr: u64| {
+            build_fn(tc, name, addr, |b| {
+                let slot = stack_addr_lit(b.context_mut(), -8);
+                let v = b.context_mut().get_const(7u64, 8).id();
+                b.push_store(v, slot, ram);
+                let loaded = b.push_load::<false>(slot, 8, ram).id();
+                let sink_slot = stack_addr_lit(b.context_mut(), -16);
+                b.push_store(loaded, sink_slot, ram);
+                let sink = b.context_mut().get_const(0u64, 8).id();
+                b.push_return(sink);
+            })
+        };
+
+        // Baseline: the local is promoted away (no stack loads remain).
+        let promoted = build_local_fn(&mut tc, "promoted", 0x1000);
+        let aliases = AliasResult::simple(&tc.ctx);
+        crate::mem2reg(&mut tc.ctx, promoted, &aliases);
+        assert_eq!(
+            stack_load_count(&tc.ctx, promoted),
+            0,
+            "without the flag, the local stack slot is promoted to SSA"
+        );
+
+        // Flagged: promotion is disabled and the load survives.
+        let escaping = build_local_fn(&mut tc, "escaping", 0x2000);
+        Function::from_id_mut(&mut tc.ctx, escaping).set_frame_escapes_to_unbounded(true);
+        let aliases = AliasResult::simple(&tc.ctx);
+        crate::mem2reg(&mut tc.ctx, escaping, &aliases);
+        assert!(
+            stack_load_count(&tc.ctx, escaping) > 0,
+            "a frame-escaping function must keep its stack frame in memory"
+        );
+    }
+
+    #[test]
+    fn passing_frame_pointer_to_external_flags_caller() {
+        // Passing &local to an external callee (conservatively unbounded) flags the
+        // caller as frame-escaping, so its frame will not be promoted next round.
+        let mut tc = TestContext::new();
+        let sp = tc.r3;
+        let reg = tc.reg_space;
+        let r0 = tc.r0;
+        crate::brighten::get_or_make_stack_space(&mut tc.ctx, 8);
+
+        // External callee taking one pointer argument in r0.
+        let ext = Function::make(&mut tc.ctx, "gets".into()).unwrap().id;
+        Function::from_id_mut(&mut tc.ctx, ext).set_external(true);
+        Function::from_id_mut(&mut tc.ctx, ext).set_input_regs(vec![r0]);
+
+        let caller = build_fn(&mut tc, "caller", 0x1000, |b| {
+            // r0 = &local; call gets(r0)
+            let local = stack_addr_lit(b.context_mut(), -8);
+            b.push_store(local, ValueId::Varnode(r0), reg);
+            b.push_call(ext);
+        });
+
+        bind_all_call_args(&mut tc.ctx, sp);
+
+        assert!(
+            Function::from_id(&tc.ctx, caller).frame_escapes_to_unbounded(),
+            "passing a frame pointer to an external must flag the caller as escaping"
+        );
+    }
 }
+
+// ----- passes ----------------------------------------------------------------
+
+use crate::{Pass, PipelineEnv};
+
+#[derive(Default)]
+pub struct SeedClobbers;
+
+impl Pass for SeedClobbers {
+    const NAME: &'static str = "seed_clobbers";
+    fn description(&self) -> &'static str {
+        "Seed each function's call-clobbered-register set from the lifted IR"
+    }
+    fn run(&self, ctx: &mut Context, _env: &PipelineEnv) -> Result<bool, String> {
+        set_all_call_clobbered_regs(ctx);
+        Ok(false)
+    }
+}
+
+crate::register_module_pass!(SeedClobbers);
+
+#[derive(Default)]
+pub struct Summaries;
+
+impl Pass for Summaries {
+    const NAME: &'static str = "summaries";
+    fn description(&self) -> &'static str {
+        "Infer each function's input/clobber/saved summary and stack delta"
+    }
+    fn run(&self, ctx: &mut Context, env: &PipelineEnv) -> Result<bool, String> {
+        set_all_function_summaries(ctx, env.sp_varnode);
+        Ok(false)
+    }
+}
+
+crate::register_module_pass!(Summaries);
+
+#[derive(Default)]
+pub struct BindArgs;
+
+impl Pass for BindArgs {
+    const NAME: &'static str = "bind_args";
+    fn description(&self) -> &'static str {
+        "Bind argument and per-call alias sets at every call site"
+    }
+    fn run(&self, ctx: &mut Context, env: &PipelineEnv) -> Result<bool, String> {
+        bind_all_call_args(ctx, env.sp_varnode);
+        Ok(false)
+    }
+}
+
+crate::register_module_pass!(BindArgs);

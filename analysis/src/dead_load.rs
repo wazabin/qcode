@@ -723,3 +723,54 @@ mod tests {
         );
     }
 }
+
+// ----- pass ------------------------------------------------------------------
+
+use crate::{FunctionPass, PipelineEnv};
+
+#[derive(Default)]
+pub struct DeadLoad;
+
+impl FunctionPass for DeadLoad {
+    const NAME: &'static str = "dead_load";
+    fn description(&self) -> &'static str {
+        "Remove dead memory loads"
+    }
+    fn run(
+        &self,
+        ctx: &mut Context,
+        fun_id: FunctionId,
+        _env: &PipelineEnv,
+    ) -> Result<bool, String> {
+        let aliases = AliasResult::simple(ctx);
+        remove_dead_load_insns(ctx, fun_id, Some(&aliases), &[]);
+        Ok(false)
+    }
+}
+
+crate::register_function_pass!(DeadLoad);
+
+/// Lives here (not in the orphaned `dead_store.rs`) because it shares
+/// [`remove_dead_load_insns`] with [`DeadLoad`]; the only difference is that it
+/// also treats the architecture's flag registers as dead.
+#[derive(Default)]
+pub struct DeadStore;
+
+impl FunctionPass for DeadStore {
+    const NAME: &'static str = "dead_store";
+    fn description(&self) -> &'static str {
+        "Remove dead register loads and overwritten flag stores"
+    }
+    fn run(
+        &self,
+        ctx: &mut Context,
+        fun_id: FunctionId,
+        env: &PipelineEnv,
+    ) -> Result<bool, String> {
+        let aliases = AliasResult::simple(ctx);
+        remove_dead_load_insns(ctx, fun_id, Some(&aliases), &env.cfg.dead_flag_regs);
+        Ok(false)
+    }
+}
+
+crate::register_function_pass!(DeadStore);

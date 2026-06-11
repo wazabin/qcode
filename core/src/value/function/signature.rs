@@ -25,4 +25,20 @@ pub struct FunctionSignature {
     /// `None` when the delta is unknown or the function's return blocks disagree;
     /// in that case the stack pointer is treated as an ordinary clobber.
     pub stack_delta: Option<i64>,
+    /// `true` when this function performs an unresolved/dynamic memory access, or
+    /// forwards a stack-typed pointer into a callee that does. A caller that hands
+    /// a pointer into its own frame to such a function cannot bound which of its
+    /// stack slots the callee reads, so it must keep its whole frame in memory
+    /// (no stack promotion). See the stack-escape handling in `mem2reg`.
+    #[serde(default)]
+    pub reads_unbounded_stack: bool,
+    /// `true` when this function passes a pointer into its *own* stack frame to a
+    /// callee that may read it unboundedly (a callee with
+    /// [`reads_unbounded_stack`](Self::reads_unbounded_stack), an external, or an
+    /// indirect call). Such a callee may clobber any of this function's stack
+    /// slots, so its frame must stay in memory — `mem2reg` disables all stack
+    /// promotion for it. Computed at bind time (while `StackAddress` types are
+    /// still present) and seeded across checkpoint+replay rounds.
+    #[serde(default)]
+    pub frame_escapes_to_unbounded: bool,
 }
