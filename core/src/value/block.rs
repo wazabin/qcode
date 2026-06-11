@@ -435,18 +435,22 @@ impl<'str, 'ctx> BlockMutRef<'str, 'ctx> {
     }
 
     /// Adds an edge to this block's edge set.
-    pub fn add_edge(&mut self, edge_id: EdgeId) {
+    /// DO NOT USE THIS
+    pub(crate) fn add_edge(&mut self, edge_id: EdgeId) {
         self.inner_mut().edges.insert(edge_id);
     }
 
     /// Removes an edge from this block's edge set.
-    pub fn remove_edge(&mut self, edge_id: EdgeId) {
+    /// DO NOT USE THIS
+    pub(crate) fn remove_edge(&mut self, edge_id: EdgeId) {
         self.inner_mut().edges.remove(&edge_id);
     }
 
     /// Removes the last instruction from this block.
-    pub fn pop_insn(&mut self) -> Option<InstructionId> {
-        self.inner_mut().instructions.pop()
+    pub fn pop_insn(&mut self) {
+        if let Some(last_id) = self.inner().instructions.last() {
+            self.ctx.remove_instruction(*last_id);
+        }
     }
 
     /// Appends a slice of instruction ids to this block.
@@ -761,5 +765,87 @@ mod tests {
         let sum = builder.push_add(param_id, param_id);
         assert_eq!(sum.size(), 8);
         unsafe { builder.dont_finalize() };
+    }
+
+    #[test]
+    fn remove_terminator_branch() {
+        let mut ctx = Context::new();
+        qcode!(
+            ctx,
+            "
+            <entry>
+                goto <done>;
+            <done>
+            "
+        );
+
+        let mut entry_block = BasicBlock::from_id_mut(&mut ctx, entry);
+        assert_eq!(entry_block.instruction_ids().len(), 1);
+        assert_eq!(entry_block.successors().count(), 1);
+        assert!(entry_block.is_terminated());
+
+        entry_block.pop_insn();
+        assert_eq!(entry_block.instruction_ids().len(), 0);
+        assert_eq!(entry_block.successors().count(), 0);
+        assert!(!entry_block.is_terminated());
+    }
+
+    #[test]
+    fn remove_terminator_cbranch() {
+        let mut ctx = Context::new();
+        qcode!(
+            ctx,
+            "
+            varnode i8 cond;
+
+            <entry>
+                %c = load(i8, cond);
+                if %c goto <then_lbl> else goto <else_lbl>;
+
+            <then_lbl>
+
+            <else_lbl>
+            "
+        );
+
+        let mut entry_block = BasicBlock::from_id_mut(&mut ctx, entry);
+        assert_eq!(entry_block.successors().count(), 2);
+        assert_eq!(entry_block.instruction_ids().len(), 2);
+        assert!(entry_block.is_terminated());
+
+        entry_block.pop_insn();
+
+        assert_eq!(entry_block.successors().count(), 0);
+        assert_eq!(entry_block.instruction_ids().len(), 1);
+        assert!(!entry_block.is_terminated());
+
+        assert_eq!(
+            BasicBlock::from_id(&ctx, then_lbl).predecessors().count(),
+            0
+        );
+        assert_eq!(
+            BasicBlock::from_id(&ctx, else_lbl).predecessors().count(),
+            0
+        );
+    }
+
+    #[test]
+    fn remove_terminator_return() {
+        let mut ctx = Context::new();
+        qcode!(
+            ctx,
+            "
+            <entry>
+                return [i64 0];
+            "
+        );
+
+        let mut entry_block = BasicBlock::from_id_mut(&mut ctx, entry);
+        assert_eq!(entry_block.instruction_ids().len(), 1);
+        assert_eq!(entry_block.successors().count(), 0);
+
+        entry_block.pop_insn();
+        assert_eq!(entry_block.instruction_ids().len(), 0);
+        assert_eq!(entry_block.successors().count(), 0);
     }
 }

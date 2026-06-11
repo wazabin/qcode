@@ -386,7 +386,21 @@ impl<'str> Context<'str> {
             self.values.basic_blocks[block_id]
                 .instructions
                 .retain(|&i| i != id);
+
+            // If this instruction was a terminator instruction in a basic block,
+            // remove cfg edges
+            if Instruction::from_id(self, id).mnemonic().is_terminator() {
+                let mut edges_to_remove = HashSet::new();
+                for edge in BasicBlock::from_id(self, block_id).successors() {
+                    edges_to_remove.insert(edge.0);
+                }
+
+                for edge_id in edges_to_remove {
+                    self.remove_cfg_edge(edge_id);
+                }
+            }
         }
+
         self.values.instructions[id].parent = None;
 
         if let Some(ref n) = name {
