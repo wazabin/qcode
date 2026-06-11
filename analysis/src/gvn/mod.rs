@@ -21,7 +21,7 @@ mod memory;
 #[cfg(test)]
 mod tests;
 
-use integer::{algebraic_identity, constant_folding};
+use integer::try_fold;
 use memory::{gvn_block_inner, prune_clobbered_by_call, prune_loop_carried_loads};
 
 /// Constant-fold every foldable instruction in `func_id` to interned literals,
@@ -63,12 +63,8 @@ pub fn constant_fold_function(ctx: &mut Context, func_id: FunctionId) -> bool {
                     continue;
                 }
 
-                if let Some(cst) = constant_folding(ctx, &mnemonic, size) {
-                    ctx.replace_all_uses_with(id, cst);
-                    redundant.insert(insn_id);
-                    changed = true;
-                } else if let Some(simplified) = algebraic_identity(ctx, &mnemonic, size) {
-                    ctx.replace_all_uses_with(id, simplified);
+                if let Some(folded) = try_fold(ctx, &mnemonic, size) {
+                    ctx.replace_all_uses_with(id, folded);
                     redundant.insert(insn_id);
                     changed = true;
                 }
@@ -104,17 +100,51 @@ fn gvn_block_rec(
     inherited: &HashMap<Mnemonic, ValueId>,
     tree: &DominatorTree<BlockId>,
     aliases: Option<&AliasResult>,
+    shared: &HashSet<BlockId>,
+    changed: &mut bool,
 ) {
+    // A block reachable from more than one walk entry is not truly dominated by
+    // anything in this walk's entry-local dominator tree (control can arrive
+    // via the other entry), so no values may be forwarded into it.
+    let empty = HashMap::new();
+    let inherited = if shared.contains(&block_id) {
+        &empty
+    } else {
+        inherited
+    };
     let inherited = prune_loop_carried_loads(ctx, block_id, inherited, tree, aliases);
-    let updated = gvn_block_inner(ctx, block_id, inherited.as_ref(), aliases);
+    let (updated, block_changed) = gvn_block_inner(ctx, block_id, inherited.as_ref(), aliases);
+    *changed |= block_changed;
     // A block that ends in a call clobbers registers: its dominated children run
     // after the call, so register `Load` leaders the call clobbers must not be
     // forwarded into them (e.g. a caller's post-call `RAX` read is the callee's
     // result, not a value computed before the call).
     let for_children = prune_clobbered_by_call(ctx, block_id, &updated, aliases);
     for &child in tree.children_of(block_id) {
-        gvn_block_rec(ctx, child, for_children.as_ref(), tree, aliases);
+        gvn_block_rec(
+            ctx,
+            child,
+            for_children.as_ref(),
+            tree,
+            aliases,
+            shared,
+            changed,
+        );
     }
+}
+
+/// All blocks reachable from `entry` via CFG successor edges (including `entry`).
+fn reachable_from(ctx: &Context, entry: BlockId) -> HashSet<BlockId> {
+    let mut seen = HashSet::from([entry]);
+    let mut stack = vec![entry];
+    while let Some(block) = stack.pop() {
+        for (_, succ) in BasicBlock::from_id(ctx, block).successors() {
+            if seen.insert(succ) {
+                stack.push(succ);
+            }
+        }
+    }
+    seen
 }
 
 /// Dominator-tree GVN over an entire function.
@@ -124,45 +154,67 @@ fn gvn_block_rec(
 /// available to every descendant, so redundant recomputations across blocks are
 /// eliminated. Store/load invalidation follows the same alias-aware rules as the
 /// single-block pass.
-pub fn gvn_function(ctx: &mut Context, func_id: FunctionId, aliases: Option<&AliasResult>) {
+/// Returns `true` if anything changed.
+pub fn gvn_function(ctx: &mut Context, func_id: FunctionId, aliases: Option<&AliasResult>) -> bool {
     let root = match ctx.values.functions[func_id].root {
         Some(r) => r,
-        None => return,
+        None => return false,
     };
 
-    let tree = compute_dominators(ctx, root);
-    gvn_block_rec(ctx, root, &HashMap::new(), &tree, aliases);
-
-    // Blocks unreachable from the function root are not covered by the walk
-    // above. The common case is the fall-through after a `call`: a `Call` is a
+    // Blocks unreachable from the function root are not covered by the root
+    // walk. The common case is the fall-through after a `call`: a `Call` is a
     // block terminator, but the lifter records no CFG edge from the call site
     // back to its return block, so the entire post-call region (register reload
     // chains, the epilogue, ...) is orphaned. Optimize each such region with its
     // own dominator tree, rooted at its entry — an unreachable block with no
-    // predecessor. Once calls grow a proper return edge this loop simply finds
-    // nothing to do.
-    let is_reachable = |b: BlockId| b == root || tree.dominates(root, b);
-    let block_ids: Vec<BlockId> = Function::from_id(ctx, func_id)
+    // predecessor. Once calls grow a proper return edge this finds nothing to do.
+    let root_reachable = reachable_from(ctx, root);
+    let entries: Vec<BlockId> = Function::from_id(ctx, func_id)
         .iter()
+        .filter(|block| !root_reachable.contains(&block.id))
+        .filter(|block| block.predecessors().next().is_none())
         .map(|block| block.id)
         .collect();
 
-    for block_id in block_ids {
-        if is_reachable(block_id) {
-            continue;
+    // Blocks reachable from more than one entry get no forwarded values: each
+    // walk's dominator tree only sees its own entry's edges, so its dominance
+    // claims are invalid for blocks the other entries can also reach.
+    let mut seen_count: HashMap<BlockId, u32> = HashMap::new();
+    for &entry in std::iter::once(&root).chain(&entries) {
+        for block in reachable_from(ctx, entry) {
+            *seen_count.entry(block).or_default() += 1;
         }
-        // Only start at region entries; interior blocks are reached by the
-        // sub-walk from their entry.
-        if BasicBlock::from_id(ctx, block_id)
-            .predecessors()
-            .next()
-            .is_some()
-        {
-            continue;
-        }
-        let subtree = compute_dominators(ctx, block_id);
-        gvn_block_rec(ctx, block_id, &HashMap::new(), &subtree, aliases);
     }
+    let shared: HashSet<BlockId> = seen_count
+        .into_iter()
+        .filter_map(|(block, count)| (count > 1).then_some(block))
+        .collect();
+
+    let mut changed = false;
+    let tree = compute_dominators(ctx, root);
+    gvn_block_rec(
+        ctx,
+        root,
+        &HashMap::new(),
+        &tree,
+        aliases,
+        &shared,
+        &mut changed,
+    );
+
+    for entry in entries {
+        let subtree = compute_dominators(ctx, entry);
+        gvn_block_rec(
+            ctx,
+            entry,
+            &HashMap::new(),
+            &subtree,
+            aliases,
+            &shared,
+            &mut changed,
+        );
+    }
+    changed
 }
 
 // ----- passes ----------------------------------------------------------------
@@ -206,10 +258,10 @@ impl FunctionPass for Gvn {
         // Canonicalize pointer arithmetic into literals *before* building the alias
         // oracle, so it sees per-slot stack locations rather than collapsing them
         // onto `stack_base`.
-        constant_fold_function(ctx, fun_id);
+        let mut changed = constant_fold_function(ctx, fun_id);
         let aliases = AliasResult::simple(ctx);
-        gvn_function(ctx, fun_id, Some(&aliases));
-        Ok(false)
+        changed |= gvn_function(ctx, fun_id, Some(&aliases));
+        Ok(changed)
     }
 }
 

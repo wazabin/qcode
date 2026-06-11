@@ -11,15 +11,19 @@ use qcode::{
 // Normalization (used for commutative binops)
 // ---------------------------------------------------------------------------
 
-fn value_id_index(v: ValueId) -> usize {
+/// Total order over `ValueId`s for commutative-operand canonicalization. The
+/// variant rank breaks ties between equal indices of different variants (e.g.
+/// `Literal(5)` vs `Instruction(5)`), which would otherwise leave `a + b` and
+/// `b + a` un-normalized.
+fn value_id_key(v: ValueId) -> (u8, usize) {
     match v {
-        ValueId::Literal(x) => x.into(),
-        ValueId::Instruction(x) => x.into(),
-        ValueId::Varnode(x) => x.into(),
-        ValueId::BasicBlock(x) => x.into(),
-        ValueId::Function(x) => x.into(),
-        ValueId::BlockParam(x) => x.into(),
-        _ => todo!("unsupported value id type in value_id_index: {:?}", v),
+        ValueId::Literal(x) => (0, x.into()),
+        ValueId::Instruction(x) => (1, x.into()),
+        ValueId::Varnode(x) => (2, x.into()),
+        ValueId::BasicBlock(x) => (3, x.into()),
+        ValueId::Function(x) => (4, x.into()),
+        ValueId::BlockParam(x) => (5, x.into()),
+        _ => todo!("unsupported value id type in value_id_key: {:?}", v),
     }
 }
 
@@ -45,8 +49,8 @@ pub(super) fn normalize(m: &mut Mnemonic) {
     if let Mnemonic::Binop(b) = m
         && is_commutative(&b.op)
     {
-        let l = value_id_index(b.lhs);
-        let r = value_id_index(b.rhs);
+        let l = value_id_key(b.lhs);
+        let r = value_id_key(b.rhs);
         if l > r {
             std::mem::swap(&mut b.lhs, &mut b.rhs);
         }
@@ -71,6 +75,16 @@ fn is_symbolic_literal(ctx: &Context, v: ValueId) -> bool {
     ctx.values.literals[id].symbolic.is_some()
 }
 
+/// `get_const`, but refusing Block/Function/String symbolic literals: those are
+/// not numeric constants and folding them would discard the symbolic annotation.
+/// StackAddress-typed literals have symbolic=None and are foldable.
+fn get_numeric_const<'a>(ctx: &'a Context<'a>, v: ValueId) -> Option<LiteralRef<'a, 'a>> {
+    if is_symbolic_literal(ctx, v) {
+        return None;
+    }
+    get_const(ctx, v)
+}
+
 // TODO: use the existing `evaluate_const` machinery instead of re-implementing it here.
 pub(super) fn constant_folding(
     ctx: &mut Context,
@@ -79,15 +93,10 @@ pub(super) fn constant_folding(
 ) -> Option<ValueId> {
     match m {
         &Mnemonic::Binop(Binary { lhs, rhs, op }) => {
-            let lhs = get_const(ctx, lhs)?;
-            let rhs = get_const(ctx, rhs)?;
-            // Block/Function/String symbolic literals are not numeric constants and
-            // must not be folded (folding would discard the symbolic annotation).
-            // StackAddress-typed literals have symbolic=None and are foldable; their
-            // type is preserved through the output type computed by binop_result below.
-            if is_symbolic_literal(ctx, lhs.id()) || is_symbolic_literal(ctx, rhs.id()) {
-                return None;
-            }
+            // StackAddress-typed literals are foldable; their type is preserved
+            // through the output type computed by binop_result below.
+            let lhs = get_numeric_const(ctx, lhs)?;
+            let rhs = get_numeric_const(ctx, rhs)?;
             // Shifts take a shift *count* whose operand width may be narrower than
             // the value being shifted (e.g. `shr eax, cl`: 4-byte value, 1-byte
             // count). For every other binop the operands must be the same width —
@@ -128,8 +137,23 @@ pub(super) fn constant_folding(
                 Binop::Int(IntBinop::Xor) => (l ^ r) & mask,
                 Binop::Int(IntBinop::And) => (l & r) & mask,
                 Binop::Int(IntBinop::Or) => (l | r) & mask,
-                Binop::Int(IntBinop::ShiftLeft) => (l << r) & mask,
-                Binop::Int(IntBinop::ShiftRight) => (l >> r) & mask,
+                // Logical shifts by >= the operand width yield 0 (pcode
+                // semantics); going through Rust's `<<`/`>>` with such a count
+                // would panic (debug) or wrap the count (release).
+                Binop::Int(IntBinop::ShiftLeft) => {
+                    if r >= size as u64 * 8 {
+                        0
+                    } else {
+                        (l << r) & mask
+                    }
+                }
+                Binop::Int(IntBinop::ShiftRight) => {
+                    if r >= size as u64 * 8 {
+                        0
+                    } else {
+                        (l >> r) & mask
+                    }
+                }
                 // Arithmetic shift: sign-extend the lhs from its byte width to
                 // i64, shift, then re-mask to the lhs width.
                 Binop::Int(IntBinop::SShiftRight) => {
@@ -143,8 +167,10 @@ pub(super) fn constant_folding(
                 }
 
                 Binop::Int(IntBinop::Mul) => l.wrapping_mul(r) & mask,
-                Binop::Int(IntBinop::Div) => l.wrapping_div(r) & mask,
-                Binop::Int(IntBinop::Rem) => l.wrapping_rem(r) & mask,
+                // Division by a constant zero is left unfolded: `wrapping_div`
+                // still panics on a zero divisor.
+                Binop::Int(IntBinop::Div) => l.checked_div(r)? & mask,
+                Binop::Int(IntBinop::Rem) => l.checked_rem(r)? & mask,
 
                 Binop::Bool(BoolBinop::And) => (l != 0 && r != 0) as u64,
                 Binop::Bool(BoolBinop::Or) => (l != 0 || r != 0) as u64,
@@ -161,7 +187,7 @@ pub(super) fn constant_folding(
         }
 
         Mnemonic::Unop(unop) => {
-            let src = get_const(ctx, unop.src)?;
+            let src = get_numeric_const(ctx, unop.src)?;
 
             let v = src.value();
             let size = src.size();
@@ -180,27 +206,35 @@ pub(super) fn constant_folding(
         }
 
         Mnemonic::Zext(zext) => {
-            let src = get_const(ctx, zext.src)?;
+            let src = get_numeric_const(ctx, zext.src)?;
             Some(ctx.get_const(src.value(), zext.size).id())
         }
 
         Mnemonic::Sext(sext) => {
-            let src = get_const(ctx, sext.src)?;
-            let value = ((src.value() as i64) << (64 - src.size() * 8)) >> (64 - sext.size * 8);
-            Some(ctx.get_const(value as u64, sext.size).id())
+            let src = get_numeric_const(ctx, sext.src)?;
+            // Sign-extend from the *source* width to 64 bits, then mask down to
+            // the destination width.
+            let src_bits = src.size() * 8;
+            let extended = if src_bits >= 64 {
+                src.value()
+            } else {
+                (((src.value() << (64 - src_bits)) as i64) >> (64 - src_bits)) as u64
+            };
+            Some(
+                ctx.get_const(extended & all_ones(sext.size), sext.size)
+                    .id(),
+            )
         }
 
         Mnemonic::Range(range) => {
             // Extract `range.size` bytes starting at byte `range.start` of a
             // constant (e.g. EDI = low 4 bytes of a wide RDI literal).
-            let src = get_const(ctx, range.src)?;
+            let src = get_numeric_const(ctx, range.src)?;
             let shifted = src.value().overflowing_shr(range.start as u32 * 8).0;
-            let mask = if range.size >= 8 {
-                u64::MAX
-            } else {
-                (1u64 << (range.size * 8)) - 1
-            };
-            Some(ctx.get_const(shifted & mask, range.size).id())
+            Some(
+                ctx.get_const(shifted & all_ones(range.size), range.size)
+                    .id(),
+            )
         }
 
         _ => None,
@@ -222,10 +256,14 @@ fn all_ones(output_size: usize) -> u64 {
 
 /// Concrete value of `v` when it is a non-symbolic literal, else `None`.
 fn const_value(ctx: &Context, v: ValueId) -> Option<u64> {
-    if is_symbolic_literal(ctx, v) {
-        return None;
-    }
-    get_const(ctx, v).map(|c| c.value())
+    get_numeric_const(ctx, v).map(|c| c.value())
+}
+
+/// [`constant_folding`] then [`algebraic_identity`]: the value `m` collapses to
+/// when either rewrite applies. Shared by the standalone constant-folding pass
+/// and the GVN block walk so the two cannot drift.
+pub(super) fn try_fold(ctx: &mut Context, m: &Mnemonic, output_size: usize) -> Option<ValueId> {
+    constant_folding(ctx, m, output_size).or_else(|| algebraic_identity(ctx, m, output_size))
 }
 
 /// Algebraic simplifications that, unlike [`constant_folding`], do *not* require

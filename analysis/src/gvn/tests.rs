@@ -1,11 +1,12 @@
 use qcode_macro::qcode;
 
 use super::*;
+use integer::{constant_folding, normalize};
 use qcode::{
     context::Context,
     value::{
         BasicBlock, Value,
-        insn::{Binary, Binop, IntBinop},
+        insn::{Binary, Binop, IntBinop, Sext, Zext},
     },
 };
 
@@ -651,5 +652,252 @@ fn test_register_forwarding_in_orphaned_post_call_block() {
             .contains(&load_insn),
         "forwarding must reach the orphaned post-call block, got:\n{}",
         BasicBlock::from_id(&tc.ctx, post_call)
+    );
+}
+
+// -----------------------------------------------------------------------
+// Regression tests for constant-folding edge cases
+// -----------------------------------------------------------------------
+
+/// Sext must sign-extend from the *source* width; an earlier version shifted
+/// by the destination width, computing `sext(x) << (dst_bits - src_bits)`.
+#[test]
+fn constant_folding_sext_extends_from_source_width() {
+    let mut ctx = Context::new();
+
+    let src = ctx.get_const(0x80, 1).id();
+    let folded = constant_folding(&mut ctx, &Mnemonic::Sext(Sext { src, size: 4 }), 4)
+        .expect("sext of a constant must fold");
+    let ValueId::Literal(lid) = folded else {
+        panic!("folded result must be a literal");
+    };
+    assert_eq!(ctx.values.literals[lid].value, 0xFFFF_FF80);
+
+    let src = ctx.get_const(0x7f, 1).id();
+    let folded = constant_folding(&mut ctx, &Mnemonic::Sext(Sext { src, size: 8 }), 8)
+        .expect("sext of a constant must fold");
+    let ValueId::Literal(lid) = folded else {
+        panic!("folded result must be a literal");
+    };
+    assert_eq!(ctx.values.literals[lid].value, 0x7f);
+}
+
+/// A constant zero divisor must not fold (and must not panic).
+#[test]
+fn constant_folding_leaves_division_by_zero_unfolded() {
+    for op in [IntBinop::Div, IntBinop::Rem] {
+        let mut ctx = Context::new();
+        let lhs = ctx.get_const(42, 4).id();
+        let rhs = ctx.get_const(0, 4).id();
+        let folded = constant_folding(
+            &mut ctx,
+            &Mnemonic::Binop(Binary {
+                op: Binop::Int(op),
+                lhs,
+                rhs,
+            }),
+            4,
+        );
+        assert!(
+            folded.is_none(),
+            "{op:?} by constant 0 must be left unfolded"
+        );
+    }
+}
+
+/// Logical shifts by >= the operand width fold to 0 (and must not panic on
+/// counts >= 64, which overflow Rust's shift operators).
+#[test]
+fn constant_folding_oversized_shift_counts_fold_to_zero() {
+    for op in [IntBinop::ShiftLeft, IntBinop::ShiftRight] {
+        let mut ctx = Context::new();
+        let lhs = ctx.get_const(1, 8).id();
+        let rhs = ctx.get_const(64, 8).id();
+        let folded = constant_folding(
+            &mut ctx,
+            &Mnemonic::Binop(Binary {
+                op: Binop::Int(op),
+                lhs,
+                rhs,
+            }),
+            8,
+        )
+        .expect("oversized shift must fold to 0");
+        let ValueId::Literal(lid) = folded else {
+            panic!("folded result must be a literal");
+        };
+        assert_eq!(ctx.values.literals[lid].value, 0, "{op:?} by 64 must be 0");
+    }
+}
+
+/// The symbolic-literal guard applies to cast/extract arms too, not just
+/// binops: folding a symbolic literal would discard its annotation.
+#[test]
+fn constant_folding_does_not_fold_symbolic_literals_in_casts() {
+    let mut ctx = Context::new();
+    let type_id = ctx.types.get_or_make_int(4);
+    let lid = ctx.values.push_literal(qcode::value::literal::Literal {
+        value: 0x1000,
+        type_id,
+        symbolic: Some(qcode::value::literal::SymbolicRef::String("s".into())),
+    });
+    let src = ValueId::Literal(lid);
+
+    assert!(constant_folding(&mut ctx, &Mnemonic::Zext(Zext { src, size: 8 }), 8).is_none());
+    assert!(constant_folding(&mut ctx, &Mnemonic::Sext(Sext { src, size: 8 }), 8).is_none());
+    assert!(
+        constant_folding(
+            &mut ctx,
+            &Mnemonic::Range(qcode::value::insn::Range {
+                src,
+                start: 0,
+                size: 2,
+            }),
+            2,
+        )
+        .is_none()
+    );
+}
+
+/// Commutative canonicalization must order operands even when their indices
+/// tie across different `ValueId` variants (e.g. `Literal(0)` vs
+/// `Instruction(0)`), otherwise `a + b` and `b + a` value-number differently.
+#[test]
+fn normalize_orders_equal_indices_across_value_id_variants() {
+    let a = ValueId::Literal(0usize.into());
+    let b = ValueId::Instruction(0usize.into());
+    let make = |lhs, rhs| {
+        Mnemonic::Binop(Binary {
+            op: Binop::Int(IntBinop::Add),
+            lhs,
+            rhs,
+        })
+    };
+    let mut m1 = make(a, b);
+    let mut m2 = make(b, a);
+    normalize(&mut m1);
+    normalize(&mut m2);
+    assert_eq!(
+        m1, m2,
+        "a + b and b + a must normalize to the same mnemonic"
+    );
+}
+
+// -----------------------------------------------------------------------
+// Regression tests for the function walk
+// -----------------------------------------------------------------------
+
+/// A header that is its own loop body: the header's own store (after the load,
+/// before the back edge) clobbers the inherited value on iterations >= 2, so
+/// the entry store must not be forwarded into the header's load.
+#[test]
+fn test_gvn_function_self_loop_header_store_blocks_forwarding() {
+    let mut ctx = Context::new();
+
+    qcode!(
+        ctx,
+        "
+            varnode i32 A;
+
+            fn self_loop:
+                <entry>
+                    store(&A, i32 0);
+                    goto <header>;
+
+                <header>
+                    %v = load(i32, &A);
+                    store(&A, i32 1);
+                    if i8 1 goto <header> else goto <exit>;
+
+                <exit>
+                    return [0x1000];
+            "
+    );
+
+    let aliases = AliasResult::simple(&ctx);
+    gvn_function(&mut ctx, self_loop, Some(&aliases));
+
+    assert!(
+        BasicBlock::from_id(&ctx, header)
+            .instruction_ids()
+            .contains(&v),
+        "header load must not be replaced by the entry store; the header's own store \
+         overwrites it before the back edge"
+    );
+}
+
+/// A block reachable from two orphan-region entries must receive no forwarded
+/// values: each entry-local dominator tree's claims are invalid for it.
+#[test]
+fn test_gvn_function_does_not_forward_into_block_shared_by_orphan_regions() {
+    let mut ctx = Context::new();
+
+    qcode!(
+        ctx,
+        "
+            varnode i32 A;
+            varnode i32 B;
+
+            fn shared_orphans:
+                <entry>
+                    return [0x1000];
+
+                <e1>
+                    store(&A, i32 1);
+                    goto <shared>;
+
+                <e2>
+                    store(&A, i32 2);
+                    goto <shared>;
+
+                <shared>
+                    %v = load(i32, &A);
+                    store(&B, %v);
+                    return [0x1001];
+            "
+    );
+
+    let aliases = AliasResult::simple(&ctx);
+    gvn_function(&mut ctx, shared_orphans, Some(&aliases));
+
+    assert!(
+        BasicBlock::from_id(&ctx, shared)
+            .instruction_ids()
+            .contains(&v),
+        "the load in a block reachable from two orphan entries must not be forwarded \
+         a store from either entry"
+    );
+}
+
+/// `gvn_function` reports whether it rewrote anything, so the pass manager can
+/// see GVN's changes.
+#[test]
+fn gvn_function_reports_changes() {
+    let mut ctx = Context::new();
+
+    qcode!(
+        ctx,
+        "
+            varnode i64 A;
+            varnode i64 B;
+
+            fn g:
+                <entry>
+                    %a = load(i64, &A);
+                    %v1 = %a + %a;
+                    %v2 = %a + %a;
+                    store(&B, %v2);
+                    return [0x1000];
+            "
+    );
+
+    let aliases = AliasResult::simple(&ctx);
+    assert!(
+        gvn_function(&mut ctx, g, Some(&aliases)),
+        "eliminating the duplicate binop must be reported as a change"
+    );
+    assert!(
+        !gvn_function(&mut ctx, g, Some(&aliases)),
+        "a second run on the already-optimized function must report no change"
     );
 }

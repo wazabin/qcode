@@ -13,7 +13,7 @@ use qcode::{
     },
 };
 
-use super::integer::{algebraic_identity, constant_folding, normalize, simplify_flag_idiom};
+use super::integer::{normalize, simplify_flag_idiom, try_fold};
 
 // ---------------------------------------------------------------------------
 // GVN pass
@@ -22,13 +22,14 @@ use super::integer::{algebraic_identity, constant_folding, normalize, simplify_f
 /// Process all instructions in `block_id` with an inherited value table.
 ///
 /// Returns the updated table (inherited entries plus new entries from this block)
-/// for descendants in the dominator tree to inherit.
+/// for descendants in the dominator tree to inherit, plus whether any
+/// instruction was rewritten.
 pub(super) fn gvn_block_inner(
     ctx: &mut Context,
     block_id: BlockId,
     inherited: &HashMap<Mnemonic, ValueId>,
     aliases: Option<&AliasResult>,
-) -> HashMap<Mnemonic, ValueId> {
+) -> (HashMap<Mnemonic, ValueId>, bool) {
     let mut table = inherited.clone();
     // Maps a narrow-load mnemonic to (wide_src, byte_offset_within_wide, sub_size),
     // populated when a wide store covers sub-register locations.
@@ -64,11 +65,14 @@ pub(super) fn gvn_block_inner(
                     table.insert(Mnemonic::Load(store.get_matching_load()), store.src);
                 }
 
-                // Invalidate range_table entries for locations this store may overwrite.
+                // Invalidate range_table entries for locations this store may
+                // overwrite. Like the main table above, drop everything when no
+                // alias oracle is available (currently unreachable: entries are
+                // only inserted when `aliases` is `Some`).
                 range_table.retain(|k, _| {
                     if let Mnemonic::Load(sub_load) = k {
                         aliases
-                            .is_none_or(|aliases| !aliases.may_alias(ctx, store_ptr, sub_load.ptr))
+                            .is_some_and(|aliases| !aliases.may_alias(ctx, store_ptr, sub_load.ptr))
                     } else {
                         true
                     }
@@ -91,14 +95,8 @@ pub(super) fn gvn_block_inner(
             _ if mnemonic.is_terminator() || insn_size == 0 => {}
 
             _ => {
-                if let Some(cst) = constant_folding(ctx, &mnemonic, insn_size) {
-                    ctx.replace_all_uses_with(id, cst);
-                    redundant.insert(insn_id);
-                    continue;
-                }
-
-                if let Some(simplified) = algebraic_identity(ctx, &mnemonic, insn_size) {
-                    ctx.replace_all_uses_with(id, simplified);
+                if let Some(folded) = try_fold(ctx, &mnemonic, insn_size) {
+                    ctx.replace_all_uses_with(id, folded);
                     redundant.insert(insn_id);
                     continue;
                 }
@@ -152,8 +150,9 @@ pub(super) fn gvn_block_inner(
         }
     }
 
+    let changed = !redundant.is_empty();
     BasicBlock::from_id_mut(ctx, block_id).retain_insns(|insn| !redundant.contains(insn));
-    table
+    (table, changed)
 }
 
 /// The registers a call may clobber, used to invalidate forwarded `Load` leaders.
@@ -219,9 +218,10 @@ pub(super) fn prune_loop_carried_loads<'a>(
     tree: &DominatorTree<BlockId>,
     aliases: Option<&AliasResult>,
 ) -> std::borrow::Cow<'a, HashMap<Mnemonic, ValueId>> {
+    // `dominates` is reflexive, so a self-loop (pred == block_id) also counts.
     let is_loop_header = BasicBlock::from_id(ctx, block_id)
         .predecessors()
-        .any(|(_, pred)| pred != block_id && tree.dominates(block_id, pred));
+        .any(|(_, pred)| tree.dominates(block_id, pred));
     if !is_loop_header || !inherited.keys().any(|m| matches!(m, Mnemonic::Load(_))) {
         return std::borrow::Cow::Borrowed(inherited);
     }
@@ -235,9 +235,13 @@ pub(super) fn prune_loop_carried_loads<'a>(
             return false;
         };
 
+        // The header itself is included: a store in the header (e.g. after the
+        // load, before the back edge) clobbers the inherited value on every
+        // iteration after the first, so the preheader value must not be
+        // forwarded into the header's load.
         !ctx.block_ids()
             .into_iter()
-            .filter(|&candidate| candidate != block_id && tree.dominates(block_id, candidate))
+            .filter(|&candidate| tree.dominates(block_id, candidate))
             .flat_map(|candidate| {
                 BasicBlock::from_id(ctx, candidate)
                     .iter()
