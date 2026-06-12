@@ -370,7 +370,9 @@ mod tests {
             panic!("expected the rebuilt value to be an instruction, got {src:?}");
         };
         match tc.ctx.get_insn(zid).mnemonic() {
-            Mnemonic::Zext(z) => assert_eq!(z.src, ValueId::Instruction(cc), "zext of the setnz byte"),
+            Mnemonic::Zext(z) => {
+                assert_eq!(z.src, ValueId::Instruction(cc), "zext of the setnz byte")
+            }
             other => panic!("expected zext(%cc), got {other:?}"),
         }
     }

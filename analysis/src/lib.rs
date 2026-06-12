@@ -18,6 +18,8 @@ pub use call_summary::{
     set_function_summaries,
 };
 
+pub mod cfg;
+
 pub mod naming;
 
 #[cfg(test)]
@@ -46,6 +48,9 @@ pub use gvn::{constant_fold_function, gvn, gvn_function};
 
 pub mod mem2reg;
 pub use mem2reg::mem2reg;
+
+pub mod value_range;
+pub use value_range::{ValueRange, value_range};
 
 pub mod pipeline;
 pub use pipeline::{
