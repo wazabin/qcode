@@ -25,7 +25,7 @@ use qcode::{
     value::{
         BasicBlock, Value, ValueId, ValueRef,
         block::BlockId,
-        insn::{Binary, Binop, InstructionId, IntBinop, Mnemonic},
+        insn::{Binary, Binop, InstructionId, IntBinop, Mnemonic, Unary, Unop},
     },
 };
 
@@ -243,6 +243,7 @@ impl Solver<'_> {
                     | IntBinop::SLess
                     | IntBinop::LessEqual
                     | IntBinop::SLessEqual => ValueRange { min: 0, max: 1 },
+
                     IntBinop::Add => {
                         let a = self.range(lhs, depth + 1);
                         let b = self.range(rhs, depth + 1);
@@ -281,6 +282,11 @@ impl Solver<'_> {
                     _ => top,
                 }
             }
+
+            Mnemonic::Unop(Unary {
+                op: Unop::BoolNot, ..
+            }) => ValueRange { min: 0, max: 1 },
+
             // Zero-extension preserves the unsigned value, and the source
             // interval always fits in the wider output mask.
             Mnemonic::Zext(z) => self.range(z.src, depth + 1),
@@ -298,6 +304,7 @@ impl Solver<'_> {
                 let src = self.range(r.src, depth + 1);
                 if src.max <= mask { src } else { top }
             }
+
             // Loads, calls, unops, ... : opaque.
             _ => top,
         }

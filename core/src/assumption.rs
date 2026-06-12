@@ -46,6 +46,10 @@ pub enum Proposition {
     /// Function hands a pointer into its own frame to an unbounded-reading
     /// callee, so its own frame must stay in memory.
     FrameEscapingCaller(FunctionId),
+    /// The `size` bytes at virtual address `addr` (a jump-table entry the
+    /// jump-table resolver read out of read-only data) are assumed never
+    /// written at runtime; a write would invalidate the resolved jump target.
+    ImmutableMemory { addr: u64, size: u8 },
 }
 
 /// How certain we are about a proposition's recorded value.

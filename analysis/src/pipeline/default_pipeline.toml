@@ -35,6 +35,14 @@ name = "gvn"
 scope = "function"
 passes = ["gvn"]
 
+# Resolve jump tables now that gvn has const-folded the dispatch address into the
+# recognizable `table_base + index*scale` + load shape, so the indirect branch
+# gains real CFG successors before the binding and cleanup stages run.
+[[stage]]
+name = "jump-tables"
+scope = "function"
+passes = ["handle_jump_tables"]
+
 # Simplify so the lifter's straight-line goto-chains are merged into single
 # blocks: the binder forwards each call's argument loads to the reaching
 # arg-setup store via gvn's intra-block forwarding, so store and call must share

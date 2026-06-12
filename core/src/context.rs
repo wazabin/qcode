@@ -2,7 +2,7 @@
 
 use std::{
     borrow::Cow,
-    collections::{HashMap, HashSet},
+    collections::{BTreeSet, HashMap, HashSet},
     fmt::Display,
 };
 
@@ -79,6 +79,21 @@ pub struct Context<'str> {
 
     /// Type registry: owns all [`Type`] objects and hands out [`TypeId`]s.
     pub types: TypeManager,
+
+    /// Initialized memory of the loaded binary (read-only data, code, …),
+    /// populated by the lifter. Lets analysis passes read constants such as
+    /// jump-table entries straight out of `.rodata` without the loader-side
+    /// `BinaryFormat`. Empty for synthetically-built contexts.
+    pub memory_image: crate::memory_image::MemoryImage,
+
+    /// `(function_entry_addr, target_addr)` pairs resolved by the jump-table
+    /// pass but that may not yet have been disassembled. `qcode_analysis` cannot
+    /// call the lifter (one-way crate dependency), so it records discovered
+    /// targets here; the harbinger re-lift loop drains them, lifts the new code
+    /// into the baseline, and re-analyzes. Rides through clone (so it survives
+    /// the checkpoint+replay rounds) and serialization.
+    #[serde(default)]
+    discovered_code: BTreeSet<(u64, u64)>,
 }
 
 impl<'str> Context<'str> {
@@ -141,6 +156,40 @@ impl<'str> Context<'str> {
             addr_size,
             ty: crate::space::SpaceType::Temporary,
         })
+    }
+
+    /// Read `n` bytes of initialized binary memory at virtual address `addr`,
+    /// or `None` if any byte is unmapped. See [`MemoryImage::read_bytes`].
+    ///
+    /// [`MemoryImage::read_bytes`]: crate::memory_image::MemoryImage::read_bytes
+    pub fn read_bytes(&self, addr: u64, n: usize) -> Option<Vec<u8>> {
+        self.memory_image.read_bytes(addr, n)
+    }
+
+    /// Read a little-endian unsigned integer of `size` bytes from initialized
+    /// binary memory at `addr`. See [`MemoryImage::read_uint`].
+    ///
+    /// [`MemoryImage::read_uint`]: crate::memory_image::MemoryImage::read_uint
+    pub fn read_uint(&self, addr: u64, size: usize) -> Option<u64> {
+        self.memory_image.read_uint(addr, size)
+    }
+
+    /// True if `addr` lies in an executable region of the loaded binary.
+    pub fn is_executable_addr(&self, addr: u64) -> bool {
+        self.memory_image.is_executable(addr)
+    }
+
+    /// Records that the jump-table pass resolved a branch in the function at
+    /// `func_entry` to a `target` that may not yet be disassembled. The
+    /// harbinger re-lift loop drains these via [`discovered_code`](Self::discovered_code).
+    pub fn discover_code(&mut self, func_entry: u64, target: u64) {
+        self.discovered_code.insert((func_entry, target));
+    }
+
+    /// Iterates the `(function_entry_addr, target_addr)` pairs recorded by
+    /// [`discover_code`](Self::discover_code).
+    pub fn discovered_code(&self) -> impl Iterator<Item = (u64, u64)> + '_ {
+        self.discovered_code.iter().copied()
     }
 
     /// Returns the [`BlockId`] for a block at `addr`, creating one if needed.
@@ -1089,6 +1138,23 @@ mod tests {
             "re-proving a seed is not novel"
         );
         assert!(ctx.violations().is_empty());
+    }
+
+    #[test]
+    fn discovered_code_records_and_survives_round_trip() {
+        let mut ctx = Context::new();
+        ctx.discover_code(0x1000, 0x1100);
+        ctx.discover_code(0x1000, 0x1200);
+        ctx.discover_code(0x1000, 0x1100); // duplicate is deduped
+
+        let pairs: Vec<_> = ctx.discovered_code().collect();
+        assert_eq!(pairs, vec![(0x1000, 0x1100), (0x1000, 0x1200)]);
+
+        let config = bincode::config::standard();
+        let bytes = bincode::serde::encode_to_vec(&ctx, config).expect("encode");
+        let (restored, _): (Context<'static>, usize) =
+            bincode::serde::decode_from_slice(&bytes, config).expect("decode");
+        assert_eq!(restored.discovered_code().collect::<Vec<_>>(), pairs);
     }
 
     #[test]
