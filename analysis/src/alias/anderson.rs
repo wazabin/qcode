@@ -2,11 +2,7 @@ use std::collections::HashMap;
 
 use qcode::{
     context::Context,
-    value::{
-        ValueId,
-        function::FunctionSignature,
-        insn::{Binop, FloatBinop, IntBinop, Mnemonic},
-    },
+    value::{ValueId, function::FunctionSignature, insn::Mnemonic},
 };
 
 use super::{AliasResult, NodeId};
@@ -164,22 +160,6 @@ fn apply_sig(state: &mut SteensgaardState, sig: &FunctionSignature) {
     }
 }
 
-fn is_comparison(op: &Binop) -> bool {
-    matches!(
-        op,
-        Binop::Int(
-            IntBinop::Equal
-                | IntBinop::NotEqual
-                | IntBinop::Less
-                | IntBinop::SLess
-                | IntBinop::LessEqual
-                | IntBinop::SLessEqual
-        ) | Binop::Float(
-            FloatBinop::Equal | FloatBinop::NotEqual | FloatBinop::Less | FloatBinop::LessEqual
-        )
-    )
-}
-
 /// Run Steensgaard's flow-insensitive alias analysis over all instructions in
 /// `ctx` and return an [`AliasResult`] that answers [`AliasResult::may_alias`]
 /// queries.
@@ -236,7 +216,7 @@ pub fn alias_analysis(ctx: &Context) -> AliasResult {
             }
 
             // r = Binop { lhs, rhs } (non-comparison) => node(r) == node(lhs), node(r) == node(rhs)
-            Mnemonic::Binop(bin) if size > 0 && !is_comparison(&bin.op) => {
+            Mnemonic::Binop(bin) if size > 0 && !bin.op.is_comparison() => {
                 let r = state.node_for(result_id);
                 let l = state.node_for(bin.lhs);
                 let rh = state.node_for(bin.rhs);

@@ -644,16 +644,18 @@ impl<'str, 'ctx> Builder<'str, 'ctx> {
             (false, true, false) => rhs_size,
             (false, false, true) => lhs_size,
             (false, true, true) => lhs_size.max(rhs_size),
-            // Two non-literal operands of differing size. This is legitimate for
-            // shifts (the shift amount may be wider than the value) and also
-            // occurs for some lifted comparisons. Neither operand is a literal,
-            // so `coerce_literal_size` below is a no-op; we keep both operands as
-            // emitted and let the result type derive from the lhs, matching the
-            // historical tolerant behaviour the emulator already relies on.
+            // Two non-literal operands of differing size cannot be repaired here
+            // without choosing a semantic cast. Lifters should emit explicit
+            // zext/sext/range operations before constructing the binop.
             (false, false, false) => lhs_size,
         };
         let lhs = self.coerce_literal_size(lhs, operand_size);
         let rhs = self.coerce_literal_size(rhs, operand_size);
+        assert_eq!(
+            ValueRef::new(lhs, self.context()).size(),
+            ValueRef::new(rhs, self.context()).size(),
+            "push_binop: operands must have equal size; emit an explicit cast first"
+        );
 
         // Determine result type using the TypeManager's arithmetic rules.
         let result_type = {
