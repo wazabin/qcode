@@ -155,6 +155,26 @@ pub fn verify_assumptions(ctx: &mut Context) -> usize {
     novel
 }
 
+/// Re-prove user-forced `FunctionReturns` facts against the function body.
+///
+/// [`verify_assumptions`] only checks propositions still in the *assumed* state,
+/// so a user override (seeded as *known*) is otherwise never validated. This
+/// proves each forced `FunctionReturns` override and records a
+/// [`KnownContradiction`](qcode::assumption::KnownContradiction) on the context
+/// when the forced polarity disagrees with the body — the driver's signal to
+/// abort with an error rather than silently honor an impossible override.
+pub fn verify_forced_returns(ctx: &mut Context, overrides: &HashMap<Proposition, bool>) {
+    let _scope = pass_scope::enter("verify_assumptions");
+    for &prop in overrides.keys() {
+        if let Proposition::FunctionReturns(f) = prop {
+            let returns = function_returns(ctx, f);
+            // Same value: no-op. Opposite of the forced known fact: records a
+            // known-contradiction (set_known keeps the original known value).
+            ctx.set_known(prop, returns);
+        }
+    }
+}
+
 /// Whether `f` is assumed to return to its caller.
 ///
 /// v1 rule (edge-independent, hence monotone): a function returns iff its body

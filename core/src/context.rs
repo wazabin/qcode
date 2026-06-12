@@ -7,7 +7,7 @@ use std::{
 };
 
 use crate::{
-    assumption::{Certainty, PassName, Proposition, Truth, Violation},
+    assumption::{Certainty, KnownContradiction, PassName, Proposition, Truth, Violation},
     error::{Error, ErrorTy, Result},
     pass_scope,
     space::{Space, SpaceId},
@@ -266,12 +266,20 @@ impl<'str> Context<'str> {
         let pass = PassName(pass_scope::current_pass());
         let novel = match self.values.truths.get(&prop) {
             Some(prior) => {
-                debug_assert!(
-                    !(prior.certainty == Certainty::Known && prior.value != value),
-                    "{prop:?}: {pass} proves {value} but {} already proved {}",
-                    prior.pass,
-                    prior.value,
-                );
+                // Proving the opposite of an already-*known* fact (e.g. a user
+                // override the analysis disproves) is not a replay signal: record
+                // it as a hard contradiction and keep the original known value so
+                // the driver can surface an error and terminate.
+                if prior.certainty == Certainty::Known && prior.value != value {
+                    self.values.known_contradictions.push(KnownContradiction {
+                        prop,
+                        known: prior.value,
+                        proven: value,
+                        known_pass: prior.pass,
+                        proven_pass: pass,
+                    });
+                    return false;
+                }
                 if prior.certainty == Certainty::Assumed && prior.value != value {
                     self.values.violations.push(Violation {
                         prop,
@@ -342,6 +350,13 @@ impl<'str> Context<'str> {
     /// assumption). Non-empty means derived IR may be wrong: replay.
     pub fn violations(&self) -> &[Violation] {
         &self.values.violations
+    }
+
+    /// Facts proven this round that contradicted an existing *known* fact (e.g. a
+    /// user override the analysis disproved). Non-empty means the analysis cannot
+    /// honor the forced value; the driver surfaces this as a hard error.
+    pub fn known_contradictions(&self) -> &[KnownContradiction] {
+        &self.values.known_contradictions
     }
 
     /// Returns the raw `u64` backing value of the literal `id`.

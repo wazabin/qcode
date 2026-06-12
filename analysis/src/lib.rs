@@ -1,5 +1,7 @@
 pub mod assumptions;
-pub use assumptions::{analyze_with_assumptions, assume_call_returns, verify_assumptions};
+pub use assumptions::{
+    analyze_with_assumptions, assume_call_returns, verify_assumptions, verify_forced_returns,
+};
 
 pub mod brighten;
 pub use brighten::brighten_stack;

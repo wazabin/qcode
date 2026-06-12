@@ -1,5 +1,5 @@
 use crate::{
-    assumption::{Proposition, Truth, Violation},
+    assumption::{KnownContradiction, Proposition, Truth, Violation},
     types::TypeId,
     value::{
         ValueId,
@@ -64,6 +64,12 @@ pub struct ValueRegistry<'str> {
     /// Proven facts that contradicted an assumption this round; non-empty means
     /// the checkpoint+replay driver must discard this working copy and replay.
     pub(crate) violations: Vec<Violation>,
+
+    /// Proven facts that contradicted an existing *known* fact this round (e.g. a
+    /// user override the analysis disproved). A hard error for the driver, not a
+    /// replay signal. Transient per round, so not serialized.
+    #[serde(default, skip)]
+    pub(crate) known_contradictions: Vec<KnownContradiction>,
 
     /// Reverse use-def map: for each `ValueId`, the list of instructions that
     /// use it as an operand. Kept in sync by [`push_insn`](Self::push_insn),

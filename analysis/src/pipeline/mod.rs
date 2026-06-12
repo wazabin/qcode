@@ -29,7 +29,41 @@ use qcode::{
     value::{RegisterId, ValueId, VarnodeId},
 };
 
-use crate::{assume_call_returns, learn_stack_facts, seed_stack_facts, verify_assumptions};
+use crate::{
+    assume_call_returns, learn_stack_facts, seed_stack_facts, verify_assumptions,
+    verify_forced_returns,
+};
+
+/// Maximum checkpoint+replay rounds the overrides-aware driver attempts before
+/// giving up with [`PipelineError::NoConvergence`].
+const MAX_OVERRIDE_ROUNDS: usize = 5;
+
+/// Failure modes of [`analyze_with_overrides_with_progress`].
+#[derive(Debug, Clone)]
+pub enum PipelineError {
+    /// A user-forced fact was disproved by analysis: the forced value and the
+    /// proven value disagree irreconcilably.
+    Contradiction(qcode::assumption::KnownContradiction),
+    /// The checkpoint+replay loop did not converge within the round cap.
+    NoConvergence { rounds: usize },
+}
+
+impl std::fmt::Display for PipelineError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            PipelineError::Contradiction(c) => write!(
+                f,
+                "forced assumption rejected: {:?} was set to {} but {} proved {}",
+                c.prop, c.known, c.proven_pass, c.proven,
+            ),
+            PipelineError::NoConvergence { rounds } => {
+                write!(f, "analysis did not converge after {rounds} rounds")
+            }
+        }
+    }
+}
+
+impl std::error::Error for PipelineError {}
 
 /// The architecture-specific registers the register-aware passes need.
 ///
@@ -208,6 +242,95 @@ pub fn analyze_with_pipeline_with_progress<'s>(
             return ctx;
         }
         knowledge.extend(ctx.known_facts());
+    }
+}
+
+/// Like [`analyze_with_pipeline_with_progress`], but seeds a set of user-forced
+/// `overrides` as known facts before round 1 and keeps them authoritative across
+/// replays. Used by the GUI assumption panel: a user can pin a proposition to a
+/// value and rerun.
+///
+/// An override is treated exactly like a machine-proven known fact. If analysis
+/// disproves one (a [`KnownContradiction`](qcode::assumption::KnownContradiction)),
+/// or the loop fails to converge within [`MAX_OVERRIDE_ROUNDS`], the driver
+/// returns a [`PipelineError`] instead of looping or panicking.
+pub fn analyze_with_overrides_with_progress<'s>(
+    baseline: &Context<'s>,
+    cfg: &ArchConfig,
+    pipeline: &Pipeline,
+    overrides: &HashMap<Proposition, bool>,
+    mut progress: impl FnMut(PipelineProgress),
+) -> Result<Context<'s>, PipelineError> {
+    let env = PipelineEnv::new(baseline, cfg.clone());
+    let mut knowledge: HashMap<Proposition, bool> = overrides.clone();
+    let mut round = 0usize;
+
+    progress(PipelineProgress::Started);
+    loop {
+        round += 1;
+        progress(PipelineProgress::AssumptionRound { round });
+        log::info!(target: "pipeline", "assumption round {round} starting");
+        let started = std::time::Instant::now();
+
+        let mut ctx = baseline.clone();
+        for (&prop, &value) in &knowledge {
+            ctx.seed_known(prop, value);
+        }
+        let count = assume_call_returns(&mut ctx);
+        seed_stack_facts(&mut ctx);
+        progress(PipelineProgress::AssumptionsRecorded { round, count });
+
+        pipeline
+            .run(&mut ctx, &env, round, &mut progress)
+            .unwrap_or_else(|e| panic!("pipeline pass failed: {e}"));
+
+        progress(PipelineProgress::WholeProgramPhase {
+            round,
+            stage: "verify".into(),
+            pass: "verify_assumptions",
+        });
+        let novel = verify_assumptions(&mut ctx) + learn_stack_facts(&mut ctx);
+        // verify_assumptions skips facts already *known* (the overrides), so check
+        // each forced FunctionReturns against the body explicitly.
+        verify_forced_returns(&mut ctx, overrides);
+
+        // A user override the analysis disproved cannot be honored — abort.
+        if let Some(c) = ctx.known_contradictions().first() {
+            log::warn!(
+                target: "pipeline",
+                "round {round}: forced {:?}={} rejected by {} (proved {})",
+                c.prop, c.known, c.proven_pass, c.proven,
+            );
+            return Err(PipelineError::Contradiction(*c));
+        }
+
+        for v in ctx.violations() {
+            log::info!(
+                target: "pipeline",
+                "round {round}: {} violated {:?} (assumed {} by {}, proven {})",
+                v.asserting_pass, v.prop, v.assumed, v.assuming_pass, !v.assumed,
+            );
+        }
+        log_round_stats(round);
+        log::info!(
+            target: "pipeline",
+            "round {round} finished in {:.2?}: {novel} novel facts, {} violations",
+            started.elapsed(),
+            ctx.violations().len(),
+        );
+
+        if novel == 0 && ctx.violations().is_empty() {
+            progress(PipelineProgress::Finished);
+            return Ok(ctx);
+        }
+        if round >= MAX_OVERRIDE_ROUNDS {
+            return Err(PipelineError::NoConvergence { rounds: round });
+        }
+        knowledge.extend(ctx.known_facts());
+        // Keep the user's overrides authoritative over anything learned this round.
+        for (&prop, &value) in overrides {
+            knowledge.insert(prop, value);
+        }
     }
 }
 

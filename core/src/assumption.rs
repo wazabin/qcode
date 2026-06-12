@@ -85,6 +85,25 @@ pub struct Violation {
     pub asserting_pass: PassName,
 }
 
+/// A proven fact that contradicted an existing *known* fact (as opposed to a
+/// mere assumption). Unlike a [`Violation`], this is not a replay signal — it
+/// means two verification results, or a user-forced override and a verification
+/// result, disagree irreconcilably. The checkpoint+replay driver surfaces it as
+/// a hard error rather than looping.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct KnownContradiction {
+    /// The proposition proven two different ways.
+    pub prop: Proposition,
+    /// The value already recorded as known (e.g. a user override).
+    pub known: bool,
+    /// The value a later pass proved (the negation of `known`).
+    pub proven: bool,
+    /// The pass that recorded the original known fact.
+    pub known_pass: PassName,
+    /// The pass that proved the contradicting value.
+    pub proven_pass: PassName,
+}
+
 /// A pass name, as recorded on truth-map entries. A transparent `&'static str`
 /// wrapper: serde's derive would otherwise tie the deserializer lifetime to
 /// `'static`, so it gets manual impls — serialized as a string, deserialized by
