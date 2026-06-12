@@ -4,9 +4,10 @@
 //! Passes implement the [`pass`] traits and are registered by name; the pass
 //! order, scopes, and fixpoints live in `default_pipeline.toml` (parsed by
 //! [`config`]). The checkpoint+replay loop in [`analyze_with_pipeline`] stays in
-//! Rust: each round clones the baseline IR, asserts call-return assumptions from
-//! accumulated knowledge, runs the configured [`Pipeline`], verifies the
-//! assumptions, and replays from baseline until no new noreturn facts are found.
+//! Rust: each round clones the baseline IR, seeds the facts proven in earlier
+//! rounds, records call-return assumptions, runs the configured [`Pipeline`],
+//! verifies the assumptions, and replays from baseline until a round proves no
+//! novel fact and records no violation.
 //!
 //! `qcode_analysis` does not depend on any architecture crate, so the
 //! architecture-specific registers the register-aware passes need are injected
@@ -20,8 +21,10 @@ pub use pass::{
     DynFunctionPass, DynPass, FunctionPass, Pass, PassRegistration, PipelineEnv, RegisteredPass,
 };
 
+use std::collections::HashMap;
+
 use qcode::{
-    assumption::AssumptionKnowledge,
+    assumption::Proposition,
     context::Context,
     value::{RegisterId, ValueId, VarnodeId},
 };
@@ -149,19 +152,24 @@ pub fn analyze_with_pipeline_with_progress<'s>(
     mut progress: impl FnMut(PipelineProgress),
 ) -> Context<'s> {
     let env = PipelineEnv::new(baseline, cfg.clone());
-    let mut knowledge = AssumptionKnowledge::default();
+    let mut knowledge: HashMap<Proposition, bool> = HashMap::new();
     let mut round = 0usize;
 
     progress(PipelineProgress::Started);
     loop {
         round += 1;
         progress(PipelineProgress::AssumptionRound { round });
+        log::info!(target: "pipeline", "assumption round {round} starting");
+        let started = std::time::Instant::now();
 
         let mut ctx = baseline.clone();
-        let count = assume_call_returns(&mut ctx, &knowledge);
-        // Re-apply the stack-escape facts learned in earlier rounds so this round's
+        for (&prop, &value) in &knowledge {
+            ctx.seed_known(prop, value);
+        }
+        let count = assume_call_returns(&mut ctx);
+        // Re-apply the stack-escape facts proven in earlier rounds so this round's
         // mem2reg/summary passes observe them (mirrors `assume_call_returns`).
-        seed_stack_facts(&mut ctx, &knowledge);
+        seed_stack_facts(&mut ctx);
         progress(PipelineProgress::AssumptionsRecorded { round, count });
 
         pipeline
@@ -173,21 +181,46 @@ pub fn analyze_with_pipeline_with_progress<'s>(
             stage: "verify".into(),
             pass: "verify_assumptions",
         });
-        let learned = verify_assumptions(&mut ctx);
-        let (readers, escapers) = learn_stack_facts(&ctx);
+        // Converge only once a round proves no novel fact — a violated
+        // call-return assumption, a newly-learned unbounded stack reader, or a
+        // frame-escaping caller all change what earlier passes would have done,
+        // so the round must replay with the fact seeded. Knowledge only grows,
+        // hence termination.
+        let novel = verify_assumptions(&mut ctx) + learn_stack_facts(&mut ctx);
 
-        // Converge only once no round produces a new noreturn fact *and* no new
-        // stack-escape fact — a newly-learned unbounded reader or frame-escaping
-        // caller changes how a later round promotes the stack, so it must replay.
-        let no_new_noreturn = learned.iter().all(|f| knowledge.noreturn.contains(f));
-        let no_new_readers = readers.is_subset(&knowledge.unbounded_stack_readers);
-        let no_new_escapers = escapers.is_subset(&knowledge.frame_escaping_callers);
-        if no_new_noreturn && no_new_readers && no_new_escapers {
+        for v in ctx.violations() {
+            log::info!(
+                target: "pipeline",
+                "round {round}: {} violated {:?} (assumed {} by {}, proven {})",
+                v.asserting_pass, v.prop, v.assumed, v.assuming_pass, !v.assumed,
+            );
+        }
+        log_round_stats(round);
+        log::info!(
+            target: "pipeline",
+            "round {round} finished in {:.2?}: {novel} novel facts, {} violations",
+            started.elapsed(),
+            ctx.violations().len(),
+        );
+
+        if novel == 0 && ctx.violations().is_empty() {
             progress(PipelineProgress::Finished);
             return ctx;
         }
-        knowledge.noreturn.extend(learned);
-        knowledge.unbounded_stack_readers.extend(readers);
-        knowledge.frame_escaping_callers.extend(escapers);
+        knowledge.extend(ctx.known_facts());
     }
+}
+
+/// Drain the per-pass counters accumulated during this round (via
+/// [`qcode::stat!`]) and log them as one `debug` table.
+fn log_round_stats(round: usize) {
+    let stats = qcode::pass_scope::drain_stats();
+    if stats.is_empty() || !log::log_enabled!(target: "pipeline", log::Level::Debug) {
+        return;
+    }
+    let mut table = String::new();
+    for ((pass, key), n) in stats {
+        table.push_str(&format!("\n  {pass:<24} {key:<32} {n}"));
+    }
+    log::debug!(target: "pipeline", "round {round} statistics:{table}");
 }

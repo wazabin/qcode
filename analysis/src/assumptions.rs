@@ -1,26 +1,24 @@
 //! Reasonable-assumption analysis passes and the checkpoint+replay driver.
 //!
 //! - [`assume_call_returns`] is the *make* pass: it connects the fall-through of
-//!   every returning call with a real CFG edge and records a
-//!   [`CallReturns`](qcode::assumption::AssumptionKind::CallReturns) assumption.
-//! - [`verify_assumptions`] is the *verify* pass: it checks each recorded
-//!   assumption against its callee and reports any newly-proven noreturn facts.
+//!   every returning call with a real CFG edge after recording a
+//!   [`Proposition::FunctionReturns`] assumption (skipping callees already
+//!   known noreturn — the assume itself refuses).
+//! - [`verify_assumptions`] is the *verify* pass: it proves each assumed
+//!   `FunctionReturns` proposition true or false via
+//!   [`Context::set_known`](qcode::context::Context::set_known); a
+//!   contradiction records a violation on the context.
 //! - [`analyze_with_assumptions`] wraps a caller-supplied set of dependent
 //!   passes in whole-program checkpoint+replay so a violated assumption leaves
 //!   no derived residue (see [`qcode::assumption`]).
 
-use std::collections::HashSet;
+use std::collections::HashMap;
 
 use qcode::{
-    assumption::{
-        AssumptionId, AssumptionKind, AssumptionKnowledge, AssumptionStatus, CallReturnsAssumption,
-    },
+    assumption::Proposition,
     context::Context,
-    value::{
-        BasicBlock, Function, FunctionId, Instruction,
-        block::BlockId,
-        insn::{InstructionId, Mnemonic},
-    },
+    pass_scope,
+    value::{BasicBlock, Function, FunctionId, Instruction, block::BlockId, insn::Mnemonic},
 };
 
 /// Callees that, by convention, do not return. Used to classify external stubs
@@ -45,19 +43,20 @@ const NORETURN_NAMES: &[&str] = &[
 
 /// *Make* pass — record call-return assumptions across the whole program.
 ///
-/// For every block that ends in a direct `Call` whose callee is not already
-/// known noreturn, this connects the call block to its fall-through
-/// continuation with a CFG edge and records an
-/// [`Unverified`](AssumptionStatus::Unverified) assumption. The continuation is
-/// the block in the same function with the smallest address strictly greater
-/// than the call instruction's address — robustly the instruction after the
-/// call, since nothing can start inside the call's bytes.
+/// For every block that ends in a direct `Call`, this assumes
+/// [`Proposition::FunctionReturns`] for the callee and, if the assumption is
+/// admissible (not already known/assumed noreturn), connects the call block to
+/// its fall-through continuation with a CFG edge. The continuation is the
+/// block in the same function with the smallest address strictly greater than
+/// the call instruction's address — robustly the instruction after the call,
+/// since nothing can start inside the call's bytes.
 ///
 /// Idempotent: a call block that already has a successor edge is skipped.
 /// `CallInd` is skipped in v1 (callee unknown).
 ///
-/// Returns the number of assumptions recorded.
-pub fn assume_call_returns(ctx: &mut Context, knowledge: &AssumptionKnowledge) -> usize {
+/// Returns the number of continuation edges added.
+pub fn assume_call_returns(ctx: &mut Context) -> usize {
+    let _scope = pass_scope::enter("assume_call_returns");
     let func_ids: Vec<FunctionId> = ctx.functions().map(|f| f.id).collect();
     let mut count = 0;
 
@@ -76,9 +75,9 @@ pub fn assume_call_returns(ctx: &mut Context, knowledge: &AssumptionKnowledge) -
             .collect();
         addressed.sort_by_key(|(a, _)| *a);
 
-        // (call_block, call_site, callee, continuation) to materialise after the
+        // (call_block, callee, continuation) to materialise after the
         // read-only scan releases its borrow of `ctx`.
-        let mut edits: Vec<(BlockId, InstructionId, FunctionId, BlockId)> = Vec::new();
+        let mut edits: Vec<(BlockId, FunctionId, BlockId)> = Vec::new();
 
         for &call_block in &block_ids {
             let Some(&call_site) = ctx.values.basic_blocks[call_block].instructions.last() else {
@@ -88,9 +87,6 @@ pub fn assume_call_returns(ctx: &mut Context, knowledge: &AssumptionKnowledge) -
                 Mnemonic::Call(call) => call.target,
                 _ => continue,
             };
-            if knowledge.is_noreturn(callee) {
-                continue;
-            }
             // Idempotency: don't double-connect an already-linked call block.
             if BasicBlock::from_id(ctx, call_block)
                 .successors()
@@ -105,58 +101,58 @@ pub fn assume_call_returns(ctx: &mut Context, knowledge: &AssumptionKnowledge) -
             let Some(&(_, continuation)) = addressed.iter().find(|(a, _)| *a > call_addr) else {
                 continue;
             };
-            edits.push((call_block, call_site, callee, continuation));
+            edits.push((call_block, callee, continuation));
         }
 
-        for (call_block, call_site, callee, continuation) in edits {
-            let continuation_edge = ctx.add_cfg_edge(call_block, continuation);
-            ctx.add_assumption(AssumptionKind::CallReturns(CallReturnsAssumption {
-                callee,
-                call_site,
-                call_block,
-                continuation,
-                continuation_edge,
-            }));
+        for (call_block, callee, continuation) in edits {
+            // Refused when the callee is already known (or assumed) noreturn.
+            if !ctx.assume_true(Proposition::FunctionReturns(callee)) {
+                qcode::pass_log!(trace, "callee {callee:?} is noreturn, not linking");
+                continue;
+            }
+            ctx.add_cfg_edge(call_block, continuation);
             count += 1;
         }
     }
 
+    qcode::stat!("call_return_edges", count as u64);
     count
 }
 
-/// *Verify* pass — check every unverified assumption against its callee.
+/// *Verify* pass — prove every assumed `FunctionReturns` proposition.
 ///
-/// Each assumption is flipped to [`Confirmed`](AssumptionStatus::Confirmed) or
-/// [`Violated`](AssumptionStatus::Violated). On violation the continuation edge
-/// is removed (best-effort, for single-pass use) and the callee is added to the
-/// returned set of newly-proven noreturn functions — the facts the
-/// checkpoint+replay driver feeds back into the next round.
-pub fn verify_assumptions(ctx: &mut Context) -> HashSet<FunctionId> {
-    let mut learned = HashSet::new();
+/// Each assumed callee is checked with [`function_returns`] and the result
+/// recorded via [`Context::set_known`](Context::set_known); a contradiction
+/// (an assumed-returning callee proven noreturn) lands in
+/// [`Context::violations`](Context::violations), the replay driver's signal.
+///
+/// Returns the number of newly-proven facts (novel knowledge).
+pub fn verify_assumptions(ctx: &mut Context) -> usize {
+    let _scope = pass_scope::enter("verify_assumptions");
 
-    let unverified: Vec<AssumptionId> = ctx
-        .assumptions()
-        .filter(|(_, a)| a.status == AssumptionStatus::Unverified)
-        .map(|(id, _)| id)
+    let assumed: Vec<FunctionId> = ctx
+        .truths()
+        .filter(|(_, t)| t.certainty == qcode::assumption::Certainty::Assumed)
+        .filter_map(|(p, _)| match p {
+            Proposition::FunctionReturns(f) => Some(f),
+            _ => None,
+        })
         .collect();
 
-    for id in unverified {
-        let AssumptionKind::CallReturns(call) = &ctx.assumption(id).kind else {
-            continue;
-        };
-        let callee = call.callee;
-        let continuation_edge = call.continuation_edge;
-
-        if function_returns(ctx, callee) {
-            ctx.set_assumption_status(id, AssumptionStatus::Confirmed);
-        } else {
-            ctx.set_assumption_status(id, AssumptionStatus::Violated);
-            ctx.remove_cfg_edge(continuation_edge);
-            learned.insert(callee);
+    let mut novel = 0;
+    for callee in assumed {
+        let returns = function_returns(ctx, callee);
+        if ctx.set_known(Proposition::FunctionReturns(callee), returns) {
+            novel += 1;
+            qcode::pass_log!(
+                debug,
+                "proved {} {}",
+                Function::from_id(ctx, callee).name(),
+                if returns { "returns" } else { "noreturn" },
+            );
         }
     }
-
-    learned
+    novel
 }
 
 /// Whether `f` is assumed to return to its caller.
@@ -198,27 +194,31 @@ fn is_noreturn_name(name: &str) -> bool {
 /// checkpoint+replay.
 ///
 /// `baseline` is the freshly-lifted IR (no speculation). Each round clones it,
-/// pins already-proven facts, records call-return assumptions, runs the
-/// caller-supplied `run_dependent` passes (mem2reg, gvn, dce, …) on the assumed
-/// edges, then verifies. If verification proves a *new* noreturn callee, the
-/// working copy is discarded and the round replays with the fact pinned;
-/// knowledge only grows, so the loop terminates. Returns the converged Context.
+/// seeds the facts proven in earlier rounds, records call-return assumptions,
+/// runs the caller-supplied `run_dependent` passes (mem2reg, gvn, dce, …) on
+/// the assumed edges, then verifies. If the round recorded a violation or
+/// proved a novel fact, the working copy is discarded and the round replays
+/// with the knowledge seeded; knowledge only grows, so the loop terminates.
+/// Returns the converged Context.
 pub fn analyze_with_assumptions<'str>(
     baseline: &Context<'str>,
     mut run_dependent: impl FnMut(&mut Context<'str>),
 ) -> Context<'str> {
-    let mut knowledge = AssumptionKnowledge::default();
+    let mut knowledge: HashMap<Proposition, bool> = HashMap::new();
 
     loop {
         let mut ctx = baseline.clone();
-        assume_call_returns(&mut ctx, &knowledge);
+        for (&prop, &value) in &knowledge {
+            ctx.seed_known(prop, value);
+        }
+        assume_call_returns(&mut ctx);
         run_dependent(&mut ctx);
-        let learned = verify_assumptions(&mut ctx);
+        let novel = verify_assumptions(&mut ctx);
 
-        if learned.iter().all(|f| knowledge.noreturn.contains(f)) {
+        if novel == 0 && ctx.violations().is_empty() {
             return ctx;
         }
-        knowledge.noreturn.extend(learned);
+        knowledge.extend(ctx.known_facts());
     }
 }
 

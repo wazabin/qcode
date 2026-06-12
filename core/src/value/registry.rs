@@ -1,5 +1,5 @@
 use crate::{
-    assumption::{Assumption, AssumptionId},
+    assumption::{Proposition, Truth, Violation},
     types::TypeId,
     value::{
         ValueId,
@@ -55,14 +55,15 @@ pub struct ValueRegistry<'str> {
     /// Function storage.
     pub functions: Registry<FunctionId, Function<'str>>,
 
-    /// Heuristic assumption ledger (see [`crate::assumption`]).
-    pub assumptions: Registry<AssumptionId, Assumption>,
+    /// Truth map of the assumption system: what each [`Proposition`] is
+    /// currently assumed or known to be (see [`crate::assumption`]). Accessed
+    /// through [`Context::assume_true`](crate::context::Context::assume_true)
+    /// and friends.
+    pub(crate) truths: HashMap<Proposition, Truth>,
 
-    /// Reverse index: callee `FunctionId` -> assumptions predicting it. Used by
-    /// the verification pass to find every assumption to check when a function
-    /// is analyzed. Kept in sync by
-    /// [`Context::add_assumption`](crate::context::Context::add_assumption).
-    pub(crate) assumptions_by_callee: HashMap<FunctionId, Vec<AssumptionId>>,
+    /// Proven facts that contradicted an assumption this round; non-empty means
+    /// the checkpoint+replay driver must discard this working copy and replay.
+    pub(crate) violations: Vec<Violation>,
 
     /// Reverse use-def map: for each `ValueId`, the list of instructions that
     /// use it as an operand. Kept in sync by [`push_insn`](Self::push_insn),

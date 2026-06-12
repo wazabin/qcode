@@ -15,6 +15,7 @@ jstd.workspace = true
 pest.workspace = true
 qcode_macro.workspace = true
 serde.workspace = true
+log.workspace = true
 
 [dev-dependencies]
 bincode.workspace = true

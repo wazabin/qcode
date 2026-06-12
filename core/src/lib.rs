@@ -96,9 +96,14 @@ pub mod assumption;
 pub mod builder;
 pub mod context;
 pub mod error;
+pub mod pass_scope;
 pub mod space;
 pub mod types;
 pub mod value;
 
 #[cfg(any(test, feature = "testing"))]
 pub mod testing;
+
+/// Re-export for the [`pass_log!`] macro; not public API.
+#[doc(hidden)]
+pub use log as __log;

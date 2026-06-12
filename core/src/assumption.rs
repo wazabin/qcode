@@ -1,130 +1,125 @@
-//! Heuristic *assumptions* made during analysis, and a [`AssumptionKnowledge`]
-//! base that survives checkpoint+replay.
+//! Heuristic *assumptions* and proven *knowledge* shared by analysis passes.
 //!
-//! An analysis pass may make a *reasonable assumption* about a value before it
-//! has been proven — for example, that a called function returns normally to the
-//! instruction after the `call`. Each such guess is recorded in a side ledger
-//! (an arena on [`ValueRegistry`](crate::value::registry::ValueRegistry)), keyed
-//! by the entity it predicts (a callee [`FunctionId`]). When that entity is
-//! later analyzed, a verification pass flips the assumption to
-//! [`Confirmed`](AssumptionStatus::Confirmed) or
-//! [`Violated`](AssumptionStatus::Violated).
+//! A [`Proposition`] is a positive statement about the program ("function `f`
+//! returns to its caller"). During analysis each proposition can be in one of
+//! four states, tracked by a [`Truth`] in a single map on the
+//! [`Context`](crate::context::Context):
 //!
-//! Because analysis passes mutate the [`Context`](crate::context::Context) arena
-//! in place, a *wrong* assumption leaves behind IR that is now incorrect. The
-//! invalidation strategy is **checkpoint + replay**: a freshly-lifted baseline
-//! `Context` is cloned before any speculative analysis, and on a violation the
-//! whole pipeline is replayed from that baseline with the newly-learned fact
-//! pinned in an [`AssumptionKnowledge`]. Knowledge only ever grows, so replay
+//! - **assumed true / assumed false** — a pass guessed, recorded via
+//!   [`Context::assume_true`](crate::context::Context::assume_true) /
+//!   [`assume_false`](crate::context::Context::assume_false). Assuming fails
+//!   (returns `false`) if the opposite polarity is already assumed or known.
+//! - **known true / known false** — proven by a verification pass via
+//!   [`Context::set_known`](crate::context::Context::set_known). Proving the
+//!   opposite of an existing assumption records a [`Violation`].
+//!
+//! Every entry carries the name of the pass that recorded it, picked up
+//! automatically from the [`pass_scope`](crate::pass_scope) thread-local set by
+//! the pipeline driver.
+//!
+//! Because analysis passes mutate the [`Context`](crate::context::Context)
+//! arena in place, a *violated* assumption leaves behind IR that is now
+//! incorrect. The invalidation strategy is **checkpoint + replay**: a
+//! freshly-lifted baseline `Context` is cloned before any speculative
+//! analysis; after a round, if any violation was recorded (or a novel fact
+//! proven), the working copy is discarded, its known facts are seeded into a
+//! fresh clone, and the round replays. Knowledge only ever grows, so replay
 //! terminates.
 
-use std::collections::HashSet;
+use crate::value::function::FunctionId;
 
-use jstd::Identifier;
-
-use crate::value::{block::BlockId, block::EdgeId, function::FunctionId, insn::InstructionId};
-
-/// Identifies an [`Assumption`] stored in the ledger.
-#[derive(Identifier)]
-pub struct AssumptionId(usize);
-
-/// Verification state of an [`Assumption`].
-#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-pub enum AssumptionStatus {
-    /// Recorded but not yet checked against the predicted entity.
-    Unverified,
-    /// Checked and found to hold.
-    Confirmed,
-    /// Checked and found to be wrong; whatever was derived from it must be
-    /// discarded (see the module-level checkpoint+replay note).
-    Violated,
-}
-
-/// The heuristic kinds we can assume.
+/// A positive statement about the program whose truth a pass may assume or
+/// prove. Used as the key of the truth map on the
+/// [`Context`](crate::context::Context).
 ///
-/// `#[non_exhaustive]` so adding future heuristics does not break exhaustive
+/// `#[non_exhaustive]` so adding future propositions does not break exhaustive
 /// matches in downstream crates.
 #[non_exhaustive]
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
-pub enum AssumptionKind {
-    /// A called function returns normally to the fall-through after the call.
-    CallReturns(CallReturnsAssumption),
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+pub enum Proposition {
+    /// Function returns normally to the fall-through after a call to it
+    /// (false = noreturn: `exit`/`abort`, infinite loops, no `Return` in body).
+    FunctionReturns(FunctionId),
+    /// Function performs an unresolved/dynamic stack read, or forwards a stack
+    /// pointer into one, so callers must keep their frame in memory.
+    UnboundedStackReader(FunctionId),
+    /// Function hands a pointer into its own frame to an unbounded-reading
+    /// callee, so its own frame must stay in memory.
+    FrameEscapingCaller(FunctionId),
 }
 
-/// "Function `callee` returns to the instruction after the call at `call_site`."
-///
-/// Materialized as a real CFG edge `call_block -> continuation` so downstream
-/// dataflow can reason across the call.
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
-pub struct CallReturnsAssumption {
-    /// The function we assume returns — the primary verification key.
-    pub callee: FunctionId,
-    /// The `Call` instruction the assumption is about.
-    pub call_site: InstructionId,
-    /// The block that ends in the call.
-    pub call_block: BlockId,
-    /// The fall-through block we assume control returns to.
-    pub continuation: BlockId,
-    /// The synthetic CFG edge `call_block -> continuation` we added.
-    pub continuation_edge: EdgeId,
+/// How certain we are about a proposition's recorded value.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum Certainty {
+    /// A pass's heuristic guess; can be contradicted by [`set_known`]
+    /// (recording a [`Violation`]).
+    ///
+    /// [`set_known`]: crate::context::Context::set_known
+    Assumed,
+    /// Proven by a verification pass; survives checkpoint+replay rounds.
+    Known,
 }
 
-/// A recorded heuristic guess together with its verification [`AssumptionStatus`].
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
-pub struct Assumption {
-    pub kind: AssumptionKind,
-    pub status: AssumptionStatus,
+/// The recorded truth state of one [`Proposition`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct Truth {
+    /// The polarity recorded for the proposition.
+    pub value: bool,
+    /// Guess or proven fact.
+    pub certainty: Certainty,
+    /// The pass that recorded this entry (from [`crate::pass_scope`]).
+    pub pass: PassName,
 }
 
-impl Assumption {
-    /// Creates an [`Unverified`](AssumptionStatus::Unverified) assumption.
-    pub fn new(kind: AssumptionKind) -> Self {
-        Self {
-            kind,
-            status: AssumptionStatus::Unverified,
-        }
+/// A proven fact contradicting an earlier assumption — the signal that the
+/// checkpoint+replay driver must discard the working copy and replay.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct Violation {
+    /// The contradicted proposition.
+    pub prop: Proposition,
+    /// The polarity that was assumed (the proven value is its negation).
+    pub assumed: bool,
+    /// The pass that made the wrong assumption.
+    pub assuming_pass: PassName,
+    /// The verification pass that proved the opposite.
+    pub asserting_pass: PassName,
+}
+
+/// A pass name, as recorded on truth-map entries. A transparent `&'static str`
+/// wrapper: serde's derive would otherwise tie the deserializer lifetime to
+/// `'static`, so it gets manual impls — serialized as a string, deserialized by
+/// leaking. Pass names form a small finite set, so the leak is bounded.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct PassName(pub &'static str);
+
+impl std::ops::Deref for PassName {
+    type Target = str;
+    fn deref(&self) -> &str {
+        self.0
     }
+}
 
-    /// The callee this assumption predicts, used to index it for verification.
-    pub fn callee(&self) -> Option<FunctionId> {
-        match &self.kind {
-            AssumptionKind::CallReturns(a) => Some(a.callee),
-        }
+impl std::fmt::Display for PassName {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.0)
     }
 }
 
-/// Facts proven across checkpoint+replay rounds, kept *outside* the snapshotted
-/// [`Context`](crate::context::Context) so they persist when the working copy is
-/// discarded.
-///
-/// Keyed by [`FunctionId`], which is stable across `Context::clone` (registry
-/// IDs are indices into the immutable baseline). The set only grows, which is
-/// what guarantees the replay loop converges.
-#[derive(Debug, Clone, Default)]
-pub struct AssumptionKnowledge {
-    /// Callees proven not to return (noreturn): `exit`/`abort`, infinite loops,
-    /// or any function whose body contains no `Return`.
-    pub noreturn: HashSet<FunctionId>,
-    /// Functions found to perform an unresolved/dynamic stack read, or to forward
-    /// a stack pointer into one. Learned after a pipeline round and re-seeded onto
-    /// each function's signature at the start of the next, so a caller's stack
-    /// promotion can account for a callee that reads its frame unboundedly. Like
-    /// [`noreturn`](Self::noreturn) the set only grows, so replay converges.
-    pub unbounded_stack_readers: HashSet<FunctionId>,
-    /// Functions that hand a pointer into their own frame to an unbounded-reading
-    /// callee. Learned at bind time (when `StackAddress` types still exist) and
-    /// re-seeded onto each function's signature next round so `mem2reg` keeps the
-    /// whole frame in memory. Monotonic, so replay converges.
-    pub frame_escaping_callers: HashSet<FunctionId>,
+impl PartialEq<&str> for PassName {
+    fn eq(&self, other: &&str) -> bool {
+        self.0 == *other
+    }
 }
 
-impl AssumptionKnowledge {
-    pub fn new() -> Self {
-        Self::default()
+impl serde::Serialize for PassName {
+    fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        s.serialize_str(self.0)
     }
+}
 
-    /// Whether `f` has been proven not to return.
-    pub fn is_noreturn(&self, f: FunctionId) -> bool {
-        self.noreturn.contains(&f)
+impl<'de> serde::Deserialize<'de> for PassName {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        let s = String::deserialize(d)?;
+        Ok(PassName(Box::leak(s.into_boxed_str())))
     }
 }

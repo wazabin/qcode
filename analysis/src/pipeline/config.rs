@@ -7,6 +7,8 @@
 //!
 //! [`parse`]: Pipeline::parse
 
+use std::collections::HashMap;
+
 use serde::Deserialize;
 
 use qcode::{
@@ -218,7 +220,17 @@ fn run_module_stage(
                 stage: stage_name.clone(),
                 pass: p.name(),
             });
-            changed |= p.run(ctx, env).map_err(|e| format!("{}: {e}", p.name()))?;
+            let _scope = qcode::pass_scope::enter(p.name());
+            let started = std::time::Instant::now();
+            let pass_changed = p.run(ctx, env).map_err(|e| format!("{}: {e}", p.name()))?;
+            log::debug!(
+                target: "pipeline",
+                "{} ran in {:.2?} ({})",
+                p.name(),
+                started.elapsed(),
+                if pass_changed { "changed" } else { "no change" },
+            );
+            changed |= pass_changed;
         }
         iters += 1;
         if stage.repeat_until.is_none() || !changed {
@@ -252,6 +264,10 @@ fn run_function_stage(
     let total = fun_ids.len();
     let stage_name: std::sync::Arc<str> = stage.name.as_str().into();
 
+    // Function-major stages run each pass thousands of times, so timing is
+    // aggregated per pass over the whole stage rather than logged per call.
+    let mut elapsed: HashMap<&'static str, (std::time::Duration, usize, usize)> = HashMap::new();
+
     for (index, fun_id) in fun_ids.into_iter().enumerate() {
         let function: std::sync::Arc<str> = FunctionRef::from_id(ctx, fun_id).name().into();
         let mut iters = 0;
@@ -266,9 +282,16 @@ fn run_function_stage(
                     total,
                     pass: p.name(),
                 });
-                changed |= p
+                let _scope = qcode::pass_scope::enter(p.name());
+                let started = std::time::Instant::now();
+                let pass_changed = p
                     .run(ctx, fun_id, env)
                     .map_err(|e| format!("{}: {e}", p.name()))?;
+                let entry = elapsed.entry(p.name()).or_default();
+                entry.0 += started.elapsed();
+                entry.1 += 1;
+                entry.2 += pass_changed as usize;
+                changed |= pass_changed;
             }
             iters += 1;
             if stage.repeat_until.is_none() || !changed {
@@ -280,6 +303,18 @@ fn run_function_stage(
                     stage.name
                 ));
             }
+        }
+    }
+
+    if log::log_enabled!(target: "pipeline", log::Level::Debug) {
+        let mut rows: Vec<_> = elapsed.into_iter().collect();
+        rows.sort_by(|a, b| b.1.0.cmp(&a.1.0));
+        for (pass, (time, runs, changes)) in rows {
+            log::debug!(
+                target: "pipeline",
+                "stage {}: {pass} took {time:.2?} over {runs} runs ({changes} changed)",
+                stage.name,
+            );
         }
     }
     Ok(())

@@ -7,8 +7,9 @@ use std::{
 };
 
 use crate::{
-    assumption::{Assumption, AssumptionId, AssumptionKind, AssumptionStatus},
+    assumption::{Certainty, PassName, Proposition, Truth, Violation},
     error::{Error, ErrorTy, Result},
+    pass_scope,
     space::{Space, SpaceId},
     types::TypeManager,
     value::{
@@ -224,47 +225,123 @@ impl<'str> Context<'str> {
         BasicBlock::from_id_mut(self, to).remove_edge(edge_id);
     }
 
-    /// Records a heuristic [`Assumption`] and indexes it by the callee it
-    /// predicts. Returns the new [`AssumptionId`].
-    pub fn add_assumption(&mut self, kind: AssumptionKind) -> AssumptionId {
-        let assumption = Assumption::new(kind);
-        let callee = assumption.callee();
-        let id = self.values.assumptions.push(assumption);
-        if let Some(callee) = callee {
-            self.values
-                .assumptions_by_callee
-                .entry(callee)
-                .or_default()
-                .push(id);
+    /// Assumes `prop` is true. Returns `false` (and records nothing) if the
+    /// proposition is already assumed or known false; returns `true` if it was
+    /// recorded or already held with the same polarity (idempotent). The
+    /// recording pass is taken from [`pass_scope`](crate::pass_scope).
+    pub fn assume_true(&mut self, prop: Proposition) -> bool {
+        self.assume(prop, true)
+    }
+
+    /// Assumes `prop` is false. Mirror of [`assume_true`](Self::assume_true).
+    pub fn assume_false(&mut self, prop: Proposition) -> bool {
+        self.assume(prop, false)
+    }
+
+    fn assume(&mut self, prop: Proposition, value: bool) -> bool {
+        match self.values.truths.get(&prop) {
+            Some(t) => t.value == value,
+            None => {
+                self.values.truths.insert(
+                    prop,
+                    Truth {
+                        value,
+                        certainty: Certainty::Assumed,
+                        pass: PassName(pass_scope::current_pass()),
+                    },
+                );
+                true
+            }
         }
-        id
     }
 
-    /// Returns the [`Assumption`] with the given id.
-    pub fn assumption(&self, id: AssumptionId) -> &Assumption {
-        &self.values.assumptions[id]
+    /// Records `prop = value` as proven, overriding any assumption. If this
+    /// contradicts an existing assumption, a [`Violation`] is recorded — the
+    /// checkpoint+replay driver's signal to discard this working copy.
+    /// Contradicting an existing *known* fact is a logic error.
+    ///
+    /// Returns `true` if the fact is *novel* (no prior truth, or it overturned
+    /// an assumption): the driver replays when a round produced novel facts.
+    pub fn set_known(&mut self, prop: Proposition, value: bool) -> bool {
+        let pass = PassName(pass_scope::current_pass());
+        let novel = match self.values.truths.get(&prop) {
+            Some(prior) => {
+                debug_assert!(
+                    !(prior.certainty == Certainty::Known && prior.value != value),
+                    "{prop:?}: {pass} proves {value} but {} already proved {}",
+                    prior.pass,
+                    prior.value,
+                );
+                if prior.certainty == Certainty::Assumed && prior.value != value {
+                    self.values.violations.push(Violation {
+                        prop,
+                        assumed: prior.value,
+                        assuming_pass: prior.pass,
+                        asserting_pass: pass,
+                    });
+                    true
+                } else {
+                    false
+                }
+            }
+            None => true,
+        };
+        self.values.truths.insert(
+            prop,
+            Truth {
+                value,
+                certainty: Certainty::Known,
+                pass,
+            },
+        );
+        novel
     }
 
-    /// Returns the assumptions predicting `callee`, in insertion order.
-    pub fn assumptions_for_callee(&self, callee: FunctionId) -> &[AssumptionId] {
-        self.values
-            .assumptions_by_callee
-            .get(&callee)
-            .map(Vec::as_slice)
-            .unwrap_or(&[])
+    /// Seeds a proven fact carried over from an earlier checkpoint+replay
+    /// round. Unlike [`set_known`](Self::set_known) this is not "novel": it
+    /// must not retrigger a replay, and seeding over an existing entry is a
+    /// logic error (seed before any pass runs).
+    pub fn seed_known(&mut self, prop: Proposition, value: bool) {
+        let prior = self.values.truths.insert(
+            prop,
+            Truth {
+                value,
+                certainty: Certainty::Known,
+                pass: PassName(pass_scope::current_pass()),
+            },
+        );
+        debug_assert!(prior.is_none(), "seeding {prop:?} over an existing truth");
     }
 
-    /// Sets the verification status of an assumption.
-    pub fn set_assumption_status(&mut self, id: AssumptionId, status: AssumptionStatus) {
-        self.values.assumptions[id].status = status;
+    /// The recorded [`Truth`] of `prop`, if any.
+    pub fn truth(&self, prop: Proposition) -> Option<Truth> {
+        self.values.truths.get(&prop).copied()
     }
 
-    /// Iterates over all recorded assumptions.
-    pub fn assumptions(&self) -> impl Iterator<Item = (AssumptionId, &Assumption)> {
-        self.values
-            .assumptions
-            .iter()
-            .map(|item| (item.id, item.inner))
+    /// The proven value of `prop`: `Some` only for *known* entries.
+    pub fn known(&self, prop: Proposition) -> Option<bool> {
+        self.truth(prop)
+            .filter(|t| t.certainty == Certainty::Known)
+            .map(|t| t.value)
+    }
+
+    /// Iterates over every recorded truth (assumed and known).
+    pub fn truths(&self) -> impl Iterator<Item = (Proposition, Truth)> + '_ {
+        self.values.truths.iter().map(|(&p, &t)| (p, t))
+    }
+
+    /// Iterates over the proven facts, for the replay driver to harvest into
+    /// the next round's [`seed_known`](Self::seed_known) calls.
+    pub fn known_facts(&self) -> impl Iterator<Item = (Proposition, bool)> + '_ {
+        self.truths()
+            .filter(|(_, t)| t.certainty == Certainty::Known)
+            .map(|(p, t)| (p, t.value))
+    }
+
+    /// The violations recorded this round (proven facts that contradicted an
+    /// assumption). Non-empty means derived IR may be wrong: replay.
+    pub fn violations(&self) -> &[Violation] {
+        &self.values.violations
     }
 
     /// Returns the raw `u64` backing value of the literal `id`.
@@ -944,35 +1021,59 @@ mod tests {
     }
 
     #[test]
-    fn assumption_ledger_indexes_by_callee_and_tracks_status() {
-        use crate::assumption::{AssumptionKind, AssumptionStatus, CallReturnsAssumption};
-        use crate::value::insn::InstructionId;
-
+    fn truth_map_tracks_four_states_and_conflicts() {
         let mut ctx = Context::new();
         let callee = Function::make(&mut ctx, "callee".into()).unwrap().id;
-        let call_block = BasicBlock::make(&mut ctx).id;
-        let continuation = BasicBlock::make(&mut ctx).id;
-        let edge = ctx.add_cfg_edge(call_block, continuation);
+        let prop = Proposition::FunctionReturns(callee);
 
-        let id = ctx.add_assumption(AssumptionKind::CallReturns(CallReturnsAssumption {
-            callee,
-            call_site: InstructionId::from(0usize),
-            call_block,
-            continuation,
-            continuation_edge: edge,
-        }));
+        // First assume wins; same polarity is idempotent; opposite fails.
+        assert!(ctx.assume_true(prop));
+        assert!(ctx.assume_true(prop));
+        assert!(!ctx.assume_false(prop));
+        assert_eq!(ctx.known(prop), None, "assumed is not known");
 
-        assert_eq!(ctx.assumptions_for_callee(callee), &[id]);
-        assert_eq!(ctx.assumption(id).status, AssumptionStatus::Unverified);
-
-        // The ledger is part of the arena, so it snapshots with a clone.
+        // The truth map is part of the arena, so it snapshots with a clone.
         let snapshot = ctx.clone();
-        assert_eq!(snapshot.assumptions_for_callee(callee), &[id]);
 
-        ctx.set_assumption_status(id, AssumptionStatus::Violated);
-        assert_eq!(ctx.assumption(id).status, AssumptionStatus::Violated);
+        // Proving the opposite overturns the assumption and records the
+        // violation with both pass names.
+        let scope = pass_scope::enter("verifier");
+        assert!(ctx.set_known(prop, false), "overturning is novel");
+        drop(scope);
+        assert_eq!(ctx.known(prop), Some(false));
+        let [v] = ctx.violations() else {
+            panic!("expected one violation")
+        };
+        assert_eq!(v.prop, prop);
+        assert!(v.assumed);
+        assert_eq!(v.asserting_pass, "verifier");
+
+        // Re-proving the same value is not novel.
+        assert!(!ctx.set_known(prop, false));
+
         // The independent snapshot is unaffected.
-        assert_eq!(snapshot.assumption(id).status, AssumptionStatus::Unverified);
+        assert!(snapshot.violations().is_empty());
+        assert_eq!(snapshot.known(prop), None);
+
+        // An assume against a known fact fails; with it, succeeds.
+        assert!(!ctx.assume_true(prop));
+        assert!(ctx.assume_false(prop));
+    }
+
+    #[test]
+    fn seeded_facts_are_not_novel() {
+        let mut ctx = Context::new();
+        let callee = Function::make(&mut ctx, "exit".into()).unwrap().id;
+        let prop = Proposition::FunctionReturns(callee);
+
+        ctx.seed_known(prop, false);
+        assert_eq!(ctx.known(prop), Some(false));
+        assert!(!ctx.assume_true(prop), "seeded fact blocks opposite assume");
+        assert!(
+            !ctx.set_known(prop, false),
+            "re-proving a seed is not novel"
+        );
+        assert!(ctx.violations().is_empty());
     }
 
     #[test]
