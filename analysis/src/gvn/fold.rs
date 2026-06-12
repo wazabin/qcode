@@ -21,7 +21,7 @@ impl SubPass for Fold {
         if ic.mnemonic.is_terminator() || ic.size == 0 {
             return Claim::Pass;
         }
-        match try_fold(ctx, ic.mnemonic, ic.size) {
+        match try_fold_insn(ctx, ic) {
             Some(folded) => {
                 ed.replace(ctx, ic.insn_id, folded);
                 Claim::Done
@@ -60,10 +60,20 @@ fn get_numeric_const<'a>(ctx: &'a Context<'a>, v: ValueId) -> Option<LiteralRef<
 }
 
 // TODO: use the existing `evaluate_const` machinery instead of re-implementing it here.
+#[cfg(test)]
 pub(super) fn constant_folding(
     ctx: &mut Context,
     m: &Mnemonic,
+    output_size: usize,
+) -> Option<ValueId> {
+    constant_folding_with_location(ctx, m, output_size, None)
+}
+
+fn constant_folding_with_location(
+    ctx: &mut Context,
+    m: &Mnemonic,
     _output_size: usize,
+    location: Option<&InsnCtx>,
 ) -> Option<ValueId> {
     match m {
         &Mnemonic::Binop(Binary { lhs, rhs, op }) => {
@@ -71,23 +81,19 @@ pub(super) fn constant_folding(
             // through the output type computed by binop_result below.
             let lhs = get_numeric_const(ctx, lhs)?;
             let rhs = get_numeric_const(ctx, rhs)?;
-            // Shifts take a shift *count* whose operand width may be narrower than
-            // the value being shifted (e.g. `shr eax, cl`: 4-byte value, 1-byte
-            // count). For every other binop the operands must be the same width —
-            // the lifter guarantees it, so a mismatch is a type error.
-            let is_shift = matches!(
-                op,
-                Binop::Int(IntBinop::ShiftLeft | IntBinop::ShiftRight | IntBinop::SShiftRight)
-            );
+            // Binops require equal-width operands. If SLEIGH gives an
+            // implicitly narrow shift count or comparison operand, the lifter
+            // must make that coercion explicit before GVN reaches this point.
             assert!(
-                is_shift || lhs.size() == rhs.size(),
-                "type error in binop constant folding: lhs is {} bytes, rhs is {} bytes",
+                lhs.size() == rhs.size(),
+                "type error in binop constant folding at {}: lhs {} is {} bytes, rhs {} is {} bytes, op {}",
+                fold_location(ctx, location),
+                lhs.id(),
                 lhs.size(),
-                rhs.size()
+                rhs.id(),
+                rhs.size(),
+                op,
             );
-
-            let l = lhs.value();
-            let r = rhs.value();
 
             let size = lhs.size();
             let lhs_type = lhs.type_id();
@@ -98,12 +104,20 @@ pub(super) fn constant_folding(
             } else {
                 (1u64 << (size * 8)) - 1
             };
+            let l = lhs.value() & mask;
+            let r = rhs.value() & mask;
 
             let value = match op {
                 Binop::Int(IntBinop::Equal) => (l == r) as u64,
                 Binop::Int(IntBinop::NotEqual) => (l != r) as u64,
                 Binop::Int(IntBinop::Less) => (l < r) as u64,
                 Binop::Int(IntBinop::LessEqual) => (l <= r) as u64,
+                Binop::Int(IntBinop::SLess) => {
+                    (signed_value(l, size) < signed_value(r, size)) as u64
+                }
+                Binop::Int(IntBinop::SLessEqual) => {
+                    (signed_value(l, size) <= signed_value(r, size)) as u64
+                }
 
                 Binop::Int(IntBinop::Add) => l.wrapping_add(r) & mask,
                 Binop::Int(IntBinop::Sub) => l.wrapping_sub(r) & mask,
@@ -228,15 +242,38 @@ fn all_ones(output_size: usize) -> u64 {
     }
 }
 
+fn signed_value(value: u64, size: usize) -> i64 {
+    let bits = size * 8;
+    if bits >= 64 {
+        value as i64
+    } else {
+        ((value << (64 - bits)) as i64) >> (64 - bits)
+    }
+}
+
 /// Concrete value of `v` when it is a non-symbolic literal, else `None`.
 pub(super) fn const_value(ctx: &Context, v: ValueId) -> Option<u64> {
     get_numeric_const(ctx, v).map(|c| c.value())
 }
 
-/// [`constant_folding`] then [`algebraic_identity`]: the value `m` collapses to
-/// when either rewrite applies.
-pub(super) fn try_fold(ctx: &mut Context, m: &Mnemonic, output_size: usize) -> Option<ValueId> {
-    constant_folding(ctx, m, output_size).or_else(|| algebraic_identity(ctx, m, output_size))
+fn try_fold_insn(ctx: &mut Context, ic: &InsnCtx) -> Option<ValueId> {
+    constant_folding_with_location(ctx, ic.mnemonic, ic.size, Some(ic))
+        .or_else(|| algebraic_identity(ctx, ic.mnemonic, ic.size))
+}
+
+fn fold_location(ctx: &Context, location: Option<&InsnCtx>) -> String {
+    let Some(ic) = location else {
+        return "unknown instruction".to_string();
+    };
+    let insn = qcode::value::Instruction::from_id(ctx, ic.insn_id);
+    let address = insn
+        .address()
+        .map(|addr| format!("{addr:#x}"))
+        .unwrap_or_else(|| "unknown".to_string());
+    format!(
+        "address {address}, insn {}, value {}, block {}",
+        ic.insn_id, ic.id, ic.block_id
+    )
 }
 
 /// Algebraic simplifications that, unlike [`constant_folding`], do *not* require

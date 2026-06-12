@@ -52,6 +52,23 @@ impl Display for Binop {
     }
 }
 
+impl Binop {
+    pub fn is_comparison(self) -> bool {
+        match self {
+            Binop::Int(op) => op.is_comparison(),
+            Binop::Float(op) => op.is_comparison(),
+            Binop::Bool(_) => false,
+        }
+    }
+
+    pub fn is_shift(self) -> bool {
+        matches!(
+            self,
+            Binop::Int(IntBinop::ShiftLeft | IntBinop::ShiftRight | IntBinop::SShiftRight)
+        )
+    }
+}
+
 #[non_exhaustive]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub enum BoolBinop {
@@ -111,6 +128,18 @@ pub enum IntBinop {
 }
 
 impl IntBinop {
+    pub fn is_comparison(self) -> bool {
+        matches!(
+            self,
+            IntBinop::Equal
+                | IntBinop::NotEqual
+                | IntBinop::Less
+                | IntBinop::SLess
+                | IntBinop::LessEqual
+                | IntBinop::SLessEqual
+        )
+    }
+
     /// Evaluates this operation on raw bit patterns.
     ///
     /// `size` is the operand width in bytes. Arithmetic results are masked to `size` bytes.
@@ -199,6 +228,15 @@ pub enum FloatBinop {
     Sub,
     Mul,
     Div,
+}
+
+impl FloatBinop {
+    pub fn is_comparison(self) -> bool {
+        matches!(
+            self,
+            FloatBinop::Equal | FloatBinop::NotEqual | FloatBinop::Less | FloatBinop::LessEqual
+        )
+    }
 }
 
 impl Display for FloatBinop {
