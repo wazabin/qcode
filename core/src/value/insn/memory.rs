@@ -7,7 +7,7 @@ use std::fmt::Formatter;
 
 use super::mnemonic::MnemonicKind;
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub struct Load {
     pub space: SpaceId,
     pub ptr: ValueId,
@@ -43,7 +43,7 @@ impl MnemonicKind for Load {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub struct Store {
     pub space: SpaceId,
     pub ptr: ValueId,

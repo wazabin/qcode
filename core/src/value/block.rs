@@ -26,7 +26,7 @@ pub mod cfg;
 
 /// A block of instructions.
 /// This is the basic unit of code in our IR.
-#[derive(Debug, Default, Clone)]
+#[derive(Debug, Default, Clone, serde::Serialize, serde::Deserialize)]
 pub struct BasicBlock<'str> {
     /// An optionnal name for this basic block
     name: Option<Cow<'str, str>>,
@@ -357,11 +357,13 @@ impl<'str, 'ctx> BlockMutRef<'str, 'ctx> {
     pub fn push_param(&mut self, size: usize) -> BlockParamMutRef<'str, '_> {
         let block_id = self.id;
         let index = self.inner().params.len();
+        let type_id = self.ctx.types.get_or_make_int(size);
         let id = self.ctx.values.block_params.push(BlockParam {
             index,
-            size,
+            type_id,
             parent: Some(block_id),
             name: None,
+            origin: None,
         });
         self.inner_mut().params.push(id);
         BlockParamMutRef::from_id(self.ctx, id)
@@ -378,6 +380,12 @@ impl<'str, 'ctx> BlockMutRef<'str, 'ctx> {
     /// Inserts an instruction at the start of this block, before all existing instructions.
     pub fn insert_insn_at_start(&mut self, insn_id: InstructionId) {
         self.insert_insn(0, insn_id);
+    }
+
+    /// Inserts an instruction at the given index, shifting later instructions right.
+    /// Panics if `index > len`.
+    pub fn insert_insn_at_index(&mut self, index: usize, insn_id: InstructionId) {
+        self.insert_insn(index, insn_id);
     }
 
     /// Inserts an instruction before the instruction identified by `before_id` in this block.
@@ -427,18 +435,22 @@ impl<'str, 'ctx> BlockMutRef<'str, 'ctx> {
     }
 
     /// Adds an edge to this block's edge set.
-    pub fn add_edge(&mut self, edge_id: EdgeId) {
+    /// DO NOT USE THIS
+    pub(crate) fn add_edge(&mut self, edge_id: EdgeId) {
         self.inner_mut().edges.insert(edge_id);
     }
 
     /// Removes an edge from this block's edge set.
-    pub fn remove_edge(&mut self, edge_id: EdgeId) {
+    /// DO NOT USE THIS
+    pub(crate) fn remove_edge(&mut self, edge_id: EdgeId) {
         self.inner_mut().edges.remove(&edge_id);
     }
 
     /// Removes the last instruction from this block.
-    pub fn pop_insn(&mut self) -> Option<InstructionId> {
-        self.inner_mut().instructions.pop()
+    pub fn pop_insn(&mut self) {
+        if let Some(last_id) = self.inner().instructions.last() {
+            self.ctx.remove_instruction(*last_id);
+        }
     }
 
     /// Appends a slice of instruction ids to this block.
@@ -492,8 +504,13 @@ impl<'str, 'ctx> BlockMutRef<'str, 'ctx> {
         // Remove terminal branch.
         self.inner_mut().instructions.pop();
 
-        // Append other's instructions, updating their parent to point to this block.
-        let b_insns = self.ctx.values.basic_blocks[other].instructions.clone();
+        // Move other's instructions into this block, updating their parent. The
+        // source list must be drained, not just copied: leaving the ids in
+        // `other.instructions` would put every absorbed instruction in two
+        // blocks at once, so a later `remove_instruction` (which unlinks via the
+        // instruction's `parent`) clears it from one block while it lingers in
+        // the other — corrupting block membership.
+        let b_insns = std::mem::take(&mut self.ctx.values.basic_blocks[other].instructions);
         let self_id = self.id;
         for &insn_id in &b_insns {
             self.ctx.values.instructions[insn_id].parent = Some(self_id);
@@ -748,5 +765,87 @@ mod tests {
         let sum = builder.push_add(param_id, param_id);
         assert_eq!(sum.size(), 8);
         unsafe { builder.dont_finalize() };
+    }
+
+    #[test]
+    fn remove_terminator_branch() {
+        let mut ctx = Context::new();
+        qcode!(
+            ctx,
+            "
+            <entry>
+                goto <done>;
+            <done>
+            "
+        );
+
+        let mut entry_block = BasicBlock::from_id_mut(&mut ctx, entry);
+        assert_eq!(entry_block.instruction_ids().len(), 1);
+        assert_eq!(entry_block.successors().count(), 1);
+        assert!(entry_block.is_terminated());
+
+        entry_block.pop_insn();
+        assert_eq!(entry_block.instruction_ids().len(), 0);
+        assert_eq!(entry_block.successors().count(), 0);
+        assert!(!entry_block.is_terminated());
+    }
+
+    #[test]
+    fn remove_terminator_cbranch() {
+        let mut ctx = Context::new();
+        qcode!(
+            ctx,
+            "
+            varnode i8 cond;
+
+            <entry>
+                %c = load(i8, cond);
+                if %c goto <then_lbl> else goto <else_lbl>;
+
+            <then_lbl>
+
+            <else_lbl>
+            "
+        );
+
+        let mut entry_block = BasicBlock::from_id_mut(&mut ctx, entry);
+        assert_eq!(entry_block.successors().count(), 2);
+        assert_eq!(entry_block.instruction_ids().len(), 2);
+        assert!(entry_block.is_terminated());
+
+        entry_block.pop_insn();
+
+        assert_eq!(entry_block.successors().count(), 0);
+        assert_eq!(entry_block.instruction_ids().len(), 1);
+        assert!(!entry_block.is_terminated());
+
+        assert_eq!(
+            BasicBlock::from_id(&ctx, then_lbl).predecessors().count(),
+            0
+        );
+        assert_eq!(
+            BasicBlock::from_id(&ctx, else_lbl).predecessors().count(),
+            0
+        );
+    }
+
+    #[test]
+    fn remove_terminator_return() {
+        let mut ctx = Context::new();
+        qcode!(
+            ctx,
+            "
+            <entry>
+                return [i64 0];
+            "
+        );
+
+        let mut entry_block = BasicBlock::from_id_mut(&mut ctx, entry);
+        assert_eq!(entry_block.instruction_ids().len(), 1);
+        assert_eq!(entry_block.successors().count(), 0);
+
+        entry_block.pop_insn();
+        assert_eq!(entry_block.instruction_ids().len(), 0);
+        assert_eq!(entry_block.successors().count(), 0);
     }
 }

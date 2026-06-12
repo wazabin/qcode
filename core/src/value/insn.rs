@@ -6,6 +6,7 @@ use crate::{
     context::Context,
     error::Result,
     space::{Space, SpaceId, SpaceRef, SpaceType},
+    types::TypeId,
     value::{
         BasicBlock, BlockId, BlockRef, FunctionRef, Value, ValueId,
         util::{
@@ -44,19 +45,16 @@ pub struct InstructionId(usize);
 
 /// A local SSA value, which is a value that is defined by an instruction and can be used by other instructions.
 /// Local values are not associated with any particular memory location.
-#[derive(Clone)]
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
 pub struct Instruction<'str> {
     /// The name of this instruction
     pub(crate) name: Option<Cow<'str, str>>,
 
-    /// The size of this value in bytes
-    size: usize,
+    /// The type of this instruction's result value (encodes size and semantic kind).
+    pub(crate) type_id: TypeId,
 
     /// The instruction which defines this value.
     mnemonic: Mnemonic,
-
-    /// Optional address-space provenance for this instruction's result.
-    space: Option<SpaceId>,
 
     /// The block that this instruction belongs to, if any.
     /// Instructions that are not part of any block (e.g. lifted from data sections) have `None` here.
@@ -69,14 +67,13 @@ pub struct Instruction<'str> {
 }
 
 impl<'str> Instruction<'str> {
-    fn new(size: usize, mnemonic: Mnemonic, space: Option<SpaceId>) -> Self {
+    pub(crate) fn new(type_id: TypeId, mnemonic: Mnemonic) -> Self {
         Self {
             name: None,
             parent: None,
-            size,
+            type_id,
             mnemonic,
             address: None,
-            space,
             _marker: std::marker::PhantomData,
         }
     }
@@ -113,9 +110,14 @@ where
         self.inner().name.as_deref()
     }
 
+    /// The [`TypeId`] of this instruction's result value.
+    pub fn type_id(&'s self) -> TypeId {
+        self.inner().type_id
+    }
+
     /// The size in bytes of the instruction's output value
     pub fn size(&'s self) -> usize {
-        self.inner().size
+        self.ctx().types.size_of(self.inner().type_id)
     }
 
     /// The basic block that this instruction belongs to, if any.
@@ -144,9 +146,15 @@ where
         self.inner().address
     }
 
-    /// The address-space provenance for this instruction's result, if known.
+    /// The address-space provenance for this instruction's result, if any.
+    ///
+    /// Returns `Some` only for instructions whose result type is a pointer to a
+    /// known memory space (e.g. [`StackAddress`](crate::types::StackAddress)).
     pub fn space(&'s self) -> Option<SpaceRef<'ctx>> {
-        self.inner().space.map(|id| Space::from_id(self.ctx(), id))
+        self.ctx()
+            .types
+            .space_of(self.inner().type_id)
+            .map(|id| Space::from_id(self.ctx(), id))
     }
 
     /// The opcode for this instruction
@@ -174,21 +182,59 @@ where
 pub type InstructionRef<'str, 'ctx> = BaseRef<&'ctx Context<'str>, InstructionId>;
 
 impl<'str, 'ctx> InstructionRef<'str, 'ctx> {
+    /// Creates an instruction with a plain `Int(size)` result type.
     pub fn from_mnemonic(ctx: &'ctx mut Context<'str>, mnemonic: Mnemonic, size: usize) -> Self {
-        Self::from_mnemonic_with_space(ctx, mnemonic, size, None)
+        let type_id = ctx.types.get_or_make_int(size);
+        let insn = Instruction::new(type_id, mnemonic);
+        let id = ctx.values.push_insn(insn);
+        Self::from_id(ctx, id)
     }
 
-    // Pointer arithmetic is not allowed in the register space
+    /// Creates an instruction with an explicit [`TypeId`].
+    ///
+    /// Pass a [`StackAddress`](crate::types::StackAddress) type id when the
+    /// result is a stack-space pointer. Register-space provenance is silently
+    /// demoted to `Int` (pointer arithmetic on registers is not meaningful).
+    pub fn from_mnemonic_with_type(
+        ctx: &'ctx mut Context<'str>,
+        mnemonic: Mnemonic,
+        type_id: TypeId,
+    ) -> Self {
+        let insn = Instruction::new(type_id, mnemonic);
+        let id = ctx.values.push_insn(insn);
+        Self::from_id(ctx, id)
+    }
+
+    /// Creates an instruction, deriving the result type from an optional space tag.
+    ///
+    /// This is a migration shim: callers that still pass a `SpaceId` to indicate
+    /// provenance get `StackAddress` for the stack space and `Int(size)` for
+    /// everything else. New code should use [`from_mnemonic_with_type`] directly.
     pub fn from_mnemonic_with_space(
         ctx: &'ctx mut Context<'str>,
         mnemonic: Mnemonic,
         size: usize,
         space: Option<SpaceId>,
     ) -> Self {
-        // Pointer arithmetic is not allowed in the register space
-        let space =
-            space.filter(|&space| !matches!(Space::from_id(ctx, space).ty, SpaceType::Register));
-        let insn = Instruction::new(size, mnemonic, space);
+        // Pointer arithmetic is not allowed in the register space; treat as Int.
+        let effective_space =
+            space.filter(|&s| !matches!(Space::from_id(ctx, s).ty, SpaceType::Register));
+
+        let type_id = match effective_space {
+            Some(sid)
+                if ctx
+                    .types
+                    .stack_address_id()
+                    .and_then(|sa| ctx.types.space_of(sa))
+                    == Some(sid) =>
+            {
+                // The space matches the registered stack space → StackAddress
+                ctx.types.stack_address_id().unwrap()
+            }
+            _ => ctx.types.get_or_make_int(size),
+        };
+
+        let insn = Instruction::new(type_id, mnemonic);
         let id = ctx.values.push_insn(insn);
         Self::from_id(ctx, id)
     }
@@ -265,17 +311,45 @@ impl<'str, 'ctx> InstructionMutRef<'str, 'ctx> {
         *self.address_mut() = Some(address);
     }
 
-    pub fn set_space(&mut self, space: SpaceId) {
-        if self.inner().space.is_some_and(|s| s != space) {
+    /// Sets the type of this instruction's result.
+    ///
+    /// Panics if the instruction already has a type that is incompatible with
+    /// `new_type` (same size but different kind).
+    pub fn set_type(&mut self, new_type: TypeId) {
+        let current = self.inner().type_id;
+        let current_size = self.ctx.types.size_of(current);
+        let new_size = self.ctx.types.size_of(new_type);
+        if current_size != 0 && current_size != new_size {
             panic!(
-                "Cannot change space of instruction {} from {:?} to {:?}",
-                self,
-                self.inner().space.map(|s| Space::from_id(self.ctx, s)),
-                Space::from_id(self.ctx, space)
+                "Cannot change type of instruction {}: size {} → {}",
+                self, current_size, new_size
             );
         }
+        self.inner_mut().type_id = new_type;
+    }
 
-        self.inner_mut().space = Some(space);
+    /// Sets the address-space provenance of this instruction's result.
+    ///
+    /// The stack space promotes the result to
+    /// [`StackAddress`](crate::types::StackAddress); any other non-register
+    /// space promotes it to a [`SpaceAddress`](crate::types::SpaceAddress) of
+    /// the same byte width. Register spaces are ignored (pointer arithmetic is
+    /// not allowed in the register space).
+    pub fn set_space(&mut self, space: SpaceId) {
+        // Pointer arithmetic is not allowed in the register space.
+        if matches!(Space::from_id(self.ctx, space).ty, SpaceType::Register) {
+            return;
+        }
+        // The stack space has dedicated `StackAddress` semantics.
+        if let Some(sa_id) = self.ctx.types.stack_address_id()
+            && self.ctx.types.space_of(sa_id) == Some(space)
+        {
+            self.inner_mut().type_id = sa_id;
+            return;
+        }
+        let size = self.ctx.types.size_of(self.inner().type_id);
+        let type_id = self.ctx.types.get_or_make_space_address(size, space);
+        self.inner_mut().type_id = type_id;
     }
 }
 

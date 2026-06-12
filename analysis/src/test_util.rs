@@ -1,0 +1,31 @@
+//! Small helpers for exercising individual passes in unit tests.
+
+use qcode::{
+    context::Context,
+    value::{FunctionId, RegisterId, VarnodeId},
+};
+
+use crate::{ArchConfig, CallingConvention, FunctionPass, PipelineEnv};
+
+/// A throwaway [`PipelineEnv`] for passes that don't touch architecture state
+/// (no real stack pointer or ABI). Arch-aware passes should build a real env via
+/// [`PipelineEnv::new`] with a context that has a registered stack pointer.
+pub(crate) fn dummy_env() -> PipelineEnv {
+    PipelineEnv {
+        cfg: ArchConfig {
+            stack_pointer: RegisterId::from(0usize),
+            dead_flag_regs: Vec::new(),
+            abi: CallingConvention::default(),
+        },
+        sp_varnode: VarnodeId::from(0usize),
+    }
+}
+
+/// Construct `P` via [`Default`] and run it once over `fun` with a [`dummy_env`],
+/// returning whether the pass reported a change.
+pub(crate) fn run_function_pass<P: FunctionPass>(
+    ctx: &mut Context,
+    fun: FunctionId,
+) -> Result<bool, String> {
+    P::default().run(ctx, fun, &dummy_env())
+}

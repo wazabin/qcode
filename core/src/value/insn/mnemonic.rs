@@ -57,7 +57,7 @@ pub trait MnemonicKind {
 /// | [`IsFloatNaN`], [`PopCount`], [`LzCount`], [`Carry`], [`SCarry`], [`SBorrow`] | Bit/flag operations |
 /// | [`PCodeOp`] | User-defined or architecture-specific operation |
 #[non_exhaustive]
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub enum Mnemonic {
     /// Load a value from a memory space.
     Load(Load),

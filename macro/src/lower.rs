@@ -36,7 +36,7 @@ fn collect_block_param_names(statements: &[Statement]) -> HashMap<String, Vec<St
             if let Statement::LabelDecl {
                 label: Label::Named { name, params, .. },
                 ..
-            } = s
+            } = s.inner()
             {
                 Some((
                     name.clone(),
@@ -72,7 +72,7 @@ pub(crate) fn compile_fn_program(
     for stmt in top_varnodes {
         let Statement::LocalDecl {
             name, size_bytes, ..
-        } = stmt
+        } = stmt.inner()
         else {
             return Err(syn::Error::new(
                 proc_macro2::Span::call_site(),
@@ -150,7 +150,7 @@ fn compile_single_fn(
             format!("fn `{fn_name_str}`: function body cannot be empty"),
         )
     })?;
-    let (entry_name, entry_params) = match first {
+    let (entry_name, entry_params) = match first.inner() {
         Statement::LabelDecl {
             label: Label::Named {
                 name: n, params: p, ..
@@ -174,7 +174,7 @@ fn compile_single_fn(
             if let Statement::LabelDecl {
                 label: Label::Named { name: n, .. },
                 ..
-            } = s
+            } = s.inner()
             {
                 Some(format_ident!("{}", n))
             } else {
@@ -186,7 +186,7 @@ fn compile_single_fn(
     let mut seen_ssa_names = std::collections::HashSet::new();
     let mut exposed_ssas: Vec<proc_macro2::Ident> = Vec::new();
     for s in statements.iter() {
-        if let Statement::Assign { name, .. } = s {
+        if let Statement::Assign { name, .. } = s.inner() {
             if !seen_ssa_names.insert(name.clone()) {
                 return Err(syn::Error::new(
                     proc_macro2::Span::call_site(),
@@ -204,7 +204,7 @@ fn compile_single_fn(
     let local_decls: Vec<proc_macro2::Ident> = statements
         .iter()
         .filter_map(|s| {
-            if let Statement::LocalDecl { name, .. } = s {
+            if let Statement::LocalDecl { name, .. } = s.inner() {
                 Some(format_ident!("{}", name))
             } else {
                 None
@@ -218,7 +218,7 @@ fn compile_single_fn(
             if let Statement::LabelDecl {
                 label: Label::Named { params, .. },
                 ..
-            } = s
+            } = s.inner()
             {
                 Some(params.iter().map(|p| format_ident!("{}", p.name)))
             } else {
@@ -257,7 +257,7 @@ fn compile_single_fn(
         if let Statement::LabelDecl {
             label: Label::Named { name, params, .. },
             ..
-        } = stmt
+        } = stmt.inner()
         {
             let block_ident = format_ident!("{}", name);
             if name != &entry_name {
@@ -360,7 +360,7 @@ pub(crate) fn compile_qcode_from_statements_ctx(
     // Split off any leading varnode declarations that precede the entry block label.
     let preamble_end = statements
         .iter()
-        .position(|s| !matches!(s, Statement::LocalDecl { .. }))
+        .position(|s| !matches!(s.inner(), Statement::LocalDecl { .. }))
         .unwrap_or(statements.len());
     let (preamble_varnodes, body_statements) = statements.split_at(preamble_end);
 
@@ -371,7 +371,7 @@ pub(crate) fn compile_qcode_from_statements_ctx(
         ));
     }
 
-    let (entry_name, entry_params) = match body_statements.first() {
+    let (entry_name, entry_params) = match body_statements.first().map(|s| s.inner()) {
         Some(Statement::LabelDecl {
             label: Label::Named {
                 name: n, params: p, ..
@@ -396,7 +396,7 @@ pub(crate) fn compile_qcode_from_statements_ctx(
     for stmt in preamble_varnodes {
         let Statement::LocalDecl {
             name, size_bytes, ..
-        } = stmt
+        } = stmt.inner()
         else {
             unreachable!()
         };
@@ -428,7 +428,7 @@ pub(crate) fn compile_qcode_from_statements_ctx(
             if let Statement::LabelDecl {
                 label: Label::Named { name: n, .. },
                 ..
-            } = s
+            } = s.inner()
             {
                 Some(format_ident!("{}", n))
             } else {
@@ -440,7 +440,7 @@ pub(crate) fn compile_qcode_from_statements_ctx(
     let mut seen_ssa_names = std::collections::HashSet::new();
     let mut exposed_ssas: Vec<proc_macro2::Ident> = Vec::new();
     for s in body_statements.iter() {
-        if let Statement::Assign { name, .. } = s {
+        if let Statement::Assign { name, .. } = s.inner() {
             if !seen_ssa_names.insert(name.clone()) {
                 return Err(syn::Error::new(
                     proc_macro2::Span::call_site(),
@@ -458,7 +458,7 @@ pub(crate) fn compile_qcode_from_statements_ctx(
     let local_decls: Vec<proc_macro2::Ident> = body_statements
         .iter()
         .filter_map(|s| {
-            if let Statement::LocalDecl { name, .. } = s {
+            if let Statement::LocalDecl { name, .. } = s.inner() {
                 Some(format_ident!("{}", name))
             } else {
                 None
@@ -472,7 +472,7 @@ pub(crate) fn compile_qcode_from_statements_ctx(
             if let Statement::LabelDecl {
                 label: Label::Named { params, .. },
                 ..
-            } = s
+            } = s.inner()
             {
                 Some(params.iter().map(|p| format_ident!("{}", p.name)))
             } else {
@@ -493,7 +493,7 @@ pub(crate) fn compile_qcode_from_statements_ctx(
         if let Statement::LabelDecl {
             label: Label::Named { name, params, .. },
             ..
-        } = stmt
+        } = stmt.inner()
         {
             let block_ident = format_ident!("{}", name);
             block_preinits.push(quote! {
@@ -744,6 +744,10 @@ fn emit_statement(
                     __qcode_builder.push_return(__qcode_ptr);
                 }
             });
+        }
+
+        Statement::Commented { inner, .. } => {
+            emit_statement(inner, index, locals, emitted, block_param_names, pcode_root)?;
         }
     }
     Ok(())

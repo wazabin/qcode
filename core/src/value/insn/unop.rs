@@ -6,7 +6,7 @@ use crate::{
 };
 
 #[non_exhaustive]
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub enum Unop {
     IntNegate,
     IntNot,
@@ -55,7 +55,7 @@ impl Display for Unop {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub struct Unary {
     pub op: Unop,
     pub src: ValueId,

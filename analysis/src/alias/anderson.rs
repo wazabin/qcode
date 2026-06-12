@@ -254,10 +254,22 @@ pub fn alias_analysis(ctx: &Context) -> AliasResult {
                 if let Some(sig) = ctx.values.functions[call.target].signature.as_ref() {
                     apply_sig(&mut state, sig);
                 }
+                // Arguments escape: a value passed into the callee may be stored
+                // through, so it joins Unknown. Likewise every recorded
+                // clobbered/aliased location.
+                for &arg in call.args.iter().chain(call.clobbers.iter()) {
+                    let n = state.node_for(arg);
+                    state.join(n, NodeId::Unknown);
+                }
             }
 
-            Mnemonic::CallInd(_) => {
-                // No FunctionId available; no signature to look up.
+            Mnemonic::CallInd(call) => {
+                // No FunctionId, so no signature; conservatively escape the
+                // (over-approximated) arguments through the unknown callee.
+                for &arg in &call.args {
+                    let n = state.node_for(arg);
+                    state.join(n, NodeId::Unknown);
+                }
             }
 
             _ => {}
@@ -441,9 +453,8 @@ mod tests {
     fn test_call_caller_saved_clobbered() {
         let rax_vn = TestContext::new().r0;
         let sig = FunctionSignature {
-            inputs: None,
-            outputs: None,
             caller_saved: Some(vec![rax_vn]),
+            ..Default::default()
         };
         let (ctx, rax_vid) = make_call_ctx(Some(sig));
         let result = alias_analysis(&ctx);
@@ -458,9 +469,8 @@ mod tests {
     fn test_call_output_clobbered() {
         let rax_vn = TestContext::new().r0;
         let sig = FunctionSignature {
-            inputs: None,
             outputs: Some(vec![rax_vn]),
-            caller_saved: None,
+            ..Default::default()
         };
         let (ctx, rax_vid) = make_call_ctx(Some(sig));
         let result = alias_analysis(&ctx);

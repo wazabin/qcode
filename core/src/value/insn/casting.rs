@@ -9,7 +9,7 @@ use std::fmt::Formatter;
 
 use super::mnemonic::MnemonicKind;
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub struct Zext {
     pub src: ValueId,
     pub size: usize,
@@ -41,7 +41,7 @@ impl MnemonicKind for Zext {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub struct Sext {
     pub src: ValueId,
     pub size: usize,
@@ -76,7 +76,7 @@ impl MnemonicKind for Sext {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub struct Range {
     pub src: ValueId,
     pub start: usize,
@@ -116,7 +116,7 @@ impl MnemonicKind for Range {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub struct IntToFloat {
     pub src: ValueId,
     pub size: usize,
@@ -141,7 +141,7 @@ impl MnemonicKind for IntToFloat {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub struct FloatToFloat {
     pub src: ValueId,
     pub size: usize,
@@ -166,7 +166,7 @@ impl MnemonicKind for FloatToFloat {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub struct FloatToInt {
     pub src: ValueId,
     pub size: usize,

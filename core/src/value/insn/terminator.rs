@@ -31,7 +31,7 @@ fn fmt_branch_target(
     write!(f, ">")
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub struct Branch {
     pub target: BlockId,
     /// Arguments passed to the target block's parameters.
@@ -58,7 +58,7 @@ impl MnemonicKind for Branch {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub struct BranchInd {
     pub ptr: ValueId,
 }
@@ -81,10 +81,16 @@ impl MnemonicKind for BranchInd {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub struct Call {
     pub target: FunctionId,
+    /// Values passed to the callee, one per inferred callee input, in order.
     pub args: Vec<ValueId>,
+    /// Register / memory locations the call may write or alias (the callee's
+    /// clobbered set plus escaping pointer arguments). These are *defs*, not
+    /// reads: they are intentionally excluded from [`MnemonicKind::args`] so
+    /// they do not participate in use-def bookkeeping.
+    pub clobbers: Vec<ValueId>,
 }
 
 impl MnemonicKind for Call {
@@ -97,7 +103,16 @@ impl MnemonicKind for Call {
     }
 
     fn fmt(&self, f: &mut Formatter<'_>, ctx: &Context<'_>) -> std::fmt::Result {
-        write!(f, "call fn {};", Function::from_id(ctx, self.target).name())
+        // The clobber set is intentionally not printed: it is large and
+        // repetitive at every call site. Only the argument list is shown.
+        write!(f, "call fn {}(", Function::from_id(ctx, self.target).name())?;
+        for (i, &arg) in self.args.iter().enumerate() {
+            if i > 0 {
+                write!(f, ", ")?;
+            }
+            write!(f, "{}", ValueRef::new(arg, ctx))?;
+        }
+        write!(f, ");")
     }
 
     fn args(&self) -> Vec<ValueId> {
@@ -105,7 +120,7 @@ impl MnemonicKind for Call {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub struct CallInd {
     pub ptr: ValueId,
     pub args: Vec<ValueId>,
@@ -131,7 +146,7 @@ impl MnemonicKind for CallInd {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub struct CBranch {
     pub condition: ValueId,
     pub success_block: BlockId,
@@ -167,7 +182,7 @@ impl MnemonicKind for CBranch {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub struct Return {
     pub ptr: ValueId,
     pub value: Option<ValueId>,

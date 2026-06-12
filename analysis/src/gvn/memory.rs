@@ -1,0 +1,694 @@
+//! Memory sub-pass: alias-aware store→load forwarding.
+//!
+//! A thin [`SubPass`] adapter over [`MemForward`], which holds the byte-level
+//! forwarding state. Unlike pure CSE state, forwarded memory does not flow
+//! freely down the dominator tree: it is pruned at loop headers (a loop-body
+//! store may overwrite it on a later iteration), after calls (clobbered
+//! registers), and cleared entirely for blocks shared between walk entries.
+
+use jstd::graph::analysis::DominatorTree;
+
+use crate::AliasResult;
+use qcode::{
+    context::Context,
+    value::{block::BlockId, insn::Mnemonic},
+};
+
+use super::mem_forward::MemForward;
+use super::walk::{Claim, Editor, InsnCtx, SubPass};
+
+pub(super) struct MemoryForwarding;
+
+impl SubPass for MemoryForwarding {
+    type State = MemForward;
+
+    fn on_block_entry(
+        &self,
+        ctx: &mut Context,
+        state: &mut MemForward,
+        block_id: BlockId,
+        tree: &DominatorTree<BlockId>,
+        aliases: Option<&AliasResult>,
+        is_shared: bool,
+    ) {
+        if is_shared {
+            state.clear();
+        }
+        state.prune_loop_carried(ctx, block_id, tree, aliases);
+    }
+
+    fn on_insn(
+        &self,
+        ctx: &mut Context,
+        state: &mut MemForward,
+        ic: &InsnCtx,
+        ed: &mut Editor,
+    ) -> Claim {
+        match ic.mnemonic {
+            Mnemonic::Store(store) => {
+                state.record_store(ctx, store, ic.aliases);
+                Claim::Done
+            }
+            Mnemonic::Load(load) => {
+                match state.try_load(ctx, ic.block_id, ic.insn_id, load, ic.aliases) {
+                    Some(value) => {
+                        ed.replace(ctx, ic.insn_id, value);
+                        state.define_load(load, value, ic.aliases);
+                    }
+                    None => state.define_load(load, ic.id, ic.aliases),
+                }
+                Claim::Done
+            }
+            _ => Claim::Pass,
+        }
+    }
+
+    // A block that ends in a call clobbers registers: its dominated children
+    // run after the call, so register values the call clobbers must not be
+    // forwarded into them (e.g. a caller's post-call `RAX` read is the
+    // callee's result, not a value computed before the call).
+    fn after_block(
+        &self,
+        ctx: &Context,
+        state: &mut MemForward,
+        block_id: BlockId,
+        aliases: Option<&AliasResult>,
+    ) {
+        state.prune_clobbered_by_call(ctx, block_id, aliases);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::AliasResult;
+    use crate::gvn::{constant_fold_function, gvn, gvn_function};
+    use qcode::{
+        context::Context,
+        testing::TestContext,
+        value::{
+            BasicBlock, ValueId,
+            block::BlockId,
+            function::FunctionId,
+            insn::{InstructionId, Mnemonic, Range},
+        },
+    };
+    use qcode_macro::qcode;
+
+    #[test]
+    fn test_gvn_function_does_not_forward_loads_across_loop_header() {
+        let mut ctx = Context::new();
+
+        qcode!(
+            ctx,
+            "
+                varnode i32 A;
+
+                fn loop_load:
+                    <entry>
+                        store(&A, i32 0);
+                        goto <header>;
+
+                    <header>
+                        %v = load(i32, &A);
+                        if i8 1 goto <body> else goto <exit>;
+
+                    <body>
+                        store(&A, i32 1);
+                        goto <header>;
+
+                    <exit>
+                        return [0x1000];
+                "
+        );
+
+        let aliases = AliasResult::simple(&ctx);
+        gvn_function(&mut ctx, loop_load, Some(&aliases));
+
+        assert!(
+            BasicBlock::from_id(&ctx, header)
+                .instruction_ids()
+                .contains(&v),
+            "header load must not be replaced by the entry store; the backedge may overwrite it"
+        );
+    }
+
+    #[test]
+    fn test_gvn_function_forwards_loads_across_loop_header_when_body_stores_do_not_alias() {
+        let mut ctx = Context::new();
+
+        qcode!(
+            ctx,
+            "
+                varnode i32 A;
+                varnode i32 B;
+
+                fn loop_load:
+                    <entry>
+                        store(&A, i32 7);
+                        goto <header>;
+
+                    <header>
+                        %v = load(i32, &A);
+                        if i8 1 goto <body> else goto <exit>;
+
+                    <body>
+                        store(&B, i32 1);
+                        goto <header>;
+
+                    <exit>
+                        return [0x1000];
+                "
+        );
+
+        let aliases = AliasResult::simple(&ctx);
+        gvn_function(&mut ctx, loop_load, Some(&aliases));
+
+        assert!(
+            !BasicBlock::from_id(&ctx, header)
+                .instruction_ids()
+                .contains(&v),
+            "header load should be replaced by the dominating store when loop stores do not alias"
+        );
+    }
+
+    /// A header that is its own loop body: the header's own store (after the load,
+    /// before the back edge) clobbers the inherited value on iterations >= 2, so
+    /// the entry store must not be forwarded into the header's load.
+    #[test]
+    fn test_gvn_function_self_loop_header_store_blocks_forwarding() {
+        let mut ctx = Context::new();
+
+        qcode!(
+            ctx,
+            "
+                varnode i32 A;
+
+                fn self_loop:
+                    <entry>
+                        store(&A, i32 0);
+                        goto <header>;
+
+                    <header>
+                        %v = load(i32, &A);
+                        store(&A, i32 1);
+                        if i8 1 goto <header> else goto <exit>;
+
+                    <exit>
+                        return [0x1000];
+                "
+        );
+
+        let aliases = AliasResult::simple(&ctx);
+        gvn_function(&mut ctx, self_loop, Some(&aliases));
+
+        assert!(
+            BasicBlock::from_id(&ctx, header)
+                .instruction_ids()
+                .contains(&v),
+            "header load must not be replaced by the entry store; the header's own store \
+             overwrites it before the back edge"
+        );
+    }
+
+    /// Constant propagation: store → load → fold chain collapses to a literal.
+    #[test]
+    fn test_constant_propagation() {
+        let mut ctx = Context::new();
+
+        qcode!(
+            ctx,
+            "
+                varnode i64 A;
+                varnode i64 B;
+                <block>
+                    store(&A, i64 5);
+                    %a = load(i64, &A);
+                    %v1 = %a + 2;
+                    %v2 = %v1 + 3;
+                    store(&B, %v2);
+                    goto <0x1001>;"
+        );
+
+        let aliases = AliasResult::simple(&ctx);
+
+        let mut block = BasicBlock::from_id_mut(&mut ctx, block);
+
+        assert!(block.instruction_ids().contains(&v1));
+        assert!(block.instruction_ids().contains(&v2));
+
+        gvn(&mut block, Some(&aliases));
+
+        assert!(!block.instruction_ids().contains(&v1));
+        assert!(!block.instruction_ids().contains(&v2));
+        assert!(block.to_string().contains("B = 0xa"));
+    }
+
+    // -----------------------------------------------------------------------
+    // Register store→load forwarding
+    // -----------------------------------------------------------------------
+
+    /// Storing to a register and reading it straight back must forward the
+    /// stored value, even when overlapping sub-registers (r0/r0_lo32/...) put
+    /// the location in a multi-member alias class. Mirrors the post-call
+    /// `*[register]:4 EAX = v; %r = *[register]:4 EAX` reload chains the lifter
+    /// emits across every fixture.
+    #[test]
+    fn test_register_store_load_forwarding() {
+        let mut tc = TestContext::new();
+        let eax = tc.r0_lo32;
+        let other = tc.r1;
+
+        qcode!(
+            tc.ctx,
+            "
+                fn func:
+                    <block>
+                        store({eax}, i32 0x12345678); # EAX = c
+                        %r = load(i32, {eax});         # %r = EAX
+                        store({other}, %r);            # use %r (keeps it live)
+                        return [0x1000];
+                "
+        );
+
+        let aliases = AliasResult::simple(&tc.ctx);
+        gvn_function(&mut tc.ctx, func, Some(&aliases));
+
+        assert!(
+            !block_contains(&tc.ctx, block, r),
+            "register reload should be forwarded to the stored value, got:\n{}",
+            BasicBlock::from_id(&tc.ctx, block)
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Memory coalesce: rebuilding a wide value from partial writes
+    // -----------------------------------------------------------------------
+
+    /// Run const-fold + GVN to a fixpoint, as the real `Gvn` pass does.
+    fn optimize(ctx: &mut Context, fun_id: FunctionId) {
+        loop {
+            let mut changed = constant_fold_function(ctx, fun_id);
+            let aliases = AliasResult::simple(ctx);
+            changed |= gvn_function(ctx, fun_id, Some(&aliases));
+            if !changed {
+                break;
+            }
+        }
+    }
+
+    fn store_src(ctx: &Context, store: ValueId) -> ValueId {
+        let ValueId::Instruction(id) = store else {
+            panic!("expected an instruction value, got {store:?}");
+        };
+        match ctx.get_insn(id).mnemonic() {
+            Mnemonic::Store(s) => s.src,
+            other => panic!("expected a store, got {other:?}"),
+        }
+    }
+
+    fn block_contains(ctx: &Context, block: BlockId, id: InstructionId) -> bool {
+        BasicBlock::from_id(ctx, block)
+            .instruction_ids()
+            .contains(&id)
+    }
+
+    fn literal_value(ctx: &Context, v: ValueId) -> Option<u64> {
+        match v {
+            ValueId::Literal(lid) => Some(ctx.values.literals[lid].value),
+            _ => None,
+        }
+    }
+
+    /// Helper: the store-to-r1 instruction in `block` (used to read its src).
+    fn load_insn_use(tc: &TestContext, block: BlockId) -> ValueId {
+        BasicBlock::from_id(&tc.ctx, block)
+            .iter()
+            .find(|i| {
+                matches!(i.mnemonic(), Mnemonic::Store(s)
+                    if matches!(s.ptr, ValueId::Varnode(v) if v == tc.r1))
+            })
+            .expect("store to r1")
+            .id()
+    }
+
+    /// `xor eax,eax; setnz al; push eax`: the wide read of EAX must be rebuilt as
+    /// `zext(%cc)` — low byte from the partial write, upper bytes from the zero.
+    #[test]
+    fn coalesce_motivating_idiom_symbolic_low_byte() {
+        let mut tc = TestContext::new();
+        let r0_byte0 = tc.r0_byte0;
+        let r0_byte1 = tc.r0_byte1;
+        let r0_lo32 = tc.r0_lo32;
+        let r1 = tc.r1;
+
+        qcode!(
+            tc.ctx,
+            "
+                fn func:
+                    <block>
+                        # A symbolic 1-byte value (the `setnz al` result), read before the zero.
+                        %cc = load(i8, {r0_byte1});
+                        store({r0_lo32}, i32 0); # xor eax, eax
+                        store({r0_byte0}, %cc);  # setnz al
+                        %load = load(i32, {r0_lo32});
+                        store({r1}, %load);      # push eax (use)
+                        return [0x1000];
+                "
+        );
+
+        optimize(&mut tc.ctx, func);
+
+        assert!(
+            !block_contains(&tc.ctx, block, load),
+            "the wide EAX read should be coalesced away:\n{}",
+            BasicBlock::from_id(&tc.ctx, block)
+        );
+
+        // After folding, the rebuilt value is exactly `zext(%cc)`.
+        let src = store_src(&tc.ctx, load_insn_use(&tc, block));
+        let ValueId::Instruction(zid) = src else {
+            panic!("expected the rebuilt value to be an instruction, got {src:?}");
+        };
+        match tc.ctx.get_insn(zid).mnemonic() {
+            Mnemonic::Zext(z) => {
+                assert_eq!(z.src, ValueId::Instruction(cc), "zext of the setnz byte")
+            }
+            other => panic!("expected zext(%cc), got {other:?}"),
+        }
+    }
+
+    /// Same idiom but the low byte is a constant: the whole read folds to a literal.
+    #[test]
+    fn coalesce_constant_idiom_folds_to_literal() {
+        let mut tc = TestContext::new();
+        let r0_byte0 = tc.r0_byte0;
+        let r0_lo32 = tc.r0_lo32;
+        let r1 = tc.r1;
+
+        qcode!(
+            tc.ctx,
+            "
+                fn func:
+                    <block>
+                        store({r0_lo32}, i32 0);
+                        store({r0_byte0}, i8 1);
+                        %v = load(i32, {r0_lo32});
+                        store({r1}, %v);
+                        return [0x1000];
+                "
+        );
+
+        optimize(&mut tc.ctx, func);
+
+        assert_eq!(
+            literal_value(&tc.ctx, store_src(&tc.ctx, load_insn_use(&tc, block))),
+            Some(1),
+            "0x00000000 with low byte 1 folds to 1"
+        );
+    }
+
+    /// Four distinct constant byte writes coalesce in little-endian order.
+    #[test]
+    fn coalesce_constant_bytes_are_little_endian() {
+        let mut tc = TestContext::new();
+        let r0_byte0 = tc.r0_byte0;
+        let r0_byte1 = tc.r0_byte1;
+        let r0_byte2 = tc.r0_byte2;
+        let r0_byte3 = tc.r0_byte3;
+        let r0_lo32 = tc.r0_lo32;
+        let r1 = tc.r1;
+
+        qcode!(
+            tc.ctx,
+            "
+                fn func:
+                    <block>
+                        store({r0_byte0}, i8 0xAA);
+                        store({r0_byte1}, i8 0xBB);
+                        store({r0_byte2}, i8 0xCC);
+                        store({r0_byte3}, i8 0xDD);
+                        %v = load(i32, {r0_lo32});
+                        store({r1}, %v);
+                        return [0x1000];
+                "
+        );
+
+        optimize(&mut tc.ctx, func);
+
+        assert_eq!(
+            literal_value(&tc.ctx, store_src(&tc.ctx, load_insn_use(&tc, block))),
+            Some(0xDDCC_BBAA),
+            "byte 0 is least significant"
+        );
+    }
+
+    /// Two symbolic byte reads coalesce into a halfword built with `zext`/`<<`/`|`.
+    #[test]
+    fn coalesce_two_symbolic_bytes_into_halfword() {
+        let mut tc = TestContext::new();
+        let r0_byte0 = tc.r0_byte0;
+        let r0_byte1 = tc.r0_byte1;
+        let r0_byte2 = tc.r0_byte2;
+        let r0_byte3 = tc.r0_byte3;
+        let r0_lo16 = tc.r0_lo16;
+        let r1 = tc.r1;
+
+        qcode!(
+            tc.ctx,
+            "
+                fn func:
+                    <block>
+                        # Symbolic sources from non-overlapping bytes (offsets 2 and 3).
+                        %x = load(i8, {r0_byte2});
+                        %y = load(i8, {r0_byte3});
+                        store({r0_byte0}, %x);
+                        store({r0_byte1}, %y);
+                        %load = load(i16, {r0_lo16});
+                        store({r1}, %load);
+                        return [0x1000];
+                "
+        );
+
+        optimize(&mut tc.ctx, func);
+
+        assert!(
+            !block_contains(&tc.ctx, block, load),
+            "the halfword read should be coalesced:\n{}",
+            BasicBlock::from_id(&tc.ctx, block)
+        );
+        // The result must not collapse to a constant (both pieces are symbolic).
+        assert!(
+            literal_value(&tc.ctx, store_src(&tc.ctx, load_insn_use(&tc, block))).is_none(),
+            "symbolic coalesce must not fold to a literal"
+        );
+    }
+
+    /// Four sub-byte reads then a wide read: the wide read coalesces all four.
+    #[test]
+    fn coalesce_four_byte_reads_into_word() {
+        let mut tc = TestContext::new();
+        let r0_byte0 = tc.r0_byte0;
+        let r0_byte1 = tc.r0_byte1;
+        let r0_byte2 = tc.r0_byte2;
+        let r0_byte3 = tc.r0_byte3;
+        let r0_lo32 = tc.r0_lo32;
+        let r1 = tc.r1;
+
+        qcode!(
+            tc.ctx,
+            "
+                fn func:
+                    <block>
+                        load(i8, {r0_byte0});
+                        load(i8, {r0_byte1});
+                        load(i8, {r0_byte2});
+                        load(i8, {r0_byte3});
+                        %load = load(i32, {r0_lo32});
+                        store({r1}, %load);
+                        return [0x1000];
+                "
+        );
+
+        optimize(&mut tc.ctx, func);
+
+        assert!(
+            !block_contains(&tc.ctx, block, load),
+            "the word read should coalesce four byte reads:\n{}",
+            BasicBlock::from_id(&tc.ctx, block)
+        );
+    }
+
+    /// A wide store then a one-byte overwrite: the wide read keeps a `Range` of the
+    /// wide store for the untouched upper bytes.
+    #[test]
+    fn coalesce_wide_store_with_one_byte_overwrite_uses_range() {
+        let mut tc = TestContext::new();
+        let r0_byte0 = tc.r0_byte0;
+        let r0_lo32 = tc.r0_lo32;
+        let r1 = tc.r1;
+
+        qcode!(
+            tc.ctx,
+            "
+                fn func:
+                    <block>
+                        %w = load(i32, {r0_lo32});
+                        store({r0_lo32}, %w); # re-store: %w is the live writer of bytes 1..4
+                        store({r0_byte0}, i8 0xAB);
+                        %v = load(i32, {r0_lo32});
+                        store({r1}, %v);
+                        return [0x1000];
+                "
+        );
+
+        optimize(&mut tc.ctx, func);
+
+        // A Range(%w, 1, 3) must have been materialized for the upper three bytes.
+        let w = ValueId::Instruction(w);
+        let has_upper_range = BasicBlock::from_id(&tc.ctx, block).iter().any(|i| {
+            matches!(i.mnemonic(), Mnemonic::Range(Range { src, start: 1, size: 3 }) if *src == w)
+        });
+        assert!(
+            has_upper_range,
+            "expected Range(%w, 1, 3) for the untouched upper bytes:\n{}",
+            BasicBlock::from_id(&tc.ctx, block)
+        );
+    }
+
+    /// A wide write then a narrow read still works (the old `range_table` path):
+    /// reading byte 1 of a wide value yields `Range(%w, 1, 1)`.
+    #[test]
+    fn narrow_read_of_wide_value_extracts_range() {
+        let mut tc = TestContext::new();
+        let r0_byte1 = tc.r0_byte1;
+        let r0_lo32 = tc.r0_lo32;
+        let r1 = tc.r1;
+
+        qcode!(
+            tc.ctx,
+            "
+                fn func:
+                    <block>
+                        %w = load(i32, {r0_lo32});
+                        store({r0_lo32}, %w);
+                        %narrow = load(i8, {r0_byte1});
+                        store({r1}, %narrow);
+                        return [0x1000];
+                "
+        );
+
+        optimize(&mut tc.ctx, func);
+
+        assert!(
+            !block_contains(&tc.ctx, block, narrow),
+            "the narrow read should be replaced by a Range"
+        );
+        let w = ValueId::Instruction(w);
+        let has_range = BasicBlock::from_id(&tc.ctx, block).iter().any(|i| {
+            matches!(i.mnemonic(), Mnemonic::Range(Range { src, start: 1, size: 1 }) if *src == w)
+        });
+        assert!(has_range, "expected Range(%w, 1, 1)");
+    }
+
+    /// A gap in coverage (byte 1 never written) leaves the wide read intact.
+    #[test]
+    fn coalesce_bails_on_coverage_gap() {
+        let mut tc = TestContext::new();
+        let r0_byte0 = tc.r0_byte0;
+        let r0_byte2 = tc.r0_byte2;
+        let r0_lo32 = tc.r0_lo32;
+        let r1 = tc.r1;
+
+        qcode!(
+            tc.ctx,
+            "
+                fn func:
+                    <block>
+                        store({r0_byte0}, i8 1);
+                        store({r0_byte2}, i8 2); # byte 1 and 3 unwritten
+                        %load = load(i32, {r0_lo32});
+                        store({r1}, %load);
+                        return [0x1000];
+                "
+        );
+
+        optimize(&mut tc.ctx, func);
+
+        assert!(
+            block_contains(&tc.ctx, block, load),
+            "a partially-covered read must not be forwarded"
+        );
+    }
+
+    /// Partial writes in a dominating block forward into a dominated successor.
+    #[test]
+    fn coalesce_across_dominating_block() {
+        let mut tc = TestContext::new();
+        let r0_byte0 = tc.r0_byte0;
+        let r0_byte1 = tc.r0_byte1;
+        let r0_lo16 = tc.r0_lo16;
+        let r1 = tc.r1;
+
+        qcode!(
+            tc.ctx,
+            "
+                fn func:
+                    <entry>
+                        store({r0_byte0}, i8 0xAA);
+                        store({r0_byte1}, i8 0xBB);
+                        goto <succ>;
+
+                    <succ>
+                        %load = load(i16, {r0_lo16});
+                        store({r1}, %load);
+                        return [0x2000];
+                "
+        );
+
+        optimize(&mut tc.ctx, func);
+
+        assert!(
+            !block_contains(&tc.ctx, succ, load),
+            "partial writes in the dominator should coalesce into the successor read:\n{}",
+            BasicBlock::from_id(&tc.ctx, succ)
+        );
+        // Both bytes are constant, so the dominated read folds to 0xBBAA.
+        let keep = load_insn_use(&tc, succ);
+        assert_eq!(
+            literal_value(&tc.ctx, store_src(&tc.ctx, keep)),
+            Some(0xBBAA)
+        );
+    }
+
+    /// With no alias oracle the byte map is inert: only exact opaque matches forward,
+    /// so a coalesce-shaped read is left untouched.
+    #[test]
+    fn no_alias_oracle_disables_coalesce() {
+        let mut tc = TestContext::new();
+
+        let r0_byte0 = tc.r0_byte0;
+        let r0_byte1 = tc.r0_byte1;
+        let r0_lo16 = tc.r0_lo16;
+        let r0 = tc.r1;
+
+        qcode!(
+            tc.ctx,
+            "
+                <block>
+                    store({r0_byte0}, i32 0xAA);
+                    store({r0_byte1}, i32 0xBB);
+
+                    %load = load(i32, {r0_lo16});
+                    store(%load, {r0});
+                    goto <0x1000>;"
+        );
+
+        let mut bb = BasicBlock::from_id_mut(&mut tc.ctx, block);
+        gvn(&mut bb, None);
+
+        assert!(
+            block_contains(&tc.ctx, block, load),
+            "without an alias oracle the coalesce read must remain"
+        );
+    }
+}

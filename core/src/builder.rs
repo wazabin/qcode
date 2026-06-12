@@ -34,7 +34,8 @@ use std::{borrow::Cow, cmp, collections::HashMap};
 
 use crate::{
     context::Context,
-    space::{SPACE_CONST, SpaceId},
+    space::{SPACE_CONST, Space, SpaceId, SpaceType},
+    types::TypeId,
     value::{
         Function, Instruction, Renameable, Value, ValueId, ValueRef,
         block::{BasicBlock, BlockId, BlockMutRef},
@@ -42,9 +43,9 @@ use crate::{
         function::FunctionId,
         insn::{
             Binary, Binop, BoolBinop, Branch, BranchInd, CBranch, Call, CallInd, Carry, FloatBinop,
-            FloatToFloat, FloatToInt, InstructionRef, IntBinop, IntToFloat, IsFloatNaN, Load,
-            LzCount, Mnemonic, PCodeOp, PCodeOpId, PopCount, Range, Return, SBorrow, SCarry, Sext,
-            Store, Unary, Unop, Zext,
+            FloatToFloat, FloatToInt, InstructionId, InstructionRef, IntBinop, IntToFloat,
+            IsFloatNaN, Load, LzCount, Mnemonic, PCodeOp, PCodeOpId, PopCount, Range, Return,
+            SBorrow, SCarry, Sext, Store, Unary, Unop, Zext,
         },
         util::base_ref::{WithCtx, WithCtxMut},
         varnode::{Varnode, VarnodeId},
@@ -71,6 +72,13 @@ pub struct Builder<'str, 'ctx> {
     pub(crate) is_terminated: bool,
 
     verify_terminated: bool,
+
+    /// Explicit insert position for new instructions.
+    ///
+    /// `None` (default) appends to the end of the block.
+    /// `Some(n)` inserts at index `n` and auto-advances after each push,
+    /// so consecutive pushes form a contiguous sequence starting at `n`.
+    insert_point: Option<usize>,
 }
 
 /// Generates a canonical comparison method and its "greater-than" mirror (operands swapped).
@@ -98,6 +106,7 @@ impl<'str, 'ctx> Builder<'str, 'ctx> {
             namespace: HashMap::new(),
             local_labels: HashMap::new(),
             address: None,
+            insert_point: None,
         }
     }
 
@@ -124,6 +133,44 @@ impl<'str, 'ctx> Builder<'str, 'ctx> {
     /// Remove the current address
     pub fn clear_address(&mut self) {
         self.address = None;
+    }
+
+    /// Positions the builder at the beginning of the block.
+    ///
+    /// Subsequent `push_*` calls insert instructions starting at index 0,
+    /// advancing by 1 after each push, so they appear in push order as a
+    /// contiguous prefix before any pre-existing instructions.
+    ///
+    /// This allows inserting synthetic preamble instructions (e.g. a
+    /// symbolic stack-pointer initialization) into a block that already
+    /// contains lifted code, without disturbing the relative order of
+    /// either the new or the existing instructions.
+    pub fn set_insert_point_to_start(&mut self) {
+        self.insert_point = Some(0);
+    }
+
+    /// Positions the builder immediately before an existing instruction in the
+    /// current block.
+    ///
+    /// Subsequent `push_*` calls insert instructions starting at that position,
+    /// advancing by 1 after each push, so they appear in push order immediately
+    /// before `before_id` and after any earlier inserted instructions.
+    ///
+    /// Panics if `before_id` is not an instruction in the current block.
+    pub fn set_insert_point_before(&mut self, before_id: InstructionId) {
+        let index = self
+            .block
+            .as_ref()
+            .instruction_ids()
+            .iter()
+            .position(|&id| id == before_id)
+            .expect("before_id not found in block");
+        self.insert_point = Some(index);
+    }
+
+    /// Resets the insert point to append mode (the default).
+    pub fn set_insert_point_to_end(&mut self) {
+        self.insert_point = None;
     }
 
     /// Disables the termination check that runs when the builder is dropped.
@@ -255,7 +302,8 @@ impl<'str, 'ctx> Builder<'str, 'ctx> {
     /// Panics if the block is already terminated (ends with a branch/call/return).
     #[track_caller]
     fn push_instruction(&mut self, mnemonic: Mnemonic, size: usize) -> InstructionRef<'str, '_> {
-        self.push_instruction_in_space(mnemonic, size, None)
+        let type_id = self.context_mut().types.get_or_make_int(size);
+        self.push_instruction_with_type(mnemonic, type_id)
     }
 
     #[track_caller]
@@ -265,18 +313,51 @@ impl<'str, 'ctx> Builder<'str, 'ctx> {
         size: usize,
         space: Option<SpaceId>,
     ) -> InstructionRef<'str, '_> {
-        if self.is_terminated {
-            panic!("cannot push instruction to a terminated block");
+        let type_id = {
+            let ctx = self.context_mut();
+            match space {
+                Some(sid)
+                    if ctx
+                        .types
+                        .stack_address_id()
+                        .and_then(|sa| ctx.types.space_of(sa))
+                        == Some(sid) =>
+                {
+                    ctx.types.stack_address_id().unwrap()
+                }
+                _ => ctx.types.get_or_make_int(size),
+            }
+        };
+        self.push_instruction_with_type(mnemonic, type_id)
+    }
+
+    #[track_caller]
+    fn push_instruction_with_type(
+        &mut self,
+        mnemonic: Mnemonic,
+        type_id: TypeId,
+    ) -> InstructionRef<'str, '_> {
+        if self.is_terminated && self.insert_point.is_none() {
+            if let Some(address) = self.address.or_else(|| self.block.address()) {
+                panic!("cannot append instruction to a terminated block at {address:#x}");
+            }
+            panic!("cannot append instruction to a terminated block");
         }
 
-        let id =
-            InstructionRef::from_mnemonic_with_space(self.context_mut(), mnemonic, size, space).id;
+        let id = InstructionRef::from_mnemonic_with_type(self.context_mut(), mnemonic, type_id).id;
 
         if let Some(address) = self.address {
             Instruction::from_id_mut(self.context_mut(), id).set_address(address);
         }
 
-        self.block.push_insn(id);
+        match self.insert_point {
+            None => self.block.push_insn(id),
+            Some(ref mut pos) => {
+                self.block.insert_insn_at_index(*pos, id);
+                *pos += 1;
+            }
+        }
+
         self.context().get_insn(id)
     }
 
@@ -284,6 +365,11 @@ impl<'str, 'ctx> Builder<'str, 'ctx> {
         ValueRef::from_id(self.context(), id)
     }
 
+    /// The common address-space provenance of two pointer-arithmetic operands.
+    ///
+    /// Returns the space carried by whichever operand has one (varnodes carry
+    /// their space; pointer-typed instructions carry theirs), or `None` when the
+    /// two disagree or neither has a space.
     fn merge_space_ids(&self, lhs: ValueId, rhs: ValueId) -> Option<SpaceId> {
         match (
             ValueRef::from_id(self.context(), lhs).space().map(|s| s.id),
@@ -293,6 +379,27 @@ impl<'str, 'ctx> Builder<'str, 'ctx> {
             (Some(space), None) | (None, Some(space)) => Some(space),
             _ => None,
         }
+    }
+
+    fn is_literal(&self, id: ValueId) -> bool {
+        matches!(id, ValueId::Literal(_))
+    }
+
+    fn coerce_literal_size(&mut self, id: ValueId, size: usize) -> ValueId {
+        let ValueId::Literal(lit_id) = id else {
+            return id;
+        };
+        let literal = self.context().values.literals[lit_id].clone();
+        let current_size = self.context().types.size_of(literal.type_id);
+        if current_size == size || literal.symbolic.is_some() {
+            return id;
+        }
+        // Preserve the type kind (e.g. StackAddress) but resize.
+        if self.context().types.is_stack_address(literal.type_id) {
+            // StackAddress is always pointer-width; don't resize.
+            return id;
+        }
+        self.context_mut().get_const(literal.value, size).id()
     }
 
     fn ensure_created_block_in_function(&mut self, block: BlockId) {
@@ -526,12 +633,75 @@ impl<'str, 'ctx> Builder<'str, 'ctx> {
         rhs: ValueId,
         size: Option<usize>,
     ) -> InstructionRef<'str, '_> {
-        let size = size.unwrap_or_else(|| ValueRef::new(lhs, self.context()).size());
-        let space = match op {
-            Binop::Int(IntBinop::Add | IntBinop::Sub) => self.merge_space_ids(lhs, rhs),
-            _ => None,
+        let lhs_size = ValueRef::new(lhs, self.context()).size();
+        let rhs_size = ValueRef::new(rhs, self.context()).size();
+        let operand_size = match (
+            lhs_size == rhs_size,
+            self.is_literal(lhs),
+            self.is_literal(rhs),
+        ) {
+            (true, _, _) => lhs_size,
+            (false, true, false) => rhs_size,
+            (false, false, true) => lhs_size,
+            (false, true, true) => lhs_size.max(rhs_size),
+            // Two non-literal operands of differing size. This is legitimate for
+            // shifts (the shift amount may be wider than the value) and also
+            // occurs for some lifted comparisons. Neither operand is a literal,
+            // so `coerce_literal_size` below is a no-op; we keep both operands as
+            // emitted and let the result type derive from the lhs, matching the
+            // historical tolerant behaviour the emulator already relies on.
+            (false, false, false) => lhs_size,
         };
-        self.push_instruction_in_space(Mnemonic::Binop(Binary { op, lhs, rhs }), size, space)
+        let lhs = self.coerce_literal_size(lhs, operand_size);
+        let rhs = self.coerce_literal_size(rhs, operand_size);
+
+        // Determine result type using the TypeManager's arithmetic rules.
+        let result_type = {
+            let ctx = self.context_mut();
+            let lhs_type = ctx.type_of(lhs);
+            let rhs_type = ctx.type_of(rhs);
+            ctx.types.binop_result(lhs_type, op, rhs_type)
+        };
+
+        // Comparisons always override the result size to 1.
+        let result_type = if let Some(forced_size) = size {
+            let current_size = self.context().types.size_of(result_type);
+            if forced_size != current_size {
+                self.context_mut().types.get_or_make_int(forced_size)
+            } else {
+                result_type
+            }
+        } else {
+            result_type
+        };
+
+        // Restore address-space provenance for pointer arithmetic. When the
+        // result is not already a space pointer (e.g. a `StackAddress` produced
+        // from a stack-base operand), `Add`/`Sub` inherit the space of whichever
+        // operand carries one — so `&A + k` points into `A`'s space. Register
+        // spaces are excluded (pointer arithmetic is not allowed there).
+        let result_type = if self.context().types.space_of(result_type).is_none()
+            && matches!(op, Binop::Int(IntBinop::Add | IntBinop::Sub))
+        {
+            match self.merge_space_ids(lhs, rhs) {
+                Some(space)
+                    if !matches!(
+                        Space::from_id(self.context(), space).ty,
+                        SpaceType::Register
+                    ) =>
+                {
+                    let size = self.context().types.size_of(result_type);
+                    self.context_mut()
+                        .types
+                        .get_or_make_space_address(size, space)
+                }
+                _ => result_type,
+            }
+        } else {
+            result_type
+        };
+
+        self.push_instruction_with_type(Mnemonic::Binop(Binary { op, lhs, rhs }), result_type)
     }
 
     // --- Arithmetic ---
@@ -985,6 +1155,7 @@ impl<'str, 'ctx> Builder<'str, 'ctx> {
                 Mnemonic::Call(Call {
                     target,
                     args: vec![],
+                    clobbers: vec![],
                 }),
                 0,
             )
@@ -1277,6 +1448,32 @@ mod tests {
     }
 
     #[test]
+    fn append_after_terminated_block_panic_includes_current_address() {
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let mut ctx = Context::new();
+            let value = ctx.get_const(0, 1).id();
+            let mut builder = Builder::from_context(&mut ctx, 0x4010);
+            let target = builder.get_or_make_block(0x4020);
+
+            builder.push_branch(target);
+            builder.set_address(0x4015);
+            builder.push_bool_not(value);
+        }));
+
+        let panic = result.expect_err("append should panic after a terminator");
+        let message = panic
+            .downcast_ref::<String>()
+            .map(String::as_str)
+            .or_else(|| panic.downcast_ref::<&'static str>().copied())
+            .expect("panic should carry a string message");
+
+        assert!(
+            message.contains("cannot append instruction to a terminated block at 0x4015"),
+            "unexpected panic message: {message}"
+        );
+    }
+
+    #[test]
     fn push_copy_supports_partial_final_lane() {
         let mut ctx = Context::new();
         let block_id = ctx.get_or_make_block(0x1000);
@@ -1297,5 +1494,130 @@ mod tests {
             })
             .collect::<Vec<_>>();
         assert_eq!(store_sizes, [8, 1]);
+    }
+
+    // --- insert-point tests ---
+
+    #[test]
+    fn insert_point_to_start_prepends_before_existing_instruction() {
+        let mut ctx = Context::new();
+        let block_id = ctx.get_or_make_block(0x1000);
+        let val = ctx.get_const(0, 8).id();
+
+        let existing_id = {
+            let mut b = Builder::from_block(BasicBlock::from_id_mut(&mut ctx, block_id));
+            let id = b.push_bool_not(val).id;
+            unsafe { b.dont_finalize() };
+            id
+        };
+
+        let prepended_id = {
+            let mut b = Builder::from_block(BasicBlock::from_id_mut(&mut ctx, block_id));
+            b.set_insert_point_to_start();
+            unsafe { b.dont_finalize() };
+            b.push_bool_not(val).id
+        };
+
+        let ids: Vec<_> = BasicBlock::from_id(&ctx, block_id)
+            .instruction_ids()
+            .to_vec();
+        assert_eq!(ids, [prepended_id, existing_id]);
+    }
+
+    #[test]
+    fn multiple_pushes_with_insert_point_to_start_preserve_push_order() {
+        let mut ctx = Context::new();
+        let block_id = ctx.get_or_make_block(0x1000);
+        let val = ctx.get_const(0, 8).id();
+
+        let existing_id = {
+            let mut b = Builder::from_block(BasicBlock::from_id_mut(&mut ctx, block_id));
+            let id = b.push_bool_not(val).id;
+            unsafe { b.dont_finalize() };
+            id
+        };
+
+        let (id0, id1, id2) = {
+            let mut b = Builder::from_block(BasicBlock::from_id_mut(&mut ctx, block_id));
+            b.set_insert_point_to_start();
+            unsafe { b.dont_finalize() };
+            (
+                b.push_bool_not(val).id,
+                b.push_bool_not(val).id,
+                b.push_bool_not(val).id,
+            )
+        };
+
+        let ids: Vec<_> = BasicBlock::from_id(&ctx, block_id)
+            .instruction_ids()
+            .to_vec();
+        assert_eq!(ids, [id0, id1, id2, existing_id]);
+    }
+
+    #[test]
+    fn insert_point_before_existing_instruction_inserts_before_target() {
+        let mut ctx = Context::new();
+        let block_id = ctx.get_or_make_block(0x1000);
+        let val = ctx.get_const(0, 8).id();
+
+        let (first_id, target_id) = {
+            let mut b = Builder::from_block(BasicBlock::from_id_mut(&mut ctx, block_id));
+            unsafe { b.dont_finalize() };
+            (b.push_bool_not(val).id, b.push_bool_not(val).id)
+        };
+
+        let (inserted0, inserted1) = {
+            let mut b = Builder::from_block(BasicBlock::from_id_mut(&mut ctx, block_id));
+            b.set_insert_point_before(target_id);
+            unsafe { b.dont_finalize() };
+            (b.push_bool_not(val).id, b.push_bool_not(val).id)
+        };
+
+        let ids: Vec<_> = BasicBlock::from_id(&ctx, block_id)
+            .instruction_ids()
+            .to_vec();
+        assert_eq!(ids, [first_id, inserted0, inserted1, target_id]);
+    }
+
+    #[test]
+    fn insert_point_to_start_allows_push_into_terminated_block() {
+        let mut ctx = Context::new();
+        qcode!(ctx, "<entry> goto <0x1001>;");
+
+        let val = ctx.get_const(1, 1).id();
+        let new_id = {
+            let mut b = Builder::from_block(BasicBlock::from_id_mut(&mut ctx, entry));
+            b.set_insert_point_to_start();
+            unsafe { b.dont_finalize() };
+            b.push_bool_not(val).id
+        };
+
+        let block = BasicBlock::from_id(&ctx, entry);
+        assert_eq!(block.instruction_ids()[0], new_id);
+        // The original branch terminator is still present
+        assert!(block.is_terminated());
+    }
+
+    #[test]
+    fn set_insert_point_to_end_restores_append_mode() {
+        let mut ctx = Context::new();
+        let block_id = ctx.get_or_make_block(0x1000);
+        let val = ctx.get_const(0, 8).id();
+
+        let (first_id, middle_id, last_id) = {
+            let mut b = Builder::from_block(BasicBlock::from_id_mut(&mut ctx, block_id));
+            unsafe { b.dont_finalize() };
+            let first = b.push_bool_not(val).id; // appended → index 0
+            b.set_insert_point_to_start();
+            let middle = b.push_bool_not(val).id; // inserted at 0, first shifts to 1
+            b.set_insert_point_to_end();
+            let last = b.push_bool_not(val).id; // appended → index 2
+            (first, middle, last)
+        };
+
+        let ids: Vec<_> = BasicBlock::from_id(&ctx, block_id)
+            .instruction_ids()
+            .to_vec();
+        assert_eq!(ids, [middle_id, first_id, last_id]);
     }
 }

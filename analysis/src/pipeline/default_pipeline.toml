@@ -1,0 +1,79 @@
+# The canonical default analysis pipeline (the inner body the checkpoint+replay
+# driver in `analyze_default` runs each round; the `assume_call_returns` /
+# `verify_assumptions` steps that wrap it are the driver's job, not stages here).
+#
+# Each stage runs in order. A stage is `scope = "function"` (its passes run on
+# every non-external function, function-major) or `scope = "module"` (its passes
+# run once over the whole program). `repeat_until = "no_change"` loops a stage to
+# a fixpoint — per function for function-scoped stages, whole-program for
+# module-scoped ones.
+
+# Seed each function's call-clobbered-register set from the lifted IR before the
+# value-producing passes consult it.
+[[stage]]
+name = "seed-clobbers"
+scope = "module"
+passes = ["seed_clobbers"]
+
+# Value-producing passes, per function (the pre-bind group).
+[[stage]]
+name = "brighten"
+scope = "function"
+passes = ["brighten"]
+
+# Promote to a fixpoint: each round may expose a register as the symbolic stack
+# base, then const-fold rewrites its arithmetic into stack-slot literals that
+# become promotable on the next round.
+[[stage]]
+name = "promote"
+scope = "function"
+passes = ["mem2reg", "const_fold"]
+repeat_until = "no_change"
+
+[[stage]]
+name = "gvn"
+scope = "function"
+passes = ["gvn"]
+
+# Simplify so the lifter's straight-line goto-chains are merged into single
+# blocks: the binder forwards each call's argument loads to the reaching
+# arg-setup store via gvn's intra-block forwarding, so store and call must share
+# a block.
+[[stage]]
+name = "simplify"
+scope = "function"
+passes = ["simplify"]
+
+# Interprocedural binding milestones, whole-program, after every function is
+# post-mem2reg/gvn but *before* the eliminating passes (so the arg-setup stores
+# are still alive for the binder to forward).
+[[stage]]
+name = "bind"
+scope = "module"
+passes = ["external_sigs", "summaries", "bind_args"]
+
+# Eliminating passes, per function: drop the now-dead arg-setup stores and the
+# loads the binder forwarded.
+[[stage]]
+name = "post-bind"
+scope = "function"
+passes = ["dead_store", "dce"]
+
+# Lowering last: rewrite the surviving `@stack_base ± N` literals back onto each
+# function's real stack pointer, then clear the dead artifacts that exposes (a
+# caller-side RSP relink whose store is overwritten before use): DCE drops the
+# dead arithmetic, DeadStore the now-unused register load it fed, a final DCE
+# anything that exposes.
+[[stage]]
+name = "lower"
+scope = "function"
+passes = ["lower_stack", "dce", "dead_store", "dce"]
+
+# Aesthetic changes. `include_external` so the demangler also reaches imported
+# library functions (PLT stubs like `_ZNSsixEj` -> `std::string::operator[]`),
+# which are bodyless and therefore skipped by function-scoped stages by default.
+[[stage]]
+name = "cleanup"
+scope = "function"
+passes = ["cpp_demangle"]
+include_external = true

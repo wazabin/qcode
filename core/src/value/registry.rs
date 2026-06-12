@@ -1,11 +1,15 @@
-use crate::value::{
-    ValueId,
-    block::{BasicBlock, BlockId, EdgeData, EdgeId},
-    block_param::{BlockParam, BlockParamId},
-    function::{Function, FunctionId},
-    insn::{Instruction, InstructionId},
-    literal::{Literal, LiteralId},
-    varnode::{Varnode, VarnodeId},
+use crate::{
+    assumption::{KnownContradiction, Proposition, Truth, Violation},
+    types::TypeId,
+    value::{
+        ValueId,
+        block::{BasicBlock, BlockId, EdgeData, EdgeId},
+        block_param::{BlockParam, BlockParamId},
+        function::{Function, FunctionId},
+        insn::{Instruction, InstructionId},
+        literal::{Literal, LiteralId},
+        varnode::{Varnode, VarnodeId},
+    },
 };
 use jstd::registry::Registry;
 use std::collections::{HashMap, HashSet};
@@ -28,7 +32,7 @@ use std::collections::{HashMap, HashSet};
 ///   directly. Use [`users_of`](Self::users_of) to read and
 ///   [`remove_instructions`](Self::remove_instructions) to remove dead
 ///   instructions from the map.
-#[derive(Clone, Default)]
+#[derive(Clone, Default, serde::Serialize, serde::Deserialize)]
 pub struct ValueRegistry<'str> {
     /// Literal (constant) storage.
     pub literals: Registry<LiteralId, Literal>,
@@ -51,43 +55,64 @@ pub struct ValueRegistry<'str> {
     /// Function storage.
     pub functions: Registry<FunctionId, Function<'str>>,
 
+    /// Truth map of the assumption system: what each [`Proposition`] is
+    /// currently assumed or known to be (see [`crate::assumption`]). Accessed
+    /// through [`Context::assume_true`](crate::context::Context::assume_true)
+    /// and friends.
+    pub(crate) truths: HashMap<Proposition, Truth>,
+
+    /// Proven facts that contradicted an assumption this round; non-empty means
+    /// the checkpoint+replay driver must discard this working copy and replay.
+    pub(crate) violations: Vec<Violation>,
+
+    /// Proven facts that contradicted an existing *known* fact this round (e.g. a
+    /// user override the analysis disproved). A hard error for the driver, not a
+    /// replay signal. Transient per round, so not serialized.
+    #[serde(default, skip)]
+    pub(crate) known_contradictions: Vec<KnownContradiction>,
+
     /// Reverse use-def map: for each `ValueId`, the list of instructions that
     /// use it as an operand. Kept in sync by [`push_insn`](Self::push_insn),
     /// [`remove_instructions`](Self::remove_instructions), and
     /// [`Context::replace_all_uses_with`].
     pub(crate) users: HashMap<ValueId, Vec<InstructionId>>,
 
-    /// Intern cache for non-symbolic literals: `(masked_value, size) → LiteralId`.
-    literal_cache: HashMap<(u64, usize), LiteralId>,
+    /// Intern cache for non-symbolic literals: `(masked_value, TypeId) → LiteralId`.
+    literal_cache: HashMap<(u64, TypeId), LiteralId>,
 }
 
 impl<'str> ValueRegistry<'str> {
-    /// Returns a canonical [`LiteralId`] for the given integer constant.
+    /// Returns a canonical [`LiteralId`] for the given typed constant.
     ///
-    /// The value is masked to `size` bytes before lookup so that, for example,
-    /// `get_or_make_literal(0x1ff, 1)` and `get_or_make_literal(0xff, 1)` both
-    /// return the same `LiteralId`.
+    /// The value is masked to `type_id`'s size before lookup. Symbolic literals
+    /// (created via [`push_literal`](Self::push_literal)) are not included in
+    /// the intern cache and will not alias with constants produced here.
     ///
-    /// Symbolic literals (created via [`push_literal`](Self::push_literal)) are
-    /// not included in the intern cache and will not alias with constants
-    /// produced here.
-    pub fn get_or_make_literal(&mut self, mut value: u64, size: usize) -> LiteralId {
+    /// Call [`Context::get_const`] for the common `Int(size)` case; use this
+    /// method directly when you need to preserve a non-`Int` type (e.g.
+    /// [`StackAddress`](crate::types::StackAddress)) through folding.
+    pub fn get_or_make_typed_literal(
+        &mut self,
+        mut value: u64,
+        type_id: TypeId,
+        size: usize,
+    ) -> LiteralId {
         value &= if size >= 8 {
             u64::MAX
         } else {
             (1u64 << (size * 8)) - 1
         };
 
-        if let Some(&id) = self.literal_cache.get(&(value, size)) {
+        if let Some(&id) = self.literal_cache.get(&(value, type_id)) {
             return id;
         }
 
         let id = self.literals.push(Literal {
             value,
-            size,
+            type_id,
             symbolic: None,
         });
-        self.literal_cache.insert((value, size), id);
+        self.literal_cache.insert((value, type_id), id);
         id
     }
 

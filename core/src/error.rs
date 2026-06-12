@@ -65,6 +65,9 @@ pub enum ErrorTy {
         expected: BlockId,
         actual: BlockId,
     },
+
+    /// A pass was invoked on a function that has no root (entry) block.
+    NoRootBlock,
 }
 
 #[derive(Debug)]
@@ -225,6 +228,8 @@ impl Display for Error {
             ErrorTy::FunctionRootMismatch { expected, actual } => {
                 format!("Function root mismatch: expected root block {expected:?}, got {actual:?}")
             }
+
+            ErrorTy::NoRootBlock => "function has no root (entry) block".to_string(),
         };
 
         if let Some((start, end)) = self.span {

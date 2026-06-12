@@ -7,7 +7,7 @@ use crate::{
 
 use super::mnemonic::MnemonicKind;
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub struct Binary {
     pub op: Binop,
     pub lhs: ValueId,
@@ -35,7 +35,7 @@ impl MnemonicKind for Binary {
 }
 
 #[non_exhaustive]
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub enum Binop {
     Int(IntBinop),
     Bool(BoolBinop),
@@ -53,7 +53,7 @@ impl Display for Binop {
 }
 
 #[non_exhaustive]
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub enum BoolBinop {
     And,
     Or,
@@ -87,7 +87,7 @@ impl Display for BoolBinop {
 }
 
 #[non_exhaustive]
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub enum IntBinop {
     Equal,
     NotEqual,
@@ -189,7 +189,7 @@ impl Display for IntBinop {
 }
 
 #[non_exhaustive]
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub enum FloatBinop {
     Equal,
     NotEqual,

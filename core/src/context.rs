@@ -7,12 +7,15 @@ use std::{
 };
 
 use crate::{
+    assumption::{Certainty, KnownContradiction, PassName, Proposition, Truth, Violation},
     error::{Error, ErrorTy, Result},
+    pass_scope,
     space::{Space, SpaceId},
+    types::TypeManager,
     value::{
         BasicBlock, Function, FunctionId, FunctionRef, Instruction, ValueId,
         block::{BlockId, BlockMutRef, BlockRef, EdgeData, EdgeId, EdgeMutRef, EdgeRef},
-        insn::{InstructionId, InstructionRef, PCodeOpId},
+        insn::{InstructionId, InstructionRef, Mnemonic, PCodeOpId},
         literal::{LiteralId, LiteralRef},
         registry::ValueRegistry,
         varnode::{Varnode, VarnodeId, VarnodeRef, register::RegisterId},
@@ -49,7 +52,7 @@ use jstd::{
 /// and space identifiers. When names are owned (e.g. generated names), they
 /// are stored as `Cow::Owned`; when they are borrowed from source data they are
 /// `Cow::Borrowed` and must outlive the context.
-#[derive(Default, Clone)]
+#[derive(Default, Clone, serde::Serialize, serde::Deserialize)]
 pub struct Context<'str> {
     pub default_space: SpaceId,
 
@@ -73,6 +76,9 @@ pub struct Context<'str> {
 
     /// The values available in the context, indexed by their ID
     pub values: ValueRegistry<'str>,
+
+    /// Type registry: owns all [`Type`] objects and hands out [`TypeId`]s.
+    pub types: TypeManager,
 }
 
 impl<'str> Context<'str> {
@@ -200,11 +206,157 @@ impl<'str> Context<'str> {
             .map(|v| Varnode::from_id(self, v.id))
     }
 
-    /// Adds a directed edge in the CFG from `from` to `to`.
-    pub fn add_cfg_edge(&mut self, from: BlockId, to: BlockId) {
+    /// Adds a directed edge in the CFG from `from` to `to`, returning its id.
+    pub fn add_cfg_edge(&mut self, from: BlockId, to: BlockId) -> EdgeId {
         let edge_id = self.values.edges.push(EdgeData { from, to });
         BasicBlock::from_id_mut(self, from).add_edge(edge_id);
         BasicBlock::from_id_mut(self, to).add_edge(edge_id);
+        edge_id
+    }
+
+    /// Removes a CFG edge, unlinking it from both incident blocks' edge sets.
+    ///
+    /// The backing [`EdgeData`] slot in the append-only registry is left in
+    /// place (dangling), consistent with how removed instructions are handled;
+    /// per-block traversal reads the block edge sets, which this updates.
+    pub fn remove_cfg_edge(&mut self, edge_id: EdgeId) {
+        let EdgeData { from, to } = self.values.edges[edge_id];
+        BasicBlock::from_id_mut(self, from).remove_edge(edge_id);
+        BasicBlock::from_id_mut(self, to).remove_edge(edge_id);
+    }
+
+    /// Assumes `prop` is true. Returns `false` (and records nothing) if the
+    /// proposition is already assumed or known false; returns `true` if it was
+    /// recorded or already held with the same polarity (idempotent). The
+    /// recording pass is taken from [`pass_scope`](crate::pass_scope).
+    pub fn assume_true(&mut self, prop: Proposition) -> bool {
+        self.assume(prop, true)
+    }
+
+    /// Assumes `prop` is false. Mirror of [`assume_true`](Self::assume_true).
+    pub fn assume_false(&mut self, prop: Proposition) -> bool {
+        self.assume(prop, false)
+    }
+
+    fn assume(&mut self, prop: Proposition, value: bool) -> bool {
+        match self.values.truths.get(&prop) {
+            Some(t) => t.value == value,
+            None => {
+                self.values.truths.insert(
+                    prop,
+                    Truth {
+                        value,
+                        certainty: Certainty::Assumed,
+                        pass: PassName(pass_scope::current_pass()),
+                    },
+                );
+                true
+            }
+        }
+    }
+
+    /// Records `prop = value` as proven, overriding any assumption. If this
+    /// contradicts an existing assumption, a [`Violation`] is recorded — the
+    /// checkpoint+replay driver's signal to discard this working copy.
+    /// Contradicting an existing *known* fact is a logic error.
+    ///
+    /// Returns `true` if the fact is *novel* (no prior truth, or it overturned
+    /// an assumption): the driver replays when a round produced novel facts.
+    pub fn set_known(&mut self, prop: Proposition, value: bool) -> bool {
+        let pass = PassName(pass_scope::current_pass());
+        let novel = match self.values.truths.get(&prop) {
+            Some(prior) => {
+                // Proving the opposite of an already-*known* fact (e.g. a user
+                // override the analysis disproves) is not a replay signal: record
+                // it as a hard contradiction and keep the original known value so
+                // the driver can surface an error and terminate.
+                if prior.certainty == Certainty::Known && prior.value != value {
+                    self.values.known_contradictions.push(KnownContradiction {
+                        prop,
+                        known: prior.value,
+                        proven: value,
+                        known_pass: prior.pass,
+                        proven_pass: pass,
+                    });
+                    return false;
+                }
+                if prior.certainty == Certainty::Assumed && prior.value != value {
+                    self.values.violations.push(Violation {
+                        prop,
+                        assumed: prior.value,
+                        assuming_pass: prior.pass,
+                        asserting_pass: pass,
+                    });
+                    true
+                } else {
+                    false
+                }
+            }
+            None => true,
+        };
+        self.values.truths.insert(
+            prop,
+            Truth {
+                value,
+                certainty: Certainty::Known,
+                pass,
+            },
+        );
+        novel
+    }
+
+    /// Seeds a proven fact carried over from an earlier checkpoint+replay
+    /// round. Unlike [`set_known`](Self::set_known) this is not "novel": it
+    /// must not retrigger a replay, and seeding over an existing entry is a
+    /// logic error (seed before any pass runs).
+    pub fn seed_known(&mut self, prop: Proposition, value: bool) {
+        let prior = self.values.truths.insert(
+            prop,
+            Truth {
+                value,
+                certainty: Certainty::Known,
+                pass: PassName(pass_scope::current_pass()),
+            },
+        );
+        debug_assert!(prior.is_none(), "seeding {prop:?} over an existing truth");
+    }
+
+    /// The recorded [`Truth`] of `prop`, if any.
+    pub fn truth(&self, prop: Proposition) -> Option<Truth> {
+        self.values.truths.get(&prop).copied()
+    }
+
+    /// The proven value of `prop`: `Some` only for *known* entries.
+    pub fn known(&self, prop: Proposition) -> Option<bool> {
+        self.truth(prop)
+            .filter(|t| t.certainty == Certainty::Known)
+            .map(|t| t.value)
+    }
+
+    /// Iterates over every recorded truth (assumed and known).
+    pub fn truths(&self) -> impl Iterator<Item = (Proposition, Truth)> + '_ {
+        self.values.truths.iter().map(|(&p, &t)| (p, t))
+    }
+
+    /// Iterates over the proven facts, for the replay driver to harvest into
+    /// the next round's [`seed_known`](Self::seed_known) calls.
+    pub fn known_facts(&self) -> impl Iterator<Item = (Proposition, bool)> + '_ {
+        self.truths()
+            .filter(|(_, t)| t.certainty == Certainty::Known)
+            .map(|(p, t)| (p, t.value))
+    }
+
+    /// The violations recorded this round (proven facts that contradicted an
+    /// assumption). Non-empty means derived IR may be wrong: replay.
+    pub fn violations(&self) -> &[Violation] {
+        &self.values.violations
+    }
+
+    /// Facts proven this round that contradicted an existing *known* fact (e.g. a
+    /// user override the analysis disproved). Non-empty means the analysis cannot
+    /// honor the forced value; the driver surfaces this as a hard error.
+    pub fn known_contradictions(&self) -> &[KnownContradiction] {
+        &self.values.known_contradictions
     }
 
     /// Returns the raw `u64` backing value of the literal `id`.
@@ -223,10 +375,45 @@ impl<'str> Context<'str> {
         Varnode::from_id(self, self.registers[&id])
     }
 
-    /// Creates a [`Value`] representing a constant value.
+    /// Creates a [`Value`] representing an integer constant of the given byte width.
     pub fn get_const(&mut self, value: u64, size: usize) -> LiteralRef<'str, '_> {
-        let id = self.values.get_or_make_literal(value, size);
+        let type_id = self.types.get_or_make_int(size);
+        let id = self.values.get_or_make_typed_literal(value, type_id, size);
         LiteralRef::new(self, id)
+    }
+
+    /// Creates a typed constant literal.
+    ///
+    /// Unlike [`get_const`](Self::get_const) this accepts an arbitrary [`TypeId`],
+    /// allowing StackAddress constants (e.g. the stack base) to preserve their
+    /// type through constant folding.
+    pub fn get_typed_const(
+        &mut self,
+        value: u64,
+        type_id: crate::types::TypeId,
+    ) -> LiteralRef<'str, '_> {
+        let size = self.types.size_of(type_id);
+        let id = self.values.get_or_make_typed_literal(value, type_id, size);
+        LiteralRef::new(self, id)
+    }
+
+    /// Returns the [`TypeId`] of any [`ValueId`] in this context.
+    ///
+    /// Varnodes are typed as `Int(varnode.size())`. Blocks, functions, and other
+    /// non-data values return `Int(0)`.
+    pub fn type_of(&mut self, id: ValueId) -> crate::types::TypeId {
+        match id {
+            ValueId::Literal(lid) => self.values.literals[lid].type_id,
+            ValueId::Instruction(iid) => self.values.instructions[iid].type_id,
+            ValueId::BlockParam(pid) => self.values.block_params[pid].type_id,
+            ValueId::Varnode(vid) => {
+                let size = self.values.varnodes[vid].size_bytes();
+                self.types.get_or_make_int(size)
+            }
+            // Exhaustive on purpose: a new ValueId variant must decide its type
+            // here rather than silently inheriting the zero-width sentinel.
+            ValueId::BasicBlock(_) | ValueId::Function(_) => self.types.get_or_make_int(0),
+        }
     }
 
     /// Return all instructions that use `value` as an operand.
@@ -252,6 +439,30 @@ impl<'str> Context<'str> {
         self.values.users.remove(&old);
     }
 
+    /// Replaces one instruction's mnemonic and keeps the reverse use map in sync.
+    ///
+    /// This is for transforms that change an instruction in place without
+    /// changing its identity, parent block, address, or result type.
+    pub fn replace_instruction_mnemonic(&mut self, id: InstructionId, mnemonic: Mnemonic) {
+        let old_args = self.values.instructions[id].mnemonic().args();
+        for arg in old_args {
+            let mut remove_arg = false;
+            if let Some(users) = self.values.users.get_mut(&arg) {
+                users.retain(|&user| user != id);
+                remove_arg = users.is_empty();
+            }
+            if remove_arg {
+                self.values.users.remove(&arg);
+            }
+        }
+
+        *Instruction::from_id_mut(self, id).mnemonic_mut() = mnemonic;
+
+        for arg in self.values.instructions[id].mnemonic().args() {
+            self.values.users.entry(arg).or_default().push(id);
+        }
+    }
+
     /// Removes an instruction from its parent block and unlinks all associated state:
     /// removes the instruction from the block's instruction list, clears `parent`,
     /// removes its name from the name map, clears the name field, and prunes it from
@@ -267,7 +478,21 @@ impl<'str> Context<'str> {
             self.values.basic_blocks[block_id]
                 .instructions
                 .retain(|&i| i != id);
+
+            // If this instruction was a terminator instruction in a basic block,
+            // remove cfg edges
+            if Instruction::from_id(self, id).mnemonic().is_terminator() {
+                let mut edges_to_remove = HashSet::new();
+                for edge in BasicBlock::from_id(self, block_id).successors() {
+                    edges_to_remove.insert(edge.0);
+                }
+
+                for edge_id in edges_to_remove {
+                    self.remove_cfg_edge(edge_id);
+                }
+            }
         }
+
         self.values.instructions[id].parent = None;
 
         if let Some(ref n) = name {
@@ -448,7 +673,10 @@ impl<'str, 'ctx> IntoIterator for &'ctx Context<'str> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::value::{BasicBlock, Function};
+    use crate::value::{
+        BasicBlock, Function, ValueId,
+        insn::{Binary, Binop, Call, IntBinop, Load, Mnemonic},
+    };
     use qcode_macro::qcode;
 
     fn make_fn_with_blocks(ctx: &mut Context<'static>, name: &'static str, n: usize) -> FunctionId {
@@ -651,6 +879,114 @@ mod tests {
     }
 
     #[test]
+    fn replace_instruction_mnemonic_rewrites_callind_users() {
+        let mut ctx = Context::new();
+        qcode!(
+            ctx,
+            "
+            varnode i64 ptr;
+            <block>
+                call [ptr];
+            "
+        );
+        let call_id = BasicBlock::from_id(&ctx, block).instruction_ids()[0];
+        let ptr = match ctx.get_insn(call_id).mnemonic() {
+            Mnemonic::CallInd(call) => call.ptr,
+            other => panic!("expected CallInd, got {other:?}"),
+        };
+        assert_eq!(ctx.users(ptr), &[call_id]);
+
+        let target = Function::make(&mut ctx, "target".into()).unwrap().id;
+        ctx.replace_instruction_mnemonic(
+            call_id,
+            Mnemonic::Call(Call {
+                target,
+                args: vec![],
+                clobbers: vec![],
+            }),
+        );
+
+        assert!(
+            ctx.users(ptr).is_empty(),
+            "old indirect pointer should no longer list the rewritten call"
+        );
+        assert!(matches!(
+            ctx.get_insn(call_id).mnemonic(),
+            Mnemonic::Call(Call {
+                target: actual,
+                args,
+                ..
+            }) if *actual == target && args.is_empty()
+        ));
+    }
+
+    #[test]
+    fn replace_instruction_mnemonic_moves_operand_users() {
+        let mut ctx = Context::new();
+        qcode!(
+            ctx,
+            "
+            varnode i64 x;
+            varnode i64 y;
+            <block>
+                %a = load(i64, x);
+                return [%a];
+            "
+        );
+        let load_id = BasicBlock::from_id(&ctx, block).instruction_ids()[0];
+        let old_ptr = ValueId::Varnode(x);
+        let new_ptr = ValueId::Varnode(y);
+        assert_eq!(ctx.users(old_ptr), &[load_id]);
+        assert!(ctx.users(new_ptr).is_empty());
+
+        ctx.replace_instruction_mnemonic(
+            load_id,
+            Mnemonic::Load(Load {
+                space: ctx.default_space,
+                ptr: new_ptr,
+                size: 8,
+            }),
+        );
+
+        assert!(ctx.users(old_ptr).is_empty());
+        assert_eq!(ctx.users(new_ptr), &[load_id]);
+    }
+
+    #[test]
+    fn replace_instruction_mnemonic_tracks_repeated_operands() {
+        let mut ctx = Context::new();
+        qcode!(
+            ctx,
+            "
+            varnode i64 x;
+            varnode i64 y;
+            <block>
+                %a = load(i64, x);
+                return [%a];
+            "
+        );
+        let load_id = BasicBlock::from_id(&ctx, block).instruction_ids()[0];
+        let old_ptr = ValueId::Varnode(x);
+        let new_arg = ValueId::Varnode(y);
+
+        ctx.replace_instruction_mnemonic(
+            load_id,
+            Mnemonic::Binop(Binary {
+                op: Binop::Int(IntBinop::Add),
+                lhs: new_arg,
+                rhs: new_arg,
+            }),
+        );
+
+        assert!(ctx.users(old_ptr).is_empty());
+        assert_eq!(
+            ctx.users(new_arg),
+            &[load_id, load_id],
+            "a mnemonic using the same operand twice should record both uses"
+        );
+    }
+
+    #[test]
     fn remove_instruction_unparented_noop() {
         let mut ctx = Context::new();
         qcode!(
@@ -672,5 +1008,123 @@ mod tests {
         ctx.remove_instruction(load_id);
 
         assert!(ctx.get_named("a").is_none());
+    }
+
+    #[test]
+    fn add_cfg_edge_returns_id_and_remove_unlinks_both_blocks() {
+        let mut ctx = Context::new();
+        let a = BasicBlock::make(&mut ctx).id;
+        let b = BasicBlock::make(&mut ctx).id;
+
+        let edge = ctx.add_cfg_edge(a, b);
+        assert_eq!(
+            BasicBlock::from_id(&ctx, a)
+                .successors()
+                .collect::<Vec<_>>(),
+            vec![(edge, b)]
+        );
+        assert_eq!(
+            BasicBlock::from_id(&ctx, b)
+                .predecessors()
+                .collect::<Vec<_>>(),
+            vec![(edge, a)]
+        );
+
+        ctx.remove_cfg_edge(edge);
+        assert!(BasicBlock::from_id(&ctx, a).successors().next().is_none());
+        assert!(BasicBlock::from_id(&ctx, b).predecessors().next().is_none());
+    }
+
+    #[test]
+    fn truth_map_tracks_four_states_and_conflicts() {
+        let mut ctx = Context::new();
+        let callee = Function::make(&mut ctx, "callee".into()).unwrap().id;
+        let prop = Proposition::FunctionReturns(callee);
+
+        // First assume wins; same polarity is idempotent; opposite fails.
+        assert!(ctx.assume_true(prop));
+        assert!(ctx.assume_true(prop));
+        assert!(!ctx.assume_false(prop));
+        assert_eq!(ctx.known(prop), None, "assumed is not known");
+
+        // The truth map is part of the arena, so it snapshots with a clone.
+        let snapshot = ctx.clone();
+
+        // Proving the opposite overturns the assumption and records the
+        // violation with both pass names.
+        let scope = pass_scope::enter("verifier");
+        assert!(ctx.set_known(prop, false), "overturning is novel");
+        drop(scope);
+        assert_eq!(ctx.known(prop), Some(false));
+        let [v] = ctx.violations() else {
+            panic!("expected one violation")
+        };
+        assert_eq!(v.prop, prop);
+        assert!(v.assumed);
+        assert_eq!(v.asserting_pass, "verifier");
+
+        // Re-proving the same value is not novel.
+        assert!(!ctx.set_known(prop, false));
+
+        // The independent snapshot is unaffected.
+        assert!(snapshot.violations().is_empty());
+        assert_eq!(snapshot.known(prop), None);
+
+        // An assume against a known fact fails; with it, succeeds.
+        assert!(!ctx.assume_true(prop));
+        assert!(ctx.assume_false(prop));
+    }
+
+    #[test]
+    fn seeded_facts_are_not_novel() {
+        let mut ctx = Context::new();
+        let callee = Function::make(&mut ctx, "exit".into()).unwrap().id;
+        let prop = Proposition::FunctionReturns(callee);
+
+        ctx.seed_known(prop, false);
+        assert_eq!(ctx.known(prop), Some(false));
+        assert!(!ctx.assume_true(prop), "seeded fact blocks opposite assume");
+        assert!(
+            !ctx.set_known(prop, false),
+            "re-proving a seed is not novel"
+        );
+        assert!(ctx.violations().is_empty());
+    }
+
+    #[test]
+    fn context_survives_bincode_round_trip() {
+        let mut ctx = Context::new();
+        qcode!(
+            ctx,
+            "
+            varnode i64 ptr;
+            <block>
+                %a = load(i64, &ptr);
+                %b = %a + i64 0x10;
+                store(&ptr, i64 0x1234);
+                return [%b];
+            "
+        );
+
+        // A StackAddress type exercises the custom TypeManager serialization.
+        let stack_space = ctx.make_named_temp_space("stack");
+        let sa = ctx.types.get_or_make_stack_address(8, Some(stack_space));
+        let sa_size = ctx.types.size_of(sa);
+
+        let blocks_before = ctx.block_ids().len();
+        let insns_before = ctx.instruction_ids().len();
+        let funcs_before = ctx.function_ids().len();
+
+        let config = bincode::config::standard();
+        let bytes = bincode::serde::encode_to_vec(&ctx, config).expect("encode");
+        let (restored, _): (Context<'static>, usize) =
+            bincode::serde::decode_from_slice(&bytes, config).expect("decode");
+
+        assert_eq!(restored.block_ids().len(), blocks_before);
+        assert_eq!(restored.instruction_ids().len(), insns_before);
+        assert_eq!(restored.function_ids().len(), funcs_before);
+        // The StackAddress type round-trips: same id, same size, still a stack address.
+        assert_eq!(restored.types.size_of(sa), sa_size);
+        assert!(restored.types.is_stack_address(sa));
     }
 }
