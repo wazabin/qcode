@@ -2,7 +2,9 @@ use std::fmt::Formatter;
 
 use crate::{
     context::Context,
-    value::{BasicBlock, Function, ValueId, ValueRef, block::BlockId, function::FunctionId},
+    value::{
+        BasicBlock, Function, ValueId, ValueRef, Varnode, block::BlockId, function::FunctionId,
+    },
 };
 
 use super::mnemonic::MnemonicKind;
@@ -29,6 +31,24 @@ fn fmt_branch_target(
     }
 
     write!(f, ">")
+}
+
+fn fmt_call_arg_name(
+    f: &mut Formatter<'_>,
+    ctx: &Context<'_>,
+    target: FunctionId,
+    index: usize,
+) -> std::fmt::Result {
+    let function = Function::from_id(ctx, target);
+    if let Some(input) = function
+        .input_regs()
+        .and_then(|inputs| inputs.get(index).copied())
+        && let Some(name) = Varnode::from_id(ctx, input).name()
+    {
+        return write!(f, "@{name}=");
+    }
+
+    write!(f, "@arg{index}=")
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
@@ -110,6 +130,7 @@ impl MnemonicKind for Call {
             if i > 0 {
                 write!(f, ", ")?;
             }
+            fmt_call_arg_name(f, ctx, self.target, i)?;
             write!(f, "{}", ValueRef::new(arg, ctx))?;
         }
         write!(f, ");")
@@ -215,8 +236,10 @@ mod tests {
     use qcode_macro::qcode;
 
     use crate::{
+        builder::Builder,
         context::Context,
-        value::{BasicBlock, insn::Mnemonic},
+        testing::TestContext,
+        value::{BasicBlock, Function, Instruction, insn::Mnemonic},
     };
 
     #[test]
@@ -294,6 +317,35 @@ mod tests {
         let block = BasicBlock::from_id(&ctx, block);
         let last = block.iter().last().expect("block has instructions");
         assert!(matches!(last.mnemonic(), Mnemonic::Call(_)));
+    }
+
+    #[test]
+    fn call_display_shows_named_args_with_fallbacks() {
+        let mut tc = TestContext::new();
+        let callee = Function::make(&mut tc.ctx, "callee".into()).unwrap().id;
+        Function::from_id_mut(&mut tc.ctx, callee).set_input_regs(vec![tc.r0]);
+
+        let block = BasicBlock::make(&mut tc.ctx).id;
+        let call_id = {
+            let mut builder = Builder::from_block(BasicBlock::from_id_mut(&mut tc.ctx, block));
+            builder.push_call(callee).id
+        };
+
+        let first = tc.ctx.get_const(1u64, 8).id();
+        let second = tc.ctx.get_const(2u64, 8).id();
+        tc.ctx.replace_instruction_mnemonic(
+            call_id,
+            Mnemonic::Call(super::Call {
+                target: callee,
+                args: vec![first, second],
+                clobbers: vec![],
+            }),
+        );
+
+        let rendered = Instruction::from_id(&tc.ctx, call_id)
+            .as_statement()
+            .to_string();
+        assert_eq!(rendered, "call fn callee(@r0=0x1, @arg1=0x2);");
     }
 
     #[test]

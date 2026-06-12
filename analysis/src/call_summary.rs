@@ -1272,8 +1272,8 @@ mod tests {
         });
         let text = first_call_text(&tc.ctx, caller);
         assert!(
-            text.starts_with("call fn callee(") && text.ends_with(");"),
-            "call renders its argument list: {text:?}"
+            text.contains("@r0=0x5"),
+            "call renders named arguments: {text:?}"
         );
         assert!(
             !text.contains("clobber"),
