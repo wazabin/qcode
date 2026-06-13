@@ -1,20 +1,46 @@
-//! Handles jump tables.
+//! Resolves jump tables — the indirect `switch` dispatch a compiler emits as
+//! `goto [table_base + index*scale]`.
 //!
-//! The first version of this pass looks for indirect jumps that are built
-//! using a constant and possibly an offset.
+//! For each block terminated by a [`BranchInd`], the pass recognizes the
+//! address computation feeding the indirect jump, bounds the table index with
+//! the value-range analysis ([`crate::value_range`]), reads each table entry
+//! straight out of the binary's initialized memory
+//! ([`Context::read_uint`](qcode::context::Context::read_uint)), and connects
+//! the block to every resolved target with a real CFG edge.
 //!
-//! We perform a quick value analysis on the offset to try and determine the
-//! jump table's size.
+//! Two table encodings are handled:
 //!
-//! TODO: if we can't we should scan the addresses in the jump table and try and
-//! find address "close to" one another
+//! - **Absolute** — each slot holds the target address directly; the loaded
+//!   value *is* the branch pointer: `goto [Load(base + index*ptr_width)]`.
+//! - **Relative** — each slot holds a (usually signed 32-bit) offset that is
+//!   added back to a constant base before the branch, as emitted for
+//!   position-independent code: `goto base + sext(Load(base + index*4))`.
+//!
+//! Because a resolved target is only valid while the table bytes stay put, every
+//! entry read records a [`Proposition::ImmutableMemory`] assumption on the
+//! context: if a later pass ever proves that memory writable, the assumption is
+//! violated and the resolution is discarded by the replay driver.
+//!
+//! TODO: when the index cannot be bounded, scan the table for a run of
+//! addresses "close to" one another to recover the size heuristically.
 
 use qcode::{
+    assumption::Proposition,
+    builder::Builder,
     context::Context,
-    value::{Function, FunctionId},
+    value::{
+        BasicBlock, BlockMutRef, Function, FunctionId, Value, ValueId, ValueRef,
+        block::BlockId,
+        insn::{Binary, Binop, BranchInd, IntBinop, Load, Mnemonic},
+        util::base_ref::{WithCtx, WithCtxMut},
+    },
 };
 
-use crate::{FunctionPass, PipelineEnv};
+use crate::{FunctionPass, PipelineEnv, value_range::value_range};
+
+/// Largest table the pass will materialize. Guards against a mis-bounded index
+/// turning into millions of bogus edges.
+const MAX_TABLE_ENTRIES: u64 = 4096;
 
 pub struct HandleJumpTables;
 
@@ -24,25 +50,415 @@ impl Default for HandleJumpTables {
     }
 }
 
+/// One resolved jump-table edge to apply after the read-only scan.
+struct Edit {
+    /// The block ending in the indirect branch.
+    from: BlockId,
+    /// Resolved target address.
+    target: u64,
+    /// The value "switched on"
+    index: ValueId,
+    /// The index value for this target
+    value: u64,
+}
+
+struct MakeBranch {
+    /// The block ending in the indirect branch.
+    from: BlockId,
+    /// Resolved target address.
+    target: u64,
+}
+
+struct MakeCBranch {
+    /// The block ending in the indirect branch.
+    from: BlockId,
+
+    index: ValueId,
+    offset: u64,
+
+    true_target: u64,
+    false_target: u64,
+}
+
 impl FunctionPass for HandleJumpTables {
     const NAME: &'static str = "handle_jump_tables";
 
     fn description(&self) -> &'static str {
-        "Attempts to resolve jump tables"
+        "Resolves jump tables, connecting indirect branches to their targets"
     }
 
-    // Returns true if a change was made, so it can be used in a `repeat_until` stage if needed.
-    // This pass doesn't need to be, but it's good practice to track changes in case you later add more functionality
     fn run(
         &self,
         ctx: &mut Context,
         fun_id: FunctionId,
-        env: &PipelineEnv,
+        _env: &PipelineEnv,
     ) -> Result<bool, String> {
-        let mut function = Function::from_id_mut(ctx, fun_id);
+        let function = Function::from_id(ctx, fun_id);
 
-        Ok(false)
+        // Entry address of the function owning these branches, paired with every
+        // discovered target so the re-lift loop knows which function to grow.
+        let fn_entry = function.address();
+
+        // Read-only scan: collect every resolvable edge, then mutate.
+        let mut edits: Vec<Edit> = Vec::new();
+        let mut single_branches: Vec<MakeBranch> = Vec::new();
+        let mut branches: Vec<MakeCBranch> = Vec::new();
+
+        let block_ids = function.blocks().map(|b| b.id).collect::<Vec<_>>();
+
+        for id in block_ids {
+            let block = BasicBlock::from_id_mut(ctx, id);
+
+            if let Some(mut block_edits) = resolve_block(block) {
+                match block_edits.len() {
+                    1 => {
+                        let e = block_edits.pop().unwrap();
+                        single_branches.push(MakeBranch {
+                            from: e.from,
+                            target: e.target,
+                        });
+                    }
+                    2 => {
+                        let e1 = block_edits.pop().unwrap();
+                        let e2 = block_edits.pop().unwrap();
+
+                        // The false target is the case the index is compared
+                        // *equal* to; `offset` carries that index value. A zero
+                        // case is the common shape but not required.
+                        let ((true_target, false_target), offset) = if e1.value == 0 {
+                            ((e2.target, e1.target), e1.value)
+                        } else {
+                            ((e1.target, e2.target), e2.value)
+                        };
+
+                        branches.push(MakeCBranch {
+                            from: e1.from,
+                            index: e1.index,
+                            offset,
+                            true_target,
+                            false_target,
+                        });
+                    }
+                    _ => edits.append(&mut block_edits),
+                }
+            }
+        }
+
+        if edits.is_empty() && single_branches.is_empty() && branches.is_empty() {
+            return Ok(false);
+        }
+
+        for Edit { from, target, .. } in edits {
+            let tb = ctx.get_or_make_block(target);
+            Function::from_id_mut(ctx, fun_id).add_block(tb);
+
+            ctx.add_cfg_edge(from, tb);
+            discover(ctx, fn_entry, target);
+        }
+
+        // A single resolved target: the indirect branch is really an
+        // unconditional jump. Replace `BranchInd` with a direct `Branch`.
+        for MakeBranch { from, target } in single_branches {
+            let target_block = ctx.get_or_make_block(target);
+            Function::from_id_mut(ctx, fun_id).add_block(target_block);
+
+            let mut block = BasicBlock::from_id_mut(ctx, from);
+            block.pop_insn();
+            Builder::from_block(block).push_branch(target_block);
+            discover(ctx, fn_entry, target);
+        }
+
+        for MakeCBranch {
+            from,
+            index,
+            offset,
+            true_target,
+            false_target,
+        } in branches
+        {
+            let true_block = ctx.get_or_make_block(true_target);
+            let false_block = ctx.get_or_make_block(false_target);
+            Function::from_id_mut(ctx, fun_id).add_block(true_block);
+            Function::from_id_mut(ctx, fun_id).add_block(false_block);
+            discover(ctx, fn_entry, true_target);
+            discover(ctx, fn_entry, false_target);
+
+            let mut block = BasicBlock::from_id_mut(ctx, from);
+            block.pop_insn();
+
+            let mut builder = Builder::from_block(block);
+            let size = ValueRef::from_id(builder.context(), index).size();
+            let false_value = builder.context_mut().get_const(offset, size).id();
+            // `index != false_value` selects the true target, else the false one.
+            let cond = builder.push_ne(index, false_value).id();
+            builder.push_cbranch(cond, true_block, false_block);
+        }
+
+        qcode::stat!("jump_table_edges", 1);
+        Ok(true)
     }
+}
+
+/// Record a resolved `target` for later disassembly, keyed by the owning
+/// function's entry address. A no-op for synthetic functions that lack an
+/// address (nothing to re-lift from a binary image).
+fn discover(ctx: &mut Context, fn_entry: Option<u64>, target: u64) {
+    if let Some(entry) = fn_entry {
+        ctx.discover_code(entry, target);
+    }
+}
+
+/// If `block_id` ends in an indirect branch whose table the pass can resolve,
+/// push one [`Edit`] per case target onto `edits`.
+fn resolve_block(mut block: BlockMutRef) -> Option<Vec<Edit>> {
+    let ctx = block.ctx();
+
+    // Already-resolved indirect branches have successors; don't double-connect.
+    if block.successors().next().is_some() {
+        return None;
+    }
+
+    let insn = block.instructions().last()?;
+
+    let Mnemonic::BranchInd(BranchInd { ptr }) = insn.mnemonic() else {
+        return None;
+    };
+
+    log::trace!(
+        target: "jump_table",
+        "considering block {:x} with indirect branch",
+        block.address().unwrap_or_default(),
+    );
+
+    let table = recognize_table(ctx, *ptr)?;
+
+    log::debug!(
+        target: "jump_table",
+        "recognized jump table at {:x} with base {:x} and scale {}",
+        table.base, table.base, table.scale
+    );
+
+    let index_size = value_size(ctx, table.index);
+
+    let range = value_range(ctx, table.index, block.id);
+
+    if !range.is_bounded(index_size) || range.count() > MAX_TABLE_ENTRIES {
+        log::debug!(target: "jump_table", "skipping unbounded or huge table: range {range:?}");
+        return None;
+    }
+    log::trace!(
+        target: "jump_table",
+        "bounded index {} with range {range:?}",
+        ValueRef::from_id(ctx, table.index),
+    );
+
+    // Materialize one edge per index value. Bail on the whole table if any slot
+    // is unmapped or points outside executable memory — a partial resolution
+    // would leave a misleading CFG.
+    let mut resolved: Vec<Edit> = Vec::new();
+    for index in range.min..=range.max {
+        let entry_addr = table.base.wrapping_add(index.wrapping_mul(table.scale));
+
+        if !block.ctx_mut().assume_true(Proposition::ImmutableMemory {
+            addr: entry_addr,
+            size: table.slot_width as u8,
+        }) {
+            log::debug!(target: "jump_table", "skipping table: entry {entry_addr:x} not immutable");
+            return None;
+        }
+
+        let ctx = block.ctx();
+
+        let Some(raw) = ctx.read_uint(entry_addr, table.slot_width) else {
+            log::debug!(target: "jump_table", "skipping table: slot {entry_addr:x} unmapped");
+            return None;
+        };
+
+        let target = match table.relative_base {
+            Some(base) => base.wrapping_add(sign_extend(raw, table.slot_width)),
+            None => raw,
+        };
+
+        if !ctx.is_executable_addr(target) {
+            log::debug!(target: "jump_table", "skipping table: target {target:x} not executable");
+            return None;
+        }
+
+        resolved.push(Edit {
+            from: block.id,
+            target,
+            index: table.index,
+            value: index,
+        });
+    }
+
+    Some(resolved)
+}
+
+/// The shape of a recognized jump table.
+struct Table {
+    /// Address of the table's first slot.
+    base: u64,
+    /// Byte stride between slots (the entry width).
+    scale: u64,
+    /// Width of one slot in bytes (`ptr_width` for absolute, often 4 for relative).
+    slot_width: usize,
+    /// For a relative table, the constant the loaded offset is added back to.
+    /// `None` for an absolute table (the slot holds the target directly).
+    relative_base: Option<u64>,
+    /// The switch index SSA value to bound.
+    index: ValueId,
+}
+
+fn recognize_absolute_table(ctx: &Context, load: Load) -> Option<Table> {
+    let (base, scale, index) = decompose_address(ctx, load.ptr)?;
+
+    Some(Table {
+        base,
+        scale,
+        slot_width: load.size,
+        relative_base: None,
+        index,
+    })
+}
+
+/// Recognize the address computation feeding a `BranchInd` as a jump table.
+///
+/// Absolute: `ptr = Load(base + index*scale)`.
+/// Relative: `ptr = Add(rel_base, [s|z]ext(Load(base + index*scale)))`.
+fn recognize_table(ctx: &Context, ptr: ValueId) -> Option<Table> {
+    // Absolute: the branch pointer is the loaded value itself.
+    if let Some(load) = as_load(ctx, ptr) {
+        return recognize_absolute_table(ctx, load);
+    }
+
+    // Relative: `rel_base + ext(load)`. One operand is the constant base, the
+    // other resolves (through an optional sext/zext) to a table load.
+    if let Mnemonic::Binop(Binary {
+        op: Binop::Int(IntBinop::Add),
+        lhs,
+        rhs,
+    }) = def_mnemonic(ctx, ptr)?
+    {
+        let (lhs, rhs) = (*lhs, *rhs);
+        let (rel_base, offset) = match (numeric_const(ctx, lhs), numeric_const(ctx, rhs)) {
+            (Some(c), _) => (c, rhs),
+            (_, Some(c)) => (c, lhs),
+            _ => return None,
+        };
+        let load = as_load(ctx, strip_ext(ctx, offset))?;
+        let (base, scale, index) = decompose_address(ctx, load.ptr)?;
+        return Some(Table {
+            base,
+            scale,
+            slot_width: load.size,
+            relative_base: Some(rel_base),
+            index,
+        });
+    }
+
+    None
+}
+
+/// Decompose a table-element address `base + index*scale` into its parts.
+/// Accepts `base + index` (scale 1), `base + index*c`, and `base + index<<c`.
+fn decompose_address(ctx: &Context, addr: ValueId) -> Option<(u64, u64, ValueId)> {
+    let Mnemonic::Binop(Binary {
+        op: Binop::Int(IntBinop::Add),
+        lhs,
+        rhs,
+    }) = *def_mnemonic(ctx, addr)?
+    else {
+        log::trace!(target: "jump_table", "not a table: no add");
+        return None;
+    };
+
+    // The base is the constant operand; the other is the (scaled) index.
+    let (base, idx_expr) = match (numeric_const(ctx, lhs), numeric_const(ctx, rhs)) {
+        (Some(c), _) => (c, rhs),
+        (_, Some(c)) => (c, lhs),
+        _ => {
+            log::trace!(target: "jump_table", "not a table: no constant base");
+            return None;
+        }
+    };
+
+    let (scale, index) = decompose_scale(ctx, idx_expr);
+
+    Some((base, scale, index))
+}
+
+/// Pull a constant scale out of `index*c` or `index<<c`; otherwise scale 1.
+fn decompose_scale(ctx: &Context, v: ValueId) -> (u64, ValueId) {
+    if let Some(Mnemonic::Binop(Binary {
+        op: Binop::Int(op),
+        lhs,
+        rhs,
+    })) = def_mnemonic(ctx, v)
+    {
+        match op {
+            IntBinop::Mul => match (numeric_const(ctx, *lhs), numeric_const(ctx, *rhs)) {
+                (Some(c), _) => return (c, *rhs),
+                (_, Some(c)) => return (c, *lhs),
+                _ => {}
+            },
+            IntBinop::ShiftLeft => {
+                if let Some(sh) = numeric_const(ctx, *rhs)
+                    && sh < 64
+                {
+                    return (1u64 << sh, *lhs);
+                }
+            }
+            _ => {}
+        }
+    }
+    (1, v)
+}
+
+/// The `Load` defining `v`, if `v` is the result of a RAM load.
+fn as_load(ctx: &Context, v: ValueId) -> Option<Load> {
+    match def_mnemonic(ctx, v)? {
+        Mnemonic::Load(load) => Some(load.clone()),
+        _ => None,
+    }
+}
+
+/// Peel a single sign/zero-extension off `v`, returning its source.
+fn strip_ext(ctx: &Context, v: ValueId) -> ValueId {
+    match def_mnemonic(ctx, v) {
+        Some(Mnemonic::Sext(s)) => s.src,
+        Some(Mnemonic::Zext(z)) => z.src,
+        _ => v,
+    }
+}
+
+/// The defining mnemonic of `v` when it is an instruction result.
+fn def_mnemonic<'c>(ctx: &'c Context<'_>, v: ValueId) -> Option<&'c Mnemonic> {
+    match v {
+        ValueId::Instruction(id) => Some(ctx.get_insn(id).mnemonic()),
+        _ => None,
+    }
+}
+
+/// Concrete value of `v` when it is a literal.
+fn numeric_const(ctx: &Context, v: ValueId) -> Option<u64> {
+    match ValueRef::new(v, ctx) {
+        ValueRef::Literal(c) => Some(c.value()),
+        _ => None,
+    }
+}
+
+fn value_size(ctx: &Context, v: ValueId) -> usize {
+    ValueRef::new(v, ctx).size()
+}
+
+/// Sign-extend the low `size` bytes of `raw` to a full `u64`.
+fn sign_extend(raw: u64, size: usize) -> u64 {
+    if size == 0 || size >= 8 {
+        return raw;
+    }
+    let shift = 64 - size * 8;
+    (((raw << shift) as i64) >> shift) as u64
 }
 
 crate::register_function_pass!(HandleJumpTables);
@@ -53,4 +469,299 @@ mod tests {
 
     use super::*;
     use crate::test_util::run_function_pass;
+
+    /// Number of CFG successors of `block`.
+    fn successor_count(ctx: &Context, block: BlockId) -> usize {
+        BasicBlock::from_id(ctx, block).successors().count()
+    }
+
+    /// Seed `ctx` with an executable code region `[start, start+len)`.
+    fn add_code(ctx: &mut Context, start: u64, len: usize) {
+        ctx.memory_image.add_segment(start, vec![0u8; len], true);
+    }
+
+    /// Seed `ctx` with a read-only data region holding `bytes`.
+    fn add_rodata(ctx: &mut Context, start: u64, bytes: Vec<u8>) {
+        ctx.memory_image.add_segment(start, bytes, false);
+    }
+
+    /// An absolute table: each 8-byte slot holds the target address directly.
+    #[test]
+    fn resolves_absolute_table() {
+        let mut ctx = Context::new();
+        let targets = [0x1100u64, 0x1200, 0x1300];
+
+        qcode!(
+            ctx,
+            "
+            varnode i64 A;
+            fn fun:
+            <entry>
+                %idx = load(i64, &A);
+                %c = %idx < 0x3;
+                if %c goto <disp> else goto <oob>;
+            <disp>
+                %off = %idx * 0x8;
+                %addr = i64 0x2000 + %off;
+                %t = load(i64, %addr);
+                goto [%t];
+            <oob>
+                goto <0x9000>;
+            "
+        );
+
+        // Executable code the targets live in, plus the rodata table itself.
+        add_code(&mut ctx, 0x1000, 0x1000);
+        let mut table = Vec::new();
+        for t in targets {
+            table.extend_from_slice(&t.to_le_bytes());
+        }
+        add_rodata(&mut ctx, 0x2000, table);
+
+        let changed = run_function_pass::<HandleJumpTables>(&mut ctx, fun).unwrap();
+        assert!(changed);
+
+        // The dispatch block gained one successor per case target.
+        assert_eq!(successor_count(&ctx, disp), 3);
+        for t in targets {
+            assert!(ctx.get_at_addr(&t).is_some(), "no block created for {t:#x}");
+        }
+        // Each slot read recorded an immutable-memory assumption.
+        for i in 0..3u64 {
+            let prop = Proposition::ImmutableMemory {
+                addr: 0x2000 + i * 8,
+                size: 8,
+            };
+            assert_eq!(ctx.truth(prop).map(|t| t.value), Some(true));
+        }
+    }
+
+    /// A relative table: each 4-byte slot holds a signed offset added back to a
+    /// constant base (the position-independent `switch` shape).
+    #[test]
+    fn resolves_relative_table() {
+        let mut ctx = Context::new();
+
+        qcode!(
+            ctx,
+            "
+            varnode i64 A;
+            fn fun:
+            <entry>
+                %idx = load(i64, &A);
+                %c = %idx < 0x3;
+                if %c goto <disp> else goto <oob>;
+            <disp>
+                %off = %idx * 0x4;
+                %addr = i64 0x5000 + %off;
+                %rel = load(i32, %addr);
+                %sx = sext(i64, %rel);
+                %t = i64 0x3000 + %sx;
+                goto [%t];
+            <oob>
+                goto <0x9000>;
+            "
+        );
+
+        // Targets are 0x3000 + {0x100, 0x200, 0x300}.
+        add_code(&mut ctx, 0x3000, 0x1000);
+        let mut table = Vec::new();
+        for off in [0x100i32, 0x200, 0x300] {
+            table.extend_from_slice(&off.to_le_bytes());
+        }
+        add_rodata(&mut ctx, 0x5000, table);
+
+        let changed = run_function_pass::<HandleJumpTables>(&mut ctx, fun).unwrap();
+        assert!(changed);
+
+        assert_eq!(successor_count(&ctx, disp), 3);
+        for t in [0x3100u64, 0x3200, 0x3300] {
+            assert!(ctx.get_at_addr(&t).is_some(), "no block created for {t:#x}");
+        }
+    }
+
+    /// An unbounded index (no dominating guard) leaves the indirect branch alone.
+    #[test]
+    fn unbounded_index_is_left_alone() {
+        let mut ctx = Context::new();
+
+        qcode!(
+            ctx,
+            "
+            varnode i64 A;
+            fn fun:
+            <disp>
+                %idx = load(i64, &A);
+                %off = %idx * 0x8;
+                %addr = i64 0x2000 + %off;
+                %t = load(i64, %addr);
+                goto [%t];
+            "
+        );
+        add_code(&mut ctx, 0x1000, 0x1000);
+        add_rodata(&mut ctx, 0x2000, vec![0u8; 0x100]);
+
+        let changed = run_function_pass::<HandleJumpTables>(&mut ctx, fun).unwrap();
+        assert!(!changed);
+        assert_eq!(successor_count(&ctx, disp), 0);
+    }
+
+    /// The mnemonic of the last instruction in `block`.
+    fn terminator<'a>(ctx: &'a Context, block: BlockId) -> &'a Mnemonic {
+        BasicBlock::from_id(ctx, block)
+            .instructions()
+            .last()
+            .expect("block has a terminator")
+            .mnemonic()
+    }
+
+    /// A single resolved target collapses the indirect branch to a direct,
+    /// unconditional `Branch`.
+    #[test]
+    fn collapses_single_target_to_branch() {
+        let mut ctx = Context::new();
+
+        qcode!(
+            ctx,
+            "
+            varnode i64 A;
+            fn fun:
+            <entry>
+                %idx = load(i64, &A);
+                %c = %idx < 0x1;
+                if %c goto <disp> else goto <oob>;
+            <disp>
+                %off = %idx * 0x8;
+                %addr = i64 0x2000 + %off;
+                %t = load(i64, %addr);
+                goto [%t];
+            <oob>
+                goto <0x9000>;
+            "
+        );
+
+        add_code(&mut ctx, 0x1000, 0x1000);
+        add_rodata(&mut ctx, 0x2000, 0x1100u64.to_le_bytes().to_vec());
+
+        let changed = run_function_pass::<HandleJumpTables>(&mut ctx, fun).unwrap();
+        assert!(changed);
+
+        // BranchInd became a direct Branch to the single target.
+        assert_eq!(successor_count(&ctx, disp), 1);
+        assert!(
+            matches!(terminator(&ctx, disp), Mnemonic::Branch(_)),
+            "expected an unconditional Branch, got {:?}",
+            terminator(&ctx, disp),
+        );
+        assert!(ctx.get_at_addr(&0x1100).is_some());
+    }
+
+    /// Two targets with a zero case lower to `if index != 0` (the common shape).
+    #[test]
+    fn two_targets_with_zero_case() {
+        let mut ctx = Context::new();
+        let targets = [0x1100u64, 0x1200];
+
+        qcode!(
+            ctx,
+            "
+            varnode i64 A;
+            fn fun:
+            <entry>
+                %idx = load(i64, &A);
+                %c = %idx < 0x2;
+                if %c goto <disp> else goto <oob>;
+            <disp>
+                %off = %idx * 0x8;
+                %addr = i64 0x2000 + %off;
+                %t = load(i64, %addr);
+                goto [%t];
+            <oob>
+                goto <0x9000>;
+            "
+        );
+
+        add_code(&mut ctx, 0x1000, 0x1000);
+        let mut table = Vec::new();
+        for t in targets {
+            table.extend_from_slice(&t.to_le_bytes());
+        }
+        add_rodata(&mut ctx, 0x2000, table);
+
+        let changed = run_function_pass::<HandleJumpTables>(&mut ctx, fun).unwrap();
+        assert!(changed);
+
+        assert_eq!(successor_count(&ctx, disp), 2);
+        assert!(matches!(terminator(&ctx, disp), Mnemonic::CBranch(_)));
+        // The condition compares the index against the false-case value, 0.
+        assert!(
+            cbranch_compares_against(&ctx, disp, 0),
+            "expected `index != 0` guard",
+        );
+    }
+
+    /// Two targets whose indices straddle a nonzero base lower to a comparison
+    /// against the false-case index value, not a hardcoded zero.
+    #[test]
+    fn two_targets_without_zero_case() {
+        let mut ctx = Context::new();
+
+        // `%j = idx + 5`, with idx bounded to {0,1}, gives index range {5,6}.
+        qcode!(
+            ctx,
+            "
+            varnode i64 A;
+            fn fun:
+            <entry>
+                %idx = load(i64, &A);
+                %c = %idx < 0x2;
+                if %c goto <disp> else goto <oob>;
+            <disp>
+                %j = %idx + 0x5;
+                %off = %j * 0x8;
+                %addr = i64 0x2000 + %off;
+                %t = load(i64, %addr);
+                goto [%t];
+            <oob>
+                goto <0x9000>;
+            "
+        );
+
+        add_code(&mut ctx, 0x1000, 0x1000);
+        // Slots 0..=6; only slots 5 and 6 are read.
+        let mut table = vec![0u8; 7 * 8];
+        table[5 * 8..6 * 8].copy_from_slice(&0x1100u64.to_le_bytes());
+        table[6 * 8..7 * 8].copy_from_slice(&0x1200u64.to_le_bytes());
+        add_rodata(&mut ctx, 0x2000, table);
+
+        let changed = run_function_pass::<HandleJumpTables>(&mut ctx, fun).unwrap();
+        assert!(changed);
+
+        assert_eq!(successor_count(&ctx, disp), 2);
+        assert!(matches!(terminator(&ctx, disp), Mnemonic::CBranch(_)));
+        // The false case is index 5, so the guard is `index != 5`.
+        assert!(
+            cbranch_compares_against(&ctx, disp, 5),
+            "expected `index != 5` guard",
+        );
+    }
+
+    /// True if `block` contains a `NotEqual` comparison with a literal operand
+    /// equal to `value` (the cbranch guard the pass synthesizes).
+    fn cbranch_compares_against(ctx: &Context, block: BlockId, value: u64) -> bool {
+        BasicBlock::from_id(ctx, block).instructions().any(|insn| {
+            if let Mnemonic::Binop(Binary {
+                op: Binop::Int(IntBinop::NotEqual),
+                lhs,
+                rhs,
+            }) = insn.mnemonic()
+            {
+                [*lhs, *rhs]
+                    .into_iter()
+                    .any(|v| numeric_const(ctx, v) == Some(value))
+            } else {
+                false
+            }
+        })
+    }
 }
