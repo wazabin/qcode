@@ -45,7 +45,8 @@ pub struct PipelineEnv {
 }
 
 impl PipelineEnv {
-    /// Resolve the stack-pointer varnode from `cfg` against `ctx` once.
+    /// Resolve the stack-pointer varnode from `cfg` against `ctx` once. No lifter:
+    /// the lifting passes will be inert.
     pub fn new(ctx: &Context, cfg: ArchConfig) -> Self {
         let sp_varnode = ctx.registers[&cfg.stack_pointer];
         Self { cfg, sp_varnode }

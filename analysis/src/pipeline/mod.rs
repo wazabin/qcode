@@ -14,9 +14,11 @@
 //! via [`ArchConfig`]. Callers build one with `harbinger::arch::arch_config`.
 
 mod config;
+mod lifter;
 mod pass;
 
 pub use config::{DEFAULT_PIPELINE_TOML, Pipeline};
+pub use lifter::{LiftOutcome, LiftSummary, Lifter, PipelineServices};
 pub use pass::{
     DynFunctionPass, DynPass, FunctionPass, Pass, PassRegistration, PipelineEnv, RegisteredPass,
 };
@@ -30,13 +32,15 @@ use qcode::{
 };
 
 use crate::{
-    assume_call_returns, learn_stack_facts, seed_stack_facts, verify_assumptions,
+    assume_call_returns, discover_addresses_in_binary, establish_memory_protections,
+    learn_stack_facts, lift_new_addresses, seed_stack_facts, verify_assumptions,
     verify_forced_returns,
 };
 
 /// Maximum checkpoint+replay rounds the overrides-aware driver attempts before
 /// giving up with [`PipelineError::NoConvergence`].
 const MAX_OVERRIDE_ROUNDS: usize = 5;
+const MAX_ANALYZE_LIFT_ROUNDS: usize = 100;
 
 /// Failure modes of [`analyze_with_overrides_with_progress`].
 #[derive(Debug, Clone)]
@@ -183,19 +187,222 @@ pub fn analyze_with_pipeline_with_progress<'s>(
     baseline: &Context<'s>,
     cfg: &ArchConfig,
     pipeline: &Pipeline,
-    mut progress: impl FnMut(PipelineProgress),
+    progress: impl FnMut(PipelineProgress),
 ) -> Context<'s> {
+    analyze_and_lift_with_progress(baseline, cfg, pipeline, PipelineServices::none(), progress)
+}
+
+/// The checkpoint+replay driver, with two contexts and lifting folded in.
+///
+/// `clean` (the persistent clean IR) is cloned from `baseline` and grown by the
+/// lifter until address discovery reaches a fixpoint. While it is still growing,
+/// only function-local discovery analysis runs on disposable clones; the full
+/// interprocedural checkpoint+replay pipeline runs after lifting is quiet.
+///
+/// `lifter == None` reproduces the original single-context behavior: the lifting
+/// passes are inert, `clean` never grows, and discoveries (if any) ride out on the
+/// returned context for an external driver to handle.
+///
+/// [`LIFT_BARRIER`]: config::LIFT_BARRIER
+pub fn analyze_and_lift_with_progress<'s>(
+    baseline: &Context<'s>,
+    cfg: &ArchConfig,
+    pipeline: &Pipeline,
+    services: PipelineServices<'_>,
+    progress: impl FnMut(PipelineProgress),
+) -> Context<'s> {
+    analyze_with_progress(baseline, cfg, pipeline, services, &HashMap::new(), progress)
+        .expect("a run with no overrides is infallible")
+}
+
+/// The single analysis driver: discovery + lifting + assumption checkpoint/replay
+/// folded into one code path.
+///
+/// `services` injects the lifter (whole-binary recursive disassembly grows the
+/// persistent clean IR until address discovery reaches a fixpoint); `None`
+/// reproduces single-context analysis of an already-lifted `baseline`. `overrides`
+/// are user-forced facts (empty for the default analysis), honored on the lifting
+/// path too, so a jump table that only resolves under a user override gets its
+/// targets lifted.
+///
+/// Verify-then-use: the binary's memory protections are established *before* the
+/// lift loop consults executability. Returns the converged optimized context, or a
+/// [`PipelineError`] when a forced override is disproved or the bounded
+/// (overrides) fixpoint fails to converge. With no overrides it is infallible.
+pub fn analyze_with_progress<'s>(
+    baseline: &Context<'s>,
+    cfg: &ArchConfig,
+    pipeline: &Pipeline,
+    mut services: PipelineServices<'_>,
+    overrides: &HashMap<Proposition, bool>,
+    mut progress: impl FnMut(PipelineProgress),
+) -> Result<Context<'s>, PipelineError> {
+    let lifting = services.lifter.is_some();
+    progress(PipelineProgress::Started);
+
+    if !lifting {
+        let analyzed = run_analysis_fixpoint(baseline, cfg, pipeline, overrides, &mut progress)?;
+        progress(PipelineProgress::Finished);
+        return Ok(analyzed);
+    }
+
+    // The persistent clean IR. Only the lifting passes mutate it; it grows
+    // monotonically across discovery rounds.
+    let mut clean = baseline.clone();
+    if let Err(e) = discover_addresses_in_binary(&mut clean, &mut services) {
+        log::warn!(target: "pipeline", "binary discovery failed, continuing best-effort: {e}");
+    }
+    // Verify-then-use: establish the binary's real protections before the lift
+    // loop consults executability, so non-executable targets are skipped rather
+    // than decoded as phantom code.
+    establish_memory_protections(&mut clean);
+
+    let mut discovery_round = 0usize;
+    for _ in 0..MAX_ANALYZE_LIFT_ROUNDS {
+        let converged = lift_and_discover_until_quiet(
+            &mut clean,
+            cfg,
+            pipeline,
+            &mut services,
+            &mut discovery_round,
+            &mut progress,
+        );
+
+        let mut analyzed = run_analysis_fixpoint(&clean, cfg, pipeline, overrides, &mut progress)?;
+        // Stop on a clean fixpoint, or bail out best-effort if lifting could not
+        // converge (round cap / error) — never panic on input-dependent paths.
+        if !converged || analyzed.has_no_discoveries() {
+            progress(PipelineProgress::Finished);
+            return Ok(analyzed);
+        }
+
+        for discovery in analyzed.drain_discoveries() {
+            clean.discover(discovery);
+        }
+    }
+
+    log::warn!(
+        target: "pipeline",
+        "analyze/lift did not converge after {MAX_ANALYZE_LIFT_ROUNDS} rounds; returning best-effort analysis of the most-grown IR ({} pending discoveries)",
+        clean.discoveries().count(),
+    );
+    let analyzed = run_analysis_fixpoint(&clean, cfg, pipeline, overrides, &mut progress)?;
+    progress(PipelineProgress::Finished);
+    Ok(analyzed)
+}
+
+/// Grow the clean IR until address discovery is quiet for this analysis round.
+/// Returns `true` on a clean fixpoint, `false` if it bailed best-effort (round
+/// cap reached) so the caller can return the most-grown analysis without panicking.
+fn lift_and_discover_until_quiet(
+    clean: &mut Context<'_>,
+    cfg: &ArchConfig,
+    pipeline: &Pipeline,
+    services: &mut PipelineServices<'_>,
+    discovery_round: &mut usize,
+    progress: &mut impl FnMut(PipelineProgress),
+) -> bool {
+    let env = PipelineEnv::new(clean, cfg.clone());
+
+    loop {
+        if *discovery_round >= MAX_ANALYZE_LIFT_ROUNDS {
+            log::warn!(
+                target: "pipeline",
+                "lift/discover hit the {MAX_ANALYZE_LIFT_ROUNDS}-round cap; stopping best-effort with {} pending discoveries",
+                clean.discoveries().count(),
+            );
+            return false;
+        }
+        *discovery_round += 1;
+        let round = *discovery_round;
+        progress(PipelineProgress::AssumptionRound { round });
+        log::info!(target: "pipeline", "discovery round {round} starting");
+        let started = std::time::Instant::now();
+
+        // Lifting phase: grow the raw clean IR. Newly lifted direct successors are
+        // queued back into the same clean context and drained to a direct-code
+        // fixpoint before deriving the optimized context. A lifter error stops this
+        // round's lifting but keeps whatever was already lifted.
+        loop {
+            match lift_new_addresses(clean, services) {
+                Ok(summary) if summary.changed() => {}
+                Ok(_) => break,
+                Err(e) => {
+                    log::warn!(target: "pipeline", "lifting failed, continuing best-effort: {e}");
+                    break;
+                }
+            }
+        }
+        if let Some(lifter) = services.lifter.as_deref_mut()
+            && let Err(e) = lifter.finish_lifting(clean)
+        {
+            log::warn!(target: "pipeline", "lift finalization failed, continuing best-effort: {e}");
+        }
+
+        // Derive a disposable function-local analysis context from clean IR.
+        // Discoveries found here are the only durable output; analysis residue is
+        // discarded so newly lifted blocks invalidate the whole owning function.
+        let mut ctx = clean.clone();
+        if let Err(e) = pipeline.run_address_discovery_phase(&mut ctx, &env, round, progress) {
+            log::warn!(target: "pipeline", "address discovery pass failed, continuing best-effort: {e}");
+        }
+
+        for discovery in ctx.drain_discoveries() {
+            clean.discover(discovery);
+        }
+
+        let pending = !clean.has_no_discoveries();
+        log_round_stats(round);
+        log::info!(
+            target: "pipeline",
+            "discovery round {round} finished in {:.2?}: pending_lifts={pending}",
+            started.elapsed(),
+        );
+
+        if !pending {
+            return true;
+        }
+    }
+}
+
+/// The shared checkpoint+replay fixpoint over a stable `baseline` (clean IR).
+///
+/// Each round derives a *fresh* clone of `baseline`, seeds the accumulated
+/// `knowledge` (and any user `overrides`), runs the full optimization pipeline
+/// once, then verifies assumptions; it replays while a round produces novel facts
+/// or violations. Knowledge only grows, so it terminates.
+///
+/// `overrides` are user-forced facts kept authoritative across replays. When they
+/// are present the fixpoint is *bounded*: it additionally verifies forced returns,
+/// returns [`PipelineError::Contradiction`] if analysis disproves an override, and
+/// gives up with [`PipelineError::NoConvergence`] after [`MAX_OVERRIDE_ROUNDS`].
+/// With no overrides it cannot fail (knowledge-growth termination, no forced
+/// facts to contradict) and the loop is unbounded.
+///
+/// Emits no `Started`/`Finished` progress — the top-level driver brackets those.
+fn run_analysis_fixpoint<'s>(
+    baseline: &Context<'s>,
+    cfg: &ArchConfig,
+    pipeline: &Pipeline,
+    overrides: &HashMap<Proposition, bool>,
+    progress: &mut impl FnMut(PipelineProgress),
+) -> Result<Context<'s>, PipelineError> {
     let env = PipelineEnv::new(baseline, cfg.clone());
-    let mut knowledge: HashMap<Proposition, bool> = HashMap::new();
+    let bounded = !overrides.is_empty();
+    let mut knowledge: HashMap<Proposition, bool> = overrides.clone();
     let mut round = 0usize;
 
-    progress(PipelineProgress::Started);
     loop {
         round += 1;
         progress(PipelineProgress::AssumptionRound { round });
         log::info!(target: "pipeline", "assumption round {round} starting");
         let started = std::time::Instant::now();
 
+        // Invariant: each round derives a *fresh* clone of the raw `baseline`
+        // (clean IR) and runs the full optimization pipeline on it exactly once.
+        // Knowledge carries across rounds via `seed_known`/facts, never via
+        // accumulated IR mutations, so no optimization pass is ever applied to its
+        // own output — they need not be idempotent. Preserve this on refactors.
         let mut ctx = baseline.clone();
         for (&prop, &value) in &knowledge {
             ctx.seed_known(prop, value);
@@ -207,7 +414,7 @@ pub fn analyze_with_pipeline_with_progress<'s>(
         progress(PipelineProgress::AssumptionsRecorded { round, count });
 
         pipeline
-            .run(&mut ctx, &env, round, &mut progress)
+            .run(&mut ctx, &env, round, progress)
             .unwrap_or_else(|e| panic!("pipeline pass failed: {e}"));
 
         progress(PipelineProgress::WholeProgramPhase {
@@ -221,6 +428,21 @@ pub fn analyze_with_pipeline_with_progress<'s>(
         // so the round must replay with the fact seeded. Knowledge only grows,
         // hence termination.
         let novel = verify_assumptions(&mut ctx) + learn_stack_facts(&mut ctx);
+
+        if bounded {
+            // verify_assumptions skips facts already *known* (the overrides), so
+            // check each forced FunctionReturns against the body explicitly.
+            verify_forced_returns(&mut ctx, overrides);
+            // A user override the analysis disproved cannot be honored — abort.
+            if let Some(c) = ctx.known_contradictions().first() {
+                log::warn!(
+                    target: "pipeline",
+                    "round {round}: forced {:?}={} rejected by {} (proved {})",
+                    c.prop, c.known, c.proven_pass, c.proven,
+                );
+                return Err(PipelineError::Contradiction(*c));
+            }
+        }
 
         for v in ctx.violations() {
             log::info!(
@@ -238,10 +460,19 @@ pub fn analyze_with_pipeline_with_progress<'s>(
         );
 
         if novel == 0 && ctx.violations().is_empty() {
-            progress(PipelineProgress::Finished);
-            return ctx;
+            return Ok(ctx);
         }
+        if bounded && round >= MAX_OVERRIDE_ROUNDS {
+            return Err(PipelineError::NoConvergence { rounds: round });
+        }
+
         knowledge.extend(ctx.known_facts());
+        if bounded {
+            // Keep the user's overrides authoritative over anything learned.
+            for (&prop, &value) in overrides {
+                knowledge.insert(prop, value);
+            }
+        }
     }
 }
 
@@ -259,79 +490,16 @@ pub fn analyze_with_overrides_with_progress<'s>(
     cfg: &ArchConfig,
     pipeline: &Pipeline,
     overrides: &HashMap<Proposition, bool>,
-    mut progress: impl FnMut(PipelineProgress),
+    progress: impl FnMut(PipelineProgress),
 ) -> Result<Context<'s>, PipelineError> {
-    let env = PipelineEnv::new(baseline, cfg.clone());
-    let mut knowledge: HashMap<Proposition, bool> = overrides.clone();
-    let mut round = 0usize;
-
-    progress(PipelineProgress::Started);
-    loop {
-        round += 1;
-        progress(PipelineProgress::AssumptionRound { round });
-        log::info!(target: "pipeline", "assumption round {round} starting");
-        let started = std::time::Instant::now();
-
-        let mut ctx = baseline.clone();
-        for (&prop, &value) in &knowledge {
-            ctx.seed_known(prop, value);
-        }
-        let count = assume_call_returns(&mut ctx);
-        seed_stack_facts(&mut ctx);
-        progress(PipelineProgress::AssumptionsRecorded { round, count });
-
-        pipeline
-            .run(&mut ctx, &env, round, &mut progress)
-            .unwrap_or_else(|e| panic!("pipeline pass failed: {e}"));
-
-        progress(PipelineProgress::WholeProgramPhase {
-            round,
-            stage: "verify".into(),
-            pass: "verify_assumptions",
-        });
-        let novel = verify_assumptions(&mut ctx) + learn_stack_facts(&mut ctx);
-        // verify_assumptions skips facts already *known* (the overrides), so check
-        // each forced FunctionReturns against the body explicitly.
-        verify_forced_returns(&mut ctx, overrides);
-
-        // A user override the analysis disproved cannot be honored — abort.
-        if let Some(c) = ctx.known_contradictions().first() {
-            log::warn!(
-                target: "pipeline",
-                "round {round}: forced {:?}={} rejected by {} (proved {})",
-                c.prop, c.known, c.proven_pass, c.proven,
-            );
-            return Err(PipelineError::Contradiction(*c));
-        }
-
-        for v in ctx.violations() {
-            log::info!(
-                target: "pipeline",
-                "round {round}: {} violated {:?} (assumed {} by {}, proven {})",
-                v.asserting_pass, v.prop, v.assumed, v.assuming_pass, !v.assumed,
-            );
-        }
-        log_round_stats(round);
-        log::info!(
-            target: "pipeline",
-            "round {round} finished in {:.2?}: {novel} novel facts, {} violations",
-            started.elapsed(),
-            ctx.violations().len(),
-        );
-
-        if novel == 0 && ctx.violations().is_empty() {
-            progress(PipelineProgress::Finished);
-            return Ok(ctx);
-        }
-        if round >= MAX_OVERRIDE_ROUNDS {
-            return Err(PipelineError::NoConvergence { rounds: round });
-        }
-        knowledge.extend(ctx.known_facts());
-        // Keep the user's overrides authoritative over anything learned this round.
-        for (&prop, &value) in overrides {
-            knowledge.insert(prop, value);
-        }
-    }
+    analyze_with_progress(
+        baseline,
+        cfg,
+        pipeline,
+        PipelineServices::none(),
+        overrides,
+        progress,
+    )
 }
 
 /// Drain the per-pass counters accumulated during this round (via

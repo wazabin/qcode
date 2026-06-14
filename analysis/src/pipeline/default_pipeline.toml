@@ -8,6 +8,45 @@
 # a fixpoint — per function for function-scoped stages, whole-program for
 # module-scoped ones.
 
+# --- Lifting phase (clean IR) ------------------------------------------------
+# These stages run on the persistent clean-IR context (before the
+# `code-discovery-fixpoint` barrier), and are inert when no lifter is injected
+# (e.g. analyzing an already-lifted context). Recursive disassembly emerges from
+# the fixpoint: `lift_new_addresses` lifts one block per discovered address and
+# re-queues the addresses it reaches; jump-table targets resolved in the
+# optimization phase are flowed back as discoveries and lifted next round.
+
+# Establish the binary's real memory protections before lifting consults
+# executability (verify-then-use), so the lifter narrows its permissive default
+# (every readable byte is r/x) to the real section flags and skips data targets.
+[[stage]]
+name = "memory-protections"
+scope = "module"
+passes = ["memory_protections"]
+
+# Seed the binary's entry points as discovered functions (and load its memory).
+[[stage]]
+name = "discover-binary"
+scope = "module"
+passes = ["discover_addresses_in_binary"]
+
+# Drain the discovery queue to a fixpoint, lifting reachable code into clean IR.
+[[stage]]
+name = "lift"
+scope = "module"
+passes = ["lift_new_addresses"]
+repeat_until = "no_change"
+
+# Barrier: everything after this runs on the derived optimized IR. Unresolved
+# indirect control-flow may remain; this only means the discovery loop has reached
+# a fixpoint for the currently resolvable code.
+[[stage]]
+name = "code-discovery-fixpoint"
+scope = "module"
+passes = []
+
+# --- Optimization phase (derived IR) -----------------------------------------
+
 # Seed each function's call-clobbered-register set from the lifted IR before the
 # value-producing passes consult it.
 [[stage]]

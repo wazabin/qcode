@@ -95,6 +95,7 @@
 pub mod assumption;
 pub mod builder;
 pub mod context;
+pub mod discovery;
 pub mod error;
 pub mod memory_image;
 pub mod pass_scope;

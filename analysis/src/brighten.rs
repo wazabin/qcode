@@ -46,28 +46,58 @@ pub fn brighten_stack(
     ctx: &mut Context,
     function_id: FunctionId,
     stack_ptr: RegisterId,
-) -> Result<()> {
+) -> Result<bool> {
     // The pointer width is the stack-pointer register's own width (8 for RSP, 4
     // for ESP); it sizes the synthetic stack base so the injected store matches
     // the register and the base survives truncation to that register.
     let ptr_width = ctx.get_register(stack_ptr).size();
-    let literal_id: ValueId = make_stack_base(ctx, ptr_width);
-
-    let stack_ptr = ctx.get_register(stack_ptr);
-    let reg_space_id = stack_ptr.space().id;
-    let stack_ptr = stack_ptr.id();
 
     let root_id = Function::from_id(ctx, function_id)
         .root()
         .ok_or_else(|| Error::spanless(ErrorTy::NoRootBlock))?
         .id;
 
+    // Idempotent: the pass may be re-run across fixpoint rounds, so bail out if the
+    // synthetic stack-base store is already present at the root. Doing this before
+    // creating the literal/space avoids leaking a duplicate literal.
+    if root_has_stack_base_store(ctx, root_id, ptr_width) {
+        return Ok(false);
+    }
+
+    let literal_id: ValueId = make_stack_base(ctx, ptr_width);
+
+    let stack_ptr = ctx.get_register(stack_ptr);
+    let reg_space_id = stack_ptr.space().id;
+    let stack_ptr = stack_ptr.id();
+
     let mut builder = Builder::from_block(BasicBlock::from_id_mut(ctx, root_id));
     builder.set_insert_point_to_start();
     unsafe { builder.dont_finalize() };
     builder.push_store(literal_id, stack_ptr, reg_space_id);
 
-    Ok(())
+    Ok(true)
+}
+
+/// True if `root_id` already begins with the synthetic stack-base store this pass
+/// injects — i.e. a store whose source is the `@stack_base` literal of the given
+/// pointer width. Used to keep [`brighten_stack`] idempotent when re-run.
+fn root_has_stack_base_store(
+    ctx: &Context,
+    root_id: qcode::value::BlockId,
+    ptr_width: usize,
+) -> bool {
+    use qcode::value::insn::Mnemonic;
+    let base = stack_base(ptr_width);
+    BasicBlock::from_id(ctx, root_id).iter().any(|insn| {
+        if let Mnemonic::Store(store) = insn.mnemonic() {
+            store
+                .src
+                .as_literal()
+                .is_some_and(|lit| ctx.values.literals[lit].value == base)
+        } else {
+            false
+        }
+    })
 }
 
 #[cfg(test)]
@@ -112,6 +142,27 @@ mod tests {
             matches!(first.mnemonic(), Mnemonic::Store(_)),
             "first instruction should be a store, got: {}",
             first
+        );
+    }
+
+    #[test]
+    fn brighten_is_idempotent_when_rerun() {
+        let mut ctx = Context::new();
+        let reg_id = setup_sp(&mut ctx);
+
+        qcode!(ctx, "fn test: <entry> goto <0x1001>;");
+
+        brighten_stack(&mut ctx, test, reg_id).unwrap();
+        brighten_stack(&mut ctx, test, reg_id).unwrap();
+
+        let root = Function::from_id(&ctx, test).root().unwrap();
+        let stores = root
+            .iter()
+            .filter(|insn| matches!(insn.mnemonic(), Mnemonic::Store(_)))
+            .count();
+        assert_eq!(
+            stores, 1,
+            "re-running brighten must not duplicate the store"
         );
     }
 
@@ -229,8 +280,7 @@ impl FunctionPass for Brighten {
         fun_id: FunctionId,
         env: &PipelineEnv,
     ) -> std::result::Result<bool, String> {
-        brighten_stack(ctx, fun_id, env.cfg.stack_pointer).map_err(|e| e.to_string())?;
-        Ok(false)
+        brighten_stack(ctx, fun_id, env.cfg.stack_pointer).map_err(|e| e.to_string())
     }
 }
 

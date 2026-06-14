@@ -54,9 +54,16 @@ pub use mem2reg::mem2reg;
 pub mod value_range;
 pub use value_range::{ValueRange, value_range};
 
+pub mod lift;
+pub use lift::{discover_addresses_in_binary, lift_new_addresses};
+
+pub mod mem_protections;
+pub use mem_protections::{MemoryProtections, establish_memory_protections};
+
 pub mod pipeline;
 pub use pipeline::{
     ArchConfig, CallingConvention, DEFAULT_PIPELINE_TOML, DynFunctionPass, DynPass, FunctionPass,
-    GpReg, Pass, PassRegistration, Pipeline, PipelineEnv, RegisteredPass, analyze_default,
+    GpReg, LiftOutcome, LiftSummary, Pass, PassRegistration, Pipeline, PipelineEnv,
+    PipelineServices, RegisteredPass, analyze_and_lift_with_progress, analyze_default,
     analyze_with_pipeline,
 };

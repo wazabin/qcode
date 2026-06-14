@@ -28,6 +28,17 @@ pub const DEFAULT_PIPELINE_TOML: &str = include_str!("default_pipeline.toml");
 /// Guard against a `repeat_until` stage that never converges.
 const MAX_FIXPOINT_ITERS: usize = 100;
 
+/// Name of the stage that marks the boundary between the lifting (clean-IR) phase
+/// and the optimization phase. Stages before it run on the persistent clean IR
+/// (recursive disassembly); stages from it onward run on the derived optimized
+/// clone. The marker stage itself is a delimiter and normally carries no passes.
+pub const LIFT_BARRIER: &str = "code-discovery-fixpoint";
+
+/// Last function-local pass needed for address discovery in the default pipeline.
+/// Interprocedural analysis is intentionally deferred until no more discovered
+/// addresses need lifting.
+const ADDRESS_DISCOVERY_PASS: &str = "handle_jump_tables";
+
 #[derive(Deserialize)]
 struct PipelineConfig {
     #[serde(default)]
@@ -145,7 +156,50 @@ impl Pipeline {
         round: usize,
         progress: &mut impl FnMut(PipelineProgress),
     ) -> Result<(), String> {
-        for stage in &self.stages {
+        self.run_stages(0..self.stages.len(), ctx, env, round, progress)
+    }
+
+    /// Index of the [`LIFT_BARRIER`] marker stage, if present.
+    fn barrier_index(&self) -> Option<usize> {
+        self.stages.iter().position(|s| s.name == LIFT_BARRIER)
+    }
+
+    /// Run only the function-local analysis needed to discover additional code
+    /// addresses. Module-scoped stages are skipped here; the full interprocedural
+    /// pipeline runs only after lifting reaches a fixpoint.
+    pub fn run_address_discovery_phase(
+        &self,
+        ctx: &mut Context,
+        env: &PipelineEnv,
+        round: usize,
+        progress: &mut impl FnMut(PipelineProgress),
+    ) -> Result<(), String> {
+        let start = self.barrier_index().map(|i| i + 1).unwrap_or(0);
+        for stage in &self.stages[start..] {
+            match &stage.passes {
+                StagePasses::Function(passes) => {
+                    let reaches_discovery_pass =
+                        passes.iter().any(|p| p.name() == ADDRESS_DISCOVERY_PASS);
+                    run_function_stage(ctx, env, stage, passes, round, progress)?;
+                    if reaches_discovery_pass {
+                        return Ok(());
+                    }
+                }
+                StagePasses::Module(_) => {}
+            }
+        }
+        Ok(())
+    }
+
+    fn run_stages(
+        &self,
+        range: std::ops::Range<usize>,
+        ctx: &mut Context,
+        env: &PipelineEnv,
+        round: usize,
+        progress: &mut impl FnMut(PipelineProgress),
+    ) -> Result<(), String> {
+        for stage in &self.stages[range] {
             match &stage.passes {
                 StagePasses::Module(passes) => {
                     run_module_stage(ctx, env, stage, passes, round, progress)?

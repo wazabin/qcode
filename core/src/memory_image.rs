@@ -42,6 +42,12 @@ impl Segment {
 #[derive(Clone, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct MemoryImage {
     segments: Vec<Segment>,
+    /// Whether the per-segment `executable` flags are authoritative. Until the
+    /// `memory_protections` pass establishes them, the lifter treats every mapped
+    /// byte as potentially executable (default r/x); once known, it narrows to the
+    /// real flags. See [`may_be_executable`](Self::may_be_executable).
+    #[serde(default)]
+    protections_known: bool,
 }
 
 impl MemoryImage {
@@ -95,7 +101,8 @@ impl MemoryImage {
         Some(value)
     }
 
-    /// True if `addr` lies in an executable mapped region.
+    /// True if `addr` lies in an executable mapped region (per the raw segment
+    /// flag, regardless of whether protections have been established).
     pub fn is_executable(&self, addr: u64) -> bool {
         self.segment_at(addr).is_some_and(|s| s.executable)
     }
@@ -103,6 +110,24 @@ impl MemoryImage {
     /// True if `addr` is mapped by any segment.
     pub fn contains(&self, addr: u64) -> bool {
         self.segment_at(addr).is_some()
+    }
+
+    /// Whether the per-segment executable flags are authoritative (the
+    /// `memory_protections` pass has run).
+    pub fn protections_known(&self) -> bool {
+        self.protections_known
+    }
+
+    /// Mark the per-segment protection flags as authoritative, so the lifter
+    /// narrows from the permissive default to the real flags.
+    pub fn mark_protections_known(&mut self) {
+        self.protections_known = true;
+    }
+
+    /// True if no segments have been loaded yet. Used to make binary memory
+    /// loading idempotent across fixpoint rounds.
+    pub fn is_empty(&self) -> bool {
+        self.segments.is_empty()
     }
 }
 
@@ -149,5 +174,13 @@ mod tests {
         assert!(img.is_executable(0x2002));
         assert!(!img.is_executable(0x1002));
         assert!(!img.is_executable(0x9999));
+    }
+
+    #[test]
+    fn protections_known_is_off_by_default() {
+        let mut img = image();
+        assert!(!img.protections_known());
+        img.mark_protections_known();
+        assert!(img.protections_known());
     }
 }

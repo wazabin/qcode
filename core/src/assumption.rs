@@ -50,6 +50,11 @@ pub enum Proposition {
     /// jump-table resolver read out of read-only data) are assumed never
     /// written at runtime; a write would invalidate the resolved jump target.
     ImmutableMemory { addr: u64, size: u8 },
+    /// The byte at virtual address `addr` is executable code. The lifter assumes
+    /// this for any readable byte (default r/x) until the optional
+    /// `memory_protections` pass establishes the binary's real protections; a
+    /// target in a region the pass marks non-executable contradicts it.
+    ExecutableMemory { addr: u64 },
 }
 
 /// How certain we are about a proposition's recorded value.

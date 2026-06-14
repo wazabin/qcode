@@ -2,7 +2,7 @@
 
 use std::{
     borrow::Cow,
-    collections::{BTreeSet, HashMap, HashSet},
+    collections::{HashMap, HashSet},
     fmt::Display,
 };
 
@@ -86,14 +86,14 @@ pub struct Context<'str> {
     /// `BinaryFormat`. Empty for synthetically-built contexts.
     pub memory_image: crate::memory_image::MemoryImage,
 
-    /// `(function_entry_addr, target_addr)` pairs resolved by the jump-table
-    /// pass but that may not yet have been disassembled. `qcode_analysis` cannot
-    /// call the lifter (one-way crate dependency), so it records discovered
-    /// targets here; the harbinger re-lift loop drains them, lifts the new code
-    /// into the baseline, and re-analyzes. Rides through clone (so it survives
-    /// the checkpoint+replay rounds) and serialization.
+    /// Code addresses discovered by lifting or analysis but not yet lifted.
+    /// `qcode_analysis` cannot call the lifter (one-way crate dependency), so
+    /// passes that resolve new targets (e.g. the jump-table pass) record them
+    /// here; the `lift_new_addresses` pass drains them and lifts the code into
+    /// the (clean) IR. Rides through clone (so it survives checkpoint+replay
+    /// rounds) and serialization.
     #[serde(default)]
-    discovered_code: BTreeSet<(u64, u64)>,
+    discoveries: crate::discovery::DiscoveryQueue,
 }
 
 impl<'str> Context<'str> {
@@ -179,17 +179,88 @@ impl<'str> Context<'str> {
         self.memory_image.is_executable(addr)
     }
 
-    /// Records that the jump-table pass resolved a branch in the function at
-    /// `func_entry` to a `target` that may not yet be disassembled. The
-    /// harbinger re-lift loop drains these via [`discovered_code`](Self::discovered_code).
-    pub fn discover_code(&mut self, func_entry: u64, target: u64) {
-        self.discovered_code.insert((func_entry, target));
+    /// Mark the binary's memory protections as established (the
+    /// `memory_protections` pass has run), so executability checks narrow from the
+    /// permissive default to the real per-segment flags.
+    pub fn mark_protections_known(&mut self) {
+        self.memory_image.mark_protections_known();
     }
 
-    /// Iterates the `(function_entry_addr, target_addr)` pairs recorded by
-    /// [`discover_code`](Self::discover_code).
-    pub fn discovered_code(&self) -> impl Iterator<Item = (u64, u64)> + '_ {
-        self.discovered_code.iter().copied()
+    /// The lifter's pre-decode executability gate, modeling executability as a
+    /// [`Proposition::ExecutableMemory`]. Returns whether `addr` should be lifted:
+    ///
+    /// - protections not yet established → optimistic default r/x (`true`); the
+    ///   memory image may be empty (the lifter reads bytes from the binary format,
+    ///   not the image), so it is *not* consulted in this case;
+    /// - protections known and the region is executable → `true`;
+    /// - protections known and the region is non-executable (or unmapped) →
+    ///   `false` (skip), recording the proven fact `ExecutableMemory{addr} = false`
+    ///   for mapped-but-non-executable targets.
+    ///
+    /// The proposition is recorded only for the actionable non-executable case (a
+    /// rare event), not for every lifted block, so the truth map does not bloat.
+    pub fn assume_executable(&mut self, addr: u64) -> bool {
+        if !self.memory_image.protections_known() || self.memory_image.is_executable(addr) {
+            return true;
+        }
+        if self.memory_image.contains(addr) {
+            self.set_known(Proposition::ExecutableMemory { addr }, false);
+        }
+        false
+    }
+
+    /// Record a discovered code address (typed: a new function or a block within
+    /// an existing function) for the `lift_new_addresses` pass to lift.
+    pub fn discover(&mut self, discovery: crate::discovery::Discovery) -> bool {
+        self.discoveries.insert(discovery)
+    }
+
+    /// Convenience for the common case: the jump-table pass resolved a branch in
+    /// the function at `func_entry` to `target`, a block within that function.
+    pub fn discover_code(&mut self, func_entry: u64, target: u64) {
+        self.discoveries.insert(
+            crate::discovery::Discovery::block(target, func_entry)
+                .with_edge_kind(crate::discovery::EdgeKind::JumpTableTarget)
+                .with_provenance(crate::discovery::DiscoveryProvenance::Optimization {
+                    pass: "handle_jump_tables".to_string(),
+                    assumption: None,
+                }),
+        );
+    }
+
+    /// Remove and return every pending discovery, leaving the queue empty.
+    pub fn drain_discoveries(&mut self) -> Vec<crate::discovery::Discovery> {
+        self.discoveries.drain()
+    }
+
+    /// Iterate pending discoveries without consuming them.
+    pub fn discoveries(&self) -> impl Iterator<Item = &crate::discovery::Discovery> + '_ {
+        self.discoveries.iter()
+    }
+
+    /// True if there are no pending discoveries.
+    pub fn has_no_discoveries(&self) -> bool {
+        self.discoveries.is_empty()
+    }
+
+    pub fn mark_discovery_lifted(&mut self, key: crate::discovery::DiscoveryKey) {
+        self.discoveries.mark_lifted(key);
+    }
+
+    pub fn mark_discovery_failed(
+        &mut self,
+        key: crate::discovery::DiscoveryKey,
+        reason: impl Into<String>,
+    ) {
+        self.discoveries.mark_failed(key, reason);
+    }
+
+    pub fn mark_discovery_skipped(
+        &mut self,
+        key: crate::discovery::DiscoveryKey,
+        reason: impl Into<String>,
+    ) {
+        self.discoveries.mark_skipped(key, reason);
     }
 
     /// Returns the [`BlockId`] for a block at `addr`, creating one if needed.
@@ -1145,16 +1216,48 @@ mod tests {
         let mut ctx = Context::new();
         ctx.discover_code(0x1000, 0x1100);
         ctx.discover_code(0x1000, 0x1200);
-        ctx.discover_code(0x1000, 0x1100); // duplicate is deduped
+        ctx.discover_code(0x1000, 0x1100); // duplicate target is deduped
 
-        let pairs: Vec<_> = ctx.discovered_code().collect();
-        assert_eq!(pairs, vec![(0x1000, 0x1100), (0x1000, 0x1200)]);
+        let targets: Vec<u64> = ctx.discoveries().map(|d| d.target).collect();
+        assert_eq!(targets, vec![0x1100, 0x1200]);
 
         let config = bincode::config::standard();
         let bytes = bincode::serde::encode_to_vec(&ctx, config).expect("encode");
         let (restored, _): (Context<'static>, usize) =
             bincode::serde::decode_from_slice(&bytes, config).expect("decode");
-        assert_eq!(restored.discovered_code().collect::<Vec<_>>(), pairs);
+        assert_eq!(
+            restored.discoveries().map(|d| d.target).collect::<Vec<_>>(),
+            targets
+        );
+    }
+
+    #[test]
+    fn assume_executable_narrows_once_protections_known() {
+        let mut ctx = Context::new();
+        ctx.memory_image.add_segment(0x1000, vec![0u8; 4], true); // code
+        ctx.memory_image.add_segment(0x2000, vec![0u8; 4], false); // data
+
+        // Default r/x while protections unknown: everything is permissive, even
+        // unmapped (the lifter reads bytes from the format, not the image).
+        assert!(ctx.assume_executable(0x1000));
+        assert!(ctx.assume_executable(0x2000));
+        assert!(ctx.assume_executable(0x9999));
+
+        ctx.mark_protections_known();
+        assert!(ctx.assume_executable(0x1000), "code region stays liftable");
+        assert!(
+            !ctx.assume_executable(0x2000),
+            "data region is skipped once protections are known"
+        );
+        assert!(
+            !ctx.assume_executable(0x9999),
+            "unmapped is skipped once known"
+        );
+        // The skip records the proven fact for analysis/audit.
+        assert_eq!(
+            ctx.known(Proposition::ExecutableMemory { addr: 0x2000 }),
+            Some(false),
+        );
     }
 
     #[test]
