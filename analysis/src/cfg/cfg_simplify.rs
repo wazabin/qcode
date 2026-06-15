@@ -3,13 +3,39 @@ use qcode::{
     value::{BasicBlock, FunctionId, insn::Mnemonic},
 };
 
+use crate::{FunctionPass, PipelineEnv};
+
+#[derive(Default)]
+pub struct SimplifyCfg;
+
+impl FunctionPass for SimplifyCfg {
+    const NAME: &'static str = "simplify_cfg";
+
+    fn description(&self) -> &'static str {
+        "Merge straight-line basic blocks"
+    }
+
+    fn run(
+        &self,
+        ctx: &mut Context,
+        function_id: FunctionId,
+        _env: &PipelineEnv,
+    ) -> Result<bool, String> {
+        Ok(simplify_cfg(ctx, function_id))
+    }
+}
+
+crate::register_function_pass!(SimplifyCfg);
+
 /// Merges basic blocks in `function_id` wherever the conditions allow:
 /// if block A has exactly one successor B, B has exactly one predecessor A,
 /// and A ends with an unconditional `Branch { target: B }`, then A and B are
 /// merged into A (the branch is removed and B's instructions are appended).
 ///
 /// The pass repeats until no further merges are possible.
-pub fn simplify_cfg(ctx: &mut Context, function_id: FunctionId) {
+pub fn simplify_cfg(ctx: &mut Context, function_id: FunctionId) -> bool {
+    let mut changed = false;
+
     loop {
         let blocks = ctx.values.functions[function_id].blocks.clone();
         let mut merged = false;
@@ -71,6 +97,7 @@ pub fn simplify_cfg(ctx: &mut Context, function_id: FunctionId) {
 
             BasicBlock::from_id_mut(ctx, a_id).absorb_block(b_id, edge_ab, function_id);
             merged = true;
+            changed = true;
             break 'outer;
         }
 
@@ -78,6 +105,8 @@ pub fn simplify_cfg(ctx: &mut Context, function_id: FunctionId) {
             break;
         }
     }
+
+    changed
 }
 
 #[cfg(test)]
@@ -381,28 +410,3 @@ mod tests {
         );
     }
 }
-
-// ----- pass ------------------------------------------------------------------
-
-use crate::{FunctionPass, PipelineEnv};
-
-#[derive(Default)]
-pub struct Simplify;
-
-impl FunctionPass for Simplify {
-    const NAME: &'static str = "simplify";
-    fn description(&self) -> &'static str {
-        "Merge straight-line basic blocks"
-    }
-    fn run(
-        &self,
-        ctx: &mut Context,
-        fun_id: FunctionId,
-        _env: &PipelineEnv,
-    ) -> Result<bool, String> {
-        simplify_cfg(ctx, fun_id);
-        Ok(false)
-    }
-}
-
-crate::register_function_pass!(Simplify);

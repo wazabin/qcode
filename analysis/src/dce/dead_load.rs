@@ -221,7 +221,7 @@ fn punch_killed(killed: &mut Vec<KilledInterval>, iv: KilledInterval) {
 /// `dead` is extended with the dead stores found. Returns the block's
 /// upward-exposed live set (`live_in`) and the locations guaranteed overwritten
 /// before any read from block entry (`killed_in`), which the cross-block
-/// dataflow in [`crate::mem_liveness`] propagates to predecessors.
+/// dataflow in [`crate::mem::mem_liveness`] propagates to predecessors.
 ///
 /// `live` tracks [`LiveLoc`]s of loads not yet satisfied; `killed` tracks
 /// [`KilledInterval`]s of locations overwritten by a covering store before any
@@ -411,7 +411,7 @@ fn unread_temp_space_stores(ctx: &Context, function_id: FunctionId) -> HashSet<I
 /// Removes dead loads/stores from `function_id` in-place.
 ///
 /// When `aliases` is provided, a flow-sensitive memory-liveness dataflow
-/// ([`crate::mem_liveness`]) is run over the CFG so that register/temp-space
+/// ([`crate::mem::mem_liveness`]) is run over the CFG so that register/temp-space
 /// stores that are dead *across* basic-block boundaries — overwritten before
 /// being read on every path, or written to a `dead_reg` and never read — are
 /// removed. Without `aliases` each block is treated independently.
@@ -432,7 +432,7 @@ pub fn remove_dead_load_insns(
     match aliases {
         Some(aliases) => {
             let liveness =
-                crate::mem_liveness::compute_memory_liveness(ctx, function_id, aliases, dead_regs);
+                crate::mem::compute_memory_liveness(ctx, function_id, aliases, dead_regs);
             for &block_id in &block_ids {
                 dead.extend(dead_load_insns_seeded(
                     ctx,

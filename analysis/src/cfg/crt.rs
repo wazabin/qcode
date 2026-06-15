@@ -32,6 +32,7 @@ pub fn discover_libc_main(ctx: &mut Context, env: &PipelineEnv) -> bool {
     let Some(entry) = ctx.primary_entrypoint() else {
         return false;
     };
+
     let Some(main_reg) = env
         .cfg
         .abi
@@ -42,14 +43,17 @@ pub fn discover_libc_main(ctx: &mut Context, env: &PipelineEnv) -> bool {
     else {
         return false;
     };
+
     let Some((main, source_addr)) = find_libc_main_arg(ctx, entry, main_reg) else {
         return false;
     };
+
     // Idempotent across analyze rounds: once the discovery has materialized a
     // function at `main` (named or not), don't re-emit it every round.
     if Function::from_addr(ctx, main).is_some() {
         return false;
     }
+
     // A `main` already exists elsewhere (e.g. from the symbol table). Naming our
     // target `main` too would collide on the unique-name invariant, so bail.
     if Function::from_name(ctx, "main").is_some() {

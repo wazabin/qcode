@@ -14,7 +14,7 @@
 //!   return is not considered killed (only an explicit `dead_reg` is removable
 //!   at a function boundary).
 //!
-//! These are fed back into [`crate::dead_load::dead_load_insns_seeded`] as scan
+//! These are fed back into [`crate::dce::dead_load::dead_load_insns_seeded`] as scan
 //! seeds. The fixpoint is computed from below (both sets start empty), which is
 //! sound for loops — `killed_out` is under-approximated (fewer guaranteed
 //! kills) and `live_out` over-approximated.
@@ -27,7 +27,7 @@ use qcode::{
 };
 
 use crate::AliasResult;
-use crate::dead_load::{
+use crate::dce::dead_load::{
     KilledInterval, KilledSet, LiveLoc, LiveSet, block_transfer, is_tracked_space,
 };
 
@@ -161,7 +161,7 @@ pub fn compute_memory_liveness(
 mod tests {
     use super::*;
     use crate::AliasResult;
-    use crate::dead_load::dead_load_insns_seeded;
+    use crate::dce::dead_load::dead_load_insns_seeded;
     use qcode::value::insn::{InstructionId, Mnemonic};
     use qcode_macro::qcode;
     use std::collections::HashSet;

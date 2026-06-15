@@ -1,6 +1,6 @@
 //! Signatures for known external (libc) functions, from C prototypes.
 //!
-//! External functions are bodyless stubs, so [`call_summary`](crate::call_summary)
+//! External functions are bodyless stubs, so [`call_summary`](crate::calls)
 //! cannot infer their inputs. Instead we look the function name up in the
 //! build-time [`cabi`] prototype database and assign argument/return registers
 //! using the System V calling convention supplied by [`CallingConvention`].
@@ -17,6 +17,26 @@ use qcode::{
 };
 
 use crate::pipeline::CallingConvention;
+
+use crate::{Pass, PipelineEnv};
+
+#[derive(Default)]
+pub struct ExternalSigs;
+
+impl Pass for ExternalSigs {
+    const NAME: &'static str = "external_sigs";
+
+    fn description(&self) -> &'static str {
+        "Give known external (libc) functions signatures from their C prototypes"
+    }
+
+    fn run(&self, ctx: &mut Context, env: &PipelineEnv) -> Result<bool, String> {
+        apply_all_external_signatures(ctx, &env.cfg.abi);
+        Ok(false)
+    }
+}
+
+crate::register_module_pass!(ExternalSigs);
 
 /// System V argument classes for a scalar value.
 enum Class {
@@ -207,23 +227,3 @@ mod tests {
         assert!(Function::from_id(&tc.ctx, f).signature().is_none());
     }
 }
-
-// ----- pass ------------------------------------------------------------------
-
-use crate::{Pass, PipelineEnv};
-
-#[derive(Default)]
-pub struct ExternalSigs;
-
-impl Pass for ExternalSigs {
-    const NAME: &'static str = "external_sigs";
-    fn description(&self) -> &'static str {
-        "Give known external (libc) functions signatures from their C prototypes"
-    }
-    fn run(&self, ctx: &mut Context, env: &PipelineEnv) -> Result<bool, String> {
-        apply_all_external_signatures(ctx, &env.cfg.abi);
-        Ok(false)
-    }
-}
-
-crate::register_module_pass!(ExternalSigs);
