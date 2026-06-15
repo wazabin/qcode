@@ -17,6 +17,7 @@ use qcode::{
 };
 
 use super::PipelineProgress;
+use super::lifter::PipelineServices;
 use super::pass::{
     DynFunctionPass, DynPass, PipelineEnv, RegisteredPass, known_pass_names, make_pass,
 };
@@ -159,6 +160,31 @@ impl Pipeline {
         self.run_stages(0..self.stages.len(), ctx, env, round, progress)
     }
 
+    /// Run the clean-IR lifting stages before the `code-discovery-fixpoint`
+    /// barrier. These are ordinary TOML stages; the caller supplies lifter
+    /// services for TOML-visible lifting passes.
+    pub fn run_lifting_phase(
+        &self,
+        ctx: &mut Context,
+        env: &PipelineEnv,
+        services: &mut PipelineServices<'_>,
+        round: usize,
+        progress: &mut impl FnMut(PipelineProgress),
+    ) -> Result<(), String> {
+        let end = self.barrier_index().unwrap_or(self.stages.len());
+        for stage in &self.stages[..end] {
+            match &stage.passes {
+                StagePasses::Module(passes) => {
+                    run_lifting_module_stage(ctx, env, services, stage, passes, round, progress)?
+                }
+                StagePasses::Function(passes) => {
+                    run_function_stage(ctx, env, stage, passes, round, progress)?
+                }
+            }
+        }
+        Ok(())
+    }
+
     /// Index of the [`LIFT_BARRIER`] marker stage, if present.
     fn barrier_index(&self) -> Option<usize> {
         self.stages.iter().position(|s| s.name == LIFT_BARRIER)
@@ -299,6 +325,72 @@ fn run_module_stage(
     }
 }
 
+/// Run a clean-IR whole-program stage during recursive lifting. Most passes are
+/// ordinary analysis passes; the two lifting pass names are TOML-visible
+/// adapters over the caller-provided lifter service.
+fn run_lifting_module_stage(
+    ctx: &mut Context,
+    env: &PipelineEnv,
+    services: &mut PipelineServices<'_>,
+    stage: &Stage,
+    passes: &[Box<dyn DynPass>],
+    round: usize,
+    progress: &mut impl FnMut(PipelineProgress),
+) -> Result<(), String> {
+    let stage_name: std::sync::Arc<str> = stage.name.as_str().into();
+    let mut iters = 0;
+    loop {
+        let mut changed = false;
+        for p in passes {
+            progress(PipelineProgress::WholeProgramPhase {
+                round,
+                stage: stage_name.clone(),
+                pass: p.name(),
+            });
+            let _scope = qcode::pass_scope::enter(p.name());
+            let started = std::time::Instant::now();
+            let pass_changed = match p.name() {
+                "discover_addresses_in_binary" => {
+                    crate::discover_addresses_in_binary(ctx, services)
+                        .map_err(|e| format!("{}: {e}", p.name()))?
+                        .changed()
+                }
+                "lift_new_addresses" => {
+                    let summary = crate::lift_new_addresses(ctx, services)
+                        .map_err(|e| format!("{}: {e}", p.name()))?;
+                    if summary.changed()
+                        && let Some(lifter) = services.lifter.as_deref_mut()
+                    {
+                        lifter
+                            .finish_lifting(ctx)
+                            .map_err(|e| format!("{}: {e}", p.name()))?;
+                    }
+                    summary.changed()
+                }
+                _ => p.run(ctx, env).map_err(|e| format!("{}: {e}", p.name()))?,
+            };
+            log::debug!(
+                target: "pipeline",
+                "{} ran in {:.2?} ({})",
+                p.name(),
+                started.elapsed(),
+                if pass_changed { "changed" } else { "no change" },
+            );
+            changed |= pass_changed;
+        }
+        iters += 1;
+        if stage.repeat_until.is_none() || !changed {
+            return Ok(());
+        }
+        if iters >= MAX_FIXPOINT_ITERS {
+            return Err(format!(
+                "stage \"{}\" did not converge after {MAX_FIXPOINT_ITERS} iterations",
+                stage.name
+            ));
+        }
+    }
+}
+
 /// Run a function-scoped stage function-major: for each non-external function,
 /// run the stage's passes; if `repeat_until` is set, loop that function's passes
 /// to a fixpoint before moving to the next function.
@@ -362,7 +454,7 @@ fn run_function_stage(
 
     if log::log_enabled!(target: "pipeline", log::Level::Debug) {
         let mut rows: Vec<_> = elapsed.into_iter().collect();
-        rows.sort_by(|a, b| b.1.0.cmp(&a.1.0));
+        rows.sort_by_key(|b| std::cmp::Reverse(b.1.0));
         for (pass, (time, runs, changes)) in rows {
             log::debug!(
                 target: "pipeline",

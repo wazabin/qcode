@@ -77,6 +77,10 @@ pub trait Lifter {
     /// out of the caller) is independent of the order discoveries drain in.
     fn ensure_function(&mut self, ctx: &mut Context, addr: u64);
 
+    fn ensure_discovered_function(&mut self, ctx: &mut Context, discovery: &Discovery) {
+        self.ensure_function(ctx, discovery.target);
+    }
+
     fn lift_discovered(
         &mut self,
         clean_ctx: &mut Context,

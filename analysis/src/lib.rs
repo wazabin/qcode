@@ -12,6 +12,9 @@ pub use lower_stack::lower_stack;
 pub mod clobbered;
 pub use clobbered::{compute_clobbered_regs, set_clobbered_regs};
 
+pub mod crt;
+pub use crt::discover_libc_main;
+
 pub mod call_summary;
 pub use call_summary::{
     bind_all_call_args, bind_call_args, compute_call_clobbered_regs, compute_input_regs,

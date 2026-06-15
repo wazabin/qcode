@@ -60,10 +60,7 @@ pub fn record_stat(key: &'static str, n: u64) {
 /// `((pass, key), total)` in sorted order. The pipeline driver calls this once
 /// per round to log a statistics table.
 pub fn drain_stats() -> Vec<((&'static str, &'static str), u64)> {
-    STATS
-        .with_borrow_mut(|stats| std::mem::take(stats))
-        .into_iter()
-        .collect()
+    STATS.with_borrow_mut(std::mem::take).into_iter().collect()
 }
 
 /// Log a message attributed to the current pass: the `log` target is the pass

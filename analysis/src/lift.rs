@@ -47,7 +47,7 @@ pub fn lift_new_addresses(
     // out of the branching function) regardless of the order discoveries drain in.
     for discovery in &pending {
         if matches!(discovery.kind, DiscoveryKind::Function { .. }) {
-            lifter.ensure_function(clean_ctx, discovery.target);
+            lifter.ensure_discovered_function(clean_ctx, discovery);
         }
     }
 

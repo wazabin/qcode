@@ -32,8 +32,7 @@ use qcode::{
 };
 
 use crate::{
-    assume_call_returns, discover_addresses_in_binary, establish_memory_protections,
-    learn_stack_facts, lift_new_addresses, seed_stack_facts, verify_assumptions,
+    assume_call_returns, learn_stack_facts, seed_stack_facts, verify_assumptions,
     verify_forced_returns,
 };
 
@@ -249,14 +248,6 @@ pub fn analyze_with_progress<'s>(
     // The persistent clean IR. Only the lifting passes mutate it; it grows
     // monotonically across discovery rounds.
     let mut clean = baseline.clone();
-    if let Err(e) = discover_addresses_in_binary(&mut clean, &mut services) {
-        log::warn!(target: "pipeline", "binary discovery failed, continuing best-effort: {e}");
-    }
-    // Verify-then-use: establish the binary's real protections before the lift
-    // loop consults executability, so non-executable targets are skipped rather
-    // than decoded as phantom code.
-    establish_memory_protections(&mut clean);
-
     let mut discovery_round = 0usize;
     for _ in 0..MAX_ANALYZE_LIFT_ROUNDS {
         let converged = lift_and_discover_until_quiet(
@@ -302,8 +293,6 @@ fn lift_and_discover_until_quiet(
     discovery_round: &mut usize,
     progress: &mut impl FnMut(PipelineProgress),
 ) -> bool {
-    let env = PipelineEnv::new(clean, cfg.clone());
-
     loop {
         if *discovery_round >= MAX_ANALYZE_LIFT_ROUNDS {
             log::warn!(
@@ -319,31 +308,22 @@ fn lift_and_discover_until_quiet(
         log::info!(target: "pipeline", "discovery round {round} starting");
         let started = std::time::Instant::now();
 
-        // Lifting phase: grow the raw clean IR. Newly lifted direct successors are
-        // queued back into the same clean context and drained to a direct-code
-        // fixpoint before deriving the optimized context. A lifter error stops this
-        // round's lifting but keeps whatever was already lifted.
-        loop {
-            match lift_new_addresses(clean, services) {
-                Ok(summary) if summary.changed() => {}
-                Ok(_) => break,
-                Err(e) => {
-                    log::warn!(target: "pipeline", "lifting failed, continuing best-effort: {e}");
-                    break;
-                }
-            }
-        }
-        if let Some(lifter) = services.lifter.as_deref_mut()
-            && let Err(e) = lifter.finish_lifting(clean)
-        {
-            log::warn!(target: "pipeline", "lift finalization failed, continuing best-effort: {e}");
+        // Lifting phase: grow the raw clean IR through the TOML-configured
+        // pre-barrier stages. Newly discovered addresses are drained by the
+        // ordinary `lift_new_addresses` pass.
+        let env = PipelineEnv::new(clean, cfg.clone());
+        if let Err(e) = pipeline.run_lifting_phase(clean, &env, services, round, progress) {
+            log::warn!(target: "pipeline", "lifting phase failed, continuing best-effort: {e}");
         }
 
         // Derive a disposable function-local analysis context from clean IR.
         // Discoveries found here are the only durable output; analysis residue is
         // discarded so newly lifted blocks invalidate the whole owning function.
         let mut ctx = clean.clone();
-        if let Err(e) = pipeline.run_address_discovery_phase(&mut ctx, &env, round, progress) {
+        let analysis_env = PipelineEnv::new(clean, cfg.clone());
+        if let Err(e) =
+            pipeline.run_address_discovery_phase(&mut ctx, &analysis_env, round, progress)
+        {
             log::warn!(target: "pipeline", "address discovery pass failed, continuing best-effort: {e}");
         }
 

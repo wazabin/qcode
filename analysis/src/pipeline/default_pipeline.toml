@@ -16,6 +16,12 @@
 # re-queues the addresses it reaches; jump-table targets resolved in the
 # optimization phase are flowed back as discoveries and lifted next round.
 
+# Seed the binary's entry points as discovered functions (and load its memory).
+[[stage]]
+name = "discover-binary"
+scope = "module"
+passes = ["discover_addresses_in_binary"]
+
 # Establish the binary's real memory protections before lifting consults
 # executability (verify-then-use), so the lifter narrows its permissive default
 # (every readable byte is r/x) to the real section flags and skips data targets.
@@ -24,15 +30,22 @@ name = "memory-protections"
 scope = "module"
 passes = ["memory_protections"]
 
-# Seed the binary's entry points as discovered functions (and load its memory).
-[[stage]]
-name = "discover-binary"
-scope = "module"
-passes = ["discover_addresses_in_binary"]
-
 # Drain the discovery queue to a fixpoint, lifting reachable code into clean IR.
 [[stage]]
 name = "lift"
+scope = "module"
+passes = ["lift_new_addresses"]
+repeat_until = "no_change"
+
+# Discover the glibc CRT `main` argument from the lifted primary entrypoint.
+[[stage]]
+name = "discover-crt-main"
+scope = "module"
+passes = ["discover_libc_main"]
+
+# Let the normal recursive lifter own the discovered `main` function.
+[[stage]]
+name = "lift-crt-main"
 scope = "module"
 passes = ["lift_new_addresses"]
 repeat_until = "no_change"

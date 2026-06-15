@@ -16,6 +16,7 @@ pub type Address = u64;
 )]
 pub enum FunctionDiscoveryReason {
     Entry,
+    CrtMain,
     CallTarget,
     TailCall,
     UserSeed,
@@ -63,26 +64,24 @@ pub struct DiscoveryKey {
 
 /// Why this discovery exists. Kept as debugging/UI metadata that records how a
 /// discovered address came to be queued.
-#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[derive(Clone, Default, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum DiscoveryProvenance {
     LoaderEntry,
+
     DirectLift {
         source_addr: Address,
     },
+
     Optimization {
         pass: String,
         assumption: Option<String>,
     },
+
     UserSeed,
+
+    #[default]
     Unknown,
 }
-
-impl Default for DiscoveryProvenance {
-    fn default() -> Self {
-        Self::Unknown
-    }
-}
-
 /// A code address discovered but not yet lifted.
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct Discovery {

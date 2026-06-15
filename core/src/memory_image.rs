@@ -112,6 +112,11 @@ impl MemoryImage {
         self.segment_at(addr).is_some()
     }
 
+    /// The `[start, end)` bounds of the segment containing `addr`, if any.
+    pub fn segment_bounds(&self, addr: u64) -> Option<(u64, u64)> {
+        self.segment_at(addr).map(|s| (s.start, s.end()))
+    }
+
     /// Whether the per-segment executable flags are authoritative (the
     /// `memory_protections` pass has run).
     pub fn protections_known(&self) -> bool {

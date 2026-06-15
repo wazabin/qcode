@@ -86,6 +86,12 @@ pub struct Context<'str> {
     /// `BinaryFormat`. Empty for synthetically-built contexts.
     pub memory_image: crate::memory_image::MemoryImage,
 
+    /// The binary format's primary entrypoint, when the loader supplied one.
+    /// Analysis passes use this for narrow loader-shaped recognizers such as
+    /// CRT startup recovery without depending on a binary-format crate.
+    #[serde(default)]
+    primary_entrypoint: Option<u64>,
+
     /// Code addresses discovered by lifting or analysis but not yet lifted.
     /// `qcode_analysis` cannot call the lifter (one-way crate dependency), so
     /// passes that resolve new targets (e.g. the jump-table pass) record them
@@ -141,6 +147,14 @@ impl<'str> Context<'str> {
         self.spaces.len()
     }
 
+    pub fn set_primary_entrypoint(&mut self, entrypoint: Option<u64>) {
+        self.primary_entrypoint = entrypoint;
+    }
+
+    pub fn primary_entrypoint(&self) -> Option<u64> {
+        self.primary_entrypoint
+    }
+
     /// Replaces the spaces registry wholesale. Intended for initialization from a pre-built spec.
     pub fn load_spaces(&mut self, spaces: registry::Registry<SpaceId, Space>) {
         self.spaces = spaces;
@@ -194,17 +208,29 @@ impl<'str> Context<'str> {
     ///   not the image), so it is *not* consulted in this case;
     /// - protections known and the region is executable → `true`;
     /// - protections known and the region is non-executable (or unmapped) →
-    ///   `false` (skip), recording the proven fact `ExecutableMemory{addr} = false`
-    ///   for mapped-but-non-executable targets.
+    ///   `false` (skip), recording the proven fact
+    ///   `ExecutableMemory{start, end} = false` for the whole containing segment
+    ///   of a mapped-but-non-executable target.
     ///
-    /// The proposition is recorded only for the actionable non-executable case (a
-    /// rare event), not for every lifted block, so the truth map does not bloat.
+    /// The proposition is keyed by the containing segment, not the individual
+    /// address, so repeated skips in the same non-executable region collapse to a
+    /// single truth-map entry rather than one per byte.
+    ///
+    /// A *known* value for the containing region (a proven fact, or a user
+    /// override seeded as known) wins over the raw segment flags, so the user can
+    /// force a region executable or non-executable from the Assumptions panel.
     pub fn assume_executable(&mut self, addr: u64) -> bool {
+        let bounds = self.memory_image.segment_bounds(addr);
+        if let Some((start, end)) = bounds
+            && let Some(known) = self.known(Proposition::ExecutableMemory { start, end })
+        {
+            return known;
+        }
         if !self.memory_image.protections_known() || self.memory_image.is_executable(addr) {
             return true;
         }
-        if self.memory_image.contains(addr) {
-            self.set_known(Proposition::ExecutableMemory { addr }, false);
+        if let Some((start, end)) = bounds {
+            self.set_known(Proposition::ExecutableMemory { start, end }, false);
         }
         false
     }
@@ -1253,10 +1279,46 @@ mod tests {
             !ctx.assume_executable(0x9999),
             "unmapped is skipped once known"
         );
-        // The skip records the proven fact for analysis/audit.
+        // The skip records the proven fact for the whole containing segment.
         assert_eq!(
-            ctx.known(Proposition::ExecutableMemory { addr: 0x2000 }),
+            ctx.known(Proposition::ExecutableMemory {
+                start: 0x2000,
+                end: 0x2004,
+            }),
             Some(false),
+        );
+    }
+
+    #[test]
+    fn assume_executable_honors_region_override() {
+        let mut ctx = Context::new();
+        ctx.memory_image.add_segment(0x1000, vec![0u8; 4], true); // code
+        ctx.memory_image.add_segment(0x2000, vec![0u8; 4], false); // data
+        ctx.mark_protections_known();
+
+        // Force the data region executable and the code region non-executable.
+        ctx.seed_known(
+            Proposition::ExecutableMemory {
+                start: 0x2000,
+                end: 0x2004,
+            },
+            true,
+        );
+        ctx.seed_known(
+            Proposition::ExecutableMemory {
+                start: 0x1000,
+                end: 0x1004,
+            },
+            false,
+        );
+
+        assert!(
+            ctx.assume_executable(0x2000),
+            "override wins over the non-executable segment flag"
+        );
+        assert!(
+            !ctx.assume_executable(0x1000),
+            "override wins over the executable segment flag"
         );
     }
 
