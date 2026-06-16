@@ -900,6 +900,23 @@ impl Mem2Reg<'_, '_> {
             .map(|b| b.id)
             .collect();
 
+        // Vars that still have a Load somewhere in the function — i.e. a load the
+        // renaming DFS did not forward away (a successor block it never reached, or
+        // a partially promoted var). Removing a store to such a var would strand its
+        // load reading an undefined location (the SLEIGH `v0`/`v1` unique-space
+        // leak), so those stores fall back to the consumed/dead guard below.
+        let mut vars_with_surviving_loads: HashSet<ValueId> = HashSet::new();
+        for &block_id in &block_ids {
+            for &insn_id in BasicBlock::from_id(self.ctx, block_id).instruction_ids() {
+                if let Mnemonic::Load(Load { ptr, .. }) =
+                    Instruction::from_id(self.ctx, insn_id).mnemonic()
+                    && vars.contains(ptr)
+                {
+                    vars_with_surviving_loads.insert(*ptr);
+                }
+            }
+        }
+
         for block_id in block_ids {
             let insn_ids: Vec<InstructionId> = BasicBlock::from_id(self.ctx, block_id)
                 .instruction_ids()
@@ -914,15 +931,24 @@ impl Mem2Reg<'_, '_> {
                     continue;
                 }
                 // For register-space varnodes, preserve live-out stores (callee-save
-                // restores, return values). A store is live-out when it is neither
-                // consumed by any local load/branch-arg nor overwritten before being
-                // read. Both consumed and dead (overwritten) stores are safe to remove.
-                if let ValueId::Varnode(vn_id) = ptr
-                    && matches!(
-                        Varnode::from_id(self.ctx, *vn_id).space().ty,
-                        SpaceType::Register
-                    )
-                {
+                // restores, return values); only consumed or overwritten stores are
+                // safe to drop. Temporary-space varnodes are never live-out, but a
+                // store whose load was not forwarded (the var still has a surviving
+                // load) must be kept under the same guard — dropping it would strand
+                // that load on an undefined temp read. A temp var with no surviving
+                // load is fully promoted, so its remaining stores (e.g. a dead store
+                // the conservative frame analysis did not flag) are safe to remove.
+                // Stack-slot literals keep the unconditional removal.
+                let guarded = if let ValueId::Varnode(vn_id) = ptr {
+                    match Varnode::from_id(self.ctx, *vn_id).space().ty {
+                        SpaceType::Register => true,
+                        SpaceType::Temporary => vars_with_surviving_loads.contains(ptr),
+                        _ => false,
+                    }
+                } else {
+                    false
+                };
+                if guarded {
                     let removable = (consumed_stores.contains(&insn_id)
                         || dead_stores.contains(&insn_id))
                         && !preserved_stores.contains(&insn_id);
@@ -2382,6 +2408,72 @@ mod tests {
             join_block.num_params(),
             0,
             "the implicit-edge join must not receive a block param:\n{join_block}"
+        );
+    }
+
+    #[test]
+    fn promoted_temp_store_kept_when_its_load_is_not_forwarded() {
+        // Regression: a temporary-space varnode is both stored and loaded (so it
+        // is a promotion candidate), but its load lives in a block the renaming
+        // DFS never reaches, so the load is left in place. The store must NOT be
+        // removed — dropping it while the load survives stranded an undefined
+        // unique-space read (the SLEIGH `v0`/`v1` leak in indirect-call lifts).
+        use qcode::{builder::Builder, testing::TestContext};
+
+        let mut tc = TestContext::new();
+        let f = Function::make(&mut tc.ctx, "test".into()).unwrap().id;
+        let entry = tc.ctx.get_or_make_block(0x1000);
+        // `orphan` holds the load but is not wired as a CFG successor of `entry`,
+        // standing in for a successor the renaming DFS does not visit.
+        let orphan = tc.ctx.get_or_make_block(0x1100);
+        {
+            let mut fr = Function::from_id_mut(&mut tc.ctx, f);
+            fr.set_root(entry).unwrap();
+            fr.add_block(orphan);
+        }
+
+        let temp = {
+            let mut b = Builder::from_block(BasicBlock::from_id_mut(&mut tc.ctx, entry));
+            let temp = b.make_temp(4);
+            let val = b.context_mut().get_const(7u64, 4).id();
+            let space = Varnode::from_id(b.context(), temp).space().id;
+            b.push_store(val, ValueId::Varnode(temp), space);
+            let ret = b.context_mut().get_const(0u64, 4).id();
+            b.push_return(ret);
+            temp
+        };
+        let load_id = {
+            let mut b = Builder::from_block(BasicBlock::from_id_mut(&mut tc.ctx, orphan));
+            let space = Varnode::from_id(b.context(), temp).space().id;
+            let load = b.push_load::<false>(ValueId::Varnode(temp), 4, space).id();
+            let ret = b.context_mut().get_const(0u64, 4).id();
+            b.push_return(ret);
+            load
+        };
+
+        let aliases = AliasResult::simple(&tc.ctx);
+        mem2reg(&mut tc.ctx, f, &aliases);
+
+        let ValueId::Instruction(load_id) = load_id else {
+            unreachable!()
+        };
+        // The load survived (was not forwarded)...
+        assert!(
+            BasicBlock::from_id(&tc.ctx, orphan)
+                .instruction_ids()
+                .contains(&load_id),
+            "precondition: the unreached load is left in place"
+        );
+        // ...so its store must survive too — no dangling temp read.
+        let entry_has_store = BasicBlock::from_id(&tc.ctx, entry).iter().any(|insn| {
+            matches!(
+                insn.mnemonic(),
+                Mnemonic::Store(Store { ptr, .. }) if *ptr == ValueId::Varnode(temp)
+            )
+        });
+        assert!(
+            entry_has_store,
+            "the temp store must be kept while its load survives (no v0/v1 leak)"
         );
     }
 }
