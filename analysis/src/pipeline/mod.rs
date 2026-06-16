@@ -306,6 +306,7 @@ fn lift_and_discover_until_quiet(
         let round = *discovery_round;
         progress(PipelineProgress::AssumptionRound { round });
         log::info!(target: "pipeline", "discovery round {round} starting");
+        #[cfg(not(target_arch = "wasm32"))]
         let started = std::time::Instant::now();
 
         // Lifting phase: grow the raw clean IR through the TOML-configured
@@ -339,6 +340,7 @@ fn lift_and_discover_until_quiet(
 
         let pending = split || !clean.has_no_discoveries();
         log_round_stats(round);
+        #[cfg(not(target_arch = "wasm32"))]
         log::info!(
             target: "pipeline",
             "discovery round {round} finished in {:.2?}: pending_lifts={pending}",
@@ -387,6 +389,7 @@ fn run_analysis_fixpoint<'s>(
         round += 1;
         progress(PipelineProgress::AssumptionRound { round });
         log::info!(target: "pipeline", "assumption round {round} starting");
+        #[cfg(not(target_arch = "wasm32"))]
         let started = std::time::Instant::now();
 
         // Invariant: each round derives a *fresh* clone of the raw `baseline`
@@ -443,6 +446,7 @@ fn run_analysis_fixpoint<'s>(
             );
         }
         log_round_stats(round);
+        #[cfg(not(target_arch = "wasm32"))]
         log::info!(
             target: "pipeline",
             "round {round} finished in {:.2?}: {novel} novel facts, {} violations",

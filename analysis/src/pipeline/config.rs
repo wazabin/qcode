@@ -301,8 +301,10 @@ fn run_module_stage(
                 pass: p.name(),
             });
             let _scope = qcode::pass_scope::enter(p.name());
+            #[cfg(not(target_arch = "wasm32"))]
             let started = std::time::Instant::now();
             let pass_changed = p.run(ctx, env).map_err(|e| format!("{}: {e}", p.name()))?;
+            #[cfg(not(target_arch = "wasm32"))]
             log::debug!(
                 target: "pipeline",
                 "{} ran in {:.2?} ({})",
@@ -348,6 +350,7 @@ fn run_lifting_module_stage(
                 pass: p.name(),
             });
             let _scope = qcode::pass_scope::enter(p.name());
+            #[cfg(not(target_arch = "wasm32"))]
             let started = std::time::Instant::now();
             let pass_changed = match p.name() {
                 "discover_addresses_in_binary" => {
@@ -369,6 +372,7 @@ fn run_lifting_module_stage(
                 }
                 _ => p.run(ctx, env).map_err(|e| format!("{}: {e}", p.name()))?,
             };
+            #[cfg(not(target_arch = "wasm32"))]
             log::debug!(
                 target: "pipeline",
                 "{} ran in {:.2?} ({})",
@@ -429,12 +433,16 @@ fn run_function_stage(
                     pass: p.name(),
                 });
                 let _scope = qcode::pass_scope::enter(p.name());
+                #[cfg(not(target_arch = "wasm32"))]
                 let started = std::time::Instant::now();
                 let pass_changed = p
                     .run(ctx, fun_id, env)
                     .map_err(|e| format!("{}: {e}", p.name()))?;
                 let entry = elapsed.entry(p.name()).or_default();
-                entry.0 += started.elapsed();
+                #[cfg(not(target_arch = "wasm32"))]
+                {
+                    entry.0 += started.elapsed();
+                }
                 entry.1 += 1;
                 entry.2 += pass_changed as usize;
                 changed |= pass_changed;
