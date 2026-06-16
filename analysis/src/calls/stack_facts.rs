@@ -11,7 +11,7 @@ use qcode::{assumption::Proposition, context::Context, pass_scope, value::Functi
 /// and the summary/bind passes union onto `reads_unbounded_stack`. Mirrors
 /// [`assume_call_returns`](crate::assume_call_returns) for these facts.
 pub fn seed_stack_facts(ctx: &mut Context) {
-    let facts: Vec<(Proposition, bool)> = ctx.known_facts().collect();
+    let facts: Vec<(Proposition, bool)> = ctx.known_facts().map(|(p, v, _pass)| (p, v)).collect();
     for (prop, value) in facts {
         if !value {
             continue;

@@ -2,10 +2,10 @@
 
 //! Reasonable-assumption analysis passes and the checkpoint+replay driver.
 //!
-//! - [`assume_call_returns`] is the *make* pass: it connects the fall-through of
-//!   every returning call with a real CFG edge after recording a
-//!   [`Proposition::FunctionReturns`] assumption (skipping callees already
-//!   known noreturn — the assume itself refuses).
+//! - [`assume_call_returns`] is the *make* pass: the clean IR already carries a
+//!   materialized fall-through edge for every may-return call, so this records a
+//!   [`Proposition::FunctionReturns`] assumption for each callee and *prunes*
+//!   that edge for callees already known/assumed noreturn (the assume refuses).
 //! - [`verify_assumptions`] is the *verify* pass: it proves each assumed
 //!   `FunctionReturns` proposition true or false via
 //!   [`Context::set_known`](qcode::context::Context::set_known); a
@@ -17,10 +17,10 @@
 use std::collections::HashMap;
 
 use qcode::{
-    assumption::Proposition,
+    assumption::{PassName, Proposition},
     context::Context,
     pass_scope,
-    value::{BasicBlock, Function, FunctionId, Instruction, block::BlockId, insn::Mnemonic},
+    value::{BasicBlock, Function, FunctionId, block::BlockId, insn::Mnemonic},
 };
 
 /// Callees that, by convention, do not return. Used to classify external stubs
@@ -45,18 +45,18 @@ const NORETURN_NAMES: &[&str] = &[
 
 /// *Make* pass — record call-return assumptions across the whole program.
 ///
-/// For every block that ends in a direct `Call`, this assumes
-/// [`Proposition::FunctionReturns`] for the callee and, if the assumption is
-/// admissible (not already known/assumed noreturn), connects the call block to
-/// its fall-through continuation with a CFG edge. The continuation is the
-/// block in the same function with the smallest address strictly greater than
-/// the call instruction's address — robustly the instruction after the call,
-/// since nothing can start inside the call's bytes.
+/// The clean IR already carries a materialized fall-through edge for every
+/// may-return call (wired at lift time). For every block that ends in a direct
+/// `Call`, this assumes [`Proposition::FunctionReturns`] for the callee; if the
+/// assumption is refused (the callee is already known/assumed noreturn), the
+/// materialized fall-through edge is *pruned*. A `Call` is a terminator, so its
+/// only successor is that fall-through, making the edge to remove unambiguous.
 ///
-/// Idempotent: a call block that already has a successor edge is skipped.
-/// `CallInd` is skipped in v1 (callee unknown).
+/// Idempotent: a returning callee keeps its edge; a noreturn callee's edge is
+/// removed once and a re-run finds nothing left to prune. `CallInd` is left
+/// untouched (callee unknown — conservatively assumed returning).
 ///
-/// Returns the number of continuation edges added.
+/// Returns the number of fall-through edges pruned.
 pub fn assume_call_returns(ctx: &mut Context) -> usize {
     let _scope = pass_scope::enter("assume_call_returns");
     let func_ids: Vec<FunctionId> = ctx.functions().map(|f| f.id).collect();
@@ -69,17 +69,9 @@ pub fn assume_call_returns(ctx: &mut Context) -> usize {
             .copied()
             .collect();
 
-        // Blocks of this function that carry a machine address, sorted ascending,
-        // so the continuation lookup is a simple "first address greater than".
-        let mut addressed: Vec<(u64, BlockId)> = block_ids
-            .iter()
-            .filter_map(|&bid| ctx.values.basic_blocks[bid].address.map(|a| (a, bid)))
-            .collect();
-        addressed.sort_by_key(|(a, _)| *a);
-
-        // (call_block, callee, continuation) to materialise after the
-        // read-only scan releases its borrow of `ctx`.
-        let mut edits: Vec<(BlockId, FunctionId, BlockId)> = Vec::new();
+        // (call_block, callee) to act on after the read-only scan releases its
+        // borrow of `ctx`.
+        let mut calls: Vec<(BlockId, FunctionId)> = Vec::new();
 
         for &call_block in &block_ids {
             let Some(&call_site) = ctx.values.basic_blocks[call_block].instructions.last() else {
@@ -89,35 +81,30 @@ pub fn assume_call_returns(ctx: &mut Context) -> usize {
                 Mnemonic::Call(call) => call.target,
                 _ => continue,
             };
-            // Idempotency: don't double-connect an already-linked call block.
-            if BasicBlock::from_id(ctx, call_block)
-                .successors()
-                .next()
-                .is_some()
-            {
-                continue;
-            }
-            let Some(call_addr) = Instruction::from_id(ctx, call_site).address() else {
-                continue;
-            };
-            let Some(&(_, continuation)) = addressed.iter().find(|(a, _)| *a > call_addr) else {
-                continue;
-            };
-            edits.push((call_block, callee, continuation));
+            calls.push((call_block, callee));
         }
 
-        for (call_block, callee, continuation) in edits {
-            // Refused when the callee is already known (or assumed) noreturn.
-            if !ctx.assume_true(Proposition::FunctionReturns(callee)) {
-                qcode::pass_log!(trace, "callee {callee:?} is noreturn, not linking");
+        for (call_block, callee) in calls {
+            // Admissible (callee may return): keep the materialized edge.
+            if ctx.assume_true(Proposition::FunctionReturns(callee)) {
                 continue;
             }
-            ctx.add_cfg_edge(call_block, continuation);
-            count += 1;
+            // Refused — the callee is known/assumed noreturn. Prune the call
+            // block's fall-through edge(s); a `Call` terminator has no other
+            // successor, so this only removes the continuation edge.
+            qcode::pass_log!(trace, "callee {callee:?} is noreturn, pruning fall-through");
+            let edges: Vec<_> = BasicBlock::from_id(ctx, call_block)
+                .successors()
+                .map(|(edge, _)| edge)
+                .collect();
+            for edge in edges {
+                ctx.remove_cfg_edge(edge);
+                count += 1;
+            }
         }
     }
 
-    qcode::stat!("call_return_edges", count as u64);
+    qcode::stat!("call_return_edges_pruned", count as u64);
     count
 }
 
@@ -226,12 +213,12 @@ pub fn analyze_with_assumptions<'str>(
     baseline: &Context<'str>,
     mut run_dependent: impl FnMut(&mut Context<'str>),
 ) -> Context<'str> {
-    let mut knowledge: HashMap<Proposition, bool> = HashMap::new();
+    let mut knowledge: HashMap<Proposition, (bool, PassName)> = HashMap::new();
 
     loop {
         let mut ctx = baseline.clone();
-        for (&prop, &value) in &knowledge {
-            ctx.seed_known(prop, value);
+        for (&prop, &(value, pass)) in &knowledge {
+            ctx.seed_known(prop, value, pass);
         }
         assume_call_returns(&mut ctx);
         run_dependent(&mut ctx);
@@ -240,7 +227,7 @@ pub fn analyze_with_assumptions<'str>(
         if novel == 0 && ctx.violations().is_empty() {
             return ctx;
         }
-        knowledge.extend(ctx.known_facts());
+        knowledge.extend(ctx.known_facts().map(|(p, v, pass)| (p, (v, pass))));
     }
 }
 

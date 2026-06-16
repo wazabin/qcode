@@ -149,23 +149,25 @@ impl FunctionPass for HandleJumpTables {
         }
 
         for Edit { from, target, .. } in edits {
+            let from_addr = BasicBlock::from_id(ctx, from).address();
             let tb = ctx.get_or_make_block(target);
             Function::from_id_mut(ctx, fun_id).add_block(tb);
 
             ctx.add_cfg_edge(from, tb);
-            discover(ctx, fn_entry, target);
+            discover(ctx, fn_entry, from_addr, target);
         }
 
         // A single resolved target: the indirect branch is really an
         // unconditional jump. Replace `BranchInd` with a direct `Branch`.
         for MakeBranch { from, target } in single_branches {
+            let from_addr = BasicBlock::from_id(ctx, from).address();
             let target_block = ctx.get_or_make_block(target);
             Function::from_id_mut(ctx, fun_id).add_block(target_block);
 
             let mut block = BasicBlock::from_id_mut(ctx, from);
             block.pop_insn();
             Builder::from_block(block).push_branch(target_block);
-            discover(ctx, fn_entry, target);
+            discover(ctx, fn_entry, from_addr, target);
         }
 
         for MakeCBranch {
@@ -176,12 +178,13 @@ impl FunctionPass for HandleJumpTables {
             false_target,
         } in branches
         {
+            let from_addr = BasicBlock::from_id(ctx, from).address();
             let true_block = ctx.get_or_make_block(true_target);
             let false_block = ctx.get_or_make_block(false_target);
             Function::from_id_mut(ctx, fun_id).add_block(true_block);
             Function::from_id_mut(ctx, fun_id).add_block(false_block);
-            discover(ctx, fn_entry, true_target);
-            discover(ctx, fn_entry, false_target);
+            discover(ctx, fn_entry, from_addr, true_target);
+            discover(ctx, fn_entry, from_addr, false_target);
 
             let mut block = BasicBlock::from_id_mut(ctx, from);
             block.pop_insn();
@@ -202,9 +205,9 @@ impl FunctionPass for HandleJumpTables {
 /// Record a resolved `target` for later disassembly, keyed by the owning
 /// function's entry address. A no-op for synthetic functions that lack an
 /// address (nothing to re-lift from a binary image).
-fn discover(ctx: &mut Context, fn_entry: Option<u64>, target: u64) {
-    if let Some(entry) = fn_entry {
-        ctx.discover_code(entry, target);
+fn discover(ctx: &mut Context, fn_entry: Option<u64>, source_block: Option<u64>, target: u64) {
+    if let (Some(entry), Some(source)) = (fn_entry, source_block) {
+        ctx.discover_code(entry, source, target);
     }
 }
 

@@ -26,7 +26,7 @@ pub use pass::{
 use std::collections::HashMap;
 
 use qcode::{
-    assumption::Proposition,
+    assumption::{PassName, Proposition},
     context::Context,
     value::{RegisterId, ValueId, VarnodeId},
 };
@@ -331,7 +331,13 @@ fn lift_and_discover_until_quiet(
             clean.discover(discovery);
         }
 
-        let pending = !clean.has_no_discoveries();
+        // Repair functions that absorbed another function's body before its entry
+        // was known (thunks/tail calls/late call targets). A split rewrites the
+        // clean IR's `blocks`/`instruction_addrs`, so treat it like a discovery:
+        // keep the loop going and let analysis replay over the corrected IR.
+        let split = crate::split_overlapping_functions(clean);
+
+        let pending = split || !clean.has_no_discoveries();
         log_round_stats(round);
         log::info!(
             target: "pipeline",
@@ -369,7 +375,12 @@ fn run_analysis_fixpoint<'s>(
 ) -> Result<Context<'s>, PipelineError> {
     let env = PipelineEnv::new(baseline, cfg.clone());
     let bounded = !overrides.is_empty();
-    let mut knowledge: HashMap<Proposition, bool> = overrides.clone();
+    // User overrides carry a synthetic "override" provenance so the converged
+    // context attributes a forced fact to the user, not the re-seeding driver.
+    let mut knowledge: HashMap<Proposition, (bool, PassName)> = overrides
+        .iter()
+        .map(|(&prop, &value)| (prop, (value, PassName("override"))))
+        .collect();
     let mut round = 0usize;
 
     loop {
@@ -384,8 +395,8 @@ fn run_analysis_fixpoint<'s>(
         // accumulated IR mutations, so no optimization pass is ever applied to its
         // own output — they need not be idempotent. Preserve this on refactors.
         let mut ctx = baseline.clone();
-        for (&prop, &value) in &knowledge {
-            ctx.seed_known(prop, value);
+        for (&prop, &(value, pass)) in &knowledge {
+            ctx.seed_known(prop, value, pass);
         }
         let count = assume_call_returns(&mut ctx);
         // Re-apply the stack-escape facts proven in earlier rounds so this round's
@@ -446,11 +457,11 @@ fn run_analysis_fixpoint<'s>(
             return Err(PipelineError::NoConvergence { rounds: round });
         }
 
-        knowledge.extend(ctx.known_facts());
+        knowledge.extend(ctx.known_facts().map(|(p, v, pass)| (p, (v, pass))));
         if bounded {
             // Keep the user's overrides authoritative over anything learned.
             for (&prop, &value) in overrides {
-                knowledge.insert(prop, value);
+                knowledge.insert(prop, (value, PassName("override")));
             }
         }
     }

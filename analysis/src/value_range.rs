@@ -25,7 +25,7 @@ use qcode::{
     value::{
         BasicBlock, Value, ValueId, ValueRef,
         block::BlockId,
-        insn::{Binary, Binop, InstructionId, IntBinop, Mnemonic, Unary, Unop},
+        insn::{Binary, Binop, BoolBinop, InstructionId, IntBinop, Mnemonic, Unary, Unop},
     },
 };
 
@@ -168,6 +168,15 @@ fn shl(a: ValueRange, shift: u64, mask: u64) -> Option<ValueRange> {
         return None;
     }
     mul(a, ValueRange::exact(1u64 << shift), mask)
+}
+
+/// The smallest interval containing both `a` and `b` (their join / convex hull).
+/// A sound over-approximation of the set union `a ∪ b`.
+fn hull(a: ValueRange, b: ValueRange) -> ValueRange {
+    ValueRange {
+        min: a.min.min(b.min),
+        max: a.max.max(b.max),
+    }
 }
 
 fn shr(a: ValueRange, shift: u64) -> ValueRange {
@@ -346,7 +355,7 @@ impl Solver<'_> {
                     None
                 };
                 if let Some(taken) = taken
-                    && let Some(r) = self.refine_from_cmp(cb.condition, v, taken, mask)
+                    && let Some(r) = self.refine_condition(cb.condition, v, taken, mask, 0)
                 {
                     acc = acc.intersect(r);
                 }
@@ -356,9 +365,111 @@ impl Solver<'_> {
         acc
     }
 
+    /// Peel value-preserving zero-extensions off `v`, returning the underlying
+    /// value. `zext` preserves the unsigned value exactly, so a comparison on the
+    /// narrow value bounds the widened one (and vice versa); the constant is
+    /// masked to the query width by the caller. Other widenings are left intact
+    /// to stay sound for unsigned interval reasoning.
+    fn zext_core(&self, mut v: ValueId) -> ValueId {
+        for _ in 0..RECURSE_CAP {
+            let ValueId::Instruction(id) = v else { break };
+            match self.ctx.get_insn(id).mnemonic() {
+                Mnemonic::Zext(z) => v = z.src,
+                _ => break,
+            }
+        }
+        v
+    }
+
+    /// Recognize `base - c` (a constant subtrahend), the shape the `cmp`
+    /// instruction lowers to before its result feeds a flag test. Returns
+    /// `(base, c)`.
+    fn as_sub_const(&self, v: ValueId) -> Option<(ValueId, u64)> {
+        let ValueId::Instruction(id) = v else {
+            return None;
+        };
+        if let Mnemonic::Binop(Binary {
+            op: Binop::Int(IntBinop::Sub),
+            lhs,
+            rhs,
+        }) = self.ctx.get_insn(id).mnemonic()
+            && let Some(c) = numeric_const(self.ctx, *rhs)
+        {
+            return Some((*lhs, c));
+        }
+        None
+    }
+
+    /// The interval implied for `v` by a (possibly compound) boolean
+    /// `condition` being `taken`.
+    ///
+    /// Compilers lower `switch` bound checks like `x <= 7` (x86 `cmp; ja`/`jbe`)
+    /// into a negated disjunction of primitive comparisons, e.g.
+    /// `!((x < 7) || (x == 7))`, so the dominating `CBranch` condition is rarely
+    /// a bare comparison. This walks the boolean structure:
+    ///
+    /// - `!c` flips the taken polarity and recurses.
+    /// - `a && b` / `a || b` decompose to their operands at the *same* polarity;
+    ///   whether the two refinements combine by intersection or by union follows
+    ///   from the De Morgan duality of `taken`. A union is over-approximated by
+    ///   the interval hull (sound: `union ⊆ hull`), so `(x < 7) || (x == 7)`
+    ///   taken yields `[0, 6] ⊔ [7, 7] = [0, 7]`.
+    /// - a leaf comparison is handled by [`Self::refine_from_cmp`].
+    fn refine_condition(
+        &self,
+        condition: ValueId,
+        v: ValueId,
+        taken: bool,
+        mask: u64,
+        depth: usize,
+    ) -> Option<ValueRange> {
+        if depth >= GUARD_DEPTH_CAP {
+            return None;
+        }
+        let ValueId::Instruction(id) = condition else {
+            return None;
+        };
+        match self.ctx.get_insn(id).mnemonic() {
+            Mnemonic::Unop(Unary {
+                op: Unop::BoolNot,
+                src,
+            }) => self.refine_condition(*src, v, !taken, mask, depth + 1),
+
+            Mnemonic::Binop(Binary {
+                op: Binop::Bool(op @ (BoolBinop::And | BoolBinop::Or)),
+                lhs,
+                rhs,
+            }) => {
+                let (lhs, rhs) = (*lhs, *rhs);
+                let l = self.refine_condition(lhs, v, taken, mask, depth + 1);
+                let r = self.refine_condition(rhs, v, taken, mask, depth + 1);
+                // `OR` taken and `AND` not-taken are disjunctions (value in the
+                // union of the operand facts); the other two are conjunctions.
+                let union = (*op == BoolBinop::Or) == taken;
+                if union {
+                    // A union with an unknown operand is unknown — no bound.
+                    match (l, r) {
+                        (Some(a), Some(b)) => Some(hull(a, b)),
+                        _ => None,
+                    }
+                } else {
+                    // A conjunction: an unknown operand simply adds no constraint.
+                    match (l, r) {
+                        (Some(a), Some(b)) => Some(a.intersect(b)),
+                        (Some(a), None) | (None, Some(a)) => Some(a),
+                        (None, None) => None,
+                    }
+                }
+            }
+
+            _ => self.refine_from_cmp(condition, v, taken, mask),
+        }
+    }
+
     /// The interval implied for `v` by `condition` being `taken`, when the
-    /// condition is a comparison between exactly `v` (the same SSA value — no
-    /// aliasing reasoning) and a non-symbolic constant.
+    /// condition is a comparison between `v` (matched up to a value-preserving
+    /// zero-extension, so a guard on `EDI` bounds `zext(EDI)`) and a
+    /// non-symbolic constant.
     ///
     /// Signed comparisons are skipped: `v s< k` with `k >= 0` constrains `v`
     /// to `[0, k-1] ∪ [2^(bits-1), MAX]`, two disjoint unsigned intervals;
@@ -386,13 +497,28 @@ impl Solver<'_> {
             return None;
         };
 
-        let (k, v_is_lhs) = if *lhs == v {
-            (numeric_const(self.ctx, *rhs)?, true)
-        } else if *rhs == v {
-            (numeric_const(self.ctx, *lhs)?, false)
-        } else {
+        // Split the comparison into its constant side and its value side.
+        let (mut cmp_base, mut k, v_is_lhs) =
+            match (numeric_const(self.ctx, *lhs), numeric_const(self.ctx, *rhs)) {
+                (None, Some(k)) => (*lhs, k, true),
+                (Some(k), None) => (*rhs, k, false),
+                _ => return None,
+            };
+
+        // The value side may be the `cmp`-derived `base - c0` (a constant
+        // subtrahend), as in the ZF idiom `(x - c0) == 0`. For an equality test
+        // that is exactly `base == k + c0`, so fold `c0` into the constant.
+        if matches!(*op, IntBinop::Equal | IntBinop::NotEqual)
+            && let Some((base, c0)) = self.as_sub_const(cmp_base)
+        {
+            cmp_base = base;
+            k = k.wrapping_add(c0);
+        }
+
+        let core = self.zext_core(v);
+        if self.zext_core(cmp_base) != core {
             return None;
-        };
+        }
         let k = k & mask;
 
         let range = match (*op, v_is_lhs, taken) {
@@ -562,6 +688,46 @@ mod tests {
         let r = value_range(&ctx, idx.into(), disp);
         assert_eq!((r.min, r.max), (0, 7));
         assert_eq!(r.count(), 8);
+    }
+
+    /// The `cmp; ja`/`jbe` lowering: a bound check `idx <= 7` becomes
+    /// `!((idx < 7) || ((idx - 7) == 0))` on the *above* edge, so the
+    /// fall-through (dispatch) edge must bound `idx` to `[0, 7]`. Exercises
+    /// boolean-negation/`||` see-through plus the `(x - k) == 0` ZF idiom, and a
+    /// guard reached through a `zext` of the compared value.
+    #[test]
+    fn jbe_flag_lowering_bounds_index() {
+        let mut ctx = Context::new();
+        qcode!(
+            ctx,
+            "
+            varnode i32 A;
+            <entry>
+                %edi = load(i32, &A);
+                %idx = zext(i64, %edi);
+                %lt = %idx < 0x7;
+                %sub = %edi - 0x7;
+                %zf = %sub == 0x0;
+                %le = %lt || %zf;
+                %above = ! %le;
+                if %above goto <oob> else goto <disp>;
+            <disp>
+                goto <0x1001>;
+            <oob>
+                goto <0x1002>;
+            "
+        );
+
+        // The dispatch (fall-through) edge: idx in [0, 7].
+        let r = value_range(&ctx, idx.into(), disp);
+        assert_eq!((r.min, r.max), (0, 7));
+        assert_eq!(r.count(), 8);
+
+        // The above edge: `idx >= 7` — the `< 7` disjunct refines the lower
+        // bound, while the `== 7` complement excludes only a midpoint (not
+        // representable), so the result is the sound over-approximation [7, MAX].
+        let r = value_range(&ctx, idx.into(), oob);
+        assert_eq!(r.min, 7);
     }
 
     #[test]

@@ -243,10 +243,17 @@ impl<'str> Context<'str> {
 
     /// Convenience for the common case: the jump-table pass resolved a branch in
     /// the function at `func_entry` to `target`, a block within that function.
-    pub fn discover_code(&mut self, func_entry: u64, target: u64) {
+    ///
+    /// `source_block` is the address of the block ending in the indirect branch,
+    /// so the lifter can connect a real CFG edge from it to `target` in the clean
+    /// IR (the resolution is otherwise only reflected in the disposable optimized
+    /// clone, which would leave the target an orphan that function-splitting and
+    /// reachability cannot follow).
+    pub fn discover_code(&mut self, func_entry: u64, source_block: u64, target: u64) {
         self.discoveries.insert(
             crate::discovery::Discovery::block(target, func_entry)
                 .with_edge_kind(crate::discovery::EdgeKind::JumpTableTarget)
+                .from_block_addr(source_block)
                 .with_provenance(crate::discovery::DiscoveryProvenance::Optimization {
                     pass: "handle_jump_tables".to_string(),
                     assumption: None,
@@ -455,13 +462,18 @@ impl<'str> Context<'str> {
     /// round. Unlike [`set_known`](Self::set_known) this is not "novel": it
     /// must not retrigger a replay, and seeding over an existing entry is a
     /// logic error (seed before any pass runs).
-    pub fn seed_known(&mut self, prop: Proposition, value: bool) {
+    ///
+    /// `pass` is the identity of the pass that originally proved the fact (as
+    /// harvested from [`known_facts`](Self::known_facts)), preserved across the
+    /// round boundary so the converged context still names the proving pass
+    /// rather than the re-seeding driver.
+    pub fn seed_known(&mut self, prop: Proposition, value: bool, pass: PassName) {
         let prior = self.values.truths.insert(
             prop,
             Truth {
                 value,
                 certainty: Certainty::Known,
-                pass: PassName(pass_scope::current_pass()),
+                pass,
             },
         );
         debug_assert!(prior.is_none(), "seeding {prop:?} over an existing truth");
@@ -486,10 +498,10 @@ impl<'str> Context<'str> {
 
     /// Iterates over the proven facts, for the replay driver to harvest into
     /// the next round's [`seed_known`](Self::seed_known) calls.
-    pub fn known_facts(&self) -> impl Iterator<Item = (Proposition, bool)> + '_ {
+    pub fn known_facts(&self) -> impl Iterator<Item = (Proposition, bool, PassName)> + '_ {
         self.truths()
             .filter(|(_, t)| t.certainty == Certainty::Known)
-            .map(|(p, t)| (p, t.value))
+            .map(|(p, t)| (p, t.value, t.pass))
     }
 
     /// The violations recorded this round (proven facts that contradicted an
@@ -1227,7 +1239,7 @@ mod tests {
         let callee = Function::make(&mut ctx, "exit".into()).unwrap().id;
         let prop = Proposition::FunctionReturns(callee);
 
-        ctx.seed_known(prop, false);
+        ctx.seed_known(prop, false, PassName("seed"));
         assert_eq!(ctx.known(prop), Some(false));
         assert!(!ctx.assume_true(prop), "seeded fact blocks opposite assume");
         assert!(
@@ -1240,9 +1252,9 @@ mod tests {
     #[test]
     fn discovered_code_records_and_survives_round_trip() {
         let mut ctx = Context::new();
-        ctx.discover_code(0x1000, 0x1100);
-        ctx.discover_code(0x1000, 0x1200);
-        ctx.discover_code(0x1000, 0x1100); // duplicate target is deduped
+        ctx.discover_code(0x1000, 0x10f0, 0x1100);
+        ctx.discover_code(0x1000, 0x10f0, 0x1200);
+        ctx.discover_code(0x1000, 0x10f0, 0x1100); // duplicate target is deduped
 
         let targets: Vec<u64> = ctx.discoveries().map(|d| d.target).collect();
         assert_eq!(targets, vec![0x1100, 0x1200]);
@@ -1303,6 +1315,7 @@ mod tests {
                 end: 0x2004,
             },
             true,
+            PassName("override"),
         );
         ctx.seed_known(
             Proposition::ExecutableMemory {
@@ -1310,6 +1323,7 @@ mod tests {
                 end: 0x1004,
             },
             false,
+            PassName("override"),
         );
 
         assert!(
