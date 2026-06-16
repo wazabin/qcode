@@ -72,18 +72,23 @@ pub(super) fn constant_folding(
 fn constant_folding_with_location(
     ctx: &mut Context,
     m: &Mnemonic,
-    _output_size: usize,
+    output_size: usize,
     location: Option<&InsnCtx>,
 ) -> Option<ValueId> {
     match m {
         &Mnemonic::Binop(Binary { lhs, rhs, op }) => {
             // StackAddress-typed literals are foldable; their type is preserved
             // through the output type computed by binop_result below.
+            let lhs_id = lhs;
+            let rhs_id = rhs;
             let lhs = get_numeric_const(ctx, lhs)?;
             let rhs = get_numeric_const(ctx, rhs)?;
-            // Binops require equal-width operands. If SLEIGH gives an
-            // implicitly narrow shift count or comparison operand, the lifter
-            // must make that coercion explicit before GVN reaches this point.
+            // Binops require equal-width operands. If GVN sees mixed-width
+            // literals, an earlier fold/rewrite failed to preserve a use-site
+            // type and should be fixed there instead of normalizing it here.
+            if lhs.size() != rhs.size() {
+                log_mixed_width_binop(ctx, location, lhs_id, rhs_id, lhs.size(), rhs.size(), op);
+            }
             assert!(
                 lhs.size() == rhs.size(),
                 "type error in binop constant folding at {}: lhs {} is {} bytes, rhs {} is {} bytes, op {}",
@@ -129,14 +134,14 @@ fn constant_folding_with_location(
                 // semantics); going through Rust's `<<`/`>>` with such a count
                 // would panic (debug) or wrap the count (release).
                 Binop::Int(IntBinop::ShiftLeft) => {
-                    if r >= size as u64 * 8 {
+                    if r >= size as u64 * 8 || r >= u64::BITS as u64 {
                         0
                     } else {
                         (l << r) & mask
                     }
                 }
                 Binop::Int(IntBinop::ShiftRight) => {
-                    if r >= size as u64 * 8 {
+                    if r >= size as u64 * 8 || r >= u64::BITS as u64 {
                         0
                     } else {
                         (l >> r) & mask
@@ -171,6 +176,11 @@ fn constant_folding_with_location(
 
             // Preserve the semantic type (e.g. StackAddress) through folding.
             let out_type = ctx.types.binop_result(lhs_type, op, rhs_type);
+            let out_type = if ctx.types.size_of(out_type) == output_size {
+                out_type
+            } else {
+                ctx.types.get_or_make_int(output_size)
+            };
             Some(ctx.get_typed_const(value, out_type).id())
         }
 
@@ -259,6 +269,62 @@ pub(super) fn const_value(ctx: &Context, v: ValueId) -> Option<u64> {
 fn try_fold_insn(ctx: &mut Context, ic: &InsnCtx) -> Option<ValueId> {
     constant_folding_with_location(ctx, ic.mnemonic, ic.size, Some(ic))
         .or_else(|| algebraic_identity(ctx, ic.mnemonic, ic.size))
+}
+
+fn log_mixed_width_binop(
+    ctx: &Context,
+    location: Option<&InsnCtx>,
+    lhs: ValueId,
+    rhs: ValueId,
+    lhs_size: usize,
+    rhs_size: usize,
+    op: Binop,
+) {
+    qcode::pass_log!(
+        warn,
+        "mixed-width constant-fold binop at {}: op {op}, lhs {} bytes [{}], rhs {} bytes [{}]",
+        fold_location(ctx, location),
+        lhs_size,
+        value_detail(ctx, lhs),
+        rhs_size,
+        value_detail(ctx, rhs),
+    );
+}
+
+fn value_detail(ctx: &Context, value: ValueId) -> String {
+    match value {
+        ValueId::Literal(_) => {
+            let ValueRef::Literal(lit) = ValueRef::new(value, ctx) else {
+                unreachable!();
+            };
+            format!(
+                "{value:?} literal value={:#x} size={} type={:?}",
+                lit.value(),
+                lit.size(),
+                lit.type_id()
+            )
+        }
+        ValueId::Instruction(id) => {
+            let insn = qcode::value::Instruction::from_id(ctx, id);
+            let address = insn
+                .address()
+                .map(|addr| format!("{addr:#x}"))
+                .unwrap_or_else(|| "unknown".to_string());
+            let function = insn
+                .function()
+                .map(|f| f.name().to_string())
+                .unwrap_or_else(|| "unknown".to_string());
+            format!(
+                "{value:?} insn={id} addr={address} fn={function} size={} mnemonic={:?}",
+                insn.size(),
+                insn.mnemonic()
+            )
+        }
+        _ => {
+            let value_ref = ValueRef::new(value, ctx);
+            format!("{value:?} value=`{value_ref}` size={}", value_ref.size())
+        }
+    }
 }
 
 fn fold_location(ctx: &Context, location: Option<&InsnCtx>) -> String {
@@ -389,6 +455,30 @@ mod tests {
             }),
             4,
         );
+    }
+
+    #[test]
+    fn constant_folding_respects_instruction_result_width() {
+        let mut ctx = Context::new();
+        let lhs = ctx.get_const(0xffff_ffff, 8).id();
+        let rhs = ctx.get_const(0x1_0000_00ff, 8).id();
+
+        let folded = constant_folding(
+            &mut ctx,
+            &Mnemonic::Binop(Binary {
+                op: Binop::Int(IntBinop::And),
+                lhs,
+                rhs,
+            }),
+            4,
+        )
+        .expect("same-size literal binop should fold");
+
+        let ValueId::Literal(lid) = folded else {
+            panic!("folded result must be a literal");
+        };
+        assert_eq!(ctx.types.size_of(ctx.values.literals[lid].type_id), 4);
+        assert_eq!(ctx.values.literals[lid].value, 0xff);
     }
 
     #[test]
