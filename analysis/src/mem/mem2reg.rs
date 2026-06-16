@@ -3,7 +3,7 @@ use qcode::space::SpaceType;
 use qcode::value::{
     BasicBlock, BlockId, BlockParamId, Function, FunctionId, Instruction, Value, ValueId, ValueRef,
     Varnode, VarnodeId,
-    insn::{Branch, CBranch, InstructionId, Load, Mnemonic, Store},
+    insn::{Branch, CBranch, InstructionId, InstructionRef, Load, Mnemonic, Range, Store, Zext},
 };
 use qcode::{
     builder::Builder,
@@ -92,6 +92,42 @@ impl<'ctx, 'str> Mem2Reg<'ctx, 'str> {
 
     fn root_id(&self) -> BlockId {
         self.root_id.expect("function has no root")
+    }
+
+    fn resize_forwarded_load_value(
+        &mut self,
+        block: BlockId,
+        before: InstructionId,
+        value: ValueId,
+        load_size: usize,
+    ) -> ValueId {
+        let value_size = ValueRef::new(value, self.ctx).size();
+        if value_size == load_size {
+            return value;
+        }
+
+        if let ValueId::Literal(id) = value {
+            let literal = self.ctx.values.literals[id].clone();
+            if literal.symbolic.is_none() && !self.ctx.types.is_stack_address(literal.type_id) {
+                return self.ctx.get_const(literal.value, load_size).id();
+            }
+        }
+
+        let mnemonic = if value_size < load_size {
+            Mnemonic::Zext(Zext {
+                src: value,
+                size: load_size,
+            })
+        } else {
+            Mnemonic::Range(Range {
+                src: value,
+                start: 0,
+                size: load_size,
+            })
+        };
+        let new_id = InstructionRef::from_mnemonic(self.ctx, mnemonic, load_size).id;
+        BasicBlock::from_id_mut(self.ctx, block).insert_insn_before(before, new_id);
+        ValueId::Instruction(new_id)
     }
 }
 
@@ -1127,9 +1163,9 @@ impl Mem2Reg<'_, '_> {
                     self.clobber_overlapping_register_vars(ptr, insn_id, state);
                 }
 
-                Mnemonic::Load(Load { ptr, .. }) if state.vars.contains(&ptr) => {
+                Mnemonic::Load(Load { ptr, size, .. }) if state.vars.contains(&ptr) => {
                     let reaching = decide_variable_value(ptr, &state.frames);
-                    let (load_value, store_insn) = match reaching {
+                    let (mut load_value, store_insn) = match reaching {
                         Some(FrameEntry::Defined(reaching)) => {
                             (reaching.value, reaching.store_insn)
                         }
@@ -1151,6 +1187,7 @@ impl Mem2Reg<'_, '_> {
                     if let Some(store_id) = store_insn {
                         state.consumed_stores.insert(store_id);
                     }
+                    load_value = self.resize_forwarded_load_value(block, insn_id, load_value, size);
                     self.ctx
                         .replace_all_uses_with(ValueId::Instruction(insn_id), load_value);
                     self.ctx.remove_instruction(insn_id);
@@ -1391,6 +1428,33 @@ mod tests {
         assert!(named_result.contains(&"bb2"), "bb2 should be in the result");
         assert!(named_result.contains(&"bb7"), "bb7 should be in the result");
         assert!(named_result.contains(&"bb8"), "bb8 should be in the result");
+    }
+
+    #[test]
+    fn forwarded_load_value_is_resized_to_load_width() {
+        let mut ctx = Context::new();
+        qcode!(
+            ctx,
+            "
+            varnode i64 A;
+
+            fn test:
+                <bb>
+                    store(&A, i32 0xffffffff);
+                    %loaded = load(i64, &A);
+                    %masked = %loaded & 0xf;
+                    return [%masked];
+        "
+        );
+
+        let aliases = AliasResult::simple(&ctx);
+        mem2reg(&mut ctx, test, &aliases);
+
+        let Mnemonic::Binop(masked_mnemonic) = Instruction::from_id(&ctx, masked).mnemonic() else {
+            panic!("masked instruction should remain a binop");
+        };
+        assert_eq!(ValueRef::new(masked_mnemonic.lhs, &ctx).size(), 8);
+        assert_eq!(ValueRef::new(masked_mnemonic.rhs, &ctx).size(), 8);
     }
 
     #[test]
