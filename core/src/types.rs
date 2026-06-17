@@ -350,6 +350,8 @@ impl TypeManager {
             Binop::Int(int_op) => match (lhs_stack, rhs_stack, int_op) {
                 // SA + Int → SA
                 (true, false, IntBinop::Add) => lhs,
+                // Int + SA → SA
+                (false, true, IntBinop::Add) => rhs,
                 // SA - Int → SA
                 (true, false, IntBinop::Sub) => lhs,
                 // SA - SA → Int(ptr_width)
@@ -359,8 +361,12 @@ impl TypeManager {
                 }
                 // SA & Int → SA  (alignment masking)
                 (true, false, IntBinop::And) => lhs,
+                // Int & SA → SA  (alignment masking)
+                (false, true, IntBinop::And) => rhs,
                 // SA | Int → SA
                 (true, false, IntBinop::Or) => lhs,
+                // Int | SA → SA
+                (false, true, IntBinop::Or) => rhs,
                 // Comparisons always yield a 1-byte boolean, regardless of
                 // whether the operands are stack addresses or plain integers.
                 (

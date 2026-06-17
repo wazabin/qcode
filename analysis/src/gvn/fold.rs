@@ -520,6 +520,42 @@ mod tests {
         );
     }
 
+    #[test]
+    fn constant_folding_preserves_stack_address_type_for_commuted_add() {
+        let mut ctx = Context::new();
+        let stack = ctx.add_space(qcode::space::Space {
+            name: Some(Box::from("stack")),
+            word_size: 1,
+            addr_size: 8,
+            ty: qcode::space::SpaceType::Ram,
+        });
+        let sa_type = ctx.types.get_or_make_stack_address(8, Some(stack));
+        let base_lid = ctx
+            .values
+            .get_or_make_typed_literal(0x1000_0000_0000_0000, sa_type, 8);
+        let base = ValueId::Literal(base_lid);
+        let offset = ctx.get_const(8, 8).id();
+
+        let folded = constant_folding(
+            &mut ctx,
+            &Mnemonic::Binop(Binary {
+                op: Binop::Int(IntBinop::Add),
+                lhs: offset,
+                rhs: base,
+            }),
+            8,
+        );
+
+        let folded_id = folded.expect("Int + SA should constant-fold to a SA-typed literal");
+        let ValueId::Literal(lid) = folded_id else {
+            panic!("folded result must be a literal");
+        };
+        assert_eq!(
+            ctx.values.literals[lid].type_id, sa_type,
+            "folded Int + SA must preserve the StackAddress TypeId"
+        );
+    }
+
     // -----------------------------------------------------------------------
     // Algebraic identities
     // -----------------------------------------------------------------------

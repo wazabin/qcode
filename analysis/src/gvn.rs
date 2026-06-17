@@ -16,6 +16,7 @@ use qcode::{
 mod cse;
 mod flag_idiom;
 mod fold;
+mod identity;
 mod mem_forward;
 mod memory;
 mod walk;
@@ -23,14 +24,16 @@ mod walk;
 use cse::Cse;
 use flag_idiom::FlagIdiom;
 use fold::Fold;
+use identity::Identities;
 use memory::MemoryForwarding;
 use walk::{run_dominator_walk, run_flat_fixpoint, run_single_block};
 
 /// The full GVN sub-pass chain. Order is load-bearing: memory forwarding must
-/// see loads/stores first, folding must run before flag-idiom recognition, and
-/// CSE last over already-simplified mnemonics.
-fn gvn_passes() -> (MemoryForwarding, Fold, FlagIdiom, Cse) {
-    (MemoryForwarding, Fold, FlagIdiom, Cse)
+/// see loads/stores first, folding must run before idiom recognition (so shift
+/// amounts and multipliers are constants), and CSE last over already-simplified
+/// mnemonics.
+fn gvn_passes() -> (MemoryForwarding, Fold, FlagIdiom, Identities, Cse) {
+    (MemoryForwarding, Fold, FlagIdiom, Identities, Cse)
 }
 
 /// Constant-fold every foldable instruction in `func_id` to interned literals,

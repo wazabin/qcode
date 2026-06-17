@@ -12,7 +12,7 @@ use crate::{
     context::Context,
     error::{Error, ErrorTy, Result},
     value::{
-        BasicBlock, BlockId, BlockRef, Value, ValueId, VarnodeId,
+        BasicBlock, BlockId, BlockRef, Value, ValueId, Varnode, VarnodeId,
         util::{
             base_ref::{BaseRef, WithCtx, WithCtxMut},
             named::{Named, Renameable, update_context_name},
@@ -204,6 +204,26 @@ where
             .signature
             .as_ref()
             .and_then(|s| s.inputs.as_deref())
+    }
+
+    /// The display name for the call-site argument bound to input `index`: the
+    /// register name for a register input, or a synthesized `stack_<addr>` slot
+    /// name for a stack-passed input (whose varnode is a nameless stack-space
+    /// offset carrier). Mirrors mem2reg's `block_param_name_for_var` so a call
+    /// argument reads with the same name as the callee's promoted stack
+    /// parameter. `None` when there is no input at `index`.
+    pub fn input_arg_name(&'s self, index: usize) -> Option<String> {
+        let input = self.input_regs()?.get(index).copied()?;
+        let vn = Varnode::from_id(self.ctx(), input);
+        if let Some(name) = vn.name() {
+            return Some(name.to_owned());
+        }
+        let space = vn.space();
+        if space.name.as_deref() == Some("stack") {
+            let addr = crate::types::stack_base(space.addr_size).wrapping_add(vn.address() as u64);
+            return Some(format!("stack_{addr:x}"));
+        }
+        None
     }
 
     /// Registers saved and restored unchanged (preserved across calls), as

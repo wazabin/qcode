@@ -33,13 +33,47 @@ pub fn remove_dead_insns(ctx: &mut Context, block_id: BlockId) {
     loop {
         let dead = dead_insns(ctx, block_id);
         if dead.is_empty() {
-            return;
+            break;
         }
 
         for id in &dead {
             ctx.remove_instruction(*id);
         }
     }
+
+    remove_unused_no_pred_block_params(ctx, block_id);
+}
+
+/// Removes block params that have no users when the block has no incoming
+/// control-flow edges. This covers function-entry params introduced for
+/// load-before-store registers that later become dead, without touching join
+/// blocks whose predecessor terminators carry positional arguments.
+pub fn remove_unused_no_pred_block_params(ctx: &mut Context, block_id: BlockId) -> bool {
+    if BasicBlock::from_id(ctx, block_id)
+        .predecessors()
+        .next()
+        .is_some()
+    {
+        return false;
+    }
+
+    let params = ctx.values.basic_blocks[block_id].params.clone();
+    let mut kept = Vec::with_capacity(params.len());
+    let mut changed = false;
+    for param in params {
+        if ctx.users(param).is_empty() {
+            ctx.values.block_params[param].parent = None;
+            changed = true;
+        } else {
+            ctx.values.block_params[param].index = kept.len();
+            kept.push(param);
+        }
+    }
+
+    if changed {
+        ctx.values.basic_blocks[block_id].params = kept;
+    }
+    changed
 }
 
 #[cfg(test)]
@@ -184,6 +218,22 @@ mod tests {
             dead_insns(&ctx, block_id)
         };
         assert!(dead.is_empty(), "terminator must not be marked dead");
+    }
+
+    #[test]
+    fn unused_entry_block_param_removed_after_dead_user_is_removed() {
+        let (mut ctx, block_id) = build_block(|b| {
+            let param = b.push_param(4).id();
+            b.push_zext(param, 8);
+        });
+
+        assert_eq!(BasicBlock::from_id(&ctx, block_id).num_params(), 1);
+        remove_dead_insns(&mut ctx, block_id);
+        assert_eq!(
+            BasicBlock::from_id(&ctx, block_id).num_params(),
+            0,
+            "unused entry block param should be pruned"
+        );
     }
 }
 

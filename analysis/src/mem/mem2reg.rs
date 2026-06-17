@@ -155,6 +155,34 @@ fn is_stack_typed(ctx: &Context, v: ValueId) -> bool {
     ctx.types.is_stack_address(type_id)
 }
 
+fn depends_on_stack_frame_pointer(ctx: &Context, v: ValueId, seen: &mut HashSet<ValueId>) -> bool {
+    if !seen.insert(v) {
+        return false;
+    }
+    match v {
+        ValueId::Literal(_) => stack_slot_addr(ctx, v).is_some(),
+        ValueId::Instruction(id) => {
+            is_stack_typed(ctx, v)
+                || Instruction::from_id(ctx, id)
+                    .mnemonic()
+                    .args()
+                    .into_iter()
+                    .any(|arg| depends_on_stack_frame_pointer(ctx, arg, seen))
+        }
+        // A block parameter whose origin is a stack slot represents the value
+        // read from that slot, not the caller-frame address itself.
+        ValueId::BlockParam(_)
+        | ValueId::Varnode(_)
+        | ValueId::BasicBlock(_)
+        | ValueId::Function(_) => false,
+        _ => false,
+    }
+}
+
+fn is_computed_stack_frame_pointer(ctx: &Context, v: ValueId) -> bool {
+    stack_slot_addr(ctx, v).is_none() && depends_on_stack_frame_pointer(ctx, v, &mut HashSet::new())
+}
+
 /// The `(offset, ptr_width)` a stack-slot literal encodes, relative to the
 /// per-function stack base. `offset` is negative for locals below the entry SP
 /// and `>= ptr_width` for the caller's frame (the return-address slot sits at
@@ -174,24 +202,18 @@ pub(crate) fn stack_slot_offset(ctx: &Context, v: ValueId) -> Option<(i64, usize
     Some((offset, ptr_width))
 }
 
-/// Whether `function_id` performs any load or store through a *computed* pointer
-/// — one that does not resolve to a fixed location (a register varnode, a stack
-/// slot, or a constant/global address literal). Such an access reads or writes a
-/// pointer the function cannot bound to a fixed byte range, so if that pointer is
-/// a parameter the caller handed in (e.g. a frame pointer), the callee may touch
-/// arbitrary bytes behind it. This is the broad "unresolved dynamic memory
-/// access" signal used to flag a function as an unbounded reader.
-pub(crate) fn has_dynamic_pointer_deref(ctx: &Context, function_id: FunctionId) -> bool {
+/// Whether `function_id` performs any load or store through a *computed stack
+/// frame pointer* — a `StackAddress`-typed value that does not resolve to a fixed
+/// slot literal. A computed RAM pointer loaded from a stack-passed argument is
+/// not enough: that reads behind the argument value, not arbitrary bytes of the
+/// caller's frame.
+pub(crate) fn has_dynamic_stack_pointer_deref(ctx: &Context, function_id: FunctionId) -> bool {
     for block in Function::from_id(ctx, function_id).blocks() {
         for insn in block.iter() {
             let Some(access) = MemoryAccess::from_mnemonic(insn.mnemonic()) else {
                 continue;
             };
-            // A pointer is fixed only when it is a named location (varnode) or a
-            // constant address (literal, including a stack-slot literal). An
-            // instruction/block-param pointer is a computed — hence unbounded —
-            // address.
-            if !matches!(access.ptr, ValueId::Varnode(_) | ValueId::Literal(_)) {
+            if is_computed_stack_frame_pointer(ctx, access.ptr) {
                 return true;
             }
         }

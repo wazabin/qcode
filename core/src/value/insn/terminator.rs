@@ -2,9 +2,7 @@ use std::fmt::Formatter;
 
 use crate::{
     context::Context,
-    value::{
-        BasicBlock, Function, ValueId, ValueRef, Varnode, block::BlockId, function::FunctionId,
-    },
+    value::{BasicBlock, Function, ValueId, ValueRef, block::BlockId, function::FunctionId},
 };
 
 use super::mnemonic::MnemonicKind;
@@ -39,12 +37,7 @@ fn fmt_call_arg_name(
     target: FunctionId,
     index: usize,
 ) -> std::fmt::Result {
-    let function = Function::from_id(ctx, target);
-    if let Some(input) = function
-        .input_regs()
-        .and_then(|inputs| inputs.get(index).copied())
-        && let Some(name) = Varnode::from_id(ctx, input).name()
-    {
+    if let Some(name) = Function::from_id(ctx, target).input_arg_name(index) {
         return write!(f, "@{name}=");
     }
 
@@ -346,6 +339,44 @@ mod tests {
             .as_statement()
             .to_string();
         assert_eq!(rendered, "call fn callee(@r0=0x1, @arg1=0x2);");
+    }
+
+    #[test]
+    fn call_display_names_stack_passed_arg() {
+        use crate::{space::Space, value::Varnode};
+
+        let mut tc = TestContext::new();
+
+        // A "stack" space (addr_size = pointer width 4), as brighten_stack
+        // creates it. A stack-passed parameter is a nameless varnode in this
+        // space at the slot offset.
+        let stack_space = tc.ctx.add_space(Space::new(Some("stack"), 1, 4));
+        let stack_input = Varnode::make(&mut tc.ctx, 4, 4, stack_space).id;
+
+        let callee = Function::make(&mut tc.ctx, "callee".into()).unwrap().id;
+        Function::from_id_mut(&mut tc.ctx, callee).set_input_regs(vec![stack_input]);
+
+        let block = BasicBlock::make(&mut tc.ctx).id;
+        let call_id = {
+            let mut builder = Builder::from_block(BasicBlock::from_id_mut(&mut tc.ctx, block));
+            builder.push_call(callee).id
+        };
+
+        let arg = tc.ctx.get_const(7u64, 4).id();
+        tc.ctx.replace_instruction_mnemonic(
+            call_id,
+            Mnemonic::Call(super::Call {
+                target: callee,
+                args: vec![arg],
+                clobbers: vec![],
+            }),
+        );
+
+        let rendered = Instruction::from_id(&tc.ctx, call_id)
+            .as_statement()
+            .to_string();
+        // stack_base(4) + offset 4 = 0x1000_0000 + 4 = 0x1000_0004.
+        assert_eq!(rendered, "call fn callee(@stack_10000004=0x7);");
     }
 
     #[test]

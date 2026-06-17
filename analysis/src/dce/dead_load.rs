@@ -1,6 +1,7 @@
 use std::collections::HashSet;
 
 use crate::AliasResult;
+use jstd::graph::analysis::compute_postdominators;
 use qcode::{
     context::Context,
     space::{Space, SpaceId, SpaceType},
@@ -408,6 +409,99 @@ fn unread_temp_space_stores(ctx: &Context, function_id: FunctionId) -> HashSet<I
         .collect()
 }
 
+#[derive(Clone, Copy)]
+struct RegisterStore {
+    id: InstructionId,
+    block: BlockId,
+    ptr: ValueId,
+    space: SpaceId,
+}
+
+/// Finds register stores that are overwritten by a covering store in a
+/// postdominating block, with no reads of that register anywhere in the
+/// function. This complements the killed-set dataflow for loop shapes where an
+/// exit-block overwrite postdominates the entry store but is not propagated as a
+/// must-kill through the loop backedge.
+fn postdominated_dead_register_stores(
+    ctx: &Context,
+    function_id: FunctionId,
+    aliases: &AliasResult,
+) -> HashSet<InstructionId> {
+    let function = Function::from_id(ctx, function_id);
+    let blocks: Vec<BlockId> = function.iter().map(|block| block.id).collect();
+    if blocks.is_empty() {
+        return HashSet::new();
+    }
+
+    // Calls can observe argument registers implicitly or through bound call args;
+    // keep this cleanup for straight-line/local register traffic.
+    if function
+        .iter()
+        .flat_map(|block| block.iter())
+        .any(|insn| matches!(insn.mnemonic(), Mnemonic::Call(_) | Mnemonic::CallInd(_)))
+    {
+        return HashSet::new();
+    }
+
+    let node_set: HashSet<BlockId> = blocks.iter().copied().collect();
+    let exit_set: HashSet<BlockId> = blocks
+        .iter()
+        .copied()
+        .filter(|&block| {
+            BasicBlock::from_id(ctx, block)
+                .successors()
+                .next()
+                .is_none()
+        })
+        .collect();
+    if exit_set.is_empty() {
+        return HashSet::new();
+    }
+    let pdom = compute_postdominators(ctx, &blocks, &node_set, &exit_set);
+
+    let mut stores = Vec::new();
+    let mut loads = Vec::new();
+    for block in &blocks {
+        for &id in BasicBlock::from_id(ctx, *block).instruction_ids() {
+            match ctx.get_insn(id).mnemonic() {
+                Mnemonic::Store(store) if is_reg_space(ctx, store.space) => {
+                    stores.push(RegisterStore {
+                        id,
+                        block: *block,
+                        ptr: store.ptr,
+                        space: store.space,
+                    });
+                }
+                Mnemonic::Load(load) if is_reg_space(ctx, load.space) => {
+                    loads.push((load.ptr, load.space));
+                }
+                _ => {}
+            }
+        }
+    }
+
+    stores
+        .iter()
+        .filter(|candidate| {
+            !loads.iter().any(|&(ptr, space)| {
+                space == candidate.space && aliases.may_alias(ctx, candidate.ptr, ptr)
+            })
+        })
+        .filter(|candidate| {
+            stores.iter().any(|killer| {
+                killer.id != candidate.id
+                    && killer.block != candidate.block
+                    && killer.space == candidate.space
+                    && pdom
+                        .get(&candidate.block)
+                        .is_some_and(|set| set.contains(&killer.block))
+                    && aliases.covers(candidate.ptr, killer.ptr)
+            })
+        })
+        .map(|store| store.id)
+        .collect()
+}
+
 /// Removes dead loads/stores from `function_id` in-place.
 ///
 /// When `aliases` is provided, a flow-sensitive memory-liveness dataflow
@@ -431,6 +525,11 @@ pub fn remove_dead_load_insns(
 
     match aliases {
         Some(aliases) => {
+            dead.extend(postdominated_dead_register_stores(
+                ctx,
+                function_id,
+                aliases,
+            ));
             let liveness =
                 crate::mem::compute_memory_liveness(ctx, function_id, aliases, dead_regs);
             for &block_id in &block_ids {
@@ -720,6 +819,60 @@ mod tests {
         assert!(
             !dead.contains(&store_ids[1]),
             "store to r0 must not be dead"
+        );
+    }
+
+    #[test]
+    fn postdominating_exit_store_kills_loop_entry_register_store() {
+        let mut tc = TestContext::new();
+        let r0_lo32 = tc.r0_lo32;
+        let r1 = tc.r1;
+        qcode!(
+            tc.ctx,
+            "
+            fn test:
+                <entry>
+                    store({r0_lo32}, i32 1);
+                    goto <loop_head>;
+
+                <loop_head>
+                    if i8 1 goto <loop_body> else goto <exit>;
+
+                <loop_body>
+                    store({r1}, i64 2);
+                    goto <loop_head>;
+
+                <exit>
+                    store({r0_lo32}, i32 3);
+                    return [i64 0];
+            "
+        );
+
+        let aliases = crate::AliasResult::simple(&tc.ctx);
+        let entry_store = *BasicBlock::from_id(&tc.ctx, entry)
+            .instruction_ids()
+            .iter()
+            .find(|&&id| matches!(tc.ctx.get_insn(id).mnemonic(), Mnemonic::Store(_)))
+            .expect("entry store exists");
+        let exit_store = *BasicBlock::from_id(&tc.ctx, exit)
+            .instruction_ids()
+            .iter()
+            .find(|&&id| matches!(tc.ctx.get_insn(id).mnemonic(), Mnemonic::Store(_)))
+            .expect("exit store exists");
+
+        remove_dead_load_insns(&mut tc.ctx, test, Some(&aliases), &[]);
+
+        assert!(
+            !BasicBlock::from_id(&tc.ctx, entry)
+                .instruction_ids()
+                .contains(&entry_store),
+            "entry r0_lo32 store should be removed because exit store postdominates it"
+        );
+        assert!(
+            BasicBlock::from_id(&tc.ctx, exit)
+                .instruction_ids()
+                .contains(&exit_store),
+            "exit r0_lo32 store is the return-visible value and must remain"
         );
     }
 }

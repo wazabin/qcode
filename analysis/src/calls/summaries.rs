@@ -27,7 +27,7 @@ use qcode::{
 
 use crate::{
     compute_clobbered_regs,
-    mem::mem2reg::{has_dynamic_pointer_deref, stack_slot_offset},
+    mem::mem2reg::{has_dynamic_stack_pointer_deref, stack_slot_offset},
 };
 
 /// The maximum caller-frame span (bytes above the return-address slot) over which
@@ -416,7 +416,7 @@ pub fn set_function_summaries(ctx: &mut Context, function_id: FunctionId, stack_
     // value so the fact only grows across checkpoint+replay rounds.
     let reads_unbounded = Function::from_id(ctx, function_id).reads_unbounded_stack()
         || stack_unbounded
-        || has_dynamic_pointer_deref(ctx, function_id)
+        || has_dynamic_stack_pointer_deref(ctx, function_id)
         || function_makes_unbounded_call(ctx, function_id);
 
     // Append the stack parameters as stack-space varnodes (offset/size carriers,
@@ -1313,6 +1313,70 @@ mod tests {
         assert!(
             Function::from_id(&tc.ctx, callee).reads_unbounded_stack(),
             "a read beyond the cap must flag the function as an unbounded reader"
+        );
+    }
+
+    #[test]
+    fn dynamic_read_through_stack_argument_is_not_unbounded_stack_reader() {
+        // The callee reads exactly one incoming stack slot, then treats the
+        // value stored there as a RAM pointer. That is a bounded stack-argument
+        // read plus a dynamic RAM read, not an unbounded read of the caller's
+        // stack frame.
+        let mut tc = TestContext::new();
+        let sp = tc.r3;
+        let ram = tc.ctx.default_space;
+        let reg = tc.reg_space;
+        let r0 = tc.r0;
+        crate::stack::brighten::get_or_make_stack_space(&mut tc.ctx, 8);
+
+        let callee = build_fn(&mut tc, "callee", 0x2000, |b| {
+            let slot = stack_addr_lit(b.context_mut(), 8);
+            let base = b.push_load::<false>(slot, 8, ram).id();
+            let idx = b.push_load::<false>(ValueId::Varnode(r0), 8, reg).id();
+            let ptr = b.push_add(base, idx).id();
+            let loaded = b.push_load::<false>(ptr, 1, ram).id();
+            let ret = b.push_zext(loaded, 8).id();
+            b.push_return(ret);
+        });
+        let aliases = AliasResult::simple(&tc.ctx);
+        crate::mem2reg(&mut tc.ctx, callee, &aliases);
+        set_function_summaries(&mut tc.ctx, callee, sp);
+
+        assert_eq!(
+            stack_inputs_of(&tc.ctx, callee),
+            vec![(8, 8)],
+            "the stack slot itself should remain a precise input"
+        );
+        assert!(
+            !Function::from_id(&tc.ctx, callee).reads_unbounded_stack(),
+            "reading through a stack-passed pointer value must not mark the whole caller frame as read"
+        );
+    }
+
+    #[test]
+    fn dynamic_stack_frame_pointer_read_is_unbounded_stack_reader() {
+        let mut tc = TestContext::new();
+        let sp = tc.r3;
+        let ram = tc.ctx.default_space;
+        let reg = tc.reg_space;
+        let r0 = tc.r0;
+        crate::stack::brighten::get_or_make_stack_space(&mut tc.ctx, 8);
+
+        let callee = build_fn(&mut tc, "callee", 0x2000, |b| {
+            let local = stack_addr_lit(b.context_mut(), -8);
+            let idx = b.push_load::<false>(ValueId::Varnode(r0), 8, reg).id();
+            let ptr = b.push_add(local, idx).id();
+            let loaded = b.push_load::<false>(ptr, 1, ram).id();
+            let ret = b.push_zext(loaded, 8).id();
+            b.push_return(ret);
+        });
+        let aliases = AliasResult::simple(&tc.ctx);
+        crate::mem2reg(&mut tc.ctx, callee, &aliases);
+        set_function_summaries(&mut tc.ctx, callee, sp);
+
+        assert!(
+            Function::from_id(&tc.ctx, callee).reads_unbounded_stack(),
+            "a computed pointer into this function's own frame remains unbounded"
         );
     }
 
