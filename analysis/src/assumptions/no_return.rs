@@ -14,7 +14,7 @@
 //!   passes in whole-program checkpoint+replay so a violated assumption leaves
 //!   no derived residue (see [`qcode::assumption`]).
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use qcode::{
     assumption::{PassName, Proposition},
@@ -166,9 +166,18 @@ pub fn verify_forced_returns(ctx: &mut Context, overrides: &HashMap<Proposition,
 
 /// Whether `f` is assumed to return to its caller.
 ///
-/// v1 rule (edge-independent, hence monotone): a function returns iff its body
-/// contains a `Return`. External stubs have no body, so they are taken to return
-/// unless their name is in [`NORETURN_NAMES`].
+/// A function returns unless it provably cannot. The *only* way it cannot is if
+/// a call to a noreturn callee post-dominates the entry: then every path from
+/// entry funnels through that call and control never comes back. Crucially,
+/// *absence of a `Return`* is **not** evidence of noreturn — a function whose
+/// tail is an indirect call or indirect branch (a tail call / jump table) has
+/// no `Return` of its own yet still returns to its caller through the tail
+/// target. The old "returns iff body contains a `Return`" rule mis-flagged
+/// exactly those functions as noreturn, dropping the fall-through edges between
+/// their callers and the instruction after the call.
+///
+/// External stubs have no body, so they are taken to return unless their name is
+/// in [`NORETURN_NAMES`].
 fn function_returns(ctx: &Context, f: FunctionId) -> bool {
     let func = Function::from_id(ctx, f);
 
@@ -179,11 +188,50 @@ fn function_returns(ctx: &Context, f: FunctionId) -> bool {
         return true;
     }
 
-    func.blocks().any(|block| {
-        block
-            .iter()
-            .any(|insn| matches!(insn.mnemonic(), Mnemonic::Return(_)))
-    })
+    let Some(entry) = func.root() else {
+        // No body to inspect: conservatively assume it returns.
+        return true;
+    };
+
+    // f returns iff a *returning exit* is reachable from the entry. A returning
+    // exit is an exit block (no successors) whose terminator is anything but a
+    // call to a noreturn callee — `Return`, an indirect branch/call tail, etc.
+    // The only path to noreturn is for every reachable exit to be a noreturn
+    // call (equivalently: such a call post-dominates the entry), so control
+    // never flows back. An exitless body (an unconditional infinite loop) has no
+    // returning exit and is therefore noreturn.
+    let mut seen: HashSet<BlockId> = HashSet::new();
+    let mut stack = vec![entry.id];
+    while let Some(block) = stack.pop() {
+        if !seen.insert(block) {
+            continue;
+        }
+        let mut has_successor = false;
+        for (_, succ) in BasicBlock::from_id(ctx, block).successors() {
+            has_successor = true;
+            stack.push(succ);
+        }
+        if !has_successor && !is_noreturn_call_block(ctx, block) {
+            return true;
+        }
+    }
+    false
+}
+
+/// Whether `block`'s terminator is a direct `Call` to a callee already
+/// known/assumed noreturn (the fall-through edge having been pruned by
+/// [`assume_call_returns`], leaving the block an exit).
+fn is_noreturn_call_block(ctx: &Context, block: BlockId) -> bool {
+    let Some(&last) = ctx.values.basic_blocks[block].instructions.last() else {
+        return false;
+    };
+    let Mnemonic::Call(call) = ctx.values.instructions[last].mnemonic() else {
+        return false;
+    };
+    // A recorded `FunctionReturns(callee) = false` (assumed or known) marks the
+    // callee noreturn; an unrecorded callee defaults to returning.
+    ctx.truth(Proposition::FunctionReturns(call.target))
+        .is_some_and(|t| !t.value)
 }
 
 fn is_noreturn_name(name: &str) -> bool {
