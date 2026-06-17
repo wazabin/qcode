@@ -21,6 +21,7 @@ use std::{
     fmt::{Display, Formatter},
 };
 
+mod aggregate;
 mod assert;
 mod binop;
 mod bits;
@@ -33,6 +34,7 @@ mod pcode_op;
 mod terminator;
 mod unop;
 
+pub use aggregate::{Extract, Tuple};
 pub use assert::Assert;
 pub use binop::{Binary, Binop, BoolBinop, FloatBinop, IntBinop};
 pub use casting::{FloatToFloat, FloatToInt, IntToFloat, Range, Sext, Zext};

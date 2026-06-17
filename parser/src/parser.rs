@@ -466,8 +466,38 @@ fn parse_expr(pair: Pair<'_, Rule>) -> Result<ExprNode, ParseError> {
         Rule::binary => parse_binary(inner),
         Rule::memory => parse_memory(inner),
         Rule::cast => parse_cast(inner),
+        Rule::tuple => parse_tuple(inner),
+        Rule::extract => parse_extract(inner),
         _ => Err(ParseError::new("invalid expression")),
     }
+}
+
+fn parse_tuple(pair: Pair<'_, Rule>) -> Result<ExprNode, ParseError> {
+    let fields = pair
+        .into_inner()
+        .filter(|p| p.as_rule() == Rule::typed_atom)
+        .map(parse_typed_atom)
+        .collect::<Result<Vec<_>, _>>()?;
+    if fields.is_empty() {
+        return Err(ParseError::new("tuple must have at least one field"));
+    }
+    Ok(ExprNode::Tuple { fields })
+}
+
+fn parse_extract(pair: Pair<'_, Rule>) -> Result<ExprNode, ParseError> {
+    let mut inner = pair.into_inner();
+    let agg = parse_typed_atom(
+        inner
+            .find(|p| p.as_rule() == Rule::typed_atom)
+            .ok_or_else(|| ParseError::new("missing extract aggregate"))?,
+    )?;
+    let index = parse_integer(
+        inner
+            .find(|p| p.as_rule() == Rule::integer)
+            .ok_or_else(|| ParseError::new("missing extract index"))?
+            .as_str(),
+    )?;
+    Ok(ExprNode::Extract { agg, index })
 }
 
 fn parse_unop(pair: Pair<'_, Rule>) -> Result<ExprNode, ParseError> {

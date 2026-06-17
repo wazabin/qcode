@@ -1143,6 +1143,31 @@ fn lower_expr(
                 __qcode_builder.intrinsic(__qcode_intr_id, __qcode_intr_args).id
             }})
         }
+
+        ExprNode::Tuple { fields } => {
+            let field_tokens = fields
+                .iter()
+                .map(|f| lower_atom(f, None, locals, pcode_root))
+                .collect::<syn::Result<Vec<_>>>()?;
+            Ok(quote! {
+                {
+                    let __qcode_fields: Vec<#pcode_root::value::ValueId> =
+                        vec![#(#field_tokens),*];
+                    __qcode_builder.push_tuple(__qcode_fields).id
+                }
+            })
+        }
+
+        ExprNode::Extract { agg, index } => {
+            let agg_tokens = lower_atom(agg, None, locals, pcode_root)?;
+            let idx = *index as usize;
+            Ok(quote! {
+                {
+                    let __qcode_agg = #agg_tokens;
+                    __qcode_builder.push_extract(__qcode_agg, #idx).id
+                }
+            })
+        }
     }
 }
 

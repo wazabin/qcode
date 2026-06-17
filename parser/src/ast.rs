@@ -73,6 +73,15 @@ pub enum ExprNode {
         name: String,
         args: Vec<TypedAtom>,
     },
+    /// `(a, b, c)` — build an aggregate value from its fields.
+    Tuple {
+        fields: Vec<TypedAtom>,
+    },
+    /// `extract(agg, index)` — project a field out of an aggregate value.
+    Extract {
+        agg: TypedAtom,
+        index: u64,
+    },
 }
 
 #[derive(Clone, Copy, Debug)]

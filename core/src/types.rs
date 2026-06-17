@@ -56,6 +56,11 @@ pub trait Type: Send + Sync {
         None
     }
 
+    /// The ordered field types, if this is an [`AggregateType`].
+    fn fields(&self) -> Option<&[TypeId]> {
+        None
+    }
+
     /// Clones this type into a fresh boxed trait object.
     ///
     /// This enables `Clone for Box<dyn Type>` (and hence `Clone` for
@@ -78,11 +83,15 @@ pub trait Type: Send + Sync {
 /// type table as a `Vec<TypeRepr>` and replays the `get_or_make_*` constructors
 /// on load, which reproduces both the interned [`TypeId`] indices and the lookup
 /// maps exactly.
-#[derive(Clone, Copy, serde::Serialize, serde::Deserialize)]
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
 pub enum TypeRepr {
     Int { size: usize },
     StackAddress { size: usize, space: Option<SpaceId> },
     SpaceAddress { size: usize, space: SpaceId },
+    /// A fixed, ordered group of field types — the functional-IR representation
+    /// of a tuple. Used by `argpromote` to return `(real_return, write-set)`.
+    /// Abstract: it has no physical return-register ABI.
+    Aggregate { fields: Vec<TypeId> },
 }
 
 impl Clone for Box<dyn Type> {
@@ -220,6 +229,35 @@ impl Type for SpaceAddress {
     }
 }
 
+/// A fixed, ordered group of field types — the functional-IR tuple. Its `size`
+/// is the sum of its fields' sizes (a nominal layout; aggregates are abstract and
+/// never lowered to a physical ABI, so the value is informational only).
+#[derive(Clone)]
+struct AggregateType {
+    fields: Vec<TypeId>,
+    size: usize,
+}
+
+impl Type for AggregateType {
+    fn size(&self) -> usize {
+        self.size
+    }
+
+    fn fields(&self) -> Option<&[TypeId]> {
+        Some(&self.fields)
+    }
+
+    fn clone_box(&self) -> Box<dyn Type> {
+        Box::new(self.clone())
+    }
+
+    fn repr(&self) -> TypeRepr {
+        TypeRepr::Aggregate {
+            fields: self.fields.clone(),
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // TypeManager
 // ---------------------------------------------------------------------------
@@ -238,6 +276,8 @@ pub struct TypeManager {
     stack_address: Option<TypeId>,
     /// Fast lookup: (size, space) → SpaceAddress TypeId.
     space_address: HashMap<(usize, SpaceId), TypeId>,
+    /// Fast lookup: field-type list → Aggregate TypeId.
+    aggregate_by_fields: HashMap<Vec<TypeId>, TypeId>,
 }
 
 impl Default for TypeManager {
@@ -253,6 +293,7 @@ impl TypeManager {
             int_by_size: HashMap::default(),
             stack_address: None,
             space_address: HashMap::default(),
+            aggregate_by_fields: HashMap::default(),
         }
     }
 
@@ -300,6 +341,34 @@ impl TypeManager {
         let id = self.register(Box::new(SpaceAddress { size, space }));
         self.space_address.insert((size, space), id);
         id
+    }
+
+    /// Returns the [`TypeId`] for an [`AggregateType`] with the given ordered
+    /// field types, creating it if it does not yet exist. Each field type must
+    /// already be registered (it always is in practice: you build the field
+    /// types before grouping them).
+    pub fn get_or_make_aggregate(&mut self, fields: Vec<TypeId>) -> TypeId {
+        if let Some(&id) = self.aggregate_by_fields.get(&fields) {
+            return id;
+        }
+        let size = fields.iter().map(|&f| self.size_of(f)).sum();
+        let id = self.register(Box::new(AggregateType {
+            fields: fields.clone(),
+            size,
+        }));
+        self.aggregate_by_fields.insert(fields, id);
+        id
+    }
+
+    /// The ordered field types of `id`, or `None` if `id` is not an aggregate.
+    pub fn aggregate_fields(&self, id: TypeId) -> Option<&[TypeId]> {
+        self.get(id).fields()
+    }
+
+    /// The type of field `index` of aggregate `id`, if `id` is an aggregate with
+    /// at least `index + 1` fields.
+    pub fn field_type(&self, id: TypeId, index: usize) -> Option<TypeId> {
+        self.aggregate_fields(id)?.get(index).copied()
     }
 
     /// Returns a reference to the concrete [`Type`] for `id`.
@@ -451,6 +520,11 @@ impl<'de> serde::Deserialize<'de> for TypeManager {
                 }
                 TypeRepr::SpaceAddress { size, space } => {
                     manager.get_or_make_space_address(size, space);
+                }
+                // Field types have lower TypeIds (built before the aggregate),
+                // so replaying in order guarantees they already exist here.
+                TypeRepr::Aggregate { fields } => {
+                    manager.get_or_make_aggregate(fields);
                 }
             }
         }

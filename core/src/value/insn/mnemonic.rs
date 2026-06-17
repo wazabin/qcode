@@ -4,9 +4,9 @@ use crate::{
         ValueId,
         function::FunctionId,
         insn::{
-            Assert, Binary, Branch, BranchInd, CBranch, Call, CallInd, Carry, FloatToFloat,
+            Assert, Binary, Branch, BranchInd, CBranch, Call, CallInd, Carry, Extract, FloatToFloat,
             FloatToInt, IntToFloat, Intrinsic, IsFloatNaN, Load, LzCount, PCodeOp, PopCount, Range,
-            Return, SBorrow, SCarry, Sext, Store, Unary, Zext,
+            Return, SBorrow, SCarry, Sext, Store, Tuple, Unary, Zext,
         },
     },
 };
@@ -112,6 +112,10 @@ pub enum Mnemonic {
     /// A pure named intrinsic function (e.g. `rol`, `ror`). Categorically pure:
     /// no memory or observable side effects.
     Intrinsic(Intrinsic),
+    /// Build an aggregate (tuple) value from ordered fields.
+    Tuple(Tuple),
+    /// Project a single field out of an aggregate value.
+    Extract(Extract),
 }
 
 impl Mnemonic {
@@ -142,6 +146,8 @@ impl Mnemonic {
             Mnemonic::Assert(m) => m,
             Mnemonic::PCodeOp(m) => m,
             Mnemonic::Intrinsic(m) => m,
+            Mnemonic::Tuple(m) => m,
+            Mnemonic::Extract(m) => m,
         }
     }
 
@@ -358,9 +364,21 @@ impl Mnemonic {
                     }
                 });
             }
+            Mnemonic::Tuple(m) => {
+                m.fields.iter_mut().for_each(|a| {
+                    if *a == old {
+                        *a = new;
+                    }
+                });
+            }
             Mnemonic::Assert(m) => {
                 if m.condition == old {
                     m.condition = new;
+                }
+            }
+            Mnemonic::Extract(m) => {
+                if m.agg == old {
+                    m.agg = new;
                 }
             }
         }

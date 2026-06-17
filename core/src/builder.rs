@@ -45,9 +45,10 @@ use crate::{
         function::FunctionId,
         insn::{
             Assert, Binary, Binop, BoolBinop, Branch, BranchInd, CBranch, Call, CallInd, Carry,
-            FloatBinop, FloatToFloat, FloatToInt, InstructionId, InstructionRef, IntBinop,
+            Extract, FloatBinop, FloatToFloat, FloatToInt, InstructionId, InstructionRef, IntBinop,
             IntToFloat, Intrinsic, IntrinsicId, IsFloatNaN, Load, LzCount, Mnemonic, PCodeOp,
-            PCodeOpId, PopCount, Range, Return, SBorrow, SCarry, Sext, Store, Unary, Unop, Zext,
+            PCodeOpId, PopCount, Range, Return, SBorrow, SCarry, Sext, Store, Tuple, Unary, Unop,
+            Zext,
         },
         util::base_ref::{WithCtx, WithCtxMut},
         varnode::{Varnode, VarnodeId},
@@ -897,6 +898,29 @@ impl<'str, 'ctx> Builder<'str, 'ctx> {
     pub fn push_sext(&mut self, src: ValueId, size: usize) -> InstructionRef<'str, '_> {
         assert!(!src.is_varnode(), "push_sext: varnode operand not allowed");
         self.push_instruction(Mnemonic::Sext(Sext { src, size }), size)
+    }
+
+    /// Builds an aggregate value from `fields`. The result type is the
+    /// [`Aggregate`](crate::types::TypeRepr::Aggregate) of the fields' types.
+    pub fn push_tuple(&mut self, fields: Vec<ValueId>) -> InstructionRef<'str, '_> {
+        let field_types: Vec<TypeId> = fields
+            .iter()
+            .map(|&f| self.context_mut().type_of(f))
+            .collect();
+        let ty = self.context_mut().types.get_or_make_aggregate(field_types);
+        self.push_instruction_with_type(Mnemonic::Tuple(Tuple { fields }), ty)
+    }
+
+    /// Projects field `index` out of the aggregate value `agg`. The result type
+    /// is that field's type. Panics if `agg` is not an aggregate with that field.
+    pub fn push_extract(&mut self, agg: ValueId, index: usize) -> InstructionRef<'str, '_> {
+        let agg_ty = self.context_mut().type_of(agg);
+        let ty = self
+            .context()
+            .types
+            .field_type(agg_ty, index)
+            .expect("push_extract: agg is not an aggregate with that field index");
+        self.push_instruction_with_type(Mnemonic::Extract(Extract { agg, index }), ty)
     }
 
     pub fn push_popcount(&mut self, src: ValueId, size: usize) -> InstructionRef<'str, '_> {

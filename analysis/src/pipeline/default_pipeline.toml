@@ -161,6 +161,21 @@ scope = "function"
 passes = ["dce", "dead_store", "dce"]
 only_dirty = true
 
+# Interprocedural by-reference -> by-value parameter promotion. Runs once, late:
+# it needs bound call sites and the final lowered body to recognize the in/out
+# buffer pattern, and rewrites callee + every caller in one shot.
+[[stage]]
+name = "argpromote"
+scope = "module"
+passes = ["argpromote"]
+
+# Sweep the dead artifacts argpromote exposes: the callee's old `EAX <- ptr`
+# store and the caller's now-dead register loads it repointed.
+[[stage]]
+name = "argpromote-cleanup"
+scope = "function"
+passes = ["dce", "dead_store", "dce"]
+
 # Aesthetic changes. `include_external` so the demangler also reaches imported
 # library functions (PLT stubs like `_ZNSsixEj` -> `std::string::operator[]`),
 # which are bodyless and therefore skipped by function-scoped stages by default.
