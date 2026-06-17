@@ -30,7 +30,7 @@ use qcode::{
     context::Context,
     value::{
         BasicBlock, BlockMutRef, Function, FunctionId, Value, ValueId, ValueRef,
-        block::BlockId,
+        block::{BlockId, EdgeId},
         insn::{Binary, Binop, BranchInd, IntBinop, Load, Mnemonic},
         util::base_ref::{WithCtx, WithCtxMut},
     },
@@ -148,7 +148,14 @@ impl FunctionPass for HandleJumpTables {
             return Ok(false);
         }
 
+        // A table with more than two cases stays an indirect `switch`: we keep
+        // the `BranchInd` but connect a real edge to every case body. Clear the
+        // block's existing edges first so a re-resolution does not double them.
+        let mut cleared: std::collections::HashSet<BlockId> = std::collections::HashSet::new();
         for Edit { from, target, .. } in edits {
+            if cleared.insert(from) {
+                clear_successors(ctx, from);
+            }
             let from_addr = BasicBlock::from_id(ctx, from).address();
             let tb = ctx.get_or_make_block(target);
             Function::from_id_mut(ctx, fun_id).add_block(tb);
@@ -164,6 +171,7 @@ impl FunctionPass for HandleJumpTables {
             let target_block = ctx.get_or_make_block(target);
             Function::from_id_mut(ctx, fun_id).add_block(target_block);
 
+            clear_successors(ctx, from);
             let mut block = BasicBlock::from_id_mut(ctx, from);
             block.pop_insn();
             Builder::from_block(block).push_branch(target_block);
@@ -186,6 +194,7 @@ impl FunctionPass for HandleJumpTables {
             discover(ctx, fn_entry, from_addr, true_target);
             discover(ctx, fn_entry, from_addr, false_target);
 
+            clear_successors(ctx, from);
             let mut block = BasicBlock::from_id_mut(ctx, from);
             block.pop_insn();
 
@@ -199,6 +208,20 @@ impl FunctionPass for HandleJumpTables {
 
         qcode::stat!("jump_table_edges", 1);
         Ok(true)
+    }
+}
+
+/// Remove every outgoing CFG edge of `from`. The jump-table edges the lifter
+/// adds to the clean IR persist on the block alongside its `BranchInd`; clearing
+/// them before the apply step rebuilds the terminator keeps a re-resolution from
+/// doubling edges.
+fn clear_successors(ctx: &mut Context, from: BlockId) {
+    let edges: Vec<EdgeId> = BasicBlock::from_id(ctx, from)
+        .successors()
+        .map(|(edge, _)| edge)
+        .collect();
+    for edge in edges {
+        ctx.remove_cfg_edge(edge);
     }
 }
 
@@ -216,11 +239,12 @@ fn discover(ctx: &mut Context, fn_entry: Option<u64>, source_block: Option<u64>,
 fn resolve_block(mut block: BlockMutRef) -> Option<Vec<Edit>> {
     let ctx = block.ctx();
 
-    // Already-resolved indirect branches have successors; don't double-connect.
-    if block.successors().next().is_some() {
-        return None;
-    }
-
+    // A block still terminated by `BranchInd` is re-resolved every round, even
+    // once the lifter has connected its targets in the clean IR: those edges let
+    // function-splitting follow the switch, but the terminator itself is only
+    // rewritten in this (disposable or final) optimized clone. The apply step
+    // clears the block's existing edges before rebuilding, so re-resolving an
+    // already-connected block is idempotent rather than edge-doubling.
     let insn = block.instructions().last()?;
 
     let Mnemonic::BranchInd(BranchInd { ptr }) = insn.mnemonic() else {
@@ -701,6 +725,56 @@ mod tests {
             cbranch_compares_against(&ctx, disp, 0),
             "expected `index != 0` guard",
         );
+    }
+
+    /// A block that already carries the lifter's jump-table edges (the clean-IR
+    /// state after `discover_code` connects the targets) must still be rewritten
+    /// from `BranchInd` to a `CBranch`, and must not end up with doubled edges.
+    #[test]
+    fn rewrites_already_connected_branch() {
+        let mut ctx = Context::new();
+        let targets = [0x1100u64, 0x1200];
+
+        qcode!(
+            ctx,
+            "
+            varnode i64 A;
+            fn fun:
+            <entry>
+                %idx = load(i64, &A);
+                %c = %idx < 0x2;
+                if %c goto <disp> else goto <oob>;
+            <disp>
+                %off = %idx * 0x8;
+                %addr = i64 0x2000 + %off;
+                %t = load(i64, %addr);
+                goto [%t];
+            <oob>
+                goto <0x9000>;
+            "
+        );
+
+        add_code(&mut ctx, 0x1000, 0x1000);
+        let mut table = Vec::new();
+        for t in targets {
+            table.extend_from_slice(&t.to_le_bytes());
+        }
+        add_rodata(&mut ctx, 0x2000, table);
+
+        // Pre-connect the dispatch block to its targets, mimicking the edges the
+        // lifter materializes in the clean IR before this pass re-runs.
+        for t in targets {
+            let tb = ctx.get_or_make_block(t);
+            ctx.add_cfg_edge(disp, tb);
+        }
+        assert_eq!(successor_count(&ctx, disp), 2);
+
+        let changed = run_function_pass::<HandleJumpTables>(&mut ctx, fun).unwrap();
+        assert!(changed);
+
+        // Rewritten to a CBranch with exactly two successors (no doubling).
+        assert_eq!(successor_count(&ctx, disp), 2);
+        assert!(matches!(terminator(&ctx, disp), Mnemonic::CBranch(_)));
     }
 
     /// Two targets whose indices straddle a nonzero base lower to a comparison
