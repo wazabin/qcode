@@ -18,6 +18,11 @@ mod lifter;
 mod pass;
 
 pub use config::{DEFAULT_PIPELINE_TOML, Pipeline};
+#[cfg(not(target_arch = "wasm32"))]
+pub use config::{
+    PipelineFile, create_named_user_pipeline_from_default, create_user_pipeline_from_default,
+    list_user_pipelines, load_named_user_pipeline, user_pipeline_dir,
+};
 pub use lifter::{LiftOutcome, LiftSummary, Lifter, PipelineServices};
 pub use pass::{
     DynFunctionPass, DynPass, FunctionPass, Pass, PassRegistration, PipelineEnv, RegisteredPass,

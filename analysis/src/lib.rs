@@ -53,3 +53,8 @@ pub use pipeline::{
     PipelineServices, RegisteredPass, analyze_and_lift_with_progress, analyze_default,
     analyze_with_pipeline,
 };
+#[cfg(not(target_arch = "wasm32"))]
+pub use pipeline::{
+    PipelineFile, create_named_user_pipeline_from_default, create_user_pipeline_from_default,
+    list_user_pipelines, load_named_user_pipeline, user_pipeline_dir,
+};

@@ -8,6 +8,8 @@
 //! [`parse`]: Pipeline::parse
 
 use std::collections::HashMap;
+#[cfg(not(target_arch = "wasm32"))]
+use std::path::{Path, PathBuf};
 
 use serde::Deserialize;
 
@@ -25,6 +27,8 @@ use super::pass::{
 /// The canonical default pipeline, compiled into the binary. Used by
 /// `analyze_default` and as the GUI's starting pipeline.
 pub const DEFAULT_PIPELINE_TOML: &str = include_str!("default_pipeline.toml");
+#[cfg(not(target_arch = "wasm32"))]
+const DEFAULT_PIPELINE_FILE: &str = "default.toml";
 
 /// Guard against a `repeat_until` stage that never converges.
 const MAX_FIXPOINT_ITERS: usize = 100;
@@ -43,7 +47,15 @@ const ADDRESS_DISCOVERY_PASS: &str = "handle_jump_tables";
 #[derive(Deserialize)]
 struct PipelineConfig {
     #[serde(default)]
+    description: Option<String>,
+    #[serde(default)]
     stage: Vec<StageConfig>,
+}
+
+#[derive(Deserialize)]
+struct PipelineMetadata {
+    #[serde(default)]
+    description: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -93,12 +105,219 @@ pub struct Pipeline {
     stages: Vec<Stage>,
 }
 
+/// A TOML pipeline available from the user's runtime pipeline directory.
+#[cfg(not(target_arch = "wasm32"))]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PipelineFile {
+    pub name: String,
+    pub description: String,
+    pub path: PathBuf,
+}
+
 impl Default for Pipeline {
     /// The canonical [`DEFAULT_PIPELINE_TOML`] pipeline. Panics only if that
     /// compiled-in TOML is malformed, which a unit test guards against.
     fn default() -> Self {
         Pipeline::parse(DEFAULT_PIPELINE_TOML).expect("default pipeline TOML is valid")
     }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+pub fn user_pipeline_dir() -> Result<PathBuf, String> {
+    let home = std::env::var_os("HOME").ok_or_else(|| {
+        "HOME is not set; cannot locate ~/.config/harbinger/pipelines".to_string()
+    })?;
+    Ok(PathBuf::from(home).join(".config/harbinger/pipelines"))
+}
+
+/// Ensure the runtime pipeline directory exists and contains at least
+/// `default.toml`, then return every `*.toml` pipeline found there.
+#[cfg(not(target_arch = "wasm32"))]
+pub fn list_user_pipelines() -> Result<Vec<PipelineFile>, String> {
+    list_user_pipelines_in(&user_pipeline_dir()?)
+}
+
+/// Load and parse a named pipeline from the runtime pipeline directory.
+#[cfg(not(target_arch = "wasm32"))]
+pub fn load_named_user_pipeline(name: &str) -> Result<Pipeline, String> {
+    load_named_user_pipeline_in(&user_pipeline_dir()?, name)
+}
+
+/// Create a new editable pipeline TOML by copying the default pipeline into the
+/// runtime directory under a unique `pipeline*.toml` name.
+#[cfg(not(target_arch = "wasm32"))]
+pub fn create_user_pipeline_from_default() -> Result<PipelineFile, String> {
+    create_user_pipeline_from_default_in(&user_pipeline_dir()?)
+}
+
+/// Create a new editable pipeline TOML with the given runtime pipeline name.
+#[cfg(not(target_arch = "wasm32"))]
+pub fn create_named_user_pipeline_from_default(name: &str) -> Result<PipelineFile, String> {
+    create_named_user_pipeline_from_default_in(&user_pipeline_dir()?, name)
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn list_user_pipelines_in(dir: &Path) -> Result<Vec<PipelineFile>, String> {
+    ensure_user_pipeline_dir(dir)?;
+    let mut files = Vec::new();
+    for entry in std::fs::read_dir(dir)
+        .map_err(|e| format!("failed to read pipeline directory {}: {e}", dir.display()))?
+    {
+        let entry = entry.map_err(|e| {
+            format!(
+                "failed to read an entry in pipeline directory {}: {e}",
+                dir.display()
+            )
+        })?;
+        let path = entry.path();
+        if path.extension().and_then(|e| e.to_str()) != Some("toml") {
+            continue;
+        }
+        let Some(name) = path
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .map(str::to_string)
+        else {
+            continue;
+        };
+        files.push(pipeline_file(path, name));
+    }
+    sort_pipeline_files(&mut files);
+    Ok(files)
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn create_user_pipeline_from_default_in(dir: &Path) -> Result<PipelineFile, String> {
+    ensure_user_pipeline_dir(dir)?;
+    let path = unique_pipeline_path(dir);
+    write_default_pipeline_to_path(path)
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn create_named_user_pipeline_from_default_in(
+    dir: &Path,
+    name: &str,
+) -> Result<PipelineFile, String> {
+    ensure_user_pipeline_dir(dir)?;
+    let name = normalize_pipeline_name(name)?;
+    let path = dir.join(format!("{name}.toml"));
+    if path.exists() {
+        return Err(format!("pipeline \"{name}\" already exists"));
+    }
+    write_default_pipeline_to_path(path)
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn write_default_pipeline_to_path(path: PathBuf) -> Result<PipelineFile, String> {
+    std::fs::write(&path, DEFAULT_PIPELINE_TOML)
+        .map_err(|e| format!("failed to write new pipeline {}: {e}", path.display()))?;
+    let name = path
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or("pipeline")
+        .to_string();
+    Ok(pipeline_file(path, name))
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn normalize_pipeline_name(name: &str) -> Result<String, String> {
+    let name = name.trim().trim_end_matches(".toml").trim();
+    if name.is_empty() {
+        return Err("pipeline name cannot be empty".to_string());
+    }
+    if name == "default" {
+        return Err("default is reserved for the built-in pipeline".to_string());
+    }
+    if name.contains('/') || name.contains('\\') {
+        return Err("pipeline name cannot contain path separators".to_string());
+    }
+    if name == "." || name == ".." || name.starts_with('.') {
+        return Err("pipeline name cannot start with a dot".to_string());
+    }
+    Ok(name.to_string())
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn unique_pipeline_path(dir: &Path) -> PathBuf {
+    let first = dir.join("pipeline.toml");
+    if !first.exists() {
+        return first;
+    }
+
+    for i in 2.. {
+        let path = dir.join(format!("pipeline-{i}.toml"));
+        if !path.exists() {
+            return path;
+        }
+    }
+    unreachable!("unbounded counter should find a pipeline filename")
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn pipeline_file(path: PathBuf, name: String) -> PipelineFile {
+    let description = std::fs::read_to_string(&path)
+        .ok()
+        .and_then(|src| toml::from_str::<PipelineMetadata>(&src).ok())
+        .and_then(|metadata| metadata.description)
+        .unwrap_or_default();
+    PipelineFile {
+        name,
+        description,
+        path,
+    }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn sort_pipeline_files(files: &mut [PipelineFile]) {
+    files.sort_by(
+        |a, b| match (a.name.as_str() == "default", b.name.as_str() == "default") {
+            (true, false) => std::cmp::Ordering::Less,
+            (false, true) => std::cmp::Ordering::Greater,
+            _ => a.name.cmp(&b.name),
+        },
+    );
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn load_named_user_pipeline_in(dir: &Path, name: &str) -> Result<Pipeline, String> {
+    let files = list_user_pipelines_in(dir)?;
+    let file = files
+        .into_iter()
+        .find(|file| file.name == name)
+        .ok_or_else(|| format!("unknown pipeline \"{name}\""))?;
+    let src = std::fs::read_to_string(&file.path)
+        .map_err(|e| format!("failed to read pipeline {}: {e}", file.path.display()))?;
+    Pipeline::parse(&src).map_err(|e| format!("{}: {e}", file.path.display()))
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn ensure_user_pipeline_dir(dir: &Path) -> Result<(), String> {
+    std::fs::create_dir_all(dir)
+        .map_err(|e| format!("failed to create pipeline directory {}: {e}", dir.display()))?;
+
+    let mut has_toml = false;
+    for entry in std::fs::read_dir(dir)
+        .map_err(|e| format!("failed to read pipeline directory {}: {e}", dir.display()))?
+    {
+        let entry = entry.map_err(|e| {
+            format!(
+                "failed to read an entry in pipeline directory {}: {e}",
+                dir.display()
+            )
+        })?;
+        if entry.path().extension().and_then(|e| e.to_str()) == Some("toml") {
+            has_toml = true;
+            break;
+        }
+    }
+
+    if !has_toml {
+        let path = dir.join(DEFAULT_PIPELINE_FILE);
+        std::fs::write(&path, DEFAULT_PIPELINE_TOML)
+            .map_err(|e| format!("failed to write default pipeline {}: {e}", path.display()))?;
+    }
+
+    Ok(())
 }
 
 impl Pipeline {
@@ -108,9 +327,13 @@ impl Pipeline {
     pub fn parse(toml_src: &str) -> Result<Pipeline, String> {
         let config: PipelineConfig =
             toml::from_str(toml_src).map_err(|e| format!("pipeline TOML parse error: {e}"))?;
+        let PipelineConfig {
+            description: _description,
+            stage,
+        } = config;
 
-        let mut stages = Vec::with_capacity(config.stage.len());
-        for sc in config.stage {
+        let mut stages = Vec::with_capacity(stage.len());
+        for sc in stage {
             let passes = match sc.scope {
                 Scope::Function => StagePasses::Function(resolve_function_passes(&sc)?),
                 Scope::Module => StagePasses::Module(resolve_module_passes(&sc)?),
@@ -518,5 +741,105 @@ mod tests {
             "#,
         );
         assert!(err.contains("whole-program pass"), "{err}");
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn runtime_pipeline_dir_is_seeded_when_empty() {
+        let dir = std::env::temp_dir().join(format!(
+            "harbinger-pipelines-test-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("system clock after Unix epoch")
+                .as_nanos()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+
+        let files = list_user_pipelines_in(&dir).expect("runtime pipelines list");
+        assert_eq!(files.len(), 1);
+        assert_eq!(files[0].name, "default");
+        assert!(files[0].description.contains("Default whole-program"));
+        assert!(files[0].path.ends_with(DEFAULT_PIPELINE_FILE));
+        load_named_user_pipeline_in(&dir, "default").expect("seeded default pipeline parses");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn runtime_pipeline_list_pins_default_then_sorts_by_name() {
+        let dir = std::env::temp_dir().join(format!(
+            "harbinger-pipelines-sort-test-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("system clock after Unix epoch")
+                .as_nanos()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("create temp pipeline dir");
+        std::fs::write(dir.join("zeta.toml"), "description = \"Zed\"\n").expect("write zeta");
+        std::fs::write(dir.join("default.toml"), "description = \"Default\"\n")
+            .expect("write default");
+        std::fs::write(dir.join("alpha.toml"), "description = \"Alpha\"\n").expect("write alpha");
+
+        let files = list_user_pipelines_in(&dir).expect("runtime pipelines list");
+        let names: Vec<_> = files.iter().map(|file| file.name.as_str()).collect();
+        assert_eq!(names, ["default", "alpha", "zeta"]);
+        assert_eq!(files[1].description, "Alpha");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn new_runtime_pipeline_copies_default_with_unique_name() {
+        let dir = std::env::temp_dir().join(format!(
+            "harbinger-pipelines-create-test-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("system clock after Unix epoch")
+                .as_nanos()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+
+        let first = create_user_pipeline_from_default_in(&dir).expect("create first pipeline");
+        let second = create_user_pipeline_from_default_in(&dir).expect("create second pipeline");
+        assert_eq!(first.name, "pipeline");
+        assert_eq!(second.name, "pipeline-2");
+        assert_eq!(
+            std::fs::read_to_string(first.path).expect("read created pipeline"),
+            DEFAULT_PIPELINE_TOML
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn named_runtime_pipeline_uses_requested_name() {
+        let dir = std::env::temp_dir().join(format!(
+            "harbinger-pipelines-named-test-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("system clock after Unix epoch")
+                .as_nanos()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+
+        let file = create_named_user_pipeline_from_default_in(&dir, "strings-only")
+            .expect("create named pipeline");
+        assert_eq!(file.name, "strings-only");
+        assert!(file.path.ends_with("strings-only.toml"));
+        assert!(
+            create_named_user_pipeline_from_default_in(&dir, "strings-only")
+                .expect_err("duplicate name should fail")
+                .contains("already exists")
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

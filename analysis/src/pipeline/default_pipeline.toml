@@ -7,6 +7,7 @@
 # run once over the whole program). `repeat_until = "no_change"` loops a stage to
 # a fixpoint — per function for function-scoped stages, whole-program for
 # module-scoped ones.
+description = "Default whole-program lifting, discovery, optimization, and cleanup pipeline."
 
 # --- Lifting phase (clean IR) ------------------------------------------------
 # These stages run on the persistent clean-IR context (before the
