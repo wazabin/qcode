@@ -185,6 +185,17 @@ name = "argpromote-cleanup"
 scope = "function"
 passes = ["dce", "dead_store", "dce"]
 
+# Now that callees are functionalized and the dead replay stores/extracts are
+# swept, drop arguments no callee reads and returned write-set fields no caller
+# projects, rewriting every direct call site. Module-scoped (it edits call sites
+# across functions) and looped to a whole-program fixpoint; it runs `dce` on the
+# functions it dirties internally to expose the next round's opportunities.
+[[stage]]
+name = "dead-signature"
+scope = "module"
+passes = ["dead_signature"]
+repeat_until = "no_change"
+
 # Aesthetic changes. `include_external` so the demangler also reaches imported
 # library functions (PLT stubs like `_ZNSsixEj` -> `std::string::operator[]`),
 # which are bodyless and therefore skipped by function-scoped stages by default.

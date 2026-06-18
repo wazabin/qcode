@@ -41,4 +41,14 @@ pub struct FunctionSignature {
     /// still present) and seeded across checkpoint+replay rounds.
     #[serde(default)]
     pub frame_escapes_to_unbounded: bool,
+    /// `true` once `argpromote_registers` has functionalized this function's
+    /// register side effects: every register read is a by-value input param and
+    /// every register write rides the returned write-set aggregate, so the body
+    /// is a pure function over its params with no register-channel ABI left to
+    /// honor. Set only on success (which already implies non-external,
+    /// non-address-taken, and direct callers only). `dead_signature` gates on
+    /// this — a pure-reg function's args and returned fields can be trimmed
+    /// purely from in-IR uses, decoupled from the ABI register lists.
+    #[serde(default)]
+    pub pure_reg: bool,
 }

@@ -337,6 +337,16 @@ impl<'str, 'ctx> InstructionMutRef<'str, 'ctx> {
         self.inner_mut().type_id = new_type;
     }
 
+    /// Sets the result type, allowing the byte size to change.
+    ///
+    /// Unlike [`set_type`](Self::set_type), this does not enforce size
+    /// invariance: it exists for transforms that legitimately resize an
+    /// aggregate result, such as trimming dead fields from a returned write-set
+    /// (`dead_signature`). Prefer `set_type` for any same-size retype.
+    pub fn set_type_resized(&mut self, new_type: TypeId) {
+        self.inner_mut().type_id = new_type;
+    }
+
     /// Sets the address-space provenance of this instruction's result.
     ///
     /// The stack space promotes the result to

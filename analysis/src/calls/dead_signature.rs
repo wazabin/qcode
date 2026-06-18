@@ -1,0 +1,674 @@
+//! `dead_signature`: drop dead arguments and dead returned values from
+//! functionalized (`pure_reg`) functions, rewriting every direct call site to
+//! match.
+//!
+//! Two complementary trims, run to a fixpoint over a worklist:
+//!
+//! * **dead argument** — an input the body never reads. After
+//!   `argpromote_registers` (and the mem2reg/DCE that follows it) a truly-unused
+//!   input either has no root block param left (DCE already pruned it) or a param
+//!   with zero users. Such an input is removed from `signature.inputs`, its root
+//!   param is dropped, and its positional argument is deleted at every direct
+//!   call site.
+//! * **dead returned field** — a `pure_reg` function returns its register writes
+//!   as an aggregate write-set; the caller projects each field with an `extract`.
+//!   A field whose `extract` is dead at *every* call site has already been DCE'd
+//!   away (aggregate values are extract-only by invariant, so a missing extract
+//!   *is* the deadness signal — we delete none). Such fields are dropped from the
+//!   callee's return `Tuple`, the call-result aggregate type is rebuilt, and the
+//!   surviving extracts are renumbered through one old→new index map.
+//!
+//! ## Scope and soundness
+//!
+//! Only `pure_reg` functions are touched. That flag (set by
+//! `argpromote_registers` on success) already implies the function is
+//! non-external, is not address-taken, and has only direct callers — so the
+//! closed-world rewrite reaches every caller. The functionalized return is the
+//! source of truth and `signature.outputs` (the ABI register list) is analyzed
+//! independently, so it is intentionally **not** updated by the field trim.
+//!
+//! As with `argpromote`, a caller in code we never disassembled would still bind
+//! to the old shape; that gap is accepted and unguarded.
+
+use std::collections::HashSet;
+
+use qcode::{
+    context::Context,
+    types::AggregateField,
+    value::{
+        BasicBlock, Function, FunctionId, Instruction, ValueId,
+        insn::{Call, Extract, InstructionId, Mnemonic, Return, Tuple},
+    },
+};
+
+use crate::{Pass, PipelineEnv};
+
+/// Bound on worklist iterations: each *changing* iteration strictly removes at
+/// least one param or returned field (a quantity bounded by the module), so this
+/// only guards against an unforeseen non-terminating rewrite.
+const MAX_ITERS: usize = 100_000;
+
+/// Trim dead args and dead returned fields from every `pure_reg` function,
+/// rewriting all direct call sites. Returns `true` if anything changed.
+pub fn dead_signature(ctx: &mut Context) -> bool {
+    let mut changed = false;
+    let mut worklist: Vec<FunctionId> = ctx
+        .function_ids()
+        .into_iter()
+        .filter(|&f| Function::from_id(ctx, f).is_pure_reg())
+        .collect();
+
+    let mut iters = 0;
+    while let Some(fid) = worklist.pop() {
+        iters += 1;
+        if iters > MAX_ITERS {
+            break;
+        }
+        if !Function::from_id(ctx, fid).is_pure_reg() {
+            continue;
+        }
+
+        let mut touched: HashSet<FunctionId> = HashSet::new();
+        let arg_changed = trim_dead_args(ctx, fid, &mut touched);
+        let ret_changed = trim_dead_return_fields(ctx, fid, &mut touched);
+
+        if arg_changed || ret_changed {
+            changed = true;
+            touched.insert(fid);
+            // DCE the dirtied functions (drops the now-unused arg-setup loads /
+            // the returned-field computations the trim exposed), then re-queue
+            // them: a freed value may expose the next dead arg or field.
+            for t in touched {
+                dce_function(ctx, t);
+                if !worklist.contains(&t) {
+                    worklist.push(t);
+                }
+            }
+        }
+    }
+    changed
+}
+
+/// Direct call sites (`Call` instructions) whose target is `fid`.
+fn direct_call_sites(ctx: &Context, fid: FunctionId) -> Vec<InstructionId> {
+    ctx.instructions()
+        .filter_map(|insn| match insn.mnemonic() {
+            Mnemonic::Call(c) if c.target == fid => Some(insn.id),
+            _ => None,
+        })
+        .collect()
+}
+
+/// Every `Return` terminator in `fid`.
+fn returns_of(ctx: &Context, fid: FunctionId) -> Vec<InstructionId> {
+    Function::from_id(ctx, fid)
+        .iter()
+        .filter_map(|b| {
+            let last = b.iter().last()?;
+            matches!(last.mnemonic(), Mnemonic::Return(_)).then_some(last.id)
+        })
+        .collect()
+}
+
+/// Run per-block DCE across `fid`, removing the instructions a trim made dead.
+fn dce_function(ctx: &mut Context, fid: FunctionId) {
+    let blocks: Vec<_> = Function::from_id(ctx, fid).blocks().map(|b| b.id).collect();
+    for b in blocks {
+        crate::remove_dead_insns(ctx, b);
+    }
+}
+
+/// The root-block param whose name matches `name`, if present.
+fn root_param_named(ctx: &Context, root: qcode::value::BlockId, name: &str) -> Option<ValueId> {
+    BasicBlock::from_id(ctx, root)
+        .params()
+        .find(|p| p.name() == Some(name))
+        .map(|p| p.id())
+}
+
+// ---------------------------------------------------------------------------
+// dead arguments
+// ---------------------------------------------------------------------------
+
+/// Remove every input `fid` never reads: drop it from `signature.inputs`, delete
+/// its root param, and delete its positional argument at each direct caller.
+/// Records each caller in `touched`. Returns `true` if anything changed.
+fn trim_dead_args(
+    ctx: &mut Context,
+    fid: FunctionId,
+    touched: &mut HashSet<FunctionId>,
+) -> bool {
+    let inputs = match Function::from_id(ctx, fid).input_regs() {
+        Some(i) if !i.is_empty() => i.to_vec(),
+        _ => return false,
+    };
+    let Some(root) = Function::from_id(ctx, fid).root().map(|b| b.id) else {
+        return false;
+    };
+
+    // Resolve each input's param name *before* mutating `inputs` (the name
+    // lookup indexes into it).
+    let names: Vec<Option<String>> = (0..inputs.len())
+        .map(|i| Function::from_id(ctx, fid).input_arg_name(i))
+        .collect();
+
+    // An input is dead when its root param is absent (already DCE'd) or has no
+    // users. A nameless input cannot be matched to a param, so keep it.
+    let keep: Vec<bool> = names
+        .iter()
+        .map(|name| match name {
+            None => true,
+            Some(n) => match root_param_named(ctx, root, n) {
+                None => false,
+                Some(pid) => !ctx.users(pid).is_empty(),
+            },
+        })
+        .collect();
+
+    if keep.iter().all(|&k| k) {
+        return false;
+    }
+
+    // Names of the inputs being dropped, to remove the matching root params.
+    let dead_names: HashSet<&str> = names
+        .iter()
+        .zip(&keep)
+        .filter(|&(_, &k)| !k)
+        .filter_map(|(n, _)| n.as_deref())
+        .collect();
+
+    // Rebuild the root param list, dropping the dead params and reindexing.
+    let params = ctx.values.basic_blocks[root].params.clone();
+    let mut kept_params = Vec::with_capacity(params.len());
+    for param in params {
+        let is_dead = ctx.values.block_params[param]
+            .name
+            .as_deref()
+            .is_some_and(|n| dead_names.contains(n));
+        if is_dead {
+            ctx.values.block_params[param].parent = None;
+        } else {
+            ctx.values.block_params[param].index = kept_params.len();
+            kept_params.push(param);
+        }
+    }
+    ctx.values.basic_blocks[root].params = kept_params;
+
+    // Drop the dead inputs from the signature.
+    let new_inputs: Vec<_> = inputs
+        .iter()
+        .zip(&keep)
+        .filter(|&(_, &k)| k)
+        .map(|(&v, _)| v)
+        .collect();
+    Function::from_id_mut(ctx, fid).set_input_regs(new_inputs);
+
+    // Drop the dead positional argument at every direct call site. A caller with
+    // fewer args than inputs (an incompletely-bound site) keeps whatever it has
+    // beyond the trimmed range.
+    for call_id in direct_call_sites(ctx, fid) {
+        let Mnemonic::Call(call) = ctx.get_insn(call_id).mnemonic().clone() else {
+            continue;
+        };
+        let new_args: Vec<ValueId> = call
+            .args
+            .iter()
+            .enumerate()
+            .filter(|(i, _)| keep.get(*i).copied().unwrap_or(true))
+            .map(|(_, &a)| a)
+            .collect();
+        if new_args.len() != call.args.len() {
+            if let Some(caller) = ctx.get_insn(call_id).function().map(|f| f.id) {
+                touched.insert(caller);
+            }
+            ctx.replace_instruction_mnemonic(
+                call_id,
+                Mnemonic::Call(Call {
+                    target: call.target,
+                    args: new_args,
+                    clobbers: call.clobbers,
+                }),
+            );
+        }
+    }
+
+    true
+}
+
+// ---------------------------------------------------------------------------
+// dead returned fields
+// ---------------------------------------------------------------------------
+
+/// Drop every returned write-set field that no caller projects: trim the callee
+/// return `Tuple`s, rebuild the call-result aggregate type, and renumber the
+/// surviving extracts. Records each caller in `touched`. Returns `true` if
+/// anything changed.
+fn trim_dead_return_fields(
+    ctx: &mut Context,
+    fid: FunctionId,
+    touched: &mut HashSet<FunctionId>,
+) -> bool {
+    let call_sites = direct_call_sites(ctx, fid);
+    if call_sites.is_empty() {
+        return false;
+    }
+
+    // The returned aggregate type (uniform across call sites). A `pure_reg`
+    // function always returns the write-set aggregate.
+    let Some(agg_ty) = ctx.stored_type_of(ValueId::Instruction(call_sites[0])) else {
+        return false;
+    };
+    let Some(fields) = ctx.types.aggregate_fields(agg_ty).map(<[_]>::to_vec) else {
+        return false;
+    };
+    let n = fields.len();
+    if n == 0 {
+        return false;
+    }
+
+    // A field is live iff some surviving `extract` projects it at some call site.
+    // Aggregate results are extract-only by invariant; a non-extract use would
+    // mean we cannot reason per-field, so bail (keep everything) in release.
+    let mut live = vec![false; n];
+    for &call_id in &call_sites {
+        let result = ValueId::Instruction(call_id);
+        for &u in ctx.users(result) {
+            match ctx.get_insn(u).mnemonic() {
+                Mnemonic::Extract(e) if e.agg == result => {
+                    if let Some(slot) = live.get_mut(e.index) {
+                        *slot = true;
+                    }
+                }
+                _ => {
+                    debug_assert!(false, "aggregate call result used by a non-extract");
+                    return false;
+                }
+            }
+        }
+    }
+
+    if live.iter().all(|&l| l) {
+        return false;
+    }
+
+    // Kept field indices and the old→new remap for surviving extracts.
+    let kept: Vec<usize> = (0..n).filter(|&i| live[i]).collect();
+    let mut new_index = vec![None; n];
+    for (new_i, &old_i) in kept.iter().enumerate() {
+        new_index[old_i] = Some(new_i);
+    }
+
+    // The trimmed aggregate type, shared by the call results and the callee
+    // return tuples (same field names/types ⇒ same structural type).
+    let new_fields: Vec<AggregateField> = kept.iter().map(|&i| fields[i].clone()).collect();
+    let new_ty = ctx.types.get_or_make_named_aggregate(new_fields);
+
+    // Rewrite each callee return: trim the tuple to the kept fields, or drop the
+    // returned value entirely when nothing survives.
+    for ret_id in returns_of(ctx, fid) {
+        let Mnemonic::Return(Return { ptr, value: Some(value) }) =
+            ctx.get_insn(ret_id).mnemonic().clone()
+        else {
+            continue;
+        };
+        let ValueId::Instruction(tuple_id) = value else {
+            continue;
+        };
+        let Mnemonic::Tuple(tuple) = ctx.get_insn(tuple_id).mnemonic().clone() else {
+            continue;
+        };
+
+        if kept.is_empty() {
+            ctx.replace_instruction_mnemonic(ret_id, Mnemonic::Return(Return { ptr, value: None }));
+            continue;
+        }
+
+        let new_tuple_fields: Vec<ValueId> = kept
+            .iter()
+            .filter_map(|&i| tuple.fields.get(i).copied())
+            .collect();
+        ctx.replace_instruction_mnemonic(
+            tuple_id,
+            Mnemonic::Tuple(Tuple {
+                fields: new_tuple_fields,
+            }),
+        );
+        Instruction::from_id_mut(ctx, tuple_id).set_type_resized(new_ty);
+    }
+
+    // Retype each call result and renumber the surviving extracts.
+    for &call_id in &call_sites {
+        Instruction::from_id_mut(ctx, call_id).set_type_resized(new_ty);
+        if let Some(caller) = ctx.get_insn(call_id).function().map(|f| f.id) {
+            touched.insert(caller);
+        }
+        let result = ValueId::Instruction(call_id);
+        let extracts: Vec<InstructionId> = ctx.users(result).to_vec();
+        for u in extracts {
+            let Mnemonic::Extract(Extract { agg, index }) = ctx.get_insn(u).mnemonic().clone()
+            else {
+                continue;
+            };
+            if let Some(new_i) = new_index[index] {
+                ctx.replace_instruction_mnemonic(
+                    u,
+                    Mnemonic::Extract(Extract { agg, index: new_i }),
+                );
+            }
+        }
+    }
+
+    true
+}
+
+#[derive(Default)]
+pub struct DeadSignature;
+
+impl Pass for DeadSignature {
+    const NAME: &'static str = "dead_signature";
+    fn description(&self) -> &'static str {
+        "Remove dead arguments and dead returned fields from functionalized functions"
+    }
+    fn run(&self, ctx: &mut Context, _env: &PipelineEnv) -> Result<bool, String> {
+        Ok(dead_signature(ctx))
+    }
+}
+
+crate::register_module_pass!(DeadSignature);
+
+#[cfg(test)]
+mod tests {
+    use qcode::{
+        builder::Builder,
+        types::TypeId,
+        value::{BlockId, Varnode, VarnodeId},
+    };
+    use qcode_macro::qcode;
+
+    use super::*;
+
+    /// Give `block`'s call instruction the target `target` and `args`.
+    fn set_call(
+        tc: &mut qcode::testing::TestContext,
+        block: BlockId,
+        target: FunctionId,
+        args: Vec<ValueId>,
+    ) -> InstructionId {
+        let call_id = BasicBlock::from_id(&tc.ctx, block)
+            .iter()
+            .find(|i| matches!(i.mnemonic(), Mnemonic::Call(_)))
+            .unwrap()
+            .id;
+        tc.ctx.replace_instruction_mnemonic(
+            call_id,
+            Mnemonic::Call(Call {
+                target,
+                args,
+                clobbers: vec![],
+            }),
+        );
+        call_id
+    }
+
+    /// Turn `fid` into the `pure_reg` shape: attach a write-set `Tuple` of
+    /// `fields` as the single return's value, mark it pure-reg, and record its
+    /// `inputs`. Returns the returned aggregate's type.
+    fn make_pure_reg_return(
+        tc: &mut qcode::testing::TestContext,
+        fid: FunctionId,
+        inputs: Vec<VarnodeId>,
+        fields: Vec<(String, ValueId)>,
+    ) -> TypeId {
+        let ret_id = returns_of(&tc.ctx, fid)[0];
+        let ret_block = tc.ctx.get_insn(ret_id).parent().map(|b| b.id).unwrap();
+        let Mnemonic::Return(Return { ptr, .. }) = tc.ctx.get_insn(ret_id).mnemonic().clone() else {
+            unreachable!()
+        };
+        let tuple = {
+            let mut b = Builder::from_block(BasicBlock::from_id_mut(&mut tc.ctx, ret_block));
+            b.set_insert_point_before(ret_id);
+            b.push_named_tuple(fields).id
+        };
+        tc.ctx.replace_instruction_mnemonic(
+            ret_id,
+            Mnemonic::Return(Return {
+                ptr,
+                value: Some(ValueId::Instruction(tuple)),
+            }),
+        );
+        Function::from_id_mut(&mut tc.ctx, fid).set_input_regs(inputs);
+        Function::from_id_mut(&mut tc.ctx, fid).set_pure_reg(true);
+        tc.ctx.stored_type_of(ValueId::Instruction(tuple)).unwrap()
+    }
+
+    /// Field count of `fid`'s single return write-set tuple, or `None` if the
+    /// return carries no value.
+    fn return_field_count(tc: &qcode::testing::TestContext, fid: FunctionId) -> Option<usize> {
+        let ret = returns_of(&tc.ctx, fid)[0];
+        let Mnemonic::Return(Return { value: Some(v), .. }) = tc.ctx.get_insn(ret).mnemonic() else {
+            return None;
+        };
+        let ValueId::Instruction(t) = v else { return None };
+        match tc.ctx.get_insn(*t).mnemonic() {
+            Mnemonic::Tuple(t) => Some(t.fields.len()),
+            _ => None,
+        }
+    }
+
+    fn call_args(tc: &qcode::testing::TestContext, call_id: InstructionId) -> Vec<ValueId> {
+        match tc.ctx.get_insn(call_id).mnemonic() {
+            Mnemonic::Call(c) => c.args.clone(),
+            _ => unreachable!(),
+        }
+    }
+
+    /// An input whose root param is never read is dropped from the signature and
+    /// from the call site, while the read input (and its argument) survives.
+    #[test]
+    fn drops_unread_argument() {
+        let mut tc = qcode::testing::TestContext::new();
+        let (vr0, vr1) = (tc.r0, tc.r1);
+        qcode!(
+            tc.ctx,
+            "
+            fn f:
+                <entry @r0:i64 @r1:i64>
+                    return [i64 0];
+
+            fn g:
+                <g_entry>
+                    goto <g_call>;
+                <g_call>
+                    call <f>;
+                <g_cont>
+                    return [i64 0];
+            "
+        );
+        let _ = g;
+        // Production names each promoted register param after its register (so
+        // `input_arg_name(i)` matches the param); the qcode macro leaves them
+        // unnamed, so mirror the naming here. Params are positional: [0]↔r0,
+        // [1]↔r1.
+        let param_ids: Vec<ValueId> = BasicBlock::from_id(&tc.ctx, entry)
+            .params()
+            .map(|p| p.id())
+            .collect();
+        for (pv, name) in param_ids.iter().zip(["r0", "r1"]) {
+            if let ValueId::BlockParam(pid) = pv {
+                tc.ctx.values.block_params[*pid].name = Some(std::borrow::Cow::Owned(name.into()));
+            }
+        }
+        // f returns a one-field write-set of its r1 param; the r0 param is unused
+        // (the post-mem2reg pure-reg shape: the body reads params, not varnodes).
+        let r1_param = param_ids[1];
+        let agg = make_pure_reg_return(
+            &mut tc,
+            f,
+            vec![vr0, vr1],
+            vec![("o0".to_owned(), r1_param)],
+        );
+
+        let a = tc.ctx.get_const(0x10, 8).id();
+        let b = tc.ctx.get_const(0x20, 8).id();
+        let call_id = set_call(&mut tc, g_call, f, vec![a, b]);
+        tc.ctx.add_cfg_edge(g_call, g_cont);
+        // Keep the single return field live so only the arg trim fires.
+        Instruction::from_id_mut(&mut tc.ctx, call_id).set_type(agg);
+        {
+            let reg_space = tc.reg_space;
+            let mut bld = Builder::from_block(BasicBlock::from_id_mut(&mut tc.ctx, g_cont));
+            bld.set_insert_point_to_start();
+            let f0 = bld.push_extract(ValueId::Instruction(call_id), 0).id();
+            bld.push_store(f0, ValueId::Varnode(vr0), reg_space);
+        }
+
+        assert!(dead_signature(&mut tc.ctx), "the unread r0 arg should be dropped");
+
+        assert_eq!(
+            Function::from_id(&tc.ctx, f).input_regs().unwrap(),
+            &[vr1],
+            "only the read input survives"
+        );
+        assert_eq!(
+            call_args(&tc, call_id),
+            vec![b],
+            "the dropped input's argument is removed at the call site"
+        );
+        assert_eq!(
+            BasicBlock::from_id(&tc.ctx, entry).params().count(),
+            1,
+            "the dead root param is removed"
+        );
+    }
+
+    /// A returned field no caller projects is dropped from the callee tuple, and
+    /// a surviving higher-index extract is renumbered down.
+    #[test]
+    fn trims_unprojected_return_field_and_renumbers() {
+        let mut tc = qcode::testing::TestContext::new();
+        let r0 = tc.r0;
+        qcode!(
+            tc.ctx,
+            "
+            fn f:
+                <entry>
+                    return [i64 0];
+
+            fn g:
+                <g_entry>
+                    goto <g_call>;
+                <g_call>
+                    call <f>;
+                <g_cont>
+                    return [i64 0];
+            "
+        );
+        let _ = (g, entry);
+        let c0 = tc.ctx.get_const(7, 8).id();
+        let c1 = tc.ctx.get_const(9, 8).id();
+        let agg = make_pure_reg_return(
+            &mut tc,
+            f,
+            vec![],
+            vec![("o0".to_owned(), c0), ("o1".to_owned(), c1)],
+        );
+
+        let call_id = set_call(&mut tc, g_call, f, vec![]);
+        tc.ctx.add_cfg_edge(g_call, g_cont);
+        Instruction::from_id_mut(&mut tc.ctx, call_id).set_type(agg);
+        // The caller projects only field 1 (the second output).
+        let extract_id = {
+            let mut bld = Builder::from_block(BasicBlock::from_id_mut(&mut tc.ctx, g_cont));
+            bld.set_insert_point_to_start();
+            let f1 = bld.push_extract(ValueId::Instruction(call_id), 1);
+            let id = f1.id;
+            let val = f1.id();
+            bld.push_store(val, ValueId::Varnode(r0), tc.reg_space);
+            id
+        };
+
+        assert!(dead_signature(&mut tc.ctx), "field 0 is unprojected and should be trimmed");
+
+        assert_eq!(
+            return_field_count(&tc, f),
+            Some(1),
+            "the callee return tuple keeps only the live field"
+        );
+        let Mnemonic::Extract(Extract { index, .. }) = tc.ctx.get_insn(extract_id).mnemonic() else {
+            panic!("surviving projection must still be an extract");
+        };
+        assert_eq!(*index, 0, "the surviving extract is renumbered from 1 to 0");
+    }
+
+    /// When no caller projects any field, the whole returned value is dropped.
+    #[test]
+    fn drops_return_value_when_all_fields_dead() {
+        let mut tc = qcode::testing::TestContext::new();
+        qcode!(
+            tc.ctx,
+            "
+            fn f:
+                <entry>
+                    return [i64 0];
+
+            fn g:
+                <g_entry>
+                    goto <g_call>;
+                <g_call>
+                    call <f>;
+                <g_cont>
+                    return [i64 0];
+            "
+        );
+        let _ = (g, entry);
+        let c0 = tc.ctx.get_const(7, 8).id();
+        let agg = make_pure_reg_return(&mut tc, f, vec![], vec![("o0".to_owned(), c0)]);
+        let call_id = set_call(&mut tc, g_call, f, vec![]);
+        tc.ctx.add_cfg_edge(g_call, g_cont);
+        Instruction::from_id_mut(&mut tc.ctx, call_id).set_type(agg);
+        // No extract: nothing projects the result.
+
+        assert!(dead_signature(&mut tc.ctx));
+        assert_eq!(
+            return_field_count(&tc, f),
+            None,
+            "an entirely-unused return drops its value"
+        );
+    }
+
+    /// A function that was never functionalized (`pure_reg == false`) is left
+    /// untouched even with an unread param.
+    #[test]
+    fn skips_non_pure_reg_functions() {
+        let mut tc = qcode::testing::TestContext::new();
+        let (vr0, vr1) = (tc.r0, tc.r1);
+        qcode!(
+            tc.ctx,
+            "
+            fn f:
+                <entry @r0:i64 @r1:i64>
+                    %u = @r1 + i64 1;
+                    return [i64 0];
+
+            fn g:
+                <g_entry>
+                    goto <g_call>;
+                <g_call>
+                    call <f>;
+                <g_cont>
+                    return [i64 0];
+            "
+        );
+        let _ = (g, entry);
+        Function::from_id_mut(&mut tc.ctx, f).set_input_regs(vec![vr0, vr1]);
+        // Deliberately not marked pure_reg.
+        let a = tc.ctx.get_const(0x10, 8).id();
+        let b = tc.ctx.get_const(0x20, 8).id();
+        let call_id = set_call(&mut tc, g_call, f, vec![a, b]);
+        tc.ctx.add_cfg_edge(g_call, g_cont);
+
+        assert!(!dead_signature(&mut tc.ctx), "non-pure-reg functions are skipped");
+        assert_eq!(call_args(&tc, call_id).len(), 2, "no argument is dropped");
+        let _ = Varnode::from_id(&tc.ctx, vr1);
+    }
+}

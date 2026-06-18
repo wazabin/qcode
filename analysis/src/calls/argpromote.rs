@@ -801,6 +801,11 @@ fn try_promote_registers(ctx: &mut Context, fid: FunctionId) -> bool {
     for call_id in call_sites {
         rewrite_caller_registers(ctx, call_id, &input_meta, &output_meta, writeset_ty);
     }
+
+    // The body now reads its registers only through by-value params and returns
+    // every write through the aggregate write-set: it is a pure value function.
+    // `dead_signature` keys on this flag to trim dead params / returned fields.
+    Function::from_id_mut(ctx, fid).set_pure_reg(true);
     true
 }
 

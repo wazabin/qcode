@@ -200,6 +200,16 @@ where
             .and_then(|s| s.clobbered.as_deref())
     }
 
+    /// Whether `argpromote_registers` has functionalized this function's register
+    /// side effects into a pure value function. See
+    /// [`FunctionSignature::pure_reg`].
+    pub fn is_pure_reg(&'s self) -> bool {
+        self.inner()
+            .signature
+            .as_ref()
+            .is_some_and(|s| s.pure_reg)
+    }
+
     /// Registers read before written (function inputs), as inferred by analysis.
     pub fn input_regs(&'s self) -> Option<&'ctx [VarnodeId]> {
         self.inner()
@@ -552,6 +562,12 @@ impl<'str, 'ctx> FunctionMutRef<'str, 'ctx> {
     /// Records the analysis-inferred input (live-in) register set on this function.
     pub fn set_input_regs(&mut self, regs: Vec<VarnodeId>) {
         self.inner_mut().signature.get_or_insert_default().inputs = Some(regs);
+    }
+
+    /// Marks this function as fully functionalized over its register channel.
+    /// See [`FunctionSignature::pure_reg`].
+    pub fn set_pure_reg(&mut self, value: bool) {
+        self.inner_mut().signature.get_or_insert_default().pure_reg = value;
     }
 
     /// Records the analysis-inferred saved (preserved) register set on this function.
