@@ -53,7 +53,7 @@ use std::borrow::Cow;
 use qcode::{
     builder::Builder,
     context::Context,
-    space::SpaceType,
+    space::{SpaceId, SpaceType},
     value::{
         BasicBlock, Function, FunctionId, Instruction, Value, ValueId, Varnode, VarnodeId,
         insn::{Binop, Call, InstructionId, IntBinop, Mnemonic},
@@ -480,6 +480,342 @@ fn apply(ctx: &mut Context, fid: FunctionId, mut promoted: Vec<Promoted>, ret_id
     true
 }
 
+// ===========================================================================
+// Register channel (runs early, before mem2reg — see ARGPROMOTE_REGISTERS.md)
+// ===========================================================================
+//
+// Unlike the RAM channel above, register effects are functionalized by a purely
+// syntactic scan of the lifted body: a register *loaded* is an input, a register
+// *stored* is an output. No shadow space is needed — every register access
+// converts, so the body keeps operating on real register space and the *next*
+// mem2reg run SSA-promotes it into a pure value function. Inputs become by-value
+// params seeded into register space at entry; outputs are returned as a flat
+// positional aggregate (slot i ↔ output register i) the caller replays.
+
+/// A function's register interface, recovered by [`scan_register_effects`].
+struct RegisterEffects {
+    /// Registers the body loads — each becomes a by-value input parameter
+    /// (over-approximated: a written-first register yields a dead param that
+    /// mem2reg/DCE prune). Sorted by `(address, size)` for a deterministic
+    /// param/argument order shared with the caller rewrite.
+    inputs: Vec<VarnodeId>,
+    /// Registers the body stores, canonicalized to the coarsest register per
+    /// overlap group so the caller's replay is order-independent. Sorted.
+    outputs: Vec<VarnodeId>,
+}
+
+/// The byte interval `(space, start, end)` a register varnode occupies.
+fn reg_interval(ctx: &Context, vn: VarnodeId) -> (SpaceId, i64, i64) {
+    let v = Varnode::from_id(ctx, vn);
+    let start = v.address();
+    (v.space().id, start, start + v.size() as i64)
+}
+
+/// `true` if two register varnodes occupy overlapping bytes of the same space.
+fn regs_overlap(ctx: &Context, a: VarnodeId, b: VarnodeId) -> bool {
+    let (sa, a0, a1) = reg_interval(ctx, a);
+    let (sb, b0, b1) = reg_interval(ctx, b);
+    sa == sb && a0 < b1 && b0 < a1
+}
+
+/// Collapse a set of register varnodes into the coarsest register per overlap
+/// group. Register files nest (AL ⊂ AX ⊂ EAX ⊂ RAX), so each overlap group has a
+/// unique member whose interval contains the rest; for *outputs*, loading that
+/// register at the return reads the merged final state of every sub-write, and
+/// for *inputs* one seed of it covers every overlapping read. Returns `None` if
+/// some group has no single covering register (partial overlap with no cover) —
+/// that function is left on the conservative path.
+fn canonicalize_to_coarsest(ctx: &Context, regs: &[VarnodeId]) -> Option<Vec<VarnodeId>> {
+    // Connected components under `regs_overlap` (tiny N, so O(N²) is fine).
+    let mut group_of: Vec<usize> = (0..regs.len()).collect();
+    for i in 0..regs.len() {
+        for j in (i + 1)..regs.len() {
+            if regs_overlap(ctx, regs[i], regs[j]) {
+                let (gi, gj) = (group_of[i], group_of[j]);
+                if gi != gj {
+                    for g in &mut group_of {
+                        if *g == gj {
+                            *g = gi;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    let mut coarse: Vec<VarnodeId> = Vec::new();
+    for g in 0..regs.len() {
+        let members: Vec<VarnodeId> = (0..regs.len())
+            .filter(|&i| group_of[i] == g)
+            .map(|i| regs[i])
+            .collect();
+        if members.is_empty() {
+            continue; // not a group representative
+        }
+        // The cover must contain every member's interval.
+        let cover = members.iter().copied().find(|&m| {
+            let (_, m0, m1) = reg_interval(ctx, m);
+            members.iter().all(|&o| {
+                let (_, o0, o1) = reg_interval(ctx, o);
+                m0 <= o0 && m1 >= o1
+            })
+        })?;
+        if !coarse.contains(&cover) {
+            coarse.push(cover);
+        }
+    }
+    Some(coarse)
+}
+
+/// Scan `fid` for register reads (inputs) and writes (outputs). Returns `None`
+/// when there is no register write (nothing to functionalize) or an output
+/// overlap group has no single covering register.
+fn scan_register_effects(ctx: &Context, fid: FunctionId) -> Option<RegisterEffects> {
+    let mut loaded: Vec<VarnodeId> = Vec::new();
+    let mut stored: Vec<VarnodeId> = Vec::new();
+    for block in Function::from_id(ctx, fid).blocks() {
+        for insn in block.iter() {
+            match insn.mnemonic() {
+                Mnemonic::Load(l) => {
+                    if let ValueId::Varnode(vn) = l.ptr
+                        && is_register(ctx, vn)
+                        && !loaded.contains(&vn)
+                    {
+                        loaded.push(vn);
+                    }
+                }
+                Mnemonic::Store(s) => {
+                    if let ValueId::Varnode(vn) = s.ptr
+                        && is_register(ctx, vn)
+                        && !stored.contains(&vn)
+                    {
+                        stored.push(vn);
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    if stored.is_empty() {
+        return None;
+    }
+    let mut outputs = canonicalize_to_coarsest(ctx, &stored)?;
+
+    // The rewritten body reads not only the originally-loaded registers but also
+    // every output (the return write-set loads each one). An output written on
+    // only some paths is therefore read-before-write at a return on a no-write
+    // path; seeding it from an input param makes that read the caller's incoming
+    // value (replayed back as a no-op), keeping callee params and caller args in
+    // sync. Always-written outputs just yield a dead seed that DCE prunes.
+    let mut read_set = loaded;
+    for &o in &outputs {
+        if !read_set.contains(&o) {
+            read_set.push(o);
+        }
+    }
+    let mut inputs = canonicalize_to_coarsest(ctx, &read_set)?;
+
+    let key = |ctx: &Context, vn: &VarnodeId| {
+        let v = Varnode::from_id(ctx, *vn);
+        (v.address(), v.size())
+    };
+    inputs.sort_by_key(|vn| key(ctx, vn));
+    outputs.sort_by_key(|vn| key(ctx, vn));
+    Some(RegisterEffects { inputs, outputs })
+}
+
+/// Rewrite `fid`'s **callee** side for its register effects: add a by-value param
+/// per input register (seeded into real register space at entry), and return the
+/// outputs' final values as a flat positional aggregate at every return. The
+/// caller rewrite (passing inputs, replaying outputs) is separate — see Phase 2.
+fn rewrite_callee_registers(ctx: &mut Context, fid: FunctionId, eff: &RegisterEffects) {
+    let root = Function::from_id(ctx, fid).root().map(|b| b.id).unwrap();
+
+    // --- inputs: a by-value param per input register, seeded at entry ---------
+    // Precompute (register, size, space, name) before taking any mutable borrow.
+    let input_meta: Vec<(VarnodeId, usize, SpaceId, Option<String>)> = eff
+        .inputs
+        .iter()
+        .map(|&r| {
+            let v = Varnode::from_id(ctx, r);
+            (r, v.size(), v.space().id, v.name().map(str::to_owned))
+        })
+        .collect();
+
+    let mut seeds: Vec<(VarnodeId, SpaceId, ValueId)> = Vec::new();
+    for (r, size, space, name) in &input_meta {
+        let pid = BasicBlock::from_id_mut(ctx, root).push_param(*size).id;
+        // Name the param after its register so the calling convention binds it
+        // from the register file (mem2reg's promoted-register-param naming, which
+        // the emulator's `seed_entry_params` keys on).
+        ctx.values.block_params[pid].name = name.clone().map(Cow::Owned);
+        seeds.push((*r, *space, ValueId::BlockParam(pid)));
+    }
+    if !seeds.is_empty() {
+        let mut b = Builder::from_block(BasicBlock::from_id_mut(ctx, root));
+        b.set_insert_point_to_start();
+        for (r, space, param) in &seeds {
+            b.push_store(*param, ValueId::Varnode(*r), *space);
+        }
+    }
+
+    // --- outputs: a flat positional write-set at every return -----------------
+    let output_meta: Vec<(VarnodeId, usize, SpaceId)> = eff
+        .outputs
+        .iter()
+        .map(|&r| {
+            let v = Varnode::from_id(ctx, r);
+            (r, v.size(), v.space().id)
+        })
+        .collect();
+
+    let returns: Vec<InstructionId> = Function::from_id(ctx, fid)
+        .iter()
+        .filter_map(|b| {
+            let last = b.iter().last()?;
+            matches!(last.mnemonic(), Mnemonic::Return(_)).then_some(last.id)
+        })
+        .collect();
+
+    for ret_id in returns {
+        let Some(ret_block) = ctx.get_insn(ret_id).parent().map(|b| b.id) else {
+            continue;
+        };
+        let tuple_val = {
+            let mut b = Builder::from_block(BasicBlock::from_id_mut(ctx, ret_block));
+            b.set_insert_point_before(ret_id);
+            let fields: Vec<ValueId> = output_meta
+                .iter()
+                .map(|(r, size, space)| b.push_load::<false>(ValueId::Varnode(*r), *size, *space).id())
+                .collect();
+            ValueId::Instruction(b.push_tuple(fields).id)
+        };
+        let mut m = ctx.get_insn(ret_id).mnemonic().clone();
+        if let Mnemonic::Return(ref mut r) = m {
+            // The register run is the first to touch the slot (it runs before the
+            // RAM run), so it sets rather than appends. Composition with a later
+            // run is handled when that run lands (append-only — see the design).
+            r.value = Some(tuple_val);
+        }
+        ctx.replace_instruction_mnemonic(ret_id, m);
+    }
+}
+
+/// Functionalize every eligible function's register effects (see
+/// [`try_promote_registers`]). Returns `true` if anything changed.
+pub fn argpromote_registers(ctx: &mut Context) -> bool {
+    let mut changed = false;
+    for fid in ctx.function_ids() {
+        if try_promote_registers(ctx, fid) {
+            changed = true;
+        }
+    }
+    changed
+}
+
+fn try_promote_registers(ctx: &mut Context, fid: FunctionId) -> bool {
+    let f = Function::from_id(ctx, fid);
+    if f.is_external() || f.root().is_none() {
+        return false;
+    }
+    // Closed-world: an address-taken function may be reached by an indirect call
+    // this pass cannot find and rewrite, leaving a caller on the old register ABI.
+    if is_address_taken(ctx, fid) {
+        return false;
+    }
+    let Some(eff) = scan_register_effects(ctx, fid) else {
+        return false;
+    };
+
+    // Only direct callers can be rewritten to pass inputs / replay outputs; with
+    // none, rewriting the callee would leave it expecting params nobody provides.
+    let call_sites: Vec<InstructionId> = ctx
+        .instructions()
+        .filter_map(|insn| match insn.mnemonic() {
+            Mnemonic::Call(c) if c.target == fid => Some(insn.id),
+            _ => None,
+        })
+        .collect();
+    if call_sites.is_empty() {
+        return false;
+    }
+
+    rewrite_callee_registers(ctx, fid, &eff);
+
+    // The flat positional write-set type: one integer field per output register.
+    let field_tys: Vec<_> = eff
+        .outputs
+        .iter()
+        .map(|&r| ctx.types.get_or_make_int(Varnode::from_id(ctx, r).size()))
+        .collect();
+    let writeset_ty = ctx.types.get_or_make_aggregate(field_tys);
+
+    let meta = |ctx: &Context, regs: &[VarnodeId]| -> Vec<(VarnodeId, usize, SpaceId)> {
+        regs.iter()
+            .map(|&r| {
+                let v = Varnode::from_id(ctx, r);
+                (r, v.size(), v.space().id)
+            })
+            .collect()
+    };
+    let input_meta = meta(ctx, &eff.inputs);
+    let output_meta = meta(ctx, &eff.outputs);
+
+    for call_id in call_sites {
+        rewrite_caller_registers(ctx, call_id, &input_meta, &output_meta, writeset_ty);
+    }
+    true
+}
+
+/// Rewrite one direct call site for the register channel: load each input
+/// register before the call and append it as a positional argument, retype the
+/// call to the write-set aggregate, then replay each output register from the
+/// returned aggregate into register space at the continuation. The next mem2reg
+/// run forwards the replay stores into precise SSA.
+fn rewrite_caller_registers(
+    ctx: &mut Context,
+    call_id: InstructionId,
+    input_meta: &[(VarnodeId, usize, SpaceId)],
+    output_meta: &[(VarnodeId, usize, SpaceId)],
+    writeset_ty: qcode::types::TypeId,
+) {
+    let Some(call_block) = ctx.get_insn(call_id).parent().map(|b| b.id) else {
+        return;
+    };
+    let (target, mut args, clobbers) = match ctx.get_insn(call_id).mnemonic().clone() {
+        Mnemonic::Call(c) => (c.target, c.args, c.clobbers),
+        _ => return,
+    };
+
+    // Inputs: load each input register's current value just before the call.
+    {
+        let mut b = Builder::from_block(BasicBlock::from_id_mut(ctx, call_block));
+        b.set_insert_point_before(call_id);
+        for (r, size, space) in input_meta {
+            let v = b.push_load::<false>(ValueId::Varnode(*r), *size, *space).id();
+            args.push(v);
+        }
+    }
+    ctx.replace_instruction_mnemonic(call_id, Mnemonic::Call(Call { target, args, clobbers }));
+    Instruction::from_id_mut(ctx, call_id).set_type(writeset_ty);
+
+    // Outputs: replay the returned final values into register space.
+    let Some(cont) = BasicBlock::from_id(ctx, call_block)
+        .successors()
+        .next()
+        .map(|(_, b)| b)
+    else {
+        return;
+    };
+    let result = ValueId::Instruction(call_id);
+    let mut b = Builder::from_block(BasicBlock::from_id_mut(ctx, cont));
+    b.set_insert_point_to_start();
+    for (i, (r, _size, space)) in output_meta.iter().enumerate() {
+        let v = ValueId::Instruction(b.push_extract(result, i).id);
+        b.push_store(v, ValueId::Varnode(*r), *space);
+    }
+}
+
 #[derive(Default)]
 pub struct ArgPromote;
 
@@ -494,6 +830,21 @@ impl Pass for ArgPromote {
 }
 
 crate::register_module_pass!(ArgPromote);
+
+#[derive(Default)]
+pub struct ArgPromoteRegisters;
+
+impl Pass for ArgPromoteRegisters {
+    const NAME: &'static str = "argpromote_registers";
+    fn description(&self) -> &'static str {
+        "Functionalize register side effects into a returned write-set (runs early)"
+    }
+    fn run(&self, ctx: &mut Context, _env: &PipelineEnv) -> Result<bool, String> {
+        Ok(argpromote_registers(ctx))
+    }
+}
+
+crate::register_module_pass!(ArgPromoteRegisters);
 
 #[cfg(test)]
 mod tests {
@@ -527,6 +878,68 @@ mod tests {
             Mnemonic::Call(Call { target, args, clobbers: vec![] }),
         );
         call_id
+    }
+
+    /// Phase 0 gate for the register channel (see `ARGPROMOTE_REGISTERS.md`): the
+    /// early register run will send an **aggregate-typed call result** through
+    /// mem2reg/gvn/dce for the first time (today's RAM run is post-mem2reg, so
+    /// aggregates never reach those passes). An opaque call result is the riskiest
+    /// shape — gvn cannot fold it, so the `extract` must thread through intact.
+    /// This builds exactly that and asserts the value passes neither panic nor
+    /// mangle it.
+    #[test]
+    fn aggregate_call_result_survives_value_passes() {
+        let mut tc = qcode::testing::TestContext::new();
+        let (r0, r1, r3) = (tc.r0, tc.r1, tc.r3);
+        qcode!(
+            tc.ctx,
+            "
+            fn f:
+                <f_entry>
+                    %v = load(i64, {r1});
+                    %s = %v + i64 5;
+                    store({r0}, %s);
+                    %fin = load(i64, {r0});
+                    %agg = (%fin);
+                    return [%agg];
+
+            fn g:
+                <g_entry>
+                    goto <g_call>;
+                <g_call>
+                    call <f>;
+                <g_cont>
+                    return [i64 0];
+            "
+        );
+        let _ = (f, g, r0, r1);
+
+        // A one-field aggregate (the positional register write-set shape).
+        let i64_ty = tc.ctx.types.get_or_make_int(8);
+        let agg_ty = tc.ctx.types.get_or_make_aggregate(vec![i64_ty]);
+
+        // Make the call produce that aggregate, then replay field 0 into r3.
+        let call_id = set_call(&mut tc, g_call, f, vec![]);
+        Instruction::from_id_mut(&mut tc.ctx, call_id).set_type(agg_ty);
+        tc.ctx.add_cfg_edge(g_call, g_cont);
+        {
+            let mut b = Builder::from_block(BasicBlock::from_id_mut(&mut tc.ctx, g_cont));
+            b.set_insert_point_to_start();
+            let out = ValueId::Instruction(b.push_extract(ValueId::Instruction(call_id), 0).id);
+            b.push_store(out, ValueId::Varnode(r3), tc.reg_space);
+        }
+
+        // The Phase 0 question: do the value passes survive an aggregate-typed,
+        // opaque call result? (A panic here fails the test.)
+        let aliases = crate::AliasResult::simple(&tc.ctx);
+        let _ = crate::mem2reg(&mut tc.ctx, g, &aliases);
+        let _ = crate::gvn_function(&mut tc.ctx, g, Some(&aliases));
+
+        // gvn cannot see into the opaque call result, so the extract must remain.
+        let has_extract = Function::from_id(&tc.ctx, g)
+            .iter()
+            .any(|b| b.iter().any(|i| matches!(i.mnemonic(), Mnemonic::Extract(_))));
+        assert!(has_extract, "extract of an aggregate call result must survive mem2reg+gvn");
     }
 
     #[test]
@@ -885,5 +1298,359 @@ mod tests {
 
         assert!(argpromote(&mut tc.ctx));
         assert_eq!(replayed_stores(&tc, call_id), 1);
+    }
+
+    // ---- Phase 1: register channel — callee-side scan + rewrite -------------
+
+    /// The width of the flat register write-set on `fid`'s (first) return: the
+    /// field count of the `Tuple` in `Return::value`, or `None` if unset.
+    fn register_writeset_len(tc: &qcode::testing::TestContext, fid: FunctionId) -> Option<usize> {
+        let ret = Function::from_id(&tc.ctx, fid).iter().find_map(|b| {
+            let last = b.iter().last()?;
+            matches!(last.mnemonic(), Mnemonic::Return(_)).then_some(last.id)
+        })?;
+        let val = match tc.ctx.get_insn(ret).mnemonic() {
+            Mnemonic::Return(r) => r.value?,
+            _ => return None,
+        };
+        let ValueId::Instruction(tuple_id) = val else {
+            return None;
+        };
+        match tc.ctx.get_insn(tuple_id).mnemonic() {
+            Mnemonic::Tuple(t) => Some(t.fields.len()),
+            _ => None,
+        }
+    }
+
+    /// `void f() { r0 = 42; }` — a pure clobber: no inputs, one output, and a
+    /// one-field write-set. The return register has no special status.
+    #[test]
+    fn register_pure_clobber() {
+        let mut tc = qcode::testing::TestContext::new();
+        let r0 = tc.r0;
+        qcode!(
+            tc.ctx,
+            "
+            fn f:
+                <entry>
+                    store({r0}, i64 42);
+                    return [i64 0];
+            "
+        );
+        let _ = entry;
+        let eff = scan_register_effects(&tc.ctx, f).expect("a written register is promotable");
+        assert_eq!(eff.outputs, vec![r0]);
+        // The output is over-approximated as an input too (seeded so a no-write
+        // path reads the caller's incoming value); the seed is dead here and DCE
+        // would prune it.
+        assert_eq!(eff.inputs, vec![r0]);
+
+        rewrite_callee_registers(&mut tc.ctx, f, &eff);
+        assert_eq!(register_writeset_len(&tc, f), Some(1), "one output → one field");
+    }
+
+    /// `r0 += 1` — read-modify-write: r0 is both input and output. The input
+    /// becomes a by-value param seeded into register space at entry.
+    #[test]
+    fn register_read_modify_write() {
+        let mut tc = qcode::testing::TestContext::new();
+        let r0 = tc.r0;
+        qcode!(
+            tc.ctx,
+            "
+            fn f:
+                <entry>
+                    %v = load(i64, {r0});
+                    %s = %v + i64 1;
+                    store({r0}, %s);
+                    return [i64 0];
+            "
+        );
+        let eff = scan_register_effects(&tc.ctx, f).expect("written register");
+        assert_eq!(eff.inputs, vec![r0]);
+        assert_eq!(eff.outputs, vec![r0]);
+
+        rewrite_callee_registers(&mut tc.ctx, f, &eff);
+        // One by-value input param added, and its seed store is the new entry head.
+        assert_eq!(BasicBlock::from_id(&tc.ctx, entry).params().count(), 1);
+        let first = BasicBlock::from_id(&tc.ctx, entry).iter().next().unwrap();
+        assert!(
+            matches!(first.mnemonic(), Mnemonic::Store(s) if s.ptr == ValueId::Varnode(r0)),
+            "entry must begin by seeding r0 from its input param"
+        );
+        assert_eq!(register_writeset_len(&tc, f), Some(1));
+    }
+
+    /// Writes to `r0_lo32` and `r0` overlap; the write-set canonicalizes to the
+    /// coarsest covering register (`r0`), so replay stays order-independent.
+    #[test]
+    fn register_overlap_canonicalizes_to_coarsest() {
+        let mut tc = qcode::testing::TestContext::new();
+        let (r0, r0_lo32) = (tc.r0, tc.r0_lo32);
+        qcode!(
+            tc.ctx,
+            "
+            fn f:
+                <entry>
+                    store({r0_lo32}, i32 2);
+                    store({r0}, i64 3);
+                    return [i64 0];
+            "
+        );
+        let eff = scan_register_effects(&tc.ctx, f).expect("written register");
+        assert_eq!(eff.outputs, vec![r0], "overlap group collapses to the 8-byte r0");
+        let _ = r0_lo32;
+        rewrite_callee_registers(&mut tc.ctx, f, &eff);
+        assert_eq!(register_writeset_len(&tc, f), Some(1));
+    }
+
+    /// `r0` (the return register) and `r1` (a clobber) are written. Both ride the
+    /// single write-set — the return value is just another output register.
+    #[test]
+    fn register_return_value_folds_into_writeset() {
+        let mut tc = qcode::testing::TestContext::new();
+        let (r0, r1) = (tc.r0, tc.r1);
+        qcode!(
+            tc.ctx,
+            "
+            fn f:
+                <entry>
+                    store({r0}, i64 7);
+                    store({r1}, i64 8);
+                    return [i64 0];
+            "
+        );
+        let eff = scan_register_effects(&tc.ctx, f).expect("written register");
+        assert_eq!(eff.outputs, vec![r0, r1], "both outputs, sorted by address");
+        rewrite_callee_registers(&mut tc.ctx, f, &eff);
+        assert_eq!(register_writeset_len(&tc, f), Some(2), "return reg folds in");
+    }
+
+    /// A function that only *reads* registers has nothing to functionalize.
+    #[test]
+    fn register_read_only_is_skipped() {
+        let mut tc = qcode::testing::TestContext::new();
+        let r0 = tc.r0;
+        qcode!(
+            tc.ctx,
+            "
+            fn f:
+                <entry>
+                    %v = load(i64, {r0});
+                    return [i64 0];
+            "
+        );
+        assert!(scan_register_effects(&tc.ctx, f).is_none(), "no write ⇒ nothing to promote");
+    }
+
+    // ---- Phase 2: register channel — caller replay + precision --------------
+
+    /// `void f() { r0 = 42; }` called by `g`, which reads r0 afterwards. The
+    /// caller replays the returned r0, and the following mem2reg forwards that
+    /// replay into the post-call read — precise dataflow, not an opaque reload.
+    #[test]
+    fn register_caller_replays_output_precisely() {
+        let mut tc = qcode::testing::TestContext::new();
+        let (r0, r1) = (tc.r0, tc.r1);
+        qcode!(
+            tc.ctx,
+            "
+            fn f:
+                <f_entry>
+                    store({r0}, i64 42);
+                    return [i64 0];
+
+            fn g:
+                <g_entry>
+                    goto <g_call>;
+                <g_call>
+                    call <f>;
+                <g_cont>
+                    %x = load(i64, {r0});
+                    store({r1}, %x);
+                    return [i64 0];
+            "
+        );
+        let _ = (f, g, r0);
+        set_call(&mut tc, g_call, f, vec![]);
+        tc.ctx.add_cfg_edge(g_call, g_cont);
+
+        assert!(argpromote_registers(&mut tc.ctx), "f's register clobber should be promoted");
+
+        // The continuation replays the returned register from the call result.
+        let has_extract = BasicBlock::from_id(&tc.ctx, g_cont)
+            .iter()
+            .any(|i| matches!(i.mnemonic(), Mnemonic::Extract(_)));
+        assert!(has_extract, "continuation must extract the returned register value");
+
+        // mem2reg realizes precision: r1 receives the extracted value, not a reload.
+        let aliases = crate::AliasResult::simple(&tc.ctx);
+        crate::mem2reg(&mut tc.ctx, g, &aliases);
+
+        let stored_to_r1 = BasicBlock::from_id(&tc.ctx, g_cont).iter().find_map(|i| {
+            match i.mnemonic() {
+                Mnemonic::Store(s) if s.ptr == ValueId::Varnode(r1) => Some(s.src),
+                _ => None,
+            }
+        });
+        let src = stored_to_r1.expect("store to r1 present");
+        let is_extract = matches!(
+            src,
+            ValueId::Instruction(id) if matches!(tc.ctx.get_insn(id).mnemonic(), Mnemonic::Extract(_))
+        );
+        assert!(is_extract, "r1 must receive the precise extracted return value, got {src:?}");
+    }
+
+    /// An RMW callee's input register is passed as a positional call argument.
+    #[test]
+    fn register_caller_passes_input_arg() {
+        let mut tc = qcode::testing::TestContext::new();
+        let r0 = tc.r0;
+        qcode!(
+            tc.ctx,
+            "
+            fn f:
+                <f_entry>
+                    %v = load(i64, {r0});
+                    %s = %v + i64 1;
+                    store({r0}, %s);
+                    return [i64 0];
+
+            fn g:
+                <g_entry>
+                    store({r0}, i64 10);
+                    goto <g_call>;
+                <g_call>
+                    call <f>;
+                <g_cont>
+                    return [i64 0];
+            "
+        );
+        let _ = (f, g, r0);
+        let call_id = set_call(&mut tc, g_call, f, vec![]);
+        tc.ctx.add_cfg_edge(g_call, g_cont);
+
+        assert!(argpromote_registers(&mut tc.ctx));
+
+        // f gained exactly one by-value input param (r0).
+        let root = Function::from_id(&tc.ctx, f).root().unwrap().id;
+        assert_eq!(BasicBlock::from_id(&tc.ctx, root).params().count(), 1);
+
+        // The call passes that input as one positional argument.
+        let args_len = match tc.ctx.get_insn(call_id).mnemonic() {
+            Mnemonic::Call(c) => c.args.len(),
+            _ => unreachable!(),
+        };
+        assert_eq!(args_len, 1, "the input register is passed as one call argument");
+    }
+
+    /// Every return block gets its own write-set (the design's per-return rule).
+    #[test]
+    fn register_multiple_returns_each_get_writeset() {
+        let mut tc = qcode::testing::TestContext::new();
+        let r0 = tc.r0;
+        qcode!(
+            tc.ctx,
+            "
+            fn f:
+                <entry>
+                    store({r0}, i64 1);
+                    return [i64 0];
+                <other>
+                    store({r0}, i64 2);
+                    return [i64 0];
+            "
+        );
+        let _ = (r0, entry, other);
+        let eff = scan_register_effects(&tc.ctx, f).expect("written register");
+        rewrite_callee_registers(&mut tc.ctx, f, &eff);
+        let with_writeset = Function::from_id(&tc.ctx, f)
+            .iter()
+            .filter(|b| {
+                b.iter().last().is_some_and(
+                    |i| matches!(i.mnemonic(), Mnemonic::Return(r) if r.value.is_some()),
+                )
+            })
+            .count();
+        assert_eq!(with_writeset, 2, "every return carries the register write-set");
+    }
+
+    /// Phase 3: emulator round-trip. The rewritten module must produce the same
+    /// caller-visible register state as the original. `g` calls an RMW `f`
+    /// (`r0 += 1`); we pin `f`'s return at `g`'s continuation address so the
+    /// nested return works, then emulate before and after the rewrite and compare
+    /// `r0`. This exercises the whole functional path: input-param seeding, the
+    /// returned aggregate (`Return.value`), and the caller's `extract`/replay.
+    #[test]
+    fn register_roundtrip_preserves_caller_visible_state() {
+        use qcode_emulator::StandaloneEmulator;
+
+        let mut tc = qcode::testing::TestContext::new();
+        let r0 = tc.r0;
+        qcode!(
+            tc.ctx,
+            "
+            fn f:
+                <f_entry>
+                    %v = load(i64, {r0});
+                    %s = %v + i64 1;
+                    store({r0}, %s);
+                    return [i64 4096];
+
+            fn g:
+                <g_entry>
+                    goto <g_call>;
+                <g_call>
+                    call <f>;
+                <g_cont>
+                    return [i64 0];
+            "
+        );
+        let _ = (f, r0);
+        // `f` returns to `g`'s continuation: pin it at the return address (4096).
+        BasicBlock::from_id_mut(&mut tc.ctx, g_cont).set_address(4096).unwrap();
+        set_call(&mut tc, g_call, f, vec![]);
+        tc.ctx.add_cfg_edge(g_call, g_cont);
+
+        let g_root = Function::from_id(&tc.ctx, g).root().unwrap().id;
+        let run = |ctx: &Context<'_>| -> u64 {
+            let mut emu = StandaloneEmulator::new(g_root);
+            emu.set_varnode(ctx, r0, 10).unwrap();
+            emu.run_function(ctx, g).unwrap();
+            emu.read_varnode(ctx, r0).unwrap()
+        };
+
+        let original = run(&tc.ctx);
+        assert!(argpromote_registers(&mut tc.ctx));
+        let transformed = run(&tc.ctx);
+
+        assert_eq!(original, 11, "original: r0 = 10 + 1");
+        assert_eq!(transformed, original, "rewrite preserves caller-visible r0");
+    }
+
+    /// Two registers that overlap but where neither contains the other (no single
+    /// covering register) leave the function on the conservative path.
+    #[test]
+    fn register_partial_overlap_no_cover_bails() {
+        let mut tc = qcode::testing::TestContext::new();
+        let r0_lo32 = tc.r0_lo32; // bytes [0, 4)
+        // A 4-byte register at offset 2 → bytes [2, 6): overlaps r0_lo32 at [2,4)
+        // but neither interval contains the other.
+        let mid = Varnode::make(&mut tc.ctx, 2, 4, tc.reg_space).id;
+        qcode!(
+            tc.ctx,
+            "
+            fn f:
+                <entry>
+                    store({r0_lo32}, i32 1);
+                    store({mid}, i32 2);
+                    return [i64 0];
+            "
+        );
+        let _ = (r0_lo32, mid, entry);
+        assert!(
+            scan_register_effects(&tc.ctx, f).is_none(),
+            "partial overlap with no covering register must bail"
+        );
     }
 }

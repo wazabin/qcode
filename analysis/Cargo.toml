@@ -21,3 +21,5 @@ pollster.workspace = true
 [dev-dependencies]
 qcode = { workspace = true, features = ["testing"] }
 qcode_macro.workspace = true
+# Execution-level (emulator round-trip) validation of the argpromote rewrite.
+qcode_emulator.workspace = true

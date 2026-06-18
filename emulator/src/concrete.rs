@@ -9,9 +9,9 @@ use qcode::{
         BasicBlock, BlockId, BlockParamId, BlockRef, Function, FunctionId, Instruction, Value,
         ValueId, ValueRef, Varnode,
         insn::{
-            BoolBinop, Branch, BranchInd, CBranch, Call, CallInd, Carry, InstructionId,
+            BoolBinop, Branch, BranchInd, CBranch, Call, CallInd, Carry, Extract, InstructionId,
             InstructionRef, IntBinop, LzCount, Mnemonic, PopCount, Range, Return, SBorrow, SCarry,
-            Sext, Unop, Zext,
+            Sext, Tuple, Unop, Zext,
         },
         varnode::{VarnodeId, register::RegisterId},
     },
@@ -740,10 +740,18 @@ pub struct StandaloneEmulator {
     pub memory: EmulatedMemory,
     pub insn_values: FxHashMap<InstructionId, SizedValue>,
     pub block_param_values: FxHashMap<BlockParamId, SizedValue>,
+    /// Field values of aggregate-typed instruction results (`Tuple` results and,
+    /// on return, the call instruction that produced them). `Extract` projects a
+    /// field back out. Keeps the scalar `SizedValue` domain unchanged — the
+    /// functional `argpromote` write-set is the only producer/consumer.
+    pub aggregate_values: FxHashMap<InstructionId, Vec<SizedValue>>,
     pub block: BlockId,
     pub idx: usize,
     /// Call stack maintained by `run_function` (outermost function first).
     pub call_stack: Vec<FunctionId>,
+    /// The call instruction id for each active nested call, so a `Return` can
+    /// deposit the callee's `Return.value` as that call's result.
+    call_site_stack: Vec<InstructionId>,
 
     pub instruction_hook: Option<InstructionHook>,
     call_interceptor: Option<CallInterceptor>,
@@ -755,9 +763,11 @@ impl StandaloneEmulator {
             memory: EmulatedMemory::default(),
             insn_values: FxHashMap::default(),
             block_param_values: FxHashMap::default(),
+            aggregate_values: FxHashMap::default(),
             block: entry,
             idx: 0,
             call_stack: Vec::new(),
+            call_site_stack: Vec::new(),
             instruction_hook: None,
             call_interceptor: None,
         }
@@ -1122,6 +1132,9 @@ impl StandaloneEmulator {
                     })?
                     .id;
                 self.idx = 0;
+                // Remember this call so the matching `Return` can deposit the
+                // callee's `Return.value` as this call's (aggregate) result.
+                self.call_site_stack.push(insn_id);
                 return Ok(StepEvent::DirectCallEntered(target));
             }
 
@@ -1165,10 +1178,25 @@ impl StandaloneEmulator {
                     .id;
                 self.block = target;
                 self.idx = 0;
+                self.call_site_stack.push(insn_id);
                 return Ok(StepEvent::IndirectCallEntered);
             }
 
-            Mnemonic::Return(Return { ptr, .. }) => {
+            Mnemonic::Return(Return { ptr, value, .. }) => {
+                // Deposit the callee's return value as the result of the call that
+                // entered it: an aggregate (the functional write-set) is copied
+                // field-wise; a scalar return is copied through. This is what makes
+                // a caller's `extract(call, i)` see the callee's effects.
+                if let Some(call_id) = self.call_site_stack.pop()
+                    && let Some(ValueId::Instruction(src)) = value
+                {
+                    if let Some(agg) = self.aggregate_values.get(src).cloned() {
+                        self.aggregate_values.insert(call_id, agg);
+                    } else if let Some(scalar) = self.insn_values.get(src).copied() {
+                        self.insn_values.insert(call_id, scalar);
+                    }
+                }
+
                 let addr = self.get_value(ctx, *ptr).unwrap();
                 let target = BasicBlock::from_addr(ctx, addr)
                     .ok_or_else(|| {
@@ -1178,6 +1206,39 @@ impl StandaloneEmulator {
                 self.block = target;
                 self.idx = 0;
                 return Ok(StepEvent::Return);
+            }
+
+            // Aggregate construction: evaluate each field and stash the field
+            // vector. Fields are scalar for the register write-set (nested
+            // aggregates, e.g. the RAM channel, are not modelled here yet).
+            Mnemonic::Tuple(Tuple { fields }) => {
+                let fields = fields.clone();
+                let mut vals: Vec<SizedValue> = Vec::with_capacity(fields.len());
+                for f in fields {
+                    let val = {
+                        let mut tmp = TempInterpreter {
+                            memory: &mut self.memory,
+                            insn_values: &mut self.insn_values,
+                            block_param_values: &mut self.block_param_values,
+                            ctx,
+                        };
+                        tmp.get_value(f)
+                    };
+                    vals.push(val.map_err(|kind| self.make_error(ctx, kind))?);
+                }
+                self.aggregate_values.insert(insn_id, vals);
+                self.idx += 1;
+            }
+
+            // Aggregate projection: pull field `index` out of the stashed vector.
+            Mnemonic::Extract(Extract { agg, index }) => {
+                if let ValueId::Instruction(agg_id) = agg
+                    && let Some(field) =
+                        self.aggregate_values.get(agg_id).and_then(|v| v.get(*index)).copied()
+                {
+                    self.insn_values.insert(insn_id, field);
+                }
+                self.idx += 1;
             }
 
             _ => {
