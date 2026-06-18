@@ -454,8 +454,17 @@ impl Mem2Reg<'_, '_> {
                 let Some(access) = MemoryAccess::from_mnemonic(insn.mnemonic()) else {
                     continue;
                 };
+                // A store whose source width differs from the access width would
+                // forward a mis-sized value — *unless* the source is a constant
+                // literal, which the renamer resizes (zero-extends/truncates) to
+                // each consumer's width on both the load and the phi-edge paths.
+                // This is the `MOV EAX, imm32` zero-extend-into-RAX lift: an 8-byte
+                // `store(RAX, imm:4)`. The store/forward semantics match (the
+                // emulator zero-fills the wider store too), so a literal source
+                // stays promotable; a non-literal width mismatch still disqualifies.
                 if let MemoryAccessKind::Store { src } = access.kind
                     && ValueRef::new(src, self.ctx).size() != access.size
+                    && !matches!(src, ValueId::Literal(_))
                 {
                     mixed_width.insert(access.ptr);
                 }
@@ -907,9 +916,9 @@ impl Mem2Reg<'_, '_> {
             // The block param has the var's width, but a reaching definition may be
             // narrower or wider (a literal stored through a wider access — the
             // `MOV EAX, imm32` zero-extend-into-RAX idiom — or a truncating store).
-            // Branch args bind to params without resizing, so the edge value must
-            // already match the param width. Resize before the branch, mirroring
-            // the load-forwarding path. A no-op when widths match.
+            // The emulator binds branch args to params without resizing, so the
+            // edge value must already match the param width. Resize before the
+            // branch, mirroring the load-forwarding path. A no-op when widths match.
             let param_size = BlockParam::from_id(self.ctx, param_id).size();
             let val = self.resize_forwarded_load_value(
                 edge.source_block,
