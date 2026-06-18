@@ -531,6 +531,16 @@ pub fn compute_stack_delta(
 /// the stack pointer is excluded from both as well: the delta models its effect
 /// precisely, so it is neither a data argument nor a clobber.
 pub fn set_function_summaries(ctx: &mut Context, function_id: FunctionId, stack_ptr: VarnodeId) {
+    // A functionalized (`pure_reg`) function's interface — its by-value input
+    // params and returned write-set — is owned by `argpromote_registers`. The
+    // legacy register-ABI summary (recomputing input/clobbered/saved/stack-delta
+    // from a conventional prologue/epilogue) does not model a functionalized body
+    // and would desync `input_regs` from the arguments `argpromote_registers`
+    // already bound at every call site. Leave its signature untouched.
+    if Function::from_id(ctx, function_id).is_pure_reg() {
+        return;
+    }
+
     let stack_delta = compute_stack_delta(ctx, function_id, stack_ptr);
 
     let saved_set: HashSet<VarnodeId> = compute_saved_regs(ctx, function_id).into_iter().collect();

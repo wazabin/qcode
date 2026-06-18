@@ -36,12 +36,12 @@ use qcode::{
     context::Context,
     types::AggregateField,
     value::{
-        BasicBlock, Function, FunctionId, Instruction, ValueId,
-        insn::{Call, Extract, InstructionId, Mnemonic, Return, Tuple},
+        Function, FunctionId, Instruction, ValueId,
+        insn::{Extract, InstructionId, Mnemonic, Return, Tuple},
     },
 };
 
-use crate::{Pass, PipelineEnv};
+use crate::{Pass, PipelineEnv, remove_entry_param};
 
 /// Bound on worklist iterations: each *changing* iteration strictly removes at
 /// least one param or returned field (a quantity bounded by the module), so this
@@ -118,118 +118,47 @@ fn dce_function(ctx: &mut Context, fid: FunctionId) {
     }
 }
 
-/// The root-block param whose name matches `name`, if present.
-fn root_param_named(ctx: &Context, root: qcode::value::BlockId, name: &str) -> Option<ValueId> {
-    BasicBlock::from_id(ctx, root)
-        .params()
-        .find(|p| p.name() == Some(name))
-        .map(|p| p.id())
-}
-
 // ---------------------------------------------------------------------------
 // dead arguments
 // ---------------------------------------------------------------------------
 
-/// Remove every input `fid` never reads: drop it from `signature.inputs`, delete
-/// its root param, and delete its positional argument at each direct caller.
-/// Records each caller in `touched`. Returns `true` if anything changed.
+/// Remove every input `fid` never reads. A `pure_reg` function's entry params
+/// are aligned index-for-index with `input_regs` and every caller's `Call.args`,
+/// so a param with no users is a dead argument; drop each through the shared
+/// [`remove_entry_param`], which keeps all three in lockstep. Records each caller
+/// in `touched`. Returns `true` if anything changed.
+///
+/// This is the same operation DCE's no-pred param sweep performs, so the two stay
+/// consistent; running it here as well lets the dead-signature worklist expose
+/// and reclaim dead args between return-field trims without a separate DCE round.
 fn trim_dead_args(
     ctx: &mut Context,
     fid: FunctionId,
     touched: &mut HashSet<FunctionId>,
 ) -> bool {
-    let inputs = match Function::from_id(ctx, fid).input_regs() {
-        Some(i) if !i.is_empty() => i.to_vec(),
-        _ => return false,
-    };
     let Some(root) = Function::from_id(ctx, fid).root().map(|b| b.id) else {
         return false;
     };
 
-    // Resolve each input's param name *before* mutating `inputs` (the name
-    // lookup indexes into it).
-    let names: Vec<Option<String>> = (0..inputs.len())
-        .map(|i| Function::from_id(ctx, fid).input_arg_name(i))
-        .collect();
-
-    // An input is dead when its root param is absent (already DCE'd) or has no
-    // users. A nameless input cannot be matched to a param, so keep it.
-    let keep: Vec<bool> = names
+    let params = ctx.values.basic_blocks[root].params.clone();
+    let dead: Vec<usize> = params
         .iter()
-        .map(|name| match name {
-            None => true,
-            Some(n) => match root_param_named(ctx, root, n) {
-                None => false,
-                Some(pid) => !ctx.users(pid).is_empty(),
-            },
-        })
+        .enumerate()
+        .filter(|(_, p)| ctx.users(**p).is_empty() && !ctx.values.block_params[**p].protected)
+        .map(|(i, _)| i)
         .collect();
-
-    if keep.iter().all(|&k| k) {
+    if dead.is_empty() {
         return false;
     }
 
-    // Names of the inputs being dropped, to remove the matching root params.
-    let dead_names: HashSet<&str> = names
-        .iter()
-        .zip(&keep)
-        .filter(|&(_, &k)| !k)
-        .filter_map(|(n, _)| n.as_deref())
-        .collect();
-
-    // Rebuild the root param list, dropping the dead params and reindexing.
-    let params = ctx.values.basic_blocks[root].params.clone();
-    let mut kept_params = Vec::with_capacity(params.len());
-    for param in params {
-        let is_dead = ctx.values.block_params[param]
-            .name
-            .as_deref()
-            .is_some_and(|n| dead_names.contains(n));
-        if is_dead {
-            ctx.values.block_params[param].parent = None;
-        } else {
-            ctx.values.block_params[param].index = kept_params.len();
-            kept_params.push(param);
+    for call_id in direct_call_sites(ctx, fid) {
+        if let Some(caller) = ctx.get_insn(call_id).function().map(|f| f.id) {
+            touched.insert(caller);
         }
     }
-    ctx.values.basic_blocks[root].params = kept_params;
-
-    // Drop the dead inputs from the signature.
-    let new_inputs: Vec<_> = inputs
-        .iter()
-        .zip(&keep)
-        .filter(|&(_, &k)| k)
-        .map(|(&v, _)| v)
-        .collect();
-    Function::from_id_mut(ctx, fid).set_input_regs(new_inputs);
-
-    // Drop the dead positional argument at every direct call site. A caller with
-    // fewer args than inputs (an incompletely-bound site) keeps whatever it has
-    // beyond the trimmed range.
-    for call_id in direct_call_sites(ctx, fid) {
-        let Mnemonic::Call(call) = ctx.get_insn(call_id).mnemonic().clone() else {
-            continue;
-        };
-        let new_args: Vec<ValueId> = call
-            .args
-            .iter()
-            .enumerate()
-            .filter(|(i, _)| keep.get(*i).copied().unwrap_or(true))
-            .map(|(_, &a)| a)
-            .collect();
-        if new_args.len() != call.args.len() {
-            if let Some(caller) = ctx.get_insn(call_id).function().map(|f| f.id) {
-                touched.insert(caller);
-            }
-            ctx.replace_instruction_mnemonic(
-                call_id,
-                Mnemonic::Call(Call {
-                    target: call.target,
-                    args: new_args,
-                    clobbers: call.clobbers,
-                }),
-            );
-        }
+    // Remove high index first so the lower indices stay valid.
+    for &index in dead.iter().rev() {
+        remove_entry_param(ctx, fid, index);
     }
 
     true
@@ -381,7 +310,7 @@ mod tests {
     use qcode::{
         builder::Builder,
         types::TypeId,
-        value::{BlockId, Varnode, VarnodeId},
+        value::{BasicBlock, BlockId, Varnode, VarnodeId, insn::Call},
     };
     use qcode_macro::qcode;
 

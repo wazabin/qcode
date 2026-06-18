@@ -86,6 +86,13 @@ pub fn brighten_stack(
     {
         let literal_id = make_stack_base(ctx, ptr_width);
         ctx.replace_all_uses_with(param, literal_id);
+        // The param is now user-less until `lower_stack` relabels `@stack_base`
+        // back onto it — but it is the real incoming stack pointer, not a dead
+        // argument. Protect it so the dead-param sweeps leave it (and its caller
+        // args) in place across this window.
+        if let ValueId::BlockParam(pid) = param {
+            ctx.values.block_params[pid].protected = true;
+        }
         return Ok(true);
     }
 

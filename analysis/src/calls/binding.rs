@@ -166,6 +166,18 @@ pub fn bind_call_args(ctx: &mut Context, function_id: FunctionId, stack_ptr: Var
         };
         let target = call.target;
 
+        // A functionalized (`pure_reg`) callee takes its inputs by value through
+        // `Call.args` (built by `argpromote_registers`, forwarded to precise SSA
+        // values by mem2reg) and the emulator binds its entry params from those
+        // args — so none of the legacy register-ABI work applies: re-binding would
+        // discard the precise args (notably the frame pointer), and the
+        // return-address slot rides the `@RSP` arg, so the stack-pointer relink /
+        // decrement and the return-address linkage are unnecessary. Memory-channel
+        // analysis (`mark_frame_escapes`) runs separately and still applies.
+        if Function::from_id(ctx, target).is_pure_reg() {
+            continue;
+        }
+
         // For a returning call: re-establish RSP across it when the callee's net
         // stack delta is known, link the pushed return address to the
         // continuation block, and decrement the stack-pointer register to the

@@ -3,5 +3,5 @@
 mod dead_insns;
 pub mod dead_load;
 
-pub use dead_insns::{dead_insns, remove_dead_insns};
+pub use dead_insns::{dead_insns, remove_dead_insns, remove_entry_param};
 pub use dead_load::{dead_load_insns, remove_dead_load_insns, remove_dead_load_insns_block};

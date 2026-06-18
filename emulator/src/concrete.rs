@@ -1233,8 +1233,11 @@ impl StandaloneEmulator {
             // Aggregate projection: pull field `index` out of the stashed vector.
             Mnemonic::Extract(Extract { agg, index }) => {
                 if let ValueId::Instruction(agg_id) = agg
-                    && let Some(field) =
-                        self.aggregate_values.get(agg_id).and_then(|v| v.get(*index)).copied()
+                    && let Some(field) = self
+                        .aggregate_values
+                        .get(agg_id)
+                        .and_then(|v| v.get(*index))
+                        .copied()
                 {
                     self.insn_values.insert(insn_id, field);
                 }
@@ -1324,6 +1327,54 @@ impl StandaloneEmulator {
         }
     }
 
+    /// Bind a functionalized (`pure_reg`) callee's entry params positionally from
+    /// the call's arguments, evaluated in the *caller's* frame.
+    ///
+    /// `argpromote_registers` makes such a callee a pure value function whose
+    /// inputs flow through `Call.args` (not ambient register state), so the args
+    /// are the source of truth — this replaces the register-file seeding
+    /// [`seed_entry_params`](Self::seed_entry_params) does for conventional
+    /// callees. The arg/param alignment invariant (`arg[i] ↔ param[i]`, built in
+    /// lockstep by argpromote and preserved by mem2reg + `remove_entry_param`)
+    /// makes the positional binding sound. Every arg is read before any param is
+    /// written, so a self-recursive call still sees the caller's values.
+    fn bind_entry_params_from_args(
+        &mut self,
+        ctx: &Context<'_>,
+        call_id: InstructionId,
+        target: FunctionId,
+    ) {
+        let args = match ctx.get_insn(call_id).mnemonic() {
+            Mnemonic::Call(call) => call.args.clone(),
+            _ => return,
+        };
+        let Some(root) = Function::from_id(ctx, target).root() else {
+            return;
+        };
+        let params: Vec<(BlockParamId, usize)> = BasicBlock::from_id(ctx, root.id)
+            .params()
+            .map(|p| (p.id, p.size()))
+            .collect();
+        if args.len() != params.len() {
+            // The alignment invariant is violated; fall back to register seeding
+            // rather than mis-bind by position.
+            self.seed_entry_params(ctx, target);
+            return;
+        }
+        // Evaluate every arg in the caller frame first (recursion-safe), then bind.
+        let values: Vec<SizedValue> = args
+            .iter()
+            .zip(&params)
+            .map(|(&arg, &(_, size))| {
+                let raw = self.get_value(ctx, arg).unwrap_or(0);
+                SizedValue::new(raw, size)
+            })
+            .collect();
+        for ((param_id, _), value) in params.into_iter().zip(values) {
+            self.block_param_values.insert(param_id, value);
+        }
+    }
+
     pub fn run_function(&mut self, ctx: &Context<'_>, func: FunctionId) -> crate::Result<()> {
         let root = Function::from_id(ctx, func)
             .root()
@@ -1350,9 +1401,16 @@ impl StandaloneEmulator {
                 StepEvent::DirectCallEntered(target) => {
                     call_depth += 1;
                     self.call_stack.push(target);
-                    // Pass arguments: bind the callee's entry params from the
-                    // registers the calling convention placed them in.
-                    self.seed_entry_params(ctx, target);
+                    // A functionalized (`pure_reg`) callee takes its inputs by
+                    // value through `Call.args`; a conventional callee reads them
+                    // from the register file the calling convention set up.
+                    if Function::from_id(ctx, target).is_pure_reg() {
+                        if let Some(&call_id) = self.call_site_stack.last() {
+                            self.bind_entry_params_from_args(ctx, call_id, target);
+                        }
+                    } else {
+                        self.seed_entry_params(ctx, target);
+                    }
                 }
                 StepEvent::IndirectCallEntered => {
                     call_depth += 1;
