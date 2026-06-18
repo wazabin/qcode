@@ -4,7 +4,11 @@ use qcode::{
     error::{Error, ErrorTy, Result},
     space::{Space, SpaceId, SpaceType},
     types::stack_base,
-    value::{BasicBlock, Function, FunctionId, RegisterId, ValueId, literal::Literal},
+    value::{
+        BasicBlock, BlockId, Function, FunctionId, RegisterId, ValueId,
+        insn::Mnemonic,
+        literal::Literal,
+    },
 };
 
 const STACK_NAME: &str = "stack";
@@ -64,11 +68,28 @@ pub fn brighten_stack(
         return Ok(false);
     }
 
-    let literal_id: ValueId = make_stack_base(ctx, ptr_width);
-
     let stack_ptr = ctx.get_register(stack_ptr);
     let reg_space_id = stack_ptr.space().id;
     let stack_ptr = stack_ptr.id();
+
+    // For a `pure_reg` function, `argpromote_registers` has already seeded the
+    // stack pointer from a by-value input param: `store(rsp_param, RSP)` is the
+    // first thing in the entry. Injecting a base store *ahead* of it (as below)
+    // would be immediately clobbered by that seed, so the symbolic origin would
+    // never reach mem2reg. Instead, replace every use of that param with
+    // `@stack_base` — including the seed (which becomes the base store) and any
+    // further use the param flowed to (e.g. a loop-header block argument). This
+    // makes the entry's stack-pointer origin identical to a non-functionalized
+    // function; the now-unused param is reclaimed by DCE / `dead_signature`.
+    if Function::from_id(ctx, function_id).is_pure_reg()
+        && let Some(param) = entry_stack_ptr_seed_param(ctx, root_id, stack_ptr, reg_space_id)
+    {
+        let literal_id = make_stack_base(ctx, ptr_width);
+        ctx.replace_all_uses_with(param, literal_id);
+        return Ok(true);
+    }
+
+    let literal_id: ValueId = make_stack_base(ctx, ptr_width);
 
     let mut builder = Builder::from_block(BasicBlock::from_id_mut(ctx, root_id));
     builder.set_insert_point_to_start();
@@ -76,6 +97,27 @@ pub fn brighten_stack(
     builder.push_store(literal_id, stack_ptr, reg_space_id);
 
     Ok(true)
+}
+
+/// The by-value param the argpromote register seed writes into the stack-pointer
+/// register (`store(rsp_param, RSP)` in register space) at entry — i.e. the
+/// `src` of that seed store, if present. Replacing every use of this param with
+/// `@stack_base` gives the stack pointer its symbolic origin in a functionalized
+/// function.
+fn entry_stack_ptr_seed_param(
+    ctx: &Context,
+    root_id: BlockId,
+    stack_ptr: ValueId,
+    reg_space: SpaceId,
+) -> Option<ValueId> {
+    BasicBlock::from_id(ctx, root_id).iter().find_map(|insn| {
+        match insn.mnemonic() {
+            Mnemonic::Store(store) if store.ptr == stack_ptr && store.space == reg_space => {
+                Some(store.src)
+            }
+            _ => None,
+        }
+    })
 }
 
 /// True if `root_id` already begins with the synthetic stack-base store this pass
@@ -245,6 +287,56 @@ mod tests {
             space_after_first, space_after_second,
             "stack space should be reused, not duplicated"
         );
+    }
+
+    /// For a `pure_reg` function the stack pointer is already seeded from an
+    /// input param at entry; brighten must redirect that seed to `@stack_base`
+    /// (not inject a second, clobbered store), leaving the param dead.
+    #[test]
+    fn redirects_rsp_seed_for_pure_reg_function() {
+        let mut ctx = Context::new();
+        let reg_id = setup_sp(&mut ctx);
+
+        qcode!(ctx, "fn test: <entry> goto <0x1001>;");
+
+        // Emulate argpromote_registers: a by-value param seeded into RSP at entry.
+        let sp_vn = ctx.get_register(reg_id).id();
+        let reg_space = ctx.get_register(reg_id).space().id;
+        let root_id = Function::from_id(&ctx, test).root().unwrap().id;
+        let param = {
+            let p = BasicBlock::from_id_mut(&mut ctx, root_id).push_param(8).id;
+            ValueId::BlockParam(p)
+        };
+        {
+            let mut b = Builder::from_block(BasicBlock::from_id_mut(&mut ctx, root_id));
+            b.set_insert_point_to_start();
+            unsafe { b.dont_finalize() };
+            b.push_store(param, sp_vn, reg_space);
+        }
+        Function::from_id_mut(&mut ctx, test).set_pure_reg(true);
+
+        assert!(brighten_stack(&mut ctx, test, reg_id).unwrap());
+
+        let root = Function::from_id(&ctx, test).root().unwrap();
+        let stores: Vec<_> = root
+            .iter()
+            .filter(|i| matches!(i.mnemonic(), Mnemonic::Store(_)))
+            .collect();
+        assert_eq!(stores.len(), 1, "the seed is redirected, not duplicated");
+        let Mnemonic::Store(store) = stores[0].mnemonic() else {
+            unreachable!()
+        };
+        assert!(
+            matches!(store.src, ValueId::Literal(_)),
+            "RSP is now seeded from the @stack_base literal"
+        );
+        assert!(
+            ctx.users(param).is_empty(),
+            "the input param that seeded RSP is now dead"
+        );
+
+        // Idempotent: re-running finds the base store and makes no change.
+        assert!(!brighten_stack(&mut ctx, test, reg_id).unwrap());
     }
 
     #[test]
