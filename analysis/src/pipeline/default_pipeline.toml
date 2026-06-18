@@ -161,16 +161,18 @@ scope = "function"
 passes = ["dce", "dead_store", "dce"]
 only_dirty = true
 
-# Interprocedural by-reference -> by-value parameter promotion. Runs once, late:
-# it needs bound call sites and the final lowered body to recognize the in/out
-# buffer pattern, and rewrites callee + every caller in one shot.
+# Functionalize memory side effects: rewrite a callee that mutates memory through
+# pointer params to operate on a private shadow copy and return its writes as a
+# `(address, value)` write-set, replayed at every caller. Runs once, late: it
+# needs bound call sites and the final lowered body, and rewrites callee + every
+# caller in one shot.
 [[stage]]
 name = "argpromote"
 scope = "module"
 passes = ["argpromote"]
 
-# Sweep the dead artifacts argpromote exposes: the callee's old `EAX <- ptr`
-# store and the caller's now-dead register loads it repointed.
+# Sweep the instructions the rewrite makes dead (redirected/forwarded loads and
+# stores, now-unused address computations).
 [[stage]]
 name = "argpromote-cleanup"
 scope = "function"

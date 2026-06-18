@@ -1,60 +1,61 @@
-//! `argpromote`: interprocedural by-reference → by-value parameter promotion.
+//! `argpromote`: functionalize a function's memory side effects via shadow
+//! memory and a returned write-set.
 //!
-//! Some functions take a pointer and mutate `*ptr` in place — an in/out
-//! parameter. This pass rewrites such a function so it takes the *value* and
-//! returns the new value, and hoists the load/store to every caller:
+//! Some functions mutate memory through pointer parameters (and globals). This
+//! pass rewrites such a function so it has no side effects: it operates on a
+//! private *shadow* copy of memory and *returns the writes it made* as data —
+//! a tuple of `(address, value)` pairs — which the caller replays:
 //!
 //! ```text
-//!   callee:  f(ptr)            -->  v = f(load(ptr));  store(ptr, v)   (caller)
+//!   void f(int *p, int *q) { *q = 100; *p += 1; }
+//!     callee:  f(p_ptr, q_ptr, p)  ->  return ((q_ptr, 100), (p_ptr, p + 1))
+//!     caller:  r = f(&x, &x, x);  store(&x, r.0); store(&x, r.1)
 //! ```
 //!
-//! It fires only when it can prove the rewrite is faithful (see [`analyze_param`]
-//! and [`try_promote`]):
+//! ## Why aliasing is handled
 //!
-//! * the parameter is a stack-passed pointer used *only* as the base of
-//!   loads/stores within a statically bounded, contiguous region of
-//!   1/2/4/8 bytes (the by-value width), plus the optional "return the pointer
-//!   in a register" passthrough;
-//! * the by-value width fits the pointer-sized parameter slot (it may be
-//!   *narrower* — e.g. a 4-byte `int*` on a 64-bit target — in which case the
-//!   caller zero-extends into the slot);
-//! * the function both reads and writes the region (a true in/out buffer);
-//! * it is the *only* promotable in/out parameter of its function — the promoted
-//!   value claims the function's single return channel ([`Return::value`]), so a
-//!   second one would have nowhere to go (lifting this needs an aggregate/tuple
-//!   return; see the module-level TODO);
-//! * no *other* parameter is a pointer the callee dereferences — otherwise it
-//!   could alias the promoted pointee, and hoisting the promoted read before the
-//!   call and its write after would reorder the two accesses across the call;
+//! Every dereferenced pointer parameter shares **one shadow space**, keyed by the
+//! real address values. When two pointers are equal they collide in the shadow,
+//! so a `load p` after a `store q` sees the written value — the value
+//! computation stays correct with no equality guards and no anti-alias gate. The
+//! writes are replayed by the caller in any order (aliased addresses carry the
+//! same final value), which preserves the caller-visible effect.
+//!
+//! ## Mechanism (see [`analyze_param`], [`try_promote`], [`apply`])
+//!
+//! * each dereferenced pointer param keeps its *address* and gains a by-value
+//!   snapshot of the bounded region it *reads* (1/2/4/8 bytes; write-only params
+//!   need no snapshot). The caller loads that snapshot and passes it in.
+//! * the callee seeds the shadow from the snapshot at entry, its loads/stores are
+//!   redirected into the shadow (the real address kept as the index), and at the
+//!   single return it reloads each written address and hands back the write-set
+//!   through [`Return::value`] as an [`Aggregate`](qcode::types::TypeRepr::Aggregate).
+//! * a real register-based return value is left untouched on its own channel.
+//!
+//! Eligibility (anything else leaves the function untouched):
+//!
+//! * at least one promoted pointer is written (otherwise nothing to move);
+//! * the function makes no call (composition of effectful callees is deferred);
+//! * it has a single return block (so written addresses dominate the return);
+//! * every dereferenced pointer is promotable — an address leaked to memory bails
+//!   the whole function, since promoting some-but-not-all would be unsound;
 //! * the function's address is never taken, so every caller is a direct
 //!   [`Call`] this pass can rewrite. NB: this assumes a *closed world* over
-//!   discovered code — a caller in code we never disassembled would still see
-//!   the old by-reference ABI. That gap is intentional and unguarded.
+//!   discovered code — a caller we never disassembled would still see the old
+//!   by-reference ABI. That gap is intentional and unguarded.
 //!
-//! A function that returns a real value through its normal output register is
-//! *not* excluded: that register return is left untouched and coexists with the
-//! promoted channel.
-//!
-//! Anything else makes the function ineligible and it is left untouched.
-//!
-//! ## Representation
-//!
-//! The callee keeps its dynamic byte indexing by spilling the incoming value
-//! into a fresh, private [`Temporary`](SpaceType::Temporary) address space (a
-//! distinct `SpaceId`, so it cannot alias anything), running the existing body
-//! against that buffer, and reloading it into [`Return::value`]. The call gains
-//! a result value the natural way — an instruction *is* the value it defines, so
-//! the call terminator is given a non-zero result width (`%r = call f(...)`),
-//! referenced in the continuation by the store-back. The old "return the pointer
-//! in EAX" store becomes dead; any caller that forwarded that register is
-//! repointed to the pointer it already holds.
+//! Out of scope for now: loops / dynamically-sized write sets, addresses loaded
+//! from memory (`**pp`), lifting register/stack effects, and effectful-callee
+//! composition. See `ARGPROMOTE_DESIGN.md`.
+
+use std::borrow::Cow;
 
 use qcode::{
     builder::Builder,
     context::Context,
     space::SpaceType,
     value::{
-        BasicBlock, BlockId, Function, FunctionId, Instruction, Value, ValueId, Varnode, VarnodeId,
+        BasicBlock, Function, FunctionId, Instruction, Value, ValueId, Varnode, VarnodeId,
         insn::{Binop, Call, InstructionId, IntBinop, Mnemonic},
     },
 };
@@ -73,29 +74,42 @@ pub fn argpromote(ctx: &mut Context) -> bool {
     changed
 }
 
-/// A proven-promotable parameter and the IR sites the rewrite must touch.
-struct Plan {
-    /// The pointer parameter (a root block param), as a value.
+/// A dereferenced pointer parameter slated for promotion, and the IR sites the
+/// rewrite must touch.
+struct Promoted {
+    /// The pointer parameter (a root block param) — its *address* value, kept in
+    /// the rewritten function as the shadow-space index and write-set address.
     param: ValueId,
-    /// The parameter's display name, used to find its call-argument index.
-    param_name: String,
-    /// By-value width in bytes (the bounded region size); one of 1/2/4/8.
-    region_size: usize,
-    /// Width in bytes of the pointer-sized parameter slot the value rides in.
-    /// `>= region_size`; when strictly greater the caller zero-extends into it.
-    slot_width: usize,
-    /// `param + offset` address computations to rebase onto the local buffer.
-    adds: Vec<InstructionId>,
-    /// Load/store instructions whose space must switch to the local buffer.
+    /// Display name, used to name the added by-value snapshot param and to find
+    /// the parameter's call-argument index.
+    name: String,
+    /// Call-argument index of the pointer parameter.
+    arg_idx: usize,
+    /// By-value width in bytes (the bounded region the body touches); 1/2/4/8.
+    region: usize,
+    /// Load/store instructions whose space must switch to the shadow space.
     accesses: Vec<InstructionId>,
-    /// The optional `store(register R <- param)` passthrough (the "return the
-    /// pointer in a register" idiom): its instruction and the register R that
-    /// callers may read as the returned pointer. `None` for functions that
-    /// return void or return a real value through their normal output register —
-    /// both are fine, because the promoted value rides an orthogonal channel
-    /// (`Return::value` / the call's result), which nothing outside this pass
-    /// reads. Only the returns-the-pointer idiom needs the cleanup in [`apply`].
-    passthrough: Option<(InstructionId, VarnodeId)>,
+    /// Distinct `(address, size)` of each store target written through this
+    /// parameter — one write-set entry per address.
+    write_targets: Vec<(ValueId, usize)>,
+}
+
+/// How a named parameter is used, deciding whether it is promoted.
+enum ParamUse {
+    /// Not used as a load/store base — left untouched (e.g. a pointer used only
+    /// in arithmetic and returned, or a plain integer).
+    NonPointer,
+    /// A dereferenced pointer with a bounded region; promote it.
+    Deref {
+        region: usize,
+        accesses: Vec<InstructionId>,
+        write_targets: Vec<(ValueId, usize)>,
+    },
+    /// Dereferenced *and* the address leaks somewhere this pass cannot follow
+    /// (stored to memory, mixed deref/non-deref arithmetic). Promoting some but
+    /// not all dereferenced pointers would be unsound, so this bails the whole
+    /// function.
+    Escape,
 }
 
 fn try_promote(ctx: &mut Context, fid: FunctionId) -> bool {
@@ -115,31 +129,79 @@ fn try_promote(ctx: &mut Context, fid: FunctionId) -> bool {
         return false;
     }
 
-    // Candidate parameters: every named root parameter. Stack-passed inputs have
-    // a nameless varnode, so we key off the param itself (its name maps it to a
-    // call-argument index via `input_arg_name`) rather than a varnode lookup.
-    let candidates: Vec<(ValueId, usize, String)> = BasicBlock::from_id(ctx, root)
+    // Composition is out of scope: a callee with its own memory effects would
+    // have to bubble its write-set up through ours. Bail if this function calls
+    // anything.
+    if function_makes_call(ctx, fid) {
+        return false;
+    }
+
+    // A single return block keeps every written address dominating the return,
+    // so the write-set can load each one's final value there.
+    let returns: Vec<InstructionId> = Function::from_id(ctx, fid)
+        .iter()
+        .filter_map(|b| {
+            let last = b.iter().last()?;
+            matches!(last.mnemonic(), Mnemonic::Return(_)).then_some(last.id)
+        })
+        .collect();
+    let &[ret_id] = returns.as_slice() else {
+        return false;
+    };
+
+    // Classify every named root parameter. Dereferenced pointers are promoted and
+    // share one shadow space (so aliasing among them stays correct); a leaked
+    // address bails the whole function; everything else is left as-is.
+    let candidates: Vec<(ValueId, String)> = BasicBlock::from_id(ctx, root)
         .params()
-        .filter_map(|p| Some((p.id(), p.size(), p.name()?.to_string())))
+        .filter_map(|p| Some((p.id(), p.name()?.to_string())))
         .collect();
 
-    for (param, width, name) in &candidates {
-        // Anti-aliasing cut: refuse if any *other* parameter is a pointer the
-        // callee dereferences. It could alias the promoted pointee, and the
-        // rewrite moves the promoted access to the other side of the call.
-        if candidates
-            .iter()
-            .any(|(other, _, _)| other != param && param_is_memory_base(ctx, *other))
-        {
-            continue;
-        }
-        if let Some(plan) = analyze_param(ctx, *param, *width, name.clone())
-            && apply(ctx, fid, plan)
-        {
-            return true;
+    let mut promoted: Vec<Promoted> = Vec::new();
+    for (param, name) in candidates {
+        match analyze_param(ctx, param) {
+            ParamUse::NonPointer => {}
+            ParamUse::Escape => return false,
+            ParamUse::Deref {
+                region,
+                accesses,
+                write_targets,
+            } => {
+                let Some(arg_idx) = arg_index_of(ctx, fid, &name) else {
+                    return false;
+                };
+                promoted.push(Promoted {
+                    param,
+                    name,
+                    arg_idx,
+                    region,
+                    accesses,
+                    write_targets,
+                });
+            }
         }
     }
-    false
+
+    // Nothing to move to the caller unless some promoted pointer is written.
+    if promoted.iter().all(|p| p.write_targets.is_empty()) {
+        return false;
+    }
+
+    apply(ctx, fid, promoted, ret_id)
+}
+
+/// `true` if `function_id` makes any call (direct or indirect).
+fn function_makes_call(ctx: &Context, function_id: FunctionId) -> bool {
+    Function::from_id(ctx, function_id).blocks().any(|b| {
+        b.iter()
+            .any(|i| matches!(i.mnemonic(), Mnemonic::Call(_) | Mnemonic::CallInd(_)))
+    })
+}
+
+/// The call-argument index whose synthesized name matches `name`.
+fn arg_index_of(ctx: &Context, fid: FunctionId, name: &str) -> Option<usize> {
+    let len = Function::from_id(ctx, fid).input_regs().map_or(0, |i| i.len());
+    (0..len).find(|&i| Function::from_id(ctx, fid).input_arg_name(i).as_deref() == Some(name))
 }
 
 /// `true` if `fid`'s address is used as a value anywhere (stored, passed, or the
@@ -151,154 +213,125 @@ fn is_address_taken(ctx: &Context, fid: FunctionId) -> bool {
         .any(|insn| insn.mnemonic().args().contains(&target))
 }
 
-/// `true` if `param` is dereferenced as a pointer: used directly as a load/store
-/// address, or as `param + offset` feeding one. Used to reject promotion when a
-/// *second* parameter could alias the promoted buffer.
-fn param_is_memory_base(ctx: &Context, param: ValueId) -> bool {
-    ctx.users(param).iter().any(|&uid| {
-        match ctx.get_insn(uid).mnemonic() {
-            Mnemonic::Load(l) => l.ptr == param,
-            Mnemonic::Store(s) => s.ptr == param,
-            Mnemonic::Binop(b)
-                if matches!(b.op, Binop::Int(IntBinop::Add))
-                    && (b.lhs == param || b.rhs == param) =>
-            {
-                let add_val = ValueId::Instruction(uid);
-                ctx.users(add_val).iter().any(|&u2| {
-                    matches!(
-                        ctx.get_insn(u2).mnemonic(),
-                        Mnemonic::Load(_) | Mnemonic::Store(_)
-                    )
-                })
-            }
-            _ => false,
-        }
-    })
-}
-
 fn is_register(ctx: &Context, vn: VarnodeId) -> bool {
     matches!(Varnode::from_id(ctx, vn).space().ty, SpaceType::Register)
 }
 
-/// Classify every use of `param` and, if it is a bounded in/out buffer pointer
-/// that never escapes, return the [`Plan`] describing how to promote it.
-fn analyze_param(
-    ctx: &Context,
-    param: ValueId,
-    ptr_width: usize,
-    param_name: String,
-) -> Option<Plan> {
-    let mut adds = Vec::new();
-    // (load/store insn, offset value (None == 0), access size, is_store)
-    let mut accesses: Vec<(InstructionId, Option<ValueId>, usize, bool)> = Vec::new();
-    let mut passthrough: Option<(InstructionId, VarnodeId)> = None;
-    let mut has_in = false;
-    let mut has_out = false;
+/// Classify how `param` is used (see [`ParamUse`]). Collects the loads/stores to
+/// redirect into the shadow space, the distinct write targets, and the by-value
+/// snapshot width (bounded by the *reads* — writes may land at any offset).
+fn analyze_param(ctx: &Context, param: ValueId) -> ParamUse {
+    let mut accesses: Vec<InstructionId> = Vec::new();
+    // (load insn, offset value (None == 0), size) — used only to bound the read
+    // region the by-value snapshot must cover.
+    let mut reads: Vec<(InstructionId, Option<ValueId>, usize)> = Vec::new();
+    let mut write_targets: Vec<(ValueId, usize)> = Vec::new();
+    let mut is_deref = false;
 
     for uid in ctx.users(param).to_vec() {
         match ctx.get_insn(uid).mnemonic().clone() {
-            // param ± offset address computation feeding loads/stores.
+            // param ± offset address computation.
             Mnemonic::Binop(b)
                 if matches!(b.op, Binop::Int(IntBinop::Add))
                     && (b.lhs == param || b.rhs == param) =>
             {
                 let offset = if b.lhs == param { b.rhs } else { b.lhs };
                 let add_val = ValueId::Instruction(uid);
+                let mut any = false;
+                let mut all = true;
                 for u2 in ctx.users(add_val).to_vec() {
                     match ctx.get_insn(u2).mnemonic().clone() {
                         Mnemonic::Load(l) if l.ptr == add_val => {
-                            accesses.push((u2, Some(offset), l.size, false));
-                            has_in = true;
+                            any = true;
+                            accesses.push(u2);
+                            reads.push((u2, Some(offset), l.size));
                         }
                         Mnemonic::Store(s) if s.ptr == add_val => {
-                            accesses.push((u2, Some(offset), s.size, true));
-                            has_out = true;
+                            any = true;
+                            accesses.push(u2);
+                            write_targets.push((add_val, s.size));
                         }
-                        // The address escaped to a non-load/store use.
-                        _ => return None,
+                        _ => all = false,
                     }
                 }
-                adds.push(uid);
+                if any {
+                    is_deref = true;
+                    // The dereferenced address also flowed somewhere we cannot
+                    // follow — unsound to shadow.
+                    if !all {
+                        return ParamUse::Escape;
+                    }
+                }
+                // `!any`: pure address arithmetic (e.g. `return p + k`) — fine.
             }
             // Direct access at offset 0.
             Mnemonic::Load(l) if l.ptr == param => {
-                accesses.push((uid, None, l.size, false));
-                has_in = true;
+                is_deref = true;
+                accesses.push(uid);
+                reads.push((uid, None, l.size));
             }
             Mnemonic::Store(s) if s.ptr == param => {
-                accesses.push((uid, None, s.size, true));
-                has_out = true;
+                is_deref = true;
+                accesses.push(uid);
+                write_targets.push((param, s.size));
             }
-            // The tolerated passthrough: `store(register R <- param)`.
-            Mnemonic::Store(s) if s.src == param => {
-                let ValueId::Varnode(reg) = s.ptr else {
-                    return None;
-                };
-                if !is_register(ctx, reg) || passthrough.is_some() {
-                    return None;
-                }
-                passthrough = Some((uid, reg));
+            // The address stored as a *value* into memory leaks it (a store into
+            // a register is the harmless "return the pointer" idiom).
+            Mnemonic::Store(s)
+                if s.src == param
+                    && !matches!(s.ptr, ValueId::Varnode(vn) if is_register(ctx, vn)) =>
+            {
+                return ParamUse::Escape;
             }
-            // Any other use escapes the pointer.
-            _ => return None,
+            // Any other use treats the address as data (returned, compared,
+            // branched, returned in a register). Harmless: the address is a value
+            // the caller owns.
+            _ => {}
         }
     }
 
-    // Only true in/out buffers. The passthrough is optional: void- and
-    // value-returning functions have none, and that is fine.
-    if !(has_in && has_out) {
-        return None;
+    if !is_deref {
+        return ParamUse::NonPointer;
     }
 
-    // Bound the accessed region. An unbounded offset yields a huge `region_end`
-    // that fails the width check below, so no separate Top test is needed.
+    // The snapshot must cover every offset *read*. An unbounded (e.g. loop-driven)
+    // offset yields a huge region that fails the width check. A write-only param
+    // needs no snapshot (region 0): its store precedes the write-set reload.
     let mut region_end: u64 = 0;
-    for (insn, offset, size, _) in &accesses {
-        let block = ctx.get_insn(*insn).parent().map(|b| b.id)?;
+    for (insn, offset, size) in &reads {
+        let Some(block) = ctx.get_insn(*insn).parent().map(|b| b.id) else {
+            return ParamUse::Escape;
+        };
         let hi = match offset {
             None => 0,
             Some(off) => value_range(ctx, *off, block).max,
         };
         region_end = region_end.max(hi.saturating_add(*size as u64));
     }
-
-    let region_size = region_end as usize;
-    if !matches!(region_size, 1 | 2 | 4 | 8) {
-        return None;
-    }
-    // The by-value width must *fit* the pointer-sized parameter slot. It may be
-    // narrower (e.g. a 4-byte `int*` on a 64-bit target): the caller zero-extends
-    // the loaded value into the slot and the callee reads back the low bytes. A
-    // region wider than the slot has nowhere to ride, so it is rejected.
-    if region_size > ptr_width {
-        return None;
+    let region = region_end as usize;
+    if region != 0 && !matches!(region, 1 | 2 | 4 | 8) {
+        return ParamUse::Escape;
     }
 
-    Some(Plan {
-        param,
-        param_name,
-        region_size,
-        slot_width: ptr_width,
-        adds,
-        accesses: accesses.iter().map(|a| a.0).collect(),
-        passthrough,
-    })
+    // Dedup write targets by address value.
+    let mut deduped: Vec<(ValueId, usize)> = Vec::new();
+    for wt in write_targets {
+        if !deduped.iter().any(|(a, _)| *a == wt.0) {
+            deduped.push(wt);
+        }
+    }
+
+    ParamUse::Deref {
+        region,
+        accesses,
+        write_targets: deduped,
+    }
 }
 
-/// Apply a promotion: rewrite the callee body and every direct caller. Returns
-/// `false` (leaving the function untouched) if a precondition fails late.
-fn apply(ctx: &mut Context, fid: FunctionId, plan: Plan) -> bool {
-    // Caller plumbing needs the input index of the promoted param: the input
-    // whose synthesized argument name matches the param's name.
-    let inputs_len = Function::from_id(ctx, fid)
-        .input_regs()
-        .map_or(0, |i| i.len());
-    let arg_idx = (0..inputs_len).find(|&i| {
-        Function::from_id(ctx, fid).input_arg_name(i).as_deref() == Some(plan.param_name.as_str())
-    });
-    let Some(arg_idx) = arg_idx else {
-        return false;
-    };
+/// Rewrite `fid` and every direct caller into the shadow-memory / write-set form.
+/// `ret_id` is the function's single `Return`. Returns `false` if a precondition
+/// fails late (e.g. no callers).
+fn apply(ctx: &mut Context, fid: FunctionId, mut promoted: Vec<Promoted>, ret_id: InstructionId) -> bool {
     let call_sites: Vec<InstructionId> = ctx
         .instructions()
         .filter_map(|insn| match insn.mnemonic() {
@@ -310,84 +343,88 @@ fn apply(ctx: &mut Context, fid: FunctionId, plan: Plan) -> bool {
         return false;
     }
 
-    let region = plan.region_size;
-    let slot_width = plan.slot_width;
     let ram = ctx.default_space;
-    let buf_space = ctx.make_temp_space();
-    // A space-typed base pointer: distinct per buffer space, so the alias
-    // analysis's "one space per pointer value" invariant holds across functions.
-    // Addresses use the native pointer (slot) width; the *value* load/stores
-    // below use `region`.
-    let base_ty = ctx.types.get_or_make_space_address(slot_width, buf_space);
-    let base0 = ctx.get_typed_const(0, base_ty).id();
-    let int_region = ctx.types.get_or_make_int(region);
+    // One private shadow space shared by every promoted pointer, keyed by the
+    // real address values: equal addresses collide here, so aliasing among the
+    // pointers stays correct without any anti-alias gate.
+    let shadow = ctx.make_temp_space();
+    let root = Function::from_id(ctx, fid).root().map(|b| b.id).unwrap();
+
+    // Deterministic order shared by the callee (param creation) and the callers
+    // (snapshot argument order).
+    promoted.sort_by_key(|p| p.arg_idx);
 
     // ---- callee rewrite -----------------------------------------------------
 
-    // Spill the incoming value into the private buffer at function entry.
-    let root = Function::from_id(ctx, fid).root().map(|b| b.id).unwrap();
-    {
+    // Add a by-value snapshot parameter per *read* region and seed the shadow
+    // with it at entry. Write-only params (region 0) need no snapshot.
+    let mut snapshots: Vec<(ValueId, ValueId, usize)> = Vec::new(); // (ptr_param, snapshot, region)
+    for p in &promoted {
+        if p.region == 0 {
+            continue;
+        }
+        let val_pid = BasicBlock::from_id_mut(ctx, root).push_param(p.region).id;
+        ctx.values.block_params[val_pid].name = Some(Cow::Owned(format!("{}_val", p.name)));
+        snapshots.push((p.param, ValueId::BlockParam(val_pid), p.region));
+    }
+    if !snapshots.is_empty() {
         let mut b = Builder::from_block(BasicBlock::from_id_mut(ctx, root));
         b.set_insert_point_to_start();
-        b.push_store(plan.param, base0, buf_space);
-    }
-
-    // Rebase `param + offset` onto the buffer base (0).
-    for &add in &plan.adds {
-        let mut m = ctx.get_insn(add).mnemonic().clone();
-        m.replace_value(plan.param, base0);
-        ctx.replace_instruction_mnemonic(add, m);
-    }
-
-    // Point the loads/stores at the buffer space (and at base 0 for direct ones).
-    for &acc in &plan.accesses {
-        let mut m = ctx.get_insn(acc).mnemonic().clone();
-        match &mut m {
-            Mnemonic::Load(l) => {
-                l.space = buf_space;
-                if l.ptr == plan.param {
-                    l.ptr = base0;
-                }
-            }
-            Mnemonic::Store(s) => {
-                s.space = buf_space;
-                if s.ptr == plan.param {
-                    s.ptr = base0;
-                }
-            }
-            _ => {}
+        for (ptr, snap, _region) in &snapshots {
+            b.push_store(*snap, *ptr, shadow);
         }
-        ctx.replace_instruction_mnemonic(acc, m);
     }
 
-    // Drop the "return the pointer" passthrough, if any; the value return
-    // replaces it. Void- and value-returning functions have none.
-    if let Some((passthrough_insn, _)) = plan.passthrough {
-        ctx.remove_instruction(passthrough_insn);
+    // Redirect every promoted load/store into the shadow space, keeping the real
+    // address as the index.
+    for p in &promoted {
+        for &acc in &p.accesses {
+            let mut m = ctx.get_insn(acc).mnemonic().clone();
+            match &mut m {
+                Mnemonic::Load(l) => l.space = shadow,
+                Mnemonic::Store(s) => s.space = shadow,
+                _ => {}
+            }
+            ctx.replace_instruction_mnemonic(acc, m);
+        }
     }
 
-    // Reload the buffer and hand it back through Return.value at each return.
-    let ret_sites: Vec<(BlockId, InstructionId)> = Function::from_id(ctx, fid)
-        .iter()
-        .filter_map(|b| {
-            let last = b.iter().last()?;
-            matches!(last.mnemonic(), Mnemonic::Return(_)).then(|| (b.id, last.id))
-        })
-        .collect();
-    for (blk, ret_id) in ret_sites {
-        let ret_val = {
-            let mut b = Builder::from_block(BasicBlock::from_id_mut(ctx, blk));
-            b.set_insert_point_before(ret_id);
-            b.push_load::<false>(base0, region, buf_space).id()
-        };
+    // The distinct write targets across all promoted params, in a stable order.
+    let mut write_targets: Vec<(ValueId, usize)> = Vec::new();
+    for p in &promoted {
+        for wt in &p.write_targets {
+            if !write_targets.iter().any(|(a, _)| *a == wt.0) {
+                write_targets.push(*wt);
+            }
+        }
+    }
+
+    // Build the write-set `((addr, final_value), …)` from the shadow at the
+    // single return, and hand it back through `Return::value`. A real
+    // register-based return is left untouched on its own channel.
+    let ret_block = ctx.get_insn(ret_id).parent().map(|b| b.id).unwrap();
+    let writeset_val = {
+        let mut b = Builder::from_block(BasicBlock::from_id_mut(ctx, ret_block));
+        b.set_insert_point_before(ret_id);
+        let mut pairs: Vec<ValueId> = Vec::new();
+        for (addr, size) in &write_targets {
+            let v = b.push_load::<false>(*addr, *size, shadow).id();
+            let pair = b.push_tuple(vec![*addr, v]).id;
+            pairs.push(ValueId::Instruction(pair));
+        }
+        ValueId::Instruction(b.push_tuple(pairs).id)
+    };
+    {
         let mut m = ctx.get_insn(ret_id).mnemonic().clone();
         if let Mnemonic::Return(ref mut r) = m {
-            r.value = Some(ret_val);
+            r.value = Some(writeset_val);
         }
         ctx.replace_instruction_mnemonic(ret_id, m);
     }
+    let writeset_ty = ctx.type_of(writeset_val);
 
     // ---- caller rewrite -----------------------------------------------------
+    let n_writes = write_targets.len();
     for call_id in call_sites {
         let Some(call_block) = ctx.get_insn(call_id).parent().map(|b| b.id) else {
             continue;
@@ -396,26 +433,20 @@ fn apply(ctx: &mut Context, fid: FunctionId, plan: Plan) -> bool {
             Mnemonic::Call(c) => (c.target, c.args, c.clobbers),
             _ => continue,
         };
-        if arg_idx >= args.len() {
-            continue;
-        }
-        let p = args[arg_idx];
 
-        // Load the region value just before the call and pass it by value,
-        // zero-extending into the (wider) pointer-sized parameter slot when the
-        // value is narrower. The callee reads back the low `region` bytes.
-        let in_val = {
+        // Pass each read-region snapshot by value, loaded from the pointer arg.
+        let mut new_args = args.clone();
+        {
             let mut b = Builder::from_block(BasicBlock::from_id_mut(ctx, call_block));
             b.set_insert_point_before(call_id);
-            let loaded = b.push_load::<false>(p, region, ram).id();
-            if region < slot_width {
-                b.push_zext(loaded, slot_width).id()
-            } else {
-                loaded
+            for p in &promoted {
+                if p.region == 0 || p.arg_idx >= args.len() {
+                    continue;
+                }
+                let snap = b.push_load::<false>(args[p.arg_idx], p.region, ram).id();
+                new_args.push(snap);
             }
-        };
-        let mut new_args = args.clone();
-        new_args[arg_idx] = in_val;
+        }
         ctx.replace_instruction_mnemonic(
             call_id,
             Mnemonic::Call(Call {
@@ -424,9 +455,10 @@ fn apply(ctx: &mut Context, fid: FunctionId, plan: Plan) -> bool {
                 clobbers,
             }),
         );
-        // The call now produces the returned value.
-        Instruction::from_id_mut(ctx, call_id).set_type(int_region);
+        // The call now produces the write-set aggregate.
+        Instruction::from_id_mut(ctx, call_id).set_type(writeset_ty);
 
+        // Replay each returned `(addr, value)` write into real memory.
         let Some(cont) = BasicBlock::from_id(ctx, call_block)
             .successors()
             .next()
@@ -434,42 +466,18 @@ fn apply(ctx: &mut Context, fid: FunctionId, plan: Plan) -> bool {
         else {
             continue;
         };
-        // Store the returned value back into the caller's buffer.
-        {
-            let mut b = Builder::from_block(BasicBlock::from_id_mut(ctx, cont));
-            b.set_insert_point_to_start();
-            b.push_store(ValueId::Instruction(call_id), p, ram);
-        }
-        // For the returns-the-pointer idiom only: any forward of the old
-        // "returned pointer" register now reads the value channel; repoint it to
-        // the pointer the caller already holds.
-        if let Some((_, return_reg)) = plan.passthrough {
-            fixup_returned_pointer(ctx, cont, return_reg, p);
+        let result = ValueId::Instruction(call_id);
+        let mut b = Builder::from_block(BasicBlock::from_id_mut(ctx, cont));
+        b.set_insert_point_to_start();
+        for i in 0..n_writes {
+            let pair = ValueId::Instruction(b.push_extract(result, i).id);
+            let addr = ValueId::Instruction(b.push_extract(pair, 0).id);
+            let val = ValueId::Instruction(b.push_extract(pair, 1).id);
+            b.push_store(val, addr, ram);
         }
     }
 
     true
-}
-
-/// Replace, in `block`, reads of `reg` (the callee's old "returned pointer"
-/// register) with `p`, up to the point `reg` is redefined. The now-dead register
-/// loads are left for DCE.
-fn fixup_returned_pointer(ctx: &mut Context, block: BlockId, reg: VarnodeId, p: ValueId) {
-    let regv = ValueId::Varnode(reg);
-    let insns: Vec<InstructionId> = BasicBlock::from_id(ctx, block)
-        .iter()
-        .map(|i| i.id)
-        .collect();
-    for id in insns {
-        match ctx.get_insn(id).mnemonic().clone() {
-            // reg redefined here: later reads see the new value, stop.
-            Mnemonic::Store(s) if s.ptr == regv => break,
-            Mnemonic::Load(l) if l.ptr == regv => {
-                ctx.replace_all_uses_with(ValueId::Instruction(id), p);
-            }
-            _ => {}
-        }
-    }
 }
 
 #[derive(Default)]
@@ -489,7 +497,7 @@ crate::register_module_pass!(ArgPromote);
 
 #[cfg(test)]
 mod tests {
-    use qcode::value::Function;
+    use qcode::value::{BlockId, Function};
     use qcode_macro::qcode;
 
     use super::*;
@@ -571,47 +579,6 @@ mod tests {
     }
 
     #[test]
-    fn rejects_second_dereferenced_pointer_param() {
-        let mut tc = qcode::testing::TestContext::new();
-        let in0 = stack_input(&mut tc, 4, 8); // stack_10000004
-        let in1 = stack_input(&mut tc, 16, 8); // stack_10000010
-
-        qcode!(
-            tc.ctx,
-            "
-            fn f2:
-                <f2_entry @stack_10000004:i64 @stack_10000010:i64>
-                    %v = load(i32, @stack_10000004);
-                    store(@stack_10000004, %v);
-                    %w = load(i32, @stack_10000010);
-                    store(@stack_10000010, %w);
-                    return [i64 0];
-
-            fn g:
-                <g_entry>
-                    goto <g_call>;
-                <g_call>
-                    call <f2>;
-                <g_cont>
-                    return [i64 0];
-            "
-        );
-        let _ = g;
-        Function::from_id_mut(&mut tc.ctx, f2).set_input_regs(vec![in0, in1]);
-        let a = tc.ctx.get_const(0x4000, 8).id();
-        let b = tc.ctx.get_const(0x5000, 8).id();
-        set_call(&mut tc, g_call, f2, vec![a, b]);
-        tc.ctx.add_cfg_edge(g_call, g_cont);
-
-        // Both params are dereferenced pointers that could alias at the call
-        // site, so neither may be promoted (the blunt v1 anti-aliasing cut).
-        assert!(
-            !argpromote(&mut tc.ctx),
-            "a callee with a second dereferenced pointer param must be left untouched"
-        );
-    }
-
-    #[test]
     fn noop_when_no_promotable_param() {
         let mut ctx = Context::new();
         qcode!(
@@ -625,5 +592,298 @@ mod tests {
         assert!(Function::from_id(&ctx, foo).root().is_some());
         // No pointer parameters, no callers: nothing to promote, and no panic.
         assert!(!argpromote(&mut ctx));
+    }
+
+    // ---- TDD acceptance suite for the shadow-memory / write-set redesign ----
+    //
+    // These encode the worked examples from the design (see ARGPROMOTE_DESIGN.md).
+    // They are `#[ignore]`d until the shadow-memory rewrite lands: the current
+    // single-buffer pass does not yet produce the `(real_return, write-set)`
+    // aggregate return, nor replay it at the caller. Each test builds the
+    // pre-transformation callee + a caller, runs `argpromote`, and asserts the
+    // caller-observable contract: one replayed `store` per write-set entry. The
+    // exact aggregate nesting is an implementation detail and deliberately not
+    // asserted here.
+
+    /// Number of `store` instructions the caller replays after the call — i.e.
+    /// in the call block's continuation. The new design emits one per write-set
+    /// `(address, value)` pair returned by the callee.
+    fn replayed_stores(tc: &qcode::testing::TestContext, call_id: InstructionId) -> usize {
+        let Some(call_block) = Instruction::from_id(&tc.ctx, call_id).parent().map(|b| b.id) else {
+            return 0;
+        };
+        let Some(cont) = BasicBlock::from_id(&tc.ctx, call_block)
+            .successors()
+            .next()
+            .map(|(_, b)| b)
+        else {
+            return 0;
+        };
+        BasicBlock::from_id(&tc.ctx, cont)
+            .iter()
+            .filter(|i| matches!(i.mnemonic(), Mnemonic::Store(_)))
+            .count()
+    }
+
+    /// `void f(int *p, int *q) { *q = 100; *p += 1; }`
+    /// → `((q_ptr, 100), (p_ptr, p + 1))`. The aliasing example: with both
+    /// pointers sharing `shadow_ram`, `f(&x, &x)` stays correct, and the caller
+    /// replays two writes. (This is the case v1 *rejects*.)
+    #[test]
+    fn example_two_inout_pointers() {
+        let mut tc = qcode::testing::TestContext::new();
+        let in_p = stack_input(&mut tc, 4, 8); // stack_10000004
+        let in_q = stack_input(&mut tc, 16, 8); // stack_10000010
+        qcode!(
+            tc.ctx,
+            "
+            fn f:
+                <f_entry @stack_10000004:i64 @stack_10000010:i64>
+                    store(@stack_10000010, i32 100);
+                    %v = load(i32, @stack_10000004);
+                    %s = %v + i32 1;
+                    store(@stack_10000004, %s);
+                    return [i64 0];
+
+            fn g:
+                <g_entry>
+                    goto <g_call>;
+                <g_call>
+                    call <f>;
+                <g_cont>
+                    return [i64 0];
+            "
+        );
+        let _ = g;
+        Function::from_id_mut(&mut tc.ctx, f).set_input_regs(vec![in_p, in_q]);
+        let a = tc.ctx.get_const(0x4000, 8).id();
+        let b = tc.ctx.get_const(0x5000, 8).id();
+        let call_id = set_call(&mut tc, g_call, f, vec![a, b]);
+        tc.ctx.add_cfg_edge(g_call, g_cont);
+
+        assert!(argpromote(&mut tc.ctx), "both in/out pointers should be promoted");
+        assert_eq!(replayed_stores(&tc, call_id), 2, "two writes => two replays");
+    }
+
+    /// `void foo(int *p) { *p += 10; }`
+    /// → `(intptr, int) foo(intptr p_ptr, int p) { return (p_ptr, p + 10); }`.
+    #[test]
+    fn example_single_inout_void() {
+        let mut tc = qcode::testing::TestContext::new();
+        let in_p = stack_input(&mut tc, 4, 8);
+        qcode!(
+            tc.ctx,
+            "
+            fn foo:
+                <foo_entry @stack_10000004:i64>
+                    %v = load(i32, @stack_10000004);
+                    %s = %v + i32 10;
+                    store(@stack_10000004, %s);
+                    return [i64 0];
+
+            fn g:
+                <g_entry>
+                    goto <g_call>;
+                <g_call>
+                    call <foo>;
+                <g_cont>
+                    return [i64 0];
+            "
+        );
+        let _ = g;
+        Function::from_id_mut(&mut tc.ctx, foo).set_input_regs(vec![in_p]);
+        let a = tc.ctx.get_const(0x4000, 8).id();
+        let call_id = set_call(&mut tc, g_call, foo, vec![a]);
+        tc.ctx.add_cfg_edge(g_call, g_cont);
+
+        assert!(argpromote(&mut tc.ctx));
+        assert_eq!(replayed_stores(&tc, call_id), 1);
+    }
+
+    /// `int* foo(int* p) { *p += 10; return p; }`
+    /// → `(intptr, (intptr, int)) foo(intptr p_ptr, int p) { return (p_ptr, (p_ptr, p + 10)); }`.
+    /// A real return value coexists with the write-set.
+    #[test]
+    fn example_inout_returns_pointer() {
+        let mut tc = qcode::testing::TestContext::new();
+        let in_p = stack_input(&mut tc, 4, 8);
+        let r0 = tc.r0; // the real-return register
+        qcode!(
+            tc.ctx,
+            "
+            fn foo:
+                <foo_entry @stack_10000004:i64>
+                    %v = load(i32, @stack_10000004);
+                    %s = %v + i32 10;
+                    store(@stack_10000004, %s);
+                    store({r0}, @stack_10000004);
+                    return [i64 0];
+
+            fn g:
+                <g_entry>
+                    goto <g_call>;
+                <g_call>
+                    call <foo>;
+                <g_cont>
+                    return [i64 0];
+            "
+        );
+        let _ = g;
+        Function::from_id_mut(&mut tc.ctx, foo).set_input_regs(vec![in_p]);
+        let a = tc.ctx.get_const(0x4000, 8).id();
+        let call_id = set_call(&mut tc, g_call, foo, vec![a]);
+        tc.ctx.add_cfg_edge(g_call, g_cont);
+
+        assert!(argpromote(&mut tc.ctx));
+        // One write replayed; the returned pointer rides the real-return channel.
+        assert_eq!(replayed_stores(&tc, call_id), 1);
+    }
+
+    /// `int foo(int* p) { p += 10; *p = 5; }`
+    /// → `(intptr, int) foo(intptr p_ptr, int p) { return (p_ptr + 10, 5); }`.
+    /// A write through an *advanced* pointer: the returned address is `p + 10`.
+    #[test]
+    fn example_write_through_advanced_pointer() {
+        let mut tc = qcode::testing::TestContext::new();
+        let in_p = stack_input(&mut tc, 4, 8);
+        qcode!(
+            tc.ctx,
+            "
+            fn foo:
+                <foo_entry @stack_10000004:i64>
+                    %adv = @stack_10000004 + i64 40;
+                    store(%adv, i32 5);
+                    return [i64 0];
+
+            fn g:
+                <g_entry>
+                    goto <g_call>;
+                <g_call>
+                    call <foo>;
+                <g_cont>
+                    return [i64 0];
+            "
+        );
+        let _ = g;
+        Function::from_id_mut(&mut tc.ctx, foo).set_input_regs(vec![in_p]);
+        let a = tc.ctx.get_const(0x4000, 8).id();
+        let call_id = set_call(&mut tc, g_call, foo, vec![a]);
+        tc.ctx.add_cfg_edge(g_call, g_cont);
+
+        assert!(argpromote(&mut tc.ctx));
+        assert_eq!(replayed_stores(&tc, call_id), 1);
+    }
+
+    /// `int foo(int *p) { return *p + 10; }`
+    /// → `int foo(int p) { return p + 10; }`. A read-only pointer collapses to a
+    /// by-value scalar: no write-set, so the caller replays nothing.
+    #[test]
+    fn example_read_only_pointer_has_no_writeset() {
+        let mut tc = qcode::testing::TestContext::new();
+        let in_p = stack_input(&mut tc, 4, 8);
+        let r0 = tc.r0;
+        qcode!(
+            tc.ctx,
+            "
+            fn foo:
+                <foo_entry @stack_10000004:i64>
+                    %v = load(i32, @stack_10000004);
+                    %s = %v + i32 10;
+                    store({r0}, %s);
+                    return [i64 0];
+
+            fn g:
+                <g_entry>
+                    goto <g_call>;
+                <g_call>
+                    call <foo>;
+                <g_cont>
+                    return [i64 0];
+            "
+        );
+        let _ = g;
+        Function::from_id_mut(&mut tc.ctx, foo).set_input_regs(vec![in_p]);
+        let a = tc.ctx.get_const(0x4000, 8).id();
+        let call_id = set_call(&mut tc, g_call, foo, vec![a]);
+        tc.ctx.add_cfg_edge(g_call, g_cont);
+
+        argpromote(&mut tc.ctx);
+        assert_eq!(replayed_stores(&tc, call_id), 0, "read-only pointer writes nothing back");
+    }
+
+    /// `int* foo(int *p) { return p + 10; }`
+    /// → `intptr foo(intptr p) { return p + 10; }`. Pure pointer arithmetic, no
+    /// dereference: nothing to mirror, no write-set.
+    #[test]
+    fn example_pointer_arithmetic_only_has_no_writeset() {
+        let mut tc = qcode::testing::TestContext::new();
+        let in_p = stack_input(&mut tc, 4, 8);
+        let r0 = tc.r0;
+        qcode!(
+            tc.ctx,
+            "
+            fn foo:
+                <foo_entry @stack_10000004:i64>
+                    %adv = @stack_10000004 + i64 40;
+                    store({r0}, %adv);
+                    return [i64 0];
+
+            fn g:
+                <g_entry>
+                    goto <g_call>;
+                <g_call>
+                    call <foo>;
+                <g_cont>
+                    return [i64 0];
+            "
+        );
+        let _ = g;
+        Function::from_id_mut(&mut tc.ctx, foo).set_input_regs(vec![in_p]);
+        let a = tc.ctx.get_const(0x4000, 8).id();
+        let call_id = set_call(&mut tc, g_call, foo, vec![a]);
+        tc.ctx.add_cfg_edge(g_call, g_cont);
+
+        argpromote(&mut tc.ctx);
+        assert_eq!(replayed_stores(&tc, call_id), 0, "no dereference => no write-set");
+    }
+
+    /// `(int*, int, int) f1(int* p_ptr, int p, int q) { return (p_ptr, p + 1, 100); }`
+    /// The flat multi-value illustration: one write through `p` plus a real
+    /// return, producing a multi-element functional return. Modeled here as
+    /// `*p += 1` with an `int` return of `100`; the caller replays the single
+    /// write while the `100` rides the real-return channel.
+    #[test]
+    fn example_multi_value_return() {
+        let mut tc = qcode::testing::TestContext::new();
+        let in_p = stack_input(&mut tc, 4, 8);
+        let r0 = tc.r0;
+        qcode!(
+            tc.ctx,
+            "
+            fn f1:
+                <f1_entry @stack_10000004:i64>
+                    %v = load(i32, @stack_10000004);
+                    %s = %v + i32 1;
+                    store(@stack_10000004, %s);
+                    store({r0}, i32 100);
+                    return [i64 0];
+
+            fn g:
+                <g_entry>
+                    goto <g_call>;
+                <g_call>
+                    call <f1>;
+                <g_cont>
+                    return [i64 0];
+            "
+        );
+        let _ = g;
+        Function::from_id_mut(&mut tc.ctx, f1).set_input_regs(vec![in_p]);
+        let a = tc.ctx.get_const(0x4000, 8).id();
+        let call_id = set_call(&mut tc, g_call, f1, vec![a]);
+        tc.ctx.add_cfg_edge(g_call, g_cont);
+
+        assert!(argpromote(&mut tc.ctx));
+        assert_eq!(replayed_stores(&tc, call_id), 1);
     }
 }

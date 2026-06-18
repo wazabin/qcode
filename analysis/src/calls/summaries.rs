@@ -20,8 +20,9 @@ use qcode::{
     context::Context,
     space::SpaceType,
     value::{
-        BasicBlock, BlockId, Function, FunctionId, Instruction, ValueId, Varnode, VarnodeId,
-        insn::Mnemonic,
+        BasicBlock, BlockId, BlockParam, Function, FunctionId, Instruction, ValueId, Varnode,
+        VarnodeId,
+        insn::{Binop, IntBinop, Mnemonic},
     },
 };
 
@@ -163,6 +164,124 @@ fn function_makes_unbounded_call(ctx: &Context, function_id: FunctionId) -> bool
         }
     }
     false
+}
+
+/// True when `function_id` *writes* through a stack-passed pointer parameter at
+/// an unbounded offset — e.g. walking the pointer across a loop. Such a store
+/// mutates memory the *caller* owns at an offset this function does not bound, so
+/// a caller that passes a pointer into its own frame must keep that frame in
+/// memory. A bounded write (`*p` or `*(p + const)`) or a mere *read* through such
+/// a pointer is not enough — only an unbounded write counts (see the unit tests).
+fn function_writes_through_stack_arg(ctx: &Context, function_id: FunctionId) -> bool {
+    let ram = ctx.default_space;
+    for block in Function::from_id(ctx, function_id).blocks() {
+        for insn in block.iter() {
+            if let Mnemonic::Store(s) = insn.mnemonic()
+                && s.space == ram
+            {
+                let mut visited = HashSet::new();
+                let (derives, dynamic) = trace_stack_arg_pointer(ctx, s.ptr, &mut visited);
+                if derives && dynamic {
+                    return true;
+                }
+            }
+        }
+    }
+    false
+}
+
+/// Trace `v` back toward a stack-passed pointer parameter. Returns
+/// `(derives, dynamic)`: whether `v` derives from such a parameter, and whether
+/// the path to it carries a non-constant (loop- or index-driven) offset.
+fn trace_stack_arg_pointer(
+    ctx: &Context,
+    v: ValueId,
+    visited: &mut HashSet<ValueId>,
+) -> (bool, bool) {
+    if !visited.insert(v) {
+        return (false, false);
+    }
+    match v {
+        ValueId::BlockParam(pid) => {
+            let param = BlockParam::from_id(ctx, pid);
+            // A stack-input parameter: promoted from a caller-frame slot at or
+            // above the return-address slot. This is the static pointer base.
+            if let Some(origin) = param.origin()
+                && let Some((offset, ptr_width)) = stack_slot_offset(ctx, origin)
+                && offset >= ptr_width as i64
+            {
+                return (true, false);
+            }
+            // A merge/loop-carried parameter: follow its incoming values. Reaching
+            // a stack arg through such a param means the pointer varies (the
+            // induction pointer of a loop), which is the unbounded case.
+            let Some(block) = param.parent().map(|b| b.id) else {
+                return (false, false);
+            };
+            let index = param.index();
+            let derives = incoming_values(ctx, block, index)
+                .into_iter()
+                .any(|incoming| trace_stack_arg_pointer(ctx, incoming, visited).0);
+            (derives, derives)
+        }
+        ValueId::Instruction(iid) => match ctx.get_insn(iid).mnemonic().clone() {
+            Mnemonic::Binop(b)
+                if matches!(b.op, Binop::Int(IntBinop::Add | IntBinop::Sub)) =>
+            {
+                let (ld, ldyn) = trace_stack_arg_pointer(ctx, b.lhs, visited);
+                let (rd, rdyn) = trace_stack_arg_pointer(ctx, b.rhs, visited);
+                let derives = ld || rd;
+                // The operand that does not derive from the pointer is the offset;
+                // a non-constant offset makes the access unbounded.
+                let mut dynamic = ldyn || rdyn;
+                if ld && !matches!(b.rhs, ValueId::Literal(_)) {
+                    dynamic = true;
+                }
+                if rd && !matches!(b.lhs, ValueId::Literal(_)) {
+                    dynamic = true;
+                }
+                (derives, derives && dynamic)
+            }
+            _ => (false, false),
+        },
+        _ => (false, false),
+    }
+}
+
+/// The values flowing into parameter `index` of `block` from its predecessors'
+/// branch arguments.
+fn incoming_values(ctx: &Context, block: BlockId, index: usize) -> Vec<ValueId> {
+    let preds: Vec<BlockId> = BasicBlock::from_id(ctx, block)
+        .predecessors()
+        .map(|(_, p)| p)
+        .collect();
+    let mut out = Vec::new();
+    for pred in preds {
+        let Some(term) = BasicBlock::from_id(ctx, pred).iter().last() else {
+            continue;
+        };
+        match term.mnemonic() {
+            Mnemonic::Branch(br) if br.target == block => {
+                if let Some(&a) = br.args.get(index) {
+                    out.push(a);
+                }
+            }
+            Mnemonic::CBranch(cb) => {
+                if cb.success_block == block
+                    && let Some(&a) = cb.success_args.get(index)
+                {
+                    out.push(a);
+                }
+                if cb.failure_block == block
+                    && let Some(&a) = cb.failure_args.get(index)
+                {
+                    out.push(a);
+                }
+            }
+            _ => {}
+        }
+    }
+    out
 }
 
 /// True when `vn` lives in a register address space.
@@ -440,7 +559,8 @@ pub fn set_function_summaries(ctx: &mut Context, function_id: FunctionId, stack_
     let reads_unbounded = Function::from_id(ctx, function_id).reads_unbounded_stack()
         || stack_unbounded
         || has_dynamic_stack_pointer_deref(ctx, function_id)
-        || function_makes_unbounded_call(ctx, function_id);
+        || function_makes_unbounded_call(ctx, function_id)
+        || function_writes_through_stack_arg(ctx, function_id);
 
     // Append the stack parameters as stack-space varnodes (offset/size carriers,
     // distinguished from register inputs by their space). `bind_call_args`
