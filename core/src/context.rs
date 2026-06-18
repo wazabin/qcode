@@ -582,6 +582,20 @@ impl<'str> Context<'str> {
         }
     }
 
+    /// Returns the stored [`TypeId`] for value kinds that carry one directly.
+    ///
+    /// Unlike [`Context::type_of`], this never interns fallback integer types,
+    /// so it works from immutable formatting and parsing paths. Varnodes,
+    /// blocks, and functions return `None`.
+    pub fn stored_type_of(&self, id: ValueId) -> Option<crate::types::TypeId> {
+        match id {
+            ValueId::Literal(lid) => Some(self.values.literals[lid].type_id),
+            ValueId::Instruction(iid) => Some(self.values.instructions[iid].type_id),
+            ValueId::BlockParam(pid) => Some(self.values.block_params[pid].type_id),
+            ValueId::Varnode(_) | ValueId::BasicBlock(_) | ValueId::Function(_) => None,
+        }
+    }
+
     /// Return all instructions that use `value` as an operand.
     pub fn users(&self, value: impl Into<ValueId>) -> &[InstructionId] {
         self.values.users_of(value.into())

@@ -57,7 +57,7 @@ pub trait Type: Send + Sync {
     }
 
     /// The ordered field types, if this is an [`AggregateType`].
-    fn fields(&self) -> Option<&[TypeId]> {
+    fn fields(&self) -> Option<&[AggregateField]> {
         None
     }
 
@@ -85,13 +85,43 @@ pub trait Type: Send + Sync {
 /// maps exactly.
 #[derive(Clone, serde::Serialize, serde::Deserialize)]
 pub enum TypeRepr {
-    Int { size: usize },
-    StackAddress { size: usize, space: Option<SpaceId> },
-    SpaceAddress { size: usize, space: SpaceId },
-    /// A fixed, ordered group of field types — the functional-IR representation
-    /// of a tuple. Used by `argpromote` to return `(real_return, write-set)`.
-    /// Abstract: it has no physical return-register ABI.
-    Aggregate { fields: Vec<TypeId> },
+    Int {
+        size: usize,
+    },
+    StackAddress {
+        size: usize,
+        space: Option<SpaceId>,
+    },
+    SpaceAddress {
+        size: usize,
+        space: SpaceId,
+    },
+    /// A fixed, ordered group of named field types — the functional-IR
+    /// representation of a tuple. Used by `argpromote` to return
+    /// `(real_return, write-set)`. Abstract: it has no physical return-register
+    /// ABI.
+    Aggregate {
+        fields: Vec<AggregateField>,
+    },
+}
+
+/// One field of an aggregate type.
+///
+/// Field names are part of aggregate identity, but still only name the slots:
+/// instructions store and project by the slot's numeric index internally.
+#[derive(Clone, Debug, Hash, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct AggregateField {
+    pub name: String,
+    pub type_id: TypeId,
+}
+
+impl AggregateField {
+    pub fn new(name: impl Into<String>, type_id: TypeId) -> Self {
+        Self {
+            name: name.into(),
+            type_id,
+        }
+    }
 }
 
 impl Clone for Box<dyn Type> {
@@ -234,7 +264,7 @@ impl Type for SpaceAddress {
 /// never lowered to a physical ABI, so the value is informational only).
 #[derive(Clone)]
 struct AggregateType {
-    fields: Vec<TypeId>,
+    fields: Vec<AggregateField>,
     size: usize,
 }
 
@@ -243,7 +273,7 @@ impl Type for AggregateType {
         self.size
     }
 
-    fn fields(&self) -> Option<&[TypeId]> {
+    fn fields(&self) -> Option<&[AggregateField]> {
         Some(&self.fields)
     }
 
@@ -276,8 +306,8 @@ pub struct TypeManager {
     stack_address: Option<TypeId>,
     /// Fast lookup: (size, space) → SpaceAddress TypeId.
     space_address: HashMap<(usize, SpaceId), TypeId>,
-    /// Fast lookup: field-type list → Aggregate TypeId.
-    aggregate_by_fields: HashMap<Vec<TypeId>, TypeId>,
+    /// Fast lookup: named field-type list → Aggregate TypeId.
+    aggregate_by_fields: HashMap<Vec<AggregateField>, TypeId>,
 }
 
 impl Default for TypeManager {
@@ -343,15 +373,32 @@ impl TypeManager {
         id
     }
 
-    /// Returns the [`TypeId`] for an [`AggregateType`] with the given ordered
-    /// field types, creating it if it does not yet exist. Each field type must
+    /// Returns the [`TypeId`] for an [`AggregateType`] with default field names
+    /// (`field1`, `field2`, ...), creating it if it does not yet exist.
+    pub fn get_or_make_aggregate(&mut self, fields: Vec<TypeId>) -> TypeId {
+        let fields = fields
+            .into_iter()
+            .enumerate()
+            .map(|(i, type_id)| AggregateField::new(format!("field{}", i + 1), type_id))
+            .collect();
+        self.get_or_make_named_aggregate(fields)
+    }
+
+    /// Returns the [`TypeId`] for an [`AggregateType`] with the given ordered,
+    /// named fields, creating it if it does not yet exist. Each field type must
     /// already be registered (it always is in practice: you build the field
     /// types before grouping them).
-    pub fn get_or_make_aggregate(&mut self, fields: Vec<TypeId>) -> TypeId {
+    pub fn get_or_make_named_aggregate(&mut self, fields: Vec<AggregateField>) -> TypeId {
+        for (i, field) in fields.iter().enumerate() {
+            assert!(
+                !fields[..i].iter().any(|prev| prev.name == field.name),
+                "aggregate field names must be unique"
+            );
+        }
         if let Some(&id) = self.aggregate_by_fields.get(&fields) {
             return id;
         }
-        let size = fields.iter().map(|&f| self.size_of(f)).sum();
+        let size = fields.iter().map(|f| self.size_of(f.type_id)).sum();
         let id = self.register(Box::new(AggregateType {
             fields: fields.clone(),
             size,
@@ -360,15 +407,31 @@ impl TypeManager {
         id
     }
 
-    /// The ordered field types of `id`, or `None` if `id` is not an aggregate.
-    pub fn aggregate_fields(&self, id: TypeId) -> Option<&[TypeId]> {
+    /// The ordered named fields of `id`, or `None` if `id` is not an aggregate.
+    pub fn aggregate_fields(&self, id: TypeId) -> Option<&[AggregateField]> {
         self.get(id).fields()
     }
 
     /// The type of field `index` of aggregate `id`, if `id` is an aggregate with
     /// at least `index + 1` fields.
     pub fn field_type(&self, id: TypeId, index: usize) -> Option<TypeId> {
-        self.aggregate_fields(id)?.get(index).copied()
+        self.aggregate_fields(id)?
+            .get(index)
+            .map(|field| field.type_id)
+    }
+
+    /// The name of field `index` of aggregate `id`, if it exists.
+    pub fn field_name(&self, id: TypeId, index: usize) -> Option<&str> {
+        self.aggregate_fields(id)?
+            .get(index)
+            .map(|field| field.name.as_str())
+    }
+
+    /// The index of field `name` of aggregate `id`, if it exists.
+    pub fn field_index(&self, id: TypeId, name: &str) -> Option<usize> {
+        self.aggregate_fields(id)?
+            .iter()
+            .position(|field| field.name == name)
     }
 
     /// Returns a reference to the concrete [`Type`] for `id`.
@@ -524,7 +587,7 @@ impl<'de> serde::Deserialize<'de> for TypeManager {
                 // Field types have lower TypeIds (built before the aggregate),
                 // so replaying in order guarantees they already exist here.
                 TypeRepr::Aggregate { fields } => {
-                    manager.get_or_make_aggregate(fields);
+                    manager.get_or_make_named_aggregate(fields);
                 }
             }
         }

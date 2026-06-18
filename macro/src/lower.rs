@@ -1,5 +1,5 @@
 use qcode_parser::ast::{
-    Atom, BlockParamDecl, CastOp, ExprNode, FnDecl, Label, Statement, TypedAtom,
+    Atom, BlockParamDecl, CastOp, ExprNode, ExtractField, FnDecl, Label, Statement, TypedAtom,
 };
 use quote::{format_ident, quote};
 use std::collections::HashMap;
@@ -1147,26 +1147,50 @@ fn lower_expr(
         ExprNode::Tuple { fields } => {
             let field_tokens = fields
                 .iter()
-                .map(|f| lower_atom(f, None, locals, pcode_root))
+                .map(|f| lower_atom(&f.value, None, locals, pcode_root))
                 .collect::<syn::Result<Vec<_>>>()?;
+            let field_names = fields
+                .iter()
+                .enumerate()
+                .map(|(i, f)| f.name.clone().unwrap_or_else(|| format!("field{}", i + 1)))
+                .collect::<Vec<_>>();
             Ok(quote! {
                 {
-                    let __qcode_fields: Vec<#pcode_root::value::ValueId> =
-                        vec![#(#field_tokens),*];
-                    __qcode_builder.push_tuple(__qcode_fields).id
+                    let __qcode_fields: Vec<(String, #pcode_root::value::ValueId)> =
+                        vec![#((String::from(#field_names), #field_tokens)),*];
+                    __qcode_builder.push_named_tuple(__qcode_fields).id
                 }
             })
         }
 
-        ExprNode::Extract { agg, index } => {
+        ExprNode::Extract { agg, field } => {
             let agg_tokens = lower_atom(agg, None, locals, pcode_root)?;
-            let idx = *index as usize;
-            Ok(quote! {
-                {
-                    let __qcode_agg = #agg_tokens;
-                    __qcode_builder.push_extract(__qcode_agg, #idx).id
+            match field {
+                ExtractField::Index(index) => {
+                    let idx = *index as usize;
+                    Ok(quote! {
+                        {
+                            let __qcode_agg = #agg_tokens;
+                            __qcode_builder.push_extract(__qcode_agg, #idx).id
+                        }
+                    })
                 }
-            })
+                ExtractField::Name(name) => Ok(quote! {
+                    {
+                        let __qcode_agg = #agg_tokens;
+                        let __qcode_agg_ty = __qcode_builder
+                            .context()
+                            .stored_type_of(__qcode_agg)
+                            .expect("qcode extract: aggregate value has no stored type");
+                        let __qcode_field = __qcode_builder
+                            .context()
+                            .types
+                            .field_index(__qcode_agg_ty, #name)
+                            .expect("qcode extract: aggregate does not have the named field");
+                        __qcode_builder.push_extract(__qcode_agg, __qcode_field).id
+                    }
+                }),
+            }
         }
     }
 }

@@ -70,6 +70,13 @@ name = "seed-clobbers"
 scope = "module"
 passes = ["seed_clobbers"]
 
+# Functionalize register side effects while register load/stores are still
+# explicit (before brighten abstracts RSP to @stack_base).
+[[stage]]
+name = "argpromote-registers"
+scope = "module"
+passes = ["argpromote_registers"]
+
 # Value-producing passes, per function (the pre-bind group).
 [[stage]]
 name = "brighten"

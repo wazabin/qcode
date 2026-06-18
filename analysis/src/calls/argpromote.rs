@@ -54,6 +54,7 @@ use qcode::{
     builder::Builder,
     context::Context,
     space::{SpaceId, SpaceType},
+    types::AggregateField,
     value::{
         BasicBlock, Function, FunctionId, Instruction, Value, ValueId, Varnode, VarnodeId,
         insn::{Binop, Call, InstructionId, IntBinop, Mnemonic},
@@ -200,7 +201,9 @@ fn function_makes_call(ctx: &Context, function_id: FunctionId) -> bool {
 
 /// The call-argument index whose synthesized name matches `name`.
 fn arg_index_of(ctx: &Context, fid: FunctionId, name: &str) -> Option<usize> {
-    let len = Function::from_id(ctx, fid).input_regs().map_or(0, |i| i.len());
+    let len = Function::from_id(ctx, fid)
+        .input_regs()
+        .map_or(0, |i| i.len());
     (0..len).find(|&i| Function::from_id(ctx, fid).input_arg_name(i).as_deref() == Some(name))
 }
 
@@ -331,7 +334,12 @@ fn analyze_param(ctx: &Context, param: ValueId) -> ParamUse {
 /// Rewrite `fid` and every direct caller into the shadow-memory / write-set form.
 /// `ret_id` is the function's single `Return`. Returns `false` if a precondition
 /// fails late (e.g. no callers).
-fn apply(ctx: &mut Context, fid: FunctionId, mut promoted: Vec<Promoted>, ret_id: InstructionId) -> bool {
+fn apply(
+    ctx: &mut Context,
+    fid: FunctionId,
+    mut promoted: Vec<Promoted>,
+    ret_id: InstructionId,
+) -> bool {
     let call_sites: Vec<InstructionId> = ctx
         .instructions()
         .filter_map(|insn| match insn.mnemonic() {
@@ -409,10 +417,17 @@ fn apply(ctx: &mut Context, fid: FunctionId, mut promoted: Vec<Promoted>, ret_id
         let mut pairs: Vec<ValueId> = Vec::new();
         for (addr, size) in &write_targets {
             let v = b.push_load::<false>(*addr, *size, shadow).id();
-            let pair = b.push_tuple(vec![*addr, v]).id;
+            let pair = b
+                .push_named_tuple(vec![("addr".to_owned(), *addr), ("value".to_owned(), v)])
+                .id;
             pairs.push(ValueId::Instruction(pair));
         }
-        ValueId::Instruction(b.push_tuple(pairs).id)
+        let fields = pairs
+            .into_iter()
+            .enumerate()
+            .map(|(i, value)| (format!("write{}", i + 1), value))
+            .collect();
+        ValueId::Instruction(b.push_named_tuple(fields).id)
     };
     {
         let mut m = ctx.get_insn(ret_id).mnemonic().clone();
@@ -684,11 +699,22 @@ fn rewrite_callee_registers(ctx: &mut Context, fid: FunctionId, eff: &RegisterEf
         let tuple_val = {
             let mut b = Builder::from_block(BasicBlock::from_id_mut(ctx, ret_block));
             b.set_insert_point_before(ret_id);
-            let fields: Vec<ValueId> = output_meta
+            let fields: Vec<(String, ValueId)> = output_meta
                 .iter()
-                .map(|(r, size, space)| b.push_load::<false>(ValueId::Varnode(*r), *size, *space).id())
+                .map(|(r, size, space)| {
+                    let name = {
+                        let v = Varnode::from_id(b.context(), *r);
+                        v.name()
+                            .map(str::to_owned)
+                            .unwrap_or_else(|| format!("output{}", usize::from(*r) + 1))
+                    };
+                    let value = b
+                        .push_load::<false>(ValueId::Varnode(*r), *size, *space)
+                        .id();
+                    (name, value)
+                })
                 .collect();
-            ValueId::Instruction(b.push_tuple(fields).id)
+            ValueId::Instruction(b.push_named_tuple(fields).id)
         };
         let mut m = ctx.get_insn(ret_id).mnemonic().clone();
         if let Mnemonic::Return(ref mut r) = m {
@@ -743,12 +769,23 @@ fn try_promote_registers(ctx: &mut Context, fid: FunctionId) -> bool {
     rewrite_callee_registers(ctx, fid, &eff);
 
     // The flat positional write-set type: one integer field per output register.
-    let field_tys: Vec<_> = eff
+    let fields: Vec<_> = eff
         .outputs
         .iter()
-        .map(|&r| ctx.types.get_or_make_int(Varnode::from_id(ctx, r).size()))
+        .map(|&r| {
+            let (name, size) = {
+                let v = Varnode::from_id(ctx, r);
+                (
+                    v.name()
+                        .map(str::to_owned)
+                        .unwrap_or_else(|| format!("output{}", usize::from(r) + 1)),
+                    v.size(),
+                )
+            };
+            AggregateField::new(name, ctx.types.get_or_make_int(size))
+        })
         .collect();
-    let writeset_ty = ctx.types.get_or_make_aggregate(field_tys);
+    let writeset_ty = ctx.types.get_or_make_named_aggregate(fields);
 
     let meta = |ctx: &Context, regs: &[VarnodeId]| -> Vec<(VarnodeId, usize, SpaceId)> {
         regs.iter()
@@ -792,11 +829,20 @@ fn rewrite_caller_registers(
         let mut b = Builder::from_block(BasicBlock::from_id_mut(ctx, call_block));
         b.set_insert_point_before(call_id);
         for (r, size, space) in input_meta {
-            let v = b.push_load::<false>(ValueId::Varnode(*r), *size, *space).id();
+            let v = b
+                .push_load::<false>(ValueId::Varnode(*r), *size, *space)
+                .id();
             args.push(v);
         }
     }
-    ctx.replace_instruction_mnemonic(call_id, Mnemonic::Call(Call { target, args, clobbers }));
+    ctx.replace_instruction_mnemonic(
+        call_id,
+        Mnemonic::Call(Call {
+            target,
+            args,
+            clobbers,
+        }),
+    );
     Instruction::from_id_mut(ctx, call_id).set_type(writeset_ty);
 
     // Outputs: replay the returned final values into register space.
@@ -867,7 +913,12 @@ mod tests {
     }
 
     /// Find the (single) call instruction in `block` and give it `args`.
-    fn set_call(tc: &mut qcode::testing::TestContext, block: BlockId, target: FunctionId, args: Vec<ValueId>) -> InstructionId {
+    fn set_call(
+        tc: &mut qcode::testing::TestContext,
+        block: BlockId,
+        target: FunctionId,
+        args: Vec<ValueId>,
+    ) -> InstructionId {
         let call_id = BasicBlock::from_id(&tc.ctx, block)
             .iter()
             .find(|i| matches!(i.mnemonic(), Mnemonic::Call(_)))
@@ -875,7 +926,11 @@ mod tests {
             .id;
         tc.ctx.replace_instruction_mnemonic(
             call_id,
-            Mnemonic::Call(Call { target, args, clobbers: vec![] }),
+            Mnemonic::Call(Call {
+                target,
+                args,
+                clobbers: vec![],
+            }),
         );
         call_id
     }
@@ -936,10 +991,14 @@ mod tests {
         let _ = crate::gvn_function(&mut tc.ctx, g, Some(&aliases));
 
         // gvn cannot see into the opaque call result, so the extract must remain.
-        let has_extract = Function::from_id(&tc.ctx, g)
-            .iter()
-            .any(|b| b.iter().any(|i| matches!(i.mnemonic(), Mnemonic::Extract(_))));
-        assert!(has_extract, "extract of an aggregate call result must survive mem2reg+gvn");
+        let has_extract = Function::from_id(&tc.ctx, g).iter().any(|b| {
+            b.iter()
+                .any(|i| matches!(i.mnemonic(), Mnemonic::Extract(_)))
+        });
+        assert!(
+            has_extract,
+            "extract of an aggregate call result must survive mem2reg+gvn"
+        );
     }
 
     #[test]
@@ -973,7 +1032,10 @@ mod tests {
         let call_id = set_call(&mut tc, g_call, f, vec![ptr]);
         tc.ctx.add_cfg_edge(g_call, g_cont);
 
-        assert!(argpromote(&mut tc.ctx), "single in/out param should be promoted");
+        assert!(
+            argpromote(&mut tc.ctx),
+            "single in/out param should be promoted"
+        );
 
         // The callee now hands the buffer back through Return::value.
         let returns_value = Function::from_id(&tc.ctx, f).iter().any(|b| {
@@ -987,7 +1049,10 @@ mod tests {
         let has_load = BasicBlock::from_id(&tc.ctx, g_call)
             .iter()
             .any(|i| matches!(i.mnemonic(), Mnemonic::Load(_)));
-        assert!(has_load, "caller must load the region value before the call");
+        assert!(
+            has_load,
+            "caller must load the region value before the call"
+        );
         let _ = call_id;
     }
 
@@ -1022,7 +1087,10 @@ mod tests {
     /// in the call block's continuation. The new design emits one per write-set
     /// `(address, value)` pair returned by the callee.
     fn replayed_stores(tc: &qcode::testing::TestContext, call_id: InstructionId) -> usize {
-        let Some(call_block) = Instruction::from_id(&tc.ctx, call_id).parent().map(|b| b.id) else {
+        let Some(call_block) = Instruction::from_id(&tc.ctx, call_id)
+            .parent()
+            .map(|b| b.id)
+        else {
             return 0;
         };
         let Some(cont) = BasicBlock::from_id(&tc.ctx, call_block)
@@ -1074,8 +1142,15 @@ mod tests {
         let call_id = set_call(&mut tc, g_call, f, vec![a, b]);
         tc.ctx.add_cfg_edge(g_call, g_cont);
 
-        assert!(argpromote(&mut tc.ctx), "both in/out pointers should be promoted");
-        assert_eq!(replayed_stores(&tc, call_id), 2, "two writes => two replays");
+        assert!(
+            argpromote(&mut tc.ctx),
+            "both in/out pointers should be promoted"
+        );
+        assert_eq!(
+            replayed_stores(&tc, call_id),
+            2,
+            "two writes => two replays"
+        );
     }
 
     /// `void foo(int *p) { *p += 10; }`
@@ -1221,7 +1296,11 @@ mod tests {
         tc.ctx.add_cfg_edge(g_call, g_cont);
 
         argpromote(&mut tc.ctx);
-        assert_eq!(replayed_stores(&tc, call_id), 0, "read-only pointer writes nothing back");
+        assert_eq!(
+            replayed_stores(&tc, call_id),
+            0,
+            "read-only pointer writes nothing back"
+        );
     }
 
     /// `int* foo(int *p) { return p + 10; }`
@@ -1257,7 +1336,11 @@ mod tests {
         tc.ctx.add_cfg_edge(g_call, g_cont);
 
         argpromote(&mut tc.ctx);
-        assert_eq!(replayed_stores(&tc, call_id), 0, "no dereference => no write-set");
+        assert_eq!(
+            replayed_stores(&tc, call_id),
+            0,
+            "no dereference => no write-set"
+        );
     }
 
     /// `(int*, int, int) f1(int* p_ptr, int p, int q) { return (p_ptr, p + 1, 100); }`
@@ -1346,7 +1429,11 @@ mod tests {
         assert_eq!(eff.inputs, vec![r0]);
 
         rewrite_callee_registers(&mut tc.ctx, f, &eff);
-        assert_eq!(register_writeset_len(&tc, f), Some(1), "one output → one field");
+        assert_eq!(
+            register_writeset_len(&tc, f),
+            Some(1),
+            "one output → one field"
+        );
     }
 
     /// `r0 += 1` — read-modify-write: r0 is both input and output. The input
@@ -1398,7 +1485,11 @@ mod tests {
             "
         );
         let eff = scan_register_effects(&tc.ctx, f).expect("written register");
-        assert_eq!(eff.outputs, vec![r0], "overlap group collapses to the 8-byte r0");
+        assert_eq!(
+            eff.outputs,
+            vec![r0],
+            "overlap group collapses to the 8-byte r0"
+        );
         let _ = r0_lo32;
         rewrite_callee_registers(&mut tc.ctx, f, &eff);
         assert_eq!(register_writeset_len(&tc, f), Some(1));
@@ -1423,7 +1514,11 @@ mod tests {
         let eff = scan_register_effects(&tc.ctx, f).expect("written register");
         assert_eq!(eff.outputs, vec![r0, r1], "both outputs, sorted by address");
         rewrite_callee_registers(&mut tc.ctx, f, &eff);
-        assert_eq!(register_writeset_len(&tc, f), Some(2), "return reg folds in");
+        assert_eq!(
+            register_writeset_len(&tc, f),
+            Some(2),
+            "return reg folds in"
+        );
     }
 
     /// A function that only *reads* registers has nothing to functionalize.
@@ -1440,7 +1535,10 @@ mod tests {
                     return [i64 0];
             "
         );
-        assert!(scan_register_effects(&tc.ctx, f).is_none(), "no write ⇒ nothing to promote");
+        assert!(
+            scan_register_effects(&tc.ctx, f).is_none(),
+            "no write ⇒ nothing to promote"
+        );
     }
 
     // ---- Phase 2: register channel — caller replay + precision --------------
@@ -1475,30 +1573,40 @@ mod tests {
         set_call(&mut tc, g_call, f, vec![]);
         tc.ctx.add_cfg_edge(g_call, g_cont);
 
-        assert!(argpromote_registers(&mut tc.ctx), "f's register clobber should be promoted");
+        assert!(
+            argpromote_registers(&mut tc.ctx),
+            "f's register clobber should be promoted"
+        );
 
         // The continuation replays the returned register from the call result.
         let has_extract = BasicBlock::from_id(&tc.ctx, g_cont)
             .iter()
             .any(|i| matches!(i.mnemonic(), Mnemonic::Extract(_)));
-        assert!(has_extract, "continuation must extract the returned register value");
+        assert!(
+            has_extract,
+            "continuation must extract the returned register value"
+        );
 
         // mem2reg realizes precision: r1 receives the extracted value, not a reload.
         let aliases = crate::AliasResult::simple(&tc.ctx);
         crate::mem2reg(&mut tc.ctx, g, &aliases);
 
-        let stored_to_r1 = BasicBlock::from_id(&tc.ctx, g_cont).iter().find_map(|i| {
-            match i.mnemonic() {
-                Mnemonic::Store(s) if s.ptr == ValueId::Varnode(r1) => Some(s.src),
-                _ => None,
-            }
-        });
+        let stored_to_r1 =
+            BasicBlock::from_id(&tc.ctx, g_cont)
+                .iter()
+                .find_map(|i| match i.mnemonic() {
+                    Mnemonic::Store(s) if s.ptr == ValueId::Varnode(r1) => Some(s.src),
+                    _ => None,
+                });
         let src = stored_to_r1.expect("store to r1 present");
         let is_extract = matches!(
             src,
             ValueId::Instruction(id) if matches!(tc.ctx.get_insn(id).mnemonic(), Mnemonic::Extract(_))
         );
-        assert!(is_extract, "r1 must receive the precise extracted return value, got {src:?}");
+        assert!(
+            is_extract,
+            "r1 must receive the precise extracted return value, got {src:?}"
+        );
     }
 
     /// An RMW callee's input register is passed as a positional call argument.
@@ -1541,7 +1649,10 @@ mod tests {
             Mnemonic::Call(c) => c.args.len(),
             _ => unreachable!(),
         };
-        assert_eq!(args_len, 1, "the input register is passed as one call argument");
+        assert_eq!(
+            args_len, 1,
+            "the input register is passed as one call argument"
+        );
     }
 
     /// Every return block gets its own write-set (the design's per-return rule).
@@ -1572,7 +1683,10 @@ mod tests {
                 )
             })
             .count();
-        assert_eq!(with_writeset, 2, "every return carries the register write-set");
+        assert_eq!(
+            with_writeset, 2,
+            "every return carries the register write-set"
+        );
     }
 
     /// Phase 3: emulator round-trip. The rewritten module must produce the same
@@ -1608,7 +1722,9 @@ mod tests {
         );
         let _ = (f, r0);
         // `f` returns to `g`'s continuation: pin it at the return address (4096).
-        BasicBlock::from_id_mut(&mut tc.ctx, g_cont).set_address(4096).unwrap();
+        BasicBlock::from_id_mut(&mut tc.ctx, g_cont)
+            .set_address(4096)
+            .unwrap();
         set_call(&mut tc, g_call, f, vec![]);
         tc.ctx.add_cfg_edge(g_call, g_cont);
 

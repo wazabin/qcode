@@ -415,6 +415,9 @@ impl Display for InstructionStatement<'_> {
             write!(f, "{} = ", self.0)?;
         }
 
-        self.0.mnemonic().fmt(f, self.0.ctx)
+        match self.0.mnemonic() {
+            Mnemonic::Tuple(t) => t.fmt_with_type(f, self.0.ctx, self.0.type_id()),
+            mnemonic => mnemonic.fmt(f, self.0.ctx),
+        }
     }
 }

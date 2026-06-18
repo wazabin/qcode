@@ -37,7 +37,7 @@ use rustc_hash::FxHashMap as HashMap;
 use crate::{
     context::Context,
     space::{SPACE_CONST, Space, SpaceId, SpaceType},
-    types::TypeId,
+    types::{AggregateField, TypeId},
     value::{
         Function, Instruction, Renameable, Value, ValueId, ValueRef,
         block::{BasicBlock, BlockId, BlockMutRef},
@@ -900,15 +900,36 @@ impl<'str, 'ctx> Builder<'str, 'ctx> {
         self.push_instruction(Mnemonic::Sext(Sext { src, size }), size)
     }
 
-    /// Builds an aggregate value from `fields`. The result type is the
-    /// [`Aggregate`](crate::types::TypeRepr::Aggregate) of the fields' types.
+    /// Builds an aggregate value from `fields` using default field names
+    /// (`field1`, `field2`, ...). The result type is the
+    /// [`Aggregate`](crate::types::TypeRepr::Aggregate) of the named fields'
+    /// types.
     pub fn push_tuple(&mut self, fields: Vec<ValueId>) -> InstructionRef<'str, '_> {
+        let named_fields = fields
+            .into_iter()
+            .enumerate()
+            .map(|(i, value)| (format!("field{}", i + 1), value))
+            .collect();
+        self.push_named_tuple(named_fields)
+    }
+
+    /// Builds an aggregate value from ordered named fields.
+    pub fn push_named_tuple(&mut self, fields: Vec<(String, ValueId)>) -> InstructionRef<'str, '_> {
         let field_types: Vec<TypeId> = fields
             .iter()
-            .map(|&f| self.context_mut().type_of(f))
+            .map(|(_, f)| self.context_mut().type_of(*f))
             .collect();
-        let ty = self.context_mut().types.get_or_make_aggregate(field_types);
-        self.push_instruction_with_type(Mnemonic::Tuple(Tuple { fields }), ty)
+        let aggregate_fields = fields
+            .iter()
+            .zip(field_types)
+            .map(|((name, _), type_id)| AggregateField::new(name.clone(), type_id))
+            .collect();
+        let ty = self
+            .context_mut()
+            .types
+            .get_or_make_named_aggregate(aggregate_fields);
+        let values = fields.into_iter().map(|(_, value)| value).collect();
+        self.push_instruction_with_type(Mnemonic::Tuple(Tuple { fields: values }), ty)
     }
 
     /// Projects field `index` out of the aggregate value `agg`. The result type

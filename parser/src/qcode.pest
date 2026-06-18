@@ -40,8 +40,13 @@ memory          =  { load | store }
 load            =  { "load" ~ "(" ~ ty ~ "," ~ typed_atom ~ ")" }
 store           =  { "store" ~ "(" ~ typed_atom ~ "," ~ typed_atom ~ ")" }
 cast            =  { cast_op ~ "(" ~ ty ~ "," ~ typed_atom ~ ")" }
-extract         =  { "extract" ~ "(" ~ typed_atom ~ "," ~ integer ~ ")" }
-tuple           =  { "(" ~ typed_atom ~ ("," ~ typed_atom)* ~ ")" }
+extract         =  { "extract" ~ "(" ~ (named_extract | indexed_extract) ~ ")" }
+named_extract   =  { typed_atom ~ "." ~ ident }
+indexed_extract =  { typed_atom ~ "," ~ integer }
+tuple           =  { pack_tuple | positional_tuple }
+pack_tuple      =  { "pack" ~ "(" ~ tuple_field ~ ("," ~ tuple_field)* ~ ")" }
+tuple_field     =  { ident ~ "=" ~ typed_atom }
+positional_tuple = { "(" ~ typed_atom ~ ("," ~ typed_atom)* ~ ")" }
 cast_op         =  { "zext" | "sext" | "int2float" | "float2float" | "trunc" }
 typed_atom      =  { ty? ~ atom }
 atom            =  { capture | block_param_name | ssa_name | addressof | ident | integer }

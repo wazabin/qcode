@@ -1,6 +1,6 @@
 use crate::ast::{
-    Atom, BlockParamDecl, CastOp, ExprNode, FnDecl, Label, Program, SourcePosition, SourceSpan,
-    Statement, TypedAtom,
+    Atom, BlockParamDecl, CastOp, ExprNode, ExtractField, FnDecl, Label, Program, SourcePosition,
+    SourceSpan, Statement, TupleField, TypedAtom,
 };
 use pest::Parser;
 use pest::iterators::Pair;
@@ -473,11 +473,45 @@ fn parse_expr(pair: Pair<'_, Rule>) -> Result<ExprNode, ParseError> {
 }
 
 fn parse_tuple(pair: Pair<'_, Rule>) -> Result<ExprNode, ParseError> {
-    let fields = pair
+    let inner = pair
         .into_inner()
-        .filter(|p| p.as_rule() == Rule::typed_atom)
-        .map(parse_typed_atom)
-        .collect::<Result<Vec<_>, _>>()?;
+        .next()
+        .ok_or_else(|| ParseError::new("missing tuple body"))?;
+    let fields = match inner.as_rule() {
+        Rule::pack_tuple => inner
+            .into_inner()
+            .filter(|p| p.as_rule() == Rule::tuple_field)
+            .map(|field| {
+                let mut parts = field.into_inner();
+                let name = parts
+                    .find(|p| p.as_rule() == Rule::ident)
+                    .ok_or_else(|| ParseError::new("missing tuple field name"))?
+                    .as_str()
+                    .to_owned();
+                let value = parse_typed_atom(
+                    parts
+                        .find(|p| p.as_rule() == Rule::typed_atom)
+                        .ok_or_else(|| ParseError::new("missing tuple field value"))?,
+                )?;
+                Ok(TupleField {
+                    name: Some(name),
+                    value,
+                })
+            })
+            .collect::<Result<Vec<_>, _>>()?,
+        Rule::positional_tuple => inner
+            .into_inner()
+            .filter(|p| p.as_rule() == Rule::typed_atom)
+            .enumerate()
+            .map(|(i, value)| {
+                Ok(TupleField {
+                    name: Some(format!("field{}", i + 1)),
+                    value: parse_typed_atom(value)?,
+                })
+            })
+            .collect::<Result<Vec<_>, _>>()?,
+        _ => return Err(ParseError::new("invalid tuple")),
+    };
     if fields.is_empty() {
         return Err(ParseError::new("tuple must have at least one field"));
     }
@@ -485,19 +519,34 @@ fn parse_tuple(pair: Pair<'_, Rule>) -> Result<ExprNode, ParseError> {
 }
 
 fn parse_extract(pair: Pair<'_, Rule>) -> Result<ExprNode, ParseError> {
-    let mut inner = pair.into_inner();
+    let inner = pair
+        .into_inner()
+        .next()
+        .ok_or_else(|| ParseError::new("missing extract body"))?;
+    let rule = inner.as_rule();
+    let mut parts = inner.into_inner();
     let agg = parse_typed_atom(
-        inner
+        parts
             .find(|p| p.as_rule() == Rule::typed_atom)
             .ok_or_else(|| ParseError::new("missing extract aggregate"))?,
     )?;
-    let index = parse_integer(
-        inner
-            .find(|p| p.as_rule() == Rule::integer)
-            .ok_or_else(|| ParseError::new("missing extract index"))?
-            .as_str(),
-    )?;
-    Ok(ExprNode::Extract { agg, index })
+    let field = match rule {
+        Rule::named_extract => ExtractField::Name(
+            parts
+                .find(|p| p.as_rule() == Rule::ident)
+                .ok_or_else(|| ParseError::new("missing extract field name"))?
+                .as_str()
+                .to_owned(),
+        ),
+        Rule::indexed_extract => ExtractField::Index(parse_integer(
+            parts
+                .find(|p| p.as_rule() == Rule::integer)
+                .ok_or_else(|| ParseError::new("missing extract index"))?
+                .as_str(),
+        )?),
+        _ => return Err(ParseError::new("invalid extract")),
+    };
+    Ok(ExprNode::Extract { agg, field })
 }
 
 fn parse_unop(pair: Pair<'_, Rule>) -> Result<ExprNode, ParseError> {

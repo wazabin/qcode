@@ -40,6 +40,18 @@ pub struct TypedAtom {
 }
 
 #[derive(Clone, Debug)]
+pub struct TupleField {
+    pub name: Option<String>,
+    pub value: TypedAtom,
+}
+
+#[derive(Clone, Debug)]
+pub enum ExtractField {
+    Name(String),
+    Index(u64),
+}
+
+#[derive(Clone, Debug)]
 pub enum ExprNode {
     Atom(TypedAtom),
     Unop {
@@ -73,14 +85,14 @@ pub enum ExprNode {
         name: String,
         args: Vec<TypedAtom>,
     },
-    /// `(a, b, c)` — build an aggregate value from its fields.
+    /// `pack(a=x, b=y)` — build an aggregate value from its named fields.
     Tuple {
-        fields: Vec<TypedAtom>,
+        fields: Vec<TupleField>,
     },
-    /// `extract(agg, index)` — project a field out of an aggregate value.
+    /// `extract(agg.field)` — project a field out of an aggregate value.
     Extract {
         agg: TypedAtom,
-        index: u64,
+        field: ExtractField,
     },
 }
 
