@@ -206,6 +206,18 @@ repeat_until = "no_change"
 # which are bodyless and therefore skipped by function-scoped stages by default.
 # `cpp_demangle` gives bodyless imports their real names (so `include_external`);
 # `name_thunks` then labels each single-jump stub `thunk_<callee>`.
+# Re-canonicalize after the late lowering/binding passes. `lower_stack` rewrites
+# `@stack_base ± N` back onto the real stack pointer by substituting into the
+# pre-gvn reload chains, and argpromote/dead_signature reshape call sites, both
+# leaving un-reassociated stack arithmetic (`((rsp-0x10)-0xc)+4+0xc`). gvn last
+# ran before all of that, so a final pass folds these chains into single
+# `@RSP - N` slots (and CSEs them against the prologue's slots). DCE clears the
+# arithmetic this makes dead.
+[[stage]]
+name = "final-canonicalize"
+scope = "function"
+passes = ["gvn", "dce"]
+
 [[stage]]
 name = "cleanup"
 scope = "function"

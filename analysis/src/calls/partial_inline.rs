@@ -283,8 +283,7 @@ fn try_partial_inline(ctx: &mut Context, fid: FunctionId) -> bool {
                 .collect();
 
             for extract_id in extracts {
-                let clone =
-                    clone_expr(ctx, extract_id, inl.value, &inl.order, &inputs, &args);
+                let clone = clone_expr(ctx, extract_id, inl.value, &inl.order, &inputs, &args);
                 ctx.replace_all_uses_with(ValueId::Instruction(extract_id), clone);
                 ctx.remove_instruction(extract_id);
                 changed = true;
@@ -504,7 +503,10 @@ mod tests {
         replay_field(&mut tc, g_cont, call_id, 1, vr2);
         replay_field(&mut tc, g_cont, call_id, 2, vr3);
 
-        assert!(partial_inline(&mut tc.ctx), "three cheap outputs should inline");
+        assert!(
+            partial_inline(&mut tc.ctx),
+            "three cheap outputs should inline"
+        );
         assert_eq!(
             extracts_of(&tc, g_cont, call_id),
             0,
@@ -553,7 +555,10 @@ mod tests {
         Instruction::from_id_mut(&mut tc.ctx, call_id).set_type(agg);
         replay_field(&mut tc, g_cont, call_id, 0, vr3);
 
-        assert!(!partial_inline(&mut tc.ctx), "param 1 is not an inline input");
+        assert!(
+            !partial_inline(&mut tc.ctx),
+            "param 1 is not an inline input"
+        );
         assert_eq!(
             extracts_of(&tc, g_cont, call_id),
             1,
@@ -595,7 +600,10 @@ mod tests {
         Instruction::from_id_mut(&mut tc.ctx, call_id).set_type(agg);
         replay_field(&mut tc, g_cont, call_id, 0, vr3);
 
-        assert!(!partial_inline(&mut tc.ctx), "over-budget expr must not inline");
+        assert!(
+            !partial_inline(&mut tc.ctx),
+            "over-budget expr must not inline"
+        );
         assert_eq!(extracts_of(&tc, g_cont, call_id), 1, "extract survives");
     }
 
@@ -630,7 +638,10 @@ mod tests {
         Instruction::from_id_mut(&mut tc.ctx, call_id).set_type(agg);
         replay_field(&mut tc, g_cont, call_id, 0, vr3);
 
-        assert!(!partial_inline(&mut tc.ctx), "impure output must not inline");
+        assert!(
+            !partial_inline(&mut tc.ctx),
+            "impure output must not inline"
+        );
         assert_eq!(extracts_of(&tc, g_cont, call_id), 1);
     }
 

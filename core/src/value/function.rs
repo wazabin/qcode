@@ -204,10 +204,7 @@ where
     /// side effects into a pure value function. See
     /// [`FunctionSignature::pure_reg`].
     pub fn is_pure_reg(&'s self) -> bool {
-        self.inner()
-            .signature
-            .as_ref()
-            .is_some_and(|s| s.pure_reg)
+        self.inner().signature.as_ref().is_some_and(|s| s.pure_reg)
     }
 
     /// Registers read before written (function inputs), as inferred by analysis.

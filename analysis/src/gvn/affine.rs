@@ -1,0 +1,599 @@
+//! Normal-form value numbering for arithmetic and bitwise-mask expressions.
+//!
+//! Syntactic CSE ([`super::cse`]) numbers an instruction by its mnemonic, so two
+//! expressions that compute the same value via different shapes never unify. This
+//! module canonicalizes the *covered* operations into a width-tagged normal form
+//! so that, e.g., `(@ESP - 0xc) + 4`, `@ESP - 8` and `@ESP + 0xfffffff8` all hash
+//! to the same [`NormalForm`] and forward to whichever dominating value already
+//! computes it.
+//!
+//! Two normal-form kinds (arithmetic and bitwise never mix):
+//! * **Affine**: `c + Σ kᵢ·termᵢ`, all arithmetic wrapping mod `2^(width*8)`.
+//!   `sub` contributes a `-1` coefficient, `mul`/`shl` by a constant a scale,
+//!   `neg` a `-1` scale.
+//! * **Mask**: `term OP const` for `OP ∈ {and, or, xor}`, coalescing same-op
+//!   constant-mask chains over a single term.
+//!
+//! Anything else — loads, calls, casts (`zext`/`sext`), block params, non-linear
+//! products, symbolic literals — is an opaque leaf term. The *key* of such an
+//! instruction falls back to the normalized mnemonic ([`NormalForm::Opaque`]).
+//!
+//! ## Key vs. emitted IR
+//! The key uses wrapping `u64` with everything as addition, maximizing forwarding
+//! collisions. Materialization (when no dominating equal exists) interprets each
+//! constant/coefficient as *signed at the operation width* and renders negatives
+//! with `sub`, preserving stack-frame offsets without special-casing pointer
+//! types. Reconstruction is deterministic (terms ordered by `value_id_key`) so it
+//! is idempotent: a value already in canonical form is detected and left in place.
+
+use std::collections::HashMap;
+
+use qcode::{
+    context::Context,
+    value::{
+        BasicBlock, ValueId,
+        block::BlockId,
+        insn::{Binary, Binop, InstructionId, InstructionRef, IntBinop, Mnemonic, Unary, Unop},
+    },
+};
+
+use super::cse::{normalize, value_id_key};
+use super::fold::const_value;
+
+/// The value-numbering key. `Affine`/`Mask` are also stored per value as the
+/// "arithmetic view" used to compose parents; `Opaque` is key-only.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub(super) enum NormalForm {
+    /// `constant + Σ coeff·term`, wrapping mod `2^(width*8)`. `terms` is sorted by
+    /// [`value_id_key`] with zero coefficients dropped; `width` is in bytes.
+    Affine {
+        width: usize,
+        constant: u64,
+        terms: Vec<(ValueId, u64)>,
+    },
+    /// `term op mask` for `op ∈ {And, Or, Xor}`, `mask` reduced mod width.
+    Mask {
+        width: usize,
+        term: ValueId,
+        op: IntBinop,
+        mask: u64,
+    },
+    /// Fallback: the commutativity-normalized mnemonic (loads, calls, casts, …).
+    Opaque(Mnemonic),
+}
+
+/// Per-walk value-numbering state, cloned down the dominator tree.
+#[derive(Clone, Default)]
+pub(super) struct Numbering {
+    /// Canonical key → the dominating value that computes it (the leader).
+    leaders: HashMap<NormalForm, ValueId>,
+    /// Value → its arithmetic view (always `Affine` or `Mask`), used to compose
+    /// the forms of instructions that consume it.
+    forms: HashMap<ValueId, NormalForm>,
+}
+
+// ---------------------------------------------------------------------------
+// Width helpers
+// ---------------------------------------------------------------------------
+
+/// Affine reasoning is limited to widths the wrapping `u64` arithmetic models
+/// exactly. Wider values (e.g. packed 96-bit aggregates) stay opaque.
+const MAX_AFFINE_WIDTH: usize = 8;
+
+fn mask_for(width: usize) -> u64 {
+    if width >= 8 {
+        u64::MAX
+    } else {
+        (1u64 << (width * 8)) - 1
+    }
+}
+
+/// Interpret `value` as signed at `width` bytes.
+fn signed(value: u64, width: usize) -> i64 {
+    let bits = width * 8;
+    if bits >= 64 {
+        value as i64
+    } else {
+        ((value << (64 - bits)) as i64) >> (64 - bits)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Affine term arithmetic
+// ---------------------------------------------------------------------------
+
+/// Merge `b` into `a`, summing coefficients of shared terms, dropping zeros, and
+/// re-sorting by `value_id_key` for a canonical order.
+fn merge_terms(mut a: Vec<(ValueId, u64)>, b: Vec<(ValueId, u64)>, m: u64) -> Vec<(ValueId, u64)> {
+    for (v, k) in b {
+        match a.iter_mut().find(|(vv, _)| *vv == v) {
+            Some(e) => e.1 = e.1.wrapping_add(k) & m,
+            None => a.push((v, k & m)),
+        }
+    }
+    a.retain(|(_, k)| *k & m != 0);
+    a.sort_by_key(|(v, _)| value_id_key(*v));
+    a
+}
+
+fn scale_terms(terms: &[(ValueId, u64)], k: u64, m: u64) -> Vec<(ValueId, u64)> {
+    let mut out: Vec<(ValueId, u64)> = terms
+        .iter()
+        .map(|(v, c)| (*v, c.wrapping_mul(k) & m))
+        .filter(|(_, c)| *c != 0)
+        .collect();
+    out.sort_by_key(|(v, _)| value_id_key(*v));
+    out
+}
+
+/// The arithmetic view of an operand: its stored affine form, a constant, or an
+/// opaque leaf `1·v`. Mask/opaque values are treated as opaque leaves.
+fn affine_view(
+    ctx: &Context,
+    v: ValueId,
+    width: usize,
+    state: &Numbering,
+) -> (u64, Vec<(ValueId, u64)>) {
+    if let Some(NormalForm::Affine {
+        width: w,
+        constant,
+        terms,
+    }) = state.forms.get(&v)
+        && *w == width
+    {
+        return (*constant, terms.clone());
+    }
+    if let Some(c) = const_value(ctx, v) {
+        return (c & mask_for(width), vec![]);
+    }
+    (0, vec![(v, 1)])
+}
+
+fn leaf(id: ValueId, width: usize) -> NormalForm {
+    NormalForm::Affine {
+        width,
+        constant: 0,
+        terms: vec![(id, 1)],
+    }
+}
+
+/// Whether `form` is the trivial leaf of `id` itself (`1·id + 0`), i.e. the op
+/// did not decompose into anything but itself.
+fn is_self_leaf(form: &NormalForm, id: ValueId) -> bool {
+    matches!(
+        form,
+        NormalForm::Affine { constant: 0, terms, .. }
+            if terms.len() == 1 && terms[0] == (id, 1)
+    )
+}
+
+// ---------------------------------------------------------------------------
+// Classification
+// ---------------------------------------------------------------------------
+
+/// Compute the arithmetic view of the value `id` produced by `mnemonic`. Returns
+/// an `Affine`/`Mask` form for covered ops, else the opaque leaf `1·id`.
+pub(super) fn arith_form(
+    ctx: &Context,
+    id: ValueId,
+    mnemonic: &Mnemonic,
+    width: usize,
+    state: &Numbering,
+) -> NormalForm {
+    if width == 0 || width > MAX_AFFINE_WIDTH {
+        return leaf(id, width);
+    }
+    let m = mask_for(width);
+
+    match mnemonic {
+        Mnemonic::Binop(Binary {
+            op: Binop::Int(op),
+            lhs,
+            rhs,
+        }) => match op {
+            IntBinop::Add => {
+                let (cl, tl) = affine_view(ctx, *lhs, width, state);
+                let (cr, tr) = affine_view(ctx, *rhs, width, state);
+                NormalForm::Affine {
+                    width,
+                    constant: cl.wrapping_add(cr) & m,
+                    terms: merge_terms(tl, tr, m),
+                }
+            }
+            IntBinop::Sub => {
+                let (cl, tl) = affine_view(ctx, *lhs, width, state);
+                let (cr, tr) = affine_view(ctx, *rhs, width, state);
+                NormalForm::Affine {
+                    width,
+                    constant: cl.wrapping_sub(cr) & m,
+                    terms: merge_terms(tl, scale_terms(&tr, m /* -1 */, m), m),
+                }
+            }
+            IntBinop::Mul => {
+                // Affine only when exactly one side is a constant scale.
+                if let Some(k) = const_value(ctx, *rhs) {
+                    scale_affine(ctx, *lhs, k & m, width, state)
+                } else if let Some(k) = const_value(ctx, *lhs) {
+                    scale_affine(ctx, *rhs, k & m, width, state)
+                } else {
+                    leaf(id, width)
+                }
+            }
+            IntBinop::ShiftLeft => {
+                // x << s  ==  x * 2^s  (constant amount, in range).
+                match const_value(ctx, *rhs) {
+                    Some(s) if s < (width as u64 * 8) && s < 64 => {
+                        scale_affine(ctx, *lhs, (1u64 << s) & m, width, state)
+                    }
+                    _ => leaf(id, width),
+                }
+            }
+            IntBinop::And | IntBinop::Or | IntBinop::Xor => {
+                if let Some(k) = const_value(ctx, *rhs) {
+                    mask_form(*lhs, *op, k & m, width, state)
+                } else if let Some(k) = const_value(ctx, *lhs) {
+                    mask_form(*rhs, *op, k & m, width, state)
+                } else {
+                    leaf(id, width)
+                }
+            }
+            _ => leaf(id, width),
+        },
+        Mnemonic::Unop(Unary {
+            op: Unop::IntNegate,
+            src,
+        }) => {
+            scale_affine(ctx, *src, m /* -1 */, width, state)
+        }
+        _ => leaf(id, width),
+    }
+}
+
+fn scale_affine(ctx: &Context, v: ValueId, k: u64, width: usize, state: &Numbering) -> NormalForm {
+    let m = mask_for(width);
+    let (c, t) = affine_view(ctx, v, width, state);
+    NormalForm::Affine {
+        width,
+        constant: c.wrapping_mul(k) & m,
+        terms: scale_terms(&t, k, m),
+    }
+}
+
+/// Build a `Mask` form for `operand op const`, coalescing with a same-op mask
+/// chain on `operand` and collapsing identities (`& all-ones`, `| 0`, `^ 0` → the
+/// term; `& 0` → `0`; `| all-ones` → all-ones).
+fn mask_form(
+    operand: ValueId,
+    op: IntBinop,
+    k: u64,
+    width: usize,
+    state: &Numbering,
+) -> NormalForm {
+    let all = mask_for(width);
+    // Coalesce with an inner same-op mask if present.
+    let (term, mask) = match state.forms.get(&operand) {
+        Some(NormalForm::Mask {
+            width: w,
+            term,
+            op: iop,
+            mask,
+        }) if *w == width && *iop == op => (
+            *term,
+            match op {
+                IntBinop::And => mask & k,
+                IntBinop::Or => mask | k,
+                IntBinop::Xor => mask ^ k,
+                _ => unreachable!(),
+            },
+        ),
+        _ => (operand, k),
+    };
+
+    // Identity collapses.
+    match op {
+        IntBinop::And if mask == all => leaf(term, width),
+        IntBinop::And if mask == 0 => NormalForm::Affine {
+            width,
+            constant: 0,
+            terms: vec![],
+        },
+        IntBinop::Or if mask == 0 => leaf(term, width),
+        IntBinop::Or if mask == all => NormalForm::Affine {
+            width,
+            constant: all,
+            terms: vec![],
+        },
+        IntBinop::Xor if mask == 0 => leaf(term, width),
+        _ => NormalForm::Mask {
+            width,
+            term,
+            op,
+            mask,
+        },
+    }
+}
+
+/// The value-numbering key for `id`: the arithmetic form for covered ops that
+/// genuinely decomposed, else the normalized mnemonic.
+pub(super) fn key_for(form: &NormalForm, id: ValueId, mnemonic: &Mnemonic) -> NormalForm {
+    if is_self_leaf(form, id) {
+        let mut m = mnemonic.clone();
+        normalize(&mut m);
+        NormalForm::Opaque(m)
+    } else {
+        form.clone()
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Materialization
+// ---------------------------------------------------------------------------
+
+/// Insert a fresh instruction `(mnemonic, type)` before `at` in `block`.
+fn emit(
+    ctx: &mut Context,
+    block: BlockId,
+    at: InstructionId,
+    mnemonic: Mnemonic,
+    ty: qcode::types::TypeId,
+) -> ValueId {
+    let new = InstructionRef::from_mnemonic_with_type(ctx, mnemonic, ty).id;
+    BasicBlock::from_id_mut(ctx, block).insert_insn_before(at, new);
+    ValueId::Instruction(new)
+}
+
+/// Reuse-or-create the value computing `form` (a sub-expression). Trivial forms
+/// resolve to a literal or the bare term; otherwise a dominating leader is reused
+/// if present, else the canonical instruction is emitted and registered.
+fn build_value(
+    ctx: &mut Context,
+    block: BlockId,
+    at: InstructionId,
+    form: &NormalForm,
+    state: &mut Numbering,
+) -> ValueId {
+    if let NormalForm::Affine {
+        width,
+        constant,
+        terms,
+    } = form
+    {
+        if terms.is_empty() {
+            return ctx.get_const(*constant, *width).id();
+        }
+        if terms.len() == 1 && terms[0].1 == 1 && *constant == 0 {
+            return terms[0].0;
+        }
+    }
+    if let Some(&leader) = state.leaders.get(form) {
+        return leader;
+    }
+    let int_ty = match form {
+        NormalForm::Affine { width, .. } | NormalForm::Mask { width, .. } => {
+            ctx.types.get_or_make_int(*width)
+        }
+        NormalForm::Opaque(_) => unreachable!("opaque forms are never materialized"),
+    };
+    let m = canonical_mnemonic(ctx, block, at, form, state);
+    let vid = emit(ctx, block, at, m, int_ty);
+    state.leaders.insert(form.clone(), vid);
+    state.forms.insert(vid, form.clone());
+    vid
+}
+
+/// The single-level canonical mnemonic for `form`, building its operands via
+/// [`build_value`] (which reuses dominating sub-results). Deterministic: terms in
+/// `value_id_key` order, negatives rendered as `sub`, the constant applied last.
+fn canonical_mnemonic(
+    ctx: &mut Context,
+    block: BlockId,
+    at: InstructionId,
+    form: &NormalForm,
+    state: &mut Numbering,
+) -> Mnemonic {
+    match form {
+        NormalForm::Mask {
+            width,
+            term,
+            op,
+            mask,
+        } => Mnemonic::Binop(Binary {
+            op: Binop::Int(*op),
+            lhs: *term,
+            rhs: ctx.get_const(*mask, *width).id(),
+        }),
+        NormalForm::Affine {
+            width,
+            constant,
+            terms,
+        } => {
+            let width = *width;
+            let constant = *constant;
+
+            // The constant, when present, is the trailing element (added last).
+            // It is the last element only when there is at least one term to
+            // anchor it; a pure constant is handled as a trivial form earlier.
+            if constant != 0 {
+                let prefix = NormalForm::Affine {
+                    width,
+                    constant: 0,
+                    terms: terms.clone(),
+                };
+                let pv = build_value(ctx, block, at, &prefix, state);
+                let (op, lit) = signed_lit(ctx, signed(constant, width), width);
+                return Mnemonic::Binop(Binary {
+                    op: Binop::Int(op),
+                    lhs: pv,
+                    rhs: lit,
+                });
+            }
+
+            // constant == 0. Order operations as: positive terms added (in key
+            // order), then negative terms subtracted (in key order). This keeps
+            // `b - a` as `sub(b, a)` rather than introducing a negate.
+            let last_neg = terms
+                .iter()
+                .rev()
+                .find(|(_, k)| signed(*k, width) < 0)
+                .copied();
+            let (last_v, last_k) = match last_neg {
+                Some(t) => t,
+                // No negative terms: the trailing element is the highest-key
+                // positive term.
+                None => *terms.last().unwrap(),
+            };
+
+            let prefix_terms: Vec<(ValueId, u64)> = terms
+                .iter()
+                .copied()
+                .filter(|(v, _)| *v != last_v)
+                .collect();
+
+            // Lone term: `-x` → negate, `k·x` → mul by the raw (wrapping) coeff.
+            if prefix_terms.is_empty() {
+                if signed(last_k, width) == -1 {
+                    return Mnemonic::Unop(Unary {
+                        op: Unop::IntNegate,
+                        src: last_v,
+                    });
+                }
+                return Mnemonic::Binop(Binary {
+                    op: Binop::Int(IntBinop::Mul),
+                    lhs: last_v,
+                    rhs: ctx.get_const(last_k, width).id(),
+                });
+            }
+
+            let prefix = NormalForm::Affine {
+                width,
+                constant: 0,
+                terms: prefix_terms,
+            };
+            let pv = build_value(ctx, block, at, &prefix, state);
+            let s = signed(last_k, width);
+            let (op, mag) = if s < 0 {
+                (IntBinop::Sub, s.unsigned_abs() & mask_for(width))
+            } else {
+                (IntBinop::Add, last_k)
+            };
+            let tv = scaled_value(ctx, block, at, last_v, mag, width, state);
+            Mnemonic::Binop(Binary {
+                op: Binop::Int(op),
+                lhs: pv,
+                rhs: tv,
+            })
+        }
+        NormalForm::Opaque(_) => unreachable!("opaque forms are never materialized"),
+    }
+}
+
+/// The value of `mag·term` (a positive magnitude): the bare term when `mag == 1`,
+/// else a reused-or-created `mul`.
+fn scaled_value(
+    ctx: &mut Context,
+    block: BlockId,
+    at: InstructionId,
+    term: ValueId,
+    mag: u64,
+    width: usize,
+    state: &mut Numbering,
+) -> ValueId {
+    if mag == 1 {
+        return term;
+    }
+    let form = NormalForm::Affine {
+        width,
+        constant: 0,
+        terms: vec![(term, mag)],
+    };
+    build_value(ctx, block, at, &form, state)
+}
+
+/// `(op, literal)` for adding a signed constant: `sub |s|` when negative.
+fn signed_lit(ctx: &mut Context, s: i64, width: usize) -> (IntBinop, ValueId) {
+    if s < 0 {
+        (
+            IntBinop::Sub,
+            ctx.get_const(s.unsigned_abs() & mask_for(width), width)
+                .id(),
+        )
+    } else {
+        (
+            IntBinop::Add,
+            ctx.get_const(s as u64 & mask_for(width), width).id(),
+        )
+    }
+}
+
+/// Materialize the canonical form for `key` at `at`. Returns the original
+/// `at` value if it is already canonical (no rewrite); otherwise the value of a
+/// reused dominating leader or a freshly emitted canonical expression.
+///
+/// `root_ty` is the result type to give a newly created root instruction so that
+/// StackAddress/symbolic typing is preserved.
+pub(super) fn materialize(
+    ctx: &mut Context,
+    block: BlockId,
+    at: InstructionId,
+    at_mnemonic: &Mnemonic,
+    key: &NormalForm,
+    root_ty: qcode::types::TypeId,
+    state: &mut Numbering,
+) -> ValueId {
+    // Trivial roots: forward straight to the literal / bare term.
+    if let NormalForm::Affine {
+        width,
+        constant,
+        terms,
+    } = key
+    {
+        if terms.is_empty() {
+            return ctx.get_const(*constant, *width).id();
+        }
+        if terms.len() == 1 && terms[0].1 == 1 && *constant == 0 {
+            return terms[0].0;
+        }
+    }
+    // A dominating value already computes this form: reuse it.
+    if let Some(&leader) = state.leaders.get(key) {
+        return leader;
+    }
+    // Build the canonical root; if it matches the current instruction, the value
+    // is already canonical — leave it in place.
+    let m = canonical_mnemonic(ctx, block, at, key, state);
+    if &m == at_mnemonic {
+        let vid = ValueId::Instruction(at);
+        state.leaders.insert(key.clone(), vid);
+        return vid;
+    }
+    let vid = emit(ctx, block, at, m, root_ty);
+    state.leaders.insert(key.clone(), vid);
+    state.forms.insert(vid, key.clone());
+    vid
+}
+
+impl Numbering {
+    /// Record the arithmetic view of `id` so consumers can compose it.
+    pub(super) fn record_form(&mut self, id: ValueId, form: NormalForm) {
+        self.forms.insert(id, form);
+    }
+
+    /// Claim `id` as the leader for `key` if no dominating leader exists yet,
+    /// returning the existing dominating leader otherwise.
+    pub(super) fn lookup(&self, key: &NormalForm) -> Option<ValueId> {
+        self.leaders.get(key).copied()
+    }
+
+    pub(super) fn claim(&mut self, key: NormalForm, id: ValueId) {
+        self.leaders.entry(key).or_insert(id);
+    }
+
+    /// Drop all inherited leaders. Used on entry to a block reachable from more
+    /// than one walk root, whose inherited dominance claims are invalid — a
+    /// leader from a per-entry dominator-tree ancestor need not actually
+    /// dominate it. (The per-value `forms` are SSA decompositions and only ever
+    /// consulted for genuine operands, so they stay valid.)
+    pub(super) fn clear_leaders(&mut self) {
+        self.leaders.clear();
+    }
+}

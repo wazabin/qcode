@@ -1,9 +1,17 @@
-//! Common-subexpression-elimination sub-pass.
+//! Value-numbering sub-pass.
 //!
-//! Numbers pure instructions by their (commutativity-normalized) mnemonic and
-//! forwards repeats to the first occurrence. Pure values computed in a
-//! dominator are always available to its descendants, so this state flows
-//! freely down the dominator tree.
+//! Numbers pure instructions by a canonical [`NormalForm`](super::affine) and
+//! forwards repeats to the first occurrence. Arithmetic (`c + Σ kᵢ·termᵢ`) and
+//! bitwise-mask expressions are canonicalized so that reassociated shapes — e.g.
+//! `(@ESP - 0xc) + 4` and `@ESP - 8` — value-number identically; everything else
+//! falls back to its commutativity-normalized mnemonic. Pure values computed in a
+//! dominator are always available to its descendants, so this state flows freely
+//! down the dominator tree.
+//!
+//! On a miss for a covered (arithmetic/mask) form, the instruction is rebuilt
+//! into its canonical minimal shape in place (reusing dominating sub-results),
+//! unless it is already canonical. See [`super::affine`] for the normal form,
+//! key/emit split, and idempotence argument.
 
 use rustc_hash::FxHashMap as HashMap;
 
@@ -15,12 +23,31 @@ use qcode::{
     },
 };
 
+use super::affine::{NormalForm, Numbering, arith_form, key_for, materialize};
 use super::walk::{Claim, Editor, InsnCtx, SubPass};
 
 pub(super) struct Cse;
 
 impl SubPass for Cse {
-    type State = HashMap<Mnemonic, ValueId>;
+    type State = Numbering;
+
+    fn on_block_entry(
+        &self,
+        _ctx: &mut Context,
+        state: &mut Numbering,
+        _block_id: qcode::value::block::BlockId,
+        _tree: &jstd::graph::analysis::DominatorTree<qcode::value::block::BlockId>,
+        _aliases: Option<&crate::AliasResult>,
+        is_shared: bool,
+    ) {
+        // A block reachable from more than one walk root has invalid inherited
+        // dominance claims: a leader from a per-entry dominator-tree ancestor
+        // need not actually dominate it, so forwarding to (or materializing
+        // against) it would be unsound. Drop them, like MemoryForwarding does.
+        if is_shared {
+            state.clear_leaders();
+        }
+    }
 
     fn on_insn(
         &self,
@@ -32,12 +59,40 @@ impl SubPass for Cse {
         if ic.mnemonic.is_terminator() || ic.size == 0 {
             return Claim::Pass;
         }
-        let mut mnemonic = ic.mnemonic.clone();
-        normalize(&mut mnemonic);
-        match state.get(&mnemonic) {
-            Some(&leader) => ed.replace(ctx, ic.insn_id, leader),
-            None => {
-                state.insert(mnemonic, ic.id);
+
+        // Arithmetic view (used to compose consumers) and the value-numbering key.
+        let form = arith_form(ctx, ic.id, ic.mnemonic, ic.size, state);
+        state.record_form(ic.id, form.clone());
+        let key = key_for(&form, ic.id, ic.mnemonic);
+
+        // A dominating value already computes this form: forward to it.
+        if let Some(leader) = state.lookup(&key) {
+            if leader != ic.id {
+                ed.replace(ctx, ic.insn_id, leader);
+            }
+            return Claim::Done;
+        }
+
+        match key {
+            // Opaque ops keep the syntactic-CSE behaviour: claim ourselves.
+            NormalForm::Opaque(_) => state.claim(key, ic.id),
+            // Covered forms: canonicalize in place (rebuild minimal subtree),
+            // reusing dominating sub-results. `materialize` returns `ic.id` when
+            // the instruction is already canonical.
+            _ => {
+                let root_ty = ctx.type_of(ic.id);
+                let v = materialize(
+                    ctx,
+                    ic.block_id,
+                    ic.insn_id,
+                    ic.mnemonic,
+                    &key,
+                    root_ty,
+                    state,
+                );
+                if v != ic.id {
+                    ed.replace(ctx, ic.insn_id, v);
+                }
             }
         }
         Claim::Done
@@ -52,7 +107,7 @@ impl SubPass for Cse {
 /// variant rank breaks ties between equal indices of different variants (e.g.
 /// `Literal(5)` vs `Instruction(5)`), which would otherwise leave `a + b` and
 /// `b + a` un-normalized.
-fn value_id_key(v: ValueId) -> (u8, usize) {
+pub(super) fn value_id_key(v: ValueId) -> (u8, usize) {
     match v {
         ValueId::Literal(x) => (0, x.into()),
         ValueId::Instruction(x) => (1, x.into()),
@@ -358,6 +413,235 @@ mod tests {
         assert_eq!(
             m1, m2,
             "a + b and b + a must normalize to the same mnemonic"
+        );
+    }
+
+    // ----- normal-form value numbering ------------------------------------
+
+    /// Helper: numeric value of a literal operand.
+    fn lit_value(ctx: &Context, v: ValueId) -> Option<u64> {
+        match v {
+            ValueId::Literal(id) => Some(ctx.values.literals[id].value),
+            _ => None,
+        }
+    }
+
+    /// `(@SP - 0xc) + 4` reassociates to `@SP - 8`, which a dominating
+    /// instruction already computes, so the chain forwards and is deleted.
+    #[test]
+    fn test_reassociation_forwards_to_dominating_value() {
+        let mut ctx = Context::new();
+        qcode!(
+            ctx,
+            "
+                varnode i32 SP;
+                varnode i32 OUT;
+
+                fn f:
+                    <entry>
+                        %b = &SP - i32 0x8;
+                        %a = &SP - i32 0xc;
+                        %c = %a + i32 0x4;
+                        store(&OUT, %c);
+                        return [0x1000];
+                "
+        );
+
+        assert!(gvn_function(&mut ctx, f, None));
+
+        let insns = BasicBlock::from_id(&ctx, entry).instruction_ids().to_vec();
+        assert!(
+            !insns.contains(&c),
+            "(@SP-0xc)+4 must forward to the existing @SP-8 and be removed"
+        );
+        assert!(insns.contains(&b), "@SP-8 is the surviving leader");
+    }
+
+    /// A second GVN run over an already-canonical function must report no change.
+    #[test]
+    fn test_reassociation_is_idempotent() {
+        let mut ctx = Context::new();
+        qcode!(
+            ctx,
+            "
+                varnode i32 SP;
+                varnode i32 OUT;
+
+                fn f:
+                    <entry>
+                        %b = &SP - i32 0x8;
+                        %a = &SP - i32 0xc;
+                        %c = %a + i32 0x4;
+                        store(&OUT, %c);
+                        return [0x1000];
+                "
+        );
+
+        assert!(
+            gvn_function(&mut ctx, f, None),
+            "first run rewrites the chain"
+        );
+        assert!(
+            !gvn_function(&mut ctx, f, None),
+            "second run must reach a fixpoint and report no change"
+        );
+    }
+
+    /// Same-op constant-mask chains coalesce: `(x & 0xff0) & 0x0ff` forwards to
+    /// the dominating `x & 0xf0`.
+    #[test]
+    fn test_mask_chain_coalesces_and_forwards() {
+        let mut ctx = Context::new();
+        qcode!(
+            ctx,
+            "
+                varnode i32 X;
+                varnode i32 OUT;
+
+                fn f:
+                    <entry>
+                        %x = load(i32, &X);
+                        %p = %x & i32 0xf0;
+                        %m = %x & i32 0xff0;
+                        %n = %m & i32 0xff;
+                        store(&OUT, %n);
+                        return [0x1000];
+                "
+        );
+
+        assert!(gvn_function(&mut ctx, f, None));
+
+        let insns = BasicBlock::from_id(&ctx, entry).instruction_ids().to_vec();
+        assert!(
+            !insns.contains(&n),
+            "(x & 0xff0) & 0xff == x & 0xf0 must forward to %p"
+        );
+        assert!(insns.contains(&p), "x & 0xf0 is the surviving leader");
+    }
+
+    /// When rebuilding, a negative offset is emitted as `sub 8`, never
+    /// `add 0xfffffff8` — preserving the sign that stack lowering relies on.
+    #[test]
+    fn test_rebuild_emits_signed_subtraction() {
+        let mut ctx = Context::new();
+        qcode!(
+            ctx,
+            "
+                varnode i32 SP;
+                varnode i32 OUT;
+
+                fn f:
+                    <entry>
+                        %a = &SP + i32 0x4;
+                        %b = %a - i32 0xc;
+                        store(&OUT, %b);
+                        return [0x1000];
+                "
+        );
+
+        assert!(gvn_function(&mut ctx, f, None));
+
+        // No instruction may carry the wrapped positive constant 0xfffffff8.
+        for &id in BasicBlock::from_id(&ctx, entry).instruction_ids() {
+            for arg in ctx.get_insn(id).mnemonic().args() {
+                assert_ne!(
+                    lit_value(&ctx, arg),
+                    Some(0xffff_fff8),
+                    "rebuild must use signed `sub 8`, not `add 0xfffffff8`"
+                );
+            }
+        }
+
+        // The rebuilt value must be `sub(_, 8)`.
+        let mut found_sub_by_8 = false;
+        for &id in BasicBlock::from_id(&ctx, entry).instruction_ids() {
+            if let Mnemonic::Binop(Binary {
+                op: Binop::Int(IntBinop::Sub),
+                rhs,
+                ..
+            }) = ctx.get_insn(id).mnemonic()
+                && lit_value(&ctx, *rhs) == Some(8)
+            {
+                found_sub_by_8 = true;
+            }
+        }
+        assert!(found_sub_by_8, "@SP+4-0xc must rebuild to @SP - 8");
+    }
+
+    /// Widening is a width boundary: `zext(a) + zext(b)` must NOT value-number
+    /// with `zext(a + b)` (distributing across zext is unsound on carry).
+    #[test]
+    fn test_zext_is_an_opaque_leaf() {
+        let mut ctx = Context::new();
+        qcode!(
+            ctx,
+            "
+                varnode i32 A;
+                varnode i32 B;
+                varnode i64 OUT;
+
+                fn f:
+                    <entry>
+                        %a = load(i32, &A);
+                        %b = load(i32, &B);
+                        %za = zext(i64, %a);
+                        %zb = zext(i64, %b);
+                        %wide = %za + %zb;
+                        %sum = %a + %b;
+                        %zs = zext(i64, %sum);
+                        store(&OUT, %wide);
+                        store(&OUT, %zs);
+                        return [0x1000];
+                "
+        );
+
+        gvn_function(&mut ctx, f, None);
+
+        let insns = BasicBlock::from_id(&ctx, entry).instruction_ids().to_vec();
+        assert!(
+            insns.contains(&wide) && insns.contains(&zs),
+            "zext(a)+zext(b) and zext(a+b) are different values and must both survive"
+        );
+    }
+
+    /// An arithmetic value computed in one orphan-region entry must not be
+    /// forwarded into a block both entries reach: that block's inherited
+    /// dominance claims are invalid (mirrors the load-forwarding guard).
+    #[test]
+    fn test_arithmetic_not_forwarded_into_shared_orphan_block() {
+        let mut ctx = Context::new();
+        qcode!(
+            ctx,
+            "
+                varnode i32 A;
+                varnode i32 OUT;
+
+                fn shared_orphans:
+                    <entry>
+                        return [0x1000];
+
+                    <e1>
+                        %x1 = &A - i32 0x8;
+                        store(&OUT, %x1);
+                        goto <shared>;
+
+                    <e2>
+                        goto <shared>;
+
+                    <shared>
+                        %x2 = &A - i32 0x8;
+                        store(&OUT, %x2);
+                        return [0x1001];
+                "
+        );
+
+        gvn_function(&mut ctx, shared_orphans, None);
+
+        assert!(
+            BasicBlock::from_id(&ctx, shared)
+                .instruction_ids()
+                .contains(&x2),
+            "@A-8 in a block reachable from two orphan entries must not be forwarded"
         );
     }
 }

@@ -679,8 +679,8 @@ fn scan_register_effects(
     if stored.is_empty() {
         return Err(RegPurityReason::NoRegisterWrites);
     }
-    let mut outputs = canonicalize_to_coarsest(ctx, &stored)
-        .ok_or(RegPurityReason::NonCanonicalRegisters)?;
+    let mut outputs =
+        canonicalize_to_coarsest(ctx, &stored).ok_or(RegPurityReason::NonCanonicalRegisters)?;
 
     // The rewritten body reads not only the originally-loaded registers but also
     // every output (the return write-set loads each one). An output written on
@@ -1837,7 +1837,8 @@ mod tests {
         );
         let _ = (r0_lo32, mid, entry);
         assert!(
-            scan_register_effects(&tc.ctx, f).unwrap_err() == RegPurityReason::NonCanonicalRegisters,
+            scan_register_effects(&tc.ctx, f).unwrap_err()
+                == RegPurityReason::NonCanonicalRegisters,
             "partial overlap with no covering register must bail"
         );
     }
