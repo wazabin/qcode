@@ -6,7 +6,9 @@
 # every non-external function, function-major) or `scope = "module"` (its passes
 # run once over the whole program). `repeat_until = "no_change"` loops a stage to
 # a fixpoint — per function for function-scoped stages, whole-program for
-# module-scoped ones.
+# module-scoped ones. Function stages may set `only_dirty = true` to run only on
+# functions changed by the previous stage; module changes are treated
+# conservatively as dirtying all functions.
 description = "Default whole-program lifting, discovery, optimization, and cleanup pipeline."
 
 # --- Lifting phase (clean IR) ------------------------------------------------
@@ -105,12 +107,27 @@ name = "simplify-cfg"
 scope = "function"
 passes = ["simplify_cfg"]
 
-# Recognize and unroll small, trivially-bounded loops after CFG simplification has
-# exposed the header/body/back-edge shape.
+# Recognize small, trivially-bounded loops after CFG simplification has exposed
+# the header/body/back-edge shape. Then restrict unrolling and cleanup to the
+# functions that recognition annotated; the follow-up optimizer only runs where
+# unroll/simplify actually rewrote IR.
 [[stage]]
 name = "loop-recognition"
 scope = "function"
-passes = ["recognize_simple_loops", "unroll_simple_loops"]
+passes = ["recognize_simple_loops"]
+
+[[stage]]
+name = "loop-unroll-cleanup"
+scope = "function"
+passes = ["unroll_simple_loops", "simplify_cfg"]
+only_dirty = true
+
+[[stage]]
+name = "post-loop-opt"
+scope = "function"
+passes = ["gvn", "dce"]
+repeat_until = "no_change"
+only_dirty = true
 
 # Interprocedural binding milestones, whole-program, after every function is
 # post-mem2reg/gvn but *before* the eliminating passes (so the arg-setup stores
@@ -131,11 +148,18 @@ passes = ["dead_store", "dce"]
 # function's real stack pointer, then clear the dead artifacts that exposes (a
 # caller-side RSP relink whose store is overwritten before use): DCE drops the
 # dead arithmetic, DeadStore the now-unused register load it fed, a final DCE
-# anything that exposes.
+# anything that exposes. The cleanup only runs on functions actually changed by
+# stack lowering.
 [[stage]]
-name = "lower"
+name = "lower-stack"
 scope = "function"
-passes = ["lower_stack", "dce", "dead_store", "dce"]
+passes = ["lower_stack"]
+
+[[stage]]
+name = "post-lower-cleanup"
+scope = "function"
+passes = ["dce", "dead_store", "dce"]
+only_dirty = true
 
 # Aesthetic changes. `include_external` so the demangler also reaches imported
 # library functions (PLT stubs like `_ZNSsixEj` -> `std::string::operator[]`),

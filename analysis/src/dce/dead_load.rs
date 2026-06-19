@@ -514,7 +514,7 @@ pub fn remove_dead_load_insns(
     function_id: FunctionId,
     aliases: Option<&AliasResult>,
     dead_regs: &[ValueId],
-) {
+) -> bool {
     let block_ids: Vec<BlockId> = Function::from_id(ctx, function_id)
         .iter()
         .map(|block| block.id)
@@ -550,9 +550,11 @@ pub fn remove_dead_load_insns(
         }
     }
 
+    let changed = !dead.is_empty();
     for id in &dead {
         ctx.remove_instruction(*id);
     }
+    changed
 }
 
 #[cfg(test)]
@@ -896,8 +898,7 @@ impl FunctionPass for DeadLoad {
         _env: &PipelineEnv,
     ) -> Result<bool, String> {
         let aliases = AliasResult::simple(ctx);
-        remove_dead_load_insns(ctx, fun_id, Some(&aliases), &[]);
-        Ok(false)
+        Ok(remove_dead_load_insns(ctx, fun_id, Some(&aliases), &[]))
     }
 }
 
@@ -921,8 +922,12 @@ impl FunctionPass for DeadStore {
         env: &PipelineEnv,
     ) -> Result<bool, String> {
         let aliases = AliasResult::simple(ctx);
-        remove_dead_load_insns(ctx, fun_id, Some(&aliases), &env.cfg.dead_flag_regs);
-        Ok(false)
+        Ok(remove_dead_load_insns(
+            ctx,
+            fun_id,
+            Some(&aliases),
+            &env.cfg.dead_flag_regs,
+        ))
     }
 }
 

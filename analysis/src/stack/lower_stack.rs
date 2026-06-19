@@ -58,9 +58,9 @@ fn incoming_stack_pointer(ctx: &mut Context, root: BlockId, stack_ptr: VarnodeId
 /// Rewrite every surviving `@stack_base ± N` literal in `function_id` into
 /// `incoming_stack_pointer ± N`. A no-op for functions that never touched the
 /// stack (no `StackAddress` literal was ever interned).
-pub fn lower_stack(ctx: &mut Context, function_id: FunctionId, stack_ptr: VarnodeId) {
+pub fn lower_stack(ctx: &mut Context, function_id: FunctionId, stack_ptr: VarnodeId) -> bool {
     let Some(sa_id) = ctx.types.stack_address_id() else {
-        return;
+        return false;
     };
     // The pointer width sizes both the offset-from-base recovery and the
     // materialized `incoming ± magnitude` arithmetic (4 for ESP, 8 for RSP).
@@ -88,7 +88,7 @@ pub fn lower_stack(ctx: &mut Context, function_id: FunctionId, stack_ptr: Varnod
         }
     }
     if lit_offsets.is_empty() {
-        return;
+        return false;
     }
 
     let root = Function::from_id(ctx, function_id)
@@ -142,6 +142,8 @@ pub fn lower_stack(ctx: &mut Context, function_id: FunctionId, stack_ptr: Varnod
             ctx.replace_instruction_mnemonic(iid, mnemonic);
         }
     }
+
+    true
 }
 
 #[cfg(test)]
@@ -317,8 +319,7 @@ impl FunctionPass for LowerStack {
         fun_id: FunctionId,
         env: &PipelineEnv,
     ) -> Result<bool, String> {
-        lower_stack(ctx, fun_id, env.sp_varnode);
-        Ok(false)
+        Ok(lower_stack(ctx, fun_id, env.sp_varnode))
     }
 }
 

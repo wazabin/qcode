@@ -7,7 +7,7 @@
 //!
 //! [`parse`]: Pipeline::parse
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 #[cfg(not(target_arch = "wasm32"))]
 use std::path::{Path, PathBuf};
 
@@ -70,6 +70,11 @@ struct StageConfig {
     /// like `cpp_demangle` want them too, so a stage can opt in.
     #[serde(default)]
     include_external: bool,
+    /// Restrict a function-scoped stage to functions changed by the previous
+    /// stage. Module-scoped changes are treated conservatively as "unknown", so
+    /// a following dirty-only stage runs on all functions if a module pass changed.
+    #[serde(default)]
+    only_dirty: bool,
 }
 
 #[derive(Deserialize, Clone, Copy, PartialEq, Eq)]
@@ -98,6 +103,8 @@ struct Stage {
     repeat_until: Option<RepeatCond>,
     /// Run function-scoped passes on external functions too (see [`StageConfig`]).
     include_external: bool,
+    /// Restrict this function-scoped stage to functions dirtied by the previous stage.
+    only_dirty: bool,
 }
 
 /// A parsed, name-resolved analysis pipeline ready to run.
@@ -300,6 +307,12 @@ impl Pipeline {
 
         let mut stages = Vec::with_capacity(stage.len());
         for sc in stage {
+            if sc.only_dirty && sc.scope != Scope::Function {
+                return Err(format!(
+                    "stage \"{}\" sets only_dirty=true, but only function-scoped stages can use it",
+                    sc.name
+                ));
+            }
             let passes = match sc.scope {
                 Scope::Function => StagePasses::Function(resolve_function_passes(&sc)?),
                 Scope::Module => StagePasses::Module(resolve_module_passes(&sc)?),
@@ -309,6 +322,7 @@ impl Pipeline {
                 passes,
                 repeat_until: sc.repeat_until,
                 include_external: sc.include_external,
+                only_dirty: sc.only_dirty,
             });
         }
         Ok(Pipeline { stages })
@@ -325,6 +339,7 @@ impl Pipeline {
             passes: names.iter().map(|n| n.to_string()).collect(),
             repeat_until: None,
             include_external: false,
+            only_dirty: false,
         };
         Ok(Pipeline {
             stages: vec![Stage {
@@ -332,6 +347,7 @@ impl Pipeline {
                 passes: StagePasses::Function(resolve_function_passes(&sc)?),
                 repeat_until: None,
                 include_external: sc.include_external,
+                only_dirty: sc.only_dirty,
             }],
         })
     }
@@ -361,13 +377,25 @@ impl Pipeline {
         progress: &mut impl FnMut(PipelineProgress),
     ) -> Result<(), String> {
         let end = self.barrier_index().unwrap_or(self.stages.len());
+        let mut dirty_functions = Some(HashSet::new());
         for stage in &self.stages[..end] {
             match &stage.passes {
                 StagePasses::Module(passes) => {
-                    run_lifting_module_stage(ctx, env, services, stage, passes, round, progress)?
+                    if run_lifting_module_stage(ctx, env, services, stage, passes, round, progress)?
+                    {
+                        dirty_functions = None;
+                    }
                 }
                 StagePasses::Function(passes) => {
-                    run_function_stage(ctx, env, stage, passes, round, progress)?
+                    dirty_functions = Some(run_function_stage(
+                        ctx,
+                        env,
+                        stage,
+                        passes,
+                        dirty_functions.as_ref(),
+                        round,
+                        progress,
+                    )?);
                 }
             }
         }
@@ -390,12 +418,21 @@ impl Pipeline {
         progress: &mut impl FnMut(PipelineProgress),
     ) -> Result<(), String> {
         let start = self.barrier_index().map(|i| i + 1).unwrap_or(0);
+        let mut dirty_functions = Some(HashSet::new());
         for stage in &self.stages[start..] {
             match &stage.passes {
                 StagePasses::Function(passes) => {
                     let reaches_discovery_pass =
                         passes.iter().any(|p| p.name() == ADDRESS_DISCOVERY_PASS);
-                    run_function_stage(ctx, env, stage, passes, round, progress)?;
+                    dirty_functions = Some(run_function_stage(
+                        ctx,
+                        env,
+                        stage,
+                        passes,
+                        dirty_functions.as_ref(),
+                        round,
+                        progress,
+                    )?);
                     if reaches_discovery_pass {
                         return Ok(());
                     }
@@ -414,13 +451,24 @@ impl Pipeline {
         round: usize,
         progress: &mut impl FnMut(PipelineProgress),
     ) -> Result<(), String> {
+        let mut dirty_functions = Some(HashSet::new());
         for stage in &self.stages[range] {
             match &stage.passes {
                 StagePasses::Module(passes) => {
-                    run_module_stage(ctx, env, stage, passes, round, progress)?
+                    if run_module_stage(ctx, env, stage, passes, round, progress)? {
+                        dirty_functions = None;
+                    }
                 }
                 StagePasses::Function(passes) => {
-                    run_function_stage(ctx, env, stage, passes, round, progress)?
+                    dirty_functions = Some(run_function_stage(
+                        ctx,
+                        env,
+                        stage,
+                        passes,
+                        dirty_functions.as_ref(),
+                        round,
+                        progress,
+                    )?);
                 }
             }
         }
@@ -478,9 +526,10 @@ fn run_module_stage(
     passes: &[Box<dyn DynPass>],
     round: usize,
     progress: &mut impl FnMut(PipelineProgress),
-) -> Result<(), String> {
+) -> Result<bool, String> {
     let stage_name: std::sync::Arc<str> = stage.name.as_str().into();
     let mut iters = 0;
+    let mut stage_changed = false;
     loop {
         let mut changed = false;
         for p in passes {
@@ -503,9 +552,10 @@ fn run_module_stage(
             );
             changed |= pass_changed;
         }
+        stage_changed |= changed;
         iters += 1;
         if stage.repeat_until.is_none() || !changed {
-            return Ok(());
+            return Ok(stage_changed);
         }
         if iters >= MAX_FIXPOINT_ITERS {
             return Err(format!(
@@ -527,9 +577,10 @@ fn run_lifting_module_stage(
     passes: &[Box<dyn DynPass>],
     round: usize,
     progress: &mut impl FnMut(PipelineProgress),
-) -> Result<(), String> {
+) -> Result<bool, String> {
     let stage_name: std::sync::Arc<str> = stage.name.as_str().into();
     let mut iters = 0;
+    let mut stage_changed = false;
     loop {
         let mut changed = false;
         for p in passes {
@@ -571,9 +622,10 @@ fn run_lifting_module_stage(
             );
             changed |= pass_changed;
         }
+        stage_changed |= changed;
         iters += 1;
         if stage.repeat_until.is_none() || !changed {
-            return Ok(());
+            return Ok(stage_changed);
         }
         if iters >= MAX_FIXPOINT_ITERS {
             return Err(format!(
@@ -592,13 +644,15 @@ fn run_function_stage(
     env: &PipelineEnv,
     stage: &Stage,
     passes: &[Box<dyn DynFunctionPass>],
+    previous_dirty: Option<&HashSet<FunctionId>>,
     round: usize,
     progress: &mut impl FnMut(PipelineProgress),
-) -> Result<(), String> {
+) -> Result<HashSet<FunctionId>, String> {
     let fun_ids: Vec<FunctionId> = ctx
         .functions()
         .filter(|f| stage.include_external || !f.is_external())
         .map(|f| f.id)
+        .filter(|id| !stage.only_dirty || previous_dirty.is_none_or(|dirty| dirty.contains(id)))
         .collect();
     let total = fun_ids.len();
     let stage_name: std::sync::Arc<str> = stage.name.as_str().into();
@@ -607,9 +661,12 @@ fn run_function_stage(
     // aggregated per pass over the whole stage rather than logged per call.
     let mut elapsed: HashMap<&'static str, (std::time::Duration, usize, usize)> = HashMap::new();
 
+    let mut dirty = HashSet::new();
+
     for (index, fun_id) in fun_ids.into_iter().enumerate() {
         let function: std::sync::Arc<str> = FunctionRef::from_id(ctx, fun_id).name().into();
         let mut iters = 0;
+        let mut function_changed = false;
         loop {
             let mut changed = false;
             for p in passes {
@@ -636,6 +693,7 @@ fn run_function_stage(
                 entry.2 += pass_changed as usize;
                 changed |= pass_changed;
             }
+            function_changed |= changed;
             iters += 1;
             if stage.repeat_until.is_none() || !changed {
                 break;
@@ -646,6 +704,9 @@ fn run_function_stage(
                     stage.name
                 ));
             }
+        }
+        if function_changed {
+            dirty.insert(fun_id);
         }
     }
 
@@ -660,7 +721,7 @@ fn run_function_stage(
             );
         }
     }
-    Ok(())
+    Ok(dirty)
 }
 
 #[cfg(test)]
@@ -707,6 +768,20 @@ mod tests {
             "#,
         );
         assert!(err.contains("whole-program pass"), "{err}");
+    }
+
+    #[test]
+    fn only_dirty_is_function_scope_only() {
+        let err = parse_err(
+            r#"
+            [[stage]]
+            name = "x"
+            scope = "module"
+            passes = []
+            only_dirty = true
+            "#,
+        );
+        assert!(err.contains("only_dirty=true"), "{err}");
     }
 
     #[cfg(not(target_arch = "wasm32"))]

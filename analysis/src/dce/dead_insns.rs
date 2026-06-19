@@ -29,19 +29,22 @@ pub fn dead_insns(ctx: &Context, block_id: BlockId) -> HashSet<InstructionId> {
 
 /// Removes dead pure instructions from `block_id` iteratively until fixed point,
 /// updating the users reverse map after each round.
-pub fn remove_dead_insns(ctx: &mut Context, block_id: BlockId) {
+pub fn remove_dead_insns(ctx: &mut Context, block_id: BlockId) -> bool {
+    let mut changed = false;
     loop {
         let dead = dead_insns(ctx, block_id);
         if dead.is_empty() {
             break;
         }
 
+        changed = true;
         for id in &dead {
             ctx.remove_instruction(*id);
         }
     }
 
-    remove_unused_no_pred_block_params(ctx, block_id);
+    let params_changed = remove_unused_no_pred_block_params(ctx, block_id);
+    changed || params_changed
 }
 
 /// Removes block params that have no users when the block has no incoming
@@ -261,10 +264,11 @@ impl FunctionPass for Dce {
             .blocks()
             .map(|b| b.id)
             .collect();
+        let mut changed = false;
         for block_id in block_ids {
-            remove_dead_insns(ctx, block_id);
+            changed |= remove_dead_insns(ctx, block_id);
         }
-        Ok(false)
+        Ok(changed)
     }
 }
 
