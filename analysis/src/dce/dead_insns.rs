@@ -66,9 +66,14 @@ pub fn remove_unused_no_pred_block_params(ctx: &mut Context, block_id: BlockId) 
     // at every direct caller in lockstep — keeping the alignment the emulator's
     // positional arg-binding relies on. (Conventional functions keep the local
     // removal below; their call args are re-derived by `bind_call_args`.)
-    if let Some((fid, is_entry, pure_reg)) = BasicBlock::from_id(ctx, block_id)
-        .function()
-        .map(|f| (f.id, f.root().map(|b| b.id) == Some(block_id), f.is_pure_reg()))
+    if let Some((fid, is_entry, pure_reg)) =
+        BasicBlock::from_id(ctx, block_id).function().map(|f| {
+            (
+                f.id,
+                f.root().map(|b| b.id) == Some(block_id),
+                f.is_pure_reg(),
+            )
+        })
         && is_entry
         && pure_reg
     {

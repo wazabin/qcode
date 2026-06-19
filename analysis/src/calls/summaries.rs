@@ -225,9 +225,7 @@ fn trace_stack_arg_pointer(
             (derives, derives)
         }
         ValueId::Instruction(iid) => match ctx.get_insn(iid).mnemonic().clone() {
-            Mnemonic::Binop(b)
-                if matches!(b.op, Binop::Int(IntBinop::Add | IntBinop::Sub)) =>
-            {
+            Mnemonic::Binop(b) if matches!(b.op, Binop::Int(IntBinop::Add | IntBinop::Sub)) => {
                 let (ld, ldyn) = trace_stack_arg_pointer(ctx, b.lhs, visited);
                 let (rd, rdyn) = trace_stack_arg_pointer(ctx, b.rhs, visited);
                 let derives = ld || rd;

@@ -131,11 +131,7 @@ fn dce_function(ctx: &mut Context, fid: FunctionId) {
 /// This is the same operation DCE's no-pred param sweep performs, so the two stay
 /// consistent; running it here as well lets the dead-signature worklist expose
 /// and reclaim dead args between return-field trims without a separate DCE round.
-fn trim_dead_args(
-    ctx: &mut Context,
-    fid: FunctionId,
-    touched: &mut HashSet<FunctionId>,
-) -> bool {
+fn trim_dead_args(ctx: &mut Context, fid: FunctionId, touched: &mut HashSet<FunctionId>) -> bool {
     let Some(root) = Function::from_id(ctx, fid).root().map(|b| b.id) else {
         return false;
     };
@@ -235,8 +231,10 @@ fn trim_dead_return_fields(
     // Rewrite each callee return: trim the tuple to the kept fields, or drop the
     // returned value entirely when nothing survives.
     for ret_id in returns_of(ctx, fid) {
-        let Mnemonic::Return(Return { ptr, value: Some(value) }) =
-            ctx.get_insn(ret_id).mnemonic().clone()
+        let Mnemonic::Return(Return {
+            ptr,
+            value: Some(value),
+        }) = ctx.get_insn(ret_id).mnemonic().clone()
         else {
             continue;
         };
@@ -350,7 +348,8 @@ mod tests {
     ) -> TypeId {
         let ret_id = returns_of(&tc.ctx, fid)[0];
         let ret_block = tc.ctx.get_insn(ret_id).parent().map(|b| b.id).unwrap();
-        let Mnemonic::Return(Return { ptr, .. }) = tc.ctx.get_insn(ret_id).mnemonic().clone() else {
+        let Mnemonic::Return(Return { ptr, .. }) = tc.ctx.get_insn(ret_id).mnemonic().clone()
+        else {
             unreachable!()
         };
         let tuple = {
@@ -374,10 +373,13 @@ mod tests {
     /// return carries no value.
     fn return_field_count(tc: &qcode::testing::TestContext, fid: FunctionId) -> Option<usize> {
         let ret = returns_of(&tc.ctx, fid)[0];
-        let Mnemonic::Return(Return { value: Some(v), .. }) = tc.ctx.get_insn(ret).mnemonic() else {
+        let Mnemonic::Return(Return { value: Some(v), .. }) = tc.ctx.get_insn(ret).mnemonic()
+        else {
             return None;
         };
-        let ValueId::Instruction(t) = v else { return None };
+        let ValueId::Instruction(t) = v else {
+            return None;
+        };
         match tc.ctx.get_insn(*t).mnemonic() {
             Mnemonic::Tuple(t) => Some(t.fields.len()),
             _ => None,
@@ -451,7 +453,10 @@ mod tests {
             bld.push_store(f0, ValueId::Varnode(vr0), reg_space);
         }
 
-        assert!(dead_signature(&mut tc.ctx), "the unread r0 arg should be dropped");
+        assert!(
+            dead_signature(&mut tc.ctx),
+            "the unread r0 arg should be dropped"
+        );
 
         assert_eq!(
             Function::from_id(&tc.ctx, f).input_regs().unwrap(),
@@ -516,14 +521,18 @@ mod tests {
             id
         };
 
-        assert!(dead_signature(&mut tc.ctx), "field 0 is unprojected and should be trimmed");
+        assert!(
+            dead_signature(&mut tc.ctx),
+            "field 0 is unprojected and should be trimmed"
+        );
 
         assert_eq!(
             return_field_count(&tc, f),
             Some(1),
             "the callee return tuple keeps only the live field"
         );
-        let Mnemonic::Extract(Extract { index, .. }) = tc.ctx.get_insn(extract_id).mnemonic() else {
+        let Mnemonic::Extract(Extract { index, .. }) = tc.ctx.get_insn(extract_id).mnemonic()
+        else {
             panic!("surviving projection must still be an extract");
         };
         assert_eq!(*index, 0, "the surviving extract is renumbered from 1 to 0");
@@ -596,7 +605,10 @@ mod tests {
         let call_id = set_call(&mut tc, g_call, f, vec![a, b]);
         tc.ctx.add_cfg_edge(g_call, g_cont);
 
-        assert!(!dead_signature(&mut tc.ctx), "non-pure-reg functions are skipped");
+        assert!(
+            !dead_signature(&mut tc.ctx),
+            "non-pure-reg functions are skipped"
+        );
         assert_eq!(call_args(&tc, call_id).len(), 2, "no argument is dropped");
         let _ = Varnode::from_id(&tc.ctx, vr1);
     }

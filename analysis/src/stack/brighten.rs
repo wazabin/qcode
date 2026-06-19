@@ -5,8 +5,7 @@ use qcode::{
     space::{Space, SpaceId, SpaceType},
     types::stack_base,
     value::{
-        BasicBlock, BlockId, Function, FunctionId, RegisterId, ValueId,
-        insn::Mnemonic,
+        BasicBlock, BlockId, Function, FunctionId, RegisterId, ValueId, insn::Mnemonic,
         literal::Literal,
     },
 };
@@ -117,14 +116,14 @@ fn entry_stack_ptr_seed_param(
     stack_ptr: ValueId,
     reg_space: SpaceId,
 ) -> Option<ValueId> {
-    BasicBlock::from_id(ctx, root_id).iter().find_map(|insn| {
-        match insn.mnemonic() {
+    BasicBlock::from_id(ctx, root_id)
+        .iter()
+        .find_map(|insn| match insn.mnemonic() {
             Mnemonic::Store(store) if store.ptr == stack_ptr && store.space == reg_space => {
                 Some(store.src)
             }
             _ => None,
-        }
-    })
+        })
 }
 
 /// True if `root_id` already begins with the synthetic stack-base store this pass
