@@ -16,18 +16,23 @@ use jstd::graph::analysis::{DominatorTree, compute_dominators, compute_postdomin
 use qcode::{
     context::Context,
     value::{
-        BasicBlock, BlockParam, BlockParamId, Function, FunctionId, ValueId,
+        BasicBlock, BlockParam, BlockParamId, Function, FunctionId, InstructionRef, Renameable,
+        ValueId,
         block::BlockId,
-        insn::{Binary, Binop, Branch, CBranch, IntBinop, Mnemonic},
+        insn::{Binary, Binop, Branch, CBranch, InstructionId, IntBinop, Mnemonic},
     },
 };
 
 use crate::{FunctionPass, PipelineEnv};
 
 const COMMENT_PREFIX: &str = "loop_unroll:";
+const MAX_UNROLL_ITERATIONS: u64 = 10;
 
 #[derive(Default)]
 pub struct RecognizeSimpleLoops;
+
+#[derive(Default)]
+pub struct UnrollSimpleLoops;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct SimpleLoop {
@@ -72,6 +77,25 @@ impl FunctionPass for RecognizeSimpleLoops {
 
 crate::register_function_pass!(RecognizeSimpleLoops);
 
+impl FunctionPass for UnrollSimpleLoops {
+    const NAME: &'static str = "unroll_simple_loops";
+
+    fn description(&self) -> &'static str {
+        "Unroll simple constant-bound induction-variable loops with fewer than ten iterations"
+    }
+
+    fn run(
+        &self,
+        ctx: &mut Context,
+        fun_id: FunctionId,
+        _env: &PipelineEnv,
+    ) -> Result<bool, String> {
+        Ok(unroll_simple_loops(ctx, fun_id))
+    }
+}
+
+crate::register_function_pass!(UnrollSimpleLoops);
+
 pub fn recognize_simple_loops(ctx: &mut Context, fun_id: FunctionId) -> bool {
     let Some(analysis) = LoopAnalysis::compute(ctx, fun_id) else {
         return false;
@@ -109,6 +133,319 @@ pub fn recognize_simple_loops(ctx: &mut Context, fun_id: FunctionId) -> bool {
         }
     }
     changed
+}
+
+pub fn unroll_simple_loops(ctx: &mut Context, fun_id: FunctionId) -> bool {
+    let Some(analysis) = LoopAnalysis::compute(ctx, fun_id) else {
+        return false;
+    };
+
+    let candidates = analysis
+        .backedges
+        .iter()
+        .filter_map(|&edge| {
+            let lp = recognize_simple_loop(ctx, &analysis, edge)?;
+            (lp.iterations < MAX_UNROLL_ITERATIONS).then_some((edge, lp))
+        })
+        .collect::<Vec<_>>();
+
+    let mut changed = false;
+    for (edge, lp) in candidates {
+        let Some(plan) = UnrollPlan::build(ctx, &analysis, edge, lp) else {
+            continue;
+        };
+        if apply_unroll_plan(ctx, fun_id, plan) {
+            changed = true;
+        }
+    }
+
+    changed
+}
+
+struct UnrollPlan {
+    lp: SimpleLoop,
+    preheader: BlockId,
+    exit: BlockId,
+    preheader_args: Vec<ValueId>,
+    exit_args: Vec<ValueId>,
+    path: Vec<BlockId>,
+    loop_nodes: HashSet<BlockId>,
+}
+
+impl UnrollPlan {
+    fn build(
+        ctx: &Context,
+        analysis: &LoopAnalysis,
+        edge: BackEdge,
+        lp: SimpleLoop,
+    ) -> Option<Self> {
+        let loop_nodes = natural_loop(ctx, edge);
+        let preheader = loop_preheader(ctx, lp.header, &loop_nodes)?;
+        let cbranch = header_cbranch(ctx, lp.header)?;
+        let (exit, exit_args) = header_exit(&loop_nodes, &cbranch)?;
+        let preheader_args = branch_args_to(ctx, preheader, lp.header)?;
+        let path = linear_loop_path(ctx, lp.body, lp.latch, &loop_nodes)?;
+
+        if !path
+            .iter()
+            .all(|block| BasicBlock::from_id(ctx, *block).params().next().is_none())
+        {
+            return None;
+        }
+
+        if analysis
+            .backedges
+            .iter()
+            .filter(|candidate| candidate.header == lp.header)
+            .count()
+            != 1
+        {
+            return None;
+        }
+
+        Some(Self {
+            lp,
+            preheader,
+            exit,
+            preheader_args,
+            exit_args,
+            path,
+            loop_nodes,
+        })
+    }
+}
+
+fn apply_unroll_plan(ctx: &mut Context, fun_id: FunctionId, plan: UnrollPlan) -> bool {
+    let mut carried = plan.preheader_args.clone();
+    let mut first_new_block = None;
+    let mut previous_new_block = None;
+    let mut created_blocks = Vec::new();
+
+    for iteration in 0..plan.lp.iterations {
+        let mut value_map = header_value_map(ctx, plan.lp.header, &carried);
+
+        for (path_index, &old_block) in plan.path.iter().enumerate() {
+            let new_block = BasicBlock::make(ctx).id;
+            let _ = BasicBlock::from_id_mut(ctx, new_block).rename(
+                format!(
+                    "unroll_{:x}_{iteration}_{path_index}",
+                    usize::from(old_block)
+                )
+                .into(),
+            );
+            Function::from_id_mut(ctx, fun_id).add_block(new_block);
+            created_blocks.push(new_block);
+            first_new_block.get_or_insert(new_block);
+
+            if let Some(previous) = previous_new_block {
+                replace_terminator_with_branch(ctx, previous, new_block, Vec::new());
+            }
+
+            let old_insns = BasicBlock::from_id(ctx, old_block)
+                .instruction_ids()
+                .to_vec();
+            let Some((&terminator, body_insns)) = old_insns.split_last() else {
+                return false;
+            };
+
+            for old_insn in body_insns.iter().copied() {
+                let old_ref = qcode::value::Instruction::from_id(ctx, old_insn);
+                let type_id = old_ref.type_id();
+                let mnemonic = remap_mnemonic(old_ref.mnemonic(), &value_map);
+                let new_insn = InstructionRef::from_mnemonic_with_type(ctx, mnemonic, type_id).id;
+                let insert_at = BasicBlock::from_id(ctx, new_block).instruction_ids().len();
+                BasicBlock::from_id_mut(ctx, new_block).insert_insn_at_index(insert_at, new_insn);
+                value_map.insert(
+                    ValueId::Instruction(old_insn),
+                    ValueId::Instruction(new_insn),
+                );
+            }
+
+            let is_latch = path_index + 1 == plan.path.len();
+            if is_latch {
+                let Some(next_carried) =
+                    remapped_branch_args_to(ctx, terminator, plan.lp.header, &value_map)
+                else {
+                    return false;
+                };
+                carried = next_carried;
+                previous_new_block = Some(new_block);
+            } else {
+                previous_new_block = Some(new_block);
+            }
+        }
+    }
+
+    let final_target = first_new_block.unwrap_or(plan.exit);
+    let preheader_args = if first_new_block.is_some() {
+        Vec::new()
+    } else {
+        remap_values(
+            &plan.exit_args,
+            &header_value_map(ctx, plan.lp.header, &plan.preheader_args),
+        )
+    };
+    replace_terminator_with_branch(ctx, plan.preheader, final_target, preheader_args);
+
+    if let Some(last_new_block) = previous_new_block {
+        let exit_args = remap_values(
+            &plan.exit_args,
+            &header_value_map(ctx, plan.lp.header, &carried),
+        );
+        replace_terminator_with_branch(ctx, last_new_block, plan.exit, exit_args);
+    }
+
+    for block in plan.loop_nodes {
+        BasicBlock::from_id_mut(ctx, block).delete(fun_id);
+    }
+
+    !created_blocks.is_empty() || plan.lp.iterations == 0
+}
+
+fn loop_preheader(
+    ctx: &Context,
+    header: BlockId,
+    loop_nodes: &HashSet<BlockId>,
+) -> Option<BlockId> {
+    let header_ref = BasicBlock::from_id(ctx, header);
+    let mut preheaders = header_ref
+        .predecessors()
+        .filter_map(|(_, pred)| (!loop_nodes.contains(&pred)).then_some(pred));
+    let preheader = preheaders.next()?;
+    preheaders.next().is_none().then_some(preheader)
+}
+
+fn branch_args_to(ctx: &Context, block: BlockId, target: BlockId) -> Option<Vec<ValueId>> {
+    let term_id = *BasicBlock::from_id(ctx, block).instruction_ids().last()?;
+    let term = qcode::value::Instruction::from_id(ctx, term_id);
+    let Mnemonic::Branch(Branch {
+        target: branch_target,
+        args,
+    }) = term.mnemonic()
+    else {
+        return None;
+    };
+    (*branch_target == target).then(|| args.clone())
+}
+
+fn header_exit(
+    loop_nodes: &HashSet<BlockId>,
+    cbranch: &CBranch,
+) -> Option<(BlockId, Vec<ValueId>)> {
+    let success_is_body = loop_nodes.contains(&cbranch.success_block);
+    let failure_is_body = loop_nodes.contains(&cbranch.failure_block);
+    match (success_is_body, failure_is_body) {
+        (true, false) => Some((cbranch.failure_block, cbranch.failure_args.clone())),
+        (false, true) => Some((cbranch.success_block, cbranch.success_args.clone())),
+        _ => None,
+    }
+}
+
+fn linear_loop_path(
+    ctx: &Context,
+    body: BlockId,
+    latch: BlockId,
+    loop_nodes: &HashSet<BlockId>,
+) -> Option<Vec<BlockId>> {
+    let mut path = Vec::new();
+    let mut seen = HashSet::new();
+    let mut current = body;
+
+    loop {
+        if !loop_nodes.contains(&current) || !seen.insert(current) {
+            return None;
+        }
+        path.push(current);
+        if current == latch {
+            return Some(path);
+        }
+
+        let current_ref = BasicBlock::from_id(ctx, current);
+        let mut successors = current_ref
+            .successors()
+            .filter_map(|(_, succ)| loop_nodes.contains(&succ).then_some(succ));
+        let next = successors.next()?;
+        if successors.next().is_some() {
+            return None;
+        }
+        current = next;
+    }
+}
+
+fn header_value_map(
+    ctx: &Context,
+    header: BlockId,
+    values: &[ValueId],
+) -> HashMap<ValueId, ValueId> {
+    BasicBlock::from_id(ctx, header)
+        .params()
+        .map(|param| ValueId::BlockParam(param.id))
+        .zip(values.iter().copied())
+        .collect()
+}
+
+fn remapped_branch_args_to(
+    ctx: &Context,
+    terminator: InstructionId,
+    target: BlockId,
+    value_map: &HashMap<ValueId, ValueId>,
+) -> Option<Vec<ValueId>> {
+    let term = qcode::value::Instruction::from_id(ctx, terminator);
+    let Mnemonic::Branch(Branch {
+        target: branch_target,
+        args,
+    }) = term.mnemonic()
+    else {
+        return None;
+    };
+    (*branch_target == target).then(|| remap_values(args, value_map))
+}
+
+fn remap_values(values: &[ValueId], value_map: &HashMap<ValueId, ValueId>) -> Vec<ValueId> {
+    values
+        .iter()
+        .map(|value| remap_value(*value, value_map))
+        .collect()
+}
+
+fn remap_value(value: ValueId, value_map: &HashMap<ValueId, ValueId>) -> ValueId {
+    value_map.get(&value).copied().unwrap_or(value)
+}
+
+fn remap_mnemonic(mnemonic: &Mnemonic, value_map: &HashMap<ValueId, ValueId>) -> Mnemonic {
+    let mut remapped = mnemonic.clone();
+    for (&old, &new) in value_map {
+        remapped.replace_value(old, new);
+    }
+    remapped
+}
+
+fn replace_terminator_with_branch(
+    ctx: &mut Context,
+    block: BlockId,
+    target: BlockId,
+    args: Vec<ValueId>,
+) {
+    let old_successors = BasicBlock::from_id(ctx, block)
+        .successors()
+        .map(|(edge, _)| edge)
+        .collect::<Vec<_>>();
+    for edge in old_successors {
+        ctx.remove_cfg_edge(edge);
+    }
+
+    let term_id = BasicBlock::from_id(ctx, block)
+        .instruction_ids()
+        .last()
+        .copied();
+    if let Some(term_id) = term_id {
+        ctx.replace_instruction_mnemonic(term_id, Mnemonic::Branch(Branch { target, args }));
+    } else {
+        let branch =
+            InstructionRef::from_mnemonic(ctx, Mnemonic::Branch(Branch { target, args }), 0).id;
+        BasicBlock::from_id_mut(ctx, block).insert_insn_at_index(0, branch);
+    }
+    ctx.add_cfg_edge(block, target);
 }
 
 impl LoopAnalysis {
@@ -553,5 +890,115 @@ mod tests {
 
         assert!(!run_function_pass::<RecognizeSimpleLoops>(&mut ctx, test).unwrap());
         assert!(BasicBlock::from_id(&ctx, header).comment().is_none());
+    }
+
+    #[test]
+    fn unrolls_simple_loop_with_known_count_under_limit() {
+        let mut ctx = Context::new();
+        qcode!(
+            ctx,
+            "
+            fn test:
+            <entry>
+                goto <header @i=0x0 @sum=0x0>;
+            <header @i:i64 @sum:i64>
+                %cond = @i < 0x3;
+                if %cond goto <body> else goto <exit>;
+            <body>
+                %sum_next = @sum + @i;
+                %i_next = @i + 0x1;
+                goto <header @i=%i_next @sum=%sum_next>;
+            <exit @result:i64>
+                return [@result];
+            "
+        );
+
+        assert!(run_function_pass::<UnrollSimpleLoops>(&mut ctx, test).unwrap());
+
+        let blocks = Function::from_id(&ctx, test)
+            .iter()
+            .map(|block| block.id)
+            .collect::<Vec<_>>();
+        assert!(!blocks.contains(&header));
+        assert!(!blocks.contains(&body));
+        assert_eq!(blocks.len(), 5);
+        assert_eq!(BasicBlock::from_id(&ctx, entry).successors().count(), 1);
+    }
+
+    #[test]
+    fn unrolls_loop_body_with_memory_and_cast_instructions() {
+        let mut ctx = Context::new();
+        qcode!(
+            ctx,
+            "
+            fn test:
+            <entry>
+                goto <header @i=0x0 @ptr=0x1000>;
+            <header @i:i64 @ptr:i64>
+                %cond = @i < 0x3;
+                if %cond goto <body> else goto <exit>;
+            <body>
+                %addr = @ptr + @i;
+                %byte = load(i8, %addr);
+                %wide = zext(i64, %byte);
+                %mixed = %wide ^ @i;
+                %byte_next = %mixed + 0x1;
+                store(%addr, %byte_next);
+                %i_next = @i + 0x1;
+                goto <header @i=%i_next @ptr=@ptr>;
+            <exit>
+                return [0x0];
+            "
+        );
+
+        assert!(run_function_pass::<UnrollSimpleLoops>(&mut ctx, test).unwrap());
+
+        let blocks = Function::from_id(&ctx, test)
+            .iter()
+            .map(|block| block.id)
+            .collect::<Vec<_>>();
+        assert!(!blocks.contains(&header));
+        assert!(!blocks.contains(&body));
+
+        let stores = Function::from_id(&ctx, test)
+            .iter()
+            .flat_map(|block| block.instruction_ids().iter().copied().collect::<Vec<_>>())
+            .filter(|&insn| {
+                matches!(
+                    qcode::value::Instruction::from_id(&ctx, insn).mnemonic(),
+                    Mnemonic::Store(_)
+                )
+            })
+            .count();
+        assert_eq!(stores, 3);
+    }
+
+    #[test]
+    fn does_not_unroll_loop_at_iteration_limit() {
+        let mut ctx = Context::new();
+        qcode!(
+            ctx,
+            "
+            fn test:
+            <entry>
+                goto <header @i=0x0>;
+            <header @i:i64>
+                %cond = @i < 0xa;
+                if %cond goto <body> else goto <exit>;
+            <body>
+                %i_next = @i + 0x1;
+                goto <header @i=%i_next>;
+            <exit>
+                return [0x0];
+            "
+        );
+
+        assert!(!run_function_pass::<UnrollSimpleLoops>(&mut ctx, test).unwrap());
+        let blocks = Function::from_id(&ctx, test)
+            .iter()
+            .map(|block| block.id)
+            .collect::<Vec<_>>();
+        assert!(blocks.contains(&header));
+        assert!(blocks.contains(&body));
     }
 }

@@ -44,7 +44,9 @@ pub mod value_range;
 pub use value_range::{ValueRange, value_range};
 
 pub mod loop_unroll;
-pub use loop_unroll::{RecognizeSimpleLoops, recognize_simple_loops};
+pub use loop_unroll::{
+    RecognizeSimpleLoops, UnrollSimpleLoops, recognize_simple_loops, unroll_simple_loops,
+};
 
 pub mod lift;
 pub use lift::{discover_addresses_in_binary, lift_new_addresses, split_overlapping_functions};

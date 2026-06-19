@@ -105,12 +105,12 @@ name = "simplify-cfg"
 scope = "function"
 passes = ["simplify_cfg"]
 
-# Annotate trivially-unrollable loops after CFG simplification has exposed the
-# header/body/back-edge shape. This is recognition only; it does not transform IR.
+# Recognize and unroll small, trivially-bounded loops after CFG simplification has
+# exposed the header/body/back-edge shape.
 [[stage]]
 name = "loop-recognition"
 scope = "function"
-passes = ["recognize_simple_loops"]
+passes = ["recognize_simple_loops", "unroll_simple_loops"]
 
 # Interprocedural binding milestones, whole-program, after every function is
 # post-mem2reg/gvn but *before* the eliminating passes (so the arg-setup stores
