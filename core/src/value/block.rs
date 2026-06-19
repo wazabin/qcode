@@ -31,6 +31,9 @@ pub struct BasicBlock<'str> {
     /// An optionnal name for this basic block
     name: Option<Cow<'str, str>>,
 
+    /// Optional human-readable analysis note rendered under the block label.
+    comment: Option<String>,
+
     /// Typed parameters declared at block entry (block-argument style).
     /// These are NOT part of `instructions`; use `params()` to iterate them.
     pub params: Vec<BlockParamId>,
@@ -137,6 +140,10 @@ where
         self.inner().address
     }
 
+    pub fn comment(&'s self) -> Option<&'ctx str> {
+        self.inner().comment.as_deref()
+    }
+
     /// Iterates over this block's parameters in declaration order.
     pub fn params(&'s self) -> impl Iterator<Item = BlockParamRef<'str, 'ctx>> + 's {
         self.inner()
@@ -196,6 +203,12 @@ where
             write!(f, " {param}")?;
         }
         writeln!(f, ">")?;
+
+        if let Some(comment) = self.comment() {
+            for line in comment.lines() {
+                writeln!(f, "\t// {line}")?;
+            }
+        }
 
         self.iter().try_for_each(|instr| {
             write!(f, "\t")?;
@@ -347,6 +360,10 @@ impl<'str, 'ctx> BlockMutRef<'str, 'ctx> {
 
     pub fn as_ref(&self) -> BlockRef<'str, '_> {
         BlockRef::new(self.ctx, self.id)
+    }
+
+    pub fn set_comment(&mut self, comment: Option<String>) {
+        self.inner_mut().comment = comment;
     }
 
     /// Declares a new parameter on this block with the given size in bytes.

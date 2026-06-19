@@ -43,6 +43,9 @@ pub use mem::{MemLiveness, compute_memory_liveness, mem2reg};
 pub mod value_range;
 pub use value_range::{ValueRange, value_range};
 
+pub mod loop_unroll;
+pub use loop_unroll::{RecognizeSimpleLoops, recognize_simple_loops};
+
 pub mod lift;
 pub use lift::{discover_addresses_in_binary, lift_new_addresses, split_overlapping_functions};
 
@@ -55,6 +58,6 @@ pub use pipeline::{
 };
 #[cfg(not(target_arch = "wasm32"))]
 pub use pipeline::{
-    PipelineFile, create_named_user_pipeline_from_default, create_user_pipeline_from_default,
-    list_user_pipelines, load_named_user_pipeline, user_pipeline_dir,
+    PipelineFile, create_named_user_pipeline_from_default_in, create_user_pipeline_from_default_in,
+    list_user_pipelines_in, load_named_user_pipeline_in,
 };

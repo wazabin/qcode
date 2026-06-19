@@ -123,41 +123,7 @@ impl Default for Pipeline {
 }
 
 #[cfg(not(target_arch = "wasm32"))]
-pub fn user_pipeline_dir() -> Result<PathBuf, String> {
-    let home = std::env::var_os("HOME").ok_or_else(|| {
-        "HOME is not set; cannot locate ~/.config/harbinger/pipelines".to_string()
-    })?;
-    Ok(PathBuf::from(home).join(".config/harbinger/pipelines"))
-}
-
-/// Ensure the runtime pipeline directory exists and contains at least
-/// `default.toml`, then return every `*.toml` pipeline found there.
-#[cfg(not(target_arch = "wasm32"))]
-pub fn list_user_pipelines() -> Result<Vec<PipelineFile>, String> {
-    list_user_pipelines_in(&user_pipeline_dir()?)
-}
-
-/// Load and parse a named pipeline from the runtime pipeline directory.
-#[cfg(not(target_arch = "wasm32"))]
-pub fn load_named_user_pipeline(name: &str) -> Result<Pipeline, String> {
-    load_named_user_pipeline_in(&user_pipeline_dir()?, name)
-}
-
-/// Create a new editable pipeline TOML by copying the default pipeline into the
-/// runtime directory under a unique `pipeline*.toml` name.
-#[cfg(not(target_arch = "wasm32"))]
-pub fn create_user_pipeline_from_default() -> Result<PipelineFile, String> {
-    create_user_pipeline_from_default_in(&user_pipeline_dir()?)
-}
-
-/// Create a new editable pipeline TOML with the given runtime pipeline name.
-#[cfg(not(target_arch = "wasm32"))]
-pub fn create_named_user_pipeline_from_default(name: &str) -> Result<PipelineFile, String> {
-    create_named_user_pipeline_from_default_in(&user_pipeline_dir()?, name)
-}
-
-#[cfg(not(target_arch = "wasm32"))]
-fn list_user_pipelines_in(dir: &Path) -> Result<Vec<PipelineFile>, String> {
+pub fn list_user_pipelines_in(dir: &Path) -> Result<Vec<PipelineFile>, String> {
     ensure_user_pipeline_dir(dir)?;
     let mut files = Vec::new();
     for entry in std::fs::read_dir(dir)
@@ -187,14 +153,14 @@ fn list_user_pipelines_in(dir: &Path) -> Result<Vec<PipelineFile>, String> {
 }
 
 #[cfg(not(target_arch = "wasm32"))]
-fn create_user_pipeline_from_default_in(dir: &Path) -> Result<PipelineFile, String> {
+pub fn create_user_pipeline_from_default_in(dir: &Path) -> Result<PipelineFile, String> {
     ensure_user_pipeline_dir(dir)?;
     let path = unique_pipeline_path(dir);
     write_default_pipeline_to_path(path)
 }
 
 #[cfg(not(target_arch = "wasm32"))]
-fn create_named_user_pipeline_from_default_in(
+pub fn create_named_user_pipeline_from_default_in(
     dir: &Path,
     name: &str,
 ) -> Result<PipelineFile, String> {
@@ -279,7 +245,7 @@ fn sort_pipeline_files(files: &mut [PipelineFile]) {
 }
 
 #[cfg(not(target_arch = "wasm32"))]
-fn load_named_user_pipeline_in(dir: &Path, name: &str) -> Result<Pipeline, String> {
+pub fn load_named_user_pipeline_in(dir: &Path, name: &str) -> Result<Pipeline, String> {
     let files = list_user_pipelines_in(dir)?;
     let file = files
         .into_iter()

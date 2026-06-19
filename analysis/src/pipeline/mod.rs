@@ -20,8 +20,8 @@ mod pass;
 pub use config::{DEFAULT_PIPELINE_TOML, Pipeline};
 #[cfg(not(target_arch = "wasm32"))]
 pub use config::{
-    PipelineFile, create_named_user_pipeline_from_default, create_user_pipeline_from_default,
-    list_user_pipelines, load_named_user_pipeline, user_pipeline_dir,
+    PipelineFile, create_named_user_pipeline_from_default_in, create_user_pipeline_from_default_in,
+    list_user_pipelines_in, load_named_user_pipeline_in,
 };
 pub use lifter::{LiftOutcome, LiftSummary, Lifter, PipelineServices};
 pub use pass::{
