@@ -9,7 +9,7 @@ mod dead_signature;
 mod stack_facts;
 mod summaries;
 
-pub use argpromote::argpromote;
+pub use argpromote::{RegPurityReason, argpromote, reg_purity};
 pub use binding::{bind_all_call_args, bind_call_args, resolve_arg_loads};
 pub use clobbered::{compute_clobbered_regs, set_clobbered_regs};
 pub use dead_signature::dead_signature;

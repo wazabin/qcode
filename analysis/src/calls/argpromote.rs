@@ -508,6 +508,7 @@ fn apply(
 // positional aggregate (slot i ↔ output register i) the caller replays.
 
 /// A function's register interface, recovered by [`scan_register_effects`].
+#[derive(Debug)]
 struct RegisterEffects {
     /// Registers the body loads — each becomes a by-value input parameter
     /// (over-approximated: a written-first register yields a dead param that
@@ -582,10 +583,74 @@ fn canonicalize_to_coarsest(ctx: &Context, regs: &[VarnodeId]) -> Option<Vec<Var
     Some(coarse)
 }
 
-/// Scan `fid` for register reads (inputs) and writes (outputs). Returns `None`
+/// Why a function is not register-pure (cannot be functionalized by
+/// [`argpromote_registers`]). Mirrors the gating in [`try_promote_registers`].
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum RegPurityReason {
+    /// External function — no body to functionalize.
+    External,
+    /// Lifted but has no root block (empty body).
+    NoBody,
+    /// Address-taken: reachable by an indirect call this pass can't rewrite.
+    AddressTaken,
+    /// Writes no registers, so there is nothing to functionalize.
+    NoRegisterWrites,
+    /// A register-write overlap group has no single covering register.
+    NonCanonicalRegisters,
+    /// No direct callers to thread by-value inputs / replayed outputs through.
+    NoCallers,
+}
+
+impl RegPurityReason {
+    /// One-line human-readable explanation, for display in the GUI / headless dump.
+    pub fn describe(self) -> &'static str {
+        match self {
+            RegPurityReason::External => "external function (no body to functionalize)",
+            RegPurityReason::NoBody => "no function body",
+            RegPurityReason::AddressTaken => {
+                "address-taken (reachable by indirect calls this pass can't rewrite)"
+            }
+            RegPurityReason::NoRegisterWrites => "writes no registers (nothing to functionalize)",
+            RegPurityReason::NonCanonicalRegisters => {
+                "register writes don't canonicalize to a coarsest register"
+            }
+            RegPurityReason::NoCallers => "no direct callers to thread inputs/outputs through",
+        }
+    }
+}
+
+/// Report whether `fid` is eligible to be functionalized into a register-pure
+/// function (`Ok`) or, if not, the gating reason (`Err`). A function whose
+/// [`Function::is_pure_reg`] is already set is necessarily `Ok`; this is the
+/// source of the "why not" shown for the rest.
+pub fn reg_purity(ctx: &Context, fid: FunctionId) -> Result<(), RegPurityReason> {
+    let f = Function::from_id(ctx, fid);
+    if f.is_external() {
+        return Err(RegPurityReason::External);
+    }
+    if f.root().is_none() {
+        return Err(RegPurityReason::NoBody);
+    }
+    if is_address_taken(ctx, fid) {
+        return Err(RegPurityReason::AddressTaken);
+    }
+    scan_register_effects(ctx, fid)?;
+    let has_caller = ctx
+        .instructions()
+        .any(|insn| matches!(insn.mnemonic(), Mnemonic::Call(c) if c.target == fid));
+    if !has_caller {
+        return Err(RegPurityReason::NoCallers);
+    }
+    Ok(())
+}
+
+/// Scan `fid` for register reads (inputs) and writes (outputs). Returns `Err`
 /// when there is no register write (nothing to functionalize) or an output
 /// overlap group has no single covering register.
-fn scan_register_effects(ctx: &Context, fid: FunctionId) -> Option<RegisterEffects> {
+fn scan_register_effects(
+    ctx: &Context,
+    fid: FunctionId,
+) -> Result<RegisterEffects, RegPurityReason> {
     let mut loaded: Vec<VarnodeId> = Vec::new();
     let mut stored: Vec<VarnodeId> = Vec::new();
     for block in Function::from_id(ctx, fid).blocks() {
@@ -612,9 +677,10 @@ fn scan_register_effects(ctx: &Context, fid: FunctionId) -> Option<RegisterEffec
         }
     }
     if stored.is_empty() {
-        return None;
+        return Err(RegPurityReason::NoRegisterWrites);
     }
-    let mut outputs = canonicalize_to_coarsest(ctx, &stored)?;
+    let mut outputs = canonicalize_to_coarsest(ctx, &stored)
+        .ok_or(RegPurityReason::NonCanonicalRegisters)?;
 
     // The rewritten body reads not only the originally-loaded registers but also
     // every output (the return write-set loads each one). An output written on
@@ -628,7 +694,8 @@ fn scan_register_effects(ctx: &Context, fid: FunctionId) -> Option<RegisterEffec
             read_set.push(o);
         }
     }
-    let mut inputs = canonicalize_to_coarsest(ctx, &read_set)?;
+    let mut inputs =
+        canonicalize_to_coarsest(ctx, &read_set).ok_or(RegPurityReason::NonCanonicalRegisters)?;
 
     let key = |ctx: &Context, vn: &VarnodeId| {
         let v = Varnode::from_id(ctx, *vn);
@@ -636,7 +703,7 @@ fn scan_register_effects(ctx: &Context, fid: FunctionId) -> Option<RegisterEffec
     };
     inputs.sort_by_key(|vn| key(ctx, vn));
     outputs.sort_by_key(|vn| key(ctx, vn));
-    Some(RegisterEffects { inputs, outputs })
+    Ok(RegisterEffects { inputs, outputs })
 }
 
 /// Rewrite `fid`'s **callee** side for its register effects: add a by-value param
@@ -749,7 +816,7 @@ fn try_promote_registers(ctx: &mut Context, fid: FunctionId) -> bool {
     if is_address_taken(ctx, fid) {
         return false;
     }
-    let Some(eff) = scan_register_effects(ctx, fid) else {
+    let Ok(eff) = scan_register_effects(ctx, fid) else {
         return false;
     };
 
@@ -1541,7 +1608,7 @@ mod tests {
             "
         );
         assert!(
-            scan_register_effects(&tc.ctx, f).is_none(),
+            scan_register_effects(&tc.ctx, f).unwrap_err() == RegPurityReason::NoRegisterWrites,
             "no write ⇒ nothing to promote"
         );
     }
@@ -1770,7 +1837,7 @@ mod tests {
         );
         let _ = (r0_lo32, mid, entry);
         assert!(
-            scan_register_effects(&tc.ctx, f).is_none(),
+            scan_register_effects(&tc.ctx, f).unwrap_err() == RegPurityReason::NonCanonicalRegisters,
             "partial overlap with no covering register must bail"
         );
     }
