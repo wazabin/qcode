@@ -242,6 +242,18 @@ fn scan_block_aliased(
     let mut live = live_seed.to_vec();
     let mut killed = killed_seed.to_vec();
 
+    // In a `pure_reg` function the whole architectural register file is
+    // functionalized into the returned write-set tuple — callers replay every
+    // output register from the tuple, never from the register file — so no
+    // register is live at the function's exit. A register store with no
+    // in-function reader is therefore dead, exactly like an explicit `dead_reg`.
+    // Like `dead_reg`s (and unlike `is_killed`) this does not require a covering
+    // store, so it also sees through the call barrier below. Sound *only* for
+    // `pure_reg`: otherwise registers are live-out per the calling convention.
+    let regs_dead_at_exit = BasicBlock::from_id(ctx, block_id)
+        .function()
+        .is_some_and(|f| f.is_pure_reg());
+
     for &id in insns.iter().rev() {
         match ctx.get_insn(id).mnemonic() {
             Mnemonic::Load(load) if !dead.contains(&id) => {
@@ -263,7 +275,8 @@ fn scan_block_aliased(
                     .iter()
                     .any(|l| l.space == store.space && aliases.may_alias(ctx, ptr, l.ptr));
                 let is_killed = ptr_iv.is_some_and(|iv| fully_covered_iv(&killed, iv));
-                let is_dead_reg = dead_regs.contains(&ptr);
+                let is_dead_reg = dead_regs.contains(&ptr)
+                    || (regs_dead_at_exit && is_reg_space(ctx, store.space));
                 if no_live_reader && (is_killed || is_dead_reg) {
                     dead.insert(id);
                 } else {

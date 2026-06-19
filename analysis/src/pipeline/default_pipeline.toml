@@ -186,14 +186,19 @@ scope = "function"
 passes = ["dce", "dead_store", "dce"]
 
 # Now that callees are functionalized and the dead replay stores/extracts are
-# swept, drop arguments no callee reads and returned write-set fields no caller
-# projects, rewriting every direct call site. Module-scoped (it edits call sites
-# across functions) and looped to a whole-program fixpoint; it runs `dce` on the
-# functions it dirties internally to expose the next round's opportunities.
+# swept, simplify the functionalized signatures, rewriting every direct call site.
+# Both passes are module-scoped (they edit call sites across functions) and looped
+# together to a whole-program fixpoint:
+#   * `partial_inline` recomputes a callee's cheap outputs (a small pure
+#     expression of its inputs) at every caller and kills the projecting extract,
+#     leaving the returned field unprojected;
+#   * `dead_signature` then drops arguments no callee reads and returned write-set
+#     fields no caller projects, and DCEs the functions it dirties.
+# A field one pass exposes can feed the other, so they share the loop.
 [[stage]]
 name = "dead-signature"
 scope = "module"
-passes = ["dead_signature"]
+passes = ["partial_inline", "dead_signature"]
 repeat_until = "no_change"
 
 # Aesthetic changes. `include_external` so the demangler also reaches imported

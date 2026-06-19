@@ -268,24 +268,17 @@ fn ensure_user_pipeline_dir(dir: &Path) -> Result<(), String> {
     std::fs::create_dir_all(dir)
         .map_err(|e| format!("failed to create pipeline directory {}: {e}", dir.display()))?;
 
-    let mut has_toml = false;
-    for entry in std::fs::read_dir(dir)
-        .map_err(|e| format!("failed to read pipeline directory {}: {e}", dir.display()))?
-    {
-        let entry = entry.map_err(|e| {
-            format!(
-                "failed to read an entry in pipeline directory {}: {e}",
-                dir.display()
-            )
-        })?;
-        if entry.path().extension().and_then(|e| e.to_str()) == Some("toml") {
-            has_toml = true;
-            break;
-        }
-    }
-
-    if !has_toml {
-        let path = dir.join(DEFAULT_PIPELINE_FILE);
+    // `default.toml` is a *managed* file: we keep it byte-for-byte in sync with
+    // the embedded `DEFAULT_PIPELINE_TOML` so that pipeline changes shipped in
+    // the binary take effect without the user having to delete a stale copy. (A
+    // copy made by an older binary would otherwise shadow the embedded default
+    // forever — e.g. miss a newly added pass.) Users who want a customized
+    // pipeline create a differently-named file; `default` is not theirs to edit.
+    let path = dir.join(DEFAULT_PIPELINE_FILE);
+    let up_to_date = std::fs::read_to_string(&path)
+        .map(|existing| existing == DEFAULT_PIPELINE_TOML)
+        .unwrap_or(false);
+    if !up_to_date {
         std::fs::write(&path, DEFAULT_PIPELINE_TOML)
             .map_err(|e| format!("failed to write default pipeline {}: {e}", path.display()))?;
     }
@@ -1010,6 +1003,35 @@ mod tests {
         assert!(files[0].description.contains("Default whole-program"));
         assert!(files[0].path.ends_with(DEFAULT_PIPELINE_FILE));
         load_named_user_pipeline_in(&dir, "default").expect("seeded default pipeline parses");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn stale_default_is_resynced_to_embedded() {
+        let dir = std::env::temp_dir().join(format!(
+            "harbinger-pipelines-resync-test-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("system clock after Unix epoch")
+                .as_nanos()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("create temp pipeline dir");
+        // A `default.toml` written by an older binary (here, arbitrary stale
+        // content) must be overwritten with the embedded default, not preserved.
+        let default_path = dir.join(DEFAULT_PIPELINE_FILE);
+        std::fs::write(&default_path, "description = \"stale\"\n").expect("write stale default");
+
+        list_user_pipelines_in(&dir).expect("runtime pipelines list");
+
+        assert_eq!(
+            std::fs::read_to_string(&default_path).expect("read resynced default"),
+            DEFAULT_PIPELINE_TOML,
+            "default.toml is kept in sync with the embedded pipeline"
+        );
 
         let _ = std::fs::remove_dir_all(&dir);
     }
