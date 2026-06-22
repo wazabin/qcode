@@ -215,7 +215,9 @@ pub fn make_pass(name: &str) -> Option<RegisteredPass> {
 
 /// The inner pass name of a `module(<inner>)` adapter spelling, if `name` is one.
 fn module_adapter_inner(name: &str) -> Option<&str> {
-    name.strip_prefix("module(")?.strip_suffix(')').map(str::trim)
+    name.strip_prefix("module(")?
+        .strip_suffix(')')
+        .map(str::trim)
 }
 
 /// A [`FunctionPass`] adapted to run module-wide. A `module(<fn_pass>)` entry in a

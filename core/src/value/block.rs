@@ -555,9 +555,23 @@ impl<'str, 'ctx> BlockMutRef<'str, 'ctx> {
         self.inner_mut().instructions.extend_from_slice(insns);
     }
 
-    /// Removes this block from `function_id`'s block list and clears its parent.
+    /// Removes this block from `function_id`'s block list, unlinks every CFG
+    /// edge incident to it, and clears its parent.
+    ///
+    /// Detaching the edges is what keeps a deleted block from leaving phantom
+    /// predecessors/successors on its neighbours (e.g. an unrolled-away loop
+    /// body whose stale exit edge would otherwise inflate the exit block's
+    /// predecessor count and block `simplify_cfg` from merging it).
     pub fn delete(&mut self, function_id: FunctionId) {
         let id = self.id;
+
+        // Snapshot first: `remove_cfg_edge` mutates this block's edge set. A
+        // self-loop appears once in the set and unlinks cleanly (both endpoints
+        // are this block, so the second remove is a no-op).
+        let edges: Vec<EdgeId> = self.inner().edges.iter().copied().collect();
+        for edge in edges {
+            self.ctx.remove_cfg_edge(edge);
+        }
 
         Function::from_id_mut(self.ctx, function_id)
             .inner_mut()
@@ -1022,5 +1036,68 @@ mod tests {
                 "cloned instruction still references original value {arg:?}"
             );
         }
+    }
+
+    /// Regression: deleting a block must unlink its CFG edges, so it leaves no
+    /// phantom predecessor on a block it used to branch to. (An unrolled-away
+    /// loop body's stale exit edge would otherwise inflate the exit block's
+    /// predecessor count and block `simplify_cfg` from merging it.)
+    #[test]
+    fn delete_unlinks_incident_edges() {
+        let mut ctx = Context::new();
+        qcode!(
+            ctx,
+            "
+            fn f:
+            <a>
+                goto <exit>;
+            <b>
+                goto <exit>;
+            <exit>
+                return [i64 0];
+            "
+        );
+
+        assert_eq!(BasicBlock::from_id(&ctx, exit).predecessors().count(), 2);
+
+        BasicBlock::from_id_mut(&mut ctx, b).delete(f);
+
+        assert_eq!(
+            BasicBlock::from_id(&ctx, exit).predecessors().count(),
+            1,
+            "deleted block's edge must not linger as a phantom predecessor"
+        );
+        assert_eq!(BasicBlock::from_id(&ctx, b).successors().count(), 0);
+    }
+
+    /// A self-loop edge appears once in the block's edge set and must unlink
+    /// cleanly on delete without double-removal trouble.
+    #[test]
+    fn delete_unlinks_self_loop() {
+        let mut ctx = Context::new();
+        qcode!(
+            ctx,
+            "
+            fn f:
+            <a>
+                goto <loop_hdr>;
+            <loop_hdr>
+                goto <loop_hdr>;
+            "
+        );
+
+        assert!(
+            BasicBlock::from_id(&ctx, loop_hdr)
+                .successors()
+                .any(|(_, s)| s == loop_hdr)
+        );
+
+        BasicBlock::from_id_mut(&mut ctx, loop_hdr).delete(f);
+
+        assert_eq!(BasicBlock::from_id(&ctx, loop_hdr).successors().count(), 0);
+        assert_eq!(
+            BasicBlock::from_id(&ctx, loop_hdr).predecessors().count(),
+            0
+        );
     }
 }

@@ -81,7 +81,10 @@ fn try_promote_stack(ctx: &mut Context, fid: FunctionId, stack_ptr: RegisterId) 
             return false;
         }
     }
-    let root = Function::from_id(ctx, fid).root().expect("checked above").id;
+    let root = Function::from_id(ctx, fid)
+        .root()
+        .expect("checked above")
+        .id;
     let default_space = ctx.default_space;
 
     // The caller-arg position carrying the stack pointer: the root param named
@@ -90,10 +93,14 @@ fn try_promote_stack(ctx: &mut Context, fid: FunctionId, stack_ptr: RegisterId) 
     let Some(sp_name) = ctx.get_register(stack_ptr).name().map(str::to_owned) else {
         return false;
     };
-    let params: Vec<BlockParamId> = BasicBlock::from_id(ctx, root).params().map(|p| p.id).collect();
-    let Some(rsp_idx) = params.iter().position(|&pid| {
-        ctx.values.block_params[pid].name.as_deref() == Some(sp_name.as_str())
-    }) else {
+    let params: Vec<BlockParamId> = BasicBlock::from_id(ctx, root)
+        .params()
+        .map(|p| p.id)
+        .collect();
+    let Some(rsp_idx) = params
+        .iter()
+        .position(|&pid| ctx.values.block_params[pid].name.as_deref() == Some(sp_name.as_str()))
+    else {
         return false;
     };
 
