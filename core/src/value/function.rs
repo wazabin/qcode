@@ -208,6 +208,17 @@ where
     }
 
     /// Registers read before written (function inputs), as inferred by analysis.
+    ///
+    /// Legacy ABI input-register list. It is **`None` for `pure_reg` functions**
+    /// (argpromote never populates it); their by-value root block params are the
+    /// source of truth for the call interface, so prefer the params (e.g.
+    /// [`input_arg_name`](Self::input_arg_name)). Retained only for the
+    /// conventional/external calling-convention path (`bind_call_args`,
+    /// `summaries`).
+    #[deprecated(
+        note = "legacy ABI register list; None for pure_reg functions. Use the root block params \
+                as the call interface; this remains only for the conventional/external path."
+    )]
     pub fn input_regs(&'s self) -> Option<&'ctx [VarnodeId]> {
         self.inner()
             .signature
@@ -222,6 +233,26 @@ where
     /// argument reads with the same name as the callee's promoted stack
     /// parameter. `None` when there is no input at `index`.
     pub fn input_arg_name(&'s self, index: usize) -> Option<String> {
+        // The root block param at `index` is the interface element a call
+        // argument actually binds to, named after its register by
+        // `argpromote_registers` or `stack_<addr>` by mem2reg's
+        // `block_param_name_for_var`. Prefer it: it is the source of truth and is
+        // populated even for `pure_reg` functions, whose ABI register list
+        // (`input_regs`) is never filled in.
+        if let Some(root) = self.root()
+            && let Some(name) = root
+                .params()
+                .nth(index)
+                .and_then(|p| p.name().map(str::to_owned))
+        {
+            return Some(name);
+        }
+
+        // Fall back to the inferred input-register list: a register name, or a
+        // synthesized `stack_<addr>` slot name for a stack-passed input.
+        // Intentional use of the legacy list — only reached when the param has no
+        // name (conventional functions, never `pure_reg`).
+        #[allow(deprecated)]
         let input = self.input_regs()?.get(index).copied()?;
         let vn = Varnode::from_id(self.ctx(), input);
         if let Some(name) = vn.name() {
@@ -557,6 +588,13 @@ impl<'str, 'ctx> FunctionMutRef<'str, 'ctx> {
     }
 
     /// Records the analysis-inferred input (live-in) register set on this function.
+    ///
+    /// Legacy ABI input-register list — see [`input_regs`](Self::input_regs).
+    /// Not set for `pure_reg` functions, whose param interface supersedes it.
+    #[deprecated(
+        note = "legacy ABI register list; None for pure_reg functions. Use the root block params \
+                as the call interface; this remains only for the conventional/external path."
+    )]
     pub fn set_input_regs(&mut self, regs: Vec<VarnodeId>) {
         self.inner_mut().signature.get_or_insert_default().inputs = Some(regs);
     }

@@ -3,17 +3,21 @@
 //! backs them, and the clobbered-register computation.
 
 mod argpromote;
+mod argpromote_stack;
 mod binding;
 mod clobbered;
 mod dead_signature;
+mod interface;
 mod partial_inline;
 mod stack_facts;
 mod summaries;
 
-pub use argpromote::{RegPurityReason, argpromote, reg_purity};
+pub use argpromote::{RegPurityReason, argpromote, argpromote_registers, reg_purity};
+pub use argpromote_stack::argpromote_stack;
 pub use binding::{bind_all_call_args, bind_call_args, resolve_arg_loads};
 pub use clobbered::{compute_clobbered_regs, set_clobbered_regs};
 pub use dead_signature::dead_signature;
+pub use interface::{append_caller_arg, append_entry_param, remove_entry_param};
 pub use partial_inline::partial_inline;
 pub use stack_facts::{learn_stack_facts, seed_stack_facts};
 pub use summaries::{

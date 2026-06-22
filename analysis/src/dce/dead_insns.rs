@@ -2,10 +2,7 @@ use rustc_hash::FxHashSet as HashSet;
 
 use qcode::{
     context::Context,
-    value::{
-        BasicBlock, BlockId, Function, FunctionId, InstructionId,
-        insn::{Call, Mnemonic},
-    },
+    value::{BasicBlock, BlockId, FunctionId, InstructionId, insn::Mnemonic},
 };
 
 /// Returns instructions in `block_id` that are pure and have no users.
@@ -86,7 +83,7 @@ pub fn remove_unused_no_pred_block_params(ctx: &mut Context, block_id: BlockId) 
             .collect();
         // Remove high index first so the lower indices stay valid.
         for &index in dead.iter().rev() {
-            remove_entry_param(ctx, fid, index);
+            crate::remove_entry_param(ctx, fid, index);
         }
         return !dead.is_empty();
     }
@@ -108,69 +105,6 @@ pub fn remove_unused_no_pred_block_params(ctx: &mut Context, block_id: BlockId) 
         ctx.values.basic_blocks[block_id].params = kept;
     }
     changed
-}
-
-/// Remove the entry param at position `index` from `fid` and keep its interface
-/// aligned: drop the root block param, the `input_regs[index]` entry, and the
-/// `Call.args[index]` argument at every direct caller, all in lockstep.
-///
-/// This is the single ABI-consistent entry-param removal both this module's
-/// dead-param sweep and `dead_signature` route through, so a `pure_reg`
-/// function's `param[i] ↔ input_regs[i] ↔ arg[i]` alignment holds by
-/// construction after any removal. The caller must ensure the param has no
-/// remaining users.
-pub fn remove_entry_param(ctx: &mut Context, fid: FunctionId, index: usize) {
-    let Some(root) = Function::from_id(ctx, fid).root().map(|b| b.id) else {
-        return;
-    };
-
-    // Drop the root param at `index`, reindexing the survivors.
-    let mut params = ctx.values.basic_blocks[root].params.clone();
-    if index >= params.len() {
-        return;
-    }
-    let removed = params.remove(index);
-    ctx.values.block_params[removed].parent = None;
-    for (i, &p) in params.iter().enumerate() {
-        ctx.values.block_params[p].index = i;
-    }
-    ctx.values.basic_blocks[root].params = params;
-
-    // Drop the matching input-register entry.
-    if let Some(inputs) = Function::from_id(ctx, fid).input_regs()
-        && index < inputs.len()
-    {
-        let mut inputs = inputs.to_vec();
-        inputs.remove(index);
-        Function::from_id_mut(ctx, fid).set_input_regs(inputs);
-    }
-
-    // Drop the matching positional argument at every direct caller.
-    let call_sites: Vec<InstructionId> = ctx
-        .instructions()
-        .filter_map(|insn| match insn.mnemonic() {
-            Mnemonic::Call(c) if c.target == fid => Some(insn.id),
-            _ => None,
-        })
-        .collect();
-    for call_id in call_sites {
-        let Mnemonic::Call(call) = ctx.get_insn(call_id).mnemonic().clone() else {
-            continue;
-        };
-        if index >= call.args.len() {
-            continue;
-        }
-        let mut args = call.args;
-        args.remove(index);
-        ctx.replace_instruction_mnemonic(
-            call_id,
-            Mnemonic::Call(Call {
-                target: call.target,
-                args,
-                clobbers: call.clobbers,
-            }),
-        );
-    }
 }
 
 #[cfg(test)]

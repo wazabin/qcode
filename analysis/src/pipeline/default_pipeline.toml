@@ -85,12 +85,27 @@ passes = ["brighten"]
 
 # Promote to a fixpoint: each round may expose a register as the symbolic stack
 # base, then const-fold rewrites its arithmetic into stack-slot literals that
-# become promotable on the next round.
+# become promotable on the next round. mem2reg also promotes each load-only
+# caller-frame stack slot into a root param (recording the slot literal as the
+# param's `origin`), the source of truth for which stack inputs a function has.
 [[stage]]
 name = "promote"
 scope = "function"
 passes = ["mem2reg", "const_fold"]
 repeat_until = "no_change"
+
+# Functionalize the stack-input channel of pure-reg functions (legacy
+# `bind_call_args` stays bypassed for them). Runs *after* `promote`: it consumes
+# the stack-input params mem2reg already promoted, reading each one's `origin`
+# offset and backfilling the matching positional caller argument
+# (`load(rsp_arg + (offset - ptr_width))`) at every direct call site. It does not
+# re-detect slots or mint params — mem2reg owns that — so there is no race or
+# duplicated logic. Module-scoped because it rewrites call sites across functions;
+# the caller-side loads it inserts are forwarded by the following `gvn`.
+[[stage]]
+name = "argpromote-stack"
+scope = "module"
+passes = ["argpromote_stack"]
 
 [[stage]]
 name = "gvn"

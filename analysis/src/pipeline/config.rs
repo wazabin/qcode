@@ -75,6 +75,10 @@ struct StageConfig {
     /// a following dirty-only stage runs on all functions if a module pass changed.
     #[serde(default)]
     only_dirty: bool,
+    /// Debugging aid: function selectors (name, or decimal/hex address) whose
+    /// QCode is dumped to stderr before this stage runs. Empty in normal use.
+    #[serde(default)]
+    dump: Vec<String>,
 }
 
 #[derive(Deserialize, Clone, Copy, PartialEq, Eq)]
@@ -105,6 +109,8 @@ struct Stage {
     include_external: bool,
     /// Restrict this function-scoped stage to functions dirtied by the previous stage.
     only_dirty: bool,
+    /// Function selectors whose QCode is dumped before the stage (see [`StageConfig`]).
+    dump: Vec<String>,
 }
 
 /// A parsed, name-resolved analysis pipeline ready to run.
@@ -323,6 +329,7 @@ impl Pipeline {
                 repeat_until: sc.repeat_until,
                 include_external: sc.include_external,
                 only_dirty: sc.only_dirty,
+                dump: sc.dump,
             });
         }
         Ok(Pipeline { stages })
@@ -340,6 +347,7 @@ impl Pipeline {
             repeat_until: None,
             include_external: false,
             only_dirty: false,
+            dump: Vec::new(),
         };
         Ok(Pipeline {
             stages: vec![Stage {
@@ -348,6 +356,7 @@ impl Pipeline {
                 repeat_until: None,
                 include_external: sc.include_external,
                 only_dirty: sc.only_dirty,
+                dump: Vec::new(),
             }],
         })
     }
@@ -591,6 +600,29 @@ fn resolve_module_passes(sc: &StageConfig) -> Result<Vec<Box<dyn DynPass>>, Stri
     Ok(resolved)
 }
 
+/// Dump the QCode of a stage's `dump` functions to stderr before it runs. A
+/// selector matches a function by exact name or by decimal/hex address; an
+/// unmatched selector is reported rather than silently skipped.
+fn dump_stage_inputs(ctx: &Context, dump: &[String], stage_name: &str) {
+    for sel in dump {
+        let addr = sel
+            .strip_prefix("0x")
+            .and_then(|h| u64::from_str_radix(h, 16).ok())
+            .or_else(|| sel.parse::<u64>().ok());
+        let target = ctx
+            .functions()
+            .find(|f| f.name() == sel.as_str() || (addr.is_some() && f.address() == addr))
+            .map(|f| f.id);
+        match target {
+            Some(fid) => {
+                eprintln!("==== dump before stage \"{stage_name}\": {sel} ====");
+                eprint!("{}", FunctionRef::from_id(ctx, fid));
+            }
+            None => eprintln!("==== dump before stage \"{stage_name}\": {sel} (not found) ===="),
+        }
+    }
+}
+
 fn unknown_pass(name: &str, stage: &str) -> String {
     format!(
         "unknown pass \"{name}\" in stage \"{stage}\". Known passes: {}",
@@ -608,6 +640,7 @@ async fn run_module_stage(
     round: usize,
     progress: &mut impl ProgressSink,
 ) -> Result<bool, String> {
+    dump_stage_inputs(ctx, &stage.dump, &stage.name);
     let stage_name: std::sync::Arc<str> = stage.name.as_str().into();
     let mut iters = 0;
     let mut stage_changed = false;
@@ -659,6 +692,7 @@ async fn run_lifting_module_stage(
     round: usize,
     progress: &mut impl ProgressSink,
 ) -> Result<bool, String> {
+    dump_stage_inputs(ctx, &stage.dump, &stage.name);
     let stage_name: std::sync::Arc<str> = stage.name.as_str().into();
     let mut iters = 0;
     let mut stage_changed = false;
@@ -827,6 +861,7 @@ async fn run_function_stage(
     round: usize,
     progress: &mut impl ProgressSink,
 ) -> Result<HashSet<FunctionId>, String> {
+    dump_stage_inputs(ctx, &stage.dump, &stage.name);
     let fun_ids: Vec<FunctionId> = ctx
         .functions()
         .filter(|f| stage.include_external || !f.is_external())

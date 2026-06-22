@@ -195,10 +195,62 @@ pub struct PassRegistration {
 inventory::collect!(PassRegistration);
 
 /// Construct the pass registered under `name`, or `None` if unknown.
+///
+/// The `module(<fn_pass>)` spelling resolves to a [`ModuleFnAdapter`] over the
+/// named per-function pass, so a function pass can run in a module-scoped stage
+/// (see the adapter docs).
 pub fn make_pass(name: &str) -> Option<RegisteredPass> {
+    if let Some(inner) = module_adapter_inner(name) {
+        // `module(...)` only wraps a per-function pass; wrapping a module pass
+        // (or an unknown name) is a config error and fails to resolve.
+        let RegisteredPass::Function(inner) = make_pass(inner)? else {
+            return None;
+        };
+        return Some(RegisteredPass::Module(Box::new(ModuleFnAdapter { inner })));
+    }
     inventory::iter::<PassRegistration>()
         .find(|r| r.name == name)
         .map(|r| (r.make)())
+}
+
+/// The inner pass name of a `module(<inner>)` adapter spelling, if `name` is one.
+fn module_adapter_inner(name: &str) -> Option<&str> {
+    name.strip_prefix("module(")?.strip_suffix(')').map(str::trim)
+}
+
+/// A [`FunctionPass`] adapted to run module-wide. A `module(<fn_pass>)` entry in a
+/// module-scoped stage runs the wrapped per-function pass over every non-external
+/// function exactly once, OR-ing their change flags.
+///
+/// Its purpose is to let a function pass join a module stage's `repeat_until`
+/// fixpoint — e.g. looping `argpromote_stack` (module) together with
+/// `module(mem2reg)` / `module(const_fold)` until the stack arguments are fully
+/// threaded — without minting a bespoke module pass per function pass. The
+/// `module(...)` spelling keeps it visible in the TOML that the underlying pass is
+/// a function pass being run program-wide.
+struct ModuleFnAdapter {
+    inner: Box<dyn DynFunctionPass>,
+}
+
+impl DynPass for ModuleFnAdapter {
+    fn name(&self) -> &'static str {
+        self.inner.name()
+    }
+    fn description(&self) -> &'static str {
+        self.inner.description()
+    }
+    fn run(&self, ctx: &mut Context, env: &PipelineEnv) -> Result<bool, String> {
+        let fun_ids: Vec<FunctionId> = ctx
+            .functions()
+            .filter(|f| !f.is_external())
+            .map(|f| f.id)
+            .collect();
+        let mut changed = false;
+        for fun_id in fun_ids {
+            changed |= self.inner.run(ctx, fun_id, env)?;
+        }
+        Ok(changed)
+    }
 }
 
 /// Register a per-function pass. Place one call in the pass's own module; the
