@@ -50,13 +50,14 @@
 
 use std::borrow::Cow;
 
+use jstd::graph::analysis::compute_dominators;
 use qcode::{
     builder::Builder,
     context::Context,
     space::{SpaceId, SpaceType},
     types::AggregateField,
     value::{
-        BasicBlock, Function, FunctionId, Instruction, Value, ValueId, Varnode, VarnodeId,
+        BasicBlock, BlockId, Function, FunctionId, Instruction, Value, ValueId, Varnode, VarnodeId,
         insn::{Binop, Call, InstructionId, IntBinop, Mnemonic},
     },
 };
@@ -66,9 +67,16 @@ use crate::{Pass, PipelineEnv, value_range};
 /// Promotes every eligible by-reference in/out parameter in the module. Returns
 /// `true` if anything changed.
 pub fn argpromote(ctx: &mut Context) -> bool {
+    // One shadow space shared by *every* promoted function and every promoted
+    // pointer within it. The shadow is only a tag for alias analysis and a key for
+    // store-to-load forwarding; functions execute independently, so sharing one
+    // SpaceId across them is sound. Using a single space (rather than one per
+    // `apply`) keeps a function's snapshot seed and its redirected body accesses in
+    // the *same* space, so the seed store forwards into the body's loads.
+    let shadow = ctx.make_temp_space();
     let mut changed = false;
     for fid in ctx.function_ids() {
-        if try_promote(ctx, fid) {
+        if try_promote(ctx, fid, shadow) {
             changed = true;
         }
     }
@@ -113,7 +121,7 @@ enum ParamUse {
     Escape,
 }
 
-fn try_promote(ctx: &mut Context, fid: FunctionId) -> bool {
+fn try_promote(ctx: &mut Context, fid: FunctionId, shadow: SpaceId) -> bool {
     let f = Function::from_id(ctx, fid);
     if f.is_external() {
         return false;
@@ -137,8 +145,14 @@ fn try_promote(ctx: &mut Context, fid: FunctionId) -> bool {
         return false;
     }
 
-    // A single return block keeps every written address dominating the return,
-    // so the write-set can load each one's final value there.
+    // Every return block carries its own copy of the write-set (the register
+    // channel already emits a per-return tuple we append to). With more than one
+    // return we additionally require each written address to *dominate every
+    // return* (see [`writes_dominate_returns`]): then the write executes on every
+    // path, so reloading the shadow at each return reads the value the caller must
+    // replay — no path-dependent "no-op replay" arises, and the address value is
+    // in scope at every return. Path-dependent writes (the union-with-seeding case
+    // of the design) are left for a follow-up.
     let returns: Vec<InstructionId> = Function::from_id(ctx, fid)
         .iter()
         .filter_map(|b| {
@@ -146,9 +160,9 @@ fn try_promote(ctx: &mut Context, fid: FunctionId) -> bool {
             matches!(last.mnemonic(), Mnemonic::Return(_)).then_some(last.id)
         })
         .collect();
-    let &[ret_id] = returns.as_slice() else {
+    if returns.is_empty() {
         return false;
-    };
+    }
 
     // Classify every named root parameter. Dereferenced pointers are promoted and
     // share one shadow space (so aliasing among them stays correct); a leaked
@@ -183,12 +197,54 @@ fn try_promote(ctx: &mut Context, fid: FunctionId) -> bool {
         }
     }
 
+    // Multi-return soundness gate (see above): every written address must dominate
+    // all returns. A single return trivially satisfies this (it post-dominates the
+    // whole body), so skip the dominator computation in that common case.
+    if returns.len() > 1 && !writes_dominate_returns(ctx, root, &promoted, &returns) {
+        return false;
+    }
+
     // Nothing to move to the caller unless some promoted pointer is written.
     if promoted.iter().all(|p| p.write_targets.is_empty()) {
         return false;
     }
 
-    apply(ctx, fid, promoted, ret_id)
+    apply(ctx, fid, promoted, returns, shadow)
+}
+
+/// `true` if every promoted **store** dominates *all* of `returns` — the soundness
+/// condition for building the write-set at every return (see [`try_promote`]). When
+/// a store dominates every return it executes on every path, so the shadow holds the
+/// written value at each return and no unseeded "no-op replay" path can arise. A
+/// path-dependent write (in only one arm) fails this and the function is left alone.
+/// (The store's *address* is recomputed before the store, so address-dominance
+/// follows from store-dominance — we check the store block directly.)
+fn writes_dominate_returns(
+    ctx: &Context,
+    root: BlockId,
+    promoted: &[Promoted],
+    returns: &[InstructionId],
+) -> bool {
+    let ret_blocks: Vec<BlockId> = returns
+        .iter()
+        .filter_map(|&r| ctx.get_insn(r).parent().map(|b| b.id))
+        .collect();
+    if ret_blocks.len() != returns.len() {
+        return false;
+    }
+    let tree = compute_dominators(ctx, root);
+    promoted.iter().all(|p| {
+        p.accesses.iter().all(|&acc| {
+            // Only stores constrain the write-set; a load may sit anywhere.
+            if !matches!(ctx.get_insn(acc).mnemonic(), Mnemonic::Store(_)) {
+                return true;
+            }
+            let Some(store_block) = ctx.get_insn(acc).parent().map(|b| b.id) else {
+                return false;
+            };
+            ret_blocks.iter().all(|&rb| tree.dominates(store_block, rb))
+        })
+    })
 }
 
 /// `true` if `function_id` makes any call (direct or indirect).
@@ -200,10 +256,18 @@ fn function_makes_call(ctx: &Context, function_id: FunctionId) -> bool {
 }
 
 /// The call-argument index whose synthesized name matches `name`.
+///
+/// Indexes over the root block's parameters, *not* `input_regs`: a `pure_reg`
+/// callee (the functions this pass augments after the register/stack channels)
+/// never has its ABI register list filled in, so `input_regs` is empty and the
+/// pointer — passed positionally, whether in a register or on the stack — would
+/// otherwise be unfindable, bailing the whole function. The root params are the
+/// real call interface and are in lockstep with `Call.args` (see
+/// [`Function::input_arg_name`]), so a param's index *is* its argument index.
 fn arg_index_of(ctx: &Context, fid: FunctionId, name: &str) -> Option<usize> {
     let len = Function::from_id(ctx, fid)
-        .input_regs()
-        .map_or(0, |i| i.len());
+        .root()
+        .map_or(0, |b| b.params().count());
     (0..len).find(|&i| Function::from_id(ctx, fid).input_arg_name(i).as_deref() == Some(name))
 }
 
@@ -332,13 +396,14 @@ fn analyze_param(ctx: &Context, param: ValueId) -> ParamUse {
 }
 
 /// Rewrite `fid` and every direct caller into the shadow-memory / write-set form.
-/// `ret_id` is the function's single `Return`. Returns `false` if a precondition
-/// fails late (e.g. no callers).
+/// `returns` is every `Return` in the function (the write-set is appended at each).
+/// Returns `false` if a precondition fails late (e.g. no callers).
 fn apply(
     ctx: &mut Context,
     fid: FunctionId,
     mut promoted: Vec<Promoted>,
-    ret_id: InstructionId,
+    returns: Vec<InstructionId>,
+    shadow: SpaceId,
 ) -> bool {
     let call_sites: Vec<InstructionId> = ctx
         .instructions()
@@ -352,10 +417,10 @@ fn apply(
     }
 
     let ram = ctx.default_space;
-    // One private shadow space shared by every promoted pointer, keyed by the
-    // real address values: equal addresses collide here, so aliasing among the
-    // pointers stays correct without any anti-alias gate.
-    let shadow = ctx.make_temp_space();
+    // `shadow` is the module-wide argpromote shadow space (see `argpromote`): equal
+    // addresses collide here, so aliasing among the pointers stays correct without
+    // any anti-alias gate, and a function's snapshot seed shares the space of its
+    // redirected body accesses so the seed forwards into them.
     let root = Function::from_id(ctx, fid).root().map(|b| b.id).unwrap();
 
     // Deterministic order shared by the callee (param creation) and the callers
@@ -407,36 +472,70 @@ fn apply(
         }
     }
 
-    // Build the write-set `((addr, final_value), …)` from the shadow at the
-    // single return, and hand it back through `Return::value`. A real
-    // register-based return is left untouched on its own channel.
-    let ret_block = ctx.get_insn(ret_id).parent().map(|b| b.id).unwrap();
-    let writeset_val = {
-        let mut b = Builder::from_block(BasicBlock::from_id_mut(ctx, ret_block));
-        b.set_insert_point_before(ret_id);
-        let mut pairs: Vec<ValueId> = Vec::new();
-        for (addr, size) in &write_targets {
-            let v = b.push_load::<false>(*addr, *size, shadow).id();
-            let pair = b
-                .push_named_tuple(vec![("addr".to_owned(), *addr), ("value".to_owned(), v)])
-                .id;
-            pairs.push(ValueId::Instruction(pair));
+    // Build the write-set at *every* return. The register/stack channels (which
+    // run earlier) may have already populated each return's `Return::value` with a
+    // flat write-set `Tuple` of this function's register outputs; we *append* our
+    // `(addr, value)` memory pairs after those fields so both channels share one
+    // aggregate — never clobber the register write-set. Soundness for >1 return is
+    // guaranteed by the dominance gate in `try_promote`: each written address is in
+    // scope and written on every path, so reloading the shadow here is well-defined.
+    // `base_len` (uniform across returns — the register channel emits the same
+    // output fields everywhere) is how many register fields precede ours, the offset
+    // the caller's memory-replay extracts must skip past.
+    let mut base_len = 0usize;
+    let mut writeset_ty = None;
+    for &ret_id in &returns {
+        let ret_block = ctx.get_insn(ret_id).parent().map(|b| b.id).unwrap();
+        let base_fields: Vec<(String, ValueId)> = match ctx.get_insn(ret_id).mnemonic() {
+            Mnemonic::Return(r) => match r.value {
+                Some(val @ ValueId::Instruction(tid)) => {
+                    match ctx.get_insn(tid).mnemonic().clone() {
+                        Mnemonic::Tuple(t) => {
+                            let ty = ctx.type_of(val);
+                            t.fields
+                                .iter()
+                                .enumerate()
+                                .map(|(i, &v)| {
+                                    let name = ctx
+                                        .types
+                                        .field_name(ty, i)
+                                        .map(str::to_owned)
+                                        .unwrap_or_else(|| format!("field{}", i + 1));
+                                    (name, v)
+                                })
+                                .collect()
+                        }
+                        _ => Vec::new(),
+                    }
+                }
+                _ => Vec::new(),
+            },
+            _ => Vec::new(),
+        };
+        base_len = base_fields.len();
+        let writeset_val = {
+            let mut b = Builder::from_block(BasicBlock::from_id_mut(ctx, ret_block));
+            b.set_insert_point_before(ret_id);
+            let mut fields = base_fields;
+            for (i, (addr, size)) in write_targets.iter().enumerate() {
+                let v = b.push_load::<false>(*addr, *size, shadow).id();
+                let pair = b
+                    .push_named_tuple(vec![("addr".to_owned(), *addr), ("value".to_owned(), v)])
+                    .id;
+                fields.push((format!("write{}", i + 1), ValueId::Instruction(pair)));
+            }
+            ValueId::Instruction(b.push_named_tuple(fields).id)
+        };
+        {
+            let mut m = ctx.get_insn(ret_id).mnemonic().clone();
+            if let Mnemonic::Return(ref mut r) = m {
+                r.value = Some(writeset_val);
+            }
+            ctx.replace_instruction_mnemonic(ret_id, m);
         }
-        let fields = pairs
-            .into_iter()
-            .enumerate()
-            .map(|(i, value)| (format!("write{}", i + 1), value))
-            .collect();
-        ValueId::Instruction(b.push_named_tuple(fields).id)
-    };
-    {
-        let mut m = ctx.get_insn(ret_id).mnemonic().clone();
-        if let Mnemonic::Return(ref mut r) = m {
-            r.value = Some(writeset_val);
-        }
-        ctx.replace_instruction_mnemonic(ret_id, m);
+        writeset_ty = Some(ctx.type_of(writeset_val));
     }
-    let writeset_ty = ctx.type_of(writeset_val);
+    let writeset_ty = writeset_ty.expect("returns is non-empty");
 
     // ---- caller rewrite -----------------------------------------------------
     let n_writes = write_targets.len();
@@ -470,8 +569,11 @@ fn apply(
                 clobbers,
             }),
         );
-        // The call now produces the write-set aggregate.
-        Instruction::from_id_mut(ctx, call_id).set_type(writeset_ty);
+        // The call now produces the write-set aggregate. Use the resizing setter:
+        // the register channel may have already typed this call to its (smaller)
+        // register-only write-set, and we are *growing* it with the appended
+        // memory pairs — a legitimate aggregate resize, like `dead_signature`'s.
+        Instruction::from_id_mut(ctx, call_id).set_type_resized(writeset_ty);
 
         // Replay each returned `(addr, value)` write into real memory.
         let Some(cont) = BasicBlock::from_id(ctx, call_block)
@@ -485,7 +587,9 @@ fn apply(
         let mut b = Builder::from_block(BasicBlock::from_id_mut(ctx, cont));
         b.set_insert_point_to_start();
         for i in 0..n_writes {
-            let pair = ValueId::Instruction(b.push_extract(result, i).id);
+            // Our memory pairs sit *after* the register channel's `base_len`
+            // output fields in the shared aggregate (see the return rewrite).
+            let pair = ValueId::Instruction(b.push_extract(result, base_len + i).id);
             let addr = ValueId::Instruction(b.push_extract(pair, 0).id);
             let val = ValueId::Instruction(b.push_extract(pair, 1).id);
             b.push_store(val, addr, ram);
@@ -1453,6 +1557,274 @@ mod tests {
 
         assert!(argpromote(&mut tc.ctx));
         assert_eq!(replayed_stores(&tc, call_id), 1);
+    }
+
+    /// A `pure_reg` callee — empty `input_regs`, a register write-set already on
+    /// the return — whose **stack-argument** pointer is written. The memory pass
+    /// must (1) still *trigger* (the pointer is found via the root params, not the
+    /// empty `input_regs`) and (2) *append* its `(addr, value)` pair after the
+    /// register field instead of clobbering it. Regression for the two fixes.
+    #[test]
+    fn pure_reg_stack_pointer_appends_to_register_writeset() {
+        let mut tc = qcode::testing::TestContext::new();
+        let _ = stack_input(&mut tc, 4, 8);
+        qcode!(
+            tc.ctx,
+            "
+            fn f:
+                <f_entry @stack_10000004:i64>
+                    %out = i64 7 + i64 0;
+                    store(@stack_10000004, i32 5);
+                    return [i64 0];
+
+            fn g:
+                <g_entry>
+                    goto <g_call>;
+                <g_call>
+                    call <f>;
+                <g_cont>
+                    return [i64 0];
+            "
+        );
+        let _ = g;
+        // The shape the register/stack channels leave behind: a functionalized
+        // function whose ABI register list is never filled in, with a one-field
+        // register write-set already on `Return::value` (set as the register
+        // channel does, since `return [..]` only sets the conventional operand).
+        Function::from_id_mut(&mut tc.ctx, f).set_pure_reg(true);
+        let ret_id = Function::from_id(&tc.ctx, f)
+            .iter()
+            .find_map(|b| {
+                let last = b.iter().last()?;
+                matches!(last.mnemonic(), Mnemonic::Return(_)).then_some(last.id)
+            })
+            .unwrap();
+        let ret_block = tc.ctx.get_insn(ret_id).parent().map(|b| b.id).unwrap();
+        let out = ValueId::Instruction(
+            BasicBlock::from_id(&tc.ctx, ret_block)
+                .iter()
+                .find(|i| matches!(i.mnemonic(), Mnemonic::Binop(_)))
+                .unwrap()
+                .id,
+        );
+        let reg_tuple = {
+            let mut b = Builder::from_block(BasicBlock::from_id_mut(&mut tc.ctx, ret_block));
+            b.set_insert_point_before(ret_id);
+            ValueId::Instruction(b.push_named_tuple(vec![("o0".to_owned(), out)]).id)
+        };
+        {
+            let mut m = tc.ctx.get_insn(ret_id).mnemonic().clone();
+            if let Mnemonic::Return(ref mut r) = m {
+                r.value = Some(reg_tuple);
+            }
+            tc.ctx.replace_instruction_mnemonic(ret_id, m);
+        }
+        assert_eq!(
+            register_writeset_len(&tc, f),
+            Some(1),
+            "precondition: one register output field on the return"
+        );
+
+        let a = tc.ctx.get_const(0x4000, 8).id();
+        let call_id = set_call(&mut tc, g_call, f, vec![a]);
+        tc.ctx.add_cfg_edge(g_call, g_cont);
+
+        assert!(
+            argpromote(&mut tc.ctx),
+            "the stack-argument pointer must be found and promoted"
+        );
+        assert_eq!(
+            register_writeset_len(&tc, f),
+            Some(2),
+            "the memory pair is appended after the register field, not clobbering it"
+        );
+        assert_eq!(
+            replayed_stores(&tc, call_id),
+            1,
+            "the caller replays the one appended write"
+        );
+    }
+
+    /// Regression: when the register channel has **already typed** the call result
+    /// to its (smaller) register-only write-set, appending the memory pairs *grows*
+    /// that aggregate. The caller retype must use the resizing setter — a plain
+    /// `set_type` panics on the size change (`size N → M`), which is what crashed the
+    /// whole pipeline on a real binary. Here we pre-type the call to a 1-field
+    /// aggregate so the append must resize it.
+    #[test]
+    fn appended_writeset_resizes_already_typed_call() {
+        let mut tc = qcode::testing::TestContext::new();
+        let _ = stack_input(&mut tc, 4, 8);
+        qcode!(
+            tc.ctx,
+            "
+            fn f:
+                <f_entry @stack_10000004:i64>
+                    %out = i64 7 + i64 0;
+                    store(@stack_10000004, i32 5);
+                    return [i64 0];
+
+            fn g:
+                <g_entry>
+                    goto <g_call>;
+                <g_call>
+                    call <f>;
+                <g_cont>
+                    return [i64 0];
+            "
+        );
+        let _ = g;
+        Function::from_id_mut(&mut tc.ctx, f).set_pure_reg(true);
+
+        // Give the return a 1-field register write-set, as the register channel does.
+        let ret_id = Function::from_id(&tc.ctx, f)
+            .iter()
+            .find_map(|b| {
+                let last = b.iter().last()?;
+                matches!(last.mnemonic(), Mnemonic::Return(_)).then_some(last.id)
+            })
+            .unwrap();
+        let ret_block = tc.ctx.get_insn(ret_id).parent().map(|b| b.id).unwrap();
+        let out = ValueId::Instruction(
+            BasicBlock::from_id(&tc.ctx, ret_block)
+                .iter()
+                .find(|i| matches!(i.mnemonic(), Mnemonic::Binop(_)))
+                .unwrap()
+                .id,
+        );
+        let reg_tuple = {
+            let mut b = Builder::from_block(BasicBlock::from_id_mut(&mut tc.ctx, ret_block));
+            b.set_insert_point_before(ret_id);
+            ValueId::Instruction(b.push_named_tuple(vec![("o0".to_owned(), out)]).id)
+        };
+        let reg_ty = tc.ctx.type_of(reg_tuple);
+        {
+            let mut m = tc.ctx.get_insn(ret_id).mnemonic().clone();
+            if let Mnemonic::Return(ref mut r) = m {
+                r.value = Some(reg_tuple);
+            }
+            tc.ctx.replace_instruction_mnemonic(ret_id, m);
+        }
+
+        let a = tc.ctx.get_const(0x4000, 8).id();
+        let call_id = set_call(&mut tc, g_call, f, vec![a]);
+        tc.ctx.add_cfg_edge(g_call, g_cont);
+        // Pre-type the call result to the register-only write-set (non-zero size),
+        // exactly as the register caller-rewrite leaves it. Without the resizing
+        // setter, the append below panics on the size change.
+        Instruction::from_id_mut(&mut tc.ctx, call_id).set_type(reg_ty);
+
+        assert!(
+            argpromote(&mut tc.ctx),
+            "the pointer must be promoted and its write-set appended"
+        );
+        // The append grew the call result past its original register-only size.
+        let new_ty = tc.ctx.type_of(ValueId::Instruction(call_id));
+        let new_size = tc.ctx.types.size_of(new_ty);
+        let old_size = tc.ctx.types.size_of(reg_ty);
+        assert!(
+            new_size > old_size,
+            "call result must grow ({old_size} -> {new_size}) without panicking"
+        );
+        assert_eq!(replayed_stores(&tc, call_id), 1);
+    }
+
+    /// A callee with **two return blocks** whose single in/out write dominates
+    /// both returns (it happens in the entry, before the branch). The write-set is
+    /// built at *every* return, and the one caller replays the write once. Exercises
+    /// the multi-return path and its dominance gate.
+    #[test]
+    fn example_multi_return_write_dominates() {
+        let mut tc = qcode::testing::TestContext::new();
+        let in_p = stack_input(&mut tc, 4, 8);
+        let r0 = tc.r0;
+        qcode!(
+            tc.ctx,
+            "
+            fn foo:
+                <foo_entry @stack_10000004:i64>
+                    %v = load(i32, @stack_10000004);
+                    %s = %v + i32 1;
+                    store(@stack_10000004, %s);
+                    %c = load(i8, {r0});
+                    if %c goto <ret_a> else goto <ret_b>;
+                <ret_a>
+                    return [i64 0];
+                <ret_b>
+                    return [i64 1];
+
+            fn g:
+                <g_entry>
+                    goto <g_call>;
+                <g_call>
+                    call <foo>;
+                <g_cont>
+                    return [i64 0];
+            "
+        );
+        let _ = (g, r0, ret_a, ret_b);
+        Function::from_id_mut(&mut tc.ctx, foo).set_input_regs(vec![in_p]);
+        let a = tc.ctx.get_const(0x4000, 8).id();
+        let call_id = set_call(&mut tc, g_call, foo, vec![a]);
+        tc.ctx.add_cfg_edge(g_call, g_cont);
+
+        assert!(
+            argpromote(&mut tc.ctx),
+            "a multi-return function whose write dominates both returns must promote"
+        );
+        // Both returns now carry a write-set.
+        let returns_with_value = Function::from_id(&tc.ctx, foo)
+            .iter()
+            .filter(|b| {
+                b.iter().last().is_some_and(
+                    |i| matches!(i.mnemonic(), Mnemonic::Return(r) if r.value.is_some()),
+                )
+            })
+            .count();
+        assert_eq!(returns_with_value, 2, "every return carries the write-set");
+        assert_eq!(replayed_stores(&tc, call_id), 1, "the caller replays one write");
+    }
+
+    /// A path-dependent write (written on only one arm) does **not** dominate all
+    /// returns, so the conservative multi-return gate leaves the function alone.
+    #[test]
+    fn multi_return_path_dependent_write_is_skipped() {
+        let mut tc = qcode::testing::TestContext::new();
+        let in_p = stack_input(&mut tc, 4, 8);
+        let r0 = tc.r0;
+        qcode!(
+            tc.ctx,
+            "
+            fn foo:
+                <foo_entry @stack_10000004:i64>
+                    %c = load(i8, {r0});
+                    if %c goto <wr> else goto <skip>;
+                <wr>
+                    store(@stack_10000004, i32 7);
+                    return [i64 0];
+                <skip>
+                    return [i64 1];
+
+            fn g:
+                <g_entry>
+                    goto <g_call>;
+                <g_call>
+                    call <foo>;
+                <g_cont>
+                    return [i64 0];
+            "
+        );
+        let _ = (g, r0, wr, skip);
+        Function::from_id_mut(&mut tc.ctx, foo).set_input_regs(vec![in_p]);
+        let a = tc.ctx.get_const(0x4000, 8).id();
+        let call_id = set_call(&mut tc, g_call, foo, vec![a]);
+        tc.ctx.add_cfg_edge(g_call, g_cont);
+
+        assert!(
+            !argpromote(&mut tc.ctx),
+            "a write that doesn't dominate all returns must be left unpromoted"
+        );
+        assert_eq!(replayed_stores(&tc, call_id), 0);
     }
 
     // ---- Phase 1: register channel — callee-side scan + rewrite -------------

@@ -299,6 +299,22 @@ fn apply_unroll_plan(ctx: &mut Context, fun_id: FunctionId, plan: UnrollPlan) ->
         replace_terminator_with_branch(ctx, last_new_block, plan.exit, exit_args);
     }
 
+    // A header param may be read *directly* outside the loop: the header dominates
+    // the exit, so a live-out can use the param without an exit-block param (e.g. a
+    // returned register write-set referencing the loop counter — `fn_449740`'s
+    // `pack(ECX=@counter)`). Deleting the header would dangle such uses, so rewrite
+    // every header param to its final loop-carried value. `carried` holds, in param
+    // order, each param's value at loop exit (the last latch's args; the initial
+    // values when the loop ran zero times). Uses inside the about-to-be-deleted loop
+    // blocks are rewritten too, harmlessly.
+    let header_params: Vec<BlockParamId> = BasicBlock::from_id(ctx, plan.lp.header)
+        .params()
+        .map(|param| param.id)
+        .collect();
+    for (&param, &final_value) in header_params.iter().zip(carried.iter()) {
+        ctx.replace_all_uses_with(ValueId::BlockParam(param), final_value);
+    }
+
     for block in plan.loop_nodes {
         BasicBlock::from_id_mut(ctx, block).delete(fun_id);
     }
@@ -438,16 +454,24 @@ fn replace_terminator_with_branch(
         ctx.remove_cfg_edge(edge);
     }
 
+    // Reuse the existing terminator only if the block actually ends in one. The
+    // freshly-created unrolled blocks hold only copied *body* instructions (no
+    // terminator yet); their last instruction is a real value (e.g. the induction
+    // increment), which must not be clobbered into the branch — doing so destroys
+    // that value and, when it is the exit argument, yields a branch that passes
+    // itself. In that case append the branch instead.
     let term_id = BasicBlock::from_id(ctx, block)
         .instruction_ids()
         .last()
-        .copied();
+        .copied()
+        .filter(|&id| ctx.values.instructions[id].mnemonic().is_terminator());
     if let Some(term_id) = term_id {
         ctx.replace_instruction_mnemonic(term_id, Mnemonic::Branch(Branch { target, args }));
     } else {
         let branch =
             InstructionRef::from_mnemonic(ctx, Mnemonic::Branch(Branch { target, args }), 0).id;
-        BasicBlock::from_id_mut(ctx, block).insert_insn_at_index(0, branch);
+        let end = BasicBlock::from_id(ctx, block).instruction_ids().len();
+        BasicBlock::from_id_mut(ctx, block).insert_insn_at_index(end, branch);
     }
     ctx.add_cfg_edge(block, target);
 }
@@ -975,6 +999,139 @@ mod tests {
             })
             .count();
         assert_eq!(stores, 3);
+    }
+
+    /// Reproduction: a loop-carried induction value passed to an *exit param* and
+    /// used *after* the loop (the shape of a returned register write-set referencing
+    /// the loop counter). After unrolling deletes the loop, that use must remain
+    /// defined — not dangle on the removed header param.
+    #[test]
+    fn live_out_induction_value_stays_defined_after_unroll() {
+        let mut ctx = Context::new();
+        qcode!(
+            ctx,
+            "
+            fn test:
+            <entry>
+                goto <header @i=0x0>;
+            <header @i:i64>
+                %cond = @i < 0x3;
+                if %cond goto <body> else goto <exit @fin=@i>;
+            <body>
+                %i_next = @i + 0x1;
+                goto <header @i=%i_next>;
+            <exit @fin:i64>
+                %p = (@fin);
+                return [@fin];
+            "
+        );
+
+        assert!(run_function_pass::<UnrollSimpleLoops>(&mut ctx, test).unwrap());
+
+        // The exit block (which holds the live-out use) survives and keeps a param,
+        // and every predecessor edge into it carries an argument for that param —
+        // i.e. the live-out value is not dangling.
+        let exit_params = BasicBlock::from_id(&ctx, exit).params().count();
+        assert_eq!(exit_params, 1, "exit keeps its live-out param");
+        let preds: Vec<_> = BasicBlock::from_id(&ctx, exit)
+            .predecessors()
+            .map(|(_, p)| p)
+            .collect();
+        assert!(!preds.is_empty(), "exit must still be reachable");
+        for pred in preds {
+            let args = branch_args_to(&ctx, pred, exit);
+            assert!(
+                args.is_some_and(|a| a.len() == exit_params),
+                "pred {pred:?} must pass an arg for the live-out exit param"
+            );
+        }
+
+        // The following `simplify_cfg` (which runs right after unrolling in the
+        // pipeline) merges the now-single-pred exit into its predecessor: the
+        // live-out use must be rewritten to the incoming value, never left dangling
+        // on the removed exit param.
+        let _ = run_function_pass::<crate::cfg::SimplifyCfg>(&mut ctx, test);
+        let defined: std::collections::HashSet<ValueId> = Function::from_id(&ctx, test)
+            .iter()
+            .flat_map(|b| {
+                b.params()
+                    .map(|p| ValueId::BlockParam(p.id))
+                    .chain(b.instruction_ids().iter().map(|&i| ValueId::Instruction(i)))
+                    .collect::<Vec<_>>()
+            })
+            .collect();
+        for insn in Function::from_id(&ctx, test)
+            .iter()
+            .flat_map(|b| b.instruction_ids().to_vec())
+        {
+            for operand in qcode::value::Instruction::from_id(&ctx, insn).mnemonic().args() {
+                if matches!(operand, ValueId::Instruction(_) | ValueId::BlockParam(_)) {
+                    assert!(
+                        defined.contains(&operand),
+                        "operand {operand:?} of {insn:?} is undefined after simplify_cfg (dangling)"
+                    );
+                }
+            }
+        }
+    }
+
+    /// Asserts no instruction in `fid` references a value (instruction or block
+    /// param) that is not defined anywhere in the function — i.e. no dangling use.
+    fn assert_no_dangling(ctx: &Context, fid: FunctionId) {
+        let defined: std::collections::HashSet<ValueId> = Function::from_id(ctx, fid)
+            .iter()
+            .flat_map(|b| {
+                b.params()
+                    .map(|p| ValueId::BlockParam(p.id))
+                    .chain(b.instruction_ids().iter().map(|&i| ValueId::Instruction(i)))
+                    .collect::<Vec<_>>()
+            })
+            .collect();
+        for insn in Function::from_id(ctx, fid)
+            .iter()
+            .flat_map(|b| b.instruction_ids().to_vec())
+        {
+            for operand in qcode::value::Instruction::from_id(ctx, insn).mnemonic().args() {
+                if matches!(operand, ValueId::Instruction(_) | ValueId::BlockParam(_)) {
+                    assert!(
+                        defined.contains(&operand),
+                        "operand {operand:?} of {insn:?} is undefined (dangling)"
+                    );
+                }
+            }
+        }
+    }
+
+    /// Reproduction: the induction variable used **directly** in the exit block
+    /// (no exit param). This is valid SSA — the header dominates the exit — and is
+    /// the shape of `fn_449740`'s `pack(ECX=@counter)` register write-set. Unrolling
+    /// deletes the header, so it must replace the induction param's live-out uses
+    /// with its final value, or they dangle.
+    #[test]
+    fn direct_live_out_use_of_induction_var_is_rewritten() {
+        let mut ctx = Context::new();
+        qcode!(
+            ctx,
+            "
+            fn test:
+            <entry>
+                goto <header @i=0x0>;
+            <header @i:i64>
+                %cond = @i < 0x3;
+                if %cond goto <body> else goto <exit>;
+            <body>
+                %i_next = @i + 0x1;
+                goto <header @i=%i_next>;
+            <exit>
+                %p = (@i);
+                return [@i];
+            "
+        );
+
+        assert!(run_function_pass::<UnrollSimpleLoops>(&mut ctx, test).unwrap());
+        assert_no_dangling(&ctx, test);
+        let _ = run_function_pass::<crate::cfg::SimplifyCfg>(&mut ctx, test);
+        assert_no_dangling(&ctx, test);
     }
 
     #[test]

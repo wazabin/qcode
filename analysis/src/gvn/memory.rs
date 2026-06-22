@@ -14,6 +14,7 @@ use qcode::{
     value::{block::BlockId, insn::Mnemonic},
 };
 
+use super::affine::Numbering;
 use super::mem_forward::MemForward;
 use super::walk::{Claim, Editor, InsnCtx, SubPass};
 
@@ -29,12 +30,13 @@ impl SubPass for MemoryForwarding {
         block_id: BlockId,
         tree: &DominatorTree<BlockId>,
         aliases: Option<&AliasResult>,
+        numbering: &Numbering,
         is_shared: bool,
     ) {
         if is_shared {
             state.clear();
         }
-        state.prune_loop_carried(ctx, block_id, tree, aliases);
+        state.prune_loop_carried(ctx, block_id, tree, aliases, numbering);
     }
 
     fn on_insn(
@@ -46,16 +48,16 @@ impl SubPass for MemoryForwarding {
     ) -> Claim {
         match ic.mnemonic {
             Mnemonic::Store(store) => {
-                state.record_store(ctx, store, ic.aliases);
+                state.record_store(ctx, store, ic.aliases, ic.numbering);
                 Claim::Done
             }
             Mnemonic::Load(load) => {
-                match state.try_load(ctx, ic.block_id, ic.insn_id, load, ic.aliases) {
+                match state.try_load(ctx, ic.block_id, ic.insn_id, load, ic.aliases, ic.numbering) {
                     Some(value) => {
                         ed.replace(ctx, ic.insn_id, value);
-                        state.define_load(load, value, ic.aliases);
+                        state.define_load(load, value, ic.aliases, ic.numbering);
                     }
-                    None => state.define_load(load, ic.id, ic.aliases),
+                    None => state.define_load(load, ic.id, ic.aliases, ic.numbering),
                 }
                 Claim::Done
             }
@@ -73,6 +75,7 @@ impl SubPass for MemoryForwarding {
         state: &mut MemForward,
         block_id: BlockId,
         aliases: Option<&AliasResult>,
+        _numbering: &Numbering,
     ) {
         state.prune_clobbered_by_call(ctx, block_id, aliases);
     }
@@ -690,5 +693,156 @@ mod tests {
             block_contains(&tc.ctx, block, load),
             "without an alias oracle the coalesce read must remain"
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // Symbolic (affine base) RAM forwarding
+    // -----------------------------------------------------------------------
+
+    /// `store(p, 4); load(p + 1, 1)` forwards a `Range` of the store: `p` has no
+    /// pinned interval, so it is tracked as a symbolic affine base and the inner
+    /// byte is covered.
+    #[test]
+    fn symbolic_base_forwards_inner_byte() {
+        let mut ctx = Context::new();
+        qcode!(
+            ctx,
+            "
+                varnode i64 PB;
+                varnode i32 OUT;
+
+                fn f:
+                    <entry>
+                        %p = load(i64, &PB);
+                        store(%p, i32 0x11223344);
+                        %p1 = %p + i64 1;
+                        %r = load(i8, %p1);
+                        store(&OUT, %r);
+                        return [0x1000];
+                "
+        );
+
+        optimize(&mut ctx, f);
+
+        assert!(
+            !block_contains(&ctx, entry, r),
+            "load(p+1, 1) must forward from store(p, 4) via the symbolic base:\n{}",
+            BasicBlock::from_id(&ctx, entry)
+        );
+        // Byte 1 of 0x11223344 (little-endian) is 0x33.
+        assert_eq!(
+            literal_value(&ctx, store_src(&ctx, out_store(&ctx, entry))),
+            Some(0x33)
+        );
+    }
+
+    /// `store(p, 4); load(p + 3, 2)` reads past the store's last byte (offset 4
+    /// is uncovered), so it is not forwarded.
+    #[test]
+    fn symbolic_base_coverage_gap_not_forwarded() {
+        let mut ctx = Context::new();
+        qcode!(
+            ctx,
+            "
+                varnode i64 PB;
+                varnode i16 OUT;
+
+                fn f:
+                    <entry>
+                        %p = load(i64, &PB);
+                        store(%p, i32 0x11223344);
+                        %p3 = %p + i64 3;
+                        %r = load(i16, %p3);
+                        store(&OUT, %r);
+                        return [0x1000];
+                "
+        );
+
+        optimize(&mut ctx, f);
+
+        assert!(
+            block_contains(&ctx, entry, r),
+            "load(p+3, 2) spills past the 4-byte store and must not be forwarded"
+        );
+    }
+
+    /// Two distinct symbolic bases with no may-alias proof: a store to `q` must
+    /// conservatively drop the cells of `p`, so `load(p + 1, 1)` does not forward.
+    #[test]
+    fn distinct_symbolic_bases_not_forwarded() {
+        let mut ctx = Context::new();
+        qcode!(
+            ctx,
+            "
+                varnode i64 PB;
+                varnode i64 QB;
+                varnode i32 OUT;
+
+                fn f:
+                    <entry>
+                        %p = load(i64, &PB);
+                        %q = load(i64, &QB);
+                        store(%p, i32 0x11223344);
+                        store(%q, i32 0x55667788);
+                        %p1 = %p + i64 1;
+                        %r = load(i8, %p1);
+                        store(&OUT, %r);
+                        return [0x1000];
+                "
+        );
+
+        optimize(&mut ctx, f);
+
+        assert!(
+            block_contains(&ctx, entry, r),
+            "store(q) may alias p (no disjointness proof), so load(p+1) must remain:\n{}",
+            BasicBlock::from_id(&ctx, entry)
+        );
+    }
+
+    /// `(p + 4) - 4` canonicalizes to the same affine base as `p`, so a whole
+    /// store forwards through the reassociated pointer.
+    #[test]
+    fn affine_base_reassociation_unifies_with_p() {
+        let mut ctx = Context::new();
+        qcode!(
+            ctx,
+            "
+                varnode i64 PB;
+                varnode i32 OUT;
+
+                fn f:
+                    <entry>
+                        %p = load(i64, &PB);
+                        store(%p, i32 0x11223344);
+                        %p4 = %p + i64 4;
+                        %pm = %p4 - i64 4;
+                        %r = load(i32, %pm);
+                        store(&OUT, %r);
+                        return [0x1000];
+                "
+        );
+
+        optimize(&mut ctx, f);
+
+        assert!(
+            !block_contains(&ctx, entry, r),
+            "load((p+4)-4, 4) must forward the whole store(p, 4):\n{}",
+            BasicBlock::from_id(&ctx, entry)
+        );
+        assert_eq!(
+            literal_value(&ctx, store_src(&ctx, out_store(&ctx, entry))),
+            Some(0x1122_3344)
+        );
+    }
+
+    /// The store-to-`&OUT` instruction in `block` (used to read the forwarded src).
+    fn out_store(ctx: &Context, block: BlockId) -> ValueId {
+        BasicBlock::from_id(ctx, block)
+            .iter()
+            .find(|i| matches!(i.mnemonic(), Mnemonic::Store(s)
+                if matches!(s.ptr, ValueId::Varnode(_))))
+            .expect("store to &OUT")
+            .id()
     }
 }

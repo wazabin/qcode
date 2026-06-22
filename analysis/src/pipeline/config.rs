@@ -664,6 +664,9 @@ async fn run_module_stage(
                 started.elapsed(),
                 if pass_changed { "changed" } else { "no change" },
             );
+            // Between-pass invariant check (opt-in via `QCODE_VERIFY`): pin a broken
+            // invariant to the pass that produced it.
+            crate::verify::verify_after(ctx, &p.name());
             changed |= pass_changed;
         }
         stage_changed |= changed;
@@ -919,6 +922,8 @@ async fn run_function_stage(
                 }
                 entry.1 += 1;
                 entry.2 += pass_changed as usize;
+                // Between-pass invariant check (opt-in via `QCODE_VERIFY`).
+                crate::verify::verify_after(ctx, &p.name());
                 changed |= pass_changed;
             }
             function_changed |= changed;

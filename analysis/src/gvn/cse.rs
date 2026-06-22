@@ -38,6 +38,7 @@ impl SubPass for Cse {
         _block_id: qcode::value::block::BlockId,
         _tree: &jstd::graph::analysis::DominatorTree<qcode::value::block::BlockId>,
         _aliases: Option<&crate::AliasResult>,
+        _numbering: &Numbering,
         is_shared: bool,
     ) {
         // A block reachable from more than one walk root has invalid inherited

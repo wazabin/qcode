@@ -31,8 +31,9 @@ use std::collections::HashMap;
 use qcode::{
     context::Context,
     value::{
-        BasicBlock, ValueId,
+        BasicBlock, Function, ValueId,
         block::BlockId,
+        function::FunctionId,
         insn::{Binary, Binop, InstructionId, InstructionRef, IntBinop, Mnemonic, Unary, Unop},
     },
 };
@@ -596,4 +597,69 @@ impl Numbering {
     pub(super) fn clear_leaders(&mut self) {
         self.leaders.clear();
     }
+
+    /// The affine decomposition of `ptr` as a single base term plus a signed
+    /// byte offset, i.e. `ptr == base + constant` with a unit coefficient.
+    /// Returns `None` for multi-term, scaled, masked, or non-affine pointers —
+    /// the caller then treats the whole pointer value as its own base.
+    ///
+    /// This is the affine base-identity used by memory forwarding: `(p + 4) - 4`
+    /// and `p` decompose to the same `base = p`, so they unify for free.
+    pub(super) fn base_offset(&self, ptr: ValueId) -> Option<(ValueId, i64)> {
+        match self.forms.get(&ptr)? {
+            NormalForm::Affine {
+                width,
+                constant,
+                terms,
+            } if terms.len() == 1 && terms[0].1 == 1 => Some((terms[0].0, signed(*constant, *width))),
+            _ => None,
+        }
+    }
+}
+
+/// Precompute the position-independent affine view (`forms`) of every
+/// instruction value in `func_id`, memoized into a fresh [`Numbering`].
+///
+/// A value's arithmetic view depends only on the SSA graph (its operands'
+/// views), not on dominance, so it can be computed once up front and shared
+/// read-only with sub-passes that need a pointer's base identity before the
+/// dominator walk reaches the pointer's definition (see memory forwarding). Only
+/// `forms` is populated; `leaders` stay empty (they are dominance-sensitive).
+pub(super) fn precompute_forms(ctx: &Context, func_id: FunctionId) -> Numbering {
+    let mut numbering = Numbering::default();
+    let ids: Vec<ValueId> = Function::from_id(ctx, func_id)
+        .iter()
+        .flat_map(|block| {
+            block
+                .instruction_ids()
+                .iter()
+                .map(|&id| ValueId::Instruction(id))
+                .collect::<Vec<_>>()
+        })
+        .collect();
+    for id in ids {
+        ensure_form(ctx, id, &mut numbering);
+    }
+    numbering
+}
+
+/// Memoize the affine form of `v`, recursing into operands first so that nested
+/// pointer arithmetic (e.g. `(p + 4) - 4`) fully decomposes. A placeholder leaf
+/// is inserted before recursing to break any operand cycle.
+fn ensure_form(ctx: &Context, v: ValueId, numbering: &mut Numbering) {
+    if numbering.forms.contains_key(&v) {
+        return;
+    }
+    let ValueId::Instruction(id) = v else {
+        return;
+    };
+    let insn = ctx.get_insn(id);
+    let width = insn.size();
+    let mnemonic = insn.mnemonic().clone();
+    numbering.forms.insert(v, leaf(v, width));
+    for arg in mnemonic.args() {
+        ensure_form(ctx, arg, numbering);
+    }
+    let form = arith_form(ctx, v, &mnemonic, width, numbering);
+    numbering.forms.insert(v, form);
 }

@@ -13,6 +13,8 @@ use jstd::graph::analysis::{DominatorTree, compute_dominators};
 
 use crate::AliasResult;
 
+use super::affine::Numbering;
+
 use qcode::{
     context::Context,
     value::{
@@ -40,6 +42,9 @@ pub(super) struct InsnCtx<'a> {
     pub size: usize,
     pub mnemonic: &'a Mnemonic,
     pub aliases: Option<&'a AliasResult>,
+    /// Read-only, function-wide affine view of every value, precomputed before
+    /// the walk. Used for pointer base identity in memory forwarding.
+    pub numbering: &'a Numbering,
 }
 
 /// Block-local rewrite bookkeeping shared by all sub-passes.
@@ -109,6 +114,7 @@ pub(super) trait SubPass {
         _block_id: BlockId,
         _tree: &DominatorTree<BlockId>,
         _aliases: Option<&AliasResult>,
+        _numbering: &Numbering,
         _is_shared: bool,
     ) {
     }
@@ -129,6 +135,7 @@ pub(super) trait SubPass {
         _state: &mut Self::State,
         _block_id: BlockId,
         _aliases: Option<&AliasResult>,
+        _numbering: &Numbering,
     ) {
     }
 }
@@ -144,6 +151,7 @@ pub(super) trait SubPasses {
         block_id: BlockId,
         tree: &DominatorTree<BlockId>,
         aliases: Option<&AliasResult>,
+        numbering: &Numbering,
         is_shared: bool,
     );
 
@@ -156,6 +164,7 @@ pub(super) trait SubPasses {
         states: &mut Self::States,
         block_id: BlockId,
         aliases: Option<&AliasResult>,
+        numbering: &Numbering,
     );
 }
 
@@ -171,9 +180,10 @@ macro_rules! impl_sub_passes {
                 block_id: BlockId,
                 tree: &DominatorTree<BlockId>,
                 aliases: Option<&AliasResult>,
+                numbering: &Numbering,
                 is_shared: bool,
             ) {
-                $(self.$idx.on_block_entry(ctx, &mut states.$idx, block_id, tree, aliases, is_shared);)+
+                $(self.$idx.on_block_entry(ctx, &mut states.$idx, block_id, tree, aliases, numbering, is_shared);)+
             }
 
             fn on_insn(
@@ -194,8 +204,9 @@ macro_rules! impl_sub_passes {
                 states: &mut Self::States,
                 block_id: BlockId,
                 aliases: Option<&AliasResult>,
+                numbering: &Numbering,
             ) {
-                $(self.$idx.after_block(ctx, &mut states.$idx, block_id, aliases);)+
+                $(self.$idx.after_block(ctx, &mut states.$idx, block_id, aliases, numbering);)+
             }
         }
     };
@@ -220,6 +231,7 @@ fn run_block<P: SubPasses>(
     passes: &P,
     states: &mut P::States,
     aliases: Option<&AliasResult>,
+    numbering: &Numbering,
 ) -> bool {
     let mut ed = Editor::new();
     let insns = BasicBlock::from_id(ctx, block_id)
@@ -238,6 +250,7 @@ fn run_block<P: SubPasses>(
             size,
             mnemonic: &mnemonic,
             aliases,
+            numbering,
         };
         passes.on_insn(ctx, states, &ic, &mut ed);
     }
@@ -253,7 +266,17 @@ pub(super) fn run_single_block<P: SubPasses>(
     passes: &P,
     aliases: Option<&AliasResult>,
 ) -> bool {
-    run_block(ctx, block_id, passes, &mut P::States::default(), aliases)
+    // No function context for a lone block: memory forwarding falls back to
+    // degenerate per-pointer bases (exact-match only).
+    let numbering = Numbering::default();
+    run_block(
+        ctx,
+        block_id,
+        passes,
+        &mut P::States::default(),
+        aliases,
+        &numbering,
+    )
 }
 
 /// Iterate the sub-passes over every block of `func_id` in flat order with
@@ -269,11 +292,19 @@ pub(super) fn run_flat_fixpoint<P: SubPasses>(
         .map(|block| block.id)
         .collect();
 
+    let numbering = Numbering::default();
     let mut changed_any = false;
     loop {
         let mut changed = false;
         for &block_id in &block_ids {
-            changed |= run_block(ctx, block_id, passes, &mut P::States::default(), None);
+            changed |= run_block(
+                ctx,
+                block_id,
+                passes,
+                &mut P::States::default(),
+                None,
+                &numbering,
+            );
         }
         changed_any |= changed;
         if !changed {
@@ -289,6 +320,7 @@ struct Walk<'a, P: SubPasses> {
     func_id: FunctionId,
     tree: &'a DominatorTree<BlockId>,
     aliases: Option<&'a AliasResult>,
+    numbering: &'a Numbering,
     shared: &'a HashSet<BlockId>,
     changed: bool,
 }
@@ -321,11 +353,19 @@ impl<P: SubPasses> Walk<'_, P> {
             block_id,
             self.tree,
             self.aliases,
+            self.numbering,
             self.shared.contains(&block_id),
         );
-        self.changed |= run_block(ctx, block_id, self.passes, &mut states, self.aliases);
+        self.changed |= run_block(
+            ctx,
+            block_id,
+            self.passes,
+            &mut states,
+            self.aliases,
+            self.numbering,
+        );
         self.passes
-            .after_block(ctx, &mut states, block_id, self.aliases);
+            .after_block(ctx, &mut states, block_id, self.aliases, self.numbering);
         for &child in self.tree.children_of(block_id) {
             self.rec(ctx, child, &states);
         }
@@ -392,6 +432,10 @@ pub(super) fn run_dominator_walk<P: SubPasses>(
         .filter_map(|(block, count)| (count > 1).then_some(block))
         .collect();
 
+    // Function-wide affine views, computed once and shared read-only with every
+    // entry's walk (a value's arithmetic view is dominance-independent).
+    let numbering = super::affine::precompute_forms(ctx, func_id);
+
     let mut changed = false;
     for entry in std::iter::once(root).chain(entries) {
         let tree = compute_dominators(ctx, entry);
@@ -400,6 +444,7 @@ pub(super) fn run_dominator_walk<P: SubPasses>(
             func_id,
             tree: &tree,
             aliases,
+            numbering: &numbering,
             shared: &shared,
             changed: false,
         };

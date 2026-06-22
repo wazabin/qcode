@@ -10,11 +10,17 @@
 //!   setnz al; push eax` idiom.
 //!
 //! All three are the same operation: forwarding over an alias-resolved byte
-//! interval. Pointers the [`AliasResult`] can pin to a concrete interval
-//! (registers, constant-folded stack slots) are tracked byte-precisely in
-//! [`byte_map`](MemForward::byte_map); everything else (heap pointers with no
-//! precise location) falls back to the exact `Load`-mnemonic table in
-//! [`opaque`](MemForward::opaque), preserving the old may-alias behavior.
+//! run. Every cell is keyed by a [`Base`] plus a signed byte offset:
+//!
+//! - **`Base::Pinned`** — a pointer the [`AliasResult`] resolves to a concrete
+//!   interval (registers, constant-folded stack slots); the offset is the
+//!   absolute byte address, exactly as the flat `(space, addr)` map used to be.
+//! - **`Base::Symbolic`** — a RAM pointer with no pinned interval, identified by
+//!   its affine base value (from the precomputed [`Numbering`]); the offset is
+//!   the signed affine constant. `(p + 4) - 4` and `p` share a base, so a
+//!   `store(p, …)` forwards to a `load(p + c, …)` for `c` inside the store.
+//!   With no oracle every pointer becomes its own degenerate symbolic base
+//!   (offset 0), so only exact same-pointer reads forward.
 //!
 //! The whole structure is cloned and threaded down the dominator tree by
 //! the dominator walk in [`super::walk`], so forwarding works across blocks; the pruning
@@ -34,6 +40,8 @@ use qcode::{
         insn::{Binary, Binop, InstructionRef, IntBinop, Load, Mnemonic, Range, Store, Zext},
     },
 };
+
+use super::affine::Numbering;
 
 /// One byte of forwarded memory: it equals byte `src_off` of value `src`.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -62,12 +70,84 @@ enum CallClobbers {
     Regs(Vec<VarnodeId>),
 }
 
+/// The identity of a byte-addressable region the byte map keys on.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+enum Base {
+    /// A pointer the oracle pins to a concrete interval. All pinned pointers in
+    /// a space share this base; the map offset is the absolute byte address.
+    Pinned(SpaceId),
+    /// A pointer with no pinned interval, identified by its affine base value.
+    /// The map offset is the signed affine constant relative to that base.
+    Symbolic(SpaceId, ValueId),
+}
+
+impl Base {
+    fn space(self) -> SpaceId {
+        match self {
+            Base::Pinned(s) | Base::Symbolic(s, _) => s,
+        }
+    }
+}
+
+/// Decompose `ptr` (read/written in memory `space`) into its base identity and
+/// the signed byte offset of its first byte within that base.
+fn locate(
+    ptr: ValueId,
+    space: SpaceId,
+    aliases: Option<&AliasResult>,
+    numbering: &Numbering,
+) -> (Base, i64) {
+    if let Some((sp, start, _end)) = aliases.and_then(|a| a.interval(ptr)) {
+        return (Base::Pinned(sp), start as i64);
+    }
+    match numbering.base_offset(ptr) {
+        Some((base, off)) => (Base::Symbolic(space, base), off),
+        None => (Base::Symbolic(space, ptr), 0),
+    }
+}
+
+/// Whether the oracle gives `a` and `b` distinct, concrete alias classes —
+/// *positive* proof they never refer to the same location. Absence of class
+/// info (isolated values) or an `Unknown` class is **not** proof: such pairs
+/// are treated as possibly-aliasing, so a forwarded cell is dropped on any
+/// doubt.
+fn proven_disjoint(aliases: Option<&AliasResult>, a: ValueId, b: ValueId) -> bool {
+    let Some(aliases) = aliases else { return false };
+    matches!(
+        (aliases.alias_class(a), aliases.alias_class(b)),
+        (Some(crate::alias::NodeId::Id(x)), Some(crate::alias::NodeId::Id(y))) if x != y
+    )
+}
+
+/// Whether a cell at base `cb` is provably disjoint from an access at `base`
+/// (whose pointer value is `ptr`), i.e. the cell can be kept across the access.
+/// Only meaningful when `cb != base`. Conservative: returns `false` (not
+/// disjoint) whenever disjointness cannot be proven.
+fn cross_base_disjoint(aliases: Option<&AliasResult>, ptr: ValueId, base: Base, cb: Base) -> bool {
+    // Different address spaces never overlap.
+    if base.space() != cb.space() {
+        return true;
+    }
+    match (base, cb) {
+        // Symbolic vs symbolic: disjoint only if the oracle proves the base
+        // values occupy different locations.
+        (Base::Symbolic(_, sv), Base::Symbolic(_, ov)) => proven_disjoint(aliases, sv, ov),
+        // Pinned access vs a symbolic cell: compare the access pointer against
+        // the cell's base value.
+        (Base::Pinned(_), Base::Symbolic(_, ov)) => proven_disjoint(aliases, ptr, ov),
+        // Symbolic access vs a pinned cell: the cell's absolute address has no
+        // value to query, so we cannot prove disjointness.
+        (Base::Symbolic(_, _), Base::Pinned(_)) => false,
+        // Two pinned bases in the same space are equal (caller's `cb == base`
+        // check already kept them); unreachable here.
+        (Base::Pinned(_), Base::Pinned(_)) => true,
+    }
+}
+
 #[derive(Clone, Default)]
 pub(super) struct MemForward {
-    /// Per-byte forwarding for pointers with a concrete alias interval.
-    byte_map: HashMap<(SpaceId, u64), Cell>,
-    /// Exact `Load`-mnemonic → leader, for pointers with no precise interval.
-    opaque: HashMap<Mnemonic, ValueId>,
+    /// Per-byte forwarding, keyed by base identity and a signed byte offset.
+    byte_map: HashMap<(Base, i64), Cell>,
 }
 
 impl MemForward {
@@ -77,60 +157,45 @@ impl MemForward {
         ctx: &mut Context,
         store: &Store,
         aliases: Option<&AliasResult>,
+        numbering: &Numbering,
     ) {
-        // Drop opaque load leaders this store may overwrite. With no oracle every
-        // load is conservatively invalidated (mirrors the old single-block pass).
-        self.opaque.retain(|k, _| {
-            let Mnemonic::Load(load) = k else { return true };
-            aliases.is_some_and(|a| !a.may_alias(ctx, store.ptr, load.ptr))
+        let (base, start) = locate(store.ptr, store.space, aliases, numbering);
+        let end = start + store.size as i64;
+
+        // Drop cells at *other* bases this store may overwrite (cross-base
+        // aliasing); same-base cells are handled by the explicit clear below.
+        self.byte_map.retain(|&(cb, _), _| {
+            cb == base || cross_base_disjoint(aliases, store.ptr, base, cb)
         });
 
-        match aliases.and_then(|a| a.interval(store.ptr)) {
-            // Pinned location: model the `store.size` bytes it actually writes,
-            // starting at the pinned base. (`store.size` can be narrower than the
-            // resolved varnode interval — a sub-register write.)
-            Some((space, start, _end)) => {
-                let store_end = start + store.size as u64;
-                // The store always overwrites those bytes, so clear them first.
-                for addr in start..store_end {
-                    self.byte_map.remove(&(space, addr));
-                }
-                // The low `src.size` bytes come from the value. When the src is
-                // narrower than the location (e.g. `MOV ESI, imm32`, whose
-                // store width is the full 8-byte RSI), the store zero-extends:
-                // the upper bytes are zero, so model them with a zero constant
-                // rather than leaving them unmapped.
-                let covered = ValueRef::new(store.src, ctx).size().min(store.size);
-                for (i, addr) in (start..start + covered as u64).enumerate() {
-                    self.byte_map.insert(
-                        (space, addr),
-                        Cell {
-                            src: store.src,
-                            src_off: i,
-                        },
-                    );
-                }
-                if covered < store.size {
-                    let zero = ctx.get_const(0, store.size - covered).id();
-                    for (i, addr) in (start + covered as u64..store_end).enumerate() {
-                        self.byte_map.insert(
-                            (space, addr),
-                            Cell {
-                                src: zero,
-                                src_off: i,
-                            },
-                        );
-                    }
-                }
-            }
-            // No precise location. Conservatively forget every byte cell the
-            // store could touch (its whole space), then record the exact load.
-            None => {
-                self.byte_map.retain(|&(space, _), _| space != store.space);
-                if ValueRef::new(store.src, ctx).size() == store.size {
-                    self.opaque
-                        .insert(Mnemonic::Load(store.get_matching_load()), store.src);
-                }
+        // The store always overwrites the bytes at its own base, so clear them.
+        for off in start..end {
+            self.byte_map.remove(&(base, off));
+        }
+        // The low `src.size` bytes come from the value. When the src is narrower
+        // than the location (e.g. `MOV ESI, imm32`, whose store width is the full
+        // 8-byte RSI), the store zero-extends: the upper bytes are zero, so model
+        // them with a zero constant rather than leaving them unmapped.
+        let covered = ValueRef::new(store.src, ctx).size().min(store.size);
+        for (i, off) in (start..start + covered as i64).enumerate() {
+            self.byte_map.insert(
+                (base, off),
+                Cell {
+                    src: store.src,
+                    src_off: i,
+                },
+            );
+        }
+        if covered < store.size {
+            let zero = ctx.get_const(0, store.size - covered).id();
+            for (i, off) in (start + covered as i64..end).enumerate() {
+                self.byte_map.insert(
+                    (base, off),
+                    Cell {
+                        src: zero,
+                        src_off: i,
+                    },
+                );
             }
         }
     }
@@ -144,15 +209,13 @@ impl MemForward {
         insn_id: qcode::value::InstructionId,
         load: &Load,
         aliases: Option<&AliasResult>,
+        numbering: &Numbering,
     ) -> Option<ValueId> {
-        let Some((space, start, _end)) = aliases.and_then(|a| a.interval(load.ptr)) else {
-            // Unpinned location: only exact opaque matches forward.
-            return self.opaque.get(&Mnemonic::Load(load.clone())).copied();
-        };
+        let (base, start) = locate(load.ptr, load.space, aliases, numbering);
 
-        // Cover the `load.size` bytes the load actually reads from the pinned base.
-        let end = start + load.size as u64;
-        let segments = self.segments(space, start, end)?;
+        // Cover the `load.size` bytes the load actually reads from the base.
+        let end = start + load.size as i64;
+        let segments = self.segments(base, start, end)?;
         let load_size = load.size;
 
         let value = if segments.len() == 1
@@ -177,32 +240,27 @@ impl MemForward {
         load: &Load,
         value: ValueId,
         aliases: Option<&AliasResult>,
+        numbering: &Numbering,
     ) {
-        match aliases.and_then(|a| a.interval(load.ptr)) {
-            Some((space, start, _end)) => {
-                for (i, addr) in (start..start + load.size as u64).enumerate() {
-                    self.byte_map.insert(
-                        (space, addr),
-                        Cell {
-                            src: value,
-                            src_off: i,
-                        },
-                    );
-                }
-            }
-            None => {
-                self.opaque.insert(Mnemonic::Load(load.clone()), value);
-            }
+        let (base, start) = locate(load.ptr, load.space, aliases, numbering);
+        for (i, off) in (start..start + load.size as i64).enumerate() {
+            self.byte_map.insert(
+                (base, off),
+                Cell {
+                    src: value,
+                    src_off: i,
+                },
+            );
         }
     }
 
-    /// Group bytes `start..end` of `space` into maximal single-source segments,
+    /// Group bytes `start..end` of `base` into maximal single-source segments,
     /// or `None` if any byte is unmapped (coverage gap — not forwardable).
-    fn segments(&self, space: SpaceId, start: u64, end: u64) -> Option<Vec<Segment>> {
+    fn segments(&self, base: Base, start: i64, end: i64) -> Option<Vec<Segment>> {
         let mut segments: Vec<Segment> = Vec::new();
-        for addr in start..end {
-            let cell = self.byte_map.get(&(space, addr)).copied()?;
-            let load_off = (addr - start) as usize;
+        for off in start..end {
+            let cell = self.byte_map.get(&(base, off)).copied()?;
+            let load_off = (off - start) as usize;
             match segments.last_mut() {
                 // Extend the run when it continues the same source contiguously.
                 Some(seg) if seg.src == cell.src && seg.src_off + seg.size == cell.src_off => {
@@ -344,35 +402,32 @@ impl MemForward {
 
         let is_reg = |space| matches!(Space::from_id(ctx, space).ty, SpaceType::Register);
 
-        // Byte cells: drop register bytes the call clobbers.
-        self.byte_map.retain(|&(space, addr), _| {
+        self.byte_map.retain(|&(base, off), _| {
+            let space = base.space();
             if !is_reg(space) {
-                return true;
+                // RAM: a call may write through any symbolic pointer (no memory
+                // summary exists), so drop all symbolic RAM cells. Pinned RAM
+                // cells (resolved stack slots) are unaffected by register clobbers.
+                return !matches!(base, Base::Symbolic(..));
             }
-            match &clobbers {
-                CallClobbers::AllRegisters => false,
-                CallClobbers::Regs(regs) => !regs.iter().any(|&r| {
-                    let vn = Varnode::from_id(ctx, r);
-                    vn.space().id == space
-                        && (vn.address() as u64) <= addr
-                        && addr < vn.address() as u64 + vn.size() as u64
-                }),
-            }
-        });
-
-        // Opaque register load leaders: same rule, via may-alias.
-        self.opaque.retain(|m, _| {
-            let Mnemonic::Load(load) = m else { return true };
-            let load_space = ValueRef::new(load.ptr, ctx).space().map(|s| s.id);
-            if !load_space.is_some_and(is_reg) {
-                return true;
-            }
-            match &clobbers {
-                CallClobbers::AllRegisters => false,
-                CallClobbers::Regs(regs) => !regs.iter().any(|&r| match aliases {
-                    Some(a) => a.may_alias(ctx, load.ptr, ValueId::Varnode(r)),
-                    None => true,
-                }),
+            // Register cells: drop those the call clobbers.
+            match base {
+                Base::Pinned(_) => match &clobbers {
+                    CallClobbers::AllRegisters => false,
+                    CallClobbers::Regs(regs) => !regs.iter().any(|&r| {
+                        let vn = Varnode::from_id(ctx, r);
+                        vn.space().id == space
+                            && (vn.address() as i64) <= off
+                            && off < vn.address() as i64 + vn.size() as i64
+                    }),
+                },
+                Base::Symbolic(_, bv) => match &clobbers {
+                    CallClobbers::AllRegisters => false,
+                    CallClobbers::Regs(regs) => !regs.iter().any(|&r| match aliases {
+                        Some(a) => a.may_alias(ctx, bv, ValueId::Varnode(r)),
+                        None => true,
+                    }),
+                },
             }
         });
     }
@@ -385,12 +440,13 @@ impl MemForward {
         block_id: BlockId,
         tree: &DominatorTree<BlockId>,
         aliases: Option<&AliasResult>,
+        numbering: &Numbering,
     ) {
         // `dominates` is reflexive, so a self-loop also counts.
         let is_loop_header = BasicBlock::from_id(ctx, block_id)
             .predecessors()
             .any(|(_, pred)| tree.dominates(block_id, pred));
-        if !is_loop_header || (self.byte_map.is_empty() && self.opaque.is_empty()) {
+        if !is_loop_header || self.byte_map.is_empty() {
             return;
         }
 
@@ -434,21 +490,17 @@ impl MemForward {
             })
             .collect();
 
-        self.byte_map.retain(|&(space, addr), _| {
-            !stores
-                .iter()
-                .any(|store| match aliases.and_then(|a| a.interval(store.ptr)) {
-                    Some((sp, s, e)) => sp == space && s <= addr && addr < e,
-                    // A store we cannot pin may overwrite any byte of its space.
-                    None => store.space == space,
-                })
-        });
-        self.opaque.retain(|m, _| {
-            let Mnemonic::Load(load) = m else { return true };
-            let Some(aliases) = aliases else { return false };
-            !stores
-                .iter()
-                .any(|store| aliases.may_alias(ctx, store.ptr, load.ptr))
+        self.byte_map.retain(|&(base, off), _| {
+            !stores.iter().any(|store| {
+                let (sb, s) = locate(store.ptr, store.space, aliases, numbering);
+                if sb == base {
+                    // Same base: overwritten only on the bytes it covers.
+                    s <= off && off < s + store.size as i64
+                } else {
+                    // Other base: may overwrite unless provably disjoint.
+                    !cross_base_disjoint(aliases, store.ptr, sb, base)
+                }
+            })
         });
     }
 
@@ -456,7 +508,6 @@ impl MemForward {
     /// dominator-tree entry, whose dominance claims are invalid).
     pub(super) fn clear(&mut self) {
         self.byte_map.clear();
-        self.opaque.clear();
     }
 }
 
@@ -521,23 +572,25 @@ mod tests {
             .interval(ValueId::Varnode(tc.r0_lo32))
             .expect("r0_lo32 has an interval");
 
+        let base = Base::Pinned(space);
+        let start = start as i64;
         let src = ValueId::Varnode(tc.r1);
         let mut mf = MemForward::default();
         // bytes 0,1 = src[0],src[1]  (contiguous) ; byte 2 = src[3] (jump)
-        mf.byte_map.insert((space, start), Cell { src, src_off: 0 });
+        mf.byte_map.insert((base, start), Cell { src, src_off: 0 });
         mf.byte_map
-            .insert((space, start + 1), Cell { src, src_off: 1 });
+            .insert((base, start + 1), Cell { src, src_off: 1 });
         mf.byte_map
-            .insert((space, start + 2), Cell { src, src_off: 3 });
+            .insert((base, start + 2), Cell { src, src_off: 3 });
 
-        let segs = mf.segments(space, start, start + 3).expect("fully covered");
+        let segs = mf.segments(base, start, start + 3).expect("fully covered");
         assert_eq!(segs.len(), 2, "discontiguous src_off splits the run");
         assert_eq!((segs[0].load_off, segs[0].size, segs[0].src_off), (0, 2, 0));
         assert_eq!((segs[1].load_off, segs[1].size, segs[1].src_off), (2, 1, 3));
 
         // A hole makes the load unforwardable.
-        mf.byte_map.remove(&(space, start + 1));
-        assert!(mf.segments(space, start, start + 3).is_none());
+        mf.byte_map.remove(&(base, start + 1));
+        assert!(mf.segments(base, start, start + 3).is_none());
     }
 
     /// A later store overwrites only the bytes it covers.
@@ -549,15 +602,18 @@ mod tests {
         let aliases = manual_aliases(&tc, &[tc.r0_lo32, tc.r0_byte0]);
         let (space, start, _) = aliases.interval(ValueId::Varnode(tc.r0_lo32)).unwrap();
 
+        let base = Base::Pinned(space);
+        let start = start as i64;
         let wide_store = store_to(&tc, tc.r0_lo32, wide);
         let byte_store = store_to(&tc, tc.r0_byte0, byte);
+        let nb = Numbering::default();
         let mut mf = MemForward::default();
-        mf.record_store(&mut tc.ctx, &wide_store, Some(&aliases));
-        mf.record_store(&mut tc.ctx, &byte_store, Some(&aliases));
+        mf.record_store(&mut tc.ctx, &wide_store, Some(&aliases), &nb);
+        mf.record_store(&mut tc.ctx, &byte_store, Some(&aliases), &nb);
 
-        assert_eq!(mf.byte_map[&(space, start)].src, byte, "byte 0 overwritten");
+        assert_eq!(mf.byte_map[&(base, start)].src, byte, "byte 0 overwritten");
         assert_eq!(
-            mf.byte_map[&(space, start + 1)].src,
+            mf.byte_map[&(base, start + 1)].src,
             wide,
             "byte 1 still from the wide store"
         );
@@ -571,30 +627,34 @@ mod tests {
         let (space, r0_start, _) = aliases.interval(ValueId::Varnode(tc.r0_lo32)).unwrap();
         let (_, r1_start, _) = aliases.interval(ValueId::Varnode(tc.r1)).unwrap();
 
+        let base = Base::Pinned(space);
+        let r0_start = r0_start as i64;
+        let r1_start = r1_start as i64;
         let src = ValueId::Varnode(tc.r2);
         let mut mf = MemForward::default();
         mf.byte_map
-            .insert((space, r0_start), Cell { src, src_off: 0 });
+            .insert((base, r0_start), Cell { src, src_off: 0 });
         mf.byte_map
-            .insert((space, r1_start), Cell { src, src_off: 0 });
+            .insert((base, r1_start), Cell { src, src_off: 0 });
 
         // Simulate a call clobbering only r0 by retaining via the same predicate.
         let regs = [tc.r0_lo32];
         let is_reg = |sp| matches!(Space::from_id(&tc.ctx, sp).ty, SpaceType::Register);
-        mf.byte_map.retain(|&(sp, addr), _| {
+        mf.byte_map.retain(|&(b, off), _| {
+            let sp = b.space();
             if !is_reg(sp) {
                 return true;
             }
             !regs.iter().any(|&r| {
                 let vn = Varnode::from_id(&tc.ctx, r);
                 vn.space().id == sp
-                    && (vn.address() as u64) <= addr
-                    && addr < vn.address() as u64 + vn.size() as u64
+                    && (vn.address() as i64) <= off
+                    && off < vn.address() as i64 + vn.size() as i64
             })
         });
 
-        assert!(!mf.byte_map.contains_key(&(space, r0_start)), "r0 dropped");
-        assert!(mf.byte_map.contains_key(&(space, r1_start)), "r1 kept");
+        assert!(!mf.byte_map.contains_key(&(base, r0_start)), "r0 dropped");
+        assert!(mf.byte_map.contains_key(&(base, r1_start)), "r1 kept");
     }
 
     /// A store whose src is narrower than the written location zero-extends: the
@@ -613,20 +673,22 @@ mod tests {
             src: narrow,
             size: 4,
         };
+        let base = Base::Pinned(space);
+        let start = start as i64;
         let mut mf = MemForward::default();
-        mf.record_store(&mut tc.ctx, &store, Some(&aliases));
+        mf.record_store(&mut tc.ctx, &store, Some(&aliases), &Numbering::default());
 
         assert_eq!(mf.byte_map.len(), 4, "all four written bytes are defined");
-        assert_eq!(mf.byte_map[&(space, start)].src, narrow);
-        assert_eq!(mf.byte_map[&(space, start + 1)].src, narrow);
+        assert_eq!(mf.byte_map[&(base, start)].src, narrow);
+        assert_eq!(mf.byte_map[&(base, start + 1)].src, narrow);
         // Upper bytes resolve to a zero constant.
-        let upper = mf.byte_map[&(space, start + 2)].src;
+        let upper = mf.byte_map[&(base, start + 2)].src;
         assert_eq!(
             literal_of(&tc.ctx, upper),
             Some(0),
             "upper bytes zero-extend"
         );
-        assert_eq!(mf.byte_map[&(space, start + 3)].src, upper);
+        assert_eq!(mf.byte_map[&(base, start + 3)].src, upper);
     }
 
     fn literal_of(ctx: &Context, v: ValueId) -> Option<u64> {
@@ -645,16 +707,60 @@ mod tests {
         let aliases = manual_aliases(&tc, &[tc.r0_lo32]);
 
         let store = store_to(&tc, tc.r0_lo32, src);
+        let nb = Numbering::default();
         let mut mf = MemForward::default();
-        mf.record_store(&mut tc.ctx, &store, Some(&aliases));
+        mf.record_store(&mut tc.ctx, &store, Some(&aliases), &nb);
 
         let load = load_of(&tc, tc.r0_lo32);
         // A dummy instruction id to insert before; none is created here because
         // an exact forward materializes nothing.
         let dummy = qcode::value::InstructionId::from(0usize);
         let forwarded = mf
-            .try_load(&mut tc.ctx, block_id, dummy, &load, Some(&aliases))
+            .try_load(&mut tc.ctx, block_id, dummy, &load, Some(&aliases), &nb)
             .expect("exact forward");
         assert_eq!(forwarded, src);
+    }
+
+    /// A call may write through any pointer (no memory-write summary), so it
+    /// drops every symbolic RAM cell. A pinned RAM cell (a resolved stack slot)
+    /// is unaffected by register clobbers and survives.
+    #[test]
+    fn call_drops_symbolic_ram_cells_keeps_pinned() {
+        use qcode::builder::Builder;
+
+        let mut tc = TestContext::new();
+        let fun_id = Function::make(&mut tc.ctx, "f".into()).unwrap().id;
+        let block = tc.ctx.get_or_make_block(0x1000);
+        {
+            let mut f = Function::from_id_mut(&mut tc.ctx, fun_id);
+            f.set_root(block).unwrap();
+            f.add_block(block);
+        }
+        // The block ends in a (direct) call.
+        {
+            let mut b = Builder::from_block(BasicBlock::from_id_mut(&mut tc.ctx, block));
+            b.push_call(fun_id);
+            unsafe { b.dont_finalize() };
+        }
+
+        let ram = tc.ctx.default_space;
+        let symbolic = Base::Symbolic(ram, ValueId::Varnode(tc.r1));
+        let pinned = Base::Pinned(ram);
+        let src = ValueId::Varnode(tc.r2);
+
+        let mut mf = MemForward::default();
+        mf.byte_map.insert((symbolic, 0), Cell { src, src_off: 0 });
+        mf.byte_map.insert((pinned, 0x40), Cell { src, src_off: 0 });
+
+        mf.prune_clobbered_by_call(&tc.ctx, block, None);
+
+        assert!(
+            !mf.byte_map.contains_key(&(symbolic, 0)),
+            "a call drops symbolic RAM cells"
+        );
+        assert!(
+            mf.byte_map.contains_key(&(pinned, 0x40)),
+            "a pinned RAM cell survives a call"
+        );
     }
 }

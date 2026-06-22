@@ -50,6 +50,9 @@ pub use mem::{MemLiveness, compute_memory_liveness, mem2reg};
 pub mod value_range;
 pub use value_range::{ValueRange, value_range};
 
+pub mod verify;
+pub use verify::{Verify, verify_ir};
+
 pub mod loop_unroll;
 pub use loop_unroll::{
     RecognizeSimpleLoops, UnrollSimpleLoops, recognize_simple_loops, unroll_simple_loops,

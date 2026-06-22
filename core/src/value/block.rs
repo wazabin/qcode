@@ -573,6 +573,19 @@ impl<'str, 'ctx> BlockMutRef<'str, 'ctx> {
             self.ctx.remove_cfg_edge(edge);
         }
 
+        // Remove the block's instructions, not just the block. Otherwise they
+        // linger in the value arena: still registered in their operands' use-lists,
+        // so `ctx.users(v)` keeps returning a deleted block's `load`/`store`/etc.
+        // even though the block is gone from the CFG. Arena-global analyses (e.g.
+        // `argpromote`'s `analyze_param`, which scans `ctx.users`) would then see
+        // phantom accesses from the deleted block. `remove_instruction` updates the
+        // use-lists (via `remove_instructions`) and clears each instruction's
+        // parent; outgoing edges were already dropped above.
+        let insns: Vec<InstructionId> = self.inner().instructions.clone();
+        for insn in insns {
+            self.ctx.remove_instruction(insn);
+        }
+
         Function::from_id_mut(self.ctx, function_id)
             .inner_mut()
             .blocks
@@ -1098,6 +1111,52 @@ mod tests {
         assert_eq!(
             BasicBlock::from_id(&ctx, loop_hdr).predecessors().count(),
             0
+        );
+    }
+
+    /// Regression: deleting a block must also remove its instructions from the
+    /// value arena's use-lists. Otherwise a deleted block's instruction lingers as
+    /// an orphan — still registered as a user of its operands — so `ctx.users(v)`
+    /// keeps returning it even though the block is gone from the CFG, misleading
+    /// arena-global analyses (this caused `argpromote` to see a phantom access from
+    /// a loop body the unroller had deleted).
+    #[test]
+    fn delete_removes_instructions_from_use_lists() {
+        let mut ctx = Context::new();
+        qcode!(
+            ctx,
+            "
+            fn f:
+            <a>
+                %x = i64 1 + i64 2;
+                goto <b>;
+            <b>
+                %y = %x + i64 3;
+                goto <exit>;
+            <exit>
+                return [i64 0];
+            "
+        );
+
+        // `%x` (in the surviving entry) is used by `%y` (in block `b`).
+        assert!(
+            ctx.users(crate::value::ValueId::Instruction(x))
+                .to_vec()
+                .contains(&y),
+            "precondition: %x is used by %y"
+        );
+
+        BasicBlock::from_id_mut(&mut ctx, b).delete(f);
+
+        assert!(
+            !ctx.users(crate::value::ValueId::Instruction(x))
+                .to_vec()
+                .contains(&y),
+            "deleting b must unregister %y from %x's use-list, not orphan it"
+        );
+        assert!(
+            ctx.get_insn(y).parent().is_none(),
+            "deleted instruction must have its parent cleared"
         );
     }
 }
