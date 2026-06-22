@@ -48,6 +48,10 @@ const ADDRESS_DISCOVERY_PASS: &str = "handle_jump_tables";
 struct PipelineConfig {
     #[serde(default)]
     description: Option<String>,
+    /// Debugging aid: when set, run the whole-program verifier after every
+    /// pipeline stage and fail at the first invariant violation.
+    #[serde(default)]
+    debug: bool,
     #[serde(default)]
     stage: Vec<StageConfig>,
 }
@@ -116,6 +120,7 @@ struct Stage {
 /// A parsed, name-resolved analysis pipeline ready to run.
 pub struct Pipeline {
     stages: Vec<Stage>,
+    debug: bool,
 }
 
 /// A TOML pipeline available from the user's runtime pipeline directory.
@@ -308,6 +313,7 @@ impl Pipeline {
             toml::from_str(toml_src).map_err(|e| format!("pipeline TOML parse error: {e}"))?;
         let PipelineConfig {
             description: _description,
+            debug,
             stage,
         } = config;
 
@@ -332,7 +338,7 @@ impl Pipeline {
                 dump: sc.dump,
             });
         }
-        Ok(Pipeline { stages })
+        Ok(Pipeline { stages, debug })
     }
 
     /// Build a single function-scoped stage from pass names (à-la-carte), for
@@ -358,6 +364,7 @@ impl Pipeline {
                 only_dirty: sc.only_dirty,
                 dump: Vec::new(),
             }],
+            debug: false,
         })
     }
 
@@ -438,6 +445,7 @@ impl Pipeline {
                     );
                 }
             }
+            self.verify_after_stage(ctx, stage)?;
         }
         Ok(())
     }
@@ -501,11 +509,14 @@ impl Pipeline {
                         )
                         .await?,
                     );
+                    self.verify_after_stage(ctx, stage)?;
                     if reaches_discovery_pass {
                         return Ok(());
                     }
                 }
-                StagePasses::Module(_) => {}
+                StagePasses::Module(_) => {
+                    self.verify_after_stage(ctx, stage)?;
+                }
             }
         }
         Ok(())
@@ -549,8 +560,25 @@ impl Pipeline {
                     );
                 }
             }
+            self.verify_after_stage(ctx, stage)?;
         }
         Ok(())
+    }
+
+    fn verify_after_stage(&self, ctx: &Context, stage: &Stage) -> Result<(), String> {
+        if !self.debug {
+            return Ok(());
+        }
+        let diagnostics = crate::verify(ctx);
+        if diagnostics.is_empty() {
+            Ok(())
+        } else {
+            Err(format!(
+                "verifier failed after stage \"{}\":\n{}",
+                stage.name,
+                diagnostics.join("\n")
+            ))
+        }
     }
 }
 
@@ -971,6 +999,22 @@ mod tests {
     #[test]
     fn default_pipeline_parses() {
         Pipeline::default();
+    }
+
+    #[test]
+    fn debug_flag_is_parsed() {
+        let pipeline = Pipeline::parse(
+            r#"
+            debug = true
+
+            [[stage]]
+            name = "x"
+            scope = "module"
+            passes = []
+            "#,
+        )
+        .expect("debug pipeline parses");
+        assert!(pipeline.debug);
     }
 
     fn parse_err(toml_src: &str) -> String {

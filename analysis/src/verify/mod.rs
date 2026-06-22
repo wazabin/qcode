@@ -1,4 +1,4 @@
-//! IR invariant verification.
+//! Whole-program IR verifier.
 //!
 //! `verify_ir` walks the module and returns a list of structural-invariant
 //! violations. It is meant to run *between passes* (enabled by the `QCODE_VERIFY`
@@ -6,10 +6,10 @@
 //! failure is reported against the exact pass that produced it, rather than
 //! surfacing far downstream as a confusing symptom.
 //!
-//! This is intentionally a small placeholder: today it only checks that every
-//! basic block ends in a terminator. Add `check_*` helpers as new invariants are
-//! worth enforcing (e.g. no use of a value defined in a non-dominating /
-//! deleted block, single-entry blocks, well-typed aggregates, …).
+//! Beyond the structural checks here, each higher-level invariant rule lives in
+//! its own module and exposes a small, testable function (see
+//! [`pure_reg_call_args`]). [`verify`] runs every rule and returns all
+//! diagnostics.
 
 use std::sync::OnceLock;
 
@@ -17,12 +17,28 @@ use qcode::{context::Context, value::Function};
 
 use crate::{Pass, PipelineEnv};
 
+mod pure_reg_call_args;
+
+pub use pure_reg_call_args::{PureRegCallArgsViolation, verify_pure_reg_call_args};
+
 /// Returns every structural-invariant violation found in `ctx`, as human-readable
 /// strings. An empty result means the IR is well-formed by the checks we have.
 pub fn verify_ir(ctx: &Context) -> Vec<String> {
     let mut violations = Vec::new();
     check_blocks_end_with_terminator(ctx, &mut violations);
     violations
+}
+
+/// Run every verifier rule (structural invariants plus the per-rule modules) and
+/// return all diagnostics.
+pub fn verify(ctx: &Context<'_>) -> Vec<String> {
+    let mut diagnostics = verify_ir(ctx);
+    diagnostics.extend(
+        verify_pure_reg_call_args(ctx)
+            .into_iter()
+            .map(|v| v.diagnostic(ctx)),
+    );
+    diagnostics
 }
 
 /// Every basic block must end in a terminator (branch / cbranch / return / …).

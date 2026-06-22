@@ -46,7 +46,11 @@ impl<'ctx, 'str> Mem2Reg<'ctx, 'str> {
         // of rescanning the whole function for each variable.
         let mut live_in_cache = LiveInBlocks::new(&*self.ctx, self.function_id);
 
-        let Promotable { vars, sizes } = self.collect_promotable_vars(&mut live_in_cache);
+        let Promotable {
+            vars,
+            sizes,
+            no_root_params,
+        } = self.collect_promotable_vars(&mut live_in_cache);
         if vars.is_empty() {
             return false;
         }
@@ -58,7 +62,13 @@ impl<'ctx, 'str> Mem2Reg<'ctx, 'str> {
             by_block: var_params,
             changed,
             excluded,
-        } = self.insert_block_params(&vars, &sizes, &frontier, &mut live_in_cache);
+        } = self.insert_block_params(
+            &vars,
+            &sizes,
+            &no_root_params,
+            &frontier,
+            &mut live_in_cache,
+        );
 
         // Drop vars whose promotion was declined (implicit-edge join); their
         // memory accesses stay in place, so renaming and store removal must not
@@ -228,6 +238,54 @@ fn register_varnode(ctx: &Context, value: ValueId) -> Option<VarnodeId> {
     matches!(Varnode::from_id(ctx, vn_id).space().ty, SpaceType::Register).then_some(vn_id)
 }
 
+fn wider_register_store_contains(ctx: &Context, store: ValueId, var: ValueId) -> bool {
+    let (Some(store), Some(var)) = (register_varnode(ctx, store), register_varnode(ctx, var))
+    else {
+        return false;
+    };
+    let (store, var) = (Varnode::from_id(ctx, store), Varnode::from_id(ctx, var));
+    if store.space().id != var.space().id || store.size() <= var.size() {
+        return false;
+    }
+    let store_start = store.address() as i128;
+    let var_start = var.address() as i128;
+    let store_end = store_start + store.size() as i128;
+    let var_end = var_start + var.size() as i128;
+    store_start <= var_start && var_end <= store_end
+}
+
+/// Whether the call terminating `block` (if any) clobbers register `var`.
+///
+/// A direct call clobbers the registers in its target's recorded clobber set,
+/// overlap-aware so a callee writing RAX clobbers a caller's EAX read. A
+/// `CallInd` has an unknown target and conservatively clobbers every register; a
+/// target with no recorded clobber set is likewise treated conservatively.
+/// Non-register vars (stack slots) are never clobbered by a call.
+fn call_clobbers_var(ctx: &Context, block: BlockId, var: ValueId, aliases: &AliasResult) -> bool {
+    if register_varnode(ctx, var).is_none() {
+        return false;
+    };
+    let term = BasicBlock::from_id(ctx, block)
+        .iter()
+        .last()
+        .map(|i| i.mnemonic().clone());
+    match term {
+        Some(Mnemonic::CallInd(_)) => true,
+        Some(Mnemonic::Call(call)) => {
+            let clobbered: Option<Vec<VarnodeId>> = Function::from_id(ctx, call.target)
+                .clobbered_regs()
+                .map(<[VarnodeId]>::to_vec);
+            match clobbered {
+                Some(clobbered) => clobbered
+                    .iter()
+                    .any(|&c| aliases.may_alias(ctx, ValueId::Varnode(c), var)),
+                None => true,
+            }
+        }
+        _ => false,
+    }
+}
+
 /// For each register store-pointer in the function, the set of promoted register
 /// vars it may clobber (overlapping byte ranges in the same space).
 ///
@@ -281,6 +339,11 @@ fn register_clobber_index(
 struct Promotable {
     vars: HashSet<ValueId>,
     sizes: HashMap<ValueId, usize>,
+    /// Promoted vars that should not receive a function-entry param. These are
+    /// sub-register reads covered by a wider overlapping seed store (e.g. an EDX
+    /// read after argpromote's RDX seed). The initial load stays as a register
+    /// read, while later exact stores/loads can still be promoted in the body.
+    no_root_params: HashSet<ValueId>,
 }
 
 #[derive(Clone, Copy)]
@@ -426,6 +489,7 @@ impl Mem2Reg<'_, '_> {
         let mut stored = HashSet::default();
         let mut loaded = HashSet::default();
         let mut store_counts: HashMap<ValueId, usize> = HashMap::default();
+        let mut register_stores: HashSet<ValueId> = HashSet::default();
 
         // Stack-slot bookkeeping, keyed by the slot literal `ValueId`.
         let mut stack_stored: HashSet<ValueId> = HashSet::default();
@@ -476,6 +540,12 @@ impl Mem2Reg<'_, '_> {
                     if access.is_store() {
                         stored.insert(access.ptr);
                         *store_counts.entry(access.ptr).or_insert(0) += 1;
+                        if matches!(
+                            Varnode::from_id(self.ctx, vn_id).space().ty,
+                            SpaceType::Register
+                        ) {
+                            register_stores.insert(access.ptr);
+                        }
                     } else {
                         loaded.insert(access.ptr);
                     }
@@ -527,9 +597,24 @@ impl Mem2Reg<'_, '_> {
                     // call is the call's output, not an input; leaving it as a
                     // register load lets emulation read the clobbered value rather
                     // than a spurious entry parameter.
-                    if self.root_id.is_some_and(|r| {
-                        self.live_in_blocks_cached(var, live_in_cache).contains(&r)
-                    }) {
+                    //
+                    // Be conservative around overlapping register writes. A full
+                    // register seed such as `store(RDX, @RDX)` followed by a
+                    // sub-register read `load(EDX)` makes `EDX` look load-only when
+                    // vars are keyed by exact varnode id. Promoting that apparent
+                    // live-in creates a transient, usually-unused root param; for a
+                    // `pure_reg` callee, that mutates the by-value call interface
+                    // outside the lockstep helpers. Leave such loads in memory SSA
+                    // so the overlap-aware GVN memory pass can forward/slice the
+                    // dominating store instead.
+                    let has_overlapping_register_store = register_stores.iter().any(|&store| {
+                        store != var && wider_register_store_contains(self.ctx, store, var)
+                    });
+                    if !has_overlapping_register_store
+                        && self.root_id.is_some_and(|r| {
+                            self.live_in_blocks_cached(var, live_in_cache).contains(&r)
+                        })
+                    {
                         vars.insert(var);
                     }
                 } else if !is_store_only || count >= 2 {
@@ -600,13 +685,29 @@ impl Mem2Reg<'_, '_> {
         vars.retain(|var| !mixed_width.contains(var));
         sizes.retain(|var, _| vars.contains(var));
 
-        Promotable { vars, sizes }
+        let no_root_params = vars
+            .iter()
+            .copied()
+            .filter(|&var| {
+                register_varnode(self.ctx, var).is_some()
+                    && register_stores
+                        .iter()
+                        .any(|&store| wider_register_store_contains(self.ctx, store, var))
+            })
+            .collect();
+
+        Promotable {
+            vars,
+            sizes,
+            no_root_params,
+        }
     }
 
     fn insert_block_params(
         &mut self,
         vars: &HashSet<ValueId>,
         sizes: &HashMap<ValueId, usize>,
+        no_root_params: &HashSet<ValueId>,
         frontier: &HashMap<BlockId, HashSet<BlockId>>,
         live_in_cache: &mut LiveInBlocks,
     ) -> InsertedBlockParams {
@@ -674,7 +775,7 @@ impl Mem2Reg<'_, '_> {
             let root_has_param = var_params
                 .get(&root_id)
                 .is_some_and(|m| m.contains_key(&var));
-            if !root_has_param && live_in.contains(&root_id) {
+            if !root_has_param && live_in.contains(&root_id) && !no_root_params.contains(&var) {
                 let (param_id, inserted) =
                     self.get_or_insert_param_for_var(root_id, size, var, var_name.as_deref());
                 changed |= inserted;
@@ -1843,6 +1944,51 @@ mod tests {
         assert!(named_result.contains(&"bb2"), "bb2 should be in the result");
         assert!(named_result.contains(&"bb7"), "bb7 should be in the result");
         assert!(named_result.contains(&"bb8"), "bb8 should be in the result");
+    }
+
+    #[test]
+    fn overlapping_full_register_seed_does_not_create_subregister_entry_param() {
+        use qcode::{builder::Builder, testing::TestContext};
+
+        let mut tc = TestContext::new();
+        let fun_id = Function::make(&mut tc.ctx, "callee".into()).unwrap().id;
+        let block_id = tc.ctx.get_or_make_block(0x1000);
+        Function::from_id_mut(&mut tc.ctx, fun_id)
+            .set_root(block_id)
+            .unwrap();
+        Function::from_id_mut(&mut tc.ctx, fun_id).set_pure_reg(true);
+
+        let full_param = BasicBlock::from_id_mut(&mut tc.ctx, block_id)
+            .push_param(8)
+            .id;
+        tc.ctx.values.block_params[full_param].name = Some("r0".into());
+
+        {
+            let mut b = Builder::from_context(&mut tc.ctx, 0x1000);
+            b.push_store(
+                ValueId::BlockParam(full_param),
+                ValueId::Varnode(tc.r0),
+                tc.reg_space,
+            );
+            let sub = b
+                .push_load::<false>(ValueId::Varnode(tc.r0_lo32), 4, tc.reg_space)
+                .id();
+            b.push_store(sub, ValueId::Varnode(tc.r1), tc.reg_space);
+            unsafe { b.dont_finalize() };
+        }
+
+        let aliases = AliasResult::simple(&tc.ctx);
+        mem2reg(&mut tc.ctx, fun_id, &aliases);
+
+        let params: Vec<_> = BasicBlock::from_id(&tc.ctx, block_id).params().collect();
+        assert_eq!(
+            params.len(),
+            1,
+            "mem2reg must not turn the sub-register read into a new pure_reg \
+             entry param; it is covered by the wider seed store:\n{}",
+            Function::from_id(&tc.ctx, fun_id)
+        );
+        assert_eq!(params[0].id, full_param);
     }
 
     #[test]

@@ -51,7 +51,7 @@ pub mod value_range;
 pub use value_range::{ValueRange, value_range};
 
 pub mod verify;
-pub use verify::{Verify, verify_ir};
+pub use verify::{PureRegCallArgsViolation, Verify, verify, verify_ir, verify_pure_reg_call_args};
 
 pub mod loop_unroll;
 pub use loop_unroll::{
