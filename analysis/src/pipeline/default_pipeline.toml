@@ -216,6 +216,26 @@ scope = "module"
 passes = ["partial_inline", "dead_signature"]
 repeat_until = "no_change"
 
+# Forward the `argpromote_stack` seed-store/load pairs (the by-value stack args,
+# stored into the shadow space at entry and read back as narrow loads, which
+# mem2reg leaves unpromoted for `pure_reg` callees) into their by-value params, so
+# the purity check below sees a load-free body. `dead_store`+`dce` then sweep the
+# now-unread seed stores.
+[[stage]]
+name = "pre-pure-cleanup"
+scope = "function"
+passes = ["gvn", "dead_store", "dce"]
+
+# Now that every side-effect channel is functionalized, assert `is_pure` on the
+# functions whose returned values are a deterministic function of their params
+# (no loads / external reads). The following `gvn` then emulates such callees at
+# call sites with constant arguments, replacing the projecting `extract` with the
+# computed return value.
+[[stage]]
+name = "mark-pure"
+scope = "module"
+passes = ["mark_pure"]
+
 # Aesthetic changes. `include_external` so the demangler also reaches imported
 # library functions (PLT stubs like `_ZNSsixEj` -> `std::string::operator[]`),
 # which are bodyless and therefore skipped by function-scoped stages by default.

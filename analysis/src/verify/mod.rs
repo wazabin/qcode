@@ -1,63 +1,46 @@
 //! Whole-program IR verifier.
 //!
-//! `verify_ir` walks the module and returns a list of structural-invariant
-//! violations. It is meant to run *between passes* (enabled by the `QCODE_VERIFY`
-//! environment variable; see [`enabled`]) so that when a pass corrupts the IR the
-//! failure is reported against the exact pass that produced it, rather than
-//! surfacing far downstream as a confusing symptom.
-//!
-//! Beyond the structural checks here, each higher-level invariant rule lives in
-//! its own module and exposes a small, testable function (see
-//! [`pure_reg_call_args`]). [`verify`] runs every rule and returns all
-//! diagnostics.
+//! Each invariant rule lives in its own module and exposes a small, testable
+//! function. The verifier is meant to run *between passes* (enabled by the
+//! `QCODE_VERIFY` environment variable; see [`enabled`]) so that when a pass
+//! corrupts the IR the failure is reported against the exact pass that produced
+//! it, rather than surfacing far downstream as a confusing symptom.
+
+mod block_terminators;
+mod pure_function;
+mod pure_reg_call_args;
+
+pub use block_terminators::verify_block_terminators;
+pub use pure_function::{PureFunctionViolation, verify_pure_functions};
+pub use pure_reg_call_args::{PureRegCallArgsViolation, verify_pure_reg_call_args};
 
 use std::sync::OnceLock;
 
-use qcode::{context::Context, value::Function};
+use qcode::context::Context;
 
 use crate::{Pass, PipelineEnv};
 
-mod pure_reg_call_args;
-
-pub use pure_reg_call_args::{PureRegCallArgsViolation, verify_pure_reg_call_args};
-
-/// Returns every structural-invariant violation found in `ctx`, as human-readable
-/// strings. An empty result means the IR is well-formed by the checks we have.
-pub fn verify_ir(ctx: &Context) -> Vec<String> {
-    let mut violations = Vec::new();
-    check_blocks_end_with_terminator(ctx, &mut violations);
-    violations
-}
-
-/// Run every verifier rule (structural invariants plus the per-rule modules) and
-/// return all diagnostics.
+/// Run every verifier rule and return all diagnostics as human-readable strings.
+/// An empty result means the IR is well-formed by the checks we have.
 pub fn verify(ctx: &Context<'_>) -> Vec<String> {
-    let mut diagnostics = verify_ir(ctx);
+    let mut diagnostics = Vec::new();
+    diagnostics.extend(verify_block_terminators(ctx));
     diagnostics.extend(
         verify_pure_reg_call_args(ctx)
+            .into_iter()
+            .map(|v| v.diagnostic(ctx)),
+    );
+    diagnostics.extend(
+        verify_pure_functions(ctx)
             .into_iter()
             .map(|v| v.diagnostic(ctx)),
     );
     diagnostics
 }
 
-/// Every basic block must end in a terminator (branch / cbranch / return / …).
-/// A block that is empty, or whose last instruction is an ordinary value op, has
-/// fall-through control flow with no defined successor — a malformed CFG.
-fn check_blocks_end_with_terminator(ctx: &Context, out: &mut Vec<String>) {
-    for fid in ctx.function_ids() {
-        for block in Function::from_id(ctx, fid).iter() {
-            match block.iter().last() {
-                None => out.push(format!("fn {fid:?} block {:?} is empty (no terminator)", block.id)),
-                Some(last) if !last.mnemonic().is_terminator() => out.push(format!(
-                    "fn {fid:?} block {:?} does not end in a terminator (last op: `{}`)",
-                    block.id,
-                    last.mnemonic().opcode()
-                )),
-                Some(_) => {}
-            }
-        }
-    }
+/// Back-compat alias for [`verify`].
+pub fn verify_ir(ctx: &Context) -> Vec<String> {
+    verify(ctx)
 }
 
 /// Whether between-pass verification is enabled. Reads the `QCODE_VERIFY`
@@ -68,14 +51,14 @@ pub fn enabled() -> bool {
     *ENABLED.get_or_init(|| std::env::var("QCODE_VERIFY").is_ok_and(|v| !v.is_empty()))
 }
 
-/// Run [`verify_ir`] and panic if it fails, naming `pass` — the pass that just ran.
+/// Run [`verify`] and panic if it fails, naming `pass` — the pass that just ran.
 /// A no-op unless [`enabled`]. Called by the pipeline driver after each pass so the
 /// first invariant break is pinned to its culprit.
 pub fn verify_after(ctx: &Context, pass: &str) {
     if !enabled() {
         return;
     }
-    let violations = verify_ir(ctx);
+    let violations = verify(ctx);
     assert!(
         violations.is_empty(),
         "IR verification failed after pass `{pass}`:\n  - {}",
@@ -95,7 +78,7 @@ impl Pass for Verify {
         "Check IR structural invariants (fails on violation)"
     }
     fn run(&self, ctx: &mut Context, _env: &PipelineEnv) -> Result<bool, String> {
-        let violations = verify_ir(ctx);
+        let violations = verify(ctx);
         if violations.is_empty() {
             Ok(false)
         } else {

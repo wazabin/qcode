@@ -17,9 +17,9 @@ inventory.workspace = true
 log.workspace = true
 rustc-hash.workspace = true
 pollster.workspace = true
+# Pure-function emulation in constant propagation runs the callee body.
+qcode_emulator.workspace = true
 
 [dev-dependencies]
 qcode = { workspace = true, features = ["testing"] }
 qcode_macro.workspace = true
-# Execution-level (emulator round-trip) validation of the argpromote rewrite.
-qcode_emulator.workspace = true

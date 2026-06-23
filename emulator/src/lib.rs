@@ -90,6 +90,8 @@ pub enum EmulatorErrorKind {
     UnsupportedIntrinsic(Box<str>),
     /// A user-provided call interceptor failed while modeling a call
     InterceptError(Box<str>),
+    /// A bounded emulation run (e.g. `run_pure`) exceeded its step budget.
+    StepBudgetExceeded(usize),
 }
 
 impl std::fmt::Display for EmulatorErrorKind {
@@ -109,6 +111,9 @@ impl std::fmt::Display for EmulatorErrorKind {
             Self::UnsupportedPCodeOp(op) => write!(f, "unsupported p-code operation `{op}`"),
             Self::UnsupportedIntrinsic(op) => write!(f, "unsupported intrinsic `{op}`"),
             Self::InterceptError(message) => write!(f, "call interceptor failed: {message}"),
+            Self::StepBudgetExceeded(budget) => {
+                write!(f, "emulation exceeded step budget of {budget}")
+            }
         }
     }
 }

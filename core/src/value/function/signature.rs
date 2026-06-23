@@ -51,4 +51,16 @@ pub struct FunctionSignature {
     /// purely from in-IR uses, decoupled from the ABI register lists.
     #[serde(default)]
     pub pure_reg: bool,
+    /// `true` once this function's returned values are a deterministic function of
+    /// its by-value params, with no value flowing in from outside the SSA graph:
+    /// no loads (an untracked memory read), no calls, no architecture p-code ops,
+    /// and no raw register/global reads. Stores are permitted — they produce no
+    /// value, so they cannot feed a returned field. Strictly stronger than
+    /// [`pure_reg`](Self::pure_reg), which only asserts the register channel is
+    /// functionalized. Pure-function emulation in constant propagation gates on
+    /// this (see `PURE_EMULATION_DESIGN.md`): such a callee may be emulated to
+    /// harvest constant return-tuple fields, with the call left in place. Asserted
+    /// by argpromote's `mark_pure`; checked by a `verify/` rule.
+    #[serde(default)]
+    pub is_pure: bool,
 }

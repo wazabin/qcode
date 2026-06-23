@@ -21,6 +21,7 @@ mod identity;
 mod intrinsics;
 mod mem_forward;
 mod memory;
+mod pure_call;
 mod walk;
 
 use cse::Cse;
@@ -29,16 +30,19 @@ use fold::Fold;
 use identity::Identities;
 use intrinsics::Recognize;
 use memory::MemoryForwarding;
+use pure_call::PureCall;
 use walk::{run_dominator_walk, run_flat_fixpoint, run_single_block};
 
 /// The full GVN sub-pass chain. Order is load-bearing: memory forwarding must
 /// see loads/stores first, folding must run before idiom recognition (so shift
-/// amounts and multipliers are constants), intrinsic recognition before the
-/// algebraic identities that simplify the intrinsics it produces, and CSE last
-/// over already-simplified mnemonics.
+/// amounts and multipliers are constants), pure-call folding before intrinsic
+/// recognition, intrinsic recognition before the algebraic identities that
+/// simplify the intrinsics it produces, and CSE last over already-simplified
+/// mnemonics.
 fn gvn_passes() -> (
     MemoryForwarding,
     Fold,
+    PureCall,
     Recognize,
     FlagIdiom,
     Identities,
@@ -47,6 +51,7 @@ fn gvn_passes() -> (
     (
         MemoryForwarding,
         Fold,
+        PureCall,
         Recognize,
         FlagIdiom,
         Identities,

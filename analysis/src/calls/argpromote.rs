@@ -84,6 +84,62 @@ pub fn argpromote(ctx: &mut Context) -> bool {
     changed
 }
 
+/// Assert [`Function::is_pure`] on every `pure_reg` function whose body has no
+/// residual side effect — no memory access, no calls, and no raw register/global
+/// (varnode) reads — so it is a deterministic pure function of its params.
+///
+/// This is the final argpromote step: the register/stack/memory channels each
+/// functionalize one kind of effect, and a function with nothing left for any of
+/// them is fully pure. Idempotent; returns `true` if any flag was newly set.
+/// The [`verify`](crate::verify) pure-function rule re-checks this invariant.
+pub fn mark_pure_functions(ctx: &mut Context) -> bool {
+    let mut changed = false;
+    for fid in ctx.function_ids() {
+        let f = Function::from_id(ctx, fid);
+        if f.is_pure() || !f.is_pure_reg() {
+            continue;
+        }
+        if body_is_pure(ctx, fid) {
+            Function::from_id_mut(ctx, fid).set_is_pure(true);
+            changed = true;
+        }
+    }
+    changed
+}
+
+/// Whether `fid`'s body computes its returned values as a deterministic function
+/// of its params, with no value flowing in from outside the SSA graph.
+///
+/// Concretely it forbids: **loads** (a memory read is an untracked value source —
+/// the return projection follows SSA only and cannot prove a loaded value is
+/// independent of a symbolic input), **calls / indirect transfers / p-code ops**,
+/// and any **raw varnode operand** on a value-producing instruction (an
+/// un-promoted register/global read). **Stores are permitted**: they produce no
+/// value, so they never feed a returned field, and the emulation harvesting this
+/// property keeps the call in place — any real side effect the store represents
+/// is preserved. (This is why argpromote_stack's dead private seed-stores do not
+/// block purity.)
+pub(crate) fn body_is_pure(ctx: &Context, fid: FunctionId) -> bool {
+    Function::from_id(ctx, fid)
+        .iter()
+        .all(|block| block.iter().all(|insn| mnemonic_is_pure(insn.mnemonic())))
+}
+
+fn mnemonic_is_pure(m: &Mnemonic) -> bool {
+    match m {
+        Mnemonic::Load(_)
+        | Mnemonic::Call(_)
+        | Mnemonic::CallInd(_)
+        | Mnemonic::BranchInd(_)
+        | Mnemonic::PCodeOp(_) => false,
+        // A store produces no value, so it never feeds a returned field.
+        Mnemonic::Store(_) => true,
+        // Every other op is a value computation or structured control flow; it is
+        // pure as long as it reads no raw varnode (un-promoted register/global).
+        _ => m.args().iter().all(|a| !matches!(a, ValueId::Varnode(_))),
+    }
+}
+
 /// A dereferenced pointer parameter slated for promotion, and the IR sites the
 /// rewrite must touch.
 struct Promoted {
@@ -1071,6 +1127,21 @@ impl Pass for ArgPromoteRegisters {
 }
 
 crate::register_module_pass!(ArgPromoteRegisters);
+
+#[derive(Default)]
+pub struct MarkPure;
+
+impl Pass for MarkPure {
+    const NAME: &'static str = "mark_pure";
+    fn description(&self) -> &'static str {
+        "Assert is_pure on fully functionalized (side-effect-free) functions"
+    }
+    fn run(&self, ctx: &mut Context, _env: &PipelineEnv) -> Result<bool, String> {
+        Ok(mark_pure_functions(ctx))
+    }
+}
+
+crate::register_module_pass!(MarkPure);
 
 #[cfg(test)]
 mod tests {
@@ -2218,5 +2289,60 @@ mod tests {
                 == RegPurityReason::NonCanonicalRegisters,
             "partial overlap with no covering register must bail"
         );
+    }
+
+    /// `mark_pure_functions` asserts `is_pure` on a `pure_reg` function with a
+    /// side-effect-free body, but not on one that still stores to memory.
+    #[test]
+    fn mark_pure_flags_only_fully_pure_bodies() {
+        let mut tc = qcode::testing::TestContext::new();
+
+        // A clean function: arithmetic over a param, returned through a tuple.
+        let clean = Function::make(&mut tc.ctx, "clean".into()).unwrap().id;
+        let clean_entry = tc.ctx.get_or_make_block(0x1000);
+        {
+            let mut f = Function::from_id_mut(&mut tc.ctx, clean);
+            f.set_root(clean_entry).unwrap();
+            f.add_block(clean_entry);
+        }
+        {
+            let mut b = Builder::from_block(BasicBlock::from_id_mut(&mut tc.ctx, clean_entry));
+            let a = b.push_param(8).id();
+            let c = b.context_mut().get_const(1, 8).id();
+            let s = b.push_add(a, c).id();
+            let _ = b.push_tuple(vec![s]).id();
+            let ptr = b.context_mut().get_const(0x2000, 8).id();
+            b.push_return(ptr);
+            unsafe { b.dont_finalize() };
+        }
+        Function::from_id_mut(&mut tc.ctx, clean).set_pure_reg(true);
+
+        // A function that still loads from memory (an untracked value source).
+        let dirty = Function::make(&mut tc.ctx, "dirty".into()).unwrap().id;
+        let dirty_entry = tc.ctx.get_or_make_block(0x3000);
+        {
+            let mut f = Function::from_id_mut(&mut tc.ctx, dirty);
+            f.set_root(dirty_entry).unwrap();
+            f.add_block(dirty_entry);
+        }
+        let (r0, reg_space) = (tc.r0, tc.reg_space);
+        {
+            let mut b = Builder::from_block(BasicBlock::from_id_mut(&mut tc.ctx, dirty_entry));
+            let _ = b.push_load::<false>(ValueId::Varnode(r0), 8, reg_space).id();
+            let ptr = b.context_mut().get_const(0x4000, 8).id();
+            b.push_return(ptr);
+            unsafe { b.dont_finalize() };
+        }
+        Function::from_id_mut(&mut tc.ctx, dirty).set_pure_reg(true);
+
+        assert!(mark_pure_functions(&mut tc.ctx), "the clean function is newly pure");
+        assert!(Function::from_id(&tc.ctx, clean).is_pure());
+        assert!(
+            !Function::from_id(&tc.ctx, dirty).is_pure(),
+            "a function with a residual load must not be marked pure"
+        );
+
+        // Idempotent: a second run flags nothing new.
+        assert!(!mark_pure_functions(&mut tc.ctx));
     }
 }

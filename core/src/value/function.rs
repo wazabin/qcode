@@ -207,6 +207,14 @@ where
         self.inner().signature.as_ref().is_some_and(|s| s.pure_reg)
     }
 
+    /// Whether argpromote has functionalized *every* side-effect channel of this
+    /// function — it is a deterministic pure function of its by-value params,
+    /// touching no caller-visible memory or registers. Strictly stronger than
+    /// [`is_pure_reg`](Self::is_pure_reg). See [`FunctionSignature::is_pure`].
+    pub fn is_pure(&'s self) -> bool {
+        self.inner().signature.as_ref().is_some_and(|s| s.is_pure)
+    }
+
     /// Registers read before written (function inputs), as inferred by analysis.
     ///
     /// Legacy ABI input-register list. It is **`None` for `pure_reg` functions**
@@ -603,6 +611,13 @@ impl<'str, 'ctx> FunctionMutRef<'str, 'ctx> {
     /// See [`FunctionSignature::pure_reg`].
     pub fn set_pure_reg(&mut self, value: bool) {
         self.inner_mut().signature.get_or_insert_default().pure_reg = value;
+    }
+
+    /// Marks this function as fully functionalized over *every* side-effect
+    /// channel — a deterministic pure function of its params. See
+    /// [`FunctionSignature::is_pure`].
+    pub fn set_is_pure(&mut self, value: bool) {
+        self.inner_mut().signature.get_or_insert_default().is_pure = value;
     }
 
     /// Records the analysis-inferred saved (preserved) register set on this function.

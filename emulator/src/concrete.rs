@@ -1432,6 +1432,62 @@ impl StandaloneEmulator {
         self.call_stack.pop(); // pop the outermost function
         result
     }
+
+    /// Emulate a **pure** function in isolation: bind its root params positionally
+    /// from `args` (so symbolic caller inputs can be passed an arbitrary poison
+    /// value) and run to the first top-level `Return` *without executing it*,
+    /// leaving the body's computed values readable via [`get_value`](Self::get_value)
+    /// at the block returned by [`current_block`](Self::current_block).
+    ///
+    /// `args` must align with the root params index-for-index (the `pure_reg`
+    /// call interface). The run is bounded by `max_steps`; exceeding it yields
+    /// [`EmulatorErrorKind::StepBudgetExceeded`]. Intended for v1 **leaf** pure
+    /// functions (no nested calls), so call bookkeeping is intentionally minimal.
+    pub fn run_pure(
+        &mut self,
+        ctx: &Context<'_>,
+        func: FunctionId,
+        args: &[SizedValue],
+        max_steps: usize,
+    ) -> crate::Result<()> {
+        let root = Function::from_id(ctx, func)
+            .root()
+            .ok_or_else(|| self.make_error(ctx, EmulatorErrorKind::EmptyFunctionRoot(func)))?
+            .id;
+        self.block = root;
+        self.idx = 0;
+        self.call_stack.push(func);
+
+        // Bind root params positionally from `args`.
+        let param_ids: Vec<BlockParamId> = BasicBlock::from_id(ctx, root)
+            .params()
+            .map(|p| p.id)
+            .collect();
+        for (param_id, &value) in param_ids.into_iter().zip(args) {
+            self.block_param_values.insert(param_id, value);
+        }
+
+        let mut steps = 0usize;
+        let result = loop {
+            let insn_ids = BasicBlock::from_id(ctx, self.block)
+                .instruction_ids()
+                .to_vec();
+            let insn = InstructionRef::new(ctx, insn_ids[self.idx]);
+            if matches!(insn.mnemonic(), Mnemonic::Return(_)) {
+                break Ok(());
+            }
+            steps += 1;
+            if steps > max_steps {
+                break Err(self.make_error(ctx, EmulatorErrorKind::StepBudgetExceeded(max_steps)));
+            }
+            if let Err(e) = self.step(ctx) {
+                break Err(e);
+            }
+        };
+
+        self.call_stack.pop();
+        result
+    }
 }
 
 /// Private helper that pairs `&mut StandaloneEmulator` fields with `&Context<'_>`

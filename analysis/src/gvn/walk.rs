@@ -218,6 +218,7 @@ impl_sub_passes!(A.0, B.1, C.2);
 impl_sub_passes!(A.0, B.1, C.2, D.3);
 impl_sub_passes!(A.0, B.1, C.2, D.3, E.4);
 impl_sub_passes!(A.0, B.1, C.2, D.3, E.4, F.5);
+impl_sub_passes!(A.0, B.1, C.2, D.3, E.4, F.5, G.6);
 
 // ---------------------------------------------------------------------------
 // Drivers
