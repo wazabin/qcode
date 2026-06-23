@@ -181,6 +181,29 @@ fn hull(a: ValueRange, b: ValueRange) -> ValueRange {
     }
 }
 
+/// Bitwise-OR of two intervals, over-approximated.
+///
+/// `a | b >= a` and `>= b` (unsigned), so the result's minimum is at least the
+/// larger of the two minima. For the maximum, every set bit of `a | b` lies at
+/// or below the highest set bit of `a.max | b.max`, so filling all bits below
+/// that bit (`fill_below_msb`) is a sound upper bound.
+fn or(a: ValueRange, b: ValueRange, mask: u64) -> ValueRange {
+    ValueRange {
+        min: a.min.max(b.min),
+        max: fill_below_msb(a.max | b.max).min(mask),
+    }
+}
+
+/// The smallest `2^k - 1` that is `>= m` (i.e. `m` with every bit below its
+/// most-significant set bit filled in). `0` for `m == 0`.
+fn fill_below_msb(m: u64) -> u64 {
+    if m == 0 {
+        0
+    } else {
+        u64::MAX >> m.leading_zeros()
+    }
+}
+
 fn shr(a: ValueRange, shift: u64) -> ValueRange {
     let s = shift.min(63);
     ValueRange {
@@ -280,6 +303,11 @@ impl Solver<'_> {
                         Some(c) => shr(self.range(lhs, depth + 1), c),
                         None => top,
                     },
+                    IntBinop::Or => {
+                        let a = self.range(lhs, depth + 1);
+                        let b = self.range(rhs, depth + 1);
+                        or(a, b, mask)
+                    }
                     // `x & c` can clear bits anywhere, so the min is 0; the
                     // result can exceed neither operand's max.
                     IntBinop::And => {
@@ -310,10 +338,14 @@ impl Solver<'_> {
                 let sign_bit = (all_ones(src_size) >> 1) + 1;
                 if src.max < sign_bit { src } else { top }
             }
-            // A low-bytes extract is the identity when the value fits.
-            Mnemonic::Range(r) if r.start == 0 => {
+            // A byte-range extract `src[start:end]` is `(src >> start*8)`
+            // truncated to the output width: shift the source interval down by
+            // the start offset, then keep it only if it fits the result mask.
+            // (`start == 0` is the plain low-bytes-fit-the-width case.)
+            Mnemonic::Range(r) => {
                 let src = self.range(r.src, depth + 1);
-                if src.max <= mask { src } else { top }
+                let shifted = shr(src, (r.start as u64) * 8);
+                if shifted.max <= mask { shifted } else { top }
             }
 
             // Loads, calls, unops, ... : opaque.
@@ -932,6 +964,111 @@ mod tests {
 
         let r = value_range(&ctx, j.into(), disp);
         assert_eq!((r.min, r.max), (0, 12));
+    }
+
+    /// Bitwise-OR of two bounded operands is bounded by the hull of their bits.
+    #[test]
+    fn or_of_bounded_operands() {
+        let mut ctx = Context::new();
+        qcode!(
+            ctx,
+            "
+            varnode i64 A;
+            varnode i64 B;
+            <block>
+                %a = load(i64, &A);
+                %b = load(i64, &B);
+                %ca = %a & 0x1;
+                %cb = %b & 0x4;
+                %j = %ca | %cb;
+                goto <0x1001>;
+            "
+        );
+
+        // [0,1] | [0,4] => bits below msb(1|4=5) filled => [0,7].
+        let r = value_range(&ctx, j.into(), block);
+        assert_eq!((r.min, r.max), (0, 7));
+    }
+
+    /// A high-bytes extract (`src[start:end]` with `start != 0`) of a value
+    /// known to be zero is zero — the `0x0[1:4]` slice the lifter emits for the
+    /// upper bytes of a `xor reg,reg`-zeroed register. Built via the builder
+    /// because the `qcode!` macro has no byte-range surface syntax.
+    #[test]
+    fn range_extract_of_zero_high_bytes() {
+        use qcode::builder::Builder;
+        use qcode::value::BasicBlock;
+
+        let mut ctx = Context::new();
+        qcode!(
+            ctx,
+            "
+            varnode i64 A;
+            <block>
+                %a = load(i64, &A);
+                %zero = %a & 0x0;
+                goto <0x1001>;
+            "
+        );
+
+        // `%zero` is an instruction (range [0,0]); take its bytes [1:4).
+        let hi = {
+            let mut blk = BasicBlock::from_id_mut(&mut ctx, block);
+            blk.pop_insn(); // drop the `goto` so we can append before re-terminating
+            let mut b = Builder::from_block(blk);
+            let hi = b.get_range(zero.into(), 1..4).unwrap().id();
+            let tgt = b.context_mut().get_or_make_block(0x1001);
+            b.push_branch(tgt);
+            hi
+        };
+
+        let r = value_range(&ctx, hi, block);
+        assert_eq!((r.min, r.max), (0, 0));
+    }
+
+    /// The `xor reg,reg; setnz cl` switch-index idiom end to end: the dispatch
+    /// index is `zext(bool) | (extract_high_bytes(0) << 8)`, which must bound to
+    /// {0, 1} so the jump-table pass can size the table. Mirrors the real
+    /// lifting where `xor ecx,ecx` zeroes the upper bytes and `setnz cl` sets
+    /// the boolean low byte.
+    #[test]
+    fn setnz_register_reconstruction_bounds_index() {
+        use qcode::builder::Builder;
+        use qcode::value::BasicBlock;
+
+        let mut ctx = Context::new();
+        qcode!(
+            ctx,
+            "
+            varnode i64 A;
+            varnode i64 B;
+            <block>
+                %a = load(i64, &A);
+                %b = load(i64, &B);
+                %bool = %a < %b;
+                %lo = zext(i32, %bool);
+                %wide = %a & 0x0;
+                goto <0x1001>;
+            "
+        );
+
+        let idx = {
+            let mut blk = BasicBlock::from_id_mut(&mut ctx, block);
+            blk.pop_insn(); // drop the `goto` so we can append before re-terminating
+            let mut b = Builder::from_block(blk);
+            // hi3 = wide[1:4] (== 0); hi = zext(hi3); hishift = hi << 8.
+            let hi3 = b.get_range(wide.into(), 1..4).unwrap().id();
+            let hi = b.push_zext(hi3, 4).id();
+            let shift = b.context_mut().get_const(8, 4).id();
+            let hishift = b.push_shl(hi, shift).id();
+            let idx = b.push_bit_or(lo.into(), hishift).id();
+            let tgt = b.context_mut().get_or_make_block(0x1001);
+            b.push_branch(tgt);
+            idx
+        };
+
+        let r = value_range(&ctx, idx, block);
+        assert_eq!((r.min, r.max), (0, 1));
     }
 
     /// `x & c` is bounded by `c` with no guard at all.
