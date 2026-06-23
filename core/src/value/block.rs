@@ -635,7 +635,13 @@ impl<'str, 'ctx> BlockMutRef<'str, 'ctx> {
         self.ctx.set_address(addr, self.id.into())?;
 
         if self.name().is_none() {
-            self.rename(Cow::Owned(format!("{addr:x}")))?;
+            // Block labels share the global name map with register varnodes, whose
+            // names are short mnemonics (`cf`, `sf`, `ax`, …). A block landing at a
+            // low address whose hex spells such a name (0xcf → "cf") would otherwise
+            // collide and panic through `with_address`. Disambiguate with a numeric
+            // suffix, keeping the bare-hex label for the overwhelmingly common case.
+            let label = self.ctx.get_unique_name(Cow::Owned(format!("{addr:x}")));
+            self.rename(label)?;
         }
 
         Ok(())
