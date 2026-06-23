@@ -65,7 +65,7 @@ pub(super) enum NormalForm {
 
 /// Per-walk value-numbering state, cloned down the dominator tree.
 #[derive(Clone, Default)]
-pub(super) struct Numbering {
+pub(crate) struct Numbering {
     /// Canonical key → the dominating value that computes it (the leader).
     leaders: HashMap<NormalForm, ValueId>,
     /// Value → its arithmetic view (always `Affine` or `Mask`), used to compose
@@ -605,7 +605,7 @@ impl Numbering {
     ///
     /// This is the affine base-identity used by memory forwarding: `(p + 4) - 4`
     /// and `p` decompose to the same `base = p`, so they unify for free.
-    pub(super) fn base_offset(&self, ptr: ValueId) -> Option<(ValueId, i64)> {
+    pub(crate) fn base_offset(&self, ptr: ValueId) -> Option<(ValueId, i64)> {
         match self.forms.get(&ptr)? {
             NormalForm::Affine {
                 width,
@@ -625,7 +625,7 @@ impl Numbering {
 /// read-only with sub-passes that need a pointer's base identity before the
 /// dominator walk reaches the pointer's definition (see memory forwarding). Only
 /// `forms` is populated; `leaders` stay empty (they are dominance-sensitive).
-pub(super) fn precompute_forms(ctx: &Context, func_id: FunctionId) -> Numbering {
+pub(crate) fn precompute_forms(ctx: &Context, func_id: FunctionId) -> Numbering {
     let mut numbering = Numbering::default();
     let ids: Vec<ValueId> = Function::from_id(ctx, func_id)
         .iter()
@@ -641,6 +641,68 @@ pub(super) fn precompute_forms(ctx: &Context, func_id: FunctionId) -> Numbering 
         ensure_form(ctx, id, &mut numbering);
     }
     numbering
+}
+
+#[cfg(test)]
+mod spike {
+    //! Throwaway probe for the brighten/lower removal: does the affine numbering
+    //! give `@SP - const` stable slot identity without the `@stack_base` literal?
+    use super::*;
+    use qcode::{
+        builder::Builder,
+        testing::TestContext,
+        value::{BasicBlock, Function},
+    };
+
+    #[test]
+    fn sp_relative_identity_holds_but_alignment_reroots() {
+        let mut tc = TestContext::new();
+        let fun = Function::make(&mut tc.ctx, "f".into()).unwrap().id;
+        let entry = tc.ctx.get_or_make_block(0x1000);
+        {
+            let mut f = Function::from_id_mut(&mut tc.ctx, fun);
+            f.set_root(entry).unwrap();
+            f.add_block(entry);
+        }
+        // `@SP`: the incoming stack-pointer entry parameter.
+        let sp = ValueId::BlockParam(BasicBlock::from_id_mut(&mut tc.ctx, entry).push_param(8).id);
+
+        let (s1, s2, threaded, aligned, al) = {
+            let mut b = Builder::from_block(BasicBlock::from_id_mut(&mut tc.ctx, entry));
+            let c8 = b.context_mut().get_const(8, 8).id();
+            let c20 = b.context_mut().get_const(0x20, 8).id();
+            let neg16 = b.context_mut().get_const((-16i64) as u64, 8).id();
+            // Two independent occurrences of `@SP - 8` (distinct ValueIds).
+            let s1 = b.push_sub(sp, c8).id();
+            let s2 = b.push_sub(sp, c8).id();
+            // `[rsp+8]` after `sub rsp, 0x20`: (@SP - 0x20) + 8.
+            let sub_rsp = b.push_sub(sp, c20).id();
+            let threaded = b.push_add(sub_rsp, c8).id();
+            // `[rsp+8]` after `and rsp, -16`: (@SP & -16) + 8.
+            let aligned = b.push_bit_and(sp, neg16).id();
+            let al = b.push_add(aligned, c8).id();
+            unsafe { b.dont_finalize() };
+            (s1, s2, threaded, aligned, al)
+        };
+
+        let nb = precompute_forms(&tc.ctx, fun);
+
+        // VERDICT 1 — plain slots get stable `(@SP, offset)` identity, the same for
+        // every independent occurrence, with no `@stack_base` literal and no
+        // dominance information. This is the make-or-break for the migration.
+        assert_eq!(nb.base_offset(s1), Some((sp, -8)));
+        assert_eq!(nb.base_offset(s2), Some((sp, -8)));
+
+        // VERDICT 2 — SP moves thread through affine composition for free: a slot
+        // reached after `sub rsp, 0x20` still roots at `@SP`, at the summed offset.
+        assert_eq!(nb.base_offset(threaded), Some((sp, -0x18)));
+
+        // VERDICT 3 — the regression: `and rsp, -16` is a *mask*, not affine, so the
+        // slot re-roots at the aligned base (`@SP & -16`) instead of `@SP`. Identity
+        // among post-alignment slots survives; the link back to `@SP` is lost.
+        assert_eq!(nb.base_offset(aligned), None);
+        assert_eq!(nb.base_offset(al), Some((aligned, 8)));
+    }
 }
 
 /// Memoize the affine form of `v`, recursing into operands first so that nested

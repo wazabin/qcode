@@ -13,7 +13,7 @@ use qcode::{
     value::{block::BlockMutRef, function::FunctionId, util::base_ref::WithCtxMut},
 };
 
-mod affine;
+pub(crate) mod affine;
 mod cse;
 mod flag_idiom;
 mod fold;
