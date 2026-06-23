@@ -25,7 +25,8 @@
 //! (harvest less), never unsound. It can be tightened later without changing the
 //! interface.
 
-use std::collections::{BTreeSet, HashMap, HashSet};
+use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
+use std::collections::BTreeSet;
 
 use qcode::{
     context::Context,
@@ -79,7 +80,7 @@ pub fn project_return(ctx: &Context, fid: FunctionId, field: usize) -> Option<Pr
 
     // Map every instruction to its block once, and collect the block list, for
     // control-dependence reachability below.
-    let mut insn_block: HashMap<InstructionId, BlockId> = HashMap::new();
+    let mut insn_block: HashMap<InstructionId, BlockId> = HashMap::default();
     let mut blocks: Vec<BlockId> = Vec::new();
     for block in Function::from_id(ctx, fid).iter() {
         let bid = block.id;
@@ -106,13 +107,13 @@ pub fn project_return(ctx: &Context, fid: FunctionId, field: usize) -> Option<Pr
     }
 
     let mut proj = Projection::default();
-    let mut visited: HashSet<ValueId> = HashSet::new();
+    let mut visited: HashSet<ValueId> = HashSet::default();
     let mut worklist: Vec<ValueId> = seeds;
 
     // Blocks of values already in the slice — drives control-dependence seeding.
-    let mut sliced_blocks: HashSet<BlockId> = HashSet::new();
+    let mut sliced_blocks: HashSet<BlockId> = HashSet::default();
     // cbranch condition values already fed into the worklist, to avoid repeats.
-    let mut seeded_conditions: HashSet<ValueId> = HashSet::new();
+    let mut seeded_conditions: HashSet<ValueId> = HashSet::default();
 
     loop {
         // Drain the data/value worklist to a fixpoint.
@@ -259,7 +260,7 @@ fn predecessor_args(ctx: &Context, bid: BlockId, param_index: usize) -> Vec<Opti
 /// Whether any block in `targets` is reachable from `from` via CFG successor
 /// edges (excluding `from` itself, which is the cbranch's own block).
 fn reaches_any(ctx: &Context, from: BlockId, targets: &HashSet<BlockId>) -> bool {
-    let mut seen = HashSet::from([from]);
+    let mut seen = HashSet::from_iter([from]);
     let mut stack = vec![from];
     while let Some(b) = stack.pop() {
         for (_, succ) in BasicBlock::from_id(ctx, b).successors() {
@@ -351,8 +352,8 @@ mod tests {
         );
 
         // Gate: field 1 is harvestable when `b` (index 1) is a literal arg.
-        assert!(f1.is_constant_over(&HashSet::from([1])));
-        assert!(!f1.is_constant_over(&HashSet::from([0])));
+        assert!(f1.is_constant_over(&HashSet::from_iter([1])));
+        assert!(!f1.is_constant_over(&HashSet::from_iter([0])));
     }
 
     /// A merge value selected by a `cbranch` on `a` must pick up `a` through the
@@ -441,6 +442,6 @@ mod tests {
 
         let f0 = project_return(&tc.ctx, fid, 0).expect("field 0");
         assert!(f0.opaque, "a varnode read cannot be proven constant");
-        assert!(!f0.is_constant_over(&HashSet::from([0, 1])));
+        assert!(!f0.is_constant_over(&HashSet::from_iter([0, 1])));
     }
 }

@@ -1132,7 +1132,7 @@ mod tests {
         // live-out use must be rewritten to the incoming value, never left dangling
         // on the removed exit param.
         let _ = run_function_pass::<crate::cfg::SimplifyCfg>(&mut ctx, test);
-        let defined: std::collections::HashSet<ValueId> = Function::from_id(&ctx, test)
+        let defined: rustc_hash::FxHashSet<ValueId> = Function::from_id(&ctx, test)
             .iter()
             .flat_map(|b| {
                 b.params()
@@ -1145,7 +1145,10 @@ mod tests {
             .iter()
             .flat_map(|b| b.instruction_ids().to_vec())
         {
-            for operand in qcode::value::Instruction::from_id(&ctx, insn).mnemonic().args() {
+            for operand in qcode::value::Instruction::from_id(&ctx, insn)
+                .mnemonic()
+                .args()
+            {
                 if matches!(operand, ValueId::Instruction(_) | ValueId::BlockParam(_)) {
                     assert!(
                         defined.contains(&operand),
@@ -1159,7 +1162,7 @@ mod tests {
     /// Asserts no instruction in `fid` references a value (instruction or block
     /// param) that is not defined anywhere in the function — i.e. no dangling use.
     fn assert_no_dangling(ctx: &Context, fid: FunctionId) {
-        let defined: std::collections::HashSet<ValueId> = Function::from_id(ctx, fid)
+        let defined: rustc_hash::FxHashSet<ValueId> = Function::from_id(ctx, fid)
             .iter()
             .flat_map(|b| {
                 b.params()
@@ -1172,7 +1175,10 @@ mod tests {
             .iter()
             .flat_map(|b| b.instruction_ids().to_vec())
         {
-            for operand in qcode::value::Instruction::from_id(ctx, insn).mnemonic().args() {
+            for operand in qcode::value::Instruction::from_id(ctx, insn)
+                .mnemonic()
+                .args()
+            {
                 if matches!(operand, ValueId::Instruction(_) | ValueId::BlockParam(_)) {
                     assert!(
                         defined.contains(&operand),

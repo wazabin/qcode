@@ -48,7 +48,7 @@
 //! code we never disassembled would keep the old shape, the same accepted,
 //! unguarded gap as `argpromote` / `dead_signature`.
 
-use std::collections::HashMap;
+use rustc_hash::FxHashMap as HashMap;
 
 use qcode::{
     context::Context,
@@ -245,7 +245,7 @@ fn try_partial_inline(ctx: &mut Context, fid: FunctionId) -> bool {
         if per_return.iter().any(|f| f[i] != value) {
             continue;
         }
-        let mut visited = HashMap::new();
+        let mut visited = HashMap::default();
         let mut order = Vec::new();
         if collect_expr(ctx, value, &inputs, &mut visited, &mut order) {
             inlinable.push(Inlinable {
@@ -319,7 +319,7 @@ fn clone_expr(
         op
     };
 
-    let mut map: HashMap<InstructionId, ValueId> = HashMap::new();
+    let mut map: HashMap<InstructionId, ValueId> = HashMap::default();
     for &iid in order {
         let mut m = ctx.get_insn(iid).mnemonic().clone();
         for op in ctx.get_insn(iid).mnemonic().args() {

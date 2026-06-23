@@ -319,12 +319,16 @@ mod tests {
     ) -> (BlockId, BlockId) {
         let callee = Function::make(ctx, "callee".into()).unwrap().id;
         let callee_block = ctx.get_or_make_block(0x4000);
-        Function::from_id_mut(ctx, callee).set_root(callee_block).unwrap();
+        Function::from_id_mut(ctx, callee)
+            .set_root(callee_block)
+            .unwrap();
         Function::from_id_mut(ctx, callee).set_is_pure(pure);
 
         let caller = Function::make(ctx, "caller".into()).unwrap().id;
         let call_block = ctx.get_or_make_block(0x1000);
-        Function::from_id_mut(ctx, caller).set_root(call_block).unwrap();
+        Function::from_id_mut(ctx, caller)
+            .set_root(call_block)
+            .unwrap();
 
         let call_id = {
             let mut b = Builder::from_context(ctx, 0x1000);
@@ -369,7 +373,11 @@ mod tests {
         }
         // The continuation is still reachable via exactly its one predecessor.
         let preds: Vec<_> = BasicBlock::from_id(&ctx, cont).predecessors().collect();
-        assert_eq!(preds.len(), 1, "continuation must keep its single predecessor");
+        assert_eq!(
+            preds.len(),
+            1,
+            "continuation must keep its single predecessor"
+        );
         assert_eq!(preds[0].1, call_block);
     }
 

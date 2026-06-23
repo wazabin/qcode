@@ -30,7 +30,7 @@
 //! As with `argpromote`, a caller in code we never disassembled would still bind
 //! to the old shape; that gap is accepted and unguarded.
 
-use std::collections::HashSet;
+use rustc_hash::FxHashSet as HashSet;
 
 use qcode::{
     context::Context,
@@ -68,7 +68,7 @@ pub fn dead_signature(ctx: &mut Context) -> bool {
             continue;
         }
 
-        let mut touched: HashSet<FunctionId> = HashSet::new();
+        let mut touched: HashSet<FunctionId> = HashSet::default();
         let arg_changed = trim_dead_args(ctx, fid, &mut touched);
         let ret_changed = trim_dead_return_fields(ctx, fid, &mut touched);
 

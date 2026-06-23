@@ -359,7 +359,7 @@ mod tests {
 
         simplify_cfg(&mut ctx, f);
 
-        let mut seen = std::collections::HashSet::new();
+        let mut seen = rustc_hash::FxHashSet::default();
         for block in ctx.values.basic_blocks.iter() {
             for &insn in &block.instructions {
                 assert!(

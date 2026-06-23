@@ -37,62 +37,49 @@ pub fn lift_new_addresses(
         return Ok(LiftSummary::default());
     };
 
+    let pending = clean_ctx.drain_discoveries();
+    if pending.is_empty() {
+        return Ok(LiftSummary::default());
+    }
+
+    // Pre-register every pending function entry before lifting any block, so a
+    // direct branch into one of these entries is recognized as a tail call (left
+    // out of the branching function) regardless of the order discoveries drain in.
+    for discovery in &pending {
+        if matches!(discovery.kind, DiscoveryKind::Function { .. }) {
+            lifter.ensure_discovered_function(clean_ctx, discovery);
+        }
+    }
+
     let mut summary = LiftSummary::default();
-
-    // Drain the discovery queue to a fixpoint within this one call. `lift_block`
-    // lifts a single instruction-block per discovery and re-queues the addresses it
-    // reaches, so the recursive-disassembly BFS advances only one block-level per
-    // drain. Looping here completes the whole currently-reachable BFS at once;
-    // relying on the stage's `repeat_until` instead capped it at `MAX_FIXPOINT_ITERS`
-    // (100) block-levels — truncating any straight-line run longer than that and
-    // pushing the remainder into extra discovery rounds, each of which re-pays the
-    // full optimization pipeline. Lifting is monotonic (each block lifts at most
-    // once; `lift_block` no-ops already-lifted blocks) and terminating, so the queue
-    // empties.
-    loop {
-        let pending = clean_ctx.drain_discoveries();
-        if pending.is_empty() {
-            break;
-        }
-
-        // Pre-register every pending function entry before lifting any block, so a
-        // direct branch into one of these entries is recognized as a tail call (left
-        // out of the branching function) regardless of the order discoveries drain in.
-        for discovery in &pending {
-            if matches!(discovery.kind, DiscoveryKind::Function { .. }) {
-                lifter.ensure_discovered_function(clean_ctx, discovery);
+    for discovery in pending {
+        let outcome = lifter.lift_discovered(clean_ctx, discovery)?;
+        match outcome {
+            LiftOutcome::Lifted { key, successors } => {
+                clean_ctx.mark_discovery_lifted(key);
+                summary.lifted += 1;
+                for successor in successors {
+                    if clean_ctx.discover(successor) {
+                        summary.enqueued += 1;
+                    }
+                }
             }
-        }
-
-        for discovery in pending {
-            let outcome = lifter.lift_discovered(clean_ctx, discovery)?;
-            match outcome {
-                LiftOutcome::Lifted { key, successors } => {
-                    clean_ctx.mark_discovery_lifted(key);
-                    summary.lifted += 1;
-                    for successor in successors {
-                        if clean_ctx.discover(successor) {
-                            summary.enqueued += 1;
-                        }
+            LiftOutcome::AlreadyLifted { key, successors } => {
+                clean_ctx.mark_discovery_lifted(key);
+                summary.already_lifted += 1;
+                for successor in successors {
+                    if clean_ctx.discover(successor) {
+                        summary.enqueued += 1;
                     }
                 }
-                LiftOutcome::AlreadyLifted { key, successors } => {
-                    clean_ctx.mark_discovery_lifted(key);
-                    summary.already_lifted += 1;
-                    for successor in successors {
-                        if clean_ctx.discover(successor) {
-                            summary.enqueued += 1;
-                        }
-                    }
-                }
-                LiftOutcome::Failed { key, reason } => {
-                    clean_ctx.mark_discovery_failed(key, reason);
-                    summary.failed += 1;
-                }
-                LiftOutcome::Skipped { key, reason } => {
-                    clean_ctx.mark_discovery_skipped(key, reason);
-                    summary.skipped += 1;
-                }
+            }
+            LiftOutcome::Failed { key, reason } => {
+                clean_ctx.mark_discovery_failed(key, reason);
+                summary.failed += 1;
+            }
+            LiftOutcome::Skipped { key, reason } => {
+                clean_ctx.mark_discovery_skipped(key, reason);
+                summary.skipped += 1;
             }
         }
     }

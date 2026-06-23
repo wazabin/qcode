@@ -14,7 +14,7 @@
 //! Symbolic arguments are bound to a poison value (`0`) for emulation; the
 //! projection guarantees the harvested field is independent of that choice.
 
-use std::collections::HashSet;
+use rustc_hash::FxHashSet as HashSet;
 
 use qcode::{
     context::Context,
@@ -187,7 +187,11 @@ mod tests {
     /// Build caller `g` that calls `foo(a_in, b_const)` and stores both extracted
     /// fields. Returns `(g, g_cont)`. `b_const` is `None` to pass a symbolic value
     /// for the second argument too.
-    fn build_caller(tc: &mut TestContext, foo: FunctionId, b_const: Option<u64>) -> (FunctionId, qcode::value::block::BlockId) {
+    fn build_caller(
+        tc: &mut TestContext,
+        foo: FunctionId,
+        b_const: Option<u64>,
+    ) -> (FunctionId, qcode::value::block::BlockId) {
         let agg_ty = {
             let i64_ty = tc.ctx.types.get_or_make_int(8);
             tc.ctx.types.get_or_make_aggregate(vec![i64_ty, i64_ty])
@@ -247,7 +251,11 @@ mod tests {
     }
 
     /// The literal stored into varnode `reg` in `block`, if its source is a const.
-    fn stored_const(tc: &TestContext, block: qcode::value::block::BlockId, reg: ValueId) -> Option<u64> {
+    fn stored_const(
+        tc: &TestContext,
+        block: qcode::value::block::BlockId,
+        reg: ValueId,
+    ) -> Option<u64> {
         BasicBlock::from_id(&tc.ctx, block).iter().find_map(|i| {
             let Mnemonic::Store(Store { ptr, src, .. }) = i.mnemonic() else {
                 return None;

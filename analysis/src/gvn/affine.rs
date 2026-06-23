@@ -26,7 +26,7 @@
 //! types. Reconstruction is deterministic (terms ordered by `value_id_key`) so it
 //! is idempotent: a value already in canonical form is detected and left in place.
 
-use std::collections::HashMap;
+use rustc_hash::FxHashMap as HashMap;
 
 use qcode::{
     context::Context,
@@ -615,7 +615,9 @@ impl Numbering {
                 width,
                 constant,
                 terms,
-            } if terms.len() == 1 && terms[0].1 == 1 => Some((terms[0].0, signed(*constant, *width))),
+            } if terms.len() == 1 && terms[0].1 == 1 => {
+                Some((terms[0].0, signed(*constant, *width)))
+            }
             _ => None,
         }
     }

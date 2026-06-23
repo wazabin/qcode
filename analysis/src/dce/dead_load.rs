@@ -125,7 +125,10 @@ fn addr_key(ctx: &Context, ptr: ValueId) -> (AddrBase, i64) {
     }
     let (base, off) = base_plus_offset(ctx, ptr);
     match base {
-        ValueId::Literal(lid) => (AddrBase::Absolute, ctx.values.literals[lid].value as i64 + off),
+        ValueId::Literal(lid) => (
+            AddrBase::Absolute,
+            ctx.values.literals[lid].value as i64 + off,
+        ),
         other => (AddrBase::Sym(other), off),
     }
 }

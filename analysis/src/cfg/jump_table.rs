@@ -151,7 +151,7 @@ impl FunctionPass for HandleJumpTables {
         // A table with more than two cases stays an indirect `switch`: we keep
         // the `BranchInd` but connect a real edge to every case body. Clear the
         // block's existing edges first so a re-resolution does not double them.
-        let mut cleared: std::collections::HashSet<BlockId> = std::collections::HashSet::default();
+        let mut cleared: rustc_hash::FxHashSet<BlockId> = rustc_hash::FxHashSet::default();
         for Edit { from, target, .. } in edits {
             if cleared.insert(from) {
                 clear_successors(ctx, from);

@@ -20,6 +20,9 @@ toml.workspace = true
 cpp_demangle.workspace = true
 inventory.workspace = true
 log.workspace = true
+# Fast non-cryptographic hasher for internal int-keyed maps (ValueId/BlockId/...).
+# Profiling showed ~⅓ of analysis CPU was SipHash; FxHashMap also makes map
+# iteration order deterministic (std RandomState reseeds per process).
 rustc-hash.workspace = true
 pollster.workspace = true
 # Pure-function emulation in constant propagation runs the callee body.
