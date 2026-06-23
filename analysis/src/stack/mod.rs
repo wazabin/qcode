@@ -2,6 +2,7 @@
 //! back onto the real stack pointer.
 
 pub(crate) mod brighten;
+pub(crate) mod canonicalize;
 pub(crate) mod frame;
 mod lower_stack;
 

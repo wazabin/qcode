@@ -1,0 +1,157 @@
+//! Canonicalize fixed `@SP ± N` stack addresses to one root-dominating
+//! representative per offset.
+//!
+//! This is the `@SP`-rooted successor to the brighten/lower round-trip. brighten
+//! used to relabel `@SP` uses to an interned `@stack_base` *literal* purely so
+//! that `@stack_base − N` const-folded to a single literal — giving every
+//! reference to a slot one stable `ValueId`. We keep `@SP` instead, but a slot's
+//! address is now an instruction (`Sub(@SP, N)`), and two occurrences in
+//! different blocks are distinct `ValueId`s. Downstream passes (notably mem2reg)
+//! key stack slots by that `ValueId`, so they need exactly one per slot.
+//!
+//! [`canonicalize_sp_slots`] restores that invariant the way `lower_stack`
+//! already materialized `incoming ± N` at the root: it builds one `@SP ± N`
+//! instruction per distinct offset at the entry block (which dominates the whole
+//! function) and points every load/store at that representative. It only touches
+//! the affine `@SP ± N` form; `@stack_base` literals are left to the legacy path,
+//! so this is inert until brighten is removed.
+
+use std::collections::{BTreeSet, HashMap};
+
+use qcode::{
+    builder::Builder,
+    context::Context,
+    value::{BasicBlock, Function, FunctionId, ValueId, Varnode, VarnodeId, insn::Mnemonic},
+};
+
+use super::frame::incoming_sp_param;
+use crate::gvn::affine::precompute_forms;
+
+/// Rewrite every fixed `@SP ± N` load/store address in `fid` to a single
+/// root-block representative per offset `N`. Returns whether anything changed.
+pub fn canonicalize_sp_slots(ctx: &mut Context, fid: FunctionId, sp_reg: VarnodeId) -> bool {
+    let numbering = precompute_forms(&*ctx, fid);
+    let Some(sp_param) = incoming_sp_param(&*ctx, fid, sp_reg) else {
+        return false;
+    };
+    let Some(root) = Function::from_id(&*ctx, fid).root().map(|b| b.id) else {
+        return false;
+    };
+
+    // Each distinct load/store pointer that is `@SP ± N` with a fixed offset.
+    let mut ptr_offset: HashMap<ValueId, i64> = HashMap::new();
+    for block in Function::from_id(&*ctx, fid).blocks() {
+        for insn in block.iter() {
+            let ptr = match insn.mnemonic() {
+                Mnemonic::Load(load) => load.ptr,
+                Mnemonic::Store(store) => store.ptr,
+                _ => continue,
+            };
+            if let Some((base, off)) = numbering.base_offset(ptr)
+                && base == sp_param
+            {
+                ptr_offset.insert(ptr, off);
+            }
+        }
+    }
+    if ptr_offset.is_empty() {
+        return false;
+    }
+
+    let ptr_width = Varnode::from_id(&*ctx, sp_reg).size();
+    let offsets: BTreeSet<i64> = ptr_offset.values().copied().collect();
+
+    // One representative per offset, materialized at the entry block (which
+    // dominates every use). Offset 0 is `@SP` itself.
+    let mut repr: HashMap<i64, ValueId> = HashMap::new();
+    {
+        let mut b = Builder::from_block(BasicBlock::from_id_mut(ctx, root));
+        b.set_insert_point_to_start();
+        for &off in &offsets {
+            let rep = if off == 0 {
+                sp_param
+            } else {
+                let mag = b.context_mut().get_const(off.unsigned_abs(), ptr_width).id();
+                if off > 0 {
+                    b.push_add(sp_param, mag).id()
+                } else {
+                    b.push_sub(sp_param, mag).id()
+                }
+            };
+            repr.insert(off, rep);
+        }
+        unsafe { b.dont_finalize() };
+    }
+
+    // Point every occurrence at its representative; the now-dead per-site
+    // address instructions are reclaimed by DCE.
+    for (ptr, off) in ptr_offset {
+        let rep = repr[&off];
+        if ptr != rep {
+            ctx.replace_all_uses_with(ptr, rep);
+        }
+    }
+    true
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use qcode::{
+        testing::TestContext,
+        value::{BasicBlock, Value},
+    };
+
+    /// Two `load(@SP - 8)` in different blocks become one shared pointer after
+    /// canonicalization — the single-`ValueId`-per-slot invariant mem2reg needs.
+    #[test]
+    fn unifies_same_slot_across_blocks() {
+        let mut tc = TestContext::new();
+        let sp_reg = tc.r0;
+        let ram = tc.ctx.default_space;
+        let fid = Function::make(&mut tc.ctx, "f".into()).unwrap().id;
+        let root = tc.ctx.get_or_make_block(0x1000);
+        let other = tc.ctx.get_or_make_block(0x2000);
+        {
+            let mut f = Function::from_id_mut(&mut tc.ctx, fid);
+            f.set_root(root).unwrap();
+            f.add_block(root);
+            f.add_block(other);
+        }
+        let pid = BasicBlock::from_id_mut(&mut tc.ctx, root).push_param(8).id;
+        tc.ctx.values.block_params[pid].origin = Some(ValueId::Varnode(sp_reg));
+        let sp = ValueId::BlockParam(pid);
+
+        // `load(@SP - 8)` in each block — distinct Sub ValueIds.
+        let load_in = |block, tc: &mut TestContext| {
+            let mut b = qcode::builder::Builder::from_block(BasicBlock::from_id_mut(&mut tc.ctx, block));
+            let c8 = b.context_mut().get_const(8, 8).id();
+            let addr = b.push_sub(sp, c8).id();
+            let load = b.push_load::<false>(addr, 8, ram);
+            let id = load.id();
+            unsafe { b.dont_finalize() };
+            id
+        };
+        let l0 = load_in(root, &mut tc);
+        let l1 = load_in(other, &mut tc);
+
+        let ptr_of = |tc: &TestContext, load: ValueId| {
+            let ValueId::Instruction(id) = load else {
+                unreachable!()
+            };
+            match tc.ctx.get_insn(id).mnemonic() {
+                Mnemonic::Load(l) => l.ptr,
+                _ => unreachable!(),
+            }
+        };
+        assert_ne!(ptr_of(&tc, l0), ptr_of(&tc, l1), "distinct before canonicalization");
+
+        assert!(canonicalize_sp_slots(&mut tc.ctx, fid, sp_reg));
+
+        assert_eq!(
+            ptr_of(&tc, l0),
+            ptr_of(&tc, l1),
+            "both loads share one representative pointer for slot -8"
+        );
+    }
+}
