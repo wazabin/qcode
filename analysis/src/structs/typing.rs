@@ -17,11 +17,14 @@
 //! whose width disagrees with the field size, is left untyped (a plain
 //! `base + const` / integer read). Non-constant offsets are never lowered.
 
+use std::borrow::Cow;
+
 use qcode::{
     context::Context,
     space::{Space, SpaceId, SpaceType},
+    types::TypeId,
     value::{
-        Function, FunctionId, Instruction, ValueId,
+        BlockParam, Function, FunctionId, Instruction, Renameable, ValueId,
         insn::{Binary, Binop, Gep, InstructionId, IntBinop, Mnemonic},
     },
 };
@@ -62,8 +65,73 @@ impl FunctionPass for StructTyping {
                 break;
             }
         }
+
+        // Once the types have settled, rename every struct-typed SSA value and
+        // argument after the struct it (points to): a value of type `PEB*`
+        // becomes `%peb`. This runs over the whole function so it also picks up
+        // arguments typed by an upstream seed.
+        changed_any |= rename_struct_values(ctx, fun_id);
+
         Ok(changed_any)
     }
+}
+
+/// Renames struct-typed SSA values and block parameters after the struct they
+/// reference (e.g. a `PEB*` value becomes `%peb`), keeping names unique within
+/// the function. Returns `true` if any value was renamed.
+fn rename_struct_values(ctx: &mut Context, fun_id: FunctionId) -> bool {
+    let fun = Function::from_id(ctx, fun_id);
+    let values: Vec<ValueId> = fun
+        .blocks()
+        .flat_map(|b| {
+            b.params()
+                .map(|p| p.id())
+                .chain(b.iter().map(|i| ValueId::Instruction(i.id)))
+                .collect::<Vec<_>>()
+        })
+        .collect();
+
+    let mut changed = false;
+    for value in values {
+        let Some(base) = ctx.stored_type_of(value).and_then(|t| struct_base_name(ctx, t)) else {
+            continue;
+        };
+        if let Some(name) = unique_name(ctx, value, &base) {
+            let renamed = match value {
+                ValueId::Instruction(id) => Instruction::from_id_mut(ctx, id).rename(name).is_ok(),
+                ValueId::BlockParam(id) => BlockParam::from_id_mut(ctx, id).rename(name).is_ok(),
+                _ => false,
+            };
+            changed |= renamed;
+        }
+    }
+    changed
+}
+
+/// The lowercased struct name a value of type `ty` should be named after: the
+/// pointee's name when `ty` is a struct pointer, or the struct's own name when
+/// `ty` is a struct value. `None` for non-struct types.
+fn struct_base_name(ctx: &Context, ty: TypeId) -> Option<String> {
+    let struct_ty = ctx.types.pointee_of(ty).unwrap_or(ty);
+    ctx.types.struct_name_of(struct_ty).map(str::to_lowercase)
+}
+
+/// Picks a unique name for `value` from `base`, `base1`, `base2`, … Returns
+/// `None` if `value` is already named with such a candidate (nothing to do).
+fn unique_name<'str>(ctx: &Context, value: ValueId, base: &str) -> Option<Cow<'str, str>> {
+    for n in 0.. {
+        let candidate = if n == 0 {
+            base.to_string()
+        } else {
+            format!("{base}{n}")
+        };
+        match ctx.get_named(&candidate) {
+            Some(owner) if owner == value => return None,
+            Some(_) => continue,
+            None => return Some(Cow::Owned(candidate)),
+        }
+    }
+    None
 }
 
 /// Attempts one typing step on instruction `id`. Returns `true` if it changed
@@ -237,6 +305,34 @@ mod tests {
             ctx.types.pointee_of(inner_ty).is_some(),
             "%inner should be a struct pointer"
         );
+    }
+
+    #[test]
+    fn renames_struct_typed_values_after_their_struct() {
+        let mut ctx = Context::new();
+        qcode!(
+            ctx,
+            "
+            type Inner { _: 8, val: 4 };
+            type Root { _: 0x10, inner: Inner* };
+            fn f:
+                <entry>
+                    varnode i64 base;
+                    Root* %x = load(i64, base);
+                    %slot = %x + 0x10;
+                    %y = load(i64, %slot);
+                    return [i32 0];
+            "
+        );
+
+        run_function_pass::<StructTyping>(&mut ctx, f).unwrap();
+
+        // The `Root*` value `%x` and the `Inner*` value `%y` are renamed after
+        // the structs they reference.
+        assert!(ctx.get_named("root").is_some());
+        assert!(ctx.get_named("inner").is_some());
+        assert!(ctx.get_named("x").is_none());
+        assert!(ctx.get_named("y").is_none());
     }
 
     #[test]
