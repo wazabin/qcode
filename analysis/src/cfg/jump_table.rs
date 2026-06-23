@@ -237,8 +237,6 @@ fn discover(ctx: &mut Context, fn_entry: Option<u64>, source_block: Option<u64>,
 /// If `block_id` ends in an indirect branch whose table the pass can resolve,
 /// push one [`Edit`] per case target onto `edits`.
 fn resolve_block(mut block: BlockMutRef) -> Option<Vec<Edit>> {
-    let ctx = block.ctx();
-
     // A block still terminated by `BranchInd` is re-resolved every round, even
     // once the lifter has connected its targets in the clean IR: those edges let
     // function-splitting follow the switch, but the terminator itself is only
@@ -250,6 +248,7 @@ fn resolve_block(mut block: BlockMutRef) -> Option<Vec<Edit>> {
     let Mnemonic::BranchInd(BranchInd { ptr }) = insn.mnemonic() else {
         return None;
     };
+    let ptr = *ptr;
 
     log::trace!(
         target: "jump_table",
@@ -257,7 +256,15 @@ fn resolve_block(mut block: BlockMutRef) -> Option<Vec<Edit>> {
         block.address().unwrap_or_default(),
     );
 
-    let table = recognize_table(ctx, *ptr)?;
+    // Indirect jump through a single fixed pointer slot: `goto [load(const)]`.
+    // Not a table (there is no index), but the slot is immutable data, so it
+    // resolves to one concrete target.
+    if let Some(edits) = resolve_constant_load(&mut block, ptr) {
+        return Some(edits);
+    }
+
+    let ctx = block.ctx();
+    let table = recognize_table(ctx, ptr)?;
 
     log::debug!(
         target: "jump_table",
@@ -320,6 +327,46 @@ fn resolve_block(mut block: BlockMutRef) -> Option<Vec<Edit>> {
     }
 
     Some(resolved)
+}
+
+/// A `goto [load(const_addr)]`: the branch pointer is loaded from one fixed
+/// data address (e.g. an indirect tail-jump through a relocated function
+/// pointer). Reading that immutable slot yields the single concrete target.
+///
+/// Returns a one-element edit list on success so the caller's single-target
+/// path rewrites the `BranchInd` into a direct `Branch`.
+fn resolve_constant_load(block: &mut BlockMutRef, ptr: ValueId) -> Option<Vec<Edit>> {
+    let ctx = block.ctx();
+    let load = as_load(ctx, ptr)?;
+    let addr = numeric_const(ctx, load.ptr)?;
+
+    if !block.ctx_mut().assume_true(Proposition::ImmutableMemory {
+        addr,
+        size: load.size as u8,
+    }) {
+        log::debug!(target: "jump_table", "skipping constant load: slot {addr:x} not immutable");
+        return None;
+    }
+
+    let ctx = block.ctx();
+    let Some(target) = ctx.read_uint(addr, load.size) else {
+        log::debug!(target: "jump_table", "skipping constant load: slot {addr:x} unmapped");
+        return None;
+    };
+
+    if !ctx.is_executable_addr(target) {
+        log::debug!(target: "jump_table", "skipping constant load: target {target:x} not executable");
+        return None;
+    }
+
+    log::debug!(target: "jump_table", "resolved indirect jump via {addr:x} to {target:x}");
+
+    Some(vec![Edit {
+        from: block.id,
+        target,
+        index: ptr,
+        value: 0,
+    }])
 }
 
 /// The shape of a recognized jump table.
@@ -561,6 +608,42 @@ mod tests {
             };
             assert_eq!(ctx.truth(prop).map(|t| t.value), Some(true));
         }
+    }
+
+    /// A plain indirect jump through a fixed pointer slot: `goto [load(const)]`.
+    /// The slot is immutable data holding the single target, so the indirect
+    /// branch collapses to a direct jump with exactly one successor.
+    #[test]
+    fn resolves_constant_pointer_load() {
+        let mut ctx = Context::new();
+
+        qcode!(
+            ctx,
+            "
+            varnode i64 A;
+            fn fun:
+            <entry>
+                %t = load(i64, 0x2000);
+                goto [%t];
+            "
+        );
+
+        add_code(&mut ctx, 0x1000, 0x1000);
+        add_rodata(&mut ctx, 0x2000, 0x1100u64.to_le_bytes().to_vec());
+
+        let changed = run_function_pass::<HandleJumpTables>(&mut ctx, fun).unwrap();
+        assert!(changed);
+
+        // The indirect branch is now a direct jump to the one resolved target.
+        assert_eq!(successor_count(&ctx, entry), 1);
+        assert!(ctx.get_at_addr(&0x1100).is_some(), "no block for target");
+
+        // The slot read recorded an immutable-memory assumption.
+        let prop = Proposition::ImmutableMemory {
+            addr: 0x2000,
+            size: 8,
+        };
+        assert_eq!(ctx.truth(prop).map(|t| t.value), Some(true));
     }
 
     /// A relative table: each 4-byte slot holds a signed offset added back to a
