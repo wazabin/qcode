@@ -67,9 +67,8 @@ pub fn append_entry_param(
 }
 
 /// Append one positional argument — built per call site by `build` — to every
-/// direct caller of `fid`, in place. The low-level lockstep primitive shared by
-/// [`append_entry_param`] (after it adds the param) and `argpromote_stack`'s
-/// backfill of mem2reg-promoted stack params. The value lands at the end of
+/// direct caller of `fid`, in place. The low-level lockstep primitive used by
+/// [`append_entry_param`] (after it adds the param). The value lands at the end of
 /// `Call.args`, so to keep `param[i] ↔ arg[i]` aligned the caller must invoke this
 /// in param order. `build` returning `None` skips that call site (e.g. one whose
 /// argument is already present, for idempotent re-runs). Returns `true` if it

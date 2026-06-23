@@ -1048,7 +1048,7 @@ mod tests {
             [[stage]]
             name = "x"
             scope = "function"
-            passes = ["bind_args"]
+            passes = ["summaries"]
             "#,
         );
         assert!(err.contains("whole-program pass"), "{err}");

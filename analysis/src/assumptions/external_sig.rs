@@ -5,10 +5,9 @@
 //! build-time [`cabi`] prototype database and assign argument/return registers
 //! using the System V calling convention supplied by [`CallingConvention`].
 //!
-//! Run before [`set_all_function_summaries`](crate::set_all_function_summaries)
-//! and [`bind_all_call_args`](crate::bind_all_call_args): once an external
-//! callee has a signature, the existing binding pass produces real arguments at
-//! its call sites.
+//! Run before [`set_all_function_summaries`](crate::set_all_function_summaries):
+//! once an external callee has a signature, the argument-producing passes can
+//! produce real arguments at its call sites.
 
 use cabi::{CFunctionProto, CType};
 use qcode::{

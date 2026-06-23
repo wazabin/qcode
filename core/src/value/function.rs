@@ -221,8 +221,7 @@ where
     /// (argpromote never populates it); their by-value root block params are the
     /// source of truth for the call interface, so prefer the params (e.g.
     /// [`input_arg_name`](Self::input_arg_name)). Retained only for the
-    /// conventional/external calling-convention path (`bind_call_args`,
-    /// `summaries`).
+    /// conventional/external calling-convention path (`summaries`).
     #[deprecated(
         note = "legacy ABI register list; None for pure_reg functions. Use the root block params \
                 as the call interface; this remains only for the conventional/external path."

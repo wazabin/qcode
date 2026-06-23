@@ -642,42 +642,17 @@ impl Mem2Reg<'_, '_> {
                 }
             }
 
-            // Incoming stack parameters: a caller-frame slot (offset >= 0 — the
-            // return-address slot at offset 0 and the caller's stack arguments
-            // above it) that is *loaded but never stored* is read before any
-            // definition — a function input passed on the stack (cdecl, or an
-            // x86-64 stack-overflow argument; offset 0 is the continuation the
-            // explicit `store(inst_next)` before a `call` writes). Promote it to a
-            // root block param, mirroring the load-only register-input path, so
-            // `compute_inputs` can recover it. The same single-size and no-overlap
-            // guards apply.
-            //
-            // This runs for `pure_reg` functions too: mem2reg owns stack-slot
-            // detection (offset, size, conflict, and a stable `origin` identity on
-            // the param), so it is the single source of truth for *which* stack
-            // inputs exist. The transient lockstep gap it opens — a promoted stack
-            // param with no matching `Call.args` entry yet — is closed immediately
-            // after by `argpromote_stack`, which reads these params' `origin`
-            // offsets and backfills the caller argument. (Consuming mem2reg's output
-            // rather than re-deriving it from raw loads; see `calls::argpromote_stack`.)
-            for &var in stack_loaded.difference(&stack_stored) {
-                let Some((offset, _ptr_width)) = stack_slot_offset(self.ctx, var) else {
-                    continue;
-                };
-                if offset < 0 {
-                    continue;
-                }
-                if let Some(size) = promotable_stack_slot_size(
-                    self.ctx,
-                    var,
-                    &stack_size,
-                    &stack_size_conflict,
-                    &stack_intervals,
-                ) {
-                    vars.insert(var);
-                    sizes.insert(var, size);
-                }
-            }
+            // Incoming stack arguments — a caller-frame slot (offset >= 0) that is
+            // *loaded but never stored* — are deliberately NOT promoted to root
+            // params here. Minting a stack-input param forces a separate
+            // interprocedural backfill (the former `argpromote_stack`) to reconnect
+            // the caller side, and threading the stack pointer through that channel
+            // was a recurring source of frame-epilogue correctness bugs. Instead we
+            // leave these slots as plain `load(@stack_base + offset)` memory reads
+            // and let the post-lowering memory channel (`calls::argpromote`)
+            // functionalize them as ordinary by-value pointer arguments, the same
+            // way it handles any other caller-frame dereference. Local frame slots
+            // (offset < 0) are still promoted by the stored+loaded path above.
         }
 
         // Drop any location fed by a narrower-than-access store: forwarding its value

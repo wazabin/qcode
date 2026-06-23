@@ -85,27 +85,16 @@ passes = ["brighten"]
 
 # Promote to a fixpoint: each round may expose a register as the symbolic stack
 # base, then const-fold rewrites its arithmetic into stack-slot literals that
-# become promotable on the next round. mem2reg also promotes each load-only
-# caller-frame stack slot into a root param (recording the slot literal as the
-# param's `origin`), the source of truth for which stack inputs a function has.
+# become promotable on the next round. mem2reg promotes local frame slots
+# (offset < 0) to SSA values; incoming caller-frame stack arguments (offset >= 0)
+# are left as `load(@stack_base + offset)` memory reads for the post-lowering
+# `argpromote` memory channel to functionalize, rather than being minted as
+# stack-input params here.
 [[stage]]
 name = "promote"
 scope = "function"
 passes = ["mem2reg", "const_fold"]
 repeat_until = "no_change"
-
-# Functionalize the stack-input channel of pure-reg functions (legacy
-# `bind_call_args` stays bypassed for them). Runs *after* `promote`: it consumes
-# the stack-input params mem2reg already promoted, reading each one's `origin`
-# offset and backfilling the matching positional caller argument
-# (`load(rsp_arg + (offset - ptr_width))`) at every direct call site. It does not
-# re-detect slots or mint params — mem2reg owns that — so there is no race or
-# duplicated logic. Module-scoped because it rewrites call sites across functions;
-# the caller-side loads it inserts are forwarded by the following `gvn`.
-[[stage]]
-name = "argpromote-stack"
-scope = "module"
-passes = ["argpromote_stack"]
 
 [[stage]]
 name = "gvn"
@@ -151,16 +140,21 @@ passes = ["gvn", "dce"]
 repeat_until = "no_change"
 only_dirty = true
 
-# Interprocedural binding milestones, whole-program, after every function is
-# post-mem2reg/gvn but *before* the eliminating passes (so the arg-setup stores
-# are still alive for the binder to forward).
+# Interprocedural signature milestones, whole-program, after every function is
+# post-mem2reg/gvn but *before* the eliminating passes. `external_sigs` assigns
+# conventional ABI signatures to imported/unresolved callees and `summaries`
+# computes each function's input/clobber/stack-delta summary; both feed the
+# downstream `dead_signature`, `partial_inline`, `mark_pure`, and `argpromote`
+# stages. (The legacy `bind_args` register-ABI binder has been removed: register
+# inputs are threaded by `argpromote_registers` and stack/memory inputs are
+# functionalized by `argpromote`, so call sites no longer need a separate
+# argument-load binding pass.)
 [[stage]]
-name = "bind"
+name = "signatures"
 scope = "module"
-passes = ["external_sigs", "summaries", "bind_args"]
+passes = ["external_sigs", "summaries"]
 
-# Eliminating passes, per function: drop the now-dead arg-setup stores and the
-# loads the binder forwarded.
+# Eliminating passes, per function: drop the now-dead arg-setup stores and loads.
 [[stage]]
 name = "post-bind"
 scope = "function"
@@ -216,11 +210,10 @@ scope = "module"
 passes = ["partial_inline", "dead_signature"]
 repeat_until = "no_change"
 
-# Forward the `argpromote_stack` seed-store/load pairs (the by-value stack args,
-# stored into the shadow space at entry and read back as narrow loads, which
-# mem2reg leaves unpromoted for `pure_reg` callees) into their by-value params, so
-# the purity check below sees a load-free body. `dead_store`+`dce` then sweep the
-# now-unread seed stores.
+# Forward the `argpromote` shadow seed-store/load pairs (by-value arguments stored
+# into the shadow space at entry and read back as narrow loads) into their
+# by-value params, so the purity check below sees a load-free body.
+# `dead_store`+`dce` then sweep the now-unread seed stores.
 [[stage]]
 name = "pre-pure-cleanup"
 scope = "function"

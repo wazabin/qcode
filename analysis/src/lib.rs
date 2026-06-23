@@ -10,11 +10,11 @@ pub use stack::{brighten_stack, lower_stack};
 
 pub mod calls;
 pub use calls::{
-    append_caller_arg, append_entry_param, argpromote, argpromote_registers, argpromote_stack,
-    bind_all_call_args, bind_call_args, compute_call_clobbered_regs, compute_clobbered_regs,
-    compute_input_regs, compute_saved_regs, compute_stack_delta, learn_stack_facts,
-    remove_entry_param, resolve_arg_loads, seed_stack_facts, set_all_call_clobbered_regs,
-    set_all_function_summaries, set_clobbered_regs, set_function_summaries,
+    append_caller_arg, append_entry_param, argpromote, argpromote_registers,
+    compute_call_clobbered_regs, compute_clobbered_regs, compute_input_regs, compute_saved_regs,
+    compute_stack_delta, learn_stack_facts, remove_entry_param, seed_stack_facts,
+    set_all_call_clobbered_regs, set_all_function_summaries, set_clobbered_regs,
+    set_function_summaries,
 };
 
 pub mod cfg;

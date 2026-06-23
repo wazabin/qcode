@@ -225,8 +225,8 @@ fn module_adapter_inner(name: &str) -> Option<&str> {
 /// function exactly once, OR-ing their change flags.
 ///
 /// Its purpose is to let a function pass join a module stage's `repeat_until`
-/// fixpoint — e.g. looping `argpromote_stack` (module) together with
-/// `module(mem2reg)` / `module(const_fold)` until the stack arguments are fully
+/// fixpoint — e.g. looping `argpromote_registers` (module) together with
+/// `module(mem2reg)` / `module(const_fold)` until the arguments are fully
 /// threaded — without minting a bespoke module pass per function pass. The
 /// `module(...)` spelling keeps it visible in the TOML that the underlying pass is
 /// a function pass being run program-wide.

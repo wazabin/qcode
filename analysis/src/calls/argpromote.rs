@@ -171,8 +171,7 @@ pub fn mark_pure_functions(ctx: &mut Context) -> bool {
 /// guarding against a stale over-approximated clobber set.) **Stores are
 /// permitted**: they produce no value, so they never feed a returned field, and
 /// the emulation harvesting this property keeps the call in place — any real side
-/// effect the store represents is preserved. (This is why argpromote_stack's dead
-/// private seed-stores do not block purity.)
+/// effect the store represents is preserved.
 pub(crate) fn body_is_pure(ctx: &Context, fid: FunctionId) -> bool {
     Function::from_id(ctx, fid)
         .iter()
