@@ -1,5 +1,6 @@
 use qcode_parser::ast::{
-    Atom, BlockParamDecl, CastOp, ExprNode, ExtractField, FnDecl, Label, Statement, TypedAtom,
+    Atom, BlockParamDecl, CastOp, ExprNode, ExtractField, FnDecl, GepField, Label, Statement,
+    StructDecl, StructFieldType, TypedAtom,
 };
 use quote::{format_ident, quote};
 use std::collections::HashMap;
@@ -58,6 +59,64 @@ fn block_param_size(param: &BlockParamDecl) -> usize {
 }
 
 /// Compile a function-level program (one or more `fn name: ...` declarations).
+/// Emits statements that register each `type Foo { ... }` declaration into the
+/// context's [`TypeManager`] before the body is built. Field offsets are the
+/// running byte sum (padding fields named `_` advance the offset without
+/// producing a named slot); the struct size is the total extent. Each named
+/// field is typed as an integer of its declared byte width.
+pub(crate) fn compile_struct_decls(
+    ctx: &Expr,
+    structs: &[StructDecl],
+    pcode_root: &proc_macro2::TokenStream,
+) -> proc_macro2::TokenStream {
+    let regs = structs.iter().map(|s| {
+        let name = &s.name;
+        let mut offset = 0usize;
+        let mut field_tokens: Vec<proc_macro2::TokenStream> = Vec::new();
+        for field in &s.fields {
+            // Field width: an `iN` field is `N` bytes; a `Foo*` field is a
+            // pointer (width 8). Padding (`_`) is always a scalar size.
+            let (size, ty_tokens) = match &field.ty {
+                StructFieldType::Int(n) => (
+                    *n,
+                    quote! { (#ctx).types.get_or_make_int(#n) },
+                ),
+                StructFieldType::StructPtr(target) => (
+                    8usize,
+                    quote! {
+                        {
+                            // The pointee `target` must already be declared.
+                            let __pointee = (#ctx).types.get_or_make_struct(#target, 0, Vec::new());
+                            (#ctx).types.get_or_make_struct_pointer(8, __pointee)
+                        }
+                    },
+                ),
+            };
+            if !field.is_padding() {
+                let fname = &field.name;
+                field_tokens.push(quote! {
+                    {
+                        let __ty = #ty_tokens;
+                        __qcode_fields.push(
+                            #pcode_root::types::AggregateField::new_at(#fname, __ty, #offset)
+                        );
+                    }
+                });
+            }
+            offset += size;
+        }
+        let total_size = offset;
+        quote! {
+            {
+                let mut __qcode_fields: Vec<#pcode_root::types::AggregateField> = Vec::new();
+                #(#field_tokens)*
+                (#ctx).types.get_or_make_struct(#name, #total_size, __qcode_fields);
+            }
+        }
+    });
+    quote! { #(#regs)* }
+}
+
 pub(crate) fn compile_fn_program(
     ctx: &Expr,
     top_varnodes: &[Statement],
@@ -593,15 +652,41 @@ fn emit_statement(
             locals.insert(name.clone(), LocalKind::Varnode(ident));
         }
 
-        Statement::Assign { name, expr, .. } => {
+        Statement::Assign {
+            name,
+            expr,
+            decl_struct_ptr,
+            ..
+        } => {
             let ident = format_ident!("__qcode_local_{}", name);
             let outer_ident = format_ident!("{}", name);
             let value_tokens = lower_expr(expr, locals, pcode_root)?;
+            // A `Foo*` declared type retypes the result to a struct pointer (the
+            // pointee `Foo` must already be declared). Pointer width defaults to 8.
+            let retype = match decl_struct_ptr {
+                Some(struct_name) => quote! {
+                    {
+                        let __sp_pointee = __qcode_builder
+                            .context_mut()
+                            .types
+                            .get_or_make_struct(#struct_name, 0, Vec::new());
+                        let __sp = __qcode_builder
+                            .context_mut()
+                            .types
+                            .get_or_make_struct_pointer(8, __sp_pointee);
+                        #pcode_root::value::Instruction::from_id_mut(
+                            __qcode_builder.context_mut(), #ident
+                        ).set_type(__sp);
+                    }
+                },
+                None => quote! {},
+            };
             emitted.push(quote! {
                 let #ident = #value_tokens;
                 let _ = #pcode_root::value::Instruction::from_id_mut(
                     __qcode_builder.context_mut(), #ident
                 ).rename(Cow::Borrowed(#name));
+                #retype
                 #outer_ident = #ident;
             });
             locals.insert(name.clone(), LocalKind::Instruction(ident));
@@ -1188,6 +1273,27 @@ fn lower_expr(
                             .field_index(__qcode_agg_ty, #name)
                             .expect("qcode extract: aggregate does not have the named field");
                         __qcode_builder.push_extract(__qcode_agg, __qcode_field).id
+                    }
+                }),
+            }
+        }
+
+        ExprNode::Gep { base, field } => {
+            let base_tokens = lower_atom(base, None, locals, pcode_root)?;
+            match field {
+                GepField::Offset(offset) => {
+                    let off = *offset as usize;
+                    Ok(quote! {
+                        {
+                            let __qcode_base = #base_tokens;
+                            __qcode_builder.push_gep(__qcode_base, #off).id
+                        }
+                    })
+                }
+                GepField::Name(name) => Ok(quote! {
+                    {
+                        let __qcode_base = #base_tokens;
+                        __qcode_builder.push_gep_field(__qcode_base, #name).id
                     }
                 }),
             }

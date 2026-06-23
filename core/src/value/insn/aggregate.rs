@@ -115,6 +115,54 @@ impl MnemonicKind for Extract {
     }
 }
 
+/// Computes the address of a struct field: `gep(base, offset)` ≡
+/// `base + offset`, but the result is *typed* `PtrTo<field.type>` and prints by
+/// field **name** instead of the raw offset.
+///
+/// Unlike [`Extract`] — which projects a field *value* out of an in-register
+/// aggregate — `Gep` does **no memory access**: it is pure pointer arithmetic.
+/// The field value is obtained by a separate `load` of the `Gep` result. The
+/// field name is recovered from the pointee of `base`'s
+/// [`StructPointer`](crate::types::TypeRepr::StructPointer) type, keyed by the
+/// byte `offset`.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+pub struct Gep {
+    pub base: ValueId,
+    pub offset: usize,
+}
+
+impl Gep {
+    /// The name of the field this `Gep` addresses, recovered from the nominal
+    /// struct that `base` points at. `None` if `base` is not a typed struct
+    /// pointer or the offset matches no field.
+    pub fn field_name<'a>(&self, ctx: &'a Context<'_>) -> Option<&'a str> {
+        let base_ty = ctx.stored_type_of(self.base)?;
+        let pointee = ctx.types.pointee_of(base_ty)?;
+        ctx.types
+            .field_by_offset(pointee, self.offset)
+            .map(|(_, field)| field.name.as_str())
+    }
+}
+
+impl MnemonicKind for Gep {
+    fn opcode(&self) -> &'static str {
+        "gep"
+    }
+
+    fn fmt(&self, f: &mut Formatter<'_>, ctx: &Context<'_>) -> std::fmt::Result {
+        f.write_str("gep(")?;
+        fmt_bare_value(f, ctx, self.base)?;
+        match self.field_name(ctx) {
+            Some(name) => write!(f, ".{name});"),
+            None => write!(f, " + {:#x});", self.offset),
+        }
+    }
+
+    fn args(&self) -> Vec<ValueId> {
+        vec![self.base]
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use qcode_macro::qcode;
@@ -198,4 +246,43 @@ mod tests {
         let extract_ty = ctx.type_of(ValueId::Instruction(extract_id));
         assert_eq!(ctx.types.size_of(extract_ty), 8);
     }
+
+    #[test]
+    fn gep_via_qcode_resolves_field_name_and_pointer_type() {
+        let mut ctx = Context::new();
+        // `Inner { val: i32 @ 0x08 }` (0x08 via leading padding), `%p : Inner*`.
+        qcode!(
+            ctx,
+            "
+            type Inner { _: 8, val: 4 };
+            varnode i64 base;
+            <block>
+                Inner* %p = load(i64, base);
+                %f = gep(%p.val);
+                return [i64 0];
+            "
+        );
+
+        let gep = BasicBlock::from_id(&ctx, block)
+            .iter()
+            .find(|i| matches!(i.mnemonic(), Mnemonic::Gep(_)))
+            .expect("gep instruction");
+        let gep_id = gep.id;
+        // Prints by field name, not the raw 0x8 offset.
+        assert!(
+            gep.as_statement().to_string().contains("gep(%p.val)"),
+            "got: {}",
+            gep.as_statement()
+        );
+
+        // Result type is a pointer (width 8) to the i32 field.
+        let gep_ty = ctx.type_of(ValueId::Instruction(gep_id));
+        assert_eq!(ctx.types.size_of(gep_ty), 8);
+        let pointee = ctx
+            .types
+            .pointee_of(gep_ty)
+            .expect("gep result is a pointer");
+        assert_eq!(ctx.types.size_of(pointee), 4);
+    }
+
 }

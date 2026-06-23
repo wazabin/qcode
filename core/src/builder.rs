@@ -45,10 +45,10 @@ use crate::{
         function::FunctionId,
         insn::{
             Assert, Binary, Binop, BoolBinop, Branch, BranchInd, CBranch, Call, CallInd, Carry,
-            Extract, FloatBinop, FloatToFloat, FloatToInt, InstructionId, InstructionRef, IntBinop,
-            IntToFloat, Intrinsic, IntrinsicId, IsFloatNaN, Load, LzCount, Mnemonic, PCodeOp,
-            PCodeOpId, PopCount, Range, Return, SBorrow, SCarry, Sext, Store, Tuple, Unary, Unop,
-            Zext,
+            Extract, FloatBinop, FloatToFloat, FloatToInt, Gep, InstructionId, InstructionRef,
+            IntBinop, IntToFloat, Intrinsic, IntrinsicId, IsFloatNaN, Load, LzCount, Mnemonic,
+            PCodeOp, PCodeOpId, PopCount, Range, Return, SBorrow, SCarry, Sext, Store, Tuple, Unary,
+            Unop, Zext,
         },
         util::base_ref::{WithCtx, WithCtxMut},
         varnode::{Varnode, VarnodeId},
@@ -942,6 +942,46 @@ impl<'str, 'ctx> Builder<'str, 'ctx> {
             .field_type(agg_ty, index)
             .expect("push_extract: agg is not an aggregate with that field index");
         self.push_instruction_with_type(Mnemonic::Extract(Extract { agg, index }), ty)
+    }
+
+    /// Computes the address of the field at byte `offset` of the struct that
+    /// `base` points at: `gep(base, offset)`. `base` must have a
+    /// [`StructPointer`](crate::types::TypeRepr::StructPointer) type whose
+    /// pointee has a field at exactly `offset`. The result type is a pointer
+    /// (same width as `base`) to that field's type. Panics otherwise.
+    pub fn push_gep(&mut self, base: ValueId, offset: usize) -> InstructionRef<'str, '_> {
+        let base_ty = self.context_mut().type_of(base);
+        let types = &self.context().types;
+        let ptr_width = types.size_of(base_ty);
+        let pointee = types
+            .pointee_of(base_ty)
+            .expect("push_gep: base is not a struct pointer");
+        let field_ty = types
+            .field_by_offset(pointee, offset)
+            .map(|(_, field)| field.type_id)
+            .expect("push_gep: no field at that offset in the pointee struct");
+        let ty = self
+            .context_mut()
+            .types
+            .get_or_make_struct_pointer(ptr_width, field_ty);
+        self.push_instruction_with_type(Mnemonic::Gep(Gep { base, offset }), ty)
+    }
+
+    /// Like [`push_gep`](Builder::push_gep) but selects the field by name,
+    /// resolving it to a byte offset via the pointee struct of `base`. Panics if
+    /// `base` is not a struct pointer or has no field of that name.
+    pub fn push_gep_field(&mut self, base: ValueId, name: &str) -> InstructionRef<'str, '_> {
+        let base_ty = self.context_mut().type_of(base);
+        let types = &self.context().types;
+        let pointee = types
+            .pointee_of(base_ty)
+            .expect("push_gep_field: base is not a struct pointer");
+        let offset = types
+            .aggregate_fields(pointee)
+            .and_then(|fields| fields.iter().find(|f| f.name == name))
+            .map(|f| f.offset)
+            .expect("push_gep_field: pointee struct has no field of that name");
+        self.push_gep(base, offset)
     }
 
     pub fn push_popcount(&mut self, src: ValueId, size: usize) -> InstructionRef<'str, '_> {

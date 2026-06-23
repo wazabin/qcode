@@ -51,6 +51,44 @@ pub enum ExtractField {
     Index(u64),
 }
 
+/// The field selector of a `gep(...)` — by field name or by raw byte offset.
+#[derive(Clone, Debug)]
+pub enum GepField {
+    Name(String),
+    Offset(u64),
+}
+
+/// The declared type of a struct field: either a scalar of `n` bytes, or a
+/// pointer to a named (nominal) struct, written `Foo*`.
+#[derive(Clone, Debug)]
+pub enum StructFieldType {
+    Int(usize),
+    StructPtr(String),
+}
+
+/// One field of a `type Foo { ... }` declaration. A field named `_` is padding:
+/// it advances the running offset by its byte size without naming a slot.
+#[derive(Clone, Debug)]
+pub struct StructFieldDecl {
+    pub name: String,
+    pub ty: StructFieldType,
+}
+
+impl StructFieldDecl {
+    pub fn is_padding(&self) -> bool {
+        self.name == "_"
+    }
+}
+
+/// A nominal struct definition: `type Foo { a: 4, _: 5, b: 2 }`. Field offsets
+/// are the running byte sum (padding included); the struct `size` is the total.
+#[derive(Clone, Debug)]
+pub struct StructDecl {
+    pub name: String,
+    pub fields: Vec<StructFieldDecl>,
+    pub span: SourceSpan,
+}
+
 #[derive(Clone, Debug)]
 pub enum ExprNode {
     Atom(TypedAtom),
@@ -93,6 +131,12 @@ pub enum ExprNode {
     Extract {
         agg: TypedAtom,
         field: ExtractField,
+    },
+    /// `gep(base.field)` — compute the address of a struct field (typed, named
+    /// pointer arithmetic; no memory access).
+    Gep {
+        base: TypedAtom,
+        field: GepField,
     },
 }
 
@@ -154,6 +198,11 @@ pub enum Statement {
         name: String,
         name_span: SourceSpan,
         expr: ExprNode,
+        /// A `Foo*` struct-pointer type declared on the assignment, if any. When
+        /// present, the result value is retyped to that struct pointer (used to
+        /// seed struct typing in tests). A plain `iN`/`fN` declared type is not
+        /// recorded here — it only drives size coercion of the rhs.
+        decl_struct_ptr: Option<String>,
         span: SourceSpan,
     },
     Expr(ExprNode),
@@ -222,9 +271,16 @@ pub struct FnDecl {
     pub statements: Vec<Statement>,
 }
 
-/// Top-level program representation.
+/// Top-level program representation. Any leading `type` declarations are
+/// collected into `structs`; `kind` is the statement or function body.
 #[derive(Clone, Debug)]
-pub enum Program {
+pub struct Program {
+    pub structs: Vec<StructDecl>,
+    pub kind: ProgramKind,
+}
+
+#[derive(Clone, Debug)]
+pub enum ProgramKind {
     Statements(Vec<Statement>),
     Functions {
         varnodes: Vec<Statement>,

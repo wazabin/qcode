@@ -140,6 +140,8 @@ mod tests {
                 }],
                 ..CallingConvention::default()
             },
+            os: qcode::context::TargetOs::Unknown,
+            bitness: 64,
         };
         let env = PipelineEnv {
             cfg,

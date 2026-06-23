@@ -1,6 +1,6 @@
 use proc_macro::TokenStream;
 use proc_macro_crate::{FoundCrate, crate_name};
-use qcode_parser::ast::Program;
+use qcode_parser::ast::ProgramKind;
 use quote::quote;
 use syn::{
     Expr, LitStr, Token,
@@ -52,12 +52,20 @@ fn compile_qcode_from_str(expr: &Expr, program: &str) -> syn::Result<proc_macro2
         }
     };
 
-    match parsed {
-        Program::Statements(stmts) => {
-            lower::compile_qcode_from_statements_ctx(expr, &stmts, &pcode_root)
+    let struct_regs = lower::compile_struct_decls(expr, &parsed.structs, &pcode_root);
+    let body = match parsed.kind {
+        ProgramKind::Statements(stmts) => {
+            lower::compile_qcode_from_statements_ctx(expr, &stmts, &pcode_root)?
         }
-        Program::Functions { varnodes, fns } => {
-            lower::compile_fn_program(expr, &varnodes, &fns, &pcode_root)
+        ProgramKind::Functions { varnodes, fns } => {
+            lower::compile_fn_program(expr, &varnodes, &fns, &pcode_root)?
         }
-    }
+    };
+    // NB: do not wrap in a block — the statement form leaks bindings (`block`,
+    // `entry`, varnodes) into the caller's scope, which callers rely on. The
+    // struct registrations are self-contained `{ … }` statements and run first.
+    Ok(quote! {
+        #struct_regs
+        #body
+    })
 }

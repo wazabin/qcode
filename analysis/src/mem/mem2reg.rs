@@ -479,6 +479,16 @@ impl Mem2Reg<'_, '_> {
             .push_param(size)
             .id;
         self.ctx.values.block_params[param_id].origin = Some(var);
+        // Carry a global varnode type override (e.g. the `FS_OFFSET` segment base
+        // typed `PtrTo<TEB>` by `windows_teb_seed`) onto the promoted param, so the
+        // ambient register's richer type survives mem2reg instead of decaying to
+        // the default `Int(size)`. Width matches by construction (the override is
+        // installed with the varnode's own width).
+        if let ValueId::Varnode(_) = var
+            && let Some(ty) = self.ctx.stored_type_of(var)
+        {
+            self.ctx.values.block_params[param_id].type_id = ty;
+        }
         if let Some(name) = name {
             self.ctx.values.block_params[param_id].name = Some(Cow::Owned(name.to_owned()));
         }

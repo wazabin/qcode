@@ -1,6 +1,7 @@
 use crate::ast::{
-    Atom, BlockParamDecl, CastOp, ExprNode, ExtractField, FnDecl, Label, Program, SourcePosition,
-    SourceSpan, Statement, TupleField, TypedAtom,
+    Atom, BlockParamDecl, CastOp, ExprNode, ExtractField, FnDecl, GepField, Label, Program,
+    ProgramKind, SourcePosition, SourceSpan, Statement, StructDecl, StructFieldDecl,
+    StructFieldType, TupleField, TypedAtom,
 };
 use pest::Parser;
 use pest::iterators::Pair;
@@ -41,6 +42,7 @@ pub fn parse_program(program: &str) -> Result<Program, ParseError> {
     let mut fn_decls: Vec<FnDecl> = Vec::new();
     let mut statements: Vec<Statement> = Vec::new();
     let mut top_varnodes: Vec<Statement> = Vec::new();
+    let mut structs: Vec<StructDecl> = Vec::new();
     let mut is_fn_program = false;
 
     // A comment may appear at the program level (before statement_list or fn_decl)
@@ -51,6 +53,10 @@ pub fn parse_program(program: &str) -> Result<Program, ParseError> {
         match pair.as_rule() {
             Rule::COMMENT => {
                 pending_comment = Some(comment_text(pair.as_str()));
+            }
+            Rule::struct_decl => {
+                pending_comment = None;
+                structs.push(parse_struct_decl(pair)?);
             }
             Rule::top_varnode_list => {
                 for part in pair.into_inner() {
@@ -87,14 +93,59 @@ pub fn parse_program(program: &str) -> Result<Program, ParseError> {
         }
     }
 
-    if is_fn_program {
-        Ok(Program::Functions {
+    let kind = if is_fn_program {
+        ProgramKind::Functions {
             varnodes: top_varnodes,
             fns: fn_decls,
-        })
+        }
     } else {
-        Ok(Program::Statements(statements))
+        ProgramKind::Statements(statements)
+    };
+    Ok(Program { structs, kind })
+}
+
+fn parse_struct_decl(pair: Pair<'_, Rule>) -> Result<StructDecl, ParseError> {
+    let span = source_span(pair.as_span());
+    let mut inner = pair.into_inner();
+    let name = inner
+        .next()
+        .ok_or_else(|| ParseError::new("missing struct name"))?
+        .as_str()
+        .to_owned();
+    let mut fields = Vec::new();
+    for field in inner {
+        if field.as_rule() != Rule::struct_field {
+            continue;
+        }
+        let mut parts = field.into_inner();
+        let field_name = parts
+            .next()
+            .ok_or_else(|| ParseError::new("missing struct field name"))?
+            .as_str()
+            .to_owned();
+        let ty_pair = parts
+            .next()
+            .ok_or_else(|| ParseError::new("missing struct field type"))?;
+        let ty = match ty_pair.as_rule() {
+            Rule::struct_ptr_ty => StructFieldType::StructPtr(
+                ty_pair
+                    .as_str()
+                    .trim_end_matches('*')
+                    .to_owned(),
+            ),
+            Rule::integer => StructFieldType::Int(parse_integer(ty_pair.as_str())? as usize),
+            _ => return Err(ParseError::new("invalid struct field type")),
+        };
+        fields.push(StructFieldDecl {
+            name: field_name,
+            ty,
+        });
     }
+    Ok(StructDecl {
+        name,
+        fields,
+        span,
+    })
 }
 
 fn parse_fn_decl(pair: Pair<'_, Rule>) -> Result<FnDecl, ParseError> {
@@ -417,16 +468,28 @@ fn parse_assert_stmt(pair: Pair<'_, Rule>) -> Result<Statement, ParseError> {
 fn parse_assignment_ssa(pair: Pair<'_, Rule>) -> Result<Statement, ParseError> {
     let span = source_span(pair.as_span());
     let mut inner = pair.into_inner();
-    // Skip optional ty token
+    // Optional declared type (`decl_ty`): an `iN`/`fN` size, or a `Foo*` struct
+    // pointer. Only the struct-pointer form is recorded (it retypes the result).
     let name_or_ty = inner
         .next()
         .ok_or_else(|| ParseError::new("missing ssa assignment name"))?;
-    let ssa_pair = if name_or_ty.as_rule() == Rule::ty {
-        inner
+    let (decl_struct_ptr, ssa_pair) = if name_or_ty.as_rule() == Rule::decl_ty {
+        let decl = name_or_ty
+            .into_inner()
             .next()
-            .ok_or_else(|| ParseError::new("missing ssa name after type"))?
+            .ok_or_else(|| ParseError::new("empty declared type"))?;
+        let decl_struct_ptr = match decl.as_rule() {
+            Rule::struct_ptr_ty => Some(decl.as_str().trim_end_matches('*').to_owned()),
+            _ => None,
+        };
+        (
+            decl_struct_ptr,
+            inner
+                .next()
+                .ok_or_else(|| ParseError::new("missing ssa name after type"))?,
+        )
     } else {
-        name_or_ty
+        (None, name_or_ty)
     };
     let name_span = source_span(ssa_pair.as_span());
     let name = ssa_pair
@@ -441,6 +504,7 @@ fn parse_assignment_ssa(pair: Pair<'_, Rule>) -> Result<Statement, ParseError> {
         name,
         name_span,
         expr: parse_expr(expr_pair)?,
+        decl_struct_ptr,
         span,
     })
 }
@@ -468,8 +532,40 @@ fn parse_expr(pair: Pair<'_, Rule>) -> Result<ExprNode, ParseError> {
         Rule::cast => parse_cast(inner),
         Rule::tuple => parse_tuple(inner),
         Rule::extract => parse_extract(inner),
+        Rule::gep => parse_gep(inner),
         _ => Err(ParseError::new("invalid expression")),
     }
+}
+
+fn parse_gep(pair: Pair<'_, Rule>) -> Result<ExprNode, ParseError> {
+    let inner = pair
+        .into_inner()
+        .next()
+        .ok_or_else(|| ParseError::new("missing gep body"))?;
+    let rule = inner.as_rule();
+    let mut parts = inner.into_inner();
+    let base = parse_typed_atom(
+        parts
+            .find(|p| p.as_rule() == Rule::typed_atom)
+            .ok_or_else(|| ParseError::new("missing gep base"))?,
+    )?;
+    let field = match rule {
+        Rule::named_gep => GepField::Name(
+            parts
+                .find(|p| p.as_rule() == Rule::ident)
+                .ok_or_else(|| ParseError::new("missing gep field name"))?
+                .as_str()
+                .to_owned(),
+        ),
+        Rule::offset_gep => GepField::Offset(parse_integer(
+            parts
+                .find(|p| p.as_rule() == Rule::integer)
+                .ok_or_else(|| ParseError::new("missing gep offset"))?
+                .as_str(),
+        )?),
+        _ => return Err(ParseError::new("invalid gep")),
+    };
+    Ok(ExprNode::Gep { base, field })
 }
 
 fn parse_tuple(pair: Pair<'_, Rule>) -> Result<ExprNode, ParseError> {
@@ -861,12 +957,12 @@ fn source_span(span: pest::Span<'_>) -> SourceSpan {
 #[cfg(test)]
 mod tests {
     use super::parse_program;
-    use crate::ast::{Atom, CastOp, ExprNode, Label, Program, Statement};
+    use crate::ast::{Atom, CastOp, ExprNode, Label, ProgramKind, Statement};
 
     fn stmts(program: &str) -> Vec<Statement> {
-        match parse_program(program).expect("parse should succeed") {
-            Program::Statements(s) => s,
-            Program::Functions { .. } => panic!("expected statements, got functions"),
+        match parse_program(program).expect("parse should succeed").kind {
+            ProgramKind::Statements(s) => s,
+            ProgramKind::Functions { .. } => panic!("expected statements, got functions"),
         }
     }
 
@@ -1203,6 +1299,7 @@ mod tests {
                 expr,
                 name_span,
                 span,
+                ..
             } => {
                 assert_eq!(name, "a");
                 assert!(matches!(expr, ExprNode::Binary { .. }));
@@ -1426,8 +1523,8 @@ mod tests {
     fn parses_fn_decl() {
         let program = parse_program("fn f: <entry> varnode i64 a; goto <done>; <done> a + 1")
             .expect("parse should succeed");
-        match program {
-            Program::Functions { fns, .. } => {
+        match program.kind {
+            ProgramKind::Functions { fns, .. } => {
                 assert_eq!(fns.len(), 1);
                 let f = &fns[0];
                 assert_eq!(f.name, "f");
@@ -1457,8 +1554,8 @@ mod tests {
     fn parses_fn_decl_with_address_labels() {
         let program = parse_program("fn f: <entry> varnode i64 a; goto <0x1001>")
             .expect("parse should succeed");
-        match program {
-            Program::Functions { fns, .. } => {
+        match program.kind {
+            ProgramKind::Functions { fns, .. } => {
                 assert_eq!(fns.len(), 1);
                 let f = &fns[0];
                 assert!(matches!(
@@ -1597,8 +1694,8 @@ mod tests {
     fn parses_comment_in_fn_body() {
         let program = parse_program("fn f: <entry> # load value\n%x = {v} + 1; return [%x]")
             .expect("parse should succeed");
-        match program {
-            Program::Functions { fns, .. } => {
+        match program.kind {
+            ProgramKind::Functions { fns, .. } => {
                 let stmts = &fns[0].statements;
                 // stmts[0] = LabelDecl <entry>, stmts[1] = Commented(%x = ...), stmts[2] = return
                 assert!(
@@ -1613,8 +1710,8 @@ mod tests {
     fn parses_top_level_varnode_before_fn() {
         let program = parse_program("varnode i64 ptr; fn f: <entry> return [ptr]")
             .expect("parse should succeed");
-        match program {
-            Program::Functions { varnodes, fns } => {
+        match program.kind {
+            ProgramKind::Functions { varnodes, fns } => {
                 assert_eq!(varnodes.len(), 1);
                 assert!(
                     matches!(&varnodes[0], Statement::LocalDecl { name, size_bytes, .. } if name == "ptr" && *size_bytes == 8)
@@ -1623,5 +1720,42 @@ mod tests {
             }
             _ => panic!("expected function program"),
         }
+    }
+
+    #[test]
+    fn parses_struct_decl_offsets_and_padding() {
+        use crate::ast::{StructFieldType, GepField, ExprNode};
+        let program =
+            parse_program("type Foo { a: 4, _: 5, b: 2, p: Bar* }; %x + 1").expect("parse");
+        assert_eq!(program.structs.len(), 1);
+        let foo = &program.structs[0];
+        assert_eq!(foo.name, "Foo");
+        // 4 named fields minus padding = a, b, p.
+        let named: Vec<&str> = foo
+            .fields
+            .iter()
+            .filter(|f| !f.is_padding())
+            .map(|f| f.name.as_str())
+            .collect();
+        assert_eq!(named, ["a", "b", "p"]);
+        // Padding `_` advances the running offset (a@0, then 4 + 5 = 9 → b@9).
+        assert!(matches!(foo.fields[1].ty, StructFieldType::Int(5)));
+        assert!(foo.fields[1].is_padding());
+        // Pointer-to-struct field type is captured.
+        assert!(
+            matches!(&foo.fields[3].ty, StructFieldType::StructPtr(name) if name == "Bar")
+        );
+
+        // gep parses as its own expression node.
+        let geps = parse_program("%y = gep(%p.field)")
+            .expect("parse")
+            .kind;
+        let ProgramKind::Statements(stmts) = geps else {
+            panic!("expected statements")
+        };
+        assert!(matches!(
+            &stmts[0],
+            Statement::Assign { expr: ExprNode::Gep { field: GepField::Name(n), .. }, .. } if n == "field"
+        ));
     }
 }

@@ -27,6 +27,10 @@ pub use structure::{
 
 pub mod naming;
 
+pub mod structs;
+pub use structs::StructTyping;
+pub use structs::win32::{WindowsTebSeed, register_teb_structs, seed_teb_register};
+
 pub mod example;
 
 #[cfg(test)]

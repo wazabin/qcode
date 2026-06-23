@@ -5,7 +5,8 @@ use crate::{
         function::FunctionId,
         insn::{
             Assert, Binary, Branch, BranchInd, CBranch, Call, CallInd, Carry, Extract, FloatToFloat,
-            FloatToInt, IntToFloat, Intrinsic, IsFloatNaN, Load, LzCount, PCodeOp, PopCount, Range,
+            FloatToInt, Gep, IntToFloat, Intrinsic, IsFloatNaN, Load, LzCount, PCodeOp, PopCount,
+            Range,
             Return, SBorrow, SCarry, Sext, Store, Tuple, Unary, Zext,
         },
     },
@@ -116,6 +117,8 @@ pub enum Mnemonic {
     Tuple(Tuple),
     /// Project a single field out of an aggregate value.
     Extract(Extract),
+    /// Compute the address of a struct field (typed, named pointer arithmetic).
+    Gep(Gep),
 }
 
 impl Mnemonic {
@@ -148,6 +151,7 @@ impl Mnemonic {
             Mnemonic::Intrinsic(m) => m,
             Mnemonic::Tuple(m) => m,
             Mnemonic::Extract(m) => m,
+            Mnemonic::Gep(m) => m,
         }
     }
 
@@ -379,6 +383,11 @@ impl Mnemonic {
             Mnemonic::Extract(m) => {
                 if m.agg == old {
                     m.agg = new;
+                }
+            }
+            Mnemonic::Gep(m) => {
+                if m.base == old {
+                    m.base = new;
                 }
             }
         }

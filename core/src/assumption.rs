@@ -56,6 +56,12 @@ pub enum Proposition {
     /// target in a region the pass marks non-executable contradicts it. Keyed by
     /// the whole containing segment (not per byte) so the truth map stays small.
     ExecutableMemory { start: u64, end: u64 },
+    /// The binary is a Windows target of the given `bitness` (32 or 64), so the
+    /// segment-base register (`FS` on x86, `GS` on x64) points at the Thread
+    /// Information Block. Recorded `Assumed` by the TEB-seeding pass to justify
+    /// retyping that base as `PtrTo<TEB>`; it is an analyst aid and override
+    /// hook, with no verifier in v1 (nothing currently proves the negation).
+    WindowsTeb { bitness: u8 },
 }
 
 /// How certain we are about a proposition's recorded value.

@@ -108,6 +108,22 @@ pub struct Context<'str> {
     /// rounds) and serialization.
     #[serde(default)]
     discoveries: crate::discovery::DiscoveryQueue,
+
+    /// The operating system of the loaded binary, stamped by the loader from the
+    /// binary format (PE → Windows, ELF → Linux). Platform-gated passes — e.g.
+    /// TEB seeding, which only applies to Windows — read it. `Unknown` for
+    /// synthetic contexts.
+    #[serde(default)]
+    target_os: TargetOs,
+}
+
+/// The operating system of a loaded binary, inferred from its container format.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum TargetOs {
+    #[default]
+    Unknown,
+    Windows,
+    Linux,
 }
 
 impl<'str> Context<'str> {
@@ -161,6 +177,17 @@ impl<'str> Context<'str> {
 
     pub fn primary_entrypoint(&self) -> Option<u64> {
         self.primary_entrypoint
+    }
+
+    /// Records the loaded binary's operating system (set by the loader from the
+    /// container format).
+    pub fn set_target_os(&mut self, os: TargetOs) {
+        self.target_os = os;
+    }
+
+    /// The loaded binary's operating system, or [`TargetOs::Unknown`].
+    pub fn target_os(&self) -> TargetOs {
+        self.target_os
     }
 
     /// Replaces the spaces registry wholesale. Intended for initialization from a pre-built spec.
@@ -573,6 +600,9 @@ impl<'str> Context<'str> {
             ValueId::Instruction(iid) => self.values.instructions[iid].type_id,
             ValueId::BlockParam(pid) => self.values.block_params[pid].type_id,
             ValueId::Varnode(vid) => {
+                if let Some(&ty) = self.values.varnode_types.get(&vid) {
+                    return ty;
+                }
                 let size = self.values.varnodes[vid].size_bytes();
                 self.types.get_or_make_int(size)
             }
@@ -592,8 +622,17 @@ impl<'str> Context<'str> {
             ValueId::Literal(lid) => Some(self.values.literals[lid].type_id),
             ValueId::Instruction(iid) => Some(self.values.instructions[iid].type_id),
             ValueId::BlockParam(pid) => Some(self.values.block_params[pid].type_id),
-            ValueId::Varnode(_) | ValueId::BasicBlock(_) | ValueId::Function(_) => None,
+            ValueId::Varnode(vid) => self.values.varnode_types.get(&vid).copied(),
+            ValueId::BasicBlock(_) | ValueId::Function(_) => None,
         }
+    }
+
+    /// Gives `varnode` a global type override, replacing the default
+    /// `Int(size)`. Used to type ambient register globals — e.g. the `FS_OFFSET`
+    /// segment base as `PtrTo<TEB>` — so every use across all functions reads the
+    /// richer type. Pass a type whose size matches the varnode's width.
+    pub fn set_varnode_type(&mut self, varnode: VarnodeId, type_id: crate::types::TypeId) {
+        self.values.varnode_types.insert(varnode, type_id);
     }
 
     /// Return all instructions that use `value` as an operand.

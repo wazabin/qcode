@@ -33,7 +33,7 @@ use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
 
 use qcode::{
     assumption::{PassName, Proposition},
-    context::Context,
+    context::{Context, TargetOs},
     value::{FunctionId, RegisterId, ValueId, VarnodeId},
 };
 
@@ -87,6 +87,11 @@ pub struct ArchConfig {
     /// Calling-convention argument/return register layout, used to give known
     /// external (libc) functions signatures. Empty for unsupported arches.
     pub abi: CallingConvention,
+    /// The loaded binary's operating system (from the container format).
+    /// Platform-gated passes (e.g. TEB seeding) read this.
+    pub os: TargetOs,
+    /// Pointer width in bits (32 or 64), derived from the default space.
+    pub bitness: u8,
 }
 
 /// A general-purpose argument/return register exposed at several byte widths

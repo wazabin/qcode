@@ -16,6 +16,8 @@ pub(crate) fn dummy_env() -> PipelineEnv {
             stack_pointer: RegisterId::from(0usize),
             dead_flag_regs: Vec::new(),
             abi: CallingConvention::default(),
+            os: qcode::context::TargetOs::Unknown,
+            bitness: 64,
         },
         sp_varnode: VarnodeId::from(0usize),
     }

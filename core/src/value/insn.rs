@@ -34,7 +34,7 @@ mod pcode_op;
 mod terminator;
 mod unop;
 
-pub use aggregate::{Extract, Tuple};
+pub use aggregate::{Extract, Gep, Tuple};
 pub use assert::Assert;
 pub use binop::{Binary, Binop, BoolBinop, FloatBinop, IntBinop};
 pub use casting::{FloatToFloat, FloatToInt, IntToFloat, Range, Sext, Zext};
@@ -177,13 +177,13 @@ where
     }
 
     fn fmt(&'s self, f: &mut Formatter<'_>) -> std::fmt::Result {
-        let bit_size = self.size() * 8;
+        let ty = self.ctx().types.type_name(self.type_id());
 
         if let Some(name) = self.name() {
-            write!(f, "i{} %{}", bit_size, name)
+            write!(f, "{ty} %{name}")
         } else {
             let id: usize = self.id.into();
-            write!(f, "i{} %tmp{:x}", bit_size, id)
+            write!(f, "{ty} %tmp{id:x}")
         }
     }
 }

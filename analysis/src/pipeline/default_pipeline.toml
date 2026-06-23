@@ -70,6 +70,16 @@ name = "seed-clobbers"
 scope = "module"
 passes = ["seed_clobbers"]
 
+# On Windows x86, type the FS_OFFSET segment-base register as PtrTo<TEB> (a global
+# varnode-type override) before any pass turns register reads into params, so the
+# promoted entry params (argpromote-registers, then mem2reg) inherit the type and
+# the later `struct-typing` stage can unfold `fs:[…]` into named TEB/PEB fields. A
+# no-op on any other platform (gated on the PE header via ArchConfig).
+[[stage]]
+name = "windows-teb-seed"
+scope = "function"
+passes = ["windows_teb_seed"]
+
 # Functionalize register side effects while register load/stores are still
 # explicit (before brighten abstracts RSP to @stack_base).
 [[stage]]
@@ -100,6 +110,15 @@ repeat_until = "no_change"
 name = "gvn"
 scope = "function"
 passes = ["gvn"]
+
+# Recover named struct-field accesses now that gvn has canonicalized
+# `base + const` into a single expression: rewrite seeded segment/struct-pointer
+# arithmetic into typed `gep`s and propagate field types through loads. A no-op
+# unless something (e.g. `windows-teb-seed`) installed a struct-pointer type.
+[[stage]]
+name = "struct-typing"
+scope = "function"
+passes = ["struct_typing"]
 
 # Resolve jump tables now that gvn has const-folded the dispatch address into the
 # recognizable `table_base + index*scale` + load shape, so the indirect branch
@@ -263,10 +282,26 @@ repeat_until = "no_change"
 # (`unread_temp_space_stores`). It runs after `dce` so the forwarded loads are
 # already gone when it scans for readers; the trailing `dce` clears the address
 # arithmetic the removed stores leave behind.
+# Repeat to a fixpoint: forwarding a partially-overlapping store (e.g. a byte
+# overwrite of a wider word) exposes a constant the next round folds, which can
+# in turn expose further forwarding. A single pass leaves a constant assembled
+# byte-by-byte (such as an obfuscated `fs:[c]` offset) only partly reduced.
 [[stage]]
 name = "final-canonicalize"
 scope = "function"
 passes = ["gvn", "dce", "dead_store", "dce"]
+repeat_until = "no_change"
+
+# Second struct-typing pass: the early one (above) runs right after the first
+# `gvn`, before late forwarding has assembled offsets built from overlapping
+# partial stores into single constants. Now that `final-canonicalize` has folded
+# those into the canonical `base + const` shape, recover the remaining
+# segment/struct-pointer field accesses (e.g. an `fs:[0x30]` whose offset was
+# only foldable this late) into named `gep`s.
+[[stage]]
+name = "struct-typing-late"
+scope = "function"
+passes = ["struct_typing"]
 
 [[stage]]
 name = "cleanup"

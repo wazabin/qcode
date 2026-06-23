@@ -50,6 +50,15 @@ pub struct ValueRegistry<'str> {
     /// Varnode storage.
     pub varnodes: Registry<VarnodeId, Varnode<'str>>,
 
+    /// Per-varnode type overrides. A varnode is normally typed `Int(size)`; an
+    /// entry here gives it a richer *global* type instead (e.g. the `FS_OFFSET`
+    /// register typed `PtrTo<TEB>` by the TEB-seeding pass). Consulted by
+    /// [`Context::type_of`](crate::context::Context::type_of) /
+    /// [`stored_type_of`](crate::context::Context::stored_type_of). Set via
+    /// [`Context::set_varnode_type`](crate::context::Context::set_varnode_type).
+    #[serde(default)]
+    pub(crate) varnode_types: HashMap<VarnodeId, TypeId>,
+
     /// Control-flow edge storage.
     pub edges: Registry<EdgeId, EdgeData>,
 

@@ -134,6 +134,14 @@ where
     }
 
     fn fmt(&'s self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        // Surface a richer-than-integer type (e.g. a seeded `TEB*` segment base)
+        // as a `Type ` prefix. Plain `Int` params stay bare `@name` so the many
+        // existing signature assertions (`<f @ESP @EDI>`) are unaffected.
+        let types = &self.ctx().types;
+        let ty = types.type_name(self.type_id());
+        if types.pointee_of(self.type_id()).is_some() || types.struct_name_of(self.type_id()).is_some() {
+            write!(f, "{ty} ")?;
+        }
         if let Some(name) = self.name() {
             write!(f, "@{name}")
         } else {

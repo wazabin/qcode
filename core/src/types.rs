@@ -56,8 +56,19 @@ pub trait Type: Send + Sync {
         None
     }
 
-    /// The ordered field types, if this is an [`AggregateType`].
+    /// The ordered field types, if this is an [`AggregateType`] or nominal
+    /// [`StructType`].
     fn fields(&self) -> Option<&[AggregateField]> {
+        None
+    }
+
+    /// The name of this type, if it is a nominal [`StructType`].
+    fn struct_name(&self) -> Option<&str> {
+        None
+    }
+
+    /// The pointee type, if this is a [`StructPointer`].
+    fn pointee(&self) -> Option<TypeId> {
         None
     }
 
@@ -103,23 +114,51 @@ pub enum TypeRepr {
     Aggregate {
         fields: Vec<AggregateField>,
     },
+    /// A named, nominal struct with explicit per-field byte offsets — the
+    /// pointee of a [`StructPointer`]. Identity is the `name`, not the field
+    /// list, so two structs with coincident layouts stay distinct. Sparse: only
+    /// the fields of interest are listed; `size` is the real struct size and
+    /// need not equal the fields' extent.
+    Struct {
+        name: String,
+        size: usize,
+        fields: Vec<AggregateField>,
+    },
+    /// A pointer to a nominal [`Struct`](TypeRepr::Struct) (or any other type),
+    /// of the given byte width. `pointee` is the [`TypeId`] it points at.
+    StructPointer {
+        size: usize,
+        pointee: TypeId,
+    },
 }
 
-/// One field of an aggregate type.
+/// One field of an aggregate or struct type.
 ///
-/// Field names are part of aggregate identity, but still only name the slots:
-/// instructions store and project by the slot's numeric index internally.
+/// Field names are part of aggregate identity. For structural aggregates the
+/// slots are addressed by numeric index and `offset` is informational (the
+/// running byte sum); for nominal [`StructType`]s `offset` is the field's real
+/// byte offset and is the key a [`Gep`](crate::value::insn::Gep) resolves on.
 #[derive(Clone, Debug, Hash, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct AggregateField {
     pub name: String,
     pub type_id: TypeId,
+    /// Byte offset of this field within its containing aggregate/struct.
+    pub offset: usize,
 }
 
 impl AggregateField {
+    /// Field with offset `0`. Used by structural aggregates, where the slot is
+    /// addressed by index and the offset is not consulted.
     pub fn new(name: impl Into<String>, type_id: TypeId) -> Self {
+        Self::new_at(name, type_id, 0)
+    }
+
+    /// Field at an explicit byte `offset`. Used by nominal [`StructType`]s.
+    pub fn new_at(name: impl Into<String>, type_id: TypeId, offset: usize) -> Self {
         Self {
             name: name.into(),
             type_id,
+            offset,
         }
     }
 }
@@ -288,6 +327,77 @@ impl Type for AggregateType {
     }
 }
 
+/// A named, nominal struct with explicit per-field byte offsets.
+///
+/// Unlike [`AggregateType`], identity is the **name** (not the field list), so
+/// two structs that happen to share a layout stay distinct types. Field lists
+/// are **sparse** — only the fields of interest are recorded — and `size` is the
+/// real struct size, which need not equal the fields' extent. This is the
+/// pointee of a [`StructPointer`] and the type a
+/// [`Gep`](crate::value::insn::Gep) resolves field offsets against.
+#[derive(Clone)]
+struct StructType {
+    name: String,
+    fields: Vec<AggregateField>,
+    size: usize,
+}
+
+impl Type for StructType {
+    fn size(&self) -> usize {
+        self.size
+    }
+
+    fn fields(&self) -> Option<&[AggregateField]> {
+        Some(&self.fields)
+    }
+
+    fn struct_name(&self) -> Option<&str> {
+        Some(&self.name)
+    }
+
+    fn clone_box(&self) -> Box<dyn Type> {
+        Box::new(self.clone())
+    }
+
+    fn repr(&self) -> TypeRepr {
+        TypeRepr::Struct {
+            name: self.name.clone(),
+            size: self.size,
+            fields: self.fields.clone(),
+        }
+    }
+}
+
+/// A pointer of a given byte width pointing at `pointee` (typically a nominal
+/// [`StructType`]). Carries the pointee identity so a chain of
+/// [`Gep`](crate::value::insn::Gep) + `load` can resolve successive fields.
+#[derive(Clone)]
+struct StructPointer {
+    size: usize,
+    pointee: TypeId,
+}
+
+impl Type for StructPointer {
+    fn size(&self) -> usize {
+        self.size
+    }
+
+    fn pointee(&self) -> Option<TypeId> {
+        Some(self.pointee)
+    }
+
+    fn clone_box(&self) -> Box<dyn Type> {
+        Box::new(self.clone())
+    }
+
+    fn repr(&self) -> TypeRepr {
+        TypeRepr::StructPointer {
+            size: self.size,
+            pointee: self.pointee,
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // TypeManager
 // ---------------------------------------------------------------------------
@@ -308,6 +418,10 @@ pub struct TypeManager {
     space_address: HashMap<(usize, SpaceId), TypeId>,
     /// Fast lookup: named field-type list → Aggregate TypeId.
     aggregate_by_fields: HashMap<Vec<AggregateField>, TypeId>,
+    /// Nominal lookup: struct name → StructType TypeId.
+    struct_by_name: HashMap<String, TypeId>,
+    /// Fast lookup: (size, pointee) → StructPointer TypeId.
+    struct_pointer: HashMap<(usize, TypeId), TypeId>,
 }
 
 impl Default for TypeManager {
@@ -324,6 +438,8 @@ impl TypeManager {
             stack_address: None,
             space_address: HashMap::default(),
             aggregate_by_fields: HashMap::default(),
+            struct_by_name: HashMap::default(),
+            struct_pointer: HashMap::default(),
         }
     }
 
@@ -405,6 +521,77 @@ impl TypeManager {
         }));
         self.aggregate_by_fields.insert(fields, id);
         id
+    }
+
+    /// Returns the nominal [`StructType`] named `name`, creating it if it does
+    /// not yet exist. Identity is the name: a second call with the same `name`
+    /// returns the original `TypeId` and **ignores** `size`/`fields`.
+    pub fn get_or_make_struct(
+        &mut self,
+        name: impl Into<String>,
+        size: usize,
+        fields: Vec<AggregateField>,
+    ) -> TypeId {
+        let name = name.into();
+        if let Some(&id) = self.struct_by_name.get(&name) {
+            return id;
+        }
+        let id = self.register(Box::new(StructType {
+            name: name.clone(),
+            fields,
+            size,
+        }));
+        self.struct_by_name.insert(name, id);
+        id
+    }
+
+    /// The [`TypeId`] of the nominal struct named `name`, if registered.
+    pub fn struct_by_name(&self, name: &str) -> Option<TypeId> {
+        self.struct_by_name.get(name).copied()
+    }
+
+    /// Returns the [`TypeId`] for a [`StructPointer`] of the given byte width
+    /// pointing at `pointee`, creating it if it does not yet exist.
+    pub fn get_or_make_struct_pointer(&mut self, size: usize, pointee: TypeId) -> TypeId {
+        if let Some(&id) = self.struct_pointer.get(&(size, pointee)) {
+            return id;
+        }
+        let id = self.register(Box::new(StructPointer { size, pointee }));
+        self.struct_pointer.insert((size, pointee), id);
+        id
+    }
+
+    /// The pointee type of `id`, if `id` is a [`StructPointer`].
+    pub fn pointee_of(&self, id: TypeId) -> Option<TypeId> {
+        self.get(id).pointee()
+    }
+
+    /// A short display name for `id`, used by the IR formatters in place of the
+    /// raw `i<bits>` width. Nominal structs print their name and struct pointers
+    /// print `Pointee*`; everything else (integers, stack/space addresses, and
+    /// the structural aggregates used by `argpromote`) keeps its width-based
+    /// `i<bits>` form, so existing IR/signature assertions are unaffected.
+    pub fn type_name(&self, id: TypeId) -> String {
+        match self.get(id).repr() {
+            TypeRepr::Struct { name, .. } => name,
+            TypeRepr::StructPointer { pointee, .. } => format!("{}*", self.type_name(pointee)),
+            _ => format!("i{}", self.size_of(id) * 8),
+        }
+    }
+
+    /// The name of `id`, if `id` is a nominal [`StructType`].
+    pub fn struct_name_of(&self, id: TypeId) -> Option<&str> {
+        self.get(id).struct_name()
+    }
+
+    /// The field of struct/aggregate `id` whose byte offset is exactly `offset`,
+    /// returned as `(index, field)`. Used by [`Gep`](crate::value::insn::Gep)
+    /// resolution, which matches on exact offset.
+    pub fn field_by_offset(&self, id: TypeId, offset: usize) -> Option<(usize, &AggregateField)> {
+        self.aggregate_fields(id)?
+            .iter()
+            .enumerate()
+            .find(|(_, field)| field.offset == offset)
     }
 
     /// The ordered named fields of `id`, or `None` if `id` is not an aggregate.
@@ -588,6 +775,18 @@ impl<'de> serde::Deserialize<'de> for TypeManager {
                 // so replaying in order guarantees they already exist here.
                 TypeRepr::Aggregate { fields } => {
                     manager.get_or_make_named_aggregate(fields);
+                }
+                TypeRepr::Struct {
+                    name,
+                    size,
+                    fields,
+                } => {
+                    manager.get_or_make_struct(name, size, fields);
+                }
+                // The pointee has a lower TypeId (built before the pointer),
+                // so replaying in order guarantees it already exists here.
+                TypeRepr::StructPointer { size, pointee } => {
+                    manager.get_or_make_struct_pointer(size, pointee);
                 }
             }
         }

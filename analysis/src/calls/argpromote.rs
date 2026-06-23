@@ -1101,6 +1101,14 @@ fn rewrite_callee_registers(ctx: &mut Context, fid: FunctionId, eff: &RegisterEf
         // from the register file (mem2reg's promoted-register-param naming, which
         // the emulator's `seed_entry_params` keys on).
         ctx.values.block_params[pid].name = name.clone().map(Cow::Owned);
+        ctx.values.block_params[pid].origin = Some(ValueId::Varnode(*r));
+        // Inherit a global varnode type override (e.g. `FS_OFFSET` typed
+        // `PtrTo<TEB>` by `windows_teb_seed`, which runs first) so the by-value
+        // entry param carries the ambient register's richer type rather than the
+        // default `Int(size)`.
+        if let Some(ty) = ctx.stored_type_of(ValueId::Varnode(*r)) {
+            ctx.values.block_params[pid].type_id = ty;
+        }
         seeds.push((*r, *space, ValueId::BlockParam(pid)));
     }
     if !seeds.is_empty() {

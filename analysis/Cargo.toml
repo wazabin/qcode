@@ -11,6 +11,7 @@ jstd.workspace = true
 qcode.workspace = true
 cabi.workspace = true
 serde.workspace = true
+bincode.workspace = true
 toml.workspace = true
 cpp_demangle.workspace = true
 inventory.workspace = true
@@ -19,6 +20,12 @@ rustc-hash.workspace = true
 pollster.workspace = true
 # Pure-function emulation in constant propagation runs the callee body.
 qcode_emulator.workspace = true
+
+[build-dependencies]
+serde.workspace = true
+bincode.workspace = true
+# Parse the TEB/PEB layout from `src/teb.h` at build time (same libclang dep cabi uses).
+clang.workspace = true
 
 [dev-dependencies]
 qcode = { workspace = true, features = ["testing"] }

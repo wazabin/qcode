@@ -446,7 +446,7 @@ mod tests {
     use crate::AliasResult;
     use crate::gvn::gvn;
     use qcode::value::{
-        BasicBlock,
+        BasicBlock, Function,
         insn::{Sext, Zext},
     };
     use qcode_macro::qcode;
@@ -491,6 +491,184 @@ mod tests {
         };
         assert_eq!(ctx.types.size_of(ctx.values.literals[lid].type_id), 4);
         assert_eq!(ctx.values.literals[lid].value, 0xff);
+    }
+
+    /// Constant-folding `StructPointer + Int` (the shape `windows_teb_seed`
+    /// creates: a `TEB*`-typed base plus a field offset). Must fold to the sum
+    /// without panicking on the non-integer pointer operand, and the result must
+    /// keep the pointer type so struct typing can still recognize it downstream.
+    #[test]
+    fn constant_folding_on_pointer_addition() {
+        let mut ctx = Context::new();
+        let teb = ctx.types.get_or_make_struct("TEB", 0x1000, vec![]);
+        let teb_ptr = ctx.types.get_or_make_struct_pointer(4, teb);
+        let base = ctx
+            .values
+            .get_or_make_typed_literal(0x7ffd_f000, teb_ptr, 4);
+        let base = ValueId::Literal(base);
+        let offset = ctx.get_const(0x30, 4).id();
+
+        let folded = constant_folding(
+            &mut ctx,
+            &Mnemonic::Binop(Binary {
+                op: Binop::Int(IntBinop::Add),
+                lhs: base,
+                rhs: offset,
+            }),
+            4,
+        );
+
+        let folded_id = folded.expect("TEB* + Int should constant-fold");
+        let ValueId::Literal(lid) = folded_id else {
+            panic!("folded result must be a literal");
+        };
+        assert_eq!(ctx.values.literals[lid].value, 0x7ffd_f030);
+        assert_eq!(
+            ctx.values.literals[lid].type_id, teb_ptr,
+            "folded TEB* + Int must preserve the struct-pointer type"
+        );
+    }
+
+    /// The offset feeding a struct-pointer add must still constant-fold. Models
+    /// the real `fs:[c]` shape where `c` is a foldable expression (`0x31 + 0x32`)
+    /// rather than a bare literal, and the base is a `TEB*`-typed varnode. The
+    /// pointer-typed add (`teb + c`) must not suppress folding of its int offset.
+    #[test]
+    fn typed_pointer_add_does_not_suppress_folding_its_offset() {
+        use crate::gvn::gvn_function;
+
+        let mut ctx = Context::new();
+        qcode!(
+            ctx,
+            "
+            fn f:
+                <entry>
+                    varnode i32 fs;
+                    %c = i32 0x31 + i32 0x32;
+                    %addr = &fs + %c;
+                    %v = load(i32, %addr);
+                    return [i32 0];
+            "
+        );
+        // Type `fs` as a struct pointer, exactly as `windows_teb_seed` does.
+        let teb = ctx.types.get_or_make_struct("TEB", 0x1000, vec![]);
+        let teb_ptr = ctx.types.get_or_make_struct_pointer(4, teb);
+        ctx.set_varnode_type(fs, teb_ptr);
+
+        let aliases = AliasResult::simple(&ctx);
+        gvn_function(&mut ctx, f, Some(&aliases));
+
+        // `0x31 + 0x32` must fold to 0x63 — so the address add reads `fs + 0x63`,
+        // the canonical `base + const` shape struct typing needs.
+        let addr_rhs = Function::from_id(&ctx, f)
+            .blocks()
+            .flat_map(|b| b.iter().collect::<Vec<_>>())
+            .find_map(|i| match i.mnemonic() {
+                Mnemonic::Binop(Binary { rhs, op: Binop::Int(IntBinop::Add), .. }) => Some(rhs),
+                _ => None,
+            })
+            .expect("an add survives");
+        assert_eq!(
+            const_value(&ctx, *addr_rhs),
+            Some(0x63),
+            "the offset feeding the TEB* add must fold to 0x63"
+        );
+    }
+
+    /// The byte-assembly idiom `zext(b0) | (zext(b1) << 8) | …` over constant
+    /// bytes must fold to the assembled constant. This is how the test binary
+    /// builds the `fs:[c]` offset; if it stays unfolded, struct typing can never
+    /// match a constant field offset.
+    #[test]
+    fn byte_assembly_of_constants_folds() {
+        use crate::gvn::gvn_function;
+
+        let mut ctx = Context::new();
+        qcode!(
+            ctx,
+            "
+            fn f:
+                <entry>
+                    varnode i32 sink;
+                    %b0 = zext(i32, i8 0x30);
+                    %b1 = zext(i32, i8 0x0);
+                    %s1 = %b1 << i32 0x8;
+                    %o1 = %b0 | %s1;
+                    %b2 = zext(i32, i8 0x0);
+                    %s2 = %b2 << i32 0x10;
+                    %o2 = %o1 | %s2;
+                    store(&sink, %o2);
+                    return [i32 0];
+            "
+        );
+
+        let aliases = AliasResult::simple(&ctx);
+        gvn_function(&mut ctx, f, Some(&aliases));
+
+        // The stored value must be the folded constant 0x30.
+        let stored = Function::from_id(&ctx, f)
+            .blocks()
+            .flat_map(|b| b.iter().collect::<Vec<_>>())
+            .find_map(|i| match i.mnemonic() {
+                Mnemonic::Store(s) => Some(s.src),
+                _ => None,
+            })
+            .expect("a store survives");
+        assert_eq!(
+            const_value(&ctx, stored),
+            Some(0x30),
+            "the byte-assembly chain must fold to 0x30"
+        );
+    }
+
+    /// Faithful reproduction of the test binary's `fs:[c]` shape: the offset
+    /// byte is written by a narrow store overwriting a wider one, read back,
+    /// zext-assembled, then added to a `TEB*`-typed base — all in one function.
+    /// The forwarded byte must fold so the address add reads `fs + 0x30`.
+    #[test]
+    fn forwarded_byte_offset_to_typed_pointer_folds() {
+        use crate::gvn::gvn_function;
+
+        let mut ctx = Context::new();
+        qcode!(
+            ctx,
+            "
+            fn f:
+                <entry>
+                    varnode i32 fs;
+                    varnode i32 slot;
+                    store(&slot, i32 0x1f1e1d2c);
+                    store(&slot, i8 0x30);
+                    %lo = load(i8, &slot);
+                    %b0 = zext(i32, %lo);
+                    %b1 = zext(i32, i8 0x0);
+                    %s1 = %b1 << i32 0x8;
+                    %off = %b0 | %s1;
+                    %addr = &fs + %off;
+                    %v = load(i32, %addr);
+                    return [i32 0];
+            "
+        );
+        let teb = ctx.types.get_or_make_struct("TEB", 0x1000, vec![]);
+        let teb_ptr = ctx.types.get_or_make_struct_pointer(4, teb);
+        ctx.set_varnode_type(fs, teb_ptr);
+
+        let aliases = AliasResult::simple(&ctx);
+        gvn_function(&mut ctx, f, Some(&aliases));
+
+        let addr_rhs = Function::from_id(&ctx, f)
+            .blocks()
+            .flat_map(|b| b.iter().collect::<Vec<_>>())
+            .find_map(|i| match i.mnemonic() {
+                Mnemonic::Binop(Binary { rhs, op: Binop::Int(IntBinop::Add), .. }) => Some(*rhs),
+                _ => None,
+            })
+            .expect("an add survives");
+        assert_eq!(
+            const_value(&ctx, addr_rhs),
+            Some(0x30),
+            "the forwarded byte offset feeding the TEB* add must fold to 0x30"
+        );
     }
 
     #[test]
