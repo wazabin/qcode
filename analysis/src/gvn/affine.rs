@@ -89,10 +89,14 @@ fn mask_for(width: usize) -> u64 {
     }
 }
 
-/// Interpret `value` as signed at `width` bytes.
+/// Interpret `value` as signed at `width` bytes. A zero-width value (a
+/// result-less instruction such as a store) has no meaningful magnitude — its
+/// sign is zero — which keeps the shift below well-defined.
 fn signed(value: u64, width: usize) -> i64 {
     let bits = width * 8;
-    if bits >= 64 {
+    if bits == 0 {
+        0
+    } else if bits >= 64 {
         value as i64
     } else {
         ((value << (64 - bits)) as i64) >> (64 - bits)

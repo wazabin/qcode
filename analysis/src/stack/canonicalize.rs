@@ -61,22 +61,34 @@ pub fn canonicalize_sp_slots(ctx: &mut Context, fid: FunctionId, sp_reg: Varnode
     let ptr_width = Varnode::from_id(&*ctx, sp_reg).size();
     let offsets: BTreeSet<i64> = ptr_offset.values().copied().collect();
 
-    // One representative per offset, materialized at the entry block (which
-    // dominates every use). Offset 0 is `@SP` itself.
+    // Reuse a prior run's representatives so this pass is idempotent: the first
+    // root-block `@SP ± N` instruction per offset (in program order) dominates
+    // every use of that slot. Offset 0 is `@SP` itself.
     let mut repr: HashMap<i64, ValueId> = HashMap::new();
-    {
+    if offsets.contains(&0) {
+        repr.insert(0, sp_param);
+    }
+    for insn in Function::from_id(&*ctx, fid).root().unwrap().iter() {
+        let v = ValueId::Instruction(insn.id);
+        if let Some((base, off)) = numbering.base_offset(v)
+            && base == sp_param
+            && offsets.contains(&off)
+        {
+            repr.entry(off).or_insert(v);
+        }
+    }
+
+    // Materialize the rest at the entry-block start (which dominates everything).
+    let missing: Vec<i64> = offsets.iter().copied().filter(|o| !repr.contains_key(o)).collect();
+    if !missing.is_empty() {
         let mut b = Builder::from_block(BasicBlock::from_id_mut(ctx, root));
         b.set_insert_point_to_start();
-        for &off in &offsets {
-            let rep = if off == 0 {
-                sp_param
+        for off in missing {
+            let mag = b.context_mut().get_const(off.unsigned_abs(), ptr_width).id();
+            let rep = if off > 0 {
+                b.push_add(sp_param, mag).id()
             } else {
-                let mag = b.context_mut().get_const(off.unsigned_abs(), ptr_width).id();
-                if off > 0 {
-                    b.push_add(sp_param, mag).id()
-                } else {
-                    b.push_sub(sp_param, mag).id()
-                }
+                b.push_sub(sp_param, mag).id()
             };
             repr.insert(off, rep);
         }
@@ -85,13 +97,15 @@ pub fn canonicalize_sp_slots(ctx: &mut Context, fid: FunctionId, sp_reg: Varnode
 
     // Point every occurrence at its representative; the now-dead per-site
     // address instructions are reclaimed by DCE.
+    let mut changed = false;
     for (ptr, off) in ptr_offset {
         let rep = repr[&off];
         if ptr != rep {
             ctx.replace_all_uses_with(ptr, rep);
+            changed = true;
         }
     }
-    true
+    changed
 }
 
 #[cfg(test)]
@@ -153,5 +167,13 @@ mod tests {
             ptr_of(&tc, l1),
             "both loads share one representative pointer for slot -8"
         );
+
+        // Idempotent: a second run reuses the representative and reports no change.
+        let shared = ptr_of(&tc, l0);
+        assert!(
+            !canonicalize_sp_slots(&mut tc.ctx, fid, sp_reg),
+            "second run must be a no-op"
+        );
+        assert_eq!(ptr_of(&tc, l0), shared, "representative is stable across runs");
     }
 }
