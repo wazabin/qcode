@@ -385,13 +385,16 @@ impl Pipeline {
     ) -> Result<(), String> {
         let end = self.barrier_index().unwrap_or(self.stages.len());
         let mut dirty_functions = Some(HashSet::new());
+        let mut cache = FixpointCache::default();
         for stage in &self.stages[..end] {
             match &stage.passes {
                 StagePasses::Module(passes) => {
+                    let before = cache.snapshot_clean(ctx);
                     if run_lifting_module_stage(ctx, env, services, stage, passes, round, progress)?
                     {
                         dirty_functions = None;
                     }
+                    cache.invalidate_changed(ctx, before);
                 }
                 StagePasses::Function(passes) => {
                     dirty_functions = Some(run_function_stage(
@@ -400,6 +403,7 @@ impl Pipeline {
                         stage,
                         passes,
                         dirty_functions.as_ref(),
+                        &mut cache,
                         round,
                         progress,
                     )?);
@@ -426,6 +430,7 @@ impl Pipeline {
     ) -> Result<(), String> {
         let start = self.barrier_index().map(|i| i + 1).unwrap_or(0);
         let mut dirty_functions = Some(HashSet::new());
+        let mut cache = FixpointCache::default();
         for stage in &self.stages[start..] {
             match &stage.passes {
                 StagePasses::Function(passes) => {
@@ -437,6 +442,7 @@ impl Pipeline {
                         stage,
                         passes,
                         dirty_functions.as_ref(),
+                        &mut cache,
                         round,
                         progress,
                     )?);
@@ -459,12 +465,17 @@ impl Pipeline {
         progress: &mut impl FnMut(PipelineProgress),
     ) -> Result<(), String> {
         let mut dirty_functions = Some(HashSet::new());
+        let mut cache = FixpointCache::default();
         for stage in &self.stages[range] {
             match &stage.passes {
                 StagePasses::Module(passes) => {
+                    // Fingerprint the clean functions, run the stage, then invalidate
+                    // only those the stage actually modified (see `snapshot_clean`).
+                    let before = cache.snapshot_clean(ctx);
                     if run_module_stage(ctx, env, stage, passes, round, progress)? {
                         dirty_functions = None;
                     }
+                    cache.invalidate_changed(ctx, before);
                 }
                 StagePasses::Function(passes) => {
                     dirty_functions = Some(run_function_stage(
@@ -473,6 +484,7 @@ impl Pipeline {
                         stage,
                         passes,
                         dirty_functions.as_ref(),
+                        &mut cache,
                         round,
                         progress,
                     )?);
@@ -643,6 +655,95 @@ fn run_lifting_module_stage(
     }
 }
 
+/// Per-`(function, pass)` fixpoint memo for a single pipeline run.
+///
+/// Once a function-scoped pass returns "no change" on a function, it has reached a
+/// fixpoint there and is skipped on that function until some *other* pass modifies
+/// the function. The default pipeline runs `gvn`/`dead_store`/`dce` in several
+/// separate stages; without this, each stage re-runs every pass on every function
+/// even when nothing has touched the function since — the bulk of the per-function
+/// pass time.
+///
+/// Scope is one pipeline run (`Pipeline::run` builds a fresh cache). The
+/// checkpoint+replay driver re-clones clean IR each round, so the cache naturally
+/// resets between rounds — preserving the invariant that no pass ever sees its own
+/// output across rounds.
+#[derive(Default)]
+struct FixpointCache {
+    /// Bumped whenever a pass reports it modified a function; a clean-mark recorded
+    /// at an older generation no longer counts as clean.
+    generation: HashMap<FunctionId, u64>,
+    /// `(function, pass)` → the function generation at which the pass last reported
+    /// no change.
+    clean: HashMap<(FunctionId, &'static str), u64>,
+}
+
+impl FixpointCache {
+    fn generation_of(&self, f: FunctionId) -> u64 {
+        self.generation.get(&f).copied().unwrap_or(0)
+    }
+
+    /// True if `pass` already reached a fixpoint on `f` and `f` is unchanged since.
+    fn is_clean(&self, f: FunctionId, pass: &'static str) -> bool {
+        self.clean.get(&(f, pass)).copied() == Some(self.generation_of(f))
+    }
+
+    /// Record that `pass` reached a fixpoint on `f` at its current generation.
+    fn mark_clean(&mut self, f: FunctionId, pass: &'static str) {
+        let g = self.generation_of(f);
+        self.clean.insert((f, pass), g);
+    }
+
+    /// Record that a pass modified `f`, invalidating every pass's clean-mark for it
+    /// (their recorded generation no longer matches).
+    fn mark_dirty(&mut self, f: FunctionId) {
+        *self.generation.entry(f).or_insert(0) += 1;
+    }
+
+    /// The functions that currently hold at least one fixpoint mark — the only ones
+    /// a module stage could wrongly let us skip, so the only ones worth fingerprinting.
+    fn clean_function_ids(&self) -> HashSet<FunctionId> {
+        self.clean.keys().map(|(f, _)| *f).collect()
+    }
+
+    /// Fingerprint every currently-clean function before a module stage runs.
+    ///
+    /// A module pass may touch *any* function, and the interprocedural milestones
+    /// (`bind_args`, `seed_clobbers`, `summaries`) rewrite IR while reporting
+    /// `Ok(false)` — so we cannot trust the stage's change flag. Instead we diff a
+    /// cheap per-function fingerprint across the stage and invalidate only the
+    /// functions that actually moved (a module stage *can* dirty everything, but
+    /// usually rewrites a handful of call sites). Cost scales with the marks held,
+    /// not the program size.
+    fn snapshot_clean(&self, ctx: &Context) -> Vec<(FunctionId, u64)> {
+        self.clean_function_ids()
+            .into_iter()
+            .map(|f| (f, function_fingerprint(ctx, f)))
+            .collect()
+    }
+
+    /// Invalidate exactly the functions whose fingerprint changed since
+    /// [`snapshot_clean`](Self::snapshot_clean).
+    fn invalidate_changed(&mut self, ctx: &Context, before: Vec<(FunctionId, u64)>) {
+        for (f, old) in before {
+            if function_fingerprint(ctx, f) != old {
+                self.mark_dirty(f);
+            }
+        }
+    }
+}
+
+/// A cheap structural fingerprint of one function's body, used to detect whether a
+/// module stage modified it. Rendering the IR captures operand rewrites,
+/// insertions/removals, and CFG edits; block order is address-sorted (deterministic)
+/// so an unchanged function fingerprints identically across a stage.
+fn function_fingerprint(ctx: &Context, fun_id: FunctionId) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    FunctionRef::from_id(ctx, fun_id).to_string().hash(&mut hasher);
+    hasher.finish()
+}
+
 /// Run a function-scoped stage function-major: for each non-external function,
 /// run the stage's passes; if `repeat_until` is set, loop that function's passes
 /// to a fixpoint before moving to the next function.
@@ -652,6 +753,7 @@ fn run_function_stage(
     stage: &Stage,
     passes: &[Box<dyn DynFunctionPass>],
     previous_dirty: Option<&HashSet<FunctionId>>,
+    cache: &mut FixpointCache,
     round: usize,
     progress: &mut impl FnMut(PipelineProgress),
 ) -> Result<HashSet<FunctionId>, String> {
@@ -677,6 +779,12 @@ fn run_function_stage(
         loop {
             let mut changed = false;
             for p in passes {
+                // Skip a pass that already reached a fixpoint on this function and
+                // has not been dirtied since (by an earlier pass this iteration, a
+                // prior stage, or — via `invalidate_all` — a module pass).
+                if cache.is_clean(fun_id, p.name()) {
+                    continue;
+                }
                 progress(PipelineProgress::FunctionPass {
                     round,
                     stage: stage_name.clone(),
@@ -691,6 +799,12 @@ fn run_function_stage(
                 let pass_changed = p
                     .run(ctx, fun_id, env)
                     .map_err(|e| format!("{}: {e}", p.name()))?;
+                if pass_changed {
+                    // The function moved: invalidate every pass's fixpoint mark.
+                    cache.mark_dirty(fun_id);
+                } else {
+                    cache.mark_clean(fun_id, p.name());
+                }
                 let entry = elapsed.entry(p.name()).or_default();
                 #[cfg(not(target_arch = "wasm32"))]
                 {
