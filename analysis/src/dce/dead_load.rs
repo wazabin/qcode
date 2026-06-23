@@ -60,6 +60,92 @@ pub(crate) fn is_tracked_space(ctx: &Context, space_id: SpaceId) -> bool {
     is_reg_space(ctx, space_id) || is_temp_space(ctx, space_id)
 }
 
+/// Decompose `ptr` into `(base, byte_offset)` by peeling literal `+`/`-` terms,
+/// so `base + 8` and `base` (decomposing to the same `base`) can be compared
+/// by their static offset. A pointer with no recognizable arithmetic is its own
+/// base at offset 0. Mirrors `gvn::affine::base_offset` but is self-contained
+/// (no `Numbering`) and used only for disjointness, where over-conservatism is
+/// always safe.
+fn base_plus_offset(ctx: &Context, ptr: ValueId) -> (ValueId, i64) {
+    use qcode::value::insn::{Binop, IntBinop};
+    let mut cur = ptr;
+    let mut acc = 0i64;
+    // Bound the walk so a malformed cyclic graph can't loop forever.
+    for _ in 0..64 {
+        let ValueId::Instruction(id) = cur else { break };
+        let Mnemonic::Binop(b) = ctx.get_insn(id).mnemonic() else {
+            break;
+        };
+        let (op, lhs, rhs) = (b.op, b.lhs, b.rhs);
+        let lit = |v: ValueId| match v {
+            ValueId::Literal(lid) => Some(ctx.values.literals[lid].value as i64),
+            _ => None,
+        };
+        match op {
+            Binop::Int(IntBinop::Add) => {
+                if let Some(c) = lit(rhs) {
+                    acc += c;
+                    cur = lhs;
+                } else if let Some(c) = lit(lhs) {
+                    acc += c;
+                    cur = rhs;
+                } else {
+                    break;
+                }
+            }
+            Binop::Int(IntBinop::Sub) => {
+                if let Some(c) = lit(rhs) {
+                    acc -= c;
+                    cur = lhs;
+                } else {
+                    break;
+                }
+            }
+            _ => break,
+        }
+    }
+    (cur, acc)
+}
+
+/// The base a pointer is anchored to, for offset-precise disjointness.
+/// `Absolute` is a literal (global) address — all literals share one base, so
+/// they compare purely by offset. `Sym` is an opaque SSA base value; two `Sym`s
+/// compare only when they are the *same* value.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum AddrBase {
+    Absolute,
+    Sym(ValueId),
+}
+
+/// Decompose `ptr` into `(base, byte_offset)`, folding a literal base into an
+/// `Absolute` anchor so `0x1000` and `p + 4` are each described precisely.
+fn addr_key(ctx: &Context, ptr: ValueId) -> (AddrBase, i64) {
+    if let ValueId::Literal(lid) = ptr {
+        return (AddrBase::Absolute, ctx.values.literals[lid].value as i64);
+    }
+    let (base, off) = base_plus_offset(ctx, ptr);
+    match base {
+        ValueId::Literal(lid) => (AddrBase::Absolute, ctx.values.literals[lid].value as i64 + off),
+        other => (AddrBase::Sym(other), off),
+    }
+}
+
+/// True when `store` (a store of `store_size` bytes at `store_ptr`) provably does
+/// not overlap any `load` at `load_ptr`/`load_size`: they share a comparable base
+/// (both absolute, or the same symbolic base) and their byte ranges are disjoint.
+/// Incomparable bases conservatively count as a possible overlap (not disjoint).
+fn disjoint_access(
+    ctx: &Context,
+    store_ptr: ValueId,
+    store_size: usize,
+    load_ptr: ValueId,
+    load_size: usize,
+) -> bool {
+    let (sb, so) = addr_key(ctx, store_ptr);
+    let (lb, lo) = addr_key(ctx, load_ptr);
+    sb == lb && !intervals_overlap((so, so + store_size as i64), (lo, lo + load_size as i64))
+}
+
 fn ptr_offset(ctx: &Context, ptr: ValueId) -> Option<i64> {
     match ptr {
         ValueId::Varnode(id) => Some(Varnode::from_id(ctx, id).address()),
@@ -367,43 +453,35 @@ pub fn remove_dead_load_insns_block(
     }
 }
 
+/// A temp-space load: the space it reads, its pointer, and byte size.
+type TempLoad = (SpaceId, ValueId, usize);
+/// A candidate temp-space store: its instruction, space, pointer, and byte size.
+type TempStore = (InstructionId, SpaceId, ValueId, usize);
+
 /// Returns stores to temp/mysave spaces (not Register, not default RAM) from
 /// which no load ever reads within `function_id`. These stores are dead because
 /// the temp spaces are function-scoped and not observable outside.
 ///
-/// When a store's pointer is a known literal, the check is address-precise:
-/// the store is dead only if no load in the function reads from an overlapping
-/// byte range in the same space. When the pointer is not a literal, the check
-/// falls back to space-level coarseness (dead only if the space has no loads).
-/// (insn_id, space_id, Some(start, end) if the store address is a literal).
-type CandidateStore = (InstructionId, SpaceId, Option<(i64, i64)>);
-
+/// The check is offset-precise: a store is dead only if every load in the same
+/// space is provably disjoint from it ([`disjoint_access`]). This covers both
+/// literal (global) addresses and symbolic `base + const` addresses sharing a
+/// common base — the latter is what argpromote's shadow accesses look like, so a
+/// store to one field of a base is removable even when another, disjoint field of
+/// the same base is still loaded. A load on an *incomparable* base conservatively
+/// keeps the store.
 fn unread_temp_space_stores(ctx: &Context, function_id: FunctionId) -> HashSet<InstructionId> {
     let fun = Function::from_id(ctx, function_id);
-    let mut loaded_spaces: HashSet<SpaceId> = HashSet::default();
-    // (space_id, byte_start, byte_end) for loads with known literal addresses
-    let mut loaded_intervals: Vec<(SpaceId, i64, i64)> = Vec::new();
-    // (insn_id, space_id, Some(start, end) if address is a literal)
-    let mut candidate_stores: Vec<CandidateStore> = Vec::new();
+    let mut loads: Vec<TempLoad> = Vec::new();
+    let mut candidate_stores: Vec<TempStore> = Vec::new();
 
     for block in &fun {
         for &insn_id in block.instruction_ids() {
             match ctx.get_insn(insn_id).mnemonic() {
                 Mnemonic::Load(load) if is_temp_space(ctx, load.space) => {
-                    loaded_spaces.insert(load.space);
-                    if let ValueId::Literal(lid) = load.ptr {
-                        let addr = ctx.values.literals[lid].value as i64;
-                        loaded_intervals.push((load.space, addr, addr + load.size as i64));
-                    }
+                    loads.push((load.space, load.ptr, load.size));
                 }
                 Mnemonic::Store(store) if is_temp_space(ctx, store.space) => {
-                    let interval = if let ValueId::Literal(lid) = store.ptr {
-                        let addr = ctx.values.literals[lid].value as i64;
-                        Some((addr, addr + store.size as i64))
-                    } else {
-                        None
-                    };
-                    candidate_stores.push((insn_id, store.space, interval));
+                    candidate_stores.push((insn_id, store.space, store.ptr, store.size));
                 }
                 _ => {}
             }
@@ -412,13 +490,12 @@ fn unread_temp_space_stores(ctx: &Context, function_id: FunctionId) -> HashSet<I
 
     candidate_stores
         .into_iter()
-        .filter(|(_, space_id, interval)| match interval {
-            Some((start, end)) => !loaded_intervals.iter().any(|(ls, ls_start, ls_end)| {
-                ls == space_id && *ls_start < *end && *start < *ls_end
-            }),
-            None => !loaded_spaces.contains(space_id),
+        .filter(|&(_, space, sptr, ssize)| {
+            !loads.iter().any(|&(lspace, lptr, lsize)| {
+                lspace == space && !disjoint_access(ctx, sptr, ssize, lptr, lsize)
+            })
         })
-        .map(|(id, _, _)| id)
+        .map(|(id, _, _, _)| id)
         .collect()
 }
 
@@ -628,6 +705,97 @@ mod tests {
         assert!(
             !dead.contains(&load_ids[0]),
             "used load must not be eliminated"
+        );
+    }
+
+    /// Build a one-block function with a temp ("shadow") space modeling what
+    /// argpromote leaves behind: `base` is an opaque pointer value (a register
+    /// load), `store(base + store_off, _)` writes the shadow, and
+    /// `v = load(base + load_off)` reads it back into a register (keeping the
+    /// load live). Returns `(ctx, function, shadow_store_id)`.
+    fn argpromote_shadow_fn(
+        store_off: i64,
+        load_off: i64,
+    ) -> (Context<'static>, FunctionId, InstructionId) {
+        use qcode::builder::Builder;
+        let mut tc = TestContext::new();
+        let shadow = tc.ctx.make_temp_space();
+        let regsp = tc.reg_space;
+        let r1 = tc.r1;
+
+        let block_id = BasicBlock::make(&mut tc.ctx).id;
+        let fid = {
+            let mut f = Function::make(&mut tc.ctx, "f".into()).unwrap();
+            f.add_block(block_id);
+            f.id
+        };
+
+        let offset_ptr = |b: &mut Builder<'static, '_>, base: ValueId, off: i64| {
+            if off == 0 {
+                base
+            } else {
+                let c = b.context_mut().get_const(off as u64, 8).id();
+                ValueId::Instruction(b.push_add(base, c).id)
+            }
+        };
+        {
+            let mut b = Builder::from_block(BasicBlock::from_id_mut(&mut tc.ctx, block_id));
+            let base = b.push_load::<false>(ValueId::Varnode(r1), 8, regsp).id();
+            let store_ptr = offset_ptr(&mut b, base, store_off);
+            let five = b.context_mut().get_const(5, 4).id();
+            b.push_store(five, store_ptr, shadow);
+            let load_ptr = offset_ptr(&mut b, base, load_off);
+            let v = b.push_load::<false>(load_ptr, 4, shadow).id();
+            b.push_store(v, ValueId::Varnode(r1), regsp);
+            unsafe { b.dont_finalize() };
+        }
+        let store_id = BasicBlock::from_id(&tc.ctx, block_id)
+            .instruction_ids()
+            .iter()
+            .copied()
+            .find(|&id| {
+                matches!(tc.ctx.get_insn(id).mnemonic(),
+                    Mnemonic::Store(s) if is_temp_space(&tc.ctx, s.space))
+            })
+            .unwrap();
+        (tc.ctx, fid, store_id)
+    }
+
+    /// Regression for argpromote leftover shadow stores: a store into a
+    /// function-scoped temp space is dead at the function's exit, so a store to
+    /// one offset of a base is removable even when a *disjoint* offset of the
+    /// same base is still loaded. Before the offset-precise check this was kept,
+    /// because the coarse "space has a load" fallback could not tell the two
+    /// `base + const` addresses apart.
+    #[test]
+    fn temp_store_dead_when_only_disjoint_offset_is_read() {
+        // store base+0 (4 bytes), load base+8 (4 bytes): disjoint => dead.
+        let (mut ctx, fid, store_id) = argpromote_shadow_fn(0, 8);
+        assert!(
+            unread_temp_space_stores(&ctx, fid).contains(&store_id),
+            "temp-space store to base+0 is dead when only base+8 is read"
+        );
+        let aliases = AliasResult::simple(&ctx);
+        assert!(
+            remove_dead_load_insns(&mut ctx, fid, Some(&aliases), &[]),
+            "the dead shadow store should be removed end-to-end"
+        );
+        assert!(
+            ctx.get_insn(store_id).parent().is_none(),
+            "the dead shadow store is gone after DSE"
+        );
+    }
+
+    /// Guard: the same store must be kept when the surviving load *does* overlap
+    /// it (same base, overlapping byte range), so the offset-precise rule never
+    /// drops a store whose value is still observed.
+    #[test]
+    fn temp_store_kept_when_overlapping_offset_is_read() {
+        // store base+0 (4 bytes), load base+2 (4 bytes): ranges overlap => live.
+        let (ctx, fid, store_id) = argpromote_shadow_fn(0, 2);
+        assert!(
+            !unread_temp_space_stores(&ctx, fid).contains(&store_id),
+            "temp-space store must be kept when an overlapping offset is read"
         );
     }
 

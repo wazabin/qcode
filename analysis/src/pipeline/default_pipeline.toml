@@ -228,10 +228,19 @@ repeat_until = "no_change"
 # ran before all of that, so a final pass folds these chains into single
 # `@RSP - N` slots (and CSEs them against the prologue's slots). DCE clears the
 # arithmetic this makes dead.
+#
+# `gvn` here also forwards the argpromote shadow stores into the loads that read
+# them back (e.g. into the returned write-set `pack`), which `dce` then deletes —
+# leaving the shadow stores with no remaining reader. That forwarding happens
+# only at this late point, after argpromote-cleanup's own `dead_store` has run,
+# so a final `dead_store` is needed to sweep the now-unread temp-space stores
+# (`unread_temp_space_stores`). It runs after `dce` so the forwarded loads are
+# already gone when it scans for readers; the trailing `dce` clears the address
+# arithmetic the removed stores leave behind.
 [[stage]]
 name = "final-canonicalize"
 scope = "function"
-passes = ["gvn", "dce"]
+passes = ["gvn", "dce", "dead_store", "dce"]
 
 [[stage]]
 name = "cleanup"
