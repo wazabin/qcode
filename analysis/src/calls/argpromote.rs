@@ -4,12 +4,13 @@
 //! Some functions mutate memory through pointer parameters (and globals). This
 //! pass rewrites such a function so it has no side effects: it operates on a
 //! private *shadow* copy of memory and *returns the writes it made* as data —
-//! a tuple of `(address, value)` pairs — which the caller replays:
+//! a flat aggregate of interleaved `address, value` fields — which the caller
+//! replays:
 //!
 //! ```text
 //!   void f(int *p, int *q) { *q = 100; *p += 1; }
-//!     callee:  f(p_ptr, q_ptr, p)  ->  return ((q_ptr, 100), (p_ptr, p + 1))
-//!     caller:  r = f(&x, &x, x);  store(&x, r.0); store(&x, r.1)
+//!     callee:  f(p_ptr, q_ptr, p)  ->  return (q_ptr, 100, p_ptr, p + 1)
+//!     caller:  r = f(&x, &x, x);  store(r.w0_addr, r.w0_value); store(r.w1_addr, r.w1_value)
 //! ```
 //!
 //! ## Why aliasing is handled
@@ -519,10 +520,12 @@ fn apply(
             let mut fields = base_fields;
             for (i, (addr, size)) in write_targets.iter().enumerate() {
                 let v = b.push_load::<false>(*addr, *size, shadow).id();
-                let pair = b
-                    .push_named_tuple(vec![("addr".to_owned(), *addr), ("value".to_owned(), v)])
-                    .id;
-                fields.push((format!("write{}", i + 1), ValueId::Instruction(pair)));
+                // Flat, interleaved `(addr, value)` per write — not a nested pair.
+                // Separate top-level fields let `partial_inline` recompute either
+                // half at the caller independently (the address is usually the
+                // pointer arg, so it inlines away while a computed value rides on).
+                fields.push((format!("write{}_addr", i + 1), *addr));
+                fields.push((format!("write{}_value", i + 1), v));
             }
             ValueId::Instruction(b.push_named_tuple(fields).id)
         };
@@ -587,11 +590,12 @@ fn apply(
         let mut b = Builder::from_block(BasicBlock::from_id_mut(ctx, cont));
         b.set_insert_point_to_start();
         for i in 0..n_writes {
-            // Our memory pairs sit *after* the register channel's `base_len`
-            // output fields in the shared aggregate (see the return rewrite).
-            let pair = ValueId::Instruction(b.push_extract(result, base_len + i).id);
-            let addr = ValueId::Instruction(b.push_extract(pair, 0).id);
-            let val = ValueId::Instruction(b.push_extract(pair, 1).id);
+            // Our memory `(addr, value)` fields are flat and interleaved, sitting
+            // *after* the register channel's `base_len` output fields in the shared
+            // aggregate (see the return rewrite): write `i` is at `base_len + 2*i`
+            // (addr) and `base_len + 2*i + 1` (value).
+            let addr = ValueId::Instruction(b.push_extract(result, base_len + 2 * i).id);
+            let val = ValueId::Instruction(b.push_extract(result, base_len + 2 * i + 1).id);
             b.push_store(val, addr, ram);
         }
     }
@@ -1635,8 +1639,9 @@ mod tests {
         );
         assert_eq!(
             register_writeset_len(&tc, f),
-            Some(2),
-            "the memory pair is appended after the register field, not clobbering it"
+            Some(3),
+            "the memory write's flat addr+value fields are appended after the \
+             register field, not clobbering it"
         );
         assert_eq!(
             replayed_stores(&tc, call_id),

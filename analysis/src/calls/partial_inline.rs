@@ -202,18 +202,15 @@ fn try_partial_inline(ctx: &mut Context, fid: FunctionId) -> bool {
     // Only the *register* arguments a caller passes positionally in `Call.args`
     // are reconstructible inline inputs. They occupy the leading params (added by
     // `argpromote_registers` before any stack-passed param), so the number of
-    // such inputs is the `Call.args` length — taken as the minimum across call
-    // sites, the prefix every caller is guaranteed to supply. Params beyond it
+    // such inputs is the `Call.args` length. Every direct call site supplies the
+    // same arg count — `verify_pure_reg_call_args` enforces that each equals the
+    // callee's root param count — so any one site gives it. Params beyond it
     // (stack-passed arguments, with no `Call.args` slot) are *not* inputs and a
     // field reading one is left on the return.
-    let n_inputs = call_sites
-        .iter()
-        .map(|&c| match ctx.get_insn(c).mnemonic() {
-            Mnemonic::Call(call) => call.args.len(),
-            _ => 0,
-        })
-        .min()
-        .unwrap_or(0);
+    let n_inputs = match ctx.get_insn(call_sites[0]).mnemonic() {
+        Mnemonic::Call(call) => call.args.len(),
+        _ => 0,
+    };
     let inputs: HashMap<ValueId, usize> = BasicBlock::from_id(ctx, root)
         .params()
         .take(n_inputs)
