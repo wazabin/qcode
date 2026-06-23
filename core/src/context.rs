@@ -614,10 +614,21 @@ impl<'str> Context<'str> {
             }
         }
 
+        // Drop this instruction's old call edge (if it was a direct call) before
+        // overwriting the mnemonic; the new one's edge is recorded below.
+        if let Some(target) = self.values.instructions[id].mnemonic().call_target()
+            && let Some(sites) = self.values.call_sites.get_mut(&target)
+        {
+            sites.retain(|&site| site != id);
+        }
+
         *Instruction::from_id_mut(self, id).mnemonic_mut() = mnemonic;
 
         for arg in self.values.instructions[id].mnemonic().args() {
             self.values.users.entry(arg).or_default().push(id);
+        }
+        if let Some(target) = self.values.instructions[id].mnemonic().call_target() {
+            self.values.call_sites.entry(target).or_default().push(id);
         }
     }
 
@@ -1076,6 +1087,41 @@ mod tests {
                 ..
             }) if *actual == target && args.is_empty()
         ));
+
+        // Rewriting the indirect call into a direct one records the call edge.
+        assert_eq!(ctx.values.call_sites_of(target), &[call_id]);
+    }
+
+    #[test]
+    fn call_sites_track_direct_calls_through_replace_and_remove() {
+        let mut ctx = Context::new();
+        qcode!(
+            ctx,
+            "
+            varnode i64 ptr;
+            <block>
+                call [ptr];
+            "
+        );
+        let call_id = BasicBlock::from_id(&ctx, block).instruction_ids()[0];
+        let target = Function::make(&mut ctx, "target".into()).unwrap().id;
+
+        // Indirect calls have no static target, so nothing is recorded yet.
+        assert!(ctx.values.call_sites_of(target).is_empty());
+
+        ctx.replace_instruction_mnemonic(
+            call_id,
+            Mnemonic::Call(Call {
+                target,
+                args: vec![],
+                clobbers: vec![],
+            }),
+        );
+        assert_eq!(ctx.values.call_sites_of(target), &[call_id]);
+
+        // Removing the instruction prunes its call edge.
+        ctx.remove_instruction(call_id);
+        assert!(ctx.values.call_sites_of(target).is_empty());
     }
 
     #[test]

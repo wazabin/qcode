@@ -2,6 +2,7 @@ use crate::{
     context::Context,
     value::{
         ValueId,
+        function::FunctionId,
         insn::{
             Binary, Branch, BranchInd, CBranch, Call, CallInd, Carry, FloatToFloat, FloatToInt,
             IntToFloat, IsFloatNaN, Load, LzCount, PCodeOp, PopCount, Range, Return, SBorrow,
@@ -142,6 +143,16 @@ impl Mnemonic {
 
     pub fn is_terminator(&self) -> bool {
         self.as_kind().is_terminator()
+    }
+
+    /// The callee of a direct [`Call`], or `None` for any other mnemonic
+    /// (including indirect [`CallInd`] calls, whose target is not statically
+    /// known). Used to maintain the reverse call graph.
+    pub fn call_target(&self) -> Option<FunctionId> {
+        match self {
+            Mnemonic::Call(call) => Some(call.target),
+            _ => None,
+        }
     }
 
     pub fn fmt(&self, f: &mut Formatter<'_>, ctx: &Context<'_>) -> std::fmt::Result {

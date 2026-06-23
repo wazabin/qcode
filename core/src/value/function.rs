@@ -12,7 +12,7 @@ use crate::{
     context::Context,
     error::{Error, ErrorTy, Result},
     value::{
-        BasicBlock, BlockId, BlockRef, Value, ValueId, Varnode, VarnodeId,
+        BasicBlock, BlockId, BlockRef, Instruction, Value, ValueId, Varnode, VarnodeId,
         util::{
             base_ref::{BaseRef, WithCtx, WithCtxMut},
             named::{Named, Renameable, update_context_name},
@@ -271,6 +271,47 @@ where
     /// optimization, so it drives the raw disassembly view.
     pub fn instruction_addrs(&'s self) -> impl Iterator<Item = u64> + 'ctx {
         self.inner().instruction_addrs.iter().copied()
+    }
+
+    /// The functions this function directly calls, deduplicated and ordered by
+    /// id. Derived from the IR on demand — like [`BlockRef::successors`] reading
+    /// the CFG — so it always reflects the current instructions. Indirect calls
+    /// have no static target and are not included.
+    pub fn callees(&'s self) -> Vec<FunctionId> {
+        let mut callees = self
+            .blocks()
+            .flat_map(|block| {
+                block
+                    .instructions()
+                    .filter_map(|insn| insn.mnemonic().call_target())
+                    .collect::<Vec<_>>()
+            })
+            .collect::<Vec<_>>();
+        callees.sort_by_key(|&id| Into::<usize>::into(id));
+        callees.dedup();
+        callees
+    }
+
+    /// The functions that directly call this one, deduplicated and ordered by
+    /// id. Reads the reverse call graph maintained alongside the use-def map and
+    /// resolves each call site to its enclosing function. Counterpart of
+    /// [`callees`](Self::callees).
+    pub fn callers(&'s self) -> Vec<FunctionId> {
+        let ctx = self.ctx();
+        let mut callers = ctx
+            .values
+            .call_sites_of(self.id)
+            .iter()
+            .filter_map(|&site| {
+                Instruction::from_id(ctx, site)
+                    .block()
+                    .and_then(|block| block.function())
+                    .map(|function| function.id)
+            })
+            .collect::<Vec<_>>();
+        callers.sort_by_key(|&id| Into::<usize>::into(id));
+        callers.dedup();
+        callers
     }
 
     /// The root block of this function, if it exists.

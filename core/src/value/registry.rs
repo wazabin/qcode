@@ -77,6 +77,15 @@ pub struct ValueRegistry<'str> {
     /// [`Context::replace_all_uses_with`].
     pub(crate) users: HashMap<ValueId, Vec<InstructionId>>,
 
+    /// Reverse call graph: for each callee [`FunctionId`], the direct-call sites
+    /// (instructions) that target it. Kept in sync alongside `users` by
+    /// [`push_insn`](Self::push_insn),
+    /// [`remove_instructions`](Self::remove_instructions), and
+    /// [`Context::replace_instruction_mnemonic`](crate::context::Context::replace_instruction_mnemonic).
+    /// Indirect calls have no static target and are not recorded here.
+    #[serde(default)]
+    pub(crate) call_sites: HashMap<FunctionId, Vec<InstructionId>>,
+
     /// Intern cache for non-symbolic literals: `(masked_value, TypeId) → LiteralId`.
     literal_cache: HashMap<(u64, TypeId), LiteralId>,
 }
@@ -134,9 +143,13 @@ impl<'str> ValueRegistry<'str> {
     /// instead.
     pub fn push_insn(&mut self, insn: Instruction<'str>) -> InstructionId {
         let args = insn.mnemonic().args();
+        let call_target = insn.mnemonic().call_target();
         let id = self.instructions.push(insn);
         for arg in args {
             self.users.entry(arg).or_default().push(id);
+        }
+        if let Some(target) = call_target {
+            self.call_sites.entry(target).or_default().push(id);
         }
         id
     }
@@ -144,6 +157,14 @@ impl<'str> ValueRegistry<'str> {
     /// Returns all instructions that use `value` as an operand.
     pub fn users_of(&self, value: ValueId) -> &[InstructionId] {
         self.users.get(&value).map(Vec::as_slice).unwrap_or(&[])
+    }
+
+    /// Returns the direct-call sites (instructions) targeting `callee`.
+    pub fn call_sites_of(&self, callee: FunctionId) -> &[InstructionId] {
+        self.call_sites
+            .get(&callee)
+            .map(Vec::as_slice)
+            .unwrap_or(&[])
     }
 
     /// Removes a set of dead instructions from the use-def map.
@@ -158,6 +179,11 @@ impl<'str> ValueRegistry<'str> {
                 if let Some(users) = self.users.get_mut(&arg) {
                     users.retain(|u| !dead.contains(u));
                 }
+            }
+            if let Some(target) = self.instructions[id].mnemonic().call_target()
+                && let Some(sites) = self.call_sites.get_mut(&target)
+            {
+                sites.retain(|s| !dead.contains(s));
             }
         }
     }
