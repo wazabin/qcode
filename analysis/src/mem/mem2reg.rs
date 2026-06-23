@@ -12,10 +12,25 @@ use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
 use std::borrow::Cow;
 
 use crate::AliasResult;
+use crate::gvn::affine::{Numbering, precompute_forms};
+use crate::stack::frame::{frame_offset, incoming_sp_param};
 
 /// Returns `true` if any variables were promoted.
 pub fn mem2reg(ctx: &mut Context, function_id: FunctionId, aliases: &AliasResult) -> bool {
-    Mem2Reg::new(ctx, function_id, aliases).run()
+    mem2reg_framed(ctx, function_id, aliases, None)
+}
+
+/// [`mem2reg`] with the incoming stack-pointer parameter (`@SP`) supplied, so
+/// canonical `@SP ± N` stack slots are recognised alongside legacy `@stack_base`
+/// literals. `sp_param` is `None` when the caller has no stack-pointer context
+/// (most unit tests), leaving only the literal path active.
+pub fn mem2reg_framed(
+    ctx: &mut Context,
+    function_id: FunctionId,
+    aliases: &AliasResult,
+    sp_param: Option<ValueId>,
+) -> bool {
+    Mem2Reg::new(ctx, function_id, aliases, sp_param).run()
 }
 
 struct Mem2Reg<'ctx, 'str> {
@@ -23,6 +38,12 @@ struct Mem2Reg<'ctx, 'str> {
     function_id: FunctionId,
     root_id: Option<BlockId>,
     aliases: &'ctx AliasResult,
+    /// Affine decomposition of every value, used to resolve `@SP ± N` slot
+    /// offsets. Position-independent, computed once up front.
+    numbering: Numbering,
+    /// The incoming stack-pointer parameter, when known. Slots are `@SP ± N`
+    /// relative to it; `None` falls back to `@stack_base`-literal recognition.
+    sp_param: Option<ValueId>,
 }
 
 impl<'ctx, 'str> Mem2Reg<'ctx, 'str> {
@@ -30,13 +51,27 @@ impl<'ctx, 'str> Mem2Reg<'ctx, 'str> {
         ctx: &'ctx mut Context<'str>,
         function_id: FunctionId,
         aliases: &'ctx AliasResult,
+        sp_param: Option<ValueId>,
     ) -> Self {
         let root_id = Function::from_id(&*ctx, function_id).root().map(|b| b.id);
+        let numbering = precompute_forms(&*ctx, function_id);
         Self {
             ctx,
             function_id,
             root_id,
             aliases,
+            numbering,
+            sp_param,
+        }
+    }
+
+    /// The signed byte offset of stack-slot pointer `ptr` from the entry stack
+    /// pointer — the canonical slot key — across both the `@SP ± N` and legacy
+    /// `@stack_base ± N` representations. `None` for non-stack pointers.
+    fn slot_offset(&self, ptr: ValueId) -> Option<i64> {
+        match self.sp_param {
+            Some(sp) => frame_offset(self.ctx, &self.numbering, sp, ptr),
+            None => stack_slot_offset(self.ctx, ptr).map(|(off, _)| off),
         }
     }
 
@@ -381,32 +416,35 @@ impl MemoryAccess {
     }
 }
 
+/// A byte range of a stack access, in *frame-offset* coordinates (signed bytes
+/// from the entry stack pointer). Offsets unify the `@SP ± N` and legacy
+/// `@stack_base ± N` representations; overlap is invariant under the constant
+/// shift between an absolute address and its offset.
 #[derive(Clone, Copy, PartialEq, Eq)]
 struct StackAccessRange {
-    start: u64,
-    end: u64,
+    start: i64,
+    end: i64,
 }
 
 impl StackAccessRange {
-    fn new(start: u64, size: usize) -> Self {
+    fn new(start: i64, size: usize) -> Self {
         Self {
             start,
-            end: start.saturating_add(size as u64),
+            end: start.saturating_add(size as i64),
         }
     }
 
-    fn overlaps_slot(&self, slot_start: u64, slot_size: usize) -> bool {
-        let slot_start = slot_start as u128;
-        let slot_end = slot_start + slot_size as u128;
-        slot_start < self.end as u128 && (self.start as u128) < slot_end
+    fn overlaps_slot(&self, slot_start: i64, slot_size: usize) -> bool {
+        let slot_end = slot_start + slot_size as i64;
+        slot_start < self.end && self.start < slot_end
     }
 }
 
-/// The promotion access size for stack-slot literal `var`, or `None` if it fails
-/// the single-size or no-overlap guard: a slot accessed at conflicting sizes, or
+/// The promotion access size for stack slot `var`, or `None` if it fails the
+/// single-size or no-overlap guard: a slot accessed at conflicting sizes, or
 /// whose byte range is touched by any *other* stack access, cannot be promoted.
 fn promotable_stack_slot_size(
-    ctx: &Context,
+    offset: i64,
     var: ValueId,
     stack_size: &HashMap<ValueId, usize>,
     stack_size_conflict: &HashSet<ValueId>,
@@ -416,7 +454,7 @@ fn promotable_stack_slot_size(
         return None;
     }
     let size = stack_size[&var];
-    let addr = stack_slot_addr(ctx, var).expect("stack slot var is a stack literal");
+    let addr = offset;
     let own = StackAccessRange::new(addr, size);
     let overlapped = stack_intervals
         .iter()
@@ -443,7 +481,7 @@ impl Mem2Reg<'_, '_> {
             ValueId::Varnode(varnode_id) => Varnode::from_id(self.ctx, varnode_id)
                 .name()
                 .map(|n| n.to_owned()),
-            _ => stack_slot_addr(self.ctx, var).map(|addr| format!("stack_{addr:x}")),
+            _ => self.slot_offset(var).map(|off| format!("stack_{off:x}")),
         }
     }
 
@@ -452,15 +490,26 @@ impl Mem2Reg<'_, '_> {
     /// rather than its display name. `origin` is a stable cross-run identity, so
     /// this finds the param even for varnodes that have no name (the name-based
     /// match used to miss them, re-pushing a duplicate on every re-run).
+    ///
+    /// For an `@SP ± N` stack slot the per-run representative pointer is a fresh
+    /// `ValueId` each round (the canonicalizer re-materializes it), so an exact
+    /// `origin == var` miss falls back to matching by frame offset — the stable
+    /// slot identity across runs.
     fn existing_param_for_var(
         &self,
         block_id: BlockId,
         size: usize,
         var: ValueId,
     ) -> Option<BlockParamId> {
+        let var_offset = self.slot_offset(var);
         BasicBlock::from_id(self.ctx, block_id)
             .params()
-            .find(|param| param.size() == size && param.origin() == Some(var))
+            .find(|param| {
+                param.size() == size
+                    && (param.origin() == Some(var)
+                        || (var_offset.is_some()
+                            && param.origin().and_then(|o| self.slot_offset(o)) == var_offset))
+            })
             .map(|param| param.id)
     }
 
@@ -559,8 +608,8 @@ impl Mem2Reg<'_, '_> {
                     } else {
                         loaded.insert(access.ptr);
                     }
-                } else if let Some(addr) = stack_slot_addr(self.ctx, access.ptr) {
-                    stack_intervals.push(StackAccessRange::new(addr, access.size));
+                } else if let Some(off) = self.slot_offset(access.ptr) {
+                    stack_intervals.push(StackAccessRange::new(off, access.size));
                     match stack_size.get(&access.ptr) {
                         Some(&prev) if prev != access.size => {
                             stack_size_conflict.insert(access.ptr);
@@ -640,8 +689,11 @@ impl Mem2Reg<'_, '_> {
         let mut sizes: HashMap<ValueId, usize> = HashMap::default();
         if !dynamic_stack {
             for &var in stack_stored.intersection(&stack_loaded) {
+                let Some(offset) = self.slot_offset(var) else {
+                    continue;
+                };
                 if let Some(size) = promotable_stack_slot_size(
-                    self.ctx,
+                    offset,
                     var,
                     &stack_size,
                     &stack_size_conflict,
@@ -1976,6 +2028,78 @@ mod tests {
         assert_eq!(params[0].id, full_param);
     }
 
+    /// Build `store(0x1234, @SP-8); reload(@SP-8)` in one block off an `@SP`
+    /// param (origin = `sp_reg`). The two `@SP-8` addresses are distinct `Sub`
+    /// values until canonicalized. Returns `(fun_id, block, sp_param, sp_reg)`.
+    fn sp_slot_function(
+        tc: &mut qcode::testing::TestContext,
+    ) -> (FunctionId, ValueId, VarnodeId) {
+        use qcode::builder::Builder;
+        let sp_reg = tc.r0;
+        let ram = tc.ctx.default_space;
+        let fun_id = Function::make(&mut tc.ctx, "f".into()).unwrap().id;
+        let block = tc.ctx.get_or_make_block(0x1000);
+        Function::from_id_mut(&mut tc.ctx, fun_id)
+            .set_root(block)
+            .unwrap();
+        let pid = BasicBlock::from_id_mut(&mut tc.ctx, block).push_param(8).id;
+        tc.ctx.values.block_params[pid].origin = Some(ValueId::Varnode(sp_reg));
+        tc.ctx.values.block_params[pid].name = Some("RSP".into());
+        let sp = ValueId::BlockParam(pid);
+
+        let mut b = Builder::from_context(&mut tc.ctx, 0x1000);
+        let v = b.context_mut().get_const(0x1234, 8).id();
+        let c8 = b.context_mut().get_const(8, 8).id();
+        let addr_store = b.push_sub(sp, c8).id();
+        b.push_store(v, addr_store, ram);
+        let addr_load = b.push_sub(sp, c8).id();
+        b.push_load::<false>(addr_load, 8, ram);
+        unsafe { b.dont_finalize() };
+        (fun_id, sp, sp_reg)
+    }
+
+    fn has_load(ctx: &Context, fun_id: FunctionId) -> bool {
+        Function::from_id(ctx, fun_id)
+            .blocks()
+            .any(|b| b.iter().any(|i| matches!(i.mnemonic(), Mnemonic::Load(_))))
+    }
+
+    /// A canonical `@SP - N` local slot is promoted just like a `@stack_base`
+    /// literal: the reload forwards from the store and the load disappears.
+    #[test]
+    fn promotes_canonical_sp_relative_slot() {
+        use crate::stack::canonicalize::canonicalize_sp_slots;
+        let mut tc = qcode::testing::TestContext::new();
+        let (fun_id, sp, sp_reg) = sp_slot_function(&mut tc);
+
+        canonicalize_sp_slots(&mut tc.ctx, fun_id, sp_reg);
+        let aliases = AliasResult::simple(&tc.ctx);
+        let changed = mem2reg_framed(&mut tc.ctx, fun_id, &aliases, Some(sp));
+
+        assert!(changed, "the @SP-8 slot should be promoted");
+        assert!(
+            !has_load(&tc.ctx, fun_id),
+            "the reload should be forwarded from the store:\n{}",
+            Function::from_id(&tc.ctx, fun_id)
+        );
+    }
+
+    /// Without the `@SP` parameter the `@SP - N` address is unrecognised (it is
+    /// not a `@stack_base` literal), so the slot is left in memory.
+    #[test]
+    fn sp_relative_slot_not_promoted_without_sp_param() {
+        let mut tc = qcode::testing::TestContext::new();
+        let (fun_id, _sp, _sp_reg) = sp_slot_function(&mut tc);
+
+        let aliases = AliasResult::simple(&tc.ctx);
+        mem2reg_framed(&mut tc.ctx, fun_id, &aliases, None);
+
+        assert!(
+            has_load(&tc.ctx, fun_id),
+            "an unrecognised @SP-relative slot must stay in memory"
+        );
+    }
+
     #[test]
     fn partial_register_store_clobbers_promoted_full_register_value() {
         use qcode::{builder::Builder, testing::TestContext};
@@ -2869,12 +2993,16 @@ impl FunctionPass for Mem2RegPass {
         &self,
         ctx: &mut Context,
         fun_id: FunctionId,
-        _env: &PipelineEnv,
+        env: &PipelineEnv,
     ) -> Result<bool, String> {
         // Per-function pass: scope the alias oracle to this function so the
         // stage is O(program) total, not O(functions × program).
         let aliases = AliasResult::simple_for_function(ctx, fun_id);
-        Ok(mem2reg(ctx, fun_id, &aliases))
+        // Resolve `@SP` so canonical `@SP ± N` slots are recognised; `None` when
+        // the function has no incoming stack-pointer param (legacy literal path).
+        let sp_reg = ctx.registers[&env.cfg.stack_pointer];
+        let sp_param = incoming_sp_param(ctx, fun_id, sp_reg);
+        Ok(mem2reg_framed(ctx, fun_id, &aliases, sp_param))
     }
 }
 

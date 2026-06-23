@@ -108,7 +108,7 @@ fn function_writes_through_stack_arg(ctx: &Context, function_id: FunctionId) -> 
             if let Mnemonic::Store(s) = insn.mnemonic()
                 && s.space == ram
             {
-                let mut visited = HashSet::new();
+                let mut visited = HashSet::default();
                 let (derives, dynamic) = trace_stack_arg_pointer(ctx, s.ptr, &mut visited);
                 if derives && dynamic {
                     return true;
