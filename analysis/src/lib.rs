@@ -6,7 +6,7 @@ pub use assumptions::{
 };
 
 pub mod stack;
-pub use stack::{brighten_stack, lower_stack};
+pub use stack::brighten_stack;
 
 pub mod calls;
 pub use calls::{

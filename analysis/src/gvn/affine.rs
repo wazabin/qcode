@@ -619,6 +619,41 @@ impl Numbering {
             _ => None,
         }
     }
+
+    /// Whether `v`'s normal form is built (transitively) on `target` as a term.
+    ///
+    /// Unlike [`base_offset`], which only recognises the clean `target + const`
+    /// shape, this answers "does `v` *depend on* `target` arithmetically at all" —
+    /// catching `target + reg` (a dynamically indexed stack access) and a realigned
+    /// `(target & -mask) + k`, where the offset from `target` is not a fixed
+    /// constant. A stack pointer that mentions `@SP` this way but is not a fixed
+    /// slot may alias any slot, so it disables slot promotion.
+    pub(crate) fn affine_mentions(&self, v: ValueId, target: ValueId) -> bool {
+        self.affine_mentions_rec(v, target, &mut std::collections::HashSet::new())
+    }
+
+    fn affine_mentions_rec(
+        &self,
+        v: ValueId,
+        target: ValueId,
+        seen: &mut std::collections::HashSet<ValueId>,
+    ) -> bool {
+        if v == target {
+            return true;
+        }
+        if !seen.insert(v) {
+            return false;
+        }
+        match self.forms.get(&v) {
+            Some(NormalForm::Affine { terms, .. }) => terms
+                .iter()
+                .any(|(t, _)| self.affine_mentions_rec(*t, target, seen)),
+            Some(NormalForm::Mask { term, .. }) => {
+                self.affine_mentions_rec(*term, target, seen)
+            }
+            _ => false,
+        }
+    }
 }
 
 /// Precompute the position-independent affine view (`forms`) of every
@@ -655,7 +690,7 @@ mod spike {
     use qcode::{
         builder::Builder,
         testing::TestContext,
-        value::{BasicBlock, Function},
+        value::{BasicBlock, Function, Value},
     };
 
     #[test]
@@ -706,6 +741,57 @@ mod spike {
         // among post-alignment slots survives; the link back to `@SP` is lost.
         assert_eq!(nb.base_offset(aligned), None);
         assert_eq!(nb.base_offset(al), Some((aligned, 8)));
+    }
+
+    /// `affine_mentions` recognises every pointer transitively built on `@SP`,
+    /// including the dynamically indexed (`@SP + reg`) and realigned
+    /// (`(@SP & -mask) + k`) shapes that `base_offset` rejects — these are exactly
+    /// the stack pointers that must disable slot promotion.
+    #[test]
+    fn affine_mentions_catches_dynamic_and_aligned_sp() {
+        let mut tc = TestContext::new();
+        let ram = tc.ctx.default_space;
+        let reg = tc.reg_space;
+        let fun = Function::make(&mut tc.ctx, "f".into()).unwrap().id;
+        let entry = tc.ctx.get_or_make_block(0x1000);
+        {
+            let mut f = Function::from_id_mut(&mut tc.ctx, fun);
+            f.set_root(entry).unwrap();
+            f.add_block(entry);
+        }
+        let sp = ValueId::BlockParam(BasicBlock::from_id_mut(&mut tc.ctx, entry).push_param(8).id);
+
+        let (fixed, indexed, aligned_slot, unrelated) = {
+            let mut b = Builder::from_block(BasicBlock::from_id_mut(&mut tc.ctx, entry));
+            let c8 = b.context_mut().get_const(8, 8).id();
+            let neg16 = b.context_mut().get_const((-16i64) as u64, 8).id();
+            // A non-constant index loaded from a register.
+            let idx = b.push_load::<false>(ValueId::Varnode(tc.r1), 8, reg).id();
+            let fixed = b.push_sub(sp, c8).id(); // @SP - 8   (fixed slot)
+            let indexed = b.push_add(sp, idx).id(); // @SP + reg (dynamic)
+            let aligned = b.push_bit_and(sp, neg16).id();
+            let aligned_slot = b.push_add(aligned, c8).id(); // (@SP & -16) + 8
+            let other = b.context_mut().get_const(0x4000, 8).id();
+            let unrelated = b.push_add(other, idx).id(); // base + reg, no @SP
+            let _ = b.push_load::<false>(indexed, 1, ram);
+            unsafe { b.dont_finalize() };
+            (fixed, indexed, aligned_slot, unrelated)
+        };
+
+        let nb = precompute_forms(&tc.ctx, fun);
+
+        assert!(nb.affine_mentions(fixed, sp), "@SP - 8 is built on @SP");
+        assert!(nb.affine_mentions(indexed, sp), "@SP + reg is built on @SP");
+        assert!(
+            nb.affine_mentions(aligned_slot, sp),
+            "(@SP & -16) + 8 is built on @SP through the mask term"
+        );
+        assert!(
+            !nb.affine_mentions(unrelated, sp),
+            "a pointer with no @SP term is not mentioned"
+        );
+        // `@SP` itself trivially mentions `@SP`.
+        assert!(nb.affine_mentions(sp, sp));
     }
 }
 

@@ -24,7 +24,9 @@ use qcode::value::Instruction;
 
 use crate::{
     compute_clobbered_regs,
-    mem::mem2reg::{has_dynamic_stack_pointer_deref, stack_slot_offset},
+    gvn::affine::{Numbering, precompute_forms},
+    mem::mem2reg::has_dynamic_stack_pointer_deref,
+    stack::frame::{frame_offset, incoming_sp_param},
 };
 
 /// Window around a stack base within which a bare integer is taken to be a frame
@@ -101,15 +103,16 @@ fn function_makes_unbounded_call(ctx: &Context, function_id: FunctionId) -> bool
 /// a caller that passes a pointer into its own frame must keep that frame in
 /// memory. A bounded write (`*p` or `*(p + const)`) or a mere *read* through such
 /// a pointer is not enough — only an unbounded write counts (see the unit tests).
-fn function_writes_through_stack_arg(ctx: &Context, function_id: FunctionId) -> bool {
+fn function_writes_through_stack_arg(ctx: &Context, function_id: FunctionId, stack_ptr: VarnodeId) -> bool {
     let ram = ctx.default_space;
+    let frame = FrameCtx::new(ctx, function_id, stack_ptr);
     for block in Function::from_id(ctx, function_id).blocks() {
         for insn in block.iter() {
             if let Mnemonic::Store(s) = insn.mnemonic()
                 && s.space == ram
             {
                 let mut visited = HashSet::default();
-                let (derives, dynamic) = trace_stack_arg_pointer(ctx, s.ptr, &mut visited);
+                let (derives, dynamic) = trace_stack_arg_pointer(ctx, &frame, s.ptr, &mut visited);
                 if derives && dynamic {
                     return true;
                 }
@@ -119,11 +122,39 @@ fn function_writes_through_stack_arg(ctx: &Context, function_id: FunctionId) -> 
     false
 }
 
+/// The frame-offset context for tracing stack-passed pointers: the affine
+/// numbering plus the entry stack-pointer `base` (the `@SP` param or the bare
+/// stack-pointer varnode) and its width, so a caller-frame slot is recognised in
+/// either the legacy `@stack_base + N` or the `@SP + N` representation.
+struct FrameCtx {
+    numbering: Numbering,
+    base: ValueId,
+    ptr_width: usize,
+}
+
+impl FrameCtx {
+    fn new(ctx: &Context, function_id: FunctionId, stack_ptr: VarnodeId) -> Self {
+        let base = incoming_sp_param(ctx, function_id, stack_ptr)
+            .unwrap_or(ValueId::Varnode(stack_ptr));
+        Self {
+            numbering: precompute_forms(ctx, function_id),
+            base,
+            ptr_width: Varnode::from_id(ctx, stack_ptr).size(),
+        }
+    }
+
+    /// The frame offset of `v`, in either stack-address representation.
+    fn offset(&self, ctx: &Context, v: ValueId) -> Option<i64> {
+        frame_offset(ctx, &self.numbering, self.base, v)
+    }
+}
+
 /// Trace `v` back toward a stack-passed pointer parameter. Returns
 /// `(derives, dynamic)`: whether `v` derives from such a parameter, and whether
 /// the path to it carries a non-constant (loop- or index-driven) offset.
 fn trace_stack_arg_pointer(
     ctx: &Context,
+    frame: &FrameCtx,
     v: ValueId,
     visited: &mut HashSet<ValueId>,
 ) -> (bool, bool) {
@@ -136,8 +167,8 @@ fn trace_stack_arg_pointer(
             // A stack-input parameter: promoted from a caller-frame slot at or
             // above the return-address slot. This is the static pointer base.
             if let Some(origin) = param.origin()
-                && let Some((offset, ptr_width)) = stack_slot_offset(ctx, origin)
-                && offset >= ptr_width as i64
+                && let Some(offset) = frame.offset(ctx, origin)
+                && offset >= frame.ptr_width as i64
             {
                 return (true, false);
             }
@@ -150,13 +181,13 @@ fn trace_stack_arg_pointer(
             let index = param.index();
             let derives = incoming_values(ctx, block, index)
                 .into_iter()
-                .any(|incoming| trace_stack_arg_pointer(ctx, incoming, visited).0);
+                .any(|incoming| trace_stack_arg_pointer(ctx, frame, incoming, visited).0);
             (derives, derives)
         }
         ValueId::Instruction(iid) => match ctx.get_insn(iid).mnemonic().clone() {
             Mnemonic::Binop(b) if matches!(b.op, Binop::Int(IntBinop::Add | IntBinop::Sub)) => {
-                let (ld, ldyn) = trace_stack_arg_pointer(ctx, b.lhs, visited);
-                let (rd, rdyn) = trace_stack_arg_pointer(ctx, b.rhs, visited);
+                let (ld, ldyn) = trace_stack_arg_pointer(ctx, frame, b.lhs, visited);
+                let (rd, rdyn) = trace_stack_arg_pointer(ctx, frame, b.rhs, visited);
                 let derives = ld || rd;
                 // The operand that does not derive from the pointer is the offset;
                 // a non-constant offset makes the access unbounded.
@@ -394,19 +425,28 @@ pub fn compute_saved_regs(ctx: &Context, function_id: FunctionId) -> Vec<Varnode
 }
 
 /// The net change a function applies to the stack pointer between entry and
-/// return, derived from the final `RSP = @stack_base + N` write in each
-/// return-terminated block (the offset `N` from [`STACK_BASE`]).
+/// return, derived from the final stack-pointer write in each return-terminated
+/// block, decoded as a frame offset from the entry stack pointer.
+///
+/// The final write is recognised in either representation: a legacy
+/// `@stack_base + N` literal, or an affine `@SP + N` rooted at the incoming
+/// stack-pointer parameter (`@SP`) — or, in a non-functionalized body, the bare
+/// stack-pointer varnode (`RSP + N`). [`frame_offset`] folds all three to the
+/// same `N`.
 ///
 /// Returns `None` when no such write is found or the return blocks disagree, in
-/// which case the stack pointer must be treated as an ordinary clobber. Must run
-/// *before* the lower-stack pass rewrites `@stack_base` back into real RSP
-/// arithmetic, while the `StackAddress`-typed literal store still exists.
+/// which case the stack pointer must be treated as an ordinary clobber.
 pub fn compute_stack_delta(
     ctx: &Context,
     function_id: FunctionId,
     stack_ptr: VarnodeId,
 ) -> Option<i64> {
     let sp = ValueId::Varnode(stack_ptr);
+    let numbering = precompute_forms(ctx, function_id);
+    // The entry stack-pointer base offsets are measured from: the functionalized
+    // `@SP` param when present, else the bare stack-pointer varnode (a
+    // non-functionalized body roots its RSP arithmetic at the register itself).
+    let base = incoming_sp_param(ctx, function_id, stack_ptr).unwrap_or(sp);
     let mut delta: Option<i64> = None;
 
     for block in Function::from_id(ctx, function_id).iter() {
@@ -419,7 +459,7 @@ pub fn compute_stack_delta(
             continue;
         }
 
-        // The last `RSP = <stack-address literal>` store reaching the return.
+        // The last `RSP = <stack address>` store reaching the return.
         let mut block_delta: Option<i64> = None;
         for insn in block.iter() {
             let Mnemonic::Store(store) = insn.mnemonic() else {
@@ -428,13 +468,8 @@ pub fn compute_stack_delta(
             if store.ptr != sp {
                 continue;
             }
-            let ValueId::Literal(lit) = store.src else {
-                continue;
-            };
-            let lit = &ctx.values.literals[lit];
-            if ctx.types.is_stack_address(lit.type_id) {
-                let base = qcode::types::stack_base(ctx.types.size_of(lit.type_id));
-                block_delta = Some(lit.value.wrapping_sub(base) as i64);
+            if let Some(off) = frame_offset(ctx, &numbering, base, store.src) {
+                block_delta = Some(off);
             }
         }
 
@@ -491,9 +526,9 @@ pub fn set_function_summaries(ctx: &mut Context, function_id: FunctionId, stack_
     // call. Union with the seeded value so the fact only grows across
     // checkpoint+replay rounds.
     let reads_unbounded = Function::from_id(ctx, function_id).reads_unbounded_stack()
-        || has_dynamic_stack_pointer_deref(ctx, function_id)
+        || has_dynamic_stack_pointer_deref(ctx, function_id, stack_ptr)
         || function_makes_unbounded_call(ctx, function_id)
-        || function_writes_through_stack_arg(ctx, function_id);
+        || function_writes_through_stack_arg(ctx, function_id, stack_ptr);
 
     let mut f = Function::from_id_mut(ctx, function_id);
     f.set_input_regs(inputs);

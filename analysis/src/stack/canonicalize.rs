@@ -108,6 +108,36 @@ pub fn canonicalize_sp_slots(ctx: &mut Context, fid: FunctionId, sp_reg: Varnode
     changed
 }
 
+// ----- pass ------------------------------------------------------------------
+
+use crate::{FunctionPass, PipelineEnv};
+
+/// Runs [`canonicalize_sp_slots`] over a function, resolving `@SP` from the
+/// configured stack-pointer register. Replaces the legacy `brighten`/`lower_stack`
+/// round-trip: it unifies the per-site `@SP ± N` address instructions mem2reg's
+/// register forwarding produces into one representative per offset, so the
+/// ValueId-keyed slot promoter sees a single pointer per slot.
+#[derive(Default)]
+pub struct CanonicalizeSpSlots;
+
+impl FunctionPass for CanonicalizeSpSlots {
+    const NAME: &'static str = "canonicalize_sp_slots";
+    fn description(&self) -> &'static str {
+        "Canonicalize @SP±N stack slots to one representative per offset"
+    }
+    fn run(
+        &self,
+        ctx: &mut Context,
+        fun_id: FunctionId,
+        env: &PipelineEnv,
+    ) -> std::result::Result<bool, String> {
+        let sp_reg = ctx.registers[&env.cfg.stack_pointer];
+        Ok(canonicalize_sp_slots(ctx, fun_id, sp_reg))
+    }
+}
+
+crate::register_function_pass!(CanonicalizeSpSlots);
+
 #[cfg(test)]
 mod tests {
     use super::*;

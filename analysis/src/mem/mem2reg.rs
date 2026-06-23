@@ -75,6 +75,16 @@ impl<'ctx, 'str> Mem2Reg<'ctx, 'str> {
         }
     }
 
+    /// Whether `ptr` is `@SP`-derived but *not* a fixed slot offset — a
+    /// dynamically indexed (`@SP + reg`) or realigned (`(@SP & -mask) + k`) stack
+    /// pointer that may alias any slot. Only meaningful once the incoming
+    /// stack-pointer param is known; the legacy `@stack_base` path relies on
+    /// [`is_stack_typed`] instead.
+    fn is_dynamic_sp_deref(&self, ptr: ValueId) -> bool {
+        self.sp_param
+            .is_some_and(|sp| self.numbering.affine_mentions(ptr, sp))
+    }
+
     fn run(&mut self) -> bool {
         // Precompute the liveness inputs in one sweep so the collection and
         // block-param phases share a single per-var computation (memoized) instead
@@ -248,17 +258,32 @@ pub(crate) fn stack_slot_offset(ctx: &Context, v: ValueId) -> Option<(i64, usize
 }
 
 /// Whether `function_id` performs any load or store through a *computed stack
-/// frame pointer* — a `StackAddress`-typed value that does not resolve to a fixed
-/// slot literal. A computed RAM pointer loaded from a stack-passed argument is
-/// not enough: that reads behind the argument value, not arbitrary bytes of the
-/// caller's frame.
-pub(crate) fn has_dynamic_stack_pointer_deref(ctx: &Context, function_id: FunctionId) -> bool {
+/// frame pointer* — a stack-frame pointer that does not resolve to a fixed slot.
+///
+/// Recognised in either representation: a legacy `StackAddress`-typed value that
+/// is not a slot literal, or an `@SP`-rooted value whose offset from the incoming
+/// stack pointer is not a fixed constant (`@SP + reg`, or a realigned
+/// `(@SP & -mask) + k`). A computed RAM pointer loaded from a stack-passed
+/// argument is not enough: that reads behind the argument value, not arbitrary
+/// bytes of the caller's frame.
+pub(crate) fn has_dynamic_stack_pointer_deref(
+    ctx: &Context,
+    function_id: FunctionId,
+    stack_ptr: VarnodeId,
+) -> bool {
+    let sp_param = incoming_sp_param(ctx, function_id, stack_ptr);
+    let numbering = precompute_forms(ctx, function_id);
+    let is_dynamic_sp = |ptr: ValueId| {
+        sp_param.is_some_and(|sp| {
+            frame_offset(ctx, &numbering, sp, ptr).is_none() && numbering.affine_mentions(ptr, sp)
+        })
+    };
     for block in Function::from_id(ctx, function_id).blocks() {
         for insn in block.iter() {
             let Some(access) = MemoryAccess::from_mnemonic(insn.mnemonic()) else {
                 continue;
             };
-            if is_computed_stack_frame_pointer(ctx, access.ptr) {
+            if is_computed_stack_frame_pointer(ctx, access.ptr) || is_dynamic_sp(access.ptr) {
                 return true;
             }
         }
@@ -623,7 +648,9 @@ impl Mem2Reg<'_, '_> {
                     } else {
                         stack_loaded.insert(access.ptr);
                     }
-                } else if is_stack_typed(self.ctx, access.ptr) {
+                } else if is_stack_typed(self.ctx, access.ptr)
+                    || self.is_dynamic_sp_deref(access.ptr)
+                {
                     dynamic_stack = true;
                 }
             }
@@ -2097,6 +2124,64 @@ mod tests {
         assert!(
             has_load(&tc.ctx, fun_id),
             "an unrecognised @SP-relative slot must stay in memory"
+        );
+    }
+
+    /// A dynamically indexed `@SP + reg` access may alias any slot, so it poisons
+    /// stack promotion for the whole function: an otherwise-promotable `@SP - 8`
+    /// local is left in memory.
+    #[test]
+    fn dynamic_sp_indexed_access_disables_promotion() {
+        use crate::stack::canonicalize::canonicalize_sp_slots;
+        use qcode::builder::Builder;
+
+        let mut tc = qcode::testing::TestContext::new();
+        let sp_reg = tc.r0;
+        let ram = tc.ctx.default_space;
+        let fun_id = Function::make(&mut tc.ctx, "f".into()).unwrap().id;
+        let block = tc.ctx.get_or_make_block(0x1000);
+        Function::from_id_mut(&mut tc.ctx, fun_id)
+            .set_root(block)
+            .unwrap();
+        let pid = BasicBlock::from_id_mut(&mut tc.ctx, block).push_param(8).id;
+        tc.ctx.values.block_params[pid].origin = Some(ValueId::Varnode(sp_reg));
+        let sp = ValueId::BlockParam(pid);
+
+        {
+            let mut b = Builder::from_context(&mut tc.ctx, 0x1000);
+            let v = b.context_mut().get_const(0x1234, 8).id();
+            let c8 = b.context_mut().get_const(8, 8).id();
+            // A promotable local: store then reload `@SP - 8`.
+            let addr_store = b.push_sub(sp, c8).id();
+            b.push_store(v, addr_store, ram);
+            let addr_load = b.push_sub(sp, c8).id();
+            let reloaded = b.push_load::<false>(addr_load, 8, ram).id();
+            // A dynamic `@SP + reloaded` access — index is not a constant.
+            let dyn_ptr = b.push_add(sp, reloaded).id();
+            b.push_load::<false>(dyn_ptr, 1, ram);
+            unsafe { b.dont_finalize() };
+        }
+
+        let loads_before = Function::from_id(&tc.ctx, fun_id)
+            .blocks()
+            .flat_map(|b| b.iter().collect::<Vec<_>>())
+            .filter(|i| matches!(i.mnemonic(), Mnemonic::Load(_)))
+            .count();
+
+        canonicalize_sp_slots(&mut tc.ctx, fun_id, sp_reg);
+        let aliases = AliasResult::simple(&tc.ctx);
+        mem2reg_framed(&mut tc.ctx, fun_id, &aliases, Some(sp));
+
+        let loads_after = Function::from_id(&tc.ctx, fun_id)
+            .blocks()
+            .flat_map(|b| b.iter().collect::<Vec<_>>())
+            .filter(|i| matches!(i.mnemonic(), Mnemonic::Load(_)))
+            .count();
+
+        assert_eq!(
+            loads_after, loads_before,
+            "the dynamic @SP+reg access must disable promotion of the @SP-8 local:\n{}",
+            Function::from_id(&tc.ctx, fun_id)
         );
     }
 

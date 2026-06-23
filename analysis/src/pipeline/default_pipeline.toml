@@ -81,29 +81,28 @@ scope = "function"
 passes = ["windows_teb_seed"]
 
 # Functionalize register side effects while register load/stores are still
-# explicit (before brighten abstracts RSP to @stack_base).
+# explicit. This mints the by-value `@SP` param (origin = the stack-pointer
+# register) and seeds `store(@SP, RSP)` at entry, giving stack arithmetic a
+# symbolic root to forward onto.
 [[stage]]
 name = "argpromote-registers"
 scope = "module"
 passes = ["argpromote_registers"]
 
-# Value-producing passes, per function (the pre-bind group).
-[[stage]]
-name = "brighten"
-scope = "function"
-passes = ["brighten"]
-
-# Promote to a fixpoint: each round may expose a register as the symbolic stack
-# base, then const-fold rewrites its arithmetic into stack-slot literals that
-# become promotable on the next round. mem2reg promotes local frame slots
-# (offset < 0) to SSA values; incoming caller-frame stack arguments (offset >= 0)
-# are left as `load(@stack_base + offset)` memory reads for the post-lowering
-# `argpromote` memory channel to functionalize, rather than being minted as
-# stack-input params here.
+# Promote to a fixpoint on the real incoming stack pointer `@SP` (no `@stack_base`
+# round-trip). Each round: `canonicalize_sp_slots` unifies the per-site `@SP ± N`
+# address instructions into one representative per offset; `mem2reg` forwards the
+# entry `store(@SP, RSP)` seed (rewriting `RSP ± N` reads to `@SP ± N`) and
+# promotes local frame slots (offset < 0) to SSA values; `const_fold` reassociates
+# the exposed arithmetic. Convergence takes an extra round versus the literal
+# model: round 1 forwards `RSP → @SP`, round 2 canonicalizes and promotes the now
+# `@SP`-rooted slots. Incoming caller-frame stack arguments (offset >= 0) are left
+# as `load(@SP + offset)` memory reads for the `argpromote` memory channel to
+# functionalize, rather than being minted as stack-input params here.
 [[stage]]
 name = "promote"
 scope = "function"
-passes = ["mem2reg", "const_fold"]
+passes = ["canonicalize_sp_slots", "mem2reg", "const_fold"]
 repeat_until = "no_change"
 
 [[stage]]
@@ -174,27 +173,13 @@ scope = "module"
 passes = ["external_sigs", "summaries"]
 
 # Eliminating passes, per function: drop the now-dead arg-setup stores and loads.
+# The stack pointer keeps its real `@SP`-rooted arithmetic throughout (the legacy
+# `brighten`/`lower_stack` `@stack_base` round-trip has been removed), so no
+# stack-lowering stage is needed here.
 [[stage]]
 name = "post-bind"
 scope = "function"
 passes = ["dead_store", "dce"]
-
-# Lowering last: rewrite the surviving `@stack_base ± N` literals back onto each
-# function's real stack pointer, then clear the dead artifacts that exposes (a
-# caller-side RSP relink whose store is overwritten before use): DCE drops the
-# dead arithmetic, DeadStore the now-unused register load it fed, a final DCE
-# anything that exposes. The cleanup only runs on functions actually changed by
-# stack lowering.
-[[stage]]
-name = "lower-stack"
-scope = "function"
-passes = ["lower_stack"]
-
-[[stage]]
-name = "post-lower-cleanup"
-scope = "function"
-passes = ["dce", "dead_store", "dce"]
-only_dirty = true
 
 # Functionalize memory side effects: rewrite a callee that mutates memory through
 # pointer params to operate on a private shadow copy and return its writes as a
@@ -266,13 +251,11 @@ repeat_until = "no_change"
 # which are bodyless and therefore skipped by function-scoped stages by default.
 # `cpp_demangle` gives bodyless imports their real names (so `include_external`);
 # `name_thunks` then labels each single-jump stub `thunk_<callee>`.
-# Re-canonicalize after the late lowering/binding passes. `lower_stack` rewrites
-# `@stack_base ± N` back onto the real stack pointer by substituting into the
-# pre-gvn reload chains, and argpromote/dead_signature reshape call sites, both
-# leaving un-reassociated stack arithmetic (`((rsp-0x10)-0xc)+4+0xc`). gvn last
-# ran before all of that, so a final pass folds these chains into single
-# `@RSP - N` slots (and CSEs them against the prologue's slots). DCE clears the
-# arithmetic this makes dead.
+# Re-canonicalize after the late binding passes. argpromote/dead_signature reshape
+# call sites, leaving un-reassociated stack arithmetic (`((rsp-0x10)-0xc)+4+0xc`)
+# on the `@SP`-rooted slots. gvn last ran before all of that, so a final pass folds
+# these chains into single `@SP - N` slots (and CSEs them against the prologue's
+# slots). DCE clears the arithmetic this makes dead.
 #
 # `gvn` here also forwards the argpromote shadow stores into the loads that read
 # them back (e.g. into the returned write-set `pack`), which `dce` then deletes —
