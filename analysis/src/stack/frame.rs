@@ -65,6 +65,28 @@ fn is_aligned_sp(ctx: &Context, sp_param: ValueId, base: ValueId) -> bool {
     )
 }
 
+/// The signed byte offset of `v` from the entry stack pointer, when `v` is an
+/// `@SP`-rooted (or legacy `@stack_base`) stack address. Every representation of
+/// the same slot yields the same offset, so this is the **canonical slot key**
+/// that replaces the interned `StackAddress` literal as a stable slot identity.
+///
+/// Returns `None` for a realigned (`@SP & -mask`) base — which has no stable
+/// `@SP`-relative offset — and for any non-stack pointer.
+pub(crate) fn frame_offset(
+    ctx: &Context,
+    numbering: &Numbering,
+    sp_param: ValueId,
+    v: ValueId,
+) -> Option<i64> {
+    // Legacy `@stack_base ± k` literal: its decoded signed offset.
+    if let Some((off, _)) = stack_slot_offset(ctx, v) {
+        return Some(off);
+    }
+    // Affine `@SP ± k` (the bare param decomposes to itself at offset 0).
+    let (base, off) = numbering.base_offset(v).unwrap_or((v, 0));
+    (base == sp_param).then_some(off)
+}
+
 /// Classify pointer `v` against the frame whose incoming stack pointer is
 /// `sp_param`, decomposing `@SP ± k` through `numbering`. Returns `None` when `v`
 /// is not stack-pointer-rooted.
@@ -74,20 +96,14 @@ pub(crate) fn frame_class(
     sp_param: ValueId,
     v: ValueId,
 ) -> Option<FrameClass> {
-    // Legacy `@stack_base ± k` literal: classify by the sign of its offset.
-    if let Some((off, _)) = stack_slot_offset(ctx, v) {
+    // An `@SP`/`@stack_base`-relative slot: classify by the sign of its offset.
+    if let Some(off) = frame_offset(ctx, numbering, sp_param, v) {
         return Some(by_sign(off));
     }
-    // Affine `@SP ± k` (the bare param decomposes to itself at offset 0).
-    let (base, off) = numbering.base_offset(v).unwrap_or((v, 0));
-    if base == sp_param {
-        return Some(by_sign(off));
-    }
-    // A realigned frame base: everything offset from it is a local.
-    if is_aligned_sp(ctx, sp_param, base) {
-        return Some(FrameClass::Local);
-    }
-    None
+    // A realigned frame base (`@SP & -mask`): everything offset from it is a
+    // local — incoming args never flow through the alignment mask.
+    let (base, _) = numbering.base_offset(v).unwrap_or((v, 0));
+    is_aligned_sp(ctx, sp_param, base).then_some(FrameClass::Local)
 }
 
 /// Below the entry stack pointer (`off < 0`) is an own-frame local; the
@@ -161,6 +177,18 @@ mod tests {
 
         let nb = precompute_forms(&tc.ctx, fid);
         let class = |v| frame_class(&tc.ctx, &nb, sp, v);
+
+        // The canonical slot key agrees across representations and is `None`
+        // exactly where there is no stable `@SP`-relative offset.
+        assert_eq!(frame_offset(&tc.ctx, &nb, sp, local), Some(-8));
+        assert_eq!(frame_offset(&tc.ctx, &nb, sp, caller_arg), Some(8));
+        assert_eq!(frame_offset(&tc.ctx, &nb, sp, ret_slot), Some(0));
+        assert_eq!(
+            frame_offset(&tc.ctx, &nb, sp, aligned_slot),
+            None,
+            "a realigned base has no stable @SP-relative offset"
+        );
+        assert_eq!(frame_offset(&tc.ctx, &nb, sp, unrelated), None);
 
         assert_eq!(class(local), Some(FrameClass::Local), "@SP - 8 is a local");
         assert_eq!(
