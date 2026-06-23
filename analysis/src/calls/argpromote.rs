@@ -50,6 +50,7 @@
 //! composition. See `ARGPROMOTE_DESIGN.md`.
 
 use std::borrow::Cow;
+use std::collections::HashSet;
 
 use jstd::graph::analysis::compute_dominators;
 use qcode::{
@@ -76,12 +77,48 @@ pub fn argpromote(ctx: &mut Context) -> bool {
     // the *same* space, so the seed store forwards into the body's loads.
     let shadow = ctx.make_temp_space();
     let mut changed = false;
-    for fid in ctx.function_ids() {
+    // Callee-before-caller order: a function may keep a call to a memory-free
+    // callee (see [`function_makes_blocking_call`]), and that callee must already
+    // be promoted — its own loads gone — for the caller to qualify. One visit per
+    // function (no fixpoint), so an already-promoted body is never re-promoted.
+    for fid in callee_first_order(ctx) {
         if try_promote(ctx, fid, shadow) {
             changed = true;
         }
     }
     changed
+}
+
+/// Functions in callee-before-caller (reverse-topological / DFS post) order, each
+/// once. Recursion and cycles are handled by the visited set: a function in a
+/// cycle is emitted once, which is fine — recursion is out of scope for purity, so
+/// such a caller simply fails the blocking-call gate.
+fn callee_first_order(ctx: &Context) -> Vec<FunctionId> {
+    let mut visited = HashSet::new();
+    let mut order = Vec::new();
+    for root in ctx.function_ids() {
+        if visited.contains(&root) {
+            continue;
+        }
+        // (fid, children_expanded) — the marker entry emits in post order.
+        let mut stack = vec![(root, false)];
+        while let Some((fid, expanded)) = stack.pop() {
+            if expanded {
+                order.push(fid);
+                continue;
+            }
+            if !visited.insert(fid) {
+                continue;
+            }
+            stack.push((fid, true));
+            for callee in Function::from_id(ctx, fid).callees() {
+                if !visited.contains(&callee) {
+                    stack.push((callee, false));
+                }
+            }
+        }
+    }
+    order
 }
 
 /// Assert [`Function::is_pure`] on every `pure_reg` function whose body has no
@@ -93,16 +130,29 @@ pub fn argpromote(ctx: &mut Context) -> bool {
 /// them is fully pure. Idempotent; returns `true` if any flag was newly set.
 /// The [`verify`](crate::verify) pure-function rule re-checks this invariant.
 pub fn mark_pure_functions(ctx: &mut Context) -> bool {
+    // Loop to a fixpoint: a pure function may call pure functions
+    // ([`mnemonic_is_pure`]), so a caller becomes provably pure only once its
+    // callees are flagged. A single pass in an unlucky (caller-before-callee)
+    // order would miss the caller; iterating until nothing new is flagged makes
+    // the result independent of `function_ids()` order (acyclic call graphs settle
+    // in depth-many rounds; recursion never flags, which is correct).
     let mut changed = false;
-    for fid in ctx.function_ids() {
-        let f = Function::from_id(ctx, fid);
-        if f.is_pure() || !f.is_pure_reg() {
-            continue;
+    loop {
+        let mut round = false;
+        for fid in ctx.function_ids() {
+            let f = Function::from_id(ctx, fid);
+            if f.is_pure() || !f.is_pure_reg() {
+                continue;
+            }
+            if body_is_pure(ctx, fid) {
+                Function::from_id_mut(ctx, fid).set_is_pure(true);
+                round = true;
+            }
         }
-        if body_is_pure(ctx, fid) {
-            Function::from_id_mut(ctx, fid).set_is_pure(true);
-            changed = true;
+        if !round {
+            break;
         }
+        changed = true;
     }
     changed
 }
@@ -112,32 +162,54 @@ pub fn mark_pure_functions(ctx: &mut Context) -> bool {
 ///
 /// Concretely it forbids: **loads** (a memory read is an untracked value source —
 /// the return projection follows SSA only and cannot prove a loaded value is
-/// independent of a symbolic input), **calls / indirect transfers / p-code ops**,
-/// and any **raw varnode operand** on a value-producing instruction (an
-/// un-promoted register/global read). **Stores are permitted**: they produce no
-/// value, so they never feed a returned field, and the emulation harvesting this
-/// property keeps the call in place — any real side effect the store represents
-/// is preserved. (This is why argpromote_stack's dead private seed-stores do not
-/// block purity.)
+/// independent of a symbolic input), **indirect transfers / p-code ops**, and any
+/// **raw varnode operand** on a value-producing instruction (an un-promoted
+/// register/global read). A **direct call to a function already proven `is_pure`**
+/// is permitted: its result is itself a deterministic function of its (SSA)
+/// arguments, and a pure callee clobbers nothing — so the call introduces no
+/// untracked value or side effect. (The call's own `clobbers` must be empty,
+/// guarding against a stale over-approximated clobber set.) **Stores are
+/// permitted**: they produce no value, so they never feed a returned field, and
+/// the emulation harvesting this property keeps the call in place — any real side
+/// effect the store represents is preserved. (This is why argpromote_stack's dead
+/// private seed-stores do not block purity.)
 pub(crate) fn body_is_pure(ctx: &Context, fid: FunctionId) -> bool {
     Function::from_id(ctx, fid)
         .iter()
-        .all(|block| block.iter().all(|insn| mnemonic_is_pure(insn.mnemonic())))
+        .all(|block| block.iter().all(|insn| mnemonic_is_pure(ctx, insn.mnemonic())))
 }
 
-fn mnemonic_is_pure(m: &Mnemonic) -> bool {
+fn mnemonic_is_pure(ctx: &Context, m: &Mnemonic) -> bool {
     match m {
         Mnemonic::Load(_)
-        | Mnemonic::Call(_)
         | Mnemonic::CallInd(_)
         | Mnemonic::BranchInd(_)
         | Mnemonic::PCodeOp(_) => false,
+        // A direct call to a pure function is a deterministic value of its args
+        // and clobbers nothing — provided the call site carries no residual
+        // clobbers of its own.
+        Mnemonic::Call(c) => c.clobbers.is_empty() && Function::from_id(ctx, c.target).is_pure(),
         // A store produces no value, so it never feeds a returned field.
         Mnemonic::Store(_) => true,
         // Every other op is a value computation or structured control flow; it is
         // pure as long as it reads no raw varnode (un-promoted register/global).
         _ => m.args().iter().all(|a| !matches!(a, ValueId::Varnode(_))),
     }
+}
+
+/// One scalar read through a promoted pointer: a load of `size` bytes at a fixed
+/// constant byte `offset` from the base. Each becomes its own by-value snapshot
+/// parameter (seeded into the shadow at `base + offset`) and its own caller-side
+/// `load(arg + offset, size)`. Keying the snapshot by `(offset, size)` — rather
+/// than snapshotting one contiguous `[base, base+offset+size)` region — is what
+/// lets a deref at a large fixed offset (e.g. a segment-relative `FS:0x30` read)
+/// promote: the width gate applies to the access `size`, not `offset + size`.
+#[derive(Clone, Copy)]
+struct ReadField {
+    /// Constant byte offset from the base pointer.
+    offset: u64,
+    /// Access width in bytes; 1/2/4/8.
+    size: usize,
 }
 
 /// A dereferenced pointer parameter slated for promotion, and the IR sites the
@@ -151,8 +223,12 @@ struct Promoted {
     name: String,
     /// Call-argument index of the pointer parameter.
     arg_idx: usize,
-    /// By-value width in bytes (the bounded region the body touches); 1/2/4/8.
-    region: usize,
+    /// Byte width of the base pointer itself (the address width), used to build
+    /// the `base + offset` constants on both the callee and caller side.
+    base_size: usize,
+    /// One snapshot scalar per distinct read `(offset, size)`, sorted by offset.
+    /// Empty for a write-only pointer.
+    reads: Vec<ReadField>,
     /// Load/store instructions whose space must switch to the shadow space.
     accesses: Vec<InstructionId>,
     /// Distinct `(address, size)` of each store target written through this
@@ -165,9 +241,9 @@ enum ParamUse {
     /// Not used as a load/store base — left untouched (e.g. a pointer used only
     /// in arithmetic and returned, or a plain integer).
     NonPointer,
-    /// A dereferenced pointer with a bounded region; promote it.
+    /// A dereferenced pointer with bounded scalar accesses; promote it.
     Deref {
-        region: usize,
+        reads: Vec<ReadField>,
         accesses: Vec<InstructionId>,
         write_targets: Vec<(ValueId, usize)>,
     },
@@ -195,10 +271,13 @@ fn try_promote(ctx: &mut Context, fid: FunctionId, shadow: SpaceId) -> bool {
         return false;
     }
 
-    // Composition is out of scope: a callee with its own memory effects would
-    // have to bubble its write-set up through ours. Bail if this function calls
-    // anything.
-    if function_makes_call(ctx, fid) {
+    // A call composes with our shadow promotion only if it is fully inert toward
+    // memory: a *direct* call, with no clobbers (writes nothing the caller sees),
+    // to a callee that reads no memory (so it cannot dereference any promoted
+    // pointer we hand it, and there is no read/write alias with our shadow). Any
+    // other call — indirect, clobbering, or memory-reading — would have to bubble
+    // its effects through ours, which is out of scope; bail.
+    if function_makes_blocking_call(ctx, fid) {
         return false;
     }
 
@@ -235,23 +314,36 @@ fn try_promote(ctx: &mut Context, fid: FunctionId, shadow: SpaceId) -> bool {
             ParamUse::NonPointer => {}
             ParamUse::Escape => return false,
             ParamUse::Deref {
-                region,
+                reads,
                 accesses,
                 write_targets,
             } => {
                 let Some(arg_idx) = arg_index_of(ctx, fid, &name) else {
                     return false;
                 };
+                let base_ty = ctx.type_of(param);
+                let base_size = ctx.types.size_of(base_ty);
                 promoted.push(Promoted {
                     param,
                     name,
                     arg_idx,
-                    region,
+                    base_size,
+                    reads,
                     accesses,
                     write_targets,
                 });
             }
         }
+    }
+
+    // All-or-nothing modelling gate: the read-via-shadow scheme is sound only if
+    // the shared shadow captures the function's *entire* memory footprint. If even
+    // one real-memory access is left unmodelled and may-alias a promoted read, the
+    // later store→load forwarder — which only sees shadow stores — would collapse
+    // that read to its seed across the invisible aliasing write (the bug this
+    // replaces). So promote only when every real-memory load/store is redirected.
+    if !all_accesses_modelled(ctx, fid, &promoted) {
+        return false;
     }
 
     // Multi-return soundness gate (see above): every written address must dominate
@@ -261,12 +353,41 @@ fn try_promote(ctx: &mut Context, fid: FunctionId, shadow: SpaceId) -> bool {
         return false;
     }
 
-    // Nothing to move to the caller unless some promoted pointer is written.
-    if promoted.iter().all(|p| p.write_targets.is_empty()) {
+    // Nothing to do unless some promoted pointer is actually dereferenced — read
+    // (its loaded scalar moves to a by-value arg) or written (its stored value
+    // moves to the returned write-set). A pointer touched only as data is a no-op.
+    if promoted
+        .iter()
+        .all(|p| p.reads.is_empty() && p.write_targets.is_empty())
+    {
         return false;
     }
 
     apply(ctx, fid, promoted, returns, shadow)
+}
+
+/// Whether every real-memory (default-space) load/store in `fid` is captured by
+/// `promoted` — i.e. will be redirected into the shadow. Accesses already in a
+/// shadow space (a prior promotion round) are inherently modelled and skipped, so
+/// the check is idempotent. A single uncaptured ram access fails it: see the
+/// all-or-nothing rationale at the call site.
+fn all_accesses_modelled(ctx: &Context, fid: FunctionId, promoted: &[Promoted]) -> bool {
+    let ram = ctx.default_space;
+    let captured: HashSet<InstructionId> = promoted
+        .iter()
+        .flat_map(|p| p.accesses.iter().copied())
+        .collect();
+    Function::from_id(ctx, fid).iter().all(|block| {
+        block.iter().all(|insn| {
+            let space = match insn.mnemonic() {
+                Mnemonic::Load(l) => l.space,
+                Mnemonic::Store(s) => s.space,
+                // Not a memory access — nothing to model.
+                _ => return true,
+            };
+            space != ram || captured.contains(&insn.id)
+        })
+    })
 }
 
 /// `true` if every promoted **store** dominates *all* of `returns` — the soundness
@@ -305,11 +426,26 @@ fn writes_dominate_returns(
 }
 
 /// `true` if `function_id` makes any call (direct or indirect).
-fn function_makes_call(ctx: &Context, function_id: FunctionId) -> bool {
+fn function_makes_blocking_call(ctx: &Context, function_id: FunctionId) -> bool {
     Function::from_id(ctx, function_id).blocks().any(|b| {
-        b.iter()
-            .any(|i| matches!(i.mnemonic(), Mnemonic::Call(_) | Mnemonic::CallInd(_)))
+        b.iter().any(|i| match i.mnemonic() {
+            // Indirect transfers: target unknown, cannot vet.
+            Mnemonic::CallInd(_) => true,
+            // A direct call is inert iff it clobbers nothing and the callee reads
+            // no memory; otherwise its effects would have to bubble through ours.
+            Mnemonic::Call(c) => !c.clobbers.is_empty() || function_reads_memory(ctx, c.target),
+            _ => false,
+        })
     })
+}
+
+/// `true` if `function_id`'s body contains any memory **load**. A memory-free
+/// callee cannot dereference a pointer passed to it, so handing it a promoted
+/// pointer is safe (it can neither observe our shadow nor alias it).
+fn function_reads_memory(ctx: &Context, function_id: FunctionId) -> bool {
+    Function::from_id(ctx, function_id)
+        .blocks()
+        .any(|b| b.iter().any(|i| matches!(i.mnemonic(), Mnemonic::Load(_))))
 }
 
 /// The call-argument index whose synthesized name matches `name`.
@@ -345,36 +481,85 @@ fn is_register(ctx: &Context, vn: VarnodeId) -> bool {
 /// redirect into the shadow space, the distinct write targets, and the by-value
 /// snapshot width (bounded by the *reads* — writes may land at any offset).
 fn analyze_param(ctx: &Context, param: ValueId) -> ParamUse {
+    // Only real (default-space) memory accesses are promotable. Accesses already
+    // redirected into a shadow space — and the seed store a prior promotion left
+    // behind — are skipped, not re-promoted: this is what makes the pass idempotent
+    // so it can be looped (fold → re-promote) to a fixpoint.
+    let ram = ctx.default_space;
     let mut accesses: Vec<InstructionId> = Vec::new();
-    // (load insn, offset value (None == 0), size) — used only to bound the read
-    // region the by-value snapshot must cover.
-    let mut reads: Vec<(InstructionId, Option<ValueId>, usize)> = Vec::new();
+    // (offset from base, access width) for each load — one snapshot scalar each.
+    let mut read_fields: Vec<ReadField> = Vec::new();
     let mut write_targets: Vec<(ValueId, usize)> = Vec::new();
     let mut is_deref = false;
 
+    // Record a load at constant byte `offset` of `size` bytes. The width is gated
+    // on the *access size* alone (not `offset + size`), so a deref at a large
+    // fixed offset still promotes. A scalar a register cannot hold (size ∉
+    // {1,2,4,8}) bails the whole function.
+    let mut push_read = |offset: u64, size: usize| -> bool {
+        if !matches!(size, 1 | 2 | 4 | 8) {
+            return false;
+        }
+        // Dedup by offset, widening to the largest access there (a narrower load
+        // forwards from the wider seed via base+const matching).
+        if let Some(f) = read_fields.iter_mut().find(|f| f.offset == offset) {
+            f.size = f.size.max(size);
+        } else {
+            read_fields.push(ReadField { offset, size });
+        }
+        true
+    };
+
     for uid in ctx.users(param).to_vec() {
         match ctx.get_insn(uid).mnemonic().clone() {
-            // param ± offset address computation.
+            // `param ± const` address computation. `Add` (offset on either side)
+            // and `param - const` (`Sub`, param on the left) both qualify.
             Mnemonic::Binop(b)
-                if matches!(b.op, Binop::Int(IntBinop::Add))
-                    && (b.lhs == param || b.rhs == param) =>
+                if (matches!(b.op, Binop::Int(IntBinop::Add))
+                    && (b.lhs == param || b.rhs == param))
+                    || (matches!(b.op, Binop::Int(IntBinop::Sub)) && b.lhs == param) =>
             {
+                let is_add = matches!(b.op, Binop::Int(IntBinop::Add));
                 let offset = if b.lhs == param { b.rhs } else { b.lhs };
                 let add_val = ValueId::Instruction(uid);
                 let mut any = false;
                 let mut all = true;
                 for u2 in ctx.users(add_val).to_vec() {
                     match ctx.get_insn(u2).mnemonic().clone() {
-                        Mnemonic::Load(l) if l.ptr == add_val => {
+                        Mnemonic::Load(l) if l.ptr == add_val && l.space == ram => {
+                            // Reads become caller-seeded snapshots at `arg + offset`,
+                            // so only a `param + const` form is recomputable as a
+                            // non-negative offset; a `param - const` read would need
+                            // a signed snapshot offset (unsupported) — leave it
+                            // unmodelled for the all-or-nothing gate to reject.
+                            if !is_add {
+                                all = false;
+                                continue;
+                            }
+                            let Some(block) = ctx.get_insn(u2).parent().map(|b| b.id) else {
+                                return ParamUse::Escape;
+                            };
+                            let range = value_range(ctx, offset, block);
+                            if range.min != range.max {
+                                return ParamUse::Escape;
+                            }
+                            if !push_read(range.min, l.size) {
+                                return ParamUse::Escape;
+                            }
                             any = true;
                             accesses.push(u2);
-                            reads.push((u2, Some(offset), l.size));
                         }
-                        Mnemonic::Store(s) if s.ptr == add_val => {
+                        Mnemonic::Store(s) if s.ptr == add_val && s.space == ram => {
+                            // The write address rides out in the return set as data,
+                            // so any `param ± const` store target qualifies.
                             any = true;
                             accesses.push(u2);
                             write_targets.push((add_val, s.size));
                         }
+                        // Already-redirected shadow access from a prior promotion:
+                        // following our own indirection, not an escape — ignore.
+                        Mnemonic::Load(l) if l.ptr == add_val => {}
+                        Mnemonic::Store(s) if s.ptr == add_val => {}
                         _ => all = false,
                     }
                 }
@@ -389,12 +574,14 @@ fn analyze_param(ctx: &Context, param: ValueId) -> ParamUse {
                 // `!any`: pure address arithmetic (e.g. `return p + k`) — fine.
             }
             // Direct access at offset 0.
-            Mnemonic::Load(l) if l.ptr == param => {
+            Mnemonic::Load(l) if l.ptr == param && l.space == ram => {
+                if !push_read(0, l.size) {
+                    return ParamUse::Escape;
+                }
                 is_deref = true;
                 accesses.push(uid);
-                reads.push((uid, None, l.size));
             }
-            Mnemonic::Store(s) if s.ptr == param => {
+            Mnemonic::Store(s) if s.ptr == param && s.space == ram => {
                 is_deref = true;
                 accesses.push(uid);
                 write_targets.push((param, s.size));
@@ -418,24 +605,9 @@ fn analyze_param(ctx: &Context, param: ValueId) -> ParamUse {
         return ParamUse::NonPointer;
     }
 
-    // The snapshot must cover every offset *read*. An unbounded (e.g. loop-driven)
-    // offset yields a huge region that fails the width check. A write-only param
-    // needs no snapshot (region 0): its store precedes the write-set reload.
-    let mut region_end: u64 = 0;
-    for (insn, offset, size) in &reads {
-        let Some(block) = ctx.get_insn(*insn).parent().map(|b| b.id) else {
-            return ParamUse::Escape;
-        };
-        let hi = match offset {
-            None => 0,
-            Some(off) => value_range(ctx, *off, block).max,
-        };
-        region_end = region_end.max(hi.saturating_add(*size as u64));
-    }
-    let region = region_end as usize;
-    if region != 0 && !matches!(region, 1 | 2 | 4 | 8) {
-        return ParamUse::Escape;
-    }
+    // Deterministic offset order, shared by callee param creation and caller
+    // argument loads.
+    read_fields.sort_by_key(|f| f.offset);
 
     // Dedup write targets by address value.
     let mut deduped: Vec<(ValueId, usize)> = Vec::new();
@@ -446,7 +618,7 @@ fn analyze_param(ctx: &Context, param: ValueId) -> ParamUse {
     }
 
     ParamUse::Deref {
-        region,
+        reads: read_fields,
         accesses,
         write_targets: deduped,
     }
@@ -486,22 +658,36 @@ fn apply(
 
     // ---- callee rewrite -----------------------------------------------------
 
-    // Add a by-value snapshot parameter per *read* region and seed the shadow
-    // with it at entry. Write-only params (region 0) need no snapshot.
-    let mut snapshots: Vec<(ValueId, ValueId, usize)> = Vec::new(); // (ptr_param, snapshot, region)
+    // Add one by-value snapshot parameter per read scalar and seed the shadow at
+    // its `base + offset` address at entry, so the body's redirected load forwards
+    // from it. Write-only params contribute no reads, hence no snapshot.
+    // `(base_param, base_size, offset, snapshot_value, size)`.
+    let mut snapshots: Vec<(ValueId, usize, u64, ValueId, usize)> = Vec::new();
     for p in &promoted {
-        if p.region == 0 {
-            continue;
+        for f in &p.reads {
+            let val_pid = BasicBlock::from_id_mut(ctx, root).push_param(f.size).id;
+            ctx.values.block_params[val_pid].name =
+                Some(Cow::Owned(format!("{}_val_{:x}", p.name, f.offset)));
+            snapshots.push((
+                p.param,
+                p.base_size,
+                f.offset,
+                ValueId::BlockParam(val_pid),
+                f.size,
+            ));
         }
-        let val_pid = BasicBlock::from_id_mut(ctx, root).push_param(p.region).id;
-        ctx.values.block_params[val_pid].name = Some(Cow::Owned(format!("{}_val", p.name)));
-        snapshots.push((p.param, ValueId::BlockParam(val_pid), p.region));
     }
     if !snapshots.is_empty() {
         let mut b = Builder::from_block(BasicBlock::from_id_mut(ctx, root));
         b.set_insert_point_to_start();
-        for (ptr, snap, _region) in &snapshots {
-            b.push_store(*snap, *ptr, shadow);
+        for (base, base_size, offset, snap, _size) in &snapshots {
+            let addr = if *offset == 0 {
+                *base
+            } else {
+                let k = b.context_mut().get_const(*offset, *base_size).id();
+                b.push_add(*base, k).id()
+            };
+            b.push_store(*snap, addr, shadow);
         }
     }
 
@@ -539,9 +725,14 @@ fn apply(
     // `base_len` (uniform across returns — the register channel emits the same
     // output fields everywhere) is how many register fields precede ours, the offset
     // the caller's memory-replay extracts must skip past.
+    // A read-only promotion has no write-set: leave every return untouched (and
+    // the call result type unchanged) — only the by-value read args are added.
     let mut base_len = 0usize;
     let mut writeset_ty = None;
     for &ret_id in &returns {
+        if write_targets.is_empty() {
+            break;
+        }
         let ret_block = ctx.get_insn(ret_id).parent().map(|b| b.id).unwrap();
         let base_fields: Vec<(String, ValueId)> = match ctx.get_insn(ret_id).mnemonic() {
             Mnemonic::Return(r) => match r.value {
@@ -594,7 +785,6 @@ fn apply(
         }
         writeset_ty = Some(ctx.type_of(writeset_val));
     }
-    let writeset_ty = writeset_ty.expect("returns is non-empty");
 
     // ---- caller rewrite -----------------------------------------------------
     let n_writes = write_targets.len();
@@ -607,17 +797,28 @@ fn apply(
             _ => continue,
         };
 
-        // Pass each read-region snapshot by value, loaded from the pointer arg.
+        // Pass each read scalar by value, loaded from `arg + offset` — the same
+        // address the callee dereferenced, relocated to the caller (faithful: the
+        // base is a by-value param identical on both sides).
         let mut new_args = args.clone();
         {
             let mut b = Builder::from_block(BasicBlock::from_id_mut(ctx, call_block));
             b.set_insert_point_before(call_id);
             for p in &promoted {
-                if p.region == 0 || p.arg_idx >= args.len() {
+                if p.arg_idx >= args.len() {
                     continue;
                 }
-                let snap = b.push_load::<false>(args[p.arg_idx], p.region, ram).id();
-                new_args.push(snap);
+                let base = args[p.arg_idx];
+                for f in &p.reads {
+                    let addr = if f.offset == 0 {
+                        base
+                    } else {
+                        let k = b.context_mut().get_const(f.offset, p.base_size).id();
+                        b.push_add(base, k).id()
+                    };
+                    let snap = b.push_load::<false>(addr, f.size, ram).id();
+                    new_args.push(snap);
+                }
             }
         }
         ctx.replace_instruction_mnemonic(
@@ -632,7 +833,13 @@ fn apply(
         // the register channel may have already typed this call to its (smaller)
         // register-only write-set, and we are *growing* it with the appended
         // memory pairs — a legitimate aggregate resize, like `dead_signature`'s.
-        Instruction::from_id_mut(ctx, call_id).set_type_resized(writeset_ty);
+        // A read-only promotion leaves the return (and so the result type) alone.
+        if let Some(writeset_ty) = writeset_ty {
+            Instruction::from_id_mut(ctx, call_id).set_type_resized(writeset_ty);
+        }
+        if n_writes == 0 {
+            continue;
+        }
 
         // Replay each returned `(addr, value)` write into real memory.
         let Some(cont) = BasicBlock::from_id(ctx, call_block)
@@ -1305,6 +1512,253 @@ mod tests {
             "caller must load the region value before the call"
         );
         let _ = call_id;
+    }
+
+    #[test]
+    fn pure_function_may_call_pure_function() {
+        // A `pure_reg` caller whose only non-trivial instruction is a clobber-free
+        // call to an `is_pure` callee is itself pure; flip the callee to impure and
+        // the caller must no longer qualify.
+        let mut tc = qcode::testing::TestContext::new();
+        qcode!(
+            tc.ctx,
+            "
+            fn callee:
+                <c_entry>
+                    return [i64 0];
+
+            fn caller:
+                <f_entry>
+                    goto <f_call>;
+                <f_call>
+                    call <callee>;
+                <f_cont>
+                    return [i64 0];
+            "
+        );
+        let _ = (f_entry, f_cont);
+
+        Function::from_id_mut(&mut tc.ctx, caller).set_pure_reg(true);
+        set_call(&mut tc, f_call, callee, vec![]);
+        tc.ctx.add_cfg_edge(f_call, f_cont);
+
+        // Callee not yet pure → caller's call is an untracked effect.
+        assert!(!body_is_pure(&tc.ctx, caller), "call to impure callee blocks purity");
+
+        Function::from_id_mut(&mut tc.ctx, callee).set_is_pure(true);
+        assert!(
+            body_is_pure(&tc.ctx, caller),
+            "a clobber-free call to a pure callee is permitted in a pure body"
+        );
+
+        // mark_pure flags the caller once the callee is pure, order-independently.
+        Function::from_id_mut(&mut tc.ctx, caller).set_pure_reg(true);
+        mark_pure_functions(&mut tc.ctx);
+        assert!(
+            Function::from_id(&tc.ctx, caller).is_pure(),
+            "caller of a pure function should be marked pure"
+        );
+    }
+
+    /// Whether `f`'s root has a by-value snapshot param (a promoted read).
+    fn has_val_param(ctx: &Context, f: FunctionId) -> bool {
+        Function::from_id(ctx, f).root().is_some_and(|b| {
+            b.params()
+                .any(|p| p.name().is_some_and(|n| n.contains("_val_")))
+        })
+    }
+
+    #[test]
+    fn unmodelable_access_blocks_whole_promotion() {
+        // All-or-nothing gate: if any real-memory access cannot be captured in the
+        // shadow — here a store through an address *loaded from memory* (a
+        // multi-level deref the model can't recompute) — the whole function is left
+        // unpromoted, even though it has a clean `@p+0x30` read. Otherwise the
+        // shadow would miss that store and a later store→load forward could
+        // unsoundly collapse a read across it.
+        let mut tc = qcode::testing::TestContext::new();
+        let input = stack_input(&mut tc, 4, 8);
+        qcode!(
+            tc.ctx,
+            "
+            fn f:
+                <f_entry @stack_10000004:i64>
+                    %addr = load(i64, @stack_10000004);
+                    store(%addr, i32 0);
+                    %a = @stack_10000004 + i64 0x30;
+                    %v = load(i32, %a);
+                    return [%v];
+
+            fn g:
+                <g_entry>
+                    goto <g_call>;
+                <g_call>
+                    call <f>;
+                <g_cont>
+                    return [i64 0];
+            "
+        );
+        let _ = g;
+        Function::from_id_mut(&mut tc.ctx, f).set_input_regs(vec![input]);
+        let ptr = tc.ctx.get_const(0x4000, 8).id();
+        set_call(&mut tc, g_call, f, vec![ptr]);
+        tc.ctx.add_cfg_edge(g_call, g_cont);
+
+        assert!(
+            !argpromote(&mut tc.ctx),
+            "an unmodelable access must block the whole promotion"
+        );
+        assert!(
+            !has_val_param(&tc.ctx, f),
+            "no read should be promoted when the footprint can't be fully modelled"
+        );
+    }
+
+    #[test]
+    fn sub_offset_store_is_modelled_and_read_promotes() {
+        // A `Sub`-form deref store (`@p-4`, the `[ESP-k]` shape) is now captured and
+        // redirected into the shadow, so the footprint is fully modelled and the
+        // disjoint `@p+0x30` read still promotes. (The shared shadow + alias-aware
+        // gvn is what later keeps an *overlapping* read behind a load; here the
+        // store is disjoint, so the read is free to forward.)
+        let mut tc = qcode::testing::TestContext::new();
+        let input = stack_input(&mut tc, 4, 8);
+        qcode!(
+            tc.ctx,
+            "
+            fn f:
+                <f_entry @stack_10000004:i64>
+                    %s = @stack_10000004 - i64 0x4;
+                    store(%s, i32 0);
+                    %a = @stack_10000004 + i64 0x30;
+                    %v = load(i32, %a);
+                    return [%v];
+
+            fn g:
+                <g_entry>
+                    goto <g_call>;
+                <g_call>
+                    call <f>;
+                <g_cont>
+                    return [i64 0];
+            "
+        );
+        let _ = g;
+        Function::from_id_mut(&mut tc.ctx, f).set_input_regs(vec![input]);
+        let ptr = tc.ctx.get_const(0x4000, 8).id();
+        set_call(&mut tc, g_call, f, vec![ptr]);
+        tc.ctx.add_cfg_edge(g_call, g_cont);
+
+        assert!(
+            argpromote(&mut tc.ctx),
+            "a fully-modelled footprint (Sub store + disjoint read) must promote"
+        );
+        assert!(
+            has_val_param(&tc.ctx, f),
+            "the disjoint read should still be promoted"
+        );
+    }
+
+    #[test]
+    fn argpromote_is_idempotent() {
+        // Re-running over already-promoted IR must be a no-op: the seed store and
+        // the redirected shadow accesses live in a shadow space, which
+        // `analyze_param` now skips. (Without this, the seed `store(snap, ptr)`
+        // would look like a fresh write through the pointer and re-promote.)
+        let mut tc = qcode::testing::TestContext::new();
+        let input = stack_input(&mut tc, 4, 8);
+        qcode!(
+            tc.ctx,
+            "
+            fn f:
+                <f_entry @stack_10000004:i64>
+                    %v = load(i32, @stack_10000004);
+                    store(@stack_10000004, %v);
+                    return [i64 0];
+
+            fn g:
+                <g_entry>
+                    goto <g_call>;
+                <g_call>
+                    call <f>;
+                <g_cont>
+                    return [i64 0];
+            "
+        );
+        let _ = g;
+        Function::from_id_mut(&mut tc.ctx, f).set_input_regs(vec![input]);
+        let ptr = tc.ctx.get_const(0x4000, 8).id();
+        set_call(&mut tc, g_call, f, vec![ptr]);
+        tc.ctx.add_cfg_edge(g_call, g_cont);
+
+        assert!(argpromote(&mut tc.ctx), "first run promotes");
+        assert!(
+            !argpromote(&mut tc.ctx),
+            "second run over promoted IR must change nothing"
+        );
+    }
+
+    #[test]
+    fn promotes_read_at_large_fixed_offset() {
+        // A read at offset 0x30 (a segment-relative `FS:0x30`-style access) used to
+        // Escape: the snapshot was a contiguous `[base, base+0x30+4)` = 0x34-byte
+        // region failing the 1|2|4|8 width gate. Now the offset is decoupled from
+        // the width: a 4-byte scalar keyed by offset 0x30. Read-only, so no return
+        // rewrite — only a by-value arg appears.
+        let mut tc = qcode::testing::TestContext::new();
+        let input = stack_input(&mut tc, 4, 8);
+
+        qcode!(
+            tc.ctx,
+            "
+            fn f:
+                <f_entry @stack_10000004:i64>
+                    %a = @stack_10000004 + i64 0x30;
+                    %v = load(i32, %a);
+                    return [%v];
+
+            fn g:
+                <g_entry>
+                    goto <g_call>;
+                <g_call>
+                    call <f>;
+                <g_cont>
+                    return [i64 0];
+            "
+        );
+        let _ = g;
+
+        Function::from_id_mut(&mut tc.ctx, f).set_input_regs(vec![input]);
+        let ptr = tc.ctx.get_const(0x4000, 8).id();
+        set_call(&mut tc, g_call, f, vec![ptr]);
+        tc.ctx.add_cfg_edge(g_call, g_cont);
+
+        assert!(
+            argpromote(&mut tc.ctx),
+            "a 4-byte read at fixed offset 0x30 should promote"
+        );
+
+        // The callee gains a by-value snapshot param keyed by the offset.
+        let has_val_param = Function::from_id(&tc.ctx, f).root().is_some_and(|b| {
+            b.params()
+                .any(|p| p.name().is_some_and(|n| n.contains("_val_30")))
+        });
+        assert!(has_val_param, "callee must gain a `*_val_30` by-value param");
+
+        // The caller computes `arg + 0x30` and loads the scalar before the call.
+        let g_block = BasicBlock::from_id(&tc.ctx, g_call);
+        assert!(
+            g_block
+                .iter()
+                .any(|i| matches!(i.mnemonic(), Mnemonic::Load(_))),
+            "caller must load the scalar at arg + 0x30"
+        );
+        assert!(
+            g_block.iter().any(
+                |i| matches!(i.mnemonic(), Mnemonic::Binop(b) if matches!(b.op, Binop::Int(IntBinop::Add)))
+            ),
+            "caller must compute the arg + 0x30 address"
+        );
     }
 
     #[test]

@@ -226,15 +226,28 @@ name = "pre-pure-cleanup"
 scope = "function"
 passes = ["gvn", "dead_store", "dce"]
 
-# Now that every side-effect channel is functionalized, assert `is_pure` on the
-# functions whose returned values are a deterministic function of their params
-# (no loads / external reads). The following `gvn` then emulates such callees at
-# call sites with constant arguments, replacing the projecting `extract` with the
-# computed return value.
+# Purify to a whole-program fixpoint by interleaving marking, pure-call folding,
+# and re-promotion — a function's purity can unlock its callers'. Each round:
+#   * `mark_pure` asserts `is_pure` on functions whose returns are now a
+#     deterministic function of their params (a pure call to an already-pure
+#     callee is permitted, so a caller settles once its callees are flagged);
+#   * `module(gvn)` emulates those pure callees at constant-argument call sites,
+#     replacing the projecting `extract` with the computed literal — which can
+#     turn a previously call-derived address (e.g. a deobfuscated `FS:<canary>`
+#     offset) into a constant, and forwards argpromote's shadow seeds into the
+#     loads that read them back;
+#   * `module(dce)` / `module(dead_store)` sweep the folded extracts, now-dead
+#     calls, and unread shadow stores;
+#   * `argpromote` then re-runs: with the address now constant, the load it had to
+#     skip last round becomes a by-value argument, functionalizing one more memory
+#     channel and feeding the next round's `mark_pure`.
+# `argpromote` is idempotent (it skips shadow-space accesses), `is_pure` only ever
+# grows, and folding only removes work, so the round count is bounded.
 [[stage]]
 name = "mark-pure"
 scope = "module"
-passes = ["mark_pure"]
+passes = ["mark_pure", "module(gvn)", "module(dce)", "module(dead_store)", "argpromote"]
+repeat_until = "no_change"
 
 # Aesthetic changes. `include_external` so the demangler also reaches imported
 # library functions (PLT stubs like `_ZNSsixEj` -> `std::string::operator[]`),

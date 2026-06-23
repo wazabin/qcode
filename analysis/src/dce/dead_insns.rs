@@ -2,8 +2,10 @@ use rustc_hash::FxHashSet as HashSet;
 
 use qcode::{
     context::Context,
-    value::{BasicBlock, BlockId, FunctionId, InstructionId, insn::Mnemonic},
+    value::{BasicBlock, BlockId, Function, FunctionId, InstructionId, insn::Mnemonic},
 };
+
+use crate::loop_unroll::replace_terminator_with_branch;
 
 /// Returns instructions in `block_id` that are pure and have no users.
 pub fn dead_insns(ctx: &Context, block_id: BlockId) -> HashSet<InstructionId> {
@@ -41,6 +43,57 @@ pub fn remove_dead_insns(ctx: &mut Context, block_id: BlockId) -> bool {
 
     let params_changed = remove_unused_no_pred_block_params(ctx, block_id);
     changed || params_changed
+}
+
+/// Removes a `Call` terminator whose callee is `is_pure`, whose return value
+/// has no users, and whose clobber set is empty: such a call has no observable
+/// effect and is dead.
+///
+/// A call is a terminator with a single CFG fall-through edge to its
+/// continuation, so it cannot simply be deleted (that would tear down the edge
+/// and orphan the continuation). Instead it is rewritten into an unconditional
+/// `Branch` to that fall-through successor, preserving the CFG minus the call.
+/// The fall-through has no params fed by the call, so the branch carries no
+/// arguments.
+pub fn remove_dead_pure_call(ctx: &mut Context, block_id: BlockId) -> bool {
+    let Some(term_id) = BasicBlock::from_id(ctx, block_id)
+        .instruction_ids()
+        .last()
+        .copied()
+    else {
+        return false;
+    };
+
+    let Mnemonic::Call(call) = ctx.get_insn(term_id).mnemonic() else {
+        return false;
+    };
+    if !call.clobbers.is_empty() {
+        return false;
+    }
+    let target = call.target;
+    if !Function::from_id(ctx, target).is_pure() {
+        return false;
+    }
+    if !ctx.users(term_id).is_empty() {
+        return false;
+    }
+
+    // A pure call's block has exactly one successor: its fall-through.
+    let successors: Vec<BlockId> = BasicBlock::from_id(ctx, block_id)
+        .successors()
+        .map(|(_, b)| b)
+        .collect();
+    debug_assert_eq!(
+        successors.len(),
+        1,
+        "pure call block must have a single fall-through successor"
+    );
+    let Some(&fallthrough) = successors.first() else {
+        return false;
+    };
+
+    replace_terminator_with_branch(ctx, block_id, fallthrough, vec![]);
+    true
 }
 
 /// Removes block params that have no users when the block has no incoming
@@ -116,7 +169,10 @@ mod tests {
         context::Context,
         space::SpaceId,
         testing::TestContext,
-        value::{BlockId, ValueId, insn::PCodeOpId},
+        value::{
+            BlockId, Function, FunctionId, ValueId,
+            insn::{Mnemonic, PCodeOpId},
+        },
     };
 
     fn reg_space(ctx: &Context) -> SpaceId {
@@ -251,6 +307,90 @@ mod tests {
         assert!(dead.is_empty(), "terminator must not be marked dead");
     }
 
+    /// Build a callee (optionally marked `is_pure`) and a caller whose root
+    /// block at `0x1000` ends in a `Call` to it, with a fall-through edge to a
+    /// continuation block at `0x2000`. If `use_result`, the continuation
+    /// `Extract`s the call's return value so it has a user. Returns the caller's
+    /// call block and continuation block.
+    fn build_call_case(
+        ctx: &mut Context<'static>,
+        pure: bool,
+        use_result: bool,
+    ) -> (BlockId, BlockId) {
+        let callee = Function::make(ctx, "callee".into()).unwrap().id;
+        let callee_block = ctx.get_or_make_block(0x4000);
+        Function::from_id_mut(ctx, callee).set_root(callee_block).unwrap();
+        Function::from_id_mut(ctx, callee).set_is_pure(pure);
+
+        let caller = Function::make(ctx, "caller".into()).unwrap().id;
+        let call_block = ctx.get_or_make_block(0x1000);
+        Function::from_id_mut(ctx, caller).set_root(call_block).unwrap();
+
+        let call_id = {
+            let mut b = Builder::from_context(ctx, 0x1000);
+            let id = b.push_call(callee).id();
+            unsafe { b.dont_finalize() };
+            id
+        };
+
+        let cont = ctx.get_or_make_block(0x2000);
+        ctx.add_cfg_edge(call_block, cont);
+
+        if use_result {
+            // Give the call's return value a user so it is no longer dead.
+            let reg = ctx.try_get_space("register").unwrap();
+            let rax = ctx.get_named("r0").unwrap().as_varnode().unwrap();
+            let mut b = Builder::from_context(ctx, 0x2000);
+            b.push_store(call_id, ValueId::Varnode(rax), reg);
+            unsafe { b.dont_finalize() };
+        }
+
+        (call_block, cont)
+    }
+
+    fn terminator(ctx: &Context, block_id: BlockId) -> Mnemonic {
+        let id = *BasicBlock::from_id(ctx, block_id)
+            .instruction_ids()
+            .last()
+            .unwrap();
+        ctx.get_insn(id).mnemonic().clone()
+    }
+
+    #[test]
+    fn unused_pure_call_rewritten_to_branch() {
+        let mut ctx = TestContext::new().ctx;
+        let (call_block, cont) = build_call_case(&mut ctx, true, false);
+
+        assert!(remove_dead_pure_call(&mut ctx, call_block));
+
+        match terminator(&ctx, call_block) {
+            Mnemonic::Branch(br) => assert_eq!(br.target, cont, "branch must target fall-through"),
+            other => panic!("expected branch, got {other:?}"),
+        }
+        // The continuation is still reachable via exactly its one predecessor.
+        let preds: Vec<_> = BasicBlock::from_id(&ctx, cont).predecessors().collect();
+        assert_eq!(preds.len(), 1, "continuation must keep its single predecessor");
+        assert_eq!(preds[0].1, call_block);
+    }
+
+    #[test]
+    fn used_pure_call_kept() {
+        let mut ctx = TestContext::new().ctx;
+        let (call_block, _) = build_call_case(&mut ctx, true, true);
+
+        assert!(!remove_dead_pure_call(&mut ctx, call_block));
+        assert!(matches!(terminator(&ctx, call_block), Mnemonic::Call(_)));
+    }
+
+    #[test]
+    fn unused_impure_call_kept() {
+        let mut ctx = TestContext::new().ctx;
+        let (call_block, _) = build_call_case(&mut ctx, false, false);
+
+        assert!(!remove_dead_pure_call(&mut ctx, call_block));
+        assert!(matches!(terminator(&ctx, call_block), Mnemonic::Call(_)));
+    }
+
     #[test]
     fn unused_entry_block_param_removed_after_dead_user_is_removed() {
         let (mut ctx, block_id) = build_block(|b| {
@@ -293,8 +433,19 @@ impl FunctionPass for Dce {
             .map(|b| b.id)
             .collect();
         let mut changed = false;
-        for block_id in block_ids {
-            changed |= remove_dead_insns(ctx, block_id);
+        // Loop to fixed point: rewriting a dead pure call into a branch can make
+        // its argument-producing instructions (Extracts, etc.) unused, which the
+        // dead-instruction sweep then removes, and so on.
+        loop {
+            let mut round = false;
+            for &block_id in &block_ids {
+                round |= remove_dead_pure_call(ctx, block_id);
+                round |= remove_dead_insns(ctx, block_id);
+            }
+            if !round {
+                break;
+            }
+            changed = true;
         }
         Ok(changed)
     }

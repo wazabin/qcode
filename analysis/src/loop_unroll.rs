@@ -440,7 +440,7 @@ fn remap_mnemonic(mnemonic: &Mnemonic, value_map: &HashMap<ValueId, ValueId>) ->
     remapped
 }
 
-fn replace_terminator_with_branch(
+pub(crate) fn replace_terminator_with_branch(
     ctx: &mut Context,
     block: BlockId,
     target: BlockId,
