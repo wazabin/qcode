@@ -121,6 +121,10 @@ struct Stage {
 pub struct Pipeline {
     stages: Vec<Stage>,
     debug: bool,
+    /// Function entry addresses the user asked to skip optimizing (`--ignore`).
+    /// Carried from the CLI to the loader, which stamps them onto the lifted
+    /// [`Context`](qcode::context::Context) before analysis runs.
+    ignored_functions: HashSet<u64>,
 }
 
 /// A TOML pipeline available from the user's runtime pipeline directory.
@@ -338,7 +342,11 @@ impl Pipeline {
                 dump: sc.dump,
             });
         }
-        Ok(Pipeline { stages, debug })
+        Ok(Pipeline {
+            stages,
+            debug,
+            ignored_functions: HashSet::default(),
+        })
     }
 
     /// Build a single function-scoped stage from pass names (à-la-carte), for
@@ -365,7 +373,21 @@ impl Pipeline {
                 dump: Vec::new(),
             }],
             debug: false,
+            ignored_functions: HashSet::default(),
         })
+    }
+
+    /// Mark the given function entry addresses to be skipped by every
+    /// per-function pass (`--ignore`). The loader stamps these onto the lifted
+    /// context before analysis. Returns `self` for builder-style chaining.
+    pub fn with_ignored_functions(mut self, addrs: HashSet<u64>) -> Self {
+        self.ignored_functions = addrs;
+        self
+    }
+
+    /// The function entry addresses this pipeline run skips optimizing.
+    pub fn ignored_functions(&self) -> &HashSet<u64> {
+        &self.ignored_functions
     }
 
     /// Run every stage in order over `ctx`. `round` and `progress` are threaded
@@ -896,6 +918,9 @@ async fn run_function_stage(
     let fun_ids: Vec<FunctionId> = ctx
         .functions()
         .filter(|f| stage.include_external || !f.is_external())
+        // Honor `--ignore`: never run a per-function pass on a function the user
+        // marked ignored. It stays lifted, just unoptimized.
+        .filter(|f| !ctx.is_function_ignored(f.address()))
         .map(|f| f.id)
         .filter(|id| !stage.only_dirty || previous_dirty.is_none_or(|dirty| dirty.contains(id)))
         .filter(|id| restrict.is_none_or(|r| r.contains(id)))

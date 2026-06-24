@@ -273,22 +273,25 @@ struct Promoted {
     write_targets: Vec<(ValueId, usize)>,
 }
 
-/// How a named parameter is used, deciding whether it is promoted.
-enum ParamUse {
-    /// Not used as a load/store base — left untouched (e.g. a pointer used only
-    /// in arithmetic and returned, or a plain integer).
-    NonPointer,
-    /// A dereferenced pointer with bounded scalar accesses; promote it.
-    Deref {
-        reads: Vec<ReadField>,
-        accesses: Vec<InstructionId>,
-        write_targets: Vec<(ValueId, usize)>,
-    },
-    /// Dereferenced *and* the address leaks somewhere this pass cannot follow
-    /// (stored to memory, mixed deref/non-deref arithmetic). Promoting some but
-    /// not all dereferenced pointers would be unsound, so this bails the whole
-    /// function.
-    Escape,
+/// How a named parameter is used, deciding whether and how it is promoted.
+struct ParamInfo {
+    /// The param is a load/store base at least once (a real dereference). When
+    /// false the param is left untouched (e.g. a plain integer, or a pointer used
+    /// only in arithmetic and returned).
+    is_deref: bool,
+    /// The address leaks somewhere this pass cannot follow — stored to memory,
+    /// mixed deref/non-deref arithmetic, or a read with no recomputable
+    /// `(offset, size)`. This disqualifies the **shadow** path (promoting
+    /// some-but-not-all dereferenced pointers in one shadow is unsound) and so
+    /// forces the whole function onto the **partial** path, which uses no shadow
+    /// and can soundly promote this param's bounded reads regardless of the leak.
+    escaped: bool,
+    /// One snapshot scalar per distinct read `(offset, size)`, sorted by offset.
+    reads: Vec<ReadField>,
+    /// Load/store instructions to redirect into the shadow (shadow path only).
+    accesses: Vec<InstructionId>,
+    /// Distinct `(address, size)` of each store target written through this param.
+    write_targets: Vec<(ValueId, usize)>,
 }
 
 fn try_promote(
@@ -351,42 +354,52 @@ fn try_promote(
         .collect();
 
     let mut promoted: Vec<Promoted> = Vec::new();
+    let mut any_escape = false;
     for (param, name) in candidates {
-        match analyze_param(ctx, param) {
-            ParamUse::NonPointer => {}
-            ParamUse::Escape => return false,
-            ParamUse::Deref {
-                reads,
-                accesses,
-                write_targets,
-            } => {
-                let Some(arg_idx) = arg_index_of(ctx, fid, &name) else {
-                    return false;
-                };
-                let base_ty = ctx.type_of(param);
-                let base_size = ctx.types.size_of(base_ty);
-                promoted.push(Promoted {
-                    param,
-                    name,
-                    arg_idx,
-                    base_size,
-                    reads,
-                    accesses,
-                    write_targets,
-                });
-            }
+        let info = analyze_param(ctx, param);
+        // A leaked address forces partial mode (it is unsound only for shadow).
+        // Recorded even for a non-dereferenced param (a pure `store(p -> q)` leak).
+        any_escape |= info.escaped;
+        if !info.is_deref {
+            continue;
         }
+        // A deref param with no findable argument index cannot have its snapshot
+        // loaded at the caller; skip it. Its accesses then stay unmodelled, which
+        // steers the function to partial mode.
+        let Some(arg_idx) = arg_index_of(ctx, fid, &name) else {
+            continue;
+        };
+        let base_ty = ctx.type_of(param);
+        let base_size = ctx.types.size_of(base_ty);
+        promoted.push(Promoted {
+            param,
+            name,
+            arg_idx,
+            base_size,
+            reads: info.reads,
+            accesses: info.accesses,
+            write_targets: info.write_targets,
+        });
     }
 
-    // All-or-nothing modelling gate: the read-via-shadow scheme is sound only if
-    // the shared shadow captures the function's *entire* memory footprint. If even
-    // one real-memory access is left unmodelled and may-alias a promoted read, the
-    // later store→load forwarder — which only sees shadow stores — would collapse
-    // that read to its seed across the invisible aliasing write (the bug this
-    // replaces). So promote only when every real-memory load/store is redirected.
-    if !all_accesses_modelled(ctx, fid, &promoted) {
-        return false;
+    // Mode selection. The shadow path is sound only when (a) no promoted address
+    // leaks — promoting some-but-not-all dereferenced pointers in one shadow is
+    // unsound — and (b) the shared shadow captures the function's *entire* memory
+    // footprint, so the later store→load forwarder (which only sees shadow stores)
+    // cannot collapse a read to its seed across an invisible aliasing write.
+    //
+    // When either condition fails we no longer bail outright: we fall back to
+    // *partial* promotion (see [`apply_partial`]) — seed each read snapshot into
+    // REAL ram and leave every load/store untouched. No shadow, no write-set, no
+    // purity. The seed is a no-op-equivalent (it re-writes the value the caller
+    // loaded from that same slot), so it is sound on its own regardless of aliasing
+    // or any leak; a downstream forwarder may then collapse a loaded pointer into a
+    // clean by-value param that a later fully-modelled round can shadow-promote.
+    if any_escape || !all_accesses_modelled(ctx, fid, &promoted) {
+        return apply_partial(ctx, fid, &promoted);
     }
+
+    // ---- shadow path (no leak, footprint fully modelled) -------------------
 
     // Multi-return soundness gate (see above): every written address must dominate
     // all returns. A single return trivially satisfies this (it post-dominates the
@@ -519,10 +532,14 @@ fn is_register(ctx: &Context, vn: VarnodeId) -> bool {
     matches!(Varnode::from_id(ctx, vn).space().ty, SpaceType::Register)
 }
 
-/// Classify how `param` is used (see [`ParamUse`]). Collects the loads/stores to
-/// redirect into the shadow space, the distinct write targets, and the by-value
-/// snapshot width (bounded by the *reads* — writes may land at any offset).
-fn analyze_param(ctx: &Context, param: ValueId) -> ParamUse {
+/// Classify how `param` is used (see [`ParamInfo`]). Collects the loads/stores to
+/// redirect into the shadow space, the distinct write targets, the by-value
+/// snapshot width (bounded by the *reads* — writes may land at any offset), and
+/// whether the address *escapes*. Note the deref info is collected **even when the
+/// param escapes**: the shadow path discards it (an escape bails shadow), but
+/// partial mode promotes the bounded reads regardless, since a real-ram seed is
+/// sound no matter where else the address flows.
+fn analyze_param(ctx: &Context, param: ValueId) -> ParamInfo {
     // Only real (default-space) memory accesses are promotable. Accesses already
     // redirected into a shadow space — and the seed store a prior promotion left
     // behind — are skipped, not re-promoted: this is what makes the pass idempotent
@@ -533,11 +550,12 @@ fn analyze_param(ctx: &Context, param: ValueId) -> ParamUse {
     let mut read_fields: Vec<ReadField> = Vec::new();
     let mut write_targets: Vec<(ValueId, usize)> = Vec::new();
     let mut is_deref = false;
+    let mut escaped = false;
 
     // Record a load at constant byte `offset` of `size` bytes. The width is gated
     // on the *access size* alone (not `offset + size`), so a deref at a large
     // fixed offset still promotes. A scalar a register cannot hold (size ∉
-    // {1,2,4,8}) bails the whole function.
+    // {1,2,4,8}) is not snapshotable, so the read is left unpromoted (an escape).
     let mut push_read = |offset: u64, size: usize| -> bool {
         if !matches!(size, 1 | 2 | 4 | 8) {
             return false;
@@ -579,14 +597,17 @@ fn analyze_param(ctx: &Context, param: ValueId) -> ParamUse {
                                 continue;
                             }
                             let Some(block) = ctx.get_insn(u2).parent().map(|b| b.id) else {
-                                return ParamUse::Escape;
+                                escaped = true;
+                                continue;
                             };
                             let range = value_range(ctx, offset, block);
                             if range.min != range.max {
-                                return ParamUse::Escape;
+                                escaped = true;
+                                continue;
                             }
                             if !push_read(range.min, l.size) {
-                                return ParamUse::Escape;
+                                escaped = true;
+                                continue;
                             }
                             any = true;
                             accesses.push(u2);
@@ -608,20 +629,22 @@ fn analyze_param(ctx: &Context, param: ValueId) -> ParamUse {
                 if any {
                     is_deref = true;
                     // The dereferenced address also flowed somewhere we cannot
-                    // follow — unsound to shadow.
+                    // follow — unsound to shadow (but fine for partial).
                     if !all {
-                        return ParamUse::Escape;
+                        escaped = true;
                     }
                 }
                 // `!any`: pure address arithmetic (e.g. `return p + k`) — fine.
             }
             // Direct access at offset 0.
             Mnemonic::Load(l) if l.ptr == param && l.space == ram => {
-                if !push_read(0, l.size) {
-                    return ParamUse::Escape;
+                if push_read(0, l.size) {
+                    is_deref = true;
+                    accesses.push(uid);
+                } else {
+                    // Unsnapshotable width — leave the read unpromoted.
+                    escaped = true;
                 }
-                is_deref = true;
-                accesses.push(uid);
             }
             Mnemonic::Store(s) if s.ptr == param && s.space == ram => {
                 is_deref = true;
@@ -629,22 +652,22 @@ fn analyze_param(ctx: &Context, param: ValueId) -> ParamUse {
                 write_targets.push((param, s.size));
             }
             // The address stored as a *value* into memory leaks it (a store into
-            // a register is the harmless "return the pointer" idiom).
+            // a register is the harmless "return the pointer" idiom). NB: this also
+            // catches partial mode's own entry seed `store(snap -> base+offset)`,
+            // whose `src` is the snapshot param — which is exactly why partial mode
+            // promotes reads despite the escape, so a seeded pointer's own derefs
+            // can still be promoted on a later round.
             Mnemonic::Store(s)
                 if s.src == param
                     && !matches!(s.ptr, ValueId::Varnode(vn) if is_register(ctx, vn)) =>
             {
-                return ParamUse::Escape;
+                escaped = true;
             }
             // Any other use treats the address as data (returned, compared,
             // branched, returned in a register). Harmless: the address is a value
             // the caller owns.
             _ => {}
         }
-    }
-
-    if !is_deref {
-        return ParamUse::NonPointer;
     }
 
     // Deterministic offset order, shared by callee param creation and caller
@@ -659,7 +682,9 @@ fn analyze_param(ctx: &Context, param: ValueId) -> ParamUse {
         }
     }
 
-    ParamUse::Deref {
+    ParamInfo {
+        is_deref,
+        escaped,
         reads: read_fields,
         accesses,
         write_targets: deduped,
@@ -916,6 +941,143 @@ fn apply(
         }
     }
 
+    true
+}
+
+/// Partial (no-shadow) promotion — the fallback when [`try_promote`]'s footprint
+/// is not fully modelled. For every promoted deref param it adds a by-value
+/// snapshot param per *read* field and seeds it into **real ram** at entry
+/// (`store(snap → base+offset, ram)`), leaving every load and store in place. It
+/// builds no write-set, marks nothing pure, and redirects no access into shadow —
+/// so it is sound even though the function has memory accesses this pass cannot
+/// model: the seed merely re-writes the value the caller loaded from that same
+/// slot (a no-op-equivalent), and nothing is moved to shadow, so there is no
+/// forwarder-collapse exposure. It only *exposes* each read as a by-value
+/// parameter; a downstream forwarder may then fold the matching load to it,
+/// turning a loaded pointer into a clean by-value pointer param that a later
+/// fully-modelled round can shadow-promote.
+///
+/// Idempotent: a read whose snapshot param already exists (matched by name) is
+/// skipped, so re-visiting an already-partially-promoted function adds nothing and
+/// the `mark-pure` `repeat_until = no_change` loop settles. Returns `true` only if
+/// at least one new snapshot was added.
+fn apply_partial(ctx: &mut Context, fid: FunctionId, promoted: &[Promoted]) -> bool {
+    let call_sites: Vec<InstructionId> = ctx
+        .instructions()
+        .filter_map(|insn| match insn.mnemonic() {
+            Mnemonic::Call(c) if c.target == fid => Some(insn.id),
+            _ => None,
+        })
+        .collect();
+    if call_sites.is_empty() {
+        return false;
+    }
+    let root = Function::from_id(ctx, fid).root().map(|b| b.id).unwrap();
+    let ram = ctx.default_space;
+
+    // Existing root-param names, used to skip read fields already seeded by a
+    // prior round (idempotence).
+    let existing: HashSet<String> = BasicBlock::from_id(ctx, root)
+        .params()
+        .filter_map(|p| p.name().map(str::to_owned))
+        .collect();
+
+    // The new read snapshots to add, in a deterministic order shared by the callee
+    // (param creation) and every caller (argument order): by arg index, then by
+    // read offset (`reads` is already offset-sorted).
+    struct NewSnap {
+        arg_idx: usize,
+        base: ValueId,
+        base_size: usize,
+        offset: u64,
+        size: usize,
+        name: String,
+    }
+    let mut order: Vec<&Promoted> = promoted.iter().collect();
+    order.sort_by_key(|p| p.arg_idx);
+    let mut new_snaps: Vec<NewSnap> = Vec::new();
+    for p in &order {
+        for f in &p.reads {
+            let name = format!("{}_val_{:x}", p.name, f.offset);
+            if existing.contains(&name) {
+                continue;
+            }
+            new_snaps.push(NewSnap {
+                arg_idx: p.arg_idx,
+                base: p.param,
+                base_size: p.base_size,
+                offset: f.offset,
+                size: f.size,
+                name,
+            });
+        }
+    }
+    if new_snaps.is_empty() {
+        return false;
+    }
+
+    // ---- callee: a by-value snapshot param per new read, seeded into real ram ---
+    let mut seeds: Vec<(ValueId, usize, u64, ValueId)> = Vec::new();
+    for ns in &new_snaps {
+        let val_pid = BasicBlock::from_id_mut(ctx, root).push_param(ns.size).id;
+        ctx.values.block_params[val_pid].name = Some(Cow::Owned(ns.name.clone()));
+        seeds.push((ns.base, ns.base_size, ns.offset, ValueId::BlockParam(val_pid)));
+    }
+    {
+        let mut b = Builder::from_block(BasicBlock::from_id_mut(ctx, root));
+        b.set_insert_point_to_start();
+        for (base, base_size, offset, snap) in &seeds {
+            let addr = if *offset == 0 {
+                *base
+            } else {
+                let k = b.context_mut().get_const(*offset, *base_size).id();
+                b.push_add(*base, k).id()
+            };
+            b.push_store(*snap, addr, ram);
+        }
+    }
+
+    // ---- callers: append the snapshot loads as positional args ------------------
+    // Each is loaded from `arg + offset` in real ram — the same address the callee
+    // re-seeds, relocated to the caller (faithful: the base is a by-value param
+    // identical on both sides). No write-set, so the call's result type is left
+    // alone and there is no replay.
+    for call_id in call_sites {
+        let Some(call_block) = ctx.get_insn(call_id).parent().map(|b| b.id) else {
+            continue;
+        };
+        let (target, args, clobbers) = match ctx.get_insn(call_id).mnemonic().clone() {
+            Mnemonic::Call(c) => (c.target, c.args, c.clobbers),
+            _ => continue,
+        };
+        let mut new_args = args.clone();
+        {
+            let mut b = Builder::from_block(BasicBlock::from_id_mut(ctx, call_block));
+            b.set_insert_point_before(call_id);
+            for ns in &new_snaps {
+                if ns.arg_idx >= args.len() {
+                    continue;
+                }
+                let base = args[ns.arg_idx];
+                let addr = if ns.offset == 0 {
+                    base
+                } else {
+                    let k = b.context_mut().get_const(ns.offset, ns.base_size).id();
+                    b.push_add(base, k).id()
+                };
+                let snap = b.push_load::<false>(addr, ns.size, ram).id();
+                new_args.push(snap);
+            }
+        }
+        ctx.replace_instruction_mnemonic(
+            call_id,
+            Mnemonic::Call(Call {
+                target,
+                args: new_args,
+                clobbers,
+            }),
+        );
+    }
     true
 }
 
@@ -1631,13 +1793,15 @@ mod tests {
     }
 
     #[test]
-    fn unmodelable_access_blocks_whole_promotion() {
-        // All-or-nothing gate: if any real-memory access cannot be captured in the
-        // shadow — here a store through an address *loaded from memory* (a
-        // multi-level deref the model can't recompute) — the whole function is left
-        // unpromoted, even though it has a clean `@p+0x30` read. Otherwise the
-        // shadow would miss that store and a later store→load forward could
-        // unsoundly collapse a read across it.
+    fn unmodelable_access_falls_back_to_partial() {
+        // When a real-memory access cannot be captured in the shadow — here a store
+        // through an address *loaded from memory* (a multi-level deref the model
+        // can't recompute) — the shadow path is unsound (a later store→load forward
+        // could collapse a read across the unmodelled store). Instead of bailing,
+        // we fall back to *partial* promotion: the clean `@p+0` / `@p+0x30` reads
+        // are exposed as by-value snapshot params seeded into REAL ram, and nothing
+        // is redirected into shadow — so the unmodelled store is left untouched and
+        // there is no forwarder-collapse exposure.
         let mut tc = qcode::testing::TestContext::new();
         let input = stack_input(&mut tc, 4, 8);
         qcode!(
@@ -1667,12 +1831,28 @@ mod tests {
         tc.ctx.add_cfg_edge(g_call, g_cont);
 
         assert!(
-            !argpromote(&mut tc.ctx),
-            "an unmodelable access must block the whole promotion"
+            argpromote(&mut tc.ctx),
+            "an unmodelable access must fall back to partial promotion, not bail"
         );
         assert!(
-            !has_val_param(&tc.ctx, f),
-            "no read should be promoted when the footprint can't be fully modelled"
+            has_val_param(&tc.ctx, f),
+            "the clean reads should be exposed as by-value snapshot params"
+        );
+        // Partial mode never touches shadow: every load/store stays in real ram, so
+        // the unmodelled store cannot be collapsed across.
+        let ram = tc.ctx.default_space;
+        let all_ram = Function::from_id(&tc.ctx, f).blocks().all(|b| {
+            b.iter().all(|i| match i.mnemonic() {
+                Mnemonic::Load(l) => l.space == ram,
+                Mnemonic::Store(s) => s.space == ram,
+                _ => true,
+            })
+        });
+        assert!(all_ram, "partial mode must not redirect any access into shadow");
+        // Idempotent: the snapshots already exist, so a re-visit adds nothing.
+        assert!(
+            !argpromote(&mut tc.ctx),
+            "re-running partial promotion must be a no-op (idempotence)"
         );
     }
 

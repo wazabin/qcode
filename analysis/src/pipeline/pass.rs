@@ -245,6 +245,9 @@ impl DynPass for ModuleFnAdapter {
         let fun_ids: Vec<FunctionId> = ctx
             .functions()
             .filter(|f| !f.is_external())
+            // Honor `--ignore`: a function-pass run module-wide must still skip
+            // functions the user marked ignored.
+            .filter(|f| !ctx.is_function_ignored(f.address()))
             .map(|f| f.id)
             .collect();
         let mut changed = false;

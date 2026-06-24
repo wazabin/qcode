@@ -115,6 +115,14 @@ pub struct Context<'str> {
     /// synthetic contexts.
     #[serde(default)]
     target_os: TargetOs,
+
+    /// Entry addresses of functions the user asked to skip optimizing (via the
+    /// `--ignore` flag). Such functions are still lifted, but every per-function
+    /// analysis pass skips them. Rides through clone so it survives the
+    /// checkpoint+replay rounds, and through serialization so a saved session
+    /// keeps honoring the request.
+    #[serde(default)]
+    ignored_functions: HashSet<u64>,
 }
 
 /// The operating system of a loaded binary, inferred from its container format.
@@ -177,6 +185,24 @@ impl<'str> Context<'str> {
 
     pub fn primary_entrypoint(&self) -> Option<u64> {
         self.primary_entrypoint
+    }
+
+    /// Record the set of function entry addresses whose optimization the user
+    /// asked to skip (`--ignore`). Per-function passes consult
+    /// [`Context::is_function_ignored`] and skip these functions.
+    pub fn set_ignored_functions(&mut self, addrs: HashSet<u64>) {
+        self.ignored_functions = addrs;
+    }
+
+    /// The function entry addresses whose optimization is being skipped.
+    pub fn ignored_functions(&self) -> &HashSet<u64> {
+        &self.ignored_functions
+    }
+
+    /// Whether the function at `addr` was marked ignored (`--ignore`). A `None`
+    /// address (synthetic functions with no entry) is never ignored.
+    pub fn is_function_ignored(&self, addr: Option<u64>) -> bool {
+        addr.is_some_and(|a| self.ignored_functions.contains(&a))
     }
 
     /// Records the loaded binary's operating system (set by the loader from the
