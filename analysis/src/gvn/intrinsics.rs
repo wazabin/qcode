@@ -65,7 +65,10 @@ fn root_op_of(m: &Mnemonic) -> Option<RootOp> {
 #[cfg(test)]
 mod tests {
     use crate::gvn::{constant_fold_function, gvn_function};
-    use qcode::{context::Context, value::insn::Mnemonic};
+    use qcode::{
+        context::Context,
+        value::{ValueId, insn::Mnemonic},
+    };
     use qcode_macro::qcode;
 
     /// Live (still-parented) instructions only — the arena retains removed ones.
@@ -79,6 +82,25 @@ mod tests {
     fn has_live_intrinsic(ctx: &Context) -> bool {
         ctx.instructions().any(|insn| {
             insn.parent().is_some() && matches!(insn.mnemonic(), Mnemonic::Intrinsic(_))
+        })
+    }
+
+    /// The constant rotate amount of the single live intrinsic named `name`.
+    fn live_rotate_amount(ctx: &Context, name: &str) -> Option<u64> {
+        ctx.instructions().find_map(|insn| {
+            if insn.parent().is_none() {
+                return None;
+            }
+            let Mnemonic::Intrinsic(i) = insn.mnemonic() else {
+                return None;
+            };
+            if i.id.name() != name {
+                return None;
+            }
+            match i.args[1] {
+                ValueId::Literal(lid) => Some(ctx.get_literal_value(lid)),
+                _ => None,
+            }
         })
     }
 
@@ -148,6 +170,89 @@ mod tests {
         gvn_function(&mut ctx, f, None);
 
         assert!(!has_live_intrinsic(&ctx), "rol(x, 0) should simplify to x");
+    }
+
+    /// `ror(rol(x, c), c)` cancels to `x`, leaving no live intrinsic.
+    #[test]
+    fn inverse_rotate_cancels() {
+        let mut ctx = Context::new();
+        qcode!(
+            ctx,
+            "
+            varnode i32 X;
+            fn f:
+                <entry>
+                    %x = load(i32, &X);
+                    %l = $rol(%x, i32 8);
+                    %r = $ror(%l, i32 8);
+                    return [%r];
+            "
+        );
+
+        gvn_function(&mut ctx, f, None);
+
+        // The outer `ror` cancels against the inner `rol`: it is gone and the
+        // return forwards straight to `%x`. (The now-unused inner `rol` is left
+        // for a DCE pass to reclaim.)
+        assert!(
+            !live_intrinsic_named(&ctx, "ror"),
+            "ror(rol(x, c), c) should cancel away"
+        );
+        assert!(
+            ctx.to_string().contains("return [i32 %x]"),
+            "return should forward to x after cancellation, got:\n{ctx}"
+        );
+    }
+
+    /// A rotate by a constant ≥ width is normalised modulo the bit width:
+    /// `rol(x, 40)` over 32 bits becomes `rol(x, 8)`.
+    #[test]
+    fn constant_amount_reduced_modulo_width() {
+        let mut ctx = Context::new();
+        qcode!(
+            ctx,
+            "
+            varnode i32 X;
+            fn f:
+                <entry>
+                    %x = load(i32, &X);
+                    %r = $rol(%x, i32 40);
+                    return [%r];
+            "
+        );
+
+        gvn_function(&mut ctx, f, None);
+
+        assert_eq!(
+            live_rotate_amount(&ctx, "rol"),
+            Some(8),
+            "rol(x, 40) over 32 bits should normalise to rol(x, 8)"
+        );
+    }
+
+    /// A rotate by a whole number of turns is the identity: `rol(x, 32)` over
+    /// 32 bits collapses to `x`.
+    #[test]
+    fn whole_turn_rotate_is_identity() {
+        let mut ctx = Context::new();
+        qcode!(
+            ctx,
+            "
+            varnode i32 X;
+            fn f:
+                <entry>
+                    %x = load(i32, &X);
+                    %r = $rol(%x, i32 32);
+                    return [%r];
+            "
+        );
+
+        gvn_function(&mut ctx, f, None);
+
+        assert!(
+            !has_live_intrinsic(&ctx),
+            "rol(x, 32) over 32 bits should simplify to x"
+        );
     }
 
     /// The recognized intrinsic prints with the `$` sigil.

@@ -79,6 +79,20 @@ pub enum RootOp {
     IntBinop(IntBinop),
 }
 
+/// Evaluator for an intrinsic: concrete operands `(bits, byte_width)` and an
+/// `out_size`-byte result. `None` means "not foldable / trap".
+pub type IntrinsicEval = fn(&[(u128, usize)], usize) -> Option<u128>;
+
+/// Recognizer for an intrinsic's raw-IR idiom, returning the intrinsic's
+/// operands when the instruction matches.
+pub type IntrinsicRecognize = fn(&Context, InstructionId) -> Option<Vec<ValueId>>;
+
+/// Algebraic simplifier for an intrinsic. Receives the intrinsic's
+/// [`IntrinsicId`] (so a shared simplifier can branch on which intrinsic it is,
+/// e.g. `rol` vs `ror`), the result byte width, and the operands; returns a
+/// [`Simplified`] outcome when a rewrite applies.
+pub type IntrinsicSimplify = fn(&mut Context, IntrinsicId, usize, &[ValueId]) -> Option<Simplified>;
+
 /// Static description of one intrinsic: its name, arity, result-size rule, the
 /// shared evaluator (used by both constant folding and the emulator), and
 /// optional recognition / simplification hooks.
@@ -89,19 +103,30 @@ pub struct IntrinsicDesc {
     pub arity: usize,
     /// Computes the result byte width from the operand byte widths.
     pub result_size: fn(&[usize]) -> usize,
-    /// Evaluate on concrete operands `(bits, byte_width)` for an `out_size`-byte
-    /// result. `None` means "not foldable / trap" — fold bails, the emulator
-    /// raises.
-    pub eval: fn(&[(u128, usize)], usize) -> Option<u128>,
+    /// Evaluate on concrete operands. `None` means "not foldable / trap" — fold
+    /// bails, the emulator raises.
+    pub eval: IntrinsicEval,
     /// IR shape this intrinsic's idiom roots at, if it participates in
     /// recognition.
     pub root_op: Option<RootOp>,
-    /// Recognize the raw-IR idiom rooted at the given instruction, returning the
-    /// intrinsic's operands when it matches.
-    pub recognize: Option<fn(&Context, InstructionId) -> Option<Vec<ValueId>>>,
-    /// Algebraic simplification on the intrinsic's own operands (e.g.
-    /// `rol(x, 0) → x`), returning a replacement value when one applies.
-    pub simplify: Option<fn(&mut Context, &[ValueId]) -> Option<ValueId>>,
+    /// Recognize the raw-IR idiom rooted at the given instruction.
+    pub recognize: Option<IntrinsicRecognize>,
+    /// Algebraic simplification on the intrinsic's own operands — e.g.
+    /// `rol(x, 0) → x` or `rol(a, c) → rol(a, c mod bits)`.
+    pub simplify: Option<IntrinsicSimplify>,
+}
+
+/// The result of an intrinsic's [`simplify`](IntrinsicDesc::simplify) hook.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Simplified {
+    /// Forward all uses of the intrinsic to this existing value, e.g.
+    /// `rol(x, 0) → x` or `ror(rol(a, c), c) → a`.
+    Value(ValueId),
+    /// Replace the intrinsic instruction with a new expression of the same
+    /// width. The mnemonic is free to be a different intrinsic (e.g.
+    /// `rol(a, c) → ror(a, bits - c)`) or a plain operation (e.g. an
+    /// [`IntBinop`]-rooted `+`).
+    Expression(super::Mnemonic),
 }
 
 /// One intrinsic's registration, submitted via [`inventory::submit!`] (see

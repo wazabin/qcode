@@ -43,7 +43,14 @@ fn gvn_passes() -> (
     Identities,
     Cse,
 ) {
-    (MemoryForwarding, Fold, Recognize, FlagIdiom, Identities, Cse)
+    (
+        MemoryForwarding,
+        Fold,
+        Recognize,
+        FlagIdiom,
+        Identities,
+        Cse,
+    )
 }
 
 /// Constant-fold every foldable instruction in `func_id` to interned literals,

@@ -36,7 +36,8 @@ pub use binop::{Binary, Binop, BoolBinop, FloatBinop, IntBinop};
 pub use casting::{FloatToFloat, FloatToInt, IntToFloat, Range, Sext, Zext};
 pub use flags::{Carry, IsFloatNaN, LzCount, PopCount, SBorrow, SCarry};
 pub use intrinsic::{
-    Intrinsic, IntrinsicDesc, IntrinsicId, IntrinsicRegistration, RootOp, recognizers_for,
+    Intrinsic, IntrinsicDesc, IntrinsicId, IntrinsicRegistration, RootOp, Simplified,
+    recognizers_for,
 };
 pub use memory::{Load, Store};
 pub use mnemonic::Mnemonic;

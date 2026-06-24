@@ -8,7 +8,7 @@ use crate::context::Context;
 use crate::register_intrinsic;
 use crate::value::ValueId;
 use crate::value::insn::intrinsic::{as_int_binop, const_u64, mask_for};
-use crate::value::insn::{IntBinop, RootOp};
+use crate::value::insn::{IntBinop, Intrinsic, IntrinsicId, Mnemonic, RootOp, Simplified};
 
 fn eval_rotate(args: &[(u128, usize)], out_size: usize, left: bool) -> Option<u128> {
     let (x, _) = *args.first()?;
@@ -75,16 +75,85 @@ fn recognize_rol(ctx: &Context, root: crate::value::InstructionId) -> Option<Vec
     None
 }
 
-/// `rol(x, 0) → x`, `ror(x, 0) → x`.
-fn simplify_rotate(ctx: &mut Context, args: &[ValueId]) -> Option<ValueId> {
+/// If `v` is defined by a rotate intrinsic, return `(name, x, k)`.
+fn as_rotate(ctx: &Context, v: ValueId) -> Option<(&'static str, ValueId, ValueId)> {
+    let ValueId::Instruction(id) = v else {
+        return None;
+    };
+    let Mnemonic::Intrinsic(intr) = ctx.get_insn(id).mnemonic() else {
+        return None;
+    };
+    let name = intr.id.name();
+    if name != "rol" && name != "ror" {
+        return None;
+    }
+    let &[x, k] = intr.args.as_slice() else {
+        return None;
+    };
+    Some((name, x, k))
+}
+
+/// Simplify a rotate `op(x, k)` (where `op` is `rol`/`ror`, named by `id`) over
+/// an `out_size`-byte result:
+///
+/// * **Inverse cancellation** — `ror(rol(a, c), c) → a` and `rol(ror(a, c), c)
+///   → a`. The inner amount must provably match the outer one: the same value,
+///   or two constants equal modulo the bit width (rotating by `c` then by `-c`
+///   is the identity for any `c`).
+/// * **Modulo-width** — for a constant amount `c`, normalise to `c mod bits`:
+///   `c` that is a multiple of the width collapses to `x`; otherwise the rotate
+///   is rebuilt on the reduced amount (e.g. `rol(a, 33) → rol(a, 1)` at 32 bits).
+fn simplify_rotate(
+    ctx: &mut Context,
+    id: IntrinsicId,
+    out_size: usize,
+    args: &[ValueId],
+) -> Option<Simplified> {
     let &[x, k] = args else {
         return None;
     };
-    if const_u64(ctx, k) == Some(0) {
-        Some(x)
-    } else {
-        None
+    let bits = (out_size * 8) as u64;
+    if bits == 0 {
+        return None;
     }
+
+    // Inverse cancellation: op(inv_op(a, k2), k) → a when k and k2 agree.
+    if let Some((inner_name, a, k2)) = as_rotate(ctx, x) {
+        let outer_name = id.name();
+        let is_inverse = (outer_name == "rol" && inner_name == "ror")
+            || (outer_name == "ror" && inner_name == "rol");
+        let same_amount = k == k2
+            || match (const_u64(ctx, k), const_u64(ctx, k2)) {
+                (Some(a), Some(b)) => a % bits == b % bits,
+                _ => false,
+            };
+        if is_inverse && same_amount {
+            return Some(Simplified::Value(a));
+        }
+    }
+
+    // Modulo-width normalisation of a constant amount.
+    if let Some(c) = const_u64(ctx, k) {
+        let r = c % bits;
+        if r == 0 {
+            // A whole number of turns: the rotate is the identity.
+            return Some(Simplified::Value(x));
+        }
+        if r != c {
+            // Rebuild the same rotate on the reduced amount. The amount keeps
+            // the operand's width.
+            let k_size = ctx.type_of(k);
+            let k_size = ctx.types.size_of(k_size);
+            let reduced = ctx.get_const(r, k_size).id();
+            let rotate = Intrinsic {
+                id,
+                args: vec![x, reduced],
+            };
+            return Some(Simplified::Expression(Mnemonic::Intrinsic(rotate)));
+        }
+    }
+
+    None
 }
 
 register_intrinsic! {

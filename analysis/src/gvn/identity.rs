@@ -22,7 +22,7 @@ use qcode::{
     context::Context,
     value::{
         ValueId,
-        insn::{Binary, Binop, IntBinop, Mnemonic},
+        insn::{Binary, Binop, IntBinop, Mnemonic, Simplified},
     },
 };
 
@@ -46,10 +46,18 @@ impl SubPass for Identities {
         if let Mnemonic::Intrinsic(intr) = ic.mnemonic
             && let Some(simplify) = intr.id.desc().simplify
         {
+            let id = intr.id;
             let args = intr.args.clone();
-            if let Some(repl) = simplify(ctx, &args) {
-                ed.replace(ctx, ic.insn_id, repl);
-                return Claim::Done;
+            match simplify(ctx, id, ic.size, &args) {
+                Some(Simplified::Value(repl)) => {
+                    ed.replace(ctx, ic.insn_id, repl);
+                    return Claim::Done;
+                }
+                Some(Simplified::Expression(mnemonic)) => {
+                    ed.replace_with_new_insn(ctx, ic.block_id, ic.insn_id, mnemonic, ic.size);
+                    return Claim::Done;
+                }
+                None => {}
             }
         }
         match simplify_identity(ctx, ic.mnemonic) {
