@@ -92,7 +92,7 @@ mod tests {
             BasicBlock, ValueId,
             block::BlockId,
             function::FunctionId,
-            insn::{InstructionId, Mnemonic, Range},
+            insn::{Instruction, InstructionId, Mnemonic, Range},
         },
     };
     use qcode_macro::qcode;
@@ -210,6 +210,94 @@ mod tests {
                 .contains(&v),
             "header load must not be replaced by the entry store; the header's own store \
              overwrites it before the back edge"
+        );
+    }
+
+    /// Build `caller`: store a value to a pinned stack slot `A`, call `callee`,
+    /// then reload `A` (kept live by storing it to `B`). The call block falls
+    /// through to the reload block. Returns `(caller_id, reload_block, load_v,
+    /// store_to_A_ptr, call_insn)`.
+    fn build_store_call_reload(
+        mut ctx: &mut Context,
+    ) -> (FunctionId, BlockId, InstructionId, ValueId, InstructionId) {
+        qcode!(
+            ctx,
+            "
+                varnode i32 A;
+                varnode i32 B;
+
+                fn caller:
+                    <entry>
+                        store(&A, i32 7);
+                        call <callee>;
+                    <reload>
+                        %v = load(i32, &A);
+                        store(&B, %v);
+                        return [0x1000];
+                "
+        );
+
+        // The macro does not wire a call's fallthrough edge, so connect the call
+        // block to the reload block: the reload now runs after the call.
+        ctx.add_cfg_edge(entry, reload);
+
+        let (store_ptr, call_id) = {
+            let mut store_ptr = None;
+            let mut call_id = None;
+            for insn in BasicBlock::from_id(ctx, entry).iter() {
+                match insn.mnemonic() {
+                    Mnemonic::Store(s) => store_ptr = Some(s.ptr),
+                    Mnemonic::Call(_) => call_id = Some(insn.id),
+                    _ => {}
+                }
+            }
+            (store_ptr.expect("store to A"), call_id.expect("call"))
+        };
+
+        (caller, reload, v, store_ptr, call_id)
+    }
+
+    /// A call that may write through `&A` (the pointer escaped into the callee,
+    /// recorded in the call's clobber set) must block forwarding the pre-call
+    /// store of `A` to the post-call reload: the callee may have overwritten it.
+    #[test]
+    fn test_gvn_does_not_forward_pinned_stack_slot_across_call_that_may_write_it() {
+        let mut ctx = Context::new();
+        let (caller, reload, v, store_ptr, call_id) = build_store_call_reload(&mut ctx);
+
+        // Record that `&A` escaped into the callee.
+        if let Mnemonic::Call(call) = Instruction::from_id_mut(&mut ctx, call_id).mnemonic_mut() {
+            call.clobbers.push(store_ptr);
+        } else {
+            panic!("expected a call");
+        }
+
+        let aliases = AliasResult::simple(&ctx);
+        gvn_function(&mut ctx, caller, Some(&aliases));
+
+        assert!(
+            BasicBlock::from_id(&ctx, reload)
+                .instruction_ids()
+                .contains(&v),
+            "the reload must not be forwarded: the call may write through &A"
+        );
+    }
+
+    /// Control: an identical call with an empty clobber set does not endanger the
+    /// stack slot, so the pre-call store still forwards to the reload.
+    #[test]
+    fn test_gvn_forwards_pinned_stack_slot_across_call_that_cannot_write_it() {
+        let mut ctx = Context::new();
+        let (caller, reload, v, _store_ptr, _call_id) = build_store_call_reload(&mut ctx);
+
+        let aliases = AliasResult::simple(&ctx);
+        gvn_function(&mut ctx, caller, Some(&aliases));
+
+        assert!(
+            !BasicBlock::from_id(&ctx, reload)
+                .instruction_ids()
+                .contains(&v),
+            "the reload should be forwarded: the call cannot write through &A"
         );
     }
 

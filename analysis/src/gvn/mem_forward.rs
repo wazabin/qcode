@@ -404,15 +404,52 @@ impl MemForward {
             .iter()
             .last()
             .map(|i| i.mnemonic().clone());
-        let clobbers = match term {
-            Some(Mnemonic::CallInd(_)) => CallClobbers::AllRegisters,
+        // Pointers that escape into the callee (its arguments plus every
+        // recorded clobbered/aliased location). The callee may store through any
+        // of them, so a forwarded RAM cell one of them may reach is stale after
+        // the call. `interval(p)` pins those resolvable to a concrete byte range
+        // (e.g. `&local`); a pointer that does not pin is symbolic and, like an
+        // unresolved store, must be treated as possibly reaching every pinned
+        // RAM cell (see [`cross_base_disjoint`]).
+        // `unknown_callee` is set for an indirect call: its target is unknown, so
+        // it may write to any pinned RAM cell (a global or stack slot) even
+        // without receiving a pointer to it. A direct call's memory writes are all
+        // recorded in its `clobbers`, so only its escaping pointers matter.
+        let (clobbers, escaping, unknown_callee): (CallClobbers, Vec<ValueId>, bool) = match &term {
+            Some(Mnemonic::CallInd(call)) => (CallClobbers::AllRegisters, call.args.clone(), true),
             Some(Mnemonic::Call(call)) => {
-                match Function::from_id(ctx, call.target).clobbered_regs() {
+                let regs = match Function::from_id(ctx, call.target).clobbered_regs() {
                     Some(regs) => CallClobbers::Regs(regs.to_vec()),
                     None => CallClobbers::AllRegisters,
-                }
+                };
+                let escaping = call.args.iter().chain(call.clobbers.iter()).copied().collect();
+                (regs, escaping, false)
             }
             _ => return,
+        };
+
+        // A pinned RAM cell at `(space, off)` is clobbered by the call if some
+        // escaping pointer may write to it: one whose pinned interval overlaps it,
+        // or any pointer that does not pin (symbolic — reach is unknown, so it may
+        // alias any pinned cell). An unknown callee clobbers every pinned RAM cell.
+        let symbolic_escape = unknown_callee
+            || match aliases {
+                Some(a) => escaping.iter().any(|&p| a.interval(p).is_none()),
+                // No oracle: every escaping pointer is unresolved, so treat any
+                // escape as possibly reaching every pinned RAM cell.
+                None => !escaping.is_empty(),
+            };
+        let pinned_ram_clobbered = |space: SpaceId, off: i64| {
+            if symbolic_escape {
+                return true;
+            }
+            let Some(a) = aliases else { return false };
+            escaping.iter().any(|&p| match a.interval(p) {
+                Some((sp, start, end)) => {
+                    sp == space && (start as i64) <= off && off < end as i64
+                }
+                None => false,
+            })
         };
 
         let is_reg = |space| matches!(Space::from_id(ctx, space).ty, SpaceType::Register);
@@ -421,9 +458,13 @@ impl MemForward {
             let space = base.space();
             if !is_reg(space) {
                 // RAM: a call may write through any symbolic pointer (no memory
-                // summary exists), so drop all symbolic RAM cells. Pinned RAM
-                // cells (resolved stack slots) are unaffected by register clobbers.
-                return !matches!(base, Base::Symbolic(..));
+                // summary exists), so drop all symbolic RAM cells. A pinned RAM
+                // cell (a resolved stack slot) survives unless a pointer to it
+                // escaped into the callee, which may then store through it.
+                return match base {
+                    Base::Symbolic(..) => false,
+                    Base::Pinned(_) => !pinned_ram_clobbered(space, off),
+                };
             }
             // Register cells: drop those the call clobbers.
             match base {
