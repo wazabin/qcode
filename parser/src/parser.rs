@@ -229,6 +229,7 @@ fn parse_inner_stmt(pair: Pair<'_, Rule>, out: &mut Vec<Statement>) -> Result<()
         Rule::local_decl => parse_local_decl(inner)?,
         Rule::assignment_ssa => parse_assignment_ssa(inner)?,
         Rule::terminator => parse_terminator(inner)?,
+        Rule::assert_stmt => parse_assert_stmt(inner)?,
         Rule::expr => Statement::Expr(parse_expr(inner)?),
         _ => return Err(ParseError::new("unexpected inner statement")),
     };
@@ -400,6 +401,17 @@ fn parse_terminator(pair: Pair<'_, Rule>) -> Result<Statement, ParseError> {
 
         _ => Err(ParseError::new("invalid terminator")),
     }
+}
+
+fn parse_assert_stmt(pair: Pair<'_, Rule>) -> Result<Statement, ParseError> {
+    let span = source_span(pair.as_span());
+    let mut inner = pair.into_inner();
+    let condition = parse_typed_atom(
+        inner
+            .next()
+            .ok_or_else(|| ParseError::new("missing assert condition"))?,
+    )?;
+    Ok(Statement::Assert { condition, span })
 }
 
 fn parse_assignment_ssa(pair: Pair<'_, Rule>) -> Result<Statement, ParseError> {

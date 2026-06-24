@@ -746,6 +746,16 @@ fn emit_statement(
             });
         }
 
+        Statement::Assert { condition, .. } => {
+            let cond_tokens = lower_atom(condition, None, locals, pcode_root)?;
+            emitted.push(quote! {
+                {
+                    let __qcode_cond = #cond_tokens;
+                    __qcode_builder.push_assert(__qcode_cond);
+                }
+            });
+        }
+
         Statement::Commented { inner, .. } => {
             emit_statement(inner, index, locals, emitted, block_param_names, pcode_root)?;
         }

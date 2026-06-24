@@ -171,6 +171,10 @@ pub enum Statement {
         ptr: TypedAtom,
         span: SourceSpan,
     },
+    Assert {
+        condition: TypedAtom,
+        span: SourceSpan,
+    },
     /// A comment attached to this statement, written as `# text` on the preceding line.
     Commented {
         comment: String,
