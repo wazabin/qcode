@@ -25,7 +25,7 @@ mod binop;
 mod bits;
 mod casting;
 mod flags;
-mod intrinsic;
+pub(crate) mod intrinsic;
 mod memory;
 mod mnemonic;
 mod pcode_op;
