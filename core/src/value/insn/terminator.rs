@@ -347,9 +347,8 @@ mod tests {
 
         let mut tc = TestContext::new();
 
-        // A "stack" space (addr_size = pointer width 4), as brighten_stack
-        // creates it. A stack-passed parameter is a nameless varnode in this
-        // space at the slot offset.
+        // A "stack" space (addr_size = pointer width 4). A stack-passed parameter
+        // is a nameless varnode in this space at the slot offset.
         let stack_space = tc.ctx.add_space(Space::new(Some("stack"), 1, 4));
         let stack_input = Varnode::make(&mut tc.ctx, 4, 4, stack_space).id;
 
@@ -375,8 +374,8 @@ mod tests {
         let rendered = Instruction::from_id(&tc.ctx, call_id)
             .as_statement()
             .to_string();
-        // stack_base(4) + offset 4 = 0x1000_0000 + 4 = 0x1000_0004.
-        assert_eq!(rendered, "call fn callee(@stack_10000004=0x7);");
+        // The stack-passed input is named after its slot offset (varnode address 4).
+        assert_eq!(rendered, "call fn callee(@stack_4=0x7);");
     }
 
     #[test]

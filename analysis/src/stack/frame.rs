@@ -22,7 +22,6 @@ use qcode::{
 };
 
 use crate::gvn::affine::Numbering;
-use crate::mem::mem2reg::stack_slot_offset;
 
 /// Where a stack pointer lands relative to the entry stack pointer.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -65,23 +64,18 @@ fn is_aligned_sp(ctx: &Context, sp_param: ValueId, base: ValueId) -> bool {
     )
 }
 
-/// The signed byte offset of `v` from the entry stack pointer, when `v` is an
-/// `@SP`-rooted (or legacy `@stack_base`) stack address. Every representation of
-/// the same slot yields the same offset, so this is the **canonical slot key**
-/// that replaces the interned `StackAddress` literal as a stable slot identity.
+/// The signed byte offset of `v` from the entry stack pointer `@SP`, when `v` is
+/// an `@SP`-rooted stack address. Every representation of the same slot yields the
+/// same offset, so this is the **canonical slot key** and stable slot identity.
 ///
 /// Returns `None` for a realigned (`@SP & -mask`) base — which has no stable
 /// `@SP`-relative offset — and for any non-stack pointer.
 pub(crate) fn frame_offset(
-    ctx: &Context,
+    _ctx: &Context,
     numbering: &Numbering,
     sp_param: ValueId,
     v: ValueId,
 ) -> Option<i64> {
-    // Legacy `@stack_base ± k` literal: its decoded signed offset.
-    if let Some((off, _)) = stack_slot_offset(ctx, v) {
-        return Some(off);
-    }
     // Affine `@SP ± k` (the bare param decomposes to itself at offset 0).
     let (base, off) = numbering.base_offset(v).unwrap_or((v, 0));
     (base == sp_param).then_some(off)

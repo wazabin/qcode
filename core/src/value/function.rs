@@ -267,8 +267,7 @@ where
         }
         let space = vn.space();
         if space.name.as_deref() == Some("stack") {
-            let addr = crate::types::stack_base(space.addr_size).wrapping_add(vn.address() as u64);
-            return Some(format!("stack_{addr:x}"));
+            return Some(format!("stack_{:x}", vn.address() as u64));
         }
         None
     }

@@ -1506,9 +1506,9 @@ mod tests {
             "
         );
 
-        // A StackAddress type exercises the custom TypeManager serialization.
-        let stack_space = ctx.make_named_temp_space("stack");
-        let sa = ctx.types.get_or_make_stack_address(8, Some(stack_space));
+        // A SpaceAddress type exercises the custom TypeManager serialization.
+        let some_space = ctx.make_named_temp_space("scratch");
+        let sa = ctx.types.get_or_make_space_address(8, some_space);
         let sa_size = ctx.types.size_of(sa);
 
         let blocks_before = ctx.block_ids().len();
@@ -1523,9 +1523,9 @@ mod tests {
         assert_eq!(restored.block_ids().len(), blocks_before);
         assert_eq!(restored.instruction_ids().len(), insns_before);
         assert_eq!(restored.function_ids().len(), funcs_before);
-        // The StackAddress type round-trips: same id, same size, still a stack address.
+        // The SpaceAddress type round-trips: same id, same size, same space.
         assert_eq!(restored.types.size_of(sa), sa_size);
-        assert!(restored.types.is_stack_address(sa));
+        assert_eq!(restored.types.space_of(sa), Some(some_space));
     }
 
     #[test]

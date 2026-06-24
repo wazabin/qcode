@@ -314,23 +314,9 @@ impl<'str, 'ctx> Builder<'str, 'ctx> {
         &mut self,
         mnemonic: Mnemonic,
         size: usize,
-        space: Option<SpaceId>,
+        _space: Option<SpaceId>,
     ) -> InstructionRef<'str, '_> {
-        let type_id = {
-            let ctx = self.context_mut();
-            match space {
-                Some(sid)
-                    if ctx
-                        .types
-                        .stack_address_id()
-                        .and_then(|sa| ctx.types.space_of(sa))
-                        == Some(sid) =>
-                {
-                    ctx.types.stack_address_id().unwrap()
-                }
-                _ => ctx.types.get_or_make_int(size),
-            }
-        };
+        let type_id = self.context_mut().types.get_or_make_int(size);
         self.push_instruction_with_type(mnemonic, type_id)
     }
 
@@ -395,11 +381,6 @@ impl<'str, 'ctx> Builder<'str, 'ctx> {
         let literal = self.context().values.literals[lit_id].clone();
         let current_size = self.context().types.size_of(literal.type_id);
         if current_size == size || literal.symbolic.is_some() {
-            return id;
-        }
-        // Preserve the type kind (e.g. StackAddress) but resize.
-        if self.context().types.is_stack_address(literal.type_id) {
-            // StackAddress is always pointer-width; don't resize.
             return id;
         }
         self.context_mut().get_const(literal.value, size).id()

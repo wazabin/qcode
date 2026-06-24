@@ -66,13 +66,11 @@ impl<'ctx, 'str> Mem2Reg<'ctx, 'str> {
     }
 
     /// The signed byte offset of stack-slot pointer `ptr` from the entry stack
-    /// pointer — the canonical slot key — across both the `@SP ± N` and legacy
-    /// `@stack_base ± N` representations. `None` for non-stack pointers.
+    /// pointer `@SP` — the canonical slot key. `None` when there is no incoming
+    /// stack-pointer param or `ptr` is not an `@SP ± N` slot.
     fn slot_offset(&self, ptr: ValueId) -> Option<i64> {
-        match self.sp_param {
-            Some(sp) => frame_offset(self.ctx, &self.numbering, sp, ptr),
-            None => stack_slot_offset(self.ctx, ptr).map(|(off, _)| off),
-        }
+        let sp = self.sp_param?;
+        frame_offset(self.ctx, &self.numbering, sp, ptr)
     }
 
     /// Whether `ptr` is `@SP`-derived but *not* a fixed slot offset — a
@@ -162,7 +160,7 @@ impl<'ctx, 'str> Mem2Reg<'ctx, 'str> {
 
         if let ValueId::Literal(id) = value {
             let literal = self.ctx.values.literals[id].clone();
-            if literal.symbolic.is_none() && !self.ctx.types.is_stack_address(literal.type_id) {
+            if literal.symbolic.is_none() {
                 return self.ctx.get_const(literal.value, load_size).id();
             }
         }
@@ -185,84 +183,9 @@ impl<'ctx, 'str> Mem2Reg<'ctx, 'str> {
     }
 }
 
-/// The `StackAddress` offset encoded by a stack-typed literal pointer, if `v`
-/// is one. Stack slots are interned per `(offset, StackAddress)`, so equal
-/// offsets share a single `ValueId` — making the literal a stable slot key.
-fn stack_slot_addr(ctx: &Context, v: ValueId) -> Option<u64> {
-    let ValueId::Literal(id) = v else {
-        return None;
-    };
-    let lit = &ctx.values.literals[id];
-    ctx.types.is_stack_address(lit.type_id).then_some(lit.value)
-}
-
-/// True if `v`'s result type is a `StackAddress` pointer, whether or not it is
-/// a concrete literal. A stack-typed value that is *not* a slot literal is a
-/// dynamic stack pointer (e.g. an indexed stack array), which we cannot
-/// resolve to a fixed byte range and which therefore defeats slot promotion.
-fn is_stack_typed(ctx: &Context, v: ValueId) -> bool {
-    let type_id = match v {
-        ValueId::Literal(id) => ctx.values.literals[id].type_id,
-        ValueId::Instruction(id) => Instruction::from_id(ctx, id).type_id(),
-        _ => return false,
-    };
-    ctx.types.is_stack_address(type_id)
-}
-
-fn depends_on_stack_frame_pointer(ctx: &Context, v: ValueId, seen: &mut HashSet<ValueId>) -> bool {
-    if !seen.insert(v) {
-        return false;
-    }
-    match v {
-        ValueId::Literal(_) => stack_slot_addr(ctx, v).is_some(),
-        ValueId::Instruction(id) => {
-            is_stack_typed(ctx, v)
-                || Instruction::from_id(ctx, id)
-                    .mnemonic()
-                    .args()
-                    .into_iter()
-                    .any(|arg| depends_on_stack_frame_pointer(ctx, arg, seen))
-        }
-        // A block parameter whose origin is a stack slot represents the value
-        // read from that slot, not the caller-frame address itself.
-        ValueId::BlockParam(_)
-        | ValueId::Varnode(_)
-        | ValueId::BasicBlock(_)
-        | ValueId::Function(_) => false,
-        _ => false,
-    }
-}
-
-fn is_computed_stack_frame_pointer(ctx: &Context, v: ValueId) -> bool {
-    stack_slot_addr(ctx, v).is_none()
-        && depends_on_stack_frame_pointer(ctx, v, &mut HashSet::default())
-}
-
-/// The `(offset, ptr_width)` a stack-slot literal encodes, relative to the
-/// per-function stack base. `offset` is negative for locals below the entry SP
-/// and `>= ptr_width` for the caller's frame (the return-address slot sits at
-/// offset `0`, incoming parameters above it). Mirrors `compute_stack_delta`'s
-/// `value - stack_base` decode, deriving the pointer width from the literal's
-/// own `StackAddress` type so it needs no separate stack-pointer argument.
-pub(crate) fn stack_slot_offset(ctx: &Context, v: ValueId) -> Option<(i64, usize)> {
-    let ValueId::Literal(id) = v else {
-        return None;
-    };
-    let lit = &ctx.values.literals[id];
-    if !ctx.types.is_stack_address(lit.type_id) {
-        return None;
-    }
-    let ptr_width = ctx.types.size_of(lit.type_id);
-    let offset = lit.value.wrapping_sub(qcode::types::stack_base(ptr_width)) as i64;
-    Some((offset, ptr_width))
-}
-
 /// Whether `function_id` performs any load or store through a *computed stack
-/// frame pointer* — a stack-frame pointer that does not resolve to a fixed slot.
-///
-/// Recognised in either representation: a legacy `StackAddress`-typed value that
-/// is not a slot literal, or an `@SP`-rooted value whose offset from the incoming
-/// stack pointer is not a fixed constant (`@SP + reg`, or a realigned
+/// frame pointer* — an `@SP`-rooted value whose offset from the incoming stack
+/// pointer is not a fixed constant (`@SP + reg`, or a realigned
 /// `(@SP & -mask) + k`). A computed RAM pointer loaded from a stack-passed
 /// argument is not enough: that reads behind the argument value, not arbitrary
 /// bytes of the caller's frame.
@@ -271,19 +194,18 @@ pub(crate) fn has_dynamic_stack_pointer_deref(
     function_id: FunctionId,
     stack_ptr: VarnodeId,
 ) -> bool {
-    let sp_param = incoming_sp_param(ctx, function_id, stack_ptr);
-    let numbering = precompute_forms(ctx, function_id);
-    let is_dynamic_sp = |ptr: ValueId| {
-        sp_param.is_some_and(|sp| {
-            frame_offset(ctx, &numbering, sp, ptr).is_none() && numbering.affine_mentions(ptr, sp)
-        })
+    let Some(sp) = incoming_sp_param(ctx, function_id, stack_ptr) else {
+        return false;
     };
+    let numbering = precompute_forms(ctx, function_id);
     for block in Function::from_id(ctx, function_id).blocks() {
         for insn in block.iter() {
             let Some(access) = MemoryAccess::from_mnemonic(insn.mnemonic()) else {
                 continue;
             };
-            if is_computed_stack_frame_pointer(ctx, access.ptr) || is_dynamic_sp(access.ptr) {
+            if frame_offset(ctx, &numbering, sp, access.ptr).is_none()
+                && numbering.affine_mentions(access.ptr, sp)
+            {
                 return true;
             }
         }
@@ -648,9 +570,7 @@ impl Mem2Reg<'_, '_> {
                     } else {
                         stack_loaded.insert(access.ptr);
                     }
-                } else if is_stack_typed(self.ctx, access.ptr)
-                    || self.is_dynamic_sp_deref(access.ptr)
-                {
+                } else if self.is_dynamic_sp_deref(access.ptr) {
                     dynamic_stack = true;
                 }
             }

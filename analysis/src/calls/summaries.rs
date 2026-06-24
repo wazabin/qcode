@@ -18,9 +18,6 @@ use qcode::{
         insn::{Binop, IntBinop, Mnemonic},
     },
 };
-// Only the test-gated frame-pointer helpers below resolve an instruction's type.
-#[cfg(test)]
-use qcode::value::Instruction;
 
 use crate::{
     compute_clobbered_regs,
@@ -29,56 +26,11 @@ use crate::{
     stack::frame::{frame_offset, incoming_sp_param},
 };
 
-/// Window around a stack base within which a bare integer is taken to be a frame
-/// pointer. Comfortably larger than any plausible stack frame, yet far smaller
-/// than the distance from a stack base to code/global/immediate constants.
-#[cfg(test)]
-const FRAME_POINTER_WINDOW: u64 = 0x0100_0000;
-
-/// True when `v` addresses some function's stack frame.
-///
-/// A frame pointer keeps its `StackAddress` type while the symbolic stack base is
-/// live, but constant folding can collapse `@stack_base ± k` to a bare integer
-/// (losing the type) before this runs. So we accept either: an explicit
-/// `StackAddress` value, or a constant within [`FRAME_POINTER_WINDOW`] of a
-/// pointer-width stack base. Over-approximate by design — a false positive only
-/// keeps a caller's frame in memory, which is always sound.
-#[cfg(test)]
-pub(crate) fn value_is_frame_pointer(ctx: &Context, v: ValueId) -> bool {
-    match v {
-        ValueId::Literal(id) => {
-            let lit = &ctx.values.literals[id];
-            if ctx.types.is_stack_address(lit.type_id) {
-                return true;
-            }
-            [qcode::types::stack_base(4), qcode::types::stack_base(8)]
-                .into_iter()
-                .any(|base| lit.value.abs_diff(base) < FRAME_POINTER_WINDOW)
-        }
-        ValueId::Instruction(id) => ctx
-            .types
-            .is_stack_address(Instruction::from_id(ctx, id).type_id()),
-        _ => false,
-    }
-}
-
 /// True when `function_id` makes a call that could read a pointer argument
 /// unboundedly: an indirect call (unknown target), or a direct call to an
 /// external function or one already flagged [`Function::reads_unbounded_stack`].
 /// Such a function may forward a caller-supplied pointer into that read, so it is
 /// itself treated as an unbounded reader.
-/// The absolute (per-function) stack address a frame-pointer literal `v` encodes,
-/// or `None` if `v` is not one. Accepts an explicit `StackAddress` literal or a
-/// bare constant near a stack base (constant folding can strip the type). Used to
-/// read the caller-frame base a callee's stack arguments are measured from.
-#[cfg(test)]
-pub(crate) fn stack_address_literal_value(ctx: &Context, v: ValueId) -> Option<u64> {
-    let ValueId::Literal(id) = v else {
-        return None;
-    };
-    value_is_frame_pointer(ctx, v).then(|| ctx.values.literals[id].value)
-}
-
 fn function_makes_unbounded_call(ctx: &Context, function_id: FunctionId) -> bool {
     for block in Function::from_id(ctx, function_id).blocks() {
         for insn in block.iter() {
@@ -603,7 +555,7 @@ mod tests {
     use qcode::{
         builder::Builder,
         testing::TestContext,
-        value::{Function, FunctionId, Value},
+        value::{BasicBlock, Function, FunctionId, Value},
     };
 
     /// Build a function rooted at `addr` in `tc`, populated by `f`.
@@ -620,6 +572,32 @@ mod tests {
             .unwrap();
         let mut builder = Builder::from_context(&mut tc.ctx, addr);
         f(&mut builder);
+        unsafe { builder.dont_finalize() };
+        drop(builder);
+        fun_id
+    }
+
+    /// Build a function rooted at `addr` with an incoming `@SP` param (origin = the
+    /// stack-pointer varnode `sp`), as `argpromote_registers` would mint it. The
+    /// closure receives the builder and the `@SP` param `ValueId`, so a body can
+    /// address its frame as `@SP ± N`.
+    fn build_fn_with_sp(
+        tc: &mut TestContext,
+        name: &'static str,
+        addr: u64,
+        sp: VarnodeId,
+        f: impl FnOnce(&mut Builder<'static, '_>, ValueId),
+    ) -> FunctionId {
+        let fun_id = Function::make(&mut tc.ctx, name.into()).unwrap().id;
+        let block_id = tc.ctx.get_or_make_block(addr);
+        Function::from_id_mut(&mut tc.ctx, fun_id)
+            .set_root(block_id)
+            .unwrap();
+        let pid = BasicBlock::from_id_mut(&mut tc.ctx, block_id).push_param(8).id;
+        tc.ctx.values.block_params[pid].origin = Some(ValueId::Varnode(sp));
+        let sp_param = ValueId::BlockParam(pid);
+        let mut builder = Builder::from_context(&mut tc.ctx, addr);
+        f(&mut builder, sp_param);
         unsafe { builder.dont_finalize() };
         drop(builder);
         fun_id
@@ -752,16 +730,8 @@ mod tests {
     // Stack delta + caller relink (Phase B)
     // -----------------------------------------------------------------------
 
-    /// A `StackAddress`-typed literal for `STACK_BASE + offset`, mirroring the
-    /// stack-slot literals brighten+mem2reg leave behind.
-    fn stack_addr_lit(ctx: &mut Context, offset: i64) -> ValueId {
-        let sa = ctx.types.get_or_make_stack_address(8, None);
-        ctx.get_typed_const(qcode::types::STACK_BASE.wrapping_add(offset as u64), sa)
-            .id()
-    }
-
-    /// Build a callee rooted at `addr` whose final `RSP = @stack_base+offset`
-    /// write encodes a net stack delta of `offset`.
+    /// Build a callee rooted at `addr` whose final `RSP = @SP + offset` write
+    /// encodes a net stack delta of `offset`.
     fn build_callee_with_delta(
         tc: &mut TestContext,
         sp: VarnodeId,
@@ -769,8 +739,13 @@ mod tests {
         offset: i64,
     ) -> FunctionId {
         let reg = tc.reg_space;
-        build_fn(tc, "callee", addr, |b| {
-            let v = stack_addr_lit(b.context_mut(), offset);
+        build_fn_with_sp(tc, "callee", addr, sp, |b, sp_param| {
+            let mag = b.context_mut().get_const(offset.unsigned_abs(), 8).id();
+            let v = if offset >= 0 {
+                b.push_add(sp_param, mag).id()
+            } else {
+                b.push_sub(sp_param, mag).id()
+            };
             b.push_store(v, ValueId::Varnode(sp), reg);
             let ret = b.context_mut().get_const(0u64, 8).id();
             b.push_return(ret);
@@ -834,12 +809,12 @@ mod tests {
         let ram = tc.ctx.default_space;
         let reg = tc.reg_space;
         let r0 = tc.r0;
-        crate::stack::brighten::get_or_make_stack_space(&mut tc.ctx, 8);
 
-        let callee = build_fn(&mut tc, "callee", 0x2000, |b| {
-            let local = stack_addr_lit(b.context_mut(), -8);
+        let callee = build_fn_with_sp(&mut tc, "callee", 0x2000, sp, |b, sp_param| {
+            let c8 = b.context_mut().get_const(8, 8).id();
+            let local = b.push_sub(sp_param, c8).id(); // @SP - 8
             let idx = b.push_load::<false>(ValueId::Varnode(r0), 8, reg).id();
-            let ptr = b.push_add(local, idx).id();
+            let ptr = b.push_add(local, idx).id(); // (@SP - 8) + idx → dynamic
             let loaded = b.push_load::<false>(ptr, 1, ram).id();
             let ret = b.push_zext(loaded, 8).id();
             b.push_return(ret);
@@ -856,41 +831,54 @@ mod tests {
 
     #[test]
     fn frame_escape_flag_disables_stack_promotion() {
+        use crate::mem::mem2reg::mem2reg_framed;
+        use crate::stack::canonicalize::canonicalize_sp_slots;
+        use crate::stack::frame::incoming_sp_param;
+
         // A normally-promotable local (stored then loaded) must stay in memory once
         // the function is flagged as letting a frame pointer escape unboundedly.
         let mut tc = TestContext::new();
         let ram = tc.ctx.default_space;
-        crate::stack::brighten::get_or_make_stack_space(&mut tc.ctx, 8);
+        let sp = tc.r3;
 
-        let stack_load_count = |ctx: &Context, fun: FunctionId| {
+        // The only loads in the body are the stack-slot reload, so a plain RAM-load
+        // count tracks whether the local was promoted away.
+        let ram_load_count = |ctx: &Context, fun: FunctionId| {
             Function::from_id(ctx, fun)
                 .blocks()
                 .flat_map(|b| b.iter().collect::<Vec<_>>())
-                .filter(|i| {
-                    matches!(i.mnemonic(), Mnemonic::Load(l) if stack_address_literal_value(ctx, l.ptr).is_some())
-                })
+                .filter(|i| matches!(i.mnemonic(), Mnemonic::Load(_)))
                 .count()
         };
 
         let build_local_fn = |tc: &mut TestContext, name: &'static str, addr: u64| {
-            build_fn(tc, name, addr, |b| {
-                let slot = stack_addr_lit(b.context_mut(), -8);
+            build_fn_with_sp(tc, name, addr, sp, |b, sp_param| {
+                let c8 = b.context_mut().get_const(8, 8).id();
+                let c16 = b.context_mut().get_const(16, 8).id();
+                let slot = b.push_sub(sp_param, c8).id(); // @SP - 8
                 let v = b.context_mut().get_const(7u64, 8).id();
                 b.push_store(v, slot, ram);
-                let loaded = b.push_load::<false>(slot, 8, ram).id();
-                let sink_slot = stack_addr_lit(b.context_mut(), -16);
+                let slot_reload = b.push_sub(sp_param, c8).id(); // reload @SP - 8
+                let loaded = b.push_load::<false>(slot_reload, 8, ram).id();
+                let sink_slot = b.push_sub(sp_param, c16).id(); // @SP - 16
                 b.push_store(loaded, sink_slot, ram);
                 let sink = b.context_mut().get_const(0u64, 8).id();
                 b.push_return(sink);
             })
         };
 
+        let promote = |tc: &mut TestContext, fun: FunctionId| {
+            let sp_param = incoming_sp_param(&tc.ctx, fun, sp).unwrap();
+            canonicalize_sp_slots(&mut tc.ctx, fun, sp);
+            let aliases = AliasResult::simple(&tc.ctx);
+            mem2reg_framed(&mut tc.ctx, fun, &aliases, Some(sp_param));
+        };
+
         // Baseline: the local is promoted away (no stack loads remain).
         let promoted = build_local_fn(&mut tc, "promoted", 0x1000);
-        let aliases = AliasResult::simple(&tc.ctx);
-        crate::mem2reg(&mut tc.ctx, promoted, &aliases);
+        promote(&mut tc, promoted);
         assert_eq!(
-            stack_load_count(&tc.ctx, promoted),
+            ram_load_count(&tc.ctx, promoted),
             0,
             "without the flag, the local stack slot is promoted to SSA"
         );
@@ -898,10 +886,9 @@ mod tests {
         // Flagged: promotion is disabled and the load survives.
         let escaping = build_local_fn(&mut tc, "escaping", 0x2000);
         Function::from_id_mut(&mut tc.ctx, escaping).set_frame_escapes_to_unbounded(true);
-        let aliases = AliasResult::simple(&tc.ctx);
-        crate::mem2reg(&mut tc.ctx, escaping, &aliases);
+        promote(&mut tc, escaping);
         assert!(
-            stack_load_count(&tc.ctx, escaping) > 0,
+            ram_load_count(&tc.ctx, escaping) > 0,
             "a frame-escaping function must keep its stack frame in memory"
         );
     }

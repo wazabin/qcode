@@ -216,33 +216,15 @@ impl<'str, 'ctx> InstructionRef<'str, 'ctx> {
 
     /// Creates an instruction, deriving the result type from an optional space tag.
     ///
-    /// This is a migration shim: callers that still pass a `SpaceId` to indicate
-    /// provenance get `StackAddress` for the stack space and `Int(size)` for
-    /// everything else. New code should use [`from_mnemonic_with_type`] directly.
+    /// This is a migration shim that types the result as `Int(size)` regardless of
+    /// the `space` tag. New code should use [`from_mnemonic_with_type`] directly.
     pub fn from_mnemonic_with_space(
         ctx: &'ctx mut Context<'str>,
         mnemonic: Mnemonic,
         size: usize,
-        space: Option<SpaceId>,
+        _space: Option<SpaceId>,
     ) -> Self {
-        // Pointer arithmetic is not allowed in the register space; treat as Int.
-        let effective_space =
-            space.filter(|&s| !matches!(Space::from_id(ctx, s).ty, SpaceType::Register));
-
-        let type_id = match effective_space {
-            Some(sid)
-                if ctx
-                    .types
-                    .stack_address_id()
-                    .and_then(|sa| ctx.types.space_of(sa))
-                    == Some(sid) =>
-            {
-                // The space matches the registered stack space → StackAddress
-                ctx.types.stack_address_id().unwrap()
-            }
-            _ => ctx.types.get_or_make_int(size),
-        };
-
+        let type_id = ctx.types.get_or_make_int(size);
         let insn = Instruction::new(type_id, mnemonic);
         let id = ctx.values.push_insn(insn);
         Self::from_id(ctx, id)
@@ -349,21 +331,13 @@ impl<'str, 'ctx> InstructionMutRef<'str, 'ctx> {
 
     /// Sets the address-space provenance of this instruction's result.
     ///
-    /// The stack space promotes the result to
-    /// [`StackAddress`](crate::types::StackAddress); any other non-register
-    /// space promotes it to a [`SpaceAddress`](crate::types::SpaceAddress) of
-    /// the same byte width. Register spaces are ignored (pointer arithmetic is
-    /// not allowed in the register space).
+    /// A non-register space promotes the result to a
+    /// [`SpaceAddress`](crate::types::SpaceAddress) of the same byte width.
+    /// Register spaces are ignored (pointer arithmetic is not allowed in the
+    /// register space).
     pub fn set_space(&mut self, space: SpaceId) {
         // Pointer arithmetic is not allowed in the register space.
         if matches!(Space::from_id(self.ctx, space).ty, SpaceType::Register) {
-            return;
-        }
-        // The stack space has dedicated `StackAddress` semantics.
-        if let Some(sa_id) = self.ctx.types.stack_address_id()
-            && self.ctx.types.space_of(sa_id) == Some(space)
-        {
-            self.inner_mut().type_id = sa_id;
             return;
         }
         let size = self.ctx.types.size_of(self.inner().type_id);

@@ -5,10 +5,9 @@
 //! the address of a known block or function. When a literal has a symbolic
 //! reference it is displayed as `&<name>` rather than `0x…`.
 //!
-//! Every literal carries a [`TypeId`] that encodes both its byte width and its
-//! semantic kind (plain integer vs. stack address). Type is preserved through
-//! constant folding: folding `@stack_base - 0x8` produces a literal whose
-//! `type_id` is still [`StackAddress`](crate::types::StackAddress).
+//! Every literal carries a [`TypeId`] that encodes its byte width (and, for
+//! pointer literals, its space provenance). Type is preserved through constant
+//! folding.
 
 use crate::{
     context::Context,
@@ -31,9 +30,6 @@ pub struct LiteralId(usize);
 /// address of a block, a function, or a string, it stores a `SymbolicRef` so
 /// that the literal can be displayed and reasoned about symbolically.
 ///
-/// Note: `Space(SpaceId)` has been removed. Stack base addresses are now
-/// represented as [`StackAddress`](crate::types::StackAddress)-typed literals;
-/// their display derives from the type, not from a symbolic annotation.
 #[derive(Debug, Clone, Hash, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum SymbolicRef {
     /// The literal is the address of this basic block.
@@ -109,21 +105,7 @@ impl std::fmt::Display for LiteralRef<'_, '_> {
                 write!(f, "&<{}>", fn_ref.name())
             }
             Some(SymbolicRef::String(s)) => write!(f, "&{:?}", s),
-            None => {
-                if self.ctx.types.is_stack_address(literal.type_id) {
-                    // The value is an absolute `stack_base + offset` address;
-                    // show the signed offset (negative for locals below entry).
-                    let base = crate::types::stack_base(self.ctx.types.size_of(literal.type_id));
-                    let offset = literal.value.wrapping_sub(base) as i64;
-                    if offset < 0 {
-                        write!(f, "@stack_base-0x{:x}", offset.unsigned_abs())
-                    } else {
-                        write!(f, "@stack_base+0x{:x}", offset)
-                    }
-                } else {
-                    write!(f, "0x{:x}", literal.value)
-                }
-            }
+            None => write!(f, "0x{:x}", literal.value),
         }
     }
 }
