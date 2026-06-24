@@ -2016,6 +2016,34 @@ mod tests {
     }
 
     #[test]
+    fn gep_emulates_as_base_plus_offset() {
+        let mut ctx = Context::new();
+
+        // `Inner { val: i32 @ 0x08 }` (0x08 via leading padding), `%p : Inner*`.
+        qcode!(
+            ctx,
+            "
+            type Inner { _: 8, val: 4 };
+            varnode i64 V0;
+
+        <block>
+            Inner* %p = load(i64, &V0);
+            %fld = gep(%p.val);
+            goto <0x1001>;
+        "
+        );
+
+        let mut emu = Emulator::from_block(&ctx, block);
+        emu.set_varnode(V0, 0x1000).unwrap();
+        emu.run_block().unwrap();
+
+        let fld = emu.get_value(fld.into()).unwrap();
+        assert_eq!(fld.value().unwrap(), 0x1008);
+        // Width follows the pointer base, not the immediate's default u64.
+        assert_eq!(fld.size().unwrap(), 8);
+    }
+
+    #[test]
     fn emulator_int_div_works_with_128_bit_operands() {
         let mut ctx = Context::new();
         qcode!(

@@ -4,8 +4,9 @@ use qcode::{
     value::{
         BlockId, FunctionId, InstructionId, ValueId, Varnode,
         insn::{
-            Binary, Binop, BoolBinop, Carry, FloatBinop, FloatToFloat, FloatToInt, InstructionRef,
-            IntBinop, IntToFloat, IsFloatNaN, Load, LzCount, Mnemonic, PopCount, Range, SBorrow,
+            Binary, Binop, BoolBinop, Carry, FloatBinop, FloatToFloat, FloatToInt, Gep,
+            InstructionRef, IntBinop, IntToFloat, IsFloatNaN, Load, LzCount, Mnemonic, PopCount,
+            Range, SBorrow,
             SCarry, Sext, Store, Unary, Unop, Zext,
         },
         varnode::{VarnodeId, register::RegisterId},
@@ -445,6 +446,16 @@ pub trait Interpreter {
             &Mnemonic::Range(Range { src, start, size }) => {
                 let value = self.get_value(src)?;
                 Some(value.range(start, size)?)
+            }
+
+            // ===== Aggregate operations =====
+            // `Gep` is pure pointer arithmetic: base pointer + constant byte
+            // offset. The width follows the base (int_add uses the lhs width),
+            // so the immediate's default u64 width is harmless.
+            &Mnemonic::Gep(Gep { base, offset }) => {
+                let base = self.get_value(base)?;
+                let offset = Self::V::from_u64(offset as u64);
+                Some(base.int_add(&offset)?)
             }
 
             // ===== Other operations =====
