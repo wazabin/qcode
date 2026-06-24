@@ -68,6 +68,11 @@ pub enum ExprNode {
         op: String,
         args: Vec<TypedAtom>,
     },
+    /// A pure intrinsic call, e.g. `$rol(%x, %k)`. `name` excludes the `$`.
+    Intrinsic {
+        name: String,
+        args: Vec<TypedAtom>,
+    },
 }
 
 #[derive(Clone, Copy, Debug)]

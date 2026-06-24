@@ -5,8 +5,8 @@ use crate::{
         function::FunctionId,
         insn::{
             Binary, Branch, BranchInd, CBranch, Call, CallInd, Carry, FloatToFloat, FloatToInt,
-            IntToFloat, IsFloatNaN, Load, LzCount, PCodeOp, PopCount, Range, Return, SBorrow,
-            SCarry, Sext, Store, Unary, Zext,
+            IntToFloat, Intrinsic, IsFloatNaN, Load, LzCount, PCodeOp, PopCount, Range, Return,
+            SBorrow, SCarry, Sext, Store, Unary, Zext,
         },
     },
 };
@@ -57,6 +57,7 @@ pub trait MnemonicKind {
 /// | [`Zext`], [`Sext`], [`Range`], [`IntToFloat`], [`FloatToInt`], [`FloatToFloat`] | Type casts and bit extraction |
 /// | [`IsFloatNaN`], [`PopCount`], [`LzCount`], [`Carry`], [`SCarry`], [`SBorrow`] | Bit/flag operations |
 /// | [`PCodeOp`] | User-defined or architecture-specific operation |
+/// | [`Intrinsic`] | Pure named intrinsic function (e.g. `rol`, `ror`) |
 #[non_exhaustive]
 #[derive(Debug, Clone, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub enum Mnemonic {
@@ -106,6 +107,9 @@ pub enum Mnemonic {
     SBorrow(SBorrow),
     /// A user-defined or architecture-specific p-code operation.
     PCodeOp(PCodeOp),
+    /// A pure named intrinsic function (e.g. `rol`, `ror`). Categorically pure:
+    /// no memory or observable side effects.
+    Intrinsic(Intrinsic),
 }
 
 impl Mnemonic {
@@ -134,6 +138,7 @@ impl Mnemonic {
             Mnemonic::SCarry(m) => m,
             Mnemonic::SBorrow(m) => m,
             Mnemonic::PCodeOp(m) => m,
+            Mnemonic::Intrinsic(m) => m,
         }
     }
 
@@ -321,6 +326,13 @@ impl Mnemonic {
                 }
             }
             Mnemonic::Branch(m) => {
+                m.args.iter_mut().for_each(|a| {
+                    if *a == old {
+                        *a = new;
+                    }
+                });
+            }
+            Mnemonic::Intrinsic(m) => {
                 m.args.iter_mut().for_each(|a| {
                     if *a == old {
                         *a = new;

@@ -17,6 +17,7 @@ mod cse;
 mod flag_idiom;
 mod fold;
 mod identity;
+mod intrinsics;
 mod mem_forward;
 mod memory;
 mod walk;
@@ -25,15 +26,24 @@ use cse::Cse;
 use flag_idiom::FlagIdiom;
 use fold::Fold;
 use identity::Identities;
+use intrinsics::Recognize;
 use memory::MemoryForwarding;
 use walk::{run_dominator_walk, run_flat_fixpoint, run_single_block};
 
 /// The full GVN sub-pass chain. Order is load-bearing: memory forwarding must
 /// see loads/stores first, folding must run before idiom recognition (so shift
-/// amounts and multipliers are constants), and CSE last over already-simplified
-/// mnemonics.
-fn gvn_passes() -> (MemoryForwarding, Fold, FlagIdiom, Identities, Cse) {
-    (MemoryForwarding, Fold, FlagIdiom, Identities, Cse)
+/// amounts and multipliers are constants), intrinsic recognition before the
+/// algebraic identities that simplify the intrinsics it produces, and CSE last
+/// over already-simplified mnemonics.
+fn gvn_passes() -> (
+    MemoryForwarding,
+    Fold,
+    Recognize,
+    FlagIdiom,
+    Identities,
+    Cse,
+) {
+    (MemoryForwarding, Fold, Recognize, FlagIdiom, Identities, Cse)
 }
 
 /// Constant-fold every foldable instruction in `func_id` to interned literals,

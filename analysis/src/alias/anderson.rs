@@ -230,6 +230,17 @@ pub fn alias_analysis(ctx: &Context) -> AliasResult {
                 state.join(r, NodeId::Unknown);
             }
 
+            // r = Intrinsic { args } => node(r) == node(arg) for each arg.
+            // Pure intrinsics derive their result from their operands, so the
+            // result aliases whatever its operands alias (mirrors Binop).
+            Mnemonic::Intrinsic(intr) if size > 0 => {
+                let r = state.node_for(result_id);
+                for &arg in &intr.args {
+                    let a = state.node_for(arg);
+                    state.join(r, a);
+                }
+            }
+
             Mnemonic::Call(call) => {
                 if let Some(sig) = ctx.values.functions[call.target].signature.as_ref() {
                     apply_sig(&mut state, sig);

@@ -334,6 +334,20 @@ impl DomainValue for SizedValue {
         Ok(Self::from_bits(value, size))
     }
 
+    fn intrinsic(
+        id: qcode::value::insn::IntrinsicId,
+        args: &[Self],
+        out_size: usize,
+    ) -> Result<Self, EmulatorErrorKind> {
+        let operands: Vec<(u128, usize)> = args
+            .iter()
+            .map(|a| (a.as_bits(), a.size as usize))
+            .collect();
+        let value = (id.desc().eval)(&operands, out_size)
+            .ok_or_else(|| EmulatorErrorKind::UnsupportedIntrinsic(Box::from(id.name())))?;
+        Ok(Self::from_bits(value, out_size))
+    }
+
     fn pop_count(&self) -> Result<Self, EmulatorErrorKind> {
         let size = self.size as usize;
         Ok(Self::from_bits(PopCount::eval(self.as_bits(), size), size))
@@ -1941,6 +1955,34 @@ mod tests {
                 .and_then(|value| value.value())
                 .unwrap(),
             0x3412
+        );
+    }
+
+    #[test]
+    fn rol_intrinsic_is_emulated() {
+        use qcode::value::insn::IntrinsicId;
+        let mut ctx = Context::new();
+        let rol = IntrinsicId::from_name("rol").unwrap();
+        let block_id = ctx.get_or_make_block(0x1000);
+        let result = {
+            let x = ctx.get_const(0x1234_5678, 4).id();
+            let k = ctx.get_const(8, 4).id();
+            let mut builder =
+                qcode::builder::Builder::from_block(BasicBlock::from_id_mut(&mut ctx, block_id));
+            let result = builder.intrinsic(rol, vec![x, k]).id;
+            builder.finalize(0x1001);
+            result
+        };
+        let mut emulator = Emulator::from_block(&ctx, block_id);
+
+        emulator.step().unwrap();
+
+        assert_eq!(
+            emulator
+                .get_value(result.into())
+                .and_then(|value| value.value())
+                .unwrap(),
+            0x1234_5678u32.rotate_left(8) as u64,
         );
     }
 

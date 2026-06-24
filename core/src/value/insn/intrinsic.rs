@@ -1,0 +1,439 @@
+//! Pure intrinsic functions: named, side-effect-free operations such as `rol`
+//! and `ror`.
+//!
+//! An intrinsic is represented by a single [`Mnemonic::Intrinsic`] variant
+//! carrying an [`IntrinsicId`] plus its operands — there is no dedicated
+//! mnemonic per intrinsic and no control-flow call. Semantics live in an
+//! [`IntrinsicDesc`] looked up from a process-global registry.
+//!
+//! # Purity
+//!
+//! `Mnemonic::Intrinsic` is *categorically pure*: it has no memory effects and
+//! no observable side effects. Passes treat the variant itself as the purity
+//! contract (DCE may drop an unused intrinsic; GVN/CSE may dedup one). Anything
+//! impure (syscalls, `rdtsc`, …) stays a [`PCodeOp`](super::PCodeOp).
+//!
+//! # Registry
+//!
+//! Built-in intrinsics self-register with [`inventory`] via
+//! [`register_intrinsic!`], mirroring the pass registry. The id-indexed table
+//! and the name→id map are built once, lazily, from `inventory::iter`. An
+//! [`IntrinsicId`] is a runtime handle (cheap to copy/match/hash) but
+//! *serializes by name*, so the on-disk form is stable regardless of link
+//! order and an unknown name is a clean deserialize error.
+
+use std::collections::HashMap;
+use std::sync::OnceLock;
+
+use super::mnemonic::MnemonicKind;
+use super::binop::IntBinop;
+use crate::{
+    context::Context,
+    value::{InstructionId, ValueId, ValueRef},
+};
+
+/// A stable-by-name handle into the intrinsic registry.
+///
+/// Cheap to copy, match, and hash in hot pass code; serialized as the
+/// intrinsic's name so the id is never written to disk.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct IntrinsicId(usize);
+
+impl IntrinsicId {
+    /// Resolve an intrinsic by name, or `None` if no intrinsic is registered
+    /// under `name`.
+    pub fn from_name(name: &str) -> Option<Self> {
+        registry().by_name.get(name).copied()
+    }
+
+    /// The registered name of this intrinsic (e.g. `"rol"`).
+    pub fn name(self) -> &'static str {
+        self.desc().name
+    }
+
+    /// The full descriptor for this intrinsic.
+    pub fn desc(self) -> &'static IntrinsicDesc {
+        registry().descs[self.0]
+    }
+}
+
+impl serde::Serialize for IntrinsicId {
+    fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        s.serialize_str(self.name())
+    }
+}
+
+impl<'de> serde::Deserialize<'de> for IntrinsicId {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        let name = <std::borrow::Cow<'de, str>>::deserialize(d)?;
+        IntrinsicId::from_name(&name)
+            .ok_or_else(|| serde::de::Error::custom(format!("unknown intrinsic `{name}`")))
+    }
+}
+
+/// The IR shape an intrinsic's idiom is rooted at, used to gate recognition so
+/// only relevant recognizers run per instruction.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum RootOp {
+    /// Rooted at an integer binop (e.g. `rol`/`ror` root at `IntBinop::Or`).
+    IntBinop(IntBinop),
+}
+
+/// Static description of one intrinsic: its name, arity, result-size rule, the
+/// shared evaluator (used by both constant folding and the emulator), and
+/// optional recognition / simplification hooks.
+pub struct IntrinsicDesc {
+    /// Textual name, e.g. `"rol"`. Unique across the registry.
+    pub name: &'static str,
+    /// Number of operands the intrinsic takes.
+    pub arity: usize,
+    /// Computes the result byte width from the operand byte widths.
+    pub result_size: fn(&[usize]) -> usize,
+    /// Evaluate on concrete operands `(bits, byte_width)` for an `out_size`-byte
+    /// result. `None` means "not foldable / trap" — fold bails, the emulator
+    /// raises.
+    pub eval: fn(&[(u128, usize)], usize) -> Option<u128>,
+    /// IR shape this intrinsic's idiom roots at, if it participates in
+    /// recognition.
+    pub root_op: Option<RootOp>,
+    /// Recognize the raw-IR idiom rooted at the given instruction, returning the
+    /// intrinsic's operands when it matches.
+    pub recognize: Option<fn(&Context, InstructionId) -> Option<Vec<ValueId>>>,
+    /// Algebraic simplification on the intrinsic's own operands (e.g.
+    /// `rol(x, 0) → x`), returning a replacement value when one applies.
+    pub simplify: Option<fn(&mut Context, &[ValueId]) -> Option<ValueId>>,
+}
+
+/// One intrinsic's registration, submitted via [`inventory::submit!`] (see
+/// [`register_intrinsic!`]) and collected into the global registry.
+pub struct IntrinsicRegistration(pub IntrinsicDesc);
+
+inventory::collect!(IntrinsicRegistration);
+
+struct Registry {
+    /// Descriptors indexed by [`IntrinsicId`].
+    descs: Vec<&'static IntrinsicDesc>,
+    /// Name → id, for parsing and serde.
+    by_name: HashMap<&'static str, IntrinsicId>,
+    /// Ids grouped by recognition root, so the recognizer pass can fetch only
+    /// the relevant ones per instruction.
+    by_root: HashMap<RootOp, Vec<IntrinsicId>>,
+}
+
+fn registry() -> &'static Registry {
+    static REG: OnceLock<Registry> = OnceLock::new();
+    REG.get_or_init(|| {
+        // Sort by name so ids are deterministic within a build regardless of
+        // inventory iteration order.
+        let mut descs: Vec<&'static IntrinsicDesc> = inventory::iter::<IntrinsicRegistration>()
+            .map(|r| &r.0)
+            .collect();
+        descs.sort_by_key(|d| d.name);
+
+        let mut by_name = HashMap::new();
+        let mut by_root: HashMap<RootOp, Vec<IntrinsicId>> = HashMap::new();
+        for (idx, desc) in descs.iter().enumerate() {
+            let id = IntrinsicId(idx);
+            let prev = by_name.insert(desc.name, id);
+            assert!(prev.is_none(), "duplicate intrinsic registration: {}", desc.name);
+            if let Some(root) = desc.root_op {
+                by_root.entry(root).or_default().push(id);
+            }
+        }
+
+        Registry {
+            descs,
+            by_name,
+            by_root,
+        }
+    })
+}
+
+/// Every intrinsic whose recognition idiom roots at `root`. Empty if none.
+pub fn recognizers_for(root: RootOp) -> &'static [IntrinsicId] {
+    registry()
+        .by_root
+        .get(&root)
+        .map(Vec::as_slice)
+        .unwrap_or(&[])
+}
+
+/// A pure intrinsic instruction: an [`IntrinsicId`] applied to its operands.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+pub struct Intrinsic {
+    pub id: IntrinsicId,
+    pub args: Vec<ValueId>,
+}
+
+impl MnemonicKind for Intrinsic {
+    fn opcode(&self) -> &'static str {
+        self.id.name()
+    }
+
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>, ctx: &Context<'_>) -> std::fmt::Result {
+        let args = self
+            .args
+            .iter()
+            .map(|&arg| ValueRef::new(arg, ctx).to_string())
+            .collect::<Vec<_>>()
+            .join(", ");
+        write!(f, "${}({});", self.id.name(), args)
+    }
+
+    fn args(&self) -> Vec<ValueId> {
+        self.args.clone()
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Registration macro
+// ---------------------------------------------------------------------------
+
+/// Register a built-in intrinsic with the global registry.
+///
+/// ```ignore
+/// register_intrinsic! {
+///     name: "rol",
+///     arity: 2,
+///     result_size: |sz| sz[0],
+///     eval: eval_rol,
+///     root_op: Some(RootOp::IntBinop(IntBinop::Or)),
+///     recognize: Some(recognize_rol),
+///     simplify: Some(simplify_rotate),
+/// }
+/// ```
+#[macro_export]
+macro_rules! register_intrinsic {
+    (
+        name: $name:expr,
+        arity: $arity:expr,
+        result_size: $result_size:expr,
+        eval: $eval:expr,
+        root_op: $root_op:expr,
+        recognize: $recognize:expr,
+        simplify: $simplify:expr $(,)?
+    ) => {
+        inventory::submit! {
+            $crate::value::insn::IntrinsicRegistration($crate::value::insn::IntrinsicDesc {
+                name: $name,
+                arity: $arity,
+                result_size: $result_size,
+                eval: $eval,
+                root_op: $root_op,
+                recognize: $recognize,
+                simplify: $simplify,
+            })
+        }
+    };
+}
+
+// ---------------------------------------------------------------------------
+// Helpers shared by the built-in intrinsics
+// ---------------------------------------------------------------------------
+
+/// The unsigned mask for a `bytes`-wide value, saturating at 128 bits.
+fn mask_for(bytes: usize) -> u128 {
+    let bits = (bytes * 8).min(128);
+    if bits == 0 {
+        0
+    } else if bits == 128 {
+        u128::MAX
+    } else {
+        (1u128 << bits) - 1
+    }
+}
+
+/// The non-symbolic constant value of `v`, or `None`.
+fn const_u64(ctx: &Context, v: ValueId) -> Option<u64> {
+    match ValueRef::new(v, ctx) {
+        ValueRef::Literal(lit) => {
+            let ValueId::Literal(id) = v else {
+                return None;
+            };
+            if ctx.values.literals[id].symbolic.is_some() {
+                return None;
+            }
+            Some(lit.value())
+        }
+        _ => None,
+    }
+}
+
+/// If `v` is defined by an `IntBinop::want`, return its `(lhs, rhs)`.
+fn as_int_binop(ctx: &Context, v: ValueId, want: IntBinop) -> Option<(ValueId, ValueId)> {
+    use super::{Binary, Binop, Mnemonic};
+    let ValueId::Instruction(id) = v else {
+        return None;
+    };
+    match ctx.get_insn(id).mnemonic() {
+        Mnemonic::Binop(Binary {
+            lhs,
+            rhs,
+            op: Binop::Int(op),
+        }) if *op == want => Some((*lhs, *rhs)),
+        _ => None,
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Built-in intrinsics: rol, ror
+// ---------------------------------------------------------------------------
+
+fn eval_rotate(args: &[(u128, usize)], out_size: usize, left: bool) -> Option<u128> {
+    let (x, _) = *args.first()?;
+    let (k, _) = *args.get(1)?;
+    let bits = (out_size * 8) as u32;
+    if bits == 0 || bits > 128 {
+        return None;
+    }
+    let mask = mask_for(out_size);
+    let x = x & mask;
+    let k = (k % bits as u128) as u32;
+    let res = if k == 0 {
+        x
+    } else if left {
+        (x << k) | (x >> (bits - k))
+    } else {
+        (x >> k) | (x << (bits - k))
+    };
+    Some(res & mask)
+}
+
+fn eval_rol(args: &[(u128, usize)], out_size: usize) -> Option<u128> {
+    eval_rotate(args, out_size, true)
+}
+
+fn eval_ror(args: &[(u128, usize)], out_size: usize) -> Option<u128> {
+    eval_rotate(args, out_size, false)
+}
+
+/// Recognize `(x << c1) | (x >> c2)` with `c1 + c2 == bits` as `rol(x, c1)`.
+///
+/// Tries both operand orderings of the `or`. The constant ror idiom is
+/// captured here too: `ror(x, c2)` has the same shape and is represented as
+/// `rol(x, bits - c2)`.
+fn recognize_rol(ctx: &Context, root: InstructionId) -> Option<Vec<ValueId>> {
+    let root_size = ctx.get_insn(root).size();
+    let bits = (root_size * 8) as u64;
+    if bits == 0 {
+        return None;
+    }
+
+    let (lhs, rhs) = as_int_binop(ctx, ValueId::Instruction(root), IntBinop::Or)?;
+
+    // (shl_side, shr_side) — try both orderings of the commutative `or`.
+    for (shl_side, shr_side) in [(lhs, rhs), (rhs, lhs)] {
+        let Some((x1, c1)) = as_int_binop(ctx, shl_side, IntBinop::ShiftLeft) else {
+            continue;
+        };
+        let Some((x2, c2)) = as_int_binop(ctx, shr_side, IntBinop::ShiftRight) else {
+            continue;
+        };
+        if x1 != x2 {
+            continue;
+        }
+        let (Some(c1v), Some(c2v)) = (const_u64(ctx, c1), const_u64(ctx, c2)) else {
+            continue;
+        };
+        if c1v == 0 || c2v == 0 || c1v + c2v != bits {
+            continue;
+        }
+        // rol(x, c1): reuse the left-shift amount as the rotate amount.
+        return Some(vec![x1, c1]);
+    }
+    None
+}
+
+/// `rol(x, 0) → x`, `ror(x, 0) → x`.
+fn simplify_rotate(ctx: &mut Context, args: &[ValueId]) -> Option<ValueId> {
+    let &[x, k] = args else {
+        return None;
+    };
+    if const_u64(ctx, k) == Some(0) {
+        Some(x)
+    } else {
+        None
+    }
+}
+
+register_intrinsic! {
+    name: "rol",
+    arity: 2,
+    result_size: |sz| sz[0],
+    eval: eval_rol,
+    root_op: Some(RootOp::IntBinop(IntBinop::Or)),
+    recognize: Some(recognize_rol),
+    simplify: Some(simplify_rotate),
+}
+
+register_intrinsic! {
+    name: "ror",
+    arity: 2,
+    result_size: |sz| sz[0],
+    eval: eval_ror,
+    root_op: None,
+    recognize: None,
+    simplify: Some(simplify_rotate),
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn rol_ror_registered_and_resolve() {
+        let rol = IntrinsicId::from_name("rol").expect("rol registered");
+        let ror = IntrinsicId::from_name("ror").expect("ror registered");
+        assert_eq!(rol.name(), "rol");
+        assert_eq!(ror.name(), "ror");
+        assert_eq!(rol.desc().arity, 2);
+        assert!(IntrinsicId::from_name("nope").is_none());
+    }
+
+    #[test]
+    fn eval_rol_matches_native() {
+        let rol = IntrinsicId::from_name("rol").unwrap();
+        // rol(0x12345678, 8) over 4 bytes == u32 rotate_left
+        let got = (rol.desc().eval)(&[(0x1234_5678, 4), (8, 4)], 4).unwrap();
+        assert_eq!(got as u32, 0x1234_5678u32.rotate_left(8));
+    }
+
+    #[test]
+    fn eval_ror_matches_native() {
+        let ror = IntrinsicId::from_name("ror").unwrap();
+        let got = (ror.desc().eval)(&[(0x1234_5678, 4), (12, 4)], 4).unwrap();
+        assert_eq!(got as u32, 0x1234_5678u32.rotate_right(12));
+    }
+
+    #[test]
+    fn rol_zero_is_identity_eval() {
+        let rol = IntrinsicId::from_name("rol").unwrap();
+        let got = (rol.desc().eval)(&[(0xdead_beef, 4), (0, 4)], 4).unwrap();
+        assert_eq!(got as u32, 0xdead_beef);
+    }
+
+    #[test]
+    fn recognizers_indexed_by_root() {
+        let ids = recognizers_for(RootOp::IntBinop(IntBinop::Or));
+        assert!(ids.iter().any(|id| id.name() == "rol"));
+    }
+
+    #[test]
+    fn intrinsic_id_serializes_by_name() {
+        let config = bincode::config::standard();
+        let rol = IntrinsicId::from_name("rol").unwrap();
+
+        // Serialized form is the name string, so it round-trips by name.
+        let bytes = bincode::serde::encode_to_vec(rol, config).unwrap();
+        let name: String = bincode::serde::decode_from_slice(&bytes, config).unwrap().0;
+        assert_eq!(name, "rol");
+
+        let (back, _): (IntrinsicId, usize) =
+            bincode::serde::decode_from_slice(&bytes, config).unwrap();
+        assert_eq!(back, rol);
+
+        // An unknown name is a clean error, not a corrupt id.
+        let bad = bincode::serde::encode_to_vec("nope", config).unwrap();
+        assert!(bincode::serde::decode_from_slice::<IntrinsicId, _>(&bad, config).is_err());
+    }
+}

@@ -44,8 +44,8 @@ use crate::{
         insn::{
             Binary, Binop, BoolBinop, Branch, BranchInd, CBranch, Call, CallInd, Carry, FloatBinop,
             FloatToFloat, FloatToInt, InstructionId, InstructionRef, IntBinop, IntToFloat,
-            IsFloatNaN, Load, LzCount, Mnemonic, PCodeOp, PCodeOpId, PopCount, Range, Return,
-            SBorrow, SCarry, Sext, Store, Unary, Unop, Zext,
+            Intrinsic, IntrinsicId, IsFloatNaN, Load, LzCount, Mnemonic, PCodeOp, PCodeOpId,
+            PopCount, Range, Return, SBorrow, SCarry, Sext, Store, Unary, Unop, Zext,
         },
         util::base_ref::{WithCtx, WithCtxMut},
         varnode::{Varnode, VarnodeId},
@@ -942,6 +942,37 @@ impl<'str, 'ctx> Builder<'str, 'ctx> {
             .collect::<Vec<_>>();
 
         self.push_instruction(Mnemonic::PCodeOp(PCodeOp { id, args, dst }), size)
+    }
+
+    /// Creates a pure intrinsic instruction (e.g. `rol`, `ror`).
+    ///
+    /// Validates the operand count against the intrinsic's declared arity and
+    /// derives the result width from its `result_size` rule, so passes can
+    /// assume well-formed intrinsics. Panics on an arity mismatch.
+    #[track_caller]
+    pub fn intrinsic(&mut self, id: IntrinsicId, args: Vec<ValueId>) -> InstructionRef<'str, '_> {
+        let desc = id.desc();
+        assert_eq!(
+            args.len(),
+            desc.arity,
+            "intrinsic `{}` expects {} args, got {}",
+            desc.name,
+            desc.arity,
+            args.len()
+        );
+
+        let args = args
+            .into_iter()
+            .map(|arg| self.ensure_local(arg))
+            .collect::<Vec<_>>();
+
+        let arg_sizes = args
+            .iter()
+            .map(|&arg| ValueRef::new(arg, self.context()).size())
+            .collect::<Vec<_>>();
+        let size = (desc.result_size)(&arg_sizes);
+
+        self.push_instruction(Mnemonic::Intrinsic(Intrinsic { id, args }), size)
     }
 
     // --- Loads & Stores ---

@@ -450,6 +450,7 @@ fn parse_expr(pair: Pair<'_, Rule>) -> Result<ExprNode, ParseError> {
         Rule::unop => parse_unop(inner),
         Rule::func_unop => parse_func_unop(inner),
         Rule::func_call => parse_func_call(inner),
+        Rule::intrinsic_call => parse_intrinsic_call(inner),
         Rule::binary => parse_binary(inner),
         Rule::memory => parse_memory(inner),
         Rule::cast => parse_cast(inner),
@@ -503,6 +504,25 @@ fn parse_func_call(pair: Pair<'_, Rule>) -> Result<ExprNode, ParseError> {
 
     Ok(ExprNode::FuncCall {
         op: op.ok_or_else(|| ParseError::new("missing function name"))?,
+        args,
+    })
+}
+
+fn parse_intrinsic_call(pair: Pair<'_, Rule>) -> Result<ExprNode, ParseError> {
+    let mut name = None;
+    let mut args = Vec::new();
+
+    for part in pair.into_inner() {
+        match part.as_rule() {
+            // Strip the leading `$` sigil.
+            Rule::intrinsic_name => name = Some(part.as_str()[1..].to_owned()),
+            Rule::typed_atom => args.push(parse_typed_atom(part)?),
+            _ => {}
+        }
+    }
+
+    Ok(ExprNode::Intrinsic {
+        name: name.ok_or_else(|| ParseError::new("missing intrinsic name"))?,
         args,
     })
 }

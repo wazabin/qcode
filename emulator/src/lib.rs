@@ -85,6 +85,9 @@ pub enum EmulatorErrorKind {
     UnknownSpace(SpaceId),
     /// Encountered an architecture-specific p-code operation without an emulator implementation
     UnsupportedPCodeOp(Box<str>),
+    /// An intrinsic's evaluator could not produce a result (e.g. a trap or
+    /// unsupported operand width)
+    UnsupportedIntrinsic(Box<str>),
     /// A user-provided call interceptor failed while modeling a call
     InterceptError(Box<str>),
 }
@@ -104,6 +107,7 @@ impl std::fmt::Display for EmulatorErrorKind {
             Self::UnknownRegister(reg) => write!(f, "register {reg:?} not found in context"),
             Self::UnknownSpace(space) => write!(f, "memory space {space:?} not initialised"),
             Self::UnsupportedPCodeOp(op) => write!(f, "unsupported p-code operation `{op}`"),
+            Self::UnsupportedIntrinsic(op) => write!(f, "unsupported intrinsic `{op}`"),
             Self::InterceptError(message) => write!(f, "call interceptor failed: {message}"),
         }
     }
@@ -140,6 +144,14 @@ pub trait DomainValue: Clone + Copy {
     fn sext(&self, size: usize) -> std::result::Result<Self, EmulatorErrorKind>;
     fn range(&self, start: usize, size: usize) -> std::result::Result<Self, EmulatorErrorKind>;
     fn byte_swap(&self) -> std::result::Result<Self, EmulatorErrorKind>;
+
+    /// Evaluate a pure intrinsic on its concrete operands, producing an
+    /// `out_size`-byte result via the intrinsic's shared evaluator.
+    fn intrinsic(
+        id: qcode::value::insn::IntrinsicId,
+        args: &[Self],
+        out_size: usize,
+    ) -> std::result::Result<Self, EmulatorErrorKind>;
 
     fn pop_count(&self) -> std::result::Result<Self, EmulatorErrorKind>;
     fn lz_count(&self) -> std::result::Result<Self, EmulatorErrorKind>;
@@ -437,6 +449,15 @@ pub trait Interpreter {
                     ("swap_bytes", [src]) => Some(self.get_value(*src)?.byte_swap()?),
                     _ => return Err(EmulatorErrorKind::UnsupportedPCodeOp(name)),
                 }
+            }
+
+            Mnemonic::Intrinsic(intr) => {
+                let out_size = insn.size();
+                let mut args = Vec::with_capacity(intr.args.len());
+                for &arg in &intr.args {
+                    args.push(self.get_value(arg)?);
+                }
+                Some(Self::V::intrinsic(intr.id, &args, out_size)?)
             }
 
             _ => todo!("unimplemented mnemonic: {:?}", insn.mnemonic()),

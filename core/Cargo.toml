@@ -11,6 +11,7 @@ testing = []
 
 [dependencies]
 common.workspace = true
+inventory.workspace = true
 jstd.workspace = true
 pest.workspace = true
 qcode_macro.workspace = true

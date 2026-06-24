@@ -235,6 +235,18 @@ fn constant_folding_with_location(
             )
         }
 
+        // Pure intrinsics fold through their shared `eval` (the same evaluator
+        // the emulator uses), when every operand is a non-symbolic constant.
+        Mnemonic::Intrinsic(intr) => {
+            let mut operands = Vec::with_capacity(intr.args.len());
+            for &arg in &intr.args {
+                let c = get_numeric_const(ctx, arg)?;
+                operands.push((u128::from(c.value()), c.size()));
+            }
+            let value = (intr.id.desc().eval)(&operands, output_size)?;
+            Some(ctx.get_const(value as u64, output_size).id())
+        }
+
         _ => None,
     }
 }

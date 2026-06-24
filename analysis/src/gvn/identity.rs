@@ -41,6 +41,17 @@ impl SubPass for Identities {
         if ic.mnemonic.is_terminator() || ic.size == 0 {
             return Claim::Pass;
         }
+        // Pure intrinsics carry their own algebraic simplifier (e.g.
+        // `rol(x, 0) → x`), which forwards uses to an existing value.
+        if let Mnemonic::Intrinsic(intr) = ic.mnemonic
+            && let Some(simplify) = intr.id.desc().simplify
+        {
+            let args = intr.args.clone();
+            if let Some(repl) = simplify(ctx, &args) {
+                ed.replace(ctx, ic.insn_id, repl);
+                return Claim::Done;
+            }
+        }
         match simplify_identity(ctx, ic.mnemonic) {
             Some(new_mnemonic) => {
                 ed.replace_with_new_insn(ctx, ic.block_id, ic.insn_id, new_mnemonic, ic.size);

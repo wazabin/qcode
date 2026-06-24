@@ -1118,6 +1118,21 @@ fn lower_expr(
             };
             Ok(call)
         }
+
+        ExprNode::Intrinsic { name, args } => {
+            let name = name.as_str();
+            let arg_tokens = args
+                .iter()
+                .map(|arg| lower_atom(arg, None, locals, pcode_root))
+                .collect::<syn::Result<Vec<_>>>()?;
+
+            Ok(quote! {{
+                let __qcode_intr_id = #pcode_root::value::insn::IntrinsicId::from_name(#name)
+                    .unwrap_or_else(|| panic!("unknown intrinsic `{}`", #name));
+                let __qcode_intr_args = ::std::vec![#(#arg_tokens),*];
+                __qcode_builder.intrinsic(__qcode_intr_id, __qcode_intr_args).id
+            }})
+        }
     }
 }
 
