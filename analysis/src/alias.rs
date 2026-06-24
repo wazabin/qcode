@@ -1,15 +1,37 @@
-use rustc_hash::FxHashMap as HashMap;
+use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
 
 use qcode::{
     context::Context,
     space::SpaceId,
-    value::{ValueId, ValueRef},
+    value::{
+        BlockId, BlockParam, Function, FunctionId, Instruction, ValueId, ValueRef, VarnodeId,
+        insn::{Binop, IntBinop, Mnemonic},
+    },
 };
+
+use crate::gvn::affine::precompute_forms;
+use crate::stack::frame::{FrameClass, frame_class, incoming_sp_param};
 
 mod anderson;
 mod simple;
 
 pub use anderson::alias_analysis;
+
+/// Per-function frame-freshness context, precomputed when an [`AliasResult`] is
+/// built with [`AliasResult::with_frame_freshness`]. `None` leaves the rule inert
+/// (hand-built results and callers without a stack-pointer register).
+pub(crate) struct FrameInfo {
+    /// This function's root (entry) block — a pointer that peels to one of its
+    /// params is an *incoming* pointer from the caller.
+    root_block: Option<BlockId>,
+    /// The incoming stack-pointer param `@SP`. Excluded from "input-derived": a
+    /// pointer rooted at `@SP` is a frame pointer, not a caller-supplied data
+    /// pointer, so the rule must not treat `@SP ± k` as an incoming pointer.
+    sp_param: ValueId,
+    /// Every value classified as an own-frame local (`@SP`-rooted slot below the
+    /// entry stack pointer, or a realigned-frame slot) for this function.
+    own_frame_locals: HashSet<ValueId>,
+}
 
 /// Abstract node in the alias graph.
 ///
@@ -27,6 +49,8 @@ pub struct AliasResult {
     /// statically resolved: `(space_id, byte_start, byte_end)`.
     /// Populated by location-aware analyses (e.g. `simple`); empty otherwise.
     pub(crate) value_to_interval: HashMap<ValueId, (SpaceId, u64, u64)>,
+    /// Frame-freshness context, when populated (see [`AliasResult::provably_disjoint`]).
+    pub(crate) frame: Option<FrameInfo>,
 }
 
 impl AliasResult {
@@ -113,11 +137,132 @@ impl AliasResult {
             return false;
         }
 
+        // Frame freshness (sound): a function's own stack locals can never alias a
+        // pointer that entered from its caller, so answer "no" before the alias
+        // graph collapses both partitions to `Unknown` (and thus "may alias").
+        if self.provably_disjoint(ctx, a, b) {
+            return false;
+        }
+
         match (self.alias_class(a), self.alias_class(b)) {
             (None, _) | (_, None) => false,
             (Some(NodeId::Unknown), _) | (_, Some(NodeId::Unknown)) => true,
             (Some(ra), Some(rb)) => ra == rb,
         }
+    }
+
+    /// Frame-freshness disjointness: a function's own stack locals never alias a
+    /// pointer that entered from its caller.
+    ///
+    /// Returns `true` only when one value is an own-frame local (an `@SP`-rooted
+    /// slot below the entry stack pointer, classified [`FrameClass::Local`]) and
+    /// the other is *input-derived* (peels to one of this function's entry-block
+    /// params). This is **sound**, not heuristic: the callee's frame is younger
+    /// than anything the caller could already name, so no incoming pointer (nor
+    /// anything offset from one) can reach the callee's locals. The alias graph
+    /// cannot express this — both partitions escape to calls/stores and collapse
+    /// to [`NodeId::Unknown`], which would otherwise force a "may alias" answer.
+    ///
+    /// Inert (`false`) unless the result was built with
+    /// [`AliasResult::with_frame_freshness`].
+    pub fn provably_disjoint(&self, ctx: &Context, a: ValueId, b: ValueId) -> bool {
+        let Some(frame) = &self.frame else {
+            return false;
+        };
+        (frame.own_frame_locals.contains(&a) && self.is_input_derived(ctx, b))
+            || (frame.own_frame_locals.contains(&b) && self.is_input_derived(ctx, a))
+    }
+
+    /// Whether `v` is an own-frame local under the populated frame-freshness
+    /// context (see [`AliasResult::provably_disjoint`]).
+    pub fn is_own_frame_local(&self, v: ValueId) -> bool {
+        self.frame
+            .as_ref()
+            .is_some_and(|f| f.own_frame_locals.contains(&v))
+    }
+
+    /// Whether `v` is *input-derived*: it peels — through address arithmetic
+    /// (`add`/`sub` of an offset) and width casts (`zext`/`sext`/`range`) — to a
+    /// parameter of this function's root block, i.e. a value that entered from the
+    /// caller. The `add`/`sub` peel bails if either operand is itself an own-frame
+    /// local, so a nonsensical `local + arg` mix is never read as input.
+    fn is_input_derived(&self, ctx: &Context, v: ValueId) -> bool {
+        let Some(frame) = &self.frame else {
+            return false;
+        };
+        self.is_input_derived_rec(ctx, frame, v, &mut HashSet::default())
+    }
+
+    fn is_input_derived_rec(
+        &self,
+        ctx: &Context,
+        frame: &FrameInfo,
+        v: ValueId,
+        seen: &mut HashSet<ValueId>,
+    ) -> bool {
+        if !seen.insert(v) {
+            return false;
+        }
+        match v {
+            // A root-block param other than `@SP` is a caller-supplied pointer.
+            ValueId::BlockParam(id) => {
+                v != frame.sp_param
+                    && BlockParam::from_id(ctx, id)
+                        .parent()
+                        .is_some_and(|b| frame.root_block == Some(b.id))
+            }
+            ValueId::Instruction(id) => match Instruction::from_id(ctx, id).mnemonic() {
+                Mnemonic::Binop(b) if matches!(b.op, Binop::Int(IntBinop::Add | IntBinop::Sub)) => {
+                    if frame.own_frame_locals.contains(&b.lhs)
+                        || frame.own_frame_locals.contains(&b.rhs)
+                    {
+                        return false;
+                    }
+                    self.is_input_derived_rec(ctx, frame, b.lhs, seen)
+                        || self.is_input_derived_rec(ctx, frame, b.rhs, seen)
+                }
+                Mnemonic::Zext(z) => self.is_input_derived_rec(ctx, frame, z.src, seen),
+                Mnemonic::Sext(s) => self.is_input_derived_rec(ctx, frame, s.src, seen),
+                Mnemonic::Range(r) => self.is_input_derived_rec(ctx, frame, r.src, seen),
+                _ => false,
+            },
+            _ => false,
+        }
+    }
+
+    /// Populate the frame-freshness oracle for function `fid`, given the
+    /// stack-pointer register varnode `sp_reg` (resolved from the arch config). A
+    /// no-op when `sp_reg` is `None` or the function has no incoming `@SP` param,
+    /// leaving [`AliasResult::provably_disjoint`] inert.
+    pub fn with_frame_freshness(
+        mut self,
+        ctx: &Context,
+        fid: FunctionId,
+        sp_reg: Option<VarnodeId>,
+    ) -> Self {
+        let Some(sp_reg) = sp_reg else {
+            return self;
+        };
+        let Some(sp) = incoming_sp_param(ctx, fid, sp_reg) else {
+            return self;
+        };
+        let numbering = precompute_forms(ctx, fid);
+        let mut own_frame_locals = HashSet::default();
+        for block in Function::from_id(ctx, fid).blocks() {
+            for insn in block.iter() {
+                let v = ValueId::Instruction(insn.id);
+                if frame_class(ctx, &numbering, sp, v) == Some(FrameClass::Local) {
+                    own_frame_locals.insert(v);
+                }
+            }
+        }
+        let root_block = Function::from_id(ctx, fid).root().map(|r| r.id);
+        self.frame = Some(FrameInfo {
+            root_block,
+            sp_param: sp,
+            own_frame_locals,
+        });
+        self
     }
 }
 
@@ -157,6 +302,7 @@ mod tests {
         AliasResult {
             value_to_root: HashMap::default(),
             value_to_interval,
+            frame: None,
         }
     }
 
@@ -192,5 +338,68 @@ mod tests {
              other-space value(4) and value(0) itself excluded"
         );
         assert!(r.sub_intervals_of(value(9)).is_empty(), "untracked value");
+    }
+
+    /// Frame freshness: a function's own stack local (`@SP - 8`) is provably
+    /// disjoint from an incoming data pointer param and anything offset from it,
+    /// but not from `@SP` itself, a caller-frame stack arg (`@SP + 8`), or itself.
+    #[test]
+    fn frame_freshness_local_disjoint_from_incoming_pointer() {
+        use qcode::{
+            builder::Builder,
+            testing::TestContext,
+            value::{BasicBlock, Function},
+        };
+
+        let mut tc = TestContext::new();
+        let sp_reg = tc.r0;
+        let fid = Function::make(&mut tc.ctx, "f".into()).unwrap().id;
+        let root = tc.ctx.get_or_make_block(0x1000);
+        {
+            let mut f = Function::from_id_mut(&mut tc.ctx, fid);
+            f.set_root(root).unwrap();
+            f.add_block(root);
+        }
+        // `@SP` param (origin = the stack-pointer reg) and a caller data-pointer param.
+        let sp_pid = BasicBlock::from_id_mut(&mut tc.ctx, root).push_param(8).id;
+        tc.ctx.values.block_params[sp_pid].origin = Some(ValueId::Varnode(sp_reg));
+        let sp = ValueId::BlockParam(sp_pid);
+        let arg_pid = BasicBlock::from_id_mut(&mut tc.ctx, root).push_param(8).id;
+        let arg = ValueId::BlockParam(arg_pid);
+
+        let (local, caller_arg, arg_plus) = {
+            let mut b = Builder::from_block(BasicBlock::from_id_mut(&mut tc.ctx, root));
+            let c8 = b.context_mut().get_const(8, 8).id();
+            let local = b.push_sub(sp, c8).id(); // @SP - 8  (own-frame local)
+            let caller_arg = b.push_add(sp, c8).id(); // @SP + 8  (caller frame)
+            let arg_plus = b.push_add(arg, c8).id(); // arg + 8  (input-derived)
+            unsafe { b.dont_finalize() };
+            (local, caller_arg, arg_plus)
+        };
+
+        let r = AliasResult::simple(&tc.ctx).with_frame_freshness(&tc.ctx, fid, Some(sp_reg));
+
+        assert!(r.provably_disjoint(&tc.ctx, local, arg), "local ⊥ incoming arg");
+        assert!(r.provably_disjoint(&tc.ctx, arg, local), "rule is symmetric");
+        assert!(
+            r.provably_disjoint(&tc.ctx, local, arg_plus),
+            "local ⊥ a pointer offset from the incoming arg"
+        );
+        assert!(
+            !r.provably_disjoint(&tc.ctx, local, local),
+            "a local is not disjoint from itself"
+        );
+        assert!(
+            !r.provably_disjoint(&tc.ctx, local, sp),
+            "@SP is a frame pointer, not an incoming data pointer"
+        );
+        assert!(
+            !r.provably_disjoint(&tc.ctx, local, caller_arg),
+            "a caller-frame stack arg shares the @SP base (handled by offset disjointness)"
+        );
+
+        // Inert without the frame-freshness context.
+        let plain = AliasResult::simple(&tc.ctx);
+        assert!(!plain.provably_disjoint(&tc.ctx, local, arg));
     }
 }

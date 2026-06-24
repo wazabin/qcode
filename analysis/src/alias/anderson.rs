@@ -140,6 +140,7 @@ impl SteensgaardState {
         AliasResult {
             value_to_root,
             value_to_interval: HashMap::default(),
+            frame: None,
         }
     }
 }

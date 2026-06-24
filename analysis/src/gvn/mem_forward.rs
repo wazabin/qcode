@@ -111,8 +111,17 @@ fn locate(
 /// info (isolated values) or an `Unknown` class is **not** proof: such pairs
 /// are treated as possibly-aliasing, so a forwarded cell is dropped on any
 /// doubt.
-fn proven_disjoint(aliases: Option<&AliasResult>, a: ValueId, b: ValueId) -> bool {
+fn proven_disjoint(
+    ctx: &Context,
+    aliases: Option<&AliasResult>,
+    a: ValueId,
+    b: ValueId,
+) -> bool {
     let Some(aliases) = aliases else { return false };
+    // Frame freshness: an own-frame local and an incoming pointer never alias.
+    if aliases.provably_disjoint(ctx, a, b) {
+        return true;
+    }
     matches!(
         (aliases.alias_class(a), aliases.alias_class(b)),
         (Some(crate::alias::NodeId::Id(x)), Some(crate::alias::NodeId::Id(y))) if x != y
@@ -123,7 +132,13 @@ fn proven_disjoint(aliases: Option<&AliasResult>, a: ValueId, b: ValueId) -> boo
 /// (whose pointer value is `ptr`), i.e. the cell can be kept across the access.
 /// Only meaningful when `cb != base`. Conservative: returns `false` (not
 /// disjoint) whenever disjointness cannot be proven.
-fn cross_base_disjoint(aliases: Option<&AliasResult>, ptr: ValueId, base: Base, cb: Base) -> bool {
+fn cross_base_disjoint(
+    ctx: &Context,
+    aliases: Option<&AliasResult>,
+    ptr: ValueId,
+    base: Base,
+    cb: Base,
+) -> bool {
     // Different address spaces never overlap.
     if base.space() != cb.space() {
         return true;
@@ -131,10 +146,10 @@ fn cross_base_disjoint(aliases: Option<&AliasResult>, ptr: ValueId, base: Base, 
     match (base, cb) {
         // Symbolic vs symbolic: disjoint only if the oracle proves the base
         // values occupy different locations.
-        (Base::Symbolic(_, sv), Base::Symbolic(_, ov)) => proven_disjoint(aliases, sv, ov),
+        (Base::Symbolic(_, sv), Base::Symbolic(_, ov)) => proven_disjoint(ctx, aliases, sv, ov),
         // Pinned access vs a symbolic cell: compare the access pointer against
         // the cell's base value.
-        (Base::Pinned(_), Base::Symbolic(_, ov)) => proven_disjoint(aliases, ptr, ov),
+        (Base::Pinned(_), Base::Symbolic(_, ov)) => proven_disjoint(ctx, aliases, ptr, ov),
         // Symbolic access vs a pinned cell: the cell's absolute address has no
         // value to query, so we cannot prove disjointness.
         (Base::Symbolic(_, _), Base::Pinned(_)) => false,
@@ -165,7 +180,7 @@ impl MemForward {
         // Drop cells at *other* bases this store may overwrite (cross-base
         // aliasing); same-base cells are handled by the explicit clear below.
         self.byte_map.retain(|&(cb, _), _| {
-            cb == base || cross_base_disjoint(aliases, store.ptr, base, cb)
+            cb == base || cross_base_disjoint(ctx, aliases, store.ptr, base, cb)
         });
 
         // The store always overwrites the bytes at its own base, so clear them.
@@ -498,7 +513,7 @@ impl MemForward {
                     s <= off && off < s + store.size as i64
                 } else {
                     // Other base: may overwrite unless provably disjoint.
-                    !cross_base_disjoint(aliases, store.ptr, sb, base)
+                    !cross_base_disjoint(ctx, aliases, store.ptr, sb, base)
                 }
             })
         });
@@ -559,6 +574,7 @@ mod tests {
         AliasResult {
             value_to_root,
             value_to_interval,
+            frame: None,
         }
     }
 

@@ -399,6 +399,7 @@ impl AliasResult {
         AliasResult {
             value_to_root,
             value_to_interval: a.value_to_interval,
+            frame: None,
         }
     }
 }

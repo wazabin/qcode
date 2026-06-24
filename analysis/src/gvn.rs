@@ -137,17 +137,20 @@ impl FunctionPass for Gvn {
         &self,
         ctx: &mut Context,
         fun_id: FunctionId,
-        _env: &PipelineEnv,
+        env: &PipelineEnv,
     ) -> Result<bool, String> {
-        // Canonicalize pointer arithmetic into literals *before* building the alias
-        // oracle, so it sees per-slot stack locations rather than collapsing them
-        // onto `stack_base`.
+        // Canonicalize pointer arithmetic *before* building the alias oracle, so it
+        // sees per-slot `@SP`-rooted stack locations.
         let mut changed = constant_fold_function(ctx, fun_id);
         // Per-function pass: build the alias oracle from this function's own
         // instructions, not the whole program, so cost stays O(function) per
         // call instead of O(program) once per function (O(functions × program)
-        // across the stage, which dominated on large binaries).
-        let aliases = AliasResult::simple_for_function(ctx, fun_id);
+        // across the stage, which dominated on large binaries). Supply the stack
+        // pointer so the oracle can also apply frame freshness (a function's own
+        // locals never alias an incoming pointer).
+        let sp_reg = ctx.registers.get(&env.cfg.stack_pointer).copied();
+        let aliases =
+            AliasResult::simple_for_function(ctx, fun_id).with_frame_freshness(ctx, fun_id, sp_reg);
         changed |= gvn_function(ctx, fun_id, Some(&aliases));
         Ok(changed)
     }

@@ -64,11 +64,49 @@ use qcode::{
     },
 };
 
+use crate::gvn::affine::{Numbering, precompute_forms};
+use crate::stack::frame::{FrameClass, frame_class, incoming_sp_param};
 use crate::{Pass, PipelineEnv, value_range};
+
+/// Recognises this function's own stack-frame locals (`@SP`-rooted slots below the
+/// entry stack pointer). Inert when there is no stack-pointer register or no
+/// incoming `@SP` param, in which case [`OwnFrame::is_local`] is always `false`.
+struct OwnFrame {
+    sp_param: Option<ValueId>,
+    numbering: Numbering,
+}
+
+impl OwnFrame {
+    fn new(ctx: &Context, fid: FunctionId, sp_reg: Option<VarnodeId>) -> Self {
+        let sp_param = sp_reg.and_then(|r| incoming_sp_param(ctx, fid, r));
+        Self {
+            sp_param,
+            numbering: precompute_forms(ctx, fid),
+        }
+    }
+
+    /// Whether `addr` points into this function's own frame (classified
+    /// [`FrameClass::Local`]).
+    fn is_local(&self, ctx: &Context, addr: ValueId) -> bool {
+        self.sp_param
+            .is_some_and(|sp| frame_class(ctx, &self.numbering, sp, addr) == Some(FrameClass::Local))
+    }
+}
 
 /// Promotes every eligible by-reference in/out parameter in the module. Returns
 /// `true` if anything changed.
+///
+/// Without a stack-pointer register the frame-deadness rule is inert; production
+/// callers use [`argpromote_with_sp`].
 pub fn argpromote(ctx: &mut Context) -> bool {
+    argpromote_with_sp(ctx, None)
+}
+
+/// [`argpromote`] with the stack-pointer register `sp_reg`, so a function's own
+/// stack frame is recognised and **excluded** from the returned write-set: own-
+/// frame locals are destroyed at return, so the caller can never observe writes to
+/// them (they are dead on exit). The redirected shadow store is left to DCE.
+pub fn argpromote_with_sp(ctx: &mut Context, sp_reg: Option<VarnodeId>) -> bool {
     // One shadow space shared by *every* promoted function and every promoted
     // pointer within it. The shadow is only a tag for alias analysis and a key for
     // store-to-load forwarding; functions execute independently, so sharing one
@@ -82,7 +120,7 @@ pub fn argpromote(ctx: &mut Context) -> bool {
     // be promoted — its own loads gone — for the caller to qualify. One visit per
     // function (no fixpoint), so an already-promoted body is never re-promoted.
     for fid in callee_first_order(ctx) {
-        if try_promote(ctx, fid, shadow) {
+        if try_promote(ctx, fid, shadow, sp_reg) {
             changed = true;
         }
     }
@@ -253,7 +291,12 @@ enum ParamUse {
     Escape,
 }
 
-fn try_promote(ctx: &mut Context, fid: FunctionId, shadow: SpaceId) -> bool {
+fn try_promote(
+    ctx: &mut Context,
+    fid: FunctionId,
+    shadow: SpaceId,
+    sp_reg: Option<VarnodeId>,
+) -> bool {
     let f = Function::from_id(ctx, fid);
     if f.is_external() {
         return false;
@@ -362,7 +405,7 @@ fn try_promote(ctx: &mut Context, fid: FunctionId, shadow: SpaceId) -> bool {
         return false;
     }
 
-    apply(ctx, fid, promoted, returns, shadow)
+    apply(ctx, fid, promoted, returns, shadow, sp_reg)
 }
 
 /// Whether every real-memory (default-space) load/store in `fid` is captured by
@@ -632,6 +675,7 @@ fn apply(
     mut promoted: Vec<Promoted>,
     returns: Vec<InstructionId>,
     shadow: SpaceId,
+    sp_reg: Option<VarnodeId>,
 ) -> bool {
     let call_sites: Vec<InstructionId> = ctx
         .instructions()
@@ -705,9 +749,19 @@ fn apply(
     }
 
     // The distinct write targets across all promoted params, in a stable order.
+    // A write to this function's *own* stack frame (an `@SP`-rooted local below the
+    // entry stack pointer) is dead on exit — the frame is destroyed at return, so
+    // the caller can never observe it. Such writes are still redirected into the
+    // shadow above (keeping `all_accesses_modelled` satisfied), but they are
+    // excluded from the returned write-set; the now-readerless shadow store is left
+    // for DCE.
+    let own_frame = OwnFrame::new(ctx, fid, sp_reg);
     let mut write_targets: Vec<(ValueId, usize)> = Vec::new();
     for p in &promoted {
         for wt in &p.write_targets {
+            if own_frame.is_local(ctx, wt.0) {
+                continue;
+            }
             if !write_targets.iter().any(|(a, _)| *a == wt.0) {
                 write_targets.push(*wt);
             }
@@ -1320,8 +1374,9 @@ impl Pass for ArgPromote {
     fn description(&self) -> &'static str {
         "Promote by-reference in/out pointer parameters to by-value"
     }
-    fn run(&self, ctx: &mut Context, _env: &PipelineEnv) -> Result<bool, String> {
-        Ok(argpromote(ctx))
+    fn run(&self, ctx: &mut Context, env: &PipelineEnv) -> Result<bool, String> {
+        let sp_reg = ctx.registers.get(&env.cfg.stack_pointer).copied();
+        Ok(argpromote_with_sp(ctx, sp_reg))
     }
 }
 
@@ -2179,6 +2234,80 @@ mod tests {
             replayed_stores(&tc, call_id),
             1,
             "the caller replays the one appended write"
+        );
+    }
+
+    /// Build a callee `f(@RSP, @p)` that writes to its own stack frame (`@RSP - 8`)
+    /// *and* through the caller-supplied pointer `@p`, plus a caller `g`. `@RSP` is
+    /// marked as the incoming stack pointer (origin = `sp_vn`). Returns `(f, sp_vn)`.
+    fn build_own_frame_writer(tc: &mut qcode::testing::TestContext) -> (FunctionId, VarnodeId) {
+        let sp_vn = tc.r3; // stand-in stack-pointer register varnode
+        qcode!(
+            tc.ctx,
+            "
+            fn f:
+                <f_entry @RSP:i64 @p:i64>
+                    %loc = @RSP - i64 0x8;
+                    store(%loc, i32 5);
+                    store(@p, i32 9);
+                    return [i64 0];
+
+            fn g:
+                <g_entry>
+                    goto <g_call>;
+                <g_call>
+                    call <f>;
+                <g_cont>
+                    return [i64 0];
+            "
+        );
+        let _ = g;
+        // Mark `@RSP` as the incoming stack pointer (origin = the SP register).
+        let pid = {
+            let f_ref = Function::from_id(&tc.ctx, f);
+            let p = f_ref
+                .root()
+                .unwrap()
+                .params()
+                .find(|p| p.name() == Some("RSP"))
+                .unwrap();
+            match p.id() {
+                ValueId::BlockParam(pid) => pid,
+                _ => unreachable!(),
+            }
+        };
+        tc.ctx.values.block_params[pid].origin = Some(ValueId::Varnode(sp_vn));
+
+        let sp_arg = tc.ctx.get_const(0x7000, 8).id();
+        let p_arg = tc.ctx.get_const(0x4000, 8).id();
+        set_call(tc, g_call, f, vec![sp_arg, p_arg]);
+        tc.ctx.add_cfg_edge(g_call, g_cont);
+        (f, sp_vn)
+    }
+
+    /// With the stack pointer supplied, the own-frame write (`@RSP - 8`) is dead on
+    /// exit and excluded from the returned write-set — only the caller-pointer write
+    /// survives (one flat `(addr, value)` pair → 2 fields). Without it, both writes
+    /// are captured (4 fields).
+    #[test]
+    fn own_frame_write_excluded_from_returned_writeset() {
+        let mut tc = qcode::testing::TestContext::new();
+        let (f, sp_vn) = build_own_frame_writer(&mut tc);
+        assert!(argpromote_with_sp(&mut tc.ctx, Some(sp_vn)));
+        assert_eq!(
+            register_writeset_len(&tc, f),
+            Some(2),
+            "only the caller-pointer write is returned; the own-frame write is dead on exit"
+        );
+
+        // Control: without the stack pointer, the own-frame write is also captured.
+        let mut tc2 = qcode::testing::TestContext::new();
+        let (f2, _) = build_own_frame_writer(&mut tc2);
+        assert!(argpromote_with_sp(&mut tc2.ctx, None));
+        assert_eq!(
+            register_writeset_len(&tc2, f2),
+            Some(4),
+            "without frame awareness, both the caller write and the own-frame write are captured"
         );
     }
 
