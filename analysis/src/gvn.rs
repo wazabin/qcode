@@ -142,15 +142,16 @@ impl FunctionPass for Gvn {
         // Canonicalize pointer arithmetic *before* building the alias oracle, so it
         // sees per-slot `@SP`-rooted stack locations.
         let mut changed = constant_fold_function(ctx, fun_id);
-        // Per-function pass: build the alias oracle from this function's own
-        // instructions, not the whole program, so cost stays O(function) per
-        // call instead of O(program) once per function (O(functions × program)
-        // across the stage, which dominated on large binaries). Supply the stack
-        // pointer so the oracle can also apply frame freshness (a function's own
-        // locals never alias an incoming pointer).
+        // Reuse the shared, function-independent register/varnode alias base (built
+        // once per varnode set) and finish it for just this function's pointers,
+        // instead of rebuilding the whole-module oracle on every function. Then
+        // supply the stack pointer so the oracle can apply frame freshness (a
+        // function's own locals never alias an incoming pointer).
         let sp_reg = ctx.registers.get(&env.cfg.stack_pointer).copied();
-        let aliases =
-            AliasResult::simple_for_function(ctx, fun_id).with_frame_freshness(ctx, fun_id, sp_reg);
+        let aliases = env
+            .alias_base(ctx)
+            .for_function(ctx, fun_id)
+            .with_frame_freshness(ctx, fun_id, sp_reg);
         changed |= gvn_function(ctx, fun_id, Some(&aliases));
         Ok(changed)
     }

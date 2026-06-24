@@ -217,16 +217,16 @@ mod tests {
     fn env_for(os: TargetOs, bitness: u8) -> PipelineEnv {
         use crate::{ArchConfig, CallingConvention};
         use qcode::value::{RegisterId, VarnodeId};
-        PipelineEnv {
-            cfg: ArchConfig {
+        PipelineEnv::from_parts(
+            ArchConfig {
                 stack_pointer: RegisterId::from(0usize),
                 dead_flag_regs: Vec::new(),
                 abi: CallingConvention::default(),
                 os,
                 bitness,
             },
-            sp_varnode: VarnodeId::from(0usize),
-        }
+            VarnodeId::from(0usize),
+        )
     }
 
     /// The registered pass types `FS_OFFSET` only on a Windows-x86 env.

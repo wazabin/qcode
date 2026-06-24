@@ -4,7 +4,7 @@ use qcode::{
     context::Context,
     space::{SpaceId, SpaceType},
     value::{
-        Function, FunctionId, ValueId, ValueRef, Varnode,
+        FunctionId, FunctionRef, ValueId, ValueRef, Varnode,
         insn::{Binop, IntBinop, Mnemonic},
     },
 };
@@ -20,6 +20,7 @@ struct SizedNode {
 
 /// Union-find with union-by-rank and half-path-compression (path splitting).
 /// https://en.wikipedia.org/wiki/Disjoint-set_data_structure
+#[derive(Clone)]
 struct UnionFind {
     parent: Vec<usize>,
     rank: Vec<u8>,
@@ -90,11 +91,15 @@ impl UnionFind {
 struct Analysis<'a> {
     ctx: &'a Context<'a>,
 
-    /// Maps each tracked value to its equivalence-class root.
+    /// Maps each tracked value to its equivalence-class root. Seeded from the
+    /// shared [`RegisterBase`] (varnode entries), then grown with this function's
+    /// pointer values.
     value_to_root: HashMap<ValueId, NodeId>,
 
-    /// All varnodes in each address space, sorted by address (populated once, then read-only).
-    by_space: HashMap<SpaceId, Vec<SizedNode>>,
+    /// All varnodes in each address space, sorted by address. Borrowed read-only
+    /// from the shared [`RegisterBase`]; it is function-independent so it is built
+    /// once and never rebuilt per function.
+    by_space: &'a HashMap<SpaceId, Vec<SizedNode>>,
 
     /// Literal-pointer ranges encountered during pointer resolution; grows as loads/stores are processed.
     literal_ranges: HashMap<SpaceId, Vec<SizedNode>>,
@@ -263,61 +268,40 @@ fn literal_interval(ctx: &Context, literal: ValueId, size: usize) -> Option<(u64
     Some((start, end))
 }
 
-impl AliasResult {
-    /// A location-based aliasing result that only reasons about known varnode
-    /// ranges. Overlapping varnodes in the same space are joined; only pointer
-    /// values that actually participate in loads/stores are added.
-    pub fn simple(ctx: &Context) -> Self {
-        let mut pointer_uses: Vec<(ValueId, SpaceId, usize)> = Vec::new();
-        for insn in ctx.instructions() {
-            match insn.mnemonic() {
-                Mnemonic::Load(load) => pointer_uses.push((load.ptr, load.space, load.size)),
-                Mnemonic::Store(store) => pointer_uses.push((store.ptr, store.space, store.size)),
-                _ => {}
-            }
-        }
-        Self::from_pointer_uses(ctx, pointer_uses)
-    }
+/// Function-independent register/varnode aliasing — "Part A" of the simple alias
+/// analysis. Seeding one union-find node per varnode and merging overlapping
+/// (sub-)registers within each address space depends only on the varnode/register
+/// layout, not on any function body, and is invariant under the constant-folding
+/// GVN does before consulting the oracle. So it is built once per varnode set and
+/// shared (via `PipelineEnv`) across the per-function GVN runs, instead of being
+/// rebuilt — including its O(varnodes·log) sort — on every one of them.
+pub struct RegisterBase {
+    /// Varnodes per space, sorted by address and sub-register-merged. Read-only
+    /// after construction; lent to each per-function [`Analysis`].
+    by_space: HashMap<SpaceId, Vec<SizedNode>>,
+    /// Union-find seeded with every varnode node and its sub-register merges.
+    /// Cloned per function (Part B mutates it: literal nodes, joins, path
+    /// compression).
+    uf: UnionFind,
+    /// Varnode value -> root. Cloned per function, then grown with pointer values.
+    value_to_root: HashMap<ValueId, NodeId>,
+    /// The varnode count this base was built from. The varnode registry is
+    /// append-only, so an equal count means an unchanged varnode set — the cache
+    /// validity key used by `PipelineEnv`.
+    varnode_count: usize,
+}
 
-    /// Like [`simple`](Self::simple), but only scans `function_id`'s own
-    /// instructions for pointer uses. This avoids the O(functions × program) cost
-    /// callers like `bind_args`/`resolve_arg_loads` paid by rebuilding `simple`
-    /// per function.
-    ///
-    /// The answers match the whole-program build only for pointers this function
-    /// actually uses: a pointer that also appears in another function is put in
-    /// its own class here, so `may_alias` between this function's pointer and a
-    /// pointer it never touches can differ. Callers must therefore only ask about
-    /// pointers within `function_id` — e.g. GVN confines its dominator walk to
-    /// this function's own blocks ([`run_dominator_walk`](crate::gvn)).
-    pub fn simple_for_function(ctx: &Context, function_id: FunctionId) -> Self {
-        let mut pointer_uses: Vec<(ValueId, SpaceId, usize)> = Vec::new();
-        for block in Function::from_id(ctx, function_id).blocks() {
-            for insn in block.iter() {
-                match insn.mnemonic() {
-                    Mnemonic::Load(load) => pointer_uses.push((load.ptr, load.space, load.size)),
-                    Mnemonic::Store(store) => {
-                        pointer_uses.push((store.ptr, store.space, store.size))
-                    }
-                    _ => {}
-                }
-            }
-        }
-        Self::from_pointer_uses(ctx, pointer_uses)
-    }
-
-    fn from_pointer_uses(ctx: &Context, pointer_uses: Vec<(ValueId, SpaceId, usize)>) -> Self {
-        let mut a = Analysis {
-            ctx,
-            value_to_root: HashMap::default(),
-            by_space: HashMap::default(),
-            literal_ranges: HashMap::default(),
-            value_to_interval: HashMap::default(),
-            uf: UnionFind::new(),
-        };
+impl RegisterBase {
+    /// Build Part A from the whole context's varnode set.
+    pub fn build(ctx: &Context) -> Self {
+        let mut uf = UnionFind::new();
+        let mut value_to_root: HashMap<ValueId, NodeId> = HashMap::default();
+        let mut by_space: HashMap<SpaceId, Vec<SizedNode>> = HashMap::default();
+        let mut varnode_count = 0usize;
 
         // Seed one union-find node per varnode and group by address space.
         for varnode in ctx.varnodes() {
+            varnode_count += 1;
             let address = varnode.address();
             debug_assert!(
                 address >= 0,
@@ -328,9 +312,9 @@ impl AliasResult {
             let end = start
                 .checked_add(varnode.size() as u64)
                 .expect("varnode range must fit in u64");
-            let root = a.uf.alloc_node();
+            let root = uf.alloc_node();
 
-            a.value_to_root.insert(varnode.id.into(), root);
+            value_to_root.insert(varnode.id.into(), root);
 
             // Each temporary lives alone in its own freshly-minted space (see
             // `Context::make_temp_space`), so it can never overlap another varnode
@@ -341,7 +325,7 @@ impl AliasResult {
             // still carries it, so its equivalence class is unchanged.
             let space = varnode.space();
             if !matches!(space.ty, SpaceType::Temporary) {
-                a.by_space
+                by_space
                     .entry(space.id)
                     .or_default()
                     .push(SizedNode { root, start, end });
@@ -350,7 +334,7 @@ impl AliasResult {
 
         // Within each space, sort by address and sweep to merge overlapping varnodes
         // (e.g. al/ax/eax/rax all fall into one equivalence class).
-        for sized_nodes in a.by_space.values_mut() {
+        for sized_nodes in by_space.values_mut() {
             sized_nodes.sort_by_key(|node| (node.start, node.end));
 
             let Some(first) = sized_nodes.first().copied() else {
@@ -362,7 +346,7 @@ impl AliasResult {
 
             for node in sized_nodes.iter().skip(1).copied() {
                 if node.start < component_end {
-                    component_root = a.uf.join(component_root, node.root);
+                    component_root = uf.join(component_root, node.root);
                     component_end = component_end.max(node.end);
                 } else {
                     component_root = node.root;
@@ -371,8 +355,31 @@ impl AliasResult {
             }
         }
 
-        // Resolve each pointer use collected by the caller (whole-program or a
-        // single function) against the varnode equivalence classes above.
+        Self {
+            by_space,
+            uf,
+            value_to_root,
+            varnode_count,
+        }
+    }
+
+    /// Number of varnodes this base was built from; see the field docs.
+    pub fn varnode_count(&self) -> usize {
+        self.varnode_count
+    }
+
+    /// Finish the analysis ("Part B") for the given load/store `pointer_uses`,
+    /// resolving each against a private clone of this shared base.
+    fn resolve(&self, ctx: &Context, pointer_uses: Vec<(ValueId, SpaceId, usize)>) -> AliasResult {
+        let mut a = Analysis {
+            ctx,
+            value_to_root: self.value_to_root.clone(),
+            by_space: &self.by_space,
+            literal_ranges: HashMap::default(),
+            value_to_interval: HashMap::default(),
+            uf: self.uf.clone(),
+        };
+
         // pointer_spaces guards the invariant that a given pointer value always
         // refers to the same address space across all uses.
         let mut pointer_spaces: HashMap<ValueId, SpaceId> = HashMap::default();
@@ -401,6 +408,54 @@ impl AliasResult {
             value_to_interval: a.value_to_interval,
             frame: None,
         }
+    }
+
+    /// Finish Part B for a single function: resolve only the pointers used by
+    /// `fun_id`'s own loads/stores, so the module-wide instruction scan is not
+    /// repeated for every function. This is the per-function GVN entry point.
+    pub fn for_function(&self, ctx: &Context, fun_id: FunctionId) -> AliasResult {
+        let mut pointer_uses: Vec<(ValueId, SpaceId, usize)> = Vec::new();
+        for block in FunctionRef::from_id(ctx, fun_id).blocks() {
+            for &iid in block.instruction_ids() {
+                match ctx.get_insn(iid).mnemonic() {
+                    Mnemonic::Load(load) => pointer_uses.push((load.ptr, load.space, load.size)),
+                    Mnemonic::Store(store) => {
+                        pointer_uses.push((store.ptr, store.space, store.size))
+                    }
+                    _ => {}
+                }
+            }
+        }
+        self.resolve(ctx, pointer_uses)
+    }
+}
+
+impl AliasResult {
+    /// A location-based aliasing result that only reasons about known varnode
+    /// ranges. Overlapping varnodes in the same space are joined; only pointer
+    /// values that actually participate in loads/stores are added.
+    ///
+    /// Whole-context entry point (every load/store in `ctx`), preserved for callers
+    /// and tests that analyze a context as a unit. The per-function GVN pass instead
+    /// goes through [`RegisterBase::for_function`], which neither rebuilds Part A nor
+    /// rescans the whole module per function.
+    pub fn simple(ctx: &Context) -> Self {
+        let pointer_uses: Vec<(ValueId, SpaceId, usize)> = ctx
+            .instructions()
+            .filter_map(|insn| match insn.mnemonic() {
+                Mnemonic::Load(load) => Some((load.ptr, load.space, load.size)),
+                Mnemonic::Store(store) => Some((store.ptr, store.space, store.size)),
+                _ => None,
+            })
+            .collect();
+        RegisterBase::build(ctx).resolve(ctx, pointer_uses)
+    }
+
+    /// Like [`simple`](Self::simple), but only scans `function_id`'s own
+    /// instructions. Convenience wrapper over [`RegisterBase`] for callers
+    /// (e.g. `mem2reg`, dead-load tests) that lack a shared base to reuse.
+    pub fn simple_for_function(ctx: &Context, function_id: FunctionId) -> Self {
+        RegisterBase::build(ctx).for_function(ctx, function_id)
     }
 }
 

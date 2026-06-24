@@ -173,6 +173,21 @@ impl<'ctx, 'str> Mem2Reg<'ctx, 'str> {
     }
 }
 
+/// A total, hash-independent order over `ValueId`, used to canonicalize the order
+/// in which mem2reg promotes variables (and thus the order of the block params it
+/// creates). Keyed by `(variant, inner index)`; both halves are stable across runs.
+fn value_id_order_key(v: ValueId) -> (u8, usize) {
+    match v {
+        ValueId::Literal(id) => (0, id.into()),
+        ValueId::Instruction(id) => (1, id.into()),
+        ValueId::BasicBlock(id) => (2, id.into()),
+        ValueId::BlockParam(id) => (3, id.into()),
+        ValueId::Varnode(id) => (4, id.into()),
+        ValueId::Function(id) => (5, id.into()),
+        // `ValueId` is `#[non_exhaustive]`; keep any future variant last but stable.
+        _ => (u8::MAX, 0),
+    }
+}
 /// Whether `function_id` performs any load or store through a *computed stack
 /// frame pointer* — an `@SP`-rooted value whose offset from the incoming stack
 /// pointer is not a fixed constant (`@SP + reg`, or a realigned
@@ -700,7 +715,15 @@ impl Mem2Reg<'_, '_> {
         };
         let no_store_blocks = HashSet::default();
 
-        for &var in vars {
+        // `vars` is a `HashSet`, so iterating it directly promotes variables in an
+        // order seeded by their value ids' hashes. That order decides block-param
+        // order and the value ids minted for those params, so it must be canonical:
+        // otherwise equivalent runs emit the same IR with params (e.g. `arg_stack_8`
+        // vs `arg_stack_16`) swapped. Sort into a stable, hash-independent order.
+        let mut ordered_vars: Vec<ValueId> = vars.iter().copied().collect();
+        ordered_vars.sort_unstable_by_key(|&v| value_id_order_key(v));
+
+        for var in ordered_vars {
             // Block-param width: varnodes carry their own size; stack slots use the
             // (consistent) access size recorded during collection.
             let size = match var {

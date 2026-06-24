@@ -11,16 +11,16 @@ use crate::{ArchConfig, CallingConvention, FunctionPass, PipelineEnv};
 /// (no real stack pointer or ABI). Arch-aware passes should build a real env via
 /// [`PipelineEnv::new`] with a context that has a registered stack pointer.
 pub(crate) fn dummy_env() -> PipelineEnv {
-    PipelineEnv {
-        cfg: ArchConfig {
+    PipelineEnv::from_parts(
+        ArchConfig {
             stack_pointer: RegisterId::from(0usize),
             dead_flag_regs: Vec::new(),
             abi: CallingConvention::default(),
             os: qcode::context::TargetOs::Unknown,
             bitness: 64,
         },
-        sp_varnode: VarnodeId::from(0usize),
-    }
+        VarnodeId::from(0usize),
+    )
 }
 
 /// Construct `P` via [`Default`] and run it once over `fun` with a [`dummy_env`],

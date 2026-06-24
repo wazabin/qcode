@@ -43,7 +43,7 @@ pub use dce::{
 };
 
 pub mod alias;
-pub use alias::{AliasResult, alias_analysis};
+pub use alias::{AliasResult, RegisterBase, alias_analysis};
 
 pub mod gvn;
 pub use gvn::{constant_fold_function, gvn, gvn_function};

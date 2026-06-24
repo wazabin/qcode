@@ -17,6 +17,7 @@ mod anderson;
 mod simple;
 
 pub use anderson::alias_analysis;
+pub use simple::RegisterBase;
 
 /// Per-function frame-freshness context, precomputed when an [`AliasResult`] is
 /// built with [`AliasResult::with_frame_freshness`]. `None` leaves the rule inert

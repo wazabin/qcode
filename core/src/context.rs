@@ -421,6 +421,14 @@ impl<'str> Context<'str> {
             .map(|v| Varnode::from_id(self, v.id))
     }
 
+    /// Number of varnodes in the context. The varnode registry is append-only, so
+    /// this is monotonic and an unchanged value means an unchanged varnode set —
+    /// used to validate caches keyed on the register/varnode layout (e.g. the
+    /// alias [`RegisterBase`](../../qcode_analysis/alias/struct.RegisterBase.html)).
+    pub fn varnode_count(&self) -> usize {
+        self.values.varnodes.len()
+    }
+
     /// Adds a directed edge in the CFG from `from` to `to`, returning its id.
     pub fn add_cfg_edge(&mut self, from: BlockId, to: BlockId) -> EdgeId {
         let edge_id = self.values.edges.push(EdgeData { from, to });

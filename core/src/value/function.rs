@@ -377,15 +377,14 @@ where
     /// An iterator over the blocks belonging to this function.
     pub fn blocks(&'s self) -> impl Iterator<Item = BlockRef<'str, 'ctx>> + 's {
         let ctx = self.ctx();
-        let mut blocks = self
-            .inner()
-            .blocks
-            .iter()
-            .map(move |&id| BlockRef::new(ctx, id))
-            .collect::<Vec<_>>();
+        let mut ids = self.inner().blocks.iter().copied().collect::<Vec<_>>();
 
-        blocks.sort_by_key(|b| b.address());
-        blocks.into_iter()
+        // Total order: primarily by machine address, but break ties by BlockId.
+        // `blocks` is a `HashSet`, so address-less blocks (e.g. fallthrough splits,
+        // whose `address()` is `None`) would otherwise be ordered by the set's
+        // per-process random seed, making block emission order nondeterministic.
+        ids.sort_by_key(|&id| (BlockRef::new(ctx, id).address(), usize::from(id)));
+        ids.into_iter().map(move |id| BlockRef::new(ctx, id))
     }
 
     /// Iterates over the blocks in this function

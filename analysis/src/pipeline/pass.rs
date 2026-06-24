@@ -27,6 +27,8 @@
 //! [`DynFunctionPass`] shim, which every `FunctionPass` gets for free via a blanket
 //! impl.
 
+use std::cell::{Ref, RefCell};
+
 use qcode::{
     context::Context,
     value::{FunctionId, VarnodeId},
@@ -34,6 +36,7 @@ use qcode::{
 
 use super::ArchConfig;
 use crate::structure::Program;
+use crate::RegisterBase;
 
 /// The architecture-specific inputs the register-aware passes need, resolved once
 /// per pipeline run and shared by reference with every pass.
@@ -43,6 +46,11 @@ pub struct PipelineEnv {
     /// The stack-pointer *varnode* (`cfg.stack_pointer` resolved through
     /// `ctx.registers`), cached so passes don't re-resolve it each call.
     pub sp_varnode: VarnodeId,
+    /// Function-independent register/varnode alias base, built lazily and shared
+    /// across the per-function GVN runs (see [`PipelineEnv::alias_base`]). Behind a
+    /// `RefCell` because passes hold `&PipelineEnv`; sound because the function-pass
+    /// runner is single-threaded.
+    alias_base: RefCell<Option<RegisterBase>>,
 }
 
 impl PipelineEnv {
@@ -50,7 +58,37 @@ impl PipelineEnv {
     /// the lifting passes will be inert.
     pub fn new(ctx: &Context, cfg: ArchConfig) -> Self {
         let sp_varnode = ctx.registers[&cfg.stack_pointer];
-        Self { cfg, sp_varnode }
+        Self::from_parts(cfg, sp_varnode)
+    }
+
+    /// Build an env from already-resolved parts, without consulting a `ctx`. Used by
+    /// unit tests that construct a throwaway env for arch-agnostic passes; prefer
+    /// [`PipelineEnv::new`] in production.
+    pub(crate) fn from_parts(cfg: ArchConfig, sp_varnode: VarnodeId) -> Self {
+        Self {
+            cfg,
+            sp_varnode,
+            alias_base: RefCell::new(None),
+        }
+    }
+
+    /// The shared register/varnode alias base ("Part A" of the simple alias
+    /// analysis) for `ctx`. Built on first use and reused while the varnode set is
+    /// unchanged; rebuilt only when a varnode is added mid-run (the registry is
+    /// append-only, so a changed `varnode_count` is the validity key). The
+    /// per-function GVN pass finishes it with [`RegisterBase::for_function`], so the
+    /// O(varnodes·log) base build no longer runs on every function.
+    pub fn alias_base(&self, ctx: &Context) -> Ref<'_, RegisterBase> {
+        let valid = matches!(
+            &*self.alias_base.borrow(),
+            Some(base) if base.varnode_count() == ctx.varnode_count()
+        );
+        if !valid {
+            *self.alias_base.borrow_mut() = Some(RegisterBase::build(ctx));
+        }
+        Ref::map(self.alias_base.borrow(), |o| {
+            o.as_ref().expect("alias_base just built")
+        })
     }
 }
 

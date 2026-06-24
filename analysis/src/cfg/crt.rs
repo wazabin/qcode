@@ -143,10 +143,7 @@ mod tests {
             os: qcode::context::TargetOs::Unknown,
             bitness: 64,
         };
-        let env = PipelineEnv {
-            cfg,
-            sp_varnode: tc.r3,
-        };
+        let env = PipelineEnv::from_parts(cfg, tc.r3);
 
         assert!(DiscoverLibcMain.run(&mut tc.ctx, &env).unwrap());
         let discoveries = tc.ctx.discoveries().collect::<Vec<_>>();
