@@ -105,25 +105,30 @@ impl ResolvedPath {
             }
         }
 
-        // Wire each cloned CBranch block to its successor in trace order.
-        // This replaces the two-target CBranch with an unconditional branch,
-        // since the assert above already encodes which path was taken.
+        // Wire each cloned block to its successor in trace order so the resolved
+        // path is self-contained rather than pointing back into the original CFG.
+        //
+        // - `CBranch`: replaced with an unconditional branch (the assert inserted
+        //   above already encodes which side was taken).
+        // - `Branch`: its target is retargeted to the cloned successor.
+        //
+        // `Call`/`CallInd`/`Return`/`BranchInd` are intentionally left untouched:
+        // their targets are either indirect, absent, or semantically meaningful
+        // (the original callee), so consumers should rely on `blocks` order across
+        // those boundaries.
         for i in 0..blocks.len().saturating_sub(1) {
             let block_id = blocks[i];
             let next_block_id = blocks[i + 1];
 
-            let is_cbranch = BasicBlock::from_id(ctx, block_id)
+            let terminator = BasicBlock::from_id(ctx, block_id)
                 .instruction_ids()
                 .last()
-                .is_some_and(|&id| {
-                    matches!(
-                        Instruction::from_id(ctx, id).mnemonic(),
-                        Mnemonic::CBranch(_)
-                    )
-                });
+                .map(|&id| Instruction::from_id(ctx, id).mnemonic().clone());
 
-            if is_cbranch {
-                wire_cbranch_to_next(ctx, block_id, next_block_id);
+            match terminator {
+                Some(Mnemonic::CBranch(_)) => wire_cbranch_to_next(ctx, block_id, next_block_id),
+                Some(Mnemonic::Branch(_)) => wire_branch_to_next(ctx, block_id, next_block_id),
+                _ => {}
             }
         }
 
@@ -190,6 +195,32 @@ fn wire_cbranch_to_next(ctx: &mut Context, block_id: BlockId, next_block_id: Blo
     BasicBlock::from_id_mut(ctx, block_id).push_insn(branch_id);
 }
 
+/// Retargets the unconditional branch terminator of `block_id` to `next_block_id`,
+/// preserving the arguments passed to the block parameters.
+fn wire_branch_to_next(ctx: &mut Context, block_id: BlockId, next_block_id: BlockId) {
+    let last_id = *BasicBlock::from_id(ctx, block_id)
+        .instruction_ids()
+        .last()
+        .expect("caller guarantees a branch terminator");
+    let args = match Instruction::from_id(ctx, last_id).mnemonic() {
+        Mnemonic::Branch(branch) => branch.args.clone(),
+        _ => unreachable!("caller guarantees a branch terminator"),
+    };
+
+    BasicBlock::from_id_mut(ctx, block_id).pop_insn();
+    ctx.add_cfg_edge(block_id, next_block_id);
+    let branch_id = InstructionRef::from_mnemonic(
+        ctx,
+        Mnemonic::Branch(Branch {
+            target: next_block_id,
+            args,
+        }),
+        0,
+    )
+    .id;
+    BasicBlock::from_id_mut(ctx, block_id).push_insn(branch_id);
+}
+
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
@@ -246,8 +277,8 @@ mod tests {
         (ctx, entry, success, failure, out)
     }
 
-    /// Builds a simple context with a conditional branch and returns a trace
-    /// resolved through the success path.
+    /// Builds a context with a loop (`cond` -> `body` -> `cond`) so a trace can
+    /// exercise repeated cloning of the same blocks.
     fn make_loop_ctx() -> (Context<'static>, BlockId, BlockId, BlockId, BlockId) {
         let mut ctx = Context::new();
         qcode!(
@@ -394,5 +425,28 @@ mod tests {
             all_ids.len(),
             "cloned blocks must not share instruction ids"
         );
+
+        // Every block but the last must end with an unconditional branch wired to
+        // the next cloned block, so the path stays inside the cloned CFG.
+        let cloned: std::collections::HashSet<_> = resolved.blocks.iter().copied().collect();
+        for window in resolved.blocks.windows(2) {
+            let [block_id, next_id] = window else {
+                continue;
+            };
+            let block = BasicBlock::from_id(&ctx, *block_id);
+            match block.iter().last().map(|i| i.mnemonic().clone()) {
+                Some(Mnemonic::Branch(branch)) => {
+                    assert_eq!(
+                        branch.target, *next_id,
+                        "cloned branch must target the cloned successor"
+                    );
+                    assert!(
+                        cloned.contains(&branch.target),
+                        "branch target must be a cloned block, not the original CFG"
+                    );
+                }
+                other => panic!("expected unconditional branch terminator, got {other:?}"),
+            }
+        }
     }
 }

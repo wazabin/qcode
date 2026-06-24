@@ -32,8 +32,6 @@ mod tests {
 
     use crate::{context::Context, value::insn::Mnemonic};
 
-    use super::*;
-
     #[test]
     fn test_assert_macro_and_display() {
         let mut ctx = Context::new();

@@ -150,8 +150,14 @@ impl<'str> BasicBlock<'str> {
             // Create the new instruction and derive the cloned mnemonic
             let mut new_mnemonic = insn_ref.mnemonic().clone();
 
-            for (old, new) in value_map.iter() {
-                new_mnemonic.replace_value(*old, *new);
+            // Only remap the values this instruction actually references. This
+            // avoids scanning the whole (trace-wide) `value_map` per instruction
+            // and sidesteps chained `old -> new -> newer` replacements that a
+            // full iteration could trigger.
+            for old in new_mnemonic.args() {
+                if let Some(&new) = value_map.get(&old) {
+                    new_mnemonic.replace_value(old, new);
+                }
             }
 
             let new_insn_id =
