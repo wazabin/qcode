@@ -542,7 +542,7 @@ fn recognize_simple_loop(
 ) -> Option<SimpleLoop> {
     let header = edge.header;
     let cbranch = header_cbranch(ctx, header)?;
-    let (induction, bound) = condition_bound(ctx, cbranch.condition)?;
+    let (induction, bound, signed) = condition_bound(ctx, cbranch.condition)?;
     let header_params = BasicBlock::from_id(ctx, header)
         .params()
         .map(|param| param.id)
@@ -557,7 +557,21 @@ fn recognize_simple_loop(
         return None;
     }
 
-    let iterations = if initial >= bound {
+    let iterations = if signed {
+        // Trip count for a signed comparison must be computed with signed
+        // arithmetic: an initial value like `-10` is stored as a large u64,
+        // and naive unsigned `initial >= bound` would wrongly yield 0.
+        let initial = initial as i64;
+        let bound = bound as i64;
+        if initial >= bound {
+            0
+        } else {
+            // `bound > initial` and `step > 0`, so the gap is positive:
+            // ceil(gap / step) without the unstable signed `div_ceil`.
+            let step = step as i64;
+            ((bound - initial + step - 1) / step) as u64
+        }
+    } else if initial >= bound {
         0
     } else {
         (bound - initial).div_ceil(step)
@@ -599,13 +613,13 @@ fn header_cbranch(ctx: &Context, header: BlockId) -> Option<CBranch> {
     }
 }
 
-fn condition_bound(ctx: &Context, condition: ValueId) -> Option<(BlockParamId, u64)> {
+fn condition_bound(ctx: &Context, condition: ValueId) -> Option<(BlockParamId, u64, bool)> {
     let ValueId::Instruction(condition_id) = condition else {
         return None;
     };
     let condition = qcode::value::Instruction::from_id(ctx, condition_id);
     let Mnemonic::Binop(Binary {
-        op: Binop::Int(IntBinop::Less | IntBinop::SLess),
+        op: op @ Binop::Int(IntBinop::Less | IntBinop::SLess),
         lhs,
         rhs,
     }) = condition.mnemonic()
@@ -613,9 +627,10 @@ fn condition_bound(ctx: &Context, condition: ValueId) -> Option<(BlockParamId, u
         return None;
     };
 
+    let signed = matches!(op, Binop::Int(IntBinop::SLess));
     let induction = lhs.as_block_param()?;
     let bound = numeric_const(ctx, *rhs)?;
-    Some((induction, bound))
+    Some((induction, bound, signed))
 }
 
 fn first_body_block(
@@ -632,9 +647,14 @@ fn first_body_block(
     let success_is_body = loop_nodes.contains(&cbranch.success_block);
     let failure_is_body = loop_nodes.contains(&cbranch.failure_block);
 
+    // The trip-count formula in `condition_bound` treats the header comparison
+    // (`i < bound`) as the loop-*continue* condition, i.e. it assumes the body
+    // executes precisely while the condition is true. That only holds when the
+    // condition-true edge enters the body. If the true edge exits the loop
+    // instead (body on the failure branch), the polarity is inverted and the
+    // computed iteration count would be wrong, so refuse to recognize the loop.
     let body = match (success_is_body, failure_is_body) {
         (true, false) => cbranch.success_block,
-        (false, true) => cbranch.failure_block,
         _ => return None,
     };
 
@@ -837,6 +857,38 @@ mod tests {
     }
 
     #[test]
+    fn signed_loop_with_negative_initial_computes_trip_count() {
+        // Regression: `for (int i = -10; i < 0; i++)` lowers to a signed
+        // comparison (`s<`) with initial = -10 stored as 0xffff…fff6. Computing
+        // the trip count with unsigned arithmetic wrongly yields 0 iterations,
+        // deleting the loop body. The correct count is 10.
+        let mut ctx = Context::new();
+        qcode!(
+            ctx,
+            "
+            fn test:
+            <entry>
+                goto <header @i=0xfffffffffffffff6 @sum=0x0>;
+            <header @i:i64 @sum:i64>
+                %cond = @i s< 0x0;
+                if %cond goto <body> else goto <exit>;
+            <body>
+                %sum_next = @sum + @i;
+                %i_next = @i + 0x1;
+                goto <header @i=%i_next @sum=%sum_next>;
+            <exit>
+                return [0x0];
+            "
+        );
+
+        assert!(run_function_pass::<RecognizeSimpleLoops>(&mut ctx, test).unwrap());
+
+        let header = BasicBlock::from_id(&ctx, header);
+        let comment = header.comment().expect("header should be annotated");
+        assert!(comment.contains("iterations=10"), "comment: {comment}");
+    }
+
+    #[test]
     fn annotates_loop_with_multiple_body_blocks() {
         let mut ctx = Context::new();
         qcode!(
@@ -887,6 +939,35 @@ mod tests {
                 %i_next = @i + 0x1;
                 %keep_going = @i != 0x1;
                 if %keep_going goto <header @i=%i_next> else goto <exit>;
+            <exit>
+                return [0x0];
+            "
+        );
+
+        assert!(!run_function_pass::<RecognizeSimpleLoops>(&mut ctx, test).unwrap());
+        assert!(BasicBlock::from_id(&ctx, header).comment().is_none());
+    }
+
+    #[test]
+    fn rejects_inverted_condition_polarity() {
+        // The header compares `@i < 0x3` but the condition-*true* edge exits the
+        // loop while the false edge enters the body. The trip-count formula
+        // assumes "continue while i < bound", so accepting this loop would emit
+        // the wrong number of unrolled copies. The recognizer must reject it.
+        let mut ctx = Context::new();
+        qcode!(
+            ctx,
+            "
+            fn test:
+            <entry>
+                goto <header @i=0x0 @sum=0x0>;
+            <header @i:i64 @sum:i64>
+                %cond = @i < 0x3;
+                if %cond goto <exit> else goto <body>;
+            <body>
+                %sum_next = @sum + @i;
+                %i_next = @i + 0x1;
+                goto <header @i=%i_next @sum=%sum_next>;
             <exit>
                 return [0x0];
             "
