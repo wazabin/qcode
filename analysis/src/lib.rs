@@ -63,3 +63,6 @@ pub use pipeline::{
     PipelineFile, create_named_user_pipeline_from_default_in, create_user_pipeline_from_default_in,
     list_user_pipelines_in, load_named_user_pipeline_in,
 };
+
+pub mod trace;
+pub use trace::Trace;

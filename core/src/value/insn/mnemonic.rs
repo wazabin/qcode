@@ -4,9 +4,9 @@ use crate::{
         ValueId,
         function::FunctionId,
         insn::{
-            Binary, Branch, BranchInd, CBranch, Call, CallInd, Carry, FloatToFloat, FloatToInt,
-            IntToFloat, Intrinsic, IsFloatNaN, Load, LzCount, PCodeOp, PopCount, Range, Return,
-            SBorrow, SCarry, Sext, Store, Unary, Zext,
+            Assert, Binary, Branch, BranchInd, CBranch, Call, CallInd, Carry, FloatToFloat,
+            FloatToInt, IntToFloat, Intrinsic, IsFloatNaN, Load, LzCount, PCodeOp, PopCount, Range,
+            Return, SBorrow, SCarry, Sext, Store, Unary, Zext,
         },
     },
 };
@@ -105,6 +105,8 @@ pub enum Mnemonic {
     SCarry(SCarry),
     /// Signed subtraction borrow flag.
     SBorrow(SBorrow),
+    /// Assert when resolving an execution trace
+    Assert(Assert),
     /// A user-defined or architecture-specific p-code operation.
     PCodeOp(PCodeOp),
     /// A pure named intrinsic function (e.g. `rol`, `ror`). Categorically pure:
@@ -137,6 +139,7 @@ impl Mnemonic {
             Mnemonic::Carry(m) => m,
             Mnemonic::SCarry(m) => m,
             Mnemonic::SBorrow(m) => m,
+            Mnemonic::Assert(m) => m,
             Mnemonic::PCodeOp(m) => m,
             Mnemonic::Intrinsic(m) => m,
         }
@@ -338,6 +341,11 @@ impl Mnemonic {
                         *a = new;
                     }
                 });
+            }
+            Mnemonic::Assert(m) => {
+                if m.condition == old {
+                    m.condition = new;
+                }
             }
         }
     }

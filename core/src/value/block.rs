@@ -16,7 +16,7 @@ use core::slice;
 use jstd::graph::Graph;
 use std::{
     borrow::Cow,
-    collections::HashSet,
+    collections::{HashMap, HashSet},
     fmt::{Display, Formatter},
 };
 
@@ -103,6 +103,69 @@ impl<'str> BasicBlock<'str> {
     pub fn make<'ctx>(ctx: &'ctx mut Context<'str>) -> BlockMutRef<'str, 'ctx> {
         let id = ctx.values.push_block(BasicBlock::default());
         BlockMutRef::new(ctx, id)
+    }
+
+    /// Deep-clone the block at `orig` into a new block in the same context.
+    /// Updates `value_map` with parameters and instructions remapping.
+    pub fn clone_into_ctx(
+        ctx: &mut Context<'str>,
+        orig: BlockId,
+        value_map: &mut HashMap<ValueId, ValueId>,
+    ) -> BlockId {
+        // Create a fresh block
+        let new_block_id = BasicBlock::make(ctx).id;
+
+        let name = Cow::Owned(format!(
+            "clone_{:x}",
+            ctx.values.basic_blocks[orig].address.unwrap_or(0)
+        ));
+        let unique_name = ctx.get_unique_name(name);
+        BasicBlock::from_id_mut(ctx, new_block_id)
+            .rename(unique_name)
+            .expect("name was deduplicated");
+
+        // Clone parameters
+        for old_param_id in &ctx.values.basic_blocks[orig].params.clone() {
+            let old_param = ctx.values.block_params[*old_param_id].clone();
+            let new_param_id = ctx.values.block_params.push(BlockParam {
+                parent: Some(new_block_id),
+                ..old_param
+            });
+
+            BasicBlock::from_id_mut(ctx, new_block_id).push_existing_param(new_param_id);
+            value_map.insert(
+                ValueId::BlockParam(*old_param_id),
+                ValueId::BlockParam(new_param_id),
+            );
+        }
+
+        // Clone instructions
+        let orig_insns = ctx.values.basic_blocks[orig].instructions.clone();
+        for &old_insn_id in orig_insns.iter() {
+            // Extract information from the old instruciton
+            let insn_ref = Instruction::from_id(ctx, old_insn_id);
+            let size = insn_ref.size();
+            let space = insn_ref.space().map(|s| s.id);
+
+            // Create the new instruction and derive the cloned mnemonic
+            let mut new_mnemonic = insn_ref.mnemonic().clone();
+
+            for (old, new) in value_map.iter() {
+                new_mnemonic.replace_value(*old, *new);
+            }
+
+            let new_insn_id =
+                InstructionRef::from_mnemonic_with_space(ctx, new_mnemonic, size, space).id;
+
+            BasicBlock::from_id_mut(ctx, new_block_id).push_insn(new_insn_id);
+
+            value_map.insert(
+                ValueId::Instruction(old_insn_id),
+                ValueId::Instruction(new_insn_id),
+            );
+        }
+
+        new_block_id
     }
 }
 
@@ -384,6 +447,11 @@ impl<'str, 'ctx> BlockMutRef<'str, 'ctx> {
         });
         self.inner_mut().params.push(id);
         BlockParamMutRef::from_id(self.ctx, id)
+    }
+
+    /// Appends an already-created block parameter to the parameters list
+    pub fn push_existing_param(&mut self, id: BlockParamId) {
+        self.inner_mut().params.push(id);
     }
 
     fn insert_insn(&mut self, index: usize, insn_id: InstructionId) {
@@ -864,5 +932,77 @@ mod tests {
         entry_block.pop_insn();
         assert_eq!(entry_block.instruction_ids().len(), 0);
         assert_eq!(entry_block.successors().count(), 0);
+    }
+
+    #[test]
+    fn clone_into_ctx_produces_distinct_ids() {
+        let mut ctx = Context::new();
+        qcode!(
+            ctx,
+            "
+            varnode i64 X;
+            varnode i64 Y;
+
+            <block>
+                %x = load(i64, &X);
+                %y = load(i64, &Y);
+                %sum = i64 %x + i64 %y;
+                return [i64 0];
+            "
+        );
+
+        let mut value_map = HashMap::new();
+        let cloned_id = BasicBlock::clone_into_ctx(&mut ctx, block, &mut value_map);
+
+        let orig = BasicBlock::from_id(&ctx, block);
+        let cloned = BasicBlock::from_id(&ctx, cloned_id);
+
+        assert_ne!(block, cloned_id, "cloned block must have a different id");
+        assert_ne!(
+            orig.name(),
+            cloned.name(),
+            "cloned block must have a different name"
+        );
+
+        assert_eq!(orig.instruction_ids().len(), cloned.instruction_ids().len());
+        for (orig_id, clone_id) in orig.instruction_ids().iter().zip(cloned.instruction_ids()) {
+            assert_ne!(
+                orig_id, clone_id,
+                "cloned instruction must have a different id"
+            );
+        }
+    }
+
+    #[test]
+    fn clone_into_ctx_remaps_operands() {
+        let mut ctx = Context::new();
+        qcode!(
+            ctx,
+            "
+            varnode i64 X;
+            varnode i64 Y;
+
+            <block>
+                %x = load(i64, &X);
+                %y = load(i64, &Y);
+                %sum = i64 %x + i64 %y;
+                return [i64 0];
+            "
+        );
+
+        let mut value_map = HashMap::new();
+        let cloned_id = BasicBlock::clone_into_ctx(&mut ctx, block, &mut value_map);
+        let cloned = BasicBlock::from_id(&ctx, cloned_id);
+
+        let orig_value_ids: HashSet<ValueId> = value_map.keys().copied().collect();
+
+        // All operands in the clone must reference new (remapped) values, not the originals
+        // so no value map key should be referenced
+        for arg in cloned.iter().flat_map(|i| i.mnemonic().args()) {
+            assert!(
+                !orig_value_ids.contains(&arg),
+                "cloned instruction still references original value {arg:?}"
+            );
+        }
     }
 }

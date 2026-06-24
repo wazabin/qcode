@@ -21,6 +21,7 @@ use std::{
     fmt::{Display, Formatter},
 };
 
+mod assert;
 mod binop;
 mod bits;
 mod casting;
@@ -32,6 +33,7 @@ mod pcode_op;
 mod terminator;
 mod unop;
 
+pub use assert::Assert;
 pub use binop::{Binary, Binop, BoolBinop, FloatBinop, IntBinop};
 pub use casting::{FloatToFloat, FloatToInt, IntToFloat, Range, Sext, Zext};
 pub use flags::{Carry, IsFloatNaN, LzCount, PopCount, SBorrow, SCarry};

@@ -42,10 +42,10 @@ use crate::{
         block_param::BlockParamMutRef,
         function::FunctionId,
         insn::{
-            Binary, Binop, BoolBinop, Branch, BranchInd, CBranch, Call, CallInd, Carry, FloatBinop,
-            FloatToFloat, FloatToInt, InstructionId, InstructionRef, IntBinop, IntToFloat,
-            Intrinsic, IntrinsicId, IsFloatNaN, Load, LzCount, Mnemonic, PCodeOp, PCodeOpId,
-            PopCount, Range, Return, SBorrow, SCarry, Sext, Store, Unary, Unop, Zext,
+            Assert, Binary, Binop, BoolBinop, Branch, BranchInd, CBranch, Call, CallInd, Carry,
+            FloatBinop, FloatToFloat, FloatToInt, InstructionId, InstructionRef, IntBinop,
+            IntToFloat, Intrinsic, IntrinsicId, IsFloatNaN, Load, LzCount, Mnemonic, PCodeOp,
+            PCodeOpId, PopCount, Range, Return, SBorrow, SCarry, Sext, Store, Unary, Unop, Zext,
         },
         util::base_ref::{WithCtx, WithCtxMut},
         varnode::{Varnode, VarnodeId},
@@ -1211,6 +1211,13 @@ impl<'str, 'ctx> Builder<'str, 'ctx> {
             .id;
         self.is_terminated = true;
         self.context().get_insn(id)
+    }
+
+    // --- Assert ---
+
+    /// Asserts that a condition holds at this point in execution
+    pub fn push_assert(&mut self, condition: ValueId) -> InstructionRef<'str, '_> {
+        self.push_instruction(Mnemonic::Assert(Assert { condition }), 0)
     }
 }
 
