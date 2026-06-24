@@ -294,6 +294,13 @@ fn ensure_user_pipeline_dir(dir: &Path) -> Result<(), String> {
 }
 
 impl Pipeline {
+    /// Ordered names of the pipeline's stages, for progress display. Stages with
+    /// no passes (e.g. the lift-boundary marker) are included so the reported
+    /// stage name from [`PipelineProgress`] always resolves to an index here.
+    pub fn stage_names(&self) -> Vec<String> {
+        self.stages.iter().map(|s| s.name.clone()).collect()
+    }
+
     /// Parse and name-resolve a pipeline from TOML source. Every pass name is
     /// resolved against the registry up front; an unknown name (or a scope
     /// mismatch) is a hard error and the pipeline does not load.
