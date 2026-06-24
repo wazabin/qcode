@@ -1,8 +1,9 @@
 pub mod assumptions;
 pub use assumptions::{
     MemoryProtections, analyze_with_assumptions, apply_all_external_signatures,
-    apply_external_signature, assume_call_returns, establish_memory_protections,
-    verify_assumptions, verify_forced_returns,
+    apply_external_signature, assume_args_disjoint_caller_frame, assume_call_returns,
+    establish_memory_protections, verify_args_disjoint_caller_frame, verify_assumptions,
+    verify_forced_returns,
 };
 
 pub mod stack;
@@ -10,7 +11,7 @@ pub mod stack;
 pub mod calls;
 pub use calls::{
     append_caller_arg, append_entry_param, argpromote, argpromote_registers,
-    compute_call_clobbered_regs, compute_clobbered_regs, compute_input_regs, compute_saved_regs,
+    compute_call_clobbered_regs, compute_clobbered_regs, compute_input_regs,
     compute_stack_delta, learn_stack_facts, remove_entry_param, seed_stack_facts,
     set_all_call_clobbered_regs, set_all_function_summaries, set_clobbered_regs,
     set_function_summaries,

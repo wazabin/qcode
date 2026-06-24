@@ -46,6 +46,18 @@ pub enum Proposition {
     /// Function hands a pointer into its own frame to an unbounded-reading
     /// callee, so its own frame must stay in memory.
     FrameEscapingCaller(FunctionId),
+    /// Every incoming pointer parameter of this function (and any address offset
+    /// from one) is disjoint from the function's own *caller-frame* region — the
+    /// `@SP + k` (`k ≥ 0`) slots holding the return address and incoming stack
+    /// arguments. This lets the frame-freshness alias rule forward a load of a
+    /// caller-frame slot across a store through an incoming pointer (the
+    /// spilled-pointer reload idiom). Unlike own-frame freshness it is **not**
+    /// statically sound on its own — a caller could pass the address of one of its
+    /// outgoing-argument slots — so a pass records it `Assumed` and a verifier
+    /// (`verify_args_disjoint_caller_frame`) keeps it standing by default,
+    /// refuting it (→ replay) only when a direct caller *provably* passes a pointer
+    /// argument whose access interval overlaps the callee's argument slots.
+    ArgsDisjointFromCallerFrame(FunctionId),
     /// The `size` bytes at virtual address `addr` (a jump-table entry the
     /// jump-table resolver read out of read-only data) are assumed never
     /// written at runtime; a write would invalidate the resolved jump target.

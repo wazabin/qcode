@@ -1,6 +1,7 @@
 use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
 
 use qcode::{
+    assumption::Proposition,
     context::Context,
     space::SpaceId,
     value::{
@@ -21,6 +22,10 @@ pub use anderson::alias_analysis;
 /// built with [`AliasResult::with_frame_freshness`]. `None` leaves the rule inert
 /// (hand-built results and callers without a stack-pointer register).
 pub(crate) struct FrameInfo {
+    /// The function this frame belongs to — the key for the
+    /// [`Proposition::ArgsDisjointFromCallerFrame`] truth consulted by the
+    /// assumed caller-frame rule in [`AliasResult::provably_disjoint`].
+    fid: FunctionId,
     /// This function's root (entry) block — a pointer that peels to one of its
     /// params is an *incoming* pointer from the caller.
     root_block: Option<BlockId>,
@@ -31,6 +36,10 @@ pub(crate) struct FrameInfo {
     /// Every value classified as an own-frame local (`@SP`-rooted slot below the
     /// entry stack pointer, or a realigned-frame slot) for this function.
     own_frame_locals: HashSet<ValueId>,
+    /// Every value classified as a *caller-frame* slot (`@SP + k`, `k ≥ 0`: the
+    /// return-address slot and incoming stack arguments). Used only by the
+    /// assumed `ArgsDisjointFromCallerFrame` rule.
+    caller_frame_slots: HashSet<ValueId>,
 }
 
 /// Abstract node in the alias graph.
@@ -137,9 +146,10 @@ impl AliasResult {
             return false;
         }
 
-        // Frame freshness (sound): a function's own stack locals can never alias a
-        // pointer that entered from its caller, so answer "no" before the alias
-        // graph collapses both partitions to `Unknown` (and thus "may alias").
+        // Frame freshness: an own-frame local never aliases an incoming pointer
+        // (sound), and a caller-frame slot is disjoint from one under the recorded
+        // `ArgsDisjointFromCallerFrame` assumption (see `provably_disjoint`). Answer
+        // "no" before the alias graph collapses both partitions to `Unknown`.
         if self.provably_disjoint(ctx, a, b) {
             return false;
         }
@@ -151,17 +161,26 @@ impl AliasResult {
         }
     }
 
-    /// Frame-freshness disjointness: a function's own stack locals never alias a
-    /// pointer that entered from its caller.
+    /// Frame-freshness disjointness between a stack slot and an incoming pointer.
     ///
-    /// Returns `true` only when one value is an own-frame local (an `@SP`-rooted
-    /// slot below the entry stack pointer, classified [`FrameClass::Local`]) and
-    /// the other is *input-derived* (peels to one of this function's entry-block
-    /// params). This is **sound**, not heuristic: the callee's frame is younger
-    /// than anything the caller could already name, so no incoming pointer (nor
-    /// anything offset from one) can reach the callee's locals. The alias graph
-    /// cannot express this — both partitions escape to calls/stores and collapse
-    /// to [`NodeId::Unknown`], which would otherwise force a "may alias" answer.
+    /// Two rules, both querying one own/caller-frame slot against an
+    /// *input-derived* value (one that peels to a non-`@SP` entry-block param):
+    ///
+    /// 1. **Own-frame (sound).** An own-frame local ([`FrameClass::Local`], an
+    ///    `@SP`-rooted slot below entry SP) never aliases an incoming pointer: the
+    ///    callee's frame is younger than anything the caller could already name. The
+    ///    alias graph cannot express this — both partitions escape and collapse to
+    ///    [`NodeId::Unknown`] — so this rule answers before that.
+    ///
+    /// 2. **Caller-frame (assumed).** A caller-frame slot ([`FrameClass::CallerFrame`],
+    ///    `@SP + k`, `k ≥ 0`: the return-address slot and incoming stack-argument
+    ///    slots) is taken disjoint from an incoming pointer *iff*
+    ///    [`Proposition::ArgsDisjointFromCallerFrame`] is recorded true for this
+    ///    function. This is **not** statically sound (a caller could pass the address
+    ///    of one of its outgoing-argument slots), so it fires only under the recorded
+    ///    assumption, which a verifier discharges and the checkpoint+replay driver
+    ///    rolls back if contradicted. It unblocks forwarding a caller-frame slot load
+    ///    across a store through an incoming pointer (the spilled-pointer reload).
     ///
     /// Inert (`false`) unless the result was built with
     /// [`AliasResult::with_frame_freshness`].
@@ -169,8 +188,32 @@ impl AliasResult {
         let Some(frame) = &self.frame else {
             return false;
         };
-        (frame.own_frame_locals.contains(&a) && self.is_input_derived(ctx, b))
+        // Rule 1: own-frame local ⊥ incoming pointer (sound).
+        if (frame.own_frame_locals.contains(&a) && self.is_input_derived(ctx, b))
             || (frame.own_frame_locals.contains(&b) && self.is_input_derived(ctx, a))
+        {
+            return true;
+        }
+        // Rule 2: caller-frame slot ⊥ incoming pointer, under the recorded
+        // assumption (validated by replay).
+        //
+        // Memory forwarding keys cells by their *affine base*, and every
+        // `@SP ± k` slot collapses to the bare `@SP` param (its base term) — so the
+        // value that actually reaches this query for a stack cell is `sp_param`,
+        // not the `@SP + k` instruction. We therefore also treat `sp_param` itself
+        // as a caller-frame base: `disjoint(incoming_ptr, @SP)` claims the pointer
+        // misses the *whole* own frame, which is the own-frame locals (sound by
+        // rule 1) plus the caller-frame slots (this assumption) — both hold, so the
+        // claim is justified. `caller_frame_slots` still covers the non-affine path
+        // (e.g. a realigned frame) where the instruction value is passed directly.
+        let caller_frame_assumed = ctx
+            .truth(Proposition::ArgsDisjointFromCallerFrame(frame.fid))
+            .is_some_and(|t| t.value);
+        let is_caller_frame =
+            |v: ValueId| v == frame.sp_param || frame.caller_frame_slots.contains(&v);
+        caller_frame_assumed
+            && ((is_caller_frame(a) && self.is_input_derived(ctx, b))
+                || (is_caller_frame(b) && self.is_input_derived(ctx, a)))
     }
 
     /// Whether `v` is an own-frame local under the populated frame-freshness
@@ -248,19 +291,28 @@ impl AliasResult {
         };
         let numbering = precompute_forms(ctx, fid);
         let mut own_frame_locals = HashSet::default();
+        let mut caller_frame_slots = HashSet::default();
         for block in Function::from_id(ctx, fid).blocks() {
             for insn in block.iter() {
                 let v = ValueId::Instruction(insn.id);
-                if frame_class(ctx, &numbering, sp, v) == Some(FrameClass::Local) {
-                    own_frame_locals.insert(v);
+                match frame_class(ctx, &numbering, sp, v) {
+                    Some(FrameClass::Local) => {
+                        own_frame_locals.insert(v);
+                    }
+                    Some(FrameClass::CallerFrame) => {
+                        caller_frame_slots.insert(v);
+                    }
+                    None => {}
                 }
             }
         }
         let root_block = Function::from_id(ctx, fid).root().map(|r| r.id);
         self.frame = Some(FrameInfo {
+            fid,
             root_block,
             sp_param: sp,
             own_frame_locals,
+            caller_frame_slots,
         });
         self
     }
@@ -401,5 +453,66 @@ mod tests {
         // Inert without the frame-freshness context.
         let plain = AliasResult::simple(&tc.ctx);
         assert!(!plain.provably_disjoint(&tc.ctx, local, arg));
+    }
+
+    /// Caller-frame rule: a caller-frame slot (`@SP + 8`) is disjoint from an
+    /// incoming pointer *only* when `ArgsDisjointFromCallerFrame` is recorded true
+    /// for the function — it is an assumption, not statically sound.
+    #[test]
+    fn caller_frame_disjoint_only_under_assumption() {
+        use qcode::{
+            assumption::Proposition,
+            builder::Builder,
+            testing::TestContext,
+            value::{BasicBlock, Function},
+        };
+
+        let mut tc = TestContext::new();
+        let sp_reg = tc.r0;
+        let fid = Function::make(&mut tc.ctx, "f".into()).unwrap().id;
+        let root = tc.ctx.get_or_make_block(0x1000);
+        {
+            let mut f = Function::from_id_mut(&mut tc.ctx, fid);
+            f.set_root(root).unwrap();
+            f.add_block(root);
+        }
+        let sp_pid = BasicBlock::from_id_mut(&mut tc.ctx, root).push_param(8).id;
+        tc.ctx.values.block_params[sp_pid].origin = Some(ValueId::Varnode(sp_reg));
+        let sp = ValueId::BlockParam(sp_pid);
+        let arg_pid = BasicBlock::from_id_mut(&mut tc.ctx, root).push_param(8).id;
+        let arg = ValueId::BlockParam(arg_pid);
+
+        let (caller_arg, arg_plus) = {
+            let mut b = Builder::from_block(BasicBlock::from_id_mut(&mut tc.ctx, root));
+            let c8 = b.context_mut().get_const(8, 8).id();
+            let caller_arg = b.push_add(sp, c8).id(); // @SP + 8  (caller-frame slot)
+            let arg_plus = b.push_add(arg, c8).id(); // arg + 8  (input-derived)
+            unsafe { b.dont_finalize() };
+            (caller_arg, arg_plus)
+        };
+
+        let r = AliasResult::simple(&tc.ctx).with_frame_freshness(&tc.ctx, fid, Some(sp_reg));
+
+        // Without the assumption, a caller-frame slot may alias an incoming pointer.
+        assert!(
+            !r.provably_disjoint(&tc.ctx, caller_arg, arg),
+            "caller-frame slot is not statically disjoint from an incoming pointer"
+        );
+
+        tc.ctx
+            .assume_true(Proposition::ArgsDisjointFromCallerFrame(fid));
+
+        assert!(
+            r.provably_disjoint(&tc.ctx, caller_arg, arg),
+            "under the assumption, @SP+8 ⊥ incoming pointer"
+        );
+        assert!(
+            r.provably_disjoint(&tc.ctx, arg_plus, caller_arg),
+            "symmetric, and applies to an offset from the incoming pointer"
+        );
+        assert!(
+            !r.provably_disjoint(&tc.ctx, caller_arg, sp),
+            "@SP is a frame pointer, not an incoming data pointer"
+        );
     }
 }

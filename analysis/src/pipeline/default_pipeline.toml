@@ -181,6 +181,18 @@ name = "post-bind"
 scope = "function"
 passes = ["dead_store", "dce"]
 
+# Assume each function's incoming pointer args are disjoint from its own
+# caller-frame slots, so the frame-freshness alias rule can forward a caller-frame
+# slot load across a store through an incoming pointer (the spilled-pointer reload
+# idiom argpromote relies on). Must run here, not in the pre-pipeline driver: the
+# `@SP` param it keys on is minted by the earlier `argpromote-registers`/`promote`
+# stages, so it does not exist before the pipeline runs. Recorded fresh each round;
+# verified (and rolled back on a proven collision) after the round.
+[[stage]]
+name = "assume-arg-frame"
+scope = "module"
+passes = ["assume_arg_frame"]
+
 # Functionalize memory side effects: rewrite a callee that mutates memory through
 # pointer params to operate on a private shadow copy and return its writes as a
 # `(address, value)` write-set, replayed at every caller. Runs once, late: it
@@ -243,7 +255,7 @@ passes = ["gvn", "dead_store", "dce"]
 [[stage]]
 name = "mark-pure"
 scope = "module"
-passes = ["mark_pure", "module(gvn)", "module(dce)", "module(dead_store)", "argpromote"]
+passes = ["mark_pure", "module(gvn)", "module(dce)", "module(dead_store)", "assume_arg_frame", "argpromote"]
 repeat_until = "no_change"
 
 # Aesthetic changes. `include_external` so the demangler also reaches imported

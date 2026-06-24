@@ -89,11 +89,7 @@ impl<'ctx, 'str> Mem2Reg<'ctx, 'str> {
         // of rescanning the whole function for each variable.
         let mut live_in_cache = LiveInBlocks::new(&*self.ctx, self.function_id);
 
-        let Promotable {
-            vars,
-            sizes,
-            no_root_params,
-        } = self.collect_promotable_vars(&mut live_in_cache);
+        let Promotable { vars, sizes } = self.collect_promotable_vars(&mut live_in_cache);
         if vars.is_empty() {
             return false;
         }
@@ -105,13 +101,7 @@ impl<'ctx, 'str> Mem2Reg<'ctx, 'str> {
             by_block: var_params,
             changed,
             excluded,
-        } = self.insert_block_params(
-            &vars,
-            &sizes,
-            &no_root_params,
-            &frontier,
-            &mut live_in_cache,
-        );
+        } = self.insert_block_params(&vars, &sizes, &frontier, &mut live_in_cache);
 
         // Drop vars whose promotion was declined (implicit-edge join); their
         // memory accesses stay in place, so renaming and store removal must not
@@ -321,11 +311,6 @@ fn register_clobber_index(
 struct Promotable {
     vars: HashSet<ValueId>,
     sizes: HashMap<ValueId, usize>,
-    /// Promoted vars that should not receive a function-entry param. These are
-    /// sub-register reads covered by a wider overlapping seed store (e.g. an EDX
-    /// read after argpromote's RDX seed). The initial load stays as a register
-    /// read, while later exact stores/loads can still be promoted in the body.
-    no_root_params: HashSet<ValueId>,
 }
 
 #[derive(Clone, Copy)]
@@ -669,29 +654,36 @@ impl Mem2Reg<'_, '_> {
         vars.retain(|var| !mixed_width.contains(var));
         sizes.retain(|var, _| vars.contains(var));
 
-        let no_root_params = vars
+        // mem2reg must never produce a root block param. A root param is a positional
+        // call argument, i.e. part of the by-value call interface that `argpromote`
+        // owns exclusively — mem2reg minting one (for a var live-in to the function)
+        // corrupts the `param[i] ↔ Call.args[i]` lockstep argpromote relies on and
+        // crashes it. So drop *every* var that is live-in to the root from the promotion
+        // set: the only thing that would turn such a var into a root param is the
+        // root-param path in `insert_block_params`, and with no live-in var promoted it
+        // never fires (and is asserted away below). These inputs stay as plain loads —
+        // correct (emulation reads the real incoming value); the legacy register-ABI
+        // summary still recognizes register inputs by raw-IR liveness
+        // (`compute_input_regs`), independent of any mem2reg param. A var written before
+        // it is read (RMW / local scratch) is not live-in and still promotes normally.
+        let root_id = self.root_id();
+        let root_live_in: Vec<ValueId> = vars
             .iter()
             .copied()
-            .filter(|&var| {
-                register_varnode(self.ctx, var).is_some()
-                    && register_stores
-                        .iter()
-                        .any(|&store| wider_register_store_contains(self.ctx, store, var))
-            })
+            .filter(|&var| self.live_in_blocks_cached(var, live_in_cache).contains(&root_id))
             .collect();
-
-        Promotable {
-            vars,
-            sizes,
-            no_root_params,
+        for var in root_live_in {
+            vars.remove(&var);
+            sizes.remove(&var);
         }
+
+        Promotable { vars, sizes }
     }
 
     fn insert_block_params(
         &mut self,
         vars: &HashSet<ValueId>,
         sizes: &HashMap<ValueId, usize>,
-        no_root_params: &HashSet<ValueId>,
         frontier: &HashMap<BlockId, HashSet<BlockId>>,
         live_in_cache: &mut LiveInBlocks,
     ) -> InsertedBlockParams {
@@ -753,18 +745,18 @@ impl Mem2Reg<'_, '_> {
                     .insert(var, param_id);
             }
 
-            // Add a root block param for variables that are live-in to the function
-            // (i.e. have some upward-exposed use not covered by any dominator store).
-            let root_id = self.root_id();
-            let root_has_param = var_params
-                .get(&root_id)
-                .is_some_and(|m| m.contains_key(&var));
-            if !root_has_param && live_in.contains(&root_id) && !no_root_params.contains(&var) {
-                let (param_id, inserted) =
-                    self.get_or_insert_param_for_var(root_id, size, var, var_name.as_deref());
-                changed |= inserted;
-                var_params.entry(root_id).or_default().insert(var, param_id);
-            }
+            // mem2reg never produces a root block param: the call interface (root
+            // params ↔ Call.args) is owned exclusively by argpromote. Every var live-in
+            // to the function root was dropped from the promotion set in
+            // `collect_promotable_vars`, so this point is unreachable for a root-live-in
+            // var — a register/stack *input* stays a plain load. (Non-root join params —
+            // phis — are still created above.)
+            debug_assert!(
+                !live_in.contains(&self.root_id()),
+                "mem2reg must not promote a root-live-in var ({var:?} in {}): the call \
+                 interface is argpromote's",
+                Function::from_id(self.ctx, self.function_id).name(),
+            );
         }
 
         InsertedBlockParams {
@@ -2406,22 +2398,13 @@ mod tests {
         crate::set_all_call_clobbered_regs(&mut tc.ctx);
 
         let aliases = AliasResult::simple(&tc.ctx);
-        assert!(mem2reg(&mut tc.ctx, caller, &aliases));
-        let entry_params_after_first = BasicBlock::from_id(&tc.ctx, entry).num_params();
-        assert_eq!(
-            entry_params_after_first, 1,
-            "the live-in r0 path should create exactly one entry param"
-        );
-
-        let aliases = AliasResult::simple(&tc.ctx);
-        assert!(
-            !mem2reg(&mut tc.ctx, caller, &aliases),
-            "the second run should converge instead of reporting a duplicate-param change"
-        );
+        mem2reg(&mut tc.ctx, caller, &aliases);
+        // mem2reg must NOT mint a root param for a live-in register input (here r0,
+        // live-in via the non-clobbered path): the call interface is argpromote's.
         assert_eq!(
             BasicBlock::from_id(&tc.ctx, entry).num_params(),
-            entry_params_after_first,
-            "re-running mem2reg must reuse the existing r0 entry param"
+            0,
+            "mem2reg must not mint a root param for a live-in register input"
         );
     }
 
@@ -2551,22 +2534,13 @@ mod tests {
         crate::set_all_call_clobbered_regs(&mut tc.ctx);
 
         let aliases = AliasResult::simple(&tc.ctx);
-        assert!(mem2reg(&mut tc.ctx, caller, &aliases));
-        let entry_params_after_first = BasicBlock::from_id(&tc.ctx, entry).num_params();
-        assert_eq!(
-            entry_params_after_first, 1,
-            "the live-in unnamed register should create exactly one entry param"
-        );
-
-        let aliases = AliasResult::simple(&tc.ctx);
-        assert!(
-            !mem2reg(&mut tc.ctx, caller, &aliases),
-            "the second run should converge instead of duplicating the unnamed entry param"
-        );
+        mem2reg(&mut tc.ctx, caller, &aliases);
+        // mem2reg must NOT mint a root param for a live-in register input: the call
+        // interface is argpromote's. The unnamed register stays a plain load.
         assert_eq!(
             BasicBlock::from_id(&tc.ctx, entry).num_params(),
-            entry_params_after_first,
-            "re-running mem2reg must reuse the existing unnamed-register entry param"
+            0,
+            "mem2reg must not mint a root param for a live-in register input"
         );
     }
 

@@ -333,49 +333,6 @@ pub fn compute_input_regs(ctx: &Context, function_id: FunctionId) -> Vec<Varnode
     inputs
 }
 
-/// Registers read on entry and restored unchanged before exit — the
-/// save/restore prologue/epilogue pattern (`push rbp` … `pop rbp`, lifted as
-/// `*[register]:8 RBP = @RBP;`).
-///
-/// mem2reg surfaces such a register as a root-block param whose incoming value
-/// is used *only* to be stored straight back to its own register. A saved
-/// register is preserved across any call, so it is neither a real input nor a
-/// clobber: marking it clobbered would wrongly tell callers their preserved copy
-/// is destroyed. Returned sorted by [`VarnodeId`].
-pub fn compute_saved_regs(ctx: &Context, function_id: FunctionId) -> Vec<VarnodeId> {
-    let Some(root) = Function::from_id(ctx, function_id).root().map(|b| b.id) else {
-        return Vec::new();
-    };
-
-    let mut saved: Vec<VarnodeId> = Vec::new();
-    for param in BasicBlock::from_id(ctx, root).params() {
-        let Some(name) = param.name() else { continue };
-        let Some(vn) = ctx.get_named(name).and_then(|v| v.as_varnode()) else {
-            continue;
-        };
-        if !is_register(ctx, vn) {
-            continue;
-        }
-        let param_id = param.id();
-        let users = ctx.users(param_id);
-        // Restored unchanged: at least one use, and every use stores this exact
-        // incoming value straight back to its own register.
-        let restored_only = !users.is_empty()
-            && users.iter().all(|&uid| {
-                matches!(
-                    ctx.get_insn(uid).mnemonic(),
-                    Mnemonic::Store(store)
-                        if store.ptr == ValueId::Varnode(vn) && store.src == param_id
-                )
-            });
-        if restored_only {
-            saved.push(vn);
-        }
-    }
-    saved.sort_by_key(|&vn| usize::from(vn));
-    saved
-}
-
 /// The net change a function applies to the stack pointer between entry and
 /// return, derived from the final stack-pointer write in each return-terminated
 /// block, decoded as a frame offset from the entry stack pointer.
@@ -457,21 +414,18 @@ pub fn set_function_summaries(ctx: &mut Context, function_id: FunctionId, stack_
 
     let stack_delta = compute_stack_delta(ctx, function_id, stack_ptr);
 
-    let saved_set: HashSet<VarnodeId> = compute_saved_regs(ctx, function_id).into_iter().collect();
-    // Register inputs (existing path). The saved/stack-pointer exclusions apply
-    // only to registers; stack-passed parameters are appended below untouched.
+    // Register inputs (existing path). The stack-pointer exclusion applies only to
+    // registers; stack-passed parameters are appended below untouched. (Saved-register
+    // detection — the push/pop-rbp pattern — is no longer computed here: it is handled
+    // by `argpromote`/`partial_inline`, which functionalize the save/restore directly.)
     let inputs: Vec<VarnodeId> = compute_input_regs(ctx, function_id)
         .into_iter()
-        .filter(|vn| !saved_set.contains(vn))
         .filter(|&vn| stack_delta.is_none() || vn != stack_ptr)
         .collect();
     let clobbered: Vec<VarnodeId> = compute_clobbered_regs(ctx, function_id)
         .into_iter()
-        .filter(|vn| !saved_set.contains(vn))
         .filter(|&vn| stack_delta.is_none() || vn != stack_ptr)
         .collect();
-    let mut saved: Vec<VarnodeId> = saved_set.into_iter().collect();
-    saved.sort_by_key(|&vn| usize::from(vn));
 
     // This function reads a passed pointer (or its own frame) unboundedly when it
     // has a dynamic stack access or forwards into an unbounded/indirect/external
@@ -485,7 +439,6 @@ pub fn set_function_summaries(ctx: &mut Context, function_id: FunctionId, stack_
     let mut f = Function::from_id_mut(ctx, function_id);
     f.set_input_regs(inputs);
     f.set_clobbered_regs(clobbered);
-    f.set_saved_regs(saved);
     f.set_reads_unbounded_stack(reads_unbounded);
     if let Some(delta) = stack_delta {
         f.set_stack_delta(delta);
@@ -673,43 +626,8 @@ mod tests {
     }
 
     #[test]
-    fn saved_and_restored_register_is_not_input_or_clobber() {
-        // The push rbp / pop rbp pattern: a register is read on entry and stored
-        // straight back unchanged at exit. mem2reg surfaces it as a root param
-        // whose only use is the restore store. It must be reported as `saved`, and
-        // excluded from both `inputs` and `clobbered` — marking it clobbered would
-        // wrongly tell callers their preserved copy is destroyed across the call.
-        let mut tc = TestContext::new();
-        let (r0, reg) = (tc.r0, tc.reg_space);
-        let fun = build_fn(&mut tc, "callee", 0x1000, |b| {
-            let v = b.push_load::<false>(ValueId::Varnode(r0), 8, reg).id();
-            b.push_store(v, ValueId::Varnode(r0), reg); // restore r0 unchanged
-        });
-
-        let aliases = crate::AliasResult::simple(&tc.ctx);
-        crate::mem2reg(&mut tc.ctx, fun, &aliases);
-        assert!(
-            compute_saved_regs(&tc.ctx, fun).contains(&r0),
-            "a saved-and-restored register must be detected as saved"
-        );
-
-        set_function_summaries(&mut tc.ctx, fun, tc.r3);
-        let f = Function::from_id(&tc.ctx, fun);
-        assert!(f.saved_regs().unwrap().contains(&r0));
-        assert!(
-            !f.input_regs().unwrap().contains(&r0),
-            "a saved register must not be reported as an input"
-        );
-        assert!(
-            !f.clobbered_regs().unwrap().contains(&r0),
-            "a saved register must not be reported as clobbered"
-        );
-    }
-
-    #[test]
-    fn register_written_with_new_value_is_clobber_not_saved() {
-        // A register the function overwrites with a fresh value is a genuine
-        // clobber, never a saved register.
+    fn register_written_with_new_value_is_clobber() {
+        // A register the function overwrites with a fresh value is a genuine clobber.
         let mut tc = TestContext::new();
         let (r0, reg) = (tc.r0, tc.reg_space);
         let fun = build_fn(&mut tc, "callee", 0x1000, |b| {
@@ -720,10 +638,6 @@ mod tests {
         set_function_summaries(&mut tc.ctx, fun, tc.r3);
         let f = Function::from_id(&tc.ctx, fun);
         assert!(f.clobbered_regs().unwrap().contains(&r0));
-        assert!(
-            !f.saved_regs().unwrap().contains(&r0),
-            "an overwritten register is a clobber, not a saved register"
-        );
     }
 
     // -----------------------------------------------------------------------

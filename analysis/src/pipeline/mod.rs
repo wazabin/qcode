@@ -38,8 +38,8 @@ use qcode::{
 };
 
 use crate::{
-    assume_call_returns, learn_stack_facts, seed_stack_facts, verify_assumptions,
-    verify_forced_returns,
+    assume_call_returns, learn_stack_facts, seed_stack_facts,
+    verify_args_disjoint_caller_frame, verify_assumptions, verify_forced_returns,
 };
 
 /// Maximum checkpoint+replay rounds the overrides-aware driver attempts before
@@ -568,6 +568,12 @@ async fn run_analysis_fixpoint<'s>(
         // Re-apply the stack-escape facts proven in earlier rounds so this round's
         // mem2reg/summary passes observe them (mirrors `assume_call_returns`).
         seed_stack_facts(&mut ctx);
+        // The `ArgsDisjointFromCallerFrame` assumption is recorded *inside* the
+        // pipeline (the `assume-arg-frame` stage, before each `argpromote`): the
+        // `@SP` param it keys on is minted mid-pipeline, so it cannot be assumed
+        // here on the raw baseline. It is verified below (and rolled back if a
+        // caller is proven to pass a colliding pointer).
+        let sp_reg = ctx.registers.get(&cfg.stack_pointer).copied();
         progress.report(PipelineProgress::AssumptionsRecorded { round, count });
 
         pipeline
@@ -585,7 +591,9 @@ async fn run_analysis_fixpoint<'s>(
         // frame-escaping caller all change what earlier passes would have done,
         // so the round must replay with the fact seeded. Knowledge only grows,
         // hence termination.
-        let novel = verify_assumptions(&mut ctx) + learn_stack_facts(&mut ctx);
+        let novel = verify_assumptions(&mut ctx)
+            + learn_stack_facts(&mut ctx)
+            + verify_args_disjoint_caller_frame(&mut ctx, sp_reg);
 
         if bounded {
             // verify_assumptions skips facts already *known* (the overrides), so

@@ -227,6 +227,11 @@ impl<'str> ValueRegistry<'str> {
             if let Some(target) = mnemonic.call_target() {
                 affected_targets.insert(target);
             }
+            // Tombstone it. Registry IDs are stable indices and cannot be reclaimed, so
+            // the entry stays in the arena; marking it deleted keeps `Context::instructions`
+            // (and any whole-program scan built on it) from yielding the stale operands it
+            // still carries.
+            self.instructions[id].deleted = true;
         }
         for arg in affected_args {
             if let Some(users) = self.users.get_mut(&arg) {

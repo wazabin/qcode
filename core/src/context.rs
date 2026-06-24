@@ -388,6 +388,7 @@ impl<'str> Context<'str> {
         self.values
             .instructions
             .iter()
+            .filter(|i| !i.deleted)
             .map(|i| Instruction::from_id(self, i.id))
     }
 
@@ -1179,6 +1180,44 @@ mod tests {
         assert!(
             ctx.users(load_id).is_empty(),
             "load should have no users after add is removed"
+        );
+    }
+
+    #[test]
+    fn removed_instruction_is_tombstoned_and_not_iterated() {
+        // Registry IDs are stable, so a removed instruction stays in the arena — but it
+        // must be tombstoned and skipped by `ctx.instructions()`, so the stale operands
+        // it still carries (e.g. its `Load.ptr`) never pollute a whole-program scan.
+        // Regression: a deleted ram load kept showing up in the alias pass's pointer
+        // scan, faking a "pointer used in two spaces" invariant break.
+        let mut ctx = Context::new();
+        qcode!(
+            ctx,
+            "
+            varnode i64 x;
+            <block>
+                %a = load(i64, &x);
+                %dead = %a + i64 1;
+                return [i64 0];
+            "
+        );
+        let ids: Vec<_> = BasicBlock::from_id(&ctx, block).instruction_ids().to_vec();
+        let dead_id = ids[1]; // %dead, unused
+
+        assert!(
+            ctx.instructions().any(|i| i.id == dead_id),
+            "the instruction is iterated while live"
+        );
+
+        ctx.remove_instruction(dead_id);
+
+        assert!(
+            ctx.get_insn(dead_id).is_deleted(),
+            "a removed instruction must be tombstoned"
+        );
+        assert!(
+            !ctx.instructions().any(|i| i.id == dead_id),
+            "a deleted instruction must not be yielded by ctx.instructions()"
         );
     }
 

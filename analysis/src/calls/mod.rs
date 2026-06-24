@@ -21,6 +21,6 @@ pub use partial_inline::partial_inline;
 pub use projection::{Projection, project_return, return_field};
 pub use stack_facts::{learn_stack_facts, seed_stack_facts};
 pub use summaries::{
-    compute_call_clobbered_regs, compute_input_regs, compute_saved_regs, compute_stack_delta,
+    compute_call_clobbered_regs, compute_input_regs, compute_stack_delta,
     set_all_call_clobbered_regs, set_all_function_summaries, set_function_summaries,
 };
