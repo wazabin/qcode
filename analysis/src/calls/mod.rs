@@ -6,6 +6,7 @@ mod argpromote;
 mod clobbered;
 mod dead_signature;
 mod interface;
+mod loop_to_map;
 mod partial_inline;
 mod projection;
 mod stack_facts;
