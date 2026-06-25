@@ -635,7 +635,10 @@ impl<'str> Context<'str> {
     pub fn get_bytes(&mut self, data: Vec<u8>) -> crate::value::BytesRef<'str, '_> {
         let i8_ty = self.types.get_or_make_int(1);
         let type_id = self.types.get_or_make_array(i8_ty, data.len());
-        let id = self.values.bytes.push(crate::value::Bytes { data, type_id });
+        let id = self
+            .values
+            .bytes
+            .push(crate::value::Bytes { data, type_id });
         crate::value::BytesRef::new(self, id)
     }
 

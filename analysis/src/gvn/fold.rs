@@ -903,7 +903,9 @@ mod tests {
     fn range_of_bytes_downconverts_to_literal() {
         let mut ctx = Context::new();
         let src = ctx
-            .get_bytes(vec![0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88, 0x99, 0xaa])
+            .get_bytes(vec![
+                0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88, 0x99, 0xaa,
+            ])
             .id();
 
         let folded = constant_folding(
@@ -921,7 +923,10 @@ mod tests {
             panic!("expected a numeric literal, got {folded:?}");
         };
         // bytes 2..6 = 33 44 55 66, little-endian => 0x66554433
-        assert_eq!(qcode::value::LiteralRef::new(&ctx, lid).value(), 0x6655_4433);
+        assert_eq!(
+            qcode::value::LiteralRef::new(&ctx, lid).value(),
+            0x6655_4433
+        );
     }
 
     /// Extracting > 8 bytes from a byte blob yields a narrower byte blob.

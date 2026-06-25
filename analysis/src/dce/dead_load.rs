@@ -220,6 +220,62 @@ fn fully_covered(set: &[(i64, i64)], range: (i64, i64)) -> bool {
     covered >= range.1
 }
 
+/// A byte interval overwritten before any read, keyed by an [`AddrBase`] so
+/// instruction-computed pointers (`p`, `p + 4`, …) — which have no entry in the
+/// alias interval map (`value_to_interval` only holds `Literal`/`Varnode` keys)
+/// — can still be proven covered by a later store to the same base.
+///
+/// Purely block-local: created and consumed within a single backward scan, never
+/// seeded or propagated across blocks. That keeps it sound without any
+/// escape/locality proof — a kill only exists because a *later store in this same
+/// block* must-covers the victim, so the victim is overwritten before any exit.
+#[derive(Clone, Copy)]
+struct RelKill {
+    space: SpaceId,
+    base: AddrBase,
+    start: i64,
+    end: i64,
+}
+
+/// True when the kills sharing `(space, base)` fully cover `range`.
+fn rel_fully_covered(kills: &[RelKill], space: SpaceId, base: AddrBase, range: (i64, i64)) -> bool {
+    let set: Vec<(i64, i64)> = kills
+        .iter()
+        .filter(|k| k.space == space && k.base == base)
+        .map(|k| (k.start, k.end))
+        .collect();
+    fully_covered(&set, range)
+}
+
+/// Drop kills a load at `(space, base, range)` may read. Same-base kills have the
+/// read range punched out (possibly splitting an interval); a kill on a
+/// different — hence incomparable — base in the same space cannot be proven
+/// disjoint from the read and is dropped (mirrors the absolute path dropping
+/// same-space kills on an unknown read location).
+fn rel_punch_on_load(kills: &mut Vec<RelKill>, space: SpaceId, base: AddrBase, range: (i64, i64)) {
+    let mut next = Vec::with_capacity(kills.len());
+    for k in kills.drain(..) {
+        if k.space != space {
+            next.push(k);
+        } else if k.base != base {
+            // Incomparable / possibly-aliasing read: cannot keep the kill.
+        } else if k.end <= range.0 || k.start >= range.1 {
+            next.push(k);
+        } else {
+            if k.start < range.0 {
+                next.push(RelKill { end: range.0, ..k });
+            }
+            if k.end > range.1 {
+                next.push(RelKill {
+                    start: range.1,
+                    ..k
+                });
+            }
+        }
+    }
+    *kills = next;
+}
+
 fn remove_overlap(set: &mut Vec<(i64, i64)>, range: (i64, i64)) {
     let mut result = Vec::new();
     for &(s, e) in set.iter() {
@@ -368,6 +424,9 @@ fn scan_block_aliased(
         .to_vec();
     let mut live = live_seed.to_vec();
     let mut killed = killed_seed.to_vec();
+    // Block-local overwrite tracking for instruction-computed pointers (which
+    // have no alias interval). Never seeded/propagated — see [`RelKill`].
+    let mut rel_killed: Vec<RelKill> = Vec::new();
 
     // In a `pure_reg` function the whole architectural register file is
     // functionalized into the returned write-set tuple — callers replay every
@@ -389,6 +448,10 @@ fn scan_block_aliased(
                     // Unknown read location: conservatively drop same-space kills.
                     None => killed.retain(|k| k.space != load.space),
                 }
+                // Relative path: a read of `base + off` clears any same-base
+                // overwrite it overlaps, and any incomparable same-space kill.
+                let (lb, lo) = addr_key(ctx, load.ptr);
+                rel_punch_on_load(&mut rel_killed, load.space, lb, (lo, lo + load.size as i64));
                 live.push(LiveLoc {
                     ptr: load.ptr,
                     size: load.size,
@@ -401,7 +464,13 @@ fn scan_block_aliased(
                 let no_live_reader = !live
                     .iter()
                     .any(|l| l.space == store.space && aliases.may_alias(ctx, ptr, l.ptr));
-                let is_killed = ptr_iv.is_some_and(|iv| fully_covered_iv(&killed, iv));
+                // Relative coverage for instruction-computed pointers with no
+                // alias interval: a later store to the same base must-covers this
+                // one. Sound for any space (RAM included) — overwrite before exit.
+                let (sb, so) = addr_key(ctx, ptr);
+                let rel_range = (so, so + store.size as i64);
+                let is_killed = ptr_iv.is_some_and(|iv| fully_covered_iv(&killed, iv))
+                    || rel_fully_covered(&rel_killed, store.space, sb, rel_range);
                 let is_dead_reg = dead_regs.contains(&ptr)
                     || (regs_dead_at_exit && is_reg_space(ctx, store.space));
                 if no_live_reader && (is_killed || is_dead_reg) {
@@ -413,6 +482,12 @@ fn scan_block_aliased(
                     if let Some(iv) = ptr_iv {
                         killed.push(iv);
                     }
+                    rel_killed.push(RelKill {
+                        space: store.space,
+                        base: sb,
+                        start: rel_range.0,
+                        end: rel_range.1,
+                    });
                 }
             }
             // An `externally_resolved` call reads no registers and writes exactly
@@ -430,6 +505,9 @@ fn scan_block_aliased(
                     live.retain(|l| l.space != iv.space || !killed_covers_loc(ctx, iv, l));
                     killed.push(iv);
                 }
+                // A callee may read memory through pointer arguments, so no
+                // relative (RAM/temp) overwrite survives across the call.
+                rel_killed.clear();
             }
             // Any other call may read any register before its continuation
             // overwrites it, so a register store preceding the call cannot be proven
@@ -440,6 +518,9 @@ fn scan_block_aliased(
             // alive so the callee's entry stack pointer is seeded correctly.
             Mnemonic::Call(_) | Mnemonic::CallInd(_) => {
                 killed.retain(|k| !is_reg_space(ctx, k.space));
+                // The callee may read any memory it can reach (pointer args,
+                // globals), so drop every relative overwrite at the barrier.
+                rel_killed.clear();
             }
             _ => {}
         }
@@ -854,6 +935,96 @@ mod tests {
             !unread_temp_space_stores(&ctx, fid).contains(&store_id),
             "temp-space store must be kept when an overlapping offset is read"
         );
+    }
+
+    /// Build a one-block function modeling the array-build idiom: a base pointer
+    /// (`@ESP - k` in real IR, an opaque load here), several constant 4-byte RAM
+    /// stores at `base + 0/4/8`, then a wide store covering them. The covering
+    /// store must-covers each narrow one (same symbolic base, contained offsets),
+    /// so all three are dead — even though they are RAM-space stores through
+    /// instruction-computed pointers with no alias interval. `with_read` inserts a
+    /// load of `base + 4` between the narrow stores and the covering store.
+    fn array_build_block(with_read: bool) -> (Context<'static>, BlockId) {
+        build_block(|b| {
+            let r1 = b.context().get_named("r1").unwrap().as_varnode().unwrap();
+            let regsp = reg_space(b.context());
+            let ram = b.context().default_space;
+            let base = b.push_load::<false>(ValueId::Varnode(r1), 8, regsp).id();
+
+            let at = |b: &mut Builder<'static, '_>, off: u64| {
+                if off == 0 {
+                    base
+                } else {
+                    let c = b.context_mut().get_const(off, 8).id();
+                    ValueId::Instruction(b.push_add(base, c).id)
+                }
+            };
+
+            for off in [0u64, 4, 8] {
+                let v = b.context_mut().get_const(0x1111_1111 + off, 4).id();
+                let p = at(b, off);
+                b.push_store(v, p, ram);
+            }
+
+            if with_read {
+                // A read of base+4 before the overwrite keeps that store live.
+                let p = at(b, 4);
+                let v = b.push_load::<false>(p, 4, ram).id();
+                b.push_store(v, ValueId::Varnode(r1), regsp);
+            }
+
+            // Covering 12-byte store at base+0.
+            let blob = b.context_mut().get_bytes(vec![0u8; 12]).id();
+            b.push_store(blob, base, ram);
+        })
+    }
+
+    fn ram_stores(ctx: &Context, block_id: BlockId) -> Vec<InstructionId> {
+        BasicBlock::from_id(ctx, block_id)
+            .instruction_ids()
+            .iter()
+            .copied()
+            .filter(|&id| matches!(ctx.get_insn(id).mnemonic(), Mnemonic::Store(_)))
+            .collect()
+    }
+
+    /// RAM stores through `base + off` pointers (no alias interval) are killed by
+    /// a later wide store to the same base — the array-build dead-store case.
+    #[test]
+    fn ram_stores_covered_by_wide_store_are_dead() {
+        let (ctx, block_id) = array_build_block(false);
+        let aliases = AliasResult::simple(&ctx);
+        let dead = dead_load_insns(&ctx, block_id, Some(&aliases), &[]);
+
+        let stores = ram_stores(&ctx, block_id);
+        assert_eq!(stores.len(), 4, "three narrow stores + one covering store");
+        for (i, &s) in stores[..3].iter().enumerate() {
+            assert!(dead.contains(&s), "narrow store {i} is covered → dead");
+        }
+        assert!(
+            !dead.contains(&stores[3]),
+            "the covering store is live (it is the surviving value)"
+        );
+    }
+
+    /// Soundness: a read of the region before the covering store keeps the
+    /// narrow stores live (their value is observed before the overwrite). The
+    /// live-reader test is class-based, so a single same-base read conservatively
+    /// protects every same-base store — the point is that none are wrongly killed.
+    #[test]
+    fn ram_stores_kept_when_read_before_overwrite() {
+        let (ctx, block_id) = array_build_block(true);
+        let aliases = AliasResult::simple(&ctx);
+        let dead = dead_load_insns(&ctx, block_id, Some(&aliases), &[]);
+
+        // Stores in program order: base+0, base+4, base+8, [read's reg store], cover.
+        let stores = ram_stores(&ctx, block_id);
+        for (i, &s) in stores[..3].iter().enumerate() {
+            assert!(
+                !dead.contains(&s),
+                "narrow store {i} is read before the overwrite → must be kept"
+            );
+        }
     }
 
     /// Build a one-block caller that stores `0x1` into register `r`, then calls

@@ -4,8 +4,8 @@ use crate::{
     value::{
         ValueId,
         block::{BasicBlock, BlockId, EdgeData, EdgeId},
-        bytes::{Bytes, BytesId},
         block_param::{BlockParam, BlockParamId},
+        bytes::{Bytes, BytesId},
         function::{Function, FunctionId},
         insn::{Instruction, InstructionId},
         literal::{Literal, LiteralId},
