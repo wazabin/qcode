@@ -461,9 +461,16 @@ fn scan_block_aliased(
             Mnemonic::Store(store) => {
                 let ptr = store.ptr;
                 let ptr_iv = aliases.interval(ptr).map(KilledInterval::from_alias);
-                let no_live_reader = !live
-                    .iter()
-                    .any(|l| l.space == store.space && aliases.may_alias(ctx, ptr, l.ptr));
+                // A live load blocks the store only if it may-alias *and* is not
+                // provably offset-disjoint: `may_alias` is class-based (true for
+                // any same-base access), so refine it with the offset-precise
+                // `disjoint_access` so a disjoint read of `base + k` does not pin
+                // an unrelated `base + j` store.
+                let no_live_reader = !live.iter().any(|l| {
+                    l.space == store.space
+                        && aliases.may_alias(ctx, ptr, l.ptr)
+                        && !disjoint_access(ctx, ptr, store.size, l.ptr, l.size)
+                });
                 // Relative coverage for instruction-computed pointers with no
                 // alias interval: a later store to the same base must-covers this
                 // one. Sound for any space (RAM included) — overwrite before exit.
@@ -1007,24 +1014,30 @@ mod tests {
         );
     }
 
-    /// Soundness: a read of the region before the covering store keeps the
-    /// narrow stores live (their value is observed before the overwrite). The
-    /// live-reader test is class-based, so a single same-base read conservatively
-    /// protects every same-base store — the point is that none are wrongly killed.
+    /// Offset-precise liveness: a read of `base + 4` before the covering store
+    /// keeps *only* the `base + 4` store live; the disjoint `base + 0` / `base + 8`
+    /// stores are still dead. Without `disjoint_access` the class-based
+    /// `may_alias` would conservatively pin all three.
     #[test]
-    fn ram_stores_kept_when_read_before_overwrite() {
+    fn ram_store_kept_only_for_read_offset() {
         let (ctx, block_id) = array_build_block(true);
         let aliases = AliasResult::simple(&ctx);
         let dead = dead_load_insns(&ctx, block_id, Some(&aliases), &[]);
 
         // Stores in program order: base+0, base+4, base+8, [read's reg store], cover.
         let stores = ram_stores(&ctx, block_id);
-        for (i, &s) in stores[..3].iter().enumerate() {
-            assert!(
-                !dead.contains(&s),
-                "narrow store {i} is read before the overwrite → must be kept"
-            );
-        }
+        assert!(
+            !dead.contains(&stores[1]),
+            "store to base+4 is read before the overwrite → kept"
+        );
+        assert!(
+            dead.contains(&stores[0]),
+            "base+0 is disjoint from the read → still dead"
+        );
+        assert!(
+            dead.contains(&stores[2]),
+            "base+8 is disjoint from the read → still dead"
+        );
     }
 
     /// Build a one-block caller that stores `0x1` into register `r`, then calls
