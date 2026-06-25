@@ -84,8 +84,10 @@ pub enum RootOp {
 pub type IntrinsicEval = fn(&[(u128, usize)], usize) -> Option<u128>;
 
 /// Recognizer for an intrinsic's raw-IR idiom, returning the intrinsic's
-/// operands when the instruction matches.
-pub type IntrinsicRecognize = fn(&Context, InstructionId) -> Option<Vec<ValueId>>;
+/// operands when the instruction matches. Takes `&mut Context` so a matcher may
+/// materialize literals for derived operands (e.g. a rotate amount recovered as
+/// the `log2` of a strength-reduced multiplier).
+pub type IntrinsicRecognize = fn(&mut Context, InstructionId) -> Option<Vec<ValueId>>;
 
 /// Algebraic simplifier for an intrinsic. Receives the intrinsic's
 /// [`IntrinsicId`] (so a shared simplifier can branch on which intrinsic it is,

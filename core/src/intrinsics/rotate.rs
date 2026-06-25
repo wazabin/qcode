@@ -38,12 +38,40 @@ fn eval_ror(args: &[(u128, usize)], out_size: usize) -> Option<u128> {
     eval_rotate(args, out_size, false)
 }
 
+/// The left-shift side of the rotate idiom: a real `x << c1`, or the
+/// strength-reduced `x * 2^c1` (either operand order) that affine
+/// canonicalization leaves behind. Returns `(x, c1, amount)` where `c1` is the
+/// shift count and `amount` is the existing literal for it when the source was
+/// a shift (so the caller can reuse it), or `None` for the multiply form (whose
+/// amount must be materialized).
+fn as_shl_idiom(ctx: &Context, v: ValueId) -> Option<(ValueId, u64, Option<ValueId>)> {
+    // Canonical shift form: `x << c1`.
+    if let Some((x, c)) = as_int_binop(ctx, v, IntBinop::ShiftLeft) {
+        let cv = const_u64(ctx, c)?;
+        return Some((x, cv, Some(c)));
+    }
+    // Strength-reduced form: `x * 2^c1` (or `2^c1 * x`). Recover the shift count
+    // as the log2 of the power-of-two multiplier.
+    if let Some((a, b)) = as_int_binop(ctx, v, IntBinop::Mul) {
+        let (x, m) = match (const_u64(ctx, b), const_u64(ctx, a)) {
+            (Some(m), _) => (a, m),
+            (None, Some(m)) => (b, m),
+            _ => return None,
+        };
+        if m.is_power_of_two() {
+            return Some((x, m.trailing_zeros() as u64, None));
+        }
+    }
+    None
+}
+
 /// Recognize `(x << c1) | (x >> c2)` with `c1 + c2 == bits` as `rol(x, c1)`.
 ///
-/// Tries both operand orderings of the `or`. The constant ror idiom is
-/// captured here too: `ror(x, c2)` has the same shape and is represented as
-/// `rol(x, bits - c2)`.
-fn recognize_rol(ctx: &Context, root: crate::value::InstructionId) -> Option<Vec<ValueId>> {
+/// Tries both operand orderings of the `or`, and accepts the strength-reduced
+/// `x * 2^c1` in place of `x << c1` (see [`as_shl_idiom`]). The constant ror
+/// idiom is captured here too: `ror(x, c2)` has the same shape and is
+/// represented as `rol(x, bits - c2)`.
+fn recognize_rol(ctx: &mut Context, root: crate::value::InstructionId) -> Option<Vec<ValueId>> {
     let root_size = ctx.get_insn(root).size();
     let bits = (root_size * 8) as u64;
     if bits == 0 {
@@ -54,7 +82,7 @@ fn recognize_rol(ctx: &Context, root: crate::value::InstructionId) -> Option<Vec
 
     // (shl_side, shr_side) — try both orderings of the commutative `or`.
     for (shl_side, shr_side) in [(lhs, rhs), (rhs, lhs)] {
-        let Some((x1, c1)) = as_int_binop(ctx, shl_side, IntBinop::ShiftLeft) else {
+        let Some((x1, c1v, c1_amount)) = as_shl_idiom(ctx, shl_side) else {
             continue;
         };
         let Some((x2, c2)) = as_int_binop(ctx, shr_side, IntBinop::ShiftRight) else {
@@ -63,14 +91,24 @@ fn recognize_rol(ctx: &Context, root: crate::value::InstructionId) -> Option<Vec
         if x1 != x2 {
             continue;
         }
-        let (Some(c1v), Some(c2v)) = (const_u64(ctx, c1), const_u64(ctx, c2)) else {
+        let Some(c2v) = const_u64(ctx, c2) else {
             continue;
         };
         if c1v == 0 || c2v == 0 || c1v + c2v != bits {
             continue;
         }
-        // rol(x, c1): reuse the left-shift amount as the rotate amount.
-        return Some(vec![x1, c1]);
+        // rol(x, c1): reuse the left-shift amount literal when present, else
+        // materialize one (sized like the right-shift amount) for the `x * 2^c1`
+        // form.
+        let amount = match c1_amount {
+            Some(existing) => existing,
+            None => {
+                let amt_ty = ctx.type_of(c2);
+                let amt_size = ctx.types.size_of(amt_ty);
+                ctx.get_const(c1v, amt_size).id()
+            }
+        };
+        return Some(vec![x1, amount]);
     }
     None
 }
