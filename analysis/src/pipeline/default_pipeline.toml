@@ -89,6 +89,17 @@ name = "argpromote-registers"
 scope = "module"
 passes = ["argpromote_registers"]
 
+# Resolve arguments at calls to bodyless external (imported) functions from their
+# cabi C prototype, while register/stack accesses are still explicit (like
+# argpromote-registers above): insert each argument's load just before the call —
+# a register reload (System V) or an SP-relative stack load (32-bit stdcall, and
+# System V overflow) — so the following promote/gvn forwards it onto the value the
+# caller set up (a register write, or the push that wrote the stack slot).
+[[stage]]
+name = "external-args"
+scope = "module"
+passes = ["argpromote_external"]
+
 # Promote to a fixpoint on the real incoming stack pointer `@SP` (no `@stack_base`
 # round-trip). Each round: `canonicalize_sp_slots` unifies the per-site `@SP ± N`
 # address instructions into one representative per offset; `mem2reg` forwards the

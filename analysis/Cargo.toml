@@ -6,6 +6,10 @@ license.workspace = true
 description = "Optimization passes for the qcode IR: GVN, DCE, dead-store elimination, alias analysis"
 repository.workspace = true
 
+[features]
+# Forward to cabi's Win32 prototype tables (mingw-w64). Off by default; see cabi.
+win32 = ["cabi/win32"]
+
 [dependencies]
 jstd.workspace = true
 qcode.workspace = true

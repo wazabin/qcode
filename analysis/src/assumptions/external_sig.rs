@@ -9,9 +9,9 @@
 //! once an external callee has a signature, the argument-producing passes can
 //! produce real arguments at its call sites.
 
-use cabi::{CFunctionProto, CType};
+use cabi::{AbiTarget, CFunctionProto, CType};
 use qcode::{
-    context::Context,
+    context::{Context, TargetOs},
     value::{Function, FunctionId, VarnodeId},
 };
 
@@ -30,9 +30,21 @@ impl Pass for ExternalSigs {
     }
 
     fn run(&self, ctx: &mut Context, env: &PipelineEnv) -> Result<bool, String> {
-        apply_all_external_signatures(ctx, &env.cfg.abi);
+        let target = abi_target(ctx, env);
+        apply_all_external_signatures(ctx, &env.cfg.abi, target);
         Ok(false)
     }
+}
+
+/// The cabi table to consult for this binary: its platform (from the container
+/// format) and pointer width.
+fn abi_target(ctx: &Context, env: &PipelineEnv) -> AbiTarget {
+    let platform = match ctx.target_os() {
+        TargetOs::Windows => cabi::Platform::Windows,
+        // ELF/unknown binaries use the SysV/libc (host) table.
+        TargetOs::Linux | TargetOs::Unknown => cabi::Platform::Linux,
+    };
+    AbiTarget::new(platform, env.cfg.bitness)
 }
 
 crate::register_module_pass!(ExternalSigs);
@@ -53,9 +65,11 @@ enum Class {
 /// builtin typedefs (e.g. `size_t`). Using the full register is ABI-correct.
 fn classify(ty: &CType) -> Option<Class> {
     match ty {
-        CType::Integer { .. } | CType::Pointer => Some(Class::Integer),
+        CType::Integer { .. } | CType::Pointer { .. } => Some(Class::Integer),
         CType::Float { .. } => Some(Class::Sse),
-        CType::Void | CType::Other => None,
+        // By-value aggregates use the memory/split classes, which we do not
+        // model; treat them (like `void`) as unmappable.
+        CType::Void | CType::Struct { .. } | CType::Other => None,
     }
 }
 
@@ -73,7 +87,7 @@ fn map_prototype(
 ) -> Option<(Vec<VarnodeId>, Vec<VarnodeId>)> {
     // An aggregate return uses a hidden pointer argument (memory class), which
     // would shift every argument. Rather than mis-map, skip the function.
-    if matches!(proto.return_type, CType::Other) {
+    if matches!(proto.return_type, CType::Other | CType::Struct { .. }) {
         return None;
     }
 
@@ -112,7 +126,12 @@ fn map_prototype(
 }
 
 /// Assign a signature to `fun_id` if it is a known external function.
-pub fn apply_external_signature(ctx: &mut Context, fun_id: FunctionId, abi: &CallingConvention) {
+pub fn apply_external_signature(
+    ctx: &mut Context,
+    fun_id: FunctionId,
+    abi: &CallingConvention,
+    target: AbiTarget,
+) {
     if abi.int_args.is_empty() {
         return; // no convention for this architecture
     }
@@ -123,7 +142,7 @@ pub fn apply_external_signature(ctx: &mut Context, fun_id: FunctionId, abi: &Cal
     // symbol is the part before the first `@`.
     let raw = Function::from_id(ctx, fun_id).name().to_string();
     let name = raw.split('@').next().unwrap_or(&raw);
-    let Some(proto) = cabi::lookup(name) else {
+    let Some(proto) = cabi::lookup(target, name) else {
         return;
     };
     let Some((inputs, outputs)) = map_prototype(proto, abi) else {
@@ -136,7 +155,11 @@ pub fn apply_external_signature(ctx: &mut Context, fun_id: FunctionId, abi: &Cal
 }
 
 /// Apply [`apply_external_signature`] to every external function.
-pub fn apply_all_external_signatures(ctx: &mut Context, abi: &CallingConvention) {
+pub fn apply_all_external_signatures(
+    ctx: &mut Context,
+    abi: &CallingConvention,
+    target: AbiTarget,
+) {
     if abi.int_args.is_empty() {
         return;
     }
@@ -146,7 +169,7 @@ pub fn apply_all_external_signatures(ctx: &mut Context, abi: &CallingConvention)
         .map(|f| f.id)
         .collect();
     for id in ids {
-        apply_external_signature(ctx, id, abi);
+        apply_external_signature(ctx, id, abi, target);
     }
 }
 
@@ -177,13 +200,24 @@ mod tests {
         Function::make_external(&mut tc.ctx, 0x9000, Some(name.to_string().into())).id
     }
 
+    /// The cabi table extracted for this build host (where the libc symbols the
+    /// tests look up actually live). The toy ABI is 64-bit.
+    fn host() -> AbiTarget {
+        let platform = if cfg!(windows) {
+            cabi::Platform::Windows
+        } else {
+            cabi::Platform::Linux
+        };
+        AbiTarget::new(platform, 64)
+    }
+
     #[test]
     fn integer_and_pointer_params_take_gp_registers() {
         // memcpy(void*, const void*, size_t) -> three INTEGER-class args.
         let mut tc = TestContext::new();
         let abi = toy_abi(&tc);
         let f = external(&mut tc, "memcpy");
-        apply_external_signature(&mut tc.ctx, f, &abi);
+        apply_external_signature(&mut tc.ctx, f, &abi, host());
         // Only two GP registers exist in the toy ABI; the third arg is stack.
         let inputs = Function::from_id(&tc.ctx, f).input_regs().unwrap();
         assert_eq!(inputs, [tc.r0, tc.r1]);
@@ -204,7 +238,7 @@ mod tests {
         let mut tc = TestContext::new();
         let abi = toy_abi(&tc);
         let f = external(&mut tc, "pow");
-        apply_external_signature(&mut tc.ctx, f, &abi);
+        apply_external_signature(&mut tc.ctx, f, &abi, host());
         let inputs = Function::from_id(&tc.ctx, f).input_regs().unwrap();
         assert_eq!(inputs, [tc.r2]);
     }
@@ -214,7 +248,7 @@ mod tests {
         let mut tc = TestContext::new();
         let abi = toy_abi(&tc);
         let f = external(&mut tc, "definitely_not_a_libc_function_xyz");
-        apply_external_signature(&mut tc.ctx, f, &abi);
+        apply_external_signature(&mut tc.ctx, f, &abi, host());
         assert!(Function::from_id(&tc.ctx, f).signature().is_none());
     }
 
@@ -222,7 +256,7 @@ mod tests {
     fn empty_abi_is_a_noop() {
         let mut tc = TestContext::new();
         let f = external(&mut tc, "memcpy");
-        apply_external_signature(&mut tc.ctx, f, &CallingConvention::default());
+        apply_external_signature(&mut tc.ctx, f, &CallingConvention::default(), host());
         assert!(Function::from_id(&tc.ctx, f).signature().is_none());
     }
 }
