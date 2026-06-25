@@ -60,6 +60,12 @@ fn impurity(ctx: &Context, m: &Mnemonic) -> Option<&'static str> {
         Mnemonic::BranchInd(_) => Some("indirect branch"),
         Mnemonic::PCodeOp(_) => Some("architecture p-code op"),
         Mnemonic::Store(_) => None,
+        // A map is a deterministic value of its array argument iff its per-element
+        // body is itself pure (the body symbol is not an operand, so the generic
+        // varnode check below would miss an impure body).
+        Mnemonic::Map(m) => {
+            (!Function::from_id(ctx, m.body).is_pure()).then_some("map with impure body")
+        }
         // A pure function reads its inputs only through params: a raw varnode
         // operand is an un-functionalized register/global read.
         _ => m

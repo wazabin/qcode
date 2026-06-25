@@ -7,21 +7,24 @@
 //! drives it (finding the loop, proving element-locality, calling
 //! [`push_map`](qcode::builder::Builder::push_map)) builds on top.
 //!
-//! `outline_expression` and its helpers are exercised by tests today; the
-//! recognizer (next) is their first production caller.
-#![allow(dead_code)]
+//! `outline_expression` is the recognizer's mechanical core.
 
 use std::borrow::Cow;
 
 use rustc_hash::FxHashMap as HashMap;
 
 use qcode::{
+    builder::Builder,
     context::Context,
+    space::{Space, SpaceId, SpaceType},
     value::{
-        BasicBlock, Function, FunctionId, Instruction, InstructionRef, ValueId,
-        insn::{InstructionId, Mnemonic, Return},
+        BasicBlock, BlockId, Function, FunctionId, Instruction, InstructionRef, ValueId,
+        insn::{Binop, InstructionId, IntBinop, Mnemonic, Return},
     },
 };
+
+use crate::value_range;
+use crate::{Pass, PipelineEnv};
 
 /// Whether `m` is a pure value-computing op that may appear inside an outlined
 /// per-element body: arithmetic, casts, bit ops, aggregate projection. Anything
@@ -149,6 +152,292 @@ pub(crate) fn outline_expression(
     Function::from_id_mut(ctx, fid).set_is_pure(true);
     Some(fid)
 }
+
+// ===========================================================================
+// Total-map recognizer
+// ===========================================================================
+//
+// After step-1 argpromote, a dynamic-index buffer loop has this canonical shape
+// (see `ARGPROMOTE_ARRAY_MAP.md`): an `Array` snapshot param seeded into a shadow
+// space, a counted loop that read-modify-writes one shadow lane per iteration,
+// and a wide shadow reload that becomes the returned write-set value:
+//
+//   <entry @base @arr:[i8;N]>
+//       *[shadow]:N @base = @arr;                 // seed
+//       goto <head @i=0>;
+//   <head @i>   if @i < N goto <body> else goto <exit>;
+//   <body>      %a = @base + @i;
+//               %b = *[shadow]:1 %a;              // load lane
+//               %v = body(@i, %b);                // pure
+//               *[shadow]:1 %a = %v;              // store lane
+//               goto <head @i=@i+1>;
+//   <exit>      %wv = *[shadow]:N @base;          // write-set value
+//               ... pack(write_value=%wv) ...
+//
+// The recognizer proves this is a *total* element-wise map (every lane written
+// once by a pure body) and rewrites the write-set value to `map(body, @arr)` —
+// the projectable form. The dead shadow loop is left for later cleanup; the
+// function stays pure and correct. v1 handles byte lanes (`elem == 1`) with a
+// body closed over `(index, element)` only.
+
+/// A recognized total-map loop (all fields are values/ids stable across the
+/// rewrite, which only *adds* a function and instructions).
+struct MapMatch {
+    /// The `Array` snapshot param mapped over.
+    arr: ValueId,
+    /// The header induction parameter (`@i`).
+    index: ValueId,
+    /// The per-lane loaded element (`%b`).
+    elem_val: ValueId,
+    /// The per-lane stored value (`%v`), the body's result.
+    stored_val: ValueId,
+    /// The wide shadow reload whose uses become the map result (`%wv`).
+    wv_id: InstructionId,
+    /// The block holding `%wv` (where the map is inserted).
+    exit_block: BlockId,
+    /// Lane count == byte length (v1: `elem == 1`).
+    count: usize,
+}
+
+fn is_temp(ctx: &Context, s: SpaceId) -> bool {
+    matches!(Space::from_id(ctx, s).ty, SpaceType::Temporary)
+}
+
+/// `c` if `v` is the integer literal `c`, else `None`.
+fn literal(ctx: &Context, v: ValueId) -> Option<u64> {
+    match qcode::value::ValueRef::new(v, ctx) {
+        qcode::value::ValueRef::Literal(l) => Some(l.value()),
+        _ => None,
+    }
+}
+
+/// `idx` if `addr` is `base + idx` (either operand order) with `idx` a block
+/// param, else `None`.
+fn base_plus_param(ctx: &Context, addr: ValueId, base: ValueId) -> Option<ValueId> {
+    let ValueId::Instruction(id) = addr else {
+        return None;
+    };
+    let Mnemonic::Binop(b) = ctx.get_insn(id).mnemonic() else {
+        return None;
+    };
+    if !matches!(b.op, Binop::Int(IntBinop::Add)) {
+        return None;
+    }
+    let other = if b.lhs == base {
+        b.rhs
+    } else if b.rhs == base {
+        b.lhs
+    } else {
+        return None;
+    };
+    matches!(other, ValueId::BlockParam(_)).then_some(other)
+}
+
+/// `true` if `v` is `idx + 1` (either operand order).
+fn is_increment(ctx: &Context, v: ValueId, idx: ValueId) -> bool {
+    let ValueId::Instruction(id) = v else {
+        return false;
+    };
+    let Mnemonic::Binop(b) = ctx.get_insn(id).mnemonic() else {
+        return false;
+    };
+    matches!(b.op, Binop::Int(IntBinop::Add))
+        && ((b.lhs == idx && literal(ctx, b.rhs) == Some(1))
+            || (b.rhs == idx && literal(ctx, b.lhs) == Some(1)))
+}
+
+/// The values feeding header block-param index `k` from every predecessor edge.
+fn header_incoming(ctx: &Context, header: BlockId, k: usize) -> Vec<ValueId> {
+    let mut out = Vec::new();
+    let preds: Vec<BlockId> = BasicBlock::from_id(ctx, header)
+        .predecessors()
+        .map(|(_, p)| p)
+        .collect();
+    for pred in preds {
+        let Some(term) = BasicBlock::from_id(ctx, pred).iter().last() else {
+            continue;
+        };
+        match term.mnemonic() {
+            Mnemonic::Branch(b) => out.extend(b.args.get(k).copied()),
+            Mnemonic::CBranch(cb) => {
+                if cb.success_block == header {
+                    out.extend(cb.success_args.get(k).copied());
+                }
+                if cb.failure_block == header {
+                    out.extend(cb.failure_args.get(k).copied());
+                }
+            }
+            _ => {}
+        }
+    }
+    out
+}
+
+/// One shadow-space memory access: `(insn, block, ptr, size, stored)`. `stored`
+/// is `Some` for a store.
+struct Access {
+    id: InstructionId,
+    block: BlockId,
+    ptr: ValueId,
+    size: usize,
+    stored: Option<ValueId>,
+}
+
+/// Match the canonical total-map loop in `fid`, or `None` if it is any other
+/// shape (the function is then left untouched).
+fn try_match(ctx: &Context, fid: FunctionId) -> Option<MapMatch> {
+    // Collect every temporary-space (shadow) access, with its block.
+    let mut accesses: Vec<Access> = Vec::new();
+    for block in Function::from_id(ctx, fid).iter() {
+        let bid = block.id;
+        for insn in block.iter() {
+            let acc = match insn.mnemonic() {
+                Mnemonic::Load(l) if is_temp(ctx, l.space) => Access {
+                    id: insn.id,
+                    block: bid,
+                    ptr: l.ptr,
+                    size: l.size,
+                    stored: None,
+                },
+                Mnemonic::Store(s) if is_temp(ctx, s.space) => Access {
+                    id: insn.id,
+                    block: bid,
+                    ptr: s.ptr,
+                    size: s.size,
+                    stored: Some(s.src),
+                },
+                _ => continue,
+            };
+            accesses.push(acc);
+        }
+    }
+    // Exactly four shadow accesses: seed store, body load, body store, wide
+    // reload. Any other shadow access means the footprint is not the clean map.
+    if accesses.len() != 4 {
+        return None;
+    }
+
+    // Seed store: `*[shadow]:N base = arr`, `arr` a root Array param, `base` a
+    // root param. Identifies (arr, base, N).
+    let root_params: Vec<ValueId> = Function::from_id(ctx, fid)
+        .root()?
+        .params()
+        .map(|p| p.id())
+        .collect();
+    let is_root = |v: ValueId| root_params.contains(&v);
+    let seed = accesses.iter().find(|a| {
+        a.stored.is_some_and(|src| is_root(src) && ctx.stored_type_of(src).and_then(|t| ctx.types.array_of(t)).is_some())
+            && is_root(a.ptr)
+    })?;
+    let arr = seed.stored.unwrap();
+    let base = seed.ptr;
+    let count = seed.size;
+    // v1: byte lanes only.
+    let (elem_ty, arr_count) = ctx.types.array_of(ctx.stored_type_of(arr)?)?;
+    if ctx.types.size_of(elem_ty) != 1 || arr_count != count {
+        return None;
+    }
+
+    // Body store: `*[shadow]:1 (base + idx) = v`.
+    let body_store = accesses
+        .iter()
+        .find(|a| a.stored.is_some() && a.size == 1 && base_plus_param(ctx, a.ptr, base).is_some())?;
+    let index = base_plus_param(ctx, body_store.ptr, base)?;
+    let stored_val = body_store.stored.unwrap();
+    let body_block = body_store.block;
+
+    // Body load: `*[shadow]:1 (base + idx)` at the same address value.
+    let body_load = accesses
+        .iter()
+        .find(|a| a.stored.is_none() && a.size == 1 && a.ptr == body_store.ptr)?;
+    let elem_val = ValueId::Instruction(body_load.id);
+
+    // Wide reload: `*[shadow]:N base` — the write-set value.
+    let wv = accesses
+        .iter()
+        .find(|a| a.stored.is_none() && a.size == count && a.ptr == base)?;
+
+    // Totality: the index covers exactly `[0, count)` with init 0 and step +1, so
+    // every lane is written once.
+    let range = value_range(ctx, index, body_block);
+    if range.min != 0 || range.max as usize != count - 1 {
+        return None;
+    }
+    let ValueId::BlockParam(pid) = index else {
+        return None;
+    };
+    let header = ctx.values.block_params[pid].parent?;
+    let k = BasicBlock::from_id(ctx, header)
+        .params()
+        .position(|p| p.id() == index)?;
+    let incoming = header_incoming(ctx, header, k);
+    let inits_at_zero = incoming.iter().any(|&v| literal(ctx, v) == Some(0));
+    let steps_by_one = incoming.iter().any(|&v| is_increment(ctx, v, index));
+    if !inits_at_zero || !steps_by_one {
+        return None;
+    }
+
+    Some(MapMatch {
+        arr,
+        index,
+        elem_val,
+        stored_val,
+        wv_id: wv.id,
+        exit_block: wv.block,
+        count,
+    })
+}
+
+/// Rewrite a matched loop: outline the per-element body, insert `map(body, arr)`,
+/// and forward the write-set value to it. Returns `false` if the body is not a
+/// closed pure expression of `(index, element)` (then nothing is changed).
+fn apply(ctx: &mut Context, fid: FunctionId, m: &MapMatch) -> bool {
+    let name = format!("{}_map_body", Function::from_id(ctx, fid).name());
+    let Some(body_fn) = outline_expression(ctx, &name, m.stored_val, &[m.index, m.elem_val]) else {
+        return false;
+    };
+
+    let wv_val = ValueId::Instruction(m.wv_id);
+    let map_val = {
+        let mut b = Builder::from_block(BasicBlock::from_id_mut(ctx, m.exit_block));
+        b.set_insert_point_before(m.wv_id);
+        b.push_map(body_fn, m.arr, Vec::new()).id()
+    };
+    ctx.replace_all_uses_with(wv_val, map_val);
+    let _ = m.count;
+    true
+}
+
+/// Recognize total-map loops across all pure functions, rewriting each to a
+/// `map`. Returns `true` if anything changed.
+pub(crate) fn recognize_total_maps(ctx: &mut Context) -> bool {
+    let fids: Vec<FunctionId> = ctx.function_ids();
+    let mut changed = false;
+    for fid in fids {
+        if !Function::from_id(ctx, fid).is_pure() {
+            continue;
+        }
+        if let Some(m) = try_match(ctx, fid) {
+            changed |= apply(ctx, fid, &m);
+        }
+    }
+    changed
+}
+
+#[derive(Default)]
+pub struct LoopToMap;
+
+impl Pass for LoopToMap {
+    const NAME: &'static str = "loop_to_map";
+    fn description(&self) -> &'static str {
+        "Rewrite a total element-wise array loop as a single map"
+    }
+    fn run(&self, ctx: &mut Context, _env: &PipelineEnv) -> Result<bool, String> {
+        Ok(recognize_total_maps(ctx))
+    }
+}
+
+crate::register_module_pass!(LoopToMap);
 
 #[cfg(test)]
 mod tests {

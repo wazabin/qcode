@@ -76,6 +76,9 @@ fn mnemonic_is_pure(ctx: &Context, m: &Mnemonic) -> bool {
             qcode::space::SpaceType::Temporary
         ),
         Mnemonic::CallInd(_) | Mnemonic::BranchInd(_) | Mnemonic::PCodeOp(_) => false,
+        // A map is pure exactly when its per-element body is pure. The body is a
+        // symbol, not an operand, so the generic varnode check below cannot see it.
+        Mnemonic::Map(m) => Function::from_id(ctx, m.body).is_pure(),
         // A direct call to a pure function is a deterministic value of its args
         // and clobbers nothing — provided the call site carries no residual
         // clobbers of its own.

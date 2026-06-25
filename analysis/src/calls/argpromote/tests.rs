@@ -1803,4 +1803,97 @@ mod tests {
             "verifier must not flag the shadow loop as impure: {violations:?}"
         );
     }
+
+    /// End to end: step-1 region promotion then the loop-to-map recognizer turns
+    /// the buffer loop's returned write-set value into `map(body_fn, arr)` — the
+    /// projectable form. The body is outlined into a fresh pure function.
+    #[test]
+    fn dynamic_index_loop_becomes_map() {
+        let mut tc = qcode::testing::TestContext::new();
+        let input = stack_input(&mut tc, 4, 8);
+
+        qcode!(
+            tc.ctx,
+            "
+            fn f:
+                <f_entry @stack_10000004:i64>
+                    goto <f_head @i=i64 0x0>;
+                <f_head @i:i64>
+                    %c = @i < i64 0x14;
+                    if %c goto <f_body> else goto <f_exit>;
+                <f_body>
+                    %addr = @stack_10000004 + @i;
+                    %b = load(i8, %addr);
+                    %nb = %b + i8 0x1;
+                    store(%addr, %nb);
+                    %ni = @i + i64 0x1;
+                    goto <f_head @i=%ni>;
+                <f_exit>
+                    return [i64 0x0];
+
+            fn g:
+                <g_entry>
+                    goto <g_call>;
+                <g_call>
+                    call <f>;
+                <g_cont>
+                    return [i64 0];
+            "
+        );
+        let _ = (g, f_head, f_body, f_exit);
+
+        Function::from_id_mut(&mut tc.ctx, f).set_input_regs(vec![input]);
+        Function::from_id_mut(&mut tc.ctx, f).set_pure_reg(true);
+        let ptr = tc.ctx.get_const(0x4000, 8).id();
+        set_call(&mut tc, g_call, f, vec![ptr]);
+        tc.ctx.add_cfg_edge(g_call, g_cont);
+
+        assert!(argpromote(&mut tc.ctx), "step 1 region promotion");
+        mark_pure_functions(&mut tc.ctx);
+        assert!(
+            crate::calls::loop_to_map::recognize_total_maps(&mut tc.ctx),
+            "the total-map loop should be recognized"
+        );
+
+        // f now contains a `map` whose source is the Array snapshot param.
+        let map_src = Function::from_id(&tc.ctx, f).iter().find_map(|b| {
+            b.iter().find_map(|i| match i.mnemonic() {
+                Mnemonic::Map(m) => Some(m.src),
+                _ => None,
+            })
+        });
+        let map_src = map_src.expect("f must contain a map");
+        assert!(
+            tc.ctx
+                .stored_type_of(map_src)
+                .and_then(|t| tc.ctx.types.array_of(t))
+                .is_some(),
+            "the map source is the Array snapshot"
+        );
+
+        // The returned write-set value is now the map result (the wide shadow
+        // reload was forwarded away).
+        let map_val = Function::from_id(&tc.ctx, f)
+            .iter()
+            .find_map(|b| {
+                b.iter().find_map(|i| match i.mnemonic() {
+                    Mnemonic::Map(_) => Some(ValueId::Instruction(i.id)),
+                    _ => None,
+                })
+            })
+            .unwrap();
+        let writeset_uses_map = Function::from_id(&tc.ctx, f).iter().any(|b| {
+            b.iter()
+                .any(|i| matches!(i.mnemonic(), Mnemonic::Tuple(t) if t.fields.contains(&map_val)))
+        });
+        assert!(writeset_uses_map, "write-set value must be the map result");
+
+        // The outlined body is a fresh pure function.
+        let has_body = tc
+            .ctx
+            .function_ids()
+            .into_iter()
+            .any(|fid| Function::from_id(&tc.ctx, fid).name().contains("_map_body"));
+        assert!(has_body, "the per-element body was outlined");
+    }
 }
