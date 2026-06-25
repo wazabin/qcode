@@ -13,7 +13,7 @@
 
 use qcode::{
     context::Context,
-    value::insn::{Binop, Intrinsic, Mnemonic, RootOp, recognizers_for},
+    value::insn::{Binop, IntrinsicApp, Mnemonic, RootOp, recognizers_for},
 };
 
 use super::walk::{Claim, Editor, InsnCtx, SubPass};
@@ -33,15 +33,14 @@ impl SubPass for Recognize {
         };
 
         for &id in recognizers_for(root) {
-            let Some(recognize) = id.desc().recognize else {
-                continue;
-            };
-            if let Some(args) = recognize(ctx, ic.insn_id) {
+            if let Some(args) = id.desc().recognize(ctx, ic.insn_id) {
+                // Recognized intrinsics (rol/ror) are width-preserving, so the
+                // root's width is the result width.
                 ed.replace_with_new_insn(
                     ctx,
                     ic.block_id,
                     ic.insn_id,
-                    Mnemonic::Intrinsic(Intrinsic { id, args }),
+                    Mnemonic::Intrinsic(IntrinsicApp { id, args }),
                     ic.size,
                 );
                 return Claim::Done;

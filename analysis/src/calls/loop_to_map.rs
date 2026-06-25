@@ -17,10 +17,11 @@ use qcode::{
     builder::Builder,
     context::Context,
     space::{Space, SpaceId, SpaceType},
+    types::TypeId,
     value::{
         BasicBlock, BlockId, Function, FunctionId, Instruction, InstructionRef, Renameable,
         ValueId,
-        insn::{Binop, Branch, InstructionId, IntBinop, Mnemonic, Return},
+        insn::{Binop, Branch, Extract, InstructionId, IntBinop, IntrinsicId, Mnemonic, Return},
     },
 };
 
@@ -50,11 +51,7 @@ fn is_pure_expr_op(m: &Mnemonic) -> bool {
 /// **closed** over `inputs` + literals: it reaches a free block-param, a raw
 /// varnode, a function ref, or an impure op. A value in `inputs` is a leaf (it
 /// becomes a parameter); a literal is a leaf (referenced directly).
-fn pure_slice(
-    ctx: &Context,
-    result: ValueId,
-    inputs: &[ValueId],
-) -> Option<Vec<InstructionId>> {
+fn pure_slice(ctx: &Context, result: ValueId, inputs: &[ValueId]) -> Option<Vec<InstructionId>> {
     let is_input = |v: ValueId| inputs.contains(&v);
     let mut order: Vec<InstructionId> = Vec::new();
     let mut seen: HashMap<ValueId, ()> = HashMap::default();
@@ -105,7 +102,77 @@ pub(crate) fn outline_expression(
     inputs: &[ValueId],
 ) -> Option<FunctionId> {
     let slice = pure_slice(ctx, result, inputs)?;
+    let inputs = inputs.to_vec();
+    outline_core(ctx, name, result, &slice, move |ctx, root| {
+        // Parameters, in input order, typed as the host inputs.
+        let mut value_map: HashMap<ValueId, ValueId> = HashMap::default();
+        for inp in inputs {
+            let ty = ctx.type_of(inp);
+            let size = ctx.types.size_of(ty);
+            let pid = BasicBlock::from_id_mut(ctx, root).push_param(size).id;
+            ctx.values.block_params[pid].type_id = ty;
+            value_map.insert(inp, ValueId::BlockParam(pid));
+        }
+        value_map
+    })
+}
 
+/// Outline a body that takes a single `enumerate` tuple param `(index, elem)` and
+/// unpacks it: the host `index_input` / `elem_input` are bound to `Extract(t, 0)`
+/// / `Extract(t, 1)` of the tuple param `t` before the expression computing
+/// `result` is cloned. This is the body shape for a `map` over `enumerate(arr)`
+/// (rather than over `arr`) — a unary body whose element is the index/value pair.
+///
+/// Returns `None` if the expression is not closed over `(index, elem)` + literals
+/// (see [`pure_slice`]).
+fn outline_tupled(
+    ctx: &mut Context,
+    name: &str,
+    result: ValueId,
+    index_input: ValueId,
+    elem_input: ValueId,
+    tuple_ty: TypeId,
+) -> Option<FunctionId> {
+    let slice = pure_slice(ctx, result, &[index_input, elem_input])?;
+    outline_core(ctx, name, result, &slice, move |ctx, root| {
+        let mut value_map: HashMap<ValueId, ValueId> = HashMap::default();
+        let tsz = ctx.types.size_of(tuple_ty);
+        let pid = BasicBlock::from_id_mut(ctx, root).push_param(tsz).id;
+        ctx.values.block_params[pid].type_id = tuple_ty;
+        let tuple = ValueId::BlockParam(pid);
+        // index = t.0, elem = t.1 — the two extracts the body unpacks.
+        for (field, input) in [(0usize, index_input), (1usize, elem_input)] {
+            let fty = ctx
+                .types
+                .field_type(tuple_ty, field)
+                .expect("enumerate tuple field");
+            let ex = InstructionRef::from_mnemonic_with_type(
+                ctx,
+                Mnemonic::Extract(Extract {
+                    agg: tuple,
+                    index: field,
+                }),
+                fty,
+            )
+            .id;
+            BasicBlock::from_id_mut(ctx, root).push_insn(ex);
+            value_map.insert(input, ValueId::Instruction(ex));
+        }
+        value_map
+    })
+}
+
+/// Build a fresh single-block pure function `name` returning `result`, cloning
+/// the pure `slice` (in definition order) with operands remapped through the
+/// value map that `seed` installs. `seed` creates the root block's parameters
+/// (and any unpacking instructions) and returns the initial input→value map.
+fn outline_core(
+    ctx: &mut Context,
+    name: &str,
+    result: ValueId,
+    slice: &[InstructionId],
+    seed: impl FnOnce(&mut Context, BlockId) -> HashMap<ValueId, ValueId>,
+) -> Option<FunctionId> {
     let fid = Function::make(ctx, Cow::Owned(name.to_owned())).ok()?.id;
     let root = Function::from_id_mut(ctx, fid).make_root().id;
 
@@ -117,18 +184,11 @@ pub(crate) fn outline_expression(
         .rename(block_name)
         .expect("name was deduplicated");
 
-    // Parameters, in input order, typed as the host inputs.
-    let mut value_map: HashMap<ValueId, ValueId> = HashMap::default();
-    for &inp in inputs {
-        let ty = ctx.type_of(inp);
-        let size = ctx.types.size_of(ty);
-        let pid = BasicBlock::from_id_mut(ctx, root).push_param(size).id;
-        ctx.values.block_params[pid].type_id = ty;
-        value_map.insert(inp, ValueId::BlockParam(pid));
-    }
+    // Params / unpacking, installed by the caller; seeds the input→value map.
+    let mut value_map = seed(ctx, root);
 
     // Clone the slice in definition order, remapping operands through the map.
-    for &iid in &slice {
+    for &iid in slice {
         let (mut m, ty) = {
             let insn = Instruction::from_id(ctx, iid);
             (insn.mnemonic().clone(), insn.type_id())
@@ -175,7 +235,8 @@ pub(crate) fn outline_expression(
 /// constant). `None` on an arity mismatch, a missing body, or no return value.
 ///
 /// This is the dual of [`outline_expression`] and the engine of element
-/// projection: `Extract`/`Range` of a `Map` inlines `body_fn(k, src[k])` here.
+/// projection: `Range` of a `Map` inlines `body_fn(src[k])` here (the body is
+/// unary in the element).
 pub(crate) fn inline_pure_body(
     ctx: &mut Context,
     body_fn: FunctionId,
@@ -195,7 +256,10 @@ pub(crate) fn inline_pure_body(
     for (&p, &a) in params.iter().zip(args) {
         value_map.insert(p, a);
     }
-    let insns: Vec<InstructionId> = BasicBlock::from_id(ctx, root).iter().map(|i| i.id).collect();
+    let insns: Vec<InstructionId> = BasicBlock::from_id(ctx, root)
+        .iter()
+        .map(|i| i.id)
+        .collect();
     for iid in insns {
         let m = ctx.get_insn(iid).mnemonic().clone();
         if let Mnemonic::Return(r) = &m {
@@ -238,10 +302,13 @@ pub(crate) fn inline_pure_body(
 //               ... pack(write_value=%wv) ...
 //
 // The recognizer proves this is a *total* element-wise map (every lane written
-// once by a pure body) and rewrites the write-set value to `map(body, @arr)` —
-// the projectable form. The dead shadow loop is left for later cleanup; the
-// function stays pure and correct. v1 handles byte lanes (`elem == 1`) with a
-// body closed over `(index, element)` only.
+// once by a pure body) and rewrites the write-set value to a map — the
+// projectable form. When the body reads only the element it is `map(body, @arr)`
+// with a unary `body(elem)`; when it also reads the index it is `map(body,
+// enumerate(@arr))` with `body(tuple)` unpacking the `(index, elem)` pair. The
+// dead shadow loop is left for later cleanup; the function stays pure and
+// correct. v1 handles byte lanes (`elem == 1`) with a body closed over
+// `(index, element)` only.
 
 /// A recognized total-map loop (all fields are values/ids stable across the
 /// rewrite, which only *adds* a function and instructions).
@@ -390,8 +457,13 @@ fn try_match(ctx: &Context, fid: FunctionId) -> Option<MapMatch> {
         .collect();
     let is_root = |v: ValueId| root_params.contains(&v);
     let seed = accesses.iter().find(|a| {
-        a.stored.is_some_and(|src| is_root(src) && ctx.stored_type_of(src).and_then(|t| ctx.types.array_of(t)).is_some())
-            && is_root(a.ptr)
+        a.stored.is_some_and(|src| {
+            is_root(src)
+                && ctx
+                    .stored_type_of(src)
+                    .and_then(|t| ctx.types.array_of(t))
+                    .is_some()
+        }) && is_root(a.ptr)
     })?;
     let arr = seed.stored.unwrap();
     let base = seed.ptr;
@@ -416,9 +488,9 @@ fn try_match(ctx: &Context, fid: FunctionId) -> Option<MapMatch> {
     }
 
     // Body store: `*[shadow]:1 (base + idx) = v`.
-    let body_store = accesses
-        .iter()
-        .find(|a| a.stored.is_some() && a.size == 1 && base_plus_param(ctx, a.ptr, base).is_some())?;
+    let body_store = accesses.iter().find(|a| {
+        a.stored.is_some() && a.size == 1 && base_plus_param(ctx, a.ptr, base).is_some()
+    })?;
     let index = base_plus_param(ctx, body_store.ptr, base)?;
     let stored_val = body_store.stored.unwrap();
     let body_block = body_store.block;
@@ -464,9 +536,11 @@ fn try_match(ctx: &Context, fid: FunctionId) -> Option<MapMatch> {
     }
     let loop_blocks = [header, body_block];
     let in_loop = |v: ValueId| {
-        ctx.users(v)
-            .iter()
-            .all(|&u| ctx.get_insn(u).parent().is_some_and(|b| loop_blocks.contains(&b.id)))
+        ctx.users(v).iter().all(|&u| {
+            ctx.get_insn(u)
+                .parent()
+                .is_some_and(|b| loop_blocks.contains(&b.id))
+        })
     };
     for &blk in &loop_blocks {
         let b = BasicBlock::from_id(ctx, blk);
@@ -492,24 +566,70 @@ fn try_match(ctx: &Context, fid: FunctionId) -> Option<MapMatch> {
     })
 }
 
+/// Does the per-element body actually read the loop index? `enumerate` is only
+/// worth inserting when it does; a value-only body maps directly over `arr`.
+fn body_uses_index(ctx: &Context, m: &MapMatch) -> bool {
+    if m.stored_val == m.index {
+        return true;
+    }
+    match pure_slice(ctx, m.stored_val, &[m.index, m.elem_val]) {
+        Some(slice) => slice
+            .iter()
+            .any(|&iid| ctx.get_insn(iid).mnemonic().args().contains(&m.index)),
+        None => false,
+    }
+}
+
 /// Rewrite a matched loop: outline the per-element body, replace the write-set
-/// value with `map(body, arr)`, then delete the now-dead loop (reroute the
-/// preheader straight to the exit and remove the loop blocks, the seed store, and
-/// the wide reload). Returns `false` if the body is not a closed pure expression
-/// of `(index, element)` (then nothing is changed — `outline_expression` is
-/// all-or-nothing and runs before any rewrite).
+/// value with a `map`, then delete the now-dead loop (reroute the preheader
+/// straight to the exit and remove the loop blocks, the seed store, and the wide
+/// reload).
+///
+/// The map source depends on whether the body reads the index. A value-only body
+/// maps over `arr` directly — `map(body, arr)`, `body(elem)`. An index-aware body
+/// maps over `enumerate(arr)`, whose element is the `(index, elem)` tuple —
+/// `map(body, enumerate(arr))`, `body(tuple)` unpacking it (the `map` is unary in
+/// the element). Returns `false` if the body is not a closed pure expression of
+/// `(index, element)` (then nothing is changed — outlining is all-or-nothing and
+/// runs before any rewrite).
 fn apply(ctx: &mut Context, fid: FunctionId, m: &MapMatch) -> bool {
     let name = format!("{}_map_body", Function::from_id(ctx, fid).name());
-    let Some(body_fn) = outline_expression(ctx, &name, m.stored_val, &[m.index, m.elem_val]) else {
-        return false;
+
+    // Outline the body and pick the map source, both before any rewrite so a
+    // non-closed body leaves the loop untouched.
+    let (body_fn, src_val) = if body_uses_index(ctx, m) {
+        let arr_ty = ctx.type_of(m.arr);
+        let enum_id = IntrinsicId::from_name("enumerate").expect("enumerate registered");
+        let enum_result_ty = enum_id.desc().result_type(&mut ctx.types, &[arr_ty]);
+        let Some((tuple_ty, _)) = ctx.types.array_of(enum_result_ty) else {
+            return false;
+        };
+        let Some(body_fn) = outline_tupled(ctx, &name, m.stored_val, m.index, m.elem_val, tuple_ty)
+        else {
+            return false;
+        };
+        // enumerate(arr), inserted just before the wide reload it feeds.
+        let enum_val = {
+            let mut b = Builder::from_block(BasicBlock::from_id_mut(ctx, m.exit_block));
+            b.set_insert_point_before(m.wv_id);
+            b.push_intrinsic(enum_id, vec![m.arr]).id()
+        };
+        (body_fn, enum_val)
+    } else {
+        let Some(body_fn) = outline_expression(ctx, &name, m.stored_val, &[m.elem_val]) else {
+            return false;
+        };
+        (body_fn, m.arr)
     };
 
-    // Forward the returned write-set value to the map result.
+    // Forward the returned write-set value to the map result. `push_map` types the
+    // result from the body's return (the element output type), so it is correct
+    // even when the source element is an `enumerate` tuple.
     let wv_val = ValueId::Instruction(m.wv_id);
     let map_val = {
         let mut b = Builder::from_block(BasicBlock::from_id_mut(ctx, m.exit_block));
         b.set_insert_point_before(m.wv_id);
-        b.push_map(body_fn, m.arr, Vec::new()).id()
+        b.push_map(body_fn, src_val, Vec::new()).id()
     };
     ctx.replace_all_uses_with(wv_val, map_val);
 
@@ -659,5 +779,65 @@ mod tests {
             outline_expression(&mut tc.ctx, "body", result, &[idx]).is_none(),
             "an expression reaching a load must not outline"
         );
+    }
+
+    /// `outline_tupled` produces a unary body taking the `(index, elem)` tuple and
+    /// unpacking it with two extracts before recomputing `index + zext(elem)`.
+    #[test]
+    fn outlines_tupled_index_aware_body() {
+        let mut tc = TestContext::new();
+        let host = Function::make(&mut tc.ctx, "host".into()).unwrap().id;
+        let entry = tc.ctx.get_or_make_block(0x1000);
+        {
+            let mut f = Function::from_id_mut(&mut tc.ctx, host);
+            f.set_root(entry).unwrap();
+            f.add_block(entry);
+        }
+        let (idx, elem, result) = {
+            let mut b = Builder::from_block(BasicBlock::from_id_mut(&mut tc.ctx, entry));
+            let idx = b.push_param(8).id();
+            let elem = b.push_param(1).id();
+            let widened = b.push_zext(elem, 8).id();
+            let result = b.push_add(idx, widened).id();
+            (idx, elem, result)
+        };
+
+        // The enumerate tuple `(index: i64, elem: i8)`, via enumerate's own rule.
+        let i8 = tc.ctx.types.get_or_make_int(1);
+        let arr_ty = tc.ctx.types.get_or_make_array(i8, 1);
+        let enum_id = IntrinsicId::from_name("enumerate").unwrap();
+        let enum_ty = enum_id.desc().result_type(&mut tc.ctx.types, &[arr_ty]);
+        let (tuple_ty, _) = tc.ctx.types.array_of(enum_ty).unwrap();
+
+        let body = outline_tupled(&mut tc.ctx, "body", result, idx, elem, tuple_ty)
+            .expect("expression is closed over (idx, elem)");
+
+        // A single param — the tuple — sized to the `(i64, i8)` aggregate.
+        let params: Vec<usize> = Function::from_id(&tc.ctx, body)
+            .root()
+            .unwrap()
+            .params()
+            .map(|p| p.size())
+            .collect();
+        assert_eq!(params, vec![tc.ctx.types.size_of(tuple_ty)]);
+
+        // The body unpacks the tuple (two extracts) and recomputes zext + add.
+        let root = Function::from_id(&tc.ctx, body).root().unwrap().id;
+        let extracts = BasicBlock::from_id(&tc.ctx, root)
+            .iter()
+            .filter(|i| matches!(i.mnemonic(), Mnemonic::Extract(_)))
+            .count();
+        assert_eq!(
+            extracts, 2,
+            "the body unpacks index and elem from the tuple"
+        );
+        let has_zext = BasicBlock::from_id(&tc.ctx, root)
+            .iter()
+            .any(|i| matches!(i.mnemonic(), Mnemonic::Zext(_)));
+        let has_add = BasicBlock::from_id(&tc.ctx, root)
+            .iter()
+            .any(|i| matches!(i.mnemonic(), Mnemonic::Binop(_)));
+        assert!(has_zext && has_add, "body recomputes zext + add");
+        assert!(Function::from_id(&tc.ctx, body).is_pure());
     }
 }

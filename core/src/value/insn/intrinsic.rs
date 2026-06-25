@@ -4,7 +4,7 @@
 //! An intrinsic is represented by a single [`Mnemonic::Intrinsic`] variant
 //! carrying an [`IntrinsicId`] plus its operands — there is no dedicated
 //! mnemonic per intrinsic and no control-flow call. Semantics live in an
-//! [`IntrinsicDesc`] looked up from a process-global registry.
+//! [`Intrinsic`] definition looked up from a process-global registry.
 //!
 //! # Purity
 //!
@@ -29,6 +29,7 @@ use super::binop::IntBinop;
 use super::mnemonic::MnemonicKind;
 use crate::{
     context::Context,
+    types::{TypeId, TypeManager},
     value::{InstructionId, ValueId, ValueRef},
 };
 
@@ -48,11 +49,11 @@ impl IntrinsicId {
 
     /// The registered name of this intrinsic (e.g. `"rol"`).
     pub fn name(self) -> &'static str {
-        self.desc().name
+        self.desc().name()
     }
 
-    /// The full descriptor for this intrinsic.
-    pub fn desc(self) -> &'static IntrinsicDesc {
+    /// The [`Intrinsic`] definition this id resolves to.
+    pub fn desc(self) -> &'static dyn Intrinsic {
         registry().descs[self.0]
     }
 }
@@ -79,46 +80,61 @@ pub enum RootOp {
     IntBinop(IntBinop),
 }
 
-/// Evaluator for an intrinsic: concrete operands `(bits, byte_width)` and an
-/// `out_size`-byte result. `None` means "not foldable / trap".
-pub type IntrinsicEval = fn(&[(u128, usize)], usize) -> Option<u128>;
-
-/// Recognizer for an intrinsic's raw-IR idiom, returning the intrinsic's
-/// operands when the instruction matches. Takes `&mut Context` so a matcher may
-/// materialize literals for derived operands (e.g. a rotate amount recovered as
-/// the `log2` of a strength-reduced multiplier).
-pub type IntrinsicRecognize = fn(&mut Context, InstructionId) -> Option<Vec<ValueId>>;
-
-/// Algebraic simplifier for an intrinsic. Receives the intrinsic's
-/// [`IntrinsicId`] (so a shared simplifier can branch on which intrinsic it is,
-/// e.g. `rol` vs `ror`), the result byte width, and the operands; returns a
-/// [`Simplified`] outcome when a rewrite applies.
-pub type IntrinsicSimplify = fn(&mut Context, IntrinsicId, usize, &[ValueId]) -> Option<Simplified>;
-
-/// Static description of one intrinsic: its name, arity, result-size rule, the
-/// shared evaluator (used by both constant folding and the emulator), and
-/// optional recognition / simplification hooks.
-pub struct IntrinsicDesc {
+/// The definition of one *kind* of intrinsic — its name, arity, result typing,
+/// shared evaluator, and optional recognition / simplification behaviour.
+///
+/// An [`IntrinsicId`] is a by-name handle resolving to a single `&'static dyn
+/// Intrinsic`; the [`IntrinsicApp`] mnemonic is an *application* of that
+/// definition to operands. Built-in definitions are unit structs registered via
+/// [`register_intrinsic!`](crate::register_intrinsic).
+pub trait Intrinsic: Sync {
     /// Textual name, e.g. `"rol"`. Unique across the registry.
-    pub name: &'static str,
+    fn name(&self) -> &'static str;
+
     /// Number of operands the intrinsic takes.
-    pub arity: usize,
-    /// Computes the result byte width from the operand byte widths.
-    pub result_size: fn(&[usize]) -> usize,
-    /// Evaluate on concrete operands. `None` means "not foldable / trap" — fold
-    /// bails, the emulator raises.
-    pub eval: IntrinsicEval,
+    fn arity(&self) -> usize;
+
+    /// The result type for an application to operands of types `args`. A sized
+    /// integer is just a type, so a width-only intrinsic returns
+    /// `types.get_or_make_int(width)`; an array-producing one returns the array
+    /// type.
+    fn result_type(&self, types: &mut TypeManager, args: &[TypeId]) -> TypeId;
+
+    /// Evaluate on concrete operands `(bits, byte_width)`, producing an
+    /// `out_size`-byte result. `None` means "not foldable / trap" — constant
+    /// folding bails, the emulator raises.
+    fn eval(&self, args: &[(u128, usize)], out_size: usize) -> Option<u128>;
+
     /// IR shape this intrinsic's idiom roots at, if it participates in
     /// recognition.
-    pub root_op: Option<RootOp>,
-    /// Recognize the raw-IR idiom rooted at the given instruction.
-    pub recognize: Option<IntrinsicRecognize>,
+    fn root_op(&self) -> Option<RootOp> {
+        None
+    }
+
+    /// Recognize the raw-IR idiom rooted at `at`, returning the intrinsic's
+    /// operands when the instruction matches. Takes `&mut Context` so a matcher
+    /// may materialize literals for derived operands (e.g. a rotate amount
+    /// recovered as the `log2` of a strength-reduced multiplier).
+    fn recognize(&self, _ctx: &mut Context, _at: InstructionId) -> Option<Vec<ValueId>> {
+        None
+    }
+
     /// Algebraic simplification on the intrinsic's own operands — e.g.
-    /// `rol(x, 0) → x` or `rol(a, c) → rol(a, c mod bits)`.
-    pub simplify: Option<IntrinsicSimplify>,
+    /// `rol(x, 0) → x` or `rol(a, c) → rol(a, c mod bits)`. Receives the
+    /// applied [`IntrinsicId`] (so a shared simplifier can branch on `rol` vs
+    /// `ror`), the result byte width, and the operands.
+    fn simplify(
+        &self,
+        _ctx: &mut Context,
+        _id: IntrinsicId,
+        _out_size: usize,
+        _args: &[ValueId],
+    ) -> Option<Simplified> {
+        None
+    }
 }
 
-/// The result of an intrinsic's [`simplify`](IntrinsicDesc::simplify) hook.
+/// The result of an intrinsic's [`simplify`](Intrinsic::simplify) hook.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Simplified {
     /// Forward all uses of the intrinsic to this existing value, e.g.
@@ -133,13 +149,13 @@ pub enum Simplified {
 
 /// One intrinsic's registration, submitted via [`inventory::submit!`] (see
 /// [`register_intrinsic!`]) and collected into the global registry.
-pub struct IntrinsicRegistration(pub IntrinsicDesc);
+pub struct IntrinsicRegistration(pub &'static dyn Intrinsic);
 
 inventory::collect!(IntrinsicRegistration);
 
 struct Registry {
-    /// Descriptors indexed by [`IntrinsicId`].
-    descs: Vec<&'static IntrinsicDesc>,
+    /// Definitions indexed by [`IntrinsicId`].
+    descs: Vec<&'static dyn Intrinsic>,
     /// Name → id, for parsing and serde.
     by_name: HashMap<&'static str, IntrinsicId>,
     /// Ids grouped by recognition root, so the recognizer pass can fetch only
@@ -152,22 +168,22 @@ fn registry() -> &'static Registry {
     REG.get_or_init(|| {
         // Sort by name so ids are deterministic within a build regardless of
         // inventory iteration order.
-        let mut descs: Vec<&'static IntrinsicDesc> = inventory::iter::<IntrinsicRegistration>()
-            .map(|r| &r.0)
+        let mut descs: Vec<&'static dyn Intrinsic> = inventory::iter::<IntrinsicRegistration>()
+            .map(|r| r.0)
             .collect();
-        descs.sort_by_key(|d| d.name);
+        descs.sort_by_key(|d| d.name());
 
         let mut by_name = HashMap::default();
         let mut by_root: HashMap<RootOp, Vec<IntrinsicId>> = HashMap::default();
         for (idx, desc) in descs.iter().enumerate() {
             let id = IntrinsicId(idx);
-            let prev = by_name.insert(desc.name, id);
+            let prev = by_name.insert(desc.name(), id);
             assert!(
                 prev.is_none(),
                 "duplicate intrinsic registration: {}",
-                desc.name
+                desc.name()
             );
-            if let Some(root) = desc.root_op {
+            if let Some(root) = desc.root_op() {
                 by_root.entry(root).or_default().push(id);
             }
         }
@@ -191,12 +207,12 @@ pub fn recognizers_for(root: RootOp) -> &'static [IntrinsicId] {
 
 /// A pure intrinsic instruction: an [`IntrinsicId`] applied to its operands.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
-pub struct Intrinsic {
+pub struct IntrinsicApp {
     pub id: IntrinsicId,
     pub args: Vec<ValueId>,
 }
 
-impl MnemonicKind for Intrinsic {
+impl MnemonicKind for IntrinsicApp {
     fn opcode(&self) -> &'static str {
         self.id.name()
     }
@@ -222,38 +238,19 @@ impl MnemonicKind for Intrinsic {
 
 /// Register a built-in intrinsic with the global registry.
 ///
+/// Takes a unit-struct value implementing [`Intrinsic`]; the registry stores it
+/// as a `&'static dyn Intrinsic`.
+///
 /// ```ignore
-/// register_intrinsic! {
-///     name: "rol",
-///     arity: 2,
-///     result_size: |sz| sz[0],
-///     eval: eval_rol,
-///     root_op: Some(RootOp::IntBinop(IntBinop::Or)),
-///     recognize: Some(recognize_rol),
-///     simplify: Some(simplify_rotate),
-/// }
+/// struct Rol;
+/// impl Intrinsic for Rol { /* … */ }
+/// register_intrinsic!(Rol);
 /// ```
 #[macro_export]
 macro_rules! register_intrinsic {
-    (
-        name: $name:expr,
-        arity: $arity:expr,
-        result_size: $result_size:expr,
-        eval: $eval:expr,
-        root_op: $root_op:expr,
-        recognize: $recognize:expr,
-        simplify: $simplify:expr $(,)?
-    ) => {
+    ($def:expr $(,)?) => {
         inventory::submit! {
-            $crate::value::insn::IntrinsicRegistration($crate::value::insn::IntrinsicDesc {
-                name: $name,
-                arity: $arity,
-                result_size: $result_size,
-                eval: $eval,
-                root_op: $root_op,
-                recognize: $recognize,
-                simplify: $simplify,
-            })
+            $crate::value::insn::IntrinsicRegistration(&$def)
         }
     };
 }

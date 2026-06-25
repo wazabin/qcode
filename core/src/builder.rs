@@ -46,9 +46,9 @@ use crate::{
         insn::{
             Assert, Binary, Binop, BoolBinop, Branch, BranchInd, CBranch, Call, CallInd, Carry,
             Extract, FloatBinop, FloatToFloat, FloatToInt, Gep, InstructionId, InstructionRef,
-            IntBinop, IntToFloat, Intrinsic, IntrinsicId, IsFloatNaN, Load, LzCount, Map, Mnemonic,
-            PCodeOp, PCodeOpId, PopCount, Range, Return, SBorrow, SCarry, Sext, Store, Tuple,
-            Unary, Unop, Zext,
+            IntBinop, IntToFloat, IntrinsicApp, IntrinsicId, IsFloatNaN, Load, LzCount, Map,
+            Mnemonic, PCodeOp, PCodeOpId, PopCount, Range, Return, SBorrow, SCarry, Sext, Store,
+            Tuple, Unary, Unop, Zext,
         },
         util::base_ref::{WithCtx, WithCtxMut},
         varnode::{Varnode, VarnodeId},
@@ -925,19 +925,51 @@ impl<'str, 'ctx> Builder<'str, 'ctx> {
         self.push_instruction_with_type(Mnemonic::Extract(Extract { agg, index }), ty)
     }
 
-    /// Builds a total element-wise map `out[i] = body(i, src[i], captures…)`
-    /// over the array value `src`. The result type is `src`'s array type (v1: the
-    /// body preserves the element width). `body` is a function symbol, not an
-    /// operand. Soundness of the body (pure, element-local) is the recognizer's
-    /// obligation; the builder only wires the value graph.
+    /// Builds a total element-wise map `out[i] = body(src[i], captures…)` over the
+    /// array value `src`. The body is **unary** in the element (index-aware bodies
+    /// take an [`enumerate`](crate::value::insn::Intrinsic) tuple as that element);
+    /// `body` is a function symbol, not an operand. Soundness of the body (pure,
+    /// element-local) is the recognizer's obligation; the builder only wires the
+    /// value graph.
+    ///
+    /// The result is `[U; N]` where `N` is `src`'s element count and `U` is the
+    /// body's return type — which need not equal the input element type (e.g. a
+    /// map over `enumerate(arr)` consumes tuples but returns bare elements). When
+    /// the body is a bare symbol with no return (or `src` is not an array), the
+    /// result falls back to `src`'s type.
     pub fn push_map(
         &mut self,
         body: FunctionId,
         src: ValueId,
         captures: Vec<ValueId>,
     ) -> InstructionRef<'str, '_> {
-        let ty = self.context_mut().type_of(src);
-        self.push_instruction_with_type(Mnemonic::Map(Map { body, src, captures }), ty)
+        let src_ty = self.context_mut().type_of(src);
+        let count = self.context().types.array_of(src_ty).map(|(_, n)| n);
+        let ret_ty = self.map_body_return_type(body);
+        let ty = match (count, ret_ty) {
+            (Some(n), Some(rt)) => self.context_mut().types.get_or_make_array(rt, n),
+            _ => src_ty,
+        };
+        self.push_instruction_with_type(
+            Mnemonic::Map(Map {
+                body,
+                src,
+                captures,
+            }),
+            ty,
+        )
+    }
+
+    /// The type of the value returned by `body`'s first `Return`, or `None` if
+    /// `body` has no root or returns nothing — used to size a [`push_map`] result.
+    fn map_body_return_type(&self, body: FunctionId) -> Option<TypeId> {
+        let root = Function::from_id(self.context(), body).root()?.id;
+        BasicBlock::from_id(self.context(), root)
+            .iter()
+            .find_map(|i| match i.mnemonic() {
+                Mnemonic::Return(r) => r.value.and_then(|v| self.context().stored_type_of(v)),
+                _ => None,
+            })
     }
 
     /// Computes the address of the field at byte `offset` of the struct that
@@ -1035,20 +1067,26 @@ impl<'str, 'ctx> Builder<'str, 'ctx> {
         self.push_instruction(Mnemonic::PCodeOp(PCodeOp { id, args, dst }), size)
     }
 
-    /// Creates a pure intrinsic instruction (e.g. `rol`, `ror`).
+    /// Creates a pure intrinsic instruction (e.g. `rol`, `ror`, `enumerate`).
     ///
     /// Validates the operand count against the intrinsic's declared arity and
-    /// derives the result width from its `result_size` rule, so passes can
-    /// assume well-formed intrinsics. Panics on an arity mismatch.
+    /// types the node via the intrinsic's
+    /// [`result_type`](crate::value::insn::Intrinsic::result_type)
+    /// rule, so the result carries its full type (not just a width) — an array
+    /// or aggregate result is projectable. Panics on an arity mismatch.
     #[track_caller]
-    pub fn intrinsic(&mut self, id: IntrinsicId, args: Vec<ValueId>) -> InstructionRef<'str, '_> {
+    pub fn push_intrinsic(
+        &mut self,
+        id: IntrinsicId,
+        args: Vec<ValueId>,
+    ) -> InstructionRef<'str, '_> {
         let desc = id.desc();
         assert_eq!(
             args.len(),
-            desc.arity,
+            desc.arity(),
             "intrinsic `{}` expects {} args, got {}",
-            desc.name,
-            desc.arity,
+            desc.name(),
+            desc.arity(),
             args.len()
         );
 
@@ -1057,13 +1095,13 @@ impl<'str, 'ctx> Builder<'str, 'ctx> {
             .map(|arg| self.ensure_local(arg))
             .collect::<Vec<_>>();
 
-        let arg_sizes = args
+        let arg_types = args
             .iter()
-            .map(|&arg| ValueRef::new(arg, self.context()).size())
+            .map(|&arg| self.context_mut().type_of(arg))
             .collect::<Vec<_>>();
-        let size = (desc.result_size)(&arg_sizes);
+        let type_id = desc.result_type(&mut self.context_mut().types, &arg_types);
 
-        self.push_instruction(Mnemonic::Intrinsic(Intrinsic { id, args }), size)
+        self.push_instruction_with_type(Mnemonic::Intrinsic(IntrinsicApp { id, args }), type_id)
     }
 
     // --- Loads & Stores ---

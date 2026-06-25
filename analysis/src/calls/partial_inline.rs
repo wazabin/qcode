@@ -100,8 +100,13 @@ fn is_pure_dataop(m: &Mnemonic) -> bool {
             // of its `src`/`captures` operands (the `body` symbol is not an
             // operand and is cloned verbatim). Allowing it here lets a returned
             // `body <$> arr` project to `body <$> arg` at each caller, which
-            // `MapProject` then reduces to `body(k, arr[k])`.
+            // `ArrayProject` then reduces to `body(arr[k])`.
             | Mnemonic::Map(_)
+            // A pure intrinsic (`rol`, `ror`, `enumerate`) is categorically a pure
+            // function of its operands. Allowing it lets a returned
+            // `body <$> enumerate(arr)` carry its `enumerate(arr)` source across
+            // the inline, so the whole index-aware map projects at the caller.
+            | Mnemonic::Intrinsic(_)
     )
     // Deliberately excluded: Load/Store (memory), Call*/Return/Branch* (control
     // & effects), Tuple/Extract (aggregate plumbing), PCodeOp (opaque/arch).
@@ -526,7 +531,7 @@ mod tests {
     /// A callee whose sole output is a `map` over its input array param projects
     /// that map back into every caller: the caller's `extract` of the field is
     /// replaced by `body <$> arg`, the callee's param substituted by the call
-    /// argument. This is what lets caller-side `MapProject` later recover an
+    /// argument. This is what lets caller-side `ArrayProject` later recover an
     /// element `body(k, arr[k])`.
     #[test]
     fn projects_returned_map_into_caller() {
@@ -581,7 +586,10 @@ mod tests {
         Instruction::from_id_mut(&mut tc.ctx, call_id).set_type(agg);
         replay_field(&mut tc, g_cont, call_id, 0, vr1);
 
-        assert!(partial_inline(&mut tc.ctx), "the returned map should project");
+        assert!(
+            partial_inline(&mut tc.ctx),
+            "the returned map should project"
+        );
         assert_eq!(
             extracts_of(&tc, g_cont, call_id),
             0,

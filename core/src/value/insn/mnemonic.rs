@@ -5,8 +5,9 @@ use crate::{
         function::FunctionId,
         insn::{
             Assert, Binary, Branch, BranchInd, CBranch, Call, CallInd, Carry, Extract,
-            FloatToFloat, FloatToInt, Gep, IntToFloat, Intrinsic, IsFloatNaN, Load, LzCount, Map,
-            PCodeOp, PopCount, Range, Return, SBorrow, SCarry, Sext, Store, Tuple, Unary, Zext,
+            FloatToFloat, FloatToInt, Gep, IntToFloat, IntrinsicApp, IsFloatNaN, Load, LzCount,
+            Map, PCodeOp, PopCount, Range, Return, SBorrow, SCarry, Sext, Store, Tuple, Unary,
+            Zext,
         },
     },
 };
@@ -111,7 +112,7 @@ pub enum Mnemonic {
     PCodeOp(PCodeOp),
     /// A pure named intrinsic function (e.g. `rol`, `ror`). Categorically pure:
     /// no memory or observable side effects.
-    Intrinsic(Intrinsic),
+    Intrinsic(IntrinsicApp),
     /// Build an aggregate (tuple) value from ordered fields.
     Tuple(Tuple),
     /// Project a single field out of an aggregate value.

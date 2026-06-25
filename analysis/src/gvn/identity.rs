@@ -43,12 +43,10 @@ impl SubPass for Identities {
         }
         // Pure intrinsics carry their own algebraic simplifier (e.g.
         // `rol(x, 0) → x`), which forwards uses to an existing value.
-        if let Mnemonic::Intrinsic(intr) = ic.mnemonic
-            && let Some(simplify) = intr.id.desc().simplify
-        {
+        if let Mnemonic::Intrinsic(intr) = ic.mnemonic {
             let id = intr.id;
             let args = intr.args.clone();
-            match simplify(ctx, id, ic.size, &args) {
+            match id.desc().simplify(ctx, id, ic.size, &args) {
                 Some(Simplified::Value(repl)) => {
                     ed.replace(ctx, ic.insn_id, repl);
                     return Claim::Done;

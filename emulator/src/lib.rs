@@ -484,7 +484,7 @@ pub trait Interpreter {
             // recoverably so a best-effort consumer — pure-call folding emulating a
             // function whose return depends on a `map` — declines to harvest the
             // field instead of crashing the whole analysis. (Element projection
-            // does not go through emulation; it inlines the body via `MapProject`.)
+            // does not go through emulation; it inlines the body via `ArrayProject`.)
             Mnemonic::Map(_) => return Err(EmulatorErrorKind::UnsupportedMnemonic("map")),
 
             _ => todo!("unimplemented mnemonic: {:?}", insn.mnemonic()),

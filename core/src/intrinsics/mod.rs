@@ -14,4 +14,5 @@
 //! each name. The `inventory`-based registry picks it up automatically — no
 //! central table to edit.
 
+mod enumerate;
 mod rotate;

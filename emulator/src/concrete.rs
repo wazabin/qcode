@@ -343,7 +343,9 @@ impl DomainValue for SizedValue {
             .iter()
             .map(|a| (a.as_bits(), a.size as usize))
             .collect();
-        let value = (id.desc().eval)(&operands, out_size)
+        let value = id
+            .desc()
+            .eval(&operands, out_size)
             .ok_or_else(|| EmulatorErrorKind::UnsupportedIntrinsic(Box::from(id.name())))?;
         Ok(Self::from_bits(value, out_size))
     }
@@ -1857,7 +1859,9 @@ mod tests {
             unsafe { b.dont_finalize() };
             (m, ret, ptr)
         };
-        let ValueId::Instruction(rid) = ret else { unreachable!() };
+        let ValueId::Instruction(rid) = ret else {
+            unreachable!()
+        };
         ctx.replace_instruction_mnemonic(
             rid,
             Mnemonic::Return(Return {
@@ -1874,6 +1878,66 @@ mod tests {
             err.kind,
             EmulatorErrorKind::UnsupportedMnemonic("map")
         ));
+    }
+
+    /// Emulating a function that returns an `enumerate` array bails with a
+    /// recoverable `UnsupportedIntrinsic` rather than panicking — its `eval`
+    /// returns `None` (whole-array evaluation is deferred), so a best-effort
+    /// consumer declines to harvest instead of crashing the analysis.
+    #[test]
+    fn enumerate_emulation_bails_recoverably() {
+        use qcode::builder::Builder;
+        use qcode::value::{
+            BasicBlock, Function, ValueId,
+            insn::{IntrinsicId, Return},
+        };
+
+        let mut ctx = Context::new();
+        let f = Function::make(&mut ctx, "f".into()).unwrap().id;
+        let entry = ctx.get_or_make_block(0x1000);
+        {
+            let mut fm = Function::from_id_mut(&mut ctx, f);
+            fm.set_root(entry).unwrap();
+            fm.add_block(entry);
+        }
+        let i8 = ctx.types.get_or_make_int(1);
+        let arr_ty = ctx.types.get_or_make_array(i8, 4);
+        let src = {
+            let mut b = Builder::from_block(BasicBlock::from_id_mut(&mut ctx, entry));
+            b.push_param(4).id()
+        };
+        if let ValueId::BlockParam(pid) = src {
+            ctx.values.block_params[pid].type_id = arr_ty;
+        }
+        let enum_id = IntrinsicId::from_name("enumerate").unwrap();
+        let (env, ret, ptr) = {
+            let mut b = Builder::from_block(BasicBlock::from_id_mut(&mut ctx, entry));
+            let env = b.push_intrinsic(enum_id, vec![src]).id();
+            let ptr = b.context_mut().get_const(0, 8).id();
+            let ret = b.push_return(ptr).id();
+            unsafe { b.dont_finalize() };
+            (env, ret, ptr)
+        };
+        let ValueId::Instruction(rid) = ret else {
+            unreachable!()
+        };
+        ctx.replace_instruction_mnemonic(
+            rid,
+            Mnemonic::Return(Return {
+                ptr,
+                value: Some(env),
+            }),
+        );
+
+        let mut emu = StandaloneEmulator::new(entry);
+        let err = emu
+            .run_pure(&ctx, f, &[SizedValue::new(0, 4)], 1000)
+            .expect_err("enumerate must not be emulated");
+        assert!(
+            matches!(err.kind, EmulatorErrorKind::UnsupportedIntrinsic(ref n) if &**n == "enumerate"),
+            "expected recoverable UnsupportedIntrinsic, got {:?}",
+            err.kind
+        );
     }
 
     #[test]
@@ -2225,7 +2289,7 @@ mod tests {
             let k = ctx.get_const(8, 4).id();
             let mut builder =
                 qcode::builder::Builder::from_block(BasicBlock::from_id_mut(&mut ctx, block_id));
-            let result = builder.intrinsic(rol, vec![x, k]).id;
+            let result = builder.push_intrinsic(rol, vec![x, k]).id;
             builder.finalize(0x1001);
             result
         };

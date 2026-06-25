@@ -1,15 +1,18 @@
 //! `map`: a total element-wise map over an array value.
 //!
-//! [`Map`] applies the pure function `body` to every lane of the array `src`,
-//! producing an array of the same length: conceptually `out[i] = body(i, src[i],
-//! captures…)`. It is the projectable representation of a loop that rewrites a
-//! buffer element-wise (see `ARGPROMOTE_ARRAY_MAP.md`).
+//! [`Map`] applies the pure **unary** function `body` to every lane of the array
+//! `src`, producing an array of the same length: conceptually `out[i] =
+//! body(src[i], captures…)`. The body takes the element only — index-aware bodies
+//! map over [`enumerate`](super::Intrinsic)`(arr)`, whose element is the `(index,
+//! elem)` tuple. The result element type is the body's return type, which need
+//! not equal the input element type. It is the projectable representation of a
+//! loop that rewrites a buffer element-wise (see `ARGPROMOTE_ARRAY_MAP.md`).
 //!
 //! `body` is a **function symbol** (like [`Call::target`](super::Call)), not a
 //! value operand, so `Map` stays an ordinary first-order SSA instruction: its
 //! value operands are `src` plus any loop-invariant `captures` the body closes
 //! over. The projection rewrite
-//! `Range(Map(body, src), k·sz, sz) → body(k, Range(src, k·sz, sz), captures…)`
+//! `Range(Map(body, src), k·osz, osz) → body(Range(src, k·isz, isz), captures…)`
 //! recovers one element as an expression without materializing the whole array.
 
 use crate::{
@@ -20,17 +23,17 @@ use std::fmt::Formatter;
 
 use super::mnemonic::MnemonicKind;
 
-/// A total element-wise map `out[i] = body(i, src[i], captures…)`. The result
-/// type is the array type of `src` (v1: the body preserves the element width).
+/// A total element-wise map `out[i] = body(src[i], captures…)`. The result is
+/// `[U; N]` where `N` is `src`'s length and `U` is the body's return type.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub struct Map {
     /// The pure per-element function, applied at each lane. A symbol, not an
-    /// operand — exactly like a direct call's target.
+    /// operand — exactly like a direct call's target. Unary in the element.
     pub body: FunctionId,
     /// The array value mapped over.
     pub src: ValueId,
-    /// Loop-invariant values the body closes over (the index and element are
-    /// supplied per-lane by the map itself). Empty for a closed body.
+    /// Loop-invariant values the body closes over (the element is supplied
+    /// per-lane by the map itself). Empty for a closed body.
     pub captures: Vec<ValueId>,
 }
 
@@ -42,8 +45,8 @@ impl MnemonicKind for Map {
     fn fmt(&self, f: &mut Formatter<'_>, ctx: &Context<'_>) -> std::fmt::Result {
         // `foo <$> arr` (Haskell `fmap`): apply the per-element body over the
         // array. Captures render as a partial application of the body —
-        // `(foo c0 c1) <$> arr` — since the index and element are supplied by the
-        // map itself, not written here.
+        // `(foo c0 c1) <$> arr` — since the element is supplied by the map
+        // itself, not written here.
         let body = Function::from_id(ctx, self.body).name();
         if self.captures.is_empty() {
             write!(f, "@{} <$> {};", body, ValueRef::new(self.src, ctx))
@@ -102,7 +105,9 @@ mod tests {
             let mut b = Builder::from_block(BasicBlock::from_id_mut(&mut tc.ctx, entry));
             b.push_map(body, src, Vec::new()).id()
         };
-        let ValueId::Instruction(plain_id) = plain else { unreachable!() };
+        let ValueId::Instruction(plain_id) = plain else {
+            unreachable!()
+        };
         let rendered = tc.ctx.get_insn(plain_id).as_statement().to_string();
         assert!(
             rendered.contains("@foo <$>"),
@@ -113,7 +118,9 @@ mod tests {
             let mut b = Builder::from_block(BasicBlock::from_id_mut(&mut tc.ctx, entry));
             b.push_map(body, src, vec![cap]).id()
         };
-        let ValueId::Instruction(cap_id) = with_cap else { unreachable!() };
+        let ValueId::Instruction(cap_id) = with_cap else {
+            unreachable!()
+        };
         let rendered = tc.ctx.get_insn(cap_id).as_statement().to_string();
         assert!(
             rendered.contains("(@foo ") && rendered.contains(") <$>"),
@@ -163,8 +170,15 @@ mod tests {
 
         // `body` is a symbol; `src` + captures are the value operands.
         assert_eq!(m.body, body);
-        assert_eq!(m.args(), vec![src, cap], "src then captures are the operands");
-        assert!(!m.args().contains(&ValueId::Function(body)), "body is not an operand");
+        assert_eq!(
+            m.args(),
+            vec![src, cap],
+            "src then captures are the operands"
+        );
+        assert!(
+            !m.args().contains(&ValueId::Function(body)),
+            "body is not an operand"
+        );
 
         // Result type is the array type of `src`.
         assert_eq!(tc.ctx.type_of(map_val), array_ty);
@@ -176,7 +190,9 @@ mod tests {
         };
         let mut rewritten = Mnemonic::Map(m);
         rewritten.replace_value(src, new_src);
-        let Mnemonic::Map(r) = rewritten else { unreachable!() };
+        let Mnemonic::Map(r) = rewritten else {
+            unreachable!()
+        };
         assert_eq!(r.src, new_src);
         assert_eq!(r.body, body, "body symbol is untouched by replace_value");
         assert_eq!(r.captures, vec![cap]);

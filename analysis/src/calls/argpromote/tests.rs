@@ -1776,7 +1776,10 @@ mod tests {
                 .last()
                 .is_some_and(|i| matches!(i.mnemonic(), Mnemonic::Return(r) if r.value.is_some()))
         });
-        assert!(returns_value, "the written region must ride out in the write-set");
+        assert!(
+            returns_value,
+            "the written region must ride out in the write-set"
+        );
 
         // The caller snapshots the region (a wide load) before the call.
         let has_load = BasicBlock::from_id(&tc.ctx, g_call)
@@ -1853,7 +1856,11 @@ mod tests {
         let _ = (g, f_head, f_body, f_exit);
 
         // Mark @esp as the stack pointer so frame freshness activates.
-        let esp_pid = BasicBlock::from_id(&tc.ctx, f_entry).params().next().unwrap().id();
+        let esp_pid = BasicBlock::from_id(&tc.ctx, f_entry)
+            .params()
+            .next()
+            .unwrap()
+            .id();
         if let ValueId::BlockParam(inner) = esp_pid {
             tc.ctx.values.block_params[inner].origin = Some(ValueId::Varnode(sp_reg));
         }
@@ -1865,8 +1872,10 @@ mod tests {
 
         // Record both frame assumptions (as the pipeline's assume_arg_frame does),
         // then forward with a frame-fresh oracle.
-        tc.ctx.assume_true(Proposition::ArgsDisjointFromCallerFrame(f));
-        tc.ctx.assume_true(Proposition::LoadedPointerDisjointFromSlot(f));
+        tc.ctx
+            .assume_true(Proposition::ArgsDisjointFromCallerFrame(f));
+        tc.ctx
+            .assume_true(Proposition::LoadedPointerDisjointFromSlot(f));
         let aliases =
             crate::AliasResult::simple(&tc.ctx).with_frame_freshness(&tc.ctx, f, Some(sp_reg));
         crate::gvn::gvn_function(&mut tc.ctx, f, Some(&aliases));
@@ -1938,7 +1947,11 @@ mod tests {
         );
         let _ = (g, f_head, f_body, f_exit, f_entry);
 
-        let esp_pid = BasicBlock::from_id(&tc.ctx, f_entry).params().next().unwrap().id();
+        let esp_pid = BasicBlock::from_id(&tc.ctx, f_entry)
+            .params()
+            .next()
+            .unwrap()
+            .id();
         if let ValueId::BlockParam(inner) = esp_pid {
             tc.ctx.values.block_params[inner].origin = Some(ValueId::Varnode(sp_reg));
         }
@@ -1949,7 +1962,8 @@ mod tests {
         set_call(&mut tc, g_call, f, vec![espv, v0, v4]);
         tc.ctx.add_cfg_edge(g_call, g_cont);
 
-        tc.ctx.assume_true(Proposition::ArgsDisjointFromCallerFrame(f));
+        tc.ctx
+            .assume_true(Proposition::ArgsDisjointFromCallerFrame(f));
 
         assert!(
             argpromote_with_sp(&mut tc.ctx, Some(sp_reg)),
@@ -1957,7 +1971,8 @@ mod tests {
         );
         // The buffer region snapshots as an Array param.
         let has_array_param = Function::from_id(&tc.ctx, f).root().is_some_and(|b| {
-            b.params().any(|p| tc.ctx.types.array_of(p.type_id()).is_some())
+            b.params()
+                .any(|p| tc.ctx.types.array_of(p.type_id()).is_some())
         });
         assert!(has_array_param, "the buffer region became an Array input");
 
@@ -2071,13 +2086,17 @@ mod tests {
             2,
             "loop blocks deleted, leaving entry + exit"
         );
-        let any_mem = Function::from_id(&tc.ctx, f)
-            .iter()
-            .any(|b| b.iter().any(|i| matches!(i.mnemonic(), Mnemonic::Load(_) | Mnemonic::Store(_))));
+        let any_mem = Function::from_id(&tc.ctx, f).iter().any(|b| {
+            b.iter()
+                .any(|i| matches!(i.mnemonic(), Mnemonic::Load(_) | Mnemonic::Store(_)))
+        });
         assert!(!any_mem, "no shadow load/store should remain in f");
 
         // The rewritten IR verifies clean (no dangling refs, valid terminators).
         let problems = crate::verify::verify(&tc.ctx);
-        assert!(problems.is_empty(), "post-rewrite IR must verify: {problems:?}");
+        assert!(
+            problems.is_empty(),
+            "post-rewrite IR must verify: {problems:?}"
+        );
     }
 }

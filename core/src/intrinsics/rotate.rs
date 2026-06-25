@@ -6,9 +6,12 @@
 
 use crate::context::Context;
 use crate::register_intrinsic;
+use crate::types::{TypeId, TypeManager};
 use crate::value::ValueId;
 use crate::value::insn::intrinsic::{as_int_binop, const_u64, mask_for};
-use crate::value::insn::{IntBinop, Intrinsic, IntrinsicId, Mnemonic, RootOp, Simplified};
+use crate::value::insn::{
+    InstructionId, IntBinop, Intrinsic, IntrinsicApp, IntrinsicId, Mnemonic, RootOp, Simplified,
+};
 
 fn eval_rotate(args: &[(u128, usize)], out_size: usize, left: bool) -> Option<u128> {
     let (x, _) = *args.first()?;
@@ -183,7 +186,7 @@ fn simplify_rotate(
             let k_size = ctx.type_of(k);
             let k_size = ctx.types.size_of(k_size);
             let reduced = ctx.get_const(r, k_size).id();
-            let rotate = Intrinsic {
+            let rotate = IntrinsicApp {
                 id,
                 args: vec![x, reduced],
             };
@@ -194,25 +197,74 @@ fn simplify_rotate(
     None
 }
 
-register_intrinsic! {
-    name: "rol",
-    arity: 2,
-    result_size: |sz| sz[0],
-    eval: eval_rol,
-    root_op: Some(RootOp::IntBinop(IntBinop::Or)),
-    recognize: Some(recognize_rol),
-    simplify: Some(simplify_rotate),
+/// A rotate's result is the same sized integer as its first operand.
+fn rotate_result_type(types: &mut TypeManager, args: &[TypeId]) -> TypeId {
+    types.get_or_make_int(types.size_of(args[0]))
 }
 
-register_intrinsic! {
-    name: "ror",
-    arity: 2,
-    result_size: |sz| sz[0],
-    eval: eval_ror,
-    root_op: None,
-    recognize: None,
-    simplify: Some(simplify_rotate),
+/// `rol` — rotate left. Recognizes the `(x << c1) | (x >> c2)` idiom.
+struct Rol;
+
+impl Intrinsic for Rol {
+    fn name(&self) -> &'static str {
+        "rol"
+    }
+    fn arity(&self) -> usize {
+        2
+    }
+    fn result_type(&self, types: &mut TypeManager, args: &[TypeId]) -> TypeId {
+        rotate_result_type(types, args)
+    }
+    fn eval(&self, args: &[(u128, usize)], out_size: usize) -> Option<u128> {
+        eval_rol(args, out_size)
+    }
+    fn root_op(&self) -> Option<RootOp> {
+        Some(RootOp::IntBinop(IntBinop::Or))
+    }
+    fn recognize(&self, ctx: &mut Context, at: InstructionId) -> Option<Vec<ValueId>> {
+        recognize_rol(ctx, at)
+    }
+    fn simplify(
+        &self,
+        ctx: &mut Context,
+        id: IntrinsicId,
+        out_size: usize,
+        args: &[ValueId],
+    ) -> Option<Simplified> {
+        simplify_rotate(ctx, id, out_size, args)
+    }
 }
+
+/// `ror` — rotate right. Its constant idiom is normalised into a `rol` by the
+/// recognizer, so it has no `root_op` of its own.
+struct Ror;
+
+impl Intrinsic for Ror {
+    fn name(&self) -> &'static str {
+        "ror"
+    }
+    fn arity(&self) -> usize {
+        2
+    }
+    fn result_type(&self, types: &mut TypeManager, args: &[TypeId]) -> TypeId {
+        rotate_result_type(types, args)
+    }
+    fn eval(&self, args: &[(u128, usize)], out_size: usize) -> Option<u128> {
+        eval_ror(args, out_size)
+    }
+    fn simplify(
+        &self,
+        ctx: &mut Context,
+        id: IntrinsicId,
+        out_size: usize,
+        args: &[ValueId],
+    ) -> Option<Simplified> {
+        simplify_rotate(ctx, id, out_size, args)
+    }
+}
+
+register_intrinsic!(Rol);
+register_intrinsic!(Ror);
 
 #[cfg(test)]
 mod tests {
@@ -224,7 +276,7 @@ mod tests {
         let ror = IntrinsicId::from_name("ror").expect("ror registered");
         assert_eq!(rol.name(), "rol");
         assert_eq!(ror.name(), "ror");
-        assert_eq!(rol.desc().arity, 2);
+        assert_eq!(rol.desc().arity(), 2);
         assert!(IntrinsicId::from_name("nope").is_none());
     }
 
@@ -232,21 +284,21 @@ mod tests {
     fn eval_rol_matches_native() {
         let rol = IntrinsicId::from_name("rol").unwrap();
         // rol(0x12345678, 8) over 4 bytes == u32 rotate_left
-        let got = (rol.desc().eval)(&[(0x1234_5678, 4), (8, 4)], 4).unwrap();
+        let got = rol.desc().eval(&[(0x1234_5678, 4), (8, 4)], 4).unwrap();
         assert_eq!(got as u32, 0x1234_5678u32.rotate_left(8));
     }
 
     #[test]
     fn eval_ror_matches_native() {
         let ror = IntrinsicId::from_name("ror").unwrap();
-        let got = (ror.desc().eval)(&[(0x1234_5678, 4), (12, 4)], 4).unwrap();
+        let got = ror.desc().eval(&[(0x1234_5678, 4), (12, 4)], 4).unwrap();
         assert_eq!(got as u32, 0x1234_5678u32.rotate_right(12));
     }
 
     #[test]
     fn rol_zero_is_identity_eval() {
         let rol = IntrinsicId::from_name("rol").unwrap();
-        let got = (rol.desc().eval)(&[(0xdead_beef, 4), (0, 4)], 4).unwrap();
+        let got = rol.desc().eval(&[(0xdead_beef, 4), (0, 4)], 4).unwrap();
         assert_eq!(got as u32, 0xdead_beef);
     }
 
