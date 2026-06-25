@@ -46,7 +46,7 @@ use crate::{
         insn::{
             Assert, Binary, Binop, BoolBinop, Branch, BranchInd, CBranch, Call, CallInd, Carry,
             Extract, FloatBinop, FloatToFloat, FloatToInt, Gep, InstructionId, InstructionRef,
-            IntBinop, IntToFloat, Intrinsic, IntrinsicId, IsFloatNaN, Load, LzCount, Mnemonic,
+            IntBinop, IntToFloat, Intrinsic, IntrinsicId, IsFloatNaN, Load, LzCount, Map, Mnemonic,
             PCodeOp, PCodeOpId, PopCount, Range, Return, SBorrow, SCarry, Sext, Store, Tuple,
             Unary, Unop, Zext,
         },
@@ -923,6 +923,21 @@ impl<'str, 'ctx> Builder<'str, 'ctx> {
             .field_type(agg_ty, index)
             .expect("push_extract: agg is not an aggregate with that field index");
         self.push_instruction_with_type(Mnemonic::Extract(Extract { agg, index }), ty)
+    }
+
+    /// Builds a total element-wise map `out[i] = body(i, src[i], captures…)`
+    /// over the array value `src`. The result type is `src`'s array type (v1: the
+    /// body preserves the element width). `body` is a function symbol, not an
+    /// operand. Soundness of the body (pure, element-local) is the recognizer's
+    /// obligation; the builder only wires the value graph.
+    pub fn push_map(
+        &mut self,
+        body: FunctionId,
+        src: ValueId,
+        captures: Vec<ValueId>,
+    ) -> InstructionRef<'str, '_> {
+        let ty = self.context_mut().type_of(src);
+        self.push_instruction_with_type(Mnemonic::Map(Map { body, src, captures }), ty)
     }
 
     /// Computes the address of the field at byte `offset` of the struct that

@@ -5,7 +5,7 @@ use crate::{
         function::FunctionId,
         insn::{
             Assert, Binary, Branch, BranchInd, CBranch, Call, CallInd, Carry, Extract,
-            FloatToFloat, FloatToInt, Gep, IntToFloat, Intrinsic, IsFloatNaN, Load, LzCount,
+            FloatToFloat, FloatToInt, Gep, IntToFloat, Intrinsic, IsFloatNaN, Load, LzCount, Map,
             PCodeOp, PopCount, Range, Return, SBorrow, SCarry, Sext, Store, Tuple, Unary, Zext,
         },
     },
@@ -118,6 +118,8 @@ pub enum Mnemonic {
     Extract(Extract),
     /// Compute the address of a struct field (typed, named pointer arithmetic).
     Gep(Gep),
+    /// Total element-wise map over an array value (a projectable loop).
+    Map(Map),
 }
 
 impl Mnemonic {
@@ -151,6 +153,7 @@ impl Mnemonic {
             Mnemonic::Tuple(m) => m,
             Mnemonic::Extract(m) => m,
             Mnemonic::Gep(m) => m,
+            Mnemonic::Map(m) => m,
         }
     }
 
@@ -388,6 +391,17 @@ impl Mnemonic {
                 if m.base == old {
                     m.base = new;
                 }
+            }
+            Mnemonic::Map(m) => {
+                // `body` is a function symbol, not a value operand — left intact.
+                if m.src == old {
+                    m.src = new;
+                }
+                m.captures.iter_mut().for_each(|a| {
+                    if *a == old {
+                        *a = new;
+                    }
+                });
             }
         }
     }

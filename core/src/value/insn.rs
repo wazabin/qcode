@@ -28,6 +28,7 @@ mod bits;
 mod casting;
 mod flags;
 pub(crate) mod intrinsic;
+mod map;
 mod memory;
 mod mnemonic;
 mod pcode_op;
@@ -43,6 +44,7 @@ pub use intrinsic::{
     Intrinsic, IntrinsicDesc, IntrinsicId, IntrinsicRegistration, RootOp, Simplified,
     recognizers_for,
 };
+pub use map::Map;
 pub use memory::{Load, Store};
 pub use mnemonic::Mnemonic;
 pub use pcode_op::{PCodeOp, PCodeOpId};
