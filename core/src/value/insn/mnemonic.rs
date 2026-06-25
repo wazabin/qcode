@@ -181,12 +181,13 @@ impl Mnemonic {
         ) || self.is_terminator()
     }
 
-    /// The callee of a direct [`Call`], or `None` for any other mnemonic
+    /// The callee of a direct [`Call`] or body of a [`Map`], or `None`
     /// (including indirect [`CallInd`] calls, whose target is not statically
     /// known). Used to maintain the reverse call graph.
     pub fn call_target(&self) -> Option<FunctionId> {
         match self {
             Mnemonic::Call(call) => Some(call.target),
+            Mnemonic::Map(map) => Some(map.body),
             _ => None,
         }
     }
