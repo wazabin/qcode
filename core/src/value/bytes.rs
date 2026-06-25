@@ -113,10 +113,17 @@ pub fn decode_string(data: &[u8]) -> Option<(StringEncoding, String)> {
             .map(|c| u16::from_le_bytes([c[0], c[1]]))
             .collect();
         let units = units.strip_suffix(&[0]).unwrap_or(&units);
+        // Require printable ASCII-range code units: random binary read as
+        // UTF-16 lands in CJK / presentation-form ranges that decode to valid
+        // but meaningless text (e.g. "凜ﯺ"). Genuine wide strings (the Windows
+        // `W`-API convention, e.g. "ntdll.dll") are ASCII in the low byte with a
+        // zero high byte, so this keeps real strings and drops the noise.
         if !units.is_empty()
-            && let Ok(s) = String::from_utf16(units)
-            && s.chars().all(|c| !c.is_control())
+            && units
+                .iter()
+                .all(|&u| u < 0x80 && (u as u8).is_ascii_graphic() || u == b' ' as u16)
         {
+            let s: String = units.iter().map(|&u| u as u8 as char).collect();
             return Some((StringEncoding::Utf16Le, s));
         }
     }
@@ -139,9 +146,97 @@ pub fn escape_decoded(s: &str) -> String {
     out
 }
 
+/// How a [`Bytes`] blob should be rendered as a `b"..."` literal.
+///
+/// [`Auto`](BytesDisplay::Auto) is the default and lets [`decode_string`] pick
+/// the encoding (or fall back to hex). The remaining variants are user-forced
+/// overrides — e.g. from the GUI Strings pane — and are applied even when the
+/// blob is not cleanly printable, escaping any bytes that don't fit.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+pub enum BytesDisplay {
+    /// Auto-detect ASCII / UTF-16LE, else hex.
+    #[default]
+    Auto,
+    /// Force ASCII rendering.
+    Ascii,
+    /// Force UTF-16LE rendering.
+    Utf16Le,
+    /// Force raw `\xNN` hex.
+    Raw,
+}
+
+/// Push one ASCII byte to `out`, either as a literal char or a `\xNN` escape.
+fn push_ascii_byte(out: &mut String, b: u8) {
+    match b {
+        b'"' | b'\\' => {
+            out.push('\\');
+            out.push(b as char);
+        }
+        _ if b.is_ascii_graphic() || b == b' ' => out.push(b as char),
+        _ => out.push_str(&format!("\\x{b:02x}")),
+    }
+}
+
+/// Render `data` as the full `b"..."` literal text under `mode`.
+///
+/// Forced ASCII/UTF-16LE modes are best-effort: bytes (or code units) that
+/// aren't printable are escaped rather than rejected, so the user always sees
+/// the override they asked for.
+pub fn render_bytes_literal(data: &[u8], mode: BytesDisplay) -> String {
+    let mut out = String::new();
+    out.push_str("b\"");
+    match mode {
+        BytesDisplay::Auto => {
+            if let Some((_, s)) = decode_string(data) {
+                out.push_str(&escape_decoded(&s));
+            } else {
+                for &b in data {
+                    out.push_str(&format!("\\x{b:02x}"));
+                }
+            }
+        }
+        BytesDisplay::Ascii => {
+            for &b in data {
+                push_ascii_byte(&mut out, b);
+            }
+        }
+        BytesDisplay::Utf16Le => {
+            let mut chunks = data.chunks_exact(2);
+            for c in &mut chunks {
+                let unit = u16::from_le_bytes([c[0], c[1]]);
+                match char::from_u32(unit as u32) {
+                    Some(ch) if !ch.is_control() => match ch {
+                        '"' | '\\' => {
+                            out.push('\\');
+                            out.push(ch);
+                        }
+                        _ => out.push(ch),
+                    },
+                    _ => out.push_str(&format!("\\u{{{unit:04x}}}")),
+                }
+            }
+            // Trailing odd byte, if any.
+            for &b in chunks.remainder() {
+                out.push_str(&format!("\\x{b:02x}"));
+            }
+        }
+        BytesDisplay::Raw => {
+            for &b in data {
+                out.push_str(&format!("\\x{b:02x}"));
+            }
+        }
+    }
+    out.push('"');
+    out
+}
+
 impl std::fmt::Display for BytesRef<'_, '_> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let data = &self.ctx.values.bytes[self.id].data;
+        let mode = self.ctx.bytes_display(self.id);
+        if mode != BytesDisplay::Auto {
+            return f.write_str(&render_bytes_literal(data, mode));
+        }
         if let Some((_, s)) = decode_string(data) {
             return write!(f, "b\"{}\"", escape_decoded(&s));
         }

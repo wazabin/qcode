@@ -26,7 +26,10 @@ use std::fmt::{Debug, Display, Formatter};
 
 pub use block::{BasicBlock, BlockId, BlockMutRef, BlockRef};
 pub use block_param::{BlockParam, BlockParamId, BlockParamMutRef, BlockParamRef};
-pub use bytes::{Bytes, BytesId, BytesRef, StringEncoding, decode_string, escape_decoded};
+pub use bytes::{
+    Bytes, BytesDisplay, BytesId, BytesRef, StringEncoding, decode_string, escape_decoded,
+    render_bytes_literal,
+};
 pub use function::{Function, FunctionId, FunctionMutRef, FunctionRef};
 pub use insn::{Instruction, InstructionId, InstructionRef};
 pub use literal::{LiteralId, LiteralRef};

@@ -43,6 +43,11 @@ pub struct ValueRegistry<'str> {
     #[serde(default)]
     pub bytes: Registry<BytesId, Bytes>,
 
+    /// User-forced rendering overrides for `Bytes` blobs (e.g. from the GUI
+    /// Strings pane). Absent entries render under [`BytesDisplay::Auto`].
+    #[serde(default)]
+    pub(crate) bytes_display: HashMap<BytesId, crate::value::BytesDisplay>,
+
     /// Instruction storage.
     pub instructions: Registry<InstructionId, Instruction<'str>>,
 

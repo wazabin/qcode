@@ -368,6 +368,27 @@ impl<'str> Context<'str> {
         }
     }
 
+    /// The forced rendering mode for a `Bytes` blob, or
+    /// [`BytesDisplay::Auto`](crate::value::BytesDisplay::Auto) if unset.
+    pub fn bytes_display(&self, id: crate::value::BytesId) -> crate::value::BytesDisplay {
+        self.values
+            .bytes_display
+            .get(&id)
+            .copied()
+            .unwrap_or_default()
+    }
+
+    /// Force how a `Bytes` blob renders as a `b"..."` literal everywhere.
+    /// Setting [`BytesDisplay::Auto`](crate::value::BytesDisplay::Auto) clears
+    /// any existing override.
+    pub fn set_bytes_display(&mut self, id: crate::value::BytesId, mode: crate::value::BytesDisplay) {
+        if mode == crate::value::BytesDisplay::Auto {
+            self.values.bytes_display.remove(&id);
+        } else {
+            self.values.bytes_display.insert(id, mode);
+        }
+    }
+
     /// Returns a list of all blocks in the context
     pub fn block_ids(&self) -> Vec<BlockId> {
         self.values.basic_blocks.iter().map(|b| b.id).collect()
