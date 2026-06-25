@@ -151,7 +151,9 @@ fn add(a: ValueRange, b: ValueRange, mask: u64) -> Option<ValueRange> {
 
 fn sub(a: ValueRange, b: ValueRange) -> Option<ValueRange> {
     // Underflow anywhere in the interval would wrap; bail out entirely.
-    (a.min >= b.max).then_some(ValueRange {
+    // Lazy `then` so the subtractions are evaluated only once the guard holds —
+    // `then_some` would compute `a.min - b.max` eagerly and overflow when it fails.
+    (a.min >= b.max).then(|| ValueRange {
         min: a.min - b.max,
         max: a.max - b.min,
     })
