@@ -96,6 +96,12 @@ fn is_pure_dataop(m: &Mnemonic) -> bool {
             | Mnemonic::Carry(_)
             | Mnemonic::SCarry(_)
             | Mnemonic::SBorrow(_)
+            // A `map`'s body is pure by invariant, so the map is a pure function
+            // of its `src`/`captures` operands (the `body` symbol is not an
+            // operand and is cloned verbatim). Allowing it here lets a returned
+            // `body <$> arr` project to `body <$> arg` at each caller, which
+            // `MapProject` then reduces to `body(k, arr[k])`.
+            | Mnemonic::Map(_)
     )
     // Deliberately excluded: Load/Store (memory), Call*/Return/Branch* (control
     // & effects), Tuple/Extract (aggregate plumbing), PCodeOp (opaque/arch).
@@ -139,7 +145,8 @@ fn return_tuple_fields(ctx: &Context, ret_id: InstructionId) -> Option<Vec<Value
 
 /// Walk `value`'s def DAG, collecting the instruction nodes in post-order (defs
 /// before uses, deduplicated). Returns `false` if any node is not a pure data-op
-/// over literals / inline-input params, or the budget is exceeded. `inputs` maps
+/// (or a pure-bodied `map`) over literals / inline-input params, or the budget is
+/// exceeded. `inputs` maps
 /// each *register-argument* param `ValueId` to its positional `Call.args` index
 /// (see [`try_partial_inline`] — stack-passed params are excluded and so fail
 /// here like any other non-input leaf).
@@ -513,6 +520,86 @@ mod tests {
             binops_in(&tc, g_cont),
             1,
             "the 1-insn expr is recomputed once at the caller"
+        );
+    }
+
+    /// A callee whose sole output is a `map` over its input array param projects
+    /// that map back into every caller: the caller's `extract` of the field is
+    /// replaced by `body <$> arg`, the callee's param substituted by the call
+    /// argument. This is what lets caller-side `MapProject` later recover an
+    /// element `body(k, arr[k])`.
+    #[test]
+    fn projects_returned_map_into_caller() {
+        let mut tc = qcode::testing::TestContext::new();
+        let (vr0, vr1) = (tc.r0, tc.r1);
+        let body = Function::make(&mut tc.ctx, "foobar".into()).unwrap().id;
+
+        qcode!(
+            tc.ctx,
+            "
+            fn f:
+                <f_entry @r0:i64>
+                    return [i64 0];
+
+            fn g:
+                <g_entry>
+                    goto <g_call>;
+                <g_call>
+                    call <f>;
+                <g_cont>
+                    return [i64 0];
+            "
+        );
+        let _ = g;
+
+        // Type the input param as `[i8;8]` so the map's result is the array.
+        let i8 = tc.ctx.types.get_or_make_int(1);
+        let arr_ty = tc.ctx.types.get_or_make_array(i8, 8);
+        let r0 = BasicBlock::from_id(&tc.ctx, f_entry)
+            .params()
+            .next()
+            .unwrap()
+            .id();
+        if let ValueId::BlockParam(pid) = r0 {
+            tc.ctx.values.block_params[pid].type_id = arr_ty;
+        }
+
+        // Build `%m = foobar <$> @r0; %agg = (%m,)` at the head of f_entry;
+        // `make_pure_reg` then wires that tuple as the functional return value.
+        {
+            let mut b = Builder::from_block(BasicBlock::from_id_mut(&mut tc.ctx, f_entry));
+            b.set_insert_point_to_start();
+            let m = b.push_map(body, r0, Vec::new()).id();
+            b.push_tuple(vec![m]);
+        }
+        let agg = make_pure_reg(&mut tc, f, vec![vr0]);
+
+        // g calls f with an array argument and extracts the single output field.
+        let arg = tc.ctx.get_const(0x4000, 8).id();
+        let call_id = set_call(&mut tc, g_call, f, vec![arg]);
+        tc.ctx.add_cfg_edge(g_call, g_cont);
+        Instruction::from_id_mut(&mut tc.ctx, call_id).set_type(agg);
+        replay_field(&mut tc, g_cont, call_id, 0, vr1);
+
+        assert!(partial_inline(&mut tc.ctx), "the returned map should project");
+        assert_eq!(
+            extracts_of(&tc, g_cont, call_id),
+            0,
+            "the projecting extract is redirected"
+        );
+
+        // A map now lives in the caller, over the same body and the call argument.
+        let projected = BasicBlock::from_id(&tc.ctx, g_cont)
+            .iter()
+            .find_map(|i| match i.mnemonic() {
+                Mnemonic::Map(m) => Some(m.clone()),
+                _ => None,
+            })
+            .expect("the caller holds the projected map");
+        assert_eq!(projected.body, body, "same outlined body symbol");
+        assert_eq!(
+            projected.src, arg,
+            "the map source is substituted by the call argument"
         );
     }
 

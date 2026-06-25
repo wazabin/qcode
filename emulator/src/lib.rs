@@ -92,6 +92,10 @@ pub enum EmulatorErrorKind {
     InterceptError(Box<str>),
     /// A bounded emulation run (e.g. `run_pure`) exceeded its step budget.
     StepBudgetExceeded(usize),
+    /// A mnemonic the interpreter does not model (e.g. `map`, whose whole-array
+    /// emulation is deferred). Recoverable: a best-effort consumer such as
+    /// pure-call folding simply declines to harvest, rather than crashing.
+    UnsupportedMnemonic(&'static str),
 }
 
 impl std::fmt::Display for EmulatorErrorKind {
@@ -114,6 +118,7 @@ impl std::fmt::Display for EmulatorErrorKind {
             Self::StepBudgetExceeded(budget) => {
                 write!(f, "emulation exceeded step budget of {budget}")
             }
+            Self::UnsupportedMnemonic(op) => write!(f, "unsupported mnemonic `{op}`"),
         }
     }
 }
@@ -474,6 +479,13 @@ pub trait Interpreter {
                 }
                 Some(Self::V::intrinsic(intr.id, &args, out_size)?)
             }
+
+            // `map` has no interpreter (whole-array emulation is deferred). Bail
+            // recoverably so a best-effort consumer — pure-call folding emulating a
+            // function whose return depends on a `map` — declines to harvest the
+            // field instead of crashing the whole analysis. (Element projection
+            // does not go through emulation; it inlines the body via `MapProject`.)
+            Mnemonic::Map(_) => return Err(EmulatorErrorKind::UnsupportedMnemonic("map")),
 
             _ => todo!("unimplemented mnemonic: {:?}", insn.mnemonic()),
         };

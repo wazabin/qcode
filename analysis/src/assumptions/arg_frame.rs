@@ -90,10 +90,14 @@ pub fn assume_args_disjoint_caller_frame(ctx: &mut Context, sp_reg: Option<Varno
     let fids: Vec<FunctionId> = ctx.function_ids();
     let mut count = 0;
     for fid in fids {
-        if eligible(ctx, fid, sp_reg, &taken)
-            && ctx.assume_true(Proposition::ArgsDisjointFromCallerFrame(fid))
-        {
-            count += 1;
+        if eligible(ctx, fid, sp_reg, &taken) {
+            if ctx.assume_true(Proposition::ArgsDisjointFromCallerFrame(fid)) {
+                count += 1;
+            }
+            // Same eligibility and consumer (the memory-forwarding alias rule), so
+            // record the loaded-pointer-vs-slot assumption here too — it unblocks
+            // forwarding the spilled buffer-pointer reload argpromote depends on.
+            ctx.assume_true(Proposition::LoadedPointerDisjointFromSlot(fid));
         }
     }
     qcode::pass_log!(

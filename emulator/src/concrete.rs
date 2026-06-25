@@ -1823,6 +1823,59 @@ mod tests {
         assert_eq!(emu.get_value(&ctx, sum.into()), Some(5));
     }
 
+    /// Emulating a function whose body contains a `map` bails with a recoverable
+    /// `UnsupportedMnemonic` error rather than panicking (whole-array emulation is
+    /// deferred; a best-effort consumer declines to harvest).
+    #[test]
+    fn map_emulation_bails_recoverably() {
+        use qcode::builder::Builder;
+        use qcode::value::{BasicBlock, Function, ValueId, insn::Return};
+
+        let mut ctx = Context::new();
+        let body = Function::make(&mut ctx, "body".into()).unwrap().id;
+        let f = Function::make(&mut ctx, "f".into()).unwrap().id;
+        let entry = ctx.get_or_make_block(0x1000);
+        {
+            let mut fm = Function::from_id_mut(&mut ctx, f);
+            fm.set_root(entry).unwrap();
+            fm.add_block(entry);
+        }
+        let i8 = ctx.types.get_or_make_int(1);
+        let arr_ty = ctx.types.get_or_make_array(i8, 4);
+        let src = {
+            let mut b = Builder::from_block(BasicBlock::from_id_mut(&mut ctx, entry));
+            b.push_param(4).id()
+        };
+        if let ValueId::BlockParam(pid) = src {
+            ctx.values.block_params[pid].type_id = arr_ty;
+        }
+        let (mapv, ret, ptr) = {
+            let mut b = Builder::from_block(BasicBlock::from_id_mut(&mut ctx, entry));
+            let m = b.push_map(body, src, Vec::new()).id();
+            let ptr = b.context_mut().get_const(0, 8).id();
+            let ret = b.push_return(ptr).id();
+            unsafe { b.dont_finalize() };
+            (m, ret, ptr)
+        };
+        let ValueId::Instruction(rid) = ret else { unreachable!() };
+        ctx.replace_instruction_mnemonic(
+            rid,
+            Mnemonic::Return(Return {
+                ptr,
+                value: Some(mapv),
+            }),
+        );
+
+        let mut emu = StandaloneEmulator::new(entry);
+        let err = emu
+            .run_pure(&ctx, f, &[SizedValue::new(0, 4)], 1000)
+            .expect_err("map must not be emulated");
+        assert!(matches!(
+            err.kind,
+            EmulatorErrorKind::UnsupportedMnemonic("map")
+        ));
+    }
+
     #[test]
     fn int_mul_wraps_for_64_bit_values() {
         let lhs = SizedValue::new(u64::MAX, 8);

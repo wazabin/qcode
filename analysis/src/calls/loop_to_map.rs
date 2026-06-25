@@ -18,7 +18,8 @@ use qcode::{
     context::Context,
     space::{Space, SpaceId, SpaceType},
     value::{
-        BasicBlock, BlockId, Function, FunctionId, Instruction, InstructionRef, ValueId,
+        BasicBlock, BlockId, Function, FunctionId, Instruction, InstructionRef, Renameable,
+        ValueId,
         insn::{Binop, Branch, InstructionId, IntBinop, Mnemonic, Return},
     },
 };
@@ -108,6 +109,14 @@ pub(crate) fn outline_expression(
     let fid = Function::make(ctx, Cow::Owned(name.to_owned())).ok()?.id;
     let root = Function::from_id_mut(ctx, fid).make_root().id;
 
+    // Give the root block a name so it renders with a real label in the GUI
+    // (otherwise it falls back to an opaque `<bb_N>`). The name must be unique
+    // across the context name map.
+    let block_name = ctx.get_unique_name(Cow::Owned(format!("{name}_entry")));
+    BasicBlock::from_id_mut(ctx, root)
+        .rename(block_name)
+        .expect("name was deduplicated");
+
     // Parameters, in input order, typed as the host inputs.
     let mut value_map: HashMap<ValueId, ValueId> = HashMap::default();
     for &inp in inputs {
@@ -149,7 +158,12 @@ pub(crate) fn outline_expression(
     .id;
     BasicBlock::from_id_mut(ctx, root).push_insn(ret);
 
-    Function::from_id_mut(ctx, fid).set_is_pure(true);
+    // Fully pure: a deterministic function of its params. `is_pure` is the strong
+    // flag; also set `pure_reg` (which it implies) so the GUI — whose purity badge
+    // keys off `is_pure_reg` — marks the outlined body as functionalized.
+    let mut body = Function::from_id_mut(ctx, fid);
+    body.set_is_pure(true);
+    body.set_pure_reg(true);
     Some(fid)
 }
 
@@ -366,11 +380,6 @@ fn try_match(ctx: &Context, fid: FunctionId) -> Option<MapMatch> {
             accesses.push(acc);
         }
     }
-    // Exactly four shadow accesses: seed store, body load, body store, wide
-    // reload. Any other shadow access means the footprint is not the clean map.
-    if accesses.len() != 4 {
-        return None;
-    }
 
     // Seed store: `*[shadow]:N base = arr`, `arr` a root Array param, `base` a
     // root param. Identifies (arr, base, N).
@@ -390,6 +399,19 @@ fn try_match(ctx: &Context, fid: FunctionId) -> Option<MapMatch> {
     // v1: byte lanes only.
     let (elem_ty, arr_count) = ctx.types.array_of(ctx.stored_type_of(arr)?)?;
     if ctx.types.size_of(elem_ty) != 1 || arr_count != count {
+        return None;
+    }
+
+    // Exactly four shadow accesses touch the *region base* — seed store and wide
+    // reload at `base`, plus the body load+store at `base + idx`. Any other access
+    // to the region means it is not a clean total map. Shadow accesses to *other*
+    // bases (e.g. argpromote's coexisting frame seed stores) are unrelated and
+    // ignored: the region is disjoint from them (see `regions_disjoint`).
+    let region_accesses = accesses
+        .iter()
+        .filter(|a| a.ptr == base || base_plus_param(ctx, a.ptr, base).is_some())
+        .count();
+    if region_accesses != 4 {
         return None;
     }
 
@@ -602,6 +624,13 @@ mod tests {
             .any(|i| matches!(i.mnemonic(), Mnemonic::Return(r) if r.value.is_some()));
         assert!(returns_value, "the outlined body returns the element");
         assert!(Function::from_id(&tc.ctx, body).is_pure());
+        // Full purity implies register purity — the GUI badge keys off the latter.
+        assert!(Function::from_id(&tc.ctx, body).is_pure_reg());
+        // The root block carries a real label (not an opaque `<bb_N>` fallback).
+        assert!(
+            BasicBlock::from_id(&tc.ctx, root).name().is_some(),
+            "the outlined root block is named for display"
+        );
     }
 
     /// An expression that reaches a memory load is not a closed pure function of

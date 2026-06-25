@@ -586,6 +586,17 @@ impl<'str, 'ctx> BlockMutRef<'str, 'ctx> {
             self.ctx.remove_instruction(insn);
         }
 
+        // Detach the block's parameters too. They are value defs (e.g. a loop's
+        // induction variable) just like instruction results; leaving them with a
+        // stale `parent` pointing at the now-deleted block would dangle the same
+        // way a tombstoned instruction would. Callers must already have unlinked
+        // their uses (the params have no live readers once the block is gone).
+        let params: Vec<BlockParamId> = self.inner().params.clone();
+        for param in params {
+            self.ctx.values.users.remove(&ValueId::BlockParam(param));
+            self.ctx.values.block_params[param].parent = None;
+        }
+
         Function::from_id_mut(self.ctx, function_id)
             .inner_mut()
             .blocks

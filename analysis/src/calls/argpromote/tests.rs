@@ -1804,6 +1804,174 @@ mod tests {
         );
     }
 
+    /// The real-world shape: the buffer pointer is spilled to `[ESP+4]` and
+    /// **reloaded inside the loop**. Under the frame assumptions
+    /// (`ArgsDisjointFromCallerFrame` + `LoadedPointerDisjointFromSlot`), GVN
+    /// forwards that reload to the by-value pointer param — turning the deref base
+    /// into a clean param, which the region path then promotes (covered by
+    /// `dynamic_index_loop_becomes_map`). This was the bug: without the
+    /// loaded-pointer assumption the reload stays opaque and forwarding is blocked
+    /// by the loop's byte store, so the buffer never promotes.
+    #[test]
+    fn spilled_reloaded_base_forwards_under_assumption() {
+        use qcode::assumption::Proposition;
+
+        let mut tc = qcode::testing::TestContext::new();
+        let sp_reg = tc.r0;
+
+        qcode!(
+            tc.ctx,
+            "
+            fn f:
+                <f_entry @esp:i64 @bufptr:i64>
+                    %slot = @esp + i64 0x4;
+                    store(%slot, @bufptr);
+                    goto <f_head @i=i64 0x0>;
+                <f_head @i:i64>
+                    %c = @i < i64 0x14;
+                    if %c goto <f_body> else goto <f_exit>;
+                <f_body>
+                    %cc = load(i64, %slot);
+                    %addr = %cc + @i;
+                    %b = load(i8, %addr);
+                    %nb = %b + i8 0x1;
+                    store(%addr, %nb);
+                    %ni = @i + i64 0x1;
+                    goto <f_head @i=%ni>;
+                <f_exit>
+                    return [i64 0x0];
+
+            fn g:
+                <g_entry>
+                    goto <g_call>;
+                <g_call>
+                    call <f>;
+                <g_cont>
+                    return [i64 0];
+            "
+        );
+        let _ = (g, f_head, f_body, f_exit);
+
+        // Mark @esp as the stack pointer so frame freshness activates.
+        let esp_pid = BasicBlock::from_id(&tc.ctx, f_entry).params().next().unwrap().id();
+        if let ValueId::BlockParam(inner) = esp_pid {
+            tc.ctx.values.block_params[inner].origin = Some(ValueId::Varnode(sp_reg));
+        }
+        Function::from_id_mut(&mut tc.ctx, f).set_pure_reg(true);
+        let espv = tc.ctx.get_const(0x7000, 8).id();
+        let bufp = tc.ctx.get_const(0x9000, 8).id();
+        set_call(&mut tc, g_call, f, vec![espv, bufp]);
+        tc.ctx.add_cfg_edge(g_call, g_cont);
+
+        // Record both frame assumptions (as the pipeline's assume_arg_frame does),
+        // then forward with a frame-fresh oracle.
+        tc.ctx.assume_true(Proposition::ArgsDisjointFromCallerFrame(f));
+        tc.ctx.assume_true(Proposition::LoadedPointerDisjointFromSlot(f));
+        let aliases =
+            crate::AliasResult::simple(&tc.ctx).with_frame_freshness(&tc.ctx, f, Some(sp_reg));
+        crate::gvn::gvn_function(&mut tc.ctx, f, Some(&aliases));
+
+        // The in-loop reload of the buffer pointer is forwarded away: no load of
+        // `%slot` survives in the body (the base is now the by-value @bufptr).
+        let slot_reload = Function::from_id(&tc.ctx, f).iter().any(|blk| {
+            blk.iter().any(|i| {
+                matches!(i.mnemonic(), Mnemonic::Load(l)
+                    if l.size == 8 && l.space == tc.ctx.default_space)
+            })
+        });
+        assert!(
+            !slot_reload,
+            "the spilled buffer-pointer reload must be forwarded to @bufptr"
+        );
+
+        // The deref base is now the by-value pointer param directly.
+        let base_is_param = Function::from_id(&tc.ctx, f).iter().any(|b| {
+            b.iter().any(|i| matches!(i.mnemonic(), Mnemonic::Binop(bi)
+                if matches!(bi.op, Binop::Int(IntBinop::Add)) && matches!(bi.lhs, ValueId::BlockParam(_))))
+        });
+        assert!(base_is_param, "the buffer deref base is now a clean param");
+    }
+
+    /// The user's real post-forwarding shape: the buffer base is now the by-value
+    /// pointer param `@ESP_val_4`, but argpromote's own dead spilled-arg seed stores
+    /// to `[ESP]`/`[ESP+4]` (caller-frame slots) still sit in the entry. The region
+    /// is through an incoming pointer, disjoint from the whole frame, so those frame
+    /// writes must not block region promotion (the relaxed `regions_disjoint`).
+    #[test]
+    fn region_promotes_with_coexisting_frame_seed_stores() {
+        use qcode::assumption::Proposition;
+
+        let mut tc = qcode::testing::TestContext::new();
+        let sp_reg = tc.r0;
+
+        qcode!(
+            tc.ctx,
+            "
+            fn f:
+                <f_entry @esp:i64 @esp_val_0:i64 @esp_val_4:i64>
+                    store(@esp, @esp_val_0);
+                    %slot = @esp + i64 0x4;
+                    store(%slot, @esp_val_4);
+                    goto <f_head @i=i64 0x0>;
+                <f_head @i:i64>
+                    %c = @i < i64 0x14;
+                    if %c goto <f_body> else goto <f_exit>;
+                <f_body>
+                    %addr = @i + @esp_val_4;
+                    %b = load(i8, %addr);
+                    %nb = %b + i8 0x1;
+                    store(%addr, %nb);
+                    %ni = @i + i64 0x1;
+                    goto <f_head @i=%ni>;
+                <f_exit>
+                    %r = pack(EAX=@esp_val_4);
+                    return [@esp_val_0];
+
+            fn g:
+                <g_entry>
+                    goto <g_call>;
+                <g_call>
+                    call <f>;
+                <g_cont>
+                    return [i64 0];
+            "
+        );
+        let _ = (g, f_head, f_body, f_exit, f_entry);
+
+        let esp_pid = BasicBlock::from_id(&tc.ctx, f_entry).params().next().unwrap().id();
+        if let ValueId::BlockParam(inner) = esp_pid {
+            tc.ctx.values.block_params[inner].origin = Some(ValueId::Varnode(sp_reg));
+        }
+        Function::from_id_mut(&mut tc.ctx, f).set_pure_reg(true);
+        let espv = tc.ctx.get_const(0x7000, 8).id();
+        let v0 = tc.ctx.get_const(0x10, 8).id();
+        let v4 = tc.ctx.get_const(0x9000, 8).id();
+        set_call(&mut tc, g_call, f, vec![espv, v0, v4]);
+        tc.ctx.add_cfg_edge(g_call, g_cont);
+
+        tc.ctx.assume_true(Proposition::ArgsDisjointFromCallerFrame(f));
+
+        assert!(
+            argpromote_with_sp(&mut tc.ctx, Some(sp_reg)),
+            "region must promote despite the caller-frame seed stores"
+        );
+        // The buffer region snapshots as an Array param.
+        let has_array_param = Function::from_id(&tc.ctx, f).root().is_some_and(|b| {
+            b.params().any(|p| tc.ctx.types.array_of(p.type_id()).is_some())
+        });
+        assert!(has_array_param, "the buffer region became an Array input");
+
+        mark_pure_functions(&mut tc.ctx);
+        assert!(
+            crate::calls::loop_to_map::recognize_total_maps(&mut tc.ctx),
+            "the loop should be recognized as a map"
+        );
+        let has_map = Function::from_id(&tc.ctx, f)
+            .iter()
+            .any(|b| b.iter().any(|i| matches!(i.mnemonic(), Mnemonic::Map(_))));
+        assert!(has_map, "f must contain a map");
+    }
+
     /// End to end: step-1 region promotion then the loop-to-map recognizer turns
     /// the buffer loop's returned write-set value into `map(body_fn, arr)` — the
     /// projectable form. The body is outlined into a fresh pure function.

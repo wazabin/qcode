@@ -2,6 +2,7 @@ use std::borrow::Cow;
 use std::collections::HashSet;
 
 use qcode::{
+    assumption::Proposition,
     builder::Builder,
     context::Context,
     space::SpaceId,
@@ -40,6 +41,17 @@ impl OwnFrame {
     fn is_local(&self, ctx: &Context, addr: ValueId) -> bool {
         self.sp_param.is_some_and(|sp| {
             frame_class(ctx, &self.numbering, sp, addr) == Some(FrameClass::Local)
+        })
+    }
+
+    /// Whether `addr` is any `@SP`-rooted frame slot — an own-frame local or a
+    /// caller-frame slot (`@SP + k`, `k ≥ 0`).
+    fn is_frame_slot(&self, ctx: &Context, addr: ValueId) -> bool {
+        self.sp_param.is_some_and(|sp| {
+            matches!(
+                frame_class(ctx, &self.numbering, sp, addr),
+                Some(FrameClass::Local | FrameClass::CallerFrame)
+            )
         })
     }
 }
@@ -479,15 +491,18 @@ fn all_writes_resolvable(
 /// to be sound it must not overlap another replayed write the caller orders
 /// independently. Two *incoming* pointer regions can essentially never be proven
 /// disjoint (no `restrict`), so v1 promotes a region only when it is unambiguously
-/// the sole writer:
+/// the sole non-frame writer:
 ///
 /// * at most one region in the whole function, and
-/// * if it is written, every *other* surfaced store is an own-frame local (dead on
-///   exit, excluded from the write-set) — so no second caller-visible write exists
-///   to alias it.
+/// * if it is written, every *other* surfaced store lands in an `@SP`-rooted frame
+///   slot — an own-frame local (sound by frame freshness) or a caller-frame slot
+///   (under [`Proposition::ArgsDisjointFromCallerFrame`]). The region base is a
+///   promoted *incoming* pointer param, disjoint from the whole frame, so those
+///   frame writes (e.g. argpromote's own spilled-arg seed stores, replayed as
+///   no-ops) cannot overlap the region. Any *non-frame* coexisting write — a second
+///   incoming pointer we cannot separate — keeps the function on the partial path.
 ///
-/// Anything else falls to partial mode. (A read-only region has no replay, so it is
-/// always safe.)
+/// (A read-only region has no replay, so it is always safe.)
 fn regions_disjoint(
     ctx: &Context,
     fid: FunctionId,
@@ -503,11 +518,15 @@ fn regions_disjoint(
     if !writing_region {
         return true;
     }
+    let caller_frame_assumed = ctx
+        .truth(Proposition::ArgsDisjointFromCallerFrame(fid))
+        .is_some_and(|t| t.value);
     let own_frame = OwnFrame::new(ctx, fid, sp_reg);
     promoted.iter().all(|p| {
-        p.write_targets
-            .iter()
-            .all(|&(addr, _)| own_frame.is_local(ctx, addr))
+        p.write_targets.iter().all(|&(addr, _)| {
+            own_frame.is_local(ctx, addr)
+                || (caller_frame_assumed && own_frame.is_frame_slot(ctx, addr))
+        })
     })
 }
 

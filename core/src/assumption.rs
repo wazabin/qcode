@@ -58,6 +58,20 @@ pub enum Proposition {
     /// refuting it (→ replay) only when a direct caller *provably* passes a pointer
     /// argument whose access interval overlaps the callee's argument slots.
     ArgsDisjointFromCallerFrame(FunctionId),
+    /// Within this function, a pointer **loaded from a slot** does not alias that
+    /// slot: a store through `load(X) + …` cannot clobber `X` itself — the buffer a
+    /// pointer addresses does not overlap the storage of the pointer. This lets the
+    /// alias rule (see [`AliasResult::provably_disjoint`]) forward a spilled buffer
+    /// pointer's in-loop reload across the very store that writes *through* it,
+    /// which `argpromote` needs to region-promote a dynamic-index buffer loop.
+    /// Like [`ArgsDisjointFromCallerFrame`] it is **not** statically sound on its
+    /// own — it fails only for a self-referential pointer (`*pp == &pp`), which real
+    /// code does not build — so a pass records it `Assumed`; v1 has no verifier
+    /// (nothing currently proves the negation), the checkpoint+replay net catching
+    /// any future refutation.
+    ///
+    /// [`AliasResult::provably_disjoint`]: crate
+    LoadedPointerDisjointFromSlot(FunctionId),
     /// The `size` bytes at virtual address `addr` (a jump-table entry the
     /// jump-table resolver read out of read-only data) are assumed never
     /// written at runtime; a write would invalidate the resolved jump target.

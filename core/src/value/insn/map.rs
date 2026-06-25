@@ -40,16 +40,20 @@ impl MnemonicKind for Map {
     }
 
     fn fmt(&self, f: &mut Formatter<'_>, ctx: &Context<'_>) -> std::fmt::Result {
-        write!(
-            f,
-            "map(@{}, {}",
-            Function::from_id(ctx, self.body).name(),
-            ValueRef::new(self.src, ctx),
-        )?;
-        for &c in &self.captures {
-            write!(f, ", {}", ValueRef::new(c, ctx))?;
+        // `foo <$> arr` (Haskell `fmap`): apply the per-element body over the
+        // array. Captures render as a partial application of the body —
+        // `(foo c0 c1) <$> arr` — since the index and element are supplied by the
+        // map itself, not written here.
+        let body = Function::from_id(ctx, self.body).name();
+        if self.captures.is_empty() {
+            write!(f, "@{} <$> {};", body, ValueRef::new(self.src, ctx))
+        } else {
+            write!(f, "(@{}", body)?;
+            for &c in &self.captures {
+                write!(f, " {}", ValueRef::new(c, ctx))?;
+            }
+            write!(f, ") <$> {};", ValueRef::new(self.src, ctx))
         }
-        f.write_str(");")
     }
 
     fn args(&self) -> Vec<ValueId> {
@@ -70,6 +74,52 @@ mod tests {
             insn::{Mnemonic, mnemonic::MnemonicKind},
         },
     };
+
+    /// A `map` renders as Haskell `fmap`: `@body <$> src` (and a partial
+    /// application `(@body c0) <$> src` when it captures loop invariants).
+    #[test]
+    fn map_renders_as_fmap() {
+        let mut tc = TestContext::new();
+        let body = Function::make(&mut tc.ctx, "foo".into()).unwrap().id;
+        let host = Function::make(&mut tc.ctx, "host".into()).unwrap().id;
+        let entry = tc.ctx.get_or_make_block(0x2000);
+        {
+            let mut f = Function::from_id_mut(&mut tc.ctx, host);
+            f.set_root(entry).unwrap();
+            f.add_block(entry);
+        }
+        let i8 = tc.ctx.types.get_or_make_int(1);
+        let array_ty = tc.ctx.types.get_or_make_array(i8, 8);
+        let (src, cap) = {
+            let mut b = Builder::from_block(BasicBlock::from_id_mut(&mut tc.ctx, entry));
+            (b.push_param(8).id(), b.push_param(4).id())
+        };
+        if let ValueId::BlockParam(pid) = src {
+            tc.ctx.values.block_params[pid].type_id = array_ty;
+        }
+
+        let plain = {
+            let mut b = Builder::from_block(BasicBlock::from_id_mut(&mut tc.ctx, entry));
+            b.push_map(body, src, Vec::new()).id()
+        };
+        let ValueId::Instruction(plain_id) = plain else { unreachable!() };
+        let rendered = tc.ctx.get_insn(plain_id).as_statement().to_string();
+        assert!(
+            rendered.contains("@foo <$>"),
+            "map renders as fmap, got: {rendered}"
+        );
+
+        let with_cap = {
+            let mut b = Builder::from_block(BasicBlock::from_id_mut(&mut tc.ctx, entry));
+            b.push_map(body, src, vec![cap]).id()
+        };
+        let ValueId::Instruction(cap_id) = with_cap else { unreachable!() };
+        let rendered = tc.ctx.get_insn(cap_id).as_statement().to_string();
+        assert!(
+            rendered.contains("(@foo ") && rendered.contains(") <$>"),
+            "a capturing map renders as a partial application, got: {rendered}"
+        );
+    }
 
     #[test]
     fn map_builds_with_array_result_and_symbol_body() {

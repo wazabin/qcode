@@ -189,9 +189,10 @@ impl AliasResult {
         let Some(frame) = &self.frame else {
             return false;
         };
-        // Rule 1: own-frame local ⊥ incoming pointer (sound).
-        if (frame.own_frame_locals.contains(&a) && self.is_input_derived(ctx, b))
-            || (frame.own_frame_locals.contains(&b) && self.is_input_derived(ctx, a))
+        // Rule 1: own-frame local ⊥ incoming pointer (sound). Strict input-derivation
+        // (no load peeling) keeps this rule a theorem, not an assumption.
+        if (frame.own_frame_locals.contains(&a) && self.is_input_derived(ctx, b, false))
+            || (frame.own_frame_locals.contains(&b) && self.is_input_derived(ctx, a, false))
         {
             return true;
         }
@@ -210,11 +211,22 @@ impl AliasResult {
         let caller_frame_assumed = ctx
             .truth(Proposition::ArgsDisjointFromCallerFrame(frame.fid))
             .is_some_and(|t| t.value);
+        // Under [`Proposition::LoadedPointerDisjointFromSlot`], a value *loaded* from
+        // a slot is treated as carrying incoming-pointer provenance (`peel_loads`):
+        // the spilled-pointer reload idiom, where a buffer pointer is spilled to a
+        // caller-frame slot and reloaded inside a loop. Without it the reload reads
+        // as opaque and blocks forwarding (the deref's base is a `load`, so the loop
+        // store cannot be shown disjoint from the slot). The frame footprint a
+        // loaded pointer is taken disjoint from is the same one rule 2 already
+        // assumes for a direct incoming pointer.
+        let peel_loads = ctx
+            .truth(Proposition::LoadedPointerDisjointFromSlot(frame.fid))
+            .is_some_and(|t| t.value);
         let is_caller_frame =
             |v: ValueId| v == frame.sp_param || frame.caller_frame_slots.contains(&v);
         caller_frame_assumed
-            && ((is_caller_frame(a) && self.is_input_derived(ctx, b))
-                || (is_caller_frame(b) && self.is_input_derived(ctx, a)))
+            && ((is_caller_frame(a) && self.is_input_derived(ctx, b, peel_loads))
+                || (is_caller_frame(b) && self.is_input_derived(ctx, a, peel_loads)))
     }
 
     /// Whether `v` is an own-frame local under the populated frame-freshness
@@ -230,11 +242,14 @@ impl AliasResult {
     /// parameter of this function's root block, i.e. a value that entered from the
     /// caller. The `add`/`sub` peel bails if either operand is itself an own-frame
     /// local, so a nonsensical `local + arg` mix is never read as input.
-    fn is_input_derived(&self, ctx: &Context, v: ValueId) -> bool {
+    /// With `peel_loads`, a `load(…)` also counts as input-derived (a reloaded
+    /// spilled pointer carries incoming provenance) — see rule 2 / the
+    /// [`Proposition::LoadedPointerDisjointFromSlot`] assumption.
+    fn is_input_derived(&self, ctx: &Context, v: ValueId, peel_loads: bool) -> bool {
         let Some(frame) = &self.frame else {
             return false;
         };
-        self.is_input_derived_rec(ctx, frame, v, &mut HashSet::default())
+        self.is_input_derived_rec(ctx, frame, v, peel_loads, &mut HashSet::default())
     }
 
     fn is_input_derived_rec(
@@ -242,6 +257,7 @@ impl AliasResult {
         ctx: &Context,
         frame: &FrameInfo,
         v: ValueId,
+        peel_loads: bool,
         seen: &mut HashSet<ValueId>,
     ) -> bool {
         if !seen.insert(v) {
@@ -256,18 +272,23 @@ impl AliasResult {
                         .is_some_and(|b| frame.root_block == Some(b.id))
             }
             ValueId::Instruction(id) => match Instruction::from_id(ctx, id).mnemonic() {
+                // A reloaded spilled pointer: assumed to carry incoming provenance
+                // (gated by the caller via `peel_loads`).
+                Mnemonic::Load(_) if peel_loads => true,
                 Mnemonic::Binop(b) if matches!(b.op, Binop::Int(IntBinop::Add | IntBinop::Sub)) => {
                     if frame.own_frame_locals.contains(&b.lhs)
                         || frame.own_frame_locals.contains(&b.rhs)
                     {
                         return false;
                     }
-                    self.is_input_derived_rec(ctx, frame, b.lhs, seen)
-                        || self.is_input_derived_rec(ctx, frame, b.rhs, seen)
+                    self.is_input_derived_rec(ctx, frame, b.lhs, peel_loads, seen)
+                        || self.is_input_derived_rec(ctx, frame, b.rhs, peel_loads, seen)
                 }
-                Mnemonic::Zext(z) => self.is_input_derived_rec(ctx, frame, z.src, seen),
-                Mnemonic::Sext(s) => self.is_input_derived_rec(ctx, frame, s.src, seen),
-                Mnemonic::Range(r) => self.is_input_derived_rec(ctx, frame, r.src, seen),
+                Mnemonic::Zext(z) => self.is_input_derived_rec(ctx, frame, z.src, peel_loads, seen),
+                Mnemonic::Sext(s) => self.is_input_derived_rec(ctx, frame, s.src, peel_loads, seen),
+                Mnemonic::Range(r) => {
+                    self.is_input_derived_rec(ctx, frame, r.src, peel_loads, seen)
+                }
                 _ => false,
             },
             _ => false,
@@ -460,6 +481,64 @@ mod tests {
         // Inert without the frame-freshness context.
         let plain = AliasResult::simple(&tc.ctx);
         assert!(!plain.provably_disjoint(&tc.ctx, local, arg));
+    }
+
+    /// Loaded-pointer rule: a deref through a pointer reloaded from a caller-frame
+    /// slot (`load(@SP+4) + i`) is taken disjoint from the frame (`@SP`) — but only
+    /// when *both* `ArgsDisjointFromCallerFrame` and `LoadedPointerDisjointFromSlot`
+    /// are recorded (it rides the caller-frame rule via `peel_loads`).
+    #[test]
+    fn loaded_pointer_disjoint_from_slot_only_under_assumption() {
+        use qcode::{
+            assumption::Proposition,
+            builder::Builder,
+            testing::TestContext,
+            value::{BasicBlock, Function, Value},
+        };
+
+        let mut tc = TestContext::new();
+        let sp_reg = tc.r0;
+        let fid = Function::make(&mut tc.ctx, "f".into()).unwrap().id;
+        let root = tc.ctx.get_or_make_block(0x1000);
+        {
+            let mut f = Function::from_id_mut(&mut tc.ctx, fid);
+            f.set_root(root).unwrap();
+            f.add_block(root);
+        }
+        let sp_pid = BasicBlock::from_id_mut(&mut tc.ctx, root).push_param(8).id;
+        tc.ctx.values.block_params[sp_pid].origin = Some(ValueId::Varnode(sp_reg));
+        let sp = ValueId::BlockParam(sp_pid);
+
+        let ram = tc.ctx.default_space;
+        let addr = {
+            let mut b = Builder::from_block(BasicBlock::from_id_mut(&mut tc.ctx, root));
+            let c4 = b.context_mut().get_const(4, 8).id();
+            let slot = b.push_add(sp, c4).id(); // @SP + 4 (caller-frame slot)
+            let cc = b.push_load::<false>(slot, 8, ram).id(); // buf = load(@SP+4)
+            let addr = b.push_add(cc, c4).id(); // buf + 4
+            unsafe { b.dont_finalize() };
+            addr
+        };
+
+        // Caller-frame disjointness is assumed, but the reload is opaque without the
+        // loaded-pointer assumption, so the deref is not yet input-derived.
+        tc.ctx
+            .assume_true(Proposition::ArgsDisjointFromCallerFrame(fid));
+        let r = AliasResult::simple(&tc.ctx).with_frame_freshness(&tc.ctx, fid, Some(sp_reg));
+        assert!(
+            !r.provably_disjoint(&tc.ctx, addr, sp),
+            "the spilled reload is opaque without LoadedPointerDisjointFromSlot"
+        );
+
+        // With both assumptions, the deref counts as incoming and misses the frame.
+        tc.ctx
+            .assume_true(Proposition::LoadedPointerDisjointFromSlot(fid));
+        let r = AliasResult::simple(&tc.ctx).with_frame_freshness(&tc.ctx, fid, Some(sp_reg));
+        assert!(
+            r.provably_disjoint(&tc.ctx, addr, sp),
+            "load(@SP+4) + 4 ⊥ @SP under both assumptions"
+        );
+        assert!(r.provably_disjoint(&tc.ctx, sp, addr), "rule is symmetric");
     }
 
     /// Caller-frame rule: a caller-frame slot (`@SP + 8`) is disjoint from an
