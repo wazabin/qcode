@@ -67,6 +67,13 @@ pub trait Type: Send + Sync {
         None
     }
 
+    /// The `(elem, count)` pair, if this is an [`ArrayType`]. Returns `None` for
+    /// every other type — this is the *only* discriminator element-aware code
+    /// uses to tell an array from the width-N scalar it otherwise looks like.
+    fn array(&self) -> Option<(TypeId, usize)> {
+        None
+    }
+
     /// Clones this type into a fresh boxed trait object.
     ///
     /// This enables `Clone for Box<dyn Type>` (and hence `Clone` for
@@ -120,6 +127,20 @@ pub enum TypeRepr {
     StructPointer {
         size: usize,
         pointee: TypeId,
+    },
+    /// A fixed-length homogeneous array of `count` elements of type `elem`,
+    /// laid out contiguously. Its byte width is `count * sizeof(elem)`.
+    ///
+    /// Deliberately **disguised as a width-N scalar**: it answers
+    /// [`Type::size`] like any integer and does *not* expose [`Type::fields`],
+    /// so structural passes (mem2reg, alias, DCE, GVN value-numbering) handle it
+    /// unchanged. Only element-aware sites (`argpromote`, the `Extract`/`Range`
+    /// over `Map` rewrite, emulation) consult [`Type::array`]. Lane projection is
+    /// defined as a contiguous bit-slice: `Extract(arr, k) ≡ Range(arr,
+    /// k*sizeof(elem), sizeof(elem))`.
+    Array {
+        elem: TypeId,
+        count: usize,
     },
 }
 
@@ -318,6 +339,37 @@ impl Type for StructPointer {
     }
 }
 
+/// A fixed-length homogeneous array — see [`TypeRepr::Array`]. `size` is cached
+/// as `count * sizeof(elem)`; the array is opaque (no `fields()`) so it presents
+/// to structural passes exactly as a width-`size` integer would.
+#[derive(Clone)]
+struct ArrayType {
+    elem: TypeId,
+    count: usize,
+    size: usize,
+}
+
+impl Type for ArrayType {
+    fn size(&self) -> usize {
+        self.size
+    }
+
+    fn array(&self) -> Option<(TypeId, usize)> {
+        Some((self.elem, self.count))
+    }
+
+    fn clone_box(&self) -> Box<dyn Type> {
+        Box::new(self.clone())
+    }
+
+    fn repr(&self) -> TypeRepr {
+        TypeRepr::Array {
+            elem: self.elem,
+            count: self.count,
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // TypeManager
 // ---------------------------------------------------------------------------
@@ -340,6 +392,8 @@ pub struct TypeManager {
     struct_by_name: HashMap<String, TypeId>,
     /// Fast lookup: (size, pointee) → StructPointer TypeId.
     struct_pointer: HashMap<(usize, TypeId), TypeId>,
+    /// Fast lookup: (elem, count) → Array TypeId.
+    array_by_elem_count: HashMap<(TypeId, usize), TypeId>,
 }
 
 impl Default for TypeManager {
@@ -357,6 +411,7 @@ impl TypeManager {
             aggregate_by_fields: HashMap::default(),
             struct_by_name: HashMap::default(),
             struct_pointer: HashMap::default(),
+            array_by_elem_count: HashMap::default(),
         }
     }
 
@@ -465,6 +520,24 @@ impl TypeManager {
         self.get(id).pointee()
     }
 
+    /// Returns the [`TypeId`] for an [`ArrayType`] of `count` elements of type
+    /// `elem`, creating it if it does not yet exist. `elem` must already be
+    /// registered (it always is: you build the element type first).
+    pub fn get_or_make_array(&mut self, elem: TypeId, count: usize) -> TypeId {
+        if let Some(&id) = self.array_by_elem_count.get(&(elem, count)) {
+            return id;
+        }
+        let size = self.size_of(elem) * count;
+        let id = self.register(Box::new(ArrayType { elem, count, size }));
+        self.array_by_elem_count.insert((elem, count), id);
+        id
+    }
+
+    /// The `(elem, count)` of `id`, if `id` is an [`ArrayType`].
+    pub fn array_of(&self, id: TypeId) -> Option<(TypeId, usize)> {
+        self.get(id).array()
+    }
+
     /// A short display name for `id`, used by the IR formatters in place of the
     /// raw `i<bits>` width. Nominal structs print their name and struct pointers
     /// print `Pointee*`; everything else (integers, stack/space addresses, and
@@ -474,6 +547,7 @@ impl TypeManager {
         match self.get(id).repr() {
             TypeRepr::Struct { name, .. } => name,
             TypeRepr::StructPointer { pointee, .. } => format!("{}*", self.type_name(pointee)),
+            TypeRepr::Array { elem, count } => format!("[{};{}]", self.type_name(elem), count),
             _ => format!("i{}", self.size_of(id) * 8),
         }
     }
@@ -576,6 +650,45 @@ impl serde::Serialize for TypeManager {
     }
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn array_is_a_disguised_width_n_scalar() {
+        let mut tm = TypeManager::new();
+        let i8 = tm.get_or_make_int(1);
+        let arr = tm.get_or_make_array(i8, 20);
+
+        // Width is count * sizeof(elem) — structural passes see a 20-byte scalar.
+        assert_eq!(tm.size_of(arr), 20);
+        // Disguise: no aggregate fields, so tuple/struct machinery skips it.
+        assert!(tm.aggregate_fields(arr).is_none());
+        // Element-aware sites recover (elem, count).
+        assert_eq!(tm.array_of(arr), Some((i8, 20)));
+        // Interned: same (elem, count) → same TypeId.
+        assert_eq!(tm.get_or_make_array(i8, 20), arr);
+        assert_ne!(tm.get_or_make_array(i8, 21), arr);
+        // Pretty name for dumps.
+        assert_eq!(tm.type_name(arr), "[i8;20]");
+    }
+
+    #[test]
+    fn array_round_trips_through_serde() {
+        let mut tm = TypeManager::new();
+        let i8 = tm.get_or_make_int(1);
+        let arr = tm.get_or_make_array(i8, 20);
+
+        let config = bincode::config::standard();
+        let bytes = bincode::serde::encode_to_vec(&tm, config).unwrap();
+        let (back, _): (TypeManager, _) =
+            bincode::serde::decode_from_slice(&bytes, config).unwrap();
+        // Replaying constructors in TypeId order reproduces the same handles.
+        assert_eq!(back.array_of(arr), Some((i8, 20)));
+        assert_eq!(back.size_of(arr), 20);
+    }
+}
+
 impl<'de> serde::Deserialize<'de> for TypeManager {
     fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
         let reprs = Vec::<TypeRepr>::deserialize(deserializer)?;
@@ -600,6 +713,11 @@ impl<'de> serde::Deserialize<'de> for TypeManager {
                 // so replaying in order guarantees it already exists here.
                 TypeRepr::StructPointer { size, pointee } => {
                     manager.get_or_make_struct_pointer(size, pointee);
+                }
+                // The element type has a lower TypeId (built before the array),
+                // so replaying in order guarantees it already exists here.
+                TypeRepr::Array { elem, count } => {
+                    manager.get_or_make_array(elem, count);
                 }
             }
         }

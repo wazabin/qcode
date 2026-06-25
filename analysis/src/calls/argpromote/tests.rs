@@ -1691,4 +1691,116 @@ mod tests {
         // Idempotent: a second run flags nothing new.
         assert!(!mark_pure_functions(&mut tc.ctx));
     }
+
+    /// A dynamic-index buffer loop — `for i in 0..20 { buf[i] += 1 }`, where `buf`
+    /// is an incoming pointer arg — is the motivating case for the region path. The
+    /// induction variable is bounded to `[0,20)` by the loop guard, so the whole
+    /// `[buf, buf+20)` span snapshots as ONE `Array` input and returns as ONE wide
+    /// write-set entry. Step-1 guarantee: **no real-ram access survives** (every
+    /// load/store redirected into shadow), the function is functionalized.
+    #[test]
+    fn dynamic_index_loop_promotes_as_array_region() {
+        let mut tc = qcode::testing::TestContext::new();
+        // The buffer *pointer* is f's single stack-passed input.
+        let input = stack_input(&mut tc, 4, 8);
+
+        qcode!(
+            tc.ctx,
+            "
+            fn f:
+                <f_entry @stack_10000004:i64>
+                    goto <f_head @i=i64 0x0>;
+                <f_head @i:i64>
+                    %c = @i < i64 0x14;
+                    if %c goto <f_body> else goto <f_exit>;
+                <f_body>
+                    %addr = @stack_10000004 + @i;
+                    %b = load(i8, %addr);
+                    %nb = %b + i8 0x1;
+                    store(%addr, %nb);
+                    %ni = @i + i64 0x1;
+                    goto <f_head @i=%ni>;
+                <f_exit>
+                    return [i64 0x0];
+
+            fn g:
+                <g_entry>
+                    goto <g_call>;
+                <g_call>
+                    call <f>;
+                <g_cont>
+                    return [i64 0];
+            "
+        );
+        let _ = (g, f_head, f_body, f_exit);
+
+        Function::from_id_mut(&mut tc.ctx, f).set_input_regs(vec![input]);
+        Function::from_id_mut(&mut tc.ctx, f).set_pure_reg(true);
+        let ptr = tc.ctx.get_const(0x4000, 8).id();
+        set_call(&mut tc, g_call, f, vec![ptr]);
+        tc.ctx.add_cfg_edge(g_call, g_cont);
+
+        assert!(
+            argpromote(&mut tc.ctx),
+            "a bounded dynamic-index buffer loop should region-promote"
+        );
+
+        // Step-1 guarantee: no access into the real (default) space remains —
+        // every load/store was redirected into the shadow.
+        let ram = tc.ctx.default_space;
+        let real_access = Function::from_id(&tc.ctx, f).iter().any(|blk| {
+            blk.iter().any(|i| match i.mnemonic() {
+                Mnemonic::Load(l) => l.space == ram,
+                Mnemonic::Store(s) => s.space == ram,
+                _ => false,
+            })
+        });
+        assert!(
+            !real_access,
+            "no real-ram access may survive: the buffer is fully functionalized"
+        );
+
+        // The callee gains one `Array`-typed by-value snapshot param for the region.
+        let has_array_param = Function::from_id(&tc.ctx, f).root().is_some_and(|b| {
+            b.params()
+                .any(|p| tc.ctx.types.array_of(p.type_id()).is_some())
+        });
+        assert!(
+            has_array_param,
+            "callee must gain one Array-typed region snapshot param"
+        );
+
+        // The written region rides back out through the return write-set.
+        let returns_value = Function::from_id(&tc.ctx, f).iter().any(|b| {
+            b.iter()
+                .last()
+                .is_some_and(|i| matches!(i.mnemonic(), Mnemonic::Return(r) if r.value.is_some()))
+        });
+        assert!(returns_value, "the written region must ride out in the write-set");
+
+        // The caller snapshots the region (a wide load) before the call.
+        let has_load = BasicBlock::from_id(&tc.ctx, g_call)
+            .iter()
+            .any(|i| matches!(i.mnemonic(), Mnemonic::Load(_)));
+        assert!(has_load, "caller must snapshot the region before the call");
+
+        // The functionalized callee is now pure: its only residual loads are into
+        // the private shadow space (seeded from the Array input), which `mark_pure`
+        // treats as deterministic. The loop survives, but no caller-visible effect.
+        assert!(
+            mark_pure_functions(&mut tc.ctx),
+            "the region-promoted function should be marked pure"
+        );
+        assert!(
+            Function::from_id(&tc.ctx, f).is_pure(),
+            "f is a deterministic function of its Array input"
+        );
+
+        // And the independent verifier agrees — a shadow loop is not a violation.
+        let violations = crate::verify::verify_pure_functions(&tc.ctx);
+        assert!(
+            violations.iter().all(|v| v.function != f),
+            "verifier must not flag the shadow loop as impure: {violations:?}"
+        );
+    }
 }

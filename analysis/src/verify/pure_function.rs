@@ -9,6 +9,7 @@
 
 use qcode::{
     context::Context,
+    space::SpaceType,
     value::{
         Function, FunctionId, Instruction, ValueId,
         insn::{InstructionId, Mnemonic},
@@ -38,13 +39,23 @@ impl PureFunctionViolation {
     }
 }
 
+/// Whether `space` is a builder/argpromote scratch space (a temporary). A
+/// load/store there is private to the function — seeded from inputs or written
+/// earlier in the body — so it is not a caller-visible effect.
+fn is_temp_space(ctx: &Context, space: qcode::space::SpaceId) -> bool {
+    matches!(qcode::space::Space::from_id(ctx, space).ty, SpaceType::Temporary)
+}
+
 /// The residual side effect a mnemonic carries, or `None` if it is pure.
-fn impurity(m: &Mnemonic) -> Option<&'static str> {
+fn impurity(ctx: &Context, m: &Mnemonic) -> Option<&'static str> {
     match m {
-        // A load is an untracked value source; the rest are non-functionalized
-        // effects/transfers. Stores are permitted (they produce no value and the
-        // call site is retained), matching `argpromote::body_is_pure`.
-        Mnemonic::Load(_) => Some("memory load"),
+        // A *real-memory* load is an untracked value source; the rest are
+        // non-functionalized effects/transfers. A load from a temporary (shadow)
+        // space is private — seeded from inputs by argpromote — so it is pure
+        // (a dynamic-index region loop leaves such loads permanently). Stores are
+        // permitted (they produce no value and the call site is retained),
+        // matching `argpromote::body_is_pure`.
+        Mnemonic::Load(l) => (!is_temp_space(ctx, l.space)).then_some("memory load"),
         Mnemonic::Call(_) | Mnemonic::CallInd(_) => Some("call"),
         Mnemonic::BranchInd(_) => Some("indirect branch"),
         Mnemonic::PCodeOp(_) => Some("architecture p-code op"),
@@ -69,7 +80,7 @@ pub fn verify_pure_functions(ctx: &Context<'_>) -> Vec<PureFunctionViolation> {
         }
         for block in Function::from_id(ctx, fid).iter() {
             for insn in block.iter() {
-                if let Some(reason) = impurity(insn.mnemonic()) {
+                if let Some(reason) = impurity(ctx, insn.mnemonic()) {
                     violations.push(PureFunctionViolation {
                         function: fid,
                         insn: insn.id,

@@ -5,6 +5,7 @@ use qcode::{
     builder::Builder,
     context::Context,
     space::SpaceId,
+    types::TypeId,
     value::{
         BasicBlock, Function, FunctionId, Value, ValueId, VarnodeId,
         insn::{Binop, Call, InstructionId, IntBinop, Mnemonic},
@@ -124,6 +125,104 @@ struct ReadField {
     size: usize,
 }
 
+/// Largest byte span a single dynamic-index region may snapshot. A bound the
+/// `value_range` analysis over-approximates past this is treated as unbounded
+/// (the function falls to partial mode rather than snapshotting a huge — and
+/// possibly mostly-unmapped — region).
+const MAX_REGION_BYTES: u64 = 4096;
+
+/// A *region* deref: a load/store through `base + idx` where `idx` is not a
+/// single constant but a value bounded to `[lo, hi]` (typically a loop induction
+/// variable, bounded by the loop guard — see [`value_range`]). The whole touched
+/// span `[lo, hi + size)` is snapshotted as **one** by-value [`Array`] input and,
+/// if written, returned as **one** `Array` write-set entry — the compact
+/// alternative to enumerating `hi - lo + 1` scalar slots (which would blow up for
+/// a large trip count). Soundness rests on the bound, not on per-byte coverage:
+/// snapshotting the whole span over-reads at most the same speculative way the
+/// scalar write-seed already does (see [`apply`]).
+///
+/// [`Array`]: qcode::types::TypeRepr::Array
+#[derive(Clone, Copy)]
+struct Region {
+    /// Byte offset of the region start from the base pointer (the bound's `lo`).
+    base_off: u64,
+    /// Element/access width in bytes (uniform across the region's accesses).
+    elem_size: usize,
+    /// Element count: `ceil(byte_span / elem_size)`.
+    count: usize,
+    /// Whether any store writes into the region — then it contributes one
+    /// `Array` write-set entry; a read-only region contributes only an input.
+    has_write: bool,
+}
+
+impl Region {
+    /// Total snapshot width in bytes.
+    fn byte_len(&self) -> usize {
+        self.count * self.elem_size
+    }
+}
+
+/// Running union of one parameter's dynamic-index accesses, folded into a single
+/// [`Region`]. All accesses through the same base merge into one span; a mismatched
+/// element width clears `ok` (the region is then dropped and its accesses left
+/// unmodelled, steering the function to partial mode).
+#[derive(Default)]
+struct RegionAcc {
+    present: bool,
+    ok: bool,
+    /// Inclusive low byte offset (the bound's `lo`).
+    min: u64,
+    /// Exclusive high byte offset (`hi + elem`).
+    max_end: u64,
+    elem: usize,
+    has_write: bool,
+}
+
+impl RegionAcc {
+    /// Fold in one bounded access: index in `[lo, hi]`, `size`-byte element,
+    /// `is_store` if it writes.
+    fn add(&mut self, lo: u64, hi: u64, size: usize, is_store: bool) {
+        let end = hi.saturating_add(size as u64);
+        if !self.present {
+            *self = RegionAcc {
+                present: true,
+                ok: true,
+                min: lo,
+                max_end: end,
+                elem: size,
+                has_write: is_store,
+            };
+        } else {
+            if self.elem != size {
+                self.ok = false;
+            }
+            self.min = self.min.min(lo);
+            self.max_end = self.max_end.max(end);
+            self.has_write |= is_store;
+        }
+    }
+
+    /// The finished [`Region`], or `None` if absent, inconsistent, or larger than
+    /// [`MAX_REGION_BYTES`].
+    fn build(&self) -> Option<Region> {
+        if !self.present || !self.ok || self.elem == 0 {
+            return None;
+        }
+        let span = self.max_end.checked_sub(self.min)?;
+        if span == 0 || span > MAX_REGION_BYTES {
+            return None;
+        }
+        // Round the span up to a whole number of elements.
+        let count = span.div_ceil(self.elem as u64) as usize;
+        Some(Region {
+            base_off: self.min,
+            elem_size: self.elem,
+            count,
+            has_write: self.has_write,
+        })
+    }
+}
+
 /// A dereferenced pointer parameter slated for promotion, and the IR sites the
 /// rewrite must touch.
 struct Promoted {
@@ -146,6 +245,10 @@ struct Promoted {
     /// Distinct `(address, size)` of each store target written through this
     /// parameter — one write-set entry per address.
     write_targets: Vec<(ValueId, usize)>,
+    /// Dynamic-index region snapshotted through this parameter, if any. At most
+    /// one per param (all dynamic accesses through the param merge into a single
+    /// span). Snapshotted as one `Array` input + (if written) one write entry.
+    region: Option<Region>,
 }
 
 /// How a named parameter is used, deciding whether and how it is promoted.
@@ -160,6 +263,8 @@ struct ParamInfo {
     accesses: Vec<InstructionId>,
     /// Distinct `(address, size)` of each store target written through this param.
     write_targets: Vec<(ValueId, usize)>,
+    /// Dynamic-index region snapshotted through this param, if any.
+    region: Option<Region>,
 }
 
 fn try_promote(
@@ -256,6 +361,7 @@ fn try_promote(
             reads: info.reads,
             accesses: info.accesses,
             write_targets: info.write_targets,
+            region: info.region,
         });
     }
 
@@ -284,6 +390,7 @@ fn try_promote(
     // partial path. (`other passes drop the redundant seed args.`)
     if !all_accesses_modelled(ctx, fid, &promoted)
         || !all_writes_resolvable(ctx, fid, &promoted, sp_reg)
+        || !regions_disjoint(ctx, fid, &promoted, sp_reg)
     {
         qcode::pass_log!(
             debug,
@@ -306,7 +413,7 @@ fn try_promote(
     // moves to the returned write-set). A pointer touched only as data is a no-op.
     if promoted
         .iter()
-        .all(|p| p.reads.is_empty() && p.write_targets.is_empty())
+        .all(|p| p.reads.is_empty() && p.write_targets.is_empty() && p.region.is_none())
     {
         return false;
     }
@@ -367,6 +474,43 @@ fn all_writes_resolvable(
     })
 }
 
+/// Conservative v1 disjointness gate for dynamic-index regions. A written region
+/// is snapshotted and *replayed as one wide store* at the caller; for that replay
+/// to be sound it must not overlap another replayed write the caller orders
+/// independently. Two *incoming* pointer regions can essentially never be proven
+/// disjoint (no `restrict`), so v1 promotes a region only when it is unambiguously
+/// the sole writer:
+///
+/// * at most one region in the whole function, and
+/// * if it is written, every *other* surfaced store is an own-frame local (dead on
+///   exit, excluded from the write-set) — so no second caller-visible write exists
+///   to alias it.
+///
+/// Anything else falls to partial mode. (A read-only region has no replay, so it is
+/// always safe.)
+fn regions_disjoint(
+    ctx: &Context,
+    fid: FunctionId,
+    promoted: &[Promoted],
+    sp_reg: Option<VarnodeId>,
+) -> bool {
+    if promoted.iter().filter(|p| p.region.is_some()).count() > 1 {
+        return false;
+    }
+    let writing_region = promoted
+        .iter()
+        .any(|p| p.region.is_some_and(|r| r.has_write));
+    if !writing_region {
+        return true;
+    }
+    let own_frame = OwnFrame::new(ctx, fid, sp_reg);
+    promoted.iter().all(|p| {
+        p.write_targets
+            .iter()
+            .all(|&(addr, _)| own_frame.is_local(ctx, addr))
+    })
+}
+
 /// `true` if `function_id` makes any call (direct or indirect).
 fn function_makes_blocking_call(ctx: &Context, function_id: FunctionId) -> bool {
     Function::from_id(ctx, function_id).blocks().any(|b| {
@@ -417,6 +561,9 @@ fn analyze_param(ctx: &Context, param: ValueId) -> ParamInfo {
     // (offset from base, access width) for each load — one snapshot scalar each.
     let mut read_fields: Vec<ReadField> = Vec::new();
     let mut write_targets: Vec<(ValueId, usize)> = Vec::new();
+    // One dynamic-index region per param, accumulated across all of its bounded
+    // `param + idx` accesses.
+    let mut region = RegionAcc::default();
     let mut is_deref = false;
 
     // Record a load at constant byte `offset` of `size` bytes. The width is gated
@@ -469,21 +616,49 @@ fn analyze_param(ctx: &Context, param: ValueId) -> ParamInfo {
                                 continue;
                             };
                             let range = value_range(ctx, offset, block);
-                            if range.min != range.max {
-                                continue;
+                            if range.min == range.max {
+                                // Constant offset → one scalar snapshot.
+                                if !push_read(range.min, l.size) {
+                                    continue;
+                                }
+                                any = true;
+                                accesses.push(u2);
+                            } else if region_bounded(ctx, offset, range) {
+                                // Bounded dynamic offset → fold into the region.
+                                region.add(range.min, range.max, l.size, false);
+                                any = true;
+                                accesses.push(u2);
                             }
-                            if !push_read(range.min, l.size) {
-                                continue;
-                            }
-                            any = true;
-                            accesses.push(u2);
+                            // Else: unbounded (Top) — leave unmodelled for the gate.
                         }
                         Mnemonic::Store(s) if s.ptr == add_val && s.space == ram => {
-                            // The write address rides out in the return set as data,
-                            // so any `param ± const` store target qualifies.
-                            any = true;
-                            accesses.push(u2);
-                            write_targets.push((add_val, s.size));
+                            let block = ctx.get_insn(u2).parent().map(|b| b.id);
+                            let range = block.map(|blk| value_range(ctx, offset, blk));
+                            match range {
+                                // Bounded dynamic store → fold into the region (a
+                                // `param - idx` store keeps `is_add == false`, whose
+                                // negative span we do not model; leave it out).
+                                Some(r)
+                                    if r.min != r.max
+                                        && is_add
+                                        && region_bounded(ctx, offset, r) =>
+                                {
+                                    region.add(r.min, r.max, s.size, true);
+                                    any = true;
+                                    accesses.push(u2);
+                                }
+                                // Unbounded dynamic store → unmodelled; leave it out
+                                // of `accesses` so the all-or-nothing gate rejects it.
+                                Some(r) if r.min != r.max => {}
+                                // Constant offset (or no block): the write address
+                                // rides out in the return set as data, so any
+                                // `param ± const` store target qualifies.
+                                _ => {
+                                    any = true;
+                                    accesses.push(u2);
+                                    write_targets.push((add_val, s.size));
+                                }
+                            }
                         }
                         // Already-redirected shadow access from a prior promotion:
                         // following our own indirection — ignore. Any other use of
@@ -524,6 +699,11 @@ fn analyze_param(ctx: &Context, param: ValueId) -> ParamInfo {
         }
     }
 
+    let region = region.build();
+    if region.is_some() {
+        is_deref = true;
+    }
+
     // Deterministic offset order, shared by callee param creation and caller
     // argument loads.
     read_fields.sort_by_key(|f| f.offset);
@@ -541,7 +721,16 @@ fn analyze_param(ctx: &Context, param: ValueId) -> ParamInfo {
         reads: read_fields,
         accesses,
         write_targets: deduped,
+        region,
     }
+}
+
+/// Whether `range` is a usable region bound for `offset`: narrower than the full
+/// width of `offset` (i.e. not Top). A Top range means the index is unconstrained,
+/// so the region would be unbounded — leave the access unmodelled instead.
+fn region_bounded(ctx: &Context, offset: ValueId, range: crate::ValueRange) -> bool {
+    let size = qcode::value::ValueRef::new(offset, ctx).size();
+    range.is_bounded(size)
 }
 
 /// Rewrite `fid` and every direct caller into the shadow-memory / write-set form.
@@ -606,6 +795,16 @@ fn apply(
             }
         }
     }
+    // A written region contributes one *wide* write slot: the whole `[base +
+    // base_off, + byte_len)` span, reloaded from shadow at the return and replayed
+    // as a single store at every caller. Its initial value is seeded by the region
+    // input below, so a path that does not write replays a no-op — same discipline
+    // as the scalar slots.
+    for p in &promoted {
+        if let Some(r) = p.region.filter(|r| r.has_write) {
+            write_slots.push((p.param, p.base_size, r.base_off as i64, r.byte_len()));
+        }
+    }
 
     // The slots to snapshot+seed as by-value input args: one per read scalar, plus
     // one per write target whose `(base, offset)` no read already covers. Each write
@@ -620,7 +819,10 @@ fn apply(
     // location the original never read. We accept this — it is the cost of dropping
     // the write-dominance requirement in favour of unconditional seeding, and the
     // address is always one the caller demonstrably holds a pointer to.
-    // `(arg_idx, base, base_size, offset, size, name)`.
+    // `(arg_idx, base, base_size, offset, size, name)`. `type_id` is set for a
+    // region snapshot (an `Array`-typed input); `tag` distinguishes a region's
+    // param-name suffix (`_arr_`) from a scalar's (`_val_`) so the two never
+    // collide and idempotence holds.
     struct Snap {
         arg_idx: usize,
         base: ValueId,
@@ -628,6 +830,8 @@ fn apply(
         offset: i64,
         size: usize,
         name: String,
+        type_id: Option<TypeId>,
+        tag: &'static str,
     }
     let mut snaps: Vec<Snap> = Vec::new();
     for p in &promoted {
@@ -639,6 +843,27 @@ fn apply(
                 offset: f.offset as i64,
                 size: f.size,
                 name: p.name.clone(),
+                type_id: None,
+                tag: "val",
+            });
+        }
+    }
+    // One `Array`-typed snapshot input per region — read or written. Built before
+    // the write-slot auto-seed loop so a written region's `(base, base_off)` is
+    // already covered and not double-seeded as a scalar.
+    for p in &promoted {
+        if let Some(r) = p.region {
+            let elem_ty = ctx.types.get_or_make_int(r.elem_size);
+            let array_ty = ctx.types.get_or_make_array(elem_ty, r.count);
+            snaps.push(Snap {
+                arg_idx: p.arg_idx,
+                base: p.param,
+                base_size: p.base_size,
+                offset: r.base_off as i64,
+                size: r.byte_len(),
+                name: p.name.clone(),
+                type_id: Some(array_ty),
+                tag: "arr",
             });
         }
     }
@@ -656,6 +881,8 @@ fn apply(
             offset,
             size,
             name: q.name.clone(),
+            type_id: None,
+            tag: "val",
         });
     }
 
@@ -668,7 +895,7 @@ fn apply(
     for s in &snaps {
         let (base, base_size, offset, size, arg_idx) =
             (s.base, s.base_size, s.offset, s.size, s.arg_idx);
-        let name = format!("{}_val_{:x}", s.name, s.offset);
+        let name = format!("{}_{}_{:x}", s.name, s.tag, s.offset);
         let pname = s.name.clone();
         super::add_input(
             ctx,
@@ -676,7 +903,7 @@ fn apply(
             size,
             Some(name),
             None,
-            None,
+            s.type_id,
             shadow,
             move |b| seed_addr(b, base, base_size, offset),
             move |ctx, call_id, block| {

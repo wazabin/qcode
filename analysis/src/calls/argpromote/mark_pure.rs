@@ -66,10 +66,16 @@ pub(crate) fn body_is_pure(ctx: &Context, fid: FunctionId) -> bool {
 
 fn mnemonic_is_pure(ctx: &Context, m: &Mnemonic) -> bool {
     match m {
-        Mnemonic::Load(_)
-        | Mnemonic::CallInd(_)
-        | Mnemonic::BranchInd(_)
-        | Mnemonic::PCodeOp(_) => false,
+        // A load from a temporary (shadow) space is private to the function —
+        // argpromote seeds it from inputs — so it is a deterministic value of the
+        // params, not an untracked source. A dynamic-index region loop leaves such
+        // loads permanently (they cannot be forwarded away like constant-offset
+        // ones), so exempting them is what lets a region-promoted function be pure.
+        Mnemonic::Load(l) => matches!(
+            qcode::space::Space::from_id(ctx, l.space).ty,
+            qcode::space::SpaceType::Temporary
+        ),
+        Mnemonic::CallInd(_) | Mnemonic::BranchInd(_) | Mnemonic::PCodeOp(_) => false,
         // A direct call to a pure function is a deterministic value of its args
         // and clobbers nothing — provided the call site carries no residual
         // clobbers of its own.
