@@ -31,7 +31,7 @@ call_stmt       =  { "call" ~ label }
 callind_stmt    =  { "call" ~ "[" ~ typed_atom ~ "]" }
 return_stmt     =  { "return" ~ "[" ~ typed_atom ~ "]" }
 assert_stmt     =  { "assert" ~ typed_atom }
-expr            =  { memory | cast | extract | gep | unop | func_unop | intrinsic_call | func_call | binary | tuple | atom_expr }
+expr            =  { memory | cast | extract | gep | unop | func_unop | intrinsic_call | map | func_call | binary | tuple | atom_expr }
 expr_stmt       =  { SOI ~ expr ~ EOI }
 atom_expr       =  { typed_atom }
 unop            =  { unop_op ~ typed_atom }
@@ -39,6 +39,11 @@ func_unop       =  { func_unop_op ~ "(" ~ typed_atom ~ ")" }
 func_call       =  { func_ident ~ "(" ~ typed_atom ~ ("," ~ typed_atom)? ~ ")" }
 intrinsic_call  =  { intrinsic_name ~ "(" ~ typed_atom ~ ("," ~ typed_atom)* ~ ")" }
 intrinsic_name  = @{ "$" ~ (ASCII_ALPHA | "_") ~ (ASCII_ALPHANUMERIC | "_")* }
+// `body <$> src` / `(body c0 c1) <$> src` (Haskell `fmap`): a `map` over an
+// array. The body is a function symbol declared elsewhere in the program; the
+// optional parenthesized list supplies loop-invariant captures.
+map             =  { map_app ~ "<$>" ~ typed_atom }
+map_app         =  { "(" ~ ident ~ typed_atom* ~ ")" | ident }
 binary          =  { typed_atom ~ op ~ typed_atom }
 memory          =  { load | store }
 load            =  { "load" ~ "(" ~ ty ~ "," ~ typed_atom ~ ")" }

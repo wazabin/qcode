@@ -125,7 +125,16 @@ impl EmulateMap {
             out.extend_from_slice(&lane_bytes);
         }
 
-        // Materialize the result as a constant blob carrying the map's array type.
+        // Materialize the result carrying the map's array type. A short array
+        // (≤ 8 bytes) is represented as a numeric `Literal`, exactly as such
+        // constants *enter* the pipeline (see [`const_source`]); only wider
+        // results become a `Bytes` blob. Emitting a literal keeps the value in
+        // the numeric domain the rest of GVN handles — a `Bytes` operand would
+        // crash the commutative-binop canonicalizer's `value_id_key`.
+        if out.len() <= 8 {
+            let value = read_le(&out, 0, out.len());
+            return Some(ctx.get_typed_const(value, map_ty).id());
+        }
         let bid = ctx.get_bytes(out).id();
         if let ValueId::Bytes(b) = bid {
             ctx.values.bytes[b].type_id = map_ty;
@@ -134,34 +143,55 @@ impl EmulateMap {
     }
 }
 
-/// Resolve a `map` source that is a fully-known constant: a `Bytes` blob
-/// (`Lane::Scalar`) or an `enumerate` of one (`Lane::Enumerate`). Returns the
-/// raw source bytes and the lane shape.
+/// Resolve a `map` source that is a fully-known constant: a constant array
+/// (`Lane::Scalar`) or an `enumerate` of one (`Lane::Enumerate`). The constant
+/// may be a [`Bytes`](qcode::value::Bytes) blob *or* a numeric `Literal` — a
+/// short array (≤ 8 bytes) that fits a `u64` is stored as a plain literal (e.g.
+/// `0x1f1e1d2c` for `[i8;4]`), so both must be accepted. Returns the raw source
+/// bytes (little-endian, memory order) and the lane shape.
 fn const_source(ctx: &Context, src: ValueId) -> Option<(Vec<u8>, Lane)> {
-    match src {
-        ValueId::Bytes(bid) => {
-            let esz = array_elem_size(ctx, ctx.values.bytes[bid].type_id)?;
-            Some((ctx.values.bytes[bid].data.clone(), Lane::Scalar { esz }))
-        }
-        ValueId::Instruction(id) => {
-            let Mnemonic::Intrinsic(intr) = ctx.get_insn(id).mnemonic().clone() else {
-                return None;
-            };
-            if intr.id.name() != "enumerate" {
+    // Direct constant array: `body <$> <const>`.
+    if let Some(data) = const_bytes(ctx, src) {
+        let esz = array_elem_size(ctx, ctx.stored_type_of(src)?)?;
+        return Some((data, Lane::Scalar { esz }));
+    }
+
+    // `body <$> enumerate(<const>)`.
+    let ValueId::Instruction(id) = src else {
+        return None;
+    };
+    let Mnemonic::Intrinsic(intr) = ctx.get_insn(id).mnemonic().clone() else {
+        return None;
+    };
+    if intr.id.name() != "enumerate" {
+        return None;
+    }
+    let data = const_bytes(ctx, *intr.args.first()?)?;
+    // The element and index widths are fixed by `enumerate`'s result type
+    // (`[(index, elem); n]`), independent of how the source constant is stored.
+    let enum_ty = ctx.stored_type_of(src)?;
+    let (tuple_ty, _) = ctx.types.array_of(enum_ty)?;
+    let index_sz = ctx.types.size_of(ctx.types.field_type(tuple_ty, 0)?);
+    let esz = ctx.types.size_of(ctx.types.field_type(tuple_ty, 1)?);
+    Some((data, Lane::Enumerate { esz, index_sz }))
+}
+
+/// The constant little-endian bytes of `v`, if it is a fully-known constant: a
+/// `Bytes` blob or a non-symbolic numeric `Literal` (sized by its type).
+fn const_bytes(ctx: &Context, v: ValueId) -> Option<Vec<u8>> {
+    match v {
+        ValueId::Bytes(bid) => Some(ctx.values.bytes[bid].data.clone()),
+        ValueId::Literal(lid) => {
+            let lit = &ctx.values.literals[lid];
+            if lit.symbolic.is_some() {
                 return None;
             }
-            let ValueId::Bytes(bid) = *intr.args.first()? else {
+            let size = ctx.types.size_of(lit.type_id);
+            if size == 0 || size > 8 {
                 return None;
-            };
-            let esz = array_elem_size(ctx, ctx.values.bytes[bid].type_id)?;
-            // The index field width is fixed by `enumerate`'s result type.
-            let enum_ty = ctx.stored_type_of(src)?;
-            let (tuple_ty, _) = ctx.types.array_of(enum_ty)?;
-            let index_sz = ctx.types.size_of(ctx.types.field_type(tuple_ty, 0)?);
-            Some((
-                ctx.values.bytes[bid].data.clone(),
-                Lane::Enumerate { esz, index_sz },
-            ))
+            }
+            let value = qcode::value::LiteralRef::new(ctx, lid).value();
+            Some(value.to_le_bytes()[..size].to_vec())
         }
         _ => None,
     }
@@ -290,16 +320,23 @@ mod tests {
         fid
     }
 
-    /// The constant `Bytes` blob a host's `map` collapsed to, if any.
+    /// The constant memory-order bytes a host's `map` collapsed to, if any.
+    /// A wide result is a `Bytes` blob; a short array (≤ 8 bytes) is a numeric
+    /// `Literal` typed as the array, so both are decoded here.
     fn map_bytes(tc: &TestContext, host: FunctionId) -> Option<Vec<u8>> {
         let root = Function::from_id(&tc.ctx, host).root()?.id;
         BasicBlock::from_id(&tc.ctx, root).iter().find_map(|i| {
-            if let Mnemonic::Return(Return { value: Some(v), .. }) = i.mnemonic()
-                && let ValueId::Bytes(bid) = v
-            {
-                Some(tc.ctx.values.bytes[*bid].data.clone())
-            } else {
-                None
+            let Mnemonic::Return(Return { value: Some(v), .. }) = i.mnemonic() else {
+                return None;
+            };
+            match v {
+                ValueId::Bytes(bid) => Some(tc.ctx.values.bytes[*bid].data.clone()),
+                ValueId::Literal(lid) => {
+                    let lit = &tc.ctx.values.literals[*lid];
+                    let size = tc.ctx.types.size_of(lit.type_id);
+                    Some(lit.value.to_le_bytes()[..size].to_vec())
+                }
+                _ => None,
             }
         })
     }
@@ -331,6 +368,41 @@ mod tests {
             map_bytes(&tc, host),
             Some(vec![0x02, 0x03, 0x04]),
             "inc over a byte blob folds to the per-lane constants"
+        );
+    }
+
+    /// `inc <$> 0x1f1e1d2c` (a numeric `[i8;4]` literal, not a `Bytes` blob)
+    /// emulates to `b"\x2d\x1e\x1f\x20"` — the literal source arm of `const_bytes`.
+    #[test]
+    fn emulates_map_over_int_literal() {
+        let mut tc = TestContext::new();
+        let body = build_inc_body(&mut tc);
+
+        let host = Function::make(&mut tc.ctx, "host".into()).unwrap().id;
+        let entry = tc.ctx.get_or_make_block(0x7000);
+        {
+            let mut f = Function::from_id_mut(&mut tc.ctx, host);
+            f.set_root(entry).unwrap();
+            f.add_block(entry);
+        }
+        // A short `[i8;4]` array stored as a plain numeric literal (`0x1f1e1d2c`),
+        // exactly as constprop hands it to `map` in the reported sample.
+        let i8 = tc.ctx.types.get_or_make_int(1);
+        let arr_ty = tc.ctx.types.get_or_make_array(i8, 4);
+        let src = tc.ctx.get_typed_const(0x1f1e1d2c, arr_ty).id();
+        let map_val = {
+            let mut b = Builder::from_block(BasicBlock::from_id_mut(&mut tc.ctx, entry));
+            b.push_map(body, src, Vec::new()).id()
+        };
+        return_value(&mut tc, entry, map_val);
+
+        let aliases = crate::AliasResult::simple(&tc.ctx);
+        while super::super::gvn_function(&mut tc.ctx, host, Some(&aliases)) {}
+
+        assert_eq!(
+            map_bytes(&tc, host),
+            Some(vec![0x2d, 0x1e, 0x1f, 0x20]),
+            "inc over a numeric-literal array folds per-lane (each LE byte + 1)"
         );
     }
 

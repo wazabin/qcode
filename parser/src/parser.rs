@@ -520,6 +520,7 @@ fn parse_expr(pair: Pair<'_, Rule>) -> Result<ExprNode, ParseError> {
         Rule::func_unop => parse_func_unop(inner),
         Rule::func_call => parse_func_call(inner),
         Rule::intrinsic_call => parse_intrinsic_call(inner),
+        Rule::map => parse_map(inner),
         Rule::binary => parse_binary(inner),
         Rule::memory => parse_memory(inner),
         Rule::cast => parse_cast(inner),
@@ -704,6 +705,36 @@ fn parse_intrinsic_call(pair: Pair<'_, Rule>) -> Result<ExprNode, ParseError> {
     Ok(ExprNode::Intrinsic {
         name: name.ok_or_else(|| ParseError::new("missing intrinsic name"))?,
         args,
+    })
+}
+
+fn parse_map(pair: Pair<'_, Rule>) -> Result<ExprNode, ParseError> {
+    let mut inner = pair.into_inner();
+    // `map_app` holds the body ident and any parenthesized captures.
+    let app = inner
+        .next()
+        .filter(|p| p.as_rule() == Rule::map_app)
+        .ok_or_else(|| ParseError::new("missing map body"))?;
+    let mut app_parts = app.into_inner();
+    let body = app_parts
+        .next()
+        .filter(|p| p.as_rule() == Rule::ident)
+        .ok_or_else(|| ParseError::new("missing map body function"))?
+        .as_str()
+        .to_owned();
+    let captures = app_parts
+        .filter(|p| p.as_rule() == Rule::typed_atom)
+        .map(parse_typed_atom)
+        .collect::<Result<Vec<_>, _>>()?;
+    let src = parse_typed_atom(
+        inner
+            .find(|p| p.as_rule() == Rule::typed_atom)
+            .ok_or_else(|| ParseError::new("missing map source"))?,
+    )?;
+    Ok(ExprNode::Map {
+        body,
+        src,
+        captures,
     })
 }
 
@@ -998,6 +1029,44 @@ mod tests {
                 }
             }
             _ => panic!("expected expression statement"),
+        }
+    }
+
+    #[test]
+    fn parses_map_without_captures() {
+        let statements = stmts("%m = inc <$> %src");
+        match &statements[0] {
+            Statement::Assign {
+                expr: ExprNode::Map { body, src, captures },
+                ..
+            } => {
+                assert_eq!(body, "inc");
+                assert!(captures.is_empty());
+                match &src.atom {
+                    Atom::Ssa(name) => assert_eq!(name, "src"),
+                    _ => panic!("expected ssa src"),
+                }
+            }
+            _ => panic!("expected map expression"),
+        }
+    }
+
+    #[test]
+    fn parses_map_with_captures() {
+        let statements = stmts("%m = (addk %k0 %k1) <$> %src");
+        match &statements[0] {
+            Statement::Assign {
+                expr: ExprNode::Map { body, src, captures },
+                ..
+            } => {
+                assert_eq!(body, "addk");
+                assert_eq!(captures.len(), 2);
+                match &src.atom {
+                    Atom::Ssa(name) => assert_eq!(name, "src"),
+                    _ => panic!("expected ssa src"),
+                }
+            }
+            _ => panic!("expected map expression"),
         }
     }
 

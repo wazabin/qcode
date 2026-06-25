@@ -1226,6 +1226,27 @@ fn lower_expr(
             }})
         }
 
+        ExprNode::Map {
+            body,
+            src,
+            captures,
+        } => {
+            // The body names a function declared elsewhere in the program; its
+            // `let <name>: FunctionId` binding is in scope here.
+            let body_ident = format_ident!("{}", body);
+            let src_tokens = lower_atom(src, None, locals, pcode_root)?;
+            let capture_tokens = captures
+                .iter()
+                .map(|c| lower_atom(c, None, locals, pcode_root))
+                .collect::<syn::Result<Vec<_>>>()?;
+            Ok(quote! {{
+                let __qcode_map_src = #src_tokens;
+                let __qcode_map_caps: ::std::vec::Vec<#pcode_root::value::ValueId> =
+                    ::std::vec![#(#capture_tokens),*];
+                __qcode_builder.push_map(#body_ident, __qcode_map_src, __qcode_map_caps).id
+            }})
+        }
+
         ExprNode::Tuple { fields } => {
             let field_tokens = fields
                 .iter()

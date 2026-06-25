@@ -123,6 +123,14 @@ pub enum ExprNode {
         name: String,
         args: Vec<TypedAtom>,
     },
+    /// `body <$> src` / `(body c0 c1) <$> src` — an element-wise `map` over the
+    /// array `src`. `body` names a function symbol declared in the same program;
+    /// `captures` are the loop-invariant operands the body closes over.
+    Map {
+        body: String,
+        src: TypedAtom,
+        captures: Vec<TypedAtom>,
+    },
     /// `pack(a=x, b=y)` — build an aggregate value from its named fields.
     Tuple {
         fields: Vec<TupleField>,

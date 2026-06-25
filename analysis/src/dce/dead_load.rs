@@ -986,6 +986,69 @@ mod tests {
         })
     }
 
+    /// REPRO of the reported sample: RAM stores through `base - k` pointers, an
+    /// intervening non-memory instruction (`%m`, modeling the un-folded map),
+    /// then a covering store to `base - 4`. The early `base-4` store and the
+    /// duplicate `base-12` / `base-8` stores should all be dead.
+    #[test]
+    fn repro_sample_dead_stores() {
+        let mut ctx = Context::new();
+        qcode!(
+            ctx,
+            "
+            varnode i32 BASE;
+            <block>
+                %base = load(i32, &BASE);
+                %p4 = %base - i32 4;
+                %p8 = %base - i32 8;
+                %pc = %base - i32 12;
+                store(%p4, i32 0x1f1e1d2c);
+                store(%p8, %p4);
+                store(%pc, i32 0x44c420);
+                store(%pc, i32 0x44c420);
+                store(%p8, %p4);
+                %m = %base + i32 0;
+                store(%p4, %m);
+            "
+        );
+        let block_id = block;
+        let aliases = AliasResult::simple(&ctx);
+        let dead = dead_load_insns(&ctx, block_id, Some(&aliases), &[]);
+        let stores = ram_stores(&ctx, block_id);
+        let which: Vec<bool> = stores.iter().map(|s| dead.contains(s)).collect();
+        // Each earlier writer is overwritten before any read (the intervening
+        // `%m` is not a memory op), so stores 0/1/2 are dead; the last writer to
+        // each slot (3/4/5) survives. None of this depends on folding the map.
+        assert_eq!(which, vec![true, true, true, false, false, false]);
+    }
+
+    /// The `<$>` macro surface lowers to a real `Map` instruction whose body is
+    /// the named function — end-to-end check of the proc-macro support.
+    #[test]
+    fn qcode_map_lowers_to_map_insn() {
+        let mut ctx = Context::new();
+        qcode!(
+            ctx,
+            "
+            varnode i32 SRC;
+            fn inc:
+                <inc_entry @e:i8>
+                    %r = @e + i8 1;
+                    return [%r];
+            fn host:
+                <host_entry>
+                    %s = load(i32, &SRC);
+                    %m = inc <$> %s;
+                    return [%m];
+            "
+        );
+        let root = Function::from_id(&ctx, host).root().unwrap().id;
+        let has_map = BasicBlock::from_id(&ctx, root)
+            .iter()
+            .any(|i| matches!(i.mnemonic(), Mnemonic::Map(m) if m.body == inc));
+        assert!(has_map, "`inc <$> %s` should lower to a Map with body=inc");
+    }
+
     fn ram_stores(ctx: &Context, block_id: BlockId) -> Vec<InstructionId> {
         BasicBlock::from_id(ctx, block_id)
             .instruction_ids()
