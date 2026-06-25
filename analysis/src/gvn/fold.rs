@@ -226,7 +226,23 @@ fn constant_folding_with_location(
 
         Mnemonic::Range(range) => {
             // Extract `range.size` bytes starting at byte `range.start` of a
-            // constant (e.g. EDI = low 4 bytes of a wide RDI literal).
+            // constant. The source may be a numeric literal (e.g. EDI = low 4
+            // bytes of a wide RDI literal) or an opaque byte blob.
+            if let Some(bid) = range.src.as_bytes() {
+                let data = &ctx.values.bytes[bid].data;
+                let start = range.start;
+                let end = start.checked_add(range.size)?;
+                let slice = data.get(start..end)?;
+                if range.size <= 8 {
+                    // Downconvert: a sub-blob that now fits in a u64 rejoins the
+                    // numeric pipeline as an ordinary literal.
+                    let mut buf = [0u8; 8];
+                    buf[..slice.len()].copy_from_slice(slice);
+                    return Some(ctx.get_const(u64::from_le_bytes(buf), range.size).id());
+                }
+                // Still wider than a u64: a narrower byte blob.
+                return Some(ctx.get_bytes(slice.to_vec()).id());
+            }
             let src = get_numeric_const(ctx, range.src)?;
             let shifted = src.value().overflowing_shr(range.start as u32 * 8).0;
             Some(
@@ -879,5 +895,55 @@ mod tests {
             )
             .is_none()
         );
+    }
+
+    /// Extracting <= 8 bytes from a byte blob downconverts to a numeric literal,
+    /// reassembled little-endian.
+    #[test]
+    fn range_of_bytes_downconverts_to_literal() {
+        let mut ctx = Context::new();
+        let src = ctx
+            .get_bytes(vec![0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88, 0x99, 0xaa])
+            .id();
+
+        let folded = constant_folding(
+            &mut ctx,
+            &Mnemonic::Range(qcode::value::insn::Range {
+                src,
+                start: 2,
+                size: 4,
+            }),
+            4,
+        )
+        .expect("range of a byte blob folds");
+
+        let ValueId::Literal(lid) = folded else {
+            panic!("expected a numeric literal, got {folded:?}");
+        };
+        // bytes 2..6 = 33 44 55 66, little-endian => 0x66554433
+        assert_eq!(qcode::value::LiteralRef::new(&ctx, lid).value(), 0x6655_4433);
+    }
+
+    /// Extracting > 8 bytes from a byte blob yields a narrower byte blob.
+    #[test]
+    fn range_of_bytes_keeps_wide_slice_as_bytes() {
+        let mut ctx = Context::new();
+        let src = ctx.get_bytes((0..16u8).collect()).id();
+
+        let folded = constant_folding(
+            &mut ctx,
+            &Mnemonic::Range(qcode::value::insn::Range {
+                src,
+                start: 2,
+                size: 12,
+            }),
+            12,
+        )
+        .expect("range of a byte blob folds");
+
+        let ValueId::Bytes(bid) = folded else {
+            panic!("expected a byte blob, got {folded:?}");
+        };
+        assert_eq!(ctx.values.bytes[bid].data, (2..14u8).collect::<Vec<_>>());
     }
 }

@@ -236,6 +236,12 @@ impl MemForward {
         {
             // Exact whole-location forward: reuse the stored value directly.
             segments[0].src
+        } else if load_size > 8 {
+            // Wider than a u64: the Zext/shift/or rebuild operates on u64 values
+            // and cannot represent the result. Assemble a byte blob instead, but
+            // only when every covering byte comes from a constant (numeric
+            // literal or byte blob); otherwise there is nothing to fold to.
+            self.rebuild_bytes(ctx, &segments, load_size)?
         } else {
             self.rebuild(ctx, block_id, insn_id, &segments, load_size)
         };
@@ -321,6 +327,42 @@ impl MemForward {
             });
         }
         acc.expect("a fully-covered load has at least one segment")
+    }
+
+    /// Assemble a `load_size`-byte opaque blob from `segments`, in little-endian
+    /// memory order, when every segment's source is a compile-time constant.
+    /// Returns `None` if any segment is non-constant (the all-constant-or-bail
+    /// rule) or out of bounds.
+    fn rebuild_bytes(
+        &self,
+        ctx: &mut Context,
+        segments: &[Segment],
+        load_size: usize,
+    ) -> Option<ValueId> {
+        let mut buf = vec![0u8; load_size];
+        for seg in segments {
+            let bytes: Vec<u8> = match seg.src {
+                ValueId::Literal(lid) => {
+                    // Numeric literal: bail on symbolic refs; take the LE bytes.
+                    let lit = &ctx.values.literals[lid];
+                    if lit.symbolic.is_some() {
+                        return None;
+                    }
+                    let masked = qcode::value::LiteralRef::new(ctx, lid).value();
+                    let le = masked.to_le_bytes();
+                    le.get(seg.src_off..seg.src_off + seg.size)?.to_vec()
+                }
+                ValueId::Bytes(bid) => {
+                    let data = &ctx.values.bytes[bid].data;
+                    data.get(seg.src_off..seg.src_off + seg.size)?.to_vec()
+                }
+                // Non-constant source: nothing to fold to.
+                _ => return None,
+            };
+            buf.get_mut(seg.load_off..seg.load_off + seg.size)?
+                .copy_from_slice(&bytes);
+        }
+        Some(ctx.get_bytes(buf).id())
     }
 
     /// Build one segment's contribution: `Range` of the source (skipped when the

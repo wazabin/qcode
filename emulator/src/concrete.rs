@@ -1516,6 +1516,8 @@ impl<'ctx> Interpreter for TempInterpreter<'_, 'ctx> {
     fn get_value(&mut self, id: ValueId) -> Result<Self::V, EmulatorErrorKind> {
         match ValueRef::new(id, self.ctx) {
             ValueRef::Literal(literal) => Ok(SizedValue::new(literal.value(), literal.size())),
+            // Byte blobs are wider than the emulator's scalar SizedValue.
+            ValueRef::Bytes(_) => Err(EmulatorErrorKind::ValueError(0)),
             ValueRef::Instruction(insn) => self
                 .insn_values
                 .get(&insn.id)
@@ -1753,6 +1755,8 @@ impl<'ctx> Interpreter for Emulator<'ctx> {
     fn get_value(&mut self, id: ValueId) -> Result<Self::V, EmulatorErrorKind> {
         match ValueRef::new(id, self.ctx) {
             ValueRef::Literal(literal) => Ok(SizedValue::new(literal.value(), literal.size())),
+            // Byte blobs are wider than the emulator's scalar SizedValue.
+            ValueRef::Bytes(_) => Err(EmulatorErrorKind::ValueError(0)),
             ValueRef::Instruction(insn) => self
                 .inner
                 .insn_values

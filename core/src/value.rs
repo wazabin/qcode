@@ -25,6 +25,7 @@ use serde::{Deserialize, Serialize};
 use std::fmt::{Debug, Display, Formatter};
 
 pub use block::{BasicBlock, BlockId, BlockMutRef, BlockRef};
+pub use bytes::{Bytes, BytesId, BytesRef};
 pub use block_param::{BlockParam, BlockParamId, BlockParamMutRef, BlockParamRef};
 pub use function::{Function, FunctionId, FunctionMutRef, FunctionRef};
 pub use insn::{Instruction, InstructionId, InstructionRef};
@@ -34,6 +35,7 @@ pub use varnode::{Varnode, VarnodeId, VarnodeRef, register::Register, register::
 
 pub mod block;
 pub mod block_param;
+pub mod bytes;
 pub mod function;
 pub mod insn;
 pub mod literal;
@@ -60,6 +62,8 @@ pub mod varnode;
 pub enum ValueId {
     /// A compile-time integer constant, optionally carrying a symbolic label.
     Literal(LiteralId),
+    /// A compile-time opaque byte blob wider than a [`Literal`] can hold.
+    Bytes(BytesId),
     /// An SSA value produced by an [`Instruction`].
     Instruction(InstructionId),
     /// A control-flow node ([`BasicBlock`]).
@@ -76,6 +80,7 @@ impl ValueId {
     pub fn ty(&self) -> &'static str {
         match self {
             ValueId::Literal(_) => "Literal",
+            ValueId::Bytes(_) => "Bytes",
             ValueId::Instruction(_) => "Instruction",
             ValueId::BasicBlock(_) => "BasicBlock",
             ValueId::BlockParam(_) => "BlockParam",
@@ -116,6 +121,14 @@ impl ValueId {
         }
     }
 
+    pub fn as_bytes(self) -> Option<BytesId> {
+        if let ValueId::Bytes(id) = self {
+            Some(id)
+        } else {
+            None
+        }
+    }
+
     pub fn is_varnode(self) -> bool {
         matches!(self, ValueId::Varnode(_))
     }
@@ -140,6 +153,12 @@ impl ValueId {
 impl From<LiteralId> for ValueId {
     fn from(id: LiteralId) -> Self {
         ValueId::Literal(id)
+    }
+}
+
+impl From<BytesId> for ValueId {
+    fn from(id: BytesId) -> Self {
+        ValueId::Bytes(id)
     }
 }
 
@@ -177,6 +196,7 @@ impl From<ValueId> for usize {
     fn from(id: ValueId) -> Self {
         match id {
             ValueId::Literal(lit_id) => lit_id.into(),
+            ValueId::Bytes(bytes_id) => bytes_id.into(),
             ValueId::Instruction(insn_id) => insn_id.into(),
             ValueId::BasicBlock(bb_id) => bb_id.into(),
             ValueId::BlockParam(param_id) => param_id.into(),
@@ -212,6 +232,7 @@ pub trait Value<'str, 'ctx>: Display {
 /// Use pattern matching to downcast to a concrete reference type.
 pub enum ValueRef<'str, 'ctx> {
     Literal(LiteralRef<'str, 'ctx>),
+    Bytes(BytesRef<'str, 'ctx>),
     Instruction(InstructionRef<'str, 'ctx>),
     BasicBlock(BlockRef<'str, 'ctx>),
     BlockParam(BlockParamRef<'str, 'ctx>),
@@ -223,6 +244,7 @@ impl Debug for ValueRef<'_, '_> {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         match self {
             ValueRef::Literal(_) => f.write_str("Literal"),
+            ValueRef::Bytes(_) => f.write_str("Bytes"),
             ValueRef::Instruction(_) => f.write_str("Instruction"),
             ValueRef::BasicBlock(_) => f.write_str("BasicBlock"),
             ValueRef::BlockParam(_) => f.write_str("BlockParam"),
@@ -235,6 +257,12 @@ impl Debug for ValueRef<'_, '_> {
 impl<'str, 'ctx> From<LiteralRef<'str, 'ctx>> for ValueRef<'str, 'ctx> {
     fn from(lit_ref: LiteralRef<'str, 'ctx>) -> Self {
         ValueRef::Literal(lit_ref)
+    }
+}
+
+impl<'str, 'ctx> From<BytesRef<'str, 'ctx>> for ValueRef<'str, 'ctx> {
+    fn from(bytes_ref: BytesRef<'str, 'ctx>) -> Self {
+        ValueRef::Bytes(bytes_ref)
     }
 }
 
@@ -272,6 +300,7 @@ impl<'str, 'ctx> ValueRef<'str, 'ctx> {
     fn inner(&self) -> &dyn Value<'str, 'ctx> {
         match self {
             ValueRef::Literal(lit_ref) => lit_ref,
+            ValueRef::Bytes(bytes_ref) => bytes_ref,
             ValueRef::Instruction(insn_ref) => insn_ref,
             ValueRef::BasicBlock(bb_ref) => bb_ref,
             ValueRef::BlockParam(param_ref) => param_ref,
@@ -283,6 +312,7 @@ impl<'str, 'ctx> ValueRef<'str, 'ctx> {
     pub fn new(id: ValueId, ctx: &'ctx Context<'str>) -> Self {
         match id {
             ValueId::Literal(lit_id) => ValueRef::Literal(LiteralRef::new(ctx, lit_id)),
+            ValueId::Bytes(bytes_id) => ValueRef::Bytes(BytesRef::new(ctx, bytes_id)),
             ValueId::Instruction(insn_id) => {
                 ValueRef::Instruction(InstructionRef::new(ctx, insn_id))
             }
@@ -304,6 +334,7 @@ impl<'str, 'ctx> ValueRef<'str, 'ctx> {
             ValueRef::Varnode(v) => Some(v.space()),
             ValueRef::Instruction(i) => i.space(),
             ValueRef::Literal(_)
+            | ValueRef::Bytes(_)
             | ValueRef::BasicBlock(_)
             | ValueRef::BlockParam(_)
             | ValueRef::Function(_) => None,
@@ -317,6 +348,7 @@ impl Display for ValueRef<'_, '_> {
             // Display function as compact reference when used as a value operand.
             ValueRef::Function(fn_ref) => write!(f, "<{}>", fn_ref.name()),
             ValueRef::Literal(_)
+            | ValueRef::Bytes(_)
             | ValueRef::Instruction(_)
             | ValueRef::BasicBlock(_)
             | ValueRef::BlockParam(_)

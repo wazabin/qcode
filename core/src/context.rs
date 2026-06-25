@@ -625,6 +625,20 @@ impl<'str> Context<'str> {
         LiteralRef::new(self, id)
     }
 
+    /// Creates an opaque byte-blob constant from a little-endian, memory-order
+    /// byte vector.
+    ///
+    /// The blob is typed as an `Array(i8, data.len())`. Unlike numeric literals,
+    /// byte blobs are **not interned**: every call produces a fresh
+    /// [`BytesId`](crate::value::BytesId). Use this for constants wider than a
+    /// `u64` (SSE/AVX pools, wide stack/memory reads, coalesced constant stores).
+    pub fn get_bytes(&mut self, data: Vec<u8>) -> crate::value::BytesRef<'str, '_> {
+        let i8_ty = self.types.get_or_make_int(1);
+        let type_id = self.types.get_or_make_array(i8_ty, data.len());
+        let id = self.values.bytes.push(crate::value::Bytes { data, type_id });
+        crate::value::BytesRef::new(self, id)
+    }
+
     /// Returns the [`TypeId`] of any [`ValueId`] in this context.
     ///
     /// Varnodes are typed as `Int(varnode.size())`. Blocks, functions, and other
@@ -632,6 +646,7 @@ impl<'str> Context<'str> {
     pub fn type_of(&mut self, id: ValueId) -> crate::types::TypeId {
         match id {
             ValueId::Literal(lid) => self.values.literals[lid].type_id,
+            ValueId::Bytes(bid) => self.values.bytes[bid].type_id,
             ValueId::Instruction(iid) => self.values.instructions[iid].type_id,
             ValueId::BlockParam(pid) => self.values.block_params[pid].type_id,
             ValueId::Varnode(vid) => {
@@ -655,6 +670,7 @@ impl<'str> Context<'str> {
     pub fn stored_type_of(&self, id: ValueId) -> Option<crate::types::TypeId> {
         match id {
             ValueId::Literal(lid) => Some(self.values.literals[lid].type_id),
+            ValueId::Bytes(bid) => Some(self.values.bytes[bid].type_id),
             ValueId::Instruction(iid) => Some(self.values.instructions[iid].type_id),
             ValueId::BlockParam(pid) => Some(self.values.block_params[pid].type_id),
             ValueId::Varnode(vid) => self.values.varnode_types.get(&vid).copied(),

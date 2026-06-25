@@ -4,6 +4,7 @@ use crate::{
     value::{
         ValueId,
         block::{BasicBlock, BlockId, EdgeData, EdgeId},
+        bytes::{Bytes, BytesId},
         block_param::{BlockParam, BlockParamId},
         function::{Function, FunctionId},
         insn::{Instruction, InstructionId},
@@ -37,6 +38,10 @@ use std::collections::BTreeSet;
 pub struct ValueRegistry<'str> {
     /// Literal (constant) storage.
     pub literals: Registry<LiteralId, Literal>,
+
+    /// Opaque byte-blob constant storage (constants wider than a `u64`).
+    #[serde(default)]
+    pub bytes: Registry<BytesId, Bytes>,
 
     /// Instruction storage.
     pub instructions: Registry<InstructionId, Instruction<'str>>,
