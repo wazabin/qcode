@@ -17,6 +17,7 @@ pub(crate) mod affine;
 mod array_project;
 mod cse;
 mod flag_idiom;
+mod emulate_map;
 mod fold;
 mod identity;
 mod intrinsics;
@@ -27,6 +28,7 @@ mod walk;
 
 use array_project::ArrayProject;
 use cse::Cse;
+use emulate_map::EmulateMap;
 use flag_idiom::FlagIdiom;
 use fold::Fold;
 use identity::Identities;
@@ -44,6 +46,7 @@ use walk::{run_dominator_walk, run_flat_fixpoint, run_single_block};
 fn gvn_passes() -> (
     MemoryForwarding,
     Fold,
+    EmulateMap,
     ArrayProject,
     PureCall,
     Recognize,
@@ -54,6 +57,7 @@ fn gvn_passes() -> (
     (
         MemoryForwarding,
         Fold,
+        EmulateMap,
         ArrayProject,
         PureCall,
         Recognize,

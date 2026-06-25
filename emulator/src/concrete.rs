@@ -747,6 +747,10 @@ pub struct StandaloneEmulator {
     /// field back out. Keeps the scalar `SizedValue` domain unchanged — the
     /// functional `argpromote` write-set is the only producer/consumer.
     pub aggregate_values: FxHashMap<InstructionId, Vec<SizedValue>>,
+    /// Field values of aggregate-typed **block params** seeded by
+    /// [`run_map_body`](Self::run_map_body) (the `enumerate` `(index, elem)` lane
+    /// fed to a `map` body). `Extract` on such a param projects a field back out.
+    pub block_param_aggregates: FxHashMap<BlockParamId, Vec<SizedValue>>,
     pub block: BlockId,
     pub idx: usize,
     /// Call stack maintained by `run_function` (outermost function first).
@@ -766,6 +770,7 @@ impl StandaloneEmulator {
             insn_values: FxHashMap::default(),
             block_param_values: FxHashMap::default(),
             aggregate_values: FxHashMap::default(),
+            block_param_aggregates: FxHashMap::default(),
             block: entry,
             idx: 0,
             call_stack: Vec::new(),
@@ -1234,13 +1239,22 @@ impl StandaloneEmulator {
 
             // Aggregate projection: pull field `index` out of the stashed vector.
             Mnemonic::Extract(Extract { agg, index }) => {
-                if let ValueId::Instruction(agg_id) = agg
-                    && let Some(field) = self
+                let field = match agg {
+                    ValueId::Instruction(agg_id) => self
                         .aggregate_values
                         .get(agg_id)
                         .and_then(|v| v.get(*index))
-                        .copied()
-                {
+                        .copied(),
+                    // A `map` body's `enumerate` lane arrives as an aggregate
+                    // block param seeded by `run_map_body`.
+                    ValueId::BlockParam(pid) => self
+                        .block_param_aggregates
+                        .get(pid)
+                        .and_then(|v| v.get(*index))
+                        .copied(),
+                    _ => None,
+                };
+                if let Some(field) = field {
                     self.insn_values.insert(insn_id, field);
                 }
                 self.idx += 1;
@@ -1469,6 +1483,58 @@ impl StandaloneEmulator {
             self.block_param_values.insert(param_id, value);
         }
 
+        self.drive_to_return(ctx, root, func, max_steps)
+    }
+
+    /// Like [`run_pure`](Self::run_pure), but for a `map` body — its leading
+    /// element param may be an **aggregate** (the `enumerate` `(index, elem)`
+    /// lane), seeded so the body's `Extract`s on it resolve. `args` align with
+    /// the root params index-for-index: a [`BodyArg::Scalar`] seeds a scalar
+    /// param, a [`BodyArg::Aggregate`] seeds an `Extract`-able tuple param.
+    pub fn run_map_body(
+        &mut self,
+        ctx: &Context<'_>,
+        func: FunctionId,
+        args: &[BodyArg],
+        max_steps: usize,
+    ) -> crate::Result<()> {
+        let root = Function::from_id(ctx, func)
+            .root()
+            .ok_or_else(|| self.make_error(ctx, EmulatorErrorKind::EmptyFunctionRoot(func)))?
+            .id;
+        self.block = root;
+        self.idx = 0;
+        self.call_stack.push(func);
+
+        let param_ids: Vec<BlockParamId> = BasicBlock::from_id(ctx, root)
+            .params()
+            .map(|p| p.id)
+            .collect();
+        for (param_id, arg) in param_ids.into_iter().zip(args) {
+            match arg {
+                BodyArg::Scalar(v) => {
+                    self.block_param_values.insert(param_id, *v);
+                }
+                BodyArg::Aggregate(fields) => {
+                    self.block_param_aggregates.insert(param_id, fields.clone());
+                }
+            }
+        }
+
+        self.drive_to_return(ctx, root, func, max_steps)
+    }
+
+    /// Shared drive loop for the bounded `run_pure`/`run_map_body` entry points:
+    /// run from the current position to the first top-level `Return` (without
+    /// executing it), popping the call frame. Params must already be seeded and
+    /// `func` pushed onto the call stack.
+    fn drive_to_return(
+        &mut self,
+        ctx: &Context<'_>,
+        _root: BlockId,
+        _func: FunctionId,
+        max_steps: usize,
+    ) -> crate::Result<()> {
         let mut steps = 0usize;
         let result = loop {
             let insn_ids = BasicBlock::from_id(ctx, self.block)
@@ -1490,6 +1556,14 @@ impl StandaloneEmulator {
         self.call_stack.pop();
         result
     }
+}
+
+/// A positional argument to a `map` body for [`run_map_body`](StandaloneEmulator::run_map_body):
+/// a scalar param value, or the field vector of an aggregate (tuple) param.
+#[derive(Debug, Clone)]
+pub enum BodyArg {
+    Scalar(SizedValue),
+    Aggregate(Vec<SizedValue>),
 }
 
 /// Private helper that pairs `&mut StandaloneEmulator` fields with `&Context<'_>`

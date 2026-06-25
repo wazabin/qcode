@@ -14,7 +14,7 @@ use qcode::{
 
 mod concrete;
 
-pub use concrete::{Emulator, SizedValue, StandaloneEmulator};
+pub use concrete::{BodyArg, Emulator, SizedValue, StandaloneEmulator};
 
 #[derive(Debug, Clone)]
 pub struct CallSite {

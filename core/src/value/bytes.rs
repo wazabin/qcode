@@ -66,9 +66,85 @@ where
     }
 }
 
+/// The encoding under which a byte blob was successfully read as text.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum StringEncoding {
+    /// Printable 7-bit ASCII (one byte per character).
+    Ascii,
+    /// Printable UTF-16, little-endian (two bytes per code unit).
+    Utf16Le,
+}
+
+impl StringEncoding {
+    /// Short human-readable label (e.g. for a UI column).
+    pub fn label(self) -> &'static str {
+        match self {
+            StringEncoding::Ascii => "ascii",
+            StringEncoding::Utf16Le => "utf16le",
+        }
+    }
+}
+
+/// Attempt to decode `data` as a printable ASCII or UTF-16LE string.
+///
+/// Both encodings tolerate a single trailing NUL terminator (the common C /
+/// Windows-`W` convention). Returns the decoded text and the encoding it was
+/// read under, but only when every character is printable; otherwise the blob
+/// has no clean string reading and the caller should fall back to the `\xNN`
+/// hex form.
+pub fn decode_string(data: &[u8]) -> Option<(StringEncoding, String)> {
+    if data.is_empty() {
+        return None;
+    }
+
+    // ASCII, optionally NUL-terminated.
+    let ascii = data.strip_suffix(&[0]).unwrap_or(data);
+    if !ascii.is_empty() && ascii.iter().all(|&b| b.is_ascii_graphic() || b == b' ') {
+        return Some((
+            StringEncoding::Ascii,
+            ascii.iter().map(|&b| b as char).collect(),
+        ));
+    }
+
+    // UTF-16LE, optionally NUL-terminated.
+    if data.len() >= 2 && data.len() % 2 == 0 {
+        let units: Vec<u16> = data
+            .chunks_exact(2)
+            .map(|c| u16::from_le_bytes([c[0], c[1]]))
+            .collect();
+        let units = units.strip_suffix(&[0]).unwrap_or(&units);
+        if !units.is_empty()
+            && let Ok(s) = String::from_utf16(units)
+            && s.chars().all(|c| !c.is_control())
+        {
+            return Some((StringEncoding::Utf16Le, s));
+        }
+    }
+
+    None
+}
+
+/// Escape a decoded string for display inside `b"..."` quotes.
+pub fn escape_decoded(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for c in s.chars() {
+        match c {
+            '"' | '\\' => {
+                out.push('\\');
+                out.push(c);
+            }
+            _ => out.push(c),
+        }
+    }
+    out
+}
+
 impl std::fmt::Display for BytesRef<'_, '_> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let data = &self.ctx.values.bytes[self.id].data;
+        if let Some((_, s)) = decode_string(data) {
+            return write!(f, "b\"{}\"", escape_decoded(&s));
+        }
         write!(f, "b\"")?;
         for &b in data {
             write!(f, "\\x{:02x}", b)?;
