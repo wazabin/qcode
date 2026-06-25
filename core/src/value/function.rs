@@ -645,7 +645,10 @@ impl<'str, 'ctx> FunctionMutRef<'str, 'ctx> {
     /// for callees (chiefly externals) whose argument names come from a C
     /// prototype rather than a register or promoted stack param.
     pub fn set_input_arg_names(&mut self, names: Vec<Option<Box<str>>>) {
-        self.inner_mut().signature.get_or_insert_default().input_names = Some(names);
+        self.inner_mut()
+            .signature
+            .get_or_insert_default()
+            .input_names = Some(names);
     }
 
     /// Marks this function as fully functionalized over its register channel.

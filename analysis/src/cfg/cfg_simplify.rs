@@ -209,7 +209,11 @@ fn try_bypass_empty_block(ctx: &mut Context, function_id: FunctionId, b_id: Bloc
     // param is only visible inside dominated blocks via forwarded args, so this
     // normally holds; bail if it doesn't rather than risk a dangling use.
     for &p in &params {
-        if ctx.users(ValueId::BlockParam(p)).iter().any(|&u| u != term_id) {
+        if ctx
+            .users(ValueId::BlockParam(p))
+            .iter()
+            .any(|&u| u != term_id)
+        {
             return false;
         }
     }
@@ -314,11 +318,7 @@ fn try_bypass_empty_block(ctx: &mut Context, function_id: FunctionId, b_id: Bloc
 /// through one predecessor's incoming arguments: a value that is one of the
 /// block's `params` is replaced by the predecessor's argument at the same index;
 /// any other value (e.g. one defined in a dominating block) is kept as-is.
-fn substitute(
-    template: &[ValueId],
-    params: &[BlockParamId],
-    incoming: &[ValueId],
-) -> Vec<ValueId> {
+fn substitute(template: &[ValueId], params: &[BlockParamId], incoming: &[ValueId]) -> Vec<ValueId> {
     template
         .iter()
         .map(|&v| match v {
