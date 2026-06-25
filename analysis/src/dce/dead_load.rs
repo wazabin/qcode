@@ -48,6 +48,44 @@ pub(crate) fn is_reg_space(ctx: &Context, space_id: SpaceId) -> bool {
     matches!(Space::from_id(ctx, space_id).ty, SpaceType::Register)
 }
 
+/// The byte intervals a resolved external `target` clobbers (its recorded
+/// caller-saved register set), as kills for the backward scan. Empty for a
+/// callee with no recorded clobber set.
+fn call_clobber_intervals(ctx: &Context, target: FunctionId) -> Vec<KilledInterval> {
+    let Some(clobbered) = Function::from_id(ctx, target).clobbered_regs() else {
+        return Vec::new();
+    };
+    clobbered
+        .iter()
+        .map(|&vn| {
+            let v = Varnode::from_id(ctx, vn);
+            let start = v.address() as u64;
+            KilledInterval {
+                space: v.space().id,
+                start,
+                end: start + v.size() as u64,
+            }
+        })
+        .collect()
+}
+
+/// Whether the kill interval `iv` fully covers the live register load `l` — so
+/// the clobbering write satisfies it (the load reads the call's output). Only a
+/// register-varnode load is matched; any other live location is left in place
+/// (conservative — the store before it stays live).
+fn killed_covers_loc(ctx: &Context, iv: KilledInterval, l: &LiveLoc) -> bool {
+    let ValueId::Varnode(vn) = l.ptr else {
+        return false;
+    };
+    let v = Varnode::from_id(ctx, vn);
+    if v.space().id != iv.space {
+        return false;
+    }
+    let start = v.address() as u64;
+    let end = start + v.size() as u64;
+    iv.start <= start && end <= iv.end
+}
+
 pub(crate) fn is_temp_space(ctx: &Context, space_id: SpaceId) -> bool {
     !is_reg_space(ctx, space_id) && space_id != ctx.default_space
 }
@@ -377,13 +415,29 @@ fn scan_block_aliased(
                     }
                 }
             }
-            // A call may read any register before its continuation overwrites it,
-            // so a register store preceding the call cannot be proven dead by a
-            // later (post-call) covering store. Drop register-space kills at the
-            // call boundary; explicit `dead_reg` removals still apply (they do not
-            // depend on `killed`). This keeps the caller's pre-call stack-pointer
-            // decrement (see call_summary::decrement_stack_pointer) alive so the
-            // callee's entry stack pointer is seeded correctly.
+            // An `externally_resolved` call reads no registers and writes exactly
+            // its caller-saved clobber set (a C prototype under a known calling
+            // convention). So its clobbered registers are *killed* here — a
+            // preceding store to one of them, with no read in between, is dead —
+            // and the call satisfies any post-call read of them (that read is the
+            // call's own output, not the caller's pre-call value). Registers it
+            // does not clobber (callee-saved) it neither reads nor writes, so their
+            // existing kills pass through untouched.
+            Mnemonic::Call(call)
+                if Function::from_id(ctx, call.target).is_externally_resolved() =>
+            {
+                for iv in call_clobber_intervals(ctx, call.target) {
+                    live.retain(|l| l.space != iv.space || !killed_covers_loc(ctx, iv, l));
+                    killed.push(iv);
+                }
+            }
+            // Any other call may read any register before its continuation
+            // overwrites it, so a register store preceding the call cannot be proven
+            // dead by a later (post-call) covering store. Drop register-space kills
+            // at the call boundary; explicit `dead_reg` removals still apply (they
+            // do not depend on `killed`). This keeps the caller's pre-call
+            // stack-pointer decrement (see call_summary::decrement_stack_pointer)
+            // alive so the callee's entry stack pointer is seeded correctly.
             Mnemonic::Call(_) | Mnemonic::CallInd(_) => {
                 killed.retain(|k| !is_reg_space(ctx, k.space));
             }
@@ -799,6 +853,67 @@ mod tests {
         assert!(
             !unread_temp_space_stores(&ctx, fid).contains(&store_id),
             "temp-space store must be kept when an overlapping offset is read"
+        );
+    }
+
+    /// Build a one-block caller that stores `0x1` into register `r`, then calls
+    /// `callee`. Returns `(ctx, block, store_id)`.
+    fn store_then_call_fn(
+        configure_callee: impl FnOnce(&mut Context, FunctionId),
+    ) -> (Context<'static>, BlockId, InstructionId) {
+        let mut tc = TestContext::new();
+        let (r, reg) = (tc.r0, tc.reg_space);
+
+        let callee = Function::make_external(&mut tc.ctx, 0x9000, Some("ext".into())).id;
+        configure_callee(&mut tc.ctx, callee);
+
+        let caller = Function::make(&mut tc.ctx, "caller".into()).unwrap().id;
+        let entry = tc.ctx.get_or_make_block(0x1000);
+        Function::from_id_mut(&mut tc.ctx, caller)
+            .set_root(entry)
+            .unwrap();
+        let store_id;
+        {
+            let mut b = Builder::from_context(&mut tc.ctx, 0x1000);
+            let v = b.context_mut().get_const(0x1u64, 8).id();
+            store_id = b.push_store(v, ValueId::Varnode(r), reg).id;
+            b.push_call(callee);
+            unsafe { b.dont_finalize() };
+        }
+        (tc.ctx, entry, store_id)
+    }
+
+    /// A store to a register an `externally_resolved` callee clobbers, never read
+    /// before the call, is dead: the call overwrites it and reads no registers.
+    #[test]
+    fn store_before_resolved_call_to_clobbered_reg_is_dead() {
+        let (ctx, block, store_id) = store_then_call_fn(|ctx, callee| {
+            let r0 = ctx.get_named("r0").unwrap().as_varnode().unwrap();
+            Function::from_id_mut(ctx, callee).set_clobbered_regs(vec![r0]);
+            Function::from_id_mut(ctx, callee).set_externally_resolved(true);
+        });
+        let aliases = AliasResult::simple(&ctx);
+        let dead = dead_load_insns(&ctx, block, Some(&aliases), &[]);
+        assert!(
+            dead.contains(&store_id),
+            "store to a clobbered register before a resolved call is dead"
+        );
+    }
+
+    /// The same store is *kept* when the callee is not `externally_resolved`: the
+    /// call may read the register (e.g. an argument), so the store is live.
+    #[test]
+    fn store_before_unresolved_call_is_kept() {
+        let (ctx, block, store_id) = store_then_call_fn(|ctx, callee| {
+            let r0 = ctx.get_named("r0").unwrap().as_varnode().unwrap();
+            // Clobbers r0 but is *not* marked resolved.
+            Function::from_id_mut(ctx, callee).set_clobbered_regs(vec![r0]);
+        });
+        let aliases = AliasResult::simple(&ctx);
+        let dead = dead_load_insns(&ctx, block, Some(&aliases), &[]);
+        assert!(
+            !dead.contains(&store_id),
+            "store before an unresolved call must be kept (the callee may read it)"
         );
     }
 

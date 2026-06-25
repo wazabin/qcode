@@ -192,6 +192,17 @@ where
         self.inner().signature.as_ref()
     }
 
+    /// Whether this function's full register effect is captured by its call
+    /// interface: it reads no registers (only its explicit args) and writes
+    /// exactly its [`clobbered_regs`](Self::clobbered_regs). See
+    /// [`FunctionSignature::externally_resolved`].
+    pub fn is_externally_resolved(&'s self) -> bool {
+        self.inner()
+            .signature
+            .as_ref()
+            .is_some_and(|s| s.externally_resolved)
+    }
+
     /// Registers concretely written by this function, as set by analysis.
     pub fn clobbered_regs(&'s self) -> Option<&'ctx [VarnodeId]> {
         self.inner()
@@ -253,6 +264,21 @@ where
                 .and_then(|p| p.name().map(str::to_owned))
         {
             return Some(name);
+        }
+
+        // Explicit per-argument names recorded by name-derived passes (e.g. an
+        // external callee's C-prototype parameters, plus a synthesized
+        // `return_address` slot). The source of truth for bodyless externals,
+        // which have neither a root block nor an inferred input-register list.
+        if let Some(name) = self
+            .inner()
+            .signature
+            .as_ref()
+            .and_then(|s| s.input_names.as_ref())
+            .and_then(|names| names.get(index))
+            .and_then(|n| n.as_deref())
+        {
+            return Some(name.to_owned());
         }
 
         // Fall back to the inferred input-register list: a register name, or a
@@ -592,6 +618,16 @@ impl<'str, 'ctx> FunctionMutRef<'str, 'ctx> {
         self.inner_mut().signature.get_or_insert_default().clobbered = Some(regs);
     }
 
+    /// Marks this function's register effect as fully captured by its call
+    /// interface — reads no registers, writes exactly its clobbered set. See
+    /// [`FunctionSignature::externally_resolved`].
+    pub fn set_externally_resolved(&mut self, value: bool) {
+        self.inner_mut()
+            .signature
+            .get_or_insert_default()
+            .externally_resolved = value;
+    }
+
     /// Records the analysis-inferred input (live-in) register set on this function.
     ///
     /// Legacy ABI input-register list — see [`input_regs`](Self::input_regs).
@@ -602,6 +638,14 @@ impl<'str, 'ctx> FunctionMutRef<'str, 'ctx> {
     )]
     pub fn set_input_regs(&mut self, regs: Vec<VarnodeId>) {
         self.inner_mut().signature.get_or_insert_default().inputs = Some(regs);
+    }
+
+    /// Records display names for this function's positional call arguments, one
+    /// per `Call.args` slot. Consulted by [`input_arg_name`](Self::input_arg_name)
+    /// for callees (chiefly externals) whose argument names come from a C
+    /// prototype rather than a register or promoted stack param.
+    pub fn set_input_arg_names(&mut self, names: Vec<Option<Box<str>>>) {
+        self.inner_mut().signature.get_or_insert_default().input_names = Some(names);
     }
 
     /// Marks this function as fully functionalized over its register channel.

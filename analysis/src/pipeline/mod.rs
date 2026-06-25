@@ -132,6 +132,14 @@ pub struct CallingConvention {
     pub int_ret: Option<GpReg>,
     /// SSE return register (XMM0).
     pub sse_ret: Option<VarnodeId>,
+    /// Caller-saved (volatile) registers: the registers a callee may clobber
+    /// without preserving, which a caller must therefore treat as written across
+    /// any call obeying this convention. Used to seed the clobber set of
+    /// **resolved** external callees (whose body is unavailable), one varnode per
+    /// physical register — typically its widest view (e.g. RAX, not EAX/AX/AL),
+    /// since the clobber test is overlap-aware. Empty when the convention is
+    /// unknown (the conservative every-register fallback then applies).
+    pub caller_saved: Vec<VarnodeId>,
 }
 
 /// Progress events emitted while a pipeline runs, for the GUI/loader to display.

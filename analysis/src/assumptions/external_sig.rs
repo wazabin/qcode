@@ -132,7 +132,7 @@ pub fn apply_external_signature(
     abi: &CallingConvention,
     target: AbiTarget,
 ) {
-    if abi.int_args.is_empty() {
+    if !abi_is_known(abi) {
         return; // no convention for this architecture
     }
     if !Function::from_id(ctx, fun_id).is_external() {
@@ -152,6 +152,23 @@ pub fn apply_external_signature(
     let mut f = Function::from_id_mut(ctx, fun_id);
     f.set_input_regs(inputs);
     f.set_output_regs(outputs);
+    // The prototype fully describes this callee's register effect: its inputs are
+    // the arguments the caller passes (a register reload, or — for stdcall/cdecl
+    // — a stack load supplied by `argpromote_external`), and its writes are the
+    // convention's caller-saved (volatile) registers. Marking it resolved lets
+    // the value passes drop the conservative "reads/writes every register"
+    // fallback and treat the call precisely. See
+    // [`FunctionSignature::externally_resolved`].
+    f.set_clobbered_regs(abi.caller_saved.clone());
+    f.set_externally_resolved(true);
+}
+
+/// Whether `abi` carries enough of a convention to resolve external callees: it
+/// either passes integer arguments in registers (x64 System V) or, for a
+/// stack-only convention (x86 stdcall/cdecl), at least names its caller-saved
+/// registers so a resolved call has a clobber set.
+fn abi_is_known(abi: &CallingConvention) -> bool {
+    !abi.int_args.is_empty() || !abi.caller_saved.is_empty()
 }
 
 /// Apply [`apply_external_signature`] to every external function.
@@ -160,7 +177,7 @@ pub fn apply_all_external_signatures(
     abi: &CallingConvention,
     target: AbiTarget,
 ) {
-    if abi.int_args.is_empty() {
+    if !abi_is_known(abi) {
         return;
     }
     let ids: Vec<FunctionId> = ctx
@@ -193,6 +210,7 @@ mod tests {
             sse_args: vec![tc.r2],
             int_ret: Some(gp(tc.r3)),
             sse_ret: Some(tc.r2),
+            caller_saved: vec![tc.r3],
         }
     }
 

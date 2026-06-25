@@ -246,7 +246,10 @@ fn wider_register_store_contains(ctx: &Context, store: ValueId, var: ValueId) ->
 /// A direct call clobbers the registers in its target's recorded clobber set,
 /// overlap-aware so a callee writing RAX clobbers a caller's EAX read. A
 /// `CallInd` has an unknown target and conservatively clobbers every register; a
-/// target with no recorded clobber set is likewise treated conservatively.
+/// target with no recorded clobber set is likewise treated conservatively —
+/// *unless* it is [`externally_resolved`](Function::is_externally_resolved), in
+/// which case its clobber set is exact (a prototype-derived volatile set, often
+/// empty) and an absent/empty set clobbers nothing rather than everything.
 /// Non-register vars (stack slots) are never clobbered by a call.
 fn call_clobbers_var(ctx: &Context, block: BlockId, var: ValueId, aliases: &AliasResult) -> bool {
     if register_varnode(ctx, var).is_none() {
@@ -259,14 +262,17 @@ fn call_clobbers_var(ctx: &Context, block: BlockId, var: ValueId, aliases: &Alia
     match term {
         Some(Mnemonic::CallInd(_)) => true,
         Some(Mnemonic::Call(call)) => {
-            let clobbered: Option<Vec<VarnodeId>> = Function::from_id(ctx, call.target)
-                .clobbered_regs()
-                .map(<[VarnodeId]>::to_vec);
+            let callee = Function::from_id(ctx, call.target);
+            let resolved = callee.is_externally_resolved();
+            let clobbered: Option<Vec<VarnodeId>> =
+                callee.clobbered_regs().map(<[VarnodeId]>::to_vec);
             match clobbered {
                 Some(clobbered) => clobbered
                     .iter()
                     .any(|&c| aliases.may_alias(ctx, ValueId::Varnode(c), var)),
-                None => true,
+                // A resolved callee with no recorded set clobbers nothing; an
+                // unresolved one is unknown, so conservatively clobbers all.
+                None => !resolved,
             }
         }
         _ => false,
@@ -1554,6 +1560,21 @@ impl Mem2Reg<'_, '_> {
                     {
                         let frame = state.frames.last_mut().unwrap();
                         for v in clobbered {
+                            // A pending store to a clobbered register, never read
+                            // before the call, is overwritten by the call's own
+                            // write — it is dead, exactly as a store-overwrites-store
+                            // would be (see the `Store` arm). Only the top frame is
+                            // consulted, for the same path-domination reason.
+                            if let Some(FrameEntry::Defined(ReachingValue {
+                                store_insn: Some(old_id),
+                                ..
+                            })) = frame.get(&v)
+                            {
+                                let old_id = *old_id;
+                                if !state.consumed_stores.contains(&old_id) {
+                                    state.dead_stores.insert(old_id);
+                                }
+                            }
                             frame.insert(v, FrameEntry::Clobbered);
                         }
                     }
@@ -1604,11 +1625,19 @@ impl Mem2Reg<'_, '_> {
         match call {
             Mnemonic::CallInd(_) => register_vars().collect(),
             Mnemonic::Call(call) => {
-                let clobbered = Function::from_id(self.ctx, call.target)
-                    .clobbered_regs()
-                    .map(<[VarnodeId]>::to_vec);
+                let callee = Function::from_id(self.ctx, call.target);
+                let resolved = callee.is_externally_resolved();
+                let clobbered = callee.clobbered_regs().map(<[VarnodeId]>::to_vec);
                 match clobbered {
-                    None => register_vars().collect(),
+                    // A resolved callee with no recorded set clobbers nothing; an
+                    // unresolved one is unknown, so conservatively clobbers all.
+                    None => {
+                        if resolved {
+                            Vec::new()
+                        } else {
+                            register_vars().collect()
+                        }
+                    }
                     Some(clobbered) => register_vars()
                         .filter(|&v| {
                             clobbered
@@ -2289,6 +2318,125 @@ mod tests {
             cont_block.instruction_ids().contains(&post_load_id),
             "the post-call read of r0 must survive as a register load, not be \
              forwarded to the pre-call value:\n{cont_block}"
+        );
+    }
+
+    /// A store to a register the callee clobbers, never read before the call, is
+    /// dead — the call overwrites it — so mem2reg removes it (the call-clobber
+    /// analogue of a store-overwrites-store).
+    #[test]
+    fn dead_pre_call_store_to_clobbered_register_is_removed() {
+        use qcode::{builder::Builder, testing::TestContext};
+
+        let mut tc = TestContext::new();
+        let (r0, r1, reg) = (tc.r0, tc.r1, tc.reg_space);
+
+        // Callee that writes (clobbers) r0.
+        let callee = Function::make(&mut tc.ctx, "callee".into()).unwrap().id;
+        let cbody = tc.ctx.get_or_make_block(0x2000);
+        Function::from_id_mut(&mut tc.ctx, callee)
+            .set_root(cbody)
+            .unwrap();
+        {
+            let mut b = Builder::from_context(&mut tc.ctx, 0x2000);
+            let v = b.context_mut().get_const(0x99u64, 8).id();
+            b.push_store(v, ValueId::Varnode(r0), reg);
+            let ret = b.context_mut().get_const(0u64, 8).id();
+            b.push_return(ret);
+            unsafe { b.dont_finalize() };
+        }
+        crate::set_all_call_clobbered_regs(&mut tc.ctx);
+
+        // Caller: write r0 (dead — never read before the call), call, then read r0
+        // after (so r0 is a promoted var) into r1.
+        let caller = Function::make(&mut tc.ctx, "caller".into()).unwrap().id;
+        let entry = tc.ctx.get_or_make_block(0x1000);
+        let cont = tc.ctx.get_or_make_block(0x1100);
+        Function::from_id_mut(&mut tc.ctx, caller)
+            .set_root(entry)
+            .unwrap();
+        Function::from_id_mut(&mut tc.ctx, caller).add_block(cont);
+        let pre_store;
+        {
+            let mut b = Builder::from_context(&mut tc.ctx, 0x1000);
+            let pre = b.context_mut().get_const(0x1u64, 8).id();
+            pre_store = b.push_store(pre, ValueId::Varnode(r0), reg).id;
+            b.push_call(callee);
+            b.switch_to_block(cont);
+            let post = b.push_load::<false>(ValueId::Varnode(r0), 8, reg).id();
+            b.push_store(post, ValueId::Varnode(r1), reg);
+            let ret = b.context_mut().get_const(0u64, 8).id();
+            b.push_return(ret);
+            unsafe { b.dont_finalize() };
+        }
+        tc.ctx.add_cfg_edge(entry, cont);
+
+        let aliases = AliasResult::simple(&tc.ctx);
+        mem2reg(&mut tc.ctx, caller, &aliases);
+
+        let entry_block = BasicBlock::from_id(&tc.ctx, entry);
+        assert!(
+            !entry_block.instruction_ids().contains(&pre_store),
+            "the dead pre-call store to clobbered r0 must be removed:\n{entry_block}"
+        );
+    }
+
+    /// A write-only register written before a clobbering call and again after it
+    /// (so it is promoted as store-only with 2+ stores) has its dead pre-call
+    /// store removed; the call clobbers it with no intervening read.
+    #[test]
+    fn dead_pre_call_store_to_write_only_clobbered_register_is_removed() {
+        use qcode::{builder::Builder, testing::TestContext};
+
+        let mut tc = TestContext::new();
+        let (r0, reg) = (tc.r0, tc.reg_space);
+
+        let callee = Function::make(&mut tc.ctx, "callee".into()).unwrap().id;
+        let cbody = tc.ctx.get_or_make_block(0x2000);
+        Function::from_id_mut(&mut tc.ctx, callee)
+            .set_root(cbody)
+            .unwrap();
+        {
+            let mut b = Builder::from_context(&mut tc.ctx, 0x2000);
+            let v = b.context_mut().get_const(0x99u64, 8).id();
+            b.push_store(v, ValueId::Varnode(r0), reg);
+            let ret = b.context_mut().get_const(0u64, 8).id();
+            b.push_return(ret);
+            unsafe { b.dont_finalize() };
+        }
+        crate::set_all_call_clobbered_regs(&mut tc.ctx);
+
+        let caller = Function::make(&mut tc.ctx, "caller".into()).unwrap().id;
+        let entry = tc.ctx.get_or_make_block(0x1000);
+        let cont = tc.ctx.get_or_make_block(0x1100);
+        Function::from_id_mut(&mut tc.ctx, caller)
+            .set_root(entry)
+            .unwrap();
+        Function::from_id_mut(&mut tc.ctx, caller).add_block(cont);
+        let pre_store;
+        {
+            let mut b = Builder::from_context(&mut tc.ctx, 0x1000);
+            let v1 = b.context_mut().get_const(0x1u64, 8).id();
+            pre_store = b.push_store(v1, ValueId::Varnode(r0), reg).id; // dead
+            b.push_call(callee);
+            b.switch_to_block(cont);
+            // A second store after the call — never read — making r0 store-only
+            // with 2 stores (promoted), as the obfuscated junk does.
+            let v2 = b.context_mut().get_const(0x2u64, 8).id();
+            b.push_store(v2, ValueId::Varnode(r0), reg);
+            let ret = b.context_mut().get_const(0u64, 8).id();
+            b.push_return(ret);
+            unsafe { b.dont_finalize() };
+        }
+        tc.ctx.add_cfg_edge(entry, cont);
+
+        let aliases = AliasResult::simple(&tc.ctx);
+        mem2reg(&mut tc.ctx, caller, &aliases);
+
+        let entry_block = BasicBlock::from_id(&tc.ctx, entry);
+        assert!(
+            !entry_block.instruction_ids().contains(&pre_store),
+            "the dead pre-call store to write-only clobbered r0 must be removed:\n{entry_block}"
         );
     }
 
