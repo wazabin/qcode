@@ -88,7 +88,10 @@ impl Pass for Verify {
         if violations.is_empty() {
             Ok(false)
         } else {
-            Err(format!("IR verification failed:\n  - {}", violations.join("\n  - ")))
+            Err(format!(
+                "IR verification failed:\n  - {}",
+                violations.join("\n  - ")
+            ))
         }
     }
 }

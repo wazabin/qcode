@@ -432,8 +432,14 @@ mod tests {
 
         let r = AliasResult::simple(&tc.ctx).with_frame_freshness(&tc.ctx, fid, Some(sp_reg));
 
-        assert!(r.provably_disjoint(&tc.ctx, local, arg), "local ⊥ incoming arg");
-        assert!(r.provably_disjoint(&tc.ctx, arg, local), "rule is symmetric");
+        assert!(
+            r.provably_disjoint(&tc.ctx, local, arg),
+            "local ⊥ incoming arg"
+        );
+        assert!(
+            r.provably_disjoint(&tc.ctx, arg, local),
+            "rule is symmetric"
+        );
         assert!(
             r.provably_disjoint(&tc.ctx, local, arg_plus),
             "local ⊥ a pointer offset from the incoming arg"

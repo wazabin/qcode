@@ -6,8 +6,7 @@ use qcode::{
         insn::{
             Binary, Binop, BoolBinop, Carry, FloatBinop, FloatToFloat, FloatToInt, Gep,
             InstructionRef, IntBinop, IntToFloat, IsFloatNaN, Load, LzCount, Mnemonic, PopCount,
-            Range, SBorrow,
-            SCarry, Sext, Store, Unary, Unop, Zext,
+            Range, SBorrow, SCarry, Sext, Store, Unary, Unop, Zext,
         },
         varnode::{VarnodeId, register::RegisterId},
     },

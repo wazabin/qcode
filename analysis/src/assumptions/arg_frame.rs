@@ -27,7 +27,9 @@ use qcode::{
     assumption::{Certainty, Proposition},
     context::Context,
     pass_scope,
-    value::{Function, FunctionId, Instruction, ValueId, VarnodeId, insn::InstructionId, insn::Mnemonic},
+    value::{
+        Function, FunctionId, Instruction, ValueId, VarnodeId, insn::InstructionId, insn::Mnemonic,
+    },
 };
 
 use crate::gvn::affine::{Numbering, precompute_forms};
@@ -61,7 +63,12 @@ fn address_taken_set(ctx: &Context) -> HashSet<FunctionId> {
 /// it for every `@SP`-param function is harmless for those that never gain a
 /// pointer param — the frame-freshness alias rule only consults it when querying an
 /// input-derived pointer.
-fn eligible(ctx: &Context, fid: FunctionId, sp_reg: VarnodeId, taken: &HashSet<FunctionId>) -> bool {
+fn eligible(
+    ctx: &Context,
+    fid: FunctionId,
+    sp_reg: VarnodeId,
+    taken: &HashSet<FunctionId>,
+) -> bool {
     let f = Function::from_id(ctx, fid);
     if f.is_external() || f.root().is_none() {
         return false;
@@ -89,7 +96,10 @@ pub fn assume_args_disjoint_caller_frame(ctx: &mut Context, sp_reg: Option<Varno
             count += 1;
         }
     }
-    qcode::pass_log!(debug, "assumed ArgsDisjointFromCallerFrame for {count} functions");
+    qcode::pass_log!(
+        debug,
+        "assumed ArgsDisjointFromCallerFrame for {count} functions"
+    );
     count
 }
 
@@ -117,7 +127,9 @@ pub fn verify_args_disjoint_caller_frame(ctx: &mut Context, sp_reg: Option<Varno
         // Default to holding: the assumption is refuted only by a *provable*
         // collision (a resolved interval overlap). An unresolvable caller/offset
         // is not proof of a collision, so it leaves the assumption standing.
-        let holds = sp_reg.map_or(true, |sp| !args_provably_collide(ctx, callee, sp, &mut cache));
+        let holds = sp_reg.map_or(true, |sp| {
+            !args_provably_collide(ctx, callee, sp, &mut cache)
+        });
         if ctx.set_known(Proposition::ArgsDisjointFromCallerFrame(callee), holds) {
             novel += 1;
             qcode::pass_log!(
@@ -353,7 +365,10 @@ mod tests {
     /// Build `f` (reads its caller-frame slot `@sp+4`, derefs pointer param `@p`)
     /// and a caller `g` with an `@SP` param and a `call <f>`. Returns
     /// `(f, g_entry, g_call, gsp)`.
-    fn build_f_and_g(tc: &mut TestContext, sp_reg: VarnodeId) -> (FunctionId, BlockId, BlockId, ValueId) {
+    fn build_f_and_g(
+        tc: &mut TestContext,
+        sp_reg: VarnodeId,
+    ) -> (FunctionId, BlockId, BlockId, ValueId) {
         qcode!(
             tc.ctx,
             "

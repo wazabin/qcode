@@ -79,12 +79,19 @@ pub fn canonicalize_sp_slots(ctx: &mut Context, fid: FunctionId, sp_reg: Varnode
     }
 
     // Materialize the rest at the entry-block start (which dominates everything).
-    let missing: Vec<i64> = offsets.iter().copied().filter(|o| !repr.contains_key(o)).collect();
+    let missing: Vec<i64> = offsets
+        .iter()
+        .copied()
+        .filter(|o| !repr.contains_key(o))
+        .collect();
     if !missing.is_empty() {
         let mut b = Builder::from_block(BasicBlock::from_id_mut(ctx, root));
         b.set_insert_point_to_start();
         for off in missing {
-            let mag = b.context_mut().get_const(off.unsigned_abs(), ptr_width).id();
+            let mag = b
+                .context_mut()
+                .get_const(off.unsigned_abs(), ptr_width)
+                .id();
             let rep = if off > 0 {
                 b.push_add(sp_param, mag).id()
             } else {
@@ -168,7 +175,8 @@ mod tests {
 
         // `load(@SP - 8)` in each block — distinct Sub ValueIds.
         let load_in = |block, tc: &mut TestContext| {
-            let mut b = qcode::builder::Builder::from_block(BasicBlock::from_id_mut(&mut tc.ctx, block));
+            let mut b =
+                qcode::builder::Builder::from_block(BasicBlock::from_id_mut(&mut tc.ctx, block));
             let c8 = b.context_mut().get_const(8, 8).id();
             let addr = b.push_sub(sp, c8).id();
             let load = b.push_load::<false>(addr, 8, ram);
@@ -188,7 +196,11 @@ mod tests {
                 _ => unreachable!(),
             }
         };
-        assert_ne!(ptr_of(&tc, l0), ptr_of(&tc, l1), "distinct before canonicalization");
+        assert_ne!(
+            ptr_of(&tc, l0),
+            ptr_of(&tc, l1),
+            "distinct before canonicalization"
+        );
 
         assert!(canonicalize_sp_slots(&mut tc.ctx, fid, sp_reg));
 
@@ -204,6 +216,10 @@ mod tests {
             !canonicalize_sp_slots(&mut tc.ctx, fid, sp_reg),
             "second run must be a no-op"
         );
-        assert_eq!(ptr_of(&tc, l0), shared, "representative is stable across runs");
+        assert_eq!(
+            ptr_of(&tc, l0),
+            shared,
+            "representative is stable across runs"
+        );
     }
 }

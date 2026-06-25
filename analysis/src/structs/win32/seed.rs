@@ -26,7 +26,7 @@ use qcode::{
     assumption::Proposition,
     context::{Context, TargetOs},
     types::{AggregateField, TypeId},
-    value::{FunctionId, Varnode, VarnodeId, ValueId},
+    value::{FunctionId, ValueId, Varnode, VarnodeId},
 };
 
 use crate::{FunctionPass, PipelineEnv};
@@ -54,9 +54,9 @@ pub fn register_teb_structs(ctx: &mut Context) -> HashMap<String, TypeId> {
                 let type_id = match &f.kind {
                     HFieldKind::Int { size } => ctx.types.get_or_make_int(*size),
                     HFieldKind::StructPtr { pointee, width } => {
-                        let pointee_ty = *by_name
-                            .get(pointee)
-                            .unwrap_or_else(|| panic!("pointee struct {pointee} not yet registered"));
+                        let pointee_ty = *by_name.get(pointee).unwrap_or_else(|| {
+                            panic!("pointee struct {pointee} not yet registered")
+                        });
                         ctx.types.get_or_make_struct_pointer(*width, pointee_ty)
                     }
                 };
@@ -82,7 +82,9 @@ pub fn seed_teb_register(ctx: &mut Context, fs_offset: VarnodeId, bitness: u8) -
     let Some(&teb) = structs.get("TEB") else {
         return false;
     };
-    let teb_ptr = ctx.types.get_or_make_struct_pointer(ptr_width(bitness), teb);
+    let teb_ptr = ctx
+        .types
+        .get_or_make_struct_pointer(ptr_width(bitness), teb);
     ctx.set_varnode_type(fs_offset, teb_ptr);
     ctx.assume_true(Proposition::WindowsTeb { bitness });
     true
@@ -163,8 +165,14 @@ mod tests {
 
         // TEB.ProcessEnvironmentBlock @0x30 is a pointer to PEB.
         let teb = structs["TEB"];
-        let (_, peb_field) = ctx.types.field_by_offset(teb, 0x30).expect("PEB pointer @0x30");
-        let pointee = ctx.types.pointee_of(peb_field.type_id).expect("is a pointer");
+        let (_, peb_field) = ctx
+            .types
+            .field_by_offset(teb, 0x30)
+            .expect("PEB pointer @0x30");
+        let pointee = ctx
+            .types
+            .pointee_of(peb_field.type_id)
+            .expect("is a pointer");
         assert_eq!(ctx.types.struct_name_of(pointee), Some("PEB"));
     }
 
@@ -232,8 +240,8 @@ mod tests {
     /// The registered pass types `FS_OFFSET` only on a Windows-x86 env.
     #[test]
     fn pass_gates_on_windows_x86() {
-        use std::borrow::Cow;
         use qcode::value::{RegisterId, Renameable, Varnode};
+        use std::borrow::Cow;
 
         let mut ctx = Context::new();
         qcode!(
@@ -253,14 +261,26 @@ mod tests {
         ctx.registers.insert(RegisterId::from(0usize), fs);
 
         // Wrong platform: no-op, register stays untyped.
-        assert!(!WindowsTebSeed.run(&mut ctx, f, &env_for(TargetOs::Linux, 64)).unwrap());
+        assert!(
+            !WindowsTebSeed
+                .run(&mut ctx, f, &env_for(TargetOs::Linux, 64))
+                .unwrap()
+        );
         let t = ctx.type_of(ValueId::Varnode(fs));
         assert!(ctx.types.pointee_of(t).is_none());
 
         // Windows x86: types the register and is idempotent on a second run.
-        assert!(WindowsTebSeed.run(&mut ctx, f, &env_for(TargetOs::Windows, 32)).unwrap());
+        assert!(
+            WindowsTebSeed
+                .run(&mut ctx, f, &env_for(TargetOs::Windows, 32))
+                .unwrap()
+        );
         let t = ctx.type_of(ValueId::Varnode(fs));
         assert!(ctx.types.pointee_of(t).is_some());
-        assert!(!WindowsTebSeed.run(&mut ctx, f, &env_for(TargetOs::Windows, 32)).unwrap());
+        assert!(
+            !WindowsTebSeed
+                .run(&mut ctx, f, &env_for(TargetOs::Windows, 32))
+                .unwrap()
+        );
     }
 }

@@ -38,8 +38,8 @@ use qcode::{
 };
 
 use crate::{
-    assume_call_returns, learn_stack_facts, seed_stack_facts,
-    verify_args_disjoint_caller_frame, verify_assumptions, verify_forced_returns,
+    assume_call_returns, learn_stack_facts, seed_stack_facts, verify_args_disjoint_caller_frame,
+    verify_assumptions, verify_forced_returns,
 };
 
 /// Maximum checkpoint+replay rounds the overrides-aware driver attempts before

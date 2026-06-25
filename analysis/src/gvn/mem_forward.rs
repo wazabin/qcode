@@ -111,12 +111,7 @@ fn locate(
 /// info (isolated values) or an `Unknown` class is **not** proof: such pairs
 /// are treated as possibly-aliasing, so a forwarded cell is dropped on any
 /// doubt.
-fn proven_disjoint(
-    ctx: &Context,
-    aliases: Option<&AliasResult>,
-    a: ValueId,
-    b: ValueId,
-) -> bool {
+fn proven_disjoint(ctx: &Context, aliases: Option<&AliasResult>, a: ValueId, b: ValueId) -> bool {
     let Some(aliases) = aliases else { return false };
     // Frame freshness: an own-frame local and an incoming pointer never alias.
     if aliases.provably_disjoint(ctx, a, b) {
@@ -422,7 +417,12 @@ impl MemForward {
                     Some(regs) => CallClobbers::Regs(regs.to_vec()),
                     None => CallClobbers::AllRegisters,
                 };
-                let escaping = call.args.iter().chain(call.clobbers.iter()).copied().collect();
+                let escaping = call
+                    .args
+                    .iter()
+                    .chain(call.clobbers.iter())
+                    .copied()
+                    .collect();
                 (regs, escaping, false)
             }
             _ => return,
@@ -445,9 +445,7 @@ impl MemForward {
             }
             let Some(a) = aliases else { return false };
             escaping.iter().any(|&p| match a.interval(p) {
-                Some((sp, start, end)) => {
-                    sp == space && (start as i64) <= off && off < end as i64
-                }
+                Some((sp, start, end)) => sp == space && (start as i64) <= off && off < end as i64,
                 None => false,
             })
         };

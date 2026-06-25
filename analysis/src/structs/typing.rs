@@ -93,7 +93,10 @@ fn rename_struct_values(ctx: &mut Context, fun_id: FunctionId) -> bool {
 
     let mut changed = false;
     for value in values {
-        let Some(base) = ctx.stored_type_of(value).and_then(|t| struct_base_name(ctx, t)) else {
+        let Some(base) = ctx
+            .stored_type_of(value)
+            .and_then(|t| struct_base_name(ctx, t))
+        else {
             continue;
         };
         if let Some(name) = unique_name(ctx, value, &base) {
@@ -181,7 +184,10 @@ fn try_type_register_read(ctx: &mut Context, id: InstructionId, reg: ValueId, si
 /// offset of `S` → `gep(base, off)` typed `PtrTo<field.type>`.
 fn try_add_to_gep(ctx: &mut Context, id: InstructionId, lhs: ValueId, rhs: ValueId) -> bool {
     for (base, off_op) in [(lhs, rhs), (rhs, lhs)] {
-        let Some(pointee) = ctx.stored_type_of(base).and_then(|t| ctx.types.pointee_of(t)) else {
+        let Some(pointee) = ctx
+            .stored_type_of(base)
+            .and_then(|t| ctx.types.pointee_of(t))
+        else {
             continue;
         };
         let Some(offset) = const_offset(ctx, off_op) else {
@@ -203,7 +209,10 @@ fn try_add_to_gep(ctx: &mut Context, id: InstructionId, lhs: ValueId, rhs: Value
 /// `load(ptr)` with `ptr : PtrTo<F>` and `load.size == size_of(F)` → result
 /// retyped to `F`. Exact-size match only; otherwise left as an integer read.
 fn try_type_load(ctx: &mut Context, id: InstructionId, ptr: ValueId, size: usize) -> bool {
-    let Some(field_ty) = ctx.stored_type_of(ptr).and_then(|t| ctx.types.pointee_of(t)) else {
+    let Some(field_ty) = ctx
+        .stored_type_of(ptr)
+        .and_then(|t| ctx.types.pointee_of(t))
+    else {
         return false;
     };
     if ctx.types.size_of(field_ty) != size {

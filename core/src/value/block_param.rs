@@ -139,7 +139,9 @@ where
         // existing signature assertions (`<f @ESP @EDI>`) are unaffected.
         let types = &self.ctx().types;
         let ty = types.type_name(self.type_id());
-        if types.pointee_of(self.type_id()).is_some() || types.struct_name_of(self.type_id()).is_some() {
+        if types.pointee_of(self.type_id()).is_some()
+            || types.struct_name_of(self.type_id()).is_some()
+        {
             write!(f, "{ty} ")?;
         }
         if let Some(name) = self.name() {

@@ -928,8 +928,10 @@ mod tests {
     fn out_store(ctx: &Context, block: BlockId) -> ValueId {
         BasicBlock::from_id(ctx, block)
             .iter()
-            .find(|i| matches!(i.mnemonic(), Mnemonic::Store(s)
-                if matches!(s.ptr, ValueId::Varnode(_))))
+            .find(|i| {
+                matches!(i.mnemonic(), Mnemonic::Store(s)
+                if matches!(s.ptr, ValueId::Varnode(_)))
+            })
             .expect("store to &OUT")
             .id()
     }

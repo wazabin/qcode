@@ -31,7 +31,10 @@ impl PureFunctionViolation {
             .address()
             .map(|a| format!(" at {a:#x}"))
             .unwrap_or_default();
-        format!("function `{name}` is marked is_pure but has a {} {insn}{addr}", self.reason)
+        format!(
+            "function `{name}` is marked is_pure but has a {} {insn}{addr}",
+            self.reason
+        )
     }
 }
 

@@ -650,9 +650,7 @@ impl Numbering {
             Some(NormalForm::Affine { terms, .. }) => terms
                 .iter()
                 .any(|(t, _)| self.affine_mentions_rec(*t, target, seen)),
-            Some(NormalForm::Mask { term, .. }) => {
-                self.affine_mentions_rec(*term, target, seen)
-            }
+            Some(NormalForm::Mask { term, .. }) => self.affine_mentions_rec(*term, target, seen),
             _ => false,
         }
     }

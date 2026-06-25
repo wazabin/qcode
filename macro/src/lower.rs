@@ -77,10 +77,7 @@ pub(crate) fn compile_struct_decls(
             // Field width: an `iN` field is `N` bytes; a `Foo*` field is a
             // pointer (width 8). Padding (`_`) is always a scalar size.
             let (size, ty_tokens) = match &field.ty {
-                StructFieldType::Int(n) => (
-                    *n,
-                    quote! { (#ctx).types.get_or_make_int(#n) },
-                ),
+                StructFieldType::Int(n) => (*n, quote! { (#ctx).types.get_or_make_int(#n) }),
                 StructFieldType::StructPtr(target) => (
                     8usize,
                     quote! {

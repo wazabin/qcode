@@ -564,7 +564,11 @@ mod tests {
             .blocks()
             .flat_map(|b| b.iter().collect::<Vec<_>>())
             .find_map(|i| match i.mnemonic() {
-                Mnemonic::Binop(Binary { rhs, op: Binop::Int(IntBinop::Add), .. }) => Some(rhs),
+                Mnemonic::Binop(Binary {
+                    rhs,
+                    op: Binop::Int(IntBinop::Add),
+                    ..
+                }) => Some(rhs),
                 _ => None,
             })
             .expect("an add survives");
@@ -660,7 +664,11 @@ mod tests {
             .blocks()
             .flat_map(|b| b.iter().collect::<Vec<_>>())
             .find_map(|i| match i.mnemonic() {
-                Mnemonic::Binop(Binary { rhs, op: Binop::Int(IntBinop::Add), .. }) => Some(*rhs),
+                Mnemonic::Binop(Binary {
+                    rhs,
+                    op: Binop::Int(IntBinop::Add),
+                    ..
+                }) => Some(*rhs),
                 _ => None,
             })
             .expect("an add survives");

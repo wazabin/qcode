@@ -127,12 +127,9 @@ fn parse_struct_decl(pair: Pair<'_, Rule>) -> Result<StructDecl, ParseError> {
             .next()
             .ok_or_else(|| ParseError::new("missing struct field type"))?;
         let ty = match ty_pair.as_rule() {
-            Rule::struct_ptr_ty => StructFieldType::StructPtr(
-                ty_pair
-                    .as_str()
-                    .trim_end_matches('*')
-                    .to_owned(),
-            ),
+            Rule::struct_ptr_ty => {
+                StructFieldType::StructPtr(ty_pair.as_str().trim_end_matches('*').to_owned())
+            }
             Rule::integer => StructFieldType::Int(parse_integer(ty_pair.as_str())? as usize),
             _ => return Err(ParseError::new("invalid struct field type")),
         };
@@ -141,11 +138,7 @@ fn parse_struct_decl(pair: Pair<'_, Rule>) -> Result<StructDecl, ParseError> {
             ty,
         });
     }
-    Ok(StructDecl {
-        name,
-        fields,
-        span,
-    })
+    Ok(StructDecl { name, fields, span })
 }
 
 fn parse_fn_decl(pair: Pair<'_, Rule>) -> Result<FnDecl, ParseError> {
@@ -1724,7 +1717,7 @@ mod tests {
 
     #[test]
     fn parses_struct_decl_offsets_and_padding() {
-        use crate::ast::{StructFieldType, GepField, ExprNode};
+        use crate::ast::{ExprNode, GepField, StructFieldType};
         let program =
             parse_program("type Foo { a: 4, _: 5, b: 2, p: Bar* }; %x + 1").expect("parse");
         assert_eq!(program.structs.len(), 1);
@@ -1742,14 +1735,10 @@ mod tests {
         assert!(matches!(foo.fields[1].ty, StructFieldType::Int(5)));
         assert!(foo.fields[1].is_padding());
         // Pointer-to-struct field type is captured.
-        assert!(
-            matches!(&foo.fields[3].ty, StructFieldType::StructPtr(name) if name == "Bar")
-        );
+        assert!(matches!(&foo.fields[3].ty, StructFieldType::StructPtr(name) if name == "Bar"));
 
         // gep parses as its own expression node.
-        let geps = parse_program("%y = gep(%p.field)")
-            .expect("parse")
-            .kind;
+        let geps = parse_program("%y = gep(%p.field)").expect("parse").kind;
         let ProgramKind::Statements(stmts) = geps else {
             panic!("expected statements")
         };

@@ -57,9 +57,11 @@ pub fn mark_pure_functions(ctx: &mut Context) -> bool {
 /// the emulation harvesting this property keeps the call in place — any real side
 /// effect the store represents is preserved.
 pub(crate) fn body_is_pure(ctx: &Context, fid: FunctionId) -> bool {
-    Function::from_id(ctx, fid)
-        .iter()
-        .all(|block| block.iter().all(|insn| mnemonic_is_pure(ctx, insn.mnemonic())))
+    Function::from_id(ctx, fid).iter().all(|block| {
+        block
+            .iter()
+            .all(|insn| mnemonic_is_pure(ctx, insn.mnemonic()))
+    })
 }
 
 fn mnemonic_is_pure(ctx: &Context, m: &Mnemonic) -> bool {

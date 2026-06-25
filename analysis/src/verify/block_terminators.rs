@@ -10,7 +10,10 @@ pub fn verify_block_terminators(ctx: &Context) -> Vec<String> {
     for fid in ctx.function_ids() {
         for block in Function::from_id(ctx, fid).iter() {
             match block.iter().last() {
-                None => out.push(format!("fn {fid:?} block {:?} is empty (no terminator)", block.id)),
+                None => out.push(format!(
+                    "fn {fid:?} block {:?} is empty (no terminator)",
+                    block.id
+                )),
                 Some(last) if !last.mnemonic().is_terminator() => out.push(format!(
                     "fn {fid:?} block {:?} does not end in a terminator (last op: `{}`)",
                     block.id,

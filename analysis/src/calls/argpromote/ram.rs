@@ -37,8 +37,9 @@ impl OwnFrame {
     /// Whether `addr` points into this function's own frame (classified
     /// [`FrameClass::Local`]).
     fn is_local(&self, ctx: &Context, addr: ValueId) -> bool {
-        self.sp_param
-            .is_some_and(|sp| frame_class(ctx, &self.numbering, sp, addr) == Some(FrameClass::Local))
+        self.sp_param.is_some_and(|sp| {
+            frame_class(ctx, &self.numbering, sp, addr) == Some(FrameClass::Local)
+        })
     }
 }
 
@@ -281,7 +282,8 @@ fn try_promote(
     // that does not execute on some path replays a no-op, and no dominance reasoning
     // is needed. A function with any other (dynamic-address) write stays on the
     // partial path. (`other passes drop the redundant seed args.`)
-    if !all_accesses_modelled(ctx, fid, &promoted) || !all_writes_resolvable(ctx, fid, &promoted, sp_reg)
+    if !all_accesses_modelled(ctx, fid, &promoted)
+        || !all_writes_resolvable(ctx, fid, &promoted, sp_reg)
     {
         qcode::pass_log!(
             debug,
@@ -596,7 +598,10 @@ fn apply(
                 .iter()
                 .find(|q| q.param == base)
                 .map_or(p.base_size, |q| q.base_size);
-            if !write_slots.iter().any(|&(b, _, o, _)| b == base && o == offset) {
+            if !write_slots
+                .iter()
+                .any(|&(b, _, o, _)| b == base && o == offset)
+            {
                 write_slots.push((base, base_size, offset, size));
             }
         }
@@ -840,7 +845,12 @@ fn apply_partial(ctx: &mut Context, fid: FunctionId, promoted: &[Promoted]) -> b
     for ns in &new_snaps {
         let val_pid = BasicBlock::from_id_mut(ctx, root).push_param(ns.size).id;
         ctx.values.block_params[val_pid].name = Some(Cow::Owned(ns.name.clone()));
-        seeds.push((ns.base, ns.base_size, ns.offset, ValueId::BlockParam(val_pid)));
+        seeds.push((
+            ns.base,
+            ns.base_size,
+            ns.offset,
+            ValueId::BlockParam(val_pid),
+        ));
     }
     {
         let mut b = Builder::from_block(BasicBlock::from_id_mut(ctx, root));

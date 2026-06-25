@@ -3,10 +3,7 @@ use qcode::{
     context::Context,
     space::{SpaceId, SpaceType},
     types::TypeId,
-    value::{
-        BasicBlock, Function, FunctionId, Value, ValueId, Varnode, VarnodeId,
-        insn::Mnemonic,
-    },
+    value::{BasicBlock, Function, FunctionId, Value, ValueId, Varnode, VarnodeId, insn::Mnemonic},
 };
 
 use crate::{Pass, PipelineEnv};

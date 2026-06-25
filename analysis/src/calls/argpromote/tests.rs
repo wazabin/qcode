@@ -239,7 +239,10 @@ mod tests {
         tc.ctx.add_cfg_edge(f_call, f_cont);
 
         // Callee not yet pure → caller's call is an untracked effect.
-        assert!(!body_is_pure(&tc.ctx, caller), "call to impure callee blocks purity");
+        assert!(
+            !body_is_pure(&tc.ctx, caller),
+            "call to impure callee blocks purity"
+        );
 
         Function::from_id_mut(&mut tc.ctx, callee).set_is_pure(true);
         assert!(
@@ -321,7 +324,10 @@ mod tests {
                 _ => true,
             })
         });
-        assert!(all_ram, "partial mode must not redirect any access into shadow");
+        assert!(
+            all_ram,
+            "partial mode must not redirect any access into shadow"
+        );
         // Idempotent: the snapshots already exist, so a re-visit adds nothing.
         assert!(
             !argpromote(&mut tc.ctx),
@@ -372,9 +378,9 @@ mod tests {
         // The in-place store survives untouched (still in real ram).
         let ram = tc.ctx.default_space;
         assert!(
-            Function::from_id(&tc.ctx, f).blocks().any(|b| b
-                .iter()
-                .any(|i| matches!(i.mnemonic(), Mnemonic::Store(s) if s.space == ram && s.size == 4))),
+            Function::from_id(&tc.ctx, f).blocks().any(|b| b.iter().any(
+                |i| matches!(i.mnemonic(), Mnemonic::Store(s) if s.space == ram && s.size == 4)
+            )),
             "the original in-place store must survive"
         );
 
@@ -522,7 +528,10 @@ mod tests {
             b.params()
                 .any(|p| p.name().is_some_and(|n| n.contains("_val_30")))
         });
-        assert!(has_val_param, "callee must gain a `*_val_30` by-value param");
+        assert!(
+            has_val_param,
+            "callee must gain a `*_val_30` by-value param"
+        );
 
         // The caller computes `arg + 0x30` and loads the scalar before the call.
         let g_block = BasicBlock::from_id(&tc.ctx, g_call);
@@ -1174,7 +1183,11 @@ mod tests {
             })
             .count();
         assert_eq!(returns_with_value, 2, "every return carries the write-set");
-        assert_eq!(replayed_stores(&tc, call_id), 1, "the caller replays one write");
+        assert_eq!(
+            replayed_stores(&tc, call_id),
+            1,
+            "the caller replays one write"
+        );
     }
 
     /// A path-dependent write (written on only one arm) is now promotable: the write
@@ -1656,14 +1669,19 @@ mod tests {
         let (r0, reg_space) = (tc.r0, tc.reg_space);
         {
             let mut b = Builder::from_block(BasicBlock::from_id_mut(&mut tc.ctx, dirty_entry));
-            let _ = b.push_load::<false>(ValueId::Varnode(r0), 8, reg_space).id();
+            let _ = b
+                .push_load::<false>(ValueId::Varnode(r0), 8, reg_space)
+                .id();
             let ptr = b.context_mut().get_const(0x4000, 8).id();
             b.push_return(ptr);
             unsafe { b.dont_finalize() };
         }
         Function::from_id_mut(&mut tc.ctx, dirty).set_pure_reg(true);
 
-        assert!(mark_pure_functions(&mut tc.ctx), "the clean function is newly pure");
+        assert!(
+            mark_pure_functions(&mut tc.ctx),
+            "the clean function is newly pure"
+        );
         assert!(Function::from_id(&tc.ctx, clean).is_pure());
         assert!(
             !Function::from_id(&tc.ctx, dirty).is_pure(),

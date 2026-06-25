@@ -593,11 +593,7 @@ impl<'de> serde::Deserialize<'de> for TypeManager {
                 TypeRepr::Aggregate { fields } => {
                     manager.get_or_make_named_aggregate(fields);
                 }
-                TypeRepr::Struct {
-                    name,
-                    size,
-                    fields,
-                } => {
+                TypeRepr::Struct { name, size, fields } => {
                     manager.get_or_make_struct(name, size, fields);
                 }
                 // The pointee has a lower TypeId (built before the pointer),

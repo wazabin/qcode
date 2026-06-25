@@ -13,8 +13,7 @@ use qcode::{
     context::Context,
     space::SpaceType,
     value::{
-        BasicBlock, BlockId, BlockParam, Function, FunctionId, ValueId, Varnode,
-        VarnodeId,
+        BasicBlock, BlockId, BlockParam, Function, FunctionId, ValueId, Varnode, VarnodeId,
         insn::{Binop, IntBinop, Mnemonic},
     },
 };
@@ -55,7 +54,11 @@ fn function_makes_unbounded_call(ctx: &Context, function_id: FunctionId) -> bool
 /// a caller that passes a pointer into its own frame must keep that frame in
 /// memory. A bounded write (`*p` or `*(p + const)`) or a mere *read* through such
 /// a pointer is not enough — only an unbounded write counts (see the unit tests).
-fn function_writes_through_stack_arg(ctx: &Context, function_id: FunctionId, stack_ptr: VarnodeId) -> bool {
+fn function_writes_through_stack_arg(
+    ctx: &Context,
+    function_id: FunctionId,
+    stack_ptr: VarnodeId,
+) -> bool {
     let ram = ctx.default_space;
     let frame = FrameCtx::new(ctx, function_id, stack_ptr);
     for block in Function::from_id(ctx, function_id).blocks() {
@@ -86,8 +89,8 @@ struct FrameCtx {
 
 impl FrameCtx {
     fn new(ctx: &Context, function_id: FunctionId, stack_ptr: VarnodeId) -> Self {
-        let base = incoming_sp_param(ctx, function_id, stack_ptr)
-            .unwrap_or(ValueId::Varnode(stack_ptr));
+        let base =
+            incoming_sp_param(ctx, function_id, stack_ptr).unwrap_or(ValueId::Varnode(stack_ptr));
         Self {
             numbering: precompute_forms(ctx, function_id),
             base,
@@ -546,7 +549,9 @@ mod tests {
         Function::from_id_mut(&mut tc.ctx, fun_id)
             .set_root(block_id)
             .unwrap();
-        let pid = BasicBlock::from_id_mut(&mut tc.ctx, block_id).push_param(8).id;
+        let pid = BasicBlock::from_id_mut(&mut tc.ctx, block_id)
+            .push_param(8)
+            .id;
         tc.ctx.values.block_params[pid].origin = Some(ValueId::Varnode(sp));
         let sp_param = ValueId::BlockParam(pid);
         let mut builder = Builder::from_context(&mut tc.ctx, addr);
@@ -710,7 +715,6 @@ mod tests {
         assert!(f.stack_delta().is_none());
         assert!(f.clobbered_regs().unwrap().contains(&sp));
     }
-
 
     // -----------------------------------------------------------------------
     // Stack-passed parameters + frame-escape safety

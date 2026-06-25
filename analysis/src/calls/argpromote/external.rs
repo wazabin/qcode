@@ -332,7 +332,10 @@ mod tests {
     fn proto(params: Vec<CType>) -> CFunctionProto {
         CFunctionProto {
             name: "f".into(),
-            return_type: CType::Integer { bytes: 4, signed: true },
+            return_type: CType::Integer {
+                bytes: 4,
+                signed: true,
+            },
             params: params
                 .into_iter()
                 .map(|ty| CParam { name: None, ty })
@@ -343,11 +346,16 @@ mod tests {
     }
 
     fn ptr() -> CType {
-        CType::Pointer { pointee: Box::new(CType::Void) }
+        CType::Pointer {
+            pointee: Box::new(CType::Void),
+        }
     }
 
     fn int() -> CType {
-        CType::Integer { bytes: 4, signed: true }
+        CType::Integer {
+            bytes: 4,
+            signed: true,
+        }
     }
 
     /// stdcall: a synthesized `return_address` slot occupies `[SP+0]` and the

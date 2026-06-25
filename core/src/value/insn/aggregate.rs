@@ -284,5 +284,4 @@ mod tests {
             .expect("gep result is a pointer");
         assert_eq!(ctx.types.size_of(pointee), 4);
     }
-
 }

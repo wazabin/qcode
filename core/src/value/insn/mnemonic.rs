@@ -4,10 +4,9 @@ use crate::{
         ValueId,
         function::FunctionId,
         insn::{
-            Assert, Binary, Branch, BranchInd, CBranch, Call, CallInd, Carry, Extract, FloatToFloat,
-            FloatToInt, Gep, IntToFloat, Intrinsic, IsFloatNaN, Load, LzCount, PCodeOp, PopCount,
-            Range,
-            Return, SBorrow, SCarry, Sext, Store, Tuple, Unary, Zext,
+            Assert, Binary, Branch, BranchInd, CBranch, Call, CallInd, Carry, Extract,
+            FloatToFloat, FloatToInt, Gep, IntToFloat, Intrinsic, IsFloatNaN, Load, LzCount,
+            PCodeOp, PopCount, Range, Return, SBorrow, SCarry, Sext, Store, Tuple, Unary, Zext,
         },
     },
 };

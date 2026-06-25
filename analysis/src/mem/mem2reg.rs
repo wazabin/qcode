@@ -691,7 +691,10 @@ impl Mem2Reg<'_, '_> {
         let root_live_in: Vec<ValueId> = vars
             .iter()
             .copied()
-            .filter(|&var| self.live_in_blocks_cached(var, live_in_cache).contains(&root_id))
+            .filter(|&var| {
+                self.live_in_blocks_cached(var, live_in_cache)
+                    .contains(&root_id)
+            })
             .collect();
         for var in root_live_in {
             vars.remove(&var);
@@ -2022,9 +2025,7 @@ mod tests {
     /// Build `store(0x1234, @SP-8); reload(@SP-8)` in one block off an `@SP`
     /// param (origin = `sp_reg`). The two `@SP-8` addresses are distinct `Sub`
     /// values until canonicalized. Returns `(fun_id, block, sp_param, sp_reg)`.
-    fn sp_slot_function(
-        tc: &mut qcode::testing::TestContext,
-    ) -> (FunctionId, ValueId, VarnodeId) {
+    fn sp_slot_function(tc: &mut qcode::testing::TestContext) -> (FunctionId, ValueId, VarnodeId) {
         use qcode::builder::Builder;
         let sp_reg = tc.r0;
         let ram = tc.ctx.default_space;
@@ -2143,7 +2144,8 @@ mod tests {
             .count();
 
         assert_eq!(
-            loads_after, loads_before,
+            loads_after,
+            loads_before,
             "the dynamic @SP+reg access must disable promotion of the @SP-8 local:\n{}",
             Function::from_id(&tc.ctx, fun_id)
         );
