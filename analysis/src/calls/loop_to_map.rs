@@ -19,7 +19,7 @@ use qcode::{
     space::{Space, SpaceId, SpaceType},
     value::{
         BasicBlock, BlockId, Function, FunctionId, Instruction, InstructionRef, ValueId,
-        insn::{Binop, InstructionId, IntBinop, Mnemonic, Return},
+        insn::{Binop, Branch, InstructionId, IntBinop, Mnemonic, Return},
     },
 };
 
@@ -153,6 +153,55 @@ pub(crate) fn outline_expression(
     Some(fid)
 }
 
+/// Inline the pure straight-line body of `body_fn` (a single-block function
+/// returning a value, as produced by [`outline_expression`]) with its parameters
+/// bound to `args`, splicing the cloned computation into `block` immediately
+/// before `at`. Returns the value the body returns, remapped onto the inserted
+/// clones (or directly an arg/literal when the body just returns a param or
+/// constant). `None` on an arity mismatch, a missing body, or no return value.
+///
+/// This is the dual of [`outline_expression`] and the engine of element
+/// projection: `Extract`/`Range` of a `Map` inlines `body_fn(k, src[k])` here.
+pub(crate) fn inline_pure_body(
+    ctx: &mut Context,
+    body_fn: FunctionId,
+    args: &[ValueId],
+    block: BlockId,
+    at: InstructionId,
+) -> Option<ValueId> {
+    let root = Function::from_id(ctx, body_fn).root().map(|b| b.id)?;
+    let params: Vec<ValueId> = BasicBlock::from_id(ctx, root)
+        .params()
+        .map(|p| p.id())
+        .collect();
+    if params.len() != args.len() {
+        return None;
+    }
+    let mut value_map: HashMap<ValueId, ValueId> = HashMap::default();
+    for (&p, &a) in params.iter().zip(args) {
+        value_map.insert(p, a);
+    }
+    let insns: Vec<InstructionId> = BasicBlock::from_id(ctx, root).iter().map(|i| i.id).collect();
+    for iid in insns {
+        let m = ctx.get_insn(iid).mnemonic().clone();
+        if let Mnemonic::Return(r) = &m {
+            let v = r.value?;
+            return Some(value_map.get(&v).copied().unwrap_or(v));
+        }
+        let ty = ctx.get_insn(iid).type_id();
+        let mut nm = m;
+        for a in nm.args() {
+            if let Some(&n) = value_map.get(&a) {
+                nm.replace_value(a, n);
+            }
+        }
+        let new_id = InstructionRef::from_mnemonic_with_type(ctx, nm, ty).id;
+        BasicBlock::from_id_mut(ctx, block).insert_insn_before(at, new_id);
+        value_map.insert(ValueId::Instruction(iid), ValueId::Instruction(new_id));
+    }
+    None
+}
+
 // ===========================================================================
 // Total-map recognizer
 // ===========================================================================
@@ -193,10 +242,16 @@ struct MapMatch {
     stored_val: ValueId,
     /// The wide shadow reload whose uses become the map result (`%wv`).
     wv_id: InstructionId,
+    /// The seed store `*[shadow]:N base = arr` (dead after the rewrite).
+    seed_id: InstructionId,
+    /// The root/entry block holding the seed store and the loop preheader branch.
+    entry_block: BlockId,
+    /// The loop header block (carries the induction param).
+    header_block: BlockId,
+    /// The loop body block (the per-lane read-modify-write).
+    body_block: BlockId,
     /// The block holding `%wv` (where the map is inserted).
     exit_block: BlockId,
-    /// Lane count == byte length (v1: `elem == 1`).
-    count: usize,
 }
 
 fn is_temp(ctx: &Context, s: SpaceId) -> bool {
@@ -377,26 +432,57 @@ fn try_match(ctx: &Context, fid: FunctionId) -> Option<MapMatch> {
         return None;
     }
 
+    // The loop blocks are deleted by the rewrite, so its values must be private to
+    // it: the exit block carries no loop-carried params, header and body are
+    // distinct, and nothing the loop defines is used outside the loop. Otherwise
+    // deleting the loop would dangle a reference (a `verify_no_dangling_refs`
+    // violation).
+    if header == body_block || BasicBlock::from_id(ctx, wv.block).params().next().is_some() {
+        return None;
+    }
+    let loop_blocks = [header, body_block];
+    let in_loop = |v: ValueId| {
+        ctx.users(v)
+            .iter()
+            .all(|&u| ctx.get_insn(u).parent().is_some_and(|b| loop_blocks.contains(&b.id)))
+    };
+    for &blk in &loop_blocks {
+        let b = BasicBlock::from_id(ctx, blk);
+        if !b.params().all(|p| in_loop(p.id())) {
+            return None;
+        }
+        if !b.iter().all(|i| in_loop(ValueId::Instruction(i.id))) {
+            return None;
+        }
+    }
+
     Some(MapMatch {
         arr,
         index,
         elem_val,
         stored_val,
         wv_id: wv.id,
+        seed_id: seed.id,
+        entry_block: seed.block,
+        header_block: header,
+        body_block,
         exit_block: wv.block,
-        count,
     })
 }
 
-/// Rewrite a matched loop: outline the per-element body, insert `map(body, arr)`,
-/// and forward the write-set value to it. Returns `false` if the body is not a
-/// closed pure expression of `(index, element)` (then nothing is changed).
+/// Rewrite a matched loop: outline the per-element body, replace the write-set
+/// value with `map(body, arr)`, then delete the now-dead loop (reroute the
+/// preheader straight to the exit and remove the loop blocks, the seed store, and
+/// the wide reload). Returns `false` if the body is not a closed pure expression
+/// of `(index, element)` (then nothing is changed — `outline_expression` is
+/// all-or-nothing and runs before any rewrite).
 fn apply(ctx: &mut Context, fid: FunctionId, m: &MapMatch) -> bool {
     let name = format!("{}_map_body", Function::from_id(ctx, fid).name());
     let Some(body_fn) = outline_expression(ctx, &name, m.stored_val, &[m.index, m.elem_val]) else {
         return false;
     };
 
+    // Forward the returned write-set value to the map result.
     let wv_val = ValueId::Instruction(m.wv_id);
     let map_val = {
         let mut b = Builder::from_block(BasicBlock::from_id_mut(ctx, m.exit_block));
@@ -404,7 +490,27 @@ fn apply(ctx: &mut Context, fid: FunctionId, m: &MapMatch) -> bool {
         b.push_map(body_fn, m.arr, Vec::new()).id()
     };
     ctx.replace_all_uses_with(wv_val, map_val);
-    let _ = m.count;
+
+    // Reroute the preheader past the loop, straight to the exit. `replace_…`
+    // does not touch CFG edges, so add the new edge explicitly; deleting the
+    // header/body blocks below unlinks the stale `entry → header` edge.
+    if let Some(term) = BasicBlock::from_id(ctx, m.entry_block).iter().last() {
+        let term_id = term.id;
+        ctx.replace_instruction_mnemonic(
+            term_id,
+            Mnemonic::Branch(Branch {
+                target: m.exit_block,
+                args: Vec::new(),
+            }),
+        );
+        ctx.add_cfg_edge(m.entry_block, m.exit_block);
+    }
+
+    // Delete the dead loop and its now-readerless shadow accesses.
+    BasicBlock::from_id_mut(ctx, m.body_block).delete(fid);
+    BasicBlock::from_id_mut(ctx, m.header_block).delete(fid);
+    ctx.remove_instruction(m.seed_id);
+    ctx.remove_instruction(m.wv_id);
     true
 }
 

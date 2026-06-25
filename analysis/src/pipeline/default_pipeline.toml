@@ -269,6 +269,18 @@ scope = "module"
 passes = ["mark_pure", "module(gvn)", "module(dce)", "module(dead_store)", "assume_arg_frame", "argpromote"]
 repeat_until = "no_change"
 
+# Recognize a total element-wise array loop left by `argpromote`'s region
+# snapshot (a dynamic-index buffer rewrite, e.g. a byte decrypt loop) and rewrite
+# its returned write-set value to a single `map` over the snapshot array, outlining
+# the per-element body into a fresh pure function. Runs after `mark-pure` because
+# it only considers `is_pure` callees, and deletes the now-dead shadow loop itself.
+# The `Extract`/`Range`-of-`map` rewrite in the `gvn` below then projects an
+# element back to a `body(k, in[k])` call at the caller. See `ARGPROMOTE_ARRAY_MAP.md`.
+[[stage]]
+name = "loop-to-map"
+scope = "module"
+passes = ["loop_to_map"]
+
 # Aesthetic changes. `include_external` so the demangler also reaches imported
 # library functions (PLT stubs like `_ZNSsixEj` -> `std::string::operator[]`),
 # which are bodyless and therefore skipped by function-scoped stages by default.

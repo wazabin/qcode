@@ -19,6 +19,7 @@ mod flag_idiom;
 mod fold;
 mod identity;
 mod intrinsics;
+mod map_project;
 mod mem_forward;
 mod memory;
 mod pure_call;
@@ -29,6 +30,7 @@ use flag_idiom::FlagIdiom;
 use fold::Fold;
 use identity::Identities;
 use intrinsics::Recognize;
+use map_project::MapProject;
 use memory::MemoryForwarding;
 use pure_call::PureCall;
 use walk::{run_dominator_walk, run_flat_fixpoint, run_single_block};
@@ -42,6 +44,7 @@ use walk::{run_dominator_walk, run_flat_fixpoint, run_single_block};
 fn gvn_passes() -> (
     MemoryForwarding,
     Fold,
+    MapProject,
     PureCall,
     Recognize,
     FlagIdiom,
@@ -51,6 +54,7 @@ fn gvn_passes() -> (
     (
         MemoryForwarding,
         Fold,
+        MapProject,
         PureCall,
         Recognize,
         FlagIdiom,

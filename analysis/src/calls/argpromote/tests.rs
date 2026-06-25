@@ -1895,5 +1895,21 @@ mod tests {
             .into_iter()
             .any(|fid| Function::from_id(&tc.ctx, fid).name().contains("_map_body"));
         assert!(has_body, "the per-element body was outlined");
+
+        // The dead loop is gone: only entry + exit remain, and no shadow access
+        // (seed store, RMW, or reload) survives.
+        assert_eq!(
+            Function::from_id(&tc.ctx, f).iter().count(),
+            2,
+            "loop blocks deleted, leaving entry + exit"
+        );
+        let any_mem = Function::from_id(&tc.ctx, f)
+            .iter()
+            .any(|b| b.iter().any(|i| matches!(i.mnemonic(), Mnemonic::Load(_) | Mnemonic::Store(_))));
+        assert!(!any_mem, "no shadow load/store should remain in f");
+
+        // The rewritten IR verifies clean (no dangling refs, valid terminators).
+        let problems = crate::verify::verify(&tc.ctx);
+        assert!(problems.is_empty(), "post-rewrite IR must verify: {problems:?}");
     }
 }

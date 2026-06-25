@@ -18,6 +18,7 @@ pub use argpromote::{
 pub use clobbered::{compute_clobbered_regs, set_clobbered_regs};
 pub use dead_signature::dead_signature;
 pub use interface::{append_caller_arg, append_entry_param, remove_entry_param};
+pub(crate) use loop_to_map::inline_pure_body;
 pub use partial_inline::partial_inline;
 pub use projection::{Projection, project_return, return_field};
 pub use stack_facts::{learn_stack_facts, seed_stack_facts};
