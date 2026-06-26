@@ -325,8 +325,6 @@ struct MapMatch {
     wv_id: InstructionId,
     /// The seed store `*[shadow]:N base = arr` (dead after the rewrite).
     seed_id: InstructionId,
-    /// The per-lane store `*[shadow]:1 (base + idx) = v` (dead after the rewrite).
-    body_store_id: InstructionId,
     /// The root/entry block holding the seed store and the loop preheader branch.
     entry_block: BlockId,
     /// The loop header block (carries the induction param).
@@ -541,23 +539,12 @@ fn try_match(ctx: &Context, fid: FunctionId) -> Option<MapMatch> {
         return None;
     }
 
-    // Region locality is what makes the array channel separable from the rest of
-    // the loop. `region_accesses == 4` already proved nothing *else* touches the
-    // region's memory; this additionally proves the loaded element does not *leak*
-    // into any other result. Every use of the per-lane element must lie on the
-    // pure slice that computes the stored value (or be the per-lane store itself).
-    // If it did leak, an escaping result (e.g. `@EDX`) would read the array and we
-    // could neither delete nor strip the lane load. With both facts, the array's
-    // four shadow accesses are the only producers/consumers of the region, so they
-    // can be replaced by a `map` regardless of what else the loop computes.
-    let slice = pure_slice(ctx, stored_val, &[index, elem_val])?;
-    let elem_local = ctx
-        .users(elem_val)
-        .iter()
-        .all(|&u| u == body_store.id || slice.contains(&u));
-    if !elem_local {
-        return None;
-    }
+    // The map replacement only needs `region_accesses == 4` (nothing else touches
+    // the region) plus totality: the wide reload then equals `body(arr[i])` per
+    // lane regardless of what *else* the loaded element feeds. So the loaded
+    // element is allowed to leak into other results (e.g. an escaping `@EDX`) — we
+    // simply keep the loop's shadow channel running in that case (see `deletable`
+    // below and the stripping in [`apply`]). No element-locality gate is required.
 
     // The loop is *deletable* iff it is wholly private: the exit carries no
     // loop-carried params and every value the loop defines is used only inside it.
@@ -588,7 +575,6 @@ fn try_match(ctx: &Context, fid: FunctionId) -> Option<MapMatch> {
         stored_val,
         wv_id: wv.id,
         seed_id: seed.id,
-        body_store_id: body_store.id,
         entry_block: seed.block,
         header_block: header,
         body_block,
@@ -664,20 +650,19 @@ fn apply(ctx: &mut Context, fid: FunctionId, m: &MapMatch) -> bool {
     };
     ctx.replace_all_uses_with(wv_val, map_val);
 
-    // Strip the array's shadow accesses. The wide reload is now forwarded to the
-    // map; the seed store and the per-lane store have no remaining readers. The
-    // per-lane *load* is left in place — its result still feeds the (now dead)
-    // body slice, so it falls to a later DCE rather than being unlinked here.
-    ctx.remove_instruction(m.seed_id);
-    ctx.remove_instruction(m.body_store_id);
+    // The wide reload is now forwarded to the map and has no remaining readers
+    // (`region_accesses == 4` guarantees nothing else reads the region), so drop
+    // it unconditionally.
     ctx.remove_instruction(m.wv_id);
 
     if m.deletable {
         // The loop is wholly private, so nothing outside it reads what it computes.
-        // Reroute the preheader past the loop, straight to the exit (`replace_…`
-        // does not touch CFG edges, so add the new edge explicitly; deleting the
-        // header/body blocks unlinks the stale `entry → header` edge), then delete
-        // the loop blocks.
+        // Strip the seed store (the per-lane store/load vanish with `body_block`
+        // below), then reroute the preheader past the loop, straight to the exit
+        // (`replace_…` does not touch CFG edges, so add the new edge explicitly;
+        // deleting the header/body blocks unlinks the stale `entry → header` edge),
+        // then delete the loop blocks.
+        ctx.remove_instruction(m.seed_id);
         if let Some(term) = BasicBlock::from_id(ctx, m.entry_block).iter().last() {
             let term_id = term.id;
             ctx.replace_instruction_mnemonic(
@@ -693,7 +678,10 @@ fn apply(ctx: &mut Context, fid: FunctionId, m: &MapMatch) -> bool {
         BasicBlock::from_id_mut(ctx, m.header_block).delete(fid);
     }
     // Otherwise the loop also computes values consumed outside it, so it keeps
-    // running; only the array channel was extracted into the map above.
+    // running with its shadow channel intact: the seed store, per-lane store, and
+    // per-lane load are *left in place* — removing them would leave the surviving
+    // lane load reading an unseeded region. Only the wide reload was extracted into
+    // the map above.
     true
 }
 

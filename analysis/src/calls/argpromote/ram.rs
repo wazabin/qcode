@@ -215,13 +215,46 @@ impl RegionAcc {
     }
 
     /// The finished [`Region`], or `None` if absent, inconsistent, or larger than
-    /// [`MAX_REGION_BYTES`].
+    /// [`MAX_REGION_BYTES`]. A `None` is logged with its reason at `debug`, since it
+    /// means the folded accesses get no `Array` seed (and are dropped as unmodelled).
     fn build(&self) -> Option<Region> {
-        if !self.present || !self.ok || self.elem == 0 {
+        if !self.present {
             return None;
         }
-        let span = self.max_end.checked_sub(self.min)?;
+        if !self.ok {
+            qcode::pass_log!(
+                debug,
+                "region build bail: width mismatch (elem={}, min={:#x}, max_end={:#x})",
+                self.elem,
+                self.min,
+                self.max_end,
+            );
+            return None;
+        }
+        if self.elem == 0 {
+            qcode::pass_log!(debug, "region build bail: zero element width");
+            return None;
+        }
+        let Some(span) = self.max_end.checked_sub(self.min) else {
+            qcode::pass_log!(
+                debug,
+                "region build bail: max_end {:#x} < min {:#x} (underflow)",
+                self.max_end,
+                self.min,
+            );
+            return None;
+        };
         if span == 0 || span > MAX_REGION_BYTES {
+            qcode::pass_log!(
+                debug,
+                "region build bail: span {:#x} ({} bytes) {} (min={:#x}, max_end={:#x}, elem={})",
+                span,
+                span,
+                if span == 0 { "is zero" } else { "exceeds MAX_REGION_BYTES (4096)" },
+                self.min,
+                self.max_end,
+                self.elem,
+            );
             return None;
         }
         // Round the span up to a whole number of elements.
@@ -583,6 +616,13 @@ fn analyze_param(ctx: &Context, param: ValueId) -> ParamInfo {
     // One dynamic-index region per param, accumulated across all of its bounded
     // `param + idx` accesses.
     let mut region = RegionAcc::default();
+    // Accesses folded into the region. Kept separate from `accesses` until
+    // `region.build()` confirms the region is viable: if the span exceeds
+    // `MAX_REGION_BYTES` (or widths mismatch) `build()` returns `None` and these
+    // accesses get NO snapshot seed, so they must NOT be committed to `accesses`
+    // (which would redirect them to shadow as un-seeded orphan reads) — they are
+    // dropped instead, left unmodelled for the all-or-nothing gate to reject.
+    let mut region_accesses: Vec<InstructionId> = Vec::new();
     let mut is_deref = false;
 
     // Record a load at constant byte `offset` of `size` bytes. The width is gated
@@ -643,10 +683,13 @@ fn analyze_param(ctx: &Context, param: ValueId) -> ParamInfo {
                                 any = true;
                                 accesses.push(u2);
                             } else if region_bounded(ctx, offset, range) {
-                                // Bounded dynamic offset → fold into the region.
+                                // Bounded dynamic offset → fold into the region. The
+                                // access is committed to `accesses` only if the region
+                                // later builds (see `region_accesses`); otherwise it is
+                                // dropped as unmodelled.
                                 region.add(range.min, range.max, l.size, false);
                                 any = true;
-                                accesses.push(u2);
+                                region_accesses.push(u2);
                             }
                             // Else: unbounded (Top) — leave unmodelled for the gate.
                         }
@@ -664,7 +707,7 @@ fn analyze_param(ctx: &Context, param: ValueId) -> ParamInfo {
                                 {
                                     region.add(r.min, r.max, s.size, true);
                                     any = true;
-                                    accesses.push(u2);
+                                    region_accesses.push(u2);
                                 }
                                 // Unbounded dynamic store → unmodelled; leave it out
                                 // of `accesses` so the all-or-nothing gate rejects it.
@@ -689,6 +732,43 @@ fn analyze_param(ctx: &Context, param: ValueId) -> ParamInfo {
                 }
                 // `any` marks a real deref; `!any` is pure address arithmetic
                 // (e.g. `return p + k`).
+                if any {
+                    is_deref = true;
+                }
+            }
+            // `gep(param.field)` — a typed, constant-offset field deref. The
+            // struct-typing pass canonicalizes a `param + const` address into a
+            // `Gep`, so the same field read that the `Binop(Add)` arm above would
+            // have captured arrives here instead and must be modelled too, or it
+            // stays unmodelled and the function never gets its by-value snapshot.
+            // `Gep.offset` is always non-negative, so — unlike `param - const` —
+            // it is cleanly recomputable as a snapshot offset at the caller.
+            Mnemonic::Gep(g) if g.base == param => {
+                let offset = g.offset as u64;
+                let gep_val = ValueId::Instruction(uid);
+                let mut any = false;
+                for u2 in ctx.users(gep_val).to_vec() {
+                    match ctx.get_insn(u2).mnemonic().clone() {
+                        Mnemonic::Load(l) if l.ptr == gep_val && l.space == ram => {
+                            // Constant offset → one scalar snapshot, seeded by the
+                            // caller at `arg + offset` exactly like the add path.
+                            if !push_read(offset, l.size) {
+                                continue;
+                            }
+                            any = true;
+                            accesses.push(u2);
+                        }
+                        Mnemonic::Store(s) if s.ptr == gep_val && s.space == ram => {
+                            // The write address rides out in the return set as data.
+                            any = true;
+                            accesses.push(u2);
+                            write_targets.push((gep_val, s.size));
+                        }
+                        // Already-redirected shadow access, or use as data — not a
+                        // hazard (see the add arm and `all_accesses_modelled`).
+                        _ => {}
+                    }
+                }
                 if any {
                     is_deref = true;
                 }
@@ -721,7 +801,23 @@ fn analyze_param(ctx: &Context, param: ValueId) -> ParamInfo {
     let region = region.build();
     if region.is_some() {
         is_deref = true;
+        // The region is viable (an `Array` snapshot will be seeded for it), so its
+        // folded accesses are now safe to redirect into shadow.
+        accesses.append(&mut region_accesses);
+    } else if !region_accesses.is_empty() {
+        qcode::pass_log!(
+            debug,
+            "dropping {} unmodelled region access(es) (region failed to build) — \
+             function will fall to partial/no promotion rather than orphan them in shadow",
+            region_accesses.len(),
+        );
     }
+    // Else: `region.build()` returned `None` (span > `MAX_REGION_BYTES`, or
+    // inconsistent widths). The folded accesses get no seed, so they are deliberately
+    // NOT added to `accesses` — left unmodelled so `all_accesses_modelled` rejects the
+    // function to partial mode, rather than orphan-redirecting an un-seeded shadow
+    // read. (This is the TEB/PEB bug: a wide bounded fs-offset failed to build a
+    // region, leaving the `load(teb + idx)` redirected to shadow with no snapshot arg.)
 
     // Deterministic offset order, shared by callee param creation and caller
     // argument loads.

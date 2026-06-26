@@ -549,6 +549,99 @@ mod tests {
         );
     }
 
+    /// Reproduction of the TEB/PEB bug: a read through a **`gep`** field access
+    /// (`load(gep(p.field))`) — the form the struct-typing pass produces — must
+    /// promote to a by-value snapshot exactly like the equivalent `load(p + off)`
+    /// add form. Otherwise the load is redirected into shadow with no seed and
+    /// reads garbage.
+    #[test]
+    fn promotes_read_through_gep_field() {
+        use qcode::types::AggregateField;
+        let mut tc = qcode::testing::TestContext::new();
+        let input = stack_input(&mut tc, 4, 8);
+
+        qcode!(
+            tc.ctx,
+            "
+            fn f:
+                <f_entry @stack_10000004:i64>
+                    %a = @stack_10000004 + i64 0x30;
+                    %v = load(i32, %a);
+                    return [%v];
+
+            fn g:
+                <g_entry>
+                    goto <g_call>;
+                <g_call>
+                    call <f>;
+                <g_cont>
+                    return [i64 0];
+            "
+        );
+        let _ = g;
+
+        // Type the param as a struct pointer with a field at 0x30 and rewrite the
+        // `param + 0x30` add into the `gep(param.field)` form the typing pass emits.
+        let i32_ty = tc.ctx.types.get_or_make_int(4);
+        let s_ty =
+            tc.ctx
+                .types
+                .get_or_make_struct("S", 0x34, vec![AggregateField::new_at("peb", i32_ty, 0x30)]);
+        let ptr_ty = tc.ctx.types.get_or_make_struct_pointer(8, s_ty);
+        let root = Function::from_id(&tc.ctx, f).root().unwrap().id;
+        let pid = BasicBlock::from_id(&tc.ctx, root).params().next().unwrap().id();
+        let param = pid;
+        if let ValueId::BlockParam(bp) = param {
+            tc.ctx.values.block_params[bp].type_id = ptr_ty;
+        }
+        // Find the add and its load, replace the add with a gep.
+        let add_id = BasicBlock::from_id(&tc.ctx, root)
+            .iter()
+            .find(|i| matches!(i.mnemonic(), Mnemonic::Binop(b) if matches!(b.op, Binop::Int(IntBinop::Add))))
+            .unwrap()
+            .id;
+        let gep = {
+            let mut b = Builder::from_block(BasicBlock::from_id_mut(&mut tc.ctx, root));
+            b.set_insert_point_before(add_id);
+            b.push_gep(param, 0x30).id()
+        };
+        tc.ctx.replace_all_uses_with(ValueId::Instruction(add_id), gep);
+
+        Function::from_id_mut(&mut tc.ctx, f).set_input_regs(vec![input]);
+        Function::from_id_mut(&mut tc.ctx, f).set_pure_reg(true);
+        let ptr = tc.ctx.get_const(0x4000, 8).id();
+        set_call(&mut tc, g_call, f, vec![ptr]);
+        tc.ctx.add_cfg_edge(g_call, g_cont);
+
+        assert!(
+            argpromote(&mut tc.ctx),
+            "a 4-byte read through gep(p.field) at offset 0x30 should promote"
+        );
+
+        assert!(
+            has_val_param(&tc.ctx, f),
+            "the gep read must be exposed as a by-value snapshot param"
+        );
+
+        // The real-pipeline step that exposes the bug: GVN's memory forwarding must
+        // forward the redirected *shadow* gep-load from the entry seed store (both
+        // resolve to base @param + 0x30). Without gep-aware affine numbering the
+        // load reads un-seeded shadow and survives — the reported PEB bug.
+        let aliases = crate::AliasResult::simple(&tc.ctx);
+        crate::gvn::gvn_function(&mut tc.ctx, f, Some(&aliases));
+
+        let ram = tc.ctx.default_space;
+        let surviving_shadow_load = Function::from_id(&tc.ctx, f).iter().any(|blk| {
+            blk.iter()
+                .any(|i| matches!(i.mnemonic(), Mnemonic::Load(l) if l.space != ram))
+        });
+        assert!(
+            !surviving_shadow_load,
+            "the redirected shadow load must forward from the seed (read the snapshot \
+             param), not survive reading un-seeded shadow"
+        );
+    }
+
     #[test]
     fn noop_when_no_promotable_param() {
         let mut ctx = Context::new();
@@ -1807,6 +1900,72 @@ mod tests {
         );
     }
 
+    /// Regression for the TEB/PEB orphan bug: a bounded dynamic-index read whose
+    /// span exceeds `MAX_REGION_BYTES` (4096) makes `RegionAcc::build()` return
+    /// `None` — so NO `Array` snapshot is seeded for it. The folded access must then
+    /// be left **unmodelled** (dropped), steering the function to partial mode, NOT
+    /// committed to `accesses` where it would be redirected into shadow as an
+    /// un-seeded orphan load (reading garbage). Here the index is `idx & 0x1fff`, a
+    /// bounded `[0, 0x1fff]` range whose 0x2003-byte span exceeds 4096, so the
+    /// region enters the fold path (`region.add`) but cannot build — exactly the
+    /// shape that orphaned the PEB read into shadow.
+    #[test]
+    fn oversized_region_does_not_orphan_into_shadow() {
+        let mut tc = qcode::testing::TestContext::new();
+        let input = stack_input(&mut tc, 4, 8);
+
+        qcode!(
+            tc.ctx,
+            "
+            fn f:
+                <f_entry @stack_10000004:i64 @idx:i64>
+                    %m = @idx & i64 0x1fff;
+                    %addr = @stack_10000004 + %m;
+                    %v = load(i32, %addr);
+                    return [%v];
+
+            fn g:
+                <g_entry>
+                    goto <g_call>;
+                <g_call>
+                    call <f>;
+                <g_cont>
+                    return [i64 0];
+            "
+        );
+        let _ = g;
+
+        Function::from_id_mut(&mut tc.ctx, f).set_input_regs(vec![input]);
+        Function::from_id_mut(&mut tc.ctx, f).set_pure_reg(true);
+        let ptr = tc.ctx.get_const(0x4000, 8).id();
+        let idx = tc.ctx.get_const(0x10, 8).id();
+        set_call(&mut tc, g_call, f, vec![ptr, idx]);
+        tc.ctx.add_cfg_edge(g_call, g_cont);
+
+        // The region can't build, so there's nothing to model: no shadow promotion.
+        argpromote(&mut tc.ctx);
+
+        // The crux: the buffer load must NOT have been redirected into a shadow
+        // space. It stays a real-ram load (left for a later round once the index is
+        // a constant, or genuinely unpromotable) — never an un-seeded shadow orphan.
+        let ram = tc.ctx.default_space;
+        let shadow_load = Function::from_id(&tc.ctx, f).iter().any(|blk| {
+            blk.iter()
+                .any(|i| matches!(i.mnemonic(), Mnemonic::Load(l) if l.space != ram))
+        });
+        assert!(
+            !shadow_load,
+            "an oversized region must not be redirected into shadow without a seed"
+        );
+
+        // No `Array` snapshot param was minted for the failed region.
+        let has_array_param = Function::from_id(&tc.ctx, f).root().is_some_and(|b| {
+            b.params()
+                .any(|p| tc.ctx.types.array_of(p.type_id()).is_some())
+        });
+        assert!(!has_array_param, "no Array param for a region that can't build");
+    }
+
     /// The real-world shape: the buffer pointer is spilled to `[ESP+4]` and
     /// **reloaded inside the loop**. Under the frame assumptions
     /// (`ArgsDisjointFromCallerFrame` + `LoadedPointerDisjointFromSlot`), GVN
@@ -2192,13 +2351,16 @@ mod tests {
             .any(|b| b.iter().any(|i| matches!(i.mnemonic(), Mnemonic::CBranch(_))));
         assert!(has_cbranch, "the loop's header branch must remain");
 
-        // No shadow store survives (seed + per-lane store stripped); the now-dead
-        // per-lane load is left for a later DCE, so we don't assert its absence.
+        // The loop's shadow channel is *kept intact*: only the wide reload was
+        // rerouted to the map. The seed and per-lane stores remain so the surviving
+        // residual loop (which still loads each lane) reads a properly seeded
+        // region. (Contrast `dynamic_index_loop_becomes_map`, where the deletable
+        // loop is removed and the seed store stripped.)
         let any_store = Function::from_id(&tc.ctx, f).iter().any(|b| {
             b.iter().any(|i| matches!(i.mnemonic(), Mnemonic::Store(s)
                 if matches!(qcode::space::Space::from_id(&tc.ctx, s.space).ty, qcode::space::SpaceType::Temporary)))
         });
-        assert!(!any_store, "no shadow store should remain in f");
+        assert!(any_store, "the kept loop's shadow stores must remain");
 
         // The rewritten IR verifies clean (no dangling refs, valid terminators).
         let problems = crate::verify::verify(&tc.ctx);
@@ -2208,12 +2370,15 @@ mod tests {
         );
     }
 
-    /// Soundness guard for the keep-loop path: when the escaping accumulator reads
-    /// the *array element* (`@acc += buf[i]`), the array channel is not separable —
-    /// extracting a map and stripping the lane load would lose the data the
-    /// accumulator needs. The recognizer must refuse (no map, loop untouched).
+    /// Keep-loop extraction still applies when the escaping accumulator reads the
+    /// *array element* (`@acc += buf[i]`). The map replacement only depends on the
+    /// region being touched by exactly the four shadow accesses plus totality — it
+    /// does not care that the loaded element also feeds `@acc`. Because the loop is
+    /// not deletable, its shadow channel (seed + per-lane store + lane load) is left
+    /// fully intact so the surviving accumulator loop keeps reading a seeded region;
+    /// only the wide reload is rerouted to `map(body, arr)`.
     #[test]
-    fn keep_loop_refuses_when_element_leaks_to_escaping_result() {
+    fn keep_loop_extracts_map_when_element_leaks_to_escaping_result() {
         let mut tc = qcode::testing::TestContext::new();
         let input = stack_input(&mut tc, 4, 8);
 
@@ -2259,12 +2424,33 @@ mod tests {
         assert!(argpromote(&mut tc.ctx), "step 1 region promotion");
         mark_pure_functions(&mut tc.ctx);
         assert!(
-            !crate::calls::loop_to_map::recognize_total_maps(&mut tc.ctx),
-            "the element leaks into @acc, so the array channel is not separable"
+            crate::calls::loop_to_map::recognize_total_maps(&mut tc.ctx),
+            "the array channel is a clean total map even though the element feeds @acc"
         );
+
+        // A map over the Array snapshot is extracted for the buffer write-set value.
         let has_map = Function::from_id(&tc.ctx, f)
             .iter()
             .any(|b| b.iter().any(|i| matches!(i.mnemonic(), Mnemonic::Map(_))));
-        assert!(!has_map, "no map may be extracted when the element leaks");
+        assert!(has_map, "the array channel must be extracted as a map");
+
+        // The loop is kept (not deletable — @acc escapes), with its shadow channel
+        // left intact so the surviving lane load still reads a seeded region.
+        let has_cbranch = Function::from_id(&tc.ctx, f)
+            .iter()
+            .any(|b| b.iter().any(|i| matches!(i.mnemonic(), Mnemonic::CBranch(_))));
+        assert!(has_cbranch, "the residual @acc loop must remain");
+        let any_store = Function::from_id(&tc.ctx, f).iter().any(|b| {
+            b.iter().any(|i| matches!(i.mnemonic(), Mnemonic::Store(s)
+                if matches!(qcode::space::Space::from_id(&tc.ctx, s.space).ty, qcode::space::SpaceType::Temporary)))
+        });
+        assert!(any_store, "the kept loop's shadow stores must remain");
+
+        // The rewritten IR verifies clean (no dangling refs, valid terminators).
+        let problems = crate::verify::verify(&tc.ctx);
+        assert!(
+            problems.is_empty(),
+            "post-rewrite IR must verify: {problems:?}"
+        );
     }
 }

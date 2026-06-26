@@ -250,6 +250,20 @@ pub(super) fn arith_form(
         }) => {
             scale_affine(ctx, *src, m /* -1 */, width, state)
         }
+        // `gep(base, off)` ≡ `base + off` (a constant byte offset). Decompose it
+        // like an `Add` so a field address numbers the same as the equivalent
+        // pointer arithmetic: this lets memory forwarding unify a `gep(p.field)`
+        // load with a seed/store written to `p + off`. The gep itself is kept
+        // syntactic (never rewritten into an add) by [`key_for`], which forces a
+        // `Gep` mnemonic to an opaque key.
+        Mnemonic::Gep(g) => {
+            let (c, t) = affine_view(ctx, g.base, width, state);
+            NormalForm::Affine {
+                width,
+                constant: c.wrapping_add(g.offset as u64) & m,
+                terms: t,
+            }
+        }
         _ => leaf(id, width),
     }
 }
@@ -321,6 +335,16 @@ fn mask_form(
 /// The value-numbering key for `id`: the arithmetic form for covered ops that
 /// genuinely decomposed, else the normalized mnemonic.
 pub(super) fn key_for(form: &NormalForm, id: ValueId, mnemonic: &Mnemonic) -> NormalForm {
+    // A `Gep` decomposes affinely (see [`arith_form`]) so its *consumers* unify
+    // through it, but the gep instruction itself must stay syntactic: it carries
+    // struct field typing the canonicalizer would discard by rebuilding it as a
+    // bare `add`. Key it opaquely so CSE claims it as-is rather than materializing
+    // an affine replacement.
+    if matches!(mnemonic, Mnemonic::Gep(_)) {
+        let mut m = mnemonic.clone();
+        normalize(&mut m);
+        return NormalForm::Opaque(m);
+    }
     if is_self_leaf(form, id) {
         let mut m = mnemonic.clone();
         normalize(&mut m);
@@ -792,6 +816,54 @@ mod spike {
         );
         // `@SP` itself trivially mentions `@SP`.
         assert!(nb.affine_mentions(sp, sp));
+    }
+
+    /// A `gep(base, off)` decomposes to the same affine base+offset as `base + off`,
+    /// so a field address unifies with the equivalent pointer arithmetic for memory
+    /// forwarding. This is the fix for argpromote reading an un-seeded shadow slot:
+    /// the seed is stored at `p + off` (an add) while the body dereferences
+    /// `gep(p.field)`; without gep decomposition the two never unify and the
+    /// redirected load forwards from nothing.
+    #[test]
+    fn gep_decomposes_to_base_plus_offset_like_an_add() {
+        use qcode::types::AggregateField;
+        let mut tc = TestContext::new();
+        let fun = Function::make(&mut tc.ctx, "f".into()).unwrap().id;
+        let entry = tc.ctx.get_or_make_block(0x1000);
+        {
+            let mut f = Function::from_id_mut(&mut tc.ctx, fun);
+            f.set_root(entry).unwrap();
+            f.add_block(entry);
+        }
+        // A struct with a field at byte 0x60, so `push_gep` accepts the base.
+        let i64_ty = tc.ctx.types.get_or_make_int(8);
+        let s_ty = tc.ctx.types.get_or_make_struct(
+            "S",
+            0x68,
+            vec![AggregateField::new_at("f", i64_ty, 0x60)],
+        );
+        let ptr_ty = tc.ctx.types.get_or_make_struct_pointer(8, s_ty);
+        let pid = BasicBlock::from_id_mut(&mut tc.ctx, entry).push_param(8).id;
+        tc.ctx.values.block_params[pid].type_id = ptr_ty;
+        let p = ValueId::BlockParam(pid);
+
+        let (gep, add) = {
+            let mut b = Builder::from_block(BasicBlock::from_id_mut(&mut tc.ctx, entry));
+            let c60 = b.context_mut().get_const(0x60, 8).id();
+            let gep = b.push_gep(p, 0x60).id(); // gep(p + 0x60)
+            let add = b.push_add(p, c60).id(); // p + 0x60
+            unsafe { b.dont_finalize() };
+            (gep, add)
+        };
+
+        let nb = precompute_forms(&tc.ctx, fun);
+
+        // Both decompose to the same affine base+offset, so memory forwarding
+        // treats them as the same cell.
+        assert_eq!(nb.base_offset(gep), Some((p, 0x60)));
+        assert_eq!(nb.base_offset(add), nb.base_offset(gep));
+        // The gep is still recognised as built on `p`.
+        assert!(nb.affine_mentions(gep, p));
     }
 }
 

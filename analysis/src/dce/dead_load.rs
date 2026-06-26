@@ -111,6 +111,15 @@ fn base_plus_offset(ctx: &Context, ptr: ValueId) -> (ValueId, i64) {
     // Bound the walk so a malformed cyclic graph can't loop forever.
     for _ in 0..64 {
         let ValueId::Instruction(id) = cur else { break };
+        // `gep(base, off)` ≡ `base + off` (a constant byte offset) — peel it like
+        // a literal `add` so a field deref `gep(p.field)` compares offset-precisely
+        // against the equivalent `p + off` arithmetic (e.g. an argpromote seed
+        // store written to `p + off`).
+        if let Mnemonic::Gep(g) = ctx.get_insn(id).mnemonic() {
+            acc += g.offset as i64;
+            cur = g.base;
+            continue;
+        }
         let Mnemonic::Binop(b) = ctx.get_insn(id).mnemonic() else {
             break;
         };
