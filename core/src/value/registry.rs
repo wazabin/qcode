@@ -12,7 +12,7 @@ use crate::{
     },
 };
 use jstd::registry::Registry;
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 
 /// Central storage arena for all IR values in a [`Context`](crate::context::Context).
 ///
@@ -85,6 +85,16 @@ pub struct ValueRegistry<'str> {
     /// Indirect calls have no static target and are not recorded here.
     #[serde(default)]
     pub(crate) call_sites: HashMap<FunctionId, Vec<InstructionId>>,
+
+    /// Synthetic forward call-graph edges that are not backed by a direct `Call`
+    /// instruction: `caller FunctionId → set of callee entry addresses`. Used for
+    /// relationships a pass recovers but the IR can't express as a direct call —
+    /// e.g. `entry → main`, where `main` is passed to `__libc_start_main` as a
+    /// pointer argument rather than called. Keyed by address so the edge resolves
+    /// once a function exists at the callee, independent of when it materializes.
+    /// Merged into [`FunctionRef::callees`](crate::value::FunctionRef::callees).
+    #[serde(default)]
+    pub(crate) synthetic_callees: HashMap<FunctionId, BTreeSet<u64>>,
 
     /// Intern cache for non-symbolic literals: `(masked_value, TypeId) → LiteralId`.
     literal_cache: HashMap<(u64, TypeId), LiteralId>,
@@ -165,6 +175,25 @@ impl<'str> ValueRegistry<'str> {
             .get(&callee)
             .map(Vec::as_slice)
             .unwrap_or(&[])
+    }
+
+    /// Records a synthetic forward call-graph edge `caller → callee_addr` (see
+    /// [`synthetic_callees`](Self::synthetic_callees)). Returns `true` if the
+    /// edge was newly added, so callers can drive a fixpoint without spinning.
+    pub fn add_synthetic_callee(&mut self, caller: FunctionId, callee_addr: u64) -> bool {
+        self.synthetic_callees
+            .entry(caller)
+            .or_default()
+            .insert(callee_addr)
+    }
+
+    /// Returns the synthetic callee entry addresses recorded for `caller`.
+    pub fn synthetic_callees_of(&self, caller: FunctionId) -> impl Iterator<Item = u64> + '_ {
+        self.synthetic_callees
+            .get(&caller)
+            .into_iter()
+            .flatten()
+            .copied()
     }
 
     /// Removes a set of dead instructions from the use-def map.

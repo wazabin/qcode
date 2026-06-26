@@ -278,6 +278,7 @@ where
     /// the CFG — so it always reflects the current instructions. Indirect calls
     /// have no static target and are not included.
     pub fn callees(&'s self) -> Vec<FunctionId> {
+        let ctx = self.ctx();
         let mut callees = self
             .blocks()
             .flat_map(|block| {
@@ -287,6 +288,14 @@ where
                     .collect::<Vec<_>>()
             })
             .collect::<Vec<_>>();
+        // Synthetic edges (e.g. `entry → main`) recovered by a pass but not
+        // backed by a direct call. Keyed by address; included once a function
+        // exists at that address.
+        callees.extend(
+            ctx.values
+                .synthetic_callees_of(self.id)
+                .filter_map(|addr| Function::from_addr(ctx, addr).map(|function| function.id)),
+        );
         callees.sort_by_key(|&id| Into::<usize>::into(id));
         callees.dedup();
         callees

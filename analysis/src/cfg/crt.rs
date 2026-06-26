@@ -48,24 +48,31 @@ pub fn discover_libc_main(ctx: &mut Context, env: &PipelineEnv) -> bool {
         return false;
     };
 
-    // Idempotent across analyze rounds: once the discovery has materialized a
-    // function at `main` (named or not), don't re-emit it every round.
-    if Function::from_addr(ctx, main).is_some() {
-        return false;
+    let mut changed = false;
+
+    // `main` is passed to `__libc_start_main` as a pointer argument, not called
+    // directly, so it never appears as a derived callee of `entry`. Record the
+    // `entry → main` call-graph edge synthetically so the call graph links them.
+    // Keyed by address, this is independent of whether we (below) or the symbol
+    // table materialize `main`, and it is idempotent across analyze rounds.
+    if let Some(entry_id) = Function::from_addr(ctx, entry).map(|function| function.id) {
+        changed |= ctx.values.add_synthetic_callee(entry_id, main);
     }
 
-    // A `main` already exists elsewhere (e.g. from the symbol table). Naming our
-    // target `main` too would collide on the unique-name invariant, so bail.
-    if Function::from_name(ctx, "main").is_some() {
-        return false;
+    // Materialize and name `main` only if nothing lives there yet: a function may
+    // already exist at `main` (a prior round's discovery) or the name `main` may
+    // be taken (e.g. from the symbol table), in which case naming ours `main`
+    // would collide on the unique-name invariant.
+    if Function::from_addr(ctx, main).is_none() && Function::from_name(ctx, "main").is_none() {
+        changed |= ctx.discover(
+            Discovery::function(main)
+                .with_function_reason(FunctionDiscoveryReason::CrtMain)
+                .with_name(Some("main".to_string()))
+                .from_addr(source_addr),
+        );
     }
 
-    ctx.discover(
-        Discovery::function(main)
-            .with_function_reason(FunctionDiscoveryReason::CrtMain)
-            .with_name(Some("main".to_string()))
-            .from_addr(source_addr),
-    )
+    changed
 }
 
 fn find_libc_main_arg(ctx: &Context<'_>, entry: u64, main_reg: ValueId) -> Option<(u64, u64)> {
@@ -144,5 +151,65 @@ mod tests {
         assert_eq!(discoveries.len(), 1);
         assert_eq!(discoveries[0].target, 0x2000);
         assert_eq!(discoveries[0].name.as_deref(), Some("main"));
+    }
+
+    #[test]
+    fn records_entry_to_main_call_graph_edge() {
+        let mut tc = TestContext::new();
+        tc.ctx.set_primary_entrypoint(Some(0x1000));
+        Function::make_at_addr(&mut tc.ctx, 0x1000, Some("start".into()));
+
+        {
+            let block = tc.ctx.get_or_make_block(0x1000);
+            Function::from_addr_mut(&mut tc.ctx, 0x1000)
+                .unwrap()
+                .set_root(block)
+                .unwrap();
+            let mut builder = Builder::from_block(BasicBlock::from_id_mut(&mut tc.ctx, block));
+            let main = builder.context_mut().get_const(0x2000, 8).id();
+            builder.push_store(main, ValueId::Varnode(tc.r0), tc.reg_space);
+            let target = builder.context_mut().get_const(0x3000, 8).id();
+            builder.push_call_ind(target);
+        }
+
+        let cfg = ArchConfig {
+            stack_pointer: qcode::value::RegisterId::from(0usize),
+            dead_flag_regs: Vec::new(),
+            abi: CallingConvention {
+                int_args: vec![GpReg {
+                    widths: vec![(8, tc.r0)],
+                }],
+                ..CallingConvention::default()
+            },
+        };
+        let env = PipelineEnv {
+            cfg,
+            sp_varnode: tc.r3,
+        };
+
+        assert!(DiscoverLibcMain.run(&mut tc.ctx, &env).unwrap());
+
+        let entry_id = Function::from_addr(&tc.ctx, 0x1000).unwrap().id;
+        // The synthetic edge is keyed by `main`'s address.
+        assert!(
+            tc.ctx
+                .values
+                .synthetic_callees_of(entry_id)
+                .any(|addr| addr == 0x2000)
+        );
+
+        // It does not surface as a callee until a function exists at `main`...
+        assert!(Function::from_id(&tc.ctx, entry_id).callees().is_empty());
+
+        // ...and once one does, `entry → main` shows up in the call graph.
+        Function::make_at_addr(&mut tc.ctx, 0x2000, Some("main".into()));
+        let main_id = Function::from_addr(&tc.ctx, 0x2000).unwrap().id;
+        assert_eq!(
+            Function::from_id(&tc.ctx, entry_id).callees(),
+            vec![main_id]
+        );
+
+        // Re-running is idempotent: the edge already exists, so nothing changes.
+        assert!(!DiscoverLibcMain.run(&mut tc.ctx, &env).unwrap());
     }
 }
