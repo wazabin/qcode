@@ -379,6 +379,17 @@ where
         callees
     }
 
+    /// Whether this function contains at least one indirect call — a
+    /// [`CallInd`](Mnemonic::CallInd) through a computed function pointer that
+    /// analysis could not resolve to a static [`Call`](Mnemonic::Call) target.
+    pub fn has_indirect_call(&'s self) -> bool {
+        self.blocks().any(|block| {
+            block
+                .instructions()
+                .any(|insn| matches!(insn.mnemonic(), Mnemonic::CallInd(_)))
+        })
+    }
+
     /// The functions that directly call this one, deduplicated and ordered by
     /// id. Reads the reverse call graph maintained alongside the use-def map and
     /// resolves each call site to its enclosing function. Counterpart of
