@@ -89,6 +89,15 @@ fn mask_for(width: usize) -> u64 {
     }
 }
 
+/// Whether `mask` is a round-down alignment mask at `width` bytes: `-2^k`
+/// truncated to the width, i.e. the cleared low bits form a contiguous run
+/// (`2^k - 1`) and every higher bit is set. `x & mask` then satisfies
+/// `x & mask ≤ x`, the monotonicity the frame classifier relies on.
+fn is_round_down_mask(mask: u64, width: usize) -> bool {
+    let low = !mask & mask_for(width); // the bits this mask clears
+    low.wrapping_add(1) & low == 0 // low == 2^k - 1  ⟹  a contiguous low run
+}
+
 /// Interpret `value` as signed at `width` bytes. A zero-width value (a
 /// result-less instruction such as a store) has no meaningful magnitude — its
 /// sign is zero — which keeps the shift below well-defined.
@@ -642,6 +651,24 @@ impl Numbering {
             } if terms.len() == 1 && terms[0].1 == 1 => {
                 Some((terms[0].0, signed(*constant, *width)))
             }
+            _ => None,
+        }
+    }
+
+    /// If `v`'s arithmetic view is `term & mask` for a power-of-two **round-down**
+    /// alignment mask (`-2^k`: a contiguous run of clear low bits with every higher
+    /// bit set), return `term` — the value being aligned. Such a mask can only
+    /// *lower* an address (`x & -2^k ≤ x`); that monotonicity is what lets the frame
+    /// classifier keep a realigned own-frame base own-frame. `None` for any other
+    /// form. (`& 0` and `& all-ones` never reach here — [`mask_form`] collapses both.)
+    pub(crate) fn alignment_base(&self, v: ValueId) -> Option<ValueId> {
+        match self.forms.get(&v)? {
+            NormalForm::Mask {
+                width,
+                term,
+                op: IntBinop::And,
+                mask,
+            } if is_round_down_mask(*mask, *width) => Some(*term),
             _ => None,
         }
     }

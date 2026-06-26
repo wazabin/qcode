@@ -15,13 +15,14 @@
 
 use qcode::{
     context::Context,
-    value::{
-        Function, FunctionId, ValueId, VarnodeId,
-        insn::{Binop, IntBinop, Mnemonic},
-    },
+    value::{Function, FunctionId, ValueId, VarnodeId},
 };
 
 use crate::gvn::affine::Numbering;
+
+/// Maximum depth of a realignment cascade we will follow back to `@SP`. Real
+/// frames nest only a handful of `and rsp,-N` steps; this is a loop backstop.
+const ALIGN_CASCADE_LIMIT: u32 = 32;
 
 /// Where a stack pointer lands relative to the entry stack pointer.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -49,19 +50,31 @@ pub(crate) fn incoming_sp_param(
         .map(|p| p.id())
 }
 
-/// Whether `base` is `@SP & -mask` — a power-of-two stack realignment of the
-/// incoming stack pointer. The realigned base sits within the current frame, so
-/// every slot built on it is a local.
-fn is_aligned_sp(ctx: &Context, sp_param: ValueId, base: ValueId) -> bool {
-    let ValueId::Instruction(id) = base else {
+/// Whether `base` is a power-of-two stack realignment of the incoming stack
+/// pointer — `@SP & -mask` — or a *cascade* of such realignments anchored to `@SP`
+/// through downward steps: `(((@SP - a) & -m1) - b) & -m2 …`, as emitted by nested
+/// `sub rsp,k; and rsp,-N` sequences. A realigned base sits within the current
+/// frame, so every slot built on it is a local.
+///
+/// Soundness rests on monotonicity: a round-down mask only *lowers* an address
+/// (`x & -2^k ≤ x`), so a value already at-or-below entry `@SP` stays there. The
+/// value feeding each mask must therefore reach `@SP` (or an already-recognised
+/// aligned base) through a **non-positive** offset — a *positive* offset before a
+/// mask could round to an address at/above entry `@SP` (the caller's frame), which
+/// must not be classified as a local.
+fn is_aligned_sp(numbering: &Numbering, sp_param: ValueId, base: ValueId, depth: u32) -> bool {
+    if depth == 0 {
+        return false;
+    }
+    let Some(term) = numbering.alignment_base(base) else {
         return false;
     };
-    matches!(
-        ctx.get_insn(id).mnemonic(),
-        Mnemonic::Binop(b)
-            if matches!(b.op, Binop::Int(IntBinop::And))
-                && (b.lhs == sp_param || b.rhs == sp_param)
-    )
+    // Peel the affine offset of the value being aligned; it must go downward.
+    let (inner, off) = numbering.base_offset(term).unwrap_or((term, 0));
+    if off > 0 {
+        return false;
+    }
+    inner == sp_param || is_aligned_sp(numbering, sp_param, inner, depth - 1)
 }
 
 /// The signed byte offset of `v` from the entry stack pointer `@SP`, when `v` is
@@ -94,10 +107,10 @@ pub(crate) fn frame_class(
     if let Some(off) = frame_offset(ctx, numbering, sp_param, v) {
         return Some(by_sign(off));
     }
-    // A realigned frame base (`@SP & -mask`): everything offset from it is a
-    // local — incoming args never flow through the alignment mask.
+    // A realigned frame base (`@SP & -mask`, possibly cascaded): everything offset
+    // from it is a local — incoming args never flow through the alignment mask.
     let (base, _) = numbering.base_offset(v).unwrap_or((v, 0));
-    is_aligned_sp(ctx, sp_param, base).then_some(FrameClass::Local)
+    is_aligned_sp(numbering, sp_param, base, ALIGN_CASCADE_LIMIT).then_some(FrameClass::Local)
 }
 
 /// Below the entry stack pointer (`off < 0`) is an own-frame local; the
@@ -201,5 +214,78 @@ mod tests {
             "a realigned slot is always a local"
         );
         assert_eq!(class(unrelated), None, "a non-@SP pointer is unclassified");
+    }
+
+    /// A cascade of `sub rsp,k; and rsp,-N` realignments — the shape a frame with
+    /// several over-aligned local buffers produces — stays anchored to `@SP`, so
+    /// slots built on the innermost aligned base are still locals.
+    #[test]
+    fn classifies_cascaded_realignment_as_local() {
+        let mut tc = TestContext::new();
+        let (fid, sp, _) = sp_function(&mut tc);
+        let root = Function::from_id(&tc.ctx, fid).root().unwrap().id;
+
+        let slot = {
+            let mut b = Builder::from_block(BasicBlock::from_id_mut(&mut tc.ctx, root));
+            let neg8 = b.context_mut().get_const((-8i64) as u64, 8).id();
+            let k10 = b.context_mut().get_const(0x10, 8).id();
+            let k270 = b.context_mut().get_const(0x270, 8).id();
+            let k658 = b.context_mut().get_const(0x658, 8).id();
+            // ((@SP - 0x10) & -8)
+            let s1 = b.push_sub(sp, k10).id();
+            let a1 = b.push_bit_and(s1, neg8).id();
+            // (((… ) - 0x270) & -8)
+            let s2 = b.push_sub(a1, k270).id();
+            let a2 = b.push_bit_and(s2, neg8).id();
+            // a slot in the innermost realigned frame: a2 - 0x658
+            let slot = b.push_sub(a2, k658).id();
+            unsafe { b.dont_finalize() };
+            slot
+        };
+
+        let nb = precompute_forms(&tc.ctx, fid);
+        // A cascaded base has no stable `@SP`-relative offset…
+        assert_eq!(frame_offset(&tc.ctx, &nb, sp, slot), None);
+        // …but is still classified as an own-frame local.
+        assert_eq!(
+            frame_class(&tc.ctx, &nb, sp, slot),
+            Some(FrameClass::Local),
+            "a slot on a cascaded realignment of @SP is a local"
+        );
+    }
+
+    /// A mask applied to an address *above* entry `@SP` must NOT be a local: a
+    /// round-down mask can leave it at/above `@SP`, in the caller's frame. Guards
+    /// the downward-anchor soundness condition of [`is_aligned_sp`].
+    #[test]
+    fn rejects_realignment_above_entry_sp() {
+        let mut tc = TestContext::new();
+        let (fid, sp, _) = sp_function(&mut tc);
+        let root = Function::from_id(&tc.ctx, fid).root().unwrap().id;
+
+        let (aligned, slot) = {
+            let mut b = Builder::from_block(BasicBlock::from_id_mut(&mut tc.ctx, root));
+            let neg8 = b.context_mut().get_const((-8i64) as u64, 8).id();
+            let k10 = b.context_mut().get_const(0x10, 8).id();
+            let k20 = b.context_mut().get_const(0x20, 8).id();
+            // (@SP + 0x10) & -8  — anchored through a *positive* offset.
+            let up = b.push_add(sp, k10).id();
+            let aligned = b.push_bit_and(up, neg8).id();
+            let slot = b.push_sub(aligned, k20).id();
+            unsafe { b.dont_finalize() };
+            (aligned, slot)
+        };
+
+        let nb = precompute_forms(&tc.ctx, fid);
+        assert_eq!(
+            frame_class(&tc.ctx, &nb, sp, aligned),
+            None,
+            "(@SP + k) & -mask may land in the caller frame — not a local"
+        );
+        assert_eq!(
+            frame_class(&tc.ctx, &nb, sp, slot),
+            None,
+            "a slot on an upward-anchored realignment is not a local"
+        );
     }
 }
