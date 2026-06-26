@@ -125,6 +125,10 @@ pub struct Pipeline {
     /// Carried from the CLI to the loader, which stamps them onto the lifted
     /// [`Context`](qcode::context::Context) before analysis runs.
     ignored_functions: HashSet<u64>,
+    /// Code addresses exported from a previous run, replayed into the lifter's
+    /// first pass so the disas↔analyze fixpoint converges in fewer rounds
+    /// (`--code-map`). The loader seeds these onto the context before lifting.
+    seeds: Vec<qcode::discovery::CodeSeed>,
 }
 
 /// A TOML pipeline available from the user's runtime pipeline directory.
@@ -346,6 +350,7 @@ impl Pipeline {
             stages,
             debug,
             ignored_functions: HashSet::default(),
+            seeds: Vec::new(),
         })
     }
 
@@ -374,6 +379,7 @@ impl Pipeline {
             }],
             debug: false,
             ignored_functions: HashSet::default(),
+            seeds: Vec::new(),
         })
     }
 
@@ -388,6 +394,19 @@ impl Pipeline {
     /// The function entry addresses this pipeline run skips optimizing.
     pub fn ignored_functions(&self) -> &HashSet<u64> {
         &self.ignored_functions
+    }
+
+    /// Replay exported code addresses (`--code-map`) into the lifter's first
+    /// pass. The loader seeds these onto the context before lifting. Returns
+    /// `self` for builder-style chaining.
+    pub fn with_seeds(mut self, seeds: Vec<qcode::discovery::CodeSeed>) -> Self {
+        self.seeds = seeds;
+        self
+    }
+
+    /// The exported code addresses this pipeline run pre-seeds onto the context.
+    pub fn seeds(&self) -> &[qcode::discovery::CodeSeed] {
+        &self.seeds
     }
 
     /// Run every stage in order over `ctx`. `round` and `progress` are threaded

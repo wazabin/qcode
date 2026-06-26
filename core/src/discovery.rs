@@ -265,6 +265,70 @@ impl DiscoveryQueue {
     pub fn states(&self) -> impl Iterator<Item = (&DiscoveryKey, &DiscoveryState)> + '_ {
         self.states.iter()
     }
+
+    /// Every code address this queue lifted successfully, as a portable
+    /// [`CodeSeed`]. Exported from one analysis run and replayed into the next
+    /// (via [`Context::seed_code`](crate::context::Context::seed_code)) so the
+    /// lifter reaches jump-table targets in its first pass instead of waiting for
+    /// the analysis fixpoint to discover them round by round.
+    pub fn lifted_seeds(&self) -> Vec<CodeSeed> {
+        self.states
+            .iter()
+            .filter(|(_, state)| matches!(state, DiscoveryState::Lifted))
+            .map(|(key, _)| CodeSeed::from_key(key))
+            .collect()
+    }
+}
+
+/// A code address known to lift, captured from one analysis run to pre-seed the
+/// next. Mirrors a [`DiscoveryKey`] but drops the run-specific bits the lifter
+/// reconstructs on its own (the precise CFG edge is re-attached by the pass that
+/// originally found the target).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum CodeSeed {
+    /// A discovered function entry.
+    Function { target: Address },
+    /// A block at `target` inside the function entered at `function`.
+    Block {
+        function: Address,
+        target: Address,
+        edge_kind: EdgeKind,
+    },
+}
+
+impl CodeSeed {
+    fn from_key(key: &DiscoveryKey) -> Self {
+        match key.kind {
+            DiscoveryKind::Function { .. } => CodeSeed::Function { target: key.target },
+            DiscoveryKind::Block {
+                function,
+                edge_kind,
+            } => CodeSeed::Block {
+                function,
+                target: key.target,
+                edge_kind,
+            },
+        }
+    }
+
+    /// Rebuild the [`Discovery`] to enqueue, attributed to [`UserSeed`] so the
+    /// origin stays honest rather than impersonating the pass that first found it.
+    ///
+    /// [`UserSeed`]: DiscoveryProvenance::UserSeed
+    pub fn into_discovery(self) -> Discovery {
+        match self {
+            CodeSeed::Function { target } => {
+                Discovery::function(target).with_provenance(DiscoveryProvenance::UserSeed)
+            }
+            CodeSeed::Block {
+                function,
+                target,
+                edge_kind,
+            } => Discovery::block(target, function)
+                .with_edge_kind(edge_kind)
+                .with_provenance(DiscoveryProvenance::UserSeed),
+        }
+    }
 }
 
 #[cfg(test)]

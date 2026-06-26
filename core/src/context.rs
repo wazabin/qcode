@@ -337,6 +337,25 @@ impl<'str> Context<'str> {
         self.discoveries.is_empty()
     }
 
+    /// Every code address lifted in this context, as portable [`CodeSeed`]s. Used
+    /// to export a "code map" that pre-seeds a later run of the same binary.
+    ///
+    /// [`CodeSeed`]: crate::discovery::CodeSeed
+    pub fn lifted_code_seeds(&self) -> Vec<crate::discovery::CodeSeed> {
+        self.discoveries.lifted_seeds()
+    }
+
+    /// Enqueue exported [`CodeSeed`]s as pending discoveries so the lifter reaches
+    /// them in its first pass. Call before lifting begins; seeds whose key already
+    /// has a terminal outcome are ignored by the queue.
+    ///
+    /// [`CodeSeed`]: crate::discovery::CodeSeed
+    pub fn seed_code(&mut self, seeds: impl IntoIterator<Item = crate::discovery::CodeSeed>) {
+        for seed in seeds {
+            self.discoveries.insert(seed.into_discovery());
+        }
+    }
+
     pub fn mark_discovery_lifted(&mut self, key: crate::discovery::DiscoveryKey) {
         self.discoveries.mark_lifted(key);
     }
