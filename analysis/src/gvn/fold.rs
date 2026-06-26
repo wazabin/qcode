@@ -272,7 +272,7 @@ fn constant_folding_with_location(
 // ---------------------------------------------------------------------------
 
 /// The all-ones bit pattern for an `output_size`-byte value.
-fn all_ones(output_size: usize) -> u64 {
+pub(super) fn all_ones(output_size: usize) -> u64 {
     if output_size >= 8 {
         u64::MAX
     } else {

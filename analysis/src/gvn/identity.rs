@@ -26,7 +26,7 @@ use qcode::{
     },
 };
 
-use super::fold::const_value;
+use super::fold::{all_ones, const_value};
 use super::walk::{Claim, Editor, InsnCtx, SubPass};
 
 /// Recognize the add/and/shift (and or/and) idioms and rewrite the root
@@ -58,13 +58,19 @@ impl SubPass for Identities {
                 None => {}
             }
         }
-        match simplify_identity(ctx, ic.mnemonic) {
-            Some(new_mnemonic) => {
-                ed.replace_with_new_insn(ctx, ic.block_id, ic.insn_id, new_mnemonic, ic.size);
-                Claim::Done
-            }
-            None => Claim::Pass,
+        if let Some(new_mnemonic) = simplify_identity(ctx, ic.mnemonic) {
+            ed.replace_with_new_insn(ctx, ic.block_id, ic.insn_id, new_mnemonic, ic.size);
+            return Claim::Done;
         }
+        // Constant-absorbing / De Morgan rewrites need `&mut Context` (they intern
+        // a folded constant), so they live outside the borrow-only
+        // `simplify_identity`. They canonicalize obfuscated bit math — e.g. an
+        // `i & 1` emitted as `~(~i | ~1)` with a redundant outer mask — back into
+        // the plain `&`/`^` the full-adder idioms above then recognize.
+        if simplify_bitwise(ctx, ic, ed) {
+            return Claim::Done;
+        }
+        Claim::Pass
     }
 }
 
@@ -173,6 +179,138 @@ pub(super) fn simplify_identity(ctx: &Context, m: &Mnemonic) -> Option<Mnemonic>
             None
         }
         _ => None,
+    }
+}
+
+/// The `(constant, other_operand)` pairs of a binop — one entry per side that is
+/// a numeric constant (both-constant binops are handled by [`super::fold`] before
+/// this sub-pass, so in practice at most one side is constant here).
+fn const_operands(ctx: &Context, lhs: ValueId, rhs: ValueId) -> Vec<(u64, ValueId)> {
+    let mut out = Vec::new();
+    if let Some(c) = const_value(ctx, rhs) {
+        out.push((c, lhs));
+    }
+    if let Some(c) = const_value(ctx, lhs) {
+        out.push((c, rhs));
+    }
+    out
+}
+
+/// If `v` is `x OP c` (or `c OP x`) for integer op `want` with a numeric constant
+/// `c`, return `(x, c)`.
+fn binop_const(ctx: &Context, v: ValueId, want: IntBinop) -> Option<(ValueId, u64)> {
+    let (lhs, rhs) = as_int_binop(ctx, v, want)?;
+    const_operands(ctx, lhs, rhs)
+        .into_iter()
+        .next()
+        .map(|(c, x)| (x, c))
+}
+
+/// `~v` over `size` bytes expressed *without* emitting a fresh xor: a folded
+/// constant when `v` is constant, or `x` when `v` is `x ^ ~0` (double-negation).
+/// `None` when representing `~v` would need a new instruction — the caller then
+/// declines the rewrite, keeping it strictly size-reducing.
+fn simplify_not(ctx: &mut Context, v: ValueId, size: usize) -> Option<ValueId> {
+    let all = all_ones(size);
+    if let Some(c) = const_value(ctx, v) {
+        return Some(ctx.get_const((!c) & all, size).id());
+    }
+    if let Some((x, c)) = binop_const(ctx, v, IntBinop::Xor)
+        && (c & all) == all
+    {
+        return Some(x);
+    }
+    None
+}
+
+/// Constant-absorbing and De Morgan rewrites that, unlike [`simplify_identity`],
+/// must intern a folded constant and so take `&mut Context`. All are exact in
+/// `size`-byte modular arithmetic and strictly simplify (never grow the DAG):
+///
+/// ```text
+///   (x & c1) & c2   →  x & (c1 & c2)     stacked masks collapse
+///   (x ^ c1) ^ c2   →  x ^ (c1 ^ c2)     stacked xor-constants collapse
+///   (a | b) ^ ~0    →  (~a) & (~b)        De Morgan, only when both ~ collapse
+///   (a & b) ^ ~0    →  (~a) | (~b)
+/// ```
+///
+/// De Morgan fires only when each `~operand` is itself a constant or a
+/// double-negation (so no new xor is created), which is exactly the shape
+/// compilers emit for `a & const` as `~(~a | ~const)`. Returns whether it
+/// rewrote the root.
+fn simplify_bitwise(ctx: &mut Context, ic: &InsnCtx, ed: &mut Editor) -> bool {
+    let &Mnemonic::Binop(Binary {
+        lhs,
+        rhs,
+        op: Binop::Int(op),
+    }) = ic.mnemonic
+    else {
+        return false;
+    };
+    let size = ic.size;
+    let all = all_ones(size);
+
+    match op {
+        // (x & c1) & c2 → x & (c1 & c2)
+        IntBinop::And => {
+            for (outer, inner) in const_operands(ctx, lhs, rhs) {
+                if let Some((x, c1)) = binop_const(ctx, inner, IntBinop::And) {
+                    let folded = ctx.get_const((c1 & outer) & all, size).id();
+                    ed.replace_with_new_insn(
+                        ctx,
+                        ic.block_id,
+                        ic.insn_id,
+                        int_binop(x, folded, IntBinop::And),
+                        size,
+                    );
+                    return true;
+                }
+            }
+            false
+        }
+        IntBinop::Xor => {
+            for (outer, inner) in const_operands(ctx, lhs, rhs) {
+                // (x ^ c1) ^ c2 → x ^ (c1 ^ c2)
+                if let Some((x, c1)) = binop_const(ctx, inner, IntBinop::Xor) {
+                    let folded = ctx.get_const((c1 ^ outer) & all, size).id();
+                    ed.replace_with_new_insn(
+                        ctx,
+                        ic.block_id,
+                        ic.insn_id,
+                        int_binop(x, folded, IntBinop::Xor),
+                        size,
+                    );
+                    return true;
+                }
+                // De Morgan: `inner ^ ~0`, pushing the complement inward.
+                if outer != all {
+                    continue;
+                }
+                for (dual_in, dual_out) in [
+                    (IntBinop::Or, IntBinop::And),
+                    (IntBinop::And, IntBinop::Or),
+                ] {
+                    let Some((a, b)) = as_int_binop(ctx, inner, dual_in) else {
+                        continue;
+                    };
+                    let (Some(na), Some(nb)) =
+                        (simplify_not(ctx, a, size), simplify_not(ctx, b, size))
+                    else {
+                        continue;
+                    };
+                    ed.replace_with_new_insn(
+                        ctx,
+                        ic.block_id,
+                        ic.insn_id,
+                        int_binop(na, nb, dual_out),
+                        size,
+                    );
+                    return true;
+                }
+            }
+            false
+        }
+        _ => false,
     }
 }
 
@@ -286,6 +424,48 @@ mod tests {
         assert!(
             !text.contains(" | ") && !text.contains(" & "),
             "the or/and math should be dead, got:\n{text}"
+        );
+    }
+
+    /// The obfuscated `i + 1` a real loop emits — `((~i | ~1) ^ ~0) & ~2` is
+    /// `i & 1` behind De Morgan plus a redundant mask, doubled and added to
+    /// `i ^ 1` (the full-adder form of `i + 1`). The bitwise canonicalization
+    /// must peel the obfuscation so the existing full-adder idiom collapses the
+    /// whole thing to a single `i + 1`.
+    #[test]
+    fn obfuscated_increment_collapses_to_add_one() {
+        let mut ctx = Context::new();
+        qcode!(
+            ctx,
+            "
+                varnode i32 I;
+
+                fn f:
+                    <entry>
+                        %i = load(i32, &I);
+                        %n1 = %i ^ 0xffffffff;
+                        %n2 = %n1 | 0xfffffffe;
+                        %n3 = %n2 ^ 0xffffffff;
+                        %n4 = %n3 & 0xfffffffd;
+                        %dbl = %n4 * 0x2;
+                        %x = %i ^ 0x1;
+                        %inc = %dbl + %x;
+                        store(&I, %inc);
+                        return [0x1000];
+                "
+        );
+
+        let aliases = AliasResult::simple(&ctx);
+        gvn_function(&mut ctx, f, Some(&aliases));
+        crate::remove_dead_insns(&mut ctx, entry);
+        let text = BasicBlock::from_id(&ctx, entry).to_string();
+        assert!(
+            text.contains(" + 0x1") || text.contains(" + 0x00000001"),
+            "the obfuscated increment should collapse to `i + 1`, got:\n{text}"
+        );
+        assert!(
+            !text.contains(" | ") && !text.contains(" * ") && !text.contains('~'),
+            "the De Morgan / doubling obfuscation should be gone, got:\n{text}"
         );
     }
 
