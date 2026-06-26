@@ -250,7 +250,11 @@ impl RegionAcc {
                 "region build bail: span {:#x} ({} bytes) {} (min={:#x}, max_end={:#x}, elem={})",
                 span,
                 span,
-                if span == 0 { "is zero" } else { "exceeds MAX_REGION_BYTES (4096)" },
+                if span == 0 {
+                    "is zero"
+                } else {
+                    "exceeds MAX_REGION_BYTES (4096)"
+                },
                 self.min,
                 self.max_end,
                 self.elem,

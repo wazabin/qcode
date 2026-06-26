@@ -322,6 +322,13 @@ impl Solver<'_> {
                 }
             }
 
+            // Boolean connectives produce a 0/1 result, like the comparisons
+            // above. Without this, an `&&`/`||`-fed index drops to `top` and a
+            // 2-case switch looks like a 256-entry table.
+            Mnemonic::Binop(Binary {
+                op: Binop::Bool(_), ..
+            }) => ValueRange { min: 0, max: 1 },
+
             Mnemonic::Unop(Unary {
                 op: Unop::BoolNot, ..
             }) => ValueRange { min: 0, max: 1 },
@@ -788,6 +795,35 @@ mod tests {
         // `==` not taken excludes a single midpoint: not representable.
         let r = value_range(&ctx, idx.into(), ne);
         assert!(r.is_full(8));
+    }
+
+    /// A boolean connective (`&&`/`||`) produces a 0/1 value, even though it is
+    /// neither a comparison nor a guard. A `zext` of such a value must keep the
+    /// `{0,1}` range so a 2-case switch is not mistaken for a 256-entry table.
+    #[test]
+    fn bool_and_zext_is_two_valued() {
+        let mut ctx = Context::new();
+        qcode!(
+            ctx,
+            "
+            varnode i64 A;
+            <entry>
+                %v = load(i64, &A);
+                %neg = %v s< 0x0;
+                %nz = %v != 0x0;
+                %pos = ! %neg;
+                %b = %nz && %pos;
+                %idx = zext(i32, %b);
+                goto <0x1001>;
+            "
+        );
+
+        let r = value_range(&ctx, b.into(), entry);
+        assert_eq!((r.min, r.max), (0, 1));
+
+        let r = value_range(&ctx, idx.into(), entry);
+        assert_eq!((r.min, r.max), (0, 1));
+        assert_eq!(r.count(), 2);
     }
 
     #[test]

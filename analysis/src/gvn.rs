@@ -16,8 +16,8 @@ use qcode::{
 pub(crate) mod affine;
 mod array_project;
 mod cse;
-mod flag_idiom;
 mod emulate_map;
+mod flag_idiom;
 mod fold;
 mod identity;
 mod intrinsics;

@@ -583,13 +583,18 @@ mod tests {
         // Type the param as a struct pointer with a field at 0x30 and rewrite the
         // `param + 0x30` add into the `gep(param.field)` form the typing pass emits.
         let i32_ty = tc.ctx.types.get_or_make_int(4);
-        let s_ty =
-            tc.ctx
-                .types
-                .get_or_make_struct("S", 0x34, vec![AggregateField::new_at("peb", i32_ty, 0x30)]);
+        let s_ty = tc.ctx.types.get_or_make_struct(
+            "S",
+            0x34,
+            vec![AggregateField::new_at("peb", i32_ty, 0x30)],
+        );
         let ptr_ty = tc.ctx.types.get_or_make_struct_pointer(8, s_ty);
         let root = Function::from_id(&tc.ctx, f).root().unwrap().id;
-        let pid = BasicBlock::from_id(&tc.ctx, root).params().next().unwrap().id();
+        let pid = BasicBlock::from_id(&tc.ctx, root)
+            .params()
+            .next()
+            .unwrap()
+            .id();
         let param = pid;
         if let ValueId::BlockParam(bp) = param {
             tc.ctx.values.block_params[bp].type_id = ptr_ty;
@@ -605,7 +610,8 @@ mod tests {
             b.set_insert_point_before(add_id);
             b.push_gep(param, 0x30).id()
         };
-        tc.ctx.replace_all_uses_with(ValueId::Instruction(add_id), gep);
+        tc.ctx
+            .replace_all_uses_with(ValueId::Instruction(add_id), gep);
 
         Function::from_id_mut(&mut tc.ctx, f).set_input_regs(vec![input]);
         Function::from_id_mut(&mut tc.ctx, f).set_pure_reg(true);
@@ -1963,7 +1969,10 @@ mod tests {
             b.params()
                 .any(|p| tc.ctx.types.array_of(p.type_id()).is_some())
         });
-        assert!(!has_array_param, "no Array param for a region that can't build");
+        assert!(
+            !has_array_param,
+            "no Array param for a region that can't build"
+        );
     }
 
     /// The real-world shape: the buffer pointer is spilled to `[ESP+4]` and
@@ -2346,9 +2355,10 @@ mod tests {
             Function::from_id(&tc.ctx, f).iter().count() > 2,
             "the residual @acc loop must remain"
         );
-        let has_cbranch = Function::from_id(&tc.ctx, f)
-            .iter()
-            .any(|b| b.iter().any(|i| matches!(i.mnemonic(), Mnemonic::CBranch(_))));
+        let has_cbranch = Function::from_id(&tc.ctx, f).iter().any(|b| {
+            b.iter()
+                .any(|i| matches!(i.mnemonic(), Mnemonic::CBranch(_)))
+        });
         assert!(has_cbranch, "the loop's header branch must remain");
 
         // The loop's shadow channel is *kept intact*: only the wide reload was
@@ -2436,9 +2446,10 @@ mod tests {
 
         // The loop is kept (not deletable — @acc escapes), with its shadow channel
         // left intact so the surviving lane load still reads a seeded region.
-        let has_cbranch = Function::from_id(&tc.ctx, f)
-            .iter()
-            .any(|b| b.iter().any(|i| matches!(i.mnemonic(), Mnemonic::CBranch(_))));
+        let has_cbranch = Function::from_id(&tc.ctx, f).iter().any(|b| {
+            b.iter()
+                .any(|i| matches!(i.mnemonic(), Mnemonic::CBranch(_)))
+        });
         assert!(has_cbranch, "the residual @acc loop must remain");
         let any_store = Function::from_id(&tc.ctx, f).iter().any(|b| {
             b.iter().any(|i| matches!(i.mnemonic(), Mnemonic::Store(s)

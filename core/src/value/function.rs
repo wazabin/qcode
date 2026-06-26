@@ -780,7 +780,8 @@ mod tests {
         // Thunk at 0x1000: a lone `jmp` into the callee's entry.
         let thunk = Function::make_at_addr(&mut ctx, 0x1000, None).id;
         let thunk_entry = BasicBlock::make(&mut ctx).with_address(0x1000).id;
-        Builder::from_block(BasicBlock::from_id_mut(&mut ctx, thunk_entry)).push_branch(callee_entry);
+        Builder::from_block(BasicBlock::from_id_mut(&mut ctx, thunk_entry))
+            .push_branch(callee_entry);
         ctx.add_cfg_edge(thunk_entry, callee_entry);
         Function::from_id_mut(&mut ctx, thunk)
             .set_root(thunk_entry)

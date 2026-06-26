@@ -1062,7 +1062,12 @@ mod tests {
         for (src, want_start, want_end) in cases {
             match &stmts(src)[0] {
                 Statement::Assign {
-                    expr: ExprNode::Range { start, end, src: atom },
+                    expr:
+                        ExprNode::Range {
+                            start,
+                            end,
+                            src: atom,
+                        },
                     ..
                 } => {
                     assert_eq!(*start, want_start, "start for `{src}`");
@@ -1082,7 +1087,12 @@ mod tests {
         let statements = stmts("%m = inc <$> %src");
         match &statements[0] {
             Statement::Assign {
-                expr: ExprNode::Map { body, src, captures },
+                expr:
+                    ExprNode::Map {
+                        body,
+                        src,
+                        captures,
+                    },
                 ..
             } => {
                 assert_eq!(body, "inc");
@@ -1101,7 +1111,12 @@ mod tests {
         let statements = stmts("%m = (addk %k0 %k1) <$> %src");
         match &statements[0] {
             Statement::Assign {
-                expr: ExprNode::Map { body, src, captures },
+                expr:
+                    ExprNode::Map {
+                        body,
+                        src,
+                        captures,
+                    },
                 ..
             } => {
                 assert_eq!(body, "addk");

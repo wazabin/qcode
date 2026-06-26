@@ -381,7 +381,11 @@ impl<'str> Context<'str> {
     /// Force how a `Bytes` blob renders as a `b"..."` literal everywhere.
     /// Setting [`BytesDisplay::Auto`](crate::value::BytesDisplay::Auto) clears
     /// any existing override.
-    pub fn set_bytes_display(&mut self, id: crate::value::BytesId, mode: crate::value::BytesDisplay) {
+    pub fn set_bytes_display(
+        &mut self,
+        id: crate::value::BytesId,
+        mode: crate::value::BytesDisplay,
+    ) {
         if mode == crate::value::BytesDisplay::Auto {
             self.values.bytes_display.remove(&id);
         } else {

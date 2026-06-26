@@ -314,9 +314,7 @@ fn value_size(ctx: &Context, v: ValueId) -> usize {
 /// * `zext(_, v)[0:N]` where `v` is `N` bytes → `v` (e.g. `zext(i32, i1 v)[0:1]`)
 pub(super) fn cast_identity(ctx: &Context, m: &Mnemonic) -> Option<ValueId> {
     match m {
-        Mnemonic::Zext(zext) => {
-            (value_size(ctx, zext.src) == zext.size).then_some(zext.src)
-        }
+        Mnemonic::Zext(zext) => (value_size(ctx, zext.src) == zext.size).then_some(zext.src),
         Mnemonic::Range(range) if range.start == 0 => {
             // `v[0:N]` keeps the low `N` bytes. If `v` is exactly `N` bytes the
             // extract is a no-op.
@@ -327,7 +325,8 @@ pub(super) fn cast_identity(ctx: &Context, m: &Mnemonic) -> Option<ValueId> {
             // `N` bytes of the zext are `inner` untouched, so the extract peels
             // the widening back off.
             if let ValueId::Instruction(id) = range.src {
-                if let Mnemonic::Zext(inner) = qcode::value::Instruction::from_id(ctx, id).mnemonic()
+                if let Mnemonic::Zext(inner) =
+                    qcode::value::Instruction::from_id(ctx, id).mnemonic()
                 {
                     if value_size(ctx, inner.src) == range.size {
                         return Some(inner.src);
@@ -869,7 +868,11 @@ mod tests {
                 _ => None,
             })
             .expect("a store survives");
-        assert_eq!(stored, ValueId::Instruction(a), "zext(i32, i32 v) must collapse to v");
+        assert_eq!(
+            stored,
+            ValueId::Instruction(a),
+            "zext(i32, i32 v) must collapse to v"
+        );
     }
 
     /// `v[0:4]` for a 4-byte `v` is a no-op: the range is replaced by `v`.
@@ -903,7 +906,11 @@ mod tests {
                 _ => None,
             })
             .expect("a store survives");
-        assert_eq!(stored, ValueId::Instruction(a), "v[0:4] for a 4-byte v must collapse to v");
+        assert_eq!(
+            stored,
+            ValueId::Instruction(a),
+            "v[0:4] for a 4-byte v must collapse to v"
+        );
     }
 
     /// `zext(i32, i1 v)[0:1]` is `v`: the extract peels off the widening.
@@ -938,7 +945,11 @@ mod tests {
                 _ => None,
             })
             .expect("a store survives");
-        assert_eq!(stored, ValueId::Instruction(a), "zext(i32, i1 v)[0:1] must collapse to v");
+        assert_eq!(
+            stored,
+            ValueId::Instruction(a),
+            "zext(i32, i1 v)[0:1] must collapse to v"
+        );
     }
 
     // -----------------------------------------------------------------------

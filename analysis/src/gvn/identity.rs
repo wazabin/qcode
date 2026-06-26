@@ -289,10 +289,9 @@ fn simplify_bitwise(ctx: &mut Context, ic: &InsnCtx, ed: &mut Editor) -> bool {
                 if outer != all {
                     continue;
                 }
-                for (dual_in, dual_out) in [
-                    (IntBinop::Or, IntBinop::And),
-                    (IntBinop::And, IntBinop::Or),
-                ] {
+                for (dual_in, dual_out) in
+                    [(IntBinop::Or, IntBinop::And), (IntBinop::And, IntBinop::Or)]
+                {
                     let Some((a, b)) = as_int_binop(ctx, inner, dual_in) else {
                         continue;
                     };

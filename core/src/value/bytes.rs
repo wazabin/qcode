@@ -152,7 +152,9 @@ pub fn escape_decoded(s: &str) -> String {
 /// the encoding (or fall back to hex). The remaining variants are user-forced
 /// overrides — e.g. from the GUI Strings pane — and are applied even when the
 /// blob is not cleanly printable, escaping any bytes that don't fit.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+#[derive(
+    Debug, Clone, Copy, Default, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize,
+)]
 pub enum BytesDisplay {
     /// Auto-detect ASCII / UTF-16LE, else hex.
     #[default]
