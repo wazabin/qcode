@@ -31,7 +31,7 @@ call_stmt       =  { "call" ~ label }
 callind_stmt    =  { "call" ~ "[" ~ typed_atom ~ "]" }
 return_stmt     =  { "return" ~ "[" ~ typed_atom ~ "]" }
 assert_stmt     =  { "assert" ~ typed_atom }
-expr            =  { memory | cast | extract | gep | unop | func_unop | intrinsic_call | map | func_call | binary | tuple | atom_expr }
+expr            =  { memory | cast | extract | gep | unop | func_unop | intrinsic_call | map | func_call | range | binary | tuple | atom_expr }
 expr_stmt       =  { SOI ~ expr ~ EOI }
 atom_expr       =  { typed_atom }
 unop            =  { unop_op ~ typed_atom }
@@ -45,6 +45,12 @@ intrinsic_name  = @{ "$" ~ (ASCII_ALPHA | "_") ~ (ASCII_ALPHANUMERIC | "_")* }
 map             =  { map_app ~ "<$>" ~ typed_atom }
 map_app         =  { "(" ~ ident ~ typed_atom* ~ ")" | ident }
 binary          =  { typed_atom ~ op ~ typed_atom }
+// `v[start:end]` — extract bytes `[start, end)` of `v`. `start` defaults to 0
+// and `end` defaults to `v`'s byte width, so `v[:4]`, `v[1:]` and `v[:]` are all
+// valid. Lowers to a `Range` instruction (size = end - start).
+range           =  { typed_atom ~ "[" ~ range_start? ~ ":" ~ range_end? ~ "]" }
+range_start     =  { integer }
+range_end       =  { integer }
 memory          =  { load | store }
 load            =  { "load" ~ "(" ~ ty ~ "," ~ typed_atom ~ ")" }
 store           =  { "store" ~ "(" ~ typed_atom ~ "," ~ typed_atom ~ ")" }

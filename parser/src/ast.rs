@@ -146,6 +146,13 @@ pub enum ExprNode {
         base: TypedAtom,
         field: GepField,
     },
+    /// `src[start:end]` — extract the byte range `[start, end)` of `src`. A
+    /// missing `start` defaults to 0; a missing `end` defaults to `src`'s width.
+    Range {
+        src: TypedAtom,
+        start: Option<u64>,
+        end: Option<u64>,
+    },
 }
 
 #[derive(Clone, Copy, Debug)]

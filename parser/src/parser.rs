@@ -527,8 +527,25 @@ fn parse_expr(pair: Pair<'_, Rule>) -> Result<ExprNode, ParseError> {
         Rule::tuple => parse_tuple(inner),
         Rule::extract => parse_extract(inner),
         Rule::gep => parse_gep(inner),
+        Rule::range => parse_range(inner),
         _ => Err(ParseError::new("invalid expression")),
     }
+}
+
+fn parse_range(pair: Pair<'_, Rule>) -> Result<ExprNode, ParseError> {
+    let mut src = None;
+    let mut start = None;
+    let mut end = None;
+    for part in pair.into_inner() {
+        match part.as_rule() {
+            Rule::typed_atom => src = Some(parse_typed_atom(part)?),
+            Rule::range_start => start = Some(parse_integer(part.as_str().trim())?),
+            Rule::range_end => end = Some(parse_integer(part.as_str().trim())?),
+            _ => {}
+        }
+    }
+    let src = src.ok_or_else(|| ParseError::new("missing range source"))?;
+    Ok(ExprNode::Range { src, start, end })
 }
 
 fn parse_gep(pair: Pair<'_, Rule>) -> Result<ExprNode, ParseError> {
@@ -1029,6 +1046,34 @@ mod tests {
                 }
             }
             _ => panic!("expected expression statement"),
+        }
+    }
+
+    #[test]
+    fn parses_range_with_and_without_default_bounds() {
+        // Explicit `[start:end]`, defaulted start `[:end]`, defaulted end
+        // `[start:]`, and fully defaulted `[:]`.
+        let cases = [
+            ("%r = %a[1:4]", Some(1), Some(4)),
+            ("%r = %a[:4]", None, Some(4)),
+            ("%r = %a[1:]", Some(1), None),
+            ("%r = %a[:]", None, None),
+        ];
+        for (src, want_start, want_end) in cases {
+            match &stmts(src)[0] {
+                Statement::Assign {
+                    expr: ExprNode::Range { start, end, src: atom },
+                    ..
+                } => {
+                    assert_eq!(*start, want_start, "start for `{src}`");
+                    assert_eq!(*end, want_end, "end for `{src}`");
+                    match &atom.atom {
+                        Atom::Ssa(name) => assert_eq!(name, "a"),
+                        _ => panic!("expected ssa range source"),
+                    }
+                }
+                other => panic!("expected range expression for `{src}`, got {other:?}"),
+            }
         }
     }
 

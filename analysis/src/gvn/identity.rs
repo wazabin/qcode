@@ -21,8 +21,8 @@
 use qcode::{
     context::Context,
     value::{
-        ValueId,
-        insn::{Binary, Binop, IntBinop, Mnemonic, Simplified},
+        Value, ValueId, ValueRef,
+        insn::{Binary, Binop, IntBinop, Mnemonic, Simplified, Unary, Unop},
     },
 };
 
@@ -68,6 +68,9 @@ impl SubPass for Identities {
         // `i & 1` emitted as `~(~i | ~1)` with a redundant outer mask — back into
         // the plain `&`/`^` the full-adder idioms above then recognize.
         if simplify_bitwise(ctx, ic, ed) {
+            return Claim::Done;
+        }
+        if simplify_compare(ctx, ic, ed) {
             return Claim::Done;
         }
         Claim::Pass
@@ -314,6 +317,148 @@ fn simplify_bitwise(ctx: &mut Context, ic: &InsnCtx, ed: &mut Editor) -> bool {
     }
 }
 
+/// The byte width of `v`'s output.
+fn value_size(ctx: &Context, v: ValueId) -> usize {
+    ValueRef::new(v, ctx).size()
+}
+
+/// If `v` is `zext(src)`, returns `(src, src_width)`.
+fn as_zext(ctx: &Context, v: ValueId) -> Option<(ValueId, usize)> {
+    let ValueId::Instruction(id) = v else {
+        return None;
+    };
+    match ctx.get_insn(id).mnemonic() {
+        Mnemonic::Zext(z) => Some((z.src, value_size(ctx, z.src))),
+        _ => None,
+    }
+}
+
+/// Whether `v` is produced by an operation that always yields `0` or `1`: an
+/// integer comparison, a boolean binop, or a logical `!`.
+fn is_boolean(ctx: &Context, v: ValueId) -> bool {
+    let ValueId::Instruction(id) = v else {
+        return false;
+    };
+    match ctx.get_insn(id).mnemonic() {
+        Mnemonic::Binop(Binary {
+            op: Binop::Int(op), ..
+        }) => op.is_comparison(),
+        Mnemonic::Binop(Binary {
+            op: Binop::Bool(_), ..
+        }) => true,
+        Mnemonic::Unop(Unary {
+            op: Unop::BoolNot, ..
+        }) => true,
+        _ => false,
+    }
+}
+
+/// The negation of an equality comparison: `==`↔`!=`. Ordering comparisons are
+/// not flipped here (their negation swaps operand order and strictness).
+fn negated_compare(op: IntBinop) -> Option<IntBinop> {
+    match op {
+        IntBinop::Equal => Some(IntBinop::NotEqual),
+        IntBinop::NotEqual => Some(IntBinop::Equal),
+        _ => None,
+    }
+}
+
+/// Comparison-idiom simplifications around `zext` and boolean values — the shape
+/// a compiler emits for `if (x != 0)` after flag materialization:
+///
+/// ```text
+///   zext(v) == 0   →   v == 0          (zext is zero-preserving)
+///   zext(v) != 0   →   v != 0
+///   b != 0         →   b               (b already 0/1)
+///   b == 0         →   !b
+///   !(a == b)      →   a != b          (negating an equality test)
+///   !(a != b)      →   a == b
+/// ```
+///
+/// Together these collapse `zext(!(x == 0)) != 0` down to `x != 0`. Returns
+/// whether the root was rewritten.
+fn simplify_compare(ctx: &mut Context, ic: &InsnCtx, ed: &mut Editor) -> bool {
+    match ic.mnemonic {
+        &Mnemonic::Binop(Binary {
+            lhs,
+            rhs,
+            op: Binop::Int(op),
+        }) if matches!(op, IntBinop::Equal | IntBinop::NotEqual) => {
+            for (c, other) in const_operands(ctx, lhs, rhs) {
+                if c != 0 {
+                    continue;
+                }
+                // `zext(v) ==/!= 0` → `v ==/!= 0`: comparing a zero-extended
+                // value against 0 is comparing the source against 0.
+                if let Some((src, src_size)) = as_zext(ctx, other) {
+                    let zero = ctx.get_const(0, src_size).id();
+                    ed.replace_with_new_insn(
+                        ctx,
+                        ic.block_id,
+                        ic.insn_id,
+                        int_binop(src, zero, op),
+                        ic.size,
+                    );
+                    return true;
+                }
+                // A boolean is already `0`/`1`, so `b != 0` is `b` and `b == 0`
+                // is `!b`. The width must match so the forwarded/negated value
+                // is a drop-in for the comparison result.
+                if is_boolean(ctx, other) && value_size(ctx, other) == ic.size {
+                    match op {
+                        IntBinop::NotEqual => {
+                            ed.replace(ctx, ic.insn_id, other);
+                            return true;
+                        }
+                        IntBinop::Equal => {
+                            ed.replace_with_new_insn(
+                                ctx,
+                                ic.block_id,
+                                ic.insn_id,
+                                Mnemonic::Unop(Unary {
+                                    op: Unop::BoolNot,
+                                    src: other,
+                                }),
+                                ic.size,
+                            );
+                            return true;
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            false
+        }
+        &Mnemonic::Unop(Unary {
+            op: Unop::BoolNot,
+            src,
+        }) => {
+            // `!(a == b)` → `a != b` and `!(a != b)` → `a == b`.
+            let ValueId::Instruction(id) = src else {
+                return false;
+            };
+            if let &Mnemonic::Binop(Binary {
+                lhs,
+                rhs,
+                op: Binop::Int(inner),
+            }) = ctx.get_insn(id).mnemonic()
+                && let Some(flipped) = negated_compare(inner)
+            {
+                ed.replace_with_new_insn(
+                    ctx,
+                    ic.block_id,
+                    ic.insn_id,
+                    int_binop(lhs, rhs, flipped),
+                    ic.size,
+                );
+                return true;
+            }
+            false
+        }
+        _ => false,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use crate::AliasResult;
@@ -466,6 +611,87 @@ mod tests {
         assert!(
             !text.contains(" | ") && !text.contains(" * ") && !text.contains('~'),
             "the De Morgan / doubling obfuscation should be gone, got:\n{text}"
+        );
+    }
+
+    /// `zext(!(x == 0)) != 0` is the flag-materialization shape a compiler emits
+    /// for `if (x != 0)`. GVN must collapse the whole condition to a single
+    /// `x != 0`, leaving the zext / not / redundant `!= 0` dead.
+    #[test]
+    fn zext_bool_compare_collapses_to_single_compare() {
+        let mut ctx = Context::new();
+        qcode!(
+            ctx,
+            "
+                varnode i32 X;
+
+                fn f:
+                    <entry>
+                        %x = load(i32, &X);
+                        %eq = %x == 0x0;
+                        %ne = ! %eq;
+                        %z = zext(i32, %ne);
+                        %cond = %z != 0x0;
+                        if %cond goto <0x2000> else goto <0x1000>;
+                    <0x1000>
+                        return [0x0];
+                    <0x2000>
+                        return [0x1];
+                "
+        );
+
+        let aliases = AliasResult::simple(&ctx);
+        while gvn_function(&mut ctx, f, Some(&aliases)) {}
+        crate::remove_dead_insns(&mut ctx, entry);
+        let text = BasicBlock::from_id(&ctx, entry).to_string();
+
+        assert!(
+            !text.contains("zext"),
+            "the zext should be dead, got:\n{text}"
+        );
+        assert!(
+            !text.contains("== 0x0"),
+            "the `== 0` flag test should be gone, got:\n{text}"
+        );
+        assert_eq!(
+            text.matches("!=").count(),
+            1,
+            "the condition should collapse to a single `x != 0`, got:\n{text}"
+        );
+    }
+
+    /// `zext(v) != 0` strips the zext even when `v` is not itself boolean.
+    #[test]
+    fn zext_compare_with_zero_strips_zext() {
+        let mut ctx = Context::new();
+        qcode!(
+            ctx,
+            "
+                varnode i8 V;
+                varnode i8 B;
+
+                fn f:
+                    <entry>
+                        %v = load(i8, &V);
+                        %z = zext(i32, %v);
+                        %cond = %z != 0x0;
+                        %c8 = zext(i8, %cond);
+                        store(&B, %c8);
+                        return [0x0];
+                "
+        );
+
+        let aliases = AliasResult::simple(&ctx);
+        while gvn_function(&mut ctx, f, Some(&aliases)) {}
+        crate::remove_dead_insns(&mut ctx, entry);
+        let text = BasicBlock::from_id(&ctx, entry).to_string();
+        assert!(
+            !text.contains("zext(i32"),
+            "the i32 zext feeding the compare should be gone, got:\n{text}"
+        );
+        assert!(
+            text.contains("!="),
+            "the `!= 0` comparison on the i8 source must remain, got:\n{text}"
         );
     }
 

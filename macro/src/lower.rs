@@ -1316,6 +1316,41 @@ fn lower_expr(
                 }),
             }
         }
+
+        ExprNode::Range { src, start, end } => {
+            let src_tokens = lower_atom(src, None, locals, pcode_root)?;
+            let start_tokens = match start {
+                Some(s) => {
+                    let s = *s as usize;
+                    quote! { #s }
+                }
+                None => quote! { 0usize },
+            };
+            // A missing `end` defaults to the source's full byte width, so
+            // `v[1:]` extracts from byte 1 to the end of `v`.
+            let end_tokens = match end {
+                Some(e) => {
+                    let e = *e as usize;
+                    quote! { #e }
+                }
+                None => quote! { __qcode_src_size },
+            };
+            Ok(quote! {
+                {
+                    let __qcode_src = #src_tokens;
+                    let __qcode_src_size = #pcode_root::value::ValueRef::new(
+                        __qcode_src,
+                        __qcode_builder.context(),
+                    )
+                    .size();
+                    let __qcode_start = #start_tokens;
+                    let __qcode_end = #end_tokens;
+                    __qcode_builder
+                        .push_range(__qcode_src, __qcode_start, __qcode_end - __qcode_start)
+                        .id
+                }
+            })
+        }
     }
 }
 

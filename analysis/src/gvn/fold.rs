@@ -297,6 +297,47 @@ pub(super) fn const_value(ctx: &Context, v: ValueId) -> Option<u64> {
 fn try_fold_insn(ctx: &mut Context, ic: &InsnCtx) -> Option<ValueId> {
     constant_folding_with_location(ctx, ic.mnemonic, ic.size, Some(ic))
         .or_else(|| algebraic_identity(ctx, ic.mnemonic, ic.size))
+        .or_else(|| cast_identity(ctx, ic.mnemonic))
+}
+
+/// The size in bytes of `v`'s output.
+fn value_size(ctx: &Context, v: ValueId) -> usize {
+    ValueRef::new(v, ctx).size()
+}
+
+/// Width-preserving casts and extracts that collapse to an existing value.
+/// Unlike [`constant_folding`] these need no constant operand — they hold for
+/// any value whose width already matches:
+///
+/// * `zext(iN, v)` where `v` is already `N` bytes wide → `v`
+/// * `v[0:N]` (i.e. `Range { start: 0, size: N }`) where `v` is `N` bytes → `v`
+/// * `zext(_, v)[0:N]` where `v` is `N` bytes → `v` (e.g. `zext(i32, i1 v)[0:1]`)
+pub(super) fn cast_identity(ctx: &Context, m: &Mnemonic) -> Option<ValueId> {
+    match m {
+        Mnemonic::Zext(zext) => {
+            (value_size(ctx, zext.src) == zext.size).then_some(zext.src)
+        }
+        Mnemonic::Range(range) if range.start == 0 => {
+            // `v[0:N]` keeps the low `N` bytes. If `v` is exactly `N` bytes the
+            // extract is a no-op.
+            if value_size(ctx, range.src) == range.size {
+                return Some(range.src);
+            }
+            // `zext(_, inner)[0:N]` where `inner` is exactly `N` bytes: the low
+            // `N` bytes of the zext are `inner` untouched, so the extract peels
+            // the widening back off.
+            if let ValueId::Instruction(id) = range.src {
+                if let Mnemonic::Zext(inner) = qcode::value::Instruction::from_id(ctx, id).mnemonic()
+                {
+                    if value_size(ctx, inner.src) == range.size {
+                        return Some(inner.src);
+                    }
+                }
+            }
+            None
+        }
+        _ => None,
+    }
 }
 
 fn log_mixed_width_binop(
@@ -791,6 +832,113 @@ mod tests {
             block.to_string().contains("B = 0x0"),
             "x ^ x should fold to the zero constant, got:\n{block}"
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // Cast / extract identities
+    // -----------------------------------------------------------------------
+
+    /// `zext(i32, i32 v)` is a no-op: the zext is replaced by `v`.
+    #[test]
+    fn test_zext_to_same_width_is_noop() {
+        use crate::gvn::gvn_function;
+
+        let mut ctx = Context::new();
+        qcode!(
+            ctx,
+            "
+            fn f:
+                <entry>
+                    varnode i32 A;
+                    varnode i32 B;
+                    %a = load(i32, &A);
+                    %z = zext(i32, %a);
+                    store(&B, %z);
+                    return [i32 0];
+            "
+        );
+
+        let aliases = AliasResult::simple(&ctx);
+        gvn_function(&mut ctx, f, Some(&aliases));
+
+        let stored = Function::from_id(&ctx, f)
+            .blocks()
+            .flat_map(|b| b.iter().collect::<Vec<_>>())
+            .find_map(|i| match i.mnemonic() {
+                Mnemonic::Store(s) => Some(s.src),
+                _ => None,
+            })
+            .expect("a store survives");
+        assert_eq!(stored, ValueId::Instruction(a), "zext(i32, i32 v) must collapse to v");
+    }
+
+    /// `v[0:4]` for a 4-byte `v` is a no-op: the range is replaced by `v`.
+    #[test]
+    fn test_full_width_range_is_noop() {
+        use crate::gvn::gvn_function;
+
+        let mut ctx = Context::new();
+        qcode!(
+            ctx,
+            "
+            fn f:
+                <entry>
+                    varnode i32 A;
+                    varnode i32 B;
+                    %a = load(i32, &A);
+                    %r = %a[0:4];
+                    store(&B, %r);
+                    return [i32 0];
+            "
+        );
+
+        let aliases = AliasResult::simple(&ctx);
+        gvn_function(&mut ctx, f, Some(&aliases));
+
+        let stored = Function::from_id(&ctx, f)
+            .blocks()
+            .flat_map(|b| b.iter().collect::<Vec<_>>())
+            .find_map(|i| match i.mnemonic() {
+                Mnemonic::Store(s) => Some(s.src),
+                _ => None,
+            })
+            .expect("a store survives");
+        assert_eq!(stored, ValueId::Instruction(a), "v[0:4] for a 4-byte v must collapse to v");
+    }
+
+    /// `zext(i32, i1 v)[0:1]` is `v`: the extract peels off the widening.
+    #[test]
+    fn test_range_of_zext_back_to_source_is_noop() {
+        use crate::gvn::gvn_function;
+
+        let mut ctx = Context::new();
+        qcode!(
+            ctx,
+            "
+            fn f:
+                <entry>
+                    varnode i8 A;
+                    varnode i8 B;
+                    %a = load(i8, &A);
+                    %z = zext(i32, %a);
+                    %r = %z[0:1];
+                    store(&B, %r);
+                    return [i32 0];
+            "
+        );
+
+        let aliases = AliasResult::simple(&ctx);
+        gvn_function(&mut ctx, f, Some(&aliases));
+
+        let stored = Function::from_id(&ctx, f)
+            .blocks()
+            .flat_map(|b| b.iter().collect::<Vec<_>>())
+            .find_map(|i| match i.mnemonic() {
+                Mnemonic::Store(s) => Some(s.src),
+                _ => None,
+            })
+            .expect("a store survives");
+        assert_eq!(stored, ValueId::Instruction(a), "zext(i32, i1 v)[0:1] must collapse to v");
     }
 
     // -----------------------------------------------------------------------

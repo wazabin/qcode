@@ -251,6 +251,20 @@ impl<'str, 'ctx> Builder<'str, 'ctx> {
         Some(dst)
     }
 
+    /// Pushes a `Range` instruction extracting `size` bytes starting at byte
+    /// `start` of `src`. Unlike [`get_range`](Self::get_range), this always emits
+    /// a `Range` instruction (no constant/varnode folding), so the result is a
+    /// fresh SSA value — used by the `qcode!` macro's `src[start:end]` form.
+    pub fn push_range(
+        &mut self,
+        src: ValueId,
+        start: usize,
+        size: usize,
+    ) -> InstructionRef<'str, '_> {
+        let space = ValueRef::from_id(self.context(), src).space().map(|s| s.id);
+        self.push_instruction_in_space(Mnemonic::Range(Range { src, start, size }), size, space)
+    }
+
     /// Creates a new builder with the same insert point but an empty namespace.
     /// This builder won't need to be finalized
     pub fn with_empty_namespaces(&mut self) -> Builder<'str, '_> {
