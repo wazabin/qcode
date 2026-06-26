@@ -494,15 +494,34 @@ impl MemForward {
 
         let is_reg = |space| matches!(Space::from_id(ctx, space).ty, SpaceType::Register);
 
+        // PROTOTYPE (realigned-frame): frame freshness extended from stores to
+        // calls. A symbolic RAM cell whose base is an own-frame local the callee
+        // never received a pointer to cannot be written by it — the callee's frame
+        // is younger and it holds no pointer into ours. Keep such a cell across the
+        // call; this is what lets a realigned-frame spill (whose base is the
+        // `@SP & -mask` anchor, classified `Local`) survive intervening calls.
+        // Conservative for an unknown (indirect) callee, which has no clobber
+        // summary, and requires every escaping pointer to be provably disjoint from
+        // the base.
+        let own_frame_survives = |bv: ValueId| -> bool {
+            if unknown_callee {
+                return false;
+            }
+            let Some(a) = aliases else { return false };
+            a.is_own_frame_local(bv)
+                && escaping.iter().all(|&p| a.provably_disjoint(ctx, p, bv))
+        };
+
         self.byte_map.retain(|&(base, off), _| {
             let space = base.space();
             if !is_reg(space) {
                 // RAM: a call may write through any symbolic pointer (no memory
-                // summary exists), so drop all symbolic RAM cells. A pinned RAM
-                // cell (a resolved stack slot) survives unless a pointer to it
+                // summary exists), so drop symbolic RAM cells — except an own-frame
+                // slot the callee cannot reach (see `own_frame_survives`). A pinned
+                // RAM cell (a resolved stack slot) survives unless a pointer to it
                 // escaped into the callee, which may then store through it.
                 return match base {
-                    Base::Symbolic(..) => false,
+                    Base::Symbolic(_, bv) => own_frame_survives(bv),
                     Base::Pinned(_) => !pinned_ram_clobbered(space, off),
                 };
             }
@@ -752,6 +771,85 @@ mod tests {
 
         assert!(!mf.byte_map.contains_key(&(base, r0_start)), "r0 dropped");
         assert!(mf.byte_map.contains_key(&(base, r1_start)), "r1 kept");
+    }
+
+    /// PROTOTYPE (realigned-frame): a spill into a realigned own-frame slot
+    /// survives an intervening call whose callee receives no pointer into the
+    /// frame, while a caller-frame (`@SP`-rooted) slot does not. This is the wall
+    /// that keeps `%tmp5633 = load(reload-of-spilled-&buffer)` opaque in the
+    /// `410a60` function — the reload sits behind four calls.
+    #[test]
+    fn realigned_own_frame_slot_survives_call() {
+        use crate::gvn::affine::precompute_forms;
+        use qcode::{
+            builder::Builder,
+            value::{BasicBlock, Function},
+        };
+
+        let mut tc = TestContext::new();
+        let sp_reg = tc.r0;
+        let fid = Function::make(&mut tc.ctx, "f".into()).unwrap().id;
+        let callee = Function::make(&mut tc.ctx, "callee".into()).unwrap().id;
+        let root = tc.ctx.get_or_make_block(0x1000);
+        {
+            let mut f = Function::from_id_mut(&mut tc.ctx, fid);
+            f.set_root(root).unwrap();
+            f.add_block(root);
+        }
+        let pid = BasicBlock::from_id_mut(&mut tc.ctx, root).push_param(8).id;
+        tc.ctx.values.block_params[pid].origin = Some(ValueId::Varnode(sp_reg));
+        let sp = ValueId::BlockParam(pid);
+        let ram = tc.ctx.default_space;
+
+        // `slot = ((@SP - 0x10) & -8) - 0x78`; spill an 8-byte value into it, then
+        // end the block with a direct call carrying no arguments (nothing escapes).
+        let (aligned, slot_store, val) = {
+            let mut b = Builder::from_block(BasicBlock::from_id_mut(&mut tc.ctx, root));
+            let c10 = b.context_mut().get_const(0x10, 8).id();
+            let neg8 = b.context_mut().get_const((-8i64) as u64, 8).id();
+            let c78 = b.context_mut().get_const(0x78, 8).id();
+            let val = b.context_mut().get_const(0xdead_beef, 8).id();
+            let s = b.push_sub(sp, c10).id();
+            let aligned = b.push_bit_and(s, neg8).id();
+            let slot = b.push_sub(aligned, c78).id();
+            let store = Store {
+                space: ram,
+                ptr: slot,
+                src: val,
+                size: 8,
+            };
+            b.push_call(callee);
+            unsafe { b.dont_finalize() };
+            (aligned, store, val)
+        };
+
+        let aliases = AliasResult::simple(&tc.ctx).with_frame_freshness(&tc.ctx, fid, Some(sp_reg));
+        let nb = precompute_forms(&tc.ctx, fid);
+
+        let mut mf = MemForward::default();
+        mf.record_store(&mut tc.ctx, &slot_store, Some(&aliases), &nb);
+        // A plain caller-frame `@SP - 4` cell, for contrast: its base is the `@SP`
+        // param (classified CallerFrame), so it is not own-frame-private.
+        let caller_slot = Base::Symbolic(ram, sp);
+        mf.byte_map
+            .insert((caller_slot, -4), Cell { src: val, src_off: 0 });
+
+        let realigned = Base::Symbolic(ram, aligned);
+        assert!(
+            mf.byte_map.contains_key(&(realigned, -0x78)),
+            "spill recorded at the realigned own-frame base"
+        );
+
+        mf.prune_clobbered_by_call(&tc.ctx, root, Some(&aliases));
+
+        assert!(
+            mf.byte_map.contains_key(&(realigned, -0x78)),
+            "realigned own-frame spill survives the call (callee got no frame pointer)"
+        );
+        assert!(
+            !mf.byte_map.contains_key(&(caller_slot, -4)),
+            "a caller-frame @SP slot is still dropped across the call"
+        );
     }
 
     /// A store whose src is narrower than the written location zero-extends: the

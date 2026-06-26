@@ -7,7 +7,11 @@ use qcode::value::{
     ValueId, ValueRef, Varnode, VarnodeId,
     insn::{Branch, CBranch, InstructionId, InstructionRef, Load, Mnemonic, Range, Store, Zext},
 };
-use qcode::{builder::Builder, context::Context, value::FunctionRef};
+use qcode::{
+    builder::Builder,
+    context::Context,
+    value::{FunctionRef, block::BlockRef},
+};
 use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
 use std::borrow::Cow;
 
@@ -84,12 +88,15 @@ impl<'ctx, 'str> Mem2Reg<'ctx, 'str> {
     }
 
     fn run(&mut self) -> bool {
-        // Precompute the liveness inputs in one sweep so the collection and
-        // block-param phases share a single per-var computation (memoized) instead
-        // of rescanning the whole function for each variable.
-        let mut live_in_cache = LiveInBlocks::new(&*self.ctx, self.function_id);
+        // `live_in_blocks` is an O(blocks × insns) fixpoint; cache it per var so
+        // the collection and block-param phases share a single computation.
+        let mut live_in_cache: HashMap<ValueId, HashSet<BlockId>> = HashMap::default();
 
-        let Promotable { vars, sizes } = self.collect_promotable_vars(&mut live_in_cache);
+        let Promotable {
+            vars,
+            sizes,
+            sliced,
+        } = self.collect_promotable_vars(&mut live_in_cache);
         if vars.is_empty() {
             return false;
         }
@@ -101,7 +108,7 @@ impl<'ctx, 'str> Mem2Reg<'ctx, 'str> {
             by_block: var_params,
             changed,
             excluded,
-        } = self.insert_block_params(&vars, &sizes, &frontier, &mut live_in_cache);
+        } = self.insert_block_params(&vars, &sizes, &sliced, &frontier, &mut live_in_cache);
 
         // Drop vars whose promotion was declined (implicit-edge join); their
         // memory accesses stay in place, so renaming and store removal must not
@@ -118,7 +125,8 @@ impl<'ctx, 'str> Mem2Reg<'ctx, 'str> {
         let register_clobbers =
             register_clobber_index(self.ctx, self.function_id, &vars, self.aliases);
 
-        let mut state = RenameState::new(&var_params, &vars, register_clobbers, changed);
+        let mut state =
+            RenameState::new(&var_params, &vars, &sliced, register_clobbers, changed);
         self.decide_values_start_from(root_id, &mut state);
 
         let RenameState {
@@ -241,6 +249,25 @@ fn wider_register_store_contains(ctx: &Context, store: ValueId, var: ValueId) ->
     store_start <= var_start && var_end <= store_end
 }
 
+/// Whether register store `store` fully covers narrower register var `var` and
+/// shares its start address — so `var`'s bytes are exactly the low `var.size`
+/// bytes of the stored value (e.g. `AL`/`AX` within an `EAX` store). For such a
+/// low-aligned containment the stored value can be *sliced* into `var` with a
+/// plain low-byte truncation (`Range { start: 0 }`), the resize the renamer
+/// already applies when forwarding. A containment at a non-zero offset (e.g.
+/// `AH`) would need a shift, which this pass does not synthesize, so it is
+/// excluded here and left to the GVN memory pass.
+fn register_store_low_aligned_contains(ctx: &Context, store: ValueId, var: ValueId) -> bool {
+    let (Some(store), Some(var)) = (register_varnode(ctx, store), register_varnode(ctx, var))
+    else {
+        return false;
+    };
+    let (store, var) = (Varnode::from_id(ctx, store), Varnode::from_id(ctx, var));
+    store.space().id == var.space().id
+        && store.size() > var.size()
+        && store.address() == var.address()
+}
+
 /// Whether the call terminating `block` (if any) clobbers register `var`.
 ///
 /// A direct call clobbers the registers in its target's recorded clobber set,
@@ -332,6 +359,12 @@ fn register_clobber_index(
 struct Promotable {
     vars: HashSet<ValueId>,
     sizes: HashMap<ValueId, usize>,
+    /// Promoted register vars that have *no store to themselves* but are fully,
+    /// low-alignedly covered by a wider register store (e.g. `AL` read in a loop
+    /// while the body writes `EAX`). Their reaching value is sliced out of the
+    /// wider store's source. Threaded into liveness, phi placement and renaming
+    /// so the covering store acts as a definition of the narrow var.
+    sliced: HashSet<ValueId>,
 }
 
 #[derive(Clone, Copy)]
@@ -497,7 +530,10 @@ impl Mem2Reg<'_, '_> {
         (param_id, true)
     }
 
-    fn collect_promotable_vars(&self, live_in_cache: &mut LiveInBlocks) -> Promotable {
+    fn collect_promotable_vars(
+        &self,
+        live_in_cache: &mut HashMap<ValueId, HashSet<BlockId>>,
+    ) -> Promotable {
         let mut stored = HashSet::default();
         let mut loaded = HashSet::default();
         let mut store_counts: HashMap<ValueId, usize> = HashMap::default();
@@ -524,6 +560,8 @@ impl Mem2Reg<'_, '_> {
         //     (e.g. a 4-byte load of an 8-byte-stored register).
         // Promoting either would forward a wrong-width value.
         let mut mixed_width: HashSet<ValueId> = HashSet::default();
+
+        let mut sliced: HashSet<ValueId> = HashSet::default();
 
         for block in Function::from_id(self.ctx, self.function_id).blocks() {
             for insn in block.iter() {
@@ -619,16 +657,35 @@ impl Mem2Reg<'_, '_> {
                     // outside the lockstep helpers. Leave such loads in memory SSA
                     // so the overlap-aware GVN memory pass can forward/slice the
                     // dominating store instead.
-                    let has_overlapping_register_store = register_stores.iter().any(|&store| {
-                        store != var && wider_register_store_contains(self.ctx, store, var)
-                    });
-                    if !has_overlapping_register_store
-                        && self.root_id.is_some_and(|r| {
-                            self.live_in_blocks_cached(var, live_in_cache).contains(&r)
+                    let containing: Vec<ValueId> = register_stores
+                        .iter()
+                        .copied()
+                        .filter(|&store| {
+                            store != var && wider_register_store_contains(self.ctx, store, var)
                         })
-                    {
+                        .collect();
+                    if containing.is_empty() {
+                        if self.root_id.is_some_and(|r| {
+                            self.live_in_blocks_cached(var, &sliced, live_in_cache)
+                                .contains(&r)
+                        }) {
+                            vars.insert(var);
+                        }
+                    } else if containing.iter().all(|&store| {
+                        register_store_low_aligned_contains(self.ctx, store, var)
+                    }) {
+                        // Every covering store shares the var's start address, so the
+                        // narrow value is the low bytes of the stored value — a slice
+                        // the renamer can synthesize. Promote it as a *sliced* var:
+                        // the covering store acts as its definition (threaded through
+                        // liveness, phi placement and renaming). A var live-in to the
+                        // root (no covering store dominates the read) is still dropped
+                        // by the root-live-in filter below and stays a plain load.
                         vars.insert(var);
+                        sliced.insert(var);
                     }
+                    // A covering store at a non-zero offset (e.g. `AH`) is left in
+                    // memory SSA for the overlap-aware GVN memory pass, as before.
                 } else if !is_store_only || count >= 2 {
                     vars.insert(var);
                 }
@@ -692,37 +749,34 @@ impl Mem2Reg<'_, '_> {
             .iter()
             .copied()
             .filter(|&var| {
-                self.live_in_blocks_cached(var, live_in_cache)
+                self.live_in_blocks_cached(var, &sliced, live_in_cache)
                     .contains(&root_id)
             })
             .collect();
         for var in root_live_in {
             vars.remove(&var);
             sizes.remove(&var);
+            sliced.remove(&var);
         }
 
-        Promotable { vars, sizes }
+        Promotable {
+            vars,
+            sizes,
+            sliced,
+        }
     }
 
     fn insert_block_params(
         &mut self,
         vars: &HashSet<ValueId>,
         sizes: &HashMap<ValueId, usize>,
+        sliced: &HashSet<ValueId>,
         frontier: &HashMap<BlockId, HashSet<BlockId>>,
-        live_in_cache: &mut LiveInBlocks,
+        live_in_cache: &mut HashMap<ValueId, HashSet<BlockId>>,
     ) -> InsertedBlockParams {
         let mut var_params: BlockParamAssignments = HashMap::default();
         let mut changed = false;
         let mut excluded: HashSet<ValueId> = HashSet::default();
-
-        // One pass over the function yields the store-block set for every var,
-        // so `find_phi_insert_positions` is a lookup rather than a full block
-        // rescan per variable.
-        let stores_by_var = {
-            let function = Function::from_id(self.ctx, self.function_id);
-            blocks_storing_to_vars(&function, vars)
-        };
-        let no_store_blocks = HashSet::default();
 
         // `vars` is a `HashSet`, so iterating it directly promotes variables in an
         // order seeded by their value ids' hashes. That order decides block-param
@@ -744,10 +798,11 @@ impl Mem2Reg<'_, '_> {
             };
             let var_name = self.block_param_name_for_var(var);
 
-            let live_in = self.live_in_blocks_cached(var, live_in_cache);
-            let block_containing_store = stores_by_var.get(&var).unwrap_or(&no_store_blocks);
-            let phi_positions =
-                find_phi_insert_positions(block_containing_store, frontier, &live_in);
+            let live_in = self.live_in_blocks_cached(var, sliced, live_in_cache);
+            let phi_positions = {
+                let function = Function::from_id(self.ctx, self.function_id);
+                find_phi_insert_positions(self.ctx, var, &function, sliced, frontier, &live_in)
+            };
 
             // A block param is only meaningful if every incoming edge can supply
             // its argument. Branch/CBranch edges are wired by `merge_branch_args`,
@@ -815,147 +870,92 @@ impl Mem2Reg<'_, '_> {
             })
     }
 
-    /// Memoized live-in blocks for `var` (see [`LiveInBlocks`]). The returned set
-    /// is cloned so the caller may freely take further `&mut self` borrows; the
-    /// clone is cheap relative to the liveness propagation.
-    fn live_in_blocks_cached(&self, var: ValueId, cache: &mut LiveInBlocks) -> HashSet<BlockId> {
-        cache.get(self.ctx, var, self.aliases)
+    /// Memoized [`live_in_blocks`]. The returned set is cloned from the cache so
+    /// the caller may freely take further `&mut self` borrows; the clone is cheap
+    /// relative to recomputing the liveness fixpoint.
+    fn live_in_blocks_cached(
+        &self,
+        var: ValueId,
+        sliced: &HashSet<ValueId>,
+        cache: &mut HashMap<ValueId, HashSet<BlockId>>,
+    ) -> HashSet<BlockId> {
+        cache
+            .entry(var)
+            .or_insert_with(|| {
+                live_in_blocks(self.ctx, self.function_id, var, sliced, self.aliases)
+            })
+            .clone()
     }
 }
 
-/// How the call terminating a block clobbers register vars, classified once per
-/// block so liveness need not re-read the terminator (and re-fetch the callee's
-/// clobber set) for every variable.
-enum CallClobber {
-    /// A `CallInd`, or a `Call` whose target has no recorded clobber set:
-    /// conservatively clobbers every register var.
-    All,
-    /// A `Call` with a known clobbered-register set (overlap decided per var).
-    Regs(Vec<VarnodeId>),
-}
-
-/// Precomputed inputs for per-variable live-in analysis, shared across every
-/// variable in one mem2reg run.
+/// Blocks into which `var` is live-in.
 ///
-/// A block is live-in for `var` if it has an upward-exposed use of `var` (a load
-/// not preceded by a store to it in that block), or a successor is live-in and
-/// the block does not define `var`. A call that clobbers `var` counts as a
-/// definition: a read reachable only through that call is the call's *output*,
-/// not a value flowing in from the entry (this keeps a post-call register read of
-/// e.g. `RAX` from being promoted to a spurious root parameter).
-///
-/// The store / upward-exposed block sets and the call classification are gathered
-/// in a single sweep over the function, so each variable's liveness is only the
-/// backward propagation from its seeds — turning the old O(vars × instructions)
-/// per-var rescan into one O(instructions) sweep plus cheap per-var work. Results
-/// are memoized because `collect_promotable_vars` and `insert_block_params` query
-/// the same variables.
-struct LiveInBlocks {
-    /// Blocks containing a store to the pointer (a definition site).
-    store_blocks: HashMap<ValueId, HashSet<BlockId>>,
-    /// Blocks with an upward-exposed load of the pointer — the liveness seeds.
-    upward_exposed: HashMap<ValueId, HashSet<BlockId>>,
-    /// Call-terminated blocks and what each clobbers.
-    call_blocks: Vec<(BlockId, CallClobber)>,
-    /// The function's own blocks. The backward liveness walk stays inside this
-    /// set: a tail-call edge into another function is a real CFG predecessor
-    /// edge, but following it would let a foreign block flip this function's
-    /// live-in decisions.
-    blocks: HashSet<BlockId>,
-    /// Memoized live-in sets, keyed by variable.
-    memo: HashMap<ValueId, HashSet<BlockId>>,
-}
+/// A call that clobbers `var` counts as a definition of it: a read of `var`
+/// reachable only through that call is the call's *output*, not a value flowing
+/// in from the function entry. This keeps a post-call register read (e.g. a
+/// caller reading the callee's `RAX`/`EAX` result) from being treated as a
+/// function input and promoted to a spurious root parameter.
+fn live_in_blocks(
+    ctx: &Context,
+    function_id: FunctionId,
+    var: ValueId,
+    sliced: &HashSet<ValueId>,
+    aliases: &AliasResult,
+) -> HashSet<BlockId> {
+    let mut upward_exposed = HashSet::default();
+    let mut defined = HashSet::default();
+    let var_is_sliced = sliced.contains(&var);
 
-impl LiveInBlocks {
-    fn new(ctx: &Context, function_id: FunctionId) -> Self {
-        let mut store_blocks: HashMap<ValueId, HashSet<BlockId>> = HashMap::default();
-        let mut upward_exposed: HashMap<ValueId, HashSet<BlockId>> = HashMap::default();
-        let mut call_blocks = Vec::new();
-        let mut blocks: HashSet<BlockId> = HashSet::default();
-        let mut stored_here: HashSet<ValueId> = HashSet::default();
+    for block in Function::from_id(ctx, function_id).blocks() {
+        let block_id = block.id;
+        let mut has_def = false;
 
-        for block in Function::from_id(ctx, function_id).blocks() {
-            let block_id = block.id;
-            blocks.insert(block_id);
-            stored_here.clear();
-            for insn in block.iter() {
-                match insn.mnemonic() {
-                    Mnemonic::Store(Store { ptr, .. }) => {
-                        store_blocks.entry(*ptr).or_default().insert(block_id);
-                        stored_here.insert(*ptr);
-                    }
-                    Mnemonic::Load(Load { ptr, .. }) if !stored_here.contains(ptr) => {
-                        upward_exposed.entry(*ptr).or_default().insert(block_id);
-                    }
-                    _ => {}
+        for insn in block.iter() {
+            match insn.mnemonic() {
+                // A store to the var itself, or — for a sliced var — a wider store
+                // that low-alignedly covers it, fully defines the var's bytes.
+                Mnemonic::Store(Store { ptr, .. })
+                    if *ptr == var
+                        || (var_is_sliced
+                            && register_store_low_aligned_contains(ctx, *ptr, var)) =>
+                {
+                    has_def = true;
                 }
-            }
-
-            match block.iter().last().map(|i| i.mnemonic().clone()) {
-                Some(Mnemonic::CallInd(_)) => call_blocks.push((block_id, CallClobber::All)),
-                Some(Mnemonic::Call(call)) => {
-                    let clobber = match Function::from_id(ctx, call.target).clobbered_regs() {
-                        Some(regs) => CallClobber::Regs(regs.to_vec()),
-                        None => CallClobber::All,
-                    };
-                    call_blocks.push((block_id, clobber));
+                Mnemonic::Load(Load { ptr, .. }) if *ptr == var && !has_def => {
+                    upward_exposed.insert(block_id);
                 }
                 _ => {}
             }
         }
 
-        Self {
-            store_blocks,
-            upward_exposed,
-            call_blocks,
-            blocks,
-            memo: HashMap::default(),
+        if call_clobbers_var(ctx, block_id, var, aliases) {
+            has_def = true;
+        }
+
+        if has_def {
+            defined.insert(block_id);
         }
     }
 
-    /// Memoized live-in block set for `var`.
-    fn get(&mut self, ctx: &Context, var: ValueId, aliases: &AliasResult) -> HashSet<BlockId> {
-        if let Some(cached) = self.memo.get(&var) {
-            return cached.clone();
-        }
-        let live_in = self.compute(ctx, var, aliases);
-        self.memo.insert(var, live_in.clone());
-        live_in
-    }
-
-    fn compute(&self, ctx: &Context, var: ValueId, aliases: &AliasResult) -> HashSet<BlockId> {
-        // A store defines `var`; a call that clobbers it does too (only register
-        // vars can be call-clobbered).
-        let mut defined = self.store_blocks.get(&var).cloned().unwrap_or_default();
-        if register_varnode(ctx, var).is_some() {
-            for (block_id, clobber) in &self.call_blocks {
-                let clobbers = match clobber {
-                    CallClobber::All => true,
-                    CallClobber::Regs(regs) => regs
-                        .iter()
-                        .any(|&c| aliases.may_alias(ctx, ValueId::Varnode(c), var)),
-                };
-                if clobbers {
-                    defined.insert(*block_id);
-                }
+    let mut live_in = upward_exposed;
+    let mut changed = true;
+    while changed {
+        changed = false;
+        for block in Function::from_id(ctx, function_id).blocks() {
+            if defined.contains(&block.id) || live_in.contains(&block.id) {
+                continue;
+            }
+            if block
+                .successors()
+                .any(|(_, successor)| live_in.contains(&successor))
+            {
+                live_in.insert(block.id);
+                changed = true;
             }
         }
-
-        // Propagate backward from the upward-exposed seeds to predecessors,
-        // stopping where `var` is defined. Each block enters the worklist at most
-        // once, so this is O(edges in the live region) rather than an O(B²)
-        // re-sweep to a fixpoint.
-        let mut live_in = self.upward_exposed.get(&var).cloned().unwrap_or_default();
-        let mut worklist: Vec<BlockId> = live_in.iter().copied().collect();
-        while let Some(block_id) = worklist.pop() {
-            for (_, pred) in BasicBlock::from_id(ctx, block_id).predecessors() {
-                if self.blocks.contains(&pred) && !defined.contains(&pred) && live_in.insert(pred) {
-                    worklist.push(pred);
-                }
-            }
-        }
-        live_in
     }
+
+    live_in
 }
 
 struct BranchEdge<'a> {
@@ -982,11 +982,6 @@ impl Mem2Reg<'_, '_> {
         edge: BranchEdge<'_>,
         state: &mut RenameState<'_>,
     ) -> Vec<ValueId> {
-        // A tail-call edge into another function's entry carries that function's
-        // own params, meaningless to wire from this promotion; leave it untouched.
-        if !self.in_function(edge.target) {
-            return edge.existing_args.to_vec();
-        }
         let param_count = BasicBlock::from_id(self.ctx, edge.target).params().count();
 
         // Seed every slot with the argument already on the branch (from a prior run).
@@ -1217,6 +1212,15 @@ impl Mem2Reg<'_, '_> {
         let clobbered = clobbered_vars
             .iter()
             .copied()
+            // A sliced var this store low-alignedly covers is *defined*, not
+            // clobbered — `define_sliced_vars` installs its precise value right
+            // after. Excluding it here also keeps this store off the preserved
+            // list on its account, so a genuinely dead wider store stays
+            // removable.
+            .filter(|&var| {
+                !(state.sliced.contains(&var)
+                    && register_store_low_aligned_contains(self.ctx, stored_ptr, var))
+            })
             .map(|var| {
                 let reaching_store = match decide_variable_value(var, &state.frames) {
                     Some(FrameEntry::Defined(ReachingValue {
@@ -1228,6 +1232,9 @@ impl Mem2Reg<'_, '_> {
                 (var, reaching_store)
             })
             .collect::<Vec<_>>();
+        if clobbered.is_empty() {
+            return;
+        }
 
         let frame = state.frames.last_mut().unwrap();
         state.preserved_stores.insert(store_insn);
@@ -1238,58 +1245,74 @@ impl Mem2Reg<'_, '_> {
             frame.insert(var, FrameEntry::Clobbered);
         }
     }
+
+    /// Install the sliced-var definitions a store contributes: for every sliced
+    /// register var the store low-alignedly covers, its reaching value becomes
+    /// the stored source (sliced to width on each later forward/edge by the
+    /// resize the renamer already applies). Recorded with `store_insn: None` so
+    /// the covering store is never marked consumed/dead on the slice's behalf —
+    /// the narrow var only reads the SSA value, not the store's memory effect.
+    fn define_sliced_vars(
+        &self,
+        block: BlockId,
+        stored_ptr: ValueId,
+        src: ValueId,
+        state: &mut RenameState<'_>,
+    ) {
+        if state.sliced.is_empty() {
+            return;
+        }
+        let covered: Vec<ValueId> = state
+            .sliced
+            .iter()
+            .copied()
+            .filter(|&var| register_store_low_aligned_contains(self.ctx, stored_ptr, var))
+            .collect();
+        let frame = state.frames.last_mut().unwrap();
+        for var in covered {
+            frame.insert(
+                var,
+                FrameEntry::Defined(ReachingValue {
+                    _defining_block: block,
+                    value: src,
+                    store_insn: None,
+                }),
+            );
+        }
+    }
 }
 
-#[cfg(test)]
-fn block_contains_store_to_var(block: &BlockRef, var: ValueId) -> bool {
+fn block_contains_store_to_var(
+    ctx: &Context,
+    block: &BlockRef,
+    var: ValueId,
+    var_is_sliced: bool,
+) -> bool {
     block.iter().any(|insn| {
         if let Mnemonic::Store(Store { ptr, .. }) = insn.mnemonic() {
             *ptr == var
+                || (var_is_sliced && register_store_low_aligned_contains(ctx, *ptr, var))
         } else {
             false
         }
     })
 }
 
-/// Blocks that contain a `Store` to `var`. Single-var form; production uses the
-/// batched [`blocks_storing_to_vars`] instead.
-#[cfg(test)]
-fn blocks_storing_to_var(function: &FunctionRef, var: ValueId) -> HashSet<BlockId> {
-    function
-        .iter()
-        .filter(|b| block_contains_store_to_var(b, var))
-        .map(|b| b.id)
-        .collect()
-}
-
-/// For each promotable var in `vars`, the set of blocks that store to it,
-/// computed in a single pass over the function. This replaces rescanning every
-/// block once per variable inside `find_phi_insert_positions` (which was
-/// quadratic — vars × instructions — and the dominant mem2reg cost on large
-/// functions).
-fn blocks_storing_to_vars(
-    function: &FunctionRef,
-    vars: &HashSet<ValueId>,
-) -> HashMap<ValueId, HashSet<BlockId>> {
-    let mut map: HashMap<ValueId, HashSet<BlockId>> = HashMap::default();
-    for block in function.iter() {
-        let bid = block.id;
-        for insn in block.iter() {
-            if let Mnemonic::Store(Store { ptr, .. }) = insn.mnemonic()
-                && vars.contains(ptr)
-            {
-                map.entry(*ptr).or_default().insert(bid);
-            }
-        }
-    }
-    map
-}
-
 fn find_phi_insert_positions(
-    block_containing_store: &HashSet<BlockId>,
+    ctx: &Context,
+    var: ValueId,
+    function: &FunctionRef,
+    sliced: &HashSet<ValueId>,
     frontier: &HashMap<BlockId, HashSet<BlockId>>,
     live_in: &HashSet<BlockId>,
 ) -> HashSet<BlockId> {
+    let var_is_sliced = sliced.contains(&var);
+    let block_containing_store = function
+        .blocks()
+        .filter(|b| block_contains_store_to_var(ctx, b, var, var_is_sliced))
+        .map(|b| b.id)
+        .collect::<HashSet<_>>();
+
     let mut worklist: Vec<BlockId> = block_containing_store.iter().copied().collect();
     let mut result = HashSet::default();
 
@@ -1332,6 +1355,9 @@ type Frame = HashMap<ValueId, FrameEntry>;
 struct RenameState<'a> {
     var_params: &'a BlockParamAssignments,
     vars: &'a HashSet<ValueId>,
+    /// Sliced register vars (see [`Promotable::sliced`]). A covering wider store
+    /// defines these instead of clobbering them.
+    sliced: &'a HashSet<ValueId>,
     register_clobbers: HashMap<ValueId, Vec<ValueId>>,
     visited: HashSet<BlockId>,
     frames: Vec<Frame>,
@@ -1345,12 +1371,14 @@ impl<'a> RenameState<'a> {
     fn new(
         var_params: &'a BlockParamAssignments,
         vars: &'a HashSet<ValueId>,
+        sliced: &'a HashSet<ValueId>,
         register_clobbers: HashMap<ValueId, Vec<ValueId>>,
         changed: bool,
     ) -> Self {
         Self {
             var_params,
             vars,
+            sliced,
             register_clobbers,
             visited: HashSet::default(),
             frames: vec![Frame::default()],
@@ -1375,25 +1403,7 @@ fn decide_variable_value(var: ValueId, frames: &[Frame]) -> Option<FrameEntry> {
 }
 
 impl Mem2Reg<'_, '_> {
-    /// True if `block` belongs to the function being promoted.
-    ///
-    /// A tail-call `Branch`/`CBranch` names another function's *entry* as its
-    /// terminator target — a legitimate inter-procedural jump (the CFG edge is
-    /// stripped by `split`'s `remove_cross_function_edges`, but the terminator
-    /// still records the target). The rename walk follows terminator targets, so
-    /// it must stop at that boundary itself — exactly like `claimed_from` in
-    /// split.rs — rather than descend into a foreign function's blocks, whose
-    /// loads reference the same globally-interned stack slots yet have no
-    /// reaching definition in *this* function's promotion.
-    fn in_function(&self, block: BlockId) -> bool {
-        BasicBlock::from_id(self.ctx, block).parent().map(|f| f.id) == Some(self.function_id)
-    }
-
     fn decide_values_start_from(&mut self, block: BlockId, state: &mut RenameState<'_>) {
-        // Never cross a tail-call boundary into another function's blocks.
-        if !self.in_function(block) {
-            return;
-        }
         if state.visited.contains(&block) {
             return;
         }
@@ -1462,6 +1472,7 @@ impl Mem2Reg<'_, '_> {
                         );
                     }
                     self.clobber_overlapping_register_vars(ptr, insn_id, state);
+                    self.define_sliced_vars(block, ptr, src, state);
                 }
 
                 Mnemonic::Load(Load { ptr, size, .. }) if state.vars.contains(&ptr) => {
@@ -1633,9 +1644,9 @@ impl Mem2Reg<'_, '_> {
     /// The promoted register vars in `vars` clobbered by call terminator `call`.
     ///
     /// Computed once per call block: the callee's clobber set is fetched a single
-    /// time rather than re-derived per var. A `CallInd`, or a callee with no
-    /// recorded clobber set, is treated conservatively as clobbering every
-    /// promoted register var.
+    /// time rather than re-derived per var (as a per-var [`call_clobbers_var`]
+    /// would). A `CallInd`, or a callee with no recorded clobber set, is treated
+    /// conservatively as clobbering every promoted register var.
     fn call_clobbered_register_vars(
         &self,
         call: &Mnemonic,
@@ -1735,10 +1746,11 @@ mod tests {
         let dom = compute_dominators(&ctx, function.root().unwrap().id);
         let frontier = dom.dominator_frontier();
         let aliases = AliasResult::simple(&ctx);
-        let live_in = LiveInBlocks::new(&ctx, test).get(&ctx, A.into(), &aliases);
+        let sliced = HashSet::default();
+        let live_in = live_in_blocks(&ctx, test, A.into(), &sliced, &aliases);
 
-        let stores = blocks_storing_to_var(&function, A.into());
-        let result = find_phi_insert_positions(&stores, frontier, &live_in);
+        let result =
+            find_phi_insert_positions(&ctx, A.into(), &function, &sliced, frontier, &live_in);
 
         let named_result = result
             .iter()
@@ -1874,8 +1886,9 @@ mod tests {
             (loop_header, HashSet::from_iter([loop_header])),
         ]);
 
-        let stores = blocks_storing_to_var(&function, A.into());
-        let result = find_phi_insert_positions(&stores, &frontier, &live_in);
+        let sliced = HashSet::default();
+        let result =
+            find_phi_insert_positions(&ctx, A.into(), &function, &sliced, &frontier, &live_in);
 
         assert_eq!(result, HashSet::from_iter([loop_header]));
     }
@@ -1978,10 +1991,11 @@ mod tests {
         let dom = compute_dominators(&ctx, function.root().unwrap().id);
         let frontier = dom.dominator_frontier();
         let aliases = AliasResult::simple(&ctx);
-        let live_in = LiveInBlocks::new(&ctx, test).get(&ctx, A.into(), &aliases);
+        let sliced = HashSet::default();
+        let live_in = live_in_blocks(&ctx, test, A.into(), &sliced, &aliases);
 
-        let stores = blocks_storing_to_var(&function, A.into());
-        let result = find_phi_insert_positions(&stores, frontier, &live_in);
+        let result =
+            find_phi_insert_positions(&ctx, A.into(), &function, &sliced, frontier, &live_in);
 
         let named_result = result
             .iter()
@@ -2222,11 +2236,15 @@ mod tests {
         );
     }
 
+    /// A low-aligned sub-register read (`AL`) covered by a wider register store
+    /// (`EAX`) is *sliced* out of the stored value during renaming: the narrow
+    /// load is forwarded (and removed), not left dangling. With a constant store
+    /// the slice folds to the low byte of the constant. This is the read-side
+    /// dual of the `clobber_overlapping_register_vars` sub-register-splice TODO,
+    /// and supersedes the earlier conservative behaviour where the byte load was
+    /// kept and deferred to the GVN memory pass.
     #[test]
-    #[ignore = "regression on the argpromote branch: an overlapping full-register \
-                store is wrongly eliminated while a subregister load still reads \
-                state derived from it. Fix on this branch before merge."]
-    fn overlapping_store_survives_when_subregister_load_remains() {
+    fn subregister_load_is_sliced_from_overlapping_full_store() {
         use qcode::{builder::Builder, testing::TestContext};
 
         let mut tc = TestContext::new();
@@ -2241,35 +2259,146 @@ mod tests {
             .set_root(block_id)
             .unwrap();
 
-        let full_store;
+        let byte_store;
         let byte_load;
         {
             let mut b = Builder::from_context(&mut tc.ctx, 0x1000);
             let value = b.context_mut().get_const(0x12345678, 4).id();
-            full_store = b.push_store(value, full, tc.reg_space).id;
+            b.push_store(value, full, tc.reg_space);
             let full_load = b.push_load::<false>(full, 4, tc.reg_space).id();
             b.push_store(full_load, full_sink, tc.reg_space);
             byte_load = b.push_load::<false>(low_byte, 1, tc.reg_space).id();
-            b.push_store(byte_load, byte_sink, tc.reg_space);
+            byte_store = b.push_store(byte_load, byte_sink, tc.reg_space).id;
             unsafe { b.dont_finalize() };
         }
 
         let aliases = AliasResult::simple(&tc.ctx);
         mem2reg(&mut tc.ctx, fun_id, &aliases);
 
-        let ValueId::Instruction(byte_load_id) = byte_load else {
-            panic!("push_load should produce an instruction value");
-        };
         let block = BasicBlock::from_id(&tc.ctx, block_id);
         assert!(
-            block.instruction_ids().contains(&full_store),
-            "the full-register store must remain because the later byte load \
-             reads register state derived from it:\n{block}"
+            !block
+                .iter()
+                .any(|i| matches!(i.mnemonic(), Mnemonic::Load(_))),
+            "both the full and the sliced byte load should be forwarded away:\n{block}"
         );
+        // The byte sink receives the low byte of the stored constant: 0x78.
+        let Mnemonic::Store(Store { src, .. }) =
+            Instruction::from_id(&tc.ctx, byte_store).mnemonic()
+        else {
+            panic!("byte sink store vanished");
+        };
+        let ValueId::Literal(lit) = src else {
+            panic!("expected the sliced byte to fold to a constant, got {src:?}");
+        };
+        assert_eq!(
+            tc.ctx.values.literals[*lit].value, 0x78,
+            "the slice is the low byte of 0x12345678"
+        );
+    }
+
+    /// The motivating loop (the `410f50` string-copy shape): a loop body writes a
+    /// full register (`EAX`) and reads its low byte (`AL`) at the top, so `AL` is
+    /// loop-carried. The low-aligned slice promotes `AL` to a byte-wide phi at the
+    /// loop header; the register load disappears, the back-edge carries the slice
+    /// of the body's store, and the entry edge the slice of the seed.
+    #[test]
+    fn subregister_read_in_loop_is_sliced_to_a_phi() {
+        let mut tc = qcode::testing::TestContext::new();
+        let r0_lo32 = tc.r0_lo32;
+        let r0_byte0 = tc.r0_byte0;
+        let r1 = tc.r1;
+        let r2 = tc.r2;
+        let r3 = tc.r3;
+
+        qcode!(
+            tc.ctx,
+            "
+                fn func:
+                    <entry>
+                        store({r0_lo32}, i32 0x12345678);
+                        goto <body>;
+                    <body>
+                        %al = load(i8, {r0_byte0});
+                        store({r3}, %al);
+                        %next = load(i32, {r1});
+                        store({r0_lo32}, %next);
+                        %c = load(i8, {r2});
+                        if %c goto <body> else goto <exit>;
+                    <exit>
+                        return [0x1000];
+            "
+        );
+
+        let aliases = AliasResult::simple(&tc.ctx);
+        let changed = mem2reg(&mut tc.ctx, func, &aliases);
+        assert!(changed, "the sliced AL should be promoted");
+
+        let body_block = BasicBlock::from_id(&tc.ctx, body);
+        // The loop header gains a 1-byte phi carrying AL around the back-edge.
         assert!(
-            block.instruction_ids().contains(&byte_load_id),
-            "the sub-register load should remain after the overlapping full \
-             register write clobbers its promoted entry value:\n{block}"
+            body_block
+                .params()
+                .any(|p| BlockParam::from_id(&tc.ctx, p.id).size() == 1),
+            "the loop header should gain a 1-byte phi for the sliced AL:\n{body_block}"
+        );
+        // The narrow AL load is forwarded away (sliced from the EAX store).
+        assert!(
+            !body_block.iter().any(|i| matches!(
+                i.mnemonic(),
+                Mnemonic::Load(Load { ptr, .. }) if *ptr == ValueId::Varnode(r0_byte0)
+            )),
+            "the AL load should be sliced from the wider EAX store, not left in place:\n{body_block}"
+        );
+    }
+
+    /// A sub-register read at a *non-zero* offset (`AH`, `r0_byte1`) is not
+    /// low-aligned in the covering `EAX` store, so slicing it would need a shift
+    /// this pass does not synthesize. It stays a register load (deferred to the
+    /// GVN memory pass), and no phi is minted for it.
+    #[test]
+    fn non_low_aligned_subregister_read_in_loop_is_not_sliced() {
+        let mut tc = qcode::testing::TestContext::new();
+        let r0_lo32 = tc.r0_lo32;
+        let r0_byte1 = tc.r0_byte1;
+        let r1 = tc.r1;
+        let r2 = tc.r2;
+        let r3 = tc.r3;
+
+        qcode!(
+            tc.ctx,
+            "
+                fn func:
+                    <entry>
+                        store({r0_lo32}, i32 0x12345678);
+                        goto <body>;
+                    <body>
+                        %ah = load(i8, {r0_byte1});
+                        store({r3}, %ah);
+                        %next = load(i32, {r1});
+                        store({r0_lo32}, %next);
+                        %c = load(i8, {r2});
+                        if %c goto <body> else goto <exit>;
+                    <exit>
+                        return [0x1000];
+            "
+        );
+
+        let aliases = AliasResult::simple(&tc.ctx);
+        mem2reg(&mut tc.ctx, func, &aliases);
+
+        let body_block = BasicBlock::from_id(&tc.ctx, body);
+        assert!(
+            body_block.iter().any(|i| matches!(
+                i.mnemonic(),
+                Mnemonic::Load(Load { ptr, .. }) if *ptr == ValueId::Varnode(r0_byte1)
+            )),
+            "the non-low-aligned AH load must stay a register load:\n{body_block}"
+        );
+        assert_eq!(
+            body_block.num_params(),
+            0,
+            "no phi should be minted for the un-sliceable AH read:\n{body_block}"
         );
     }
 
@@ -3129,99 +3258,6 @@ mod tests {
             "the temp store must be kept while its load survives (no v0/v1 leak)"
         );
     }
-
-    /// Regression: the rename walk follows terminator targets, and a tail-call
-    /// `Branch` names another function's entry as its target. Stack-slot literals
-    /// are interned per `(offset, StackAddress)`, so the *same* `ValueId` appears
-    /// in both functions. If the walk descends across that boundary it decides a
-    /// reaching value for this function's promoted slot inside a block it never
-    /// analyzed — and a stack slot with no reaching definition panics by design.
-    /// The walk must stop at the function boundary, like split's `claimed_from`.
-    #[test]
-    fn rename_walk_stops_at_tail_call_into_another_function() {
-        use qcode::{
-            builder::Builder,
-            space::{Space, SpaceType},
-            testing::TestContext,
-        };
-
-        let mut tc = TestContext::new();
-        let ctx = &mut tc.ctx;
-
-        // A StackAddress-typed slot literal `s`, shared (by interning) between the
-        // promoted function and the foreign block it must not descend into.
-        let stack = ctx.add_space(Space {
-            name: Some(Box::from("stack")),
-            word_size: 1,
-            addr_size: 8,
-            ty: SpaceType::Ram,
-        });
-        let sa = ctx.types.get_or_make_stack_address(8, Some(stack));
-        let slot = qcode::types::stack_base(8).wrapping_sub(8);
-        let s = ValueId::Literal(ctx.values.get_or_make_typed_literal(slot, sa, 8));
-
-        // Function A promotes `s` (stored+loaded on one CBranch arm); the other
-        // arm tail-jumps into function B, which loads `s`. Neither `a_entry` nor
-        // the tail arm defines `s`, so on the tail path `s` has no reaching value.
-        let a = Function::make(ctx, "promoted".into()).unwrap().id;
-        let a_entry = ctx.get_or_make_block(0x1000);
-        let a_store = ctx.get_or_make_block(0x1100);
-        let a_tail = ctx.get_or_make_block(0x1200);
-        {
-            let mut fr = Function::from_id_mut(ctx, a);
-            fr.set_root(a_entry).unwrap();
-            fr.add_block(a_store);
-            fr.add_block(a_tail);
-        }
-
-        let b = Function::make(ctx, "callee".into()).unwrap().id;
-        let b_entry = ctx.get_or_make_block(0x2000);
-        Function::from_id_mut(ctx, b).set_root(b_entry).unwrap();
-
-        // a_entry: if 1 goto a_store else goto a_tail
-        {
-            let mut bld = Builder::from_block(BasicBlock::from_id_mut(ctx, a_entry));
-            let cond = bld.context_mut().get_const(1u64, 1).id();
-            bld.push_cbranch(cond, a_store, a_tail);
-        }
-        // a_store: store(s, 0x42); load(s); return  -> makes `s` promotable in A
-        {
-            let mut bld = Builder::from_block(BasicBlock::from_id_mut(ctx, a_store));
-            let val = bld.context_mut().get_const(0x42u64, 8).id();
-            bld.push_store(val, s, stack);
-            bld.push_load::<false>(s, 8, stack);
-            let ret = bld.context_mut().get_const(0u64, 8).id();
-            bld.push_return(ret);
-        }
-        // a_tail: goto b_entry  (a tail jump into function B, no store of `s`)
-        {
-            let mut bld = Builder::from_block(BasicBlock::from_id_mut(ctx, a_tail));
-            bld.push_branch(b_entry);
-        }
-        // b_entry: load(s); return  (foreign block reading the shared slot)
-        let b_load = {
-            let mut bld = Builder::from_block(BasicBlock::from_id_mut(ctx, b_entry));
-            let load = bld.push_load::<false>(s, 8, stack).id();
-            let ret = bld.context_mut().get_const(0u64, 8).id();
-            bld.push_return(ret);
-            load
-        };
-
-        // Without the boundary guard this panics decoding `s` in `b_entry`.
-        let aliases = AliasResult::simple(&*ctx);
-        mem2reg(ctx, a, &aliases);
-
-        // The foreign load is untouched — the walk never entered function B.
-        let ValueId::Instruction(b_load) = b_load else {
-            unreachable!()
-        };
-        assert!(
-            BasicBlock::from_id(ctx, b_entry)
-                .instruction_ids()
-                .contains(&b_load),
-            "the rename walk must not cross into another function's block",
-        );
-    }
 }
 
 // ----- pass ------------------------------------------------------------------
@@ -3242,8 +3278,8 @@ impl FunctionPass for Mem2RegPass {
         fun_id: FunctionId,
         env: &PipelineEnv,
     ) -> Result<bool, String> {
-        // Per-function pass: scope the alias oracle to this function so the
-        // stage is O(program) total, not O(functions × program).
+        // Per-function pass: scope the alias oracle to this function so the stage
+        // is O(program) total, not O(functions × program).
         let aliases = AliasResult::simple_for_function(ctx, fun_id);
         // Resolve `@SP` so canonical `@SP ± N` slots are recognised; `None` when
         // the function has no incoming stack-pointer param (legacy literal path).
