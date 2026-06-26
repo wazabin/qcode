@@ -15,6 +15,7 @@ use crate::{
     error::{Error, ErrorTy, Result},
     value::{
         BasicBlock, BlockId, BlockRef, Instruction, Value, ValueId, Varnode, VarnodeId,
+        insn::{Branch, Mnemonic},
         util::{
             base_ref::{BaseRef, WithCtx, WithCtxMut},
             named::{Named, Renameable, update_context_name},
@@ -349,6 +350,10 @@ where
     /// id. Derived from the IR on demand — like [`BlockRef::successors`] reading
     /// the CFG — so it always reflects the current instructions. Indirect calls
     /// have no static target and are not included.
+    ///
+    /// A tail jump into another function's entry — the `Branch` a thunk or
+    /// tail-call emits instead of a [`Call`](Mnemonic::Call) — is also a call
+    /// edge and is included; see [`tail_call_target`].
     pub fn callees(&'s self) -> Vec<FunctionId> {
         let ctx = self.ctx();
         let mut callees = self
@@ -357,6 +362,7 @@ where
                 block
                     .instructions()
                     .filter_map(|insn| insn.mnemonic().call_target())
+                    .chain(tail_call_target(ctx, block.id))
                     .collect::<Vec<_>>()
             })
             .collect::<Vec<_>>();
@@ -390,6 +396,21 @@ where
                     .map(|function| function.id)
             })
             .collect::<Vec<_>>();
+
+        // Tail-call/thunk callers reach us through a `Branch` into our entry
+        // rather than a recorded call site, so they are absent from the reverse
+        // call-graph map. Recover them from the entry block's CFG predecessors:
+        // any predecessor in another function whose terminator tail-jumps here.
+        if let Some(root) = self.root() {
+            for (_edge, pred_id) in root.predecessors() {
+                if tail_call_target(ctx, pred_id) == Some(self.id) {
+                    if let Some(caller) = BasicBlock::from_id(ctx, pred_id).function() {
+                        callers.push(caller.id);
+                    }
+                }
+            }
+        }
+
         callers.sort_by_key(|&id| Into::<usize>::into(id));
         callers.dedup();
         callers
@@ -434,6 +455,25 @@ where
         }
         Ok(())
     }
+}
+
+/// If `block`'s terminator is an unconditional `Branch` into the *entry* of a
+/// *different* function, return that function — the call-graph edge a thunk or
+/// tail call produces (`jmp realfunc`) instead of a [`Call`](Mnemonic::Call).
+///
+/// Returns `None` for a fall-through branch within the same function, a branch
+/// into the middle of another function (not a call), or any non-`Branch`
+/// terminator. Shared by [`Function::callees`] and [`Function::callers`] so both
+/// directions of the graph agree on what counts as a tail-call edge.
+fn tail_call_target(ctx: &Context, block: BlockId) -> Option<FunctionId> {
+    let block = BasicBlock::from_id(ctx, block);
+    let Mnemonic::Branch(Branch { target, .. }) = block.instructions().last()?.mnemonic() else {
+        return None;
+    };
+    let caller = block.function()?.id;
+    let callee = BasicBlock::from_id(ctx, *target).function()?;
+    let enters_at_entry = callee.root().map(|root| root.id) == Some(*target);
+    (enters_at_entry && callee.id != caller).then_some(callee.id)
 }
 
 pub type FunctionRef<'str, 'ctx> = BaseRef<&'ctx Context<'str>, FunctionId>;
@@ -719,6 +759,66 @@ mod tests {
     use qcode_macro::qcode;
 
     use super::*;
+
+    /// A tail jump (`Branch`) into another function's entry is a call edge in
+    /// both directions of the graph, even though the IR has no `Call`.
+    #[test]
+    fn tail_jump_into_entry_is_a_call_edge() {
+        use crate::builder::Builder;
+
+        let mut ctx = Context::new();
+
+        // Callee at 0x2000: a single block that returns.
+        let callee = Function::make_at_addr(&mut ctx, 0x2000, None).id;
+        let callee_entry = BasicBlock::make(&mut ctx).with_address(0x2000).id;
+        let zero = ctx.get_const(0, 8).id();
+        Builder::from_block(BasicBlock::from_id_mut(&mut ctx, callee_entry)).push_return(zero);
+        Function::from_id_mut(&mut ctx, callee)
+            .set_root(callee_entry)
+            .unwrap();
+
+        // Thunk at 0x1000: a lone `jmp` into the callee's entry.
+        let thunk = Function::make_at_addr(&mut ctx, 0x1000, None).id;
+        let thunk_entry = BasicBlock::make(&mut ctx).with_address(0x1000).id;
+        Builder::from_block(BasicBlock::from_id_mut(&mut ctx, thunk_entry)).push_branch(callee_entry);
+        ctx.add_cfg_edge(thunk_entry, callee_entry);
+        Function::from_id_mut(&mut ctx, thunk)
+            .set_root(thunk_entry)
+            .unwrap();
+
+        assert_eq!(Function::from_id(&ctx, thunk).callees(), vec![callee]);
+        assert_eq!(Function::from_id(&ctx, callee).callers(), vec![thunk]);
+    }
+
+    /// A `Branch` into the *middle* of another function is not a call edge — a
+    /// call enters at the entry, not at an interior block.
+    #[test]
+    fn tail_jump_into_interior_block_is_not_a_call_edge() {
+        use crate::builder::Builder;
+
+        let mut ctx = Context::new();
+
+        let callee = Function::make_at_addr(&mut ctx, 0x2000, None).id;
+        let callee_entry = BasicBlock::make(&mut ctx).with_address(0x2000).id;
+        let interior = BasicBlock::make(&mut ctx).with_address(0x2008).id;
+        let zero = ctx.get_const(0, 8).id();
+        Builder::from_block(BasicBlock::from_id_mut(&mut ctx, interior)).push_return(zero);
+        Function::from_id_mut(&mut ctx, callee).add_block(interior);
+        Function::from_id_mut(&mut ctx, callee)
+            .set_root(callee_entry)
+            .unwrap();
+
+        let thunk = Function::make_at_addr(&mut ctx, 0x1000, None).id;
+        let thunk_entry = BasicBlock::make(&mut ctx).with_address(0x1000).id;
+        Builder::from_block(BasicBlock::from_id_mut(&mut ctx, thunk_entry)).push_branch(interior);
+        ctx.add_cfg_edge(thunk_entry, interior);
+        Function::from_id_mut(&mut ctx, thunk)
+            .set_root(thunk_entry)
+            .unwrap();
+
+        assert!(Function::from_id(&ctx, thunk).callees().is_empty());
+        assert!(Function::from_id(&ctx, callee).callers().is_empty());
+    }
 
     #[test]
     fn make_function_creates_function_with_correct_name_root_address() {

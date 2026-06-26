@@ -2099,4 +2099,172 @@ mod tests {
             "post-rewrite IR must verify: {problems:?}"
         );
     }
+
+    /// Keep-loop extraction: the buffer loop *also* threads a register accumulator
+    /// (`@acc`, the obfuscator's clobbered `EDX`-style value) that escapes into the
+    /// return envelope. The loop is therefore not deletable, but the array channel
+    /// is still a clean total map. The recognizer must extract `map(body, arr)` for
+    /// the buffer write-set value while leaving the loop running for `@acc`.
+    #[test]
+    fn keep_loop_extracts_map_when_register_escapes() {
+        let mut tc = qcode::testing::TestContext::new();
+        let input = stack_input(&mut tc, 4, 8);
+
+        qcode!(
+            tc.ctx,
+            "
+            fn f:
+                <f_entry @stack_10000004:i64>
+                    goto <f_head @i=i64 0x0 @acc=i64 0x0>;
+                <f_head @i:i64 @acc:i64>
+                    %c = @i < i64 0x14;
+                    if %c goto <f_body> else goto <f_exit>;
+                <f_body>
+                    %addr = @stack_10000004 + @i;
+                    %b = load(i8, %addr);
+                    %nb = %b + i8 0x1;
+                    store(%addr, %nb);
+                    %ni = @i + i64 0x1;
+                    %nacc = @acc + @i;
+                    goto <f_head @i=%ni @acc=%nacc>;
+                <f_exit>
+                    %r = pack(EDX=@acc);
+                    return [@acc];
+
+            fn g:
+                <g_entry>
+                    goto <g_call>;
+                <g_call>
+                    call <f>;
+                <g_cont>
+                    return [i64 0];
+            "
+        );
+        let _ = (g, f_head, f_body, f_exit, f_entry, r);
+
+        Function::from_id_mut(&mut tc.ctx, f).set_input_regs(vec![input]);
+        Function::from_id_mut(&mut tc.ctx, f).set_pure_reg(true);
+        let ptr = tc.ctx.get_const(0x4000, 8).id();
+        set_call(&mut tc, g_call, f, vec![ptr]);
+        tc.ctx.add_cfg_edge(g_call, g_cont);
+
+        assert!(argpromote(&mut tc.ctx), "step 1 region promotion");
+        mark_pure_functions(&mut tc.ctx);
+        assert!(
+            crate::calls::loop_to_map::recognize_total_maps(&mut tc.ctx),
+            "the array channel should be recognized as a map even though @acc escapes"
+        );
+
+        // f contains a `map` over the Array snapshot for the buffer write-set value.
+        let map_src = Function::from_id(&tc.ctx, f).iter().find_map(|b| {
+            b.iter().find_map(|i| match i.mnemonic() {
+                Mnemonic::Map(m) => Some(m.src),
+                _ => None,
+            })
+        });
+        let map_src = map_src.expect("f must contain a map");
+        assert!(
+            tc.ctx
+                .stored_type_of(map_src)
+                .and_then(|t| tc.ctx.types.array_of(t))
+                .is_some(),
+            "the map source is the Array snapshot"
+        );
+
+        // The outlined per-element body is a fresh pure function.
+        assert!(
+            tc.ctx
+                .function_ids()
+                .into_iter()
+                .any(|fid| Function::from_id(&tc.ctx, fid).name().contains("_map_body")),
+            "the per-element body was outlined"
+        );
+
+        // The loop is *kept*: the header/body survive so @acc keeps being computed.
+        // (Contrast `dynamic_index_loop_becomes_map`, where the private loop is
+        // deleted down to entry + exit.)
+        assert!(
+            Function::from_id(&tc.ctx, f).iter().count() > 2,
+            "the residual @acc loop must remain"
+        );
+        let has_cbranch = Function::from_id(&tc.ctx, f)
+            .iter()
+            .any(|b| b.iter().any(|i| matches!(i.mnemonic(), Mnemonic::CBranch(_))));
+        assert!(has_cbranch, "the loop's header branch must remain");
+
+        // No shadow store survives (seed + per-lane store stripped); the now-dead
+        // per-lane load is left for a later DCE, so we don't assert its absence.
+        let any_store = Function::from_id(&tc.ctx, f).iter().any(|b| {
+            b.iter().any(|i| matches!(i.mnemonic(), Mnemonic::Store(s)
+                if matches!(qcode::space::Space::from_id(&tc.ctx, s.space).ty, qcode::space::SpaceType::Temporary)))
+        });
+        assert!(!any_store, "no shadow store should remain in f");
+
+        // The rewritten IR verifies clean (no dangling refs, valid terminators).
+        let problems = crate::verify::verify(&tc.ctx);
+        assert!(
+            problems.is_empty(),
+            "post-rewrite IR must verify: {problems:?}"
+        );
+    }
+
+    /// Soundness guard for the keep-loop path: when the escaping accumulator reads
+    /// the *array element* (`@acc += buf[i]`), the array channel is not separable —
+    /// extracting a map and stripping the lane load would lose the data the
+    /// accumulator needs. The recognizer must refuse (no map, loop untouched).
+    #[test]
+    fn keep_loop_refuses_when_element_leaks_to_escaping_result() {
+        let mut tc = qcode::testing::TestContext::new();
+        let input = stack_input(&mut tc, 4, 8);
+
+        qcode!(
+            tc.ctx,
+            "
+            fn f:
+                <f_entry @stack_10000004:i64>
+                    goto <f_head @i=i64 0x0 @acc=i64 0x0>;
+                <f_head @i:i64 @acc:i64>
+                    %c = @i < i64 0x14;
+                    if %c goto <f_body> else goto <f_exit>;
+                <f_body>
+                    %addr = @stack_10000004 + @i;
+                    %b = load(i8, %addr);
+                    %nb = %b + i8 0x1;
+                    store(%addr, %nb);
+                    %ni = @i + i64 0x1;
+                    %bw = zext(i64, %b);
+                    %nacc = @acc + %bw;
+                    goto <f_head @i=%ni @acc=%nacc>;
+                <f_exit>
+                    %r = pack(EDX=@acc);
+                    return [@acc];
+
+            fn g:
+                <g_entry>
+                    goto <g_call>;
+                <g_call>
+                    call <f>;
+                <g_cont>
+                    return [i64 0];
+            "
+        );
+        let _ = (g, f_head, f_body, f_exit, f_entry, r);
+
+        Function::from_id_mut(&mut tc.ctx, f).set_input_regs(vec![input]);
+        Function::from_id_mut(&mut tc.ctx, f).set_pure_reg(true);
+        let ptr = tc.ctx.get_const(0x4000, 8).id();
+        set_call(&mut tc, g_call, f, vec![ptr]);
+        tc.ctx.add_cfg_edge(g_call, g_cont);
+
+        assert!(argpromote(&mut tc.ctx), "step 1 region promotion");
+        mark_pure_functions(&mut tc.ctx);
+        assert!(
+            !crate::calls::loop_to_map::recognize_total_maps(&mut tc.ctx),
+            "the element leaks into @acc, so the array channel is not separable"
+        );
+        let has_map = Function::from_id(&tc.ctx, f)
+            .iter()
+            .any(|b| b.iter().any(|i| matches!(i.mnemonic(), Mnemonic::Map(_))));
+        assert!(!has_map, "no map may be extracted when the element leaks");
+    }
 }
