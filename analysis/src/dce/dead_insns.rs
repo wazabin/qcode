@@ -436,6 +436,7 @@ impl FunctionPass for Dce {
         fun_id: FunctionId,
         _env: &PipelineEnv,
     ) -> Result<bool, String> {
+        let root = FunctionRef::from_id(ctx, fun_id).root().map(|b| b.id);
         let block_ids: Vec<_> = FunctionRef::from_id(ctx, fun_id)
             .blocks()
             .map(|b| b.id)
@@ -443,13 +444,16 @@ impl FunctionPass for Dce {
         let mut changed = false;
         // Loop to fixed point: rewriting a dead pure call into a branch can make
         // its argument-producing instructions (Extracts, etc.) unused, which the
-        // dead-instruction sweep then removes, and so on.
+        // dead-instruction sweep then removes, and so on. Dropping a useless block
+        // argument likewise strips the predecessor's arg-producing value, which
+        // can then become dead — so the block-arg sweep joins the same fixpoint.
         loop {
             let mut round = false;
             for &block_id in &block_ids {
                 round |= remove_dead_pure_call(ctx, block_id);
                 round |= remove_dead_insns(ctx, block_id);
             }
+            round |= super::remove_dead_block_args(ctx, &block_ids, root);
             if !round {
                 break;
             }
