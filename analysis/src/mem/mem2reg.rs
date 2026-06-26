@@ -1114,13 +1114,25 @@ impl Mem2Reg<'_, '_> {
         // load reading an undefined location (the SLEIGH `v0`/`v1` unique-space
         // leak), so those stores fall back to the consumed/dead guard below.
         let mut vars_with_surviving_loads: HashSet<ValueId> = HashSet::default();
+        // Register loads left *unpromoted* — e.g. a narrow sub-register read (`CL`)
+        // declined by `has_overlapping_register_store` because a wider overlapping
+        // store (`ECX`) exists. The decline defers such a load to the overlap-aware
+        // GVN memory pass to slice out of "the dominating store", which assumes that
+        // store still exists. So a register store that *contains* one of these loads
+        // must not be removed here (even when it is a dead overwrite): dropping it
+        // would strand the narrow load as a free register read — a spurious live-in —
+        // silently discarding the value the wider store carried.
+        let mut unpromoted_register_loads: Vec<ValueId> = Vec::new();
         for &block_id in &block_ids {
             for &insn_id in BasicBlock::from_id(self.ctx, block_id).instruction_ids() {
                 if let Mnemonic::Load(Load { ptr, .. }) =
                     Instruction::from_id(self.ctx, insn_id).mnemonic()
-                    && vars.contains(ptr)
                 {
-                    vars_with_surviving_loads.insert(*ptr);
+                    if vars.contains(ptr) {
+                        vars_with_surviving_loads.insert(*ptr);
+                    } else if register_varnode(self.ctx, *ptr).is_some() {
+                        unpromoted_register_loads.push(*ptr);
+                    }
                 }
             }
         }
@@ -1136,6 +1148,15 @@ impl Mem2Reg<'_, '_> {
                     continue;
                 };
                 if !vars.contains(ptr) {
+                    continue;
+                }
+                // A wider register store an unpromoted narrow load overlaps is the
+                // slice source that load was deferred to — keep it (see above).
+                if register_varnode(self.ctx, *ptr).is_some()
+                    && unpromoted_register_loads
+                        .iter()
+                        .any(|&load| wider_register_store_contains(self.ctx, *ptr, load))
+                {
                     continue;
                 }
                 // For register-space varnodes, preserve live-out stores (callee-save
@@ -2320,6 +2341,77 @@ mod tests {
             cont_block.instruction_ids().contains(&post_load_id),
             "the post-call read of r0 must survive as a register load, not be \
              forwarded to the pre-call value:\n{cont_block}"
+        );
+    }
+
+    /// Regression: a wide register write (`r0`, the `ECX` analog) followed by a
+    /// read of its low byte (`r0_byte0`, the `CL` analog) must not leave the byte
+    /// read orphaned. mem2reg declines to promote the narrow load because a wider
+    /// overlapping store exists (`has_overlapping_register_store`), deferring it to
+    /// a later overlap-aware GVN slice of "the dominating store". But if mem2reg
+    /// *also* removes that wider store — here the first `r0` write is dead, being
+    /// overwritten by the second with no intervening `r0` (full-width) read; the
+    /// byte read is a different varnode and does not count as a use — then the
+    /// deferral target is gone and the narrow load dangles as a free register read
+    /// (treated as a function live-in), silently discarding the computed value.
+    ///
+    /// The invariant: mem2reg must not delete the wide store while leaving an
+    /// unpromoted overlapping narrow load behind. A fix may either keep the
+    /// dominating store (so GVN can slice it) or slice the byte out of the promoted
+    /// value during renaming (the read-side dual of the
+    /// `clobber_overlapping_register_vars` sub-register-splice TODO).
+    ///
+    /// Fixed by preserving a register store an unpromoted overlapping narrow load
+    /// depends on (see `remove_promoted_stores`); originally surfaced by the
+    /// argpromote `fn_40b970` investigation.
+    #[test]
+    fn narrow_subregister_read_is_not_orphaned_by_wide_store_removal() {
+        use qcode::{builder::Builder, testing::TestContext};
+
+        let mut tc = TestContext::new();
+        let (r0, r0_byte0, r2, r3, reg) =
+            (tc.r0, tc.r0_byte0, tc.r2, tc.r3, tc.reg_space);
+
+        let f = Function::make(&mut tc.ctx, "f".into()).unwrap().id;
+        let entry = tc.ctx.get_or_make_block(0x1000);
+        Function::from_id_mut(&mut tc.ctx, f).set_root(entry).unwrap();
+
+        let (c1_store, byte_load);
+        {
+            let mut b = Builder::from_context(&mut tc.ctx, 0x1000);
+            // Compute a wide value into r0 (the `ECX` build).
+            let v = b.push_load::<false>(ValueId::Varnode(r2), 8, reg).id();
+            let one = b.context_mut().get_const(1u64, 8).id();
+            let c1 = b.push_add(v, one).id();
+            c1_store = b.push_store(c1, ValueId::Varnode(r0), reg).id;
+            // Read the low byte (the `mov [mem], cl` source) and make it observable.
+            let byte_val = b.push_load::<false>(ValueId::Varnode(r0_byte0), 1, reg).id();
+            let ValueId::Instruction(byte_load_id) = byte_val else {
+                unreachable!("a load is an instruction value")
+            };
+            byte_load = byte_load_id;
+            b.push_store(byte_val, ValueId::Varnode(r3), reg);
+            // Overwrite r0, making the c1 store a dead overwrite that mem2reg drops.
+            let c2 = b.context_mut().get_const(0u64, 8).id();
+            b.push_store(c2, ValueId::Varnode(r0), reg);
+            let ret = b.context_mut().get_const(0u64, 8).id();
+            b.push_return(ret);
+            unsafe { b.dont_finalize() };
+        }
+
+        let aliases = AliasResult::simple(&tc.ctx);
+        mem2reg(&mut tc.ctx, f, &aliases);
+
+        let entry_block = BasicBlock::from_id(&tc.ctx, entry);
+        let ids = entry_block.instruction_ids();
+        let wide_store_removed = !ids.contains(&c1_store);
+        let byte_load_survives = ids.contains(&byte_load);
+        assert!(
+            !(wide_store_removed && byte_load_survives),
+            "mem2reg orphaned the narrow r0_byte0 read: it removed the wider r0 store \
+             (the deferred GVN slice's source) while leaving the byte load dangling as a \
+             live-in. Keep the dominating store or slice the byte from the promoted \
+             value.\n{entry_block}"
         );
     }
 
