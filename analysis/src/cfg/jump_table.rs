@@ -810,6 +810,54 @@ mod tests {
         );
     }
 
+    /// A bitwise-`&` of two booleans (`(a != 0) & (b != 0)`) bounds the index to
+    /// `{0,1}` on its own — no dominating guard — so the two-slot table resolves
+    /// to a `CBranch`. Mirrors `two_targets_with_zero_case` for the `&` index
+    /// form a compiler emits when both sides are already 0/1.
+    #[test]
+    fn bitwise_and_index_resolves_two_targets() {
+        let mut ctx = Context::new();
+        let targets = [0x1100u64, 0x1200];
+
+        qcode!(
+            ctx,
+            "
+            varnode i64 A;
+            varnode i64 B;
+            fn fun:
+            <disp>
+                %a = load(i64, &A);
+                %b = load(i64, &B);
+                %na = %a != 0x0;
+                %nb = %b != 0x0;
+                %and = %na & %nb;
+                %idx = zext(i64, %and);
+                %off = %idx * 0x8;
+                %addr = i64 0x2000 + %off;
+                %t = load(i64, %addr);
+                goto [%t];
+            "
+        );
+
+        add_code(&mut ctx, 0x1000, 0x1000);
+        let mut table = Vec::new();
+        for t in targets {
+            table.extend_from_slice(&t.to_le_bytes());
+        }
+        add_rodata(&mut ctx, 0x2000, table);
+
+        let changed = run_function_pass::<HandleJumpTables>(&mut ctx, fun).unwrap();
+        assert!(changed);
+
+        assert_eq!(successor_count(&ctx, disp), 2);
+        assert!(matches!(terminator(&ctx, disp), Mnemonic::CBranch(_)));
+        // Index 0 is the false case, so the guard is `index != 0`.
+        assert!(
+            cbranch_compares_against(&ctx, disp, 0),
+            "expected `index != 0` guard",
+        );
+    }
+
     /// A block that already carries the lifter's jump-table edges (the clean-IR
     /// state after `discover_code` connects the targets) must still be rewritten
     /// from `BranchInd` to a `CBranch`, and must not end up with doubled edges.

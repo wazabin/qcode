@@ -2369,12 +2369,13 @@ mod tests {
         use qcode::{builder::Builder, testing::TestContext};
 
         let mut tc = TestContext::new();
-        let (r0, r0_byte0, r2, r3, reg) =
-            (tc.r0, tc.r0_byte0, tc.r2, tc.r3, tc.reg_space);
+        let (r0, r0_byte0, r2, r3, reg) = (tc.r0, tc.r0_byte0, tc.r2, tc.r3, tc.reg_space);
 
         let f = Function::make(&mut tc.ctx, "f".into()).unwrap().id;
         let entry = tc.ctx.get_or_make_block(0x1000);
-        Function::from_id_mut(&mut tc.ctx, f).set_root(entry).unwrap();
+        Function::from_id_mut(&mut tc.ctx, f)
+            .set_root(entry)
+            .unwrap();
 
         let (c1_store, byte_load);
         {
@@ -2385,7 +2386,9 @@ mod tests {
             let c1 = b.push_add(v, one).id();
             c1_store = b.push_store(c1, ValueId::Varnode(r0), reg).id;
             // Read the low byte (the `mov [mem], cl` source) and make it observable.
-            let byte_val = b.push_load::<false>(ValueId::Varnode(r0_byte0), 1, reg).id();
+            let byte_val = b
+                .push_load::<false>(ValueId::Varnode(r0_byte0), 1, reg)
+                .id();
             let ValueId::Instruction(byte_load_id) = byte_val else {
                 unreachable!("a load is an instruction value")
             };

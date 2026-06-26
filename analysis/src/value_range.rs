@@ -308,13 +308,17 @@ impl Solver<'_> {
                         let b = self.range(rhs, depth + 1);
                         or(a, b, mask)
                     }
-                    // `x & c` can clear bits anywhere, so the min is 0; the
-                    // result can exceed neither operand's max.
+                    // `x & y` can clear bits anywhere, so the min is 0; the
+                    // result can exceed neither operand's max. With two symbolic
+                    // operands the tighter of their maxima still bounds it — e.g.
+                    // a `bool & bool` switch index stays `{0,1}` rather than Top.
                     IntBinop::And => {
+                        let a = self.range(lhs, depth + 1).max;
+                        let b = self.range(rhs, depth + 1).max;
                         let bound = match (numeric_const(ctx, lhs), numeric_const(ctx, rhs)) {
-                            (_, Some(c)) => self.range(lhs, depth + 1).max.min(c),
-                            (Some(c), _) => self.range(rhs, depth + 1).max.min(c),
-                            (None, None) => return top,
+                            (_, Some(c)) => a.min(c),
+                            (Some(c), _) => b.min(c),
+                            (None, None) => a.min(b),
                         };
                         ValueRange { min: 0, max: bound }
                     }
@@ -819,6 +823,36 @@ mod tests {
         );
 
         let r = value_range(&ctx, b.into(), entry);
+        assert_eq!((r.min, r.max), (0, 1));
+
+        let r = value_range(&ctx, idx.into(), entry);
+        assert_eq!((r.min, r.max), (0, 1));
+        assert_eq!(r.count(), 2);
+    }
+
+    /// The bitwise-`&` form a compiler emits when both sides are already 0/1
+    /// (`(a != 0) & (b != 0)`) must stay `{0,1}` too, even though neither
+    /// operand is a constant — `a & b <= min(a.max, b.max)`.
+    #[test]
+    fn bitwise_and_of_booleans_is_two_valued() {
+        let mut ctx = Context::new();
+        qcode!(
+            ctx,
+            "
+            varnode i64 A;
+            varnode i64 B;
+            <entry>
+                %a = load(i64, &A);
+                %b = load(i64, &B);
+                %na = %a != 0x0;
+                %nb = %b != 0x0;
+                %and = %na & %nb;
+                %idx = zext(i32, %and);
+                goto <0x1001>;
+            "
+        );
+
+        let r = value_range(&ctx, and.into(), entry);
         assert_eq!((r.min, r.max), (0, 1));
 
         let r = value_range(&ctx, idx.into(), entry);
