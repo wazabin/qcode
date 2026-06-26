@@ -390,6 +390,17 @@ where
         })
     }
 
+    /// Whether this function contains at least one [`Map`](Mnemonic::Map)
+    /// instruction — a lane-wise array map operation. Surfaced as an advanced
+    /// filter in the function list.
+    pub fn has_map(&'s self) -> bool {
+        self.blocks().any(|block| {
+            block
+                .instructions()
+                .any(|insn| matches!(insn.mnemonic(), Mnemonic::Map(_)))
+        })
+    }
+
     /// The functions that directly call this one, deduplicated and ordered by
     /// id. Reads the reverse call graph maintained alongside the use-def map and
     /// resolves each call site to its enclosing function. Counterpart of
