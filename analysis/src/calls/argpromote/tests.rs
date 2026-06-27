@@ -259,6 +259,117 @@ mod tests {
         );
     }
 
+    /// A constant real-ram address used as a load/store base is lifted to a
+    /// `glob_<addr>` parameter: the access is rewritten to dereference the param,
+    /// no constant-address access remains, and every direct caller passes the
+    /// address literal as the new argument.
+    #[test]
+    fn lifts_constant_global_address_to_param() {
+        let mut tc = qcode::testing::TestContext::new();
+        qcode!(
+            tc.ctx,
+            "
+            fn f:
+                <f_entry>
+                    %p = load(i32, 0x454df8);
+                    store(0x454df8, i32 0x270);
+                    return [i64 0];
+
+            fn g:
+                <g_entry>
+                    goto <g_call>;
+                <g_call>
+                    call <f>;
+                <g_cont>
+                    return [i64 0];
+            "
+        );
+        let _ = g;
+        Function::from_id_mut(&mut tc.ctx, f).set_pure_reg(true);
+        let call_id = set_call(&mut tc, g_call, f, vec![]);
+        tc.ctx.add_cfg_edge(g_call, g_cont);
+
+        assert!(
+            super::super::globals::globalize_constants(&mut tc.ctx, f),
+            "constant global address must be lifted to a param"
+        );
+
+        // f gains a `glob_454df8` param.
+        let pnames: Vec<String> = Function::from_id(&tc.ctx, f)
+            .root()
+            .unwrap()
+            .params()
+            .filter_map(|p| p.name().map(str::to_string))
+            .collect();
+        assert!(
+            pnames.iter().any(|n| n == "glob_454df8"),
+            "glob param added: {pnames:?}"
+        );
+
+        // No constant-address real-ram access remains in f's body.
+        let const_access = Function::from_id(&tc.ctx, f)
+            .iter()
+            .flat_map(|b| b.iter())
+            .any(|i| match i.mnemonic() {
+                Mnemonic::Load(l) => matches!(l.ptr, ValueId::Literal(_)),
+                Mnemonic::Store(s) => matches!(s.ptr, ValueId::Literal(_)),
+                _ => false,
+            });
+        assert!(
+            !const_access,
+            "every constant-address access is rewritten to deref the param"
+        );
+
+        // The caller threads the address literal as the new last argument.
+        let Mnemonic::Call(call) = tc.ctx.get_insn(call_id).mnemonic().clone() else {
+            panic!("g_call is a call");
+        };
+        assert_eq!(call.args.len(), 1, "address threaded to the caller");
+        assert!(
+            matches!(call.args[0], ValueId::Literal(_)),
+            "caller passes the address literal"
+        );
+    }
+
+    /// An address-taken function must not be globalized: an indirect caller this
+    /// pass cannot rewrite would be left without the new argument.
+    #[test]
+    fn skips_address_taken_function_for_globals() {
+        let mut tc = qcode::testing::TestContext::new();
+        qcode!(
+            tc.ctx,
+            "
+            fn f:
+                <f_entry>
+                    %p = load(i32, 0x454df8);
+                    return [i64 0];
+
+            fn g:
+                <g_entry>
+                    return [i64 0];
+            "
+        );
+        Function::from_id_mut(&mut tc.ctx, f).set_pure_reg(true);
+
+        // Take f's address: store the function value somewhere in g, so
+        // `is_address_taken(f)` holds.
+        let addr = tc.ctx.get_const(0x9000, 8).id();
+        {
+            let mut b = Builder::from_block(BasicBlock::from_id_mut(&mut tc.ctx, g_entry));
+            b.set_insert_point_to_start();
+            b.push_store(ValueId::Function(f), addr, tc.reg_space);
+        }
+
+        assert!(
+            super::super::is_address_taken(&tc.ctx, f),
+            "test setup: f must be address-taken"
+        );
+        assert!(
+            !super::super::globals::globalize_constants(&mut tc.ctx, f),
+            "address-taken function must be left untouched"
+        );
+    }
+
     /// Whether `f`'s root has a by-value snapshot param (a promoted read).
     fn has_val_param(ctx: &Context, f: FunctionId) -> bool {
         Function::from_id(ctx, f).root().is_some_and(|b| {
@@ -335,13 +446,13 @@ mod tests {
         );
     }
 
+    /// End-to-end globalize: a store to a *constant* global address used to be an
+    /// unmodellable access that forced partial (inputs-only) mode. Globalize now
+    /// lifts `0x9000` into a `glob_9000` param, so the access is param-relative and
+    /// the RAM channel fully functionalizes the write into the returned write-set.
+    /// The caller passes the address literal in and replays the global write.
     #[test]
-    fn partial_mode_is_inputs_only_no_writeset() {
-        // A pointer param written through (an in/out write) AND leaked (its address
-        // stored to memory) escapes, so the shadow path is unavailable. Partial mode
-        // is **inputs-only**: with no *reads* to expose, there is nothing to promote.
-        // The write is left in place (correct, just not functionalized) and no
-        // write-set is surfaced.
+    fn global_store_is_functionalized_and_replayed_at_caller() {
         let mut tc = qcode::testing::TestContext::new();
         let input = stack_input(&mut tc, 4, 8);
         qcode!(
@@ -369,31 +480,47 @@ mod tests {
         let call_id = set_call(&mut tc, g_call, f, vec![ptr]);
         tc.ctx.add_cfg_edge(g_call, g_cont);
 
-        // No reads to expose → inputs-only partial mode promotes nothing.
-        assert!(
-            !argpromote(&mut tc.ctx),
-            "a write-only leaked function has no reads to expose, so partial mode is a no-op"
-        );
+        assert!(argpromote(&mut tc.ctx), "the global write functionalizes");
 
-        // The in-place store survives untouched (still in real ram).
-        let ram = tc.ctx.default_space;
+        // f gained a `glob_9000` param for the lifted constant address, and no
+        // constant-address access remains in its body.
+        let pnames: Vec<String> = Function::from_id(&tc.ctx, f)
+            .root()
+            .unwrap()
+            .params()
+            .filter_map(|p| p.name().map(str::to_string))
+            .collect();
         assert!(
-            Function::from_id(&tc.ctx, f).blocks().any(|b| b.iter().any(
-                |i| matches!(i.mnemonic(), Mnemonic::Store(s) if s.space == ram && s.size == 4)
-            )),
-            "the original in-place store must survive"
+            pnames.iter().any(|n| n == "glob_9000"),
+            "glob param added: {pnames:?}"
         );
+        let const_access = Function::from_id(&tc.ctx, f)
+            .iter()
+            .flat_map(|b| b.iter())
+            .any(|i| match i.mnemonic() {
+                Mnemonic::Load(l) => matches!(l.ptr, ValueId::Literal(_)),
+                Mnemonic::Store(s) => matches!(s.ptr, ValueId::Literal(_)),
+                _ => false,
+            });
+        assert!(!const_access, "no constant-address access remains in f");
 
-        // No write-set was surfaced, so the caller has no replay extract.
+        // The caller threads the address literal `0x9000` as an argument …
+        let Mnemonic::Call(call) = tc.ctx.get_insn(call_id).mnemonic().clone() else {
+            panic!("g_call is a call");
+        };
+        let passes_addr = call.args.iter().any(|&a| match qcode::value::ValueRef::new(a, &tc.ctx) {
+            qcode::value::ValueRef::Literal(l) => l.value() == 0x9000,
+            _ => false,
+        });
+        assert!(passes_addr, "caller passes the global address literal");
+
+        // … and replays the functionalized write-set out of the call result.
         let has_replay = Function::from_id(&tc.ctx, g).iter().any(|b| {
             b.iter().any(
                 |i| matches!(i.mnemonic(), Mnemonic::Extract(e) if e.agg == ValueId::Instruction(call_id)),
             )
         });
-        assert!(
-            !has_replay,
-            "inputs-only partial mode surfaces no write-set to replay"
-        );
+        assert!(has_replay, "caller replays the returned global write-set");
     }
 
     #[test]

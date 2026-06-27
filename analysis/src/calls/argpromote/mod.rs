@@ -63,6 +63,7 @@ use qcode::{
 use super::append_entry_param;
 
 mod external;
+mod globals;
 mod mark_pure;
 mod ram;
 mod registers;

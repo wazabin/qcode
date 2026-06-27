@@ -83,6 +83,12 @@ pub fn argpromote_with_sp(ctx: &mut Context, sp_reg: Option<VarnodeId>) -> bool 
     // be promoted — its own loads gone — for the caller to qualify. One visit per
     // function (no fixpoint), so an already-promoted body is never re-promoted.
     for fid in callee_first_order(ctx) {
+        // Lift constant-address (global) accesses into params first, so the freshly
+        // param-relative derefs are visible to `try_promote`'s footprint scan in the
+        // same visit.
+        if super::globals::globalize_constants(ctx, fid) {
+            changed = true;
+        }
         if try_promote(ctx, fid, shadow, sp_reg) {
             changed = true;
         }
