@@ -454,6 +454,7 @@ impl FunctionPass for Dce {
                 round |= remove_dead_insns(ctx, block_id);
             }
             round |= super::remove_dead_block_args(ctx, &block_ids, root);
+            round |= super::remove_dead_block_params(ctx, &block_ids, root);
             if !round {
                 break;
             }

@@ -132,6 +132,134 @@ pub fn remove_dead_block_args(
     changed
 }
 
+/// Remove block parameters that are *dead by liveness*: a param whose value is
+/// never observed — it feeds no real instruction, no branch condition, no call or
+/// return — and only flows, around branch edges, into other equally-dead params.
+///
+/// This is the complement of [`remove_dead_block_args`]. That pass collapses a
+/// param whose incoming values all *agree* (a redundant φ); this one drops a param
+/// whose value is *unused* regardless of what it carries. The motivating case is a
+/// loop register that is recomputed every iteration from the induction variable
+/// and threaded around the back-edge but never read (e.g. `<40b3f0>`'s `@EAX`,
+/// flags, `@EIP`): each iteration binds a *distinct* value, so it is not redundant,
+/// yet it is a back-edge argument, so a use-counting instruction DCE sees it as
+/// live. Only a transitive liveness fixpoint over the param graph removes it.
+///
+/// A param is live iff:
+///   * it is an operand of some non-branch instruction, a `CBranch` condition, an
+///     indirect branch/call pointer, a call argument, or the return slot
+///     (a *direct* use — the value is observed), **or**
+///   * it is passed, on a `Branch`/`CBranch` edge, into a param that is itself live
+///     (it is observed indirectly, through the live param it feeds).
+///
+/// Root (entry) and `protected` params are seeded live: they are the function
+/// interface / pinned, never removed, and they keep their sources alive. The pass
+/// iterates to a fixpoint over the forwarding edges, then drops every param that
+/// stays dead, stripping the matching predecessor argument columns.
+///
+/// Returns whether anything was removed.
+pub fn remove_dead_block_params(
+    ctx: &mut Context,
+    block_ids: &[BlockId],
+    root: Option<BlockId>,
+) -> bool {
+    // Seed: directly-used params. Edges: forwarding (src param -> target param) on
+    // every branch-argument slot.
+    let mut live: HashSet<BlockParamId> = HashSet::default();
+    let mut edges: Vec<(BlockParamId, BlockParamId)> = Vec::new();
+
+    let mark = |v: ValueId, live: &mut HashSet<BlockParamId>| {
+        if let ValueId::BlockParam(p) = v {
+            live.insert(p);
+        }
+    };
+
+    for &block in block_ids {
+        let insns: Vec<_> = BasicBlock::from_id(ctx, block).iter().map(|i| i.id).collect();
+        for id in insns {
+            match ctx.get_insn(id).mnemonic() {
+                Mnemonic::Branch(b) => forward_edges(ctx, &b.args, b.target, &mut edges),
+                Mnemonic::CBranch(c) => {
+                    // The condition is a real read; only the per-target argument
+                    // lists are forwarding edges.
+                    if let ValueId::BlockParam(p) = c.condition {
+                        live.insert(p);
+                    }
+                    forward_edges(ctx, &c.success_args, c.success_block, &mut edges);
+                    forward_edges(ctx, &c.failure_args, c.failure_block, &mut edges);
+                }
+                // Every other instruction (incl. indirect branch/call pointers,
+                // call args, the return slot) observes all of its operands.
+                other => {
+                    for v in other.args() {
+                        mark(v, &mut live);
+                    }
+                }
+            }
+        }
+    }
+
+    // Seed root + protected params live, then propagate liveness backwards along
+    // the forwarding edges to a fixpoint: a param feeding a live param is live.
+    if let Some(root) = root {
+        for &p in &ctx.values.basic_blocks[root].params {
+            live.insert(p);
+        }
+    }
+    for &(src, _) in &edges {
+        if ctx.values.block_params[src].protected {
+            live.insert(src);
+        }
+    }
+    loop {
+        let mut grew = false;
+        for &(src, tgt) in &edges {
+            if live.contains(&tgt) && live.insert(src) {
+                grew = true;
+            }
+        }
+        if !grew {
+            break;
+        }
+    }
+
+    // Collect dead params per block (protected params are always seeded live, so
+    // they never appear here; root params likewise).
+    let mut dead_by_block: rustc_hash::FxHashMap<BlockId, HashSet<usize>> = Default::default();
+    for &block in block_ids {
+        let params = ctx.values.basic_blocks[block].params.clone();
+        for (index, &p) in params.iter().enumerate() {
+            if !live.contains(&p) {
+                dead_by_block.entry(block).or_default().insert(index);
+            }
+        }
+    }
+
+    if dead_by_block.is_empty() {
+        return false;
+    }
+    for (block, indices) in dead_by_block {
+        remove_params_from_block(ctx, block, &indices);
+    }
+    true
+}
+
+/// Record a forwarding edge `src_param -> target_param` for each branch argument
+/// at `target`'s matching param slot that is itself a block parameter.
+fn forward_edges(
+    ctx: &Context,
+    args: &[ValueId],
+    target: BlockId,
+    edges: &mut Vec<(BlockParamId, BlockParamId)>,
+) {
+    let params = &ctx.values.basic_blocks[target].params;
+    for (i, &a) in args.iter().enumerate() {
+        if let (ValueId::BlockParam(src), Some(&tgt)) = (a, params.get(i)) {
+            edges.push((src, tgt));
+        }
+    }
+}
+
 /// Scan for the first redundant param: a non-root, non-protected param on a block
 /// with predecessors whose incoming arguments reduce to a single value `repl`.
 fn find_redundant_param(
@@ -463,5 +591,244 @@ mod tests {
             .find(|s| s.contains("0x5000"))
             .expect("store on 0x5000 survives in b");
         assert!(store.contains("%seed"), "store rewritten to %seed: {store}");
+    }
+
+    // ---- liveness-based dead-param removal (`remove_dead_block_params`) ----
+
+    /// The motivating case (`<40b3f0>`): a loop carries an accumulator `@acc` that
+    /// reads itself (live), an induction `@i` used in the exit test (live), and a
+    /// junk register `@junk` recomputed every iteration *from the index* — never
+    /// read — and threaded around the back-edge. Each iteration binds `@junk` a
+    /// distinct value, so it is not redundant; it is a back-edge arg, so naive DCE
+    /// sees it live. Liveness removes it and keeps the two real carriers.
+    #[test]
+    fn dead_recomputed_register_removed_keeps_carriers() {
+        let mut ctx = Context::new();
+        qcode!(
+            ctx,
+            "
+            fn test:
+            <entry>
+                goto <hdr @acc=0x0 @i=0x0 @junk=0x0>;
+            <hdr @acc:i64 @i:i64 @junk:i64>
+                %na = @acc + @i;
+                store(0x4000, i64 %na);
+                %ni = @i + 0x1;
+                %nj = @i & 0x1;
+                %c = %ni < 0x270;
+                if %c goto <hdr @acc=%na @i=%ni @junk=%nj> else goto <exit>;
+            <exit>
+                return [0x0];
+            "
+        );
+
+        let blocks = block_ids(&ctx, test);
+        let root = root_of(&ctx, test);
+        assert!(remove_dead_block_params(&mut ctx, &blocks, root));
+        assert_eq!(
+            param_names(&ctx, hdr),
+            vec!["acc", "i"],
+            "@junk is dead; @acc (self-read) and @i (exit test) stay"
+        );
+        // The back-edge no longer carries a @junk column.
+        let term = BasicBlock::from_id(&ctx, hdr)
+            .iter()
+            .last()
+            .unwrap()
+            .as_statement()
+            .to_string();
+        assert!(!term.contains("@junk"), "back-edge dropped @junk: {term}");
+    }
+
+    /// A cycle of two params that only forward into each other — neither read by
+    /// any instruction, condition, or return — is a dead SCC and both go.
+    #[test]
+    fn dead_param_cycle_both_removed() {
+        let mut ctx = Context::new();
+        qcode!(
+            ctx,
+            "
+            fn test:
+            <entry>
+                goto <hdr @a=0x0 @b=0x0>;
+            <hdr @a:i64 @b:i64>
+                %i = load(i8, 0x1000);
+                if %i goto <latch @a2=@b @b2=@a> else goto <exit>;
+            <latch @a2:i64 @b2:i64>
+                goto <hdr @a=@a2 @b=@b2>;
+            <exit>
+                return [0x0];
+            "
+        );
+
+        let blocks = block_ids(&ctx, test);
+        let root = root_of(&ctx, test);
+        assert!(remove_dead_block_params(&mut ctx, &blocks, root));
+        assert_eq!(num_params(&ctx, hdr), 0, "@a, @b dead SCC");
+        assert_eq!(num_params(&ctx, latch), 0, "@a2, @b2 dead SCC");
+    }
+
+    /// Soundness: a param that is *not* directly used but forwards into a param
+    /// that IS read must be KEPT — its value is observed indirectly. `@x` is never
+    /// touched in `hdr`, yet it feeds `@y`, which is stored, so `@x` is live.
+    #[test]
+    fn param_forwarding_into_live_param_is_kept() {
+        let mut ctx = Context::new();
+        qcode!(
+            ctx,
+            "
+            fn test:
+            <entry>
+                %s = load(i64, 0x2000);
+                goto <hdr @x=%s>;
+            <hdr @x:i64>
+                %i = load(i8, 0x1000);
+                if %i goto <usr @y=@x> else goto <exit>;
+            <usr @y:i64>
+                store(0x4000, i64 @y);
+                goto <exit>;
+            <exit>
+                return [0x0];
+            "
+        );
+
+        let blocks = block_ids(&ctx, test);
+        let root = root_of(&ctx, test);
+        assert!(!remove_dead_block_params(&mut ctx, &blocks, root));
+        assert_eq!(num_params(&ctx, hdr), 1, "@x feeds the stored @y → live");
+        assert_eq!(num_params(&ctx, usr), 1, "@y is read → live");
+    }
+
+    /// A param read only by the branch *condition* is live and kept.
+    #[test]
+    fn param_used_in_condition_is_kept() {
+        let mut ctx = Context::new();
+        qcode!(
+            ctx,
+            "
+            fn test:
+            <entry>
+                goto <hdr @cnt=0x0>;
+            <hdr @cnt:i64>
+                %n = @cnt + 0x1;
+                %c = @cnt < 0xa;
+                if %c goto <hdr @cnt=%n> else goto <exit>;
+            <exit>
+                return [0x0];
+            "
+        );
+
+        let blocks = block_ids(&ctx, test);
+        let root = root_of(&ctx, test);
+        assert!(!remove_dead_block_params(&mut ctx, &blocks, root));
+        assert_eq!(num_params(&ctx, hdr), 1, "@cnt drives the condition → live");
+    }
+
+    /// A param read only by the `return` slot is live and kept.
+    #[test]
+    fn param_used_by_return_is_kept() {
+        let mut ctx = Context::new();
+        qcode!(
+            ctx,
+            "
+            fn test:
+            <entry>
+                %p = load(i64, 0x2000);
+                goto <ret @r=%p>;
+            <ret @r:i64>
+                return [@r];
+            "
+        );
+
+        let blocks = block_ids(&ctx, test);
+        let root = root_of(&ctx, test);
+        assert!(!remove_dead_block_params(&mut ctx, &blocks, root));
+        assert_eq!(num_params(&ctx, ret), 1, "@r is the return pointer → live");
+    }
+
+    /// Mixed column: one dead and one live param on the same loop header. Only the
+    /// dead column is dropped; the live induction column and its back-edge arg
+    /// survive, re-indexed.
+    #[test]
+    fn dead_column_dropped_live_column_survives() {
+        let mut ctx = Context::new();
+        qcode!(
+            ctx,
+            "
+            fn test:
+            <entry>
+                goto <hdr @i=0x0 @dead=0x0>;
+            <hdr @i:i64 @dead:i64>
+                %ni = @i + 0x1;
+                %nd = @i * 0x3;
+                %c = @i < 0x5;
+                if %c goto <hdr @i=%ni @dead=%nd> else goto <exit>;
+            <exit>
+                return [0x0];
+            "
+        );
+
+        let blocks = block_ids(&ctx, test);
+        let root = root_of(&ctx, test);
+        assert!(remove_dead_block_params(&mut ctx, &blocks, root));
+        assert_eq!(param_names(&ctx, hdr), vec!["i"], "@dead removed, @i kept");
+        let term = BasicBlock::from_id(&ctx, hdr)
+            .iter()
+            .last()
+            .unwrap()
+            .as_statement()
+            .to_string();
+        assert_eq!(term, "if i8 %c goto <hdr @i=i64 %ni> else goto <exit>;");
+    }
+
+    /// Root (entry) params are the function interface and are never removed even
+    /// when no instruction reads them.
+    #[test]
+    fn root_params_not_removed_by_liveness() {
+        let mut ctx = Context::new();
+        qcode!(
+            ctx,
+            "
+            fn test:
+            <root @x:i64 @y:i64>
+                store(0x4000, i64 @x);
+                return [0x0];
+            "
+        );
+
+        let blocks = block_ids(&ctx, test);
+        let root = root_of(&ctx, test);
+        // @y is unused but it is a root param → kept.
+        assert!(!remove_dead_block_params(&mut ctx, &blocks, root));
+        assert_eq!(num_params(&ctx, root.unwrap()), 2);
+    }
+
+    /// A dead param feeds, across two blocks, into another dead param — a forward
+    /// chain with no read anywhere. The whole chain is removed.
+    #[test]
+    fn dead_forward_chain_removed() {
+        let mut ctx = Context::new();
+        qcode!(
+            ctx,
+            "
+            fn test:
+            <entry>
+                %i = load(i8, 0x1000);
+                if %i goto <a @za=0x1> else goto <exit>;
+            <a @za:i64>
+                goto <b @zb=@za>;
+            <b @zb:i64>
+                store(0x4000, 0x9);
+                return [0x0];
+            <exit>
+                return [0x0];
+            "
+        );
+
+        let blocks = block_ids(&ctx, test);
+        let root = root_of(&ctx, test);
+        assert!(remove_dead_block_params(&mut ctx, &blocks, root));
+        assert_eq!(num_params(&ctx, a), 0, "@za never read");
+        assert_eq!(num_params(&ctx, b), 0, "@zb never read");
     }
 }
