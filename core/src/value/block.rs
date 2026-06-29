@@ -274,7 +274,8 @@ where
         let name = self.name().unwrap_or("unnamed");
         write!(f, "<{name}")?;
         for param in self.params() {
-            write!(f, " {param}")?;
+            write!(f, " ")?;
+            param.fmt_decl(f)?;
         }
         writeln!(f, ">")?;
 
@@ -746,8 +747,8 @@ mod tests {
             varnode i64 Y;
 
             <block>
-                %x = load(i64, &X);
-                %y = load(i64, &Y);
+                %x = load(X:8, &X);
+                %y = load(Y:8, &Y);
                 %sum = i64 %x + i64 %y;
                 return at i64 0;
             "
@@ -761,11 +762,11 @@ mod tests {
 
         assert_eq!(
             iter.next().unwrap().as_statement().to_string(),
-            "i64 %x = *[X]:8 X;"
+            "i64 %x = load(X:8, X);"
         );
         assert_eq!(
             iter.next().unwrap().as_statement().to_string(),
-            "i64 %y = *[Y]:8 Y;"
+            "i64 %y = load(Y:8, Y);"
         );
         assert_eq!(
             iter.next().unwrap().as_statement().to_string(),
@@ -788,8 +789,8 @@ mod tests {
             varnode i64 Y;
 
             <block>
-                %x = load(i64, &X);
-                %y = load(i64, &Y);
+                %x = load(X:8, &X);
+                %y = load(Y:8, &Y);
                 %sum = i64 %x + i64 %y;
                 return at i64 0;
             "
@@ -940,7 +941,7 @@ mod tests {
             varnode i8 cond;
 
             <entry>
-                %c = load(i8, cond);
+                %c = load(cond:1, cond);
                 if %c goto <then_lbl> else goto <else_lbl>;
 
             <then_lbl>
@@ -1000,8 +1001,8 @@ mod tests {
             varnode i64 Y;
 
             <block>
-                %x = load(i64, &X);
-                %y = load(i64, &Y);
+                %x = load(X:8, &X);
+                %y = load(Y:8, &Y);
                 %sum = i64 %x + i64 %y;
                 return at i64 0;
             "
@@ -1039,8 +1040,8 @@ mod tests {
             varnode i64 Y;
 
             <block>
-                %x = load(i64, &X);
-                %y = load(i64, &Y);
+                %x = load(X:8, &X);
+                %y = load(Y:8, &Y);
                 %sum = i64 %x + i64 %y;
                 return at i64 0;
             "

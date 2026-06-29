@@ -559,8 +559,8 @@ mod tests {
 
                 fn f:
                     <entry>
-                        %a = load(i32, &A);
-                        %b = load(i32, &B);
+                        %a = load(A:4, &A);
+                        %b = load(B:4, &B);
                         %sum = %a + %b;
                         %and = %a & %b;
                         %dbl = %and << 0x1;
@@ -600,8 +600,8 @@ mod tests {
 
                 fn f:
                     <entry>
-                        %a = load(i32, &A);
-                        %b = load(i32, &B);
+                        %a = load(A:4, &A);
+                        %b = load(B:4, &B);
                         %or = %a | %b;
                         %and = %a & %b;
                         %root = %or - %and;
@@ -632,8 +632,8 @@ mod tests {
 
                 fn f:
                     <entry>
-                        %a = load(i32, &A);
-                        %b = load(i32, &B);
+                        %a = load(A:4, &A);
+                        %b = load(B:4, &B);
                         %or = %a | %b;
                         %and = %a & %b;
                         %root = %or + %and;
@@ -667,7 +667,7 @@ mod tests {
 
                 fn f:
                     <entry>
-                        %i = load(i32, &I);
+                        %i = load(I:4, &I);
                         %n1 = %i ^ 0xffffffff;
                         %n2 = %n1 | 0xfffffffe;
                         %n3 = %n2 ^ 0xffffffff;
@@ -675,7 +675,7 @@ mod tests {
                         %dbl = %n4 * 0x2;
                         %x = %i ^ 0x1;
                         %inc = %dbl + %x;
-                        store(&I, %inc);
+                        store(I:4, &I <- %inc);
                         return at 0x1000;
                 "
         );
@@ -707,7 +707,7 @@ mod tests {
 
                 fn f:
                     <entry>
-                        %x = load(i32, &X);
+                        %x = load(X:4, &X);
                         %eq = %x == 0x0;
                         %ne = ! %eq;
                         %z = zext(i32, %ne);
@@ -752,11 +752,11 @@ mod tests {
 
                 fn f:
                     <entry>
-                        %v = load(i8, &V);
+                        %v = load(V:1, &V);
                         %z = zext(i32, %v);
                         %cond = %z != 0x0;
                         %c8 = zext(i8, %cond);
-                        store(&B, %c8);
+                        store(B:1, &B <- %c8);
                         return at 0x0;
                 "
         );
@@ -789,7 +789,7 @@ mod tests {
 
                 fn f:
                     <entry>
-                        %sp = load(i32, &SP);
+                        %sp = load(SP:4, &SP);
                         %s0 = %sp - 0x10;
                         %base = %s0 & 0xfffffff8;
                         %a0 = %base - 0x270;
@@ -826,7 +826,7 @@ mod tests {
 
                 fn f:
                     <entry>
-                        %sp = load(i32, &SP);
+                        %sp = load(SP:4, &SP);
                         %base = %sp & 0xfffffff8;
                         %a0 = %base - 0xa4;
                         %a1 = %a0 & 0xfffffff8;
@@ -856,8 +856,8 @@ mod tests {
 
                 fn f:
                     <entry>
-                        %a = load(i32, &A);
-                        %b = load(i32, &B);
+                        %a = load(A:4, &A);
+                        %b = load(B:4, &B);
                         %sum = %a + %b;
                         %and = %a & %b;
                         %root = %sum - %and;

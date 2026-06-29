@@ -341,7 +341,7 @@ mod tests {
             varnode i8 cond;
 
             <block>
-                %c = load(i8, &cond);
+                %c = load(cond:1, &cond);
                 if %c goto <then_lbl> else goto <else_lbl>;
 
             <then_lbl>
@@ -546,7 +546,7 @@ mod tests {
             varnode i8 cond;
 
             <block>
-                %c = load(i8, &cond);
+                %c = load(cond:1, &cond);
                 if %c goto <then_lbl> else goto <else_lbl>;
 
             <then_lbl>

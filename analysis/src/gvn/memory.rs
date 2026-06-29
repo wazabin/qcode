@@ -108,15 +108,15 @@ mod tests {
 
                 fn loop_load:
                     <entry>
-                        store(&A, i32 0);
+                        store(A:4, &A <- i32 0);
                         goto <header>;
 
                     <header>
-                        %v = load(i32, &A);
+                        %v = load(A:4, &A);
                         if i8 1 goto <body> else goto <exit>;
 
                     <body>
-                        store(&A, i32 1);
+                        store(A:4, &A <- i32 1);
                         goto <header>;
 
                     <exit>
@@ -147,15 +147,15 @@ mod tests {
 
                 fn loop_load:
                     <entry>
-                        store(&A, i32 7);
+                        store(A:4, &A <- i32 7);
                         goto <header>;
 
                     <header>
-                        %v = load(i32, &A);
+                        %v = load(A:4, &A);
                         if i8 1 goto <body> else goto <exit>;
 
                     <body>
-                        store(&B, i32 1);
+                        store(B:4, &B <- i32 1);
                         goto <header>;
 
                     <exit>
@@ -188,12 +188,12 @@ mod tests {
 
                 fn self_loop:
                     <entry>
-                        store(&A, i32 0);
+                        store(A:4, &A <- i32 0);
                         goto <header>;
 
                     <header>
-                        %v = load(i32, &A);
-                        store(&A, i32 1);
+                        %v = load(A:4, &A);
+                        store(A:4, &A <- i32 1);
                         if i8 1 goto <header> else goto <exit>;
 
                     <exit>
@@ -228,11 +228,11 @@ mod tests {
 
                 fn caller:
                     <entry>
-                        store(&A, i32 7);
+                        store(A:4, &A <- i32 7);
                         call <callee>;
                     <reload>
-                        %v = load(i32, &A);
-                        store(&B, %v);
+                        %v = load(A:4, &A);
+                        store(B:4, &B <- %v);
                         return at 0x1000;
                 "
         );
@@ -312,11 +312,11 @@ mod tests {
                 varnode i64 A;
                 varnode i64 B;
                 <block>
-                    store(&A, i64 5);
-                    %a = load(i64, &A);
+                    store(A:8, &A <- i64 5);
+                    %a = load(A:8, &A);
                     %v1 = %a + 2;
                     %v2 = %v1 + 3;
-                    store(&B, %v2);
+                    store(B:8, &B <- %v2);
                     goto <0x1001>;"
         );
 
@@ -331,7 +331,7 @@ mod tests {
 
         assert!(!block.instruction_ids().contains(&v1));
         assert!(!block.instruction_ids().contains(&v2));
-        assert!(block.to_string().contains("B = 0xa"));
+        assert!(block.to_string().contains("B <- 0xa"));
     }
 
     // -----------------------------------------------------------------------
@@ -354,9 +354,9 @@ mod tests {
             "
                 fn func:
                     <block>
-                        store({eax}, i32 0x12345678); # EAX = c
-                        %r = load(i32, {eax});         # %r = EAX
-                        store({other}, %r);            # use %r (keeps it live)
+                        store(register:4, {eax} <- i32 0x12345678); # EAX = c
+                        %r = load(register:4, {eax});         # %r = EAX
+                        store(register:4, {other} <- %r);            # use %r (keeps it live)
                         return at 0x1000;
                 "
         );
@@ -438,11 +438,11 @@ mod tests {
                 fn func:
                     <block>
                         # A symbolic 1-byte value (the `setnz al` result), read before the zero.
-                        %cc = load(i8, {r0_byte1});
-                        store({r0_lo32}, i32 0); # xor eax, eax
-                        store({r0_byte0}, %cc);  # setnz al
-                        %load = load(i32, {r0_lo32});
-                        store({r1}, %load);      # push eax (use)
+                        %cc = load(register:1, {r0_byte1});
+                        store(register:4, {r0_lo32} <- i32 0); # xor eax, eax
+                        store(register:1, {r0_byte0} <- %cc);  # setnz al
+                        %load = load(register:4, {r0_lo32});
+                        store(register:4, {r1} <- %load);      # push eax (use)
                         return at 0x1000;
                 "
         );
@@ -481,10 +481,10 @@ mod tests {
             "
                 fn func:
                     <block>
-                        store({r0_lo32}, i32 0);
-                        store({r0_byte0}, i8 1);
-                        %v = load(i32, {r0_lo32});
-                        store({r1}, %v);
+                        store(register:4, {r0_lo32} <- i32 0);
+                        store(register:1, {r0_byte0} <- i8 1);
+                        %v = load(register:4, {r0_lo32});
+                        store(register:4, {r1} <- %v);
                         return at 0x1000;
                 "
         );
@@ -514,12 +514,12 @@ mod tests {
             "
                 fn func:
                     <block>
-                        store({r0_byte0}, i8 0xAA);
-                        store({r0_byte1}, i8 0xBB);
-                        store({r0_byte2}, i8 0xCC);
-                        store({r0_byte3}, i8 0xDD);
-                        %v = load(i32, {r0_lo32});
-                        store({r1}, %v);
+                        store(register:1, {r0_byte0} <- i8 0xAA);
+                        store(register:1, {r0_byte1} <- i8 0xBB);
+                        store(register:1, {r0_byte2} <- i8 0xCC);
+                        store(register:1, {r0_byte3} <- i8 0xDD);
+                        %v = load(register:4, {r0_lo32});
+                        store(register:4, {r1} <- %v);
                         return at 0x1000;
                 "
         );
@@ -550,12 +550,12 @@ mod tests {
                 fn func:
                     <block>
                         # Symbolic sources from non-overlapping bytes (offsets 2 and 3).
-                        %x = load(i8, {r0_byte2});
-                        %y = load(i8, {r0_byte3});
-                        store({r0_byte0}, %x);
-                        store({r0_byte1}, %y);
-                        %load = load(i16, {r0_lo16});
-                        store({r1}, %load);
+                        %x = load(register:1, {r0_byte2});
+                        %y = load(register:1, {r0_byte3});
+                        store(register:1, {r0_byte0} <- %x);
+                        store(register:1, {r0_byte1} <- %y);
+                        %load = load(register:2, {r0_lo16});
+                        store(register:2, {r1} <- %load);
                         return at 0x1000;
                 "
         );
@@ -590,12 +590,12 @@ mod tests {
             "
                 fn func:
                     <block>
-                        load(i8, {r0_byte0});
-                        load(i8, {r0_byte1});
-                        load(i8, {r0_byte2});
-                        load(i8, {r0_byte3});
-                        %load = load(i32, {r0_lo32});
-                        store({r1}, %load);
+                        load(register:1, {r0_byte0});
+                        load(register:1, {r0_byte1});
+                        load(register:1, {r0_byte2});
+                        load(register:1, {r0_byte3});
+                        %load = load(register:4, {r0_lo32});
+                        store(register:4, {r1} <- %load);
                         return at 0x1000;
                 "
         );
@@ -623,11 +623,11 @@ mod tests {
             "
                 fn func:
                     <block>
-                        %w = load(i32, {r0_lo32});
-                        store({r0_lo32}, %w); # re-store: %w is the live writer of bytes 1..4
-                        store({r0_byte0}, i8 0xAB);
-                        %v = load(i32, {r0_lo32});
-                        store({r1}, %v);
+                        %w = load(register:4, {r0_lo32});
+                        store(register:4, {r0_lo32} <- %w); # re-store: %w is the live writer of bytes 1..4
+                        store(register:1, {r0_byte0} <- i8 0xAB);
+                        %v = load(register:4, {r0_lo32});
+                        store(register:4, {r1} <- %v);
                         return at 0x1000;
                 "
         );
@@ -660,10 +660,10 @@ mod tests {
             "
                 fn func:
                     <block>
-                        %w = load(i32, {r0_lo32});
-                        store({r0_lo32}, %w);
-                        %narrow = load(i8, {r0_byte1});
-                        store({r1}, %narrow);
+                        %w = load(register:4, {r0_lo32});
+                        store(register:4, {r0_lo32} <- %w);
+                        %narrow = load(register:1, {r0_byte1});
+                        store(register:1, {r1} <- %narrow);
                         return at 0x1000;
                 "
         );
@@ -695,10 +695,10 @@ mod tests {
             "
                 fn func:
                     <block>
-                        store({r0_byte0}, i8 1);
-                        store({r0_byte2}, i8 2); # byte 1 and 3 unwritten
-                        %load = load(i32, {r0_lo32});
-                        store({r1}, %load);
+                        store(register:1, {r0_byte0} <- i8 1);
+                        store(register:1, {r0_byte2} <- i8 2); # byte 1 and 3 unwritten
+                        %load = load(register:4, {r0_lo32});
+                        store(register:4, {r1} <- %load);
                         return at 0x1000;
                 "
         );
@@ -725,13 +725,13 @@ mod tests {
             "
                 fn func:
                     <entry>
-                        store({r0_byte0}, i8 0xAA);
-                        store({r0_byte1}, i8 0xBB);
+                        store(register:1, {r0_byte0} <- i8 0xAA);
+                        store(register:1, {r0_byte1} <- i8 0xBB);
                         goto <succ>;
 
                     <succ>
-                        %load = load(i16, {r0_lo16});
-                        store({r1}, %load);
+                        %load = load(register:2, {r0_lo16});
+                        store(register:2, {r1} <- %load);
                         return at 0x2000;
                 "
         );
@@ -766,11 +766,11 @@ mod tests {
             tc.ctx,
             "
                 <block>
-                    store({r0_byte0}, i32 0xAA);
-                    store({r0_byte1}, i32 0xBB);
+                    store(register:4, {r0_byte0} <- i32 0xAA);
+                    store(register:4, {r0_byte1} <- i32 0xBB);
 
-                    %load = load(i32, {r0_lo16});
-                    store(%load, {r0});
+                    %load = load(register:4, {r0_lo16});
+                    store(ram:8, %load <- {r0});
                     goto <0x1000>;"
         );
 
@@ -801,11 +801,11 @@ mod tests {
 
                 fn f:
                     <entry>
-                        %p = load(i64, &PB);
-                        store(%p, i32 0x11223344);
+                        %p = load(PB:8, &PB);
+                        store(ram:4, %p <- i32 0x11223344);
                         %p1 = %p + i64 1;
-                        %r = load(i8, %p1);
-                        store(&OUT, %r);
+                        %r = load(ram:1, %p1);
+                        store(OUT:1, &OUT <- %r);
                         return at 0x1000;
                 "
         );
@@ -837,11 +837,11 @@ mod tests {
 
                 fn f:
                     <entry>
-                        %p = load(i64, &PB);
-                        store(%p, i32 0x11223344);
+                        %p = load(PB:8, &PB);
+                        store(ram:4, %p <- i32 0x11223344);
                         %p3 = %p + i64 3;
-                        %r = load(i16, %p3);
-                        store(&OUT, %r);
+                        %r = load(ram:2, %p3);
+                        store(OUT:2, &OUT <- %r);
                         return at 0x1000;
                 "
         );
@@ -868,13 +868,13 @@ mod tests {
 
                 fn f:
                     <entry>
-                        %p = load(i64, &PB);
-                        %q = load(i64, &QB);
-                        store(%p, i32 0x11223344);
-                        store(%q, i32 0x55667788);
+                        %p = load(PB:8, &PB);
+                        %q = load(QB:8, &QB);
+                        store(ram:4, %p <- i32 0x11223344);
+                        store(ram:4, %q <- i32 0x55667788);
                         %p1 = %p + i64 1;
-                        %r = load(i8, %p1);
-                        store(&OUT, %r);
+                        %r = load(ram:1, %p1);
+                        store(OUT:1, &OUT <- %r);
                         return at 0x1000;
                 "
         );
@@ -901,12 +901,12 @@ mod tests {
 
                 fn f:
                     <entry>
-                        %p = load(i64, &PB);
-                        store(%p, i32 0x11223344);
+                        %p = load(PB:8, &PB);
+                        store(ram:4, %p <- i32 0x11223344);
                         %p4 = %p + i64 4;
                         %pm = %p4 - i64 4;
-                        %r = load(i32, %pm);
-                        store(&OUT, %r);
+                        %r = load(ram:4, %pm);
+                        store(OUT:4, &OUT <- %r);
                         return at 0x1000;
                 "
         );

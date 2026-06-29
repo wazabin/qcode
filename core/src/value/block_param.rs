@@ -151,6 +151,23 @@ where
             write!(f, "@param{id:x}")
         }
     }
+
+    /// Formats this parameter in *declaration* position — the form that appears
+    /// in a block header, `@name:iN`. Unlike the operand [`fmt`](Self::fmt), a
+    /// scalar param surfaces its type as a `:iN`/`:fN` suffix so the header
+    /// round-trips through the parser's `block_param_decl` rule. Pointer/struct
+    /// params (no parser syntax) and unnamed/untyped params fall back to the
+    /// operand rendering.
+    pub(crate) fn fmt_decl(&'s self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        let types = &self.ctx().types;
+        let tid = self.type_id();
+        let is_scalar =
+            types.pointee_of(tid).is_none() && types.struct_name_of(tid).is_none();
+        match (self.name(), is_scalar && self.size() > 0) {
+            (Some(name), true) => write!(f, "@{name}:{}", types.type_name(tid)),
+            _ => self.fmt(f),
+        }
+    }
 }
 
 pub type BlockParamRef<'str, 'ctx> = BaseRef<&'ctx Context<'str>, BlockParamId>;

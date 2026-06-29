@@ -113,7 +113,7 @@ mod tests {
             varnode i32 V0;
 
             <block>
-                %v0 = load(i32, &V0);
+                %v0 = load(V0:4, &V0);
                 %v = !%v0;
                 goto <0x1001>;
             "

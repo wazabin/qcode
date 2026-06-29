@@ -41,8 +41,8 @@ fn separate_varnodes_do_not_alias() {
         varnode i32 B;
 
         <block>
-            %a = load(i32, &A);
-            %b = load(i32, &B);
+            %a = load(A:4, &A);
+            %b = load(B:4, &B);
             return at 0;
     "
     );
@@ -66,8 +66,8 @@ fn complex_operations_in_same_space_become_may_alias() {
 
         <block>
             %ptr = &A + i32 4;
-            %a = load(i32, %ptr);
-            %b = load(i32, &A);
+            %a = load(A:4, %ptr);
+            %b = load(A:4, &A);
             return at 0;
     "
     );
@@ -91,8 +91,8 @@ fn complex_operations_in_other_space_do_not_alias() {
 
         <block>
             %ptr = &A + i32 4;
-            %a = load(i32, %ptr);
-            %b = load(i32, &A);
+            %a = load(A:4, %ptr);
+            %b = load(A:4, &A);
             return at 0;
     "
     );
@@ -465,8 +465,8 @@ fn unresolvable_load_ptr_becomes_unknown_and_aliases_everything() {
         <block>
             %ptr1 = i64 0x10 + i64 0x2;
             %ptr2 = i64 0x10 + i64 0x1;
-            %v1 = load(i64, %ptr1);
-            %v2 = load(i64, %ptr2);
+            %v1 = load(ram:8, %ptr1);
+            %v2 = load(ram:8, %ptr2);
             return at 0;
     "
     );
@@ -485,10 +485,10 @@ fn unresolvable_load_ptr_in_register_space_does_not_alias_registers() {
         test_ctx.ctx,
         "
         <block>
-            %lhs = load(i64, {r0});
-            %rhs = load(i64, {r0});
+            %lhs = load(register:8, {r0});
+            %rhs = load(register:8, {r0});
             %ptr = %lhs + %rhs;
-            %value = load(i64, %ptr);
+            %value = load(ram:8, %ptr);
             return at %value;
     "
     );
@@ -513,11 +513,11 @@ fn store_then_load_invalidation_is_conservative_for_unknown_ptr() {
         varnode i64 B;
 
         <block>
-            %before = load(i64, &A);
-            %base = load(i64, &B);
+            %before = load(A:8, &A);
+            %base = load(B:8, &B);
             %ptr = &A + %base;
-            store(%ptr, i64 0x7);
-            %after = load(i64, &A);
+            store(A:8, %ptr <- i64 0x7);
+            %after = load(A:8, &A);
             return at %after;
     "
     );

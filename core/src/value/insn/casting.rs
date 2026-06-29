@@ -209,7 +209,7 @@ mod tests {
             "
             <block>
                 local i32 V0;
-                %v0 = load(i32, V0);
+                %v0 = load(V0:4, V0);
                 i64 %v = zext(i64, i32 %v0);
                 goto <0x1001>;
             "
@@ -233,7 +233,7 @@ mod tests {
             "
             <block>
                 local i32 V0;
-                %v0 = load(i32, V0);
+                %v0 = load(V0:4, V0);
                 i64 %v = sext(i64, i32 %v0);
                 goto <0x1001>;
             "
@@ -257,7 +257,7 @@ mod tests {
             "
             <block>
                 local i32 V0;
-                %v0 = load(i32, V0);
+                %v0 = load(V0:4, V0);
                 i64 %v = int2float(f32, i32 %v0);
                 goto <0x1001>;
             "
@@ -287,7 +287,7 @@ mod tests {
             "
             <block>
                 local i32 V0;
-                %v0 = load(i32, V0);
+                %v0 = load(V0:4, V0);
                 i64 %v = float2float(f64, i32 %v0);
                 goto <0x1001>;
             "
@@ -317,7 +317,7 @@ mod tests {
             "
             <block>
                 local i32 V0;
-                %v0 = load(i32, V0);
+                %v0 = load(V0:4, V0);
                 i16 %v = trunc(i16, i32 %v0);
                 goto <0x1001>;
             "

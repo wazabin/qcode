@@ -541,16 +541,16 @@ mod tests {
                         return at 0x1000;
 
                     <e1>
-                        store(&A, i32 1);
+                        store(A:4, &A <- i32 1);
                         goto <shared>;
 
                     <e2>
-                        store(&A, i32 2);
+                        store(A:4, &A <- i32 2);
                         goto <shared>;
 
                     <shared>
-                        %v = load(i32, &A);
-                        store(&B, %v);
+                        %v = load(A:4, &A);
+                        store(B:4, &B <- %v);
                         return at 0x1001;
                 "
         );
@@ -581,10 +581,10 @@ mod tests {
 
                 fn g:
                     <entry>
-                        %a = load(i64, &A);
+                        %a = load(A:8, &A);
                         %v1 = %a + %a;
                         %v2 = %a + %a;
-                        store(&B, %v2);
+                        store(B:8, &B <- %v2);
                         return at 0x1000;
                 "
         );

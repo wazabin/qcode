@@ -111,7 +111,7 @@ mod tests {
             varnode i32 X;
             fn f:
                 <entry>
-                    %x  = load(i32, &X);
+                    %x  = load(X:4, &X);
                     %s1 = %x << i32 8;
                     %s2 = %x >> i32 24;
                     %r  = %s1 | %s2;
@@ -158,7 +158,7 @@ mod tests {
             varnode i32 X;
             fn f:
                 <entry>
-                    %x = load(i32, &X);
+                    %x = load(X:4, &X);
                     %r = $rol(%x, i32 0);
                     return at %r;
             "
@@ -179,7 +179,7 @@ mod tests {
             varnode i32 X;
             fn f:
                 <entry>
-                    %x = load(i32, &X);
+                    %x = load(X:4, &X);
                     %l = $rol(%x, i32 8);
                     %r = $ror(%l, i32 8);
                     return at %r;
@@ -212,7 +212,7 @@ mod tests {
             varnode i32 X;
             fn f:
                 <entry>
-                    %x = load(i32, &X);
+                    %x = load(X:4, &X);
                     %r = $rol(%x, i32 40);
                     return at %r;
             "
@@ -238,7 +238,7 @@ mod tests {
             varnode i32 X;
             fn f:
                 <entry>
-                    %x = load(i32, &X);
+                    %x = load(X:4, &X);
                     %r = $rol(%x, i32 32);
                     return at %r;
             "
@@ -262,7 +262,7 @@ mod tests {
             varnode i32 X;
             fn f:
                 <entry>
-                    %x  = load(i32, &X);
+                    %x  = load(X:4, &X);
                     %s1 = %x << i32 8;
                     %s2 = %x >> i32 24;
                     %r  = %s1 | %s2;

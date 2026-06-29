@@ -80,9 +80,8 @@ fn run() -> Result<(), String> {
         println!("Available passes:\n  {}", known_pass_names().replace(", ", "\n  "));
         return Ok(());
     }
-    if args.passes.is_empty() {
-        return Err(format!("no pass selected; pass -p <NAME> (or --list)\n\n{HELP}"));
-    }
+    // With no passes selected, the tool degenerates to a canonicalizing formatter:
+    // parse the IR and print it back in canonical syntax (stdin -> stdout).
 
     let source = match &args.input {
         Some(path) => fs::read_to_string(path).map_err(|e| format!("reading {path}: {e}"))?,

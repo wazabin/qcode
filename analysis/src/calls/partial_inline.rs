@@ -717,7 +717,7 @@ mod tests {
             "
             fn f:
                 <f_entry @r0:i64>
-                    %l = load(i64, {r2});
+                    %l = load(register:8, {r2});
                     %agg = (%l);
                     return at %agg;
 
@@ -841,7 +841,7 @@ mod tests {
             fn f:
                 <f_entry @r0:i64>
                     %sum = @r0 + i64 5;
-                    %l = load(i64, {r2});
+                    %l = load(register:8, {r2});
                     %agg = (%sum, %l);
                     return at %agg;
 

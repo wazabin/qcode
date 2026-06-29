@@ -57,8 +57,11 @@ range           =  { typed_atom ~ "[" ~ range_start? ~ ":" ~ range_end? ~ "]" }
 range_start     =  { integer }
 range_end       =  { integer }
 memory          =  { load | store }
-load            =  { "load" ~ "(" ~ ty ~ "," ~ typed_atom ~ ")" }
-store           =  { "store" ~ "(" ~ typed_atom ~ "," ~ typed_atom ~ ")" }
+// Memory accesses name their space and byte size explicitly via `mem_loc`
+// (`space:bytes`): `load(ram:4, ptr)` reads, `store(ram:4, ptr <- value)` writes.
+load            =  { "load" ~ "(" ~ mem_loc ~ "," ~ typed_atom ~ ")" }
+store           =  { "store" ~ "(" ~ mem_loc ~ "," ~ typed_atom ~ "<-" ~ typed_atom ~ ")" }
+mem_loc         =  { ident ~ ":" ~ integer }
 cast            =  { cast_op ~ "(" ~ ty ~ "," ~ typed_atom ~ ")" }
 extract         =  { "extract" ~ "(" ~ (named_extract | indexed_extract) ~ ")" }
 named_extract   =  { typed_atom ~ "." ~ ident }

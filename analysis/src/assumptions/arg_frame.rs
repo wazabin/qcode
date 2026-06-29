@@ -379,8 +379,8 @@ mod tests {
             fn f:
                 <f_entry @sp:i64 @p:i64>
                     %off = @sp + i64 0x4;
-                    %x = load(i32, %off);
-                    store(@p, %x);
+                    %x = load(ram:4, %off);
+                    store(ram:4, @p <- %x);
                     return at i64 0;
             fn g:
                 <g_entry @gsp:i64>

@@ -228,10 +228,10 @@ mod tests {
             varnode i64 A;
             fn test:
                 <bb1>
-                    store(&A, i64 1);
+                    store(A:8, &A <- i64 1);
                     goto <bb2>;
                 <bb2>
-                    store(&A, i64 2);
+                    store(A:8, &A <- i64 2);
                     return at 0;
             "
         );
@@ -262,11 +262,11 @@ mod tests {
             varnode i64 B;
             fn test:
                 <bb1>
-                    store(&A, i64 1);
+                    store(A:8, &A <- i64 1);
                     goto <bb2>;
                 <bb2>
-                    %v = load(i64, &A);
-                    store(&B, %v);
+                    %v = load(A:8, &A);
+                    store(B:8, &B <- %v);
                     return at 0;
             "
         );
@@ -291,11 +291,11 @@ mod tests {
             varnode i64 B;
             fn test:
                 <bb1>
-                    store(&A, i64 1);
+                    store(A:8, &A <- i64 1);
                     if i8 1 goto <bb2> else goto <bb3>;
                 <bb2>
-                    %v = load(i64, &A);
-                    store(&B, %v);
+                    %v = load(A:8, &A);
+                    store(B:8, &B <- %v);
                     goto <bb4>;
                 <bb3>
                     goto <bb4>;
@@ -323,10 +323,10 @@ mod tests {
             varnode i64 A;
             fn test:
                 <bb1>
-                    store(&A, i64 1);
+                    store(A:8, &A <- i64 1);
                     if i8 1 goto <bb2> else goto <bb3>;
                 <bb2>
-                    store(&A, i64 2);
+                    store(A:8, &A <- i64 2);
                     goto <bb4>;
                 <bb3>
                     goto <bb4>;
@@ -354,7 +354,7 @@ mod tests {
             varnode i64 A;
             fn test:
                 <bb1>
-                    store(&A, i64 1);
+                    store(A:8, &A <- i64 1);
                     goto <bb2>;
                 <bb2>
                     return at 0;

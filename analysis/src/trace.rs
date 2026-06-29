@@ -248,8 +248,8 @@ mod tests {
             varnode i64 A;
             varnode i64 B;
             <entry>
-                %a = load(i64, &A);
-                %b = load(i64, &B);
+                %a = load(A:8, &A);
+                %b = load(B:8, &B);
                 if i8 1 goto <success> else goto <failure>;
 
             <success>
@@ -290,7 +290,7 @@ mod tests {
                 goto <cond>;
 
             <cond>
-                %c = load(i8, &COND);
+                %c = load(COND:1, &COND);
                 if i8 %c goto <body> else goto <exit>;
 
             <body>

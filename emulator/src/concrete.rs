@@ -2296,8 +2296,8 @@ mod tests {
             varnode i64 V1;
 
         <block>
-            %v0 = load(i64, &V0);
-            %v1 = load(i64, &V1);
+            %v0 = load(V0:8, &V0);
+            %v1 = load(V1:8, &V1);
             %res = %v0 + %v1;
             goto <0x1001>;
         "
@@ -2326,7 +2326,7 @@ mod tests {
             varnode i64 V0;
 
         <block>
-            Inner* %p = load(i64, &V0);
+            Inner* %p = load(V0:8, &V0);
             %fld = gep(%p.val);
             goto <0x1001>;
         "
@@ -2352,8 +2352,8 @@ mod tests {
             varnode i128 V1;
 
         <block>
-            %v0 = load(i128, &V0);
-            %v1 = load(i128, &V1);
+            %v0 = load(V0:16, &V0);
+            %v1 = load(V1:16, &V1);
 
             %res = %v0 / %v1;
             goto <0x1001>;
@@ -2550,8 +2550,8 @@ mod tests {
 
             fn function:
             <entry>
-                %a = load(i64, &A);
-                %b = load(i64, &B);
+                %a = load(A:8, &A);
+                %b = load(B:8, &B);
                 %sum = %a + %b;
                 return at i64 0;
             "
@@ -2580,8 +2580,8 @@ mod tests {
 
             fn function:
             <entry>
-                %a = load(i64, &A);
-                %b = load(i64, &B);
+                %a = load(A:8, &A);
+                %b = load(B:8, &B);
                 %sum = %a + %b;
                 return at i64 0;
             "
@@ -2630,7 +2630,7 @@ mod tests {
             <entry>
                 call <library>;
             <after_call>
-                %ret = load(i64, &RET);
+                %ret = load(RET:8, &RET);
                 return at i64 0;
             "
         );
@@ -2826,7 +2826,7 @@ mod tests {
             fn function:
             <entry>
                 # Null pointer dereference
-                %bad_load = load(i64, i64 0);
+                %bad_load = load(ram:8, i64 0);
                 return at i64 0;
             "
         );

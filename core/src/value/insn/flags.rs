@@ -230,7 +230,7 @@ mod tests {
             "
             <block>
                 local i32 V0;
-                %v0 = load(i32, V0);
+                %v0 = load(V0:4, V0);
                 %v = nan(%v0);
                 goto <0x1001>;
             "
@@ -255,7 +255,7 @@ mod tests {
             "
             <block>
                 local i32 V0;
-                %v0 = load(i32, V0);
+                %v0 = load(V0:4, V0);
                 %v = popcount(%v0);
                 goto <0x1001>;
             "
@@ -277,7 +277,7 @@ mod tests {
             "
             <block>
                 local i32 V0;
-                %v0 = load(i32, V0);
+                %v0 = load(V0:4, V0);
                 %v = lzcount(%v0);
                 goto <0x1001>;
             "
@@ -300,8 +300,8 @@ mod tests {
             <block>
                 local i32 V0;
                 local i32 V1;
-                %v0 = load(i32, V0);
-                %v1 = load(i32, V1);
+                %v0 = load(V0:4, V0);
+                %v1 = load(V1:4, V1);
                 %v = carry(%v0, %v1);
                 goto <0x1001>;
             "
@@ -327,8 +327,8 @@ mod tests {
             <block>
                 local i32 V0;
                 local i32 V1;
-                %v0 = load(i32, V0);
-                %v1 = load(i32, V1);
+                %v0 = load(V0:4, V0);
+                %v1 = load(V1:4, V1);
                 %v = scarry(%v0, %v1);
                 goto <0x1001>;
             "
@@ -354,8 +354,8 @@ mod tests {
             <block>
                 local i32 V0;
                 local i32 V1;
-                %v0 = load(i32, V0);
-                %v1 = load(i32, V1);
+                %v0 = load(V0:4, V0);
+                %v1 = load(V1:4, V1);
                 %v = sborrow(%v0, %v1);
                 goto <0x1001>;
             "

@@ -156,6 +156,31 @@ impl<'str> Context<'str> {
         self.named_spaces.get(name).copied()
     }
 
+    /// Resolve a space by name for textual lowering: an already-registered named
+    /// space, the default space when its name matches (the default `ram` space is
+    /// not in `named_spaces`), or a freshly-registered RAM space otherwise. Used
+    /// by the canonical `load(space:size, ptr)` / `store(...)` lowering.
+    pub fn get_or_make_named_space(&mut self, name: &str) -> SpaceId {
+        if let Some(id) = self.try_get_space(name) {
+            return id;
+        }
+        // Named temp spaces (e.g. the per-varnode spaces minted by
+        // `make_named_temp_space`) carry a name but are not in `named_spaces`, so
+        // scan the registry by name before minting a fresh one. This keeps a
+        // canonical `load(V0:4, V0)` bound to the same space as varnode `V0`.
+        if let Some(found) = self
+            .spaces
+            .iter()
+            .find(|s| s.name.as_deref() == Some(name))
+            .map(|s| s.id)
+        {
+            return found;
+        }
+        let default = &self.spaces[self.default_space];
+        let space = Space::new(Some(name), default.word_size, default.addr_size);
+        self.add_space(space)
+    }
+
     /// Creates a new temporary address space and returns its ID.
     pub fn make_temp_space(&mut self) -> SpaceId {
         let default_space = &self.spaces[self.default_space];
@@ -1106,7 +1131,7 @@ mod tests {
             varnode i64 ptr;
 
             <block>
-                store(&ptr, i64 0x1234);
+                store(ptr:8, &ptr <- i64 0x1234);
                 return at ptr;
             "
         );
@@ -1123,8 +1148,8 @@ mod tests {
             "
             varnode i64 x;
             <block>
-                %a = load(i64, &x);
-                %b = load(i64, &x);
+                %a = load(x:8, &x);
+                %b = load(x:8, &x);
                 return at %a;
             "
         );
@@ -1148,7 +1173,7 @@ mod tests {
             "
             varnode i64 x;
             <block>
-                %a = load(i64, &x);
+                %a = load(x:8, &x);
                 return at %a;
             "
         );
@@ -1170,7 +1195,7 @@ mod tests {
             "
             varnode i64 x;
             <block>
-                %a = load(i64, &x);
+                %a = load(x:8, &x);
                 return at %a;
             "
         );
@@ -1200,7 +1225,7 @@ mod tests {
             "
             varnode i64 x;
             <block>
-                %a = load(i64, &x);
+                %a = load(x:8, &x);
                 return at %a;
             "
         );
@@ -1214,7 +1239,7 @@ mod tests {
             "
             varnode i64 y;
             <block2>
-                %a = load(i64, &y);
+                %a = load(y:8, &y);
                 return at %a;
             "
         );
@@ -1232,7 +1257,7 @@ mod tests {
             "
             varnode i64 x;
             <block>
-                %a = load(i64, &x);
+                %a = load(x:8, &x);
                 %b = %a + i64 1;
                 return at %b;
             "
@@ -1267,7 +1292,7 @@ mod tests {
             "
             varnode i64 x;
             <block>
-                %a = load(i64, &x);
+                %a = load(x:8, &x);
                 %dead = %a + i64 1;
                 return at i64 0;
             "
@@ -1378,7 +1403,7 @@ mod tests {
             varnode i64 x;
             varnode i64 y;
             <block>
-                %a = load(i64, x);
+                %a = load(x:8, x);
                 return at %a;
             "
         );
@@ -1410,7 +1435,7 @@ mod tests {
             varnode i64 x;
             varnode i64 y;
             <block>
-                %a = load(i64, x);
+                %a = load(x:8, x);
                 return at %a;
             "
         );
@@ -1443,7 +1468,7 @@ mod tests {
             "
             varnode i64 x;
             <block>
-                %a = load(i64, &x);
+                %a = load(x:8, &x);
                 return at %a;
             "
         );
@@ -1635,9 +1660,9 @@ mod tests {
             "
             varnode i64 ptr;
             <block>
-                %a = load(i64, &ptr);
+                %a = load(ptr:8, &ptr);
                 %b = %a + i64 0x10;
-                store(&ptr, i64 0x1234);
+                store(ptr:8, &ptr <- i64 0x1234);
                 return at %b;
             "
         );

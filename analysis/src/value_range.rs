@@ -769,7 +769,7 @@ mod tests {
             "
             varnode i64 A;
             <block>
-                %a = load(i64, &A);
+                %a = load(A:8, &A);
                 goto <0x1001>;
             "
         );
@@ -787,7 +787,7 @@ mod tests {
             "
             varnode i64 A;
             <entry>
-                %idx = load(i64, &A);
+                %idx = load(A:8, &A);
                 %c = %idx < 0x5;
                 if %c goto <disp> else goto <oob>;
             <disp>
@@ -810,7 +810,7 @@ mod tests {
             "
             varnode i64 A;
             <entry>
-                %idx = load(i64, &A);
+                %idx = load(A:8, &A);
                 %c = %idx < 0x5;
                 if %c goto <disp> else goto <oob>;
             <disp>
@@ -832,7 +832,7 @@ mod tests {
             "
             varnode i64 A;
             <entry>
-                %idx = load(i64, &A);
+                %idx = load(A:8, &A);
                 %c = i64 0x5 < %idx;
                 if %c goto <hi> else goto <lo>;
             <hi>
@@ -857,7 +857,7 @@ mod tests {
             "
             varnode i64 A;
             <entry>
-                %idx = load(i64, &A);
+                %idx = load(A:8, &A);
                 %c = %idx <= 0x7;
                 if %c goto <disp> else goto <oob>;
             <disp>
@@ -885,7 +885,7 @@ mod tests {
             "
             varnode i32 A;
             <entry>
-                %edi = load(i32, &A);
+                %edi = load(A:4, &A);
                 %idx = zext(i64, %edi);
                 %lt = %idx < 0x7;
                 %sub = %edi - 0x7;
@@ -920,7 +920,7 @@ mod tests {
             "
             varnode i64 A;
             <entry>
-                %idx = load(i64, &A);
+                %idx = load(A:8, &A);
                 %c = %idx == 0x3;
                 if %c goto <eq> else goto <ne>;
             <eq>
@@ -949,7 +949,7 @@ mod tests {
             "
             varnode i64 A;
             <entry>
-                %v = load(i64, &A);
+                %v = load(A:8, &A);
                 %neg = %v s< 0x0;
                 %nz = %v != 0x0;
                 %pos = ! %neg;
@@ -979,8 +979,8 @@ mod tests {
             varnode i64 A;
             varnode i64 B;
             <entry>
-                %a = load(i64, &A);
-                %b = load(i64, &B);
+                %a = load(A:8, &A);
+                %b = load(B:8, &B);
                 %na = %a != 0x0;
                 %nb = %b != 0x0;
                 %and = %na & %nb;
@@ -1005,7 +1005,7 @@ mod tests {
             "
             varnode i64 A;
             <entry>
-                %idx = load(i64, &A);
+                %idx = load(A:8, &A);
                 %c = %idx != 0x3;
                 if %c goto <ne> else goto <eq>;
             <eq>
@@ -1028,7 +1028,7 @@ mod tests {
             "
             varnode i32 A;
             <entry>
-                %idx = load(i32, &A);
+                %idx = load(A:4, &A);
                 %c = %idx < i32 0x10;
                 if %c goto <disp> else goto <oob>;
             <disp>
@@ -1051,7 +1051,7 @@ mod tests {
             "
             varnode i32 A;
             <block>
-                %x = load(i32, &A);
+                %x = load(A:4, &A);
                 %w = sext(i64, %x);
                 goto <0x1001>;
             "
@@ -1070,7 +1070,7 @@ mod tests {
             "
             varnode i32 A;
             <entry>
-                %x = load(i32, &A);
+                %x = load(A:4, &A);
                 %c = %x < i32 0x10;
                 if %c goto <disp> else goto <oob>;
             <disp>
@@ -1093,7 +1093,7 @@ mod tests {
             "
             varnode i64 A;
             <entry>
-                %idx = load(i64, &A);
+                %idx = load(A:8, &A);
                 %c = %idx < 0x5;
                 if %c goto <disp> else goto <oob>;
             <disp>
@@ -1117,7 +1117,7 @@ mod tests {
             "
             varnode i8 A;
             <block>
-                %a = load(i8, &A);
+                %a = load(A:1, &A);
                 %j = %a + i8 0x10;
                 goto <0x1001>;
             "
@@ -1135,7 +1135,7 @@ mod tests {
             "
             varnode i64 A;
             <entry>
-                %idx = load(i64, &A);
+                %idx = load(A:8, &A);
                 %c = %idx < 0x4;
                 if %c goto <disp> else goto <oob>;
             <disp>
@@ -1158,7 +1158,7 @@ mod tests {
             "
             varnode i64 A;
             <entry>
-                %idx = load(i64, &A);
+                %idx = load(A:8, &A);
                 %c = %idx <= 0x3;
                 if %c goto <disp> else goto <oob>;
             <disp>
@@ -1183,8 +1183,8 @@ mod tests {
             varnode i64 A;
             varnode i64 B;
             <block>
-                %a = load(i64, &A);
-                %b = load(i64, &B);
+                %a = load(A:8, &A);
+                %b = load(B:8, &B);
                 %ca = %a & 0x1;
                 %cb = %b & 0x4;
                 %j = %ca | %cb;
@@ -1212,7 +1212,7 @@ mod tests {
             "
             varnode i64 A;
             <block>
-                %a = load(i64, &A);
+                %a = load(A:8, &A);
                 %zero = %a & 0x0;
                 goto <0x1001>;
             "
@@ -1250,8 +1250,8 @@ mod tests {
             varnode i64 A;
             varnode i64 B;
             <block>
-                %a = load(i64, &A);
-                %b = load(i64, &B);
+                %a = load(A:8, &A);
+                %b = load(B:8, &B);
                 %bool = %a < %b;
                 %lo = zext(i32, %bool);
                 %wide = %a & 0x0;
@@ -1287,7 +1287,7 @@ mod tests {
             "
             varnode i64 A;
             <block>
-                %a = load(i64, &A);
+                %a = load(A:8, &A);
                 %j = %a & 0x7;
                 goto <0x1001>;
             "
@@ -1308,7 +1308,7 @@ mod tests {
             "
             varnode i64 A;
             <entry>
-                %idx = load(i64, &A);
+                %idx = load(A:8, &A);
                 %c = %idx < 0x5;
                 if %c goto <a> else goto <b>;
             <a>
@@ -1334,8 +1334,8 @@ mod tests {
             varnode i64 A;
             varnode i64 B;
             <entry>
-                %idx = load(i64, &A);
-                %other = load(i64, &B);
+                %idx = load(A:8, &A);
+                %other = load(B:8, &B);
                 %c = %other < 0x5;
                 if %c goto <disp> else goto <oob>;
             <disp>
@@ -1359,7 +1359,7 @@ mod tests {
             "
             varnode i64 A;
             <entry>
-                %idx = load(i64, &A);
+                %idx = load(A:8, &A);
                 %c = %idx s< 0x5;
                 if %c goto <disp> else goto <oob>;
             <disp>
@@ -1382,8 +1382,8 @@ mod tests {
             varnode i64 A;
             varnode i64 B;
             <block>
-                %a = load(i64, &A);
-                %b = load(i64, &B);
+                %a = load(A:8, &A);
+                %b = load(B:8, &B);
                 %c = %a < %b;
                 goto <0x1001>;
             "

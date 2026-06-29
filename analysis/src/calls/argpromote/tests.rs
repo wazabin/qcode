@@ -62,10 +62,10 @@ mod tests {
             "
             fn f:
                 <f_entry>
-                    %v = load(i64, {r1});
+                    %v = load(register:8, {r1});
                     %s = %v + i64 5;
-                    store({r0}, %s);
-                    %fin = load(i64, {r0});
+                    store(register:8, {r0} <- %s);
+                    %fin = load(register:8, {r0});
                     %agg = (%fin);
                     return at %agg;
 
@@ -123,8 +123,8 @@ mod tests {
             "
             fn f:
                 <f_entry @stack_10000004:i64>
-                    %v = load(i32, @stack_10000004);
-                    store(@stack_10000004, %v);
+                    %v = load(ram:4, @stack_10000004);
+                    store(ram:4, @stack_10000004 <- %v);
                     return at i64 0;
 
             fn g:
@@ -184,8 +184,8 @@ mod tests {
             "
             fn f:
                 <f_entry @stack_10000004:i64>
-                    %v = load(i32, @stack_10000004);
-                    store(@stack_10000004, %v);
+                    %v = load(ram:4, @stack_10000004);
+                    store(ram:4, @stack_10000004 <- %v);
                     return at i64 0;
 
             fn g:
@@ -271,8 +271,8 @@ mod tests {
             "
             fn f:
                 <f_entry>
-                    %p = load(i32, 0x454df8);
-                    store(0x454df8, i32 0x270);
+                    %p = load(ram:4, 0x454df8);
+                    store(ram:4, 0x454df8 <- i32 0x270);
                     return at i64 0;
 
             fn g:
@@ -342,7 +342,7 @@ mod tests {
             "
             fn f:
                 <f_entry>
-                    %p = load(i32, 0x454df8);
+                    %p = load(ram:4, 0x454df8);
                     return at i64 0;
 
             fn g:
@@ -397,10 +397,10 @@ mod tests {
             "
             fn f:
                 <f_entry @stack_10000004:i64>
-                    %addr = load(i64, @stack_10000004);
-                    store(%addr, i32 0);
+                    %addr = load(ram:8, @stack_10000004);
+                    store(ram:4, %addr <- i32 0);
                     %a = @stack_10000004 + i64 0x30;
-                    %v = load(i32, %a);
+                    %v = load(ram:4, %a);
                     return at %v;
 
             fn g:
@@ -462,8 +462,8 @@ mod tests {
             "
             fn f:
                 <f_entry @stack_10000004:i64>
-                    store(@stack_10000004, i32 0x41);
-                    store(i64 0x9000, @stack_10000004);
+                    store(ram:4, @stack_10000004 <- i32 0x41);
+                    store(ram:8, i64 0x9000 <- @stack_10000004);
                     return at i64 0;
 
             fn g:
@@ -543,9 +543,9 @@ mod tests {
             fn f:
                 <f_entry @stack_10000004:i64>
                     %s = @stack_10000004 - i64 0x4;
-                    store(%s, i32 0);
+                    store(ram:4, %s <- i32 0);
                     %a = @stack_10000004 + i64 0x30;
-                    %v = load(i32, %a);
+                    %v = load(ram:4, %a);
                     return at %v;
 
             fn g:
@@ -587,8 +587,8 @@ mod tests {
             "
             fn f:
                 <f_entry @stack_10000004:i64>
-                    %v = load(i32, @stack_10000004);
-                    store(@stack_10000004, %v);
+                    %v = load(ram:4, @stack_10000004);
+                    store(ram:4, @stack_10000004 <- %v);
                     return at i64 0;
 
             fn g:
@@ -630,7 +630,7 @@ mod tests {
             fn f:
                 <f_entry @stack_10000004:i64>
                     %a = @stack_10000004 + i64 0x30;
-                    %v = load(i32, %a);
+                    %v = load(ram:4, %a);
                     return at %v;
 
             fn g:
@@ -698,7 +698,7 @@ mod tests {
             fn f:
                 <f_entry @stack_10000004:i64>
                     %a = @stack_10000004 + i64 0x30;
-                    %v = load(i32, %a);
+                    %v = load(ram:4, %a);
                     return at %v;
 
             fn g:
@@ -844,10 +844,10 @@ mod tests {
             "
             fn f:
                 <f_entry @stack_10000004:i64 @stack_10000010:i64>
-                    store(@stack_10000010, i32 100);
-                    %v = load(i32, @stack_10000004);
+                    store(ram:4, @stack_10000010 <- i32 100);
+                    %v = load(ram:4, @stack_10000004);
                     %s = %v + i32 1;
-                    store(@stack_10000004, %s);
+                    store(ram:4, @stack_10000004 <- %s);
                     return at i64 0;
 
             fn g:
@@ -889,9 +889,9 @@ mod tests {
             "
             fn foo:
                 <foo_entry @stack_10000004:i64>
-                    %v = load(i32, @stack_10000004);
+                    %v = load(ram:4, @stack_10000004);
                     %s = %v + i32 10;
-                    store(@stack_10000004, %s);
+                    store(ram:4, @stack_10000004 <- %s);
                     return at i64 0;
 
             fn g:
@@ -927,10 +927,10 @@ mod tests {
             "
             fn foo:
                 <foo_entry @stack_10000004:i64>
-                    %v = load(i32, @stack_10000004);
+                    %v = load(ram:4, @stack_10000004);
                     %s = %v + i32 10;
-                    store(@stack_10000004, %s);
-                    store({r0}, @stack_10000004);
+                    store(ram:4, @stack_10000004 <- %s);
+                    store(register:8, {r0} <- @stack_10000004);
                     return at i64 0;
 
             fn g:
@@ -967,7 +967,7 @@ mod tests {
             fn foo:
                 <foo_entry @stack_10000004:i64>
                     %adv = @stack_10000004 + i64 40;
-                    store(%adv, i32 5);
+                    store(ram:4, %adv <- i32 5);
                     return at i64 0;
 
             fn g:
@@ -1003,9 +1003,9 @@ mod tests {
             "
             fn foo:
                 <foo_entry @stack_10000004:i64>
-                    %v = load(i32, @stack_10000004);
+                    %v = load(ram:4, @stack_10000004);
                     %s = %v + i32 10;
-                    store({r0}, %s);
+                    store(register:4, {r0} <- %s);
                     return at i64 0;
 
             fn g:
@@ -1046,7 +1046,7 @@ mod tests {
             fn foo:
                 <foo_entry @stack_10000004:i64>
                     %adv = @stack_10000004 + i64 40;
-                    store({r0}, %adv);
+                    store(register:8, {r0} <- %adv);
                     return at i64 0;
 
             fn g:
@@ -1088,10 +1088,10 @@ mod tests {
             "
             fn f1:
                 <f1_entry @stack_10000004:i64>
-                    %v = load(i32, @stack_10000004);
+                    %v = load(ram:4, @stack_10000004);
                     %s = %v + i32 1;
-                    store(@stack_10000004, %s);
-                    store({r0}, i32 100);
+                    store(ram:4, @stack_10000004 <- %s);
+                    store(register:4, {r0} <- i32 100);
                     return at i64 0;
 
             fn g:
@@ -1129,7 +1129,7 @@ mod tests {
             fn f:
                 <f_entry @stack_10000004:i64>
                     %out = i64 7 + i64 0;
-                    store(@stack_10000004, i32 5);
+                    store(ram:4, @stack_10000004 <- i32 5);
                     return at i64 0;
 
             fn g:
@@ -1212,8 +1212,8 @@ mod tests {
             fn f:
                 <f_entry @RSP:i64 @p:i64>
                     %loc = @RSP - i64 0x8;
-                    store(%loc, i32 5);
-                    store(@p, i32 9);
+                    store(ram:4, %loc <- i32 5);
+                    store(ram:4, @p <- i32 9);
                     return at i64 0;
 
             fn g:
@@ -1292,7 +1292,7 @@ mod tests {
             fn f:
                 <f_entry @stack_10000004:i64>
                     %out = i64 7 + i64 0;
-                    store(@stack_10000004, i32 5);
+                    store(ram:4, @stack_10000004 <- i32 5);
                     return at i64 0;
 
             fn g:
@@ -1374,10 +1374,10 @@ mod tests {
             "
             fn foo:
                 <foo_entry @stack_10000004:i64>
-                    %v = load(i32, @stack_10000004);
+                    %v = load(ram:4, @stack_10000004);
                     %s = %v + i32 1;
-                    store(@stack_10000004, %s);
-                    %c = load(i8, {r0});
+                    store(ram:4, @stack_10000004 <- %s);
+                    %c = load(register:1, {r0});
                     if %c goto <ret_a> else goto <ret_b>;
                 <ret_a>
                     return at i64 0;
@@ -1435,10 +1435,10 @@ mod tests {
             "
             fn foo:
                 <foo_entry @stack_10000004:i64>
-                    %c = load(i8, {r0});
+                    %c = load(register:1, {r0});
                     if %c goto <wr> else goto <skip>;
                 <wr>
-                    store(@stack_10000004, i32 7);
+                    store(ram:4, @stack_10000004 <- i32 7);
                     return at i64 0;
                 <skip>
                     return at i64 1;
@@ -1508,7 +1508,7 @@ mod tests {
             "
             fn f:
                 <entry>
-                    store({r0}, i64 42);
+                    store(register:8, {r0} <- i64 42);
                     return at i64 0;
             "
         );
@@ -1539,9 +1539,9 @@ mod tests {
             "
             fn f:
                 <entry>
-                    %v = load(i64, {r0});
+                    %v = load(register:8, {r0});
                     %s = %v + i64 1;
-                    store({r0}, %s);
+                    store(register:8, {r0} <- %s);
                     return at i64 0;
             "
         );
@@ -1571,8 +1571,8 @@ mod tests {
             "
             fn f:
                 <entry>
-                    store({r0_lo32}, i32 2);
-                    store({r0}, i64 3);
+                    store(register:4, {r0_lo32} <- i32 2);
+                    store(register:8, {r0} <- i64 3);
                     return at i64 0;
             "
         );
@@ -1598,8 +1598,8 @@ mod tests {
             "
             fn f:
                 <entry>
-                    store({r0}, i64 7);
-                    store({r1}, i64 8);
+                    store(register:8, {r0} <- i64 7);
+                    store(register:8, {r1} <- i64 8);
                     return at i64 0;
             "
         );
@@ -1623,7 +1623,7 @@ mod tests {
             "
             fn f:
                 <entry>
-                    %v = load(i64, {r0});
+                    %v = load(register:8, {r0});
                     return at i64 0;
             "
         );
@@ -1647,7 +1647,7 @@ mod tests {
             "
             fn f:
                 <f_entry>
-                    store({r0}, i64 42);
+                    store(register:8, {r0} <- i64 42);
                     return at i64 0;
 
             fn g:
@@ -1656,8 +1656,8 @@ mod tests {
                 <g_call>
                     call <f>;
                 <g_cont>
-                    %x = load(i64, {r0});
-                    store({r1}, %x);
+                    %x = load(register:8, {r0});
+                    store(register:8, {r1} <- %x);
                     return at i64 0;
             "
         );
@@ -1711,14 +1711,14 @@ mod tests {
             "
             fn f:
                 <f_entry>
-                    %v = load(i64, {r0});
+                    %v = load(register:8, {r0});
                     %s = %v + i64 1;
-                    store({r0}, %s);
+                    store(register:8, {r0} <- %s);
                     return at i64 0;
 
             fn g:
                 <g_entry>
-                    store({r0}, i64 10);
+                    store(register:8, {r0} <- i64 10);
                     goto <g_call>;
                 <g_call>
                     call <f>;
@@ -1757,10 +1757,10 @@ mod tests {
             "
             fn f:
                 <entry>
-                    store({r0}, i64 1);
+                    store(register:8, {r0} <- i64 1);
                     return at i64 0;
                 <other>
-                    store({r0}, i64 2);
+                    store(register:8, {r0} <- i64 2);
                     return at i64 0;
             "
         );
@@ -1798,9 +1798,9 @@ mod tests {
             "
             fn f:
                 <f_entry>
-                    %v = load(i64, {r0});
+                    %v = load(register:8, {r0});
                     %s = %v + i64 1;
-                    store({r0}, %s);
+                    store(register:8, {r0} <- %s);
                     return at i64 4096;
 
             fn g:
@@ -1850,8 +1850,8 @@ mod tests {
             "
             fn f:
                 <entry>
-                    store({r0_lo32}, i32 1);
-                    store({mid}, i32 2);
+                    store(register:4, {r0_lo32} <- i32 1);
+                    store(register:4, {mid} <- i32 2);
                     return at i64 0;
             "
         );
@@ -1946,9 +1946,9 @@ mod tests {
                     if %c goto <f_body> else goto <f_exit>;
                 <f_body>
                     %addr = @stack_10000004 + @i;
-                    %b = load(i8, %addr);
+                    %b = load(ram:1, %addr);
                     %nb = %b + i8 0x1;
-                    store(%addr, %nb);
+                    store(ram:1, %addr <- %nb);
                     %ni = @i + i64 0x1;
                     goto <f_head @i=%ni>;
                 <f_exit>
@@ -2062,7 +2062,7 @@ mod tests {
                     %s = @i * i64 0x4;
                     %base = %s + @stack_10000004;
                     %addr = %base + i64 0x4;
-                    store(%addr, i32 0x7b);
+                    store(ram:4, %addr <- i32 0x7b);
                     %ni = @i + i64 0x1;
                     goto <f_head @i=%ni>;
                 <f_exit>
@@ -2139,7 +2139,7 @@ mod tests {
                     %s = @i * i64 0x4;
                     %base = %s + @stack_10000004;
                     %addr = %base + i64 0x4;
-                    store(%addr, i32 0x7b);
+                    store(ram:4, %addr <- i32 0x7b);
                     %ni = @i + i64 0x1;
                     %c = %ni < i64 0x14;
                     if %c goto <f_loop @i=%ni> else goto <f_exit>;
@@ -2195,16 +2195,16 @@ mod tests {
             fn f:
                 <f_entry @stack_10000004:i64>
                     %said = @stack_10000004 + i64 0x40;
-                    store(%said, i32 0xaa);
+                    store(ram:4, %said <- i32 0xaa);
                     goto <f_head @i=i64 0x0>;
                 <f_head @i:i64>
                     %c = @i < i64 0x14;
                     if %c goto <f_body> else goto <f_exit>;
                 <f_body>
                     %addr = @stack_10000004 + @i;
-                    %b = load(i8, %addr);
+                    %b = load(ram:1, %addr);
                     %nb = %b + i8 0x1;
-                    store(%addr, %nb);
+                    store(ram:1, %addr <- %nb);
                     %ni = @i + i64 0x1;
                     goto <f_head @i=%ni>;
                 <f_exit>
@@ -2279,7 +2279,7 @@ mod tests {
                 <f_entry @stack_10000004:i64 @idx:i64>
                     %m = @idx & i64 0x1fff;
                     %addr = @stack_10000004 + %m;
-                    %v = load(i32, %addr);
+                    %v = load(ram:4, %addr);
                     return at %v;
 
             fn g:
@@ -2348,17 +2348,17 @@ mod tests {
             fn f:
                 <f_entry @esp:i64 @bufptr:i64>
                     %slot = @esp + i64 0x4;
-                    store(%slot, @bufptr);
+                    store(ram:8, %slot <- @bufptr);
                     goto <f_head @i=i64 0x0>;
                 <f_head @i:i64>
                     %c = @i < i64 0x14;
                     if %c goto <f_body> else goto <f_exit>;
                 <f_body>
-                    %cc = load(i64, %slot);
+                    %cc = load(ram:8, %slot);
                     %addr = %cc + @i;
-                    %b = load(i8, %addr);
+                    %b = load(ram:1, %addr);
                     %nb = %b + i8 0x1;
-                    store(%addr, %nb);
+                    store(ram:1, %addr <- %nb);
                     %ni = @i + i64 0x1;
                     goto <f_head @i=%ni>;
                 <f_exit>
@@ -2438,18 +2438,18 @@ mod tests {
             "
             fn f:
                 <f_entry @esp:i64 @esp_val_0:i64 @esp_val_4:i64>
-                    store(@esp, @esp_val_0);
+                    store(ram:8, @esp <- @esp_val_0);
                     %slot = @esp + i64 0x4;
-                    store(%slot, @esp_val_4);
+                    store(ram:8, %slot <- @esp_val_4);
                     goto <f_head @i=i64 0x0>;
                 <f_head @i:i64>
                     %c = @i < i64 0x14;
                     if %c goto <f_body> else goto <f_exit>;
                 <f_body>
                     %addr = @i + @esp_val_4;
-                    %b = load(i8, %addr);
+                    %b = load(ram:1, %addr);
                     %nb = %b + i8 0x1;
-                    store(%addr, %nb);
+                    store(ram:1, %addr <- %nb);
                     %ni = @i + i64 0x1;
                     goto <f_head @i=%ni>;
                 <f_exit>
@@ -2526,16 +2526,16 @@ mod tests {
             "
             fn f:
                 <f_entry @esp:i64 @gp:i64 @gp_val_0:i64>
-                    store(@gp, @gp_val_0);
+                    store(ram:8, @gp <- @gp_val_0);
                     goto <f_head @i=i64 0x0>;
                 <f_head @i:i64>
                     %c = @i < i64 0x14;
                     if %c goto <f_body> else goto <f_exit>;
                 <f_body>
                     %addr = @i + @gp_val_0;
-                    %b = load(i8, %addr);
+                    %b = load(ram:1, %addr);
                     %nb = %b + i8 0x1;
-                    store(%addr, %nb);
+                    store(ram:1, %addr <- %nb);
                     %ni = @i + i64 0x1;
                     goto <f_head @i=%ni>;
                 <f_exit>
@@ -2607,24 +2607,24 @@ mod tests {
             "
             fn f:
                 <f_entry @esp:i32 @gp:i32 @esp_val_0:i32 @esp_val_4:i32 @gp_val_0:i32>
-                    store(@esp, @esp_val_0);
+                    store(ram:4, @esp <- @esp_val_0);
                     %a4 = @esp + i32 0x4;
-                    store(%a4, @esp_val_4);
-                    store(@gp, @gp_val_0);
+                    store(ram:4, %a4 <- @esp_val_4);
+                    store(ram:4, @gp <- @gp_val_0);
                     %seed = @gp_val_0 + i32 0x4;
-                    store(%seed, @esp_val_4);
+                    store(ram:4, %seed <- @esp_val_4);
                     goto <f_head @ebx=@esp_val_4 @i=i32 0x1>;
                 <f_head @ebx:i32 @i:i32>
                     %v = @ebx + @i;
                     %off = @i * i32 0x4;
                     %a = %off + @gp_val_0;
                     %addr = %a + i32 0x4;
-                    store(%addr, %v);
+                    store(ram:4, %addr <- %v);
                     %ni = @i + i32 0x1;
                     %c = %ni < i32 0x270;
                     if %c goto <f_head @ebx=%v @i=%ni> else goto <f_exit>;
                 <f_exit>
-                    store(@gp_val_0, i32 0x270);
+                    store(ram:4, @gp_val_0 <- i32 0x270);
                     %r = pack(EAX=@esp_val_4);
                     return at @esp_val_0;
 
@@ -2691,9 +2691,9 @@ mod tests {
                     if %c goto <f_body> else goto <f_exit>;
                 <f_body>
                     %addr = @stack_10000004 + @i;
-                    %b = load(i8, %addr);
+                    %b = load(ram:1, %addr);
                     %nb = %b + i8 0x1;
-                    store(%addr, %nb);
+                    store(ram:1, %addr <- %nb);
                     %ni = @i + i64 0x1;
                     goto <f_head @i=%ni>;
                 <f_exit>
@@ -2806,9 +2806,9 @@ mod tests {
                     if %c goto <f_body> else goto <f_exit>;
                 <f_body>
                     %addr = @stack_10000004 + @i;
-                    %b = load(i8, %addr);
+                    %b = load(ram:1, %addr);
                     %nb = %b + i8 0x1;
-                    store(%addr, %nb);
+                    store(ram:1, %addr <- %nb);
                     %ni = @i + i64 0x1;
                     %nacc = @acc + @i;
                     goto <f_head @i=%ni @acc=%nacc>;
@@ -2920,9 +2920,9 @@ mod tests {
                     if %c goto <f_body> else goto <f_exit>;
                 <f_body>
                     %addr = @stack_10000004 + @i;
-                    %b = load(i8, %addr);
+                    %b = load(ram:1, %addr);
                     %nb = %b + i8 0x1;
-                    store(%addr, %nb);
+                    store(ram:1, %addr <- %nb);
                     %ni = @i + i64 0x1;
                     %bw = zext(i64, %b);
                     %nacc = @acc + %bw;

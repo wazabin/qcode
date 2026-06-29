@@ -540,7 +540,7 @@ mod tests {
             "
             fn test:
             <entry>
-                %c = load(i64, 0x2000);
+                %c = load(ram:8, 0x2000);
                 goto <header @inv=%c @ind=0x0>;
             <header @inv:i64 @ind:i64>
                 %cond = @ind < 0x3;
@@ -583,7 +583,7 @@ mod tests {
             <entry>
                 goto <header @x=0x0>;
             <header @x:i64>
-                %i = load(i8, 0x1000);
+                %i = load(ram:1, 0x1000);
                 if %i goto <latch @y=@x> else goto <exit>;
             <latch @y:i64>
                 goto <header @x=@y>;
@@ -616,12 +616,12 @@ mod tests {
             "
             fn test:
             <entry>
-                %c = load(i8, 0x1000);
+                %c = load(ram:1, 0x1000);
                 if %c goto <join @m=0x1> else goto <other>;
             <other>
                 goto <join @m=0x2>;
             <join @m:i64>
-                store(0x4000, i64 @m);
+                store(ram:8, 0x4000 <- i64 @m);
                 return at 0x0;
             "
         );
@@ -643,13 +643,13 @@ mod tests {
             "
             fn test:
             <entry>
-                %c = load(i8, 0x1000);
+                %c = load(ram:1, 0x1000);
                 if %c goto <join @same=0x7 @merge=0x2> else goto <other>;
             <other>
                 goto <join @same=0x7 @merge=0x4>;
             <join @same:i64 @merge:i64>
-                store(0x4000, i64 @merge);
-                store(0x4008, i64 @same);
+                store(ram:8, 0x4000 <- i64 @merge);
+                store(ram:8, 0x4008 <- i64 @same);
                 return at 0x0;
             "
         );
@@ -683,14 +683,14 @@ mod tests {
             varnode i64 B;
             fn test:
             <entry>
-                %a = load(i64, &A);
-                %b = load(i64, &B);
+                %a = load(A:8, &A);
+                %b = load(B:8, &B);
                 %off = %a + %b;
                 goto <header @inv=%off>;
             <header @inv:i64>
-                %i = load(i8, 0x1000);
+                %i = load(ram:1, 0x1000);
                 %re = %b + %a;
-                store(0x4000, i64 @inv);
+                store(ram:8, 0x4000 <- i64 @inv);
                 if %i goto <header @inv=%re> else goto <exit>;
             <exit>
                 return at 0x0;
@@ -725,12 +725,12 @@ mod tests {
             varnode i64 A;
             fn test:
             <entry>
-                %c1 = load(i64, &A);
+                %c1 = load(A:8, &A);
                 goto <header @inv=%c1>;
             <header @inv:i64>
-                %i = load(i8, 0x1000);
-                %c2 = load(i64, &A);
-                store(0x4000, i64 @inv);
+                %i = load(ram:1, 0x1000);
+                %c2 = load(A:8, &A);
+                store(ram:8, 0x4000 <- i64 @inv);
                 if %i goto <header @inv=%c2> else goto <exit>;
             <exit>
                 return at 0x0;
@@ -761,14 +761,14 @@ mod tests {
             varnode i64 A;
             fn test:
             <entry>
-                %c1 = load(i64, &A);
+                %c1 = load(A:8, &A);
                 %off = %c1 + 0x1;
                 goto <header @inv=%off>;
             <header @inv:i64>
-                %i = load(i8, 0x1000);
-                %c2 = load(i64, &A);
+                %i = load(ram:1, 0x1000);
+                %c2 = load(A:8, &A);
                 %re = %c2 + 0x1;
-                store(0x4000, i64 @inv);
+                store(ram:8, 0x4000 <- i64 @inv);
                 if %i goto <header @inv=%re> else goto <exit>;
             <exit>
                 return at 0x0;
@@ -798,12 +798,12 @@ mod tests {
             varnode i64 A;
             fn test:
             <entry>
-                %c = load(i64, &A);
+                %c = load(A:8, &A);
                 %off = %c + 0x1;
                 goto <header @inv=%off>;
             <header @inv:i64>
-                %i = load(i8, 0x1000);
-                store(0x4000, i64 @inv);
+                %i = load(ram:1, 0x1000);
+                store(ram:8, 0x4000 <- i64 @inv);
                 %re = %c + 0x1;
                 if %i goto <header @inv=%re> else goto <exit>;
             <exit>
@@ -831,7 +831,7 @@ mod tests {
             "
             fn test:
             <root @x:i64>
-                %c = load(i8, 0x1000);
+                %c = load(ram:1, 0x1000);
                 if %c goto <root @x=@x> else goto <exit>;
             <exit>
                 return at 0x0;
@@ -856,14 +856,14 @@ mod tests {
             "
             fn test:
             <entry>
-                %seed = load(i64, 0x2000);
+                %seed = load(ram:8, 0x2000);
                 goto <a @inva=%seed @merga=0x0>;
             <a @inva:i64 @merga:i64>
                 goto <b @invb=@inva @mergb=@merga>;
             <b @invb:i64 @mergb:i64>
-                store(0x5000, i64 @invb);
+                store(ram:8, 0x5000 <- i64 @invb);
                 %n = @mergb + 0x1;
-                %c = load(i8, 0x1000);
+                %c = load(ram:1, 0x1000);
                 if %c goto <a @inva=@invb @merga=%n> else goto <exit>;
             <exit>
                 return at 0x0;
@@ -909,7 +909,7 @@ mod tests {
                 goto <hdr @acc=0x0 @i=0x0 @junk=0x0>;
             <hdr @acc:i64 @i:i64 @junk:i64>
                 %na = @acc + @i;
-                store(0x4000, i64 %na);
+                store(ram:8, 0x4000 <- i64 %na);
                 %ni = @i + 0x1;
                 %nj = @i & 0x1;
                 %c = %ni < 0x270;
@@ -949,7 +949,7 @@ mod tests {
             <entry>
                 goto <hdr @a=0x0 @b=0x0>;
             <hdr @a:i64 @b:i64>
-                %i = load(i8, 0x1000);
+                %i = load(ram:1, 0x1000);
                 if %i goto <latch @a2=@b @b2=@a> else goto <exit>;
             <latch @a2:i64 @b2:i64>
                 goto <hdr @a=@a2 @b=@b2>;
@@ -976,13 +976,13 @@ mod tests {
             "
             fn test:
             <entry>
-                %s = load(i64, 0x2000);
+                %s = load(ram:8, 0x2000);
                 goto <hdr @x=%s>;
             <hdr @x:i64>
-                %i = load(i8, 0x1000);
+                %i = load(ram:1, 0x1000);
                 if %i goto <usr @y=@x> else goto <exit>;
             <usr @y:i64>
-                store(0x4000, i64 @y);
+                store(ram:8, 0x4000 <- i64 @y);
                 goto <exit>;
             <exit>
                 return at 0x0;
@@ -1030,7 +1030,7 @@ mod tests {
             "
             fn test:
             <entry>
-                %p = load(i64, 0x2000);
+                %p = load(ram:8, 0x2000);
                 goto <ret @r=%p>;
             <ret @r:i64>
                 return at @r;
@@ -1088,7 +1088,7 @@ mod tests {
             "
             fn test:
             <root @x:i64 @y:i64>
-                store(0x4000, i64 @x);
+                store(ram:8, 0x4000 <- i64 @x);
                 return at 0x0;
             "
         );
@@ -1110,12 +1110,12 @@ mod tests {
             "
             fn test:
             <entry>
-                %i = load(i8, 0x1000);
+                %i = load(ram:1, 0x1000);
                 if %i goto <a @za=0x1> else goto <exit>;
             <a @za:i64>
                 goto <b @zb=@za>;
             <b @zb:i64>
-                store(0x4000, 0x9);
+                store(ram:8, 0x4000 <- 0x9);
                 return at 0x0;
             <exit>
                 return at 0x0;

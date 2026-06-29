@@ -1048,11 +1048,11 @@ mod tests {
                 if %cond goto <body> else goto <exit>;
             <body>
                 %addr = @ptr + @i;
-                %byte = load(i8, %addr);
+                %byte = load(ram:1, %addr);
                 %wide = zext(i64, %byte);
                 %mixed = %wide ^ @i;
                 %byte_next = %mixed + 0x1;
-                store(%addr, %byte_next);
+                store(ram:8, %addr <- %byte_next);
                 %i_next = @i + 0x1;
                 goto <header @i=%i_next @ptr=@ptr>;
             <exit>

@@ -234,8 +234,8 @@ mod tests {
             varnode i64 B;
             fn f:
             <entry>
-                %a = load(i64, &A);
-                %b = load(i64, &B);
+                %a = load(A:8, &A);
+                %b = load(B:8, &B);
                 %ab = %a + %b;
                 %ba = %b + %a;
                 %sub1 = %a - %b;
@@ -260,8 +260,8 @@ mod tests {
             varnode i64 B;
             fn f:
             <entry>
-                %a = load(i64, &A);
-                %b = load(i64, &B);
+                %a = load(A:8, &A);
+                %b = load(B:8, &B);
                 %ab1 = %a + %b;
                 %ab2 = %a + %b;
                 return at 0x0;
@@ -284,8 +284,8 @@ mod tests {
             varnode i64 A;
             fn f:
             <entry>
-                %c1 = load(i64, &A);
-                %c2 = load(i64, &A);
+                %c1 = load(A:8, &A);
+                %c2 = load(A:8, &A);
                 return at 0x0;
             "
         );
@@ -309,8 +309,8 @@ mod tests {
             varnode i32 B;
             fn f:
             <entry>
-                %a = load(i32, &A);
-                %b = load(i32, &B);
+                %a = load(A:4, &A);
+                %b = load(B:4, &B);
                 %za1 = zext(i64, %a);
                 %za2 = zext(i64, %a);
                 %zb = zext(i64, %b);
@@ -336,8 +336,8 @@ mod tests {
             varnode i64 A;
             fn f:
             <entry>
-                %c1 = load(i64, &A);
-                %c2 = load(i64, &A);
+                %c1 = load(A:8, &A);
+                %c2 = load(A:8, &A);
                 %p1 = %c1 + 0x1;
                 %p2 = %c2 + 0x1;
                 return at 0x0;
@@ -363,7 +363,7 @@ mod tests {
             varnode i64 A;
             fn f:
             <entry>
-                %c = load(i64, &A);
+                %c = load(A:8, &A);
                 %p1 = %c + 0x1;
                 %p2 = %c + 0x1;
                 return at 0x0;
@@ -387,9 +387,9 @@ mod tests {
             varnode i64 C;
             fn f:
             <entry>
-                %a = load(i64, &A);
-                %b = load(i64, &B);
-                %c = load(i64, &C);
+                %a = load(A:8, &A);
+                %b = load(B:8, &B);
+                %c = load(C:8, &C);
                 %m1 = %a * %b;
                 %m2 = %b * %a;
                 %e1 = %m1 + %c;

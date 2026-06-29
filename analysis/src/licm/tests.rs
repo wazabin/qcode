@@ -49,8 +49,8 @@ fn hoists_invariant_arithmetic() {
 
             fn f:
                 <entry>
-                    %x = load(i64, &A);
-                    %y = load(i64, &B);
+                    %x = load(A:8, &A);
+                    %y = load(B:8, &B);
                     goto <header @i=0x0>;
                 <header @i:i64>
                     %cond = @i < 0x3;
@@ -100,8 +100,8 @@ fn hoists_transitive_chain() {
 
             fn f:
                 <entry>
-                    %x = load(i64, &A);
-                    %y = load(i64, &B);
+                    %x = load(A:8, &A);
+                    %y = load(B:8, &B);
                     goto <header @i=0x0>;
                 <header @i:i64>
                     %cond = @i < 0x3;
@@ -145,7 +145,7 @@ fn keeps_loop_variant_in_body() {
 
             fn f:
                 <entry>
-                    %x = load(i64, &A);
+                    %x = load(A:8, &A);
                     goto <header @i=0x0>;
                 <header @i:i64>
                     %cond = @i < 0x3;
@@ -187,7 +187,7 @@ fn hoists_invariant_load() {
                     %cond = @i < 0x3;
                     if %cond goto <body> else goto <exit>;
                 <body>
-                    %v = load(i32, &G);
+                    %v = load(G:4, &G);
                     %i_next = @i + 0x1;
                     goto <header @i=%i_next>;
                 <exit>
@@ -226,8 +226,8 @@ fn keeps_load_with_aliasing_store() {
                     %cond = @i < 0x3;
                     if %cond goto <body> else goto <exit>;
                 <body>
-                    %v = load(i32, &G);
-                    store(&G, i32 0x5);
+                    %v = load(G:4, &G);
+                    store(G:4, &G <- i32 0x5);
                     %i_next = @i + 0x1;
                     goto <header @i=%i_next>;
                 <exit>
@@ -261,8 +261,8 @@ fn hoists_load_over_disjoint_store_with_oracle() {
                     %cond = @i < 0x3;
                     if %cond goto <body> else goto <exit>;
                 <body>
-                    %v = load(i32, &G);
-                    store(&H, i32 0x5);
+                    %v = load(G:4, &G);
+                    store(H:4, &H <- i32 0x5);
                     %i_next = @i + 0x1;
                     goto <header @i=%i_next>;
                 <exit>
@@ -299,8 +299,8 @@ fn keeps_load_over_aliasing_store_with_oracle() {
                     %cond = @i < 0x3;
                     if %cond goto <body> else goto <exit>;
                 <body>
-                    %v = load(i32, &G);
-                    store(&G, i32 0x5);
+                    %v = load(G:4, &G);
+                    store(G:4, &G <- i32 0x5);
                     %i_next = @i + 0x1;
                     goto <header @i=%i_next>;
                 <exit>
@@ -368,8 +368,8 @@ fn is_idempotent() {
 
             fn f:
                 <entry>
-                    %x = load(i64, &A);
-                    %y = load(i64, &B);
+                    %x = load(A:8, &A);
+                    %y = load(B:8, &B);
                     goto <header @i=0x0>;
                 <header @i:i64>
                     %cond = @i < 0x3;
@@ -407,15 +407,15 @@ fn rewires_uses_to_hoisted_copy() {
 
             fn f:
                 <entry>
-                    %x = load(i64, &A);
-                    %y = load(i64, &B);
+                    %x = load(A:8, &A);
+                    %y = load(B:8, &B);
                     goto <header @i=0x0>;
                 <header @i:i64>
                     %cond = @i < 0x3;
                     if %cond goto <body> else goto <exit>;
                 <body>
                     %z = %x + %y;
-                    store(&OUT, %z);
+                    store(OUT:8, &OUT <- %z);
                     %i_next = @i + 0x1;
                     goto <header @i=%i_next>;
                 <exit>

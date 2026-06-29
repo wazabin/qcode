@@ -1065,17 +1065,17 @@ mod tests {
             "
             varnode i32 BASE;
             <block>
-                %base = load(i32, &BASE);
+                %base = load(BASE:4, &BASE);
                 %p4 = %base - i32 4;
                 %p8 = %base - i32 8;
                 %pc = %base - i32 12;
-                store(%p4, i32 0x1f1e1d2c);
-                store(%p8, %p4);
-                store(%pc, i32 0x44c420);
-                store(%pc, i32 0x44c420);
-                store(%p8, %p4);
+                store(ram:4, %p4 <- i32 0x1f1e1d2c);
+                store(ram:4, %p8 <- %p4);
+                store(ram:4, %pc <- i32 0x44c420);
+                store(ram:4, %pc <- i32 0x44c420);
+                store(ram:4, %p8 <- %p4);
                 %m = %base + i32 0;
-                store(%p4, %m);
+                store(ram:4, %p4 <- %m);
             "
         );
         let block_id = block;
@@ -1104,7 +1104,7 @@ mod tests {
                     return at %r;
             fn host:
                 <host_entry>
-                    %s = load(i32, &SRC);
+                    %s = load(SRC:4, &SRC);
                     %m = inc <$> %s;
                     return at %m;
             "
@@ -1240,8 +1240,8 @@ mod tests {
             "
             varnode i32 A;
             <block>
-                store(&A, i64 1);
-                store(&A, i64 2);
+                store(A:8, &A <- i64 1);
+                store(A:8, &A <- i64 2);
             "
         );
         let block_id = block;
@@ -1398,9 +1398,9 @@ mod tests {
             "
             varnode i32 A;
             <block>
-                store(&A, i64 1);
-                %tmp = load(i64, &A);
-                store(&A, i64 2);
+                store(A:8, &A <- i64 1);
+                %tmp = load(A:8, &A);
+                store(A:8, &A <- i64 2);
             "
         );
         let block_id = block;
@@ -1466,8 +1466,8 @@ mod tests {
             "
             varnode i64 A;
             <block>
-                store(&A, i64 1);
-                store(&A, i64 2);
+                store(A:8, &A <- i64 1);
+                store(A:8, &A <- i64 2);
             "
         );
         let block_id = block;
@@ -1496,10 +1496,10 @@ mod tests {
             varnode i64 A;
             varnode i64 B;
             <block>
-                store(&A, i64 1);
-                %tmp = load(i64, &A);
-                store(&B, %tmp);
-                store(&A, i64 2);
+                store(A:8, &A <- i64 1);
+                %tmp = load(A:8, &A);
+                store(B:8, &B <- %tmp);
+                store(A:8, &A <- i64 2);
             "
         );
         let block_id = block;
@@ -1579,18 +1579,18 @@ mod tests {
             "
             fn test:
                 <entry>
-                    store({r0_lo32}, i32 1);
+                    store(register:4, {r0_lo32} <- i32 1);
                     goto <loop_head>;
 
                 <loop_head>
                     if i8 1 goto <loop_body> else goto <exit>;
 
                 <loop_body>
-                    store({r1}, i64 2);
+                    store(register:8, {r1} <- i64 2);
                     goto <loop_head>;
 
                 <exit>
-                    store({r0_lo32}, i32 3);
+                    store(register:4, {r0_lo32} <- i32 3);
                     return at i64 0;
             "
         );

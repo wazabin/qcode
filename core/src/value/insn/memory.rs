@@ -21,15 +21,9 @@ impl MnemonicKind for Load {
     }
 
     fn fmt(&self, f: &mut Formatter<'_>, ctx: &Context<'_>) -> std::fmt::Result {
-        // if matches!(ctx.get_value(self.ptr), ValueRef::Varnode(_)) {
-        //     write!(f, "{};", ctx.get_value(self.ptr))
-        // } else {
-        // let space = ctx.get_space(self.space).name.unwrap_or("space");
-        // write!(f, "*[{}]:{} {};", space, self.size, ctx.get_value(self.ptr))
-        // }
         write!(
             f,
-            "*[{}]:{} {};",
+            "load({}:{}, {});",
             Space::from_id(ctx, self.space)
                 .name
                 .as_deref()
@@ -69,27 +63,9 @@ impl MnemonicKind for Store {
     }
 
     fn fmt(&self, f: &mut Formatter<'_>, ctx: &Context<'_>) -> std::fmt::Result {
-        // if matches!(ctx.get_value(self.ptr), ValueRef::Varnode(_)) {
-        //     write!(
-        //         f,
-        //         "{} = {};",
-        //         ctx.get_value(self.ptr),
-        //         ctx.get_value(self.src)
-        //     )
-        // } else {
-        //     let space = ctx.get_space(self.space).name.unwrap_or("space");
-        //     write!(
-        //         f,
-        //         "*[{}]:{} {} = {};",
-        //         space,
-        //         self.size,
-        //         ctx.get_value(self.ptr),
-        //         ctx.get_value(self.src)
-        //     )
-        // }
         write!(
             f,
-            "*[{}]:{} {} = {};",
+            "store({}:{}, {} <- {});",
             Space::from_id(ctx, self.space)
                 .name
                 .as_deref()
@@ -127,7 +103,7 @@ mod tests {
 
             <block>
                 %ptr = i64 &v0 + i64 0x2;
-                %v = load(i32, %ptr);
+                %v = load(v0:4, %ptr);
                 goto <0x1001>;
             "
         );
@@ -140,7 +116,7 @@ mod tests {
 
         assert_eq!(v.size(), 4);
         assert!(v.space().is_none());
-        assert_eq!(v.as_statement().to_string(), "i32 %v = *[v0]:4 i32 %ptr;");
+        assert_eq!(v.as_statement().to_string(), "i32 %v = load(v0:4, i32 %ptr);");
     }
 
     #[test]
@@ -153,9 +129,9 @@ mod tests {
             varnode i32 V0;
 
             <block>
-                %v0 = load(i32, V0);
+                %v0 = load(V0:4, V0);
                 %ptr = i32 %v0 + i32 0x2;
-                store(%ptr, i32 0x7);
+                store(ram:4, %ptr <- i32 0x7);
                 goto <0x1001>;
             "
         );
@@ -169,7 +145,7 @@ mod tests {
 
         assert_eq!(store.size(), 0);
         assert!(store.space().is_none());
-        assert_eq!(store.as_statement().to_string(), "*[ram]:4 i32 %ptr = 0x7;");
+        assert_eq!(store.as_statement().to_string(), "store(ram:4, i32 %ptr <- 0x7);");
     }
 
     #[test]
@@ -198,7 +174,7 @@ mod tests {
 
             <block>
                 %ptr = i64 &A + i64 0x2;
-                %value = load(i64, %ptr);
+                %value = load(A:8, %ptr);
                 goto <0x1001>;
             "
         );
@@ -216,7 +192,7 @@ mod tests {
         assert_eq!(load.space, a.space().id);
         assert_eq!(
             value.as_statement().to_string(),
-            "i64 %value = *[A]:8 i64 %ptr;"
+            "i64 %value = load(A:8, i64 %ptr);"
         );
     }
 
@@ -231,7 +207,7 @@ mod tests {
 
             <block>
                 %ptr = i64 &A + i64 0x2;
-                store(%ptr, i64 0x7);
+                store(A:8, %ptr <- i64 0x7);
                 goto <0x1001>;
             "
         );
@@ -244,7 +220,7 @@ mod tests {
             panic!("expected store instruction");
         };
         assert_eq!(store_mnemonic.space, a.space().id);
-        assert_eq!(store.as_statement().to_string(), "*[A]:8 i64 %ptr = 0x7;");
+        assert_eq!(store.as_statement().to_string(), "store(A:8, i64 %ptr <- 0x7);");
     }
 
     #[test]
@@ -256,7 +232,7 @@ mod tests {
             "
             <block>
                 %ptr = i64 0x10 + i64 0x2;
-                %v = load(i64, %ptr);
+                %v = load(ram:8, %ptr);
                 goto <0x1001>;
             "
         );
@@ -276,7 +252,7 @@ mod tests {
         assert_eq!(load.space, ctx.default_space);
         assert_eq!(
             value.as_statement().to_string(),
-            "i64 %v = *[ram]:8 i64 %ptr;"
+            "i64 %v = load(ram:8, i64 %ptr);"
         );
     }
 }

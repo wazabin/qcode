@@ -233,7 +233,7 @@ fn collect_expr(expr: &ExprNode, names: &mut Names) {
         }
         ExprNode::Cast { src, .. } => collect_atom(src, names),
         ExprNode::Load { ptr, .. } => collect_atom(ptr, names),
-        ExprNode::Store { ptr, src } => {
+        ExprNode::Store { ptr, src, .. } => {
             collect_atom(ptr, names);
             collect_atom(src, names);
         }

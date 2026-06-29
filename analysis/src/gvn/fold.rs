@@ -602,7 +602,7 @@ mod tests {
                     varnode i32 fs;
                     %c = i32 0x31 + i32 0x32;
                     %addr = &fs + %c;
-                    %v = load(i32, %addr);
+                    %v = load(fs:4, %addr);
                     return at i32 0;
             "
         );
@@ -657,7 +657,7 @@ mod tests {
                     %b2 = zext(i32, i8 0x0);
                     %s2 = %b2 << i32 0x10;
                     %o2 = %o1 | %s2;
-                    store(&sink, %o2);
+                    store(sink:4, &sink <- %o2);
                     return at i32 0;
             "
         );
@@ -697,15 +697,15 @@ mod tests {
                 <entry>
                     varnode i32 fs;
                     varnode i32 slot;
-                    store(&slot, i32 0x1f1e1d2c);
-                    store(&slot, i8 0x30);
-                    %lo = load(i8, &slot);
+                    store(slot:4, &slot <- i32 0x1f1e1d2c);
+                    store(slot:1, &slot <- i8 0x30);
+                    %lo = load(slot:1, &slot);
                     %b0 = zext(i32, %lo);
                     %b1 = zext(i32, i8 0x0);
                     %s1 = %b1 << i32 0x8;
                     %off = %b0 | %s1;
                     %addr = &fs + %off;
-                    %v = load(i32, %addr);
+                    %v = load(fs:4, %addr);
                     return at i32 0;
             "
         );
@@ -749,9 +749,9 @@ mod tests {
                 varnode i64 A;
                 varnode i64 B;
                 <block>
-                    %a = load(i64, &A);
+                    %a = load(A:8, &A);
                     %v = %a & %a;
-                    store(&B, %v);
+                    store(B:8, &B <- %v);
                     goto <0x1001>;
             "
         );
@@ -782,9 +782,9 @@ mod tests {
                 varnode i64 A;
                 varnode i64 B;
                 <block>
-                    %a = load(i64, &A);
+                    %a = load(A:8, &A);
                     %v = %a + 0x0;
-                    store(&B, %v);
+                    store(B:8, &B <- %v);
                     goto <0x1001>;
             "
         );
@@ -811,9 +811,9 @@ mod tests {
                 varnode i64 A;
                 varnode i64 B;
                 <block>
-                    %a = load(i64, &A);
+                    %a = load(A:8, &A);
                     %v = %a ^ %a;
-                    store(&B, %v);
+                    store(B:8, &B <- %v);
                     goto <0x1001>;
             "
         );
@@ -828,7 +828,7 @@ mod tests {
             "x ^ x should be eliminated"
         );
         assert!(
-            block.to_string().contains("B = 0x0"),
+            block.to_string().contains("B <- 0x0"),
             "x ^ x should fold to the zero constant, got:\n{block}"
         );
     }
@@ -850,9 +850,9 @@ mod tests {
                 <entry>
                     varnode i32 A;
                     varnode i32 B;
-                    %a = load(i32, &A);
+                    %a = load(A:4, &A);
                     %z = zext(i32, %a);
-                    store(&B, %z);
+                    store(B:4, &B <- %z);
                     return at i32 0;
             "
         );
@@ -888,9 +888,9 @@ mod tests {
                 <entry>
                     varnode i32 A;
                     varnode i32 B;
-                    %a = load(i32, &A);
+                    %a = load(A:4, &A);
                     %r = %a[0:4];
-                    store(&B, %r);
+                    store(B:4, &B <- %r);
                     return at i32 0;
             "
         );
@@ -926,10 +926,10 @@ mod tests {
                 <entry>
                     varnode i8 A;
                     varnode i8 B;
-                    %a = load(i8, &A);
+                    %a = load(A:1, &A);
                     %z = zext(i32, %a);
                     %r = %z[0:1];
-                    store(&B, %r);
+                    store(B:1, &B <- %r);
                     return at i32 0;
             "
         );

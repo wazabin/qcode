@@ -583,13 +583,13 @@ mod tests {
             varnode i64 A;
             fn fun:
             <entry>
-                %idx = load(i64, &A);
+                %idx = load(A:8, &A);
                 %c = %idx < 0x3;
                 if %c goto <disp> else goto <oob>;
             <disp>
                 %off = %idx * 0x8;
                 %addr = i64 0x2000 + %off;
-                %t = load(i64, %addr);
+                %t = load(ram:8, %addr);
                 goto [%t];
             <oob>
                 goto <0x9000>;
@@ -635,7 +635,7 @@ mod tests {
             varnode i64 A;
             fn fun:
             <entry>
-                %t = load(i64, 0x2000);
+                %t = load(ram:8, 0x2000);
                 goto [%t];
             "
         );
@@ -670,13 +670,13 @@ mod tests {
             varnode i64 A;
             fn fun:
             <entry>
-                %idx = load(i64, &A);
+                %idx = load(A:8, &A);
                 %c = %idx < 0x3;
                 if %c goto <disp> else goto <oob>;
             <disp>
                 %off = %idx * 0x4;
                 %addr = i64 0x5000 + %off;
-                %rel = load(i32, %addr);
+                %rel = load(ram:4, %addr);
                 %sx = sext(i64, %rel);
                 %t = i64 0x3000 + %sx;
                 goto [%t];
@@ -713,10 +713,10 @@ mod tests {
             varnode i64 A;
             fn fun:
             <disp>
-                %idx = load(i64, &A);
+                %idx = load(A:8, &A);
                 %off = %idx * 0x8;
                 %addr = i64 0x2000 + %off;
-                %t = load(i64, %addr);
+                %t = load(ram:8, %addr);
                 goto [%t];
             "
         );
@@ -749,13 +749,13 @@ mod tests {
             varnode i64 A;
             fn fun:
             <entry>
-                %idx = load(i64, &A);
+                %idx = load(A:8, &A);
                 %c = %idx < 0x1;
                 if %c goto <disp> else goto <oob>;
             <disp>
                 %off = %idx * 0x8;
                 %addr = i64 0x2000 + %off;
-                %t = load(i64, %addr);
+                %t = load(ram:8, %addr);
                 goto [%t];
             <oob>
                 goto <0x9000>;
@@ -790,13 +790,13 @@ mod tests {
             varnode i64 A;
             fn fun:
             <entry>
-                %idx = load(i64, &A);
+                %idx = load(A:8, &A);
                 %c = %idx < 0x2;
                 if %c goto <disp> else goto <oob>;
             <disp>
                 %off = %idx * 0x8;
                 %addr = i64 0x2000 + %off;
-                %t = load(i64, %addr);
+                %t = load(ram:8, %addr);
                 goto [%t];
             <oob>
                 goto <0x9000>;
@@ -838,15 +838,15 @@ mod tests {
             varnode i64 B;
             fn fun:
             <disp>
-                %a = load(i64, &A);
-                %b = load(i64, &B);
+                %a = load(A:8, &A);
+                %b = load(B:8, &B);
                 %na = %a != 0x0;
                 %nb = %b != 0x0;
                 %and = %na & %nb;
                 %idx = zext(i64, %and);
                 %off = %idx * 0x8;
                 %addr = i64 0x2000 + %off;
-                %t = load(i64, %addr);
+                %t = load(ram:8, %addr);
                 goto [%t];
             "
         );
@@ -884,13 +884,13 @@ mod tests {
             varnode i64 A;
             fn fun:
             <entry>
-                %idx = load(i64, &A);
+                %idx = load(A:8, &A);
                 %c = %idx < 0x2;
                 if %c goto <disp> else goto <oob>;
             <disp>
                 %off = %idx * 0x8;
                 %addr = i64 0x2000 + %off;
-                %t = load(i64, %addr);
+                %t = load(ram:8, %addr);
                 goto [%t];
             <oob>
                 goto <0x9000>;
@@ -933,14 +933,14 @@ mod tests {
             varnode i64 A;
             fn fun:
             <entry>
-                %idx = load(i64, &A);
+                %idx = load(A:8, &A);
                 %c = %idx < 0x2;
                 if %c goto <disp> else goto <oob>;
             <disp>
                 %j = %idx + 0x5;
                 %off = %j * 0x8;
                 %addr = i64 0x2000 + %off;
-                %t = load(i64, %addr);
+                %t = load(ram:8, %addr);
                 goto [%t];
             <oob>
                 goto <0x9000>;

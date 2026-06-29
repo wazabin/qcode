@@ -842,37 +842,74 @@ fn parse_memory(pair: Pair<'_, Rule>) -> Result<ExprNode, ParseError> {
 
     match inner.as_rule() {
         Rule::load => {
-            let mut load_inner = inner.into_inner();
-            let type_pair = load_inner
-                .find(|p| p.as_rule() == Rule::ty)
-                .ok_or_else(|| ParseError::new("missing load type"))?;
-            let size_bytes = parse_size_bytes(type_pair.as_str(), "load")?;
-            let ptr_pair = load_inner
-                .find(|p| p.as_rule() == Rule::typed_atom)
-                .ok_or_else(|| ParseError::new("missing load pointer"))?;
-            let ptr = parse_typed_atom(ptr_pair)?;
-
-            Ok(ExprNode::Load { size_bytes, ptr })
+            let mut space = None;
+            let mut size_bytes = None;
+            let mut ptr = None;
+            for part in inner.into_inner() {
+                match part.as_rule() {
+                    Rule::mem_loc => {
+                        let (name, bytes) = parse_mem_loc(part)?;
+                        space = Some(name);
+                        size_bytes = Some(bytes);
+                    }
+                    Rule::typed_atom => ptr = Some(parse_typed_atom(part)?),
+                    _ => {}
+                }
+            }
+            Ok(ExprNode::Load {
+                space: space.ok_or_else(|| ParseError::new("missing load space"))?,
+                size_bytes: size_bytes.ok_or_else(|| ParseError::new("missing load size"))?,
+                ptr: ptr.ok_or_else(|| ParseError::new("missing load pointer"))?,
+            })
         }
         Rule::store => {
-            let mut store_inner = inner
-                .into_inner()
-                .filter(|p| p.as_rule() == Rule::typed_atom);
-            let ptr = parse_typed_atom(
-                store_inner
-                    .next()
-                    .ok_or_else(|| ParseError::new("missing store pointer"))?,
-            )?;
-            let src = parse_typed_atom(
-                store_inner
-                    .next()
-                    .ok_or_else(|| ParseError::new("missing store source"))?,
-            )?;
-
-            Ok(ExprNode::Store { ptr, src })
+            let mut space = None;
+            let mut size_bytes = None;
+            let mut atoms = Vec::new();
+            for part in inner.into_inner() {
+                match part.as_rule() {
+                    Rule::mem_loc => {
+                        let (name, bytes) = parse_mem_loc(part)?;
+                        space = Some(name);
+                        size_bytes = Some(bytes);
+                    }
+                    Rule::typed_atom => atoms.push(parse_typed_atom(part)?),
+                    _ => {}
+                }
+            }
+            let mut atoms = atoms.into_iter();
+            let ptr = atoms
+                .next()
+                .ok_or_else(|| ParseError::new("missing store pointer"))?;
+            let src = atoms
+                .next()
+                .ok_or_else(|| ParseError::new("missing store source"))?;
+            Ok(ExprNode::Store {
+                space: space.ok_or_else(|| ParseError::new("missing store space"))?,
+                size_bytes: size_bytes.ok_or_else(|| ParseError::new("missing store size"))?,
+                ptr,
+                src,
+            })
         }
         _ => Err(ParseError::new("invalid memory expression")),
     }
+}
+
+/// Parse a `space:bytes` memory location into `(space_name, byte_size)`.
+fn parse_mem_loc(pair: Pair<'_, Rule>) -> Result<(String, usize), ParseError> {
+    let mut name = None;
+    let mut bytes = None;
+    for part in pair.into_inner() {
+        match part.as_rule() {
+            Rule::ident => name = Some(part.as_str().to_owned()),
+            Rule::integer => bytes = Some(parse_integer(part.as_str())? as usize),
+            _ => {}
+        }
+    }
+    Ok((
+        name.ok_or_else(|| ParseError::new("missing space name"))?,
+        bytes.ok_or_else(|| ParseError::new("missing space size"))?,
+    ))
 }
 
 fn parse_cast(pair: Pair<'_, Rule>) -> Result<ExprNode, ParseError> {
@@ -1272,11 +1309,16 @@ mod tests {
 
     #[test]
     fn parses_load_and_store_statements() {
-        let statements = stmts("load(i32, {ptr}); store({ptr}, {src})");
+        let statements = stmts("load(ram:4, {ptr}); store(ram:4, {ptr} <- {src})");
         assert_eq!(statements.len(), 2);
 
         match &statements[0] {
-            Statement::Expr(ExprNode::Load { size_bytes, ptr }) => {
+            Statement::Expr(ExprNode::Load {
+                space,
+                size_bytes,
+                ptr,
+            }) => {
+                assert_eq!(space, "ram");
                 assert_eq!(*size_bytes, 4);
                 match &ptr.atom {
                     Atom::External(name) => assert_eq!(name, "ptr"),
@@ -1287,7 +1329,14 @@ mod tests {
         }
 
         match &statements[1] {
-            Statement::Expr(ExprNode::Store { ptr, src }) => {
+            Statement::Expr(ExprNode::Store {
+                space,
+                size_bytes,
+                ptr,
+                src,
+            }) => {
+                assert_eq!(space, "ram");
+                assert_eq!(*size_bytes, 4);
                 match &ptr.atom {
                     Atom::External(name) => assert_eq!(name, "ptr"),
                     _ => panic!("expected external store pointer"),

@@ -106,11 +106,18 @@ pub enum ExprNode {
         size_bytes: usize,
         src: TypedAtom,
     },
+    /// `load(space:size, ptr)` — read `size` bytes from address `ptr` in the
+    /// named `space`.
     Load {
+        space: String,
         size_bytes: usize,
         ptr: TypedAtom,
     },
+    /// `store(space:size, ptr <- value)` — write `value` (`size` bytes) to
+    /// address `ptr` in the named `space`.
     Store {
+        space: String,
+        size_bytes: usize,
         ptr: TypedAtom,
         src: TypedAtom,
     },

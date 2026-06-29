@@ -204,8 +204,8 @@ mod tests {
                 varnode i64 B;
 
                 <block>
-                    %a = load(i64, &A);
-                    %b = load(i64, &B);
+                    %a = load(A:8, &A);
+                    %b = load(B:8, &B);
 
                     %v1 = %a + %b;
                     %v2 = %a + %b;
@@ -237,8 +237,8 @@ mod tests {
                 varnode i64 B;
 
                 <block>
-                    %a = load(i64, &A);
-                    %b = load(i64, &B);
+                    %a = load(A:8, &A);
+                    %b = load(B:8, &B);
                     %v1 = %a + %b;
                     %v2 = %b + %a;
                     goto <0x1001>;
@@ -268,8 +268,8 @@ mod tests {
                 varnode i64 B;
 
                 <block>
-                    %a = load(i64, &A);
-                    %b = load(i64, &B);
+                    %a = load(A:8, &A);
+                    %b = load(B:8, &B);
                     %v1 = %a - %b;
                     %v2 = %b - %a;
                     goto <0x1001>;
@@ -299,8 +299,8 @@ mod tests {
                 varnode i64 B;
 
                 <block>
-                    %a = load(i64, &A);
-                    %b = load(i64, &B);
+                    %a = load(A:8, &A);
+                    %b = load(B:8, &B);
                     %v1 = %a + %b;
                     %v2 = %a * %b;
                     goto <0x1001>;
@@ -334,8 +334,8 @@ mod tests {
 
                 fn f:
                     <entry>
-                        %a = load(i64, &A);
-                        %b = load(i64, &B);
+                        %a = load(A:8, &A);
+                        %b = load(B:8, &B);
 
                         %v1 = %a + %b;
                         goto <succ>;
@@ -378,8 +378,8 @@ mod tests {
 
                 fn g:
                     <entry>
-                        %a = load(i64, &A);
-                        %b = load(i64, &B);
+                        %a = load(A:8, &A);
+                        %b = load(B:8, &B);
                         if i8 1 goto <left> else goto <right>;
 
                     <left>
@@ -458,7 +458,7 @@ mod tests {
                         %b = &SP - i32 0x8;
                         %a = &SP - i32 0xc;
                         %c = %a + i32 0x4;
-                        store(&OUT, %c);
+                        store(OUT:4, &OUT <- %c);
                         return at 0x1000;
                 "
         );
@@ -488,7 +488,7 @@ mod tests {
                         %b = &SP - i32 0x8;
                         %a = &SP - i32 0xc;
                         %c = %a + i32 0x4;
-                        store(&OUT, %c);
+                        store(OUT:4, &OUT <- %c);
                         return at 0x1000;
                 "
         );
@@ -516,11 +516,11 @@ mod tests {
 
                 fn f:
                     <entry>
-                        %x = load(i32, &X);
+                        %x = load(X:4, &X);
                         %p = %x & i32 0xf0;
                         %m = %x & i32 0xff0;
                         %n = %m & i32 0xff;
-                        store(&OUT, %n);
+                        store(OUT:4, &OUT <- %n);
                         return at 0x1000;
                 "
         );
@@ -550,7 +550,7 @@ mod tests {
                     <entry>
                         %a = &SP + i32 0x4;
                         %b = %a - i32 0xc;
-                        store(&OUT, %b);
+                        store(OUT:4, &OUT <- %b);
                         return at 0x1000;
                 "
         );
@@ -598,15 +598,15 @@ mod tests {
 
                 fn f:
                     <entry>
-                        %a = load(i32, &A);
-                        %b = load(i32, &B);
+                        %a = load(A:4, &A);
+                        %b = load(B:4, &B);
                         %za = zext(i64, %a);
                         %zb = zext(i64, %b);
                         %wide = %za + %zb;
                         %sum = %a + %b;
                         %zs = zext(i64, %sum);
-                        store(&OUT, %wide);
-                        store(&OUT, %zs);
+                        store(OUT:8, &OUT <- %wide);
+                        store(OUT:8, &OUT <- %zs);
                         return at 0x1000;
                 "
         );
@@ -638,7 +638,7 @@ mod tests {
 
                     <e1>
                         %x1 = &A - i32 0x8;
-                        store(&OUT, %x1);
+                        store(OUT:4, &OUT <- %x1);
                         goto <shared>;
 
                     <e2>
@@ -646,7 +646,7 @@ mod tests {
 
                     <shared>
                         %x2 = &A - i32 0x8;
-                        store(&OUT, %x2);
+                        store(OUT:4, &OUT <- %x2);
                         return at 0x1001;
                 "
         );

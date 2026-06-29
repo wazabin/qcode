@@ -42,7 +42,7 @@ mod tests {
             "
             <block>
                 local i8 COND;
-                %cond = load(i8, COND);
+                %cond = load(COND:1, COND);
                 assert %cond;
                 goto <0x1001>;
             "

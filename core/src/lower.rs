@@ -598,23 +598,25 @@ impl Lowerer<'_, '_, '_> {
                 })
             }
 
-            ExprNode::Load { size_bytes, ptr } => {
+            ExprNode::Load {
+                space,
+                size_bytes,
+                ptr,
+            } => {
                 let p = self.ptr_atom(ptr)?;
-                let space = ValueRef::from_id(self.b.context(), p)
-                    .space()
-                    .map(|s| s.id)
-                    .unwrap_or(self.b.context().default_space);
+                let space = self.b.context_mut().get_or_make_named_space(space);
                 Ok(self.b.push_load::<false>(p, *size_bytes, space).id())
             }
 
-            ExprNode::Store { ptr, src } => {
-                let src_hint = self.size_hint(src);
+            ExprNode::Store {
+                space,
+                size_bytes,
+                ptr,
+                src,
+            } => {
                 let p = self.ptr_atom(ptr)?;
-                let s = self.atom(src, src_hint)?;
-                let space = ValueRef::from_id(self.b.context(), p)
-                    .space()
-                    .map(|sp| sp.id)
-                    .unwrap_or(self.b.context().default_space);
+                let s = self.atom(src, Some(*size_bytes))?;
+                let space = self.b.context_mut().get_or_make_named_space(space);
                 Ok(self.b.push_store(s, p, space).id())
             }
 

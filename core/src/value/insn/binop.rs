@@ -274,7 +274,7 @@ mod tests {
             "
             <block>
                 local i32 V0;
-                %v0 = load(i32, V0);
+                %v0 = load(V0:4, V0);
                 %v = i32 %v0 + i32 0x2;
                 goto <0x1001>;
             "
@@ -302,7 +302,7 @@ mod tests {
             "
             <block>
                 local i32 V0;
-                %v0 = load(i32, V0);
+                %v0 = load(V0:4, V0);
                 %v = i32 %v0 - i32 0x2;
                 goto <0x1001>;
             "
@@ -330,7 +330,7 @@ mod tests {
             "
             <block>
                local i32 V0;
-                %v0 = load(i32, V0);
+                %v0 = load(V0:4, V0);
                 %v = i32 %v0 * i32 0x2;
                 goto <0x1001>;
             "
@@ -358,7 +358,7 @@ mod tests {
             "
             <block>
                 local i32 V0;
-                %v0 = load(i32, V0);
+                %v0 = load(V0:4, V0);
                 %v = i32 %v0 / i32 0x2;
                 goto <0x1001>;
             "
@@ -386,7 +386,7 @@ mod tests {
             "
             <block>
                 local i32 V0;
-                %v0 = load(i32, V0);
+                %v0 = load(V0:4, V0);
                 %v = i32 %v0 & i32 0x2;
                 goto <0x1001>;
             "
@@ -414,7 +414,7 @@ mod tests {
             "
             <block>
                 local i32 V0;
-                %v0 = load(i32, V0);
+                %v0 = load(V0:4, V0);
                 %v = i32 %v0 | i32 0x2;
                 goto <0x1001>;
             "
@@ -442,7 +442,7 @@ mod tests {
             "
             <block>
                 local i32 V0;
-                %v0 = load(i32, V0);
+                %v0 = load(V0:4, V0);
                 %v = i32 %v0 ^ i32 0x2;
                 goto <0x1001>;
             "
@@ -470,7 +470,7 @@ mod tests {
             "
             <block>
                 local i32 V0;
-                %v0 = load(i32, V0);
+                %v0 = load(V0:4, V0);
                 %v = i32 %v0 << i32 0x2;
                 goto <0x1001>;
             "
@@ -498,7 +498,7 @@ mod tests {
             "
             <block>
                 local i32 V0;
-                %v0 = load(i32, V0);
+                %v0 = load(V0:4, V0);
                 %v = i32 %v0 >> i32 0x2;
                 goto <0x1001>;
             "
@@ -526,7 +526,7 @@ mod tests {
             "
             <block>
                 local i32 V0;
-                %v0 = load(i32, V0);
+                %v0 = load(V0:4, V0);
                 %v = i32 %v0 == i32 0x2;
                 goto <0x1001>;
             "
@@ -554,7 +554,7 @@ mod tests {
             "
             <block>
                 local i32 V0;
-                %v0 = load(i32, V0);
+                %v0 = load(V0:4, V0);
                 %v = i32 %v0 != i32 0x2;
                 goto <0x1001>;
             "
@@ -582,7 +582,7 @@ mod tests {
             "
             <block>
                 local i32 V0;
-                %v0 = load(i32, V0);
+                %v0 = load(V0:4, V0);
                 %v = i32 %v0 < i32 0x2;
                 goto <0x1001>;
             "
@@ -610,7 +610,7 @@ mod tests {
             "
             <block>
                 local i32 V0;
-                %v0 = load(i32, V0);
+                %v0 = load(V0:4, V0);
                 %v = i32 %v0 <= i32 0x2;
                 goto <0x1001>;
             "
@@ -638,7 +638,7 @@ mod tests {
             "
             <block>
                 local i32 V0;
-                %v0 = load(i32, V0);
+                %v0 = load(V0:4, V0);
                 %v = i32 %v0 > i32 0x2;
                 goto <0x1001>;
             "
@@ -666,7 +666,7 @@ mod tests {
             "
             <block>
                 local i32 V0;
-                %v0 = load(i32, V0);
+                %v0 = load(V0:4, V0);
                 %v = i32 %v0 >= i32 0x2;
                 goto <0x1001>;
             "
@@ -695,8 +695,8 @@ mod tests {
             <block>
                 local i8 V0;
                 local i8 V1;
-                %v0 = load(i8, V0);
-                %v1 = load(i8, V1);
+                %v0 = load(V0:1, V0);
+                %v1 = load(V1:1, V1);
                 %v = %v0 ^^ %v1;
                 goto <0x1001>;
             "
@@ -725,8 +725,8 @@ mod tests {
             <block>
                 local i8 V0;
                 local i8 V1;
-                %v0 = load(i8, V0);
-                %v1 = load(i8, V1);
+                %v0 = load(V0:1, V0);
+                %v1 = load(V1:1, V1);
                 %v = %v0 && %v1;
                 goto <0x1001>;
             "
@@ -755,8 +755,8 @@ mod tests {
             <block>
                 local i8 V0;
                 local i8 V1;
-                %v0 = load(i8, V0);
-                %v1 = load(i8, V1);
+                %v0 = load(V0:1, V0);
+                %v1 = load(V1:1, V1);
                 %v = %v0 || %v1;
                 goto <0x1001>;
             "
@@ -785,7 +785,7 @@ mod tests {
             "
             <block>
                 local i32 V0;
-                %v0 = load(i32, V0);
+                %v0 = load(V0:4, V0);
                 %v = i16 %v0 + i16 0x2;
                 goto <0x1001>;
             "

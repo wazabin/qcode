@@ -120,8 +120,8 @@ mod tests {
 
                 fn cmp:
                     <entry>
-                        %a = load(i32, &A);
-                        %b = load(i32, &B);
+                        %a = load(A:4, &A);
+                        %b = load(B:4, &B);
                         %of = sborrow(%a, %b);
                         %sub = %a - %b;
                         %sf = %sub s< 0x0;

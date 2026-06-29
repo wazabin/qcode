@@ -1780,38 +1780,38 @@ mod tests {
 
             fn test:
                 <bb1>
-                    store(&A, i32 1);
+                    store(A:4, &A <- i32 1);
                     if i8 1 goto <bb2> else goto <bb4>;
 
                 <bb2>
-                    %a0 = load(i32, &A);
-                    store(&A, i32 0);
+                    %a0 = load(A:4, &A);
+                    store(A:4, &A <- i32 0);
                     goto <bb3>;
 
                 <bb3>
-                    %a1 = load(i32, &A);
-                    store(&A, i32 1);
+                    %a1 = load(A:4, &A);
+                    store(A:4, &A <- i32 1);
                     if i8 1 goto <bb2> else goto <bb8>;
 
                 <bb4>
                     if i8 1 goto <bb5> else goto <bb6>;
 
                 <bb5>
-                    %a2 = load(i32, &A);
-                    store(&A, i32 2);
+                    %a2 = load(A:4, &A);
+                    store(A:4, &A <- i32 2);
                     goto <bb7>;
 
                 <bb6>
-                    %a3 = load(i32, &A);
-                    store(&A, i32 3);
+                    %a3 = load(A:4, &A);
+                    store(A:4, &A <- i32 3);
                     goto <bb7>;
 
                 <bb7>
-                    %a4 = load(i32, &A);
+                    %a4 = load(A:4, &A);
                     goto <bb8>;
 
                 <bb8>
-                    %a5 = load(i32, &A);
+                    %a5 = load(A:4, &A);
                     return at 0;
         "
         );
@@ -1852,8 +1852,8 @@ mod tests {
 
             fn test:
                 <bb>
-                    store(&A, i32 0xffffffff);
-                    %loaded = load(i64, &A);
+                    store(A:4, &A <- i32 0xffffffff);
+                    %loaded = load(A:8, &A);
                     %masked = %loaded & 0xf;
                     return at %masked;
         "
@@ -1881,19 +1881,19 @@ mod tests {
 
             fn test:
                 <entry>
-                    store(&A, i32 1);
+                    store(A:4, &A <- i32 1);
                     if i8 1 goto <left> else goto <right>;
 
                 <left>
-                    store(&A, i32 2);
+                    store(A:4, &A <- i32 2);
                     goto <exit>;
 
                 <right>
-                    store(&A, i32 3);
+                    store(A:4, &A <- i32 3);
                     goto <exit>;
 
                 <exit>
-                    %val = load(i32, &A);
+                    %val = load(A:4, &A);
                     return at 0;
         "
         );
@@ -1942,11 +1942,11 @@ mod tests {
 
             fn test:
                 <entry>
-                    store(&A, i32 1);
+                    store(A:4, &A <- i32 1);
                     goto <loop_header>;
 
                 <loop_header>
-                    %val = load(i32, &A);
+                    %val = load(A:4, &A);
                     if i8 1 goto <loop_header> else goto <exit>;
 
                 <exit>
@@ -1978,11 +1978,11 @@ mod tests {
 
             fn test:
                 <entry>
-                    store(&A, i32 42);
+                    store(A:4, &A <- i32 42);
                     goto <exit>;
 
                 <exit>
-                    %val = load(i32, &A);
+                    %val = load(A:4, &A);
                     return at 0;
         "
         );
@@ -2021,42 +2021,42 @@ mod tests {
 
             fn test:
                 <bb1>
-                    store(&A, i32 1);
+                    store(A:4, &A <- i32 1);
                     if i8 1 goto <bb2> else goto <bb4>;
 
                 <bb2>
-                    %a0 = load(i32, &A);
+                    %a0 = load(A:4, &A);
                     %t0 = %a0 + i32 1;
-                    store(&A, %t0);
+                    store(A:4, &A <- %t0);
                     goto <bb3>;
 
                 <bb3>
-                    %a1 = load(i32, &A);
+                    %a1 = load(A:4, &A);
                     %t1 = %a1 + %a1;
-                    store(&A, %t1);
+                    store(A:4, &A <- %t1);
                     if i8 1 goto <bb2> else goto <bb8>;
 
                 <bb4>
                     if i8 1 goto <bb5> else goto <bb6>;
 
                 <bb5>
-                    %a2 = load(i32, &A);
+                    %a2 = load(A:4, &A);
                     %t2 = %a2 + i32 2;
-                    store(&A, %t2);
+                    store(A:4, &A <- %t2);
                     goto <bb7>;
 
                 <bb6>
-                    %a3 = load(i32, &A);
+                    %a3 = load(A:4, &A);
                     %t3 = %a3 + i32 3;
-                    store(&A, %t3);
+                    store(A:4, &A <- %t3);
                     goto <bb7>;
 
                 <bb7>
-                    %a4 = load(i32, &A);
+                    %a4 = load(A:4, &A);
                     goto <bb8>;
 
                 <bb8>
-                    %a5 = load(i32, &A);
+                    %a5 = load(A:4, &A);
                     return at 0;
         "
         );
@@ -2391,14 +2391,14 @@ mod tests {
             "
                 fn func:
                     <entry>
-                        store({r0_lo32}, i32 0x12345678);
+                        store(register:4, {r0_lo32} <- i32 0x12345678);
                         goto <body>;
                     <body>
-                        %al = load(i8, {r0_byte0});
-                        store({r3}, %al);
-                        %next = load(i32, {r1});
-                        store({r0_lo32}, %next);
-                        %c = load(i8, {r2});
+                        %al = load(register:1, {r0_byte0});
+                        store(register:1, {r3} <- %al);
+                        %next = load(register:4, {r1});
+                        store(register:4, {r0_lo32} <- %next);
+                        %c = load(register:1, {r2});
                         if %c goto <body> else goto <exit>;
                     <exit>
                         return at 0x1000;
@@ -2445,14 +2445,14 @@ mod tests {
             "
                 fn func:
                     <entry>
-                        store({r0_lo32}, i32 0x12345678);
+                        store(register:4, {r0_lo32} <- i32 0x12345678);
                         goto <body>;
                     <body>
-                        %ah = load(i8, {r0_byte1});
-                        store({r3}, %ah);
-                        %next = load(i32, {r1});
-                        store({r0_lo32}, %next);
-                        %c = load(i8, {r2});
+                        %ah = load(register:1, {r0_byte1});
+                        store(register:1, {r3} <- %ah);
+                        %next = load(register:4, {r1});
+                        store(register:4, {r0_lo32} <- %next);
+                        %c = load(register:1, {r2});
                         if %c goto <body> else goto <exit>;
                     <exit>
                         return at 0x1000;
@@ -2844,7 +2844,7 @@ mod tests {
             "
             fn callee:
                 <callee_entry>
-                    store({r0}, i64 0x99);
+                    store(register:8, {r0} <- i64 0x99);
                     return at i64 0;
 
             fn caller:
@@ -2861,8 +2861,8 @@ mod tests {
                     goto <join>;
 
                 <join>
-                    %loaded = load(i64, {r0});
-                    store({r1}, %loaded);
+                    %loaded = load(register:8, {r0});
+                    store(register:8, {r1} <- %loaded);
                     return at i64 0;
             "
         );
@@ -2892,12 +2892,12 @@ mod tests {
             "
             fn callee:
                 <callee_entry>
-                    store({r0}, i64 0x99);
+                    store(register:8, {r0} <- i64 0x99);
                     return at i64 0;
 
             fn caller:
                 <entry>
-                    store({r0}, i64 1);
+                    store(register:8, {r0} <- i64 1);
                     if i8 1 goto <clobbered_path> else goto <live_in_path>;
 
                 <clobbered_path>
@@ -2907,17 +2907,17 @@ mod tests {
                     goto <join>;
 
                 <live_in_path>
-                    store({r0}, i64 2);
+                    store(register:8, {r0} <- i64 2);
                     goto <join>;
 
                 <join>
-                    %loaded = load(i64, {r0});
-                    store({r1}, %loaded);
+                    %loaded = load(register:8, {r0});
+                    store(register:8, {r1} <- %loaded);
 
                     goto <exit>;
 
                 <exit>
-                    store({r0}, i64 7);
+                    store(register:8, {r0} <- i64 7);
                     return at i64 0;
             "
         );
@@ -2980,7 +2980,7 @@ mod tests {
             "
             fn callee:
                 <callee_entry>
-                    store({unnamed}, i64 0x99);
+                    store(register:8, {unnamed} <- i64 0x99);
                     return at i64 0;
 
             fn caller:
@@ -2997,8 +2997,8 @@ mod tests {
                     goto <join>;
 
                 <join>
-                    %loaded = load(i64, {unnamed});
-                    store({r1}, %loaded);
+                    %loaded = load(register:8, {unnamed});
+                    store(register:8, {r1} <- %loaded);
                     return at i64 0;
             "
         );

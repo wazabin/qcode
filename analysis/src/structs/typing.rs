@@ -307,11 +307,11 @@ mod tests {
             fn f:
                 <entry>
                     varnode i64 base;
-                    Root* %root = load(i64, base);
+                    Root* %root = load(base:8, base);
                     %inner_slot = %root + 0x10;
-                    %inner = load(i64, %inner_slot);
+                    %inner = load(ram:8, %inner_slot);
                     %val_slot = %inner + 8;
-                    %vv = load(i32, %val_slot);
+                    %vv = load(ram:4, %val_slot);
                     return at i32 0;
             "
         );
@@ -359,9 +359,9 @@ mod tests {
             fn f:
                 <entry>
                     varnode i64 base;
-                    Root* %x = load(i64, base);
+                    Root* %x = load(base:8, base);
                     %slot = %x + 0x10;
-                    %y = load(i64, %slot);
+                    %y = load(ram:8, %slot);
                     return at i32 0;
             "
         );
@@ -387,9 +387,9 @@ mod tests {
                 <entry>
                     varnode i64 base;
                     varnode i64 dynp;
-                    Root* %root = load(i64, base);
+                    Root* %root = load(base:8, base);
                     %no_field = %root + 0x99;
-                    %d = load(i64, dynp);
+                    %d = load(dynp:8, dynp);
                     %dynamic = %root + %d;
                     return at i32 0;
             "

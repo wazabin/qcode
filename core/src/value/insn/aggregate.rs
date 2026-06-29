@@ -258,7 +258,7 @@ mod tests {
             type Inner { _: 8, val: 4 };
             varnode i64 base;
             <block>
-                Inner* %p = load(i64, base);
+                Inner* %p = load(base:8, base);
                 %f = gep(%p.val);
                 return at i64 0;
             "
