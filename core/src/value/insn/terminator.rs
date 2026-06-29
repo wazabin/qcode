@@ -108,12 +108,13 @@ impl MnemonicKind for Apply {
     }
 
     fn fmt(&self, f: &mut Formatter<'_>, ctx: &Context<'_>) -> std::fmt::Result {
-        write!(f, "apply @{}(", Function::from_id(ctx, self.target).name())?;
+        // Printed in the grammar's `apply name(positional args)` form so the
+        // result re-parses (the parser binds args positionally to root params).
+        write!(f, "apply {}(", Function::from_id(ctx, self.target).name())?;
         for (i, &arg) in self.args.iter().enumerate() {
             if i > 0 {
                 write!(f, ", ")?;
             }
-            fmt_call_arg_name(f, ctx, self.target, i)?;
             write!(f, "{}", ValueRef::new(arg, ctx))?;
         }
         write!(f, ");")
@@ -498,7 +499,7 @@ mod tests {
             ctx.get_insn(*insns.last().unwrap()).mnemonic(),
             Mnemonic::ReturnValue(_)
         ));
-        assert!(apply.as_statement().to_string().contains("apply @rec("));
+        assert!(apply.as_statement().to_string().contains("apply rec("));
         assert_eq!(
             ctx.get_insn(*insns.last().unwrap())
                 .as_statement()

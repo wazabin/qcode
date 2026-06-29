@@ -286,7 +286,7 @@ mod tests {
 
         let rec = Function::from_name(&ctx, "fib_loop_rec").expect("recursive lambda exists");
         assert!(rec.is_lambda());
-        assert!(rec.to_string().contains("apply @fib_loop_rec"));
+        assert!(rec.to_string().contains("apply fib_loop_rec"));
 
         assert_eq!(run(&ctx, fib_loop, 6), Some(8));
         assert_eq!(run(&ctx, fib_loop, 10), Some(55));

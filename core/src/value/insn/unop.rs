@@ -72,11 +72,12 @@ impl MnemonicKind for Unary {
 
     fn fmt(&self, f: &mut Formatter<'_>, ctx: &Context<'_>) -> std::fmt::Result {
         match self.op {
-            Unop::IntNegate | Unop::IntNot | Unop::BoolNot => {
+            // Prefix operators (`unop_op` in the grammar): `f- @x`, `~ @x`, …
+            Unop::IntNegate | Unop::IntNot | Unop::BoolNot | Unop::FloatNegate => {
                 write!(f, "{} {};", self.op, ValueRef::new(self.src, ctx))
             }
-            Unop::FloatNegate
-            | Unop::FloatAbs
+            // Named float operators (`func_unop` in the grammar): `abs(@x)`, …
+            Unop::FloatAbs
             | Unop::FloatSqrt
             | Unop::FloatCeil
             | Unop::FloatFloor

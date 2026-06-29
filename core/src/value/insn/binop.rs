@@ -97,7 +97,7 @@ impl Display for BoolBinop {
         let s = match self {
             BoolBinop::And => "&&",
             BoolBinop::Or => "||",
-            BoolBinop::Xor => "xor",
+            BoolBinop::Xor => "^^",
         };
 
         write!(f, "{}", s)

@@ -50,9 +50,9 @@ impl MnemonicKind for Map {
         // itself, not written here.
         let body = Function::from_id(ctx, self.body).name();
         if self.captures.is_empty() {
-            write!(f, "@{} <$> {};", body, ValueRef::new(self.src, ctx))
+            write!(f, "{} <$> {};", body, ValueRef::new(self.src, ctx))
         } else {
-            write!(f, "(@{}", body)?;
+            write!(f, "({}", body)?;
             for &c in &self.captures {
                 write!(f, " {}", ValueRef::new(c, ctx))?;
             }
@@ -111,7 +111,7 @@ mod tests {
         };
         let rendered = tc.ctx.get_insn(plain_id).as_statement().to_string();
         assert!(
-            rendered.contains("@foo <$>"),
+            rendered.contains("foo <$>"),
             "map renders as fmap, got: {rendered}"
         );
 
@@ -124,7 +124,7 @@ mod tests {
         };
         let rendered = tc.ctx.get_insn(cap_id).as_statement().to_string();
         assert!(
-            rendered.contains("(@foo ") && rendered.contains(") <$>"),
+            rendered.contains("(foo ") && rendered.contains(") <$>"),
             "a capturing map renders as a partial application, got: {rendered}"
         );
     }
