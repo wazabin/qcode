@@ -31,10 +31,11 @@ use std::cell::{Ref, RefCell};
 
 use qcode::{
     context::Context,
-    value::{FunctionId, VarnodeId},
+    space::Space,
+    value::{FunctionId, RegisterId, Varnode, VarnodeId},
 };
 
-use super::ArchConfig;
+use super::{ArchConfig, CallingConvention};
 use crate::structure::Program;
 use crate::RegisterBase;
 
@@ -58,6 +59,26 @@ impl PipelineEnv {
     /// the lifting passes will be inert.
     pub fn new(ctx: &Context, cfg: ArchConfig) -> Self {
         let sp_varnode = ctx.registers[&cfg.stack_pointer];
+        Self::from_parts(cfg, sp_varnode)
+    }
+
+    /// Build an env for running arch-agnostic passes on hand-written IR (CLI and
+    /// other tools), where there is no machine architecture to resolve. The
+    /// stack pointer is a throwaway varnode and the ABI is empty, so passes that
+    /// genuinely need register/ABI/stack information must not use this env —
+    /// arch-agnostic transforms (e.g. `loop_to_recursion`, `gvn`, `dce`) are fine.
+    pub fn headless(ctx: &mut Context) -> Self {
+        let space = ctx.make_temp_space();
+        let bitness = (Space::from_id(ctx, ctx.default_space).addr_size * 8) as u8;
+        let sp_varnode = Varnode::make(ctx, 0, (bitness / 8) as usize, space).id;
+        let cfg = ArchConfig {
+            // Unused by arch-agnostic passes; the real SP is `sp_varnode` above.
+            stack_pointer: RegisterId::from(0usize),
+            dead_flag_regs: Vec::new(),
+            abi: CallingConvention::default(),
+            os: ctx.target_os(),
+            bitness,
+        };
         Self::from_parts(cfg, sp_varnode)
     }
 

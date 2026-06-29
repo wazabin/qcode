@@ -71,6 +71,9 @@ pub use loop_unroll::{
     RecognizeSimpleLoops, UnrollSimpleLoops, recognize_simple_loops, unroll_simple_loops,
 };
 
+pub mod loop_to_recursion;
+pub use loop_to_recursion::{LoopToRecursion, loop_to_recursion};
+
 pub mod lift;
 pub use lift::{discover_addresses_in_binary, lift_new_addresses, split_overlapping_functions};
 
@@ -80,6 +83,7 @@ pub use pipeline::{
     DynFunctionPass, DynPass, FunctionPass, GpReg, LiftOutcome, LiftSummary, Pass,
     PassRegistration, Pipeline, PipelineEnv, PipelineServices, ProgressSink, RegisteredPass,
     YieldSignal, analyze_and_lift_with_progress, analyze_default, analyze_with_pipeline,
+    known_pass_names, make_pass,
 };
 #[cfg(not(target_arch = "wasm32"))]
 pub use pipeline::{
