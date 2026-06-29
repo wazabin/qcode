@@ -43,7 +43,7 @@ fn separate_varnodes_do_not_alias() {
         <block>
             %a = load(i32, &A);
             %b = load(i32, &B);
-            return [0];
+            return at 0;
     "
     );
 
@@ -68,7 +68,7 @@ fn complex_operations_in_same_space_become_may_alias() {
             %ptr = &A + i32 4;
             %a = load(i32, %ptr);
             %b = load(i32, &A);
-            return [0];
+            return at 0;
     "
     );
 
@@ -93,7 +93,7 @@ fn complex_operations_in_other_space_do_not_alias() {
             %ptr = &A + i32 4;
             %a = load(i32, %ptr);
             %b = load(i32, &A);
-            return [0];
+            return at 0;
     "
     );
 
@@ -129,7 +129,7 @@ fn irrelevant_instructions_and_constants_do_not_appear() {
         "
         <block>
             %sum = i32 1 + i32 2;
-            return [0];
+            return at 0;
     "
     );
 
@@ -467,7 +467,7 @@ fn unresolvable_load_ptr_becomes_unknown_and_aliases_everything() {
             %ptr2 = i64 0x10 + i64 0x1;
             %v1 = load(i64, %ptr1);
             %v2 = load(i64, %ptr2);
-            return [0];
+            return at 0;
     "
     );
 
@@ -489,7 +489,7 @@ fn unresolvable_load_ptr_in_register_space_does_not_alias_registers() {
             %rhs = load(i64, {r0});
             %ptr = %lhs + %rhs;
             %value = load(i64, %ptr);
-            return [%value];
+            return at %value;
     "
     );
 
@@ -518,7 +518,7 @@ fn store_then_load_invalidation_is_conservative_for_unknown_ptr() {
             %ptr = &A + %base;
             store(%ptr, i64 0x7);
             %after = load(i64, &A);
-            return [%after];
+            return at %after;
     "
     );
 

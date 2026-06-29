@@ -51,7 +51,7 @@ mod tests {
             "
                 fn foo:
                     <entry>
-                        return [0x1000];
+                        return at 0x1000;
             "
         );
 

@@ -1812,7 +1812,7 @@ mod tests {
 
                 <bb8>
                     %a5 = load(i32, &A);
-                    return [0];
+                    return at 0;
         "
         );
 
@@ -1855,7 +1855,7 @@ mod tests {
                     store(&A, i32 0xffffffff);
                     %loaded = load(i64, &A);
                     %masked = %loaded & 0xf;
-                    return [%masked];
+                    return at %masked;
         "
         );
 
@@ -1894,7 +1894,7 @@ mod tests {
 
                 <exit>
                     %val = load(i32, &A);
-                    return [0];
+                    return at 0;
         "
         );
 
@@ -1950,7 +1950,7 @@ mod tests {
                     if i8 1 goto <loop_header> else goto <exit>;
 
                 <exit>
-                    return [0];
+                    return at 0;
         "
         );
 
@@ -1983,7 +1983,7 @@ mod tests {
 
                 <exit>
                     %val = load(i32, &A);
-                    return [0];
+                    return at 0;
         "
         );
 
@@ -2057,7 +2057,7 @@ mod tests {
 
                 <bb8>
                     %a5 = load(i32, &A);
-                    return [0];
+                    return at 0;
         "
         );
 
@@ -2401,7 +2401,7 @@ mod tests {
                         %c = load(i8, {r2});
                         if %c goto <body> else goto <exit>;
                     <exit>
-                        return [0x1000];
+                        return at 0x1000;
             "
         );
 
@@ -2455,7 +2455,7 @@ mod tests {
                         %c = load(i8, {r2});
                         if %c goto <body> else goto <exit>;
                     <exit>
-                        return [0x1000];
+                        return at 0x1000;
             "
         );
 
@@ -2845,7 +2845,7 @@ mod tests {
             fn callee:
                 <callee_entry>
                     store({r0}, i64 0x99);
-                    return [i64 0];
+                    return at i64 0;
 
             fn caller:
                 <entry>
@@ -2863,7 +2863,7 @@ mod tests {
                 <join>
                     %loaded = load(i64, {r0});
                     store({r1}, %loaded);
-                    return [i64 0];
+                    return at i64 0;
             "
         );
         tc.ctx.add_cfg_edge(clobbered_path, clobbered_cont);
@@ -2893,7 +2893,7 @@ mod tests {
             fn callee:
                 <callee_entry>
                     store({r0}, i64 0x99);
-                    return [i64 0];
+                    return at i64 0;
 
             fn caller:
                 <entry>
@@ -2918,7 +2918,7 @@ mod tests {
 
                 <exit>
                     store({r0}, i64 7);
-                    return [i64 0];
+                    return at i64 0;
             "
         );
         tc.ctx.add_cfg_edge(clobbered_path, clobbered_cont);
@@ -2981,7 +2981,7 @@ mod tests {
             fn callee:
                 <callee_entry>
                     store({unnamed}, i64 0x99);
-                    return [i64 0];
+                    return at i64 0;
 
             fn caller:
                 <entry>
@@ -2999,7 +2999,7 @@ mod tests {
                 <join>
                     %loaded = load(i64, {unnamed});
                     store({r1}, %loaded);
-                    return [i64 0];
+                    return at i64 0;
             "
         );
         tc.ctx.add_cfg_edge(clobbered_path, clobbered_cont);

@@ -1,5 +1,5 @@
 use crate::ast::{
-    Atom, BlockParamDecl, CastOp, ExprNode, ExtractField, FnDecl, GepField, Label, Program,
+    Atom, BlockParamDecl, CastOp, ExprNode, ExtractField, FnDecl, FnKind, GepField, Label, Program,
     ProgramKind, SourcePosition, SourceSpan, Statement, StructDecl, StructFieldDecl,
     StructFieldType, TupleField, TypedAtom,
 };
@@ -144,6 +144,14 @@ fn parse_struct_decl(pair: Pair<'_, Rule>) -> Result<StructDecl, ParseError> {
 fn parse_fn_decl(pair: Pair<'_, Rule>) -> Result<FnDecl, ParseError> {
     let span = source_span(pair.as_span());
     let mut inner = pair.into_inner();
+    let kind_pair = inner
+        .next()
+        .ok_or_else(|| ParseError::new("missing function kind"))?;
+    let kind = match kind_pair.as_str() {
+        "fn" => FnKind::Machine,
+        "lambda" => FnKind::Lambda,
+        _ => return Err(ParseError::new("invalid function kind")),
+    };
     let name_pair = inner
         .next()
         .ok_or_else(|| ParseError::new("missing function name"))?;
@@ -177,6 +185,7 @@ fn parse_fn_decl(pair: Pair<'_, Rule>) -> Result<FnDecl, ParseError> {
     }
 
     Ok(FnDecl {
+        kind,
         name,
         name_span,
         span,
@@ -435,12 +444,50 @@ fn parse_terminator(pair: Pair<'_, Rule>) -> Result<Statement, ParseError> {
 
         Rule::return_stmt => {
             let mut inner = specific.into_inner();
-            let ptr = parse_typed_atom(
-                inner
-                    .next()
-                    .ok_or_else(|| ParseError::new("missing return pointer"))?,
-            )?;
-            Ok(Statement::Return { ptr, span })
+            let ret = inner
+                .next()
+                .ok_or_else(|| ParseError::new("missing return body"))?;
+            match ret.as_rule() {
+                Rule::return_at_stmt => {
+                    let ptr = parse_typed_atom(
+                        ret.into_inner()
+                            .find(|p| p.as_rule() == Rule::typed_atom)
+                            .ok_or_else(|| ParseError::new("missing return pointer"))?,
+                    )?;
+                    Ok(Statement::Return {
+                        ptr,
+                        value: None,
+                        span,
+                    })
+                }
+                Rule::return_value_at_stmt => {
+                    let mut atoms = ret.into_inner().filter(|p| p.as_rule() == Rule::typed_atom);
+                    let value = parse_typed_atom(
+                        atoms
+                            .next()
+                            .ok_or_else(|| ParseError::new("missing return value"))?,
+                    )?;
+                    let ptr = parse_typed_atom(
+                        atoms
+                            .next()
+                            .ok_or_else(|| ParseError::new("missing return pointer"))?,
+                    )?;
+                    Ok(Statement::Return {
+                        ptr,
+                        value: Some(value),
+                        span,
+                    })
+                }
+                Rule::return_value_stmt => {
+                    let value = parse_typed_atom(
+                        ret.into_inner()
+                            .find(|p| p.as_rule() == Rule::typed_atom)
+                            .ok_or_else(|| ParseError::new("missing return value"))?,
+                    )?;
+                    Ok(Statement::ReturnValue { value, span })
+                }
+                _ => Err(ParseError::new("invalid return")),
+            }
         }
 
         _ => Err(ParseError::new("invalid terminator")),
@@ -520,6 +567,7 @@ fn parse_expr(pair: Pair<'_, Rule>) -> Result<ExprNode, ParseError> {
         Rule::func_unop => parse_func_unop(inner),
         Rule::func_call => parse_func_call(inner),
         Rule::intrinsic_call => parse_intrinsic_call(inner),
+        Rule::apply => parse_apply(inner),
         Rule::map => parse_map(inner),
         Rule::binary => parse_binary(inner),
         Rule::memory => parse_memory(inner),
@@ -530,6 +578,24 @@ fn parse_expr(pair: Pair<'_, Rule>) -> Result<ExprNode, ParseError> {
         Rule::range => parse_range(inner),
         _ => Err(ParseError::new("invalid expression")),
     }
+}
+
+fn parse_apply(pair: Pair<'_, Rule>) -> Result<ExprNode, ParseError> {
+    let mut target = None;
+    let mut args = Vec::new();
+
+    for part in pair.into_inner() {
+        match part.as_rule() {
+            Rule::ident => target = Some(part.as_str().to_owned()),
+            Rule::typed_atom => args.push(parse_typed_atom(part)?),
+            _ => {}
+        }
+    }
+
+    Ok(ExprNode::Apply {
+        target: target.ok_or_else(|| ParseError::new("missing apply target"))?,
+        args,
+    })
 }
 
 fn parse_range(pair: Pair<'_, Rule>) -> Result<ExprNode, ParseError> {
@@ -1583,7 +1649,7 @@ mod tests {
 
     #[test]
     fn parses_return() {
-        let statements = stmts("return [{ptr}]");
+        let statements = stmts("return at {ptr}");
         assert_eq!(statements.len(), 1);
 
         match &statements[0] {
@@ -1814,7 +1880,7 @@ mod tests {
 
     #[test]
     fn parses_comment_in_fn_body() {
-        let program = parse_program("fn f: <entry> # load value\n%x = {v} + 1; return [%x]")
+        let program = parse_program("fn f: <entry> # load value\n%x = {v} + 1; return at %x")
             .expect("parse should succeed");
         match program.kind {
             ProgramKind::Functions { fns, .. } => {
@@ -1830,7 +1896,7 @@ mod tests {
 
     #[test]
     fn parses_top_level_varnode_before_fn() {
-        let program = parse_program("varnode i64 ptr; fn f: <entry> return [ptr]")
+        let program = parse_program("varnode i64 ptr; fn f: <entry> return at ptr")
             .expect("parse should succeed");
         match program.kind {
             ProgramKind::Functions { varnodes, fns } => {
@@ -1842,6 +1908,45 @@ mod tests {
             }
             _ => panic!("expected function program"),
         }
+    }
+
+    #[test]
+    fn parses_lambda_apply_and_value_returns() {
+        let program = parse_program(
+            "lambda rec: <entry @s:i64> %next = @s + 1; %out = apply rec(%next); return %out",
+        )
+        .expect("parse should succeed");
+        let ProgramKind::Functions { fns, .. } = program.kind else {
+            panic!("expected function program")
+        };
+        assert_eq!(fns.len(), 1);
+        assert_eq!(fns[0].kind, crate::ast::FnKind::Lambda);
+        assert!(matches!(
+            &fns[0].statements[2],
+            Statement::Assign { expr: ExprNode::Apply { target, args }, .. }
+                if target == "rec" && args.len() == 1
+        ));
+        assert!(matches!(
+            &fns[0].statements[3],
+            Statement::ReturnValue { value, .. } if matches!(&value.atom, Atom::Ssa(name) if name == "out")
+        ));
+    }
+
+    #[test]
+    fn parses_machine_return_at_forms() {
+        let statements = stmts("return at %ptr; return %v at %ptr");
+        assert_eq!(statements.len(), 2);
+        assert!(matches!(
+            &statements[0],
+            Statement::Return { value: None, ptr, .. }
+                if matches!(&ptr.atom, Atom::Ssa(name) if name == "ptr")
+        ));
+        assert!(matches!(
+            &statements[1],
+            Statement::Return { value: Some(value), ptr, .. }
+                if matches!(&value.atom, Atom::Ssa(name) if name == "v")
+                    && matches!(&ptr.atom, Atom::Ssa(name) if name == "ptr")
+        ));
     }
 
     #[test]

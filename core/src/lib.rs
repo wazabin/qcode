@@ -98,6 +98,7 @@ pub mod context;
 pub mod discovery;
 pub mod error;
 pub mod intrinsics;
+pub mod lower;
 pub mod memory_image;
 pub mod pass_scope;
 pub mod space;

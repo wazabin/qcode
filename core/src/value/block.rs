@@ -749,7 +749,7 @@ mod tests {
                 %x = load(i64, &X);
                 %y = load(i64, &Y);
                 %sum = i64 %x + i64 %y;
-                return [i64 0];
+                return at i64 0;
             "
         );
 
@@ -773,7 +773,7 @@ mod tests {
         );
         assert_eq!(
             iter.next().unwrap().as_statement().to_string(),
-            "return [0x0];"
+            "return at 0x0;"
         );
     }
 
@@ -791,7 +791,7 @@ mod tests {
                 %x = load(i64, &X);
                 %y = load(i64, &Y);
                 %sum = i64 %x + i64 %y;
-                return [i64 0];
+                return at i64 0;
             "
         );
 
@@ -977,7 +977,7 @@ mod tests {
             ctx,
             "
             <entry>
-                return [i64 0];
+                return at i64 0;
             "
         );
 
@@ -1003,7 +1003,7 @@ mod tests {
                 %x = load(i64, &X);
                 %y = load(i64, &Y);
                 %sum = i64 %x + i64 %y;
-                return [i64 0];
+                return at i64 0;
             "
         );
 
@@ -1042,7 +1042,7 @@ mod tests {
                 %x = load(i64, &X);
                 %y = load(i64, &Y);
                 %sum = i64 %x + i64 %y;
-                return [i64 0];
+                return at i64 0;
             "
         );
 
@@ -1078,7 +1078,7 @@ mod tests {
             <b>
                 goto <exit>;
             <exit>
-                return [i64 0];
+                return at i64 0;
             "
         );
 
@@ -1145,7 +1145,7 @@ mod tests {
                 %y = %x + i64 3;
                 goto <exit>;
             <exit>
-                return [i64 0];
+                return at i64 0;
             "
         );
 

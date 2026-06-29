@@ -128,9 +128,9 @@ mod tests {
                         %lt = %of != %sf;
                         if %lt goto <t> else goto <e>;
                     <t>
-                        return [0x1000];
+                        return at 0x1000;
                     <e>
-                        return [0x2000];
+                        return at 0x2000;
                 "
         );
 

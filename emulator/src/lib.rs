@@ -336,7 +336,9 @@ pub trait Interpreter {
             | Mnemonic::BranchInd(_)
             | Mnemonic::Call(_)
             | Mnemonic::CallInd(_)
-            | Mnemonic::Return(_) => None,
+            | Mnemonic::Return(_)
+            | Mnemonic::ReturnValue(_)
+            | Mnemonic::Apply(_) => None,
 
             // ===== Unary operations =====
             Mnemonic::Unop(Unary { op, src }) => {

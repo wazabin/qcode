@@ -412,7 +412,7 @@ mod tests {
 
     /// Wire `fid` into the `pure_reg` shape used by production: attach each
     /// return block's in-block `Tuple` as that `Return`'s functional value (the
-    /// `qcode` `return [..]` bracket is only the ABI list, not `Return::value`),
+    /// `qcode` `return at ..` operand is only the ABI list, not `Return::value`),
     /// mark it `pure_reg`, and record `inputs`. Returns the write-set type.
     fn make_pure_reg(
         tc: &mut qcode::testing::TestContext,
@@ -494,7 +494,7 @@ mod tests {
                 <f_entry @r0:i64 @r1:i64>
                     %sum = @r0 + i64 5;
                     %agg = (@r0, i64 100, %sum);
-                    return [%agg];
+                    return at %agg;
 
             fn g:
                 <g_entry>
@@ -502,7 +502,7 @@ mod tests {
                 <g_call>
                     call <f>;
                 <g_cont>
-                    return [i64 0];
+                    return at i64 0;
             "
         );
         let _ = g;
@@ -548,7 +548,7 @@ mod tests {
             "
             fn f:
                 <f_entry @r0:i64>
-                    return [i64 0];
+                    return at i64 0;
 
             fn g:
                 <g_entry>
@@ -556,7 +556,7 @@ mod tests {
                 <g_call>
                     call <f>;
                 <g_cont>
-                    return [i64 0];
+                    return at i64 0;
             "
         );
         let _ = g;
@@ -629,7 +629,7 @@ mod tests {
             fn f:
                 <f_entry @r0:i64 @r1:i64>
                     %agg = (@r1);
-                    return [%agg];
+                    return at %agg;
 
             fn g:
                 <g_entry>
@@ -637,7 +637,7 @@ mod tests {
                 <g_call>
                     call <f>;
                 <g_cont>
-                    return [i64 0];
+                    return at i64 0;
             "
         );
         let _ = g;
@@ -681,7 +681,7 @@ mod tests {
                     %c = %b + i64 1;
                     %d = %c + i64 1;
                     %agg = (%d);
-                    return [%agg];
+                    return at %agg;
 
             fn g:
                 <g_entry>
@@ -689,7 +689,7 @@ mod tests {
                 <g_call>
                     call <f>;
                 <g_cont>
-                    return [i64 0];
+                    return at i64 0;
             "
         );
         let _ = g;
@@ -719,7 +719,7 @@ mod tests {
                 <f_entry @r0:i64>
                     %l = load(i64, {r2});
                     %agg = (%l);
-                    return [%agg];
+                    return at %agg;
 
             fn g:
                 <g_entry>
@@ -727,7 +727,7 @@ mod tests {
                 <g_call>
                     call <f>;
                 <g_cont>
-                    return [i64 0];
+                    return at i64 0;
             "
         );
         let _ = (g, r2);
@@ -758,7 +758,7 @@ mod tests {
                 <f_entry @r0:i64>
                     %s = @r0 + {r2};
                     %agg = (%s);
-                    return [%agg];
+                    return at %agg;
 
             fn g:
                 <g_entry>
@@ -766,7 +766,7 @@ mod tests {
                 <g_call>
                     call <f>;
                 <g_cont>
-                    return [i64 0];
+                    return at i64 0;
             "
         );
         let _ = (g, r2);
@@ -796,11 +796,11 @@ mod tests {
                     if @r0 goto <rt> else goto <rf>;
                 <rt>
                     %at = (%sum, @r0);
-                    return [%at];
+                    return at %at;
                 <rf>
                     %bsum = @r0 + i64 9;
                     %af = (%sum, %bsum);
-                    return [%af];
+                    return at %af;
 
             fn g:
                 <g_entry>
@@ -808,7 +808,7 @@ mod tests {
                 <g_call>
                     call <f>;
                 <g_cont>
-                    return [i64 0];
+                    return at i64 0;
             "
         );
         let _ = g;
@@ -843,7 +843,7 @@ mod tests {
                     %sum = @r0 + i64 5;
                     %l = load(i64, {r2});
                     %agg = (%sum, %l);
-                    return [%agg];
+                    return at %agg;
 
             fn g:
                 <g_entry>
@@ -851,7 +851,7 @@ mod tests {
                 <g_call>
                     call <f>;
                 <g_cont>
-                    return [i64 0];
+                    return at i64 0;
             "
         );
         let _ = (g, r2);

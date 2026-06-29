@@ -115,7 +115,7 @@ mod tests {
                     %s1 = %x << i32 8;
                     %s2 = %x >> i32 24;
                     %r  = %s1 | %s2;
-                    return [%r];
+                    return at %r;
             "
         );
 
@@ -138,7 +138,7 @@ mod tests {
             fn f:
                 <entry>
                     %r = $rol(i32 0x12345678, i32 8);
-                    return [%r];
+                    return at %r;
             "
         );
 
@@ -160,7 +160,7 @@ mod tests {
                 <entry>
                     %x = load(i32, &X);
                     %r = $rol(%x, i32 0);
-                    return [%r];
+                    return at %r;
             "
         );
 
@@ -182,7 +182,7 @@ mod tests {
                     %x = load(i32, &X);
                     %l = $rol(%x, i32 8);
                     %r = $ror(%l, i32 8);
-                    return [%r];
+                    return at %r;
             "
         );
 
@@ -196,7 +196,7 @@ mod tests {
             "ror(rol(x, c), c) should cancel away"
         );
         assert!(
-            ctx.to_string().contains("return [i32 %x]"),
+            ctx.to_string().contains("return at i32 %x"),
             "return should forward to x after cancellation, got:\n{ctx}"
         );
     }
@@ -214,7 +214,7 @@ mod tests {
                 <entry>
                     %x = load(i32, &X);
                     %r = $rol(%x, i32 40);
-                    return [%r];
+                    return at %r;
             "
         );
 
@@ -240,7 +240,7 @@ mod tests {
                 <entry>
                     %x = load(i32, &X);
                     %r = $rol(%x, i32 32);
-                    return [%r];
+                    return at %r;
             "
         );
 
@@ -266,7 +266,7 @@ mod tests {
                     %s1 = %x << i32 8;
                     %s2 = %x >> i32 24;
                     %r  = %s1 | %s2;
-                    return [%r];
+                    return at %r;
             "
         );
         gvn_function(&mut ctx, f, None);

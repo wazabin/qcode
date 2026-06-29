@@ -6,9 +6,10 @@ struct_decl     =  { "type" ~ ident ~ "{" ~ struct_field ~ ("," ~ struct_field)*
 struct_field    =  { ident ~ ":" ~ (struct_ptr_ty | integer) }
 struct_ptr_ty   = @{ ident ~ "*" }
 top_varnode_list =  { local_decl ~ (";" ~ local_decl)* ~ ";"* }
-fn_decl         =  { "fn" ~ ident ~ ":" ~ fn_body? }
+fn_decl         =  { fn_kind ~ ident ~ ":" ~ fn_body? }
+fn_kind         =  { "fn" | "lambda" }
 fn_body         =  { fn_stmt ~ (";" ~ fn_stmt)* ~ ";"* }
-fn_stmt         =  { !("fn" ~ ident ~ ":") ~ compound_stmt }
+fn_stmt         =  { !((fn_kind ~ ident ~ ":")) ~ compound_stmt }
 statement_list  =  { compound_stmt ~ (";" ~ compound_stmt)* ~ ";"* }
 compound_stmt   =  { label_decl+ ~ inner_stmt? | inner_stmt }
 inner_stmt      =  { local_decl | assignment_ssa | terminator | assert_stmt | expr }
@@ -29,9 +30,12 @@ branchind_stmt  =  { "goto" ~ "[" ~ typed_atom ~ "]" }
 cbranch_stmt    =  { "if" ~ typed_atom ~ "goto" ~ branch_label ~ "else" ~ "goto" ~ branch_label }
 call_stmt       =  { "call" ~ label }
 callind_stmt    =  { "call" ~ "[" ~ typed_atom ~ "]" }
-return_stmt     =  { "return" ~ "[" ~ typed_atom ~ "]" }
+return_stmt     =  { return_at_stmt | return_value_at_stmt | return_value_stmt }
+return_at_stmt  =  { "return" ~ "at" ~ typed_atom }
+return_value_at_stmt = { "return" ~ typed_atom ~ "at" ~ typed_atom }
+return_value_stmt = { "return" ~ typed_atom }
 assert_stmt     =  { "assert" ~ typed_atom }
-expr            =  { memory | cast | extract | gep | unop | func_unop | intrinsic_call | map | func_call | range | binary | tuple | atom_expr }
+expr            =  { memory | cast | extract | gep | unop | func_unop | intrinsic_call | apply | map | func_call | range | binary | tuple | atom_expr }
 expr_stmt       =  { SOI ~ expr ~ EOI }
 atom_expr       =  { typed_atom }
 unop            =  { unop_op ~ typed_atom }
@@ -39,6 +43,7 @@ func_unop       =  { func_unop_op ~ "(" ~ typed_atom ~ ")" }
 func_call       =  { func_ident ~ "(" ~ typed_atom ~ ("," ~ typed_atom)? ~ ")" }
 intrinsic_call  =  { intrinsic_name ~ "(" ~ typed_atom ~ ("," ~ typed_atom)* ~ ")" }
 intrinsic_name  = @{ "$" ~ (ASCII_ALPHA | "_") ~ (ASCII_ALPHANUMERIC | "_")* }
+apply           =  { "apply" ~ ident ~ "(" ~ (typed_atom ~ ("," ~ typed_atom)*)? ~ ")" }
 // `body <$> src` / `(body c0 c1) <$> src` (Haskell `fmap`): a `map` over an
 // array. The body is a function symbol declared elsewhere in the program; the
 // optional parenthesized list supplies loop-invariant captures.

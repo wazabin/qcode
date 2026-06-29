@@ -15,6 +15,7 @@ inventory.workspace = true
 jstd.workspace = true
 pest.workspace = true
 qcode_macro.workspace = true
+qcode_parser.workspace = true
 serde.workspace = true
 log.workspace = true
 rustc-hash.workspace = true

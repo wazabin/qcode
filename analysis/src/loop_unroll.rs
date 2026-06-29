@@ -842,7 +842,7 @@ mod tests {
                 %i_next = @i + 0x1;
                 goto <header @i=%i_next @sum=%sum_next>;
             <exit>
-                return [0x0];
+                return at 0x0;
             "
         );
 
@@ -877,7 +877,7 @@ mod tests {
                 %i_next = @i + 0x1;
                 goto <header @i=%i_next @sum=%sum_next>;
             <exit>
-                return [0x0];
+                return at 0x0;
             "
         );
 
@@ -910,7 +910,7 @@ mod tests {
                 %i_next = @i + 0x1;
                 goto <header @i=%i_next @sum=%sum_next>;
             <exit>
-                return [0x0];
+                return at 0x0;
             "
         );
 
@@ -940,7 +940,7 @@ mod tests {
                 %keep_going = @i != 0x1;
                 if %keep_going goto <header @i=%i_next> else goto <exit>;
             <exit>
-                return [0x0];
+                return at 0x0;
             "
         );
 
@@ -969,7 +969,7 @@ mod tests {
                 %i_next = @i + 0x1;
                 goto <header @i=%i_next @sum=%sum_next>;
             <exit>
-                return [0x0];
+                return at 0x0;
             "
         );
 
@@ -993,7 +993,7 @@ mod tests {
                 %i_next = @i * 0x2;
                 goto <header @i=%i_next>;
             <exit>
-                return [0x0];
+                return at 0x0;
             "
         );
 
@@ -1018,7 +1018,7 @@ mod tests {
                 %i_next = @i + 0x1;
                 goto <header @i=%i_next @sum=%sum_next>;
             <exit @result:i64>
-                return [@result];
+                return at @result;
             "
         );
 
@@ -1056,7 +1056,7 @@ mod tests {
                 %i_next = @i + 0x1;
                 goto <header @i=%i_next @ptr=@ptr>;
             <exit>
-                return [0x0];
+                return at 0x0;
             "
         );
 
@@ -1103,7 +1103,7 @@ mod tests {
                 goto <header @i=%i_next>;
             <exit @fin:i64>
                 %p = (@fin);
-                return [@fin];
+                return at @fin;
             "
         );
 
@@ -1211,7 +1211,7 @@ mod tests {
                 goto <header @i=%i_next>;
             <exit>
                 %p = (@i);
-                return [@i];
+                return at @i;
             "
         );
 
@@ -1237,7 +1237,7 @@ mod tests {
                 %i_next = @i + 0x1;
                 goto <header @i=%i_next>;
             <exit>
-                return [0x0];
+                return at 0x0;
             "
         );
 

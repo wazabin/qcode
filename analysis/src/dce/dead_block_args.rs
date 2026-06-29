@@ -547,7 +547,7 @@ mod tests {
                 %next = @ind + @inv;
                 if %cond goto <header @inv=@inv @ind=%next> else goto <exit>;
             <exit>
-                return [0x0];
+                return at 0x0;
             "
         );
 
@@ -588,7 +588,7 @@ mod tests {
             <latch @y:i64>
                 goto <header @x=@y>;
             <exit>
-                return [0x0];
+                return at 0x0;
             "
         );
 
@@ -622,7 +622,7 @@ mod tests {
                 goto <join @m=0x2>;
             <join @m:i64>
                 store(0x4000, i64 @m);
-                return [0x0];
+                return at 0x0;
             "
         );
 
@@ -650,7 +650,7 @@ mod tests {
             <join @same:i64 @merge:i64>
                 store(0x4000, i64 @merge);
                 store(0x4008, i64 @same);
-                return [0x0];
+                return at 0x0;
             "
         );
 
@@ -693,7 +693,7 @@ mod tests {
                 store(0x4000, i64 @inv);
                 if %i goto <header @inv=%re> else goto <exit>;
             <exit>
-                return [0x0];
+                return at 0x0;
             "
         );
 
@@ -733,7 +733,7 @@ mod tests {
                 store(0x4000, i64 @inv);
                 if %i goto <header @inv=%c2> else goto <exit>;
             <exit>
-                return [0x0];
+                return at 0x0;
             "
         );
 
@@ -771,7 +771,7 @@ mod tests {
                 store(0x4000, i64 @inv);
                 if %i goto <header @inv=%re> else goto <exit>;
             <exit>
-                return [0x0];
+                return at 0x0;
             "
         );
 
@@ -807,7 +807,7 @@ mod tests {
                 %re = %c + 0x1;
                 if %i goto <header @inv=%re> else goto <exit>;
             <exit>
-                return [0x0];
+                return at 0x0;
             "
         );
 
@@ -834,7 +834,7 @@ mod tests {
                 %c = load(i8, 0x1000);
                 if %c goto <root @x=@x> else goto <exit>;
             <exit>
-                return [0x0];
+                return at 0x0;
             "
         );
 
@@ -866,7 +866,7 @@ mod tests {
                 %c = load(i8, 0x1000);
                 if %c goto <a @inva=@invb @merga=%n> else goto <exit>;
             <exit>
-                return [0x0];
+                return at 0x0;
             "
         );
 
@@ -915,7 +915,7 @@ mod tests {
                 %c = %ni < 0x270;
                 if %c goto <hdr @acc=%na @i=%ni @junk=%nj> else goto <exit>;
             <exit>
-                return [0x0];
+                return at 0x0;
             "
         );
 
@@ -954,7 +954,7 @@ mod tests {
             <latch @a2:i64 @b2:i64>
                 goto <hdr @a=@a2 @b=@b2>;
             <exit>
-                return [0x0];
+                return at 0x0;
             "
         );
 
@@ -985,7 +985,7 @@ mod tests {
                 store(0x4000, i64 @y);
                 goto <exit>;
             <exit>
-                return [0x0];
+                return at 0x0;
             "
         );
 
@@ -1011,7 +1011,7 @@ mod tests {
                 %c = @cnt < 0xa;
                 if %c goto <hdr @cnt=%n> else goto <exit>;
             <exit>
-                return [0x0];
+                return at 0x0;
             "
         );
 
@@ -1033,7 +1033,7 @@ mod tests {
                 %p = load(i64, 0x2000);
                 goto <ret @r=%p>;
             <ret @r:i64>
-                return [@r];
+                return at @r;
             "
         );
 
@@ -1061,7 +1061,7 @@ mod tests {
                 %c = @i < 0x5;
                 if %c goto <hdr @i=%ni @dead=%nd> else goto <exit>;
             <exit>
-                return [0x0];
+                return at 0x0;
             "
         );
 
@@ -1089,7 +1089,7 @@ mod tests {
             fn test:
             <root @x:i64 @y:i64>
                 store(0x4000, i64 @x);
-                return [0x0];
+                return at 0x0;
             "
         );
 
@@ -1116,9 +1116,9 @@ mod tests {
                 goto <b @zb=@za>;
             <b @zb:i64>
                 store(0x4000, 0x9);
-                return [0x0];
+                return at 0x0;
             <exit>
-                return [0x0];
+                return at 0x0;
             "
         );
 

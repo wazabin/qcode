@@ -184,7 +184,7 @@ mod tests {
                 %b = i64 7 + i64 0;
                 %t = pack(lhs=%a, rhs=%b);
                 %x = extract(%t.rhs);
-                return [i64 0];
+                return at i64 0;
             "
         );
 
@@ -260,7 +260,7 @@ mod tests {
             <block>
                 Inner* %p = load(i64, base);
                 %f = gep(%p.val);
-                return [i64 0];
+                return at i64 0;
             "
         );
 

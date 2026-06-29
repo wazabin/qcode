@@ -44,11 +44,11 @@ use crate::{
         block_param::BlockParamMutRef,
         function::FunctionId,
         insn::{
-            Assert, Binary, Binop, BoolBinop, Branch, BranchInd, CBranch, Call, CallInd, Carry,
-            Extract, FloatBinop, FloatToFloat, FloatToInt, Gep, InstructionId, InstructionRef,
-            IntBinop, IntToFloat, IntrinsicApp, IntrinsicId, IsFloatNaN, Load, LzCount, Map,
-            Mnemonic, PCodeOp, PCodeOpId, PopCount, Range, Return, SBorrow, SCarry, Scan, Sext,
-            Store, Tuple, Unary, Unop, Zext,
+            Apply, Assert, Binary, Binop, BoolBinop, Branch, BranchInd, CBranch, Call, CallInd,
+            Carry, Extract, FloatBinop, FloatToFloat, FloatToInt, Gep, InstructionId,
+            InstructionRef, IntBinop, IntToFloat, IntrinsicApp, IntrinsicId, IsFloatNaN, Load,
+            LzCount, Map, Mnemonic, PCodeOp, PCodeOpId, PopCount, Range, Return, ReturnValue,
+            SBorrow, SCarry, Scan, Sext, Store, Tuple, Unary, Unop, Zext,
         },
         util::base_ref::{WithCtx, WithCtxMut},
         varnode::{Varnode, VarnodeId},
@@ -1018,6 +1018,22 @@ impl<'str, 'ctx> Builder<'str, 'ctx> {
         )
     }
 
+    /// Builds a value-level application of a pure lambda function. Unlike
+    /// [`push_call`](Self::push_call), this is an ordinary SSA instruction and
+    /// does not terminate the current block.
+    pub fn push_apply(
+        &mut self,
+        target: FunctionId,
+        args: Vec<ValueId>,
+    ) -> InstructionRef<'str, '_> {
+        let ty = self.lambda_return_type(target).unwrap_or_else(|| {
+            args.first()
+                .map(|&arg| self.context_mut().type_of(arg))
+                .unwrap_or_else(|| self.context_mut().types.get_or_make_int(0))
+        });
+        self.push_instruction_with_type(Mnemonic::Apply(Apply { target, args }), ty)
+    }
+
     /// The type of the value returned by `body`'s first `Return`, or `None` if
     /// `body` has no root or returns nothing — used to size a [`push_map`] result.
     fn map_body_return_type(&self, body: FunctionId) -> Option<TypeId> {
@@ -1026,6 +1042,17 @@ impl<'str, 'ctx> Builder<'str, 'ctx> {
             .iter()
             .find_map(|i| match i.mnemonic() {
                 Mnemonic::Return(r) => r.value.and_then(|v| self.context().stored_type_of(v)),
+                _ => None,
+            })
+    }
+
+    /// The type of the first value returned by a lambda body.
+    fn lambda_return_type(&self, body: FunctionId) -> Option<TypeId> {
+        Function::from_id(self.context(), body)
+            .iter()
+            .flat_map(|block| block.iter())
+            .find_map(|i| match i.mnemonic() {
+                Mnemonic::ReturnValue(r) => self.context().stored_type_of(r.value),
                 _ => None,
             })
     }
@@ -1392,8 +1419,28 @@ impl<'str, 'ctx> Builder<'str, 'ctx> {
     }
 
     pub fn push_return(&mut self, ptr: ValueId) -> InstructionRef<'str, '_> {
+        self.push_return_at(None, ptr)
+    }
+
+    pub fn push_return_with_value(
+        &mut self,
+        value: ValueId,
+        ptr: ValueId,
+    ) -> InstructionRef<'str, '_> {
+        self.push_return_at(Some(value), ptr)
+    }
+
+    fn push_return_at(&mut self, value: Option<ValueId>, ptr: ValueId) -> InstructionRef<'str, '_> {
         let id = self
-            .push_instruction(Mnemonic::Return(Return { ptr, value: None }), 0)
+            .push_instruction(Mnemonic::Return(Return { ptr, value }), 0)
+            .id;
+        self.is_terminated = true;
+        self.context().get_insn(id)
+    }
+
+    pub fn push_return_value(&mut self, value: ValueId) -> InstructionRef<'str, '_> {
+        let id = self
+            .push_instruction(Mnemonic::ReturnValue(ReturnValue { value }), 0)
             .id;
         self.is_terminated = true;
         self.context().get_insn(id)
@@ -1551,7 +1598,7 @@ mod tests {
             "
             <entry>
                 local i64 ptr;
-                return [ptr];
+                return at ptr;
         "
         );
         assert_eq!(ctx.nodes().count(), 1);

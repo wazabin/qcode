@@ -67,7 +67,7 @@ mod tests {
                     store({r0}, %s);
                     %fin = load(i64, {r0});
                     %agg = (%fin);
-                    return [%agg];
+                    return at %agg;
 
             fn g:
                 <g_entry>
@@ -75,7 +75,7 @@ mod tests {
                 <g_call>
                     call <f>;
                 <g_cont>
-                    return [i64 0];
+                    return at i64 0;
             "
         );
         let _ = (f, g, r0, r1);
@@ -125,7 +125,7 @@ mod tests {
                 <f_entry @stack_10000004:i64>
                     %v = load(i32, @stack_10000004);
                     store(@stack_10000004, %v);
-                    return [i64 0];
+                    return at i64 0;
 
             fn g:
                 <g_entry>
@@ -133,7 +133,7 @@ mod tests {
                 <g_call>
                     call <f>;
                 <g_cont>
-                    return [i64 0];
+                    return at i64 0;
             "
         );
         let _ = g;
@@ -186,7 +186,7 @@ mod tests {
                 <f_entry @stack_10000004:i64>
                     %v = load(i32, @stack_10000004);
                     store(@stack_10000004, %v);
-                    return [i64 0];
+                    return at i64 0;
 
             fn g:
                 <g_entry>
@@ -194,7 +194,7 @@ mod tests {
                 <g_call>
                     call <f>;
                 <g_cont>
-                    return [i64 0];
+                    return at i64 0;
             "
         );
         let _ = g;
@@ -221,7 +221,7 @@ mod tests {
             "
             fn callee:
                 <c_entry>
-                    return [i64 0];
+                    return at i64 0;
 
             fn caller:
                 <f_entry>
@@ -229,7 +229,7 @@ mod tests {
                 <f_call>
                     call <callee>;
                 <f_cont>
-                    return [i64 0];
+                    return at i64 0;
             "
         );
         let _ = (f_entry, f_cont);
@@ -273,7 +273,7 @@ mod tests {
                 <f_entry>
                     %p = load(i32, 0x454df8);
                     store(0x454df8, i32 0x270);
-                    return [i64 0];
+                    return at i64 0;
 
             fn g:
                 <g_entry>
@@ -281,7 +281,7 @@ mod tests {
                 <g_call>
                     call <f>;
                 <g_cont>
-                    return [i64 0];
+                    return at i64 0;
             "
         );
         let _ = g;
@@ -343,11 +343,11 @@ mod tests {
             fn f:
                 <f_entry>
                     %p = load(i32, 0x454df8);
-                    return [i64 0];
+                    return at i64 0;
 
             fn g:
                 <g_entry>
-                    return [i64 0];
+                    return at i64 0;
             "
         );
         Function::from_id_mut(&mut tc.ctx, f).set_pure_reg(true);
@@ -401,7 +401,7 @@ mod tests {
                     store(%addr, i32 0);
                     %a = @stack_10000004 + i64 0x30;
                     %v = load(i32, %a);
-                    return [%v];
+                    return at %v;
 
             fn g:
                 <g_entry>
@@ -409,7 +409,7 @@ mod tests {
                 <g_call>
                     call <f>;
                 <g_cont>
-                    return [i64 0];
+                    return at i64 0;
             "
         );
         let _ = g;
@@ -464,7 +464,7 @@ mod tests {
                 <f_entry @stack_10000004:i64>
                     store(@stack_10000004, i32 0x41);
                     store(i64 0x9000, @stack_10000004);
-                    return [i64 0];
+                    return at i64 0;
 
             fn g:
                 <g_entry>
@@ -472,7 +472,7 @@ mod tests {
                 <g_call>
                     call <f>;
                 <g_cont>
-                    return [i64 0];
+                    return at i64 0;
             "
         );
         let _ = g;
@@ -546,7 +546,7 @@ mod tests {
                     store(%s, i32 0);
                     %a = @stack_10000004 + i64 0x30;
                     %v = load(i32, %a);
-                    return [%v];
+                    return at %v;
 
             fn g:
                 <g_entry>
@@ -554,7 +554,7 @@ mod tests {
                 <g_call>
                     call <f>;
                 <g_cont>
-                    return [i64 0];
+                    return at i64 0;
             "
         );
         let _ = g;
@@ -589,7 +589,7 @@ mod tests {
                 <f_entry @stack_10000004:i64>
                     %v = load(i32, @stack_10000004);
                     store(@stack_10000004, %v);
-                    return [i64 0];
+                    return at i64 0;
 
             fn g:
                 <g_entry>
@@ -597,7 +597,7 @@ mod tests {
                 <g_call>
                     call <f>;
                 <g_cont>
-                    return [i64 0];
+                    return at i64 0;
             "
         );
         let _ = g;
@@ -631,7 +631,7 @@ mod tests {
                 <f_entry @stack_10000004:i64>
                     %a = @stack_10000004 + i64 0x30;
                     %v = load(i32, %a);
-                    return [%v];
+                    return at %v;
 
             fn g:
                 <g_entry>
@@ -639,7 +639,7 @@ mod tests {
                 <g_call>
                     call <f>;
                 <g_cont>
-                    return [i64 0];
+                    return at i64 0;
             "
         );
         let _ = g;
@@ -699,7 +699,7 @@ mod tests {
                 <f_entry @stack_10000004:i64>
                     %a = @stack_10000004 + i64 0x30;
                     %v = load(i32, %a);
-                    return [%v];
+                    return at %v;
 
             fn g:
                 <g_entry>
@@ -707,7 +707,7 @@ mod tests {
                 <g_call>
                     call <f>;
                 <g_cont>
-                    return [i64 0];
+                    return at i64 0;
             "
         );
         let _ = g;
@@ -788,7 +788,7 @@ mod tests {
             "
             fn foo:
                 <entry>
-                    return [0x1000];
+                    return at 0x1000;
             "
         );
         assert!(Function::from_id(&ctx, foo).root().is_some());
@@ -848,7 +848,7 @@ mod tests {
                     %v = load(i32, @stack_10000004);
                     %s = %v + i32 1;
                     store(@stack_10000004, %s);
-                    return [i64 0];
+                    return at i64 0;
 
             fn g:
                 <g_entry>
@@ -856,7 +856,7 @@ mod tests {
                 <g_call>
                     call <f>;
                 <g_cont>
-                    return [i64 0];
+                    return at i64 0;
             "
         );
         let _ = g;
@@ -892,7 +892,7 @@ mod tests {
                     %v = load(i32, @stack_10000004);
                     %s = %v + i32 10;
                     store(@stack_10000004, %s);
-                    return [i64 0];
+                    return at i64 0;
 
             fn g:
                 <g_entry>
@@ -900,7 +900,7 @@ mod tests {
                 <g_call>
                     call <foo>;
                 <g_cont>
-                    return [i64 0];
+                    return at i64 0;
             "
         );
         let _ = g;
@@ -931,7 +931,7 @@ mod tests {
                     %s = %v + i32 10;
                     store(@stack_10000004, %s);
                     store({r0}, @stack_10000004);
-                    return [i64 0];
+                    return at i64 0;
 
             fn g:
                 <g_entry>
@@ -939,7 +939,7 @@ mod tests {
                 <g_call>
                     call <foo>;
                 <g_cont>
-                    return [i64 0];
+                    return at i64 0;
             "
         );
         let _ = g;
@@ -968,7 +968,7 @@ mod tests {
                 <foo_entry @stack_10000004:i64>
                     %adv = @stack_10000004 + i64 40;
                     store(%adv, i32 5);
-                    return [i64 0];
+                    return at i64 0;
 
             fn g:
                 <g_entry>
@@ -976,7 +976,7 @@ mod tests {
                 <g_call>
                     call <foo>;
                 <g_cont>
-                    return [i64 0];
+                    return at i64 0;
             "
         );
         let _ = g;
@@ -1006,7 +1006,7 @@ mod tests {
                     %v = load(i32, @stack_10000004);
                     %s = %v + i32 10;
                     store({r0}, %s);
-                    return [i64 0];
+                    return at i64 0;
 
             fn g:
                 <g_entry>
@@ -1014,7 +1014,7 @@ mod tests {
                 <g_call>
                     call <foo>;
                 <g_cont>
-                    return [i64 0];
+                    return at i64 0;
             "
         );
         let _ = g;
@@ -1047,7 +1047,7 @@ mod tests {
                 <foo_entry @stack_10000004:i64>
                     %adv = @stack_10000004 + i64 40;
                     store({r0}, %adv);
-                    return [i64 0];
+                    return at i64 0;
 
             fn g:
                 <g_entry>
@@ -1055,7 +1055,7 @@ mod tests {
                 <g_call>
                     call <foo>;
                 <g_cont>
-                    return [i64 0];
+                    return at i64 0;
             "
         );
         let _ = g;
@@ -1092,7 +1092,7 @@ mod tests {
                     %s = %v + i32 1;
                     store(@stack_10000004, %s);
                     store({r0}, i32 100);
-                    return [i64 0];
+                    return at i64 0;
 
             fn g:
                 <g_entry>
@@ -1100,7 +1100,7 @@ mod tests {
                 <g_call>
                     call <f1>;
                 <g_cont>
-                    return [i64 0];
+                    return at i64 0;
             "
         );
         let _ = g;
@@ -1130,7 +1130,7 @@ mod tests {
                 <f_entry @stack_10000004:i64>
                     %out = i64 7 + i64 0;
                     store(@stack_10000004, i32 5);
-                    return [i64 0];
+                    return at i64 0;
 
             fn g:
                 <g_entry>
@@ -1138,14 +1138,14 @@ mod tests {
                 <g_call>
                     call <f>;
                 <g_cont>
-                    return [i64 0];
+                    return at i64 0;
             "
         );
         let _ = g;
         // The shape the register/stack channels leave behind: a functionalized
         // function whose ABI register list is never filled in, with a one-field
         // register write-set already on `Return::value` (set as the register
-        // channel does, since `return [..]` only sets the conventional operand).
+        // channel does, since `return at ..` only sets the conventional operand).
         Function::from_id_mut(&mut tc.ctx, f).set_pure_reg(true);
         let ret_id = Function::from_id(&tc.ctx, f)
             .iter()
@@ -1214,7 +1214,7 @@ mod tests {
                     %loc = @RSP - i64 0x8;
                     store(%loc, i32 5);
                     store(@p, i32 9);
-                    return [i64 0];
+                    return at i64 0;
 
             fn g:
                 <g_entry>
@@ -1222,7 +1222,7 @@ mod tests {
                 <g_call>
                     call <f>;
                 <g_cont>
-                    return [i64 0];
+                    return at i64 0;
             "
         );
         let _ = g;
@@ -1293,7 +1293,7 @@ mod tests {
                 <f_entry @stack_10000004:i64>
                     %out = i64 7 + i64 0;
                     store(@stack_10000004, i32 5);
-                    return [i64 0];
+                    return at i64 0;
 
             fn g:
                 <g_entry>
@@ -1301,7 +1301,7 @@ mod tests {
                 <g_call>
                     call <f>;
                 <g_cont>
-                    return [i64 0];
+                    return at i64 0;
             "
         );
         let _ = g;
@@ -1380,9 +1380,9 @@ mod tests {
                     %c = load(i8, {r0});
                     if %c goto <ret_a> else goto <ret_b>;
                 <ret_a>
-                    return [i64 0];
+                    return at i64 0;
                 <ret_b>
-                    return [i64 1];
+                    return at i64 1;
 
             fn g:
                 <g_entry>
@@ -1390,7 +1390,7 @@ mod tests {
                 <g_call>
                     call <foo>;
                 <g_cont>
-                    return [i64 0];
+                    return at i64 0;
             "
         );
         let _ = (g, r0, ret_a, ret_b);
@@ -1439,9 +1439,9 @@ mod tests {
                     if %c goto <wr> else goto <skip>;
                 <wr>
                     store(@stack_10000004, i32 7);
-                    return [i64 0];
+                    return at i64 0;
                 <skip>
-                    return [i64 1];
+                    return at i64 1;
 
             fn g:
                 <g_entry>
@@ -1449,7 +1449,7 @@ mod tests {
                 <g_call>
                     call <foo>;
                 <g_cont>
-                    return [i64 0];
+                    return at i64 0;
             "
         );
         let _ = (g, r0, wr, skip);
@@ -1509,7 +1509,7 @@ mod tests {
             fn f:
                 <entry>
                     store({r0}, i64 42);
-                    return [i64 0];
+                    return at i64 0;
             "
         );
         let _ = entry;
@@ -1542,7 +1542,7 @@ mod tests {
                     %v = load(i64, {r0});
                     %s = %v + i64 1;
                     store({r0}, %s);
-                    return [i64 0];
+                    return at i64 0;
             "
         );
         let eff = scan_register_effects(&tc.ctx, f).expect("written register");
@@ -1573,7 +1573,7 @@ mod tests {
                 <entry>
                     store({r0_lo32}, i32 2);
                     store({r0}, i64 3);
-                    return [i64 0];
+                    return at i64 0;
             "
         );
         let eff = scan_register_effects(&tc.ctx, f).expect("written register");
@@ -1600,7 +1600,7 @@ mod tests {
                 <entry>
                     store({r0}, i64 7);
                     store({r1}, i64 8);
-                    return [i64 0];
+                    return at i64 0;
             "
         );
         let eff = scan_register_effects(&tc.ctx, f).expect("written register");
@@ -1624,7 +1624,7 @@ mod tests {
             fn f:
                 <entry>
                     %v = load(i64, {r0});
-                    return [i64 0];
+                    return at i64 0;
             "
         );
         assert!(
@@ -1648,7 +1648,7 @@ mod tests {
             fn f:
                 <f_entry>
                     store({r0}, i64 42);
-                    return [i64 0];
+                    return at i64 0;
 
             fn g:
                 <g_entry>
@@ -1658,7 +1658,7 @@ mod tests {
                 <g_cont>
                     %x = load(i64, {r0});
                     store({r1}, %x);
-                    return [i64 0];
+                    return at i64 0;
             "
         );
         let _ = (f, g, r0);
@@ -1714,7 +1714,7 @@ mod tests {
                     %v = load(i64, {r0});
                     %s = %v + i64 1;
                     store({r0}, %s);
-                    return [i64 0];
+                    return at i64 0;
 
             fn g:
                 <g_entry>
@@ -1723,7 +1723,7 @@ mod tests {
                 <g_call>
                     call <f>;
                 <g_cont>
-                    return [i64 0];
+                    return at i64 0;
             "
         );
         let _ = (f, g, r0);
@@ -1758,10 +1758,10 @@ mod tests {
             fn f:
                 <entry>
                     store({r0}, i64 1);
-                    return [i64 0];
+                    return at i64 0;
                 <other>
                     store({r0}, i64 2);
-                    return [i64 0];
+                    return at i64 0;
             "
         );
         let _ = (r0, entry, other);
@@ -1801,7 +1801,7 @@ mod tests {
                     %v = load(i64, {r0});
                     %s = %v + i64 1;
                     store({r0}, %s);
-                    return [i64 4096];
+                    return at i64 4096;
 
             fn g:
                 <g_entry>
@@ -1809,7 +1809,7 @@ mod tests {
                 <g_call>
                     call <f>;
                 <g_cont>
-                    return [i64 0];
+                    return at i64 0;
             "
         );
         let _ = (f, r0);
@@ -1852,7 +1852,7 @@ mod tests {
                 <entry>
                     store({r0_lo32}, i32 1);
                     store({mid}, i32 2);
-                    return [i64 0];
+                    return at i64 0;
             "
         );
         let _ = (r0_lo32, mid, entry);
@@ -1952,7 +1952,7 @@ mod tests {
                     %ni = @i + i64 0x1;
                     goto <f_head @i=%ni>;
                 <f_exit>
-                    return [i64 0x0];
+                    return at i64 0x0;
 
             fn g:
                 <g_entry>
@@ -1960,7 +1960,7 @@ mod tests {
                 <g_call>
                     call <f>;
                 <g_cont>
-                    return [i64 0];
+                    return at i64 0;
             "
         );
         let _ = (g, f_head, f_body, f_exit);
@@ -2066,7 +2066,7 @@ mod tests {
                     %ni = @i + i64 0x1;
                     goto <f_head @i=%ni>;
                 <f_exit>
-                    return [i64 0x0];
+                    return at i64 0x0;
 
             fn g:
                 <g_entry>
@@ -2074,7 +2074,7 @@ mod tests {
                 <g_call>
                     call <f>;
                 <g_cont>
-                    return [i64 0];
+                    return at i64 0;
             "
         );
         let _ = (g, f_head, f_body, f_exit);
@@ -2144,7 +2144,7 @@ mod tests {
                     %c = %ni < i64 0x14;
                     if %c goto <f_loop @i=%ni> else goto <f_exit>;
                 <f_exit>
-                    return [i64 0x0];
+                    return at i64 0x0;
 
             fn g:
                 <g_entry>
@@ -2152,7 +2152,7 @@ mod tests {
                 <g_call>
                     call <f>;
                 <g_cont>
-                    return [i64 0];
+                    return at i64 0;
             "
         );
         let _ = (g, f_loop, f_exit);
@@ -2208,7 +2208,7 @@ mod tests {
                     %ni = @i + i64 0x1;
                     goto <f_head @i=%ni>;
                 <f_exit>
-                    return [i64 0x0];
+                    return at i64 0x0;
 
             fn g:
                 <g_entry>
@@ -2216,7 +2216,7 @@ mod tests {
                 <g_call>
                     call <f>;
                 <g_cont>
-                    return [i64 0];
+                    return at i64 0;
             "
         );
         let _ = (g, f_head, f_body, f_exit);
@@ -2280,7 +2280,7 @@ mod tests {
                     %m = @idx & i64 0x1fff;
                     %addr = @stack_10000004 + %m;
                     %v = load(i32, %addr);
-                    return [%v];
+                    return at %v;
 
             fn g:
                 <g_entry>
@@ -2288,7 +2288,7 @@ mod tests {
                 <g_call>
                     call <f>;
                 <g_cont>
-                    return [i64 0];
+                    return at i64 0;
             "
         );
         let _ = g;
@@ -2362,7 +2362,7 @@ mod tests {
                     %ni = @i + i64 0x1;
                     goto <f_head @i=%ni>;
                 <f_exit>
-                    return [i64 0x0];
+                    return at i64 0x0;
 
             fn g:
                 <g_entry>
@@ -2370,7 +2370,7 @@ mod tests {
                 <g_call>
                     call <f>;
                 <g_cont>
-                    return [i64 0];
+                    return at i64 0;
             "
         );
         let _ = (g, f_head, f_body, f_exit);
@@ -2454,7 +2454,7 @@ mod tests {
                     goto <f_head @i=%ni>;
                 <f_exit>
                     %r = pack(EAX=@esp_val_4);
-                    return [@esp_val_0];
+                    return at @esp_val_0;
 
             fn g:
                 <g_entry>
@@ -2462,7 +2462,7 @@ mod tests {
                 <g_call>
                     call <f>;
                 <g_cont>
-                    return [i64 0];
+                    return at i64 0;
             "
         );
         let _ = (g, f_head, f_body, f_exit, f_entry);
@@ -2539,7 +2539,7 @@ mod tests {
                     %ni = @i + i64 0x1;
                     goto <f_head @i=%ni>;
                 <f_exit>
-                    return [i64 0x0];
+                    return at i64 0x0;
 
             fn g:
                 <g_entry>
@@ -2547,7 +2547,7 @@ mod tests {
                 <g_call>
                     call <f>;
                 <g_cont>
-                    return [i64 0];
+                    return at i64 0;
             "
         );
         let _ = (g, f_head, f_body, f_exit, f_entry);
@@ -2626,7 +2626,7 @@ mod tests {
                 <f_exit>
                     store(@gp_val_0, i32 0x270);
                     %r = pack(EAX=@esp_val_4);
-                    return [@esp_val_0];
+                    return at @esp_val_0;
 
             fn g:
                 <g_entry>
@@ -2634,7 +2634,7 @@ mod tests {
                 <g_call>
                     call <f>;
                 <g_cont>
-                    return [i32 0];
+                    return at i32 0;
             "
         );
         let _ = (g, f_head, f_exit, f_entry);
@@ -2697,7 +2697,7 @@ mod tests {
                     %ni = @i + i64 0x1;
                     goto <f_head @i=%ni>;
                 <f_exit>
-                    return [i64 0x0];
+                    return at i64 0x0;
 
             fn g:
                 <g_entry>
@@ -2705,7 +2705,7 @@ mod tests {
                 <g_call>
                     call <f>;
                 <g_cont>
-                    return [i64 0];
+                    return at i64 0;
             "
         );
         let _ = (g, f_head, f_body, f_exit);
@@ -2814,7 +2814,7 @@ mod tests {
                     goto <f_head @i=%ni @acc=%nacc>;
                 <f_exit>
                     %r = pack(EDX=@acc);
-                    return [@acc];
+                    return at @acc;
 
             fn g:
                 <g_entry>
@@ -2822,7 +2822,7 @@ mod tests {
                 <g_call>
                     call <f>;
                 <g_cont>
-                    return [i64 0];
+                    return at i64 0;
             "
         );
         let _ = (g, f_head, f_body, f_exit, f_entry, r);
@@ -2929,7 +2929,7 @@ mod tests {
                     goto <f_head @i=%ni @acc=%nacc>;
                 <f_exit>
                     %r = pack(EDX=@acc);
-                    return [@acc];
+                    return at @acc;
 
             fn g:
                 <g_entry>
@@ -2937,7 +2937,7 @@ mod tests {
                 <g_call>
                     call <f>;
                 <g_cont>
-                    return [i64 0];
+                    return at i64 0;
             "
         );
         let _ = (g, f_head, f_body, f_exit, f_entry, r);

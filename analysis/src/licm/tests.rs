@@ -60,7 +60,7 @@ fn hoists_invariant_arithmetic() {
                     %i_next = @i + 0x1;
                     goto <header @i=%i_next>;
                 <exit>
-                    return [0x0];
+                    return at 0x0;
         "
     );
 
@@ -113,7 +113,7 @@ fn hoists_transitive_chain() {
                     %i_next = @i + 0x1;
                     goto <header @i=%i_next>;
                 <exit>
-                    return [0x0];
+                    return at 0x0;
         "
     );
 
@@ -155,7 +155,7 @@ fn keeps_loop_variant_in_body() {
                     %i_next = @i + 0x1;
                     goto <header @i=%i_next>;
                 <exit>
-                    return [0x0];
+                    return at 0x0;
         "
     );
 
@@ -191,7 +191,7 @@ fn hoists_invariant_load() {
                     %i_next = @i + 0x1;
                     goto <header @i=%i_next>;
                 <exit>
-                    return [0x0];
+                    return at 0x0;
         "
     );
 
@@ -231,7 +231,7 @@ fn keeps_load_with_aliasing_store() {
                     %i_next = @i + 0x1;
                     goto <header @i=%i_next>;
                 <exit>
-                    return [0x0];
+                    return at 0x0;
         "
     );
 
@@ -266,7 +266,7 @@ fn hoists_load_over_disjoint_store_with_oracle() {
                     %i_next = @i + 0x1;
                     goto <header @i=%i_next>;
                 <exit>
-                    return [0x0];
+                    return at 0x0;
         "
     );
 
@@ -304,7 +304,7 @@ fn keeps_load_over_aliasing_store_with_oracle() {
                     %i_next = @i + 0x1;
                     goto <header @i=%i_next>;
                 <exit>
-                    return [0x0];
+                    return at 0x0;
         "
     );
 
@@ -339,7 +339,7 @@ fn skips_loop_without_preheader() {
                     %i_next = @i + 0x1;
                     goto <header @i=%i_next>;
                 <exit>
-                    return [0x0];
+                    return at 0x0;
         "
     );
 
@@ -379,7 +379,7 @@ fn is_idempotent() {
                     %i_next = @i + 0x1;
                     goto <header @i=%i_next>;
                 <exit>
-                    return [0x0];
+                    return at 0x0;
         "
     );
 
@@ -419,7 +419,7 @@ fn rewires_uses_to_hoisted_copy() {
                     %i_next = @i + 0x1;
                     goto <header @i=%i_next>;
                 <exit>
-                    return [0x0];
+                    return at 0x0;
         "
     );
 

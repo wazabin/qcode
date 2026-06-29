@@ -123,6 +123,11 @@ pub enum ExprNode {
         name: String,
         args: Vec<TypedAtom>,
     },
+    /// `apply lambda(args...)` — value-level application of a pure lambda.
+    Apply {
+        target: String,
+        args: Vec<TypedAtom>,
+    },
     /// `body <$> src` / `(body c0 c1) <$> src` — an element-wise `map` over the
     /// array `src`. `body` names a function symbol declared in the same program;
     /// `captures` are the loop-invariant operands the body closes over.
@@ -254,6 +259,11 @@ pub enum Statement {
     },
     Return {
         ptr: TypedAtom,
+        value: Option<TypedAtom>,
+        span: SourceSpan,
+    },
+    ReturnValue {
+        value: TypedAtom,
         span: SourceSpan,
     },
     Assert {
@@ -280,10 +290,17 @@ impl Statement {
 /// A function declaration (`fn name: <entry> stmts...`).
 #[derive(Clone, Debug)]
 pub struct FnDecl {
+    pub kind: FnKind,
     pub name: String,
     pub name_span: SourceSpan,
     pub span: SourceSpan,
     pub statements: Vec<Statement>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FnKind {
+    Machine,
+    Lambda,
 }
 
 /// Top-level program representation. Any leading `type` declarations are

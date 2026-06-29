@@ -240,7 +240,7 @@ mod tests {
                 %ba = %b + %a;
                 %sub1 = %a - %b;
                 %sub2 = %b - %a;
-                return [0x0];
+                return at 0x0;
             "
         );
         let mut e = engine(&ctx, f);
@@ -264,7 +264,7 @@ mod tests {
                 %b = load(i64, &B);
                 %ab1 = %a + %b;
                 %ab2 = %a + %b;
-                return [0x0];
+                return at 0x0;
             "
         );
         let mut e = engine(&ctx, f);
@@ -286,7 +286,7 @@ mod tests {
             <entry>
                 %c1 = load(i64, &A);
                 %c2 = load(i64, &A);
-                return [0x0];
+                return at 0x0;
             "
         );
         let mut e = engine(&ctx, f);
@@ -314,7 +314,7 @@ mod tests {
                 %za1 = zext(i64, %a);
                 %za2 = zext(i64, %a);
                 %zb = zext(i64, %b);
-                return [0x0];
+                return at 0x0;
             "
         );
         let mut e = engine(&ctx, f);
@@ -340,7 +340,7 @@ mod tests {
                 %c2 = load(i64, &A);
                 %p1 = %c1 + 0x1;
                 %p2 = %c2 + 0x1;
-                return [0x0];
+                return at 0x0;
             "
         );
         let mut e = engine(&ctx, f);
@@ -366,7 +366,7 @@ mod tests {
                 %c = load(i64, &A);
                 %p1 = %c + 0x1;
                 %p2 = %c + 0x1;
-                return [0x0];
+                return at 0x0;
             "
         );
         let mut e = engine(&ctx, f);
@@ -394,7 +394,7 @@ mod tests {
                 %m2 = %b * %a;
                 %e1 = %m1 + %c;
                 %e2 = %c + %m2;
-                return [0x0];
+                return at 0x0;
             "
         );
         let mut e = engine(&ctx, f);

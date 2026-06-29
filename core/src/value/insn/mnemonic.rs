@@ -4,10 +4,10 @@ use crate::{
         ValueId,
         function::FunctionId,
         insn::{
-            Assert, Binary, Branch, BranchInd, CBranch, Call, CallInd, Carry, Extract,
+            Apply, Assert, Binary, Branch, BranchInd, CBranch, Call, CallInd, Carry, Extract,
             FloatToFloat, FloatToInt, Gep, IntToFloat, IntrinsicApp, IsFloatNaN, Load, LzCount,
-            Map, PCodeOp, PopCount, Range, Return, SBorrow, SCarry, Scan, Sext, Store, Tuple,
-            Unary, Zext,
+            Map, PCodeOp, PopCount, Range, Return, ReturnValue, SBorrow, SCarry, Scan, Sext, Store,
+            Tuple, Unary, Zext,
         },
     },
 };
@@ -60,7 +60,7 @@ pub trait MnemonicKind {
 /// | Variants | Category |
 /// |---|---|
 /// | [`Load`], [`Store`] | Memory access |
-/// | [`Branch`], [`CBranch`], [`BranchInd`], [`Call`], [`CallInd`], [`Return`] | Control flow (terminators) |
+/// | [`Branch`], [`CBranch`], [`BranchInd`], [`Call`], [`CallInd`], [`Return`], [`ReturnValue`] | Control flow (terminators) |
 /// | [`Unop`](Mnemonic::Unop) | Unary integer/float/bool operations |
 /// | [`Binop`](Mnemonic::Binop) | Binary integer/float/bool operations |
 /// | [`Zext`], [`Sext`], [`Range`], [`IntToFloat`], [`FloatToInt`], [`FloatToFloat`] | Type casts and bit extraction |
@@ -82,10 +82,14 @@ pub enum Mnemonic {
     BranchInd(BranchInd),
     /// Direct call to a known function.
     Call(Call),
+    /// Value-level application of a pure lambda function.
+    Apply(Apply),
     /// Indirect call through a computed function pointer.
     CallInd(CallInd),
     /// Return from the current function.
     Return(Return),
+    /// Value return from a lambda function.
+    ReturnValue(ReturnValue),
     /// A unary integer, float, or boolean operation.
     Unop(Unary),
     /// A binary integer, float, or boolean operation.
@@ -143,8 +147,10 @@ impl Mnemonic {
             Mnemonic::CBranch(m) => m,
             Mnemonic::BranchInd(m) => m,
             Mnemonic::Call(m) => m,
+            Mnemonic::Apply(m) => m,
             Mnemonic::CallInd(m) => m,
             Mnemonic::Return(m) => m,
+            Mnemonic::ReturnValue(m) => m,
             Mnemonic::Range(m) => m,
             Mnemonic::Unop(m) => m,
             Mnemonic::Binop(m) => m,
@@ -200,6 +206,7 @@ impl Mnemonic {
     pub fn call_target(&self) -> Option<FunctionId> {
         match self {
             Mnemonic::Call(call) => Some(call.target),
+            Mnemonic::Apply(apply) => Some(apply.target),
             Mnemonic::Map(map) => Some(map.body),
             Mnemonic::Scan(scan) => Some(scan.body),
             _ => None,
@@ -257,6 +264,13 @@ impl Mnemonic {
                     }
                 });
             }
+            Mnemonic::Apply(m) => {
+                m.args.iter_mut().for_each(|a| {
+                    if *a == old {
+                        *a = new;
+                    }
+                });
+            }
             Mnemonic::CallInd(m) => {
                 if m.ptr == old {
                     m.ptr = new;
@@ -275,6 +289,11 @@ impl Mnemonic {
                     && *v == old
                 {
                     *v = new;
+                }
+            }
+            Mnemonic::ReturnValue(m) => {
+                if m.value == old {
+                    m.value = new;
                 }
             }
             Mnemonic::Unop(m) => {

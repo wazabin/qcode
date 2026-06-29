@@ -232,7 +232,7 @@ mod tests {
                     goto <bb2>;
                 <bb2>
                     store(&A, i64 2);
-                    return [0];
+                    return at 0;
             "
         );
 
@@ -267,7 +267,7 @@ mod tests {
                 <bb2>
                     %v = load(i64, &A);
                     store(&B, %v);
-                    return [0];
+                    return at 0;
             "
         );
 
@@ -300,7 +300,7 @@ mod tests {
                 <bb3>
                     goto <bb4>;
                 <bb4>
-                    return [0];
+                    return at 0;
             "
         );
 
@@ -331,7 +331,7 @@ mod tests {
                 <bb3>
                     goto <bb4>;
                 <bb4>
-                    return [0];
+                    return at 0;
             "
         );
 
@@ -357,7 +357,7 @@ mod tests {
                     store(&A, i64 1);
                     goto <bb2>;
                 <bb2>
-                    return [0];
+                    return at 0;
             "
         );
 

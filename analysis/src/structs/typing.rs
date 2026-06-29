@@ -312,7 +312,7 @@ mod tests {
                     %inner = load(i64, %inner_slot);
                     %val_slot = %inner + 8;
                     %vv = load(i32, %val_slot);
-                    return [i32 0];
+                    return at i32 0;
             "
         );
 
@@ -362,7 +362,7 @@ mod tests {
                     Root* %x = load(i64, base);
                     %slot = %x + 0x10;
                     %y = load(i64, %slot);
-                    return [i32 0];
+                    return at i32 0;
             "
         );
 
@@ -391,7 +391,7 @@ mod tests {
                     %no_field = %root + 0x99;
                     %d = load(i64, dynp);
                     %dynamic = %root + %d;
-                    return [i32 0];
+                    return at i32 0;
             "
         );
 

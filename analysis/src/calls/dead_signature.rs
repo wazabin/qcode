@@ -435,7 +435,7 @@ mod tests {
             "
             fn f:
                 <entry @r0:i64 @r1:i64>
-                    return [i64 0];
+                    return at i64 0;
 
             fn g:
                 <g_entry>
@@ -443,7 +443,7 @@ mod tests {
                 <g_call>
                     call <f>;
                 <g_cont>
-                    return [i64 0];
+                    return at i64 0;
             "
         );
         let _ = g;
@@ -517,7 +517,7 @@ mod tests {
             "
             fn f:
                 <entry>
-                    return [i64 0];
+                    return at i64 0;
 
             fn g:
                 <g_entry>
@@ -525,7 +525,7 @@ mod tests {
                 <g_call>
                     call <f>;
                 <g_cont>
-                    return [i64 0];
+                    return at i64 0;
             "
         );
         let _ = (g, entry);
@@ -578,7 +578,7 @@ mod tests {
             "
             fn f:
                 <entry>
-                    return [i64 0];
+                    return at i64 0;
 
             fn g:
                 <g_entry>
@@ -586,7 +586,7 @@ mod tests {
                 <g_call>
                     call <f>;
                 <g_cont>
-                    return [i64 0];
+                    return at i64 0;
             "
         );
         let _ = (g, entry);
@@ -617,7 +617,7 @@ mod tests {
             fn f:
                 <entry @r0:i64 @r1:i64>
                     %u = @r1 + i64 1;
-                    return [i64 0];
+                    return at i64 0;
 
             fn g:
                 <g_entry>
@@ -625,7 +625,7 @@ mod tests {
                 <g_call>
                     call <f>;
                 <g_cont>
-                    return [i64 0];
+                    return at i64 0;
             "
         );
         let _ = (g, entry);

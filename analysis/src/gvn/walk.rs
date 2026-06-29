@@ -538,7 +538,7 @@ mod tests {
 
                 fn shared_orphans:
                     <entry>
-                        return [0x1000];
+                        return at 0x1000;
 
                     <e1>
                         store(&A, i32 1);
@@ -551,7 +551,7 @@ mod tests {
                     <shared>
                         %v = load(i32, &A);
                         store(&B, %v);
-                        return [0x1001];
+                        return at 0x1001;
                 "
         );
 
@@ -585,7 +585,7 @@ mod tests {
                         %v1 = %a + %a;
                         %v2 = %a + %a;
                         store(&B, %v2);
-                        return [0x1000];
+                        return at 0x1000;
                 "
         );
 

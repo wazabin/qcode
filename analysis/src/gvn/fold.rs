@@ -603,7 +603,7 @@ mod tests {
                     %c = i32 0x31 + i32 0x32;
                     %addr = &fs + %c;
                     %v = load(i32, %addr);
-                    return [i32 0];
+                    return at i32 0;
             "
         );
         // Type `fs` as a struct pointer, exactly as `windows_teb_seed` does.
@@ -658,7 +658,7 @@ mod tests {
                     %s2 = %b2 << i32 0x10;
                     %o2 = %o1 | %s2;
                     store(&sink, %o2);
-                    return [i32 0];
+                    return at i32 0;
             "
         );
 
@@ -706,7 +706,7 @@ mod tests {
                     %off = %b0 | %s1;
                     %addr = &fs + %off;
                     %v = load(i32, %addr);
-                    return [i32 0];
+                    return at i32 0;
             "
         );
         let teb = ctx.types.get_or_make_struct("TEB", 0x1000, vec![]);
@@ -853,7 +853,7 @@ mod tests {
                     %a = load(i32, &A);
                     %z = zext(i32, %a);
                     store(&B, %z);
-                    return [i32 0];
+                    return at i32 0;
             "
         );
 
@@ -891,7 +891,7 @@ mod tests {
                     %a = load(i32, &A);
                     %r = %a[0:4];
                     store(&B, %r);
-                    return [i32 0];
+                    return at i32 0;
             "
         );
 
@@ -930,7 +930,7 @@ mod tests {
                     %z = zext(i32, %a);
                     %r = %z[0:1];
                     store(&B, %r);
-                    return [i32 0];
+                    return at i32 0;
             "
         );
 

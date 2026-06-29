@@ -342,7 +342,7 @@ mod tests {
 
                     <succ>
                         %v2 = %a + %b;
-                        return [0x1000];
+                        return at 0x1000;
                 "
         );
 
@@ -459,7 +459,7 @@ mod tests {
                         %a = &SP - i32 0xc;
                         %c = %a + i32 0x4;
                         store(&OUT, %c);
-                        return [0x1000];
+                        return at 0x1000;
                 "
         );
 
@@ -489,7 +489,7 @@ mod tests {
                         %a = &SP - i32 0xc;
                         %c = %a + i32 0x4;
                         store(&OUT, %c);
-                        return [0x1000];
+                        return at 0x1000;
                 "
         );
 
@@ -521,7 +521,7 @@ mod tests {
                         %m = %x & i32 0xff0;
                         %n = %m & i32 0xff;
                         store(&OUT, %n);
-                        return [0x1000];
+                        return at 0x1000;
                 "
         );
 
@@ -551,7 +551,7 @@ mod tests {
                         %a = &SP + i32 0x4;
                         %b = %a - i32 0xc;
                         store(&OUT, %b);
-                        return [0x1000];
+                        return at 0x1000;
                 "
         );
 
@@ -607,7 +607,7 @@ mod tests {
                         %zs = zext(i64, %sum);
                         store(&OUT, %wide);
                         store(&OUT, %zs);
-                        return [0x1000];
+                        return at 0x1000;
                 "
         );
 
@@ -634,7 +634,7 @@ mod tests {
 
                 fn shared_orphans:
                     <entry>
-                        return [0x1000];
+                        return at 0x1000;
 
                     <e1>
                         %x1 = &A - i32 0x8;
@@ -647,7 +647,7 @@ mod tests {
                     <shared>
                         %x2 = &A - i32 0x8;
                         store(&OUT, %x2);
-                        return [0x1001];
+                        return at 0x1001;
                 "
         );
 

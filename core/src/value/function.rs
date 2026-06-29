@@ -55,6 +55,17 @@ pub struct Function<'str> {
 
     /// Optional ABI description used by alias analysis.
     pub signature: Option<FunctionSignature>,
+
+    /// What semantic class this function belongs to.
+    #[serde(default)]
+    pub kind: FunctionKind,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum FunctionKind {
+    #[default]
+    Machine,
+    Lambda,
 }
 
 impl<'str> Function<'str> {
@@ -67,6 +78,7 @@ impl<'str> Function<'str> {
             instruction_addrs: BTreeSet::new(),
             is_external: false,
             signature: None,
+            kind: FunctionKind::Machine,
         }
     }
 
@@ -118,6 +130,18 @@ impl<'str> Function<'str> {
         let id = ctx.values.push_function(Function::new(name.clone()));
         ctx.update_name(name, id.into(), None)?;
         Ok(Self::from_id_mut(ctx, id))
+    }
+
+    /// Create a new pure value-level lambda function.
+    pub fn make_lambda<'ctx>(
+        ctx: &'ctx mut Context<'str>,
+        name: Cow<'str, str>,
+    ) -> Result<FunctionMutRef<'str, 'ctx>> {
+        let mut function = Self::make(ctx, name)?;
+        function.inner_mut().kind = FunctionKind::Lambda;
+        function.set_is_pure(true);
+        function.set_pure_reg(true);
+        Ok(function)
     }
 
     /// Create a new function at a given address, generating a name if necessary.
@@ -246,6 +270,15 @@ where
     /// [`is_pure_reg`](Self::is_pure_reg). See [`FunctionSignature::is_pure`].
     pub fn is_pure(&'s self) -> bool {
         self.inner().signature.as_ref().is_some_and(|s| s.is_pure)
+    }
+
+    /// Whether this is a pure value-level lambda rather than a machine function.
+    pub fn is_lambda(&'s self) -> bool {
+        self.inner().kind == FunctionKind::Lambda
+    }
+
+    pub fn kind(&'s self) -> FunctionKind {
+        self.inner().kind
     }
 
     /// Registers read before written (function inputs), as inferred by analysis.
@@ -503,7 +536,11 @@ where
         if self.is_external() {
             return writeln!(f, "extern fn {};", self.name());
         }
-        writeln!(f, "fn {}:", self.name())?;
+        let keyword = match self.kind() {
+            FunctionKind::Machine => "fn",
+            FunctionKind::Lambda => "lambda",
+        };
+        writeln!(f, "{keyword} {}:", self.name())?;
         for block in self.blocks() {
             block.fmt(f)?;
         }
@@ -703,6 +740,14 @@ impl<'str, 'ctx> FunctionMutRef<'str, 'ctx> {
         );
     }
 
+    pub fn set_kind(&mut self, kind: FunctionKind) {
+        self.inner_mut().kind = kind;
+        if kind == FunctionKind::Lambda {
+            self.set_is_pure(true);
+            self.set_pure_reg(true);
+        }
+    }
+
     pub fn set_signature(&mut self, sig: FunctionSignature) {
         self.ctx.values.functions[self.id].signature = Some(sig);
     }
@@ -822,6 +867,13 @@ impl<'str, 'ctx> FunctionMutRef<'str, 'ctx> {
     pub fn add_block(&mut self, id: BlockId) {
         self.inner_mut().blocks.insert(id);
         self.ctx.values.basic_blocks[id].parent = Some(self.id);
+    }
+
+    /// Disassociates `block` from this function, removing it from the block list.
+    /// The block's `parent` is left untouched, so callers moving a block to
+    /// another function should call [`add_block`](Self::add_block) afterwards.
+    pub fn remove_block(&mut self, id: BlockId) {
+        self.inner_mut().blocks.remove(&id);
     }
 }
 
@@ -1000,7 +1052,7 @@ mod tests {
             "
             fn simple:
                 <entry>
-                    return [0];
+                    return at 0;
             "
         );
 
@@ -1025,7 +1077,7 @@ mod tests {
                     goto <bb3>;
 
                 <bb3>
-                    return [0];
+                    return at 0;
             "
         );
 
@@ -1046,7 +1098,7 @@ mod tests {
             "
             fn myfn:
                 <start>
-                    return [0];
+                    return at 0;
             "
         );
 

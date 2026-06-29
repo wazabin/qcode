@@ -1101,12 +1101,12 @@ mod tests {
             fn inc:
                 <inc_entry @e:i8>
                     %r = @e + i8 1;
-                    return [%r];
+                    return at %r;
             fn host:
                 <host_entry>
                     %s = load(i32, &SRC);
                     %m = inc <$> %s;
-                    return [%m];
+                    return at %m;
             "
         );
         let root = Function::from_id(&ctx, host).root().unwrap().id;
@@ -1591,7 +1591,7 @@ mod tests {
 
                 <exit>
                     store({r0_lo32}, i32 3);
-                    return [i64 0];
+                    return at i64 0;
             "
         );
 

@@ -120,7 +120,7 @@ mod tests {
                         goto <header>;
 
                     <exit>
-                        return [0x1000];
+                        return at 0x1000;
                 "
         );
 
@@ -159,7 +159,7 @@ mod tests {
                         goto <header>;
 
                     <exit>
-                        return [0x1000];
+                        return at 0x1000;
                 "
         );
 
@@ -197,7 +197,7 @@ mod tests {
                         if i8 1 goto <header> else goto <exit>;
 
                     <exit>
-                        return [0x1000];
+                        return at 0x1000;
                 "
         );
 
@@ -233,7 +233,7 @@ mod tests {
                     <reload>
                         %v = load(i32, &A);
                         store(&B, %v);
-                        return [0x1000];
+                        return at 0x1000;
                 "
         );
 
@@ -357,7 +357,7 @@ mod tests {
                         store({eax}, i32 0x12345678); # EAX = c
                         %r = load(i32, {eax});         # %r = EAX
                         store({other}, %r);            # use %r (keeps it live)
-                        return [0x1000];
+                        return at 0x1000;
                 "
         );
 
@@ -443,7 +443,7 @@ mod tests {
                         store({r0_byte0}, %cc);  # setnz al
                         %load = load(i32, {r0_lo32});
                         store({r1}, %load);      # push eax (use)
-                        return [0x1000];
+                        return at 0x1000;
                 "
         );
 
@@ -485,7 +485,7 @@ mod tests {
                         store({r0_byte0}, i8 1);
                         %v = load(i32, {r0_lo32});
                         store({r1}, %v);
-                        return [0x1000];
+                        return at 0x1000;
                 "
         );
 
@@ -520,7 +520,7 @@ mod tests {
                         store({r0_byte3}, i8 0xDD);
                         %v = load(i32, {r0_lo32});
                         store({r1}, %v);
-                        return [0x1000];
+                        return at 0x1000;
                 "
         );
 
@@ -556,7 +556,7 @@ mod tests {
                         store({r0_byte1}, %y);
                         %load = load(i16, {r0_lo16});
                         store({r1}, %load);
-                        return [0x1000];
+                        return at 0x1000;
                 "
         );
 
@@ -596,7 +596,7 @@ mod tests {
                         load(i8, {r0_byte3});
                         %load = load(i32, {r0_lo32});
                         store({r1}, %load);
-                        return [0x1000];
+                        return at 0x1000;
                 "
         );
 
@@ -628,7 +628,7 @@ mod tests {
                         store({r0_byte0}, i8 0xAB);
                         %v = load(i32, {r0_lo32});
                         store({r1}, %v);
-                        return [0x1000];
+                        return at 0x1000;
                 "
         );
 
@@ -664,7 +664,7 @@ mod tests {
                         store({r0_lo32}, %w);
                         %narrow = load(i8, {r0_byte1});
                         store({r1}, %narrow);
-                        return [0x1000];
+                        return at 0x1000;
                 "
         );
 
@@ -699,7 +699,7 @@ mod tests {
                         store({r0_byte2}, i8 2); # byte 1 and 3 unwritten
                         %load = load(i32, {r0_lo32});
                         store({r1}, %load);
-                        return [0x1000];
+                        return at 0x1000;
                 "
         );
 
@@ -732,7 +732,7 @@ mod tests {
                     <succ>
                         %load = load(i16, {r0_lo16});
                         store({r1}, %load);
-                        return [0x2000];
+                        return at 0x2000;
                 "
         );
 
@@ -806,7 +806,7 @@ mod tests {
                         %p1 = %p + i64 1;
                         %r = load(i8, %p1);
                         store(&OUT, %r);
-                        return [0x1000];
+                        return at 0x1000;
                 "
         );
 
@@ -842,7 +842,7 @@ mod tests {
                         %p3 = %p + i64 3;
                         %r = load(i16, %p3);
                         store(&OUT, %r);
-                        return [0x1000];
+                        return at 0x1000;
                 "
         );
 
@@ -875,7 +875,7 @@ mod tests {
                         %p1 = %p + i64 1;
                         %r = load(i8, %p1);
                         store(&OUT, %r);
-                        return [0x1000];
+                        return at 0x1000;
                 "
         );
 
@@ -907,7 +907,7 @@ mod tests {
                         %pm = %p4 - i64 4;
                         %r = load(i32, %pm);
                         store(&OUT, %r);
-                        return [0x1000];
+                        return at 0x1000;
                 "
         );
 

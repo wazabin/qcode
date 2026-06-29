@@ -733,6 +733,7 @@ enum StepEvent {
     DirectCallEntered(FunctionId),
     IndirectCallEntered,
     Return,
+    ReturnValue,
     InterceptedCall,
 }
 
@@ -1161,6 +1162,34 @@ impl StandaloneEmulator {
                 return Ok(StepEvent::DirectCallEntered(target));
             }
 
+            Mnemonic::Apply(apply) => {
+                const APPLY_STEP_BUDGET: usize = 100_000;
+                let args = self
+                    .collect_block_args(ctx, &apply.args)
+                    .map_err(|kind| self.make_error(ctx, kind))?;
+                let root = Function::from_id(ctx, apply.target)
+                    .root()
+                    .ok_or_else(|| {
+                        self.make_error(ctx, EmulatorErrorKind::EmptyFunctionRoot(apply.target))
+                    })?
+                    .id;
+                let mut nested = StandaloneEmulator::new(root);
+                nested
+                    .run_pure(ctx, apply.target, &args, APPLY_STEP_BUDGET)
+                    .map_err(|e| self.make_error(ctx, e.kind))?;
+                let ret_value = lambda_return_value(ctx, nested.current_block())
+                    .ok_or_else(|| self.make_error(ctx, EmulatorErrorKind::ValueError(0)))?;
+                if let Some(value) = nested.get_value(ctx, ret_value) {
+                    let size = ctx
+                        .stored_type_of(ret_value)
+                        .map(|ty| ctx.types.size_of(ty))
+                        .unwrap_or(8);
+                    self.insn_values
+                        .insert(insn_id, SizedValue::new(value, size));
+                }
+                self.idx += 1;
+            }
+
             Mnemonic::CBranch(CBranch {
                 condition,
                 success_block: target,
@@ -1229,6 +1258,10 @@ impl StandaloneEmulator {
                 self.block = target;
                 self.idx = 0;
                 return Ok(StepEvent::Return);
+            }
+
+            Mnemonic::ReturnValue(_) => {
+                return Ok(StepEvent::ReturnValue);
             }
 
             // Aggregate construction: evaluate each field and stash the field
@@ -1453,7 +1486,7 @@ impl StandaloneEmulator {
                         self.seed_entry_params(ctx, callee);
                     }
                 }
-                StepEvent::Return => {
+                StepEvent::Return | StepEvent::ReturnValue => {
                     self.call_stack.pop();
                     call_depth -= 1;
                 }
@@ -1541,7 +1574,8 @@ impl StandaloneEmulator {
     }
 
     /// Shared drive loop for the bounded `run_pure`/`run_map_body` entry points:
-    /// run from the current position to the first top-level `Return` (without
+    /// run from the current position to the first top-level value or machine
+    /// `Return` (without
     /// executing it), popping the call frame. Params must already be seeded and
     /// `func` pushed onto the call stack.
     fn drive_to_return(
@@ -1565,7 +1599,10 @@ impl StandaloneEmulator {
                 break Err(self.make_empty_block_error(ctx));
             }
             let insn = InstructionRef::new(ctx, insn_ids[self.idx]);
-            if matches!(insn.mnemonic(), Mnemonic::Return(_)) {
+            if matches!(
+                insn.mnemonic(),
+                Mnemonic::Return(_) | Mnemonic::ReturnValue(_)
+            ) {
                 break Ok(());
             }
             steps += 1;
@@ -1579,6 +1616,14 @@ impl StandaloneEmulator {
 
         self.call_stack.pop();
         result
+    }
+}
+
+fn lambda_return_value(ctx: &Context<'_>, block: BlockId) -> Option<ValueId> {
+    let last = BasicBlock::from_id(ctx, block).iter().last()?;
+    match last.mnemonic() {
+        Mnemonic::ReturnValue(ret) => Some(ret.value),
+        _ => None,
     }
 }
 
@@ -1925,6 +1970,41 @@ mod tests {
         emu.step(&ctx).expect("destination uses block param");
 
         assert_eq!(emu.get_value(&ctx, sum.into()), Some(5));
+    }
+
+    #[test]
+    fn apply_evaluates_recursive_lambda_value_return() {
+        let mut ctx = Context::new();
+        qcode!(
+            ctx,
+            "
+            lambda dec:
+            <entry @n:i64>
+                %is_zero = @n == 0;
+                if %is_zero goto <done @r=@n> else goto <step @m=@n>;
+
+            <step @m:i64>
+                %next = @m - 1;
+                %out = apply dec(%next);
+                return %out;
+
+            <done @r:i64>
+                return @r;
+            "
+        );
+
+        let dec = qcode::value::Function::from_name(&ctx, "dec")
+            .expect("lambda exists")
+            .id;
+        let root = qcode::value::Function::from_id(&ctx, dec)
+            .root()
+            .expect("lambda has root")
+            .id;
+        let mut emu = StandaloneEmulator::new(root);
+        emu.run_pure(&ctx, dec, &[SizedValue::new(3, 8)], 1000)
+            .expect("recursive lambda evaluates");
+        let ret = lambda_return_value(&ctx, emu.current_block()).expect("lambda returned a value");
+        assert_eq!(emu.get_value(&ctx, ret), Some(0));
     }
 
     /// Emulating a function whose body contains a `map` bails with a recoverable
@@ -2451,7 +2531,7 @@ mod tests {
             "
             fn function:
             <entry>
-                return [i64 0];
+                return at i64 0;
             "
         );
 
@@ -2473,7 +2553,7 @@ mod tests {
                 %a = load(i64, &A);
                 %b = load(i64, &B);
                 %sum = %a + %b;
-                return [i64 0];
+                return at i64 0;
             "
         );
 
@@ -2503,7 +2583,7 @@ mod tests {
                 %a = load(i64, &A);
                 %b = load(i64, &B);
                 %sum = %a + %b;
-                return [i64 0];
+                return at i64 0;
             "
         );
 
@@ -2521,7 +2601,7 @@ mod tests {
             "
             fn callee:
             <callee_entry>
-                return [i64 0];
+                return at i64 0;
 
             <caller>
                 call <callee>;
@@ -2544,14 +2624,14 @@ mod tests {
 
             fn library:
             <library_entry>
-                return [i64 0];
+                return at i64 0;
 
             fn function:
             <entry>
                 call <library>;
             <after_call>
                 %ret = load(i64, &RET);
-                return [i64 0];
+                return at i64 0;
             "
         );
 
@@ -2585,12 +2665,12 @@ mod tests {
             "
             fn library:
             <library_entry>
-                return [i64 0];
+                return at i64 0;
 
             <entry>
                 call <library>;
             <0x2000>
-                return [i64 0];
+                return at i64 0;
             "
         );
 
@@ -2616,7 +2696,7 @@ mod tests {
             "
             fn library:
             <library_entry>
-                return [i64 0];
+                return at i64 0;
 
             <entry>
                 call <library>;
@@ -2648,7 +2728,7 @@ mod tests {
             "
             fn library:
             <library_entry>
-                return [i64 0];
+                return at i64 0;
 
             <entry>
                 call <library>;
@@ -2675,11 +2755,11 @@ mod tests {
             "
             fn make_object:
             <make_object_entry>
-                return [i64 0];
+                return at i64 0;
 
             fn append_byte:
             <append_byte_entry>
-                return [i64 0];
+                return at i64 0;
 
             fn function:
             <entry>
@@ -2687,7 +2767,7 @@ mod tests {
             <append>
                 call <append_byte>;
             <done>
-                return [i64 0];
+                return at i64 0;
             "
         );
 
@@ -2747,7 +2827,7 @@ mod tests {
             <entry>
                 # Null pointer dereference
                 %bad_load = load(i64, i64 0);
-                return [i64 0];
+                return at i64 0;
             "
         );
 

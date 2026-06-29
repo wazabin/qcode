@@ -565,7 +565,7 @@ mod tests {
                         %and = %a & %b;
                         %dbl = %and << 0x1;
                         %root = %sum - %dbl;
-                        return [%root];
+                        return at %root;
                 "
         );
 
@@ -605,7 +605,7 @@ mod tests {
                         %or = %a | %b;
                         %and = %a & %b;
                         %root = %or - %and;
-                        return [%root];
+                        return at %root;
                 "
         );
 
@@ -637,7 +637,7 @@ mod tests {
                         %or = %a | %b;
                         %and = %a & %b;
                         %root = %or + %and;
-                        return [%root];
+                        return at %root;
                 "
         );
 
@@ -676,7 +676,7 @@ mod tests {
                         %x = %i ^ 0x1;
                         %inc = %dbl + %x;
                         store(&I, %inc);
-                        return [0x1000];
+                        return at 0x1000;
                 "
         );
 
@@ -714,9 +714,9 @@ mod tests {
                         %cond = %z != 0x0;
                         if %cond goto <0x2000> else goto <0x1000>;
                     <0x1000>
-                        return [0x0];
+                        return at 0x0;
                     <0x2000>
-                        return [0x1];
+                        return at 0x1;
                 "
         );
 
@@ -757,7 +757,7 @@ mod tests {
                         %cond = %z != 0x0;
                         %c8 = zext(i8, %cond);
                         store(&B, %c8);
-                        return [0x0];
+                        return at 0x0;
                 "
         );
 
@@ -798,7 +798,7 @@ mod tests {
                         %b1 = %b0 & 0xfffffff8;
                         %c0 = %b1 - 0x88;
                         %c1 = %c0 & 0xfffffff8;
-                        return [%c1];
+                        return at %c1;
                 "
         );
 
@@ -830,7 +830,7 @@ mod tests {
                         %base = %sp & 0xfffffff8;
                         %a0 = %base - 0xa4;
                         %a1 = %a0 & 0xfffffff8;
-                        return [%a1];
+                        return at %a1;
                 "
         );
 
@@ -861,7 +861,7 @@ mod tests {
                         %sum = %a + %b;
                         %and = %a & %b;
                         %root = %sum - %and;
-                        return [%root];
+                        return at %root;
                 "
         );
 

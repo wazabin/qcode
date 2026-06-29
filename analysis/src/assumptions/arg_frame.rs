@@ -381,14 +381,14 @@ mod tests {
                     %off = @sp + i64 0x4;
                     %x = load(i32, %off);
                     store(@p, %x);
-                    return [i64 0];
+                    return at i64 0;
             fn g:
                 <g_entry @gsp:i64>
                     goto <g_call>;
                 <g_call>
                     call <f>;
                 <g_cont>
-                    return [i64 0];
+                    return at i64 0;
             "
         );
         let _ = g_cont;

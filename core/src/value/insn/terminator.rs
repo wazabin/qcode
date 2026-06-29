@@ -96,6 +96,35 @@ impl MnemonicKind for BranchInd {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+pub struct Apply {
+    pub target: FunctionId,
+    /// Values passed to the lambda, one per root block param, in order.
+    pub args: Vec<ValueId>,
+}
+
+impl MnemonicKind for Apply {
+    fn opcode(&self) -> &'static str {
+        "apply"
+    }
+
+    fn fmt(&self, f: &mut Formatter<'_>, ctx: &Context<'_>) -> std::fmt::Result {
+        write!(f, "apply @{}(", Function::from_id(ctx, self.target).name())?;
+        for (i, &arg) in self.args.iter().enumerate() {
+            if i > 0 {
+                write!(f, ", ")?;
+            }
+            fmt_call_arg_name(f, ctx, self.target, i)?;
+            write!(f, "{}", ValueRef::new(arg, ctx))?;
+        }
+        write!(f, ");")
+    }
+
+    fn args(&self) -> Vec<ValueId> {
+        self.args.clone()
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub struct Call {
     pub target: FunctionId,
     /// Values passed to the callee, one per inferred callee input, in order.
@@ -213,7 +242,15 @@ impl MnemonicKind for Return {
     }
 
     fn fmt(&self, f: &mut Formatter<'_>, ctx: &Context<'_>) -> std::fmt::Result {
-        write!(f, "return [{}];", ValueRef::new(self.ptr, ctx))
+        match self.value {
+            Some(value) => write!(
+                f,
+                "return {} at {};",
+                ValueRef::new(value, ctx),
+                ValueRef::new(self.ptr, ctx)
+            ),
+            None => write!(f, "return at {};", ValueRef::new(self.ptr, ctx)),
+        }
     }
 
     fn args(&self) -> Args {
@@ -222,6 +259,29 @@ impl MnemonicKind for Return {
             args.push(value);
         }
         args
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+pub struct ReturnValue {
+    pub value: ValueId,
+}
+
+impl MnemonicKind for ReturnValue {
+    fn opcode(&self) -> &'static str {
+        "returnvalue"
+    }
+
+    fn is_terminator(&self) -> bool {
+        true
+    }
+
+    fn fmt(&self, f: &mut Formatter<'_>, ctx: &Context<'_>) -> std::fmt::Result {
+        write!(f, "return {};", ValueRef::new(self.value, ctx))
+    }
+
+    fn args(&self) -> Vec<ValueId> {
+        vec![self.value]
     }
 }
 
@@ -404,13 +464,47 @@ mod tests {
             "
             <block>
                 local i64 ptr;
-                return [ptr];
+                return at ptr;
             "
         );
 
         let block = BasicBlock::from_id(&ctx, block);
         let last = block.iter().last().expect("block has instructions");
         assert!(matches!(last.mnemonic(), Mnemonic::Return(_)));
+    }
+
+    #[test]
+    fn qcode_emits_lambda_apply_and_value_return() {
+        let mut ctx = Context::new();
+        qcode!(
+            ctx,
+            "
+            lambda rec:
+            <entry @s:i64>
+                %next = @s + 1;
+                %out = apply rec(%next);
+                return %out;
+            "
+        );
+
+        let rec = Function::from_name(&ctx, "rec").expect("lambda exists");
+        assert!(rec.is_lambda());
+        let entry = rec.root().expect("lambda has root");
+        let insns = entry.instruction_ids();
+        let apply = ctx.get_insn(insns[1]);
+        assert!(!apply.is_terminator(), "apply is a value instruction");
+        assert!(matches!(apply.mnemonic(), Mnemonic::Apply(_)));
+        assert!(matches!(
+            ctx.get_insn(*insns.last().unwrap()).mnemonic(),
+            Mnemonic::ReturnValue(_)
+        ));
+        assert!(apply.as_statement().to_string().contains("apply @rec("));
+        assert_eq!(
+            ctx.get_insn(*insns.last().unwrap())
+                .as_statement()
+                .to_string(),
+            "return i64 %out;"
+        );
     }
 
     #[test]

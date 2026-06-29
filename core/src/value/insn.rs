@@ -50,7 +50,7 @@ pub use memory::{Load, Store};
 pub use mnemonic::Mnemonic;
 pub use pcode_op::{PCodeOp, PCodeOpId};
 pub use scan::Scan;
-pub use terminator::{Branch, BranchInd, CBranch, Call, CallInd, Return};
+pub use terminator::{Apply, Branch, BranchInd, CBranch, Call, CallInd, Return, ReturnValue};
 pub use unop::{Unary, Unop};
 
 #[derive(Identifier)]

@@ -88,7 +88,7 @@ mod tests {
             "
                 fn foo:
                     <entry>
-                        return [0x1000];
+                        return at 0x1000;
             "
         );
 
@@ -106,7 +106,7 @@ mod tests {
             "
                 fn _ZN5space3fooEibc:
                     <entry>
-                        return [0x1000];
+                        return at 0x1000;
             "
         );
 
@@ -130,7 +130,7 @@ mod tests {
             "
                 fn placeholder:
                     <entry>
-                        return [0x1000];
+                        return at 0x1000;
             "
         );
         Function::from_id_mut(&mut ctx, placeholder)

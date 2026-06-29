@@ -189,7 +189,7 @@ mod tests {
                 <entry>
                     varnode i32 fs;
                     %peb_slot = &fs + i32 0x30;
-                    return [i32 0];
+                    return at i32 0;
             "
         );
 
@@ -249,7 +249,7 @@ mod tests {
             "
             fn f:
                 <entry>
-                    return [i32 0];
+                    return at i32 0;
             "
         );
         // Register an `FS_OFFSET` register varnode (as the lifter would).

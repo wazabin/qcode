@@ -1107,7 +1107,7 @@ mod tests {
 
             <block>
                 store(&ptr, i64 0x1234);
-                return [ptr];
+                return at ptr;
             "
         );
 
@@ -1125,7 +1125,7 @@ mod tests {
             <block>
                 %a = load(i64, &x);
                 %b = load(i64, &x);
-                return [%a];
+                return at %a;
             "
         );
         let block_ref = BasicBlock::from_id(&ctx, block);
@@ -1149,7 +1149,7 @@ mod tests {
             varnode i64 x;
             <block>
                 %a = load(i64, &x);
-                return [%a];
+                return at %a;
             "
         );
         let load_id = BasicBlock::from_id(&ctx, block).instruction_ids()[0];
@@ -1171,7 +1171,7 @@ mod tests {
             varnode i64 x;
             <block>
                 %a = load(i64, &x);
-                return [%a];
+                return at %a;
             "
         );
         let load_id = BasicBlock::from_id(&ctx, block).instruction_ids()[0];
@@ -1201,7 +1201,7 @@ mod tests {
             varnode i64 x;
             <block>
                 %a = load(i64, &x);
-                return [%a];
+                return at %a;
             "
         );
         let load_id = BasicBlock::from_id(&ctx, block).instruction_ids()[0];
@@ -1215,7 +1215,7 @@ mod tests {
             varnode i64 y;
             <block2>
                 %a = load(i64, &y);
-                return [%a];
+                return at %a;
             "
         );
         assert!(
@@ -1234,7 +1234,7 @@ mod tests {
             <block>
                 %a = load(i64, &x);
                 %b = %a + i64 1;
-                return [%b];
+                return at %b;
             "
         );
         let ids: Vec<_> = BasicBlock::from_id(&ctx, block).instruction_ids().to_vec();
@@ -1269,7 +1269,7 @@ mod tests {
             <block>
                 %a = load(i64, &x);
                 %dead = %a + i64 1;
-                return [i64 0];
+                return at i64 0;
             "
         );
         let ids: Vec<_> = BasicBlock::from_id(&ctx, block).instruction_ids().to_vec();
@@ -1379,7 +1379,7 @@ mod tests {
             varnode i64 y;
             <block>
                 %a = load(i64, x);
-                return [%a];
+                return at %a;
             "
         );
         let load_id = BasicBlock::from_id(&ctx, block).instruction_ids()[0];
@@ -1411,7 +1411,7 @@ mod tests {
             varnode i64 y;
             <block>
                 %a = load(i64, x);
-                return [%a];
+                return at %a;
             "
         );
         let load_id = BasicBlock::from_id(&ctx, block).instruction_ids()[0];
@@ -1444,7 +1444,7 @@ mod tests {
             varnode i64 x;
             <block>
                 %a = load(i64, &x);
-                return [%a];
+                return at %a;
             "
         );
         let load_id = BasicBlock::from_id(&ctx, block).instruction_ids()[0];
@@ -1638,7 +1638,7 @@ mod tests {
                 %a = load(i64, &ptr);
                 %b = %a + i64 0x10;
                 store(&ptr, i64 0x1234);
-                return [%b];
+                return at %b;
             "
         );
 

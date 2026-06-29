@@ -30,7 +30,9 @@ pub use bytes::{
     Bytes, BytesDisplay, BytesId, BytesRef, StringEncoding, decode_string, escape_decoded,
     render_bytes_literal,
 };
-pub use function::{Function, FunctionId, FunctionMutRef, FunctionRef, ParamAttrs};
+pub use function::{
+    Function, FunctionId, FunctionKind, FunctionMutRef, FunctionRef, ParamAttrs,
+};
 pub use insn::{Instruction, InstructionId, InstructionRef};
 pub use literal::{LiteralId, LiteralRef};
 pub use util::named::{Named, Renameable};
