@@ -61,10 +61,7 @@ pub(super) fn globalize_constants(ctx: &mut Context, fid: FunctionId) -> bool {
                 Mnemonic::Store(s) => (s.space, s.ptr),
                 _ => continue,
             };
-            if matches!(ptr, ValueId::Literal(_))
-                && is_real_ram(ctx, space)
-                && seen.insert(ptr)
-            {
+            if matches!(ptr, ValueId::Literal(_)) && is_real_ram(ctx, space) && seen.insert(ptr) {
                 globals.push(ptr);
             }
         }
@@ -83,8 +80,11 @@ pub(super) fn globalize_constants(ctx: &mut Context, fid: FunctionId) -> bool {
         let name = format!("glob_{:x}", lit.value());
 
         // The caller passes the address literal verbatim: literals are context-
-        // global, so `addr` is a valid `ValueId` in any function's body.
-        let Some(param) = append_entry_param(ctx, fid, size, Some(name), None, move |_, _, _| addr)
+        // global, so `addr` is a valid `ValueId` in any function's body. Record the
+        // address literal as the param's `origin` so alias analysis recognizes this
+        // param as a static/global pointer, disjoint from the live stack frame.
+        let Some(param) =
+            append_entry_param(ctx, fid, size, Some(name), Some(addr), move |_, _, _| addr)
         else {
             continue;
         };

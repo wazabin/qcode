@@ -72,6 +72,20 @@ pub enum Proposition {
     ///
     /// [`AliasResult::provably_disjoint`]: crate
     LoadedPointerDisjointFromSlot(FunctionId),
+    /// The source and destination buffers of a recognized copy/transform loop in
+    /// this function do not overlap — the C `strcpy`/`memcpy` contract, where
+    /// overlapping buffers are undefined behaviour (that is `memmove`'s job).
+    ///
+    /// A copy-until-terminator (`while (*src) *dst++ = *src++;`) loop pipelines
+    /// its loaded byte through a loop-carried register, and re-deriving that byte
+    /// as `load(src - step)` — the move that removes the carry and exposes the
+    /// `map(body, take_while(src))` shape — re-reads memory that the body also
+    /// writes through `dst`. That re-read is value-preserving only when the two
+    /// buffers are disjoint. Like [`ArgsDisjointFromCallerFrame`] it is **not**
+    /// statically sound on its own — a caller may pass overlapping pointers — so a
+    /// pass records it `Assumed`; v1 has no verifier (the checkpoint+replay net
+    /// catches any future refutation).
+    CopyBuffersDisjoint(FunctionId),
     /// The `size` bytes at virtual address `addr` (a jump-table entry the
     /// jump-table resolver read out of read-only data) are assumed never
     /// written at runtime; a write would invalidate the resolved jump target.

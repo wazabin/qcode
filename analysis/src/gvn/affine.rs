@@ -616,6 +616,12 @@ impl Numbering {
         self.forms.insert(id, form);
     }
 
+    /// The stored arithmetic view of `v` (`Affine`/`Mask`), if any. Used by the
+    /// structural congruence engine to flatten affine subtrees.
+    pub(super) fn lookup_form(&self, v: ValueId) -> Option<&NormalForm> {
+        self.forms.get(&v)
+    }
+
     /// Claim `id` as the leader for `key` if no dominating leader exists yet,
     /// returning the existing dominating leader otherwise.
     pub(super) fn lookup(&self, key: &NormalForm) -> Option<ValueId> {
@@ -651,6 +657,26 @@ impl Numbering {
             } if terms.len() == 1 && terms[0].1 == 1 => {
                 Some((terms[0].0, signed(*constant, *width)))
             }
+            _ => None,
+        }
+    }
+
+    /// The full affine decomposition of `v` as `(width, constant, terms)` where
+    /// `v == constant + Σ coeff·term` (wrapping mod `2^(width*8)`), or `None` if
+    /// `v` has no affine arithmetic view (a bare leaf, a mask, or an opaque op).
+    ///
+    /// Unlike [`base_offset`], which only accepts the single-term unit-coefficient
+    /// `base + const` shape, this exposes the *whole* sum so a caller can pick out a
+    /// base pointer term and treat the remaining (possibly scaled, possibly
+    /// dynamic) terms as a strided index — e.g. `(base + idx*4) + 4` decomposes to
+    /// `constant=4, terms=[(base,1),(idx,4)]`.
+    pub(crate) fn affine_terms(&self, v: ValueId) -> Option<(usize, u64, Vec<(ValueId, u64)>)> {
+        match self.forms.get(&v)? {
+            NormalForm::Affine {
+                width,
+                constant,
+                terms,
+            } => Some((*width, *constant, terms.clone())),
             _ => None,
         }
     }
@@ -721,6 +747,27 @@ pub(crate) fn precompute_forms(ctx: &Context, func_id: FunctionId) -> Numbering 
         .iter()
         .flat_map(|block| {
             block
+                .instruction_ids()
+                .iter()
+                .map(|&id| ValueId::Instruction(id))
+                .collect::<Vec<_>>()
+        })
+        .collect();
+    for id in ids {
+        ensure_form(ctx, id, &mut numbering);
+    }
+    numbering
+}
+
+/// Like [`precompute_forms`] but seeded from an explicit block set rather than a
+/// whole function. Operand recursion follows the SSA graph regardless of block,
+/// so passing a function's full block list is equivalent to `precompute_forms`.
+pub(crate) fn precompute_forms_for_blocks(ctx: &Context, blocks: &[BlockId]) -> Numbering {
+    let mut numbering = Numbering::default();
+    let ids: Vec<ValueId> = blocks
+        .iter()
+        .flat_map(|&b| {
+            BasicBlock::from_id(ctx, b)
                 .instruction_ids()
                 .iter()
                 .map(|&id| ValueId::Instruction(id))

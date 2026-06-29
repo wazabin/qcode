@@ -10,7 +10,7 @@ use qcode::{
     },
 };
 
-use crate::gvn::affine::precompute_forms;
+use crate::gvn::affine::{Numbering, precompute_forms};
 use crate::stack::frame::{FrameClass, frame_class, incoming_sp_param};
 
 mod anderson;
@@ -41,6 +41,11 @@ pub(crate) struct FrameInfo {
     /// return-address slot and incoming stack arguments). Used only by the
     /// assumed `ArgsDisjointFromCallerFrame` rule.
     caller_frame_slots: HashSet<ValueId>,
+    /// The function's affine numbering, kept so [`AliasResult::provably_disjoint`]
+    /// can classify an *arbitrary* pointer (`@SP ± k`, `@glob + k`, …) on demand —
+    /// not just the precomputed own/caller-frame instruction sets — which the
+    /// stack-vs-global rule needs for literal and globalized-param pointers.
+    numbering: Numbering,
 }
 
 /// Abstract node in the alias graph.
@@ -196,6 +201,40 @@ impl AliasResult {
         {
             return true;
         }
+        // Rule 1b: stack ⊥ static-global. A runtime `@SP`-rooted stack address never
+        // coincides with a fixed absolute address — a global literal `0x…`, or a
+        // *globalized-global* parameter (`@glob_<addr>`, whose `origin` records the
+        // literal it replaced). The live stack and the static image occupy disjoint
+        // regions of the address space, so the two can never name the same byte.
+        // Unlike rule 2 this needs no recorded assumption: it holds in the
+        // decompilation memory model the same way frame freshness (rule 1) does.
+        if (self.is_stack_rooted(ctx, a) && self.is_global_static(ctx, b))
+            || (self.is_stack_rooted(ctx, b) && self.is_global_static(ctx, a))
+        {
+            return true;
+        }
+        // Rule 1c: a globalized-global slot ⊥ a pointer *loaded from it*. `@glob_<addr>`
+        // holds a pointer; a store through `load(@glob) + …` addresses the buffer
+        // behind the pointer, not the pointer slot itself. This is the global-slot
+        // analogue of the caller-frame spilled-pointer reload (rule 2) and rides the
+        // same [`Proposition::LoadedPointerDisjointFromSlot`] assumption — not
+        // statically sound (a self-referential global `*pp == &pp` would break it),
+        // recorded `Assumed`, caught by checkpoint+replay. It lets the in-loop reload
+        // of a globalized pointer forward across the store that writes through it,
+        // which `argpromote` needs to region-promote the buffer behind the global.
+        //
+        // We require an actual `load` on the path (`peels_to_load`), not merely
+        // `is_input_derived`: a `@glob` slot is itself a root param, so the looser
+        // test would wrongly call it disjoint from itself.
+        let loaded_ptr_disjoint = ctx
+            .truth(Proposition::LoadedPointerDisjointFromSlot(frame.fid))
+            .is_some_and(|t| t.value);
+        if loaded_ptr_disjoint
+            && ((self.is_global_static(ctx, a) && self.peels_to_load(ctx, b))
+                || (self.is_global_static(ctx, b) && self.peels_to_load(ctx, a)))
+        {
+            return true;
+        }
         // Rule 2: caller-frame slot ⊥ incoming pointer, under the recorded
         // assumption (validated by replay).
         //
@@ -237,6 +276,38 @@ impl AliasResult {
             .is_some_and(|f| f.own_frame_locals.contains(&v))
     }
 
+    /// Whether `v` is a stack-pointer-rooted address (`@SP ± k`, or a realigned
+    /// `(@SP & -mask) ± k`) — i.e. it names a slot in this function's live stack
+    /// frame. Inert without frame-freshness context. Used by the stack-vs-global
+    /// disjointness rule.
+    fn is_stack_rooted(&self, ctx: &Context, v: ValueId) -> bool {
+        self.frame
+            .as_ref()
+            .is_some_and(|f| frame_class(ctx, &f.numbering, f.sp_param, v).is_some())
+    }
+
+    /// Whether `v` is a fixed static/global address: a literal absolute address,
+    /// a *globalized-global* parameter (`@glob_<addr>`, whose `origin` is the
+    /// address literal it replaced — see `argpromote::globals`), or affine
+    /// arithmetic (`base + k`) over either. Such an address lives in the static
+    /// image, never in the live stack.
+    fn is_global_static(&self, ctx: &Context, v: ValueId) -> bool {
+        match v {
+            ValueId::Literal(_) => true,
+            ValueId::BlockParam(pid) => {
+                matches!(
+                    BlockParam::from_id(ctx, pid).origin(),
+                    Some(ValueId::Literal(_))
+                )
+            }
+            _ => self
+                .frame
+                .as_ref()
+                .and_then(|f| f.numbering.base_offset(v))
+                .is_some_and(|(base, _)| base != v && self.is_global_static(ctx, base)),
+        }
+    }
+
     /// Whether `v` is *input-derived*: it peels — through address arithmetic
     /// (`add`/`sub` of an offset) and width casts (`zext`/`sext`/`range`) — to a
     /// parameter of this function's root block, i.e. a value that entered from the
@@ -250,6 +321,49 @@ impl AliasResult {
             return false;
         };
         self.is_input_derived_rec(ctx, frame, v, peel_loads, &mut HashSet::default())
+    }
+
+    /// Whether `v` is a pointer obtained from the *contents of a slot* — through
+    /// pointer arithmetic (`add`/`sub`) and width casts — i.e. a buffer pointer read
+    /// out of a slot and then indexed. Two provenances qualify:
+    ///   * an actual `load(…)` on the path (the reloaded pointer), or
+    ///   * a by-value snapshot param whose `origin` is a global-static slot param —
+    ///     `argpromote`'s partial-promotion materialization of `*slot` (see
+    ///     `apply_partial`), which equals the loaded pointer by construction.
+    ///
+    /// Unlike [`is_input_derived`] (which stops at any root param), this requires one
+    /// of those load provenances, so a bare slot address is never mistaken for a
+    /// pointer loaded *from* it. Used by the globalized-global slot rule in
+    /// [`AliasResult::provably_disjoint`].
+    fn peels_to_load(&self, ctx: &Context, v: ValueId) -> bool {
+        self.peels_to_load_rec(ctx, v, &mut HashSet::default())
+    }
+
+    fn peels_to_load_rec(&self, ctx: &Context, v: ValueId, seen: &mut HashSet<ValueId>) -> bool {
+        if !seen.insert(v) {
+            return false;
+        }
+        match v {
+            // A partial-promotion snapshot of `*slot` (origin = the global slot param)
+            // — materialized loaded pointer. The `BlockParam` origin distinguishes it
+            // from the slot itself (whose origin is the address *literal*).
+            ValueId::BlockParam(pid) => matches!(
+                BlockParam::from_id(ctx, pid).origin(),
+                Some(o @ ValueId::BlockParam(_)) if self.is_global_static(ctx, o)
+            ),
+            ValueId::Instruction(id) => match Instruction::from_id(ctx, id).mnemonic() {
+                Mnemonic::Load(_) => true,
+                Mnemonic::Binop(b) if matches!(b.op, Binop::Int(IntBinop::Add | IntBinop::Sub)) => {
+                    self.peels_to_load_rec(ctx, b.lhs, seen)
+                        || self.peels_to_load_rec(ctx, b.rhs, seen)
+                }
+                Mnemonic::Zext(z) => self.peels_to_load_rec(ctx, z.src, seen),
+                Mnemonic::Sext(s) => self.peels_to_load_rec(ctx, s.src, seen),
+                Mnemonic::Range(r) => self.peels_to_load_rec(ctx, r.src, seen),
+                _ => false,
+            },
+            _ => false,
+        }
     }
 
     fn is_input_derived_rec(
@@ -335,6 +449,7 @@ impl AliasResult {
             sp_param: sp,
             own_frame_locals,
             caller_frame_slots,
+            numbering,
         });
         self
     }
@@ -481,6 +596,158 @@ mod tests {
         // Inert without the frame-freshness context.
         let plain = AliasResult::simple(&tc.ctx);
         assert!(!plain.provably_disjoint(&tc.ctx, local, arg));
+    }
+
+    /// Stack-vs-global rule: an `@SP`-rooted stack slot is disjoint from a static
+    /// global address — both a bare literal address and a *globalized-global*
+    /// parameter (`@glob_<addr>`, whose `origin` is the address literal).
+    #[test]
+    fn stack_is_disjoint_from_global_statics() {
+        use qcode::{
+            builder::Builder,
+            testing::TestContext,
+            value::{BasicBlock, Function},
+        };
+
+        let mut tc = TestContext::new();
+        let sp_reg = tc.r0;
+        let fid = Function::make(&mut tc.ctx, "f".into()).unwrap().id;
+        let root = tc.ctx.get_or_make_block(0x1000);
+        {
+            let mut f = Function::from_id_mut(&mut tc.ctx, fid);
+            f.set_root(root).unwrap();
+            f.add_block(root);
+        }
+        let sp_pid = BasicBlock::from_id_mut(&mut tc.ctx, root).push_param(8).id;
+        tc.ctx.values.block_params[sp_pid].origin = Some(ValueId::Varnode(sp_reg));
+        let sp = ValueId::BlockParam(sp_pid);
+        // A globalized-global param (origin set to the address literal below).
+        let glob_pid = BasicBlock::from_id_mut(&mut tc.ctx, root).push_param(8).id;
+        let glob = ValueId::BlockParam(glob_pid);
+
+        let (local, caller_arg, glob_plus, lit_addr, glob_addr) = {
+            let mut b = Builder::from_block(BasicBlock::from_id_mut(&mut tc.ctx, root));
+            let c8 = b.context_mut().get_const(8, 8).id();
+            let local = b.push_sub(sp, c8).id(); // @SP - 8  (own-frame local)
+            let caller_arg = b.push_add(sp, c8).id(); // @SP + 8  (caller frame)
+            let glob_plus = b.push_add(glob, c8).id(); // @glob + 8
+            let lit_addr = b.context_mut().get_const(0x401000, 8).id(); // bare global address
+            let glob_addr = b.context_mut().get_const(0x454df8, 8).id();
+            unsafe { b.dont_finalize() };
+            (local, caller_arg, glob_plus, lit_addr, glob_addr)
+        };
+        tc.ctx.values.block_params[glob_pid].origin = Some(glob_addr);
+
+        let r = AliasResult::simple(&tc.ctx).with_frame_freshness(&tc.ctx, fid, Some(sp_reg));
+
+        assert!(
+            r.provably_disjoint(&tc.ctx, local, glob),
+            "stack local ⊥ globalized-global param"
+        );
+        assert!(
+            r.provably_disjoint(&tc.ctx, glob, local),
+            "rule is symmetric"
+        );
+        assert!(
+            r.provably_disjoint(&tc.ctx, local, lit_addr),
+            "stack local ⊥ a bare literal global address"
+        );
+        assert!(
+            r.provably_disjoint(&tc.ctx, local, glob_plus),
+            "stack local ⊥ a pointer offset from a globalized global"
+        );
+        assert!(
+            r.provably_disjoint(&tc.ctx, caller_arg, lit_addr),
+            "a caller-frame slot is also stack-rooted, so ⊥ a global"
+        );
+        assert!(
+            !r.provably_disjoint(&tc.ctx, lit_addr, glob),
+            "two globals are not shown disjoint by this rule"
+        );
+        assert!(
+            !r.provably_disjoint(&tc.ctx, local, caller_arg),
+            "two stack pointers are not shown disjoint by this rule"
+        );
+        assert!(
+            !r.may_alias(&tc.ctx, local, glob),
+            "may_alias reflects the disjointness"
+        );
+
+        // Inert without the frame-freshness context.
+        let plain = AliasResult::simple(&tc.ctx);
+        assert!(!plain.provably_disjoint(&tc.ctx, local, lit_addr));
+    }
+
+    /// Rule 1c: a globalized-global slot `@glob` is disjoint from a pointer *loaded
+    /// from it* (`load(@glob) + k`) — but only under `LoadedPointerDisjointFromSlot`.
+    /// The slot must not be called disjoint from itself.
+    #[test]
+    fn globalized_slot_disjoint_from_loaded_pointer_under_assumption() {
+        use qcode::{
+            assumption::Proposition,
+            builder::Builder,
+            testing::TestContext,
+            value::{BasicBlock, Function, Value},
+        };
+
+        let mut tc = TestContext::new();
+        let sp_reg = tc.r0;
+        let fid = Function::make(&mut tc.ctx, "f".into()).unwrap().id;
+        let root = tc.ctx.get_or_make_block(0x1000);
+        {
+            let mut f = Function::from_id_mut(&mut tc.ctx, fid);
+            f.set_root(root).unwrap();
+            f.add_block(root);
+        }
+        let sp_pid = BasicBlock::from_id_mut(&mut tc.ctx, root).push_param(8).id;
+        tc.ctx.values.block_params[sp_pid].origin = Some(ValueId::Varnode(sp_reg));
+        let glob_pid = BasicBlock::from_id_mut(&mut tc.ctx, root).push_param(4).id;
+        let glob = ValueId::BlockParam(glob_pid);
+        // A partial-promotion snapshot of `*@glob` (origin = the slot param), as
+        // `apply_partial` materializes it.
+        let snap_pid = BasicBlock::from_id_mut(&mut tc.ctx, root).push_param(4).id;
+        tc.ctx.values.block_params[snap_pid].origin = Some(glob);
+        let snap = ValueId::BlockParam(snap_pid);
+
+        let ram = tc.ctx.default_space;
+        let (store_addr, snap_addr, glob_addr) = {
+            let mut b = Builder::from_block(BasicBlock::from_id_mut(&mut tc.ctx, root));
+            let p = b.push_load::<false>(glob, 4, ram).id(); // P = *@glob (the buffer pointer)
+            let c4 = b.context_mut().get_const(4, 4).id();
+            let store_addr = b.push_add(p, c4).id(); // P + 4 (a write through the loaded pointer)
+            let snap_addr = b.push_add(snap, c4).id(); // snapshot + 4 (write through the by-value pointer)
+            let glob_addr = b.context_mut().get_const(0x454df8, 4).id();
+            unsafe { b.dont_finalize() };
+            (store_addr, snap_addr, glob_addr)
+        };
+        tc.ctx.values.block_params[glob_pid].origin = Some(glob_addr);
+
+        let r = AliasResult::simple(&tc.ctx).with_frame_freshness(&tc.ctx, fid, Some(sp_reg));
+
+        // Without the assumption, the reload-through store is opaque.
+        assert!(
+            !r.provably_disjoint(&tc.ctx, glob, store_addr),
+            "no disjointness without LoadedPointerDisjointFromSlot"
+        );
+
+        tc.ctx
+            .assume_true(Proposition::LoadedPointerDisjointFromSlot(fid));
+        assert!(
+            r.provably_disjoint(&tc.ctx, glob, store_addr),
+            "@glob ⊥ a store through load(@glob) under the assumption"
+        );
+        assert!(
+            r.provably_disjoint(&tc.ctx, store_addr, glob),
+            "rule is symmetric"
+        );
+        assert!(
+            r.provably_disjoint(&tc.ctx, snap_addr, glob),
+            "the materialized snapshot of *@glob is also a pointer from the slot"
+        );
+        assert!(
+            !r.provably_disjoint(&tc.ctx, glob, glob),
+            "a slot is never disjoint from itself (the loaded-pointer path needs a real load)"
+        );
     }
 
     /// Loaded-pointer rule: a deref through a pointer reloaded from a caller-frame

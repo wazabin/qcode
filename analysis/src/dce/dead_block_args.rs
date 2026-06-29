@@ -25,6 +25,8 @@
 
 use rustc_hash::FxHashSet as HashSet;
 
+use jstd::graph::analysis::{DominatorTree, compute_dominators};
+
 use qcode::{
     context::Context,
     value::{
@@ -32,6 +34,9 @@ use qcode::{
         insn::{Branch, CBranch, Mnemonic},
     },
 };
+
+use crate::gvn::affine::precompute_forms_for_blocks;
+use crate::gvn::congruence::{Congruence, SymId};
 
 /// Collect the distinct values bound to position `index` of `block` across all
 /// predecessor edges, excluding the param's own value `self_val` (self-edges
@@ -119,7 +124,12 @@ pub fn remove_dead_block_args(
 ) -> bool {
     let mut changed = false;
     loop {
-        let Some((block, index, param, repl)) = find_redundant_param(ctx, block_ids, root) else {
+        // Cheap syntactic pass first (no value numbering); only when it is
+        // exhausted do we build the dominator tree + congruence engine to catch
+        // params whose incoming arguments are *congruent* but not identical.
+        let found = find_redundant_param(ctx, block_ids, root)
+            .or_else(|| find_congruent_param(ctx, block_ids, root));
+        let Some((block, index, param, repl)) = found else {
             break;
         };
 
@@ -175,7 +185,10 @@ pub fn remove_dead_block_params(
     };
 
     for &block in block_ids {
-        let insns: Vec<_> = BasicBlock::from_id(ctx, block).iter().map(|i| i.id).collect();
+        let insns: Vec<_> = BasicBlock::from_id(ctx, block)
+            .iter()
+            .map(|i| i.id)
+            .collect();
         for id in insns {
             match ctx.get_insn(id).mnemonic() {
                 Mnemonic::Branch(b) => forward_edges(ctx, &b.args, b.target, &mut edges),
@@ -260,6 +273,134 @@ fn forward_edges(
     }
 }
 
+/// Scan for the first param that is *congruent*-redundant: every non-self
+/// incoming argument computes the same value (by structural value number, not
+/// just the same `ValueId`), and at least one of those arguments comes from a
+/// predecessor that dominates the block — so it dominates every use of the param
+/// and can replace it.
+///
+/// This is the loop-aware generalization of [`find_redundant_param`]: it unifies
+/// reassociated/recomputed pure expressions (e.g. an off-loop `%a + %b` and a
+/// back-edge `%b + %a`) that the syntactic pass leaves as a genuine merge. Loads
+/// and calls stay identity leaves in the congruence, so no value that depends on
+/// mutable memory is ever assumed stable across iterations.
+fn find_congruent_param(
+    ctx: &Context,
+    block_ids: &[BlockId],
+    root: Option<BlockId>,
+) -> Option<(BlockId, usize, BlockParamId, ValueId)> {
+    let root = root?;
+    let dom = compute_dominators(ctx, root);
+    let mut cong = Congruence::new(precompute_forms_for_blocks(ctx, block_ids));
+
+    for &block in block_ids {
+        if block == root {
+            continue;
+        }
+        if BasicBlock::from_id(ctx, block)
+            .predecessors()
+            .next()
+            .is_none()
+        {
+            continue;
+        }
+        let params = ctx.values.basic_blocks[block].params.clone();
+        for (index, &param) in params.iter().enumerate() {
+            if ctx.values.block_params[param].protected {
+                continue;
+            }
+            if let Some(repl) = congruent_incoming(
+                ctx,
+                &mut cong,
+                &dom,
+                block,
+                index,
+                ValueId::BlockParam(param),
+            ) {
+                return Some((block, index, param, repl));
+            }
+        }
+    }
+    None
+}
+
+/// The replacement for a congruent-redundant param, or `None`.
+///
+/// Groups the incoming arguments at `index` by structural value number, ignoring
+/// any that are congruent to the param itself (loop pass-throughs). If all
+/// remaining arguments share one value number and at least one comes from a
+/// predecessor that dominates `block`, returns that dominating argument — it
+/// dominates `block` and hence every use of the param, so the substitution is
+/// sound. Returns `None` for a genuine merge of distinct values or when no
+/// dominating predecessor carries the value.
+fn congruent_incoming(
+    ctx: &Context,
+    cong: &mut Congruence,
+    dom: &DominatorTree<BlockId>,
+    block: BlockId,
+    index: usize,
+    self_val: ValueId,
+) -> Option<ValueId> {
+    let self_sym = cong.id(ctx, self_val);
+
+    // Dedup predecessor blocks (a `CBranch` with both edges to `block` lists it
+    // twice but its terminator is read once, covering both arms).
+    let preds: HashSet<BlockId> = BasicBlock::from_id(ctx, block)
+        .predecessors()
+        .map(|(_, b)| b)
+        .collect();
+
+    let mut common: Option<SymId> = None;
+    let mut dom_repl: Option<ValueId> = None;
+
+    for pred in preds {
+        let Some(&term_id) = ctx.values.basic_blocks[pred].instructions.last() else {
+            continue;
+        };
+        for arg in incoming_args(ctx, term_id, block, index) {
+            let s = cong.id(ctx, arg);
+            if s == self_sym {
+                continue; // self / congruent-to-self: a pass-through edge
+            }
+            match common {
+                Some(c) if c == s => {}
+                Some(_) => return None, // a second distinct value: a real merge
+                None => common = Some(s),
+            }
+            if dom.dominates(pred, block) {
+                dom_repl.get_or_insert(arg);
+            }
+        }
+    }
+
+    common?; // there must be at least one non-self incoming value
+    dom_repl
+}
+
+/// The argument bound to position `index` of `block` by `term_id` (a
+/// predecessor's terminator), considering both arms of a `CBranch`.
+fn incoming_args(
+    ctx: &Context,
+    term_id: qcode::value::insn::InstructionId,
+    block: BlockId,
+    index: usize,
+) -> Vec<ValueId> {
+    let mut out = Vec::new();
+    match ctx.get_insn(term_id).mnemonic() {
+        Mnemonic::Branch(b) if b.target == block => out.extend(b.args.get(index).copied()),
+        Mnemonic::CBranch(c) => {
+            if c.success_block == block {
+                out.extend(c.success_args.get(index).copied());
+            }
+            if c.failure_block == block {
+                out.extend(c.failure_args.get(index).copied());
+            }
+        }
+        _ => {}
+    }
+    out
+}
+
 /// Scan for the first redundant param: a non-root, non-protected param on a block
 /// with predecessors whose incoming arguments reduce to a single value `repl`.
 fn find_redundant_param(
@@ -293,7 +434,11 @@ fn find_redundant_param(
 
 /// Drop the params at `dead_indices` from `block`, reindexing the survivors, and
 /// strip the matching positional argument from every predecessor terminator.
-fn remove_params_from_block(ctx: &mut Context, block: BlockId, dead_indices: &HashSet<usize>) {
+pub(crate) fn remove_params_from_block(
+    ctx: &mut Context,
+    block: BlockId,
+    dead_indices: &HashSet<usize>,
+) {
     let params = ctx.values.basic_blocks[block].params.clone();
     let mut kept = Vec::with_capacity(params.len());
     for (i, &p) in params.iter().enumerate() {
@@ -522,6 +667,158 @@ mod tests {
             .as_statement()
             .to_string();
         assert_eq!(other_term, "goto <join @merge=0x4>;");
+    }
+
+    /// Congruence generalization: a loop-invariant param fed a *recomputed* (but
+    /// congruent) expression on the back-edge — `%a + %b` off-loop and `%b + %a`
+    /// on the latch — is not a syntactic match, but value numbering proves the
+    /// two equal, so the param collapses to the off-loop (dominating) value.
+    #[test]
+    fn congruent_recomputed_loop_invariant_collapses() {
+        let mut ctx = Context::new();
+        qcode!(
+            ctx,
+            "
+            varnode i64 A;
+            varnode i64 B;
+            fn test:
+            <entry>
+                %a = load(i64, &A);
+                %b = load(i64, &B);
+                %off = %a + %b;
+                goto <header @inv=%off>;
+            <header @inv:i64>
+                %i = load(i8, 0x1000);
+                %re = %b + %a;
+                store(0x4000, i64 @inv);
+                if %i goto <header @inv=%re> else goto <exit>;
+            <exit>
+                return [0x0];
+            "
+        );
+
+        let blocks = block_ids(&ctx, test);
+        let root = root_of(&ctx, test);
+        assert!(remove_dead_block_args(&mut ctx, &blocks, root));
+
+        assert_eq!(num_params(&ctx, header), 0, "@inv collapses to %off");
+        let store = BasicBlock::from_id(&ctx, header)
+            .iter()
+            .map(|i| i.as_statement().to_string())
+            .find(|s| s.contains("0x4000"))
+            .expect("store survives");
+        assert!(
+            store.contains("%off"),
+            "use of @inv rewritten to %off: {store}"
+        );
+    }
+
+    /// Soundness boundary: the back-edge re-*loads* the same address rather than
+    /// reusing the off-loop load. Two loads are not congruent (an intervening
+    /// store could differ), so the param is a genuine merge and must be KEPT.
+    #[test]
+    fn reloaded_value_on_backedge_is_not_collapsed() {
+        let mut ctx = Context::new();
+        qcode!(
+            ctx,
+            "
+            varnode i64 A;
+            fn test:
+            <entry>
+                %c1 = load(i64, &A);
+                goto <header @inv=%c1>;
+            <header @inv:i64>
+                %i = load(i8, 0x1000);
+                %c2 = load(i64, &A);
+                store(0x4000, i64 @inv);
+                if %i goto <header @inv=%c2> else goto <exit>;
+            <exit>
+                return [0x0];
+            "
+        );
+
+        let blocks = block_ids(&ctx, test);
+        let root = root_of(&ctx, test);
+        assert!(!remove_dead_block_args(&mut ctx, &blocks, root));
+        assert_eq!(
+            num_params(&ctx, header),
+            1,
+            "reloaded back-edge value is a real merge"
+        );
+    }
+
+    /// Memory edge case: the back-edge value is *arithmetic over a reloaded*
+    /// address (`%c2 + 1`) while the off-loop value is `%c1 + 1`. The two adds are
+    /// affine-identical but built on distinct loads, so they are not congruent and
+    /// the param is a genuine merge — KEPT. (A reload could see a store from the
+    /// loop body, so collapsing would be unsound.)
+    #[test]
+    fn arithmetic_over_reloaded_value_is_kept() {
+        let mut ctx = Context::new();
+        qcode!(
+            ctx,
+            "
+            varnode i64 A;
+            fn test:
+            <entry>
+                %c1 = load(i64, &A);
+                %off = %c1 + 0x1;
+                goto <header @inv=%off>;
+            <header @inv:i64>
+                %i = load(i8, 0x1000);
+                %c2 = load(i64, &A);
+                %re = %c2 + 0x1;
+                store(0x4000, i64 @inv);
+                if %i goto <header @inv=%re> else goto <exit>;
+            <exit>
+                return [0x0];
+            "
+        );
+
+        let blocks = block_ids(&ctx, test);
+        let root = root_of(&ctx, test);
+        assert!(!remove_dead_block_args(&mut ctx, &blocks, root));
+        assert_eq!(
+            num_params(&ctx, header),
+            1,
+            "arithmetic over a reload is a real merge"
+        );
+    }
+
+    /// Dual: an intervening store does NOT block collapse when the carried value
+    /// is SSA-stable. The back-edge recomputes `%c + 1` from the *same* dominating
+    /// load `%c`; a store to a different address sits in the loop, but `%c` is one
+    /// SSA value, so `@inv` is loop-invariant and collapses to the off-loop value.
+    #[test]
+    fn intervening_store_does_not_block_ssa_stable_collapse() {
+        let mut ctx = Context::new();
+        qcode!(
+            ctx,
+            "
+            varnode i64 A;
+            fn test:
+            <entry>
+                %c = load(i64, &A);
+                %off = %c + 0x1;
+                goto <header @inv=%off>;
+            <header @inv:i64>
+                %i = load(i8, 0x1000);
+                store(0x4000, i64 @inv);
+                %re = %c + 0x1;
+                if %i goto <header @inv=%re> else goto <exit>;
+            <exit>
+                return [0x0];
+            "
+        );
+
+        let blocks = block_ids(&ctx, test);
+        let root = root_of(&ctx, test);
+        assert!(remove_dead_block_args(&mut ctx, &blocks, root));
+        assert_eq!(
+            num_params(&ctx, header),
+            0,
+            "SSA-stable @inv collapses despite the store"
+        );
     }
 
     /// Root (entry) params are the function interface and must not be touched

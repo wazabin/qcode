@@ -5,6 +5,7 @@
 mod argpromote;
 mod clobbered;
 mod dead_signature;
+mod depipeline;
 mod interface;
 mod loop_to_map;
 mod partial_inline;

@@ -185,6 +185,76 @@ pub(super) fn simplify_identity(ctx: &Context, m: &Mnemonic) -> Option<Mnemonic>
     }
 }
 
+/// How many low bits a round-down alignment mask clears, i.e. `k` for a mask of
+/// the form `~(2^k − 1)` over `size` bytes (`mask & ~0 == all` with a contiguous
+/// run of cleared low bits). `None` if `mask` is not such a mask.
+fn align_mask_bits(mask: u64, size: usize) -> Option<u32> {
+    let low = !mask & all_ones(size); // the bits the mask clears
+    // `low == 2^k − 1` ⇔ `low + 1` is a power of two ⇔ the cleared bits are a
+    // contiguous low run, so the mask only rounds *down* to a 2^k boundary.
+    (low.wrapping_add(1) & low == 0).then(|| low.count_ones())
+}
+
+/// A sound lower bound on the number of low-order bits known to be zero in `v`
+/// (its base-2 alignment exponent). Recurses through the arithmetic that inlined,
+/// stack-realigning prologues build on top of one `sp & ~7`; `depth` bounds the
+/// walk (straight-line SSA has no operand cycles, but loops over block params
+/// could, so the bound is load-bearing). Every case is a sound *under*-estimate.
+fn known_align(ctx: &Context, v: ValueId, depth: u32) -> u32 {
+    if depth == 0 {
+        return 0;
+    }
+    if let Some(c) = const_value(ctx, v) {
+        // A constant's alignment is its trailing-zero count; `0` is aligned to
+        // its full width.
+        return if c == 0 {
+            (size_bits(ctx, v)).min(64)
+        } else {
+            c.trailing_zeros()
+        };
+    }
+    let ValueId::Instruction(id) = v else {
+        return 0;
+    };
+    let &Mnemonic::Binop(Binary {
+        lhs,
+        rhs,
+        op: Binop::Int(op),
+    }) = ctx.get_insn(id).mnemonic()
+    else {
+        return 0;
+    };
+    let (a, b) = (
+        || known_align(ctx, lhs, depth - 1),
+        || known_align(ctx, rhs, depth - 1),
+    );
+    match op {
+        // `&` keeps a low bit zero if it is zero in *either* operand — so a mask
+        // is what *establishes* alignment: `x & ~7` is 8-aligned regardless of x.
+        IntBinop::And => a().max(b()),
+        // `|`/`^`/`+`/`-` keep a low bit zero only if it is zero in *both*.
+        IntBinop::Or | IntBinop::Xor | IntBinop::Add | IntBinop::Sub => a().min(b()),
+        // A left shift by a constant appends that many trailing zeros.
+        IntBinop::ShiftLeft => match const_value(ctx, rhs) {
+            Some(s) => a().saturating_add(s as u32),
+            None => 0,
+        },
+        // Alignments add under multiplication.
+        IntBinop::Mul => a().saturating_add(b()),
+        _ => 0,
+    }
+}
+
+/// The bit width of `v`'s output.
+fn size_bits(ctx: &Context, v: ValueId) -> u32 {
+    (value_size(ctx, v) as u32).saturating_mul(8)
+}
+
+/// Bound on the recursion `known_align` does back through a realignment cascade.
+/// Inlined prologues stack only a handful of `& ~7` on top of one another, so a
+/// generous fixed depth covers them without risking pathological walks.
+const ALIGN_DEPTH: u32 = 64;
+
 /// The `(constant, other_operand)` pairs of a binop — one entry per side that is
 /// a numeric constant (both-constant binops are handled by [`super::fold`] before
 /// this sub-pass, so in practice at most one side is constant here).
@@ -254,9 +324,20 @@ fn simplify_bitwise(ctx: &mut Context, ic: &InsnCtx, ed: &mut Editor) -> bool {
     let all = all_ones(size);
 
     match op {
-        // (x & c1) & c2 → x & (c1 & c2)
+        // (x & c1) & c2 → x & (c1 & c2), and dropping a redundant alignment mask.
         IntBinop::And => {
             for (outer, inner) in const_operands(ctx, lhs, rhs) {
+                // `inner & mask → inner` when `inner` is already aligned to the
+                // mask's granularity. This collapses the cascade of `& ~7` that
+                // inlined, stack-realigning prologues emit: each mask after the
+                // first sits on a base already proven 8-aligned minus an
+                // 8-multiple, so it is a no-op.
+                if let Some(k) = align_mask_bits(outer, size)
+                    && known_align(ctx, inner, ALIGN_DEPTH) >= k
+                {
+                    ed.replace(ctx, ic.insn_id, inner);
+                    return true;
+                }
                 if let Some((x, c1)) = binop_const(ctx, inner, IntBinop::And) {
                     let folded = ctx.get_const((c1 & outer) & all, size).id();
                     ed.replace_with_new_insn(
@@ -691,6 +772,75 @@ mod tests {
         assert!(
             text.contains("!="),
             "the `!= 0` comparison on the i8 source must remain, got:\n{text}"
+        );
+    }
+
+    /// The realignment cascade an inlined, stack-aligning prologue emits: one
+    /// real `& ~7` to align `sp`, then a chain of `(aligned − 8·m) & ~7` whose
+    /// masks are all no-ops. Every mask after the first must drop, leaving the
+    /// frame as flat offsets off the single aligned base.
+    #[test]
+    fn realignment_cascade_drops_redundant_masks() {
+        let mut ctx = Context::new();
+        qcode!(
+            ctx,
+            "
+                varnode i32 SP;
+
+                fn f:
+                    <entry>
+                        %sp = load(i32, &SP);
+                        %s0 = %sp - 0x10;
+                        %base = %s0 & 0xfffffff8;
+                        %a0 = %base - 0x270;
+                        %a1 = %a0 & 0xfffffff8;
+                        %b0 = %a1 - 0x90;
+                        %b1 = %b0 & 0xfffffff8;
+                        %c0 = %b1 - 0x88;
+                        %c1 = %c0 & 0xfffffff8;
+                        return [%c1];
+                "
+        );
+
+        let aliases = AliasResult::simple(&ctx);
+        while gvn_function(&mut ctx, f, Some(&aliases)) {}
+        crate::remove_dead_insns(&mut ctx, entry);
+        let text = BasicBlock::from_id(&ctx, entry).to_string();
+        assert_eq!(
+            text.matches("0xfffffff8").count(),
+            1,
+            "only the base-establishing mask should survive, got:\n{text}"
+        );
+    }
+
+    /// The mask must stay when alignment is *not* provable: `0xa4` is not an
+    /// 8-multiple, so `(aligned − 0xa4) & ~7` genuinely rounds down and is not a
+    /// no-op.
+    #[test]
+    fn non_aligned_offset_keeps_mask() {
+        let mut ctx = Context::new();
+        qcode!(
+            ctx,
+            "
+                varnode i32 SP;
+
+                fn f:
+                    <entry>
+                        %sp = load(i32, &SP);
+                        %base = %sp & 0xfffffff8;
+                        %a0 = %base - 0xa4;
+                        %a1 = %a0 & 0xfffffff8;
+                        return [%a1];
+                "
+        );
+
+        let aliases = AliasResult::simple(&ctx);
+        while gvn_function(&mut ctx, f, Some(&aliases)) {}
+        let text = BasicBlock::from_id(&ctx, entry).to_string();
+        assert_eq!(
+            text.matches("0xfffffff8").count(),
+            2,
+            "the non-8-multiple realignment mask must be preserved, got:\n{text}"
         );
     }
 

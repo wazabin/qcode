@@ -15,6 +15,7 @@ use qcode::{
 
 pub(crate) mod affine;
 mod array_project;
+pub(crate) mod congruence;
 mod cse;
 mod emulate_map;
 mod flag_idiom;

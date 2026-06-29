@@ -169,6 +169,18 @@ passes = ["gvn", "dce"]
 repeat_until = "no_change"
 only_dirty = true
 
+# Hoist loop-invariant computations into each loop's preheader, so values that do
+# not change across iterations are computed once. Runs over every function (not
+# just unrolled ones — large loops the unroller skips benefit most), after `gvn`
+# has canonicalized pointer arithmetic so the alias oracle sees per-slot stack
+# locations and constant-address globals. The follow-up `gvn`/`dce` fold and
+# sweep the hoisted code; the trio loops to a fixpoint.
+[[stage]]
+name = "licm"
+scope = "function"
+passes = ["licm", "gvn", "dce"]
+repeat_until = "no_change"
+
 # Interprocedural signature milestones, whole-program, after every function is
 # post-mem2reg/gvn but *before* the eliminating passes. `external_sigs` assigns
 # conventional ABI signatures to imported/unresolved callees and `summaries`

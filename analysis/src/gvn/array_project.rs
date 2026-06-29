@@ -71,6 +71,12 @@ impl ArrayProject {
             Mnemonic::Intrinsic(intr) if intr.id.name() == "enumerate" => {
                 self.project_enumerate(ctx, ic, ed, src, intr.args[0], start, size)
             }
+            Mnemonic::Intrinsic(intr) if intr.id.name() == "concat" => {
+                self.project_concat(ctx, ic, ed, &intr.args, start, size)
+            }
+            // A `scan` is deliberately *not* projected: lane `k` is the `k`-th
+            // accumulator, which depends on the whole prefix `0..=k`, not just
+            // `src[k]`, so there is no cheap single-element extract.
             _ => Claim::Pass,
         }
     }
@@ -209,6 +215,49 @@ impl ArrayProject {
         };
 
         ed.replace(ctx, ic.insn_id, tuple);
+        Claim::Done
+    }
+
+    /// `Range(concat(a, b), off, size)` ⇒ `Range(a, off, size)` when wholly in
+    /// `a`, or `Range(b, off - sizeof(a), size)` when wholly in `b`.
+    fn project_concat(
+        &self,
+        ctx: &mut Context,
+        ic: &InsnCtx,
+        ed: &mut Editor,
+        args: &[ValueId],
+        start: usize,
+        size: usize,
+    ) -> Claim {
+        let [lhs, rhs] = args else {
+            return Claim::Pass;
+        };
+        let lhs_ty = ctx.type_of(*lhs);
+        let Some((lhs_elem, lhs_len, _)) = ctx.types.seq_of(lhs_ty) else {
+            return Claim::Pass;
+        };
+        let lhs_bytes = ctx.types.size_of(lhs_elem) * lhs_len;
+
+        let (src, rel_start) = if start + size <= lhs_bytes {
+            (*lhs, start)
+        } else if start >= lhs_bytes {
+            (*rhs, start - lhs_bytes)
+        } else {
+            return Claim::Pass;
+        };
+
+        let r = InstructionRef::from_mnemonic(
+            ctx,
+            Mnemonic::Range(Range {
+                src,
+                start: rel_start,
+                size,
+            }),
+            size,
+        )
+        .id;
+        BasicBlock::from_id_mut(ctx, ic.block_id).insert_insn_before(ic.insn_id, r);
+        ed.replace(ctx, ic.insn_id, ValueId::Instruction(r));
         Claim::Done
     }
 
@@ -445,6 +494,60 @@ mod tests {
             .iter()
             .any(|m| matches!(m, Mnemonic::Range(r) if r.src == src && r.start == 2));
         assert!(elem_slices_src, "the elem field must slice src[2] directly");
+    }
+
+    /// `concat(a, b)[4]` where `a` has 3 lanes projects to `b[1]`.
+    #[test]
+    fn projects_lane_from_concat_rhs() {
+        let mut tc = TestContext::new();
+        let concat_id = IntrinsicId::from_name("concat").unwrap();
+
+        let host = Function::make(&mut tc.ctx, "host".into()).unwrap().id;
+        let entry = tc.ctx.get_or_make_block(0x6800);
+        {
+            let mut f = Function::from_id_mut(&mut tc.ctx, host);
+            f.set_root(entry).unwrap();
+            f.add_block(entry);
+        }
+        let i8 = tc.ctx.types.get_or_make_int(1);
+        let a_ty = tc.ctx.types.get_or_make_array(i8, 3);
+        let b_ty = tc.ctx.types.get_or_make_array(i8, 5);
+
+        let (a, b_src) = {
+            let mut builder = Builder::from_block(BasicBlock::from_id_mut(&mut tc.ctx, entry));
+            (builder.push_param(3).id(), builder.push_param(5).id())
+        };
+        if let ValueId::BlockParam(pid) = a {
+            tc.ctx.values.block_params[pid].type_id = a_ty;
+        }
+        if let ValueId::BlockParam(pid) = b_src {
+            tc.ctx.values.block_params[pid].type_id = b_ty;
+        }
+
+        let reg_space = tc.reg_space;
+        let r0 = tc.r0;
+        {
+            let mut builder = Builder::from_block(BasicBlock::from_id_mut(&mut tc.ctx, entry));
+            let concat = builder.push_intrinsic(concat_id, vec![a, b_src]).id();
+            let lane = builder.get_range(concat, 4..5).unwrap().id();
+            builder.push_store(lane, ValueId::Varnode(r0), reg_space);
+            let ptr = builder.context_mut().get_const(0, 8).id();
+            builder.push_return(ptr);
+        }
+
+        let aliases = crate::AliasResult::simple(&tc.ctx);
+        super::super::gvn_function(&mut tc.ctx, host, Some(&aliases));
+
+        let insns: Vec<Mnemonic> = BasicBlock::from_id(&tc.ctx, entry)
+            .iter()
+            .map(|i| i.mnemonic().clone())
+            .collect();
+        assert!(
+            insns
+                .iter()
+                .any(|m| matches!(m, Mnemonic::Range(r) if r.src == b_src && r.start == 1)),
+            "concat lane 4 should project to rhs lane 1"
+        );
     }
 
     /// `body(t: (index: i64, elem: i8)) -> t.elem`, marked pure. The unary,

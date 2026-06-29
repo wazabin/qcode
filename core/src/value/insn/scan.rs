@@ -1,0 +1,216 @@
+//! `scan`: a total left-scan (prefix fold) over an array value.
+//!
+//! [`Scan`] threads an accumulator left-to-right across every lane of the array
+//! `src`, emitting the accumulator after each step: conceptually
+//!
+//! ```text
+//!   acc_0   = init
+//!   acc_i+1 = body(acc_i, src[i], captures…)
+//!   out[i]  = acc_i+1
+//! ```
+//!
+//! producing an array of the same length as `src`. It is the projectable
+//! representation of a loop whose per-element write depends on the previous
+//! iteration's result — `out[i] = f(out[i-1], i)` — which [`Map`](super::Map)
+//! cannot express because its body is element-local. The MT19937 seeding loop
+//! `mt[i] = 1812433253 * (mt[i-1] ^ (mt[i-1] >> 30)) + i` is the canonical case;
+//! its `src` is `enumerate(arr)`, so the body's element is the `(index, elem)`
+//! tuple and the `elem` half is simply unused.
+//!
+//! Like [`Map`](super::Map), `body` is a **function symbol** (not a value
+//! operand), so `Scan` stays an ordinary first-order SSA instruction. Its value
+//! operands are `init` and `src` plus any loop-invariant `captures` the body
+//! closes over. The body is **binary in (accumulator, element)**: its first
+//! parameter is the carried accumulator (typed as the result element), its second
+//! is the lane element of `src`.
+
+use crate::{
+    context::Context,
+    value::{Function, ValueId, ValueRef, function::FunctionId},
+};
+use std::fmt::Formatter;
+
+use super::mnemonic::MnemonicKind;
+
+/// A total left-scan `out[i] = acc_i+1` where `acc_i+1 = body(acc_i, src[i],
+/// captures…)` and `acc_0 = init`. The result is `[U; N]` where `N` is `src`'s
+/// length and `U` is the body's return type (also the accumulator's type).
+#[derive(Debug, Clone, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+pub struct Scan {
+    /// The pure per-element fold function, applied at each lane. A symbol, not an
+    /// operand — exactly like a direct call's target. Binary in `(accumulator,
+    /// element)`.
+    pub body: FunctionId,
+    /// The initial accumulator value (`acc_0`).
+    pub init: ValueId,
+    /// The array value scanned over.
+    pub src: ValueId,
+    /// Loop-invariant values the body closes over (the accumulator and element
+    /// are supplied per-lane by the scan itself). Empty for a closed body.
+    pub captures: Vec<ValueId>,
+}
+
+impl MnemonicKind for Scan {
+    fn opcode(&self) -> &'static str {
+        "scan"
+    }
+
+    fn fmt(&self, f: &mut Formatter<'_>, ctx: &Context<'_>) -> std::fmt::Result {
+        // `scanl @body init src` (Haskell `scanl`-flavored): fold `body` across
+        // the array, seeded with `init`. Captures render as a partial application
+        // of the body — `scanl (@body c0 c1) init src` — since the accumulator and
+        // element are supplied by the scan itself, not written here.
+        let body = Function::from_id(ctx, self.body).name();
+        let init = ValueRef::new(self.init, ctx);
+        let src = ValueRef::new(self.src, ctx);
+        if self.captures.is_empty() {
+            write!(f, "scanl @{body} {init} {src};")
+        } else {
+            write!(f, "scanl (@{body}")?;
+            for &c in &self.captures {
+                write!(f, " {}", ValueRef::new(c, ctx))?;
+            }
+            write!(f, ") {init} {src};")
+        }
+    }
+
+    fn args(&self) -> Vec<ValueId> {
+        let mut args = Vec::with_capacity(2 + self.captures.len());
+        args.push(self.init);
+        args.push(self.src);
+        args.extend(self.captures.iter().copied());
+        args
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::{
+        builder::Builder,
+        testing::TestContext,
+        value::{
+            BasicBlock, Function, ValueId,
+            insn::{Mnemonic, mnemonic::MnemonicKind},
+        },
+    };
+
+    /// A `scan` renders as `scanl @body init src` (and a partial application
+    /// `scanl (@body c0) init src` when it captures loop invariants).
+    #[test]
+    fn scan_renders_as_scanl() {
+        let mut tc = TestContext::new();
+        let body = Function::make(&mut tc.ctx, "foo".into()).unwrap().id;
+        let host = Function::make(&mut tc.ctx, "host".into()).unwrap().id;
+        let entry = tc.ctx.get_or_make_block(0x2000);
+        {
+            let mut f = Function::from_id_mut(&mut tc.ctx, host);
+            f.set_root(entry).unwrap();
+            f.add_block(entry);
+        }
+        let i32_ty = tc.ctx.types.get_or_make_int(4);
+        let array_ty = tc.ctx.types.get_or_make_array(i32_ty, 8);
+        let (init, src, cap) = {
+            let mut b = Builder::from_block(BasicBlock::from_id_mut(&mut tc.ctx, entry));
+            (
+                b.push_param(4).id(),
+                b.push_param(32).id(),
+                b.push_param(4).id(),
+            )
+        };
+        if let ValueId::BlockParam(pid) = src {
+            tc.ctx.values.block_params[pid].type_id = array_ty;
+        }
+
+        let plain = {
+            let mut b = Builder::from_block(BasicBlock::from_id_mut(&mut tc.ctx, entry));
+            b.push_scan(body, init, src, Vec::new()).id()
+        };
+        let ValueId::Instruction(plain_id) = plain else {
+            unreachable!()
+        };
+        let rendered = tc.ctx.get_insn(plain_id).as_statement().to_string();
+        assert!(
+            rendered.contains("scanl @foo"),
+            "scan renders as scanl, got: {rendered}"
+        );
+
+        let with_cap = {
+            let mut b = Builder::from_block(BasicBlock::from_id_mut(&mut tc.ctx, entry));
+            b.push_scan(body, init, src, vec![cap]).id()
+        };
+        let ValueId::Instruction(cap_id) = with_cap else {
+            unreachable!()
+        };
+        let rendered = tc.ctx.get_insn(cap_id).as_statement().to_string();
+        assert!(
+            rendered.contains("scanl (@foo "),
+            "a capturing scan renders as a partial application, got: {rendered}"
+        );
+    }
+
+    /// `push_scan` yields an array-typed value whose operands are `init`, `src`,
+    /// then captures — with `body` kept as a symbol, never an operand — and
+    /// `replace_value` rewrites the operands but never the body.
+    #[test]
+    fn scan_builds_with_array_result_and_symbol_body() {
+        let mut tc = TestContext::new();
+        let body = Function::make(&mut tc.ctx, "body".into()).unwrap().id;
+        let host = Function::make(&mut tc.ctx, "host".into()).unwrap().id;
+        let entry = tc.ctx.get_or_make_block(0x1000);
+        {
+            let mut f = Function::from_id_mut(&mut tc.ctx, host);
+            f.set_root(entry).unwrap();
+            f.add_block(entry);
+        }
+        let i32_ty = tc.ctx.types.get_or_make_int(4);
+        let array_ty = tc.ctx.types.get_or_make_array(i32_ty, 20);
+        let (init, src, cap) = {
+            let mut b = Builder::from_block(BasicBlock::from_id_mut(&mut tc.ctx, entry));
+            (
+                b.push_param(4).id(),
+                b.push_param(80).id(),
+                b.push_param(4).id(),
+            )
+        };
+        if let ValueId::BlockParam(pid) = src {
+            tc.ctx.values.block_params[pid].type_id = array_ty;
+        }
+        let scan_val = {
+            let mut b = Builder::from_block(BasicBlock::from_id_mut(&mut tc.ctx, entry));
+            b.push_scan(body, init, src, vec![cap]).id()
+        };
+        let ValueId::Instruction(scan_id) = scan_val else {
+            panic!("push_scan should yield an instruction value");
+        };
+        let m = match tc.ctx.get_insn(scan_id).mnemonic().clone() {
+            Mnemonic::Scan(m) => m,
+            other => panic!("expected Scan, got {other:?}"),
+        };
+        assert_eq!(m.body, body);
+        assert_eq!(
+            m.args(),
+            vec![init, src, cap],
+            "init, src, then captures are the operands"
+        );
+        assert!(
+            !m.args().contains(&ValueId::Function(body)),
+            "body is not an operand"
+        );
+        // Result type is the array type of `src` (same length, body return elem).
+        assert_eq!(tc.ctx.type_of(scan_val), array_ty);
+
+        let new_src = {
+            let mut b = Builder::from_block(BasicBlock::from_id_mut(&mut tc.ctx, entry));
+            b.push_param(80).id()
+        };
+        let mut rewritten = Mnemonic::Scan(m);
+        rewritten.replace_value(src, new_src);
+        let Mnemonic::Scan(r) = rewritten else {
+            unreachable!()
+        };
+        assert_eq!(r.src, new_src);
+        assert_eq!(r.body, body, "body symbol is untouched by replace_value");
+        assert_eq!(r.init, init);
+        assert_eq!(r.captures, vec![cap]);
+    }
+}

@@ -53,8 +53,13 @@ pub use mem::{MemLiveness, compute_memory_liveness, mem2reg};
 pub mod value_range;
 pub use value_range::{ValueRange, value_range};
 
+pub mod sequence;
+
 pub mod verify;
 pub use verify::{PureRegCallArgsViolation, Verify, verify, verify_ir, verify_pure_reg_call_args};
+
+pub mod licm;
+pub use licm::{Licm, hoist_loop_invariants};
 
 pub mod loop_unroll;
 pub use loop_unroll::{

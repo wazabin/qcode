@@ -47,8 +47,8 @@ use crate::{
             Assert, Binary, Binop, BoolBinop, Branch, BranchInd, CBranch, Call, CallInd, Carry,
             Extract, FloatBinop, FloatToFloat, FloatToInt, Gep, InstructionId, InstructionRef,
             IntBinop, IntToFloat, IntrinsicApp, IntrinsicId, IsFloatNaN, Load, LzCount, Map,
-            Mnemonic, PCodeOp, PCodeOpId, PopCount, Range, Return, SBorrow, SCarry, Sext, Store,
-            Tuple, Unary, Unop, Zext,
+            Mnemonic, PCodeOp, PCodeOpId, PopCount, Range, Return, SBorrow, SCarry, Scan, Sext,
+            Store, Tuple, Unary, Unop, Zext,
         },
         util::base_ref::{WithCtx, WithCtxMut},
         varnode::{Varnode, VarnodeId},
@@ -958,15 +958,59 @@ impl<'str, 'ctx> Builder<'str, 'ctx> {
         captures: Vec<ValueId>,
     ) -> InstructionRef<'str, '_> {
         let src_ty = self.context_mut().type_of(src);
-        let count = self.context().types.array_of(src_ty).map(|(_, n)| n);
+        // `map` preserves the source's sequence kind: an array maps to an array,
+        // a list (e.g. `take_while`'s result) maps to a list of the same bound.
+        let seq = self.context().types.seq_of(src_ty);
         let ret_ty = self.map_body_return_type(body);
-        let ty = match (count, ret_ty) {
-            (Some(n), Some(rt)) => self.context_mut().types.get_or_make_array(rt, n),
+        let ty = match (seq, ret_ty) {
+            (Some((_, len, is_list)), Some(rt)) => {
+                self.context_mut().types.get_or_make_seq(rt, len, is_list)
+            }
             _ => src_ty,
         };
         self.push_instruction_with_type(
             Mnemonic::Map(Map {
                 body,
+                src,
+                captures,
+            }),
+            ty,
+        )
+    }
+
+    /// Builds a total left-scan `out[i] = body(acc_i, src[i], captures…)` with
+    /// `acc_0 = init` over the array value `src` (see [`Scan`]). The body is
+    /// **binary** in `(accumulator, element)` — index-aware bodies take an
+    /// [`enumerate`](crate::value::insn::Intrinsic) tuple as the element; `body`
+    /// is a function symbol, not an operand. Soundness of the body (pure, with the
+    /// accumulator threaded only through the scan) is the recognizer's obligation.
+    ///
+    /// The result is `[U; N]` where `N` is `src`'s element count and `U` is the
+    /// body's return type (also the accumulator type). When the body is a bare
+    /// symbol with no return (or `src` is not an array), the result falls back to
+    /// `src`'s type.
+    pub fn push_scan(
+        &mut self,
+        body: FunctionId,
+        init: ValueId,
+        src: ValueId,
+        captures: Vec<ValueId>,
+    ) -> InstructionRef<'str, '_> {
+        let src_ty = self.context_mut().type_of(src);
+        // Like `map`, a scan preserves the source's sequence kind and takes its
+        // element type from the body's return type (the accumulator type).
+        let seq = self.context().types.seq_of(src_ty);
+        let ret_ty = self.map_body_return_type(body);
+        let ty = match (seq, ret_ty) {
+            (Some((_, len, is_list)), Some(rt)) => {
+                self.context_mut().types.get_or_make_seq(rt, len, is_list)
+            }
+            _ => src_ty,
+        };
+        self.push_instruction_with_type(
+            Mnemonic::Scan(Scan {
+                body,
+                init,
                 src,
                 captures,
             }),
@@ -1388,6 +1432,56 @@ mod tests {
 
     use super::*;
     use crate::context::Context;
+
+    /// `map` preserves its source's sequence kind: mapping over a `List<T>`
+    /// (e.g. a `take_while` result) yields a `List<U>`, not a fixed array.
+    #[test]
+    fn map_over_a_list_yields_a_list() {
+        use crate::value::{Function, insn::Return};
+
+        let mut ctx = Context::new();
+        let i8 = ctx.types.get_or_make_int(1);
+
+        // body: fn(i8) -> i8 returning its param (so the map result elem is i8).
+        let body = Function::make(&mut ctx, "body".into()).unwrap().id;
+        let broot = Function::from_id_mut(&mut ctx, body).make_root().id;
+        let bp = BasicBlock::from_id_mut(&mut ctx, broot).push_param(1).id;
+        let dummy = ctx.get_const(0, 8).id();
+        let ret = InstructionRef::from_mnemonic_with_type(
+            &mut ctx,
+            Mnemonic::Return(Return {
+                ptr: dummy,
+                value: Some(ValueId::BlockParam(bp)),
+            }),
+            i8,
+        )
+        .id;
+        BasicBlock::from_id_mut(&mut ctx, broot).push_insn(ret);
+
+        // host: a value typed `List<i8>` (bound 4) to map over.
+        let host = Function::make(&mut ctx, "host".into()).unwrap().id;
+        let hentry = Function::from_id_mut(&mut ctx, host).make_root().id;
+        let list_ty = ctx.types.get_or_make_list(i8, 4);
+        let src_pid = BasicBlock::from_id_mut(&mut ctx, hentry).push_param(4).id;
+        ctx.values.block_params[src_pid].type_id = list_ty;
+        let src = ValueId::BlockParam(src_pid);
+
+        let map_ty = {
+            let mut b = Builder::from_block(BasicBlock::from_id_mut(&mut ctx, hentry));
+            b.push_map(body, src, Vec::new()).type_id()
+        };
+
+        assert_eq!(
+            ctx.types.array_of(map_ty),
+            None,
+            "map of a list is not an array"
+        );
+        assert_eq!(
+            ctx.types.list_of(map_ty),
+            Some((i8, Some(4))),
+            "map of List<i8> (bound 4) is List<i8> (bound 4)"
+        );
+    }
 
     #[test]
     fn cfg_branch_adds_one_node_and_one_edge() {

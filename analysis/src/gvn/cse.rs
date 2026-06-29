@@ -120,7 +120,7 @@ pub(super) fn value_id_key(v: ValueId) -> (u8, usize) {
     }
 }
 
-fn is_commutative(op: &Binop) -> bool {
+pub(super) fn is_commutative(op: &Binop) -> bool {
     matches!(
         op,
         Binop::Int(

@@ -401,6 +401,17 @@ where
         })
     }
 
+    /// Whether this function contains at least one [`Scan`](Mnemonic::Scan)
+    /// instruction — a lane-wise prefix-fold array operation. Surfaced as an
+    /// advanced filter in the function list, alongside [`has_map`](Self::has_map).
+    pub fn has_scan(&'s self) -> bool {
+        self.blocks().any(|block| {
+            block
+                .instructions()
+                .any(|insn| matches!(insn.mnemonic(), Mnemonic::Scan(_)))
+        })
+    }
+
     /// The functions that directly call this one, deduplicated and ordered by
     /// id. Reads the reverse call graph maintained alongside the use-def map and
     /// resolves each call site to its enclosing function. Counterpart of

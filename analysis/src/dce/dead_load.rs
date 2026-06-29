@@ -653,6 +653,63 @@ fn unread_temp_space_stores(ctx: &Context, function_id: FunctionId) -> HashSet<I
         .collect()
 }
 
+/// Stores to **own-frame stack locals** whose slot is never read in the function.
+///
+/// An own-frame local (`@SP - k`, below the entry stack pointer) is private to
+/// this activation: by frame freshness no incoming pointer names it, and the
+/// frame is deallocated at return, so the caller can never observe it. A store to
+/// such a slot is therefore dead when no load in the function may read it — no
+/// covering later store required (like the `dead_reg`/temp-space rules, and unlike
+/// the killed-set dataflow).
+///
+/// Conservatively disabled when the function makes any call (or indirect branch):
+/// a callee could read the frame through a pointer it was handed, which is not
+/// modeled as an explicit load here (mirrors `postdominated_dead_register_stores`).
+/// Escape of a slot *address* into memory needs no special case: recovering the
+/// slot requires a load through the reloaded (opaque) pointer, which `may_alias`
+/// conservatively treats as reading every slot, so such a store is kept. Run to a
+/// fixpoint, a chain of slots that only hold each other's addresses collapses.
+fn unread_frame_local_stores(
+    ctx: &Context,
+    function_id: FunctionId,
+    aliases: &AliasResult,
+) -> HashSet<InstructionId> {
+    let fun = Function::from_id(ctx, function_id);
+    if fun.iter().flat_map(|block| block.iter()).any(|insn| {
+        matches!(
+            insn.mnemonic(),
+            Mnemonic::Call(_) | Mnemonic::CallInd(_) | Mnemonic::BranchInd(_)
+        )
+    }) {
+        return HashSet::default();
+    }
+
+    let mut loads: Vec<(ValueId, usize)> = Vec::new();
+    let mut stores: Vec<(InstructionId, ValueId, usize)> = Vec::new();
+    for block in &fun {
+        for &id in block.instruction_ids() {
+            match ctx.get_insn(id).mnemonic() {
+                Mnemonic::Load(load) => loads.push((load.ptr, load.size)),
+                Mnemonic::Store(store) if aliases.is_own_frame_local(store.ptr) => {
+                    stores.push((id, store.ptr, store.size))
+                }
+                _ => {}
+            }
+        }
+    }
+
+    stores
+        .into_iter()
+        .filter(|&(_, sptr, ssize)| {
+            !loads.iter().any(|&(lptr, lsize)| {
+                aliases.may_alias(ctx, sptr, lptr)
+                    && !disjoint_access(ctx, sptr, ssize, lptr, lsize)
+            })
+        })
+        .map(|(id, _, _)| id)
+        .collect()
+}
+
 #[derive(Clone, Copy)]
 struct RegisterStore {
     id: InstructionId,
@@ -774,6 +831,7 @@ pub fn remove_dead_load_insns(
                 function_id,
                 aliases,
             ));
+            dead.extend(unread_frame_local_stores(ctx, function_id, aliases));
             let liveness =
                 crate::mem::compute_memory_liveness(ctx, function_id, aliases, dead_regs);
             for &block_id in &block_ids {
@@ -1200,6 +1258,138 @@ mod tests {
         assert!(!dead.contains(&store_ids[1]), "last store must not be dead");
     }
 
+    /// A redundant store to an `@SP`-rooted stack slot is dead even when a later
+    /// load from a *global* address sits between exit and the store: under the
+    /// stack-vs-global disjointness rule the global load cannot read the slot, so
+    /// it no longer pins the overwritten store. Without frame freshness the global
+    /// load conservatively may-alias the slot and keeps the store alive (the bug).
+    #[test]
+    fn redundant_stack_store_dead_despite_global_load() {
+        use qcode::{
+            builder::Builder,
+            testing::TestContext,
+            value::{BasicBlock, Function},
+        };
+
+        let mut tc = TestContext::new();
+        let sp_reg = tc.r0;
+        let fid = Function::make(&mut tc.ctx, "f".into()).unwrap().id;
+        let root = tc.ctx.get_or_make_block(0x1000);
+        {
+            let mut f = Function::from_id_mut(&mut tc.ctx, fid);
+            f.set_root(root).unwrap();
+            f.add_block(root);
+        }
+        let sp_pid = BasicBlock::from_id_mut(&mut tc.ctx, root).push_param(8).id;
+        tc.ctx.values.block_params[sp_pid].origin = Some(ValueId::Varnode(sp_reg));
+        let sp = ValueId::BlockParam(sp_pid);
+
+        let ram = tc.ctx.default_space;
+        {
+            let mut b = Builder::from_block(BasicBlock::from_id_mut(&mut tc.ctx, root));
+            let c18 = b.context_mut().get_const(0x18, 8).id();
+            let slot = b.push_sub(sp, c18).id(); // @SP - 0x18
+            let val = b.context_mut().get_const(0x2f45c825, 4).id();
+            b.push_store(val, slot, ram); // S1
+            b.push_store(val, slot, ram); // S2 (identical → S1 dead)
+            let glob = b.context_mut().get_const(0x454df8, 4).id();
+            let g = b.push_load::<false>(glob, 4, ram).id(); // global load after the stores
+            // Give the load a user so it is a live reader (not a pruned dead load).
+            let zero = b.context_mut().get_const(0, 4).id();
+            b.push_add(g, zero);
+            unsafe { b.dont_finalize() };
+        }
+
+        let store_ids: Vec<_> = BasicBlock::from_id(&tc.ctx, root)
+            .instruction_ids()
+            .iter()
+            .copied()
+            .filter(|&id| matches!(tc.ctx.get_insn(id).mnemonic(), Mnemonic::Store(_)))
+            .collect();
+        assert_eq!(store_ids.len(), 2);
+        let (s1, s2) = (store_ids[0], store_ids[1]);
+
+        // Without frame freshness the global load pins the redundant store.
+        let plain = crate::AliasResult::simple(&tc.ctx);
+        let dead_plain = dead_load_insns(&tc.ctx, root, Some(&plain), &[]);
+        assert!(
+            !dead_plain.contains(&s1),
+            "without stack/global disjointness the global load pins S1"
+        );
+
+        // With frame freshness, stack ⊥ global, so S1 is correctly dead.
+        let r =
+            crate::AliasResult::simple(&tc.ctx).with_frame_freshness(&tc.ctx, fid, Some(sp_reg));
+        let dead = dead_load_insns(&tc.ctx, root, Some(&r), &[]);
+        assert!(dead.contains(&s1), "the redundant first store is dead");
+        assert!(!dead.contains(&s2), "the surviving last store is kept");
+    }
+
+    /// A store to an own-frame local (`@SP - k`) that no load ever reads is dead;
+    /// a caller-frame slot (`@SP + k`) and a local whose slot *is* read are kept.
+    #[test]
+    fn unread_own_frame_local_store_is_dead() {
+        use qcode::{
+            builder::Builder,
+            testing::TestContext,
+            value::{BasicBlock, Function},
+        };
+
+        let mut tc = TestContext::new();
+        let sp_reg = tc.r0;
+        let fid = Function::make(&mut tc.ctx, "f".into()).unwrap().id;
+        let root = tc.ctx.get_or_make_block(0x1000);
+        {
+            let mut f = Function::from_id_mut(&mut tc.ctx, fid);
+            f.set_root(root).unwrap();
+            f.add_block(root);
+        }
+        let sp_pid = BasicBlock::from_id_mut(&mut tc.ctx, root).push_param(8).id;
+        tc.ctx.values.block_params[sp_pid].origin = Some(ValueId::Varnode(sp_reg));
+        let sp = ValueId::BlockParam(sp_pid);
+
+        let ram = tc.ctx.default_space;
+        {
+            let mut b = Builder::from_block(BasicBlock::from_id_mut(&mut tc.ctx, root));
+            let c8 = b.context_mut().get_const(8, 8).id();
+            let c10 = b.context_mut().get_const(0x10, 8).id();
+            let v = b.context_mut().get_const(0x1234, 4).id();
+            let local = b.push_sub(sp, c8).id(); // @SP - 8 (never read)
+            b.push_store(v, local, ram); // dead
+            let caller = b.push_add(sp, c8).id(); // @SP + 8 (caller frame)
+            b.push_store(v, caller, ram); // kept (caller-visible)
+            let read_local = b.push_sub(sp, c10).id(); // @SP - 0x10 (read below)
+            b.push_store(v, read_local, ram); // kept (its slot is read)
+            b.push_load::<false>(read_local, 4, ram);
+            unsafe { b.dont_finalize() };
+        }
+
+        let stores: Vec<_> = BasicBlock::from_id(&tc.ctx, root)
+            .instruction_ids()
+            .iter()
+            .copied()
+            .filter(|&id| matches!(tc.ctx.get_insn(id).mnemonic(), Mnemonic::Store(_)))
+            .collect();
+        let (s_local, s_caller, s_read) = (stores[0], stores[1], stores[2]);
+
+        let r =
+            crate::AliasResult::simple(&tc.ctx).with_frame_freshness(&tc.ctx, fid, Some(sp_reg));
+        let dead = unread_frame_local_stores(&tc.ctx, fid, &r);
+
+        assert!(
+            dead.contains(&s_local),
+            "unread own-frame local store is dead"
+        );
+        assert!(
+            !dead.contains(&s_caller),
+            "a caller-frame slot is observable, not dead"
+        );
+        assert!(
+            !dead.contains(&s_read),
+            "a local whose slot is loaded is not dead"
+        );
+    }
+
     #[test]
     fn test_store_read_then_overwrite_not_dead() {
         let mut ctx = Context::new();
@@ -1450,11 +1640,9 @@ impl FunctionPass for DeadLoad {
         &self,
         ctx: &mut Context,
         fun_id: FunctionId,
-        _env: &PipelineEnv,
+        env: &PipelineEnv,
     ) -> Result<bool, String> {
-        // Per-function pass: scope the alias oracle to this function so the
-        // stage is O(program) total, not O(functions × program).
-        let aliases = AliasResult::simple_for_function(ctx, fun_id);
+        let aliases = frame_aware_aliases(ctx, fun_id, env);
         Ok(remove_dead_load_insns(ctx, fun_id, Some(&aliases), &[]))
     }
 }
@@ -1478,9 +1666,7 @@ impl FunctionPass for DeadStore {
         fun_id: FunctionId,
         env: &PipelineEnv,
     ) -> Result<bool, String> {
-        // Per-function pass: scope the alias oracle to this function so the
-        // stage is O(program) total, not O(functions × program).
-        let aliases = AliasResult::simple_for_function(ctx, fun_id);
+        let aliases = frame_aware_aliases(ctx, fun_id, env);
         Ok(remove_dead_load_insns(
             ctx,
             fun_id,
@@ -1491,3 +1677,14 @@ impl FunctionPass for DeadStore {
 }
 
 crate::register_function_pass!(DeadStore);
+
+/// Build a per-function alias oracle with frame-freshness populated (the same way
+/// [`crate::gvn::Gvn`] does), so the dead-store/dead-load scans get the
+/// stack-vs-global and own-frame disjointness rules. Falls back to an inert frame
+/// when no stack-pointer register is registered.
+fn frame_aware_aliases(ctx: &Context, fun_id: FunctionId, env: &PipelineEnv) -> AliasResult {
+    let sp_reg = ctx.registers.get(&env.cfg.stack_pointer).copied();
+    env.alias_base(ctx)
+        .for_function(ctx, fun_id)
+        .with_frame_freshness(ctx, fun_id, sp_reg)
+}

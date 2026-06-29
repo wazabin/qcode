@@ -125,8 +125,7 @@ impl<'ctx, 'str> Mem2Reg<'ctx, 'str> {
         let register_clobbers =
             register_clobber_index(self.ctx, self.function_id, &vars, self.aliases);
 
-        let mut state =
-            RenameState::new(&var_params, &vars, &sliced, register_clobbers, changed);
+        let mut state = RenameState::new(&var_params, &vars, &sliced, register_clobbers, changed);
         self.decide_values_start_from(root_id, &mut state);
 
         let RenameState {
@@ -671,9 +670,10 @@ impl Mem2Reg<'_, '_> {
                         }) {
                             vars.insert(var);
                         }
-                    } else if containing.iter().all(|&store| {
-                        register_store_low_aligned_contains(self.ctx, store, var)
-                    }) {
+                    } else if containing
+                        .iter()
+                        .all(|&store| register_store_low_aligned_contains(self.ctx, store, var))
+                    {
                         // Every covering store shares the var's start address, so the
                         // narrow value is the low bytes of the stored value — a slice
                         // the renamer can synthesize. Promote it as a *sliced* var:
@@ -1290,8 +1290,7 @@ fn block_contains_store_to_var(
 ) -> bool {
     block.iter().any(|insn| {
         if let Mnemonic::Store(Store { ptr, .. }) = insn.mnemonic() {
-            *ptr == var
-                || (var_is_sliced && register_store_low_aligned_contains(ctx, *ptr, var))
+            *ptr == var || (var_is_sliced && register_store_low_aligned_contains(ctx, *ptr, var))
         } else {
             false
         }

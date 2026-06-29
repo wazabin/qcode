@@ -69,6 +69,12 @@ fn impurity(ctx: &Context, m: &Mnemonic) -> Option<&'static str> {
         Mnemonic::Map(m) => {
             (!Function::from_id(ctx, m.body).is_pure()).then_some("map with impure body")
         }
+        // A scan, like a map, is a deterministic value of its array argument and
+        // initial accumulator iff its per-element body is pure (the body symbol is
+        // not an operand, so the generic varnode check below would miss it).
+        Mnemonic::Scan(m) => {
+            (!Function::from_id(ctx, m.body).is_pure()).then_some("scan with impure body")
+        }
         // A pure function reads its inputs only through params: a raw varnode
         // operand is an un-functionalized register/global read.
         _ => m

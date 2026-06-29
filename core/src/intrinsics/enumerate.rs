@@ -26,16 +26,17 @@ impl Intrinsic for Enumerate {
     }
 
     fn result_type(&self, types: &mut TypeManager, args: &[TypeId]) -> TypeId {
-        // `[(index: i64, elem: T); N]` from the operand array `[T; N]`.
-        let (elem, count) = types
-            .array_of(args[0])
-            .expect("enumerate operand must be an array");
+        // `[(index: i64, elem: T)]` from a sequence of `T`, preserving the kind:
+        // an array of `T` enumerates to an array of tuples, a list to a list.
+        let (elem, len, is_list) = types
+            .seq_of(args[0])
+            .expect("enumerate operand must be a sequence (array or list)");
         let i64_ty = types.get_or_make_int(8);
         let tuple = types.get_or_make_named_aggregate(vec![
             AggregateField::new("index", i64_ty),
             AggregateField::new("elem", elem),
         ]);
-        types.get_or_make_array(tuple, count)
+        types.get_or_make_seq(tuple, len, is_list)
     }
 
     fn eval(&self, _args: &[(u128, usize)], _out_size: usize) -> Option<u128> {
@@ -60,6 +61,25 @@ mod tests {
         let id = IntrinsicId::from_name("enumerate").expect("enumerate registered");
         assert_eq!(id.name(), "enumerate");
         assert_eq!(id.desc().arity(), 1);
+    }
+
+    /// `enumerate` preserves the list kind: `enumerate(List<T>) = List<(i,T)>`,
+    /// so it composes onto a `take_while` result.
+    #[test]
+    fn enumerate_of_a_list_is_a_list_of_tuples() {
+        let mut types = crate::types::TypeManager::default();
+        let i8 = types.get_or_make_int(1);
+        let list = types.get_or_make_list(i8, 4);
+
+        let id = IntrinsicId::from_name("enumerate").unwrap();
+        let result = id.desc().result_type(&mut types, &[list]);
+
+        // A list (not a fixed array) of `(index, elem)` tuples, same bound.
+        assert_eq!(types.array_of(result), None);
+        let (tuple, bound) = types.list_of(result).expect("result is a list");
+        assert_eq!(bound, Some(4));
+        let fields = types.aggregate_fields(tuple).expect("element is a tuple");
+        assert_eq!(fields[1].type_id, i8);
     }
 
     #[test]

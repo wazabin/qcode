@@ -9,13 +9,16 @@ use qcode::{
     types::TypeId,
     value::{
         BasicBlock, Function, FunctionId, Value, ValueId, VarnodeId,
-        insn::{Binop, Call, InstructionId, IntBinop, Mnemonic},
+        insn::{Call, InstructionId, Mnemonic},
     },
 };
 
 use crate::gvn::affine::{Numbering, precompute_forms};
+use crate::sequence::{
+    AddressRelation, MemoryAccess, SequenceRegion, collect_regions_for_base, relate_address,
+};
 use crate::stack::frame::{FrameClass, frame_class, incoming_sp_param};
-use crate::{Pass, PipelineEnv, value_range};
+use crate::{Pass, PipelineEnv};
 
 use super::{arg_index_of, is_address_taken};
 
@@ -143,141 +146,6 @@ struct ReadField {
     size: usize,
 }
 
-/// Largest byte span a single dynamic-index region may snapshot. A bound the
-/// `value_range` analysis over-approximates past this is treated as unbounded
-/// (the function falls to partial mode rather than snapshotting a huge — and
-/// possibly mostly-unmapped — region).
-const MAX_REGION_BYTES: u64 = 4096;
-
-/// A *region* deref: a load/store through `base + idx` where `idx` is not a
-/// single constant but a value bounded to `[lo, hi]` (typically a loop induction
-/// variable, bounded by the loop guard — see [`value_range`]). The whole touched
-/// span `[lo, hi + size)` is snapshotted as **one** by-value [`Array`] input and,
-/// if written, returned as **one** `Array` write-set entry — the compact
-/// alternative to enumerating `hi - lo + 1` scalar slots (which would blow up for
-/// a large trip count). Soundness rests on the bound, not on per-byte coverage:
-/// snapshotting the whole span over-reads at most the same speculative way the
-/// scalar write-seed already does (see [`apply`]).
-///
-/// [`Array`]: qcode::types::TypeRepr::Array
-#[derive(Clone, Copy)]
-struct Region {
-    /// Byte offset of the region start from the base pointer (the bound's `lo`).
-    base_off: u64,
-    /// Element/access width in bytes (uniform across the region's accesses).
-    elem_size: usize,
-    /// Element count: `ceil(byte_span / elem_size)`.
-    count: usize,
-    /// Whether any store writes into the region — then it contributes one
-    /// `Array` write-set entry; a read-only region contributes only an input.
-    has_write: bool,
-}
-
-impl Region {
-    /// Total snapshot width in bytes.
-    fn byte_len(&self) -> usize {
-        self.count * self.elem_size
-    }
-}
-
-/// Running union of one parameter's dynamic-index accesses, folded into a single
-/// [`Region`]. All accesses through the same base merge into one span; a mismatched
-/// element width clears `ok` (the region is then dropped and its accesses left
-/// unmodelled, steering the function to partial mode).
-#[derive(Default)]
-struct RegionAcc {
-    present: bool,
-    ok: bool,
-    /// Inclusive low byte offset (the bound's `lo`).
-    min: u64,
-    /// Exclusive high byte offset (`hi + elem`).
-    max_end: u64,
-    elem: usize,
-    has_write: bool,
-}
-
-impl RegionAcc {
-    /// Fold in one bounded access: index in `[lo, hi]`, `size`-byte element,
-    /// `is_store` if it writes.
-    fn add(&mut self, lo: u64, hi: u64, size: usize, is_store: bool) {
-        let end = hi.saturating_add(size as u64);
-        if !self.present {
-            *self = RegionAcc {
-                present: true,
-                ok: true,
-                min: lo,
-                max_end: end,
-                elem: size,
-                has_write: is_store,
-            };
-        } else {
-            if self.elem != size {
-                self.ok = false;
-            }
-            self.min = self.min.min(lo);
-            self.max_end = self.max_end.max(end);
-            self.has_write |= is_store;
-        }
-    }
-
-    /// The finished [`Region`], or `None` if absent, inconsistent, or larger than
-    /// [`MAX_REGION_BYTES`]. A `None` is logged with its reason at `debug`, since it
-    /// means the folded accesses get no `Array` seed (and are dropped as unmodelled).
-    fn build(&self) -> Option<Region> {
-        if !self.present {
-            return None;
-        }
-        if !self.ok {
-            qcode::pass_log!(
-                debug,
-                "region build bail: width mismatch (elem={}, min={:#x}, max_end={:#x})",
-                self.elem,
-                self.min,
-                self.max_end,
-            );
-            return None;
-        }
-        if self.elem == 0 {
-            qcode::pass_log!(debug, "region build bail: zero element width");
-            return None;
-        }
-        let Some(span) = self.max_end.checked_sub(self.min) else {
-            qcode::pass_log!(
-                debug,
-                "region build bail: max_end {:#x} < min {:#x} (underflow)",
-                self.max_end,
-                self.min,
-            );
-            return None;
-        };
-        if span == 0 || span > MAX_REGION_BYTES {
-            qcode::pass_log!(
-                debug,
-                "region build bail: span {:#x} ({} bytes) {} (min={:#x}, max_end={:#x}, elem={})",
-                span,
-                span,
-                if span == 0 {
-                    "is zero"
-                } else {
-                    "exceeds MAX_REGION_BYTES (4096)"
-                },
-                self.min,
-                self.max_end,
-                self.elem,
-            );
-            return None;
-        }
-        // Round the span up to a whole number of elements.
-        let count = span.div_ceil(self.elem as u64) as usize;
-        Some(Region {
-            base_off: self.min,
-            elem_size: self.elem,
-            count,
-            has_write: self.has_write,
-        })
-    }
-}
-
 /// A dereferenced pointer parameter slated for promotion, and the IR sites the
 /// rewrite must touch.
 struct Promoted {
@@ -303,7 +171,7 @@ struct Promoted {
     /// Dynamic-index region snapshotted through this parameter, if any. At most
     /// one per param (all dynamic accesses through the param merge into a single
     /// span). Snapshotted as one `Array` input + (if written) one write entry.
-    region: Option<Region>,
+    region: Option<SequenceRegion>,
 }
 
 /// How a named parameter is used, deciding whether and how it is promoted.
@@ -319,7 +187,7 @@ struct ParamInfo {
     /// Distinct `(address, size)` of each store target written through this param.
     write_targets: Vec<(ValueId, usize)>,
     /// Dynamic-index region snapshotted through this param, if any.
-    region: Option<Region>,
+    region: Option<SequenceRegion>,
 }
 
 fn try_promote(
@@ -394,9 +262,38 @@ fn try_promote(
         .filter_map(|p| Some((p.id(), p.name()?.to_string())))
         .collect();
 
+    // The affine view of every value, and the function's full real-ram load/store
+    // list — both shared across all params so the per-param decomposition can peel
+    // a strided `param + idx*scale + const` address (see [`relate_address`]).
+    let numbering = precompute_forms(ctx, fid);
+    let ram = ctx.default_space;
+    let accesses_in: Vec<MemoryAccess> = Function::from_id(ctx, fid)
+        .iter()
+        .flat_map(|b| {
+            let bid = b.id;
+            b.iter().filter_map(move |insn| match insn.mnemonic() {
+                Mnemonic::Load(l) if l.space == ram => Some(MemoryAccess {
+                    id: insn.id,
+                    block: bid,
+                    is_store: false,
+                    ptr: l.ptr,
+                    size: l.size,
+                }),
+                Mnemonic::Store(s) if s.space == ram => Some(MemoryAccess {
+                    id: insn.id,
+                    block: bid,
+                    is_store: true,
+                    ptr: s.ptr,
+                    size: s.size,
+                }),
+                _ => None,
+            })
+        })
+        .collect();
+
     let mut promoted: Vec<Promoted> = Vec::new();
     for (param, name) in candidates {
-        let info = analyze_param(ctx, param);
+        let info = analyze_param(ctx, &numbering, &accesses_in, param);
         if !info.is_deref {
             continue;
         }
@@ -537,13 +434,22 @@ fn all_writes_resolvable(
 /// the sole non-frame writer:
 ///
 /// * at most one region in the whole function, and
-/// * if it is written, every *other* surfaced store lands in an `@SP`-rooted frame
-///   slot — an own-frame local (sound by frame freshness) or a caller-frame slot
-///   (under [`Proposition::ArgsDisjointFromCallerFrame`]). The region base is a
-///   promoted *incoming* pointer param, disjoint from the whole frame, so those
-///   frame writes (e.g. argpromote's own spilled-arg seed stores, replayed as
-///   no-ops) cannot overlap the region. Any *non-frame* coexisting write — a second
-///   incoming pointer we cannot separate — keeps the function on the partial path.
+/// * if it is written, every *other* surfaced store either
+///   - lands in an `@SP`-rooted frame slot — an own-frame local (sound by frame
+///     freshness) or a caller-frame slot (under
+///     [`Proposition::ArgsDisjointFromCallerFrame`]); the region base is a promoted
+///     *incoming* pointer param, disjoint from the whole frame, so those frame
+///     writes (e.g. argpromote's own spilled-arg seed stores, replayed as no-ops)
+///     cannot overlap the region; or
+///   - is a scalar at a constant offset of the **region's own base param** whose
+///     byte range is disjoint from the region's span — e.g. a `count` field at
+///     offset 0 next to an array body at offset ≥ 4. Same base + non-overlapping
+///     offsets is offset-precise disjointness, so the independent replays cannot
+///     collide.
+///
+/// Any *other* non-frame coexisting write — a second incoming pointer we cannot
+/// separate, or a same-base write that overlaps the region — keeps the function on
+/// the partial path.
 ///
 /// (A read-only region has no replay, so it is always safe.)
 fn regions_disjoint(
@@ -555,20 +461,54 @@ fn regions_disjoint(
     if promoted.iter().filter(|p| p.region.is_some()).count() > 1 {
         return false;
     }
-    let writing_region = promoted
-        .iter()
-        .any(|p| p.region.is_some_and(|r| r.has_write));
-    if !writing_region {
+    // The single written region, if any: its base param (with its name) and its
+    // `[lo, hi)` span.
+    let Some((region_base, region_base_name, region_lo, region_hi)) =
+        promoted.iter().find_map(|p| {
+            p.region.filter(|r| r.has_write).map(|r| {
+                (
+                    p.param,
+                    p.name.clone(),
+                    r.base_off as i64,
+                    r.base_off as i64 + r.byte_len() as i64,
+                )
+            })
+        })
+    else {
+        // No *written* region: nothing replayed independently, so always safe.
         return true;
-    }
+    };
     let caller_frame_assumed = ctx
         .truth(Proposition::ArgsDisjointFromCallerFrame(fid))
         .is_some_and(|t| t.value);
+    // A pointer's storage slot is disjoint from the buffer it addresses — the
+    // region rooted at its *loaded value* (`Proposition::LoadedPointerDisjointFromSlot`).
+    let loaded_ptr_disjoint = ctx
+        .truth(Proposition::LoadedPointerDisjointFromSlot(fid))
+        .is_some_and(|t| t.value);
     let own_frame = OwnFrame::new(ctx, fid, sp_reg);
+    let numbering = precompute_forms(ctx, fid);
     promoted.iter().all(|p| {
-        p.write_targets.iter().all(|&(addr, _)| {
-            own_frame.is_local(ctx, addr)
+        p.write_targets.iter().all(|&(addr, wsize)| {
+            if own_frame.is_local(ctx, addr)
                 || (caller_frame_assumed && own_frame.is_frame_slot(ctx, addr))
+            {
+                return true;
+            }
+            // A write through a pointer param whose *loaded value* roots the region —
+            // i.e. the region is this pointer's pointee — cannot overlap the region:
+            // the buffer does not overlap the storage of the pointer that addresses
+            // it (`LoadedPointerDisjointFromSlot`). The snapshot naming links the two:
+            // the region base param is `p`'s deref, named `{p.name}_val_<off>`. This
+            // is what lets a state-init function that *also* publishes its buffer
+            // pointer into a global slot (`*pp = buf`) still region-promote `*buf`.
+            if loaded_ptr_disjoint && region_base_name.starts_with(&format!("{}_val_", p.name)) {
+                return true;
+            }
+            // Offset-precise disjointness against the written region: the scalar
+            // must share the region's base param and miss its byte span.
+            let (base, off) = numbering.base_offset(addr).unwrap_or((addr, 0));
+            base == region_base && (off + wsize as i64 <= region_lo || off >= region_hi)
         })
     })
 }
@@ -601,38 +541,33 @@ fn function_accesses_memory(ctx: &Context, function_id: FunctionId) -> bool {
     })
 }
 
-/// Classify how `param` is used (see [`ParamInfo`]). Collects the loads/stores to
-/// redirect into the shadow space, the distinct write targets, and the by-value
-/// snapshot width (bounded by the *reads* — writes may land at any offset).
+/// Classify how `param` is used (see [`ParamInfo`]). Walks every real-ram
+/// load/store in the function and, via the affine [`relate_address`] decomposition,
+/// collects the accesses to redirect into shadow, the distinct scalar write
+/// targets, and the dynamic-index region — the by-value snapshot width is bounded
+/// by the *reads* (writes may land at any offset).
 ///
 /// There is no "escape" concept: a pointer value flowing into memory is not a
 /// hazard on its own. The shadow path's soundness is guarded entirely by
 /// [`all_accesses_modelled`] — every real-ram access must be a captured (and so
-/// redirected) deref of a promoted pointer. A read whose address is not a constant
-/// `param + const` offset is simply *not captured*, which fails that gate and steers
-/// the function to partial mode; a stored-as-data pointer is harmless precisely
-/// because the place it lands is itself captured (regime B) or else uncaptured and
-/// rejected by the gate.
-fn analyze_param(ctx: &Context, param: ValueId) -> ParamInfo {
-    // Only real (default-space) memory accesses are promotable. Accesses already
-    // redirected into a shadow space — and the seed store a prior promotion left
-    // behind — are skipped, not re-promoted: this is what makes the pass idempotent
-    // so it can be looped (fold → re-promote) to a fixpoint.
-    let ram = ctx.default_space;
+/// redirected) deref of a promoted pointer. A read whose address is not an affine
+/// `param + offset` is simply *not captured*, which fails that gate and steers the
+/// function to partial mode; a stored-as-data pointer is harmless precisely because
+/// the place it lands is itself captured (regime B) or else uncaptured and rejected
+/// by the gate.
+///
+/// `accesses_in` is the function's full real-ram load/store list (id, block,
+/// is_store, ptr, size); precomputed once and shared across all params.
+fn analyze_param(
+    ctx: &Context,
+    numbering: &Numbering,
+    accesses_in: &[MemoryAccess],
+    param: ValueId,
+) -> ParamInfo {
     let mut accesses: Vec<InstructionId> = Vec::new();
     // (offset from base, access width) for each load — one snapshot scalar each.
     let mut read_fields: Vec<ReadField> = Vec::new();
     let mut write_targets: Vec<(ValueId, usize)> = Vec::new();
-    // One dynamic-index region per param, accumulated across all of its bounded
-    // `param + idx` accesses.
-    let mut region = RegionAcc::default();
-    // Accesses folded into the region. Kept separate from `accesses` until
-    // `region.build()` confirms the region is viable: if the span exceeds
-    // `MAX_REGION_BYTES` (or widths mismatch) `build()` returns `None` and these
-    // accesses get NO snapshot seed, so they must NOT be committed to `accesses`
-    // (which would redirect them to shadow as un-seeded orphan reads) — they are
-    // dropped instead, left unmodelled for the all-or-nothing gate to reject.
-    let mut region_accesses: Vec<InstructionId> = Vec::new();
     let mut is_deref = false;
 
     // Record a load at constant byte `offset` of `size` bytes. The width is gated
@@ -654,176 +589,54 @@ fn analyze_param(ctx: &Context, param: ValueId) -> ParamInfo {
         true
     };
 
-    for uid in ctx.users(param).to_vec() {
-        match ctx.get_insn(uid).mnemonic().clone() {
-            // `param ± const` address computation. `Add` (offset on either side)
-            // and `param - const` (`Sub`, param on the left) both qualify.
-            Mnemonic::Binop(b)
-                if (matches!(b.op, Binop::Int(IntBinop::Add))
-                    && (b.lhs == param || b.rhs == param))
-                    || (matches!(b.op, Binop::Int(IntBinop::Sub)) && b.lhs == param) =>
-            {
-                let is_add = matches!(b.op, Binop::Int(IntBinop::Add));
-                let offset = if b.lhs == param { b.rhs } else { b.lhs };
-                let add_val = ValueId::Instruction(uid);
-                let mut any = false;
-                for u2 in ctx.users(add_val).to_vec() {
-                    match ctx.get_insn(u2).mnemonic().clone() {
-                        Mnemonic::Load(l) if l.ptr == add_val && l.space == ram => {
-                            // Reads become caller-seeded snapshots at `arg + offset`,
-                            // so only a `param + const` form is recomputable as a
-                            // non-negative offset; a `param - const` read would need
-                            // a signed snapshot offset (unsupported) — leave it
-                            // unmodelled for the all-or-nothing gate to reject.
-                            if !is_add {
-                                continue;
-                            }
-                            // Unmodellable reads (no block, non-constant offset, or
-                            // unsnapshotable width) are left out of `accesses` so the
-                            // all-or-nothing gate rejects them.
-                            let Some(block) = ctx.get_insn(u2).parent().map(|b| b.id) else {
-                                continue;
-                            };
-                            let range = value_range(ctx, offset, block);
-                            if range.min == range.max {
-                                // Constant offset → one scalar snapshot.
-                                if !push_read(range.min, l.size) {
-                                    continue;
-                                }
-                                any = true;
-                                accesses.push(u2);
-                            } else if region_bounded(ctx, offset, range) {
-                                // Bounded dynamic offset → fold into the region. The
-                                // access is committed to `accesses` only if the region
-                                // later builds (see `region_accesses`); otherwise it is
-                                // dropped as unmodelled.
-                                region.add(range.min, range.max, l.size, false);
-                                any = true;
-                                region_accesses.push(u2);
-                            }
-                            // Else: unbounded (Top) — leave unmodelled for the gate.
-                        }
-                        Mnemonic::Store(s) if s.ptr == add_val && s.space == ram => {
-                            let block = ctx.get_insn(u2).parent().map(|b| b.id);
-                            let range = block.map(|blk| value_range(ctx, offset, blk));
-                            match range {
-                                // Bounded dynamic store → fold into the region (a
-                                // `param - idx` store keeps `is_add == false`, whose
-                                // negative span we do not model; leave it out).
-                                Some(r)
-                                    if r.min != r.max
-                                        && is_add
-                                        && region_bounded(ctx, offset, r) =>
-                                {
-                                    region.add(r.min, r.max, s.size, true);
-                                    any = true;
-                                    region_accesses.push(u2);
-                                }
-                                // Unbounded dynamic store → unmodelled; leave it out
-                                // of `accesses` so the all-or-nothing gate rejects it.
-                                Some(r) if r.min != r.max => {}
-                                // Constant offset (or no block): the write address
-                                // rides out in the return set as data, so any
-                                // `param ± const` store target qualifies.
-                                _ => {
-                                    any = true;
-                                    accesses.push(u2);
-                                    write_targets.push((add_val, s.size));
-                                }
-                            }
-                        }
-                        // Already-redirected shadow access from a prior promotion:
-                        // following our own indirection — ignore. Any other use of
-                        // the add value (stored as data, returned, compared) is not a
-                        // hazard: it is captured where it lands (regime B) or else
-                        // uncaptured and rejected by `all_accesses_modelled`.
-                        _ => {}
+    for access in accesses_in {
+        match relate_address(ctx, numbering, param, access.ptr, access.block) {
+            AddressRelation::Unrelated => {}
+            AddressRelation::Const(off) => {
+                if access.is_store {
+                    // The write address rides out in the return set as data; any
+                    // `param ± const` target qualifies (a negative offset wraps
+                    // two's-complement at the caller).
+                    is_deref = true;
+                    accesses.push(access.id);
+                    write_targets.push((access.ptr, access.size));
+                } else if off >= 0 {
+                    // Reads become caller-seeded snapshots at `arg + offset`, so only
+                    // a non-negative offset is recomputable; a negative-offset read
+                    // is left unmodelled for the all-or-nothing gate to reject.
+                    if push_read(off as u64, access.size) {
+                        is_deref = true;
+                        accesses.push(access.id);
                     }
                 }
-                // `any` marks a real deref; `!any` is pure address arithmetic
-                // (e.g. `return p + k`).
-                if any {
-                    is_deref = true;
-                }
             }
-            // `gep(param.field)` — a typed, constant-offset field deref. The
-            // struct-typing pass canonicalizes a `param + const` address into a
-            // `Gep`, so the same field read that the `Binop(Add)` arm above would
-            // have captured arrives here instead and must be modelled too, or it
-            // stays unmodelled and the function never gets its by-value snapshot.
-            // `Gep.offset` is always non-negative, so — unlike `param - const` —
-            // it is cleanly recomputable as a snapshot offset at the caller.
-            Mnemonic::Gep(g) if g.base == param => {
-                let offset = g.offset as u64;
-                let gep_val = ValueId::Instruction(uid);
-                let mut any = false;
-                for u2 in ctx.users(gep_val).to_vec() {
-                    match ctx.get_insn(u2).mnemonic().clone() {
-                        Mnemonic::Load(l) if l.ptr == gep_val && l.space == ram => {
-                            // Constant offset → one scalar snapshot, seeded by the
-                            // caller at `arg + offset` exactly like the add path.
-                            if !push_read(offset, l.size) {
-                                continue;
-                            }
-                            any = true;
-                            accesses.push(u2);
-                        }
-                        Mnemonic::Store(s) if s.ptr == gep_val && s.space == ram => {
-                            // The write address rides out in the return set as data.
-                            any = true;
-                            accesses.push(u2);
-                            write_targets.push((gep_val, s.size));
-                        }
-                        // Already-redirected shadow access, or use as data — not a
-                        // hazard (see the add arm and `all_accesses_modelled`).
-                        _ => {}
-                    }
-                }
-                if any {
-                    is_deref = true;
-                }
-            }
-            // Direct access at offset 0.
-            Mnemonic::Load(l) if l.ptr == param && l.space == ram => {
-                if push_read(0, l.size) {
-                    is_deref = true;
-                    accesses.push(uid);
-                }
-                // Else: unsnapshotable width — leave the read unmodelled (not in
-                // `accesses`), so `all_accesses_modelled` rejects it.
-            }
-            Mnemonic::Store(s) if s.ptr == param && s.space == ram => {
-                is_deref = true;
-                accesses.push(uid);
-                write_targets.push((param, s.size));
-            }
-            // Any other use treats the address as data (stored as a value, returned,
-            // compared, branched). Not a hazard: a stored copy is sound as long as
-            // where it lands is itself captured (regime B) or else uncaptured and
-            // rejected by `all_accesses_modelled`. The shadow is keyed by address
-            // value, so a later re-dereference of a recovered copy resolves through
-            // the shadow — unless its address is loaded at runtime, which is itself
-            // an unmodelled access the gate rejects.
-            _ => {}
+            AddressRelation::Dynamic { .. } => {}
         }
     }
 
-    let region = region.build();
-    if region.is_some() {
+    let region_set = collect_regions_for_base(ctx, numbering, param, accesses_in);
+    if region_set.regions.len() == 1 {
         is_deref = true;
         // The region is viable (an `Array` snapshot will be seeded for it), so its
         // folded accesses are now safe to redirect into shadow.
-        accesses.append(&mut region_accesses);
-    } else if !region_accesses.is_empty() {
+        accesses.extend(region_set.regions[0].accesses.iter().copied());
+    } else if !region_set.regions.is_empty() {
         qcode::pass_log!(
             debug,
-            "dropping {} unmodelled region access(es) (region failed to build) — \
-             function will fall to partial/no promotion rather than orphan them in shadow",
-            region_accesses.len(),
+            "dropping {} disjoint region(s) through one param: argpromote still materializes \
+             one Array region per param; function will fall to partial/no promotion",
+            region_set.regions.len(),
         );
     }
-    // Else: `region.build()` returned `None` (span > `MAX_REGION_BYTES`, or
-    // inconsistent widths). The folded accesses get no seed, so they are deliberately
+    if !region_set.rejected_accesses.is_empty() {
+        qcode::pass_log!(
+            debug,
+            "dropping {} unmodelled region access(es) (region failed to build) - \
+             function will fall to partial/no promotion rather than orphan them in shadow",
+            region_set.rejected_accesses.len(),
+        );
+    }
+    // Rejected or unsupported dynamic accesses get no seed, so they are deliberately
     // NOT added to `accesses` — left unmodelled so `all_accesses_modelled` rejects the
     // function to partial mode, rather than orphan-redirecting an un-seeded shadow
     // read. (This is the TEB/PEB bug: a wide bounded fs-offset failed to build a
@@ -841,6 +654,12 @@ fn analyze_param(ctx: &Context, param: ValueId) -> ParamInfo {
         }
     }
 
+    let region = if region_set.regions.len() == 1 {
+        Some(region_set.regions[0].region)
+    } else {
+        None
+    };
+
     ParamInfo {
         is_deref,
         reads: read_fields,
@@ -848,14 +667,6 @@ fn analyze_param(ctx: &Context, param: ValueId) -> ParamInfo {
         write_targets: deduped,
         region,
     }
-}
-
-/// Whether `range` is a usable region bound for `offset`: narrower than the full
-/// width of `offset` (i.e. not Top). A Top range means the index is unconstrained,
-/// so the region would be unbounded — leave the access unmodelled instead.
-fn region_bounded(ctx: &Context, offset: ValueId, range: crate::ValueRange) -> bool {
-    let size = qcode::value::ValueRef::new(offset, ctx).size();
-    range.is_bounded(size)
 }
 
 /// Rewrite `fid` and every direct caller into the shadow-memory / write-set form.
@@ -1197,6 +1008,15 @@ fn apply_partial(ctx: &mut Context, fid: FunctionId, promoted: &[Promoted]) -> b
     for ns in &new_snaps {
         let val_pid = BasicBlock::from_id_mut(ctx, root).push_param(ns.size).id;
         ctx.values.block_params[val_pid].name = Some(Cow::Owned(ns.name.clone()));
+        // An offset-0 snapshot *is* `*base` — record the base slot as its `origin`,
+        // so when `base` is a global slot and this snapshot is used as a buffer
+        // pointer, alias analysis can treat it as a pointer loaded from that slot
+        // (disjoint from the slot under `LoadedPointerDisjointFromSlot`). This lets
+        // the in-loop reload forward to this param so a later round region-promotes
+        // the buffer. Only the offset-0 snapshot equals `*base` exactly.
+        if ns.offset == 0 {
+            ctx.values.block_params[val_pid].origin = Some(ns.base);
+        }
         seeds.push((
             ns.base,
             ns.base_size,

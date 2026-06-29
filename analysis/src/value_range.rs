@@ -242,8 +242,13 @@ impl Solver<'_> {
                 None => ValueRange::top(size),
             },
             ValueId::Instruction(id) => self.transfer(id, depth),
-            // BlockParams (phis), varnodes and the rest are opaque: bounding
-            // them is the guard refinement's job.
+            // A block param (phi) is bounded by joining its incoming values,
+            // each refined by the branch condition on its edge — this is what
+            // recovers a counted-loop induction range when the loop is a single
+            // self-looping block (the index is that block's own param and the
+            // guard tests the incremented value on the back-edge).
+            ValueId::BlockParam(_) => self.block_param_range(v, depth),
+            // Varnodes and the rest are opaque.
             _ => ValueRange::top(size),
         };
         // Guards are checked for every visited value, not just the query
@@ -362,6 +367,138 @@ impl Solver<'_> {
             // Loads, calls, unops, ... : opaque.
             _ => top,
         }
+    }
+
+    /// Range of a block param `v`, joining its incoming value on every
+    /// predecessor edge — each narrowed by that edge's branch condition.
+    ///
+    /// For a counted loop `for i in 0..N` lowered to a single self-looping block,
+    /// `i` is the block's own param: the entry edge carries the constant init and
+    /// the back-edge carries `i + step` guarded by `i + step < N`. The back-edge's
+    /// incoming is itself `i`-dependent, so the SSA walk returns Top for it — but
+    /// the edge guard refines it to `[…, N-1]`, and the hull with the constant init
+    /// gives a bounded range. The recursion into the back-edge's `i` terminates via
+    /// the `in_progress` set (it returns Top there, which the guard then tightens).
+    ///
+    /// An edge we cannot read (an unknown terminator, or a missing arg) forces the
+    /// whole result to Top — a join is only as bounded as its widest incoming.
+    fn block_param_range(&mut self, v: ValueId, depth: usize) -> ValueRange {
+        let size = value_size(self.ctx, v);
+        let top = ValueRange::top(size);
+        let mask = all_ones(size);
+        let ValueId::BlockParam(pid) = v else {
+            return top;
+        };
+        let Some(parent) = self.ctx.values.block_params[pid].parent else {
+            return top;
+        };
+        let Some(k) = BasicBlock::from_id(self.ctx, parent)
+            .params()
+            .position(|p| p.id() == v)
+        else {
+            return top;
+        };
+        let preds: Vec<BlockId> = BasicBlock::from_id(self.ctx, parent)
+            .predecessors()
+            .map(|(_, p)| p)
+            .collect();
+        if preds.is_empty() {
+            return top;
+        }
+
+        let mut acc: Option<ValueRange> = None;
+        // A back-edge that increments this very param (`v = v + positive`) is a
+        // monotonically-increasing induction step. Its incoming lower bound is
+        // loose (the recursion into `v` hits the depth cap → `top`, and the loop
+        // guard only tightens *above*), so it must not drag the join's minimum
+        // below `v`'s initial value. Track whether such a step exists and the
+        // minimum over the *non-step* (initialiser) incomings.
+        let mut has_step = false;
+        let mut init_min: Option<u64> = None;
+        for pred in preds {
+            // Read the incoming value and the edge's branch polarity, ending the
+            // `ctx` borrow before the recursive `range` call.
+            let edge = {
+                let Some(term) = BasicBlock::from_id(self.ctx, pred).iter().last() else {
+                    return top;
+                };
+                match term.mnemonic() {
+                    Mnemonic::Branch(b) => b.args.get(k).copied().map(|inv| (inv, None)),
+                    Mnemonic::CBranch(cb) => {
+                        if cb.success_block == parent {
+                            cb.success_args
+                                .get(k)
+                                .copied()
+                                .map(|inv| (inv, Some((cb.condition, true))))
+                        } else if cb.failure_block == parent {
+                            cb.failure_args
+                                .get(k)
+                                .copied()
+                                .map(|inv| (inv, Some((cb.condition, false))))
+                        } else {
+                            None
+                        }
+                    }
+                    _ => None,
+                }
+            };
+            let Some((inv, guard)) = edge else {
+                return top;
+            };
+            let is_step = self.is_monotonic_step(inv, v);
+            let mut r = self.range(inv, depth + 1);
+            if let Some((cond, taken)) = guard
+                && let Some(rr) = self.refine_condition(cond, inv, taken, mask, 0)
+            {
+                r = r.intersect(rr);
+            }
+            if is_step {
+                has_step = true;
+            } else {
+                init_min = Some(init_min.map_or(r.min, |m| m.min(r.min)));
+            }
+            acc = Some(match acc {
+                Some(a) => hull(a, r),
+                None => r,
+            });
+        }
+        let mut result = acc.unwrap_or(top);
+        // Monotonic induction `v ∈ {init, init+c, init+2c, …}`: `v` never drops
+        // below its initial value. Floor the minimum there — but only when a real
+        // upper bound exists (`max < mask`), which proves the counted loop exits
+        // before `v + c` could wrap around and re-enter below `init`.
+        if has_step
+            && result.max < mask
+            && let Some(im) = init_min
+        {
+            result.min = result.min.max(im);
+        }
+        result
+    }
+
+    /// Whether `inv` is `v + c` (or `c + v`) for a positive constant `c` — the
+    /// monotonically-increasing back-edge step of an induction param `v`.
+    fn is_monotonic_step(&self, inv: ValueId, v: ValueId) -> bool {
+        let ValueId::Instruction(id) = inv else {
+            return false;
+        };
+        let Mnemonic::Binop(Binary {
+            op: Binop::Int(IntBinop::Add),
+            lhs,
+            rhs,
+        }) = self.ctx.get_insn(id).mnemonic()
+        else {
+            return false;
+        };
+        let (lhs, rhs) = (*lhs, *rhs);
+        let other = if lhs == v {
+            rhs
+        } else if rhs == v {
+            lhs
+        } else {
+            return false;
+        };
+        numeric_const(self.ctx, other).is_some_and(|c| c > 0)
     }
 
     /// Intersection of all bound checks on `v` found by climbing the

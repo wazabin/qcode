@@ -52,10 +52,11 @@ pub fn mark_pure_functions(ctx: &mut Context) -> bool {
 /// is permitted: its result is itself a deterministic function of its (SSA)
 /// arguments, and a pure callee clobbers nothing — so the call introduces no
 /// untracked value or side effect. (The call's own `clobbers` must be empty,
-/// guarding against a stale over-approximated clobber set.) **Stores are
-/// permitted**: they produce no value, so they never feed a returned field, and
-/// the emulation harvesting this property keeps the call in place — any real side
-/// effect the store represents is preserved.
+/// guarding against a stale over-approximated clobber set.) **Only shadow-space
+/// stores are permitted**: a store to argpromote's private temporary space is no
+/// caller-visible effect, but a store to real memory is an observable side effect
+/// — allowing it would let the dead-pure-call sweep delete the call (when its
+/// return is unused) and drop that store.
 pub(crate) fn body_is_pure(ctx: &Context, fid: FunctionId) -> bool {
     Function::from_id(ctx, fid).iter().all(|block| {
         block
@@ -79,12 +80,22 @@ fn mnemonic_is_pure(ctx: &Context, m: &Mnemonic) -> bool {
         // A map is pure exactly when its per-element body is pure. The body is a
         // symbol, not an operand, so the generic varnode check below cannot see it.
         Mnemonic::Map(m) => Function::from_id(ctx, m.body).is_pure(),
+        // A scan is pure exactly when its per-element body is pure (same as map).
+        Mnemonic::Scan(m) => Function::from_id(ctx, m.body).is_pure(),
         // A direct call to a pure function is a deterministic value of its args
         // and clobbers nothing — provided the call site carries no residual
         // clobbers of its own.
         Mnemonic::Call(c) => c.clobbers.is_empty() && Function::from_id(ctx, c.target).is_pure(),
-        // A store produces no value, so it never feeds a returned field.
-        Mnemonic::Store(_) => true,
+        // A store is pure only when it writes the function's *private* shadow space
+        // (argpromote's functionalized memory) — that produces no caller-visible
+        // effect. A store to REAL memory is an observable side effect and keeps the
+        // function impure: marking it pure would let the dead-pure-call sweep
+        // (`dce::remove_dead_pure_call`) delete the call when its return is unused,
+        // dropping that store. Symmetric with the `Load` arm above.
+        Mnemonic::Store(s) => matches!(
+            qcode::space::Space::from_id(ctx, s.space).ty,
+            qcode::space::SpaceType::Temporary
+        ),
         // Every other op is a value computation or structured control flow; it is
         // pure as long as it reads no raw varnode (un-promoted register/global).
         _ => m.args().iter().all(|a| !matches!(a, ValueId::Varnode(_))),
@@ -105,3 +116,60 @@ impl Pass for MarkPure {
 }
 
 crate::register_module_pass!(MarkPure);
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use qcode::{
+        builder::Builder,
+        testing::TestContext,
+        value::{BasicBlock, Function},
+    };
+
+    /// Build a one-block function with a single store through a pointer param,
+    /// into either real ram or a private shadow (temporary) space.
+    fn one_store_fn(
+        tc: &mut TestContext,
+        name: &'static str,
+        addr: u64,
+        to_shadow: bool,
+    ) -> FunctionId {
+        let fid = Function::make(&mut tc.ctx, name.into()).unwrap().id;
+        let root = tc.ctx.get_or_make_block(addr);
+        {
+            let mut f = Function::from_id_mut(&mut tc.ctx, fid);
+            f.set_root(root).unwrap();
+            f.add_block(root);
+        }
+        let p_pid = BasicBlock::from_id_mut(&mut tc.ctx, root).push_param(4).id;
+        let p = ValueId::BlockParam(p_pid);
+        let space = if to_shadow {
+            tc.ctx.make_temp_space()
+        } else {
+            tc.ctx.default_space
+        };
+        let mut b = Builder::from_block(BasicBlock::from_id_mut(&mut tc.ctx, root));
+        let v = b.context_mut().get_const(0x1234, 4).id();
+        b.push_store(v, p, space);
+        unsafe { b.dont_finalize() };
+        fid
+    }
+
+    /// A store to real memory is an observable side effect, so the function stays
+    /// impure (its call must not be dead-pure-call-eliminated). A store to the
+    /// private shadow space is functionalized memory and keeps the function pure.
+    #[test]
+    fn real_ram_store_keeps_function_impure() {
+        let mut tc = TestContext::new();
+        let real = one_store_fn(&mut tc, "real", 0x1000, false);
+        let shadow = one_store_fn(&mut tc, "shadow", 0x2000, true);
+        assert!(
+            !body_is_pure(&tc.ctx, real),
+            "a real-ram store is an observable side effect → impure"
+        );
+        assert!(
+            body_is_pure(&tc.ctx, shadow),
+            "a shadow-space store is private → pure"
+        );
+    }
+}

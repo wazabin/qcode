@@ -508,10 +508,13 @@ mod tests {
         let Mnemonic::Call(call) = tc.ctx.get_insn(call_id).mnemonic().clone() else {
             panic!("g_call is a call");
         };
-        let passes_addr = call.args.iter().any(|&a| match qcode::value::ValueRef::new(a, &tc.ctx) {
-            qcode::value::ValueRef::Literal(l) => l.value() == 0x9000,
-            _ => false,
-        });
+        let passes_addr =
+            call.args
+                .iter()
+                .any(|&a| match qcode::value::ValueRef::new(a, &tc.ctx) {
+                    qcode::value::ValueRef::Literal(l) => l.value() == 0x9000,
+                    _ => false,
+                });
         assert!(passes_addr, "caller passes the global address literal");
 
         // … and replays the functionalized write-set out of the call result.
@@ -2033,6 +2036,226 @@ mod tests {
         );
     }
 
+    /// A **strided, nested-offset** buffer write — `store((base + i*4) + 4)`, the
+    /// shape an `i32[]` fill compiles to (element scale `*4`, a `+4` skipping a
+    /// header field, with `base` buried two adds down) — must still region-promote.
+    /// The structural one-add matcher missed this; the affine decomposition recovers
+    /// `constant=4, terms=[(base,1),(i,4)]`, so the byte offset is `4 + 4·i` over the
+    /// bounded `i ∈ [0,20)`, i.e. a `[i32; 20]` region at byte offset 4.
+    #[test]
+    fn strided_nested_offset_loop_promotes_as_array_region() {
+        let mut tc = qcode::testing::TestContext::new();
+        let input = stack_input(&mut tc, 4, 8);
+
+        qcode!(
+            tc.ctx,
+            "
+            fn f:
+                <f_entry @stack_10000004:i64>
+                    goto <f_head @i=i64 0x0>;
+                <f_head @i:i64>
+                    %c = @i < i64 0x14;
+                    if %c goto <f_body> else goto <f_exit>;
+                <f_body>
+                    %s = @i * i64 0x4;
+                    %base = %s + @stack_10000004;
+                    %addr = %base + i64 0x4;
+                    store(%addr, i32 0x7b);
+                    %ni = @i + i64 0x1;
+                    goto <f_head @i=%ni>;
+                <f_exit>
+                    return [i64 0x0];
+
+            fn g:
+                <g_entry>
+                    goto <g_call>;
+                <g_call>
+                    call <f>;
+                <g_cont>
+                    return [i64 0];
+            "
+        );
+        let _ = (g, f_head, f_body, f_exit);
+
+        Function::from_id_mut(&mut tc.ctx, f).set_input_regs(vec![input]);
+        Function::from_id_mut(&mut tc.ctx, f).set_pure_reg(true);
+        let ptr = tc.ctx.get_const(0x4000, 8).id();
+        set_call(&mut tc, g_call, f, vec![ptr]);
+        tc.ctx.add_cfg_edge(g_call, g_cont);
+
+        assert!(
+            argpromote(&mut tc.ctx),
+            "a strided nested-offset buffer loop should region-promote"
+        );
+
+        // The callee gains one `[i32; 20]` region snapshot param: element width 4
+        // (the `*4` stride) and 20 elements (the `[0,20)` index bound).
+        let array = Function::from_id(&tc.ctx, f)
+            .root()
+            .and_then(|b| b.params().find_map(|p| tc.ctx.types.array_of(p.type_id())));
+        let (elem_ty, count) = array.expect("callee must gain an Array region param");
+        assert_eq!(
+            tc.ctx.types.size_of(elem_ty),
+            4,
+            "element width is the *4 stride"
+        );
+        assert_eq!(count, 20, "20 elements over the bounded index");
+
+        // No real-ram access survives — the strided store is redirected into shadow.
+        let ram = tc.ctx.default_space;
+        let real_access = Function::from_id(&tc.ctx, f).iter().any(|blk| {
+            blk.iter().any(|i| match i.mnemonic() {
+                Mnemonic::Load(l) => l.space == ram,
+                Mnemonic::Store(s) => s.space == ram,
+                _ => false,
+            })
+        });
+        assert!(
+            !real_access,
+            "the strided buffer write must be functionalized"
+        );
+    }
+
+    /// The **single-block self-loop** shape — the store and the loop guard live in
+    /// one block (the index is that block's own param, and the guard tests the
+    /// *incremented* value at the bottom). This is what a raw-lifted counted loop
+    /// looks like before any rotation, e.g. the Mersenne-Twister state fill. The
+    /// index range must still be recovered (`@i ∈ [0,20)` from the back-edge guard
+    /// on `@i+1 < 20`) so the strided write region-promotes.
+    #[test]
+    fn single_block_self_loop_promotes_as_array_region() {
+        let mut tc = qcode::testing::TestContext::new();
+        let input = stack_input(&mut tc, 4, 8);
+
+        qcode!(
+            tc.ctx,
+            "
+            fn f:
+                <f_entry @stack_10000004:i64>
+                    goto <f_loop @i=i64 0x0>;
+                <f_loop @i:i64>
+                    %s = @i * i64 0x4;
+                    %base = %s + @stack_10000004;
+                    %addr = %base + i64 0x4;
+                    store(%addr, i32 0x7b);
+                    %ni = @i + i64 0x1;
+                    %c = %ni < i64 0x14;
+                    if %c goto <f_loop @i=%ni> else goto <f_exit>;
+                <f_exit>
+                    return [i64 0x0];
+
+            fn g:
+                <g_entry>
+                    goto <g_call>;
+                <g_call>
+                    call <f>;
+                <g_cont>
+                    return [i64 0];
+            "
+        );
+        let _ = (g, f_loop, f_exit);
+
+        Function::from_id_mut(&mut tc.ctx, f).set_input_regs(vec![input]);
+        Function::from_id_mut(&mut tc.ctx, f).set_pure_reg(true);
+        let ptr = tc.ctx.get_const(0x4000, 8).id();
+        set_call(&mut tc, g_call, f, vec![ptr]);
+        tc.ctx.add_cfg_edge(g_call, g_cont);
+
+        assert!(
+            argpromote(&mut tc.ctx),
+            "a single-block self-loop buffer fill should region-promote"
+        );
+
+        let has_array_param = Function::from_id(&tc.ctx, f).root().is_some_and(|b| {
+            b.params()
+                .any(|p| tc.ctx.types.array_of(p.type_id()).is_some())
+        });
+        assert!(
+            has_array_param,
+            "callee must gain an Array region param for the self-loop fill"
+        );
+    }
+
+    /// A written dynamic-index region may coexist with a scalar write to the
+    /// *same base* at a constant offset that is disjoint from the region's span
+    /// (e.g. a `count` field beside an array body). `regions_disjoint` now proves
+    /// the two don't overlap by offset, so the function still takes the full shadow
+    /// path and the region promotes to an `Array` — previously the extra non-frame
+    /// scalar write forced partial mode and no `Array` param was minted.
+    #[test]
+    fn region_coexists_with_disjoint_scalar_write() {
+        let mut tc = qcode::testing::TestContext::new();
+        let input = stack_input(&mut tc, 4, 8);
+
+        qcode!(
+            tc.ctx,
+            "
+            fn f:
+                <f_entry @stack_10000004:i64>
+                    %said = @stack_10000004 + i64 0x40;
+                    store(%said, i32 0xaa);
+                    goto <f_head @i=i64 0x0>;
+                <f_head @i:i64>
+                    %c = @i < i64 0x14;
+                    if %c goto <f_body> else goto <f_exit>;
+                <f_body>
+                    %addr = @stack_10000004 + @i;
+                    %b = load(i8, %addr);
+                    %nb = %b + i8 0x1;
+                    store(%addr, %nb);
+                    %ni = @i + i64 0x1;
+                    goto <f_head @i=%ni>;
+                <f_exit>
+                    return [i64 0x0];
+
+            fn g:
+                <g_entry>
+                    goto <g_call>;
+                <g_call>
+                    call <f>;
+                <g_cont>
+                    return [i64 0];
+            "
+        );
+        let _ = (g, f_head, f_body, f_exit);
+
+        Function::from_id_mut(&mut tc.ctx, f).set_input_regs(vec![input]);
+        Function::from_id_mut(&mut tc.ctx, f).set_pure_reg(true);
+        let ptr = tc.ctx.get_const(0x4000, 8).id();
+        set_call(&mut tc, g_call, f, vec![ptr]);
+        tc.ctx.add_cfg_edge(g_call, g_cont);
+
+        assert!(
+            argpromote(&mut tc.ctx),
+            "the region should still promote alongside a disjoint scalar write"
+        );
+
+        // Full shadow path: no real-ram access survives — including the scalar
+        // write at offset 0x40, which is redirected into the shadow too.
+        let ram = tc.ctx.default_space;
+        let real_access = Function::from_id(&tc.ctx, f).iter().any(|blk| {
+            blk.iter().any(|i| match i.mnemonic() {
+                Mnemonic::Load(l) => l.space == ram,
+                Mnemonic::Store(s) => s.space == ram,
+                _ => false,
+            })
+        });
+        assert!(
+            !real_access,
+            "shadow path: the region and the disjoint scalar are both functionalized"
+        );
+
+        // The region still becomes an `Array`-typed by-value snapshot param.
+        let has_array_param = Function::from_id(&tc.ctx, f).root().is_some_and(|b| {
+            b.params()
+                .any(|p| tc.ctx.types.array_of(p.type_id()).is_some())
+        });
+        assert!(
+            has_array_param,
+            "the coexisting disjoint scalar must not block region→Array promotion"
+        );
+    }
+
     /// Regression for the TEB/PEB orphan bug: a bounded dynamic-index read whose
     /// span exceeds `MAX_REGION_BYTES` (4096) makes `RegionAcc::build()` return
     /// `None` — so NO `Array` snapshot is seeded for it. The folded access must then
@@ -2280,6 +2503,171 @@ mod tests {
             .iter()
             .any(|b| b.iter().any(|i| matches!(i.mnemonic(), Mnemonic::Map(_))));
         assert!(has_map, "f must contain a map");
+    }
+
+    /// A state-init function (MT19937 `init_genrand` shape) writes its buffer
+    /// region through the by-value pointer `@gp_val_0` *and* publishes that pointer
+    /// into a global slot: `store(@gp, @gp_val_0)`. The slot `@gp` is a distinct
+    /// incoming pointer — not a frame slot — so v1 `regions_disjoint` rejected the
+    /// whole function to partial mode. Under `LoadedPointerDisjointFromSlot`, the
+    /// buffer (`*@gp`, the region) is disjoint from the pointer's storage (`@gp`),
+    /// recognized via the `{slot}_val_<off>` snapshot name, so the region promotes.
+    #[test]
+    fn region_promotes_with_coexisting_global_pointer_publish() {
+        use qcode::assumption::Proposition;
+
+        let mut tc = qcode::testing::TestContext::new();
+        let sp_reg = tc.r0;
+
+        qcode!(
+            tc.ctx,
+            "
+            fn f:
+                <f_entry @esp:i64 @gp:i64 @gp_val_0:i64>
+                    store(@gp, @gp_val_0);
+                    goto <f_head @i=i64 0x0>;
+                <f_head @i:i64>
+                    %c = @i < i64 0x14;
+                    if %c goto <f_body> else goto <f_exit>;
+                <f_body>
+                    %addr = @i + @gp_val_0;
+                    %b = load(i8, %addr);
+                    %nb = %b + i8 0x1;
+                    store(%addr, %nb);
+                    %ni = @i + i64 0x1;
+                    goto <f_head @i=%ni>;
+                <f_exit>
+                    return [i64 0x0];
+
+            fn g:
+                <g_entry>
+                    goto <g_call>;
+                <g_call>
+                    call <f>;
+                <g_cont>
+                    return [i64 0];
+            "
+        );
+        let _ = (g, f_head, f_body, f_exit, f_entry);
+
+        let esp_pid = BasicBlock::from_id(&tc.ctx, f_entry)
+            .params()
+            .next()
+            .unwrap()
+            .id();
+        if let ValueId::BlockParam(inner) = esp_pid {
+            tc.ctx.values.block_params[inner].origin = Some(ValueId::Varnode(sp_reg));
+        }
+        Function::from_id_mut(&mut tc.ctx, f).set_pure_reg(true);
+        let espv = tc.ctx.get_const(0x7000, 8).id();
+        let gpv = tc.ctx.get_const(0x454df8, 8).id();
+        let bufp = tc.ctx.get_const(0x9000, 8).id();
+        set_call(&mut tc, g_call, f, vec![espv, gpv, bufp]);
+        tc.ctx.add_cfg_edge(g_call, g_cont);
+
+        // Without the loaded-pointer assumption the global-slot write blocks the
+        // region: it stays on the partial path (no Array param).
+        let array_param = |tc: &qcode::testing::TestContext| {
+            Function::from_id(&tc.ctx, f).root().is_some_and(|b| {
+                b.params()
+                    .any(|p| tc.ctx.types.array_of(p.type_id()).is_some())
+            })
+        };
+
+        tc.ctx
+            .assume_true(Proposition::ArgsDisjointFromCallerFrame(f));
+        tc.ctx
+            .assume_true(Proposition::LoadedPointerDisjointFromSlot(f));
+        assert!(
+            argpromote_with_sp(&mut tc.ctx, Some(sp_reg)),
+            "the region must promote despite the coexisting global-pointer publish"
+        );
+        assert!(
+            array_param(&tc),
+            "the buffer region became an Array input (shadow path, not partial)"
+        );
+    }
+
+    /// Faithful reproduction of MT19937 `init_genrand` (40b3d0): a **write-only**
+    /// strided region `*(buf + i*4 + 4)` with a **loop-carried** stored value, plus
+    /// the `mt[0]` index and `mt[1]` seed scalar writes, plus the global-pointer
+    /// publish and the caller-frame retaddr/arg writes. Used to pin down which gate
+    /// keeps it on the partial path.
+    #[test]
+    fn mt_init_genrand_shape_promotes() {
+        use qcode::assumption::Proposition;
+
+        let mut tc = qcode::testing::TestContext::new();
+        let sp_reg = tc.r0;
+
+        qcode!(
+            tc.ctx,
+            "
+            fn f:
+                <f_entry @esp:i32 @gp:i32 @esp_val_0:i32 @esp_val_4:i32 @gp_val_0:i32>
+                    store(@esp, @esp_val_0);
+                    %a4 = @esp + i32 0x4;
+                    store(%a4, @esp_val_4);
+                    store(@gp, @gp_val_0);
+                    %seed = @gp_val_0 + i32 0x4;
+                    store(%seed, @esp_val_4);
+                    goto <f_head @ebx=@esp_val_4 @i=i32 0x1>;
+                <f_head @ebx:i32 @i:i32>
+                    %v = @ebx + @i;
+                    %off = @i * i32 0x4;
+                    %a = %off + @gp_val_0;
+                    %addr = %a + i32 0x4;
+                    store(%addr, %v);
+                    %ni = @i + i32 0x1;
+                    %c = %ni < i32 0x270;
+                    if %c goto <f_head @ebx=%v @i=%ni> else goto <f_exit>;
+                <f_exit>
+                    store(@gp_val_0, i32 0x270);
+                    %r = pack(EAX=@esp_val_4);
+                    return [@esp_val_0];
+
+            fn g:
+                <g_entry>
+                    goto <g_call>;
+                <g_call>
+                    call <f>;
+                <g_cont>
+                    return [i32 0];
+            "
+        );
+        let _ = (g, f_head, f_exit, f_entry);
+
+        let esp_pid = BasicBlock::from_id(&tc.ctx, f_entry)
+            .params()
+            .next()
+            .unwrap()
+            .id();
+        if let ValueId::BlockParam(inner) = esp_pid {
+            tc.ctx.values.block_params[inner].origin = Some(ValueId::Varnode(sp_reg));
+        }
+        Function::from_id_mut(&mut tc.ctx, f).set_pure_reg(true);
+        let espv = tc.ctx.get_const(0x7000, 4).id();
+        let gpv = tc.ctx.get_const(0x454df8, 4).id();
+        let v0 = tc.ctx.get_const(0x10, 4).id();
+        let v4 = tc.ctx.get_const(0x20, 4).id();
+        let bufp = tc.ctx.get_const(0x9000, 4).id();
+        set_call(&mut tc, g_call, f, vec![espv, gpv, v0, v4, bufp]);
+        tc.ctx.add_cfg_edge(g_call, g_cont);
+
+        tc.ctx
+            .assume_true(Proposition::ArgsDisjointFromCallerFrame(f));
+        tc.ctx
+            .assume_true(Proposition::LoadedPointerDisjointFromSlot(f));
+        argpromote_with_sp(&mut tc.ctx, Some(sp_reg));
+
+        let array_param = Function::from_id(&tc.ctx, f).root().is_some_and(|b| {
+            b.params()
+                .any(|p| tc.ctx.types.array_of(p.type_id()).is_some())
+        });
+        assert!(
+            array_param,
+            "the MT buffer region must promote to an Array input"
+        );
     }
 
     /// End to end: step-1 region promotion then the loop-to-map recognizer turns

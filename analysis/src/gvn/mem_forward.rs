@@ -508,8 +508,7 @@ impl MemForward {
                 return false;
             }
             let Some(a) = aliases else { return false };
-            a.is_own_frame_local(bv)
-                && escaping.iter().all(|&p| a.provably_disjoint(ctx, p, bv))
+            a.is_own_frame_local(bv) && escaping.iter().all(|&p| a.provably_disjoint(ctx, p, bv))
         };
 
         self.byte_map.retain(|&(base, off), _| {
@@ -831,8 +830,13 @@ mod tests {
         // A plain caller-frame `@SP - 4` cell, for contrast: its base is the `@SP`
         // param (classified CallerFrame), so it is not own-frame-private.
         let caller_slot = Base::Symbolic(ram, sp);
-        mf.byte_map
-            .insert((caller_slot, -4), Cell { src: val, src_off: 0 });
+        mf.byte_map.insert(
+            (caller_slot, -4),
+            Cell {
+                src: val,
+                src_off: 0,
+            },
+        );
 
         let realigned = Base::Symbolic(ram, aligned);
         assert!(

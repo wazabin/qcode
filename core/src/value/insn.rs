@@ -32,6 +32,7 @@ mod map;
 mod memory;
 mod mnemonic;
 mod pcode_op;
+mod scan;
 mod terminator;
 mod unop;
 
@@ -48,6 +49,7 @@ pub use map::Map;
 pub use memory::{Load, Store};
 pub use mnemonic::Mnemonic;
 pub use pcode_op::{PCodeOp, PCodeOpId};
+pub use scan::Scan;
 pub use terminator::{Branch, BranchInd, CBranch, Call, CallInd, Return};
 pub use unop::{Unary, Unop};
 

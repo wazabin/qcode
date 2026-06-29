@@ -62,7 +62,7 @@ use crate::{Pass, PipelineEnv};
 
 /// Instruction-node budget for an inlinable output expression (literals and
 /// input params are free; shared nodes are counted once).
-const MAX_INLINE_INSNS: usize = 3;
+const MAX_INLINE_INSNS: usize = 10;
 
 /// Move every eligible cheap output of every `pure_reg` function back to its
 /// callers. Returns `true` if anything changed. Removal of the now-dead returned
@@ -102,6 +102,10 @@ fn is_pure_dataop(m: &Mnemonic) -> bool {
             // `body <$> arr` project to `body <$> arg` at each caller, which
             // `ArrayProject` then reduces to `body(arr[k])`.
             | Mnemonic::Map(_)
+            // A `scan` is likewise a pure function of its `init`/`src`/`captures`
+            // (the `body` symbol is cloned verbatim), so a returned scan can carry
+            // across the inline to where its source/init may become constant.
+            | Mnemonic::Scan(_)
             // A pure intrinsic (`rol`, `ror`, `enumerate`) is categorically a pure
             // function of its operands. Allowing it lets a returned
             // `body <$> enumerate(arr)` carry its `enumerate(arr)` source across

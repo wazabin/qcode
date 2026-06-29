@@ -6,8 +6,8 @@ use crate::{
         insn::{
             Assert, Binary, Branch, BranchInd, CBranch, Call, CallInd, Carry, Extract,
             FloatToFloat, FloatToInt, Gep, IntToFloat, IntrinsicApp, IsFloatNaN, Load, LzCount,
-            Map, PCodeOp, PopCount, Range, Return, SBorrow, SCarry, Sext, Store, Tuple, Unary,
-            Zext,
+            Map, PCodeOp, PopCount, Range, Return, SBorrow, SCarry, Scan, Sext, Store, Tuple,
+            Unary, Zext,
         },
     },
 };
@@ -121,6 +121,9 @@ pub enum Mnemonic {
     Gep(Gep),
     /// Total element-wise map over an array value (a projectable loop).
     Map(Map),
+    /// Total left-scan (prefix fold) over an array value: a projectable loop
+    /// whose per-element write depends on the previous iteration's result.
+    Scan(Scan),
 }
 
 impl Mnemonic {
@@ -155,6 +158,7 @@ impl Mnemonic {
             Mnemonic::Extract(m) => m,
             Mnemonic::Gep(m) => m,
             Mnemonic::Map(m) => m,
+            Mnemonic::Scan(m) => m,
         }
     }
 
@@ -189,6 +193,7 @@ impl Mnemonic {
         match self {
             Mnemonic::Call(call) => Some(call.target),
             Mnemonic::Map(map) => Some(map.body),
+            Mnemonic::Scan(scan) => Some(scan.body),
             _ => None,
         }
     }
@@ -396,6 +401,20 @@ impl Mnemonic {
             }
             Mnemonic::Map(m) => {
                 // `body` is a function symbol, not a value operand — left intact.
+                if m.src == old {
+                    m.src = new;
+                }
+                m.captures.iter_mut().for_each(|a| {
+                    if *a == old {
+                        *a = new;
+                    }
+                });
+            }
+            Mnemonic::Scan(m) => {
+                // `body` is a function symbol, not a value operand — left intact.
+                if m.init == old {
+                    m.init = new;
+                }
                 if m.src == old {
                     m.src = new;
                 }

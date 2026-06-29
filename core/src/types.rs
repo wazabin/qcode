@@ -74,6 +74,17 @@ pub trait Type: Send + Sync {
         None
     }
 
+    /// The `(elem, bound)` pair, if this is a [`ListType`] — a variable-length
+    /// sequence whose `bound` is the static element upper bound (`Some(n)`) or
+    /// `None` when unbounded (a pointer-sourced string). Returns `None` (the outer
+    /// option) for every non-list type. This is the discriminator that tells a
+    /// *list* (`take_while`'s result) from a fixed-length [`array`](Type::array):
+    /// both look like width-N scalars structurally, but a list's length is not
+    /// statically known.
+    fn list(&self) -> Option<(TypeId, Option<usize>)> {
+        None
+    }
+
     /// Clones this type into a fresh boxed trait object.
     ///
     /// This enables `Clone for Box<dyn Type>` (and hence `Clone` for
@@ -141,6 +152,19 @@ pub enum TypeRepr {
     Array {
         elem: TypeId,
         count: usize,
+    },
+    /// A variable-length homogeneous sequence of `elem` — the result of
+    /// [`take_while`](crate::intrinsics). `bound` is the static storage upper bound
+    /// in elements (`Some(n)` for a `take_while` over a fixed `[T; n]` array), or
+    /// `None` when the source is an unbounded pointer (a `char*` string of unknown
+    /// length). Like [`Array`](TypeRepr::Array) a *bounded* list is disguised as a
+    /// width-N scalar (its `size` is the `bound` footprint); an *unbounded* list has
+    /// no materialized footprint (`size` 0) — it is a handle consumed only by
+    /// `len`/`map`, never stored. Only [`Type::list`] tells either apart from a
+    /// fixed array; the runtime length is the position of the first failing element.
+    List {
+        elem: TypeId,
+        bound: Option<usize>,
     },
 }
 
@@ -370,6 +394,39 @@ impl Type for ArrayType {
     }
 }
 
+/// A variable-length homogeneous sequence — see [`TypeRepr::List`]. `bound` is the
+/// static element upper bound (`Some`) or `None` when unbounded; `size` is the
+/// `bound`-element footprint for a bounded list and 0 for an unbounded one (it has
+/// no materialized storage). Structurally a bounded list is indistinguishable from
+/// a width-`size` scalar; only [`Type::list`] recovers `(elem, bound)`.
+#[derive(Clone)]
+struct ListType {
+    elem: TypeId,
+    bound: Option<usize>,
+    size: usize,
+}
+
+impl Type for ListType {
+    fn size(&self) -> usize {
+        self.size
+    }
+
+    fn list(&self) -> Option<(TypeId, Option<usize>)> {
+        Some((self.elem, self.bound))
+    }
+
+    fn clone_box(&self) -> Box<dyn Type> {
+        Box::new(self.clone())
+    }
+
+    fn repr(&self) -> TypeRepr {
+        TypeRepr::List {
+            elem: self.elem,
+            bound: self.bound,
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // TypeManager
 // ---------------------------------------------------------------------------
@@ -394,6 +451,8 @@ pub struct TypeManager {
     struct_pointer: HashMap<(usize, TypeId), TypeId>,
     /// Fast lookup: (elem, count) → Array TypeId.
     array_by_elem_count: HashMap<(TypeId, usize), TypeId>,
+    /// Fast lookup: (elem, bound) → List TypeId (`bound` `None` = unbounded).
+    list_by_elem_bound: HashMap<(TypeId, Option<usize>), TypeId>,
 }
 
 impl Default for TypeManager {
@@ -412,6 +471,7 @@ impl TypeManager {
             struct_by_name: HashMap::default(),
             struct_pointer: HashMap::default(),
             array_by_elem_count: HashMap::default(),
+            list_by_elem_bound: HashMap::default(),
         }
     }
 
@@ -538,6 +598,70 @@ impl TypeManager {
         self.get(id).array()
     }
 
+    /// Returns the [`TypeId`] for a *bounded* [`ListType`] — a variable-length
+    /// sequence of at most `bound` elements of type `elem` — creating it if it does
+    /// not yet exist. `elem` must already be registered. For a pointer-sourced
+    /// string of unknown length, see [`get_or_make_unbounded_list`].
+    ///
+    /// [`get_or_make_unbounded_list`]: Self::get_or_make_unbounded_list
+    pub fn get_or_make_list(&mut self, elem: TypeId, bound: usize) -> TypeId {
+        self.get_or_make_list_opt(elem, Some(bound))
+    }
+
+    /// Returns the [`TypeId`] for an *unbounded* [`ListType`] of `elem` — a string
+    /// of unknown length (a `char*`), with no static footprint (`size` 0).
+    pub fn get_or_make_unbounded_list(&mut self, elem: TypeId) -> TypeId {
+        self.get_or_make_list_opt(elem, None)
+    }
+
+    /// Shared constructor for bounded (`Some`) and unbounded (`None`) lists.
+    fn get_or_make_list_opt(&mut self, elem: TypeId, bound: Option<usize>) -> TypeId {
+        if let Some(&id) = self.list_by_elem_bound.get(&(elem, bound)) {
+            return id;
+        }
+        // A bounded list footprints its `bound` elements; an unbounded one is a
+        // handle with no materialized storage (size 0).
+        let size = bound.map_or(0, |b| self.size_of(elem) * b);
+        let id = self.register(Box::new(ListType { elem, bound, size }));
+        self.list_by_elem_bound.insert((elem, bound), id);
+        id
+    }
+
+    /// The `(elem, bound)` of `id`, if `id` is a [`ListType`]; `bound` is `None`
+    /// for an unbounded (pointer-sourced) list.
+    pub fn list_of(&self, id: TypeId) -> Option<(TypeId, Option<usize>)> {
+        self.get(id).list()
+    }
+
+    /// Unified view of any *sequence* type — a fixed [`array`](Type::array) or a
+    /// variable-length [`list`](Type::list) — as `(elem, len, is_list)`, where
+    /// `len` is the count (array) or bound (list). `None` for non-sequences. This
+    /// is what lets `map`/`enumerate`/`take_while` operate on either kind: read
+    /// the operand with `seq_of`, rebuild the result with
+    /// [`get_or_make_seq`](Self::get_or_make_seq) preserving the kind.
+    pub fn seq_of(&self, id: TypeId) -> Option<(TypeId, usize, bool)> {
+        if let Some((elem, count)) = self.array_of(id) {
+            return Some((elem, count, false));
+        }
+        // Only a *bounded* list reports a static length for seq-preserving rebuilds
+        // (`map`/`enumerate`); an unbounded pointer-sourced list declines here.
+        if let Some((elem, Some(bound))) = self.list_of(id) {
+            return Some((elem, bound, true));
+        }
+        None
+    }
+
+    /// Build the sequence type of the given kind: a [`List`](Self::get_or_make_list)
+    /// when `is_list`, else a fixed [`Array`](Self::get_or_make_array). The inverse
+    /// of [`seq_of`](Self::seq_of).
+    pub fn get_or_make_seq(&mut self, elem: TypeId, len: usize, is_list: bool) -> TypeId {
+        if is_list {
+            self.get_or_make_list(elem, len)
+        } else {
+            self.get_or_make_array(elem, len)
+        }
+    }
+
     /// A short display name for `id`, used by the IR formatters in place of the
     /// raw `i<bits>` width. Nominal structs print their name and struct pointers
     /// print `Pointee*`; everything else (integers, stack/space addresses, and
@@ -548,6 +672,10 @@ impl TypeManager {
             TypeRepr::Struct { name, .. } => name,
             TypeRepr::StructPointer { pointee, .. } => format!("{}*", self.type_name(pointee)),
             TypeRepr::Array { elem, count } => format!("[{};{}]", self.type_name(elem), count),
+            TypeRepr::List { elem, bound } => match bound {
+                Some(b) => format!("[{};<={}]", self.type_name(elem), b),
+                None => format!("[{};*]", self.type_name(elem)),
+            },
             _ => format!("i{}", self.size_of(id) * 8),
         }
     }
@@ -687,6 +815,42 @@ mod tests {
         assert_eq!(back.array_of(arr), Some((i8, 20)));
         assert_eq!(back.size_of(arr), 20);
     }
+
+    #[test]
+    fn list_round_trips_through_serde() {
+        let mut tm = TypeManager::new();
+        let i8 = tm.get_or_make_int(1);
+        let list = tm.get_or_make_list(i8, 20);
+
+        let config = bincode::config::standard();
+        let bytes = bincode::serde::encode_to_vec(&tm, config).unwrap();
+        let (back, _): (TypeManager, _) =
+            bincode::serde::decode_from_slice(&bytes, config).unwrap();
+        // The list survives as a list (not a fixed array) with its bound and
+        // footprint intact.
+        assert_eq!(back.list_of(list), Some((i8, Some(20))));
+        assert_eq!(back.array_of(list), None);
+        assert_eq!(back.size_of(list), 20);
+    }
+
+    #[test]
+    fn unbounded_list_round_trips_and_has_no_footprint() {
+        let mut tm = TypeManager::new();
+        let i8 = tm.get_or_make_int(1);
+        let list = tm.get_or_make_unbounded_list(i8);
+        // Unbounded: a list with no static bound and no materialized footprint.
+        assert_eq!(tm.list_of(list), Some((i8, None)));
+        assert_eq!(tm.size_of(list), 0);
+        // Distinct from any bounded list of the same element.
+        assert_ne!(list, tm.get_or_make_list(i8, 20));
+
+        let config = bincode::config::standard();
+        let bytes = bincode::serde::encode_to_vec(&tm, config).unwrap();
+        let (back, _): (TypeManager, _) =
+            bincode::serde::decode_from_slice(&bytes, config).unwrap();
+        assert_eq!(back.list_of(list), Some((i8, None)));
+        assert_eq!(back.array_of(list), None);
+    }
 }
 
 impl<'de> serde::Deserialize<'de> for TypeManager {
@@ -719,6 +883,16 @@ impl<'de> serde::Deserialize<'de> for TypeManager {
                 TypeRepr::Array { elem, count } => {
                     manager.get_or_make_array(elem, count);
                 }
+                // The element type has a lower TypeId (built before the list),
+                // so replaying in order guarantees it already exists here.
+                TypeRepr::List { elem, bound } => match bound {
+                    Some(b) => {
+                        manager.get_or_make_list(elem, b);
+                    }
+                    None => {
+                        manager.get_or_make_unbounded_list(elem);
+                    }
+                },
             }
         }
         Ok(manager)
