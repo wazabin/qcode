@@ -23,24 +23,33 @@ use qcode::{
     },
 };
 
+use std::any::Any;
+
 use super::affine::{NormalForm, Numbering, arith_form, key_for, materialize};
 use super::walk::{Claim, Editor, InsnCtx, SubPass};
 
 pub(super) struct Cse;
 
 impl SubPass for Cse {
-    type State = Numbering;
+    fn init_state(&self) -> Box<dyn Any> {
+        Box::new(Numbering::default())
+    }
+
+    fn clone_state(&self, state: &dyn Any) -> Box<dyn Any> {
+        Box::new(state.downcast_ref::<Numbering>().expect("cse state").clone())
+    }
 
     fn on_block_entry(
         &self,
         _ctx: &mut Context,
-        state: &mut Numbering,
+        state: &mut dyn Any,
         _block_id: qcode::value::block::BlockId,
         _tree: &jstd::graph::analysis::DominatorTree<qcode::value::block::BlockId>,
         _aliases: Option<&crate::AliasResult>,
         _numbering: &Numbering,
         is_shared: bool,
     ) {
+        let state = state.downcast_mut::<Numbering>().expect("cse state");
         // A block reachable from more than one walk root has invalid inherited
         // dominance claims: a leader from a per-entry dominator-tree ancestor
         // need not actually dominate it, so forwarding to (or materializing
@@ -53,13 +62,14 @@ impl SubPass for Cse {
     fn on_insn(
         &self,
         ctx: &mut Context,
-        state: &mut Self::State,
+        state: &mut dyn Any,
         ic: &InsnCtx,
         ed: &mut Editor,
     ) -> Claim {
         if ic.mnemonic.is_terminator() || ic.size == 0 {
             return Claim::Pass;
         }
+        let state = state.downcast_mut::<Numbering>().expect("cse state");
 
         // Arithmetic view (used to compose consumers) and the value-numbering key.
         let form = arith_form(ctx, ic.id, ic.mnemonic, ic.size, state);

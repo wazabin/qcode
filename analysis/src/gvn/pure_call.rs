@@ -29,6 +29,8 @@ use qcode_emulator::{SizedValue, StandaloneEmulator};
 use crate::calls::{project_return, return_field};
 
 use super::fold::const_value;
+use std::any::Any;
+
 use super::walk::{Claim, Editor, InsnCtx, SubPass};
 
 /// Upper bound on emulated instructions per harvested field. Pure functions are
@@ -40,9 +42,15 @@ const STEP_BUDGET: usize = 100_000;
 pub(super) struct PureCall;
 
 impl SubPass for PureCall {
-    type State = ();
+    fn init_state(&self) -> Box<dyn Any> {
+        Box::new(())
+    }
 
-    fn on_insn(&self, ctx: &mut Context, _state: &mut (), ic: &InsnCtx, ed: &mut Editor) -> Claim {
+    fn clone_state(&self, _state: &dyn Any) -> Box<dyn Any> {
+        Box::new(())
+    }
+
+    fn on_insn(&self, ctx: &mut Context, _state: &mut dyn Any, ic: &InsnCtx, ed: &mut Editor) -> Claim {
         let Mnemonic::Extract(Extract { agg, index }) = *ic.mnemonic else {
             return Claim::Pass;
         };

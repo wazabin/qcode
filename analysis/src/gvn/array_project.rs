@@ -31,14 +31,22 @@ use qcode::{
 
 use crate::calls::inline_pure_body;
 
+use std::any::Any;
+
 use super::walk::{Claim, Editor, InsnCtx, SubPass};
 
 pub(super) struct ArrayProject;
 
 impl SubPass for ArrayProject {
-    type State = ();
+    fn init_state(&self) -> Box<dyn Any> {
+        Box::new(())
+    }
 
-    fn on_insn(&self, ctx: &mut Context, _state: &mut (), ic: &InsnCtx, ed: &mut Editor) -> Claim {
+    fn clone_state(&self, _state: &dyn Any) -> Box<dyn Any> {
+        Box::new(())
+    }
+
+    fn on_insn(&self, ctx: &mut Context, _state: &mut dyn Any, ic: &InsnCtx, ed: &mut Editor) -> Claim {
         match *ic.mnemonic {
             Mnemonic::Range(Range { src, start, size }) => {
                 self.project_range(ctx, ic, ed, src, start, size)

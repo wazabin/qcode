@@ -15,24 +15,33 @@ use qcode::{
 };
 
 use super::affine::Numbering;
+use std::any::Any;
+
 use super::mem_forward::MemForward;
 use super::walk::{Claim, Editor, InsnCtx, SubPass};
 
 pub(super) struct MemoryForwarding;
 
 impl SubPass for MemoryForwarding {
-    type State = MemForward;
+    fn init_state(&self) -> Box<dyn Any> {
+        Box::new(MemForward::default())
+    }
+
+    fn clone_state(&self, state: &dyn Any) -> Box<dyn Any> {
+        Box::new(state.downcast_ref::<MemForward>().expect("memory state").clone())
+    }
 
     fn on_block_entry(
         &self,
         ctx: &mut Context,
-        state: &mut MemForward,
+        state: &mut dyn Any,
         block_id: BlockId,
         tree: &DominatorTree<BlockId>,
         aliases: Option<&AliasResult>,
         numbering: &Numbering,
         is_shared: bool,
     ) {
+        let state = state.downcast_mut::<MemForward>().expect("memory state");
         if is_shared {
             state.clear();
         }
@@ -42,10 +51,11 @@ impl SubPass for MemoryForwarding {
     fn on_insn(
         &self,
         ctx: &mut Context,
-        state: &mut MemForward,
+        state: &mut dyn Any,
         ic: &InsnCtx,
         ed: &mut Editor,
     ) -> Claim {
+        let state = state.downcast_mut::<MemForward>().expect("memory state");
         match ic.mnemonic {
             Mnemonic::Store(store) => {
                 state.record_store(ctx, store, ic.aliases, ic.numbering);
@@ -72,11 +82,12 @@ impl SubPass for MemoryForwarding {
     fn after_block(
         &self,
         ctx: &Context,
-        state: &mut MemForward,
+        state: &mut dyn Any,
         block_id: BlockId,
         aliases: Option<&AliasResult>,
         _numbering: &Numbering,
     ) {
+        let state = state.downcast_mut::<MemForward>().expect("memory state");
         state.prune_clobbered_by_call(ctx, block_id, aliases);
     }
 }

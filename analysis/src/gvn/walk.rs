@@ -7,6 +7,8 @@
 //! own the block iteration and the dominator-tree state threading, so adding a
 //! new sub-pass never touches the walk or the other sub-passes.
 
+use std::any::Any;
+
 use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
 
 use jstd::graph::analysis::{DominatorTree, compute_dominators};
@@ -98,11 +100,21 @@ impl Editor {
     }
 }
 
-/// One composable concern of the GVN pipeline.
+/// One composable concern of the GVN pipeline. Sub-passes are held as a
+/// `&[Box<dyn SubPass>]` array and tried in order until one returns
+/// [`Claim::Done`]. Per-sub-pass state is type-erased as `Box<dyn Any>`: each
+/// pass mints it in [`SubPass::init_state`], clones it down the dominator tree
+/// in [`SubPass::clone_state`], and downcasts it in the visit hooks.
 pub(super) trait SubPass {
-    /// Per-walk state, cloned down the dominator tree (a value available in a
-    /// dominator is available in every block it dominates).
-    type State: Clone + Default;
+    /// Fresh per-walk state, cloned down the dominator tree (a value available
+    /// in a dominator is available in every block it dominates). Stateless
+    /// sub-passes return `Box::new(())`.
+    fn init_state(&self) -> Box<dyn Any>;
+
+    /// Clone this pass's own state for a dominated child. The pass clones it
+    /// (rather than a blanket `dyn` clone) because returning `Box<dyn Any>` from
+    /// a `&self`-only method would tie the clone to the borrow's lifetime.
+    fn clone_state(&self, state: &dyn Any) -> Box<dyn Any>;
 
     /// Called once per block before its instructions. `is_shared` marks blocks
     /// reachable from more than one walk entry, whose inherited dominance
@@ -110,7 +122,7 @@ pub(super) trait SubPass {
     fn on_block_entry(
         &self,
         _ctx: &mut Context,
-        _state: &mut Self::State,
+        _state: &mut dyn Any,
         _block_id: BlockId,
         _tree: &DominatorTree<BlockId>,
         _aliases: Option<&AliasResult>,
@@ -120,19 +132,13 @@ pub(super) trait SubPass {
     }
 
     /// Visit one instruction. Rewrites go through `ed`.
-    fn on_insn(
-        &self,
-        ctx: &mut Context,
-        state: &mut Self::State,
-        ic: &InsnCtx,
-        ed: &mut Editor,
-    ) -> Claim;
+    fn on_insn(&self, ctx: &mut Context, state: &mut dyn Any, ic: &InsnCtx, ed: &mut Editor) -> Claim;
 
     /// Called after the block's instructions, before its dominated children.
     fn after_block(
         &self,
         _ctx: &Context,
-        _state: &mut Self::State,
+        _state: &mut dyn Any,
         _block_id: BlockId,
         _aliases: Option<&AliasResult>,
         _numbering: &Numbering,
@@ -140,87 +146,15 @@ pub(super) trait SubPass {
     }
 }
 
-/// A statically composed list of sub-passes (implemented for tuples below).
-pub(super) trait SubPasses {
-    type States: Clone + Default;
-
-    fn on_block_entry(
-        &self,
-        ctx: &mut Context,
-        states: &mut Self::States,
-        block_id: BlockId,
-        tree: &DominatorTree<BlockId>,
-        aliases: Option<&AliasResult>,
-        numbering: &Numbering,
-        is_shared: bool,
-    );
-
-    /// Try each member in order; the first [`Claim::Done`] wins.
-    fn on_insn(&self, ctx: &mut Context, states: &mut Self::States, ic: &InsnCtx, ed: &mut Editor);
-
-    fn after_block(
-        &self,
-        ctx: &Context,
-        states: &mut Self::States,
-        block_id: BlockId,
-        aliases: Option<&AliasResult>,
-        numbering: &Numbering,
-    );
+/// One fresh erased state slot per sub-pass, in array order.
+fn init_states(passes: &[Box<dyn SubPass>]) -> Vec<Box<dyn Any>> {
+    passes.iter().map(|p| p.init_state()).collect()
 }
 
-macro_rules! impl_sub_passes {
-    ($($P:ident . $idx:tt),+) => {
-        impl<$($P: SubPass),+> SubPasses for ($($P,)+) {
-            type States = ($($P::State,)+);
-
-            fn on_block_entry(
-                &self,
-                ctx: &mut Context,
-                states: &mut Self::States,
-                block_id: BlockId,
-                tree: &DominatorTree<BlockId>,
-                aliases: Option<&AliasResult>,
-                numbering: &Numbering,
-                is_shared: bool,
-            ) {
-                $(self.$idx.on_block_entry(ctx, &mut states.$idx, block_id, tree, aliases, numbering, is_shared);)+
-            }
-
-            fn on_insn(
-                &self,
-                ctx: &mut Context,
-                states: &mut Self::States,
-                ic: &InsnCtx,
-                ed: &mut Editor,
-            ) {
-                $(if let Claim::Done = self.$idx.on_insn(ctx, &mut states.$idx, ic, ed) {
-                    return;
-                })+
-            }
-
-            fn after_block(
-                &self,
-                ctx: &Context,
-                states: &mut Self::States,
-                block_id: BlockId,
-                aliases: Option<&AliasResult>,
-                numbering: &Numbering,
-            ) {
-                $(self.$idx.after_block(ctx, &mut states.$idx, block_id, aliases, numbering);)+
-            }
-        }
-    };
+/// Clone a state vector for a dominated child, each pass cloning its own slot.
+fn clone_states(passes: &[Box<dyn SubPass>], states: &[Box<dyn Any>]) -> Vec<Box<dyn Any>> {
+    passes.iter().zip(states).map(|(p, s)| p.clone_state(s.as_ref())).collect()
 }
-
-impl_sub_passes!(A.0);
-impl_sub_passes!(A.0, B.1);
-impl_sub_passes!(A.0, B.1, C.2);
-impl_sub_passes!(A.0, B.1, C.2, D.3);
-impl_sub_passes!(A.0, B.1, C.2, D.3, E.4);
-impl_sub_passes!(A.0, B.1, C.2, D.3, E.4, F.5);
-impl_sub_passes!(A.0, B.1, C.2, D.3, E.4, F.5, G.6);
-impl_sub_passes!(A.0, B.1, C.2, D.3, E.4, F.5, G.6, H.7);
-impl_sub_passes!(A.0, B.1, C.2, D.3, E.4, F.5, G.6, H.7, I.8);
 
 // ---------------------------------------------------------------------------
 // Drivers
@@ -228,11 +162,11 @@ impl_sub_passes!(A.0, B.1, C.2, D.3, E.4, F.5, G.6, H.7, I.8);
 
 /// Run the sub-pass chain over every instruction of `block_id`, then drop the
 /// instructions it made redundant. Returns whether anything was rewritten.
-fn run_block<P: SubPasses>(
+fn run_block(
     ctx: &mut Context,
     block_id: BlockId,
-    passes: &P,
-    states: &mut P::States,
+    passes: &[Box<dyn SubPass>],
+    states: &mut [Box<dyn Any>],
     aliases: Option<&AliasResult>,
     numbering: &Numbering,
 ) -> bool {
@@ -255,7 +189,12 @@ fn run_block<P: SubPasses>(
             aliases,
             numbering,
         };
-        passes.on_insn(ctx, states, &ic, &mut ed);
+        // Try each sub-pass in array order; the first `Done` claims the insn.
+        for (pass, state) in passes.iter().zip(states.iter_mut()) {
+            if let Claim::Done = pass.on_insn(ctx, state.as_mut(), &ic, &mut ed) {
+                break;
+            }
+        }
     }
 
     ed.finish(ctx, block_id)
@@ -263,32 +202,26 @@ fn run_block<P: SubPasses>(
 
 /// Run the sub-passes over a single block with fresh state and no block-boundary
 /// hooks (no dominator tree exists for a lone block).
-pub(super) fn run_single_block<P: SubPasses>(
+pub(super) fn run_single_block(
     ctx: &mut Context,
     block_id: BlockId,
-    passes: &P,
+    passes: &[Box<dyn SubPass>],
     aliases: Option<&AliasResult>,
 ) -> bool {
     // No function context for a lone block: memory forwarding falls back to
     // degenerate per-pointer bases (exact-match only).
     let numbering = Numbering::default();
-    run_block(
-        ctx,
-        block_id,
-        passes,
-        &mut P::States::default(),
-        aliases,
-        &numbering,
-    )
+    let mut states = init_states(passes);
+    run_block(ctx, block_id, passes, &mut states, aliases, &numbering)
 }
 
 /// Iterate the sub-passes over every block of `func_id` in flat order with
 /// fresh per-block state, repeating until a full sweep changes nothing. No
 /// block-boundary hooks run. Returns whether anything changed.
-pub(super) fn run_flat_fixpoint<P: SubPasses>(
+pub(super) fn run_flat_fixpoint(
     ctx: &mut Context,
     func_id: FunctionId,
-    passes: &P,
+    passes: &[Box<dyn SubPass>],
 ) -> bool {
     let block_ids: Vec<BlockId> = Function::from_id(ctx, func_id)
         .iter()
@@ -300,14 +233,8 @@ pub(super) fn run_flat_fixpoint<P: SubPasses>(
     loop {
         let mut changed = false;
         for &block_id in &block_ids {
-            changed |= run_block(
-                ctx,
-                block_id,
-                passes,
-                &mut P::States::default(),
-                None,
-                &numbering,
-            );
+            let mut states = init_states(passes);
+            changed |= run_block(ctx, block_id, passes, &mut states, None, &numbering);
         }
         changed_any |= changed;
         if !changed {
@@ -318,8 +245,8 @@ pub(super) fn run_flat_fixpoint<P: SubPasses>(
 }
 
 /// The per-entry invariants of one dominator-tree walk.
-struct Walk<'a, P: SubPasses> {
-    passes: &'a P,
+struct Walk<'a> {
+    passes: &'a [Box<dyn SubPass>],
     func_id: FunctionId,
     tree: &'a DominatorTree<BlockId>,
     aliases: Option<&'a AliasResult>,
@@ -328,8 +255,8 @@ struct Walk<'a, P: SubPasses> {
     changed: bool,
 }
 
-impl<P: SubPasses> Walk<'_, P> {
-    fn rec(&mut self, ctx: &mut Context, block_id: BlockId, inherited: &P::States) {
+impl Walk<'_> {
+    fn rec(&mut self, ctx: &mut Context, block_id: BlockId, inherited: &[Box<dyn Any>]) {
         // Stay inside the function being processed. A tail-call edge is a real CFG
         // edge, so the dominator tree can reach blocks owned by the callee — but
         // the per-function alias oracle does not describe them, and following a
@@ -349,16 +276,19 @@ impl<P: SubPasses> Walk<'_, P> {
             }
             return;
         }
-        let mut states = inherited.clone();
-        self.passes.on_block_entry(
-            ctx,
-            &mut states,
-            block_id,
-            self.tree,
-            self.aliases,
-            self.numbering,
-            self.shared.contains(&block_id),
-        );
+        let mut states = clone_states(self.passes, inherited);
+        let is_shared = self.shared.contains(&block_id);
+        for (pass, state) in self.passes.iter().zip(states.iter_mut()) {
+            pass.on_block_entry(
+                ctx,
+                state.as_mut(),
+                block_id,
+                self.tree,
+                self.aliases,
+                self.numbering,
+                is_shared,
+            );
+        }
         self.changed |= run_block(
             ctx,
             block_id,
@@ -367,8 +297,9 @@ impl<P: SubPasses> Walk<'_, P> {
             self.aliases,
             self.numbering,
         );
-        self.passes
-            .after_block(ctx, &mut states, block_id, self.aliases, self.numbering);
+        for (pass, state) in self.passes.iter().zip(states.iter_mut()) {
+            pass.after_block(ctx, state.as_mut(), block_id, self.aliases, self.numbering);
+        }
         for &child in self.tree.children_of(block_id) {
             self.rec(ctx, child, &states);
         }
@@ -405,10 +336,10 @@ fn reachable_from(ctx: &Context, entry: BlockId) -> HashSet<BlockId> {
 /// [`SubPass::on_block_entry`]: each walk's dominator tree only sees its own
 /// entry's edges, so its dominance claims are invalid for blocks the other
 /// entries can also reach.
-pub(super) fn run_dominator_walk<P: SubPasses>(
+pub(super) fn run_dominator_walk(
     ctx: &mut Context,
     func_id: FunctionId,
-    passes: &P,
+    passes: &[Box<dyn SubPass>],
     aliases: Option<&AliasResult>,
 ) -> bool {
     let root = match ctx.values.functions[func_id].root {
@@ -451,7 +382,7 @@ pub(super) fn run_dominator_walk<P: SubPasses>(
             shared: &shared,
             changed: false,
         };
-        walk.rec(ctx, entry, &P::States::default());
+        walk.rec(ctx, entry, &init_states(passes));
         changed |= walk.changed;
     }
     changed

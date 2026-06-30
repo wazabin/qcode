@@ -27,6 +27,8 @@ rustc-hash.workspace = true
 pollster.workspace = true
 # Pure-function emulation in constant propagation runs the callee body.
 qcode_emulator.workspace = true
+# MBA solver backing the `mba_simplify` de-obfuscation pass.
+rumba-core.workspace = true
 
 [build-dependencies]
 serde.workspace = true

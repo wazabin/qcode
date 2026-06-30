@@ -29,6 +29,8 @@ use qcode_emulator::{BodyArg, SizedValue, StandaloneEmulator};
 use crate::calls::return_field;
 
 use super::fold::const_value;
+use std::any::Any;
+
 use super::walk::{Claim, Editor, InsnCtx, SubPass};
 
 /// Upper bound on emulated instructions per lane. Map bodies are loop-free pure
@@ -40,9 +42,15 @@ const STEP_BUDGET: usize = 100_000;
 pub(super) struct EmulateMap;
 
 impl SubPass for EmulateMap {
-    type State = ();
+    fn init_state(&self) -> Box<dyn Any> {
+        Box::new(())
+    }
 
-    fn on_insn(&self, ctx: &mut Context, _state: &mut (), ic: &InsnCtx, ed: &mut Editor) -> Claim {
+    fn clone_state(&self, _state: &dyn Any) -> Box<dyn Any> {
+        Box::new(())
+    }
+
+    fn on_insn(&self, ctx: &mut Context, _state: &mut dyn Any, ic: &InsnCtx, ed: &mut Editor) -> Claim {
         let folded = match ic.mnemonic.clone() {
             Mnemonic::Map(map) => self.emulate(ctx, ic, &map),
             Mnemonic::Scan(scan) => self.emulate_scan(ctx, ic, &scan),

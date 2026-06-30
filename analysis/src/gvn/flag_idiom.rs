@@ -9,6 +9,8 @@ use qcode::{
 };
 
 use super::fold::const_value;
+use std::any::Any;
+
 use super::walk::{Claim, Editor, InsnCtx, SubPass};
 
 /// Collapse the signed-compare flag idiom into a single `s<`, materializing the
@@ -17,9 +19,15 @@ use super::walk::{Claim, Editor, InsnCtx, SubPass};
 pub(super) struct FlagIdiom;
 
 impl SubPass for FlagIdiom {
-    type State = ();
+    fn init_state(&self) -> Box<dyn Any> {
+        Box::new(())
+    }
 
-    fn on_insn(&self, ctx: &mut Context, _state: &mut (), ic: &InsnCtx, ed: &mut Editor) -> Claim {
+    fn clone_state(&self, _state: &dyn Any) -> Box<dyn Any> {
+        Box::new(())
+    }
+
+    fn on_insn(&self, ctx: &mut Context, _state: &mut dyn Any, ic: &InsnCtx, ed: &mut Editor) -> Claim {
         if ic.mnemonic.is_terminator() || ic.size == 0 {
             return Claim::Pass;
         }

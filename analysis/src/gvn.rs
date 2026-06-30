@@ -24,6 +24,7 @@ mod identity;
 mod intrinsics;
 mod mem_forward;
 mod memory;
+mod narrow;
 mod pure_call;
 mod walk;
 
@@ -35,6 +36,7 @@ use fold::Fold;
 use identity::Identities;
 use intrinsics::Recognize;
 use memory::MemoryForwarding;
+use narrow::NarrowTrunc;
 use pure_call::PureCall;
 use walk::{run_dominator_walk, run_flat_fixpoint, run_single_block};
 
@@ -44,28 +46,19 @@ use walk::{run_dominator_walk, run_flat_fixpoint, run_single_block};
 /// recognition, intrinsic recognition before the algebraic identities that
 /// simplify the intrinsics it produces, and CSE last over already-simplified
 /// mnemonics.
-fn gvn_passes() -> (
-    MemoryForwarding,
-    Fold,
-    EmulateMap,
-    ArrayProject,
-    PureCall,
-    Recognize,
-    FlagIdiom,
-    Identities,
-    Cse,
-) {
-    (
-        MemoryForwarding,
-        Fold,
-        EmulateMap,
-        ArrayProject,
-        PureCall,
-        Recognize,
-        FlagIdiom,
-        Identities,
-        Cse,
-    )
+fn gvn_passes() -> Vec<Box<dyn walk::SubPass>> {
+    vec![
+        Box::new(MemoryForwarding),
+        Box::new(Fold),
+        Box::new(NarrowTrunc),
+        Box::new(EmulateMap),
+        Box::new(ArrayProject),
+        Box::new(PureCall),
+        Box::new(Recognize),
+        Box::new(FlagIdiom),
+        Box::new(Identities),
+        Box::new(Cse),
+    ]
 }
 
 /// Constant-fold every foldable instruction in `func_id` to interned literals,
@@ -84,7 +77,14 @@ fn gvn_passes() -> (
 /// Folding only — no CSE or load/store forwarding. Returns `true` if anything
 /// changed.
 pub fn constant_fold_function(ctx: &mut Context, func_id: FunctionId) -> bool {
-    run_flat_fixpoint(ctx, func_id, &(Fold,))
+    run_flat_fixpoint(ctx, func_id, &[Box::new(Fold) as Box<dyn walk::SubPass>])
+}
+
+/// Sink low-word truncations through arithmetic, cancelling widenings, to a
+/// fixpoint. Standalone composition of the [`NarrowTrunc`] sub-pass — the same
+/// shape as [`constant_fold_function`]. Returns `true` if anything changed.
+pub fn narrow_function(ctx: &mut Context, func_id: FunctionId) -> bool {
+    run_flat_fixpoint(ctx, func_id, &[Box::new(NarrowTrunc) as Box<dyn walk::SubPass>])
 }
 
 /// Single-block GVN pass (preserved for backward compatibility).
@@ -133,6 +133,26 @@ impl FunctionPass for ConstFold {
 }
 
 crate::register_function_pass!(ConstFold);
+
+#[derive(Default)]
+pub struct Narrow;
+
+impl FunctionPass for Narrow {
+    const NAME: &'static str = "narrow";
+    fn description(&self) -> &'static str {
+        "Sink low-word truncations through arithmetic, cancelling widenings"
+    }
+    fn run(
+        &self,
+        ctx: &mut Context,
+        fun_id: FunctionId,
+        _env: &PipelineEnv,
+    ) -> Result<bool, String> {
+        Ok(narrow_function(ctx, fun_id))
+    }
+}
+
+crate::register_function_pass!(Narrow);
 
 #[derive(Default)]
 pub struct Gvn;

@@ -9,15 +9,23 @@ use qcode::{
     },
 };
 
+use std::any::Any;
+
 use super::walk::{Claim, Editor, InsnCtx, SubPass};
 
 /// Fold constant arithmetic and algebraic identities into interned literals.
 pub(super) struct Fold;
 
 impl SubPass for Fold {
-    type State = ();
+    fn init_state(&self) -> Box<dyn Any> {
+        Box::new(())
+    }
 
-    fn on_insn(&self, ctx: &mut Context, _state: &mut (), ic: &InsnCtx, ed: &mut Editor) -> Claim {
+    fn clone_state(&self, _state: &dyn Any) -> Box<dyn Any> {
+        Box::new(())
+    }
+
+    fn on_insn(&self, ctx: &mut Context, _state: &mut dyn Any, ic: &InsnCtx, ed: &mut Editor) -> Claim {
         if ic.mnemonic.is_terminator() || ic.size == 0 {
             return Claim::Pass;
         }

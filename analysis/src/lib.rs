@@ -50,7 +50,7 @@ pub use dataflow_graph::{
 };
 
 pub mod gvn;
-pub use gvn::{constant_fold_function, gvn, gvn_function};
+pub use gvn::{Narrow, constant_fold_function, gvn, gvn_function, narrow_function};
 
 pub mod mem;
 pub use mem::{MemLiveness, compute_memory_liveness, mem2reg};
@@ -73,6 +73,9 @@ pub use loop_unroll::{
 
 pub mod loop_to_recursion;
 pub use loop_to_recursion::{LoopToRecursion, loop_to_recursion};
+
+pub mod mba_simplify;
+pub use mba_simplify::{MbaSimplify, mba_simplify};
 
 pub mod lift;
 pub use lift::{discover_addresses_in_binary, lift_new_addresses, split_overlapping_functions};
