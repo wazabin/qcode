@@ -65,18 +65,18 @@ impl FunctionPass for LoopToRecursion {
 crate::register_function_pass!(LoopToRecursion);
 
 #[derive(Debug, Clone)]
-struct LoopModel {
+pub(crate) struct LoopModel {
     /// The host lambda's entry block (stays in the host, performs `init`).
-    root: BlockId,
+    pub(crate) root: BlockId,
     /// The loop header; becomes the recursive lambda's root.
-    head: BlockId,
+    pub(crate) head: BlockId,
     /// Arguments forwarded from `root` into `head` — the initial state `S`.
-    init_args: Vec<ValueId>,
+    pub(crate) init_args: Vec<ValueId>,
     /// `head` plus every block reachable from it; moved into the new lambda.
-    region: Vec<BlockId>,
+    pub(crate) region: Vec<BlockId>,
     /// Latch blocks: each ends in `goto head(next...)` and is rewritten into a
     /// recursive call. Paired with the state passed on the back-edge.
-    back_edges: Vec<(BlockId, Vec<ValueId>)>,
+    pub(crate) back_edges: Vec<(BlockId, Vec<ValueId>)>,
 }
 
 pub fn loop_to_recursion(ctx: &mut Context, fun_id: FunctionId) -> bool {
@@ -87,7 +87,7 @@ pub fn loop_to_recursion(ctx: &mut Context, fun_id: FunctionId) -> bool {
     true
 }
 
-fn recognize_loop(ctx: &Context, fun_id: FunctionId) -> Option<LoopModel> {
+pub(crate) fn recognize_loop(ctx: &Context, fun_id: FunctionId) -> Option<LoopModel> {
     let fun = Function::from_id(ctx, fun_id);
     if !fun.is_lambda() {
         return None;

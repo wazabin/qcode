@@ -349,16 +349,22 @@ impl<'str, 'ctx> ValueRef<'str, 'ctx> {
 
 impl Display for ValueRef<'_, '_> {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
-        match self {
-            // Display function as compact reference when used as a value operand.
-            ValueRef::Function(fn_ref) => write!(f, "<{}>", fn_ref.name()),
-            ValueRef::Literal(_)
-            | ValueRef::Bytes(_)
-            | ValueRef::Instruction(_)
-            | ValueRef::BasicBlock(_)
-            | ValueRef::BlockParam(_)
-            | ValueRef::Varnode(_) => self.inner().fmt(f),
+        // A value operand's rendering — `<ty> <atom>` uniformly, bare for value
+        // references with no scalar type — is defined once, as tokens, in the
+        // instruction `segment` module; `Display` is those tokens concatenated.
+        let ctx = match self {
+            ValueRef::Literal(r) => r.ctx,
+            ValueRef::Bytes(r) => r.ctx,
+            ValueRef::Instruction(r) => r.ctx,
+            ValueRef::BasicBlock(r) => r.ctx,
+            ValueRef::BlockParam(r) => r.ctx,
+            ValueRef::Varnode(r) => r.ctx,
+            ValueRef::Function(r) => r.ctx,
+        };
+        for token in insn::segment::value_tokens(ctx, self.id()) {
+            write!(f, "{}", token.text)?;
         }
+        Ok(())
     }
 }
 

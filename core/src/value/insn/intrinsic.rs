@@ -26,13 +26,12 @@ use rustc_hash::FxHashMap as HashMap;
 use std::sync::OnceLock;
 
 use super::binop::IntBinop;
-use super::mnemonic::{Args, MnemonicKind};
+use super::mnemonic::MnemonicKind;
 use crate::{
     context::Context,
     types::{TypeId, TypeManager},
     value::{InstructionId, ValueId, ValueRef},
 };
-use smallvec::SmallVec;
 
 /// A stable-by-name handle into the intrinsic registry.
 ///
@@ -218,18 +217,8 @@ impl MnemonicKind for IntrinsicApp {
         self.id.name()
     }
 
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>, ctx: &Context<'_>) -> std::fmt::Result {
-        let args = self
-            .args
-            .iter()
-            .map(|&arg| ValueRef::new(arg, ctx).to_string())
-            .collect::<Vec<_>>()
-            .join(", ");
-        write!(f, "${}({});", self.id.name(), args)
-    }
-
-    fn args(&self) -> Args {
-        SmallVec::from_vec(self.args.clone())
+    fn args(&self) -> Vec<ValueId> {
+        self.args.clone()
     }
 }
 

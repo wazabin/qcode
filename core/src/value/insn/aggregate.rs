@@ -6,28 +6,9 @@
 //! `Extract` *is* the field value it names), so no multi-result instruction is
 //! needed. `argpromote` uses them to return `(real_return, write-set)`.
 
-use crate::{
-    context::Context,
-    types::TypeId,
-    value::{ValueId, ValueRef},
-};
-use std::fmt::Formatter;
+use crate::{context::Context, value::ValueId};
 
-use super::mnemonic::{Args, MnemonicKind};
-use smallvec::{SmallVec, smallvec};
-
-fn fmt_bare_value(f: &mut Formatter<'_>, ctx: &Context<'_>, value: ValueId) -> std::fmt::Result {
-    match value {
-        ValueId::Instruction(id) => {
-            if let Some(name) = ctx.values.instructions[id].name.as_deref() {
-                write!(f, "%{name}")
-            } else {
-                write!(f, "%tmp{:x}", usize::from(id))
-            }
-        }
-        other => write!(f, "{}", ValueRef::new(other, ctx)),
-    }
-}
+use super::mnemonic::MnemonicKind;
 
 /// Builds an aggregate value from its ordered fields. The instruction's result
 /// type is the [`Aggregate`](crate::types::TypeRepr::Aggregate) of the fields'
@@ -37,47 +18,13 @@ pub struct Tuple {
     pub fields: Vec<ValueId>,
 }
 
-impl Tuple {
-    pub fn fmt_with_type(
-        &self,
-        f: &mut Formatter<'_>,
-        ctx: &Context<'_>,
-        type_id: TypeId,
-    ) -> std::fmt::Result {
-        write!(f, "pack(")?;
-        for (i, &field) in self.fields.iter().enumerate() {
-            if i > 0 {
-                write!(f, ", ")?;
-            }
-            let name = ctx
-                .types
-                .field_name(type_id, i)
-                .map(str::to_owned)
-                .unwrap_or_else(|| format!("field{}", i + 1));
-            write!(f, "{}={}", name, ValueRef::new(field, ctx))?;
-        }
-        write!(f, ");")
-    }
-}
-
 impl MnemonicKind for Tuple {
     fn opcode(&self) -> &'static str {
         "pack"
     }
 
-    fn fmt(&self, f: &mut Formatter<'_>, ctx: &Context<'_>) -> std::fmt::Result {
-        write!(f, "pack(")?;
-        for (i, &field) in self.fields.iter().enumerate() {
-            if i > 0 {
-                write!(f, ", ")?;
-            }
-            write!(f, "field{}={}", i + 1, ValueRef::new(field, ctx))?;
-        }
-        write!(f, ");")
-    }
-
-    fn args(&self) -> Args {
-        SmallVec::from_vec(self.fields.clone())
+    fn args(&self) -> Vec<ValueId> {
+        self.fields.clone()
     }
 }
 
@@ -101,18 +48,8 @@ impl MnemonicKind for Extract {
         "extract"
     }
 
-    fn fmt(&self, f: &mut Formatter<'_>, ctx: &Context<'_>) -> std::fmt::Result {
-        let name = self
-            .field_name(ctx)
-            .map(str::to_owned)
-            .unwrap_or_else(|| format!("field{}", self.index + 1));
-        f.write_str("extract(")?;
-        fmt_bare_value(f, ctx, self.agg)?;
-        write!(f, ".{name});")
-    }
-
-    fn args(&self) -> Args {
-        smallvec![self.agg]
+    fn args(&self) -> Vec<ValueId> {
+        vec![self.agg]
     }
 }
 
@@ -150,17 +87,8 @@ impl MnemonicKind for Gep {
         "gep"
     }
 
-    fn fmt(&self, f: &mut Formatter<'_>, ctx: &Context<'_>) -> std::fmt::Result {
-        f.write_str("gep(")?;
-        fmt_bare_value(f, ctx, self.base)?;
-        match self.field_name(ctx) {
-            Some(name) => write!(f, ".{name});"),
-            None => write!(f, " + {:#x});", self.offset),
-        }
-    }
-
-    fn args(&self) -> Args {
-        smallvec![self.base]
+    fn args(&self) -> Vec<ValueId> {
+        vec![self.base]
     }
 }
 

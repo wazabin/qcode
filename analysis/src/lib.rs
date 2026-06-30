@@ -74,6 +74,9 @@ pub use loop_unroll::{
 pub mod loop_to_recursion;
 pub use loop_to_recursion::{LoopToRecursion, loop_to_recursion};
 
+pub mod accumulator_elim;
+pub use accumulator_elim::{AccumulatorElim, accumulator_elim};
+
 pub mod mba_simplify;
 pub use mba_simplify::{MbaSimplify, mba_simplify};
 

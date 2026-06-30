@@ -565,7 +565,7 @@ mod tests {
             .as_statement()
             .to_string();
         assert_eq!(
-            next, "i64 %next = @ind + i64 %c;",
+            next, "i64 %next = i64 @ind + i64 %c;",
             "use of @inv rewritten to %c"
         );
     }
@@ -666,7 +666,7 @@ mod tests {
             .unwrap()
             .as_statement()
             .to_string();
-        assert_eq!(other_term, "goto <join @merge=0x4>;");
+        assert_eq!(other_term, "goto <join @merge=i64 0x4>;");
     }
 
     /// Congruence generalization: a loop-invariant param fed a *recomputed* (but

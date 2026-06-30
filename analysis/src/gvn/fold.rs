@@ -836,7 +836,7 @@ mod tests {
             "x ^ x should be eliminated"
         );
         assert!(
-            block.to_string().contains("B <- 0x0"),
+            block.to_string().contains("B <- i64 0x0"),
             "x ^ x should fold to the zero constant, got:\n{block}"
         );
     }

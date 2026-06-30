@@ -1,49 +1,6 @@
-use std::fmt::Formatter;
+use crate::value::{ValueId, block::BlockId, function::FunctionId};
 
-use crate::{
-    context::Context,
-    value::{BasicBlock, Function, ValueId, ValueRef, block::BlockId, function::FunctionId},
-};
-
-use super::mnemonic::{Args, MnemonicKind};
-use smallvec::{SmallVec, smallvec};
-
-fn fmt_branch_target(
-    f: &mut Formatter<'_>,
-    ctx: &Context<'_>,
-    target: BlockId,
-    args: &[ValueId],
-) -> std::fmt::Result {
-    let block = BasicBlock::from_id(ctx, target);
-    let name = block.name().unwrap_or("unnamed");
-    write!(f, "<{name}")?;
-
-    let params = block.params().collect::<Vec<_>>();
-    for (i, &arg) in args.iter().enumerate() {
-        write!(f, " ")?;
-        if let Some(param) = params.get(i) {
-            write!(f, "{param}")?;
-        } else {
-            write!(f, "@arg{i}")?;
-        }
-        write!(f, "={}", ValueRef::new(arg, ctx))?;
-    }
-
-    write!(f, ">")
-}
-
-fn fmt_call_arg_name(
-    f: &mut Formatter<'_>,
-    ctx: &Context<'_>,
-    target: FunctionId,
-    index: usize,
-) -> std::fmt::Result {
-    if let Some(name) = Function::from_id(ctx, target).input_arg_name(index) {
-        return write!(f, "@{name}=");
-    }
-
-    write!(f, "@arg{index}=")
-}
+use super::mnemonic::MnemonicKind;
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub struct Branch {
@@ -61,14 +18,8 @@ impl MnemonicKind for Branch {
         true
     }
 
-    fn fmt(&self, f: &mut Formatter<'_>, ctx: &Context<'_>) -> std::fmt::Result {
-        write!(f, "goto ")?;
-        fmt_branch_target(f, ctx, self.target, &self.args)?;
-        write!(f, ";")
-    }
-
-    fn args(&self) -> Args {
-        SmallVec::from_vec(self.args.clone())
+    fn args(&self) -> Vec<ValueId> {
+        self.args.clone()
     }
 }
 
@@ -86,12 +37,8 @@ impl MnemonicKind for BranchInd {
         true
     }
 
-    fn fmt(&self, f: &mut Formatter<'_>, ctx: &Context<'_>) -> std::fmt::Result {
-        write!(f, "goto [{}];", ValueRef::new(self.ptr, ctx))
-    }
-
-    fn args(&self) -> Args {
-        smallvec![self.ptr]
+    fn args(&self) -> Vec<ValueId> {
+        vec![self.ptr]
     }
 }
 
@@ -105,19 +52,6 @@ pub struct Apply {
 impl MnemonicKind for Apply {
     fn opcode(&self) -> &'static str {
         "apply"
-    }
-
-    fn fmt(&self, f: &mut Formatter<'_>, ctx: &Context<'_>) -> std::fmt::Result {
-        // Printed in the grammar's `apply name(positional args)` form so the
-        // result re-parses (the parser binds args positionally to root params).
-        write!(f, "apply {}(", Function::from_id(ctx, self.target).name())?;
-        for (i, &arg) in self.args.iter().enumerate() {
-            if i > 0 {
-                write!(f, ", ")?;
-            }
-            write!(f, "{}", ValueRef::new(arg, ctx))?;
-        }
-        write!(f, ");")
     }
 
     fn args(&self) -> Vec<ValueId> {
@@ -146,22 +80,8 @@ impl MnemonicKind for Call {
         true
     }
 
-    fn fmt(&self, f: &mut Formatter<'_>, ctx: &Context<'_>) -> std::fmt::Result {
-        // The clobber set is intentionally not printed: it is large and
-        // repetitive at every call site. Only the argument list is shown.
-        write!(f, "call fn {}(", Function::from_id(ctx, self.target).name())?;
-        for (i, &arg) in self.args.iter().enumerate() {
-            if i > 0 {
-                write!(f, ", ")?;
-            }
-            fmt_call_arg_name(f, ctx, self.target, i)?;
-            write!(f, "{}", ValueRef::new(arg, ctx))?;
-        }
-        write!(f, ");")
-    }
-
-    fn args(&self) -> Args {
-        SmallVec::from_vec(self.args.clone())
+    fn args(&self) -> Vec<ValueId> {
+        self.args.clone()
     }
 }
 
@@ -180,23 +100,8 @@ impl MnemonicKind for CallInd {
         true
     }
 
-    fn fmt(&self, f: &mut Formatter<'_>, ctx: &Context<'_>) -> std::fmt::Result {
-        write!(f, "call [{}]", ValueRef::new(self.ptr, ctx))?;
-        if !self.args.is_empty() {
-            write!(f, "(")?;
-            for (i, &arg) in self.args.iter().enumerate() {
-                if i > 0 {
-                    write!(f, ", ")?;
-                }
-                write!(f, "{}", ValueRef::new(arg, ctx))?;
-            }
-            write!(f, ")")?;
-        }
-        write!(f, ";")
-    }
-
-    fn args(&self) -> Args {
-        let mut args = smallvec![self.ptr];
+    fn args(&self) -> Vec<ValueId> {
+        let mut args = vec![self.ptr];
         args.extend(self.args.clone());
         args
     }
@@ -222,16 +127,8 @@ impl MnemonicKind for CBranch {
         true
     }
 
-    fn fmt(&self, f: &mut Formatter<'_>, ctx: &Context<'_>) -> std::fmt::Result {
-        write!(f, "if {} goto ", ValueRef::new(self.condition, ctx))?;
-        fmt_branch_target(f, ctx, self.success_block, &self.success_args)?;
-        write!(f, " else goto ")?;
-        fmt_branch_target(f, ctx, self.failure_block, &self.failure_args)?;
-        write!(f, ";")
-    }
-
-    fn args(&self) -> Args {
-        let mut args = smallvec![self.condition];
+    fn args(&self) -> Vec<ValueId> {
+        let mut args = vec![self.condition];
         args.extend_from_slice(&self.success_args);
         args.extend_from_slice(&self.failure_args);
         args
@@ -253,20 +150,8 @@ impl MnemonicKind for Return {
         true
     }
 
-    fn fmt(&self, f: &mut Formatter<'_>, ctx: &Context<'_>) -> std::fmt::Result {
-        match self.value {
-            Some(value) => write!(
-                f,
-                "return {} at {};",
-                ValueRef::new(value, ctx),
-                ValueRef::new(self.ptr, ctx)
-            ),
-            None => write!(f, "return at {};", ValueRef::new(self.ptr, ctx)),
-        }
-    }
-
-    fn args(&self) -> Args {
-        let mut args = smallvec![self.ptr];
+    fn args(&self) -> Vec<ValueId> {
+        let mut args = vec![self.ptr];
         if let Some(value) = self.value {
             args.push(value);
         }
@@ -286,10 +171,6 @@ impl MnemonicKind for ReturnValue {
 
     fn is_terminator(&self) -> bool {
         true
-    }
-
-    fn fmt(&self, f: &mut Formatter<'_>, ctx: &Context<'_>) -> std::fmt::Result {
-        write!(f, "return {};", ValueRef::new(self.value, ctx))
     }
 
     fn args(&self) -> Vec<ValueId> {
@@ -411,7 +292,7 @@ mod tests {
         let rendered = Instruction::from_id(&tc.ctx, call_id)
             .as_statement()
             .to_string();
-        assert_eq!(rendered, "call fn callee(@r0=0x1, @arg1=0x2);");
+        assert_eq!(rendered, "call fn callee(@r0=i64 0x1, @arg1=i64 0x2);");
     }
 
     #[test]
@@ -448,7 +329,7 @@ mod tests {
             .as_statement()
             .to_string();
         // The stack-passed input is named after its slot offset (varnode address 4).
-        assert_eq!(rendered, "call fn callee(@stack_4=0x7);");
+        assert_eq!(rendered, "call fn callee(@stack_4=i32 0x7);");
     }
 
     #[test]
@@ -647,7 +528,7 @@ mod tests {
 
         let src_block = BasicBlock::from_id(&ctx, src);
         let last = src_block.iter().last().expect("block has instructions");
-        assert_eq!(last.as_statement().to_string(), "goto <done @x=@a>;");
+        assert_eq!(last.as_statement().to_string(), "goto <done @x=i0 @a>;");
     }
 
     #[test]
@@ -674,6 +555,6 @@ mod tests {
             branch.args,
             [ValueId::BlockParam(b), ValueId::BlockParam(a)]
         );
-        assert_eq!(last.as_statement().to_string(), "goto <done @x=@b @y=@a>;");
+        assert_eq!(last.as_statement().to_string(), "goto <done @x=i0 @b @y=i0 @a>;");
     }
 }

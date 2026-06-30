@@ -24,14 +24,9 @@
 //! parameter is the carried accumulator (typed as the result element), its second
 //! is the lane element of `src`.
 
-use crate::{
-    context::Context,
-    value::{Function, ValueId, ValueRef, function::FunctionId},
-};
-use std::fmt::Formatter;
+use crate::value::{ValueId, function::FunctionId};
 
-use super::mnemonic::{Args, MnemonicKind};
-use smallvec::SmallVec;
+use super::mnemonic::MnemonicKind;
 
 /// A total left-scan `out[i] = acc_i+1` where `acc_i+1 = body(acc_i, src[i],
 /// captures…)` and `acc_0 = init`. The result is `[U; N]` where `N` is `src`'s
@@ -56,27 +51,8 @@ impl MnemonicKind for Scan {
         "scan"
     }
 
-    fn fmt(&self, f: &mut Formatter<'_>, ctx: &Context<'_>) -> std::fmt::Result {
-        // `scanl @body init src` (Haskell `scanl`-flavored): fold `body` across
-        // the array, seeded with `init`. Captures render as a partial application
-        // of the body — `scanl (@body c0 c1) init src` — since the accumulator and
-        // element are supplied by the scan itself, not written here.
-        let body = Function::from_id(ctx, self.body).name();
-        let init = ValueRef::new(self.init, ctx);
-        let src = ValueRef::new(self.src, ctx);
-        if self.captures.is_empty() {
-            write!(f, "scanl @{body} {init} {src};")
-        } else {
-            write!(f, "scanl (@{body}")?;
-            for &c in &self.captures {
-                write!(f, " {}", ValueRef::new(c, ctx))?;
-            }
-            write!(f, ") {init} {src};")
-        }
-    }
-
-    fn args(&self) -> Args {
-        let mut args: Args = SmallVec::with_capacity(2 + self.captures.len());
+    fn args(&self) -> Vec<ValueId> {
+        let mut args = Vec::with_capacity(2 + self.captures.len());
         args.push(self.init);
         args.push(self.src);
         args.extend(self.captures.iter().copied());
@@ -189,7 +165,7 @@ mod tests {
         };
         assert_eq!(m.body, body);
         assert_eq!(
-            m.args().to_vec(),
+            m.args(),
             vec![init, src, cap],
             "init, src, then captures are the operands"
         );

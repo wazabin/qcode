@@ -342,7 +342,7 @@ mod tests {
 
         assert!(!block.instruction_ids().contains(&v1));
         assert!(!block.instruction_ids().contains(&v2));
-        assert!(block.to_string().contains("B <- 0xa"));
+        assert!(block.to_string().contains("B <- i64 0xa"));
     }
 
     // -----------------------------------------------------------------------

@@ -1,11 +1,7 @@
-use super::mnemonic::{Args, MnemonicKind};
-use crate::{
-    context::Context,
-    value::{ValueId, ValueRef},
-};
+use super::mnemonic::MnemonicKind;
+use crate::value::ValueId;
 use jstd::Identifier;
 use serde::{Deserialize, Serialize};
-use smallvec::SmallVec;
 
 #[derive(Identifier)]
 pub struct PCodeOpId(usize);
@@ -22,23 +18,7 @@ impl MnemonicKind for PCodeOp {
         "pcode_op"
     }
 
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>, ctx: &Context<'_>) -> std::fmt::Result {
-        let op = &ctx.pcode_ops[self.id];
-        let args = self
-            .args
-            .iter()
-            .map(|&arg| ValueRef::new(arg, ctx).to_string())
-            .collect::<Vec<_>>()
-            .join(", ");
-
-        if let Some(dst) = self.dst {
-            write!(f, "{} = {}({});", ValueRef::new(dst, ctx), op, args)
-        } else {
-            write!(f, "{}({});", op, args)
-        }
-    }
-
-    fn args(&self) -> Args {
-        SmallVec::from_vec(self.args.clone())
+    fn args(&self) -> Vec<ValueId> {
+        self.args.clone()
     }
 }

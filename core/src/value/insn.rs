@@ -33,6 +33,7 @@ mod memory;
 mod mnemonic;
 mod pcode_op;
 mod scan;
+pub mod segment;
 mod terminator;
 mod unop;
 
@@ -420,13 +421,11 @@ pub struct InstructionStatement<'a>(&'a InstructionRef<'a, 'a>);
 
 impl Display for InstructionStatement<'_> {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
-        if self.0.size() != 0 {
-            write!(f, "{} = ", self.0)?;
+        // The statement's rendering (result binding + mnemonic) is defined once,
+        // as tokens, in `segment`; the `Display` form is those tokens joined.
+        for token in segment::instruction_segments(self.0) {
+            write!(f, "{}", token.text)?;
         }
-
-        match self.0.mnemonic() {
-            Mnemonic::Tuple(t) => t.fmt_with_type(f, self.0.ctx, self.0.type_id()),
-            mnemonic => mnemonic.fmt(f, self.0.ctx),
-        }
+        Ok(())
     }
 }

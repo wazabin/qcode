@@ -693,7 +693,7 @@ mod tests {
         crate::remove_dead_insns(&mut ctx, entry);
         let text = BasicBlock::from_id(&ctx, entry).to_string();
         assert!(
-            text.contains(" + 0x1") || text.contains(" + 0x00000001"),
+            text.contains(" + i32 0x1") || text.contains(" + i32 0x00000001"),
             "the obfuscated increment should collapse to `i + 1`, got:\n{text}"
         );
         assert!(

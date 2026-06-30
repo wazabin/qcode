@@ -1186,6 +1186,14 @@ impl StandaloneEmulator {
                         .unwrap_or(8);
                     self.insn_values
                         .insert(insn_id, SizedValue::new(value, size));
+                } else if let ValueId::Instruction(ret_id) = ret_value
+                    && let Some(agg) = nested.aggregate_values.get(&ret_id).cloned()
+                {
+                    // The lambda returns an aggregate (e.g. the result tuple produced
+                    // by accumulator elimination); propagate it field-wise so the
+                    // caller's `extract(apply, i)` resolves — mirroring the scalar
+                    // case above and the `Return` arm's call-result handling.
+                    self.aggregate_values.insert(insn_id, agg);
                 }
                 self.idx += 1;
             }

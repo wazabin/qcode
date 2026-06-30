@@ -1,11 +1,6 @@
-use crate::{
-    context::Context,
-    value::{ValueId, ValueRef},
-};
-use std::fmt::Formatter;
+use crate::value::ValueId;
 
-use super::mnemonic::{Args, MnemonicKind};
-use smallvec::smallvec;
+use super::mnemonic::MnemonicKind;
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub struct IsFloatNaN {
@@ -17,12 +12,8 @@ impl MnemonicKind for IsFloatNaN {
         "is_float_nan"
     }
 
-    fn fmt(&self, f: &mut Formatter<'_>, ctx: &Context<'_>) -> std::fmt::Result {
-        write!(f, "nan({});", ValueRef::new(self.src, ctx))
-    }
-
-    fn args(&self) -> Args {
-        smallvec![self.src]
+    fn args(&self) -> Vec<ValueId> {
+        vec![self.src]
     }
 }
 
@@ -56,12 +47,8 @@ impl MnemonicKind for LzCount {
         "lz_count"
     }
 
-    fn fmt(&self, f: &mut Formatter<'_>, ctx: &Context<'_>) -> std::fmt::Result {
-        write!(f, "lzcount({});", ValueRef::new(self.src, ctx))
-    }
-
-    fn args(&self) -> Args {
-        smallvec![self.src]
+    fn args(&self) -> Vec<ValueId> {
+        vec![self.src]
     }
 }
 
@@ -83,12 +70,8 @@ impl MnemonicKind for PopCount {
         "pop_count"
     }
 
-    fn fmt(&self, f: &mut Formatter<'_>, ctx: &Context<'_>) -> std::fmt::Result {
-        write!(f, "popcount({});", ValueRef::new(self.src, ctx))
-    }
-
-    fn args(&self) -> Args {
-        smallvec![self.src]
+    fn args(&self) -> Vec<ValueId> {
+        vec![self.src]
     }
 }
 
@@ -119,17 +102,8 @@ impl MnemonicKind for Carry {
         "carry"
     }
 
-    fn fmt(&self, f: &mut Formatter<'_>, ctx: &Context<'_>) -> std::fmt::Result {
-        write!(
-            f,
-            "carry({}, {});",
-            ValueRef::new(self.lhs, ctx),
-            ValueRef::new(self.rhs, ctx)
-        )
-    }
-
-    fn args(&self) -> Args {
-        smallvec![self.lhs, self.rhs]
+    fn args(&self) -> Vec<ValueId> {
+        vec![self.lhs, self.rhs]
     }
 }
 
@@ -159,17 +133,8 @@ impl MnemonicKind for SCarry {
         "scarry"
     }
 
-    fn fmt(&self, f: &mut Formatter<'_>, ctx: &Context<'_>) -> std::fmt::Result {
-        write!(
-            f,
-            "scarry({}, {});",
-            ValueRef::new(self.lhs, ctx),
-            ValueRef::new(self.rhs, ctx)
-        )
-    }
-
-    fn args(&self) -> Args {
-        smallvec![self.lhs, self.rhs]
+    fn args(&self) -> Vec<ValueId> {
+        vec![self.lhs, self.rhs]
     }
 }
 
@@ -199,17 +164,8 @@ impl MnemonicKind for SBorrow {
         "sborrow"
     }
 
-    fn fmt(&self, f: &mut Formatter<'_>, ctx: &Context<'_>) -> std::fmt::Result {
-        write!(
-            f,
-            "sborrow({}, {});",
-            ValueRef::new(self.lhs, ctx),
-            ValueRef::new(self.rhs, ctx)
-        )
-    }
-
-    fn args(&self) -> Args {
-        smallvec![self.lhs, self.rhs]
+    fn args(&self) -> Vec<ValueId> {
+        vec![self.lhs, self.rhs]
     }
 }
 
@@ -217,6 +173,7 @@ impl MnemonicKind for SBorrow {
 mod tests {
     use qcode_macro::qcode;
 
+    use crate::context::Context;
     use crate::value::insn::{Instruction, Mnemonic};
 
     use super::*;

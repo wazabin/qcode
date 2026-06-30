@@ -762,11 +762,11 @@ mod tests {
 
         assert_eq!(
             iter.next().unwrap().as_statement().to_string(),
-            "i64 %x = load(X:8, X);"
+            "i64 %x = load(X:8, i64 X);"
         );
         assert_eq!(
             iter.next().unwrap().as_statement().to_string(),
-            "i64 %y = load(Y:8, Y);"
+            "i64 %y = load(Y:8, i64 Y);"
         );
         assert_eq!(
             iter.next().unwrap().as_statement().to_string(),
@@ -774,7 +774,7 @@ mod tests {
         );
         assert_eq!(
             iter.next().unwrap().as_statement().to_string(),
-            "return at 0x0;"
+            "return at i64 0x0;"
         );
     }
 

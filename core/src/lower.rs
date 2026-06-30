@@ -967,7 +967,7 @@ mod tests {
         assert!(f.is_lambda());
         let text = f.to_string();
         assert!(text.contains("lambda fib_loop"));
-        assert!(text.contains("@hn == 0x0"));
-        assert!(text.contains("@x + @y"));
+        assert!(text.contains("i64 @hn == i64 0x0"));
+        assert!(text.contains("i64 @x + i64 @y"));
     }
 }

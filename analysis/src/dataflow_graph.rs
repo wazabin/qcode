@@ -451,12 +451,12 @@ mod tests {
             varnode i64 g;
             fn other:
                 <o_entry>
-                    store(&g, i64 0xdead);
-                    return [i64 0];
+                    store(g:8, &g <- i64 0xdead);
+                    return i64 0;
             fn f:
                 <entry>
-                    %v = load(i64, i64 0x2000);
-                    return [%v];
+                    %v = load(ram:8, i64 0x2000);
+                    return %v;
             "
         );
         let aliases = AliasResult::simple(&ctx);
@@ -483,7 +483,7 @@ mod tests {
                 <entry>
                     %a = i64 1 + i64 2;
                     %b = %a + i64 3;
-                    return [%b];
+                    return %b;
             "
         );
         let aliases = AliasResult::simple(&ctx);
@@ -516,9 +516,9 @@ mod tests {
             fn f:
                 <entry>
                     %c = i64 0x1234 + i64 1;
-                    store(&cell, %c);
-                    %v = load(i64, &cell);
-                    return [%v];
+                    store(cell:8, &cell <- %c);
+                    %v = load(cell:8, &cell);
+                    return %v;
             "
         );
         let aliases = AliasResult::simple(&ctx);

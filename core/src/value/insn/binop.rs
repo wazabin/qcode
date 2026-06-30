@@ -1,12 +1,8 @@
 use std::fmt::{Display, Formatter};
 
-use crate::{
-    context::Context,
-    value::{ValueId, ValueRef},
-};
+use crate::value::ValueId;
 
-use super::mnemonic::{Args, MnemonicKind};
-use smallvec::smallvec;
+use super::mnemonic::MnemonicKind;
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub struct Binary {
@@ -20,18 +16,8 @@ impl MnemonicKind for Binary {
         "binop"
     }
 
-    fn fmt(&self, f: &mut Formatter<'_>, ctx: &Context<'_>) -> std::fmt::Result {
-        write!(
-            f,
-            "{} {} {};",
-            ValueRef::new(self.lhs, ctx),
-            self.op,
-            ValueRef::new(self.rhs, ctx)
-        )
-    }
-
-    fn args(&self) -> Args {
-        smallvec![self.lhs, self.rhs]
+    fn args(&self) -> Vec<ValueId> {
+        vec![self.lhs, self.rhs]
     }
 }
 
@@ -261,6 +247,7 @@ impl Display for FloatBinop {
 mod tests {
     use qcode_macro::qcode;
 
+    use crate::context::Context;
     use crate::value::insn::{Instruction, Mnemonic};
 
     use super::*;
@@ -290,7 +277,7 @@ mod tests {
         }
 
         assert_eq!(v.size(), 4);
-        assert_eq!(v.as_statement().to_string(), "i32 %v = i32 %v0 + 0x2;");
+        assert_eq!(v.as_statement().to_string(), "i32 %v = i32 %v0 + i32 0x2;");
     }
 
     #[test]
@@ -318,7 +305,7 @@ mod tests {
         }
 
         assert_eq!(v.size(), 4);
-        assert_eq!(v.as_statement().to_string(), "i32 %v = i32 %v0 - 0x2;");
+        assert_eq!(v.as_statement().to_string(), "i32 %v = i32 %v0 - i32 0x2;");
     }
 
     #[test]
@@ -346,7 +333,7 @@ mod tests {
         }
 
         assert_eq!(v.size(), 4);
-        assert_eq!(v.as_statement().to_string(), "i32 %v = i32 %v0 * 0x2;");
+        assert_eq!(v.as_statement().to_string(), "i32 %v = i32 %v0 * i32 0x2;");
     }
 
     #[test]
@@ -374,7 +361,7 @@ mod tests {
         }
 
         assert_eq!(v.size(), 4);
-        assert_eq!(v.as_statement().to_string(), "i32 %v = i32 %v0 / 0x2;");
+        assert_eq!(v.as_statement().to_string(), "i32 %v = i32 %v0 / i32 0x2;");
     }
 
     #[test]
@@ -402,7 +389,7 @@ mod tests {
         }
 
         assert_eq!(v.size(), 4);
-        assert_eq!(v.as_statement().to_string(), "i32 %v = i32 %v0 & 0x2;");
+        assert_eq!(v.as_statement().to_string(), "i32 %v = i32 %v0 & i32 0x2;");
     }
 
     #[test]
@@ -430,7 +417,7 @@ mod tests {
         }
 
         assert_eq!(v.size(), 4);
-        assert_eq!(v.as_statement().to_string(), "i32 %v = i32 %v0 | 0x2;");
+        assert_eq!(v.as_statement().to_string(), "i32 %v = i32 %v0 | i32 0x2;");
     }
 
     #[test]
@@ -458,7 +445,7 @@ mod tests {
         }
 
         assert_eq!(v.size(), 4);
-        assert_eq!(v.as_statement().to_string(), "i32 %v = i32 %v0 ^ 0x2;");
+        assert_eq!(v.as_statement().to_string(), "i32 %v = i32 %v0 ^ i32 0x2;");
     }
 
     #[test]
@@ -486,7 +473,7 @@ mod tests {
         }
 
         assert_eq!(v.size(), 4);
-        assert_eq!(v.as_statement().to_string(), "i32 %v = i32 %v0 << 0x2;");
+        assert_eq!(v.as_statement().to_string(), "i32 %v = i32 %v0 << i32 0x2;");
     }
 
     #[test]
@@ -514,7 +501,7 @@ mod tests {
         }
 
         assert_eq!(v.size(), 4);
-        assert_eq!(v.as_statement().to_string(), "i32 %v = i32 %v0 >> 0x2;");
+        assert_eq!(v.as_statement().to_string(), "i32 %v = i32 %v0 >> i32 0x2;");
     }
 
     #[test]
@@ -542,7 +529,7 @@ mod tests {
         }
 
         assert_eq!(v.size(), 1);
-        assert_eq!(v.as_statement().to_string(), "i8 %v = i32 %v0 == 0x2;");
+        assert_eq!(v.as_statement().to_string(), "i8 %v = i32 %v0 == i32 0x2;");
     }
 
     #[test]
@@ -570,7 +557,7 @@ mod tests {
         }
 
         assert_eq!(v.size(), 1);
-        assert_eq!(v.as_statement().to_string(), "i8 %v = i32 %v0 != 0x2;");
+        assert_eq!(v.as_statement().to_string(), "i8 %v = i32 %v0 != i32 0x2;");
     }
 
     #[test]
@@ -598,7 +585,7 @@ mod tests {
         }
 
         assert_eq!(v.size(), 1);
-        assert_eq!(v.as_statement().to_string(), "i8 %v = i32 %v0 < 0x2;");
+        assert_eq!(v.as_statement().to_string(), "i8 %v = i32 %v0 < i32 0x2;");
     }
 
     #[test]
@@ -626,7 +613,7 @@ mod tests {
         }
 
         assert_eq!(v.size(), 1);
-        assert_eq!(v.as_statement().to_string(), "i8 %v = i32 %v0 <= 0x2;");
+        assert_eq!(v.as_statement().to_string(), "i8 %v = i32 %v0 <= i32 0x2;");
     }
 
     #[test]
@@ -654,7 +641,7 @@ mod tests {
         }
 
         assert_eq!(v.size(), 1);
-        assert_eq!(v.as_statement().to_string(), "i8 %v = 0x2 < i32 %v0;");
+        assert_eq!(v.as_statement().to_string(), "i8 %v = i32 0x2 < i32 %v0;");
     }
 
     #[test]
@@ -682,7 +669,7 @@ mod tests {
         }
 
         assert_eq!(v.size(), 1);
-        assert_eq!(v.as_statement().to_string(), "i8 %v = 0x2 <= i32 %v0;");
+        assert_eq!(v.as_statement().to_string(), "i8 %v = i32 0x2 <= i32 %v0;");
     }
 
     #[test]

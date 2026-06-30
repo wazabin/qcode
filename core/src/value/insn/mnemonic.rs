@@ -24,17 +24,10 @@ pub type Args = SmallVec<[ValueId; 2]>;
 /// Implemented by each concrete instruction type.
 ///
 /// Provides the common interface that [`Mnemonic`] dispatches to: a short
-/// opcode string, argument enumeration, terminator status, and a context-aware
-/// display implementation.
+/// opcode string, argument enumeration, and terminator status.
 pub trait MnemonicKind {
     /// Short textual opcode, e.g. `"load"`, `"int_add"`, `"branch"`.
     fn opcode(&self) -> &'static str;
-
-    /// Formats the full instruction (opcode + operands) into `f`.
-    ///
-    /// Operands are displayed using their context-aware `Display` impls so that
-    /// names, addresses, and symbolic labels are shown when available.
-    fn fmt(&self, f: &mut Formatter<'_>, ctx: &Context<'_>) -> std::fmt::Result;
 
     // TODO: replace with a visitor pattern to avoid the need for this method
     /// Returns the [`ValueId`]s of all operands consumed by this instruction.
@@ -214,7 +207,12 @@ impl Mnemonic {
     }
 
     pub fn fmt(&self, f: &mut Formatter<'_>, ctx: &Context<'_>) -> std::fmt::Result {
-        self.as_kind().fmt(f, ctx)
+        // The textual rendering is defined once, as tokens, in `segment`; the
+        // `Display` form is those tokens concatenated.
+        for token in super::segment::mnemonic_tokens(ctx, self) {
+            write!(f, "{}", token.text)?;
+        }
+        Ok(())
     }
 
     pub fn args(&self) -> Args {

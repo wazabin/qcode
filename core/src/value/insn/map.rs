@@ -15,14 +15,9 @@
 //! `Range(Map(body, src), k·osz, osz) → body(Range(src, k·isz, isz), captures…)`
 //! recovers one element as an expression without materializing the whole array.
 
-use crate::{
-    context::Context,
-    value::{Function, ValueId, ValueRef, function::FunctionId},
-};
-use std::fmt::Formatter;
+use crate::value::{ValueId, function::FunctionId};
 
-use super::mnemonic::{Args, MnemonicKind};
-use smallvec::SmallVec;
+use super::mnemonic::MnemonicKind;
 
 /// A total element-wise map `out[i] = body(src[i], captures…)`. The result is
 /// `[U; N]` where `N` is `src`'s length and `U` is the body's return type.
@@ -43,25 +38,8 @@ impl MnemonicKind for Map {
         "map"
     }
 
-    fn fmt(&self, f: &mut Formatter<'_>, ctx: &Context<'_>) -> std::fmt::Result {
-        // `foo <$> arr` (Haskell `fmap`): apply the per-element body over the
-        // array. Captures render as a partial application of the body —
-        // `(foo c0 c1) <$> arr` — since the element is supplied by the map
-        // itself, not written here.
-        let body = Function::from_id(ctx, self.body).name();
-        if self.captures.is_empty() {
-            write!(f, "{} <$> {};", body, ValueRef::new(self.src, ctx))
-        } else {
-            write!(f, "({}", body)?;
-            for &c in &self.captures {
-                write!(f, " {}", ValueRef::new(c, ctx))?;
-            }
-            write!(f, ") <$> {};", ValueRef::new(self.src, ctx))
-        }
-    }
-
-    fn args(&self) -> Args {
-        let mut args: Args = SmallVec::with_capacity(1 + self.captures.len());
+    fn args(&self) -> Vec<ValueId> {
+        let mut args = Vec::with_capacity(1 + self.captures.len());
         args.push(self.src);
         args.extend(self.captures.iter().copied());
         args
@@ -172,7 +150,7 @@ mod tests {
         // `body` is a symbol; `src` + captures are the value operands.
         assert_eq!(m.body, body);
         assert_eq!(
-            m.args().to_vec(),
+            m.args(),
             vec![src, cap],
             "src then captures are the operands"
         );

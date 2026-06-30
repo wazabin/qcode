@@ -1,14 +1,9 @@
-use crate::{
-    context::Context,
-    value::{
-        ValueId, ValueRef,
-        insn::bits::{mask_for_size, signed_value},
-    },
+use crate::value::{
+    ValueId,
+    insn::bits::{mask_for_size, signed_value},
 };
-use std::fmt::Formatter;
 
-use super::mnemonic::{Args, MnemonicKind};
-use smallvec::smallvec;
+use super::mnemonic::MnemonicKind;
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub struct Zext {
@@ -28,17 +23,8 @@ impl MnemonicKind for Zext {
         "zext"
     }
 
-    fn fmt(&self, f: &mut Formatter<'_>, ctx: &Context<'_>) -> std::fmt::Result {
-        write!(
-            f,
-            "zext(i{}, {});",
-            self.size * 8,
-            ValueRef::new(self.src, ctx)
-        )
-    }
-
-    fn args(&self) -> Args {
-        smallvec![self.src]
+    fn args(&self) -> Vec<ValueId> {
+        vec![self.src]
     }
 }
 
@@ -63,17 +49,8 @@ impl MnemonicKind for Sext {
         "sext"
     }
 
-    fn fmt(&self, f: &mut Formatter<'_>, ctx: &Context<'_>) -> std::fmt::Result {
-        write!(
-            f,
-            "sext(i{}, {});",
-            self.size * 8,
-            ValueRef::new(self.src, ctx)
-        )
-    }
-
-    fn args(&self) -> Args {
-        smallvec![self.src]
+    fn args(&self) -> Vec<ValueId> {
+        vec![self.src]
     }
 }
 
@@ -102,18 +79,8 @@ impl MnemonicKind for Range {
         "range"
     }
 
-    fn fmt(&self, f: &mut Formatter<'_>, ctx: &Context<'_>) -> std::fmt::Result {
-        write!(
-            f,
-            "{}[{}:{}];",
-            ValueRef::new(self.src, ctx),
-            self.start,
-            self.start + self.size
-        )
-    }
-
-    fn args(&self) -> Args {
-        smallvec![self.src]
+    fn args(&self) -> Vec<ValueId> {
+        vec![self.src]
     }
 }
 
@@ -128,17 +95,8 @@ impl MnemonicKind for IntToFloat {
         "int_to_float"
     }
 
-    fn fmt(&self, f: &mut Formatter<'_>, ctx: &Context<'_>) -> std::fmt::Result {
-        write!(
-            f,
-            "int2float(f{}, {});",
-            self.size * 8,
-            ValueRef::new(self.src, ctx)
-        )
-    }
-
-    fn args(&self) -> Args {
-        smallvec![self.src]
+    fn args(&self) -> Vec<ValueId> {
+        vec![self.src]
     }
 }
 
@@ -153,17 +111,8 @@ impl MnemonicKind for FloatToFloat {
         "float_to_float"
     }
 
-    fn fmt(&self, f: &mut Formatter<'_>, ctx: &Context<'_>) -> std::fmt::Result {
-        write!(
-            f,
-            "float2float(f{}, {});",
-            self.size * 8,
-            ValueRef::new(self.src, ctx)
-        )
-    }
-
-    fn args(&self) -> Args {
-        smallvec![self.src]
+    fn args(&self) -> Vec<ValueId> {
+        vec![self.src]
     }
 }
 
@@ -178,17 +127,8 @@ impl MnemonicKind for FloatToInt {
         "float_to_int"
     }
 
-    fn fmt(&self, f: &mut Formatter<'_>, ctx: &Context<'_>) -> std::fmt::Result {
-        write!(
-            f,
-            "trunc(i{}, {});",
-            self.size * 8,
-            ValueRef::new(self.src, ctx)
-        )
-    }
-
-    fn args(&self) -> Args {
-        smallvec![self.src]
+    fn args(&self) -> Vec<ValueId> {
+        vec![self.src]
     }
 }
 
@@ -196,6 +136,7 @@ impl MnemonicKind for FloatToInt {
 mod tests {
     use qcode_macro::qcode;
 
+    use crate::context::Context;
     use crate::value::insn::{Instruction, Mnemonic};
 
     use super::*;

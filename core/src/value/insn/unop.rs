@@ -1,13 +1,6 @@
-use smallvec::smallvec;
 use std::fmt::{Display, Formatter};
 
-use crate::{
-    context::Context,
-    value::{
-        ValueId, ValueRef,
-        insn::mnemonic::{Args, MnemonicKind},
-    },
-};
+use crate::value::{ValueId, insn::mnemonic::MnemonicKind};
 
 #[non_exhaustive]
 #[derive(Debug, Clone, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
@@ -70,25 +63,8 @@ impl MnemonicKind for Unary {
         "unop"
     }
 
-    fn fmt(&self, f: &mut Formatter<'_>, ctx: &Context<'_>) -> std::fmt::Result {
-        match self.op {
-            // Prefix operators (`unop_op` in the grammar): `f- @x`, `~ @x`, …
-            Unop::IntNegate | Unop::IntNot | Unop::BoolNot | Unop::FloatNegate => {
-                write!(f, "{} {};", self.op, ValueRef::new(self.src, ctx))
-            }
-            // Named float operators (`func_unop` in the grammar): `abs(@x)`, …
-            Unop::FloatAbs
-            | Unop::FloatSqrt
-            | Unop::FloatCeil
-            | Unop::FloatFloor
-            | Unop::FloatRound => {
-                write!(f, "{}({});", self.op, ValueRef::new(self.src, ctx))
-            }
-        }
-    }
-
-    fn args(&self) -> Args {
-        smallvec![self.src]
+    fn args(&self) -> Vec<ValueId> {
+        vec![self.src]
     }
 }
 
@@ -97,6 +73,8 @@ mod tests {
     use qcode_macro::qcode;
 
     use crate::{
+        context::Context,
+        value::ValueRef,
         value::Value,
         value::insn::{Instruction, Mnemonic},
     };

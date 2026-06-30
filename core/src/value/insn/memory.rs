@@ -1,12 +1,6 @@
-use crate::{
-    context::Context,
-    space::{Space, SpaceId},
-    value::{ValueId, ValueRef},
-};
-use std::fmt::Formatter;
+use crate::{space::SpaceId, value::ValueId};
 
-use super::mnemonic::{Args, MnemonicKind};
-use smallvec::smallvec;
+use super::mnemonic::MnemonicKind;
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub struct Load {
@@ -20,21 +14,8 @@ impl MnemonicKind for Load {
         "load"
     }
 
-    fn fmt(&self, f: &mut Formatter<'_>, ctx: &Context<'_>) -> std::fmt::Result {
-        write!(
-            f,
-            "load({}:{}, {});",
-            Space::from_id(ctx, self.space)
-                .name
-                .as_deref()
-                .unwrap_or(&format!("space: {}", self.space)),
-            self.size,
-            ValueRef::new(self.ptr, ctx)
-        )
-    }
-
-    fn args(&self) -> Args {
-        smallvec![self.ptr]
+    fn args(&self) -> Vec<ValueId> {
+        vec![self.ptr]
     }
 }
 
@@ -62,22 +43,8 @@ impl MnemonicKind for Store {
         "store"
     }
 
-    fn fmt(&self, f: &mut Formatter<'_>, ctx: &Context<'_>) -> std::fmt::Result {
-        write!(
-            f,
-            "store({}:{}, {} <- {});",
-            Space::from_id(ctx, self.space)
-                .name
-                .as_deref()
-                .unwrap_or(&format!("space: {}", self.space)),
-            self.size,
-            ValueRef::new(self.ptr, ctx),
-            ValueRef::new(self.src, ctx)
-        )
-    }
-
-    fn args(&self) -> Args {
-        smallvec![self.ptr, self.src]
+    fn args(&self) -> Vec<ValueId> {
+        vec![self.ptr, self.src]
     }
 }
 
@@ -85,6 +52,7 @@ impl MnemonicKind for Store {
 mod tests {
     use qcode_macro::qcode;
 
+    use crate::context::Context;
     use crate::value::{
         BasicBlock, LiteralId, Varnode, VarnodeId,
         insn::{Instruction, Mnemonic},
@@ -145,7 +113,7 @@ mod tests {
 
         assert_eq!(store.size(), 0);
         assert!(store.space().is_none());
-        assert_eq!(store.as_statement().to_string(), "store(ram:4, i32 %ptr <- 0x7);");
+        assert_eq!(store.as_statement().to_string(), "store(ram:4, i32 %ptr <- i32 0x7);");
     }
 
     #[test]
@@ -220,7 +188,7 @@ mod tests {
             panic!("expected store instruction");
         };
         assert_eq!(store_mnemonic.space, a.space().id);
-        assert_eq!(store.as_statement().to_string(), "store(A:8, i64 %ptr <- 0x7);");
+        assert_eq!(store.as_statement().to_string(), "store(A:8, i64 %ptr <- i64 0x7);");
     }
 
     #[test]

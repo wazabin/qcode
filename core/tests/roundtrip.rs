@@ -74,7 +74,7 @@ fn roundtrip_int_binops() {
             %smod = @x s% @y;
             return @x;
         ",
-        "@x s>> @y",
+        "i32 @x s>> i32 @y",
     );
 }
 
@@ -88,7 +88,7 @@ fn roundtrip_bool_binops() {
             %xor = @x ^^ @y;
             return @x;
         ",
-        "@x ^^ @y",
+        "i8 @x ^^ i8 @y",
     );
 }
 
@@ -109,7 +109,7 @@ fn roundtrip_float_binops() {
             %ge = @x f>= @y;
             return @x;
         ",
-        "@x f<= @y",
+        "i64 @x f<= i64 @y",
     );
 }
 
@@ -129,7 +129,7 @@ fn roundtrip_unops() {
             %round = round(@f);
             return @x;
         ",
-        "abs(@f)",
+        "abs(i64 @f)",
     );
 }
 
@@ -145,7 +145,7 @@ fn roundtrip_casts() {
             %f2f = float2float(f64, @f);
             return @x;
         ",
-        "int2float(f64, @x)",
+        "int2float(f64, i32 @x)",
     );
 }
 
@@ -175,7 +175,7 @@ fn roundtrip_flags() {
             %sb = sborrow(@x, @y);
             return @x;
         ",
-        "sborrow(@x, @y)",
+        "sborrow(i32 @x, i32 @y)",
     );
 }
 
@@ -188,7 +188,7 @@ fn roundtrip_load_store() {
             store(ram:4, @p <- @v);
             return %l;
         ",
-        "store(ram:4, @p <- @v)",
+        "store(ram:4, i64 @p <- i32 @v)",
     );
 }
 
@@ -201,7 +201,7 @@ fn roundtrip_tuple_extract() {
             %e = extract(%t.lo);
             return %e;
         ",
-        "pack(lo=@x, hi=@y)",
+        "pack(lo=i32 @x, hi=i32 @y)",
     );
 }
 
@@ -216,7 +216,7 @@ fn roundtrip_branch_and_cbranch() {
         <f>
             return @c;
         ",
-        "if @c goto",
+        "if i8 @c goto",
     );
 }
 
@@ -227,7 +227,7 @@ fn roundtrip_branchind() {
         <b @p:i64>
             goto [@p];
         ",
-        "goto [@p]",
+        "goto [i64 @p]",
     );
 }
 
@@ -239,7 +239,7 @@ fn roundtrip_assert() {
             assert @c;
             return @c;
         ",
-        "assert @c",
+        "assert i8 @c",
     );
 }
 
@@ -298,7 +298,7 @@ fn roundtrip_map() {
             %r = body <$> @a;
             return %r;
         ",
-        "body <$> @a",
+        "body <$> i64 @a",
     );
 }
 
@@ -309,7 +309,7 @@ fn roundtrip_callind() {
         <b @p:i64>
             call [@p];
         ",
-        "call [@p]",
+        "call [i64 @p]",
     );
 }
 
@@ -320,7 +320,7 @@ fn roundtrip_callind_with_args() {
         <b @p:i64 @x:i32 @y:i32>
             call [@p](@x, @y);
         ",
-        "call [@p](@x, @y)",
+        "call [i64 @p](i32 @x, i32 @y)",
     );
 }
 
@@ -347,6 +347,6 @@ fn roundtrip_return_value_at() {
         <b @v:i64 @p:i64>
             return @v at @p;
         ",
-        "return @v at @p",
+        "return i64 @v at i64 @p",
     );
 }
