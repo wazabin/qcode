@@ -4,7 +4,7 @@ use qcode::{
     context::Context,
     space::SpaceId,
     value::{
-        ValueId, ValueRef, Varnode,
+        Function, FunctionId, ValueId, ValueRef, Varnode,
         insn::{Binop, IntBinop, Mnemonic},
     },
 };
@@ -268,6 +268,41 @@ impl AliasResult {
     /// ranges. Overlapping varnodes in the same space are joined; only pointer
     /// values that actually participate in loads/stores are added.
     pub fn simple(ctx: &Context) -> Self {
+        let mut pointer_uses: Vec<(ValueId, SpaceId, usize)> = Vec::new();
+        for insn in ctx.instructions() {
+            match insn.mnemonic() {
+                Mnemonic::Load(load) => pointer_uses.push((load.ptr, load.space, load.size)),
+                Mnemonic::Store(store) => pointer_uses.push((store.ptr, store.space, store.size)),
+                _ => {}
+            }
+        }
+        Self::from_pointer_uses(ctx, pointer_uses)
+    }
+
+    /// Like [`simple`](Self::simple), but only scans `function_id`'s own
+    /// instructions for pointer uses. The varnode equivalence classes are
+    /// architectural (overlapping register sub-views), so the may-alias answers
+    /// for that function's pointers are identical to the whole-program build —
+    /// while building it avoids re-scanning every instruction in the program
+    /// once per function (the O(functions × program) cost callers like
+    /// `bind_args`/`resolve_arg_loads` paid by rebuilding `simple` per function).
+    pub fn simple_for_function(ctx: &Context, function_id: FunctionId) -> Self {
+        let mut pointer_uses: Vec<(ValueId, SpaceId, usize)> = Vec::new();
+        for block in Function::from_id(ctx, function_id).blocks() {
+            for insn in block.iter() {
+                match insn.mnemonic() {
+                    Mnemonic::Load(load) => pointer_uses.push((load.ptr, load.space, load.size)),
+                    Mnemonic::Store(store) => {
+                        pointer_uses.push((store.ptr, store.space, store.size))
+                    }
+                    _ => {}
+                }
+            }
+        }
+        Self::from_pointer_uses(ctx, pointer_uses)
+    }
+
+    fn from_pointer_uses(ctx: &Context, pointer_uses: Vec<(ValueId, SpaceId, usize)>) -> Self {
         let mut a = Analysis {
             ctx,
             value_to_root: HashMap::new(),
@@ -321,16 +356,8 @@ impl AliasResult {
             }
         }
 
-        // Collect all pointer values from loads and stores, then resolve each one.
-        let pointer_uses: Vec<(ValueId, SpaceId, usize)> = ctx
-            .instructions()
-            .filter_map(|insn| match insn.mnemonic() {
-                Mnemonic::Load(load) => Some((load.ptr, load.space, load.size)),
-                Mnemonic::Store(store) => Some((store.ptr, store.space, store.size)),
-                _ => None,
-            })
-            .collect();
-
+        // Resolve each pointer use collected by the caller (whole-program or a
+        // single function) against the varnode equivalence classes above.
         // pointer_spaces guards the invariant that a given pointer value always
         // refers to the same address space across all uses.
         let mut pointer_spaces: HashMap<ValueId, SpaceId> = HashMap::new();

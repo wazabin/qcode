@@ -271,7 +271,10 @@ pub fn resolve_arg_loads(ctx: &mut Context, function_id: FunctionId) {
     use crate::{AliasResult, constant_fold_function, gvn_function, remove_dead_insns};
 
     constant_fold_function(ctx, function_id);
-    let aliases = AliasResult::simple(ctx);
+    // Only this function's pointers are forwarded here, so build the alias set
+    // from its own instructions instead of re-scanning the whole program once
+    // per function (resolve_arg_loads runs per function across the program).
+    let aliases = AliasResult::simple_for_function(ctx, function_id);
     gvn_function(ctx, function_id, Some(&aliases));
     constant_fold_function(ctx, function_id);
 

@@ -394,13 +394,21 @@ impl MemForward {
             return;
         }
 
-        // The header itself is included: a store after the load but before the
-        // back edge clobbers the inherited value on every later iteration.
-        let body: Vec<BlockId> = ctx
-            .block_ids()
-            .into_iter()
-            .filter(|&b| tree.dominates(block_id, b))
-            .collect();
+        // Every block the header dominates is a candidate loop body: a store
+        // there can clobber the inherited value on a later iteration (the header
+        // itself is included — a store after the load but before the back edge
+        // counts). Walk the dominator-tree subtree rooted at the header rather
+        // than scanning — and dominance-testing — every block in the whole
+        // program, which is O(program) per loop header and made gvn scale with
+        // total lifted code instead of the current function.
+        let mut body = vec![block_id];
+        let mut frontier = vec![block_id];
+        while let Some(b) = frontier.pop() {
+            for &child in tree.children_of(b) {
+                body.push(child);
+                frontier.push(child);
+            }
+        }
         let stores: Vec<Store> = body
             .iter()
             .flat_map(|&b| {

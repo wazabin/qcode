@@ -897,7 +897,9 @@ impl FunctionPass for DeadLoad {
         fun_id: FunctionId,
         _env: &PipelineEnv,
     ) -> Result<bool, String> {
-        let aliases = AliasResult::simple(ctx);
+        // Per-function pass: scope the alias oracle to this function so the
+        // stage is O(program) total, not O(functions × program).
+        let aliases = AliasResult::simple_for_function(ctx, fun_id);
         Ok(remove_dead_load_insns(ctx, fun_id, Some(&aliases), &[]))
     }
 }
@@ -921,7 +923,9 @@ impl FunctionPass for DeadStore {
         fun_id: FunctionId,
         env: &PipelineEnv,
     ) -> Result<bool, String> {
-        let aliases = AliasResult::simple(ctx);
+        // Per-function pass: scope the alias oracle to this function so the
+        // stage is O(program) total, not O(functions × program).
+        let aliases = AliasResult::simple_for_function(ctx, fun_id);
         Ok(remove_dead_load_insns(
             ctx,
             fun_id,

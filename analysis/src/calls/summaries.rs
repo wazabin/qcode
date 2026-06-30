@@ -238,26 +238,44 @@ pub fn compute_input_regs(ctx: &Context, function_id: FunctionId) -> Vec<Varnode
     let mut live_in: HashMap<BlockId, HashSet<VarnodeId>> =
         blocks.iter().map(|&b| (b, HashSet::new())).collect();
 
-    let mut changed = true;
-    while changed {
-        changed = false;
-        for &block in &blocks {
-            let mut live_out: HashSet<VarnodeId> = HashSet::new();
-            for &succ in &succs[&block] {
-                if let Some(set) = live_in.get(&succ) {
-                    live_out.extend(set.iter().copied());
-                }
+    // Predecessor map: a block's live-in feeds its predecessors' live-out, so a
+    // change only needs the predecessors recomputed.
+    let mut preds: HashMap<BlockId, Vec<BlockId>> =
+        blocks.iter().map(|&b| (b, Vec::new())).collect();
+    for &block in &blocks {
+        for &succ in &succs[&block] {
+            if let Some(entry) = preds.get_mut(&succ) {
+                entry.push(block);
             }
-            let (used, defined) = &flow[&block];
-            let mut new_live_in = used.clone();
-            for vn in live_out {
-                if !defined.contains(&vn) {
-                    new_live_in.insert(vn);
-                }
+        }
+    }
+
+    // Worklist fixpoint: recompute a block only when a successor's live-in
+    // changed, rather than re-sweeping every block to stability — same monotone
+    // equations and same fixpoint, but no O(B²) sweep on large functions.
+    let mut worklist: Vec<BlockId> = blocks.clone();
+    let mut queued: HashSet<BlockId> = blocks.iter().copied().collect();
+    while let Some(block) = worklist.pop() {
+        queued.remove(&block);
+        let mut live_out: HashSet<VarnodeId> = HashSet::new();
+        for &succ in &succs[&block] {
+            if let Some(set) = live_in.get(&succ) {
+                live_out.extend(set.iter().copied());
             }
-            if new_live_in != live_in[&block] {
-                live_in.insert(block, new_live_in);
-                changed = true;
+        }
+        let (used, defined) = &flow[&block];
+        let mut new_live_in = used.clone();
+        for vn in live_out {
+            if !defined.contains(&vn) {
+                new_live_in.insert(vn);
+            }
+        }
+        if new_live_in != live_in[&block] {
+            live_in.insert(block, new_live_in);
+            for &pred in &preds[&block] {
+                if queued.insert(pred) {
+                    worklist.push(pred);
+                }
             }
         }
     }

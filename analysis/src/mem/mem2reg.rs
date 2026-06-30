@@ -769,20 +769,18 @@ fn live_in_blocks(
         }
     }
 
+    // Liveness flows backward: a block is live-in for `var` if it is
+    // upward-exposed, or a successor is live-in and the block does not define
+    // `var` (a definition kills the inbound value). Propagate from the
+    // upward-exposed seeds to predecessors with a worklist — each block enters
+    // at most once — instead of re-sweeping every block to a fixpoint, which was
+    // O(B²) on large functions.
     let mut live_in = upward_exposed;
-    let mut changed = true;
-    while changed {
-        changed = false;
-        for block in Function::from_id(ctx, function_id).blocks() {
-            if defined.contains(&block.id) || live_in.contains(&block.id) {
-                continue;
-            }
-            if block
-                .successors()
-                .any(|(_, successor)| live_in.contains(&successor))
-            {
-                live_in.insert(block.id);
-                changed = true;
+    let mut worklist: Vec<BlockId> = live_in.iter().copied().collect();
+    while let Some(block_id) = worklist.pop() {
+        for (_, pred) in BasicBlock::from_id(ctx, block_id).predecessors() {
+            if !defined.contains(&pred) && live_in.insert(pred) {
+                worklist.push(pred);
             }
         }
     }
@@ -2518,7 +2516,9 @@ impl FunctionPass for Mem2RegPass {
         fun_id: FunctionId,
         _env: &PipelineEnv,
     ) -> Result<bool, String> {
-        let aliases = AliasResult::simple(ctx);
+        // Per-function pass: scope the alias oracle to this function so the
+        // stage is O(program) total, not O(functions × program).
+        let aliases = AliasResult::simple_for_function(ctx, fun_id);
         Ok(mem2reg(ctx, fun_id, &aliases))
     }
 }

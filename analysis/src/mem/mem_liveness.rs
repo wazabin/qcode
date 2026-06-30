@@ -120,25 +120,48 @@ pub fn compute_memory_liveness(
     let mut killed_in: HashMap<BlockId, KilledSet> =
         blocks.iter().map(|&b| (b, Vec::new())).collect();
 
-    let mut changed = true;
-    while changed {
-        changed = false;
-        for &block in &blocks {
-            let succs = successors(ctx, block);
-            let live_out = union_live(&succs, &live_in);
-            let killed_out = intersect_killed(&succs, &killed_in);
-
-            let (mut new_live_in, mut new_killed_in) =
-                block_transfer(ctx, block, aliases, dead_regs, &live_out, &killed_out);
-            retain_tracked(ctx, &mut new_live_in, &mut new_killed_in);
-
-            if live_changed(&live_in[&block], &new_live_in) {
-                live_in.insert(block, new_live_in);
-                changed = true;
+    // Predecessor map: a block's in-sets feed its predecessors' `live_out` /
+    // `killed_out`, so only the predecessors need recomputing when it changes.
+    let mut preds: HashMap<BlockId, Vec<BlockId>> =
+        blocks.iter().map(|&b| (b, Vec::new())).collect();
+    for &block in &blocks {
+        for succ in successors(ctx, block) {
+            if let Some(entry) = preds.get_mut(&succ) {
+                entry.push(block);
             }
-            if killed_changed(&killed_in[&block], &new_killed_in) {
-                killed_in.insert(block, new_killed_in);
-                changed = true;
+        }
+    }
+
+    // Worklist fixpoint: recompute a block only when one of its successors'
+    // in-sets changed, rather than re-sweeping every block to stability — the
+    // same monotone equations and the same fixpoint, but work proportional to
+    // actual changes instead of O(B²) on large functions.
+    let mut worklist: Vec<BlockId> = blocks.clone();
+    let mut queued: HashSet<BlockId> = blocks.iter().copied().collect();
+    while let Some(block) = worklist.pop() {
+        queued.remove(&block);
+        let succs = successors(ctx, block);
+        let live_out = union_live(&succs, &live_in);
+        let killed_out = intersect_killed(&succs, &killed_in);
+
+        let (mut new_live_in, mut new_killed_in) =
+            block_transfer(ctx, block, aliases, dead_regs, &live_out, &killed_out);
+        retain_tracked(ctx, &mut new_live_in, &mut new_killed_in);
+
+        let mut block_changed = false;
+        if live_changed(&live_in[&block], &new_live_in) {
+            live_in.insert(block, new_live_in);
+            block_changed = true;
+        }
+        if killed_changed(&killed_in[&block], &new_killed_in) {
+            killed_in.insert(block, new_killed_in);
+            block_changed = true;
+        }
+        if block_changed {
+            for &pred in &preds[&block] {
+                if queued.insert(pred) {
+                    worklist.push(pred);
+                }
             }
         }
     }
