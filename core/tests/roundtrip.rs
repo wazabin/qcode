@@ -12,8 +12,6 @@
 //! Known round-trip gaps (a printed form the parser cannot read back), excluded
 //! here by construction:
 //!   - `varnode` declarations are not printed.
-//!   - `call fn name(args)`: the textual `call <name>` form carries no
-//!     arguments, so a direct call's args cannot be expressed.
 //!   - `scan` (`scanl …`) has no grammar production.
 //!   - pointer/struct types print as `T*` / `Struct`, but a value's type
 //!     annotation in the grammar (`ty`) is only `iN`/`fN`; this affects `gep`
@@ -312,6 +310,33 @@ fn roundtrip_callind() {
             call [@p];
         ",
         "call [@p]",
+    );
+}
+
+#[test]
+fn roundtrip_callind_with_args() {
+    roundtrips(
+        "
+        <b @p:i64 @x:i32 @y:i32>
+            call [@p](@x, @y);
+        ",
+        "call [@p](@x, @y)",
+    );
+}
+
+#[test]
+fn roundtrip_call_with_args() {
+    // A direct call's args print as `@<param>=<value>` and must re-parse.
+    roundtrips(
+        "
+        fn callee:
+        <c @a:i32 @b:i32>
+            return @a;
+        fn main:
+        <e @x:i32 @y:i32>
+            call fn callee(@a=@x, @b=@y);
+        ",
+        "call fn callee(",
     );
 }
 

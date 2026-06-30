@@ -82,6 +82,7 @@ fn mnemonic_is_pure(ctx: &Context, m: &Mnemonic) -> bool {
         Mnemonic::Map(m) => Function::from_id(ctx, m.body).is_pure(),
         // A scan is pure exactly when its per-element body is pure (same as map).
         Mnemonic::Scan(m) => Function::from_id(ctx, m.body).is_pure(),
+        Mnemonic::Apply(m) => Function::from_id(ctx, m.target).is_pure(),
         // A direct call to a pure function is a deterministic value of its args
         // and clobbers nothing — provided the call site carries no residual
         // clobbers of its own.

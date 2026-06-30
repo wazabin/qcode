@@ -420,16 +420,58 @@ fn parse_terminator(pair: Pair<'_, Rule>) -> Result<Statement, ParseError> {
         }
 
         Rule::call_stmt => {
-            let mut inner = specific.into_inner();
-            let target = label_value(
-                inner
-                    .next()
-                    .ok_or_else(|| ParseError::new("missing call target"))?
-                    .into_inner()
-                    .next()
-                    .ok_or_else(|| ParseError::new("missing call target content"))?,
-            )?;
-            Ok(Statement::Call { target, span })
+            let form = specific
+                .into_inner()
+                .next()
+                .ok_or_else(|| ParseError::new("missing call form"))?;
+            let mut target = None;
+            let mut args = Vec::new();
+            match form.as_rule() {
+                Rule::call_direct => {
+                    for part in form.into_inner() {
+                        match part.as_rule() {
+                            Rule::ident => target = Some(part.as_str().to_owned()),
+                            Rule::call_arg => {
+                                let mut inner = part.into_inner();
+                                let name = inner
+                                    .next()
+                                    .ok_or_else(|| ParseError::new("missing call arg name"))?
+                                    .as_str()
+                                    .to_owned();
+                                let atom = parse_typed_atom(
+                                    inner
+                                        .next()
+                                        .ok_or_else(|| ParseError::new("missing call arg value"))?,
+                                )?;
+                                args.push((name, atom));
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+                Rule::call_legacy => {
+                    let label = label_value(
+                        form.into_inner()
+                            .next()
+                            .ok_or_else(|| ParseError::new("missing call target"))?
+                            .into_inner()
+                            .next()
+                            .ok_or_else(|| ParseError::new("missing call target content"))?,
+                    )?;
+                    match label {
+                        Label::Named { name, .. } => target = Some(name),
+                        Label::Address { .. } => {
+                            return Err(ParseError::new("call with address target is not supported"));
+                        }
+                    }
+                }
+                _ => {}
+            }
+            Ok(Statement::Call {
+                target: target.ok_or_else(|| ParseError::new("missing call target"))?,
+                args,
+                span,
+            })
         }
 
         Rule::callind_stmt => {
@@ -439,7 +481,13 @@ fn parse_terminator(pair: Pair<'_, Rule>) -> Result<Statement, ParseError> {
                     .next()
                     .ok_or_else(|| ParseError::new("missing callind pointer"))?,
             )?;
-            Ok(Statement::CallInd { ptr, span })
+            let mut args = Vec::new();
+            if let Some(arg_list) = inner.next() {
+                for atom in arg_list.into_inner() {
+                    args.push(parse_typed_atom(atom)?);
+                }
+            }
+            Ok(Statement::CallInd { ptr, args, span })
         }
 
         Rule::return_stmt => {
@@ -1674,11 +1722,38 @@ mod tests {
         assert_eq!(statements.len(), 1);
 
         match &statements[0] {
-            Statement::Call {
-                target: Label::Named { name, .. },
-                ..
-            } => assert_eq!(name, "target"),
+            Statement::Call { target, args, .. } => {
+                assert_eq!(target, "target");
+                assert!(args.is_empty());
+            }
             _ => panic!("expected call statement"),
+        }
+    }
+
+    #[test]
+    fn parses_call_with_args() {
+        let statements = stmts("call fn callee(@arg0={x}, @arg1={y})");
+        assert_eq!(statements.len(), 1);
+
+        match &statements[0] {
+            Statement::Call { target, args, .. } => {
+                assert_eq!(target, "callee");
+                assert_eq!(args.len(), 2);
+                assert_eq!(args[0].0, "@arg0");
+                assert_eq!(args[1].0, "@arg1");
+            }
+            _ => panic!("expected call statement"),
+        }
+    }
+
+    #[test]
+    fn parses_callind_with_args() {
+        let statements = stmts("call [{ptr}]({a}, {b})");
+        assert_eq!(statements.len(), 1);
+
+        match &statements[0] {
+            Statement::CallInd { args, .. } => assert_eq!(args.len(), 2),
+            _ => panic!("expected callind statement"),
         }
     }
 

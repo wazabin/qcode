@@ -181,7 +181,18 @@ impl MnemonicKind for CallInd {
     }
 
     fn fmt(&self, f: &mut Formatter<'_>, ctx: &Context<'_>) -> std::fmt::Result {
-        write!(f, "call [{}];", ValueRef::new(self.ptr, ctx))
+        write!(f, "call [{}]", ValueRef::new(self.ptr, ctx))?;
+        if !self.args.is_empty() {
+            write!(f, "(")?;
+            for (i, &arg) in self.args.iter().enumerate() {
+                if i > 0 {
+                    write!(f, ", ")?;
+                }
+                write!(f, "{}", ValueRef::new(arg, ctx))?;
+            }
+            write!(f, ")")?;
+        }
+        write!(f, ";")
     }
 
     fn args(&self) -> Args {

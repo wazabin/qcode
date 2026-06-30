@@ -1396,11 +1396,19 @@ impl<'str, 'ctx> Builder<'str, 'ctx> {
     }
 
     pub fn push_call(&mut self, target: FunctionId) -> InstructionRef<'str, '_> {
+        self.push_call_with_args(target, vec![])
+    }
+
+    pub fn push_call_with_args(
+        &mut self,
+        target: FunctionId,
+        args: Vec<ValueId>,
+    ) -> InstructionRef<'str, '_> {
         let id = self
             .push_instruction(
                 Mnemonic::Call(Call {
                     target,
-                    args: vec![],
+                    args,
                     clobbers: vec![],
                 }),
                 0,
@@ -1411,8 +1419,16 @@ impl<'str, 'ctx> Builder<'str, 'ctx> {
     }
 
     pub fn push_call_ind(&mut self, ptr: ValueId) -> InstructionRef<'str, '_> {
+        self.push_call_ind_with_args(ptr, vec![])
+    }
+
+    pub fn push_call_ind_with_args(
+        &mut self,
+        ptr: ValueId,
+        args: Vec<ValueId>,
+    ) -> InstructionRef<'str, '_> {
         let id = self
-            .push_instruction(Mnemonic::CallInd(CallInd { ptr, args: vec![] }), 0)
+            .push_instruction(Mnemonic::CallInd(CallInd { ptr, args }), 0)
             .id;
         self.is_terminated = true;
         self.context().get_insn(id)

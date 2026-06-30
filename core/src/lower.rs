@@ -475,17 +475,21 @@ impl Lowerer<'_, '_, '_> {
                 self.b.switch_to_block(f);
             }
 
-            Statement::Call { target, .. } => {
-                let Label::Named { name, .. } = target else {
-                    return Err("call with address target is not supported".into());
-                };
-                let t = self.b.get_or_make_local_function(Cow::Owned(name.clone()));
-                self.b.push_call(t);
+            Statement::Call { target, args, .. } => {
+                let t = self.b.get_or_make_local_function(Cow::Owned(target.clone()));
+                // Arg names are decorative (the callee's parameter names as
+                // printed); only the positional atoms are bound.
+                let argv = args
+                    .iter()
+                    .map(|(_, atom)| self.atom(atom, None))
+                    .collect::<Result<Vec<_>, _>>()?;
+                self.b.push_call_with_args(t, argv);
             }
 
-            Statement::CallInd { ptr, .. } => {
+            Statement::CallInd { ptr, args, .. } => {
                 let p = self.ptr_atom(ptr)?;
-                self.b.push_call_ind(p);
+                let argv = self.atoms(args)?;
+                self.b.push_call_ind_with_args(p, argv);
             }
 
             Statement::Return { ptr, value, .. } => {

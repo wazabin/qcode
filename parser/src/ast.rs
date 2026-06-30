@@ -257,11 +257,18 @@ pub enum Statement {
         span: SourceSpan,
     },
     Call {
-        target: Label,
+        target: String,
+        /// Arguments passed to the callee, one per inferred callee input, in
+        /// order. The name in each pair is the callee's parameter name as
+        /// printed (`@r0`, `@arg1`, …); it is decorative and discarded on
+        /// lowering, where only the positional atoms matter.
+        args: Vec<(String, TypedAtom)>,
         span: SourceSpan,
     },
     CallInd {
         ptr: TypedAtom,
+        /// Positional arguments passed to the indirect callee.
+        args: Vec<TypedAtom>,
         span: SourceSpan,
     },
     Return {

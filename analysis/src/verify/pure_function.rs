@@ -75,6 +75,9 @@ fn impurity(ctx: &Context, m: &Mnemonic) -> Option<&'static str> {
         Mnemonic::Scan(m) => {
             (!Function::from_id(ctx, m.body).is_pure()).then_some("scan with impure body")
         }
+        Mnemonic::Apply(m) => {
+            (!Function::from_id(ctx, m.target).is_pure()).then_some("apply with impure target")
+        }
         // A pure function reads its inputs only through params: a raw varnode
         // operand is an un-functionalized register/global read.
         _ => m

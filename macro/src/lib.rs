@@ -209,8 +209,17 @@ fn collect_statement(stmt: &Statement, names: &mut Names) {
                 collect_atom(atom, names);
             }
         }
-        Statement::Call { .. } => {}
-        Statement::CallInd { ptr, .. } => collect_atom(ptr, names),
+        Statement::Call { args, .. } => {
+            for (_, atom) in args {
+                collect_atom(atom, names);
+            }
+        }
+        Statement::CallInd { ptr, args, .. } => {
+            collect_atom(ptr, names);
+            for atom in args {
+                collect_atom(atom, names);
+            }
+        }
         Statement::Return { ptr, value, .. } => {
             collect_atom(ptr, names);
             if let Some(v) = value {

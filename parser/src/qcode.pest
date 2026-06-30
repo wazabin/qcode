@@ -28,8 +28,14 @@ branch_label    =  { "<" ~ (ident | integer) ~ branch_arg* ~ ">" }
 branch_arg      =  { block_param_name ~ "=" ~ typed_atom }
 branchind_stmt  =  { "goto" ~ "[" ~ typed_atom ~ "]" }
 cbranch_stmt    =  { "if" ~ typed_atom ~ "goto" ~ branch_label ~ "else" ~ "goto" ~ branch_label }
-call_stmt       =  { "call" ~ label }
-callind_stmt    =  { "call" ~ "[" ~ typed_atom ~ "]" }
+// `call fn name(@p0=arg, …)` is canonical (the printed form). `call <name>`
+// is an accepted arg-less shorthand kept for hand-written IR / older tests.
+call_stmt       =  { "call" ~ (call_direct | call_legacy) }
+call_direct     =  { "fn" ~ ident ~ "(" ~ (call_arg ~ ("," ~ call_arg)*)? ~ ")" }
+call_legacy     =  { label }
+call_arg        =  { block_param_name ~ "=" ~ typed_atom }
+callind_stmt    =  { "call" ~ "[" ~ typed_atom ~ "]" ~ callind_args? }
+callind_args    =  { "(" ~ (typed_atom ~ ("," ~ typed_atom)*)? ~ ")" }
 return_stmt     =  { return_at_stmt | return_value_at_stmt | return_value_stmt }
 return_at_stmt  =  { "return" ~ "at" ~ typed_atom }
 return_value_at_stmt = { "return" ~ typed_atom ~ "at" ~ typed_atom }
