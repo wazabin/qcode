@@ -28,12 +28,12 @@ pub use pass::{
     DynFunctionPass, DynPass, FunctionPass, Pass, PassRegistration, PipelineEnv, RegisteredPass,
 };
 
-use rustc_hash::FxHashMap as HashMap;
+use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
 
 use qcode::{
     assumption::{PassName, Proposition},
     context::Context,
-    value::{RegisterId, ValueId, VarnodeId},
+    value::{FunctionId, RegisterId, ValueId, VarnodeId},
 };
 
 use crate::{
@@ -305,6 +305,13 @@ fn lift_and_discover_until_quiet(
     discovery_round: &mut usize,
     progress: &mut impl FnMut(PipelineProgress),
 ) -> bool {
+    // Fingerprint of each function's clean IR as analyzed in the previous discovery
+    // round. Address discovery is function-local and deterministic, so a function whose
+    // clean IR is unchanged re-derives exactly the discoveries it produced last round
+    // (already drained) — only changed/new functions need re-analysis. This drives the
+    // `restrict` set below; on large binaries it turns a late round that re-optimizes
+    // thousands of functions to find a few addresses into one that touches only those.
+    let mut prev_bodies: HashMap<FunctionId, u64> = HashMap::default();
     loop {
         if *discovery_round >= MAX_ANALYZE_LIFT_ROUNDS {
             log::warn!(
@@ -329,14 +336,43 @@ fn lift_and_discover_until_quiet(
             log::warn!(target: "pipeline", "lifting phase failed, continuing best-effort: {e}");
         }
 
+        // Restrict this round's address discovery to functions whose clean IR changed
+        // (or appeared) since the previous round — every other function would re-derive
+        // the same, already-drained discoveries. The fingerprints are taken after the
+        // lifting phase so they reflect this round's newly lifted blocks, last round's
+        // drained discoveries, and any function splits. Round 1 (empty map) analyzes
+        // everything. Note `function_fingerprint` keys on the rendered body, so a
+        // split or block edit deterministically shows up as a change next round.
+        let bodies: HashMap<FunctionId, u64> = clean
+            .functions()
+            .filter(|f| !f.is_external())
+            .map(|f| (f.id, config::function_fingerprint(clean, f.id)))
+            .collect();
+        let restrict: HashSet<FunctionId> = bodies
+            .iter()
+            .filter(|(f, fp)| prev_bodies.get(f) != Some(fp))
+            .map(|(f, _)| *f)
+            .collect();
+        log::info!(
+            target: "pipeline",
+            "discovery round {round}: analyzing {}/{} functions changed since last round",
+            restrict.len(),
+            bodies.len(),
+        );
+        prev_bodies = bodies;
+
         // Derive a disposable function-local analysis context from clean IR.
         // Discoveries found here are the only durable output; analysis residue is
         // discarded so newly lifted blocks invalidate the whole owning function.
         let mut ctx = clean.clone();
         let analysis_env = PipelineEnv::new(clean, cfg.clone());
-        if let Err(e) =
-            pipeline.run_address_discovery_phase(&mut ctx, &analysis_env, round, progress)
-        {
+        if let Err(e) = pipeline.run_address_discovery_phase(
+            &mut ctx,
+            &analysis_env,
+            Some(&restrict),
+            round,
+            progress,
+        ) {
             log::warn!(target: "pipeline", "address discovery pass failed, continuing best-effort: {e}");
         }
 
@@ -351,6 +387,7 @@ fn lift_and_discover_until_quiet(
         let split = crate::split_overlapping_functions(clean);
 
         let pending = split || !clean.has_no_discoveries();
+
         log_round_stats(round);
         #[cfg(not(target_arch = "wasm32"))]
         log::info!(

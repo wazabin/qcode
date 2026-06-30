@@ -403,6 +403,7 @@ impl Pipeline {
                         stage,
                         passes,
                         dirty_functions.as_ref(),
+                        None,
                         &mut cache,
                         round,
                         progress,
@@ -421,10 +422,19 @@ impl Pipeline {
     /// Run only the function-local analysis needed to discover additional code
     /// addresses. Module-scoped stages are skipped here; the full interprocedural
     /// pipeline runs only after lifting reaches a fixpoint.
+    ///
+    /// `restrict`, when `Some`, limits analysis to functions whose clean IR changed
+    /// since the previous discovery round. Address discovery is function-local (only
+    /// `Function` stages run here; `Module` stages are skipped), so a function with
+    /// unchanged IR re-derives exactly the discoveries it produced last round — which
+    /// were already drained — making it safe to skip. This is the dominant cost on
+    /// large binaries: a late round re-optimizes thousands of functions to find a
+    /// handful of new addresses.
     pub fn run_address_discovery_phase(
         &self,
         ctx: &mut Context,
         env: &PipelineEnv,
+        restrict: Option<&HashSet<FunctionId>>,
         round: usize,
         progress: &mut impl FnMut(PipelineProgress),
     ) -> Result<(), String> {
@@ -442,6 +452,7 @@ impl Pipeline {
                         stage,
                         passes,
                         dirty_functions.as_ref(),
+                        restrict,
                         &mut cache,
                         round,
                         progress,
@@ -484,6 +495,7 @@ impl Pipeline {
                         stage,
                         passes,
                         dirty_functions.as_ref(),
+                        None,
                         &mut cache,
                         round,
                         progress,
@@ -737,7 +749,7 @@ impl FixpointCache {
 /// module stage modified it. Rendering the IR captures operand rewrites,
 /// insertions/removals, and CFG edits; block order is address-sorted (deterministic)
 /// so an unchanged function fingerprints identically across a stage.
-fn function_fingerprint(ctx: &Context, fun_id: FunctionId) -> u64 {
+pub(super) fn function_fingerprint(ctx: &Context, fun_id: FunctionId) -> u64 {
     use std::hash::{Hash, Hasher};
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
     FunctionRef::from_id(ctx, fun_id)
@@ -749,12 +761,18 @@ fn function_fingerprint(ctx: &Context, fun_id: FunctionId) -> u64 {
 /// Run a function-scoped stage function-major: for each non-external function,
 /// run the stage's passes; if `repeat_until` is set, loop that function's passes
 /// to a fixpoint before moving to the next function.
+#[allow(clippy::too_many_arguments)]
 fn run_function_stage(
     ctx: &mut Context,
     env: &PipelineEnv,
     stage: &Stage,
     passes: &[Box<dyn DynFunctionPass>],
     previous_dirty: Option<&HashSet<FunctionId>>,
+    // Cross-round skip: when `Some`, only these functions are processed. The address
+    // discovery loop passes the set of functions whose clean IR changed since the
+    // previous round — every other function would re-derive the same (already-drained)
+    // discoveries, so re-optimizing it is pure waste. `None` processes all functions.
+    restrict: Option<&HashSet<FunctionId>>,
     cache: &mut FixpointCache,
     round: usize,
     progress: &mut impl FnMut(PipelineProgress),
@@ -764,6 +782,7 @@ fn run_function_stage(
         .filter(|f| stage.include_external || !f.is_external())
         .map(|f| f.id)
         .filter(|id| !stage.only_dirty || previous_dirty.is_none_or(|dirty| dirty.contains(id)))
+        .filter(|id| restrict.is_none_or(|r| r.contains(id)))
         .collect();
     let total = fun_ids.len();
     let stage_name: std::sync::Arc<str> = stage.name.as_str().into();
