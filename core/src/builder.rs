@@ -425,9 +425,16 @@ impl<'str, 'ctx> Builder<'str, 'ctx> {
         if let Some(&id) = self.local_labels.get(name.as_ref()) {
             id
         } else {
+            // SLEIGH pcode label names (e.g. `start`, `end`) are only unique
+            // within a single instruction's lowering, but block names are
+            // context-global. Deduplicate with a numeric suffix so the same
+            // label appearing in different instructions/functions doesn't
+            // collide. The `local_labels` map stays keyed by the original name
+            // so within-instruction references still resolve to this block.
+            let unique_name = self.context_mut().get_unique_name(name.clone());
             let id = BasicBlock::make(self.context_mut())
-                .with_name(name.clone())
-                .expect("Block name already exists")
+                .with_name(unique_name)
+                .expect("name was deduplicated")
                 .id;
             self.local_labels.insert(name, id);
             self.ensure_created_block_in_function(id);
