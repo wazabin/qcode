@@ -839,6 +839,11 @@ impl Mem2Reg<'_, '_> {
         edge: BranchEdge<'_>,
         state: &mut RenameState<'_>,
     ) -> Vec<ValueId> {
+        // A tail-call edge into another function's entry carries that function's
+        // own params, meaningless to wire from this promotion; leave it untouched.
+        if !self.in_function(edge.target) {
+            return edge.existing_args.to_vec();
+        }
         let param_count = BasicBlock::from_id(self.ctx, edge.target).params().count();
 
         // Seed every slot with the argument already on the branch (from a prior run).
@@ -1174,7 +1179,25 @@ fn decide_variable_value(var: ValueId, frames: &[Frame]) -> Option<FrameEntry> {
 }
 
 impl Mem2Reg<'_, '_> {
+    /// True if `block` belongs to the function being promoted.
+    ///
+    /// A tail-call `Branch`/`CBranch` names another function's *entry* as its
+    /// terminator target — a legitimate inter-procedural jump (the CFG edge is
+    /// stripped by `split`'s `remove_cross_function_edges`, but the terminator
+    /// still records the target). The rename walk follows terminator targets, so
+    /// it must stop at that boundary itself — exactly like `claimed_from` in
+    /// split.rs — rather than descend into a foreign function's blocks, whose
+    /// loads reference the same globally-interned stack slots yet have no
+    /// reaching definition in *this* function's promotion.
+    fn in_function(&self, block: BlockId) -> bool {
+        BasicBlock::from_id(self.ctx, block).parent().map(|f| f.id) == Some(self.function_id)
+    }
+
     fn decide_values_start_from(&mut self, block: BlockId, state: &mut RenameState<'_>) {
+        // Never cross a tail-call boundary into another function's blocks.
+        if !self.in_function(block) {
+            return;
+        }
         if state.visited.contains(&block) {
             return;
         }
@@ -2530,6 +2553,99 @@ mod tests {
         assert!(
             entry_has_store,
             "the temp store must be kept while its load survives (no v0/v1 leak)"
+        );
+    }
+
+    /// Regression: the rename walk follows terminator targets, and a tail-call
+    /// `Branch` names another function's entry as its target. Stack-slot literals
+    /// are interned per `(offset, StackAddress)`, so the *same* `ValueId` appears
+    /// in both functions. If the walk descends across that boundary it decides a
+    /// reaching value for this function's promoted slot inside a block it never
+    /// analyzed — and a stack slot with no reaching definition panics by design.
+    /// The walk must stop at the function boundary, like split's `claimed_from`.
+    #[test]
+    fn rename_walk_stops_at_tail_call_into_another_function() {
+        use qcode::{
+            builder::Builder,
+            space::{Space, SpaceType},
+            testing::TestContext,
+        };
+
+        let mut tc = TestContext::new();
+        let ctx = &mut tc.ctx;
+
+        // A StackAddress-typed slot literal `s`, shared (by interning) between the
+        // promoted function and the foreign block it must not descend into.
+        let stack = ctx.add_space(Space {
+            name: Some(Box::from("stack")),
+            word_size: 1,
+            addr_size: 8,
+            ty: SpaceType::Ram,
+        });
+        let sa = ctx.types.get_or_make_stack_address(8, Some(stack));
+        let slot = qcode::types::stack_base(8).wrapping_sub(8);
+        let s = ValueId::Literal(ctx.values.get_or_make_typed_literal(slot, sa, 8));
+
+        // Function A promotes `s` (stored+loaded on one CBranch arm); the other
+        // arm tail-jumps into function B, which loads `s`. Neither `a_entry` nor
+        // the tail arm defines `s`, so on the tail path `s` has no reaching value.
+        let a = Function::make(ctx, "promoted".into()).unwrap().id;
+        let a_entry = ctx.get_or_make_block(0x1000);
+        let a_store = ctx.get_or_make_block(0x1100);
+        let a_tail = ctx.get_or_make_block(0x1200);
+        {
+            let mut fr = Function::from_id_mut(ctx, a);
+            fr.set_root(a_entry).unwrap();
+            fr.add_block(a_store);
+            fr.add_block(a_tail);
+        }
+
+        let b = Function::make(ctx, "callee".into()).unwrap().id;
+        let b_entry = ctx.get_or_make_block(0x2000);
+        Function::from_id_mut(ctx, b).set_root(b_entry).unwrap();
+
+        // a_entry: if 1 goto a_store else goto a_tail
+        {
+            let mut bld = Builder::from_block(BasicBlock::from_id_mut(ctx, a_entry));
+            let cond = bld.context_mut().get_const(1u64, 1).id();
+            bld.push_cbranch(cond, a_store, a_tail);
+        }
+        // a_store: store(s, 0x42); load(s); return  -> makes `s` promotable in A
+        {
+            let mut bld = Builder::from_block(BasicBlock::from_id_mut(ctx, a_store));
+            let val = bld.context_mut().get_const(0x42u64, 8).id();
+            bld.push_store(val, s, stack);
+            bld.push_load::<false>(s, 8, stack);
+            let ret = bld.context_mut().get_const(0u64, 8).id();
+            bld.push_return(ret);
+        }
+        // a_tail: goto b_entry  (a tail jump into function B, no store of `s`)
+        {
+            let mut bld = Builder::from_block(BasicBlock::from_id_mut(ctx, a_tail));
+            bld.push_branch(b_entry);
+        }
+        // b_entry: load(s); return  (foreign block reading the shared slot)
+        let b_load = {
+            let mut bld = Builder::from_block(BasicBlock::from_id_mut(ctx, b_entry));
+            let load = bld.push_load::<false>(s, 8, stack).id();
+            let ret = bld.context_mut().get_const(0u64, 8).id();
+            bld.push_return(ret);
+            load
+        };
+
+        // Without the boundary guard this panics decoding `s` in `b_entry`.
+        let aliases = AliasResult::simple(&*ctx);
+        mem2reg(ctx, a, &aliases);
+
+        // The foreign load is untouched — the walk never entered function B.
+        let ValueId::Instruction(b_load) = b_load else {
+            unreachable!()
+        };
+        assert!(
+            BasicBlock::from_id(ctx, b_entry)
+                .instruction_ids()
+                .contains(&b_load),
+            "the rename walk must not cross into another function's block",
         );
     }
 }
