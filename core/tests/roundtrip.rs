@@ -12,7 +12,6 @@
 //! Known round-trip gaps (a printed form the parser cannot read back), excluded
 //! here by construction:
 //!   - `varnode` declarations are not printed.
-//!   - `scan` (`scanl …`) has no grammar production.
 //!   - pointer/struct types print as `T*` / `Struct`, but a value's type
 //!     annotation in the grammar (`ty`) is only `iN`/`fN`; this affects `gep`
 //!     results and pointer/struct-typed block parameters.
@@ -299,6 +298,38 @@ fn roundtrip_map() {
             return %r;
         ",
         "body <$> i64 @a",
+    );
+}
+
+#[test]
+fn roundtrip_scan() {
+    roundtrips(
+        "
+        lambda body:
+        <b @acc:i32 @x:i32>
+            return @acc;
+        fn main:
+        <e @init:i32 @a:i64>
+            %r = scanl @body @init @a;
+            return %r;
+        ",
+        "scanl @body i32 @init i64 @a",
+    );
+}
+
+#[test]
+fn roundtrip_scan_with_captures() {
+    roundtrips(
+        "
+        lambda body:
+        <b @acc:i32 @x:i32>
+            return @acc;
+        fn main:
+        <e @init:i32 @a:i64 @c:i32>
+            %r = scanl (@body @c) @init @a;
+            return %r;
+        ",
+        "scanl (@body i32 @c) i32 @init i64 @a",
     );
 }
 

@@ -17,7 +17,7 @@ use crate::context::Context;
 use crate::register_intrinsic;
 use crate::types::{TypeId, TypeManager};
 use crate::value::ValueId;
-use crate::value::insn::{Intrinsic, IntrinsicId, Simplified};
+use crate::value::insn::{Intrinsic, IntrinsicId, Mnemonic, Simplified};
 
 /// `len` — the element count of a sequence.
 struct Len;
@@ -57,9 +57,21 @@ impl Intrinsic for Len {
         // A list's length is data-dependent (the NUL position for a string) and
         // stays symbolic.
         let ty = ctx.type_of(seq);
-        let (_, n) = ctx.types.array_of(ty)?;
-        let lit = ctx.get_const(n as u64, out_size).id();
-        Some(Simplified::Value(lit))
+        if let Some((_, n)) = ctx.types.array_of(ty) {
+            let lit = ctx.get_const(n as u64, out_size).id();
+            return Some(Simplified::Value(lit));
+        }
+        // `len(iota n) = n`: the length of an as-yet-unfolded index driver is its
+        // own operand, recovered symbolically even when `n` is not constant. (A
+        // constant `iota` would already have folded to a fixed array above.)
+        if let ValueId::Instruction(iid) = seq {
+            if let Mnemonic::Intrinsic(app) = ctx.get_insn(iid).mnemonic() {
+                if app.id.name() == "iota" {
+                    return Some(Simplified::Value(app.args[0]));
+                }
+            }
+        }
+        None
     }
 }
 

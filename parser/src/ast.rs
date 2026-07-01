@@ -143,6 +143,15 @@ pub enum ExprNode {
         src: TypedAtom,
         captures: Vec<TypedAtom>,
     },
+    /// `scanl @body init src` / `scanl (@body c0 c1) init src` — a left-scan over
+    /// the array `src`. `body` names a function symbol (stored without the `@`);
+    /// `init` is the initial accumulator; `captures` are loop-invariant operands.
+    Scan {
+        body: String,
+        init: TypedAtom,
+        src: TypedAtom,
+        captures: Vec<TypedAtom>,
+    },
     /// `pack(a=x, b=y)` — build an aggregate value from its named fields.
     Tuple {
         fields: Vec<TupleField>,

@@ -48,7 +48,7 @@ return_at_stmt  =  { "return" ~ "at" ~ typed_atom }
 return_value_at_stmt = { "return" ~ typed_atom ~ "at" ~ typed_atom }
 return_value_stmt = { "return" ~ typed_atom }
 assert_stmt     =  { "assert" ~ typed_atom }
-expr            =  { memory | cast | extract | gep | unop | func_unop | intrinsic_call | apply | map | func_call | range | binary | tuple | atom_expr }
+expr            =  { memory | cast | extract | gep | unop | func_unop | intrinsic_call | apply | scan | map | func_call | range | binary | tuple | atom_expr }
 expr_stmt       =  { SOI ~ expr ~ EOI }
 atom_expr       =  { typed_atom }
 unop            =  { unop_op ~ typed_atom }
@@ -62,6 +62,13 @@ apply           =  { "apply" ~ ident ~ "(" ~ (typed_atom ~ ("," ~ typed_atom)*)?
 // optional parenthesized list supplies loop-invariant captures.
 map             =  { map_app ~ "<$>" ~ typed_atom }
 map_app         =  { "(" ~ ident ~ typed_atom* ~ ")" | ident }
+// `scanl @body init src` / `scanl (@body c0 c1) init src`: a left-scan over the
+// array `src`. The body is a function symbol (printed with a leading `@`); the
+// optional parenthesized list supplies loop-invariant captures; `init` is the
+// initial accumulator, `src` the scanned array.
+scan            =  { "scanl" ~ scan_app ~ typed_atom ~ typed_atom }
+scan_app        =  { "(" ~ scan_body ~ typed_atom* ~ ")" | scan_body }
+scan_body       = @{ "@" ~ (ASCII_ALPHA | "_") ~ (ASCII_ALPHANUMERIC | "_")* }
 binary          =  { typed_atom ~ op ~ typed_atom }
 // `v[start:end]` — extract bytes `[start, end)` of `v`. `start` defaults to 0
 // and `end` defaults to `v`'s byte width, so `v[:4]`, `v[1:]` and `v[:]` are all

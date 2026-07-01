@@ -684,6 +684,23 @@ impl Lowerer<'_, '_, '_> {
                 Ok(self.b.push_map(fid, s, caps).id())
             }
 
+            ExprNode::Scan {
+                body,
+                init,
+                src,
+                captures,
+            } => {
+                let fid = *self
+                    .symbols
+                    .functions
+                    .get(body)
+                    .ok_or_else(|| format!("scan: unknown function `{body}`"))?;
+                let i = self.atom(init, None)?;
+                let s = self.atom(src, None)?;
+                let caps = self.atoms(captures)?;
+                Ok(self.b.push_scan(fid, i, s, caps).id())
+            }
+
             ExprNode::Tuple { fields } => {
                 let mut named = Vec::with_capacity(fields.len());
                 for (i, f) in fields.iter().enumerate() {

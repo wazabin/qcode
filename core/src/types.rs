@@ -651,6 +651,21 @@ impl TypeManager {
         None
     }
 
+    /// The element type of any *sequence* — a fixed [`array`](Type::array) or a
+    /// [`list`](Type::list) of any bound, *including an unbounded* `[T;*]` list
+    /// that [`seq_of`](Self::seq_of) declines (because it has no static length).
+    /// This is the accessor length-erased code (`scanl`/`iota`/`concat` results,
+    /// `at`) uses when it needs the element type but not the count.
+    pub fn seq_elem_of(&self, id: TypeId) -> Option<TypeId> {
+        if let Some((elem, _)) = self.array_of(id) {
+            return Some(elem);
+        }
+        if let Some((elem, _)) = self.list_of(id) {
+            return Some(elem);
+        }
+        None
+    }
+
     /// Build the sequence type of the given kind: a [`List`](Self::get_or_make_list)
     /// when `is_list`, else a fixed [`Array`](Self::get_or_make_array). The inverse
     /// of [`seq_of`](Self::seq_of).

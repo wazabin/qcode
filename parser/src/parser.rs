@@ -652,6 +652,7 @@ fn parse_expr(pair: Pair<'_, Rule>) -> Result<ExprNode, ParseError> {
         Rule::func_call => parse_func_call(inner),
         Rule::intrinsic_call => parse_intrinsic_call(inner),
         Rule::apply => parse_apply(inner),
+        Rule::scan => parse_scan(inner),
         Rule::map => parse_map(inner),
         Rule::binary => parse_binary(inner),
         Rule::memory => parse_memory(inner),
@@ -900,6 +901,46 @@ fn parse_map(pair: Pair<'_, Rule>) -> Result<ExprNode, ParseError> {
     )?;
     Ok(ExprNode::Map {
         body,
+        src,
+        captures,
+    })
+}
+
+fn parse_scan(pair: Pair<'_, Rule>) -> Result<ExprNode, ParseError> {
+    let mut inner = pair.into_inner();
+    // `scan_app` holds the `@body` symbol and any parenthesized captures.
+    let app = inner
+        .next()
+        .filter(|p| p.as_rule() == Rule::scan_app)
+        .ok_or_else(|| ParseError::new("missing scan body"))?;
+    let mut app_parts = app.into_inner();
+    let body = app_parts
+        .next()
+        .filter(|p| p.as_rule() == Rule::scan_body)
+        .ok_or_else(|| ParseError::new("missing scan body function"))?
+        .as_str()
+        .trim_start_matches('@')
+        .to_owned();
+    let captures = app_parts
+        .filter(|p| p.as_rule() == Rule::typed_atom)
+        .map(parse_typed_atom)
+        .collect::<Result<Vec<_>, _>>()?;
+    // After `scan_app` come two `typed_atom`s: the initial accumulator and the
+    // scanned source array, in that order.
+    let mut atoms = inner.filter(|p| p.as_rule() == Rule::typed_atom);
+    let init = parse_typed_atom(
+        atoms
+            .next()
+            .ok_or_else(|| ParseError::new("missing scan init"))?,
+    )?;
+    let src = parse_typed_atom(
+        atoms
+            .next()
+            .ok_or_else(|| ParseError::new("missing scan source"))?,
+    )?;
+    Ok(ExprNode::Scan {
+        body,
+        init,
         src,
         captures,
     })

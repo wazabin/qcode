@@ -259,6 +259,18 @@ fn collect_expr(expr: &ExprNode, names: &mut Names) {
                 collect_atom(a, names);
             }
         }
+        ExprNode::Scan {
+            init,
+            src,
+            captures,
+            ..
+        } => {
+            collect_atom(init, names);
+            collect_atom(src, names);
+            for a in captures {
+                collect_atom(a, names);
+            }
+        }
         ExprNode::Tuple { fields } => {
             for TupleField { value, .. } in fields {
                 collect_atom(value, names);
