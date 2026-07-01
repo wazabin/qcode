@@ -13,7 +13,7 @@ use crate::{
     },
 };
 use core::slice;
-use jstd::graph::Graph;
+use jstd::graph::{FxBuildHasher, Graph};
 use std::{
     borrow::Cow,
     collections::HashSet,
@@ -44,7 +44,10 @@ pub struct BasicBlock<'str> {
     pub instructions: Vec<InstructionId>,
 
     /// The set of edges that this block is incident to.
-    pub edges: HashSet<EdgeId>,
+    ///
+    /// Uses a fixed-seed hasher (matching `Context`'s `Graph::Hasher`) so that
+    /// `predecessors()`/`successors()` iterate deterministically across runs.
+    pub edges: HashSet<EdgeId, FxBuildHasher>,
 
     /// The address of this block, if it corresponds to a machine address.
     pub address: Option<u64>,

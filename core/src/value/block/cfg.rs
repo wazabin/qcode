@@ -4,7 +4,7 @@ use std::collections::HashSet;
 
 use jstd::{
     Identifier,
-    graph::{Edge, EdgeMut, Node, NodeMut},
+    graph::{Edge, EdgeMut, FxBuildHasher, Node, NodeMut},
 };
 
 use crate::{
@@ -135,7 +135,7 @@ impl<'str, 'ctx> Node<'ctx> for BlockRef<'str, 'ctx> {
         self.ctx
     }
 
-    fn edge_ids(&self) -> &'ctx HashSet<EdgeId> {
+    fn edge_ids(&self) -> &'ctx HashSet<EdgeId, FxBuildHasher> {
         &self.ctx.values.basic_blocks[self.id].edges
     }
 
@@ -159,7 +159,7 @@ impl<'str, 'ctx> NodeMut<'ctx> for BlockMutRef<'str, 'ctx> {
         self.ctx
     }
 
-    fn edge_ids(&self) -> &HashSet<EdgeId> {
+    fn edge_ids(&self) -> &HashSet<EdgeId, FxBuildHasher> {
         &self.ctx.values.basic_blocks[self.id].edges
     }
 

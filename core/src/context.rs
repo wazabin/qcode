@@ -762,6 +762,13 @@ impl<'str> Graph for Context<'str> {
 
     type EdgeId = EdgeId;
 
+    // Fixed-seed hasher so a block's incident-edge set iterates in a
+    // deterministic order. This is what makes `predecessors()`/`successors()`
+    // (and thus borderline mem2reg promotions) reproducible across runs; the
+    // std default (`RandomState`) reseeds per process and leaks that
+    // nondeterminism into the lifted IR.
+    type Hasher = jstd::graph::FxBuildHasher;
+
     type Node<'a>
         = BlockRef<'str, 'a>
     where
