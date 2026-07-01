@@ -8,8 +8,10 @@ use qcode::value::{
 use qcode::{
     builder::Builder,
     context::Context,
-    value::{FunctionRef, block::BlockRef},
+    value::FunctionRef,
 };
+#[cfg(test)]
+use qcode::value::block::BlockRef;
 use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
 use std::borrow::Cow;
 
@@ -596,6 +598,15 @@ impl Mem2Reg<'_, '_> {
         let mut changed = false;
         let mut excluded: HashSet<ValueId> = HashSet::default();
 
+        // One pass over the function yields the store-block set for every var,
+        // so `find_phi_insert_positions` is a lookup rather than a full block
+        // rescan per variable.
+        let stores_by_var = {
+            let function = Function::from_id(self.ctx, self.function_id);
+            blocks_storing_to_vars(&function, vars)
+        };
+        let no_store_blocks = HashSet::default();
+
         for &var in vars {
             // Block-param width: varnodes carry their own size; stack slots use the
             // (consistent) access size recorded during collection.
@@ -609,10 +620,9 @@ impl Mem2Reg<'_, '_> {
             let var_name = self.block_param_name_for_var(var);
 
             let live_in = self.live_in_blocks_cached(var, live_in_cache);
-            let phi_positions = {
-                let function = Function::from_id(self.ctx, self.function_id);
-                find_phi_insert_positions(var, &function, frontier, &live_in)
-            };
+            let block_containing_store = stores_by_var.get(&var).unwrap_or(&no_store_blocks);
+            let phi_positions =
+                find_phi_insert_positions(block_containing_store, frontier, &live_in);
 
             // A block param is only meaningful if every incoming edge can supply
             // its argument. Branch/CBranch edges are wired by `merge_branch_args`,
@@ -1072,6 +1082,7 @@ impl Mem2Reg<'_, '_> {
     }
 }
 
+#[cfg(test)]
 fn block_contains_store_to_var(block: &BlockRef, var: ValueId) -> bool {
     block.iter().any(|insn| {
         if let Mnemonic::Store(Store { ptr, .. }) = insn.mnemonic() {
@@ -1082,20 +1093,45 @@ fn block_contains_store_to_var(block: &BlockRef, var: ValueId) -> bool {
     })
 }
 
-fn find_phi_insert_positions(
-    var: ValueId,
-    function: &FunctionRef,
-    frontier: &HashMap<BlockId, HashSet<BlockId>>,
-    live_in: &HashSet<BlockId>,
-) -> HashSet<BlockId> {
-    // Order is irrelevant — results feed a `HashSet` — so use the unsorted
-    // `iter()` and skip the per-call Vec allocation + sort that `blocks()` does.
-    let block_containing_store = function
+/// Blocks that contain a `Store` to `var`. Single-var form; production uses the
+/// batched [`blocks_storing_to_vars`] instead.
+#[cfg(test)]
+fn blocks_storing_to_var(function: &FunctionRef, var: ValueId) -> HashSet<BlockId> {
+    function
         .iter()
         .filter(|b| block_contains_store_to_var(b, var))
         .map(|b| b.id)
-        .collect::<HashSet<_>>();
+        .collect()
+}
 
+/// For each promotable var in `vars`, the set of blocks that store to it,
+/// computed in a single pass over the function. This replaces rescanning every
+/// block once per variable inside `find_phi_insert_positions` (which was
+/// quadratic — vars × instructions — and the dominant mem2reg cost on large
+/// functions).
+fn blocks_storing_to_vars(
+    function: &FunctionRef,
+    vars: &HashSet<ValueId>,
+) -> HashMap<ValueId, HashSet<BlockId>> {
+    let mut map: HashMap<ValueId, HashSet<BlockId>> = HashMap::default();
+    for block in function.iter() {
+        let bid = block.id;
+        for insn in block.iter() {
+            if let Mnemonic::Store(Store { ptr, .. }) = insn.mnemonic()
+                && vars.contains(ptr)
+            {
+                map.entry(*ptr).or_default().insert(bid);
+            }
+        }
+    }
+    map
+}
+
+fn find_phi_insert_positions(
+    block_containing_store: &HashSet<BlockId>,
+    frontier: &HashMap<BlockId, HashSet<BlockId>>,
+    live_in: &HashSet<BlockId>,
+) -> HashSet<BlockId> {
     let mut worklist: Vec<BlockId> = block_containing_store.iter().copied().collect();
     let mut result = HashSet::default();
 
@@ -1520,7 +1556,8 @@ mod tests {
         let aliases = AliasResult::simple(&ctx);
         let live_in = LiveInBlocks::new(&ctx, test).get(&ctx, A.into(), &aliases);
 
-        let result = find_phi_insert_positions(A.into(), &function, frontier, &live_in);
+        let stores = blocks_storing_to_var(&function, A.into());
+        let result = find_phi_insert_positions(&stores, frontier, &live_in);
 
         let named_result = result
             .iter()
@@ -1656,7 +1693,8 @@ mod tests {
             (loop_header, HashSet::from_iter([loop_header])),
         ]);
 
-        let result = find_phi_insert_positions(A.into(), &function, &frontier, &live_in);
+        let stores = blocks_storing_to_var(&function, A.into());
+        let result = find_phi_insert_positions(&stores, &frontier, &live_in);
 
         assert_eq!(result, HashSet::from_iter([loop_header]));
     }
@@ -1761,7 +1799,8 @@ mod tests {
         let aliases = AliasResult::simple(&ctx);
         let live_in = LiveInBlocks::new(&ctx, test).get(&ctx, A.into(), &aliases);
 
-        let result = find_phi_insert_positions(A.into(), &function, frontier, &live_in);
+        let stores = blocks_storing_to_var(&function, A.into());
+        let result = find_phi_insert_positions(&stores, frontier, &live_in);
 
         let named_result = result
             .iter()
