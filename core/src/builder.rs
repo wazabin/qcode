@@ -458,7 +458,7 @@ impl<'str, 'ctx> Builder<'str, 'ctx> {
     pub fn make_named_temp(&mut self, name: Cow<'str, str>, size: usize) -> VarnodeId {
         let space = self.context_mut().make_temp_space();
         let id = Varnode::make(self.context_mut(), 0, size, space).id;
-        let unique_name = self.context().get_unique_name(name);
+        let unique_name = self.context_mut().get_unique_name(name);
         Varnode::from_id_mut(self.context_mut(), id)
             .rename(unique_name.clone())
             .expect("This name was deduplicated");
@@ -513,7 +513,8 @@ impl<'str, 'ctx> Builder<'str, 'ctx> {
 
                 // If the varnode has a name, give the temp a related name for easier debugging
                 if let Some(name) = Varnode::from_id(self.context(), node_id).name() {
-                    let name = self.context().get_unique_name(name.to_lowercase().into());
+                    let lowered = name.to_lowercase();
+                    let name = self.context_mut().get_unique_name(lowered.into());
 
                     Instruction::from_id_mut(
                         self.context_mut(),
@@ -1050,9 +1051,8 @@ impl<'str, 'ctx> Builder<'str, 'ctx> {
 
             // Add a name hint for the store instruction for easier debugging
             if let Some(name) = Varnode::from_id(self.context(), dst).name() {
-                let name = self
-                    .context()
-                    .get_unique_name(Cow::Owned(name.to_lowercase()));
+                let lowered = name.to_lowercase();
+                let name = self.context_mut().get_unique_name(Cow::Owned(lowered));
                 Instruction::from_id_mut(self.context_mut(), id)
                     .rename(name)
                     .expect("This name was deduplicated");

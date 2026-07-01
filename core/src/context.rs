@@ -66,6 +66,16 @@ pub struct Context<'str> {
     /// Reverse mapping of name hints to value IDs, used to ensure that name hints are unique
     name_map: HashMap<Cow<'str, str>, ValueId>,
 
+    /// Per-base "next suffix to try" hints for [`get_unique_name`], so suffix
+    /// probing resumes instead of rescanning from `0` on every call. Without it,
+    /// minting the thousands of like-named p-code temporaries the lifter emits is
+    /// O(n²) (each new `tmp` re-probes every prior `tmp_k`). Always only a lower
+    /// bound — every candidate is still confirmed free against `name_map` — and
+    /// corrected on removal, so the suffix chosen is identical to the naive
+    /// first-free scan. Derived cache: rides through `clone` but is not serialized.
+    #[serde(skip)]
+    suffix_hint: HashMap<String, u32>,
+
     /// Reverse mapping from addresses to value IDs
     address_map: HashMap<u64, ValueId>,
 
@@ -663,7 +673,7 @@ impl<'str> Context<'str> {
         self.values.instructions[id].parent = None;
 
         if let Some(ref n) = name {
-            self.name_map.remove(n.as_ref());
+            self.forget_name(n.as_ref());
         }
         self.values.instructions[id].name = None;
 
@@ -710,11 +720,25 @@ impl<'str> Context<'str> {
         old_name: Option<&str>,
     ) -> Result<()> {
         if let Some(old_name) = old_name {
-            self.name_map.remove(old_name);
+            self.forget_name(old_name);
         }
         match self.name_map.insert(name.clone(), id) {
             Some(_) => Err(Error::spanless(ErrorTy::DuplicateName(name.to_string()))),
             None => Ok(()),
+        }
+    }
+
+    /// Remove `name` from the name map, keeping the [`get_unique_name`] suffix
+    /// hint exact: if `name` is a generated `base_<n>` suffix, lower `base`'s hint
+    /// so the freed suffix is reconsidered on the next call (a naive first-free
+    /// scan would reuse it, and the hint must not skip it). Un-suffixed names are
+    /// tried before any suffix, so freeing one needs no hint adjustment.
+    fn forget_name(&mut self, name: &str) {
+        self.name_map.remove(name);
+        if let Some((base, suffix)) = split_generated_suffix(name)
+            && let Some(hint) = self.suffix_hint.get_mut(base)
+        {
+            *hint = (*hint).min(suffix);
         }
     }
 
@@ -732,19 +756,46 @@ impl<'str> Context<'str> {
     /// Gets a unique name for a value, generating one
     /// if necessary by appending a numeric suffix to the provided name
     /// until an unused name is found.
-    pub fn get_unique_name(&self, name: Cow<'str, str>) -> Cow<'str, str> {
-        // If the name is already taken, we don't want to overwrite it, since that would make debugging harder
-        // instead we add a numeric suffix to the name until we find an unused name
-        let mut suffix = 0;
+    pub fn get_unique_name(&mut self, name: Cow<'str, str>) -> Cow<'str, str> {
+        use std::fmt::Write as _;
 
-        let mut unique_name = Cow::Owned(name.to_string());
-
-        while self.name_map.contains_key(&unique_name) {
-            suffix += 1;
-            unique_name = Cow::Owned(format!("{}_{suffix}", name));
+        // If the name is already taken, we don't want to overwrite it, since that
+        // would make debugging harder; instead we append a numeric suffix until we
+        // find an unused name. The bare (un-suffixed) name is tried first, matching
+        // the historical behaviour.
+        if !self.name_map.contains_key(&name) {
+            return name;
         }
-        unique_name
+
+        // The name is taken: probe `name_1`, `name_2`, … for the first free
+        // suffix. Resume from a cached lower bound instead of restarting at `1`,
+        // so generating many like-named values stays ~O(1) amortized per call
+        // rather than O(n²) overall. `suffix_hint` is only ever a lower bound —
+        // every candidate is still confirmed free below — so the chosen suffix is
+        // identical to a naive scan from `1`.
+        let base: &str = &name;
+        let mut suffix = self.suffix_hint.get(base).copied().unwrap_or(1).max(1);
+        let mut unique_name = format!("{base}_{suffix}");
+        while self.name_map.contains_key(unique_name.as_str()) {
+            suffix += 1;
+            unique_name.clear();
+            let _ = write!(unique_name, "{base}_{suffix}");
+        }
+        self.suffix_hint.insert(base.to_string(), suffix);
+        Cow::Owned(unique_name)
     }
+}
+
+/// Split a generated unique name into its base and numeric suffix, i.e. the
+/// inverse of the `format!("{base}_{suffix}")` in [`Context::get_unique_name`]:
+/// `"tmp_7"` → `Some(("tmp", 7))`. Returns `None` for names with no `_<digits>`
+/// tail (a bare base, or a name whose tail is empty/non-numeric/overflows).
+fn split_generated_suffix(name: &str) -> Option<(&str, u32)> {
+    let (base, digits) = name.rsplit_once('_')?;
+    if digits.is_empty() || !digits.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    Some((base, digits.parse().ok()?))
 }
 
 impl Display for Context<'_> {
@@ -1422,5 +1473,40 @@ mod tests {
         // The StackAddress type round-trips: same id, same size, still a stack address.
         assert_eq!(restored.types.size_of(sa), sa_size);
         assert!(restored.types.is_stack_address(sa));
+    }
+
+    #[test]
+    fn get_unique_name_resumes_probe_and_reuses_freed_suffixes() {
+        use crate::value::VarnodeId;
+
+        let mut ctx = Context::new();
+        let id = ValueId::Varnode(VarnodeId::from(0usize));
+
+        // Mirror real callers: take the deduplicated name, then bind it.
+        fn take(ctx: &mut Context<'static>, id: ValueId, base: &str) -> String {
+            let name = ctx
+                .get_unique_name(Cow::Owned(base.to_string()))
+                .to_string();
+            ctx.update_name(Cow::Owned(name.clone()), id, None).unwrap();
+            name
+        }
+
+        // Suffixes are handed out in ascending order (bare name first).
+        assert_eq!(take(&mut ctx, id, "tmp"), "tmp");
+        assert_eq!(take(&mut ctx, id, "tmp"), "tmp_1");
+        assert_eq!(take(&mut ctx, id, "tmp"), "tmp_2");
+        assert_eq!(take(&mut ctx, id, "tmp"), "tmp_3");
+
+        // A distinct base is unaffected by tmp's hint.
+        assert_eq!(take(&mut ctx, id, "x"), "x");
+        assert_eq!(take(&mut ctx, id, "x"), "x_1");
+
+        // Freeing tmp_1 must make the next tmp reuse it, exactly as a naive
+        // first-free scan would — the resume hint must not skip the hole.
+        ctx.update_name(Cow::Borrowed("relocated"), id, Some("tmp_1"))
+            .unwrap();
+        assert_eq!(take(&mut ctx, id, "tmp"), "tmp_1");
+        // ...then continue past the still-taken suffixes.
+        assert_eq!(take(&mut ctx, id, "tmp"), "tmp_4");
     }
 }
