@@ -57,6 +57,9 @@ fn collect_raws(stmts: &[Stmt], out: &mut Vec<InstructionId>) {
                 collect_raws(then, out);
                 collect_raws(els, out);
             }
+            Stmt::While { body, .. } | Stmt::DoWhile { body, .. } | Stmt::Loop { body } => {
+                collect_raws(body, out);
+            }
             _ => {}
         }
     }
@@ -174,6 +177,58 @@ fn emit_stmt(
                 emit_stmts(ctx, program, els, indent + 1, roots, out);
                 out.push(brace_line("}", indent));
             }
+        }
+        Stmt::While { cond, body } => {
+            let mut head = LineBuf::default();
+            head.keyword("while");
+            head.space();
+            head.punct("(");
+            cond.write_tokens(&mut head);
+            head.punct(")");
+            head.space();
+            head.punct("{");
+            out.push(head.into_line(indent, None));
+            emit_stmts(ctx, program, body, indent + 1, roots, out);
+            out.push(brace_line("}", indent));
+        }
+        Stmt::DoWhile { cond, body } => {
+            out.push(brace_line("do {", indent));
+            emit_stmts(ctx, program, body, indent + 1, roots, out);
+            let mut tail = LineBuf::default();
+            tail.punct("}");
+            tail.space();
+            tail.keyword("while");
+            tail.space();
+            tail.punct("(");
+            cond.write_tokens(&mut tail);
+            tail.punct(")");
+            tail.punct(";");
+            out.push(tail.into_line(indent, None));
+        }
+        Stmt::Loop { body } => {
+            let mut head = LineBuf::default();
+            head.keyword("while");
+            head.space();
+            head.punct("(");
+            head.keyword("true");
+            head.punct(")");
+            head.space();
+            head.punct("{");
+            out.push(head.into_line(indent, None));
+            emit_stmts(ctx, program, body, indent + 1, roots, out);
+            out.push(brace_line("}", indent));
+        }
+        Stmt::Break => {
+            let mut buf = LineBuf::default();
+            buf.keyword("break");
+            buf.punct(";");
+            out.push(buf.into_line(indent, None));
+        }
+        Stmt::Continue => {
+            let mut buf = LineBuf::default();
+            buf.keyword("continue");
+            buf.punct(";");
+            out.push(buf.into_line(indent, None));
         }
     }
 }
@@ -379,7 +434,9 @@ mod tests {
             "
         );
 
-        let program = structure_function(&ctx, f);
+        // The flat lowering always labels every block and indents its body; test
+        // it directly rather than relying on a structuring fallback.
+        let program = lower_function(&ctx, f);
         let lines = emit_tokens(&ctx, &program);
 
         assert!(

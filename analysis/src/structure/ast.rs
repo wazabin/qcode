@@ -35,6 +35,17 @@ pub enum Stmt {
         then: Vec<Stmt>,
         els: Vec<Stmt>,
     },
+    /// A pre-tested loop `while (cond) { body }`.
+    While { cond: Expr, body: Vec<Stmt> },
+    /// A post-tested loop `do { body } while (cond);`.
+    DoWhile { cond: Expr, body: Vec<Stmt> },
+    /// An endless loop `while (true) { body }` whose exits are structured as
+    /// [`Stmt::Break`]. The general form when neither pre- nor post-test matches.
+    Loop { body: Vec<Stmt> },
+    /// `break;` — leaves the innermost enclosing loop.
+    Break,
+    /// `continue;` — jumps to the next iteration of the innermost enclosing loop.
+    Continue,
 }
 
 /// Counts the `goto` statements (conditional and unconditional) in a statement
@@ -45,7 +56,11 @@ pub fn count_gotos(stmts: &[Stmt]) -> usize {
         .map(|s| match s {
             Stmt::Goto(_) | Stmt::GotoIf { .. } => 1,
             Stmt::If { then, els, .. } => count_gotos(then) + count_gotos(els),
-            Stmt::Label(_) | Stmt::Raw(_) => 0,
+            // `break`/`continue` are structured control flow, not gotos.
+            Stmt::While { body, .. } | Stmt::DoWhile { body, .. } | Stmt::Loop { body } => {
+                count_gotos(body)
+            }
+            Stmt::Label(_) | Stmt::Raw(_) | Stmt::Break | Stmt::Continue => 0,
         })
         .sum()
 }
