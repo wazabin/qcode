@@ -4,7 +4,7 @@
 //! recursively so conditions render as real expressions (e.g. `a == 0x5`), which
 //! later phases — notably SAILR switch recovery — need to inspect structurally.
 //! Impure or unmodeled instructions are referenced by their SSA name instead, or
-//! fall back to [`Expr::Unknown`], so lowering is total.
+//! fall back to [`ExprKind::Unknown`], so lowering is total.
 
 use std::collections::HashSet;
 
@@ -16,7 +16,7 @@ use qcode::{
     },
 };
 
-use super::cast::{BinOp, Expr, UnOp};
+use super::cast::{BinOp, Expr, ExprKind, UnOp};
 
 /// The set of instructions that are rendered as their own statements ("roots")
 /// rather than inlined. A root reached as an operand is printed by name.
@@ -39,22 +39,29 @@ pub(crate) fn lower_expr_rooted(
 }
 
 fn lower(ctx: &Context, value: ValueId, roots: Roots) -> Expr {
-    match value {
-        ValueId::Literal(id) => Expr::Const(LiteralRef::from_id(ctx, id).value()),
-        ValueId::Varnode(id) => Expr::Var(name_or(Varnode::from_id(ctx, id).name(), "var", value)),
+    let e = match value {
+        ValueId::Literal(id) => Expr::konst(LiteralRef::from_id(ctx, id).value()),
+        ValueId::Varnode(id) => Expr::var(name_or(Varnode::from_id(ctx, id).name(), "var", value)),
         ValueId::BlockParam(id) => {
-            Expr::Var(name_or(BlockParam::from_id(ctx, id).name(), "p", value))
+            Expr::var(name_or(BlockParam::from_id(ctx, id).name(), "p", value))
         }
         ValueId::Instruction(id) => {
             if roots.is_some_and(|r| r.contains(&id)) {
-                Expr::Var(instruction_name(ctx, id))
+                Expr::var(instruction_name(ctx, id))
             } else {
                 lower_instruction(ctx, id, roots, false)
             }
         }
         // Blocks and functions appearing in an expression context are opaque
         // names (address-of-label, function pointer).
-        _ => Expr::Var(format!("{}", qcode::value::ValueRef::new(value, ctx))),
+        _ => Expr::var(format!("{}", qcode::value::ValueRef::new(value, ctx))),
+    };
+    // Stamp the node with the value it renders. For an inlined instruction this
+    // overrides any inner leaf's provenance (e.g. a load-of-varnode's `Var`
+    // token now points at the load's SSA value — the useful click target).
+    Expr {
+        value: Some(value),
+        ..e
     }
 }
 
@@ -64,7 +71,7 @@ fn lower(ctx: &Context, value: ValueId, roots: Roots) -> Expr {
 pub(crate) fn deref_location(ctx: &Context, ptr: ValueId, roots: Roots) -> Expr {
     match ptr {
         ValueId::Varnode(_) => lower(ctx, ptr, roots),
-        _ => Expr::Deref(Box::new(lower(ctx, ptr, roots))),
+        _ => Expr::bare(ExprKind::Deref(Box::new(lower(ctx, ptr, roots)))),
     }
 }
 
@@ -84,51 +91,55 @@ pub(crate) fn lower_defining_expr(
     id: InstructionId,
     roots: &HashSet<InstructionId>,
 ) -> Expr {
-    lower_instruction(ctx, id, Some(roots), true)
+    // `lower_instruction` bypasses `lower`, so stamp the result with the
+    // instruction's own value (its node is otherwise provenance-free).
+    let mut e = lower_instruction(ctx, id, Some(roots), true);
+    e.value = Some(ValueId::Instruction(id));
+    e
 }
 
 fn lower_instruction(ctx: &Context, id: InstructionId, roots: Roots, expand_unknown: bool) -> Expr {
     let insn = Instruction::from_id(ctx, id);
     match insn.mnemonic() {
         Mnemonic::Binop(b) => match map_binop(&b.op) {
-            Some(op) => Expr::Binary(
+            Some(op) => Expr::bare(ExprKind::Binary(
                 op,
                 Box::new(lower(ctx, b.lhs, roots)),
                 Box::new(lower(ctx, b.rhs, roots)),
-            ),
-            None => Expr::Unknown {
+            )),
+            None => Expr::bare(ExprKind::Unknown {
                 op: insn.opcode().to_string(),
                 operands: vec![lower(ctx, b.lhs, roots), lower(ctx, b.rhs, roots)],
-            },
+            }),
         },
         Mnemonic::Unop(u) => match map_unop(&u.op) {
-            Some(op) => Expr::Unary(op, Box::new(lower(ctx, u.src, roots))),
-            None => Expr::Unknown {
+            Some(op) => Expr::bare(ExprKind::Unary(op, Box::new(lower(ctx, u.src, roots)))),
+            None => Expr::bare(ExprKind::Unknown {
                 op: insn.opcode().to_string(),
                 operands: vec![lower(ctx, u.src, roots)],
-            },
+            }),
         },
         // A load from a named location (varnode) reads that variable directly;
         // a load through a computed pointer is a real dereference.
         Mnemonic::Load(l) => deref_location(ctx, l.ptr, roots),
-        Mnemonic::Zext(z) => Expr::Cast {
+        Mnemonic::Zext(z) => Expr::bare(ExprKind::Cast {
             signed: false,
             bits: z.size * 8,
             expr: Box::new(lower(ctx, z.src, roots)),
-        },
-        Mnemonic::Sext(s) => Expr::Cast {
+        }),
+        Mnemonic::Sext(s) => Expr::bare(ExprKind::Cast {
             signed: true,
             bits: s.size * 8,
             expr: Box::new(lower(ctx, s.src, roots)),
-        },
+        }),
         // Not modeled structurally. As an operand (`expand_unknown` false) refer
         // to the SSA temporary by name; as a defining expression expand it to an
         // opaque `opcode(args)` pseudo-call so the assignment is meaningful.
         _ => {
             if !expand_unknown && let Some(name) = insn.name() {
-                return Expr::Var(name.to_string());
+                return Expr::var(name.to_string());
             }
-            Expr::Unknown {
+            Expr::bare(ExprKind::Unknown {
                 op: insn.opcode().to_string(),
                 operands: insn
                     .mnemonic()
@@ -136,7 +147,7 @@ fn lower_instruction(ctx: &Context, id: InstructionId, roots: Roots, expand_unkn
                     .into_iter()
                     .map(|v| lower(ctx, v, roots))
                     .collect(),
-            }
+            })
         }
     }
 }

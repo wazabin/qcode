@@ -78,21 +78,24 @@ fn refine_stmts(ctx: &Context, stmts: &mut [Stmt]) -> bool {
 fn refine_loop(ctx: &Context, mut body: Vec<Stmt>) -> Stmt {
     // Pre-test: an optional condition-only prefix followed by the loop's `if`,
     // one arm of which is exactly a `break`.
-    let prefix = body.iter().take_while(|s| is_condition_only(ctx, s)).count();
-    if prefix + 1 == body.len() {
-        if let Some(Stmt::If { cond, then, els }) = body.get(prefix) {
-            if is_only(els, &Stmt::Break) {
-                return Stmt::While {
-                    cond: cond.clone(),
-                    body: without_trailing_continue(then.clone()),
-                };
-            }
-            if is_only(then, &Stmt::Break) {
-                return Stmt::While {
-                    cond: cond.clone().logical_not(),
-                    body: without_trailing_continue(els.clone()),
-                };
-            }
+    let prefix = body
+        .iter()
+        .take_while(|s| is_condition_only(ctx, s))
+        .count();
+    if prefix + 1 == body.len()
+        && let Some(Stmt::If { cond, then, els }) = body.get(prefix)
+    {
+        if is_only(els, &Stmt::Break) {
+            return Stmt::While {
+                cond: cond.clone(),
+                body: without_trailing_continue(then.clone()),
+            };
+        }
+        if is_only(then, &Stmt::Break) {
+            return Stmt::While {
+                cond: cond.clone().logical_not(),
+                body: without_trailing_continue(els.clone()),
+            };
         }
     }
 
@@ -136,7 +139,7 @@ pub(crate) fn is_condition_only(ctx: &Context, stmt: &Stmt) -> bool {
     match stmt {
         Stmt::Raw(id) => {
             let insn = Instruction::from_id(ctx, *id);
-            !is_side_effecting(&insn.mnemonic()) && ctx.users(ValueId::Instruction(*id)).len() <= 1
+            !is_side_effecting(insn.mnemonic()) && ctx.users(ValueId::Instruction(*id)).len() <= 1
         }
         _ => false,
     }

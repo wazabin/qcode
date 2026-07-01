@@ -23,7 +23,7 @@ mod switch;
 pub mod tokens;
 
 pub use ast::{Program, Stmt};
-pub use cast::{BinOp, Expr, UnOp};
+pub use cast::{BinOp, Expr, ExprKind, UnOp};
 pub use condition::{BlockExit, EdgeCondition, block_exit};
 pub use emit::{emit_c, emit_tokens};
 pub use lower::lower_function;

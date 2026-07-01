@@ -18,7 +18,7 @@ use std::collections::{HashMap, HashSet};
 use jstd::graph::analysis::{DominatorTree, compute_dominators, compute_postdominators};
 use qcode::{
     context::Context,
-    value::{BasicBlock, BlockId, function::FunctionId},
+    value::{BasicBlock, BlockId, Instruction, function::FunctionId},
 };
 
 use crate::pipeline::{DecompilePass, RegisteredPass, make_pass};
@@ -27,32 +27,48 @@ use super::{
     BlockExit,
     ast::{Program, Stmt},
     block_exit,
-    lower::{assign_labels, is_replaced_by_goto},
+    lower::{assign_labels, block_arg_moves, is_replaced_by_goto},
     lower_expr::lower_expr,
     lower_function,
 };
 
 /// The default decompilation pass pipeline, in run order: structure the CFG into
-/// an AST, refine its loops, then recover switches. SAILR deopt passes slot in
-/// here as they land.
-const DECOMPILE_PIPELINE: &[&str] = &["structure", "refine_loops", "recover_switch"];
+/// an AST, validate that structuring dropped no code (falling back to flat
+/// lowering when it did), refine its loops, then recover switches. Validation
+/// runs before the switch pass, which intentionally elides comparison setup that
+/// the coverage check would otherwise read as dropped. SAILR deopt passes slot
+/// in here as they land.
+const DECOMPILE_PIPELINE: &[&str] = &[
+    "structure",
+    "validate_structuring",
+    "refine_loops",
+    "recover_switch",
+];
 
 /// Decompiles `function_id` to a high-level [`Program`] by running the
 /// decompilation pass pipeline over it. Each pass reads the (immutable) qcode IR
 /// and rewrites the shared AST.
-pub fn decompile_function(ctx: &Context, function_id: FunctionId) -> Program {
+///
+/// Returns `Err` if a pass reports an error, so callers (notably the GUI, which
+/// decompiles every function up front) can degrade a single failing function to
+/// a placeholder instead of aborting the whole binary.
+pub fn decompile_function(ctx: &Context, function_id: FunctionId) -> Result<Program, String> {
     let mut program = Program::default();
     for &name in DECOMPILE_PIPELINE {
         match make_pass(name) {
             Some(RegisteredPass::Decompile(pass)) => {
                 pass.run(ctx, function_id, &mut program)
-                    .unwrap_or_else(|e| panic!("decompile pass `{name}`: {e}"));
+                    .map_err(|e| format!("decompile pass `{name}`: {e}"))?;
             }
-            Some(_) => panic!("pipeline pass `{name}` is not a decompilation pass"),
-            None => panic!("unknown decompilation pass `{name}`"),
+            Some(_) => {
+                return Err(format!(
+                    "pipeline pass `{name}` is not a decompilation pass"
+                ));
+            }
+            None => return Err(format!("unknown decompilation pass `{name}`")),
         }
     }
-    program
+    Ok(program)
 }
 
 /// The region-structuring decompilation pass: builds the initial AST from qcode.
@@ -79,13 +95,145 @@ impl DecompilePass for Structure {
 
 crate::register_decompile_pass!(Structure);
 
+/// Post-structuring validation: the structured AST must not silently drop code
+/// or jump to a label it never prints — the two ways region structuring can
+/// produce misleading pseudo-C (a dropped secondary loop exit, a jump-table arm
+/// whose case bodies were never walked). When either invariant fails the
+/// structured output is unsound, so this pass replaces it with the
+/// always-correct flat lowering rather than emit code that lies.
+#[derive(Default)]
+pub struct ValidateStructuring;
+
+impl DecompilePass for ValidateStructuring {
+    const NAME: &'static str = "validate_structuring";
+
+    fn description(&self) -> &'static str {
+        "validate structured output; fall back to flat lowering if code was dropped"
+    }
+
+    fn run(
+        &self,
+        ctx: &Context,
+        fun_id: FunctionId,
+        program: &mut Program,
+    ) -> Result<bool, String> {
+        if validate_program(ctx, fun_id, program).is_err() {
+            *program = lower_function(ctx, fun_id);
+            return Ok(true);
+        }
+        Ok(false)
+    }
+}
+
+crate::register_decompile_pass!(ValidateStructuring);
+
+/// Checks the two structural invariants the emitter relies on:
+///
+/// 1. **Coverage** — every reachable block with a non-control-flow body appears
+///    in the output (its instructions were emitted). A block that vanished had
+///    its body dropped.
+/// 2. **Goto/label consistency** — every `goto` to an in-subgraph block targets
+///    a label that is actually printed. A goto to a suppressed label is a jump
+///    into the void.
+///
+/// (Gotos to blocks outside the analyzed subgraph — inter-function tails — carry
+/// no label by design and are exempt.)
+fn validate_program(
+    ctx: &Context,
+    function_id: FunctionId,
+    program: &Program,
+) -> Result<(), String> {
+    let function = qcode::value::Function::from_id(ctx, function_id);
+    let Some(root) = function.root() else {
+        return Ok(());
+    };
+    let node_set: HashSet<BlockId> = reachable(ctx, root.id).into_iter().collect();
+
+    let mut labels = HashSet::new();
+    let mut gotos = HashSet::new();
+    let mut covered = HashSet::new();
+    collect_validation(ctx, &program.stmts, &mut labels, &mut gotos, &mut covered);
+
+    for &b in &node_set {
+        if block_has_body(ctx, b) && !covered.contains(&b) {
+            return Err(format!("block {b:?} was dropped from structured output"));
+        }
+    }
+    for &g in &gotos {
+        if node_set.contains(&g) && !labels.contains(&g) {
+            return Err(format!(
+                "goto targets in-subgraph block {g:?} with no printed label"
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Walks the statement tree, recording every emitted label, every goto target,
+/// and every block whose body was emitted (via a [`Stmt::Raw`], or — once a
+/// switch has folded its comparison tree — via the case's recorded provenance).
+fn collect_validation(
+    ctx: &Context,
+    stmts: &[Stmt],
+    labels: &mut HashSet<BlockId>,
+    gotos: &mut HashSet<BlockId>,
+    covered: &mut HashSet<BlockId>,
+) {
+    let cover_insn = |id, covered: &mut HashSet<BlockId>| {
+        if let Some(block) = Instruction::from_id(ctx, id).block() {
+            covered.insert(block.id);
+        }
+    };
+    for stmt in stmts {
+        match stmt {
+            Stmt::Label(b) => {
+                labels.insert(*b);
+            }
+            Stmt::Goto(b) | Stmt::GotoIf { target: b, .. } => {
+                gotos.insert(*b);
+            }
+            Stmt::Raw(id) => cover_insn(*id, covered),
+            Stmt::If { then, els, .. } => {
+                collect_validation(ctx, then, labels, gotos, covered);
+                collect_validation(ctx, els, labels, gotos, covered);
+            }
+            Stmt::While { body, .. } | Stmt::DoWhile { body, .. } | Stmt::Loop { body } => {
+                collect_validation(ctx, body, labels, gotos, covered);
+            }
+            Stmt::Switch { cases, default, .. } => {
+                for case in cases {
+                    // The equality tests a case folded away belong to the blocks
+                    // they came from; count them as covered.
+                    for &id in &case.insns {
+                        cover_insn(id, covered);
+                    }
+                    collect_validation(ctx, &case.body, labels, gotos, covered);
+                }
+                collect_validation(ctx, default, labels, gotos, covered);
+            }
+            Stmt::Assign { .. } | Stmt::Break | Stmt::Continue => {}
+        }
+    }
+}
+
+/// Whether `block` has any instruction that survives as a statement (i.e. is not
+/// a pure control-flow terminator the structurer turns into a goto).
+fn block_has_body(ctx: &Context, block: BlockId) -> bool {
+    BasicBlock::from_id(ctx, block)
+        .instructions()
+        .any(|insn| !is_replaced_by_goto(&insn))
+}
+
 /// Structures `function_id` into nested control flow (with loops as endless
 /// [`Stmt::Loop`]s), falling back to flat goto-based lowering for functions with
 /// irreducible control flow. The [`Structure`] pass's implementation.
 fn structure_regions(ctx: &Context, function_id: FunctionId) -> Program {
     let function = qcode::value::Function::from_id(ctx, function_id);
     let Some(root) = function.root() else {
-        return Program::default();
+        return Program {
+            function: Some(function_id),
+            ..Program::default()
+        };
     };
     let root_id = root.id;
 
@@ -112,7 +260,11 @@ fn structure_regions(ctx: &Context, function_id: FunctionId) -> Program {
         frames: Vec::new(),
     };
     let (stmts, _) = structurer.region(root_id, None);
-    Program { stmts, labels }
+    Program {
+        function: Some(function_id),
+        stmts,
+        labels,
+    }
 }
 
 /// A natural loop: the blocks it comprises and the single block control leaves
@@ -191,7 +343,12 @@ impl Structurer<'_, '_> {
 
             match block_exit(BasicBlock::from_id(self.ctx, b)) {
                 BlockExit::Return => cur = None,
-                BlockExit::Goto { target, .. } => cur = Some(target),
+                BlockExit::Goto { target, .. } => {
+                    // Phi copies for this edge run at the end of the source block,
+                    // just before control transfers on to `target`.
+                    out.extend(block_arg_moves(self.ctx, b, target));
+                    cur = Some(target);
+                }
                 BlockExit::Branch {
                     condition,
                     true_target,
@@ -201,16 +358,19 @@ impl Structurer<'_, '_> {
                     let merge = self.immediate_postdom(b);
                     let (then, then_ft) = self.region(true_target, merge);
                     let (els, els_ft) = self.region(false_target, merge);
+                    // Each edge's phi copies belong at the top of that arm, so
+                    // they run only on the path that takes the edge.
                     out.push(Stmt::If {
                         cond: lower_expr(self.ctx, condition),
-                        then,
-                        els,
+                        then: prepend(block_arg_moves(self.ctx, b, true_target), then),
+                        els: prepend(block_arg_moves(self.ctx, b, false_target), els),
                     });
                     // Continue at the merge only if some arm reaches it.
                     cur = if then_ft || els_ft { merge } else { None };
                 }
                 BlockExit::Indirect { edges } | BlockExit::Unstructured { edges } => {
                     for (_, target) in edges {
+                        out.extend(block_arg_moves(self.ctx, b, target));
                         out.push(Stmt::Goto(target));
                     }
                     cur = None;
@@ -222,7 +382,11 @@ impl Structurer<'_, '_> {
 
     /// Structures the natural loop headed at `header` as a [`Stmt::Loop`],
     /// returning it and the block control leaves to on exit.
-    fn structure_loop(&mut self, header: BlockId, stop: Option<BlockId>) -> (Stmt, Option<BlockId>) {
+    fn structure_loop(
+        &mut self,
+        header: BlockId,
+        stop: Option<BlockId>,
+    ) -> (Stmt, Option<BlockId>) {
         let exit = self.loops[&header].exit;
         self.frames.push(LoopFrame { header, exit });
         let (body, _) = self.region(header, stop);
@@ -379,6 +543,13 @@ fn loop_exit(
         .map(|(b, _)| b)
 }
 
+/// Returns `head` extended by `tail` — used to place an edge's phi copies before
+/// the body of the arm that takes it.
+fn prepend(mut head: Vec<Stmt>, tail: Vec<Stmt>) -> Vec<Stmt> {
+    head.extend(tail);
+    head
+}
+
 /// The blocks reachable from `root`, in DFS order.
 fn reachable(ctx: &Context, root: BlockId) -> Vec<BlockId> {
     jstd::graph::analysis::reachable_from_root(ctx, root)
@@ -450,7 +621,7 @@ mod tests {
             "
         );
 
-        let program = decompile_function(&ctx, f);
+        let program = decompile_function(&ctx, f).unwrap();
         // The branch is fully structured: no gotos remain (the merge is inlined).
         assert_eq!(
             program.goto_count(),
@@ -491,7 +662,7 @@ mod tests {
             "
         );
 
-        let program = decompile_function(&ctx, f);
+        let program = decompile_function(&ctx, f).unwrap();
         assert_eq!(
             program.goto_count(),
             0,
@@ -535,7 +706,7 @@ mod tests {
         );
 
         let flat = lower_function(&ctx, f).goto_count();
-        let structured = decompile_function(&ctx, f).goto_count();
+        let structured = decompile_function(&ctx, f).unwrap().goto_count();
         assert!(
             structured < flat,
             "structuring should reduce gotos ({structured} !< {flat})"
@@ -566,7 +737,7 @@ mod tests {
             "
         );
 
-        let program = decompile_function(&ctx, f);
+        let program = decompile_function(&ctx, f).unwrap();
         // The loop (header test, body, back edge, exit) structures with no gotos:
         // the back edge is a `continue`, the exit a `break`.
         assert_eq!(
@@ -578,10 +749,16 @@ mod tests {
         // Header-tested: refines to a pre-tested `while (cond)`.
         let c = emit_c(&ctx, &program);
         assert!(
-            program.stmts.iter().any(|s| matches!(s, Stmt::While { .. })),
+            program
+                .stmts
+                .iter()
+                .any(|s| matches!(s, Stmt::While { .. })),
             "expected a while loop, got:\n{c}"
         );
-        assert!(c.contains("while (cond) {"), "expected `while (cond)`:\n{c}");
+        assert!(
+            c.contains("while (cond) {"),
+            "expected `while (cond)`:\n{c}"
+        );
         assert!(!c.contains("while (true)"), "should not be endless:\n{c}");
         // And it no longer degrades to the flat lowering.
         let flat = lower_function(&ctx, f);
@@ -610,7 +787,7 @@ mod tests {
             "
         );
 
-        let program = decompile_function(&ctx, f);
+        let program = decompile_function(&ctx, f).unwrap();
         assert_eq!(
             program.goto_count(),
             0,
@@ -620,11 +797,138 @@ mod tests {
         // Latch-tested: refines to a post-tested `do { … } while (cond)`.
         let c = emit_c(&ctx, &program);
         assert!(
-            program.stmts.iter().any(|s| matches!(s, Stmt::DoWhile { .. })),
+            program
+                .stmts
+                .iter()
+                .any(|s| matches!(s, Stmt::DoWhile { .. })),
             "expected a do-while loop, got:\n{c}"
         );
         assert!(c.contains("do {"), "expected a do-block:\n{c}");
-        assert!(c.contains("} while (cond)"), "expected trailing while test:\n{c}");
+        assert!(
+            c.contains("} while (cond)"),
+            "expected trailing while test:\n{c}"
+        );
+    }
+
+    #[test]
+    fn block_argument_join_emits_phi_copies() {
+        // `x = cond ? 1 : 2` after mem2reg: the merge block takes a parameter `v`
+        // that each arm passes a different value to. The per-edge argument moves
+        // must be emitted, or the merge's `x = v` reads a variable never assigned.
+        let mut ctx = Context::new();
+        qcode!(
+            ctx,
+            "
+            varnode i8 cond;
+            varnode i32 x;
+
+            fn f:
+            <entry>
+                %c = load(i8, &cond);
+                if %c goto <then_lbl> else goto <else_lbl>;
+            <then_lbl>
+                goto <merge @v=i32 0x1>;
+            <else_lbl>
+                goto <merge @v=i32 0x2>;
+            <merge @v:i32>
+                store(&x, @v);
+                local i64 ptr;
+                return [ptr];
+            "
+        );
+
+        let program = decompile_function(&ctx, f).unwrap();
+        let c = emit_c(&ctx, &program);
+        // Both edges assign the join parameter before it is used.
+        assert!(c.contains("v = 0x1"), "then edge's phi copy missing:\n{c}");
+        assert!(c.contains("v = 0x2"), "else edge's phi copy missing:\n{c}");
+        // And the merge consumes that same parameter.
+        assert!(
+            c.contains("x = v"),
+            "merge should read the join parameter:\n{c}"
+        );
+    }
+
+    #[test]
+    fn loop_carried_parameter_updates_on_the_back_edge() {
+        // A counting loop: the header parameter `i` is seeded to 0 on entry and
+        // updated to `i + 1` on the back edge. The entry copy and the back-edge
+        // copy must both be emitted, or the loop counter is never initialized or
+        // never advances.
+        let mut ctx = Context::new();
+        qcode!(
+            ctx,
+            "
+            varnode i32 x;
+
+            fn f:
+            <entry>
+                goto <head @i=i32 0x0>;
+            <head @i:i32>
+                %c = i32 @i s< i32 0xa;
+                if %c goto <body> else goto <exit_lbl>;
+            <body>
+                %ni = i32 @i + i32 0x1;
+                goto <head @i=%ni>;
+            <exit_lbl>
+                store(&x, @i);
+                local i64 ptr;
+                return [ptr];
+            "
+        );
+
+        let program = decompile_function(&ctx, f).unwrap();
+        let c = emit_c(&ctx, &program);
+        assert!(c.contains("i = 0x0"), "counter should be initialized:\n{c}");
+        assert!(
+            c.contains("i = i + 0x1"),
+            "counter should advance on the back edge:\n{c}"
+        );
+    }
+
+    #[test]
+    fn loop_with_two_exits_drops_no_code() {
+        // A loop whose body leaves through two different blocks: the header's
+        // false edge to `exit1`, and the body's error edge to `cleanup`. Only one
+        // can be the structured `break` target; a naive walk turns the other into
+        // a goto it never follows, dropping that block's body. Validation must
+        // catch the drop and fall back to flat lowering, which keeps every block.
+        let mut ctx = Context::new();
+        qcode!(
+            ctx,
+            "
+            varnode i8 cond;
+            varnode i8 err;
+            varnode i32 x;
+
+            fn f:
+            <entry>
+                goto <head>;
+            <head>
+                %c = load(i8, &cond);
+                if %c goto <body> else goto <exit1>;
+            <body>
+                %e = load(i8, &err);
+                if %e goto <cleanup> else goto <head>;
+            <cleanup>
+                store(&x, i32 0xdead);
+                local i64 p1;
+                return [p1];
+            <exit1>
+                store(&x, i32 0xbeef);
+                local i64 p2;
+                return [p2];
+            "
+        );
+
+        let program = decompile_function(&ctx, f).unwrap();
+        let c = emit_c(&ctx, &program);
+        // Neither exit's body may be lost, however the loop is (or isn't) structured.
+        assert!(
+            c.contains("0xdead"),
+            "the cleanup exit body was dropped:\n{c}"
+        );
+        assert!(c.contains("0xbeef"), "the main exit body was dropped:\n{c}");
     }
 
     #[test]
@@ -655,7 +959,7 @@ mod tests {
             "
         );
 
-        let program = decompile_function(&ctx, f);
+        let program = decompile_function(&ctx, f).unwrap();
         assert_eq!(
             program.goto_count(),
             0,

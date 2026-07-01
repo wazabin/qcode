@@ -7,7 +7,7 @@
 
 use std::collections::HashMap;
 
-use qcode::value::{BlockId, InstructionId};
+use qcode::value::{BlockId, InstructionId, ValueId, function::FunctionId};
 
 use super::cast::Expr;
 
@@ -24,6 +24,11 @@ pub enum Stmt {
     Label(BlockId),
     /// A verbatim IR instruction (arithmetic, load/store, call, return, ...).
     Raw(InstructionId),
+    /// A block-parameter (phi) copy `param = value;`, realized on a CFG edge that
+    /// passes `value` to the successor block's parameter `param`. SSA join values
+    /// live in block parameters; structuring materializes the incoming-argument
+    /// assignment as a statement on the edge that carries it.
+    Assign { param: ValueId, value: ValueId },
     /// `goto <label>;`
     Goto(BlockId),
     /// `if (<cond>) goto <label>;`
@@ -61,6 +66,9 @@ pub enum Stmt {
 pub struct SwitchCase {
     pub values: Vec<u64>,
     pub body: Vec<Stmt>,
+    /// The comparison instructions this case folded away (the equality tests
+    /// against its labels), for mapping the arm back to the low-level code.
+    pub insns: Vec<InstructionId>,
 }
 
 /// Counts the `goto` statements (conditional and unconditional) in a statement
@@ -78,7 +86,7 @@ pub fn count_gotos(stmts: &[Stmt]) -> usize {
             Stmt::Switch { cases, default, .. } => {
                 cases.iter().map(|c| count_gotos(&c.body)).sum::<usize>() + count_gotos(default)
             }
-            Stmt::Label(_) | Stmt::Raw(_) | Stmt::Break | Stmt::Continue => 0,
+            Stmt::Label(_) | Stmt::Raw(_) | Stmt::Assign { .. } | Stmt::Break | Stmt::Continue => 0,
         })
         .sum()
 }
@@ -87,6 +95,9 @@ pub fn count_gotos(stmts: &[Stmt]) -> usize {
 /// gotos and labels refer to.
 #[derive(Debug, Clone, Default)]
 pub struct Program {
+    /// The function this body was lowered from, used to emit the `fn name(...)`
+    /// header. `None` only for an empty default program that no pass has filled.
+    pub(crate) function: Option<FunctionId>,
     pub stmts: Vec<Stmt>,
     pub(crate) labels: HashMap<BlockId, String>,
 }

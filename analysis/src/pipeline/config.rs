@@ -761,6 +761,7 @@ fn function_fingerprint(ctx: &Context, fun_id: FunctionId) -> u64 {
 /// Run a function-scoped stage function-major: for each non-external function,
 /// run the stage's passes; if `repeat_until` is set, loop that function's passes
 /// to a fixpoint before moving to the next function.
+#[allow(clippy::too_many_arguments)]
 fn run_function_stage(
     ctx: &mut Context,
     env: &PipelineEnv,

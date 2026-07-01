@@ -10,7 +10,7 @@ use std::collections::HashMap;
 
 use qcode::{
     context::Context,
-    value::{BasicBlock, BlockId, BlockRef, FunctionId, InstructionRef, insn::Mnemonic},
+    value::{BasicBlock, BlockId, BlockRef, FunctionId, InstructionRef, ValueId, insn::Mnemonic},
 };
 
 use super::{BlockExit, ast::Program, ast::Stmt, block_exit, lower_expr::lower_expr};
@@ -22,7 +22,10 @@ use super::{BlockExit, ast::Program, ast::Stmt, block_exit, lower_expr::lower_ex
 pub fn lower_function(ctx: &Context, function_id: FunctionId) -> Program {
     let function = qcode::value::Function::from_id(ctx, function_id);
     let Some(root) = function.root() else {
-        return Program::default();
+        return Program {
+            function: Some(function_id),
+            ..Program::default()
+        };
     };
     let root_id = root.id;
 
@@ -39,7 +42,11 @@ pub fn lower_function(ctx: &Context, function_id: FunctionId) -> Program {
         lower_block(ctx, block, &mut stmts);
     }
 
-    Program { stmts, labels }
+    Program {
+        function: Some(function_id),
+        stmts,
+        labels,
+    }
 }
 
 /// Assigns each block a stable label name: its IR name if it has one, otherwise
@@ -68,31 +75,89 @@ fn lower_block(ctx: &Context, block: BlockRef<'_, '_>, out: &mut Vec<Stmt>) {
         out.push(Stmt::Raw(insn.id));
     }
 
+    let from = block.id;
     match block_exit(block) {
         // The `return` instruction is a verbatim body statement (kept above);
         // it needs no goto.
         BlockExit::Return => {}
-        BlockExit::Goto { target, .. } => out.push(Stmt::Goto(target)),
+        BlockExit::Goto { target, .. } => {
+            out.extend(block_arg_moves(ctx, from, target));
+            out.push(Stmt::Goto(target));
+        }
         BlockExit::Branch {
             condition,
             true_target,
             false_target,
             ..
         } => {
-            // `if (cond) goto TRUE; goto FALSE;`
-            out.push(Stmt::GotoIf {
-                cond: lower_expr(ctx, condition),
-                target: true_target,
-            });
+            // `if (cond) goto TRUE; goto FALSE;`. The true edge's phi copies must
+            // run only when it is taken, so when it carries any they move inside a
+            // guarded block (`if (cond) { copies; goto TRUE; }`).
+            let true_moves = block_arg_moves(ctx, from, true_target);
+            if true_moves.is_empty() {
+                out.push(Stmt::GotoIf {
+                    cond: lower_expr(ctx, condition),
+                    target: true_target,
+                });
+            } else {
+                let mut then = true_moves;
+                then.push(Stmt::Goto(true_target));
+                out.push(Stmt::If {
+                    cond: lower_expr(ctx, condition),
+                    then,
+                    els: Vec::new(),
+                });
+            }
+            out.extend(block_arg_moves(ctx, from, false_target));
             out.push(Stmt::Goto(false_target));
         }
         // Indirect / unstructured exits: preserve reachability with a goto to
         // every successor. Lossy but keeps the baseline correct-by-construction.
         BlockExit::Indirect { edges } | BlockExit::Unstructured { edges } => {
             for (_, target) in edges {
+                out.extend(block_arg_moves(ctx, from, target));
                 out.push(Stmt::Goto(target));
             }
         }
+    }
+}
+
+/// The block-parameter (phi) copies realized on the edge `from -> to`: each of
+/// `to`'s parameters paired with the argument `from`'s terminator passes for it,
+/// as `param = arg;` assignments.
+///
+/// These are the SSA join copies. They are emitted as *sequential* assignments;
+/// a parallel copy where an argument reads a parameter also written on the same
+/// edge (e.g. a swap) is not sequentialized — rare after mem2reg, and left for a
+/// later pass. Identity copies (`p = p`) are dropped as no-ops.
+pub(crate) fn block_arg_moves(ctx: &Context, from: BlockId, to: BlockId) -> Vec<Stmt> {
+    let args = edge_args(ctx, from, to);
+    if args.is_empty() {
+        return Vec::new();
+    }
+    let target = BasicBlock::from_id(ctx, to);
+    target
+        .params()
+        .zip(args)
+        .filter_map(|(param, arg)| {
+            let param = ValueId::BlockParam(param.id);
+            (param != arg).then_some(Stmt::Assign { param, value: arg })
+        })
+        .collect()
+}
+
+/// The arguments `from`'s terminator passes along its edge to `to`, or empty if
+/// the edge carries none (or `from` has no argument-passing terminator).
+fn edge_args(ctx: &Context, from: BlockId, to: BlockId) -> Vec<ValueId> {
+    let block = BasicBlock::from_id(ctx, from);
+    let Some(term) = block.iter().last().filter(|insn| insn.is_terminator()) else {
+        return Vec::new();
+    };
+    match term.mnemonic() {
+        Mnemonic::Branch(b) if b.target == to => b.args.clone(),
+        Mnemonic::CBranch(c) if c.success_block == to => c.success_args.clone(),
+        Mnemonic::CBranch(c) if c.failure_block == to => c.failure_args.clone(),
+        _ => Vec::new(),
     }
 }
 
@@ -144,8 +209,47 @@ mod tests {
             "condition should be a real expr:\n{c}"
         );
         assert!(c.contains("goto"), "should contain gotos:\n{c}");
-        // The entry label is emitted first.
-        assert!(c.starts_with("entry:"), "entry label first:\n{c}");
+        // The entry label is emitted first, just inside the `fn` header.
+        assert!(
+            c.starts_with("fn f() {\n    entry:"),
+            "entry label first inside the fn body:\n{c}"
+        );
+    }
+
+    #[test]
+    fn flat_lowering_carries_phi_copies_on_both_edges() {
+        // The flat lowering is the always-correct fallback, so it too must copy
+        // block-parameter arguments on every edge. A conditional's true-edge copy
+        // must be guarded so it runs only when that edge is taken.
+        let mut ctx = Context::new();
+        qcode!(
+            ctx,
+            "
+            varnode i8 cond;
+            varnode i32 x;
+
+            fn f:
+            <entry>
+                %c = load(i8, &cond);
+                if %c goto <succ @v=i32 0x1> else goto <fail @w=i32 0x2>;
+            <succ @v:i32>
+                store(&x, @v);
+                goto <0x2000>;
+            <fail @w:i32>
+                store(&x, @w);
+                goto <0x2001>;
+            "
+        );
+
+        let program = lower_function(&ctx, f);
+        let c = emit_c(&ctx, &program);
+        // The true-edge copy is guarded by the branch condition; the false-edge
+        // copy runs on fall-through.
+        assert!(
+            c.contains("if (cond) {") && c.contains("v = 0x1"),
+            "true-edge phi copy should be guarded by the condition:\n{c}"
+        );
+        assert!(c.contains("w = 0x2"), "false-edge phi copy missing:\n{c}");
     }
 
     #[test]

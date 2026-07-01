@@ -9,7 +9,10 @@ use std::collections::HashSet;
 
 use qcode::{
     context::Context,
-    value::{BlockId, Function, Instruction, InstructionId, ValueId, insn::Mnemonic},
+    value::{
+        BlockId, Function, Instruction, InstructionId, ValueId, Varnode, VarnodeId,
+        function::FunctionId, insn::Mnemonic,
+    },
 };
 
 use super::{
@@ -19,11 +22,65 @@ use super::{
 };
 
 /// Renders `program` as classified, indented token lines.
+///
+/// When the program knows its source function, the body is wrapped in a
+/// `fn name(args) -> rets {` … `}` header and indented one level beneath it.
 pub fn emit_tokens(ctx: &Context, program: &Program) -> Vec<TokenLine> {
     let roots = compute_roots(ctx, program);
     let mut out = Vec::new();
-    emit_stmts(ctx, program, &program.stmts, 0, &roots, &mut out);
+    match program.function {
+        Some(function_id) => {
+            out.push(header_line(ctx, function_id));
+            emit_stmts(ctx, program, &program.stmts, 1, &roots, &mut out);
+            out.push(brace_line("}", 0));
+        }
+        None => emit_stmts(ctx, program, &program.stmts, 0, &roots, &mut out),
+    }
     out
+}
+
+/// Builds the `fn name(inputs) -> outputs {` header from the function's
+/// recovered signature. A missing signature (or an empty input/output list)
+/// simply renders empty parentheses / no return arrow.
+fn header_line(ctx: &Context, function_id: FunctionId) -> TokenLine {
+    let function = Function::from_id(ctx, function_id);
+    let sig = function.signature();
+
+    let mut buf = LineBuf::default();
+    buf.keyword("fn");
+    buf.space();
+    buf.push(function.name().to_string(), TokenKind::Label);
+
+    buf.punct("(");
+    if let Some(inputs) = sig.and_then(|s| s.inputs.as_deref()) {
+        emit_regs(ctx, inputs, &mut buf);
+    }
+    buf.punct(")");
+
+    if let Some(outputs) = sig
+        .and_then(|s| s.outputs.as_deref())
+        .filter(|o| !o.is_empty())
+    {
+        buf.space();
+        buf.punct("->");
+        buf.space();
+        emit_regs(ctx, outputs, &mut buf);
+    }
+
+    buf.space();
+    buf.punct("{");
+    buf.into_line(0, None)
+}
+
+/// Pushes a comma-separated list of register names (as variables) onto `buf`.
+fn emit_regs(ctx: &Context, regs: &[VarnodeId], buf: &mut LineBuf) {
+    for (i, &id) in regs.iter().enumerate() {
+        if i > 0 {
+            buf.punct(",");
+            buf.space();
+        }
+        buf.push(Varnode::from_id(ctx, id).to_string(), TokenKind::Variable);
+    }
 }
 
 /// Renders `program` as pseudo-C source text (indentation via spaces).
@@ -78,8 +135,42 @@ fn is_root(ctx: &Context, id: InstructionId) -> bool {
     }
     // A value used by more than one instruction is named to avoid duplicating
     // its expression; a value used zero times is dead and gets elided (not a
-    // root). Exactly-once uses are inlined into their user.
-    ctx.users(ValueId::Instruction(id)).len() > 1
+    // root). Exactly-once uses are inlined into their user — except a memory
+    // load, which reads state a later store or call can change, so it may fold
+    // into its user only when nothing between them can write that memory.
+    let users = ctx.users(ValueId::Instruction(id));
+    if users.len() != 1 {
+        return users.len() > 1;
+    }
+    is_memory_read(insn.mnemonic()) && !load_safe_to_fold(ctx, id, users[0])
+}
+
+/// Whether a single-use load may be inlined into its user rather than named:
+/// only when the user is in the same block and no instruction between them can
+/// write memory, so the loaded value cannot have changed at the point of use.
+/// Otherwise folding it would reorder the read past an aliasing write (the
+/// classic `t = *x; *x = …; use(t)` hazard).
+fn load_safe_to_fold(ctx: &Context, load: InstructionId, user: InstructionId) -> bool {
+    let load_insn = Instruction::from_id(ctx, load);
+    let Some(block) = load_insn.block() else {
+        return false;
+    };
+    if Instruction::from_id(ctx, user).block().map(|b| b.id) != Some(block.id) {
+        return false;
+    }
+    // Walk the block from the load to its user; any memory writer in between
+    // (store, call, or other side effect) forbids the fold.
+    let mut after_load = false;
+    for insn in block.instructions() {
+        if insn.id == load {
+            after_load = true;
+        } else if insn.id == user {
+            return after_load;
+        } else if after_load && is_side_effecting(insn.mnemonic()) {
+            return false;
+        }
+    }
+    false
 }
 
 /// Whether an instruction must always be a statement because it has effects.
@@ -93,6 +184,12 @@ pub(crate) fn is_side_effecting(m: &Mnemonic) -> bool {
             | Mnemonic::PCodeOp(_)
             | Mnemonic::Assert(_)
     )
+}
+
+/// Whether an instruction reads memory — a load, whose result is only valid
+/// until the next aliasing write. Such values are not freely foldable.
+pub(crate) fn is_memory_read(m: &Mnemonic) -> bool {
+    matches!(m, Mnemonic::Load(_))
 }
 
 // ---------------------------------------------------------------------------
@@ -139,7 +236,24 @@ fn emit_stmt(
                 return;
             }
             let block = Instruction::from_id(ctx, *id).block().map(|b| b.id);
-            out.push(statement(ctx, *id, roots).into_line(indent, block));
+            let mut buf = statement(ctx, *id, roots);
+            // The statement's operand expressions were lowered with `Some(roots)`,
+            // so `buf.insns` holds every genuinely inlined operand plus any root
+            // referenced by name. Drop the named roots (each is its own line) and
+            // add the statement's own instruction.
+            buf.insns.retain(|i| !roots.contains(i));
+            buf.note_insn(*id);
+            out.push(buf.into_line(indent, block));
+        }
+        Stmt::Assign { param, value } => {
+            // A phi copy `param = value;`. The value is lowered against the roots
+            // so an inlined operand renders inline and a named root by name.
+            let mut buf = LineBuf::default();
+            lower_expr_rooted(ctx, *param, roots).write_tokens(&mut buf);
+            assign(&mut buf);
+            lower_expr_rooted(ctx, *value, roots).write_tokens(&mut buf);
+            buf.punct(";");
+            out.push(buf.into_line(indent, None));
         }
         Stmt::Goto(target) => {
             let mut buf = LineBuf::default();
@@ -265,6 +379,10 @@ fn emit_stmt(
                 arm.punct("=>");
                 arm.space();
                 arm.punct("{");
+                // Map the arm's labels back to the folded-away equality tests.
+                for &insn in &case.insns {
+                    arm.note_insn(insn);
+                }
                 out.push(arm.into_line(indent + 1, None));
                 emit_stmts(ctx, program, &case.body, indent + 2, roots, out);
                 out.push(brace_line("}", indent + 1));
@@ -309,7 +427,7 @@ fn statement(ctx: &Context, id: InstructionId, roots: &HashSet<InstructionId>) -
         }
         Mnemonic::Call(c) => {
             let name = Function::from_id(ctx, c.target).name().to_string();
-            buf.push(name, TokenKind::Label);
+            buf.push_function(name, TokenKind::Label, Some(c.target));
             call_args(ctx, &c.args, roots, &mut buf);
             buf.punct(";");
         }
@@ -323,7 +441,11 @@ fn statement(ctx: &Context, id: InstructionId, roots: &HashSet<InstructionId>) -
         }
         // A named value: `name = <defining expression>;`.
         _ => {
-            buf.push(instruction_name(ctx, id), TokenKind::Variable);
+            buf.push_value(
+                instruction_name(ctx, id),
+                TokenKind::Variable,
+                Some(ValueId::Instruction(id)),
+            );
             assign(&mut buf);
             lower_defining_expr(ctx, id, roots).write_tokens(&mut buf);
             buf.punct(";");
@@ -404,6 +526,48 @@ mod tests {
     }
 
     #[test]
+    fn loads_do_not_fold_across_an_aliasing_store() {
+        // The classic swap: `t = *x; u = *y; *x = u; *y = t`. If the single-use
+        // loads folded into the stores, the output would collapse to `x = y; y =
+        // x`, losing the old value of x. Each load must instead be named, because
+        // an aliasing store sits between it and its use.
+        let mut ctx = Context::new();
+        qcode!(
+            ctx,
+            "
+            varnode i32 x;
+            varnode i32 y;
+
+            fn f:
+            <entry>
+                %t = load(i32, &x);
+                %u = load(i32, &y);
+                store(&x, %u);
+                store(&y, %t);
+                local i64 ptr;
+                return [ptr];
+            "
+        );
+
+        let program = lower_function(&ctx, f);
+        let c = emit_c(&ctx, &program);
+
+        // The old value of x must be saved to a temp before the store to x
+        // clobbers it — that load may not fold past the intervening store.
+        assert!(c.contains("t = x;"), "load of x should be named:\n{c}");
+        assert!(
+            c.contains("y = t;"),
+            "y must be restored from the saved temp:\n{c}"
+        );
+        // The bug: folding the load of x into `*y = …` past the store to x, so
+        // `y` reads the already-overwritten `x`.
+        assert!(
+            !c.contains("y = x;"),
+            "load folded across the aliasing store to x:\n{c}"
+        );
+    }
+
+    #[test]
     fn folded_expression_preserves_required_parentheses() {
         let mut ctx = Context::new();
         qcode!(
@@ -456,14 +620,15 @@ mod tests {
             "
         );
 
-        let program = decompile_function(&ctx, f);
+        let program = decompile_function(&ctx, f).unwrap();
         let lines = emit_tokens(&ctx, &program);
 
+        // Depth 2: one level for the `fn` header, one for the enclosing `if`.
         assert!(
             lines
                 .iter()
-                .any(|line| line.indent == 1 && line.text() == "x = 0x1;"),
-            "expected nested store to carry indent depth 1, got:\n{lines:#?}"
+                .any(|line| line.indent == 2 && line.text() == "x = 0x1;"),
+            "expected nested store to carry indent depth 2, got:\n{lines:#?}"
         );
     }
 
@@ -492,17 +657,113 @@ mod tests {
         let program = lower_function(&ctx, f);
         let lines = emit_tokens(&ctx, &program);
 
+        // Everything sits one level in from the `fn` header: the label at depth
+        // 1, its block body at depth 2.
         assert!(
             lines
                 .iter()
-                .any(|line| line.indent == 0 && line.text() == "entry:"),
-            "expected label at base indent, got:\n{lines:#?}"
+                .any(|line| line.indent == 1 && line.text() == "entry:"),
+            "expected label one level under the fn header, got:\n{lines:#?}"
         );
         assert!(
             lines
                 .iter()
-                .any(|line| line.indent == 1 && line.text().starts_with("if (cond) goto ")),
+                .any(|line| line.indent == 2 && line.text().starts_with("if (cond) goto ")),
             "expected flat block body to be indented under its label, got:\n{lines:#?}"
+        );
+    }
+
+    #[test]
+    fn folded_statement_maps_back_to_its_source_instructions() {
+        let mut ctx = Context::new();
+        qcode!(
+            ctx,
+            "
+            varnode i32 x;
+            varnode i32 y;
+
+            fn f:
+            <entry>
+                %a = load(i32, &x);
+                %b = i32 %a + i32 0x1;
+                store(&y, %b);
+                local i64 ptr;
+                return [ptr];
+            "
+        );
+
+        let program = lower_function(&ctx, f);
+        let lines = emit_tokens(&ctx, &program);
+
+        // The single compound store line must carry all three folded-in
+        // instructions (the load, the add, and the store itself).
+        let store_line = lines
+            .iter()
+            .find(|l| l.text() == "y = x + 0x1;")
+            .expect("expected the folded store line");
+        let opcodes: Vec<String> = store_line
+            .insns
+            .iter()
+            .map(|&id| Instruction::from_id(&ctx, id).opcode().to_string())
+            .collect();
+        assert_eq!(
+            store_line.insns.len(),
+            3,
+            "load + add + store should all map to this line, got {opcodes:?}"
+        );
+
+        // A value token carries the IR value it renders, so a front-end can
+        // highlight its uses; plain punctuation does not.
+        let x_token = store_line
+            .tokens
+            .iter()
+            .find(|t| t.text == "x")
+            .expect("expected the `x` variable token");
+        assert!(x_token.value.is_some(), "value tokens carry provenance");
+        let eq_token = store_line.tokens.iter().find(|t| t.text == "=").unwrap();
+        assert!(eq_token.value.is_none(), "punctuation carries no value");
+    }
+
+    #[test]
+    fn condition_line_maps_back_to_its_comparison_and_load() {
+        let mut ctx = Context::new();
+        qcode!(
+            ctx,
+            "
+            varnode i32 x;
+            varnode i32 y;
+
+            fn f:
+            <entry>
+                %v = load(i32, &x);
+                %c = i32 %v == i32 0x5;
+                if %c goto <then_lbl> else goto <merge>;
+            <then_lbl>
+                store(&y, i32 0x1);
+                goto <merge>;
+            <merge>
+                local i64 ptr;
+                return [ptr];
+            "
+        );
+
+        let program = decompile_function(&ctx, f).unwrap();
+        let lines = emit_tokens(&ctx, &program);
+
+        // The `if (x == 0x5)` header folds in the comparison and the load, both
+        // of which must be recoverable from the line's instruction set.
+        let cond_line = lines
+            .iter()
+            .find(|l| l.text().starts_with("if (") && l.text().contains("=="))
+            .expect("expected the folded if header");
+        assert!(
+            cond_line.insns.len() >= 2,
+            "the compare and the load should both map to the condition, got {:?}",
+            cond_line
+                .insns
+                .iter()
+                .map(|&id| Instruction::from_id(&ctx, id).opcode().to_string())
+                .collect::<Vec<_>>()
         );
     }
 

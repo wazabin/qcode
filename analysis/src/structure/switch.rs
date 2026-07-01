@@ -28,15 +28,15 @@ use std::collections::HashSet;
 
 use qcode::{
     context::Context,
-    value::{BlockId, FunctionId, Instruction},
+    value::{BlockId, FunctionId, Instruction, InstructionId, ValueId},
 };
 
 use crate::pipeline::DecompilePass;
 
 use super::{
     ast::{Program, Stmt, SwitchCase},
-    cast::{BinOp, Expr},
-    emit::is_side_effecting,
+    cast::{BinOp, Expr, ExprKind},
+    emit::{is_memory_read, is_side_effecting},
 };
 
 /// Fewer than this many case labels is left as an `if`/`else` chain — a `switch`
@@ -177,15 +177,18 @@ impl Collector<'_, '_> {
         // body of pure assignments is not mistaken for setup.
         match skip_setup_prefix(self.ctx, stmts) {
             [Stmt::If { cond, then, els }] => {
-                if let Some((s, values)) = match_case_test(cond) {
-                    if s == self.scrutinee {
-                        self.cases.push(SwitchCase {
-                            values,
-                            body: then.clone(),
-                        });
-                        self.collect(els);
-                        return;
-                    }
+                if let Some((s, values)) = match_case_test(cond)
+                    && s == self.scrutinee
+                {
+                    let mut insns = Vec::new();
+                    collect_expr_insns(cond, &mut insns);
+                    self.cases.push(SwitchCase {
+                        values,
+                        body: then.clone(),
+                        insns,
+                    });
+                    self.collect(els);
+                    return;
                 }
                 if scrutinee_of(cond).as_ref() == Some(&self.scrutinee) {
                     // A relational split on the scrutinee: both sides continue.
@@ -226,22 +229,47 @@ fn scrutinee_of(cond: &Expr) -> Option<Expr> {
     let mut vars = Vec::new();
     collect_vars(cond, &mut vars);
     let first = vars.first()?.clone();
-    vars.iter().all(|v| *v == first).then_some(Expr::Var(first))
+    vars.iter().all(|v| *v == first).then_some(Expr::var(first))
 }
 
 /// Collects the names of every variable leaf of `expr`.
 fn collect_vars(expr: &Expr, out: &mut Vec<String>) {
-    match expr {
-        Expr::Var(name) => out.push(name.clone()),
-        Expr::Const(_) => {}
-        Expr::Unary(_, e) | Expr::Deref(e) | Expr::Cast { expr: e, .. } => collect_vars(e, out),
-        Expr::Binary(_, a, b) => {
+    match &expr.kind {
+        ExprKind::Var(name) => out.push(name.clone()),
+        ExprKind::Const(_) => {}
+        ExprKind::Unary(_, e) | ExprKind::Deref(e) | ExprKind::Cast { expr: e, .. } => {
+            collect_vars(e, out)
+        }
+        ExprKind::Binary(_, a, b) => {
             collect_vars(a, out);
             collect_vars(b, out);
         }
-        Expr::Unknown { operands, .. } => {
+        ExprKind::Unknown { operands, .. } => {
             for operand in operands {
                 collect_vars(operand, out);
+            }
+        }
+    }
+}
+
+/// Collects the instruction results of every node of `expr` (its provenance),
+/// so a folded-away comparison tree can be mapped back to the low-level code.
+fn collect_expr_insns(expr: &Expr, out: &mut Vec<InstructionId>) {
+    if let Some(ValueId::Instruction(id)) = expr.value {
+        out.push(id);
+    }
+    match &expr.kind {
+        ExprKind::Const(_) | ExprKind::Var(_) => {}
+        ExprKind::Unary(_, e) | ExprKind::Deref(e) | ExprKind::Cast { expr: e, .. } => {
+            collect_expr_insns(e, out)
+        }
+        ExprKind::Binary(_, a, b) => {
+            collect_expr_insns(a, out);
+            collect_expr_insns(b, out);
+        }
+        ExprKind::Unknown { operands, .. } => {
+            for operand in operands {
+                collect_expr_insns(operand, out);
             }
         }
     }
@@ -259,8 +287,8 @@ fn match_case_test(cond: &Expr) -> Option<(Expr, Vec<u64>)> {
 /// Collects the constant labels of an equality (or `||`-chain of equalities),
 /// appending them to `values` and returning the common scrutinee.
 fn collect_eq_disjuncts(cond: &Expr, values: &mut Vec<u64>) -> Option<Expr> {
-    match cond {
-        Expr::Binary(BinOp::LOr, a, b) => {
+    match &cond.kind {
+        ExprKind::Binary(BinOp::LOr, a, b) => {
             let left = collect_eq_disjuncts(a, values)?;
             let right = collect_eq_disjuncts(b, values)?;
             (left == right).then_some(left)
@@ -276,17 +304,16 @@ fn collect_eq_disjuncts(cond: &Expr, values: &mut Vec<u64>) -> Option<Expr> {
 /// Matches one equality against a constant: `x == c`, `c == x`, or gcc's
 /// `(x - c) == 0`. Returns the scrutinee `x` and the constant `c`.
 fn single_eq(cond: &Expr) -> Option<(Expr, u64)> {
-    let Expr::Binary(BinOp::Eq, a, b) = cond else {
+    let ExprKind::Binary(BinOp::Eq, a, b) = &cond.kind else {
         return None;
     };
     let (expr, k) = const_split(a, b)?;
     // `(x - c) == 0` selects `c`; the compiler emits equality this way.
-    if k == 0 {
-        if let Expr::Binary(BinOp::Sub, lhs, rhs) = &expr {
-            if let Expr::Const(c) = rhs.as_ref() {
-                return Some(((**lhs).clone(), *c));
-            }
-        }
+    if k == 0
+        && let ExprKind::Binary(BinOp::Sub, lhs, rhs) = &expr.kind
+        && let ExprKind::Const(c) = rhs.kind
+    {
+        return Some(((**lhs).clone(), c));
     }
     Some((expr, k))
 }
@@ -294,9 +321,10 @@ fn single_eq(cond: &Expr) -> Option<(Expr, u64)> {
 /// Splits a comparison's operands into its (single) constant side and the other
 /// side, or `None` when neither or both are constants.
 fn const_split(a: &Expr, b: &Expr) -> Option<(Expr, u64)> {
-    match (a, b) {
-        (Expr::Const(_), Expr::Const(_)) => None,
-        (e, Expr::Const(c)) | (Expr::Const(c), e) => Some((e.clone(), *c)),
+    match (&a.kind, &b.kind) {
+        (ExprKind::Const(_), ExprKind::Const(_)) => None,
+        (_, ExprKind::Const(c)) => Some((a.clone(), *c)),
+        (ExprKind::Const(c), _) => Some((b.clone(), *c)),
         _ => None,
     }
 }
@@ -310,8 +338,15 @@ fn skip_setup_prefix<'a>(ctx: &Context, stmts: &'a [Stmt]) -> &'a [Stmt] {
 
 /// Whether a statement is a pure (side-effect-free) value definition — comparison
 /// setup that folds away with the switch.
+///
+/// A load is excluded even though it is side-effect-free: its value is only valid
+/// until the next aliasing write, so it is not freely foldable and must not be
+/// skipped as if it were dead setup (it is emitted as its own statement).
 fn is_pure_setup(ctx: &Context, stmt: &Stmt) -> bool {
-    matches!(stmt, Stmt::Raw(id) if !is_side_effecting(&Instruction::from_id(ctx, *id).mnemonic()))
+    matches!(stmt, Stmt::Raw(id) if {
+        let m = Instruction::from_id(ctx, *id).mnemonic();
+        !is_side_effecting(m) && !is_memory_read(m)
+    })
 }
 
 #[cfg(test)]
@@ -363,11 +398,15 @@ mod tests {
             "
         );
 
-        let program = decompile_function(&ctx, f);
+        let program = decompile_function(&ctx, f).unwrap();
         let c = emit_c(&ctx, &program);
 
         assert!(has_switch(&program.stmts), "expected a switch node:\n{c}");
-        assert_eq!(program.goto_count(), 0, "switch should erase the gotos:\n{c}");
+        assert_eq!(
+            program.goto_count(),
+            0,
+            "switch should erase the gotos:\n{c}"
+        );
         for needle in ["match sel {", "0x1 =>", "0x2 =>", "0x3 =>", "_ =>"] {
             assert!(c.contains(needle), "missing `{needle}` in:\n{c}");
         }
@@ -416,7 +455,7 @@ mod tests {
             "
         );
 
-        let program = decompile_function(&ctx, f);
+        let program = decompile_function(&ctx, f).unwrap();
         let c = emit_c(&ctx, &program);
 
         assert!(has_switch(&program.stmts), "expected a switch node:\n{c}");
@@ -464,7 +503,7 @@ mod tests {
             "
         );
 
-        let program = decompile_function(&ctx, f);
+        let program = decompile_function(&ctx, f).unwrap();
         assert!(
             !has_switch(&program.stmts),
             "two cases should stay if/else:\n{}",
