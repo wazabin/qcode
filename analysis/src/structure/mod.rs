@@ -23,6 +23,6 @@ mod lower_expr;
 pub use ast::{Program, Stmt};
 pub use cast::{BinOp, Expr, UnOp};
 pub use condition::{BlockExit, EdgeCondition, block_exit};
-pub use emit::emit_c;
+pub use emit::{Line, emit_c, emit_lines};
 pub use lower::lower_function;
 pub use lower_expr::lower_expr;

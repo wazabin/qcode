@@ -20,7 +20,8 @@ pub mod cfg;
 
 pub mod structure;
 pub use structure::{
-    BlockExit, EdgeCondition, Program, block_exit, emit_c, lower_expr, lower_function,
+    BlockExit, EdgeCondition, Line, Program, block_exit, emit_c, emit_lines, lower_expr,
+    lower_function,
 };
 
 pub mod naming;
