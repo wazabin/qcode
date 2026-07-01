@@ -9,6 +9,8 @@
 
 use std::fmt::{self, Display, Formatter};
 
+use super::tokens::{LineBuf, TokenKind};
+
 /// A C expression.
 ///
 /// [`Expr::Unknown`] is the total fallback so lowering never fails on an IR op
@@ -132,6 +134,62 @@ impl Expr {
         match self {
             Expr::Unary(UnOp::LNot, inner) => *inner,
             other => Expr::Unary(UnOp::LNot, Box::new(other)),
+        }
+    }
+
+    /// Emits this expression as classified tokens, parenthesizing exactly as
+    /// [`Display`] does. Colours are the front-end's concern.
+    pub(crate) fn write_tokens(&self, out: &mut LineBuf) {
+        match self {
+            Expr::Const(v) => out.push(format!("0x{v:x}"), TokenKind::Number),
+            Expr::Var(name) => out.push(name.clone(), TokenKind::Variable),
+            Expr::Unary(op, e) => {
+                out.push(op.spelling(), TokenKind::Operator);
+                Self::child_tokens(out, e, UNARY_PREC, false);
+            }
+            Expr::Deref(e) => {
+                out.push("*", TokenKind::Operator);
+                Self::child_tokens(out, e, UNARY_PREC, false);
+            }
+            Expr::Cast { signed, bits, expr } => {
+                let sign = if *signed { "int" } else { "uint" };
+                out.punct("(");
+                out.push(format!("{sign}{bits}_t"), TokenKind::Type);
+                out.punct(")");
+                Self::child_tokens(out, expr, UNARY_PREC, false);
+            }
+            Expr::Binary(op, lhs, rhs) => {
+                let p = op.precedence();
+                Self::child_tokens(out, lhs, p, false);
+                out.space();
+                out.push(op.spelling(), TokenKind::Operator);
+                out.space();
+                Self::child_tokens(out, rhs, p, true);
+            }
+            Expr::Unknown { op, operands } => {
+                out.push(op.clone(), TokenKind::Label);
+                out.punct("(");
+                for (i, e) in operands.iter().enumerate() {
+                    if i > 0 {
+                        out.punct(",");
+                        out.space();
+                    }
+                    e.write_tokens(out);
+                }
+                out.punct(")");
+            }
+        }
+    }
+
+    fn child_tokens(out: &mut LineBuf, child: &Expr, parent_prec: u8, on_right: bool) {
+        let cp = child.precedence();
+        let needs = cp > parent_prec || (cp == parent_prec && on_right && cp != PRIMARY_PREC);
+        if needs {
+            out.punct("(");
+            child.write_tokens(out);
+            out.punct(")");
+        } else {
+            child.write_tokens(out);
         }
     }
 

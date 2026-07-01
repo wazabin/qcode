@@ -6,6 +6,8 @@
 //! Impure or unmodeled instructions are referenced by their SSA name instead, or
 //! fall back to [`Expr::Unknown`], so lowering is total.
 
+use std::collections::HashSet;
+
 use qcode::{
     context::Context,
     value::{
@@ -16,62 +18,126 @@ use qcode::{
 
 use super::cast::{BinOp, Expr, UnOp};
 
-/// Lowers an IR value into a C expression.
+/// The set of instructions that are rendered as their own statements ("roots")
+/// rather than inlined. A root reached as an operand is printed by name.
+pub(crate) type Roots<'a> = Option<&'a HashSet<InstructionId>>;
+
+/// Lowers an IR value into a C expression, inlining all pure operations.
 pub fn lower_expr(ctx: &Context, value: ValueId) -> Expr {
+    lower(ctx, value, None)
+}
+
+/// Like [`lower_expr`], but stops inlining at any instruction in `roots`,
+/// printing it by name. Used by the statement emitter to avoid duplicating a
+/// value that also appears as its own assignment.
+pub(crate) fn lower_expr_rooted(
+    ctx: &Context,
+    value: ValueId,
+    roots: &HashSet<InstructionId>,
+) -> Expr {
+    lower(ctx, value, Some(roots))
+}
+
+fn lower(ctx: &Context, value: ValueId, roots: Roots) -> Expr {
     match value {
         ValueId::Literal(id) => Expr::Const(LiteralRef::from_id(ctx, id).value()),
         ValueId::Varnode(id) => Expr::Var(name_or(Varnode::from_id(ctx, id).name(), "var", value)),
         ValueId::BlockParam(id) => {
             Expr::Var(name_or(BlockParam::from_id(ctx, id).name(), "p", value))
         }
-        ValueId::Instruction(id) => lower_instruction(ctx, id),
+        ValueId::Instruction(id) => {
+            if roots.is_some_and(|r| r.contains(&id)) {
+                Expr::Var(instruction_name(ctx, id))
+            } else {
+                lower_instruction(ctx, id, roots, false)
+            }
+        }
         // Blocks and functions appearing in an expression context are opaque
         // names (address-of-label, function pointer).
         _ => Expr::Var(format!("{}", qcode::value::ValueRef::new(value, ctx))),
     }
 }
 
-fn lower_instruction(ctx: &Context, id: InstructionId) -> Expr {
+/// Lowers a memory reference: a named location (varnode) reads as the variable
+/// itself, a computed address as an explicit `*ptr` dereference. Shared by load
+/// (rvalue) and store (lvalue) lowering.
+pub(crate) fn deref_location(ctx: &Context, ptr: ValueId, roots: Roots) -> Expr {
+    match ptr {
+        ValueId::Varnode(_) => lower(ctx, ptr, roots),
+        _ => Expr::Deref(Box::new(lower(ctx, ptr, roots))),
+    }
+}
+
+/// The display name of an instruction's SSA result.
+pub(crate) fn instruction_name(ctx: &Context, id: InstructionId) -> String {
+    match Instruction::from_id(ctx, id).name() {
+        Some(name) => name.to_string(),
+        None => format!("v{}", Into::<usize>::into(id)),
+    }
+}
+
+/// Lowers the *defining* expression of a root instruction (its own operator
+/// expanded, operands referenced by name when they are themselves roots). Used
+/// to render `name = <expr>;` assignments.
+pub(crate) fn lower_defining_expr(
+    ctx: &Context,
+    id: InstructionId,
+    roots: &HashSet<InstructionId>,
+) -> Expr {
+    lower_instruction(ctx, id, Some(roots), true)
+}
+
+fn lower_instruction(ctx: &Context, id: InstructionId, roots: Roots, expand_unknown: bool) -> Expr {
     let insn = Instruction::from_id(ctx, id);
     match insn.mnemonic() {
         Mnemonic::Binop(b) => match map_binop(&b.op) {
             Some(op) => Expr::Binary(
                 op,
-                Box::new(lower_expr(ctx, b.lhs)),
-                Box::new(lower_expr(ctx, b.rhs)),
+                Box::new(lower(ctx, b.lhs, roots)),
+                Box::new(lower(ctx, b.rhs, roots)),
             ),
             None => Expr::Unknown {
                 op: insn.opcode().to_string(),
-                operands: vec![lower_expr(ctx, b.lhs), lower_expr(ctx, b.rhs)],
+                operands: vec![lower(ctx, b.lhs, roots), lower(ctx, b.rhs, roots)],
             },
         },
         Mnemonic::Unop(u) => match map_unop(&u.op) {
-            Some(op) => Expr::Unary(op, Box::new(lower_expr(ctx, u.src))),
+            Some(op) => Expr::Unary(op, Box::new(lower(ctx, u.src, roots))),
             None => Expr::Unknown {
                 op: insn.opcode().to_string(),
-                operands: vec![lower_expr(ctx, u.src)],
+                operands: vec![lower(ctx, u.src, roots)],
             },
         },
-        Mnemonic::Load(l) => Expr::Deref(Box::new(lower_expr(ctx, l.ptr))),
+        // A load from a named location (varnode) reads that variable directly;
+        // a load through a computed pointer is a real dereference.
+        Mnemonic::Load(l) => deref_location(ctx, l.ptr, roots),
         Mnemonic::Zext(z) => Expr::Cast {
             signed: false,
             bits: z.size * 8,
-            expr: Box::new(lower_expr(ctx, z.src)),
+            expr: Box::new(lower(ctx, z.src, roots)),
         },
         Mnemonic::Sext(s) => Expr::Cast {
             signed: true,
             bits: s.size * 8,
-            expr: Box::new(lower_expr(ctx, s.src)),
+            expr: Box::new(lower(ctx, s.src, roots)),
         },
-        // Not modeled structurally: refer to the SSA temporary by name if it has
-        // one, else emit an opaque pseudo-call so lowering stays total.
-        _ => match insn.name() {
-            Some(name) => Expr::Var(name.to_string()),
-            None => Expr::Unknown {
+        // Not modeled structurally. As an operand (`expand_unknown` false) refer
+        // to the SSA temporary by name; as a defining expression expand it to an
+        // opaque `opcode(args)` pseudo-call so the assignment is meaningful.
+        _ => {
+            if !expand_unknown && let Some(name) = insn.name() {
+                return Expr::Var(name.to_string());
+            }
+            Expr::Unknown {
                 op: insn.opcode().to_string(),
-                operands: Vec::new(),
-            },
-        },
+                operands: insn
+                    .mnemonic()
+                    .args()
+                    .into_iter()
+                    .map(|v| lower(ctx, v, roots))
+                    .collect(),
+            }
+        }
     }
 }
 

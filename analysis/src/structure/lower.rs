@@ -137,9 +137,12 @@ mod tests {
         assert!(program.goto_count() >= 3, "expected several gotos");
 
         let c = emit_c(&ctx, &program);
-        // The conditional renders the dereferenced load as a real C expression,
+        // The conditional renders the loaded variable as a real C expression,
         // not an opaque temp or a stringified predicate.
-        assert!(c.contains("if (*"), "condition should be a real expr:\n{c}");
+        assert!(
+            c.contains("if (cond)"),
+            "condition should be a real expr:\n{c}"
+        );
         assert!(c.contains("goto"), "should contain gotos:\n{c}");
         // The entry label is emitted first.
         assert!(c.starts_with("entry:"), "entry label first:\n{c}");
