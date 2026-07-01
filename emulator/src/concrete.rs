@@ -11,7 +11,7 @@ use qcode::{
         insn::{
             BoolBinop, Branch, BranchInd, CBranch, Call, CallInd, Carry, Extract, InstructionId,
             InstructionRef, IntBinop, LzCount, Mnemonic, PopCount, Range, Return, SBorrow, SCarry,
-            Sext, Tuple, Unop, Zext,
+            Scan, Sext, Tuple, Unop, Zext,
         },
         varnode::{VarnodeId, register::RegisterId},
     },
@@ -752,6 +752,13 @@ pub struct StandaloneEmulator {
     /// [`run_map_body`](Self::run_map_body) (the `enumerate` `(index, elem)` lane
     /// fed to a `map` body). `Extract` on such a param projects a field back out.
     pub block_param_aggregates: FxHashMap<BlockParamId, Vec<SizedValue>>,
+    /// Little-endian byte buffers of array-typed instruction results — the value
+    /// domain for the sequence intrinsics (`iota`/`singleton`/`insert`/`concat`),
+    /// `Scan`, and array-typed `Store`. Kept out of the scalar `SizedValue`
+    /// domain the same way [`aggregate_values`](Self::aggregate_values) keeps
+    /// tuples out of it; a scalar `at(arr, i)` reads one lane back into
+    /// `insn_values`.
+    pub array_values: FxHashMap<InstructionId, Vec<u8>>,
     pub block: BlockId,
     pub idx: usize,
     /// Call stack maintained by `run_function` (outermost function first).
@@ -772,6 +779,7 @@ impl StandaloneEmulator {
             block_param_values: FxHashMap::default(),
             aggregate_values: FxHashMap::default(),
             block_param_aggregates: FxHashMap::default(),
+            array_values: FxHashMap::default(),
             block: entry,
             idx: 0,
             call_stack: Vec::new(),
@@ -1317,6 +1325,44 @@ impl StandaloneEmulator {
                 self.idx += 1;
             }
 
+            // Whole-array store: the promoted buffer written back to memory in one
+            // shot (`store(ram, base <- arr)` at loop exit). A scalar store falls
+            // through to the generic interpreter below.
+            Mnemonic::Store(store) if self.is_array_operand(ctx, store.src) => {
+                let (space, ptr, src) = (store.space, store.ptr, store.src);
+                let buf = self
+                    .resolve_array(ctx, src)
+                    .ok_or_else(|| self.make_error(ctx, EmulatorErrorKind::ValueError(0)))?;
+                let addr = self
+                    .get_value(ctx, ptr)
+                    .ok_or_else(|| self.make_error(ctx, EmulatorErrorKind::ValueError(0)))?;
+                self.write_memory(ctx, space, addr, &buf)
+                    .map_err(|kind| self.make_error(ctx, kind))?;
+                self.idx += 1;
+            }
+
+            // Total left-scan: thread the accumulator through every lane, running
+            // the (pure) binary body once per element, and materialize the result
+            // as an array buffer.
+            Mnemonic::Scan(scan) => {
+                let scan = scan.clone();
+                self.eval_scan(ctx, insn_id, &scan)
+                    .map_err(|kind| self.make_error(ctx, kind))?;
+                self.idx += 1;
+            }
+
+            // The sequence intrinsics whose value is an *array* (or a lane read out
+            // of one) live in the `array_values` domain rather than scalar
+            // `insn_values`; every other (scalar) intrinsic falls through to the
+            // generic interpreter.
+            Mnemonic::Intrinsic(app) if is_array_intrinsic(app.id.name()) => {
+                let name = app.id.name();
+                let args = app.args.clone();
+                self.eval_array_intrinsic(ctx, insn_id, name, &args)
+                    .map_err(|kind| self.make_error(ctx, kind))?;
+                self.idx += 1;
+            }
+
             _ => {
                 let mut tmp = TempInterpreter {
                     memory: &mut self.memory,
@@ -1548,6 +1594,191 @@ impl StandaloneEmulator {
     /// lane), seeded so the body's `Extract`s on it resolve. `args` align with
     /// the root params index-for-index: a [`BodyArg::Scalar`] seeds a scalar
     /// param, a [`BodyArg::Aggregate`] seeds an `Extract`-able tuple param.
+    /// Whether `id` is an array/list-typed value (routed through
+    /// [`array_values`](Self::array_values) rather than scalar `insn_values`).
+    fn is_array_operand(&self, ctx: &Context<'_>, id: ValueId) -> bool {
+        match ctx.stored_type_of(id) {
+            Some(ty) => ctx.types.array_of(ty).is_some() || ctx.types.list_of(ty).is_some(),
+            None => false,
+        }
+    }
+
+    /// Resolve an array-typed operand to its little-endian byte buffer: a `Bytes`
+    /// blob's data, a previously-computed `array_values` entry, or a short array
+    /// materialized as a scalar literal/result.
+    fn resolve_array(&mut self, ctx: &Context<'_>, id: ValueId) -> Option<Vec<u8>> {
+        match id {
+            ValueId::Bytes(b) => Some(ctx.values.bytes[b].data.clone()),
+            ValueId::Instruction(i) => self
+                .array_values
+                .get(&i)
+                .cloned()
+                .or_else(|| self.get_value_bytes(ctx, id)),
+            ValueId::Literal(_) => self.get_value_bytes(ctx, id),
+            _ => None,
+        }
+    }
+
+    /// Evaluate one array-valued (or lane-reading) sequence intrinsic, depositing
+    /// its result in `array_values` (arrays) or `insn_values` (`at`).
+    fn eval_array_intrinsic(
+        &mut self,
+        ctx: &Context<'_>,
+        insn_id: InstructionId,
+        name: &str,
+        args: &[ValueId],
+    ) -> Result<(), EmulatorErrorKind> {
+        match name {
+            "iota" => {
+                let n = self
+                    .get_value(ctx, args[0])
+                    .ok_or(EmulatorErrorKind::ValueError(0))?;
+                let mut buf = Vec::with_capacity(n as usize * 8);
+                for i in 0..n {
+                    buf.extend_from_slice(&i.to_le_bytes());
+                }
+                self.array_values.insert(insn_id, buf);
+            }
+            "singleton" => {
+                let buf = self
+                    .get_value_bytes(ctx, args[0])
+                    .ok_or(EmulatorErrorKind::ValueError(0))?;
+                self.array_values.insert(insn_id, buf);
+            }
+            "concat" => {
+                let mut a = self
+                    .resolve_array(ctx, args[0])
+                    .ok_or(EmulatorErrorKind::ValueError(0))?;
+                let b = self
+                    .resolve_array(ctx, args[1])
+                    .ok_or(EmulatorErrorKind::ValueError(0))?;
+                a.extend_from_slice(&b);
+                self.array_values.insert(insn_id, a);
+            }
+            "insert" => {
+                let mut buf = self
+                    .resolve_array(ctx, args[0])
+                    .ok_or(EmulatorErrorKind::ValueError(0))?;
+                let i = self
+                    .get_value(ctx, args[1])
+                    .ok_or(EmulatorErrorKind::ValueError(0))? as usize;
+                let vbytes = self
+                    .get_value_bytes(ctx, args[2])
+                    .ok_or(EmulatorErrorKind::ValueError(0))?;
+                let esz = vbytes.len();
+                let off = i * esz;
+                if off + esz <= buf.len() {
+                    buf[off..off + esz].copy_from_slice(&vbytes);
+                }
+                self.array_values.insert(insn_id, buf);
+            }
+            "at" => {
+                let buf = self
+                    .resolve_array(ctx, args[0])
+                    .ok_or(EmulatorErrorKind::ValueError(0))?;
+                let i = self
+                    .get_value(ctx, args[1])
+                    .ok_or(EmulatorErrorKind::ValueError(0))? as usize;
+                let esz = ctx
+                    .stored_type_of(ValueId::Instruction(insn_id))
+                    .map(|ty| ctx.types.size_of(ty))
+                    .unwrap_or(8);
+                let off = i * esz;
+                let lane = buf
+                    .get(off..off + esz)
+                    .ok_or(EmulatorErrorKind::ValueError(0))?;
+                self.insn_values
+                    .insert(insn_id, SizedValue::from_bits(le_bits(lane), esz));
+            }
+            other => panic!("eval_array_intrinsic called on non-array intrinsic `{other}`"),
+        }
+        Ok(())
+    }
+
+    /// Thread a scan's accumulator across every lane of its source array, running
+    /// the pure binary body `(acc, elem) -> acc'` once per element in a fresh
+    /// nested emulator, and store the concatenated per-step accumulators as the
+    /// result array buffer.
+    fn eval_scan(
+        &mut self,
+        ctx: &Context<'_>,
+        insn_id: InstructionId,
+        scan: &Scan,
+    ) -> Result<(), EmulatorErrorKind> {
+        const SCAN_STEP_BUDGET: usize = 100_000;
+
+        let src = self
+            .resolve_array(ctx, scan.src)
+            .ok_or(EmulatorErrorKind::ValueError(0))?;
+        // Element sizes come from the operand/result element *types* (which are
+        // known even for a length-erased `[T;*]` result); the lane count is the
+        // source buffer's length in input elements. This handles both a folded
+        // fixed-array source and a symbolic-length `iota`.
+        let in_elem = ctx
+            .stored_type_of(scan.src)
+            .and_then(|ty| ctx.types.seq_elem_of(ty))
+            .ok_or(EmulatorErrorKind::ValueError(0))?;
+        let isz = ctx.types.size_of(in_elem).max(1);
+        let out_elem = ctx
+            .stored_type_of(ValueId::Instruction(insn_id))
+            .and_then(|ty| ctx.types.seq_elem_of(ty))
+            .ok_or(EmulatorErrorKind::ValueError(0))?;
+        let osz = ctx.types.size_of(out_elem);
+        let count = src.len() / isz;
+        if count == 0 {
+            self.array_values.insert(insn_id, Vec::new());
+            return Ok(());
+        }
+
+        // Loop-invariant captures, resolved once as scalars.
+        let capture_args: Vec<BodyArg> = scan
+            .captures
+            .iter()
+            .map(|&c| {
+                let v = self.get_value(ctx, c).ok_or(EmulatorErrorKind::ValueError(0))?;
+                let sz = ctx
+                    .stored_type_of(c)
+                    .map(|ty| ctx.types.size_of(ty))
+                    .unwrap_or(8);
+                Ok(BodyArg::Scalar(SizedValue::new(v, sz)))
+            })
+            .collect::<Result<_, EmulatorErrorKind>>()?;
+
+        let init = self
+            .get_value(ctx, scan.init)
+            .ok_or(EmulatorErrorKind::ValueError(0))?;
+        let mut acc = SizedValue::new(init, osz);
+
+        let root = Function::from_id(ctx, scan.body)
+            .root()
+            .ok_or(EmulatorErrorKind::EmptyFunctionRoot(scan.body))?
+            .id;
+
+        let mut out = Vec::with_capacity(count * osz);
+        for k in 0..count {
+            let elem = &src[k * isz..k * isz + isz];
+            let elem_arg = BodyArg::Scalar(SizedValue::from_bits(le_bits(elem), isz));
+            let mut body_args = Vec::with_capacity(2 + capture_args.len());
+            body_args.push(BodyArg::Scalar(acc));
+            body_args.push(elem_arg);
+            body_args.extend(capture_args.iter().cloned());
+
+            let mut emu = StandaloneEmulator::new(root);
+            emu.run_map_body(ctx, scan.body, &body_args, SCAN_STEP_BUDGET)
+                .map_err(|e| e.kind)?;
+            let ret = body_return_value(ctx, emu.current_block())
+                .ok_or(EmulatorErrorKind::ValueError(0))?;
+            let mut lane = emu
+                .get_value_bytes(ctx, ret)
+                .ok_or(EmulatorErrorKind::ValueError(0))?;
+            lane.resize(osz, 0);
+            acc = SizedValue::from_bits(le_bits(&lane), osz);
+            out.extend_from_slice(&lane);
+        }
+        self.array_values.insert(insn_id, out);
+        Ok(())
+    }
+
     pub fn run_map_body(
         &mut self,
         ctx: &Context<'_>,
@@ -1633,6 +1864,33 @@ fn lambda_return_value(ctx: &Context<'_>, block: BlockId) -> Option<ValueId> {
         Mnemonic::ReturnValue(ret) => Some(ret.value),
         _ => None,
     }
+}
+
+/// The value a scan/map body block returns — via either a machine `Return` (the
+/// outlined-body form) or a lambda `ReturnValue`. `None` if the block does not
+/// end in a value-carrying return.
+fn body_return_value(ctx: &Context<'_>, block: BlockId) -> Option<ValueId> {
+    let last = BasicBlock::from_id(ctx, block).iter().last()?;
+    match last.mnemonic() {
+        Mnemonic::Return(ret) => ret.value,
+        Mnemonic::ReturnValue(ret) => Some(ret.value),
+        _ => None,
+    }
+}
+
+/// The array-valued (or lane-reading) sequence intrinsics the emulator evaluates
+/// over its [`array_values`](StandaloneEmulator::array_values) domain rather than
+/// the scalar interpreter.
+fn is_array_intrinsic(name: &str) -> bool {
+    matches!(name, "iota" | "singleton" | "concat" | "insert" | "at")
+}
+
+/// Fold a little-endian byte slice (≤ 16 bytes) into a `u128`.
+fn le_bits(bytes: &[u8]) -> u128 {
+    let mut buf = [0u8; 16];
+    let n = bytes.len().min(16);
+    buf[..n].copy_from_slice(&bytes[..n]);
+    u128::from_le_bytes(buf)
 }
 
 /// A positional argument to a `map` body for [`run_map_body`](StandaloneEmulator::run_map_body):
@@ -2068,6 +2326,41 @@ mod tests {
             err.kind,
             EmulatorErrorKind::UnsupportedMnemonic("map")
         ));
+    }
+
+    /// End-to-end array emulation: `scanl @step init (iota n)` threads the
+    /// accumulator through the driver array and materializes the result buffer.
+    /// `step(acc, x) = acc + x`, `init = 10`, `iota(3) = [0, 1, 2]` ⇒
+    /// `[10, 11, 13]` (out[i] = acc after adding x_i, prefix-fold style).
+    #[test]
+    fn scan_over_iota_is_emulated() {
+        let mut ctx = Context::new();
+        qcode!(
+            ctx,
+            "
+            lambda step:
+            <sb @acc:i64 @x:i64>
+                %r = @acc + @x;
+                return %r;
+            fn main:
+            <me>
+                %src = $iota(i64 0x3);
+                %s = scanl @step i64 0xa %src;
+                goto <0x1001>;
+            "
+        );
+
+        let mut emu = StandaloneEmulator::new(me);
+        // Step: iota, then scan (do not execute the terminating goto).
+        emu.step(&ctx).expect("iota");
+        emu.step(&ctx).expect("scan");
+
+        let buf = emu.array_values.get(&s).expect("scan produced an array");
+        let words: Vec<u64> = buf
+            .chunks_exact(8)
+            .map(|c| u64::from_le_bytes(c.try_into().unwrap()))
+            .collect();
+        assert_eq!(words, vec![10, 11, 13]);
     }
 
     /// Emulating a function that returns an `enumerate` array bails with a
