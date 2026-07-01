@@ -1088,8 +1088,10 @@ fn find_phi_insert_positions(
     frontier: &HashMap<BlockId, HashSet<BlockId>>,
     live_in: &HashSet<BlockId>,
 ) -> HashSet<BlockId> {
+    // Order is irrelevant — results feed a `HashSet` — so use the unsorted
+    // `iter()` and skip the per-call Vec allocation + sort that `blocks()` does.
     let block_containing_store = function
-        .blocks()
+        .iter()
         .filter(|b| block_contains_store_to_var(b, var))
         .map(|b| b.id)
         .collect::<HashSet<_>>();
