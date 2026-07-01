@@ -2,7 +2,7 @@ use rustc_hash::FxHashMap as HashMap;
 
 use qcode::{
     context::Context,
-    space::SpaceId,
+    space::{SpaceId, SpaceType},
     value::{
         Function, FunctionId, ValueId, ValueRef, Varnode,
         insn::{Binop, IntBinop, Mnemonic},
@@ -327,10 +327,21 @@ impl AliasResult {
             let root = a.uf.alloc_node();
 
             a.value_to_root.insert(varnode.id.into(), root);
-            a.by_space
-                .entry(varnode.space().id)
-                .or_default()
-                .push(SizedNode { root, start, end });
+
+            // Each temporary lives alone in its own freshly-minted space (see
+            // `Context::make_temp_space`), so it can never overlap another varnode
+            // and no literal is ever resolved in a temporary space — a temporary is
+            // therefore never read out of `by_space`. Skipping the insert avoids
+            // allocating one tiny singleton `Vec` (and sorting it) per temporary,
+            // which is the bulk of the varnodes on real programs. `value_to_root`
+            // still carries it, so its equivalence class is unchanged.
+            let space = varnode.space();
+            if !matches!(space.ty, SpaceType::Temporary) {
+                a.by_space
+                    .entry(space.id)
+                    .or_default()
+                    .push(SizedNode { root, start, end });
+            }
         }
 
         // Within each space, sort by address and sweep to merge overlapping varnodes
