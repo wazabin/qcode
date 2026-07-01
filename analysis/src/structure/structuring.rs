@@ -18,22 +18,70 @@ use std::collections::{HashMap, HashSet};
 use jstd::graph::analysis::{DominatorTree, compute_dominators, compute_postdominators};
 use qcode::{
     context::Context,
-    value::{BasicBlock, BlockId, Instruction, ValueId, function::FunctionId},
+    value::{BasicBlock, BlockId, function::FunctionId},
 };
+
+use crate::pipeline::{DecompilePass, RegisteredPass, make_pass};
 
 use super::{
     BlockExit,
     ast::{Program, Stmt},
     block_exit,
-    emit::is_side_effecting,
     lower::{assign_labels, is_replaced_by_goto},
     lower_expr::lower_expr,
     lower_function,
 };
 
-/// Structures `function_id` into nested control flow, falling back to flat
-/// goto-based lowering for functions with irreducible control flow.
-pub fn structure_function(ctx: &Context, function_id: FunctionId) -> Program {
+/// The default decompilation pass pipeline, in run order: structure the CFG into
+/// an AST, then refine its loops. SAILR deopt passes slot in here as they land.
+const DECOMPILE_PIPELINE: &[&str] = &["structure", "refine_loops"];
+
+/// Decompiles `function_id` to a high-level [`Program`] by running the
+/// decompilation pass pipeline over it. Each pass reads the (immutable) qcode IR
+/// and rewrites the shared AST.
+pub fn decompile_function(ctx: &Context, function_id: FunctionId) -> Program {
+    let mut program = Program::default();
+    for &name in DECOMPILE_PIPELINE {
+        match make_pass(name) {
+            Some(RegisteredPass::Decompile(pass)) => {
+                pass.run(ctx, function_id, &mut program)
+                    .unwrap_or_else(|e| panic!("decompile pass `{name}`: {e}"));
+            }
+            Some(_) => panic!("pipeline pass `{name}` is not a decompilation pass"),
+            None => panic!("unknown decompilation pass `{name}`"),
+        }
+    }
+    program
+}
+
+/// The region-structuring decompilation pass: builds the initial AST from qcode.
+#[derive(Default)]
+pub struct Structure;
+
+impl DecompilePass for Structure {
+    const NAME: &'static str = "structure";
+
+    fn description(&self) -> &'static str {
+        "region structuring: nested if / loops recovered from the CFG"
+    }
+
+    fn run(
+        &self,
+        ctx: &Context,
+        fun_id: FunctionId,
+        program: &mut Program,
+    ) -> Result<bool, String> {
+        *program = structure_regions(ctx, fun_id);
+        Ok(true)
+    }
+}
+
+crate::register_decompile_pass!(Structure);
+
+/// Structures `function_id` into nested control flow (with loops as endless
+/// [`Stmt::Loop`]s), falling back to flat goto-based lowering for functions with
+/// irreducible control flow. The [`Structure`] pass's implementation.
+fn structure_regions(ctx: &Context, function_id: FunctionId) -> Program {
     let function = qcode::value::Function::from_id(ctx, function_id);
     let Some(root) = function.root() else {
         return Program::default();
@@ -178,7 +226,8 @@ impl Structurer<'_, '_> {
         self.frames.push(LoopFrame { header, exit });
         let (body, _) = self.region(header, stop);
         self.frames.pop();
-        (refine_loop(self.ctx, body), exit)
+        // Loops are emitted endless; the `refine_loops` pass rewrites the shape.
+        (Stmt::Loop { body }, exit)
     }
 
     /// If `b` is a boundary of the innermost enclosing loop, the structured
@@ -235,85 +284,6 @@ impl Structurer<'_, '_> {
             .predecessors()
             .filter(|(_, p)| self.node_set.contains(p))
             .count()
-    }
-}
-
-/// Rewrites an endless loop body into its most specific loop form: a `while`
-/// when the loop tests before its body, a `do-while` when it tests after, and
-/// an endless [`Stmt::Loop`] otherwise.
-///
-/// The recogniser works on the structured body:
-///
-/// - **`while (c) { … }`** — the body is (a possibly-empty run of condition-only
-///   statements, then) a single `if (c) { … continue } else break`. The
-///   condition-only prefix is dropped: being pure and single-use, it folds into
-///   `c` and is emitted nowhere else.
-/// - **`do { … } while (c)`** — the body ends in `if (c) continue; else break;`
-///   with the loop body preceding it.
-fn refine_loop(ctx: &Context, mut body: Vec<Stmt>) -> Stmt {
-    // Pre-test: an optional condition-only prefix followed by the loop's `if`,
-    // one arm of which is exactly a `break`.
-    let prefix = body.iter().take_while(|s| is_condition_only(ctx, s)).count();
-    if prefix + 1 == body.len() {
-        if let Some(Stmt::If { cond, then, els }) = body.get(prefix) {
-            if is_only(els, &Stmt::Break) {
-                return Stmt::While {
-                    cond: cond.clone(),
-                    body: without_trailing_continue(then.clone()),
-                };
-            }
-            if is_only(then, &Stmt::Break) {
-                return Stmt::While {
-                    cond: cond.clone().logical_not(),
-                    body: without_trailing_continue(els.clone()),
-                };
-            }
-        }
-    }
-
-    // Post-test: the body ends in `if (c) continue; else break;` (in either
-    // polarity); everything before it is the loop body, run each iteration.
-    if let Some(Stmt::If { cond, then, els }) = body.last() {
-        let cond = if is_only(then, &Stmt::Continue) && is_only(els, &Stmt::Break) {
-            Some(cond.clone())
-        } else if is_only(then, &Stmt::Break) && is_only(els, &Stmt::Continue) {
-            Some(cond.clone().logical_not())
-        } else {
-            None
-        };
-        if let Some(cond) = cond {
-            body.pop();
-            return Stmt::DoWhile { cond, body };
-        }
-    }
-
-    Stmt::Loop { body }
-}
-
-/// Whether `stmts` is exactly the single statement `stmt`.
-fn is_only(stmts: &[Stmt], stmt: &Stmt) -> bool {
-    stmts == std::slice::from_ref(stmt)
-}
-
-/// Drops a trailing `continue` (redundant at the end of a loop body).
-fn without_trailing_continue(mut stmts: Vec<Stmt>) -> Vec<Stmt> {
-    if let Some(Stmt::Continue) = stmts.last() {
-        stmts.pop();
-    }
-    stmts
-}
-
-/// Whether a statement is a pure, single-use value that only feeds the loop
-/// condition — so it folds into the condition expression and may be dropped when
-/// the loop is rewritten to a pre-tested `while`.
-fn is_condition_only(ctx: &Context, stmt: &Stmt) -> bool {
-    match stmt {
-        Stmt::Raw(id) => {
-            let insn = Instruction::from_id(ctx, *id);
-            !is_side_effecting(&insn.mnemonic())
-                && ctx.users(ValueId::Instruction(*id)).len() <= 1
-        }
-        _ => false,
     }
 }
 
@@ -443,6 +413,18 @@ mod tests {
     }
 
     #[test]
+    fn decompile_pipeline_passes_resolve_as_decompile_scope() {
+        // The driver's pipeline names must all resolve through the pass manager
+        // as decompilation-scoped passes.
+        for &name in DECOMPILE_PIPELINE {
+            assert!(
+                matches!(make_pass(name), Some(RegisteredPass::Decompile(_))),
+                "`{name}` should resolve as a decompilation pass"
+            );
+        }
+    }
+
+    #[test]
     fn if_then_else_structures_to_nested_if() {
         let mut ctx = Context::new();
         qcode!(
@@ -467,7 +449,7 @@ mod tests {
             "
         );
 
-        let program = structure_function(&ctx, f);
+        let program = decompile_function(&ctx, f);
         // The branch is fully structured: no gotos remain (the merge is inlined).
         assert_eq!(
             program.goto_count(),
@@ -508,7 +490,7 @@ mod tests {
             "
         );
 
-        let program = structure_function(&ctx, f);
+        let program = decompile_function(&ctx, f);
         assert_eq!(
             program.goto_count(),
             0,
@@ -552,7 +534,7 @@ mod tests {
         );
 
         let flat = lower_function(&ctx, f).goto_count();
-        let structured = structure_function(&ctx, f).goto_count();
+        let structured = decompile_function(&ctx, f).goto_count();
         assert!(
             structured < flat,
             "structuring should reduce gotos ({structured} !< {flat})"
@@ -583,7 +565,7 @@ mod tests {
             "
         );
 
-        let program = structure_function(&ctx, f);
+        let program = decompile_function(&ctx, f);
         // The loop (header test, body, back edge, exit) structures with no gotos:
         // the back edge is a `continue`, the exit a `break`.
         assert_eq!(
@@ -627,7 +609,7 @@ mod tests {
             "
         );
 
-        let program = structure_function(&ctx, f);
+        let program = decompile_function(&ctx, f);
         assert_eq!(
             program.goto_count(),
             0,
@@ -672,7 +654,7 @@ mod tests {
             "
         );
 
-        let program = structure_function(&ctx, f);
+        let program = decompile_function(&ctx, f);
         assert_eq!(
             program.goto_count(),
             0,

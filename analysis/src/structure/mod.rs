@@ -1,17 +1,15 @@
-//! Control-flow structuring backend (SAILR).
+//! Control-flow structuring backend (SAILR): the decompilation passes that turn
+//! optimized qcode into a high-level [`Program`] AST and pretty-print it.
 //!
-//! See `docs/sailr-structuring.md` for the overall design. This is **phase 0**:
-//! condition recovery, the enabler for everything else.
+//! Decompilation is a sequence of [`DecompilePass`]es
+//! ([`decompile_function`]), each reading the immutable qcode IR and rewriting
+//! the shared AST: [`Structure`] recovers nested `if`/loop control flow from the
+//! CFG (recovering per-edge branch conditions from block terminators, which the
+//! bare `from -> to` CFG edges do not carry), then [`RefineLoops`] rewrites
+//! endless loops into `while`/`do-while`. SAILR deopt passes join the sequence
+//! as they land.
 //!
-//! The CFG stores edges as bare `from -> to` pairs ([`EdgeData`]); it records
-//! *no* branch condition and *no* notion of which outgoing edge is the taken vs.
-//! not-taken side. That information lives only in the block's terminator
-//! instruction ([`CBranch`]). Structuring needs it to attach reaching
-//! conditions to edges, so this module reconstructs a typed, polarity-aware view
-//! of a block's control-flow exit.
-//!
-//! [`EdgeData`]: qcode::value::block
-//! [`CBranch`]: qcode::value::insn::CBranch
+//! [`DecompilePass`]: crate::DecompilePass
 
 pub mod ast;
 pub mod cast;
@@ -19,6 +17,7 @@ mod condition;
 mod emit;
 mod lower;
 mod lower_expr;
+mod refine;
 mod structuring;
 pub mod tokens;
 
@@ -28,5 +27,6 @@ pub use condition::{BlockExit, EdgeCondition, block_exit};
 pub use emit::{emit_c, emit_tokens};
 pub use lower::lower_function;
 pub use lower_expr::lower_expr;
-pub use structuring::structure_function;
+pub use refine::RefineLoops;
+pub use structuring::{Structure, decompile_function};
 pub use tokens::{Token, TokenKind, TokenLine};

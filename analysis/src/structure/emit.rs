@@ -315,7 +315,7 @@ fn label_of(program: &Program, block: BlockId) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::structure::{lower_function, structure_function, tokens::TokenKind};
+    use crate::structure::{decompile_function, lower_function, tokens::TokenKind};
     use qcode_macro::qcode;
 
     #[test]
@@ -403,7 +403,7 @@ mod tests {
             "
         );
 
-        let program = structure_function(&ctx, f);
+        let program = decompile_function(&ctx, f);
         let lines = emit_tokens(&ctx, &program);
 
         assert!(
