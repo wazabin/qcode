@@ -18,13 +18,14 @@ use std::collections::{HashMap, HashSet};
 use jstd::graph::analysis::{DominatorTree, compute_dominators, compute_postdominators};
 use qcode::{
     context::Context,
-    value::{BasicBlock, BlockId, function::FunctionId},
+    value::{BasicBlock, BlockId, Instruction, ValueId, function::FunctionId},
 };
 
 use super::{
     BlockExit,
     ast::{Program, Stmt},
     block_exit,
+    emit::is_side_effecting,
     lower::{assign_labels, is_replaced_by_goto},
     lower_expr::lower_expr,
     lower_function,
@@ -177,7 +178,7 @@ impl Structurer<'_, '_> {
         self.frames.push(LoopFrame { header, exit });
         let (body, _) = self.region(header, stop);
         self.frames.pop();
-        (refine_loop(body), exit)
+        (refine_loop(self.ctx, body), exit)
     }
 
     /// If `b` is a boundary of the innermost enclosing loop, the structured
@@ -237,11 +238,83 @@ impl Structurer<'_, '_> {
     }
 }
 
-/// Rewrites an endless loop body into its most specific loop form. For now this
-/// is the identity (always [`Stmt::Loop`]); a later refinement recognises
-/// `while`/`do-while` shapes.
-fn refine_loop(body: Vec<Stmt>) -> Stmt {
+/// Rewrites an endless loop body into its most specific loop form: a `while`
+/// when the loop tests before its body, a `do-while` when it tests after, and
+/// an endless [`Stmt::Loop`] otherwise.
+///
+/// The recogniser works on the structured body:
+///
+/// - **`while (c) { … }`** — the body is (a possibly-empty run of condition-only
+///   statements, then) a single `if (c) { … continue } else break`. The
+///   condition-only prefix is dropped: being pure and single-use, it folds into
+///   `c` and is emitted nowhere else.
+/// - **`do { … } while (c)`** — the body ends in `if (c) continue; else break;`
+///   with the loop body preceding it.
+fn refine_loop(ctx: &Context, mut body: Vec<Stmt>) -> Stmt {
+    // Pre-test: an optional condition-only prefix followed by the loop's `if`,
+    // one arm of which is exactly a `break`.
+    let prefix = body.iter().take_while(|s| is_condition_only(ctx, s)).count();
+    if prefix + 1 == body.len() {
+        if let Some(Stmt::If { cond, then, els }) = body.get(prefix) {
+            if is_only(els, &Stmt::Break) {
+                return Stmt::While {
+                    cond: cond.clone(),
+                    body: without_trailing_continue(then.clone()),
+                };
+            }
+            if is_only(then, &Stmt::Break) {
+                return Stmt::While {
+                    cond: cond.clone().logical_not(),
+                    body: without_trailing_continue(els.clone()),
+                };
+            }
+        }
+    }
+
+    // Post-test: the body ends in `if (c) continue; else break;` (in either
+    // polarity); everything before it is the loop body, run each iteration.
+    if let Some(Stmt::If { cond, then, els }) = body.last() {
+        let cond = if is_only(then, &Stmt::Continue) && is_only(els, &Stmt::Break) {
+            Some(cond.clone())
+        } else if is_only(then, &Stmt::Break) && is_only(els, &Stmt::Continue) {
+            Some(cond.clone().logical_not())
+        } else {
+            None
+        };
+        if let Some(cond) = cond {
+            body.pop();
+            return Stmt::DoWhile { cond, body };
+        }
+    }
+
     Stmt::Loop { body }
+}
+
+/// Whether `stmts` is exactly the single statement `stmt`.
+fn is_only(stmts: &[Stmt], stmt: &Stmt) -> bool {
+    stmts == std::slice::from_ref(stmt)
+}
+
+/// Drops a trailing `continue` (redundant at the end of a loop body).
+fn without_trailing_continue(mut stmts: Vec<Stmt>) -> Vec<Stmt> {
+    if let Some(Stmt::Continue) = stmts.last() {
+        stmts.pop();
+    }
+    stmts
+}
+
+/// Whether a statement is a pure, single-use value that only feeds the loop
+/// condition — so it folds into the condition expression and may be dropped when
+/// the loop is rewritten to a pre-tested `while`.
+fn is_condition_only(ctx: &Context, stmt: &Stmt) -> bool {
+    match stmt {
+        Stmt::Raw(id) => {
+            let insn = Instruction::from_id(ctx, *id);
+            !is_side_effecting(&insn.mnemonic())
+                && ctx.users(ValueId::Instruction(*id)).len() <= 1
+        }
+        _ => false,
+    }
 }
 
 /// Identifies the natural loops of the subgraph, keyed by header block.
@@ -519,11 +592,14 @@ mod tests {
             "loop should structure without gotos:\n{}",
             emit_c(&ctx, &program)
         );
+        // Header-tested: refines to a pre-tested `while (cond)`.
+        let c = emit_c(&ctx, &program);
         assert!(
-            has_loop(&program.stmts),
-            "expected a loop node:\n{:#?}",
-            program.stmts
+            program.stmts.iter().any(|s| matches!(s, Stmt::While { .. })),
+            "expected a while loop, got:\n{c}"
         );
+        assert!(c.contains("while (cond) {"), "expected `while (cond)`:\n{c}");
+        assert!(!c.contains("while (true)"), "should not be endless:\n{c}");
         // And it no longer degrades to the flat lowering.
         let flat = lower_function(&ctx, f);
         assert!(program.goto_count() < flat.goto_count());
@@ -558,11 +634,14 @@ mod tests {
             "self-looping block should structure without gotos:\n{}",
             emit_c(&ctx, &program)
         );
+        // Latch-tested: refines to a post-tested `do { … } while (cond)`.
+        let c = emit_c(&ctx, &program);
         assert!(
-            has_loop(&program.stmts),
-            "expected a loop node:\n{:#?}",
-            program.stmts
+            program.stmts.iter().any(|s| matches!(s, Stmt::DoWhile { .. })),
+            "expected a do-while loop, got:\n{c}"
         );
+        assert!(c.contains("do {"), "expected a do-block:\n{c}");
+        assert!(c.contains("} while (cond)"), "expected trailing while test:\n{c}");
     }
 
     #[test]

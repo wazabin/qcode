@@ -77,7 +77,7 @@ fn is_root(ctx: &Context, id: InstructionId) -> bool {
 }
 
 /// Whether an instruction must always be a statement because it has effects.
-fn is_side_effecting(m: &Mnemonic) -> bool {
+pub(crate) fn is_side_effecting(m: &Mnemonic) -> bool {
     matches!(
         m,
         Mnemonic::Store(_)
