@@ -28,6 +28,26 @@ pub enum Stmt {
     Goto(BlockId),
     /// `if (<cond>) goto <label>;`
     GotoIf { cond: Expr, target: BlockId },
+    /// A structured `if (cond) { then } else { els }`. `els` is empty for an
+    /// if-then with no else arm. Introduced by phase 2 (schema matching).
+    If {
+        cond: Expr,
+        then: Vec<Stmt>,
+        els: Vec<Stmt>,
+    },
+}
+
+/// Counts the `goto` statements (conditional and unconditional) in a statement
+/// tree, recursing into structured nodes.
+pub fn count_gotos(stmts: &[Stmt]) -> usize {
+    stmts
+        .iter()
+        .map(|s| match s {
+            Stmt::Goto(_) | Stmt::GotoIf { .. } => 1,
+            Stmt::If { then, els, .. } => count_gotos(then) + count_gotos(els),
+            Stmt::Label(_) | Stmt::Raw(_) => 0,
+        })
+        .sum()
 }
 
 /// A lowered function body: a flat statement list plus the label names its
@@ -43,10 +63,7 @@ impl Program {
     /// program. This is the SAILR quality metric: it starts high in phase 1 and
     /// must not increase as later phases structure the code.
     pub fn goto_count(&self) -> usize {
-        self.stmts
-            .iter()
-            .filter(|s| matches!(s, Stmt::Goto(_) | Stmt::GotoIf { .. }))
-            .count()
+        count_gotos(&self.stmts)
     }
 
     /// The label name assigned to `block`, if it is referenced in this program.

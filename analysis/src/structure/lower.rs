@@ -44,7 +44,7 @@ pub fn lower_function(ctx: &Context, function_id: FunctionId) -> Program {
 
 /// Assigns each block a stable label name: its IR name if it has one, otherwise
 /// a synthesized `bb_<addr>` / `bb_<id>`.
-fn assign_labels(ctx: &Context, order: &[BlockId]) -> HashMap<BlockId, String> {
+pub(crate) fn assign_labels(ctx: &Context, order: &[BlockId]) -> HashMap<BlockId, String> {
     let mut labels = HashMap::with_capacity(order.len());
     for &block_id in order {
         let block = BasicBlock::from_id(ctx, block_id);
@@ -98,7 +98,7 @@ fn lower_block(ctx: &Context, block: BlockRef<'_, '_>, out: &mut Vec<Stmt>) {
 
 /// Whether an instruction is a pure control-flow terminator that phase 1 replaces
 /// with structured gotos (as opposed to a value/effect statement to keep).
-fn is_replaced_by_goto(insn: &InstructionRef<'_, '_>) -> bool {
+pub(crate) fn is_replaced_by_goto(insn: &InstructionRef<'_, '_>) -> bool {
     matches!(
         insn.mnemonic(),
         Mnemonic::Branch(_) | Mnemonic::CBranch(_) | Mnemonic::BranchInd(_)

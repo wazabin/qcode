@@ -1,7 +1,8 @@
 //! Pseudo-C emission for a lowered [`Program`].
 //!
-//! Deliberately dumb and total: every [`Stmt`] variant renders to a line of
-//! C-like text. Instruction bodies reuse the IR's own statement formatting.
+//! Deliberately dumb and total: every [`Stmt`] variant renders to one or more
+//! lines of C-like text. Instruction bodies reuse the IR's own statement
+//! formatting. Structured nodes ([`Stmt::If`]) nest with brace indentation.
 
 use qcode::{
     context::Context,
@@ -16,50 +17,90 @@ use super::{ast::Program, ast::Stmt};
 /// CFG blocks (e.g. to highlight or navigate), which a flat string cannot.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Line {
-    /// The rendered text of the line (no trailing newline).
+    /// The rendered text of the line, including leading indentation.
     pub text: String,
-    /// The block this line belongs to, if any. `Label` lines and the statements
-    /// that follow them carry the enclosing block.
+    /// The block this line belongs to, if determinable.
     pub block: Option<BlockId>,
 }
 
 /// Renders `program` as a sequence of provenance-tagged lines.
 pub fn emit_lines(ctx: &Context, program: &Program) -> Vec<Line> {
-    let mut lines = Vec::with_capacity(program.stmts.len());
-    let mut current: Option<BlockId> = None;
-    for stmt in &program.stmts {
-        if let Stmt::Label(block) = stmt {
-            current = Some(*block);
-        }
-        lines.push(Line {
-            text: stmt_text(ctx, program, stmt),
-            block: current,
-        });
-    }
+    let mut lines = Vec::new();
+    emit_block(ctx, program, &program.stmts, 0, &mut lines);
     lines
 }
 
 /// Renders `program` as pseudo-C source text.
 pub fn emit_c(ctx: &Context, program: &Program) -> String {
     let mut out = String::new();
-    for stmt in &program.stmts {
-        out.push_str(&stmt_text(ctx, program, stmt));
+    for line in emit_lines(ctx, program) {
+        out.push_str(&line.text);
         out.push('\n');
     }
     out
 }
 
-/// Renders a single statement to its line of pseudo-C (no trailing newline).
-fn stmt_text(ctx: &Context, program: &Program, stmt: &Stmt) -> String {
+fn emit_block(
+    ctx: &Context,
+    program: &Program,
+    stmts: &[Stmt],
+    indent: usize,
+    out: &mut Vec<Line>,
+) {
+    for stmt in stmts {
+        emit_stmt(ctx, program, stmt, indent, out);
+    }
+}
+
+fn emit_stmt(ctx: &Context, program: &Program, stmt: &Stmt, indent: usize, out: &mut Vec<Line>) {
+    let pad = "    ".repeat(indent);
     match stmt {
-        Stmt::Label(block) => format!("{}:", label_of(program, *block)),
+        Stmt::Label(block) => out.push(Line {
+            // Labels sit one level out from the code they head.
+            text: format!(
+                "{}{}:",
+                "    ".repeat(indent.saturating_sub(1)),
+                label_of(program, *block)
+            ),
+            block: Some(*block),
+        }),
         Stmt::Raw(insn) => {
             let insn = Instruction::from_id(ctx, *insn);
-            format!("    {}", insn.as_statement())
+            out.push(Line {
+                text: format!("{pad}{}", insn.as_statement()),
+                block: insn.block().map(|b| b.id),
+            });
         }
-        Stmt::Goto(target) => format!("    goto {};", label_of(program, *target)),
-        Stmt::GotoIf { cond, target } => {
-            format!("    if ({cond}) goto {};", label_of(program, *target))
+        Stmt::Goto(target) => out.push(Line {
+            text: format!("{pad}goto {};", label_of(program, *target)),
+            block: None,
+        }),
+        Stmt::GotoIf { cond, target } => out.push(Line {
+            text: format!("{pad}if ({cond}) goto {};", label_of(program, *target)),
+            block: None,
+        }),
+        Stmt::If { cond, then, els } => {
+            out.push(Line {
+                text: format!("{pad}if ({cond}) {{"),
+                block: None,
+            });
+            emit_block(ctx, program, then, indent + 1, out);
+            if els.is_empty() {
+                out.push(Line {
+                    text: format!("{pad}}}"),
+                    block: None,
+                });
+            } else {
+                out.push(Line {
+                    text: format!("{pad}}} else {{"),
+                    block: None,
+                });
+                emit_block(ctx, program, els, indent + 1, out);
+                out.push(Line {
+                    text: format!("{pad}}}"),
+                    block: None,
+                });
+            }
         }
     }
 }
