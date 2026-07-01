@@ -116,6 +116,17 @@ scope = "function"
 passes = ["canonicalize_sp_slots", "mem2reg", "const_fold"]
 repeat_until = "no_change"
 
+# Witness each function's memory-write space set now that `argpromote-registers`
+# has functionalized callees (moving their register/stack effects into private
+# scratch spaces and returned write-sets). GVN's store-to-load forwarding consults
+# this so a value spilled into the caller's frame survives a call to a callee that
+# provably never writes the spill's space — e.g. a `pure_reg` helper that only
+# touches its own scratch space, not the real `ram` the spill lives in.
+[[stage]]
+name = "seed-written-spaces"
+scope = "module"
+passes = ["seed_written_spaces"]
+
 [[stage]]
 name = "gvn"
 scope = "function"

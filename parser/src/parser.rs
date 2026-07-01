@@ -337,6 +337,21 @@ fn label_value(pair: Pair<'_, Rule>) -> Result<Label, ParseError> {
     }
 }
 
+/// Parses an `edge_hint` rule (`// -> <a>, <b>`) into its list of target labels.
+fn parse_edge_hint(pair: Pair<'_, Rule>) -> Result<Vec<Label>, ParseError> {
+    let mut targets = Vec::new();
+    for label_pair in pair.into_inner() {
+        if label_pair.as_rule() == Rule::label {
+            let content = label_pair
+                .into_inner()
+                .next()
+                .ok_or_else(|| ParseError::new("missing edge-hint label content"))?;
+            targets.push(label_value(content)?);
+        }
+    }
+    Ok(targets)
+}
+
 /// Parses a `branch_label` rule (`<(ident|int) branch_arg*>`) into a `Label` and args.
 fn parse_branch_label(
     pair: Pair<'_, Rule>,
@@ -391,7 +406,11 @@ fn parse_terminator(pair: Pair<'_, Rule>) -> Result<Statement, ParseError> {
                     .next()
                     .ok_or_else(|| ParseError::new("missing branchind pointer"))?,
             )?;
-            Ok(Statement::BranchInd { ptr, span })
+            let targets = match inner.next() {
+                Some(hint) if hint.as_rule() == Rule::edge_hint => parse_edge_hint(hint)?,
+                _ => Vec::new(),
+            };
+            Ok(Statement::BranchInd { ptr, targets, span })
         }
 
         Rule::cbranch_stmt => {
@@ -420,8 +439,8 @@ fn parse_terminator(pair: Pair<'_, Rule>) -> Result<Statement, ParseError> {
         }
 
         Rule::call_stmt => {
-            let form = specific
-                .into_inner()
+            let mut specific_inner = specific.into_inner();
+            let form = specific_inner
                 .next()
                 .ok_or_else(|| ParseError::new("missing call form"))?;
             let mut target = None;
@@ -467,9 +486,14 @@ fn parse_terminator(pair: Pair<'_, Rule>) -> Result<Statement, ParseError> {
                 }
                 _ => {}
             }
+            let targets = match specific_inner.next() {
+                Some(hint) if hint.as_rule() == Rule::edge_hint => parse_edge_hint(hint)?,
+                _ => Vec::new(),
+            };
             Ok(Statement::Call {
                 target: target.ok_or_else(|| ParseError::new("missing call target"))?,
                 args,
+                targets,
                 span,
             })
         }
@@ -482,12 +506,24 @@ fn parse_terminator(pair: Pair<'_, Rule>) -> Result<Statement, ParseError> {
                     .ok_or_else(|| ParseError::new("missing callind pointer"))?,
             )?;
             let mut args = Vec::new();
-            if let Some(arg_list) = inner.next() {
-                for atom in arg_list.into_inner() {
-                    args.push(parse_typed_atom(atom)?);
+            let mut targets = Vec::new();
+            for part in inner {
+                match part.as_rule() {
+                    Rule::callind_args => {
+                        for atom in part.into_inner() {
+                            args.push(parse_typed_atom(atom)?);
+                        }
+                    }
+                    Rule::edge_hint => targets = parse_edge_hint(part)?,
+                    _ => {}
                 }
             }
-            Ok(Statement::CallInd { ptr, args, span })
+            Ok(Statement::CallInd {
+                ptr,
+                args,
+                targets,
+                span,
+            })
         }
 
         Rule::return_stmt => {
@@ -1743,6 +1779,41 @@ mod tests {
                 assert_eq!(args[1].0, "@arg1");
             }
             _ => panic!("expected call statement"),
+        }
+    }
+
+    #[test]
+    fn parses_call_with_edge_hint() {
+        let statements = stmts("call fn callee(@p={x}) // -> <resume>");
+        assert_eq!(statements.len(), 1);
+
+        match &statements[0] {
+            Statement::Call { target, targets, .. } => {
+                assert_eq!(target, "callee");
+                assert_eq!(targets.len(), 1);
+                assert!(matches!(&targets[0], Label::Named { name, .. } if name == "resume"));
+            }
+            _ => panic!("expected call statement"),
+        }
+    }
+
+    #[test]
+    fn parses_branchind_with_edge_hint() {
+        let statements = stmts("goto [{p}] // -> <a>, <b>");
+        assert_eq!(statements.len(), 1);
+
+        match &statements[0] {
+            Statement::BranchInd { targets, .. } => {
+                let names: Vec<&str> = targets
+                    .iter()
+                    .map(|t| match t {
+                        Label::Named { name, .. } => name.as_str(),
+                        _ => panic!("expected named target"),
+                    })
+                    .collect();
+                assert_eq!(names, ["a", "b"]);
+            }
+            _ => panic!("expected branchind statement"),
         }
     }
 

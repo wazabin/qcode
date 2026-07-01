@@ -386,6 +386,22 @@ impl Lowerer<'_, '_, '_> {
         }
     }
 
+    /// Add CFG edges from the just-terminated current block to each label in a
+    /// terminator's `// -> ...` edge hint. Used for terminators whose own syntax
+    /// encodes no successors: a `call`'s return block, or an indirect `goto`'s
+    /// resolved targets.
+    fn add_edge_hints(&mut self, targets: &[Label]) -> Result<(), String> {
+        if targets.is_empty() {
+            return Ok(());
+        }
+        let from = self.b.current_block();
+        for target in targets {
+            let to = self.block(target)?;
+            self.b.context_mut().add_cfg_edge(from, to);
+        }
+        Ok(())
+    }
+
     fn statement(&mut self, stmt: &Statement) -> Result<(), String> {
         match stmt {
             Statement::LocalDecl {
@@ -453,9 +469,10 @@ impl Lowerer<'_, '_, '_> {
                 }
             }
 
-            Statement::BranchInd { ptr, .. } => {
+            Statement::BranchInd { ptr, targets, .. } => {
                 let p = self.ptr_atom(ptr)?;
                 self.b.push_branchind(p);
+                self.add_edge_hints(targets)?;
             }
 
             Statement::CBranch {
@@ -475,7 +492,12 @@ impl Lowerer<'_, '_, '_> {
                 self.b.switch_to_block(f);
             }
 
-            Statement::Call { target, args, .. } => {
+            Statement::Call {
+                target,
+                args,
+                targets,
+                ..
+            } => {
                 let t = self.b.get_or_make_local_function(Cow::Owned(target.clone()));
                 // Arg names are decorative (the callee's parameter names as
                 // printed); only the positional atoms are bound.
@@ -484,12 +506,16 @@ impl Lowerer<'_, '_, '_> {
                     .map(|(_, atom)| self.atom(atom, None))
                     .collect::<Result<Vec<_>, _>>()?;
                 self.b.push_call_with_args(t, argv);
+                self.add_edge_hints(targets)?;
             }
 
-            Statement::CallInd { ptr, args, .. } => {
+            Statement::CallInd {
+                ptr, args, targets, ..
+            } => {
                 let p = self.ptr_atom(ptr)?;
                 let argv = self.atoms(args)?;
                 self.b.push_call_ind_with_args(p, argv);
+                self.add_edge_hints(targets)?;
             }
 
             Statement::Return { ptr, value, .. } => {

@@ -257,6 +257,17 @@ where
             .and_then(|s| s.clobbered.as_deref())
     }
 
+    /// The non-register memory spaces this function may (transitively) write, as
+    /// set by analysis. `Some(spaces)` is exact (a space not listed is never
+    /// written); `None` means unknown/unbounded. See
+    /// [`FunctionSignature::written_spaces`].
+    pub fn written_spaces(&'s self) -> Option<&'ctx [crate::space::SpaceId]> {
+        self.inner()
+            .signature
+            .as_ref()
+            .and_then(|s| s.written_spaces.as_deref())
+    }
+
     /// Whether `argpromote_registers` has functionalized this function's register
     /// side effects into a pure value function. See
     /// [`FunctionSignature::pure_reg`].
@@ -772,6 +783,13 @@ impl<'str, 'ctx> FunctionMutRef<'str, 'ctx> {
     /// Records the analysis-computed clobbered register set on this function.
     pub fn set_clobbered_regs(&mut self, regs: Vec<VarnodeId>) {
         self.inner_mut().signature.get_or_insert_default().clobbered = Some(regs);
+    }
+
+    /// Records the analysis-computed set of non-register spaces this function may
+    /// write (`None` = unknown/unbounded). See
+    /// [`FunctionSignature::written_spaces`].
+    pub fn set_written_spaces(&mut self, spaces: Option<Vec<crate::space::SpaceId>>) {
+        self.inner_mut().signature.get_or_insert_default().written_spaces = spaces;
     }
 
     /// Marks this function's register effect as fully captured by its call

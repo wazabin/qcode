@@ -291,6 +291,32 @@ where
             writeln!(f)
         })?;
 
+        // A `call` / `call [..]` / `goto [..]` terminator encodes no successors in
+        // its own syntax, so emit its out-edges as a `// -> <a>, <b>` hint that the
+        // parser reads back into CFG edges (a direct/indirect call's return block,
+        // an indirect jump's resolved targets). Without this such edges would be
+        // lost on round-trip.
+        use crate::value::insn::Mnemonic;
+        if let Some(term) = self.iter().last()
+            && matches!(
+                term.mnemonic(),
+                Mnemonic::Call(_) | Mnemonic::CallInd(_) | Mnemonic::BranchInd(_)
+            )
+        {
+            let mut succ: Vec<&str> = self
+                .successors()
+                .map(|(_, b)| BasicBlock::from_id(self.ctx(), b).name().unwrap_or("unnamed"))
+                .collect();
+            if !succ.is_empty() {
+                succ.sort_unstable();
+                write!(f, "\t// ->")?;
+                for (i, name) in succ.iter().enumerate() {
+                    write!(f, "{} <{name}>", if i == 0 { "" } else { "," })?;
+                }
+                writeln!(f)?;
+            }
+        }
+
         Ok(())
     }
 }

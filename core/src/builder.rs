@@ -296,6 +296,11 @@ impl<'str, 'ctx> Builder<'str, 'ctx> {
         self.is_terminated = self.block.is_terminated();
     }
 
+    /// The block the builder is currently appending to.
+    pub fn current_block(&self) -> BlockId {
+        self.block.id
+    }
+
     /// Gets the ID of a value in the current namespace
     pub fn try_get_value(&self, name: &str) -> Option<ValueRef<'str, '_>> {
         self.namespace

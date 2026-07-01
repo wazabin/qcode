@@ -246,6 +246,10 @@ pub enum Statement {
     },
     BranchInd {
         ptr: TypedAtom,
+        /// Resolved jump targets, from a `// -> <a>, <b>` edge hint. The indirect
+        /// jump's own syntax encodes no successors, so without this the block has
+        /// no out-edges.
+        targets: Vec<Label>,
         span: SourceSpan,
     },
     CBranch {
@@ -263,12 +267,19 @@ pub enum Statement {
         /// printed (`@r0`, `@arg1`, …); it is decorative and discarded on
         /// lowering, where only the positional atoms matter.
         args: Vec<(String, TypedAtom)>,
+        /// The call's return (fall-through) block(s), from a `// -> <ret>` edge
+        /// hint. A `call` terminates its block; this records where control resumes
+        /// after the callee returns. Empty for a non-returning call.
+        targets: Vec<Label>,
         span: SourceSpan,
     },
     CallInd {
         ptr: TypedAtom,
         /// Positional arguments passed to the indirect callee.
         args: Vec<TypedAtom>,
+        /// The call's return (fall-through) block(s), from a `// -> <ret>` edge
+        /// hint. See [`Statement::Call`].
+        targets: Vec<Label>,
         span: SourceSpan,
     },
     Return {

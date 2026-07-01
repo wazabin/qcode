@@ -32,6 +32,7 @@ use jstd::graph::analysis::DominatorTree;
 
 use crate::AliasResult;
 use qcode::{
+    assumption::Proposition,
     context::Context,
     space::{Space, SpaceId, SpaceType},
     value::{
@@ -452,6 +453,20 @@ impl MemForward {
         // it may write to any pinned RAM cell (a global or stack slot) even
         // without receiving a pointer to it. A direct call's memory writes are all
         // recorded in its `clobbers`, so only its escaping pointers matter.
+        // The non-register spaces the callee may (transitively) store to. `Some`
+        // is an exact witnessed set: a RAM cell whose space is absent cannot be
+        // clobbered by this call, regardless of what pointers escape — so it
+        // survives. `None` (an indirect callee, or one with no recorded summary)
+        // is unbounded, falling through to the conservative escape-based prune.
+        // This is what lets a functionalized callee that writes only its own
+        // private scratch space leave the caller's spilled-pointer cell intact.
+        let callee_written_spaces: Option<Vec<SpaceId>> = match &term {
+            Some(Mnemonic::Call(call)) => {
+                Function::from_id(ctx, call.target).written_spaces().map(<[_]>::to_vec)
+            }
+            _ => None,
+        };
+
         let (clobbers, escaping, unknown_callee): (CallClobbers, Vec<ValueId>, bool) = match &term {
             Some(Mnemonic::CallInd(call)) => (CallClobbers::AllRegisters, call.args.clone(), true),
             Some(Mnemonic::Call(call)) => {
@@ -523,6 +538,16 @@ impl MemForward {
         self.byte_map.retain(|&(base, off), _| {
             let space = base.space();
             if !is_reg(space) {
+                // A direct callee with a witnessed write-set that excludes this
+                // space cannot touch the cell no matter what escapes into it, so
+                // keep it. This is a per-callee memory summary, sound and needing
+                // no frame reasoning: a `pure_reg` callee writing only its private
+                // scratch space leaves the caller's real-`ram` cells intact.
+                if let Some(ws) = &callee_written_spaces
+                    && !ws.contains(&space)
+                {
+                    return true;
+                }
                 // RAM: a call may write through any symbolic pointer (no memory
                 // summary exists), so drop symbolic RAM cells — except an own-frame
                 // slot the callee cannot reach (see `own_frame_survives`). A pinned
@@ -553,6 +578,84 @@ impl MemForward {
                 },
             }
         });
+    }
+
+    /// Whether spilled-pointer-reload peeling is sound for `block_id`'s function:
+    /// it rides [`Proposition::LoadedPointerDisjointFromSlot`] (a value loaded from
+    /// a slot is disjoint from that slot — no self-referential `*pp == &pp`), the
+    /// same assumption the alias oracle's spilled-reload rules use. Off → the
+    /// conservative opaque-pointer prune.
+    pub(super) fn loaded_ptr_peeling(ctx: &Context, block_id: BlockId) -> bool {
+        BasicBlock::from_id(ctx, block_id)
+            .function()
+            .map(|f| f.id)
+            .is_some_and(|fid| {
+                ctx.truth(Proposition::LoadedPointerDisjointFromSlot(fid))
+                    .is_some_and(|t| t.value)
+            })
+    }
+
+    /// If `v` is a load whose location is, in the current byte map, fully covered
+    /// by a single source value of the same width (an *exact* reload), return that
+    /// value. This is the same single-segment cover [`try_load`] forwards on, used
+    /// here to peel a spilled-pointer reload before disjointness testing.
+    fn reload_forwards_to(
+        &self,
+        ctx: &Context,
+        v: ValueId,
+        aliases: Option<&AliasResult>,
+        numbering: &Numbering,
+    ) -> Option<ValueId> {
+        let ValueId::Instruction(id) = v else {
+            return None;
+        };
+        let Mnemonic::Load(load) = InstructionRef::new(ctx, id).mnemonic().clone() else {
+            return None;
+        };
+        let (base, start) = locate(load.ptr, load.space, aliases, numbering);
+        let segs = self.segments(base, start, start + load.size as i64)?;
+        let [seg] = segs.as_slice() else { return None };
+        (seg.load_off == 0
+            && seg.size == load.size
+            && seg.src_off == 0
+            && ValueRef::new(seg.src, ctx).size() == load.size)
+            .then_some(seg.src)
+    }
+
+    /// Locate `ptr`, peeling its affine base through spilled-pointer reloads: when
+    /// the base is a reload of a cell the (inherited) byte map already resolves to
+    /// a concrete value, substitute that value and re-locate. A store through
+    /// `%buf = load(slot)` thus resolves to the address `slot` was spilled with —
+    /// e.g. `(@SP - 0x1a0) + k` — so the loop-carried prune sees it as a precise
+    /// frame interval, provably disjoint from an unrelated slot, instead of an
+    /// opaque pointer that pessimistically clobbers every inherited cell. This is
+    /// what breaks the chicken-and-egg where the buffer-fill stores (through the
+    /// not-yet-forwarded reload) would otherwise drop the very spill cell the
+    /// reload needs to forward.
+    fn resolve_loaded_ptr(
+        &self,
+        ctx: &Context,
+        ptr: ValueId,
+        space: SpaceId,
+        aliases: Option<&AliasResult>,
+        numbering: &Numbering,
+        peel: bool,
+    ) -> (Base, i64) {
+        let (mut base, mut off) = locate(ptr, space, aliases, numbering);
+        if !peel {
+            return (base, off);
+        }
+        // Bounded peel of reload chains (a spill of a spill, …).
+        for _ in 0..8 {
+            let Base::Symbolic(_, basev) = base else { break };
+            let Some(value) = self.reload_forwards_to(ctx, basev, aliases, numbering) else {
+                break;
+            };
+            let (b2, o2) = locate(value, space, aliases, numbering);
+            base = b2;
+            off += o2;
+        }
+        (base, off)
     }
 
     /// At a loop header, drop forwarded values a store inside the loop may
@@ -613,15 +716,33 @@ impl MemForward {
             })
             .collect();
 
+        let peel = Self::loaded_ptr_peeling(ctx, block_id);
+
+        // Resolve each store's location once, peeling spilled-pointer reloads
+        // against the inherited byte map (see `resolve_loaded_ptr`). `rep` is the
+        // representative pointer value for the resolved base, used by
+        // `cross_base_disjoint`'s pinned-vs-symbolic arm.
+        let store_locs: Vec<(Base, i64, i64, ValueId)> = stores
+            .iter()
+            .map(|store| {
+                let (sb, s) =
+                    self.resolve_loaded_ptr(ctx, store.ptr, store.space, aliases, numbering, peel);
+                let rep = match sb {
+                    Base::Symbolic(_, bv) => bv,
+                    Base::Pinned(_) => store.ptr,
+                };
+                (sb, s, store.size as i64, rep)
+            })
+            .collect();
+
         self.byte_map.retain(|&(base, off), _| {
-            !stores.iter().any(|store| {
-                let (sb, s) = locate(store.ptr, store.space, aliases, numbering);
+            !store_locs.iter().any(|&(sb, s, size, rep)| {
                 if sb == base {
                     // Same base: overwritten only on the bytes it covers.
-                    s <= off && off < s + store.size as i64
+                    s <= off && off < s + size
                 } else {
                     // Other base: may overwrite unless provably disjoint.
-                    !cross_base_disjoint(ctx, aliases, store.ptr, sb, base)
+                    !cross_base_disjoint(ctx, aliases, rep, sb, base)
                 }
             })
         });
@@ -972,6 +1093,7 @@ mod tests {
         );
     }
 
+<<<<<<< HEAD
     /// Build `f` ending in `callee(arg)`, seed a pinned RAM cell at `0x40`, run
     /// the call prune, and report whether the cell survived. `readonly` sets the
     /// callee's param-0 `readonly` bit; `pin_arg` gives the argument a concrete
@@ -1068,6 +1190,59 @@ mod tests {
         assert!(
             pinned_cell_survives_call(true, false),
             "a symbolic readonly arg no longer nukes pinned cells"
+        );
+    }
+
+    /// A direct call to a callee with a witnessed write-set keeps every cell
+    /// whose space the callee never writes — even a symbolic RAM cell that the
+    /// no-summary path would drop — while still dropping cells in a space the
+    /// callee does write. This is the per-callee memory summary (Path C): a
+    /// `pure_reg` helper that writes only its private scratch space cannot clobber
+    /// the caller's real-`ram` spill.
+    #[test]
+    fn call_keeps_cells_in_spaces_callee_never_writes() {
+        use qcode::builder::Builder;
+
+        let mut tc = TestContext::new();
+        let caller = Function::make(&mut tc.ctx, "caller".into()).unwrap().id;
+        let callee = Function::make(&mut tc.ctx, "callee".into()).unwrap().id;
+        let block = tc.ctx.get_or_make_block(0x1000);
+        {
+            let mut f = Function::from_id_mut(&mut tc.ctx, caller);
+            f.set_root(block).unwrap();
+            f.add_block(block);
+        }
+        // The callee's witnessed write-set is exactly its own scratch space — it
+        // never writes real `ram`.
+        let scratch = tc.ctx.make_temp_space();
+        let ram = tc.ctx.default_space;
+        Function::from_id_mut(&mut tc.ctx, callee).set_written_spaces(Some(vec![scratch]));
+
+        // The caller block ends in a direct call to `callee`, passing a frame
+        // pointer (so a pointer escapes — the no-summary path would drop the cell).
+        {
+            let mut b = Builder::from_block(BasicBlock::from_id_mut(&mut tc.ctx, block));
+            b.push_call_with_args(callee, vec![ValueId::Varnode(tc.r1)]);
+            unsafe { b.dont_finalize() };
+        }
+
+        let ram_cell = Base::Symbolic(ram, ValueId::Varnode(tc.r1));
+        let scratch_cell = Base::Symbolic(scratch, ValueId::Varnode(tc.r2));
+        let src = ValueId::Varnode(tc.r2);
+
+        let mut mf = MemForward::default();
+        mf.byte_map.insert((ram_cell, 0), Cell { src, src_off: 0 });
+        mf.byte_map.insert((scratch_cell, 0), Cell { src, src_off: 0 });
+
+        mf.prune_clobbered_by_call(&tc.ctx, block, None);
+
+        assert!(
+            mf.byte_map.contains_key(&(ram_cell, 0)),
+            "a RAM cell survives a call to a callee that writes only scratch"
+        );
+        assert!(
+            !mf.byte_map.contains_key(&(scratch_cell, 0)),
+            "a cell in a space the callee does write is still dropped"
         );
     }
 }
