@@ -203,16 +203,29 @@ impl<'str> ValueRegistry<'str> {
     /// members of `dead` pruned from their user lists. Call this after
     /// removing dead instructions from their basic blocks.
     pub fn remove_instructions(&mut self, dead: &HashSet<InstructionId>) {
+        // Collect the distinct operands and call targets referenced by any dead
+        // instruction first, then prune each affected list exactly once. The
+        // retain condition (`!dead.contains(..)`) is independent of which dead
+        // instruction referenced the operand, so pruning per distinct operand
+        // yields the same result as pruning per (dead, operand) pair — but a
+        // value shared by K dead users has its list scanned once instead of K
+        // times. This is the dominant cost when large blocks are cleared.
+        let mut affected_args: HashSet<ValueId> = HashSet::default();
+        let mut affected_targets: HashSet<FunctionId> = HashSet::default();
         for &id in dead {
-            let args = self.instructions[id].mnemonic().args();
-            for arg in args {
-                if let Some(users) = self.users.get_mut(&arg) {
-                    users.retain(|u| !dead.contains(u));
-                }
+            let mnemonic = self.instructions[id].mnemonic();
+            affected_args.extend(mnemonic.args());
+            if let Some(target) = mnemonic.call_target() {
+                affected_targets.insert(target);
             }
-            if let Some(target) = self.instructions[id].mnemonic().call_target()
-                && let Some(sites) = self.call_sites.get_mut(&target)
-            {
+        }
+        for arg in affected_args {
+            if let Some(users) = self.users.get_mut(&arg) {
+                users.retain(|u| !dead.contains(u));
+            }
+        }
+        for target in affected_targets {
+            if let Some(sites) = self.call_sites.get_mut(&target) {
                 sites.retain(|s| !dead.contains(s));
             }
         }
