@@ -14,7 +14,7 @@
 //!   passes in whole-program checkpoint+replay so a violated assumption leaves
 //!   no derived residue (see [`qcode::assumption`]).
 
-use std::collections::{HashMap, HashSet};
+use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
 
 use qcode::{
     assumption::{PassName, Proposition},
@@ -152,7 +152,10 @@ pub fn verify_assumptions(ctx: &mut Context) -> usize {
 /// [`KnownContradiction`](qcode::assumption::KnownContradiction) on the context
 /// when the forced polarity disagrees with the body — the driver's signal to
 /// abort with an error rather than silently honor an impossible override.
-pub fn verify_forced_returns(ctx: &mut Context, overrides: &HashMap<Proposition, bool>) {
+pub fn verify_forced_returns(
+    ctx: &mut Context,
+    overrides: &std::collections::HashMap<Proposition, bool>,
+) {
     let _scope = pass_scope::enter("verify_assumptions");
     for &prop in overrides.keys() {
         if let Proposition::FunctionReturns(f) = prop {
@@ -200,7 +203,7 @@ fn function_returns(ctx: &Context, f: FunctionId) -> bool {
     // call (equivalently: such a call post-dominates the entry), so control
     // never flows back. An exitless body (an unconditional infinite loop) has no
     // returning exit and is therefore noreturn.
-    let mut seen: HashSet<BlockId> = HashSet::new();
+    let mut seen: HashSet<BlockId> = HashSet::default();
     let mut stack = vec![entry.id];
     while let Some(block) = stack.pop() {
         if !seen.insert(block) {
@@ -261,7 +264,7 @@ pub fn analyze_with_assumptions<'str>(
     baseline: &Context<'str>,
     mut run_dependent: impl FnMut(&mut Context<'str>),
 ) -> Context<'str> {
-    let mut knowledge: HashMap<Proposition, (bool, PassName)> = HashMap::new();
+    let mut knowledge: HashMap<Proposition, (bool, PassName)> = HashMap::default();
 
     loop {
         let mut ctx = baseline.clone();

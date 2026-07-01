@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use rustc_hash::FxHashMap as HashMap;
 
 use qcode::{
     context::Context,
@@ -27,7 +27,7 @@ impl SteensgaardState {
             parent: Vec::new(),
             rank: Vec::new(),
             points_to: Vec::new(),
-            value_to_node: HashMap::new(),
+            value_to_node: HashMap::default(),
             next_id: 0,
         }
     }
@@ -139,7 +139,7 @@ impl SteensgaardState {
             .collect();
         AliasResult {
             value_to_root,
-            value_to_interval: HashMap::new(),
+            value_to_interval: HashMap::default(),
         }
     }
 }

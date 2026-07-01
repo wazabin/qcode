@@ -16,9 +16,11 @@ use core::slice;
 use jstd::graph::Graph;
 use std::{
     borrow::Cow,
-    collections::{HashMap, HashSet},
+    collections::HashSet,
     fmt::{Display, Formatter},
 };
+
+use rustc_hash::FxHashMap as HashMap;
 
 pub(crate) use self::cfg::EdgeData;
 pub use self::cfg::{BlockId, EdgeId, EdgeMutRef, EdgeRef};
@@ -963,7 +965,7 @@ mod tests {
             "
         );
 
-        let mut value_map = HashMap::new();
+        let mut value_map = HashMap::default();
         let cloned_id = BasicBlock::clone_into_ctx(&mut ctx, block, &mut value_map);
 
         let orig = BasicBlock::from_id(&ctx, block);
@@ -1002,7 +1004,7 @@ mod tests {
             "
         );
 
-        let mut value_map = HashMap::new();
+        let mut value_map = HashMap::default();
         let cloned_id = BasicBlock::clone_into_ctx(&mut ctx, block, &mut value_map);
         let cloned = BasicBlock::from_id(&ctx, cloned_id);
 

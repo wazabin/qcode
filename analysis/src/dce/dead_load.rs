@@ -1,4 +1,4 @@
-use std::collections::HashSet;
+use rustc_hash::FxHashSet as HashSet;
 
 use crate::AliasResult;
 use jstd::graph::analysis::compute_postdominators;
@@ -177,7 +177,7 @@ pub fn dead_load_insns(
 
 /// Loads in `block_id` whose result has no users (dead in any address space).
 fn block_dead_loads(ctx: &Context, block_id: BlockId) -> HashSet<InstructionId> {
-    let mut dead = HashSet::new();
+    let mut dead = HashSet::default();
     for &id in BasicBlock::from_id(ctx, block_id).instruction_ids() {
         if let Mnemonic::Load(_) = ctx.get_insn(id).mnemonic()
             && ctx.users(id).is_empty()
@@ -367,7 +367,7 @@ type CandidateStore = (InstructionId, SpaceId, Option<(i64, i64)>);
 
 fn unread_temp_space_stores(ctx: &Context, function_id: FunctionId) -> HashSet<InstructionId> {
     let fun = Function::from_id(ctx, function_id);
-    let mut loaded_spaces: HashSet<SpaceId> = HashSet::new();
+    let mut loaded_spaces: HashSet<SpaceId> = HashSet::default();
     // (space_id, byte_start, byte_end) for loads with known literal addresses
     let mut loaded_intervals: Vec<(SpaceId, i64, i64)> = Vec::new();
     // (insn_id, space_id, Some(start, end) if address is a literal)
@@ -430,7 +430,7 @@ fn postdominated_dead_register_stores(
     let function = Function::from_id(ctx, function_id);
     let blocks: Vec<BlockId> = function.iter().map(|block| block.id).collect();
     if blocks.is_empty() {
-        return HashSet::new();
+        return HashSet::default();
     }
 
     // Calls can observe argument registers implicitly or through bound call args;
@@ -440,7 +440,7 @@ fn postdominated_dead_register_stores(
         .flat_map(|block| block.iter())
         .any(|insn| matches!(insn.mnemonic(), Mnemonic::Call(_) | Mnemonic::CallInd(_)))
     {
-        return HashSet::new();
+        return HashSet::default();
     }
 
     let node_set: HashSet<BlockId> = blocks.iter().copied().collect();
@@ -455,7 +455,7 @@ fn postdominated_dead_register_stores(
         })
         .collect();
     if exit_set.is_empty() {
-        return HashSet::new();
+        return HashSet::default();
     }
     let pdom = compute_postdominators(ctx, &blocks, &node_set, &exit_set);
 
@@ -520,7 +520,7 @@ pub fn remove_dead_load_insns(
         .map(|block| block.id)
         .collect();
 
-    let mut dead = HashSet::new();
+    let mut dead = HashSet::default();
     dead.extend(unread_temp_space_stores(ctx, function_id));
 
     match aliases {

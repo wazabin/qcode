@@ -22,7 +22,7 @@
 //! *serializes by name*, so the on-disk form is stable regardless of link
 //! order and an unknown name is a clean deserialize error.
 
-use std::collections::HashMap;
+use rustc_hash::FxHashMap as HashMap;
 use std::sync::OnceLock;
 
 use super::binop::IntBinop;
@@ -155,8 +155,8 @@ fn registry() -> &'static Registry {
             .collect();
         descs.sort_by_key(|d| d.name);
 
-        let mut by_name = HashMap::new();
-        let mut by_root: HashMap<RootOp, Vec<IntrinsicId>> = HashMap::new();
+        let mut by_name = HashMap::default();
+        let mut by_root: HashMap<RootOp, Vec<IntrinsicId>> = HashMap::default();
         for (idx, desc) in descs.iter().enumerate() {
             let id = IntrinsicId(idx);
             let prev = by_name.insert(desc.name, id);

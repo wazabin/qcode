@@ -1,4 +1,4 @@
-use std::collections::HashSet;
+use rustc_hash::FxHashSet as HashSet;
 
 use qcode::{
     context::Context,
@@ -78,7 +78,7 @@ pub fn dead_reg_insns(ctx: &Context, block_id: BlockId) -> HashSet<InstructionId
     let insns: Vec<InstructionId> = BasicBlock::from_id(ctx, block_id)
         .instruction_ids()
         .to_vec();
-    let mut dead = HashSet::new();
+    let mut dead = HashSet::default();
 
     // Dead loads: no users
     for &id in &insns {

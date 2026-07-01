@@ -1,9 +1,11 @@
 use jstd::Identifier;
 use std::{
     borrow::Cow,
-    collections::{BTreeSet, HashSet, hash_set},
+    collections::{BTreeSet, hash_set},
     fmt::{Display, Formatter},
 };
+
+use rustc_hash::FxHashSet as HashSet;
 
 mod signature;
 pub use signature::FunctionSignature;
@@ -60,7 +62,7 @@ impl<'str> Function<'str> {
             name,
             address: None,
             root: None,
-            blocks: HashSet::new(),
+            blocks: HashSet::default(),
             instruction_addrs: BTreeSet::new(),
             is_external: false,
             signature: None,

@@ -10,7 +10,8 @@
 //! latch: %next = @i + C2; goto header(@i = %next)
 //! ```
 
-use std::collections::{HashMap, HashSet, VecDeque};
+use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
+use std::collections::VecDeque;
 
 use jstd::graph::analysis::{DominatorTree, compute_dominators, compute_postdominators};
 use qcode::{
@@ -105,10 +106,13 @@ pub fn recognize_simple_loops(ctx: &mut Context, fun_id: FunctionId) -> bool {
         .backedges
         .iter()
         .filter_map(|&edge| recognize_simple_loop(ctx, &analysis, edge))
-        .fold(HashMap::<BlockId, Vec<SimpleLoop>>::new(), |mut acc, lp| {
-            acc.entry(lp.header()).or_default().push(lp);
-            acc
-        });
+        .fold(
+            HashMap::<BlockId, Vec<SimpleLoop>>::default(),
+            |mut acc, lp| {
+                acc.entry(lp.header()).or_default().push(lp);
+                acc
+            },
+        );
 
     let updates = block_ids
         .iter()
@@ -348,7 +352,7 @@ fn linear_loop_path(
     loop_nodes: &HashSet<BlockId>,
 ) -> Option<Vec<BlockId>> {
     let mut path = Vec::new();
-    let mut seen = HashSet::new();
+    let mut seen = HashSet::default();
     let mut current = body;
 
     loop {
@@ -548,7 +552,7 @@ fn recognize_simple_loop(
 }
 
 fn natural_loop(ctx: &Context, edge: BackEdge) -> HashSet<BlockId> {
-    let mut nodes = HashSet::from([edge.header, edge.latch]);
+    let mut nodes = HashSet::from_iter([edge.header, edge.latch]);
     let mut worklist = VecDeque::from([edge.latch]);
 
     while let Some(block) = worklist.pop_front() {
@@ -657,7 +661,7 @@ fn loop_initial_value(
 }
 
 fn can_reach(ctx: &Context, from: BlockId, to: BlockId, allowed: &HashSet<BlockId>) -> bool {
-    let mut seen = HashSet::new();
+    let mut seen = HashSet::default();
     let mut worklist = VecDeque::from([from]);
 
     while let Some(block) = worklist.pop_front() {

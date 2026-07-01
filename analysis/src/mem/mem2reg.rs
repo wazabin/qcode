@@ -10,8 +10,8 @@ use qcode::{
     context::Context,
     value::{FunctionRef, block::BlockRef},
 };
+use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
 use std::borrow::Cow;
-use std::collections::{HashMap, HashSet};
 
 use crate::AliasResult;
 
@@ -45,7 +45,7 @@ impl<'ctx, 'str> Mem2Reg<'ctx, 'str> {
     fn run(&mut self) -> bool {
         // `live_in_blocks` is an O(blocks × insns) fixpoint; cache it per var so
         // the collection and block-param phases share a single computation.
-        let mut live_in_cache: HashMap<ValueId, HashSet<BlockId>> = HashMap::new();
+        let mut live_in_cache: HashMap<ValueId, HashSet<BlockId>> = HashMap::default();
 
         let Promotable { vars, sizes } = self.collect_promotable_vars(&mut live_in_cache);
         if vars.is_empty() {
@@ -180,7 +180,8 @@ fn depends_on_stack_frame_pointer(ctx: &Context, v: ValueId, seen: &mut HashSet<
 }
 
 fn is_computed_stack_frame_pointer(ctx: &Context, v: ValueId) -> bool {
-    stack_slot_addr(ctx, v).is_none() && depends_on_stack_frame_pointer(ctx, v, &mut HashSet::new())
+    stack_slot_addr(ctx, v).is_none()
+        && depends_on_stack_frame_pointer(ctx, v, &mut HashSet::default())
 }
 
 /// The `(offset, ptr_width)` a stack-slot literal encodes, relative to the
@@ -281,10 +282,10 @@ fn register_clobber_index(
         .filter(|&var| register_varnode(ctx, var).is_some())
         .collect::<Vec<_>>();
     if promoted_register_vars.is_empty() {
-        return HashMap::new();
+        return HashMap::default();
     }
 
-    let mut store_ptrs = HashSet::new();
+    let mut store_ptrs = HashSet::default();
     for block in Function::from_id(ctx, function_id).blocks() {
         for insn in block.iter() {
             if let Mnemonic::Store(Store { ptr, .. }) = insn.mnemonic()
@@ -458,15 +459,15 @@ impl Mem2Reg<'_, '_> {
         &self,
         live_in_cache: &mut HashMap<ValueId, HashSet<BlockId>>,
     ) -> Promotable {
-        let mut stored = HashSet::new();
-        let mut loaded = HashSet::new();
-        let mut store_counts: HashMap<ValueId, usize> = HashMap::new();
+        let mut stored = HashSet::default();
+        let mut loaded = HashSet::default();
+        let mut store_counts: HashMap<ValueId, usize> = HashMap::default();
 
         // Stack-slot bookkeeping, keyed by the slot literal `ValueId`.
-        let mut stack_stored: HashSet<ValueId> = HashSet::new();
-        let mut stack_loaded: HashSet<ValueId> = HashSet::new();
-        let mut stack_size: HashMap<ValueId, usize> = HashMap::new();
-        let mut stack_size_conflict: HashSet<ValueId> = HashSet::new();
+        let mut stack_stored: HashSet<ValueId> = HashSet::default();
+        let mut stack_loaded: HashSet<ValueId> = HashSet::default();
+        let mut stack_size: HashMap<ValueId, usize> = HashMap::default();
+        let mut stack_size_conflict: HashSet<ValueId> = HashSet::default();
         let mut stack_intervals: Vec<StackAccessRange> = Vec::new();
         // A stack-typed pointer we could not resolve to a fixed slot disables all
         // stack promotion: it may alias any slot. The same applies when this
@@ -482,7 +483,7 @@ impl Mem2Reg<'_, '_> {
         //   - a varnode access whose width differs from the varnode's own width
         //     (e.g. a 4-byte load of an 8-byte-stored register).
         // Promoting either would forward a wrong-width value.
-        let mut mixed_width: HashSet<ValueId> = HashSet::new();
+        let mut mixed_width: HashSet<ValueId> = HashSet::default();
 
         for block in Function::from_id(self.ctx, self.function_id).blocks() {
             for insn in block.iter() {
@@ -568,7 +569,7 @@ impl Mem2Reg<'_, '_> {
         // is both stored and loaded at a single consistent size and whose byte range
         // is touched by no *other* stack access. Disabled entirely when a dynamic
         // stack pointer is present, since it may alias any slot.
-        let mut sizes: HashMap<ValueId, usize> = HashMap::new();
+        let mut sizes: HashMap<ValueId, usize> = HashMap::default();
         if !dynamic_stack {
             for &var in stack_stored.intersection(&stack_loaded) {
                 if let Some(size) = promotable_stack_slot_size(
@@ -625,9 +626,9 @@ impl Mem2Reg<'_, '_> {
         frontier: &HashMap<BlockId, HashSet<BlockId>>,
         live_in_cache: &mut HashMap<ValueId, HashSet<BlockId>>,
     ) -> InsertedBlockParams {
-        let mut var_params: BlockParamAssignments = HashMap::new();
+        let mut var_params: BlockParamAssignments = HashMap::default();
         let mut changed = false;
-        let mut excluded: HashSet<ValueId> = HashSet::new();
+        let mut excluded: HashSet<ValueId> = HashSet::default();
 
         for &var in vars {
             // Block-param width: varnodes carry their own size; stack slots use the
@@ -741,8 +742,8 @@ fn live_in_blocks(
     var: ValueId,
     aliases: &AliasResult,
 ) -> HashSet<BlockId> {
-    let mut upward_exposed = HashSet::new();
-    let mut defined = HashSet::new();
+    let mut upward_exposed = HashSet::default();
+    let mut defined = HashSet::default();
 
     for block in Function::from_id(ctx, function_id).blocks() {
         let block_id = block.id;
@@ -925,7 +926,7 @@ impl Mem2Reg<'_, '_> {
         // a partially promoted var). Removing a store to such a var would strand its
         // load reading an undefined location (the SLEIGH `v0`/`v1` unique-space
         // leak), so those stores fall back to the consumed/dead guard below.
-        let mut vars_with_surviving_loads: HashSet<ValueId> = HashSet::new();
+        let mut vars_with_surviving_loads: HashSet<ValueId> = HashSet::default();
         for &block_id in &block_ids {
             for &insn_id in BasicBlock::from_id(self.ctx, block_id).instruction_ids() {
                 if let Mnemonic::Load(Load { ptr, .. }) =
@@ -1054,7 +1055,7 @@ fn find_phi_insert_positions(
         .collect::<HashSet<_>>();
 
     let mut worklist: Vec<BlockId> = block_containing_store.iter().copied().collect();
-    let mut result = HashSet::new();
+    let mut result = HashSet::default();
 
     while let Some(block) = worklist.pop() {
         // `frontier` is keyed only by blocks reachable from the root. A store in
@@ -1115,11 +1116,11 @@ impl<'a> RenameState<'a> {
             var_params,
             vars,
             register_clobbers,
-            visited: HashSet::new(),
-            frames: vec![Frame::new()],
-            consumed_stores: HashSet::new(),
-            dead_stores: HashSet::new(),
-            preserved_stores: HashSet::new(),
+            visited: HashSet::default(),
+            frames: vec![Frame::default()],
+            consumed_stores: HashSet::default(),
+            dead_stores: HashSet::default(),
+            preserved_stores: HashSet::default(),
             changed,
         }
     }
@@ -1286,11 +1287,11 @@ impl Mem2Reg<'_, '_> {
                         state.changed = true;
                     }
 
-                    state.frames.push(Frame::new());
+                    state.frames.push(Frame::default());
                     self.decide_values_start_from(success_block, state);
                     state.frames.pop();
 
-                    state.frames.push(Frame::new());
+                    state.frames.push(Frame::default());
                     self.decide_values_start_from(failure_block, state);
                     state.frames.pop();
                 }
@@ -1354,7 +1355,7 @@ impl Mem2Reg<'_, '_> {
         // store made while visiting one successor's subtree is not visible when a
         // sibling successor is visited.
         for successor in successors {
-            state.frames.push(Frame::new());
+            state.frames.push(Frame::default());
             self.decide_values_start_from(successor, state);
             state.frames.pop();
         }
@@ -1589,15 +1590,15 @@ mod tests {
         );
 
         let function = Function::from_id(&ctx, test);
-        let live_in = HashSet::from([loop_header]);
-        let frontier = HashMap::from([
-            (entry, HashSet::from([loop_header])),
-            (loop_header, HashSet::from([loop_header])),
+        let live_in = HashSet::from_iter([loop_header]);
+        let frontier = HashMap::from_iter([
+            (entry, HashSet::from_iter([loop_header])),
+            (loop_header, HashSet::from_iter([loop_header])),
         ]);
 
         let result = find_phi_insert_positions(A.into(), &function, &frontier, &live_in);
 
-        assert_eq!(result, HashSet::from([loop_header]));
+        assert_eq!(result, HashSet::from_iter([loop_header]));
     }
 
     #[test]

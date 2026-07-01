@@ -12,7 +12,8 @@ use crate::{
     },
 };
 use jstd::registry::Registry;
-use std::collections::{BTreeSet, HashMap, HashSet};
+use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
+use std::collections::BTreeSet;
 
 /// Central storage arena for all IR values in a [`Context`](crate::context::Context).
 ///

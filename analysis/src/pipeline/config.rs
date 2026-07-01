@@ -7,7 +7,7 @@
 //!
 //! [`parse`]: Pipeline::parse
 
-use std::collections::{HashMap, HashSet};
+use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
 #[cfg(not(target_arch = "wasm32"))]
 use std::path::{Path, PathBuf};
 
@@ -384,7 +384,7 @@ impl Pipeline {
         progress: &mut impl FnMut(PipelineProgress),
     ) -> Result<(), String> {
         let end = self.barrier_index().unwrap_or(self.stages.len());
-        let mut dirty_functions = Some(HashSet::new());
+        let mut dirty_functions = Some(HashSet::default());
         let mut cache = FixpointCache::default();
         for stage in &self.stages[..end] {
             match &stage.passes {
@@ -429,7 +429,7 @@ impl Pipeline {
         progress: &mut impl FnMut(PipelineProgress),
     ) -> Result<(), String> {
         let start = self.barrier_index().map(|i| i + 1).unwrap_or(0);
-        let mut dirty_functions = Some(HashSet::new());
+        let mut dirty_functions = Some(HashSet::default());
         let mut cache = FixpointCache::default();
         for stage in &self.stages[start..] {
             match &stage.passes {
@@ -464,7 +464,7 @@ impl Pipeline {
         round: usize,
         progress: &mut impl FnMut(PipelineProgress),
     ) -> Result<(), String> {
-        let mut dirty_functions = Some(HashSet::new());
+        let mut dirty_functions = Some(HashSet::default());
         let mut cache = FixpointCache::default();
         for stage in &self.stages[range] {
             match &stage.passes {
@@ -740,7 +740,9 @@ impl FixpointCache {
 fn function_fingerprint(ctx: &Context, fun_id: FunctionId) -> u64 {
     use std::hash::{Hash, Hasher};
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
-    FunctionRef::from_id(ctx, fun_id).to_string().hash(&mut hasher);
+    FunctionRef::from_id(ctx, fun_id)
+        .to_string()
+        .hash(&mut hasher);
     hasher.finish()
 }
 
@@ -768,9 +770,10 @@ fn run_function_stage(
 
     // Function-major stages run each pass thousands of times, so timing is
     // aggregated per pass over the whole stage rather than logged per call.
-    let mut elapsed: HashMap<&'static str, (std::time::Duration, usize, usize)> = HashMap::new();
+    let mut elapsed: HashMap<&'static str, (std::time::Duration, usize, usize)> =
+        HashMap::default();
 
-    let mut dirty = HashSet::new();
+    let mut dirty = HashSet::default();
 
     for (index, fun_id) in fun_ids.into_iter().enumerate() {
         let function: std::sync::Arc<str> = FunctionRef::from_id(ctx, fun_id).name().into();

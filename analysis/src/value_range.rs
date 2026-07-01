@@ -18,7 +18,7 @@
 //! ([`crate::cfg::HandleJumpTables`]): bounding the index of a
 //! `table_base + index * scale` indirect branch gives the table's size.
 
-use std::collections::{HashMap, HashSet};
+use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
 
 use qcode::{
     context::Context,
@@ -105,8 +105,8 @@ pub fn value_range(ctx: &Context, value: ValueId, at_block: BlockId) -> ValueRan
     Solver {
         ctx,
         at_block,
-        memo: HashMap::new(),
-        in_progress: HashSet::new(),
+        memo: HashMap::default(),
+        in_progress: HashSet::default(),
     }
     .range(value, 0)
 }

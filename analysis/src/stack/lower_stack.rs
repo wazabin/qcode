@@ -17,8 +17,9 @@
 //! [`stack_delta`](qcode::value::function::FunctionSignature::stack_delta): once
 //! lowered, that signal is gone.
 
+use rustc_hash::FxHashMap as HashMap;
 use std::borrow::Cow;
-use std::collections::{BTreeSet, HashMap};
+use std::collections::BTreeSet;
 
 use qcode::{
     builder::Builder,
@@ -76,7 +77,7 @@ pub fn lower_stack(ctx: &mut Context, function_id: FunctionId, stack_ptr: Varnod
     // signed offset from `STACK_BASE`. Key off the real `ValueId` rather than a
     // reconstructed one: brighten's `@stack_base` literal is *uninterned* (created
     // via `push_literal`), so equal-valued literals can have distinct ids.
-    let mut lit_offsets: HashMap<ValueId, i64> = HashMap::new();
+    let mut lit_offsets: HashMap<ValueId, i64> = HashMap::default();
     for &iid in &insns {
         for arg in ctx.get_insn(iid).mnemonic().args() {
             if let ValueId::Literal(lid) = arg
@@ -101,7 +102,7 @@ pub fn lower_stack(ctx: &mut Context, function_id: FunctionId, stack_ptr: Varnod
     // 0, otherwise `incoming ± |offset|` materialised once at the root-block start
     // so it dominates every use.
     let offsets: BTreeSet<i64> = lit_offsets.values().copied().collect();
-    let mut offset_repl: HashMap<i64, ValueId> = HashMap::new();
+    let mut offset_repl: HashMap<i64, ValueId> = HashMap::default();
     {
         let mut builder = Builder::from_block(BasicBlock::from_id_mut(ctx, root));
         builder.set_insert_point_to_start();

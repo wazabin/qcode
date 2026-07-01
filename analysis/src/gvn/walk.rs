@@ -7,7 +7,7 @@
 //! own the block iteration and the dominator-tree state threading, so adding a
 //! new sub-pass never touches the walk or the other sub-passes.
 
-use std::collections::{HashMap, HashSet};
+use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
 
 use jstd::graph::analysis::{DominatorTree, compute_dominators};
 
@@ -54,7 +54,7 @@ pub(super) struct Editor {
 impl Editor {
     fn new() -> Self {
         Editor {
-            redundant: HashSet::new(),
+            redundant: HashSet::default(),
         }
     }
 
@@ -314,7 +314,7 @@ impl<P: SubPasses> Walk<'_, P> {
 
 /// All blocks reachable from `entry` via CFG successor edges (including `entry`).
 fn reachable_from(ctx: &Context, entry: BlockId) -> HashSet<BlockId> {
-    let mut seen = HashSet::from([entry]);
+    let mut seen = HashSet::from_iter([entry]);
     let mut stack = vec![entry];
     while let Some(block) = stack.pop() {
         for (_, succ) in BasicBlock::from_id(ctx, block).successors() {
@@ -361,7 +361,7 @@ pub(super) fn run_dominator_walk<P: SubPasses>(
         .map(|block| block.id)
         .collect();
 
-    let mut seen_count: HashMap<BlockId, u32> = HashMap::new();
+    let mut seen_count: HashMap<BlockId, u32> = HashMap::default();
     for &entry in std::iter::once(&root).chain(&entries) {
         for block in reachable_from(ctx, entry) {
             *seen_count.entry(block).or_default() += 1;

@@ -28,7 +28,7 @@ pub use pass::{
     DynFunctionPass, DynPass, FunctionPass, Pass, PassRegistration, PipelineEnv, RegisteredPass,
 };
 
-use std::collections::HashMap;
+use rustc_hash::FxHashMap as HashMap;
 
 use qcode::{
     assumption::{PassName, Proposition},
@@ -215,8 +215,15 @@ pub fn analyze_and_lift_with_progress<'s>(
     services: PipelineServices<'_>,
     progress: impl FnMut(PipelineProgress),
 ) -> Context<'s> {
-    analyze_with_progress(baseline, cfg, pipeline, services, &HashMap::new(), progress)
-        .expect("a run with no overrides is infallible")
+    analyze_with_progress(
+        baseline,
+        cfg,
+        pipeline,
+        services,
+        &std::collections::HashMap::default(),
+        progress,
+    )
+    .expect("a run with no overrides is infallible")
 }
 
 /// The single analysis driver: discovery + lifting + assumption checkpoint/replay
@@ -238,7 +245,7 @@ pub fn analyze_with_progress<'s>(
     cfg: &ArchConfig,
     pipeline: &Pipeline,
     mut services: PipelineServices<'_>,
-    overrides: &HashMap<Proposition, bool>,
+    overrides: &std::collections::HashMap<Proposition, bool>,
     mut progress: impl FnMut(PipelineProgress),
 ) -> Result<Context<'s>, PipelineError> {
     let lifting = services.lifter.is_some();
@@ -377,7 +384,7 @@ fn run_analysis_fixpoint<'s>(
     baseline: &Context<'s>,
     cfg: &ArchConfig,
     pipeline: &Pipeline,
-    overrides: &HashMap<Proposition, bool>,
+    overrides: &std::collections::HashMap<Proposition, bool>,
     progress: &mut impl FnMut(PipelineProgress),
 ) -> Result<Context<'s>, PipelineError> {
     let env = PipelineEnv::new(baseline, cfg.clone());
@@ -489,7 +496,7 @@ pub fn analyze_with_overrides_with_progress<'s>(
     baseline: &Context<'s>,
     cfg: &ArchConfig,
     pipeline: &Pipeline,
-    overrides: &HashMap<Proposition, bool>,
+    overrides: &std::collections::HashMap<Proposition, bool>,
     progress: impl FnMut(PipelineProgress),
 ) -> Result<Context<'s>, PipelineError> {
     analyze_with_progress(

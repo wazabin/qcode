@@ -14,7 +14,7 @@
 //!    in the caller, storing them in `Call.args`. It also records the locations
 //!    the call may alias/clobber in `Call.clobbers`.
 
-use std::collections::{HashMap, HashSet};
+use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
 
 use qcode::{
     context::Context,
@@ -173,11 +173,11 @@ fn is_register(ctx: &Context, vn: VarnodeId) -> bool {
 /// Upward-exposed register reads (`used`) and register writes (`defined`) of a
 /// single block, computed by a forward scan.
 fn block_reg_flow(ctx: &Context, block: BlockId) -> (HashSet<VarnodeId>, HashSet<VarnodeId>) {
-    let mut used = HashSet::new();
-    let mut defined = HashSet::new();
+    let mut used = HashSet::default();
+    let mut defined = HashSet::default();
     // Registers already written earlier in this block; a later read of one of
     // these is satisfied locally and is not upward-exposed.
-    let mut written: HashSet<VarnodeId> = HashSet::new();
+    let mut written: HashSet<VarnodeId> = HashSet::default();
 
     for insn in BasicBlock::from_id(ctx, block).iter() {
         match insn.mnemonic() {
@@ -236,7 +236,7 @@ pub fn compute_input_regs(ctx: &Context, function_id: FunctionId) -> Vec<Varnode
         .collect();
 
     let mut live_in: HashMap<BlockId, HashSet<VarnodeId>> =
-        blocks.iter().map(|&b| (b, HashSet::new())).collect();
+        blocks.iter().map(|&b| (b, HashSet::default())).collect();
 
     // Predecessor map: a block's live-in feeds its predecessors' live-out, so a
     // change only needs the predecessors recomputed.
@@ -257,7 +257,7 @@ pub fn compute_input_regs(ctx: &Context, function_id: FunctionId) -> Vec<Varnode
     let mut queued: HashSet<BlockId> = blocks.iter().copied().collect();
     while let Some(block) = worklist.pop() {
         queued.remove(&block);
-        let mut live_out: HashSet<VarnodeId> = HashSet::new();
+        let mut live_out: HashSet<VarnodeId> = HashSet::default();
         for &succ in &succs[&block] {
             if let Some(set) = live_in.get(&succ) {
                 live_out.extend(set.iter().copied());

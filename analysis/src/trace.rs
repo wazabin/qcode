@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use rustc_hash::FxHashMap as HashMap;
 
 use qcode::{
     context::Context,
@@ -35,7 +35,7 @@ impl ResolvedPath {
     pub fn from_perfect_trace(ctx: &mut Context, trace: &impl Trace) -> Self {
         let addresses = trace.list_addresses();
         let mut blocks = Vec::new();
-        let mut value_map = HashMap::new();
+        let mut value_map = HashMap::default();
 
         // Iterating over current address + successor to resolve paths
         for window in addresses.windows(2) {

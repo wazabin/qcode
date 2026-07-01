@@ -1,10 +1,8 @@
 //! The central arena for all IR state: [`Context`].
 
-use std::{
-    borrow::Cow,
-    collections::{HashMap, HashSet},
-    fmt::Display,
-};
+use std::{borrow::Cow, fmt::Display};
+
+use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
 
 use crate::{
     assumption::{Certainty, KnownContradiction, PassName, Proposition, Truth, Violation},
@@ -651,7 +649,7 @@ impl<'str> Context<'str> {
             // If this instruction was a terminator instruction in a basic block,
             // remove cfg edges
             if Instruction::from_id(self, id).mnemonic().is_terminator() {
-                let mut edges_to_remove = HashSet::new();
+                let mut edges_to_remove = HashSet::default();
                 for edge in BasicBlock::from_id(self, block_id).successors() {
                     edges_to_remove.insert(edge.0);
                 }
@@ -669,7 +667,7 @@ impl<'str> Context<'str> {
         }
         self.values.instructions[id].name = None;
 
-        self.values.remove_instructions(&HashSet::from([id]));
+        self.values.remove_instructions(&HashSet::from_iter([id]));
     }
 
     /// Associates `addr` with `id` in the address map.

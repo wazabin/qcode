@@ -5,7 +5,7 @@
 //! dominator are always available to its descendants, so this state flows
 //! freely down the dominator tree.
 
-use std::collections::HashMap;
+use rustc_hash::FxHashMap as HashMap;
 
 use qcode::{
     context::Context,

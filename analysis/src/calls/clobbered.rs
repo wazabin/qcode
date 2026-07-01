@@ -1,4 +1,4 @@
-use std::collections::HashSet;
+use rustc_hash::FxHashSet as HashSet;
 
 use qcode::{
     context::Context,
@@ -11,7 +11,7 @@ use qcode::{
 /// Only direct stores to named register varnodes are counted; stores through
 /// computed pointers or into other address spaces are ignored.
 pub fn compute_clobbered_regs(ctx: &Context, function_id: FunctionId) -> Vec<VarnodeId> {
-    let mut seen: HashSet<VarnodeId> = HashSet::new();
+    let mut seen: HashSet<VarnodeId> = HashSet::default();
     let mut result: Vec<VarnodeId> = Vec::new();
 
     for block in Function::from_id(ctx, function_id).iter() {

@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use rustc_hash::FxHashMap as HashMap;
 
 use qcode::{
     context::Context,
@@ -147,7 +147,7 @@ mod tests {
         space_b.ty = SpaceType::Register;
         let sb = ctx.add_space(space_b);
 
-        let value_to_interval = HashMap::from([
+        let value_to_interval = HashMap::from_iter([
             (value(0), (sa, 0, 8)),
             (value(1), (sa, 0, 4)),
             (value(2), (sa, 4, 8)),
@@ -155,7 +155,7 @@ mod tests {
             (value(4), (sb, 0, 8)),
         ]);
         AliasResult {
-            value_to_root: HashMap::new(),
+            value_to_root: HashMap::default(),
             value_to_interval,
         }
     }

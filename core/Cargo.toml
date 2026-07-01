@@ -17,6 +17,7 @@ pest.workspace = true
 qcode_macro.workspace = true
 serde.workspace = true
 log.workspace = true
+rustc-hash.workspace = true
 
 [dev-dependencies]
 bincode.workspace = true

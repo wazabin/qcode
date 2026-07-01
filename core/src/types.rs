@@ -18,7 +18,7 @@
 //!   verify pass is implemented, so that `Bool + Bool` can be rejected.
 //! - Pointer types for RAM/register spaces.
 
-use std::collections::HashMap;
+use rustc_hash::FxHashMap as HashMap;
 
 use crate::{
     space::SpaceId,
@@ -250,9 +250,9 @@ impl TypeManager {
     pub fn new() -> Self {
         Self {
             types: Vec::new(),
-            int_by_size: HashMap::new(),
+            int_by_size: HashMap::default(),
             stack_address: None,
-            space_address: HashMap::new(),
+            space_address: HashMap::default(),
         }
     }
 

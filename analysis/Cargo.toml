@@ -15,6 +15,7 @@ toml.workspace = true
 cpp_demangle.workspace = true
 inventory.workspace = true
 log.workspace = true
+rustc-hash.workspace = true
 
 [dev-dependencies]
 qcode = { workspace = true, features = ["testing"] }

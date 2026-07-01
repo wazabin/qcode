@@ -30,7 +30,9 @@
 //! the parser to resolve identifiers within a single block. Names in the
 //! namespace do not need to match the IR-level name hints stored on values.
 
-use std::{borrow::Cow, cmp, collections::HashMap};
+use std::{borrow::Cow, cmp};
+
+use rustc_hash::FxHashMap as HashMap;
 
 use crate::{
     context::Context,
@@ -103,8 +105,8 @@ impl<'str, 'ctx> Builder<'str, 'ctx> {
             is_terminated: block.is_terminated(),
             verify_terminated: true,
             block,
-            namespace: HashMap::new(),
-            local_labels: HashMap::new(),
+            namespace: HashMap::default(),
+            local_labels: HashMap::default(),
             address: None,
             insert_point: None,
         }

@@ -20,7 +20,7 @@
 //! the dominator walk in [`super::walk`], so forwarding works across blocks; the pruning
 //! methods drop entries a call clobbers or a loop back-edge invalidates.
 
-use std::collections::HashMap;
+use rustc_hash::FxHashMap as HashMap;
 
 use jstd::graph::analysis::DominatorTree;
 
@@ -480,8 +480,8 @@ mod tests {
     /// byte map directly — seed the intervals by hand. Same equivalence class
     /// per address so overlapping sub-registers may-alias as in production.
     fn manual_aliases(tc: &TestContext, vns: &[VarnodeId]) -> AliasResult {
-        let mut value_to_interval = HashMap::new();
-        let mut value_to_root = HashMap::new();
+        let mut value_to_interval = HashMap::default();
+        let mut value_to_root = HashMap::default();
         for &vn in vns {
             let v = Varnode::from_id(&tc.ctx, vn);
             let start = v.address() as u64;

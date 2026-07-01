@@ -1,4 +1,4 @@
-use std::collections::HashSet;
+use rustc_hash::FxHashSet as HashSet;
 
 use qcode::{
     context::Context,
@@ -11,7 +11,7 @@ fn has_side_effects(mnemonic: &Mnemonic) -> bool {
 
 /// Returns instructions in `block_id` that are pure and have no users.
 pub fn dead_insns(ctx: &Context, block_id: BlockId) -> HashSet<InstructionId> {
-    let mut dead = HashSet::new();
+    let mut dead = HashSet::default();
     let insn_ids: Vec<InstructionId> = BasicBlock::from_id(ctx, block_id)
         .instruction_ids()
         .to_vec();

@@ -19,7 +19,7 @@
 //! sound for loops — `killed_out` is under-approximated (fewer guaranteed
 //! kills) and `live_out` over-approximated.
 
-use std::collections::{HashMap, HashSet};
+use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
 
 use qcode::{
     context::Context,
@@ -56,7 +56,7 @@ fn successors(ctx: &Context, block: BlockId) -> Vec<BlockId> {
 
 /// `live_out(B) = ⋃ live_in(successor)`.
 fn union_live(succs: &[BlockId], live_in: &HashMap<BlockId, LiveSet>) -> LiveSet {
-    let mut acc: HashSet<LiveLoc> = HashSet::new();
+    let mut acc: HashSet<LiveLoc> = HashSet::default();
     for &succ in succs {
         if let Some(set) = live_in.get(&succ) {
             acc.extend(set.iter().copied());
@@ -166,8 +166,8 @@ pub fn compute_memory_liveness(
         }
     }
 
-    let mut live_out = HashMap::new();
-    let mut killed_out = HashMap::new();
+    let mut live_out = HashMap::default();
+    let mut killed_out = HashMap::default();
     for &block in &blocks {
         let succs = successors(ctx, block);
         live_out.insert(block, union_live(&succs, &live_in));
@@ -187,7 +187,7 @@ mod tests {
     use crate::dce::dead_load::dead_load_insns_seeded;
     use qcode::value::insn::{InstructionId, Mnemonic};
     use qcode_macro::qcode;
-    use std::collections::HashSet;
+    use rustc_hash::FxHashSet as HashSet;
 
     /// Store instruction ids in `block`, in program order.
     fn store_ids(ctx: &Context, block: BlockId) -> Vec<InstructionId> {

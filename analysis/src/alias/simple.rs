@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use rustc_hash::FxHashMap as HashMap;
 
 use qcode::{
     context::Context,
@@ -305,10 +305,10 @@ impl AliasResult {
     fn from_pointer_uses(ctx: &Context, pointer_uses: Vec<(ValueId, SpaceId, usize)>) -> Self {
         let mut a = Analysis {
             ctx,
-            value_to_root: HashMap::new(),
-            by_space: HashMap::new(),
-            literal_ranges: HashMap::new(),
-            value_to_interval: HashMap::new(),
+            value_to_root: HashMap::default(),
+            by_space: HashMap::default(),
+            literal_ranges: HashMap::default(),
+            value_to_interval: HashMap::default(),
             uf: UnionFind::new(),
         };
 
@@ -360,7 +360,7 @@ impl AliasResult {
         // single function) against the varnode equivalence classes above.
         // pointer_spaces guards the invariant that a given pointer value always
         // refers to the same address space across all uses.
-        let mut pointer_spaces: HashMap<ValueId, SpaceId> = HashMap::new();
+        let mut pointer_spaces: HashMap<ValueId, SpaceId> = HashMap::default();
 
         for (ptr, space, size) in pointer_uses {
             if let Some(existing_space) = pointer_spaces.insert(ptr, space) {

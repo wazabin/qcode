@@ -25,7 +25,8 @@
 //! edge of every may-return call, so both a switch's case bodies and a call's
 //! continuation are reachable from — and thus claimed by — their owning function.
 
-use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
+use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
+use std::collections::{BTreeSet, VecDeque};
 
 use qcode::{
     context::Context,
@@ -92,7 +93,7 @@ fn claimed_from(
     owner: FunctionId,
     entry_of: &HashMap<BlockId, FunctionId>,
 ) -> HashSet<BlockId> {
-    let mut seen = HashSet::new();
+    let mut seen = HashSet::default();
     seen.insert(entry);
     let mut queue = VecDeque::from([entry]);
     while let Some(b) = queue.pop_front() {
@@ -118,7 +119,7 @@ fn promote_shared_blocks(ctx: &mut Context) -> bool {
     let entry_of: HashMap<BlockId, FunctionId> = entries.iter().copied().collect();
 
     // First reaching function wins the block; a second reach marks it contested.
-    let mut owner_of: HashMap<BlockId, FunctionId> = HashMap::new();
+    let mut owner_of: HashMap<BlockId, FunctionId> = HashMap::default();
     let mut contested: Vec<BlockId> = Vec::new();
     for &(entry, func) in &entries {
         for b in claimed_from(ctx, entry, func, &entry_of) {
@@ -150,7 +151,7 @@ fn reattribute_blocks(ctx: &mut Context) -> bool {
     let entries = function_entries(ctx, &block_at);
     let entry_of: HashMap<BlockId, FunctionId> = entries.iter().copied().collect();
 
-    let mut new_owner: HashMap<BlockId, FunctionId> = HashMap::new();
+    let mut new_owner: HashMap<BlockId, FunctionId> = HashMap::default();
     for &(entry, func) in &entries {
         for b in claimed_from(ctx, entry, func, &entry_of) {
             // A block reachable from several entries is shared; `promote_shared_blocks`
@@ -163,7 +164,7 @@ fn reattribute_blocks(ctx: &mut Context) -> bool {
     // function; an unreached block keeps whatever owner it already had (orphans
     // from earlier lifting are left alone, not silently dropped).
     let mut changed = false;
-    let mut owners_changed: HashSet<FunctionId> = HashSet::new();
+    let mut owners_changed: HashSet<FunctionId> = HashSet::default();
     for id in ctx.block_ids() {
         let cur = ctx.values.basic_blocks[id].parent;
         let Some(desired) = new_owner.get(&id).copied().or(cur) else {
