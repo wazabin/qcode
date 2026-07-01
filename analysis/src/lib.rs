@@ -19,7 +19,9 @@ pub use calls::{
 pub mod cfg;
 
 pub mod structure;
-pub use structure::{BlockExit, EdgeCondition, block_exit};
+pub use structure::{
+    BlockExit, EdgeCondition, Program, block_exit, emit_c, lower_expr, lower_function,
+};
 
 pub mod naming;
 

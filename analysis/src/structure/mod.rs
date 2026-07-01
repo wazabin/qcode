@@ -13,6 +13,16 @@
 //! [`EdgeData`]: qcode::value::block
 //! [`CBranch`]: qcode::value::insn::CBranch
 
+pub mod ast;
+pub mod cast;
 mod condition;
+mod emit;
+mod lower;
+mod lower_expr;
 
+pub use ast::{Program, Stmt};
+pub use cast::{BinOp, Expr, UnOp};
 pub use condition::{BlockExit, EdgeCondition, block_exit};
+pub use emit::emit_c;
+pub use lower::lower_function;
+pub use lower_expr::lower_expr;
