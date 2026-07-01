@@ -20,8 +20,8 @@ pub mod cfg;
 
 pub mod structure;
 pub use structure::{
-    BlockExit, EdgeCondition, Program, RefineLoops, Structure, TokenKind, TokenLine, block_exit,
-    decompile_function, emit_c, emit_tokens, lower_expr, lower_function,
+    BlockExit, EdgeCondition, Program, RecoverSwitch, RefineLoops, Structure, TokenKind, TokenLine,
+    block_exit, decompile_function, emit_c, emit_tokens, lower_expr, lower_function,
 };
 
 pub mod naming;

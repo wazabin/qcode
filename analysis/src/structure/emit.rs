@@ -60,6 +60,12 @@ fn collect_raws(stmts: &[Stmt], out: &mut Vec<InstructionId>) {
             Stmt::While { body, .. } | Stmt::DoWhile { body, .. } | Stmt::Loop { body } => {
                 collect_raws(body, out);
             }
+            Stmt::Switch { cases, default, .. } => {
+                for case in cases {
+                    collect_raws(&case.body, out);
+                }
+                collect_raws(default, out);
+            }
             _ => {}
         }
     }
@@ -229,6 +235,53 @@ fn emit_stmt(
             buf.keyword("continue");
             buf.punct(";");
             out.push(buf.into_line(indent, None));
+        }
+        Stmt::Switch {
+            scrutinee,
+            cases,
+            default,
+        } => {
+            // Rust-style `match`: no fallthrough (so no `break`), fat-arrow arms,
+            // `|`-joined labels, and a `_` catch-all.
+            let mut head = LineBuf::default();
+            head.keyword("match");
+            head.space();
+            scrutinee.write_tokens(&mut head);
+            head.space();
+            head.punct("{");
+            out.push(head.into_line(indent, None));
+
+            for case in cases {
+                let mut arm = LineBuf::default();
+                for (i, &v) in case.values.iter().enumerate() {
+                    if i > 0 {
+                        arm.space();
+                        arm.punct("|");
+                        arm.space();
+                    }
+                    arm.push(format!("0x{v:x}"), TokenKind::Number);
+                }
+                arm.space();
+                arm.punct("=>");
+                arm.space();
+                arm.punct("{");
+                out.push(arm.into_line(indent + 1, None));
+                emit_stmts(ctx, program, &case.body, indent + 2, roots, out);
+                out.push(brace_line("}", indent + 1));
+            }
+
+            // `match` must be exhaustive, so emit the catch-all even when empty.
+            let mut arm = LineBuf::default();
+            arm.push("_", TokenKind::Keyword);
+            arm.space();
+            arm.punct("=>");
+            arm.space();
+            arm.punct("{");
+            out.push(arm.into_line(indent + 1, None));
+            emit_stmts(ctx, program, default, indent + 2, roots, out);
+            out.push(brace_line("}", indent + 1));
+
+            out.push(brace_line("}", indent));
         }
     }
 }

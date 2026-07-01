@@ -33,8 +33,9 @@ use super::{
 };
 
 /// The default decompilation pass pipeline, in run order: structure the CFG into
-/// an AST, then refine its loops. SAILR deopt passes slot in here as they land.
-const DECOMPILE_PIPELINE: &[&str] = &["structure", "refine_loops"];
+/// an AST, refine its loops, then recover switches. SAILR deopt passes slot in
+/// here as they land.
+const DECOMPILE_PIPELINE: &[&str] = &["structure", "refine_loops", "recover_switch"];
 
 /// Decompiles `function_id` to a high-level [`Program`] by running the
 /// decompilation pass pipeline over it. Each pass reads the (immutable) qcode IR

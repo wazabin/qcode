@@ -128,10 +128,11 @@ fn without_trailing_continue(mut stmts: Vec<Stmt>) -> Vec<Stmt> {
     stmts
 }
 
-/// Whether a statement is a pure, single-use value that only feeds the loop
-/// condition — so it folds into the condition expression and may be dropped when
-/// the loop is rewritten to a pre-tested `while`.
-fn is_condition_only(ctx: &Context, stmt: &Stmt) -> bool {
+/// Whether a statement is a pure, single-use value that only feeds a control-flow
+/// condition — so it folds into the condition expression and is emitted nowhere
+/// else. Such statements are structurally present but invisible in the output,
+/// so pattern matchers (loop refinement, switch recovery) skip past them.
+pub(crate) fn is_condition_only(ctx: &Context, stmt: &Stmt) -> bool {
     match stmt {
         Stmt::Raw(id) => {
             let insn = Instruction::from_id(ctx, *id);

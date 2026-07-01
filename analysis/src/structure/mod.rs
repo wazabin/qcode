@@ -19,6 +19,7 @@ mod lower;
 mod lower_expr;
 mod refine;
 mod structuring;
+mod switch;
 pub mod tokens;
 
 pub use ast::{Program, Stmt};
@@ -29,4 +30,5 @@ pub use lower::lower_function;
 pub use lower_expr::lower_expr;
 pub use refine::RefineLoops;
 pub use structuring::{Structure, decompile_function};
+pub use switch::RecoverSwitch;
 pub use tokens::{Token, TokenKind, TokenLine};

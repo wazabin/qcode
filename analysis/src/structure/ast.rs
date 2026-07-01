@@ -46,6 +46,21 @@ pub enum Stmt {
     Break,
     /// `continue;` — jumps to the next iteration of the innermost enclosing loop.
     Continue,
+    /// A `switch (scrutinee) { … }` recovered from an equality cascade. `default`
+    /// is empty when the cascade has no fallthrough default arm.
+    Switch {
+        scrutinee: Expr,
+        cases: Vec<SwitchCase>,
+        default: Vec<Stmt>,
+    },
+}
+
+/// One arm of a [`Stmt::Switch`]: the constant labels that select it (more than
+/// one for fallthrough cases, e.g. `case 1: case 2:`) and the body they run.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SwitchCase {
+    pub values: Vec<u64>,
+    pub body: Vec<Stmt>,
 }
 
 /// Counts the `goto` statements (conditional and unconditional) in a statement
@@ -59,6 +74,9 @@ pub fn count_gotos(stmts: &[Stmt]) -> usize {
             // `break`/`continue` are structured control flow, not gotos.
             Stmt::While { body, .. } | Stmt::DoWhile { body, .. } | Stmt::Loop { body } => {
                 count_gotos(body)
+            }
+            Stmt::Switch { cases, default, .. } => {
+                cases.iter().map(|c| count_gotos(&c.body)).sum::<usize>() + count_gotos(default)
             }
             Stmt::Label(_) | Stmt::Raw(_) | Stmt::Break | Stmt::Continue => 0,
         })
