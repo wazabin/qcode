@@ -201,6 +201,19 @@ fn reattribute_blocks(ctx: &mut Context) -> bool {
             ctx.values.functions[func].root = Some(entry);
         }
     }
+    // A function that only *lost* blocks (a `prev` owner) is in `owners_changed`
+    // but may be absent from `entries` (it kept no block at its own address), so
+    // the re-root above skips it. If its recorded `root` was one of the blocks
+    // just reassigned away, it now points outside the rebuilt block set — an
+    // invariant every consumer relies on (e.g. `compute_input_regs` indexes
+    // `live_in[root]`). Drop such an orphaned root so the function reads as a
+    // rootless stub instead of crashing analysis.
+    for &func in &owners_changed {
+        let f = &mut ctx.values.functions[func];
+        if f.root.is_some_and(|r| !f.blocks.contains(&r)) {
+            f.root = None;
+        }
+    }
     for func in owners_changed {
         recompute_instruction_addrs(ctx, func);
     }

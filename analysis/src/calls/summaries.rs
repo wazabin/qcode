@@ -280,7 +280,16 @@ pub fn compute_input_regs(ctx: &Context, function_id: FunctionId) -> Vec<Varnode
         }
     }
 
-    let mut inputs: HashSet<VarnodeId> = live_in[&root].iter().copied().collect();
+    // `root` should be one of the function's own blocks, but a boundary-splitting
+    // reattribution can leave a stub function's root pointing outside its block
+    // set. Fall back to an empty live-in rather than panicking; the param sweep
+    // below still recovers the mem2reg-promoted argument registers.
+    let mut inputs: HashSet<VarnodeId> = live_in
+        .get(&root)
+        .into_iter()
+        .flatten()
+        .copied()
+        .collect();
 
     // mem2reg promotes load-before-store registers (the classic argument
     // registers) into root block params named after the register, removing the
@@ -611,6 +620,25 @@ mod tests {
             b.push_load::<false>(ValueId::Varnode(r0), 8, reg);
         });
         assert_eq!(compute_input_regs(&tc.ctx, fun), vec![r0]);
+    }
+
+    #[test]
+    fn compute_input_regs_tolerates_root_outside_block_set() {
+        // A boundary-splitting reattribution can leave a stub function whose
+        // `root` points at a block reassigned away — no longer in its block set.
+        // compute_input_regs must degrade to best-effort, not panic (regression
+        // for the whole-binary "no entry found for key" crash on /usr/bin/less).
+        let mut tc = TestContext::new();
+        let r0 = tc.r0;
+        let reg = tc.reg_space;
+        let fun = build_fn(&mut tc, "stub", 0x1000, |b| {
+            b.push_load::<false>(ValueId::Varnode(r0), 8, reg);
+        });
+        let root = tc.ctx.values.functions[fun].root.unwrap();
+        // Orphan the root, as the splitter used to leave it.
+        tc.ctx.values.functions[fun].blocks.remove(&root);
+        // Best-effort, and specifically no panic.
+        let _ = compute_input_regs(&tc.ctx, fun);
     }
 
     #[test]
