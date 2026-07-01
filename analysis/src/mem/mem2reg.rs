@@ -1,8 +1,8 @@
 use jstd::graph::analysis::compute_dominators;
 use qcode::space::SpaceType;
 use qcode::value::{
-    BasicBlock, BlockId, BlockParamId, Function, FunctionId, Instruction, Value, ValueId, ValueRef,
-    Varnode, VarnodeId,
+    BasicBlock, BlockId, BlockParam, BlockParamId, Function, FunctionId, Instruction, Value,
+    ValueId, ValueRef, Varnode, VarnodeId,
     insn::{Branch, CBranch, InstructionId, InstructionRef, Load, Mnemonic, Range, Store, Zext},
 };
 use qcode::{
@@ -885,6 +885,15 @@ impl Mem2Reg<'_, '_> {
             if let Some(id) = store_insn {
                 state.consumed_stores.insert(id);
             }
+            // The block param has the var's width, but a reaching definition may be
+            // narrower or wider (a literal stored through a wider access — the
+            // `MOV EAX, imm32` zero-extend-into-RAX idiom — or a truncating store).
+            // Branch args bind to params without resizing, so the edge value must
+            // already match the param width. Resize before the branch, mirroring
+            // the load-forwarding path. A no-op when widths match.
+            let param_size = BlockParam::from_id(self.ctx, param_id).size();
+            let val =
+                self.resize_forwarded_load_value(edge.source_block, edge.branch_insn, val, param_size);
             if let Some(slot) = slots.get_mut(index) {
                 *slot = Some(val);
             }
