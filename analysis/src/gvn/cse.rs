@@ -66,6 +66,16 @@ impl SubPass for Cse {
         state.record_form(ic.id, form.clone());
         let key = key_for(&form, ic.id, ic.mnemonic);
 
+        // An instruction's own operands provably dominate it, so any composite
+        // arithmetic view they carry is a dominance-safe leader for this use — even
+        // on a `is_shared` block, where inherited leaders were dropped. Seeding them
+        // lets `materialize` rebuild against the existing operand instead of emitting
+        // a fresh duplicate. Without this, a loop-invariant value LICM hoisted into a
+        // (shared) preheader cannot be reused in the loop body: GVN re-materializes
+        // it locally, DCE deletes the hoist, and LICM re-hoists forever. Operands
+        // dominate every block this one dominates, so the seed stays valid downtree.
+        state.seed_operand_leaders(ic.mnemonic.args());
+
         // A dominating value already computes this form: forward to it.
         if let Some(leader) = state.lookup(&key) {
             if leader != ic.id {
@@ -116,7 +126,12 @@ pub(super) fn value_id_key(v: ValueId) -> (u8, usize) {
         ValueId::BasicBlock(x) => (3, x.into()),
         ValueId::Function(x) => (4, x.into()),
         ValueId::BlockParam(x) => (5, x.into()),
-        _ => todo!("unsupported value id type in value_id_key: {:?}", v),
+        // A `Bytes` blob (a constant too wide for a `Literal`) can appear as a
+        // commutative operand; give it a stable rank so canonicalization is total.
+        ValueId::Bytes(x) => (6, x.into()),
+        // `ValueId` is `#[non_exhaustive]`; keep any future variant last but stable
+        // rather than panicking mid-analysis.
+        _ => (u8::MAX, 0),
     }
 }
 

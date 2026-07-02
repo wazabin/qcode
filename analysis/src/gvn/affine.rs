@@ -616,6 +616,25 @@ impl Numbering {
         self.forms.insert(id, form);
     }
 
+    /// Register each of `operands`' recorded composite arithmetic views as a leader
+    /// for its form (keeping any existing leader). An operand provably dominates the
+    /// instruction it feeds — and therefore every block that instruction dominates —
+    /// so this is a dominance-safe leader even on an `is_shared` block whose
+    /// inherited leaders were dropped. It lets a later `materialize` rebuild against
+    /// the existing operand rather than emit a duplicate. Trivial self-leaves (`1·id`,
+    /// bare constants, unit relabelings) are skipped: `materialize` resolves those
+    /// directly and never consults the leader table for them.
+    pub(super) fn seed_operand_leaders(&mut self, operands: impl IntoIterator<Item = ValueId>) {
+        for op in operands {
+            if let Some(form) = self.forms.get(&op)
+                && !is_self_leaf(form, op)
+                && !matches!(form, NormalForm::Opaque(_))
+            {
+                self.leaders.entry(form.clone()).or_insert(op);
+            }
+        }
+    }
+
     /// The stored arithmetic view of `v` (`Affine`/`Mask`), if any. Used by the
     /// structural congruence engine to flatten affine subtrees.
     pub(super) fn lookup_form(&self, v: ValueId) -> Option<&NormalForm> {
