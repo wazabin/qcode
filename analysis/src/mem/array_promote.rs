@@ -59,6 +59,7 @@ use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
 use qcode::{
     builder::Builder,
     context::Context,
+    space::{Space, SpaceId, SpaceType},
     value::{
         BasicBlock, BlockId, Function, FunctionId, ValueId, ValueRef,
         insn::{Branch, CBranch, InstructionId, Mnemonic},
@@ -73,27 +74,62 @@ use crate::{FunctionPass, PipelineEnv};
 pub struct ArrayPromote;
 
 /// A recognized in-place array-fill loop.
+///
+/// Two loop shapes are recognized. In the *split* shape the loop body ends in a
+/// `goto header` and a distinct header block holds the guard `cbranch`; in the
+/// *rotated* (do-while) shape the body is its own header — it ends in the guard
+/// `cbranch` with one edge back to itself. In the rotated shape `header == body`.
+///
+/// The carried per-element recurrence reaches the body one of two ways. Either
+/// it is *memory-carried* — a strided lane load re-reads a previously written
+/// element (`mt[j-1]`), the clean `mem2reg`-hasn't-forwarded-it shape — or it is
+/// *register-carried*: a loop block param (`@EBX`) already holds the previous
+/// element and the memory reload is gone (what the real pipeline produces once
+/// `mem2reg`/argpromote have threaded the reload through a register). Either way
+/// the carry becomes `at(arr, index-1)`; in the register-carried case the
+/// accumulator param's uses are rewritten to that `at` and the now-dead param is
+/// left for `dce`.
 struct PromoteMatch {
     preheader: BlockId,
     header: BlockId,
     body: BlockId,
     exit: BlockId,
+    /// `header == body` (single-block do-while loop).
+    rotated: bool,
     /// Loop-invariant root pointer param the region is based at.
     base_root: ValueId,
+    /// Region origin word offset from `base_root`: element 0 sits at
+    /// `base_root + origin_word * elem_size`. All element positions below are
+    /// relative to this origin (so element 0 is the seed regardless of a nonzero
+    /// pointer bias in the lifted addresses).
+    origin_word: i64,
     /// Body induction parameter (the lane index in the store/load addresses).
     index: ValueId,
     elem_size: usize,
     count: usize,
-    /// Pre-loop lane-0 seed store and the value it writes.
+    /// Pre-loop element-0 seed store and the value it writes.
     seed_id: InstructionId,
     seed_val: ValueId,
-    /// The one strided lane store: `arr[index + store_delta] = stored_val`.
+    /// The RAM space the region lives in — all region accesses (seed, lane
+    /// store/load, exit loads) share it, and the exit-store writes it back. Its
+    /// word size is 1 (byte-addressed), so lane arithmetic in bytes is exact.
+    region_space: SpaceId,
+    /// The one strided lane store, writing element `index + store_delta`.
     lane_store_id: InstructionId,
     stored_val: ValueId,
     store_delta: i64,
-    /// The one strided lane load: `at(arr, index + load_delta)`.
-    lane_load_id: InstructionId,
+    /// The carry value to rewrite into `at(arr, index + load_delta)`: either the
+    /// memory-carried lane-load result or the register accumulator param.
+    carry_replace: ValueId,
+    /// `Some(load)` when the carry is a memory lane load (also removed).
+    carry_remove: Option<InstructionId>,
     load_delta: i64,
+    /// Additional const-offset region loads in the exit block, each rewritten to
+    /// `at(arr_exit, element)`. Pairs of `(load insn, element index)`.
+    extra_loads: Vec<(InstructionId, i64)>,
+    /// Dead pre-loop stores to element 0 (overwritten by the seed store), removed
+    /// with the rest of the promoted traffic.
+    dead_stores: Vec<InstructionId>,
 }
 
 /// Minimal union-find over `ValueId` for pass-through phi resolution.
@@ -201,6 +237,69 @@ fn is_increment(ctx: &Context, v: ValueId, idx: ValueId) -> bool {
         && ((*lhs == idx && lit(*rhs)) || (*rhs == idx && lit(*lhs)))
 }
 
+/// The arguments `from` passes to `to` on their connecting edge (the first edge
+/// to `to`, so it is unambiguous only when `from` has a single edge to `to` —
+/// which is the case for every loop edge here).
+fn edge_args(ctx: &Context, from: BlockId, to: BlockId) -> Vec<ValueId> {
+    let Some(term) = BasicBlock::from_id(ctx, from).iter().last() else {
+        return Vec::new();
+    };
+    match term.mnemonic() {
+        Mnemonic::Branch(b) if b.target == to => b.args.clone(),
+        Mnemonic::CBranch(cb) => {
+            if cb.success_block == to {
+                cb.success_args.clone()
+            } else if cb.failure_block == to {
+                cb.failure_args.clone()
+            } else {
+                Vec::new()
+            }
+        }
+        _ => Vec::new(),
+    }
+}
+
+/// Values feeding block-param `p` of `block` from every predecessor edge.
+fn param_incomings(ctx: &Context, block: BlockId, p: ValueId) -> Vec<ValueId> {
+    let Some(k) = BasicBlock::from_id(ctx, block)
+        .params()
+        .position(|q| q.id() == p)
+    else {
+        return Vec::new();
+    };
+    header_incoming(ctx, block, k)
+}
+
+/// Trip bound `N` for a rotated (do-while) loop whose guard compares the
+/// *incremented* index `inc` (`= index + 1`) to a constant `N`, so the last body
+/// index is `N-1`. Accepts only the canonical do-while polarities: `inc < N`
+/// (unsigned/signed) continuing on true, or `inc == N` exiting on true. Keying on
+/// `inc` (never the pre-increment `index`) keeps the meaning unambiguous: in a
+/// do-while the body has already run at `index` before the guard, so a guard on
+/// `index` would tile a different range.
+fn rotated_bound(ctx: &Context, cond: ValueId, inc: ValueId, exit_on_true: bool) -> Option<i64> {
+    use qcode::value::insn::{Binary, Binop, IntBinop};
+    let ValueId::Instruction(id) = cond else {
+        return None;
+    };
+    let Mnemonic::Binop(Binary { lhs, rhs, op }) = ctx.get_insn(id).mnemonic() else {
+        return None;
+    };
+    let konst = if *lhs == inc {
+        *rhs
+    } else if *rhs == inc {
+        *lhs
+    } else {
+        return None;
+    };
+    let ok = match op {
+        Binop::Int(IntBinop::Equal) => exit_on_true,
+        Binop::Int(IntBinop::Less | IntBinop::SLess) => !exit_on_true && *lhs == inc,
+        _ => false,
+    };
+    ok.then(|| literal(ctx, konst).map(|k| k as i64)).flatten()
+}
+
 /// Union-find over all block params ↔ their incoming values, resolved into a pure
 /// `value → root-pointer-param` map. A value maps to root `R` iff its pass-through
 /// phi class contains exactly one root param `R` (ambiguous classes are omitted).
@@ -253,8 +352,6 @@ fn base_roots(ctx: &mut Context, fid: FunctionId) -> HashMap<ValueId, ValueId> {
 
 /// Recognize the in-place array-fill loop in `fid`.
 fn try_match(ctx: &mut Context, fid: FunctionId) -> Option<PromoteMatch> {
-    let ram = ctx.default_space;
-
     // Reject anything with a call: another routine could observe/mutate the region.
     for block in Function::from_id(ctx, fid).iter() {
         for insn in block.iter() {
@@ -267,31 +364,38 @@ fn try_match(ctx: &mut Context, fid: FunctionId) -> Option<PromoteMatch> {
         }
     }
 
-    // Collect every RAM access.
+    // Collect every RAM access, recording the space each lives in. Accesses in
+    // different spaces never alias, so the region's space (fixed below by the lane
+    // store) partitions these: same-space accesses touch the region, others are
+    // trivially disjoint.
     struct Acc {
         id: InstructionId,
         block: BlockId,
         ptr: ValueId,
         size: usize,
+        space: SpaceId,
         stored: Option<ValueId>,
     }
+    let is_ram = |ctx: &Context, sp: SpaceId| matches!(Space::from_id(ctx, sp).ty, SpaceType::Ram);
     let mut accesses: Vec<Acc> = Vec::new();
     for block in Function::from_id(ctx, fid).iter() {
         let bid = block.id;
         for insn in block.iter() {
             match insn.mnemonic() {
-                Mnemonic::Load(l) if l.space == ram => accesses.push(Acc {
+                Mnemonic::Load(l) if is_ram(ctx, l.space) => accesses.push(Acc {
                     id: insn.id,
                     block: bid,
                     ptr: l.ptr,
                     size: l.size,
+                    space: l.space,
                     stored: None,
                 }),
-                Mnemonic::Store(s) if s.space == ram => accesses.push(Acc {
+                Mnemonic::Store(s) if is_ram(ctx, s.space) => accesses.push(Acc {
                     id: insn.id,
                     block: bid,
                     ptr: s.ptr,
                     size: s.size,
+                    space: s.space,
                     stored: Some(s.src),
                 }),
                 _ => {}
@@ -303,16 +407,19 @@ fn try_match(ctx: &mut Context, fid: FunctionId) -> Option<PromoteMatch> {
     let val_root = base_roots(ctx, fid);
     let root_of = |v: ValueId| -> Option<ValueId> { val_root.get(&v).copied() };
 
-    // The single strided lane store establishes (base_root, elem_size, index).
-    let mut lane: Option<(
-        InstructionId,
-        ValueId,
-        ValueId,
-        ValueId,
-        i64,
-        BlockId,
-        usize,
-    )> = None;
+    // The single strided lane store establishes (base_root, elem_size, index) and
+    // the region's space.
+    struct Lane {
+        store_id: InstructionId,
+        base_root: ValueId,
+        index: ValueId,
+        stored_val: ValueId,
+        c_lane: i64,
+        body: BlockId,
+        esz: usize,
+        space: SpaceId,
+    }
+    let mut lane: Option<Lane> = None;
     for a in &accesses {
         let Some(src) = a.stored else { continue };
         let Some((base, idx, c)) = affine_strided_lane(&numbering, a.ptr, a.size) else {
@@ -325,19 +432,50 @@ fn try_match(ctx: &mut Context, fid: FunctionId) -> Option<PromoteMatch> {
         if lane.is_some() {
             return None; // more than one strided store — not the canonical shape
         }
-        lane = Some((a.id, r, idx, src, c, a.block, a.size));
+        lane = Some(Lane {
+            store_id: a.id,
+            base_root: r,
+            index: idx,
+            stored_val: src,
+            c_lane: c,
+            body: a.block,
+            esz: a.size,
+            space: a.space,
+        });
     }
-    let (lane_store_id, base_root, index, stored_val, c_lane, body, esz) = lane?;
+    let Lane {
+        store_id: lane_store_id,
+        base_root,
+        index,
+        stored_val,
+        c_lane,
+        body,
+        esz,
+        space: region_space,
+    } = lane?;
     if esz == 0 || c_lane % esz as i64 != 0 {
         return None;
     }
-    let store_delta = c_lane / esz as i64;
+    // v1 works in bytes (offset % esz, count * esz, per-lane addresses). A
+    // word-addressed region would miscount lanes, so require a byte-addressed space.
+    if Space::from_id(ctx, region_space).word_size != 1 {
+        return None;
+    }
+    // Only accesses in the region's space can touch it; others are a different
+    // memory and never alias, even when the pointer arithmetic coincides.
+    let in_region = |a: &Acc| a.space == region_space;
+    let store_word = c_lane / esz as i64;
     let is_r = |v: ValueId| root_of(v) == Some(base_root);
 
-    // Seed store: a const-offset store of one element at the region base.
-    let mut seed: Option<(InstructionId, ValueId, i64)> = None;
-    for a in &accesses {
-        if a.id == lane_store_id || a.size != esz {
+    // Pre-loop const-offset region stores. Their word offset defines the region
+    // origin — element 0 lives at the lowest such word, so a nonzero pointer bias
+    // in the lifted addresses (e.g. `mt[0]` at `base + 4`) is normalized away by
+    // measuring every other access relative to it. v1 supports only element-0
+    // pre-loop stores; when several write element 0, the last in program order is
+    // the seed and the earlier ones are dead (overwritten before any read).
+    let mut seed_candidates: Vec<(usize, InstructionId, BlockId, ValueId, i64)> = Vec::new();
+    for (pos, a) in accesses.iter().enumerate() {
+        if a.id == lane_store_id || a.size != esz || !in_region(a) {
             continue;
         }
         let Some(src) = a.stored else { continue };
@@ -345,19 +483,35 @@ fn try_match(ctx: &mut Context, fid: FunctionId) -> Option<PromoteMatch> {
             continue;
         };
         if c_seed % esz as i64 != 0 {
-            continue;
-        }
-        if seed.is_some() {
             return None;
         }
-        seed = Some((a.id, src, c_seed / esz as i64));
+        seed_candidates.push((pos, a.id, a.block, src, c_seed / esz as i64));
     }
-    let (seed_id, seed_val, seed_word) = seed?;
+    if seed_candidates.is_empty() {
+        return None;
+    }
+    let origin_word = seed_candidates.iter().map(|c| c.4).min().unwrap();
+    // v1: every pre-loop region store targets element 0, all in one block.
+    let seed_block = seed_candidates[0].2;
+    if seed_candidates
+        .iter()
+        .any(|c| c.4 != origin_word || c.2 != seed_block)
+    {
+        return None;
+    }
+    seed_candidates.sort_by_key(|c| c.0);
+    let (_, seed_id, _, seed_val, _) = *seed_candidates.last().unwrap();
+    let dead_stores: Vec<InstructionId> = seed_candidates[..seed_candidates.len() - 1]
+        .iter()
+        .map(|c| c.1)
+        .collect();
+    // Element positions relative to the origin.
+    let store_delta = store_word - origin_word;
 
-    // Lane load: the strided read (the memory-carried previous element).
+    // Optional memory-carried lane load: the strided read of a previous element.
     let mut load: Option<(InstructionId, i64)> = None;
     for a in &accesses {
-        if a.id == lane_store_id || a.stored.is_some() || a.size != esz {
+        if a.id == lane_store_id || a.stored.is_some() || a.size != esz || !in_region(a) {
             continue;
         }
         let Some((base, idx, c)) = affine_strided_lane(&numbering, a.ptr, a.size) else {
@@ -369,81 +523,67 @@ fn try_match(ctx: &mut Context, fid: FunctionId) -> Option<PromoteMatch> {
         if load.is_some() {
             return None;
         }
-        load = Some((a.id, c / esz as i64));
-    }
-    let (lane_load_id, load_delta) = load?;
-
-    // Every RAM access reaching the region must be one of {seed, lane store, load}.
-    let allowed: HashSet<InstructionId> =
-        [seed_id, lane_store_id, lane_load_id].into_iter().collect();
-    for a in &accesses {
-        if allowed.contains(&a.id) {
-            continue;
-        }
-        let strided_r = affine_strided_lane(&numbering, a.ptr, a.size)
-            .and_then(|(b, _, _)| root_of(b))
-            == Some(base_root);
-        let const_r = affine_base_const(&numbering, a.ptr, &is_r).is_some();
-        if strided_r || const_r {
-            return None; // an unmodelled access to the region
-        }
+        load = Some((a.id, c / esz as i64 - origin_word));
     }
 
     // --- Loop structure ---
-    // `index` is the body's induction parameter; the body's single predecessor is
-    // the header, whose param feeds `index` on the header→body edge.
+    // `index` is the body's induction parameter.
     let ValueId::BlockParam(ipid) = index else {
         return None;
     };
     if ctx.values.block_params[ipid].parent != Some(body) {
         return None;
     }
-    let body_preds: Vec<BlockId> = BasicBlock::from_id(ctx, body)
-        .predecessors()
-        .map(|(_, p)| p)
-        .collect();
-    if body_preds.len() != 1 {
-        return None;
-    }
-    let header = body_preds[0];
-    let kj = BasicBlock::from_id(ctx, body)
-        .params()
-        .position(|p| p.id() == index)?;
-    let hi = match header_incoming(ctx, body, kj)[..] {
-        [v] => v,
+    // The body's terminator tells the two shapes apart: a `goto header` is the
+    // split shape (a distinct header holds the guard); a `cbranch` with an edge
+    // back to the body itself is the rotated do-while shape (`header == body`).
+    let body_term = BasicBlock::from_id(ctx, body).iter().last()?;
+    let (rotated, header, exit, cond, exit_on_true) = match body_term.mnemonic() {
+        Mnemonic::Branch(b) => {
+            let header = b.target;
+            let hterm = BasicBlock::from_id(ctx, header).iter().last()?;
+            let Mnemonic::CBranch(cb) = hterm.mnemonic() else {
+                return None;
+            };
+            let (sb, fb, cond) = (cb.success_block, cb.failure_block, cb.condition);
+            let exit = if sb == body {
+                fb
+            } else if fb == body {
+                sb
+            } else {
+                return None;
+            };
+            (false, header, exit, cond, exit == sb)
+        }
+        Mnemonic::CBranch(cb) => {
+            let (sb, fb, cond) = (cb.success_block, cb.failure_block, cb.condition);
+            let exit = if sb == body {
+                fb
+            } else if fb == body {
+                sb
+            } else {
+                return None;
+            };
+            (true, body, exit, cond, exit == sb)
+        }
         _ => return None,
     };
-    let ValueId::BlockParam(hpid) = hi else {
-        return None;
-    };
-    if ctx.values.block_params[hpid].parent != Some(header) {
+    if exit == body || exit == header {
         return None;
     }
-
-    // Header cbranch → {body, exit}; header preds = {preheader, body}.
-    let term = BasicBlock::from_id(ctx, header).iter().last()?;
-    let Mnemonic::CBranch(cb) = term.mnemonic() else {
-        return None;
-    };
-    let (sb, fb, cond) = (cb.success_block, cb.failure_block, cb.condition);
-    let exit = if sb == body {
-        fb
-    } else if fb == body {
-        sb
-    } else {
-        return None;
-    };
-    if exit == body {
-        return None;
-    }
+    // header preds = {preheader, body(back-edge)}.
     let header_preds: Vec<BlockId> = BasicBlock::from_id(ctx, header)
         .predecessors()
         .map(|(_, p)| p)
         .collect();
-    if header_preds.len() != 2 || !header_preds.contains(&body) {
+    if !header_preds.contains(&body) {
         return None;
     }
-    let preheader = *header_preds.iter().find(|&&p| p != body)?;
+    let mut ph_iter = header_preds.iter().copied().filter(|&p| p != body);
+    let preheader = ph_iter.next()?;
+    if ph_iter.next().is_some() {
+        return None; // more than one entry into the loop
+    }
     let exit_preds: Vec<BlockId> = BasicBlock::from_id(ctx, exit)
         .predecessors()
         .map(|(_, p)| p)
@@ -455,18 +595,35 @@ fn try_match(ctx: &mut Context, fid: FunctionId) -> Option<PromoteMatch> {
     if !matches!(ph_term.mnemonic(), Mnemonic::Branch(b) if b.target == header) {
         return None;
     }
-
-    // Induction: `hi` starts at a single literal `s` and steps by one.
-    let khi = BasicBlock::from_id(ctx, header)
-        .params()
-        .position(|p| p.id() == hi)?;
-    // The back-edge increments the induction variable by one. The IR carries the
-    // *body* copy (`index`), so the increment reads `index + 1`, not `hi + 1`.
-    let inc = header_incoming(ctx, header, khi);
-    if !inc.iter().any(|&v| is_increment(ctx, v, index)) {
+    // The pre-loop seed stores must sit in the preheader (they run once, before
+    // the loop, dominating every lane).
+    if seed_block != preheader {
         return None;
     }
-    let inits: HashSet<u64> = inc
+
+    // Induction: the values feeding `index` (directly, in the rotated shape, or
+    // via the header param it copies, in the split shape) start at a single
+    // literal `s` and step by one.
+    let feeds = if rotated {
+        param_incomings(ctx, body, index)
+    } else {
+        let kj = BasicBlock::from_id(ctx, body)
+            .params()
+            .position(|p| p.id() == index)?;
+        let hi = edge_args(ctx, header, body).get(kj).copied()?;
+        let ValueId::BlockParam(hpid) = hi else {
+            return None;
+        };
+        if ctx.values.block_params[hpid].parent != Some(header) {
+            return None;
+        }
+        param_incomings(ctx, header, hi)
+    };
+    let inc_val = feeds
+        .iter()
+        .copied()
+        .find(|&v| is_increment(ctx, v, index))?;
+    let inits: HashSet<u64> = feeds
         .iter()
         .filter(|&&v| !is_increment(ctx, v, index))
         .filter_map(|&v| literal(ctx, v))
@@ -476,13 +633,19 @@ fn try_match(ctx: &mut Context, fid: FunctionId) -> Option<PromoteMatch> {
     }
     let s = *inits.iter().next().unwrap() as i64;
 
-    // Trip bound `N` from the guard `hi <cmp> N`; the last body index is `N-1`.
-    let n = guard_bound(ctx, cond, hi, exit == sb)?;
+    // Trip bound `N`; the last body index is `N-1`.
+    let n = if rotated {
+        rotated_bound(ctx, cond, inc_val, exit_on_true)?
+    } else {
+        // Split shape: the guard compares the header param feeding `index`.
+        let kj = BasicBlock::from_id(ctx, body)
+            .params()
+            .position(|p| p.id() == index)?;
+        let hi = edge_args(ctx, header, body).get(kj).copied()?;
+        guard_bound(ctx, cond, hi, exit_on_true)?
+    };
 
-    // Coverage: seed word 0, lane stores tile [1, count-1] contiguously.
-    if seed_word != 0 {
-        return None;
-    }
+    // Coverage: element 0 is the seed, lane stores tile `[1, count-1]`.
     let store_lo = s + store_delta;
     let store_hi = (n - 1) + store_delta;
     if store_lo != 1 || store_hi < store_lo {
@@ -493,22 +656,115 @@ fn try_match(ctx: &mut Context, fid: FunctionId) -> Option<PromoteMatch> {
         return None;
     }
 
+    // Carry: either the memory lane load, or a register accumulator param whose
+    // back-edge value is `stored_val` (`@acc' = %next`) and whose preheader init
+    // is the seed. Both become `at(arr, index-1)`.
+    let (carry_replace, carry_remove, load_delta) = match load {
+        Some((load_id, ld)) => {
+            // A valid memory carry reads a strictly-earlier, already-written lane.
+            if ld >= store_delta || s + ld < 0 {
+                return None;
+            }
+            (ValueId::Instruction(load_id), Some(load_id), ld)
+        }
+        None => {
+            // Register-carried: v1 supports this only for the rotated shape, whose
+            // single-block back-edge makes the accumulator unambiguous.
+            if !rotated {
+                return None;
+            }
+            let back = edge_args(ctx, body, header);
+            let init = edge_args(ctx, preheader, header);
+            let params: Vec<ValueId> = BasicBlock::from_id(ctx, body)
+                .params()
+                .map(|p| p.id())
+                .collect();
+            let mut acc = None;
+            for (k, p) in params.iter().enumerate() {
+                if *p == index {
+                    continue;
+                }
+                if back.get(k) == Some(&stored_val) && init.get(k) == Some(&seed_val) {
+                    if acc.is_some() {
+                        return None;
+                    }
+                    acc = Some(*p);
+                }
+            }
+            (acc?, None, store_delta - 1)
+        }
+    };
+
+    // Additional const-offset region loads (e.g. the exit read of element 0 the
+    // function returns). Only const loads in the exit block are supported — there
+    // the whole array is available, so they forward to `at(arr_exit, element)`.
+    let mut extra_loads: Vec<(InstructionId, i64)> = Vec::new();
+    for a in &accesses {
+        if a.stored.is_some() || a.id == lane_store_id || Some(a.id) == carry_remove || !in_region(a)
+        {
+            continue;
+        }
+        let Some((_, c)) = affine_base_const(&numbering, a.ptr, &is_r) else {
+            continue;
+        };
+        if c % esz as i64 != 0 {
+            return None;
+        }
+        let elem = c / esz as i64 - origin_word;
+        if a.block != exit || elem < 0 || elem as usize >= count {
+            return None;
+        }
+        extra_loads.push((a.id, elem));
+    }
+
+    // Every remaining RAM access reaching the region must be accounted for.
+    let mut allowed: HashSet<InstructionId> = [seed_id, lane_store_id].into_iter().collect();
+    if let Some(load_id) = carry_remove {
+        allowed.insert(load_id);
+    }
+    allowed.extend(extra_loads.iter().map(|&(id, _)| id));
+    allowed.extend(dead_stores.iter().copied());
+    for a in &accesses {
+        if allowed.contains(&a.id) {
+            continue;
+        }
+        // An access in a different space is a different memory — trivially disjoint
+        // from the region regardless of pointer arithmetic. Only same-space
+        // accesses that alias the region need accounting.
+        if !in_region(a) {
+            continue;
+        }
+        let strided_r = affine_strided_lane(&numbering, a.ptr, a.size)
+            .and_then(|(b, _, _)| root_of(b))
+            == Some(base_root);
+        let const_r = affine_base_const(&numbering, a.ptr, &is_r).is_some();
+        if strided_r || const_r {
+            return None; // an unmodelled access to the region
+        }
+    }
+
     Some(PromoteMatch {
         preheader,
         header,
         body,
         exit,
+        rotated,
         base_root,
+        origin_word,
         index,
         elem_size: esz,
         count,
+        region_space,
         seed_id,
         seed_val,
         lane_store_id,
         stored_val,
         store_delta,
-        lane_load_id,
+        carry_replace,
+        carry_remove,
         load_delta,
+        extra_loads,
+        dead_stores,
     })
 }
 
@@ -540,6 +796,29 @@ fn append_edge_arg(ctx: &mut Context, from: BlockId, to: BlockId, arg: ValueId) 
     ctx.replace_instruction_mnemonic(term_id, m);
 }
 
+/// Build `index + delta` (as `index`, `index - 1`, or `index + c`) at `index`'s
+/// own width, so the arithmetic wraps exactly as the lifted address did. The
+/// `index - 1` form is emitted verbatim as a `sub` so `loop_to_scan`'s
+/// `is_decrement` recognizes it.
+fn index_plus(b: &mut Builder, index: ValueId, delta: i64) -> ValueId {
+    if delta == 0 {
+        return index;
+    }
+    let ty = b.context_mut().type_of(index);
+    let width = b.context_mut().types.size_of(ty);
+    if delta == -1 {
+        let one = b.context_mut().get_const(1, width).id();
+        return b.push_sub(index, one).id();
+    }
+    let mask = if width >= 8 {
+        u64::MAX
+    } else {
+        (1u64 << (width * 8)) - 1
+    };
+    let c = b.context_mut().get_const(delta as u64 & mask, width).id();
+    b.push_add(index, c).id()
+}
+
 fn apply(ctx: &mut Context, m: &PromoteMatch) -> bool {
     let esz = m.elem_size;
     let elem_ty = ctx.types.get_or_make_int(esz);
@@ -551,22 +830,20 @@ fn apply(ctx: &mut Context, m: &PromoteMatch) -> bool {
     let at_id = qcode::value::insn::IntrinsicId::from_name("at").expect("at registered");
 
     // New carried-array params (pushed last on each block so appended edge args
-    // line up positionally).
-    let arr_h = {
-        let pid = BasicBlock::from_id_mut(ctx, m.header).push_param(arr_sz).id;
+    // line up positionally). In the rotated shape the header *is* the body, so
+    // they share one param.
+    let new_param = |ctx: &mut Context, bid: BlockId| {
+        let pid = BasicBlock::from_id_mut(ctx, bid).push_param(arr_sz).id;
         ctx.values.block_params[pid].type_id = arr_ty;
         ValueId::BlockParam(pid)
     };
-    let arr_b = {
-        let pid = BasicBlock::from_id_mut(ctx, m.body).push_param(arr_sz).id;
-        ctx.values.block_params[pid].type_id = arr_ty;
-        ValueId::BlockParam(pid)
+    let arr_h = new_param(ctx, m.header);
+    let arr_b = if m.rotated {
+        arr_h
+    } else {
+        new_param(ctx, m.body)
     };
-    let arr_e = {
-        let pid = BasicBlock::from_id_mut(ctx, m.exit).push_param(arr_sz).id;
-        ctx.values.block_params[pid].type_id = arr_ty;
-        ValueId::BlockParam(pid)
-    };
+    let arr_e = new_param(ctx, m.exit);
 
     // Zero-initialized array literal, retyped to [elem;count].
     let zero = {
@@ -577,7 +854,7 @@ fn apply(ctx: &mut Context, m: &PromoteMatch) -> bool {
         id
     };
 
-    // Preheader: %a0 = insert(zero, seed_word=0, seed_val), before the branch.
+    // Preheader: %a0 = insert(zero, 0, seed_val), before the branch.
     let a0 = {
         let term_id = BasicBlock::from_id(ctx, m.preheader)
             .iter()
@@ -591,53 +868,85 @@ fn apply(ctx: &mut Context, m: &PromoteMatch) -> bool {
             .id()
     };
 
-    // Body: at(arr_b, index + load_delta) replacing the lane load.
+    // Body: at(arr_b, index + load_delta) becomes the carry. For a memory carry it
+    // replaces the lane load (inserted just before it); for a register carry it
+    // replaces the accumulator param's uses (inserted at the body top, before the
+    // first instruction that reads the accumulator).
+    let anchor = match m.carry_remove {
+        Some(load_id) => Some(load_id),
+        None => BasicBlock::from_id(ctx, m.body).iter().next().map(|i| i.id),
+    };
     let at_val = {
         let mut b = Builder::from_block(BasicBlock::from_id_mut(ctx, m.body));
-        b.set_insert_point_before(m.lane_load_id);
-        let idx = if m.load_delta == 0 {
-            m.index
-        } else {
-            let c = b.context_mut().get_const(m.load_delta as u64, 8).id();
-            b.push_add(m.index, c).id()
-        };
+        if let Some(anchor) = anchor {
+            b.set_insert_point_before(anchor);
+        }
+        let idx = index_plus(&mut b, m.index, m.load_delta);
         b.push_intrinsic(at_id, vec![arr_b, idx]).id()
     };
-    ctx.replace_all_uses_with(ValueId::Instruction(m.lane_load_id), at_val);
+    ctx.replace_all_uses_with(m.carry_replace, at_val);
 
     // Body: %arr' = insert(arr_b, index + store_delta, stored_val), before branch.
     let arr_next = {
         let term_id = BasicBlock::from_id(ctx, m.body).iter().last().unwrap().id;
         let mut b = Builder::from_block(BasicBlock::from_id_mut(ctx, m.body));
         b.set_insert_point_before(term_id);
-        let idx = if m.store_delta == 0 {
-            m.index
-        } else {
-            let c = b.context_mut().get_const(m.store_delta as u64, 8).id();
-            b.push_add(m.index, c).id()
-        };
+        let idx = index_plus(&mut b, m.index, m.store_delta);
         b.push_intrinsic(insert_id, vec![arr_b, idx, m.stored_val])
             .id()
     };
 
-    // Exit: store(ram, base <- arr_e) before the exit terminator.
+    // Exit: rewrite the extra const-offset region loads to `at(arr_e, element)`.
+    for &(load_id, elem) in &m.extra_loads {
+        let at_val = {
+            let mut b = Builder::from_block(BasicBlock::from_id_mut(ctx, m.exit));
+            b.set_insert_point_before(load_id);
+            let idx = b.context_mut().get_const(elem as u64, 8).id();
+            b.push_intrinsic(at_id, vec![arr_e, idx]).id()
+        };
+        ctx.replace_all_uses_with(ValueId::Instruction(load_id), at_val);
+        ctx.remove_instruction(load_id);
+    }
+
+    // Exit: store(ram, base(+origin) <- arr_e) before the exit terminator.
     {
         let term_id = BasicBlock::from_id(ctx, m.exit).iter().last().unwrap().id;
-        let ram = ctx.default_space;
+        let ram = m.region_space;
         let mut b = Builder::from_block(BasicBlock::from_id_mut(ctx, m.exit));
         b.set_insert_point_before(term_id);
-        b.push_store(arr_e, m.base_root, ram);
+        let dst = if m.origin_word == 0 {
+            m.base_root
+        } else {
+            let ty = b.context_mut().type_of(m.base_root);
+            let width = b.context_mut().types.size_of(ty);
+            let off = b
+                .context_mut()
+                .get_const((m.origin_word * m.elem_size as i64) as u64, width)
+                .id();
+            b.push_add(m.base_root, off).id()
+        };
+        b.push_store(arr_e, dst, ram);
     }
 
     // Drop the now-dead memory traffic.
-    ctx.remove_instruction(m.lane_load_id);
+    if let Some(load_id) = m.carry_remove {
+        ctx.remove_instruction(load_id);
+    }
+    for &dead in &m.dead_stores {
+        ctx.remove_instruction(dead);
+    }
     ctx.remove_instruction(m.lane_store_id);
     ctx.remove_instruction(m.seed_id);
 
-    // Thread the array through every loop edge.
+    // Thread the array through every loop edge. The header always passes its own
+    // array param (`arr_h`) to the exit and (in the split shape) to the body; in
+    // the rotated shape header==body, so the back-edge is the body's self-edge and
+    // there is no separate header→body edge.
     append_edge_arg(ctx, m.preheader, m.header, a0);
     append_edge_arg(ctx, m.body, m.header, arr_next);
-    append_edge_arg(ctx, m.header, m.body, arr_h);
+    if !m.rotated {
+        append_edge_arg(ctx, m.header, m.body, arr_h);
+    }
     append_edge_arg(ctx, m.header, m.exit, arr_h);
 
     true
@@ -772,6 +1081,86 @@ mod tests {
         assert!(
             !run_function_pass::<ArrayPromote>(&mut ctx, mt_init).unwrap(),
             "second run should find nothing to promote"
+        );
+    }
+
+    // Soundness guard for the iota-based scan: a lane may only be forwarded to the
+    // carried array when it was *written earlier this trip*. If the loop reads a
+    // lane's original (pre-existing) memory value, zero-seeding the promoted array
+    // would change the result, so the pass must refuse — the scan cannot be
+    // expressed over a bare `iota`, it would need the original array.
+
+    #[test]
+    fn reads_current_lane_original_value_is_rejected() {
+        // Prefix sum in place: mt[i] = mt[i] + mt[i-1]. Lane `i` is loaded (its
+        // original value) before it is stored, so the fill is not self-contained.
+        let mut ctx = Context::new();
+        qcode!(
+            ctx,
+            "
+            fn reads_orig:
+            <entry @seed:i64 @base:i64>
+                %e0 = trunc(i32, @seed);
+                store(ram:4, @base <- %e0);
+                goto <head @i=1 @buf=@base>;
+            <head @i:i64 @buf:i64>
+                %done = @i == 624;
+                if %done goto <exit> else goto <body @j=@i @b=@buf>;
+            <body @j:i64 @b:i64>
+                %jm1 = @j - 1;
+                %roff = %jm1 * 4;
+                %raddr = @b + %roff;
+                %prev = load(ram:4, %raddr);
+                %coff = @j * 4;
+                %caddr = @b + %coff;
+                %cur = load(ram:4, %caddr);
+                %next = %cur + %prev;
+                store(ram:4, %caddr <- %next);
+                %j1 = @j + 1;
+                goto <head @i=%j1 @buf=@b>;
+            <exit>
+                return at i64 0x0;
+            "
+        );
+        assert!(
+            !run_function_pass::<ArrayPromote>(&mut ctx, reads_orig).unwrap(),
+            "reading a lane's original value before writing it must block promotion"
+        );
+    }
+
+    #[test]
+    fn index_map_over_original_array_is_rejected() {
+        // Indexed map over the original data: mt[i] = mt[i] * 3 + i. Reads the
+        // original lane `i` and the index `i` — the `enumerate(l)` shape. There is
+        // no memory-carried recurrence and no seed store; the functional form would
+        // read the original array, so the zero-seeding pass must refuse.
+        let mut ctx = Context::new();
+        qcode!(
+            ctx,
+            "
+            fn reads_enum:
+            <entry @base:i64>
+                goto <head @i=0 @buf=@base>;
+            <head @i:i64 @buf:i64>
+                %done = @i == 624;
+                if %done goto <exit> else goto <body @j=@i @b=@buf>;
+            <body @j:i64 @b:i64>
+                %off = @j * 4;
+                %addr = @b + %off;
+                %cur = load(ram:4, %addr);
+                %m = %cur * 3;
+                %jt = trunc(i32, @j);
+                %next = %m + %jt;
+                store(ram:4, %addr <- %next);
+                %j1 = @j + 1;
+                goto <head @i=%j1 @buf=@b>;
+            <exit>
+                return at i64 0x0;
+            "
+        );
+        assert!(
+            !run_function_pass::<ArrayPromote>(&mut ctx, reads_enum).unwrap(),
+            "an indexed map reading the original array must block promotion"
         );
     }
 }

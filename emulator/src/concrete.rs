@@ -1672,6 +1672,58 @@ impl StandaloneEmulator {
                 }
                 self.array_values.insert(insn_id, buf);
             }
+            "enumerate" => {
+                // `enumerate(arr) = [(index: i64, elem: T); N]`, materialized only
+                // over a fixed array (or bounded list). A length-erased unbounded
+                // list has no concrete count, so bail recoverably rather than
+                // fabricate one — matching `enumerate`'s deferred `eval`.
+                let src_ty = ctx
+                    .stored_type_of(args[0])
+                    .ok_or(EmulatorErrorKind::ValueError(0))?;
+                if matches!(ctx.types.list_of(src_ty), Some((_, None))) {
+                    return Err(EmulatorErrorKind::UnsupportedIntrinsic(Box::from(
+                        "enumerate",
+                    )));
+                }
+                let in_elem = ctx
+                    .types
+                    .seq_elem_of(src_ty)
+                    .ok_or(EmulatorErrorKind::ValueError(0))?;
+                let isz = ctx.types.size_of(in_elem).max(1);
+                let buf = self
+                    .resolve_array(ctx, args[0])
+                    .ok_or(EmulatorErrorKind::ValueError(0))?;
+                // The `(index, elem)` result tuple is a *structural* aggregate:
+                // its fields are addressed by index, not byte offset, so lay them
+                // out sequentially by field size (field 0 = i64 index, field 1 =
+                // elem). This is the same layout `eval_scan` splits back out.
+                let tuple_ty = ctx
+                    .stored_type_of(ValueId::Instruction(insn_id))
+                    .and_then(|ty| ctx.types.seq_elem_of(ty))
+                    .ok_or(EmulatorErrorKind::ValueError(0))?;
+                let (idx_sz, elem_off) = {
+                    let fields = ctx
+                        .types
+                        .aggregate_fields(tuple_ty)
+                        .ok_or(EmulatorErrorKind::ValueError(0))?;
+                    let [idx_f, _elem_f] = fields else {
+                        return Err(EmulatorErrorKind::ValueError(0));
+                    };
+                    let idx_sz = ctx.types.size_of(idx_f.type_id).min(8);
+                    (idx_sz, idx_sz)
+                };
+                let tsz = idx_sz + isz;
+                let count = buf.len() / isz;
+                let mut out = vec![0u8; count * tsz];
+                for i in 0..count {
+                    let base = i * tsz;
+                    let idx_bytes = (i as u64).to_le_bytes();
+                    out[base..base + idx_sz].copy_from_slice(&idx_bytes[..idx_sz]);
+                    out[base + elem_off..base + elem_off + isz]
+                        .copy_from_slice(&buf[i * isz..i * isz + isz]);
+                }
+                self.array_values.insert(insn_id, out);
+            }
             "at" => {
                 let buf = self
                     .resolve_array(ctx, args[0])
@@ -1756,10 +1808,36 @@ impl StandaloneEmulator {
             .ok_or(EmulatorErrorKind::EmptyFunctionRoot(scan.body))?
             .id;
 
+        // When the source element is a tuple (the `enumerate` `(index, elem)`
+        // lane), each lane is passed as an aggregate so the body's `Extract`s
+        // resolve; a plain scalar element is passed as-is. The tuple is a
+        // structural aggregate (fields addressed by index), so its bytes are laid
+        // out sequentially by field size — the same layout `enumerate` writes.
+        let elem_fields: Option<Vec<(usize, usize)>> =
+            ctx.types.aggregate_fields(in_elem).map(|fs| {
+                let mut off = 0;
+                fs.iter()
+                    .map(|f| {
+                        let sz = ctx.types.size_of(f.type_id);
+                        let field = (off, sz);
+                        off += sz;
+                        field
+                    })
+                    .collect()
+            });
+
         let mut out = Vec::with_capacity(count * osz);
         for k in 0..count {
             let elem = &src[k * isz..k * isz + isz];
-            let elem_arg = BodyArg::Scalar(SizedValue::from_bits(le_bits(elem), isz));
+            let elem_arg = match &elem_fields {
+                Some(fields) => BodyArg::Aggregate(
+                    fields
+                        .iter()
+                        .map(|&(off, sz)| SizedValue::from_bits(le_bits(&elem[off..off + sz]), sz))
+                        .collect(),
+                ),
+                None => BodyArg::Scalar(SizedValue::from_bits(le_bits(elem), isz)),
+            };
             let mut body_args = Vec::with_capacity(2 + capture_args.len());
             body_args.push(BodyArg::Scalar(acc));
             body_args.push(elem_arg);
@@ -1884,7 +1962,10 @@ fn body_return_value(ctx: &Context<'_>, block: BlockId) -> Option<ValueId> {
 /// over its [`array_values`](StandaloneEmulator::array_values) domain rather than
 /// the scalar interpreter.
 fn is_array_intrinsic(name: &str) -> bool {
-    matches!(name, "iota" | "singleton" | "concat" | "insert" | "at")
+    matches!(
+        name,
+        "iota" | "singleton" | "concat" | "insert" | "at" | "enumerate"
+    )
 }
 
 /// Fold a little-endian byte slice (≤ 16 bytes) into a `u128`.
@@ -2365,16 +2446,69 @@ mod tests {
         assert_eq!(words, vec![10, 11, 13]);
     }
 
-    /// Emulating a function that returns an `enumerate` array bails with a
-    /// recoverable `UnsupportedIntrinsic` rather than panicking — its `eval`
-    /// returns `None` (whole-array evaluation is deferred), so a best-effort
-    /// consumer declines to harvest instead of crashing the analysis.
     #[test]
-    fn enumerate_emulation_bails_recoverably() {
+    fn enumerate_over_array_is_emulated() {
+        use qcode::builder::Builder;
+        use qcode::value::{BasicBlock, Function, ValueId, insn::IntrinsicId};
+
+        let mut ctx = Context::new();
+        let f = Function::make(&mut ctx, "f".into()).unwrap().id;
+        let entry = ctx.get_or_make_block(0x1000);
+        {
+            let mut fm = Function::from_id_mut(&mut ctx, f);
+            fm.set_root(entry).unwrap();
+            fm.add_block(entry);
+        }
+        // A fixed `[i64; 4]` source `[10, 20, 30, 40]`.
+        let i64_ty = ctx.types.get_or_make_int(8);
+        let arr_ty = ctx.types.get_or_make_array(i64_ty, 4);
+        let data: Vec<u8> = [10u64, 20, 30, 40]
+            .iter()
+            .flat_map(|w| w.to_le_bytes())
+            .collect();
+        let src = ctx.get_bytes(data).id();
+        if let ValueId::Bytes(bid) = src {
+            ctx.values.bytes[bid].type_id = arr_ty;
+        }
+        let enum_id = IntrinsicId::from_name("enumerate").unwrap();
+        let e = {
+            let mut b = Builder::from_block(BasicBlock::from_id_mut(&mut ctx, entry));
+            let e = b.push_intrinsic(enum_id, vec![src]).id();
+            let ptr = b.context_mut().get_const(0, 8).id();
+            b.push_return(ptr);
+            unsafe { b.dont_finalize() };
+            e
+        };
+        let ValueId::Instruction(eid) = e else {
+            unreachable!()
+        };
+
+        let mut emu = StandaloneEmulator::new(entry);
+        emu.step(&ctx).expect("enumerate");
+
+        // `enumerate([10,20,30,40]) = [(0,10),(1,20),(2,30),(3,40)]`: each lane is
+        // an `(index: i64, elem: i64)` tuple.
+        let buf = emu
+            .array_values
+            .get(&eid)
+            .expect("enumerate produced an array");
+        let words: Vec<u64> = buf
+            .chunks_exact(8)
+            .map(|c| u64::from_le_bytes(c.try_into().unwrap()))
+            .collect();
+        assert_eq!(words, vec![0, 10, 1, 20, 2, 30, 3, 40]);
+    }
+
+    /// Emulating a function that returns `enumerate` over an *unbounded* list
+    /// bails with a recoverable `UnsupportedIntrinsic` rather than fabricating a
+    /// length — a length-erased list has no concrete count to materialize. (A
+    /// fixed array *is* materialized; see the `mt_scan` differential test.)
+    #[test]
+    fn enumerate_of_unbounded_list_bails_recoverably() {
         use qcode::builder::Builder;
         use qcode::value::{
-            BasicBlock, Function, ValueId,
-            insn::{IntrinsicId, Return},
+            BasicBlock, Function, InstructionRef, ValueId,
+            insn::{IntrinsicApp, IntrinsicId, Return},
         };
 
         let mut ctx = Context::new();
@@ -2386,26 +2520,38 @@ mod tests {
             fm.add_block(entry);
         }
         let i8 = ctx.types.get_or_make_int(1);
-        let arr_ty = ctx.types.get_or_make_array(i8, 4);
+        let list_ty = ctx.types.get_or_make_unbounded_list(i8);
         let src = {
             let mut b = Builder::from_block(BasicBlock::from_id_mut(&mut ctx, entry));
-            b.push_param(4).id()
+            b.push_param(8).id()
         };
         if let ValueId::BlockParam(pid) = src {
-            ctx.values.block_params[pid].type_id = arr_ty;
+            ctx.values.block_params[pid].type_id = list_ty;
         }
+        // Build `enumerate` over the unbounded list with an explicit result type:
+        // its `result_type` declines an unbounded operand (no static length), so
+        // the intrinsic is only ever constructed this way, never via inference.
         let enum_id = IntrinsicId::from_name("enumerate").unwrap();
-        let (env, ret, ptr) = {
+        let env = {
+            let insn = InstructionRef::from_mnemonic_with_type(
+                &mut ctx,
+                Mnemonic::Intrinsic(IntrinsicApp {
+                    id: enum_id,
+                    args: vec![src],
+                }),
+                list_ty,
+            )
+            .id;
+            BasicBlock::from_id_mut(&mut ctx, entry).push_insn(insn);
+            ValueId::Instruction(insn)
+        };
+        let ptr = ctx.get_const(0, 8).id();
+        {
             let mut b = Builder::from_block(BasicBlock::from_id_mut(&mut ctx, entry));
-            let env = b.push_intrinsic(enum_id, vec![src]).id();
-            let ptr = b.context_mut().get_const(0, 8).id();
-            let ret = b.push_return(ptr).id();
+            b.push_return(ptr);
             unsafe { b.dont_finalize() };
-            (env, ret, ptr)
-        };
-        let ValueId::Instruction(rid) = ret else {
-            unreachable!()
-        };
+        }
+        let rid = BasicBlock::from_id(&ctx, entry).iter().last().unwrap().id;
         ctx.replace_instruction_mnemonic(
             rid,
             Mnemonic::Return(Return {

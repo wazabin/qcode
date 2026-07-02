@@ -1,7 +1,7 @@
 use qcode::{
     context::Context,
     value::{
-        BasicBlock, BlockId, BlockParamId, FunctionId, ValueId,
+        BasicBlock, BlockId, BlockParamId, Function, FunctionId, ValueId,
         insn::{Branch, Mnemonic},
     },
 };
@@ -43,13 +43,17 @@ crate::register_function_pass!(SimplifyCfg);
 ///    successor B, B has exactly one predecessor A, and A ends with an
 ///    unconditional `Branch { target: B }`, A absorbs B.
 ///
+/// Each round first drops every block unreachable from the entry
+/// ([`prune_unreachable`]) — an unconditional cleanup with no proof obligation,
+/// e.g. the residual loop left behind once `dce` bypasses a dead loop.
+///
 /// The pass repeats until a full scan applies no transform.
 pub fn simplify_cfg(ctx: &mut Context, function_id: FunctionId) -> bool {
     let mut changed = false;
 
     loop {
         let blocks = ctx.values.functions[function_id].blocks.clone();
-        let mut progress = false;
+        let mut progress = prune_unreachable(ctx, function_id);
 
         for block_id in blocks {
             if try_fold_cbranch(ctx, block_id)
@@ -69,6 +73,51 @@ pub fn simplify_cfg(ctx: &mut Context, function_id: FunctionId) -> bool {
     }
 
     changed
+}
+
+/// Deletes every block of `function_id` not reachable from the entry, along
+/// with its instructions (which detaches CFG edges and clears use records) and
+/// params. Removing the terminator of an unreachable block only drops edges into
+/// *other* unreachable blocks, so a single pass suffices; returns `true` if any
+/// block was removed.
+///
+/// Sound with no side conditions: a block with no path from the entry executes
+/// on no run, so nothing it computes or branches to is observable. This is what
+/// lets a dead loop, once `dce` reroutes its preheader past it, disappear.
+fn prune_unreachable(ctx: &mut Context, function_id: FunctionId) -> bool {
+    let Some(root) = Function::from_id(ctx, function_id).root().map(|b| b.id) else {
+        return false;
+    };
+
+    // Mark reachable blocks by CFG walk from the entry.
+    let mut reachable = rustc_hash::FxHashSet::default();
+    let mut stack = vec![root];
+    while let Some(b) = stack.pop() {
+        if !reachable.insert(b) {
+            continue;
+        }
+        for (_, succ) in BasicBlock::from_id(&*ctx, b).successors() {
+            stack.push(succ);
+        }
+    }
+
+    let dead: Vec<BlockId> = ctx.values.functions[function_id]
+        .blocks
+        .iter()
+        .copied()
+        .filter(|b| !reachable.contains(b))
+        .collect();
+    if dead.is_empty() {
+        return false;
+    }
+
+    for block in dead {
+        // `delete` unwinds CFG edges, removes the block's instructions (clearing
+        // their use records) and detaches its params — the full cleanup, unlike
+        // the low-level `remove_block` used to *move* blocks between functions.
+        BasicBlock::from_id_mut(ctx, block).delete(function_id);
+    }
+    true
 }
 
 /// Merges `a_id` with its unique successor when the straight-line conditions
@@ -344,10 +393,64 @@ mod tests {
     };
     use qcode_macro::qcode;
 
-    use super::simplify_cfg;
+    use super::{
+        prune_unreachable, simplify_cfg, try_bypass_empty_block, try_fold_cbranch, try_merge_block,
+    };
 
     fn make_ctx() -> Context<'static> {
         Context::new()
+    }
+
+    #[test]
+    fn prunes_unreachable_blocks() {
+        let mut ctx = make_ctx();
+        qcode!(
+            ctx,
+            "
+            fn f:
+            <a>
+                goto <t>;
+            <t>
+                goto <0x1001>;
+            <dead @x:i64>
+                %s = @x + 1;
+                goto <t>;
+            "
+        );
+
+        // `<dead>` has no path from the entry `<a>` — a full run removes it.
+        let changed = simplify_cfg(&mut ctx, f);
+        assert!(changed, "pruning an unreachable block reports progress");
+        assert!(
+            BasicBlock::from_id(&ctx, dead).parent().is_none(),
+            "unreachable block should be pruned"
+        );
+        assert!(
+            BasicBlock::from_id(&ctx, a).parent().is_some(),
+            "the reachable entry survives"
+        );
+    }
+
+    #[test]
+    fn prune_unreachable_is_a_noop_when_all_reachable() {
+        let mut ctx = make_ctx();
+        qcode!(
+            ctx,
+            "
+            fn f:
+            <a @cond:i8>
+                if @cond goto <t> else goto <u>;
+            <t>
+                goto <0x1001>;
+            <u>
+                goto <0x1002>;
+            "
+        );
+
+        assert!(
+            !prune_unreachable(&mut ctx, f),
+            "no unreachable blocks means no change"
+        );
     }
 
     #[test]
@@ -440,10 +543,12 @@ mod tests {
             "
         );
 
-        simplify_cfg(&mut ctx, f);
-
-        let blocks: Vec<_> = Function::from_id(&ctx, f).blocks().map(|b| b.id).collect();
-        assert_eq!(blocks.len(), 3, "B has two predecessors, should not merge");
+        // Isolate the merge guard: `<d>` is unreachable, so a full `simplify_cfg`
+        // run would prune it, leaving B single-predecessor and mergeable.
+        assert!(
+            !try_merge_block(&mut ctx, f, a),
+            "B has two predecessors, should not merge"
+        );
     }
 
     #[test]
@@ -664,7 +769,9 @@ mod tests {
             "
         );
 
-        simplify_cfg(&mut ctx, f);
+        // Bypass in isolation: `<d>` is unreachable, so a full `simplify_cfg`
+        // run would prune it (and then splice the forwarding `<a>`/`<d>`).
+        try_bypass_empty_block(&mut ctx, f, b);
 
         // b is gone; a and d both branch straight to t.
         assert!(
@@ -704,7 +811,9 @@ mod tests {
             "
         );
 
-        simplify_cfg(&mut ctx, f);
+        // Bypass in isolation (see `bypasses_empty_block_with_two_predecessors`):
+        // a full run would prune the unreachable `<d>` predecessor.
+        try_bypass_empty_block(&mut ctx, f, b);
 
         assert!(
             BasicBlock::from_id(&ctx, b).parent().is_none(),
@@ -821,7 +930,7 @@ mod tests {
     /// An unreachable forwarding block (no predecessors, not the root) is left
     /// alone — splicing is only for blocks on a path.
     #[test]
-    fn does_not_bypass_unreachable_block() {
+    fn prunes_unreachable_forwarding_block() {
         let mut ctx = make_ctx();
         qcode!(
             ctx,
@@ -840,9 +949,15 @@ mod tests {
 
         simplify_cfg(&mut ctx, f);
 
+        // `<orphan>` and `<t>` (reachable only via orphan) have no path from the
+        // entry `<a>`; simplify_cfg now prunes such dead blocks itself.
         assert!(
-            BasicBlock::from_id(&ctx, orphan).parent().is_some(),
-            "unreachable forwarding block should be left for dead-block elimination"
+            BasicBlock::from_id(&ctx, orphan).parent().is_none(),
+            "unreachable forwarding block should be pruned"
+        );
+        assert!(
+            BasicBlock::from_id(&ctx, t).parent().is_none(),
+            "block reachable only from an unreachable block should be pruned too"
         );
     }
 
@@ -867,7 +982,10 @@ mod tests {
             "
         );
 
-        simplify_cfg(&mut ctx, f);
+        // Exercise the fold in isolation: a full `simplify_cfg` run would prune
+        // the unreachable `<d>`, then merge the folded `goto <t>` into t, hiding
+        // the very Branch this test inspects.
+        try_fold_cbranch(&mut ctx, a);
 
         let term = BasicBlock::from_id(&ctx, a)
             .iter()

@@ -893,6 +893,11 @@ impl<'str, 'ctx> FunctionMutRef<'str, 'ctx> {
     /// Disassociates `block` from this function, removing it from the block list.
     /// The block's `parent` is left untouched, so callers moving a block to
     /// another function should call [`add_block`](Self::add_block) afterwards.
+    ///
+    /// This is the low-level primitive for *moving* a block between functions. To
+    /// *delete* a block you almost certainly want [`BasicBlock::delete`], which
+    /// also unwinds CFG edges, removes the block's instructions, and detaches its
+    /// params — none of which this does.
     pub fn remove_block(&mut self, id: BlockId) {
         self.inner_mut().blocks.remove(&id);
     }

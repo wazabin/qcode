@@ -64,12 +64,11 @@ impl Intrinsic for Len {
         // `len(iota n) = n`: the length of an as-yet-unfolded index driver is its
         // own operand, recovered symbolically even when `n` is not constant. (A
         // constant `iota` would already have folded to a fixed array above.)
-        if let ValueId::Instruction(iid) = seq {
-            if let Mnemonic::Intrinsic(app) = ctx.get_insn(iid).mnemonic() {
-                if app.id.name() == "iota" {
-                    return Some(Simplified::Value(app.args[0]));
-                }
-            }
+        if let ValueId::Instruction(iid) = seq
+            && let Mnemonic::Intrinsic(app) = ctx.get_insn(iid).mnemonic()
+            && app.id.name() == "iota"
+        {
+            return Some(Simplified::Value(app.args[0]));
         }
         None
     }

@@ -167,14 +167,34 @@ fn outline_tupled(
     })
 }
 
-/// Outline a [`Scan`](qcode::value::insn::Scan) body: a **binary** function
-/// `body(acc, tuple)` where `acc` is the carried accumulator (param 0, typed as
-/// `acc_ty`) and `tuple` is the `enumerate` element `(index, elem)` (param 1).
-/// The host `acc_input` is bound to param 0 and `index_input` to `Extract(t, 0)`.
-/// When the original loop also reads the current source lane, `elem_input` is
-/// bound to `Extract(t, 1)`, so the body can depend on `(acc, index, elem)`.
+/// How a [`Scan`](qcode::value::insn::Scan) body receives its per-lane input
+/// (param 1), which the body turns into the loop index.
 ///
-/// Returns `None` if the expression is not closed over those inputs + literals.
+/// - [`Tuple`](ScanElem::Tuple): the source is `enumerate(arr)`, so param 1 is an
+///   `(index, elem)` tuple; the index is `Extract(t, 0)` and the data lane
+///   `Extract(t, 1)`. Used by the shadow-shape recognizer, whose scan ranges over
+///   a real data array.
+/// - [`Scalar`](ScanElem::Scalar): the source is a bare index driver (an `iota`),
+///   so param 1 *is* the index element directly. There is no data lane, so the
+///   only array the scan touches is the freshly-built `iota` — no original memory
+///   is read. Used by [`loop_to_scan`](crate::calls::loop_to_scan).
+pub(crate) enum ScanElem {
+    /// `enumerate` element type — the `(index, elem)` tuple.
+    Tuple(TypeId),
+    /// The scan source's scalar element type (the `iota` element, e.g. `i64`).
+    Scalar(TypeId),
+}
+
+/// Outline a [`Scan`](qcode::value::insn::Scan) body: a **binary** function
+/// `body(acc, x)` where `acc` is the carried accumulator (param 0, typed as
+/// `acc_ty`) and `x` is the per-lane input (param 1), whose shape is set by
+/// `elem`. The host `acc_input` is bound to param 0 and `index_input` to the
+/// derived loop index. In [`ScanElem::Tuple`] mode the body may also read the
+/// current data lane via `elem_input` (`Extract(t, 1)`); [`ScanElem::Scalar`]
+/// mode has no data lane, so `elem_input` must be `None`.
+///
+/// Returns `None` if the expression is not closed over those inputs + literals,
+/// or if `elem_input` is given in scalar mode.
 pub(crate) fn outline_scan_body(
     ctx: &mut Context,
     name: &str,
@@ -185,8 +205,12 @@ pub(crate) fn outline_scan_body(
     index_start: i64,
     acc_ty: TypeId,
     index_ty: TypeId,
-    tuple_ty: TypeId,
+    elem: ScanElem,
 ) -> Option<FunctionId> {
+    // A scalar source has no separate data lane to bind.
+    if elem_input.is_some() && matches!(elem, ScanElem::Scalar(_)) {
+        return None;
+    }
     let mut inputs = vec![acc_input, index_input];
     if let Some(elem) = elem_input {
         inputs.push(elem);
@@ -199,35 +223,50 @@ pub(crate) fn outline_scan_body(
         let apid = BasicBlock::from_id_mut(ctx, root).push_param(acc_sz).id;
         ctx.values.block_params[apid].type_id = acc_ty;
         value_map.insert(acc_input, ValueId::BlockParam(apid));
-        // Param 1: the enumerate tuple. The body's loop index is
-        // `(index_ty)(t.0) + index_start` — the `i64` enumerate index narrowed to
-        // the loop index's width, shifted so `enumerate index 0` maps to the loop's
-        // first index (it may count from 1 while the array is 0-based).
-        let tsz = ctx.types.size_of(tuple_ty);
-        let pid = BasicBlock::from_id_mut(ctx, root).push_param(tsz).id;
-        ctx.values.block_params[pid].type_id = tuple_ty;
-        let tuple = ValueId::BlockParam(pid);
-        let fty = ctx
-            .types
-            .field_type(tuple_ty, 0)
-            .expect("enumerate tuple index field");
-        let mut idx = InstructionRef::from_mnemonic_with_type(
-            ctx,
-            Mnemonic::Extract(Extract {
-                agg: tuple,
-                index: 0,
-            }),
-            fty,
-        )
-        .id;
-        BasicBlock::from_id_mut(ctx, root).push_insn(idx);
+        // Param 1: the per-lane input. The body's loop index is
+        // `(index_ty)(raw) + index_start` — the `i64` driver value narrowed to the
+        // loop index's width, shifted so element 0 maps to the loop's first index
+        // (it may count from 1 while the array is 0-based). In tuple mode `raw` is
+        // `t.0` of the `enumerate` element; in scalar mode `raw` is the param
+        // itself (the `iota` lane).
+        let param_ty = match elem {
+            ScanElem::Tuple(tuple_ty) => tuple_ty,
+            ScanElem::Scalar(elem_ty) => elem_ty,
+        };
+        let psz = ctx.types.size_of(param_ty);
+        let pid = BasicBlock::from_id_mut(ctx, root).push_param(psz).id;
+        ctx.values.block_params[pid].type_id = param_ty;
+        let param = ValueId::BlockParam(pid);
+        // `idx` is the raw index driver value before narrow/shift: `t.0` in tuple
+        // mode (an instruction), or the param itself in scalar mode (no unpack).
+        let (mut idx, fty): (ValueId, TypeId) = match elem {
+            ScanElem::Tuple(tuple_ty) => {
+                let fty = ctx
+                    .types
+                    .field_type(tuple_ty, 0)
+                    .expect("enumerate tuple index field");
+                let ex = InstructionRef::from_mnemonic_with_type(
+                    ctx,
+                    Mnemonic::Extract(Extract {
+                        agg: param,
+                        index: 0,
+                    }),
+                    fty,
+                )
+                .id;
+                BasicBlock::from_id_mut(ctx, root).push_insn(ex);
+                (ValueId::Instruction(ex), fty)
+            }
+            // Scalar: the param is the index driver value directly.
+            ScanElem::Scalar(elem_ty) => (param, elem_ty),
+        };
         // Narrow `i64` index → loop index width.
         let isz = ctx.types.size_of(index_ty);
         if isz < ctx.types.size_of(fty) {
             let r = InstructionRef::from_mnemonic_with_type(
                 ctx,
                 Mnemonic::Range(Range {
-                    src: ValueId::Instruction(idx),
+                    src: idx,
                     start: 0,
                     size: isz,
                 }),
@@ -235,7 +274,7 @@ pub(crate) fn outline_scan_body(
             )
             .id;
             BasicBlock::from_id_mut(ctx, root).push_insn(r);
-            idx = r;
+            idx = ValueId::Instruction(r);
         }
         // Shift by the start index.
         if index_start != 0 {
@@ -248,7 +287,7 @@ pub(crate) fn outline_scan_body(
             let add = InstructionRef::from_mnemonic_with_type(
                 ctx,
                 Mnemonic::Binop(Binary {
-                    lhs: ValueId::Instruction(idx),
+                    lhs: idx,
                     rhs: c,
                     op: Binop::Int(IntBinop::Add),
                 }),
@@ -256,25 +295,26 @@ pub(crate) fn outline_scan_body(
             )
             .id;
             BasicBlock::from_id_mut(ctx, root).push_insn(add);
-            idx = add;
+            idx = ValueId::Instruction(add);
         }
-        value_map.insert(index_input, ValueId::Instruction(idx));
-        if let Some(elem_input) = elem_input {
+        value_map.insert(index_input, idx);
+        // Data lane (tuple mode only; scalar mode rejects `elem_input` above).
+        if let (Some(elem_input), ScanElem::Tuple(tuple_ty)) = (elem_input, elem) {
             let elem_ty = ctx
                 .types
                 .field_type(tuple_ty, 1)
                 .expect("enumerate tuple elem field");
-            let elem = InstructionRef::from_mnemonic_with_type(
+            let el = InstructionRef::from_mnemonic_with_type(
                 ctx,
                 Mnemonic::Extract(Extract {
-                    agg: tuple,
+                    agg: param,
                     index: 1,
                 }),
                 elem_ty,
             )
             .id;
-            BasicBlock::from_id_mut(ctx, root).push_insn(elem);
-            value_map.insert(elem_input, ValueId::Instruction(elem));
+            BasicBlock::from_id_mut(ctx, root).push_insn(el);
+            value_map.insert(elem_input, ValueId::Instruction(el));
         }
         value_map
     })
@@ -1091,7 +1131,7 @@ fn apply_scan(ctx: &mut Context, fid: FunctionId, m: &ScanMatch) -> bool {
         m.index_start,
         acc_ty,
         index_ty,
-        tuple_ty,
+        ScanElem::Tuple(tuple_ty),
     ) else {
         return false;
     };

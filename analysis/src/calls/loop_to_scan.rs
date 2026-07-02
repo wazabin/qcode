@@ -25,7 +25,7 @@
 //! So the whole fill folds to
 //!
 //! ```text
-//!   %scan = scanl @f seed enumerate(iota(N-1));   // arr[1..N]
+//!   %scan = scanl @f seed iota(N-1);              // arr[1..N]
 //!   %full = concat(singleton(seed), %scan);       // arr[0..N]
 //!   store(ram, @base <- %full);
 //! ```
@@ -46,7 +46,7 @@ use qcode::{
     },
 };
 
-use super::loop_to_map::outline_scan_body;
+use super::loop_to_map::{ScanElem, outline_scan_body};
 use crate::{FunctionPass, PipelineEnv};
 
 #[derive(Default)]
@@ -58,8 +58,6 @@ struct ScanMatch {
     exit: BlockId,
     /// The `store(ram, base <- arr)` to rewrite.
     store_id: InstructionId,
-    /// The store's destination pointer.
-    base: ValueId,
     /// The lane-0 seed value (`acc_0`, also the first output element).
     seed_val: ValueId,
     /// The body's per-lane result (`%next`), the scan body's return value.
@@ -68,7 +66,7 @@ struct ScanMatch {
     prev_val: ValueId,
     /// The body induction parameter used in the body expression.
     index: ValueId,
-    /// The loop index at the first body iteration (`enumerate` index 0 maps here).
+    /// The loop index at the first body iteration (`iota` element 0 maps here).
     index_start: i64,
     /// The full array length `N`.
     count: usize,
@@ -153,7 +151,9 @@ fn incoming(ctx: &Context, block: BlockId, k: usize) -> Vec<ValueId> {
 
 /// Index of block-param `p` within `block`'s parameter list.
 fn param_pos(ctx: &Context, block: BlockId, p: ValueId) -> Option<usize> {
-    BasicBlock::from_id(ctx, block).params().position(|q| q.id() == p)
+    BasicBlock::from_id(ctx, block)
+        .params()
+        .position(|q| q.id() == p)
 }
 
 /// Parent block of a block-param value.
@@ -166,7 +166,6 @@ fn param_parent(ctx: &Context, v: ValueId) -> Option<BlockId> {
 
 /// Recognize the `insert`/`at` fill loop in `fid`.
 fn try_match(ctx: &mut Context, fid: FunctionId) -> Option<ScanMatch> {
-    let ram = ctx.default_space;
     let insert_id = IntrinsicId::from_name("insert")?;
     let at_id = IntrinsicId::from_name("at")?;
 
@@ -181,14 +180,23 @@ fn try_match(ctx: &mut Context, fid: FunctionId) -> Option<ScanMatch> {
             let Mnemonic::Store(s) = insn.mnemonic() else {
                 continue;
             };
-            if s.space == ram {
+            // Any RAM space — array_promote emits the wide store into whatever RAM
+            // space the region lived in, not necessarily the default space.
+            if matches!(
+                qcode::space::Space::from_id(ctx, s.space).ty,
+                qcode::space::SpaceType::Ram
+            ) {
                 candidates.push((insn.id, bid, s.ptr, s.src));
             }
         }
     }
     let mut anchor = None;
     for (id, bid, ptr, src) in candidates {
-        if param_parent(ctx, src) != Some(bid) {
+        // The store source must be an array-typed block param — the loop-carried
+        // array reaching the exit, either the exit's own pass-through param
+        // (split shape) or the loop header's param directly (rotated shape, where
+        // gvn has already coalesced the trivial exit pass-through away).
+        if !matches!(src, ValueId::BlockParam(_)) {
             continue;
         }
         let src_ty = ctx.type_of(src);
@@ -203,10 +211,9 @@ fn try_match(ctx: &mut Context, fid: FunctionId) -> Option<ScanMatch> {
         }
         anchor = Some((id, bid, ptr, src, elem_ty, count));
     }
-    let (store_id, exit, base, arr_e, elem_ty, count) = anchor?;
+    let (store_id, exit, _base, arr_src, elem_ty, count) = anchor?;
 
-    // Exit's single predecessor is the loop header; the exit-carried array comes
-    // from the header's own array param on the exit edge.
+    // Exit's single predecessor is the loop header.
     let exit_preds: Vec<BlockId> = BasicBlock::from_id(ctx, exit)
         .predecessors()
         .map(|(_, p)| p)
@@ -214,9 +221,17 @@ fn try_match(ctx: &mut Context, fid: FunctionId) -> Option<ScanMatch> {
     let [header] = exit_preds[..] else {
         return None;
     };
-    let k_arre = param_pos(ctx, exit, arr_e)?;
-    let [arr_h] = incoming(ctx, exit, k_arre)[..] else {
-        return None;
+    // The header's own carried array param: the store source directly if it lives
+    // on the header (rotated/coalesced), otherwise the value the exit's
+    // pass-through param copies from the header on the exit edge (split).
+    let arr_h = if param_parent(ctx, arr_src) == Some(header) {
+        arr_src
+    } else {
+        let k_arre = param_pos(ctx, exit, arr_src)?;
+        match incoming(ctx, exit, k_arre)[..] {
+            [v] => v,
+            _ => return None,
+        }
     };
     if param_parent(ctx, arr_h) != Some(header) {
         return None;
@@ -293,26 +308,30 @@ fn try_match(ctx: &mut Context, fid: FunctionId) -> Option<ScanMatch> {
     }
     let prev_val = ValueId::Instruction(prev_id);
 
-    // Induction: the header param feeding `index` on the header→body edge starts
-    // at a single literal `s` and steps by one on the back-edge.
+    // Induction: the values feeding `index` start at a single literal `s` and step
+    // by one on the back-edge. In the rotated shape (`body == header`) the index
+    // param's own two incomings are the preheader init and the back-edge
+    // increment; in the split shape `index` copies a header param, whose incomings
+    // carry the init and increment.
     let k_index = param_pos(ctx, body, index)?;
-    let [hp] = incoming(ctx, body, k_index)[..] else {
-        return None;
+    let feeds = if body == header {
+        incoming(ctx, body, k_index)
+    } else {
+        let [hp] = incoming(ctx, body, k_index)[..] else {
+            return None;
+        };
+        if param_parent(ctx, hp) != Some(header) {
+            return None;
+        }
+        let k_hp = param_pos(ctx, header, hp)?;
+        incoming(ctx, header, k_hp)
     };
-    if param_parent(ctx, hp) != Some(header) {
+    if !feeds.iter().any(|&v| is_increment(ctx, v, index)) {
         return None;
     }
-    let k_hp = param_pos(ctx, header, hp)?;
-    let hp_inc = incoming(ctx, header, k_hp);
-    if !hp_inc
+    let inits: Vec<i64> = feeds
         .iter()
-        .any(|&v| is_increment(ctx, v, index) || is_increment(ctx, v, hp))
-    {
-        return None;
-    }
-    let inits: Vec<i64> = hp_inc
-        .iter()
-        .filter(|&&v| !is_increment(ctx, v, index) && !is_increment(ctx, v, hp))
+        .filter(|&&v| !is_increment(ctx, v, index))
         .filter_map(|&v| literal(ctx, v).map(|x| x as i64))
         .collect();
     let [index_start] = inits[..] else {
@@ -322,7 +341,6 @@ fn try_match(ctx: &mut Context, fid: FunctionId) -> Option<ScanMatch> {
     Some(ScanMatch {
         exit,
         store_id,
-        base,
         seed_val,
         stored_val,
         prev_val,
@@ -335,24 +353,21 @@ fn try_match(ctx: &mut Context, fid: FunctionId) -> Option<ScanMatch> {
 
 /// Rewrite a matched fill loop: outline the `(acc, index)` body and replace the
 /// wide exit store with `store(ram, base <- concat(singleton(seed), scanl @body
-/// seed enumerate(iota(N-1))))`. The residual loop is left for `dce`.
+/// seed iota(N-1)))`. The residual loop is left for `dce`.
 fn apply(ctx: &mut Context, fid: FunctionId, m: &ScanMatch) -> bool {
     let index_ty = ctx.type_of(m.index);
     let i64_ty = ctx.types.get_or_make_int(8);
     let n1 = m.count - 1;
 
     let iota_id = IntrinsicId::from_name("iota").expect("iota registered");
-    let enum_id = IntrinsicId::from_name("enumerate").expect("enumerate registered");
     let singleton_id = IntrinsicId::from_name("singleton").expect("singleton registered");
     let concat_id = IntrinsicId::from_name("concat").expect("concat registered");
 
-    // The scan ranges over `enumerate(iota(N-1))`, whose element is an `(i64, i64)`
-    // tuple; the body unpacks the index (element half unused).
+    // The scan ranges directly over `iota(N-1)`: its element *is* the loop index,
+    // fed straight to the body (no `enumerate` tuple). The only array the scan
+    // touches is this freshly-built constant, so no original memory is read — the
+    // property the functionalization exists to prove is now syntactic.
     let src_arr_ty = ctx.types.get_or_make_array(i64_ty, n1);
-    let enum_ty = enum_id.desc().result_type(&mut ctx.types, &[src_arr_ty]);
-    let Some((tuple_ty, _)) = ctx.types.array_of(enum_ty) else {
-        return false;
-    };
 
     let name = format!("{}_scan_body", Function::from_id(ctx, fid).name());
     let Some(body_fn) = outline_scan_body(
@@ -365,7 +380,7 @@ fn apply(ctx: &mut Context, fid: FunctionId, m: &ScanMatch) -> bool {
         m.index_start,
         m.elem_ty,
         index_ty,
-        tuple_ty,
+        ScanElem::Scalar(i64_ty),
     ) else {
         return false;
     };
@@ -384,12 +399,11 @@ fn apply(ctx: &mut Context, fid: FunctionId, m: &ScanMatch) -> bool {
     BasicBlock::from_id_mut(ctx, m.exit).insert_insn_before(m.store_id, iota_id_insn);
     let src = ValueId::Instruction(iota_id_insn);
 
-    // enumerate → scan → singleton(seed) → concat, all before the wide store.
+    // scan(iota) → singleton(seed) → concat, all before the wide store.
     let full = {
         let mut b = Builder::from_block(BasicBlock::from_id_mut(ctx, m.exit));
         b.set_insert_point_before(m.store_id);
-        let en = b.push_intrinsic(enum_id, vec![src]).id();
-        let scan = b.push_scan(body_fn, m.seed_val, en, Vec::new()).id();
+        let scan = b.push_scan(body_fn, m.seed_val, src, Vec::new()).id();
         let sing = b.push_intrinsic(singleton_id, vec![m.seed_val]).id();
         b.push_intrinsic(concat_id, vec![sing, scan]).id()
     };
@@ -411,7 +425,12 @@ impl FunctionPass for LoopToScan {
         "Fold the value-carried insert/at fill loop from array_promote into a scanl"
     }
 
-    fn run(&self, ctx: &mut Context, fun_id: FunctionId, _env: &PipelineEnv) -> Result<bool, String> {
+    fn run(
+        &self,
+        ctx: &mut Context,
+        fun_id: FunctionId,
+        _env: &PipelineEnv,
+    ) -> Result<bool, String> {
         match try_match(ctx, fun_id) {
             Some(m) => Ok(apply(ctx, fun_id, &m)),
             None => Ok(false),

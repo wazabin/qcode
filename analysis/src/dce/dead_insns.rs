@@ -414,11 +414,287 @@ mod tests {
             "unused entry block param should be pruned"
         );
     }
+
+    /// The canonical dead counted loop `array_promote`/`loop_to_scan` leaves
+    /// behind — a pure `iv == N` counter whose carried values are all internal —
+    /// is bypassed by rerouting its preheader straight to the exit.
+    #[test]
+    fn dead_counted_loop_is_bypassed() {
+        use qcode_macro::qcode;
+        let mut ctx = Context::new();
+        qcode!(
+            ctx,
+            "
+            fn f:
+            <pre @n:i64>
+                goto <head @i=0x1 @acc=@n>;
+            <head @i:i64 @acc:i64>
+                %done = i64 @i == i64 0x5;
+                if %done goto <exit> else goto <body>;
+            <body>
+                %next = i64 @acc + i64 @i;
+                %j1 = i64 @i + i64 0x1;
+                goto <head @i=%j1 @acc=%next>;
+            <exit>
+                goto <0x2000>;
+            "
+        );
+
+        assert!(
+            super::remove_dead_counted_loop(&mut ctx, f),
+            "the pure, terminating, live-out-free loop should be recognized"
+        );
+
+        // The preheader now jumps straight to the exit, orphaning head/body.
+        let term = BasicBlock::from_id(&ctx, pre).iter().last().unwrap();
+        let Mnemonic::Branch(br) = term.mnemonic() else {
+            panic!("preheader should end in an unconditional branch to the exit");
+        };
+        assert_eq!(br.target, exit);
+        assert!(
+            BasicBlock::from_id(&ctx, head).predecessors().count() == 1,
+            "header keeps only its now-unreachable back-edge"
+        );
+
+        // A second call is a no-op: the loop is no longer reachable/matchable.
+        assert!(!super::remove_dead_counted_loop(&mut ctx, f));
+    }
+
+    /// A loop with a memory side effect must not be removed even if its values
+    /// are otherwise unused.
+    #[test]
+    fn loop_with_side_effect_is_kept() {
+        use qcode_macro::qcode;
+        let mut ctx = Context::new();
+        qcode!(
+            ctx,
+            "
+            fn f:
+            <pre @n:i64 @p:i64>
+                goto <head @i=0x1>;
+            <head @i:i64>
+                %done = i64 @i == i64 0x5;
+                if %done goto <exit> else goto <body>;
+            <body>
+                store(ram:8, i64 @p <- i64 @i);
+                %j1 = i64 @i + i64 0x1;
+                goto <head @i=%j1>;
+            <exit>
+                goto <0x2000>;
+            "
+        );
+
+        assert!(
+            !super::remove_dead_counted_loop(&mut ctx, f),
+            "a loop that stores to memory is observable and must be kept"
+        );
+    }
+}
+
+// ----- dead counted loop -----------------------------------------------------
+
+use qcode::value::{
+    FunctionRef, ValueId, ValueRef,
+    insn::{Binary, Binop, IntBinop},
+};
+
+/// A recognized dead, provably-terminating counted loop (see
+/// [`remove_dead_counted_loop`]).
+struct DeadLoop {
+    /// The loop's sole preheader block, ending in `goto header(inits…)`.
+    preheader: BlockId,
+    /// The exit block to reroute the preheader to.
+    exit: BlockId,
+}
+
+/// `c` if `v` is the integer literal `c`, else `None`.
+fn dl_literal(ctx: &Context, v: ValueId) -> Option<u64> {
+    match ValueRef::new(v, ctx) {
+        ValueRef::Literal(l) => Some(l.value()),
+        _ => None,
+    }
+}
+
+/// `true` if `v` is `iv + 1` (either operand order).
+fn dl_is_unit_inc(ctx: &Context, v: ValueId, iv: ValueId) -> bool {
+    let ValueId::Instruction(id) = v else {
+        return false;
+    };
+    let Mnemonic::Binop(Binary { lhs, rhs, op }) = ctx.get_insn(id).mnemonic() else {
+        return false;
+    };
+    let one = |x: ValueId| dl_literal(ctx, x) == Some(1);
+    matches!(op, Binop::Int(IntBinop::Add))
+        && ((*lhs == iv && one(*rhs)) || (*rhs == iv && one(*lhs)))
+}
+
+/// `true` if `cond` is `iv == <literal>` (either operand order).
+fn dl_is_eq_const(ctx: &Context, cond: ValueId, iv: ValueId) -> bool {
+    let ValueId::Instruction(id) = cond else {
+        return false;
+    };
+    let Mnemonic::Binop(Binary { lhs, rhs, op }) = ctx.get_insn(id).mnemonic() else {
+        return false;
+    };
+    matches!(op, Binop::Int(IntBinop::Equal))
+        && ((*lhs == iv && dl_literal(ctx, *rhs).is_some())
+            || (*rhs == iv && dl_literal(ctx, *lhs).is_some()))
+}
+
+/// Distinct predecessor blocks of `b`.
+fn dl_preds(ctx: &Context, b: BlockId) -> Vec<BlockId> {
+    let mut seen = HashSet::default();
+    BasicBlock::from_id(ctx, b)
+        .predecessors()
+        .map(|(_, p)| p)
+        .filter(|&p| seen.insert(p))
+        .collect()
+}
+
+/// Terminator instruction of `b`, if any.
+fn dl_term(ctx: &Context, b: BlockId) -> Option<InstructionId> {
+    BasicBlock::from_id(ctx, b)
+        .instruction_ids()
+        .last()
+        .copied()
+}
+
+/// `true` if every user of `v` lives in one of `region`'s blocks.
+fn dl_users_confined(ctx: &Context, v: ValueId, region: &[BlockId]) -> bool {
+    ctx.users(v).to_vec().iter().all(|&u| {
+        ctx.get_insn(u)
+            .parent()
+            .is_some_and(|p| region.contains(&p.id))
+    })
+}
+
+/// Matches the canonical dead counted loop headed by `header`:
+///
+/// ```text
+///   P:  goto H(inits…)
+///   H(…iv…):  if iv == N goto E else goto B(…)     // exit on the success arm
+///   B:  … (pure) … goto H(…iv+1…)
+///   E:  …
+/// ```
+///
+/// with region `{H, B}` side-effect-free, the exit edge `H→E` carrying no
+/// arguments, and no value defined in the region used outside it.
+fn match_dead_loop(ctx: &Context, header: BlockId) -> Option<DeadLoop> {
+    let term = dl_term(ctx, header)?;
+    let Mnemonic::CBranch(cb) = ctx.get_insn(term).mnemonic() else {
+        return None;
+    };
+    let (condition, exit, body) = (cb.condition, cb.success_block, cb.failure_block);
+    // The exit arm must carry no arguments and land on a param-less block, so the
+    // rerouted preheader→exit branch stays well-formed and nothing escapes.
+    if !cb.success_args.is_empty() {
+        return None;
+    }
+    if exit == header || body == header || exit == body {
+        return None;
+    }
+    if !ctx.values.basic_blocks[exit].params.is_empty() {
+        return None;
+    }
+
+    // Body: a single unconditional back-edge to the header, reached only from it.
+    let bterm = dl_term(ctx, body)?;
+    let Mnemonic::Branch(bbr) = ctx.get_insn(bterm).mnemonic() else {
+        return None;
+    };
+    if bbr.target != header {
+        return None;
+    }
+    let back_args = bbr.args.clone();
+    let bpreds = dl_preds(ctx, body);
+    if bpreds != [header] {
+        return None;
+    }
+
+    // Header preds: exactly the back-edge plus one external preheader.
+    let hpreds = dl_preds(ctx, header);
+    if hpreds.len() != 2 || !hpreds.contains(&body) {
+        return None;
+    }
+    let preheader = *hpreds.iter().find(|&&p| p != body)?;
+    let pterm = dl_term(ctx, preheader)?;
+    let Mnemonic::Branch(pbr) = ctx.get_insn(pterm).mnemonic() else {
+        return None;
+    };
+    if pbr.target != header {
+        return None;
+    }
+    let init_args = pbr.args.clone();
+
+    // The region's non-terminator instructions must all be pure.
+    let region = [header, body];
+    for &blk in &region {
+        for id in BasicBlock::from_id(ctx, blk).instruction_ids().to_vec() {
+            let m = ctx.get_insn(id).mnemonic();
+            if !m.is_terminator() && has_side_effects(m) {
+                return None;
+            }
+        }
+    }
+
+    // No live-out: every region-defined value (instruction results and block
+    // params) is used only within the region.
+    for &blk in &region {
+        for id in BasicBlock::from_id(ctx, blk).instruction_ids().to_vec() {
+            if !dl_users_confined(ctx, ValueId::Instruction(id), &region) {
+                return None;
+            }
+        }
+        for &pid in &ctx.values.basic_blocks[blk].params {
+            if !dl_users_confined(ctx, ValueId::BlockParam(pid), &region) {
+                return None;
+            }
+        }
+    }
+
+    // Termination: some header param is a unit-stride induction variable that
+    // starts at a literal and drives the `iv == N` exit test, so the loop always
+    // reaches the exit within `2^width` iterations.
+    let hparams = ctx.values.basic_blocks[header].params.clone();
+    let counted = hparams.iter().enumerate().any(|(k, &pid)| {
+        let iv = ValueId::BlockParam(pid);
+        back_args
+            .get(k)
+            .is_some_and(|&be| dl_is_unit_inc(ctx, be, iv))
+            && init_args
+                .get(k)
+                .is_some_and(|&ini| dl_literal(ctx, ini).is_some())
+            && dl_is_eq_const(ctx, condition, iv)
+    });
+    if !counted {
+        return None;
+    }
+
+    Some(DeadLoop { preheader, exit })
+}
+
+/// Removes one dead, provably-terminating counted loop from `fun_id` by
+/// rerouting its preheader straight to the loop exit, leaving the loop region
+/// unreachable for `simplify_cfg` to prune. Returns `true` if one was removed.
+///
+/// This is the region-level counterpart to the local pure-instruction sweep: a
+/// loop-carried value is never locally dead (its back-edge is a self-use), so a
+/// dead loop can only be recognized by reasoning over the whole cyclic region.
+fn remove_dead_counted_loop(ctx: &mut Context, fun_id: FunctionId) -> bool {
+    let headers: Vec<BlockId> = FunctionRef::from_id(ctx, fun_id)
+        .blocks()
+        .map(|b| b.id)
+        .collect();
+    for header in headers {
+        if let Some(dl) = match_dead_loop(ctx, header) {
+            replace_terminator_with_branch(ctx, dl.preheader, dl.exit, vec![]);
+            return true;
+        }
+    }
+    false
 }
 
 // ----- pass ------------------------------------------------------------------
-
-use qcode::value::FunctionRef;
 
 use crate::{FunctionPass, PipelineEnv};
 
@@ -455,6 +731,7 @@ impl FunctionPass for Dce {
             }
             round |= super::remove_dead_block_args(ctx, &block_ids, root);
             round |= super::remove_dead_block_params(ctx, &block_ids, root);
+            round |= remove_dead_counted_loop(ctx, fun_id);
             if !round {
                 break;
             }
