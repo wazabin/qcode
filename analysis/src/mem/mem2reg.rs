@@ -722,6 +722,11 @@ struct LiveInBlocks {
     upward_exposed: HashMap<ValueId, HashSet<BlockId>>,
     /// Call-terminated blocks and what each clobbers.
     call_blocks: Vec<(BlockId, CallClobber)>,
+    /// The function's own blocks. The backward liveness walk stays inside this
+    /// set: a tail-call edge into another function is a real CFG predecessor
+    /// edge, but following it would let a foreign block flip this function's
+    /// live-in decisions.
+    blocks: HashSet<BlockId>,
     /// Memoized live-in sets, keyed by variable.
     memo: HashMap<ValueId, HashSet<BlockId>>,
 }
@@ -731,10 +736,12 @@ impl LiveInBlocks {
         let mut store_blocks: HashMap<ValueId, HashSet<BlockId>> = HashMap::default();
         let mut upward_exposed: HashMap<ValueId, HashSet<BlockId>> = HashMap::default();
         let mut call_blocks = Vec::new();
+        let mut blocks: HashSet<BlockId> = HashSet::default();
         let mut stored_here: HashSet<ValueId> = HashSet::default();
 
         for block in Function::from_id(ctx, function_id).blocks() {
             let block_id = block.id;
+            blocks.insert(block_id);
             stored_here.clear();
             for insn in block.iter() {
                 match insn.mnemonic() {
@@ -766,6 +773,7 @@ impl LiveInBlocks {
             store_blocks,
             upward_exposed,
             call_blocks,
+            blocks,
             memo: HashMap::default(),
         }
     }
@@ -806,7 +814,7 @@ impl LiveInBlocks {
         let mut worklist: Vec<BlockId> = live_in.iter().copied().collect();
         while let Some(block_id) = worklist.pop() {
             for (_, pred) in BasicBlock::from_id(ctx, block_id).predecessors() {
-                if !defined.contains(&pred) && live_in.insert(pred) {
+                if self.blocks.contains(&pred) && !defined.contains(&pred) && live_in.insert(pred) {
                     worklist.push(pred);
                 }
             }

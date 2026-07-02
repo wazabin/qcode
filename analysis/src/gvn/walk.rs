@@ -286,6 +286,7 @@ pub(super) fn run_flat_fixpoint<P: SubPasses>(
 /// The per-entry invariants of one dominator-tree walk.
 struct Walk<'a, P: SubPasses> {
     passes: &'a P,
+    func_id: FunctionId,
     tree: &'a DominatorTree<BlockId>,
     aliases: Option<&'a AliasResult>,
     shared: &'a HashSet<BlockId>,
@@ -294,6 +295,15 @@ struct Walk<'a, P: SubPasses> {
 
 impl<P: SubPasses> Walk<'_, P> {
     fn rec(&mut self, ctx: &mut Context, block_id: BlockId, inherited: &P::States) {
+        // Stay inside the function being processed. A tail-call edge is a real CFG
+        // edge, so the dominator tree can reach blocks owned by the callee — but
+        // the per-function alias oracle does not describe them, and following a
+        // foreign store here could invalidate (or fail to invalidate) a forwarded
+        // load using the wrong facts. Each block is processed by its own owner's
+        // walk, with its own alias oracle and dominator context.
+        if ctx.values.basic_blocks[block_id].parent != Some(self.func_id) {
+            return;
+        }
         let mut states = inherited.clone();
         self.passes.on_block_entry(
             ctx,
@@ -377,6 +387,7 @@ pub(super) fn run_dominator_walk<P: SubPasses>(
         let tree = compute_dominators(ctx, entry);
         let mut walk = Walk {
             passes,
+            func_id,
             tree: &tree,
             aliases,
             shared: &shared,
