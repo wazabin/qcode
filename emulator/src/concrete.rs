@@ -1325,6 +1325,22 @@ impl StandaloneEmulator {
                 self.idx += 1;
             }
 
+            // Whole-array load: the region snapshot `%l0 = load(ram:{N*esz}, base)`
+            // that `array_promote` reads once before an original-array scan/map.
+            // Its result is array-typed, so it lives in `array_values`; a scalar
+            // load falls through to the generic interpreter below.
+            Mnemonic::Load(load) if self.is_array_operand(ctx, ValueId::Instruction(insn_id)) => {
+                let (space, ptr, size) = (load.space, load.ptr, load.size);
+                let addr = self
+                    .get_value(ctx, ptr)
+                    .ok_or_else(|| self.make_error(ctx, EmulatorErrorKind::ValueError(0)))?;
+                let buf = self
+                    .read_memory(ctx, space, addr, size)
+                    .map_err(|kind| self.make_error(ctx, kind))?;
+                self.array_values.insert(insn_id, buf);
+                self.idx += 1;
+            }
+
             // Whole-array store: the promoted buffer written back to memory in one
             // shot (`store(ram, base <- arr)` at loop exit). A scalar store falls
             // through to the generic interpreter below.
@@ -1348,6 +1364,29 @@ impl StandaloneEmulator {
                 let scan = scan.clone();
                 self.eval_scan(ctx, insn_id, &scan)
                     .map_err(|kind| self.make_error(ctx, kind))?;
+                self.idx += 1;
+            }
+
+            // Total map: apply the pure unary body to every source element.
+            Mnemonic::Map(map) => {
+                let map = map.clone();
+                self.eval_map(ctx, insn_id, &map)
+                    .map_err(|kind| self.make_error(ctx, kind))?;
+                self.idx += 1;
+            }
+
+            // Array slice: `arr[start:start+size]` on an array-typed source is a
+            // sub-buffer (e.g. `l0[1..]`, the original-array scan source), kept in
+            // the `array_values` domain. A scalar `Range` (bit-field extract) falls
+            // through to the generic interpreter below.
+            Mnemonic::Range(range) if self.is_array_operand(ctx, range.src) => {
+                let (src, start, size) = (range.src, range.start, range.size);
+                let buf = self
+                    .resolve_array(ctx, src)
+                    .ok_or_else(|| self.make_error(ctx, EmulatorErrorKind::ValueError(0)))?;
+                let end = (start + size).min(buf.len());
+                let slice = buf.get(start..end).unwrap_or(&[]).to_vec();
+                self.array_values.insert(insn_id, slice);
                 self.idx += 1;
             }
 
@@ -1859,6 +1898,98 @@ impl StandaloneEmulator {
         Ok(())
     }
 
+    /// Total map: run the (pure) unary body once per source element and
+    /// materialize the results as an array buffer. Mirrors [`Self::eval_scan`]
+    /// without the threaded accumulator.
+    fn eval_map(
+        &mut self,
+        ctx: &Context<'_>,
+        insn_id: InstructionId,
+        map: &qcode::value::insn::Map,
+    ) -> Result<(), EmulatorErrorKind> {
+        const MAP_STEP_BUDGET: usize = 100_000;
+
+        let src = self
+            .resolve_array(ctx, map.src)
+            .ok_or(EmulatorErrorKind::ValueError(0))?;
+        let in_elem = ctx
+            .stored_type_of(map.src)
+            .and_then(|ty| ctx.types.seq_elem_of(ty))
+            .ok_or(EmulatorErrorKind::ValueError(0))?;
+        let isz = ctx.types.size_of(in_elem).max(1);
+        let out_elem = ctx
+            .stored_type_of(ValueId::Instruction(insn_id))
+            .and_then(|ty| ctx.types.seq_elem_of(ty))
+            .ok_or(EmulatorErrorKind::ValueError(0))?;
+        let osz = ctx.types.size_of(out_elem);
+        let count = src.len() / isz;
+
+        let capture_args: Vec<BodyArg> = map
+            .captures
+            .iter()
+            .map(|&c| {
+                let v = self
+                    .get_value(ctx, c)
+                    .ok_or(EmulatorErrorKind::ValueError(0))?;
+                let sz = ctx
+                    .stored_type_of(c)
+                    .map(|ty| ctx.types.size_of(ty))
+                    .unwrap_or(8);
+                Ok(BodyArg::Scalar(SizedValue::new(v, sz)))
+            })
+            .collect::<Result<_, EmulatorErrorKind>>()?;
+
+        // The element may be an `enumerate` tuple `(index, elem)`; pass it as an
+        // aggregate so the body's `Extract`s resolve (same layout as `eval_scan`).
+        let elem_fields: Option<Vec<(usize, usize)>> =
+            ctx.types.aggregate_fields(in_elem).map(|fs| {
+                let mut off = 0;
+                fs.iter()
+                    .map(|f| {
+                        let sz = ctx.types.size_of(f.type_id);
+                        let field = (off, sz);
+                        off += sz;
+                        field
+                    })
+                    .collect()
+            });
+
+        let mut out = Vec::with_capacity(count * osz);
+        for k in 0..count {
+            let elem = &src[k * isz..k * isz + isz];
+            let elem_arg = match &elem_fields {
+                Some(fields) => BodyArg::Aggregate(
+                    fields
+                        .iter()
+                        .map(|&(off, sz)| SizedValue::from_bits(le_bits(&elem[off..off + sz]), sz))
+                        .collect(),
+                ),
+                None => BodyArg::Scalar(SizedValue::from_bits(le_bits(elem), isz)),
+            };
+            let mut body_args = Vec::with_capacity(1 + capture_args.len());
+            body_args.push(elem_arg);
+            body_args.extend(capture_args.iter().cloned());
+
+            let mut emu = StandaloneEmulator::new(
+                Function::from_id(ctx, map.body)
+                    .root()
+                    .ok_or(EmulatorErrorKind::EmptyFunctionRoot(map.body))?
+                    .id,
+            );
+            emu.run_map_body(ctx, map.body, &body_args, MAP_STEP_BUDGET)
+                .map_err(|e| e.kind)?;
+            let ret = body_return_value(ctx, emu.current_block())
+                .ok_or(EmulatorErrorKind::ValueError(0))?;
+            let mut lane = emu
+                .get_value_bytes(ctx, ret)
+                .ok_or(EmulatorErrorKind::ValueError(0))?;
+            lane.resize(osz, 0);
+            out.extend_from_slice(&lane);
+        }
+        self.array_values.insert(insn_id, out);
+        Ok(())
+    }
+
     pub fn run_map_body(
         &mut self,
         ctx: &Context<'_>,
@@ -2356,59 +2487,37 @@ mod tests {
         assert_eq!(emu.get_value(&ctx, ret), Some(0));
     }
 
-    /// Emulating a function whose body contains a `map` bails with a recoverable
-    /// `UnsupportedMnemonic` error rather than panicking (whole-array emulation is
-    /// deferred; a best-effort consumer declines to harvest).
+    /// `map @f arr` runs the pure unary body over every element and materializes
+    /// the result buffer. `f(x) = x * 3`, `arr = [1, 2, 3, 4]` ⇒ `[3, 6, 9, 12]`.
     #[test]
-    fn map_emulation_bails_recoverably() {
-        use qcode::builder::Builder;
-        use qcode::value::{BasicBlock, Function, ValueId, insn::Return};
-
+    fn map_over_array_is_emulated() {
         let mut ctx = Context::new();
-        let body = Function::make(&mut ctx, "body".into()).unwrap().id;
-        let f = Function::make(&mut ctx, "f".into()).unwrap().id;
-        let entry = ctx.get_or_make_block(0x1000);
-        {
-            let mut fm = Function::from_id_mut(&mut ctx, f);
-            fm.set_root(entry).unwrap();
-            fm.add_block(entry);
-        }
-        let i8 = ctx.types.get_or_make_int(1);
-        let arr_ty = ctx.types.get_or_make_array(i8, 4);
-        let src = {
-            let mut b = Builder::from_block(BasicBlock::from_id_mut(&mut ctx, entry));
-            b.push_param(4).id()
-        };
-        if let ValueId::BlockParam(pid) = src {
-            ctx.values.block_params[pid].type_id = arr_ty;
-        }
-        let (mapv, ret, ptr) = {
-            let mut b = Builder::from_block(BasicBlock::from_id_mut(&mut ctx, entry));
-            let m = b.push_map(body, src, Vec::new()).id();
-            let ptr = b.context_mut().get_const(0, 8).id();
-            let ret = b.push_return(ptr).id();
-            unsafe { b.dont_finalize() };
-            (m, ret, ptr)
-        };
-        let ValueId::Instruction(rid) = ret else {
-            unreachable!()
-        };
-        ctx.replace_instruction_mnemonic(
-            rid,
-            Mnemonic::Return(Return {
-                ptr,
-                value: Some(mapv),
-            }),
+        qcode!(
+            ctx,
+            "
+            lambda triple:
+            <tb @x:i64>
+                %r = @x * 3;
+                return %r;
+            fn main:
+            <me>
+                %src = $iota(i64 0x4);
+                %m = triple <$> %src;
+                goto <0x1001>;
+            "
         );
 
-        let mut emu = StandaloneEmulator::new(entry);
-        let err = emu
-            .run_pure(&ctx, f, &[SizedValue::new(0, 4)], 1000)
-            .expect_err("map must not be emulated");
-        assert!(matches!(
-            err.kind,
-            EmulatorErrorKind::UnsupportedMnemonic("map")
-        ));
+        let mut emu = StandaloneEmulator::new(me);
+        emu.step(&ctx).expect("iota");
+        emu.step(&ctx).expect("map");
+
+        let buf = emu.array_values.get(&m).expect("map produced an array");
+        let words: Vec<u64> = buf
+            .chunks_exact(8)
+            .map(|c| u64::from_le_bytes(c.try_into().unwrap()))
+            .collect();
+        // iota(4) = [0,1,2,3]; triple ⇒ [0, 3, 6, 9].
+        assert_eq!(words, vec![0, 3, 6, 9]);
     }
 
     /// End-to-end array emulation: `scanl @step init (iota n)` threads the

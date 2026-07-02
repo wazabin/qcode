@@ -72,6 +72,11 @@ struct ScanMatch {
     count: usize,
     /// The array element type.
     elem_ty: qcode::types::TypeId,
+    /// Set when the body reads the region's *original* element at its own lane
+    /// (`at(%l0, index)`) — the loop is a scan over the original array rather than
+    /// a pure generation over `iota`. Holds `(element-read value, exit snapshot
+    /// param to slice)`; the scan then ranges over `l0[1..]`.
+    elem: Option<(ValueId, ValueId)>,
 }
 
 /// `c` if `v` is the integer literal `c`, else `None`.
@@ -308,6 +313,56 @@ fn try_match(ctx: &mut Context, fid: FunctionId) -> Option<ScanMatch> {
     }
     let prev_val = ValueId::Instruction(prev_id);
 
+    // Original-element read: a second `at(l0_b, index)` on a *different*
+    // loop-invariant array param `l0_b` (the whole-region snapshot `array_promote`
+    // threads when the loop reads its own lane). Its presence turns the fold into a
+    // scan over the original array `l0[1..]` instead of over `iota`.
+    let mut elem = None;
+    for insn in BasicBlock::from_id(ctx, body).iter() {
+        let Mnemonic::Intrinsic(IntrinsicApp { id, args }) = insn.mnemonic() else {
+            continue;
+        };
+        if *id != at_id || args.len() != 2 || args[0] == arr_b {
+            continue;
+        }
+        let (l0_b, e_idx) = (args[0], args[1]);
+        if !matches!(l0_b, ValueId::BlockParam(_)) || e_idx != index {
+            continue;
+        }
+        if elem.is_some() {
+            return None;
+        }
+        elem = Some((ValueId::Instruction(insn.id), l0_b));
+    }
+    // Resolve the snapshot's exit view (to slice `l0[1..]` at the store site). The
+    // snapshot is loop-invariant, so it reaches the exit as an exit param whose
+    // header-edge value is the header param feeding `l0_b`. v1 array-input support
+    // is limited to the split shape (distinct body/exit blocks).
+    let elem = match elem {
+        Some((e_read, l0_b)) => {
+            if body == header {
+                return None; // rotated array-input not supported in v1
+            }
+            let [l0_h] = incoming(ctx, body, param_pos(ctx, body, l0_b)?)[..] else {
+                return None;
+            };
+            if param_parent(ctx, l0_h) != Some(header) {
+                return None;
+            }
+            let mut l0_exit = None;
+            for p in BasicBlock::from_id(ctx, exit).params().map(|p| p.id()) {
+                if incoming(ctx, exit, param_pos(ctx, exit, p)?)[..] == [l0_h] {
+                    if l0_exit.is_some() {
+                        return None;
+                    }
+                    l0_exit = Some(p);
+                }
+            }
+            Some((e_read, l0_exit?))
+        }
+        None => None,
+    };
+
     // Induction: the values feeding `index` start at a single literal `s` and step
     // by one on the back-edge. In the rotated shape (`body == header`) the index
     // param's own two incomings are the preheader init and the back-edge
@@ -348,6 +403,7 @@ fn try_match(ctx: &mut Context, fid: FunctionId) -> Option<ScanMatch> {
         index_start,
         count,
         elem_ty,
+        elem,
     })
 }
 
@@ -363,41 +419,77 @@ fn apply(ctx: &mut Context, fid: FunctionId, m: &ScanMatch) -> bool {
     let singleton_id = IntrinsicId::from_name("singleton").expect("singleton registered");
     let concat_id = IntrinsicId::from_name("concat").expect("concat registered");
 
-    // The scan ranges directly over `iota(N-1)`: its element *is* the loop index,
-    // fed straight to the body (no `enumerate` tuple). The only array the scan
-    // touches is this freshly-built constant, so no original memory is read — the
-    // property the functionalization exists to prove is now syntactic.
-    let src_arr_ty = ctx.types.get_or_make_array(i64_ty, n1);
-
     let name = format!("{}_scan_body", Function::from_id(ctx, fid).name());
-    let Some(body_fn) = outline_scan_body(
-        ctx,
-        &name,
-        m.stored_val,
-        m.prev_val,
-        m.index,
-        None,
-        m.index_start,
-        m.elem_ty,
-        index_ty,
-        ScanElem::Scalar(i64_ty),
-    ) else {
-        return false;
-    };
 
-    // `iota(N-1)` typed to the concrete `[i64; N-1]` (construction does not fold).
-    let n1_const = ctx.get_const(n1 as u64, 8).id();
-    let iota_id_insn = InstructionRef::from_mnemonic_with_type(
-        ctx,
-        Mnemonic::Intrinsic(IntrinsicApp {
-            id: iota_id,
-            args: vec![n1_const],
-        }),
-        src_arr_ty,
-    )
-    .id;
-    BasicBlock::from_id_mut(ctx, m.exit).insert_insn_before(m.store_id, iota_id_insn);
-    let src = ValueId::Instruction(iota_id_insn);
+    // Two source shapes. When the body reads the region's original element
+    // (`m.elem`), the scan ranges over the *original array* `l0[1..]` and the body
+    // is `f(acc, x)` over that data element. Otherwise it is a pure generation and
+    // the scan ranges over `iota(N-1)`, whose element is the loop index (no
+    // original memory read — the property is then syntactic).
+    let (body_fn, src) = match m.elem {
+        Some((elem_read, l0_exit)) => {
+            let esz = ctx.types.size_of(m.elem_ty);
+            let src_arr_ty = ctx.types.get_or_make_array(m.elem_ty, n1);
+            let Some(body_fn) = outline_scan_body(
+                ctx,
+                &name,
+                m.stored_val,
+                m.prev_val,
+                m.index,
+                Some(elem_read),
+                m.index_start,
+                m.elem_ty,
+                index_ty,
+                ScanElem::Data(m.elem_ty),
+            ) else {
+                return false;
+            };
+            // `l0[1..]` — the original elements at lanes `1..N`, a byte-slice of the
+            // snapshot array from element 1 (length `N-1`).
+            let slice = InstructionRef::from_mnemonic_with_type(
+                ctx,
+                Mnemonic::Range(qcode::value::insn::Range {
+                    src: l0_exit,
+                    start: esz,
+                    size: n1 * esz,
+                }),
+                src_arr_ty,
+            )
+            .id;
+            BasicBlock::from_id_mut(ctx, m.exit).insert_insn_before(m.store_id, slice);
+            (body_fn, ValueId::Instruction(slice))
+        }
+        None => {
+            let src_arr_ty = ctx.types.get_or_make_array(i64_ty, n1);
+            let Some(body_fn) = outline_scan_body(
+                ctx,
+                &name,
+                m.stored_val,
+                m.prev_val,
+                m.index,
+                None,
+                m.index_start,
+                m.elem_ty,
+                index_ty,
+                ScanElem::Scalar(i64_ty),
+            ) else {
+                return false;
+            };
+            // `iota(N-1)` typed to the concrete `[i64; N-1]` (construction does not fold).
+            let n1_const = ctx.get_const(n1 as u64, 8).id();
+            let iota_id_insn = InstructionRef::from_mnemonic_with_type(
+                ctx,
+                Mnemonic::Intrinsic(IntrinsicApp {
+                    id: iota_id,
+                    args: vec![n1_const],
+                }),
+                src_arr_ty,
+            )
+            .id;
+            BasicBlock::from_id_mut(ctx, m.exit).insert_insn_before(m.store_id, iota_id_insn);
+            (body_fn, ValueId::Instruction(iota_id_insn))
+        }
+    };
 
     // scan(iota) → singleton(seed) → concat, all before the wide store.
     let full = {
@@ -418,6 +510,251 @@ fn apply(ctx: &mut Context, fid: FunctionId, m: &ScanMatch) -> bool {
     true
 }
 
+/// A recognized carry-free indexed-map fill loop (`l[j] = f(l[j], j)`), the
+/// seedless dual of [`ScanMatch`]: no accumulator, every lane read from the
+/// original snapshot and written once. Folds to `map @f (enumerate l0)`.
+struct MapMatch {
+    exit: BlockId,
+    store_id: InstructionId,
+    /// The body's per-lane result (`%next`), the map body's return value.
+    stored_val: ValueId,
+    /// The body induction parameter (`j`), read as the map index.
+    index: ValueId,
+    /// The `at(l0, j)` element-read value bound to the body's element input.
+    elem_read: ValueId,
+    /// The exit view of the whole-region snapshot to enumerate/map over.
+    l0_exit: ValueId,
+    /// The array element type and full length.
+    elem_ty: qcode::types::TypeId,
+    count: usize,
+}
+
+/// Recognize the carry-free `insert`/`at` map loop `array_promote` emits for an
+/// indexed map over the original array.
+fn try_match_map(ctx: &mut Context, fid: FunctionId) -> Option<MapMatch> {
+    let insert_id = IntrinsicId::from_name("insert")?;
+    let at_id = IntrinsicId::from_name("at")?;
+
+    // Anchor: a single array-typed RAM store whose source is a block param.
+    let mut candidates: Vec<(InstructionId, BlockId, ValueId)> = Vec::new();
+    for block in Function::from_id(ctx, fid).iter() {
+        let bid = block.id;
+        for insn in block.iter() {
+            let Mnemonic::Store(s) = insn.mnemonic() else {
+                continue;
+            };
+            if matches!(
+                qcode::space::Space::from_id(ctx, s.space).ty,
+                qcode::space::SpaceType::Ram
+            ) {
+                candidates.push((insn.id, bid, s.src));
+            }
+        }
+    }
+    let mut anchor = None;
+    for (id, bid, src) in candidates {
+        if !matches!(src, ValueId::BlockParam(_)) {
+            continue;
+        }
+        let src_ty = ctx.type_of(src);
+        let Some((elem_ty, count)) = ctx.types.array_of(src_ty) else {
+            continue;
+        };
+        if count == 0 {
+            continue;
+        }
+        if anchor.is_some() {
+            return None;
+        }
+        anchor = Some((id, bid, src, elem_ty, count));
+    }
+    let (store_id, exit, arr_src, elem_ty, count) = anchor?;
+
+    let exit_preds: Vec<BlockId> = BasicBlock::from_id(ctx, exit)
+        .predecessors()
+        .map(|(_, p)| p)
+        .collect();
+    let [header] = exit_preds[..] else {
+        return None;
+    };
+    let arr_h = if param_parent(ctx, arr_src) == Some(header) {
+        arr_src
+    } else {
+        let k = param_pos(ctx, exit, arr_src)?;
+        match incoming(ctx, exit, k)[..] {
+            [v] => v,
+            _ => return None,
+        }
+    };
+    if param_parent(ctx, arr_h) != Some(header) {
+        return None;
+    }
+
+    // The header array param's incomings: the body carry `insert(arr_b, j, next)`
+    // and a non-insert initial array (the zero seed). A `map` has no accumulator,
+    // so there is exactly one insert and no lane-0 seed insert.
+    let k_arrh = param_pos(ctx, header, arr_h)?;
+    let mut carry = None;
+    let mut saw_init = false;
+    for v in incoming(ctx, header, k_arrh) {
+        match v {
+            ValueId::Instruction(iid) => {
+                let Mnemonic::Intrinsic(IntrinsicApp { id, args }) = ctx.get_insn(iid).mnemonic()
+                else {
+                    return None;
+                };
+                if *id != insert_id {
+                    return None;
+                }
+                let [arr0, idx, val] = args[..] else {
+                    return None;
+                };
+                if !matches!(arr0, ValueId::BlockParam(_)) {
+                    return None;
+                }
+                if carry.is_some() {
+                    return None;
+                }
+                carry = Some((arr0, val, idx));
+            }
+            // The zero-initialized array literal.
+            ValueId::Bytes(_) => saw_init = true,
+            _ => return None,
+        }
+    }
+    if !saw_init {
+        return None;
+    }
+    let (arr_b, stored_val, ins_idx) = carry?;
+    let body = param_parent(ctx, arr_b)?;
+    if body == header {
+        return None; // rotated map deferred to v1's split-shape support
+    }
+    if !matches!(ins_idx, ValueId::BlockParam(_)) || param_parent(ctx, ins_idx) != Some(body) {
+        return None;
+    }
+    let index = ins_idx;
+
+    let header_preds: HashSet<BlockId> = BasicBlock::from_id(ctx, header)
+        .predecessors()
+        .map(|(_, p)| p)
+        .collect();
+    if !header_preds.contains(&body) {
+        return None;
+    }
+
+    // The body reads the original element `at(l0_b, j)` on a loop-invariant param
+    // `l0_b != arr_b`, and reads no accumulator (`at(arr_b, …)` would be a scan).
+    let mut elem = None;
+    for insn in BasicBlock::from_id(ctx, body).iter() {
+        let Mnemonic::Intrinsic(IntrinsicApp { id, args }) = insn.mnemonic() else {
+            continue;
+        };
+        if *id != at_id || args.len() != 2 {
+            continue;
+        }
+        if args[0] == arr_b {
+            return None; // an accumulator read — this is a scan, not a map
+        }
+        if !matches!(args[0], ValueId::BlockParam(_)) || args[1] != index {
+            continue;
+        }
+        if elem.is_some() {
+            return None;
+        }
+        elem = Some((ValueId::Instruction(insn.id), args[0]));
+    }
+    let (elem_read, l0_b) = elem?;
+
+    // Induction: `j` starts at 0 and steps by 1.
+    let k_index = param_pos(ctx, body, index)?;
+    let [hp] = incoming(ctx, body, k_index)[..] else {
+        return None;
+    };
+    if param_parent(ctx, hp) != Some(header) {
+        return None;
+    }
+    let k_hp = param_pos(ctx, header, hp)?;
+    let feeds = incoming(ctx, header, k_hp);
+    if !feeds.iter().any(|&v| is_increment(ctx, v, index)) {
+        return None;
+    }
+    let inits: Vec<i64> = feeds
+        .iter()
+        .filter(|&&v| !is_increment(ctx, v, index))
+        .filter_map(|&v| literal(ctx, v).map(|x| x as i64))
+        .collect();
+    if inits != [0] {
+        return None; // v1 maps tile [0, N) from index 0
+    }
+
+    // The exit view of the snapshot to enumerate over.
+    let [l0_h] = incoming(ctx, body, param_pos(ctx, body, l0_b)?)[..] else {
+        return None;
+    };
+    if param_parent(ctx, l0_h) != Some(header) {
+        return None;
+    }
+    let mut l0_exit = None;
+    for p in BasicBlock::from_id(ctx, exit).params().map(|p| p.id()) {
+        if incoming(ctx, exit, param_pos(ctx, exit, p)?)[..] == [l0_h] {
+            if l0_exit.is_some() {
+                return None;
+            }
+            l0_exit = Some(p);
+        }
+    }
+    let l0_exit = l0_exit?;
+
+    Some(MapMatch {
+        exit,
+        store_id,
+        stored_val,
+        index,
+        elem_read,
+        l0_exit,
+        elem_ty,
+        count,
+    })
+}
+
+/// Rewrite a matched map loop to `store(ram, base <- map @f (enumerate l0))`.
+fn apply_map(ctx: &mut Context, fid: FunctionId, m: &MapMatch) -> bool {
+    use super::loop_to_map::outline_tupled;
+
+    let enum_id = IntrinsicId::from_name("enumerate").expect("enumerate registered");
+    let l0_ty = ctx.types.get_or_make_array(m.elem_ty, m.count);
+    let enum_ty = enum_id.desc().result_type(&mut ctx.types, &[l0_ty]);
+    let Some((tuple_ty, _)) = ctx.types.array_of(enum_ty) else {
+        return false;
+    };
+
+    let name = format!("{}_map_body", Function::from_id(ctx, fid).name());
+    let Some(body_fn) = outline_tupled(
+        ctx,
+        &name,
+        m.stored_val,
+        m.index,
+        m.elem_read,
+        tuple_ty,
+    ) else {
+        return false;
+    };
+
+    let out = {
+        let mut b = Builder::from_block(BasicBlock::from_id_mut(ctx, m.exit));
+        b.set_insert_point_before(m.store_id);
+        let en = b.push_intrinsic(enum_id, vec![m.l0_exit]).id();
+        b.push_map(body_fn, en, Vec::new()).id()
+    };
+    let mut sm = ctx.get_insn(m.store_id).mnemonic().clone();
+    if let Mnemonic::Store(s) = &mut sm {
+        s.src = out;
+    }
+    ctx.replace_instruction_mnemonic(m.store_id, sm);
+    true
+}
+
 impl FunctionPass for LoopToScan {
     const NAME: &'static str = "loop_to_scan";
 
@@ -431,10 +768,14 @@ impl FunctionPass for LoopToScan {
         fun_id: FunctionId,
         _env: &PipelineEnv,
     ) -> Result<bool, String> {
-        match try_match(ctx, fun_id) {
-            Some(m) => Ok(apply(ctx, fun_id, &m)),
-            None => Ok(false),
+        if let Some(m) = try_match(ctx, fun_id) {
+            return Ok(apply(ctx, fun_id, &m));
         }
+        // The carry-free indexed map (`l[j] = f(l[j], j)`) → `map @f (enumerate l0)`.
+        if let Some(m) = try_match_map(ctx, fun_id) {
+            return Ok(apply_map(ctx, fun_id, &m));
+        }
+        Ok(false)
     }
 }
 

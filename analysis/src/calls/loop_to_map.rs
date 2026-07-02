@@ -130,7 +130,7 @@ pub(crate) fn outline_expression(
 ///
 /// Returns `None` if the expression is not closed over `(index, elem)` + literals
 /// (see [`pure_slice`]).
-fn outline_tupled(
+pub(crate) fn outline_tupled(
     ctx: &mut Context,
     name: &str,
     result: ValueId,
@@ -183,6 +183,11 @@ pub(crate) enum ScanElem {
     Tuple(TypeId),
     /// The scan source's scalar element type (the `iota` element, e.g. `i64`).
     Scalar(TypeId),
+    /// The scan ranges over a real data array (`l0[1..]`); param 1 *is* the data
+    /// element, bound to `elem_input`. The loop index is not exposed (the body of
+    /// this shape depends only on the accumulator and the current element, e.g. a
+    /// prefix sum `acc + l[i]`). Used by `loop_to_scan`'s array-input path.
+    Data(TypeId),
 }
 
 /// Outline a [`Scan`](qcode::value::insn::Scan) body: a **binary** function
@@ -207,14 +212,25 @@ pub(crate) fn outline_scan_body(
     index_ty: TypeId,
     elem: ScanElem,
 ) -> Option<FunctionId> {
-    // A scalar source has no separate data lane to bind.
-    if elem_input.is_some() && matches!(elem, ScanElem::Scalar(_)) {
-        return None;
-    }
-    let mut inputs = vec![acc_input, index_input];
-    if let Some(elem) = elem_input {
-        inputs.push(elem);
-    }
+    let inputs: Vec<ValueId> = match elem {
+        // A scalar source has no separate data lane to bind.
+        ScanElem::Scalar(_) => {
+            if elem_input.is_some() {
+                return None;
+            }
+            vec![acc_input, index_input]
+        }
+        ScanElem::Tuple(_) => {
+            let mut v = vec![acc_input, index_input];
+            if let Some(e) = elem_input {
+                v.push(e);
+            }
+            v
+        }
+        // Data source: the body reads only the accumulator and the current element;
+        // the index is not exposed.
+        ScanElem::Data(_) => vec![acc_input, elem_input?],
+    };
     let slice = pure_slice(ctx, result, &inputs)?;
     outline_core(ctx, name, result, &slice, move |ctx, root| {
         let mut value_map: HashMap<ValueId, ValueId> = HashMap::default();
@@ -232,11 +248,17 @@ pub(crate) fn outline_scan_body(
         let param_ty = match elem {
             ScanElem::Tuple(tuple_ty) => tuple_ty,
             ScanElem::Scalar(elem_ty) => elem_ty,
+            ScanElem::Data(elem_ty) => elem_ty,
         };
         let psz = ctx.types.size_of(param_ty);
         let pid = BasicBlock::from_id_mut(ctx, root).push_param(psz).id;
         ctx.values.block_params[pid].type_id = param_ty;
         let param = ValueId::BlockParam(pid);
+        // Data mode: the param *is* the element; bind it and skip index derivation.
+        if let ScanElem::Data(_) = elem {
+            value_map.insert(elem_input.expect("data mode requires elem_input"), param);
+            return value_map;
+        }
         // `idx` is the raw index driver value before narrow/shift: `t.0` in tuple
         // mode (an instruction), or the param itself in scalar mode (no unpack).
         let (mut idx, fty): (ValueId, TypeId) = match elem {
@@ -259,6 +281,8 @@ pub(crate) fn outline_scan_body(
             }
             // Scalar: the param is the index driver value directly.
             ScanElem::Scalar(elem_ty) => (param, elem_ty),
+            // Data mode returned above.
+            ScanElem::Data(_) => unreachable!("data mode handled above"),
         };
         // Narrow `i64` index → loop index width.
         let isz = ctx.types.size_of(index_ty);

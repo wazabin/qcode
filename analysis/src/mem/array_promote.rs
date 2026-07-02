@@ -107,9 +107,10 @@ struct PromoteMatch {
     index: ValueId,
     elem_size: usize,
     count: usize,
-    /// Pre-loop element-0 seed store and the value it writes.
-    seed_id: InstructionId,
-    seed_val: ValueId,
+    /// Pre-loop element-0 seed store and the value it writes. `None` for a
+    /// seedless fill (an indexed map `l[j] = f(l[j], j)` that tiles `[0, count)`
+    /// with no lane-0 pre-store and no carried recurrence).
+    seed: Option<Seed>,
     /// The RAM space the region lives in — all region accesses (seed, lane
     /// store/load, exit loads) share it, and the exit-store writes it back. Its
     /// word size is 1 (byte-addressed), so lane arithmetic in bytes is exact.
@@ -118,18 +119,44 @@ struct PromoteMatch {
     lane_store_id: InstructionId,
     stored_val: ValueId,
     store_delta: i64,
-    /// The carry value to rewrite into `at(arr, index + load_delta)`: either the
-    /// memory-carried lane-load result or the register accumulator param.
-    carry_replace: ValueId,
-    /// `Some(load)` when the carry is a memory lane load (also removed).
-    carry_remove: Option<InstructionId>,
-    load_delta: i64,
+    /// The accumulator carry, when present. Absent for a pure indexed map (no
+    /// cross-iteration dependency — only the original element and the index feed
+    /// the body).
+    carry: Option<Carry>,
+    /// Strided reads of the element *not yet written this trip* — the loop reads
+    /// the region's original memory at its own lane (`l[j]`). Each is rewritten to
+    /// `at(%l0, index + od)`, where `%l0` is the whole-region snapshot loaded once
+    /// in the preheader and threaded through the loop. Unlike the pure-generation
+    /// (iota) case, this loop class *does* read the original array; the read is
+    /// sound because `%l0` captures the region before any lane store and the read
+    /// lane is in `[0, count)`. Pairs of `(load insn, element delta `od`)`.
+    originals: Vec<(InstructionId, i64)>,
     /// Additional const-offset region loads in the exit block, each rewritten to
     /// `at(arr_exit, element)`. Pairs of `(load insn, element index)`.
     extra_loads: Vec<(InstructionId, i64)>,
     /// Dead pre-loop stores to element 0 (overwritten by the seed store), removed
     /// with the rest of the promoted traffic.
     dead_stores: Vec<InstructionId>,
+}
+
+/// A pre-loop element-0 seed: `l[0] = seed_val`, folded into the carried array as
+/// `insert(zero, 0, seed_val)` and dropped from RAM.
+struct Seed {
+    id: InstructionId,
+    val: ValueId,
+}
+
+/// The accumulator carry: a read of an *already-written* earlier lane
+/// (`l[index + load_delta]`, `load_delta < store_delta`) that becomes
+/// `at(arr, index + load_delta)`.
+struct Carry {
+    /// The value the carry read produces, whose uses are redirected to the `at`.
+    replace: ValueId,
+    /// `Some(load)` when the carry is a memory lane load (removed after rewrite);
+    /// `None` for a register-carried accumulator param.
+    remove: Option<InstructionId>,
+    /// Element offset of the carried read relative to the store lane.
+    load_delta: i64,
 }
 
 /// Minimal union-find over `ValueId` for pass-through phi resolution.
@@ -487,44 +514,30 @@ fn try_match(ctx: &mut Context, fid: FunctionId) -> Option<PromoteMatch> {
         }
         seed_candidates.push((pos, a.id, a.block, src, c_seed / esz as i64));
     }
-    if seed_candidates.is_empty() {
-        return None;
-    }
-    let origin_word = seed_candidates.iter().map(|c| c.4).min().unwrap();
-    // v1: every pre-loop region store targets element 0, all in one block.
-    let seed_block = seed_candidates[0].2;
-    if seed_candidates
-        .iter()
-        .any(|c| c.4 != origin_word || c.2 != seed_block)
-    {
-        return None;
-    }
-    seed_candidates.sort_by_key(|c| c.0);
-    let (_, seed_id, _, seed_val, _) = *seed_candidates.last().unwrap();
-    let dead_stores: Vec<InstructionId> = seed_candidates[..seed_candidates.len() - 1]
-        .iter()
-        .map(|c| c.1)
-        .collect();
-    // Element positions relative to the origin.
-    let store_delta = store_word - origin_word;
-
-    // Optional memory-carried lane load: the strided read of a previous element.
-    let mut load: Option<(InstructionId, i64)> = None;
-    for a in &accesses {
-        if a.id == lane_store_id || a.stored.is_some() || a.size != esz || !in_region(a) {
-            continue;
-        }
-        let Some((base, idx, c)) = affine_strided_lane(&numbering, a.ptr, a.size) else {
-            continue;
-        };
-        if idx != index || root_of(base) != Some(base_root) || c % esz as i64 != 0 {
-            continue;
-        }
-        if load.is_some() {
+    // Finalize the seed, if any. A seedless fill (indexed map) has no element-0
+    // pre-store; its origin is derived from the induction below. When seeded, all
+    // pre-stores target element 0 in one block; the last in program order is the
+    // live seed and the earlier ones are dead. `seed_origin_word` is the seed's
+    // element position (relative to which the origin will be fixed).
+    let seeded = if seed_candidates.is_empty() {
+        None
+    } else {
+        let seed_origin_word = seed_candidates.iter().map(|c| c.4).min().unwrap();
+        let seed_block = seed_candidates[0].2;
+        if seed_candidates
+            .iter()
+            .any(|c| c.4 != seed_origin_word || c.2 != seed_block)
+        {
             return None;
         }
-        load = Some((a.id, c / esz as i64 - origin_word));
-    }
+        seed_candidates.sort_by_key(|c| c.0);
+        let (_, seed_id, _, seed_val, _) = *seed_candidates.last().unwrap();
+        let dead_stores: Vec<InstructionId> = seed_candidates[..seed_candidates.len() - 1]
+            .iter()
+            .map(|c| c.1)
+            .collect();
+        Some((seed_origin_word, seed_block, seed_id, seed_val, dead_stores))
+    };
 
     // --- Loop structure ---
     // `index` is the body's induction parameter.
@@ -597,8 +610,10 @@ fn try_match(ctx: &mut Context, fid: FunctionId) -> Option<PromoteMatch> {
     }
     // The pre-loop seed stores must sit in the preheader (they run once, before
     // the loop, dominating every lane).
-    if seed_block != preheader {
-        return None;
+    if let Some((_, seed_block, ..)) = &seeded {
+        if *seed_block != preheader {
+            return None;
+        }
     }
 
     // Induction: the values feeding `index` (directly, in the rotated shape, or
@@ -645,10 +660,18 @@ fn try_match(ctx: &mut Context, fid: FunctionId) -> Option<PromoteMatch> {
         guard_bound(ctx, cond, hi, exit_on_true)?
     };
 
-    // Coverage: element 0 is the seed, lane stores tile `[1, count-1]`.
+    // Fix the region origin (element 0's word offset from `base_root`), and hence
+    // `store_delta`. Seeded: element 0 is the seed store's lane, lane stores tile
+    // `[1, count)`. Seedless (indexed map): element 0 is the lowest lane the store
+    // itself writes (at the minimum index `s`), so lanes tile `[0, count)`.
+    let (origin_word, store_delta) = match &seeded {
+        Some((seed_origin_word, ..)) => (*seed_origin_word, store_word - *seed_origin_word),
+        None => (s + store_word, -s),
+    };
     let store_lo = s + store_delta;
     let store_hi = (n - 1) + store_delta;
-    if store_lo != 1 || store_hi < store_lo {
+    let expected_lo = if seeded.is_some() { 1 } else { 0 };
+    if store_lo != expected_lo || store_hi < store_lo {
         return None;
     }
     let count = (store_hi + 1) as usize;
@@ -656,51 +679,105 @@ fn try_match(ctx: &mut Context, fid: FunctionId) -> Option<PromoteMatch> {
         return None;
     }
 
-    // Carry: either the memory lane load, or a register accumulator param whose
-    // back-edge value is `stored_val` (`@acc' = %next`) and whose preheader init
-    // is the seed. Both become `at(arr, index-1)`.
-    let (carry_replace, carry_remove, load_delta) = match load {
-        Some((load_id, ld)) => {
-            // A valid memory carry reads a strictly-earlier, already-written lane.
-            if ld >= store_delta || s + ld < 0 {
+    // Classify the strided region loads at `index + od`:
+    //   - `od < store_delta`: a read of an already-written *earlier* lane — the
+    //     accumulator carry. At most one (the canonical scan shape).
+    //   - `od == store_delta`: a read of this trip's *own* lane before it is
+    //     written — the region's original value; forwarded to `at(%l0, index+od)`.
+    // Reads of a *later* unwritten lane (`od > store_delta`) can run past the
+    // region end at the last iterations; v1 rejects them.
+    let mut mem_carry: Option<(InstructionId, i64)> = None;
+    let mut originals: Vec<(InstructionId, i64)> = Vec::new();
+    for a in &accesses {
+        if a.id == lane_store_id || a.stored.is_some() || a.size != esz || !in_region(a) {
+            continue;
+        }
+        let Some((base, idx, c)) = affine_strided_lane(&numbering, a.ptr, a.size) else {
+            continue;
+        };
+        if idx != index || root_of(base) != Some(base_root) || c % esz as i64 != 0 {
+            continue;
+        }
+        let od = c / esz as i64 - origin_word;
+        if od < store_delta {
+            if mem_carry.is_some() {
                 return None;
             }
-            (ValueId::Instruction(load_id), Some(load_id), ld)
+            mem_carry = Some((a.id, od));
+        } else if od == store_delta {
+            originals.push((a.id, od));
+        } else {
+            return None;
+        }
+    }
+
+    // Carry: the memory lane load, or (seeded rotated shape) a register
+    // accumulator param whose back-edge value is `stored_val` and whose preheader
+    // init is the seed. Absent when the loop only reads its own original lane (a
+    // pure indexed map — no cross-iteration dependency).
+    let carry: Option<Carry> = match mem_carry {
+        Some((load_id, ld)) => {
+            if s + ld < 0 {
+                return None; // reads before element 0
+            }
+            Some(Carry {
+                replace: ValueId::Instruction(load_id),
+                remove: Some(load_id),
+                load_delta: ld,
+            })
         }
         None => {
-            // Register-carried: v1 supports this only for the rotated shape, whose
-            // single-block back-edge makes the accumulator unambiguous.
-            if !rotated {
-                return None;
-            }
-            let back = edge_args(ctx, body, header);
-            let init = edge_args(ctx, preheader, header);
-            let params: Vec<ValueId> = BasicBlock::from_id(ctx, body)
-                .params()
-                .map(|p| p.id())
-                .collect();
-            let mut acc = None;
-            for (k, p) in params.iter().enumerate() {
-                if *p == index {
-                    continue;
-                }
-                if back.get(k) == Some(&stored_val) && init.get(k) == Some(&seed_val) {
-                    if acc.is_some() {
-                        return None;
+            // Try the register-carried accumulator (seeded rotated shape only).
+            let reg = match &seeded {
+                Some((_, _, _, seed_val, _)) if rotated => {
+                    let back = edge_args(ctx, body, header);
+                    let init = edge_args(ctx, preheader, header);
+                    let params: Vec<ValueId> = BasicBlock::from_id(ctx, body)
+                        .params()
+                        .map(|p| p.id())
+                        .collect();
+                    let mut acc = None;
+                    for (k, p) in params.iter().enumerate() {
+                        if *p == index {
+                            continue;
+                        }
+                        if back.get(k) == Some(&stored_val) && init.get(k) == Some(seed_val) {
+                            if acc.is_some() {
+                                return None;
+                            }
+                            acc = Some(*p);
+                        }
                     }
-                    acc = Some(*p);
+                    acc
                 }
+                _ => None,
+            };
+            match reg {
+                Some(acc) => Some(Carry {
+                    replace: acc,
+                    remove: None,
+                    load_delta: store_delta - 1,
+                }),
+                // No carry is only acceptable when the loop reads its own original
+                // element (an indexed map); otherwise there is nothing to promote.
+                None if !originals.is_empty() => None,
+                None => return None,
             }
-            (acc?, None, store_delta - 1)
         }
     };
 
     // Additional const-offset region loads (e.g. the exit read of element 0 the
     // function returns). Only const loads in the exit block are supported — there
     // the whole array is available, so they forward to `at(arr_exit, element)`.
+    let carry_remove = carry.as_ref().and_then(|c| c.remove);
+    let original_ids: HashSet<InstructionId> = originals.iter().map(|&(id, _)| id).collect();
     let mut extra_loads: Vec<(InstructionId, i64)> = Vec::new();
     for a in &accesses {
-        if a.stored.is_some() || a.id == lane_store_id || Some(a.id) == carry_remove || !in_region(a)
+        if a.stored.is_some()
+            || a.id == lane_store_id
+            || Some(a.id) == carry_remove
+            || original_ids.contains(&a.id)
+            || !in_region(a)
         {
             continue;
         }
@@ -718,12 +795,16 @@ fn try_match(ctx: &mut Context, fid: FunctionId) -> Option<PromoteMatch> {
     }
 
     // Every remaining RAM access reaching the region must be accounted for.
-    let mut allowed: HashSet<InstructionId> = [seed_id, lane_store_id].into_iter().collect();
+    let mut allowed: HashSet<InstructionId> = [lane_store_id].into_iter().collect();
+    if let Some((_, _, seed_id, _, dead)) = &seeded {
+        allowed.insert(*seed_id);
+        allowed.extend(dead.iter().copied());
+    }
     if let Some(load_id) = carry_remove {
         allowed.insert(load_id);
     }
+    allowed.extend(original_ids.iter().copied());
     allowed.extend(extra_loads.iter().map(|&(id, _)| id));
-    allowed.extend(dead_stores.iter().copied());
     for a in &accesses {
         if allowed.contains(&a.id) {
             continue;
@@ -743,6 +824,11 @@ fn try_match(ctx: &mut Context, fid: FunctionId) -> Option<PromoteMatch> {
         }
     }
 
+    let (seed, dead_stores) = match seeded {
+        Some((_, _, seed_id, seed_val, dead)) => (Some(Seed { id: seed_id, val: seed_val }), dead),
+        None => (None, Vec::new()),
+    };
+
     Some(PromoteMatch {
         preheader,
         header,
@@ -755,14 +841,12 @@ fn try_match(ctx: &mut Context, fid: FunctionId) -> Option<PromoteMatch> {
         elem_size: esz,
         count,
         region_space,
-        seed_id,
-        seed_val,
+        seed,
         lane_store_id,
         stored_val,
         store_delta,
-        carry_replace,
-        carry_remove,
-        load_delta,
+        carry,
+        originals,
         extra_loads,
         dead_stores,
     })
@@ -845,6 +929,55 @@ fn apply(ctx: &mut Context, m: &PromoteMatch) -> bool {
     };
     let arr_e = new_param(ctx, m.exit);
 
+    // Original-element reads need a whole-region snapshot of the original memory,
+    // loaded once in the preheader and threaded (invariant) through the loop as a
+    // separate array param. `l0_b`/`l0_e` are its body/exit views.
+    let needs_l0 = !m.originals.is_empty();
+    let (l0_pre, l0_h, l0_b, l0_e) = if needs_l0 {
+        let h = new_param(ctx, m.header);
+        let b = if m.rotated { h } else { new_param(ctx, m.body) };
+        let e = new_param(ctx, m.exit);
+        // Preheader: %l0 = load(ram:{count*esz}, base(+origin)), typed [elem;count]
+        // and placed at the top so it snapshots the region before the seed store.
+        let first = BasicBlock::from_id(ctx, m.preheader).iter().next().map(|i| i.id);
+        let dst = {
+            let mut bld = Builder::from_block(BasicBlock::from_id_mut(ctx, m.preheader));
+            if let Some(first) = first {
+                bld.set_insert_point_before(first);
+            }
+            if m.origin_word == 0 {
+                m.base_root
+            } else {
+                let ty = bld.context_mut().type_of(m.base_root);
+                let width = bld.context_mut().types.size_of(ty);
+                let off = bld
+                    .context_mut()
+                    .get_const((m.origin_word * m.elem_size as i64) as u64, width)
+                    .id();
+                bld.push_add(m.base_root, off).id()
+            }
+        };
+        let ld = qcode::value::InstructionRef::from_mnemonic_with_type(
+            ctx,
+            Mnemonic::Load(qcode::value::insn::Load {
+                space: m.region_space,
+                ptr: dst,
+                size: arr_sz,
+            }),
+            arr_ty,
+        )
+        .id;
+        match first {
+            Some(first) => BasicBlock::from_id_mut(ctx, m.preheader).insert_insn_before(first, ld),
+            None => {
+                BasicBlock::from_id_mut(ctx, m.preheader).push_insn(ld);
+            }
+        }
+        (Some(ValueId::Instruction(ld)), Some(h), Some(b), Some(e))
+    } else {
+        (None, None, None, None)
+    };
+
     // Zero-initialized array literal, retyped to [elem;count].
     let zero = {
         let id = ctx.get_bytes(vec![0u8; arr_sz]).id();
@@ -854,37 +987,51 @@ fn apply(ctx: &mut Context, m: &PromoteMatch) -> bool {
         id
     };
 
-    // Preheader: %a0 = insert(zero, 0, seed_val), before the branch.
-    let a0 = {
-        let term_id = BasicBlock::from_id(ctx, m.preheader)
-            .iter()
-            .last()
-            .unwrap()
-            .id;
-        let mut b = Builder::from_block(BasicBlock::from_id_mut(ctx, m.preheader));
-        b.set_insert_point_before(term_id);
-        let idx0 = b.context_mut().get_const(0, 8).id();
-        b.push_intrinsic(insert_id, vec![zero, idx0, m.seed_val])
-            .id()
+    // Preheader: %a0 = insert(zero, 0, seed_val) when seeded, else the bare zero
+    // literal (a seedless map writes every lane, so the initial value is dead).
+    let a0 = match &m.seed {
+        Some(seed) => {
+            let term_id = BasicBlock::from_id(ctx, m.preheader).iter().last().unwrap().id;
+            let mut b = Builder::from_block(BasicBlock::from_id_mut(ctx, m.preheader));
+            b.set_insert_point_before(term_id);
+            let idx0 = b.context_mut().get_const(0, 8).id();
+            b.push_intrinsic(insert_id, vec![zero, idx0, seed.val]).id()
+        }
+        None => zero,
     };
 
-    // Body: at(arr_b, index + load_delta) becomes the carry. For a memory carry it
-    // replaces the lane load (inserted just before it); for a register carry it
-    // replaces the accumulator param's uses (inserted at the body top, before the
-    // first instruction that reads the accumulator).
-    let anchor = match m.carry_remove {
-        Some(load_id) => Some(load_id),
-        None => BasicBlock::from_id(ctx, m.body).iter().next().map(|i| i.id),
-    };
-    let at_val = {
-        let mut b = Builder::from_block(BasicBlock::from_id_mut(ctx, m.body));
-        if let Some(anchor) = anchor {
-            b.set_insert_point_before(anchor);
-        }
-        let idx = index_plus(&mut b, m.index, m.load_delta);
-        b.push_intrinsic(at_id, vec![arr_b, idx]).id()
-    };
-    ctx.replace_all_uses_with(m.carry_replace, at_val);
+    // Body: at(arr_b, index + load_delta) becomes the accumulator carry, if any.
+    // For a memory carry it replaces the lane load (inserted just before it); for a
+    // register carry it replaces the accumulator param's uses (inserted at the body
+    // top, before the first instruction that reads the accumulator).
+    if let Some(carry) = &m.carry {
+        let anchor = match carry.remove {
+            Some(load_id) => Some(load_id),
+            None => BasicBlock::from_id(ctx, m.body).iter().next().map(|i| i.id),
+        };
+        let at_val = {
+            let mut b = Builder::from_block(BasicBlock::from_id_mut(ctx, m.body));
+            if let Some(anchor) = anchor {
+                b.set_insert_point_before(anchor);
+            }
+            let idx = index_plus(&mut b, m.index, carry.load_delta);
+            b.push_intrinsic(at_id, vec![arr_b, idx]).id()
+        };
+        ctx.replace_all_uses_with(carry.replace, at_val);
+    }
+
+    // Body: at(l0_b, index + od) becomes each original-element read.
+    for &(load_id, od) in &m.originals {
+        let l0_b = l0_b.expect("originals imply a snapshot param");
+        let at_val = {
+            let mut b = Builder::from_block(BasicBlock::from_id_mut(ctx, m.body));
+            b.set_insert_point_before(load_id);
+            let idx = index_plus(&mut b, m.index, od);
+            b.push_intrinsic(at_id, vec![l0_b, idx]).id()
+        };
+        ctx.replace_all_uses_with(ValueId::Instruction(load_id), at_val);
+        ctx.remove_instruction(load_id);
+    }
 
     // Body: %arr' = insert(arr_b, index + store_delta, stored_val), before branch.
     let arr_next = {
@@ -929,25 +1076,42 @@ fn apply(ctx: &mut Context, m: &PromoteMatch) -> bool {
     }
 
     // Drop the now-dead memory traffic.
-    if let Some(load_id) = m.carry_remove {
-        ctx.remove_instruction(load_id);
+    if let Some(carry) = &m.carry {
+        if let Some(load_id) = carry.remove {
+            ctx.remove_instruction(load_id);
+        }
     }
     for &dead in &m.dead_stores {
         ctx.remove_instruction(dead);
     }
     ctx.remove_instruction(m.lane_store_id);
-    ctx.remove_instruction(m.seed_id);
+    if let Some(seed) = &m.seed {
+        ctx.remove_instruction(seed.id);
+    }
 
-    // Thread the array through every loop edge. The header always passes its own
-    // array param (`arr_h`) to the exit and (in the split shape) to the body; in
-    // the rotated shape header==body, so the back-edge is the body's self-edge and
-    // there is no separate header→body edge.
+    // Thread the carried array through every loop edge. The header always passes
+    // its own array param (`arr_h`) to the exit and (in the split shape) to the
+    // body; in the rotated shape header==body, so the back-edge is the body's
+    // self-edge and there is no separate header→body edge.
     append_edge_arg(ctx, m.preheader, m.header, a0);
     append_edge_arg(ctx, m.body, m.header, arr_next);
     if !m.rotated {
         append_edge_arg(ctx, m.header, m.body, arr_h);
     }
     append_edge_arg(ctx, m.header, m.exit, arr_h);
+
+    // Thread the loop-invariant original snapshot the same way (it passes itself
+    // along unchanged on every edge).
+    if needs_l0 {
+        let (pre, h, b, e) = (l0_pre.unwrap(), l0_h.unwrap(), l0_b.unwrap(), l0_e.unwrap());
+        append_edge_arg(ctx, m.preheader, m.header, pre);
+        append_edge_arg(ctx, m.body, m.header, b);
+        if !m.rotated {
+            append_edge_arg(ctx, m.header, m.body, h);
+        }
+        append_edge_arg(ctx, m.header, m.exit, h);
+        let _ = e;
+    }
 
     true
 }
@@ -1084,23 +1248,24 @@ mod tests {
         );
     }
 
-    // Soundness guard for the iota-based scan: a lane may only be forwarded to the
-    // carried array when it was *written earlier this trip*. If the loop reads a
-    // lane's original (pre-existing) memory value, zero-seeding the promoted array
-    // would change the result, so the pass must refuse — the scan cannot be
-    // expressed over a bare `iota`, it would need the original array.
+    // Array-input promotion: a loop that reads the region's *original* memory at
+    // its own lane is not rejected — it is promoted with a whole-region snapshot
+    // `%l0 = load(ram, base)`, and the own-lane reads become `at(%l0, index)`
+    // (later folded to a scan/map over the original array). This is the dual of the
+    // pure-generation (iota) case: this loop class *does* read the original array.
 
     #[test]
-    fn reads_current_lane_original_value_is_rejected() {
-        // Prefix sum in place: mt[i] = mt[i] + mt[i-1]. Lane `i` is loaded (its
-        // original value) before it is stored, so the fill is not self-contained.
+    fn reads_current_lane_original_value_uses_snapshot() {
+        // Seeded prefix sum: out[0] = seed, out[i] = out[i-1] + l[i]. Lane `i`'s
+        // original value (`%cur`) and the previous result (`%prev`, the carry) both
+        // feed the body. Promotes with a snapshot + carry, not a rejection.
         let mut ctx = Context::new();
         qcode!(
             ctx,
             "
             fn reads_orig:
             <entry @seed:i64 @base:i64>
-                %e0 = trunc(i32, @seed);
+                %e0 = @seed[0:4];
                 store(ram:4, @base <- %e0);
                 goto <head @i=1 @buf=@base>;
             <head @i:i64 @buf:i64>
@@ -1123,17 +1288,29 @@ mod tests {
             "
         );
         assert!(
-            !run_function_pass::<ArrayPromote>(&mut ctx, reads_orig).unwrap(),
-            "reading a lane's original value before writing it must block promotion"
+            run_function_pass::<ArrayPromote>(&mut ctx, reads_orig).unwrap(),
+            "an original-lane read should promote via a snapshot, not be rejected"
+        );
+        let ir = format!("{}", Function::from_id(&ctx, reads_orig));
+        // The whole region is snapshotted once, and both the carry and the original
+        // element become `at(...)` reads; the per-lane loads are gone.
+        assert!(
+            ir.contains("load(ram:2496"),
+            "a whole-region snapshot load should be inserted: {ir}"
+        );
+        assert!(ir.contains("$at("), "reads should become at(): {ir}");
+        assert!(
+            !ir.contains("load(ram:4"),
+            "per-lane loads should be removed: {ir}"
         );
     }
 
     #[test]
-    fn index_map_over_original_array_is_rejected() {
-        // Indexed map over the original data: mt[i] = mt[i] * 3 + i. Reads the
-        // original lane `i` and the index `i` — the `enumerate(l)` shape. There is
-        // no memory-carried recurrence and no seed store; the functional form would
-        // read the original array, so the zero-seeding pass must refuse.
+    fn index_map_over_original_array_uses_snapshot() {
+        // Indexed map: l[i] = l[i] * 3 + i. Reads the original lane `i` and the
+        // index `i` (the `enumerate(l)` shape), no carry and no seed store; every
+        // lane is written, so the region is snapshotted and the own-lane read
+        // becomes `at(%l0, i)`.
         let mut ctx = Context::new();
         qcode!(
             ctx,
@@ -1149,7 +1326,7 @@ mod tests {
                 %addr = @b + %off;
                 %cur = load(ram:4, %addr);
                 %m = %cur * 3;
-                %jt = trunc(i32, @j);
+                %jt = @j[0:4];
                 %next = %m + %jt;
                 store(ram:4, %addr <- %next);
                 %j1 = @j + 1;
@@ -1159,8 +1336,18 @@ mod tests {
             "
         );
         assert!(
-            !run_function_pass::<ArrayPromote>(&mut ctx, reads_enum).unwrap(),
-            "an indexed map reading the original array must block promotion"
+            run_function_pass::<ArrayPromote>(&mut ctx, reads_enum).unwrap(),
+            "a seedless indexed map over the original array should promote"
+        );
+        let ir = format!("{}", Function::from_id(&ctx, reads_enum));
+        assert!(
+            ir.contains("load(ram:2496"),
+            "a whole-region snapshot load should be inserted: {ir}"
+        );
+        assert!(ir.contains("$at("), "the original read should become at(): {ir}");
+        assert!(
+            !ir.contains("load(ram:4"),
+            "the per-lane load should be removed: {ir}"
         );
     }
 }
