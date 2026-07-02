@@ -43,8 +43,11 @@ pub enum ExprKind {
     Unary(UnOp, Box<Expr>),
     /// A binary operation.
     Binary(BinOp, Box<Expr>, Box<Expr>),
-    /// A pointer dereference (`*e`), i.e. a load.
-    Deref(Box<Expr>),
+    /// A pointer dereference (`*e`), i.e. a load or store location. `size` is the
+    /// access width in bytes when known; it is rendered as a pointer cast
+    /// (`*(uintN_t *)e`) so a partial-width access is not printed as a full-width
+    /// one. `None` prints a bare `*e`.
+    Deref { size: Option<usize>, ptr: Box<Expr> },
     /// An integer width/sign cast (`(type)e`).
     Cast {
         signed: bool,
@@ -195,11 +198,29 @@ impl Expr {
             ExprKind::Var(name) => out.push_value(name.clone(), TokenKind::Variable, self.value),
             ExprKind::Unary(op, e) => {
                 out.push_value(op.spelling(), TokenKind::Operator, self.value);
-                Self::child_tokens(out, e, UNARY_PREC, false);
+                // Parenthesize a child that would otherwise merge with this
+                // operator into a different C token: `-(-x)` must not print as
+                // the pre-decrement `--x`.
+                if merges_into_different_token(*op, e) {
+                    out.punct("(");
+                    e.write_tokens(out);
+                    out.punct(")");
+                } else {
+                    Self::child_tokens(out, e, UNARY_PREC, false);
+                }
             }
-            ExprKind::Deref(e) => {
+            ExprKind::Deref { size, ptr } => {
                 out.push_value("*", TokenKind::Operator, self.value);
-                Self::child_tokens(out, e, UNARY_PREC, false);
+                // A known access width is rendered as a pointer cast so a byte or
+                // half-word access is not mistaken for a full-width one.
+                if let Some(size) = size {
+                    out.punct("(");
+                    out.push_value(format!("uint{}_t", size * 8), TokenKind::Type, self.value);
+                    out.space();
+                    out.push("*", TokenKind::Operator);
+                    out.punct(")");
+                }
+                Self::child_tokens(out, ptr, UNARY_PREC, false);
             }
             ExprKind::Cast { signed, bits, expr } => {
                 let sign = if *signed { "int" } else { "uint" };
@@ -247,66 +268,32 @@ impl Expr {
     fn precedence(&self) -> u8 {
         match &self.kind {
             ExprKind::Const(_) | ExprKind::Var(_) | ExprKind::Unknown { .. } => PRIMARY_PREC,
-            ExprKind::Unary(..) | ExprKind::Deref(_) | ExprKind::Cast { .. } => UNARY_PREC,
+            ExprKind::Unary(..) | ExprKind::Deref { .. } | ExprKind::Cast { .. } => UNARY_PREC,
             ExprKind::Binary(op, ..) => op.precedence(),
-        }
-    }
-
-    /// Formats `child`, wrapping it in parentheses only when C precedence /
-    /// associativity would otherwise change the meaning. `parent_prec` is the
-    /// enclosing operator's precedence; `on_right` marks the right operand of a
-    /// left-associative binary operator, which needs parens at equal precedence.
-    fn fmt_child(
-        f: &mut Formatter<'_>,
-        child: &Expr,
-        parent_prec: u8,
-        on_right: bool,
-    ) -> fmt::Result {
-        let cp = child.precedence();
-        let needs = cp > parent_prec || (cp == parent_prec && on_right && cp != PRIMARY_PREC);
-        if needs {
-            write!(f, "({child})")
-        } else {
-            write!(f, "{child}")
         }
     }
 }
 
+/// Whether a prefix unary `op` immediately followed by `child` would lex as a
+/// different C token than intended. The only such collision among the operators
+/// we emit is `-` before a negated child: `- -x` would read as `--x`
+/// (pre-decrement), so the child must be parenthesized. `~`/`!` are idempotent
+/// (`~~x`, `!!x`) and `*` chains freely (`**x`), so none of those need it.
+fn merges_into_different_token(op: UnOp, child: &Expr) -> bool {
+    op == UnOp::Neg && matches!(child.kind, ExprKind::Unary(UnOp::Neg, _))
+}
+
+// The pretty-printed form is the plain-text projection of the classified token
+// stream, so [`write_tokens`](Expr::write_tokens) is the single source of truth
+// for spelling, precedence, and parenthesization; `Display` never re-derives it.
 impl Display for Expr {
     fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
-        match &self.kind {
-            ExprKind::Const(v) => write!(f, "0x{v:x}"),
-            ExprKind::Var(name) => write!(f, "{name}"),
-            ExprKind::Unary(op, e) => {
-                write!(f, "{}", op.spelling())?;
-                Expr::fmt_child(f, e, UNARY_PREC, false)
-            }
-            ExprKind::Deref(e) => {
-                write!(f, "*")?;
-                Expr::fmt_child(f, e, UNARY_PREC, false)
-            }
-            ExprKind::Cast { signed, bits, expr } => {
-                let sign = if *signed { "int" } else { "uint" };
-                write!(f, "({sign}{bits}_t)")?;
-                Expr::fmt_child(f, expr, UNARY_PREC, false)
-            }
-            ExprKind::Binary(op, lhs, rhs) => {
-                let p = op.precedence();
-                Expr::fmt_child(f, lhs, p, false)?;
-                write!(f, " {} ", op.spelling())?;
-                Expr::fmt_child(f, rhs, p, true)
-            }
-            ExprKind::Unknown { op, operands } => {
-                write!(f, "{op}(")?;
-                for (i, e) in operands.iter().enumerate() {
-                    if i > 0 {
-                        write!(f, ", ")?;
-                    }
-                    write!(f, "{e}")?;
-                }
-                write!(f, ")")
-            }
+        let mut buf = LineBuf::default();
+        self.write_tokens(&mut buf);
+        for token in &buf.tokens {
+            f.write_str(&token.text)?;
         }
+        Ok(())
     }
 }
 
@@ -355,5 +342,44 @@ mod tests {
     fn double_logical_not_folds() {
         let e = Expr::var("x").logical_not().logical_not();
         assert_eq!(e, Expr::var("x"));
+    }
+
+    fn un(op: UnOp, e: Expr) -> Expr {
+        Expr::bare(ExprKind::Unary(op, Box::new(e)))
+    }
+
+    #[test]
+    fn double_negation_is_parenthesized_not_predecrement() {
+        // `-(-x)` must not collapse to `--x`, which C reads as pre-decrement.
+        let e = un(UnOp::Neg, un(UnOp::Neg, Expr::var("x")));
+        assert_eq!(e.to_string(), "-(-x)");
+    }
+
+    #[test]
+    fn idempotent_prefix_ops_need_no_parens() {
+        // `~` and `!` don't merge into a different token, so they nest bare.
+        assert_eq!(
+            un(UnOp::Not, un(UnOp::Not, Expr::var("x"))).to_string(),
+            "~~x"
+        );
+        assert_eq!(
+            un(UnOp::LNot, un(UnOp::LNot, Expr::var("x"))).to_string(),
+            "!!x"
+        );
+    }
+
+    #[test]
+    fn display_matches_token_text() {
+        // Display is the plain-text projection of the token stream; a compound
+        // expression must render identically through both paths.
+        let e = bin(
+            BinOp::Mul,
+            bin(BinOp::Add, Expr::var("a"), Expr::var("b")),
+            Expr::var("c"),
+        );
+        let mut buf = LineBuf::default();
+        e.write_tokens(&mut buf);
+        let token_text: String = buf.tokens.iter().map(|t| t.text.as_str()).collect();
+        assert_eq!(e.to_string(), token_text);
     }
 }

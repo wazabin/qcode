@@ -414,7 +414,7 @@ fn statement(ctx: &Context, id: InstructionId, roots: &HashSet<InstructionId>) -
         Mnemonic::Store(s) => {
             // <location> = src;  (a named varnode reads as the variable, a
             // computed address as `*ptr`).
-            deref_location(ctx, s.ptr, Some(roots)).write_tokens(&mut buf);
+            deref_location(ctx, s.ptr, s.size, Some(roots)).write_tokens(&mut buf);
             assign(&mut buf);
             lower_expr_rooted(ctx, s.src, roots).write_tokens(&mut buf);
             buf.punct(";");
@@ -557,10 +557,14 @@ mod tests {
         );
         let c = emit_c(&ctx, &decompile_function(&ctx, f).unwrap());
         // The load is named (a root because of the intervening store) and the
-        // condition uses that name rather than re-dereferencing memory.
-        assert!(c.contains("v = *pp;"), "load should be a named root:\n{c}");
+        // condition uses that name rather than re-dereferencing memory. The
+        // byte-wide load through `pp` carries its access width as a pointer cast.
         assert!(
-            c.contains("if (v)") && !c.contains("if (*pp)"),
+            c.contains("v = *(uint8_t *)pp;"),
+            "load should be a named, width-annotated root:\n{c}"
+        );
+        assert!(
+            c.contains("if (v)") && !c.contains("(uint8_t *)pp)"),
             "condition should reference the root, not re-read memory:\n{c}"
         );
     }
@@ -691,6 +695,38 @@ mod tests {
         assert!(
             !c.contains("y = x;"),
             "load folded across the aliasing store to x:\n{c}"
+        );
+    }
+
+    #[test]
+    fn partial_width_access_carries_its_size() {
+        // A byte load and a word store through computed pointers must render their
+        // access width, so a partial access is not mistaken for a full-width one.
+        let mut ctx = Context::new();
+        qcode!(
+            ctx,
+            "
+            varnode i64 pp;
+            varnode i64 qq;
+
+            fn f:
+            <entry>
+                %p = load(i64, &pp);
+                %b = load(i8, %p);
+                %q = load(i64, &qq);
+                store(%q, i32 0x0);
+                store(%p, i8 %b);
+                local i64 ptr;
+                return [ptr];
+            "
+        );
+
+        let program = lower_function(&ctx, f);
+        let c = emit_c(&ctx, &program);
+        // Byte accesses through pointer `p`, word store through `qq`.
+        assert!(
+            c.contains("*(uint8_t *)p") && c.contains("*(uint32_t *)qq"),
+            "loads/stores should carry their access width:\n{c}"
         );
     }
 

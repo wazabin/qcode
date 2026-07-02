@@ -84,12 +84,16 @@ fn lower(ctx: &Context, value: ValueId, roots: Roots) -> Expr {
 }
 
 /// Lowers a memory reference: a named location (varnode) reads as the variable
-/// itself, a computed address as an explicit `*ptr` dereference. Shared by load
-/// (rvalue) and store (lvalue) lowering.
-pub(crate) fn deref_location(ctx: &Context, ptr: ValueId, roots: Roots) -> Expr {
+/// itself, a computed address as an explicit `*ptr` dereference annotated with
+/// the `size`-byte access width. Shared by load (rvalue) and store (lvalue)
+/// lowering.
+pub(crate) fn deref_location(ctx: &Context, ptr: ValueId, size: usize, roots: Roots) -> Expr {
     match ptr {
         ValueId::Varnode(_) => lower(ctx, ptr, roots),
-        _ => Expr::bare(ExprKind::Deref(Box::new(lower(ctx, ptr, roots)))),
+        _ => Expr::bare(ExprKind::Deref {
+            size: Some(size),
+            ptr: Box::new(lower(ctx, ptr, roots)),
+        }),
     }
 }
 
@@ -151,7 +155,7 @@ fn lower_instruction(ctx: &Context, id: InstructionId, roots: Roots, expand_unkn
         },
         // A load from a named location (varnode) reads that variable directly;
         // a load through a computed pointer is a real dereference.
-        Mnemonic::Load(l) => deref_location(ctx, l.ptr, roots),
+        Mnemonic::Load(l) => deref_location(ctx, l.ptr, l.size, roots),
         Mnemonic::Zext(z) => Expr::bare(ExprKind::Cast {
             signed: false,
             bits: z.size * 8,

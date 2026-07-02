@@ -318,7 +318,7 @@ fn collect_vars(expr: &Expr, out: &mut Vec<String>) {
     match &expr.kind {
         ExprKind::Var(name) => out.push(name.clone()),
         ExprKind::Const(_) => {}
-        ExprKind::Unary(_, e) | ExprKind::Deref(e) | ExprKind::Cast { expr: e, .. } => {
+        ExprKind::Unary(_, e) | ExprKind::Deref { ptr: e, .. } | ExprKind::Cast { expr: e, .. } => {
             collect_vars(e, out)
         }
         ExprKind::Binary(_, a, b) => {
@@ -341,7 +341,7 @@ fn collect_expr_insns(expr: &Expr, out: &mut Vec<InstructionId>) {
     }
     match &expr.kind {
         ExprKind::Const(_) | ExprKind::Var(_) => {}
-        ExprKind::Unary(_, e) | ExprKind::Deref(e) | ExprKind::Cast { expr: e, .. } => {
+        ExprKind::Unary(_, e) | ExprKind::Deref { ptr: e, .. } | ExprKind::Cast { expr: e, .. } => {
             collect_expr_insns(e, out)
         }
         ExprKind::Binary(_, a, b) => {
