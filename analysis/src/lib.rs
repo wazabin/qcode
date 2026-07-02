@@ -44,6 +44,11 @@ pub use dce::{
 pub mod alias;
 pub use alias::{AliasResult, RegisterBase};
 
+pub mod dataflow_graph;
+pub use dataflow_graph::{
+    DataflowGraph, DataflowOptions, DfEdge, DfEdgeKind, DfNode, build_dataflow,
+};
+
 pub mod gvn;
 pub use gvn::{constant_fold_function, gvn, gvn_function};
 
