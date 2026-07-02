@@ -294,7 +294,15 @@ fn emit_stmt(
             if els.is_empty() {
                 out.push(brace_line("}", indent));
             } else {
-                out.push(brace_line("} else {", indent));
+                // Emit the braces as their own tokens (rather than one combined
+                // `} else {` string) so the front-end can match them as brackets.
+                let mut mid = LineBuf::default();
+                mid.punct("}");
+                mid.space();
+                mid.keyword("else");
+                mid.space();
+                mid.punct("{");
+                out.push(mid.into_line(indent, None));
                 emit_stmts(ctx, program, els, indent + 1, roots, out);
                 out.push(brace_line("}", indent));
             }
@@ -313,7 +321,11 @@ fn emit_stmt(
             out.push(brace_line("}", indent));
         }
         Stmt::DoWhile { cond, body } => {
-            out.push(brace_line("do {", indent));
+            let mut head = LineBuf::default();
+            head.keyword("do");
+            head.space();
+            head.punct("{");
+            out.push(head.into_line(indent, None));
             emit_stmts(ctx, program, body, indent + 1, roots, out);
             let mut tail = LineBuf::default();
             tail.punct("}");
