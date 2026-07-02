@@ -265,6 +265,12 @@ fn block_has_body(ctx: &Context, block: BlockId) -> bool {
 /// [`Stmt::Loop`]s), falling back to flat goto-based lowering for functions with
 /// irreducible control flow. The [`Structure`] pass's implementation.
 fn structure_regions(ctx: &Context, function_id: FunctionId) -> Program {
+    structure_regions_limited(ctx, function_id, MAX_REGION_DEPTH)
+}
+
+/// [`structure_regions`] with an explicit region-depth limit, so tests can drive
+/// the deep-cascade fallback without materializing thousands of blocks.
+fn structure_regions_limited(ctx: &Context, function_id: FunctionId, max_depth: usize) -> Program {
     let function = qcode::value::Function::from_id(ctx, function_id);
     let Some(root) = function.root() else {
         return Program {
@@ -295,14 +301,32 @@ fn structure_regions(ctx: &Context, function_id: FunctionId) -> Program {
         loops,
         visited: HashSet::default(),
         frames: Vec::new(),
+        max_depth,
+        overflowed: false,
     };
-    let (stmts, _) = structurer.region(root_id, None);
+    let (stmts, _) = structurer.region(root_id, None, 0);
+    // A pathologically deep region (a multi-thousand-arm comparison cascade)
+    // would recurse deep enough to overflow the stack — which no `catch_unwind`
+    // can recover. When the guard trips, discard the partial structuring and fall
+    // back to the flat lowering, whose emission is iterative and always correct.
+    if structurer.overflowed {
+        return lower_function(ctx, function_id);
+    }
     Program {
         function: Some(function_id),
         stmts,
         labels,
     }
 }
+
+/// The maximum region-recursion depth before structuring bails to flat lowering.
+/// Real control flow nests only shallowly; a depth this large means a degenerate
+/// (often obfuscated) cascade whose structured form would risk a stack overflow
+/// in this pass or in downstream AST recursion (emit/refine/switch all descend
+/// the tree structuring builds). The bound is kept well under a typical spawned
+/// thread's stack so those descents stay safe too. Flat lowering renders such a
+/// function correctly, if uglily.
+const MAX_REGION_DEPTH: usize = 1000;
 
 /// A natural loop: the blocks it comprises and the single block control leaves
 /// to on exit (its `break` target), if it has one.
@@ -331,6 +355,11 @@ struct Structurer<'ctx, 'a> {
     visited: HashSet<BlockId>,
     /// The stack of enclosing loops (innermost last).
     frames: Vec<LoopFrame>,
+    /// The region-recursion depth beyond which structuring bails out.
+    max_depth: usize,
+    /// Set when region recursion reaches [`Structurer::max_depth`], signalling the
+    /// caller to discard the partial structuring and fall back to flat lowering.
+    overflowed: bool,
 }
 
 impl Structurer<'_, '_> {
@@ -338,10 +367,17 @@ impl Structurer<'_, '_> {
     /// enclosing merge point). Returns the statement list plus whether control
     /// falls through to `stop` (vs. terminating via break/continue/return/goto),
     /// so callers can decide whether to emit the continuation.
-    fn region(&mut self, from: BlockId, stop: Option<BlockId>) -> (Vec<Stmt>, bool) {
+    fn region(&mut self, from: BlockId, stop: Option<BlockId>, depth: usize) -> (Vec<Stmt>, bool) {
         let mut out = Vec::new();
         let mut cur = Some(from);
         let mut fell_through = false;
+
+        // Deep enough to risk a stack overflow: stop recursing and signal the
+        // caller to fall back to flat lowering.
+        if depth >= self.max_depth {
+            self.overflowed = true;
+            return (out, false);
+        }
 
         while let Some(b) = cur {
             // A structured exit of the innermost loop (continue/break) or an edge
@@ -364,7 +400,7 @@ impl Structurer<'_, '_> {
             // A loop header reached for the first time: structure the whole loop
             // here, then continue from its exit.
             if self.loops.contains_key(&b) && !self.is_active(b) {
-                let (loop_stmt, exit) = self.structure_loop(b, stop);
+                let (loop_stmt, exit) = self.structure_loop(b, stop, depth);
                 out.push(loop_stmt);
                 cur = exit;
                 continue;
@@ -393,8 +429,8 @@ impl Structurer<'_, '_> {
                     ..
                 } => {
                     let merge = self.immediate_postdom(b);
-                    let (then, then_ft) = self.region(true_target, merge);
-                    let (els, els_ft) = self.region(false_target, merge);
+                    let (then, then_ft) = self.region(true_target, merge, depth + 1);
+                    let (els, els_ft) = self.region(false_target, merge, depth + 1);
                     // Each edge's phi copies belong at the top of that arm, so
                     // they run only on the path that takes the edge.
                     out.push(Stmt::If {
@@ -423,10 +459,11 @@ impl Structurer<'_, '_> {
         &mut self,
         header: BlockId,
         stop: Option<BlockId>,
+        depth: usize,
     ) -> (Stmt, Option<BlockId>) {
         let exit = self.loops[&header].exit;
         self.frames.push(LoopFrame { header, exit });
-        let (body, _) = self.region(header, stop);
+        let (body, _) = self.region(header, stop, depth + 1);
         self.frames.pop();
         // Loops are emitted endless; the `refine_loops` pass rewrites the shape.
         (Stmt::Loop { body }, exit)
@@ -1009,6 +1046,61 @@ mod tests {
             "the cleanup exit body was dropped:\n{c}"
         );
         assert!(c.contains("0xbeef"), "the main exit body was dropped:\n{c}");
+    }
+
+    #[test]
+    fn deep_cascade_falls_back_to_flat_lowering() {
+        // A comparison cascade recurses one region level per arm. Past the depth
+        // guard, structuring must abandon its partial result and fall back to the
+        // flat lowering (iterative, always correct) rather than risk a stack
+        // overflow. Driven with a tiny limit so the test needs only a few blocks.
+        let mut ctx = Context::new();
+        qcode!(
+            ctx,
+            "
+            varnode i32 sel;
+            varnode i32 out;
+
+            fn f:
+            <entry>
+                %x = load(i32, &sel);
+                %c1 = i32 %x == i32 0x1;
+                if %c1 goto <case1> else goto <t2>;
+            <case1>
+                store(&out, i32 0x10);
+                goto <done>;
+            <t2>
+                %c2 = i32 %x == i32 0x2;
+                if %c2 goto <case2> else goto <t3>;
+            <case2>
+                store(&out, i32 0x20);
+                goto <done>;
+            <t3>
+                %c3 = i32 %x == i32 0x3;
+                if %c3 goto <case3> else goto <done>;
+            <case3>
+                store(&out, i32 0x30);
+                goto <done>;
+            <done>
+                local i64 ptr;
+                return [ptr];
+            "
+        );
+
+        // A generous limit structures the cascade; a tiny one trips the guard and
+        // yields exactly the flat lowering.
+        let deep = structure_regions_limited(&ctx, f, 2);
+        let flat = lower_function(&ctx, f);
+        assert_eq!(
+            emit_c(&ctx, &deep),
+            emit_c(&ctx, &flat),
+            "an over-deep cascade should fall back to flat lowering"
+        );
+        let shallow = structure_regions_limited(&ctx, f, MAX_REGION_DEPTH);
+        assert!(
+            shallow.goto_count() < flat.goto_count(),
+            "within the limit it should still structure"
+        );
     }
 
     #[test]
