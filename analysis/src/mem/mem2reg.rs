@@ -88,9 +88,10 @@ impl<'ctx, 'str> Mem2Reg<'ctx, 'str> {
     }
 
     fn run(&mut self) -> bool {
-        // `live_in_blocks` is an O(blocks × insns) fixpoint; cache it per var so
-        // the collection and block-param phases share a single computation.
-        let mut live_in_cache: HashMap<ValueId, HashSet<BlockId>> = HashMap::default();
+        // Precompute the liveness inputs in one sweep so the collection and
+        // block-param phases share a single per-var computation (memoized) instead
+        // of rescanning the whole function for each variable.
+        let mut live_in_cache = LiveInBlocks::new(&*self.ctx, self.function_id);
 
         let Promotable {
             vars,
@@ -265,44 +266,6 @@ fn register_store_low_aligned_contains(ctx: &Context, store: ValueId, var: Value
     store.space().id == var.space().id
         && store.size() > var.size()
         && store.address() == var.address()
-}
-
-/// Whether the call terminating `block` (if any) clobbers register `var`.
-///
-/// A direct call clobbers the registers in its target's recorded clobber set,
-/// overlap-aware so a callee writing RAX clobbers a caller's EAX read. A
-/// `CallInd` has an unknown target and conservatively clobbers every register; a
-/// target with no recorded clobber set is likewise treated conservatively —
-/// *unless* it is [`externally_resolved`](Function::is_externally_resolved), in
-/// which case its clobber set is exact (a prototype-derived volatile set, often
-/// empty) and an absent/empty set clobbers nothing rather than everything.
-/// Non-register vars (stack slots) are never clobbered by a call.
-fn call_clobbers_var(ctx: &Context, block: BlockId, var: ValueId, aliases: &AliasResult) -> bool {
-    if register_varnode(ctx, var).is_none() {
-        return false;
-    };
-    let term = BasicBlock::from_id(ctx, block)
-        .iter()
-        .last()
-        .map(|i| i.mnemonic().clone());
-    match term {
-        Some(Mnemonic::CallInd(_)) => true,
-        Some(Mnemonic::Call(call)) => {
-            let callee = Function::from_id(ctx, call.target);
-            let resolved = callee.is_externally_resolved();
-            let clobbered: Option<Vec<VarnodeId>> =
-                callee.clobbered_regs().map(<[VarnodeId]>::to_vec);
-            match clobbered {
-                Some(clobbered) => clobbered
-                    .iter()
-                    .any(|&c| aliases.may_alias(ctx, ValueId::Varnode(c), var)),
-                // A resolved callee with no recorded set clobbers nothing; an
-                // unresolved one is unknown, so conservatively clobbers all.
-                None => !resolved,
-            }
-        }
-        _ => false,
-    }
 }
 
 /// For each register store-pointer in the function, the set of promoted register
@@ -529,10 +492,7 @@ impl Mem2Reg<'_, '_> {
         (param_id, true)
     }
 
-    fn collect_promotable_vars(
-        &self,
-        live_in_cache: &mut HashMap<ValueId, HashSet<BlockId>>,
-    ) -> Promotable {
+    fn collect_promotable_vars(&self, live_in_cache: &mut LiveInBlocks) -> Promotable {
         let mut stored = HashSet::default();
         let mut loaded = HashSet::default();
         let mut store_counts: HashMap<ValueId, usize> = HashMap::default();
@@ -772,7 +732,7 @@ impl Mem2Reg<'_, '_> {
         sizes: &HashMap<ValueId, usize>,
         sliced: &HashSet<ValueId>,
         frontier: &HashMap<BlockId, HashSet<BlockId>>,
-        live_in_cache: &mut HashMap<ValueId, HashSet<BlockId>>,
+        live_in_cache: &mut LiveInBlocks,
     ) -> InsertedBlockParams {
         let mut var_params: BlockParamAssignments = HashMap::default();
         let mut changed = false;
@@ -870,92 +830,210 @@ impl Mem2Reg<'_, '_> {
             })
     }
 
-    /// Memoized [`live_in_blocks`]. The returned set is cloned from the cache so
-    /// the caller may freely take further `&mut self` borrows; the clone is cheap
-    /// relative to recomputing the liveness fixpoint.
+    /// Memoized live-in blocks for `var` (see [`LiveInBlocks`]). The returned set
+    /// is cloned so the caller may freely take further `&mut self` borrows; the
+    /// clone is cheap relative to the liveness propagation.
     fn live_in_blocks_cached(
         &self,
         var: ValueId,
         sliced: &HashSet<ValueId>,
-        cache: &mut HashMap<ValueId, HashSet<BlockId>>,
+        cache: &mut LiveInBlocks,
     ) -> HashSet<BlockId> {
-        cache
-            .entry(var)
-            .or_insert_with(|| {
-                live_in_blocks(self.ctx, self.function_id, var, sliced, self.aliases)
-            })
-            .clone()
+        cache.get(self.ctx, var, sliced, self.aliases)
     }
 }
 
-/// Blocks into which `var` is live-in.
+/// How the call terminating a block clobbers register vars, classified once per
+/// block so liveness need not re-read the terminator (and re-fetch the callee's
+/// clobber set) for every variable.
+enum CallClobber {
+    /// A `CallInd`, or a `Call` whose target is unresolved and has no recorded
+    /// clobber set: conservatively clobbers every register var.
+    All,
+    /// A `Call` with a known clobbered-register set (overlap decided per var). An
+    /// externally-resolved callee with no recorded set has an exact, empty
+    /// clobber set and is represented here as `Regs(vec![])` — it clobbers
+    /// nothing rather than everything.
+    Regs(Vec<VarnodeId>),
+}
+
+/// Precomputed inputs for per-variable live-in analysis, shared across every
+/// variable in one mem2reg run.
 ///
-/// A call that clobbers `var` counts as a definition of it: a read of `var`
-/// reachable only through that call is the call's *output*, not a value flowing
-/// in from the function entry. This keeps a post-call register read (e.g. a
-/// caller reading the callee's `RAX`/`EAX` result) from being treated as a
-/// function input and promoted to a spurious root parameter.
-fn live_in_blocks(
-    ctx: &Context,
+/// A block is live-in for `var` if it has an upward-exposed use of `var` (a load
+/// not preceded by a store to it in that block), or a successor is live-in and
+/// the block does not define `var`. A call that clobbers `var` counts as a
+/// definition: a read reachable only through that call is the call's *output*,
+/// not a value flowing in from the entry (this keeps a post-call register read of
+/// e.g. `RAX` from being promoted to a spurious root parameter).
+///
+/// The store / upward-exposed block sets and the call classification are gathered
+/// in a single sweep over the function, so each variable's liveness is only the
+/// backward propagation from its seeds — turning the old O(vars × instructions)
+/// per-var rescan into one O(instructions) sweep plus cheap per-var work. Results
+/// are memoized because `collect_promotable_vars` and `insert_block_params` query
+/// the same variables.
+///
+/// A *sliced* register var (see [`Promotable::sliced`]) is defined by a wider
+/// store that low-alignedly covers it, not just by a store to itself. That
+/// covering relation is per-(store, var) and unknown to the exact-pointer sweep,
+/// so a sliced var's seeds are recomputed with a precise per-var scan; sliced
+/// vars are rare and few, so this preserves the batched fast path for the common
+/// case.
+struct LiveInBlocks {
     function_id: FunctionId,
-    var: ValueId,
-    sliced: &HashSet<ValueId>,
-    aliases: &AliasResult,
-) -> HashSet<BlockId> {
-    let mut upward_exposed = HashSet::default();
-    let mut defined = HashSet::default();
-    let var_is_sliced = sliced.contains(&var);
+    /// Blocks containing a store to the pointer (a definition site).
+    store_blocks: HashMap<ValueId, HashSet<BlockId>>,
+    /// Blocks with an upward-exposed load of the pointer — the liveness seeds.
+    upward_exposed: HashMap<ValueId, HashSet<BlockId>>,
+    /// Call-terminated blocks and what each clobbers.
+    call_blocks: Vec<(BlockId, CallClobber)>,
+    /// Memoized live-in sets, keyed by variable.
+    memo: HashMap<ValueId, HashSet<BlockId>>,
+}
 
-    for block in Function::from_id(ctx, function_id).blocks() {
-        let block_id = block.id;
-        let mut has_def = false;
+impl LiveInBlocks {
+    fn new(ctx: &Context, function_id: FunctionId) -> Self {
+        let mut store_blocks: HashMap<ValueId, HashSet<BlockId>> = HashMap::default();
+        let mut upward_exposed: HashMap<ValueId, HashSet<BlockId>> = HashMap::default();
+        let mut call_blocks = Vec::new();
+        let mut stored_here: HashSet<ValueId> = HashSet::default();
 
-        for insn in block.iter() {
-            match insn.mnemonic() {
-                // A store to the var itself, or — for a sliced var — a wider store
-                // that low-alignedly covers it, fully defines the var's bytes.
-                Mnemonic::Store(Store { ptr, .. })
-                    if *ptr == var
-                        || (var_is_sliced
-                            && register_store_low_aligned_contains(ctx, *ptr, var)) =>
-                {
-                    has_def = true;
+        for block in Function::from_id(ctx, function_id).blocks() {
+            let block_id = block.id;
+            stored_here.clear();
+            for insn in block.iter() {
+                match insn.mnemonic() {
+                    Mnemonic::Store(Store { ptr, .. }) => {
+                        store_blocks.entry(*ptr).or_default().insert(block_id);
+                        stored_here.insert(*ptr);
+                    }
+                    Mnemonic::Load(Load { ptr, .. }) if !stored_here.contains(ptr) => {
+                        upward_exposed.entry(*ptr).or_default().insert(block_id);
+                    }
+                    _ => {}
                 }
-                Mnemonic::Load(Load { ptr, .. }) if *ptr == var && !has_def => {
-                    upward_exposed.insert(block_id);
+            }
+
+            match block.iter().last().map(|i| i.mnemonic().clone()) {
+                Some(Mnemonic::CallInd(_)) => call_blocks.push((block_id, CallClobber::All)),
+                Some(Mnemonic::Call(call)) => {
+                    let callee = Function::from_id(ctx, call.target);
+                    let clobber = match callee.clobbered_regs() {
+                        Some(regs) => CallClobber::Regs(regs.to_vec()),
+                        // A resolved callee with no recorded set clobbers nothing
+                        // (exact, empty set); an unresolved one is unknown, so
+                        // conservatively clobbers all.
+                        None if callee.is_externally_resolved() => CallClobber::Regs(Vec::new()),
+                        None => CallClobber::All,
+                    };
+                    call_blocks.push((block_id, clobber));
                 }
                 _ => {}
             }
         }
 
-        if call_clobbers_var(ctx, block_id, var, aliases) {
-            has_def = true;
-        }
-
-        if has_def {
-            defined.insert(block_id);
-        }
-    }
-
-    let mut live_in = upward_exposed;
-    let mut changed = true;
-    while changed {
-        changed = false;
-        for block in Function::from_id(ctx, function_id).blocks() {
-            if defined.contains(&block.id) || live_in.contains(&block.id) {
-                continue;
-            }
-            if block
-                .successors()
-                .any(|(_, successor)| live_in.contains(&successor))
-            {
-                live_in.insert(block.id);
-                changed = true;
-            }
+        Self {
+            function_id,
+            store_blocks,
+            upward_exposed,
+            call_blocks,
+            memo: HashMap::default(),
         }
     }
 
-    live_in
+    /// Memoized live-in block set for `var`.
+    fn get(
+        &mut self,
+        ctx: &Context,
+        var: ValueId,
+        sliced: &HashSet<ValueId>,
+        aliases: &AliasResult,
+    ) -> HashSet<BlockId> {
+        if let Some(cached) = self.memo.get(&var) {
+            return cached.clone();
+        }
+        let live_in = self.compute(ctx, var, sliced, aliases);
+        self.memo.insert(var, live_in.clone());
+        live_in
+    }
+
+    fn compute(
+        &self,
+        ctx: &Context,
+        var: ValueId,
+        sliced: &HashSet<ValueId>,
+        aliases: &AliasResult,
+    ) -> HashSet<BlockId> {
+        // A store defines `var`; a call that clobbers it does too (only register
+        // vars can be call-clobbered). A sliced var's definition sites include the
+        // wider covering stores, so recompute its seeds precisely.
+        let (mut defined, mut live_in) = if sliced.contains(&var) {
+            self.sliced_seeds(ctx, var)
+        } else {
+            (
+                self.store_blocks.get(&var).cloned().unwrap_or_default(),
+                self.upward_exposed.get(&var).cloned().unwrap_or_default(),
+            )
+        };
+        if register_varnode(ctx, var).is_some() {
+            for (block_id, clobber) in &self.call_blocks {
+                let clobbers = match clobber {
+                    CallClobber::All => true,
+                    CallClobber::Regs(regs) => regs
+                        .iter()
+                        .any(|&c| aliases.may_alias(ctx, ValueId::Varnode(c), var)),
+                };
+                if clobbers {
+                    defined.insert(*block_id);
+                }
+            }
+        }
+
+        // Propagate backward from the upward-exposed seeds to predecessors,
+        // stopping where `var` is defined. Each block enters the worklist at most
+        // once, so this is O(edges in the live region) rather than an O(B²)
+        // re-sweep to a fixpoint.
+        let mut worklist: Vec<BlockId> = live_in.iter().copied().collect();
+        while let Some(block_id) = worklist.pop() {
+            for (_, pred) in BasicBlock::from_id(ctx, block_id).predecessors() {
+                if !defined.contains(&pred) && live_in.insert(pred) {
+                    worklist.push(pred);
+                }
+            }
+        }
+        live_in
+    }
+
+    /// Precise store-def and upward-exposed seeds for a sliced var: a wider store
+    /// that low-alignedly covers it counts as a definition (and suppresses a
+    /// later load's upward exposure within the block), which the exact-pointer
+    /// sweep cannot see.
+    fn sliced_seeds(&self, ctx: &Context, var: ValueId) -> (HashSet<BlockId>, HashSet<BlockId>) {
+        let mut defined = HashSet::default();
+        let mut upward_exposed = HashSet::default();
+        for block in Function::from_id(ctx, self.function_id).blocks() {
+            let block_id = block.id;
+            let mut has_def = false;
+            for insn in block.iter() {
+                match insn.mnemonic() {
+                    Mnemonic::Store(Store { ptr, .. })
+                        if *ptr == var || register_store_low_aligned_contains(ctx, *ptr, var) =>
+                    {
+                        has_def = true;
+                    }
+                    Mnemonic::Load(Load { ptr, .. }) if *ptr == var && !has_def => {
+                        upward_exposed.insert(block_id);
+                    }
+                    _ => {}
+                }
+            }
+            if has_def {
+                defined.insert(block_id);
+            }
+        }
+        (defined, upward_exposed)
+    }
 }
 
 struct BranchEdge<'a> {
@@ -1746,7 +1824,7 @@ mod tests {
         let frontier = dom.dominator_frontier();
         let aliases = AliasResult::simple(&ctx);
         let sliced = HashSet::default();
-        let live_in = live_in_blocks(&ctx, test, A.into(), &sliced, &aliases);
+        let live_in = LiveInBlocks::new(&ctx, test).get(&ctx, A.into(), &sliced, &aliases);
 
         let result =
             find_phi_insert_positions(&ctx, A.into(), &function, &sliced, frontier, &live_in);
@@ -1991,7 +2069,7 @@ mod tests {
         let frontier = dom.dominator_frontier();
         let aliases = AliasResult::simple(&ctx);
         let sliced = HashSet::default();
-        let live_in = live_in_blocks(&ctx, test, A.into(), &sliced, &aliases);
+        let live_in = LiveInBlocks::new(&ctx, test).get(&ctx, A.into(), &sliced, &aliases);
 
         let result =
             find_phi_insert_positions(&ctx, A.into(), &function, &sliced, frontier, &live_in);
