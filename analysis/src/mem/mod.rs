@@ -2,6 +2,7 @@
 //! (mem2reg) and the memory-liveness dataflow that backs dead-load/store
 //! elimination.
 
+pub mod array_promote;
 pub mod mem2reg;
 pub mod mem_liveness;
 
