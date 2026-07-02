@@ -130,7 +130,12 @@ fn collect_raws(stmts: &[Stmt], out: &mut Vec<InstructionId>) {
     }
 }
 
-fn is_root(ctx: &Context, id: InstructionId) -> bool {
+/// Whether instruction `id` is emitted as its own statement, rather than inlined
+/// into its single user. This is the one inlining contract the backend shares:
+/// [`refine::is_condition_only`](super::refine::is_condition_only) is exactly its
+/// negation for a [`Stmt::Raw`], so a statement one phase treats as invisibly
+/// folded is one the emitter actually inlines.
+pub(crate) fn is_root(ctx: &Context, id: InstructionId) -> bool {
     let insn = Instruction::from_id(ctx, id);
     if is_side_effecting(insn.mnemonic()) {
         return true;

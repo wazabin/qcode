@@ -5,16 +5,13 @@
 //! each loop into the most specific pre- or post-tested form its shape permits;
 //! everything it can't classify stays an endless `while (true)`.
 
-use qcode::{
-    context::Context,
-    value::{FunctionId, Instruction, ValueId},
-};
+use qcode::{context::Context, value::FunctionId};
 
 use crate::pipeline::DecompilePass;
 
 use super::{
     ast::{Program, Stmt},
-    emit::is_side_effecting,
+    emit::is_root,
 };
 
 /// Rewrites every endless `Loop` in the program into a pre- or post-tested loop
@@ -131,16 +128,13 @@ fn without_trailing_continue(mut stmts: Vec<Stmt>) -> Vec<Stmt> {
     stmts
 }
 
-/// Whether a statement is a pure, single-use value that only feeds a control-flow
-/// condition — so it folds into the condition expression and is emitted nowhere
-/// else. Such statements are structurally present but invisible in the output,
-/// so pattern matchers (loop refinement, switch recovery) skip past them.
+/// Whether a statement folds into a following control-flow condition and is thus
+/// invisible in the output — so pattern matchers (loop refinement) may skip past
+/// it. This is exactly "not a root": a `Stmt::Raw` the emitter would inline into
+/// its single user (or elide as dead) rather than print on its own line. Sharing
+/// [`is_root`] keeps the two from drifting — notably a load kept live across an
+/// aliasing store is a root, so it is *not* condition-only and must not be
+/// skipped as if it folded away.
 pub(crate) fn is_condition_only(ctx: &Context, stmt: &Stmt) -> bool {
-    match stmt {
-        Stmt::Raw(id) => {
-            let insn = Instruction::from_id(ctx, *id);
-            !is_side_effecting(insn.mnemonic()) && ctx.users(ValueId::Instruction(*id)).len() <= 1
-        }
-        _ => false,
-    }
+    matches!(stmt, Stmt::Raw(id) if !is_root(ctx, *id))
 }

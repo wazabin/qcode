@@ -478,6 +478,11 @@ fn skip_setup_prefix<'a>(ctx: &Context, stmts: &'a [Stmt]) -> &'a [Stmt] {
 /// Whether a statement is a pure (side-effect-free) value definition — comparison
 /// setup that folds away with the switch.
 ///
+/// This deliberately is *not* `!is_root`: the comparison arithmetic a switch
+/// shares between siblings (gcc's `x - k`, reused by both an equality and a
+/// relational test) is multiply-used, so `is_root` would call it a root — yet it
+/// vanishes with the folded subtree, so it is still dead setup to skip here.
+///
 /// A load is excluded even though it is side-effect-free: its value is only valid
 /// until the next aliasing write, so it is not freely foldable and must not be
 /// skipped as if it were dead setup (it is emitted as its own statement).
