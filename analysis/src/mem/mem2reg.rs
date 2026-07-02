@@ -88,6 +88,14 @@ impl<'ctx, 'str> Mem2Reg<'ctx, 'str> {
     }
 
     fn run(&mut self) -> bool {
+        // A function with no root (entry) block has no dominator tree, so there is
+        // nothing to promote. Lifting can leave such degenerate functions behind
+        // (blocks present, but no entry designated); bail instead of panicking in
+        // `root_id()`.
+        if self.root_id.is_none() {
+            return false;
+        }
+
         // Precompute the liveness inputs in one sweep so the collection and
         // block-param phases share a single per-var computation (memoized) instead
         // of rescanning the whole function for each variable.

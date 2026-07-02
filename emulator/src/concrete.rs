@@ -792,6 +792,22 @@ impl StandaloneEmulator {
         EmulatorError::new(kind, &Instruction::from_id(ctx, instruction))
     }
 
+    /// Construct an [`EmulatorErrorKind::EmptyBlock`] error for the current block
+    /// without indexing into it. [`make_error`](Self::make_error) can't serve this
+    /// case — it panics when the block has no instructions to attach context to.
+    fn make_empty_block_error(&self, ctx: &Context<'_>) -> EmulatorError {
+        let block = BasicBlock::from_id(ctx, self.block);
+        EmulatorError {
+            kind: EmulatorErrorKind::EmptyBlock(self.block),
+            ctx: format!(
+                "Block: {:?}\nFunction: {:?}",
+                block.name(),
+                block.function().map(|f| f.name())
+            ),
+            address: block.address(),
+        }
+    }
+
     fn make_error_at(
         &self,
         ctx: &Context<'_>,
@@ -1540,6 +1556,14 @@ impl StandaloneEmulator {
             let insn_ids = BasicBlock::from_id(ctx, self.block)
                 .instruction_ids()
                 .to_vec();
+            // A well-formed block ends in a terminator, so `self.idx` should always
+            // point at a real instruction. Lifting can leave degenerate empty blocks
+            // behind, though; bail with a recoverable error instead of indexing out
+            // of bounds (which would crash the whole analysis via GVN pure-call
+            // folding). `make_error` can't be used here — it also indexes the block.
+            if self.idx >= insn_ids.len() {
+                break Err(self.make_empty_block_error(ctx));
+            }
             let insn = InstructionRef::new(ctx, insn_ids[self.idx]);
             if matches!(insn.mnemonic(), Mnemonic::Return(_)) {
                 break Ok(());

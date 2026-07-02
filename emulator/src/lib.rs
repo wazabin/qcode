@@ -96,6 +96,10 @@ pub enum EmulatorErrorKind {
     /// emulation is deferred). Recoverable: a best-effort consumer such as
     /// pure-call folding simply declines to harvest, rather than crashing.
     UnsupportedMnemonic(&'static str),
+    /// Execution reached a block with no instructions (a malformed/degenerate
+    /// block left behind by lifting). Recoverable: bounded consumers decline to
+    /// harvest rather than indexing out of bounds.
+    EmptyBlock(BlockId),
 }
 
 impl std::fmt::Display for EmulatorErrorKind {
@@ -119,6 +123,7 @@ impl std::fmt::Display for EmulatorErrorKind {
                 write!(f, "emulation exceeded step budget of {budget}")
             }
             Self::UnsupportedMnemonic(op) => write!(f, "unsupported mnemonic `{op}`"),
+            Self::EmptyBlock(block) => write!(f, "block {block:?} has no instructions"),
         }
     }
 }
