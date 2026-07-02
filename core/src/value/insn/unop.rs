@@ -1,8 +1,9 @@
 use std::fmt::{Display, Formatter};
+use smallvec::smallvec;
 
 use crate::{
     context::Context,
-    value::{ValueId, ValueRef, insn::mnemonic::MnemonicKind},
+    value::{ValueId, ValueRef, insn::mnemonic::{Args, MnemonicKind}},
 };
 
 #[non_exhaustive]
@@ -82,8 +83,8 @@ impl MnemonicKind for Unary {
         }
     }
 
-    fn args(&self) -> Vec<ValueId> {
-        vec![self.src]
+    fn args(&self) -> Args {
+        smallvec![self.src]
     }
 }
 

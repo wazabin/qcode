@@ -7,7 +7,8 @@ use crate::{
 };
 use std::fmt::Formatter;
 
-use super::mnemonic::MnemonicKind;
+use super::mnemonic::{Args, MnemonicKind};
+use smallvec::smallvec;
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub struct Zext {
@@ -36,8 +37,8 @@ impl MnemonicKind for Zext {
         )
     }
 
-    fn args(&self) -> Vec<ValueId> {
-        vec![self.src]
+    fn args(&self) -> Args {
+        smallvec![self.src]
     }
 }
 
@@ -71,8 +72,8 @@ impl MnemonicKind for Sext {
         )
     }
 
-    fn args(&self) -> Vec<ValueId> {
-        vec![self.src]
+    fn args(&self) -> Args {
+        smallvec![self.src]
     }
 }
 
@@ -111,8 +112,8 @@ impl MnemonicKind for Range {
         )
     }
 
-    fn args(&self) -> Vec<ValueId> {
-        vec![self.src]
+    fn args(&self) -> Args {
+        smallvec![self.src]
     }
 }
 
@@ -136,8 +137,8 @@ impl MnemonicKind for IntToFloat {
         )
     }
 
-    fn args(&self) -> Vec<ValueId> {
-        vec![self.src]
+    fn args(&self) -> Args {
+        smallvec![self.src]
     }
 }
 
@@ -161,8 +162,8 @@ impl MnemonicKind for FloatToFloat {
         )
     }
 
-    fn args(&self) -> Vec<ValueId> {
-        vec![self.src]
+    fn args(&self) -> Args {
+        smallvec![self.src]
     }
 }
 
@@ -186,8 +187,8 @@ impl MnemonicKind for FloatToInt {
         )
     }
 
-    fn args(&self) -> Vec<ValueId> {
-        vec![self.src]
+    fn args(&self) -> Args {
+        smallvec![self.src]
     }
 }
 

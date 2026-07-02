@@ -5,7 +5,8 @@ use crate::{
     value::{ValueId, ValueRef},
 };
 
-use super::mnemonic::MnemonicKind;
+use super::mnemonic::{Args, MnemonicKind};
+use smallvec::smallvec;
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub struct Assert {
@@ -21,8 +22,8 @@ impl MnemonicKind for Assert {
         write!(f, "assert {};", ValueRef::new(self.condition, ctx))
     }
 
-    fn args(&self) -> Vec<ValueId> {
-        vec![self.condition]
+    fn args(&self) -> Args {
+        smallvec![self.condition]
     }
 }
 

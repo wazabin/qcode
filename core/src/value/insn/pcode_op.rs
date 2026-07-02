@@ -1,4 +1,5 @@
-use super::mnemonic::MnemonicKind;
+use super::mnemonic::{Args, MnemonicKind};
+use smallvec::SmallVec;
 use crate::{
     context::Context,
     value::{ValueId, ValueRef},
@@ -37,7 +38,7 @@ impl MnemonicKind for PCodeOp {
         }
     }
 
-    fn args(&self) -> Vec<ValueId> {
-        self.args.clone()
+    fn args(&self) -> Args {
+        SmallVec::from_vec(self.args.clone())
     }
 }

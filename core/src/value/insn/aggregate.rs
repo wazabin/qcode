@@ -13,7 +13,8 @@ use crate::{
 };
 use std::fmt::Formatter;
 
-use super::mnemonic::MnemonicKind;
+use super::mnemonic::{Args, MnemonicKind};
+use smallvec::{SmallVec, smallvec};
 
 fn fmt_bare_value(f: &mut Formatter<'_>, ctx: &Context<'_>, value: ValueId) -> std::fmt::Result {
     match value {
@@ -75,8 +76,8 @@ impl MnemonicKind for Tuple {
         write!(f, ");")
     }
 
-    fn args(&self) -> Vec<ValueId> {
-        self.fields.clone()
+    fn args(&self) -> Args {
+        SmallVec::from_vec(self.fields.clone())
     }
 }
 
@@ -110,8 +111,8 @@ impl MnemonicKind for Extract {
         write!(f, ".{name});")
     }
 
-    fn args(&self) -> Vec<ValueId> {
-        vec![self.agg]
+    fn args(&self) -> Args {
+        smallvec![self.agg]
     }
 }
 
@@ -158,8 +159,8 @@ impl MnemonicKind for Gep {
         }
     }
 
-    fn args(&self) -> Vec<ValueId> {
-        vec![self.base]
+    fn args(&self) -> Args {
+        smallvec![self.base]
     }
 }
 

@@ -5,7 +5,8 @@ use crate::{
     value::{BasicBlock, Function, ValueId, ValueRef, block::BlockId, function::FunctionId},
 };
 
-use super::mnemonic::MnemonicKind;
+use super::mnemonic::{Args, MnemonicKind};
+use smallvec::{SmallVec, smallvec};
 
 fn fmt_branch_target(
     f: &mut Formatter<'_>,
@@ -66,8 +67,8 @@ impl MnemonicKind for Branch {
         write!(f, ";")
     }
 
-    fn args(&self) -> Vec<ValueId> {
-        self.args.clone()
+    fn args(&self) -> Args {
+        SmallVec::from_vec(self.args.clone())
     }
 }
 
@@ -89,8 +90,8 @@ impl MnemonicKind for BranchInd {
         write!(f, "goto [{}];", ValueRef::new(self.ptr, ctx))
     }
 
-    fn args(&self) -> Vec<ValueId> {
-        vec![self.ptr]
+    fn args(&self) -> Args {
+        smallvec![self.ptr]
     }
 }
 
@@ -129,8 +130,8 @@ impl MnemonicKind for Call {
         write!(f, ");")
     }
 
-    fn args(&self) -> Vec<ValueId> {
-        self.args.clone()
+    fn args(&self) -> Args {
+        SmallVec::from_vec(self.args.clone())
     }
 }
 
@@ -153,8 +154,8 @@ impl MnemonicKind for CallInd {
         write!(f, "call [{}];", ValueRef::new(self.ptr, ctx))
     }
 
-    fn args(&self) -> Vec<ValueId> {
-        let mut args = vec![self.ptr];
+    fn args(&self) -> Args {
+        let mut args = smallvec![self.ptr];
         args.extend(self.args.clone());
         args
     }
@@ -188,8 +189,8 @@ impl MnemonicKind for CBranch {
         write!(f, ";")
     }
 
-    fn args(&self) -> Vec<ValueId> {
-        let mut args = vec![self.condition];
+    fn args(&self) -> Args {
+        let mut args = smallvec![self.condition];
         args.extend_from_slice(&self.success_args);
         args.extend_from_slice(&self.failure_args);
         args
@@ -215,8 +216,8 @@ impl MnemonicKind for Return {
         write!(f, "return [{}];", ValueRef::new(self.ptr, ctx))
     }
 
-    fn args(&self) -> Vec<ValueId> {
-        let mut args = vec![self.ptr];
+    fn args(&self) -> Args {
+        let mut args = smallvec![self.ptr];
         if let Some(value) = self.value {
             args.push(value);
         }

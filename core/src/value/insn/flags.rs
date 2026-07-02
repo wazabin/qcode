@@ -4,7 +4,8 @@ use crate::{
 };
 use std::fmt::Formatter;
 
-use super::mnemonic::MnemonicKind;
+use super::mnemonic::{Args, MnemonicKind};
+use smallvec::smallvec;
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub struct IsFloatNaN {
@@ -20,8 +21,8 @@ impl MnemonicKind for IsFloatNaN {
         write!(f, "nan({});", ValueRef::new(self.src, ctx))
     }
 
-    fn args(&self) -> Vec<ValueId> {
-        vec![self.src]
+    fn args(&self) -> Args {
+        smallvec![self.src]
     }
 }
 
@@ -59,8 +60,8 @@ impl MnemonicKind for LzCount {
         write!(f, "lzcount({});", ValueRef::new(self.src, ctx))
     }
 
-    fn args(&self) -> Vec<ValueId> {
-        vec![self.src]
+    fn args(&self) -> Args {
+        smallvec![self.src]
     }
 }
 
@@ -86,8 +87,8 @@ impl MnemonicKind for PopCount {
         write!(f, "popcount({});", ValueRef::new(self.src, ctx))
     }
 
-    fn args(&self) -> Vec<ValueId> {
-        vec![self.src]
+    fn args(&self) -> Args {
+        smallvec![self.src]
     }
 }
 
@@ -127,8 +128,8 @@ impl MnemonicKind for Carry {
         )
     }
 
-    fn args(&self) -> Vec<ValueId> {
-        vec![self.lhs, self.rhs]
+    fn args(&self) -> Args {
+        smallvec![self.lhs, self.rhs]
     }
 }
 
@@ -167,8 +168,8 @@ impl MnemonicKind for SCarry {
         )
     }
 
-    fn args(&self) -> Vec<ValueId> {
-        vec![self.lhs, self.rhs]
+    fn args(&self) -> Args {
+        smallvec![self.lhs, self.rhs]
     }
 }
 
@@ -207,8 +208,8 @@ impl MnemonicKind for SBorrow {
         )
     }
 
-    fn args(&self) -> Vec<ValueId> {
-        vec![self.lhs, self.rhs]
+    fn args(&self) -> Args {
+        smallvec![self.lhs, self.rhs]
     }
 }
 

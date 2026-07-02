@@ -21,7 +21,8 @@ use crate::{
 };
 use std::fmt::Formatter;
 
-use super::mnemonic::MnemonicKind;
+use super::mnemonic::{Args, MnemonicKind};
+use smallvec::SmallVec;
 
 /// A total element-wise map `out[i] = body(src[i], captures…)`. The result is
 /// `[U; N]` where `N` is `src`'s length and `U` is the body's return type.
@@ -59,8 +60,8 @@ impl MnemonicKind for Map {
         }
     }
 
-    fn args(&self) -> Vec<ValueId> {
-        let mut args = Vec::with_capacity(1 + self.captures.len());
+    fn args(&self) -> Args {
+        let mut args: Args = SmallVec::with_capacity(1 + self.captures.len());
         args.push(self.src);
         args.extend(self.captures.iter().copied());
         args
@@ -171,7 +172,7 @@ mod tests {
         // `body` is a symbol; `src` + captures are the value operands.
         assert_eq!(m.body, body);
         assert_eq!(
-            m.args(),
+            m.args().to_vec(),
             vec![src, cap],
             "src then captures are the operands"
         );

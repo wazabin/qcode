@@ -5,7 +5,8 @@ use crate::{
 };
 use std::fmt::Formatter;
 
-use super::mnemonic::MnemonicKind;
+use super::mnemonic::{Args, MnemonicKind};
+use smallvec::smallvec;
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub struct Load {
@@ -38,8 +39,8 @@ impl MnemonicKind for Load {
         )
     }
 
-    fn args(&self) -> Vec<ValueId> {
-        vec![self.ptr]
+    fn args(&self) -> Args {
+        smallvec![self.ptr]
     }
 }
 
@@ -99,8 +100,8 @@ impl MnemonicKind for Store {
         )
     }
 
-    fn args(&self) -> Vec<ValueId> {
-        vec![self.ptr, self.src]
+    fn args(&self) -> Args {
+        smallvec![self.ptr, self.src]
     }
 }
 

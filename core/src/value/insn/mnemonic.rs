@@ -11,7 +11,15 @@ use crate::{
         },
     },
 };
+use smallvec::SmallVec;
 use std::fmt::Formatter;
+
+/// Operand list returned by [`MnemonicKind::args`]. Inline-stores up to two
+/// operands (covering every fixed-arity instruction — binops, casts, loads,
+/// flags, …), so the pervasive per-instruction operand walks in the analysis
+/// passes don't heap-allocate. Variable-arity ops (calls, tuples, `scan`) spill
+/// to the heap only when they exceed two operands.
+pub type Args = SmallVec<[ValueId; 2]>;
 
 /// Implemented by each concrete instruction type.
 ///
@@ -30,7 +38,7 @@ pub trait MnemonicKind {
 
     // TODO: replace with a visitor pattern to avoid the need for this method
     /// Returns the [`ValueId`]s of all operands consumed by this instruction.
-    fn args(&self) -> Vec<ValueId>;
+    fn args(&self) -> Args;
 
     /// Returns `true` if this instruction ends a basic block.
     ///
@@ -202,7 +210,7 @@ impl Mnemonic {
         self.as_kind().fmt(f, ctx)
     }
 
-    pub fn args(&self) -> Vec<ValueId> {
+    pub fn args(&self) -> Args {
         self.as_kind().args()
     }
 
