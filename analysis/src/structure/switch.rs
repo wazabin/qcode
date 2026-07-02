@@ -117,7 +117,7 @@ fn try_switch(ctx: &Context, stmt: &Stmt) -> Option<Stmt> {
         gotos: HashSet::new(),
         ok: true,
     };
-    collector.collect(std::slice::from_ref(stmt));
+    collector.collect(std::slice::from_ref(stmt), (0, u64::MAX));
     if !collector.ok {
         return None;
     }
@@ -166,10 +166,16 @@ struct Collector<'c, 'ctx> {
 impl Collector<'_, '_> {
     /// Walks one arm of the tree, classifying it as a case, a navigation split, a
     /// default block, or a goto to the default.
-    fn collect(&mut self, stmts: &[Stmt]) {
+    ///
+    /// `interval` is the range of scrutinee values that can reach this arm, given
+    /// the navigation splits taken above it. A case whose constant falls outside
+    /// that range is a contradiction (an inconsistent or obfuscated tree) and
+    /// aborts the fold, so a dead case is never merged into a live `match`.
+    fn collect(&mut self, stmts: &[Stmt], interval: (u64, u64)) {
         if !self.ok || stmts.is_empty() {
             return;
         }
+        let (lo, hi) = interval;
         // A comparison node leads with the (now-dead once folded) statements that
         // compute its test — often multiply-used, since the compiler shares
         // `x - k` between the equality and the relational test. Skip past them to
@@ -180,6 +186,12 @@ impl Collector<'_, '_> {
                 if let Some((s, values)) = match_case_test(cond)
                     && s == self.scrutinee
                 {
+                    if !values.iter().all(|&v| lo <= v && v <= hi) {
+                        // A case for a value the navigation splits already ruled
+                        // out — an inconsistent tree we must not fold.
+                        self.ok = false;
+                        return;
+                    }
                     let mut insns = Vec::new();
                     collect_expr_insns(cond, &mut insns);
                     self.cases.push(SwitchCase {
@@ -187,13 +199,17 @@ impl Collector<'_, '_> {
                         body: then.clone(),
                         insns,
                     });
-                    self.collect(els);
+                    self.collect(els, interval);
                     return;
                 }
                 if scrutinee_of(cond).as_ref() == Some(&self.scrutinee) {
-                    // A relational split on the scrutinee: both sides continue.
-                    self.collect(then);
-                    self.collect(els);
+                    // A relational split on the scrutinee: both sides continue,
+                    // each with the sub-interval the split implies (when it is a
+                    // recognizable unsigned test; otherwise the interval is kept).
+                    let (then_iv, els_iv) = split_interval(cond, &self.scrutinee, interval)
+                        .unwrap_or((interval, interval));
+                    self.collect(then, then_iv);
+                    self.collect(els, els_iv);
                     return;
                 }
                 // A condition off the scrutinee: this whole arm is the default.
@@ -220,6 +236,71 @@ impl Collector<'_, '_> {
         if let Some(label) = label {
             self.default_label = Some(label);
         }
+    }
+}
+
+/// The sub-intervals a relational split on the scrutinee implies for its true
+/// and false sides, clamped to the current `interval`. Returns `None` when the
+/// condition is not a recognizable unsigned relational test against a constant on
+/// the bare scrutinee (e.g. a signed, cast-wrapped compare), in which case the
+/// caller keeps the interval unchanged rather than narrow it wrongly.
+fn split_interval(
+    cond: &Expr,
+    scrutinee: &Expr,
+    (lo, hi): (u64, u64),
+) -> Option<((u64, u64), (u64, u64))> {
+    let ExprKind::Binary(op, a, b) = &cond.kind else {
+        return None;
+    };
+    // Orient the relation as `scrutinee <op> k`.
+    let (k, op) = if a.as_ref() == scrutinee {
+        match b.kind {
+            ExprKind::Const(k) => (k, *op),
+            _ => return None,
+        }
+    } else if b.as_ref() == scrutinee {
+        match a.kind {
+            ExprKind::Const(k) => (k, flip_cmp(*op)),
+            _ => return None,
+        }
+    } else {
+        return None;
+    };
+    const EMPTY: (u64, u64) = (1, 0);
+    let clamp = |a: u64, b: u64| (a.max(lo), b.min(hi));
+    Some(match op {
+        // x < k → [lo, k-1] ; x >= k → [k, hi]
+        BinOp::Lt => (
+            k.checked_sub(1).map_or(EMPTY, |u| clamp(lo, u)),
+            clamp(k, hi),
+        ),
+        // x <= k → [lo, k] ; x > k → [k+1, hi]
+        BinOp::Le => (
+            clamp(lo, k),
+            k.checked_add(1).map_or(EMPTY, |l| clamp(l, hi)),
+        ),
+        // x > k → [k+1, hi] ; x <= k → [lo, k]
+        BinOp::Gt => (
+            k.checked_add(1).map_or(EMPTY, |l| clamp(l, hi)),
+            clamp(lo, k),
+        ),
+        // x >= k → [k, hi] ; x < k → [lo, k-1]
+        BinOp::Ge => (
+            clamp(k, hi),
+            k.checked_sub(1).map_or(EMPTY, |u| clamp(lo, u)),
+        ),
+        _ => return None,
+    })
+}
+
+/// The comparison operator with its operands swapped (`k < x` ⟺ `x > k`).
+fn flip_cmp(op: BinOp) -> BinOp {
+    match op {
+        BinOp::Lt => BinOp::Gt,
+        BinOp::Le => BinOp::Ge,
+        BinOp::Gt => BinOp::Lt,
+        BinOp::Ge => BinOp::Le,
+        other => other,
     }
 }
 
@@ -358,6 +439,137 @@ mod tests {
 
     fn has_switch(stmts: &[Stmt]) -> bool {
         stmts.iter().any(|s| matches!(s, Stmt::Switch { .. }))
+    }
+
+    /// Asserts every `goto <name>;` in the emitted C has a matching `<name>:`
+    /// label line — i.e. no jump dangles to an absorbed/suppressed label.
+    fn assert_no_dangling_gotos(c: &str) {
+        let labels: std::collections::HashSet<&str> = c
+            .lines()
+            .filter_map(|l| l.trim().strip_suffix(':'))
+            .collect();
+        for line in c.lines() {
+            let t = line.trim();
+            if let Some(rest) = t.strip_prefix("goto ") {
+                let target = rest.trim_end_matches(';');
+                assert!(
+                    labels.contains(target),
+                    "goto `{target}` has no label in:\n{c}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn inconsistent_navigation_tree_is_not_folded() {
+        // The `x < 2` navigation routes the `lo` side, yet that side tests
+        // `x == 5` — impossible under `x < 2`. Such a contradictory tree
+        // (patched/obfuscated) must not fold: doing so would merge a dead case
+        // into the live `match`. It stays an if/else chain instead.
+        let mut ctx = Context::new();
+        qcode!(
+            ctx,
+            "
+            varnode i32 sel;
+            varnode i32 out;
+
+            fn f:
+            <entry>
+                %x = load(i32, &sel);
+                %c2 = i32 %x == i32 0x2;
+                if %c2 goto <case2> else goto <nav>;
+            <case2>
+                store(&out, i32 0x20);
+                goto <done>;
+            <nav>
+                %lt = i32 %x < i32 0x2;
+                if %lt goto <lo> else goto <hi>;
+            <lo>
+                %c5 = i32 %x == i32 0x5;
+                if %c5 goto <case5> else goto <default_lbl>;
+            <case5>
+                store(&out, i32 0x50);
+                goto <done>;
+            <hi>
+                %c3 = i32 %x == i32 0x3;
+                if %c3 goto <case3> else goto <default_lbl>;
+            <case3>
+                store(&out, i32 0x30);
+                goto <done>;
+            <default_lbl>
+                store(&out, i32 0x0);
+                goto <done>;
+            <done>
+                local i64 ptr;
+                return [ptr];
+            "
+        );
+
+        let program = decompile_function(&ctx, f).unwrap();
+        let c = emit_c(&ctx, &program);
+        assert!(
+            !has_switch(&program.stmts),
+            "an inconsistent tree must not fold to a switch:\n{c}"
+        );
+        // No case body may be lost by the (aborted) fold.
+        for needle in ["0x20", "0x50", "0x30", "0x0"] {
+            assert!(c.contains(needle), "missing body `{needle}`:\n{c}");
+        }
+    }
+
+    #[test]
+    fn switch_default_with_external_goto_stays_consistent() {
+        // The shared default is also reached from outside the comparison cascade.
+        // Folding the cascade into a `match` that absorbs the default's label
+        // would orphan that outside jump; validation must keep the output
+        // consistent (falling back to the flat lowering) rather than dangle it.
+        let mut ctx = Context::new();
+        qcode!(
+            ctx,
+            "
+            varnode i32 sel;
+            varnode i8 pre;
+            varnode i32 out;
+
+            fn f:
+            <entry>
+                %g = load(i8, &pre);
+                if %g goto <cascade> else goto <default_lbl>;
+            <cascade>
+                %x = load(i32, &sel);
+                %c1 = i32 %x == i32 0x1;
+                if %c1 goto <case1> else goto <t2>;
+            <case1>
+                store(&out, i32 0x10);
+                goto <done>;
+            <t2>
+                %c2 = i32 %x == i32 0x2;
+                if %c2 goto <case2> else goto <t3>;
+            <case2>
+                store(&out, i32 0x20);
+                goto <done>;
+            <t3>
+                %c3 = i32 %x == i32 0x3;
+                if %c3 goto <case3> else goto <default_lbl>;
+            <case3>
+                store(&out, i32 0x30);
+                goto <done>;
+            <default_lbl>
+                store(&out, i32 0x0);
+                goto <done>;
+            <done>
+                local i64 ptr;
+                return [ptr];
+            "
+        );
+
+        let program = decompile_function(&ctx, f).unwrap();
+        let c = emit_c(&ctx, &program);
+        // No jump may dangle, and no case body may be lost.
+        assert_no_dangling_gotos(&c);
+        for needle in ["0x10", "0x20", "0x30", "0x0"] {
+            assert!(c.contains(needle), "missing case body `{needle}`:\n{c}");
+        }
     }
 
     #[test]

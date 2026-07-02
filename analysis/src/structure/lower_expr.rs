@@ -11,7 +11,7 @@ use std::collections::HashSet;
 use qcode::{
     context::Context,
     value::{
-        BlockParam, Instruction, InstructionId, LiteralRef, ValueId, Varnode,
+        BlockParam, Instruction, InstructionId, LiteralRef, Value, ValueId, ValueRef, Varnode,
         insn::{Binop, BoolBinop, FloatBinop, IntBinop, Mnemonic, Unop},
     },
 };
@@ -36,6 +36,24 @@ pub(crate) fn lower_expr_rooted(
     roots: &HashSet<InstructionId>,
 ) -> Expr {
     lower(ctx, value, Some(roots))
+}
+
+/// Re-lowers a branch/loop condition against the emit-time root set.
+///
+/// Conditions are first lowered during structuring, before the root set exists,
+/// so they inline everything. Rendering them from their source value again here
+/// lets an inner root print by name — otherwise a load that is a named statement
+/// would be re-inlined into the condition and re-read across an intervening
+/// store. A logical-not that loop refinement wrapped around the condition (for an
+/// inverted `while`) is preserved.
+pub(crate) fn lower_condition(ctx: &Context, cond: &Expr, roots: &HashSet<InstructionId>) -> Expr {
+    if let ExprKind::Unary(UnOp::LNot, inner) = &cond.kind {
+        return lower_condition(ctx, inner, roots).logical_not();
+    }
+    match cond.value {
+        Some(value) => lower_expr_rooted(ctx, value, roots),
+        None => cond.clone(),
+    }
 }
 
 fn lower(ctx: &Context, value: ValueId, roots: Roots) -> Expr {
@@ -102,11 +120,23 @@ fn lower_instruction(ctx: &Context, id: InstructionId, roots: Roots, expand_unkn
     let insn = Instruction::from_id(ctx, id);
     match insn.mnemonic() {
         Mnemonic::Binop(b) => match map_binop(&b.op) {
-            Some(op) => Expr::bare(ExprKind::Binary(
-                op,
-                Box::new(lower(ctx, b.lhs, roots)),
-                Box::new(lower(ctx, b.rhs, roots)),
-            )),
+            Some(op) => {
+                let mut lhs = lower(ctx, b.lhs, roots);
+                let mut rhs = lower(ctx, b.rhs, roots);
+                // Signed operations (`s<`, `s/`, arithmetic `s>>`) share a C
+                // spelling with their unsigned form, so their operands are cast
+                // to signed — otherwise the bare, untyped variables read unsigned
+                // and two different IR programs would print identically.
+                match signed_operands(&b.op) {
+                    SignedOperands::Both => {
+                        lhs = signed_operand(ctx, b.lhs, lhs);
+                        rhs = signed_operand(ctx, b.rhs, rhs);
+                    }
+                    SignedOperands::LhsOnly => lhs = signed_operand(ctx, b.lhs, lhs),
+                    SignedOperands::None => {}
+                }
+                Expr::bare(ExprKind::Binary(op, Box::new(lhs), Box::new(rhs)))
+            }
             None => Expr::bare(ExprKind::Unknown {
                 op: insn.opcode().to_string(),
                 operands: vec![lower(ctx, b.lhs, roots), lower(ctx, b.rhs, roots)],
@@ -127,11 +157,17 @@ fn lower_instruction(ctx: &Context, id: InstructionId, roots: Roots, expand_unkn
             bits: z.size * 8,
             expr: Box::new(lower(ctx, z.src, roots)),
         }),
-        Mnemonic::Sext(s) => Expr::bare(ExprKind::Cast {
-            signed: true,
-            bits: s.size * 8,
-            expr: Box::new(lower(ctx, s.src, roots)),
-        }),
+        // Sign extension must interpret the source as signed *at its own width*
+        // before widening: `(int64_t)(int32_t)x`. A plain `(int64_t)x` would
+        // zero-extend an unsigned source in C, silently dropping the sign.
+        Mnemonic::Sext(s) => {
+            let src = signed_operand(ctx, s.src, lower(ctx, s.src, roots));
+            Expr::bare(ExprKind::Cast {
+                signed: true,
+                bits: s.size * 8,
+                expr: Box::new(src),
+            })
+        }
         // Not modeled structurally. As an operand (`expand_unknown` false) refer
         // to the SSA temporary by name; as a defining expression expand it to an
         // opaque `opcode(args)` pseudo-call so the assignment is meaningful.
@@ -189,6 +225,48 @@ fn map_int_binop(op: &IntBinop) -> Option<BinOp> {
         IntBinop::Div | IntBinop::Sdiv => BinOp::Div,
         IntBinop::Rem | IntBinop::Srem => BinOp::Rem,
         _ => return None,
+    })
+}
+
+/// Which operands of a binary op must be cast to signed for the C output to
+/// carry the operation's true signedness.
+enum SignedOperands {
+    /// An unsigned or non-integer op: operands render as-is.
+    None,
+    /// A signed comparison or division: both operands are signed.
+    Both,
+    /// An arithmetic right shift: only the shifted value is signed; the shift
+    /// amount stays unsigned.
+    LhsOnly,
+}
+
+fn signed_operands(op: &Binop) -> SignedOperands {
+    match op {
+        Binop::Int(IntBinop::SLess | IntBinop::SLessEqual | IntBinop::Sdiv | IntBinop::Srem) => {
+            SignedOperands::Both
+        }
+        Binop::Int(IntBinop::SShiftRight) => SignedOperands::LhsOnly,
+        _ => SignedOperands::None,
+    }
+}
+
+/// Wraps `expr` (the lowering of `value`) in a signed cast to `value`'s width, so
+/// C treats it as signed. A constant that already fits the positive signed range
+/// is left bare — it reads as a signed literal there, and casting it only adds
+/// noise; a constant with its sign bit set is cast so C does not widen the
+/// comparison to unsigned.
+fn signed_operand(ctx: &Context, value: ValueId, expr: Expr) -> Expr {
+    let bits = (ValueRef::new(value, ctx).size() * 8).max(8);
+    if let ExprKind::Const(v) = expr.kind {
+        let sign_bit_set = bits < 64 && (v & (1u64 << (bits - 1))) != 0;
+        if !sign_bit_set {
+            return expr;
+        }
+    }
+    Expr::bare(ExprKind::Cast {
+        signed: true,
+        bits,
+        expr: Box::new(expr),
     })
 }
 

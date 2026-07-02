@@ -17,7 +17,9 @@ use qcode::{
 
 use super::{
     ast::{Program, Stmt},
-    lower_expr::{deref_location, instruction_name, lower_defining_expr, lower_expr_rooted},
+    lower_expr::{
+        deref_location, instruction_name, lower_condition, lower_defining_expr, lower_expr_rooted,
+    },
     tokens::{LineBuf, TokenKind, TokenLine},
 };
 
@@ -268,7 +270,7 @@ fn emit_stmt(
             buf.keyword("if");
             buf.space();
             buf.punct("(");
-            cond.write_tokens(&mut buf);
+            lower_condition(ctx, cond, roots).write_tokens(&mut buf);
             buf.punct(")");
             buf.space();
             buf.keyword("goto");
@@ -282,7 +284,7 @@ fn emit_stmt(
             head.keyword("if");
             head.space();
             head.punct("(");
-            cond.write_tokens(&mut head);
+            lower_condition(ctx, cond, roots).write_tokens(&mut head);
             head.punct(")");
             head.space();
             head.punct("{");
@@ -303,7 +305,7 @@ fn emit_stmt(
             head.keyword("while");
             head.space();
             head.punct("(");
-            cond.write_tokens(&mut head);
+            lower_condition(ctx, cond, roots).write_tokens(&mut head);
             head.punct(")");
             head.space();
             head.punct("{");
@@ -320,7 +322,7 @@ fn emit_stmt(
             tail.keyword("while");
             tail.space();
             tail.punct("(");
-            cond.write_tokens(&mut tail);
+            lower_condition(ctx, cond, roots).write_tokens(&mut tail);
             tail.punct(")");
             tail.punct(";");
             out.push(tail.into_line(indent, None));
@@ -523,6 +525,131 @@ mod tests {
         );
         assert!(!c.contains("%a"), "the load should be inlined:\n{c}");
         assert!(!c.contains("%b"), "the add should be inlined:\n{c}");
+    }
+
+    #[test]
+    fn condition_references_root_not_reread_memory() {
+        // A load kept live across an aliasing store becomes a named root. The
+        // branch that tests it must reference that name, not re-inline the
+        // dereference and re-read memory after the store.
+        let mut ctx = Context::new();
+        qcode!(
+            ctx,
+            "
+            varnode i64 pp;
+            varnode i64 qq;
+            varnode i8 flag;
+
+            fn f:
+            <entry>
+                %p = load(i64, &pp);
+                %v = load(i8, %p);
+                %q = load(i64, &qq);
+                store(%q, i8 0x0);
+                if %v goto <then_lbl> else goto <merge>;
+            <then_lbl>
+                store(&flag, i8 0x1);
+                goto <merge>;
+            <merge>
+                local i64 ptr;
+                return [ptr];
+            "
+        );
+        let c = emit_c(&ctx, &decompile_function(&ctx, f).unwrap());
+        // The load is named (a root because of the intervening store) and the
+        // condition uses that name rather than re-dereferencing memory.
+        assert!(c.contains("v = *pp;"), "load should be a named root:\n{c}");
+        assert!(
+            c.contains("if (v)") && !c.contains("if (*pp)"),
+            "condition should reference the root, not re-read memory:\n{c}"
+        );
+    }
+
+    #[test]
+    fn signed_comparison_casts_its_operand() {
+        // A signed `s<` casts its operand so the output is not silently unsigned.
+        let mut ctx = Context::new();
+        qcode!(
+            ctx,
+            "
+            varnode i32 x;
+            varnode i32 y;
+
+            fn f:
+            <entry>
+                %a = load(i32, &x);
+                %c = i32 %a s< i32 0x5;
+                if %c goto <then_lbl> else goto <merge>;
+            <then_lbl>
+                store(&y, i32 0x1);
+                goto <merge>;
+            <merge>
+                local i64 ptr;
+                return [ptr];
+            "
+        );
+        let c = emit_c(&ctx, &decompile_function(&ctx, f).unwrap());
+        assert!(
+            c.contains("(int32_t)x") && c.contains("< 0x5"),
+            "signed compare should cast its operand:\n{c}"
+        );
+    }
+
+    #[test]
+    fn unsigned_comparison_stays_bare() {
+        // The unsigned counterpart of the signed test: no cast.
+        let mut ctx = Context::new();
+        qcode!(
+            ctx,
+            "
+            varnode i32 x;
+            varnode i32 y;
+
+            fn f:
+            <entry>
+                %a = load(i32, &x);
+                %c = i32 %a < i32 0x5;
+                if %c goto <then_lbl> else goto <merge>;
+            <then_lbl>
+                store(&y, i32 0x1);
+                goto <merge>;
+            <merge>
+                local i64 ptr;
+                return [ptr];
+            "
+        );
+        let c = emit_c(&ctx, &decompile_function(&ctx, f).unwrap());
+        assert!(
+            !c.contains("(int32_t)") && c.contains("x < 0x5"),
+            "unsigned compare should stay bare:\n{c}"
+        );
+    }
+
+    #[test]
+    fn sign_extension_extends_the_sign_not_zero() {
+        // `sext` reads its source as signed before widening, rendering
+        // `(int64_t)(int32_t)x`; a plain `(int64_t)x` would zero-extend in C.
+        let mut ctx = Context::new();
+        qcode!(
+            ctx,
+            "
+            varnode i32 x;
+            varnode i64 z;
+
+            fn f:
+            <entry>
+                %a = load(i32, &x);
+                %w = sext(i64, %a);
+                store(&z, %w);
+                local i64 ptr;
+                return [ptr];
+            "
+        );
+        let c = emit_c(&ctx, &lower_function(&ctx, f));
+        assert!(
+            c.contains("(int64_t)(int32_t)x"),
+            "sext should sign-extend, not zero-extend:\n{c}"
+        );
     }
 
     #[test]

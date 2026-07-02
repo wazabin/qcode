@@ -13,7 +13,7 @@
 //! back to the phase-1 flat lowering ([`super::lower_function`]), so output is
 //! always correct.
 
-use std::collections::{HashMap, HashSet};
+use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
 
 use jstd::graph::analysis::{DominatorTree, compute_dominators, compute_postdominators};
 use qcode::{
@@ -43,6 +43,7 @@ const DECOMPILE_PIPELINE: &[&str] = &[
     "validate_structuring",
     "refine_loops",
     "recover_switch",
+    "validate_labels",
 ];
 
 /// Decompiles `function_id` to a high-level [`Program`] by running the
@@ -117,7 +118,7 @@ impl DecompilePass for ValidateStructuring {
         fun_id: FunctionId,
         program: &mut Program,
     ) -> Result<bool, String> {
-        if validate_program(ctx, fun_id, program).is_err() {
+        if validate_program(ctx, fun_id, program, true).is_err() {
             *program = lower_function(ctx, fun_id);
             return Ok(true);
         }
@@ -127,11 +128,44 @@ impl DecompilePass for ValidateStructuring {
 
 crate::register_decompile_pass!(ValidateStructuring);
 
-/// Checks the two structural invariants the emitter relies on:
+/// Final label-consistency validation, run after the switch pass. Switch recovery
+/// absorbs a shared default block's label into the `match`; if some other part of
+/// the function still jumps to that label, the jump would dangle. This re-checks
+/// goto/label consistency (but not coverage — the switch pass legitimately elides
+/// the comparison-tree setup that coverage counts) and falls back to the flat
+/// lowering if a later pass orphaned a label.
+#[derive(Default)]
+pub struct ValidateLabels;
+
+impl DecompilePass for ValidateLabels {
+    const NAME: &'static str = "validate_labels";
+
+    fn description(&self) -> &'static str {
+        "validate goto/label consistency after switch recovery"
+    }
+
+    fn run(
+        &self,
+        ctx: &Context,
+        fun_id: FunctionId,
+        program: &mut Program,
+    ) -> Result<bool, String> {
+        if validate_program(ctx, fun_id, program, false).is_err() {
+            *program = lower_function(ctx, fun_id);
+            return Ok(true);
+        }
+        Ok(false)
+    }
+}
+
+crate::register_decompile_pass!(ValidateLabels);
+
+/// Checks the structural invariants the emitter relies on:
 ///
-/// 1. **Coverage** — every reachable block with a non-control-flow body appears
-///    in the output (its instructions were emitted). A block that vanished had
-///    its body dropped.
+/// 1. **Coverage** (only when `coverage`) — every reachable block with a
+///    non-control-flow body appears in the output. A block that vanished had its
+///    body dropped. Skipped after switch recovery, which legitimately elides the
+///    comparison setup that coverage would read as dropped.
 /// 2. **Goto/label consistency** — every `goto` to an in-subgraph block targets
 ///    a label that is actually printed. A goto to a suppressed label is a jump
 ///    into the void.
@@ -142,6 +176,7 @@ fn validate_program(
     ctx: &Context,
     function_id: FunctionId,
     program: &Program,
+    coverage: bool,
 ) -> Result<(), String> {
     let function = qcode::value::Function::from_id(ctx, function_id);
     let Some(root) = function.root() else {
@@ -149,14 +184,16 @@ fn validate_program(
     };
     let node_set: HashSet<BlockId> = reachable(ctx, root.id).into_iter().collect();
 
-    let mut labels = HashSet::new();
-    let mut gotos = HashSet::new();
-    let mut covered = HashSet::new();
+    let mut labels = HashSet::default();
+    let mut gotos = HashSet::default();
+    let mut covered = HashSet::default();
     collect_validation(ctx, &program.stmts, &mut labels, &mut gotos, &mut covered);
 
-    for &b in &node_set {
-        if block_has_body(ctx, b) && !covered.contains(&b) {
-            return Err(format!("block {b:?} was dropped from structured output"));
+    if coverage {
+        for &b in &node_set {
+            if block_has_body(ctx, b) && !covered.contains(&b) {
+                return Err(format!("block {b:?} was dropped from structured output"));
+            }
         }
     }
     for &g in &gotos {
@@ -256,7 +293,7 @@ fn structure_regions(ctx: &Context, function_id: FunctionId) -> Program {
         node_set,
         pdom,
         loops,
-        visited: HashSet::new(),
+        visited: HashSet::default(),
         frames: Vec::new(),
     };
     let (stmts, _) = structurer.region(root_id, None);
@@ -435,9 +472,15 @@ impl Structurer<'_, '_> {
     ///
     /// Derived from the post-dominator sets: among the strict post-dominators of
     /// `b`, the immediate one is post-dominated by all the others.
+    ///
+    /// The candidates are scanned in a fixed (block-id) order so the choice is
+    /// deterministic: when a block has no exit its post-dominator set is the whole
+    /// graph and several candidates tie, and an unordered scan would pick a
+    /// different one — and structure the code differently — run to run.
     fn immediate_postdom(&self, b: BlockId) -> Option<BlockId> {
         let set = self.pdom.get(&b)?;
-        let strict: Vec<BlockId> = set.iter().copied().filter(|&x| x != b).collect();
+        let mut strict: Vec<BlockId> = set.iter().copied().filter(|&x| x != b).collect();
+        strict.sort_unstable_by_key(|&x| Into::<usize>::into(x));
         strict
             .iter()
             .copied()
@@ -465,7 +508,7 @@ fn find_loops(
 ) -> Option<HashMap<BlockId, LoopInfo>> {
     // Group back-edge sources (latches) by the header they jump to. A back edge
     // is `u -> v` where `v` dominates `u`.
-    let mut latches: HashMap<BlockId, Vec<BlockId>> = HashMap::new();
+    let mut latches: HashMap<BlockId, Vec<BlockId>> = HashMap::default();
     for &u in nodes {
         for (_, v) in BasicBlock::from_id(ctx, u).successors() {
             if node_set.contains(&v) && doms.dominates(v, u) {
@@ -474,7 +517,7 @@ fn find_loops(
         }
     }
 
-    let mut loops: HashMap<BlockId, LoopInfo> = HashMap::new();
+    let mut loops: HashMap<BlockId, LoopInfo> = HashMap::default();
     for (&header, latches) in &latches {
         let body = natural_loop_body(ctx, header, latches, node_set);
         let exit = loop_exit(ctx, &body, node_set);
@@ -503,7 +546,7 @@ fn natural_loop_body(
     latches: &[BlockId],
     node_set: &HashSet<BlockId>,
 ) -> HashSet<BlockId> {
-    let mut body = HashSet::new();
+    let mut body = HashSet::default();
     body.insert(header);
     let mut stack = Vec::new();
     for &l in latches {
@@ -528,7 +571,7 @@ fn loop_exit(
     body: &HashSet<BlockId>,
     node_set: &HashSet<BlockId>,
 ) -> Option<BlockId> {
-    let mut counts: HashMap<BlockId, usize> = HashMap::new();
+    let mut counts: HashMap<BlockId, usize> = HashMap::default();
     for &a in body {
         for (_, s) in BasicBlock::from_id(ctx, a).successors() {
             if node_set.contains(&s) && !body.contains(&s) {
@@ -807,6 +850,43 @@ mod tests {
         assert!(
             c.contains("} while (cond)"),
             "expected trailing while test:\n{c}"
+        );
+    }
+
+    #[test]
+    fn exitless_function_structures_deterministically() {
+        // An endless loop with no exit gives every block the whole graph as its
+        // post-dominator set (pdom = ⊤). The immediate-post-dominator choice must
+        // be canonical there, not hash-iteration-order dependent. Smoke-test that
+        // it structures at all (the ⊤ path) and yields the same output twice.
+        let mut ctx = Context::new();
+        qcode!(
+            ctx,
+            "
+            varnode i8 cond;
+            varnode i32 x;
+
+            fn f:
+            <entry>
+                goto <head>;
+            <head>
+                %c = load(i8, &cond);
+                if %c goto <a> else goto <b>;
+            <a>
+                store(&x, i32 0x1);
+                goto <head>;
+            <b>
+                store(&x, i32 0x2);
+                goto <head>;
+            "
+        );
+
+        let first = emit_c(&ctx, &decompile_function(&ctx, f).unwrap());
+        let second = emit_c(&ctx, &decompile_function(&ctx, f).unwrap());
+        assert_eq!(first, second, "structuring should be deterministic");
+        assert!(
+            first.contains("0x1") && first.contains("0x2"),
+            "both arms should be present:\n{first}"
         );
     }
 
