@@ -301,7 +301,17 @@ impl<P: SubPasses> Walk<'_, P> {
         // foreign store here could invalidate (or fail to invalidate) a forwarded
         // load using the wrong facts. Each block is processed by its own owner's
         // walk, with its own alias oracle and dominator context.
+        //
+        // Do *not* prune the subtree here: an owned block can be dominated only
+        // through a foreign block (the tail-callee sits between the root and a
+        // later owned region), and the orphan sweep only rescues predecessor-less
+        // blocks — so returning outright would leave that owned block with no GVN
+        // at all. Skip processing the foreign block, but keep recursing (threading
+        // the inherited state through unchanged) so owned descendants still run.
         if ctx.values.basic_blocks[block_id].parent != Some(self.func_id) {
+            for &child in self.tree.children_of(block_id) {
+                self.rec(ctx, child, inherited);
+            }
             return;
         }
         let mut states = inherited.clone();

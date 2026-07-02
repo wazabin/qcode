@@ -262,7 +262,7 @@ fn signed_operands(op: &Binop) -> SignedOperands {
 fn signed_operand(ctx: &Context, value: ValueId, expr: Expr) -> Expr {
     let bits = (ValueRef::new(value, ctx).size() * 8).max(8);
     if let ExprKind::Const(v) = expr.kind {
-        let sign_bit_set = bits < 64 && (v & (1u64 << (bits - 1))) != 0;
+        let sign_bit_set = bits <= 64 && (v & (1u64 << (bits - 1))) != 0;
         if !sign_bit_set {
             return expr;
         }

@@ -401,11 +401,23 @@ impl MemForward {
         // than scanning — and dominance-testing — every block in the whole
         // program, which is O(program) per loop header and made gvn scale with
         // total lifted code instead of the current function.
+        //
+        // A tail-call edge is a real CFG edge, so the dominator subtree can reach
+        // blocks owned by the callee. Those foreign blocks are not described by
+        // this function's alias oracle — `may_alias` returns false for any pointer
+        // it never scanned — so a foreign store there would be silently treated as
+        // non-clobbering and leave a stale value forwarded across the loop. Skip
+        // foreign blocks' stores entirely (they are the callee's concern, walked by
+        // its own owner), but keep traversing through them to reach any owned
+        // descendant, whose stores this function *does* reason about.
+        let owner = ctx.values.basic_blocks[block_id].parent;
         let mut body = vec![block_id];
         let mut frontier = vec![block_id];
         while let Some(b) = frontier.pop() {
             for &child in tree.children_of(b) {
-                body.push(child);
+                if ctx.values.basic_blocks[child].parent == owner {
+                    body.push(child);
+                }
                 frontier.push(child);
             }
         }

@@ -181,16 +181,10 @@ fn load_safe_to_fold(ctx: &Context, load: InstructionId, user: InstructionId) ->
 }
 
 /// Whether an instruction must always be a statement because it has effects.
+/// Shares its definition with DCE via [`Mnemonic::has_side_effects`] so the two
+/// cannot drift (e.g. DCE deleting an `Assert` the emitter would print).
 pub(crate) fn is_side_effecting(m: &Mnemonic) -> bool {
-    matches!(
-        m,
-        Mnemonic::Store(_)
-            | Mnemonic::Call(_)
-            | Mnemonic::CallInd(_)
-            | Mnemonic::Return(_)
-            | Mnemonic::PCodeOp(_)
-            | Mnemonic::Assert(_)
-    )
+    m.has_side_effects()
 }
 
 /// Whether an instruction reads memory — a load, whose result is only valid

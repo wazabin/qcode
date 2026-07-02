@@ -280,7 +280,16 @@ fn structure_regions_limited(ctx: &Context, function_id: FunctionId, max_depth: 
     };
     let root_id = root.id;
 
-    let nodes = reachable(ctx, root_id);
+    // A tail-call edge is a real CFG edge, so whole-program reachability from the
+    // root pulls in blocks owned by the callee. Restrict the region to blocks this
+    // function owns: otherwise the structured path inlines the entire callee body
+    // into the caller, and the flat fallback emits `goto bb_N;` into a block that
+    // has no matching label. Foreign successors then fall outside `node_set` and
+    // are correctly treated as region exits.
+    let nodes: Vec<BlockId> = reachable(ctx, root_id)
+        .into_iter()
+        .filter(|&b| ctx.values.basic_blocks[b].parent == Some(function_id))
+        .collect();
     let node_set: HashSet<BlockId> = nodes.iter().copied().collect();
     let doms = compute_dominators(ctx, root_id);
 

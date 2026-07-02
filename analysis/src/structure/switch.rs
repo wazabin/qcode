@@ -366,9 +366,14 @@ fn scrutinee_of(cond: &Expr) -> Option<Expr> {
     let mut leaves = Vec::new();
     collect_var_leaves(cond, &mut leaves);
     let first = *leaves.first()?;
-    // All leaves must be the same variable (by name); return the leaf itself so
-    // its `ValueId` is preserved for `same_scrutinee`.
-    leaves.iter().all(|v| *v == first).then(|| first.clone())
+    // All leaves must be the *same* variable — compared by IR provenance, not
+    // just display name, since distinct SSA versions of a register can share a
+    // name. Return the leaf itself so its `ValueId` is preserved for
+    // `same_scrutinee`.
+    leaves
+        .iter()
+        .all(|v| same_scrutinee(v, first))
+        .then(|| first.clone())
 }
 
 /// Collects every variable-leaf expression of `expr` (preserving provenance).
