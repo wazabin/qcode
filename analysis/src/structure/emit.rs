@@ -10,8 +10,8 @@ use std::collections::HashSet;
 use qcode::{
     context::Context,
     value::{
-        BlockId, Function, Instruction, InstructionId, ValueId, Varnode, VarnodeId,
-        function::FunctionId, insn::Mnemonic,
+        BlockId, Function, Instruction, InstructionId, Value, ValueId, ValueRef, Varnode,
+        VarnodeId, function::FunctionId, insn::Mnemonic,
     },
 };
 
@@ -367,6 +367,10 @@ fn emit_stmt(
             head.punct("{");
             out.push(head.into_line(indent, None));
 
+            // Case labels are interpreted at the scrutinee's width, so a value
+            // whose sign bit is set there prints as a signed decimal (`-1`)
+            // rather than a full-width unsigned constant (`0xffffffffffffffff`).
+            let width = scrutinee.value.map(|v| ValueRef::new(v, ctx).size());
             for case in cases {
                 let mut arm = LineBuf::default();
                 for (i, &v) in case.values.iter().enumerate() {
@@ -375,7 +379,7 @@ fn emit_stmt(
                         arm.punct("|");
                         arm.space();
                     }
-                    arm.push(format!("0x{v:x}"), TokenKind::Number);
+                    arm.push(format_case_value(v, width), TokenKind::Number);
                 }
                 arm.space();
                 arm.punct("=>");
@@ -478,6 +482,29 @@ fn brace_line(text: &str, indent: usize) -> TokenLine {
     let mut buf = LineBuf::default();
     buf.punct(text);
     buf.into_line(indent, None)
+}
+
+/// Formats a `switch`/`match` case label. A constant whose sign bit is set at the
+/// scrutinee's `width` (in bytes) prints as a signed decimal — `-1` rather than
+/// the sign-extended `0xffffffffffffffff` — so negative case values read
+/// naturally. Non-negative values (and values of unknown width) stay hex.
+fn format_case_value(v: u64, width: Option<usize>) -> String {
+    if let Some(w) = width
+        && (1..=8).contains(&w)
+    {
+        let bits = w * 8;
+        let fits = bits == 64 || v < (1u64 << bits);
+        let negative = (v >> (bits - 1)) & 1 == 1;
+        if fits && negative {
+            let signed = if bits == 64 {
+                v as i64
+            } else {
+                v as i64 - (1i64 << bits)
+            };
+            return format!("{signed}");
+        }
+    }
+    format!("0x{v:x}")
 }
 
 /// The label name for `block`, falling back to a synthetic name if the program

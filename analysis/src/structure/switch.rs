@@ -135,6 +135,34 @@ fn try_switch(ctx: &Context, stmt: &Stmt) -> Option<Stmt> {
         return None;
     }
 
+    // A value that selects more than one case (an overlapping/obfuscated tree)
+    // would fold into two `match` arms for the same label — reject it.
+    let mut seen = HashSet::new();
+    if !collector
+        .cases
+        .iter()
+        .flat_map(|c| &c.values)
+        .all(|&v| seen.insert(v))
+    {
+        return None;
+    }
+
+    // A `break`/`continue` that escapes to an enclosing loop reads unambiguously
+    // in the if/else form but would look like a switch `break` once folded into a
+    // `match` arm. Leave such a cascade unfolded rather than emit ambiguous code.
+    let default_has_ctl = collector
+        .default
+        .as_deref()
+        .is_some_and(has_unbound_loop_ctl);
+    if default_has_ctl
+        || collector
+            .cases
+            .iter()
+            .any(|c| has_unbound_loop_ctl(&c.body))
+    {
+        return None;
+    }
+
     let mut cases = collector.cases;
     for case in &mut cases {
         case.values.sort_unstable();
@@ -145,6 +173,21 @@ fn try_switch(ctx: &Context, stmt: &Stmt) -> Option<Stmt> {
         scrutinee,
         cases,
         default: collector.default.unwrap_or_default(),
+    })
+}
+
+/// Whether `stmts` contains a `break`/`continue` that targets an enclosing loop
+/// — i.e. one not already bound by a nested loop inside `stmts`. Nested loops
+/// capture their own loop control, but `if`/`switch` (a Rust `match`) do not, so
+/// the walk descends through those and stops at loops.
+fn has_unbound_loop_ctl(stmts: &[Stmt]) -> bool {
+    stmts.iter().any(|s| match s {
+        Stmt::Break | Stmt::Continue => true,
+        Stmt::If { then, els, .. } => has_unbound_loop_ctl(then) || has_unbound_loop_ctl(els),
+        Stmt::Switch { cases, default, .. } => {
+            has_unbound_loop_ctl(default) || cases.iter().any(|c| has_unbound_loop_ctl(&c.body))
+        }
+        _ => false,
     })
 }
 
@@ -184,7 +227,7 @@ impl Collector<'_, '_> {
         match skip_setup_prefix(self.ctx, stmts) {
             [Stmt::If { cond, then, els }] => {
                 if let Some((s, values)) = match_case_test(cond)
-                    && s == self.scrutinee
+                    && same_scrutinee(&s, &self.scrutinee)
                 {
                     if !values.iter().all(|&v| lo <= v && v <= hi) {
                         // A case for a value the navigation splits already ruled
@@ -202,7 +245,7 @@ impl Collector<'_, '_> {
                     self.collect(els, interval);
                     return;
                 }
-                if scrutinee_of(cond).as_ref() == Some(&self.scrutinee) {
+                if scrutinee_of(cond).is_some_and(|s| same_scrutinee(&s, &self.scrutinee)) {
                     // A relational split on the scrutinee: both sides continue,
                     // each with the sub-interval the split implies (when it is a
                     // recognizable unsigned test; otherwise the interval is kept).
@@ -253,12 +296,12 @@ fn split_interval(
         return None;
     };
     // Orient the relation as `scrutinee <op> k`.
-    let (k, op) = if a.as_ref() == scrutinee {
+    let (k, op) = if same_scrutinee(a, scrutinee) {
         match b.kind {
             ExprKind::Const(k) => (k, *op),
             _ => return None,
         }
-    } else if b.as_ref() == scrutinee {
+    } else if same_scrutinee(b, scrutinee) {
         match a.kind {
             ExprKind::Const(k) => (k, flip_cmp(*op)),
             _ => return None,
@@ -304,30 +347,45 @@ fn flip_cmp(op: BinOp) -> BinOp {
     }
 }
 
-/// The scrutinee of a condition: the sole variable it mentions, or `None` if it
-/// mentions none or more than one.
-fn scrutinee_of(cond: &Expr) -> Option<Expr> {
-    let mut vars = Vec::new();
-    collect_vars(cond, &mut vars);
-    let first = vars.first()?.clone();
-    vars.iter().all(|v| *v == first).then_some(Expr::var(first))
+/// Whether two expressions name the same scrutinee. Prefers IR identity: two
+/// occurrences lowered from the same [`ValueId`] are the same scrutinee, and two
+/// lowered from *different* values are not — even if they share a display name
+/// (distinct SSA versions of a register can). Falls back to structural equality
+/// (by name) only when a value is missing provenance.
+fn same_scrutinee(a: &Expr, b: &Expr) -> bool {
+    match (a.value, b.value) {
+        (Some(x), Some(y)) => x == y,
+        _ => a == b,
+    }
 }
 
-/// Collects the names of every variable leaf of `expr`.
-fn collect_vars(expr: &Expr, out: &mut Vec<String>) {
+/// The scrutinee of a condition: the sole variable leaf it mentions (returned
+/// with its IR provenance intact), or `None` if it mentions none or more than
+/// one distinct variable.
+fn scrutinee_of(cond: &Expr) -> Option<Expr> {
+    let mut leaves = Vec::new();
+    collect_var_leaves(cond, &mut leaves);
+    let first = *leaves.first()?;
+    // All leaves must be the same variable (by name); return the leaf itself so
+    // its `ValueId` is preserved for `same_scrutinee`.
+    leaves.iter().all(|v| *v == first).then(|| first.clone())
+}
+
+/// Collects every variable-leaf expression of `expr` (preserving provenance).
+fn collect_var_leaves<'a>(expr: &'a Expr, out: &mut Vec<&'a Expr>) {
     match &expr.kind {
-        ExprKind::Var(name) => out.push(name.clone()),
+        ExprKind::Var(_) => out.push(expr),
         ExprKind::Const(_) => {}
         ExprKind::Unary(_, e) | ExprKind::Deref { ptr: e, .. } | ExprKind::Cast { expr: e, .. } => {
-            collect_vars(e, out)
+            collect_var_leaves(e, out)
         }
         ExprKind::Binary(_, a, b) => {
-            collect_vars(a, out);
-            collect_vars(b, out);
+            collect_var_leaves(a, out);
+            collect_var_leaves(b, out);
         }
         ExprKind::Unknown { operands, .. } => {
             for operand in operands {
-                collect_vars(operand, out);
+                collect_var_leaves(operand, out);
             }
         }
     }
@@ -372,7 +430,7 @@ fn collect_eq_disjuncts(cond: &Expr, values: &mut Vec<u64>) -> Option<Expr> {
         ExprKind::Binary(BinOp::LOr, a, b) => {
             let left = collect_eq_disjuncts(a, values)?;
             let right = collect_eq_disjuncts(b, values)?;
-            (left == right).then_some(left)
+            same_scrutinee(&left, &right).then_some(left)
         }
         _ => {
             let (scrutinee, value) = single_eq(cond)?;
@@ -458,6 +516,120 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn unbound_loop_control_is_detected() {
+        // A bare break/continue, or one reachable through if/match, escapes to an
+        // enclosing loop; one inside a nested loop is bound by that loop.
+        let c = Expr::var("c");
+        assert!(has_unbound_loop_ctl(&[Stmt::Break]));
+        assert!(has_unbound_loop_ctl(&[Stmt::If {
+            cond: c.clone(),
+            then: vec![Stmt::Continue],
+            els: vec![],
+        }]));
+        assert!(!has_unbound_loop_ctl(&[Stmt::Loop {
+            body: vec![Stmt::Break],
+        }]));
+    }
+
+    #[test]
+    fn negative_case_label_prints_signed() {
+        // A case value whose sign bit is set at the scrutinee's i32 width should
+        // read as `-1`, not the sign-extended `0xffffffff`.
+        let mut ctx = Context::new();
+        qcode!(
+            ctx,
+            "
+            varnode i32 sel;
+            varnode i32 out;
+
+            fn f:
+            <entry>
+                %x = load(i32, &sel);
+                %c1 = i32 %x == i32 0x1;
+                if %c1 goto <case1> else goto <t2>;
+            <case1>
+                store(&out, i32 0x10);
+                goto <done>;
+            <t2>
+                %c2 = i32 %x == i32 0x2;
+                if %c2 goto <case2> else goto <t3>;
+            <case2>
+                store(&out, i32 0x20);
+                goto <done>;
+            <t3>
+                %cm = i32 %x == i32 0xffffffff;
+                if %cm goto <casem> else goto <default_lbl>;
+            <casem>
+                store(&out, i32 0xff0);
+                goto <done>;
+            <default_lbl>
+                store(&out, i32 0x0);
+                goto <done>;
+            <done>
+                local i64 ptr;
+                return [ptr];
+            "
+        );
+
+        let program = decompile_function(&ctx, f).unwrap();
+        let c = emit_c(&ctx, &program);
+        assert!(has_switch(&program.stmts), "expected a switch:\n{c}");
+        assert!(
+            c.contains("-1 =>") && !c.contains("0xffffffff"),
+            "negative case label should print as signed:\n{c}"
+        );
+    }
+
+    #[test]
+    fn overlapping_cases_are_not_folded() {
+        // The value 0x1 selects two different arms — an inconsistent tree that
+        // must not fold into a `match` with a duplicated label.
+        let mut ctx = Context::new();
+        qcode!(
+            ctx,
+            "
+            varnode i32 sel;
+            varnode i32 out;
+
+            fn f:
+            <entry>
+                %x = load(i32, &sel);
+                %c1 = i32 %x == i32 0x1;
+                if %c1 goto <case1> else goto <t2>;
+            <case1>
+                store(&out, i32 0x10);
+                goto <done>;
+            <t2>
+                %c2 = i32 %x == i32 0x2;
+                if %c2 goto <case2> else goto <t3>;
+            <case2>
+                store(&out, i32 0x20);
+                goto <done>;
+            <t3>
+                %c3 = i32 %x == i32 0x1;
+                if %c3 goto <case3> else goto <default_lbl>;
+            <case3>
+                store(&out, i32 0x30);
+                goto <done>;
+            <default_lbl>
+                store(&out, i32 0x0);
+                goto <done>;
+            <done>
+                local i64 ptr;
+                return [ptr];
+            "
+        );
+
+        let program = decompile_function(&ctx, f).unwrap();
+        let c = emit_c(&ctx, &program);
+        assert!(
+            !has_switch(&program.stmts),
+            "overlapping cases must not fold:\n{c}"
+        );
+        assert_no_dangling_gotos(&c);
     }
 
     #[test]
