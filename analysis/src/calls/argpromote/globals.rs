@@ -25,7 +25,9 @@ use qcode::{
     },
 };
 
-use super::{append_entry_param, is_address_taken};
+use rustc_hash::FxHashSet;
+
+use super::append_entry_param;
 
 /// A writable global lives in real RAM. ROM/register/temporary addresses are left
 /// alone: temporary is argpromote's own shadow, registers are varnodes (never a
@@ -37,7 +39,11 @@ fn is_real_ram(ctx: &Context, space: SpaceId) -> bool {
 /// Lift every constant real-ram load/store address in `fid` into a parameter,
 /// threading the address literal to each direct caller. Returns whether the
 /// function changed.
-pub(super) fn globalize_constants(ctx: &mut Context, fid: FunctionId) -> bool {
+pub(super) fn globalize_constants(
+    ctx: &mut Context,
+    address_taken: &FxHashSet<FunctionId>,
+    fid: FunctionId,
+) -> bool {
     let f = Function::from_id(ctx, fid);
     if f.is_external() || !f.is_pure_reg() {
         return false;
@@ -46,7 +52,7 @@ pub(super) fn globalize_constants(ctx: &mut Context, fid: FunctionId) -> bool {
     // address-taken function may also be reached by an indirect call this pass
     // cannot find and rewrite, which would desync the `param[i] ↔ arg[i]` lockstep.
     // Same closed-world gate as `try_promote`.
-    if is_address_taken(ctx, fid) {
+    if address_taken.contains(&fid) {
         return false;
     }
 

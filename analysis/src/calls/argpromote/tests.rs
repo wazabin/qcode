@@ -289,8 +289,9 @@ mod tests {
         let call_id = set_call(&mut tc, g_call, f, vec![]);
         tc.ctx.add_cfg_edge(g_call, g_cont);
 
+        let address_taken = super::super::address_taken_set(&tc.ctx);
         assert!(
-            super::super::globals::globalize_constants(&mut tc.ctx, f),
+            super::super::globals::globalize_constants(&mut tc.ctx, &address_taken, f),
             "constant global address must be lifted to a param"
         );
 
@@ -360,12 +361,13 @@ mod tests {
             b.push_store(ValueId::Function(f), addr, tc.reg_space);
         }
 
+        let address_taken = super::super::address_taken_set(&tc.ctx);
         assert!(
-            super::super::is_address_taken(&tc.ctx, f),
+            address_taken.contains(&f),
             "test setup: f must be address-taken"
         );
         assert!(
-            !super::super::globals::globalize_constants(&mut tc.ctx, f),
+            !super::super::globals::globalize_constants(&mut tc.ctx, &address_taken, f),
             "address-taken function must be left untouched"
         );
     }

@@ -6,6 +6,8 @@ use qcode::{
     value::{BasicBlock, Function, FunctionId, Value, ValueId, Varnode, VarnodeId, insn::Mnemonic},
 };
 
+use rustc_hash::FxHashSet;
+
 use crate::{Pass, PipelineEnv};
 
 use super::{add_input, append_outputs, is_address_taken};
@@ -229,8 +231,12 @@ pub(crate) fn scan_register_effects(
 /// [`try_promote_registers`]). Returns `true` if anything changed.
 pub fn argpromote_registers(ctx: &mut Context) -> bool {
     let mut changed = false;
+    // Gate every function on `is_address_taken` via one O(instructions) set instead
+    // of a per-function whole-program rescan; stable across the loop (promotion adds
+    // no `ValueId::Function` operands). See [`super::address_taken_set`].
+    let address_taken = super::address_taken_set(ctx);
     for fid in ctx.function_ids() {
-        if try_promote_registers(ctx, fid) {
+        if try_promote_registers(ctx, &address_taken, fid) {
             changed = true;
         }
     }
@@ -252,14 +258,18 @@ fn output_meta(ctx: &Context, regs: &[VarnodeId]) -> Vec<(VarnodeId, usize, Spac
         .collect()
 }
 
-fn try_promote_registers(ctx: &mut Context, fid: FunctionId) -> bool {
+fn try_promote_registers(
+    ctx: &mut Context,
+    address_taken: &FxHashSet<FunctionId>,
+    fid: FunctionId,
+) -> bool {
     let f = Function::from_id(ctx, fid);
     if f.is_external() || f.root().is_none() {
         return false;
     }
     // Closed-world: an address-taken function may be reached by an indirect call
     // this pass cannot find and rewrite, leaving a caller on the old register ABI.
-    if is_address_taken(ctx, fid) {
+    if address_taken.contains(&fid) {
         return false;
     }
     let Ok(eff) = scan_register_effects(ctx, fid) else {

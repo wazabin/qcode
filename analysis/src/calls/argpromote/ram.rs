@@ -1,6 +1,8 @@
 use std::borrow::Cow;
 use std::collections::HashSet;
 
+use rustc_hash::FxHashSet;
+
 use qcode::{
     assumption::Proposition,
     builder::Builder,
@@ -20,7 +22,7 @@ use crate::sequence::{
 use crate::stack::frame::{FrameClass, frame_class, incoming_sp_param};
 use crate::{Pass, PipelineEnv};
 
-use super::{arg_index_of, is_address_taken};
+use super::arg_index_of;
 
 /// Recognises this function's own stack-frame locals (`@SP`-rooted slots below the
 /// entry stack pointer). Inert when there is no stack-pointer register or no
@@ -81,6 +83,11 @@ pub fn argpromote_with_sp(ctx: &mut Context, sp_reg: Option<VarnodeId>) -> bool 
     // the *same* space, so the seed store forwards into the body's loads.
     let shadow = ctx.make_temp_space();
     let mut changed = false;
+    // Both channels gate every function on `is_address_taken`; build that set once
+    // (O(instructions)) instead of rescanning the whole program per function. It
+    // stays valid across the loop: promotion threads only data values, never adding
+    // a `ValueId::Function` operand. See [`super::address_taken_set`].
+    let address_taken = super::address_taken_set(ctx);
     // Callee-before-caller order: a function may keep a call to a memory-free
     // callee (see [`function_makes_blocking_call`]), and that callee must already
     // be promoted — its own loads gone — for the caller to qualify. One visit per
@@ -89,10 +96,10 @@ pub fn argpromote_with_sp(ctx: &mut Context, sp_reg: Option<VarnodeId>) -> bool 
         // Lift constant-address (global) accesses into params first, so the freshly
         // param-relative derefs are visible to `try_promote`'s footprint scan in the
         // same visit.
-        if super::globals::globalize_constants(ctx, fid) {
+        if super::globals::globalize_constants(ctx, &address_taken, fid) {
             changed = true;
         }
-        if try_promote(ctx, fid, shadow, sp_reg) {
+        if try_promote(ctx, fid, shadow, sp_reg, &address_taken) {
             changed = true;
         }
     }
@@ -195,6 +202,7 @@ fn try_promote(
     fid: FunctionId,
     shadow: SpaceId,
     sp_reg: Option<VarnodeId>,
+    address_taken: &FxHashSet<FunctionId>,
 ) -> bool {
     let f = Function::from_id(ctx, fid);
     if f.is_external() {
@@ -224,7 +232,7 @@ fn try_promote(
     // be reached by an indirect call this pass cannot find and rewrite, leaving a
     // caller on the old by-reference ABI. (Callers in undiscovered code are an
     // accepted, unguardable gap — see the module docs.)
-    if is_address_taken(ctx, fid) {
+    if address_taken.contains(&fid) {
         return false;
     }
 

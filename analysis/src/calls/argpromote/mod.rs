@@ -59,6 +59,7 @@ use qcode::{
         insn::{InstructionId, Mnemonic},
     },
 };
+use rustc_hash::FxHashSet;
 
 use super::append_entry_param;
 
@@ -93,10 +94,37 @@ pub(crate) fn arg_index_of(ctx: &Context, fid: FunctionId, name: &str) -> Option
 /// `true` if `fid`'s address is used as a value anywhere (stored, passed, or the
 /// target of an indirect call). Direct calls reference the target through
 /// [`Call::target`], which is *not* an operand, so they do not count.
+///
+/// For a per-function *gate* over the whole program — where this would otherwise
+/// run once per function, i.e. O(functions × instructions) — build the whole set
+/// once with [`address_taken_set`] and do an O(1) lookup instead.
 pub(crate) fn is_address_taken(ctx: &Context, fid: FunctionId) -> bool {
     let target = ValueId::Function(fid);
     ctx.instructions()
         .any(|insn| insn.mnemonic().args().contains(&target))
+}
+
+/// Every function whose address is taken as a value (the [`is_address_taken`]
+/// predicate, computed for all functions in one O(instructions) pass). Callers
+/// that gate every function on this — the argpromote channels — build it once at
+/// the top of their per-function loop and look up, turning an O(functions ×
+/// instructions) scan into O(instructions + functions).
+///
+/// Safe to build once and reuse across a channel's mutating loop: promotion only
+/// threads *data* values (new params/args, replayed write-sets) and never adds or
+/// removes a `ValueId::Function` operand, so the set is invariant while the loop
+/// runs. (Instruction *deletion* could only shrink it — the conservative
+/// direction for a gate that skips address-taken functions.)
+pub(crate) fn address_taken_set(ctx: &Context) -> FxHashSet<FunctionId> {
+    let mut set = FxHashSet::default();
+    for insn in ctx.instructions() {
+        for arg in insn.mnemonic().args() {
+            if let ValueId::Function(fid) = arg {
+                set.insert(fid);
+            }
+        }
+    }
+    set
 }
 
 // ===========================================================================
