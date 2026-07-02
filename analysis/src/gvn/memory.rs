@@ -28,7 +28,12 @@ impl SubPass for MemoryForwarding {
     }
 
     fn clone_state(&self, state: &dyn Any) -> Box<dyn Any> {
-        Box::new(state.downcast_ref::<MemForward>().expect("memory state").clone())
+        Box::new(
+            state
+                .downcast_ref::<MemForward>()
+                .expect("memory state")
+                .clone(),
+        )
     }
 
     fn on_block_entry(

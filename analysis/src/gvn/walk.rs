@@ -132,7 +132,13 @@ pub(super) trait SubPass {
     }
 
     /// Visit one instruction. Rewrites go through `ed`.
-    fn on_insn(&self, ctx: &mut Context, state: &mut dyn Any, ic: &InsnCtx, ed: &mut Editor) -> Claim;
+    fn on_insn(
+        &self,
+        ctx: &mut Context,
+        state: &mut dyn Any,
+        ic: &InsnCtx,
+        ed: &mut Editor,
+    ) -> Claim;
 
     /// Called after the block's instructions, before its dominated children.
     fn after_block(
@@ -153,7 +159,11 @@ fn init_states(passes: &[Box<dyn SubPass>]) -> Vec<Box<dyn Any>> {
 
 /// Clone a state vector for a dominated child, each pass cloning its own slot.
 fn clone_states(passes: &[Box<dyn SubPass>], states: &[Box<dyn Any>]) -> Vec<Box<dyn Any>> {
-    passes.iter().zip(states).map(|(p, s)| p.clone_state(s.as_ref())).collect()
+    passes
+        .iter()
+        .zip(states)
+        .map(|(p, s)| p.clone_state(s.as_ref()))
+        .collect()
 }
 
 // ---------------------------------------------------------------------------

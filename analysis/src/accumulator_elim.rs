@@ -96,24 +96,23 @@ pub fn accumulator_elim(ctx: &mut Context, host: FunctionId) -> bool {
     };
     // The loop *continues* through whichever header edge enters the latch
     // directly; the other edge exits. (Multi-block bodies are out of scope.)
-    let (cont_args, exit_block, exit_args, cond_true_is_exit) =
-        if cbranch.success_block == latch {
-            (
-                cbranch.success_args.clone(),
-                cbranch.failure_block,
-                cbranch.failure_args.clone(),
-                false,
-            )
-        } else if cbranch.failure_block == latch {
-            (
-                cbranch.failure_args.clone(),
-                cbranch.success_block,
-                cbranch.success_args.clone(),
-                true,
-            )
-        } else {
-            return false;
-        };
+    let (cont_args, exit_block, exit_args, cond_true_is_exit) = if cbranch.success_block == latch {
+        (
+            cbranch.success_args.clone(),
+            cbranch.failure_block,
+            cbranch.failure_args.clone(),
+            false,
+        )
+    } else if cbranch.failure_block == latch {
+        (
+            cbranch.failure_args.clone(),
+            cbranch.success_block,
+            cbranch.success_args.clone(),
+            true,
+        )
+    } else {
+        return false;
+    };
 
     // State slots = header parameters.
     let head_info: Vec<(BlockParamId, usize)> = BasicBlock::from_id(ctx, head)
@@ -251,7 +250,12 @@ struct Plan {
     a_slots: Vec<usize>,
 }
 
-fn transform(ctx: &mut Context, host: FunctionId, model: &crate::loop_to_recursion::LoopModel, p: &Plan) {
+fn transform(
+    ctx: &mut Context,
+    host: FunctionId,
+    model: &crate::loop_to_recursion::LoopModel,
+    p: &Plan,
+) {
     let host_name = Function::from_id(ctx, host).name().to_owned();
     let g_name = ctx.get_unique_name(Cow::Owned(format!("{host_name}_acc")));
     let g = Function::make_lambda(ctx, g_name.clone())
@@ -289,7 +293,13 @@ fn transform(ctx: &mut Context, host: FunctionId, model: &crate::loop_to_recursi
     }
 
     // Header: recompute the loop condition over g's drivers, then branch.
-    let cond = clone_value(ctx, p.cbranch.condition, &mut driver_subst, &p.body_bindings, g_head);
+    let cond = clone_value(
+        ctx,
+        p.cbranch.condition,
+        &mut driver_subst,
+        &p.body_bindings,
+        g_head,
+    );
     {
         let mut b = Builder::from_block(BasicBlock::from_id_mut(ctx, g_head));
         if p.cond_true_is_exit {
@@ -318,7 +328,15 @@ fn transform(ctx: &mut Context, host: FunctionId, model: &crate::loop_to_recursi
         let driver_next: Vec<ValueId> = p
             .d_slots
             .iter()
-            .map(|&i| clone_value(ctx, p.next_args[i], &mut driver_subst, &p.body_bindings, rec))
+            .map(|&i| {
+                clone_value(
+                    ctx,
+                    p.next_args[i],
+                    &mut driver_subst,
+                    &p.body_bindings,
+                    rec,
+                )
+            })
             .collect();
 
         let (deep, acc_vals) = {

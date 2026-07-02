@@ -161,8 +161,7 @@ where
     pub(crate) fn fmt_decl(&'s self, f: &mut Formatter<'_>) -> std::fmt::Result {
         let types = &self.ctx().types;
         let tid = self.type_id();
-        let is_scalar =
-            types.pointee_of(tid).is_none() && types.struct_name_of(tid).is_none();
+        let is_scalar = types.pointee_of(tid).is_none() && types.struct_name_of(tid).is_none();
         match (self.name(), is_scalar && self.size() > 0) {
             (Some(name), true) => write!(f, "@{name}:{}", types.type_name(tid)),
             _ => self.fmt(f),

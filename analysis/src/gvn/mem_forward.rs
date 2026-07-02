@@ -461,9 +461,9 @@ impl MemForward {
         // This is what lets a functionalized callee that writes only its own
         // private scratch space leave the caller's spilled-pointer cell intact.
         let callee_written_spaces: Option<Vec<SpaceId>> = match &term {
-            Some(Mnemonic::Call(call)) => {
-                Function::from_id(ctx, call.target).written_spaces().map(<[_]>::to_vec)
-            }
+            Some(Mnemonic::Call(call)) => Function::from_id(ctx, call.target)
+                .written_spaces()
+                .map(<[_]>::to_vec),
             _ => None,
         };
 
@@ -647,7 +647,9 @@ impl MemForward {
         }
         // Bounded peel of reload chains (a spill of a spill, …).
         for _ in 0..8 {
-            let Base::Symbolic(_, basev) = base else { break };
+            let Base::Symbolic(_, basev) = base else {
+                break;
+            };
             let Some(value) = self.reload_forwards_to(ctx, basev, aliases, numbering) else {
                 break;
             };
@@ -1093,7 +1095,6 @@ mod tests {
         );
     }
 
-<<<<<<< HEAD
     /// Build `f` ending in `callee(arg)`, seed a pinned RAM cell at `0x40`, run
     /// the call prune, and report whether the cell survived. `readonly` sets the
     /// callee's param-0 `readonly` bit; `pin_arg` gives the argument a concrete
@@ -1232,7 +1233,8 @@ mod tests {
 
         let mut mf = MemForward::default();
         mf.byte_map.insert((ram_cell, 0), Cell { src, src_off: 0 });
-        mf.byte_map.insert((scratch_cell, 0), Cell { src, src_off: 0 });
+        mf.byte_map
+            .insert((scratch_cell, 0), Cell { src, src_off: 0 });
 
         mf.prune_clobbered_by_call(&tc.ctx, block, None);
 

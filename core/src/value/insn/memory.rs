@@ -84,7 +84,10 @@ mod tests {
 
         assert_eq!(v.size(), 4);
         assert!(v.space().is_none());
-        assert_eq!(v.as_statement().to_string(), "i32 %v = load(v0:4, i32 %ptr);");
+        assert_eq!(
+            v.as_statement().to_string(),
+            "i32 %v = load(v0:4, i32 %ptr);"
+        );
     }
 
     #[test]
@@ -113,7 +116,10 @@ mod tests {
 
         assert_eq!(store.size(), 0);
         assert!(store.space().is_none());
-        assert_eq!(store.as_statement().to_string(), "store(ram:4, i32 %ptr <- i32 0x7);");
+        assert_eq!(
+            store.as_statement().to_string(),
+            "store(ram:4, i32 %ptr <- i32 0x7);"
+        );
     }
 
     #[test]
@@ -188,7 +194,10 @@ mod tests {
             panic!("expected store instruction");
         };
         assert_eq!(store_mnemonic.space, a.space().id);
-        assert_eq!(store.as_statement().to_string(), "store(A:8, i64 %ptr <- i64 0x7);");
+        assert_eq!(
+            store.as_statement().to_string(),
+            "store(A:8, i64 %ptr <- i64 0x7);"
+        );
     }
 
     #[test]

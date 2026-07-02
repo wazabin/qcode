@@ -115,7 +115,8 @@ mod tests {
         let mut ctx = Context::new();
         let n = ctx.get_const(3, 8).id();
         let id = IntrinsicId::from_name("iota").unwrap();
-        let Some(Simplified::Value(ValueId::Bytes(bid))) = id.desc().simplify(&mut ctx, id, 24, &[n])
+        let Some(Simplified::Value(ValueId::Bytes(bid))) =
+            id.desc().simplify(&mut ctx, id, 24, &[n])
         else {
             panic!("iota(3) should fold to a Bytes array");
         };

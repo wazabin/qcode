@@ -175,7 +175,7 @@ fn outline_tupled(
 /// bound to `Extract(t, 1)`, so the body can depend on `(acc, index, elem)`.
 ///
 /// Returns `None` if the expression is not closed over those inputs + literals.
-fn outline_scan_body(
+pub(crate) fn outline_scan_body(
     ctx: &mut Context,
     name: &str,
     result: ValueId,

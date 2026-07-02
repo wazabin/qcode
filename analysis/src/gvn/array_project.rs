@@ -46,7 +46,13 @@ impl SubPass for ArrayProject {
         Box::new(())
     }
 
-    fn on_insn(&self, ctx: &mut Context, _state: &mut dyn Any, ic: &InsnCtx, ed: &mut Editor) -> Claim {
+    fn on_insn(
+        &self,
+        ctx: &mut Context,
+        _state: &mut dyn Any,
+        ic: &InsnCtx,
+        ed: &mut Editor,
+    ) -> Claim {
         match *ic.mnemonic {
             Mnemonic::Range(Range { src, start, size }) => {
                 self.project_range(ctx, ic, ed, src, start, size)

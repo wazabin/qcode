@@ -32,7 +32,13 @@ impl SubPass for Recognize {
         Box::new(())
     }
 
-    fn on_insn(&self, ctx: &mut Context, _state: &mut dyn Any, ic: &InsnCtx, ed: &mut Editor) -> Claim {
+    fn on_insn(
+        &self,
+        ctx: &mut Context,
+        _state: &mut dyn Any,
+        ic: &InsnCtx,
+        ed: &mut Editor,
+    ) -> Claim {
         if ic.size == 0 {
             return Claim::Pass;
         }

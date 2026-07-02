@@ -39,7 +39,10 @@ enum Effect {
 /// The *local* write effect of `function_id`: the non-register spaces its own
 /// body stores to, the resolved functions it calls, and whether it makes a call
 /// whose effect cannot be bounded (indirect, or to an external function).
-fn local_effect(ctx: &Context, function_id: FunctionId) -> (HashSet<SpaceId>, Vec<FunctionId>, bool) {
+fn local_effect(
+    ctx: &Context,
+    function_id: FunctionId,
+) -> (HashSet<SpaceId>, Vec<FunctionId>, bool) {
     let mut spaces = HashSet::default();
     let mut callees = Vec::new();
     let mut unbounded = false;
@@ -89,7 +92,14 @@ pub fn set_all_written_spaces(ctx: &mut Context) {
     let mut callees: HashMap<FunctionId, Vec<FunctionId>> = HashMap::default();
     for &id in &ids {
         let (spaces, cs, unbounded) = local_effect(ctx, id);
-        effect.insert(id, if unbounded { Effect::Unbounded } else { Effect::Bounded(spaces) });
+        effect.insert(
+            id,
+            if unbounded {
+                Effect::Unbounded
+            } else {
+                Effect::Bounded(spaces)
+            },
+        );
         callees.insert(id, cs);
     }
 
@@ -282,7 +292,9 @@ fn callee:
         let syms = lower_str(&mut ctx, SPILL_CALL_RELOAD).expect("parse");
         set_all_written_spaces(&mut ctx);
         let callee = Function::from_id(&ctx, syms.functions["callee"]);
-        let spaces = callee.written_spaces().expect("callee write-set is bounded");
+        let spaces = callee
+            .written_spaces()
+            .expect("callee write-set is bounded");
         assert!(
             !spaces.contains(&ctx.default_space),
             "callee writes only scratch, never the default ram space"
@@ -334,5 +346,4 @@ fn callee:
             "without the assumption the loop-carried wide load must remain opaque, got:\n{out}"
         );
     }
-
 }

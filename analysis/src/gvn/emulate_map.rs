@@ -50,7 +50,13 @@ impl SubPass for EmulateMap {
         Box::new(())
     }
 
-    fn on_insn(&self, ctx: &mut Context, _state: &mut dyn Any, ic: &InsnCtx, ed: &mut Editor) -> Claim {
+    fn on_insn(
+        &self,
+        ctx: &mut Context,
+        _state: &mut dyn Any,
+        ic: &InsnCtx,
+        ed: &mut Editor,
+    ) -> Claim {
         let folded = match ic.mnemonic.clone() {
             Mnemonic::Map(map) => self.emulate(ctx, ic, &map),
             Mnemonic::Scan(scan) => self.emulate_scan(ctx, ic, &scan),

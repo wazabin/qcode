@@ -152,7 +152,11 @@ impl<'a, 'str> Seg<'a, 'str> {
             }
             ValueId::Function(fid) => {
                 let name = Function::from_id(self.ctx, fid).name().to_string();
-                self.push(format!("<{name}>"), TokenKind::Function, Some(Link::Function(fid)));
+                self.push(
+                    format!("<{name}>"),
+                    TokenKind::Function,
+                    Some(Link::Function(fid)),
+                );
             }
             ValueId::BasicBlock(bid) => {
                 // A block used as a value renders via the block's own `Display`
@@ -187,7 +191,11 @@ impl<'a, 'str> Seg<'a, 'str> {
     fn branch_target(&mut self, target: BlockId, args: &[ValueId]) {
         let block = BasicBlock::from_id(self.ctx, target);
         let name = block.name().unwrap_or("unnamed");
-        self.push(format!("<{name}"), TokenKind::Label, Some(Link::Block(target)));
+        self.push(
+            format!("<{name}"),
+            TokenKind::Label,
+            Some(Link::Block(target)),
+        );
 
         let params = block.params().collect::<Vec<_>>();
         for (i, &arg) in args.iter().enumerate() {
@@ -343,7 +351,11 @@ fn mnemonic_segments(seg: &mut Seg, m: &Mnemonic) {
                 if i > 0 {
                     seg.punct(", ");
                 }
-                seg.push(call_arg_name(seg.ctx, c.target, i), TokenKind::BlockParam, None);
+                seg.push(
+                    call_arg_name(seg.ctx, c.target, i),
+                    TokenKind::BlockParam,
+                    None,
+                );
                 seg.value(arg);
             }
             seg.punct(");");
@@ -489,7 +501,11 @@ fn mnemonic_segments(seg: &mut Seg, m: &Mnemonic) {
             let body = Function::from_id(seg.ctx, scan.body).name().to_string();
             if scan.captures.is_empty() {
                 seg.kw("scanl ");
-                seg.push(format!("@{body}"), TokenKind::Function, Some(Link::Function(scan.body)));
+                seg.push(
+                    format!("@{body}"),
+                    TokenKind::Function,
+                    Some(Link::Function(scan.body)),
+                );
                 seg.punct(" ");
                 seg.value(scan.init);
                 seg.punct(" ");
@@ -498,7 +514,11 @@ fn mnemonic_segments(seg: &mut Seg, m: &Mnemonic) {
             } else {
                 seg.kw("scanl ");
                 seg.punct("(");
-                seg.push(format!("@{body}"), TokenKind::Function, Some(Link::Function(scan.body)));
+                seg.push(
+                    format!("@{body}"),
+                    TokenKind::Function,
+                    Some(Link::Function(scan.body)),
+                );
                 for &c in &scan.captures {
                     seg.punct(" ");
                     seg.value(c);

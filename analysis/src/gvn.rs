@@ -84,7 +84,11 @@ pub fn constant_fold_function(ctx: &mut Context, func_id: FunctionId) -> bool {
 /// fixpoint. Standalone composition of the [`NarrowTrunc`] sub-pass — the same
 /// shape as [`constant_fold_function`]. Returns `true` if anything changed.
 pub fn narrow_function(ctx: &mut Context, func_id: FunctionId) -> bool {
-    run_flat_fixpoint(ctx, func_id, &[Box::new(NarrowTrunc) as Box<dyn walk::SubPass>])
+    run_flat_fixpoint(
+        ctx,
+        func_id,
+        &[Box::new(NarrowTrunc) as Box<dyn walk::SubPass>],
+    )
 }
 
 /// Single-block GVN pass (preserved for backward compatibility).

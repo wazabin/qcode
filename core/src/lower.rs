@@ -21,8 +21,7 @@ use crate::{
     types::AggregateField,
     value::{
         BasicBlock, BlockParam, BlockParamId, Function, FunctionId, Instruction, InstructionId,
-        Renameable, Value, ValueId, ValueRef, Varnode, VarnodeId,
-        block::BlockId,
+        Renameable, Value, ValueId, ValueRef, Varnode, VarnodeId, block::BlockId,
         insn::IntrinsicId,
     },
 };
@@ -317,7 +316,9 @@ fn create_blocks_and_params(
             id
         };
         for param in params {
-            let pid = BasicBlock::from_id_mut(ctx, block_id).push_param(param.size_bytes.unwrap_or(0)).id;
+            let pid = BasicBlock::from_id_mut(ctx, block_id)
+                .push_param(param.size_bytes.unwrap_or(0))
+                .id;
             let _ = BlockParam::from_id_mut(ctx, pid).rename(Cow::Owned(param.name.clone()));
             symbols.block_params.insert(param.name.clone(), pid);
         }
@@ -407,7 +408,9 @@ impl Lowerer<'_, '_, '_> {
             Statement::LocalDecl {
                 name, size_bytes, ..
             } => {
-                let id = self.b.make_named_temp(Cow::Owned(name.clone()), *size_bytes);
+                let id = self
+                    .b
+                    .make_named_temp(Cow::Owned(name.clone()), *size_bytes);
                 self.locals.insert(name.clone(), Local::Varnode(id));
                 self.symbols.varnodes.insert(name.clone(), id);
             }
@@ -425,8 +428,16 @@ impl Lowerer<'_, '_, '_> {
                 let _ = Instruction::from_id_mut(self.b.context_mut(), id)
                     .rename(Cow::Owned(name.clone()));
                 if let Some(struct_name) = decl_struct_ptr {
-                    let pointee = self.b.context_mut().types.get_or_make_struct(struct_name, 0, Vec::new());
-                    let sp = self.b.context_mut().types.get_or_make_struct_pointer(8, pointee);
+                    let pointee =
+                        self.b
+                            .context_mut()
+                            .types
+                            .get_or_make_struct(struct_name, 0, Vec::new());
+                    let sp = self
+                        .b
+                        .context_mut()
+                        .types
+                        .get_or_make_struct_pointer(8, pointee);
                     Instruction::from_id_mut(self.b.context_mut(), id).set_type(sp);
                 }
                 self.locals.insert(name.clone(), Local::Instruction(id));
@@ -498,7 +509,9 @@ impl Lowerer<'_, '_, '_> {
                 targets,
                 ..
             } => {
-                let t = self.b.get_or_make_local_function(Cow::Owned(target.clone()));
+                let t = self
+                    .b
+                    .get_or_make_local_function(Cow::Owned(target.clone()));
                 // Arg names are decorative (the callee's parameter names as
                 // printed); only the positional atoms are bound.
                 let argv = args
@@ -704,10 +717,7 @@ impl Lowerer<'_, '_, '_> {
             ExprNode::Tuple { fields } => {
                 let mut named = Vec::with_capacity(fields.len());
                 for (i, f) in fields.iter().enumerate() {
-                    let name = f
-                        .name
-                        .clone()
-                        .unwrap_or_else(|| format!("field{}", i + 1));
+                    let name = f.name.clone().unwrap_or_else(|| format!("field{}", i + 1));
                     let v = self.atom(&f.value, None)?;
                     named.push((name, v));
                 }
@@ -922,7 +932,12 @@ impl Lowerer<'_, '_, '_> {
     /// Validate that a concrete value matches an explicit `iN`/`fN` annotation.
     /// Mirrors the old macro's compile-time `assert_eq!`, but as a runtime error
     /// (which the `qcode!` macro surfaces by `expect`-ing the lowering result).
-    fn check_size(&self, value: ValueId, explicit: Option<usize>, name: &str) -> Result<(), String> {
+    fn check_size(
+        &self,
+        value: ValueId,
+        explicit: Option<usize>,
+        name: &str,
+    ) -> Result<(), String> {
         if let Some(expected) = explicit {
             let actual = ValueRef::new(value, self.b.context()).size();
             if actual != expected {

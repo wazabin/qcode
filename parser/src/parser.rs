@@ -457,11 +457,10 @@ fn parse_terminator(pair: Pair<'_, Rule>) -> Result<Statement, ParseError> {
                                     .ok_or_else(|| ParseError::new("missing call arg name"))?
                                     .as_str()
                                     .to_owned();
-                                let atom = parse_typed_atom(
-                                    inner
-                                        .next()
-                                        .ok_or_else(|| ParseError::new("missing call arg value"))?,
-                                )?;
+                                let atom =
+                                    parse_typed_atom(inner.next().ok_or_else(|| {
+                                        ParseError::new("missing call arg value")
+                                    })?)?;
                                 args.push((name, atom));
                             }
                             _ => {}
@@ -480,7 +479,9 @@ fn parse_terminator(pair: Pair<'_, Rule>) -> Result<Statement, ParseError> {
                     match label {
                         Label::Named { name, .. } => target = Some(name),
                         Label::Address { .. } => {
-                            return Err(ParseError::new("call with address target is not supported"));
+                            return Err(ParseError::new(
+                                "call with address target is not supported",
+                            ));
                         }
                     }
                 }
@@ -1829,7 +1830,9 @@ mod tests {
         assert_eq!(statements.len(), 1);
 
         match &statements[0] {
-            Statement::Call { target, targets, .. } => {
+            Statement::Call {
+                target, targets, ..
+            } => {
                 assert_eq!(target, "callee");
                 assert_eq!(targets.len(), 1);
                 assert!(matches!(&targets[0], Label::Named { name, .. } if name == "resume"));

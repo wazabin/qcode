@@ -36,7 +36,12 @@ impl SubPass for Cse {
     }
 
     fn clone_state(&self, state: &dyn Any) -> Box<dyn Any> {
-        Box::new(state.downcast_ref::<Numbering>().expect("cse state").clone())
+        Box::new(
+            state
+                .downcast_ref::<Numbering>()
+                .expect("cse state")
+                .clone(),
+        )
     }
 
     fn on_block_entry(

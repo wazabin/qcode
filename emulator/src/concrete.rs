@@ -1735,7 +1735,9 @@ impl StandaloneEmulator {
             .captures
             .iter()
             .map(|&c| {
-                let v = self.get_value(ctx, c).ok_or(EmulatorErrorKind::ValueError(0))?;
+                let v = self
+                    .get_value(ctx, c)
+                    .ok_or(EmulatorErrorKind::ValueError(0))?;
                 let sz = ctx
                     .stored_type_of(c)
                     .map(|ty| ctx.types.size_of(ty))

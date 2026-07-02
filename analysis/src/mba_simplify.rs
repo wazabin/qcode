@@ -71,7 +71,12 @@ impl FunctionPass for MbaSimplify {
         "De-obfuscate integer MBA expressions via the rumba solver"
     }
 
-    fn run(&self, ctx: &mut Context, fun_id: FunctionId, _env: &PipelineEnv) -> Result<bool, String> {
+    fn run(
+        &self,
+        ctx: &mut Context,
+        fun_id: FunctionId,
+        _env: &PipelineEnv,
+    ) -> Result<bool, String> {
         Ok(mba_simplify(ctx, fun_id))
     }
 }
@@ -105,7 +110,10 @@ fn is_root(ctx: &Context, iid: InstructionId) -> bool {
     if users.is_empty() {
         return false; // dead; leave for DCE / a prior root's prune
     }
-    if users.len() == 1 && is_mba_insn(ctx, users[0]) && insn_size(ctx, users[0]) == insn_size(ctx, iid) {
+    if users.len() == 1
+        && is_mba_insn(ctx, users[0])
+        && insn_size(ctx, users[0]) == insn_size(ctx, iid)
+    {
         return false; // subsumed by its parent region
     }
     true
@@ -122,7 +130,13 @@ fn try_simplify_root(ctx: &mut Context, root: InstructionId) -> bool {
     // 1. Classify the region cheaply first — no rumba `Expr` is built unless
     //    this is a genuine MBA: a *mix* of arithmetic and boolean ops, and more
     //    than a lone instruction.
-    let mut c = Classify { ctx, region: size, has_arith: false, has_bool: false, count: 0 };
+    let mut c = Classify {
+        ctx,
+        region: size,
+        has_arith: false,
+        has_bool: false,
+        count: 0,
+    };
     c.visit(root);
     let region_cost = c.count;
     if region_cost <= 1 || !(c.has_arith && c.has_bool) {
@@ -389,7 +403,16 @@ fn emit(
         Expr::Const(c) => ctx.get_const(c.get(mask), size).id(),
         Expr::Not(x) => {
             let xv = emit(ctx, x, leaves, size, mask, before, block);
-            push_insn(ctx, Mnemonic::Unop(Unary { op: Unop::IntNot, src: xv }), size, before, block)
+            push_insn(
+                ctx,
+                Mnemonic::Unop(Unary {
+                    op: Unop::IntNot,
+                    src: xv,
+                }),
+                size,
+                before,
+                block,
+            )
         }
         Expr::Scale(c, x) => {
             let cv = c.get(mask);
@@ -448,7 +471,17 @@ fn push_binop(
     before: InstructionId,
     block: BlockId,
 ) -> ValueId {
-    push_insn(ctx, Mnemonic::Binop(Binary { op: Binop::Int(op), lhs, rhs }), size, before, block)
+    push_insn(
+        ctx,
+        Mnemonic::Binop(Binary {
+            op: Binop::Int(op),
+            lhs,
+            rhs,
+        }),
+        size,
+        before,
+        block,
+    )
 }
 
 fn push_insn(
@@ -504,7 +537,9 @@ fn inlinable_child(ctx: &Context, region: usize, v: ValueId) -> Option<Instructi
 fn mba_class(ctx: &Context, iid: InstructionId) -> Option<OpClass> {
     match Instruction::from_id(ctx, iid).mnemonic() {
         Mnemonic::Binop(b) => match int_op(&b.op)? {
-            IntBinop::Add | IntBinop::Sub | IntBinop::Mul | IntBinop::ShiftLeft => Some(OpClass::Arith),
+            IntBinop::Add | IntBinop::Sub | IntBinop::Mul | IntBinop::ShiftLeft => {
+                Some(OpClass::Arith)
+            }
             IntBinop::And | IntBinop::Or | IntBinop::Xor => Some(OpClass::Bool),
             _ => None,
         },
@@ -584,8 +619,13 @@ mod tests {
         let root = Function::from_id(ctx, fun).root().expect("root").id;
         let ret = return_value(ctx, fun);
         let mut emu = StandaloneEmulator::new(root);
-        emu.run_pure(ctx, fun, &[SizedValue::new(a, 4), SizedValue::new(b, 4)], 100_000)
-            .expect("runs");
+        emu.run_pure(
+            ctx,
+            fun,
+            &[SizedValue::new(a, 4), SizedValue::new(b, 4)],
+            100_000,
+        )
+        .expect("runs");
         emu.get_value(ctx, ret)
     }
 
@@ -598,10 +638,16 @@ mod tests {
 
     /// Emulate on a spread of input pairs.
     fn sample(ctx: &Context, fun: FunctionId) -> Vec<Option<u64>> {
-        [(5, 3), (0, 0), (0xdead, 0xbeef), (1, 0xffff_ffff), (0x1234_5678, 9)]
-            .into_iter()
-            .map(|(a, b)| run(ctx, fun, a, b))
-            .collect()
+        [
+            (5, 3),
+            (0, 0),
+            (0xdead, 0xbeef),
+            (1, 0xffff_ffff),
+            (0x1234_5678, 9),
+        ]
+        .into_iter()
+        .map(|(a, b)| run(ctx, fun, a, b))
+        .collect()
     }
 
     #[test]
@@ -626,10 +672,15 @@ mod tests {
 
         // Return is now a single `~a`.
         let ret = return_value(&ctx, r1);
-        let ValueId::Instruction(iid) = ret else { panic!("expected insn") };
+        let ValueId::Instruction(iid) = ret else {
+            panic!("expected insn")
+        };
         assert!(matches!(
             Instruction::from_id(&ctx, iid).mnemonic(),
-            Mnemonic::Unop(Unary { op: Unop::IntNot, .. })
+            Mnemonic::Unop(Unary {
+                op: Unop::IntNot,
+                ..
+            })
         ));
         assert!(insn_total(&ctx, r1) < n_before);
         assert_eq!(sample(&ctx, r1), before);
@@ -662,10 +713,15 @@ mod tests {
         assert!(mba_simplify(&mut ctx, r2));
 
         let ret = return_value(&ctx, r2);
-        let ValueId::Instruction(iid) = ret else { panic!("expected insn") };
+        let ValueId::Instruction(iid) = ret else {
+            panic!("expected insn")
+        };
         assert!(matches!(
             Instruction::from_id(&ctx, iid).mnemonic(),
-            Mnemonic::Binop(Binary { op: Binop::Int(IntBinop::Mul), .. })
+            Mnemonic::Binop(Binary {
+                op: Binop::Int(IntBinop::Mul),
+                ..
+            })
         ));
         assert!(insn_total(&ctx, r2) < n_before);
         assert_eq!(sample(&ctx, r2), before);

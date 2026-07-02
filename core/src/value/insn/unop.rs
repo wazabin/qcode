@@ -74,8 +74,8 @@ mod tests {
 
     use crate::{
         context::Context,
-        value::ValueRef,
         value::Value,
+        value::ValueRef,
         value::insn::{Instruction, Mnemonic},
     };
 

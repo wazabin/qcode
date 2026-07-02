@@ -789,7 +789,10 @@ impl<'str, 'ctx> FunctionMutRef<'str, 'ctx> {
     /// write (`None` = unknown/unbounded). See
     /// [`FunctionSignature::written_spaces`].
     pub fn set_written_spaces(&mut self, spaces: Option<Vec<crate::space::SpaceId>>) {
-        self.inner_mut().signature.get_or_insert_default().written_spaces = spaces;
+        self.inner_mut()
+            .signature
+            .get_or_insert_default()
+            .written_spaces = spaces;
     }
 
     /// Marks this function's register effect as fully captured by its call

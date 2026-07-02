@@ -305,7 +305,11 @@ where
         {
             let mut succ: Vec<&str> = self
                 .successors()
-                .map(|(_, b)| BasicBlock::from_id(self.ctx(), b).name().unwrap_or("unnamed"))
+                .map(|(_, b)| {
+                    BasicBlock::from_id(self.ctx(), b)
+                        .name()
+                        .unwrap_or("unnamed")
+                })
                 .collect();
             if !succ.is_empty() {
                 succ.sort_unstable();

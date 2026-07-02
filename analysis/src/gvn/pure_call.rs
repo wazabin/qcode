@@ -50,7 +50,13 @@ impl SubPass for PureCall {
         Box::new(())
     }
 
-    fn on_insn(&self, ctx: &mut Context, _state: &mut dyn Any, ic: &InsnCtx, ed: &mut Editor) -> Claim {
+    fn on_insn(
+        &self,
+        ctx: &mut Context,
+        _state: &mut dyn Any,
+        ic: &InsnCtx,
+        ed: &mut Editor,
+    ) -> Claim {
         let Mnemonic::Extract(Extract { agg, index }) = *ic.mnemonic else {
             return Claim::Pass;
         };

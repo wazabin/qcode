@@ -99,7 +99,8 @@ fn compile(expr: &Expr, source: &str) -> syn::Result<proc_macro2::TokenStream> {
 
     let bind = |ty: proc_macro2::TokenStream,
                 getter: proc_macro2::TokenStream,
-                items: &[String]| -> Vec<proc_macro2::TokenStream> {
+                items: &[String]|
+     -> Vec<proc_macro2::TokenStream> {
         items
             .iter()
             .map(|name| {
@@ -116,7 +117,11 @@ fn compile(expr: &Expr, source: &str) -> syn::Result<proc_macro2::TokenStream> {
     let block_binds = bind(quote!(BlockId), quote!(block), &names.blocks);
     let ssa_binds = bind(quote!(InstructionId), quote!(ssa), &names.ssa);
     let varnode_binds = bind(quote!(VarnodeId), quote!(varnode), &names.varnodes);
-    let param_binds = bind(quote!(BlockParamId), quote!(block_param), &names.block_params);
+    let param_binds = bind(
+        quote!(BlockParamId),
+        quote!(block_param),
+        &names.block_params,
+    );
 
     // NB: emit bare `let` statements (no wrapping block) — callers rely on the
     // bound names leaking into their scope, exactly as the old macro did.

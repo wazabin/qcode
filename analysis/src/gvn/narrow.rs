@@ -54,8 +54,19 @@ impl SubPass for NarrowTrunc {
         Box::new(())
     }
 
-    fn on_insn(&self, ctx: &mut Context, _state: &mut dyn Any, ic: &InsnCtx, ed: &mut Editor) -> Claim {
-        let Mnemonic::Range(Range { src, start: 0, size }) = ic.mnemonic else {
+    fn on_insn(
+        &self,
+        ctx: &mut Context,
+        _state: &mut dyn Any,
+        ic: &InsnCtx,
+        ed: &mut Editor,
+    ) -> Claim {
+        let Mnemonic::Range(Range {
+            src,
+            start: 0,
+            size,
+        }) = ic.mnemonic
+        else {
             return Claim::Pass;
         };
         let (src, w) = (*src, *size);
@@ -121,10 +132,24 @@ fn narrow_to(
 
     let result = match v {
         ValueId::Instruction(iid) => match Instruction::from_id(ctx, iid).mnemonic().clone() {
-            Mnemonic::Binop(Binary { op: Binop::Int(o), lhs, rhs }) if distributive(o) => {
+            Mnemonic::Binop(Binary {
+                op: Binop::Int(o),
+                lhs,
+                rhs,
+            }) if distributive(o) => {
                 let l = narrow_to(ctx, lhs, w, before, block, memo);
                 let rr = narrow_to(ctx, rhs, w, before, block, memo);
-                push_insn(ctx, Mnemonic::Binop(Binary { op: Binop::Int(o), lhs: l, rhs: rr }), w, before, block)
+                push_insn(
+                    ctx,
+                    Mnemonic::Binop(Binary {
+                        op: Binop::Int(o),
+                        lhs: l,
+                        rhs: rr,
+                    }),
+                    w,
+                    before,
+                    block,
+                )
             }
             Mnemonic::Unop(Unary { op, src }) if matches!(op, Unop::IntNot | Unop::IntNegate) => {
                 let s = narrow_to(ctx, src, w, before, block, memo);
@@ -132,10 +157,16 @@ fn narrow_to(
             }
             // Widening, then truncating back below the widened width: the
             // extension is irrelevant to the low word.
-            Mnemonic::Sext(Sext { src, .. }) => narrow_extension(ctx, src, w, true, before, block, memo),
-            Mnemonic::Zext(Zext { src, .. }) => narrow_extension(ctx, src, w, false, before, block, memo),
+            Mnemonic::Sext(Sext { src, .. }) => {
+                narrow_extension(ctx, src, w, true, before, block, memo)
+            }
+            Mnemonic::Zext(Zext { src, .. }) => {
+                narrow_extension(ctx, src, w, false, before, block, memo)
+            }
             // Low-word of a low-word slice is just a narrower low-word slice.
-            Mnemonic::Range(Range { src, start: 0, .. }) => narrow_to(ctx, src, w, before, block, memo),
+            Mnemonic::Range(Range { src, start: 0, .. }) => {
+                narrow_to(ctx, src, w, before, block, memo)
+            }
             // Anything else: low `w` bytes are opaque — extract them.
             _ => push_insn(ctx, range_low(v, w), w, before, block),
         },
@@ -187,7 +218,11 @@ fn distributive(op: IntBinop) -> bool {
 }
 
 fn range_low(src: ValueId, size: usize) -> Mnemonic {
-    Mnemonic::Range(Range { src, start: 0, size })
+    Mnemonic::Range(Range {
+        src,
+        start: 0,
+        size,
+    })
 }
 
 fn push_insn(
@@ -204,7 +239,11 @@ fn push_insn(
 
 fn low_mask(w_bytes: usize) -> u64 {
     let bits = w_bytes * 8;
-    if bits >= 64 { u64::MAX } else { (1u64 << bits) - 1 }
+    if bits >= 64 {
+        u64::MAX
+    } else {
+        (1u64 << bits) - 1
+    }
 }
 
 fn numeric_const(ctx: &Context, v: ValueId) -> Option<u64> {
@@ -249,16 +288,27 @@ mod tests {
         let root = Function::from_id(ctx, fun).root().expect("root").id;
         let ret = return_value(ctx, fun);
         let mut emu = StandaloneEmulator::new(root);
-        emu.run_pure(ctx, fun, &[SizedValue::new(a, 4), SizedValue::new(b, 4)], 100_000)
-            .expect("runs");
+        emu.run_pure(
+            ctx,
+            fun,
+            &[SizedValue::new(a, 4), SizedValue::new(b, 4)],
+            100_000,
+        )
+        .expect("runs");
         emu.get_value(ctx, ret)
     }
 
     fn sample(ctx: &Context, fun: FunctionId) -> Vec<Option<u64>> {
-        [(5, 3), (0, 0), (0xdead, 0xbeef), (1, 0xffff_ffff), (0x8000_0000, 0x8000_0001)]
-            .into_iter()
-            .map(|(a, b)| run(ctx, fun, a, b))
-            .collect()
+        [
+            (5, 3),
+            (0, 0),
+            (0xdead, 0xbeef),
+            (1, 0xffff_ffff),
+            (0x8000_0000, 0x8000_0001),
+        ]
+        .into_iter()
+        .map(|(a, b)| run(ctx, fun, a, b))
+        .collect()
     }
 
     /// The defining mnemonic of the (live) return value.

@@ -27,7 +27,13 @@ impl SubPass for FlagIdiom {
         Box::new(())
     }
 
-    fn on_insn(&self, ctx: &mut Context, _state: &mut dyn Any, ic: &InsnCtx, ed: &mut Editor) -> Claim {
+    fn on_insn(
+        &self,
+        ctx: &mut Context,
+        _state: &mut dyn Any,
+        ic: &InsnCtx,
+        ed: &mut Editor,
+    ) -> Claim {
         if ic.mnemonic.is_terminator() || ic.size == 0 {
             return Claim::Pass;
         }

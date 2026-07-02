@@ -555,6 +555,9 @@ mod tests {
             branch.args,
             [ValueId::BlockParam(b), ValueId::BlockParam(a)]
         );
-        assert_eq!(last.as_statement().to_string(), "goto <done @x=i0 @b @y=i0 @a>;");
+        assert_eq!(
+            last.as_statement().to_string(),
+            "goto <done @x=i0 @b @y=i0 @a>;"
+        );
     }
 }

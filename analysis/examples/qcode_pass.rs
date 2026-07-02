@@ -41,7 +41,8 @@ fn parse_args() -> Result<Args, String> {
     while let Some(arg) = it.next() {
         match arg.as_str() {
             "-p" | "--pass" => {
-                args.passes.push(it.next().ok_or("expected a pass name after -p")?);
+                args.passes
+                    .push(it.next().ok_or("expected a pass name after -p")?);
             }
             "-i" | "--input" => {
                 args.input = Some(it.next().ok_or("expected a path after -i")?);
@@ -77,7 +78,10 @@ fn run() -> Result<(), String> {
     let args = parse_args()?;
 
     if args.list {
-        println!("Available passes:\n  {}", known_pass_names().replace(", ", "\n  "));
+        println!(
+            "Available passes:\n  {}",
+            known_pass_names().replace(", ", "\n  ")
+        );
         return Ok(());
     }
     // With no passes selected, the tool degenerates to a canonicalizing formatter:
@@ -99,8 +103,8 @@ fn run() -> Result<(), String> {
 
     let env = PipelineEnv::headless(&mut ctx);
     for pass in &args.passes {
-        let resolved =
-            make_pass(pass).ok_or_else(|| format!("unknown pass `{pass}`; known: {}", known_pass_names()))?;
+        let resolved = make_pass(pass)
+            .ok_or_else(|| format!("unknown pass `{pass}`; known: {}", known_pass_names()))?;
         match resolved {
             RegisteredPass::Function(p) => {
                 for fun_id in ctx.function_ids() {
