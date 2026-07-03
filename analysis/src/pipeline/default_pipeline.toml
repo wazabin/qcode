@@ -227,11 +227,17 @@ scope = "module"
 passes = ["argpromote"]
 
 # Sweep the instructions the rewrite makes dead (redirected/forwarded loads and
-# stores, now-unused address computations).
+# stores, now-unused address computations): `dead_store` drops the now-unread
+# stores, `dce` the forwarded loads and dead address math. A leading `dce` (the
+# stage was once `dce, dead_store, dce`) is unnecessary — the only stage between
+# here and the downstream `mark-pure`/`final-canonicalize` sweeps is
+# `dead-signature`, which keys on call signatures rather than dead address math,
+# so anything an up-front `dce` would remove is re-swept later with identical
+# output.
 [[stage]]
 name = "argpromote-cleanup"
 scope = "function"
-passes = ["dce", "dead_store", "dce"]
+passes = ["dead_store", "dce"]
 
 # Now that callees are functionalized and the dead replay stores/extracts are
 # swept, simplify the functionalized signatures, rewriting every direct call site.
@@ -309,17 +315,20 @@ passes = ["loop_to_map"]
 # leaving the shadow stores with no remaining reader. That forwarding happens
 # only at this late point, after argpromote-cleanup's own `dead_store` has run,
 # so a final `dead_store` is needed to sweep the now-unread temp-space stores
-# (`unread_temp_space_stores`). It runs after `dce` so the forwarded loads are
-# already gone when it scans for readers; the trailing `dce` clears the address
-# arithmetic the removed stores leave behind.
-# Repeat to a fixpoint: forwarding a partially-overlapping store (e.g. a byte
-# overwrite of a wider word) exposes a constant the next round folds, which can
-# in turn expose further forwarding. A single pass leaves a constant assembled
-# byte-by-byte (such as an obfuscated `fs:[c]` offset) only partly reduced.
+# (`unread_temp_space_stores`); the `dce` clears the address arithmetic the
+# removed stores (and forwarded loads) leave behind.
+# Repeat to a fixpoint: this both drives the store→load forwarding chain
+# (forwarding a partially-overlapping store — e.g. a byte overwrite of a wider
+# word — exposes a constant the next round folds, exposing further forwarding;
+# a single pass leaves a byte-by-byte-assembled constant only partly reduced)
+# *and* sequences the sweep: a `dead_store` that sees a forwarded-but-not-yet-
+# swept load still counting as a reader simply removes that store on the next
+# iteration, once `dce` has deleted the load — so no intra-iteration `dce`
+# before `dead_store` is needed.
 [[stage]]
 name = "final-canonicalize"
 scope = "function"
-passes = ["gvn", "dce", "dead_store", "dce"]
+passes = ["gvn", "dead_store", "dce"]
 repeat_until = "no_change"
 
 # Second struct-typing pass: the early one (above) runs right after the first
