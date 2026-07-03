@@ -7,7 +7,9 @@
 //!
 //! * `at(insert(a, i, v), i) = v`   (same index — provably equal),
 //! * `at(insert(a, i, v), j) = at(a, j)`   (indices provably distinct),
-//! * `at(Bytes, const j) = arr[j]`   (constant read out of a constant blob).
+//! * `at(Bytes, const j) = arr[j]`   (constant read out of a constant blob),
+//! * `at(singleton(v), _) = v`   (a one-lane array has only lane 0),
+//! * `at(concat(a, b), const j) = at(a, j)` / `at(b, j - len a)`   (side pick).
 
 use crate::context::Context;
 use crate::register_intrinsic;
@@ -70,7 +72,23 @@ impl Intrinsic for At {
         let &[arr, index] = args else {
             return None;
         };
+        simplify_at(ctx, out_size, arr, index)
+    }
+}
 
+/// Forward `at(arr, index)` through the array constructors, recursively: a
+/// `concat` side-pick or `insert` distinct-index re-issue lands on a smaller
+/// array which is itself simplified in the same step. Without the recursion the
+/// re-issued `at` would be materialized verbatim (e.g. `at(concat(singleton(v),
+/// scan), 0)` narrows to `at(singleton(v), 0)` but stops there instead of folding
+/// to `v`), leaving the seed read un-concretized and its array live.
+fn simplify_at(
+    ctx: &mut Context,
+    out_size: usize,
+    arr: ValueId,
+    index: ValueId,
+) -> Option<Simplified> {
+    {
         // Read straight out of a constant `Bytes` array at a constant index.
         if let (ValueId::Bytes(bid), ValueId::Literal(ilit)) = (arr, index) {
             let arr_ty = ctx.values.bytes[bid].type_id;
@@ -88,31 +106,59 @@ impl Intrinsic for At {
             }
         }
 
-        // Forward through `insert`: pattern `at(insert(a, i, v), j)`.
+        // Forward through the array constructors: `insert`, `singleton`, `concat`.
         let ValueId::Instruction(iid) = arr else {
             return None;
         };
         let Mnemonic::Intrinsic(app) = ctx.get_insn(iid).mnemonic() else {
             return None;
         };
-        if app.id.name() != "insert" {
-            return None;
-        }
-        let (base, ins_idx, val) = (app.args[0], app.args[1], app.args[2]);
-        match index_rel(ctx, ins_idx, index) {
-            IdxRel::Equal => Some(Simplified::Value(val)),
-            IdxRel::Distinct => {
-                // Re-issue the read against the underlying array. Encoded as a
-                // fresh `at` application over `(base, index)`.
-                let m = Mnemonic::Intrinsic(crate::value::insn::IntrinsicApp {
-                    id: IntrinsicId::from_name("at").unwrap(),
-                    args: vec![base, index],
-                });
-                Some(Simplified::Expression(m))
+        let (name, args) = (app.id.name(), app.args.clone());
+        match name {
+            // `at(insert(a, i, v), j)`.
+            "insert" => {
+                let (base, ins_idx, val) = (args[0], args[1], args[2]);
+                match index_rel(ctx, ins_idx, index) {
+                    IdxRel::Equal => Some(Simplified::Value(val)),
+                    // Re-issue the read against the underlying array.
+                    IdxRel::Distinct => Some(forward(ctx, out_size, base, index)),
+                    IdxRel::Unknown => None,
+                }
             }
-            IdxRel::Unknown => None,
+            // A one-lane array has only lane 0 (any other index is UB anyway).
+            "singleton" => Some(Simplified::Value(args[0])),
+            // `at(concat(a, b), const j)`: pick the side `j` falls in.
+            "concat" => {
+                let (a, b) = (args[0], args[1]);
+                let ValueId::Literal(jlit) = index else {
+                    return None;
+                };
+                let j = ctx.values.literals[jlit].value;
+                let a_ty = ctx.type_of(a);
+                let (_, len_a) = ctx.types.array_of(a_ty)?;
+                if j < len_a as u64 {
+                    Some(forward(ctx, out_size, a, index))
+                } else {
+                    let shifted = ctx.get_const(j - len_a as u64, 8).id();
+                    Some(forward(ctx, out_size, b, shifted))
+                }
+            }
+            _ => None,
         }
     }
+}
+
+/// Simplify `at(base, index)` one more level, falling back to the verbatim
+/// re-issued `at` expression when no further constructor forwarding applies. So
+/// a chain like `at(concat(singleton(v), s), 0)` collapses all the way to `v`
+/// rather than stalling at `at(singleton(v), 0)`.
+fn forward(ctx: &mut Context, out_size: usize, base: ValueId, index: ValueId) -> Simplified {
+    simplify_at(ctx, out_size, base, index).unwrap_or_else(|| {
+        Simplified::Expression(Mnemonic::Intrinsic(crate::value::insn::IntrinsicApp {
+            id: IntrinsicId::from_name("at").unwrap(),
+            args: vec![base, index],
+        }))
+    })
 }
 
 register_intrinsic!(At);
@@ -184,6 +230,70 @@ mod tests {
                 assert_eq!(app.args, vec![ValueId::BlockParam(a), j]);
             }
             other => panic!("expected at(a, j), got {other:?}"),
+        }
+    }
+
+    /// `at(singleton(v), _) = v` regardless of the index.
+    #[test]
+    fn at_forwards_through_singleton() {
+        let mut ctx = Context::new();
+        let v = ctx.get_const(0x99, 4).id();
+        let sing_id = IntrinsicId::from_name("singleton").unwrap();
+        let blk = ctx.get_or_make_block(0x1000);
+        let sing = {
+            let mut b = Builder::from_block(BasicBlock::from_id_mut(&mut ctx, blk));
+            b.push_intrinsic(sing_id, vec![v]).id()
+        };
+        let idx = ctx.get_const(0, 8).id();
+        match at_id().desc().simplify(&mut ctx, at_id(), 4, &[sing, idx]) {
+            Some(Simplified::Value(got)) => assert_eq!(got, v),
+            other => panic!("expected v, got {other:?}"),
+        }
+    }
+
+    /// `at(concat(a, b), j)` picks the side `j` falls in, shifting the index into
+    /// the right operand.
+    #[test]
+    fn at_picks_concat_side() {
+        let mut ctx = Context::new();
+        let i32 = ctx.types.get_or_make_int(4);
+        let a_ty = ctx.types.get_or_make_array(i32, 1);
+        let b_ty = ctx.types.get_or_make_array(i32, 3);
+        let blk = ctx.get_or_make_block(0x1000);
+        let a = BasicBlock::from_id_mut(&mut ctx, blk).push_param(4).id;
+        ctx.values.block_params[a].type_id = a_ty;
+        let b = BasicBlock::from_id_mut(&mut ctx, blk).push_param(12).id;
+        ctx.values.block_params[b].type_id = b_ty;
+        let concat_id = IntrinsicId::from_name("concat").unwrap();
+        let cat = {
+            let mut bl = Builder::from_block(BasicBlock::from_id_mut(&mut ctx, blk));
+            bl.push_intrinsic(
+                concat_id,
+                vec![ValueId::BlockParam(a), ValueId::BlockParam(b)],
+            )
+            .id()
+        };
+        // Lane 0 → left operand `a`, same index.
+        let j0 = ctx.get_const(0, 8).id();
+        match at_id().desc().simplify(&mut ctx, at_id(), 4, &[cat, j0]) {
+            Some(Simplified::Expression(Mnemonic::Intrinsic(app))) => {
+                assert_eq!(app.id.name(), "at");
+                assert_eq!(app.args, vec![ValueId::BlockParam(a), j0]);
+            }
+            other => panic!("expected at(a, 0), got {other:?}"),
+        }
+        // Lane 2 → right operand `b`, index shifted by len(a)=1 → 1.
+        let j2 = ctx.get_const(2, 8).id();
+        match at_id().desc().simplify(&mut ctx, at_id(), 4, &[cat, j2]) {
+            Some(Simplified::Expression(Mnemonic::Intrinsic(app))) => {
+                assert_eq!(app.id.name(), "at");
+                let ValueId::Literal(l) = app.args[1] else {
+                    panic!("expected literal shifted index");
+                };
+                assert_eq!(app.args[0], ValueId::BlockParam(b));
+                assert_eq!(ctx.values.literals[l].value, 1);
+            }
+            other => panic!("expected at(b, 1), got {other:?}"),
         }
     }
 

@@ -42,7 +42,9 @@ use qcode::{
     context::Context,
     value::{
         BasicBlock, BlockId, Function, FunctionId, InstructionRef, ValueId, ValueRef,
-        insn::{Binary, Binop, InstructionId, IntBinop, IntrinsicApp, IntrinsicId, Mnemonic},
+        insn::{
+            Binary, Binop, Branch, InstructionId, IntBinop, IntrinsicApp, IntrinsicId, Mnemonic,
+        },
     },
 };
 
@@ -56,8 +58,15 @@ pub struct LoopToScan;
 struct ScanMatch {
     /// The loop-exit block holding the wide store.
     exit: BlockId,
-    /// The `store(ram, base <- arr)` to rewrite.
-    store_id: InstructionId,
+    /// The loop header (guard block) and body; `header == body` in the rotated
+    /// (do-while) shape. Used to delete the residual loop once it is private.
+    header: BlockId,
+    body: BlockId,
+    /// The loop-carried array as seen by the exit block (the store's source).
+    /// Every other exit use of it (e.g. `at(arr, k)` from `array_promote`'s
+    /// exit-load rewrite) is redirected to the folded array so the residual
+    /// loop actually dies.
+    arr_exit: ValueId,
     /// The lane-0 seed value (`acc_0`, also the first output element).
     seed_val: ValueId,
     /// The body's per-lane result (`%next`), the scan body's return value.
@@ -216,7 +225,7 @@ fn try_match(ctx: &mut Context, fid: FunctionId) -> Option<ScanMatch> {
         }
         anchor = Some((id, bid, ptr, src, elem_ty, count));
     }
-    let (store_id, exit, _base, arr_src, elem_ty, count) = anchor?;
+    let (_store_id, exit, _base, arr_src, elem_ty, count) = anchor?;
 
     // Exit's single predecessor is the loop header.
     let exit_preds: Vec<BlockId> = BasicBlock::from_id(ctx, exit)
@@ -395,7 +404,9 @@ fn try_match(ctx: &mut Context, fid: FunctionId) -> Option<ScanMatch> {
 
     Some(ScanMatch {
         exit,
-        store_id,
+        header,
+        body,
+        arr_exit: arr_src,
         seed_val,
         stored_val,
         prev_val,
@@ -420,6 +431,19 @@ fn apply(ctx: &mut Context, fid: FunctionId, m: &ScanMatch) -> bool {
     let concat_id = IntrinsicId::from_name("concat").expect("concat registered");
 
     let name = format!("{}_scan_body", Function::from_id(ctx, fid).name());
+
+    // Anchor every new instruction before the exit block's *first* instruction,
+    // not just before the wide store: `array_promote` may have rewritten other
+    // exit loads to `at(arr_exit, k)` earlier in the block, and those get
+    // redirected to the folded array below — which must therefore dominate them.
+    let Some(anchor) = BasicBlock::from_id(ctx, m.exit).iter().next().map(|i| i.id) else {
+        return false;
+    };
+    // Pre-existing exit instructions whose `arr_exit` uses are redirected.
+    let preexisting: Vec<InstructionId> = BasicBlock::from_id(ctx, m.exit)
+        .iter()
+        .map(|i| i.id)
+        .collect();
 
     // Two source shapes. When the body reads the region's original element
     // (`m.elem`), the scan ranges over the *original array* `l0[1..]` and the body
@@ -456,7 +480,7 @@ fn apply(ctx: &mut Context, fid: FunctionId, m: &ScanMatch) -> bool {
                 src_arr_ty,
             )
             .id;
-            BasicBlock::from_id_mut(ctx, m.exit).insert_insn_before(m.store_id, slice);
+            BasicBlock::from_id_mut(ctx, m.exit).insert_insn_before(anchor, slice);
             (body_fn, ValueId::Instruction(slice))
         }
         None => {
@@ -486,27 +510,118 @@ fn apply(ctx: &mut Context, fid: FunctionId, m: &ScanMatch) -> bool {
                 src_arr_ty,
             )
             .id;
-            BasicBlock::from_id_mut(ctx, m.exit).insert_insn_before(m.store_id, iota_id_insn);
+            BasicBlock::from_id_mut(ctx, m.exit).insert_insn_before(anchor, iota_id_insn);
             (body_fn, ValueId::Instruction(iota_id_insn))
         }
     };
 
-    // scan(iota) → singleton(seed) → concat, all before the wide store.
+    // scan(iota) → singleton(seed) → concat, ahead of every exit use.
     let full = {
         let mut b = Builder::from_block(BasicBlock::from_id_mut(ctx, m.exit));
-        b.set_insert_point_before(m.store_id);
+        b.set_insert_point_before(anchor);
         let scan = b.push_scan(body_fn, m.seed_val, src, Vec::new()).id();
         let sing = b.push_intrinsic(singleton_id, vec![m.seed_val]).id();
         b.push_intrinsic(concat_id, vec![sing, scan]).id()
     };
 
-    // Point the wide store at the folded array (leaving the loop's own array,
-    // now dead, for `dce`).
-    let mut sm = ctx.get_insn(m.store_id).mnemonic().clone();
-    if let Mnemonic::Store(s) = &mut sm {
-        s.src = full;
+    // Redirect every exit use of the loop-carried array — the wide store and any
+    // `at(arr, k)` reads `array_promote` left for exit loads — to the folded
+    // array, leaving the loop's own array dead for `dce`.
+    for id in preexisting {
+        let mut mn = ctx.get_insn(id).mnemonic().clone();
+        mn.replace_value(m.arr_exit, full);
+        ctx.replace_instruction_mnemonic(id, mn);
     }
-    ctx.replace_instruction_mnemonic(m.store_id, sm);
+
+    // Delete the residual loop when it is now wholly private (mirrors
+    // `loop_to_map`'s deletable path): the exit carries no params and every
+    // value the loop defines is used only inside it. Then the loop computes
+    // nothing observable — reroute the single preheader straight to the exit
+    // and delete the loop blocks. Otherwise (a loop value threaded past the
+    // exit, e.g. a clobbered register in the return envelope) leave it for
+    // later dead-arg/dce rounds.
+    let loop_blocks: Vec<BlockId> = if m.header == m.body {
+        vec![m.body]
+    } else {
+        vec![m.header, m.body]
+    };
+    let in_loop = |ctx: &Context, v: ValueId| {
+        ctx.users(v).iter().all(|&u| {
+            ctx.get_insn(u)
+                .parent()
+                .is_some_and(|b| loop_blocks.contains(&b.id))
+        })
+    };
+    let private = loop_blocks.iter().all(|&blk| {
+        let b = BasicBlock::from_id(ctx, blk);
+        b.params().all(|p| in_loop(ctx, p.id()))
+            && b.iter().all(|i| in_loop(ctx, ValueId::Instruction(i.id)))
+    });
+    let defined_in_loop = |ctx: &Context, v: ValueId| match v {
+        ValueId::BlockParam(_) => param_parent(ctx, v).is_some_and(|b| loop_blocks.contains(&b)),
+        ValueId::Instruction(id) => ctx
+            .get_insn(id)
+            .parent()
+            .is_some_and(|b| loop_blocks.contains(&b.id)),
+        _ => false,
+    };
+    // Each exit param (a now-dead array pass-through the later gvn would have
+    // coalesced) must be re-fed from a preheader-available value: its
+    // header-edge incoming directly if loop-invariant, or — when it copies a
+    // loop param — that param's own loop-invariant (preheader) incoming.
+    let exit_args: Option<Vec<ValueId>> = BasicBlock::from_id(ctx, m.exit)
+        .params()
+        .map(|p| p.id())
+        .collect::<Vec<_>>()
+        .into_iter()
+        .map(|p| {
+            let k = param_pos(ctx, m.exit, p)?;
+            let [v] = incoming(ctx, m.exit, k)[..] else {
+                return None;
+            };
+            if !defined_in_loop(ctx, v) {
+                return Some(v);
+            }
+            if !matches!(v, ValueId::BlockParam(_)) {
+                return None;
+            }
+            let kv = param_pos(ctx, m.header, v)?;
+            let init: Vec<ValueId> = incoming(ctx, m.header, kv)
+                .into_iter()
+                .filter(|&w| !defined_in_loop(ctx, w))
+                .collect();
+            match init[..] {
+                [w] => Some(w),
+                _ => None,
+            }
+        })
+        .collect();
+    if private && let Some(exit_args) = exit_args {
+        let preheaders: Vec<BlockId> = BasicBlock::from_id(ctx, m.header)
+            .predecessors()
+            .map(|(_, p)| p)
+            .filter(|p| !loop_blocks.contains(p))
+            .collect();
+        if let [preheader] = preheaders[..] {
+            if let Some(term_id) = BasicBlock::from_id(ctx, preheader)
+                .iter()
+                .last()
+                .map(|t| t.id)
+            {
+                ctx.replace_instruction_mnemonic(
+                    term_id,
+                    Mnemonic::Branch(Branch {
+                        target: m.exit,
+                        args: exit_args,
+                    }),
+                );
+                ctx.add_cfg_edge(preheader, m.exit);
+            }
+            for &blk in &loop_blocks {
+                BasicBlock::from_id_mut(ctx, blk).delete(fid);
+            }
+        }
+    }
     true
 }
 
@@ -730,14 +845,8 @@ fn apply_map(ctx: &mut Context, fid: FunctionId, m: &MapMatch) -> bool {
     };
 
     let name = format!("{}_map_body", Function::from_id(ctx, fid).name());
-    let Some(body_fn) = outline_tupled(
-        ctx,
-        &name,
-        m.stored_val,
-        m.index,
-        m.elem_read,
-        tuple_ty,
-    ) else {
+    let Some(body_fn) = outline_tupled(ctx, &name, m.stored_val, m.index, m.elem_read, tuple_ty)
+    else {
         return false;
     };
 

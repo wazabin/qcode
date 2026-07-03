@@ -132,6 +132,9 @@ fn run() -> Result<(), String> {
 }
 
 fn main() -> ExitCode {
+    // Honour `RUST_LOG` so per-pass `pass_log!` diagnostics (e.g.
+    // `RUST_LOG=array_promote=debug`) surface, matching the real CLI.
+    env_logger::init();
     match run() {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {

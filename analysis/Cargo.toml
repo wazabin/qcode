@@ -39,6 +39,7 @@ clang.workspace = true
 [dev-dependencies]
 qcode = { workspace = true, features = ["testing"] }
 qcode_macro.workspace = true
+env_logger.workspace = true
 
 [[example]]
 name = "qcode-pass"

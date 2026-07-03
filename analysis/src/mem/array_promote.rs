@@ -405,6 +405,7 @@ fn try_match(ctx: &mut Context, fid: FunctionId) -> Option<PromoteMatch> {
     }
     let is_ram = |ctx: &Context, sp: SpaceId| matches!(Space::from_id(ctx, sp).ty, SpaceType::Ram);
     let mut accesses: Vec<Acc> = Vec::new();
+    let mut skipped_non_ram = 0usize;
     for block in Function::from_id(ctx, fid).iter() {
         let bid = block.id;
         for insn in block.iter() {
@@ -425,9 +426,41 @@ fn try_match(ctx: &mut Context, fid: FunctionId) -> Option<PromoteMatch> {
                     space: s.space,
                     stored: Some(s.src),
                 }),
+                // A load/store in a non-RAM space is invisible to the region
+                // analysis. If the fill loop's stores live in such a space (e.g. an
+                // unnamed synthetic space typed as something other than `Ram`),
+                // nothing here is collected and no promotion can happen.
+                Mnemonic::Load(l) if !is_ram(ctx, l.space) => {
+                    skipped_non_ram += 1;
+                    qcode::pass_log!(
+                        trace,
+                        "load {:?} in non-RAM space {} ({:?}) — not a region access",
+                        insn.id,
+                        l.space,
+                        Space::from_id(ctx, l.space).ty
+                    );
+                }
+                Mnemonic::Store(s) if !is_ram(ctx, s.space) => {
+                    skipped_non_ram += 1;
+                    qcode::pass_log!(
+                        trace,
+                        "store {:?} in non-RAM space {} ({:?}) — not a region access",
+                        insn.id,
+                        s.space,
+                        Space::from_id(ctx, s.space).ty
+                    );
+                }
                 _ => {}
             }
         }
+    }
+    if accesses.is_empty() && skipped_non_ram > 0 {
+        qcode::pass_log!(
+            debug,
+            "no RAM-typed accesses in {fid:?}, but {skipped_non_ram} load/store(s) live in \
+             non-RAM spaces — array_promote only sees `SpaceType::Ram`; check the fill loop's \
+             store space type"
+        );
     }
 
     let numbering = precompute_forms(ctx, fid);
@@ -446,6 +479,7 @@ fn try_match(ctx: &mut Context, fid: FunctionId) -> Option<PromoteMatch> {
         esz: usize,
         space: SpaceId,
     }
+    let ram_accesses = accesses.len();
     let mut lane: Option<Lane> = None;
     for a in &accesses {
         let Some(src) = a.stored else { continue };
@@ -455,7 +489,21 @@ fn try_match(ctx: &mut Context, fid: FunctionId) -> Option<PromoteMatch> {
         if !matches!(idx, ValueId::BlockParam(_)) {
             continue;
         }
-        let Some(r) = root_of(base) else { continue };
+        let Some(r) = root_of(base) else {
+            let shape = match base {
+                ValueId::Instruction(bid) => {
+                    let m = ctx.get_insn(bid).mnemonic();
+                    format!("insn {:?}", m)
+                }
+                other => format!("{other:?}"),
+            };
+            qcode::pass_log!(
+                debug,
+                "strided store {:?} has base {base:?} ({shape}) not rooted at a param — no promote",
+                a.id
+            );
+            continue;
+        };
         if lane.is_some() {
             return None; // more than one strided store — not the canonical shape
         }
@@ -479,13 +527,28 @@ fn try_match(ctx: &mut Context, fid: FunctionId) -> Option<PromoteMatch> {
         body,
         esz,
         space: region_space,
-    } = lane?;
+    } = match lane {
+        Some(l) => l,
+        None => {
+            qcode::pass_log!(
+                debug,
+                "no promotable strided lane store found among {ram_accesses} RAM accesses \
+                 (need one param-rooted `base + index*esz` store)"
+            );
+            return None;
+        }
+    };
     if esz == 0 || c_lane % esz as i64 != 0 {
         return None;
     }
     // v1 works in bytes (offset % esz, count * esz, per-lane addresses). A
     // word-addressed region would miscount lanes, so require a byte-addressed space.
     if Space::from_id(ctx, region_space).word_size != 1 {
+        qcode::pass_log!(
+            debug,
+            "region space {region_space} has word_size {} != 1 — no promote",
+            Space::from_id(ctx, region_space).word_size
+        );
         return None;
     }
     // Only accesses in the region's space can touch it; others are a different
@@ -825,7 +888,13 @@ fn try_match(ctx: &mut Context, fid: FunctionId) -> Option<PromoteMatch> {
     }
 
     let (seed, dead_stores) = match seeded {
-        Some((_, _, seed_id, seed_val, dead)) => (Some(Seed { id: seed_id, val: seed_val }), dead),
+        Some((_, _, seed_id, seed_val, dead)) => (
+            Some(Seed {
+                id: seed_id,
+                val: seed_val,
+            }),
+            dead,
+        ),
         None => (None, Vec::new()),
     };
 
@@ -939,7 +1008,10 @@ fn apply(ctx: &mut Context, m: &PromoteMatch) -> bool {
         let e = new_param(ctx, m.exit);
         // Preheader: %l0 = load(ram:{count*esz}, base(+origin)), typed [elem;count]
         // and placed at the top so it snapshots the region before the seed store.
-        let first = BasicBlock::from_id(ctx, m.preheader).iter().next().map(|i| i.id);
+        let first = BasicBlock::from_id(ctx, m.preheader)
+            .iter()
+            .next()
+            .map(|i| i.id);
         let dst = {
             let mut bld = Builder::from_block(BasicBlock::from_id_mut(ctx, m.preheader));
             if let Some(first) = first {
@@ -991,7 +1063,11 @@ fn apply(ctx: &mut Context, m: &PromoteMatch) -> bool {
     // literal (a seedless map writes every lane, so the initial value is dead).
     let a0 = match &m.seed {
         Some(seed) => {
-            let term_id = BasicBlock::from_id(ctx, m.preheader).iter().last().unwrap().id;
+            let term_id = BasicBlock::from_id(ctx, m.preheader)
+                .iter()
+                .last()
+                .unwrap()
+                .id;
             let mut b = Builder::from_block(BasicBlock::from_id_mut(ctx, m.preheader));
             b.set_insert_point_before(term_id);
             let idx0 = b.context_mut().get_const(0, 8).id();
@@ -1344,7 +1420,10 @@ mod tests {
             ir.contains("load(ram:2496"),
             "a whole-region snapshot load should be inserted: {ir}"
         );
-        assert!(ir.contains("$at("), "the original read should become at(): {ir}");
+        assert!(
+            ir.contains("$at("),
+            "the original read should become at(): {ir}"
+        );
         assert!(
             !ir.contains("load(ram:4"),
             "the per-lane load should be removed: {ir}"
