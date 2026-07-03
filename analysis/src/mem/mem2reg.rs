@@ -7,11 +7,7 @@ use qcode::value::{
     ValueId, ValueRef, Varnode, VarnodeId,
     insn::{Branch, CBranch, InstructionId, InstructionRef, Load, Mnemonic, Range, Store, Zext},
 };
-use qcode::{
-    builder::Builder,
-    context::Context,
-    value::{FunctionRef, block::BlockRef},
-};
+use qcode::{builder::Builder, context::Context};
 use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
 use std::borrow::Cow;
 
@@ -767,10 +763,9 @@ impl Mem2Reg<'_, '_> {
             let var_name = self.block_param_name_for_var(var);
 
             let live_in = self.live_in_blocks_cached(var, sliced, live_in_cache);
-            let phi_positions = {
-                let function = Function::from_id(self.ctx, self.function_id);
-                find_phi_insert_positions(self.ctx, var, &function, sliced, frontier, &live_in)
-            };
+            let store_blocks = live_in_cache.store_def_blocks(self.ctx, var, sliced);
+            let phi_positions =
+                find_phi_insert_positions(frontier, &live_in, &store_blocks);
 
             // A block param is only meaningful if every incoming edge can supply
             // its argument. Branch/CBranch edges are wired by `merge_branch_args`,
@@ -947,6 +942,26 @@ impl LiveInBlocks {
             upward_exposed,
             call_blocks,
             memo: HashMap::default(),
+        }
+    }
+
+    /// Blocks containing a *store* to `var` — the phi-insertion definition sites
+    /// (call-clobbers are intentionally excluded here; see
+    /// [`find_phi_insert_positions`]). For the common non-sliced var this is an
+    /// O(1) lookup into the one-sweep `store_blocks` index built in [`Self::new`];
+    /// only a rare sliced var falls back to a full scan for its wider covering
+    /// stores. Replaces the previous per-var `function.blocks().filter(...)`
+    /// rescan that made phi insertion O(vars × instructions).
+    fn store_def_blocks(
+        &self,
+        ctx: &Context,
+        var: ValueId,
+        sliced: &HashSet<ValueId>,
+    ) -> HashSet<BlockId> {
+        if sliced.contains(&var) {
+            self.sliced_seeds(ctx, var).0
+        } else {
+            self.store_blocks.get(&var).cloned().unwrap_or_default()
         }
     }
 
@@ -1368,36 +1383,11 @@ impl Mem2Reg<'_, '_> {
     }
 }
 
-fn block_contains_store_to_var(
-    ctx: &Context,
-    block: &BlockRef,
-    var: ValueId,
-    var_is_sliced: bool,
-) -> bool {
-    block.iter().any(|insn| {
-        if let Mnemonic::Store(Store { ptr, .. }) = insn.mnemonic() {
-            *ptr == var || (var_is_sliced && register_store_low_aligned_contains(ctx, *ptr, var))
-        } else {
-            false
-        }
-    })
-}
-
 fn find_phi_insert_positions(
-    ctx: &Context,
-    var: ValueId,
-    function: &FunctionRef,
-    sliced: &HashSet<ValueId>,
     frontier: &HashMap<BlockId, HashSet<BlockId>>,
     live_in: &HashSet<BlockId>,
+    block_containing_store: &HashSet<BlockId>,
 ) -> HashSet<BlockId> {
-    let var_is_sliced = sliced.contains(&var);
-    let block_containing_store = function
-        .blocks()
-        .filter(|b| block_contains_store_to_var(ctx, b, var, var_is_sliced))
-        .map(|b| b.id)
-        .collect::<HashSet<_>>();
-
     let mut worklist: Vec<BlockId> = block_containing_store.iter().copied().collect();
     let mut result = HashSet::default();
 
@@ -1832,10 +1822,11 @@ mod tests {
         let frontier = dom.dominator_frontier();
         let aliases = AliasResult::simple(&ctx);
         let sliced = HashSet::default();
-        let live_in = LiveInBlocks::new(&ctx, test).get(&ctx, A.into(), &sliced, &aliases);
+        let mut cache = LiveInBlocks::new(&ctx, test);
+        let live_in = cache.get(&ctx, A.into(), &sliced, &aliases);
+        let store_blocks = cache.store_def_blocks(&ctx, A.into(), &sliced);
 
-        let result =
-            find_phi_insert_positions(&ctx, A.into(), &function, &sliced, frontier, &live_in);
+        let result = find_phi_insert_positions(frontier, &live_in, &store_blocks);
 
         let named_result = result
             .iter()
@@ -1964,7 +1955,6 @@ mod tests {
         "
         );
 
-        let function = Function::from_id(&ctx, test);
         let live_in = HashSet::from_iter([loop_header]);
         let frontier = HashMap::from_iter([
             (entry, HashSet::from_iter([loop_header])),
@@ -1972,8 +1962,8 @@ mod tests {
         ]);
 
         let sliced = HashSet::default();
-        let result =
-            find_phi_insert_positions(&ctx, A.into(), &function, &sliced, &frontier, &live_in);
+        let store_blocks = LiveInBlocks::new(&ctx, test).store_def_blocks(&ctx, A.into(), &sliced);
+        let result = find_phi_insert_positions(&frontier, &live_in, &store_blocks);
 
         assert_eq!(result, HashSet::from_iter([loop_header]));
     }
@@ -2077,10 +2067,11 @@ mod tests {
         let frontier = dom.dominator_frontier();
         let aliases = AliasResult::simple(&ctx);
         let sliced = HashSet::default();
-        let live_in = LiveInBlocks::new(&ctx, test).get(&ctx, A.into(), &sliced, &aliases);
+        let mut cache = LiveInBlocks::new(&ctx, test);
+        let live_in = cache.get(&ctx, A.into(), &sliced, &aliases);
+        let store_blocks = cache.store_def_blocks(&ctx, A.into(), &sliced);
 
-        let result =
-            find_phi_insert_positions(&ctx, A.into(), &function, &sliced, frontier, &live_in);
+        let result = find_phi_insert_positions(frontier, &live_in, &store_blocks);
 
         let named_result = result
             .iter()
