@@ -30,7 +30,7 @@
 //! As with `argpromote`, a caller in code we never disassembled would still bind
 //! to the old shape; that gap is accepted and unguarded.
 
-use rustc_hash::FxHashSet as HashSet;
+use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
 
 use qcode::{
     context::Context,
@@ -58,6 +58,12 @@ pub fn dead_signature(ctx: &mut Context) -> bool {
         .filter(|&f| Function::from_id(ctx, f).is_pure_reg())
         .collect();
 
+    // Reverse call-site index, callee → its `Call` instructions, built in one
+    // pass. Call targets never change within this pass and instructions are only
+    // ever deleted (never retargeted), so this superset stays valid for the whole
+    // fixpoint — consumers just skip ids that have since been deleted.
+    let call_index = build_call_index(ctx);
+
     let mut iters = 0;
     while let Some(fid) = worklist.pop() {
         iters += 1;
@@ -69,8 +75,8 @@ pub fn dead_signature(ctx: &mut Context) -> bool {
         }
 
         let mut touched: HashSet<FunctionId> = HashSet::default();
-        let arg_changed = trim_dead_args(ctx, fid, &mut touched);
-        let ret_changed = trim_dead_return_fields(ctx, fid, &mut touched);
+        let arg_changed = trim_dead_args(ctx, fid, &call_index, &mut touched);
+        let ret_changed = trim_dead_return_fields(ctx, fid, &call_index, &mut touched);
 
         if arg_changed || ret_changed {
             changed = true;
@@ -89,13 +95,32 @@ pub fn dead_signature(ctx: &mut Context) -> bool {
     changed
 }
 
-/// Direct call sites (`Call` instructions) whose target is `fid`.
-fn direct_call_sites(ctx: &Context, fid: FunctionId) -> Vec<InstructionId> {
-    ctx.instructions()
-        .filter_map(|insn| match insn.mnemonic() {
-            Mnemonic::Call(c) if c.target == fid => Some(insn.id),
-            _ => None,
-        })
+/// Build the reverse call-site index `callee → its Call instructions` in one
+/// scan over every instruction, replacing the per-callee rescan the trims used
+/// to do (which made the worklist `O(functions × total_instructions)`).
+fn build_call_index(ctx: &Context) -> HashMap<FunctionId, Vec<InstructionId>> {
+    let mut index: HashMap<FunctionId, Vec<InstructionId>> = HashMap::default();
+    for insn in ctx.instructions() {
+        if let Mnemonic::Call(c) = insn.mnemonic() {
+            index.entry(c.target).or_default().push(insn.id);
+        }
+    }
+    index
+}
+
+/// Live direct call sites of `fid` from the prebuilt index: the recorded ids,
+/// minus any deleted since the index was built.
+fn direct_call_sites(
+    ctx: &Context,
+    fid: FunctionId,
+    call_index: &HashMap<FunctionId, Vec<InstructionId>>,
+) -> Vec<InstructionId> {
+    call_index
+        .get(&fid)
+        .into_iter()
+        .flatten()
+        .copied()
+        .filter(|&id| !ctx.get_insn(id).is_deleted())
         .collect()
 }
 
@@ -131,7 +156,12 @@ fn dce_function(ctx: &mut Context, fid: FunctionId) {
 /// This is the same operation DCE's no-pred param sweep performs, so the two stay
 /// consistent; running it here as well lets the dead-signature worklist expose
 /// and reclaim dead args between return-field trims without a separate DCE round.
-fn trim_dead_args(ctx: &mut Context, fid: FunctionId, touched: &mut HashSet<FunctionId>) -> bool {
+fn trim_dead_args(
+    ctx: &mut Context,
+    fid: FunctionId,
+    call_index: &HashMap<FunctionId, Vec<InstructionId>>,
+    touched: &mut HashSet<FunctionId>,
+) -> bool {
     let Some(root) = Function::from_id(ctx, fid).root().map(|b| b.id) else {
         return false;
     };
@@ -147,7 +177,7 @@ fn trim_dead_args(ctx: &mut Context, fid: FunctionId, touched: &mut HashSet<Func
         return false;
     }
 
-    for call_id in direct_call_sites(ctx, fid) {
+    for call_id in direct_call_sites(ctx, fid, call_index) {
         if let Some(caller) = ctx.get_insn(call_id).function().map(|f| f.id) {
             touched.insert(caller);
         }
@@ -171,9 +201,10 @@ fn trim_dead_args(ctx: &mut Context, fid: FunctionId, touched: &mut HashSet<Func
 fn trim_dead_return_fields(
     ctx: &mut Context,
     fid: FunctionId,
+    call_index: &HashMap<FunctionId, Vec<InstructionId>>,
     touched: &mut HashSet<FunctionId>,
 ) -> bool {
-    let call_sites = direct_call_sites(ctx, fid);
+    let call_sites = direct_call_sites(ctx, fid, call_index);
     if call_sites.is_empty() {
         return false;
     }
