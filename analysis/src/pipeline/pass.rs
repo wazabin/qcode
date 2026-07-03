@@ -156,6 +156,15 @@ pub trait DynPass {
     fn name(&self) -> &'static str;
     fn description(&self) -> &'static str;
     fn run(&self, ctx: &mut Context, env: &PipelineEnv) -> Result<bool, String>;
+    /// If this module pass is a `module(<fn_pass>)` adapter, the wrapped
+    /// per-function pass; `None` for a genuine whole-program pass. A dirty-tracking
+    /// module-stage runner uses this to drive the adapter function-by-function and
+    /// skip functions already at the pass's fixpoint. Running the inner pass
+    /// directly is equivalent to [`DynPass::run`] (which loops it over all
+    /// functions), so callers may always fall back to `run`.
+    fn as_module_fn(&self) -> Option<&dyn DynFunctionPass> {
+        None
+    }
 }
 
 impl<T: Pass> DynPass for T {
@@ -293,6 +302,9 @@ impl DynPass for ModuleFnAdapter {
             changed |= self.inner.run(ctx, fun_id, env)?;
         }
         Ok(changed)
+    }
+    fn as_module_fn(&self) -> Option<&dyn DynFunctionPass> {
+        Some(&*self.inner)
     }
 }
 

@@ -711,6 +711,17 @@ async fn run_module_stage(
 ) -> Result<bool, String> {
     dump_stage_inputs(ctx, &stage.dump, &stage.name);
     let stage_name: std::sync::Arc<str> = stage.name.as_str().into();
+
+    // A `repeat_until` module stage that contains `module(<fn_pass>)` adapters
+    // (currently only `mark-pure`) re-runs each wrapped per-function pass over the
+    // *whole* program every fixpoint iteration, though each iteration typically
+    // changes only a handful of functions. Drive it incrementally instead: skip a
+    // function an adapter has already settled, invalidating it (and its callers)
+    // only when its body or a callee's purity changes.
+    if stage.repeat_until.is_some() && passes.iter().any(|p| p.as_module_fn().is_some()) {
+        return run_module_stage_incremental(ctx, env, stage, passes, &stage_name, round, progress);
+    }
+
     let mut iters = 0;
     let mut stage_changed = false;
     loop {
@@ -741,6 +752,165 @@ async fn run_module_stage(
         stage_changed |= changed;
         iters += 1;
         if stage.repeat_until.is_none() || !changed {
+            return Ok(stage_changed);
+        }
+        if iters >= MAX_FIXPOINT_ITERS {
+            return Err(format!(
+                "stage \"{}\" did not converge after {MAX_FIXPOINT_ITERS} iterations",
+                stage.name
+            ));
+        }
+    }
+}
+
+/// The set of functions currently flagged `is_pure`.
+fn pure_function_set(ctx: &Context) -> HashSet<FunctionId> {
+    ctx.functions()
+        .filter(|f| f.is_pure())
+        .map(|f| f.id)
+        .collect()
+}
+
+/// A cheap structural hash of one function's body — block ids and params, then each
+/// instruction's id and mnemonic (which carries its operand value-ids, so an operand
+/// rewrite changes the hash). Unlike [`function_fingerprint`] it does no string
+/// rendering, so it is affordable to call over a large clean set every fixpoint
+/// iteration; it need only detect same-run before/after changes, not be stable
+/// across runs. Used by [`run_module_stage_incremental`] to invalidate settled
+/// functions a whole-program pass rewrote.
+fn function_body_hash(ctx: &Context, fun_id: FunctionId) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    for block in FunctionRef::from_id(ctx, fun_id).blocks() {
+        block.id.hash(&mut h);
+        for param in block.params() {
+            param.id().hash(&mut h);
+        }
+        for insn in block.iter() {
+            insn.id.hash(&mut h);
+            insn.mnemonic().hash(&mut h);
+        }
+    }
+    h.finish()
+}
+
+/// Mark every caller of `fun_id` dirty in `cache`. A change to a function's body,
+/// signature, or purity can change what its callers' `gvn`/`dce` do (pure-call
+/// emulation and dead-pure-call removal both read the callee), so a settled caller
+/// must be reprocessed.
+fn invalidate_callers(ctx: &Context, cache: &mut FixpointCache, fun_id: FunctionId) {
+    for caller in FunctionRef::from_id(ctx, fun_id).callers() {
+        cache.mark_dirty(caller);
+    }
+}
+
+/// Incremental driver for a `repeat_until` module stage carrying `module(<fn_pass>)`
+/// adapters (see [`run_module_stage`]).
+///
+/// Correctness rests on tracking, per `(function, pass)`, whether the adapter has
+/// reached a fixpoint on that function and the function is unchanged since
+/// ([`FixpointCache`]). Two interprocedural dependencies force extra invalidation,
+/// because `gvn`/`dce` read a *callee* when optimizing a caller (pure-call
+/// emulation / dead-pure-call removal):
+///   * when an adapter changes a function, its callers are invalidated;
+///   * around a genuine whole-program pass (e.g. `argpromote`, `mark_pure`), any
+///     function whose body fingerprint changed — and any function newly flagged
+///     `is_pure` — invalidates itself and its callers.
+/// The result is identical IR to re-running every adapter over every function each
+/// iteration, at a fraction of the work.
+fn run_module_stage_incremental(
+    ctx: &mut Context,
+    env: &PipelineEnv,
+    stage: &Stage,
+    passes: &[Box<dyn DynPass>],
+    stage_name: &std::sync::Arc<str>,
+    round: usize,
+    progress: &mut impl FnMut(PipelineProgress),
+) -> Result<bool, String> {
+    let mut cache = FixpointCache::default();
+    let mut known_pure = pure_function_set(ctx);
+    let mut iters = 0;
+    let mut stage_changed = false;
+    loop {
+        let mut changed = false;
+        for p in passes {
+            progress(PipelineProgress::WholeProgramPhase {
+                round,
+                stage: stage_name.clone(),
+                pass: p.name(),
+            });
+            let _scope = qcode::pass_scope::enter(p.name());
+            #[cfg(not(target_arch = "wasm32"))]
+            let started = std::time::Instant::now();
+
+            let pass_changed = if let Some(inner) = p.as_module_fn() {
+                // Per-function adapter: run only functions not already settled for
+                // this pass; a change dirties the function (all passes' marks) and
+                // its callers, a no-change settles it.
+                let fun_ids: Vec<FunctionId> = ctx
+                    .functions()
+                    .filter(|f| !f.is_external())
+                    .filter(|f| !ctx.is_function_ignored(f.address()))
+                    .map(|f| f.id)
+                    .collect();
+                let mut any = false;
+                for fun_id in fun_ids {
+                    if cache.is_clean(fun_id, p.name()) {
+                        continue;
+                    }
+                    if inner.run(ctx, fun_id, env)? {
+                        cache.mark_dirty(fun_id);
+                        invalidate_callers(ctx, &mut cache, fun_id);
+                        any = true;
+                    } else {
+                        cache.mark_clean(fun_id, p.name());
+                    }
+                }
+                any
+            } else {
+                // Genuine whole-program pass. Only *settled* (clean) functions risk
+                // being wrongly skipped later, and any already-dirty function it
+                // rewrites had its callers invalidated when it first went dirty — so
+                // fingerprinting the clean set alone soundly catches every new
+                // invalidation. Diff those fingerprints across the pass and dirty the
+                // ones that moved (plus their callers); also dirty callers of any
+                // function newly flagged `is_pure`.
+                let before: Vec<(FunctionId, u64)> = cache
+                    .clean_function_ids()
+                    .into_iter()
+                    .map(|f| (f, function_body_hash(ctx, f)))
+                    .collect();
+                let pc = p.run(ctx, env).map_err(|e| format!("{}: {e}", p.name()))?;
+                if pc {
+                    for (f, old) in before {
+                        if function_body_hash(ctx, f) != old {
+                            cache.mark_dirty(f);
+                            invalidate_callers(ctx, &mut cache, f);
+                        }
+                    }
+                    let now_pure = pure_function_set(ctx);
+                    for &f in now_pure.difference(&known_pure) {
+                        invalidate_callers(ctx, &mut cache, f);
+                    }
+                    known_pure = now_pure;
+                }
+                pc
+            };
+
+            #[cfg(not(target_arch = "wasm32"))]
+            log::debug!(
+                target: "pipeline",
+                "{} ran in {:.2?} ({})",
+                p.name(),
+                started.elapsed(),
+                if pass_changed { "changed" } else { "no change" },
+            );
+            crate::verify::verify_after(ctx, &p.name());
+            changed |= pass_changed;
+        }
+        stage_changed |= changed;
+        iters += 1;
+        if !changed {
             return Ok(stage_changed);
         }
         if iters >= MAX_FIXPOINT_ITERS {
