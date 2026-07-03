@@ -764,8 +764,7 @@ impl Mem2Reg<'_, '_> {
 
             let live_in = self.live_in_blocks_cached(var, sliced, live_in_cache);
             let store_blocks = live_in_cache.store_def_blocks(self.ctx, var, sliced);
-            let phi_positions =
-                find_phi_insert_positions(frontier, &live_in, &store_blocks);
+            let phi_positions = find_phi_insert_positions(frontier, &live_in, &store_blocks);
 
             // A block param is only meaningful if every incoming edge can supply
             // its argument. Branch/CBranch edges are wired by `merge_branch_args`,
@@ -3355,8 +3354,14 @@ impl FunctionPass for Mem2RegPass {
         env: &PipelineEnv,
     ) -> Result<bool, String> {
         // Per-function pass: scope the alias oracle to this function so the stage
-        // is O(program) total, not O(functions × program).
-        let aliases = AliasResult::simple_for_function(ctx, fun_id);
+        // is O(program) total, not O(functions × program). Reuse the shared,
+        // varnode-set-keyed `RegisterBase` cached on the env (built once, rebuilt
+        // only when the varnode set grows) instead of rebuilding the whole-program
+        // base on every function — the same base gvn uses. `for_function` restricts
+        // it to this function's pointers, yielding an identical `AliasResult` to the
+        // former `simple_for_function` (which did `RegisterBase::build` + the same
+        // `for_function`). mem2reg deliberately does not apply gvn's frame-freshness.
+        let aliases = env.alias_base(ctx).for_function(ctx, fun_id);
         // Resolve `@SP` so canonical `@SP ± N` slots are recognised; `None` when
         // the function has no incoming stack-pointer param (legacy literal path).
         let sp_reg = ctx.registers[&env.cfg.stack_pointer];
