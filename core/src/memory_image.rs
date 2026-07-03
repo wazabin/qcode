@@ -23,6 +23,13 @@ struct Segment {
     /// Whether the region is executable (so resolved jump targets can be sanity
     /// checked against code memory).
     executable: bool,
+    /// Whether the region is writable. A writable region's initialized bytes are
+    /// not a reliable constant — the runtime (e.g. the dynamic linker populating
+    /// the GOT) may overwrite them — so passes that resolve control flow or fold
+    /// constants out of memory must not trust it. Defaults to `false` for images
+    /// deserialized from before this field existed.
+    #[serde(default)]
+    writable: bool,
 }
 
 impl Segment {
@@ -53,7 +60,7 @@ pub struct MemoryImage {
 impl MemoryImage {
     /// Add a mapped region. Segments are kept sorted by start address; callers
     /// need not insert in order.
-    pub fn add_segment(&mut self, start: u64, bytes: Vec<u8>, executable: bool) {
+    pub fn add_segment(&mut self, start: u64, bytes: Vec<u8>, executable: bool, writable: bool) {
         if bytes.is_empty() {
             return;
         }
@@ -61,6 +68,7 @@ impl MemoryImage {
             start,
             bytes,
             executable,
+            writable,
         };
         let pos = self.segments.partition_point(|s| s.start < seg.start);
         self.segments.insert(pos, seg);
@@ -107,6 +115,17 @@ impl MemoryImage {
         self.segment_at(addr).is_some_and(|s| s.executable)
     }
 
+    /// True only if `addr` is mapped in a region *known* to be writable: the
+    /// per-segment protection flags must be established (see
+    /// [`protections_known`](Self::protections_known)) and the containing segment
+    /// writable. Before protections are known the segment flags are not
+    /// authoritative, so this conservatively returns `false` ("not proven
+    /// writable"). Callers use it to refuse to treat mutable memory (e.g. a GOT
+    /// slot the dynamic linker rewrites) as a constant.
+    pub fn is_known_writable(&self, addr: u64) -> bool {
+        self.protections_known && self.segment_at(addr).is_some_and(|s| s.writable)
+    }
+
     /// True if `addr` is mapped by any segment.
     pub fn contains(&self, addr: u64) -> bool {
         self.segment_at(addr).is_some()
@@ -143,8 +162,8 @@ mod tests {
     fn image() -> MemoryImage {
         let mut img = MemoryImage::default();
         // Insert out of order to exercise the sorted insert.
-        img.add_segment(0x2000, vec![0xaa, 0xbb, 0xcc, 0xdd], true);
-        img.add_segment(0x1000, vec![0x01, 0x02, 0x03, 0x04], false);
+        img.add_segment(0x2000, vec![0xaa, 0xbb, 0xcc, 0xdd], true, false);
+        img.add_segment(0x1000, vec![0x01, 0x02, 0x03, 0x04], false, false);
         img
     }
 
@@ -187,5 +206,22 @@ mod tests {
         assert!(!img.protections_known());
         img.mark_protections_known();
         assert!(img.protections_known());
+    }
+
+    #[test]
+    fn known_writable_requires_established_protections() {
+        let mut img = MemoryImage::default();
+        img.add_segment(0x1000, vec![0u8; 4], false, true); // writable data
+        img.add_segment(0x2000, vec![0u8; 4], false, false); // read-only data
+
+        // Until protections are established, writability is not authoritative, so
+        // nothing is *known* writable.
+        assert!(!img.is_known_writable(0x1000));
+        assert!(!img.is_known_writable(0x2000));
+
+        img.mark_protections_known();
+        assert!(img.is_known_writable(0x1000), "writable segment now known");
+        assert!(!img.is_known_writable(0x2000), "read-only stays read-only");
+        assert!(!img.is_known_writable(0x9999), "unmapped is not writable");
     }
 }

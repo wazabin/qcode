@@ -63,7 +63,13 @@ fn local_effect(
                         callees.push(call.target);
                     }
                 }
-                Mnemonic::CallInd(_) => unbounded = true,
+                // An unresolved indirect transfer leaves to unknown code — an
+                // indirect call, or an indirect *tail-branch* (the shape a PLT
+                // stub lifts to: `goto [GOT_slot]`). Either can write anything, so
+                // the effect is unbounded. A `BranchInd` that stayed in-function
+                // would have been resolved to a direct `Branch` by the jump-table
+                // pass; one that survives is a genuine escape.
+                Mnemonic::CallInd(_) | Mnemonic::BranchInd(_) => unbounded = true,
                 _ => {}
             }
         }
@@ -282,6 +288,31 @@ fn callee:
             gvn_function(&mut ctx, caller, Some(&aliases));
         }
         format!("{}", Function::from_id(&ctx, caller))
+    }
+
+    /// A function that ends in an unresolved indirect tail-branch (`goto [p]` —
+    /// the shape a PLT stub lifts to) escapes to unknown code, so its write-set is
+    /// unbounded (`None`), not the empty set. Otherwise a caller would forward
+    /// constant stores across the call, folding away input-dependent values.
+    #[test]
+    fn indirect_tailbranch_is_unbounded() {
+        use qcode_macro::qcode;
+        let mut ctx = Context::new();
+        qcode!(
+            ctx,
+            "
+            fn stub:
+            <entry>
+                i64 %p = load(ram:8, i64 0x3fa0);
+                goto [i64 %p];
+            "
+        );
+        let _ = entry;
+        set_all_written_spaces(&mut ctx);
+        assert!(
+            Function::from_id(&ctx, stub).written_spaces().is_none(),
+            "an unresolved indirect tail-branch must have an unbounded write-set"
+        );
     }
 
     /// The witnessed write-set of the functionalized callee is exactly its scratch

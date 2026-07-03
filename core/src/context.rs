@@ -189,6 +189,19 @@ impl<'str> Context<'str> {
         self.spaces.push(space)
     }
 
+    /// Creates a new unnamed RAM address space and returns its ID. Unlike
+    /// [`make_temp_space`](Self::make_temp_space), the result is typed
+    /// [`SpaceType::Ram`](crate::space::SpaceType::Ram) so that RAM-aware passes
+    /// (alias analysis, `array_promote`, …) treat it as memory. Used for the
+    /// argpromote shadow, which stands in for the real RAM the promoted pointers
+    /// address rather than for builder scratch.
+    pub fn make_ram_space(&mut self) -> SpaceId {
+        let default_space = &self.spaces[self.default_space];
+        let mut space = Space::new(None, default_space.word_size, default_space.addr_size);
+        space.ty = crate::space::SpaceType::Ram;
+        self.spaces.push(space)
+    }
+
     /// Adds a space to the context, registering its name, and returns its ID.
     pub fn add_space(&mut self, space: Space) -> SpaceId {
         let name_key: Option<Box<str>> = space.name.clone();
@@ -277,6 +290,16 @@ impl<'str> Context<'str> {
     /// True if `addr` lies in an executable region of the loaded binary.
     pub fn is_executable_addr(&self, addr: u64) -> bool {
         self.memory_image.is_executable(addr)
+    }
+
+    /// True only if `addr` is in a region *known* to be writable (protections
+    /// established and the segment writable). Passes that fold a value out of
+    /// initialized memory use this to refuse mutable memory — e.g. a GOT slot the
+    /// dynamic linker overwrites at load time, whose file bytes are the lazy PLT
+    /// resolver stub, not the real target. See
+    /// [`MemoryImage::is_known_writable`](crate::memory_image::MemoryImage::is_known_writable).
+    pub fn is_known_writable_addr(&self, addr: u64) -> bool {
+        self.memory_image.is_known_writable(addr)
     }
 
     /// Mark the binary's memory protections as established (the
@@ -1588,8 +1611,8 @@ mod tests {
     #[test]
     fn assume_executable_narrows_once_protections_known() {
         let mut ctx = Context::new();
-        ctx.memory_image.add_segment(0x1000, vec![0u8; 4], true); // code
-        ctx.memory_image.add_segment(0x2000, vec![0u8; 4], false); // data
+        ctx.memory_image.add_segment(0x1000, vec![0u8; 4], true, false); // code
+        ctx.memory_image.add_segment(0x2000, vec![0u8; 4], false, true); // data
 
         // Default r/x while protections unknown: everything is permissive, even
         // unmapped (the lifter reads bytes from the format, not the image).
@@ -1620,8 +1643,8 @@ mod tests {
     #[test]
     fn assume_executable_honors_region_override() {
         let mut ctx = Context::new();
-        ctx.memory_image.add_segment(0x1000, vec![0u8; 4], true); // code
-        ctx.memory_image.add_segment(0x2000, vec![0u8; 4], false); // data
+        ctx.memory_image.add_segment(0x1000, vec![0u8; 4], true, false); // code
+        ctx.memory_image.add_segment(0x2000, vec![0u8; 4], false, true); // data
         ctx.mark_protections_known();
 
         // Force the data region executable and the code region non-executable.

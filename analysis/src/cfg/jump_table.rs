@@ -305,6 +305,14 @@ fn resolve_block(mut block: BlockMutRef) -> Option<Vec<Edit>> {
     for index in range.min..=range.max {
         let entry_addr = table.base.wrapping_add(index.wrapping_mul(table.scale));
 
+        // A table in writable memory is not trustworthy data (see
+        // `resolve_constant_load`); bail on the whole table rather than resolve
+        // against bytes the runtime may rewrite.
+        if block.ctx().is_known_writable_addr(entry_addr) {
+            log::debug!(target: "jump_table", "skipping table: entry {entry_addr:x} is writable");
+            return None;
+        }
+
         if !block.ctx_mut().assume_true(Proposition::ImmutableMemory {
             addr: entry_addr,
             size: table.slot_width as u8,
@@ -351,6 +359,17 @@ fn resolve_constant_load(block: &mut BlockMutRef, ptr: ValueId) -> Option<Vec<Ed
     let ctx = block.ctx();
     let load = as_load(ctx, ptr)?;
     let addr = numeric_const(ctx, load.ptr)?;
+
+    // A load from writable memory is not a reliable constant: the canonical case
+    // is `jmp *[GOT]` in a PLT stub, whose slot the dynamic linker rewrites at
+    // load time. The file image holds the pre-relocation value (the lazy resolver
+    // stub), so resolving to it would fabricate a bogus direct branch and, worse,
+    // make the stub look like a pure, side-effect-free function. Leave the
+    // `BranchInd` in place so the stub stays an opaque external transfer.
+    if ctx.is_known_writable_addr(addr) {
+        log::debug!(target: "jump_table", "skipping constant load: slot {addr:x} is writable");
+        return None;
+    }
 
     if !block.ctx_mut().assume_true(Proposition::ImmutableMemory {
         addr,
@@ -563,12 +582,12 @@ mod tests {
 
     /// Seed `ctx` with an executable code region `[start, start+len)`.
     fn add_code(ctx: &mut Context, start: u64, len: usize) {
-        ctx.memory_image.add_segment(start, vec![0u8; len], true);
+        ctx.memory_image.add_segment(start, vec![0u8; len], true, false);
     }
 
     /// Seed `ctx` with a read-only data region holding `bytes`.
     fn add_rodata(ctx: &mut Context, start: u64, bytes: Vec<u8>) {
-        ctx.memory_image.add_segment(start, bytes, false);
+        ctx.memory_image.add_segment(start, bytes, false, false);
     }
 
     /// An absolute table: each 8-byte slot holds the target address directly.
