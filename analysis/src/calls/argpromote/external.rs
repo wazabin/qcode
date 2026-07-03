@@ -156,11 +156,21 @@ pub fn argpromote_external(ctx: &mut Context, env: &PipelineEnv) -> bool {
     let sp_space = Varnode::from_id(ctx, sp).space().id;
     let default_space = ctx.default_space;
 
+    // Only externals that are actually *called* can gain arguments: both
+    // `bind_external_args` and `bind_external_return` key on a direct `Call` whose
+    // target is the external. Filtering on the direct call-site index (an O(1) map
+    // lookup) skips the `cabi::lookup` and the whole-program instruction scan for
+    // every imported-but-unreferenced symbol — the bulk of an import table.
     let externals: Vec<FunctionId> = ctx
         .functions()
         .filter(|f| f.is_external())
         .map(|f| f.id)
+        .filter(|&id| !ctx.values.call_sites_of(id).is_empty())
         .collect();
+
+    if externals.is_empty() {
+        return false;
+    }
 
     let mut changed = false;
     for fid in externals {

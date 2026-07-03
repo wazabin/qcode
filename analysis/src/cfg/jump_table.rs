@@ -95,6 +95,18 @@ impl FunctionPass for HandleJumpTables {
     ) -> Result<bool, String> {
         let function = Function::from_id(ctx, fun_id);
 
+        // Nothing resolves in a function with no indirect branch. The vast majority
+        // of functions have none, so bail before allocating the block-id vector and
+        // walking every block through `resolve_block`.
+        if !function.blocks().any(|b| {
+            matches!(
+                b.instructions().last().map(|i| i.mnemonic()),
+                Some(Mnemonic::BranchInd(_))
+            )
+        }) {
+            return Ok(false);
+        }
+
         // Entry address of the function owning these branches, paired with every
         // discovered target so the re-lift loop knows which function to grow.
         let fn_entry = function.address();

@@ -47,6 +47,17 @@ impl FunctionPass for StructTyping {
         fun_id: FunctionId,
         _env: &PipelineEnv,
     ) -> Result<bool, String> {
+        // Nothing this pass does can fire unless some value or operand reachable in
+        // the function already carries a struct / struct-pointer type: add→gep,
+        // register-read, and load typing all key on a struct-pointer-typed operand,
+        // and renaming keys on a struct-typed value. On a function with no complex
+        // types (the common case) the whole fixpoint + rename sweep is a guaranteed
+        // no-op, so bail before allocating or scanning it twice. Per-function so it
+        // stays correct once non-Windows struct recovery lands.
+        if !function_has_struct_types(ctx, fun_id) {
+            return Ok(false);
+        }
+
         let insn_ids: Vec<InstructionId> = Function::from_id(ctx, fun_id)
             .blocks()
             .flat_map(|b| b.iter().map(|i| i.id).collect::<Vec<_>>())
@@ -135,6 +146,27 @@ fn unique_name<'str>(ctx: &Context, value: ValueId, base: &str) -> Option<Cow<'s
         }
     }
     None
+}
+
+/// Whether any value or operand reachable in `fun_id` currently carries a struct
+/// or struct-pointer type — the precondition for [`StructTyping`] to do anything.
+/// A single linear scan; returns on the first struct-ish type found. Checks
+/// instruction results, block params, *and* operands, because the seed can live on
+/// an operand varnode (the Windows TEB seed retypes the `FS_OFFSET` register that a
+/// `load(register, reg)` reads) rather than on a value the function defines.
+fn function_has_struct_types(ctx: &Context, fun_id: FunctionId) -> bool {
+    let is_struct_ish = |v: ValueId| {
+        ctx.stored_type_of(v).is_some_and(|t| {
+            ctx.types.pointee_of(t).is_some() || ctx.types.struct_name_of(t).is_some()
+        })
+    };
+    Function::from_id(ctx, fun_id).blocks().any(|b| {
+        b.params().any(|p| is_struct_ish(p.id()))
+            || b.iter().any(|i| {
+                is_struct_ish(ValueId::Instruction(i.id))
+                    || i.mnemonic().args().iter().copied().any(is_struct_ish)
+            })
+    })
 }
 
 /// Attempts one typing step on instruction `id`. Returns `true` if it changed
