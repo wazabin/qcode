@@ -13,10 +13,8 @@ use qcode::{
 use crate::gvn::affine::{Numbering, precompute_forms};
 use crate::stack::frame::{FrameClass, frame_class, incoming_sp_param};
 
-mod anderson;
 mod simple;
 
-pub use anderson::alias_analysis;
 pub use simple::RegisterBase;
 
 /// Per-function frame-freshness context, precomputed when an [`AliasResult`] is
