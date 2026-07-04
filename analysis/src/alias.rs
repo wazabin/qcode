@@ -135,8 +135,10 @@ impl AliasResult {
     /// Conservative may-alias query.
     ///
     /// Returns `true` if `a` and `b` share a class, or if either is
-    /// `NodeId::Unknown`. Returns `false` if either value was never
-    /// involved in any constraint (isolated - no alias relationship).
+    /// `NodeId::Unknown`, or if either value was never seen during analysis
+    /// (an untracked value carries no no-alias guarantee, so it must answer
+    /// may-alias). Only the earlier layers — the different-space
+    /// short-circuit and [`Self::provably_disjoint`] — can return `false`.
     pub fn may_alias(&self, ctx: &Context, a: ValueId, b: ValueId) -> bool {
         // If a and b don't share the same address space they can't alias.
         // Note this deliberately overrides `NodeId::Unknown` below: aliasing
@@ -159,7 +161,10 @@ impl AliasResult {
         }
 
         match (self.alias_class(a), self.alias_class(b)) {
-            (None, _) | (_, None) => false,
+            // A value the analysis never saw gives us no guarantee. This happens
+            // when a pass queries a value it created after the result was built;
+            // "don't know" must answer may-alias, not no-alias.
+            (None, _) | (_, None) => true,
             (Some(NodeId::Unknown), _) | (_, Some(NodeId::Unknown)) => true,
             (Some(ra), Some(rb)) => ra == rb,
         }

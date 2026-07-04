@@ -460,6 +460,44 @@ fn literal_with_upper_junk_bits_is_masked_to_size() {
 }
 
 #[test]
+fn untracked_value_may_alias_conservatively() {
+    let mut ctx = Context::new();
+    let space = make_space(&mut ctx, "register");
+    let _block_id = ctx.get_or_make_block(0x1000);
+    let mut builder = Builder::from_context(&mut ctx, 0x1000);
+
+    // Two tracked, non-overlapping literal pointers (positive control).
+    let p = builder.context_mut().get_const(0x1000, 8).id();
+    let p2 = builder.context_mut().get_const(0x2000, 8).id();
+    builder.push_load::<false>(p, 4, space);
+    builder.push_load::<false>(p2, 4, space);
+    unsafe { builder.dont_finalize() };
+    drop(builder);
+
+    let result = AliasResult::simple(&ctx);
+
+    // Append an instruction the analysis never saw.
+    let mut builder = Builder::from_context(&mut ctx, 0x1000);
+    let eight = builder.context_mut().get_const(8, 8).id();
+    let q = builder.push_add(p, eight).id();
+    unsafe { builder.dont_finalize() };
+    drop(builder);
+
+    assert!(
+        result.alias_class(q).is_none(),
+        "precondition: q is genuinely untracked"
+    );
+    assert!(
+        result.may_alias(&ctx, q, p),
+        "an untracked value must answer may-alias, not no-alias"
+    );
+    assert!(
+        !result.may_alias(&ctx, p, p2),
+        "tracked non-overlapping literals still answer no-alias"
+    );
+}
+
+#[test]
 fn many_overlapping_subregisters_still_join_in_one_class() {
     let mut varnodes = Vec::new();
 
