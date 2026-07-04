@@ -3,6 +3,7 @@
 //! backs them, and the clobbered-register computation.
 
 mod argpromote;
+mod carried_array;
 mod clobbered;
 mod dead_signature;
 mod depipeline;

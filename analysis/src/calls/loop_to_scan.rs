@@ -41,13 +41,15 @@ use qcode::{
     builder::Builder,
     context::Context,
     value::{
-        BasicBlock, BlockId, Function, FunctionId, InstructionRef, ValueId, ValueRef,
-        insn::{
-            Binary, Binop, Branch, InstructionId, IntBinop, IntrinsicApp, IntrinsicId, Mnemonic,
-        },
+        BasicBlock, BlockId, Function, FunctionId, InstructionRef, ValueId,
+        insn::{Branch, InstructionId, IntrinsicApp, IntrinsicId, Mnemonic},
     },
 };
 
+use super::carried_array::{
+    classify_body_reads, exit_view, find_carried_array, incoming, is_increment, literal,
+    param_parent, param_pos,
+};
 use super::loop_to_map::{ScanElem, outline_scan_body};
 use crate::{FunctionPass, PipelineEnv};
 
@@ -82,292 +84,79 @@ struct ScanMatch {
     /// The array element type.
     elem_ty: qcode::types::TypeId,
     /// Set when the body reads the region's *original* element at its own lane
-    /// (`at(%l0, index)`) — the loop is a scan over the original array rather than
-    /// a pure generation over `iota`. Holds `(element-read value, exit snapshot
-    /// param to slice)`; the scan then ranges over `l0[1..]`.
+    /// (`at(arr, index)` on the single carried array) — the loop is a scan over the
+    /// original array rather than a pure generation over `iota`. Holds
+    /// `(element-read value, original-array value to slice)`, where the array is the
+    /// seed insert's base operand (the preheader wide `Load`); the scan ranges over
+    /// `l0[1..]`.
     elem: Option<(ValueId, ValueId)>,
-}
-
-/// `c` if `v` is the integer literal `c`, else `None`.
-fn literal(ctx: &Context, v: ValueId) -> Option<u64> {
-    match ValueRef::new(v, ctx) {
-        ValueRef::Literal(l) => Some(l.value()),
-        _ => None,
-    }
-}
-
-/// `true` if `v` is `idx + 1` (either operand order) — a unit step of `idx`.
-fn is_increment(ctx: &Context, v: ValueId, idx: ValueId) -> bool {
-    let ValueId::Instruction(id) = v else {
-        return false;
-    };
-    let Mnemonic::Binop(Binary { lhs, rhs, op }) = ctx.get_insn(id).mnemonic() else {
-        return false;
-    };
-    let one = |x: ValueId| literal(ctx, x) == Some(1);
-    matches!(op, Binop::Int(IntBinop::Add))
-        && ((*lhs == idx && one(*rhs)) || (*rhs == idx && one(*lhs)))
-}
-
-/// `true` if `v` is `idx - 1`, expressed either as `idx - 1` or as `idx + (-1)`
-/// (the wrapping representation `array_promote` emits for the `at` back-index).
-fn is_decrement(ctx: &mut Context, v: ValueId, idx: ValueId) -> bool {
-    let ValueId::Instruction(id) = v else {
-        return false;
-    };
-    let Mnemonic::Binop(Binary { lhs, rhs, op }) = ctx.get_insn(id).mnemonic() else {
-        return false;
-    };
-    let (lhs, rhs, op) = (*lhs, *rhs, *op);
-    let idx_ty = ctx.type_of(idx);
-    let width = ctx.types.size_of(idx_ty);
-    let neg_one = if width >= 8 {
-        u64::MAX
-    } else {
-        (1u64 << (width * 8)) - 1
-    };
-    match op {
-        Binop::Int(IntBinop::Sub) => lhs == idx && literal(ctx, rhs) == Some(1),
-        Binop::Int(IntBinop::Add) => {
-            (lhs == idx && literal(ctx, rhs) == Some(neg_one))
-                || (rhs == idx && literal(ctx, lhs) == Some(neg_one))
-        }
-        _ => false,
-    }
-}
-
-/// Values feeding block-param index `k` of `block` from every predecessor edge.
-fn incoming(ctx: &Context, block: BlockId, k: usize) -> Vec<ValueId> {
-    let mut out = Vec::new();
-    let preds: Vec<BlockId> = BasicBlock::from_id(ctx, block)
-        .predecessors()
-        .map(|(_, p)| p)
-        .collect();
-    for pred in preds {
-        let Some(term) = BasicBlock::from_id(ctx, pred).iter().last() else {
-            continue;
-        };
-        match term.mnemonic() {
-            Mnemonic::Branch(b) => out.extend(b.args.get(k).copied()),
-            Mnemonic::CBranch(cb) => {
-                if cb.success_block == block {
-                    out.extend(cb.success_args.get(k).copied());
-                }
-                if cb.failure_block == block {
-                    out.extend(cb.failure_args.get(k).copied());
-                }
-            }
-            _ => {}
-        }
-    }
-    out
-}
-
-/// Index of block-param `p` within `block`'s parameter list.
-fn param_pos(ctx: &Context, block: BlockId, p: ValueId) -> Option<usize> {
-    BasicBlock::from_id(ctx, block)
-        .params()
-        .position(|q| q.id() == p)
-}
-
-/// Parent block of a block-param value.
-fn param_parent(ctx: &Context, v: ValueId) -> Option<BlockId> {
-    let ValueId::BlockParam(pid) = v else {
-        return None;
-    };
-    ctx.values.block_params[pid].parent
 }
 
 /// Recognize the `insert`/`at` fill loop in `fid`.
 fn try_match(ctx: &mut Context, fid: FunctionId) -> Option<ScanMatch> {
-    let insert_id = IntrinsicId::from_name("insert")?;
-    let at_id = IntrinsicId::from_name("at")?;
+    // Anchor on the shared carried-array matcher, then narrow to the scan shape:
+    // a lane-0 accumulator seed insert must exist (`ca.seed`).
+    let ca = find_carried_array(ctx, fid)?;
+    let (seed_val, seed_arr0) = ca.seed?;
+    let header = ca.header;
+    let body = ca.body;
+    let index = ca.index;
+    let elem_ty = ca.elem_ty;
+    let count = ca.count;
+    let stored_val = ca.stored_val;
 
-    // Anchor: a single `store(ram, base <- arr)` whose source is an array-typed
-    // block param of the storing block (the loop's exit-carried array). Collect
-    // candidate RAM stores first (the block walk borrows `ctx`), then resolve the
-    // array type.
-    let mut candidates: Vec<(InstructionId, BlockId, ValueId, ValueId)> = Vec::new();
-    for block in Function::from_id(ctx, fid).iter() {
-        let bid = block.id;
-        for insn in block.iter() {
-            let Mnemonic::Store(s) = insn.mnemonic() else {
-                continue;
-            };
-            // Any RAM space — array_promote emits the wide store into whatever RAM
-            // space the region lived in, not necessarily the default space.
-            if matches!(
-                qcode::space::Space::from_id(ctx, s.space).ty,
-                qcode::space::SpaceType::Ram
-            ) {
-                candidates.push((insn.id, bid, s.ptr, s.src));
-            }
-        }
-    }
-    let mut anchor = None;
-    for (id, bid, ptr, src) in candidates {
-        // The store source must be an array-typed block param — the loop-carried
-        // array reaching the exit, either the exit's own pass-through param
-        // (split shape) or the loop header's param directly (rotated shape, where
-        // gvn has already coalesced the trivial exit pass-through away).
-        if !matches!(src, ValueId::BlockParam(_)) {
-            continue;
-        }
-        let src_ty = ctx.type_of(src);
-        let Some((elem_ty, count)) = ctx.types.array_of(src_ty) else {
-            continue;
-        };
-        if count == 0 {
-            continue;
-        }
-        if anchor.is_some() {
-            return None; // more than one array store — not the canonical shape
-        }
-        anchor = Some((id, bid, ptr, src, elem_ty, count));
-    }
-    let (_store_id, exit, _base, arr_src, elem_ty, count) = anchor?;
-
-    // Exit's single predecessor is the loop header.
-    let exit_preds: Vec<BlockId> = BasicBlock::from_id(ctx, exit)
+    // The loop body carries the array back to the header; the guard block's other
+    // successor is the loop exit. `header`'s terminator is the `CBranch` guard
+    // (rotated: it lives on the body/header itself; split: on the distinct guard).
+    let hterm = BasicBlock::from_id(ctx, header).iter().last()?;
+    let Mnemonic::CBranch(cb) = hterm.mnemonic() else {
+        return None;
+    };
+    let (sb, fb) = (cb.success_block, cb.failure_block);
+    // The back-edge block (loop body) is a predecessor of the header; the exit is
+    // the guard's other successor.
+    let header_preds_set: HashSet<BlockId> = BasicBlock::from_id(ctx, header)
         .predecessors()
         .map(|(_, p)| p)
         .collect();
-    let [header] = exit_preds[..] else {
-        return None;
-    };
-    // The header's own carried array param: the store source directly if it lives
-    // on the header (rotated/coalesced), otherwise the value the exit's
-    // pass-through param copies from the header on the exit edge (split).
-    let arr_h = if param_parent(ctx, arr_src) == Some(header) {
-        arr_src
+    let exit = if header_preds_set.contains(&sb) && !header_preds_set.contains(&fb) {
+        fb
+    } else if header_preds_set.contains(&fb) && !header_preds_set.contains(&sb) {
+        sb
     } else {
-        let k_arre = param_pos(ctx, exit, arr_src)?;
-        match incoming(ctx, exit, k_arre)[..] {
-            [v] => v,
-            _ => return None,
-        }
+        return None;
     };
-    if param_parent(ctx, arr_h) != Some(header) {
-        return None;
-    }
 
-    // The header array param's two incomings: the preheader seed insert and the
-    // body carry insert.
-    let k_arrh = param_pos(ctx, header, arr_h)?;
-    let mut seed_val = None;
-    let mut carry = None; // (arr_b, stored_val, insert_index)
-    for v in incoming(ctx, header, k_arrh) {
-        let ValueId::Instruction(iid) = v else {
-            return None;
-        };
-        let Mnemonic::Intrinsic(IntrinsicApp { id, args }) = ctx.get_insn(iid).mnemonic() else {
-            return None;
-        };
-        if *id != insert_id {
-            return None;
-        }
-        let [arr0, idx, val] = args[..] else {
-            return None;
-        };
-        if let ValueId::BlockParam(_) = arr0 {
-            // Carry: insert into a loop-carried array param.
-            if carry.is_some() {
-                return None;
-            }
-            carry = Some((arr0, val, idx));
-        } else if literal(ctx, idx) == Some(0) {
-            // Seed: insert the lane-0 value into a fresh (non-param) array.
-            if seed_val.is_some() {
-                return None;
-            }
-            seed_val = Some(val);
-        } else {
-            return None;
-        }
-    }
-    let seed_val = seed_val?;
-    let (arr_b, stored_val, ins_idx) = carry?;
-    let body = param_parent(ctx, arr_b)?;
-    if !matches!(ins_idx, ValueId::BlockParam(_)) || param_parent(ctx, ins_idx) != Some(body) {
-        return None;
-    }
-    let index = ins_idx;
+    // The array value as the exit block sees it: an exit pass-through param that
+    // copies `arr_h` on the header→exit edge, or `arr_h` itself when gvn coalesced
+    // that trivial pass-through away (then the exit reads the header param directly).
+    let arr_src = exit_view(ctx, &ca, exit);
 
-    // The body must be a pred of the header (the loop back-edge).
-    let header_preds: HashSet<BlockId> = BasicBlock::from_id(ctx, header)
-        .predecessors()
-        .map(|(_, p)| p)
-        .collect();
-    if !header_preds.contains(&body) {
-        return None;
-    }
-
-    // The single `at(arr_b, index-1)` reading the previous element (the carry).
-    let mut prev = None;
-    for insn in BasicBlock::from_id(ctx, body).iter() {
-        let Mnemonic::Intrinsic(IntrinsicApp { id, args }) = insn.mnemonic() else {
-            continue;
-        };
-        if *id != at_id || args.first() != Some(&arr_b) {
-            continue;
-        }
-        if prev.is_some() {
-            return None;
-        }
-        prev = Some((insn.id, args[1]));
-    }
-    let (prev_id, at_idx) = prev?;
-    if !is_decrement(ctx, at_idx, index) {
-        return None;
-    }
+    // The body's `at(arr_b, ·)` reads on the single carried array: the carry
+    // `at(arr_b, index-1)` (always present) and, for an original-array scan, the
+    // own-lane original read `at(arr_b, index)`.
+    let reads = classify_body_reads(ctx, &ca)?;
+    let prev_id = reads.prev?;
     let prev_val = ValueId::Instruction(prev_id);
+    let elem_read = reads.own;
 
-    // Original-element read: a second `at(l0_b, index)` on a *different*
-    // loop-invariant array param `l0_b` (the whole-region snapshot `array_promote`
-    // threads when the loop reads its own lane). Its presence turns the fold into a
-    // scan over the original array `l0[1..]` instead of over `iota`.
-    let mut elem = None;
-    for insn in BasicBlock::from_id(ctx, body).iter() {
-        let Mnemonic::Intrinsic(IntrinsicApp { id, args }) = insn.mnemonic() else {
-            continue;
-        };
-        if *id != at_id || args.len() != 2 || args[0] == arr_b {
-            continue;
-        }
-        let (l0_b, e_idx) = (args[0], args[1]);
-        if !matches!(l0_b, ValueId::BlockParam(_)) || e_idx != index {
-            continue;
-        }
-        if elem.is_some() {
-            return None;
-        }
-        elem = Some((ValueId::Instruction(insn.id), l0_b));
-    }
-    // Resolve the snapshot's exit view (to slice `l0[1..]` at the store site). The
-    // snapshot is loop-invariant, so it reaches the exit as an exit param whose
-    // header-edge value is the header param feeding `l0_b`. v1 array-input support
-    // is limited to the split shape (distinct body/exit blocks).
-    let elem = match elem {
-        Some((e_read, l0_b)) => {
+    // An own-lane original read turns the fold into a scan over the original array
+    // `l0[1..]`. The original array is the seed insert's base operand `seed_arr0`,
+    // defined in the preheader (so it dominates the exit rewrite site). It must be a
+    // wide `Load` of the region — a `splat` base would mean literal zero, not
+    // `l0[i]`. v1 array-input support is split-shape only.
+    let elem = match elem_read {
+        Some(e_read) => {
             if body == header {
                 return None; // rotated array-input not supported in v1
             }
-            let [l0_h] = incoming(ctx, body, param_pos(ctx, body, l0_b)?)[..] else {
+            let ValueId::Instruction(a0) = seed_arr0 else {
                 return None;
             };
-            if param_parent(ctx, l0_h) != Some(header) {
+            if !matches!(ctx.get_insn(a0).mnemonic(), Mnemonic::Load(_)) {
                 return None;
             }
-            let mut l0_exit = None;
-            for p in BasicBlock::from_id(ctx, exit).params().map(|p| p.id()) {
-                if incoming(ctx, exit, param_pos(ctx, exit, p)?)[..] == [l0_h] {
-                    if l0_exit.is_some() {
-                        return None;
-                    }
-                    l0_exit = Some(p);
-                }
-            }
-            Some((e_read, l0_exit?))
+            Some((e_read, seed_arr0))
         }
         None => None,
     };
@@ -889,3 +678,63 @@ impl FunctionPass for LoopToScan {
 }
 
 crate::register_function_pass!(LoopToScan);
+
+#[cfg(test)]
+mod tests {
+    use qcode_macro::qcode;
+
+    use super::*;
+    use crate::mem::array_promote::ArrayPromote;
+    use crate::test_util::run_function_pass;
+
+    // The exact seam this rewrite touches: `array_promote` promotes the seeded
+    // prefix sum `out[0]=seed; out[i]=out[i-1]+l[i]` into a single carried array
+    // (original init + carry read `at(arr,i-1)` + own-lane read `at(arr,i)`), and
+    // `loop_to_scan` must then fold it to a `scanl` over the original array. A
+    // recognizer mismatch across the two passes is invisible to their per-pass
+    // tests, so exercise the chain directly.
+    #[test]
+    fn array_promote_then_scan_folds_prefix_sum() {
+        let mut ctx = Context::new();
+        qcode!(
+            ctx,
+            "
+            fn prefix:
+            <entry @seed:i64 @base:i64>
+                %e0 = @seed[0:4];
+                store(ram:4, @base <- %e0);
+                goto <head @i=1 @buf=@base>;
+            <head @i:i64 @buf:i64>
+                %done = @i == 624;
+                if %done goto <exit> else goto <body @j=@i @b=@buf>;
+            <body @j:i64 @b:i64>
+                %jm1 = @j - 1;
+                %roff = %jm1 * 4;
+                %raddr = @b + %roff;
+                %prev = load(ram:4, %raddr);
+                %coff = @j * 4;
+                %caddr = @b + %coff;
+                %cur = load(ram:4, %caddr);
+                %next = %cur + %prev;
+                store(ram:4, %caddr <- %next);
+                %j1 = @j + 1;
+                goto <head @i=%j1 @buf=@b>;
+            <exit>
+                return at i64 0x0;
+            "
+        );
+        assert!(
+            run_function_pass::<ArrayPromote>(&mut ctx, prefix).unwrap(),
+            "array_promote should promote the prefix sum"
+        );
+        assert!(
+            run_function_pass::<LoopToScan>(&mut ctx, prefix).unwrap(),
+            "loop_to_scan should fold the promoted single-array loop"
+        );
+        let ir = format!("{}", Function::from_id(&ctx, prefix));
+        assert!(
+            ir.contains("scanl"),
+            "the promoted loop should fold to a scanl over the original array: {ir}"
+        );
+    }
+}
