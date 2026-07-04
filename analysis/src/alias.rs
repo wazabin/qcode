@@ -1,3 +1,5 @@
+use std::cell::RefCell;
+
 use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
 
 use qcode::{
@@ -13,18 +15,16 @@ use qcode::{
 use crate::gvn::affine::{Numbering, precompute_forms};
 use crate::stack::frame::{FrameClass, frame_class, incoming_sp_param};
 
+mod provenance;
 mod simple;
 
+use provenance::Provenance;
 pub use simple::RegisterBase;
 
 /// Per-function frame-freshness context, precomputed when an [`AliasResult`] is
 /// built with [`AliasResult::with_frame_freshness`]. `None` leaves the rule inert
 /// (hand-built results and callers without a stack-pointer register).
 pub(crate) struct FrameInfo {
-    /// The function this frame belongs to — the key for the
-    /// [`Proposition::ArgsDisjointFromCallerFrame`] truth consulted by the
-    /// assumed caller-frame rule in [`AliasResult::provably_disjoint`].
-    fid: FunctionId,
     /// This function's root (entry) block — a pointer that peels to one of its
     /// params is an *incoming* pointer from the caller.
     root_block: Option<BlockId>,
@@ -35,15 +35,21 @@ pub(crate) struct FrameInfo {
     /// Every value classified as an own-frame local (`@SP`-rooted slot below the
     /// entry stack pointer, or a realigned-frame slot) for this function.
     own_frame_locals: HashSet<ValueId>,
-    /// Every value classified as a *caller-frame* slot (`@SP + k`, `k ≥ 0`: the
-    /// return-address slot and incoming stack arguments). Used only by the
-    /// assumed `ArgsDisjointFromCallerFrame` rule.
-    caller_frame_slots: HashSet<ValueId>,
     /// The function's affine numbering, kept so [`AliasResult::provably_disjoint`]
     /// can classify an *arbitrary* pointer (`@SP ± k`, `@glob + k`, …) on demand —
     /// not just the precomputed own/caller-frame instruction sets — which the
     /// stack-vs-global rule needs for literal and globalized-param pointers.
     numbering: Numbering,
+    /// Hoisted [`Proposition::ArgsDisjointFromCallerFrame`] truth for this
+    /// function — fixed for the lifetime of the result (assumptions are set
+    /// before the result is built).
+    caller_frame_assumed: bool,
+    /// Hoisted [`Proposition::LoadedPointerDisjointFromSlot`] truth.
+    loaded_ptr_assumed: bool,
+    /// Memoized per-value provenance classification (see [`provenance`]). Behind
+    /// a `RefCell` so [`AliasResult::provably_disjoint`] keeps its `&self`
+    /// signature; the result is used single-threaded within a pass.
+    provenance: RefCell<HashMap<ValueId, Provenance>>,
 }
 
 /// Abstract node in the alias graph.
@@ -197,78 +203,9 @@ impl AliasResult {
         let Some(frame) = &self.frame else {
             return false;
         };
-        // Rule 1: own-frame local ⊥ incoming pointer (sound). Strict input-derivation
-        // (no load peeling) keeps this rule a theorem, not an assumption.
-        if (frame.own_frame_locals.contains(&a) && self.is_input_derived(ctx, b, false))
-            || (frame.own_frame_locals.contains(&b) && self.is_input_derived(ctx, a, false))
-        {
-            return true;
-        }
-        // Rule 1b: stack ⊥ static-global. A runtime `@SP`-rooted stack address never
-        // coincides with a fixed absolute address — a global literal `0x…`, or a
-        // *globalized-global* parameter (`@glob_<addr>`, whose `origin` records the
-        // literal it replaced). The live stack and the static image occupy disjoint
-        // regions of the address space, so the two can never name the same byte.
-        // Unlike rule 2 this needs no recorded assumption: it holds in the
-        // decompilation memory model the same way frame freshness (rule 1) does.
-        if (self.is_stack_rooted(ctx, a) && self.is_global_static(ctx, b))
-            || (self.is_stack_rooted(ctx, b) && self.is_global_static(ctx, a))
-        {
-            return true;
-        }
-        // Rule 1c: a globalized-global slot ⊥ a pointer *loaded from it*. `@glob_<addr>`
-        // holds a pointer; a store through `load(@glob) + …` addresses the buffer
-        // behind the pointer, not the pointer slot itself. This is the global-slot
-        // analogue of the caller-frame spilled-pointer reload (rule 2) and rides the
-        // same [`Proposition::LoadedPointerDisjointFromSlot`] assumption — not
-        // statically sound (a self-referential global `*pp == &pp` would break it),
-        // recorded `Assumed`, caught by checkpoint+replay. It lets the in-loop reload
-        // of a globalized pointer forward across the store that writes through it,
-        // which `argpromote` needs to region-promote the buffer behind the global.
-        //
-        // We require an actual `load` on the path (`peels_to_load`), not merely
-        // `is_input_derived`: a `@glob` slot is itself a root param, so the looser
-        // test would wrongly call it disjoint from itself.
-        let loaded_ptr_disjoint = ctx
-            .truth(Proposition::LoadedPointerDisjointFromSlot(frame.fid))
-            .is_some_and(|t| t.value);
-        if loaded_ptr_disjoint
-            && ((self.is_global_static(ctx, a) && self.peels_to_load(ctx, b))
-                || (self.is_global_static(ctx, b) && self.peels_to_load(ctx, a)))
-        {
-            return true;
-        }
-        // Rule 2: caller-frame slot ⊥ incoming pointer, under the recorded
-        // assumption (validated by replay).
-        //
-        // Memory forwarding keys cells by their *affine base*, and every
-        // `@SP ± k` slot collapses to the bare `@SP` param (its base term) — so the
-        // value that actually reaches this query for a stack cell is `sp_param`,
-        // not the `@SP + k` instruction. We therefore also treat `sp_param` itself
-        // as a caller-frame base: `disjoint(incoming_ptr, @SP)` claims the pointer
-        // misses the *whole* own frame, which is the own-frame locals (sound by
-        // rule 1) plus the caller-frame slots (this assumption) — both hold, so the
-        // claim is justified. `caller_frame_slots` still covers the non-affine path
-        // (e.g. a realigned frame) where the instruction value is passed directly.
-        let caller_frame_assumed = ctx
-            .truth(Proposition::ArgsDisjointFromCallerFrame(frame.fid))
-            .is_some_and(|t| t.value);
-        // Under [`Proposition::LoadedPointerDisjointFromSlot`], a value *loaded* from
-        // a slot is treated as carrying incoming-pointer provenance (`peel_loads`):
-        // the spilled-pointer reload idiom, where a buffer pointer is spilled to a
-        // caller-frame slot and reloaded inside a loop. Without it the reload reads
-        // as opaque and blocks forwarding (the deref's base is a `load`, so the loop
-        // store cannot be shown disjoint from the slot). The frame footprint a
-        // loaded pointer is taken disjoint from is the same one rule 2 already
-        // assumes for a direct incoming pointer.
-        let peel_loads = ctx
-            .truth(Proposition::LoadedPointerDisjointFromSlot(frame.fid))
-            .is_some_and(|t| t.value);
-        let is_caller_frame =
-            |v: ValueId| v == frame.sp_param || frame.caller_frame_slots.contains(&v);
-        caller_frame_assumed
-            && ((is_caller_frame(a) && self.is_input_derived(ctx, b, peel_loads))
-                || (is_caller_frame(b) && self.is_input_derived(ctx, a, peel_loads)))
+        let pa = frame.provenance(ctx, a);
+        let pb = frame.provenance(ctx, b);
+        frame.disjoint_by_provenance(pa, pb) || frame.disjoint_by_provenance(pb, pa)
     }
 
     /// Whether `v` is an own-frame local under the populated frame-freshness
@@ -277,139 +214,6 @@ impl AliasResult {
         self.frame
             .as_ref()
             .is_some_and(|f| f.own_frame_locals.contains(&v))
-    }
-
-    /// Whether `v` is a stack-pointer-rooted address (`@SP ± k`, or a realigned
-    /// `(@SP & -mask) ± k`) — i.e. it names a slot in this function's live stack
-    /// frame. Inert without frame-freshness context. Used by the stack-vs-global
-    /// disjointness rule.
-    fn is_stack_rooted(&self, ctx: &Context, v: ValueId) -> bool {
-        self.frame
-            .as_ref()
-            .is_some_and(|f| frame_class(ctx, &f.numbering, f.sp_param, v).is_some())
-    }
-
-    /// Whether `v` is a fixed static/global address: a literal absolute address,
-    /// a *globalized-global* parameter (`@glob_<addr>`, whose `origin` is the
-    /// address literal it replaced — see `argpromote::globals`), or affine
-    /// arithmetic (`base + k`) over either. Such an address lives in the static
-    /// image, never in the live stack.
-    fn is_global_static(&self, ctx: &Context, v: ValueId) -> bool {
-        match v {
-            ValueId::Literal(_) => true,
-            ValueId::BlockParam(pid) => {
-                matches!(
-                    BlockParam::from_id(ctx, pid).origin(),
-                    Some(ValueId::Literal(_))
-                )
-            }
-            _ => self
-                .frame
-                .as_ref()
-                .and_then(|f| f.numbering.base_offset(v))
-                .is_some_and(|(base, _)| base != v && self.is_global_static(ctx, base)),
-        }
-    }
-
-    /// Whether `v` is *input-derived*: it peels — through address arithmetic
-    /// (`add`/`sub` of an offset) and width casts (`zext`/`sext`/`range`) — to a
-    /// parameter of this function's root block, i.e. a value that entered from the
-    /// caller. The `add`/`sub` peel bails if either operand is itself an own-frame
-    /// local, so a nonsensical `local + arg` mix is never read as input.
-    /// With `peel_loads`, a `load(…)` also counts as input-derived (a reloaded
-    /// spilled pointer carries incoming provenance) — see rule 2 / the
-    /// [`Proposition::LoadedPointerDisjointFromSlot`] assumption.
-    fn is_input_derived(&self, ctx: &Context, v: ValueId, peel_loads: bool) -> bool {
-        let Some(frame) = &self.frame else {
-            return false;
-        };
-        self.is_input_derived_rec(ctx, frame, v, peel_loads, &mut HashSet::default())
-    }
-
-    /// Whether `v` is a pointer obtained from the *contents of a slot* — through
-    /// pointer arithmetic (`add`/`sub`) and width casts — i.e. a buffer pointer read
-    /// out of a slot and then indexed. Two provenances qualify:
-    ///   * an actual `load(…)` on the path (the reloaded pointer), or
-    ///   * a by-value snapshot param whose `origin` is a global-static slot param —
-    ///     `argpromote`'s partial-promotion materialization of `*slot` (see
-    ///     `apply_partial`), which equals the loaded pointer by construction.
-    ///
-    /// Unlike [`is_input_derived`] (which stops at any root param), this requires one
-    /// of those load provenances, so a bare slot address is never mistaken for a
-    /// pointer loaded *from* it. Used by the globalized-global slot rule in
-    /// [`AliasResult::provably_disjoint`].
-    fn peels_to_load(&self, ctx: &Context, v: ValueId) -> bool {
-        self.peels_to_load_rec(ctx, v, &mut HashSet::default())
-    }
-
-    fn peels_to_load_rec(&self, ctx: &Context, v: ValueId, seen: &mut HashSet<ValueId>) -> bool {
-        if !seen.insert(v) {
-            return false;
-        }
-        match v {
-            // A partial-promotion snapshot of `*slot` (origin = the global slot param)
-            // — materialized loaded pointer. The `BlockParam` origin distinguishes it
-            // from the slot itself (whose origin is the address *literal*).
-            ValueId::BlockParam(pid) => matches!(
-                BlockParam::from_id(ctx, pid).origin(),
-                Some(o @ ValueId::BlockParam(_)) if self.is_global_static(ctx, o)
-            ),
-            ValueId::Instruction(id) => match Instruction::from_id(ctx, id).mnemonic() {
-                Mnemonic::Load(_) => true,
-                Mnemonic::Binop(b) if matches!(b.op, Binop::Int(IntBinop::Add | IntBinop::Sub)) => {
-                    self.peels_to_load_rec(ctx, b.lhs, seen)
-                        || self.peels_to_load_rec(ctx, b.rhs, seen)
-                }
-                Mnemonic::Zext(z) => self.peels_to_load_rec(ctx, z.src, seen),
-                Mnemonic::Sext(s) => self.peels_to_load_rec(ctx, s.src, seen),
-                Mnemonic::Range(r) => self.peels_to_load_rec(ctx, r.src, seen),
-                _ => false,
-            },
-            _ => false,
-        }
-    }
-
-    fn is_input_derived_rec(
-        &self,
-        ctx: &Context,
-        frame: &FrameInfo,
-        v: ValueId,
-        peel_loads: bool,
-        seen: &mut HashSet<ValueId>,
-    ) -> bool {
-        if !seen.insert(v) {
-            return false;
-        }
-        match v {
-            // A root-block param other than `@SP` is a caller-supplied pointer.
-            ValueId::BlockParam(id) => {
-                v != frame.sp_param
-                    && BlockParam::from_id(ctx, id)
-                        .parent()
-                        .is_some_and(|b| frame.root_block == Some(b.id))
-            }
-            ValueId::Instruction(id) => match Instruction::from_id(ctx, id).mnemonic() {
-                // A reloaded spilled pointer: assumed to carry incoming provenance
-                // (gated by the caller via `peel_loads`).
-                Mnemonic::Load(_) if peel_loads => true,
-                Mnemonic::Binop(b) if matches!(b.op, Binop::Int(IntBinop::Add | IntBinop::Sub)) => {
-                    if frame.own_frame_locals.contains(&b.lhs)
-                        || frame.own_frame_locals.contains(&b.rhs)
-                    {
-                        return false;
-                    }
-                    self.is_input_derived_rec(ctx, frame, b.lhs, peel_loads, seen)
-                        || self.is_input_derived_rec(ctx, frame, b.rhs, peel_loads, seen)
-                }
-                Mnemonic::Zext(z) => self.is_input_derived_rec(ctx, frame, z.src, peel_loads, seen),
-                Mnemonic::Sext(s) => self.is_input_derived_rec(ctx, frame, s.src, peel_loads, seen),
-                Mnemonic::Range(r) => {
-                    self.is_input_derived_rec(ctx, frame, r.src, peel_loads, seen)
-                }
-                _ => false,
-            },
-            _ => false,
-        }
     }
 
     /// Populate the frame-freshness oracle for function `fid`, given the
@@ -430,31 +234,174 @@ impl AliasResult {
         };
         let numbering = precompute_forms(ctx, fid);
         let mut own_frame_locals = HashSet::default();
-        let mut caller_frame_slots = HashSet::default();
         for block in Function::from_id(ctx, fid).blocks() {
             for insn in block.iter() {
                 let v = ValueId::Instruction(insn.id);
-                match frame_class(ctx, &numbering, sp, v) {
-                    Some(FrameClass::Local) => {
-                        own_frame_locals.insert(v);
-                    }
-                    Some(FrameClass::CallerFrame) => {
-                        caller_frame_slots.insert(v);
-                    }
-                    None => {}
+                if let Some(FrameClass::Local) = frame_class(ctx, &numbering, sp, v) {
+                    own_frame_locals.insert(v);
                 }
             }
         }
         let root_block = Function::from_id(ctx, fid).root().map(|r| r.id);
+        // Hoist the assumption lookups: they are fixed once the result is built
+        // (a pass sets assumptions before building the oracle). A test that flips
+        // an assumption after building must rebuild the result.
+        let caller_frame_assumed = ctx
+            .truth(Proposition::ArgsDisjointFromCallerFrame(fid))
+            .is_some_and(|t| t.value);
+        let loaded_ptr_assumed = ctx
+            .truth(Proposition::LoadedPointerDisjointFromSlot(fid))
+            .is_some_and(|t| t.value);
         self.frame = Some(FrameInfo {
-            fid,
             root_block,
             sp_param: sp,
             own_frame_locals,
-            caller_frame_slots,
             numbering,
+            caller_frame_assumed,
+            loaded_ptr_assumed,
+            provenance: RefCell::new(HashMap::default()),
         });
         self
+    }
+}
+
+impl FrameInfo {
+    /// Provenance of `v`, memoized. A peel cycle contributes nothing: the
+    /// in-progress value is seeded with the empty set before recursing, then
+    /// overwritten with the final classification.
+    fn provenance(&self, ctx: &Context, v: ValueId) -> Provenance {
+        if let Some(&p) = self.provenance.borrow().get(&v) {
+            return p;
+        }
+        self.provenance
+            .borrow_mut()
+            .insert(v, Provenance::default());
+        let p = self.classify(ctx, v);
+        self.provenance.borrow_mut().insert(v, p);
+        p
+    }
+
+    /// The uncached classification of `v` — the union over its peel tree (see
+    /// [`Provenance`]).
+    fn classify(&self, ctx: &Context, v: ValueId) -> Provenance {
+        use Provenance as P;
+        // Stack provenance first: `@SP ± k`, realigned frames, and the bare `@SP`
+        // param (offset 0 → caller frame).
+        if let Some(fc) = frame_class(ctx, &self.numbering, self.sp_param, v) {
+            return match fc {
+                FrameClass::Local => P::OWN_FRAME,
+                FrameClass::CallerFrame => P::CALLER_FRAME,
+            };
+        }
+        match v {
+            ValueId::Literal(_) => P::GLOBAL_STATIC,
+            ValueId::BlockParam(pid) => {
+                let bp = BlockParam::from_id(ctx, pid);
+                match bp.origin() {
+                    // A globalized-global slot (`@glob_<addr>`): origin is the literal.
+                    Some(ValueId::Literal(_)) => P::GLOBAL_STATIC,
+                    // A partial-promotion snapshot of `*slot` (origin = the global
+                    // slot param) — the materialized loaded pointer.
+                    Some(o @ ValueId::BlockParam(_))
+                        if self.provenance(ctx, o).is_pure(P::GLOBAL_STATIC) =>
+                    {
+                        P::LOADED
+                    }
+                    // A non-`@SP` root-block param is a caller-supplied pointer.
+                    _ if v != self.sp_param
+                        && bp.parent().is_some_and(|b| self.root_block == Some(b.id)) =>
+                    {
+                        P::INPUT
+                    }
+                    _ => P::OPAQUE,
+                }
+            }
+            ValueId::Instruction(id) => match Instruction::from_id(ctx, id).mnemonic() {
+                Mnemonic::Load(_) => P::LOADED,
+                Mnemonic::Zext(z) => self.provenance(ctx, z.src),
+                Mnemonic::Sext(s) => self.provenance(ctx, s.src),
+                Mnemonic::Range(r) => self.provenance(ctx, r.src),
+                Mnemonic::Binop(b)
+                    if matches!(b.op, Binop::Int(IntBinop::Add | IntBinop::Sub)) =>
+                {
+                    self.peel_addsub(ctx, b.lhs, b.rhs)
+                }
+                // Affine `base + const` over a global base — the old
+                // `is_global_static` fallback for a global reached via a non-add op.
+                _ => {
+                    if let Some((base, _)) = self.numbering.base_offset(v)
+                        && base != v
+                        && self.provenance(ctx, base).is_pure(P::GLOBAL_STATIC)
+                    {
+                        P::GLOBAL_STATIC
+                    } else {
+                        P::OPAQUE
+                    }
+                }
+            },
+            _ => P::OPAQUE,
+        }
+    }
+
+    /// Union the provenance of an add/sub's operands, dropping constant offsets
+    /// (literals) and pure-opaque scalar terms (a strided index, an unclassifiable
+    /// non-pointer). Both are *offsets*, not sources of the pointer, so they must
+    /// not poison the result — matching the old peel, which contributed nothing
+    /// for such operands.
+    fn peel_addsub(&self, ctx: &Context, lhs: ValueId, rhs: ValueId) -> Provenance {
+        use Provenance as P;
+        let mut acc = P::default();
+        for operand in [lhs, rhs] {
+            if matches!(operand, ValueId::Literal(_)) {
+                continue;
+            }
+            let p = self.provenance(ctx, operand);
+            if p.is_pure(P::OPAQUE) {
+                continue;
+            }
+            acc = acc.union(p);
+        }
+        if acc.is_empty() { P::OPAQUE } else { acc }
+    }
+
+    /// Whether an `x`-provenance pointer is disjoint from a `y`-provenance one
+    /// (asymmetric; callers try both orders). See [`AliasResult::provably_disjoint`].
+    fn disjoint_by_provenance(&self, px: Provenance, py: Provenance) -> bool {
+        use Provenance as P;
+        // Rule 1 (sound): own-frame local ⊥ a pure incoming pointer. The callee's
+        // frame is younger than anything the caller could already name.
+        if px.is_pure(P::OWN_FRAME) && py.is_pure(P::INPUT) {
+            return true;
+        }
+        // Rule 1b (sound): a stack address ⊥ a static-global address — the live
+        // stack and the static image occupy disjoint regions.
+        if px.is_nonempty_subset_of(P::OWN_FRAME.union(P::CALLER_FRAME))
+            && py.is_pure(P::GLOBAL_STATIC)
+        {
+            return true;
+        }
+        // Rule 1c (assumed): a globalized-global slot ⊥ a pointer *loaded from it*.
+        // Excludes a slot from itself (a bare global has no LOADED bit) and mixed
+        // `load(x) + @glob2` shapes (the global bit may re-enter the static image).
+        if self.loaded_ptr_assumed
+            && px.is_pure(P::GLOBAL_STATIC)
+            && py.contains(P::LOADED)
+            && !py.contains(P::OPAQUE)
+            && !py.contains(P::GLOBAL_STATIC)
+        {
+            return true;
+        }
+        // Rule 2 (assumed): a caller-frame slot ⊥ an incoming pointer, and — under
+        // the loaded-pointer assumption — a pointer reloaded from a slot.
+        if self.caller_frame_assumed && px.is_pure(P::CALLER_FRAME) {
+            if py.is_pure(P::INPUT) {
+                return true;
+            }
+            if self.loaded_ptr_assumed && py.is_nonempty_subset_of(P::INPUT.union(P::LOADED)) {
+                return true;
+            }
+        }
+        false
     }
 }
 
@@ -733,8 +680,11 @@ mod tests {
             "no disjointness without LoadedPointerDisjointFromSlot"
         );
 
+        // The assumption is hoisted at build time, so rebuild the result after
+        // recording it.
         tc.ctx
             .assume_true(Proposition::LoadedPointerDisjointFromSlot(fid));
+        let r = AliasResult::simple(&tc.ctx).with_frame_freshness(&tc.ctx, fid, Some(sp_reg));
         assert!(
             r.provably_disjoint(&tc.ctx, glob, store_addr),
             "@glob ⊥ a store through load(@glob) under the assumption"
@@ -855,8 +805,10 @@ mod tests {
             "caller-frame slot is not statically disjoint from an incoming pointer"
         );
 
+        // The assumption is hoisted at build time, so rebuild after recording it.
         tc.ctx
             .assume_true(Proposition::ArgsDisjointFromCallerFrame(fid));
+        let r = AliasResult::simple(&tc.ctx).with_frame_freshness(&tc.ctx, fid, Some(sp_reg));
 
         assert!(
             r.provably_disjoint(&tc.ctx, caller_arg, arg),
@@ -869,6 +821,171 @@ mod tests {
         assert!(
             !r.provably_disjoint(&tc.ctx, caller_arg, sp),
             "@SP is a frame pointer, not an incoming data pointer"
+        );
+    }
+
+    /// Soundness tightening (review item 3): a pointer with *mixed* input and
+    /// stack provenance (`arg + (sp - arg)`) is no longer treated as a pure
+    /// incoming pointer, so it is not called disjoint from an own-frame local.
+    /// A bare `arg + const` still is (guards against over-tightening).
+    #[test]
+    fn mixed_input_and_stack_is_not_input_derived() {
+        use qcode::{
+            builder::Builder,
+            testing::TestContext,
+            value::{BasicBlock, Function},
+        };
+
+        let mut tc = TestContext::new();
+        let sp_reg = tc.r0;
+        let fid = Function::make(&mut tc.ctx, "f".into()).unwrap().id;
+        let root = tc.ctx.get_or_make_block(0x1000);
+        {
+            let mut f = Function::from_id_mut(&mut tc.ctx, fid);
+            f.set_root(root).unwrap();
+            f.add_block(root);
+        }
+        let sp_pid = BasicBlock::from_id_mut(&mut tc.ctx, root).push_param(8).id;
+        tc.ctx.values.block_params[sp_pid].origin = Some(ValueId::Varnode(sp_reg));
+        let sp = ValueId::BlockParam(sp_pid);
+        let arg_pid = BasicBlock::from_id_mut(&mut tc.ctx, root).push_param(8).id;
+        let arg = ValueId::BlockParam(arg_pid);
+
+        let (local, mix, arg_plus) = {
+            let mut b = Builder::from_block(BasicBlock::from_id_mut(&mut tc.ctx, root));
+            let c8 = b.context_mut().get_const(8, 8).id();
+            let local = b.push_sub(sp, c8).id(); // @SP - 8  (own-frame local)
+            let sp_minus_arg = b.push_sub(sp, arg).id(); // sp - arg  (mixed)
+            let mix = b.push_add(arg, sp_minus_arg).id(); // arg + (sp - arg)
+            let arg_plus = b.push_add(arg, c8).id(); // arg + 8  (pure input)
+            unsafe { b.dont_finalize() };
+            (local, mix, arg_plus)
+        };
+
+        let r = AliasResult::simple(&tc.ctx).with_frame_freshness(&tc.ctx, fid, Some(sp_reg));
+
+        assert!(
+            !r.provably_disjoint(&tc.ctx, local, mix),
+            "a mixed input/stack pointer is not a pure incoming pointer"
+        );
+        assert!(
+            r.provably_disjoint(&tc.ctx, local, arg_plus),
+            "arg + const is still a pure incoming pointer (not over-tightened)"
+        );
+    }
+
+    /// Load poisoning: `arg + load(p)` carries both `INPUT` and `LOADED`, so it
+    /// is only disjoint from a caller-frame slot when *both* the caller-frame and
+    /// loaded-pointer assumptions are recorded, and never from an own-frame local
+    /// with no assumptions.
+    #[test]
+    fn input_plus_load_needs_both_assumptions() {
+        use qcode::{
+            assumption::Proposition,
+            builder::Builder,
+            testing::TestContext,
+            value::{BasicBlock, Function, Value},
+        };
+
+        let mut tc = TestContext::new();
+        let sp_reg = tc.r0;
+        let fid = Function::make(&mut tc.ctx, "f".into()).unwrap().id;
+        let root = tc.ctx.get_or_make_block(0x1000);
+        {
+            let mut f = Function::from_id_mut(&mut tc.ctx, fid);
+            f.set_root(root).unwrap();
+            f.add_block(root);
+        }
+        let sp_pid = BasicBlock::from_id_mut(&mut tc.ctx, root).push_param(8).id;
+        tc.ctx.values.block_params[sp_pid].origin = Some(ValueId::Varnode(sp_reg));
+        let sp = ValueId::BlockParam(sp_pid);
+        let arg_pid = BasicBlock::from_id_mut(&mut tc.ctx, root).push_param(8).id;
+        let arg = ValueId::BlockParam(arg_pid);
+        let p_pid = BasicBlock::from_id_mut(&mut tc.ctx, root).push_param(8).id;
+        let p = ValueId::BlockParam(p_pid);
+
+        let ram = tc.ctx.default_space;
+        let (local, caller_arg, mix) = {
+            let mut b = Builder::from_block(BasicBlock::from_id_mut(&mut tc.ctx, root));
+            let c8 = b.context_mut().get_const(8, 8).id();
+            let local = b.push_sub(sp, c8).id(); // @SP - 8 (own-frame local)
+            let caller_arg = b.push_add(sp, c8).id(); // @SP + 8 (caller frame)
+            let loaded = b.push_load::<false>(p, 8, ram).id(); // load(p)
+            let mix = b.push_add(arg, loaded).id(); // arg + load(p)
+            unsafe { b.dont_finalize() };
+            (local, caller_arg, mix)
+        };
+
+        // No assumptions: not disjoint from an own-frame local.
+        let r = AliasResult::simple(&tc.ctx).with_frame_freshness(&tc.ctx, fid, Some(sp_reg));
+        assert!(!r.provably_disjoint(&tc.ctx, local, mix));
+        assert!(!r.provably_disjoint(&tc.ctx, caller_arg, mix));
+
+        // Only the caller-frame assumption: still opaque (the load is not admitted).
+        tc.ctx
+            .assume_true(Proposition::ArgsDisjointFromCallerFrame(fid));
+        let r = AliasResult::simple(&tc.ctx).with_frame_freshness(&tc.ctx, fid, Some(sp_reg));
+        assert!(
+            !r.provably_disjoint(&tc.ctx, caller_arg, mix),
+            "the loaded operand is not admitted without LoadedPointerDisjointFromSlot"
+        );
+
+        // Both assumptions: the caller-frame slot is disjoint from arg + load(p).
+        tc.ctx
+            .assume_true(Proposition::LoadedPointerDisjointFromSlot(fid));
+        let r = AliasResult::simple(&tc.ctx).with_frame_freshness(&tc.ctx, fid, Some(sp_reg));
+        assert!(
+            r.provably_disjoint(&tc.ctx, caller_arg, mix),
+            "@SP+8 ⊥ arg + load(p) under both assumptions"
+        );
+    }
+
+    /// Memoization smoke: a repeated query on a deep peel chain must not grow the
+    /// memo table on the second call (every value is classified once).
+    #[test]
+    fn provenance_is_memoized() {
+        use qcode::{
+            builder::Builder,
+            testing::TestContext,
+            value::{BasicBlock, Function},
+        };
+
+        let mut tc = TestContext::new();
+        let sp_reg = tc.r0;
+        let fid = Function::make(&mut tc.ctx, "f".into()).unwrap().id;
+        let root = tc.ctx.get_or_make_block(0x1000);
+        {
+            let mut f = Function::from_id_mut(&mut tc.ctx, fid);
+            f.set_root(root).unwrap();
+            f.add_block(root);
+        }
+        let sp_pid = BasicBlock::from_id_mut(&mut tc.ctx, root).push_param(8).id;
+        tc.ctx.values.block_params[sp_pid].origin = Some(ValueId::Varnode(sp_reg));
+        let sp = ValueId::BlockParam(sp_pid);
+        let arg_pid = BasicBlock::from_id_mut(&mut tc.ctx, root).push_param(8).id;
+        let arg = ValueId::BlockParam(arg_pid);
+
+        let (local, deep) = {
+            let mut b = Builder::from_block(BasicBlock::from_id_mut(&mut tc.ctx, root));
+            let c8 = b.context_mut().get_const(8, 8).id();
+            let local = b.push_sub(sp, c8).id();
+            // A deep peel chain over the incoming arg.
+            let mut deep = arg;
+            for _ in 0..8 {
+                deep = b.push_add(deep, c8).id();
+            }
+            unsafe { b.dont_finalize() };
+            (local, deep)
+        };
+
+        let r = AliasResult::simple(&tc.ctx).with_frame_freshness(&tc.ctx, fid, Some(sp_reg));
+        assert!(r.provably_disjoint(&tc.ctx, local, deep));
+        let after_first = r.frame.as_ref().unwrap().provenance.borrow().len();
+        assert!(r.provably_disjoint(&tc.ctx, local, deep));
+        let after_second = r.frame.as_ref().unwrap().provenance.borrow().len();
+        assert_eq!(
+            after_first, after_second,
+            "the second query classifies nothing new"
         );
     }
 }
