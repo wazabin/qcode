@@ -274,8 +274,7 @@ fn two_literal_pointers_different_spaces_do_not_alias() {
 }
 
 #[test]
-#[should_panic(expected = "used in multiple spaces")]
-fn same_pointer_used_in_multiple_spaces_panics() {
+fn same_pointer_used_in_multiple_spaces_degrades_to_unknown() {
     let mut ctx = Context::new();
     let reg_space = make_space(&mut ctx, "register");
     let alt_space = make_space(&mut ctx, "other");
@@ -289,7 +288,46 @@ fn same_pointer_used_in_multiple_spaces_panics() {
     unsafe { builder.dont_finalize() };
     drop(builder);
 
-    let _ = AliasResult::simple(&ctx);
+    // A literal interned across two spaces must not panic; the pointer degrades
+    // to Unknown (may-alias everything) rather than killing the process.
+    let result = AliasResult::simple(&ctx);
+    assert_eq!(result.alias_class(ptr), Some(NodeId::Unknown));
+}
+
+#[test]
+fn odd_pointer_arithmetic_degrades_to_unknown() {
+    // r = sub(a, b) with both operands in the access space, then load(r) in that
+    // same space: hits the "odd pointer arithmetic" branch, which must degrade to
+    // Unknown rather than panic.
+    let mut vn_a = None;
+    let mut vn_b = None;
+    let mut r = None;
+
+    let (ctx, _, _) = build_in_custom_space(|builder, space| {
+        let a_id = Varnode::make(builder.context_mut(), 0, 8, space).id;
+        let b_id = Varnode::make(builder.context_mut(), 8, 8, space).id;
+        let sub = builder
+            .push_sub(a_id.into(), b_id.into())
+            .id()
+            .as_instruction()
+            .expect("push_sub yields an instruction");
+        builder.push_load::<false>(sub.into(), 8, space);
+
+        vn_a = Some(a_id);
+        vn_b = Some(b_id);
+        r = Some(sub);
+    });
+
+    let vn_a = vn_a.unwrap();
+    let r = r.unwrap();
+    let _ = vn_b;
+    let result = AliasResult::simple(&ctx);
+
+    assert_eq!(result.alias_class(r.into()), Some(NodeId::Unknown));
+    assert!(
+        result.may_alias(&ctx, r.into(), vn_a.into()),
+        "an Unknown pointer conservatively may-aliases the operand varnode"
+    );
 }
 
 #[test]

@@ -195,11 +195,14 @@ impl<'a> Analysis<'a> {
                     let vn = Varnode::from_id(self.ctx, id);
                     (vn.space().id, vn.address() as u64, vn.size() as u64)
                 };
-                assert_eq!(
-                    varnode_space_id, space,
-                    "load/store pointer varnodes must stay in the access space; \
-                     builder.rs::push_load documents this IR invariant"
-                );
+                if varnode_space_id != space {
+                    log::error!(
+                        "alias: load/store pointer varnode {value} lives in space {varnode_space_id:?} \
+                         but the access is in {space:?}; degrading to Unknown (IR invariant from \
+                         builder::push_load violated)"
+                    );
+                    return NodeId::Unknown;
+                }
                 self.value_to_interval
                     .insert(value, (space, start, start + vn_size));
                 let root = self.lookup_root(value);
@@ -242,9 +245,10 @@ impl<'a> Analysis<'a> {
                 } else if lhs_space.is_none() && rhs_space.is_none() {
                     NodeId::Unknown
                 } else {
-                    panic!(
-                        "Odd pointer arithmetic: {value} = {lhs} {op} {rhs} with mismatched spaces {lhs_space:?} vs {rhs_space:?}"
+                    log::error!(
+                        "Odd pointer arithmetic: {value} = {lhs} {op} {rhs} with mismatched spaces {lhs_space:?} vs {rhs_space:?}; degrading to Unknown"
                     );
+                    NodeId::Unknown
                 }
             }
 
@@ -385,11 +389,18 @@ impl RegisterBase {
         let mut pointer_spaces: HashMap<ValueId, SpaceId> = HashMap::default();
 
         for (ptr, space, size) in pointer_uses {
-            if let Some(existing_space) = pointer_spaces.insert(ptr, space) {
-                assert_eq!(
-                    existing_space, space,
-                    "simple alias analysis invariant violated: pointer {ptr} used in multiple spaces ({existing_space:?} vs {space:?})"
+            if let Some(existing_space) = pointer_spaces.insert(ptr, space)
+                && existing_space != space
+            {
+                log::warn!(
+                    "alias: pointer {ptr} used in multiple spaces ({existing_space:?} vs {space:?}); \
+                     degrading to Unknown"
                 );
+                a.set_value_root(ptr, NodeId::Unknown);
+                // Also drop any exact interval recorded under the other space — it no
+                // longer identifies a unique location.
+                a.value_to_interval.remove(&ptr);
+                continue;
             }
 
             let root = a.resolve_pointer_root(ptr, space, size);
