@@ -104,6 +104,13 @@ struct Analysis<'a> {
     /// Literal-pointer ranges encountered during pointer resolution; grows as loads/stores are processed.
     literal_ranges: HashMap<SpaceId, Vec<SizedNode>>,
 
+    /// The canonical root assigned to each distinct literal pointer on its first
+    /// sight, so repeated uses of the same interned literal short-circuit instead
+    /// of re-scanning every varnode and previously-seen range (the O(uses²) term).
+    /// The stored node is canonicalized through `uf` on lookup, so it reflects any
+    /// merges recorded after first sight.
+    literal_roots: HashMap<ValueId, NodeId>,
+
     /// Exact `(space, byte_start, byte_end)` for pointer values whose location
     /// was resolved to a concrete varnode or literal address.
     value_to_interval: HashMap<ValueId, (SpaceId, u64, u64)>,
@@ -143,6 +150,13 @@ impl<'a> Analysis<'a> {
     /// Assigns a union-find root to `literal` as a pointer into `space`, merging it
     /// with any varnode or previously-seen literal range whose address interval overlaps.
     fn assign_literal_root(&mut self, literal: ValueId, space: SpaceId, size: usize) -> NodeId {
+        // A literal seen before was already merged with every overlapping varnode
+        // and range on first sight; its class is stable modulo later joins, which
+        // `canonical_root` reflects. Short-circuit the full rescan.
+        if let Some(&root) = self.literal_roots.get(&literal) {
+            return self.canonical_root(root);
+        }
+
         let Some((start, end)) = literal_interval(self.ctx, literal, size) else {
             return NodeId::Unknown;
         };
@@ -178,6 +192,7 @@ impl<'a> Analysis<'a> {
             .push(SizedNode { root, start, end });
 
         self.value_to_interval.insert(literal, (space, start, end));
+        self.literal_roots.insert(literal, root);
 
         root
     }
@@ -443,6 +458,7 @@ impl RegisterBase {
             value_to_root: self.value_to_root.clone(),
             by_space: &self.by_space,
             literal_ranges: HashMap::default(),
+            literal_roots: HashMap::default(),
             value_to_interval: HashMap::default(),
             uf: self.uf.clone(),
         };

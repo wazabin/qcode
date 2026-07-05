@@ -235,6 +235,43 @@ fn non_align_mask_does_not_peel() {
     );
 }
 
+/// Repeated uses of the same interned literal are deduped (short-circuited) yet
+/// still merge with an overlapping varnode and a *later* overlapping literal, so
+/// the dedup does not change the resulting alias classes.
+#[test]
+fn repeated_literal_uses_share_one_range_entry() {
+    let mut a_id = None;
+    let mut l1 = None;
+    let mut l2 = None;
+    let (ctx, _, _) = build_in_custom_space(|b, space| {
+        let a = Varnode::make(b.context_mut(), 0, 8, space).id;
+        let p1 = b.context_mut().get_const(4, 8).id(); // [4,12) overlaps A [0,8)
+        let p2 = b.context_mut().get_const(6, 8).id(); // [6,14) overlaps p1
+        b.push_load::<false>(p1, 8, space);
+        b.push_load::<false>(p1, 8, space); // same literal reused
+        b.push_load::<false>(p2, 8, space);
+        a_id = Some(a);
+        l1 = Some(p1);
+        l2 = Some(p2);
+    });
+    let a = a_id.unwrap();
+    let l1 = l1.unwrap();
+    let l2 = l2.unwrap();
+    let result = AliasResult::simple(&ctx);
+
+    assert!(result.may_alias(&ctx, l1, a.into()), "l1 overlaps A");
+    assert!(
+        result.may_alias(&ctx, l1, l2),
+        "a later overlapping literal still merges with the deduped one"
+    );
+    assert_eq!(
+        result.alias_class(l1),
+        result.alias_class(l2),
+        "all overlapping literals share one class"
+    );
+    assert_eq!(result.alias_class(l1), result.alias_class(a.into()));
+}
+
 #[test]
 fn literal_straddles_two_disjoint_varnode_classes_joins_them() {
     let mut a = None;
