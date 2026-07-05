@@ -127,6 +127,8 @@ fn simplify_at(
             }
             // A one-lane array has only lane 0 (any other index is UB anyway).
             "singleton" => Some(Simplified::Value(args[0])),
+            // Every lane of `splat(v, n)` is `v`, regardless of the index.
+            "splat" => Some(Simplified::Value(args[0])),
             // `at(concat(a, b), const j)`: pick the side `j` falls in.
             "concat" => {
                 let (a, b) = (args[0], args[1]);

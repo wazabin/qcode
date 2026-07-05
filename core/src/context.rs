@@ -189,19 +189,6 @@ impl<'str> Context<'str> {
         self.spaces.push(space)
     }
 
-    /// Creates a new unnamed RAM address space and returns its ID. Unlike
-    /// [`make_temp_space`](Self::make_temp_space), the result is typed
-    /// [`SpaceType::Ram`](crate::space::SpaceType::Ram) so that RAM-aware passes
-    /// (alias analysis, `array_promote`, …) treat it as memory. Used for the
-    /// argpromote shadow, which stands in for the real RAM the promoted pointers
-    /// address rather than for builder scratch.
-    pub fn make_ram_space(&mut self) -> SpaceId {
-        let default_space = &self.spaces[self.default_space];
-        let mut space = Space::new(None, default_space.word_size, default_space.addr_size);
-        space.ty = crate::space::SpaceType::Ram;
-        self.spaces.push(space)
-    }
-
     /// Adds a space to the context, registering its name, and returns its ID.
     pub fn add_space(&mut self, space: Space) -> SpaceId {
         let name_key: Option<Box<str>> = space.name.clone();
@@ -1611,8 +1598,10 @@ mod tests {
     #[test]
     fn assume_executable_narrows_once_protections_known() {
         let mut ctx = Context::new();
-        ctx.memory_image.add_segment(0x1000, vec![0u8; 4], true, false); // code
-        ctx.memory_image.add_segment(0x2000, vec![0u8; 4], false, true); // data
+        ctx.memory_image
+            .add_segment(0x1000, vec![0u8; 4], true, false); // code
+        ctx.memory_image
+            .add_segment(0x2000, vec![0u8; 4], false, true); // data
 
         // Default r/x while protections unknown: everything is permissive, even
         // unmapped (the lifter reads bytes from the format, not the image).
@@ -1643,8 +1632,10 @@ mod tests {
     #[test]
     fn assume_executable_honors_region_override() {
         let mut ctx = Context::new();
-        ctx.memory_image.add_segment(0x1000, vec![0u8; 4], true, false); // code
-        ctx.memory_image.add_segment(0x2000, vec![0u8; 4], false, true); // data
+        ctx.memory_image
+            .add_segment(0x1000, vec![0u8; 4], true, false); // code
+        ctx.memory_image
+            .add_segment(0x2000, vec![0u8; 4], false, true); // data
         ctx.mark_protections_known();
 
         // Force the data region executable and the code region non-executable.

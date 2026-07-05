@@ -22,4 +22,5 @@ mod iota;
 mod len;
 mod rotate;
 mod singleton;
+mod splat;
 mod take_while;

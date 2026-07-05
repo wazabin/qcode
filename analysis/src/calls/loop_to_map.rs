@@ -28,9 +28,10 @@ use qcode::{
     },
 };
 
-use crate::gvn::affine::precompute_forms;
-use crate::sequence::{affine_base_const, affine_strided_lane};
-use crate::value_range;
+use super::carried_array::{
+    CarriedArray, classify_body_reads, exit_view, find_carried_array, incoming, is_increment,
+    literal, param_parent, param_pos,
+};
 use crate::{Pass, PipelineEnv};
 
 /// Whether `m` is a pure value-computing op that may appear inside an outlined
@@ -128,25 +129,34 @@ pub(crate) fn outline_expression(
 /// `result` is cloned. This is the body shape for a `map` over `enumerate(arr)`
 /// (rather than over `arr`) — a unary body whose element is the index/value pair.
 ///
-/// Returns `None` if the expression is not closed over `(index, elem)` + literals
+/// `elem_input` is `None` for a pure index-driven generation whose body reads the
+/// index but not the lane element (the `t.1` extract is then omitted); the map
+/// still ranges over `enumerate(arr)` so the body receives the index in `t.0`.
+///
+/// Returns `None` if the expression is not closed over `(index, elem?)` + literals
 /// (see [`pure_slice`]).
 pub(crate) fn outline_tupled(
     ctx: &mut Context,
     name: &str,
     result: ValueId,
     index_input: ValueId,
-    elem_input: ValueId,
+    elem_input: Option<ValueId>,
     tuple_ty: TypeId,
 ) -> Option<FunctionId> {
-    let slice = pure_slice(ctx, result, &[index_input, elem_input])?;
+    let mut inputs = vec![index_input];
+    inputs.extend(elem_input);
+    let slice = pure_slice(ctx, result, &inputs)?;
     outline_core(ctx, name, result, &slice, move |ctx, root| {
         let mut value_map: HashMap<ValueId, ValueId> = HashMap::default();
         let tsz = ctx.types.size_of(tuple_ty);
         let pid = BasicBlock::from_id_mut(ctx, root).push_param(tsz).id;
         ctx.values.block_params[pid].type_id = tuple_ty;
         let tuple = ValueId::BlockParam(pid);
-        // index = t.0, elem = t.1 — the two extracts the body unpacks.
-        for (field, input) in [(0usize, index_input), (1usize, elem_input)] {
+        // index = t.0, elem = t.1 — the extracts the body unpacks. `elem` is only
+        // extracted when the body actually consumes the lane element.
+        let fields = [(0usize, Some(index_input)), (1usize, elem_input)];
+        for (field, input) in fields {
+            let Some(input) = input else { continue };
             let fty = ctx
                 .types
                 .field_type(tuple_ty, field)
@@ -170,17 +180,11 @@ pub(crate) fn outline_tupled(
 /// How a [`Scan`](qcode::value::insn::Scan) body receives its per-lane input
 /// (param 1), which the body turns into the loop index.
 ///
-/// - [`Tuple`](ScanElem::Tuple): the source is `enumerate(arr)`, so param 1 is an
-///   `(index, elem)` tuple; the index is `Extract(t, 0)` and the data lane
-///   `Extract(t, 1)`. Used by the shadow-shape recognizer, whose scan ranges over
-///   a real data array.
 /// - [`Scalar`](ScanElem::Scalar): the source is a bare index driver (an `iota`),
 ///   so param 1 *is* the index element directly. There is no data lane, so the
 ///   only array the scan touches is the freshly-built `iota` — no original memory
 ///   is read. Used by [`loop_to_scan`](crate::calls::loop_to_scan).
 pub(crate) enum ScanElem {
-    /// `enumerate` element type — the `(index, elem)` tuple.
-    Tuple(TypeId),
     /// The scan source's scalar element type (the `iota` element, e.g. `i64`).
     Scalar(TypeId),
     /// The scan ranges over a real data array (`l0[1..]`); param 1 *is* the data
@@ -194,9 +198,9 @@ pub(crate) enum ScanElem {
 /// `body(acc, x)` where `acc` is the carried accumulator (param 0, typed as
 /// `acc_ty`) and `x` is the per-lane input (param 1), whose shape is set by
 /// `elem`. The host `acc_input` is bound to param 0 and `index_input` to the
-/// derived loop index. In [`ScanElem::Tuple`] mode the body may also read the
-/// current data lane via `elem_input` (`Extract(t, 1)`); [`ScanElem::Scalar`]
-/// mode has no data lane, so `elem_input` must be `None`.
+/// derived loop index. [`ScanElem::Scalar`] mode has no data lane, so `elem_input`
+/// must be `None`; [`ScanElem::Data`] mode binds the current element to
+/// `elem_input` and does not expose the index.
 ///
 /// Returns `None` if the expression is not closed over those inputs + literals,
 /// or if `elem_input` is given in scalar mode.
@@ -220,13 +224,6 @@ pub(crate) fn outline_scan_body(
             }
             vec![acc_input, index_input]
         }
-        ScanElem::Tuple(_) => {
-            let mut v = vec![acc_input, index_input];
-            if let Some(e) = elem_input {
-                v.push(e);
-            }
-            v
-        }
         // Data source: the body reads only the accumulator and the current element;
         // the index is not exposed.
         ScanElem::Data(_) => vec![acc_input, elem_input?],
@@ -246,7 +243,6 @@ pub(crate) fn outline_scan_body(
         // `t.0` of the `enumerate` element; in scalar mode `raw` is the param
         // itself (the `iota` lane).
         let param_ty = match elem {
-            ScanElem::Tuple(tuple_ty) => tuple_ty,
             ScanElem::Scalar(elem_ty) => elem_ty,
             ScanElem::Data(elem_ty) => elem_ty,
         };
@@ -259,26 +255,9 @@ pub(crate) fn outline_scan_body(
             value_map.insert(elem_input.expect("data mode requires elem_input"), param);
             return value_map;
         }
-        // `idx` is the raw index driver value before narrow/shift: `t.0` in tuple
-        // mode (an instruction), or the param itself in scalar mode (no unpack).
+        // `idx` is the raw index driver value before narrow/shift: in scalar mode
+        // the param itself (the `iota` lane), directly.
         let (mut idx, fty): (ValueId, TypeId) = match elem {
-            ScanElem::Tuple(tuple_ty) => {
-                let fty = ctx
-                    .types
-                    .field_type(tuple_ty, 0)
-                    .expect("enumerate tuple index field");
-                let ex = InstructionRef::from_mnemonic_with_type(
-                    ctx,
-                    Mnemonic::Extract(Extract {
-                        agg: param,
-                        index: 0,
-                    }),
-                    fty,
-                )
-                .id;
-                BasicBlock::from_id_mut(ctx, root).push_insn(ex);
-                (ValueId::Instruction(ex), fty)
-            }
             // Scalar: the param is the index driver value directly.
             ScanElem::Scalar(elem_ty) => (param, elem_ty),
             // Data mode returned above.
@@ -322,24 +301,6 @@ pub(crate) fn outline_scan_body(
             idx = ValueId::Instruction(add);
         }
         value_map.insert(index_input, idx);
-        // Data lane (tuple mode only; scalar mode rejects `elem_input` above).
-        if let (Some(elem_input), ScanElem::Tuple(tuple_ty)) = (elem_input, elem) {
-            let elem_ty = ctx
-                .types
-                .field_type(tuple_ty, 1)
-                .expect("enumerate tuple elem field");
-            let el = InstructionRef::from_mnemonic_with_type(
-                ctx,
-                Mnemonic::Extract(Extract {
-                    agg: param,
-                    index: 1,
-                }),
-                elem_ty,
-            )
-            .id;
-            BasicBlock::from_id_mut(ctx, root).push_insn(el);
-            value_map.insert(elem_input, ValueId::Instruction(el));
-        }
         value_map
     })
 }
@@ -466,83 +427,66 @@ pub(crate) fn inline_pure_body(
 // Total-map recognizer
 // ===========================================================================
 //
-// After step-1 argpromote, a dynamic-index buffer loop has this canonical shape
-// (see `ARGPROMOTE_ARRAY_MAP.md`): an `Array` snapshot param seeded into a shadow
-// space, a counted loop that read-modify-writes one shadow lane per iteration,
-// and a wide shadow reload that becomes the returned write-set value:
+// After the single-carried-array `array_promote`, an element-wise fill loop over
+// a bounded region threads one array-typed header param through the loop with
+// `insert`/`at`, initialized from a preheader wide `Load` (in-place map over the
+// original data) or a `splat(0, N)` (pure generation), and stored wide at the
+// exit:
 //
-//   <entry @base @arr:[i8;N]>
-//       *[shadow]:N @base = @arr;                 // seed
-//       goto <head @i=0>;
-//   <head @i>   if @i < N goto <body> else goto <exit>;
-//   <body>      %a = @base + @i;
-//               %b = *[shadow]:1 %a;              // load lane
-//               %v = body(@i, %b);                // pure
-//               *[shadow]:1 %a = %v;              // store lane
-//               goto <head @i=@i+1>;
-//   <exit>      %wv = *[shadow]:N @base;          // write-set value
-//               ... pack(write_value=%wv) ...
+//   <entry @base>
+//       %arr0 = load(ram:N*esz, @base)   // reads-original init  — OR —
+//       %arr0 = splat(0, N)              // pure-generation init
+//       goto <head @i=0 @arr=%arr0>;
+//   <head @i @arr:[e;N]>
+//       if @i == N goto <exit @arr> else goto <body @j=@i @a=@arr>;
+//   <body @j @a>
+//       %x   = at(@a, @j)                // optional own-lane original read
+//       %v   = body(@j, %x)              // pure
+//       %ins = insert(@a, @j, %v)        // carry
+//       goto <head @i=@j+1 @arr=%ins>;
+//   <exit @arr>  store(ram:N*esz, @base <- @arr); ...
 //
-// The load-base and store-base need not coincide. In the shape above they are
-// the same region (an in-place read-modify-write). A two-buffer copy/transform
-// `dst[i] = body(src[i])` instead reads `*[shadow]:1 (base_src+i)` and writes
-// `*[shadow]:1 (base_dst+i)` with a distinct destination base, whose wide reload
-// is the write-set; the source is still seeded from `@arr`. Both bases are root
-// params, so distinct ones name provably disjoint shadow regions. The in-place
-// case is one region of four accesses; the two-buffer case is two disjoint
-// regions of two (seed+load on the source, store+reload on the destination).
+// A map is exactly a carried array *without an accumulator*: the body writes lane
+// `@j` but never reads lane `@j-1` (that carry read is the scan shape,
+// [`loop_to_scan`](super::loop_to_scan)'s pattern). This recognizer shares the
+// carried-array matcher ([`super::carried_array`]) with `loop_to_scan` and is
+// mutually exclusive with it by the single test `ca.seed.is_none()`.
 //
-// The recognizer proves this is a *total* element-wise map (every lane written
-// once by a pure body) and rewrites the write-set value to a map — the
-// projectable form. When the body reads only the element it is `map(body, @arr)`
-// with a unary `body(elem)`; when it also reads the index it is `map(body,
-// enumerate(@arr))` with `body(tuple)` unpacking the `(index, elem)` pair. The
-// dead shadow loop is left for later cleanup; the function stays pure and
-// correct. v1 handles byte lanes (`elem == 1`) with a body closed over
-// `(index, element)` only.
+// It rewrites the exit view of the carried array to a `map`: when the body reads
+// only the element it is `map(body, arr0)` with a unary `body(elem)`; when it
+// also reads the index it is `map(body, enumerate(arr0))` with `body(tuple)`
+// unpacking the `(index, elem)` pair. The dead loop is deleted when wholly
+// private, else left for later cleanup; the function stays pure and correct.
+//
+// v1 promotes a *single* region, so the old two-buffer `dst[i] = body(src[i])`
+// copy no longer surfaces as a clean map (the second-region read makes the body
+// impure for outlining and the match bails) — an accepted generality regression.
 
-/// A recognized total-map loop (all fields are values/ids stable across the
-/// rewrite, which only *adds* a function and instructions).
+/// A recognized total-map loop built on the shared carried-array matcher.
 struct MapMatch {
-    /// The `Array` snapshot param mapped over.
-    arr: ValueId,
-    /// The header induction parameter (`@i`).
-    index: ValueId,
-    /// The per-lane loaded element (`%b`).
-    elem_val: ValueId,
-    /// The per-lane stored value (`%v`), the body's result.
-    stored_val: ValueId,
-    /// The wide shadow reload whose uses become the map result (`%wv`).
-    wv_id: InstructionId,
-    /// The seed store `*[shadow]:N base = arr` (dead after the rewrite).
-    seed_id: InstructionId,
-    /// The root/entry block holding the seed store and the loop preheader branch.
-    entry_block: BlockId,
-    /// The loop header block (carries the induction param).
-    header_block: BlockId,
-    /// The loop body block (the per-lane read-modify-write).
-    body_block: BlockId,
-    /// The block holding `%wv` (where the map is inserted).
-    exit_block: BlockId,
-    /// Whether the loop is *private* — every value it defines is used only inside
-    /// it and the exit carries no loop-carried params. When `true` the whole loop
-    /// is dead after the rewrite and is deleted; when `false` the loop also
-    /// computes values consumed outside it (e.g. a clobbered register threaded
-    /// into the return envelope), so only the array's shadow accesses are stripped
-    /// and the residual loop is left running. See [`apply`].
+    /// The carried array and its loop structure (header/body/arr/index/…).
+    ca: CarriedArray,
+    /// The loop exit block (holds the wide store / return-envelope pack).
+    exit: BlockId,
+    /// The carried array as the exit block sees it (the rewrite target).
+    arr_exit: ValueId,
+    /// The `at(arr_b, index)` own-lane original read, if the body reads its lane.
+    elem_read: Option<ValueId>,
+    /// The initial array the map ranges over: the preheader wide `Load` (reads
+    /// original) or the `splat(0, N)` (pure generation).
+    init_arr: ValueId,
+    /// The RAM store consuming `arr_exit`, when the region is real memory (else
+    /// the exit uses are a private-shadow return envelope and `arr_exit`'s uses
+    /// are simply replaced).
+    store_id: Option<InstructionId>,
+    /// Whether the loop is wholly private and can be deleted after the rewrite
+    /// (exit carries only the array pass-through, every loop value used only in
+    /// the loop). Otherwise the residual loop is left for later dce.
     deletable: bool,
 }
 
 fn is_temp(ctx: &Context, s: SpaceId) -> bool {
     matches!(Space::from_id(ctx, s).ty, SpaceType::Temporary)
-}
-
-/// `c` if `v` is the integer literal `c`, else `None`.
-fn literal(ctx: &Context, v: ValueId) -> Option<u64> {
-    match qcode::value::ValueRef::new(v, ctx) {
-        qcode::value::ValueRef::Literal(l) => Some(l.value()),
-        _ => None,
-    }
 }
 
 /// `idx` if `addr` is `base + idx` (either operand order) with `idx` a block
@@ -567,46 +511,6 @@ fn base_plus_param(ctx: &Context, addr: ValueId, base: ValueId) -> Option<ValueI
     matches!(other, ValueId::BlockParam(_)).then_some(other)
 }
 
-/// `true` if `v` is `idx + 1` (either operand order).
-fn is_increment(ctx: &Context, v: ValueId, idx: ValueId) -> bool {
-    let ValueId::Instruction(id) = v else {
-        return false;
-    };
-    let Mnemonic::Binop(b) = ctx.get_insn(id).mnemonic() else {
-        return false;
-    };
-    matches!(b.op, Binop::Int(IntBinop::Add))
-        && ((b.lhs == idx && literal(ctx, b.rhs) == Some(1))
-            || (b.rhs == idx && literal(ctx, b.lhs) == Some(1)))
-}
-
-/// The values feeding header block-param index `k` from every predecessor edge.
-fn header_incoming(ctx: &Context, header: BlockId, k: usize) -> Vec<ValueId> {
-    let mut out = Vec::new();
-    let preds: Vec<BlockId> = BasicBlock::from_id(ctx, header)
-        .predecessors()
-        .map(|(_, p)| p)
-        .collect();
-    for pred in preds {
-        let Some(term) = BasicBlock::from_id(ctx, pred).iter().last() else {
-            continue;
-        };
-        match term.mnemonic() {
-            Mnemonic::Branch(b) => out.extend(b.args.get(k).copied()),
-            Mnemonic::CBranch(cb) => {
-                if cb.success_block == header {
-                    out.extend(cb.success_args.get(k).copied());
-                }
-                if cb.failure_block == header {
-                    out.extend(cb.failure_args.get(k).copied());
-                }
-            }
-            _ => {}
-        }
-    }
-    out
-}
-
 /// One shadow-space memory access: `(insn, block, ptr, size, stored)`. `stored`
 /// is `Some` for a store.
 struct Access {
@@ -619,280 +523,288 @@ struct Access {
 
 /// Match the canonical total-map loop in `fid`, or `None` if it is any other
 /// shape (the function is then left untouched).
-fn try_match(ctx: &Context, fid: FunctionId) -> Option<MapMatch> {
-    // Collect every temporary-space (shadow) access, with its block.
-    let mut accesses: Vec<Access> = Vec::new();
-    for block in Function::from_id(ctx, fid).iter() {
-        let bid = block.id;
-        for insn in block.iter() {
-            let acc = match insn.mnemonic() {
-                Mnemonic::Load(l) if is_temp(ctx, l.space) => Access {
-                    id: insn.id,
-                    block: bid,
-                    ptr: l.ptr,
-                    size: l.size,
-                    stored: None,
-                },
-                Mnemonic::Store(s) if is_temp(ctx, s.space) => Access {
-                    id: insn.id,
-                    block: bid,
-                    ptr: s.ptr,
-                    size: s.size,
-                    stored: Some(s.src),
-                },
-                _ => continue,
-            };
-            accesses.push(acc);
-        }
+/// Match the canonical total-map loop in `fid` on the shared carried-array form,
+/// or `None` for any other shape (the function is then left untouched).
+fn try_match(ctx: &mut Context, fid: FunctionId) -> Option<MapMatch> {
+    // A map is a carried array with no lane-0 accumulator seed (a seed is the scan
+    // shape, `loop_to_scan`'s pattern — the two are mutually exclusive here) and a
+    // real initial array to range over.
+    let ca = find_carried_array(ctx, fid)?;
+    if ca.seed.is_some() {
+        return None;
     }
+    let init_arr = ca.init?;
 
-    // Seed store: `*[shadow]:N base = arr`, `arr` a root Array param, `base` a
-    // root param. Identifies (arr, base, N).
-    let root_params: Vec<ValueId> = Function::from_id(ctx, fid)
-        .root()?
-        .params()
-        .map(|p| p.id())
-        .collect();
-    let is_root = |v: ValueId| root_params.contains(&v);
-    let seed = accesses.iter().find(|a| {
-        a.stored.is_some_and(|src| {
-            is_root(src)
-                && ctx
-                    .stored_type_of(src)
-                    .and_then(|t| ctx.types.array_of(t))
-                    .is_some()
-        }) && is_root(a.ptr)
-    })?;
-    let arr = seed.stored.unwrap();
-    let base_src = seed.ptr;
-    let count = seed.size;
-    // v1: byte lanes only.
-    let (elem_ty, arr_count) = ctx.types.array_of(ctx.stored_type_of(arr)?)?;
-    if ctx.types.size_of(elem_ty) != 1 || arr_count != count {
+    // No accumulator carry read (`at(arr_b, index-1)`); the own-lane original read
+    // (`at(arr_b, index)`) is optional.
+    let reads = classify_body_reads(ctx, &ca)?;
+    if reads.prev.is_some() {
+        return None;
+    }
+    let elem_read = reads.own;
+
+    // Split shape only: the rewrite and deletion address header and body
+    // separately. A rotated (`header == body`) map is deferred (mirrors
+    // `loop_to_scan`'s v1 rejection).
+    if ca.header == ca.body {
         return None;
     }
 
-    // Wide reload: `*[shadow]:N base_dst` — the write-set value. Its base may be
-    // the seeded source base (an in-place read-modify-write) *or* a distinct
-    // destination base (a two-buffer `dst[i] = body(src[i])` copy/transform). It
-    // must be a root param so its shadow region is provably disjoint from the
-    // source's (distinct root params seed disjoint regions). Identified as the
-    // unique wide (`size == count`) load; the seed is a *store*, so it never
-    // matches here.
-    let wv = accesses
+    // Totality is `array_promote`'s coverage proof: the carried array has exactly
+    // `count` lanes and the promotion writes every one. We only confirm the index
+    // the body carries inits at 0 and steps by +1 on the back-edge (the promoted
+    // guard is an equality `@i == N`, which `value_range` cannot narrow, so we do
+    // not lean on it here — mirroring `loop_to_scan`).
+    let k_index = param_pos(ctx, ca.body, ca.index)?;
+    let feeds = {
+        let [hp] = incoming(ctx, ca.body, k_index)[..] else {
+            return None;
+        };
+        if param_parent(ctx, hp) != Some(ca.header) {
+            return None;
+        }
+        let k_hp = param_pos(ctx, ca.header, hp)?;
+        incoming(ctx, ca.header, k_hp)
+    };
+    if !feeds.iter().any(|&v| is_increment(ctx, v, ca.index)) {
+        return None;
+    }
+    let inits: Vec<i64> = feeds
         .iter()
-        .find(|a| a.stored.is_none() && a.size == count)?;
-    let base_dst = wv.ptr;
-    if !is_root(base_dst) {
-        return None;
+        .filter(|&&v| !is_increment(ctx, v, ca.index))
+        .filter_map(|&v| literal(ctx, v).map(|x| x as i64))
+        .collect();
+    if inits != [0] {
+        return None; // v1 maps tile [0, N) from index 0
     }
 
-    // Body store: `*[shadow]:1 (base_dst + idx) = v` — writes the destination lane.
-    let body_store = accesses.iter().find(|a| {
-        a.stored.is_some() && a.size == 1 && base_plus_param(ctx, a.ptr, base_dst).is_some()
-    })?;
-    let index = base_plus_param(ctx, body_store.ptr, base_dst)?;
-    let stored_val = body_store.stored.unwrap();
-    let body_block = body_store.block;
-
-    // Body load: `*[shadow]:1 (base_src + idx)` — reads the source at the *same*
-    // lane index. Matched by the index param (not the address value): in the
-    // two-buffer case the source and destination addresses differ even though
-    // they share the induction variable.
-    let body_load = accesses.iter().find(|a| {
-        a.stored.is_none() && a.size == 1 && base_plus_param(ctx, a.ptr, base_src) == Some(index)
-    })?;
-    let elem_val = ValueId::Instruction(body_load.id);
-
-    // Region exactness: nothing beyond these four accesses may touch either
-    // region — otherwise it is not a clean total map. In-place (base_src ==
-    // base_dst) is a single region of 4 accesses; two-buffer is two disjoint
-    // regions of 2 each (seed + load on the source, store + wide reload on the
-    // destination). Shadow accesses to *unrelated* bases (e.g. argpromote's frame
-    // seed stores) are disjoint from both and ignored.
-    let touches =
-        |base: ValueId, a: &Access| a.ptr == base || base_plus_param(ctx, a.ptr, base).is_some();
-    let src_region = accesses.iter().filter(|a| touches(base_src, a)).count();
-    if base_src == base_dst {
-        if src_region != 4 {
-            return None;
-        }
-    } else {
-        let dst_region = accesses.iter().filter(|a| touches(base_dst, a)).count();
-        if src_region != 2 || dst_region != 2 {
-            return None;
-        }
-    }
-
-    // Totality: the index covers exactly `[0, count)` with init 0 and step +1, so
-    // every lane is written once.
-    let range = value_range(ctx, index, body_block);
-    if range.min != 0 || range.max as usize != count - 1 {
-        return None;
-    }
-    let ValueId::BlockParam(pid) = index else {
+    // Exit discovery: the header terminator is the loop guard; the exit is the
+    // successor that is not itself a header predecessor.
+    let hterm = BasicBlock::from_id(ctx, ca.header).iter().last()?;
+    let Mnemonic::CBranch(cb) = hterm.mnemonic() else {
         return None;
     };
-    let header = ctx.values.block_params[pid].parent?;
-    let k = BasicBlock::from_id(ctx, header)
-        .params()
-        .position(|p| p.id() == index)?;
-    let incoming = header_incoming(ctx, header, k);
-    let inits_at_zero = incoming.iter().any(|&v| literal(ctx, v) == Some(0));
-    let steps_by_one = incoming.iter().any(|&v| is_increment(ctx, v, index));
-    if !inits_at_zero || !steps_by_one {
+    let (sb, fb) = (cb.success_block, cb.failure_block);
+    let preds: HashSet<BlockId> = BasicBlock::from_id(ctx, ca.header)
+        .predecessors()
+        .map(|(_, p)| p)
+        .collect();
+    let exit = if preds.contains(&sb) && !preds.contains(&fb) {
+        fb
+    } else if preds.contains(&fb) && !preds.contains(&sb) {
+        sb
+    } else {
         return None;
+    };
+    let arr_exit = exit_view(ctx, &ca, exit);
+
+    // When the body reads its own original lane, the map ranges over the *original*
+    // array, so the init must be the preheader wide `Load` — reading lane `j` of a
+    // `splat`-init region is legal but yields literal zero, not `l0[j]`, so matching
+    // it as an element read would be wrong (mirrors `loop_to_scan`'s scan check).
+    if elem_read.is_some() {
+        let ValueId::Instruction(iid) = init_arr else {
+            return None;
+        };
+        if !matches!(ctx.get_insn(iid).mnemonic(), Mnemonic::Load(_)) {
+            return None;
+        }
     }
 
-    // The header and body must be distinct blocks: the rewrite (and, in the
-    // deletable case, the block deletion) addresses them separately.
-    if header == body_block {
-        return None;
-    }
+    // Consumer: a RAM store of the carried array's exit view (real memory). When
+    // absent (private argpromote shadow, wide temp store already dce'd) the exit
+    // uses of `arr_exit` are the return envelope — the rewrite just replaces them.
+    let store_id = BasicBlock::from_id(ctx, exit)
+        .iter()
+        .find_map(|i| match i.mnemonic() {
+            Mnemonic::Store(s)
+                if matches!(Space::from_id(ctx, s.space).ty, SpaceType::Ram)
+                    && s.src == arr_exit =>
+            {
+                Some(i.id)
+            }
+            _ => None,
+        });
 
-    // The map replacement only needs `region_accesses == 4` (nothing else touches
-    // the region) plus totality: the wide reload then equals `body(arr[i])` per
-    // lane regardless of what *else* the loaded element feeds. So the loaded
-    // element is allowed to leak into other results (e.g. an escaping `@EDX`) — we
-    // simply keep the loop's shadow channel running in that case (see `deletable`
-    // below and the stripping in [`apply`]). No element-locality gate is required.
-
-    // The loop is *deletable* iff it is wholly private: the exit carries no
-    // loop-carried params and every value the loop defines is used only inside it.
-    // Then the residual loop is dead after the rewrite and is removed entirely.
-    // Otherwise the loop also feeds outside consumers (a clobbered register
-    // threaded into the return envelope, say), so it must keep running and only
-    // the array's shadow accesses are stripped.
-    let loop_blocks = [header, body_block];
-    let in_loop = |v: ValueId| {
+    // Deletable iff wholly private: every value the loop defines is used only inside
+    // it (the exit's array pass-through is re-fed from the preheader init in `apply`).
+    let loop_blocks = [ca.header, ca.body];
+    let in_loop = |ctx: &Context, v: ValueId| {
         ctx.users(v).iter().all(|&u| {
             ctx.get_insn(u)
                 .parent()
                 .is_some_and(|b| loop_blocks.contains(&b.id))
         })
     };
-    let exit_has_params = BasicBlock::from_id(ctx, wv.block).params().next().is_some();
-    let deletable = !exit_has_params
-        && loop_blocks.iter().all(|&blk| {
-            let b = BasicBlock::from_id(ctx, blk);
-            b.params().all(|p| in_loop(p.id()))
-                && b.iter().all(|i| in_loop(ValueId::Instruction(i.id)))
-        });
+    let deletable = loop_blocks.iter().all(|&blk| {
+        let b = BasicBlock::from_id(ctx, blk);
+        b.params().all(|p| in_loop(ctx, p.id()))
+            && b.iter().all(|i| in_loop(ctx, ValueId::Instruction(i.id)))
+    });
 
     Some(MapMatch {
-        arr,
-        index,
-        elem_val,
-        stored_val,
-        wv_id: wv.id,
-        seed_id: seed.id,
-        entry_block: seed.block,
-        header_block: header,
-        body_block,
-        exit_block: wv.block,
+        ca,
+        exit,
+        arr_exit,
+        elem_read,
+        init_arr,
+        store_id,
         deletable,
     })
 }
 
 /// Does the per-element body actually read the loop index? `enumerate` is only
-/// worth inserting when it does; a value-only body maps directly over `arr`.
-fn body_uses_index(ctx: &Context, m: &MapMatch) -> bool {
-    if m.stored_val == m.index {
+/// worth inserting when it does; a value-only body maps directly over the array.
+fn body_uses_index(
+    ctx: &Context,
+    stored_val: ValueId,
+    index: ValueId,
+    elem_read: Option<ValueId>,
+) -> bool {
+    if stored_val == index {
         return true;
     }
-    match pure_slice(ctx, m.stored_val, &[m.index, m.elem_val]) {
+    let mut inputs = vec![index];
+    inputs.extend(elem_read);
+    match pure_slice(ctx, stored_val, &inputs) {
         Some(slice) => slice
             .iter()
-            .any(|&iid| ctx.get_insn(iid).mnemonic().args().contains(&m.index)),
+            .any(|&iid| ctx.get_insn(iid).mnemonic().args().contains(&index)),
         None => false,
     }
 }
 
-/// Rewrite a matched loop: outline the per-element body, replace the write-set
-/// value with a `map`, then delete the now-dead loop (reroute the preheader
-/// straight to the exit and remove the loop blocks, the seed store, and the wide
-/// reload).
+/// Rewrite a matched loop: outline the per-element body, replace the exit view of
+/// the carried array with a `map`, then (when wholly private) reroute the
+/// preheader past the loop and delete the dead loop blocks.
 ///
 /// The map source depends on whether the body reads the index. A value-only body
-/// maps over `arr` directly — `map(body, arr)`, `body(elem)`. An index-aware body
-/// maps over `enumerate(arr)`, whose element is the `(index, elem)` tuple —
-/// `map(body, enumerate(arr))`, `body(tuple)` unpacking it (the `map` is unary in
-/// the element). Returns `false` if the body is not a closed pure expression of
-/// `(index, element)` (then nothing is changed — outlining is all-or-nothing and
-/// runs before any rewrite).
+/// maps over the array directly — `map(body, arr0)`, `body(elem)`. An index-aware
+/// body maps over `enumerate(arr0)`, whose element is the `(index, elem)` tuple —
+/// `map(body, enumerate(arr0))`, `body(tuple)` unpacking it. Returns `false` if
+/// the body is not a closed pure expression of `(index, element?)` (then nothing
+/// is changed — outlining is all-or-nothing and runs before any rewrite).
 fn apply(ctx: &mut Context, fid: FunctionId, m: &MapMatch) -> bool {
     let name = format!("{}_map_body", Function::from_id(ctx, fid).name());
+    let enum_id = IntrinsicId::from_name("enumerate").expect("enumerate registered");
+    let uses_index = body_uses_index(ctx, m.ca.stored_val, m.ca.index, m.elem_read);
 
-    // Outline the body and pick the map source, both before any rewrite so a
-    // non-closed body leaves the loop untouched.
-    let (body_fn, src_val) = if body_uses_index(ctx, m) {
-        let arr_ty = ctx.type_of(m.arr);
-        let enum_id = IntrinsicId::from_name("enumerate").expect("enumerate registered");
-        let enum_result_ty = enum_id.desc().result_type(&mut ctx.types, &[arr_ty]);
-        let Some((tuple_ty, _)) = ctx.types.array_of(enum_result_ty) else {
+    // Outline the body before any rewrite, so a non-closed body leaves the loop
+    // untouched.
+    let body_fn = if uses_index {
+        let arr_ty = ctx.type_of(m.init_arr);
+        let enum_ty = enum_id.desc().result_type(&mut ctx.types, &[arr_ty]);
+        let Some((tuple_ty, _)) = ctx.types.array_of(enum_ty) else {
             return false;
         };
-        let Some(body_fn) = outline_tupled(ctx, &name, m.stored_val, m.index, m.elem_val, tuple_ty)
-        else {
-            return false;
-        };
-        // enumerate(arr), inserted just before the wide reload it feeds.
-        let enum_val = {
-            let mut b = Builder::from_block(BasicBlock::from_id_mut(ctx, m.exit_block));
-            b.set_insert_point_before(m.wv_id);
-            b.push_intrinsic(enum_id, vec![m.arr]).id()
-        };
-        (body_fn, enum_val)
+        match outline_tupled(
+            ctx,
+            &name,
+            m.ca.stored_val,
+            m.ca.index,
+            m.elem_read,
+            tuple_ty,
+        ) {
+            Some(f) => f,
+            None => return false,
+        }
     } else {
-        let Some(body_fn) = outline_expression(ctx, &name, m.stored_val, &[m.elem_val]) else {
+        // A value-only body needs an element to map over; without an own-lane read
+        // there is nothing to bind (a pure constant fill is out of v1 scope).
+        let Some(elem) = m.elem_read else {
             return false;
         };
-        (body_fn, m.arr)
+        match outline_expression(ctx, &name, m.ca.stored_val, &[elem]) {
+            Some(f) => f,
+            None => return false,
+        }
     };
 
-    // Forward the returned write-set value to the map result. `push_map` types the
-    // result from the body's return (the element output type), so it is correct
-    // even when the source element is an `enumerate` tuple.
-    let wv_val = ValueId::Instruction(m.wv_id);
+    // Build `map(body, enumerate(arr0))` (index-aware) or `map(body, arr0)`
+    // (value-only) ahead of the consumer, then forward the exit view to it.
+    let anchor = m
+        .store_id
+        .or_else(|| BasicBlock::from_id(ctx, m.exit).iter().next().map(|i| i.id));
     let map_val = {
-        let mut b = Builder::from_block(BasicBlock::from_id_mut(ctx, m.exit_block));
-        b.set_insert_point_before(m.wv_id);
-        b.push_map(body_fn, src_val, Vec::new()).id()
+        let mut b = Builder::from_block(BasicBlock::from_id_mut(ctx, m.exit));
+        if let Some(at) = anchor {
+            b.set_insert_point_before(at);
+        }
+        let src = if uses_index {
+            b.push_intrinsic(enum_id, vec![m.init_arr]).id()
+        } else {
+            m.init_arr
+        };
+        b.push_map(body_fn, src, Vec::new()).id()
     };
-    ctx.replace_all_uses_with(wv_val, map_val);
+    ctx.replace_all_uses_with(m.arr_exit, map_val);
 
-    // The wide reload is now forwarded to the map and has no remaining readers
-    // (`region_accesses == 4` guarantees nothing else reads the region), so drop
-    // it unconditionally.
-    ctx.remove_instruction(m.wv_id);
-
-    if m.deletable {
-        // The loop is wholly private, so nothing outside it reads what it computes.
-        // Strip the seed store (the per-lane store/load vanish with `body_block`
-        // below), then reroute the preheader past the loop, straight to the exit
-        // (`replace_…` does not touch CFG edges, so add the new edge explicitly;
-        // deleting the header/body blocks unlinks the stale `entry → header` edge),
-        // then delete the loop blocks.
-        ctx.remove_instruction(m.seed_id);
-        if let Some(term) = BasicBlock::from_id(ctx, m.entry_block).iter().last() {
-            let term_id = term.id;
+    // Delete the residual loop when wholly private (mirrors `loop_to_scan::apply`):
+    // reroute the single preheader straight to the exit, re-feeding each exit param
+    // from a preheader-available value, then delete the loop blocks.
+    let loop_blocks = [m.ca.header, m.ca.body];
+    let defined_in_loop = |ctx: &Context, v: ValueId| match v {
+        ValueId::BlockParam(_) => param_parent(ctx, v).is_some_and(|b| loop_blocks.contains(&b)),
+        ValueId::Instruction(id) => ctx
+            .get_insn(id)
+            .parent()
+            .is_some_and(|b| loop_blocks.contains(&b.id)),
+        _ => false,
+    };
+    let exit_args: Option<Vec<ValueId>> = BasicBlock::from_id(ctx, m.exit)
+        .params()
+        .map(|p| p.id())
+        .collect::<Vec<_>>()
+        .into_iter()
+        .map(|p| {
+            let k = param_pos(ctx, m.exit, p)?;
+            let [v] = incoming(ctx, m.exit, k)[..] else {
+                return None;
+            };
+            if !defined_in_loop(ctx, v) {
+                return Some(v);
+            }
+            if !matches!(v, ValueId::BlockParam(_)) {
+                return None;
+            }
+            let kv = param_pos(ctx, m.ca.header, v)?;
+            let init: Vec<ValueId> = incoming(ctx, m.ca.header, kv)
+                .into_iter()
+                .filter(|&w| !defined_in_loop(ctx, w))
+                .collect();
+            match init[..] {
+                [w] => Some(w),
+                _ => None,
+            }
+        })
+        .collect();
+    if m.deletable
+        && let Some(exit_args) = exit_args
+    {
+        let preheaders: Vec<BlockId> = BasicBlock::from_id(ctx, m.ca.header)
+            .predecessors()
+            .map(|(_, p)| p)
+            .filter(|p| !loop_blocks.contains(p))
+            .collect();
+        if let [preheader] = preheaders[..]
+            && let Some(term_id) = BasicBlock::from_id(ctx, preheader)
+                .iter()
+                .last()
+                .map(|t| t.id)
+        {
             ctx.replace_instruction_mnemonic(
                 term_id,
                 Mnemonic::Branch(Branch {
-                    target: m.exit_block,
-                    args: Vec::new(),
+                    target: m.exit,
+                    args: exit_args,
                 }),
             );
-            ctx.add_cfg_edge(m.entry_block, m.exit_block);
+            ctx.add_cfg_edge(preheader, m.exit);
+            for &blk in &loop_blocks {
+                BasicBlock::from_id_mut(ctx, blk).delete(fid);
+            }
         }
-        BasicBlock::from_id_mut(ctx, m.body_block).delete(fid);
-        BasicBlock::from_id_mut(ctx, m.header_block).delete(fid);
     }
-    // Otherwise the loop also computes values consumed outside it, so it keeps
-    // running with its shadow channel intact: the seed store, per-lane store, and
-    // per-lane load are *left in place* — removing them would leave the surviving
-    // lane load reading an unseeded region. Only the wide reload was extracted into
-    // the map above.
     true
 }
 
@@ -907,284 +819,6 @@ pub(crate) fn recognize_total_maps(ctx: &mut Context) -> bool {
         }
         if let Some(m) = try_match(ctx, fid) {
             changed |= apply(ctx, fid, &m);
-        }
-    }
-    changed
-}
-
-// ===========================================================================
-// Scan recognizer — a map with a loop-carried accumulator
-// ===========================================================================
-//
-// The total-map shape above is element-local: `out[i] = body(arr[i], i)`. A loop
-// whose per-element write depends on the *previous* iteration's result —
-// `out[i] = body(out[i-1], i)` — cannot be a map (its body reaches a free
-// loop-carried param), but it is a left-`scan`. The MT19937 seeding loop
-// `mt[i] = 1812433253 * (mt[i-1] ^ (mt[i-1] >> 30)) + i` is the motivating case.
-//
-// Post-argpromote shadow shape (in-place; the previous value is threaded through
-// a register/param, not re-read from memory). Some recurrences also read the
-// current source lane before overwriting it:
-//
-//   <entry @base @arr:[i8;N] @init>
-//       *[shadow]:N @base = @arr;                  // seed
-//       goto <head @i=0 @acc=@init>;
-//   <head @i @acc>  if @i < N goto <body> else goto <exit …>;
-//   <body>      %b = *[shadow]:1 (@base+@i);        // optional source lane
-//               %v = body(@acc, @i[, %b]);          // pure, depends on @acc
-//               *[shadow]:1 (@base+@i) = %v;        // store lane
-//               goto <head @i=@i+1 @acc=%v>;        // carry acc' = v
-//   <exit>      %wv = *[shadow]:N @base;            // write-set value
-//
-// The recognizer proves: a counted index `[0,N)`, a second header param `@acc`
-// whose back-edge value is exactly the stored value and whose preheader value is
-// the initial accumulator, a body that is a closed pure expression of `(acc,
-// index[, elem])` actually using `acc`, and an in-place region. It rewrites the
-// write-set reload to `scan(init, enumerate(@arr), body)` and leaves the residual
-// loop running (v1 does not delete the scan loop).
-
-/// A recognized scan loop. Like [`MapMatch`] but with a carried accumulator.
-struct ScanMatch {
-    /// The `Array` snapshot seeded into the shadow region (the scan source).
-    arr: ValueId,
-    /// The header induction parameter (`@i`).
-    index: ValueId,
-    /// The index value at the array's first slot — the `idx` for which the lane
-    /// address hits `arr[0]`. The scan body's `index` is therefore `enumerate
-    /// index + index_start` (the loop may count from 1 while the array is 0-based).
-    index_start: i64,
-    /// The header accumulator parameter (`@acc`), threaded each iteration.
-    acc: ValueId,
-    /// The initial accumulator (`acc_0`), fed to `@acc` from the preheader.
-    init: ValueId,
-    /// The per-lane stored value (`%v`) — the body's result *and* the carry.
-    stored_val: ValueId,
-    /// Optional per-lane loaded source element. Present for scan loops whose body
-    /// depends on both the previous accumulator and the current array lane.
-    elem_val: Option<ValueId>,
-    /// The wide shadow reload whose uses become the scan result (`%wv`).
-    wv_id: InstructionId,
-    /// The block holding `%wv` (where the scan is inserted).
-    exit_block: BlockId,
-}
-
-/// Match a scan loop in `fid`, or `None` for any other shape.
-fn try_match_scan(ctx: &Context, fid: FunctionId) -> Option<ScanMatch> {
-    let mut accesses: Vec<Access> = Vec::new();
-    for block in Function::from_id(ctx, fid).iter() {
-        let bid = block.id;
-        for insn in block.iter() {
-            let acc = match insn.mnemonic() {
-                Mnemonic::Load(l) if is_temp(ctx, l.space) => Access {
-                    id: insn.id,
-                    block: bid,
-                    ptr: l.ptr,
-                    size: l.size,
-                    stored: None,
-                },
-                Mnemonic::Store(s) if is_temp(ctx, s.space) => Access {
-                    id: insn.id,
-                    block: bid,
-                    ptr: s.ptr,
-                    size: s.size,
-                    stored: Some(s.src),
-                },
-                _ => continue,
-            };
-            accesses.push(acc);
-        }
-    }
-
-    let numbering = precompute_forms(ctx, fid);
-    let root_params: Vec<ValueId> = Function::from_id(ctx, fid)
-        .root()?
-        .params()
-        .map(|p| p.id())
-        .collect();
-    let is_root = |v: ValueId| root_params.contains(&v);
-
-    // Seed store: `*[shadow]:bytes (root + c_arr) = arr`, `arr` a root Array param.
-    // The array body may sit at a non-zero offset of an incoming pointer (a struct
-    // field) — MT19937's state is at `+8`, after the `index`/`seed` words — so the
-    // seed address is `root + c_arr`, not a bare root param.
-    let seed = accesses.iter().find_map(|a| {
-        let src = a.stored?;
-        if !is_root(src) {
-            return None;
-        }
-        let (elem_ty, count) = ctx.types.array_of(ctx.stored_type_of(src)?)?;
-        let (root, c_arr) = affine_base_const(&numbering, a.ptr, &is_root)?;
-        let esz = ctx.types.size_of(elem_ty);
-        (esz != 0 && count != 0 && a.size == count * esz).then_some((src, root, c_arr, esz, count))
-    })?;
-    let (arr, root, c_arr, esz, count) = seed;
-    let bytes = count * esz;
-
-    // Wide reload: `*[shadow]:bytes (root + c_arr)` — the write-set value.
-    let wv = accesses.iter().find(|a| {
-        a.stored.is_none()
-            && a.size == bytes
-            && affine_base_const(&numbering, a.ptr, &is_root) == Some((root, c_arr))
-    })?;
-
-    // Lane store: `*[shadow]:esz (root + idx*esz + c_lane) = v`, `idx` a block
-    // param. No matching lane *load* exists (the previous value is carried, not
-    // re-read) — that absence is the scan signature, enforced by the coverage
-    // check below (only the seed/lane/reload touch the array region).
-    let lane = accesses.iter().find_map(|a| {
-        let v = a.stored?;
-        if a.size != esz {
-            return None;
-        }
-        let (base, idx, c_lane) = affine_strided_lane(&numbering, a.ptr, esz)?;
-        (base == root).then_some((a.id, v, idx, c_lane, a.block))
-    })?;
-    let (lane_store_id, stored_val, index, c_lane, body_block) = lane;
-
-    // Optional source lane load at the same indexed address. Older scan support
-    // required this to be absent; MT-style recurrences often need both the
-    // previous accumulator and the current original lane.
-    let elem_val = accesses.iter().find_map(|a| {
-        if a.id == wv.id || a.id == lane_store_id || a.stored.is_some() || a.size != esz {
-            return None;
-        }
-        let (base, idx, c) = affine_strided_lane(&numbering, a.ptr, esz)?;
-        (base == root && idx == index && c == c_lane).then_some(ValueId::Instruction(a.id))
-    });
-
-    // Coverage: the lane offsets `{idx*esz + c_lane : idx ∈ [min, max]}` must tile
-    // the array region `[c_arr, c_arr + count*esz)` exactly. This subsumes the
-    // start index (the loop may count from 1), the constant offset, and totality.
-    let range = value_range(ctx, index, body_block);
-    let esz_i = esz as i64;
-    let lo_off = esz_i * range.min as i64 + c_lane;
-    let hi_off = esz_i * range.max as i64 + c_lane;
-    if lo_off != c_arr || hi_off != c_arr + (count as i64 - 1) * esz_i {
-        return None;
-    }
-    // The index value at the first array slot (`arr[0]`): `idx = (c_arr - c_lane)/esz`.
-    let index_start = range.min as i64;
-
-    let ValueId::BlockParam(pid) = index else {
-        return None;
-    };
-    let header = ctx.values.block_params[pid].parent?;
-    let ki = BasicBlock::from_id(ctx, header)
-        .params()
-        .position(|p| p.id() == index)?;
-    let steps_by_one = header_incoming(ctx, header, ki)
-        .iter()
-        .any(|&v| is_increment(ctx, v, index));
-    if !steps_by_one {
-        return None;
-    }
-
-    // Accumulator: a *distinct* header param whose back-edge value is exactly the
-    // stored value (the carry `acc' = v`) and whose other incoming is the initial
-    // accumulator. `header_incoming` yields one value per predecessor edge — the
-    // preheader (init) and the body back-edge (stored_val).
-    let header_params: Vec<ValueId> = BasicBlock::from_id(ctx, header)
-        .params()
-        .map(|p| p.id())
-        .collect();
-    let (acc, init) = header_params.iter().enumerate().find_map(|(ka, &p)| {
-        if p == index {
-            return None;
-        }
-        let inc = header_incoming(ctx, header, ka);
-        let carries = inc.iter().filter(|&&v| v == stored_val).count();
-        if carries != 1 {
-            return None;
-        }
-        // The unique non-carry incoming is the initial accumulator.
-        let inits: Vec<ValueId> = inc.into_iter().filter(|&v| v != stored_val).collect();
-        let [init] = inits[..] else { return None };
-        Some((p, init))
-    })?;
-
-    // The body must be a closed pure expression of `(acc, index[, elem])` that
-    // actually uses the accumulator — otherwise it is index-local (a map/generate),
-    // not a scan.
-    let mut inputs = vec![acc, index];
-    if let Some(elem) = elem_val {
-        inputs.push(elem);
-    }
-    let slice = pure_slice(ctx, stored_val, &inputs)?;
-    let uses_acc = stored_val == acc
-        || slice
-            .iter()
-            .any(|&iid| ctx.get_insn(iid).mnemonic().args().contains(&acc));
-    if !uses_acc {
-        return None;
-    }
-
-    Some(ScanMatch {
-        arr,
-        index,
-        index_start,
-        acc,
-        init,
-        stored_val,
-        elem_val,
-        wv_id: wv.id,
-        exit_block: wv.block,
-    })
-}
-
-/// Rewrite a matched scan loop: outline the `(acc, index)` body and replace the
-/// write-set reload with `scan(init, enumerate(@arr), body)`. The residual loop
-/// is left running (v1 does not delete it). Returns `false` if the body is not a
-/// closed pure expression (then nothing is changed).
-fn apply_scan(ctx: &mut Context, fid: FunctionId, m: &ScanMatch) -> bool {
-    let name = format!("{}_scan_body", Function::from_id(ctx, fid).name());
-    let arr_ty = ctx.type_of(m.arr);
-    let acc_ty = ctx.type_of(m.acc);
-    let index_ty = ctx.type_of(m.index);
-    let enum_id = IntrinsicId::from_name("enumerate").expect("enumerate registered");
-    let enum_result_ty = enum_id.desc().result_type(&mut ctx.types, &[arr_ty]);
-    let Some((tuple_ty, _)) = ctx.types.array_of(enum_result_ty) else {
-        return false;
-    };
-    let Some(body_fn) = outline_scan_body(
-        ctx,
-        &name,
-        m.stored_val,
-        m.acc,
-        m.index,
-        m.elem_val,
-        m.index_start,
-        acc_ty,
-        index_ty,
-        ScanElem::Tuple(tuple_ty),
-    ) else {
-        return false;
-    };
-
-    // enumerate(@arr) then scan(init, that, body), inserted before the wide reload.
-    let wv_val = ValueId::Instruction(m.wv_id);
-    let scan_val = {
-        let mut b = Builder::from_block(BasicBlock::from_id_mut(ctx, m.exit_block));
-        b.set_insert_point_before(m.wv_id);
-        let enum_val = b.push_intrinsic(enum_id, vec![m.arr]).id();
-        b.push_scan(body_fn, m.init, enum_val, Vec::new()).id()
-    };
-    ctx.replace_all_uses_with(wv_val, scan_val);
-    ctx.remove_instruction(m.wv_id);
-    let _ = fid;
-    true
-}
-
-/// Recognize scan loops across all pure functions, rewriting each to a `scan`.
-/// Returns `true` if anything changed.
-pub(crate) fn recognize_scans(ctx: &mut Context) -> bool {
-    let fids: Vec<FunctionId> = ctx.function_ids();
-    let mut changed = false;
-    for fid in fids {
-        if !Function::from_id(ctx, fid).is_pure() {
-            continue;
-        }
-        if let Some(m) = try_match_scan(ctx, fid) {
-            changed |= apply_scan(ctx, fid, &m);
         }
     }
     changed
@@ -1360,7 +994,7 @@ fn try_match_strlen(ctx: &Context, fid: FunctionId) -> Option<StrlenMatch> {
     // The index must start at 0 on *every* entry edge and step by +1 on the
     // back-edge: each non-increment (preheader) incoming has to be the literal 0,
     // or some entry could start the count off-zero and the rewrite would be wrong.
-    let incoming = header_incoming(ctx, header, k);
+    let incoming = incoming(ctx, header, k);
     let inits: Vec<ValueId> = incoming
         .iter()
         .copied()
@@ -1578,7 +1212,7 @@ fn try_match_strlen_ptr(ctx: &Context, fid: FunctionId) -> Option<StrlenPtrMatch
             // single base pointer `@s0`. Requiring *exactly one* non-increment
             // incoming pins the base unambiguously — with two entry pointers, the
             // `end - base` length would only be `strlen` on the matching entry.
-            let incoming = header_incoming(ctx, header, k);
+            let incoming = incoming(ctx, header, k);
             if !incoming.iter().any(|&v| is_increment(ctx, v, s)) {
                 continue;
             }
@@ -1714,7 +1348,6 @@ impl Pass for LoopToMap {
     }
     fn run(&self, ctx: &mut Context, _env: &PipelineEnv) -> Result<bool, String> {
         let mut changed = recognize_total_maps(ctx);
-        changed |= recognize_scans(ctx);
         changed |= recognize_strlens(ctx);
         changed |= recognize_strlens_ptr(ctx);
         Ok(changed)
@@ -1731,6 +1364,20 @@ mod tests {
         testing::TestContext,
         value::{Value, insn::Mnemonic},
     };
+    use qcode_macro::qcode;
+
+    use crate::mem::array_promote::ArrayPromote;
+    use crate::test_util::run_function_pass;
+
+    /// Promote `fid`, mark it pure (the real pipeline functionalizes it before
+    /// `loop_to_map`, which gates on purity), then fold its total map. Returns
+    /// `(promoted, folded)`.
+    fn promote_then_map(ctx: &mut Context, fid: FunctionId) -> (bool, bool) {
+        let promoted = run_function_pass::<ArrayPromote>(ctx, fid).unwrap();
+        Function::from_id_mut(ctx, fid).set_is_pure(true);
+        let folded = recognize_total_maps(ctx);
+        (promoted, folded)
+    }
 
     /// Build a host function `idx + zext(elem)` and outline it into a body of
     /// `(i64 idx, i8 elem)`. The clone must have two params, recompute the
@@ -1845,7 +1492,7 @@ mod tests {
         let enum_ty = enum_id.desc().result_type(&mut tc.ctx.types, &[arr_ty]);
         let (tuple_ty, _) = tc.ctx.types.array_of(enum_ty).unwrap();
 
-        let body = outline_tupled(&mut tc.ctx, "body", result, idx, elem, tuple_ty)
+        let body = outline_tupled(&mut tc.ctx, "body", result, idx, Some(elem), tuple_ty)
             .expect("expression is closed over (idx, elem)");
 
         // A single param — the tuple — sized to the `(i64, i8)` aggregate.
@@ -1978,361 +1625,210 @@ mod tests {
         (fid, exit, arr)
     }
 
-    /// The map inserted into `block`, if any, with its source value.
-    fn map_src_in(ctx: &Context, block: BlockId) -> Option<ValueId> {
-        BasicBlock::from_id(ctx, block)
-            .iter()
-            .find_map(|i| match i.mnemonic() {
-                Mnemonic::Map(m) => Some(m.src),
-                _ => None,
-            })
-    }
-
-    /// A two-buffer counted copy `dst[i] = src[i]` is recognized: the write-set
-    /// reload over `base_dst` becomes `map(identity, arr)` over the *source*
-    /// array, even though load-base and store-base differ.
+    /// An in-place indexed map whose element body is *index-free*
+    /// (`out[i] = out[i] ^ 0x5a`): `array_promote` threads one carried array with
+    /// an own-lane `at` read, and `loop_to_map` folds it to `map(f, arr0)` — a
+    /// value-only body, so **no** `enumerate` is inserted.
     #[test]
-    fn two_buffer_copy_recognized() {
-        let mut tc = TestContext::new();
-        let (fid, exit, arr) =
-            build_copy_loop(&mut tc, /*distinct_dst*/ true, /*stray*/ false);
-
+    fn array_promote_then_map_folds_xor_fill() {
+        let mut ctx = Context::new();
+        qcode!(
+            ctx,
+            "
+            fn xorbuf:
+            <entry @base:i64>
+                goto <head @i=0 @buf=@base>;
+            <head @i:i64 @buf:i64>
+                %done = @i == 16;
+                if %done goto <exit> else goto <body @j=@i @b=@buf>;
+            <body @j:i64 @b:i64>
+                %off = @j * 4;
+                %addr = @b + %off;
+                %x = load(ram:4, %addr);
+                %v = %x ^ 0x5a;
+                store(ram:4, %addr <- %v);
+                %j1 = @j + 1;
+                goto <head @i=%j1 @buf=@b>;
+            <exit>
+                return at i64 0x0;
+            "
+        );
+        let (promoted, folded) = promote_then_map(&mut ctx, xorbuf);
+        assert!(promoted, "the indexed fill should promote");
+        assert!(folded, "the promoted loop should fold to a map");
+        let ir = format!("{}", Function::from_id(&ctx, xorbuf));
+        assert!(ir.contains("<$>"), "folds to a map: {ir}");
         assert!(
-            recognize_total_maps(&mut tc.ctx),
-            "two-buffer copy must recognize"
+            !ir.contains("enumerate"),
+            "an index-free body needs no enumerate: {ir}"
         );
-        assert_eq!(
-            map_src_in(&tc.ctx, exit),
-            Some(arr),
-            "the map source is the source array @arr"
-        );
-        // The host stays pure and the body was outlined as a pure function.
-        assert!(Function::from_id(&tc.ctx, fid).is_pure());
-    }
-
-    /// Regression: the in-place single-buffer case (`base_dst == base_src`) still
-    /// recognizes after the two-buffer generalization.
-    #[test]
-    fn in_place_single_buffer_still_recognized() {
-        let mut tc = TestContext::new();
-        let (_fid, exit, arr) =
-            build_copy_loop(&mut tc, /*distinct_dst*/ false, /*stray*/ false);
-
+        // Exactly one outlined pure body, and it recomputes the xor.
+        let bodies: Vec<FunctionId> = ctx
+            .function_ids()
+            .into_iter()
+            .filter(|&f| f != xorbuf && Function::from_id(&ctx, f).is_pure())
+            .collect();
+        assert_eq!(bodies.len(), 1, "one map body outlined");
+        let broot = Function::from_id(&ctx, bodies[0]).root().unwrap().id;
         assert!(
-            recognize_total_maps(&mut tc.ctx),
-            "in-place map must still recognize"
+            BasicBlock::from_id(&ctx, broot).iter().any(|i| matches!(
+                i.mnemonic(),
+                Mnemonic::Binop(b) if matches!(b.op, Binop::Int(IntBinop::Xor))
+            )),
+            "the body recomputes the xor"
         );
-        assert_eq!(map_src_in(&tc.ctx, exit), Some(arr));
     }
 
-    /// A stray extra access to the destination region breaks region exactness
-    /// (`dst_region != 2`), so the loop is left unrecognized — no map inserted.
+    /// The same loop with an *index-aware* body (`out[i] = out[i] + i`) folds to
+    /// `map(f, enumerate(arr0))` — the index forces an `enumerate`.
     #[test]
-    fn stray_destination_access_rejects() {
-        let mut tc = TestContext::new();
-        let (_fid, exit, _arr) =
-            build_copy_loop(&mut tc, /*distinct_dst*/ true, /*stray*/ true);
-
+    fn index_aware_body_maps_enumerate() {
+        let mut ctx = Context::new();
+        qcode!(
+            ctx,
+            "
+            fn addidx:
+            <entry @base:i64>
+                goto <head @i=0 @buf=@base>;
+            <head @i:i64 @buf:i64>
+                %done = @i == 16;
+                if %done goto <exit> else goto <body @j=@i @b=@buf>;
+            <body @j:i64 @b:i64>
+                %off = @j * 4;
+                %addr = @b + %off;
+                %x = load(ram:4, %addr);
+                %jt = @j[0:4];
+                %v = %x + %jt;
+                store(ram:4, %addr <- %v);
+                %j1 = @j + 1;
+                goto <head @i=%j1 @buf=@b>;
+            <exit>
+                return at i64 0x0;
+            "
+        );
+        let (promoted, folded) = promote_then_map(&mut ctx, addidx);
+        assert!(promoted && folded);
+        let ir = format!("{}", Function::from_id(&ctx, addidx));
         assert!(
-            !recognize_total_maps(&mut tc.ctx),
-            "a stray dst access must not recognize"
+            ir.contains("<$>") && ir.contains("enumerate"),
+            "an index-aware body maps over enumerate: {ir}"
         );
-        assert_eq!(map_src_in(&tc.ctx, exit), None, "no map is inserted");
     }
 
-    // ===== recognizer (scan) ===============================================
-
-    /// Build a scan loop `out[i] = acc; acc = acc + 1` over an `N`-lane snapshot
-    /// of `esz`-byte elements, in the canonical post-argpromote shape: a carried
-    /// accumulator threaded through a header param, an in-place lane store with
-    /// **no** matching lane load, and a wide write-set reload. The lane address is
-    /// `base + i` for `esz == 1` and `base + i*esz` for a wider lane (the MT19937
-    /// shape).
-    ///   entry: seed `*[shadow]:N·esz base = arr`; goto head(i=0, acc=init)
-    ///   head:  if i < N goto body else goto exit
-    ///   body:  v = acc + 1; *[shadow]:esz (base + i*esz) = v; goto head(i+1, acc=v)
-    ///   exit:  wv = *[shadow]:N·esz base; store(ram, &out = wv); return
-    fn build_scan_loop(
-        tc: &mut TestContext,
-        esz: usize,
-        read_lane: bool,
-    ) -> (FunctionId, BlockId, ValueId, ValueId) {
-        const N: usize = 4;
-        let elem = tc.ctx.types.get_or_make_int(esz);
-        let arr_ty = tc.ctx.types.get_or_make_array(elem, N);
-        let shadow = tc.ctx.make_temp_space();
-        let ram = tc.ctx.default_space;
-
-        let fid = Function::make(&mut tc.ctx, "scanfn".into()).unwrap().id;
-        let entry = tc.ctx.get_or_make_block(0x1000);
-        let header = tc.ctx.get_or_make_block(0x1010);
-        let body = tc.ctx.get_or_make_block(0x1020);
-        let exit = tc.ctx.get_or_make_block(0x1030);
-        {
-            let mut f = Function::from_id_mut(&mut tc.ctx, fid);
-            f.set_root(entry).unwrap();
-            f.add_block(entry);
-            f.add_block(header);
-            f.add_block(body);
-            f.add_block(exit);
-        }
-
-        // Root params: arr:[elem;N], base, init:elem (the initial accumulator).
-        let arr_pid = BasicBlock::from_id_mut(&mut tc.ctx, entry)
-            .push_param(N * esz)
-            .id;
-        tc.ctx.values.block_params[arr_pid].type_id = arr_ty;
-        let arr = ValueId::BlockParam(arr_pid);
-        let base =
-            ValueId::BlockParam(BasicBlock::from_id_mut(&mut tc.ctx, entry).push_param(8).id);
-        let init = ValueId::BlockParam(
-            BasicBlock::from_id_mut(&mut tc.ctx, entry)
-                .push_param(esz)
-                .id,
+    /// A write-only generation `out[i] = i * 3` promotes to a `splat(0, N)` init
+    /// (no region load); folding maps over `enumerate(splat)` — the map source
+    /// chains back to the splat, and no new region `Load` is introduced.
+    #[test]
+    fn generation_loop_maps_over_splat() {
+        let mut ctx = Context::new();
+        qcode!(
+            ctx,
+            "
+            fn generate:
+            <entry @base:i64>
+                goto <head @i=0 @buf=@base>;
+            <head @i:i64 @buf:i64>
+                %done = @i == 16;
+                if %done goto <exit> else goto <body @j=@i @b=@buf>;
+            <body @j:i64 @b:i64>
+                %jt = trunc(i32, @j);
+                %next = %jt * 3;
+                %off = @j * 4;
+                %addr = @b + %off;
+                store(ram:4, %addr <- %next);
+                %j1 = @j + 1;
+                goto <head @i=%j1 @buf=@b>;
+            <exit>
+                return at i64 0x0;
+            "
         );
-
-        // Header params: induction `i` (width 8) then accumulator `acc` (elem).
-        let i = ValueId::BlockParam(
-            BasicBlock::from_id_mut(&mut tc.ctx, header)
-                .push_param(8)
-                .id,
-        );
-        let acc = ValueId::BlockParam(
-            BasicBlock::from_id_mut(&mut tc.ctx, header)
-                .push_param(esz)
-                .id,
-        );
-
-        // entry: seed store + preheader branch carrying (i=0, acc=init).
-        {
-            let mut b = Builder::from_block(BasicBlock::from_id_mut(&mut tc.ctx, entry));
-            let zero = b.context_mut().get_const(0, 8).id();
-            b.push_store(arr, base, shadow);
-            b.push_branch_with_args(header, vec![zero, init]);
-        }
-        // header: counted guard.
-        {
-            let mut b = Builder::from_block(BasicBlock::from_id_mut(&mut tc.ctx, header));
-            let n = b.context_mut().get_const(N as u64, 8).id();
-            let cond = b.push_lt(i, n).id();
-            b.push_cbranch_with_args(cond, body, vec![], exit, vec![]);
-        }
-        // body: v = acc + 1, or `acc + arr[i] + 1` when `read_lane`; store lane
-        // at `base + i*esz`; carry (i+1, acc=v).
-        {
-            let mut b = Builder::from_block(BasicBlock::from_id_mut(&mut tc.ctx, body));
-            let addr = if esz == 1 {
-                b.push_add(base, i).id()
-            } else {
-                let e = b.context_mut().get_const(esz as u64, 8).id();
-                let scaled = b.push_mul(i, e).id();
-                b.push_add(base, scaled).id()
-            };
-            let one_e = b.context_mut().get_const(1, esz).id();
-            let v = if read_lane {
-                let elem = b.push_load::<false>(addr, esz, shadow).id();
-                let sum = b.push_add(acc, elem).id();
-                b.push_add(sum, one_e).id()
-            } else {
-                b.push_add(acc, one_e).id()
-            };
-            b.push_store(v, addr, shadow);
-            let one8 = b.context_mut().get_const(1, 8).id();
-            let inc = b.push_add(i, one8).id();
-            b.push_branch_with_args(header, vec![inc, v]);
-        }
-        // exit: wide reload (write-set) + external consumer + return.
-        {
-            let mut b = Builder::from_block(BasicBlock::from_id_mut(&mut tc.ctx, exit));
-            let wv = b.push_load::<false>(base, N * esz, shadow).id();
-            let out = b.context_mut().get_const(0x9000, 8).id();
-            b.push_store(wv, out, ram);
-            let dummy = b.context_mut().get_const(0, 8).id();
-            b.push_return(dummy);
-        }
-
-        Function::from_id_mut(&mut tc.ctx, fid).set_is_pure(true);
-        (fid, exit, arr, init)
-    }
-
-    /// The scan inserted into `block`, if any, with its `(init, src)`.
-    fn scan_in(ctx: &Context, block: BlockId) -> Option<(ValueId, ValueId)> {
-        BasicBlock::from_id(ctx, block)
-            .iter()
-            .find_map(|i| match i.mnemonic() {
-                Mnemonic::Scan(s) => Some((s.init, s.src)),
-                _ => None,
-            })
-    }
-
-    /// A loop whose per-lane store depends on a carried accumulator is recognized
-    /// as a `scan(init, enumerate(@arr), body)`, with a freshly outlined pure body.
-    /// Assert that `fid`'s scan loop is recognized and rewritten to
-    /// `scan(@init, enumerate(@arr), body)` with a fresh pure body.
-    fn assert_scan_recognized(
-        tc: &mut TestContext,
-        fid: FunctionId,
-        exit: BlockId,
-        arr: ValueId,
-        init: ValueId,
-    ) {
-        // A map recognizer must NOT claim it (the carried body is not a map).
+        let (promoted, folded) = promote_then_map(&mut ctx, generate);
+        assert!(promoted && folded);
+        let ir = format!("{}", Function::from_id(&ctx, generate));
         assert!(
-            !recognize_total_maps(&mut tc.ctx),
-            "a carried-accumulator loop is not a total map"
+            ir.contains("<$>") && ir.contains("$splat("),
+            "maps over splat: {ir}"
         );
-        assert!(recognize_scans(&mut tc.ctx), "the scan must be recognized");
-
-        let (scan_init, scan_src) =
-            scan_in(&tc.ctx, exit).expect("a scan is inserted at the write-set reload");
-        assert_eq!(scan_init, init, "the scan is seeded with @init");
-        let ValueId::Instruction(src_id) = scan_src else {
-            panic!("scan src should be the enumerate result");
-        };
-        match tc.ctx.get_insn(src_id).mnemonic() {
-            Mnemonic::Intrinsic(app) => {
-                assert_eq!(
-                    app.id.desc().name(),
-                    "enumerate",
-                    "scan src is enumerate(...)"
-                );
-                assert_eq!(app.args, vec![arr], "enumerate is over @arr");
-            }
-            other => panic!("expected enumerate intrinsic, got {other:?}"),
-        }
-        let has_body = tc.ctx.function_ids().iter().any(|&f| {
-            Function::from_id(&tc.ctx, f).name().ends_with("_scan_body")
-                && Function::from_id(&tc.ctx, f).is_pure()
-        });
-        assert!(has_body, "a pure scan body function was outlined");
         assert!(
-            Function::from_id(&tc.ctx, fid).is_pure(),
-            "the host stays pure"
+            !ir.contains("load(ram"),
+            "generation introduces no region load: {ir}"
         );
     }
 
-    /// A byte-lane loop whose per-lane store depends on a carried accumulator is
-    /// recognized as a `scan`.
+    /// The seeded prefix sum (a scan: lane-0 seed insert + `at(arr, i-1)` carry
+    /// read) is `loop_to_scan`'s shape, not a map — `recognize_total_maps` must
+    /// decline it (mutual exclusion via `ca.seed`).
     #[test]
-    fn carried_accumulator_loop_recognized_as_scan() {
-        let mut tc = TestContext::new();
-        let (fid, exit, arr, init) =
-            build_scan_loop(&mut tc, /*esz*/ 1, /*read_lane*/ false);
-        assert_scan_recognized(&mut tc, fid, exit, arr, init);
-    }
-
-    /// A scan body may also read the current source lane: `v = acc + arr[i] + 1`.
-    /// This is the recurrence shape needed before MT-style twist loops can be
-    /// lifted: the lane update is not element-local because it uses the previous
-    /// accumulator, but it is also not seed-only because it reads the current lane.
-    #[test]
-    fn carried_accumulator_with_lane_load_recognized_as_scan() {
-        let mut tc = TestContext::new();
-        let (fid, exit, arr, init) =
-            build_scan_loop(&mut tc, /*esz*/ 4, /*read_lane*/ true);
-        assert_scan_recognized(&mut tc, fid, exit, arr, init);
-    }
-
-    /// The same scan with **i32 lanes** and strided `base + i*4` addressing (the
-    /// MT19937 shape) is recognized — the lane-width + scaled-address generalization.
-    #[test]
-    fn wide_lane_scan_recognized() {
-        let mut tc = TestContext::new();
-        let (fid, exit, arr, init) =
-            build_scan_loop(&mut tc, /*esz*/ 4, /*read_lane*/ false);
-        assert_scan_recognized(&mut tc, fid, exit, arr, init);
-    }
-
-    /// The real MT19937 `init_genrand` shadow shape: the array snapshot sits at a
-    /// **byte offset** of an incoming pointer (`base + 8`, a struct field), the lane
-    /// address carries a **constant** (`base + i*4 + 4`), the index counts **from 1**,
-    /// and the loop is a **single self-looping block**. Exercises the affine
-    /// decomposition + index-offset path.
-    #[test]
-    fn struct_offset_scan_recognized() {
-        const N: usize = 4;
-        let mut tc = TestContext::new();
-        let i32t = tc.ctx.types.get_or_make_int(4);
-        let arr_ty = tc.ctx.types.get_or_make_array(i32t, N);
-        let shadow = tc.ctx.make_temp_space();
-        let ram = tc.ctx.default_space;
-
-        let fid = Function::make(&mut tc.ctx, "mt".into()).unwrap().id;
-        let entry = tc.ctx.get_or_make_block(0x1000);
-        let head = tc.ctx.get_or_make_block(0x1010);
-        let exit = tc.ctx.get_or_make_block(0x1020);
-        {
-            let mut f = Function::from_id_mut(&mut tc.ctx, fid);
-            f.set_root(entry).unwrap();
-            f.add_block(entry);
-            f.add_block(head);
-            f.add_block(exit);
-        }
-
-        // Root params: base (incoming pointer), arr:[i32;N] snapshot, init.
-        let base =
-            ValueId::BlockParam(BasicBlock::from_id_mut(&mut tc.ctx, entry).push_param(4).id);
-        let arr_pid = BasicBlock::from_id_mut(&mut tc.ctx, entry)
-            .push_param(N * 4)
-            .id;
-        tc.ctx.values.block_params[arr_pid].type_id = arr_ty;
-        let arr = ValueId::BlockParam(arr_pid);
-        let init =
-            ValueId::BlockParam(BasicBlock::from_id_mut(&mut tc.ctx, entry).push_param(4).id);
-
-        // Self-loop header params: accumulator `ebx`, induction `i`.
-        let ebx = ValueId::BlockParam(BasicBlock::from_id_mut(&mut tc.ctx, head).push_param(4).id);
-        let i = ValueId::BlockParam(BasicBlock::from_id_mut(&mut tc.ctx, head).push_param(4).id);
-
-        // entry: seed the array at `base + 8`; enter the loop with (ebx=init, i=1).
-        {
-            let mut b = Builder::from_block(BasicBlock::from_id_mut(&mut tc.ctx, entry));
-            let eight = b.context_mut().get_const(8, 4).id();
-            let seedaddr = b.push_add(base, eight).id();
-            b.push_store(arr, seedaddr, shadow);
-            let one = b.context_mut().get_const(1, 4).id();
-            b.push_branch_with_args(head, vec![init, one]);
-        }
-        // head (single self-loop block): v = ebx + i; store at base + i*4 + 4;
-        // carry (ebx=v, i=i+1) while i+1 < N+1.
-        {
-            let mut b = Builder::from_block(BasicBlock::from_id_mut(&mut tc.ctx, head));
-            let v = b.push_add(ebx, i).id();
-            let four = b.context_mut().get_const(4, 4).id();
-            let off = b.push_mul(i, four).id();
-            let a = b.push_add(off, base).id();
-            let addr = b.push_add(a, four).id();
-            b.push_store(v, addr, shadow);
-            let one = b.context_mut().get_const(1, 4).id();
-            let ni = b.push_add(i, one).id();
-            let bound = b.context_mut().get_const(N as u64 + 1, 4).id();
-            let c = b.push_lt(ni, bound).id();
-            b.push_cbranch_with_args(c, head, vec![v, ni], exit, vec![]);
-        }
-        // exit: wide reload at `base + 8` (write-set) + external consumer.
-        {
-            let mut b = Builder::from_block(BasicBlock::from_id_mut(&mut tc.ctx, exit));
-            let eight = b.context_mut().get_const(8, 4).id();
-            let seedaddr = b.push_add(base, eight).id();
-            let wv = b.push_load::<false>(seedaddr, N * 4, shadow).id();
-            let out = b.context_mut().get_const(0x9000, 8).id();
-            b.push_store(wv, out, ram);
-            let dummy = b.context_mut().get_const(0, 8).id();
-            b.push_return(dummy);
-        }
-        Function::from_id_mut(&mut tc.ctx, fid).set_is_pure(true);
-
+    fn scan_shape_is_not_matched_by_map() {
+        let mut ctx = Context::new();
+        qcode!(
+            ctx,
+            "
+            fn prefix:
+            <entry @seed:i64 @base:i64>
+                %e0 = @seed[0:4];
+                store(ram:4, @base <- %e0);
+                goto <head @i=1 @buf=@base>;
+            <head @i:i64 @buf:i64>
+                %done = @i == 624;
+                if %done goto <exit> else goto <body @j=@i @b=@buf>;
+            <body @j:i64 @b:i64>
+                %jm1 = @j - 1;
+                %roff = %jm1 * 4;
+                %raddr = @b + %roff;
+                %prev = load(ram:4, %raddr);
+                %coff = @j * 4;
+                %caddr = @b + %coff;
+                %cur = load(ram:4, %caddr);
+                %next = %cur + %prev;
+                store(ram:4, %caddr <- %next);
+                %j1 = @j + 1;
+                goto <head @i=%j1 @buf=@b>;
+            <exit>
+                return at i64 0x0;
+            "
+        );
+        assert!(run_function_pass::<ArrayPromote>(&mut ctx, prefix).unwrap());
+        Function::from_id_mut(&mut ctx, prefix).set_is_pure(true);
         assert!(
-            recognize_scans(&mut tc.ctx),
-            "the MT struct-offset shadow shape must be recognized as a scan"
+            !recognize_total_maps(&mut ctx),
+            "a seeded scan is not a map"
         );
-        let (scan_init, _) = scan_in(&tc.ctx, exit).expect("a scan is inserted");
-        assert_eq!(scan_init, init, "the scan is seeded with @init");
-        let has_body = tc.ctx.function_ids().iter().any(|&f| {
-            Function::from_id(&tc.ctx, f).name().ends_with("_scan_body")
-                && Function::from_id(&tc.ctx, f).is_pure()
-        });
-        assert!(has_body, "a pure scan body was outlined");
+    }
+
+    /// All-or-nothing outlining: a body reaching an unrelated RAM load is not a
+    /// closed pure expression, so the map is not applied and nothing changes.
+    #[test]
+    fn impure_body_left_alone() {
+        let mut ctx = Context::new();
+        qcode!(
+            ctx,
+            "
+            fn impure:
+            <entry @base:i64 @other:i64>
+                goto <head @i=0 @buf=@base>;
+            <head @i:i64 @buf:i64>
+                %done = @i == 16;
+                if %done goto <exit> else goto <body @j=@i @b=@buf>;
+            <body @j:i64 @b:i64>
+                %off = @j * 4;
+                %addr = @b + %off;
+                %x = load(ram:4, %addr);
+                %y = load(ram:4, @other);
+                %v = %x + %y;
+                store(ram:4, %addr <- %v);
+                %j1 = @j + 1;
+                goto <head @i=%j1 @buf=@b>;
+            <exit>
+                return at i64 0x0;
+            "
+        );
+        run_function_pass::<ArrayPromote>(&mut ctx, impure).unwrap();
+        Function::from_id_mut(&mut ctx, impure).set_is_pure(true);
+        assert!(
+            !recognize_total_maps(&mut ctx),
+            "an impure body must not fold to a map"
+        );
     }
 
     // ===== recognizer (strlen) =============================================

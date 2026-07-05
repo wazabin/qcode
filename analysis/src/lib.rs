@@ -63,6 +63,8 @@ pub mod sequence;
 pub mod verify;
 pub use verify::{PureRegCallArgsViolation, Verify, verify, verify_ir, verify_pure_reg_call_args};
 
+pub mod loop_info;
+
 pub mod licm;
 pub use licm::{Licm, hoist_loop_invariants};
 
