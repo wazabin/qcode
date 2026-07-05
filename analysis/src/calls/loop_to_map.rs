@@ -1,13 +1,16 @@
-//! Loop-to-map: recognize a total element-wise array loop and rewrite it as a
-//! single [`Map`](qcode::value::insn::Map) over the array value, outlining the
-//! per-element body into a fresh pure function. See `ARGPROMOTE_ARRAY_MAP.md`.
+//! Loop-to-map: recognize a total element-wise array loop on the shared
+//! carried-array form (see [`super::carried_array`], produced by
+//! [`array_promote`](crate::mem::array_promote)) and rewrite it as a single
+//! [`Map`](qcode::value::insn::Map) over the array value, outlining the
+//! per-element body into a fresh pure function.
 //!
-//! This module currently provides [`outline_expression`], the mechanical core:
-//! copying a pure expression DAG into a standalone function. The recognizer that
-//! drives it (finding the loop, proving element-locality, calling
-//! [`push_map`](qcode::builder::Builder::push_map)) builds on top.
+//! This file owns two pattern families over that form: the total-map recognizer
+//! ([`try_match`]/[`apply`]) and the bounded NUL-scan "strlen" recognizers
+//! ([`try_match_strlen`] on the `at`-form snapshot, and the raw-`char*` Layer 2).
+//! Accumulator scans live in the sibling [`super::loop_to_scan`].
 //!
-//! `outline_expression` is the recognizer's mechanical core.
+//! [`outline_expression`] is the recognizer's mechanical core: copying a pure
+//! expression DAG into a standalone function.
 
 use std::borrow::Cow;
 
@@ -22,8 +25,8 @@ use qcode::{
         BasicBlock, BlockId, Function, FunctionId, Instruction, InstructionRef, Renameable,
         ValueId,
         insn::{
-            Binary, Binop, Branch, CBranch, Extract, InstructionId, IntBinop, IntrinsicId,
-            Mnemonic, Range, Return, Unary, Unop,
+            Binary, Binop, Branch, CBranch, Extract, InstructionId, IntBinop, IntrinsicApp,
+            IntrinsicId, Mnemonic, Range, Return, Unary, Unop,
         },
     },
 };
@@ -489,40 +492,6 @@ fn is_temp(ctx: &Context, s: SpaceId) -> bool {
     matches!(Space::from_id(ctx, s).ty, SpaceType::Temporary)
 }
 
-/// `idx` if `addr` is `base + idx` (either operand order) with `idx` a block
-/// param, else `None`.
-fn base_plus_param(ctx: &Context, addr: ValueId, base: ValueId) -> Option<ValueId> {
-    let ValueId::Instruction(id) = addr else {
-        return None;
-    };
-    let Mnemonic::Binop(b) = ctx.get_insn(id).mnemonic() else {
-        return None;
-    };
-    if !matches!(b.op, Binop::Int(IntBinop::Add)) {
-        return None;
-    }
-    let other = if b.lhs == base {
-        b.rhs
-    } else if b.rhs == base {
-        b.lhs
-    } else {
-        return None;
-    };
-    matches!(other, ValueId::BlockParam(_)).then_some(other)
-}
-
-/// One shadow-space memory access: `(insn, block, ptr, size, stored)`. `stored`
-/// is `Some` for a store.
-struct Access {
-    id: InstructionId,
-    block: BlockId,
-    ptr: ValueId,
-    size: usize,
-    stored: Option<ValueId>,
-}
-
-/// Match the canonical total-map loop in `fid`, or `None` if it is any other
-/// shape (the function is then left untouched).
 /// Match the canonical total-map loop in `fid` on the shared carried-array form,
 /// or `None` for any other shape (the function is then left untouched).
 fn try_match(ctx: &mut Context, fid: FunctionId) -> Option<MapMatch> {
@@ -835,37 +804,34 @@ pub(crate) fn recognize_total_maps(ctx: &mut Context) -> bool {
 // the loop is such a scan and rewrites the escaping count to `len(take_while(@arr))`
 // — the projectable form — leaving the now-dead scan for DCE.
 //
-// Shape (post-argpromote snapshot): like the total-map shape but *read-only* and
-// terminated by the loaded byte rather than a static index bound:
+// Shape (carried-array form, produced by `array_reads` from an argpromote
+// read-only snapshot): a read-only scan whose lane read is `at(@arr, i)` and whose
+// exit is governed by the loaded byte rather than a static index bound:
 //
-//   <entry @base @arr:[i8;N]>
-//       *[shadow]:N @base = @arr;                 // seed
-//       goto <head @i=0>;
-//   <head @i>   %b = *[shadow]:1 (@base+@i);      // load lane
+//   <entry @arr:[i8;N] ...>  goto <head @i=0>;
+//   <head @i>   %b = at(@arr, @i);                     // lane read
 //               if %b != 0 goto <body> else goto <exit @i>;   // NUL test
 //   <body>      goto <head @i=@i+1>;
 //   <exit @count>  ... uses of @count = strlen ...
 //
-// The loaded byte governs the loop exit (the take_while predicate), and the index
+// The lane byte governs the loop exit (the take_while predicate), and the index
 // carried out on the exit edge is the scan length. v1: byte lanes, snapshot-backed
-// source (the array value `@arr`); the unbounded raw-`char*` case is a follow-up.
+// source (the array value `@arr`); the unbounded raw-`char*` case is Layer 2.
 
 /// A recognized bounded NUL-scan whose escaping count is `len(take_while(arr))`.
 struct StrlenMatch {
-    /// The `Array` snapshot scanned.
+    /// The `Array` snapshot scanned (a root `[i8;N]` param).
     arr: ValueId,
     /// The exit-block parameter holding the scan length (its uses become `len`).
     count_param: ValueId,
-    /// The seed store `*[shadow]:N base = arr` (dead after the rewrite).
-    seed_id: InstructionId,
-    /// The block holding the seed store and the loop preheader branch.
-    entry_block: BlockId,
-    /// The loop header (carries the induction param, holds the NUL test).
+    /// The loop header (carries the induction param, holds the `at` and NUL test).
     header_block: BlockId,
     /// The loop body (the per-iteration increment).
     body_block: BlockId,
     /// The exit block (where `len`/`take_while` are inserted; holds `count_param`).
     exit_block: BlockId,
+    /// The header's sole out-of-loop predecessor (rerouted to the exit on delete).
+    preheader: BlockId,
     /// Whether the loop is wholly private and can be deleted (see [`MapMatch`]).
     deletable: bool,
 }
@@ -905,76 +871,45 @@ fn nonzero_polarity(ctx: &Context, cond: ValueId, elem: ValueId) -> Option<bool>
 
 /// Match a bounded NUL-scan in `fid`, or `None` for any other shape.
 fn try_match_strlen(ctx: &Context, fid: FunctionId) -> Option<StrlenMatch> {
-    // Collect every shadow (temporary-space) access.
-    let mut accesses: Vec<Access> = Vec::new();
-    for block in Function::from_id(ctx, fid).iter() {
-        let bid = block.id;
-        for insn in block.iter() {
-            let acc = match insn.mnemonic() {
-                Mnemonic::Load(l) if is_temp(ctx, l.space) => Access {
-                    id: insn.id,
-                    block: bid,
-                    ptr: l.ptr,
-                    size: l.size,
-                    stored: None,
-                },
-                Mnemonic::Store(s) if is_temp(ctx, s.space) => Access {
-                    id: insn.id,
-                    block: bid,
-                    ptr: s.ptr,
-                    size: s.size,
-                    stored: Some(s.src),
-                },
-                _ => continue,
-            };
-            accesses.push(acc);
-        }
-    }
-
-    // Seed store: `*[shadow]:N base = arr`, `arr` a root Array param, `base` root.
+    let at_id = IntrinsicId::from_name("at")?;
+    let insert_id = IntrinsicId::from_name("insert")?;
     let root_params: Vec<ValueId> = Function::from_id(ctx, fid)
         .root()?
         .params()
         .map(|p| p.id())
         .collect();
     let is_root = |v: ValueId| root_params.contains(&v);
-    let seed = accesses.iter().find(|a| {
-        a.stored.is_some_and(|src| {
-            is_root(src)
-                && ctx
-                    .stored_type_of(src)
-                    .and_then(|t| ctx.types.array_of(t))
-                    .is_some()
-        }) && is_root(a.ptr)
-    })?;
-    let arr = seed.stored.unwrap();
-    let base = seed.ptr;
-    let count = seed.size;
-    // v1: byte lanes.
-    let (elem_ty, arr_count) = ctx.types.array_of(ctx.stored_type_of(arr)?)?;
-    if ctx.types.size_of(elem_ty) != 1 || arr_count != count {
-        return None;
-    }
 
-    // The scan is read-only: a single per-lane load `*[shadow]:1 (base + idx)`,
-    // and no store other than the seed. Exactly two accesses touch the region
-    // (seed + lane load); any store-back or extra access means it is not a pure
-    // NUL-scan (a copy/transform is the map recognizer's job).
-    if accesses
-        .iter()
-        .any(|a| a.stored.is_some() && a.id != seed.id)
-    {
-        return None;
+    // The lane read is the sole `at(@arr, idx)` over a root `[i8;N]` param. More than
+    // one `at` on that array (or any `insert` into it) means the loop is not a plain
+    // read-only NUL scan, so bail.
+    let mut lane: Option<(InstructionId, ValueId, ValueId)> = None; // (at id, arr, idx)
+    for block in Function::from_id(ctx, fid).iter() {
+        for insn in block.iter() {
+            let Mnemonic::Intrinsic(IntrinsicApp { id, args }) = insn.mnemonic() else {
+                continue;
+            };
+            if *id == insert_id && args.first().is_some_and(|&a| is_root(a)) {
+                return None; // a write into a snapshot — not read-only
+            }
+            if *id != at_id || args.len() != 2 || !is_root(args[0]) {
+                continue;
+            }
+            let byte_array = ctx
+                .stored_type_of(args[0])
+                .and_then(|t| ctx.types.array_of(t))
+                .is_some_and(|(elem, _)| ctx.types.size_of(elem) == 1);
+            if !byte_array {
+                continue;
+            }
+            if lane.is_some() {
+                return None; // more than one lane read — not the canonical scan
+            }
+            lane = Some((insn.id, args[0], args[1]));
+        }
     }
-    let lane = accesses.iter().find(|a| {
-        a.stored.is_none() && a.size == 1 && base_plus_param(ctx, a.ptr, base).is_some()
-    })?;
-    let index = base_plus_param(ctx, lane.ptr, base)?;
-    let elem_val = ValueId::Instruction(lane.id);
-    let touches = |a: &Access| a.ptr == base || base_plus_param(ctx, a.ptr, base).is_some();
-    if accesses.iter().filter(|a| touches(a)).count() != 2 {
-        return None;
-    }
+    let (at_insn, arr, index) = lane?;
+    let elem_val = ValueId::Instruction(at_insn);
 
     // The index is a header param initialised to 0 and stepped by +1 — so it counts
     // iterations from 0. (Unlike the map recognizer there is no static upper bound:
@@ -983,9 +918,9 @@ fn try_match_strlen(ctx: &Context, fid: FunctionId) -> Option<StrlenMatch> {
         return None;
     };
     let header = ctx.values.block_params[pid].parent?;
-    // The lane load must live in the header: the NUL test that governs the loop
+    // The lane read must live in the header: the NUL test that governs the loop
     // reads it there, and the count is the index at that test.
-    if lane.block != header {
+    if ctx.get_insn(at_insn).parent().map(|b| b.id) != Some(header) {
         return None;
     }
     let k = BasicBlock::from_id(ctx, header)
@@ -1062,6 +997,17 @@ fn try_match_strlen(ctx: &Context, fid: FunctionId) -> Option<StrlenMatch> {
             return None;
         }
 
+        // The preheader is the header's sole out-of-loop predecessor: the reroute
+        // source when the dead loop is deleted (there is no seed store to key on).
+        let out_of_loop: Vec<BlockId> = BasicBlock::from_id(ctx, header)
+            .predecessors()
+            .map(|(_, p)| p)
+            .filter(|&p| p != body_block)
+            .collect();
+        let [preheader] = out_of_loop[..] else {
+            return None;
+        };
+
         // Deletable iff wholly private (mirrors the map recognizer): the exit carries
         // only the count, and every value the loop defines is used only inside it.
         let loop_blocks = [header, body_block];
@@ -1085,11 +1031,10 @@ fn try_match_strlen(ctx: &Context, fid: FunctionId) -> Option<StrlenMatch> {
         Some(StrlenMatch {
             arr,
             count_param,
-            seed_id: seed.id,
-            entry_block: seed.block,
             header_block: header,
             body_block,
             exit_block,
+            preheader,
             deletable,
         })
     }
@@ -1122,14 +1067,15 @@ fn apply_strlen(ctx: &mut Context, fid: FunctionId, m: &StrlenMatch) -> bool {
         //   1. drop the exit's count param (rewrites the header cbranch's exit-edge
         //      args while the header still exists),
         //   2. reroute the preheader straight to the (now param-less) exit,
-        //   3. strip the seed store and delete the dead loop blocks.
+        //   3. delete the dead loop blocks. (There is no seed store to strip — the
+        //      `at`-form scan reads the root array param directly.)
         let kx = BasicBlock::from_id(ctx, m.exit_block)
             .params()
             .position(|p| p.id() == m.count_param);
         if let Some(kx) = kx {
             crate::dce::remove_params_from_block(ctx, m.exit_block, &HashSet::from_iter([kx]));
         }
-        if let Some(term) = BasicBlock::from_id(ctx, m.entry_block).iter().last() {
+        if let Some(term) = BasicBlock::from_id(ctx, m.preheader).iter().last() {
             let term_id = term.id;
             ctx.replace_instruction_mnemonic(
                 term_id,
@@ -1138,14 +1084,13 @@ fn apply_strlen(ctx: &mut Context, fid: FunctionId, m: &StrlenMatch) -> bool {
                     args: Vec::new(),
                 }),
             );
-            ctx.add_cfg_edge(m.entry_block, m.exit_block);
+            ctx.add_cfg_edge(m.preheader, m.exit_block);
         }
-        ctx.remove_instruction(m.seed_id);
         BasicBlock::from_id_mut(ctx, m.body_block).delete(fid);
         BasicBlock::from_id_mut(ctx, m.header_block).delete(fid);
     }
-    // Otherwise the loop also feeds outside consumers, so it keeps running with its
-    // shadow channel intact; only the count was forwarded to `len` above.
+    // Otherwise the loop also feeds outside consumers, so it keeps running; only the
+    // count was forwarded to `len` above.
     true
 }
 
@@ -1945,16 +1890,21 @@ mod tests {
         })
     }
 
-    /// A bounded NUL-scan over a snapshot is rewritten so its escaping length is
-    /// `len(take_while(@arr))` over the source array.
+    /// A bounded NUL-scan over an argpromote snapshot: `array_reads` first rewrites
+    /// the shadow lane loads to `at(@arr, i)`, then the strlen recognizer folds the
+    /// escaping length to `len(take_while(@arr))` over the source array.
     #[test]
-    fn bounded_nul_scan_recognized_as_len_take_while() {
+    fn array_reads_then_strlen_folds_nul_scan() {
         let mut tc = TestContext::new();
         let (fid, exit, arr) = build_strlen_loop(&mut tc, /*extra_break*/ false);
 
         assert!(
+            run_function_pass::<crate::mem::array_reads::ArrayReads>(&mut tc.ctx, fid).unwrap(),
+            "array_reads promotes the read-only shadow snapshot to at(@arr, i)"
+        );
+        assert!(
             recognize_strlens(&mut tc.ctx),
-            "bounded NUL-scan must recognize"
+            "bounded NUL-scan must recognize on the at-form"
         );
         assert_eq!(
             len_take_while_src(&tc.ctx, exit),
@@ -1962,16 +1912,23 @@ mod tests {
             "the escaping count becomes len(take_while(@arr))"
         );
         assert!(Function::from_id(&tc.ctx, fid).is_pure());
+        // The private scan is deleted: only entry + exit remain.
+        assert_eq!(
+            Function::from_id(&tc.ctx, fid).iter().count(),
+            2,
+            "the dead scan loop is removed"
+        );
     }
 
     /// A loop with a second data-dependent exit (a `break` besides the NUL test) is
     /// not a clean `take_while`: its count is the first of *either* terminator, not
-    /// the first zero, so recognition must decline.
+    /// the first zero, so recognition must decline even after `array_reads`.
     #[test]
     fn second_break_is_not_a_strlen() {
         let mut tc = TestContext::new();
-        let (_fid, exit, _arr) = build_strlen_loop(&mut tc, /*extra_break*/ true);
+        let (fid, exit, _arr) = build_strlen_loop(&mut tc, /*extra_break*/ true);
 
+        run_function_pass::<crate::mem::array_reads::ArrayReads>(&mut tc.ctx, fid).unwrap();
         assert!(
             !recognize_strlens(&mut tc.ctx),
             "a loop with a second exit is not a NUL-scan strlen"
@@ -1983,14 +1940,18 @@ mod tests {
         );
     }
 
-    /// A copy loop (which *stores*) is not a NUL-scan strlen — the read-only gate
-    /// rejects it, leaving it for the map recognizer.
+    /// A copy loop (which *stores*) is not a NUL-scan strlen: `array_reads` refuses
+    /// the region (a non-seed store), and the strlen recognizer finds no `at` scan.
     #[test]
     fn copy_loop_is_not_a_strlen() {
         let mut tc = TestContext::new();
-        let (_fid, exit, _arr) =
+        let (fid, exit, _arr) =
             build_copy_loop(&mut tc, /*distinct_dst*/ true, /*stray*/ false);
 
+        assert!(
+            !run_function_pass::<crate::mem::array_reads::ArrayReads>(&mut tc.ctx, fid).unwrap(),
+            "array_reads declines a region with a store"
+        );
         assert!(
             !recognize_strlens(&mut tc.ctx),
             "a loop that stores is not a read-only NUL-scan"

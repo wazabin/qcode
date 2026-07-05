@@ -298,17 +298,32 @@ scope = "module"
 passes = ["mark_pure", "module(gvn)", "module(dce)", "module(dead_store)", "assume_arg_frame", "argpromote"]
 repeat_until = "no_change"
 
-# Recognize a total element-wise array loop left by `argpromote`'s region
-# snapshot (a dynamic-index buffer rewrite, e.g. a byte decrypt loop) and rewrite
-# its returned write-set value to a single `map` over the snapshot array, outlining
-# the per-element body into a fresh pure function. Runs after `mark-pure` because
-# it only considers `is_pure` callees, and deletes the now-dead shadow loop itself.
-# The `Extract`/`Range`-of-`map` rewrite in the `gvn` below then projects an
-# element back to a `body(k, in[k])` call at the caller. See `ARGPROMOTE_ARRAY_MAP.md`.
+# Promote bounded memory regions in pure functions to first-class array values so
+# the fold recognizers below see the canonical carried-array form. `array_promote`
+# rewrites the canonical fill/scan loop `argpromote` left as a region snapshot into
+# a single loop-carried array (`insert`/`at`); `array_reads` rewrites a read-only
+# snapshot (a NUL scan) to direct `at(arr, i)` reads; then `gvn`/`dce`/`dead_store`
+# coalesce the trivial pass-through params and sweep the now-dead region
+# loads/stores (including the unread wide temp store of a private shadow region,
+# which the map matcher's "no RAM store consumer" arm relies on).
 [[stage]]
-name = "loop-to-map"
+name = "array-promote"
+scope = "function"
+passes = ["array_promote", "array_reads", "gvn", "dce", "dead_store"]
+
+# Fold the promoted carried-array loops. `loop_to_scan` folds accumulator scans
+# (a lane-0 seed insert + `at(arr, i-1)` carry) to `scanl`; `loop_to_map` folds the
+# seedless element-wise maps to `map` (outlining the per-element body into a fresh
+# pure function) and the read-only NUL scans to `len(take_while(arr))`. The two
+# recognizers are mutually exclusive on any one function (seed insert present vs
+# absent), so order does not affect correctness — scan runs first for determinism.
+# Runs after `mark-pure`/`array-promote` because both only consider `is_pure`
+# callees. The `Extract`/`Range`-of-`map` rewrite in the `gvn` below then projects
+# an element back to a `body(k, in[k])` call at the caller.
+[[stage]]
+name = "loop-fold"
 scope = "module"
-passes = ["loop_to_map"]
+passes = ["module(loop_to_scan)", "loop_to_map"]
 
 # Infer per-parameter `readonly` / `nocapture` pointer attributes bottom-up over
 # the now-functionalized (`pure_reg`) functions, whose positional arguments align
