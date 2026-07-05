@@ -179,6 +179,62 @@ fn pointer_literals_are_tracked() {
     );
 }
 
+// The `zext`/`sext`/`range`/`gep` peels all take the same `PeelAction::Peel(src)`
+// code path as the align-mask peel exercised by `aligned_sp_peels_to_base` below
+// (recurse into the source pointer, guarding on space). Constructing a *same-space*
+// widened- or gep-pointer in isolation fights the builder's typing rules (a zext
+// strips the pointer type, routing a load through it into a different space; a gep
+// needs a struct-pointer base that also resolves to a concrete location), so those
+// arms are covered structurally by the align test here and end-to-end by the
+// dump-all oracle on real binaries.
+
+/// A realigned pointer `vn & -16` peels to `vn` for aliasing (the mask only
+/// lowers the address), but records no exact interval (the address is unknown).
+#[test]
+fn aligned_sp_peels_to_base() {
+    let mut vn = None;
+    let mut aligned = None;
+    let (ctx, _, _) = build_in_custom_space(|b, space| {
+        let v = Varnode::make(b.context_mut(), 0, 8, space).id;
+        let neg16 = b.context_mut().get_const((-16i64) as u64, 8).id();
+        let p = b.push_bit_and(v.into(), neg16).id();
+        b.push_load::<false>(v.into(), 8, space);
+        b.push_load::<false>(p, 8, space);
+        vn = Some(v);
+        aligned = Some(p);
+    });
+    let vn = vn.unwrap();
+    let aligned = aligned.unwrap();
+    let result = AliasResult::simple(&ctx);
+    assert!(matches!(result.alias_class(aligned), Some(NodeId::Id(_))));
+    assert_eq!(result.alias_class(aligned), result.alias_class(vn.into()));
+    assert!(
+        result.interval(aligned).is_none(),
+        "a realigned pointer has no exact interval"
+    );
+}
+
+/// A non-alignment mask (`vn & 0xff`) is not a realignment: it does not peel and
+/// degrades to `Unknown`.
+#[test]
+fn non_align_mask_does_not_peel() {
+    let mut masked = None;
+    let (ctx, _, _) = build_in_custom_space(|b, space| {
+        let v = Varnode::make(b.context_mut(), 0, 8, space).id;
+        let m = b.context_mut().get_const(0xff, 8).id();
+        let p = b.push_bit_and(v.into(), m).id();
+        b.push_load::<false>(p, 8, space);
+        masked = Some(p);
+    });
+    let masked = masked.unwrap();
+    let result = AliasResult::simple(&ctx);
+    assert_eq!(
+        result.alias_class(masked),
+        Some(NodeId::Unknown),
+        "a non-alignment mask does not name a resolvable location"
+    );
+}
+
 #[test]
 fn literal_straddles_two_disjoint_varnode_classes_joins_them() {
     let mut a = None;

@@ -212,48 +212,111 @@ impl<'a> Analysis<'a> {
             ValueId::Literal(_) => self.assign_literal_root(value, space, size),
 
             ValueId::Instruction(id) => {
-                // TODO: this should have the same invariant as the varnode case
-                if ValueRef::from_id(self.ctx, value).space().map(|s| s.id) != Some(space) {
-                    return NodeId::Unknown;
-                }
-
-                // Copy out lhs/rhs/op before any recursive &mut self call so the
-                // temporary borrow of self.ctx is released.
-                let binop = match self.ctx.get_insn(id).mnemonic() {
+                // Decide what to peel while the ctx borrow from `mnemonic()` is live,
+                // copying out only the owned operands needed, then act after it ends
+                // (the recursive resolve takes `&mut self`).
+                let action = match self.ctx.get_insn(id).mnemonic() {
                     Mnemonic::Binop(bin)
                         if matches!(bin.op, Binop::Int(IntBinop::Add | IntBinop::Sub)) =>
                     {
-                        Some((bin.op, bin.lhs, bin.rhs))
+                        PeelAction::AddSub(bin.op, bin.lhs, bin.rhs)
                     }
-                    _ => None,
+                    // A realigned pointer `p & -2^k` (a `sub rsp,-N` frame realign, or
+                    // any align-down) names the same location as `p` for aliasing: the
+                    // mask only lowers the address. Peel to the non-mask operand.
+                    Mnemonic::Binop(bin) if matches!(bin.op, Binop::Int(IntBinop::And)) => {
+                        match align_peel_target(self.ctx, bin.lhs, bin.rhs) {
+                            Some(base) => PeelAction::Peel(base),
+                            None => PeelAction::Unknown,
+                        }
+                    }
+                    // A widened/narrowed or typed-arithmetic pointer names the same
+                    // location as its source. Root propagation only *adds* may-alias
+                    // edges, so this stays sound; no exact interval is recorded.
+                    Mnemonic::Zext(z) => PeelAction::Peel(z.src),
+                    Mnemonic::Sext(s) => PeelAction::Peel(s.src),
+                    Mnemonic::Range(r) => PeelAction::Peel(r.src),
+                    Mnemonic::Gep(g) => PeelAction::Peel(g.base),
+                    _ => PeelAction::Unknown,
                 };
 
-                let Some((op, lhs, rhs)) = binop else {
-                    return NodeId::Unknown;
-                };
+                match action {
+                    PeelAction::AddSub(op, lhs, rhs) => {
+                        if ValueRef::from_id(self.ctx, value).space().map(|s| s.id) != Some(space) {
+                            return NodeId::Unknown;
+                        }
+                        let lhs_space = ValueRef::from_id(self.ctx, lhs).space().map(|s| s.id);
+                        let rhs_space = ValueRef::from_id(self.ctx, rhs).space().map(|s| s.id);
 
-                let lhs_space = ValueRef::from_id(self.ctx, lhs).space().map(|s| s.id);
-                let rhs_space = ValueRef::from_id(self.ctx, rhs).space().map(|s| s.id);
-
-                if lhs_space == Some(space) && rhs_space != Some(space) {
-                    self.resolve_pointer_root(lhs, space, size)
-                } else if matches!(op, Binop::Int(IntBinop::Add))
-                    && rhs_space == Some(space)
-                    && lhs_space != Some(space)
-                {
-                    self.resolve_pointer_root(rhs, space, size)
-                } else if lhs_space.is_none() && rhs_space.is_none() {
-                    NodeId::Unknown
-                } else {
-                    log::error!(
-                        "Odd pointer arithmetic: {value} = {lhs} {op} {rhs} with mismatched spaces {lhs_space:?} vs {rhs_space:?}; degrading to Unknown"
-                    );
-                    NodeId::Unknown
+                        if lhs_space == Some(space) && rhs_space != Some(space) {
+                            self.resolve_pointer_root(lhs, space, size)
+                        } else if matches!(op, Binop::Int(IntBinop::Add))
+                            && rhs_space == Some(space)
+                            && lhs_space != Some(space)
+                        {
+                            self.resolve_pointer_root(rhs, space, size)
+                        } else if lhs_space.is_none() && rhs_space.is_none() {
+                            NodeId::Unknown
+                        } else {
+                            log::error!(
+                                "Odd pointer arithmetic: {value} = {lhs} {op} {rhs} with mismatched spaces {lhs_space:?} vs {rhs_space:?}; degrading to Unknown"
+                            );
+                            NodeId::Unknown
+                        }
+                    }
+                    // Peel only when the source shares the access space (a typed
+                    // pointer) or has none (an untyped/scalar carrier); a source in a
+                    // *different* space would be an unrelated location.
+                    PeelAction::Peel(src) => {
+                        let src_space = ValueRef::from_id(self.ctx, src).space().map(|s| s.id);
+                        if src_space == Some(space) || src_space.is_none() {
+                            self.resolve_pointer_root(src, space, size)
+                        } else {
+                            NodeId::Unknown
+                        }
+                    }
+                    PeelAction::Unknown => NodeId::Unknown,
                 }
             }
 
             _ => NodeId::Unknown,
         }
+    }
+}
+
+/// What [`Analysis::resolve_pointer_root`] does with an instruction pointer,
+/// computed while the `mnemonic()` borrow is live and acted on after it ends.
+enum PeelAction {
+    /// `add`/`sub` — resolve the pointer-typed operand (existing behavior).
+    AddSub(Binop, ValueId, ValueId),
+    /// A cast / gep / align-mask — propagate the root of this single source.
+    Peel(ValueId),
+    /// Unresolvable — degrade to [`NodeId::Unknown`].
+    Unknown,
+}
+
+/// The literal value of `v`, if it is a literal.
+fn literal_value(ctx: &Context, v: ValueId) -> Option<u64> {
+    match ValueRef::new(v, ctx) {
+        ValueRef::Literal(l) => Some(l.value()),
+        _ => None,
+    }
+}
+
+/// Whether `m` is a round-down alignment mask (`-2^k`): nonzero, with the bits it
+/// clears forming a contiguous low run. `x & m ≤ x`, so the masked pointer names
+/// the same region as `x`. Mirrors `gvn::affine::is_round_down_mask`.
+fn is_align_mask(m: u64) -> bool {
+    m != 0 && (!m).wrapping_add(1).is_power_of_two()
+}
+
+/// For an `and`, the non-mask operand when the other is an alignment mask
+/// (`p & -2^k`). `None` if neither operand is such a mask.
+fn align_peel_target(ctx: &Context, lhs: ValueId, rhs: ValueId) -> Option<ValueId> {
+    match (literal_value(ctx, lhs), literal_value(ctx, rhs)) {
+        (Some(m), _) if is_align_mask(m) => Some(rhs),
+        (_, Some(m)) if is_align_mask(m) => Some(lhs),
+        _ => None,
     }
 }
 
