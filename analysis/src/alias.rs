@@ -46,6 +46,14 @@ pub(crate) struct FrameInfo {
     caller_frame_assumed: bool,
     /// Hoisted [`Proposition::LoadedPointerDisjointFromSlot`] truth.
     loaded_ptr_assumed: bool,
+    /// `true` when this activation never lets any own-frame address escape: no
+    /// frame address is stored to memory, passed to a non-`nocapture` callee
+    /// param, handed to an indirect/opaque sink, or listed in a `call.clobbers`.
+    /// A *sound*, assumption-free bit (a body scan, no `Proposition`) that lets
+    /// an own-frame local be proven disjoint from a pointer loaded from memory or
+    /// derived from a call result — nothing in memory can name a slot this
+    /// activation never let out. See [`FrameInfo::disjoint_by_provenance`] rule A.
+    frame_uncaptured: bool,
     /// Memoized per-value provenance classification (see [`provenance`]). Behind
     /// a `RefCell` so [`AliasResult::provably_disjoint`] keeps its `&self`
     /// signature; the result is used single-threaded within a pass.
@@ -252,6 +260,7 @@ impl AliasResult {
         let loaded_ptr_assumed = ctx
             .truth(Proposition::LoadedPointerDisjointFromSlot(fid))
             .is_some_and(|t| t.value);
+        let frame_uncaptured = !frame_is_captured(ctx, fid, &numbering, sp);
         self.frame = Some(FrameInfo {
             root_block,
             sp_param: sp,
@@ -259,10 +268,70 @@ impl AliasResult {
             numbering,
             caller_frame_assumed,
             loaded_ptr_assumed,
+            frame_uncaptured,
             provenance: RefCell::new(HashMap::default()),
         });
         self
     }
+}
+
+/// Whether any own-frame address escapes this activation — the negation of
+/// [`FrameInfo::frame_uncaptured`]. A frame address is *captured* when a value
+/// classifying to [`FrameClass::Local`] is:
+///
+/// - the `src` of a `Store` (the address itself written to memory), or
+/// - argument `j` of a direct `Call` whose callee param `j` is not `nocapture`
+///   (a callee with no signature has no `nocapture` bit, so it captures), or
+/// - present in a `Call`'s `clobbers` (a location the callee writes), or
+/// - an argument of a `CallInd`, or an operand of an opaque op (`PCodeOp` /
+///   `Map` / `Scan`) that may have arbitrary memory effects.
+///
+/// Passing a frame address to a `nocapture` param does **not** capture it — that
+/// is the whole point of the bit. `Intrinsic` is categorically pure (no memory
+/// effects), so it cannot capture and needs no case. A frame address merely
+/// loaded through, offset, or *returned* is not captured: a return hands the
+/// address back as a call *result* in the caller (classified via
+/// [`FrameInfo::classify`]'s call arm), never into this function's memory.
+fn frame_is_captured(ctx: &Context, fid: FunctionId, numbering: &Numbering, sp: ValueId) -> bool {
+    let is_own_frame =
+        |v: ValueId| matches!(frame_class(ctx, numbering, sp, v), Some(FrameClass::Local));
+    for block in Function::from_id(ctx, fid).blocks() {
+        for insn in block.iter() {
+            match insn.mnemonic() {
+                Mnemonic::Store(s) => {
+                    if is_own_frame(s.src) {
+                        return true;
+                    }
+                }
+                Mnemonic::Call(c) => {
+                    for (j, &arg) in c.args.iter().enumerate() {
+                        if is_own_frame(arg)
+                            && !Function::from_id(ctx, c.target)
+                                .param_attr(j)
+                                .is_some_and(|a| a.nocapture)
+                        {
+                            return true;
+                        }
+                    }
+                    if c.clobbers.iter().any(|&cl| is_own_frame(cl)) {
+                        return true;
+                    }
+                }
+                Mnemonic::CallInd(c) => {
+                    if c.args.iter().any(|&arg| is_own_frame(arg)) {
+                        return true;
+                    }
+                }
+                Mnemonic::PCodeOp(_) | Mnemonic::Map(_) | Mnemonic::Scan(_) => {
+                    if insn.mnemonic().args().iter().any(|&arg| is_own_frame(arg)) {
+                        return true;
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    false
 }
 
 impl FrameInfo {
@@ -318,6 +387,7 @@ impl FrameInfo {
             }
             ValueId::Instruction(id) => match Instruction::from_id(ctx, id).mnemonic() {
                 Mnemonic::Load(_) => P::LOADED,
+                Mnemonic::Call(c) => self.classify_call_result(ctx, c),
                 Mnemonic::Zext(z) => self.provenance(ctx, z.src),
                 Mnemonic::Sext(s) => self.provenance(ctx, s.src),
                 Mnemonic::Range(r) => self.provenance(ctx, r.src),
@@ -339,6 +409,34 @@ impl FrameInfo {
             },
             _ => P::OPAQUE,
         }
+    }
+
+    /// Classify a direct-call *result* (Refinement B). A callee that cannot
+    /// squirrel away any argument — every argument flows into a `nocapture` param
+    /// and it writes no pointer clobbers — returns only what it derived from its
+    /// args, from memory it read (`LOADED`), or from the static image
+    /// (`GLOBAL_STATIC`). So the result's provenance is the union of the args'
+    /// provenances widened by `LOADED | GLOBAL_STATIC`. Any callee with a
+    /// non-`nocapture` (or unknown/signatureless) param, or a non-empty clobber
+    /// set, stays `OPAQUE` — the classifier's default for a call.
+    ///
+    /// Capture-by-return: if an argument is itself an own-frame address (passed to
+    /// a `nocapture` param, then handed back), the union carries `OWN_FRAME`, so
+    /// the result is *not* a subset of rule A's `INPUT|LOADED|GLOBAL_STATIC` mask
+    /// and stays correctly non-disjoint from the frame.
+    fn classify_call_result(&self, ctx: &Context, c: &qcode::value::insn::Call) -> Provenance {
+        use Provenance as P;
+        let callee = Function::from_id(ctx, c.target);
+        let all_nocapture = c.clobbers.is_empty()
+            && (0..c.args.len()).all(|j| callee.param_attr(j).is_some_and(|a| a.nocapture));
+        if !all_nocapture {
+            return P::OPAQUE;
+        }
+        let mut acc = P::LOADED.union(P::GLOBAL_STATIC);
+        for &arg in &c.args {
+            acc = acc.union(self.provenance(ctx, arg));
+        }
+        acc
     }
 
     /// Union the provenance of an add/sub's operands, dropping constant offsets
@@ -378,6 +476,22 @@ impl FrameInfo {
         {
             return true;
         }
+        // Rule A (sound, `frame_uncaptured`): an own-frame local ⊥ any pointer
+        // that came from the caller, from memory, or from the static image. If
+        // this activation never let a frame address escape (see
+        // [`frame_is_captured`]), then nothing in the caller's hands (`INPUT`),
+        // nothing readable from memory (`LOADED`, incl. an all-nocapture call
+        // result — see [`classify`]'s call arm), and nothing in the static image
+        // (`GLOBAL_STATIC`) can name a slot of it. Assumption-free — no
+        // `Proposition`, no replay rollback — unlike rule 1c / rule 2. Rule 1
+        // above stays unconditional because own-frame ⊥ `INPUT` holds even when
+        // the frame *is* captured (the caller's pointer predates our frame).
+        if self.frame_uncaptured
+            && px.is_pure(P::OWN_FRAME)
+            && py.is_nonempty_subset_of(P::INPUT.union(P::LOADED).union(P::GLOBAL_STATIC))
+        {
+            return true;
+        }
         // Rule 1c (assumed): a globalized-global slot ⊥ a pointer *loaded from it*.
         // Excludes a slot from itself (a bare global has no LOADED bit) and mixed
         // `load(x) + @glob2` shapes (the global bit may re-enter the static image).
@@ -390,12 +504,19 @@ impl FrameInfo {
             return true;
         }
         // Rule 2 (assumed): a caller-frame slot ⊥ an incoming pointer, and — under
-        // the loaded-pointer assumption — a pointer reloaded from a slot.
+        // the loaded-pointer assumption — a pointer reloaded from a slot, from the
+        // static image, or an all-nocapture call result derived from those. The
+        // mask includes `GLOBAL_STATIC`: a caller-frame slot is stack-rooted, so ⊥
+        // the static image by the same argument as rule 1b (which already covers a
+        // *pure* global; the widening admits mixed `INPUT|LOADED|GLOBAL_STATIC`
+        // call results).
         if self.caller_frame_assumed && px.is_pure(P::CALLER_FRAME) {
             if py.is_pure(P::INPUT) {
                 return true;
             }
-            if self.loaded_ptr_assumed && py.is_nonempty_subset_of(P::INPUT.union(P::LOADED)) {
+            if self.loaded_ptr_assumed
+                && py.is_nonempty_subset_of(P::INPUT.union(P::LOADED).union(P::GLOBAL_STATIC))
+            {
                 return true;
             }
         }
@@ -914,9 +1035,15 @@ mod tests {
             (local, caller_arg, mix)
         };
 
-        // No assumptions: not disjoint from an own-frame local.
+        // No assumptions: the own-frame local *is* disjoint from `arg + load(p)`
+        // via the sound Refinement A — this activation captures nothing, so no
+        // caller pointer or loaded value can name a slot of its frame. The
+        // caller-frame slot, by contrast, still needs the assumed rule 2 below.
         let r = AliasResult::simple(&tc.ctx).with_frame_freshness(&tc.ctx, fid, Some(sp_reg));
-        assert!(!r.provably_disjoint(&tc.ctx, local, mix));
+        assert!(
+            r.provably_disjoint(&tc.ctx, local, mix),
+            "own-frame ⊥ input|loaded when the frame is uncaptured (Refinement A)"
+        );
         assert!(!r.provably_disjoint(&tc.ctx, caller_arg, mix));
 
         // Only the caller-frame assumption: still opaque (the load is not admitted).
@@ -984,6 +1111,293 @@ mod tests {
         assert_eq!(
             after_first, after_second,
             "the second query classifies nothing new"
+        );
+    }
+
+    // === Step 8: nocapture-driven frame-freshness refinements ===============
+
+    use qcode::value::insn::{Call, CallInd};
+    use qcode::value::{BasicBlock, Function, ParamAttrs, Value};
+
+    /// Make function `name` with an `@SP` root param (origin = `sp_reg`); returns
+    /// `(fid, root_block, @SP value)`.
+    fn fn_with_sp(
+        tc: &mut qcode::testing::TestContext,
+        name: &'static str,
+        addr: u64,
+        sp_reg: VarnodeId,
+    ) -> (FunctionId, BlockId, ValueId) {
+        let fid = Function::make(&mut tc.ctx, name.into()).unwrap().id;
+        let root = tc.ctx.get_or_make_block(addr);
+        {
+            let mut f = Function::from_id_mut(&mut tc.ctx, fid);
+            f.set_root(root).unwrap();
+            f.add_block(root);
+        }
+        let sp_pid = BasicBlock::from_id_mut(&mut tc.ctx, root).push_param(8).id;
+        tc.ctx.values.block_params[sp_pid].origin = Some(ValueId::Varnode(sp_reg));
+        (fid, root, ValueId::BlockParam(sp_pid))
+    }
+
+    /// A bodyless callee carrying the given per-param attributes.
+    fn callee_with_attrs(
+        tc: &mut qcode::testing::TestContext,
+        name: &'static str,
+        attrs: Vec<ParamAttrs>,
+    ) -> FunctionId {
+        let fid = Function::make(&mut tc.ctx, name.into()).unwrap().id;
+        Function::from_id_mut(&mut tc.ctx, fid).set_param_attrs(attrs);
+        fid
+    }
+
+    const NOCAPTURE: ParamAttrs = ParamAttrs {
+        readonly: false,
+        nocapture: true,
+    };
+    const CAPTURES: ParamAttrs = ParamAttrs {
+        readonly: false,
+        nocapture: false,
+    };
+
+    /// Refinement A (sound): when the frame is never captured, an own-frame local
+    /// is disjoint from a pointer loaded from memory — which rule 1/1b/1c cannot
+    /// prove (a `LOADED` pointer could be an escaped-and-reloaded frame address,
+    /// but here nothing escaped).
+    #[test]
+    fn uncaptured_own_frame_disjoint_from_loaded_pointer() {
+        use qcode::builder::Builder;
+        let mut tc = qcode::testing::TestContext::new();
+        let sp_reg = tc.r0;
+        let (fid, root, sp) = fn_with_sp(&mut tc, "f", 0x1000, sp_reg);
+        let ram = tc.ctx.default_space;
+
+        let (local, loaded) = {
+            let mut b = Builder::from_block(BasicBlock::from_id_mut(&mut tc.ctx, root));
+            let c8 = b.context_mut().get_const(8, 8).id();
+            let local = b.push_sub(sp, c8).id(); // @SP - 8 (own-frame local)
+            let g = b.context_mut().get_const(0x404040, 8).id();
+            let loaded = b.push_load::<false>(g, 8, ram).id(); // load(global) -> LOADED
+            unsafe { b.dont_finalize() };
+            (local, loaded)
+        };
+
+        let r = AliasResult::simple(&tc.ctx).with_frame_freshness(&tc.ctx, fid, Some(sp_reg));
+        assert!(
+            r.frame.as_ref().unwrap().frame_uncaptured,
+            "nothing captures the frame"
+        );
+        assert!(
+            r.provably_disjoint(&tc.ctx, local, loaded),
+            "own-frame local ⊥ a loaded pointer when the frame is uncaptured"
+        );
+        assert!(r.provably_disjoint(&tc.ctx, loaded, local), "symmetric");
+    }
+
+    /// A frame address written to memory captures it, so Refinement A goes inert:
+    /// the own-frame local is no longer proven disjoint from a loaded pointer
+    /// (which could now be the escaped address reloaded).
+    #[test]
+    fn captured_by_store_makes_refinement_a_inert() {
+        use qcode::builder::Builder;
+        let mut tc = qcode::testing::TestContext::new();
+        let sp_reg = tc.r0;
+        let (fid, root, sp) = fn_with_sp(&mut tc, "f", 0x1000, sp_reg);
+        let ram = tc.ctx.default_space;
+
+        let (local, loaded) = {
+            let mut b = Builder::from_block(BasicBlock::from_id_mut(&mut tc.ctx, root));
+            let c8 = b.context_mut().get_const(8, 8).id();
+            let local = b.push_sub(sp, c8).id(); // @SP - 8
+            let g = b.context_mut().get_const(0x404040, 8).id();
+            b.push_store(local, g, ram); // *global = local  (frame address escapes)
+            let loaded = b.push_load::<false>(g, 8, ram).id();
+            unsafe { b.dont_finalize() };
+            (local, loaded)
+        };
+
+        let r = AliasResult::simple(&tc.ctx).with_frame_freshness(&tc.ctx, fid, Some(sp_reg));
+        assert!(
+            !r.frame.as_ref().unwrap().frame_uncaptured,
+            "storing the frame address captures the frame"
+        );
+        assert!(
+            !r.provably_disjoint(&tc.ctx, local, loaded),
+            "Refinement A is inert once the frame is captured"
+        );
+    }
+
+    /// Passing a frame address to a `nocapture` callee param does not capture it;
+    /// passing it to a capturing (or signatureless) callee, or to `CallInd`, does.
+    #[test]
+    fn call_capture_respects_nocapture_bit() {
+        use qcode::builder::Builder;
+
+        // Helper: build `f` that calls `configure` to emit a call taking `@SP-8`,
+        // then report `frame_uncaptured`.
+        fn uncaptured_after(
+            configure: impl FnOnce(&mut qcode::testing::TestContext, FunctionId) -> FunctionId,
+            indirect: bool,
+        ) -> bool {
+            let mut tc = qcode::testing::TestContext::new();
+            let sp_reg = tc.r0;
+            let (fid, root, sp) = fn_with_sp(&mut tc, "f", 0x1000, sp_reg);
+            let callee = configure(&mut tc, fid);
+            let cid = {
+                let mut b = Builder::from_block(BasicBlock::from_id_mut(&mut tc.ctx, root));
+                let c8 = b.context_mut().get_const(8, 8).id();
+                let local = b.push_sub(sp, c8).id(); // @SP - 8
+                let cid = if indirect {
+                    let t = b.context_mut().get_const(0x9000, 8).id();
+                    b.push_call_ind(t).id
+                } else {
+                    b.push_call(callee).id
+                };
+                unsafe { b.dont_finalize() };
+                (cid, local)
+            };
+            let (cid, local) = cid;
+            let mn = if indirect {
+                Mnemonic::CallInd(CallInd {
+                    ptr: match tc.ctx.get_insn(cid).mnemonic() {
+                        Mnemonic::CallInd(c) => c.ptr,
+                        _ => unreachable!(),
+                    },
+                    args: vec![local],
+                })
+            } else {
+                Mnemonic::Call(Call {
+                    target: callee,
+                    args: vec![local],
+                    clobbers: vec![],
+                })
+            };
+            tc.ctx.replace_instruction_mnemonic(cid, mn);
+            let r = AliasResult::simple(&tc.ctx).with_frame_freshness(&tc.ctx, fid, Some(sp_reg));
+            r.frame.as_ref().unwrap().frame_uncaptured
+        }
+
+        assert!(
+            uncaptured_after(|tc, _| callee_with_attrs(tc, "g", vec![NOCAPTURE]), false),
+            "a frame address into a nocapture param does not capture the frame"
+        );
+        assert!(
+            !uncaptured_after(|tc, _| callee_with_attrs(tc, "g", vec![CAPTURES]), false),
+            "a frame address into a capturing param captures the frame"
+        );
+        assert!(
+            !uncaptured_after(
+                |tc, _| Function::make(&mut tc.ctx, "g".into()).unwrap().id,
+                false
+            ),
+            "a frame address into a signatureless callee captures the frame"
+        );
+        assert!(
+            !uncaptured_after(|_, fid| fid, true),
+            "a frame address into an indirect call captures the frame"
+        );
+    }
+
+    /// Refinement B: the result of an all-`nocapture` direct call is classified
+    /// as the union of its args' provenances widened by `LOADED | GLOBAL_STATIC`,
+    /// so an own-frame local (uncaptured) is disjoint from `g(input)`. A callee
+    /// with a capturing (or missing) param leaves the result `OPAQUE` — not
+    /// disjoint.
+    #[test]
+    fn all_nocapture_call_result_classified_from_args() {
+        use qcode::builder::Builder;
+
+        fn local_disjoint_from_call_result(attrs: Vec<ParamAttrs>) -> bool {
+            let mut tc = qcode::testing::TestContext::new();
+            let sp_reg = tc.r0;
+            let (fid, root, sp) = fn_with_sp(&mut tc, "f", 0x1000, sp_reg);
+            // A caller-supplied (INPUT) data pointer param.
+            let arg_pid = BasicBlock::from_id_mut(&mut tc.ctx, root).push_param(8).id;
+            let input = ValueId::BlockParam(arg_pid);
+            let callee = callee_with_attrs(&mut tc, "g", attrs);
+
+            let (local, call_result) = {
+                let mut b = Builder::from_block(BasicBlock::from_id_mut(&mut tc.ctx, root));
+                let c8 = b.context_mut().get_const(8, 8).id();
+                let local = b.push_sub(sp, c8).id(); // @SP - 8
+                let cr = b.push_call(callee).id;
+                unsafe { b.dont_finalize() };
+                (local, cr)
+            };
+            tc.ctx.replace_instruction_mnemonic(
+                call_result,
+                Mnemonic::Call(Call {
+                    target: callee,
+                    args: vec![input], // g(input): INPUT arg, does not capture the frame
+                    clobbers: vec![],
+                }),
+            );
+            let r = AliasResult::simple(&tc.ctx).with_frame_freshness(&tc.ctx, fid, Some(sp_reg));
+            assert!(
+                r.frame.as_ref().unwrap().frame_uncaptured,
+                "an INPUT arg does not capture the frame"
+            );
+            r.provably_disjoint(&tc.ctx, local, ValueId::Instruction(call_result))
+        }
+
+        assert!(
+            local_disjoint_from_call_result(vec![NOCAPTURE]),
+            "own-frame ⊥ an all-nocapture call result (INPUT|LOADED|GLOBAL_STATIC)"
+        );
+        assert!(
+            !local_disjoint_from_call_result(vec![CAPTURES]),
+            "a capturing callee leaves its result OPAQUE — not disjoint"
+        );
+        assert!(
+            !local_disjoint_from_call_result(vec![]),
+            "a signatureless callee leaves its result OPAQUE — not disjoint"
+        );
+    }
+
+    /// Widened rule 2: under `ArgsDisjointFromCallerFrame` +
+    /// `LoadedPointerDisjointFromSlot`, a caller-frame slot is disjoint from a
+    /// mixed `INPUT | GLOBAL_STATIC` pointer (an all-nocapture call result shape).
+    /// Rule 1b does not cover it (the `INPUT` bit makes it impure), and it is not
+    /// disjoint without the assumptions.
+    #[test]
+    fn widened_rule2_caller_frame_disjoint_from_input_global_mix() {
+        use qcode::assumption::Proposition;
+        use qcode::builder::Builder;
+        let mut tc = qcode::testing::TestContext::new();
+        let sp_reg = tc.r0;
+        let (fid, root, sp) = fn_with_sp(&mut tc, "f", 0x1000, sp_reg);
+        // An INPUT param and a globalized-global param.
+        let in_pid = BasicBlock::from_id_mut(&mut tc.ctx, root).push_param(8).id;
+        let input = ValueId::BlockParam(in_pid);
+        let glob_pid = BasicBlock::from_id_mut(&mut tc.ctx, root).push_param(8).id;
+        let glob = ValueId::BlockParam(glob_pid);
+
+        let (caller_slot, mixed, glob_addr) = {
+            let mut b = Builder::from_block(BasicBlock::from_id_mut(&mut tc.ctx, root));
+            let c8 = b.context_mut().get_const(8, 8).id();
+            let caller_slot = b.push_add(sp, c8).id(); // @SP + 8 (caller frame)
+            let mixed = b.push_add(input, glob).id(); // INPUT ∪ GLOBAL_STATIC
+            let glob_addr = b.context_mut().get_const(0x454df8, 8).id();
+            unsafe { b.dont_finalize() };
+            (caller_slot, mixed, glob_addr)
+        };
+        tc.ctx.values.block_params[glob_pid].origin = Some(glob_addr);
+
+        // Without the assumptions, rule 2 is inert and rule 1b cannot fire (mixed
+        // is not a pure global).
+        let plain = AliasResult::simple(&tc.ctx).with_frame_freshness(&tc.ctx, fid, Some(sp_reg));
+        assert!(
+            !plain.provably_disjoint(&tc.ctx, caller_slot, mixed),
+            "no caller-frame disjointness without the assumptions"
+        );
+
+        tc.ctx
+            .assume_true(Proposition::ArgsDisjointFromCallerFrame(fid));
+        tc.ctx
+            .assume_true(Proposition::LoadedPointerDisjointFromSlot(fid));
+        let r = AliasResult::simple(&tc.ctx).with_frame_freshness(&tc.ctx, fid, Some(sp_reg));
+        assert!(
+            r.provably_disjoint(&tc.ctx, caller_slot, mixed),
+            "caller-frame slot ⊥ INPUT|GLOBAL_STATIC under the assumptions (widened mask)"
         );
     }
 }
