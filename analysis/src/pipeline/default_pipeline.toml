@@ -314,16 +314,17 @@ passes = ["array_promote", "array_reads", "gvn", "dce", "dead_store"]
 # Fold the promoted carried-array loops. `loop_to_scan` folds accumulator scans
 # (a lane-0 seed insert + `at(arr, i-1)` carry) to `scanl`; `loop_to_map` folds the
 # seedless element-wise maps to `map` (outlining the per-element body into a fresh
-# pure function) and the read-only NUL scans to `len(take_while(arr))`. The two
-# recognizers are mutually exclusive on any one function (seed insert present vs
-# absent), so order does not affect correctness — scan runs first for determinism.
-# Runs after `mark-pure`/`array-promote` because both only consider `is_pure`
-# callees. The `Extract`/`Range`-of-`map` rewrite in the `gvn` below then projects
-# an element back to a `body(k, in[k])` call at the caller.
+# pure function); `strlen` folds the read-only NUL scans to `len(take_while(arr))`
+# (both the `at`-form snapshot and the raw-`char*` layer). The three recognizers are
+# mutually exclusive on any one function (seed insert present → scan; seedless carry
+# insert → map; sole `at` NUL scan / no snapshot → strlen), so order does not affect
+# correctness. Runs after `mark-pure`/`array-promote` because they only consider
+# `is_pure` callees. The `Extract`/`Range`-of-`map` rewrite in the `gvn` below then
+# projects an element back to a `body(k, in[k])` call at the caller.
 [[stage]]
 name = "loop-fold"
 scope = "module"
-passes = ["module(loop_to_scan)", "loop_to_map"]
+passes = ["module(loop_to_scan)", "loop_to_map", "strlen"]
 
 # Infer per-parameter `readonly` / `nocapture` pointer attributes bottom-up over
 # the now-functionalized (`pure_reg`) functions, whose positional arguments align

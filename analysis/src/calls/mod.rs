@@ -16,6 +16,7 @@ mod param_attrs;
 mod partial_inline;
 mod projection;
 mod stack_facts;
+mod strlen;
 mod summaries;
 
 pub use argpromote::{
