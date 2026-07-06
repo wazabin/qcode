@@ -268,6 +268,13 @@ impl Solver<'_> {
         let mask = all_ones(size);
         let top = ValueRange::top(size);
 
+        // A `bool`-typed result is pinned to `{0, 1}` by the type system — a
+        // strict improvement over sniffing individual op patterns, and what keeps
+        // a bitwise `bool & bool` switch index (lifted `ja`/`jbe`) bounded.
+        if ctx.types.is_bool(insn.type_id()) {
+            return ValueRange { min: 0, max: 1 };
+        }
+
         match insn.mnemonic() {
             Mnemonic::Binop(Binary {
                 op: Binop::Int(op),
@@ -622,29 +629,97 @@ impl Solver<'_> {
                 lhs,
                 rhs,
             }) => {
-                let (lhs, rhs) = (*lhs, *rhs);
-                let l = self.refine_condition(lhs, v, taken, mask, depth + 1);
-                let r = self.refine_condition(rhs, v, taken, mask, depth + 1);
-                // `OR` taken and `AND` not-taken are disjunctions (value in the
-                // union of the operand facts); the other two are conjunctions.
-                let union = (*op == BoolBinop::Or) == taken;
-                if union {
-                    // A union with an unknown operand is unknown — no bound.
-                    match (l, r) {
-                        (Some(a), Some(b)) => Some(hull(a, b)),
-                        _ => None,
-                    }
+                let is_or = *op == BoolBinop::Or;
+                self.refine_connective(*lhs, *rhs, is_or, v, taken, mask, depth)
+            }
+
+            // Logical and/or lowered as bitwise `And`/`Or` over `bool` operands
+            // (the `bool`-migration form of the connectives above).
+            Mnemonic::Binop(Binary {
+                op: Binop::Int(op @ (IntBinop::And | IntBinop::Or)),
+                lhs,
+                rhs,
+            }) if self.is_bool_val(*lhs) && self.is_bool_val(*rhs) => {
+                let is_or = *op == IntBinop::Or;
+                self.refine_connective(*lhs, *rhs, is_or, v, taken, mask, depth)
+            }
+
+            // `x == false` / `x != false` (or `== true`) over a `bool`
+            // sub-condition is a polarity flip — the migration's canonical
+            // negation, replacing `BoolNot`. Recurse into `x` with the flipped
+            // `taken`. Only fires when `x` is itself a bool condition, so a
+            // genuine `v == k` bound on the queried value still falls through.
+            Mnemonic::Binop(Binary {
+                op: Binop::Int(op @ (IntBinop::Equal | IntBinop::NotEqual)),
+                lhs,
+                rhs,
+            }) => {
+                let sub_polarity = |sub: ValueId, c: bool| {
+                    // `Equal` taken ⟺ sub == c; `sub` holds when it equals 1.
+                    let holds = (*op == IntBinop::Equal) == c;
+                    self.refine_condition(sub, v, taken == holds, mask, depth + 1)
+                };
+                if let Some(c) = self.bool_const(*rhs)
+                    && self.is_bool_val(*lhs)
+                {
+                    sub_polarity(*lhs, c)
+                } else if let Some(c) = self.bool_const(*lhs)
+                    && self.is_bool_val(*rhs)
+                {
+                    sub_polarity(*rhs, c)
                 } else {
-                    // A conjunction: an unknown operand simply adds no constraint.
-                    match (l, r) {
-                        (Some(a), Some(b)) => Some(a.intersect(b)),
-                        (Some(a), None) | (None, Some(a)) => Some(a),
-                        (None, None) => None,
-                    }
+                    self.refine_from_cmp(condition, v, taken, mask)
                 }
             }
 
             _ => self.refine_from_cmp(condition, v, taken, mask),
+        }
+    }
+
+    /// Refine `v` from a boolean connective `lhs ∘ rhs` (`is_or` picks `||`,
+    /// else `&&`) being `taken`. `OR` taken and `AND` not-taken are disjunctions
+    /// (hull of the operand facts); the other two are conjunctions (intersection).
+    fn refine_connective(
+        &self,
+        lhs: ValueId,
+        rhs: ValueId,
+        is_or: bool,
+        v: ValueId,
+        taken: bool,
+        mask: u64,
+        depth: usize,
+    ) -> Option<ValueRange> {
+        let l = self.refine_condition(lhs, v, taken, mask, depth + 1);
+        let r = self.refine_condition(rhs, v, taken, mask, depth + 1);
+        let union = is_or == taken;
+        if union {
+            // A union with an unknown operand is unknown — no bound.
+            match (l, r) {
+                (Some(a), Some(b)) => Some(hull(a, b)),
+                _ => None,
+            }
+        } else {
+            // A conjunction: an unknown operand simply adds no constraint.
+            match (l, r) {
+                (Some(a), Some(b)) => Some(a.intersect(b)),
+                (Some(a), None) | (None, Some(a)) => Some(a),
+                (None, None) => None,
+            }
+        }
+    }
+
+    /// Whether `v` carries the `bool` type.
+    fn is_bool_val(&self, v: ValueId) -> bool {
+        self.ctx
+            .stored_type_of(v)
+            .is_some_and(|t| self.ctx.types.is_bool(t))
+    }
+
+    /// The value of `v` if it is a `bool` constant (`true`/`false`).
+    fn bool_const(&self, v: ValueId) -> Option<bool> {
+        match v {
+            ValueId::Literal(_) if self.is_bool_val(v) => numeric_const(self.ctx, v).map(|c| c != 0),
+            _ => None,
         }
     }
 
