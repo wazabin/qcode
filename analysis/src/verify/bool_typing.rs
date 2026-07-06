@@ -58,33 +58,28 @@ pub fn verify_bool_typing(ctx: &Context) -> Vec<String> {
                 match b.op {
                     // Bitwise and/or/xor: logical when both bool, integer when
                     // neither, but never mixed.
-                    Binop::Int(IntBinop::And | IntBinop::Or | IntBinop::Xor) => {
-                        if lhs_bool != rhs_bool {
-                            out.push(format!(
-                                "bitwise `{}` mixes bool and integer operands",
-                                b.op
-                            ));
-                        }
+                    Binop::Int(IntBinop::And | IntBinop::Or | IntBinop::Xor)
+                        if lhs_bool != rhs_bool =>
+                    {
+                        out.push(format!(
+                            "bitwise `{}` mixes bool and integer operands",
+                            b.op
+                        ));
                     }
+                    Binop::Int(IntBinop::And | IntBinop::Or | IntBinop::Xor) => {}
                     // Comparisons legitimately consume bool operands
                     // (`x == false` is the canonical negation) and any integers.
                     Binop::Int(op) if op.is_comparison() => {}
                     Binop::Float(op) if op.is_comparison() => {}
                     // Every other arithmetic/shift op rejects bool operands.
-                    Binop::Int(_) | Binop::Float(_) => {
-                        if lhs_bool || rhs_bool {
-                            out.push(format!("arithmetic `{}` applied to a bool operand", b.op));
-                        }
+                    Binop::Int(_) | Binop::Float(_) if lhs_bool || rhs_bool => {
+                        out.push(format!("arithmetic `{}` applied to a bool operand", b.op));
                     }
                     _ => {}
                 }
             }
-            Mnemonic::Unop(u) => {
-                if matches!(u.op, Unop::IntNot) && is_bool(ctx, u.src) {
-                    out.push(
-                        "bitwise `~` applied to a bool operand (use `x == false`)".to_string(),
-                    );
-                }
+            Mnemonic::Unop(u) if matches!(u.op, Unop::IntNot) && is_bool(ctx, u.src) => {
+                out.push("bitwise `~` applied to a bool operand (use `x == false`)".to_string());
             }
             Mnemonic::CBranch(cb) => {
                 check_domain(cb.condition, &mut out);

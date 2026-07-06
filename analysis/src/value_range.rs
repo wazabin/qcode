@@ -653,6 +653,7 @@ impl Solver<'_> {
     /// Refine `v` from a boolean connective `lhs ∘ rhs` (`is_or` picks `||`,
     /// else `&&`) being `taken`. `OR` taken and `AND` not-taken are disjunctions
     /// (hull of the operand facts); the other two are conjunctions (intersection).
+    #[allow(clippy::too_many_arguments)]
     fn refine_connective(
         &self,
         lhs: ValueId,
