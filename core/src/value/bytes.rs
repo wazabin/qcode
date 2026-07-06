@@ -107,7 +107,7 @@ pub fn decode_string(data: &[u8]) -> Option<(StringEncoding, String)> {
     }
 
     // UTF-16LE, optionally NUL-terminated.
-    if data.len() >= 2 && data.len() % 2 == 0 {
+    if data.len() >= 2 && data.len().is_multiple_of(2) {
         let units: Vec<u16> = data
             .chunks_exact(2)
             .map(|c| u16::from_le_bytes([c[0], c[1]]))

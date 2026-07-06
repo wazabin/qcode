@@ -321,9 +321,7 @@ impl FrameInfo {
                 Mnemonic::Zext(z) => self.provenance(ctx, z.src),
                 Mnemonic::Sext(s) => self.provenance(ctx, s.src),
                 Mnemonic::Range(r) => self.provenance(ctx, r.src),
-                Mnemonic::Binop(b)
-                    if matches!(b.op, Binop::Int(IntBinop::Add | IntBinop::Sub)) =>
-                {
+                Mnemonic::Binop(b) if matches!(b.op, Binop::Int(IntBinop::Add | IntBinop::Sub)) => {
                     self.peel_addsub(ctx, b.lhs, b.rhs)
                 }
                 // Affine `base + const` over a global base — the old

@@ -1,9 +1,12 @@
-use std::fmt::{Display, Formatter};
 use smallvec::smallvec;
+use std::fmt::{Display, Formatter};
 
 use crate::{
     context::Context,
-    value::{ValueId, ValueRef, insn::mnemonic::{Args, MnemonicKind}},
+    value::{
+        ValueId, ValueRef,
+        insn::mnemonic::{Args, MnemonicKind},
+    },
 };
 
 #[non_exhaustive]

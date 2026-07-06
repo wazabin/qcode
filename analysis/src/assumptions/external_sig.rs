@@ -12,7 +12,7 @@
 use cabi::{AbiTarget, CFunctionProto, CType};
 use qcode::{
     context::{Context, TargetOs},
-    value::{Function, FunctionId, VarnodeId},
+    value::{Function, FunctionId, ParamAttrs, VarnodeId},
 };
 
 use crate::pipeline::CallingConvention;
@@ -84,7 +84,7 @@ fn gp64(gp: &crate::pipeline::GpReg) -> Option<VarnodeId> {
 fn map_prototype(
     proto: &CFunctionProto,
     abi: &CallingConvention,
-) -> Option<(Vec<VarnodeId>, Vec<VarnodeId>)> {
+) -> Option<(Vec<VarnodeId>, Vec<VarnodeId>, Vec<ParamAttrs>)> {
     // An aggregate return uses a hidden pointer argument (memory class), which
     // would shift every argument. Rather than mis-map, skip the function.
     if matches!(proto.return_type, CType::Other | CType::Struct { .. }) {
@@ -92,6 +92,12 @@ fn map_prototype(
     }
 
     let mut inputs = Vec::with_capacity(proto.params.len());
+    // Per-argument attributes, kept in lockstep with `inputs`. A `const`-qualified
+    // pointer pointee (`const char *`) makes the argument `readonly`: the C
+    // contract forbids the callee writing through it. Externs are never
+    // `nocapture` (C `const` says nothing about capture — `strchr`/`tsearch`
+    // retain their pointer). Non-pointer arguments carry no attribute.
+    let mut attrs: Vec<ParamAttrs> = Vec::with_capacity(proto.params.len());
     let mut next_int = 0usize;
     let mut next_sse = 0usize;
     for param in &proto.params {
@@ -105,6 +111,10 @@ fn map_prototype(
                 next_int += 1;
                 let vn = gp64(gp)?;
                 inputs.push(vn);
+                attrs.push(ParamAttrs {
+                    readonly: is_const_pointer(&param.ty),
+                    nocapture: false,
+                });
             }
             Class::Sse => {
                 let Some(&vn) = abi.sse_args.get(next_sse) else {
@@ -112,6 +122,7 @@ fn map_prototype(
                 };
                 next_sse += 1;
                 inputs.push(vn);
+                attrs.push(ParamAttrs::default());
             }
         }
     }
@@ -122,7 +133,19 @@ fn map_prototype(
         None => Vec::new(), // void: no return register
     };
 
-    Some((inputs, outputs))
+    Some((inputs, outputs, attrs))
+}
+
+/// Whether `ty` is a pointer to a `const`-qualified pointee (`const char *`),
+/// the C signal that the callee will not write through the pointer.
+fn is_const_pointer(ty: &CType) -> bool {
+    matches!(
+        ty,
+        CType::Pointer {
+            const_pointee: true,
+            ..
+        }
+    )
 }
 
 /// Assign a signature to `fun_id` if it is a known external function.
@@ -145,13 +168,14 @@ pub fn apply_external_signature(
     let Some(proto) = cabi::lookup(target, name) else {
         return;
     };
-    let Some((inputs, outputs)) = map_prototype(proto, abi) else {
+    let Some((inputs, outputs, param_attrs)) = map_prototype(proto, abi) else {
         return;
     };
 
     let mut f = Function::from_id_mut(ctx, fun_id);
     f.set_input_regs(inputs);
     f.set_output_regs(outputs);
+    f.set_param_attrs(param_attrs);
     // The prototype fully describes this callee's register effect: its inputs are
     // the arguments the caller passes (a register reload, or — for stdcall/cdecl
     // — a stack load supplied by `argpromote_external`), and its writes are the
@@ -247,6 +271,29 @@ mod tests {
             .clone()
             .unwrap();
         assert_eq!(outputs, vec![tc.r3]);
+    }
+
+    #[test]
+    fn const_pointer_param_is_readonly() {
+        // memcpy(void *dst, const void *src, size_t) — the second pointer is
+        // `const`-qualified, so its argument is readonly; the first is not.
+        let mut tc = TestContext::new();
+        let abi = toy_abi(&tc);
+        let f = external(&mut tc, "memcpy");
+        apply_external_signature(&mut tc.ctx, f, &abi, host());
+        let func = Function::from_id(&tc.ctx, f);
+        assert!(
+            !func.param_attr(0).unwrap().readonly,
+            "dst is written through → not readonly"
+        );
+        assert!(
+            func.param_attr(1).unwrap().readonly,
+            "const src is never written through → readonly"
+        );
+        assert!(
+            !func.param_attr(1).unwrap().nocapture,
+            "externs are never nocapture (C const says nothing about capture)"
+        );
     }
 
     #[test]

@@ -8,7 +8,7 @@ use std::{
 use rustc_hash::FxHashSet as HashSet;
 
 mod signature;
-pub use signature::FunctionSignature;
+pub use signature::{FunctionSignature, ParamAttrs};
 
 use crate::{
     context::Context,
@@ -202,6 +202,27 @@ where
             .signature
             .as_ref()
             .is_some_and(|s| s.externally_resolved)
+    }
+
+    /// The inferred pointer attributes for positional argument `index`, or `None`
+    /// when this function has no analyzed attributes (treat conservatively: the
+    /// argument escapes and may be written through). See
+    /// [`FunctionSignature::param_attrs`].
+    pub fn param_attr(&'s self, index: usize) -> Option<ParamAttrs> {
+        self.inner()
+            .signature
+            .as_ref()
+            .and_then(|s| s.param_attrs.as_ref())
+            .and_then(|attrs| attrs.get(index))
+            .copied()
+    }
+
+    /// The full per-parameter attribute vector, if analyzed.
+    pub fn param_attrs(&'s self) -> Option<&'ctx [ParamAttrs]> {
+        self.inner()
+            .signature
+            .as_ref()
+            .and_then(|s| s.param_attrs.as_deref())
     }
 
     /// Registers concretely written by this function, as set by analysis.
@@ -436,10 +457,10 @@ where
         // any predecessor in another function whose terminator tail-jumps here.
         if let Some(root) = self.root() {
             for (_edge, pred_id) in root.predecessors() {
-                if tail_call_target(ctx, pred_id) == Some(self.id) {
-                    if let Some(caller) = BasicBlock::from_id(ctx, pred_id).function() {
-                        callers.push(caller.id);
-                    }
+                if tail_call_target(ctx, pred_id) == Some(self.id)
+                    && let Some(caller) = BasicBlock::from_id(ctx, pred_id).function()
+                {
+                    callers.push(caller.id);
                 }
             }
         }
@@ -684,6 +705,23 @@ impl<'str, 'ctx> FunctionMutRef<'str, 'ctx> {
 
     pub fn set_signature(&mut self, sig: FunctionSignature) {
         self.ctx.values.functions[self.id].signature = Some(sig);
+    }
+
+    /// Records the inferred per-parameter pointer attributes on this function.
+    /// See [`FunctionSignature::param_attrs`].
+    pub fn set_param_attrs(&mut self, attrs: Vec<ParamAttrs>) {
+        self.inner_mut()
+            .signature
+            .get_or_insert_default()
+            .param_attrs = Some(attrs);
+    }
+
+    /// Drops any inferred per-parameter attributes (e.g. after a signature
+    /// rewrite changed the parameter list, invalidating the index alignment).
+    pub fn clear_param_attrs(&mut self) {
+        if let Some(sig) = self.inner_mut().signature.as_mut() {
+            sig.param_attrs = None;
+        }
     }
 
     /// Records the analysis-computed clobbered register set on this function.

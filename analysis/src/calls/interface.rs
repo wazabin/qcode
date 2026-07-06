@@ -49,6 +49,11 @@ pub fn append_entry_param(
 ) -> Option<ValueId> {
     let root = Function::from_id(ctx, fid).root().map(|b| b.id)?;
 
+    // Changing the parameter list invalidates any inferred per-param attributes,
+    // whose vector is indexed by the old positions. Drop them; the `param_attrs`
+    // pass re-infers over the rewritten signature.
+    Function::from_id_mut(ctx, fid).clear_param_attrs();
+
     // New root block param, recording its source for mem2reg reuse and naming.
     let pid = BasicBlock::from_id_mut(ctx, root).push_param(size).id;
     if let Some(name) = name {
@@ -131,6 +136,10 @@ pub fn remove_entry_param(ctx: &mut Context, fid: FunctionId, index: usize) {
     }
     let removed = params.remove(index);
     ctx.values.block_params[removed].parent = None;
+
+    // Any inferred per-param attributes are indexed by the old positions; drop
+    // them rather than reindex. The `param_attrs` pass re-infers afterward.
+    Function::from_id_mut(ctx, fid).clear_param_attrs();
     for (i, &p) in params.iter().enumerate() {
         ctx.values.block_params[p].index = i;
     }

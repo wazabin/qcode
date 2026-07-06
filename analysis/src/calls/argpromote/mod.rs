@@ -73,7 +73,7 @@ mod tests;
 
 pub use mark_pure::mark_pure_functions;
 pub use ram::argpromote;
-pub use registers::{RegPurityReason, argpromote_registers, reg_purity};
+pub use registers::{RegPurityGates, RegPurityReason, argpromote_registers, reg_purity};
 
 /// The call-argument index whose synthesized name matches `name`.
 ///
@@ -91,21 +91,11 @@ pub(crate) fn arg_index_of(ctx: &Context, fid: FunctionId, name: &str) -> Option
     (0..len).find(|&i| Function::from_id(ctx, fid).input_arg_name(i).as_deref() == Some(name))
 }
 
-/// `true` if `fid`'s address is used as a value anywhere (stored, passed, or the
-/// target of an indirect call). Direct calls reference the target through
-/// [`Call::target`], which is *not* an operand, so they do not count.
-///
-/// For a per-function *gate* over the whole program — where this would otherwise
-/// run once per function, i.e. O(functions × instructions) — build the whole set
-/// once with [`address_taken_set`] and do an O(1) lookup instead.
-pub(crate) fn is_address_taken(ctx: &Context, fid: FunctionId) -> bool {
-    let target = ValueId::Function(fid);
-    ctx.instructions()
-        .any(|insn| insn.mnemonic().args().contains(&target))
-}
-
-/// Every function whose address is taken as a value (the [`is_address_taken`]
-/// predicate, computed for all functions in one O(instructions) pass). Callers
+/// Every function whose address is taken as a value — used as a value anywhere
+/// (stored, passed, or the target of an indirect call), computed for all
+/// functions in one O(instructions) pass. Direct calls reference the target
+/// through `Call::target`, which is *not* an operand, so they do not count.
+/// Callers
 /// that gate every function on this — the argpromote channels — build it once at
 /// the top of their per-function loop and look up, turning an O(functions ×
 /// instructions) scan into O(instructions + functions).
@@ -122,6 +112,26 @@ pub(crate) fn address_taken_set(ctx: &Context) -> FxHashSet<FunctionId> {
             if let ValueId::Function(fid) = arg {
                 set.insert(fid);
             }
+        }
+    }
+    set
+}
+
+/// Every function that is the target of at least one direct [`Mnemonic::Call`],
+/// computed for all functions in one O(instructions) pass. Mirrors
+/// [`address_taken_set`]: callers that gate every function on "has a direct
+/// caller" — the register channel's `reg_purity` / `try_promote_registers` and
+/// the loader's per-function purity query — build it once and look up, turning an
+/// O(functions × instructions) rescan into O(instructions + functions).
+///
+/// Safe to reuse across a channel's mutating loop: promotion rewrites a callee's
+/// interface but never adds or removes a direct `Call.target` edge, so the set of
+/// called functions is invariant while the loop runs.
+pub(crate) fn called_function_set(ctx: &Context) -> FxHashSet<FunctionId> {
+    let mut set = FxHashSet::default();
+    for insn in ctx.instructions() {
+        if let Mnemonic::Call(c) = insn.mnemonic() {
+            set.insert(c.target);
         }
     }
     set

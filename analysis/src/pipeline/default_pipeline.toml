@@ -299,6 +299,20 @@ name = "loop-to-map"
 scope = "module"
 passes = ["loop_to_map"]
 
+# Infer per-parameter `readonly` / `nocapture` pointer attributes bottom-up over
+# the now-functionalized (`pure_reg`) functions, whose positional arguments align
+# with their root params by construction. Runs before `final-canonicalize` so the
+# `gvn` there (via its `mem_forward` call-kill) stops treating a read-only passed
+# pointer as clobbering the cells it reaches — unblocking store→load forwarding
+# across calls like `strlen(&local)`. (Step 8 adds the frame-freshness consumer.)
+# Externs
+# already carry their C-prototype `readonly` bit from `external_sigs`; this fills
+# in the bodies. Module-scoped: it is a whole-program fixpoint.
+[[stage]]
+name = "param-attrs"
+scope = "module"
+passes = ["param_attrs"]
+
 # Aesthetic changes. `include_external` so the demangler also reaches imported
 # library functions (PLT stubs like `_ZNSsixEj` -> `std::string::operator[]`),
 # which are bodyless and therefore skipped by function-scoped stages by default.

@@ -8,18 +8,21 @@ mod dead_signature;
 mod depipeline;
 mod interface;
 mod loop_to_map;
+mod param_attrs;
 mod partial_inline;
 mod projection;
 mod stack_facts;
 mod summaries;
 
 pub use argpromote::{
-    RegPurityReason, argpromote, argpromote_registers, mark_pure_functions, reg_purity,
+    RegPurityGates, RegPurityReason, argpromote, argpromote_registers, mark_pure_functions,
+    reg_purity,
 };
 pub use clobbered::{compute_clobbered_regs, set_clobbered_regs};
 pub use dead_signature::dead_signature;
 pub use interface::{append_caller_arg, append_entry_param, remove_entry_param};
 pub(crate) use loop_to_map::inline_pure_body;
+pub use param_attrs::infer_param_attrs;
 pub use partial_inline::partial_inline;
 pub use projection::{Projection, project_return, return_field};
 pub use stack_facts::{learn_stack_facts, seed_stack_facts};

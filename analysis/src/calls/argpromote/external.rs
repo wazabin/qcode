@@ -102,14 +102,20 @@ fn plan_args(
 
     if stack_only {
         args.push(PlannedArg {
-            slot: Slot::Stack { offset: 0, size: ptr_width },
+            slot: Slot::Stack {
+                offset: 0,
+                size: ptr_width,
+            },
             name: Some("return_address".into()),
         });
     }
 
     let push_stack = |args: &mut Vec<PlannedArg>, next_stack: &mut i64, name: Option<Box<str>>| {
         args.push(PlannedArg {
-            slot: Slot::Stack { offset: *next_stack, size: ptr_width },
+            slot: Slot::Stack {
+                offset: *next_stack,
+                size: ptr_width,
+            },
             name,
         });
         *next_stack += ptr_width as i64;
@@ -126,14 +132,26 @@ fn plan_args(
             Class::Integer => match abi.int_args.get(next_int).and_then(|g| g.for_bytes(8)) {
                 Some(vn) => {
                     next_int += 1;
-                    args.push(PlannedArg { slot: Slot::Reg { vn, size: ptr_width }, name });
+                    args.push(PlannedArg {
+                        slot: Slot::Reg {
+                            vn,
+                            size: ptr_width,
+                        },
+                        name,
+                    });
                 }
                 None => push_stack(&mut args, &mut next_stack, name),
             },
             Class::Sse => match abi.sse_args.get(next_sse).copied() {
                 Some(vn) => {
                     next_sse += 1;
-                    args.push(PlannedArg { slot: Slot::Reg { vn, size: ptr_width }, name });
+                    args.push(PlannedArg {
+                        slot: Slot::Reg {
+                            vn,
+                            size: ptr_width,
+                        },
+                        name,
+                    });
                 }
                 None => push_stack(&mut args, &mut next_stack, name),
             },
@@ -358,6 +376,7 @@ mod tests {
     fn ptr() -> CType {
         CType::Pointer {
             pointee: Box::new(CType::Void),
+            const_pointee: false,
         }
     }
 
@@ -385,10 +404,28 @@ mod tests {
                     slot: Slot::Stack { offset: 0, size: 4 },
                     name: Some("return_address".into()),
                 },
-                PlannedArg { slot: Slot::Stack { offset: 4, size: 4 }, name: None },
-                PlannedArg { slot: Slot::Stack { offset: 8, size: 4 }, name: None },
-                PlannedArg { slot: Slot::Stack { offset: 12, size: 4 }, name: None },
-                PlannedArg { slot: Slot::Stack { offset: 16, size: 4 }, name: None },
+                PlannedArg {
+                    slot: Slot::Stack { offset: 4, size: 4 },
+                    name: None
+                },
+                PlannedArg {
+                    slot: Slot::Stack { offset: 8, size: 4 },
+                    name: None
+                },
+                PlannedArg {
+                    slot: Slot::Stack {
+                        offset: 12,
+                        size: 4
+                    },
+                    name: None
+                },
+                PlannedArg {
+                    slot: Slot::Stack {
+                        offset: 16,
+                        size: 4
+                    },
+                    name: None
+                },
             ]
         );
     }
@@ -401,7 +438,10 @@ mod tests {
         p.params[1].name = Some("csidl".into());
         let plan = plan_args(&p, &CallingConvention::default(), 4, true).expect("placeable");
         let names: Vec<_> = plan.iter().map(|a| a.name.as_deref()).collect();
-        assert_eq!(names, vec![Some("return_address"), Some("pszPath"), Some("csidl")]);
+        assert_eq!(
+            names,
+            vec![Some("return_address"), Some("pszPath"), Some("csidl")]
+        );
     }
 
     /// A `void` (or aggregate) return has no return register, so no return value

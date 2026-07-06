@@ -455,15 +455,24 @@ impl MemForward {
         let (clobbers, escaping, unknown_callee): (CallClobbers, Vec<ValueId>, bool) = match &term {
             Some(Mnemonic::CallInd(call)) => (CallClobbers::AllRegisters, call.args.clone(), true),
             Some(Mnemonic::Call(call)) => {
-                let regs = match Function::from_id(ctx, call.target).clobbered_regs() {
+                let callee = Function::from_id(ctx, call.target);
+                let regs = match callee.clobbered_regs() {
                     Some(regs) => CallClobbers::Regs(regs.to_vec()),
                     None => CallClobbers::AllRegisters,
                 };
+                // An argument flowing into a `readonly` callee param is never
+                // written through, so it does not clobber the RAM cells it may
+                // reach — exclude it from the escaping set. (Only `readonly` is
+                // consulted here; a `readonly` pointer the callee merely reads
+                // cannot invalidate a pinned cell even if it is captured.) The
+                // recorded `clobbers` are writes by definition and always escape.
                 let escaping = call
                     .args
                     .iter()
-                    .chain(call.clobbers.iter())
-                    .copied()
+                    .enumerate()
+                    .filter(|&(j, _)| !callee.param_attr(j).is_some_and(|a| a.readonly))
+                    .map(|(_, &v)| v)
+                    .chain(call.clobbers.iter().copied())
                     .collect();
                 (regs, escaping, false)
             }
@@ -960,6 +969,105 @@ mod tests {
         assert!(
             mf.byte_map.contains_key(&(pinned, 0x40)),
             "a pinned RAM cell survives a call"
+        );
+    }
+
+    /// Build `f` ending in `callee(arg)`, seed a pinned RAM cell at `0x40`, run
+    /// the call prune, and report whether the cell survived. `readonly` sets the
+    /// callee's param-0 `readonly` bit; `pin_arg` gives the argument a concrete
+    /// RAM interval covering the cell (else the argument is symbolic — no
+    /// resolvable reach).
+    fn pinned_cell_survives_call(readonly: bool, pin_arg: bool) -> bool {
+        use qcode::builder::Builder;
+        use qcode::value::ParamAttrs;
+        use qcode::value::insn::Call;
+
+        let mut tc = TestContext::new();
+        let ram = tc.ctx.default_space;
+        let callee = Function::make(&mut tc.ctx, "callee".into()).unwrap().id;
+        // A resolved callee with an empty clobber set, so registers are irrelevant.
+        Function::from_id_mut(&mut tc.ctx, callee).set_clobbered_regs(vec![]);
+        if readonly {
+            Function::from_id_mut(&mut tc.ctx, callee).set_param_attrs(vec![ParamAttrs {
+                readonly: true,
+                nocapture: false,
+            }]);
+        }
+
+        let fun_id = Function::make(&mut tc.ctx, "f".into()).unwrap().id;
+        let block = tc.ctx.get_or_make_block(0x1000);
+        {
+            let mut f = Function::from_id_mut(&mut tc.ctx, fun_id);
+            f.set_root(block).unwrap();
+            f.add_block(block);
+        }
+        let arg = ValueId::Varnode(tc.r1);
+        {
+            let mut b = Builder::from_block(BasicBlock::from_id_mut(&mut tc.ctx, block));
+            b.push_call(callee);
+            unsafe { b.dont_finalize() };
+        }
+        // The builder makes a call with no args; set them to `[arg]`.
+        let cid = BasicBlock::from_id(&tc.ctx, block)
+            .iter()
+            .find(|i| matches!(i.mnemonic(), Mnemonic::Call(_)))
+            .unwrap()
+            .id;
+        tc.ctx.replace_instruction_mnemonic(
+            cid,
+            Mnemonic::Call(Call {
+                target: callee,
+                args: vec![arg],
+                clobbers: vec![],
+            }),
+        );
+
+        let mut value_to_interval = HashMap::default();
+        if pin_arg {
+            value_to_interval.insert(arg, (ram, 0x40u64, 0x48u64));
+        }
+        let aliases = AliasResult {
+            value_to_root: HashMap::default(),
+            value_to_interval,
+            frame: None,
+        };
+
+        let pinned = Base::Pinned(ram);
+        let src = ValueId::Varnode(tc.r2);
+        let mut mf = MemForward::default();
+        mf.byte_map.insert((pinned, 0x40), Cell { src, src_off: 0 });
+        mf.prune_clobbered_by_call(&tc.ctx, block, Some(&aliases));
+        mf.byte_map.contains_key(&(pinned, 0x40))
+    }
+
+    /// A call argument flowing into a `readonly` callee param cannot be written
+    /// through, so the pinned RAM cell its interval covers survives the call —
+    /// the store→load forwarding win. The same argument into a non-readonly param
+    /// clobbers the cell.
+    #[test]
+    fn readonly_call_arg_keeps_pinned_ram_cell() {
+        assert!(
+            !pinned_cell_survives_call(false, true),
+            "a writable pointer arg clobbers the pinned cell its interval covers"
+        );
+        assert!(
+            pinned_cell_survives_call(true, true),
+            "a readonly pointer arg leaves the pinned cell it covers intact"
+        );
+    }
+
+    /// A `readonly` argument with no resolvable interval no longer triggers the
+    /// symbolic-escape path that drops *every* pinned RAM cell — the highest-value
+    /// exclusion. A symbolic writable argument still nukes them.
+    #[test]
+    fn symbolic_readonly_call_arg_does_not_nuke_pinned_cells() {
+        assert!(
+            !pinned_cell_survives_call(false, false),
+            "a symbolic writable arg drops every pinned cell"
+        );
+        assert!(
+            pinned_cell_survives_call(true, false),
+            "a symbolic readonly arg no longer nukes pinned cells"
         );
     }
 }

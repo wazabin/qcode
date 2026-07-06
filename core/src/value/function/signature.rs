@@ -1,5 +1,41 @@
 use crate::value::VarnodeId;
 
+/// Per-parameter pointer attributes, LLVM-style, inferred (or read from a C
+/// prototype) and consumed at call sites to relax the default "every pointer
+/// argument aliases everything and is written through by the callee" assumption.
+///
+/// The two bits are deliberately independent: `readonly` proves only that the
+/// callee does not write through the pointer *during this call*, which is enough
+/// to stop a call from clobbering the cells the argument reaches (see
+/// `mem_forward`'s call-kill). It does *not* prove the pointer is safe to reason
+/// about across the call: a captured pointer can be written through later, so
+/// frame-freshness reasoning additionally requires `nocapture`. Both bits default
+/// to `false` (fully conservative); an inference/extern pass sets them.
+#[derive(Clone, Copy, Default, PartialEq, Eq, Debug, serde::Serialize, serde::Deserialize)]
+pub struct ParamAttrs {
+    /// The callee never writes through this pointer parameter (C `*const`
+    /// semantics, one level deep: a store through a pointer *loaded from* the
+    /// param does not clear this — only stores whose address is affine-derived
+    /// from the param itself do).
+    #[serde(default)]
+    pub readonly: bool,
+    /// The callee does not retain this pointer beyond the call, except by
+    /// returning it (capture-by-return does not clear this: the returned pointer
+    /// is still tracked by the caller, so it is not an unbounded escape).
+    #[serde(default)]
+    pub nocapture: bool,
+}
+
+impl ParamAttrs {
+    /// The fully permissive attribute set (both bits): the optimistic starting
+    /// point of the bottom-up inference fixpoint, whittled down as the body walk
+    /// finds writes/captures/escapes.
+    pub const OPTIMISTIC: Self = Self {
+        readonly: true,
+        nocapture: true,
+    };
+}
+
 /// Optional ABI description attached to a function.
 /// All fields are `Option` — only provided fields affect analysis.
 #[derive(Clone, Default, serde::Serialize, serde::Deserialize)]
@@ -93,4 +129,17 @@ pub struct FunctionSignature {
     /// prototype + calling convention), not from analyzing a body.
     #[serde(default)]
     pub externally_resolved: bool,
+    /// Per-parameter pointer attributes ([`readonly`](ParamAttrs::readonly) /
+    /// [`nocapture`](ParamAttrs::nocapture)), indexed like the positional call
+    /// arguments (`Call.args`) — which for a functionalized (`pure_reg`) callee
+    /// align with its root block params, and for an external align with `inputs`.
+    ///
+    /// `None` means "not analyzed" (fully conservative — every pointer arg
+    /// escapes and is written through). A present vector may still be shorter than
+    /// the argument list; a missing entry is also treated conservatively. Set by
+    /// the extern C-prototype path ([`readonly`](ParamAttrs::readonly) only) and
+    /// the bottom-up `param_attrs` inference pass. Dropped (and re-inferred) when
+    /// argpromote/`dead_signature` rewrites the parameter list.
+    #[serde(default)]
+    pub param_attrs: Option<Vec<ParamAttrs>>,
 }

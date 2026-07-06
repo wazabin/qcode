@@ -10,7 +10,7 @@ use rustc_hash::FxHashSet;
 
 use crate::{Pass, PipelineEnv};
 
-use super::{add_input, append_outputs, is_address_taken};
+use super::{add_input, address_taken_set, append_outputs, called_function_set};
 
 fn is_register(ctx: &Context, vn: VarnodeId) -> bool {
     matches!(Varnode::from_id(ctx, vn).space().ty, SpaceType::Register)
@@ -144,7 +144,53 @@ impl RegPurityReason {
 /// function (`Ok`) or, if not, the gating reason (`Err`). A function whose
 /// [`Function::is_pure_reg`] is already set is necessarily `Ok`; this is the
 /// source of the "why not" shown for the rest.
+///
+/// Builds the whole-program address-taken and called-function sets on every call.
+/// A caller querying many functions in a loop (e.g. the GUI loader) should build
+/// them once with [`RegPurityGates`] and use [`RegPurityGates::purity`] to avoid
+/// an O(functions × instructions) rescan.
 pub fn reg_purity(ctx: &Context, fid: FunctionId) -> Result<(), RegPurityReason> {
+    RegPurityGates::compute(ctx).purity(ctx, fid)
+}
+
+/// The two whole-program gates a [`reg_purity`] query consults — the set of
+/// address-taken functions and the set of direct call targets — each an
+/// O(instructions) scan. Building them once amortizes both across a per-function
+/// classification loop (the GUI loader), turning O(functions × instructions) into
+/// O(instructions + functions). Both are invariant under register promotion (it
+/// threads data values and rewrites interfaces but adds no `ValueId::Function`
+/// operand and no `Call.target` edge), so a single instance is valid for the
+/// whole loop.
+pub struct RegPurityGates {
+    address_taken: FxHashSet<FunctionId>,
+    called: FxHashSet<FunctionId>,
+}
+
+impl RegPurityGates {
+    /// Compute both gates for `ctx` in two O(instructions) passes.
+    pub fn compute(ctx: &Context) -> Self {
+        Self {
+            address_taken: address_taken_set(ctx),
+            called: called_function_set(ctx),
+        }
+    }
+
+    /// Classify `fid` against the precomputed gates — see [`reg_purity`].
+    pub fn purity(&self, ctx: &Context, fid: FunctionId) -> Result<(), RegPurityReason> {
+        reg_purity_with(ctx, fid, &self.address_taken, &self.called)
+    }
+}
+
+/// [`reg_purity`] with the whole-program gating sets supplied by the caller, so a
+/// per-function loop builds them once instead of rescanning all instructions per
+/// function. `address_taken` and `called` must be
+/// [`address_taken_set`] / [`called_function_set`] over the same `ctx`.
+fn reg_purity_with(
+    ctx: &Context,
+    fid: FunctionId,
+    address_taken: &FxHashSet<FunctionId>,
+    called: &FxHashSet<FunctionId>,
+) -> Result<(), RegPurityReason> {
     let f = Function::from_id(ctx, fid);
     if f.is_external() {
         return Err(RegPurityReason::External);
@@ -152,14 +198,11 @@ pub fn reg_purity(ctx: &Context, fid: FunctionId) -> Result<(), RegPurityReason>
     if f.root().is_none() {
         return Err(RegPurityReason::NoBody);
     }
-    if is_address_taken(ctx, fid) {
+    if address_taken.contains(&fid) {
         return Err(RegPurityReason::AddressTaken);
     }
     scan_register_effects(ctx, fid)?;
-    let has_caller = ctx
-        .instructions()
-        .any(|insn| matches!(insn.mnemonic(), Mnemonic::Call(c) if c.target == fid));
-    if !has_caller {
+    if !called.contains(&fid) {
         return Err(RegPurityReason::NoCallers);
     }
     Ok(())
@@ -231,12 +274,15 @@ pub(crate) fn scan_register_effects(
 /// [`try_promote_registers`]). Returns `true` if anything changed.
 pub fn argpromote_registers(ctx: &mut Context) -> bool {
     let mut changed = false;
-    // Gate every function on `is_address_taken` via one O(instructions) set instead
-    // of a per-function whole-program rescan; stable across the loop (promotion adds
-    // no `ValueId::Function` operands). See [`super::address_taken_set`].
+    // Gate every function on the two whole-program predicates via sets built once
+    // instead of a per-function rescan: address-taken (stable — promotion adds no
+    // `ValueId::Function` operands) and has-a-direct-caller (stable — promotion
+    // rewrites interfaces but adds/removes no `Call.target` edges). See
+    // [`super::address_taken_set`] / [`super::called_function_set`].
     let address_taken = super::address_taken_set(ctx);
+    let called = super::called_function_set(ctx);
     for fid in ctx.function_ids() {
-        if try_promote_registers(ctx, &address_taken, fid) {
+        if try_promote_registers(ctx, &address_taken, &called, fid) {
             changed = true;
         }
     }
@@ -261,6 +307,7 @@ fn output_meta(ctx: &Context, regs: &[VarnodeId]) -> Vec<(VarnodeId, usize, Spac
 fn try_promote_registers(
     ctx: &mut Context,
     address_taken: &FxHashSet<FunctionId>,
+    called: &FxHashSet<FunctionId>,
     fid: FunctionId,
 ) -> bool {
     let f = Function::from_id(ctx, fid);
@@ -278,10 +325,9 @@ fn try_promote_registers(
 
     // Only direct callers can be rewritten to pass inputs / replay outputs; with
     // none, rewriting the callee would leave it expecting params nobody provides.
-    let has_caller = ctx
-        .instructions()
-        .any(|insn| matches!(insn.mnemonic(), Mnemonic::Call(c) if c.target == fid));
-    if !has_caller {
+    // `called` is the whole-program set of direct call targets (see
+    // [`super::called_function_set`]), an O(1) lookup instead of a per-function rescan.
+    if !called.contains(&fid) {
         return false;
     }
 

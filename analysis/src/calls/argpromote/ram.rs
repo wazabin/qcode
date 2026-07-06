@@ -83,7 +83,7 @@ pub fn argpromote_with_sp(ctx: &mut Context, sp_reg: Option<VarnodeId>) -> bool 
     // the *same* space, so the seed store forwards into the body's loads.
     let shadow = ctx.make_temp_space();
     let mut changed = false;
-    // Both channels gate every function on `is_address_taken`; build that set once
+    // Both channels gate every function on being address-taken; build that set once
     // (O(instructions)) instead of rescanning the whole program per function. It
     // stays valid across the loop: promotion threads only data values, never adding
     // a `ValueId::Function` operand. See [`super::address_taken_set`].

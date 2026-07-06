@@ -352,8 +352,8 @@ mod tests {
         );
         Function::from_id_mut(&mut tc.ctx, f).set_pure_reg(true);
 
-        // Take f's address: store the function value somewhere in g, so
-        // `is_address_taken(f)` holds.
+        // Take f's address: store the function value somewhere in g, so f lands
+        // in `address_taken_set`.
         let addr = tc.ctx.get_const(0x9000, 8).id();
         {
             let mut b = Builder::from_block(BasicBlock::from_id_mut(&mut tc.ctx, g_entry));
