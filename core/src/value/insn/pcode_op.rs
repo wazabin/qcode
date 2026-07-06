@@ -1,8 +1,8 @@
 use super::mnemonic::{Args, MnemonicKind};
-use smallvec::SmallVec;
 use crate::value::ValueId;
 use jstd::Identifier;
 use serde::{Deserialize, Serialize};
+use smallvec::SmallVec;
 
 #[derive(Identifier)]
 pub struct PCodeOpId(usize);

@@ -472,8 +472,8 @@ fn negated_compare(op: IntBinop) -> Option<IntBinop> {
 /// Together these collapse `zext(!(x == 0)) != 0` down to `x != 0`. Returns
 /// whether the root was rewritten.
 fn simplify_compare(ctx: &mut Context, ic: &InsnCtx, ed: &mut Editor) -> bool {
-    match ic.mnemonic {
-        &Mnemonic::Binop(Binary {
+    match *ic.mnemonic {
+        Mnemonic::Binop(Binary {
             lhs,
             rhs,
             op: Binop::Int(op),
@@ -523,7 +523,7 @@ fn simplify_compare(ctx: &mut Context, ic: &InsnCtx, ed: &mut Editor) -> bool {
             }
             false
         }
-        &Mnemonic::Unop(Unary {
+        Mnemonic::Unop(Unary {
             op: Unop::BoolNot,
             src,
         }) => {

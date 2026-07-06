@@ -250,10 +250,10 @@ fn invariant_instructions(
                 if !operands_invariant {
                     continue;
                 }
-                if let Mnemonic::Load(load) = m {
-                    if !load_is_safe(ctx, aliases, load.ptr, mem) {
-                        continue;
-                    }
+                if let Mnemonic::Load(load) = m
+                    && !load_is_safe(ctx, aliases, load.ptr, mem)
+                {
+                    continue;
                 }
                 invariant.insert(id);
                 changed = true;

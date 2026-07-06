@@ -161,6 +161,7 @@ pub(crate) fn called_function_set(ctx: &Context) -> FxHashSet<FunctionId> {
 /// caller-supplied value; `seed_space` selects the channel (a register file, the
 /// shared shadow, or real ram). The lockstep is maintained by
 /// [`append_entry_param`].
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn add_input(
     ctx: &mut Context,
     fid: FunctionId,

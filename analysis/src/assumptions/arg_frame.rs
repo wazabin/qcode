@@ -131,9 +131,7 @@ pub fn verify_args_disjoint_caller_frame(ctx: &mut Context, sp_reg: Option<Varno
         // Default to holding: the assumption is refuted only by a *provable*
         // collision (a resolved interval overlap). An unresolvable caller/offset
         // is not proof of a collision, so it leaves the assumption standing.
-        let holds = sp_reg.map_or(true, |sp| {
-            !args_provably_collide(ctx, callee, sp, &mut cache)
-        });
+        let holds = sp_reg.is_none_or(|sp| !args_provably_collide(ctx, callee, sp, &mut cache));
         if ctx.set_known(Proposition::ArgsDisjointFromCallerFrame(callee), holds) {
             novel += 1;
             qcode::pass_log!(

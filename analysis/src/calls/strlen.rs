@@ -193,9 +193,7 @@ fn try_match_strlen(ctx: &Context, fid: FunctionId) -> Option<StrlenMatch> {
     // length. Keying on the *header*'s terminator (not any matching CBranch in the
     // function) ensures the NUL test is the loop's governing exit.
     {
-        let Some(term) = BasicBlock::from_id(ctx, header).iter().last() else {
-            return None;
-        };
+        let term = BasicBlock::from_id(ctx, header).iter().last()?;
         let Mnemonic::CBranch(CBranch {
             condition,
             success_block,
@@ -451,7 +449,7 @@ fn try_match_strlen_ptr(ctx: &Context, fid: FunctionId) -> Option<StrlenPtrMatch
                 (*success_block, success_args, *failure_block)
             };
             // The exit edge must carry the induction pointer (the end pointer).
-            if !exit_args.iter().any(|&v| v == s) {
+            if !exit_args.contains(&s) {
                 continue;
             }
             if header == body_block || header == exit_block {

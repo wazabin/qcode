@@ -88,7 +88,8 @@ impl Congruence {
         s
     }
 
-    /// Whether `a` and `b` are structurally congruent.
+    /// Whether `a` and `b` are structurally congruent. Test-only helper.
+    #[cfg(test)]
     pub(crate) fn congruent(
         &mut self,
         ctx: &Context,

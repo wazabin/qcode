@@ -39,7 +39,8 @@ impl MnemonicKind for BranchInd {
     }
 
     fn args(&self) -> Args {
-        smallvec![self.ptr]}
+        smallvec![self.ptr]
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
@@ -103,7 +104,8 @@ impl MnemonicKind for CallInd {
     fn args(&self) -> Args {
         let mut args = smallvec![self.ptr];
         args.extend(self.args.clone());
-        args}
+        args
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
@@ -130,7 +132,8 @@ impl MnemonicKind for CBranch {
         let mut args = smallvec![self.condition];
         args.extend_from_slice(&self.success_args);
         args.extend_from_slice(&self.failure_args);
-        args}
+        args
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
@@ -153,7 +156,8 @@ impl MnemonicKind for Return {
         if let Some(value) = self.value {
             args.push(value);
         }
-        args}
+        args
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
@@ -171,7 +175,8 @@ impl MnemonicKind for ReturnValue {
     }
 
     fn args(&self) -> Args {
-        smallvec![self.value]}
+        smallvec![self.value]
+    }
 }
 
 #[cfg(test)]

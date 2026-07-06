@@ -14,7 +14,8 @@ impl MnemonicKind for IsFloatNaN {
     }
 
     fn args(&self) -> Args {
-        smallvec![self.src]}
+        smallvec![self.src]
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
@@ -48,7 +49,8 @@ impl MnemonicKind for LzCount {
     }
 
     fn args(&self) -> Args {
-        smallvec![self.src]}
+        smallvec![self.src]
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
@@ -70,7 +72,8 @@ impl MnemonicKind for PopCount {
     }
 
     fn args(&self) -> Args {
-        smallvec![self.src]}
+        smallvec![self.src]
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
@@ -101,7 +104,8 @@ impl MnemonicKind for Carry {
     }
 
     fn args(&self) -> Args {
-        smallvec![self.lhs, self.rhs]}
+        smallvec![self.lhs, self.rhs]
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
@@ -131,7 +135,8 @@ impl MnemonicKind for SCarry {
     }
 
     fn args(&self) -> Args {
-        smallvec![self.lhs, self.rhs]}
+        smallvec![self.lhs, self.rhs]
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
@@ -161,7 +166,8 @@ impl MnemonicKind for SBorrow {
     }
 
     fn args(&self) -> Args {
-        smallvec![self.lhs, self.rhs]}
+        smallvec![self.lhs, self.rhs]
+    }
 }
 
 #[cfg(test)]

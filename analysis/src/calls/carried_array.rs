@@ -85,34 +85,33 @@ pub(crate) fn find_carried_array(ctx: &mut Context, fid: FunctionId) -> Option<C
             for &v in &incs {
                 // `insert(arr0, idx, val)` splits into carry (param base) and
                 // lane-0 seed (non-param base); every other array value is init.
-                if let ValueId::Instruction(iid) = v {
-                    if let Mnemonic::Intrinsic(IntrinsicApp { id, args }) =
+                if let ValueId::Instruction(iid) = v
+                    && let Mnemonic::Intrinsic(IntrinsicApp { id, args }) =
                         ctx.get_insn(iid).mnemonic()
-                    {
-                        if *id == insert_id && args.len() == 3 {
-                            let [arr0, idx, val] = args[..] else {
-                                ok = false;
-                                break;
-                            };
-                            if let ValueId::BlockParam(_) = arr0 {
-                                if carry.is_some() {
-                                    ok = false;
-                                    break;
-                                }
-                                carry = Some((arr0, val, idx));
-                            } else if literal(ctx, idx) == Some(0) {
-                                if seed.is_some() || init.is_some() {
-                                    ok = false;
-                                    break;
-                                }
-                                seed = Some((val, arr0));
-                            } else {
-                                ok = false;
-                                break;
-                            }
-                            continue;
+                    && *id == insert_id
+                    && args.len() == 3
+                {
+                    let [arr0, idx, val] = args[..] else {
+                        ok = false;
+                        break;
+                    };
+                    if let ValueId::BlockParam(_) = arr0 {
+                        if carry.is_some() {
+                            ok = false;
+                            break;
                         }
+                        carry = Some((arr0, val, idx));
+                    } else if literal(ctx, idx) == Some(0) {
+                        if seed.is_some() || init.is_some() {
+                            ok = false;
+                            break;
+                        }
+                        seed = Some((val, arr0));
+                    } else {
+                        ok = false;
+                        break;
                     }
+                    continue;
                 }
                 // A non-insert array value (splat / wide Load / zero literal).
                 if seed.is_some() || init.is_some() {
@@ -224,10 +223,10 @@ pub(crate) fn exit_view(ctx: &Context, ca: &CarriedArray, exit: BlockId) -> Valu
         .map(|p| p.id())
         .collect();
     for p in exit_params {
-        if let Some(kp) = param_pos(ctx, exit, p) {
-            if incoming(ctx, exit, kp)[..] == [ca.arr_h] {
-                return p;
-            }
+        if let Some(kp) = param_pos(ctx, exit, p)
+            && incoming(ctx, exit, kp)[..] == [ca.arr_h]
+        {
+            return p;
         }
     }
     ca.arr_h

@@ -13,8 +13,6 @@
 //! unless it is already canonical. See [`super::affine`] for the normal form,
 //! key/emit split, and idempotence argument.
 
-use rustc_hash::FxHashMap as HashMap;
-
 use qcode::{
     context::Context,
     value::{

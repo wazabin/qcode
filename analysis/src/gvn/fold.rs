@@ -338,14 +338,12 @@ pub(super) fn cast_identity(ctx: &Context, m: &Mnemonic) -> Option<ValueId> {
             // `zext(_, inner)[0:N]` where `inner` is exactly `N` bytes: the low
             // `N` bytes of the zext are `inner` untouched, so the extract peels
             // the widening back off.
-            if let ValueId::Instruction(id) = range.src {
-                if let Mnemonic::Zext(inner) =
+            if let ValueId::Instruction(id) = range.src
+                && let Mnemonic::Zext(inner) =
                     qcode::value::Instruction::from_id(ctx, id).mnemonic()
-                {
-                    if value_size(ctx, inner.src) == range.size {
-                        return Some(inner.src);
-                    }
-                }
+                && value_size(ctx, inner.src) == range.size
+            {
+                return Some(inner.src);
             }
             None
         }

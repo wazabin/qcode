@@ -565,8 +565,8 @@ impl MemForward {
                     CallClobbers::Regs(regs) => !regs.iter().any(|&r| {
                         let vn = Varnode::from_id(ctx, r);
                         vn.space().id == space
-                            && (vn.address() as i64) <= off
-                            && off < vn.address() as i64 + vn.size() as i64
+                            && vn.address() <= off
+                            && off < vn.address() + vn.size() as i64
                     }),
                 },
                 Base::Symbolic(_, bv) => match &clobbers {

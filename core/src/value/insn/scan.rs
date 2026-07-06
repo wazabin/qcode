@@ -57,7 +57,8 @@ impl MnemonicKind for Scan {
         args.push(self.init);
         args.push(self.src);
         args.extend(self.captures.iter().copied());
-        args}
+        args
+    }
 }
 
 #[cfg(test)]

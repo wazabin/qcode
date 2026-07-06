@@ -157,10 +157,10 @@ impl<'a> Analysis<'a> {
         // joins, which `canonical_root` reflects. Short-circuit the full rescan.
         // A wider access falls through: its interval may overlap nodes the
         // narrower scan never touched.
-        if let Some(&(root, cached_size)) = self.literal_roots.get(&literal) {
-            if size <= cached_size {
-                return self.canonical_root(root);
-            }
+        if let Some(&(root, cached_size)) = self.literal_roots.get(&literal)
+            && size <= cached_size
+        {
+            return self.canonical_root(root);
         }
 
         let Some((start, end)) = literal_interval(self.ctx, literal, size) else {

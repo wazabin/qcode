@@ -18,7 +18,8 @@ impl MnemonicKind for Binary {
     }
 
     fn args(&self) -> Args {
-        smallvec![self.lhs, self.rhs]}
+        smallvec![self.lhs, self.rhs]
+    }
 }
 
 #[non_exhaustive]

@@ -25,7 +25,8 @@ impl MnemonicKind for Zext {
     }
 
     fn args(&self) -> Args {
-        smallvec![self.src]}
+        smallvec![self.src]
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
@@ -50,7 +51,8 @@ impl MnemonicKind for Sext {
     }
 
     fn args(&self) -> Args {
-        smallvec![self.src]}
+        smallvec![self.src]
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
@@ -79,7 +81,8 @@ impl MnemonicKind for Range {
     }
 
     fn args(&self) -> Args {
-        smallvec![self.src]}
+        smallvec![self.src]
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
@@ -94,7 +97,8 @@ impl MnemonicKind for IntToFloat {
     }
 
     fn args(&self) -> Args {
-        smallvec![self.src]}
+        smallvec![self.src]
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
@@ -109,7 +113,8 @@ impl MnemonicKind for FloatToFloat {
     }
 
     fn args(&self) -> Args {
-        smallvec![self.src]}
+        smallvec![self.src]
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
@@ -124,7 +129,8 @@ impl MnemonicKind for FloatToInt {
     }
 
     fn args(&self) -> Args {
-        smallvec![self.src]}
+        smallvec![self.src]
+    }
 }
 
 #[cfg(test)]

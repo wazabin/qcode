@@ -226,10 +226,10 @@ fn try_match(ctx: &mut Context, fid: FunctionId) -> Option<PromoteMatch> {
     let s = ind.start;
     let n = ind.count;
     // The seed store runs once, before the loop.
-    if let Some((_, seed_block, ..)) = &seed {
-        if *seed_block != preheader {
-            return None;
-        }
+    if let Some((_, seed_block, ..)) = &seed
+        && *seed_block != preheader
+    {
+        return None;
     }
     let seeded = seed.is_some();
 

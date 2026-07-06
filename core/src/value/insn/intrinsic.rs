@@ -27,12 +27,12 @@ use std::sync::OnceLock;
 
 use super::binop::IntBinop;
 use super::mnemonic::{Args, MnemonicKind};
-use smallvec::SmallVec;
 use crate::{
     context::Context,
     types::{TypeId, TypeManager},
     value::{InstructionId, ValueId, ValueRef},
 };
+use smallvec::SmallVec;
 
 /// A stable-by-name handle into the intrinsic registry.
 ///

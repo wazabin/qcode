@@ -119,6 +119,7 @@ pub(super) trait SubPass {
     /// Called once per block before its instructions. `is_shared` marks blocks
     /// reachable from more than one walk entry, whose inherited dominance
     /// claims are invalid.
+    #[allow(clippy::too_many_arguments)]
     fn on_block_entry(
         &self,
         _ctx: &mut Context,

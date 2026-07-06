@@ -50,7 +50,8 @@ impl MnemonicKind for Extract {
     }
 
     fn args(&self) -> Args {
-        smallvec![self.agg]}
+        smallvec![self.agg]
+    }
 }
 
 /// Computes the address of a struct field: `gep(base, offset)` ≡
@@ -88,7 +89,8 @@ impl MnemonicKind for Gep {
     }
 
     fn args(&self) -> Args {
-        smallvec![self.base]}
+        smallvec![self.base]
+    }
 }
 
 #[cfg(test)]

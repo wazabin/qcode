@@ -67,7 +67,8 @@ impl MnemonicKind for Unary {
     }
 
     fn args(&self) -> Args {
-        smallvec![self.src]}
+        smallvec![self.src]
+    }
 }
 
 #[cfg(test)]

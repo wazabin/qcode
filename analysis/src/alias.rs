@@ -298,10 +298,8 @@ fn frame_is_captured(ctx: &Context, fid: FunctionId, numbering: &Numbering, sp: 
     for block in Function::from_id(ctx, fid).blocks() {
         for insn in block.iter() {
             match insn.mnemonic() {
-                Mnemonic::Store(s) => {
-                    if is_own_frame(s.src) {
-                        return true;
-                    }
+                Mnemonic::Store(s) if is_own_frame(s.src) => {
+                    return true;
                 }
                 Mnemonic::Call(c) => {
                     for (j, &arg) in c.args.iter().enumerate() {
@@ -317,15 +315,13 @@ fn frame_is_captured(ctx: &Context, fid: FunctionId, numbering: &Numbering, sp: 
                         return true;
                     }
                 }
-                Mnemonic::CallInd(c) => {
-                    if c.args.iter().any(|&arg| is_own_frame(arg)) {
-                        return true;
-                    }
+                Mnemonic::CallInd(c) if c.args.iter().any(|&arg| is_own_frame(arg)) => {
+                    return true;
                 }
-                Mnemonic::PCodeOp(_) | Mnemonic::Map(_) | Mnemonic::Scan(_) => {
-                    if insn.mnemonic().args().iter().any(|&arg| is_own_frame(arg)) {
-                        return true;
-                    }
+                Mnemonic::PCodeOp(_) | Mnemonic::Map(_) | Mnemonic::Scan(_)
+                    if insn.mnemonic().args().iter().any(|&arg| is_own_frame(arg)) =>
+                {
+                    return true;
                 }
                 _ => {}
             }

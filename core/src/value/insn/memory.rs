@@ -16,7 +16,8 @@ impl MnemonicKind for Load {
     }
 
     fn args(&self) -> Args {
-        smallvec![self.ptr]}
+        smallvec![self.ptr]
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
@@ -44,7 +45,8 @@ impl MnemonicKind for Store {
     }
 
     fn args(&self) -> Args {
-        smallvec![self.ptr, self.src]}
+        smallvec![self.ptr, self.src]
+    }
 }
 
 #[cfg(test)]

@@ -43,7 +43,8 @@ impl MnemonicKind for Map {
         let mut args = SmallVec::with_capacity(1 + self.captures.len());
         args.push(self.src);
         args.extend(self.captures.iter().copied());
-        args}
+        args
+    }
 }
 
 #[cfg(test)]

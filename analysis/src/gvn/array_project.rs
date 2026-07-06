@@ -118,7 +118,7 @@ impl ArrayProject {
             return Claim::Pass;
         };
         let osz = ctx.types.size_of(out_elem);
-        if osz == 0 || size != osz || start % osz != 0 {
+        if osz == 0 || size != osz || !start.is_multiple_of(osz) {
             return Claim::Pass;
         }
         let k = (start / osz) as u64;
@@ -162,6 +162,7 @@ impl ArrayProject {
     }
 
     /// `Range(enumerate(src), k·tsz, tsz)` ⇒ `pack(index = k, elem = src[k])`.
+    #[allow(clippy::too_many_arguments)]
     fn project_enumerate(
         &self,
         ctx: &mut Context,
@@ -186,7 +187,7 @@ impl ArrayProject {
         let esz = ctx.types.size_of(elem_ty);
 
         // Lane alignment: exactly one tuple wide, starting on a lane boundary.
-        if tsz == 0 || size != tsz || start % tsz != 0 {
+        if tsz == 0 || size != tsz || !start.is_multiple_of(tsz) {
             return Claim::Pass;
         }
         let k = (start / tsz) as u64;

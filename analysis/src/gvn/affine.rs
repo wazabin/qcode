@@ -610,6 +610,10 @@ pub(super) fn materialize(
     vid
 }
 
+/// The full affine decomposition of a value: `(width, constant, terms)` where
+/// the value equals `constant + Σ coeff·term` (wrapping mod `2^(width*8)`).
+type AffineDecomposition = (usize, u64, Vec<(ValueId, u64)>);
+
 impl Numbering {
     /// Record the arithmetic view of `id` so consumers can compose it.
     pub(super) fn record_form(&mut self, id: ValueId, form: NormalForm) {
@@ -689,7 +693,7 @@ impl Numbering {
     /// base pointer term and treat the remaining (possibly scaled, possibly
     /// dynamic) terms as a strided index — e.g. `(base + idx*4) + 4` decomposes to
     /// `constant=4, terms=[(base,1),(idx,4)]`.
-    pub(crate) fn affine_terms(&self, v: ValueId) -> Option<(usize, u64, Vec<(ValueId, u64)>)> {
+    pub(crate) fn affine_terms(&self, v: ValueId) -> Option<AffineDecomposition> {
         match self.forms.get(&v)? {
             NormalForm::Affine {
                 width,

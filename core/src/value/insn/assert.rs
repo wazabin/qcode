@@ -14,7 +14,8 @@ impl MnemonicKind for Assert {
     }
 
     fn args(&self) -> Args {
-        smallvec![self.condition]}
+        smallvec![self.condition]
+    }
 }
 
 #[cfg(test)]

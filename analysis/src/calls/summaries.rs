@@ -440,6 +440,9 @@ pub fn set_function_summaries(ctx: &mut Context, function_id: FunctionId, stack_
         || function_writes_through_stack_arg(ctx, function_id, stack_ptr);
 
     let mut f = Function::from_id_mut(ctx, function_id);
+    // Legacy ABI register list, kept for the conventional (non-pure_reg) summary
+    // path; functionalized callees expose their interface via block params.
+    #[allow(deprecated)]
     f.set_input_regs(inputs);
     f.set_clobbered_regs(clobbered);
     f.set_reads_unbounded_stack(reads_unbounded);

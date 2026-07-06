@@ -746,7 +746,7 @@ async fn run_module_stage(
             );
             // Between-pass invariant check (opt-in via `QCODE_VERIFY`): pin a broken
             // invariant to the pass that produced it.
-            crate::verify::verify_after(ctx, &p.name());
+            crate::verify::verify_after(ctx, p.name());
             changed |= pass_changed;
         }
         stage_changed |= changed;
@@ -816,6 +816,7 @@ fn invalidate_callers(ctx: &Context, cache: &mut FixpointCache, fun_id: Function
 ///   * around a genuine whole-program pass (e.g. `argpromote`, `mark_pure`), any
 ///     function whose body fingerprint changed — and any function newly flagged
 ///     `is_pure` — invalidates itself and its callers.
+///
 /// The result is identical IR to re-running every adapter over every function each
 /// iteration, at a fraction of the work.
 fn run_module_stage_incremental(
@@ -905,7 +906,7 @@ fn run_module_stage_incremental(
                 started.elapsed(),
                 if pass_changed { "changed" } else { "no change" },
             );
-            crate::verify::verify_after(ctx, &p.name());
+            crate::verify::verify_after(ctx, p.name());
             changed |= pass_changed;
         }
         stage_changed |= changed;
@@ -1165,7 +1166,7 @@ async fn run_function_stage(
                 entry.1 += 1;
                 entry.2 += pass_changed as usize;
                 // Between-pass invariant check (opt-in via `QCODE_VERIFY`).
-                crate::verify::verify_after(ctx, &p.name());
+                crate::verify::verify_after(ctx, p.name());
                 changed |= pass_changed;
             }
             function_changed |= changed;

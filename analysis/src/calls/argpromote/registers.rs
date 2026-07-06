@@ -340,6 +340,9 @@ fn try_promote_registers(
     true
 }
 
+/// Precomputed `(register, size, space, name, type)` for one input register.
+type InputMeta = (VarnodeId, usize, SpaceId, Option<String>, Option<TypeId>);
+
 /// Rewrite `fid` for its register effects `eff`, in both directions: thread one
 /// by-value input param per input register (seeded into the register file, loaded
 /// fresh at every caller) and append the outputs as a flat positional write-set
@@ -350,7 +353,7 @@ pub(crate) fn rewrite_registers(ctx: &mut Context, fid: FunctionId, eff: &Regist
     // The body reads its live-in registers through params the next mem2reg run
     // SSA-promotes. Precompute `(register, size, space, name, type)` before the
     // first mutable borrow.
-    let input_meta: Vec<(VarnodeId, usize, SpaceId, Option<String>, Option<TypeId>)> = eff
+    let input_meta: Vec<InputMeta> = eff
         .inputs
         .iter()
         .map(|&r| {
