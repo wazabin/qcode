@@ -105,6 +105,11 @@ impl std::fmt::Display for LiteralRef<'_, '_> {
                 write!(f, "&<{}>", fn_ref.name())
             }
             Some(SymbolicRef::String(s)) => write!(f, "&{:?}", s),
+            // A `bool` literal prints as `true`/`false`; the `bool` type token is
+            // emitted by the operand's type prefix, so the round-trip is `bool true`.
+            None if self.ctx.types.is_bool(literal.type_id) => {
+                write!(f, "{}", if literal.value != 0 { "true" } else { "false" })
+            }
             None => write!(f, "0x{:x}", literal.value),
         }
     }

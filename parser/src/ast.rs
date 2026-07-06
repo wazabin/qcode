@@ -30,6 +30,8 @@ pub enum Atom {
     /// `&name` — takes the address of a varnode.
     AddressOf(String),
     Int(u64),
+    /// `true` / `false` — a byte-stored `bool` constant.
+    Bool(bool),
 }
 
 #[derive(Clone, Debug)]

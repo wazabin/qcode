@@ -1075,7 +1075,7 @@ mod tests {
             .unwrap()
             .as_statement()
             .to_string();
-        assert_eq!(term, "if i8 %c goto <hdr @i=i64 %ni> else goto <exit>;");
+        assert_eq!(term, "if bool %c goto <hdr @i=i64 %ni> else goto <exit>;");
     }
 
     /// Root (entry) params are the function interface and are never removed even

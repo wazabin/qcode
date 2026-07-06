@@ -10,12 +10,18 @@
 //! | Concrete type    | Meaning                                        |
 //! |------------------|------------------------------------------------|
 //! | [`IntType`]      | Plain integer of *n* bytes                     |
+//! | [`BoolType`]     | A byte-stored boolean, domain `{0, 1}`         |
 //! | [`StackAddress`] | Pointer-width address in the stack memory space |
+//!
+//! # Bool
+//!
+//! `bool` is its own type (byte-stored, `size() == 1`) minted only by
+//! comparisons and the `true`/`false` literals. The verifier pins its domain to
+//! `{0, 1}` and rejects mixing `bool` with `iN` in a binop, so bitwise
+//! `And`/`Or`/`Xor` over `bool` operands *is* logical and/or/xor.
 //!
 //! # TODO
 //!
-//! - `Bool`: currently modelled as `Int(1)`. Will become its own type once the
-//!   verify pass is implemented, so that `Bool + Bool` can be rejected.
 //! - Pointer types for RAM/register spaces.
 
 use rustc_hash::FxHashMap as HashMap;
@@ -112,6 +118,9 @@ pub enum TypeRepr {
     Int {
         size: usize,
     },
+    /// A byte-stored boolean whose value domain is `{0, 1}`. Minted only by
+    /// comparisons and the `true`/`false` literals; `size()` is always 1.
+    Bool,
     SpaceAddress {
         size: usize,
         space: SpaceId,
@@ -225,6 +234,26 @@ impl Type for IntType {
 
     fn repr(&self) -> TypeRepr {
         TypeRepr::Int { size: self.size }
+    }
+}
+
+/// A byte-stored boolean, value domain `{0, 1}`. `size()` is always 1 (the type
+/// system is byte-granular). Distinct from `Int(1)` so the verifier can reject
+/// `bool`/`iN` mixing and so bitwise ops over `bool` read as logical and/or/xor.
+#[derive(Clone)]
+struct BoolType;
+
+impl Type for BoolType {
+    fn size(&self) -> usize {
+        1
+    }
+
+    fn clone_box(&self) -> Box<dyn Type> {
+        Box::new(self.clone())
+    }
+
+    fn repr(&self) -> TypeRepr {
+        TypeRepr::Bool
     }
 }
 
@@ -441,6 +470,8 @@ pub struct TypeManager {
     types: Vec<Box<dyn Type>>,
     /// Fast lookup: Int size → TypeId.
     int_by_size: HashMap<usize, TypeId>,
+    /// The interned `bool` type, once created.
+    bool_id: Option<TypeId>,
     /// Fast lookup: (size, space) → SpaceAddress TypeId.
     space_address: HashMap<(usize, SpaceId), TypeId>,
     /// Fast lookup: named field-type list → Aggregate TypeId.
@@ -466,6 +497,7 @@ impl TypeManager {
         Self {
             types: Vec::new(),
             int_by_size: HashMap::default(),
+            bool_id: None,
             space_address: HashMap::default(),
             aggregate_by_fields: HashMap::default(),
             struct_by_name: HashMap::default(),
@@ -490,6 +522,27 @@ impl TypeManager {
         let id = self.register(Box::new(IntType { size }));
         self.int_by_size.insert(size, id);
         id
+    }
+
+    /// Returns the [`TypeId`] for the byte-stored `bool` type, creating it if it
+    /// does not yet exist.
+    pub fn get_or_make_bool(&mut self) -> TypeId {
+        if let Some(id) = self.bool_id {
+            return id;
+        }
+        let id = self.register(Box::new(BoolType));
+        self.bool_id = Some(id);
+        id
+    }
+
+    /// The interned `bool` [`TypeId`], if it has been created.
+    pub fn bool_id(&self) -> Option<TypeId> {
+        self.bool_id
+    }
+
+    /// Whether `id` is the byte-stored `bool` type.
+    pub fn is_bool(&self, id: TypeId) -> bool {
+        matches!(self.get(id).repr(), TypeRepr::Bool)
     }
 
     /// Returns the [`TypeId`] for a [`SpaceAddress`] of the given byte width
@@ -684,6 +737,7 @@ impl TypeManager {
     /// `i<bits>` form, so existing IR/signature assertions are unaffected.
     pub fn type_name(&self, id: TypeId) -> String {
         match self.get(id).repr() {
+            TypeRepr::Bool => "bool".to_string(),
             TypeRepr::Struct { name, .. } => name,
             TypeRepr::StructPointer { pointee, .. } => format!("{}*", self.type_name(pointee)),
             TypeRepr::Array { elem, count } => format!("[{};{}]", self.type_name(elem), count),
@@ -755,9 +809,10 @@ impl TypeManager {
 
     /// Computes the result [`TypeId`] for a binary operation on `lhs op rhs`.
     ///
-    /// Comparisons yield a 1-byte boolean; every other integer/float op preserves
-    /// the left operand's type (so a pointer-typed operand keeps its space
-    /// provenance through `ptr + offset`).
+    /// Comparisons yield `bool`; `And`/`Or`/`Xor` over `bool` operands stay `bool`
+    /// (this *is* logical and/or/xor); every other integer/float op preserves the
+    /// left operand's type (so a pointer-typed operand keeps its space provenance
+    /// through `ptr + offset`).
     pub fn binop_result(&mut self, lhs: TypeId, op: Binop, _rhs: TypeId) -> TypeId {
         match op {
             Binop::Int(int_op) => match int_op {
@@ -766,11 +821,20 @@ impl TypeManager {
                 | IntBinop::Less
                 | IntBinop::LessEqual
                 | IntBinop::SLess
-                | IntBinop::SLessEqual => self.get_or_make_int(1),
+                | IntBinop::SLessEqual => self.get_or_make_bool(),
+                // Bitwise and/or/xor over bool operands is logical and/or/xor and
+                // preserves the bool type; over ints it preserves the int type.
+                IntBinop::And | IntBinop::Or | IntBinop::Xor if self.is_bool(lhs) => lhs,
                 _ => lhs,
             },
-            Binop::Bool(_) => self.get_or_make_int(1),
-            Binop::Float(_) => lhs,
+            Binop::Bool(_) => self.get_or_make_bool(),
+            Binop::Float(float_op) => {
+                if float_op.is_comparison() {
+                    self.get_or_make_bool()
+                } else {
+                    lhs
+                }
+            }
         }
     }
 }
@@ -796,6 +860,64 @@ impl serde::Serialize for TypeManager {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn binop_result_bool_rules() {
+        use crate::value::insn::{Binop, FloatBinop, IntBinop};
+        let mut tm = TypeManager::new();
+        let i32 = tm.get_or_make_int(4);
+        let boolt = tm.get_or_make_bool();
+
+        // Comparisons over ints yield bool.
+        assert_eq!(tm.binop_result(i32, Binop::Int(IntBinop::Less), i32), boolt);
+        assert_eq!(
+            tm.binop_result(i32, Binop::Int(IntBinop::Equal), i32),
+            boolt
+        );
+        // Float comparisons yield bool.
+        assert_eq!(
+            tm.binop_result(i32, Binop::Float(FloatBinop::Less), i32),
+            boolt
+        );
+        // Bitwise over bool operands stays bool (logical and/or/xor).
+        assert_eq!(
+            tm.binop_result(boolt, Binop::Int(IntBinop::And), boolt),
+            boolt
+        );
+        assert_eq!(
+            tm.binop_result(boolt, Binop::Int(IntBinop::Or), boolt),
+            boolt
+        );
+        // Bitwise over ints preserves the int type.
+        assert_eq!(tm.binop_result(i32, Binop::Int(IntBinop::And), i32), i32);
+        // Arithmetic preserves the left type.
+        assert_eq!(tm.binop_result(i32, Binop::Int(IntBinop::Add), i32), i32);
+    }
+
+    #[test]
+    fn bool_is_byte_stored_and_interned() {
+        let mut tm = TypeManager::new();
+        let b = tm.get_or_make_bool();
+        assert_eq!(tm.size_of(b), 1);
+        assert!(tm.is_bool(b));
+        assert_eq!(tm.get_or_make_bool(), b);
+        assert_eq!(tm.type_name(b), "bool");
+        let i8 = tm.get_or_make_int(1);
+        assert!(!tm.is_bool(i8));
+    }
+
+    #[test]
+    fn bool_round_trips_through_serde() {
+        let mut tm = TypeManager::new();
+        let _i8 = tm.get_or_make_int(1);
+        let b = tm.get_or_make_bool();
+        let config = bincode::config::standard();
+        let bytes = bincode::serde::encode_to_vec(&tm, config).unwrap();
+        let (back, _): (TypeManager, _) =
+            bincode::serde::decode_from_slice(&bytes, config).unwrap();
+        assert!(back.is_bool(b));
+        assert_eq!(back.size_of(b), 1);
+    }
 
     #[test]
     fn array_is_a_disguised_width_n_scalar() {
@@ -876,6 +998,9 @@ impl<'de> serde::Deserialize<'de> for TypeManager {
             match repr {
                 TypeRepr::Int { size } => {
                     manager.get_or_make_int(size);
+                }
+                TypeRepr::Bool => {
+                    manager.get_or_make_bool();
                 }
                 TypeRepr::SpaceAddress { size, space } => {
                     manager.get_or_make_space_address(size, space);

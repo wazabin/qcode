@@ -7,12 +7,14 @@
 //! it, rather than surfacing far downstream as a confusing symptom.
 
 mod block_terminators;
+mod bool_typing;
 mod dangling_refs;
 mod pointer_spaces;
 mod pure_function;
 mod pure_reg_call_args;
 
 pub use block_terminators::verify_block_terminators;
+pub use bool_typing::verify_bool_typing;
 pub use dangling_refs::verify_no_dangling_refs;
 pub use pointer_spaces::verify_pointer_spaces;
 pub use pure_function::{PureFunctionViolation, verify_pure_functions};
@@ -31,6 +33,7 @@ pub fn verify(ctx: &Context<'_>) -> Vec<String> {
     diagnostics.extend(verify_block_terminators(ctx));
     diagnostics.extend(verify_no_dangling_refs(ctx));
     diagnostics.extend(verify_pointer_spaces(ctx));
+    diagnostics.extend(verify_bool_typing(ctx));
     diagnostics.extend(
         verify_pure_reg_call_args(ctx)
             .into_iter()

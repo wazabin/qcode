@@ -926,6 +926,7 @@ impl Lowerer<'_, '_, '_> {
                 let size = typed.size_bytes.or(size_hint).unwrap_or(8);
                 Ok(self.b.context_mut().get_const(*value, size).id())
             }
+            Atom::Bool(value) => Ok(self.b.context_mut().get_bool_const(*value).id()),
         }
     }
 

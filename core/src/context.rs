@@ -689,6 +689,16 @@ impl<'str> Context<'str> {
         LiteralRef::new(self, id)
     }
 
+    /// Creates a `bool`-typed constant (`true`/`false`), byte-stored with value
+    /// `1`/`0`. This is the only way to mint a `bool` literal.
+    pub fn get_bool_const(&mut self, value: bool) -> LiteralRef<'str, '_> {
+        let type_id = self.types.get_or_make_bool();
+        let id = self
+            .values
+            .get_or_make_typed_literal(u64::from(value), type_id, 1);
+        LiteralRef::new(self, id)
+    }
+
     /// Creates a typed constant literal.
     ///
     /// Unlike [`get_const`](Self::get_const) this accepts an arbitrary [`TypeId`],

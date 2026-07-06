@@ -1132,6 +1132,7 @@ fn parse_atom(pair: Pair<'_, Rule>) -> Result<Atom, ParseError> {
             Ok(Atom::AddressOf(name))
         }
         Rule::integer => parse_integer(inner.as_str()).map(Atom::Int),
+        Rule::bool_lit => Ok(Atom::Bool(inner.as_str() == "true")),
         _ => Err(ParseError::new("invalid atom")),
     }
 }
@@ -1147,6 +1148,9 @@ fn parse_integer(text: &str) -> Result<u64, ParseError> {
 }
 
 fn parse_size_bytes(text: &str, context: &str) -> Result<usize, ParseError> {
+    if text == "bool" {
+        return Ok(1);
+    }
     let bits = parse_size_bits(text).ok_or_else(|| {
         ParseError::new(format!(
             "invalid {context} size `{text}`; expected iNN or fNN"

@@ -95,7 +95,8 @@ tuple_field     =  { ident ~ "=" ~ typed_atom }
 positional_tuple = { "(" ~ typed_atom ~ ("," ~ typed_atom)* ~ ")" }
 cast_op         =  { "zext" | "sext" | "int2float" | "float2float" | "trunc" }
 typed_atom      =  { ty? ~ atom }
-atom            =  { capture | block_param_name | ssa_name | addressof | ident | integer }
+atom            =  { capture | block_param_name | ssa_name | addressof | bool_lit | ident | integer }
+bool_lit        = @{ ("true" | "false") ~ !(ASCII_ALPHANUMERIC | "_") }
 addressof       =  { "&" ~ ident }
 capture         =  { "{" ~ ident ~ "}" }
 block_param_name = @{ "@" ~ (ASCII_ALPHA | "_") ~ (ASCII_ALPHANUMERIC | "_")* }
@@ -104,7 +105,7 @@ ident           = @{ (ASCII_ALPHA | "_") ~ (ASCII_ALPHANUMERIC | "_")* }
 integer         = @{ hex_int | dec_int }
 hex_int         =  { "0" ~ ("x" | "X") ~ ASCII_HEX_DIGIT+ }
 dec_int         =  { ASCII_DIGIT+ }
-ty              = @{ ("i" | "f") ~ ASCII_DIGIT+ }
+ty              = @{ "bool" | ("i" | "f") ~ ASCII_DIGIT+ }
 op              =  { "s>>" | "s<=" | "s>=" | "s<" | "s>" | "s/" | "s%" | "f<=" | "f>=" | "f==" | "f!=" | "f<" | "f>" | "f+" | "f-" | "f*" | "f/" | "<<" | ">>" | "<=" | ">=" | "==" | "!=" | "^^" | "&&" | "||" | "+" | "-" | "*" | "/" | "%" | "&" | "|" | "^" | "<" | ">" }
 unop_op         =  { "!" | "~" | "-" | "f-" }
 func_unop_op    =  { "abs" | "sqrt" | "floor" | "ceil" | "round" }

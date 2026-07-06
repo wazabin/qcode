@@ -530,7 +530,10 @@ mod tests {
         }
 
         assert_eq!(v.size(), 1);
-        assert_eq!(v.as_statement().to_string(), "i8 %v = i32 %v0 == i32 0x2;");
+        assert_eq!(
+            v.as_statement().to_string(),
+            "bool %v = i32 %v0 == i32 0x2;"
+        );
     }
 
     #[test]
@@ -558,7 +561,10 @@ mod tests {
         }
 
         assert_eq!(v.size(), 1);
-        assert_eq!(v.as_statement().to_string(), "i8 %v = i32 %v0 != i32 0x2;");
+        assert_eq!(
+            v.as_statement().to_string(),
+            "bool %v = i32 %v0 != i32 0x2;"
+        );
     }
 
     #[test]
@@ -586,7 +592,7 @@ mod tests {
         }
 
         assert_eq!(v.size(), 1);
-        assert_eq!(v.as_statement().to_string(), "i8 %v = i32 %v0 < i32 0x2;");
+        assert_eq!(v.as_statement().to_string(), "bool %v = i32 %v0 < i32 0x2;");
     }
 
     #[test]
@@ -614,7 +620,10 @@ mod tests {
         }
 
         assert_eq!(v.size(), 1);
-        assert_eq!(v.as_statement().to_string(), "i8 %v = i32 %v0 <= i32 0x2;");
+        assert_eq!(
+            v.as_statement().to_string(),
+            "bool %v = i32 %v0 <= i32 0x2;"
+        );
     }
 
     #[test]
@@ -642,7 +651,7 @@ mod tests {
         }
 
         assert_eq!(v.size(), 1);
-        assert_eq!(v.as_statement().to_string(), "i8 %v = i32 0x2 < i32 %v0;");
+        assert_eq!(v.as_statement().to_string(), "bool %v = i32 0x2 < i32 %v0;");
     }
 
     #[test]
@@ -670,7 +679,10 @@ mod tests {
         }
 
         assert_eq!(v.size(), 1);
-        assert_eq!(v.as_statement().to_string(), "i8 %v = i32 0x2 <= i32 %v0;");
+        assert_eq!(
+            v.as_statement().to_string(),
+            "bool %v = i32 0x2 <= i32 %v0;"
+        );
     }
 
     #[test]
