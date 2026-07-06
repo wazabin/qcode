@@ -45,7 +45,7 @@ use qcode::{
 };
 
 use super::carried_array::{classify_body_reads, exit_view, find_carried_array};
-use super::loop_to_map::{ScanElem, outline_scan_body};
+use super::outline::{ScanElem, outline_scan_body};
 use crate::loop_info::{
     cbranch_exit, delete_private_loop, incoming, is_increment, is_loop_private, literal,
     param_parent, param_pos,
