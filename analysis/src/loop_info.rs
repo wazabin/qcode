@@ -22,7 +22,7 @@ use qcode::{
     context::Context,
     value::{
         BasicBlock, BlockId, Function, FunctionId, ValueId, ValueRef,
-        insn::{Binary, Binop, IntBinop, Mnemonic},
+        insn::{Binary, Binop, Branch, CBranch, IntBinop, Mnemonic},
     },
 };
 
@@ -53,7 +53,6 @@ pub(crate) fn is_increment(ctx: &Context, v: ValueId, idx: ValueId) -> bool {
 
 /// `true` if `v` is `idx - 1`, expressed either as `idx - 1` or as `idx + (-1)`
 /// (the wrapping representation `array_promote` emits for a back-index).
-#[allow(dead_code)] // used by `loop_to_scan` once it moves onto this utility
 pub(crate) fn is_decrement(ctx: &Context, v: ValueId, idx: ValueId, idx_width: usize) -> bool {
     let ValueId::Instruction(id) = v else {
         return false;
@@ -117,6 +116,88 @@ pub(crate) fn incoming(ctx: &Context, block: BlockId, k: usize) -> Vec<ValueId> 
         }
     }
     out
+}
+
+// ===========================================================================
+// Loop-recognizer plumbing (shared by the carried-array recognizers)
+// ===========================================================================
+
+/// Exit discovery for a header terminated by the loop guard `cbranch`: the exit
+/// is the successor that is **not** itself a header predecessor, and the "stay"
+/// (loop-body side) is the other. `None` if the header does not end in a
+/// `CBranch`, or neither/both successors are header predecessors.
+pub(crate) fn cbranch_exit(ctx: &Context, header: BlockId) -> Option<(BlockId, BlockId)> {
+    let hterm = BasicBlock::from_id(ctx, header).iter().last()?;
+    let Mnemonic::CBranch(CBranch {
+        success_block: sb,
+        failure_block: fb,
+        ..
+    }) = hterm.mnemonic()
+    else {
+        return None;
+    };
+    let (sb, fb) = (*sb, *fb);
+    let preds: HashSet<BlockId> = BasicBlock::from_id(ctx, header)
+        .predecessors()
+        .map(|(_, p)| p)
+        .collect();
+    if preds.contains(&sb) && !preds.contains(&fb) {
+        Some((fb, sb))
+    } else if preds.contains(&fb) && !preds.contains(&sb) {
+        Some((sb, fb))
+    } else {
+        None
+    }
+}
+
+/// `true` if the loop is wholly private: every value defined by `blocks` (params
+/// and instructions) is used only inside `blocks`. Such a loop computes nothing
+/// observable outside it once its escaping values have been rerouted, so it can
+/// be deleted.
+pub(crate) fn is_loop_private(ctx: &Context, blocks: &[BlockId]) -> bool {
+    let in_loop = |v: ValueId| {
+        ctx.users(v).iter().all(|&u| {
+            ctx.get_insn(u)
+                .parent()
+                .is_some_and(|b| blocks.contains(&b.id))
+        })
+    };
+    blocks.iter().all(|&blk| {
+        let b = BasicBlock::from_id(ctx, blk);
+        b.params().all(|p| in_loop(p.id())) && b.iter().all(|i| in_loop(ValueId::Instruction(i.id)))
+    })
+}
+
+/// Delete a wholly-private loop: reroute `preheader`'s terminator to a plain
+/// `Branch(exit, exit_args)` (re-feeding the exit's params from
+/// preheader-available values), add the new CFG edge, then delete the loop
+/// `blocks`. `preheader` is assumed to end in a terminator; if it somehow does
+/// not, the reroute is skipped but the blocks are still deleted.
+pub(crate) fn delete_private_loop(
+    ctx: &mut Context,
+    fid: FunctionId,
+    preheader: BlockId,
+    blocks: &[BlockId],
+    exit: BlockId,
+    exit_args: Vec<ValueId>,
+) {
+    if let Some(term_id) = BasicBlock::from_id(ctx, preheader)
+        .iter()
+        .last()
+        .map(|t| t.id)
+    {
+        ctx.replace_instruction_mnemonic(
+            term_id,
+            Mnemonic::Branch(Branch {
+                target: exit,
+                args: exit_args,
+            }),
+        );
+        ctx.add_cfg_edge(preheader, exit);
+    }
+    for &blk in blocks {
+        BasicBlock::from_id_mut(ctx, blk).delete(fid);
+    }
 }
 
 // ===========================================================================

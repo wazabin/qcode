@@ -35,22 +35,21 @@
 //! remove. The recognizer trusts `array_promote`'s coverage proof — the array's
 //! full length `N` comes straight from the exit store's element type.
 
-use rustc_hash::FxHashSet as HashSet;
-
 use qcode::{
     builder::Builder,
     context::Context,
     value::{
         BasicBlock, BlockId, Function, FunctionId, InstructionRef, ValueId,
-        insn::{Branch, InstructionId, IntrinsicApp, IntrinsicId, Mnemonic},
+        insn::{InstructionId, IntrinsicApp, IntrinsicId, Mnemonic},
     },
 };
 
-use super::carried_array::{
-    classify_body_reads, exit_view, find_carried_array, incoming, is_increment, literal,
+use super::carried_array::{classify_body_reads, exit_view, find_carried_array};
+use super::loop_to_map::{ScanElem, outline_scan_body};
+use crate::loop_info::{
+    cbranch_exit, delete_private_loop, incoming, is_increment, is_loop_private, literal,
     param_parent, param_pos,
 };
-use super::loop_to_map::{ScanElem, outline_scan_body};
 use crate::{FunctionPass, PipelineEnv};
 
 #[derive(Default)]
@@ -108,24 +107,8 @@ fn try_match(ctx: &mut Context, fid: FunctionId) -> Option<ScanMatch> {
     // The loop body carries the array back to the header; the guard block's other
     // successor is the loop exit. `header`'s terminator is the `CBranch` guard
     // (rotated: it lives on the body/header itself; split: on the distinct guard).
-    let hterm = BasicBlock::from_id(ctx, header).iter().last()?;
-    let Mnemonic::CBranch(cb) = hterm.mnemonic() else {
-        return None;
-    };
-    let (sb, fb) = (cb.success_block, cb.failure_block);
-    // The back-edge block (loop body) is a predecessor of the header; the exit is
-    // the guard's other successor.
-    let header_preds_set: HashSet<BlockId> = BasicBlock::from_id(ctx, header)
-        .predecessors()
-        .map(|(_, p)| p)
-        .collect();
-    let exit = if header_preds_set.contains(&sb) && !header_preds_set.contains(&fb) {
-        fb
-    } else if header_preds_set.contains(&fb) && !header_preds_set.contains(&sb) {
-        sb
-    } else {
-        return None;
-    };
+    // The exit is the guard successor that is not itself a header predecessor.
+    let (exit, _stay) = cbranch_exit(ctx, header)?;
 
     // The array value as the exit block sees it: an exit pass-through param that
     // copies `arr_h` on the header→exit edge, or `arr_h` itself when gvn coalesced
@@ -334,18 +317,7 @@ fn apply(ctx: &mut Context, fid: FunctionId, m: &ScanMatch) -> bool {
     } else {
         vec![m.header, m.body]
     };
-    let in_loop = |ctx: &Context, v: ValueId| {
-        ctx.users(v).iter().all(|&u| {
-            ctx.get_insn(u)
-                .parent()
-                .is_some_and(|b| loop_blocks.contains(&b.id))
-        })
-    };
-    let private = loop_blocks.iter().all(|&blk| {
-        let b = BasicBlock::from_id(ctx, blk);
-        b.params().all(|p| in_loop(ctx, p.id()))
-            && b.iter().all(|i| in_loop(ctx, ValueId::Instruction(i.id)))
-    });
+    let private = is_loop_private(ctx, &loop_blocks);
     let defined_in_loop = |ctx: &Context, v: ValueId| match v {
         ValueId::BlockParam(_) => param_parent(ctx, v).is_some_and(|b| loop_blocks.contains(&b)),
         ValueId::Instruction(id) => ctx
@@ -392,23 +364,7 @@ fn apply(ctx: &mut Context, fid: FunctionId, m: &ScanMatch) -> bool {
             .filter(|p| !loop_blocks.contains(p))
             .collect();
         if let [preheader] = preheaders[..] {
-            if let Some(term_id) = BasicBlock::from_id(ctx, preheader)
-                .iter()
-                .last()
-                .map(|t| t.id)
-            {
-                ctx.replace_instruction_mnemonic(
-                    term_id,
-                    Mnemonic::Branch(Branch {
-                        target: m.exit,
-                        args: exit_args,
-                    }),
-                );
-                ctx.add_cfg_edge(preheader, m.exit);
-            }
-            for &blk in &loop_blocks {
-                BasicBlock::from_id_mut(ctx, blk).delete(fid);
-            }
+            delete_private_loop(ctx, fid, preheader, &loop_blocks, m.exit, exit_args);
         }
     }
     true

@@ -15,100 +15,12 @@ use qcode::{
     context::Context,
     types::TypeId,
     value::{
-        BasicBlock, BlockId, Function, FunctionId, ValueId, ValueRef,
-        insn::{Binary, Binop, InstructionId, IntBinop, IntrinsicApp, IntrinsicId, Mnemonic},
+        BasicBlock, BlockId, Function, FunctionId, ValueId,
+        insn::{InstructionId, IntrinsicApp, IntrinsicId, Mnemonic},
     },
 };
 
-/// `c` if `v` is the integer literal `c`, else `None`.
-pub(crate) fn literal(ctx: &Context, v: ValueId) -> Option<u64> {
-    match ValueRef::new(v, ctx) {
-        ValueRef::Literal(l) => Some(l.value()),
-        _ => None,
-    }
-}
-
-/// `true` if `v` is `idx + 1` (either operand order) — a unit step of `idx`.
-pub(crate) fn is_increment(ctx: &Context, v: ValueId, idx: ValueId) -> bool {
-    let ValueId::Instruction(id) = v else {
-        return false;
-    };
-    let Mnemonic::Binop(Binary { lhs, rhs, op }) = ctx.get_insn(id).mnemonic() else {
-        return false;
-    };
-    let one = |x: ValueId| literal(ctx, x) == Some(1);
-    matches!(op, Binop::Int(IntBinop::Add))
-        && ((*lhs == idx && one(*rhs)) || (*rhs == idx && one(*lhs)))
-}
-
-/// `true` if `v` is `idx - 1`, expressed either as `idx - 1` or as `idx + (-1)`
-/// (the wrapping representation `array_promote` emits for the `at` back-index).
-pub(crate) fn is_decrement(ctx: &mut Context, v: ValueId, idx: ValueId) -> bool {
-    let ValueId::Instruction(id) = v else {
-        return false;
-    };
-    let Mnemonic::Binop(Binary { lhs, rhs, op }) = ctx.get_insn(id).mnemonic() else {
-        return false;
-    };
-    let (lhs, rhs, op) = (*lhs, *rhs, *op);
-    let idx_ty = ctx.type_of(idx);
-    let width = ctx.types.size_of(idx_ty);
-    let neg_one = if width >= 8 {
-        u64::MAX
-    } else {
-        (1u64 << (width * 8)) - 1
-    };
-    match op {
-        Binop::Int(IntBinop::Sub) => lhs == idx && literal(ctx, rhs) == Some(1),
-        Binop::Int(IntBinop::Add) => {
-            (lhs == idx && literal(ctx, rhs) == Some(neg_one))
-                || (rhs == idx && literal(ctx, lhs) == Some(neg_one))
-        }
-        _ => false,
-    }
-}
-
-/// Values feeding block-param index `k` of `block` from every predecessor edge.
-pub(crate) fn incoming(ctx: &Context, block: BlockId, k: usize) -> Vec<ValueId> {
-    let mut out = Vec::new();
-    let preds: Vec<BlockId> = BasicBlock::from_id(ctx, block)
-        .predecessors()
-        .map(|(_, p)| p)
-        .collect();
-    for pred in preds {
-        let Some(term) = BasicBlock::from_id(ctx, pred).iter().last() else {
-            continue;
-        };
-        match term.mnemonic() {
-            Mnemonic::Branch(b) => out.extend(b.args.get(k).copied()),
-            Mnemonic::CBranch(cb) => {
-                if cb.success_block == block {
-                    out.extend(cb.success_args.get(k).copied());
-                }
-                if cb.failure_block == block {
-                    out.extend(cb.failure_args.get(k).copied());
-                }
-            }
-            _ => {}
-        }
-    }
-    out
-}
-
-/// Index of block-param `p` within `block`'s parameter list.
-pub(crate) fn param_pos(ctx: &Context, block: BlockId, p: ValueId) -> Option<usize> {
-    BasicBlock::from_id(ctx, block)
-        .params()
-        .position(|q| q.id() == p)
-}
-
-/// Parent block of a block-param value.
-pub(crate) fn param_parent(ctx: &Context, v: ValueId) -> Option<BlockId> {
-    let ValueId::BlockParam(pid) = v else {
-        return None;
-    };
-    ctx.values.block_params[pid].parent
-}
+use crate::loop_info::{incoming, is_decrement, literal, param_parent, param_pos};
 
 /// A loop-carried array threaded through a loop header:
 /// header param `arr_h : [elem_ty; count]` whose incomings are exactly one
@@ -281,10 +193,12 @@ pub(crate) fn classify_body_reads(ctx: &mut Context, ca: &CarriedArray) -> Optio
             _ => None,
         })
         .collect();
+    let idx_ty = ctx.type_of(ca.index);
+    let idx_width = ctx.types.size_of(idx_ty);
     let mut prev = None;
     let mut own = None;
     for (id, e_idx) in arr_b_ats {
-        if is_decrement(ctx, e_idx, ca.index) {
+        if is_decrement(ctx, e_idx, ca.index, idx_width) {
             if prev.is_some() {
                 return None;
             }

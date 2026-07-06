@@ -32,8 +32,11 @@ use qcode::{
 };
 
 use super::carried_array::{
-    CarriedArray, classify_body_reads, exit_view, find_carried_array, incoming, is_increment,
-    literal, param_parent, param_pos,
+    CarriedArray, classify_body_reads, exit_view, find_carried_array,
+};
+use crate::loop_info::{
+    cbranch_exit, delete_private_loop, incoming, is_increment, is_loop_private, literal,
+    param_parent, param_pos,
 };
 use crate::{Pass, PipelineEnv};
 
@@ -549,22 +552,7 @@ fn try_match(ctx: &mut Context, fid: FunctionId) -> Option<MapMatch> {
 
     // Exit discovery: the header terminator is the loop guard; the exit is the
     // successor that is not itself a header predecessor.
-    let hterm = BasicBlock::from_id(ctx, ca.header).iter().last()?;
-    let Mnemonic::CBranch(cb) = hterm.mnemonic() else {
-        return None;
-    };
-    let (sb, fb) = (cb.success_block, cb.failure_block);
-    let preds: HashSet<BlockId> = BasicBlock::from_id(ctx, ca.header)
-        .predecessors()
-        .map(|(_, p)| p)
-        .collect();
-    let exit = if preds.contains(&sb) && !preds.contains(&fb) {
-        fb
-    } else if preds.contains(&fb) && !preds.contains(&sb) {
-        sb
-    } else {
-        return None;
-    };
+    let (exit, _stay) = cbranch_exit(ctx, ca.header)?;
     let arr_exit = exit_view(ctx, &ca, exit);
 
     // When the body reads its own original lane, the map ranges over the *original*
@@ -598,18 +586,7 @@ fn try_match(ctx: &mut Context, fid: FunctionId) -> Option<MapMatch> {
     // Deletable iff wholly private: every value the loop defines is used only inside
     // it (the exit's array pass-through is re-fed from the preheader init in `apply`).
     let loop_blocks = [ca.header, ca.body];
-    let in_loop = |ctx: &Context, v: ValueId| {
-        ctx.users(v).iter().all(|&u| {
-            ctx.get_insn(u)
-                .parent()
-                .is_some_and(|b| loop_blocks.contains(&b.id))
-        })
-    };
-    let deletable = loop_blocks.iter().all(|&blk| {
-        let b = BasicBlock::from_id(ctx, blk);
-        b.params().all(|p| in_loop(ctx, p.id()))
-            && b.iter().all(|i| in_loop(ctx, ValueId::Instruction(i.id)))
-    });
+    let deletable = is_loop_private(ctx, &loop_blocks);
 
     Some(MapMatch {
         ca,
@@ -755,23 +732,8 @@ fn apply(ctx: &mut Context, fid: FunctionId, m: &MapMatch) -> bool {
             .map(|(_, p)| p)
             .filter(|p| !loop_blocks.contains(p))
             .collect();
-        if let [preheader] = preheaders[..]
-            && let Some(term_id) = BasicBlock::from_id(ctx, preheader)
-                .iter()
-                .last()
-                .map(|t| t.id)
-        {
-            ctx.replace_instruction_mnemonic(
-                term_id,
-                Mnemonic::Branch(Branch {
-                    target: m.exit,
-                    args: exit_args,
-                }),
-            );
-            ctx.add_cfg_edge(preheader, m.exit);
-            for &blk in &loop_blocks {
-                BasicBlock::from_id_mut(ctx, blk).delete(fid);
-            }
+        if let [preheader] = preheaders[..] {
+            delete_private_loop(ctx, fid, preheader, &loop_blocks, m.exit, exit_args);
         }
     }
     true
@@ -1075,19 +1037,16 @@ fn apply_strlen(ctx: &mut Context, fid: FunctionId, m: &StrlenMatch) -> bool {
         if let Some(kx) = kx {
             crate::dce::remove_params_from_block(ctx, m.exit_block, &HashSet::from_iter([kx]));
         }
-        if let Some(term) = BasicBlock::from_id(ctx, m.preheader).iter().last() {
-            let term_id = term.id;
-            ctx.replace_instruction_mnemonic(
-                term_id,
-                Mnemonic::Branch(Branch {
-                    target: m.exit_block,
-                    args: Vec::new(),
-                }),
-            );
-            ctx.add_cfg_edge(m.preheader, m.exit_block);
-        }
-        BasicBlock::from_id_mut(ctx, m.body_block).delete(fid);
-        BasicBlock::from_id_mut(ctx, m.header_block).delete(fid);
+        // Reroute the preheader straight to the (now param-less) exit and delete the
+        // dead loop blocks (body before header, as they were emitted).
+        delete_private_loop(
+            ctx,
+            fid,
+            m.preheader,
+            &[m.body_block, m.header_block],
+            m.exit_block,
+            Vec::new(),
+        );
     }
     // Otherwise the loop also feeds outside consumers, so it keeps running; only the
     // count was forwarded to `len` above.
