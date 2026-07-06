@@ -272,6 +272,38 @@ fn repeated_literal_uses_share_one_range_entry() {
     assert_eq!(result.alias_class(l1), result.alias_class(a.into()));
 }
 
+/// The literal-root dedup must not be blind to the access *size*: the same
+/// interned literal first used with a narrow access (whose interval overlaps
+/// nothing) and later with a wide access (whose interval overlaps a varnode)
+/// must still merge with that varnode. A `ValueId`-only cache key short-circuits
+/// the second resolution and misses the merge, wrongly answering no-alias.
+#[test]
+fn same_literal_wider_second_use_still_merges() {
+    let mut a_id = None;
+    let mut lit = None;
+    let (ctx, _, _) = build_in_custom_space(|b, space| {
+        let a = Varnode::make(b.context_mut(), 8, 8, space).id; // A: [8,16)
+        let p = b.context_mut().get_const(4, 8).id();
+        b.push_load::<false>(p, 4, space); // [4,8) — no overlap with A
+        b.push_load::<false>(p, 8, space); // [4,12) — overlaps A
+        a_id = Some(a);
+        lit = Some(p);
+    });
+    let a = a_id.unwrap();
+    let lit = lit.unwrap();
+    let result = AliasResult::simple(&ctx);
+
+    assert!(
+        result.may_alias(&ctx, lit, a.into()),
+        "the wider second use of the literal overlaps A and must merge with it"
+    );
+    assert_eq!(
+        result.alias_class(lit),
+        result.alias_class(a.into()),
+        "literal and overlapped varnode share one class"
+    );
+}
+
 #[test]
 fn literal_straddles_two_disjoint_varnode_classes_joins_them() {
     let mut a = None;
