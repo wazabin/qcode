@@ -1,6 +1,7 @@
 use crate::value::ValueId;
 
-use super::mnemonic::MnemonicKind;
+use super::mnemonic::{Args, MnemonicKind};
+use smallvec::smallvec;
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub struct Assert {
@@ -12,9 +13,8 @@ impl MnemonicKind for Assert {
         "assert"
     }
 
-    fn args(&self) -> Vec<ValueId> {
-        vec![self.condition]
-    }
+    fn args(&self) -> Args {
+        smallvec![self.condition]}
 }
 
 #[cfg(test)]

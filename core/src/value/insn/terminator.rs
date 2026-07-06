@@ -1,6 +1,7 @@
 use crate::value::{ValueId, block::BlockId, function::FunctionId};
 
-use super::mnemonic::MnemonicKind;
+use super::mnemonic::{Args, MnemonicKind};
+use smallvec::{SmallVec, smallvec};
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub struct Branch {
@@ -18,8 +19,8 @@ impl MnemonicKind for Branch {
         true
     }
 
-    fn args(&self) -> Vec<ValueId> {
-        self.args.clone()
+    fn args(&self) -> Args {
+        SmallVec::from_vec(self.args.clone())
     }
 }
 
@@ -37,9 +38,8 @@ impl MnemonicKind for BranchInd {
         true
     }
 
-    fn args(&self) -> Vec<ValueId> {
-        vec![self.ptr]
-    }
+    fn args(&self) -> Args {
+        smallvec![self.ptr]}
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
@@ -54,8 +54,8 @@ impl MnemonicKind for Apply {
         "apply"
     }
 
-    fn args(&self) -> Vec<ValueId> {
-        self.args.clone()
+    fn args(&self) -> Args {
+        SmallVec::from_vec(self.args.clone())
     }
 }
 
@@ -80,8 +80,8 @@ impl MnemonicKind for Call {
         true
     }
 
-    fn args(&self) -> Vec<ValueId> {
-        self.args.clone()
+    fn args(&self) -> Args {
+        SmallVec::from_vec(self.args.clone())
     }
 }
 
@@ -100,11 +100,10 @@ impl MnemonicKind for CallInd {
         true
     }
 
-    fn args(&self) -> Vec<ValueId> {
-        let mut args = vec![self.ptr];
+    fn args(&self) -> Args {
+        let mut args = smallvec![self.ptr];
         args.extend(self.args.clone());
-        args
-    }
+        args}
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
@@ -127,12 +126,11 @@ impl MnemonicKind for CBranch {
         true
     }
 
-    fn args(&self) -> Vec<ValueId> {
-        let mut args = vec![self.condition];
+    fn args(&self) -> Args {
+        let mut args = smallvec![self.condition];
         args.extend_from_slice(&self.success_args);
         args.extend_from_slice(&self.failure_args);
-        args
-    }
+        args}
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
@@ -150,13 +148,12 @@ impl MnemonicKind for Return {
         true
     }
 
-    fn args(&self) -> Vec<ValueId> {
-        let mut args = vec![self.ptr];
+    fn args(&self) -> Args {
+        let mut args = smallvec![self.ptr];
         if let Some(value) = self.value {
             args.push(value);
         }
-        args
-    }
+        args}
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
@@ -173,9 +170,8 @@ impl MnemonicKind for ReturnValue {
         true
     }
 
-    fn args(&self) -> Vec<ValueId> {
-        vec![self.value]
-    }
+    fn args(&self) -> Args {
+        smallvec![self.value]}
 }
 
 #[cfg(test)]

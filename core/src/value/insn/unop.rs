@@ -1,6 +1,9 @@
 use std::fmt::{Display, Formatter};
 
 use crate::value::{ValueId, insn::mnemonic::MnemonicKind};
+use smallvec::smallvec;
+
+use super::mnemonic::Args;
 
 #[non_exhaustive]
 #[derive(Debug, Clone, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
@@ -63,9 +66,8 @@ impl MnemonicKind for Unary {
         "unop"
     }
 
-    fn args(&self) -> Vec<ValueId> {
-        vec![self.src]
-    }
+    fn args(&self) -> Args {
+        smallvec![self.src]}
 }
 
 #[cfg(test)]

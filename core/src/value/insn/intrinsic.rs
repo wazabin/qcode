@@ -26,7 +26,8 @@ use rustc_hash::FxHashMap as HashMap;
 use std::sync::OnceLock;
 
 use super::binop::IntBinop;
-use super::mnemonic::MnemonicKind;
+use super::mnemonic::{Args, MnemonicKind};
+use smallvec::SmallVec;
 use crate::{
     context::Context,
     types::{TypeId, TypeManager},
@@ -217,8 +218,8 @@ impl MnemonicKind for IntrinsicApp {
         self.id.name()
     }
 
-    fn args(&self) -> Vec<ValueId> {
-        self.args.clone()
+    fn args(&self) -> Args {
+        SmallVec::from_vec(self.args.clone())
     }
 }
 

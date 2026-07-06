@@ -1,6 +1,7 @@
 use crate::{space::SpaceId, value::ValueId};
 
-use super::mnemonic::MnemonicKind;
+use super::mnemonic::{Args, MnemonicKind};
+use smallvec::smallvec;
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub struct Load {
@@ -14,9 +15,8 @@ impl MnemonicKind for Load {
         "load"
     }
 
-    fn args(&self) -> Vec<ValueId> {
-        vec![self.ptr]
-    }
+    fn args(&self) -> Args {
+        smallvec![self.ptr]}
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
@@ -43,9 +43,8 @@ impl MnemonicKind for Store {
         "store"
     }
 
-    fn args(&self) -> Vec<ValueId> {
-        vec![self.ptr, self.src]
-    }
+    fn args(&self) -> Args {
+        smallvec![self.ptr, self.src]}
 }
 
 #[cfg(test)]

@@ -26,7 +26,8 @@
 
 use crate::value::{ValueId, function::FunctionId};
 
-use super::mnemonic::MnemonicKind;
+use super::mnemonic::{Args, MnemonicKind};
+use smallvec::SmallVec;
 
 /// A total left-scan `out[i] = acc_i+1` where `acc_i+1 = body(acc_i, src[i],
 /// captures…)` and `acc_0 = init`. The result is `[U; N]` where `N` is `src`'s
@@ -51,13 +52,12 @@ impl MnemonicKind for Scan {
         "scan"
     }
 
-    fn args(&self) -> Vec<ValueId> {
-        let mut args = Vec::with_capacity(2 + self.captures.len());
+    fn args(&self) -> Args {
+        let mut args = SmallVec::with_capacity(2 + self.captures.len());
         args.push(self.init);
         args.push(self.src);
         args.extend(self.captures.iter().copied());
-        args
-    }
+        args}
 }
 
 #[cfg(test)]
@@ -165,7 +165,7 @@ mod tests {
         };
         assert_eq!(m.body, body);
         assert_eq!(
-            m.args(),
+            m.args().to_vec(),
             vec![init, src, cap],
             "init, src, then captures are the operands"
         );

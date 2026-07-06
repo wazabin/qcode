@@ -1,4 +1,5 @@
-use super::mnemonic::MnemonicKind;
+use super::mnemonic::{Args, MnemonicKind};
+use smallvec::SmallVec;
 use crate::value::ValueId;
 use jstd::Identifier;
 use serde::{Deserialize, Serialize};
@@ -18,7 +19,7 @@ impl MnemonicKind for PCodeOp {
         "pcode_op"
     }
 
-    fn args(&self) -> Vec<ValueId> {
-        self.args.clone()
+    fn args(&self) -> Args {
+        SmallVec::from_vec(self.args.clone())
     }
 }

@@ -2,7 +2,8 @@ use std::fmt::{Display, Formatter};
 
 use crate::value::ValueId;
 
-use super::mnemonic::MnemonicKind;
+use super::mnemonic::{Args, MnemonicKind};
+use smallvec::smallvec;
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub struct Binary {
@@ -16,9 +17,8 @@ impl MnemonicKind for Binary {
         "binop"
     }
 
-    fn args(&self) -> Vec<ValueId> {
-        vec![self.lhs, self.rhs]
-    }
+    fn args(&self) -> Args {
+        smallvec![self.lhs, self.rhs]}
 }
 
 #[non_exhaustive]

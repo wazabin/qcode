@@ -8,7 +8,8 @@
 
 use crate::{context::Context, value::ValueId};
 
-use super::mnemonic::MnemonicKind;
+use super::mnemonic::{Args, MnemonicKind};
+use smallvec::{SmallVec, smallvec};
 
 /// Builds an aggregate value from its ordered fields. The instruction's result
 /// type is the [`Aggregate`](crate::types::TypeRepr::Aggregate) of the fields'
@@ -23,8 +24,8 @@ impl MnemonicKind for Tuple {
         "pack"
     }
 
-    fn args(&self) -> Vec<ValueId> {
-        self.fields.clone()
+    fn args(&self) -> Args {
+        SmallVec::from_vec(self.fields.clone())
     }
 }
 
@@ -48,9 +49,8 @@ impl MnemonicKind for Extract {
         "extract"
     }
 
-    fn args(&self) -> Vec<ValueId> {
-        vec![self.agg]
-    }
+    fn args(&self) -> Args {
+        smallvec![self.agg]}
 }
 
 /// Computes the address of a struct field: `gep(base, offset)` ≡
@@ -87,9 +87,8 @@ impl MnemonicKind for Gep {
         "gep"
     }
 
-    fn args(&self) -> Vec<ValueId> {
-        vec![self.base]
-    }
+    fn args(&self) -> Args {
+        smallvec![self.base]}
 }
 
 #[cfg(test)]
