@@ -60,12 +60,13 @@ fn int_binops() {
 
 #[test]
 fn bool_and_float_binops() {
+    // Comparison results are `bool`, `bool false` renders as `false`, and the
+    // negation `x == false` round-trips through segments.
     check(
         "
         <b @x:i8 @y:i8>
-            %and = @x && @y;
-            %or = @x || @y;
-            %xor = @x ^^ @y;
+            %cmp = @x == @y;
+            %neg = %cmp == false;
             return @x;
         ",
     );
@@ -87,7 +88,6 @@ fn unops() {
         <b @x:i32 @f:f64>
             %neg = - @x;
             %not = ~ @x;
-            %bnot = ! @x;
             %abs = abs(@f);
             %sqrt = sqrt(@f);
             return @x;

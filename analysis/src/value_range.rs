@@ -25,7 +25,7 @@ use qcode::{
     value::{
         BasicBlock, Value, ValueId, ValueRef,
         block::BlockId,
-        insn::{Binary, Binop, BoolBinop, InstructionId, IntBinop, Mnemonic, Unary, Unop},
+        insn::{Binary, Binop, InstructionId, IntBinop, Mnemonic},
     },
 };
 
@@ -338,17 +338,6 @@ impl Solver<'_> {
                 }
             }
 
-            // Boolean connectives produce a 0/1 result, like the comparisons
-            // above. Without this, an `&&`/`||`-fed index drops to `top` and a
-            // 2-case switch looks like a 256-entry table.
-            Mnemonic::Binop(Binary {
-                op: Binop::Bool(_), ..
-            }) => ValueRange { min: 0, max: 1 },
-
-            Mnemonic::Unop(Unary {
-                op: Unop::BoolNot, ..
-            }) => ValueRange { min: 0, max: 1 },
-
             // Zero-extension preserves the unsigned value, and the source
             // interval always fits in the wider output mask.
             Mnemonic::Zext(z) => self.range(z.src, depth + 1),
@@ -619,22 +608,7 @@ impl Solver<'_> {
             return None;
         };
         match self.ctx.get_insn(id).mnemonic() {
-            Mnemonic::Unop(Unary {
-                op: Unop::BoolNot,
-                src,
-            }) => self.refine_condition(*src, v, !taken, mask, depth + 1),
-
-            Mnemonic::Binop(Binary {
-                op: Binop::Bool(op @ (BoolBinop::And | BoolBinop::Or)),
-                lhs,
-                rhs,
-            }) => {
-                let is_or = *op == BoolBinop::Or;
-                self.refine_connective(*lhs, *rhs, is_or, v, taken, mask, depth)
-            }
-
-            // Logical and/or lowered as bitwise `And`/`Or` over `bool` operands
-            // (the `bool`-migration form of the connectives above).
+            // Logical and/or lowered as bitwise `And`/`Or` over `bool` operands.
             Mnemonic::Binop(Binary {
                 op: Binop::Int(op @ (IntBinop::And | IntBinop::Or)),
                 lhs,
@@ -718,7 +692,9 @@ impl Solver<'_> {
     /// The value of `v` if it is a `bool` constant (`true`/`false`).
     fn bool_const(&self, v: ValueId) -> Option<bool> {
         match v {
-            ValueId::Literal(_) if self.is_bool_val(v) => numeric_const(self.ctx, v).map(|c| c != 0),
+            ValueId::Literal(_) if self.is_bool_val(v) => {
+                numeric_const(self.ctx, v).map(|c| c != 0)
+            }
             _ => None,
         }
     }
@@ -965,8 +941,8 @@ mod tests {
                 %lt = %idx < 0x7;
                 %sub = %edi - 0x7;
                 %zf = %sub == 0x0;
-                %le = %lt || %zf;
-                %above = ! %le;
+                %le = %lt | %zf;
+                %above = %le == false;
                 if %above goto <oob> else goto <disp>;
             <disp>
                 goto <0x1001>;
@@ -1027,8 +1003,8 @@ mod tests {
                 %v = load(A:8, &A);
                 %neg = %v s< 0x0;
                 %nz = %v != 0x0;
-                %pos = ! %neg;
-                %b = %nz && %pos;
+                %pos = %neg == false;
+                %b = %nz & %pos;
                 %idx = zext(i32, %b);
                 goto <0x1001>;
             "

@@ -17,7 +17,7 @@ use qcode::{
     context::Context,
     value::{
         ValueId,
-        insn::{Binop, BoolBinop, FloatBinop, IntBinop, Mnemonic},
+        insn::{Binop, FloatBinop, IntBinop, Mnemonic},
     },
 };
 
@@ -159,8 +159,7 @@ pub(super) fn is_commutative(op: &Binop) -> bool {
                 | IntBinop::Xor
                 | IntBinop::Equal
                 | IntBinop::NotEqual
-        ) | Binop::Bool(BoolBinop::And | BoolBinop::Or | BoolBinop::Xor)
-            | Binop::Float(FloatBinop::Equal | FloatBinop::NotEqual)
+        ) | Binop::Float(FloatBinop::Equal | FloatBinop::NotEqual)
     )
 }
 

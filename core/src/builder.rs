@@ -44,11 +44,11 @@ use crate::{
         block_param::BlockParamMutRef,
         function::FunctionId,
         insn::{
-            Apply, Assert, Binary, Binop, BoolBinop, Branch, BranchInd, CBranch, Call, CallInd,
-            Carry, Extract, FloatBinop, FloatToFloat, FloatToInt, Gep, InstructionId,
-            InstructionRef, IntBinop, IntToFloat, IntrinsicApp, IntrinsicId, IsFloatNaN, Load,
-            LzCount, Map, Mnemonic, PCodeOp, PCodeOpId, PopCount, Range, Return, ReturnValue,
-            SBorrow, SCarry, Scan, Sext, Store, Tuple, Unary, Unop, Zext,
+            Apply, Assert, Binary, Binop, Branch, BranchInd, CBranch, Call, CallInd, Carry,
+            Extract, FloatBinop, FloatToFloat, FloatToInt, Gep, InstructionId, InstructionRef,
+            IntBinop, IntToFloat, IntrinsicApp, IntrinsicId, IsFloatNaN, Load, LzCount, Map,
+            Mnemonic, PCodeOp, PCodeOpId, PopCount, Range, Return, ReturnValue, SBorrow, SCarry,
+            Scan, Sext, Store, Tuple, Unary, Unop, Zext,
         },
         util::base_ref::{WithCtx, WithCtxMut},
         varnode::{Varnode, VarnodeId},
@@ -617,9 +617,16 @@ impl<'str, 'ctx> Builder<'str, 'ctx> {
         self.push_instruction(Mnemonic::Unop(Unary { op, src }), size)
     }
 
-    /// Creates a logical NOT operation on the given value.
+    /// Logical NOT of a `bool` value, canonically `src == false`.
     pub fn push_bool_not(&mut self, src: ValueId) -> InstructionRef<'str, '_> {
-        self.push_unop(Unop::BoolNot, src)
+        debug_assert!(
+            self.context()
+                .stored_type_of(src)
+                .is_some_and(|t| self.context().types.is_bool(t)),
+            "push_bool_not: operand must be bool-typed"
+        );
+        let f = self.context_mut().get_bool_const(false).id();
+        self.push_binop(Binop::Int(IntBinop::Equal), src, f, Some(1))
     }
 
     /// Creates a bitwise NOT operation on the given value.
@@ -812,19 +819,42 @@ impl<'str, 'ctx> Builder<'str, 'ctx> {
 
     // --- Bitwise ---
 
+    /// Logical XOR of two `bool` operands — a bitwise `Xor` over `bool`, which
+    /// yields `bool` (exact on the `{0,1}` domain).
     pub fn push_bool_xor(&mut self, lhs: ValueId, rhs: ValueId) -> InstructionRef<'str, '_> {
-        debug_assert_eq!(ValueRef::new(lhs, self.context()).size(), 1);
-        self.push_binop(Binop::Bool(BoolBinop::Xor), lhs, rhs, Some(1))
+        debug_assert!(
+            self.both_bool(lhs, rhs),
+            "push_bool_xor: operands must be bool"
+        );
+        self.push_binop(Binop::Int(IntBinop::Xor), lhs, rhs, None)
     }
 
+    /// Logical AND of two `bool` operands (bitwise `And` over `bool`).
     pub fn push_bool_and(&mut self, lhs: ValueId, rhs: ValueId) -> InstructionRef<'str, '_> {
-        debug_assert_eq!(ValueRef::new(lhs, self.context()).size(), 1);
-        self.push_binop(Binop::Bool(BoolBinop::And), lhs, rhs, Some(1))
+        debug_assert!(
+            self.both_bool(lhs, rhs),
+            "push_bool_and: operands must be bool"
+        );
+        self.push_binop(Binop::Int(IntBinop::And), lhs, rhs, None)
     }
 
+    /// Logical OR of two `bool` operands (bitwise `Or` over `bool`).
     pub fn push_bool_or(&mut self, lhs: ValueId, rhs: ValueId) -> InstructionRef<'str, '_> {
-        debug_assert_eq!(ValueRef::new(lhs, self.context()).size(), 1);
-        self.push_binop(Binop::Bool(BoolBinop::Or), lhs, rhs, Some(1))
+        debug_assert!(
+            self.both_bool(lhs, rhs),
+            "push_bool_or: operands must be bool"
+        );
+        self.push_binop(Binop::Int(IntBinop::Or), lhs, rhs, None)
+    }
+
+    /// Whether both operands carry the `bool` type (a `debug_assert` guard).
+    fn both_bool(&self, lhs: ValueId, rhs: ValueId) -> bool {
+        let is_bool = |v: ValueId| {
+            self.context()
+                .stored_type_of(v)
+                .is_some_and(|t| self.context().types.is_bool(t))
+        };
+        is_bool(lhs) && is_bool(rhs)
     }
 
     pub fn push_bit_xor(&mut self, lhs: ValueId, rhs: ValueId) -> InstructionRef<'str, '_> {
@@ -1780,7 +1810,7 @@ mod tests {
 
         let not_insn_id = {
             let mut builder = Builder::from_context(&mut ctx, 0x1000);
-            let not_insn_id = builder.push_bool_not(id_42).id;
+            let not_insn_id = builder.push_bit_negate(id_42).id;
             builder.finalize(0x1001);
 
             not_insn_id
@@ -1801,7 +1831,7 @@ mod tests {
 
             builder.push_branch(target);
             builder.set_address(0x4015);
-            builder.push_bool_not(value);
+            builder.push_bit_negate(value);
         }));
 
         let panic = result.expect_err("append should panic after a terminator");
@@ -1850,7 +1880,7 @@ mod tests {
 
         let existing_id = {
             let mut b = Builder::from_block(BasicBlock::from_id_mut(&mut ctx, block_id));
-            let id = b.push_bool_not(val).id;
+            let id = b.push_bit_negate(val).id;
             unsafe { b.dont_finalize() };
             id
         };
@@ -1859,7 +1889,7 @@ mod tests {
             let mut b = Builder::from_block(BasicBlock::from_id_mut(&mut ctx, block_id));
             b.set_insert_point_to_start();
             unsafe { b.dont_finalize() };
-            b.push_bool_not(val).id
+            b.push_bit_negate(val).id
         };
 
         let ids: Vec<_> = BasicBlock::from_id(&ctx, block_id)
@@ -1876,7 +1906,7 @@ mod tests {
 
         let existing_id = {
             let mut b = Builder::from_block(BasicBlock::from_id_mut(&mut ctx, block_id));
-            let id = b.push_bool_not(val).id;
+            let id = b.push_bit_negate(val).id;
             unsafe { b.dont_finalize() };
             id
         };
@@ -1886,9 +1916,9 @@ mod tests {
             b.set_insert_point_to_start();
             unsafe { b.dont_finalize() };
             (
-                b.push_bool_not(val).id,
-                b.push_bool_not(val).id,
-                b.push_bool_not(val).id,
+                b.push_bit_negate(val).id,
+                b.push_bit_negate(val).id,
+                b.push_bit_negate(val).id,
             )
         };
 
@@ -1907,14 +1937,14 @@ mod tests {
         let (first_id, target_id) = {
             let mut b = Builder::from_block(BasicBlock::from_id_mut(&mut ctx, block_id));
             unsafe { b.dont_finalize() };
-            (b.push_bool_not(val).id, b.push_bool_not(val).id)
+            (b.push_bit_negate(val).id, b.push_bit_negate(val).id)
         };
 
         let (inserted0, inserted1) = {
             let mut b = Builder::from_block(BasicBlock::from_id_mut(&mut ctx, block_id));
             b.set_insert_point_before(target_id);
             unsafe { b.dont_finalize() };
-            (b.push_bool_not(val).id, b.push_bool_not(val).id)
+            (b.push_bit_negate(val).id, b.push_bit_negate(val).id)
         };
 
         let ids: Vec<_> = BasicBlock::from_id(&ctx, block_id)
@@ -1933,7 +1963,7 @@ mod tests {
             let mut b = Builder::from_block(BasicBlock::from_id_mut(&mut ctx, entry));
             b.set_insert_point_to_start();
             unsafe { b.dont_finalize() };
-            b.push_bool_not(val).id
+            b.push_bit_negate(val).id
         };
 
         let block = BasicBlock::from_id(&ctx, entry);
@@ -1951,11 +1981,11 @@ mod tests {
         let (first_id, middle_id, last_id) = {
             let mut b = Builder::from_block(BasicBlock::from_id_mut(&mut ctx, block_id));
             unsafe { b.dont_finalize() };
-            let first = b.push_bool_not(val).id; // appended → index 0
+            let first = b.push_bit_negate(val).id; // appended → index 0
             b.set_insert_point_to_start();
-            let middle = b.push_bool_not(val).id; // inserted at 0, first shifts to 1
+            let middle = b.push_bit_negate(val).id; // inserted at 0, first shifts to 1
             b.set_insert_point_to_end();
-            let last = b.push_bool_not(val).id; // appended → index 2
+            let last = b.push_bit_negate(val).id; // appended → index 2
             (first, middle, last)
         };
 

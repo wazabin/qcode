@@ -10,7 +10,6 @@ use super::mnemonic::Args;
 pub enum Unop {
     IntNegate,
     IntNot,
-    BoolNot,
     FloatNegate,
     FloatAbs,
     FloatSqrt,
@@ -31,7 +30,6 @@ impl Unop {
         match self {
             Unop::IntNegate => Some(v.wrapping_neg() & mask),
             Unop::IntNot => Some(!v & mask),
-            Unop::BoolNot => Some(u128::from(v == 0)),
             _ => None,
         }
     }
@@ -42,7 +40,6 @@ impl Display for Unop {
         let s = match self {
             Unop::IntNegate => "-",
             Unop::IntNot => "~",
-            Unop::BoolNot => "!",
             Unop::FloatNegate => "f-",
             Unop::FloatAbs => "abs",
             Unop::FloatSqrt => "sqrt",
@@ -71,44 +68,4 @@ impl MnemonicKind for Unary {
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use qcode_macro::qcode;
-
-    use crate::{
-        context::Context,
-        value::Value,
-        value::ValueRef,
-        value::insn::{Instruction, Mnemonic},
-    };
-
-    use super::*;
-
-    // TODO: add tests for all the different unop variants similar to the ones in flags.rs and casting.rs
-
-    #[test]
-    fn test_bool_not_from_qcode() {
-        let mut ctx = Context::new();
-        qcode!(
-            ctx,
-            "
-            varnode i32 V0;
-
-            <block>
-                %v0 = load(V0:4, &V0);
-                %v = !%v0;
-                goto <0x1001>;
-            "
-        );
-
-        let v = Instruction::from_id(&ctx, v);
-
-        match v.mnemonic() {
-            Mnemonic::Unop(Unary { op, src }) => {
-                assert_eq!(*op, Unop::BoolNot);
-                assert_eq!(ValueRef::new(*src, &ctx).size(), 4);
-            }
-            _ => panic!("expected boolean unop instruction"),
-        }
-    }
-}
+// TODO: add tests for all the different unop variants similar to the ones in flags.rs and casting.rs

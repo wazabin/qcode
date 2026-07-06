@@ -39,7 +39,7 @@ mod unop;
 
 pub use aggregate::{Extract, Gep, Tuple};
 pub use assert::Assert;
-pub use binop::{Binary, Binop, BoolBinop, FloatBinop, IntBinop};
+pub use binop::{Binary, Binop, FloatBinop, IntBinop};
 pub use casting::{FloatToFloat, FloatToInt, IntToFloat, Range, Sext, Zext};
 pub use flags::{Carry, IsFloatNaN, LzCount, PopCount, SBorrow, SCarry};
 pub use intrinsic::{

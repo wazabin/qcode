@@ -25,7 +25,6 @@ use qcode::{
         BasicBlock, BlockId, Function, FunctionId, ValueId,
         insn::{
             Binop, Branch, CBranch, InstructionId, IntBinop, IntrinsicApp, IntrinsicId, Mnemonic,
-            Unary, Unop,
         },
     },
 };
@@ -85,7 +84,7 @@ struct StrlenMatch {
 /// "continue while nonzero" guard), true exactly when `elem` is **zero**
 /// (`Some(false)`), or not a zero-test of `elem` at all (`None`). Handles the bare
 /// byte used as a predicate, `elem != 0` / `elem == 0` (either operand order), and
-/// a `BoolNot` wrapper.
+/// the `bool`-migration negation wrapper `sub == false` / `sub != false`.
 fn nonzero_polarity(ctx: &Context, cond: ValueId, elem: ValueId) -> Option<bool> {
     if cond == elem {
         return Some(true); // the raw byte as a bool: true ⟺ nonzero
@@ -93,23 +92,37 @@ fn nonzero_polarity(ctx: &Context, cond: ValueId, elem: ValueId) -> Option<bool>
     let ValueId::Instruction(id) = cond else {
         return None;
     };
+    let is_bool = |v: ValueId| ctx.stored_type_of(v).is_some_and(|t| ctx.types.is_bool(t));
+    let bool_const = |v: ValueId| {
+        (is_bool(v) && matches!(v, ValueId::Literal(_)))
+            .then(|| literal(ctx, v))
+            .flatten()
+            .map(|c| c != 0)
+    };
     match ctx.get_insn(id).mnemonic() {
-        Mnemonic::Binop(b) => {
+        Mnemonic::Binop(b) if matches!(b.op, Binop::Int(IntBinop::Equal | IntBinop::NotEqual)) => {
+            // Negation wrapper: `sub == c` / `sub != c` over a bool sub-condition.
+            // If `sub` has polarity `p`, then `sub == c` has polarity `p == c`
+            // and `sub != c` has polarity `p != c`.
+            let is_eq = matches!(b.op, Binop::Int(IntBinop::Equal));
+            if let Some(c) = bool_const(b.rhs)
+                && let Some(p) = nonzero_polarity(ctx, b.lhs, elem)
+            {
+                return Some(if is_eq { p == c } else { p != c });
+            }
+            if let Some(c) = bool_const(b.lhs)
+                && let Some(p) = nonzero_polarity(ctx, b.rhs, elem)
+            {
+                return Some(if is_eq { p == c } else { p != c });
+            }
+            // Direct zero-test of `elem`.
             let zero_test = (b.lhs == elem && literal(ctx, b.rhs) == Some(0))
                 || (b.rhs == elem && literal(ctx, b.lhs) == Some(0));
             if !zero_test {
                 return None;
             }
-            match b.op {
-                Binop::Int(IntBinop::NotEqual) => Some(true),
-                Binop::Int(IntBinop::Equal) => Some(false),
-                _ => None,
-            }
+            Some(!is_eq)
         }
-        Mnemonic::Unop(Unary {
-            op: Unop::BoolNot,
-            src,
-        }) => nonzero_polarity(ctx, *src, elem).map(|p| !p),
         _ => None,
     }
 }

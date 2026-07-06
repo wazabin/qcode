@@ -9,7 +9,7 @@ use qcode::{
         BasicBlock, BlockId, BlockParamId, BlockRef, Function, FunctionId, Instruction, Value,
         ValueId, ValueRef, Varnode,
         insn::{
-            BoolBinop, Branch, BranchInd, CBranch, Call, CallInd, Carry, Extract, InstructionId,
+            Branch, BranchInd, CBranch, Call, CallInd, Carry, Extract, InstructionId,
             InstructionRef, IntBinop, LzCount, Mnemonic, PopCount, Range, Return, SBorrow, SCarry,
             Scan, Sext, Tuple, Unop, Zext,
         },
@@ -392,15 +392,6 @@ impl DomainValue for SizedValue {
         ))
     }
 
-    fn bool_not(&self) -> Result<Self, EmulatorErrorKind> {
-        Ok(Self::from_bits(
-            Unop::BoolNot
-                .eval_int(self.as_bits(), self.size as usize)
-                .unwrap(),
-            1,
-        ))
-    }
-
     fn int_negate(&self) -> Result<Self, EmulatorErrorKind> {
         let size = self.size as usize;
         Ok(Self::from_bits(
@@ -591,27 +582,6 @@ impl DomainValue for SizedValue {
         Ok(Self::from_bits(
             IntBinop::Srem.eval(self.as_bits(), other.as_bits(), size),
             size,
-        ))
-    }
-
-    fn bool_and(&self, other: &Self) -> Result<Self, EmulatorErrorKind> {
-        Ok(Self::from_bits(
-            BoolBinop::And.eval(self.as_bits(), other.as_bits()),
-            1,
-        ))
-    }
-
-    fn bool_or(&self, other: &Self) -> Result<Self, EmulatorErrorKind> {
-        Ok(Self::from_bits(
-            BoolBinop::Or.eval(self.as_bits(), other.as_bits()),
-            1,
-        ))
-    }
-
-    fn bool_xor(&self, other: &Self) -> Result<Self, EmulatorErrorKind> {
-        Ok(Self::from_bits(
-            BoolBinop::Xor.eval(self.as_bits(), other.as_bits()),
-            1,
         ))
     }
 
@@ -2820,27 +2790,6 @@ mod tests {
         let demoted = promoted.float_to_float(4).unwrap();
         assert_eq!(demoted.value().unwrap(), (1.5f32).to_bits() as u64);
         assert_eq!(demoted.size().unwrap(), 4);
-    }
-
-    #[test]
-    fn bool_operations_return_single_byte_results() {
-        let truthy = SizedValue::new(2, 8);
-        let falsy = SizedValue::new(0, 8);
-
-        let and_result = truthy.bool_and(&falsy).unwrap();
-        let or_result = truthy.bool_or(&falsy).unwrap();
-        let xor_result = truthy.bool_xor(&truthy).unwrap();
-        let not_result = falsy.bool_not().unwrap();
-
-        assert_eq!(and_result.value().unwrap(), 0);
-        assert_eq!(or_result.value().unwrap(), 1);
-        assert_eq!(xor_result.value().unwrap(), 0);
-        assert_eq!(not_result.value().unwrap(), 1);
-
-        assert_eq!(and_result.size().unwrap(), 1);
-        assert_eq!(or_result.size().unwrap(), 1);
-        assert_eq!(xor_result.size().unwrap(), 1);
-        assert_eq!(not_result.size().unwrap(), 1);
     }
 
     #[test]

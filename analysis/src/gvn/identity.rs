@@ -22,7 +22,7 @@ use qcode::{
     context::Context,
     value::{
         Value, ValueId, ValueRef,
-        insn::{Binary, Binop, IntBinop, Mnemonic, Simplified, Unary, Unop},
+        insn::{Binary, Binop, IntBinop, Mnemonic, Simplified},
     },
 };
 
@@ -427,24 +427,10 @@ fn as_zext(ctx: &Context, v: ValueId) -> Option<(ValueId, usize)> {
     }
 }
 
-/// Whether `v` is produced by an operation that always yields `0` or `1`: an
-/// integer comparison, a boolean binop, or a logical `!`.
+/// Whether `v` always yields `0` or `1` — now simply whether it is `bool`-typed
+/// (comparisons and logical `And`/`Or`/`Xor` over bool all carry the type).
 fn is_boolean(ctx: &Context, v: ValueId) -> bool {
-    let ValueId::Instruction(id) = v else {
-        return false;
-    };
-    match ctx.get_insn(id).mnemonic() {
-        Mnemonic::Binop(Binary {
-            op: Binop::Int(op), ..
-        }) => op.is_comparison(),
-        Mnemonic::Binop(Binary {
-            op: Binop::Bool(_), ..
-        }) => true,
-        Mnemonic::Unop(Unary {
-            op: Unop::BoolNot, ..
-        }) => true,
-        _ => false,
-    }
+    ctx.stored_type_of(v).is_some_and(|t| ctx.types.is_bool(t))
 }
 
 /// The negation of an equality comparison: `==`↔`!=`. Ordering comparisons are
@@ -486,66 +472,53 @@ fn simplify_compare(ctx: &mut Context, ic: &InsnCtx, ed: &mut Editor) -> bool {
                 // value against 0 is comparing the source against 0.
                 if let Some((src, src_size)) = as_zext(ctx, other) {
                     let zero = ctx.get_const(0, src_size).id();
-                    ed.replace_with_new_insn(
+                    let bool_ty = ctx.types.get_or_make_bool();
+                    ed.replace_with_new_insn_typed(
                         ctx,
                         ic.block_id,
                         ic.insn_id,
                         int_binop(src, zero, op),
-                        ic.size,
+                        bool_ty,
                     );
                     return true;
                 }
-                // A boolean is already `0`/`1`, so `b != 0` is `b` and `b == 0`
-                // is `!b`. The width must match so the forwarded/negated value
-                // is a drop-in for the comparison result.
+                // A boolean is already `0`/`1`. `b != false` is `b`, and
+                // `b == false` is the canonical negation `!b`. When `b` is itself
+                // an equality comparison, fold the double negation:
+                // `(a == c) == false` → `a != c`. The width must match so the
+                // forwarded/negated value is a drop-in for the comparison result.
                 if is_boolean(ctx, other) && value_size(ctx, other) == ic.size {
                     match op {
                         IntBinop::NotEqual => {
                             ed.replace(ctx, ic.insn_id, other);
                             return true;
                         }
+                        // `(a == c) == false` → `a != c` / `(a != c) == false`
+                        // → `a == c`. A plain `b == false` is already canonical
+                        // and is left as-is.
                         IntBinop::Equal => {
-                            ed.replace_with_new_insn(
-                                ctx,
-                                ic.block_id,
-                                ic.insn_id,
-                                Mnemonic::Unop(Unary {
-                                    op: Unop::BoolNot,
-                                    src: other,
-                                }),
-                                ic.size,
-                            );
-                            return true;
+                            if let ValueId::Instruction(id) = other
+                                && let &Mnemonic::Binop(Binary {
+                                    lhs: a,
+                                    rhs: b,
+                                    op: Binop::Int(inner),
+                                }) = ctx.get_insn(id).mnemonic()
+                                && let Some(flipped) = negated_compare(inner)
+                            {
+                                let bool_ty = ctx.types.get_or_make_bool();
+                                ed.replace_with_new_insn_typed(
+                                    ctx,
+                                    ic.block_id,
+                                    ic.insn_id,
+                                    int_binop(a, b, flipped),
+                                    bool_ty,
+                                );
+                                return true;
+                            }
                         }
                         _ => {}
                     }
                 }
-            }
-            false
-        }
-        Mnemonic::Unop(Unary {
-            op: Unop::BoolNot,
-            src,
-        }) => {
-            // `!(a == b)` → `a != b` and `!(a != b)` → `a == b`.
-            let ValueId::Instruction(id) = src else {
-                return false;
-            };
-            if let &Mnemonic::Binop(Binary {
-                lhs,
-                rhs,
-                op: Binop::Int(inner),
-            }) = ctx.get_insn(id).mnemonic()
-                && let Some(flipped) = negated_compare(inner)
-            {
-                ed.replace_with_new_insn(
-                    ctx,
-                    ic.block_id,
-                    ic.insn_id,
-                    int_binop(lhs, rhs, flipped),
-                    ic.size,
-                );
-                return true;
             }
             false
         }
@@ -723,7 +696,7 @@ mod tests {
                     <entry>
                         %x = load(X:4, &X);
                         %eq = %x == 0x0;
-                        %ne = ! %eq;
+                        %ne = %eq == false;
                         %z = zext(i32, %ne);
                         %cond = %z != 0x0;
                         if %cond goto <0x2000> else goto <0x1000>;

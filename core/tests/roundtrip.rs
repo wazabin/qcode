@@ -78,20 +78,6 @@ fn roundtrip_int_binops() {
 }
 
 #[test]
-fn roundtrip_bool_binops() {
-    roundtrips(
-        "
-        <b @x:i8 @y:i8>
-            %and = @x && @y;
-            %or = @x || @y;
-            %xor = @x ^^ @y;
-            return @x;
-        ",
-        "i8 @x ^^ i8 @y",
-    );
-}
-
-#[test]
 fn roundtrip_float_binops() {
     roundtrips(
         "
@@ -117,7 +103,6 @@ fn roundtrip_unops() {
     roundtrips(
         "
         <b @x:i32 @f:f64>
-            %not = ! @x;
             %bneg = ~ @x;
             %neg = - @x;
             %fneg = f- @f;

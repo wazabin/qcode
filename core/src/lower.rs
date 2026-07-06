@@ -604,7 +604,6 @@ impl Lowerer<'_, '_, '_> {
             ExprNode::Unop { op, src } => {
                 let s = self.atom(src, None)?;
                 Ok(match op.as_str() {
-                    "!" => self.b.push_bool_not(s).id(),
                     "~" => self.b.push_bit_negate(s).id(),
                     "-" => self.b.push_neg(s).id(),
                     "f-" => self.b.push_fneg(s).id(),
@@ -771,9 +770,6 @@ impl Lowerer<'_, '_, '_> {
             "&" => self.b.push_bit_and(l, r).id(),
             "|" => self.b.push_bit_or(l, r).id(),
             "^" => self.b.push_bit_xor(l, r).id(),
-            "^^" => self.b.push_bool_xor(l, r).id(),
-            "&&" => self.b.push_bool_and(l, r).id(),
-            "||" => self.b.push_bool_or(l, r).id(),
             "<<" => self.b.push_shl(l, r).id(),
             ">>" => self.b.push_shr(l, r).id(),
             "s>>" => self.b.push_sshr(l, r).id(),

@@ -4,7 +4,7 @@ use qcode::{
     context::Context,
     value::{
         Value, ValueId, ValueRef,
-        insn::{Binary, Binop, BoolBinop, IntBinop, Mnemonic, Unop},
+        insn::{Binary, Binop, IntBinop, Mnemonic, Unop},
         literal::LiteralRef,
     },
 };
@@ -178,10 +178,6 @@ fn constant_folding_with_location(
                 // still panics on a zero divisor.
                 Binop::Int(IntBinop::Div) => l.checked_div(r)? & mask,
                 Binop::Int(IntBinop::Rem) => l.checked_rem(r)? & mask,
-
-                Binop::Bool(BoolBinop::And) => (l != 0 && r != 0) as u64,
-                Binop::Bool(BoolBinop::Or) => (l != 0 || r != 0) as u64,
-                Binop::Bool(BoolBinop::Xor) => (l != 0) as u64 ^ (r != 0) as u64,
 
                 _ => {
                     return None;

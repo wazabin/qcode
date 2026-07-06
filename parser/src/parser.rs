@@ -1504,57 +1504,6 @@ mod tests {
     }
 
     #[test]
-    fn parses_unary_bool_not_expression_statement() {
-        let statements = stmts("!{v0}");
-        assert_eq!(statements.len(), 1);
-
-        match &statements[0] {
-            Statement::Expr(ExprNode::Unop { op, src }) => {
-                assert_eq!(op, "!");
-                assert_eq!(src.size_bytes, None);
-                match &src.atom {
-                    Atom::External(name) => assert_eq!(name, "v0"),
-                    _ => panic!("expected external unary source"),
-                }
-            }
-            _ => panic!("expected unary expression statement"),
-        }
-    }
-
-    #[test]
-    fn parses_bool_xor_expression_statement() {
-        let statements = stmts("{v0} ^^ {v1}");
-        assert_eq!(statements.len(), 1);
-
-        match &statements[0] {
-            Statement::Expr(ExprNode::Binary { op, .. }) => assert_eq!(op, "^^"),
-            _ => panic!("expected binary expression statement"),
-        }
-    }
-
-    #[test]
-    fn parses_bool_and_expression_statement() {
-        let statements = stmts("{v0} && {v1}");
-        assert_eq!(statements.len(), 1);
-
-        match &statements[0] {
-            Statement::Expr(ExprNode::Binary { op, .. }) => assert_eq!(op, "&&"),
-            _ => panic!("expected binary expression statement"),
-        }
-    }
-
-    #[test]
-    fn parses_bool_or_expression_statement() {
-        let statements = stmts("{v0} || {v1}");
-        assert_eq!(statements.len(), 1);
-
-        match &statements[0] {
-            Statement::Expr(ExprNode::Binary { op, .. }) => assert_eq!(op, "||"),
-            _ => panic!("expected binary expression statement"),
-        }
-    }
-
-    #[test]
     fn parses_float_negate_expression_statement() {
         let statements = stmts("f-{v0}");
         assert_eq!(statements.len(), 1);

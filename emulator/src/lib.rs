@@ -4,9 +4,9 @@ use qcode::{
     value::{
         BlockId, FunctionId, InstructionId, ValueId, Varnode,
         insn::{
-            Binary, Binop, BoolBinop, Carry, FloatBinop, FloatToFloat, FloatToInt, Gep,
-            InstructionRef, IntBinop, IntToFloat, IsFloatNaN, Load, LzCount, Mnemonic, PopCount,
-            Range, SBorrow, SCarry, Sext, Store, Unary, Unop, Zext,
+            Binary, Binop, Carry, FloatBinop, FloatToFloat, FloatToInt, Gep, InstructionRef,
+            IntBinop, IntToFloat, IsFloatNaN, Load, LzCount, Mnemonic, PopCount, Range, SBorrow,
+            SCarry, Sext, Store, Unary, Unop, Zext,
         },
         varnode::{VarnodeId, register::RegisterId},
     },
@@ -175,7 +175,6 @@ pub trait DomainValue: Clone + Copy {
     fn sborrow(&self, other: &Self) -> std::result::Result<Self, EmulatorErrorKind>;
 
     fn int_not(&self) -> std::result::Result<Self, EmulatorErrorKind>;
-    fn bool_not(&self) -> std::result::Result<Self, EmulatorErrorKind>;
     fn int_negate(&self) -> std::result::Result<Self, EmulatorErrorKind>;
     fn float_negate(&self) -> std::result::Result<Self, EmulatorErrorKind>;
     fn float_abs(&self) -> std::result::Result<Self, EmulatorErrorKind>;
@@ -203,10 +202,6 @@ pub trait DomainValue: Clone + Copy {
     fn int_rem(&self, other: &Self) -> std::result::Result<Self, EmulatorErrorKind>;
     fn int_sdiv(&self, other: &Self) -> std::result::Result<Self, EmulatorErrorKind>;
     fn int_srem(&self, other: &Self) -> std::result::Result<Self, EmulatorErrorKind>;
-
-    fn bool_and(&self, other: &Self) -> std::result::Result<Self, EmulatorErrorKind>;
-    fn bool_or(&self, other: &Self) -> std::result::Result<Self, EmulatorErrorKind>;
-    fn bool_xor(&self, other: &Self) -> std::result::Result<Self, EmulatorErrorKind>;
 
     fn float_add(&self, other: &Self) -> std::result::Result<Self, EmulatorErrorKind>;
     fn float_sub(&self, other: &Self) -> std::result::Result<Self, EmulatorErrorKind>;
@@ -346,7 +341,6 @@ pub trait Interpreter {
                 let v = match op {
                     Unop::IntNegate => value.int_negate(),
                     Unop::IntNot => value.int_not(),
-                    Unop::BoolNot => value.bool_not(),
                     Unop::FloatNegate => value.float_negate(),
                     Unop::FloatAbs => value.float_abs(),
                     Unop::FloatSqrt => value.float_sqrt(),
@@ -382,10 +376,6 @@ pub trait Interpreter {
                     Binop::Int(IntBinop::Rem) => value1.int_rem(&value2),
                     Binop::Int(IntBinop::Sdiv) => value1.int_sdiv(&value2),
                     Binop::Int(IntBinop::Srem) => value1.int_srem(&value2),
-
-                    Binop::Bool(BoolBinop::And) => value1.bool_and(&value2),
-                    Binop::Bool(BoolBinop::Or) => value1.bool_or(&value2),
-                    Binop::Bool(BoolBinop::Xor) => value1.bool_xor(&value2),
 
                     Binop::Float(FloatBinop::Add) => value1.float_add(&value2),
                     Binop::Float(FloatBinop::Sub) => value1.float_sub(&value2),

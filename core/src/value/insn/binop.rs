@@ -26,7 +26,6 @@ impl MnemonicKind for Binary {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub enum Binop {
     Int(IntBinop),
-    Bool(BoolBinop),
     Float(FloatBinop),
 }
 
@@ -34,7 +33,6 @@ impl Display for Binop {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         match self {
             Binop::Int(op) => write!(f, "{}", op),
-            Binop::Bool(op) => write!(f, "{}", op),
             Binop::Float(op) => write!(f, "{}", op),
         }
     }
@@ -45,7 +43,6 @@ impl Binop {
         match self {
             Binop::Int(op) => op.is_comparison(),
             Binop::Float(op) => op.is_comparison(),
-            Binop::Bool(_) => false,
         }
     }
 
@@ -54,40 +51,6 @@ impl Binop {
             self,
             Binop::Int(IntBinop::ShiftLeft | IntBinop::ShiftRight | IntBinop::SShiftRight)
         )
-    }
-}
-
-#[non_exhaustive]
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
-pub enum BoolBinop {
-    And,
-    Or,
-    Xor,
-}
-
-impl BoolBinop {
-    /// Evaluates this boolean operation on raw bit patterns.
-    /// Any non-zero value is treated as `true`; the result is `0` or `1`.
-    pub fn eval(&self, lhs: u128, rhs: u128) -> u128 {
-        let a = lhs != 0;
-        let b = rhs != 0;
-        u128::from(match self {
-            BoolBinop::And => a && b,
-            BoolBinop::Or => a || b,
-            BoolBinop::Xor => a ^ b,
-        })
-    }
-}
-
-impl Display for BoolBinop {
-    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
-        let s = match self {
-            BoolBinop::And => "&&",
-            BoolBinop::Or => "||",
-            BoolBinop::Xor => "^^",
-        };
-
-        write!(f, "{}", s)
     }
 }
 
@@ -683,96 +646,6 @@ mod tests {
             v.as_statement().to_string(),
             "bool %v = i32 0x2 <= i32 %v0;"
         );
-    }
-
-    #[test]
-    fn test_bool_xor_from_qcode() {
-        let mut ctx = Context::new();
-
-        qcode!(
-            ctx,
-            "
-            <block>
-                local i8 V0;
-                local i8 V1;
-                %v0 = load(V0:1, V0);
-                %v1 = load(V1:1, V1);
-                %v = %v0 ^^ %v1;
-                goto <0x1001>;
-            "
-        );
-
-        let v = Instruction::from_id(&ctx, v);
-
-        match v.mnemonic() {
-            Mnemonic::Binop(Binary {
-                op: Binop::Bool(op),
-                ..
-            }) => assert_eq!(*op, BoolBinop::Xor),
-            _ => panic!("expected boolean binop instruction"),
-        }
-
-        assert_eq!(v.size(), 1);
-    }
-
-    #[test]
-    fn test_bool_and_from_qcode() {
-        let mut ctx = Context::new();
-
-        qcode!(
-            ctx,
-            "
-            <block>
-                local i8 V0;
-                local i8 V1;
-                %v0 = load(V0:1, V0);
-                %v1 = load(V1:1, V1);
-                %v = %v0 && %v1;
-                goto <0x1001>;
-            "
-        );
-
-        let v = Instruction::from_id(&ctx, v);
-
-        match v.mnemonic() {
-            Mnemonic::Binop(Binary {
-                op: Binop::Bool(op),
-                ..
-            }) => assert_eq!(*op, BoolBinop::And),
-            _ => panic!("expected boolean binop instruction"),
-        }
-
-        assert_eq!(v.size(), 1);
-    }
-
-    #[test]
-    fn test_bool_or_from_qcode() {
-        let mut ctx = Context::new();
-
-        qcode!(
-            ctx,
-            "
-            <block>
-                local i8 V0;
-                local i8 V1;
-                %v0 = load(V0:1, V0);
-                %v1 = load(V1:1, V1);
-                %v = %v0 || %v1;
-                goto <0x1001>;
-            "
-        );
-
-        let v = Instruction::from_id(&ctx, v);
-
-        match v.mnemonic() {
-            Mnemonic::Binop(Binary {
-                op: Binop::Bool(op),
-                ..
-            }) => assert_eq!(*op, BoolBinop::Or),
-            _ => panic!("expected boolean binop instruction"),
-        }
-
-        assert_eq!(v.size(), 1);
     }
 
     #[test]

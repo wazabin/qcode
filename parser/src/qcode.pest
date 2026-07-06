@@ -106,8 +106,8 @@ integer         = @{ hex_int | dec_int }
 hex_int         =  { "0" ~ ("x" | "X") ~ ASCII_HEX_DIGIT+ }
 dec_int         =  { ASCII_DIGIT+ }
 ty              = @{ "bool" | ("i" | "f") ~ ASCII_DIGIT+ }
-op              =  { "s>>" | "s<=" | "s>=" | "s<" | "s>" | "s/" | "s%" | "f<=" | "f>=" | "f==" | "f!=" | "f<" | "f>" | "f+" | "f-" | "f*" | "f/" | "<<" | ">>" | "<=" | ">=" | "==" | "!=" | "^^" | "&&" | "||" | "+" | "-" | "*" | "/" | "%" | "&" | "|" | "^" | "<" | ">" }
-unop_op         =  { "!" | "~" | "-" | "f-" }
+op              =  { "s>>" | "s<=" | "s>=" | "s<" | "s>" | "s/" | "s%" | "f<=" | "f>=" | "f==" | "f!=" | "f<" | "f>" | "f+" | "f-" | "f*" | "f/" | "<<" | ">>" | "<=" | ">=" | "==" | "!=" | "+" | "-" | "*" | "/" | "%" | "&" | "|" | "^" | "<" | ">" }
+unop_op         =  { "~" | "-" | "f-" }
 func_unop_op    =  { "abs" | "sqrt" | "floor" | "ceil" | "round" }
 func_ident      =  { "nan" | "popcount" | "lzcount" | "carry" | "scarry" | "sborrow" }
 eq              =  { "=" ~ !"=" }

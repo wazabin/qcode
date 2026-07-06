@@ -76,7 +76,6 @@ pub fn verify_bool_typing(ctx: &Context) -> Vec<String> {
                             out.push(format!("arithmetic `{}` applied to a bool operand", b.op));
                         }
                     }
-                    Binop::Bool(_) => {}
                     _ => {}
                 }
             }

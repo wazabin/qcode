@@ -81,7 +81,22 @@ impl Editor {
         mnemonic: Mnemonic,
         size: usize,
     ) -> InstructionId {
-        let new_id = InstructionRef::from_mnemonic(ctx, mnemonic, size).id;
+        let type_id = ctx.types.get_or_make_int(size);
+        self.replace_with_new_insn_typed(ctx, block_id, at, mnemonic, type_id)
+    }
+
+    /// Like [`replace_with_new_insn`](Self::replace_with_new_insn) but with an
+    /// explicit result [`TypeId`] — used when the new instruction is a comparison
+    /// (which must be `bool`-typed, not a plain `iN`).
+    pub(super) fn replace_with_new_insn_typed(
+        &mut self,
+        ctx: &mut Context,
+        block_id: BlockId,
+        at: InstructionId,
+        mnemonic: Mnemonic,
+        type_id: qcode::types::TypeId,
+    ) -> InstructionId {
+        let new_id = InstructionRef::from_mnemonic_with_type(ctx, mnemonic, type_id).id;
         BasicBlock::from_id_mut(ctx, block_id).insert_insn_before(at, new_id);
         ctx.replace_all_uses_with(at, new_id);
         self.redundant.insert(at);

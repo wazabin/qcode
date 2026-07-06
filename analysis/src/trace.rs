@@ -4,7 +4,7 @@ use qcode::{
     context::Context,
     value::{
         BasicBlock, BlockId, Instruction, InstructionId, InstructionRef, ValueId,
-        insn::{Assert, Branch, CBranch, Mnemonic, Unary, Unop},
+        insn::{Assert, Binary, Binop, Branch, CBranch, IntBinop, Mnemonic},
     },
 };
 
@@ -156,15 +156,18 @@ fn insert_trace_assert(
     condition: ValueId,
     negate: bool,
 ) {
-    // Generate the not instruction if needed
+    // Generate the negation if needed — canonically `condition == false`.
     let condition = if negate {
-        let not_id = InstructionRef::from_mnemonic(
+        let f = ctx.get_bool_const(false).id();
+        let bool_ty = ctx.types.get_or_make_bool();
+        let not_id = InstructionRef::from_mnemonic_with_type(
             ctx,
-            Mnemonic::Unop(Unary {
-                op: Unop::BoolNot,
-                src: condition,
+            Mnemonic::Binop(Binary {
+                op: Binop::Int(IntBinop::Equal),
+                lhs: condition,
+                rhs: f,
             }),
-            1,
+            bool_ty,
         )
         .id;
         BasicBlock::from_id_mut(ctx, block_id).insert_insn_before(cbranch_id, not_id);
@@ -346,8 +349,8 @@ mod tests {
             "second to last must be assert"
         );
         assert!(
-            !matches!(insns[n-3].mnemonic(), Mnemonic::Unop(u) if u.op == Unop::BoolNot),
-            "no BoolNot should be present before assert on success path"
+            !matches!(insns[n-3].mnemonic(), Mnemonic::Binop(b) if b.op == Binop::Int(IntBinop::Equal)),
+            "no negation (`cond == false`) should be present before assert on success path"
         );
     }
 
@@ -381,8 +384,8 @@ mod tests {
             "second to last must be assert"
         );
         assert!(
-            matches!(insns[n-3].mnemonic(), Mnemonic::Unop(u) if u.op == Unop::BoolNot),
-            "third to last must be BoolNot on failure path"
+            matches!(insns[n-3].mnemonic(), Mnemonic::Binop(b) if b.op == Binop::Int(IntBinop::Equal)),
+            "third to last must be the negation (`cond == false`) on failure path"
         );
     }
 

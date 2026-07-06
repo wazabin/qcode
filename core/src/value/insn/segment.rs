@@ -397,7 +397,7 @@ fn mnemonic_segments(seg: &mut Seg, m: &Mnemonic) {
             seg.punct(";");
         }
         Mnemonic::Unop(u) => match u.op {
-            Unop::IntNegate | Unop::IntNot | Unop::BoolNot | Unop::FloatNegate => {
+            Unop::IntNegate | Unop::IntNot | Unop::FloatNegate => {
                 seg.op(format!("{} ", u.op));
                 seg.value(u.src);
                 seg.punct(";");

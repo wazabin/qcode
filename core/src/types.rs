@@ -827,7 +827,6 @@ impl TypeManager {
                 IntBinop::And | IntBinop::Or | IntBinop::Xor if self.is_bool(lhs) => lhs,
                 _ => lhs,
             },
-            Binop::Bool(_) => self.get_or_make_bool(),
             Binop::Float(float_op) => {
                 if float_op.is_comparison() {
                     self.get_or_make_bool()
