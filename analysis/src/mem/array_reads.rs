@@ -155,22 +155,24 @@ fn try_match(ctx: &mut Context, fid: FunctionId) -> Option<ReadsMatch> {
         if a.size != esz {
             return None; // partial / misaligned lane
         }
-        if let Some((b, idx, c)) = affine_strided_lane(&numbering, a.ptr, esz) {
-            if root_of(b) == Some(base_root) {
-                if c % esz as i64 != 0 {
-                    return None;
-                }
-                let od = c / esz as i64;
-                if od < 0 || od >= count {
-                    return None;
-                }
-                loads.push((a.id, LaneIdx::Strided(idx, od)));
-                continue;
+        // `is_base` pins the region base to `base_root`, so a general dynamic index
+        // (even one that is itself a root parameter) is classified as the index,
+        // not the base — order-independent for a unit element stride.
+        if let Some((_b, idx, c)) = affine_strided_lane(&numbering, a.ptr, esz, is_base) {
+            if c % esz as i64 != 0 {
+                return None;
             }
-            if root_of(b).is_some() {
-                continue; // a lane of a different snapshot region
+            let od = c / esz as i64;
+            if od < 0 || od >= count {
+                return None;
             }
-            return None;
+            loads.push((a.id, LaneIdx::Strided(idx, od)));
+            continue;
+        }
+        // A strided lane of a *different* root region is a separate snapshot; skip
+        // it rather than declining the whole promotion.
+        if affine_strided_lane(&numbering, a.ptr, esz, is_any_root).is_some() {
+            continue;
         }
         if let Some((b, c)) = affine_base_const(&numbering, a.ptr, &is_any_root) {
             if root_of(b) == Some(base_root) {

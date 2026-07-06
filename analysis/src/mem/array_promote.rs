@@ -157,7 +157,9 @@ fn try_match(ctx: &mut Context, fid: FunctionId) -> Option<PromoteMatch> {
     let mut lane: Option<Lane> = None;
     for a in &accesses {
         let Some(src) = a.stored else { continue };
-        let Some((base, idx, c)) = affine_strided_lane(&numbering, a.ptr, a.size) else {
+        let Some((base, idx, c)) =
+            affine_strided_lane(&numbering, a.ptr, a.size, |v| root_of(v).is_some())
+        else {
             continue;
         };
         if !matches!(idx, ValueId::BlockParam(_)) {
@@ -265,7 +267,9 @@ fn try_match(ctx: &mut Context, fid: FunctionId) -> Option<PromoteMatch> {
         if a.id == lane_store_id || a.stored.is_some() || a.size != esz || !in_region(a) {
             continue;
         }
-        let Some((base, idx, c)) = affine_strided_lane(&numbering, a.ptr, a.size) else {
+        let Some((base, idx, c)) =
+            affine_strided_lane(&numbering, a.ptr, a.size, |v| root_of(v).is_some())
+        else {
             continue;
         };
         if idx != index || root_of(base) != Some(base_root) || c % esz as i64 != 0 {
@@ -292,11 +296,19 @@ fn try_match(ctx: &mut Context, fid: FunctionId) -> Option<PromoteMatch> {
         region_reads.push((a.id, od));
     }
 
-    // Const-offset region loads in the exit block, forwarded to `at(arr_exit, elem)`.
+    // Const-offset, element-width region loads in the exit block, forwarded to
+    // `at(arr_exit, elem)`. Wider loads (e.g. a whole-region `load(base)`) are *not*
+    // matched here — they must not be narrowed to a 1-byte `at`; they fall through to
+    // the accounting loop, which leaves a whole-region exit load in place.
+    let region_bytes = count * esz;
     let read_ids: HashSet<InstructionId> = region_reads.iter().map(|&(id, _)| id).collect();
     let mut extra_loads: Vec<(InstructionId, i64)> = Vec::new();
     for a in &accesses {
-        if a.stored.is_some() || a.id == lane_store_id || read_ids.contains(&a.id) || !in_region(a)
+        if a.stored.is_some()
+            || a.id == lane_store_id
+            || a.size != esz
+            || read_ids.contains(&a.id)
+            || !in_region(a)
         {
             continue;
         }
@@ -324,7 +336,28 @@ fn try_match(ctx: &mut Context, fid: FunctionId) -> Option<PromoteMatch> {
         if allowed.contains(&a.id) || !in_region(a) {
             continue;
         }
-        let strided_r = affine_strided_lane(&numbering, a.ptr, a.size)
+        // Pre-loop region *stores* (any size/offset) are harmless: the snapshot
+        // `arr0 = load(region)` is taken at the *end* of the preheader, so it sees
+        // every preheader store. They stay in place — a RAM store through the base
+        // pointer is observable and is never DSE'd (mem_liveness is register/temp
+        // only); it is the snapshot *load* that store→load forwarding collapses.
+        // Loads are NOT given this allowance: the seed store is deleted by the
+        // rewrite, so a preheader load placed after it could change value.
+        if a.stored.is_some() && a.block == preheader {
+            continue;
+        }
+        // A whole-region load at the origin in the exit block is fed by the exit
+        // write-back `store(region <- arr_e)` (emitted at the top of the exit
+        // block), so it reads the promoted result. Left in place, to be forwarded.
+        if a.stored.is_none()
+            && a.block == exit
+            && a.size == region_bytes
+            && affine_base_const(&numbering, a.ptr, &is_r)
+                .is_some_and(|(_, c)| c == origin_word * esz as i64)
+        {
+            continue;
+        }
+        let strided_r = affine_strided_lane(&numbering, a.ptr, a.size, |v| root_of(v).is_some())
             .and_then(|(b, _, _)| root_of(b))
             == Some(base_root);
         let const_r = affine_base_const(&numbering, a.ptr, &is_r).is_some();
@@ -472,18 +505,17 @@ fn apply(ctx: &mut Context, m: &PromoteMatch) -> bool {
     };
     let arr_e = new_param(ctx, m.exit);
 
-    // Init at the top of the preheader: the region's original contents when any
-    // original lane is read, else a symbolic zero splat (no new observable read).
+    // Snapshot at the *end* of the preheader — after every preheader store, so the
+    // carried array starts from the region's fully-initialized contents — when any
+    // original lane is read; else a symbolic zero splat (no new observable read).
     let arr0 = if m.reads_original {
-        let orig_first = BasicBlock::from_id(ctx, m.preheader)
+        let term_id = BasicBlock::from_id(ctx, m.preheader)
             .iter()
-            .next()
-            .map(|i| i.id);
+            .last()
+            .unwrap()
+            .id;
         let dst = {
-            let mut b = Builder::from_block(BasicBlock::from_id_mut(ctx, m.preheader));
-            if let Some(f) = orig_first {
-                b.set_insert_point_before(f);
-            }
+            let mut b = builder_before(ctx, m.preheader, term_id);
             region_base(&mut b, m.base_root, m.origin_word, esz)
         };
         let ld = InstructionRef::from_mnemonic_with_type(
@@ -496,12 +528,7 @@ fn apply(ctx: &mut Context, m: &PromoteMatch) -> bool {
             arr_ty,
         )
         .id;
-        match orig_first {
-            Some(f) => BasicBlock::from_id_mut(ctx, m.preheader).insert_insn_before(f, ld),
-            None => {
-                BasicBlock::from_id_mut(ctx, m.preheader).push_insn(ld);
-            }
-        }
+        BasicBlock::from_id_mut(ctx, m.preheader).insert_insn_before(term_id, ld);
         ValueId::Instruction(ld)
     } else {
         let splat_id = IntrinsicId::from_name("splat").expect("splat registered");
@@ -564,10 +591,11 @@ fn apply(ctx: &mut Context, m: &PromoteMatch) -> bool {
         ctx.remove_instruction(load_id);
     }
 
-    // Exit write-back: store(region, base(+origin) <- arr_e) before the terminator.
+    // Exit write-back: store(region, base(+origin) <- arr_e) at the *top* of the exit
+    // block, so any whole-region exit load left in place reads the promoted result.
     {
-        let term_id = BasicBlock::from_id(ctx, m.exit).iter().last().unwrap().id;
-        let mut b = builder_before(ctx, m.exit, term_id);
+        let first_id = BasicBlock::from_id(ctx, m.exit).iter().next().unwrap().id;
+        let mut b = builder_before(ctx, m.exit, first_id);
         let dst = region_base(&mut b, m.base_root, m.origin_word, esz);
         b.push_store(arr_e, dst, m.region_space);
     }
@@ -795,6 +823,267 @@ mod tests {
         assert!(
             !ir.contains("store(ram:4"),
             "lane stores should be removed: {ir}"
+        );
+    }
+
+    // A byte buffer wrapped in a whole-region envelope: a pre-loop wide store of
+    // all `count*esz` bytes at the base (the region initializer) and an exit wide
+    // load. The initializer store must NOT trip the accounting veto — it is the
+    // counterpart of the exit envelope read, and the promoted `arr0 = load(region)`
+    // reads back exactly what it wrote. Mirrors the lifted `buf[i] = f(buf[i], i)`
+    // over an argpromote-functionalized stack buffer.
+    #[test]
+    fn whole_region_initializer_store_does_not_veto() {
+        let mut ctx = Context::new();
+        qcode!(
+            ctx,
+            "
+            fn mix:
+            <entry @src:i64 @base:i64>
+                %init = load(ram:24, @src);
+                store(ram:24, @base <- %init);
+                goto <head @i=0>;
+            <head @i:i64>
+                %done = @i == 24;
+                if %done goto <exit> else goto <body @j=@i>;
+            <body @j:i64>
+                %addr = @base + @j;
+                %cur = load(ram:1, %addr);
+                %jt = trunc(i8, @j);
+                %x = %cur ^ %jt;
+                store(ram:1, %addr <- %x);
+                %j1 = @j + 1;
+                goto <head @i=%j1>;
+            <exit>
+                %out = load(ram:24, @base);
+                return at i64 0x0;
+            "
+        );
+        let changed = run_function_pass::<ArrayPromote>(&mut ctx, mix).unwrap();
+        let ir = format!("{}", Function::from_id(&ctx, mix));
+        assert!(changed, "the enveloped byte fill should promote: {ir}");
+        assert!(ir.contains("$at("), "lane load becomes at(): {ir}");
+        assert!(ir.contains("$insert("), "lane store becomes insert(): {ir}");
+        assert!(
+            !ir.contains("load(ram:1") && !ir.contains("store(ram:1"),
+            "byte lane traffic should be gone: {ir}"
+        );
+        // Ordering soundness: the snapshot `load(ram:24, @base)` must be taken
+        // *after* the init store, so the carried array sees the initialized bytes.
+        let init_store = ir
+            .find("store(ram:24, i64 @base <- i192")
+            .expect("init store kept");
+        let snapshot = ir
+            .find("load(ram:24, i64 @base)")
+            .expect("snapshot load present");
+        assert!(
+            init_store < snapshot,
+            "snapshot must follow the init store: {ir}"
+        );
+    }
+
+    // The exit wide load keeps its width: it is fed by the write-back store, not
+    // narrowed to a 1-byte `at`. The write-back must precede it so it reads the
+    // promoted result.
+    #[test]
+    fn wide_exit_load_keeps_width_and_reads_result() {
+        let mut ctx = Context::new();
+        qcode!(
+            ctx,
+            "
+            fn mix:
+            <entry @base:i64>
+                goto <head @i=0>;
+            <head @i:i64>
+                %done = @i == 24;
+                if %done goto <exit> else goto <body @j=@i>;
+            <body @j:i64>
+                %addr = @base + @j;
+                %cur = load(ram:1, %addr);
+                %jt = trunc(i8, @j);
+                %x = %cur ^ %jt;
+                store(ram:1, %addr <- %x);
+                %j1 = @j + 1;
+                goto <head @i=%j1>;
+            <exit>
+                %out = load(ram:24, @base);
+                %r = trunc(i64, %out);
+                return at i64 %r;
+            "
+        );
+        let changed = run_function_pass::<ArrayPromote>(&mut ctx, mix).unwrap();
+        let ir = format!("{}", Function::from_id(&ctx, mix));
+        assert!(changed, "should promote: {ir}");
+        assert!(
+            ir.contains("load(ram:24, i64 @base)"),
+            "wide exit load keeps its width (not narrowed to a 1-byte at): {ir}"
+        );
+        let store = ir
+            .find("store(ram:24, i64 @base <-")
+            .expect("write-back present");
+        // The exit wide load is the last such load (the first is the preheader snapshot).
+        let load = ir
+            .rfind("load(ram:24, i64 @base)")
+            .expect("wide load present");
+        assert!(
+            store < load,
+            "write-back must precede the exit wide load so it reads the result: {ir}"
+        );
+    }
+
+    // A split loop whose param-less body reads the *header* induction param
+    // directly (`@i`) instead of copying it into a body param. This is the shape
+    // an SSA-minimal byte-fill loop takes; `unit_induction` must recognize the
+    // header-carried induction, and the fill must promote just like the
+    // body-copied form.
+    #[test]
+    fn header_carried_byte_fill_promoted() {
+        let mut ctx = Context::new();
+        qcode!(
+            ctx,
+            "
+            fn f:
+            <entry @base:i64>
+                goto <head @i=0>;
+            <head @i:i64>
+                %done = @i < 24;
+                if %done goto <body> else goto <exit>;
+            <body>
+                %addr = @base + @i;
+                %cur = load(ram:1, %addr);
+                %jt = trunc(i8, @i);
+                %x = %cur ^ %jt;
+                store(ram:1, %addr <- %x);
+                %i1 = @i + 1;
+                goto <head @i=%i1>;
+            <exit>
+                return at i64 0x0;
+            "
+        );
+        let changed = run_function_pass::<ArrayPromote>(&mut ctx, f).unwrap();
+        let ir = format!("{}", Function::from_id(&ctx, f));
+        assert!(changed, "header-carried byte fill should promote: {ir}");
+        assert!(ir.contains("$at("), "lane load becomes at(): {ir}");
+        assert!(ir.contains("$insert("), "lane store becomes insert(): {ir}");
+        assert!(
+            !ir.contains("load(ram:1"),
+            "lane load should be removed: {ir}"
+        );
+        assert!(
+            !ir.contains("store(ram:1"),
+            "lane store should be removed: {ir}"
+        );
+    }
+
+    // Base/index classification for a unit element stride must not depend on
+    // `ValueId` order. Here the induction body param `@j` is created *before* the
+    // base body param `@b`, so it sorts ahead of the base in the affine form; the
+    // lane address `@j + @b` still has to bind `@b` as base and `@j` as index.
+    #[test]
+    fn byte_stride_base_index_order_independent() {
+        let mut ctx = Context::new();
+        qcode!(
+            ctx,
+            "
+            fn f:
+            <entry @base:i64>
+                goto <head @i=0 @buf=@base>;
+            <head @i:i64 @buf:i64>
+                %done = @i < 24;
+                if %done goto <body @j=@i @b=@buf> else goto <exit>;
+            <body @j:i64 @b:i64>
+                %addr = @j + @b;
+                %cur = load(ram:1, %addr);
+                %x = %cur - 0x28;
+                store(ram:1, %addr <- %x);
+                %j1 = @j + 1;
+                goto <head @i=%j1 @buf=@b>;
+            <exit>
+                return at i64 0x0;
+            "
+        );
+        let changed = run_function_pass::<ArrayPromote>(&mut ctx, f).unwrap();
+        let ir = format!("{}", Function::from_id(&ctx, f));
+        assert!(
+            changed,
+            "induction sorting ahead of the base must still promote: {ir}"
+        );
+        assert!(ir.contains("$insert("), "lane store becomes insert(): {ir}");
+        assert!(
+            !ir.contains("store(ram:1"),
+            "lane store should be removed: {ir}"
+        );
+    }
+
+    // A *partial* pre-loop store (4 of 24 bytes, off the origin) in the preheader
+    // must not veto: pre-loop region traffic is absorbed by the end-of-preheader
+    // snapshot regardless of shape. Guards against the deleted shape-match's
+    // over-specificity.
+    #[test]
+    fn partial_preloop_store_does_not_veto() {
+        let mut ctx = Context::new();
+        qcode!(
+            ctx,
+            "
+            fn mix:
+            <entry @base:i64 @v:i64>
+                %v32 = trunc(i32, @v);
+                %off = @base + 8;
+                store(ram:4, %off <- %v32);
+                goto <head @i=0>;
+            <head @i:i64>
+                %done = @i == 24;
+                if %done goto <exit> else goto <body @j=@i>;
+            <body @j:i64>
+                %addr = @base + @j;
+                %cur = load(ram:1, %addr);
+                %jt = trunc(i8, @j);
+                %x = %cur ^ %jt;
+                store(ram:1, %addr <- %x);
+                %j1 = @j + 1;
+                goto <head @i=%j1>;
+            <exit>
+                return at i64 0x0;
+            "
+        );
+        let changed = run_function_pass::<ArrayPromote>(&mut ctx, mix).unwrap();
+        let ir = format!("{}", Function::from_id(&ctx, mix));
+        assert!(changed, "a partial pre-loop store should not block: {ir}");
+        assert!(ir.contains("$insert("), "lane store becomes insert(): {ir}");
+    }
+
+    // A whole-region store *inside the loop body* is an unmodelled write the carried
+    // array never sees — it must veto (positional rule: only preheader stores are free).
+    #[test]
+    fn whole_region_store_in_body_vetoes() {
+        let mut ctx = Context::new();
+        qcode!(
+            ctx,
+            "
+            fn mix:
+            <entry @base:i64 @src:i64>
+                goto <head @i=0>;
+            <head @i:i64>
+                %done = @i == 24;
+                if %done goto <exit> else goto <body @j=@i>;
+            <body @j:i64>
+                %addr = @base + @j;
+                %cur = load(ram:1, %addr);
+                %jt = trunc(i8, @j);
+                %x = %cur ^ %jt;
+                store(ram:1, %addr <- %x);
+                %blob = load(ram:24, @src);
+                store(ram:24, @base <- %blob);
+                %j1 = @j + 1;
+                goto <head @i=%j1>;
+            <exit>
+                return at i64 0x0;
+            "
+        );
+        let changed = run_function_pass::<ArrayPromote>(&mut ctx, mix).unwrap();
+        assert!(
+            !changed,
+            "a whole-region store in the body must block promotion"
         );
     }
 

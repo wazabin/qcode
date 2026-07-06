@@ -182,20 +182,35 @@ pub(crate) fn affine_base_const(
     (k == 1 && is_root(t)).then(|| (t, signed_at(constant, width)))
 }
 
-/// Decompose `addr` as the strided lane address `base + idx*elem_size + c`.
+/// Decompose `addr` as the strided lane address `base + idx*elem_size + c`, where
+/// `is_base` identifies the region-base term (typically "rooted at a function
+/// entry pointer").
+///
+/// The base carries coefficient 1; the index carries the element stride and is a
+/// loop-varying block param. When `elem_size == 1` the two roles collide on
+/// coefficient 1, so classification is by *role* (`is_base`) rather than by which
+/// term the affine form happens to list first — otherwise a byte-stride fill whose
+/// induction sorts ahead of its base pointer would bind them backwards.
 pub(crate) fn affine_strided_lane(
     numbering: &Numbering,
     addr: ValueId,
     elem_size: usize,
+    is_base: impl Fn(ValueId) -> bool,
 ) -> Option<(ValueId, ValueId, i64)> {
     let (width, constant, terms) = numbering.affine_terms(addr)?;
     let mut base = None;
     let mut idx = None;
     for (t, k) in terms {
-        if base.is_none() && k == 1 {
-            base = Some(t);
-        } else if idx.is_none() && k == elem_size as u64 && matches!(t, ValueId::BlockParam(_)) {
+        // The index is the element-strided block param that is *not* a base; the
+        // base is the unit-coefficient term the caller recognizes as a region root.
+        if idx.is_none()
+            && k == elem_size as u64
+            && matches!(t, ValueId::BlockParam(_))
+            && !is_base(t)
+        {
             idx = Some(t);
+        } else if base.is_none() && k == 1 && is_base(t) {
+            base = Some(t);
         } else {
             return None;
         }

@@ -435,31 +435,50 @@ impl NaturalLoop {
         }
     }
 
-    /// Verify that `var` (a body induction parameter) is a unit-step induction over
-    /// `[start, count)` and return `(start, count)`.
+    /// Verify that `var` is a unit-step induction over `[start, count)` and return
+    /// `(start, count)`.
     ///
-    /// The induction reaches the body one of two ways: in the rotated shape the
-    /// body param's own two incomings are the preheader init and the back-edge
-    /// increment; in the split shape `var` copies a header param whose incomings
-    /// carry the init and increment. The trip bound `N` comes from the header guard.
+    /// `var` may be the induction as it is *used* — this reaches the loop in one of
+    /// three shapes:
+    ///
+    /// - **rotated** self-loop: `var` is the header(==body) param; its own two
+    ///   incomings are the preheader init and the back-edge increment, and the
+    ///   guard tests the incremented value `i+1`.
+    /// - **split, header-carried**: `var` is a header param the body reads directly
+    ///   (the body takes no param of its own for it); the header param's incomings
+    ///   carry init + increment, and the guard tests the header param.
+    /// - **split, body-copied**: `var` is a body param that copies a header param;
+    ///   the copied header param's incomings carry init + increment, and the guard
+    ///   tests that header param.
+    ///
+    /// The trip bound `N` comes from the header guard.
     pub fn unit_induction(&self, ctx: &Context, var: ValueId) -> Option<Induction> {
-        if param_parent(ctx, var) != Some(self.body) {
-            return None;
-        }
-        let k = param_pos(ctx, self.body, var)?;
-        // The header param whose value `var` is (itself, when rotated; the copied
-        // header param, when split) — the guard compares against this.
-        let (feeds, guard_key) = if self.rotated {
-            (incoming(ctx, self.body, k), var)
-        } else {
-            let [hp] = incoming(ctx, self.body, k)[..] else {
+        let parent = param_parent(ctx, var)?;
+        // Resolve the feed set (init + increment), the value the guard compares,
+        // and whether it compares the plain index or the incremented one.
+        let (feeds, guard_key, guard_uses_inc) = if self.rotated {
+            // The rotated body *is* the header; `var` must be its own param.
+            if parent != self.header {
+                return None;
+            }
+            let k = param_pos(ctx, self.header, var)?;
+            (incoming(ctx, self.header, k), var, true)
+        } else if parent == self.header {
+            // Split loop whose body reads the header induction param directly.
+            let k = param_pos(ctx, self.header, var)?;
+            (incoming(ctx, self.header, k), var, false)
+        } else if parent == self.body {
+            // Split loop where `var` is a body param copying a header param.
+            let [hp] = incoming(ctx, self.body, param_pos(ctx, self.body, var)?)[..] else {
                 return None;
             };
             if param_parent(ctx, hp) != Some(self.header) {
                 return None;
             }
             let kh = param_pos(ctx, self.header, hp)?;
-            (incoming(ctx, self.header, kh), hp)
+            (incoming(ctx, self.header, kh), hp, false)
+        } else {
+            return None;
         };
         let inc = feeds.iter().copied().find(|&v| is_increment(ctx, v, var))?;
         let inits: Vec<i64> = feeds
@@ -472,7 +491,7 @@ impl NaturalLoop {
         };
         // Rotated guards compare the *incremented* index (`i+1`) since the body has
         // already run at `i`; split guards compare the header param itself.
-        let count = if self.rotated {
+        let count = if guard_uses_inc {
             self.guard_bound(ctx, inc)?
         } else {
             self.guard_bound(ctx, guard_key)?
@@ -590,5 +609,42 @@ mod tests {
             .unit_induction(&ctx, param(&ctx, l.body, "i"))
             .expect("i is a unit induction var");
         assert_eq!((ind.start, ind.count), (1, 10));
+    }
+
+    // A split loop whose body reads the *header* induction param directly, taking
+    // no body param of its own for it. The induction is used as `@i` (a header
+    // param) inside the body; `unit_induction` must still recognize it.
+    #[test]
+    fn split_header_carried_induction_recognized() {
+        let mut ctx = Context::new();
+        qcode!(
+            ctx,
+            "
+            fn f:
+            <entry @base:i64>
+                goto <head @i=0>;
+            <head @i:i64>
+                %done = @i < 10;
+                if %done goto <body> else goto <exit>;
+            <body>
+                %off = @i * 4;
+                %a = @base + %off;
+                %v = trunc(i32, @i);
+                store(ram:4, %a <- %v);
+                %i1 = @i + 1;
+                goto <head @i=%i1>;
+            <exit>
+                return at i64 0x0;
+            "
+        );
+        let loops = recognize_loops(&ctx, f);
+        assert_eq!(loops.len(), 1, "one loop recognized");
+        let l = &loops[0];
+        assert!(!l.rotated, "distinct guard header is the split shape");
+        // The induction is the header param, referenced directly by the body.
+        let ind = l
+            .unit_induction(&ctx, param(&ctx, l.header, "i"))
+            .expect("header param `i` is a unit induction var used in the body");
+        assert_eq!((ind.start, ind.count), (0, 10));
     }
 }
