@@ -341,6 +341,17 @@ fn simplify_bitwise(ctx: &mut Context, ic: &InsnCtx, ed: &mut Editor) -> bool {
         // (x & c1) & c2 → x & (c1 & c2), and dropping a redundant alignment mask.
         IntBinop::And => {
             for (outer, inner) in const_operands(ctx, lhs, rhs) {
+                // `b & 1 → b` when `b` is a boolean (its value is already `{0,1}`),
+                // and through a zext: `zext(b) & 1 → zext(b)`. This is what lets a
+                // lifted `(i < N) & 1 != 0` header guard collapse to the bare
+                // comparison, unblocking `guard_bound`/`array_promote`/`loop_to_map`.
+                if outer == 1
+                    && (is_boolean(ctx, inner)
+                        || as_zext(ctx, inner).is_some_and(|(src, _)| is_boolean(ctx, src)))
+                {
+                    ed.replace(ctx, ic.insn_id, inner);
+                    return true;
+                }
                 // `inner & mask → inner` when `inner` is already aligned to the
                 // mask's granularity. This collapses the cascade of `& ~7` that
                 // inlined, stack-realigning prologues emit: each mask after the
@@ -759,6 +770,46 @@ mod tests {
         assert!(
             text.contains("!="),
             "the `!= 0` comparison on the i8 source must remain, got:\n{text}"
+        );
+    }
+
+    /// `zext(i < 4) & 1 != 0` — the lifted shape of a `(i < 4) & 1` header guard
+    /// after the comparison flag is spilled to a byte and reloaded — must collapse
+    /// to the bare comparison `i < 4`. This is the `bool`-migration's `loop_to_map`
+    /// unblock: `& 1` drops on the `{0,1}`-valued zext, then `zext(b) != 0 → b`.
+    #[test]
+    fn bool_and_one_ne_zero_collapses_to_comparison() {
+        let mut ctx = Context::new();
+        qcode!(
+            ctx,
+            "
+                varnode i32 I;
+                varnode i8 B;
+
+                fn f:
+                    <entry>
+                        %i = load(I:4, &I);
+                        %lt = %i < 0x4;
+                        %z = zext(i8, %lt);
+                        %m = %z & 0x1;
+                        %nz = %m != 0x0;
+                        %c8 = zext(i8, %nz);
+                        store(B:1, &B <- %c8);
+                        return at 0x0;
+                "
+        );
+
+        let aliases = AliasResult::simple(&ctx);
+        while gvn_function(&mut ctx, f, Some(&aliases)) {}
+        crate::remove_dead_insns(&mut ctx, entry);
+        let text = BasicBlock::from_id(&ctx, entry).to_string();
+        assert!(
+            !text.contains(" & "),
+            "the `& 1` mask should be gone, got:\n{text}"
+        );
+        assert!(
+            text.contains(" < i32 0x4"),
+            "the bare comparison must survive, got:\n{text}"
         );
     }
 

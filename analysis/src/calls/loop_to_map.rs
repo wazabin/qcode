@@ -369,6 +369,8 @@ mod tests {
     use qcode::value::insn::{Binop, IntBinop, Mnemonic};
     use qcode_macro::qcode;
 
+    use crate::AliasResult;
+    use crate::gvn::gvn_function;
     use crate::mem::array_promote::ArrayPromote;
     use crate::test_util::run_function_pass;
 
@@ -434,6 +436,55 @@ mod tests {
             )),
             "the body recomputes the xor"
         );
+    }
+
+    /// The motivating `bool`-migration case (410a60-class): the loop's continue
+    /// guard is the lifted `(i < 16) & 1 != 0` — a comparison spilled to a byte,
+    /// masked with `1`, and re-tested — not a bare comparison. GVN's `& 1` +
+    /// `zext(b) != 0` collapse rewrites it back to `i < 16`, after which
+    /// `array_promote`/`loop_to_map` fold the fill exactly as for a clean guard.
+    #[test]
+    fn masked_guard_loop_folds_to_map_after_gvn() {
+        let mut ctx = Context::new();
+        qcode!(
+            ctx,
+            "
+            fn xorbuf:
+            <entry @base:i64>
+                goto <head @i=0 @buf=@base>;
+            <head @i:i64 @buf:i64>
+                %lt = @i < 16;
+                %z = zext(i8, %lt);
+                %m = %z & 0x1;
+                %cont = %m != 0x0;
+                if %cont goto <body @j=@i @b=@buf> else goto <exit>;
+            <body @j:i64 @b:i64>
+                %off = @j * 4;
+                %addr = @b + %off;
+                %x = load(ram:4, %addr);
+                %v = %x ^ 0x5a;
+                store(ram:4, %addr <- %v);
+                %j1 = @j + 1;
+                goto <head @i=%j1 @buf=@b>;
+            <exit>
+                return at i64 0x0;
+            "
+        );
+
+        // Collapse the masked guard to the bare `i < 16` first.
+        let aliases = AliasResult::simple(&ctx);
+        while gvn_function(&mut ctx, xorbuf, Some(&aliases)) {}
+        let header = format!("{}", Function::from_id(&ctx, xorbuf));
+        assert!(
+            !header.contains(" & i8 0x1") && !header.contains("!= i8 0x0"),
+            "the `& 1 != 0` mask should be gone after GVN:\n{header}"
+        );
+
+        let (promoted, folded) = promote_then_map(&mut ctx, xorbuf);
+        assert!(promoted, "the masked-guard fill should promote after GVN");
+        assert!(folded, "the promoted loop should fold to a map");
+        let ir = format!("{}", Function::from_id(&ctx, xorbuf));
+        assert!(ir.contains("<$>"), "folds to a map: {ir}");
     }
 
     /// The same loop with an *index-aware* body (`out[i] = out[i] + i`) folds to
