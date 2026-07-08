@@ -88,10 +88,12 @@ pub use lift::{discover_addresses_in_binary, lift_new_addresses, split_overlappi
 pub mod pipeline;
 pub use pipeline::{
     ArchConfig, CallingConvention, DEFAULT_PIPELINE_TOML, DecompilePass, DynDecompilePass,
-    DynFunctionPass, DynPass, FunctionPass, GpReg, LiftOutcome, LiftSummary, Pass,
+    DynFunctionPass, DynPass, Effects,
+    FunctionBody, FunctionPass, FunctionPassV2, GpReg, LiftOutcome, LiftSummary, ModuleView, Pass,
     PassRegistration, Pipeline, PipelineEnv, PipelineServices, ProgressSink, RegisteredPass,
-    YieldSignal, analyze_and_lift_with_progress, analyze_default, analyze_with_pipeline,
-    known_pass_names, make_pass,
+    V2Adapter, YieldSignal,
+    analyze_and_lift_with_progress, analyze_default, analyze_with_pipeline, known_pass_names,
+    make_pass,
 };
 #[cfg(not(target_arch = "wasm32"))]
 pub use pipeline::{

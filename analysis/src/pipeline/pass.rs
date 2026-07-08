@@ -35,7 +35,7 @@ use qcode::{
     value::{FunctionId, RegisterId, Varnode, VarnodeId},
 };
 
-use super::{ArchConfig, CallingConvention};
+use super::{ArchConfig, CallingConvention, FunctionBody, ModuleView};
 use crate::structure::Program;
 use crate::RegisterBase;
 
@@ -158,6 +158,122 @@ impl<T: FunctionPass> DynFunctionPass for T {
     ) -> Result<bool, String> {
         FunctionPass::run(self, ctx, fun_id, env)
     }
+}
+
+/// The parallel-safe successor to [`FunctionPass`] (Stage 5 of the
+/// parallel-function-passes plan; see `PARALLEL_PASSES.md`).
+///
+/// The litmus test the signature enforces: **a function pass may read the
+/// module's published interface and mutate its own function — nothing else.** It
+/// reads the module through a `&`-shared [`ModuleView`] and mutates only its own
+/// [`FunctionBody`], buffering the few legitimate global effects (assumptions,
+/// discoveries, self-renames, address claims) for the driver to replay at
+/// check-in. With no path to global mutable state, workers can run these in
+/// parallel (Stage 6) with the `ModuleView` shared and the bodies disjoint.
+///
+/// A pass migrates from [`FunctionPass`] to this trait one at a time; the
+/// [`V2Adapter`] lets a `FunctionPassV2` be stored and driven exactly like a
+/// legacy [`FunctionPass`] (it performs the checkout → run → check-in dance
+/// internally), so the sequential pipeline needs no changes while the port is in
+/// flight.
+pub trait FunctionPassV2: Default {
+    const NAME: &'static str;
+    fn description(&self) -> &'static str;
+    fn run(&self, m: &ModuleView, f: &mut FunctionBody) -> Result<bool, String>;
+}
+
+/// Adapts a [`FunctionPassV2`] to the object-safe [`DynFunctionPass`] the registry
+/// and the sequential driver speak, encapsulating the whole check-out/check-in
+/// protocol in one place:
+///
+/// 1. Check the target function out of the context ([`Context::checkout_function`]).
+/// 2. Build a [`ModuleView`] over the now-disjoint `&Context` and run the pass on
+///    the owned [`FunctionBody`].
+/// 3. Check the function back in and replay any buffered [`Effects`] in place.
+///
+/// Stage 6's parallel driver will instead check out a whole worklist and call the
+/// `FunctionPassV2` directly on each disjoint body; the adapter is the sequential
+/// bridge that keeps the pipeline running identically during the incremental port.
+pub struct V2Adapter<T: FunctionPassV2> {
+    inner: T,
+}
+
+impl<T: FunctionPassV2> Default for V2Adapter<T> {
+    fn default() -> Self {
+        Self {
+            inner: T::default(),
+        }
+    }
+}
+
+impl<T: FunctionPassV2> DynFunctionPass for V2Adapter<T> {
+    fn name(&self) -> &'static str {
+        T::NAME
+    }
+    fn description(&self) -> &'static str {
+        FunctionPassV2::description(&self.inner)
+    }
+    fn run(
+        &self,
+        ctx: &mut Context,
+        fun_id: FunctionId,
+        env: &PipelineEnv,
+    ) -> Result<bool, String> {
+        // Check out: the pass owns its function exclusively; the context it reads
+        // through `ModuleView` no longer holds (and so cannot alias) that function.
+        let fun = ctx.checkout_function(fun_id);
+        // Sequential bridge: no reserved ids yet (function minting is wired with
+        // the first V2 outliner port). A V2 pass that mints is guarded below.
+        let mut body = FunctionBody::new(fun_id, fun, Vec::new());
+        let changed = {
+            let view = ModuleView::new(ctx, env);
+            FunctionPassV2::run(&self.inner, &view, &mut body)?
+        };
+        let (fun, effects, minted, _reserved) = body.into_parts();
+        ctx.checkin_function(fun_id, fun);
+        replay_effects(ctx, T::NAME, effects, minted)?;
+        Ok(changed)
+    }
+}
+
+/// Replay a V2 pass's buffered [`Effects`] into the context at check-in. Runs on
+/// the master thread in worklist order; every item is an idempotent keyed insert
+/// or a first-writer-wins claim, so the order within one pass's buffer is
+/// immaterial.
+///
+/// Effect kinds are wired as the passes that produce them are ported (each port
+/// commit lands its replay arm). An unwired effect surfaces as a hard error rather
+/// than a silent drop, so a mis-ordered port fails loudly instead of miscompiling.
+fn replay_effects(
+    ctx: &mut Context,
+    pass: &'static str,
+    effects: super::Effects,
+    minted: Vec<qcode::value::Function>,
+) -> Result<bool, String> {
+    let mut changed = false;
+    for (prop, value) in effects.assumptions {
+        debug_assert!(value, "only assume_true is buffered");
+        changed |= ctx.assume_true(prop);
+    }
+    for discovery in effects.discoveries {
+        changed |= ctx.discover(discovery);
+    }
+    if effects.self_rename.is_some() {
+        return Err(format!(
+            "{pass}: V2 self-rename replay not wired yet (port cpp_demangle/name_thunks first)"
+        ));
+    }
+    if !effects.address_claims.is_empty() {
+        return Err(format!(
+            "{pass}: V2 address-claim replay not wired yet (port handle_jump_tables first)"
+        ));
+    }
+    if !minted.is_empty() {
+        return Err(format!(
+            "{pass}: V2 function minting not wired yet (port the loop outliners first)"
+        ));
+    }
+    Ok(changed)
 }
 
 /// A whole-program pass (an interprocedural milestone). `run` returns `Ok(true)`
@@ -344,6 +460,28 @@ macro_rules! register_function_pass {
                 name: <$ty as $crate::FunctionPass>::NAME,
                 make: || $crate::RegisteredPass::Function(::std::boxed::Box::new(
                     <$ty as ::core::default::Default>::default(),
+                )),
+            }
+        }
+    };
+}
+
+/// Register a [`FunctionPassV2`] under its `NAME`, wrapping it in a [`V2Adapter`]
+/// so the registry stores it as an ordinary [`DynFunctionPass`]. Drop-in
+/// replacement for [`register_function_pass!`] used as each pass is ported; the
+/// pipeline TOML and the driver are none the wiser.
+///
+/// ```ignore
+/// register_function_pass_v2!(ExamplePass);
+/// ```
+#[macro_export]
+macro_rules! register_function_pass_v2 {
+    ($ty:ty) => {
+        inventory::submit! {
+            $crate::PassRegistration {
+                name: <$ty as $crate::FunctionPassV2>::NAME,
+                make: || $crate::RegisteredPass::Function(::std::boxed::Box::new(
+                    <$crate::V2Adapter<$ty> as ::core::default::Default>::default(),
                 )),
             }
         }

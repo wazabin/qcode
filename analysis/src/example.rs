@@ -1,30 +1,19 @@
-//! Example pass.
-use qcode::{
-    context::Context,
-    value::{Function, FunctionId},
-};
-
-use crate::{FunctionPass, PipelineEnv};
+//! Example pass. The smallest [`FunctionPassV2`]: it reads its own function's
+//! interface and mutates nothing.
+use crate::{FunctionBody, FunctionPassV2, ModuleView};
 
 #[derive(Default)]
 pub struct ExamplePass;
 
-impl FunctionPass for ExamplePass {
+impl FunctionPassV2 for ExamplePass {
     const NAME: &'static str = "example";
 
     fn description(&self) -> &'static str {
         "Example Pass, lists functions"
     }
 
-    fn run(
-        &self,
-        ctx: &mut Context,
-        fun_id: FunctionId,
-        _env: &PipelineEnv,
-    ) -> Result<bool, String> {
-        let function = Function::from_id_mut(ctx, fun_id);
-
-        let _name = function.name().to_string();
+    fn run(&self, _m: &ModuleView, f: &mut FunctionBody) -> Result<bool, String> {
+        let _name = f.function().name.to_string();
 
         // TODO: log!(name)
 
@@ -33,14 +22,15 @@ impl FunctionPass for ExamplePass {
     }
 }
 
-crate::register_function_pass!(ExamplePass);
+crate::register_function_pass_v2!(ExamplePass);
 
 #[cfg(test)]
 mod tests {
+    use qcode::context::Context;
     use qcode_macro::qcode;
 
     use super::*;
-    use crate::test_util::run_function_pass;
+    use crate::test_util::run_function_pass_v2;
 
     #[test]
     fn named_functions() {
@@ -55,6 +45,6 @@ mod tests {
             "
         );
 
-        run_function_pass::<ExamplePass>(&mut ctx, foo).unwrap();
+        run_function_pass_v2::<ExamplePass>(&mut ctx, foo).unwrap();
     }
 }

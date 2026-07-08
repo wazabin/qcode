@@ -5,7 +5,10 @@ use qcode::{
     value::{FunctionId, RegisterId, VarnodeId},
 };
 
-use crate::{ArchConfig, CallingConvention, FunctionPass, PipelineEnv};
+use crate::{
+    ArchConfig, CallingConvention, DynFunctionPass, FunctionPass, FunctionPassV2, PipelineEnv,
+    V2Adapter,
+};
 
 /// A throwaway [`PipelineEnv`] for passes that don't touch architecture state
 /// (no real stack pointer or ABI). Arch-aware passes should build a real env via
@@ -30,4 +33,14 @@ pub(crate) fn run_function_pass<P: FunctionPass>(
     fun: FunctionId,
 ) -> Result<bool, String> {
     P::default().run(ctx, fun, &dummy_env())
+}
+
+/// Run a [`FunctionPassV2`] once over `fun` through the real [`V2Adapter`] path
+/// (check-out → run → check-in → effect replay) with a [`dummy_env`], so a unit
+/// test exercises the same plumbing the sequential driver uses.
+pub(crate) fn run_function_pass_v2<P: FunctionPassV2>(
+    ctx: &mut Context,
+    fun: FunctionId,
+) -> Result<bool, String> {
+    DynFunctionPass::run(&V2Adapter::<P>::default(), ctx, fun, &dummy_env())
 }

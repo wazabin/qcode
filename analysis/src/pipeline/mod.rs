@@ -27,8 +27,8 @@ pub use config::{
 pub use lifter::{LiftOutcome, LiftSummary, Lifter, PipelineServices};
 pub use module_view::{Effects, FunctionBody, ModuleView};
 pub use pass::{
-    DecompilePass, DynDecompilePass, DynFunctionPass, DynPass, FunctionPass, Pass,
-    PassRegistration, PipelineEnv, RegisteredPass, known_pass_names, make_pass,
+    DecompilePass, DynDecompilePass, DynFunctionPass, DynPass, FunctionPass, FunctionPassV2, Pass,
+    PassRegistration, PipelineEnv, RegisteredPass, V2Adapter, known_pass_names, make_pass,
 };
 
 use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
