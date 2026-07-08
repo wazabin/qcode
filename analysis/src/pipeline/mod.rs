@@ -15,6 +15,7 @@
 
 mod config;
 mod lifter;
+mod module_view;
 mod pass;
 
 pub use config::{DEFAULT_PIPELINE_TOML, Pipeline};
@@ -24,6 +25,7 @@ pub use config::{
     list_user_pipelines_in, load_named_user_pipeline_in,
 };
 pub use lifter::{LiftOutcome, LiftSummary, Lifter, PipelineServices};
+pub use module_view::{Effects, FunctionBody, ModuleView};
 pub use pass::{
     DecompilePass, DynDecompilePass, DynFunctionPass, DynPass, FunctionPass, Pass,
     PassRegistration, PipelineEnv, RegisteredPass, known_pass_names, make_pass,
