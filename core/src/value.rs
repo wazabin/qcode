@@ -431,6 +431,30 @@ impl<'str, 'ctx> ValueRef<'str, 'ctx> {
         Self::new(id, ctx)
     }
 
+    /// Build a value ref over a [`HostRef`], so arena-cluster values (instruction,
+    /// block, param, function) route to a checked-out function while shared leaves
+    /// (literal, bytes, varnode) come from the module. Used by the generic builder,
+    /// whose operands may be a checked-out function's own SSA values.
+    pub fn from_host(host: crate::value::util::base_ref::HostRef<'ctx, 'str>, id: ValueId) -> Self {
+        use crate::value::{
+            block::BlockRef, block_param::BlockParamRef, function::FunctionRef,
+            insn::InstructionRef,
+        };
+        match id {
+            ValueId::Literal(lit_id) => ValueRef::Literal(LiteralRef::new(host.shared(), lit_id)),
+            ValueId::Bytes(bytes_id) => ValueRef::Bytes(BytesRef::new(host.shared(), bytes_id)),
+            ValueId::Varnode(var_id) => ValueRef::Varnode(Varnode::from_id(host.shared(), var_id)),
+            ValueId::Instruction(insn_id) => {
+                ValueRef::Instruction(InstructionRef::new(host, insn_id))
+            }
+            ValueId::BasicBlock(bb_id) => ValueRef::BasicBlock(BlockRef::new(host, bb_id)),
+            ValueId::BlockParam(param_id) => {
+                ValueRef::BlockParam(BlockParamRef::new(host, param_id))
+            }
+            ValueId::Function(fn_id) => ValueRef::Function(FunctionRef::new(host, fn_id)),
+        }
+    }
+
     pub fn space(&self) -> Option<SpaceRef<'ctx>> {
         match self {
             ValueRef::Varnode(v) => Some(v.space()),

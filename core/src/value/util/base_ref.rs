@@ -123,6 +123,17 @@ impl<Ctx, Id: Copy> BaseRef<Ctx, Id> {
     pub fn new(ctx: Ctx, id: Id) -> Self {
         BaseRef { id, ctx }
     }
+
+    /// The underlying host/context handle (read). Crate-internal: the `Builder`
+    /// (a sibling module) reaches the `HostMut` through this.
+    pub(crate) fn host_ref(&self) -> &Ctx {
+        &self.ctx
+    }
+
+    /// The underlying host/context handle (write).
+    pub(crate) fn host_mut(&mut self) -> &mut Ctx {
+        &mut self.ctx
+    }
 }
 
 impl<Ctx, Id: Copy + Into<ValueId>> BaseRef<Ctx, Id> {

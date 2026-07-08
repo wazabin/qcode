@@ -32,6 +32,8 @@
 
 use std::{borrow::Cow, cmp};
 
+use std::marker::PhantomData;
+
 use rustc_hash::FxHashMap as HashMap;
 
 use crate::{
@@ -40,7 +42,7 @@ use crate::{
     types::{AggregateField, TypeId},
     value::{
         Function, Instruction, Renameable, Value, ValueId, ValueRef,
-        block::{BasicBlock, BlockId, BlockMutRef},
+        block::{BasicBlock, BlockId},
         block_param::BlockParamMutRef,
         function::FunctionId,
         insn::{
@@ -50,7 +52,7 @@ use crate::{
             Mnemonic, PCodeOp, PCodeOpId, PopCount, Range, Return, ReturnValue, SBorrow, SCarry,
             Scan, Sext, Store, Tuple, Unary, Unop, Zext,
         },
-        util::base_ref::{WithCtx, WithCtxMut},
+        util::{base_ref::BaseRef, host_mut::HostMut},
         varnode::{Varnode, VarnodeId},
     },
 };
@@ -58,8 +60,8 @@ use crate::{
 /// A builder for constructing instructions in a block.
 /// This provides a convenient API for creating instructions, and automatically
 /// manages temporary values and labels.
-pub struct Builder<'str, 'ctx> {
-    pub block: BlockMutRef<'str, 'ctx>,
+pub struct Builder<'str, 'ctx, Ctx: HostMut<'str> = &'ctx mut Context<'str>> {
+    pub block: BaseRef<Ctx, BlockId>,
 
     /// Converts from names to value IDs in the current scope.
     namespace: HashMap<Cow<'str, str>, ValueId>,
@@ -82,6 +84,10 @@ pub struct Builder<'str, 'ctx> {
     /// `Some(n)` inserts at index `n` and auto-advances after each push,
     /// so consecutive pushes form a contiguous sequence starting at `n`.
     insert_point: Option<usize>,
+
+    /// Ties the (default) `'ctx` to the module-borrow lifetime when
+    /// `Ctx = &'ctx mut Context`; phantom for other hosts.
+    _ctx: PhantomData<&'ctx ()>,
 }
 
 /// Generates a canonical comparison method and its "greater-than" mirror (operands swapped).
@@ -96,12 +102,12 @@ macro_rules! cmp_pair {
     };
 }
 
-impl<'str, 'ctx> Builder<'str, 'ctx> {
+impl<'str, 'ctx, Ctx: HostMut<'str>> Builder<'str, 'ctx, Ctx> {
     /// Creates a builder positioned at `block`.
     ///
     /// The block is borrowed mutably for the lifetime `'ctx`. New instructions
     /// will be appended to the end of `block`.
-    pub fn from_block(block: BlockMutRef<'str, 'ctx>) -> Self {
+    pub fn from_block(block: BaseRef<Ctx, BlockId>) -> Self {
         Self {
             is_terminated: block.is_terminated(),
             verify_terminated: true,
@@ -110,27 +116,8 @@ impl<'str, 'ctx> Builder<'str, 'ctx> {
             local_labels: HashMap::default(),
             address: None,
             insert_point: None,
+            _ctx: PhantomData,
         }
-    }
-
-    /// Creates a builder positioned at the block for machine `address`,
-    /// creating the block if it does not already exist.
-    /// This will emit instructions ate the given address
-    pub fn from_context<'m>(ctx: &'m mut Context<'str>, address: u64) -> Builder<'str, 'm> {
-        // A block must be born into a function's arena. If nothing is mapped at
-        // `address` yet, host the new block in a fresh anonymous function.
-        let block_id = match BasicBlock::from_addr(ctx, address) {
-            Some(block) => block.id,
-            None => {
-                let func = Function::make(ctx, Cow::Owned(format!("blk_{address:x}")))
-                    .expect("anon host function")
-                    .id;
-                ctx.get_or_make_block(address, func)
-            }
-        };
-        let mut builder = Builder::from_block(BasicBlock::from_id_mut(ctx, block_id));
-        builder.set_address(address);
-        builder
     }
 
     /// Returns `true` if the current block ends with a terminator instruction.
@@ -173,7 +160,6 @@ impl<'str, 'ctx> Builder<'str, 'ctx> {
     pub fn set_insert_point_before(&mut self, before_id: InstructionId) {
         let index = self
             .block
-            .as_ref()
             .instruction_ids()
             .iter()
             .position(|&id| id == before_id)
@@ -249,7 +235,7 @@ impl<'str, 'ctx> Builder<'str, 'ctx> {
                         size: range.len(),
                     }),
                     range.len(),
-                    ValueRef::from_id(self.context(), src).space().map(|s| s.id),
+                    self.get_value(src).space().map(|s| s.id),
                 )
                 .into()
             }
@@ -271,22 +257,8 @@ impl<'str, 'ctx> Builder<'str, 'ctx> {
         start: usize,
         size: usize,
     ) -> InstructionRef<'str, '_> {
-        let space = ValueRef::from_id(self.context(), src).space().map(|s| s.id);
+        let space = self.get_value(src).space().map(|s| s.id);
         self.push_instruction_in_space(Mnemonic::Range(Range { src, start, size }), size, space)
-    }
-
-    /// Creates a new builder with the same insert point but an empty namespace.
-    /// This builder won't need to be finalized
-    pub fn with_empty_namespaces(&mut self) -> Builder<'str, '_> {
-        let mut builder = Builder::from_block(self.block.reborrow());
-
-        unsafe {
-            // This is safe because the parent builder will not be dropped while the child builder is still in use
-            // It is responsible for finalizing the block
-            builder.dont_finalize();
-        }
-
-        builder
     }
 
     /// Removes a name from the local namespace, freeing it for reuse.
@@ -301,8 +273,7 @@ impl<'str, 'ctx> Builder<'str, 'ctx> {
     }
 
     pub fn switch_to_block(&mut self, block: BlockId) {
-        // This feels wrong, we are assigning a mut ref...
-        self.block.with_id(block);
+        self.block.id = block;
         self.is_terminated = self.block.is_terminated();
     }
 
@@ -313,18 +284,51 @@ impl<'str, 'ctx> Builder<'str, 'ctx> {
 
     /// Gets the ID of a value in the current namespace
     pub fn try_get_value(&self, name: &str) -> Option<ValueRef<'str, '_>> {
-        self.namespace
-            .get(name)
-            .map(|&id| ValueRef::from_id(self.context(), id))
+        self.namespace.get(name).map(|&id| self.get_value(id))
     }
 
-    /// Returns the current context
+    /// The module's shared context (write) — types/varnodes/spaces mint. Routed
+    /// through the host, so a checked-out builder mints into shared storage while
+    /// arena writes stay in the owned function.
     pub fn context_mut(&mut self) -> &mut Context<'str> {
-        self.block.ctx_mut()
+        self.block.host_mut().shared_mut()
     }
 
     pub fn context(&self) -> &Context<'str> {
-        self.block.as_ref().ctx()
+        self.block.host_ref().shared()
+    }
+
+    /// Retype an instruction's result as a pointer into `space` (host-routed
+    /// mirror of [`InstructionMutRef::set_space`]): the type mint is shared, the
+    /// `type_id` write goes to the owning function's arena.
+    fn set_insn_space(&mut self, id: InstructionId, space: SpaceId) {
+        if matches!(
+            Space::from_id(self.context(), space).ty,
+            SpaceType::Register
+        ) {
+            return;
+        }
+        let cur_type = self.block.host_mut().instruction_mut(id).type_id;
+        let size = self.context().types.size_of(cur_type);
+        let type_id = self
+            .context_mut()
+            .types
+            .get_or_make_space_address(size, space);
+        self.block.host_mut().instruction_mut(id).type_id = type_id;
+    }
+
+    /// Rename an instruction's result (host-routed mirror of the instruction
+    /// `Renameable`): registers the (function-local) name in the owning function's
+    /// table and sets the arena field.
+    fn rename_insn(&mut self, id: InstructionId, name: Cow<'str, str>) -> crate::error::Result<()> {
+        let old = self.block.host_mut().instruction_mut(id).name.clone();
+        self.block.host_mut().register_local_name(
+            ValueId::Instruction(id),
+            name.clone(),
+            old.as_deref(),
+        )?;
+        self.block.host_mut().instruction_mut(id).name = Some(name);
+        Ok(())
     }
 
     /// Adds an instruction at the end of the working block.
@@ -363,11 +367,14 @@ impl<'str, 'ctx> Builder<'str, 'ctx> {
         }
 
         let func = self.block.id.func;
-        let id =
-            InstructionRef::from_mnemonic_with_type(self.context_mut(), func, mnemonic, type_id).id;
+        let insn = Instruction::new(type_id, mnemonic);
+        let id = self.block.host_mut().push_insn(func, insn);
 
         if let Some(address) = self.address {
-            Instruction::from_id_mut(self.context_mut(), id).set_address(address);
+            self.block
+                .host_mut()
+                .instruction_mut(id)
+                .set_address(address);
         }
 
         match self.insert_point {
@@ -378,11 +385,37 @@ impl<'str, 'ctx> Builder<'str, 'ctx> {
             }
         }
 
-        self.context().get_insn(id)
+        InstructionRef::new(self.block.host_ref().read_host(), id)
     }
 
     fn get_value(&self, id: ValueId) -> ValueRef<'str, '_> {
-        ValueRef::from_id(self.context(), id)
+        // Route through the host's read view so a checked-out builder resolves its
+        // own function's SSA values (which live in the owned function, not the
+        // shared context) correctly.
+        ValueRef::from_host(self.block.host_ref().read_host(), id)
+    }
+
+    /// The result type of `id`, host-routed (mirror of [`Context::type_of`]): a
+    /// checked-out function's instruction/param types live in the owned arena.
+    fn type_of(&mut self, id: ValueId) -> TypeId {
+        match id {
+            ValueId::Instruction(iid) => self.block.host_ref().read_host().instruction(iid).type_id,
+            ValueId::BlockParam(pid) => self.block.host_ref().read_host().block_param(pid).type_id,
+            other => self.block.host_mut().shared_mut().type_of(other),
+        }
+    }
+
+    /// The stored type of `id`, host-routed (mirror of [`Context::stored_type_of`]).
+    fn stored_type_of(&self, id: ValueId) -> Option<TypeId> {
+        match id {
+            ValueId::Instruction(iid) => {
+                Some(self.block.host_ref().read_host().instruction(iid).type_id)
+            }
+            ValueId::BlockParam(pid) => {
+                Some(self.block.host_ref().read_host().block_param(pid).type_id)
+            }
+            other => self.block.host_ref().shared().stored_type_of(other),
+        }
     }
 
     /// The common address-space provenance of two pointer-arithmetic operands.
@@ -392,8 +425,8 @@ impl<'str, 'ctx> Builder<'str, 'ctx> {
     /// two disagree or neither has a space.
     fn merge_space_ids(&self, lhs: ValueId, rhs: ValueId) -> Option<SpaceId> {
         match (
-            ValueRef::from_id(self.context(), lhs).space().map(|s| s.id),
-            ValueRef::from_id(self.context(), rhs).space().map(|s| s.id),
+            self.get_value(lhs).space().map(|s| s.id),
+            self.get_value(rhs).space().map(|s| s.id),
         ) {
             (Some(lhs), Some(rhs)) if lhs == rhs => Some(lhs),
             (Some(space), None) | (None, Some(space)) => Some(space),
@@ -417,56 +450,37 @@ impl<'str, 'ctx> Builder<'str, 'ctx> {
         self.context_mut().get_const(literal.value, size).id()
     }
 
-    fn ensure_created_block_in_function(&mut self, block: BlockId) {
-        if let Some(mut function) = self.block.parent_mut() {
-            function.add_block(block);
-        }
-    }
-
-    /// Gets or creates a block for a given address
-    pub fn get_or_make_block(&mut self, addr: u64) -> BlockId {
-        let func = self.block.id.func;
-        let id = self.context_mut().get_or_make_block(addr, func);
-
-        if BasicBlock::from_id(self.context(), id).parent().is_none() {
-            self.ensure_created_block_in_function(id);
-        }
-
-        id
-    }
-
     pub fn get_or_make_local_label(&mut self, name: Cow<'str, str>) -> BlockId {
         if let Some(&id) = self.local_labels.get(name.as_ref()) {
-            id
-        } else {
-            // SLEIGH pcode label names (e.g. `start`, `end`) are only unique
-            // within a single instruction's lowering, but block names are
-            // context-global. Deduplicate with a numeric suffix so the same
-            // label appearing in different instructions/functions doesn't
-            // collide. The `local_labels` map stays keyed by the original name
-            // so within-instruction references still resolve to this block.
-            let func = self.block.id.func;
-            let unique_name = self.context_mut().get_unique_name_in(func, name.clone());
-            let id = BasicBlock::make(self.context_mut(), func)
-                .with_name(unique_name)
-                .expect("name was deduplicated")
-                .id;
-            self.local_labels.insert(name, id);
-            self.ensure_created_block_in_function(id);
-            id
+            return id;
         }
-    }
-
-    /// Gets or creates a function whose root is the local label block for `name`.
-    pub fn get_or_make_local_function(&mut self, name: Cow<'str, str>) -> FunctionId {
-        let existing = Function::from_name(self.context(), &name).map(|f| f.id);
-        if let Some(fid) = existing {
-            fid
-        } else {
-            Function::make(self.context_mut(), name)
-                .expect("Name was checked above")
-                .id
-        }
+        // SLEIGH pcode label names (e.g. `start`, `end`) are only unique within a
+        // single instruction's lowering, but block names are function-scoped.
+        // Deduplicate with a numeric suffix; the `local_labels` map stays keyed by
+        // the original name so within-instruction references still resolve here.
+        // Routed through the host so a checked-out builder mints the block into its
+        // owned function's arena (and registers the name in that function's table).
+        let func = self.block.id.func;
+        let unique_name = self
+            .block
+            .host_mut()
+            .function_mut(func)
+            .names
+            .unique(name.clone());
+        let id = self
+            .block
+            .host_mut()
+            .push_block(func, BasicBlock::detached(func));
+        self.block
+            .host_mut()
+            .register_local_name(ValueId::BasicBlock(id), unique_name.clone(), None)
+            .expect("name was deduplicated");
+        self.block
+            .host_mut()
+            .block_mut(id)
+            .set_name(Some(unique_name));
+        self.local_labels.insert(name, id);
+        id
     }
 
     pub fn make_temp(&mut self, size: usize) -> VarnodeId {
@@ -502,22 +516,6 @@ impl<'str, 'ctx> Builder<'str, 'ctx> {
         let id = Varnode::make(self.context_mut(), 0, size, space).id;
         Varnode::from_id_mut(self.context_mut(), id).set_label(label);
         id
-    }
-
-    /// If this block is not terminated, add a jump to the given address as a terminator instruction.
-    /// The builder is now safe to drop without panicking, and the block is properly terminated.
-    /// Returns the instructions built by the builder.
-    pub fn finalize(mut self, addr: u64) {
-        if !self.block.is_terminated() {
-            let target = self.get_or_make_block(addr);
-
-            let branch = self.push_branch(target).id;
-
-            // Sets the address for the jump instruction
-            if let Some(addr) = self.address {
-                Instruction::from_id_mut(self.context_mut(), branch).set_address(addr);
-            }
-        }
     }
 
     /// Ensures an operand is not a varnode.
@@ -602,8 +600,7 @@ impl<'str, 'ctx> Builder<'str, 'ctx> {
                 }
 
                 ValueId::Instruction(id) => {
-                    let mut insn = Instruction::from_id_mut(self.context_mut(), id);
-                    insn.set_space(space);
+                    self.set_insn_space(id, space);
                 }
 
                 _ => {}
@@ -628,15 +625,14 @@ impl<'str, 'ctx> Builder<'str, 'ctx> {
             !src.is_varnode(),
             "push_unop: varnode operand is not allowed; use ensure_local or &name addressof syntax"
         );
-        let size = ValueRef::new(src, self.context()).size();
+        let size = self.get_value(src).size();
         self.push_instruction(Mnemonic::Unop(Unary { op, src }), size)
     }
 
     /// Logical NOT of a `bool` value, canonically `src == false`.
     pub fn push_bool_not(&mut self, src: ValueId) -> InstructionRef<'str, '_> {
         debug_assert!(
-            self.context()
-                .stored_type_of(src)
+            self.stored_type_of(src)
                 .is_some_and(|t| self.context().types.is_bool(t)),
             "push_bool_not: operand must be bool-typed"
         );
@@ -666,8 +662,8 @@ impl<'str, 'ctx> Builder<'str, 'ctx> {
         rhs: ValueId,
         size: Option<usize>,
     ) -> InstructionRef<'str, '_> {
-        let lhs_size = ValueRef::new(lhs, self.context()).size();
-        let rhs_size = ValueRef::new(rhs, self.context()).size();
+        let lhs_size = self.get_value(lhs).size();
+        let rhs_size = self.get_value(rhs).size();
         let operand_size = match (
             lhs_size == rhs_size,
             self.is_literal(lhs),
@@ -685,17 +681,18 @@ impl<'str, 'ctx> Builder<'str, 'ctx> {
         let lhs = self.coerce_literal_size(lhs, operand_size);
         let rhs = self.coerce_literal_size(rhs, operand_size);
         assert_eq!(
-            ValueRef::new(lhs, self.context()).size(),
-            ValueRef::new(rhs, self.context()).size(),
+            self.get_value(lhs).size(),
+            self.get_value(rhs).size(),
             "push_binop: operands must have equal size; emit an explicit cast first"
         );
 
         // Determine result type using the TypeManager's arithmetic rules.
         let result_type = {
-            let ctx = self.context_mut();
-            let lhs_type = ctx.type_of(lhs);
-            let rhs_type = ctx.type_of(rhs);
-            ctx.types.binop_result(lhs_type, op, rhs_type)
+            let lhs_type = self.type_of(lhs);
+            let rhs_type = self.type_of(rhs);
+            self.context_mut()
+                .types
+                .binop_result(lhs_type, op, rhs_type)
         };
 
         // Comparisons always override the result size to 1.
@@ -865,8 +862,7 @@ impl<'str, 'ctx> Builder<'str, 'ctx> {
     /// Whether both operands carry the `bool` type (a `debug_assert` guard).
     fn both_bool(&self, lhs: ValueId, rhs: ValueId) -> bool {
         let is_bool = |v: ValueId| {
-            self.context()
-                .stored_type_of(v)
+            self.stored_type_of(v)
                 .is_some_and(|t| self.context().types.is_bool(t))
         };
         is_bool(lhs) && is_bool(rhs)
@@ -960,10 +956,7 @@ impl<'str, 'ctx> Builder<'str, 'ctx> {
 
     /// Builds an aggregate value from ordered named fields.
     pub fn push_named_tuple(&mut self, fields: Vec<(String, ValueId)>) -> InstructionRef<'str, '_> {
-        let field_types: Vec<TypeId> = fields
-            .iter()
-            .map(|(_, f)| self.context_mut().type_of(*f))
-            .collect();
+        let field_types: Vec<TypeId> = fields.iter().map(|(_, f)| self.type_of(*f)).collect();
         let aggregate_fields = fields
             .iter()
             .zip(field_types)
@@ -980,7 +973,7 @@ impl<'str, 'ctx> Builder<'str, 'ctx> {
     /// Projects field `index` out of the aggregate value `agg`. The result type
     /// is that field's type. Panics if `agg` is not an aggregate with that field.
     pub fn push_extract(&mut self, agg: ValueId, index: usize) -> InstructionRef<'str, '_> {
-        let agg_ty = self.context_mut().type_of(agg);
+        let agg_ty = self.type_of(agg);
         let ty = self
             .context()
             .types
@@ -1007,7 +1000,7 @@ impl<'str, 'ctx> Builder<'str, 'ctx> {
         src: ValueId,
         captures: Vec<ValueId>,
     ) -> InstructionRef<'str, '_> {
-        let src_ty = self.context_mut().type_of(src);
+        let src_ty = self.type_of(src);
         // `map` preserves the source's sequence kind: an array maps to an array,
         // a list (e.g. `take_while`'s result) maps to a list of the same bound.
         let seq = self.context().types.seq_of(src_ty);
@@ -1046,7 +1039,7 @@ impl<'str, 'ctx> Builder<'str, 'ctx> {
         src: ValueId,
         captures: Vec<ValueId>,
     ) -> InstructionRef<'str, '_> {
-        let src_ty = self.context_mut().type_of(src);
+        let src_ty = self.type_of(src);
         // Like `map`, a scan preserves the source's sequence kind and takes its
         // element type from the body's return type (the accumulator type).
         let seq = self.context().types.seq_of(src_ty);
@@ -1078,7 +1071,7 @@ impl<'str, 'ctx> Builder<'str, 'ctx> {
     ) -> InstructionRef<'str, '_> {
         let ty = self.lambda_return_type(target).unwrap_or_else(|| {
             args.first()
-                .map(|&arg| self.context_mut().type_of(arg))
+                .map(|&arg| self.type_of(arg))
                 .unwrap_or_else(|| self.context_mut().types.get_or_make_int(0))
         });
         self.push_instruction_with_type(Mnemonic::Apply(Apply { target, args }), ty)
@@ -1091,7 +1084,7 @@ impl<'str, 'ctx> Builder<'str, 'ctx> {
         BasicBlock::from_id(self.context(), root)
             .iter()
             .find_map(|i| match i.mnemonic() {
-                Mnemonic::Return(r) => r.value.and_then(|v| self.context().stored_type_of(v)),
+                Mnemonic::Return(r) => r.value.and_then(|v| self.stored_type_of(v)),
                 _ => None,
             })
     }
@@ -1102,7 +1095,7 @@ impl<'str, 'ctx> Builder<'str, 'ctx> {
             .iter()
             .flat_map(|block| block.iter())
             .find_map(|i| match i.mnemonic() {
-                Mnemonic::ReturnValue(r) => self.context().stored_type_of(r.value),
+                Mnemonic::ReturnValue(r) => self.stored_type_of(r.value),
                 _ => None,
             })
     }
@@ -1113,7 +1106,7 @@ impl<'str, 'ctx> Builder<'str, 'ctx> {
     /// pointee has a field at exactly `offset`. The result type is a pointer
     /// (same width as `base`) to that field's type. Panics otherwise.
     pub fn push_gep(&mut self, base: ValueId, offset: usize) -> InstructionRef<'str, '_> {
-        let base_ty = self.context_mut().type_of(base);
+        let base_ty = self.type_of(base);
         let types = &self.context().types;
         let ptr_width = types.size_of(base_ty);
         let pointee = types
@@ -1134,7 +1127,7 @@ impl<'str, 'ctx> Builder<'str, 'ctx> {
     /// resolving it to a byte offset via the pointee struct of `base`. Panics if
     /// `base` is not a struct pointer or has no field of that name.
     pub fn push_gep_field(&mut self, base: ValueId, name: &str) -> InstructionRef<'str, '_> {
-        let base_ty = self.context_mut().type_of(base);
+        let base_ty = self.type_of(base);
         let types = &self.context().types;
         let pointee = types
             .pointee_of(base_ty)
@@ -1232,7 +1225,7 @@ impl<'str, 'ctx> Builder<'str, 'ctx> {
 
         let arg_types = args
             .iter()
-            .map(|&arg| self.context_mut().type_of(arg))
+            .map(|&arg| self.type_of(arg))
             .collect::<Vec<_>>();
         let type_id = desc.result_type(&mut self.context_mut().types, &arg_types);
 
@@ -1287,7 +1280,7 @@ impl<'str, 'ctx> Builder<'str, 'ctx> {
 
                 if let Some(name) = Varnode::from_id(self.context(), dst).name() {
                     let name = Cow::Owned(format!("{}_lane{lane}", name.to_lowercase()));
-                    let _ = Instruction::from_id_mut(self.context_mut(), id).rename(name);
+                    let _ = self.rename_insn(id, name);
                 }
 
                 first_id.get_or_insert(id);
@@ -1317,8 +1310,7 @@ impl<'str, 'ctx> Builder<'str, 'ctx> {
                 let name = self
                     .context_mut()
                     .get_unique_name_in(func, Cow::Owned(lowered));
-                Instruction::from_id_mut(self.context_mut(), id)
-                    .rename(name)
+                self.rename_insn(id, name)
                     .expect("This name was deduplicated");
             }
 
@@ -1334,7 +1326,7 @@ impl<'str, 'ctx> Builder<'str, 'ctx> {
         space: SpaceId,
     ) -> InstructionRef<'str, '_> {
         let src = self.ensure_local(src);
-        let size = ValueRef::new(src, self.context()).size();
+        let size = self.get_value(src).size();
 
         match ptr {
             ValueId::Varnode(id) => {
@@ -1350,8 +1342,7 @@ impl<'str, 'ctx> Builder<'str, 'ctx> {
             }
 
             ValueId::Instruction(id) => {
-                let mut insn = Instruction::from_id_mut(self.context_mut(), id);
-                insn.set_space(space);
+                self.set_insn_space(id, space);
             }
 
             _ => {}
@@ -1372,12 +1363,6 @@ impl<'str, 'ctx> Builder<'str, 'ctx> {
 
     /// Declares a new parameter on the current block.
     ///
-    /// Returns a mutable reference whose `ValueId` can be used as an operand in
-    /// subsequent instructions. Parameters are NOT part of the instruction list.
-    pub fn push_param(&mut self, size: usize) -> BlockParamMutRef<'str, '_> {
-        self.block.push_param(size)
-    }
-
     /// Terminates this block with an unconditional jump to the given target block.
     /// The builder is now safe to drop without panicking, and the block is properly terminated.
     pub fn push_branch(&mut self, target: BlockId) -> InstructionRef<'str, '_> {
@@ -1391,7 +1376,7 @@ impl<'str, 'ctx> Builder<'str, 'ctx> {
         args: Vec<ValueId>,
     ) -> InstructionRef<'str, '_> {
         let current = self.block.id;
-        self.context_mut().add_cfg_edge(current, target);
+        self.block.host_mut().add_cfg_edge(current, target);
         let id = self
             .push_instruction(Mnemonic::Branch(Branch { target, args }), 0)
             .id;
@@ -1422,8 +1407,8 @@ impl<'str, 'ctx> Builder<'str, 'ctx> {
             "push_cbranch: varnode condition not allowed; load the value first"
         );
         let current = self.block.id;
-        self.context_mut().add_cfg_edge(current, target);
-        self.context_mut().add_cfg_edge(current, fallthrough);
+        self.block.host_mut().add_cfg_edge(current, target);
+        self.block.host_mut().add_cfg_edge(current, fallthrough);
         let id = self
             .push_instruction(
                 Mnemonic::CBranch(CBranch {
@@ -1523,7 +1508,78 @@ impl<'str, 'ctx> Builder<'str, 'ctx> {
     }
 }
 
-impl Drop for Builder<'_, '_> {
+/// Module-path-only constructors and helpers: these mint whole functions or look
+/// up/create blocks by machine address in the module registry, which only makes
+/// sense over a `&mut Context`. A checked-out builder appends into an existing
+/// owned block and mints owned blocks via [`Builder::get_or_make_local_label`].
+impl<'str, 'ctx> Builder<'str, 'ctx, &'ctx mut Context<'str>> {
+    /// Creates a builder positioned at the block for machine `address`, creating
+    /// the block (and an anonymous host function if nothing is mapped) if needed.
+    pub fn from_context<'m>(ctx: &'m mut Context<'str>, address: u64) -> Builder<'str, 'm> {
+        let block_id = match BasicBlock::from_addr(ctx, address) {
+            Some(block) => block.id,
+            None => {
+                let func = Function::make(ctx, Cow::Owned(format!("blk_{address:x}")))
+                    .expect("anon host function")
+                    .id;
+                ctx.get_or_make_block(address, func)
+            }
+        };
+        let mut builder = Builder::from_block(BasicBlock::from_id_mut(ctx, block_id));
+        builder.set_address(address);
+        builder
+    }
+
+    fn ensure_created_block_in_function(&mut self, block: BlockId) {
+        if let Some(mut function) = self.block.parent_mut() {
+            function.add_block(block);
+        }
+    }
+
+    /// Gets or creates a block for a given machine address.
+    pub fn get_or_make_block(&mut self, addr: u64) -> BlockId {
+        let func = self.block.id.func;
+        let id = self.context_mut().get_or_make_block(addr, func);
+
+        if BasicBlock::from_id(self.context(), id).parent().is_none() {
+            self.ensure_created_block_in_function(id);
+        }
+
+        id
+    }
+
+    /// Gets or creates a function whose root is the local label block for `name`.
+    pub fn get_or_make_local_function(&mut self, name: Cow<'str, str>) -> FunctionId {
+        let existing = Function::from_name(self.context(), &name).map(|f| f.id);
+        if let Some(fid) = existing {
+            fid
+        } else {
+            Function::make(self.context_mut(), name)
+                .expect("Name was checked above")
+                .id
+        }
+    }
+
+    /// Declares a new parameter on the current block. Returns a mutable reference
+    /// whose `ValueId` can be used as an operand.
+    pub fn push_param(&mut self, size: usize) -> BlockParamMutRef<'str, '_> {
+        self.block.push_param(size)
+    }
+
+    /// If this block is not terminated, add a jump to the given address as a
+    /// terminator instruction; the builder is then safe to drop.
+    pub fn finalize(mut self, addr: u64) {
+        if !self.block.is_terminated() {
+            let target = self.get_or_make_block(addr);
+            let branch = self.push_branch(target).id;
+            if let Some(addr) = self.address {
+                Instruction::from_id_mut(self.context_mut(), branch).set_address(addr);
+            }
+        }
+    }
+}
+
+impl<'str, 'ctx, Ctx: HostMut<'str>> Drop for Builder<'str, 'ctx, Ctx> {
     fn drop(&mut self) {
         if std::thread::panicking() {
             return;
@@ -1548,6 +1604,87 @@ mod tests {
 
     use super::*;
     use crate::context::Context;
+
+    #[test]
+    fn checked_builder_matches_module_builder() {
+        use crate::value::{
+            FunctionId, FunctionRef, block::BasicBlock, function::Function,
+            util::host_mut::CheckedOut,
+        };
+
+        // The same body over any host: temp + const, a couple of binops, a load
+        // from a temp pointer, then a branch to a freshly minted local-label block.
+        fn body<'str, 'ctx, Ctx: HostMut<'str>>(b: &mut Builder<'str, 'ctx, Ctx>) {
+            let c1 = b.context_mut().get_const(7, 8).id();
+            let c2 = b.context_mut().get_const(9, 8).id();
+            let sum = b.push_add(c1, c2).id();
+            let _doubled = b.push_add(sum, sum).id();
+            let ptr = b.make_temp(8);
+            let space = Varnode::from_id(b.context(), ptr).space().id;
+            let _loaded = b.push_load::<false>(ValueId::Varnode(ptr), 8, space).id();
+            let lbl = b.get_or_make_local_label("next".into());
+            b.push_branch(lbl);
+        }
+
+        // Structural snapshot: per block (name, per-instruction mnemonic Debug —
+        // which includes the operand ids — and sorted successor block names).
+        type BSnap = Vec<(String, Vec<String>, Vec<String>)>;
+        fn snap(ctx: &Context, fid: FunctionId) -> BSnap {
+            FunctionRef::from_id(ctx, fid)
+                .blocks()
+                .map(|blk| {
+                    let name = blk.name().unwrap_or("?").to_string();
+                    let insns: Vec<String> = blk
+                        .instructions()
+                        .map(|i| format!("{:?}", i.mnemonic()))
+                        .collect();
+                    let mut succ: Vec<String> = blk
+                        .successors()
+                        .map(|(_, s)| {
+                            BasicBlock::from_id(ctx, s)
+                                .name()
+                                .unwrap_or("?")
+                                .to_string()
+                        })
+                        .collect();
+                    succ.sort();
+                    (name, insns, succ)
+                })
+                .collect()
+        }
+
+        // ---- (a) module builder ---------------------------------------------
+        let mut ctx_a = Context::new();
+        let fid_a = Function::make(&mut ctx_a, "foo".into()).unwrap().id;
+        let entry_a = Function::from_id_mut(&mut ctx_a, fid_a).make_root().id;
+        {
+            let mut b = Builder::from_block(BasicBlock::from_id_mut(&mut ctx_a, entry_a));
+            body(&mut b);
+        }
+        let snap_a = snap(&ctx_a, fid_a);
+        assert!(
+            snap_a.iter().any(|(_, i, _)| !i.is_empty()),
+            "sanity: built IR"
+        );
+
+        // ---- (b) checked-out builder ----------------------------------------
+        let mut ctx_b = Context::new();
+        let fid_b = Function::make(&mut ctx_b, "foo".into()).unwrap().id;
+        let entry_b = Function::from_id_mut(&mut ctx_b, fid_b).make_root().id;
+        let mut fun = ctx_b.checkout_function(fid_b);
+        {
+            let mut host = CheckedOut::new(&mut fun, fid_b, &mut ctx_b);
+            let mut b = Builder::from_block(BaseRef::new(host.reborrow(), entry_b));
+            body(&mut b);
+        }
+        ctx_b.checkin_function(fid_b, fun);
+        let snap_b = snap(&ctx_b, fid_b);
+
+        assert_eq!(
+            snap_a, snap_b,
+            "a body built through a checked-out builder must match the module-built body"
+        );
+    }
 
     /// `map` preserves its source's sequence kind: mapping over a `List<T>`
     /// (e.g. a `take_while` result) yields a `List<U>`, not a fixed array.

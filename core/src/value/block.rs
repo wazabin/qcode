@@ -131,6 +131,24 @@ impl<'str> BasicBlock<'str> {
         BlockMutRef::new(ctx, id)
     }
 
+    /// Sets this block's name (crate-internal; the private `name` field is set
+    /// through the generic builder, which lives in another module). The caller is
+    /// responsible for registering the name in the owning function's name table.
+    pub(crate) fn set_name(&mut self, name: Option<Cow<'str, str>>) {
+        self.name = name;
+    }
+
+    /// A fresh, empty block value parented to `func` (crate-internal; the generic
+    /// builder pushes it into `func`'s arena via the mutation host). Mirrors the
+    /// literal in [`BasicBlock::make`], which can't be written outside this module
+    /// because some fields are private.
+    pub(crate) fn detached(func: FunctionId) -> Self {
+        BasicBlock {
+            parent: Some(func),
+            ..BasicBlock::default()
+        }
+    }
+
     /// Deep-clone the block at `orig` into a new block in the same context.
     /// Updates `value_map` with parameters and instructions remapping.
     pub fn clone_into_ctx(
@@ -424,21 +442,32 @@ impl<'str, 'ctx> IntoIterator for &BlockRef<'str, 'ctx> {
 
 pub type BlockMutRef<'str, 'ctx> = BaseRef<&'ctx mut Context<'str>, BlockId>;
 
-impl<'s, 'ctx: 's, 'str: 'ctx> WithCtx<'s, 's, 'str> for BlockMutRef<'str, 'ctx> {
-    fn ctx(&'s self) -> &'s Context<'str> {
-        self.ctx
-    }
-}
-
 impl<'s, 'ctx: 's, 'str: 'ctx> WithCtxMut<'s, 'str> for BlockMutRef<'str, 'ctx> {
     fn ctx_mut(&'s mut self) -> &'s mut Context<'str> {
         self.ctx
     }
 }
 
-impl<'s, 'ctx: 's, 'str: 'ctx> WithHost<'s, 's, 'str> for BlockMutRef<'str, 'ctx> {
+// Read access over any mutation host (covers `BlockMutRef` over `&mut Context` and
+// the checked-out block mut ref): shared reads via the host's shared context, the
+// read view via its `HostRef` so the arena cluster's read methods route correctly.
+impl<'s, 'str, Ctx> WithCtx<'s, 's, 'str> for BaseRef<Ctx, BlockId>
+where
+    Ctx: HostMut<'str>,
+    'str: 's,
+{
+    fn ctx(&'s self) -> &'s Context<'str> {
+        self.ctx.shared()
+    }
+}
+
+impl<'s, 'str, Ctx> WithHost<'s, 's, 'str> for BaseRef<Ctx, BlockId>
+where
+    Ctx: HostMut<'str>,
+    'str: 's,
+{
     fn host(&'s self) -> HostRef<'s, 'str> {
-        HostRef::Module(self.ctx)
+        self.ctx.read_host()
     }
 }
 
@@ -496,6 +525,28 @@ where
     /// Sets (or clears) this block's comment. Own-block edit, host-routed.
     pub fn set_comment(&mut self, comment: Option<String>) {
         self.ctx.block_mut(self.id).comment = comment;
+    }
+
+    fn insert_insn(&mut self, index: usize, insn_id: InstructionId) {
+        self.ctx.instruction_mut(insn_id).parent = Some(self.id);
+        self.ctx
+            .block_mut(self.id)
+            .instructions
+            .insert(index, insn_id);
+    }
+
+    /// Inserts an instruction at the given index, shifting later instructions
+    /// right. Panics if `index > len`.
+    pub fn insert_insn_at_index(&mut self, index: usize, insn_id: InstructionId) {
+        self.insert_insn(index, insn_id);
+    }
+
+    /// Pushes an instruction to the end of this block.
+    pub fn push_insn(&mut self, id: InstructionId) {
+        let len = self.ctx.function(self.id.func).blocks[self.id.local]
+            .instructions
+            .len();
+        self.insert_insn(len, id);
     }
 }
 
@@ -585,25 +636,6 @@ impl<'str, 'ctx> BlockMutRef<'str, 'ctx> {
         self.inner_mut().params.push(id);
     }
 
-    fn insert_insn(&mut self, index: usize, insn_id: InstructionId) {
-        Instruction::from_id_mut(self.ctx, insn_id)
-            .inner_mut()
-            .parent = Some(self.id);
-
-        self.inner_mut().instructions.insert(index, insn_id);
-    }
-
-    /// Inserts an instruction at the start of this block, before all existing instructions.
-    pub fn insert_insn_at_start(&mut self, insn_id: InstructionId) {
-        self.insert_insn(0, insn_id);
-    }
-
-    /// Inserts an instruction at the given index, shifting later instructions right.
-    /// Panics if `index > len`.
-    pub fn insert_insn_at_index(&mut self, index: usize, insn_id: InstructionId) {
-        self.insert_insn(index, insn_id);
-    }
-
     /// Inserts an instruction before the instruction identified by `before_id` in this block.
     /// Panics if `before_id` is not an instruction in this block.
     pub fn insert_insn_before(&mut self, before_id: InstructionId, insn_id: InstructionId) {
@@ -626,11 +658,6 @@ impl<'str, 'ctx> BlockMutRef<'str, 'ctx> {
             .position(|&id| id == after_id)
             .expect("after_id not found in block");
         self.insert_insn(index + 1, insn_id);
-    }
-
-    /// Pushes an instruction to the end of this block.
-    pub fn push_insn(&mut self, id: InstructionId) {
-        self.insert_insn(self.inner().instructions.len(), id);
     }
 
     /// Retains only the instructions for which `f` returns true, deleting the

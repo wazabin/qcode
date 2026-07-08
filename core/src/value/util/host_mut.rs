@@ -116,6 +116,42 @@ pub trait HostMut<'str> {
         EdgeId::new(func, local)
     }
 
+    /// Push a fresh instruction into `func`'s arena, recording each operand's use
+    /// in that function's reverse-use map and (for a direct call) the call-site
+    /// cache. Mirrors [`crate::value::registry::ValueRegistry::push_insn`].
+    fn push_insn(&mut self, func: FunctionId, insn: Instruction<'str>) -> InstructionId {
+        let args: Vec<ValueId> = insn.mnemonic().args().into_iter().collect();
+        let call_target = insn.mnemonic().call_target();
+        let local = self.function_mut(func).insns.push(insn);
+        let id = InstructionId::new(func, local);
+        for arg in args {
+            self.function_mut(func)
+                .users
+                .entry(arg)
+                .or_default()
+                .push(id);
+        }
+        if let Some(target) = call_target {
+            self.record_call_site(target, id);
+        }
+        id
+    }
+
+    /// Push a fresh block into `func`'s arena and onto its ownership roster.
+    /// Mirrors [`crate::value::registry::ValueRegistry::push_block`].
+    fn push_block(&mut self, func: FunctionId, block: BasicBlock<'str>) -> BlockId {
+        let local = self.function_mut(func).blocks.push(block);
+        let id = BlockId::new(func, local);
+        self.function_mut(func).roster.push(id);
+        id
+    }
+
+    /// Push a fresh block parameter into `func`'s arena.
+    fn push_block_param(&mut self, func: FunctionId, param: BlockParam<'str>) -> BlockParamId {
+        let local = self.function_mut(func).params.push(param);
+        BlockParamId::new(func, local)
+    }
+
     // ---- CFG / use-map verbs (mirror the `Context` inherent methods) ---------
 
     /// Adds a directed CFG edge `from -> to`, stored in `from`'s edge arena and

@@ -114,6 +114,12 @@ impl<'str> Instruction<'str> {
         &mut self.mnemonic
     }
 
+    /// Sets this instruction's machine address (crate-internal; used by the
+    /// generic builder, which routes through the mutation host).
+    pub(crate) fn set_address(&mut self, address: u64) {
+        self.address = Some(address);
+    }
+
     /// Whether this instruction has been logically deleted (tombstoned). A deleted
     /// instruction is no longer part of the program: it is skipped by
     /// [`Context::instructions`] and must not be treated as live.
