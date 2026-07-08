@@ -108,6 +108,12 @@ impl<'str> Instruction<'str> {
         &self.mnemonic
     }
 
+    /// Mutable access to this instruction's mnemonic (crate-internal; used by the
+    /// generic mutation host to rewrite operands).
+    pub(crate) fn mnemonic_mut(&mut self) -> &mut Mnemonic {
+        &mut self.mnemonic
+    }
+
     /// Whether this instruction has been logically deleted (tombstoned). A deleted
     /// instruction is no longer part of the program: it is skipped by
     /// [`Context::instructions`] and must not be treated as live.

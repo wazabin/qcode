@@ -8,6 +8,7 @@ use crate::{
         insn::{InstructionId, InstructionRef},
         util::{
             base_ref::{BaseRef, HostRef, WithCtx, WithCtxMut, WithHost},
+            host_mut::{CheckedOut, HostMut},
             named::{Named, Renameable, update_context_name},
         },
     },
@@ -463,6 +464,41 @@ impl<'str, 'ctx> Renameable<'str, 'ctx> for BlockMutRef<'str, 'ctx> {
     }
 }
 
+// Naming/renaming a block through a checked-out host (concrete: a generic
+// `Ctx: HostMut` can't prove `'str` outlives the returned `&str`). Block names are
+// function-local, so this reads/writes the owned function's arena directly.
+impl<'a, 'str> Named for BaseRef<CheckedOut<'a, 'str>, BlockId> {
+    fn name(&self) -> Option<&str> {
+        self.ctx.fun.blocks[self.id.local].name.as_deref()
+    }
+}
+
+impl<'a, 'str> Renameable<'str, 'a> for BaseRef<CheckedOut<'a, 'str>, BlockId> {
+    fn rename(&mut self, name: Cow<'str, str>) -> Result<()> {
+        let id = self.id.into();
+        let old_name = self.ctx.fun.blocks[self.id.local]
+            .name
+            .as_deref()
+            .map(str::to_owned);
+        self.ctx
+            .register_local_name(id, name.clone(), old_name.as_deref())?;
+        self.ctx.block_mut(self.id).name = Some(name);
+        Ok(())
+    }
+}
+
+// Comment editing has no borrowed-lifetime subtlety, so it is written once over
+// any mutation host.
+impl<'str, Ctx> BaseRef<Ctx, BlockId>
+where
+    Ctx: HostMut<'str>,
+{
+    /// Sets (or clears) this block's comment. Own-block edit, host-routed.
+    pub fn set_comment(&mut self, comment: Option<String>) {
+        self.ctx.block_mut(self.id).comment = comment;
+    }
+}
+
 impl Display for BlockMutRef<'_, '_> {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         self.fmt(f)
@@ -518,10 +554,6 @@ impl<'str, 'ctx> BlockMutRef<'str, 'ctx> {
 
     pub fn as_ref(&self) -> BlockRef<'str, '_> {
         BlockRef::new(HostRef::Module(self.ctx), self.id)
-    }
-
-    pub fn set_comment(&mut self, comment: Option<String>) {
-        self.inner_mut().comment = comment;
     }
 
     /// Declares a new parameter on this block with the given size in bytes.

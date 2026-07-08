@@ -7,6 +7,7 @@ use crate::{
         block::{BlockId, BlockRef},
         util::{
             base_ref::{BaseRef, HostRef, WithCtx, WithCtxMut, WithHost},
+            host_mut::HostMut,
             named::{Named, Renameable, update_context_name},
         },
     },
@@ -217,11 +218,6 @@ impl<'str, 'ctx> BlockParamMutRef<'str, 'ctx> {
         self.ctx.values.block_param_mut(self.id)
     }
 
-    pub fn set_size(&mut self, size: usize) {
-        let type_id = self.ctx.types.get_or_make_int(size);
-        self.inner_mut().type_id = type_id;
-    }
-
     /// Record the source value this param promotes (see [`BlockParam::origin`]).
     pub fn set_origin(&mut self, origin: ValueId) {
         self.inner_mut().origin = Some(origin);
@@ -242,6 +238,20 @@ impl<'str, 'ctx> BlockParamMutRef<'str, 'ctx> {
 
     pub fn as_ref(&self) -> BlockParamRef<'str, '_> {
         BlockParamRef::new(HostRef::Module(self.ctx), self.id)
+    }
+}
+
+// Resizing a block parameter is the same over any mutation host (mint an int type
+// in shared storage, retype the param in its owning function's arena), so it is
+// written once against `HostMut` — covering `BlockParamMutRef` and the checked-out
+// mut ref.
+impl<'str, Ctx> BaseRef<Ctx, BlockParamId>
+where
+    Ctx: HostMut<'str>,
+{
+    pub fn set_size(&mut self, size: usize) {
+        let type_id = self.ctx.shared_mut().types.get_or_make_int(size);
+        self.ctx.block_param_mut(self.id).type_id = type_id;
     }
 }
 

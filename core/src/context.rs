@@ -1372,6 +1372,120 @@ mod tests {
     }
 
     #[test]
+    fn checked_host_mut_matches_module_mut() {
+        use crate::value::{
+            BlockParam, FunctionId, FunctionRef, InstructionId, Renameable,
+            block::BlockId,
+            block_param::BlockParamId,
+            util::{
+                base_ref::BaseRef,
+                host_mut::{CheckedOut, HostMut},
+            },
+        };
+
+        fn build(mut ctx: &mut Context<'static>) -> (FunctionId, BlockId, BlockId, InstructionId) {
+            qcode!(
+                ctx,
+                "
+                varnode i64 x;
+                fn foo:
+                    <entry>
+                        %a = load(x:8, &x);
+                        %b = load(x:8, &x);
+                        goto <bb1>;
+                    <bb1>
+                        return at %a;
+                "
+            );
+            let fid = foo;
+            let entry = FunctionRef::from_id(ctx, fid).root().unwrap().id;
+            let bb1 = FunctionRef::from_id(ctx, fid)
+                .blocks()
+                .map(|b| b.id)
+                .find(|&b| b != entry)
+                .unwrap();
+            let insns = BasicBlock::from_id(ctx, entry).instruction_ids().to_vec();
+            (fid, entry, bb1, insns[0])
+        }
+
+        // Give `bb1` a parameter to resize; identical setup on both paths.
+        fn add_param(ctx: &mut Context<'static>, bb1: BlockId) -> BlockParamId {
+            BasicBlock::from_id_mut(ctx, bb1).push_param(8).id
+        }
+
+        // Structural snapshot: per block, (name, comment, param sizes, opcodes,
+        // sorted successor names).
+        type MSnap = Vec<(String, Option<String>, Vec<usize>, Vec<String>, Vec<String>)>;
+        fn snap(ctx: &Context, fid: FunctionId) -> MSnap {
+            FunctionRef::from_id(ctx, fid)
+                .blocks()
+                .map(|b| {
+                    let name = b.name().unwrap_or("?").to_string();
+                    let comment = b.comment().map(str::to_string);
+                    let params: Vec<usize> = b.params().map(|p| p.size()).collect();
+                    let ops: Vec<String> =
+                        b.instructions().map(|i| i.opcode().to_string()).collect();
+                    let mut succ: Vec<String> = b
+                        .successors()
+                        .map(|(_, s)| {
+                            BasicBlock::from_id(ctx, s)
+                                .name()
+                                .unwrap_or("?")
+                                .to_string()
+                        })
+                        .collect();
+                    succ.sort();
+                    (name, comment, params, ops, succ)
+                })
+                .collect()
+        }
+
+        // ---- (a) mutate on the module directly (the reference behaviour) ------
+        let mut ctx_a = Context::new();
+        let (fid, entry, bb1, a) = build(&mut ctx_a);
+        let param = add_param(&mut ctx_a, bb1);
+        let b = BasicBlock::from_id(&ctx_a, entry).instruction_ids()[1];
+        BasicBlock::from_id_mut(&mut ctx_a, entry).set_comment(Some("c".into()));
+        BasicBlock::from_id_mut(&mut ctx_a, entry)
+            .rename("start".into())
+            .unwrap();
+        let e = ctx_a.add_cfg_edge(entry, bb1);
+        ctx_a.remove_cfg_edge(e);
+        ctx_a.replace_all_uses_with(ValueId::Instruction(a), ValueId::Instruction(b));
+        ctx_a.remove_instruction(a);
+        BlockParam::from_id_mut(&mut ctx_a, param).set_size(4);
+        let snap_a = snap(&ctx_a, fid);
+
+        // ---- (b) the same mutations via a checked-out host -------------------
+        let mut ctx_b = Context::new();
+        let (fid_b, entry_b, bb1_b, a_b) = build(&mut ctx_b);
+        let param_b = add_param(&mut ctx_b, bb1_b);
+        let b_b = BasicBlock::from_id(&ctx_b, entry_b).instruction_ids()[1];
+
+        let mut fun = ctx_b.checkout_function(fid_b);
+        {
+            let mut host = CheckedOut::new(&mut fun, fid_b, &mut ctx_b);
+            let mut r = BaseRef::new(host.reborrow(), entry_b);
+            r.set_comment(Some("c".into()));
+            let mut r = BaseRef::new(host.reborrow(), entry_b);
+            r.rename("start".into()).unwrap();
+            let e = host.add_cfg_edge(entry_b, bb1_b);
+            host.remove_cfg_edge(e);
+            host.replace_all_uses_with(ValueId::Instruction(a_b), ValueId::Instruction(b_b));
+            host.remove_instruction(a_b);
+            let mut r = BaseRef::new(host.reborrow(), param_b);
+            r.set_size(4);
+        }
+        ctx_b.checkin_function(fid_b, fun);
+        let snap_b = snap(&ctx_b, fid_b);
+
+        assert_eq!(
+            snap_a, snap_b,
+            "mutations through a checked-out host must match the module-path mutations"
+        );
+    }
+
+    #[test]
     fn into_iterator_for_context_matches_functions() {
         let mut ctx = Context::new();
         make_fn_with_blocks(&mut ctx, "f1", 1);
