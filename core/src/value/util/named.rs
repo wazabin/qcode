@@ -10,14 +10,15 @@ pub trait Named {
     fn name(&self) -> Option<&str>;
 }
 
-/// Attempts to set the name in the context reverse map
+/// Attempts to set the name in the reverse name table that owns `id`'s kind
+/// (function-local for block/instruction/param, global otherwise).
 pub fn update_context_name<'str>(
     id: ValueId,
     ctx: &mut Context<'str>,
     name: Cow<'str, str>,
     old_name: Option<&str>,
 ) -> Result<()> {
-    if let Some(existing_id) = ctx.get_named(&name) {
+    if let Some(existing_id) = ctx.get_named_in_scope(id, &name) {
         if existing_id != id {
             Err(Error::spanless(ErrorTy::DuplicateName(name.to_string())))
         } else {

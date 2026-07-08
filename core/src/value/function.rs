@@ -90,6 +90,15 @@ pub struct Function<'str> {
     #[serde(default)]
     pub kind: FunctionKind,
 
+    /// Function-local name table for this function's block, instruction, and
+    /// block-param names (ruling 1 of the parallel-passes plan). Keeping these
+    /// out of the global [`name_map`](crate::context::Context) lets two functions
+    /// name values independently — a prerequisite for parallel function passes.
+    /// A value's own `name` field is the source of truth for rendering; this only
+    /// enforces uniqueness and resolves names within the function.
+    #[serde(default)]
+    pub(crate) names: crate::context::NameTable<'str>,
+
     /// Reverse use-def map, scoped to this function: for each [`ValueId`] the
     /// list of *this function's* instructions that use it as an operand. By the
     /// SSA ownership invariant every user of an instruction/param value is
@@ -127,6 +136,7 @@ impl<'str> Function<'str> {
             is_external: false,
             signature: None,
             kind: FunctionKind::Machine,
+            names: crate::context::NameTable::default(),
             users: FxHashMap::default(),
         }
     }
@@ -289,6 +299,12 @@ where
     /// (see [`Function::user_map_entries`]).
     pub fn user_map_entries(&'s self) -> impl Iterator<Item = (ValueId, &'ctx [InstructionId])> {
         self.inner().user_map_entries()
+    }
+
+    /// Resolve a block/instruction/param `name` within this function's local name
+    /// table (see [`Function::names`]). `None` if this function has no such name.
+    pub fn local_named(&'s self, name: &str) -> Option<ValueId> {
+        self.inner().names.get(name)
     }
 
     /// Whether this function's full register effect is captured by its call

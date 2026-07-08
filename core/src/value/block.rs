@@ -80,9 +80,14 @@ impl<'str> BasicBlock<'str> {
         BlockMutRef::new(ctx, id)
     }
 
-    /// Gets a reference to a block by name
+    /// Gets a reference to a block by name. Block names are function-scoped, so
+    /// this scans every function's local name table and returns the first match
+    /// (names are unique within a function, not across the program). Prefer
+    /// [`FunctionRef::local_named`](crate::value::FunctionRef::local_named) when
+    /// the owning function is known.
     pub fn from_name<'ctx>(ctx: &'ctx Context<'str>, name: &str) -> Option<BlockRef<'str, 'ctx>> {
-        ctx.get_named(name)
+        ctx.functions()
+            .find_map(|f| f.local_named(name))
             .and_then(ValueId::as_block)
             .map(|id| BlockRef::new(ctx, id))
     }
@@ -139,7 +144,7 @@ impl<'str> BasicBlock<'str> {
             "clone_{:x}",
             ctx.values.block(orig).address.unwrap_or(0)
         ));
-        let unique_name = ctx.get_unique_name(name);
+        let unique_name = ctx.get_unique_name_in(new_block_id.func, name);
         BasicBlock::from_id_mut(ctx, new_block_id)
             .rename(unique_name)
             .expect("name was deduplicated");
@@ -746,12 +751,12 @@ impl<'str, 'ctx> BlockMutRef<'str, 'ctx> {
         self.ctx.set_address(addr, self.id.into())?;
 
         if self.name().is_none() {
-            // Block labels share the global name map with register varnodes, whose
-            // names are short mnemonics (`cf`, `sf`, `ax`, …). A block landing at a
-            // low address whose hex spells such a name (0xcf → "cf") would otherwise
-            // collide and panic through `with_address`. Disambiguate with a numeric
-            // suffix, keeping the bare-hex label for the overwhelmingly common case.
-            let label = self.ctx.get_unique_name(Cow::Owned(format!("{addr:x}")));
+            // Give the block a hex-address label, deduplicated within this
+            // function's own name table (block names are function-scoped) so it
+            // can't collide with another label this function already carries.
+            let label = self
+                .ctx
+                .get_unique_name_in(self.id.func, Cow::Owned(format!("{addr:x}")));
             self.rename(label)?;
         }
 

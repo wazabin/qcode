@@ -139,7 +139,9 @@ fn unique_name<'str>(ctx: &Context, value: ValueId, base: &str) -> Option<Cow<'s
         } else {
             format!("{base}{n}")
         };
-        match ctx.get_named(&candidate) {
+        // `value` is an SSA def (its name is function-scoped), so check the
+        // candidate for freedom in its owning function's table, not globally.
+        match ctx.get_named_in_scope(value, &candidate) {
             Some(owner) if owner == value => return None,
             Some(_) => continue,
             None => return Some(Cow::Owned(candidate)),
@@ -369,11 +371,13 @@ mod tests {
         run_function_pass::<StructTyping>(&mut ctx, f).unwrap();
 
         // The `Root*` value `%x` and the `Inner*` value `%y` are renamed after
-        // the structs they reference.
-        assert!(ctx.get_named("root").is_some());
-        assert!(ctx.get_named("inner").is_some());
-        assert!(ctx.get_named("x").is_none());
-        assert!(ctx.get_named("y").is_none());
+        // the structs they reference. Value names are function-scoped, so resolve
+        // them within `f`.
+        let f = qcode::value::FunctionRef::from_id(&ctx, f);
+        assert!(f.local_named("root").is_some());
+        assert!(f.local_named("inner").is_some());
+        assert!(f.local_named("x").is_none());
+        assert!(f.local_named("y").is_none());
     }
 
     #[test]

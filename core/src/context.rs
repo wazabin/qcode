@@ -63,18 +63,12 @@ pub struct Context<'str> {
     /// A mapping of names to spaces
     pub named_spaces: HashMap<Box<str>, SpaceId>,
 
-    /// Reverse mapping of name hints to value IDs, used to ensure that name hints are unique
-    name_map: HashMap<Cow<'str, str>, ValueId>,
-
-    /// Per-base "next suffix to try" hints for [`get_unique_name`], so suffix
-    /// probing resumes instead of rescanning from `0` on every call. Without it,
-    /// minting the thousands of like-named p-code temporaries the lifter emits is
-    /// O(n²) (each new `tmp` re-probes every prior `tmp_k`). Always only a lower
-    /// bound — every candidate is still confirmed free against `name_map` — and
-    /// corrected on removal, so the suffix chosen is identical to the naive
-    /// first-free scan. Derived cache: rides through `clone` but is not serialized.
-    #[serde(skip)]
-    suffix_hint: HashMap<String, u32>,
+    /// Global reverse name map for module-scoped values (functions, varnodes,
+    /// spaces, p-code ops, byte blobs), used to keep their name hints unique and
+    /// resolve them by name. Block/instruction/param names are **not** here — they
+    /// live in each [`Function`](crate::value::Function)'s own [`NameTable`], so
+    /// those namespaces stay independent across functions (see [`NameTable`]).
+    name_map: NameTable<'str>,
 
     /// Reverse mapping from addresses to value IDs
     address_map: HashMap<u64, ValueId>,
@@ -934,7 +928,8 @@ impl<'str> Context<'str> {
         self.values.instruction_mut(id).parent = None;
 
         if let Some(ref n) = name {
-            self.forget_name(n.as_ref());
+            // The instruction's name lives in its own function's name table.
+            self.values.functions[id.func].names.forget(n.as_ref());
         }
         self.values.instruction_mut(id).name = None;
 
@@ -973,19 +968,30 @@ impl<'str> Context<'str> {
         }
     }
 
-    /// Changes the name of a value
+    /// Changes the name of a value, in the name table that owns its kind
+    /// (function-local for block/instruction/param, global otherwise).
     pub fn update_name(
         &mut self,
         name: Cow<'str, str>,
         id: ValueId,
         old_name: Option<&str>,
     ) -> Result<()> {
-        if let Some(old_name) = old_name {
-            self.forget_name(old_name);
+        match id.name_scope_function() {
+            Some(func) => self.values.functions[func]
+                .names
+                .register(name, id, old_name),
+            None => self.name_map.register(name, id, old_name),
         }
-        match self.name_map.insert(name.clone(), id) {
-            Some(_) => Err(Error::spanless(ErrorTy::DuplicateName(name.to_string()))),
-            None => Ok(()),
+    }
+
+    /// Resolve `name` in the table that owns `id`'s kind (function-local for
+    /// block/instruction/param, global otherwise). Used by the rename path to
+    /// check for a conflict in the correct namespace, and by passes that mint a
+    /// unique name for a known SSA value.
+    pub fn get_named_in_scope(&self, id: ValueId, name: &str) -> Option<ValueId> {
+        match id.name_scope_function() {
+            Some(func) => self.values.functions[func].names.get(name),
+            None => self.name_map.get(name),
         }
     }
 
@@ -993,20 +999,12 @@ impl<'str> Context<'str> {
     /// hint exact: if `name` is a generated `base_<n>` suffix, lower `base`'s hint
     /// so the freed suffix is reconsidered on the next call (a naive first-free
     /// scan would reuse it, and the hint must not skip it). Un-suffixed names are
-    /// tried before any suffix, so freeing one needs no hint adjustment.
-    fn forget_name(&mut self, name: &str) {
-        self.name_map.remove(name);
-        if let Some((base, suffix)) = split_generated_suffix(name)
-            && let Some(hint) = self.suffix_hint.get_mut(base)
-        {
-            *hint = (*hint).min(suffix);
-        }
-    }
-
-    /// Attempts to get a value ID by its name.
-    /// Returns `None` if no value with the given name exists.
+    /// Attempts to get a value ID by its *global* name (function/varnode/space/
+    /// p-code/bytes). Block/instruction/param names are function-scoped and are
+    /// resolved through their owning [`Function`] (see [`NameTable`]); this
+    /// returns `None` for them.
     pub fn get_named(&self, name: &str) -> Option<ValueId> {
-        self.name_map.get(name).copied()
+        self.name_map.get(name)
     }
 
     /// Gets a value ID at a given address
@@ -1014,30 +1012,98 @@ impl<'str> Context<'str> {
         self.address_map.get(addr).copied()
     }
 
-    /// Gets a unique name for a value, generating one
-    /// if necessary by appending a numeric suffix to the provided name
-    /// until an unused name is found.
+    /// Gets a unique **global** name (functions, varnodes, spaces, …), appending
+    /// a numeric suffix until free. For a block/instruction/param name, use
+    /// [`get_unique_name_in`](Self::get_unique_name_in) so uniqueness is checked
+    /// against the owning function's table.
     pub fn get_unique_name(&mut self, name: Cow<'str, str>) -> Cow<'str, str> {
+        self.name_map.unique(name)
+    }
+
+    /// Gets a unique name within `func`'s function-local name table (for block,
+    /// instruction, and block-param names). Two functions may thus reuse the same
+    /// name independently.
+    pub fn get_unique_name_in(&mut self, func: FunctionId, name: Cow<'str, str>) -> Cow<'str, str> {
+        self.values.functions[func].names.unique(name)
+    }
+}
+
+/// A name → value reverse map with amortized unique-name minting.
+///
+/// The context keeps one **global** table for module-scoped values (functions,
+/// varnodes, spaces, p-code ops, byte blobs); each [`Function`](crate::value::Function)
+/// keeps its **own** table for its block/instruction/param names. Keeping those
+/// namespaces independent is a prerequisite for running function passes in
+/// parallel: a worker mints names against its function's table with no global
+/// lock and no cross-function collisions. Two functions may each name a block
+/// `loop` — they render correctly because a value's own `name` field is the
+/// source of truth; this table only enforces uniqueness and resolves by name.
+#[derive(Clone, Default, serde::Serialize, serde::Deserialize)]
+pub struct NameTable<'str> {
+    /// name → the value that holds it.
+    map: HashMap<Cow<'str, str>, ValueId>,
+    /// Per-base "next suffix to try" lower-bound hints for [`unique`](Self::unique),
+    /// so probing resumes instead of rescanning from `0`. A derived cache: rides
+    /// through `clone` but is not serialized (see [`Context::get_unique_name`]).
+    #[serde(skip)]
+    suffix_hint: HashMap<String, u32>,
+}
+
+impl<'str> NameTable<'str> {
+    /// The value currently holding `name`, if any.
+    pub fn get(&self, name: &str) -> Option<ValueId> {
+        self.map.get(name).copied()
+    }
+
+    /// Whether `name` is taken.
+    pub fn contains(&self, name: &str) -> bool {
+        self.map.contains_key(name)
+    }
+
+    /// Register `name` for `id`, forgetting `old_name` first. Errors if `name`
+    /// is already taken (callers pre-check via [`get`](Self::get), so this only
+    /// fires defensively).
+    pub fn register(
+        &mut self,
+        name: Cow<'str, str>,
+        id: ValueId,
+        old_name: Option<&str>,
+    ) -> Result<()> {
+        if let Some(old_name) = old_name {
+            self.forget(old_name);
+        }
+        match self.map.insert(name.clone(), id) {
+            Some(_) => Err(Error::spanless(ErrorTy::DuplicateName(name.to_string()))),
+            None => Ok(()),
+        }
+    }
+
+    /// Remove `name`, keeping the [`unique`](Self::unique) suffix hint exact: if
+    /// `name` is a generated `base_<n>` suffix, lower `base`'s hint so the freed
+    /// suffix is reconsidered next time.
+    pub fn forget(&mut self, name: &str) {
+        self.map.remove(name);
+        if let Some((base, suffix)) = split_generated_suffix(name)
+            && let Some(hint) = self.suffix_hint.get_mut(base)
+        {
+            *hint = (*hint).min(suffix);
+        }
+    }
+
+    /// A free name derived from `name`: the bare name if untaken, else the first
+    /// free `name_<n>`. Resumes suffix probing from a cached lower bound so
+    /// minting many like-named values stays ~O(1) amortized; the chosen suffix is
+    /// identical to a naive first-free scan from `1`.
+    pub fn unique(&mut self, name: Cow<'str, str>) -> Cow<'str, str> {
         use std::fmt::Write as _;
 
-        // If the name is already taken, we don't want to overwrite it, since that
-        // would make debugging harder; instead we append a numeric suffix until we
-        // find an unused name. The bare (un-suffixed) name is tried first, matching
-        // the historical behaviour.
-        if !self.name_map.contains_key(&name) {
+        if !self.map.contains_key(&name) {
             return name;
         }
-
-        // The name is taken: probe `name_1`, `name_2`, … for the first free
-        // suffix. Resume from a cached lower bound instead of restarting at `1`,
-        // so generating many like-named values stays ~O(1) amortized per call
-        // rather than O(n²) overall. `suffix_hint` is only ever a lower bound —
-        // every candidate is still confirmed free below — so the chosen suffix is
-        // identical to a naive scan from `1`.
         let base: &str = &name;
         let mut suffix = self.suffix_hint.get(base).copied().unwrap_or(1).max(1);
         let mut unique_name = format!("{base}_{suffix}");
-        while self.name_map.contains_key(unique_name.as_str()) {
+        while self.map.contains_key(unique_name.as_str()) {
             suffix += 1;
             unique_name.clear();
             let _ = write!(unique_name, "{base}_{suffix}");
@@ -1048,7 +1114,7 @@ impl<'str> Context<'str> {
 }
 
 /// Split a generated unique name into its base and numeric suffix, i.e. the
-/// inverse of the `format!("{base}_{suffix}")` in [`Context::get_unique_name`]:
+/// inverse of the `format!("{base}_{suffix}")` in [`NameTable::unique`]:
 /// `"tmp_7"` → `Some(("tmp", 7))`. Returns `None` for names with no `_<digits>`
 /// tail (a bare base, or a name whose tail is empty/non-numeric/overflows).
 fn split_generated_suffix(name: &str) -> Option<(&str, u32)> {
@@ -1282,15 +1348,16 @@ mod tests {
             "
         );
         let load_id = BasicBlock::from_id(&ctx, block).instruction_ids()[0];
+        // Instruction names are function-scoped, so resolve in the owner's table.
         assert!(
-            ctx.get_named("a").is_some(),
+            ctx.get_named_in_scope(load_id.into(), "a").is_some(),
             "name should be in map before removal"
         );
 
         ctx.remove_instruction(load_id);
 
         assert!(
-            ctx.get_named("a").is_none(),
+            ctx.get_named_in_scope(load_id.into(), "a").is_none(),
             "name should be gone after removal"
         );
         assert!(
@@ -1325,8 +1392,9 @@ mod tests {
                 return at %a;
             "
         );
+        let a2 = BasicBlock::from_id(&ctx, block2).instruction_ids()[0];
         assert!(
-            ctx.get_named("a").is_some(),
+            ctx.get_named_in_scope(a2.into(), "a").is_some(),
             "name should be reusable after removal"
         );
     }

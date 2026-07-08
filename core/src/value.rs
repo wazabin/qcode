@@ -157,6 +157,21 @@ impl ValueId {
         }
     }
 
+    /// The function whose **name table** owns this value's name, if any. Block,
+    /// instruction, and block-param names are function-scoped, so those return
+    /// their function; module-scoped values (functions, varnodes, spaces,
+    /// literals, bytes) return `None` and use the global name map. Unlike
+    /// [`owning_function`](Self::owning_function) this includes blocks (by their
+    /// storage function).
+    pub fn name_scope_function(self) -> Option<FunctionId> {
+        match self {
+            ValueId::Instruction(id) => Some(id.func),
+            ValueId::BlockParam(id) => Some(id.func),
+            ValueId::BasicBlock(id) => Some(id.func),
+            _ => None,
+        }
+    }
+
     pub fn as_literal(self) -> Option<LiteralId> {
         if let ValueId::Literal(id) = self {
             Some(id)

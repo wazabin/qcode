@@ -445,8 +445,8 @@ impl<'str, 'ctx> Builder<'str, 'ctx> {
             // label appearing in different instructions/functions doesn't
             // collide. The `local_labels` map stays keyed by the original name
             // so within-instruction references still resolve to this block.
-            let unique_name = self.context_mut().get_unique_name(name.clone());
             let func = self.block.id.func;
+            let unique_name = self.context_mut().get_unique_name_in(func, name.clone());
             let id = BasicBlock::make(self.context_mut(), func)
                 .with_name(unique_name)
                 .expect("name was deduplicated")
@@ -536,7 +536,8 @@ impl<'str, 'ctx> Builder<'str, 'ctx> {
                 // If the varnode has a name, give the temp a related name for easier debugging
                 if let Some(name) = Varnode::from_id(self.context(), node_id).name() {
                     let lowered = name.to_lowercase();
-                    let name = self.context_mut().get_unique_name(lowered.into());
+                    let func = self.block.id.func;
+                    let name = self.context_mut().get_unique_name_in(func, lowered.into());
 
                     Instruction::from_id_mut(
                         self.context_mut(),
@@ -1312,7 +1313,10 @@ impl<'str, 'ctx> Builder<'str, 'ctx> {
             // Add a name hint for the store instruction for easier debugging
             if let Some(name) = Varnode::from_id(self.context(), dst).name() {
                 let lowered = name.to_lowercase();
-                let name = self.context_mut().get_unique_name(Cow::Owned(lowered));
+                let func = self.block.id.func;
+                let name = self
+                    .context_mut()
+                    .get_unique_name_in(func, Cow::Owned(lowered));
                 Instruction::from_id_mut(self.context_mut(), id)
                     .rename(name)
                     .expect("This name was deduplicated");

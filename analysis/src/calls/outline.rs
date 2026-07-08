@@ -317,9 +317,9 @@ fn outline_core(
     let root = Function::from_id_mut(ctx, fid).make_root().id;
 
     // Give the root block a name so it renders with a real label in the GUI
-    // (otherwise it falls back to an opaque `<bb_N>`). The name must be unique
-    // across the context name map.
-    let block_name = ctx.get_unique_name(Cow::Owned(format!("{name}_entry")));
+    // (otherwise it falls back to an opaque `<bb_N>`). Block names are
+    // function-scoped, so deduplicate within the new function's own table.
+    let block_name = ctx.get_unique_name_in(fid, Cow::Owned(format!("{name}_entry")));
     BasicBlock::from_id_mut(ctx, root)
         .rename(block_name)
         .expect("name was deduplicated");
