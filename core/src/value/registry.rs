@@ -8,6 +8,7 @@ use crate::{
         bytes::{Bytes, BytesId},
         function::{Function, FunctionId},
         insn::{Instruction, InstructionId},
+        interner::{Interner, LiteralInterner},
         literal::{Literal, LiteralId},
         varnode::{Varnode, VarnodeId},
     },
@@ -44,12 +45,14 @@ use std::collections::BTreeSet;
 ///   instructions via [`remove_instructions`](Self::remove_instructions).
 #[derive(Clone, Default, serde::Serialize, serde::Deserialize)]
 pub struct ValueRegistry<'str> {
-    /// Literal (constant) storage.
-    pub literals: Registry<LiteralId, Literal>,
+    /// Literal (constant) interner. Behind an `RwLock` (see
+    /// [`LiteralInterner`]) so constants can be minted through a shared `&`; the
+    /// dedup cache lives inside it.
+    pub literals: LiteralInterner,
 
-    /// Opaque byte-blob constant storage (constants wider than a `u64`).
+    /// Opaque byte-blob constant interner (constants wider than a `u64`).
     #[serde(default)]
-    pub bytes: Registry<BytesId, Bytes>,
+    pub bytes: Interner<BytesId, Bytes>,
 
     /// User-forced rendering overrides for `Bytes` blobs (e.g. from the GUI
     /// Strings pane). Absent entries render under [`BytesDisplay::Auto`].
@@ -107,9 +110,6 @@ pub struct ValueRegistry<'str> {
     /// Merged into [`FunctionRef::callees`](crate::value::FunctionRef::callees).
     #[serde(default)]
     pub(crate) synthetic_callees: HashMap<FunctionId, BTreeSet<u64>>,
-
-    /// Intern cache for non-symbolic literals: `(masked_value, TypeId) → LiteralId`.
-    literal_cache: HashMap<(u64, TypeId), LiteralId>,
 }
 
 impl<'str> ValueRegistry<'str> {
@@ -122,36 +122,16 @@ impl<'str> ValueRegistry<'str> {
     /// Call [`Context::get_const`] for the common `Int(size)` case; use this
     /// method directly when you need to preserve a non-`Int` type (e.g.
     /// [`StackAddress`](crate::types::StackAddress)) through folding.
-    pub fn get_or_make_typed_literal(
-        &mut self,
-        mut value: u64,
-        type_id: TypeId,
-        size: usize,
-    ) -> LiteralId {
-        value &= if size >= 8 {
-            u64::MAX
-        } else {
-            (1u64 << (size * 8)) - 1
-        };
-
-        if let Some(&id) = self.literal_cache.get(&(value, type_id)) {
-            return id;
-        }
-
-        let id = self.literals.push(Literal {
-            value,
-            type_id,
-            symbolic: None,
-        });
-        self.literal_cache.insert((value, type_id), id);
-        id
+    pub fn get_or_make_typed_literal(&self, value: u64, type_id: TypeId, size: usize) -> LiteralId {
+        self.literals
+            .get_or_make_typed_literal(value, type_id, size)
     }
 
     /// Pushes a [`Literal`] with arbitrary fields (e.g. with a symbolic ref)
-    /// without interning. Use [`get_or_make_literal`](Self::get_or_make_literal)
+    /// without interning. Use [`get_or_make_typed_literal`](Self::get_or_make_typed_literal)
     /// for plain integer constants.
-    pub fn push_literal(&mut self, literal: Literal) -> LiteralId {
-        self.literals.push(literal)
+    pub fn push_literal(&self, literal: Literal) -> LiteralId {
+        self.literals.push_literal(literal)
     }
 
     /// Appends an instruction and records all its operands in the `users` map.

@@ -93,6 +93,7 @@ pub mod block_param;
 pub mod bytes;
 pub mod function;
 pub mod insn;
+pub mod interner;
 pub mod literal;
 pub mod registry;
 pub mod util;
