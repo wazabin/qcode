@@ -509,6 +509,28 @@ impl<'str> Context<'str> {
         self.functions()
     }
 
+    /// Check a function *out* of the module: move its [`Function`] out of the
+    /// registry, leaving an empty [`Function::sentinel`] in its slot, and return
+    /// the owned function. The caller then owns it exclusively and can mutate it in
+    /// isolation from the rest of the module — the primitive a pass driver uses to
+    /// hand a function to a worker (see `PARALLEL_PASSES.md`). The id and every
+    /// other function's stable address are untouched (segmented registry storage).
+    ///
+    /// While a function is checked out, reading it back through this context
+    /// observes the sentinel, so a checked-out function must always be reinstalled
+    /// with [`checkin_function`](Self::checkin_function) before anything else looks
+    /// at that slot.
+    pub fn checkout_function(&mut self, id: FunctionId) -> Function<'str> {
+        self.values.functions.replace(id, Function::sentinel())
+    }
+
+    /// Reinstall a function previously taken with
+    /// [`checkout_function`](Self::checkout_function), discarding the sentinel that
+    /// held its slot. The function's id must be the one it was checked out under.
+    pub fn checkin_function(&mut self, id: FunctionId, fun: Function<'str>) {
+        self.values.functions.replace(id, fun);
+    }
+
     pub fn varnodes(&self) -> impl Iterator<Item = VarnodeRef<'str, '_>> + '_ {
         self.values
             .varnodes
@@ -1247,6 +1269,30 @@ mod tests {
         assert!(names.contains(&"alpha".to_string()));
         assert!(names.contains(&"beta".to_string()));
         assert_eq!(names.len(), 2);
+    }
+
+    #[test]
+    fn checkout_checkin_round_trips_a_function() {
+        let mut ctx = Context::new();
+        let alpha = make_fn_with_blocks(&mut ctx, "alpha", 2);
+        let beta = make_fn_with_blocks(&mut ctx, "beta", 1);
+
+        // Check `alpha` out: the slot now holds an empty sentinel, and we own the
+        // real function with all its blocks.
+        let fun = ctx.checkout_function(alpha);
+        assert_eq!(fun.name, "alpha");
+        assert_eq!(fun.roster.len(), 2);
+        assert_eq!(FunctionRef::from_id(&ctx, alpha).name(), "");
+        assert_eq!(FunctionRef::from_id(&ctx, alpha).blocks().count(), 0);
+        // A sibling is entirely undisturbed while `alpha` is out.
+        assert_eq!(FunctionRef::from_id(&ctx, beta).name(), "beta");
+        assert_eq!(FunctionRef::from_id(&ctx, beta).blocks().count(), 1);
+
+        // Check it back in: the function is whole again.
+        ctx.checkin_function(alpha, fun);
+        assert_eq!(FunctionRef::from_id(&ctx, alpha).name(), "alpha");
+        assert_eq!(FunctionRef::from_id(&ctx, alpha).blocks().count(), 2);
+        assert_eq!(FunctionRef::from_id(&ctx, beta).name(), "beta");
     }
 
     #[test]

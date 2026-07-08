@@ -141,6 +141,15 @@ impl<'str> Function<'str> {
         }
     }
 
+    /// An empty placeholder function, used to hold a registry slot while its real
+    /// occupant is *checked out* for exclusive mutation (see
+    /// [`Context::checkout_function`](crate::context::Context::checkout_function)).
+    /// It is never observed by a pass: the checked-out function is swapped back in
+    /// before anything reads the slot again.
+    pub fn sentinel() -> Self {
+        Self::new(Cow::Borrowed(""))
+    }
+
     /// This function's instructions that use `value` as an operand (see
     /// [`users`](Self::users)). Empty for a value this function never uses.
     pub fn users_of(&self, value: ValueId) -> &[InstructionId] {
