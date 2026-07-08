@@ -280,12 +280,16 @@ impl AliasResult {
     }
 
     /// Like [`simple`](Self::simple), but only scans `function_id`'s own
-    /// instructions for pointer uses. The varnode equivalence classes are
-    /// architectural (overlapping register sub-views), so the may-alias answers
-    /// for that function's pointers are identical to the whole-program build —
-    /// while building it avoids re-scanning every instruction in the program
-    /// once per function (the O(functions × program) cost callers like
-    /// `bind_args`/`resolve_arg_loads` paid by rebuilding `simple` per function).
+    /// instructions for pointer uses. This avoids the O(functions × program) cost
+    /// callers like `bind_args`/`resolve_arg_loads` paid by rebuilding `simple`
+    /// per function.
+    ///
+    /// The answers match the whole-program build only for pointers this function
+    /// actually uses: a pointer that also appears in another function is put in
+    /// its own class here, so `may_alias` between this function's pointer and a
+    /// pointer it never touches can differ. Callers must therefore only ask about
+    /// pointers within `function_id` — e.g. GVN confines its dominator walk to
+    /// this function's own blocks ([`run_dominator_walk`](crate::gvn)).
     pub fn simple_for_function(ctx: &Context, function_id: FunctionId) -> Self {
         let mut pointer_uses: Vec<(ValueId, SpaceId, usize)> = Vec::new();
         for block in Function::from_id(ctx, function_id).blocks() {

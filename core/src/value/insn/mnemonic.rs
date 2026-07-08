@@ -153,6 +153,22 @@ impl Mnemonic {
         self.as_kind().is_terminator()
     }
 
+    /// Whether an instruction must be kept even if its result has no users:
+    /// it writes memory, transfers control, calls, asserts, or invokes an
+    /// opaque p-code op. This is the single source of truth shared by DCE
+    /// (which must not delete these) and the emitter (which must always print
+    /// them); keep the two in agreement by routing both through here.
+    pub fn has_side_effects(&self) -> bool {
+        matches!(
+            self,
+            Mnemonic::Store(_)
+                | Mnemonic::Call(_)
+                | Mnemonic::CallInd(_)
+                | Mnemonic::PCodeOp(_)
+                | Mnemonic::Assert(_)
+        ) || self.is_terminator()
+    }
+
     /// The callee of a direct [`Call`], or `None` for any other mnemonic
     /// (including indirect [`CallInd`] calls, whose target is not statically
     /// known). Used to maintain the reverse call graph.

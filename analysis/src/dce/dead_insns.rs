@@ -2,12 +2,8 @@ use rustc_hash::FxHashSet as HashSet;
 
 use qcode::{
     context::Context,
-    value::{BasicBlock, BlockId, InstructionId, insn::Mnemonic},
+    value::{BasicBlock, BlockId, InstructionId},
 };
-
-fn has_side_effects(mnemonic: &Mnemonic) -> bool {
-    matches!(mnemonic, Mnemonic::Store(_) | Mnemonic::PCodeOp(_)) || mnemonic.is_terminator()
-}
 
 /// Returns instructions in `block_id` that are pure and have no users.
 pub fn dead_insns(ctx: &Context, block_id: BlockId) -> HashSet<InstructionId> {
@@ -18,7 +14,7 @@ pub fn dead_insns(ctx: &Context, block_id: BlockId) -> HashSet<InstructionId> {
     for id in insn_ids {
         let insn = ctx.get_insn(id);
         let mnemonic = insn.mnemonic();
-        let side_effects = has_side_effects(mnemonic);
+        let side_effects = mnemonic.has_side_effects();
 
         if !side_effects && ctx.users(id).is_empty() {
             dead.insert(id);

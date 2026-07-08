@@ -966,7 +966,7 @@ mod tests {
 
         let stores = Function::from_id(&ctx, test)
             .iter()
-            .flat_map(|block| block.instruction_ids().iter().copied().collect::<Vec<_>>())
+            .flat_map(|block| block.instruction_ids().to_vec())
             .filter(|&insn| {
                 matches!(
                     qcode::value::Instruction::from_id(&ctx, insn).mnemonic(),

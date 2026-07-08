@@ -18,6 +18,12 @@ pub use calls::{
 
 pub mod cfg;
 
+pub mod structure;
+pub use structure::{
+    BlockExit, EdgeCondition, Program, RecoverSwitch, RefineLoops, Structure, TokenKind, TokenLine,
+    block_exit, decompile_function, emit_c, emit_tokens, lower_expr, lower_function,
+};
+
 pub mod naming;
 
 pub mod example;
@@ -53,10 +59,10 @@ pub use lift::{discover_addresses_in_binary, lift_new_addresses, split_overlappi
 
 pub mod pipeline;
 pub use pipeline::{
-    ArchConfig, CallingConvention, DEFAULT_PIPELINE_TOML, DynFunctionPass, DynPass, FunctionPass,
-    GpReg, LiftOutcome, LiftSummary, Pass, PassRegistration, Pipeline, PipelineEnv,
-    PipelineServices, ProgressSink, RegisteredPass, YieldSignal, analyze_and_lift_with_progress,
-    analyze_default, analyze_with_pipeline,
+    ArchConfig, CallingConvention, DEFAULT_PIPELINE_TOML, DecompilePass, DynDecompilePass,
+    DynFunctionPass, DynPass, FunctionPass, GpReg, LiftOutcome, LiftSummary, Pass,
+    PassRegistration, Pipeline, PipelineEnv, PipelineServices, ProgressSink, RegisteredPass,
+    YieldSignal, analyze_and_lift_with_progress, analyze_default, analyze_with_pipeline,
 };
 #[cfg(not(target_arch = "wasm32"))]
 pub use pipeline::{

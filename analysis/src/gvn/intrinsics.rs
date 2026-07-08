@@ -88,9 +88,7 @@ mod tests {
     /// The constant rotate amount of the single live intrinsic named `name`.
     fn live_rotate_amount(ctx: &Context, name: &str) -> Option<u64> {
         ctx.instructions().find_map(|insn| {
-            if insn.parent().is_none() {
-                return None;
-            }
+            insn.parent()?;
             let Mnemonic::Intrinsic(i) = insn.mnemonic() else {
                 return None;
             };
