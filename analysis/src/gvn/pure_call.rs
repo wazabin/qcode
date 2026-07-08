@@ -112,6 +112,13 @@ impl SubPass for PureCall {
 
         // Emulate the callee on the concrete arguments and read the field back.
         let Some(value) = emulate_field(ctx, target, root, &arg_values, index) else {
+            // All static gates passed but emulation still yielded nothing — this
+            // fall-through was silent before, which is exactly why the
+            // block-param `resolve_array` gap stayed invisible.
+            qcode::pass_log!(
+                debug,
+                "pure-call emulation failed after static gates: target {target:?}, field {index}"
+            );
             return Claim::Pass;
         };
 
@@ -305,6 +312,141 @@ mod tests {
             extract_count(&tc, cont),
             1,
             "only the symbolic field-0 extract should remain"
+        );
+    }
+
+    /// Build pure `dec(sp: i32, arr: [i8;4])` returning `(sp, zext(arr[0:1]))`
+    /// and mark it `is_pure`. This mirrors the `fn_410770` byte-wise decoder
+    /// shape: the array-typed root param is read via a `Range` slice, exercising
+    /// the `BlockParam` arm of `resolve_array`.
+    fn build_pure_decoder(tc: &mut TestContext) -> FunctionId {
+        let arr_ty = {
+            let i8_ty = tc.ctx.types.get_or_make_int(1);
+            tc.ctx.types.get_or_make_array(i8_ty, 4)
+        };
+        let fid = Function::make(&mut tc.ctx, "dec".into()).unwrap().id;
+        let entry = tc.ctx.get_or_make_block(0x1000);
+        {
+            let mut f = Function::from_id_mut(&mut tc.ctx, fid);
+            f.set_root(entry).unwrap();
+            f.add_block(entry);
+        }
+        // Params in signature order (sp, arr) so the caller's positional args
+        // align. Array-typed param can't be minted via `push_param` (scalar
+        // only), so set its stored type directly, matching how argpromote does.
+        let sp_pid = BasicBlock::from_id_mut(&mut tc.ctx, entry).push_param(4).id;
+        let arr_pid = BasicBlock::from_id_mut(&mut tc.ctx, entry).push_param(4).id;
+        tc.ctx.values.block_params[arr_pid].type_id = arr_ty;
+
+        let at_id = qcode::value::insn::IntrinsicId::from_name("at").expect("at registered");
+        let (ret, ptr, tuple);
+        {
+            let mut b = Builder::from_block(BasicBlock::from_id_mut(&mut tc.ctx, entry));
+            let sp = ValueId::BlockParam(sp_pid);
+            let arr = ValueId::BlockParam(arr_pid);
+            // `at(arr, 0)` bridges the array param to a scalar lane (byte 0),
+            // routing the read through `resolve_array`'s new `BlockParam` arm.
+            let zero = b.context_mut().get_const(0, 8).id();
+            let b0 = b.push_intrinsic(at_id, vec![arr, zero]).id();
+            let z = b.push_zext(b0, 4).id();
+            tuple = b.push_tuple(vec![sp, z]).id();
+            ptr = b.context_mut().get_const(0x2000, 8).id();
+            ret = b.push_return(ptr).id();
+            unsafe { b.dont_finalize() };
+        }
+        let ValueId::Instruction(iid) = ret else {
+            unreachable!()
+        };
+        tc.ctx.replace_instruction_mnemonic(
+            iid,
+            Mnemonic::Return(Return {
+                ptr,
+                value: Some(tuple),
+            }),
+        );
+        Function::from_id_mut(&mut tc.ctx, fid).set_signature(FunctionSignature {
+            pure_reg: true,
+            is_pure: true,
+            ..Default::default()
+        });
+        fid
+    }
+
+    /// Caller `g` = `dec(0x40ea20, 0x2f76bfc2)`, extracting field 1 into `r1`.
+    /// Both args are literals (`sp` scalar, `arr` a 4-byte array-shaped literal).
+    fn build_decoder_caller(
+        tc: &mut TestContext,
+        dec: FunctionId,
+    ) -> (FunctionId, qcode::value::block::BlockId) {
+        let agg_ty = {
+            let i32_ty = tc.ctx.types.get_or_make_int(4);
+            tc.ctx.types.get_or_make_aggregate(vec![i32_ty, i32_ty])
+        };
+        let gid = Function::make(&mut tc.ctx, "g".into()).unwrap().id;
+        let entry = tc.ctx.get_or_make_block(0x4000);
+        let cont = tc.ctx.get_or_make_block(0x4100);
+        {
+            let mut f = Function::from_id_mut(&mut tc.ctx, gid);
+            f.set_root(entry).unwrap();
+            f.add_block(entry);
+            f.add_block(cont);
+        }
+        let (sp_arg, arr_arg, call_id);
+        {
+            let mut b = Builder::from_block(BasicBlock::from_id_mut(&mut tc.ctx, entry));
+            sp_arg = b.context_mut().get_const(0x40ea20, 4).id();
+            arr_arg = b.context_mut().get_const(0x2f76bfc2, 4).id();
+            let ValueId::Instruction(id) = b.push_call(dec).id() else {
+                unreachable!()
+            };
+            call_id = id;
+            unsafe { b.dont_finalize() };
+        }
+        tc.ctx.replace_instruction_mnemonic(
+            call_id,
+            Mnemonic::Call(Call {
+                target: dec,
+                args: vec![sp_arg, arr_arg],
+                clobbers: vec![],
+            }),
+        );
+        qcode::value::Instruction::from_id_mut(&mut tc.ctx, call_id).set_type(agg_ty);
+        tc.ctx.add_cfg_edge(entry, cont);
+        let (r1, reg_space) = (tc.r1, tc.reg_space);
+        {
+            let mut b = Builder::from_block(BasicBlock::from_id_mut(&mut tc.ctx, cont));
+            let cr = ValueId::Instruction(call_id);
+            let e1 = b.push_extract(cr, 1).id();
+            b.push_store(e1, ValueId::Varnode(r1), reg_space);
+            let ptr = b.context_mut().get_const(0, 8).id();
+            b.push_return(ptr);
+        }
+        (gid, cont)
+    }
+
+    /// The `fn_410770` regression: an all-literal call to a pure decoder whose
+    /// `arr` param is array-typed folds field 1 = `zext(arr[0])` to the low byte
+    /// of the little-endian arg (`0x2f76bfc2 & 0xff = 0xc2`). This is exactly the
+    /// path that stayed silent while `resolve_array` lacked a `BlockParam` arm.
+    #[test]
+    fn folds_array_param_field_from_all_literal_call() {
+        let mut tc = TestContext::new();
+        let dec = build_pure_decoder(&mut tc);
+        let (g, cont) = build_decoder_caller(&mut tc, dec);
+        let r1 = ValueId::Varnode(tc.r1);
+
+        let aliases = crate::AliasResult::simple(&tc.ctx);
+        super::super::gvn_function(&mut tc.ctx, g, Some(&aliases));
+
+        assert_eq!(
+            stored_const(&tc, cont, r1),
+            Some(0xc2),
+            "field 1 = zext(arr[0]) must fold to the LE low byte of 0x2f76bfc2"
+        );
+        assert_eq!(
+            extract_count(&tc, cont),
+            0,
+            "the sole extract must fold away"
         );
     }
 

@@ -584,10 +584,26 @@ async fn run_analysis_fixpoint<'s>(
         let sp_reg = ctx.registers.get(&cfg.stack_pointer).copied();
         progress.report(PipelineProgress::AssumptionsRecorded { round, count });
 
-        pipeline
-            .run_async(&mut ctx, &env, round, progress)
-            .await
-            .unwrap_or_else(|e| panic!("pipeline pass failed: {e}"));
+        if let Err(e) = pipeline.run_async(&mut ctx, &env, round, progress).await {
+            // A `repeat_until` stage that never settles is an input-dependent
+            // property of one function's IR, not a compiler bug. Rather than
+            // panic and lose everything, halt the pipeline best-effort: the
+            // aborting `?` already stopped the remaining stages, so `ctx` holds
+            // the IR up to (and including) the non-converged stage — hand it back
+            // so it can be viewed (e.g. in the GUI) instead of crashing. Drop any
+            // pending discoveries so the outer lift/discover loop stops here rather
+            // than replaying the same non-converging shape every round. Any other
+            // error is a real failure and still aborts loudly.
+            if config::is_nonconvergence(&e) {
+                log::warn!(
+                    target: "pipeline",
+                    "round {round}: {e}; halting analysis best-effort and surfacing the current IR",
+                );
+                let _ = ctx.drain_discoveries();
+                return Ok(ctx);
+            }
+            panic!("pipeline pass failed: {e}");
+        }
 
         progress.report(PipelineProgress::WholeProgramPhase {
             round,
@@ -625,6 +641,22 @@ async fn run_analysis_fixpoint<'s>(
                 v.asserting_pass, v.prop, v.assumed, v.assuming_pass, !v.assumed,
             );
         }
+        // Registry fragmentation probe: how much of the instruction arena is
+        // tombstones by the end of a round. Guides whether a compaction pass
+        // between rounds would pay off.
+        let total_insns = ctx.values.instructions.len();
+        let dead_insns = ctx
+            .values
+            .instructions
+            .iter()
+            .filter(|i| i.is_deleted())
+            .count();
+        log::info!(
+            target: "pipeline",
+            "round {round}: instruction arena {total_insns} slots, {} live, {dead_insns} tombstones ({:.1}% dead)",
+            total_insns - dead_insns,
+            if total_insns == 0 { 0.0 } else { 100.0 * dead_insns as f64 / total_insns as f64 },
+        );
         log_round_stats(round);
         #[cfg(not(target_arch = "wasm32"))]
         log::info!(

@@ -156,8 +156,14 @@ fn try_simplify_root(ctx: &mut Context, root: InstructionId) -> bool {
         (raw, ex.leaves)
     };
 
-    // 3 + 4. Solve, then rebuild ~/^/|.
-    let pretty = canonicalize(simplify_mba(raw, n), mask);
+    // 3 + 4. Solve, then rebuild ~/^/|. The solver aborts on inputs it cannot
+    // handle (e.g. a linear system still carrying more than 20 variables after
+    // reduction / PCT expansion); [`simplify_mba_checked`] turns that abort into a
+    // soft "leave this region un-simplified" instead of crashing the analysis.
+    let Some(solved) = simplify_mba_checked(raw, n) else {
+        return false;
+    };
+    let pretty = canonicalize(solved, mask);
 
     // 4. Only commit when the result is strictly cheaper.
     if cost(&pretty, mask) >= region_cost {
@@ -171,6 +177,22 @@ fn try_simplify_root(ctx: &mut Context, root: InstructionId) -> bool {
     ctx.replace_all_uses_with(root, new_val);
     prune_dead(ctx, root);
     true
+}
+
+/// [`simplify_mba`] guarded against the solver's `panic!`s. rumba *aborts* (rather
+/// than returning an error) on expressions it cannot solve — most notably a linear
+/// MBA still holding more than 20 variables after reduction/PCT expansion, which
+/// `panic!`s with "Too many variables". Left unhandled, that unwinds all the way
+/// out of the analysis and is reported as a hard crash. Simplifying an MBA is
+/// best-effort: a region the solver rejects should simply be left as-is, not abort
+/// the whole run. So catch the unwind and report "no simplification" via `None`.
+///
+/// Sound to catch here: the solve step touches no [`Context`] and holds no lock (it
+/// runs on an owned `Expr`, after the `ctx` borrow that built it has been
+/// released), and `simplify_mba` builds its own scratch state per call — so a
+/// caught unwind leaves no half-mutated shared state behind.
+fn simplify_mba_checked(raw: Expr, n: u8) -> Option<Expr> {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| simplify_mba(raw, n))).ok()
 }
 
 // --- qcode subgraph -> rumba Expr ------------------------------------------
@@ -634,6 +656,45 @@ mod tests {
             .blocks()
             .map(|b| b.instruction_ids().len())
             .sum()
+    }
+
+    /// A region the solver cannot handle must be a *soft* skip, never a crash. The
+    /// solver `panic!`s ("Too many variables") on a linear MBA left with more than
+    /// 20 variables; here a sum of 11 independent AND-terms over 22 distinct
+    /// variables. `simplify_mba_checked` must catch that unwind and report `None`
+    /// (leave the expression as-is) rather than let the panic abort the analysis.
+    #[test]
+    fn oversized_mba_is_soft_skipped_not_a_crash() {
+        let raw = Expr::Add(
+            (0..22)
+                .step_by(2)
+                .map(|i| Expr::And(vec![Expr::Var(VarId(i)), Expr::Var(VarId(i + 1))]))
+                .collect(),
+        );
+
+        // Silence the solver's panic message for this one intentional panic so the
+        // test output stays clean; the caught unwind is the behaviour under test.
+        let prev = std::panic::take_hook();
+        std::panic::set_hook(Box::new(|_| {}));
+        let result = simplify_mba_checked(raw, 32);
+        std::panic::set_hook(prev);
+
+        assert!(
+            result.is_none(),
+            "an over-large MBA must be softly skipped, not crash the analysis"
+        );
+    }
+
+    /// The guard is transparent on inputs the solver *can* handle: a solvable MBA
+    /// still returns a simplification (here `v0 + v0` collapses to `2·v0`), so the
+    /// panic guard costs nothing on the common path.
+    #[test]
+    fn checked_solver_passes_through_normal_results() {
+        let raw = Expr::Add(vec![Expr::Var(VarId(0)), Expr::Var(VarId(0))]);
+        assert!(
+            simplify_mba_checked(raw, 32).is_some(),
+            "a solvable MBA must still be simplified through the guard"
+        );
     }
 
     /// Emulate on a spread of input pairs.

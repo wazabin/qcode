@@ -22,8 +22,8 @@ use qcode::{
 use super::carried_array::{CarriedArray, classify_body_reads, exit_view, find_carried_array};
 use super::outline::{outline_expression, outline_tupled, pure_slice};
 use crate::loop_info::{
-    cbranch_exit, delete_private_loop, incoming, is_increment, is_loop_private, literal,
-    param_parent, param_pos,
+    cbranch_exit, delete_private_loop, incoming, is_loop_private, param_parent, param_pos,
+    recognize_loops,
 };
 use crate::{Pass, PipelineEnv};
 
@@ -34,8 +34,8 @@ use crate::{Pass, PipelineEnv};
 // After the single-carried-array `array_promote`, an element-wise fill loop over
 // a bounded region threads one array-typed header param through the loop with
 // `insert`/`at`, initialized from a preheader wide `Load` (in-place map over the
-// original data) or a `splat(0, N)` (pure generation), and stored wide at the
-// exit:
+// original data), a `splat(0, N)` (pure generation), or an incoming by-value array
+// param (an argpromoted buffer), and stored wide at the exit:
 //
 //   <entry @base>
 //       %arr0 = load(ram:N*esz, @base)   // reads-original init  — OR —
@@ -76,17 +76,14 @@ struct MapMatch {
     arr_exit: ValueId,
     /// The `at(arr_b, index)` own-lane original read, if the body reads its lane.
     elem_read: Option<ValueId>,
-    /// The initial array the map ranges over: the preheader wide `Load` (reads
-    /// original) or the `splat(0, N)` (pure generation).
+    /// The initial array the map ranges over: a preheader wide `Load` (reads
+    /// original), a `splat(0, N)` (pure generation), or an incoming by-value array
+    /// param (an argpromoted buffer). The map reproduces the loop for any of them.
     init_arr: ValueId,
     /// The RAM store consuming `arr_exit`, when the region is real memory (else
     /// the exit uses are a private-shadow return envelope and `arr_exit`'s uses
     /// are simply replaced).
     store_id: Option<InstructionId>,
-    /// Whether the loop is wholly private and can be deleted after the rewrite
-    /// (exit carries only the array pass-through, every loop value used only in
-    /// the loop). Otherwise the residual loop is left for later dce.
-    deletable: bool,
 }
 
 /// Match the canonical total-map loop in `fid` on the shared carried-array form,
@@ -117,31 +114,20 @@ fn try_match(ctx: &mut Context, fid: FunctionId) -> Option<MapMatch> {
     }
 
     // Totality is `array_promote`'s coverage proof: the carried array has exactly
-    // `count` lanes and the promotion writes every one. We only confirm the index
-    // the body carries inits at 0 and steps by +1 on the back-edge (the promoted
-    // guard is an equality `@i == N`, which `value_range` cannot narrow, so we do
-    // not lean on it here — mirroring `loop_to_scan`).
-    let k_index = param_pos(ctx, ca.body, ca.index)?;
-    let feeds = {
-        let [hp] = incoming(ctx, ca.body, k_index)[..] else {
-            return None;
-        };
-        if param_parent(ctx, hp) != Some(ca.header) {
-            return None;
-        }
-        let k_hp = param_pos(ctx, ca.header, hp)?;
-        incoming(ctx, ca.header, k_hp)
-    };
-    if !feeds.iter().any(|&v| is_increment(ctx, v, ca.index)) {
-        return None;
-    }
-    let inits: Vec<i64> = feeds
-        .iter()
-        .filter(|&&v| !is_increment(ctx, v, ca.index))
-        .filter_map(|&v| literal(ctx, v).map(|x| x as i64))
-        .collect();
-    if inits != [0] {
+    // `count` lanes and the promotion writes every one. The index check — inits at
+    // 0, steps by +1 on the back-edge — is the shared `unit_induction` resolver's,
+    // which accepts both split-loop index shapes (body-copied and header-carried)
+    // so this recognizer never learns the difference. Its trip bound comes from
+    // the guard; it must agree with the coverage proof's lane count.
+    let lp = recognize_loops(ctx, fid)
+        .into_iter()
+        .find(|l| l.header == ca.header && l.body == ca.body)?;
+    let ind = lp.unit_induction(ctx, ca.index)?;
+    if ind.start != 0 {
         return None; // v1 maps tile [0, N) from index 0
+    }
+    if ind.count != ca.count as i64 {
+        return None; // guard bound and array length must agree
     }
 
     // Exit discovery: the header terminator is the loop guard; the exit is the
@@ -149,18 +135,11 @@ fn try_match(ctx: &mut Context, fid: FunctionId) -> Option<MapMatch> {
     let (exit, _stay) = cbranch_exit(ctx, ca.header)?;
     let arr_exit = exit_view(ctx, &ca, exit);
 
-    // When the body reads its own original lane, the map ranges over the *original*
-    // array, so the init must be the preheader wide `Load` — reading lane `j` of a
-    // `splat`-init region is legal but yields literal zero, not `l0[j]`, so matching
-    // it as an element read would be wrong (mirrors `loop_to_scan`'s scan check).
-    if elem_read.is_some() {
-        let ValueId::Instruction(iid) = init_arr else {
-            return None;
-        };
-        if !matches!(ctx.get_insn(iid).mnemonic(), Mnemonic::Load(_)) {
-            return None;
-        }
-    }
+    // The map ranges over `init_arr` and reproduces the loop for *any* init value:
+    // in-order coverage (array_promote's proof) makes lane `j` read before it is
+    // written, so `at(arr_b, j) == init_arr[j]` regardless of whether the init is a
+    // preheader wide `Load`, a `splat`, or an incoming by-value array param. There is
+    // no init-shape obligation to enforce here — `init_arr` is already an array value.
 
     // Consumer: a RAM store of the carried array's exit view (real memory). When
     // absent (private argpromote shadow, wide temp store already dce'd) the exit
@@ -177,10 +156,9 @@ fn try_match(ctx: &mut Context, fid: FunctionId) -> Option<MapMatch> {
             _ => None,
         });
 
-    // Deletable iff wholly private: every value the loop defines is used only inside
-    // it (the exit's array pass-through is re-fed from the preheader init in `apply`).
-    let loop_blocks = [ca.header, ca.body];
-    let deletable = is_loop_private(ctx, &loop_blocks);
+    // Deletability of the residual loop is decided in `apply`, after the carried
+    // array's escaping use has been redirected to the map (a pre-rewrite check would
+    // still see that use in the collapsed-exit form).
 
     Some(MapMatch {
         ca,
@@ -189,7 +167,6 @@ fn try_match(ctx: &mut Context, fid: FunctionId) -> Option<MapMatch> {
         elem_read,
         init_arr,
         store_id,
-        deletable,
     })
 }
 
@@ -277,12 +254,40 @@ fn apply(ctx: &mut Context, fid: FunctionId, m: &MapMatch) -> bool {
         };
         b.push_map(body_fn, src, Vec::new()).id()
     };
-    ctx.replace_all_uses_with(m.arr_exit, map_val);
+    // Redirect the exit view of the carried array to the map. When redundant-φ
+    // elimination collapsed the exit pass-through, the exit view *is* the header
+    // array param, which is also the in-loop `at`/`insert` base — those in-loop
+    // uses must stay on the param (the map is defined in the exit and would not
+    // dominate them). So redirect only uses outside the loop; when the exit view
+    // is a distinct exit param (the uncollapsed case) it has no in-loop uses and
+    // this is exactly `replace_all_uses_with`.
+    let loop_blocks = [m.ca.header, m.ca.body];
+    let exit_users: Vec<InstructionId> = ctx.users(m.arr_exit).to_vec();
+    for id in exit_users {
+        if ctx
+            .get_insn(id)
+            .parent()
+            .is_some_and(|b| loop_blocks.contains(&b.id))
+        {
+            continue;
+        }
+        let mut mn = ctx.get_insn(id).mnemonic().clone();
+        mn.replace_value(m.arr_exit, map_val);
+        ctx.replace_instruction_mnemonic(id, mn);
+    }
+
+    // Deletability must reflect the *post-redirect* state. The redirect above moved
+    // the carried array's only out-of-loop use (the wide store / return-envelope
+    // `pack`) onto the map, so in the collapsed-exit form (`arr_exit == arr_h`) the
+    // header array param becomes loop-private only now. Deciding this before the
+    // rewrite would wrongly see that escaping use and keep the loop — and nothing
+    // later deletes it: a self-carried loop's own guard and back-edge keep the index
+    // and array live through the CFG, so no ordinary dce can collect the cycle.
+    let deletable = is_loop_private(ctx, &loop_blocks);
 
     // Delete the residual loop when wholly private (mirrors `loop_to_scan::apply`):
     // reroute the single preheader straight to the exit, re-feeding each exit param
     // from a preheader-available value, then delete the loop blocks.
-    let loop_blocks = [m.ca.header, m.ca.body];
     let defined_in_loop = |ctx: &Context, v: ValueId| match v {
         ValueId::BlockParam(_) => param_parent(ctx, v).is_some_and(|b| loop_blocks.contains(&b)),
         ValueId::Instruction(id) => ctx
@@ -318,9 +323,7 @@ fn apply(ctx: &mut Context, fid: FunctionId, m: &MapMatch) -> bool {
             }
         })
         .collect();
-    if m.deletable
-        && let Some(exit_args) = exit_args
-    {
+    if deletable && let Some(exit_args) = exit_args {
         let preheaders: Vec<BlockId> = BasicBlock::from_id(ctx, m.ca.header)
             .predecessors()
             .map(|(_, p)| p)
@@ -382,6 +385,110 @@ mod tests {
         Function::from_id_mut(ctx, fid).set_is_pure(true);
         let folded = recognize_total_maps(ctx);
         (promoted, folded)
+    }
+
+    /// Like [`promote_then_map`] but runs redundant-φ elimination between promote
+    /// and fold, mirroring the real pipeline: `array_promote` mints a distinct
+    /// body array param, which `dead_block_args` then collapses onto the header
+    /// param (its single header→body incoming). The result is the *fully*
+    /// header-carried form — both index and carried array read from the header —
+    /// that the recognizer sees in practice.
+    fn promote_collapse_map(ctx: &mut Context, fid: FunctionId) -> (bool, bool) {
+        use crate::dce::remove_dead_block_args;
+        let promoted = run_function_pass::<ArrayPromote>(ctx, fid).unwrap();
+        let blocks: Vec<BlockId> = Function::from_id(ctx, fid).iter().map(|b| b.id).collect();
+        let root = Function::from_id(ctx, fid).root().map(|b| b.id);
+        while remove_dead_block_args(ctx, &blocks, root) {}
+        Function::from_id_mut(ctx, fid).set_is_pure(true);
+        let folded = recognize_total_maps(ctx);
+        (promoted, folded)
+    }
+
+    /// The real-pipeline shape: after promote **and** redundant-φ elimination the
+    /// carried array's carry base is the *header* array param (the minted body
+    /// param collapsed onto it), so the whole loop is fully header-carried. The
+    /// fold must still recognize it. This is the case that reached the field as
+    /// `promoted=true, folded=false` before the body block was derived from the
+    /// carry insert rather than from `param_parent(arr_b)`.
+    #[test]
+    fn fully_header_carried_fill_folds_after_collapse() {
+        let mut ctx = Context::new();
+        qcode!(
+            ctx,
+            "
+            fn xorbuf:
+            <entry @base:i64>
+                goto <head @i=0>;
+            <head @i:i64>
+                %done = @i == 16;
+                if %done goto <exit> else goto <body>;
+            <body>
+                %off = @i * 4;
+                %addr = @base + %off;
+                %x = load(ram:4, %addr);
+                %v = %x ^ 0x5a;
+                store(ram:4, %addr <- %v);
+                %i1 = @i + 1;
+                goto <head @i=%i1>;
+            <exit>
+                return at i64 0x0;
+            "
+        );
+        let (promoted, folded) = promote_collapse_map(&mut ctx, xorbuf);
+        assert!(promoted, "the fill should promote");
+        assert!(folded, "the fully header-carried loop should fold to a map");
+        let ir = format!("{}", Function::from_id(&ctx, xorbuf));
+        assert!(ir.contains("<$>"), "folds to a map: {ir}");
+        // The collapsed-exit form escapes the carried array to the wide store, so
+        // deletability must be judged *after* the redirect — the dead loop (its carry
+        // `$insert`) must be gone, not left behind for a dce that never collects it.
+        assert!(
+            !ir.contains("$insert"),
+            "the residual dead loop must be deleted in the collapsed-exit case: {ir}"
+        );
+    }
+
+    /// The field case (an obfuscated `out[i] = f(out[i], i)` byte loop): fully
+    /// header-carried *and* index-aware. After promote + redundant-φ elimination
+    /// both the carried array and the index are read from the header, and the
+    /// body consumes the index — so it must fold to `map(f, enumerate(arr0))`.
+    /// This drives `outline_tupled` with a header-param index input.
+    #[test]
+    fn fully_header_carried_index_aware_folds_enumerate() {
+        let mut ctx = Context::new();
+        qcode!(
+            ctx,
+            "
+            fn mix:
+            <entry @base:i64>
+                goto <head @i=0>;
+            <head @i:i64>
+                %done = @i < 24;
+                if %done goto <body> else goto <exit>;
+            <body>
+                %addr = @base + @i;
+                %cur = load(ram:1, %addr);
+                %it = @i[0:1];
+                %x = %cur ^ %it;
+                %y = %x + %cur;
+                store(ram:1, %addr <- %y);
+                %i1 = @i + 1;
+                goto <head @i=%i1>;
+            <exit>
+                return at i64 0x0;
+            "
+        );
+        let (promoted, folded) = promote_collapse_map(&mut ctx, mix);
+        assert!(promoted, "the fill should promote");
+        assert!(
+            folded,
+            "the fully header-carried index-aware loop should fold"
+        );
+        let ir = format!("{}", Function::from_id(&ctx, mix));
+        assert!(
+            ir.contains("<$>") && ir.contains("enumerate"),
+            "index-aware body maps over enumerate: {ir}"
+        );
     }
 
     /// An in-place indexed map whose element body is *index-free*
@@ -560,6 +667,175 @@ mod tests {
         assert!(
             !ir.contains("load(ram"),
             "generation introduces no region load: {ir}"
+        );
+    }
+
+    /// The header-carried twin of `array_promote_then_map_folds_xor_fill`: the
+    /// body reads the header induction param `@i` directly instead of copying it
+    /// into a body param — the shape redundant-φ elimination (`dead_block_args`)
+    /// leaves behind. The fold must not depend on the index shape: a value-only
+    /// body maps without an `enumerate`, exactly like its body-copied twin.
+    #[test]
+    fn header_carried_xor_fill_folds() {
+        let mut ctx = Context::new();
+        qcode!(
+            ctx,
+            "
+            fn xorbuf:
+            <entry @base:i64>
+                goto <head @i=0>;
+            <head @i:i64>
+                %done = @i == 16;
+                if %done goto <exit> else goto <body>;
+            <body>
+                %off = @i * 4;
+                %addr = @base + %off;
+                %x = load(ram:4, %addr);
+                %v = %x ^ 0x5a;
+                store(ram:4, %addr <- %v);
+                %i1 = @i + 1;
+                goto <head @i=%i1>;
+            <exit>
+                return at i64 0x0;
+            "
+        );
+        let (promoted, folded) = promote_then_map(&mut ctx, xorbuf);
+        assert!(promoted, "the header-carried fill should promote");
+        assert!(folded, "the header-carried promoted loop should fold");
+        let ir = format!("{}", Function::from_id(&ctx, xorbuf));
+        assert!(ir.contains("<$>"), "folds to a map: {ir}");
+        assert!(
+            !ir.contains("enumerate"),
+            "an index-free body needs no enumerate: {ir}"
+        );
+    }
+
+    /// Header-carried with an *index-aware* body (`out[i] = out[i] + i`, the body
+    /// consuming the header param `@i` directly): folds to
+    /// `map(f, enumerate(arr0))`. This also proves the outline path binds a free
+    /// header-param index as a body input (design §4 — `pure_slice` stops at
+    /// declared inputs regardless of their defining block).
+    #[test]
+    fn header_carried_index_aware_body_maps_enumerate() {
+        let mut ctx = Context::new();
+        qcode!(
+            ctx,
+            "
+            fn addidx:
+            <entry @base:i64>
+                goto <head @i=0>;
+            <head @i:i64>
+                %done = @i == 16;
+                if %done goto <exit> else goto <body>;
+            <body>
+                %off = @i * 4;
+                %addr = @base + %off;
+                %x = load(ram:4, %addr);
+                %it = @i[0:4];
+                %v = %x + %it;
+                store(ram:4, %addr <- %v);
+                %i1 = @i + 1;
+                goto <head @i=%i1>;
+            <exit>
+                return at i64 0x0;
+            "
+        );
+        let (promoted, folded) = promote_then_map(&mut ctx, addidx);
+        assert!(promoted && folded);
+        let ir = format!("{}", Function::from_id(&ctx, addidx));
+        assert!(
+            ir.contains("<$>") && ir.contains("enumerate"),
+            "an index-aware body maps over enumerate: {ir}"
+        );
+    }
+
+    /// The field shape (410a60-class, argpromoted): a promoted, fully header-carried
+    /// in-place map whose initial array is an **incoming by-value array param** (an
+    /// argpromoted buffer) rather than a preheader wide `Load`. `array_promote` always
+    /// builds a `Load` init for an own-lane read, so the by-value form is reproduced
+    /// here by swapping that `Load` for a fresh entry array param. The own-lane read
+    /// still reads genuine original data (`at(arr_b, j) == init[j]` by coverage), so
+    /// `map(body, param)` is correct — this is exactly the case the removed init-shape
+    /// guard wrongly rejected for not being a `Load`.
+    #[test]
+    fn param_init_own_lane_read_folds_to_map() {
+        use crate::dce::remove_dead_block_args;
+        let mut ctx = Context::new();
+        qcode!(
+            ctx,
+            "
+            fn xorbuf:
+            <entry @base:i64>
+                goto <head @i=0>;
+            <head @i:i64>
+                %done = @i == 16;
+                if %done goto <exit> else goto <body>;
+            <body>
+                %off = @i * 4;
+                %addr = @base + %off;
+                %x = load(ram:4, %addr);
+                %v = %x ^ 0x5a;
+                store(ram:4, %addr <- %v);
+                %i1 = @i + 1;
+                goto <head @i=%i1>;
+            <exit>
+                return at i64 0x0;
+            "
+        );
+        // Promote + redundant-φ elimination → the fully header-carried, `Load`-init
+        // map loop (identical to `fully_header_carried_fill_folds_after_collapse`).
+        assert!(run_function_pass::<ArrayPromote>(&mut ctx, xorbuf).unwrap());
+        let blocks: Vec<BlockId> = Function::from_id(&ctx, xorbuf)
+            .iter()
+            .map(|b| b.id)
+            .collect();
+        let root = Function::from_id(&ctx, xorbuf).root().map(|b| b.id);
+        while remove_dead_block_args(&mut ctx, &blocks, root) {}
+
+        // Swap the array-typed preheader `Load` for a fresh incoming array param —
+        // the argpromoted by-value buffer form the field IR actually carries.
+        let cur_blocks: Vec<BlockId> = Function::from_id(&ctx, xorbuf)
+            .iter()
+            .map(|b| b.id)
+            .collect();
+        let mut load_ids = Vec::new();
+        for bid in &cur_blocks {
+            for i in BasicBlock::from_id(&ctx, *bid).iter() {
+                if matches!(i.mnemonic(), Mnemonic::Load(_)) {
+                    load_ids.push(i.id);
+                }
+            }
+        }
+        let load_id = load_ids
+            .into_iter()
+            .find(|&id| {
+                let ty = ctx.type_of(ValueId::Instruction(id));
+                ctx.types.array_of(ty).is_some()
+            })
+            .expect("array-typed preheader init load");
+        let arr_ty = ctx.type_of(ValueId::Instruction(load_id));
+        let arr_sz = ctx.types.size_of(arr_ty);
+        let entry = Function::from_id(&ctx, xorbuf).root().unwrap().id;
+        let pid = BasicBlock::from_id_mut(&mut ctx, entry)
+            .push_param(arr_sz)
+            .id;
+        ctx.values.block_params[pid].type_id = arr_ty;
+        ctx.replace_all_uses_with(ValueId::Instruction(load_id), ValueId::BlockParam(pid));
+
+        Function::from_id_mut(&mut ctx, xorbuf).set_is_pure(true);
+        assert!(
+            recognize_total_maps(&mut ctx),
+            "a param-init own-lane map must fold (the deleted Load-only guard blocked it)"
+        );
+        let ir = format!("{}", Function::from_id(&ctx, xorbuf));
+        assert!(ir.contains("<$>"), "folds to a map: {ir}");
+        assert!(
+            !ir.contains("enumerate"),
+            "an index-free body needs no enumerate: {ir}"
+        );
+        assert!(
+            !ir.contains("$insert"),
+            "the residual dead loop must be deleted for a param-init map: {ir}"
         );
     }
 

@@ -96,6 +96,16 @@ fn try_match(ctx: &mut Context, fid: FunctionId) -> Option<ScanMatch> {
     // Anchor on the shared carried-array matcher, then narrow to the scan shape:
     // a lane-0 accumulator seed insert must exist (`ca.seed`).
     let ca = find_carried_array(ctx, fid)?;
+    // The shared matcher also accepts a *header-carried* index (`ca.index` a
+    // param of `ca.header`, not of `ca.body`). Scan v1 is audited for the
+    // body-copied shape only — gate the other out explicitly so the relaxed
+    // matcher can never reach `apply` unaudited.
+    // TODO(loop-fold-header-index): fold header-carried scans by moving this
+    // recognizer's induction walk onto `NaturalLoop::unit_induction`, mirroring
+    // `loop_to_map::try_match`.
+    if param_parent(ctx, ca.index) != Some(ca.body) {
+        return None;
+    }
     let (seed_val, seed_arr0) = ca.seed?;
     let header = ca.header;
     let body = ca.body;
@@ -449,5 +459,53 @@ mod tests {
             ir.contains("scanl"),
             "the promoted loop should fold to a scanl over the original array: {ir}"
         );
+    }
+
+    // The *header-carried* prefix sum: the body reads the header induction param
+    // `@i` directly (no body index param). The relaxed carried-array matcher now
+    // surfaces this shape, but scan v1 is audited for the body-copied form only —
+    // `loop_to_scan` must decline it (no rewrite, no scanl), not mis-fold it.
+    // TODO(loop-fold-header-index): fold this once the scan recognizer moves onto
+    // `unit_induction` (see the gate in `try_match`).
+    #[test]
+    fn header_carried_scan_shape_declined() {
+        let mut ctx = Context::new();
+        qcode!(
+            ctx,
+            "
+            fn prefix:
+            <entry @seed:i64 @base:i64>
+                %e0 = @seed[0:4];
+                store(ram:4, @base <- %e0);
+                goto <head @i=1>;
+            <head @i:i64>
+                %done = @i == 624;
+                if %done goto <exit> else goto <body>;
+            <body>
+                %im1 = @i - 1;
+                %roff = %im1 * 4;
+                %raddr = @base + %roff;
+                %prev = load(ram:4, %raddr);
+                %coff = @i * 4;
+                %caddr = @base + %coff;
+                %cur = load(ram:4, %caddr);
+                %next = %cur + %prev;
+                store(ram:4, %caddr <- %next);
+                %i1 = @i + 1;
+                goto <head @i=%i1>;
+            <exit>
+                return at i64 0x0;
+            "
+        );
+        assert!(
+            run_function_pass::<ArrayPromote>(&mut ctx, prefix).unwrap(),
+            "the header-carried prefix sum should promote"
+        );
+        assert!(
+            !run_function_pass::<LoopToScan>(&mut ctx, prefix).unwrap(),
+            "scan v1 must decline the header-carried index shape"
+        );
+        let ir = format!("{}", Function::from_id(&ctx, prefix));
+        assert!(!ir.contains("scanl"), "declined, not rewritten: {ir}");
     }
 }

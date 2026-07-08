@@ -160,20 +160,47 @@ impl FunctionPass for HandleJumpTables {
             return Ok(false);
         }
 
-        // A table with more than two cases stays an indirect `switch`: we keep
-        // the `BranchInd` but connect a real edge to every case body. Clear the
-        // block's existing edges first so a re-resolution does not double them.
-        let mut cleared: rustc_hash::FxHashSet<BlockId> = rustc_hash::FxHashSet::default();
-        for Edit { from, target, .. } in edits {
-            if cleared.insert(from) {
-                clear_successors(ctx, from);
-            }
-            let from_addr = BasicBlock::from_id(ctx, from).address();
-            let tb = ctx.get_or_make_block(target);
-            Function::from_id_mut(ctx, fun_id).add_block(tb);
+        // The single- and two-target paths below rewrite the terminator itself,
+        // so they always change the IR (and cannot re-trigger: the block no
+        // longer ends in `BranchInd`).
+        let mut changed = !single_branches.is_empty() || !branches.is_empty();
 
-            ctx.add_cfg_edge(from, tb);
-            discover(ctx, fn_entry, from_addr, target);
+        // A table with more than two cases stays an indirect `switch`: we keep
+        // the `BranchInd` but connect a real edge to every case body. Because the
+        // terminator survives, the block is re-resolved on every fixpoint
+        // iteration — so rewrite (and report a change) only when the resolved
+        // target multiset differs from the edges already on the block. Tearing
+        // down and rebuilding identical edges would keep every `repeat_until`
+        // stage containing this pass spinning to its iteration cap.
+        let mut by_from: rustc_hash::FxHashMap<BlockId, Vec<Edit>> =
+            rustc_hash::FxHashMap::default();
+        for e in edits {
+            by_from.entry(e.from).or_default().push(e);
+        }
+        for (from, edits) in by_from {
+            let mut existing: Vec<Option<u64>> = BasicBlock::from_id(ctx, from)
+                .successors()
+                .map(|(_, succ)| BasicBlock::from_id(ctx, succ).address())
+                .collect();
+            let mut desired: Vec<Option<u64>> = edits.iter().map(|e| Some(e.target)).collect();
+            existing.sort_unstable();
+            desired.sort_unstable();
+            if existing == desired {
+                continue;
+            }
+            changed = true;
+
+            // Clear the block's existing edges first so a re-resolution does not
+            // double them.
+            clear_successors(ctx, from);
+            let from_addr = BasicBlock::from_id(ctx, from).address();
+            for Edit { target, .. } in edits {
+                let tb = ctx.get_or_make_block(target);
+                Function::from_id_mut(ctx, fun_id).add_block(tb);
+
+                ctx.add_cfg_edge(from, tb);
+                discover(ctx, fn_entry, from_addr, target);
+            }
         }
 
         // A single resolved target: the indirect branch is really an
@@ -218,8 +245,10 @@ impl FunctionPass for HandleJumpTables {
             builder.push_cbranch(cond, true_block, false_block);
         }
 
-        qcode::stat!("jump_table_edges", 1);
-        Ok(true)
+        if changed {
+            qcode::stat!("jump_table_edges", 1);
+        }
+        Ok(changed)
     }
 }
 
@@ -253,8 +282,9 @@ fn resolve_block(mut block: BlockMutRef) -> Option<Vec<Edit>> {
     // once the lifter has connected its targets in the clean IR: those edges let
     // function-splitting follow the switch, but the terminator itself is only
     // rewritten in this (disposable or final) optimized clone. The apply step
-    // clears the block's existing edges before rebuilding, so re-resolving an
-    // already-connected block is idempotent rather than edge-doubling.
+    // skips a block whose edges already match the resolution (reporting no
+    // change), and otherwise clears them before rebuilding, so re-resolving an
+    // already-connected block is a no-op rather than edge-doubling.
     let insn = block.instructions().last()?;
 
     let Mnemonic::BranchInd(BranchInd { ptr }) = insn.mnemonic() else {
@@ -288,7 +318,19 @@ fn resolve_block(mut block: BlockMutRef) -> Option<Vec<Edit>> {
 
     let range = value_range(ctx, table.index, block.id);
 
-    if !range.is_bounded(index_size) || range.count() > MAX_TABLE_ENTRIES {
+    log::debug!(
+        target: "jump_table",
+        "resolving jump table in block {:x}: base {:x}, size {}, offset {}",
+        block.address().unwrap_or_default(),
+        table.base,
+        range.count(),
+        range.min,
+    );
+
+    if !range.is_bounded(index_size)
+        || range.fills_containing_width()
+        || range.count() > MAX_TABLE_ENTRIES
+    {
         log::debug!(target: "jump_table", "skipping unbounded or huge table: range {range:?}");
         return None;
     }
@@ -337,6 +379,11 @@ fn resolve_block(mut block: BlockMutRef) -> Option<Vec<Edit>> {
             log::debug!(target: "jump_table", "skipping table: target {target:x} not executable");
             return None;
         }
+
+        log::debug!(
+            target: "jump_table",
+            "  slot[{index}] at {entry_addr:x} -> target {target:x}",
+        );
 
         resolved.push(Edit {
             from: block.id,
@@ -582,7 +629,8 @@ mod tests {
 
     /// Seed `ctx` with an executable code region `[start, start+len)`.
     fn add_code(ctx: &mut Context, start: u64, len: usize) {
-        ctx.memory_image.add_segment(start, vec![0u8; len], true, false);
+        ctx.memory_image
+            .add_segment(start, vec![0u8; len], true, false);
     }
 
     /// Seed `ctx` with a read-only data region holding `bytes`.
@@ -639,6 +687,17 @@ mod tests {
             };
             assert_eq!(ctx.truth(prop).map(|t| t.value), Some(true));
         }
+
+        // A >2-case table keeps its `BranchInd`, so the pass re-resolves it on
+        // every fixpoint iteration. Re-running against the already-connected
+        // block must be a no-op reporting no change — otherwise any
+        // `repeat_until` stage containing this pass never converges.
+        let changed = run_function_pass::<HandleJumpTables>(&mut ctx, fun).unwrap();
+        assert!(
+            !changed,
+            "re-resolving an already-connected table reported a change"
+        );
+        assert_eq!(successor_count(&ctx, disp), 3);
     }
 
     /// A plain indirect jump through a fixed pointer slot: `goto [load(const)]`.

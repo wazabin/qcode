@@ -33,6 +33,37 @@ const DEFAULT_PIPELINE_FILE: &str = "default.toml";
 /// Guard against a `repeat_until` stage that never converges.
 const MAX_FIXPOINT_ITERS: usize = 100;
 
+/// Iteration count at which a `repeat_until` stage starts *tracing* itself to
+/// diagnose non-convergence. A healthy stage settles in a handful of iterations,
+/// so tracing engages only once a stage is clearly struggling — keeping the
+/// (string-rendering) fingerprint cost off the common path. Once engaged, every
+/// pass that reports a change has the resulting IR fingerprinted and logged, and a
+/// recurring fingerprint is flagged as a proven cycle (see [`FixpointTracer`]).
+const FIXPOINT_WATCH_ITERS: usize = 16;
+
+/// Build the error a `repeat_until` stage returns when it hits the iteration cap.
+///
+/// It flows through the ordinary `Result<_, String>` plumbing, but the analysis
+/// driver recognizes it via [`is_nonconvergence`] and treats it as a *soft, best-
+/// effort halt* — stopping the pipeline and surfacing the (last, non-converged) IR
+/// for inspection — rather than a hard failure. Every non-convergence site routes
+/// through here so the phrasing [`is_nonconvergence`] keys on stays in one place.
+pub(crate) fn nonconvergence_error(stage: &str, function: Option<&str>) -> String {
+    match function {
+        Some(f) => format!(
+            "stage \"{stage}\" did not converge on function {f} after {MAX_FIXPOINT_ITERS} iterations"
+        ),
+        None => format!("stage \"{stage}\" did not converge after {MAX_FIXPOINT_ITERS} iterations"),
+    }
+}
+
+/// Whether a pipeline error string is a stage non-convergence (see
+/// [`nonconvergence_error`]). Used by the driver to halt best-effort instead of
+/// panicking, so the non-converged IR can be viewed rather than lost to a crash.
+pub(crate) fn is_nonconvergence(error: &str) -> bool {
+    error.contains("did not converge")
+}
+
 /// Name of the stage that marks the boundary between the lifting (clean-IR) phase
 /// and the optimization phase. Stages before it run on the persistent clean IR
 /// (recursive disassembly); stages from it onward run on the derived optimized
@@ -724,7 +755,10 @@ async fn run_module_stage(
 
     let mut iters = 0;
     let mut stage_changed = false;
+    let mut tracer = FixpointTracer::default();
+    let tracer_label = format!("stage {} <module>", stage.name);
     loop {
+        let watching = stage.repeat_until.is_some() && iters >= FIXPOINT_WATCH_ITERS;
         let mut changed = false;
         for p in passes {
             progress.report(PipelineProgress::WholeProgramPhase {
@@ -747,6 +781,22 @@ async fn run_module_stage(
             // Between-pass invariant check (opt-in via `QCODE_VERIFY`): pin a broken
             // invariant to the pass that produced it.
             crate::verify::verify_after(ctx, p.name());
+            if watching && pass_changed {
+                let fp = module_fingerprint(ctx);
+                if tracer.observe(&tracer_label, iters + 1, p.name(), fp) {
+                    // A proven cycle cannot converge; every further iteration
+                    // re-treads the same states. Stop the stage best-effort at
+                    // the recurring state instead of spinning to the cap.
+                    log::warn!(
+                        target: "pipeline::fixpoint",
+                        "stage {} (module): stopping best-effort on the proven cycle at \
+                         iteration {}",
+                        stage.name,
+                        iters + 1,
+                    );
+                    return Ok(true);
+                }
+            }
             changed |= pass_changed;
         }
         stage_changed |= changed;
@@ -755,10 +805,13 @@ async fn run_module_stage(
             return Ok(stage_changed);
         }
         if iters >= MAX_FIXPOINT_ITERS {
-            return Err(format!(
-                "stage \"{}\" did not converge after {MAX_FIXPOINT_ITERS} iterations",
-                stage.name
-            ));
+            log::warn!(
+                target: "pipeline::fixpoint",
+                "stage {} (module) hit the {MAX_FIXPOINT_ITERS}-iteration cap; see the \
+                 `pipeline::fixpoint` trace above for the fighting passes",
+                stage.name,
+            );
+            return Err(nonconvergence_error(&stage.name, None));
         }
     }
 }
@@ -832,7 +885,10 @@ fn run_module_stage_incremental(
     let mut known_pure = pure_function_set(ctx);
     let mut iters = 0;
     let mut stage_changed = false;
+    let mut tracer = FixpointTracer::default();
+    let tracer_label = format!("stage {} <module,incremental>", stage.name);
     loop {
+        let watching = iters >= FIXPOINT_WATCH_ITERS;
         let mut changed = false;
         for p in passes {
             progress(PipelineProgress::WholeProgramPhase {
@@ -907,6 +963,22 @@ fn run_module_stage_incremental(
                 if pass_changed { "changed" } else { "no change" },
             );
             crate::verify::verify_after(ctx, p.name());
+            if watching && pass_changed {
+                let fp = module_fingerprint(ctx);
+                if tracer.observe(&tracer_label, iters + 1, p.name(), fp) {
+                    // A proven cycle cannot converge; every further iteration
+                    // re-treads the same states. Stop the stage best-effort at
+                    // the recurring state instead of spinning to the cap.
+                    log::warn!(
+                        target: "pipeline::fixpoint",
+                        "stage {} (module,incremental): stopping best-effort on the proven \
+                         cycle at iteration {}",
+                        stage.name,
+                        iters + 1,
+                    );
+                    return Ok(true);
+                }
+            }
             changed |= pass_changed;
         }
         stage_changed |= changed;
@@ -915,10 +987,13 @@ fn run_module_stage_incremental(
             return Ok(stage_changed);
         }
         if iters >= MAX_FIXPOINT_ITERS {
-            return Err(format!(
-                "stage \"{}\" did not converge after {MAX_FIXPOINT_ITERS} iterations",
-                stage.name
-            ));
+            log::warn!(
+                target: "pipeline::fixpoint",
+                "stage {} (module,incremental) hit the {MAX_FIXPOINT_ITERS}-iteration cap; \
+                 see the `pipeline::fixpoint` trace above for the fighting passes",
+                stage.name,
+            );
+            return Err(nonconvergence_error(&stage.name, None));
         }
     }
 }
@@ -986,10 +1061,7 @@ async fn run_lifting_module_stage(
             return Ok(stage_changed);
         }
         if iters >= MAX_FIXPOINT_ITERS {
-            return Err(format!(
-                "stage \"{}\" did not converge after {MAX_FIXPOINT_ITERS} iterations",
-                stage.name
-            ));
+            return Err(nonconvergence_error(&stage.name, None));
         }
     }
 }
@@ -1072,17 +1144,116 @@ impl FixpointCache {
     }
 }
 
-/// A cheap structural fingerprint of one function's body, used to detect whether a
+/// A fingerprint of one function's rendered body, used to detect whether a
 /// module stage modified it. Rendering the IR captures operand rewrites,
-/// insertions/removals, and CFG edits; block order is address-sorted (deterministic)
-/// so an unchanged function fingerprints identically across a stage.
+/// insertions/removals, retypes, and CFG edits; block order is address-sorted
+/// (deterministic) so an unchanged function fingerprints identically across a
+/// stage. The render is streamed straight into the hasher — no intermediate
+/// `String` of the whole body is ever built, so the cost is the formatting
+/// walk alone.
 pub(super) fn function_fingerprint(ctx: &Context, fun_id: FunctionId) -> u64 {
+    use std::fmt::Write as _;
+    use std::hash::Hasher;
+
+    struct HashWriter(std::collections::hash_map::DefaultHasher);
+    impl std::fmt::Write for HashWriter {
+        fn write_str(&mut self, s: &str) -> std::fmt::Result {
+            self.0.write(s.as_bytes());
+            Ok(())
+        }
+    }
+
+    let mut writer = HashWriter(std::collections::hash_map::DefaultHasher::new());
+    write!(writer, "{}", FunctionRef::from_id(ctx, fun_id))
+        .expect("writing into a hasher cannot fail");
+    writer.0.finish()
+}
+
+/// Whole-program structural fingerprint: the address-sorted list of per-function
+/// [`function_fingerprint`]s. Stable across a stage that changes nothing, and — like
+/// its per-function basis — id-churn tolerant (it hashes rendered IR, not instruction
+/// ids), so a module stage that oscillates back to a prior whole-program state
+/// fingerprints identically. Used only while a stage is being traced for
+/// non-convergence, so the O(program) render cost is off the common path.
+fn module_fingerprint(ctx: &Context) -> u64 {
     use std::hash::{Hash, Hasher};
+    let mut per_fn: Vec<(Option<u64>, u64)> = ctx
+        .functions()
+        .map(|f| (f.address(), function_fingerprint(ctx, f.id)))
+        .collect();
+    per_fn.sort_unstable();
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
-    FunctionRef::from_id(ctx, fun_id)
-        .to_string()
-        .hash(&mut hasher);
+    per_fn.hash(&mut hasher);
     hasher.finish()
+}
+
+/// Diagnoses why a `repeat_until` stage will not converge. Engaged only once a
+/// stage passes [`FIXPOINT_WATCH_ITERS`], it fingerprints the IR after each pass
+/// that reports a change and:
+///   * logs the transition (`pass -> new fingerprint`) at `debug` on the
+///     `pipeline::fixpoint` target — the play-by-play of which passes keep moving
+///     the IR (i.e. who is "fighting"); enable with
+///     `RUST_LOG=pipeline::fixpoint=debug`;
+///   * when a fingerprint *recurs*, warns loudly with the exact loop body — proof
+///     the stage is cycling between states rather than making forward progress,
+///     which no amount of further iteration can fix. A recurring fingerprint means
+///     two or more passes are undoing each other. [`observe`](Self::observe)
+///     returns `true` on recurrence so the driver stops the fixpoint best-effort
+///     right there instead of spinning to the iteration cap.
+///
+/// Detection is best-effort: it catches an exact return to a prior rendered state.
+/// A stage that churns fresh names every iteration (never rendering identically)
+/// shows as an endless transition log with no `CYCLE` line — still diagnostic, just
+/// via the per-pass trail rather than a single verdict.
+#[derive(Default)]
+struct FixpointTracer {
+    /// fingerprint -> (iteration, pass) that first produced it.
+    seen: HashMap<u64, (usize, &'static str)>,
+    /// Ordered (iteration, pass, fingerprint) trail since watching began, used to
+    /// reconstruct the loop body when a fingerprint recurs.
+    trail: Vec<(usize, &'static str, u64)>,
+    /// Set once a recurring fingerprint has been reported, so the same cycle is not
+    /// re-logged on every subsequent iteration.
+    cycle_reported: bool,
+}
+
+impl FixpointTracer {
+    /// Record that `pass` produced fingerprint `fp` at 1-based `iter`. `label` names
+    /// the stage and function (or `<module>`). Logs the transition and, on the first
+    /// recurrence, the detected cycle.
+    ///
+    /// Returns `true` when `fp` recurred — proof the fixpoint is cycling between
+    /// states rather than converging, so the caller should stop iterating
+    /// best-effort instead of spinning to the iteration cap.
+    fn observe(&mut self, label: &str, iter: usize, pass: &'static str, fp: u64) -> bool {
+        log::debug!(
+            target: "pipeline::fixpoint",
+            "{label} iter {iter}: {pass} moved IR -> fingerprint {fp:#018x}",
+        );
+        self.trail.push((iter, pass, fp));
+        if let Some(&(first_iter, first_pass)) = self.seen.get(&fp) {
+            if !self.cycle_reported {
+                self.cycle_reported = true;
+                let body: Vec<String> = self
+                    .trail
+                    .iter()
+                    .skip_while(|&&(i, _, h)| !(i == first_iter && h == fp))
+                    .map(|&(i, p, h)| format!("    iter {i}: {p} -> {h:#018x}"))
+                    .collect();
+                log::warn!(
+                    target: "pipeline::fixpoint",
+                    "{label}: CYCLE DETECTED — fingerprint {fp:#018x} first produced by \
+                     `{first_pass}` at iter {first_iter}, reproduced by `{pass}` at iter \
+                     {iter}. The stage is oscillating, not converging; the loop body is:\n{}",
+                    body.join("\n"),
+                );
+            }
+            true
+        } else {
+            self.seen.insert(fp, (iter, pass));
+            false
+        }
+    }
 }
 
 /// Run a function-scoped stage function-major: for each non-external function,
@@ -1129,7 +1300,14 @@ async fn run_function_stage(
         let function: std::sync::Arc<str> = FunctionRef::from_id(ctx, fun_id).name().into();
         let mut iters = 0;
         let mut function_changed = false;
-        loop {
+        // Engaged only once this function's fixpoint is clearly struggling
+        // (`FIXPOINT_WATCH_ITERS`); traces which passes keep moving the IR and
+        // flags a proven cycle. Cheap on the common path (never allocates until a
+        // pass changes the IR past the threshold).
+        let mut tracer = FixpointTracer::default();
+        let tracer_label = format!("stage {} fn {function}", stage.name);
+        'fixpoint: loop {
+            let watching = stage.repeat_until.is_some() && iters >= FIXPOINT_WATCH_ITERS;
             let mut changed = false;
             for p in passes {
                 // Skip a pass that already reached a fixpoint on this function and
@@ -1167,6 +1345,26 @@ async fn run_function_stage(
                 entry.2 += pass_changed as usize;
                 // Between-pass invariant check (opt-in via `QCODE_VERIFY`).
                 crate::verify::verify_after(ctx, p.name());
+                // Trace the fingerprint after every pass that moved the IR, so a
+                // struggling fixpoint reveals which passes keep fighting and whether
+                // the IR is truly cycling (a recurring fingerprint) vs. slowly churning.
+                if watching && pass_changed {
+                    let fp = function_fingerprint(ctx, fun_id);
+                    if tracer.observe(&tracer_label, iters + 1, p.name(), fp) {
+                        // A proven cycle cannot converge; leave this function at
+                        // the recurring state and move on to the next one instead
+                        // of spinning to the iteration cap.
+                        log::warn!(
+                            target: "pipeline::fixpoint",
+                            "stage {} fn {function}: stopping best-effort on the proven \
+                             cycle at iteration {}",
+                            stage.name,
+                            iters + 1,
+                        );
+                        function_changed = true;
+                        break 'fixpoint;
+                    }
+                }
                 changed |= pass_changed;
             }
             function_changed |= changed;
@@ -1175,10 +1373,13 @@ async fn run_function_stage(
                 break;
             }
             if iters >= MAX_FIXPOINT_ITERS {
-                return Err(format!(
-                    "stage \"{}\" did not converge on function {function} after {MAX_FIXPOINT_ITERS} iterations",
-                    stage.name
-                ));
+                log::warn!(
+                    target: "pipeline::fixpoint",
+                    "stage {} fn {function} hit the {MAX_FIXPOINT_ITERS}-iteration cap; \
+                     see the `pipeline::fixpoint` trace above for the fighting passes",
+                    stage.name,
+                );
+                return Err(nonconvergence_error(&stage.name, Some(&function)));
             }
         }
         if function_changed {
@@ -1230,6 +1431,22 @@ mod tests {
         )
         .expect("debug pipeline parses");
         assert!(pipeline.debug);
+    }
+
+    #[test]
+    fn nonconvergence_error_round_trips() {
+        // The driver keys on the phrasing to halt best-effort instead of panicking,
+        // so both forms this constructor emits must be recognized, and unrelated
+        // pipeline errors must not be mistaken for a non-convergence.
+        let module = nonconvergence_error("promote", None);
+        let func = nonconvergence_error("promote", Some("fn_430c40"));
+        assert!(is_nonconvergence(&module), "module form: {module}");
+        assert!(is_nonconvergence(&func), "function form: {func}");
+        assert!(func.contains("fn_430c40"), "names the culprit: {func}");
+        assert!(!is_nonconvergence("gvn: some other failure"));
+        assert!(!is_nonconvergence(
+            "verifier failed after stage \"promote\":\nbad invariant"
+        ));
     }
 
     fn parse_err(toml_src: &str) -> String {

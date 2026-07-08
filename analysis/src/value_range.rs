@@ -75,6 +75,22 @@ impl ValueRange {
         !self.is_full(size)
     }
 
+    /// True if the interval spans the whole range of the smallest byte-width
+    /// that contains its maximum (e.g. `[0, 255]` for one byte, `[0, 0xffff]`
+    /// for two). Such a range is Top for that width — it carries no real
+    /// upper-bound information even when the SSA value is declared wider (a
+    /// zero-extended byte index is a 4-byte value whose range is still just
+    /// `[0, 255]`), so a jump-table pass must treat it as unbounded rather than
+    /// materialize a full sub-word's worth of bogus edges.
+    pub fn fills_containing_width(&self) -> bool {
+        if self.min != 0 {
+            return false;
+        }
+        let bits = (u64::BITS - self.max.leading_zeros()) as usize;
+        let width = bits.div_ceil(8).max(1);
+        self.is_full(width)
+    }
+
     /// Set intersection. If the intervals are disjoint (a contradiction, e.g.
     /// a guard on a dead edge), returns `self` unchanged: any non-empty
     /// over-approximation is sound, and we never represent emptiness.
@@ -795,6 +811,34 @@ mod tests {
     use qcode_macro::qcode;
 
     use super::*;
+
+    #[test]
+    fn fills_containing_width_rejects_full_subword_ranges() {
+        // A zero-extended byte index: declared wider, but the range is the full
+        // byte range — Top for a byte, so it must read as unbounded.
+        assert!(ValueRange { min: 0, max: 0xff }.fills_containing_width());
+        assert!(
+            ValueRange {
+                min: 0,
+                max: 0xffff
+            }
+            .fills_containing_width()
+        );
+        assert!(
+            ValueRange {
+                min: 0,
+                max: 0xffff_ffff
+            }
+            .fills_containing_width()
+        );
+
+        // Genuine guard-derived bounds carry real information and are kept.
+        assert!(!ValueRange { min: 0, max: 11 }.fills_containing_width());
+        assert!(!ValueRange { min: 0, max: 0 }.fills_containing_width());
+        assert!(!ValueRange { min: 0, max: 300 }.fills_containing_width());
+        // A non-zero floor is never a full sub-word range.
+        assert!(!ValueRange { min: 1, max: 0xff }.fills_containing_width());
+    }
 
     #[test]
     fn literal_is_exact() {

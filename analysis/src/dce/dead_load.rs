@@ -1,7 +1,7 @@
-use rustc_hash::FxHashSet as HashSet;
+use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
 
 use crate::AliasResult;
-use jstd::graph::analysis::compute_postdominators;
+use jstd::graph::analysis::{compute_dominators, compute_postdominators};
 use qcode::{
     context::Context,
     space::{Space, SpaceId, SpaceType},
@@ -803,6 +803,195 @@ fn postdominated_dead_register_stores(
         .collect()
 }
 
+/// True when the store `killer_ptr`/`killer_size` fully covers `cand_ptr`/`cand_size`:
+/// both decompose to the same [`AddrBase`] and the killer's byte range encloses the
+/// candidate's. Offset-precise (unlike the class-based [`AliasResult::covers`]), so a
+/// whole-region write-back at `base` covers an earlier same-base `base + k` field
+/// store even when neither has an alias interval.
+fn ram_covers(
+    ctx: &Context,
+    cand_ptr: ValueId,
+    cand_size: usize,
+    killer_ptr: ValueId,
+    killer_size: usize,
+) -> bool {
+    let (cb, co) = addr_key(ctx, cand_ptr);
+    let (kb, ko) = addr_key(ctx, killer_ptr);
+    cb == kb && ko <= co && co + cand_size as i64 <= ko + killer_size as i64
+}
+
+/// A RAM store/load with the block and in-block position needed to reason about
+/// program order.
+#[derive(Clone, Copy)]
+struct RamAccess {
+    id: InstructionId,
+    block: BlockId,
+    /// Index within its block's instruction list.
+    pos: usize,
+    ptr: ValueId,
+    size: usize,
+}
+
+/// Blocks reachable from `start` by following ≥1 CFG edge (so `start` itself is
+/// included only when it lies on a cycle).
+fn forward_reachable(ctx: &Context, start: BlockId) -> HashSet<BlockId> {
+    let mut seen: HashSet<BlockId> = HashSet::default();
+    let mut stack: Vec<BlockId> = BasicBlock::from_id(ctx, start)
+        .successors()
+        .map(|(_, s)| s)
+        .collect();
+    while let Some(b) = stack.pop() {
+        if seen.insert(b) {
+            stack.extend(BasicBlock::from_id(ctx, b).successors().map(|(_, s)| s));
+        }
+    }
+    seen
+}
+
+/// RAM analog of [`postdominated_dead_register_stores`]. A store to the default
+/// (RAM/global) space is dead when a covering store in a **postdominating** block
+/// overwrites its region before every function exit and no surviving load can read
+/// the store's value. Postdominators (not the killed-set dataflow) provide the
+/// coverage, so the loop shape array_promote leaves behind — a pre-loop init/seed
+/// store overwritten by the exit-block write-back across the loop backedge — is
+/// recognized (the must-dataflow cannot cross the backedge).
+///
+/// A load `L` blocks candidate `S` (covered by killer `C`) only when it can observe
+/// `S`'s value: it may-aliases the region, `S` can reach `L`, and `C` does **not**
+/// dominate `L`. This excludes a load ordered before `S` (reads an earlier value) and
+/// a load after the cover (reads `C`'s value) — e.g. array_promote's exit write-back
+/// read — so only a genuine intervening read keeps the store.
+///
+/// The dominance exclusion is only valid for a killer that cannot **reach** the
+/// candidate: with a `C →* S` path, `C` dominating `L` no longer implies `L` reads
+/// `C`'s value (execution can run `C … S … L` with the next cover only after `L`),
+/// so such killers are skipped.
+///
+/// Sound only for **call-free** functions (v1): a callee could read the region
+/// through a pointer argument, which no explicit load models — array_promote's own
+/// precondition. `return` needs no special case: an exit block has no postdominating
+/// killer, so a store reaching it stays live.
+fn postdominated_dead_ram_stores(
+    ctx: &Context,
+    function_id: FunctionId,
+    aliases: &AliasResult,
+) -> HashSet<InstructionId> {
+    let function = Function::from_id(ctx, function_id);
+    let blocks: Vec<BlockId> = function.iter().map(|block| block.id).collect();
+    let Some(&entry) = blocks.first() else {
+        return HashSet::default();
+    };
+
+    // A callee could observe the region through a pointer argument, and an indirect
+    // branch makes the CFG (hence dominance) unreliable — gate the whole pass.
+    if function.iter().flat_map(|block| block.iter()).any(|insn| {
+        matches!(
+            insn.mnemonic(),
+            Mnemonic::Call(_) | Mnemonic::CallInd(_) | Mnemonic::BranchInd(_)
+        )
+    }) {
+        return HashSet::default();
+    }
+
+    let ram = ctx.default_space;
+    let node_set: HashSet<BlockId> = blocks.iter().copied().collect();
+    let exit_set: HashSet<BlockId> = blocks
+        .iter()
+        .copied()
+        .filter(|&block| {
+            BasicBlock::from_id(ctx, block)
+                .successors()
+                .next()
+                .is_none()
+        })
+        .collect();
+    if exit_set.is_empty() {
+        return HashSet::default();
+    }
+    let pdom = compute_postdominators(ctx, &blocks, &node_set, &exit_set);
+    let dom = compute_dominators(ctx, entry);
+
+    let mut stores: Vec<RamAccess> = Vec::new();
+    let mut loads: Vec<RamAccess> = Vec::new();
+    for &block in &blocks {
+        for (pos, &id) in BasicBlock::from_id(ctx, block)
+            .instruction_ids()
+            .iter()
+            .enumerate()
+        {
+            match ctx.get_insn(id).mnemonic() {
+                Mnemonic::Store(store) if store.space == ram => stores.push(RamAccess {
+                    id,
+                    block,
+                    pos,
+                    ptr: store.ptr,
+                    size: store.size,
+                }),
+                Mnemonic::Load(load) if load.space == ram => loads.push(RamAccess {
+                    id,
+                    block,
+                    pos,
+                    ptr: load.ptr,
+                    size: load.size,
+                }),
+                _ => {}
+            }
+        }
+    }
+
+    // `S` reaches `L`: another block reachable forward, or a same-block load that is
+    // later in program order (or `S`'s block is itself on a cycle).
+    let mut reach_cache: HashMap<BlockId, HashSet<BlockId>> = HashMap::default();
+    let mut reaches = |s: &RamAccess, l: &RamAccess| -> bool {
+        let set = reach_cache
+            .entry(s.block)
+            .or_insert_with(|| forward_reachable(ctx, s.block));
+        set.contains(&l.block) || (s.block == l.block && l.pos > s.pos)
+    };
+    // `C` dominates `L`: strictly across blocks, or earlier in the same block.
+    let c_dominates_l = |c: &RamAccess, l: &RamAccess| -> bool {
+        if c.block == l.block {
+            c.pos < l.pos
+        } else {
+            dom.dominates(c.block, l.block)
+        }
+    };
+
+    let mut dead = HashSet::default();
+    for cand in &stores {
+        for killer in &stores {
+            if killer.id == cand.id
+                || killer.block == cand.block
+                || !pdom
+                    .get(&cand.block)
+                    .is_some_and(|set| set.contains(&killer.block))
+                || !ram_covers(ctx, cand.ptr, cand.size, killer.ptr, killer.size)
+            {
+                continue;
+            }
+            // The killer must not reach the candidate. Otherwise "C dominates L"
+            // below stops implying "L reads C's value": with a C →* S path (cover
+            // on a cycle back to the store, e.g. cover in a loop header, store in
+            // the body), execution can run C … S … L with no cover in between —
+            // C only re-executes *after* L observed S.
+            if reaches(killer, cand) {
+                continue;
+            }
+            let blocked = loads.iter().any(|l| {
+                aliases.may_alias(ctx, cand.ptr, l.ptr)
+                    && !disjoint_access(ctx, cand.ptr, cand.size, l.ptr, l.size)
+                    && reaches(cand, l)
+                    && !c_dominates_l(killer, l)
+            });
+            if !blocked {
+                dead.insert(cand.id);
+                break;
+            }
+        }
+    }
+    dead
+}
+
 /// Removes dead loads/stores from `function_id` in-place.
 ///
 /// When `aliases` is provided, a flow-sensitive memory-liveness dataflow
@@ -832,6 +1021,7 @@ pub fn remove_dead_load_insns(
                 aliases,
             ));
             dead.extend(unread_frame_local_stores(ctx, function_id, aliases));
+            dead.extend(postdominated_dead_ram_stores(ctx, function_id, aliases));
             let liveness =
                 crate::mem::compute_memory_liveness(ctx, function_id, aliases, dead_regs);
             for &block_id in &block_ids {
@@ -1620,6 +1810,261 @@ mod tests {
                 .instruction_ids()
                 .contains(&exit_store),
             "exit r0_lo32 store is the return-visible value and must remain"
+        );
+    }
+
+    // ----- RAM (default-space) dead-store elimination -----------------------
+
+    /// Count `store`s to the default (RAM) space remaining in the whole function.
+    fn ram_store_count(ctx: &Context, fid: FunctionId) -> usize {
+        Function::from_id(ctx, fid)
+            .iter()
+            .flat_map(|b| b.iter().map(|i| i.id).collect::<Vec<_>>())
+            .filter(|&id| {
+                matches!(ctx.get_insn(id).mnemonic(), Mnemonic::Store(s) if s.space == ctx.default_space)
+            })
+            .count()
+    }
+
+    /// The array_promote leftover shape: a pre-loop init store at `@base`, a loop that
+    /// touches nothing in RAM, and an exit-block write-back covering `@base`. The exit
+    /// store postdominates the entry store across the loop backedge, so the init store
+    /// is dead — the killed-set dataflow can't cross the backedge, postdominance can.
+    #[test]
+    fn ram_covered_store_across_loop_is_dead() {
+        let mut ctx = Context::new();
+        qcode!(
+            ctx,
+            "
+            fn mix:
+            <entry @base:i64 @src:i64>
+                %v = load(ram:8, @src);
+                store(ram:8, @base <- %v);
+                goto <head @i=0>;
+            <head @i:i64>
+                %done = @i == 24;
+                if %done goto <exit> else goto <body @j=@i>;
+            <body @j:i64>
+                %j1 = @j + 1;
+                goto <head @i=%j1>;
+            <exit>
+                store(ram:8, @base <- i64 7);
+                return at i64 0x0;
+            "
+        );
+        let aliases = crate::AliasResult::simple(&ctx);
+        remove_dead_load_insns(&mut ctx, mix, Some(&aliases), &[]);
+        // Only the exit write-back survives; the load from the *unrelated* `@src`
+        // pointer, ordered before the store, must not keep it alive.
+        assert_eq!(
+            ram_store_count(&ctx, mix),
+            1,
+            "the covered pre-loop init store should be removed"
+        );
+    }
+
+    /// A store with no covering later store reaches `return` and stays live.
+    #[test]
+    fn ram_store_reaching_return_lives() {
+        let mut ctx = Context::new();
+        qcode!(
+            ctx,
+            "
+            fn mix:
+            <entry @base:i64>
+                store(ram:8, @base <- i64 5);
+                goto <exit>;
+            <exit>
+                return at i64 0x0;
+            "
+        );
+        let aliases = crate::AliasResult::simple(&ctx);
+        remove_dead_load_insns(&mut ctx, mix, Some(&aliases), &[]);
+        assert_eq!(
+            ram_store_count(&ctx, mix),
+            1,
+            "uncovered store must survive"
+        );
+    }
+
+    /// A read of the region between the store and its cover keeps the store live.
+    #[test]
+    fn ram_intervening_read_keeps_store() {
+        let mut ctx = Context::new();
+        qcode!(
+            ctx,
+            "
+            fn mix:
+            <entry @base:i64 @sink:i64>
+                store(ram:8, @base <- i64 5);
+                goto <head @i=0>;
+            <head @i:i64>
+                %done = @i == 24;
+                if %done goto <exit> else goto <body @j=@i>;
+            <body @j:i64>
+                %r = load(ram:8, @base);
+                store(ram:8, @sink <- %r);
+                %j1 = @j + 1;
+                goto <head @i=%j1>;
+            <exit>
+                store(ram:8, @base <- i64 7);
+                return at i64 0x0;
+            "
+        );
+        let aliases = crate::AliasResult::simple(&ctx);
+        remove_dead_load_insns(&mut ctx, mix, Some(&aliases), &[]);
+        // Both `@base` stores stay: the loop reads `@base` before the cover. (`@sink`
+        // may alias `@base`, so its store is conservatively kept too.)
+        assert!(
+            ram_store_count(&ctx, mix) >= 2,
+            "an intervening region read must keep the store"
+        );
+    }
+
+    /// A load of the region *after* the covering store (reading the cover's value,
+    /// not the candidate's) does not block removal.
+    #[test]
+    fn ram_read_after_cover_does_not_block() {
+        let mut ctx = Context::new();
+        qcode!(
+            ctx,
+            "
+            fn mix:
+            <entry @base:i64 @sink:i64>
+                store(ram:8, @base <- i64 5);
+                goto <exit>;
+            <exit>
+                store(ram:8, @base <- i64 7);
+                %r = load(ram:8, @base);
+                store(ram:8, @sink <- %r);
+                return at i64 0x0;
+            "
+        );
+        let aliases = crate::AliasResult::simple(&ctx);
+        remove_dead_load_insns(&mut ctx, mix, Some(&aliases), &[]);
+        // The entry store dies; the exit cover and the `@sink` store remain (2).
+        assert_eq!(
+            ram_store_count(&ctx, mix),
+            2,
+            "a post-cover read reads the cover's value and must not keep the store"
+        );
+    }
+
+    /// A cover on a cycle back to the store must not qualify: with the cover in the
+    /// loop header and the candidate + read in the body, execution runs
+    /// `C … S … L` each iteration — `C` dominating `L` does not mean `L` reads `C`'s
+    /// value, so deleting the body store would miscompile the read.
+    #[test]
+    fn ram_cover_reaching_back_to_store_does_not_kill() {
+        let mut ctx = Context::new();
+        qcode!(
+            ctx,
+            "
+            fn mix:
+            <entry @base:i64>
+                goto <head @i=0>;
+            <head @i:i64>
+                store(ram:8, @base <- i64 0);
+                %done = @i == 24;
+                if %done goto <exit> else goto <body @j=@i>;
+            <body @j:i64>
+                store(ram:1, @base <- i8 7);
+                %v = load(ram:1, @base);
+                %w = zext(i64, %v);
+                %j1 = @j + %w;
+                goto <head @i=%j1>;
+            <exit>
+                return at i64 0x0;
+            "
+        );
+        let aliases = crate::AliasResult::simple(&ctx);
+        remove_dead_load_insns(&mut ctx, mix, Some(&aliases), &[]);
+        assert_eq!(
+            ram_store_count(&ctx, mix),
+            2,
+            "a cover that reaches back to the store must not kill it"
+        );
+    }
+
+    /// End-to-end: array_promote leaves a pre-loop init store (read by its snapshot
+    /// load), `gvn` forwards the snapshot away, and RAM-DSE then removes the now-dead
+    /// init store — leaving only the exit write-back. Exercises the pipeline stage
+    /// `["array_promote", …, "gvn", "dce", "dead_store"]`.
+    #[test]
+    fn array_promote_leftover_init_store_is_swept() {
+        use crate::gvn::Gvn;
+        use crate::mem::array_promote::ArrayPromote;
+        use crate::test_util::run_function_pass;
+
+        let mut ctx = Context::new();
+        qcode!(
+            ctx,
+            "
+            fn mix:
+            <entry @src:i64 @base:i64>
+                %init = load(ram:24, @src);
+                store(ram:24, @base <- %init);
+                goto <head @i=0>;
+            <head @i:i64>
+                %done = @i == 24;
+                if %done goto <exit> else goto <body @j=@i>;
+            <body @j:i64>
+                %addr = @base + @j;
+                %cur = load(ram:1, %addr);
+                %jt = trunc(i8, @j);
+                %x = %cur ^ %jt;
+                store(ram:1, %addr <- %x);
+                %j1 = @j + 1;
+                goto <head @i=%j1>;
+            <exit>
+                return at i64 0x0;
+            "
+        );
+        assert!(
+            run_function_pass::<ArrayPromote>(&mut ctx, mix).unwrap(),
+            "the enveloped byte fill should promote"
+        );
+        run_function_pass::<Gvn>(&mut ctx, mix).unwrap();
+        let aliases = crate::AliasResult::simple(&ctx);
+        remove_dead_load_insns(&mut ctx, mix, Some(&aliases), &[]);
+        // Only the exit write-back of the carried array survives; the init store and
+        // the (forwarded) snapshot load of `@base` are gone.
+        let ir = format!("{}", Function::from_id(&ctx, mix));
+        assert_eq!(
+            ram_store_count(&ctx, mix),
+            1,
+            "the leftover init store should be swept: {ir}"
+        );
+        assert!(
+            !ir.contains("load(ram:24, i64 @base)"),
+            "the snapshot load should be forwarded away: {ir}"
+        );
+    }
+
+    /// The whole mechanism is gated on functions with no calls or indirect
+    /// branches: control transfer to code out of view could read the region, so
+    /// nothing is removed. `@base`'s cross-block cover would otherwise be dead.
+    #[test]
+    fn ram_dse_disabled_with_indirect_transfer() {
+        let mut ctx = Context::new();
+        qcode!(
+            ctx,
+            "
+            fn mix:
+            <entry @base:i64 @p:i64>
+                store(ram:8, @base <- i64 5);
+                goto <mid>;
+            <mid>
+                store(ram:8, @base <- i64 7);
+                goto [i64 @p];
+            "
+        );
+        let aliases = crate::AliasResult::simple(&ctx);
+        remove_dead_load_insns(&mut ctx, mix, Some(&aliases), &[]);
+        assert_eq!(
+            ram_store_count(&ctx, mix),
+            2,
+            "an indirect transfer must disable cross-block RAM DSE"
         );
     }
 }

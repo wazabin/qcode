@@ -1624,6 +1624,16 @@ impl StandaloneEmulator {
                 .cloned()
                 .or_else(|| self.get_value_bytes(ctx, id)),
             ValueId::Literal(_) => self.get_value_bytes(ctx, id),
+            // A root/block param bound by `run_pure` (e.g. an argpromote-minted
+            // `[i8;N]` array param): its little-endian bytes come from the bound
+            // `SizedValue`. Defensive width check — a short buffer must fail
+            // resolution rather than silently produce clamped `Range` slices for
+            // callers that lack the projection guarantee.
+            ValueId::BlockParam(_) => {
+                let bytes = self.get_value_bytes(ctx, id)?;
+                let ty_size = ctx.stored_type_of(id).map(|ty| ctx.types.size_of(ty))?;
+                (bytes.len() == ty_size).then_some(bytes)
+            }
             _ => None,
         }
     }
@@ -2647,6 +2657,84 @@ mod tests {
             matches!(err.kind, EmulatorErrorKind::UnsupportedIntrinsic(ref n) if &**n == "enumerate"),
             "expected recoverable UnsupportedIntrinsic, got {:?}",
             err.kind
+        );
+    }
+
+    /// Build pure `f(arr: [i8; n])` returning `at(arr, idx)` and run it with the
+    /// array param bound to `bound`. Returns the emulated scalar lane, or `None`
+    /// if `resolve_array` refuses the binding (e.g. an oversize param).
+    fn run_at_over_array_param(n: usize, idx: u64, bound: SizedValue) -> Option<u64> {
+        use qcode::builder::Builder;
+        use qcode::value::{
+            BasicBlock, Function, ValueId,
+            insn::{IntrinsicId, Return},
+        };
+
+        let mut ctx = Context::new();
+        let arr_ty = {
+            let i8 = ctx.types.get_or_make_int(1);
+            ctx.types.get_or_make_array(i8, n)
+        };
+        let f = Function::make(&mut ctx, "f".into()).unwrap().id;
+        let entry = ctx.get_or_make_block(0x1000);
+        {
+            let mut fm = Function::from_id_mut(&mut ctx, f);
+            fm.set_root(entry).unwrap();
+            fm.add_block(entry);
+        }
+        let arr_pid = BasicBlock::from_id_mut(&mut ctx, entry).push_param(n).id;
+        ctx.values.block_params[arr_pid].type_id = arr_ty;
+
+        let at_id = IntrinsicId::from_name("at").unwrap();
+        let (ret, ptr, lane);
+        {
+            let mut b = Builder::from_block(BasicBlock::from_id_mut(&mut ctx, entry));
+            let arr = ValueId::BlockParam(arr_pid);
+            let i = b.context_mut().get_const(idx, 8).id();
+            lane = b.push_intrinsic(at_id, vec![arr, i]).id();
+            ptr = b.context_mut().get_const(0, 8).id();
+            ret = b.push_return(ptr).id();
+            unsafe { b.dont_finalize() };
+        }
+        let ValueId::Instruction(rid) = ret else {
+            unreachable!()
+        };
+        ctx.replace_instruction_mnemonic(
+            rid,
+            Mnemonic::Return(Return {
+                ptr,
+                value: Some(lane),
+            }),
+        );
+
+        let mut emu = StandaloneEmulator::new(entry);
+        emu.run_pure(&ctx, f, &[bound], 1000).ok()?;
+        emu.get_value(&ctx, lane)
+    }
+
+    /// A literal-bound `[i8;4]` array param resolves through the `BlockParam` arm
+    /// of `resolve_array`: each little-endian byte of `0x2f76bfc2` is readable via
+    /// `at`, exactly the read the pure-call folder needs.
+    #[test]
+    fn run_pure_reads_array_param_bytes_little_endian() {
+        let arg = SizedValue::new(0x2f76bfc2, 4);
+        // LE layout of 0x2f76bfc2 = [0xc2, 0xbf, 0x76, 0x2f].
+        assert_eq!(run_at_over_array_param(4, 0, arg), Some(0xc2));
+        assert_eq!(run_at_over_array_param(4, 1, arg), Some(0xbf));
+        assert_eq!(run_at_over_array_param(4, 2, arg), Some(0x76));
+        assert_eq!(run_at_over_array_param(4, 3, arg), Some(0x2f));
+    }
+
+    /// An oversize array param (declared width beyond `SizedValue`'s 16-byte cap)
+    /// can't be materialized from a scalar binding, so the defensive width check
+    /// fails resolution rather than hand back a clamped, misaligned buffer.
+    #[test]
+    fn run_pure_rejects_oversize_array_param() {
+        // A 20-byte `[i8;20]` param: the bound `SizedValue` clamps to 16 bytes, so
+        // `bytes.len() (16) != ty_size (20)` and resolution must fail.
+        assert_eq!(
+            run_at_over_array_param(20, 0, SizedValue::new(0xff, 20)),
+            None
         );
     }
 

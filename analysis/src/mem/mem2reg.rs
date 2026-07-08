@@ -5,7 +5,9 @@ use qcode::value::block::BlockRef;
 use qcode::value::{
     BasicBlock, BlockId, BlockParam, BlockParamId, Function, FunctionId, Instruction, Value,
     ValueId, ValueRef, Varnode, VarnodeId,
-    insn::{Branch, CBranch, InstructionId, InstructionRef, Load, Mnemonic, Range, Store, Zext},
+    insn::{
+        Branch, CBranch, InstructionId, InstructionRef, Load, Mnemonic, Range, Sext, Store, Zext,
+    },
 };
 use qcode::{builder::Builder, context::Context};
 use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
@@ -164,6 +166,30 @@ impl<'ctx, 'str> Mem2Reg<'ctx, 'str> {
             let literal = self.ctx.values.literals[id].clone();
             if literal.symbolic.is_none() {
                 return self.ctx.get_const(literal.value, load_size).id();
+            }
+        }
+
+        // Truncating a widening cast back to its source width *is* the source:
+        // `zext(x)[0:N] == x` and `sext(x)[0:N] == x` when `x` is exactly `N`
+        // bytes wide (the truncation keeps only the low bytes the cast left
+        // untouched). Peel it instead of minting a fresh `Range`. This mirrors
+        // `const_fold`'s `cast_identity` rule, so the value mem2reg wires onto a
+        // phi edge already matches the canonical form const_fold would fold it to.
+        // Without this, mem2reg re-mints the truncation on every run and
+        // const_fold folds it right back, so the `promote` fixpoint never settles
+        // — the exact `mem2reg`⇄`const_fold` oscillation seen on a byte-wide
+        // `bool` widened into a register and then promoted across a join.
+        if value_size > load_size
+            && let ValueId::Instruction(iid) = value
+        {
+            let src = match Instruction::from_id(self.ctx, iid).mnemonic() {
+                Mnemonic::Zext(Zext { src, .. }) | Mnemonic::Sext(Sext { src, .. }) => Some(*src),
+                _ => None,
+            };
+            if let Some(src) = src
+                && ValueRef::new(src, self.ctx).size() == load_size
+            {
+                return src;
             }
         }
 
@@ -2424,6 +2450,65 @@ mod tests {
                 Mnemonic::Load(Load { ptr, .. }) if *ptr == ValueId::Varnode(r0_byte0)
             )),
             "the AL load should be sliced from the wider EAX store, not left in place:\n{body_block}"
+        );
+    }
+
+    /// Regression for the `promote`-stage `mem2reg`⇄`const_fold` oscillation
+    /// (`fn_430c40`): the wide store feeding a sliced sub-register phi stores a
+    /// *widened byte* (`zext(i32, i8 v)` — the shape recent `bool` typing
+    /// produces). Slicing the byte off it yields `zext(v)[0:1]`, which
+    /// `const_fold`'s `cast_identity` folds to `v`. If `mem2reg` re-mints that
+    /// truncation on every run, the two passes trade the edge argument forever and
+    /// the fixpoint stage never converges. With `resize_forwarded_load_value`
+    /// peeling `zext(v)[0:1] → v` itself, `mem2reg` wires the canonical `v`
+    /// directly, so a second run — even after `const_fold` has folded — reports no
+    /// change.
+    #[test]
+    fn sliced_widened_byte_phi_converges_against_const_fold() {
+        let mut tc = qcode::testing::TestContext::new();
+        let r0_lo32 = tc.r0_lo32;
+        let r0_byte0 = tc.r0_byte0;
+        let r1 = tc.r1;
+        let r2 = tc.r2;
+        let r3 = tc.r3;
+
+        qcode!(
+            tc.ctx,
+            "
+                fn func:
+                    <entry>
+                        %seed = load(register:1, {r2});
+                        %seed32 = zext(i32, %seed);
+                        store(register:4, {r0_lo32} <- %seed32);
+                        goto <body>;
+                    <body>
+                        %al = load(register:1, {r0_byte0});
+                        store(register:1, {r3} <- %al);
+                        %b = load(register:1, {r1});
+                        %b32 = zext(i32, %b);
+                        store(register:4, {r0_lo32} <- %b32);
+                        %c = load(register:1, {r2});
+                        if %c goto <body> else goto <exit>;
+                    <exit>
+                        return at 0x1000;
+            "
+        );
+
+        let aliases = AliasResult::simple(&tc.ctx);
+        assert!(
+            mem2reg(&mut tc.ctx, func, &aliases),
+            "the sliced widened byte should promote to a 1-byte phi"
+        );
+
+        // The `promote` stage runs `const_fold` after `mem2reg`; mirror it so the
+        // re-run below sees exactly the IR the stage would hand back.
+        crate::gvn::constant_fold_function(&mut tc.ctx, func);
+
+        let aliases = AliasResult::simple(&tc.ctx);
+        assert!(
+            !mem2reg(&mut tc.ctx, func, &aliases),
+            "mem2reg must converge after const_fold — not re-mint the zext(v)[0:1] \
+             truncation const_fold just folded to v"
         );
     }
 
