@@ -22,7 +22,7 @@ use crate::{
         block_param::{BlockParam, LocalParamId},
         insn::{Branch, LocalInsnId, Mnemonic},
         util::{
-            base_ref::{BaseRef, WithCtx, WithCtxMut},
+            base_ref::{BaseRef, HostRef, WithCtx, WithCtxMut, WithHost},
             named::{Named, Renameable, update_context_name},
         },
     },
@@ -164,7 +164,7 @@ impl<'str> Function<'str> {
 
     /// Gets a reference to a function from its ID
     pub fn from_id<'ctx>(ctx: &'ctx Context<'str>, id: FunctionId) -> FunctionRef<'str, 'ctx> {
-        FunctionRef { ctx, id }
+        FunctionRef::new(HostRef::Module(ctx), id)
     }
 
     /// Gets a mutable reference to a function from its ID
@@ -182,14 +182,14 @@ impl<'str> Function<'str> {
     ) -> Option<FunctionRef<'str, 'ctx>> {
         ctx.get_named(name)
             .and_then(ValueId::as_function)
-            .map(|id| FunctionRef { ctx, id })
+            .map(|id| Function::from_id(ctx, id))
     }
 
     /// Gets a reference to a function by address
     pub fn from_addr<'ctx>(ctx: &'ctx Context<'str>, addr: u64) -> Option<FunctionRef<'str, 'ctx>> {
         ctx.get_at_addr(&addr)
             .and_then(ValueId::as_function)
-            .map(|id| FunctionRef { ctx, id })
+            .map(|id| Function::from_id(ctx, id))
     }
 
     /// Gets a mutable reference to a function by address
@@ -272,10 +272,10 @@ impl<'str> Function<'str> {
 
 impl<'s, 'ctx: 's, 'str: 'ctx, Ctx> BaseRef<Ctx, FunctionId>
 where
-    Self: WithCtx<'s, 'ctx, 'str>,
+    Self: WithHost<'s, 'ctx, 'str>,
 {
     fn inner(&'s self) -> &'ctx Function<'str> {
-        &self.ctx().values.functions[self.id]
+        self.host().function(self.id)
     }
 
     fn size(&self) -> usize {
@@ -615,12 +615,12 @@ where
 
     /// The root block of this function, if it exists.
     pub fn root(&'s self) -> Option<BlockRef<'str, 'ctx>> {
-        self.inner().root.map(|id| BlockRef::new(self.ctx(), id))
+        self.inner().root.map(|id| BlockRef::new(self.host(), id))
     }
 
     /// An iterator over the (live) blocks belonging to this function.
     pub fn blocks(&'s self) -> impl Iterator<Item = BlockRef<'str, 'ctx>> + 's {
-        let ctx = self.ctx();
+        let ctx = self.host();
         let func = self.id;
         let mut ids = self.block_ids();
         // Total order: primarily by machine address, but break ties by the
@@ -634,12 +634,12 @@ where
     /// The composite ids of this function's live (owned, non-tombstoned) blocks,
     /// in roster order.
     pub fn block_ids(&'s self) -> Vec<BlockId> {
-        let ctx = self.ctx();
+        let host = self.host();
         self.inner()
             .roster
             .iter()
             .copied()
-            .filter(|&id| !ctx.values.block(id).deleted)
+            .filter(|&id| !host.block(id).deleted)
             .collect()
     }
 
@@ -671,7 +671,7 @@ where
     /// sorted by address, unlike [`blocks`](Self::blocks)).
     pub fn iter(&'s self) -> BlockIter<'str, 'ctx> {
         BlockIter {
-            ctx: self.ctx(),
+            host: self.host(),
             inner: self.block_ids().into_iter(),
         }
     }
@@ -711,17 +711,23 @@ fn tail_call_target(ctx: &Context, block: BlockId) -> Option<FunctionId> {
     (enters_at_entry && callee.id != caller).then_some(callee.id)
 }
 
-pub type FunctionRef<'str, 'ctx> = BaseRef<&'ctx Context<'str>, FunctionId>;
+pub type FunctionRef<'str, 'ctx> = BaseRef<HostRef<'ctx, 'str>, FunctionId>;
 
 impl<'s, 'ctx: 's, 'str: 'ctx> WithCtx<'s, 'ctx, 'str> for FunctionRef<'str, 'ctx> {
     fn ctx(&'s self) -> &'ctx Context<'str> {
+        self.ctx.shared()
+    }
+}
+
+impl<'s, 'ctx: 's, 'str: 'ctx> WithHost<'s, 'ctx, 'str> for FunctionRef<'str, 'ctx> {
+    fn host(&'s self) -> HostRef<'ctx, 'str> {
         self.ctx
     }
 }
 
 impl Named for FunctionRef<'_, '_> {
     fn name(&self) -> Option<&str> {
-        Some(self.ctx.values.functions[self.id].name.as_ref())
+        Some(self.ctx.function(self.id).name.as_ref())
     }
 }
 
@@ -742,7 +748,7 @@ impl<'str, 'ctx> Value<'str, 'ctx> for FunctionRef<'str, 'ctx> {
 }
 
 pub struct BlockIter<'str, 'ctx> {
-    ctx: &'ctx Context<'str>,
+    host: HostRef<'ctx, 'str>,
     inner: std::vec::IntoIter<BlockId>,
 }
 
@@ -750,7 +756,7 @@ impl<'str, 'ctx> Iterator for BlockIter<'str, 'ctx> {
     type Item = BlockRef<'str, 'ctx>;
 
     fn next(&mut self) -> Option<Self::Item> {
-        self.inner.next().map(|id| BlockRef::new(self.ctx, id))
+        self.inner.next().map(|id| BlockRef::new(self.host, id))
     }
 }
 
@@ -774,6 +780,12 @@ impl<'s, 'ctx: 's, 'str: 'ctx> WithCtx<'s, 's, 'str> for FunctionMutRef<'str, 'c
 impl<'s, 'ctx: 's, 'str: 'ctx> WithCtxMut<'s, 'str> for FunctionMutRef<'str, 'ctx> {
     fn ctx_mut(&'s mut self) -> &'s mut Context<'str> {
         self.ctx
+    }
+}
+
+impl<'s, 'ctx: 's, 'str: 'ctx> WithHost<'s, 's, 'str> for FunctionMutRef<'str, 'ctx> {
+    fn host(&'s self) -> HostRef<'s, 'str> {
+        HostRef::Module(self.ctx)
     }
 }
 
@@ -832,7 +844,7 @@ impl<'str, 'ctx> FunctionMutRef<'str, 'ctx> {
         self.add_block(id);
         self.inner_mut().root = Some(id);
 
-        let block_addr = BasicBlock::from_id(self.ctx, id).address();
+        let block_addr = BasicBlock::from_id(&*self.ctx, id).address();
         let self_addr = self.address();
 
         match (self_addr, block_addr) {
@@ -860,7 +872,7 @@ impl<'str, 'ctx> FunctionMutRef<'str, 'ctx> {
         let func = self.id;
         let root = BasicBlock::make(self.ctx, func).id;
         self.set_root(root).expect("We just created the block");
-        BlockRef::new(self.ctx, root)
+        BasicBlock::from_id(&*self.ctx, root)
     }
 
     pub fn ensure_root(&mut self, id: BlockId) -> Result<()> {

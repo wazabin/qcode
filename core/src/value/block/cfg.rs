@@ -10,7 +10,7 @@ use jstd::{
 use crate::{
     context::Context,
     value::{
-        BlockMutRef, BlockRef,
+        BasicBlock, BlockMutRef, BlockRef,
         util::base_ref::{BaseRef, WithCtx},
     },
 };
@@ -42,12 +42,12 @@ where
 
     pub fn from(&'s self) -> BlockRef<'str, 'ctx> {
         let from = self.inner().from;
-        BlockRef::new(self.ctx(), from)
+        BasicBlock::from_id(self.ctx(), from)
     }
 
     pub fn to(&'s self) -> BlockRef<'str, 'ctx> {
         let to = self.inner().to;
-        BlockRef::new(self.ctx(), to)
+        BasicBlock::from_id(self.ctx(), to)
     }
 }
 
@@ -133,19 +133,19 @@ impl<'str, 'ctx> Node<'ctx> for BlockRef<'str, 'ctx> {
     }
 
     fn new(id: BlockId, graph: &'ctx Context<'str>) -> Self {
-        Self::from_id(graph, id)
+        BasicBlock::from_id(graph, id)
     }
 
     fn graph(&self) -> &'ctx Context<'str> {
-        self.ctx
+        self.ctx.shared()
     }
 
     fn edge_ids(&self) -> &'ctx HashSet<EdgeId, FxBuildHasher> {
-        &self.ctx.values.block(self.id).edges
+        &self.ctx.block(self.id).edges
     }
 
     fn edge_count(&self) -> usize {
-        self.ctx.values.block(self.id).edges.len()
+        self.ctx.block(self.id).edges.len()
     }
 }
 

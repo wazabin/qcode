@@ -7,7 +7,7 @@ use crate::{
         function::{FunctionId, FunctionMutRef, FunctionRef},
         insn::{InstructionId, InstructionRef},
         util::{
-            base_ref::{BaseRef, WithCtx, WithCtxMut},
+            base_ref::{BaseRef, HostRef, WithCtx, WithCtxMut, WithHost},
             named::{Named, Renameable, update_context_name},
         },
     },
@@ -72,7 +72,7 @@ pub struct BasicBlock<'str> {
 impl<'str> BasicBlock<'str> {
     /// Gets a reference to a block from its ID
     pub fn from_id<'ctx>(ctx: &'ctx Context<'str>, id: BlockId) -> BlockRef<'str, 'ctx> {
-        BlockRef::new(ctx, id)
+        BlockRef::new(HostRef::Module(ctx), id)
     }
 
     /// Gets a mutable reference to a block from its ID
@@ -89,14 +89,14 @@ impl<'str> BasicBlock<'str> {
         ctx.functions()
             .find_map(|f| f.local_named(name))
             .and_then(ValueId::as_block)
-            .map(|id| BlockRef::new(ctx, id))
+            .map(|id| BasicBlock::from_id(ctx, id))
     }
 
     /// Gets a reference to a block by address
     /// A block and a function can share an address
     pub fn from_addr<'ctx>(ctx: &'ctx Context<'str>, addr: u64) -> Option<BlockRef<'str, 'ctx>> {
         ctx.get_at_addr(&addr).and_then(|id| match id {
-            ValueId::BasicBlock(block_id) => Some(BlockRef::new(ctx, block_id)),
+            ValueId::BasicBlock(block_id) => Some(BasicBlock::from_id(ctx, block_id)),
             ValueId::Function(function_id) => Function::from_id(ctx, function_id).root(),
             _ => None,
         })
@@ -111,7 +111,7 @@ impl<'str> BasicBlock<'str> {
         ctx.get_at_addr(&addr)
             .and_then(|id| match id {
                 ValueId::BasicBlock(block_id) => Some(block_id),
-                ValueId::Function(function_id) => Function::from_id(ctx, function_id)
+                ValueId::Function(function_id) => Function::from_id(&*ctx, function_id)
                     .root()
                     .map(|root| root.id),
                 _ => None,
@@ -171,7 +171,7 @@ impl<'str> BasicBlock<'str> {
         let orig_insns = ctx.values.block(orig).instructions.clone();
         for &old_insn_id in orig_insns.iter() {
             // Extract information from the old instruciton
-            let insn_ref = Instruction::from_id(ctx, old_insn_id);
+            let insn_ref = Instruction::from_id(&*ctx, old_insn_id);
             let size = insn_ref.size();
             let space = insn_ref.space().map(|s| s.id);
 
@@ -212,26 +212,37 @@ impl<'str> BasicBlock<'str> {
 // Shared read-only methods available on both BlockRef and BlockMutRef
 impl<'s, 'ctx: 's, 'str: 'ctx, Ctx> BaseRef<Ctx, BlockId>
 where
-    Self: WithCtx<'s, 'ctx, 'str>,
+    Self: WithHost<'s, 'ctx, 'str>,
 {
     fn inner(&'s self) -> &'ctx BasicBlock<'str> {
-        self.ctx().values.block(self.id)
+        self.host().block(self.id)
     }
 
     /// Iterates over outgoing `(edge_id, successor_block_id)` pairs.
+    ///
+    /// Routed through [`HostRef`] (this block's incident edge set and each edge's
+    /// endpoints) rather than the `jstd` graph traits, so it reads correctly when
+    /// the owning function is checked out. On the module path it yields exactly
+    /// what `Node::children` did: the same incident-edge set, filtered to edges
+    /// leaving this block.
     pub fn successors(&'s self) -> impl Iterator<Item = (EdgeId, BlockId)> + 's {
-        use jstd::graph::Node;
-        BlockRef::new(self.ctx(), self.id)
-            .children()
-            .map(|item| (item.edge_id(), item.node_id()))
+        let host = self.host();
+        let id = self.id;
+        self.inner().edges.iter().copied().filter_map(move |edge| {
+            let e = host.edge(edge);
+            (e.from == id).then_some((edge, e.to))
+        })
     }
 
-    /// Iterates over incoming `(edge_id, predecessor_block_id)` pairs.
+    /// Iterates over incoming `(edge_id, predecessor_block_id)` pairs. See
+    /// [`successors`](Self::successors) for the routing rationale.
     pub fn predecessors(&'s self) -> impl Iterator<Item = (EdgeId, BlockId)> + 's {
-        use jstd::graph::Node;
-        BlockRef::new(self.ctx(), self.id)
-            .parents()
-            .map(|item| (item.edge_id(), item.node_id()))
+        let host = self.host();
+        let id = self.id;
+        self.inner().edges.iter().copied().filter_map(move |edge| {
+            let e = host.edge(edge);
+            (e.to == id).then_some((edge, e.from))
+        })
     }
 
     pub fn name(&'s self) -> Option<&'ctx str> {
@@ -252,7 +263,7 @@ where
         self.inner()
             .params
             .iter()
-            .map(|&id| BlockParam::from_id(self.ctx(), id))
+            .map(|&id| BlockParamRef::new(self.host(), id))
     }
 
     /// Returns the number of parameters declared on this block.
@@ -264,7 +275,7 @@ where
     pub fn instructions(&'s self) -> InstructionIter<'str, 'ctx> {
         let inner = self.inner();
         InstructionIter {
-            ctx: self.ctx(),
+            host: self.host(),
             inner: inner.instructions.iter(),
         }
     }
@@ -292,7 +303,7 @@ where
     pub fn parent(&'s self) -> Option<FunctionRef<'str, 'ctx>> {
         self.inner()
             .parent
-            .map(|fid| Function::from_id(self.ctx(), fid))
+            .map(|fid| FunctionRef::new(self.host(), fid))
     }
 
     pub fn function(&'s self) -> Option<FunctionRef<'str, 'ctx>> {
@@ -334,11 +345,7 @@ where
         {
             let mut succ: Vec<&str> = self
                 .successors()
-                .map(|(_, b)| {
-                    BasicBlock::from_id(self.ctx(), b)
-                        .name()
-                        .unwrap_or("unnamed")
-                })
+                .map(|(_, b)| BlockRef::new(self.host(), b).name().unwrap_or("unnamed"))
                 .collect();
             if !succ.is_empty() {
                 succ.sort_unstable();
@@ -354,17 +361,23 @@ where
     }
 }
 
-pub type BlockRef<'str, 'ctx> = BaseRef<&'ctx Context<'str>, BlockId>;
+pub type BlockRef<'str, 'ctx> = BaseRef<HostRef<'ctx, 'str>, BlockId>;
 
 impl<'s, 'ctx: 's, 'str: 'ctx> WithCtx<'s, 'ctx, 'str> for BlockRef<'str, 'ctx> {
     fn ctx(&'s self) -> &'ctx Context<'str> {
+        self.ctx.shared()
+    }
+}
+
+impl<'s, 'ctx: 's, 'str: 'ctx> WithHost<'s, 'ctx, 'str> for BlockRef<'str, 'ctx> {
+    fn host(&'s self) -> HostRef<'ctx, 'str> {
         self.ctx
     }
 }
 
 impl Named for BlockRef<'_, '_> {
     fn name(&self) -> Option<&str> {
-        self.ctx.values.block(self.id).name.as_deref()
+        self.ctx.block(self.id).name.as_deref()
     }
 }
 
@@ -385,7 +398,7 @@ impl<'str, 'ctx> Value<'str, 'ctx> for BlockRef<'str, 'ctx> {
 }
 
 pub struct InstructionIter<'str, 'ctx> {
-    ctx: &'ctx Context<'str>,
+    host: HostRef<'ctx, 'str>,
     inner: slice::Iter<'ctx, InstructionId>,
 }
 
@@ -395,7 +408,7 @@ impl<'str, 'ctx> Iterator for InstructionIter<'str, 'ctx> {
     fn next(&mut self) -> Option<Self::Item> {
         self.inner
             .next()
-            .map(|id| InstructionRef::new(self.ctx, *id))
+            .map(|id| InstructionRef::new(self.host, *id))
     }
 }
 
@@ -419,6 +432,12 @@ impl<'s, 'ctx: 's, 'str: 'ctx> WithCtx<'s, 's, 'str> for BlockMutRef<'str, 'ctx>
 impl<'s, 'ctx: 's, 'str: 'ctx> WithCtxMut<'s, 'str> for BlockMutRef<'str, 'ctx> {
     fn ctx_mut(&'s mut self) -> &'s mut Context<'str> {
         self.ctx
+    }
+}
+
+impl<'s, 'ctx: 's, 'str: 'ctx> WithHost<'s, 's, 'str> for BlockMutRef<'str, 'ctx> {
+    fn host(&'s self) -> HostRef<'s, 'str> {
+        HostRef::Module(self.ctx)
     }
 }
 
@@ -498,7 +517,7 @@ impl<'str, 'ctx> BlockMutRef<'str, 'ctx> {
     }
 
     pub fn as_ref(&self) -> BlockRef<'str, '_> {
-        BlockRef::new(self.ctx, self.id)
+        BlockRef::new(HostRef::Module(self.ctx), self.id)
     }
 
     pub fn set_comment(&mut self, comment: Option<String>) {

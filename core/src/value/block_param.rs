@@ -4,9 +4,9 @@ use crate::{
     types::TypeId,
     value::{
         Value, ValueId,
-        block::{BasicBlock, BlockId, BlockRef},
+        block::{BlockId, BlockRef},
         util::{
-            base_ref::{BaseRef, WithCtx, WithCtxMut},
+            base_ref::{BaseRef, HostRef, WithCtx, WithCtxMut, WithHost},
             named::{Named, Renameable, update_context_name},
         },
     },
@@ -89,7 +89,7 @@ impl<'str> BlockParam<'str> {
     }
 
     pub fn from_id<'ctx>(ctx: &'ctx Context<'str>, id: BlockParamId) -> BlockParamRef<'str, 'ctx> {
-        BlockParamRef::from_id(ctx, id)
+        BlockParamRef::new(HostRef::Module(ctx), id)
     }
 
     pub fn from_id_mut<'ctx>(
@@ -103,10 +103,10 @@ impl<'str> BlockParam<'str> {
 // Shared read-only methods available on both BlockParamRef and BlockParamMutRef
 impl<'s, 'ctx: 's, 'str: 'ctx, Ctx> BaseRef<Ctx, BlockParamId>
 where
-    Self: WithCtx<'s, 'ctx, 'str>,
+    Self: WithHost<'s, 'ctx, 'str>,
 {
     fn inner(&'s self) -> &'ctx BlockParam<'str> {
-        self.ctx().values.block_param(self.id)
+        self.host().block_param(self.id)
     }
 
     /// Position of this parameter in the owning block's param list.
@@ -126,9 +126,7 @@ where
 
     /// The block this parameter belongs to, if any.
     pub fn parent(&'s self) -> Option<BlockRef<'str, 'ctx>> {
-        self.inner()
-            .parent
-            .map(|id| BasicBlock::from_id(self.ctx(), id))
+        self.inner().parent.map(|id| BlockRef::new(self.host(), id))
     }
 
     pub fn name(&'s self) -> Option<&'ctx str> {
@@ -176,17 +174,23 @@ where
     }
 }
 
-pub type BlockParamRef<'str, 'ctx> = BaseRef<&'ctx Context<'str>, BlockParamId>;
+pub type BlockParamRef<'str, 'ctx> = BaseRef<HostRef<'ctx, 'str>, BlockParamId>;
 
 impl<'s, 'ctx: 's, 'str: 'ctx> WithCtx<'s, 'ctx, 'str> for BlockParamRef<'str, 'ctx> {
     fn ctx(&'s self) -> &'ctx Context<'str> {
+        self.ctx.shared()
+    }
+}
+
+impl<'s, 'ctx: 's, 'str: 'ctx> WithHost<'s, 'ctx, 'str> for BlockParamRef<'str, 'ctx> {
+    fn host(&'s self) -> HostRef<'ctx, 'str> {
         self.ctx
     }
 }
 
 impl Named for BlockParamRef<'_, '_> {
     fn name(&self) -> Option<&str> {
-        self.ctx.values.block_param(self.id).name.as_deref()
+        self.ctx.block_param(self.id).name.as_deref()
     }
 }
 
@@ -237,13 +241,19 @@ impl<'str, 'ctx> BlockParamMutRef<'str, 'ctx> {
     }
 
     pub fn as_ref(&self) -> BlockParamRef<'str, '_> {
-        BlockParamRef::new(self.ctx, self.id)
+        BlockParamRef::new(HostRef::Module(self.ctx), self.id)
     }
 }
 
 impl<'s, 'ctx: 's, 'str: 'ctx> WithCtx<'s, 's, 'str> for BlockParamMutRef<'str, 'ctx> {
     fn ctx(&'s self) -> &'s Context<'str> {
         self.ctx
+    }
+}
+
+impl<'s, 'ctx: 's, 'str: 'ctx> WithHost<'s, 's, 'str> for BlockParamMutRef<'str, 'ctx> {
+    fn host(&'s self) -> HostRef<'s, 'str> {
+        HostRef::Module(self.ctx)
     }
 }
 

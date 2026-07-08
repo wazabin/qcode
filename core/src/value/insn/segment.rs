@@ -126,7 +126,7 @@ impl<'a, 'str> Seg<'a, 'str> {
         let link = Some(Link::Value(id));
         match id {
             ValueId::Instruction(iid) => {
-                let r = InstructionRef::new(self.ctx, iid);
+                let r = InstructionRef::from_id(self.ctx, iid);
                 self.ty(r.type_id());
                 self.push(instruction_atom(self.ctx, iid), TokenKind::Variable, link);
             }
@@ -232,7 +232,7 @@ fn block_param_atom(ctx: &Context<'_>, id: crate::value::BlockParamId) -> String
 /// Render an instruction as colored, linkable tokens. Concatenating the tokens'
 /// text equals the instruction's `Display` (`as_statement()`) output.
 pub fn instruction_segments(insn: &InstructionRef<'_, '_>) -> Vec<Token> {
-    let ctx = insn.ctx;
+    let ctx = insn.ctx.shared();
     let mut seg = Seg {
         ctx,
         out: Vec::new(),

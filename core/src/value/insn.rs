@@ -8,9 +8,9 @@ use crate::{
     space::{Space, SpaceId, SpaceRef, SpaceType},
     types::TypeId,
     value::{
-        BasicBlock, BlockId, BlockRef, FunctionId, FunctionRef, Value, ValueId,
+        BlockId, BlockRef, FunctionId, FunctionRef, Value, ValueId,
         util::{
-            base_ref::{BaseRef, WithCtx, WithCtxMut},
+            base_ref::{BaseRef, HostRef, WithCtx, WithCtxMut, WithHost},
             named::{Named, Renameable, update_context_name},
         },
     },
@@ -119,7 +119,7 @@ impl<'str> Instruction<'str> {
         ctx: &'ctx Context<'str>,
         id: InstructionId,
     ) -> InstructionRef<'str, 'ctx> {
-        InstructionRef::from_id(ctx, id)
+        InstructionRef::new(HostRef::Module(ctx), id)
     }
 
     pub fn from_id_mut<'ctx>(
@@ -132,10 +132,10 @@ impl<'str> Instruction<'str> {
 
 impl<'s, 'ctx: 's, 'str: 'ctx, Ctx> BaseRef<Ctx, InstructionId>
 where
-    Self: WithCtx<'s, 'ctx, 'str>,
+    Self: WithHost<'s, 'ctx, 'str>,
 {
     fn inner(&'s self) -> &'ctx Instruction<'str> {
-        self.ctx().values.instruction(self.id)
+        self.host().instruction(self.id)
     }
 
     /// The name of this instruction's output value
@@ -155,9 +155,7 @@ where
 
     /// The basic block that this instruction belongs to, if any.
     pub fn parent(&'s self) -> Option<BlockRef<'str, 'ctx>> {
-        self.inner()
-            .parent
-            .map(|id| BasicBlock::from_id(self.ctx(), id))
+        self.inner().parent.map(|id| BlockRef::new(self.host(), id))
     }
 
     pub fn block(&'s self) -> Option<BlockRef<'str, 'ctx>> {
@@ -221,7 +219,7 @@ where
     }
 }
 
-pub type InstructionRef<'str, 'ctx> = BaseRef<&'ctx Context<'str>, InstructionId>;
+pub type InstructionRef<'str, 'ctx> = BaseRef<HostRef<'ctx, 'str>, InstructionId>;
 
 impl<'str, 'ctx> InstructionRef<'str, 'ctx> {
     /// Creates an instruction with a plain `Int(size)` result type, born into
@@ -236,7 +234,7 @@ impl<'str, 'ctx> InstructionRef<'str, 'ctx> {
         let type_id = ctx.types.get_or_make_int(size);
         let insn = Instruction::new(type_id, mnemonic);
         let id = ctx.values.push_insn(func, insn);
-        Self::from_id(ctx, id)
+        InstructionRef::new(HostRef::Module(ctx), id)
     }
 
     /// Creates an instruction with an explicit [`TypeId`], born into `func`.
@@ -252,7 +250,7 @@ impl<'str, 'ctx> InstructionRef<'str, 'ctx> {
     ) -> Self {
         let insn = Instruction::new(type_id, mnemonic);
         let id = ctx.values.push_insn(func, insn);
-        Self::from_id(ctx, id)
+        InstructionRef::new(HostRef::Module(ctx), id)
     }
 
     /// Creates an instruction, deriving the result type from an optional space tag.
@@ -269,7 +267,7 @@ impl<'str, 'ctx> InstructionRef<'str, 'ctx> {
         let type_id = ctx.types.get_or_make_int(size);
         let insn = Instruction::new(type_id, mnemonic);
         let id = ctx.values.push_insn(func, insn);
-        Self::from_id(ctx, id)
+        InstructionRef::new(HostRef::Module(ctx), id)
     }
 
     /// Format this instruction as a string, with the mnemonic and operands
@@ -280,13 +278,19 @@ impl<'str, 'ctx> InstructionRef<'str, 'ctx> {
 
 impl<'s, 'ctx: 's, 'str: 'ctx> WithCtx<'s, 'ctx, 'str> for InstructionRef<'str, 'ctx> {
     fn ctx(&'s self) -> &'ctx Context<'str> {
+        self.ctx.shared()
+    }
+}
+
+impl<'s, 'ctx: 's, 'str: 'ctx> WithHost<'s, 'ctx, 'str> for InstructionRef<'str, 'ctx> {
+    fn host(&'s self) -> HostRef<'ctx, 'str> {
         self.ctx
     }
 }
 
 impl Named for InstructionRef<'_, '_> {
     fn name(&self) -> Option<&str> {
-        self.ctx.values.instruction(self.id).name.as_deref()
+        self.ctx.instruction(self.id).name.as_deref()
     }
 }
 
@@ -403,6 +407,12 @@ impl<'s, 'ctx: 's, 'str: 'ctx> WithCtx<'s, 's, 'str> for InstructionMutRef<'str,
 impl<'s, 'ctx: 's, 'str: 'ctx> WithCtxMut<'s, 'str> for InstructionMutRef<'str, 'ctx> {
     fn ctx_mut(&'s mut self) -> &'s mut Context<'str> {
         self.ctx
+    }
+}
+
+impl<'s, 'ctx: 's, 'str: 'ctx> WithHost<'s, 's, 'str> for InstructionMutRef<'str, 'ctx> {
+    fn host(&'s self) -> HostRef<'s, 'str> {
+        HostRef::Module(self.ctx)
     }
 }
 

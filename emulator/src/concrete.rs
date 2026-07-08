@@ -1107,7 +1107,7 @@ impl StandaloneEmulator {
         let insn_ids = block.instruction_ids();
         assert!(self.idx < insn_ids.len(), "Reached end of block");
         let insn_id = insn_ids[self.idx];
-        let insn = InstructionRef::new(ctx, insn_id);
+        let insn = InstructionRef::from_id(ctx, insn_id);
         let id = insn.id;
 
         if let Some(hook) = self.instruction_hook.as_ref() {
@@ -1519,7 +1519,7 @@ impl StandaloneEmulator {
             let insn_ids = BasicBlock::from_id(ctx, self.block)
                 .instruction_ids()
                 .to_vec();
-            let insn = InstructionRef::new(ctx, insn_ids[self.idx]);
+            let insn = InstructionRef::from_id(ctx, insn_ids[self.idx]);
 
             if matches!(insn.mnemonic(), Mnemonic::Return(_)) && call_depth == 0 {
                 break Ok(());
@@ -2028,7 +2028,7 @@ impl StandaloneEmulator {
             if self.idx >= insn_ids.len() {
                 break Err(self.make_empty_block_error(ctx));
             }
-            let insn = InstructionRef::new(ctx, insn_ids[self.idx]);
+            let insn = InstructionRef::from_id(ctx, insn_ids[self.idx]);
             if matches!(
                 insn.mnemonic(),
                 Mnemonic::Return(_) | Mnemonic::ReturnValue(_)
@@ -2312,7 +2312,7 @@ impl<'ctx> Emulator<'ctx> {
             None
         } else {
             let id = block.instruction_ids()[self.inner.idx];
-            Some(InstructionRef::new(self.ctx, id))
+            Some(InstructionRef::from_id(self.ctx, id))
         }
     }
 

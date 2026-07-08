@@ -613,7 +613,7 @@ impl MemForward {
         let ValueId::Instruction(id) = v else {
             return None;
         };
-        let Mnemonic::Load(load) = InstructionRef::new(ctx, id).mnemonic().clone() else {
+        let Mnemonic::Load(load) = InstructionRef::from_id(ctx, id).mnemonic().clone() else {
             return None;
         };
         let (base, start) = locate(load.ptr, load.space, aliases, numbering);

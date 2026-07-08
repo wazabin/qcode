@@ -14,7 +14,7 @@ use crate::{
     types::TypeId,
     value::{
         Function, Value, ValueId,
-        block::{BlockId, BlockRef},
+        block::{BasicBlock, BlockId},
         function::FunctionId,
         util::base_ref::{BaseRef, WithCtx},
     },
@@ -94,7 +94,7 @@ impl std::fmt::Display for LiteralRef<'_, '_> {
         let literal = &self.ctx.values.literals[self.id];
         match &literal.symbolic {
             Some(SymbolicRef::Block(bid)) => {
-                let block = BlockRef::new(self.ctx, *bid);
+                let block = BasicBlock::from_id(self.ctx, *bid);
                 match block.name() {
                     Some(name) => write!(f, "&<{}>", name),
                     None => write!(f, "&<0x{:x}>", literal.value),

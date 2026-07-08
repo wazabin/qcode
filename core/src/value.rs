@@ -416,7 +416,7 @@ impl<'str, 'ctx> ValueRef<'str, 'ctx> {
             ValueId::Literal(lit_id) => ValueRef::Literal(LiteralRef::new(ctx, lit_id)),
             ValueId::Bytes(bytes_id) => ValueRef::Bytes(BytesRef::new(ctx, bytes_id)),
             ValueId::Instruction(insn_id) => {
-                ValueRef::Instruction(InstructionRef::new(ctx, insn_id))
+                ValueRef::Instruction(InstructionRef::from_id(ctx, insn_id))
             }
             ValueId::BasicBlock(bb_id) => ValueRef::BasicBlock(BasicBlock::from_id(ctx, bb_id)),
             ValueId::BlockParam(param_id) => {
@@ -452,11 +452,11 @@ impl Display for ValueRef<'_, '_> {
         let ctx = match self {
             ValueRef::Literal(r) => r.ctx,
             ValueRef::Bytes(r) => r.ctx,
-            ValueRef::Instruction(r) => r.ctx,
-            ValueRef::BasicBlock(r) => r.ctx,
-            ValueRef::BlockParam(r) => r.ctx,
+            ValueRef::Instruction(r) => r.ctx.shared(),
+            ValueRef::BasicBlock(r) => r.ctx.shared(),
+            ValueRef::BlockParam(r) => r.ctx.shared(),
             ValueRef::Varnode(r) => r.ctx,
-            ValueRef::Function(r) => r.ctx,
+            ValueRef::Function(r) => r.ctx.shared(),
         };
         for token in insn::segment::value_tokens(ctx, self.id()) {
             write!(f, "{}", token.text)?;

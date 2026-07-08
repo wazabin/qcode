@@ -485,14 +485,14 @@ impl<'str> Context<'str> {
     pub fn instructions(&self) -> impl Iterator<Item = InstructionRef<'str, '_>> + '_ {
         self.instruction_ids()
             .into_iter()
-            .map(|id| Instruction::from_id(self, id))
+            .map(move |id| Instruction::from_id(self, id))
     }
 
     /// Iterates over all the (live) blocks in the context.
     pub fn blocks(&self) -> impl Iterator<Item = BlockRef<'str, '_>> + '_ {
         self.block_ids()
             .into_iter()
-            .map(|id| BlockRef::from_id(self, id))
+            .map(move |id| BlockRef::from_id(self, id))
     }
 
     /// Iterates over all the functions in the context
@@ -715,7 +715,7 @@ impl<'str> Context<'str> {
 
     /// Returns an immutable reference to the instruction identified by `id`.
     pub fn get_insn(&self, id: InstructionId) -> InstructionRef<'str, '_> {
-        InstructionRef::new(self, id)
+        InstructionRef::from_id(self, id)
     }
 
     /// Returns an immutable reference to the varnode mapped to the named
@@ -935,9 +935,9 @@ impl<'str> Context<'str> {
 
             // If this instruction was a terminator instruction in a basic block,
             // remove cfg edges
-            if Instruction::from_id(self, id).mnemonic().is_terminator() {
+            if Instruction::from_id(&*self, id).mnemonic().is_terminator() {
                 let mut edges_to_remove = HashSet::default();
-                for edge in BasicBlock::from_id(self, block_id).successors() {
+                for edge in BasicBlock::from_id(&*self, block_id).successors() {
                     edges_to_remove.insert(edge.0);
                 }
 
@@ -1208,7 +1208,7 @@ impl<'str> Graph for Context<'str> {
     fn nodes(&self) -> impl Iterator<Item = Self::Node<'_>> + '_ {
         self.block_ids()
             .into_iter()
-            .map(|id| BasicBlock::from_id(self, id))
+            .map(move |id| BasicBlock::from_id(self, id))
     }
 
     fn edges(&self) -> impl Iterator<Item = Self::Edge<'_>> + '_ {
@@ -1293,6 +1293,82 @@ mod tests {
         assert_eq!(FunctionRef::from_id(&ctx, alpha).name(), "alpha");
         assert_eq!(FunctionRef::from_id(&ctx, alpha).blocks().count(), 2);
         assert_eq!(FunctionRef::from_id(&ctx, beta).name(), "beta");
+    }
+
+    #[test]
+    fn checked_host_reads_match_module_reads() {
+        use crate::value::{
+            FunctionId, FunctionRef,
+            block::BlockId,
+            util::base_ref::{BaseRef, HostRef},
+        };
+
+        let mut ctx = Context::new();
+        qcode!(
+            ctx,
+            "
+            fn foo:
+                <bb1>
+                    if i8 1 goto <bb2> else goto <bb3>;
+                <bb2>
+                    goto <bb3>;
+                <bb3>
+                    return at 0;
+            "
+        );
+        let fid = Function::from_name(&ctx, "foo").unwrap().id();
+        let fid = ValueId::as_function(fid).unwrap();
+
+        // A structural snapshot read entirely through a `HostRef` — function name,
+        // and per (address-then-index ordered) block: name, successor block names,
+        // instruction opcodes, and param count. Both hosts route through the same
+        // ref code, so equal snapshots prove the `Checked` routing.
+        type Snap = (String, Vec<(String, Vec<String>, Vec<String>, usize)>);
+        fn snapshot(host: HostRef, fid: FunctionId) -> Snap {
+            let f = FunctionRef::new(host, fid);
+            let blocks = f
+                .blocks()
+                .map(|b| {
+                    let name = b.name().unwrap_or("?").to_string();
+                    let mut succ: Vec<String> = b
+                        .successors()
+                        .map(|(_, s)| {
+                            BaseRef::<HostRef, BlockId>::new(host, s)
+                                .name()
+                                .unwrap_or("?")
+                                .to_string()
+                        })
+                        .collect();
+                    succ.sort();
+                    let ops: Vec<String> =
+                        b.instructions().map(|i| i.opcode().to_string()).collect();
+                    (name, succ, ops, b.num_params())
+                })
+                .collect();
+            (f.name().to_string(), blocks)
+        }
+
+        let module_snap = snapshot(HostRef::Module(&ctx), fid);
+        assert!(!module_snap.1.is_empty(), "sanity: foo has blocks");
+
+        // Check the function out; its registry slot is now an empty sentinel, so a
+        // plain module read sees nothing — only `Checked` routing recovers it.
+        let fun = ctx.checkout_function(fid);
+        assert_eq!(FunctionRef::from_id(&ctx, fid).blocks().count(), 0);
+
+        let checked = HostRef::Checked {
+            fun: &fun,
+            shared: &ctx,
+            id: fid,
+        };
+        let checked_snap = snapshot(checked, fid);
+        assert_eq!(
+            module_snap, checked_snap,
+            "reads through a Checked host must match the pre-checkout module reads"
+        );
+
+        ctx.checkin_function(fid, fun);
+        assert_eq!(FunctionRef::from_id(&ctx, fid).blocks().count(), 3);
     }
 
     #[test]
