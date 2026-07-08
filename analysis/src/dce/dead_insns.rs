@@ -111,34 +111,17 @@ pub fn remove_unused_no_pred_block_params(ctx: &mut Context, block_id: BlockId) 
 
     // A `pure_reg` function's entry params are its canonical interface, aligned
     // index-for-index with `input_regs` and every caller's `Call.args`. Removing
-    // one is an interface change, so route it through `remove_entry_param`, which
-    // drops the param, the matching `input_regs` entry, and the matching argument
-    // at every direct caller in lockstep — keeping the alignment the emulator's
-    // positional arg-binding relies on. (Conventional functions keep the local
-    // removal below.)
-    if let Some((fid, is_entry, pure_reg)) =
-        BasicBlock::from_id(ctx, block_id).function().map(|f| {
-            (
-                f.id,
-                f.root().map(|b| b.id) == Some(block_id),
-                f.is_pure_reg(),
-            )
-        })
-        && is_entry
-        && pure_reg
-    {
-        let params = ctx.values.block(block_id).params.clone();
-        let dead: Vec<usize> = params
-            .iter()
-            .enumerate()
-            .filter(|(_, p)| ctx.users(**p).is_empty() && !ctx.values.block_param(**p).protected)
-            .map(|(i, _)| i)
-            .collect();
-        // Remove high index first so the lower indices stay valid.
-        for &index in dead.iter().rev() {
-            crate::remove_entry_param(ctx, fid, index);
-        }
-        return !dead.is_empty();
+    // one is an interprocedural change that must drop the param, its `input_regs`
+    // entry, and the matching argument at every caller in lockstep — that is the
+    // job of the `dead_signature` module pass (via `remove_entry_param`), not of
+    // this per-function sweep. A function pass must not reach across functions, so
+    // leave pure_reg entry params for `dead_signature`; the *local* fallback below
+    // would silently drop the param and break the interface alignment.
+    let is_pure_reg_entry = BasicBlock::from_id(ctx, block_id)
+        .function()
+        .is_some_and(|f| f.is_pure_reg() && f.root().map(|b| b.id) == Some(block_id));
+    if is_pure_reg_entry {
+        return false;
     }
 
     let params = ctx.values.block(block_id).params.clone();
@@ -170,7 +153,7 @@ mod tests {
         space::SpaceId,
         testing::TestContext,
         value::{
-            BlockId, Function, FunctionId, ValueId,
+            BlockId, Function, ValueId,
             insn::{Mnemonic, PCodeOpId},
         },
     };

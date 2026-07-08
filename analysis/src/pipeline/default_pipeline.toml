@@ -74,10 +74,12 @@ passes = ["seed_clobbers"]
 # varnode-type override) before any pass turns register reads into params, so the
 # promoted entry params (argpromote-registers, then mem2reg) inherit the type and
 # the later `struct-typing` stage can unfold `fs:[…]` into named TEB/PEB fields. A
-# no-op on any other platform (gated on the PE header via ArchConfig).
+# no-op on any other platform (gated on the PE header via ArchConfig). A
+# whole-program pass: it installs a single global varnode-type override, so it
+# runs once module-wide rather than once per function.
 [[stage]]
 name = "windows-teb-seed"
-scope = "function"
+scope = "module"
 passes = ["windows_teb_seed"]
 
 # Functionalize register side effects while register load/stores are still

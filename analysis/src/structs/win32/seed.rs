@@ -26,10 +26,10 @@ use qcode::{
     assumption::Proposition,
     context::{Context, TargetOs},
     types::{AggregateField, TypeId},
-    value::{FunctionId, ValueId, Varnode, VarnodeId},
+    value::{ValueId, Varnode, VarnodeId},
 };
 
-use crate::{FunctionPass, PipelineEnv};
+use crate::{Pass, PipelineEnv};
 
 use super::hstruct::{HFieldKind, HStruct};
 
@@ -99,27 +99,27 @@ fn register_varnode(ctx: &Context, name: &str) -> Option<VarnodeId> {
         .find(|&vid| Varnode::from_id(ctx, vid).name() == Some(name))
 }
 
-/// Registered pass: on a **Windows x86** target, type the `FS_OFFSET` segment
-/// base as a global `PtrTo<TEB>` (the platform gate reads
+/// Registered **module** pass: on a **Windows x86** target, type the `FS_OFFSET`
+/// segment base as a global `PtrTo<TEB>` (the platform gate reads
 /// [`ArchConfig`](crate::ArchConfig) on the [`PipelineEnv`], populated from the
 /// PE header). A no-op on any other platform, or once the register is already
-/// typed (the override is global, so one application covers all functions).
+/// typed.
+///
+/// It is a whole-program [`Pass`], not a [`FunctionPass`]: it ignores any single
+/// function and mutates *global* module state (a varnode-type override, global
+/// struct types, and a module assumption). One application covers every
+/// function, so it belongs in a module-scoped stage.
 #[derive(Default)]
 pub struct WindowsTebSeed;
 
-impl FunctionPass for WindowsTebSeed {
+impl Pass for WindowsTebSeed {
     const NAME: &'static str = "windows_teb_seed";
 
     fn description(&self) -> &'static str {
         "Type the FS_OFFSET register as PtrTo<TEB> on Windows x86"
     }
 
-    fn run(
-        &self,
-        ctx: &mut Context,
-        _fun_id: FunctionId,
-        env: &PipelineEnv,
-    ) -> Result<bool, String> {
+    fn run(&self, ctx: &mut Context, env: &PipelineEnv) -> Result<bool, String> {
         if env.cfg.os != TargetOs::Windows || env.cfg.bitness != 32 {
             return Ok(false);
         }
@@ -138,7 +138,7 @@ impl FunctionPass for WindowsTebSeed {
     }
 }
 
-crate::register_function_pass!(WindowsTebSeed);
+crate::register_module_pass!(WindowsTebSeed);
 
 #[cfg(test)]
 mod tests {
@@ -263,7 +263,7 @@ mod tests {
         // Wrong platform: no-op, register stays untyped.
         assert!(
             !WindowsTebSeed
-                .run(&mut ctx, f, &env_for(TargetOs::Linux, 64))
+                .run(&mut ctx, &env_for(TargetOs::Linux, 64))
                 .unwrap()
         );
         let t = ctx.type_of(ValueId::Varnode(fs));
@@ -272,14 +272,14 @@ mod tests {
         // Windows x86: types the register and is idempotent on a second run.
         assert!(
             WindowsTebSeed
-                .run(&mut ctx, f, &env_for(TargetOs::Windows, 32))
+                .run(&mut ctx, &env_for(TargetOs::Windows, 32))
                 .unwrap()
         );
         let t = ctx.type_of(ValueId::Varnode(fs));
         assert!(ctx.types.pointee_of(t).is_some());
         assert!(
             !WindowsTebSeed
-                .run(&mut ctx, f, &env_for(TargetOs::Windows, 32))
+                .run(&mut ctx, &env_for(TargetOs::Windows, 32))
                 .unwrap()
         );
     }
