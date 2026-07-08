@@ -9,6 +9,7 @@
 mod block_terminators;
 mod bool_typing;
 mod dangling_refs;
+mod intra_function_ssa;
 mod pointer_spaces;
 mod pure_function;
 mod pure_reg_call_args;
@@ -16,6 +17,7 @@ mod pure_reg_call_args;
 pub use block_terminators::verify_block_terminators;
 pub use bool_typing::verify_bool_typing;
 pub use dangling_refs::verify_no_dangling_refs;
+pub use intra_function_ssa::verify_intra_function_ssa;
 pub use pointer_spaces::verify_pointer_spaces;
 pub use pure_function::{PureFunctionViolation, verify_pure_functions};
 pub use pure_reg_call_args::{PureRegCallArgsViolation, verify_pure_reg_call_args};
@@ -32,6 +34,7 @@ pub fn verify(ctx: &Context<'_>) -> Vec<String> {
     let mut diagnostics = Vec::new();
     diagnostics.extend(verify_block_terminators(ctx));
     diagnostics.extend(verify_no_dangling_refs(ctx));
+    diagnostics.extend(verify_intra_function_ssa(ctx));
     diagnostics.extend(verify_pointer_spaces(ctx));
     diagnostics.extend(verify_bool_typing(ctx));
     diagnostics.extend(
