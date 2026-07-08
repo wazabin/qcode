@@ -313,7 +313,8 @@ impl MemForward {
                 None => piece,
                 Some(lhs) => {
                     let or = InstructionRef::from_mnemonic(
-                        ctx, block_id.func,
+                        ctx,
+                        block_id.func,
                         Mnemonic::Binop(Binary {
                             op: Binop::Int(IntBinop::Or),
                             lhs,
@@ -383,7 +384,8 @@ impl MemForward {
             seg.src
         } else {
             let r = InstructionRef::from_mnemonic(
-                ctx, block_id.func,
+                ctx,
+                block_id.func,
                 Mnemonic::Range(Range {
                     src: seg.src,
                     start: seg.src_off,
@@ -400,7 +402,8 @@ impl MemForward {
             extracted
         } else {
             let z = InstructionRef::from_mnemonic(
-                ctx, block_id.func,
+                ctx,
+                block_id.func,
                 Mnemonic::Zext(Zext {
                     src: extracted,
                     size: load_size,
@@ -417,7 +420,8 @@ impl MemForward {
         }
         let shamt = ctx.get_const((seg.load_off * 8) as u64, load_size).id();
         let s = InstructionRef::from_mnemonic(
-            ctx, block_id.func,
+            ctx,
+            block_id.func,
             Mnemonic::Binop(Binary {
                 op: Binop::Int(IntBinop::ShiftLeft),
                 lhs: widened,
@@ -921,7 +925,10 @@ mod tests {
         let sp_reg = tc.r0;
         let fid = Function::make(&mut tc.ctx, "f".into()).unwrap().id;
         let callee = Function::make(&mut tc.ctx, "callee".into()).unwrap().id;
-        let root = tc.ctx.get_or_make_block(0x1000);
+        let root = {
+            let __f = tc.ctx.anon_function();
+            tc.ctx.get_or_make_block(0x1000, __f)
+        };
         {
             let mut f = Function::from_id_mut(&mut tc.ctx, fid);
             f.set_root(root).unwrap();
@@ -1033,7 +1040,10 @@ mod tests {
     #[test]
     fn exact_forward_returns_src() {
         let mut tc = TestContext::new();
-        let block_id = tc.ctx.get_or_make_block(0x1000);
+        let block_id = {
+            let __f = tc.ctx.anon_function();
+            tc.ctx.get_or_make_block(0x1000, __f)
+        };
         let src = tc.ctx.get_const(0x42, 4).id();
         let aliases = manual_aliases(&tc, &[tc.r0_lo32]);
 
@@ -1045,7 +1055,7 @@ mod tests {
         let load = load_of(&tc, tc.r0_lo32);
         // A dummy instruction id to insert before; none is created here because
         // an exact forward materializes nothing.
-        let dummy = qcode::value::InstructionId::from(0usize);
+        let dummy = qcode::value::InstructionId::default();
         let forwarded = mf
             .try_load(&mut tc.ctx, block_id, dummy, &load, Some(&aliases), &nb)
             .expect("exact forward");
@@ -1061,7 +1071,10 @@ mod tests {
 
         let mut tc = TestContext::new();
         let fun_id = Function::make(&mut tc.ctx, "f".into()).unwrap().id;
-        let block = tc.ctx.get_or_make_block(0x1000);
+        let block = {
+            let __f = tc.ctx.anon_function();
+            tc.ctx.get_or_make_block(0x1000, __f)
+        };
         {
             let mut f = Function::from_id_mut(&mut tc.ctx, fun_id);
             f.set_root(block).unwrap();
@@ -1118,7 +1131,10 @@ mod tests {
         }
 
         let fun_id = Function::make(&mut tc.ctx, "f".into()).unwrap().id;
-        let block = tc.ctx.get_or_make_block(0x1000);
+        let block = {
+            let __f = tc.ctx.anon_function();
+            tc.ctx.get_or_make_block(0x1000, __f)
+        };
         {
             let mut f = Function::from_id_mut(&mut tc.ctx, fun_id);
             f.set_root(block).unwrap();
@@ -1207,7 +1223,10 @@ mod tests {
         let mut tc = TestContext::new();
         let caller = Function::make(&mut tc.ctx, "caller".into()).unwrap().id;
         let callee = Function::make(&mut tc.ctx, "callee".into()).unwrap().id;
-        let block = tc.ctx.get_or_make_block(0x1000);
+        let block = {
+            let __f = tc.ctx.anon_function();
+            tc.ctx.get_or_make_block(0x1000, __f)
+        };
         {
             let mut f = Function::from_id_mut(&mut tc.ctx, caller);
             f.set_root(block).unwrap();

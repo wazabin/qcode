@@ -65,7 +65,10 @@ mod tests {
         let mut tc = TestContext::new();
         let body = Function::make(&mut tc.ctx, "foo".into()).unwrap().id;
         let host = Function::make(&mut tc.ctx, "host".into()).unwrap().id;
-        let entry = tc.ctx.get_or_make_block(0x2000);
+        let entry = {
+            let __f = tc.ctx.anon_function();
+            tc.ctx.get_or_make_block(0x2000, __f)
+        };
         {
             let mut f = Function::from_id_mut(&mut tc.ctx, host);
             f.set_root(entry).unwrap();
@@ -78,7 +81,7 @@ mod tests {
             (b.push_param(8).id(), b.push_param(4).id())
         };
         if let ValueId::BlockParam(pid) = src {
-            tc.ctx.values.block_param(pid).type_id = array_ty;
+            tc.ctx.values.block_param_mut(pid).type_id = array_ty;
         }
 
         let plain = {
@@ -117,7 +120,10 @@ mod tests {
 
         // A host function holding an `[i8;20]`-typed value to map over.
         let host = Function::make(&mut tc.ctx, "host".into()).unwrap().id;
-        let entry = tc.ctx.get_or_make_block(0x1000);
+        let entry = {
+            let __f = tc.ctx.anon_function();
+            tc.ctx.get_or_make_block(0x1000, __f)
+        };
         {
             let mut f = Function::from_id_mut(&mut tc.ctx, host);
             f.set_root(entry).unwrap();
@@ -133,7 +139,7 @@ mod tests {
         // Type the source as the array (params default to int of their width)
         // *before* building the map, so the map's result type picks it up.
         if let ValueId::BlockParam(pid) = src {
-            tc.ctx.values.block_param(pid).type_id = array_ty;
+            tc.ctx.values.block_param_mut(pid).type_id = array_ty;
         }
         let map_val = {
             let mut b = Builder::from_block(BasicBlock::from_id_mut(&mut tc.ctx, entry));

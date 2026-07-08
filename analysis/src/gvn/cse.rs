@@ -181,14 +181,14 @@ pub(super) fn normalize(m: &mut Mnemonic) {
 mod tests {
     use super::*;
     use crate::gvn::{gvn, gvn_function};
-    use qcode::value::{BasicBlock, insn::Binary};
+    use qcode::value::{BasicBlock, InstructionId, insn::Binary};
     use qcode_macro::qcode;
 
     #[test]
     fn test_normalize() {
         let mut m = Mnemonic::Binop(Binary {
             op: Binop::Int(IntBinop::Add),
-            lhs: ValueId::Instruction(0.into()),
+            lhs: ValueId::Instruction(InstructionId::default()),
             rhs: ValueId::Literal(0.into()),
         });
 
@@ -198,7 +198,7 @@ mod tests {
             Mnemonic::Binop(Binary {
                 op: Binop::Int(IntBinop::Add),
                 lhs: ValueId::Literal(0.into()),
-                rhs: ValueId::Instruction(0.into()),
+                rhs: ValueId::Instruction(InstructionId::default()),
             }),
             "normalize should swap operands to canonicalize commutative binop"
         );
@@ -426,7 +426,7 @@ mod tests {
     #[test]
     fn normalize_orders_equal_indices_across_value_id_variants() {
         let a = ValueId::Literal(0usize.into());
-        let b = ValueId::Instruction(0usize.into());
+        let b = ValueId::Instruction(InstructionId::default());
         let make = |lhs, rhs| {
             Mnemonic::Binop(Binary {
                 op: Binop::Int(IntBinop::Add),

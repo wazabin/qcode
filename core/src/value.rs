@@ -58,7 +58,11 @@ macro_rules! composite_id {
 
         impl ::core::fmt::Debug for $name {
             fn fmt(&self, f: &mut ::core::fmt::Formatter<'_>) -> ::core::fmt::Result {
-                write!(f, concat!(stringify!($name), "({}:{})"), self.func, self.local)
+                write!(
+                    f,
+                    concat!(stringify!($name), "({}:{})"),
+                    self.func, self.local
+                )
             }
         }
 
@@ -70,13 +74,15 @@ macro_rules! composite_id {
     };
 }
 
+pub use block::cfg::{LocalBlockId, LocalEdgeId};
 pub use block::{BasicBlock, BlockId, BlockMutRef, BlockRef};
-pub use block_param::{BlockParam, BlockParamId, BlockParamMutRef, BlockParamRef};
+pub use block_param::{BlockParam, BlockParamId, BlockParamMutRef, BlockParamRef, LocalParamId};
 pub use bytes::{
     Bytes, BytesDisplay, BytesId, BytesRef, StringEncoding, decode_string, escape_decoded,
     render_bytes_literal,
 };
 pub use function::{Function, FunctionId, FunctionKind, FunctionMutRef, FunctionRef, ParamAttrs};
+pub use insn::LocalInsnId;
 pub use insn::{Instruction, InstructionId, InstructionRef};
 pub use literal::{LiteralId, LiteralRef};
 pub use util::named::{Named, Renameable};
@@ -255,8 +261,12 @@ impl ValueId {
             ValueId::Instruction(id) => {
                 (4, usize::from(id.func) as u32, usize::from(id.local) as u32)
             }
-            ValueId::BasicBlock(id) => (5, usize::from(id.func) as u32, usize::from(id.local) as u32),
-            ValueId::BlockParam(id) => (6, usize::from(id.func) as u32, usize::from(id.local) as u32),
+            ValueId::BasicBlock(id) => {
+                (5, usize::from(id.func) as u32, usize::from(id.local) as u32)
+            }
+            ValueId::BlockParam(id) => {
+                (6, usize::from(id.func) as u32, usize::from(id.local) as u32)
+            }
         }
     }
 }

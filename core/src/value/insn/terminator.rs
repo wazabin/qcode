@@ -273,7 +273,11 @@ mod tests {
         let callee = Function::make(&mut tc.ctx, "callee".into()).unwrap().id;
         Function::from_id_mut(&mut tc.ctx, callee).set_input_regs(vec![tc.r0]);
 
-        let block = BasicBlock::make(&mut tc.ctx).id;
+        let block = {
+            let __f = tc.ctx.anon_function();
+            BasicBlock::make(&mut tc.ctx, __f)
+        }
+        .id;
         let call_id = {
             let mut builder = Builder::from_block(BasicBlock::from_id_mut(&mut tc.ctx, block));
             builder.push_call(callee).id
@@ -310,7 +314,11 @@ mod tests {
         let callee = Function::make(&mut tc.ctx, "callee".into()).unwrap().id;
         Function::from_id_mut(&mut tc.ctx, callee).set_input_regs(vec![stack_input]);
 
-        let block = BasicBlock::make(&mut tc.ctx).id;
+        let block = {
+            let __f = tc.ctx.anon_function();
+            BasicBlock::make(&mut tc.ctx, __f)
+        }
+        .id;
         let call_id = {
             let mut builder = Builder::from_block(BasicBlock::from_id_mut(&mut tc.ctx, block));
             builder.push_call(callee).id

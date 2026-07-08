@@ -323,7 +323,8 @@ fn hoist_into_preheader(ctx: &mut Context, preheader: BlockId, order: &[Instruct
     for &old in order {
         let mnemonic = ctx.get_insn(old).mnemonic().clone();
         let type_id = ctx.get_insn(old).type_id();
-        let new = InstructionRef::from_mnemonic_with_type(ctx, preheader.func, mnemonic, type_id).id;
+        let new =
+            InstructionRef::from_mnemonic_with_type(ctx, preheader.func, mnemonic, type_id).id;
 
         let term = *BasicBlock::from_id(ctx, preheader)
             .instruction_ids()

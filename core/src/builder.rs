@@ -1561,6 +1561,7 @@ mod tests {
         let dummy = ctx.get_const(0, 8).id();
         let ret = InstructionRef::from_mnemonic_with_type(
             &mut ctx,
+            body,
             Mnemonic::Return(Return {
                 ptr: dummy,
                 value: Some(ValueId::BlockParam(bp)),
@@ -1575,7 +1576,7 @@ mod tests {
         let hentry = Function::from_id_mut(&mut ctx, host).make_root().id;
         let list_ty = ctx.types.get_or_make_list(i8, 4);
         let src_pid = BasicBlock::from_id_mut(&mut ctx, hentry).push_param(4).id;
-        ctx.values.block_param(src_pid).type_id = list_ty;
+        ctx.values.block_param_mut(src_pid).type_id = list_ty;
         let src = ValueId::BlockParam(src_pid);
 
         let map_ty = {
@@ -1703,7 +1704,10 @@ mod tests {
         // Test code for Builder drop behavior
         // This test will fail to compile if the drop implementation panics as expected
         let mut ctx = Context::new();
-        let block_id = ctx.get_or_make_block(0);
+        let block_id = {
+            let __f = ctx.anon_function();
+            ctx.get_or_make_block(0, __f)
+        };
         let block_ref = BasicBlock::from_id_mut(&mut ctx, block_id);
 
         {
@@ -1717,7 +1721,10 @@ mod tests {
         // Test code for Builder drop behavior
         // This test will compile and run without panicking because we finalize the builder properly
         let mut ctx = Context::new();
-        let block_id = ctx.get_or_make_block(0);
+        let block_id = {
+            let __f = ctx.anon_function();
+            ctx.get_or_make_block(0, __f)
+        };
         let block_ref = BasicBlock::from_id_mut(&mut ctx, block_id);
 
         {
@@ -1776,7 +1783,10 @@ mod tests {
     #[test]
     fn push_param_via_builder_visible_on_block() {
         let mut ctx = Context::new();
-        let block_id = ctx.get_or_make_block(0x1000);
+        let block_id = {
+            let __f = ctx.anon_function();
+            ctx.get_or_make_block(0x1000, __f)
+        };
         let mut builder = Builder::from_block(BasicBlock::from_id_mut(&mut ctx, block_id));
 
         let p0 = builder.push_param(8);
@@ -1797,8 +1807,14 @@ mod tests {
     #[test]
     fn push_branch_with_args_via_builder() {
         let mut ctx = Context::new();
-        let src_id = ctx.get_or_make_block(0x1000);
-        let dst_id = ctx.get_or_make_block(0x2000);
+        let src_id = {
+            let __f = ctx.anon_function();
+            ctx.get_or_make_block(0x1000, __f)
+        };
+        let dst_id = {
+            let __f = ctx.anon_function();
+            ctx.get_or_make_block(0x2000, __f)
+        };
 
         let param_val = BasicBlock::from_id_mut(&mut ctx, dst_id).push_param(8).id();
 
@@ -1864,7 +1880,10 @@ mod tests {
     #[test]
     fn push_copy_supports_partial_final_lane() {
         let mut ctx = Context::new();
-        let block_id = ctx.get_or_make_block(0x1000);
+        let block_id = {
+            let __f = ctx.anon_function();
+            ctx.get_or_make_block(0x1000, __f)
+        };
 
         {
             let mut builder = Builder::from_block(BasicBlock::from_id_mut(&mut ctx, block_id));
@@ -1889,7 +1908,10 @@ mod tests {
     #[test]
     fn insert_point_to_start_prepends_before_existing_instruction() {
         let mut ctx = Context::new();
-        let block_id = ctx.get_or_make_block(0x1000);
+        let block_id = {
+            let __f = ctx.anon_function();
+            ctx.get_or_make_block(0x1000, __f)
+        };
         let val = ctx.get_const(0, 8).id();
 
         let existing_id = {
@@ -1915,7 +1937,10 @@ mod tests {
     #[test]
     fn multiple_pushes_with_insert_point_to_start_preserve_push_order() {
         let mut ctx = Context::new();
-        let block_id = ctx.get_or_make_block(0x1000);
+        let block_id = {
+            let __f = ctx.anon_function();
+            ctx.get_or_make_block(0x1000, __f)
+        };
         let val = ctx.get_const(0, 8).id();
 
         let existing_id = {
@@ -1945,7 +1970,10 @@ mod tests {
     #[test]
     fn insert_point_before_existing_instruction_inserts_before_target() {
         let mut ctx = Context::new();
-        let block_id = ctx.get_or_make_block(0x1000);
+        let block_id = {
+            let __f = ctx.anon_function();
+            ctx.get_or_make_block(0x1000, __f)
+        };
         let val = ctx.get_const(0, 8).id();
 
         let (first_id, target_id) = {
@@ -1989,7 +2017,10 @@ mod tests {
     #[test]
     fn set_insert_point_to_end_restores_append_mode() {
         let mut ctx = Context::new();
-        let block_id = ctx.get_or_make_block(0x1000);
+        let block_id = {
+            let __f = ctx.anon_function();
+            ctx.get_or_make_block(0x1000, __f)
+        };
         let val = ctx.get_const(0, 8).id();
 
         let (first_id, middle_id, last_id) = {

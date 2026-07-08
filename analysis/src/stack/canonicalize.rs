@@ -161,8 +161,14 @@ mod tests {
         let sp_reg = tc.r0;
         let ram = tc.ctx.default_space;
         let fid = Function::make(&mut tc.ctx, "f".into()).unwrap().id;
-        let root = tc.ctx.get_or_make_block(0x1000);
-        let other = tc.ctx.get_or_make_block(0x2000);
+        let root = {
+            let __f = tc.ctx.anon_function();
+            tc.ctx.get_or_make_block(0x1000, __f)
+        };
+        let other = {
+            let __f = tc.ctx.anon_function();
+            tc.ctx.get_or_make_block(0x2000, __f)
+        };
         {
             let mut f = Function::from_id_mut(&mut tc.ctx, fid);
             f.set_root(root).unwrap();

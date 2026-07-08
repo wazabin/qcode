@@ -252,7 +252,10 @@ fn reattribute_blocks(ctx: &mut Context) -> bool {
     // `live_in[root]`). Drop such an orphaned root so the function reads as a
     // rootless stub instead of crashing analysis.
     for &func in &owners_changed {
-        let live: HashSet<BlockId> = Function::from_id(ctx, func).block_ids().into_iter().collect();
+        let live: HashSet<BlockId> = Function::from_id(ctx, func)
+            .block_ids()
+            .into_iter()
+            .collect();
         let root = ctx.values.functions[func].root;
         if root.is_some_and(|r| !live.contains(&r)) {
             ctx.values.functions[func].root = None;
@@ -288,7 +291,8 @@ mod tests {
     use std::borrow::Cow;
 
     fn block_at(ctx: &mut Context, addr: u64) -> BlockId {
-        BasicBlock::make(ctx).with_address(addr).id
+        let f = ctx.anon_function();
+        BasicBlock::make(ctx, f).with_address(addr).id
     }
 
     /// Append an unconditional branch to `block`, tagged with machine `addr`.
@@ -482,7 +486,7 @@ mod tests {
     }
 
     fn assert_block_set(ctx: &Context, func: FunctionId, expected: &[BlockId]) {
-        let blocks = &ctx.values.functions[func].blocks;
+        let blocks = Function::from_id(ctx, func).block_ids();
         assert_eq!(
             blocks.len(),
             expected.len(),

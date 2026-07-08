@@ -14,8 +14,8 @@ use crate::{
     context::Context,
     error::{Error, ErrorTy, Result},
     value::{
-        BasicBlock, BlockId, BlockRef, Instruction, Value, ValueId, Varnode, VarnodeId,
-        InstructionId,
+        BasicBlock, BlockId, BlockRef, Instruction, InstructionId, Value, ValueId, Varnode,
+        VarnodeId,
         block::EdgeData,
         block::cfg::{LocalBlockId, LocalEdgeId},
         block_param::{BlockParam, LocalParamId},
@@ -1005,7 +1005,12 @@ mod tests {
 
         // Callee at 0x2000: a single block that returns.
         let callee = Function::make_at_addr(&mut ctx, 0x2000, None).id;
-        let callee_entry = BasicBlock::make(&mut ctx).with_address(0x2000).id;
+        let callee_entry = {
+            let __f = ctx.anon_function();
+            BasicBlock::make(&mut ctx, __f)
+        }
+        .with_address(0x2000)
+        .id;
         let zero = ctx.get_const(0, 8).id();
         Builder::from_block(BasicBlock::from_id_mut(&mut ctx, callee_entry)).push_return(zero);
         Function::from_id_mut(&mut ctx, callee)
@@ -1014,7 +1019,12 @@ mod tests {
 
         // Thunk at 0x1000: a lone `jmp` into the callee's entry.
         let thunk = Function::make_at_addr(&mut ctx, 0x1000, None).id;
-        let thunk_entry = BasicBlock::make(&mut ctx).with_address(0x1000).id;
+        let thunk_entry = {
+            let __f = ctx.anon_function();
+            BasicBlock::make(&mut ctx, __f)
+        }
+        .with_address(0x1000)
+        .id;
         Builder::from_block(BasicBlock::from_id_mut(&mut ctx, thunk_entry))
             .push_branch(callee_entry);
         ctx.add_cfg_edge(thunk_entry, callee_entry);
@@ -1035,8 +1045,18 @@ mod tests {
         let mut ctx = Context::new();
 
         let callee = Function::make_at_addr(&mut ctx, 0x2000, None).id;
-        let callee_entry = BasicBlock::make(&mut ctx).with_address(0x2000).id;
-        let interior = BasicBlock::make(&mut ctx).with_address(0x2008).id;
+        let callee_entry = {
+            let __f = ctx.anon_function();
+            BasicBlock::make(&mut ctx, __f)
+        }
+        .with_address(0x2000)
+        .id;
+        let interior = {
+            let __f = ctx.anon_function();
+            BasicBlock::make(&mut ctx, __f)
+        }
+        .with_address(0x2008)
+        .id;
         let zero = ctx.get_const(0, 8).id();
         Builder::from_block(BasicBlock::from_id_mut(&mut ctx, interior)).push_return(zero);
         Function::from_id_mut(&mut ctx, callee).add_block(interior);
@@ -1045,7 +1065,12 @@ mod tests {
             .unwrap();
 
         let thunk = Function::make_at_addr(&mut ctx, 0x1000, None).id;
-        let thunk_entry = BasicBlock::make(&mut ctx).with_address(0x1000).id;
+        let thunk_entry = {
+            let __f = ctx.anon_function();
+            BasicBlock::make(&mut ctx, __f)
+        }
+        .with_address(0x1000)
+        .id;
         Builder::from_block(BasicBlock::from_id_mut(&mut ctx, thunk_entry)).push_branch(interior);
         ctx.add_cfg_edge(thunk_entry, interior);
         Function::from_id_mut(&mut ctx, thunk)
@@ -1097,8 +1122,16 @@ mod tests {
     #[test]
     fn add_block_via_function_mut_ref_updates_blocks_list() {
         let mut ctx = Context::new();
-        let root = BasicBlock::make(&mut ctx).id;
-        let extra = BasicBlock::make(&mut ctx).id;
+        let root = {
+            let __f = ctx.anon_function();
+            BasicBlock::make(&mut ctx, __f)
+        }
+        .id;
+        let extra = {
+            let __f = ctx.anon_function();
+            BasicBlock::make(&mut ctx, __f)
+        }
+        .id;
 
         let mut baz = Function::make(&mut ctx, "baz".into()).unwrap();
         baz.add_block(root);
@@ -1127,8 +1160,16 @@ mod tests {
     #[test]
     fn iter_yields_all_blocks() {
         let mut ctx = Context::new();
-        let root = BasicBlock::make(&mut ctx).id;
-        let extra = BasicBlock::make(&mut ctx).id;
+        let root = {
+            let __f = ctx.anon_function();
+            BasicBlock::make(&mut ctx, __f)
+        }
+        .id;
+        let extra = {
+            let __f = ctx.anon_function();
+            BasicBlock::make(&mut ctx, __f)
+        }
+        .id;
         let mut f = Function::make(&mut ctx, "iter_fn".into()).unwrap();
         f.add_block(root);
         f.add_block(extra);
@@ -1142,15 +1183,23 @@ mod tests {
     #[test]
     fn into_iterator_for_function_ref_matches_iter() {
         let mut ctx = Context::new();
-        let b1 = BasicBlock::make(&mut ctx).id;
-        let b2 = BasicBlock::make(&mut ctx).id;
+        let b1 = {
+            let __f = ctx.anon_function();
+            BasicBlock::make(&mut ctx, __f)
+        }
+        .id;
+        let b2 = {
+            let __f = ctx.anon_function();
+            BasicBlock::make(&mut ctx, __f)
+        }
+        .id;
         let mut f = Function::make(&mut ctx, "into_iter_fn".into()).unwrap();
         f.add_block(b1);
         f.add_block(b2);
 
         let f = Function::from_name(&ctx, "into_iter_fn").unwrap();
-        let mut via_iter: Vec<usize> = f.iter().map(|b| b.id.into()).collect();
-        let mut via_into: Vec<usize> = (&f).into_iter().map(|b| b.id.into()).collect();
+        let mut via_iter: Vec<usize> = f.iter().map(|b| usize::from(b.id.local)).collect();
+        let mut via_into: Vec<usize> = (&f).into_iter().map(|b| usize::from(b.id.local)).collect();
         via_iter.sort();
         via_into.sort();
         assert_eq!(via_iter, via_into);
@@ -1224,7 +1273,11 @@ mod tests {
 
         // Simulate a branch-target block created at 0x1000 before the function
         // stub exists (as happens with tail-jumps to sibling functions).
-        let block_id = BasicBlock::make(&mut ctx).id;
+        let block_id = {
+            let __f = ctx.anon_function();
+            BasicBlock::make(&mut ctx, __f)
+        }
+        .id;
         ctx.set_address(0x1000, ValueId::BasicBlock(block_id))
             .unwrap();
 

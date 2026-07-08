@@ -98,7 +98,7 @@ mod tests {
     /// A bodyless callee `name` at 0x2000 to forward to; returns its entry block.
     fn make_callee(ctx: &mut Context, name: &str) -> BlockId {
         let callee = Function::make_at_addr(ctx, 0x2000, Some(name.to_owned().into())).id;
-        let entry = BasicBlock::make(ctx).with_address(0x2000).id;
+        let entry = BasicBlock::make(ctx, callee).with_address(0x2000).id;
         let zero = ctx.get_const(0, 8).id();
         Builder::from_block(BasicBlock::from_id_mut(ctx, entry)).push_return(zero);
         Function::from_id_mut(ctx, callee).set_root(entry).unwrap();
@@ -108,10 +108,10 @@ mod tests {
     /// A single-block function at 0x1000 (`name`) whose only instruction jumps to
     /// `target`, wired into the CFG. Returns its id.
     fn make_thunk(ctx: &mut Context, name: &str, target: BlockId) -> FunctionId {
-        let block = BasicBlock::make(ctx).with_address(0x1000).id;
+        let f = Function::make_at_addr(ctx, 0x1000, Some(name.to_owned().into())).id;
+        let block = BasicBlock::make(ctx, f).with_address(0x1000).id;
         Builder::from_block(BasicBlock::from_id_mut(ctx, block)).push_branch(target);
         ctx.add_cfg_edge(block, target);
-        let f = Function::make_at_addr(ctx, 0x1000, Some(name.to_owned().into())).id;
         Function::from_id_mut(ctx, f).set_root(block).unwrap();
         f
     }
@@ -147,7 +147,12 @@ mod tests {
         let callee = make_callee(&mut ctx, "realfunc");
         let f = make_thunk(&mut ctx, "fn_1000", callee);
         // A second block means it is no longer a lone-jump thunk.
-        let extra = BasicBlock::make(&mut ctx).with_address(0x1008).id;
+        let extra = {
+            let __f = ctx.anon_function();
+            BasicBlock::make(&mut ctx, __f)
+        }
+        .with_address(0x1008)
+        .id;
         Function::from_id_mut(&mut ctx, f).add_block(extra);
 
         let changed = run_function_pass::<NameThunks>(&mut ctx, f).unwrap();

@@ -278,7 +278,10 @@ fn lower_statement_block(
     let entry = entry.clone();
 
     let mut block_ids: HashMap<String, BlockId> = HashMap::new();
-    create_blocks_and_params(ctx, body, None, "", &mut block_ids, symbols);
+    // A bare-block program (no `fn`) still forms one CFG, so all its blocks must
+    // live in a single function; mint one anonymous host up front.
+    let host = ctx.anon_function();
+    create_blocks_and_params(ctx, body, Some(host), "", &mut block_ids, symbols);
 
     lower_body(ctx, body, &entry, &block_ids, globals, symbols, externals)
 }
@@ -307,12 +310,7 @@ fn create_blocks_and_params(
             // A block must be born into a function's arena. Function-mode always
             // supplies one; the bare-block DSL path has none, so mint an
             // anonymous host function for the block to live in.
-            let fid = match func {
-                Some(fid) => fid,
-                None => Function::make(ctx, Cow::Borrowed("<anon>"))
-                    .expect("anon host function")
-                    .id,
-            };
+            let fid = func.unwrap_or_else(|| ctx.anon_function());
             let id = BasicBlock::make(ctx, fid)
                 .with_name(Cow::Owned(name.clone()))
                 .expect("qcode: block name conflict")

@@ -135,7 +135,8 @@ impl ArrayProject {
         }
         let element = {
             let r = InstructionRef::from_mnemonic(
-                ctx, ic.block_id.func,
+                ctx,
+                ic.block_id.func,
                 Mnemonic::Range(Range {
                     src: map.src,
                     start: (k as usize) * isz,
@@ -202,7 +203,8 @@ impl ArrayProject {
         // `elem = src[k]`, a one-element byte slice of the operand array.
         let element = {
             let r = InstructionRef::from_mnemonic(
-                ctx, ic.block_id.func,
+                ctx,
+                ic.block_id.func,
                 Mnemonic::Range(Range {
                     src,
                     start: (k as usize) * esz,
@@ -218,7 +220,8 @@ impl ArrayProject {
         // pack the `(index, elem)` tuple, typed as the enumerate element type.
         let tuple = {
             let t = InstructionRef::from_mnemonic_with_type(
-                ctx, ic.block_id.func,
+                ctx,
+                ic.block_id.func,
                 Mnemonic::Tuple(Tuple {
                     fields: vec![index, element],
                 }),
@@ -262,7 +265,8 @@ impl ArrayProject {
         };
 
         let r = InstructionRef::from_mnemonic(
-            ctx, ic.block_id.func,
+            ctx,
+            ic.block_id.func,
             Mnemonic::Range(Range {
                 src,
                 start: rel_start,
@@ -314,7 +318,10 @@ mod tests {
     /// `body(elem: i8) -> elem + 1`, marked pure. A unary map body.
     fn build_inc_body(tc: &mut TestContext) -> FunctionId {
         let fid = Function::make(&mut tc.ctx, "inc".into()).unwrap().id;
-        let entry = tc.ctx.get_or_make_block(0x1000);
+        let entry = {
+            let __f = tc.ctx.anon_function();
+            tc.ctx.get_or_make_block(0x1000, __f)
+        };
         {
             let mut f = Function::from_id_mut(&mut tc.ctx, fid);
             f.set_root(entry).unwrap();
@@ -351,7 +358,10 @@ mod tests {
         let body = build_inc_body(&mut tc);
 
         let host = Function::make(&mut tc.ctx, "host".into()).unwrap().id;
-        let entry = tc.ctx.get_or_make_block(0x5000);
+        let entry = {
+            let __f = tc.ctx.anon_function();
+            tc.ctx.get_or_make_block(0x5000, __f)
+        };
         {
             let mut f = Function::from_id_mut(&mut tc.ctx, host);
             f.set_root(entry).unwrap();
@@ -433,7 +443,10 @@ mod tests {
         let enum_id = IntrinsicId::from_name("enumerate").unwrap();
 
         let host = Function::make(&mut tc.ctx, "host".into()).unwrap().id;
-        let entry = tc.ctx.get_or_make_block(0x6000);
+        let entry = {
+            let __f = tc.ctx.anon_function();
+            tc.ctx.get_or_make_block(0x6000, __f)
+        };
         {
             let mut f = Function::from_id_mut(&mut tc.ctx, host);
             f.set_root(entry).unwrap();
@@ -518,7 +531,10 @@ mod tests {
         let concat_id = IntrinsicId::from_name("concat").unwrap();
 
         let host = Function::make(&mut tc.ctx, "host".into()).unwrap().id;
-        let entry = tc.ctx.get_or_make_block(0x6800);
+        let entry = {
+            let __f = tc.ctx.anon_function();
+            tc.ctx.get_or_make_block(0x6800, __f)
+        };
         {
             let mut f = Function::from_id_mut(&mut tc.ctx, host);
             f.set_root(entry).unwrap();
@@ -569,7 +585,10 @@ mod tests {
     /// index-aware map body: it takes the `enumerate` tuple and unpacks it.
     fn build_unpack_elem_body(tc: &mut TestContext, tuple_ty: TypeId) -> FunctionId {
         let fid = Function::make(&mut tc.ctx, "unpack".into()).unwrap().id;
-        let entry = tc.ctx.get_or_make_block(0x2000);
+        let entry = {
+            let __f = tc.ctx.anon_function();
+            tc.ctx.get_or_make_block(0x2000, __f)
+        };
         {
             let mut f = Function::from_id_mut(&mut tc.ctx, fid);
             f.set_root(entry).unwrap();
@@ -614,7 +633,10 @@ mod tests {
         let enum_id = IntrinsicId::from_name("enumerate").unwrap();
 
         let host = Function::make(&mut tc.ctx, "host".into()).unwrap().id;
-        let entry = tc.ctx.get_or_make_block(0x7000);
+        let entry = {
+            let __f = tc.ctx.anon_function();
+            tc.ctx.get_or_make_block(0x7000, __f)
+        };
         {
             let mut f = Function::from_id_mut(&mut tc.ctx, host);
             f.set_root(entry).unwrap();

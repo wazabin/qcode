@@ -96,7 +96,8 @@ impl Editor {
         mnemonic: Mnemonic,
         type_id: qcode::types::TypeId,
     ) -> InstructionId {
-        let new_id = InstructionRef::from_mnemonic_with_type(ctx, block_id.func, mnemonic, type_id).id;
+        let new_id =
+            InstructionRef::from_mnemonic_with_type(ctx, block_id.func, mnemonic, type_id).id;
         BasicBlock::from_id_mut(ctx, block_id).insert_insn_before(at, new_id);
         ctx.replace_all_uses_with(at, new_id);
         self.redundant.insert(at);
@@ -434,8 +435,14 @@ mod tests {
     fn test_register_forwarding_in_orphaned_post_call_block() {
         let mut tc = TestContext::new();
         let fun_id = Function::make(&mut tc.ctx, "test".into()).unwrap().id;
-        let entry = tc.ctx.get_or_make_block(0x1000);
-        let post_call = tc.ctx.get_or_make_block(0x2000);
+        let entry = {
+            let __f = tc.ctx.anon_function();
+            tc.ctx.get_or_make_block(0x1000, __f)
+        };
+        let post_call = {
+            let __f = tc.ctx.anon_function();
+            tc.ctx.get_or_make_block(0x2000, __f)
+        };
         {
             let mut f = Function::from_id_mut(&mut tc.ctx, fun_id);
             f.set_root(entry).unwrap();

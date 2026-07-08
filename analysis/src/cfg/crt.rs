@@ -119,7 +119,10 @@ mod tests {
         Function::make_at_addr(&mut tc.ctx, 0x1000, Some("start".into()));
 
         {
-            let block = tc.ctx.get_or_make_block(0x1000);
+            let block = {
+                let __f = tc.ctx.anon_function();
+                tc.ctx.get_or_make_block(0x1000, __f)
+            };
             Function::from_addr_mut(&mut tc.ctx, 0x1000)
                 .unwrap()
                 .set_root(block)
@@ -159,7 +162,10 @@ mod tests {
         Function::make_at_addr(&mut tc.ctx, 0x1000, Some("start".into()));
 
         {
-            let block = tc.ctx.get_or_make_block(0x1000);
+            let block = {
+                let __f = tc.ctx.anon_function();
+                tc.ctx.get_or_make_block(0x1000, __f)
+            };
             Function::from_addr_mut(&mut tc.ctx, 0x1000)
                 .unwrap()
                 .set_root(block)

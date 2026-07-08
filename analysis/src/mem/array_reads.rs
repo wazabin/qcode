@@ -291,7 +291,10 @@ mod tests {
         let ram = tc.ctx.default_space;
 
         let fid = Function::make(&mut tc.ctx, "f".into()).unwrap().id;
-        let entry = tc.ctx.get_or_make_block(0x1000);
+        let entry = {
+            let __f = tc.ctx.anon_function();
+            tc.ctx.get_or_make_block(0x1000, __f)
+        };
         {
             let mut f = Function::from_id_mut(&mut tc.ctx, fid);
             f.set_root(entry).unwrap();

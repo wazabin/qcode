@@ -1871,7 +1871,10 @@ mod tests {
 
         // A clean function: arithmetic over a param, returned through a tuple.
         let clean = Function::make(&mut tc.ctx, "clean".into()).unwrap().id;
-        let clean_entry = tc.ctx.get_or_make_block(0x1000);
+        let clean_entry = {
+            let __f = tc.ctx.anon_function();
+            tc.ctx.get_or_make_block(0x1000, __f)
+        };
         {
             let mut f = Function::from_id_mut(&mut tc.ctx, clean);
             f.set_root(clean_entry).unwrap();
@@ -1891,7 +1894,10 @@ mod tests {
 
         // A function that still loads from memory (an untracked value source).
         let dirty = Function::make(&mut tc.ctx, "dirty".into()).unwrap().id;
-        let dirty_entry = tc.ctx.get_or_make_block(0x3000);
+        let dirty_entry = {
+            let __f = tc.ctx.anon_function();
+            tc.ctx.get_or_make_block(0x3000, __f)
+        };
         {
             let mut f = Function::from_id_mut(&mut tc.ctx, dirty);
             f.set_root(dirty_entry).unwrap();

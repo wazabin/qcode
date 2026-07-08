@@ -351,7 +351,10 @@ mod tests {
     /// `body(elem: i8) -> elem + 1`, marked pure — a unary scalar map body.
     fn build_inc_body(tc: &mut TestContext) -> FunctionId {
         let fid = Function::make(&mut tc.ctx, "inc".into()).unwrap().id;
-        let entry = tc.ctx.get_or_make_block(0x1000);
+        let entry = {
+            let __f = tc.ctx.anon_function();
+            tc.ctx.get_or_make_block(0x1000, __f)
+        };
         {
             let mut f = Function::from_id_mut(&mut tc.ctx, fid);
             f.set_root(entry).unwrap();
@@ -385,7 +388,10 @@ mod tests {
     /// an index-aware body reading both tuple fields.
     fn build_index_body(tc: &mut TestContext, tuple_ty: TypeId) -> FunctionId {
         let fid = Function::make(&mut tc.ctx, "addidx".into()).unwrap().id;
-        let entry = tc.ctx.get_or_make_block(0x2000);
+        let entry = {
+            let __f = tc.ctx.anon_function();
+            tc.ctx.get_or_make_block(0x2000, __f)
+        };
         {
             let mut f = Function::from_id_mut(&mut tc.ctx, fid);
             f.set_root(entry).unwrap();
@@ -452,7 +458,10 @@ mod tests {
         let body = build_inc_body(&mut tc);
 
         let host = Function::make(&mut tc.ctx, "host".into()).unwrap().id;
-        let entry = tc.ctx.get_or_make_block(0x5000);
+        let entry = {
+            let __f = tc.ctx.anon_function();
+            tc.ctx.get_or_make_block(0x5000, __f)
+        };
         {
             let mut f = Function::from_id_mut(&mut tc.ctx, host);
             f.set_root(entry).unwrap();
@@ -483,7 +492,10 @@ mod tests {
         let body = build_inc_body(&mut tc);
 
         let host = Function::make(&mut tc.ctx, "host".into()).unwrap().id;
-        let entry = tc.ctx.get_or_make_block(0x7000);
+        let entry = {
+            let __f = tc.ctx.anon_function();
+            tc.ctx.get_or_make_block(0x7000, __f)
+        };
         {
             let mut f = Function::from_id_mut(&mut tc.ctx, host);
             f.set_root(entry).unwrap();
@@ -525,7 +537,10 @@ mod tests {
         let body = build_index_body(&mut tc, tuple_ty);
 
         let host = Function::make(&mut tc.ctx, "host".into()).unwrap().id;
-        let entry = tc.ctx.get_or_make_block(0x6000);
+        let entry = {
+            let __f = tc.ctx.anon_function();
+            tc.ctx.get_or_make_block(0x6000, __f)
+        };
         {
             let mut f = Function::from_id_mut(&mut tc.ctx, host);
             f.set_root(entry).unwrap();
@@ -553,7 +568,10 @@ mod tests {
     /// body, binary in `(accumulator, enumerate tuple)`.
     fn build_sum_body(tc: &mut TestContext, tuple_ty: TypeId) -> FunctionId {
         let fid = Function::make(&mut tc.ctx, "scansum".into()).unwrap().id;
-        let entry = tc.ctx.get_or_make_block(0x7000);
+        let entry = {
+            let __f = tc.ctx.anon_function();
+            tc.ctx.get_or_make_block(0x7000, __f)
+        };
         {
             let mut f = Function::from_id_mut(&mut tc.ctx, fid);
             f.set_root(entry).unwrap();
@@ -602,7 +620,10 @@ mod tests {
         let body = build_sum_body(&mut tc, tuple_ty);
 
         let host = Function::make(&mut tc.ctx, "host".into()).unwrap().id;
-        let entry = tc.ctx.get_or_make_block(0x8000);
+        let entry = {
+            let __f = tc.ctx.anon_function();
+            tc.ctx.get_or_make_block(0x8000, __f)
+        };
         {
             let mut f = Function::from_id_mut(&mut tc.ctx, host);
             f.set_root(entry).unwrap();

@@ -137,7 +137,10 @@ mod tests {
 
     fn pure_callee_with_params(tc: &mut TestContext, sizes: &[usize]) -> FunctionId {
         let callee = Function::make(&mut tc.ctx, "callee".into()).unwrap().id;
-        let root = tc.ctx.get_or_make_block(0x1000);
+        let root = {
+            let __f = tc.ctx.anon_function();
+            tc.ctx.get_or_make_block(0x1000, __f)
+        };
         Function::from_id_mut(&mut tc.ctx, callee)
             .set_root(root)
             .unwrap();
@@ -154,7 +157,10 @@ mod tests {
         args: Vec<ValueId>,
     ) -> InstructionId {
         let caller = Function::make(&mut tc.ctx, "caller".into()).unwrap().id;
-        let block = tc.ctx.get_or_make_block(0x2000);
+        let block = {
+            let __f = tc.ctx.anon_function();
+            tc.ctx.get_or_make_block(0x2000, __f)
+        };
         Function::from_id_mut(&mut tc.ctx, caller)
             .set_root(block)
             .unwrap();

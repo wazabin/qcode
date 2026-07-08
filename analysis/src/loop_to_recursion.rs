@@ -161,8 +161,9 @@ fn transform(ctx: &mut Context, host: FunctionId, model: &LoopModel) {
         .id;
 
     // Move the header/body/exit region out of the host and into the new lambda.
+    // `add_block` re-homes: it drops the block from the host's ownership roster
+    // and claims it for `rec` (calling `remove_block` first would *tombstone* it).
     for &block in &model.region {
-        Function::from_id_mut(ctx, host).remove_block(block);
         Function::from_id_mut(ctx, rec).add_block(block);
     }
     Function::from_id_mut(ctx, rec)

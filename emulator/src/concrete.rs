@@ -2542,7 +2542,10 @@ mod tests {
 
         let mut ctx = Context::new();
         let f = Function::make(&mut ctx, "f".into()).unwrap().id;
-        let entry = ctx.get_or_make_block(0x1000);
+        let entry = {
+            let __f = ctx.anon_function();
+            ctx.get_or_make_block(0x1000, __f)
+        };
         {
             let mut fm = Function::from_id_mut(&mut ctx, f);
             fm.set_root(entry).unwrap();
@@ -2602,7 +2605,10 @@ mod tests {
 
         let mut ctx = Context::new();
         let f = Function::make(&mut ctx, "f".into()).unwrap().id;
-        let entry = ctx.get_or_make_block(0x1000);
+        let entry = {
+            let __f = ctx.anon_function();
+            ctx.get_or_make_block(0x1000, __f)
+        };
         {
             let mut fm = Function::from_id_mut(&mut ctx, f);
             fm.set_root(entry).unwrap();
@@ -2615,15 +2621,17 @@ mod tests {
             b.push_param(8).id()
         };
         if let ValueId::BlockParam(pid) = src {
-            ctx.values.block_param(pid).type_id = list_ty;
+            ctx.values.block_param_mut(pid).type_id = list_ty;
         }
         // Build `enumerate` over the unbounded list with an explicit result type:
         // its `result_type` declines an unbounded operand (no static length), so
         // the intrinsic is only ever constructed this way, never via inference.
         let enum_id = IntrinsicId::from_name("enumerate").unwrap();
+        let host_fn = ctx.anon_function();
         let env = {
             let insn = InstructionRef::from_mnemonic_with_type(
                 &mut ctx,
+                host_fn,
                 Mnemonic::Intrinsic(IntrinsicApp {
                     id: enum_id,
                     args: vec![src],
@@ -2676,14 +2684,17 @@ mod tests {
             ctx.types.get_or_make_array(i8, n)
         };
         let f = Function::make(&mut ctx, "f".into()).unwrap().id;
-        let entry = ctx.get_or_make_block(0x1000);
+        let entry = {
+            let __f = ctx.anon_function();
+            ctx.get_or_make_block(0x1000, __f)
+        };
         {
             let mut fm = Function::from_id_mut(&mut ctx, f);
             fm.set_root(entry).unwrap();
             fm.add_block(entry);
         }
         let arr_pid = BasicBlock::from_id_mut(&mut ctx, entry).push_param(n).id;
-        ctx.values.block_param(arr_pid).type_id = arr_ty;
+        ctx.values.block_param_mut(arr_pid).type_id = arr_ty;
 
         let at_id = IntrinsicId::from_name("at").unwrap();
         let (ret, ptr, lane);
@@ -3033,7 +3044,10 @@ mod tests {
     fn swap_bytes_pcode_op_is_emulated() {
         let mut ctx = Context::new();
         let op = ctx.pcode_ops.push(Box::from("swap_bytes"));
-        let block_id = ctx.get_or_make_block(0x1000);
+        let block_id = {
+            let __f = ctx.anon_function();
+            ctx.get_or_make_block(0x1000, __f)
+        };
         let result = {
             let src = ctx.get_const(0x1234, 2).id();
             let mut builder =
@@ -3060,7 +3074,10 @@ mod tests {
         use qcode::value::insn::IntrinsicId;
         let mut ctx = Context::new();
         let rol = IntrinsicId::from_name("rol").unwrap();
-        let block_id = ctx.get_or_make_block(0x1000);
+        let block_id = {
+            let __f = ctx.anon_function();
+            ctx.get_or_make_block(0x1000, __f)
+        };
         let result = {
             let x = ctx.get_const(0x1234_5678, 4).id();
             let k = ctx.get_const(8, 4).id();
@@ -3087,7 +3104,10 @@ mod tests {
     fn unknown_pcode_op_returns_typed_error() {
         let mut ctx = Context::new();
         let op = ctx.pcode_ops.push(Box::from("rdpmc"));
-        let block_id = ctx.get_or_make_block(0x1000);
+        let block_id = {
+            let __f = ctx.anon_function();
+            ctx.get_or_make_block(0x1000, __f)
+        };
         {
             let mut builder =
                 qcode::builder::Builder::from_block(BasicBlock::from_id_mut(&mut ctx, block_id));

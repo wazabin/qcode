@@ -136,7 +136,10 @@ mod tests {
         to_shadow: bool,
     ) -> FunctionId {
         let fid = Function::make(&mut tc.ctx, name.into()).unwrap().id;
-        let root = tc.ctx.get_or_make_block(addr);
+        let root = {
+            let __f = tc.ctx.anon_function();
+            tc.ctx.get_or_make_block(addr, __f)
+        };
         {
             let mut f = Function::from_id_mut(&mut tc.ctx, fid);
             f.set_root(root).unwrap();

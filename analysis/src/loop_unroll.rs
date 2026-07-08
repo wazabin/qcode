@@ -469,9 +469,13 @@ pub(crate) fn replace_terminator_with_branch(
     if let Some(term_id) = term_id {
         ctx.replace_instruction_mnemonic(term_id, Mnemonic::Branch(Branch { target, args }));
     } else {
-        let branch =
-            InstructionRef::from_mnemonic(ctx, block.func, Mnemonic::Branch(Branch { target, args }), 0)
-                .id;
+        let branch = InstructionRef::from_mnemonic(
+            ctx,
+            block.func,
+            Mnemonic::Branch(Branch { target, args }),
+            0,
+        )
+        .id;
         let end = BasicBlock::from_id(ctx, block).instruction_ids().len();
         BasicBlock::from_id_mut(ctx, block).insert_insn_at_index(end, branch);
     }

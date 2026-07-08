@@ -1320,7 +1320,8 @@ mod tests {
             blk.pop_insn(); // drop the `goto` so we can append before re-terminating
             let mut b = Builder::from_block(blk);
             let hi = b.get_range(zero.into(), 1..4).unwrap().id();
-            let tgt = b.context_mut().get_or_make_block(0x1001);
+            let __f = b.current_block().func;
+            let tgt = b.context_mut().get_or_make_block(0x1001, __f);
             b.push_branch(tgt);
             hi
         };
@@ -1365,7 +1366,8 @@ mod tests {
             let shift = b.context_mut().get_const(8, 4).id();
             let hishift = b.push_shl(hi, shift).id();
             let idx = b.push_bit_or(lo.into(), hishift).id();
-            let tgt = b.context_mut().get_or_make_block(0x1001);
+            let __f = b.current_block().func;
+            let tgt = b.context_mut().get_or_make_block(0x1001, __f);
             b.push_branch(tgt);
             idx
         };

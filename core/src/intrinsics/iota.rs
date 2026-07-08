@@ -133,7 +133,10 @@ mod tests {
     #[test]
     fn iota_of_symbolic_does_not_fold() {
         let mut ctx = Context::new();
-        let blk = ctx.get_or_make_block(0x1000);
+        let blk = {
+            let __f = ctx.anon_function();
+            ctx.get_or_make_block(0x1000, __f)
+        };
         let p = crate::value::BasicBlock::from_id_mut(&mut ctx, blk)
             .push_param(8)
             .id;

@@ -985,7 +985,10 @@ mod tests {
         // Pre-connect the dispatch block to its targets, mimicking the edges the
         // lifter materializes in the clean IR before this pass re-runs.
         for t in targets {
-            let tb = ctx.get_or_make_block(t);
+            let tb = {
+                let __f = ctx.anon_function();
+                ctx.get_or_make_block(t, __f)
+            };
             ctx.add_cfg_edge(disp, tb);
         }
         assert_eq!(successor_count(&ctx, disp), 2);

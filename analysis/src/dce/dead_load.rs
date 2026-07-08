@@ -1064,7 +1064,10 @@ mod tests {
         f: impl FnOnce(&mut Builder<'static, '_>),
     ) -> (qcode::context::Context<'static>, BlockId) {
         let mut ctx = TestContext::new().ctx;
-        let block_id = ctx.get_or_make_block(0x1000);
+        let block_id = {
+            let __f = ctx.anon_function();
+            ctx.get_or_make_block(0x1000, __f)
+        };
         let mut builder = Builder::from_context(&mut ctx, 0x1000);
         f(&mut builder);
         unsafe { builder.dont_finalize() };
@@ -1125,12 +1128,8 @@ mod tests {
         let regsp = tc.reg_space;
         let r1 = tc.r1;
 
-        let block_id = BasicBlock::make(&mut tc.ctx).id;
-        let fid = {
-            let mut f = Function::make(&mut tc.ctx, "f".into()).unwrap();
-            f.add_block(block_id);
-            f.id
-        };
+        let fid = Function::make(&mut tc.ctx, "f".into()).unwrap().id;
+        let block_id = BasicBlock::make(&mut tc.ctx, fid).id;
 
         let offset_ptr = |b: &mut Builder<'static, '_>, base: ValueId, off: i64| {
             if off == 0 {
@@ -1372,7 +1371,10 @@ mod tests {
         configure_callee(&mut tc.ctx, callee);
 
         let caller = Function::make(&mut tc.ctx, "caller".into()).unwrap().id;
-        let entry = tc.ctx.get_or_make_block(0x1000);
+        let entry = {
+            let __f = tc.ctx.anon_function();
+            tc.ctx.get_or_make_block(0x1000, __f)
+        };
         Function::from_id_mut(&mut tc.ctx, caller)
             .set_root(entry)
             .unwrap();
@@ -1464,7 +1466,10 @@ mod tests {
         let mut tc = TestContext::new();
         let sp_reg = tc.r0;
         let fid = Function::make(&mut tc.ctx, "f".into()).unwrap().id;
-        let root = tc.ctx.get_or_make_block(0x1000);
+        let root = {
+            let __f = tc.ctx.anon_function();
+            tc.ctx.get_or_make_block(0x1000, __f)
+        };
         {
             let mut f = Function::from_id_mut(&mut tc.ctx, fid);
             f.set_root(root).unwrap();
@@ -1528,7 +1533,10 @@ mod tests {
         let mut tc = TestContext::new();
         let sp_reg = tc.r0;
         let fid = Function::make(&mut tc.ctx, "f".into()).unwrap().id;
-        let root = tc.ctx.get_or_make_block(0x1000);
+        let root = {
+            let __f = tc.ctx.anon_function();
+            tc.ctx.get_or_make_block(0x1000, __f)
+        };
         {
             let mut f = Function::from_id_mut(&mut tc.ctx, fid);
             f.set_root(root).unwrap();

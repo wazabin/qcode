@@ -155,7 +155,8 @@ pub(crate) fn outline_tupled(
                 .field_type(tuple_ty, field)
                 .expect("enumerate tuple field");
             let ex = InstructionRef::from_mnemonic_with_type(
-                ctx, root.func,
+                ctx,
+                root.func,
                 Mnemonic::Extract(Extract {
                     agg: tuple,
                     index: field,
@@ -261,7 +262,8 @@ pub(crate) fn outline_scan_body(
         let isz = ctx.types.size_of(index_ty);
         if isz < ctx.types.size_of(fty) {
             let r = InstructionRef::from_mnemonic_with_type(
-                ctx, root.func,
+                ctx,
+                root.func,
                 Mnemonic::Range(Range {
                     src: idx,
                     start: 0,
@@ -282,7 +284,8 @@ pub(crate) fn outline_scan_body(
             };
             let c = ctx.get_const((index_start as u64) & mask, isz).id();
             let add = InstructionRef::from_mnemonic_with_type(
-                ctx, root.func,
+                ctx,
+                root.func,
                 Mnemonic::Binop(Binary {
                     lhs: idx,
                     rhs: c,
@@ -345,7 +348,8 @@ fn outline_core(
     let dummy_ptr = ctx.get_const(0, 8).id();
     let ret_ty = ctx.types.get_or_make_int(1);
     let ret = InstructionRef::from_mnemonic_with_type(
-        ctx, root.func,
+        ctx,
+        root.func,
         Mnemonic::Return(Return {
             ptr: dummy_ptr,
             value: Some(ret_val),
@@ -435,7 +439,10 @@ mod tests {
     fn outlines_closed_pure_expression() {
         let mut tc = TestContext::new();
         let host = Function::make(&mut tc.ctx, "host".into()).unwrap().id;
-        let entry = tc.ctx.get_or_make_block(0x1000);
+        let entry = {
+            let __f = tc.ctx.anon_function();
+            tc.ctx.get_or_make_block(0x1000, __f)
+        };
         {
             let mut f = Function::from_id_mut(&mut tc.ctx, host);
             f.set_root(entry).unwrap();
@@ -491,7 +498,10 @@ mod tests {
     fn refuses_open_expression_with_load() {
         let mut tc = TestContext::new();
         let host = Function::make(&mut tc.ctx, "host".into()).unwrap().id;
-        let entry = tc.ctx.get_or_make_block(0x1000);
+        let entry = {
+            let __f = tc.ctx.anon_function();
+            tc.ctx.get_or_make_block(0x1000, __f)
+        };
         {
             let mut f = Function::from_id_mut(&mut tc.ctx, host);
             f.set_root(entry).unwrap();
@@ -519,7 +529,10 @@ mod tests {
     fn outlines_tupled_index_aware_body() {
         let mut tc = TestContext::new();
         let host = Function::make(&mut tc.ctx, "host".into()).unwrap().id;
-        let entry = tc.ctx.get_or_make_block(0x1000);
+        let entry = {
+            let __f = tc.ctx.anon_function();
+            tc.ctx.get_or_make_block(0x1000, __f)
+        };
         {
             let mut f = Function::from_id_mut(&mut tc.ctx, host);
             f.set_root(entry).unwrap();

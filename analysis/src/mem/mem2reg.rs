@@ -2121,7 +2121,10 @@ mod tests {
 
         let mut tc = TestContext::new();
         let fun_id = Function::make(&mut tc.ctx, "callee".into()).unwrap().id;
-        let block_id = tc.ctx.get_or_make_block(0x1000);
+        let block_id = {
+            let __f = tc.ctx.anon_function();
+            tc.ctx.get_or_make_block(0x1000, __f)
+        };
         Function::from_id_mut(&mut tc.ctx, fun_id)
             .set_root(block_id)
             .unwrap();
@@ -2168,7 +2171,10 @@ mod tests {
         let sp_reg = tc.r0;
         let ram = tc.ctx.default_space;
         let fun_id = Function::make(&mut tc.ctx, "f".into()).unwrap().id;
-        let block = tc.ctx.get_or_make_block(0x1000);
+        let block = {
+            let __f = tc.ctx.anon_function();
+            tc.ctx.get_or_make_block(0x1000, __f)
+        };
         Function::from_id_mut(&mut tc.ctx, fun_id)
             .set_root(block)
             .unwrap();
@@ -2242,7 +2248,10 @@ mod tests {
         let sp_reg = tc.r0;
         let ram = tc.ctx.default_space;
         let fun_id = Function::make(&mut tc.ctx, "f".into()).unwrap().id;
-        let block = tc.ctx.get_or_make_block(0x1000);
+        let block = {
+            let __f = tc.ctx.anon_function();
+            tc.ctx.get_or_make_block(0x1000, __f)
+        };
         Function::from_id_mut(&mut tc.ctx, fun_id)
             .set_root(block)
             .unwrap();
@@ -2300,7 +2309,10 @@ mod tests {
         let post_clobber_sink = ValueId::Varnode(tc.r2);
 
         let fun_id = Function::make(&mut tc.ctx, "test".into()).unwrap().id;
-        let block_id = tc.ctx.get_or_make_block(0x1000);
+        let block_id = {
+            let __f = tc.ctx.anon_function();
+            tc.ctx.get_or_make_block(0x1000, __f)
+        };
         Function::from_id_mut(&mut tc.ctx, fun_id)
             .set_root(block_id)
             .unwrap();
@@ -2357,7 +2369,10 @@ mod tests {
         let byte_sink = ValueId::Varnode(tc.r2);
 
         let fun_id = Function::make(&mut tc.ctx, "test".into()).unwrap().id;
-        let block_id = tc.ctx.get_or_make_block(0x1000);
+        let block_id = {
+            let __f = tc.ctx.anon_function();
+            tc.ctx.get_or_make_block(0x1000, __f)
+        };
         Function::from_id_mut(&mut tc.ctx, fun_id)
             .set_root(block_id)
             .unwrap();
@@ -2576,7 +2591,10 @@ mod tests {
 
         // Callee that writes r0 (and only writes it), so r0 is a clobber.
         let callee = Function::make(&mut tc.ctx, "callee".into()).unwrap().id;
-        let cbody = tc.ctx.get_or_make_block(0x2000);
+        let cbody = {
+            let __f = tc.ctx.anon_function();
+            tc.ctx.get_or_make_block(0x2000, __f)
+        };
         Function::from_id_mut(&mut tc.ctx, callee)
             .set_root(cbody)
             .unwrap();
@@ -2599,8 +2617,14 @@ mod tests {
 
         // Caller: write r0 before the call, read it after.
         let caller = Function::make(&mut tc.ctx, "caller".into()).unwrap().id;
-        let entry = tc.ctx.get_or_make_block(0x1000);
-        let cont = tc.ctx.get_or_make_block(0x1100);
+        let entry = {
+            let __f = tc.ctx.anon_function();
+            tc.ctx.get_or_make_block(0x1000, __f)
+        };
+        let cont = {
+            let __f = tc.ctx.anon_function();
+            tc.ctx.get_or_make_block(0x1100, __f)
+        };
         Function::from_id_mut(&mut tc.ctx, caller)
             .set_root(entry)
             .unwrap();
@@ -2663,7 +2687,10 @@ mod tests {
         let (r0, r0_byte0, r2, r3, reg) = (tc.r0, tc.r0_byte0, tc.r2, tc.r3, tc.reg_space);
 
         let f = Function::make(&mut tc.ctx, "f".into()).unwrap().id;
-        let entry = tc.ctx.get_or_make_block(0x1000);
+        let entry = {
+            let __f = tc.ctx.anon_function();
+            tc.ctx.get_or_make_block(0x1000, __f)
+        };
         Function::from_id_mut(&mut tc.ctx, f)
             .set_root(entry)
             .unwrap();
@@ -2721,7 +2748,10 @@ mod tests {
 
         // Callee that writes (clobbers) r0.
         let callee = Function::make(&mut tc.ctx, "callee".into()).unwrap().id;
-        let cbody = tc.ctx.get_or_make_block(0x2000);
+        let cbody = {
+            let __f = tc.ctx.anon_function();
+            tc.ctx.get_or_make_block(0x2000, __f)
+        };
         Function::from_id_mut(&mut tc.ctx, callee)
             .set_root(cbody)
             .unwrap();
@@ -2738,8 +2768,14 @@ mod tests {
         // Caller: write r0 (dead — never read before the call), call, then read r0
         // after (so r0 is a promoted var) into r1.
         let caller = Function::make(&mut tc.ctx, "caller".into()).unwrap().id;
-        let entry = tc.ctx.get_or_make_block(0x1000);
-        let cont = tc.ctx.get_or_make_block(0x1100);
+        let entry = {
+            let __f = tc.ctx.anon_function();
+            tc.ctx.get_or_make_block(0x1000, __f)
+        };
+        let cont = {
+            let __f = tc.ctx.anon_function();
+            tc.ctx.get_or_make_block(0x1100, __f)
+        };
         Function::from_id_mut(&mut tc.ctx, caller)
             .set_root(entry)
             .unwrap();
@@ -2780,7 +2816,10 @@ mod tests {
         let (r0, reg) = (tc.r0, tc.reg_space);
 
         let callee = Function::make(&mut tc.ctx, "callee".into()).unwrap().id;
-        let cbody = tc.ctx.get_or_make_block(0x2000);
+        let cbody = {
+            let __f = tc.ctx.anon_function();
+            tc.ctx.get_or_make_block(0x2000, __f)
+        };
         Function::from_id_mut(&mut tc.ctx, callee)
             .set_root(cbody)
             .unwrap();
@@ -2795,8 +2834,14 @@ mod tests {
         crate::set_all_call_clobbered_regs(&mut tc.ctx);
 
         let caller = Function::make(&mut tc.ctx, "caller".into()).unwrap().id;
-        let entry = tc.ctx.get_or_make_block(0x1000);
-        let cont = tc.ctx.get_or_make_block(0x1100);
+        let entry = {
+            let __f = tc.ctx.anon_function();
+            tc.ctx.get_or_make_block(0x1000, __f)
+        };
+        let cont = {
+            let __f = tc.ctx.anon_function();
+            tc.ctx.get_or_make_block(0x1100, __f)
+        };
         Function::from_id_mut(&mut tc.ctx, caller)
             .set_root(entry)
             .unwrap();
@@ -2836,7 +2881,10 @@ mod tests {
         let (r0, r1, reg) = (tc.r0, tc.r1, tc.reg_space);
 
         let callee = Function::make(&mut tc.ctx, "callee".into()).unwrap().id;
-        let callee_body = tc.ctx.get_or_make_block(0x2000);
+        let callee_body = {
+            let __f = tc.ctx.anon_function();
+            tc.ctx.get_or_make_block(0x2000, __f)
+        };
         Function::from_id_mut(&mut tc.ctx, callee)
             .set_root(callee_body)
             .unwrap();
@@ -2851,11 +2899,26 @@ mod tests {
         crate::set_all_call_clobbered_regs(&mut tc.ctx);
 
         let caller = Function::make(&mut tc.ctx, "caller".into()).unwrap().id;
-        let entry = tc.ctx.get_or_make_block(0x1000);
-        let left = tc.ctx.get_or_make_block(0x1100);
-        let left_cont = tc.ctx.get_or_make_block(0x1200);
-        let right = tc.ctx.get_or_make_block(0x1300);
-        let join = tc.ctx.get_or_make_block(0x1400);
+        let entry = {
+            let __f = tc.ctx.anon_function();
+            tc.ctx.get_or_make_block(0x1000, __f)
+        };
+        let left = {
+            let __f = tc.ctx.anon_function();
+            tc.ctx.get_or_make_block(0x1100, __f)
+        };
+        let left_cont = {
+            let __f = tc.ctx.anon_function();
+            tc.ctx.get_or_make_block(0x1200, __f)
+        };
+        let right = {
+            let __f = tc.ctx.anon_function();
+            tc.ctx.get_or_make_block(0x1300, __f)
+        };
+        let join = {
+            let __f = tc.ctx.anon_function();
+            tc.ctx.get_or_make_block(0x1400, __f)
+        };
         {
             let mut f = Function::from_id_mut(&mut tc.ctx, caller);
             f.set_root(entry).unwrap();
@@ -3114,10 +3177,22 @@ mod tests {
         let (r0, reg) = (tc.r0, tc.reg_space);
 
         let f = Function::make(&mut tc.ctx, "test".into()).unwrap().id;
-        let entry = tc.ctx.get_or_make_block(0x1000);
-        let left = tc.ctx.get_or_make_block(0x1100);
-        let right = tc.ctx.get_or_make_block(0x1200);
-        let join = tc.ctx.get_or_make_block(0x1300);
+        let entry = {
+            let __f = tc.ctx.anon_function();
+            tc.ctx.get_or_make_block(0x1000, __f)
+        };
+        let left = {
+            let __f = tc.ctx.anon_function();
+            tc.ctx.get_or_make_block(0x1100, __f)
+        };
+        let right = {
+            let __f = tc.ctx.anon_function();
+            tc.ctx.get_or_make_block(0x1200, __f)
+        };
+        let join = {
+            let __f = tc.ctx.anon_function();
+            tc.ctx.get_or_make_block(0x1300, __f)
+        };
         {
             let mut fr = Function::from_id_mut(&mut tc.ctx, f);
             fr.set_root(entry).unwrap();
@@ -3180,10 +3255,22 @@ mod tests {
         let (r0, r1, r2, reg) = (tc.r0, tc.r1, tc.r2, tc.reg_space);
 
         let f = Function::make(&mut tc.ctx, "test".into()).unwrap().id;
-        let entry = tc.ctx.get_or_make_block(0x1000);
-        let s1 = tc.ctx.get_or_make_block(0x1100);
-        let s2 = tc.ctx.get_or_make_block(0x1200);
-        let exit = tc.ctx.get_or_make_block(0x1300);
+        let entry = {
+            let __f = tc.ctx.anon_function();
+            tc.ctx.get_or_make_block(0x1000, __f)
+        };
+        let s1 = {
+            let __f = tc.ctx.anon_function();
+            tc.ctx.get_or_make_block(0x1100, __f)
+        };
+        let s2 = {
+            let __f = tc.ctx.anon_function();
+            tc.ctx.get_or_make_block(0x1200, __f)
+        };
+        let exit = {
+            let __f = tc.ctx.anon_function();
+            tc.ctx.get_or_make_block(0x1300, __f)
+        };
         {
             let mut fr = Function::from_id_mut(&mut tc.ctx, f);
             fr.set_root(entry).unwrap();
@@ -3256,7 +3343,10 @@ mod tests {
         let (r0, r1, reg) = (tc.r0, tc.r1, tc.reg_space); // r0 is 8 bytes wide
 
         let f = Function::make(&mut tc.ctx, "test".into()).unwrap().id;
-        let entry = tc.ctx.get_or_make_block(0x1000);
+        let entry = {
+            let __f = tc.ctx.anon_function();
+            tc.ctx.get_or_make_block(0x1000, __f)
+        };
         Function::from_id_mut(&mut tc.ctx, f)
             .set_root(entry)
             .unwrap();
@@ -3300,9 +3390,18 @@ mod tests {
         let (r0, r1, reg) = (tc.r0, tc.r1, tc.reg_space);
 
         let f = Function::make(&mut tc.ctx, "test".into()).unwrap().id;
-        let entry = tc.ctx.get_or_make_block(0x1000);
-        let other = tc.ctx.get_or_make_block(0x1100);
-        let join = tc.ctx.get_or_make_block(0x1200);
+        let entry = {
+            let __f = tc.ctx.anon_function();
+            tc.ctx.get_or_make_block(0x1000, __f)
+        };
+        let other = {
+            let __f = tc.ctx.anon_function();
+            tc.ctx.get_or_make_block(0x1100, __f)
+        };
+        let join = {
+            let __f = tc.ctx.anon_function();
+            tc.ctx.get_or_make_block(0x1200, __f)
+        };
         {
             let mut fr = Function::from_id_mut(&mut tc.ctx, f);
             fr.set_root(entry).unwrap();
@@ -3366,10 +3465,16 @@ mod tests {
 
         let mut tc = TestContext::new();
         let f = Function::make(&mut tc.ctx, "test".into()).unwrap().id;
-        let entry = tc.ctx.get_or_make_block(0x1000);
+        let entry = {
+            let __f = tc.ctx.anon_function();
+            tc.ctx.get_or_make_block(0x1000, __f)
+        };
         // `orphan` holds the load but is not wired as a CFG successor of `entry`,
         // standing in for a successor the renaming DFS does not visit.
-        let orphan = tc.ctx.get_or_make_block(0x1100);
+        let orphan = {
+            let __f = tc.ctx.anon_function();
+            tc.ctx.get_or_make_block(0x1100, __f)
+        };
         {
             let mut fr = Function::from_id_mut(&mut tc.ctx, f);
             fr.set_root(entry).unwrap();

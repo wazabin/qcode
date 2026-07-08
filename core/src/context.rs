@@ -462,6 +462,18 @@ impl<'str> Context<'str> {
         self.values.functions.iter().map(|f| f.id).collect()
     }
 
+    /// Mints a fresh, uniquely-named anonymous function and returns its id.
+    ///
+    /// A block must be born into some function's arena; this hands out a host
+    /// for standalone blocks (tests, the raw-hex/bare-block lift paths, and the
+    /// pyqcode API that build a block without an enclosing function).
+    pub fn anon_function(&mut self) -> FunctionId {
+        let name = self.get_unique_name(std::borrow::Cow::Borrowed("anon"));
+        crate::value::Function::make(self, name)
+            .expect("unique anon function name")
+            .id
+    }
+
     /// `(total_slots, tombstones)` across every function's instruction arena.
     /// Instruction storage is now per-function; this sums the arenas for the
     /// whole-program fragmentation probe.
@@ -520,9 +532,10 @@ impl<'str> Context<'str> {
 
     /// Adds a directed edge in the CFG from `from` to `to`, returning its id.
     pub fn add_cfg_edge(&mut self, from: BlockId, to: BlockId) -> EdgeId {
-        // CFG edges are intra-function: `from` and `to` share a function, so the
-        // edge is born into that function's edge arena.
-        debug_assert_eq!(from.func, to.func, "CFG edge spans two functions");
+        // The edge is stored in `from`'s edge arena. It is usually intra-function,
+        // but a thunk/tail-call `Branch` targets another function's entry block —
+        // a legitimate cross-function edge. Composite `EdgeId` routing lets both
+        // incident blocks reference it regardless of which arena holds it.
         let edge_id = self.values.push_edge(from.func, EdgeData { from, to });
         BasicBlock::from_id_mut(self, from).add_edge(edge_id);
         BasicBlock::from_id_mut(self, to).add_edge(edge_id);
@@ -1507,7 +1520,7 @@ mod tests {
 
         // Manually detach from block without using remove_instruction,
         // simulating an instruction with no parent.
-        ctx.values.instruction(load_id).parent = None;
+        ctx.values.instruction_mut(load_id).parent = None;
 
         // Should not panic even though parent is None.
         ctx.remove_instruction(load_id);
@@ -1518,8 +1531,16 @@ mod tests {
     #[test]
     fn add_cfg_edge_returns_id_and_remove_unlinks_both_blocks() {
         let mut ctx = Context::new();
-        let a = BasicBlock::make(&mut ctx).id;
-        let b = BasicBlock::make(&mut ctx).id;
+        let a = {
+            let __f = ctx.anon_function();
+            BasicBlock::make(&mut ctx, __f)
+        }
+        .id;
+        let b = {
+            let __f = ctx.anon_function();
+            BasicBlock::make(&mut ctx, __f)
+        }
+        .id;
 
         let edge = ctx.add_cfg_edge(a, b);
         assert_eq!(

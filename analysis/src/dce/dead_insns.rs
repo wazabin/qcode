@@ -181,7 +181,10 @@ mod tests {
 
     fn build_block(f: impl FnOnce(&mut Builder<'static, '_>)) -> (Context<'static>, BlockId) {
         let mut ctx = TestContext::new().ctx;
-        let block_id = ctx.get_or_make_block(0x1000);
+        let block_id = {
+            let __f = ctx.anon_function();
+            ctx.get_or_make_block(0x1000, __f)
+        };
         let mut builder = Builder::from_context(&mut ctx, 0x1000);
         f(&mut builder);
         unsafe { builder.dont_finalize() };
@@ -318,14 +321,20 @@ mod tests {
         use_result: bool,
     ) -> (BlockId, BlockId) {
         let callee = Function::make(ctx, "callee".into()).unwrap().id;
-        let callee_block = ctx.get_or_make_block(0x4000);
+        let callee_block = {
+            let __f = ctx.anon_function();
+            ctx.get_or_make_block(0x4000, __f)
+        };
         Function::from_id_mut(ctx, callee)
             .set_root(callee_block)
             .unwrap();
         Function::from_id_mut(ctx, callee).set_is_pure(pure);
 
         let caller = Function::make(ctx, "caller".into()).unwrap().id;
-        let call_block = ctx.get_or_make_block(0x1000);
+        let call_block = {
+            let __f = ctx.anon_function();
+            ctx.get_or_make_block(0x1000, __f)
+        };
         Function::from_id_mut(ctx, caller)
             .set_root(call_block)
             .unwrap();
@@ -337,7 +346,10 @@ mod tests {
             id
         };
 
-        let cont = ctx.get_or_make_block(0x2000);
+        let cont = {
+            let __f = ctx.anon_function();
+            ctx.get_or_make_block(0x2000, __f)
+        };
         ctx.add_cfg_edge(call_block, cont);
 
         if use_result {

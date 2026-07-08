@@ -766,7 +766,12 @@ mod tests {
     #[test]
     fn test_create_block_at_address() {
         let mut ctx = Context::new();
-        let id = BasicBlock::make(&mut ctx).with_address(0x2000).id;
+        let id = {
+            let __f = ctx.anon_function();
+            BasicBlock::make(&mut ctx, __f)
+        }
+        .with_address(0x2000)
+        .id;
         let block_by_addr =
             BasicBlock::from_addr(&ctx, 0x2000).expect("block not found by address");
         assert_eq!(id, block_by_addr.id);
@@ -777,8 +782,16 @@ mod tests {
     #[should_panic(expected = "address is already mapped to a value")]
     fn test_create_block_at_duplicate_address() {
         let mut ctx = Context::new();
-        BasicBlock::make(&mut ctx).with_address(0x2000);
-        BasicBlock::make(&mut ctx).with_address(0x2000);
+        {
+            let __f = ctx.anon_function();
+            BasicBlock::make(&mut ctx, __f)
+        }
+        .with_address(0x2000);
+        {
+            let __f = ctx.anon_function();
+            BasicBlock::make(&mut ctx, __f)
+        }
+        .with_address(0x2000);
     }
 
     #[test]
@@ -868,7 +881,10 @@ mod tests {
     #[test]
     fn push_param_adds_to_params_not_instructions() {
         let mut ctx = Context::new();
-        let mut block = BasicBlock::make(&mut ctx);
+        let mut block = {
+            let __f = ctx.anon_function();
+            BasicBlock::make(&mut ctx, __f)
+        };
 
         assert_eq!(block.num_params(), 0);
         assert_eq!(block.as_ref().instruction_ids().len(), 0);
@@ -885,7 +901,10 @@ mod tests {
     #[test]
     fn params_iter_yields_in_order() {
         let mut ctx = Context::new();
-        let mut block = BasicBlock::make(&mut ctx);
+        let mut block = {
+            let __f = ctx.anon_function();
+            BasicBlock::make(&mut ctx, __f)
+        };
 
         let p0_id = block.push_param(8).id;
         let p1_id = block.push_param(4).id;
@@ -959,7 +978,11 @@ mod tests {
     fn param_value_id_usable_in_instruction() {
         use crate::{builder::Builder, value::ValueId};
         let mut ctx = Context::new();
-        let block_id = BasicBlock::make(&mut ctx).id;
+        let block_id = {
+            let __f = ctx.anon_function();
+            BasicBlock::make(&mut ctx, __f)
+        }
+        .id;
 
         let param_id: ValueId = {
             let mut block = BasicBlock::from_id_mut(&mut ctx, block_id);

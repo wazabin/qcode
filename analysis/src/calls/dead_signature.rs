@@ -457,7 +457,8 @@ mod tests {
             .collect();
         for (pv, name) in param_ids.iter().zip(["r0", "r1"]) {
             if let ValueId::BlockParam(pid) = pv {
-                tc.ctx.values.block_param_mut(*pid).name = Some(std::borrow::Cow::Owned(name.into()));
+                tc.ctx.values.block_param_mut(*pid).name =
+                    Some(std::borrow::Cow::Owned(name.into()));
             }
         }
         // f returns a one-field write-set of its r1 param; the r0 param is unused

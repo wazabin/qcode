@@ -22,7 +22,10 @@ fn build_in_custom_space(
 ) -> (Context<'static>, BlockId, SpaceId) {
     let mut ctx = Context::new();
     let space = make_space(&mut ctx, "register");
-    let block_id = ctx.get_or_make_block(0x1000);
+    let block_id = {
+        let __f = ctx.anon_function();
+        ctx.get_or_make_block(0x1000, __f)
+    };
     let mut builder = Builder::from_context(&mut ctx, 0x1000);
     f(&mut builder, space);
     unsafe { builder.dont_finalize() };
@@ -161,7 +164,10 @@ fn pointer_literals_are_tracked() {
     let r0 = test_ctx.r0;
     let mut ctx = test_ctx.ctx;
 
-    let _block_id = ctx.get_or_make_block(0x1000);
+    let _block_id = {
+        let __f = ctx.anon_function();
+        ctx.get_or_make_block(0x1000, __f)
+    };
     let mut builder = Builder::from_context(&mut ctx, 0x1000);
     let literal_ptr = builder.context_mut().get_const(0, 8).id();
     builder.push_load::<false>(literal_ptr, 8, reg_space);
@@ -380,7 +386,10 @@ fn two_literal_pointers_different_spaces_do_not_alias() {
     let mut ctx = Context::new();
     let reg_space = make_space(&mut ctx, "register");
     let alt_space = make_space(&mut ctx, "other");
-    let _block_id = ctx.get_or_make_block(0x1000);
+    let _block_id = {
+        let __f = ctx.anon_function();
+        ctx.get_or_make_block(0x1000, __f)
+    };
     let mut builder = Builder::from_context(&mut ctx, 0x1000);
 
     let lit1 = builder.context_mut().get_const(0x20, 8).id();
@@ -403,7 +412,10 @@ fn same_pointer_used_in_multiple_spaces_degrades_to_unknown() {
     let mut ctx = Context::new();
     let reg_space = make_space(&mut ctx, "register");
     let alt_space = make_space(&mut ctx, "other");
-    let _block_id = ctx.get_or_make_block(0x1000);
+    let _block_id = {
+        let __f = ctx.anon_function();
+        ctx.get_or_make_block(0x1000, __f)
+    };
     let mut builder = Builder::from_context(&mut ctx, 0x1000);
 
     let ptr = builder.context_mut().get_const(0x20, 8).id();
@@ -588,7 +600,10 @@ fn literal_with_upper_junk_bits_is_masked_to_size() {
 fn untracked_value_may_alias_conservatively() {
     let mut ctx = Context::new();
     let space = make_space(&mut ctx, "register");
-    let _block_id = ctx.get_or_make_block(0x1000);
+    let _block_id = {
+        let __f = ctx.anon_function();
+        ctx.get_or_make_block(0x1000, __f)
+    };
     let mut builder = Builder::from_context(&mut ctx, 0x1000);
 
     // Two tracked, non-overlapping literal pointers (positive control).

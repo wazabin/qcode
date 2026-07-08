@@ -525,7 +525,10 @@ mod tests {
         f: impl FnOnce(&mut Builder<'static, '_>),
     ) -> FunctionId {
         let fun_id = Function::make(&mut tc.ctx, name.into()).unwrap().id;
-        let block_id = tc.ctx.get_or_make_block(addr);
+        let block_id = {
+            let __f = tc.ctx.anon_function();
+            tc.ctx.get_or_make_block(addr, __f)
+        };
         Function::from_id_mut(&mut tc.ctx, fun_id)
             .set_root(block_id)
             .unwrap();
@@ -548,7 +551,10 @@ mod tests {
         f: impl FnOnce(&mut Builder<'static, '_>, ValueId),
     ) -> FunctionId {
         let fun_id = Function::make(&mut tc.ctx, name.into()).unwrap().id;
-        let block_id = tc.ctx.get_or_make_block(addr);
+        let block_id = {
+            let __f = tc.ctx.anon_function();
+            tc.ctx.get_or_make_block(addr, __f)
+        };
         Function::from_id_mut(&mut tc.ctx, fun_id)
             .set_root(block_id)
             .unwrap();
@@ -589,7 +595,7 @@ mod tests {
         });
         let root = tc.ctx.values.functions[fun].root.unwrap();
         // Orphan the root, as the splitter used to leave it.
-        tc.ctx.values.functions[fun].blocks.remove(&root);
+        qcode::value::Function::from_id_mut(&mut tc.ctx, fun).remove_block(root);
         // Best-effort, and specifically no panic.
         let _ = compute_input_regs(&tc.ctx, fun);
     }

@@ -471,7 +471,8 @@ fn clone_value(
                     remapped.replace_value(op, new_op);
                 }
             }
-            let new_id = InstructionRef::from_mnemonic_with_type(ctx, target.func, remapped, type_id).id;
+            let new_id =
+                InstructionRef::from_mnemonic_with_type(ctx, target.func, remapped, type_id).id;
             let idx = BasicBlock::from_id(ctx, target).instruction_ids().len();
             BasicBlock::from_id_mut(ctx, target).insert_insn_at_index(idx, new_id);
             ValueId::Instruction(new_id)

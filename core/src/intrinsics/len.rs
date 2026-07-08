@@ -110,11 +110,14 @@ mod tests {
         let arr = ctx.types.get_or_make_array(i8, 6);
         let list = ctx.types.get_or_make_list(i8, 6);
 
-        let blk = ctx.get_or_make_block(0x1000);
+        let blk = {
+            let __f = ctx.anon_function();
+            ctx.get_or_make_block(0x1000, __f)
+        };
         let ap = BasicBlock::from_id_mut(&mut ctx, blk).push_param(6).id;
-        ctx.values.block_param(ap).type_id = arr;
+        ctx.values.block_param_mut(ap).type_id = arr;
         let lp = BasicBlock::from_id_mut(&mut ctx, blk).push_param(6).id;
-        ctx.values.block_param(lp).type_id = list;
+        ctx.values.block_param_mut(lp).type_id = list;
 
         let id = IntrinsicId::from_name("len").unwrap();
 

@@ -591,10 +591,22 @@ mod tests {
         let ram = tc.ctx.default_space;
 
         let fid = Function::make(&mut tc.ctx, "copy".into()).unwrap().id;
-        let entry = tc.ctx.get_or_make_block(0x1000);
-        let header = tc.ctx.get_or_make_block(0x1010);
-        let body = tc.ctx.get_or_make_block(0x1020);
-        let exit = tc.ctx.get_or_make_block(0x1030);
+        let entry = {
+            let __f = tc.ctx.anon_function();
+            tc.ctx.get_or_make_block(0x1000, __f)
+        };
+        let header = {
+            let __f = tc.ctx.anon_function();
+            tc.ctx.get_or_make_block(0x1010, __f)
+        };
+        let body = {
+            let __f = tc.ctx.anon_function();
+            tc.ctx.get_or_make_block(0x1020, __f)
+        };
+        let exit = {
+            let __f = tc.ctx.anon_function();
+            tc.ctx.get_or_make_block(0x1030, __f)
+        };
         {
             let mut f = Function::from_id_mut(&mut tc.ctx, fid);
             f.set_root(entry).unwrap();
@@ -691,10 +703,22 @@ mod tests {
         let ram = tc.ctx.default_space;
 
         let fid = Function::make(&mut tc.ctx, "slen".into()).unwrap().id;
-        let entry = tc.ctx.get_or_make_block(0x1000);
-        let header = tc.ctx.get_or_make_block(0x1010);
-        let body = tc.ctx.get_or_make_block(0x1020);
-        let exit = tc.ctx.get_or_make_block(0x1030);
+        let entry = {
+            let __f = tc.ctx.anon_function();
+            tc.ctx.get_or_make_block(0x1000, __f)
+        };
+        let header = {
+            let __f = tc.ctx.anon_function();
+            tc.ctx.get_or_make_block(0x1010, __f)
+        };
+        let body = {
+            let __f = tc.ctx.anon_function();
+            tc.ctx.get_or_make_block(0x1020, __f)
+        };
+        let exit = {
+            let __f = tc.ctx.anon_function();
+            tc.ctx.get_or_make_block(0x1030, __f)
+        };
         {
             let mut f = Function::from_id_mut(&mut tc.ctx, fid);
             f.set_root(entry).unwrap();
@@ -872,10 +896,22 @@ mod tests {
     ) -> (FunctionId, BlockId, ValueId) {
         let ram = tc.ctx.default_space;
         let fid = Function::make(&mut tc.ctx, "strlen".into()).unwrap().id;
-        let entry = tc.ctx.get_or_make_block(0x2000);
-        let header = tc.ctx.get_or_make_block(0x2010);
-        let body = tc.ctx.get_or_make_block(0x2020);
-        let exit = tc.ctx.get_or_make_block(0x2030);
+        let entry = {
+            let __f = tc.ctx.anon_function();
+            tc.ctx.get_or_make_block(0x2000, __f)
+        };
+        let header = {
+            let __f = tc.ctx.anon_function();
+            tc.ctx.get_or_make_block(0x2010, __f)
+        };
+        let body = {
+            let __f = tc.ctx.anon_function();
+            tc.ctx.get_or_make_block(0x2020, __f)
+        };
+        let exit = {
+            let __f = tc.ctx.anon_function();
+            tc.ctx.get_or_make_block(0x2030, __f)
+        };
         {
             let mut f = Function::from_id_mut(&mut tc.ctx, fid);
             f.set_root(entry).unwrap();

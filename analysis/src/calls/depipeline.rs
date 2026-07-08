@@ -238,17 +238,15 @@ fn find_pipelined(
 /// forward the carry's uses to it, drop the param, and record the disjointness
 /// assumption that justifies the re-read.
 fn apply(ctx: &mut Context, fid: FunctionId, p: &Pipelined) {
-    let first = *ctx.values.block(p.header)
-        .instructions
-        .first()
-        .unwrap();
+    let first = *ctx.values.block(p.header).instructions.first().unwrap();
 
     // iv − step  (same width as the induction variable).
     let iv_ty = ctx.type_of(p.iv);
     let width = ctx.types.size_of(iv_ty);
     let step_lit = ctx.get_const(p.step, width).id();
     let sub = InstructionRef::from_mnemonic_with_type(
-        ctx, p.header.func,
+        ctx,
+        p.header.func,
         Mnemonic::Binop(Binary {
             op: Binop::Int(IntBinop::Sub),
             lhs: p.iv,
@@ -262,7 +260,8 @@ fn apply(ctx: &mut Context, fid: FunctionId, p: &Pipelined) {
     // load(space, iv − step, size) — the previous iteration's byte, re-derived.
     let load_ty = ctx.types.get_or_make_int(p.size);
     let prev = InstructionRef::from_mnemonic_with_type(
-        ctx, p.header.func,
+        ctx,
+        p.header.func,
         Mnemonic::Load(Load {
             space: p.space,
             ptr: ValueId::Instruction(sub),
@@ -325,9 +324,18 @@ mod tests {
     fn build_pipelined(tc: &mut TestContext) -> (FunctionId, BlockId) {
         let ram = tc.ctx.default_space;
         let fid = Function::make(&mut tc.ctx, "strcpy".into()).unwrap().id;
-        let entry = tc.ctx.get_or_make_block(0x1000);
-        let header = tc.ctx.get_or_make_block(0x1010);
-        let exit = tc.ctx.get_or_make_block(0x1020);
+        let entry = {
+            let __f = tc.ctx.anon_function();
+            tc.ctx.get_or_make_block(0x1000, __f)
+        };
+        let header = {
+            let __f = tc.ctx.anon_function();
+            tc.ctx.get_or_make_block(0x1010, __f)
+        };
+        let exit = {
+            let __f = tc.ctx.anon_function();
+            tc.ctx.get_or_make_block(0x1020, __f)
+        };
         {
             let mut f = Function::from_id_mut(&mut tc.ctx, fid);
             f.set_root(entry).unwrap();
@@ -434,9 +442,18 @@ mod tests {
         let mut tc = TestContext::new();
         let ram = tc.ctx.default_space;
         let fid = Function::make(&mut tc.ctx, "notstrcpy".into()).unwrap().id;
-        let entry = tc.ctx.get_or_make_block(0x3000);
-        let header = tc.ctx.get_or_make_block(0x3010);
-        let exit = tc.ctx.get_or_make_block(0x3020);
+        let entry = {
+            let __f = tc.ctx.anon_function();
+            tc.ctx.get_or_make_block(0x3000, __f)
+        };
+        let header = {
+            let __f = tc.ctx.anon_function();
+            tc.ctx.get_or_make_block(0x3010, __f)
+        };
+        let exit = {
+            let __f = tc.ctx.anon_function();
+            tc.ctx.get_or_make_block(0x3020, __f)
+        };
         {
             let mut f = Function::from_id_mut(&mut tc.ctx, fid);
             f.set_root(entry).unwrap();
@@ -503,9 +520,18 @@ mod tests {
         let mut tc = TestContext::new();
         let ram = tc.ctx.default_space;
         let fid = Function::make(&mut tc.ctx, "sum".into()).unwrap().id;
-        let entry = tc.ctx.get_or_make_block(0x2000);
-        let header = tc.ctx.get_or_make_block(0x2010);
-        let exit = tc.ctx.get_or_make_block(0x2020);
+        let entry = {
+            let __f = tc.ctx.anon_function();
+            tc.ctx.get_or_make_block(0x2000, __f)
+        };
+        let header = {
+            let __f = tc.ctx.anon_function();
+            tc.ctx.get_or_make_block(0x2010, __f)
+        };
+        let exit = {
+            let __f = tc.ctx.anon_function();
+            tc.ctx.get_or_make_block(0x2020, __f)
+        };
         {
             let mut f = Function::from_id_mut(&mut tc.ctx, fid);
             f.set_root(entry).unwrap();

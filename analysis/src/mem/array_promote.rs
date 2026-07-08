@@ -519,7 +519,8 @@ fn apply(ctx: &mut Context, m: &PromoteMatch) -> bool {
             region_base(&mut b, m.base_root, m.origin_word, esz)
         };
         let ld = InstructionRef::from_mnemonic_with_type(
-            ctx, m.preheader.func,
+            ctx,
+            m.preheader.func,
             Mnemonic::Load(Load {
                 space: m.region_space,
                 ptr: dst,

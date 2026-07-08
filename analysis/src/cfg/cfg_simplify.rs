@@ -694,8 +694,8 @@ mod tests {
         simplify_cfg(&mut ctx, f);
 
         let mut seen = rustc_hash::FxHashSet::default();
-        for block in ctx.values.basic_blocks.iter() {
-            for &insn in &block.instructions {
+        for block_id in ctx.block_ids() {
+            for &insn in &ctx.values.block(block_id).instructions {
                 assert!(
                     seen.insert(insn),
                     "instruction {insn:?} appears in more than one block after simplify_cfg"

@@ -293,7 +293,11 @@ mod tests {
     #[test]
     fn make_block_param_sets_index_and_size() {
         let mut ctx = Context::new();
-        let block_id = BasicBlock::make(&mut ctx).id;
+        let block_id = {
+            let __f = ctx.anon_function();
+            BasicBlock::make(&mut ctx, __f)
+        }
+        .id;
 
         let p0_id = BasicBlock::from_id_mut(&mut ctx, block_id).push_param(8).id;
         let p1_id = BasicBlock::from_id_mut(&mut ctx, block_id).push_param(4).id;
@@ -309,7 +313,11 @@ mod tests {
     #[test]
     fn block_param_display_uses_name_when_set() {
         let mut ctx = Context::new();
-        let block_id = BasicBlock::make(&mut ctx).id;
+        let block_id = {
+            let __f = ctx.anon_function();
+            BasicBlock::make(&mut ctx, __f)
+        }
+        .id;
         let p_id = BasicBlock::from_id_mut(&mut ctx, block_id).push_param(8).id;
 
         let mut p = BlockParam::from_id_mut(&mut ctx, p_id);
@@ -320,7 +328,11 @@ mod tests {
     #[test]
     fn block_param_display_fallback_when_unnamed() {
         let mut ctx = Context::new();
-        let block_id = BasicBlock::make(&mut ctx).id;
+        let block_id = {
+            let __f = ctx.anon_function();
+            BasicBlock::make(&mut ctx, __f)
+        }
+        .id;
         let p_id = BasicBlock::from_id_mut(&mut ctx, block_id).push_param(4).id;
         let p = BlockParam::from_id(&ctx, p_id);
         let s = p.to_string();
