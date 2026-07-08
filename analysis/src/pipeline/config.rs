@@ -18,7 +18,7 @@ use qcode::{
     value::{FunctionId, FunctionRef},
 };
 
-use super::PipelineProgress;
+use super::{PipelineProgress, ProgressSink, YieldSignal};
 use super::lifter::PipelineServices;
 use super::pass::{
     DynFunctionPass, DynPass, PipelineEnv, RegisteredPass, known_pass_names, make_pass,
@@ -364,12 +364,23 @@ impl Pipeline {
     /// empty closure when neither matters.
     pub fn run(
         &self,
-        ctx: &mut Context,
+        ctx: &mut Context<'_>,
         env: &PipelineEnv,
         round: usize,
-        progress: &mut impl FnMut(PipelineProgress),
+        progress: &mut impl ProgressSink,
+    ) -> Result<(), String> {
+        pollster::block_on(self.run_async(ctx, env, round, progress))
+    }
+
+    pub async fn run_async(
+        &self,
+        ctx: &mut Context<'_>,
+        env: &PipelineEnv,
+        round: usize,
+        progress: &mut impl ProgressSink,
     ) -> Result<(), String> {
         self.run_stages(0..self.stages.len(), ctx, env, round, progress)
+            .await
     }
 
     /// Run the clean-IR lifting stages before the `code-discovery-fixpoint`
@@ -377,11 +388,22 @@ impl Pipeline {
     /// services for TOML-visible lifting passes.
     pub fn run_lifting_phase(
         &self,
-        ctx: &mut Context,
+        ctx: &mut Context<'_>,
         env: &PipelineEnv,
         services: &mut PipelineServices<'_>,
         round: usize,
-        progress: &mut impl FnMut(PipelineProgress),
+        progress: &mut impl ProgressSink,
+    ) -> Result<(), String> {
+        pollster::block_on(self.run_lifting_phase_async(ctx, env, services, round, progress))
+    }
+
+    pub async fn run_lifting_phase_async(
+        &self,
+        ctx: &mut Context<'_>,
+        env: &PipelineEnv,
+        services: &mut PipelineServices<'_>,
+        round: usize,
+        progress: &mut impl ProgressSink,
     ) -> Result<(), String> {
         let end = self.barrier_index().unwrap_or(self.stages.len());
         let mut dirty_functions = Some(HashSet::default());
@@ -390,24 +412,28 @@ impl Pipeline {
             match &stage.passes {
                 StagePasses::Module(passes) => {
                     let before = cache.snapshot_clean(ctx);
-                    if run_lifting_module_stage(ctx, env, services, stage, passes, round, progress)?
+                    if run_lifting_module_stage(ctx, env, services, stage, passes, round, progress)
+                        .await?
                     {
                         dirty_functions = None;
                     }
                     cache.invalidate_changed(ctx, before);
                 }
                 StagePasses::Function(passes) => {
-                    dirty_functions = Some(run_function_stage(
-                        ctx,
-                        env,
-                        stage,
-                        passes,
-                        dirty_functions.as_ref(),
-                        None,
-                        &mut cache,
-                        round,
-                        progress,
-                    )?);
+                    dirty_functions = Some(
+                        run_function_stage(
+                            ctx,
+                            env,
+                            stage,
+                            passes,
+                            dirty_functions.as_ref(),
+                            None,
+                            &mut cache,
+                            round,
+                            progress,
+                        )
+                        .await?,
+                    );
                 }
             }
         }
@@ -432,11 +458,24 @@ impl Pipeline {
     /// handful of new addresses.
     pub fn run_address_discovery_phase(
         &self,
-        ctx: &mut Context,
+        ctx: &mut Context<'_>,
         env: &PipelineEnv,
         restrict: Option<&HashSet<FunctionId>>,
         round: usize,
-        progress: &mut impl FnMut(PipelineProgress),
+        progress: &mut impl ProgressSink,
+    ) -> Result<(), String> {
+        pollster::block_on(
+            self.run_address_discovery_phase_async(ctx, env, restrict, round, progress),
+        )
+    }
+
+    pub async fn run_address_discovery_phase_async(
+        &self,
+        ctx: &mut Context<'_>,
+        env: &PipelineEnv,
+        restrict: Option<&HashSet<FunctionId>>,
+        round: usize,
+        progress: &mut impl ProgressSink,
     ) -> Result<(), String> {
         let start = self.barrier_index().map(|i| i + 1).unwrap_or(0);
         let mut dirty_functions = Some(HashSet::default());
@@ -446,17 +485,20 @@ impl Pipeline {
                 StagePasses::Function(passes) => {
                     let reaches_discovery_pass =
                         passes.iter().any(|p| p.name() == ADDRESS_DISCOVERY_PASS);
-                    dirty_functions = Some(run_function_stage(
-                        ctx,
-                        env,
-                        stage,
-                        passes,
-                        dirty_functions.as_ref(),
-                        restrict,
-                        &mut cache,
-                        round,
-                        progress,
-                    )?);
+                    dirty_functions = Some(
+                        run_function_stage(
+                            ctx,
+                            env,
+                            stage,
+                            passes,
+                            dirty_functions.as_ref(),
+                            restrict,
+                            &mut cache,
+                            round,
+                            progress,
+                        )
+                        .await?,
+                    );
                     if reaches_discovery_pass {
                         return Ok(());
                     }
@@ -467,13 +509,13 @@ impl Pipeline {
         Ok(())
     }
 
-    fn run_stages(
+    async fn run_stages(
         &self,
         range: std::ops::Range<usize>,
-        ctx: &mut Context,
+        ctx: &mut Context<'_>,
         env: &PipelineEnv,
         round: usize,
-        progress: &mut impl FnMut(PipelineProgress),
+        progress: &mut impl ProgressSink,
     ) -> Result<(), String> {
         let mut dirty_functions = Some(HashSet::default());
         let mut cache = FixpointCache::default();
@@ -483,23 +525,26 @@ impl Pipeline {
                     // Fingerprint the clean functions, run the stage, then invalidate
                     // only those the stage actually modified (see `snapshot_clean`).
                     let before = cache.snapshot_clean(ctx);
-                    if run_module_stage(ctx, env, stage, passes, round, progress)? {
+                    if run_module_stage(ctx, env, stage, passes, round, progress).await? {
                         dirty_functions = None;
                     }
                     cache.invalidate_changed(ctx, before);
                 }
                 StagePasses::Function(passes) => {
-                    dirty_functions = Some(run_function_stage(
-                        ctx,
-                        env,
-                        stage,
-                        passes,
-                        dirty_functions.as_ref(),
-                        None,
-                        &mut cache,
-                        round,
-                        progress,
-                    )?);
+                    dirty_functions = Some(
+                        run_function_stage(
+                            ctx,
+                            env,
+                            stage,
+                            passes,
+                            dirty_functions.as_ref(),
+                            None,
+                            &mut cache,
+                            round,
+                            progress,
+                        )
+                        .await?,
+                    );
                 }
             }
         }
@@ -550,13 +595,13 @@ fn unknown_pass(name: &str, stage: &str) -> String {
 
 /// Run a whole-program stage; if `repeat_until` is set, loop the stage (OR-ing
 /// the passes' change flags) until nothing changes or the iteration cap is hit.
-fn run_module_stage(
-    ctx: &mut Context,
+async fn run_module_stage(
+    ctx: &mut Context<'_>,
     env: &PipelineEnv,
     stage: &Stage,
     passes: &[Box<dyn DynPass>],
     round: usize,
-    progress: &mut impl FnMut(PipelineProgress),
+    progress: &mut impl ProgressSink,
 ) -> Result<bool, String> {
     let stage_name: std::sync::Arc<str> = stage.name.as_str().into();
     let mut iters = 0;
@@ -564,7 +609,7 @@ fn run_module_stage(
     loop {
         let mut changed = false;
         for p in passes {
-            progress(PipelineProgress::WholeProgramPhase {
+            progress.report(PipelineProgress::WholeProgramPhase {
                 round,
                 stage: stage_name.clone(),
                 pass: p.name(),
@@ -600,14 +645,14 @@ fn run_module_stage(
 /// Run a clean-IR whole-program stage during recursive lifting. Most passes are
 /// ordinary analysis passes; the two lifting pass names are TOML-visible
 /// adapters over the caller-provided lifter service.
-fn run_lifting_module_stage(
-    ctx: &mut Context,
+async fn run_lifting_module_stage(
+    ctx: &mut Context<'_>,
     env: &PipelineEnv,
     services: &mut PipelineServices<'_>,
     stage: &Stage,
     passes: &[Box<dyn DynPass>],
     round: usize,
-    progress: &mut impl FnMut(PipelineProgress),
+    progress: &mut impl ProgressSink,
 ) -> Result<bool, String> {
     let stage_name: std::sync::Arc<str> = stage.name.as_str().into();
     let mut iters = 0;
@@ -615,7 +660,7 @@ fn run_lifting_module_stage(
     loop {
         let mut changed = false;
         for p in passes {
-            progress(PipelineProgress::WholeProgramPhase {
+            progress.report(PipelineProgress::WholeProgramPhase {
                 round,
                 stage: stage_name.clone(),
                 pass: p.name(),
@@ -762,8 +807,8 @@ pub(super) fn function_fingerprint(ctx: &Context, fun_id: FunctionId) -> u64 {
 /// run the stage's passes; if `repeat_until` is set, loop that function's passes
 /// to a fixpoint before moving to the next function.
 #[allow(clippy::too_many_arguments)]
-fn run_function_stage(
-    ctx: &mut Context,
+async fn run_function_stage(
+    ctx: &mut Context<'_>,
     env: &PipelineEnv,
     stage: &Stage,
     passes: &[Box<dyn DynFunctionPass>],
@@ -775,7 +820,7 @@ fn run_function_stage(
     restrict: Option<&HashSet<FunctionId>>,
     cache: &mut FixpointCache,
     round: usize,
-    progress: &mut impl FnMut(PipelineProgress),
+    progress: &mut impl ProgressSink,
 ) -> Result<HashSet<FunctionId>, String> {
     let fun_ids: Vec<FunctionId> = ctx
         .functions()
@@ -807,7 +852,7 @@ fn run_function_stage(
                 if cache.is_clean(fun_id, p.name()) {
                     continue;
                 }
-                progress(PipelineProgress::FunctionPass {
+                progress.report(PipelineProgress::FunctionPass {
                     round,
                     stage: stage_name.clone(),
                     function: function.clone(),
@@ -850,6 +895,13 @@ fn run_function_stage(
         }
         if function_changed {
             dirty.insert(fun_id);
+        }
+
+        // Cooperative yield point: one per function (never per pass). The default
+        // sink returns immediately; a wasm sink may suspend until the next frame
+        // and can cancel, in which case we stop early and return the work done so far.
+        if let YieldSignal::Cancelled = progress.yield_now().await {
+            return Ok(dirty);
         }
     }
 

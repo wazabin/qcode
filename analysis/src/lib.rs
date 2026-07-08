@@ -55,8 +55,8 @@ pub mod pipeline;
 pub use pipeline::{
     ArchConfig, CallingConvention, DEFAULT_PIPELINE_TOML, DynFunctionPass, DynPass, FunctionPass,
     GpReg, LiftOutcome, LiftSummary, Pass, PassRegistration, Pipeline, PipelineEnv,
-    PipelineServices, RegisteredPass, analyze_and_lift_with_progress, analyze_default,
-    analyze_with_pipeline,
+    PipelineServices, ProgressSink, RegisteredPass, YieldSignal, analyze_and_lift_with_progress,
+    analyze_default, analyze_with_pipeline,
 };
 #[cfg(not(target_arch = "wasm32"))]
 pub use pipeline::{
