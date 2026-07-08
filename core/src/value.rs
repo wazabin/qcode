@@ -144,6 +144,19 @@ impl ValueId {
         }
     }
 
+    /// The function that owns this value's definition, if it is an SSA def
+    /// (an [`Instruction`] result or a [`BlockParam`]). Shared values (literals,
+    /// bytes, varnodes) and functions/blocks return `None` — they have no single
+    /// owning function and their per-function use-lists live in each using
+    /// function's [`users`](crate::value::function::Function::users) map.
+    pub fn owning_function(self) -> Option<FunctionId> {
+        match self {
+            ValueId::Instruction(id) => Some(id.func),
+            ValueId::BlockParam(id) => Some(id.func),
+            _ => None,
+        }
+    }
+
     pub fn as_literal(self) -> Option<LiteralId> {
         if let ValueId::Literal(id) = self {
             Some(id)

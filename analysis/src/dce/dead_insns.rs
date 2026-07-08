@@ -313,11 +313,11 @@ mod tests {
             .unwrap();
         Function::from_id_mut(ctx, callee).set_is_pure(pure);
 
+        // Both blocks must live in the *same* function: the call's result (defined
+        // in the call block) is used by the store in the continuation, and users
+        // of an SSA value are intra-function. Store both directly in `caller`.
         let caller = Function::make(ctx, "caller".into()).unwrap().id;
-        let call_block = {
-            let __f = ctx.anon_function();
-            ctx.get_or_make_block(0x1000, __f)
-        };
+        let call_block = ctx.get_or_make_block(0x1000, caller);
         Function::from_id_mut(ctx, caller)
             .set_root(call_block)
             .unwrap();
@@ -329,10 +329,7 @@ mod tests {
             id
         };
 
-        let cont = {
-            let __f = ctx.anon_function();
-            ctx.get_or_make_block(0x2000, __f)
-        };
+        let cont = ctx.get_or_make_block(0x2000, caller);
         ctx.add_cfg_edge(call_block, cont);
 
         if use_result {

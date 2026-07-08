@@ -805,8 +805,25 @@ impl<'str> Context<'str> {
     }
 
     /// Return all instructions that use `value` as an operand.
+    ///
+    /// For an SSA value (instruction result or block param) this is the complete
+    /// user set, read from its owning function. For a shared value
+    /// (literal/bytes/varnode) it is `&[]` — those have no owning function and
+    /// their uses are tracked per using-function; use
+    /// [`users_across_functions`](Self::users_across_functions) to find them.
     pub fn users(&self, value: impl Into<ValueId>) -> &[InstructionId] {
         self.values.users_of(value.into())
+    }
+
+    /// Every instruction across all functions that uses `value` as an operand.
+    /// Unlike [`users`](Self::users) this scans every function, so it answers a
+    /// shared value (literal/bytes/varnode) whose uses span functions. Off the
+    /// hot path (allocates); prefer [`users`](Self::users) for an SSA value.
+    pub fn users_across_functions(&self, value: impl Into<ValueId>) -> Vec<InstructionId> {
+        let value = value.into();
+        self.functions()
+            .flat_map(|f| f.users_of(value).to_vec())
+            .collect()
     }
 
     /// Replace every use of `old` with `new` across all instructions that
@@ -818,13 +835,28 @@ impl<'str> Context<'str> {
             return;
         }
         let users: Vec<InstructionId> = self.values.users_of(old).to_vec();
+        // `old`'s user list lives in its owning function's map; every user we are
+        // rewriting is in that same function, so `new`'s new uses are recorded
+        // there too. `old` is always an SSA def in practice (audited); a shared
+        // value has no owning function and no locatable user list here.
+        let Some(func) = old.owning_function() else {
+            debug_assert!(
+                users.is_empty(),
+                "replace_all_uses_with on a shared value that has users"
+            );
+            return;
+        };
         for user_id in users {
             Instruction::from_id_mut(self, user_id)
                 .mnemonic_mut()
                 .replace_value(old, new);
-            self.values.users.entry(new).or_default().push(user_id);
+            self.values.functions[func]
+                .users
+                .entry(new)
+                .or_default()
+                .push(user_id);
         }
-        self.values.users.remove(&old);
+        self.values.functions[func].users.remove(&old);
     }
 
     /// Replaces one instruction's mnemonic and keeps the reverse use map in sync.
@@ -832,15 +864,17 @@ impl<'str> Context<'str> {
     /// This is for transforms that change an instruction in place without
     /// changing its identity, parent block, address, or result type.
     pub fn replace_instruction_mnemonic(&mut self, id: InstructionId, mnemonic: Mnemonic) {
+        // Every operand's use is recorded in this instruction's own function map.
+        let func = id.func;
         let old_args = self.values.instruction(id).mnemonic().args();
         for arg in old_args {
             let mut remove_arg = false;
-            if let Some(users) = self.values.users.get_mut(&arg) {
+            if let Some(users) = self.values.functions[func].users.get_mut(&arg) {
                 users.retain(|&user| user != id);
                 remove_arg = users.is_empty();
             }
             if remove_arg {
-                self.values.users.remove(&arg);
+                self.values.functions[func].users.remove(&arg);
             }
         }
 
@@ -855,7 +889,11 @@ impl<'str> Context<'str> {
         *Instruction::from_id_mut(self, id).mnemonic_mut() = mnemonic;
 
         for arg in self.values.instruction(id).mnemonic().args() {
-            self.values.users.entry(arg).or_default().push(id);
+            self.values.functions[func]
+                .users
+                .entry(arg)
+                .or_default()
+                .push(id);
         }
         if let Some(target) = self.values.instruction(id).mnemonic().call_target() {
             self.values.call_sites.entry(target).or_default().push(id);
@@ -1377,7 +1415,8 @@ mod tests {
             Mnemonic::CallInd(call) => call.ptr,
             other => panic!("expected CallInd, got {other:?}"),
         };
-        assert_eq!(ctx.users(ptr), &[call_id]);
+        // `ptr` is a shared varnode, so query its uses across functions.
+        assert_eq!(ctx.users_across_functions(ptr), vec![call_id]);
 
         let target = Function::make(&mut ctx, "target".into()).unwrap().id;
         ctx.replace_instruction_mnemonic(
@@ -1390,7 +1429,7 @@ mod tests {
         );
 
         assert!(
-            ctx.users(ptr).is_empty(),
+            ctx.users_across_functions(ptr).is_empty(),
             "old indirect pointer should no longer list the rewritten call"
         );
         assert!(matches!(
@@ -1454,8 +1493,9 @@ mod tests {
         let load_id = BasicBlock::from_id(&ctx, block).instruction_ids()[0];
         let old_ptr = ValueId::Varnode(x);
         let new_ptr = ValueId::Varnode(y);
-        assert_eq!(ctx.users(old_ptr), &[load_id]);
-        assert!(ctx.users(new_ptr).is_empty());
+        // Varnodes are shared values, so query their uses across functions.
+        assert_eq!(ctx.users_across_functions(old_ptr), vec![load_id]);
+        assert!(ctx.users_across_functions(new_ptr).is_empty());
 
         ctx.replace_instruction_mnemonic(
             load_id,
@@ -1466,8 +1506,8 @@ mod tests {
             }),
         );
 
-        assert!(ctx.users(old_ptr).is_empty());
-        assert_eq!(ctx.users(new_ptr), &[load_id]);
+        assert!(ctx.users_across_functions(old_ptr).is_empty());
+        assert_eq!(ctx.users_across_functions(new_ptr), vec![load_id]);
     }
 
     #[test]
@@ -1496,10 +1536,10 @@ mod tests {
             }),
         );
 
-        assert!(ctx.users(old_ptr).is_empty());
+        assert!(ctx.users_across_functions(old_ptr).is_empty());
         assert_eq!(
-            ctx.users(new_arg),
-            &[load_id, load_id],
+            ctx.users_across_functions(new_arg),
+            vec![load_id, load_id],
             "a mnemonic using the same operand twice should record both uses"
         );
     }

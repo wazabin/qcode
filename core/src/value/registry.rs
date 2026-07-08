@@ -30,15 +30,18 @@ use std::collections::BTreeSet;
 /// # Invariants
 ///
 /// - **`push_insn` is final.** Instructions are immutable after insertion.
-///   The `users` map is populated at push time from the instruction's operands
-///   and is not updated if operands are later altered via interior mutation.
-///   Use [`Context::replace_all_uses_with`](crate::context::Context::replace_all_uses_with)
+///   The owning function's `users` map is populated at push time from the
+///   instruction's operands and is not updated if operands are later altered via
+///   interior mutation. Use
+///   [`Context::replace_all_uses_with`](crate::context::Context::replace_all_uses_with)
 ///   to rewrite operands while keeping `users` consistent.
 ///
-/// - **`users` is managed internally.** Do not access or mutate `users`
-///   directly. Use [`users_of`](Self::users_of) to read and
-///   [`remove_instructions`](Self::remove_instructions) to remove dead
-///   instructions from the map.
+/// - **`users` is managed internally.** The reverse use-def map now lives in
+///   each [`Function`] (function-scoped; see [`Function::users`]). Do not mutate
+///   it directly. Read it through
+///   [`FunctionRef::users_of`](crate::value::FunctionRef::users_of) /
+///   [`Context::users`](crate::context::Context::users), and remove dead
+///   instructions via [`remove_instructions`](Self::remove_instructions).
 #[derive(Clone, Default, serde::Serialize, serde::Deserialize)]
 pub struct ValueRegistry<'str> {
     /// Literal (constant) storage.
@@ -85,12 +88,6 @@ pub struct ValueRegistry<'str> {
     /// replay signal. Transient per round, so not serialized.
     #[serde(default, skip)]
     pub(crate) known_contradictions: Vec<KnownContradiction>,
-
-    /// Reverse use-def map: for each `ValueId`, the list of instructions that
-    /// use it as an operand. Kept in sync by [`push_insn`](Self::push_insn),
-    /// [`remove_instructions`](Self::remove_instructions), and
-    /// [`Context::replace_all_uses_with`].
-    pub(crate) users: HashMap<ValueId, Vec<InstructionId>>,
 
     /// Reverse call graph: for each callee [`FunctionId`], the direct-call sites
     /// (instructions) that target it. Kept in sync alongside `users` by
@@ -171,9 +168,17 @@ impl<'str> ValueRegistry<'str> {
         let call_target = insn.mnemonic().call_target();
         let local = self.functions[func].insns.push(insn);
         let id = InstructionId::new(func, local);
+        // Record each operand's use in *this* function's map. For SSA operands
+        // (instruction/param) the operand's own function is `func` by the SSA
+        // ownership invariant; for shared operands (literal/varnode) the entry
+        // lives with the using function, which is all any reader needs.
         for arg in args {
-            self.users.entry(arg).or_default().push(id);
+            self.functions[func].users.entry(arg).or_default().push(id);
         }
+        // call_sites is the one remaining global reverse map (Stage 2): the
+        // parallel driver (Stage 6) will rebuild it from a per-function
+        // outgoing-call diff at check-in, at which point these direct writes move
+        // there. Until then it is maintained inline.
         if let Some(target) = call_target {
             self.call_sites.entry(target).or_default().push(id);
         }
@@ -220,9 +225,17 @@ impl<'str> ValueRegistry<'str> {
         &mut self.functions[id.func].edges[id.local]
     }
 
-    /// Returns all instructions that use `value` as an operand.
+    /// Returns the instructions that use `value` as an operand, read from
+    /// `value`'s owning function. For an SSA def (instruction/param) that is the
+    /// complete user set (all uses are intra-function). For a shared value
+    /// (literal/bytes/varnode) there is no single owner, so this returns `&[]`;
+    /// scan [`Context::functions`](crate::context::Context::functions) with
+    /// [`Function::users_of`] to find a shared value's uses across functions.
     pub fn users_of(&self, value: ValueId) -> &[InstructionId] {
-        self.users.get(&value).map(Vec::as_slice).unwrap_or(&[])
+        match value.owning_function() {
+            Some(func) => self.functions[func].users_of(value),
+            None => &[],
+        }
     }
 
     /// Returns the direct-call sites (instructions) targeting `callee`.
@@ -265,11 +278,13 @@ impl<'str> ValueRegistry<'str> {
         // yields the same result as pruning per (dead, operand) pair — but a
         // value shared by K dead users has its list scanned once instead of K
         // times. This is the dominant cost when large blocks are cleared.
-        let mut affected_args: HashSet<ValueId> = HashSet::default();
+        // An operand's user entry lives in the *using* instruction's function
+        // map, so the affected map is keyed by the dead instruction's own func.
+        let mut affected_args: HashSet<(FunctionId, ValueId)> = HashSet::default();
         let mut affected_targets: HashSet<FunctionId> = HashSet::default();
         for &id in dead {
             let mnemonic = self.instruction(id).mnemonic();
-            affected_args.extend(mnemonic.args());
+            affected_args.extend(mnemonic.args().into_iter().map(|arg| (id.func, arg)));
             if let Some(target) = mnemonic.call_target() {
                 affected_targets.insert(target);
             }
@@ -279,8 +294,8 @@ impl<'str> ValueRegistry<'str> {
             // still carries.
             self.instruction_mut(id).deleted = true;
         }
-        for arg in affected_args {
-            if let Some(users) = self.users.get_mut(&arg) {
+        for (func, arg) in affected_args {
+            if let Some(users) = self.functions[func].users.get_mut(&arg) {
                 users.retain(|u| !dead.contains(u));
             }
         }

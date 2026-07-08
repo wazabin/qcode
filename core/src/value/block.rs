@@ -654,7 +654,10 @@ impl<'str, 'ctx> BlockMutRef<'str, 'ctx> {
         // their uses (the params have no live readers once the block is gone).
         let params: Vec<BlockParamId> = self.inner().params.clone();
         for param in params {
-            self.ctx.values.users.remove(&ValueId::BlockParam(param));
+            // The param's user entry (if any) lives in its own function's map.
+            self.ctx.values.functions[param.func]
+                .users
+                .remove(&ValueId::BlockParam(param));
             self.ctx.values.block_param_mut(param).parent = None;
         }
 

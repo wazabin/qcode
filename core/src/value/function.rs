@@ -1,4 +1,5 @@
 use jstd::Identifier;
+use rustc_hash::FxHashMap;
 use std::{
     borrow::Cow,
     collections::BTreeSet,
@@ -88,6 +89,20 @@ pub struct Function<'str> {
     /// What semantic class this function belongs to.
     #[serde(default)]
     pub kind: FunctionKind,
+
+    /// Reverse use-def map, scoped to this function: for each [`ValueId`] the
+    /// list of *this function's* instructions that use it as an operand. By the
+    /// SSA ownership invariant every user of an instruction/param value is
+    /// intra-function, so an SSA def's users all live here. Shared values
+    /// (literals, varnodes) may be used by many functions; each records only its
+    /// own uses, which is all any pass needs (no pass queries a shared value's
+    /// users program-wide). Kept in sync by
+    /// [`push_insn`](crate::value::registry::ValueRegistry::push_insn),
+    /// [`remove_instructions`](crate::value::registry::ValueRegistry::remove_instructions),
+    /// [`Context::replace_all_uses_with`](crate::context::Context::replace_all_uses_with),
+    /// and [`Context::replace_instruction_mnemonic`](crate::context::Context::replace_instruction_mnemonic).
+    #[serde(default)]
+    pub(crate) users: FxHashMap<ValueId, Vec<InstructionId>>,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -112,7 +127,20 @@ impl<'str> Function<'str> {
             is_external: false,
             signature: None,
             kind: FunctionKind::Machine,
+            users: FxHashMap::default(),
         }
+    }
+
+    /// This function's instructions that use `value` as an operand (see
+    /// [`users`](Self::users)). Empty for a value this function never uses.
+    pub fn users_of(&self, value: ValueId) -> &[InstructionId] {
+        self.users.get(&value).map(Vec::as_slice).unwrap_or(&[])
+    }
+
+    /// Iterate this function's recorded `(value, users)` reverse-use entries.
+    /// Read-only; used by the users-map consistency verifier.
+    pub fn user_map_entries(&self) -> impl Iterator<Item = (ValueId, &[InstructionId])> {
+        self.users.iter().map(|(v, u)| (*v, u.as_slice()))
     }
 
     /// Gets a reference to a function from its ID
@@ -248,6 +276,19 @@ where
     /// A reference to the signature of the inner `Function`, if any.
     pub fn signature(&'s self) -> Option<&'ctx FunctionSignature> {
         self.inner().signature.as_ref()
+    }
+
+    /// This function's instructions that use `value` as an operand. See
+    /// [`Function::users_of`]; this is the function-scoped read every pass wants
+    /// for an SSA value (all its users are intra-function).
+    pub fn users_of(&'s self, value: ValueId) -> &'ctx [InstructionId] {
+        self.inner().users_of(value)
+    }
+
+    /// Iterate this function's recorded `(value, users)` reverse-use entries
+    /// (see [`Function::user_map_entries`]).
+    pub fn user_map_entries(&'s self) -> impl Iterator<Item = (ValueId, &'ctx [InstructionId])> {
+        self.inner().user_map_entries()
     }
 
     /// Whether this function's full register effect is captured by its call

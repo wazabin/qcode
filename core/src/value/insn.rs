@@ -323,14 +323,20 @@ impl<'str, 'ctx> InstructionMutRef<'str, 'ctx> {
         let old_args = self.inner().mnemonic.args();
         let new_args = mnemonic.args();
 
+        // Operand uses are recorded in this instruction's own function map.
+        let func = self.id.func;
         for arg in old_args {
-            if let Some(users) = self.ctx.values.users.get_mut(&arg) {
+            if let Some(users) = self.ctx.values.functions[func].users.get_mut(&arg) {
                 users.retain(|&user| user != self.id);
             }
         }
 
         for arg in new_args {
-            self.ctx.values.users.entry(arg).or_default().push(self.id);
+            self.ctx.values.functions[func]
+                .users
+                .entry(arg)
+                .or_default()
+                .push(self.id);
         }
 
         self.inner_mut().mnemonic = mnemonic;
