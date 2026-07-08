@@ -24,6 +24,8 @@
 //!
 //! - Pointer types for RAM/register spaces.
 
+use std::sync::{RwLock, RwLockReadGuard, RwLockWriteGuard};
+
 use rustc_hash::FxHashMap as HashMap;
 
 use crate::{
@@ -466,7 +468,7 @@ impl Type for ListType {
 /// configured) and never removed. All methods that *only read* types take
 /// `&self`; methods that may create new `Int` types on demand take `&mut self`.
 #[derive(Clone)]
-pub struct TypeManager {
+struct TypeManagerInner {
     types: Vec<Box<dyn Type>>,
     /// Fast lookup: Int size → TypeId.
     int_by_size: HashMap<usize, TypeId>,
@@ -486,14 +488,14 @@ pub struct TypeManager {
     list_by_elem_bound: HashMap<(TypeId, Option<usize>), TypeId>,
 }
 
-impl Default for TypeManager {
+impl Default for TypeManagerInner {
     fn default() -> Self {
         Self::new()
     }
 }
 
-impl TypeManager {
-    pub fn new() -> Self {
+impl TypeManagerInner {
+    fn new() -> Self {
         Self {
             types: Vec::new(),
             int_by_size: HashMap::default(),
@@ -749,23 +751,11 @@ impl TypeManager {
         }
     }
 
-    /// The name of `id`, if `id` is a nominal [`StructType`].
-    pub fn struct_name_of(&self, id: TypeId) -> Option<&str> {
-        self.get(id).struct_name()
-    }
-
-    /// The field of struct/aggregate `id` whose byte offset is exactly `offset`,
-    /// returned as `(index, field)`. Used by [`Gep`](crate::value::insn::Gep)
-    /// resolution, which matches on exact offset.
-    pub fn field_by_offset(&self, id: TypeId, offset: usize) -> Option<(usize, &AggregateField)> {
-        self.aggregate_fields(id)?
-            .iter()
-            .enumerate()
-            .find(|(_, field)| field.offset == offset)
-    }
-
     /// The ordered named fields of `id`, or `None` if `id` is not an aggregate.
-    pub fn aggregate_fields(&self, id: TypeId) -> Option<&[AggregateField]> {
+    /// Only used internally by [`field_type`](Self::field_type)/
+    /// [`field_index`](Self::field_index); the wrapper exposes the public
+    /// reference-returning accessors.
+    fn aggregate_fields(&self, id: TypeId) -> Option<&[AggregateField]> {
         self.get(id).fields()
     }
 
@@ -775,13 +765,6 @@ impl TypeManager {
         self.aggregate_fields(id)?
             .get(index)
             .map(|field| field.type_id)
-    }
-
-    /// The name of field `index` of aggregate `id`, if it exists.
-    pub fn field_name(&self, id: TypeId, index: usize) -> Option<&str> {
-        self.aggregate_fields(id)?
-            .get(index)
-            .map(|field| field.name.as_str())
     }
 
     /// The index of field `name` of aggregate `id`, if it exists.
@@ -838,6 +821,170 @@ impl TypeManager {
     }
 }
 
+/// The type interner: a global, append-only table of interned [`Type`]s behind a
+/// [`RwLock`] so that types can be minted through a shared `&` reference (a
+/// prerequisite for running function passes in parallel against a shared
+/// `ModuleView`). Reads take a read lock; the rare mint path takes a write lock.
+/// Interned [`TypeId`]s are globally stable and never remapped.
+pub struct TypeManager {
+    inner: RwLock<TypeManagerInner>,
+}
+
+impl Default for TypeManager {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl Clone for TypeManager {
+    fn clone(&self) -> Self {
+        Self {
+            inner: RwLock::new(self.read().clone()),
+        }
+    }
+}
+
+impl TypeManager {
+    pub fn new() -> Self {
+        Self {
+            inner: RwLock::new(TypeManagerInner::new()),
+        }
+    }
+
+    fn read(&self) -> RwLockReadGuard<'_, TypeManagerInner> {
+        self.inner.read().expect("type manager RwLock poisoned")
+    }
+
+    fn write(&self) -> RwLockWriteGuard<'_, TypeManagerInner> {
+        self.inner.write().expect("type manager RwLock poisoned")
+    }
+
+    // --- mint path (write lock) ------------------------------------------
+
+    pub fn get_or_make_int(&self, size: usize) -> TypeId {
+        self.write().get_or_make_int(size)
+    }
+    pub fn get_or_make_bool(&self) -> TypeId {
+        self.write().get_or_make_bool()
+    }
+    pub fn get_or_make_space_address(&self, size: usize, space: SpaceId) -> TypeId {
+        self.write().get_or_make_space_address(size, space)
+    }
+    pub fn get_or_make_aggregate(&self, fields: Vec<TypeId>) -> TypeId {
+        self.write().get_or_make_aggregate(fields)
+    }
+    pub fn get_or_make_named_aggregate(&self, fields: Vec<AggregateField>) -> TypeId {
+        self.write().get_or_make_named_aggregate(fields)
+    }
+    pub fn get_or_make_struct(
+        &self,
+        name: impl Into<String>,
+        size: usize,
+        fields: Vec<AggregateField>,
+    ) -> TypeId {
+        self.write().get_or_make_struct(name, size, fields)
+    }
+    pub fn get_or_make_struct_pointer(&self, size: usize, pointee: TypeId) -> TypeId {
+        self.write().get_or_make_struct_pointer(size, pointee)
+    }
+    pub fn get_or_make_array(&self, elem: TypeId, count: usize) -> TypeId {
+        self.write().get_or_make_array(elem, count)
+    }
+    pub fn get_or_make_list(&self, elem: TypeId, bound: usize) -> TypeId {
+        self.write().get_or_make_list(elem, bound)
+    }
+    pub fn get_or_make_unbounded_list(&self, elem: TypeId) -> TypeId {
+        self.write().get_or_make_unbounded_list(elem)
+    }
+    pub fn get_or_make_seq(&self, elem: TypeId, len: usize, is_list: bool) -> TypeId {
+        self.write().get_or_make_seq(elem, len, is_list)
+    }
+    pub fn binop_result(&self, lhs: TypeId, op: Binop, rhs: TypeId) -> TypeId {
+        self.write().binop_result(lhs, op, rhs)
+    }
+
+    // --- Copy/owned reads (read lock) ------------------------------------
+
+    pub fn bool_id(&self) -> Option<TypeId> {
+        self.read().bool_id()
+    }
+    pub fn is_bool(&self, id: TypeId) -> bool {
+        self.read().is_bool(id)
+    }
+    pub fn struct_by_name(&self, name: &str) -> Option<TypeId> {
+        self.read().struct_by_name(name)
+    }
+    pub fn size_of(&self, id: TypeId) -> usize {
+        self.read().size_of(id)
+    }
+    pub fn space_of(&self, id: TypeId) -> Option<SpaceId> {
+        self.read().space_of(id)
+    }
+    pub fn pointee_of(&self, id: TypeId) -> Option<TypeId> {
+        self.read().pointee_of(id)
+    }
+    pub fn array_of(&self, id: TypeId) -> Option<(TypeId, usize)> {
+        self.read().array_of(id)
+    }
+    pub fn list_of(&self, id: TypeId) -> Option<(TypeId, Option<usize>)> {
+        self.read().list_of(id)
+    }
+    pub fn seq_of(&self, id: TypeId) -> Option<(TypeId, usize, bool)> {
+        self.read().seq_of(id)
+    }
+    pub fn seq_elem_of(&self, id: TypeId) -> Option<TypeId> {
+        self.read().seq_elem_of(id)
+    }
+    pub fn type_name(&self, id: TypeId) -> String {
+        self.read().type_name(id)
+    }
+    pub fn field_type(&self, id: TypeId, index: usize) -> Option<TypeId> {
+        self.read().field_type(id, index)
+    }
+    pub fn field_index(&self, id: TypeId, name: &str) -> Option<usize> {
+        self.read().field_index(id, name)
+    }
+
+    // --- reference reads (built on the append-only-stable `get`) ----------
+
+    /// Returns a reference to the concrete [`Type`] for `id`.
+    ///
+    /// The reference outlives the read guard: this is sound because the type
+    /// table is **append-only** — types are created once and never removed, and
+    /// each `Box<dyn Type>` pointee is heap-allocated and never moved (growing
+    /// the backing `Vec` relocates the boxes, not the objects they own). So the
+    /// pointee lives as long as `self`, and the read lock only needs to guard the
+    /// `Vec` indexing.
+    pub fn get(&self, id: TypeId) -> &dyn Type {
+        let ptr: *const dyn Type = {
+            let inner = self.read();
+            &*inner.types[id.0 as usize] as *const dyn Type
+        };
+        // SAFETY: `ptr` points at a `Box<dyn Type>` pointee that is never moved or
+        // freed for the life of `self` (see the method doc), so dereferencing it
+        // after the read guard drops — and tying the borrow to `&self` — is sound.
+        unsafe { &*ptr }
+    }
+
+    pub fn struct_name_of(&self, id: TypeId) -> Option<&str> {
+        self.get(id).struct_name()
+    }
+    pub fn aggregate_fields(&self, id: TypeId) -> Option<&[AggregateField]> {
+        self.get(id).fields()
+    }
+    pub fn field_by_offset(&self, id: TypeId, offset: usize) -> Option<(usize, &AggregateField)> {
+        self.aggregate_fields(id)?
+            .iter()
+            .enumerate()
+            .find(|(_, field)| field.offset == offset)
+    }
+    pub fn field_name(&self, id: TypeId, index: usize) -> Option<&str> {
+        self.aggregate_fields(id)?
+            .get(index)
+            .map(|field| field.name.as_str())
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Serialization
 // ---------------------------------------------------------------------------
@@ -851,7 +998,7 @@ impl TypeManager {
 
 impl serde::Serialize for TypeManager {
     fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
-        let reprs: Vec<TypeRepr> = self.types.iter().map(|t| t.repr()).collect();
+        let reprs: Vec<TypeRepr> = self.read().types.iter().map(|t| t.repr()).collect();
         reprs.serialize(serializer)
     }
 }
@@ -863,7 +1010,7 @@ mod tests {
     #[test]
     fn binop_result_bool_rules() {
         use crate::value::insn::{Binop, FloatBinop, IntBinop};
-        let mut tm = TypeManager::new();
+        let tm = TypeManager::new();
         let i32 = tm.get_or_make_int(4);
         let boolt = tm.get_or_make_bool();
 
@@ -895,7 +1042,7 @@ mod tests {
 
     #[test]
     fn bool_is_byte_stored_and_interned() {
-        let mut tm = TypeManager::new();
+        let tm = TypeManager::new();
         let b = tm.get_or_make_bool();
         assert_eq!(tm.size_of(b), 1);
         assert!(tm.is_bool(b));
@@ -907,7 +1054,7 @@ mod tests {
 
     #[test]
     fn bool_round_trips_through_serde() {
-        let mut tm = TypeManager::new();
+        let tm = TypeManager::new();
         let _i8 = tm.get_or_make_int(1);
         let b = tm.get_or_make_bool();
         let config = bincode::config::standard();
@@ -920,7 +1067,7 @@ mod tests {
 
     #[test]
     fn array_is_a_disguised_width_n_scalar() {
-        let mut tm = TypeManager::new();
+        let tm = TypeManager::new();
         let i8 = tm.get_or_make_int(1);
         let arr = tm.get_or_make_array(i8, 20);
 
@@ -939,7 +1086,7 @@ mod tests {
 
     #[test]
     fn array_round_trips_through_serde() {
-        let mut tm = TypeManager::new();
+        let tm = TypeManager::new();
         let i8 = tm.get_or_make_int(1);
         let arr = tm.get_or_make_array(i8, 20);
 
@@ -954,7 +1101,7 @@ mod tests {
 
     #[test]
     fn list_round_trips_through_serde() {
-        let mut tm = TypeManager::new();
+        let tm = TypeManager::new();
         let i8 = tm.get_or_make_int(1);
         let list = tm.get_or_make_list(i8, 20);
 
@@ -971,7 +1118,7 @@ mod tests {
 
     #[test]
     fn unbounded_list_round_trips_and_has_no_footprint() {
-        let mut tm = TypeManager::new();
+        let tm = TypeManager::new();
         let i8 = tm.get_or_make_int(1);
         let list = tm.get_or_make_unbounded_list(i8);
         // Unbounded: a list with no static bound and no materialized footprint.
@@ -992,7 +1139,7 @@ mod tests {
 impl<'de> serde::Deserialize<'de> for TypeManager {
     fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
         let reprs = Vec::<TypeRepr>::deserialize(deserializer)?;
-        let mut manager = TypeManager::new();
+        let manager = TypeManager::new();
         for repr in reprs {
             match repr {
                 TypeRepr::Int { size } => {
