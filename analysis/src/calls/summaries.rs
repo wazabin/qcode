@@ -284,12 +284,8 @@ pub fn compute_input_regs(ctx: &Context, function_id: FunctionId) -> Vec<Varnode
     // reattribution can leave a stub function's root pointing outside its block
     // set. Fall back to an empty live-in rather than panicking; the param sweep
     // below still recovers the mem2reg-promoted argument registers.
-    let mut inputs: HashSet<VarnodeId> = live_in
-        .get(&root)
-        .into_iter()
-        .flatten()
-        .copied()
-        .collect();
+    let mut inputs: HashSet<VarnodeId> =
+        live_in.get(&root).into_iter().flatten().copied().collect();
 
     // mem2reg promotes load-before-store registers (the classic argument
     // registers) into root block params named after the register, removing the

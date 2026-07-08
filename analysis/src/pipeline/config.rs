@@ -18,11 +18,11 @@ use qcode::{
     value::{FunctionId, FunctionRef},
 };
 
-use super::{PipelineProgress, ProgressSink, YieldSignal};
 use super::lifter::PipelineServices;
 use super::pass::{
     DynFunctionPass, DynPass, PipelineEnv, RegisteredPass, known_pass_names, make_pass,
 };
+use super::{PipelineProgress, ProgressSink, YieldSignal};
 
 /// The canonical default pipeline, compiled into the binary. Used by
 /// `analyze_default` and as the GUI's starting pipeline.

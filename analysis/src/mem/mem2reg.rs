@@ -1,17 +1,13 @@
 use jstd::graph::analysis::compute_dominators;
 use qcode::space::SpaceType;
+#[cfg(test)]
+use qcode::value::block::BlockRef;
 use qcode::value::{
     BasicBlock, BlockId, BlockParam, BlockParamId, Function, FunctionId, Instruction, Value,
     ValueId, ValueRef, Varnode, VarnodeId,
     insn::{Branch, CBranch, InstructionId, InstructionRef, Load, Mnemonic, Range, Store, Zext},
 };
-use qcode::{
-    builder::Builder,
-    context::Context,
-    value::FunctionRef,
-};
-#[cfg(test)]
-use qcode::value::block::BlockRef;
+use qcode::{builder::Builder, context::Context, value::FunctionRef};
 use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
 use std::borrow::Cow;
 
@@ -915,8 +911,12 @@ impl Mem2Reg<'_, '_> {
             // already match the param width. Resize before the branch, mirroring
             // the load-forwarding path. A no-op when widths match.
             let param_size = BlockParam::from_id(self.ctx, param_id).size();
-            let val =
-                self.resize_forwarded_load_value(edge.source_block, edge.branch_insn, val, param_size);
+            let val = self.resize_forwarded_load_value(
+                edge.source_block,
+                edge.branch_insn,
+                val,
+                param_size,
+            );
             if let Some(slot) = slots.get_mut(index) {
                 *slot = Some(val);
             }

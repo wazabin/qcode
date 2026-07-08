@@ -449,7 +449,9 @@ mod tests {
             func.add_block(tail);
         }
         let g = Function::make_at_addr(&mut ctx, 0x2000, Some(Cow::Borrowed("g"))).id;
-        Function::from_id_mut(&mut ctx, g).set_root(g_entry).unwrap();
+        Function::from_id_mut(&mut ctx, g)
+            .set_root(g_entry)
+            .unwrap();
 
         assert!(split_overlapping_functions(&mut ctx));
 
