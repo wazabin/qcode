@@ -15,11 +15,16 @@ use crate::{
     },
 };
 
+/// Function-local block index (indexes the owning [`Function`]'s block arena).
 #[derive(Identifier)]
-pub struct BlockId(usize);
+pub struct LocalBlockId(u32);
 
+/// Function-local CFG-edge index (indexes the owning [`Function`]'s edge arena).
 #[derive(Identifier)]
-pub struct EdgeId(usize);
+pub struct LocalEdgeId(u32);
+
+crate::composite_id!(BlockId, LocalBlockId);
+crate::composite_id!(EdgeId, LocalEdgeId);
 
 #[derive(Debug, Default, Clone, serde::Serialize, serde::Deserialize)]
 pub struct EdgeData {
@@ -32,7 +37,7 @@ where
     Self: WithCtx<'s, 'ctx, 'str>,
 {
     fn inner(&'s self) -> &'ctx EdgeData {
-        &self.ctx().values.edges[self.id]
+        self.ctx().values.edge(self.id)
     }
 
     pub fn from(&'s self) -> BlockRef<'str, 'ctx> {
@@ -82,7 +87,7 @@ pub type EdgeMutRef<'str, 'ctx> = BaseRef<&'ctx mut Context<'str>, EdgeId>;
 
 impl<'str, 'ctx> EdgeMutRef<'str, 'ctx> {
     pub fn inner_mut(&mut self) -> &mut EdgeData {
-        &mut self.ctx.values.edges[self.id]
+        self.ctx.values.edge_mut(self.id)
     }
 }
 
@@ -136,11 +141,11 @@ impl<'str, 'ctx> Node<'ctx> for BlockRef<'str, 'ctx> {
     }
 
     fn edge_ids(&self) -> &'ctx HashSet<EdgeId, FxBuildHasher> {
-        &self.ctx.values.basic_blocks[self.id].edges
+        &self.ctx.values.block(self.id).edges
     }
 
     fn edge_count(&self) -> usize {
-        self.ctx.values.basic_blocks[self.id].edges.len()
+        self.ctx.values.block(self.id).edges.len()
     }
 }
 
@@ -160,18 +165,18 @@ impl<'str, 'ctx> NodeMut<'ctx> for BlockMutRef<'str, 'ctx> {
     }
 
     fn edge_ids(&self) -> &HashSet<EdgeId, FxBuildHasher> {
-        &self.ctx.values.basic_blocks[self.id].edges
+        &self.ctx.values.block(self.id).edges
     }
 
     fn edge_count(&self) -> usize {
-        self.ctx.values.basic_blocks[self.id].edges.len()
+        self.ctx.values.block(self.id).edges.len()
     }
 
     fn add_edge_id(&mut self, edge: EdgeId) {
-        self.ctx.values.basic_blocks[self.id].edges.insert(edge);
+        self.ctx.values.block_mut(self.id).edges.insert(edge);
     }
 
     fn remove_edge_id(&mut self, edge: EdgeId) {
-        self.ctx.values.basic_blocks[self.id].edges.remove(&edge);
+        self.ctx.values.block_mut(self.id).edges.remove(&edge);
     }
 }

@@ -1015,7 +1015,7 @@ fn apply_partial(ctx: &mut Context, fid: FunctionId, promoted: &[Promoted]) -> b
     let mut seeds: Vec<(ValueId, usize, u64, ValueId)> = Vec::new();
     for ns in &new_snaps {
         let val_pid = BasicBlock::from_id_mut(ctx, root).push_param(ns.size).id;
-        ctx.values.block_params[val_pid].name = Some(Cow::Owned(ns.name.clone()));
+        ctx.values.block_param_mut(val_pid).name = Some(Cow::Owned(ns.name.clone()));
         // An offset-0 snapshot *is* `*base` — record the base slot as its `origin`,
         // so when `base` is a global slot and this snapshot is used as a buffer
         // pointer, alias analysis can treat it as a pointer loaded from that slot
@@ -1023,7 +1023,7 @@ fn apply_partial(ctx: &mut Context, fid: FunctionId, promoted: &[Promoted]) -> b
         // the in-loop reload forward to this param so a later round region-promotes
         // the buffer. Only the offset-0 snapshot equals `*base` exactly.
         if ns.offset == 0 {
-            ctx.values.block_params[val_pid].origin = Some(ns.base);
+            ctx.values.block_param_mut(val_pid).origin = Some(ns.base);
         }
         seeds.push((
             ns.base,

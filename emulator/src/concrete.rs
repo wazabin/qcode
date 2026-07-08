@@ -2615,7 +2615,7 @@ mod tests {
             b.push_param(8).id()
         };
         if let ValueId::BlockParam(pid) = src {
-            ctx.values.block_params[pid].type_id = list_ty;
+            ctx.values.block_param(pid).type_id = list_ty;
         }
         // Build `enumerate` over the unbounded list with an explicit result type:
         // its `result_type` declines an unbounded operand (no static length), so
@@ -2683,7 +2683,7 @@ mod tests {
             fm.add_block(entry);
         }
         let arr_pid = BasicBlock::from_id_mut(&mut ctx, entry).push_param(n).id;
-        ctx.values.block_params[arr_pid].type_id = arr_ty;
+        ctx.values.block_param(arr_pid).type_id = arr_ty;
 
         let at_id = IntrinsicId::from_name("at").unwrap();
         let (ret, ptr, lane);

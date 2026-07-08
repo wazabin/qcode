@@ -644,13 +644,7 @@ async fn run_analysis_fixpoint<'s>(
         // Registry fragmentation probe: how much of the instruction arena is
         // tombstones by the end of a round. Guides whether a compaction pass
         // between rounds would pay off.
-        let total_insns = ctx.values.instructions.len();
-        let dead_insns = ctx
-            .values
-            .instructions
-            .iter()
-            .filter(|i| i.is_deleted())
-            .count();
+        let (total_insns, dead_insns) = ctx.instruction_arena_stats();
         log::info!(
             target: "pipeline",
             "round {round}: instruction arena {total_insns} slots, {} live, {dead_insns} tombstones ({:.1}% dead)",

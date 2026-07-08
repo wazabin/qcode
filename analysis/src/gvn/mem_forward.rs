@@ -313,7 +313,7 @@ impl MemForward {
                 None => piece,
                 Some(lhs) => {
                     let or = InstructionRef::from_mnemonic(
-                        ctx,
+                        ctx, block_id.func,
                         Mnemonic::Binop(Binary {
                             op: Binop::Int(IntBinop::Or),
                             lhs,
@@ -383,7 +383,7 @@ impl MemForward {
             seg.src
         } else {
             let r = InstructionRef::from_mnemonic(
-                ctx,
+                ctx, block_id.func,
                 Mnemonic::Range(Range {
                     src: seg.src,
                     start: seg.src_off,
@@ -400,7 +400,7 @@ impl MemForward {
             extracted
         } else {
             let z = InstructionRef::from_mnemonic(
-                ctx,
+                ctx, block_id.func,
                 Mnemonic::Zext(Zext {
                     src: extracted,
                     size: load_size,
@@ -417,7 +417,7 @@ impl MemForward {
         }
         let shamt = ctx.get_const((seg.load_off * 8) as u64, load_size).id();
         let s = InstructionRef::from_mnemonic(
-            ctx,
+            ctx, block_id.func,
             Mnemonic::Binop(Binary {
                 op: Binop::Int(IntBinop::ShiftLeft),
                 lhs: widened,
@@ -928,7 +928,7 @@ mod tests {
             f.add_block(root);
         }
         let pid = BasicBlock::from_id_mut(&mut tc.ctx, root).push_param(8).id;
-        tc.ctx.values.block_params[pid].origin = Some(ValueId::Varnode(sp_reg));
+        tc.ctx.values.block_param_mut(pid).origin = Some(ValueId::Varnode(sp_reg));
         let sp = ValueId::BlockParam(pid);
         let ram = tc.ctx.default_space;
 

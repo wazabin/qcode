@@ -134,7 +134,7 @@ pub fn project_return(ctx: &Context, fid: FunctionId, field: usize) -> Option<Pr
                 }
                 ValueId::BlockParam(pid) => {
                     proj.block_params.insert(pid);
-                    let param = &ctx.values.block_params[pid];
+                    let param = &ctx.values.block_param(pid);
                     let Some(parent) = param.parent else {
                         proj.opaque = true;
                         continue;
@@ -303,7 +303,7 @@ mod tests {
         let ValueId::BlockParam(pid) = v else {
             panic!("expected a block param");
         };
-        ctx.values.block_params[pid].index
+        ctx.values.block_param(pid).index
     }
 
     /// `foo(a, b) = (a, b*69 + 42)` — a straight-line pure function. Field 0 is

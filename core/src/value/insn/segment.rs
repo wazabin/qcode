@@ -214,9 +214,9 @@ impl<'a, 'str> Seg<'a, 'str> {
 
 /// The bare atom for an instruction result: `%name` or `%tmp<id>`.
 fn instruction_atom(ctx: &Context<'_>, id: crate::value::InstructionId) -> String {
-    match ctx.values.instructions[id].name.as_deref() {
+    match ctx.values.instruction(id).name.as_deref() {
         Some(name) => format!("%{name}"),
-        None => format!("%tmp{:x}", usize::from(id)),
+        None => format!("%tmp{:x}", usize::from(id.local)),
     }
 }
 
@@ -225,7 +225,7 @@ fn block_param_atom(ctx: &Context<'_>, id: crate::value::BlockParamId) -> String
     let r = BlockParam::from_id(ctx, id);
     match r.name() {
         Some(name) => format!("@{name}"),
-        None => format!("@param{:x}", usize::from(id)),
+        None => format!("@param{:x}", usize::from(id.local)),
     }
 }
 

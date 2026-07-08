@@ -347,7 +347,7 @@ fn clone_expr(
         let ty = ctx
             .stored_type_of(ValueId::Instruction(iid))
             .unwrap_or_else(|| ctx.type_of(ValueId::Instruction(iid)));
-        let new_id = InstructionRef::from_mnemonic_with_type(ctx, m, ty).id;
+        let new_id = InstructionRef::from_mnemonic_with_type(ctx, block.func, m, ty).id;
         BasicBlock::from_id_mut(ctx, block).insert_insn_before(extract_id, new_id);
         map.insert(iid, ValueId::Instruction(new_id));
     }
@@ -570,7 +570,7 @@ mod tests {
             .unwrap()
             .id();
         if let ValueId::BlockParam(pid) = r0 {
-            tc.ctx.values.block_params[pid].type_id = arr_ty;
+            tc.ctx.values.block_param_mut(pid).type_id = arr_ty;
         }
 
         // Build `%m = foobar <$> @r0; %agg = (%m,)` at the head of f_entry;

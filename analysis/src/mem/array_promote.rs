@@ -471,7 +471,7 @@ fn region_base(b: &mut Builder, base_root: ValueId, origin_word: i64, esz: usize
 /// (or append when the block is empty).
 fn insert_at_top(ctx: &mut Context, block: BlockId, mnemonic: Mnemonic, ty: TypeId) -> ValueId {
     let first = BasicBlock::from_id(ctx, block).iter().next().map(|i| i.id);
-    let id = InstructionRef::from_mnemonic_with_type(ctx, mnemonic, ty).id;
+    let id = InstructionRef::from_mnemonic_with_type(ctx, block.func, mnemonic, ty).id;
     match first {
         Some(f) => BasicBlock::from_id_mut(ctx, block).insert_insn_before(f, id),
         None => {
@@ -494,7 +494,7 @@ fn apply(ctx: &mut Context, m: &PromoteMatch) -> bool {
     // rotated shape the header *is* the body, so they share one param.
     let new_param = |ctx: &mut Context, bid: BlockId| {
         let pid = BasicBlock::from_id_mut(ctx, bid).push_param(arr_sz).id;
-        ctx.values.block_params[pid].type_id = arr_ty;
+        ctx.values.block_param_mut(pid).type_id = arr_ty;
         ValueId::BlockParam(pid)
     };
     let arr_h = new_param(ctx, m.header);
@@ -519,7 +519,7 @@ fn apply(ctx: &mut Context, m: &PromoteMatch) -> bool {
             region_base(&mut b, m.base_root, m.origin_word, esz)
         };
         let ld = InstructionRef::from_mnemonic_with_type(
-            ctx,
+            ctx, m.preheader.func,
             Mnemonic::Load(Load {
                 space: m.region_space,
                 ptr: dst,

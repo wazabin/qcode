@@ -117,7 +117,17 @@ impl<'str, 'ctx> Builder<'str, 'ctx> {
     /// creating the block if it does not already exist.
     /// This will emit instructions ate the given address
     pub fn from_context<'m>(ctx: &'m mut Context<'str>, address: u64) -> Builder<'str, 'm> {
-        let block_id = ctx.get_or_make_block(address);
+        // A block must be born into a function's arena. If nothing is mapped at
+        // `address` yet, host the new block in a fresh anonymous function.
+        let block_id = match BasicBlock::from_addr(ctx, address) {
+            Some(block) => block.id,
+            None => {
+                let func = Function::make(ctx, Cow::Owned(format!("blk_{address:x}")))
+                    .expect("anon host function")
+                    .id;
+                ctx.get_or_make_block(address, func)
+            }
+        };
         let mut builder = Builder::from_block(BasicBlock::from_id_mut(ctx, block_id));
         builder.set_address(address);
         builder
@@ -352,7 +362,9 @@ impl<'str, 'ctx> Builder<'str, 'ctx> {
             panic!("cannot append instruction to a terminated block");
         }
 
-        let id = InstructionRef::from_mnemonic_with_type(self.context_mut(), mnemonic, type_id).id;
+        let func = self.block.id.func;
+        let id =
+            InstructionRef::from_mnemonic_with_type(self.context_mut(), func, mnemonic, type_id).id;
 
         if let Some(address) = self.address {
             Instruction::from_id_mut(self.context_mut(), id).set_address(address);
@@ -413,7 +425,8 @@ impl<'str, 'ctx> Builder<'str, 'ctx> {
 
     /// Gets or creates a block for a given address
     pub fn get_or_make_block(&mut self, addr: u64) -> BlockId {
-        let id = self.context_mut().get_or_make_block(addr);
+        let func = self.block.id.func;
+        let id = self.context_mut().get_or_make_block(addr, func);
 
         if BasicBlock::from_id(self.context(), id).parent().is_none() {
             self.ensure_created_block_in_function(id);
@@ -433,7 +446,8 @@ impl<'str, 'ctx> Builder<'str, 'ctx> {
             // collide. The `local_labels` map stays keyed by the original name
             // so within-instruction references still resolve to this block.
             let unique_name = self.context_mut().get_unique_name(name.clone());
-            let id = BasicBlock::make(self.context_mut())
+            let func = self.block.id.func;
+            let id = BasicBlock::make(self.context_mut(), func)
                 .with_name(unique_name)
                 .expect("name was deduplicated")
                 .id;
@@ -1561,7 +1575,7 @@ mod tests {
         let hentry = Function::from_id_mut(&mut ctx, host).make_root().id;
         let list_ty = ctx.types.get_or_make_list(i8, 4);
         let src_pid = BasicBlock::from_id_mut(&mut ctx, hentry).push_param(4).id;
-        ctx.values.block_params[src_pid].type_id = list_ty;
+        ctx.values.block_param(src_pid).type_id = list_ty;
         let src = ValueId::BlockParam(src_pid);
 
         let map_ty = {

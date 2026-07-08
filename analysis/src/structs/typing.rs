@@ -172,7 +172,7 @@ fn function_has_struct_types(ctx: &Context, fun_id: FunctionId) -> bool {
 /// Attempts one typing step on instruction `id`. Returns `true` if it changed
 /// the IR (rewrote an add to a gep, or retyped a load result).
 fn type_instruction(ctx: &mut Context, id: InstructionId) -> bool {
-    match ctx.values.instructions[id].mnemonic().clone() {
+    match ctx.values.instruction(id).mnemonic().clone() {
         Mnemonic::Binop(Binary {
             op: Binop::Int(IntBinop::Add),
             lhs,

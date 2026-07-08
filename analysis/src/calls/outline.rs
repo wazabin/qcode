@@ -109,7 +109,7 @@ pub(crate) fn outline_expression(
             let ty = ctx.type_of(inp);
             let size = ctx.types.size_of(ty);
             let pid = BasicBlock::from_id_mut(ctx, root).push_param(size).id;
-            ctx.values.block_params[pid].type_id = ty;
+            ctx.values.block_param_mut(pid).type_id = ty;
             value_map.insert(inp, ValueId::BlockParam(pid));
         }
         value_map
@@ -143,7 +143,7 @@ pub(crate) fn outline_tupled(
         let mut value_map: HashMap<ValueId, ValueId> = HashMap::default();
         let tsz = ctx.types.size_of(tuple_ty);
         let pid = BasicBlock::from_id_mut(ctx, root).push_param(tsz).id;
-        ctx.values.block_params[pid].type_id = tuple_ty;
+        ctx.values.block_param_mut(pid).type_id = tuple_ty;
         let tuple = ValueId::BlockParam(pid);
         // index = t.0, elem = t.1 — the extracts the body unpacks. `elem` is only
         // extracted when the body actually consumes the lane element.
@@ -155,7 +155,7 @@ pub(crate) fn outline_tupled(
                 .field_type(tuple_ty, field)
                 .expect("enumerate tuple field");
             let ex = InstructionRef::from_mnemonic_with_type(
-                ctx,
+                ctx, root.func,
                 Mnemonic::Extract(Extract {
                     agg: tuple,
                     index: field,
@@ -228,7 +228,7 @@ pub(crate) fn outline_scan_body(
         // Param 0: the accumulator.
         let acc_sz = ctx.types.size_of(acc_ty);
         let apid = BasicBlock::from_id_mut(ctx, root).push_param(acc_sz).id;
-        ctx.values.block_params[apid].type_id = acc_ty;
+        ctx.values.block_param_mut(apid).type_id = acc_ty;
         value_map.insert(acc_input, ValueId::BlockParam(apid));
         // Param 1: the per-lane input. The body's loop index is
         // `(index_ty)(raw) + index_start` — the `i64` driver value narrowed to the
@@ -242,7 +242,7 @@ pub(crate) fn outline_scan_body(
         };
         let psz = ctx.types.size_of(param_ty);
         let pid = BasicBlock::from_id_mut(ctx, root).push_param(psz).id;
-        ctx.values.block_params[pid].type_id = param_ty;
+        ctx.values.block_param_mut(pid).type_id = param_ty;
         let param = ValueId::BlockParam(pid);
         // Data mode: the param *is* the element; bind it and skip index derivation.
         if let ScanElem::Data(_) = elem {
@@ -261,7 +261,7 @@ pub(crate) fn outline_scan_body(
         let isz = ctx.types.size_of(index_ty);
         if isz < ctx.types.size_of(fty) {
             let r = InstructionRef::from_mnemonic_with_type(
-                ctx,
+                ctx, root.func,
                 Mnemonic::Range(Range {
                     src: idx,
                     start: 0,
@@ -282,7 +282,7 @@ pub(crate) fn outline_scan_body(
             };
             let c = ctx.get_const((index_start as u64) & mask, isz).id();
             let add = InstructionRef::from_mnemonic_with_type(
-                ctx,
+                ctx, root.func,
                 Mnemonic::Binop(Binary {
                     lhs: idx,
                     rhs: c,
@@ -335,7 +335,7 @@ fn outline_core(
                 m.replace_value(a, n);
             }
         }
-        let new_id = InstructionRef::from_mnemonic_with_type(ctx, m, ty).id;
+        let new_id = InstructionRef::from_mnemonic_with_type(ctx, root.func, m, ty).id;
         BasicBlock::from_id_mut(ctx, root).push_insn(new_id);
         value_map.insert(ValueId::Instruction(iid), ValueId::Instruction(new_id));
     }
@@ -345,7 +345,7 @@ fn outline_core(
     let dummy_ptr = ctx.get_const(0, 8).id();
     let ret_ty = ctx.types.get_or_make_int(1);
     let ret = InstructionRef::from_mnemonic_with_type(
-        ctx,
+        ctx, root.func,
         Mnemonic::Return(Return {
             ptr: dummy_ptr,
             value: Some(ret_val),
@@ -410,7 +410,7 @@ pub(crate) fn inline_pure_body(
                 nm.replace_value(a, n);
             }
         }
-        let new_id = InstructionRef::from_mnemonic_with_type(ctx, nm, ty).id;
+        let new_id = InstructionRef::from_mnemonic_with_type(ctx, block.func, nm, ty).id;
         BasicBlock::from_id_mut(ctx, block).insert_insn_before(at, new_id);
         value_map.insert(ValueId::Instruction(iid), ValueId::Instruction(new_id));
     }

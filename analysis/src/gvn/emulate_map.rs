@@ -397,7 +397,7 @@ mod tests {
             b.push_param(tsz).id()
         };
         if let ValueId::BlockParam(pid) = t {
-            tc.ctx.values.block_params[pid].type_id = tuple_ty;
+            tc.ctx.values.block_param_mut(pid).type_id = tuple_ty;
         }
         let (sum, ptr, ret) = {
             let mut b = Builder::from_block(BasicBlock::from_id_mut(&mut tc.ctx, entry));
@@ -565,7 +565,7 @@ mod tests {
             let acc = b.push_param(1).id(); // param 0: accumulator (i8)
             let t = b.push_param(tsz).id(); // param 1: enumerate tuple
             if let ValueId::BlockParam(pid) = t {
-                b.context_mut().values.block_params[pid].type_id = tuple_ty;
+                b.context_mut().values.block_param_mut(pid).type_id = tuple_ty;
             }
             let elem = b.push_extract(t, 1).id();
             let sum = b.push_add(acc, elem).id();

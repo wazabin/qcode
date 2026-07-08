@@ -88,7 +88,7 @@ pub(crate) fn param_parent(ctx: &Context, v: ValueId) -> Option<BlockId> {
     let ValueId::BlockParam(pid) = v else {
         return None;
     };
-    ctx.values.block_params[pid].parent
+    ctx.values.block_param(pid).parent
 }
 
 /// Values feeding block-param index `k` of `block` from every predecessor edge.

@@ -135,7 +135,7 @@ impl ArrayProject {
         }
         let element = {
             let r = InstructionRef::from_mnemonic(
-                ctx,
+                ctx, ic.block_id.func,
                 Mnemonic::Range(Range {
                     src: map.src,
                     start: (k as usize) * isz,
@@ -202,7 +202,7 @@ impl ArrayProject {
         // `elem = src[k]`, a one-element byte slice of the operand array.
         let element = {
             let r = InstructionRef::from_mnemonic(
-                ctx,
+                ctx, ic.block_id.func,
                 Mnemonic::Range(Range {
                     src,
                     start: (k as usize) * esz,
@@ -218,7 +218,7 @@ impl ArrayProject {
         // pack the `(index, elem)` tuple, typed as the enumerate element type.
         let tuple = {
             let t = InstructionRef::from_mnemonic_with_type(
-                ctx,
+                ctx, ic.block_id.func,
                 Mnemonic::Tuple(Tuple {
                     fields: vec![index, element],
                 }),
@@ -262,7 +262,7 @@ impl ArrayProject {
         };
 
         let r = InstructionRef::from_mnemonic(
-            ctx,
+            ctx, ic.block_id.func,
             Mnemonic::Range(Range {
                 src,
                 start: rel_start,
@@ -366,7 +366,7 @@ mod tests {
             b.push_param(4).id()
         };
         if let ValueId::BlockParam(pid) = src {
-            tc.ctx.values.block_params[pid].type_id = arr_ty;
+            tc.ctx.values.block_param_mut(pid).type_id = arr_ty;
         }
         let reg_space = tc.reg_space;
         let r0 = tc.r0;
@@ -448,7 +448,7 @@ mod tests {
             b.push_param(4).id()
         };
         if let ValueId::BlockParam(pid) = src {
-            tc.ctx.values.block_params[pid].type_id = arr_ty;
+            tc.ctx.values.block_param_mut(pid).type_id = arr_ty;
         }
 
         // enumerate(src): `[(index: i64, elem: i8); 4]`, tuple width 9.
@@ -533,10 +533,10 @@ mod tests {
             (builder.push_param(3).id(), builder.push_param(5).id())
         };
         if let ValueId::BlockParam(pid) = a {
-            tc.ctx.values.block_params[pid].type_id = a_ty;
+            tc.ctx.values.block_param_mut(pid).type_id = a_ty;
         }
         if let ValueId::BlockParam(pid) = b_src {
-            tc.ctx.values.block_params[pid].type_id = b_ty;
+            tc.ctx.values.block_param_mut(pid).type_id = b_ty;
         }
 
         let reg_space = tc.reg_space;
@@ -581,7 +581,7 @@ mod tests {
             b.push_param(tsz).id()
         };
         if let ValueId::BlockParam(pid) = t {
-            tc.ctx.values.block_params[pid].type_id = tuple_ty;
+            tc.ctx.values.block_param_mut(pid).type_id = tuple_ty;
         }
         let (elem, ptr, ret) = {
             let mut b = Builder::from_block(BasicBlock::from_id_mut(&mut tc.ctx, entry));
@@ -635,7 +635,7 @@ mod tests {
             b.push_param(4).id()
         };
         if let ValueId::BlockParam(pid) = src {
-            tc.ctx.values.block_params[pid].type_id = arr_ty;
+            tc.ctx.values.block_param_mut(pid).type_id = arr_ty;
         }
 
         // map(unpack, enumerate(src)). The body returns `i8`, so `push_map` types

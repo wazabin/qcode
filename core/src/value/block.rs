@@ -55,8 +55,18 @@ pub struct BasicBlock<'str> {
     /// Additional addresses that map to this block (accumulated from merged blocks).
     pub extra_addresses: Vec<u64>,
 
-    /// The function this block belongs to, if any.
+    /// The function this block belongs to, if any. Invariant for a live block:
+    /// `parent == Some(id.func)` — the arena that stores the block is its
+    /// owning function.
     pub parent: Option<FunctionId>,
+
+    /// Tombstone flag. Per-function block arenas are append-only and never
+    /// compacted, so a removed block stays in its arena; this marks it as
+    /// logically deleted. Deleted blocks are skipped by
+    /// [`FunctionRef::blocks`](crate::value::FunctionRef::blocks) and the
+    /// whole-context block iterators.
+    #[serde(default)]
+    pub deleted: bool,
 }
 
 impl<'str> BasicBlock<'str> {
@@ -104,9 +114,14 @@ impl<'str> BasicBlock<'str> {
             .map(|id| BasicBlock::from_id_mut(ctx, id))
     }
 
-    /// Create a new block
-    pub fn make<'ctx>(ctx: &'ctx mut Context<'str>) -> BlockMutRef<'str, 'ctx> {
-        let id = ctx.values.push_block(BasicBlock::default());
+    /// Create a new block, born into `func`'s block arena. Its `parent` is set
+    /// to `func` (ownership == arena membership).
+    pub fn make<'ctx>(ctx: &'ctx mut Context<'str>, func: FunctionId) -> BlockMutRef<'str, 'ctx> {
+        let block = BasicBlock {
+            parent: Some(func),
+            ..BasicBlock::default()
+        };
+        let id = ctx.values.push_block(func, block);
         BlockMutRef::new(ctx, id)
     }
 
@@ -117,12 +132,12 @@ impl<'str> BasicBlock<'str> {
         orig: BlockId,
         value_map: &mut HashMap<ValueId, ValueId>,
     ) -> BlockId {
-        // Create a fresh block
-        let new_block_id = BasicBlock::make(ctx).id;
+        // Create a fresh block in the same function as `orig`.
+        let new_block_id = BasicBlock::make(ctx, orig.func).id;
 
         let name = Cow::Owned(format!(
             "clone_{:x}",
-            ctx.values.basic_blocks[orig].address.unwrap_or(0)
+            ctx.values.block(orig).address.unwrap_or(0)
         ));
         let unique_name = ctx.get_unique_name(name);
         BasicBlock::from_id_mut(ctx, new_block_id)
@@ -130,12 +145,15 @@ impl<'str> BasicBlock<'str> {
             .expect("name was deduplicated");
 
         // Clone parameters
-        for old_param_id in &ctx.values.basic_blocks[orig].params.clone() {
-            let old_param = ctx.values.block_params[*old_param_id].clone();
-            let new_param_id = ctx.values.block_params.push(BlockParam {
-                parent: Some(new_block_id),
-                ..old_param
-            });
+        for old_param_id in &ctx.values.block(orig).params.clone() {
+            let old_param = ctx.values.block_param(*old_param_id).clone();
+            let new_param_id = ctx.values.push_block_param(
+                new_block_id.func,
+                BlockParam {
+                    parent: Some(new_block_id),
+                    ..old_param
+                },
+            );
 
             BasicBlock::from_id_mut(ctx, new_block_id).push_existing_param(new_param_id);
             value_map.insert(
@@ -145,7 +163,7 @@ impl<'str> BasicBlock<'str> {
         }
 
         // Clone instructions
-        let orig_insns = ctx.values.basic_blocks[orig].instructions.clone();
+        let orig_insns = ctx.values.block(orig).instructions.clone();
         for &old_insn_id in orig_insns.iter() {
             // Extract information from the old instruciton
             let insn_ref = Instruction::from_id(ctx, old_insn_id);
@@ -165,8 +183,14 @@ impl<'str> BasicBlock<'str> {
                 }
             }
 
-            let new_insn_id =
-                InstructionRef::from_mnemonic_with_space(ctx, new_mnemonic, size, space).id;
+            let new_insn_id = InstructionRef::from_mnemonic_with_space(
+                ctx,
+                new_block_id.func,
+                new_mnemonic,
+                size,
+                space,
+            )
+            .id;
 
             BasicBlock::from_id_mut(ctx, new_block_id).push_insn(new_insn_id);
 
@@ -186,7 +210,7 @@ where
     Self: WithCtx<'s, 'ctx, 'str>,
 {
     fn inner(&'s self) -> &'ctx BasicBlock<'str> {
-        &self.ctx().values.basic_blocks[self.id]
+        self.ctx().values.block(self.id)
     }
 
     /// Iterates over outgoing `(edge_id, successor_block_id)` pairs.
@@ -335,7 +359,7 @@ impl<'s, 'ctx: 's, 'str: 'ctx> WithCtx<'s, 'ctx, 'str> for BlockRef<'str, 'ctx> 
 
 impl Named for BlockRef<'_, '_> {
     fn name(&self) -> Option<&str> {
-        self.ctx.values.basic_blocks[self.id].name.as_deref()
+        self.ctx.values.block(self.id).name.as_deref()
     }
 }
 
@@ -395,19 +419,22 @@ impl<'s, 'ctx: 's, 'str: 'ctx> WithCtxMut<'s, 'str> for BlockMutRef<'str, 'ctx> 
 
 impl Named for BlockMutRef<'_, '_> {
     fn name(&self) -> Option<&str> {
-        self.ctx.values.basic_blocks[self.id].name.as_deref()
+        self.ctx.values.block(self.id).name.as_deref()
     }
 }
 
 impl<'str, 'ctx> Renameable<'str, 'ctx> for BlockMutRef<'str, 'ctx> {
     fn rename(&mut self, name: Cow<'str, str>) -> Result<()> {
         let id = self.id.into();
-        let old_name = self.ctx.values.basic_blocks[self.id]
+        let old_name = self
+            .ctx
+            .values
+            .block(self.id)
             .name
             .as_deref()
             .map(str::to_owned);
         update_context_name(id, self.ctx, name.clone(), old_name.as_deref())?;
-        self.ctx.values.basic_blocks[self.id].name = Some(name);
+        self.ctx.values.block_mut(self.id).name = Some(name);
         Ok(())
     }
 }
@@ -454,11 +481,13 @@ impl<'str, 'ctx> BlockMutRef<'str, 'ctx> {
     }
 
     pub(in crate::value) fn inner_mut(&mut self) -> &mut BasicBlock<'str> {
-        &mut self.ctx.values.basic_blocks[self.id]
+        self.ctx.values.block_mut(self.id)
     }
 
     pub fn parent_mut(&mut self) -> Option<FunctionMutRef<'str, '_>> {
-        self.ctx.values.basic_blocks[self.id]
+        self.ctx
+            .values
+            .block(self.id)
             .parent
             .map(|fid| Function::from_id_mut(self.ctx, fid))
     }
@@ -480,14 +509,17 @@ impl<'str, 'ctx> BlockMutRef<'str, 'ctx> {
         let block_id = self.id;
         let index = self.inner().params.len();
         let type_id = self.ctx.types.get_or_make_int(size);
-        let id = self.ctx.values.block_params.push(BlockParam {
-            index,
-            type_id,
-            parent: Some(block_id),
-            name: None,
-            origin: None,
-            protected: false,
-        });
+        let id = self.ctx.values.push_block_param(
+            block_id.func,
+            BlockParam {
+                index,
+                type_id,
+                parent: Some(block_id),
+                name: None,
+                origin: None,
+                protected: false,
+            },
+        );
         self.inner_mut().params.push(id);
         BlockParamMutRef::from_id(self.ctx, id)
     }
@@ -594,8 +626,6 @@ impl<'str, 'ctx> BlockMutRef<'str, 'ctx> {
     /// body whose stale exit edge would otherwise inflate the exit block's
     /// predecessor count and block `simplify_cfg` from merging it).
     pub fn delete(&mut self, function_id: FunctionId) {
-        let id = self.id;
-
         // Snapshot first: `remove_cfg_edge` mutates this block's edge set. A
         // self-loop appears once in the set and unlinks cleanly (both endpoints
         // are this block, so the second remove is a no-op).
@@ -625,15 +655,17 @@ impl<'str, 'ctx> BlockMutRef<'str, 'ctx> {
         let params: Vec<BlockParamId> = self.inner().params.clone();
         for param in params {
             self.ctx.values.users.remove(&ValueId::BlockParam(param));
-            self.ctx.values.block_params[param].parent = None;
+            self.ctx.values.block_param_mut(param).parent = None;
         }
 
-        Function::from_id_mut(self.ctx, function_id)
-            .inner_mut()
-            .blocks
-            .retain(|&b| b != id);
-
-        self.inner_mut().parent = None;
+        // Tombstone the block: drop it from its owner's roster (append-only
+        // arena slot is never reclaimed).
+        let _ = function_id;
+        let id = self.id;
+        self.ctx.values.unroster_block(id);
+        let block = self.inner_mut();
+        block.parent = None;
+        block.deleted = true;
     }
 
     /// Absorbs `other` into this block: removes the terminal branch, appends
@@ -646,14 +678,14 @@ impl<'str, 'ctx> BlockMutRef<'str, 'ctx> {
             .inner()
             .instructions
             .last()
-            .and_then(|&id| match self.ctx.values.instructions[id].mnemonic() {
+            .and_then(|&id| match self.ctx.values.instruction(id).mnemonic() {
                 crate::value::insn::Mnemonic::Branch(branch) if branch.target == other => {
                     Some(branch.args.clone())
                 }
                 _ => None,
             })
             .unwrap_or_default();
-        let other_params = self.ctx.values.basic_blocks[other].params.clone();
+        let other_params = self.ctx.values.block(other).params.clone();
         if !other_params.is_empty() {
             assert_eq!(
                 other_params.len(),
@@ -676,26 +708,27 @@ impl<'str, 'ctx> BlockMutRef<'str, 'ctx> {
         // blocks at once, so a later `remove_instruction` (which unlinks via the
         // instruction's `parent`) clears it from one block while it lingers in
         // the other — corrupting block membership.
-        let b_insns = std::mem::take(&mut self.ctx.values.basic_blocks[other].instructions);
+        let b_insns = std::mem::take(&mut self.ctx.values.block_mut(other).instructions);
         let self_id = self.id;
         for &insn_id in &b_insns {
-            self.ctx.values.instructions[insn_id].parent = Some(self_id);
+            self.ctx.values.instruction_mut(insn_id).parent = Some(self_id);
         }
         self.inner_mut().instructions.extend(b_insns);
 
         // Rehome other's edges to this block at the graph level.
         self.ctx.merge_nodes(self.id, other, edge_ab);
 
-        // Remove other from function and clear its parent.
-        Function::from_id_mut(self.ctx, function_id)
-            .inner_mut()
-            .blocks
-            .retain(|&id| id != other);
-        self.ctx.values.basic_blocks[other].parent = None;
-
-        // Transfer other's addresses.
-        let b_addr = self.ctx.values.basic_blocks[other].address;
-        let b_extra = self.ctx.values.basic_blocks[other].extra_addresses.clone();
+        // Tombstone `other`: with per-function block arenas, removal from the
+        // function is a `deleted` flag (the arena slot is never reclaimed).
+        let _ = function_id;
+        let b_addr = self.ctx.values.block(other).address;
+        let b_extra = self.ctx.values.block(other).extra_addresses.clone();
+        self.ctx.values.unroster_block(other);
+        {
+            let other_block = self.ctx.values.block_mut(other);
+            other_block.parent = None;
+            other_block.deleted = true;
+        }
         if let Some(addr) = b_addr {
             self.inner_mut().extra_addresses.push(addr);
         }

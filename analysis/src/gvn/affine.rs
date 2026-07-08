@@ -375,7 +375,7 @@ fn emit(
     mnemonic: Mnemonic,
     ty: qcode::types::TypeId,
 ) -> ValueId {
-    let new = InstructionRef::from_mnemonic_with_type(ctx, mnemonic, ty).id;
+    let new = InstructionRef::from_mnemonic_with_type(ctx, block.func, mnemonic, ty).id;
     BasicBlock::from_id_mut(ctx, block).insert_insn_before(at, new);
     ValueId::Instruction(new)
 }
@@ -941,7 +941,7 @@ mod spike {
         );
         let ptr_ty = tc.ctx.types.get_or_make_struct_pointer(8, s_ty);
         let pid = BasicBlock::from_id_mut(&mut tc.ctx, entry).push_param(8).id;
-        tc.ctx.values.block_params[pid].type_id = ptr_ty;
+        tc.ctx.values.block_param_mut(pid).type_id = ptr_ty;
         let p = ValueId::BlockParam(pid);
 
         let (gep, add) = {

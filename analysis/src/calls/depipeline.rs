@@ -103,7 +103,7 @@ fn affine_step(ctx: &Context, v: ValueId, iv: ValueId) -> Option<u64> {
 
 /// The argument bound to position `k` of `header` by `pred`'s terminator.
 fn incoming_from(ctx: &Context, pred: BlockId, header: BlockId, k: usize) -> Option<ValueId> {
-    let &term = ctx.values.basic_blocks[pred].instructions.last()?;
+    let &term = ctx.values.block(pred).instructions.last()?;
     match ctx.get_insn(term).mnemonic() {
         Mnemonic::Branch(b) if b.target == header => b.args.get(k).copied(),
         Mnemonic::CBranch(c) => {
@@ -172,7 +172,7 @@ fn find_pipelined(
             let ValueId::BlockParam(iv_pid) = ptr else {
                 continue;
             };
-            if ctx.values.block_params[iv_pid].parent != Some(header) {
+            if ctx.values.block_param(iv_pid).parent != Some(header) {
                 continue;
             }
             let Some(j) = params.iter().position(|&p| p == iv_pid) else {
@@ -238,7 +238,7 @@ fn find_pipelined(
 /// forward the carry's uses to it, drop the param, and record the disjointness
 /// assumption that justifies the re-read.
 fn apply(ctx: &mut Context, fid: FunctionId, p: &Pipelined) {
-    let first = *ctx.values.basic_blocks[p.header]
+    let first = *ctx.values.block(p.header)
         .instructions
         .first()
         .unwrap();
@@ -248,7 +248,7 @@ fn apply(ctx: &mut Context, fid: FunctionId, p: &Pipelined) {
     let width = ctx.types.size_of(iv_ty);
     let step_lit = ctx.get_const(p.step, width).id();
     let sub = InstructionRef::from_mnemonic_with_type(
-        ctx,
+        ctx, p.header.func,
         Mnemonic::Binop(Binary {
             op: Binop::Int(IntBinop::Sub),
             lhs: p.iv,
@@ -262,7 +262,7 @@ fn apply(ctx: &mut Context, fid: FunctionId, p: &Pipelined) {
     // load(space, iv − step, size) — the previous iteration's byte, re-derived.
     let load_ty = ctx.types.get_or_make_int(p.size);
     let prev = InstructionRef::from_mnemonic_with_type(
-        ctx,
+        ctx, p.header.func,
         Mnemonic::Load(Load {
             space: p.space,
             ptr: ValueId::Instruction(sub),

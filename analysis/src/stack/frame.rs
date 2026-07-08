@@ -147,7 +147,7 @@ mod tests {
             f.add_block(root);
         }
         let pid = BasicBlock::from_id_mut(&mut tc.ctx, root).push_param(8).id;
-        tc.ctx.values.block_params[pid].origin = Some(ValueId::Varnode(sp_reg));
+        tc.ctx.values.block_param_mut(pid).origin = Some(ValueId::Varnode(sp_reg));
         (fid, ValueId::BlockParam(pid), sp_reg)
     }
 

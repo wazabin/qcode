@@ -112,9 +112,9 @@ mod tests {
 
         let blk = ctx.get_or_make_block(0x1000);
         let ap = BasicBlock::from_id_mut(&mut ctx, blk).push_param(6).id;
-        ctx.values.block_params[ap].type_id = arr;
+        ctx.values.block_param(ap).type_id = arr;
         let lp = BasicBlock::from_id_mut(&mut ctx, blk).push_param(6).id;
-        ctx.values.block_params[lp].type_id = list;
+        ctx.values.block_param(lp).type_id = list;
 
         let id = IntrinsicId::from_name("len").unwrap();
 

@@ -336,7 +336,7 @@ mod tests {
         // only), so set its stored type directly, matching how argpromote does.
         let sp_pid = BasicBlock::from_id_mut(&mut tc.ctx, entry).push_param(4).id;
         let arr_pid = BasicBlock::from_id_mut(&mut tc.ctx, entry).push_param(4).id;
-        tc.ctx.values.block_params[arr_pid].type_id = arr_ty;
+        tc.ctx.values.block_param_mut(arr_pid).type_id = arr_ty;
 
         let at_id = qcode::value::insn::IntrinsicId::from_name("at").expect("at registered");
         let (ret, ptr, tuple);

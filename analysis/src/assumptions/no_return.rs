@@ -63,21 +63,17 @@ pub fn assume_call_returns(ctx: &mut Context) -> usize {
     let mut count = 0;
 
     for func_id in func_ids {
-        let block_ids: Vec<BlockId> = ctx.values.functions[func_id]
-            .blocks
-            .iter()
-            .copied()
-            .collect();
+        let block_ids: Vec<BlockId> = qcode::value::Function::from_id(ctx, func_id).block_ids();
 
         // (call_block, callee) to act on after the read-only scan releases its
         // borrow of `ctx`.
         let mut calls: Vec<(BlockId, FunctionId)> = Vec::new();
 
         for &call_block in &block_ids {
-            let Some(&call_site) = ctx.values.basic_blocks[call_block].instructions.last() else {
+            let Some(&call_site) = ctx.values.block(call_block).instructions.last() else {
                 continue;
             };
-            let callee = match ctx.values.instructions[call_site].mnemonic() {
+            let callee = match ctx.values.instruction(call_site).mnemonic() {
                 Mnemonic::Call(call) => call.target,
                 _ => continue,
             };
@@ -225,10 +221,10 @@ fn function_returns(ctx: &Context, f: FunctionId) -> bool {
 /// known/assumed noreturn (the fall-through edge having been pruned by
 /// [`assume_call_returns`], leaving the block an exit).
 fn is_noreturn_call_block(ctx: &Context, block: BlockId) -> bool {
-    let Some(&last) = ctx.values.basic_blocks[block].instructions.last() else {
+    let Some(&last) = ctx.values.block(block).instructions.last() else {
         return false;
     };
-    let Mnemonic::Call(call) = ctx.values.instructions[last].mnemonic() else {
+    let Mnemonic::Call(call) = ctx.values.instruction(last).mnemonic() else {
         return false;
     };
     // A recorded `FunctionReturns(callee) = false` (assumed or known) marks the

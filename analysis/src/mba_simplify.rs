@@ -513,7 +513,7 @@ fn push_insn(
     before: InstructionId,
     block: BlockId,
 ) -> ValueId {
-    let id = InstructionRef::from_mnemonic(ctx, mnemonic, size).id;
+    let id = InstructionRef::from_mnemonic(ctx, block.func, mnemonic, size).id;
     BasicBlock::from_id_mut(ctx, block).insert_insn_before(before, id);
     ValueId::Instruction(id)
 }

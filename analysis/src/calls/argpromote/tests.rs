@@ -729,7 +729,7 @@ mod tests {
             .id();
         let param = pid;
         if let ValueId::BlockParam(bp) = param {
-            tc.ctx.values.block_params[bp].type_id = ptr_ty;
+            tc.ctx.values.block_param_mut(bp).type_id = ptr_ty;
         }
         // Find the add and its load, replace the add with a gep.
         let add_id = BasicBlock::from_id(&tc.ctx, root)
@@ -1240,7 +1240,7 @@ mod tests {
                 _ => unreachable!(),
             }
         };
-        tc.ctx.values.block_params[pid].origin = Some(ValueId::Varnode(sp_vn));
+        tc.ctx.values.block_param_mut(pid).origin = Some(ValueId::Varnode(sp_vn));
         Function::from_id_mut(&mut tc.ctx, f).set_pure_reg(true);
 
         let sp_arg = tc.ctx.get_const(0x7000, 8).id();
@@ -2382,7 +2382,7 @@ mod tests {
             .unwrap()
             .id();
         if let ValueId::BlockParam(inner) = esp_pid {
-            tc.ctx.values.block_params[inner].origin = Some(ValueId::Varnode(sp_reg));
+            tc.ctx.values.block_param_mut(inner).origin = Some(ValueId::Varnode(sp_reg));
         }
         Function::from_id_mut(&mut tc.ctx, f).set_pure_reg(true);
         let espv = tc.ctx.get_const(0x7000, 8).id();
@@ -2476,7 +2476,7 @@ mod tests {
             .unwrap()
             .id();
         if let ValueId::BlockParam(inner) = esp_pid {
-            tc.ctx.values.block_params[inner].origin = Some(ValueId::Varnode(sp_reg));
+            tc.ctx.values.block_param_mut(inner).origin = Some(ValueId::Varnode(sp_reg));
         }
         Function::from_id_mut(&mut tc.ctx, f).set_pure_reg(true);
         let espv = tc.ctx.get_const(0x7000, 8).id();
@@ -2566,7 +2566,7 @@ mod tests {
             .unwrap()
             .id();
         if let ValueId::BlockParam(inner) = esp_pid {
-            tc.ctx.values.block_params[inner].origin = Some(ValueId::Varnode(sp_reg));
+            tc.ctx.values.block_param_mut(inner).origin = Some(ValueId::Varnode(sp_reg));
         }
         Function::from_id_mut(&mut tc.ctx, f).set_pure_reg(true);
         let espv = tc.ctx.get_const(0x7000, 8).id();
@@ -2653,7 +2653,7 @@ mod tests {
             .unwrap()
             .id();
         if let ValueId::BlockParam(inner) = esp_pid {
-            tc.ctx.values.block_params[inner].origin = Some(ValueId::Varnode(sp_reg));
+            tc.ctx.values.block_param_mut(inner).origin = Some(ValueId::Varnode(sp_reg));
         }
         Function::from_id_mut(&mut tc.ctx, f).set_pure_reg(true);
         let espv = tc.ctx.get_const(0x7000, 4).id();

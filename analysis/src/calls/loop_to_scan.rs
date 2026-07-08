@@ -253,7 +253,7 @@ fn apply(ctx: &mut Context, fid: FunctionId, m: &ScanMatch) -> bool {
             // `l0[1..]` — the original elements at lanes `1..N`, a byte-slice of the
             // snapshot array from element 1 (length `N-1`).
             let slice = InstructionRef::from_mnemonic_with_type(
-                ctx,
+                ctx, fid,
                 Mnemonic::Range(qcode::value::insn::Range {
                     src: l0_exit,
                     start: esz,
@@ -284,7 +284,7 @@ fn apply(ctx: &mut Context, fid: FunctionId, m: &ScanMatch) -> bool {
             // `iota(N-1)` typed to the concrete `[i64; N-1]` (construction does not fold).
             let n1_const = ctx.get_const(n1 as u64, 8).id();
             let iota_id_insn = InstructionRef::from_mnemonic_with_type(
-                ctx,
+                ctx, fid,
                 Mnemonic::Intrinsic(IntrinsicApp {
                     id: iota_id,
                     args: vec![n1_const],

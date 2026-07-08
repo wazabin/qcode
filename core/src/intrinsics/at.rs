@@ -193,7 +193,7 @@ mod tests {
         let arr_ty = ctx.types.get_or_make_array(i32, 4);
         let blk = ctx.get_or_make_block(0x1000);
         let a = BasicBlock::from_id_mut(&mut ctx, blk).push_param(16).id;
-        ctx.values.block_params[a].type_id = arr_ty;
+        ctx.values.block_param(a).type_id = arr_ty;
         let i = ctx.get_const(2, 8).id();
         let v = ctx.get_const(0x77, 4).id();
         let insert_id = IntrinsicId::from_name("insert").unwrap();
@@ -216,7 +216,7 @@ mod tests {
         let arr_ty = ctx.types.get_or_make_array(i32, 4);
         let blk = ctx.get_or_make_block(0x1000);
         let a = BasicBlock::from_id_mut(&mut ctx, blk).push_param(16).id;
-        ctx.values.block_params[a].type_id = arr_ty;
+        ctx.values.block_param(a).type_id = arr_ty;
         let i = ctx.get_const(2, 8).id();
         let j = ctx.get_const(3, 8).id();
         let v = ctx.get_const(0x77, 4).id();
@@ -263,9 +263,9 @@ mod tests {
         let b_ty = ctx.types.get_or_make_array(i32, 3);
         let blk = ctx.get_or_make_block(0x1000);
         let a = BasicBlock::from_id_mut(&mut ctx, blk).push_param(4).id;
-        ctx.values.block_params[a].type_id = a_ty;
+        ctx.values.block_param(a).type_id = a_ty;
         let b = BasicBlock::from_id_mut(&mut ctx, blk).push_param(12).id;
-        ctx.values.block_params[b].type_id = b_ty;
+        ctx.values.block_param(b).type_id = b_ty;
         let concat_id = IntrinsicId::from_name("concat").unwrap();
         let cat = {
             let mut bl = Builder::from_block(BasicBlock::from_id_mut(&mut ctx, blk));

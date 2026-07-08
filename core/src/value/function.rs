@@ -1,21 +1,25 @@
 use jstd::Identifier;
 use std::{
     borrow::Cow,
-    collections::{BTreeSet, hash_set},
+    collections::BTreeSet,
     fmt::{Display, Formatter},
 };
 
-use rustc_hash::FxHashSet as HashSet;
-
 mod signature;
 pub use signature::{FunctionSignature, ParamAttrs};
+
+use jstd::registry::Registry;
 
 use crate::{
     context::Context,
     error::{Error, ErrorTy, Result},
     value::{
         BasicBlock, BlockId, BlockRef, Instruction, Value, ValueId, Varnode, VarnodeId,
-        insn::{Branch, Mnemonic},
+        InstructionId,
+        block::EdgeData,
+        block::cfg::{LocalBlockId, LocalEdgeId},
+        block_param::{BlockParam, LocalParamId},
+        insn::{Branch, LocalInsnId, Mnemonic},
         util::{
             base_ref::{BaseRef, WithCtx, WithCtxMut},
             named::{Named, Renameable, update_context_name},
@@ -24,7 +28,7 @@ use crate::{
 };
 
 #[derive(Identifier)]
-pub struct FunctionId(usize);
+pub struct FunctionId(u32);
 
 #[derive(Clone, serde::Serialize, serde::Deserialize)]
 pub struct Function<'str> {
@@ -37,8 +41,33 @@ pub struct Function<'str> {
     /// The entry block (dominates all other blocks in this function).
     pub root: Option<BlockId>,
 
-    /// All blocks belonging to this function (includes root).
-    pub blocks: HashSet<BlockId>,
+    /// Instruction storage for this function. Function-scoped: the composite
+    /// [`InstructionId`](crate::value::InstructionId) `{ func, local }` indexes
+    /// here via `local`. Append-only with tombstones; never compacted.
+    pub(crate) insns: Registry<LocalInsnId, Instruction<'str>>,
+
+    /// Basic-block *storage* for this function. A block is born here and keeps
+    /// its `id.func` for the life of the program (its `LocalBlockId` indexes
+    /// this arena). Storage is decoupled from *ownership*: lifting may attribute
+    /// a block to a different function than the one it was born in (see
+    /// `reattribute_blocks`), so a block stored here can be owned elsewhere. Use
+    /// [`FunctionRef::blocks`] (which reads [`roster`](Self::roster)) to iterate
+    /// the blocks this function owns, not this arena directly.
+    pub(crate) blocks: Registry<LocalBlockId, BasicBlock<'str>>,
+
+    /// Ownership roster: the composite ids of the blocks this function owns, in
+    /// order. Usually all live in this function's own `blocks` arena, but a
+    /// reattributed block may be stored in another function's arena. Kept in
+    /// sync with each block's `parent` by `add_block`/`remove_block`. Tombstoned
+    /// blocks are filtered out on read.
+    #[serde(default)]
+    pub(crate) roster: Vec<BlockId>,
+
+    /// Block-parameter storage for this function.
+    pub(crate) params: Registry<LocalParamId, BlockParam<'str>>,
+
+    /// CFG-edge storage for this function.
+    pub(crate) edges: Registry<LocalEdgeId, EdgeData>,
 
     /// Addresses of every machine instruction lifted into this function, in
     /// ascending order. Recorded during recursive disassembly and preserved
@@ -74,7 +103,11 @@ impl<'str> Function<'str> {
             name,
             address: None,
             root: None,
-            blocks: HashSet::default(),
+            insns: Registry::default(),
+            blocks: Registry::default(),
+            roster: Vec::new(),
+            params: Registry::default(),
+            edges: Registry::default(),
             instruction_addrs: BTreeSet::new(),
             is_external: false,
             signature: None,
@@ -519,27 +552,61 @@ where
         self.inner().root.map(|id| BlockRef::new(self.ctx(), id))
     }
 
-    /// An iterator over the blocks belonging to this function.
+    /// An iterator over the (live) blocks belonging to this function.
     pub fn blocks(&'s self) -> impl Iterator<Item = BlockRef<'str, 'ctx>> + 's {
         let ctx = self.ctx();
-        let mut ids = self.inner().blocks.iter().copied().collect::<Vec<_>>();
-
-        // Total order: primarily by machine address, but break ties by BlockId.
-        // `blocks` is a `HashSet`, so address-less blocks (e.g. fallthrough splits,
-        // whose `address()` is `None`) would otherwise be ordered by the set's
-        // per-process random seed, making block emission order nondeterministic.
-        ids.sort_by_key(|&id| (BlockRef::new(ctx, id).address(), usize::from(id)));
+        let func = self.id;
+        let mut ids = self.block_ids();
+        // Total order: primarily by machine address, but break ties by the
+        // function-local index. Address-less blocks (e.g. fallthrough splits,
+        // whose `address()` is `None`) must still order deterministically.
+        ids.sort_by_key(|&id| (BlockRef::new(ctx, id).address(), id.local));
+        let _ = func;
         ids.into_iter().map(move |id| BlockRef::new(ctx, id))
     }
 
-    /// Iterates over the blocks in this function
-    /// This is slightly different from `blocks()` as the blocks will be returned in an arbitrary order, not sorted by address.
-    pub fn iter(&'s self) -> BlockIter<'str, 'ctx> {
-        let inner = self.inner();
+    /// The composite ids of this function's live (owned, non-tombstoned) blocks,
+    /// in roster order.
+    pub fn block_ids(&'s self) -> Vec<BlockId> {
+        let ctx = self.ctx();
+        self.inner()
+            .roster
+            .iter()
+            .copied()
+            .filter(|&id| !ctx.values.block(id).deleted)
+            .collect()
+    }
 
+    /// The composite ids of this function's live (non-tombstoned) instructions,
+    /// in arena order — including any currently detached (`parent == None`).
+    pub fn instruction_ids(&'s self) -> Vec<InstructionId> {
+        let func = self.id;
+        self.inner()
+            .insns
+            .iter()
+            .filter(|i| !i.deleted)
+            .map(|i| InstructionId::new(func, i.id))
+            .collect()
+    }
+
+    /// The composite ids of every CFG edge in this function's edge arena.
+    /// Includes dangling edges (removal leaves the `EdgeData` slot in place),
+    /// matching the previous whole-context `Graph::edges` behavior.
+    pub fn edge_ids(&'s self) -> Vec<crate::value::block::EdgeId> {
+        let func = self.id;
+        self.inner()
+            .edges
+            .iter()
+            .map(|e| crate::value::block::EdgeId::new(func, e.id))
+            .collect()
+    }
+
+    /// Iterates over the (live) blocks in this function in arena order (i.e. not
+    /// sorted by address, unlike [`blocks`](Self::blocks)).
+    pub fn iter(&'s self) -> BlockIter<'str, 'ctx> {
         BlockIter {
             ctx: self.ctx(),
-            inner: inner.blocks.iter(),
+            inner: self.block_ids().into_iter(),
         }
     }
 
@@ -610,14 +677,14 @@ impl<'str, 'ctx> Value<'str, 'ctx> for FunctionRef<'str, 'ctx> {
 
 pub struct BlockIter<'str, 'ctx> {
     ctx: &'ctx Context<'str>,
-    inner: hash_set::Iter<'ctx, BlockId>,
+    inner: std::vec::IntoIter<BlockId>,
 }
 
 impl<'str, 'ctx> Iterator for BlockIter<'str, 'ctx> {
     type Item = BlockRef<'str, 'ctx>;
 
     fn next(&mut self) -> Option<Self::Item> {
-        self.inner.next().map(|id| BlockRef::new(self.ctx, *id))
+        self.inner.next().map(|id| BlockRef::new(self.ctx, id))
     }
 }
 
@@ -724,7 +791,8 @@ impl<'str, 'ctx> FunctionMutRef<'str, 'ctx> {
     }
 
     pub fn make_root(&mut self) -> BlockRef<'str, '_> {
-        let root = BasicBlock::make(self.ctx).id;
+        let func = self.id;
+        let root = BasicBlock::make(self.ctx, func).id;
         self.set_root(root).expect("We just created the block");
         BlockRef::new(self.ctx, root)
     }
@@ -883,23 +951,41 @@ impl<'str, 'ctx> FunctionMutRef<'str, 'ctx> {
         self.inner_mut().instruction_addrs.insert(addr);
     }
 
-    /// Associates `block` with `function`: pushes it onto the function's block list
-    /// and sets the block's `parent` field.
+    /// Associates `block` with `function` by setting the block's `parent` field.
+    ///
+    /// With per-function block arenas, membership *is* arena ownership: a block
+    /// lives in the arena of the function it was born into (`id.func`), and that
+    /// must equal `self.id`. This is now effectively an assertion plus a
+    /// `parent` (re)assignment; it no longer moves storage between functions.
     pub fn add_block(&mut self, id: BlockId) {
-        self.inner_mut().blocks.insert(id);
-        self.ctx.values.basic_blocks[id].parent = Some(self.id);
+        let prev = self.ctx.values.block(id).parent;
+        if prev == Some(self.id) {
+            // Already owned; ensure the roster lists it exactly once (a freshly
+            // `make`d block is auto-rostered, so this is usually a no-op).
+            if !self.inner().roster.contains(&id) {
+                self.inner_mut().roster.push(id);
+            }
+            return;
+        }
+        // Re-home: drop from the previous owner's roster, claim it here.
+        if let Some(prev) = prev {
+            self.ctx.values.functions[prev].roster.retain(|&b| b != id);
+        }
+        self.ctx.values.block_mut(id).parent = Some(self.id);
+        self.inner_mut().roster.push(id);
     }
 
-    /// Disassociates `block` from this function, removing it from the block list.
-    /// The block's `parent` is left untouched, so callers moving a block to
-    /// another function should call [`add_block`](Self::add_block) afterwards.
+    /// Removes `block` from this function: drops it from the ownership roster and
+    /// tombstones it. The arena slot is never reclaimed; the block is skipped by
+    /// [`blocks`](Self::blocks).
     ///
-    /// This is the low-level primitive for *moving* a block between functions. To
-    /// *delete* a block you almost certainly want [`BasicBlock::delete`], which
-    /// also unwinds CFG edges, removes the block's instructions, and detaches its
-    /// params — none of which this does.
+    /// To *delete* a block with its CFG edges/instructions/params unwound, use
+    /// [`BasicBlock::delete`].
     pub fn remove_block(&mut self, id: BlockId) {
-        self.inner_mut().blocks.remove(&id);
+        self.ctx.values.unroster_block(id);
+        let block = self.ctx.values.block_mut(id);
+        block.parent = None;
+        block.deleted = true;
     }
 }
 

@@ -229,11 +229,11 @@ fn apply_unroll_plan(ctx: &mut Context, fun_id: FunctionId, plan: UnrollPlan) ->
         let mut value_map = header_value_map(ctx, plan.lp.header, &carried);
 
         for (path_index, &old_block) in plan.path.iter().enumerate() {
-            let new_block = BasicBlock::make(ctx).id;
+            let new_block = BasicBlock::make(ctx, fun_id).id;
             let _ = BasicBlock::from_id_mut(ctx, new_block).rename(
                 format!(
                     "unroll_{:x}_{iteration}_{path_index}",
-                    usize::from(old_block)
+                    usize::from(old_block.local)
                 )
                 .into(),
             );
@@ -256,7 +256,8 @@ fn apply_unroll_plan(ctx: &mut Context, fun_id: FunctionId, plan: UnrollPlan) ->
                 let old_ref = qcode::value::Instruction::from_id(ctx, old_insn);
                 let type_id = old_ref.type_id();
                 let mnemonic = remap_mnemonic(old_ref.mnemonic(), &value_map);
-                let new_insn = InstructionRef::from_mnemonic_with_type(ctx, mnemonic, type_id).id;
+                let new_insn =
+                    InstructionRef::from_mnemonic_with_type(ctx, fun_id, mnemonic, type_id).id;
                 let insert_at = BasicBlock::from_id(ctx, new_block).instruction_ids().len();
                 BasicBlock::from_id_mut(ctx, new_block).insert_insn_at_index(insert_at, new_insn);
                 value_map.insert(
@@ -464,12 +465,13 @@ pub(crate) fn replace_terminator_with_branch(
         .instruction_ids()
         .last()
         .copied()
-        .filter(|&id| ctx.values.instructions[id].mnemonic().is_terminator());
+        .filter(|&id| ctx.values.instruction(id).mnemonic().is_terminator());
     if let Some(term_id) = term_id {
         ctx.replace_instruction_mnemonic(term_id, Mnemonic::Branch(Branch { target, args }));
     } else {
         let branch =
-            InstructionRef::from_mnemonic(ctx, Mnemonic::Branch(Branch { target, args }), 0).id;
+            InstructionRef::from_mnemonic(ctx, block.func, Mnemonic::Branch(Branch { target, args }), 0)
+                .id;
         let end = BasicBlock::from_id(ctx, block).instruction_ids().len();
         BasicBlock::from_id_mut(ctx, block).insert_insn_at_index(end, branch);
     }
@@ -524,7 +526,7 @@ impl LoopAnalysis {
 
     fn block_ids(&self) -> Vec<BlockId> {
         let mut blocks = self.postdominators.keys().copied().collect::<Vec<_>>();
-        blocks.sort_by_key(|id| usize::from(*id));
+        blocks.sort();
         blocks
     }
 }
@@ -791,11 +793,11 @@ fn format_loop_comment(ctx: &Context, lp: &SimpleLoop) -> String {
     let body = BasicBlock::from_id(ctx, lp.body)
         .name()
         .map(str::to_owned)
-        .unwrap_or_else(|| format!("bb_{:x}", usize::from(lp.body)));
+        .unwrap_or_else(|| format!("bb_{:x}", usize::from(lp.body.local)));
     let latch = BasicBlock::from_id(ctx, lp.latch)
         .name()
         .map(str::to_owned)
-        .unwrap_or_else(|| format!("bb_{:x}", usize::from(lp.latch)));
+        .unwrap_or_else(|| format!("bb_{:x}", usize::from(lp.latch.local)));
     format!(
         "{COMMENT_PREFIX} simple induction {} = {:#x}; {} < {:#x}; {} += {:#x}; iterations={}; body=<{}>; latch=<{}>",
         induction, lp.initial, induction, lp.bound, induction, lp.step, lp.iterations, body, latch

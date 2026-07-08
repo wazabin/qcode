@@ -24,6 +24,52 @@ use crate::{context::Context, space::SpaceRef};
 use serde::{Deserialize, Serialize};
 use std::fmt::{Debug, Display, Formatter};
 
+/// Declares a composite IR ID: a `{ func: FunctionId, local: LocalX }` pair.
+///
+/// SSA is intra-function, so every instruction/block/param/edge handle carries
+/// the owning function plus a function-local index. Unlike the `Identifier`
+/// newtypes these do **not** index a global `Registry` — they route through the
+/// owning [`Function`]'s arena. Derived `Ord` compares `func` then `local`.
+#[macro_export]
+macro_rules! composite_id {
+    ($name:ident, $local:ty) => {
+        #[derive(
+            Clone,
+            Copy,
+            PartialEq,
+            Eq,
+            Hash,
+            PartialOrd,
+            Ord,
+            Default,
+            ::serde::Serialize,
+            ::serde::Deserialize,
+        )]
+        pub struct $name {
+            pub func: $crate::value::FunctionId,
+            pub local: $local,
+        }
+
+        impl $name {
+            pub const fn new(func: $crate::value::FunctionId, local: $local) -> Self {
+                Self { func, local }
+            }
+        }
+
+        impl ::core::fmt::Debug for $name {
+            fn fmt(&self, f: &mut ::core::fmt::Formatter<'_>) -> ::core::fmt::Result {
+                write!(f, concat!(stringify!($name), "({}:{})"), self.func, self.local)
+            }
+        }
+
+        impl ::core::fmt::Display for $name {
+            fn fmt(&self, f: &mut ::core::fmt::Formatter<'_>) -> ::core::fmt::Result {
+                write!(f, "{}:{}", self.func, self.local)
+            }
+        }
+    };
+}
+
 pub use block::{BasicBlock, BlockId, BlockMutRef, BlockRef};
 pub use block_param::{BlockParam, BlockParamId, BlockParamMutRef, BlockParamRef};
 pub use bytes::{
@@ -195,23 +241,37 @@ impl From<FunctionId> for ValueId {
     }
 }
 
-impl From<ValueId> for usize {
-    fn from(id: ValueId) -> Self {
-        match id {
-            ValueId::Literal(lit_id) => lit_id.into(),
-            ValueId::Bytes(bytes_id) => bytes_id.into(),
-            ValueId::Instruction(insn_id) => insn_id.into(),
-            ValueId::BasicBlock(bb_id) => bb_id.into(),
-            ValueId::BlockParam(param_id) => param_id.into(),
-            ValueId::Varnode(var_id) => var_id.into(),
-            ValueId::Function(fn_id) => fn_id.into(),
+impl ValueId {
+    /// A total-order sort key that does not require `Into<usize>` (which the
+    /// composite instruction/block/param IDs deliberately lack). The tuple is
+    /// `(variant_tag, function-or-0, local-or-global-index)`; global values put
+    /// their index in the third slot with function 0.
+    pub fn order_key(&self) -> (u8, u32, u32) {
+        match *self {
+            ValueId::Literal(id) => (0, 0, u32::try_from(usize::from(id)).unwrap_or(u32::MAX)),
+            ValueId::Bytes(id) => (1, 0, u32::try_from(usize::from(id)).unwrap_or(u32::MAX)),
+            ValueId::Varnode(id) => (2, 0, u32::try_from(usize::from(id)).unwrap_or(u32::MAX)),
+            ValueId::Function(id) => (3, 0, u32::try_from(usize::from(id)).unwrap_or(u32::MAX)),
+            ValueId::Instruction(id) => {
+                (4, usize::from(id.func) as u32, usize::from(id.local) as u32)
+            }
+            ValueId::BasicBlock(id) => (5, usize::from(id.func) as u32, usize::from(id.local) as u32),
+            ValueId::BlockParam(id) => (6, usize::from(id.func) as u32, usize::from(id.local) as u32),
         }
     }
 }
 
 impl Display for ValueId {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{}({})", self.ty(), usize::from(*self))
+        match *self {
+            ValueId::Literal(id) => write!(f, "Literal({})", usize::from(id)),
+            ValueId::Bytes(id) => write!(f, "Bytes({})", usize::from(id)),
+            ValueId::Varnode(id) => write!(f, "Varnode({})", usize::from(id)),
+            ValueId::Function(id) => write!(f, "Function({})", usize::from(id)),
+            ValueId::Instruction(id) => write!(f, "Instruction({id})"),
+            ValueId::BasicBlock(id) => write!(f, "BasicBlock({id})"),
+            ValueId::BlockParam(id) => write!(f, "BlockParam({id})"),
+        }
     }
 }
 

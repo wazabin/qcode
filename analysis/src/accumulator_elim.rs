@@ -263,9 +263,9 @@ fn transform(
         .id;
 
     // Three fresh blocks: header (root, drivers in), base case, recursive case.
-    let g_head = BasicBlock::make(ctx).id;
-    let base = BasicBlock::make(ctx).id;
-    let rec = BasicBlock::make(ctx).id;
+    let g_head = BasicBlock::make(ctx, g).id;
+    let base = BasicBlock::make(ctx, g).id;
+    let rec = BasicBlock::make(ctx, g).id;
     for &b in &[g_head, base, rec] {
         Function::from_id_mut(ctx, g).add_block(b);
     }
@@ -471,7 +471,7 @@ fn clone_value(
                     remapped.replace_value(op, new_op);
                 }
             }
-            let new_id = InstructionRef::from_mnemonic_with_type(ctx, remapped, type_id).id;
+            let new_id = InstructionRef::from_mnemonic_with_type(ctx, target.func, remapped, type_id).id;
             let idx = BasicBlock::from_id(ctx, target).instruction_ids().len();
             BasicBlock::from_id_mut(ctx, target).insert_insn_at_index(idx, new_id);
             ValueId::Instruction(new_id)

@@ -166,11 +166,11 @@ fn trim_dead_args(
         return false;
     };
 
-    let params = ctx.values.basic_blocks[root].params.clone();
+    let params = ctx.values.block(root).params.clone();
     let dead: Vec<usize> = params
         .iter()
         .enumerate()
-        .filter(|(_, p)| ctx.users(**p).is_empty() && !ctx.values.block_params[**p].protected)
+        .filter(|(_, p)| ctx.users(**p).is_empty() && !ctx.values.block_param(**p).protected)
         .map(|(i, _)| i)
         .collect();
     if dead.is_empty() {
@@ -457,7 +457,7 @@ mod tests {
             .collect();
         for (pv, name) in param_ids.iter().zip(["r0", "r1"]) {
             if let ValueId::BlockParam(pid) = pv {
-                tc.ctx.values.block_params[*pid].name = Some(std::borrow::Cow::Owned(name.into()));
+                tc.ctx.values.block_param_mut(*pid).name = Some(std::borrow::Cow::Owned(name.into()));
             }
         }
         // f returns a one-field write-set of its r1 param; the r0 param is unused

@@ -127,11 +127,11 @@ pub fn remove_unused_no_pred_block_params(ctx: &mut Context, block_id: BlockId) 
         && is_entry
         && pure_reg
     {
-        let params = ctx.values.basic_blocks[block_id].params.clone();
+        let params = ctx.values.block(block_id).params.clone();
         let dead: Vec<usize> = params
             .iter()
             .enumerate()
-            .filter(|(_, p)| ctx.users(**p).is_empty() && !ctx.values.block_params[**p].protected)
+            .filter(|(_, p)| ctx.users(**p).is_empty() && !ctx.values.block_param(**p).protected)
             .map(|(i, _)| i)
             .collect();
         // Remove high index first so the lower indices stay valid.
@@ -141,21 +141,21 @@ pub fn remove_unused_no_pred_block_params(ctx: &mut Context, block_id: BlockId) 
         return !dead.is_empty();
     }
 
-    let params = ctx.values.basic_blocks[block_id].params.clone();
+    let params = ctx.values.block(block_id).params.clone();
     let mut kept = Vec::with_capacity(params.len());
     let mut changed = false;
     for param in params {
-        if ctx.users(param).is_empty() && !ctx.values.block_params[param].protected {
-            ctx.values.block_params[param].parent = None;
+        if ctx.users(param).is_empty() && !ctx.values.block_param(param).protected {
+            ctx.values.block_param_mut(param).parent = None;
             changed = true;
         } else {
-            ctx.values.block_params[param].index = kept.len();
+            ctx.values.block_param_mut(param).index = kept.len();
             kept.push(param);
         }
     }
 
     if changed {
-        ctx.values.basic_blocks[block_id].params = kept;
+        ctx.values.block_mut(block_id).params = kept;
     }
     changed
 }
@@ -593,7 +593,7 @@ fn match_dead_loop(ctx: &Context, header: BlockId) -> Option<DeadLoop> {
     if exit == header || body == header || exit == body {
         return None;
     }
-    if !ctx.values.basic_blocks[exit].params.is_empty() {
+    if !ctx.values.block(exit).params.is_empty() {
         return None;
     }
 
@@ -645,7 +645,7 @@ fn match_dead_loop(ctx: &Context, header: BlockId) -> Option<DeadLoop> {
                 return None;
             }
         }
-        for &pid in &ctx.values.basic_blocks[blk].params {
+        for &pid in &ctx.values.block(blk).params {
             if !dl_users_confined(ctx, ValueId::BlockParam(pid), &region) {
                 return None;
             }
@@ -655,7 +655,7 @@ fn match_dead_loop(ctx: &Context, header: BlockId) -> Option<DeadLoop> {
     // Termination: some header param is a unit-stride induction variable that
     // starts at a literal and drives the `iv == N` exit test, so the loop always
     // reaches the exit within `2^width` iterations.
-    let hparams = ctx.values.basic_blocks[header].params.clone();
+    let hparams = ctx.values.block(header).params.clone();
     let counted = hparams.iter().enumerate().any(|(k, &pid)| {
         let iv = ValueId::BlockParam(pid);
         back_args

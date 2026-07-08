@@ -17,8 +17,12 @@ use std::{
     fmt::{Display, Formatter},
 };
 
+/// Function-local block-parameter index (indexes the owning [`Function`]'s
+/// param arena).
 #[derive(Identifier)]
-pub struct BlockParamId(usize);
+pub struct LocalParamId(u32);
+
+crate::composite_id!(BlockParamId, LocalParamId);
 
 /// A typed parameter declared at the entry of a basic block.
 ///
@@ -69,15 +73,18 @@ impl<'str> BlockParam<'str> {
         size: usize,
     ) -> BlockParamMutRef<'str, 'ctx> {
         let type_id = ctx.types.get_or_make_int(size);
-        let index = ctx.values.basic_blocks[block_id].params.len();
-        let id = ctx.values.block_params.push(BlockParam {
-            index,
-            type_id,
-            parent: Some(block_id),
-            name: None,
-            origin: None,
-            protected: false,
-        });
+        let index = ctx.values.block(block_id).params.len();
+        let id = ctx.values.push_block_param(
+            block_id.func,
+            BlockParam {
+                index,
+                type_id,
+                parent: Some(block_id),
+                name: None,
+                origin: None,
+                protected: false,
+            },
+        );
         BlockParamMutRef::from_id(ctx, id)
     }
 
@@ -99,7 +106,7 @@ where
     Self: WithCtx<'s, 'ctx, 'str>,
 {
     fn inner(&'s self) -> &'ctx BlockParam<'str> {
-        &self.ctx().values.block_params[self.id]
+        self.ctx().values.block_param(self.id)
     }
 
     /// Position of this parameter in the owning block's param list.
@@ -147,7 +154,7 @@ where
         if let Some(name) = self.name() {
             write!(f, "@{name}")
         } else {
-            let id: usize = self.id.into();
+            let id: usize = self.id.local.into();
             write!(f, "@param{id:x}")
         }
     }
@@ -179,7 +186,7 @@ impl<'s, 'ctx: 's, 'str: 'ctx> WithCtx<'s, 'ctx, 'str> for BlockParamRef<'str, '
 
 impl Named for BlockParamRef<'_, '_> {
     fn name(&self) -> Option<&str> {
-        self.ctx.values.block_params[self.id].name.as_deref()
+        self.ctx.values.block_param(self.id).name.as_deref()
     }
 }
 
@@ -203,7 +210,7 @@ pub type BlockParamMutRef<'str, 'ctx> = BaseRef<&'ctx mut Context<'str>, BlockPa
 
 impl<'str, 'ctx> BlockParamMutRef<'str, 'ctx> {
     fn inner_mut(&mut self) -> &mut BlockParam<'str> {
-        &mut self.ctx.values.block_params[self.id]
+        self.ctx.values.block_param_mut(self.id)
     }
 
     pub fn set_size(&mut self, size: usize) {
@@ -248,7 +255,7 @@ impl<'s, 'ctx: 's, 'str: 'ctx> WithCtxMut<'s, 'str> for BlockParamMutRef<'str, '
 
 impl Named for BlockParamMutRef<'_, '_> {
     fn name(&self) -> Option<&str> {
-        self.ctx.values.block_params[self.id].name.as_deref()
+        self.ctx.values.block_param(self.id).name.as_deref()
     }
 }
 
@@ -273,7 +280,7 @@ impl<'str, 'ctx> Renameable<'str, 'ctx> for BlockParamMutRef<'str, 'ctx> {
         let id = self.id.into();
         let old_name = self.inner_mut().name.take();
         update_context_name(id, self.ctx, name.clone(), old_name.as_deref())?;
-        self.ctx.values.block_params[self.id].name = Some(name);
+        self.ctx.values.block_param_mut(self.id).name = Some(name);
         Ok(())
     }
 }

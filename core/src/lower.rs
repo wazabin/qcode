@@ -222,7 +222,7 @@ fn lower_fn_body(
     let entry = entry.clone();
 
     // Create entry + every other named block and its params before building.
-    let entry_id = BasicBlock::make(ctx)
+    let entry_id = BasicBlock::make(ctx, fid)
         .with_name(Cow::Owned(entry.clone()))
         .map_err(|e| e.to_string())?
         .id;
@@ -304,13 +304,19 @@ fn create_blocks_and_params(
         let block_id = if name == skip_entry {
             block_ids[name]
         } else {
-            let id = BasicBlock::make(ctx)
+            // A block must be born into a function's arena. Function-mode always
+            // supplies one; the bare-block DSL path has none, so mint an
+            // anonymous host function for the block to live in.
+            let fid = match func {
+                Some(fid) => fid,
+                None => Function::make(ctx, Cow::Borrowed("<anon>"))
+                    .expect("anon host function")
+                    .id,
+            };
+            let id = BasicBlock::make(ctx, fid)
                 .with_name(Cow::Owned(name.clone()))
                 .expect("qcode: block name conflict")
                 .id;
-            if let Some(fid) = func {
-                Function::from_id_mut(ctx, fid).add_block(id);
-            }
             block_ids.insert(name.clone(), id);
             symbols.blocks.insert(name.clone(), id);
             id

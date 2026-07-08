@@ -819,7 +819,7 @@ mod tests {
         let pid = BasicBlock::from_id_mut(&mut ctx, entry)
             .push_param(arr_sz)
             .id;
-        ctx.values.block_params[pid].type_id = arr_ty;
+        ctx.values.block_param_mut(pid).type_id = arr_ty;
         ctx.replace_all_uses_with(ValueId::Instruction(load_id), ValueId::BlockParam(pid));
 
         Function::from_id_mut(&mut ctx, xorbuf).set_is_pure(true);

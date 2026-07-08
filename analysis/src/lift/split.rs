@@ -183,7 +183,7 @@ fn promote_shared_blocks(ctx: &mut Context) -> bool {
 
     let mut promoted = false;
     for b in contested {
-        if let Some(addr) = ctx.values.basic_blocks[b].address
+        if let Some(addr) = ctx.values.block(b).address
             && Function::from_addr(ctx, addr).is_none()
         {
             Function::make_at_addr(ctx, addr, None);
@@ -217,12 +217,15 @@ fn reattribute_blocks(ctx: &mut Context) -> bool {
     let mut changed = false;
     let mut owners_changed: HashSet<FunctionId> = HashSet::default();
     for id in ctx.block_ids() {
-        let cur = ctx.values.basic_blocks[id].parent;
+        let cur = ctx.values.block(id).parent;
         let Some(desired) = new_owner.get(&id).copied().or(cur) else {
             continue;
         };
         if cur != Some(desired) {
-            ctx.values.basic_blocks[id].parent = Some(desired);
+            // `add_block` reassigns ownership: it drops the block from the
+            // previous owner's roster, sets `parent`, and claims it here. Block
+            // *storage* stays in the block's birth arena (`id.func`).
+            Function::from_id_mut(ctx, desired).add_block(id);
             if let Some(prev) = cur {
                 owners_changed.insert(prev);
             }
@@ -234,19 +237,8 @@ fn reattribute_blocks(ctx: &mut Context) -> bool {
         return false;
     }
 
-    // Rebuild the affected functions' block sets authoritatively from `parent`
-    // (the set and the parent links could otherwise disagree — a block may have
-    // lingered in an old owner's set), then fix roots and instruction addresses.
-    for &func in &owners_changed {
-        ctx.values.functions[func].blocks.clear();
-    }
-    for id in ctx.block_ids() {
-        if let Some(func) = ctx.values.basic_blocks[id].parent
-            && owners_changed.contains(&func)
-        {
-            ctx.values.functions[func].blocks.insert(id);
-        }
-    }
+    // Fix roots and instruction addresses on the affected functions. The
+    // ownership rosters were maintained by `add_block` above.
     for &(entry, func) in &entries {
         if owners_changed.contains(&func) && ctx.values.functions[func].root != Some(entry) {
             ctx.values.functions[func].root = Some(entry);
@@ -255,14 +247,15 @@ fn reattribute_blocks(ctx: &mut Context) -> bool {
     // A function that only *lost* blocks (a `prev` owner) is in `owners_changed`
     // but may be absent from `entries` (it kept no block at its own address), so
     // the re-root above skips it. If its recorded `root` was one of the blocks
-    // just reassigned away, it now points outside the rebuilt block set — an
-    // invariant every consumer relies on (e.g. `compute_input_regs` indexes
+    // just reassigned away, it now points outside the owned set — an invariant
+    // every consumer relies on (e.g. `compute_input_regs` indexes
     // `live_in[root]`). Drop such an orphaned root so the function reads as a
     // rootless stub instead of crashing analysis.
     for &func in &owners_changed {
-        let f = &mut ctx.values.functions[func];
-        if f.root.is_some_and(|r| !f.blocks.contains(&r)) {
-            f.root = None;
+        let live: HashSet<BlockId> = Function::from_id(ctx, func).block_ids().into_iter().collect();
+        let root = ctx.values.functions[func].root;
+        if root.is_some_and(|r| !live.contains(&r)) {
+            ctx.values.functions[func].root = None;
         }
     }
     for func in owners_changed {
@@ -275,7 +268,7 @@ fn reattribute_blocks(ctx: &mut Context) -> bool {
 /// instructions in its (post-split) blocks. On the clean IR blocks are not yet
 /// merged, so this is exact.
 fn recompute_instruction_addrs(ctx: &mut Context, func: FunctionId) {
-    let blocks: Vec<BlockId> = ctx.values.functions[func].blocks.iter().copied().collect();
+    let blocks: Vec<BlockId> = Function::from_id(ctx, func).block_ids();
     let mut addrs = BTreeSet::new();
     for b in blocks {
         for insn in BasicBlock::from_id(ctx, b).instructions() {
@@ -353,8 +346,8 @@ mod tests {
 
         assert_block_set(&ctx, f, &[b0]);
         assert_block_set(&ctx, g, &[b1, b2]);
-        assert_eq!(ctx.values.basic_blocks[b1].parent, Some(g));
-        assert_eq!(ctx.values.basic_blocks[b2].parent, Some(g));
+        assert_eq!(ctx.values.block(b1).parent, Some(g));
+        assert_eq!(ctx.values.block(b2).parent, Some(g));
         assert_eq!(ctx.values.functions[g].root, Some(b1));
 
         assert_eq!(addrs(&ctx, f), vec![0x1000]);
@@ -415,7 +408,7 @@ mod tests {
         assert_block_set(&ctx, f, &[b0]);
         assert_block_set(&ctx, g, &[b1, b2]);
         assert_eq!(
-            ctx.values.basic_blocks[b2].parent,
+            ctx.values.block(b2).parent,
             Some(g),
             "the post-call block must be claimed via the materialized fall-through edge",
         );

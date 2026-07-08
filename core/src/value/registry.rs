@@ -12,6 +12,11 @@ use crate::{
         varnode::{Varnode, VarnodeId},
     },
 };
+// NOTE (IR-ownership refactor): instruction/block/param/edge *storage* now lives
+// in each `Function` (see `Function::insns/blocks/params/edges`). This registry
+// keeps only the global value arenas plus the cross-function maps (`users`,
+// `call_sites`, `synthetic_callees`). Composite IDs route through the owning
+// function via the `instruction()/block()/block_param()/edge()` accessors below.
 use jstd::registry::Registry;
 use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
 use std::collections::BTreeSet;
@@ -48,15 +53,6 @@ pub struct ValueRegistry<'str> {
     #[serde(default)]
     pub(crate) bytes_display: HashMap<BytesId, crate::value::BytesDisplay>,
 
-    /// Instruction storage.
-    pub instructions: Registry<InstructionId, Instruction<'str>>,
-
-    /// Basic block storage.
-    pub basic_blocks: Registry<BlockId, BasicBlock<'str>>,
-
-    /// Block parameter storage.
-    pub block_params: Registry<BlockParamId, BlockParam<'str>>,
-
     /// Varnode storage.
     pub varnodes: Registry<VarnodeId, Varnode<'str>>,
 
@@ -69,10 +65,9 @@ pub struct ValueRegistry<'str> {
     #[serde(default)]
     pub(crate) varnode_types: HashMap<VarnodeId, TypeId>,
 
-    /// Control-flow edge storage.
-    pub edges: Registry<EdgeId, EdgeData>,
-
-    /// Function storage.
+    /// Function storage. Each function owns its instruction/block/param/edge
+    /// arenas; the composite-ID accessors ([`instruction`](Self::instruction)
+    /// etc.) route through here.
     pub functions: Registry<FunctionId, Function<'str>>,
 
     /// Truth map of the assumption system: what each [`Proposition`] is
@@ -171,10 +166,11 @@ impl<'str> ValueRegistry<'str> {
     /// stale. Rewrite operands through
     /// [`Context::replace_all_uses_with`](crate::context::Context::replace_all_uses_with)
     /// instead.
-    pub fn push_insn(&mut self, insn: Instruction<'str>) -> InstructionId {
+    pub fn push_insn(&mut self, func: FunctionId, insn: Instruction<'str>) -> InstructionId {
         let args = insn.mnemonic().args();
         let call_target = insn.mnemonic().call_target();
-        let id = self.instructions.push(insn);
+        let local = self.functions[func].insns.push(insn);
+        let id = InstructionId::new(func, local);
         for arg in args {
             self.users.entry(arg).or_default().push(id);
         }
@@ -182,6 +178,46 @@ impl<'str> ValueRegistry<'str> {
             self.call_sites.entry(target).or_default().push(id);
         }
         id
+    }
+
+    /// Borrows the instruction `id`, routing through its owning function's arena.
+    pub fn instruction(&self, id: InstructionId) -> &Instruction<'str> {
+        &self.functions[id.func].insns[id.local]
+    }
+
+    /// Mutably borrows the instruction `id`.
+    pub fn instruction_mut(&mut self, id: InstructionId) -> &mut Instruction<'str> {
+        &mut self.functions[id.func].insns[id.local]
+    }
+
+    /// Borrows the basic block `id`.
+    pub fn block(&self, id: BlockId) -> &BasicBlock<'str> {
+        &self.functions[id.func].blocks[id.local]
+    }
+
+    /// Mutably borrows the basic block `id`.
+    pub fn block_mut(&mut self, id: BlockId) -> &mut BasicBlock<'str> {
+        &mut self.functions[id.func].blocks[id.local]
+    }
+
+    /// Borrows the block parameter `id`.
+    pub fn block_param(&self, id: BlockParamId) -> &BlockParam<'str> {
+        &self.functions[id.func].params[id.local]
+    }
+
+    /// Mutably borrows the block parameter `id`.
+    pub fn block_param_mut(&mut self, id: BlockParamId) -> &mut BlockParam<'str> {
+        &mut self.functions[id.func].params[id.local]
+    }
+
+    /// Borrows the CFG edge `id`.
+    pub fn edge(&self, id: EdgeId) -> &EdgeData {
+        &self.functions[id.func].edges[id.local]
+    }
+
+    /// Mutably borrows the CFG edge `id`.
+    pub fn edge_mut(&mut self, id: EdgeId) -> &mut EdgeData {
+        &mut self.functions[id.func].edges[id.local]
     }
 
     /// Returns all instructions that use `value` as an operand.
@@ -232,7 +268,7 @@ impl<'str> ValueRegistry<'str> {
         let mut affected_args: HashSet<ValueId> = HashSet::default();
         let mut affected_targets: HashSet<FunctionId> = HashSet::default();
         for &id in dead {
-            let mnemonic = self.instructions[id].mnemonic();
+            let mnemonic = self.instruction(id).mnemonic();
             affected_args.extend(mnemonic.args());
             if let Some(target) = mnemonic.call_target() {
                 affected_targets.insert(target);
@@ -241,7 +277,7 @@ impl<'str> ValueRegistry<'str> {
             // the entry stays in the arena; marking it deleted keeps `Context::instructions`
             // (and any whole-program scan built on it) from yielding the stale operands it
             // still carries.
-            self.instructions[id].deleted = true;
+            self.instruction_mut(id).deleted = true;
         }
         for arg in affected_args {
             if let Some(users) = self.users.get_mut(&arg) {
@@ -255,12 +291,34 @@ impl<'str> ValueRegistry<'str> {
         }
     }
 
-    pub fn push_block(&mut self, block: BasicBlock<'str>) -> BlockId {
-        self.basic_blocks.push(block)
+    pub fn push_block(&mut self, func: FunctionId, block: BasicBlock<'str>) -> BlockId {
+        let local = self.functions[func].blocks.push(block);
+        let id = BlockId::new(func, local);
+        // A block is born owned by the function whose arena stores it.
+        self.functions[func].roster.push(id);
+        id
     }
 
-    pub fn push_block_param(&mut self, param: BlockParam<'str>) -> BlockParamId {
-        self.block_params.push(param)
+    /// Removes `id` from its current owner's roster, if present. Storage (the
+    /// arena slot) is untouched. Used by reattribution and block deletion.
+    pub fn unroster_block(&mut self, id: BlockId) {
+        let owner = self.block(id).parent;
+        if let Some(f) = owner {
+            self.functions[f].roster.retain(|&b| b != id);
+        }
+        // Defensive: also drop from the storage function's roster in case
+        // ownership and storage diverged and both listed it.
+        self.functions[id.func].roster.retain(|&b| b != id);
+    }
+
+    pub fn push_block_param(&mut self, func: FunctionId, param: BlockParam<'str>) -> BlockParamId {
+        let local = self.functions[func].params.push(param);
+        BlockParamId::new(func, local)
+    }
+
+    pub fn push_edge(&mut self, func: FunctionId, edge: EdgeData) -> EdgeId {
+        let local = self.functions[func].edges.push(edge);
+        EdgeId::new(func, local)
     }
 
     pub fn push_varnode(&mut self, varnode: Varnode<'str>) -> VarnodeId {

@@ -57,10 +57,10 @@ pub fn append_entry_param(
     // New root block param, recording its source for mem2reg reuse and naming.
     let pid = BasicBlock::from_id_mut(ctx, root).push_param(size).id;
     if let Some(name) = name {
-        ctx.values.block_params[pid].name = Some(Cow::Owned(name));
+        ctx.values.block_param_mut(pid).name = Some(Cow::Owned(name));
     }
     if let Some(origin) = origin {
-        ctx.values.block_params[pid].origin = Some(origin);
+        ctx.values.block_param_mut(pid).origin = Some(origin);
     }
 
     // Append the matching positional argument at every direct call site.
@@ -130,20 +130,20 @@ pub fn remove_entry_param(ctx: &mut Context, fid: FunctionId, index: usize) {
     };
 
     // Drop the root param at `index`, reindexing the survivors.
-    let mut params = ctx.values.basic_blocks[root].params.clone();
+    let mut params = ctx.values.block(root).params.clone();
     if index >= params.len() {
         return;
     }
     let removed = params.remove(index);
-    ctx.values.block_params[removed].parent = None;
+    ctx.values.block_param_mut(removed).parent = None;
 
     // Any inferred per-param attributes are indexed by the old positions; drop
     // them rather than reindex. The `param_attrs` pass re-infers afterward.
     Function::from_id_mut(ctx, fid).clear_param_attrs();
     for (i, &p) in params.iter().enumerate() {
-        ctx.values.block_params[p].index = i;
+        ctx.values.block_param_mut(p).index = i;
     }
-    ctx.values.basic_blocks[root].params = params;
+    ctx.values.block_mut(root).params = params;
 
     // Drop the matching input-register entry. Intentional legacy-path support:
     // only acts when `input_regs` is set (conventional functions); for

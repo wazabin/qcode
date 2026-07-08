@@ -96,7 +96,7 @@ impl Editor {
         mnemonic: Mnemonic,
         type_id: qcode::types::TypeId,
     ) -> InstructionId {
-        let new_id = InstructionRef::from_mnemonic_with_type(ctx, mnemonic, type_id).id;
+        let new_id = InstructionRef::from_mnemonic_with_type(ctx, block_id.func, mnemonic, type_id).id;
         BasicBlock::from_id_mut(ctx, block_id).insert_insn_before(at, new_id);
         ctx.replace_all_uses_with(at, new_id);
         self.redundant.insert(at);

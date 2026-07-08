@@ -134,11 +134,11 @@ impl SubPass for Cse {
 pub(super) fn value_id_key(v: ValueId) -> (u8, usize) {
     match v {
         ValueId::Literal(x) => (0, x.into()),
-        ValueId::Instruction(x) => (1, x.into()),
+        ValueId::Instruction(x) => (1, usize::from(x.local)),
         ValueId::Varnode(x) => (2, x.into()),
-        ValueId::BasicBlock(x) => (3, x.into()),
+        ValueId::BasicBlock(x) => (3, usize::from(x.local)),
         ValueId::Function(x) => (4, x.into()),
-        ValueId::BlockParam(x) => (5, x.into()),
+        ValueId::BlockParam(x) => (5, usize::from(x.local)),
         // A `Bytes` blob (a constant too wide for a `Literal`) can appear as a
         // commutative operand; give it a stable rank so canonicalization is total.
         ValueId::Bytes(x) => (6, x.into()),

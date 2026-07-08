@@ -142,7 +142,7 @@ pub(crate) fn recognize_loop(ctx: &Context, fun_id: FunctionId) -> Option<LoopMo
     }
 
     let mut region: Vec<BlockId> = region.into_iter().collect();
-    region.sort_by_key(|&b| usize::from(b));
+    region.sort();
 
     Some(LoopModel {
         root,

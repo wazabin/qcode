@@ -298,7 +298,7 @@ mod tests {
             f.add_block(entry);
         }
         let arr_pid = BasicBlock::from_id_mut(&mut tc.ctx, entry).push_param(N).id;
-        tc.ctx.values.block_params[arr_pid].type_id = arr_ty;
+        tc.ctx.values.block_param_mut(arr_pid).type_id = arr_ty;
         let arr = ValueId::BlockParam(arr_pid);
         let base =
             ValueId::BlockParam(BasicBlock::from_id_mut(&mut tc.ctx, entry).push_param(8).id);

@@ -52,7 +52,7 @@ pub fn simplify_cfg(ctx: &mut Context, function_id: FunctionId) -> bool {
     let mut changed = false;
 
     loop {
-        let blocks = ctx.values.functions[function_id].blocks.clone();
+        let blocks = qcode::value::Function::from_id(ctx, function_id).block_ids();
         let mut progress = prune_unreachable(ctx, function_id);
 
         for block_id in blocks {
@@ -101,10 +101,9 @@ fn prune_unreachable(ctx: &mut Context, function_id: FunctionId) -> bool {
         }
     }
 
-    let dead: Vec<BlockId> = ctx.values.functions[function_id]
-        .blocks
-        .iter()
-        .copied()
+    let dead: Vec<BlockId> = qcode::value::Function::from_id(ctx, function_id)
+        .block_ids()
+        .into_iter()
         .filter(|b| !reachable.contains(b))
         .collect();
     if dead.is_empty() {
@@ -147,11 +146,11 @@ fn try_merge_block(ctx: &mut Context, function_id: FunctionId, a_id: BlockId) ->
     }
 
     // A's terminal must be an unconditional Branch to B.
-    let a_terminal = ctx.values.basic_blocks[a_id].instructions.last().copied();
+    let a_terminal = ctx.values.block(a_id).instructions.last().copied();
     let is_branch_to_b = a_terminal
         .map(|id| {
             matches!(
-                ctx.values.instructions[id].mnemonic(),
+                ctx.values.instruction(id).mnemonic(),
                 Mnemonic::Branch(b) if b.target == b_id
             )
         })
@@ -166,9 +165,9 @@ fn try_merge_block(ctx: &mut Context, function_id: FunctionId, a_id: BlockId) ->
     // CRT stub's tail `jmp` into another routine that mem2reg gave a param,
     // lifted as an intra-function `goto` carrying no args. Leave such edges
     // unmerged rather than absorbing an unsatisfiable param.
-    let b_params = ctx.values.basic_blocks[b_id].params.len();
+    let b_params = ctx.values.block(b_id).params.len();
     let branch_args = a_terminal
-        .and_then(|id| match ctx.values.instructions[id].mnemonic() {
+        .and_then(|id| match ctx.values.instruction(id).mnemonic() {
             Mnemonic::Branch(b) => Some(b.args.len()),
             _ => None,
         })
@@ -188,10 +187,10 @@ fn try_merge_block(ctx: &mut Context, function_id: FunctionId, a_id: BlockId) ->
 /// The `CBranch` contributed two parallel CFG edges to the shared target; one
 /// is dropped so the edge multiplicity matches the new single-successor branch.
 fn try_fold_cbranch(ctx: &mut Context, block_id: BlockId) -> bool {
-    let Some(&term_id) = ctx.values.basic_blocks[block_id].instructions.last() else {
+    let Some(&term_id) = ctx.values.block(block_id).instructions.last() else {
         return false;
     };
-    let Mnemonic::CBranch(cb) = ctx.values.instructions[term_id].mnemonic() else {
+    let Mnemonic::CBranch(cb) = ctx.values.instruction(term_id).mnemonic() else {
         return false;
     };
     if cb.success_block != cb.failure_block || cb.success_args != cb.failure_args {
@@ -240,11 +239,11 @@ fn try_bypass_empty_block(ctx: &mut Context, function_id: FunctionId, b_id: Bloc
     }
 
     // B must hold exactly one instruction, an unconditional branch.
-    if ctx.values.basic_blocks[b_id].instructions.len() != 1 {
+    if ctx.values.block(b_id).instructions.len() != 1 {
         return false;
     }
-    let term_id = ctx.values.basic_blocks[b_id].instructions[0];
-    let (target, b_args) = match ctx.values.instructions[term_id].mnemonic() {
+    let term_id = ctx.values.block(b_id).instructions[0];
+    let (target, b_args) = match ctx.values.instruction(term_id).mnemonic() {
         Mnemonic::Branch(b) => (b.target, b.args.clone()),
         _ => return false,
     };
@@ -252,7 +251,7 @@ fn try_bypass_empty_block(ctx: &mut Context, function_id: FunctionId, b_id: Bloc
         return false; // bypassing `goto self` is meaningless and unsound
     }
 
-    let params: Vec<BlockParamId> = ctx.values.basic_blocks[b_id].params.clone();
+    let params: Vec<BlockParamId> = ctx.values.block(b_id).params.clone();
 
     // B's params must flow nowhere but B's own terminator. In valid SSA a block
     // param is only visible inside dominated blocks via forwarded args, so this
@@ -288,10 +287,10 @@ fn try_bypass_empty_block(ctx: &mut Context, function_id: FunctionId, b_id: Bloc
     // through a rewritable terminator that names B with a matching arg count on
     // each arm that targets B.
     for &p in &preds {
-        let Some(&p_term) = ctx.values.basic_blocks[p].instructions.last() else {
+        let Some(&p_term) = ctx.values.block(p).instructions.last() else {
             return false;
         };
-        match ctx.values.instructions[p_term].mnemonic() {
+        match ctx.values.instruction(p_term).mnemonic() {
             Mnemonic::Branch(br) => {
                 if br.target != b_id || br.args.len() != params.len() {
                     return false;
@@ -322,8 +321,8 @@ fn try_bypass_empty_block(ctx: &mut Context, function_id: FunctionId, b_id: Bloc
     // Rewrite each predecessor to branch straight to `target`, substituting B's
     // params with the arguments that predecessor supplied.
     for &p in &preds {
-        let p_term = *ctx.values.basic_blocks[p].instructions.last().unwrap();
-        let new_mnemonic = match ctx.values.instructions[p_term].mnemonic().clone() {
+        let p_term = *ctx.values.block(p).instructions.last().unwrap();
+        let new_mnemonic = match ctx.values.instruction(p_term).mnemonic().clone() {
             Mnemonic::Branch(br) => Mnemonic::Branch(Branch {
                 target,
                 args: substitute(&b_args, &params, &br.args),
@@ -605,7 +604,7 @@ mod tests {
         assert_eq!(blocks, [a], "branch-with-args chain should merge");
         assert!(BasicBlock::from_id(&ctx, b).parent().is_none());
 
-        let Mnemonic::Binop(Binary { lhs, .. }) = ctx.values.instructions[sum].mnemonic() else {
+        let Mnemonic::Binop(Binary { lhs, .. }) = ctx.values.instruction(sum).mnemonic() else {
             panic!("expected merged sum to be a binop");
         };
         assert_eq!(*lhs, ValueId::BlockParam(input));
@@ -664,7 +663,7 @@ mod tests {
         simplify_cfg(&mut ctx, f);
 
         assert!(
-            ctx.values.basic_blocks[b].instructions.is_empty(),
+            ctx.values.block(b).instructions.is_empty(),
             "absorbed block `b` must not retain its instructions after merge"
         );
     }

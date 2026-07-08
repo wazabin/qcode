@@ -53,10 +53,10 @@ impl ResolvedPath {
             // Deep clone the block
             let new_block_id = BasicBlock::clone_into_ctx(ctx, orig_block_id, &mut value_map);
 
-            let terminator = ctx.values.basic_blocks[orig_block_id]
+            let terminator = ctx.values.block(orig_block_id)
                 .instructions
                 .last()
-                .map(|&id| ctx.values.instructions[id].mnemonic().clone());
+                .map(|&id| ctx.values.instruction(id).mnemonic().clone());
 
             match terminator {
                 Some(Mnemonic::CBranch(cbranch)) => {
@@ -161,7 +161,7 @@ fn insert_trace_assert(
         let f = ctx.get_bool_const(false).id();
         let bool_ty = ctx.types.get_or_make_bool();
         let not_id = InstructionRef::from_mnemonic_with_type(
-            ctx,
+            ctx, block_id.func,
             Mnemonic::Binop(Binary {
                 op: Binop::Int(IntBinop::Equal),
                 lhs: condition,
@@ -178,7 +178,7 @@ fn insert_trace_assert(
 
     // Setup assert and insert it (along with not) before the cbranch
     let assert_id =
-        InstructionRef::from_mnemonic(ctx, Mnemonic::Assert(Assert { condition }), 0).id;
+        InstructionRef::from_mnemonic(ctx, block_id.func, Mnemonic::Assert(Assert { condition }), 0).id;
     BasicBlock::from_id_mut(ctx, block_id).insert_insn_before(cbranch_id, assert_id);
 }
 
@@ -187,7 +187,7 @@ fn wire_cbranch_to_next(ctx: &mut Context, block_id: BlockId, next_block_id: Blo
     BasicBlock::from_id_mut(ctx, block_id).pop_insn();
     ctx.add_cfg_edge(block_id, next_block_id);
     let branch_id = InstructionRef::from_mnemonic(
-        ctx,
+        ctx, block_id.func,
         Mnemonic::Branch(Branch {
             target: next_block_id,
             args: vec![],
@@ -213,7 +213,7 @@ fn wire_branch_to_next(ctx: &mut Context, block_id: BlockId, next_block_id: Bloc
     BasicBlock::from_id_mut(ctx, block_id).pop_insn();
     ctx.add_cfg_edge(block_id, next_block_id);
     let branch_id = InstructionRef::from_mnemonic(
-        ctx,
+        ctx, block_id.func,
         Mnemonic::Branch(Branch {
             target: next_block_id,
             args,

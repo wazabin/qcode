@@ -8,7 +8,7 @@ use crate::{
     space::{Space, SpaceId, SpaceRef, SpaceType},
     types::TypeId,
     value::{
-        BasicBlock, BlockId, BlockRef, FunctionRef, Value, ValueId,
+        BasicBlock, BlockId, BlockRef, FunctionId, FunctionRef, Value, ValueId,
         util::{
             base_ref::{BaseRef, WithCtx, WithCtxMut},
             named::{Named, Renameable, update_context_name},
@@ -54,8 +54,13 @@ pub use scan::Scan;
 pub use terminator::{Apply, Branch, BranchInd, CBranch, Call, CallInd, Return, ReturnValue};
 pub use unop::{Unary, Unop};
 
+/// Function-local instruction index. Storage detail: indexes the owning
+/// [`Function`](crate::value::Function)'s instruction arena. Pass composite
+/// [`InstructionId`]s around in pass code, not these.
 #[derive(Identifier)]
-pub struct InstructionId(usize);
+pub struct LocalInsnId(u32);
+
+crate::composite_id!(InstructionId, LocalInsnId);
 
 /// A local SSA value, which is a value that is defined by an instruction and can be used by other instructions.
 /// Local values are not associated with any particular memory location.
@@ -130,7 +135,7 @@ where
     Self: WithCtx<'s, 'ctx, 'str>,
 {
     fn inner(&'s self) -> &'ctx Instruction<'str> {
-        &self.ctx().values.instructions[self.id]
+        self.ctx().values.instruction(self.id)
     }
 
     /// The name of this instruction's output value
@@ -208,7 +213,9 @@ where
         if let Some(name) = self.name() {
             write!(f, "{ty} %{name}")
         } else {
-            let id: usize = self.id.into();
+            // Function-local index: `%tmp{local}` is unique within a function,
+            // which is the scope the parser resolves names in.
+            let id: usize = self.id.local.into();
             write!(f, "{ty} %tmp{id:x}")
         }
     }
@@ -217,26 +224,34 @@ where
 pub type InstructionRef<'str, 'ctx> = BaseRef<&'ctx Context<'str>, InstructionId>;
 
 impl<'str, 'ctx> InstructionRef<'str, 'ctx> {
-    /// Creates an instruction with a plain `Int(size)` result type.
-    pub fn from_mnemonic(ctx: &'ctx mut Context<'str>, mnemonic: Mnemonic, size: usize) -> Self {
+    /// Creates an instruction with a plain `Int(size)` result type, born into
+    /// `func`'s instruction arena. The result is detached (`parent == None`)
+    /// until a block appends it.
+    pub fn from_mnemonic(
+        ctx: &'ctx mut Context<'str>,
+        func: FunctionId,
+        mnemonic: Mnemonic,
+        size: usize,
+    ) -> Self {
         let type_id = ctx.types.get_or_make_int(size);
         let insn = Instruction::new(type_id, mnemonic);
-        let id = ctx.values.push_insn(insn);
+        let id = ctx.values.push_insn(func, insn);
         Self::from_id(ctx, id)
     }
 
-    /// Creates an instruction with an explicit [`TypeId`].
+    /// Creates an instruction with an explicit [`TypeId`], born into `func`.
     ///
     /// Pass a [`StackAddress`](crate::types::StackAddress) type id when the
     /// result is a stack-space pointer. Register-space provenance is silently
     /// demoted to `Int` (pointer arithmetic on registers is not meaningful).
     pub fn from_mnemonic_with_type(
         ctx: &'ctx mut Context<'str>,
+        func: FunctionId,
         mnemonic: Mnemonic,
         type_id: TypeId,
     ) -> Self {
         let insn = Instruction::new(type_id, mnemonic);
-        let id = ctx.values.push_insn(insn);
+        let id = ctx.values.push_insn(func, insn);
         Self::from_id(ctx, id)
     }
 
@@ -246,13 +261,14 @@ impl<'str, 'ctx> InstructionRef<'str, 'ctx> {
     /// the `space` tag. New code should use [`from_mnemonic_with_type`] directly.
     pub fn from_mnemonic_with_space(
         ctx: &'ctx mut Context<'str>,
+        func: FunctionId,
         mnemonic: Mnemonic,
         size: usize,
         _space: Option<SpaceId>,
     ) -> Self {
         let type_id = ctx.types.get_or_make_int(size);
         let insn = Instruction::new(type_id, mnemonic);
-        let id = ctx.values.push_insn(insn);
+        let id = ctx.values.push_insn(func, insn);
         Self::from_id(ctx, id)
     }
 
@@ -270,7 +286,7 @@ impl<'s, 'ctx: 's, 'str: 'ctx> WithCtx<'s, 'ctx, 'str> for InstructionRef<'str, 
 
 impl Named for InstructionRef<'_, '_> {
     fn name(&self) -> Option<&str> {
-        self.ctx.values.instructions[self.id].name.as_deref()
+        self.ctx.values.instruction(self.id).name.as_deref()
     }
 }
 
@@ -294,7 +310,7 @@ pub type InstructionMutRef<'str, 'ctx> = BaseRef<&'ctx mut Context<'str>, Instru
 
 impl<'str, 'ctx> InstructionMutRef<'str, 'ctx> {
     pub fn inner_mut(&mut self) -> &mut Instruction<'str> {
-        &mut self.ctx.values.instructions[self.id]
+        self.ctx.values.instruction_mut(self.id)
     }
 
     pub fn mnemonic_mut(&mut self) -> &mut Mnemonic {
@@ -386,7 +402,7 @@ impl<'s, 'ctx: 's, 'str: 'ctx> WithCtxMut<'s, 'str> for InstructionMutRef<'str, 
 
 impl Named for InstructionMutRef<'_, '_> {
     fn name(&self) -> Option<&str> {
-        self.ctx.values.instructions[self.id].name.as_deref()
+        self.ctx.values.instruction(self.id).name.as_deref()
     }
 }
 

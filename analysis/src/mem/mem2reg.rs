@@ -205,7 +205,7 @@ impl<'ctx, 'str> Mem2Reg<'ctx, 'str> {
                 size: load_size,
             })
         };
-        let new_id = InstructionRef::from_mnemonic(self.ctx, mnemonic, load_size).id;
+        let new_id = InstructionRef::from_mnemonic(self.ctx, block.func, mnemonic, load_size).id;
         BasicBlock::from_id_mut(self.ctx, block).insert_insn_before(before, new_id);
         ValueId::Instruction(new_id)
     }
@@ -216,10 +216,12 @@ impl<'ctx, 'str> Mem2Reg<'ctx, 'str> {
 /// creates). Keyed by `(variant, inner index)`; both halves are stable across runs.
 fn value_id_order_key(v: ValueId) -> (u8, usize) {
     match v {
+        // Composite IR ids key by their function-local index; mem2reg runs
+        // per-function, so the local index is a stable within-run order.
         ValueId::Literal(id) => (0, id.into()),
-        ValueId::Instruction(id) => (1, id.into()),
-        ValueId::BasicBlock(id) => (2, id.into()),
-        ValueId::BlockParam(id) => (3, id.into()),
+        ValueId::Instruction(id) => (1, usize::from(id.local)),
+        ValueId::BasicBlock(id) => (2, usize::from(id.local)),
+        ValueId::BlockParam(id) => (3, usize::from(id.local)),
         ValueId::Varnode(id) => (4, id.into()),
         ValueId::Function(id) => (5, id.into()),
         // `ValueId` is `#[non_exhaustive]`; keep any future variant last but stable.
@@ -505,7 +507,7 @@ impl Mem2Reg<'_, '_> {
         let param_id = BasicBlock::from_id_mut(self.ctx, block_id)
             .push_param(size)
             .id;
-        self.ctx.values.block_params[param_id].origin = Some(var);
+        self.ctx.values.block_param_mut(param_id).origin = Some(var);
         // Carry a global varnode type override (e.g. the `FS_OFFSET` segment base
         // typed `PtrTo<TEB>` by `windows_teb_seed`) onto the promoted param, so the
         // ambient register's richer type survives mem2reg instead of decaying to
@@ -514,10 +516,10 @@ impl Mem2Reg<'_, '_> {
         if let ValueId::Varnode(_) = var
             && let Some(ty) = self.ctx.stored_type_of(var)
         {
-            self.ctx.values.block_params[param_id].type_id = ty;
+            self.ctx.values.block_param_mut(param_id).type_id = ty;
         }
         if let Some(name) = name {
-            self.ctx.values.block_params[param_id].name = Some(Cow::Owned(name.to_owned()));
+            self.ctx.values.block_param_mut(param_id).name = Some(Cow::Owned(name.to_owned()));
         }
         (param_id, true)
     }
@@ -1127,7 +1129,7 @@ impl Mem2Reg<'_, '_> {
             .unwrap_or_default();
 
         for (var, param_id) in params {
-            let index = self.ctx.values.block_params[param_id].index;
+            let index = self.ctx.values.block_param(param_id).index;
             let (val, store_insn) = match decide_variable_value(var, &state.frames) {
                 Some(FrameEntry::Defined(reaching)) => (reaching.value, reaching.store_insn),
                 Some(FrameEntry::Clobbered) | None if self.is_register_var(var) => {
@@ -2128,7 +2130,7 @@ mod tests {
         let full_param = BasicBlock::from_id_mut(&mut tc.ctx, block_id)
             .push_param(8)
             .id;
-        tc.ctx.values.block_params[full_param].name = Some("r0".into());
+        tc.ctx.values.block_param_mut(full_param).name = Some("r0".into());
 
         {
             let mut b = Builder::from_context(&mut tc.ctx, 0x1000);
@@ -2171,8 +2173,8 @@ mod tests {
             .set_root(block)
             .unwrap();
         let pid = BasicBlock::from_id_mut(&mut tc.ctx, block).push_param(8).id;
-        tc.ctx.values.block_params[pid].origin = Some(ValueId::Varnode(sp_reg));
-        tc.ctx.values.block_params[pid].name = Some("RSP".into());
+        tc.ctx.values.block_param_mut(pid).origin = Some(ValueId::Varnode(sp_reg));
+        tc.ctx.values.block_param_mut(pid).name = Some("RSP".into());
         let sp = ValueId::BlockParam(pid);
 
         let mut b = Builder::from_context(&mut tc.ctx, 0x1000);
@@ -2245,7 +2247,7 @@ mod tests {
             .set_root(block)
             .unwrap();
         let pid = BasicBlock::from_id_mut(&mut tc.ctx, block).push_param(8).id;
-        tc.ctx.values.block_params[pid].origin = Some(ValueId::Varnode(sp_reg));
+        tc.ctx.values.block_param_mut(pid).origin = Some(ValueId::Varnode(sp_reg));
         let sp = ValueId::BlockParam(pid);
 
         {

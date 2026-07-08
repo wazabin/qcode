@@ -410,7 +410,7 @@ pub fn value_label(ctx: &Context, value: ValueId) -> String {
             let insn = Instruction::from_id(ctx, id);
             insn.name()
                 .map(|name| format!("%{name}"))
-                .unwrap_or_else(|| format!("%tmp{:x}", usize::from(id)))
+                .unwrap_or_else(|| format!("%tmp{:x}", usize::from(id.local)))
         }
         ValueId::BlockParam(_) | ValueId::Varnode(_) | ValueId::Literal(_) | ValueId::Bytes(_) => {
             ValueRef::new(value, ctx).to_string()
@@ -419,7 +419,7 @@ pub fn value_label(ctx: &Context, value: ValueId) -> String {
         ValueId::BasicBlock(id) => BasicBlock::from_id(ctx, id)
             .name()
             .map(|name| format!("<{name}>"))
-            .unwrap_or_else(|| format!("<bb_{:x}>", usize::from(id))),
+            .unwrap_or_else(|| format!("<bb_{:x}>", usize::from(id.local))),
         _ => format!("{value}"),
     }
 }

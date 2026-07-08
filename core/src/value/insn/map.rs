@@ -78,7 +78,7 @@ mod tests {
             (b.push_param(8).id(), b.push_param(4).id())
         };
         if let ValueId::BlockParam(pid) = src {
-            tc.ctx.values.block_params[pid].type_id = array_ty;
+            tc.ctx.values.block_param(pid).type_id = array_ty;
         }
 
         let plain = {
@@ -133,7 +133,7 @@ mod tests {
         // Type the source as the array (params default to int of their width)
         // *before* building the map, so the map's result type picks it up.
         if let ValueId::BlockParam(pid) = src {
-            tc.ctx.values.block_params[pid].type_id = array_ty;
+            tc.ctx.values.block_param(pid).type_id = array_ty;
         }
         let map_val = {
             let mut b = Builder::from_block(BasicBlock::from_id_mut(&mut tc.ctx, entry));

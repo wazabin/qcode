@@ -96,7 +96,7 @@ mod tests {
             )
         };
         if let ValueId::BlockParam(pid) = src {
-            tc.ctx.values.block_params[pid].type_id = array_ty;
+            tc.ctx.values.block_param(pid).type_id = array_ty;
         }
 
         let plain = {
@@ -151,7 +151,7 @@ mod tests {
             )
         };
         if let ValueId::BlockParam(pid) = src {
-            tc.ctx.values.block_params[pid].type_id = array_ty;
+            tc.ctx.values.block_param(pid).type_id = array_ty;
         }
         let scan_val = {
             let mut b = Builder::from_block(BasicBlock::from_id_mut(&mut tc.ctx, entry));

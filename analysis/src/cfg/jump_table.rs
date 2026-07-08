@@ -195,7 +195,7 @@ impl FunctionPass for HandleJumpTables {
             clear_successors(ctx, from);
             let from_addr = BasicBlock::from_id(ctx, from).address();
             for Edit { target, .. } in edits {
-                let tb = ctx.get_or_make_block(target);
+                let tb = ctx.get_or_make_block(target, fun_id);
                 Function::from_id_mut(ctx, fun_id).add_block(tb);
 
                 ctx.add_cfg_edge(from, tb);
@@ -207,7 +207,7 @@ impl FunctionPass for HandleJumpTables {
         // unconditional jump. Replace `BranchInd` with a direct `Branch`.
         for MakeBranch { from, target } in single_branches {
             let from_addr = BasicBlock::from_id(ctx, from).address();
-            let target_block = ctx.get_or_make_block(target);
+            let target_block = ctx.get_or_make_block(target, fun_id);
             Function::from_id_mut(ctx, fun_id).add_block(target_block);
 
             clear_successors(ctx, from);
@@ -226,8 +226,8 @@ impl FunctionPass for HandleJumpTables {
         } in branches
         {
             let from_addr = BasicBlock::from_id(ctx, from).address();
-            let true_block = ctx.get_or_make_block(true_target);
-            let false_block = ctx.get_or_make_block(false_target);
+            let true_block = ctx.get_or_make_block(true_target, fun_id);
+            let false_block = ctx.get_or_make_block(false_target, fun_id);
             Function::from_id_mut(ctx, fun_id).add_block(true_block);
             Function::from_id_mut(ctx, fun_id).add_block(false_block);
             discover(ctx, fn_entry, from_addr, true_target);

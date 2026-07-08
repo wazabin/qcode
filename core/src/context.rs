@@ -415,10 +415,10 @@ impl<'str> Context<'str> {
     ///
     /// The newly created block is named after the address in hex and registered
     /// in the address map.
-    pub fn get_or_make_block(&mut self, addr: u64) -> BlockId {
+    pub fn get_or_make_block(&mut self, addr: u64, func: FunctionId) -> BlockId {
         match BasicBlock::from_addr(self, addr) {
             Some(block) => block.id,
-            None => BasicBlock::make(self).with_address(addr).id,
+            None => BasicBlock::make(self, func).with_address(addr).id,
         }
     }
 
@@ -447,14 +447,14 @@ impl<'str> Context<'str> {
         }
     }
 
-    /// Returns a list of all blocks in the context
+    /// Returns a list of all live blocks in the context (across all functions).
     pub fn block_ids(&self) -> Vec<BlockId> {
-        self.values.basic_blocks.iter().map(|b| b.id).collect()
+        self.functions().flat_map(|f| f.block_ids()).collect()
     }
 
-    /// Returns a list of all instructions in the context
+    /// Returns a list of all live instructions in the context (across all functions).
     pub fn instruction_ids(&self) -> Vec<InstructionId> {
-        self.values.instructions.iter().map(|i| i.id).collect()
+        self.functions().flat_map(|f| f.instruction_ids()).collect()
     }
 
     /// Returns a list of all functions in the context
@@ -462,21 +462,31 @@ impl<'str> Context<'str> {
         self.values.functions.iter().map(|f| f.id).collect()
     }
 
-    /// Iterates over all the instructions in the context
-    pub fn instructions(&self) -> impl Iterator<Item = InstructionRef<'str, '_>> + '_ {
-        self.values
-            .instructions
-            .iter()
-            .filter(|i| !i.deleted)
-            .map(|i| Instruction::from_id(self, i.id))
+    /// `(total_slots, tombstones)` across every function's instruction arena.
+    /// Instruction storage is now per-function; this sums the arenas for the
+    /// whole-program fragmentation probe.
+    pub fn instruction_arena_stats(&self) -> (usize, usize) {
+        let mut total = 0;
+        let mut dead = 0;
+        for f in self.values.functions.iter() {
+            total += f.insns.len();
+            dead += f.insns.iter().filter(|i| i.deleted).count();
+        }
+        (total, dead)
     }
 
-    /// Iterates over all the blocks in the context
+    /// Iterates over all the (live) instructions in the context.
+    pub fn instructions(&self) -> impl Iterator<Item = InstructionRef<'str, '_>> + '_ {
+        self.instruction_ids()
+            .into_iter()
+            .map(|id| Instruction::from_id(self, id))
+    }
+
+    /// Iterates over all the (live) blocks in the context.
     pub fn blocks(&self) -> impl Iterator<Item = BlockRef<'str, '_>> + '_ {
-        self.values
-            .basic_blocks
-            .iter()
-            .map(|b| BlockRef::from_id(self, b.id))
+        self.block_ids()
+            .into_iter()
+            .map(|id| BlockRef::from_id(self, id))
     }
 
     /// Iterates over all the functions in the context
@@ -510,7 +520,10 @@ impl<'str> Context<'str> {
 
     /// Adds a directed edge in the CFG from `from` to `to`, returning its id.
     pub fn add_cfg_edge(&mut self, from: BlockId, to: BlockId) -> EdgeId {
-        let edge_id = self.values.edges.push(EdgeData { from, to });
+        // CFG edges are intra-function: `from` and `to` share a function, so the
+        // edge is born into that function's edge arena.
+        debug_assert_eq!(from.func, to.func, "CFG edge spans two functions");
+        let edge_id = self.values.push_edge(from.func, EdgeData { from, to });
         BasicBlock::from_id_mut(self, from).add_edge(edge_id);
         BasicBlock::from_id_mut(self, to).add_edge(edge_id);
         edge_id
@@ -522,7 +535,7 @@ impl<'str> Context<'str> {
     /// place (dangling), consistent with how removed instructions are handled;
     /// per-block traversal reads the block edge sets, which this updates.
     pub fn remove_cfg_edge(&mut self, edge_id: EdgeId) {
-        let EdgeData { from, to } = self.values.edges[edge_id];
+        let &EdgeData { from, to } = self.values.edge(edge_id);
         BasicBlock::from_id_mut(self, from).remove_edge(edge_id);
         BasicBlock::from_id_mut(self, to).remove_edge(edge_id);
     }
@@ -739,8 +752,8 @@ impl<'str> Context<'str> {
         match id {
             ValueId::Literal(lid) => self.values.literals[lid].type_id,
             ValueId::Bytes(bid) => self.values.bytes[bid].type_id,
-            ValueId::Instruction(iid) => self.values.instructions[iid].type_id,
-            ValueId::BlockParam(pid) => self.values.block_params[pid].type_id,
+            ValueId::Instruction(iid) => self.values.instruction(iid).type_id,
+            ValueId::BlockParam(pid) => self.values.block_param(pid).type_id,
             ValueId::Varnode(vid) => {
                 if let Some(&ty) = self.values.varnode_types.get(&vid) {
                     return ty;
@@ -763,8 +776,8 @@ impl<'str> Context<'str> {
         match id {
             ValueId::Literal(lid) => Some(self.values.literals[lid].type_id),
             ValueId::Bytes(bid) => Some(self.values.bytes[bid].type_id),
-            ValueId::Instruction(iid) => Some(self.values.instructions[iid].type_id),
-            ValueId::BlockParam(pid) => Some(self.values.block_params[pid].type_id),
+            ValueId::Instruction(iid) => Some(self.values.instruction(iid).type_id),
+            ValueId::BlockParam(pid) => Some(self.values.block_param(pid).type_id),
             ValueId::Varnode(vid) => self.values.varnode_types.get(&vid).copied(),
             ValueId::BasicBlock(_) | ValueId::Function(_) => None,
         }
@@ -806,7 +819,7 @@ impl<'str> Context<'str> {
     /// This is for transforms that change an instruction in place without
     /// changing its identity, parent block, address, or result type.
     pub fn replace_instruction_mnemonic(&mut self, id: InstructionId, mnemonic: Mnemonic) {
-        let old_args = self.values.instructions[id].mnemonic().args();
+        let old_args = self.values.instruction(id).mnemonic().args();
         for arg in old_args {
             let mut remove_arg = false;
             if let Some(users) = self.values.users.get_mut(&arg) {
@@ -820,7 +833,7 @@ impl<'str> Context<'str> {
 
         // Drop this instruction's old call edge (if it was a direct call) before
         // overwriting the mnemonic; the new one's edge is recorded below.
-        if let Some(target) = self.values.instructions[id].mnemonic().call_target()
+        if let Some(target) = self.values.instruction(id).mnemonic().call_target()
             && let Some(sites) = self.values.call_sites.get_mut(&target)
         {
             sites.retain(|&site| site != id);
@@ -828,10 +841,10 @@ impl<'str> Context<'str> {
 
         *Instruction::from_id_mut(self, id).mnemonic_mut() = mnemonic;
 
-        for arg in self.values.instructions[id].mnemonic().args() {
+        for arg in self.values.instruction(id).mnemonic().args() {
             self.values.users.entry(arg).or_default().push(id);
         }
-        if let Some(target) = self.values.instructions[id].mnemonic().call_target() {
+        if let Some(target) = self.values.instruction(id).mnemonic().call_target() {
             self.values.call_sites.entry(target).or_default().push(id);
         }
     }
@@ -844,11 +857,12 @@ impl<'str> Context<'str> {
     /// If the instruction has no parent block the block-list and parent steps are
     /// skipped, but name and users cleanup still runs.
     pub fn remove_instruction(&mut self, id: InstructionId) {
-        let parent = self.values.instructions[id].parent;
-        let name = self.values.instructions[id].name.clone();
+        let parent = self.values.instruction(id).parent;
+        let name = self.values.instruction(id).name.clone();
 
         if let Some(block_id) = parent {
-            self.values.basic_blocks[block_id]
+            self.values
+                .block_mut(block_id)
                 .instructions
                 .retain(|&i| i != id);
 
@@ -866,12 +880,12 @@ impl<'str> Context<'str> {
             }
         }
 
-        self.values.instructions[id].parent = None;
+        self.values.instruction_mut(id).parent = None;
 
         if let Some(ref n) = name {
             self.forget_name(n.as_ref());
         }
-        self.values.instructions[id].name = None;
+        self.values.instruction_mut(id).name = None;
 
         self.values.remove_instructions(&HashSet::from_iter([id]));
     }
@@ -1053,17 +1067,14 @@ impl<'str> Graph for Context<'str> {
     }
 
     fn nodes(&self) -> impl Iterator<Item = Self::Node<'_>> + '_ {
-        self.values
-            .basic_blocks
-            .iter()
-            .map(|block| BasicBlock::from_id(self, block.id))
+        self.block_ids()
+            .into_iter()
+            .map(|id| BasicBlock::from_id(self, id))
     }
 
     fn edges(&self) -> impl Iterator<Item = Self::Edge<'_>> + '_ {
-        self.values
-            .edges
-            .iter()
-            .map(|edge| EdgeRef::new(self, edge.id))
+        let ids: Vec<EdgeId> = self.functions().flat_map(|f| f.edge_ids()).collect();
+        ids.into_iter().map(move |id| EdgeRef::new(self, id))
     }
 }
 
@@ -1101,12 +1112,12 @@ mod tests {
     use qcode_macro::qcode;
 
     fn make_fn_with_blocks(ctx: &mut Context<'static>, name: &'static str, n: usize) -> FunctionId {
-        let block_ids: Vec<BlockId> = (0..n).map(|_| BasicBlock::make(ctx).id).collect();
-        let mut f = Function::make(ctx, name.into()).unwrap();
-        for id in block_ids {
-            f.add_block(id);
+        // The function must exist before its blocks so they are born into its arena.
+        let f = Function::make(ctx, name.into()).unwrap().id;
+        for _ in 0..n {
+            BasicBlock::make(ctx, f);
         }
-        f.id
+        f
     }
 
     #[test]
@@ -1496,7 +1507,7 @@ mod tests {
 
         // Manually detach from block without using remove_instruction,
         // simulating an instruction with no parent.
-        ctx.values.instructions[load_id].parent = None;
+        ctx.values.instruction(load_id).parent = None;
 
         // Should not panic even though parent is None.
         ctx.remove_instruction(load_id);

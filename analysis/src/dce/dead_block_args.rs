@@ -60,7 +60,7 @@ fn unique_incoming(
 
     let mut found: Option<ValueId> = None;
     for pred in preds {
-        let Some(&term_id) = ctx.values.basic_blocks[pred].instructions.last() else {
+        let Some(&term_id) = ctx.values.block(pred).instructions.last() else {
             continue;
         };
         let mut consider = |arg: ValueId| -> bool {
@@ -215,12 +215,12 @@ pub fn remove_dead_block_params(
     // Seed root + protected params live, then propagate liveness backwards along
     // the forwarding edges to a fixpoint: a param feeding a live param is live.
     if let Some(root) = root {
-        for &p in &ctx.values.basic_blocks[root].params {
+        for &p in &ctx.values.block(root).params {
             live.insert(p);
         }
     }
     for &(src, _) in &edges {
-        if ctx.values.block_params[src].protected {
+        if ctx.values.block_param(src).protected {
             live.insert(src);
         }
     }
@@ -240,7 +240,7 @@ pub fn remove_dead_block_params(
     // they never appear here; root params likewise).
     let mut dead_by_block: rustc_hash::FxHashMap<BlockId, HashSet<usize>> = Default::default();
     for &block in block_ids {
-        let params = ctx.values.basic_blocks[block].params.clone();
+        let params = ctx.values.block(block).params.clone();
         for (index, &p) in params.iter().enumerate() {
             if !live.contains(&p) {
                 dead_by_block.entry(block).or_default().insert(index);
@@ -265,7 +265,7 @@ fn forward_edges(
     target: BlockId,
     edges: &mut Vec<(BlockParamId, BlockParamId)>,
 ) {
-    let params = &ctx.values.basic_blocks[target].params;
+    let params = &ctx.values.block(target).params;
     for (i, &a) in args.iter().enumerate() {
         if let (ValueId::BlockParam(src), Some(&tgt)) = (a, params.get(i)) {
             edges.push((src, tgt));
@@ -304,9 +304,9 @@ fn find_congruent_param(
         {
             continue;
         }
-        let params = ctx.values.basic_blocks[block].params.clone();
+        let params = ctx.values.block(block).params.clone();
         for (index, &param) in params.iter().enumerate() {
-            if ctx.values.block_params[param].protected {
+            if ctx.values.block_param(param).protected {
                 continue;
             }
             if let Some(repl) = congruent_incoming(
@@ -354,7 +354,7 @@ fn congruent_incoming(
     let mut dom_repl: Option<ValueId> = None;
 
     for pred in preds {
-        let Some(&term_id) = ctx.values.basic_blocks[pred].instructions.last() else {
+        let Some(&term_id) = ctx.values.block(pred).instructions.last() else {
             continue;
         };
         for arg in incoming_args(ctx, term_id, block, index) {
@@ -419,9 +419,9 @@ fn find_redundant_param(
         {
             continue;
         }
-        let params = ctx.values.basic_blocks[block].params.clone();
+        let params = ctx.values.block(block).params.clone();
         for (index, &param) in params.iter().enumerate() {
-            if ctx.values.block_params[param].protected {
+            if ctx.values.block_param(param).protected {
                 continue;
             }
             if let Some(repl) = unique_incoming(ctx, block, index, ValueId::BlockParam(param)) {
@@ -439,17 +439,17 @@ pub(crate) fn remove_params_from_block(
     block: BlockId,
     dead_indices: &HashSet<usize>,
 ) {
-    let params = ctx.values.basic_blocks[block].params.clone();
+    let params = ctx.values.block(block).params.clone();
     let mut kept = Vec::with_capacity(params.len());
     for (i, &p) in params.iter().enumerate() {
         if dead_indices.contains(&i) {
-            ctx.values.block_params[p].parent = None;
+            ctx.values.block_param_mut(p).parent = None;
         } else {
-            ctx.values.block_params[p].index = kept.len();
+            ctx.values.block_param_mut(p).index = kept.len();
             kept.push(p);
         }
     }
-    ctx.values.basic_blocks[block].params = kept;
+    ctx.values.block_mut(block).params = kept;
 
     // A predecessor reaching `block` through both edges of a `CBranch` appears
     // twice; dedup so we rewrite its terminator exactly once.
@@ -459,7 +459,7 @@ pub(crate) fn remove_params_from_block(
         .collect();
 
     for pred in preds {
-        let Some(&term_id) = ctx.values.basic_blocks[pred].instructions.last() else {
+        let Some(&term_id) = ctx.values.block(pred).instructions.last() else {
             continue;
         };
         let new = match ctx.get_insn(term_id).mnemonic().clone() {

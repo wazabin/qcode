@@ -175,7 +175,7 @@ fn try_match_strlen(ctx: &Context, fid: FunctionId) -> Option<StrlenMatch> {
     let ValueId::BlockParam(pid) = index else {
         return None;
     };
-    let header = ctx.values.block_params[pid].parent?;
+    let header = ctx.values.block_param(pid).parent?;
     // The lane read must live in the header: the NUL test that governs the loop
     // reads it there, and the count is the index at that test.
     if ctx.get_insn(at_insn).parent().map(|b| b.id) != Some(header) {
@@ -606,7 +606,7 @@ mod tests {
 
         // Root params: arr:[i8;N], base_src, base_dst (the call interface).
         let arr_pid = BasicBlock::from_id_mut(&mut tc.ctx, entry).push_param(N).id;
-        tc.ctx.values.block_params[arr_pid].type_id = arr_ty;
+        tc.ctx.values.block_param_mut(arr_pid).type_id = arr_ty;
         let arr = ValueId::BlockParam(arr_pid);
         let base_src =
             ValueId::BlockParam(BasicBlock::from_id_mut(&mut tc.ctx, entry).push_param(8).id);
@@ -705,7 +705,7 @@ mod tests {
         }
 
         let arr_pid = BasicBlock::from_id_mut(&mut tc.ctx, entry).push_param(N).id;
-        tc.ctx.values.block_params[arr_pid].type_id = arr_ty;
+        tc.ctx.values.block_param_mut(arr_pid).type_id = arr_ty;
         let arr = ValueId::BlockParam(arr_pid);
         let base =
             ValueId::BlockParam(BasicBlock::from_id_mut(&mut tc.ctx, entry).push_param(8).id);
