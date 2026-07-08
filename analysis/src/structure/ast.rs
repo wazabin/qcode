@@ -29,6 +29,13 @@ pub enum Stmt {
     /// live in block parameters; structuring materializes the incoming-argument
     /// assignment as a statement on the edge that carries it.
     Assign { param: ValueId, value: ValueId },
+    /// `tmp<n> = value;` — saves a value that a cyclic phi copy on the same edge
+    /// is about to clobber, so a later [`Stmt::AssignTemp`] can read the
+    /// pre-transfer value. Temps are numbered per edge and used immediately.
+    SaveTemp { temp: usize, value: ValueId },
+    /// `param = tmp<n>;` — the phi copy that completes a cycle broken by a
+    /// [`Stmt::SaveTemp`].
+    AssignTemp { param: ValueId, temp: usize },
     /// `goto <label>;`
     Goto(BlockId),
     /// `if (<cond>) goto <label>;`
@@ -86,7 +93,13 @@ pub fn count_gotos(stmts: &[Stmt]) -> usize {
             Stmt::Switch { cases, default, .. } => {
                 cases.iter().map(|c| count_gotos(&c.body)).sum::<usize>() + count_gotos(default)
             }
-            Stmt::Label(_) | Stmt::Raw(_) | Stmt::Assign { .. } | Stmt::Break | Stmt::Continue => 0,
+            Stmt::Label(_)
+            | Stmt::Raw(_)
+            | Stmt::Assign { .. }
+            | Stmt::SaveTemp { .. }
+            | Stmt::AssignTemp { .. }
+            | Stmt::Break
+            | Stmt::Continue => 0,
         })
         .sum()
 }

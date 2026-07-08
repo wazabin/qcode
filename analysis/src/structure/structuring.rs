@@ -248,7 +248,11 @@ fn collect_validation(
                 }
                 collect_validation(ctx, default, labels, gotos, covered);
             }
-            Stmt::Assign { .. } | Stmt::Break | Stmt::Continue => {}
+            Stmt::Assign { .. }
+            | Stmt::SaveTemp { .. }
+            | Stmt::AssignTemp { .. }
+            | Stmt::Break
+            | Stmt::Continue => {}
         }
     }
 }
@@ -313,7 +317,42 @@ fn structure_regions_limited(ctx: &Context, function_id: FunctionId, max_depth: 
         max_depth,
         overflowed: false,
     };
-    let (stmts, _) = structurer.region(root_id, None, 0);
+    let (mut stmts, _) = structurer.region(root_id, None, 0);
+
+    // Emit continuation regions for virtualized edges. Structuring turns an edge
+    // it cannot fit into a schema (most commonly a loop's secondary exit) into a
+    // `goto`; a block reachable *only* through such an edge is never visited by
+    // the main walk, so its body would be dropped and the goto would dangle —
+    // demoting the whole function to flat lowering at validation. Instead, give
+    // every such goto a home: append each unvisited in-subgraph goto target as a
+    // labeled top-level region, repeating until no new targets appear (a
+    // continuation can itself virtualize further edges).
+    loop {
+        if structurer.overflowed {
+            break;
+        }
+        let mut targets = Vec::new();
+        collect_goto_targets(&stmts, &mut targets);
+        targets.retain(|b| structurer.node_set.contains(b) && !structurer.visited.contains(b));
+        targets.dedup();
+        if targets.is_empty() {
+            break;
+        }
+        for b in targets {
+            // An earlier continuation in this batch may already have emitted it.
+            if structurer.visited.contains(&b) {
+                continue;
+            }
+            // `region` labels join blocks itself; a single-predecessor target
+            // (reachable only through the virtualized edge) needs the label here.
+            if structurer.predecessor_count(b) <= 1 {
+                stmts.push(Stmt::Label(b));
+            }
+            let (cont, _) = structurer.region(b, None, 0);
+            stmts.extend(cont);
+        }
+    }
+
     // A pathologically deep region (a multi-thousand-arm comparison cascade)
     // would recurse deep enough to overflow the stack — which no `catch_unwind`
     // can recover. When the guard trips, discard the partial structuring and fall
@@ -321,6 +360,14 @@ fn structure_regions_limited(ctx: &Context, function_id: FunctionId, max_depth: 
     if structurer.overflowed {
         return lower_function(ctx, function_id);
     }
+
+    // The walk labels every join block (>1 predecessors) defensively, but a join
+    // whose incoming paths all structured away is never jumped to — drop those
+    // labels so structured output only shows labels a goto actually targets.
+    let mut used = Vec::new();
+    collect_goto_targets(&stmts, &mut used);
+    let used: HashSet<BlockId> = used.into_iter().collect();
+    prune_unused_labels(&mut stmts, &used);
     Program {
         function: Some(function_id),
         stmts,
@@ -632,6 +679,54 @@ fn loop_exit(
         .map(|(b, _)| b)
 }
 
+/// Collects every goto target in the statement tree, in emission order. Used to
+/// find the virtualized-edge targets that still need a continuation region.
+fn collect_goto_targets(stmts: &[Stmt], out: &mut Vec<BlockId>) {
+    for stmt in stmts {
+        match stmt {
+            Stmt::Goto(b) | Stmt::GotoIf { target: b, .. } => out.push(*b),
+            Stmt::If { then, els, .. } => {
+                collect_goto_targets(then, out);
+                collect_goto_targets(els, out);
+            }
+            Stmt::While { body, .. } | Stmt::DoWhile { body, .. } | Stmt::Loop { body } => {
+                collect_goto_targets(body, out);
+            }
+            Stmt::Switch { cases, default, .. } => {
+                for case in cases {
+                    collect_goto_targets(&case.body, out);
+                }
+                collect_goto_targets(default, out);
+            }
+            _ => {}
+        }
+    }
+}
+
+/// Removes every [`Stmt::Label`] whose block is not in `used` (the set of goto
+/// targets), recursing into structured bodies.
+fn prune_unused_labels(stmts: &mut Vec<Stmt>, used: &HashSet<BlockId>) {
+    stmts.retain(|s| !matches!(s, Stmt::Label(b) if !used.contains(b)));
+    for stmt in stmts {
+        match stmt {
+            Stmt::If { then, els, .. } => {
+                prune_unused_labels(then, used);
+                prune_unused_labels(els, used);
+            }
+            Stmt::While { body, .. } | Stmt::DoWhile { body, .. } | Stmt::Loop { body } => {
+                prune_unused_labels(body, used);
+            }
+            Stmt::Switch { cases, default, .. } => {
+                for case in cases {
+                    prune_unused_labels(&mut case.body, used);
+                }
+                prune_unused_labels(default, used);
+            }
+            _ => {}
+        }
+    }
+}
+
 /// Returns `head` extended by `tail` — used to place an edge's phi copies before
 /// the body of the arm that takes it.
 fn prepend(mut head: Vec<Stmt>, tail: Vec<Stmt>) -> Vec<Stmt> {
@@ -726,6 +821,46 @@ mod tests {
             has_if,
             "expected a populated if/else:\n{:#?}",
             program.stmts
+        );
+    }
+
+    #[test]
+    fn fully_structured_output_has_no_stray_labels() {
+        // The merge block of an if/else is a join (>1 predecessors), so the walk
+        // labels it defensively — but once both arms structure, nothing jumps to
+        // it and the label must be pruned from the output.
+        let mut ctx = Context::new();
+        qcode!(
+            ctx,
+            "
+            varnode i8 cond;
+            varnode i32 x;
+
+            fn f:
+            <entry>
+                %c = load(i8, &cond);
+                if %c goto <then_lbl> else goto <else_lbl>;
+            <then_lbl>
+                store(&x, i32 0x1);
+                goto <merge>;
+            <else_lbl>
+                store(&x, i32 0x2);
+                goto <merge>;
+            <merge>
+                local i64 ptr;
+                return [ptr];
+            "
+        );
+
+        let program = decompile_function(&ctx, f).unwrap();
+        let c = emit_c(&ctx, &program);
+        assert!(
+            !c.contains("merge:"),
+            "unreferenced join label should be pruned:\n{c}"
+        );
+        assert!(
+            !program.stmts.iter().any(|s| matches!(s, Stmt::Label(_))),
+            "goto-free output should carry no labels:\n{c}"
         );
     }
 
@@ -1055,6 +1190,60 @@ mod tests {
             "the cleanup exit body was dropped:\n{c}"
         );
         assert!(c.contains("0xbeef"), "the main exit body was dropped:\n{c}");
+    }
+
+    #[test]
+    fn two_exit_loop_structures_with_a_continuation_region() {
+        // Same shape as `loop_with_two_exits_drops_no_code`: the secondary exit
+        // edge is virtualized to a goto. With continuation regions the goto's
+        // target is emitted as a labeled region, so the function keeps its
+        // structured loop instead of demoting wholesale to flat lowering.
+        let mut ctx = Context::new();
+        qcode!(
+            ctx,
+            "
+            varnode i8 cond;
+            varnode i8 err;
+            varnode i32 x;
+
+            fn f:
+            <entry>
+                goto <head>;
+            <head>
+                %c = load(i8, &cond);
+                if %c goto <body> else goto <exit1>;
+            <body>
+                %e = load(i8, &err);
+                if %e goto <cleanup> else goto <head>;
+            <cleanup>
+                store(&x, i32 0xdead);
+                local i64 p1;
+                return [p1];
+            <exit1>
+                store(&x, i32 0xbeef);
+                local i64 p2;
+                return [p2];
+            "
+        );
+
+        let program = decompile_function(&ctx, f).unwrap();
+        let c = emit_c(&ctx, &program);
+        assert!(
+            has_loop(&program.stmts),
+            "the loop should stay structured, not fall back to flat:\n{c}"
+        );
+        // The virtualized exit is one goto; everything else is structured.
+        assert_eq!(program.goto_count(), 1, "expected exactly one goto:\n{c}");
+        // Both exit bodies survive, and the goto's target label is printed.
+        assert!(c.contains("0xdead"), "cleanup body dropped:\n{c}");
+        assert!(c.contains("0xbeef"), "main exit body dropped:\n{c}");
+        // Which exit gets virtualized is a tie-break; whichever it is, its goto
+        // must have a matching printed label.
+        assert!(
+            (c.contains("goto cleanup;") && c.contains("cleanup:"))
+                || (c.contains("goto exit1;") && c.contains("exit1:")),
+            "virtualized edge should have a labeled continuation:\n{c}"
+        );
     }
 
     #[test]

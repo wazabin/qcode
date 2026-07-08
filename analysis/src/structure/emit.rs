@@ -256,6 +256,22 @@ fn emit_stmt(
             buf.punct(";");
             out.push(buf.into_line(indent, None));
         }
+        Stmt::SaveTemp { temp, value } => {
+            let mut buf = LineBuf::default();
+            buf.push(temp_name(*temp), TokenKind::Variable);
+            assign(&mut buf);
+            lower_expr_rooted(ctx, *value, roots).write_tokens(&mut buf);
+            buf.punct(";");
+            out.push(buf.into_line(indent, None));
+        }
+        Stmt::AssignTemp { param, temp } => {
+            let mut buf = LineBuf::default();
+            lower_expr_rooted(ctx, *param, roots).write_tokens(&mut buf);
+            assign(&mut buf);
+            buf.push(temp_name(*temp), TokenKind::Variable);
+            buf.punct(";");
+            out.push(buf.into_line(indent, None));
+        }
         Stmt::Goto(target) => {
             let mut buf = LineBuf::default();
             buf.keyword("goto");
@@ -481,6 +497,12 @@ fn call_args(ctx: &Context, args: &[ValueId], roots: &HashSet<InstructionId>, bu
         lower_expr_rooted(ctx, arg, roots).write_tokens(buf);
     }
     buf.punct(")");
+}
+
+/// The display name of a phi-copy cycle temp. The `phi_` prefix keeps it clear
+/// of the `v*`/`p_*`/varnode namespaces.
+fn temp_name(n: usize) -> String {
+    format!("phi_tmp{n}")
 }
 
 fn assign(buf: &mut LineBuf) {

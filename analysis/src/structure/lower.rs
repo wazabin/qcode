@@ -126,24 +126,84 @@ fn lower_block(ctx: &Context, block: BlockRef<'_, '_>, out: &mut Vec<Stmt>) {
 /// `to`'s parameters paired with the argument `from`'s terminator passes for it,
 /// as `param = arg;` assignments.
 ///
-/// These are the SSA join copies. They are emitted as *sequential* assignments;
-/// a parallel copy where an argument reads a parameter also written on the same
-/// edge (e.g. a swap) is not sequentialized — rare after mem2reg, and left for a
-/// later pass. Identity copies (`p = p`) are dropped as no-ops.
+/// These are the SSA join copies, which have *parallel* semantics: every
+/// argument is evaluated in the pre-transfer state. Emitting them as sequential
+/// assignments is only correct in dependency order (a copy whose destination
+/// another copy still reads must come last), so the copies are sequentialized
+/// here; a dependency cycle (e.g. a swap `a=b, b=a`) is broken by saving one
+/// clobbered value into a temp ([`Stmt::SaveTemp`] / [`Stmt::AssignTemp`]).
+/// Identity copies (`p = p`) are dropped as no-ops.
 pub(crate) fn block_arg_moves(ctx: &Context, from: BlockId, to: BlockId) -> Vec<Stmt> {
     let args = edge_args(ctx, from, to);
     if args.is_empty() {
         return Vec::new();
     }
     let target = BasicBlock::from_id(ctx, to);
-    target
+    let copies: Vec<(ValueId, ValueId)> = target
         .params()
         .zip(args)
         .filter_map(|(param, arg)| {
             let param = ValueId::BlockParam(param.id);
-            (param != arg).then_some(Stmt::Assign { param, value: arg })
+            (param != arg).then_some((param, arg))
         })
-        .collect()
+        .collect();
+    sequentialize_copies(copies)
+}
+
+/// The source of a pending phi copy while sequentializing: the original IR
+/// value, or a temp holding its pre-transfer value after a cycle was broken.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum CopySrc {
+    Value(ValueId),
+    Temp(usize),
+}
+
+/// Orders the parallel copies `(param, arg)` into sequential statements that
+/// preserve their parallel semantics: a copy is emitted only once no pending
+/// copy still reads its destination. When no copy is emittable (a dependency
+/// cycle), one about-to-be-clobbered destination is saved into a fresh temp and
+/// its readers retargeted, which breaks the cycle.
+fn sequentialize_copies(copies: Vec<(ValueId, ValueId)>) -> Vec<Stmt> {
+    let mut pending: Vec<(ValueId, CopySrc)> = copies
+        .into_iter()
+        .map(|(p, a)| (p, CopySrc::Value(a)))
+        .collect();
+    let mut out = Vec::with_capacity(pending.len());
+    let mut temps = 0;
+    while !pending.is_empty() {
+        let ready = pending.iter().position(|&(param, _)| {
+            !pending
+                .iter()
+                .any(|&(other, src)| other != param && src == CopySrc::Value(param))
+        });
+        match ready {
+            Some(i) => {
+                let (param, src) = pending.remove(i);
+                out.push(match src {
+                    CopySrc::Value(value) => Stmt::Assign { param, value },
+                    CopySrc::Temp(temp) => Stmt::AssignTemp { param, temp },
+                });
+            }
+            None => {
+                // Every pending destination is still read by another copy: a
+                // cycle. Save one destination's pre-transfer value and retarget
+                // its readers to the temp; that copy becomes emittable.
+                let clobbered = pending[0].0;
+                let temp = temps;
+                temps += 1;
+                out.push(Stmt::SaveTemp {
+                    temp,
+                    value: clobbered,
+                });
+                for (_, src) in pending.iter_mut() {
+                    if *src == CopySrc::Value(clobbered) {
+                        *src = CopySrc::Temp(temp);
+                    }
+                }
+            }
+        }
+    }
+    out
 }
 
 /// The arguments `from`'s terminator passes along its edge to `to`, or empty if
@@ -250,6 +310,88 @@ mod tests {
             "true-edge phi copy should be guarded by the condition:\n{c}"
         );
         assert!(c.contains("w = 0x2"), "false-edge phi copy missing:\n{c}");
+    }
+
+    #[test]
+    fn swapped_phi_copies_go_through_a_temp() {
+        // The back edge passes `@a=@b @b=@a` — a parallel swap. Sequential
+        // assignments `a = b; b = a;` would lose `a`; the cycle must be broken
+        // with a temp: `t = a; a = b; b = t;` (in some order).
+        let mut ctx = Context::new();
+        qcode!(
+            ctx,
+            "
+            varnode i8 cond;
+            varnode i32 x;
+
+            fn f:
+            <entry>
+                goto <head @a=i32 0x1 @b=i32 0x2>;
+            <head @a:i32 @b:i32>
+                %c = load(i8, &cond);
+                if %c goto <head @a=@b @b=@a> else goto <exit_lbl>;
+            <exit_lbl>
+                store(&x, @a);
+                local i64 ptr;
+                return [ptr];
+            "
+        );
+
+        let program = lower_function(&ctx, f);
+        let c = emit_c(&ctx, &program);
+        assert!(
+            c.contains("phi_tmp0 = a;") || c.contains("phi_tmp0 = b;"),
+            "the swap cycle should save one value into a temp:\n{c}"
+        );
+        assert!(
+            c.contains("= phi_tmp0;"),
+            "the cycle-closing copy should read the temp:\n{c}"
+        );
+        // Exactly one side of the swap reads the temp; the other reads its
+        // partner directly. Both reading each other directly is the lost-value
+        // bug this guards against.
+        assert!(
+            c.contains("a = b;") != c.contains("b = a;"),
+            "exactly one direct copy plus one temp-closing copy expected:\n{c}"
+        );
+    }
+
+    #[test]
+    fn acyclic_phi_copies_are_ordered_without_a_temp() {
+        // `@a=@b @b=%n` reads `b` before overwriting it, so plain ordering
+        // (a = b first) suffices — no temp should appear.
+        let mut ctx = Context::new();
+        qcode!(
+            ctx,
+            "
+            varnode i8 cond;
+            varnode i32 x;
+
+            fn f:
+            <entry>
+                goto <head @a=i32 0x1 @b=i32 0x2>;
+            <head @a:i32 @b:i32>
+                %c = load(i8, &cond);
+                %n = i32 @b + i32 0x1;
+                if %c goto <head @a=@b @b=%n> else goto <exit_lbl>;
+            <exit_lbl>
+                store(&x, @a);
+                local i64 ptr;
+                return [ptr];
+            "
+        );
+
+        let program = lower_function(&ctx, f);
+        let c = emit_c(&ctx, &program);
+        assert!(!c.contains("phi_tmp"), "acyclic copies need no temp:\n{c}");
+        // The single-use increment folds into the copy, so the back edge reads
+        // `a = b; b = b + 0x1;` — and that order is mandatory.
+        let a_copy = c.find("a = b;").expect("a = b copy missing");
+        let b_copy = c.find("b = b + 0x1;").expect("b = b + 0x1 copy missing");
+        assert!(
+            a_copy < b_copy,
+            "`a = b` must run before `b` is overwritten:\n{c}"
+        );
     }
 
     #[test]
