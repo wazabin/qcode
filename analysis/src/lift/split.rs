@@ -62,6 +62,13 @@ pub fn split_overlapping_functions(ctx: &mut Context) -> bool {
     if remove_cross_function_edges(ctx) {
         changed_any = true;
     }
+    // Ownership and the CFG are now settled and each function's graph is closed
+    // over its own blocks. `reattribute_blocks` moved *ownership* (a block's
+    // `parent`/roster) without moving *storage* (`id.func`), so a function can own
+    // a block that lives in another function's arena. Callers that then check a
+    // function out for a function pass must first re-home those blocks so storage
+    // matches ownership — see [`Context::normalize_block_storage`], invoked at the
+    // pipeline's discovery-round boundary and after the initial recursive lift.
     changed_any
 }
 
@@ -503,5 +510,79 @@ mod tests {
             .iter()
             .copied()
             .collect()
+    }
+
+    /// A block *owned* by `F` but *stored* in another function's arena — exactly
+    /// the reattributed state `reattribute_blocks`/`lift_block` produce — must be
+    /// re-homed into `F`'s arena so ownership and storage agree, leaving the IR
+    /// (successors, opcodes) intact and the function checkout-safe.
+    #[test]
+    fn normalize_rehomes_reattributed_block() {
+        use qcode::value::insn::Mnemonic;
+        use qcode::value::util::host_mut::CheckedOut;
+
+        let mut ctx = Context::new();
+
+        let f = Function::make_at_addr(&mut ctx, 0x1000, Some(Cow::Borrowed("f"))).id;
+        let g = Function::make_at_addr(&mut ctx, 0x2000, Some(Cow::Borrowed("g"))).id;
+
+        // entry: stored in F, owned by F. body: born in *G*'s arena, then attached
+        // to F (parent = F, storage = G) — the entanglement.
+        let entry = BasicBlock::make(&mut ctx, f).with_address(0x1000).id;
+        let body = BasicBlock::make(&mut ctx, g).with_address(0x1008).id;
+        Function::from_id_mut(&mut ctx, f).add_block(body);
+        Function::from_id_mut(&mut ctx, f).set_root(entry).unwrap();
+
+        // `branch_at` (via `push_branch`) already wires the CFG edge entry -> body.
+        branch_at(&mut ctx, entry, body, 0x1000);
+        return_at(&mut ctx, body, 0x1008);
+
+        // Precondition: `body` is reattributed (stored in G, owned by F).
+        assert_eq!(body.func, g);
+        assert_eq!(ctx.values.block(body).parent, Some(f));
+
+        assert!(ctx.normalize_block_storage(), "expected a relocation");
+
+        // (a) Every one of F's roster blocks is now self-stored.
+        let f_blocks = Function::from_id(&ctx, f).block_ids();
+        assert_eq!(f_blocks.len(), 2);
+        for b in &f_blocks {
+            assert_eq!(
+                b.func, f,
+                "F still owns a foreign-stored block {b:?} after normalization",
+            );
+            assert_eq!(ctx.values.block(*b).parent, Some(f));
+        }
+        // The old storage in G is tombstoned and no longer owned.
+        assert!(ctx.values.block(body).deleted);
+
+        // (b) The CFG and opcodes are preserved: entry still branches to a single
+        // successor which is a `return` block, and F's root is still `entry`.
+        assert_eq!(ctx.values.functions[f].root, Some(entry));
+        let succ: Vec<BlockId> = BasicBlock::from_id(&ctx, entry)
+            .successors()
+            .map(|(_, s)| s)
+            .collect();
+        assert_eq!(succ.len(), 1, "entry must keep its single successor");
+        let new_body = succ[0];
+        assert_eq!(
+            new_body.func, f,
+            "the relocated body must live in F's arena"
+        );
+        assert_eq!(ctx.values.block(new_body).address, Some(0x1008));
+        let last = BasicBlock::from_id(&ctx, new_body)
+            .instructions()
+            .last()
+            .map(|i| i.mnemonic().clone());
+        assert!(
+            matches!(last, Some(Mnemonic::Return(_))),
+            "relocated body must still end in a return, got {last:?}",
+        );
+
+        // (c) F is now checkout-safe: `CheckedOut::new`'s debug-assert holds.
+        let mut fun = ctx.checkout_function(f);
+        let _co = CheckedOut::new(&mut fun, f, &ctx);
+        drop(_co);
+        ctx.checkin_function(f, fun);
     }
 }
