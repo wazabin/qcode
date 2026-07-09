@@ -549,6 +549,13 @@ where
         self.insert_insn(len, id);
     }
 
+    /// Inserts `insn_id` immediately before `before_id`. Panics if `before_id` is
+    /// not in this block. Delegates to [`HostMut::insert_insn_before`].
+    pub fn insert_insn_before(&mut self, before_id: InstructionId, insn_id: InstructionId) {
+        let id = self.id;
+        self.ctx.insert_insn_before(id, before_id, insn_id);
+    }
+
     /// Removes this block from its function (full cleanup + tombstone). Delegates
     /// to [`HostMut::delete_block`].
     pub fn delete(&mut self, function_id: FunctionId) {
@@ -648,18 +655,6 @@ impl<'str, 'ctx> BlockMutRef<'str, 'ctx> {
     /// Appends an already-created block parameter to the parameters list
     pub fn push_existing_param(&mut self, id: BlockParamId) {
         self.inner_mut().params.push(id);
-    }
-
-    /// Inserts an instruction before the instruction identified by `before_id` in this block.
-    /// Panics if `before_id` is not an instruction in this block.
-    pub fn insert_insn_before(&mut self, before_id: InstructionId, insn_id: InstructionId) {
-        let index = self
-            .inner()
-            .instructions
-            .iter()
-            .position(|&id| id == before_id)
-            .expect("before_id not found in block");
-        self.insert_insn(index, insn_id);
     }
 
     /// Inserts an instruction after the instruction identified by `after_id` in this block.

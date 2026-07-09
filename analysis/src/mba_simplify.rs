@@ -44,13 +44,11 @@
 
 use rustc_hash::FxHashMap as HashMap;
 
-use qcode::{
-    context::Context,
-    value::{
-        BasicBlock, Function, FunctionId, Instruction, InstructionRef, Value, ValueId, ValueRef,
-        block::BlockId,
-        insn::{Binary, Binop, InstructionId, IntBinop, Mnemonic, Unary, Unop},
-    },
+use qcode::value::{
+    FunctionId, FunctionRef, InstructionRef, Value, ValueId, ValueRef,
+    block::BlockId,
+    insn::{Binary, Binop, InstructionId, IntBinop, Mnemonic, Unary, Unop},
+    util::{base_ref::HostRef, host_mut::HostMut},
 };
 
 use rumba_core::{
@@ -59,68 +57,78 @@ use rumba_core::{
     varint::{VarInt, make_mask},
 };
 
-use crate::{FunctionPass, PipelineEnv};
+use crate::{FunctionBody, FunctionPassV2, ModuleView};
 
 #[derive(Default)]
 pub struct MbaSimplify;
 
-impl FunctionPass for MbaSimplify {
+impl FunctionPassV2 for MbaSimplify {
     const NAME: &'static str = "mba_simplify";
 
     fn description(&self) -> &'static str {
         "De-obfuscate integer MBA expressions via the rumba solver"
     }
 
-    fn run(
+    fn run<'str>(
         &self,
-        ctx: &mut Context,
-        fun_id: FunctionId,
-        _env: &PipelineEnv,
+        m: &ModuleView<'_, 'str>,
+        body: &mut FunctionBody<'str>,
     ) -> Result<bool, String> {
-        Ok(mba_simplify(ctx, fun_id))
+        let fid = body.id();
+        let mut host = body.host(m);
+        Ok(mba_simplify(&mut host, fid))
     }
 }
 
-crate::register_function_pass!(MbaSimplify);
+crate::register_function_pass_v2!(MbaSimplify);
+
+/// This function's instructions that use `v` (which must be a function-scoped
+/// SSA value — instruction or param). Routed through the read host.
+fn users_of<'a>(host: HostRef<'a, '_>, v: ValueId) -> &'a [InstructionId] {
+    match v.owning_function() {
+        Some(f) => host.function(f).users_of(v),
+        None => &[],
+    }
+}
 
 /// Maximum width rumba can model. Wider roots are skipped.
 const MAX_WIDTH_BYTES: usize = 8;
 
-pub fn mba_simplify(ctx: &mut Context, fun: FunctionId) -> bool {
-    let roots: Vec<InstructionId> = Function::from_id(ctx, fun)
+pub fn mba_simplify<'str, H: HostMut<'str>>(host: &mut H, fun: FunctionId) -> bool {
+    let roots: Vec<InstructionId> = FunctionRef::new(host.read_host(), fun)
         .blocks()
         .flat_map(|b| b.instruction_ids().to_vec())
-        .filter(|&iid| is_root(ctx, iid))
+        .filter(|&iid| is_root(host.read_host(), iid))
         .collect();
 
     let mut changed = false;
     for root in roots {
-        changed |= try_simplify_root(ctx, root);
+        changed |= try_simplify_root(host, root);
     }
     changed
 }
 
 /// A *maximal* MBA instruction: one that is live and is not a single-use
 /// operand of another same-width MBA instruction (which would subsume it).
-fn is_root(ctx: &Context, iid: InstructionId) -> bool {
-    if !is_mba_insn(ctx, iid) {
+fn is_root(host: HostRef, iid: InstructionId) -> bool {
+    if !is_mba_insn(host, iid) {
         return false;
     }
-    let users = ctx.users(ValueId::Instruction(iid));
+    let users = users_of(host, ValueId::Instruction(iid));
     if users.is_empty() {
         return false; // dead; leave for DCE / a prior root's prune
     }
     if users.len() == 1
-        && is_mba_insn(ctx, users[0])
-        && insn_size(ctx, users[0]) == insn_size(ctx, iid)
+        && is_mba_insn(host, users[0])
+        && insn_size(host, users[0]) == insn_size(host, iid)
     {
         return false; // subsumed by its parent region
     }
     true
 }
 
-fn try_simplify_root(ctx: &mut Context, root: InstructionId) -> bool {
-    let size = insn_size(ctx, root);
+fn try_simplify_root<'str, H: HostMut<'str>>(host: &mut H, root: InstructionId) -> bool {
+    let size = insn_size(host.read_host(), root);
     if size == 0 || size > MAX_WIDTH_BYTES {
         return false;
     }
@@ -131,7 +139,7 @@ fn try_simplify_root(ctx: &mut Context, root: InstructionId) -> bool {
     //    this is a genuine MBA: a *mix* of arithmetic and boolean ops, and more
     //    than a lone instruction.
     let mut c = Classify {
-        ctx,
+        host: host.read_host(),
         region: size,
         has_arith: false,
         has_bool: false,
@@ -143,10 +151,10 @@ fn try_simplify_root(ctx: &mut Context, root: InstructionId) -> bool {
         return false;
     }
 
-    // 2. Build the rumba `Expr` (immutable borrow, scoped so `ctx` is free after).
+    // 2. Build the rumba `Expr` (immutable borrow, scoped so `host` is free after).
     let (raw, leaves) = {
         let mut ex = Extract {
-            ctx: &*ctx,
+            host: host.read_host(),
             region: size,
             mask,
             leaves: Vec::new(),
@@ -169,13 +177,13 @@ fn try_simplify_root(ctx: &mut Context, root: InstructionId) -> bool {
     if cost(&pretty, mask) >= region_cost {
         return false;
     }
-    let block = Instruction::from_id(ctx, root)
+    let block = InstructionRef::new(host.read_host(), root)
         .parent()
         .expect("a root instruction lives in a block")
         .id;
-    let new_val = emit(ctx, &pretty, &leaves, size, mask, root, block);
-    ctx.replace_all_uses_with(root, new_val);
-    prune_dead(ctx, root);
+    let new_val = emit(host, &pretty, &leaves, size, mask, root, block);
+    host.replace_all_uses_with(ValueId::Instruction(root), new_val);
+    prune_dead(host, root);
     true
 }
 
@@ -198,7 +206,7 @@ fn simplify_mba_checked(raw: Expr, n: u8) -> Option<Expr> {
 // --- qcode subgraph -> rumba Expr ------------------------------------------
 
 struct Extract<'a, 'str> {
-    ctx: &'a Context<'str>,
+    host: HostRef<'a, 'str>,
     /// Region width in bytes; nodes of other widths are taken as opaque leaves.
     region: usize,
     mask: u64,
@@ -219,10 +227,10 @@ impl Extract<'_, '_> {
 
     /// Translate an operand: a constant, an inlinable MBA child, or a leaf.
     fn child(&mut self, v: ValueId) -> Expr {
-        if let Some(c) = numeric_const(self.ctx, v) {
+        if let Some(c) = numeric_const(self.host, v) {
             return Expr::Const(VarInt::from(c & self.mask));
         }
-        match inlinable_child(self.ctx, self.region, v) {
+        match inlinable_child(self.host, self.region, v) {
             Some(iid) => self.expand(iid),
             None => self.leaf(v),
         }
@@ -230,7 +238,7 @@ impl Extract<'_, '_> {
 
     /// Translate an MBA instruction's whole subtree.
     fn expand(&mut self, iid: InstructionId) -> Expr {
-        match Instruction::from_id(self.ctx, iid).mnemonic() {
+        match InstructionRef::new(self.host, iid).mnemonic() {
             Mnemonic::Binop(b) => {
                 let (lhs, rhs) = (b.lhs, b.rhs);
                 match int_op(&b.op).expect("is_mba_insn gates the opset") {
@@ -246,7 +254,7 @@ impl Extract<'_, '_> {
                     IntBinop::Xor => Expr::Xor(vec![self.child(lhs), self.child(rhs)]),
                     IntBinop::ShiftLeft => {
                         // `x << c` with constant `c < width` is `x * 2^c`.
-                        let c = numeric_const(self.ctx, rhs).expect("shl gate ensures const");
+                        let c = numeric_const(self.host, rhs).expect("shl gate ensures const");
                         let factor = 1u64.wrapping_shl(c as u32) & self.mask;
                         Expr::Scale(VarInt::from(factor), Box::new(self.child(lhs)))
                     }
@@ -278,7 +286,7 @@ enum OpClass {
 /// and instruction count — so a non-MBA region is rejected before any rumba
 /// `Expr` is allocated.
 struct Classify<'a, 'str> {
-    ctx: &'a Context<'str>,
+    host: HostRef<'a, 'str>,
     region: usize,
     has_arith: bool,
     has_bool: bool,
@@ -288,16 +296,16 @@ struct Classify<'a, 'str> {
 impl Classify<'_, '_> {
     fn visit(&mut self, iid: InstructionId) {
         self.count += 1;
-        match mba_class(self.ctx, iid) {
+        match mba_class(self.host, iid) {
             Some(OpClass::Arith) => self.has_arith = true,
             Some(OpClass::Bool) => self.has_bool = true,
             None => {}
         }
-        for op in Instruction::from_id(self.ctx, iid).mnemonic().args() {
-            if numeric_const(self.ctx, op).is_some() {
+        for op in InstructionRef::new(self.host, iid).mnemonic().args() {
+            if numeric_const(self.host, op).is_some() {
                 continue;
             }
-            if let Some(child) = inlinable_child(self.ctx, self.region, op) {
+            if let Some(child) = inlinable_child(self.host, self.region, op) {
                 self.visit(child);
             }
         }
@@ -411,8 +419,8 @@ fn cost(e: &Expr, mask: u64) -> usize {
 // --- rumba Expr -> qcode subgraph ------------------------------------------
 
 #[allow(clippy::too_many_arguments)]
-fn emit(
-    ctx: &mut Context,
+fn emit<'str, H: HostMut<'str>>(
+    host: &mut H,
     e: &Expr,
     leaves: &[ValueId],
     size: usize,
@@ -422,11 +430,11 @@ fn emit(
 ) -> ValueId {
     match e {
         Expr::Var(VarId(i)) => leaves[*i],
-        Expr::Const(c) => ctx.get_const(c.get(mask), size).id(),
+        Expr::Const(c) => host.shared().get_const(c.get(mask), size).id(),
         Expr::Not(x) => {
-            let xv = emit(ctx, x, leaves, size, mask, before, block);
+            let xv = emit(host, x, leaves, size, mask, before, block);
             push_insn(
-                ctx,
+                host,
                 Mnemonic::Unop(Unary {
                     op: Unop::IntNot,
                     src: xv,
@@ -439,26 +447,26 @@ fn emit(
         Expr::Scale(c, x) => {
             let cv = c.get(mask);
             if cv == 0 {
-                return ctx.get_const(0, size).id();
+                return host.shared().get_const(0, size).id();
             }
-            let xv = emit(ctx, x, leaves, size, mask, before, block);
+            let xv = emit(host, x, leaves, size, mask, before, block);
             if cv == 1 {
                 return xv;
             }
-            let cval = ctx.get_const(cv, size).id();
-            push_binop(ctx, IntBinop::Mul, cval, xv, size, before, block)
+            let cval = host.shared().get_const(cv, size).id();
+            push_binop(host, IntBinop::Mul, cval, xv, size, before, block)
         }
-        Expr::And(v) => fold_emit(ctx, v, IntBinop::And, leaves, size, mask, before, block),
-        Expr::Or(v) => fold_emit(ctx, v, IntBinop::Or, leaves, size, mask, before, block),
-        Expr::Xor(v) => fold_emit(ctx, v, IntBinop::Xor, leaves, size, mask, before, block),
-        Expr::Add(v) => fold_emit(ctx, v, IntBinop::Add, leaves, size, mask, before, block),
-        Expr::Mul(v) => fold_emit(ctx, v, IntBinop::Mul, leaves, size, mask, before, block),
+        Expr::And(v) => fold_emit(host, v, IntBinop::And, leaves, size, mask, before, block),
+        Expr::Or(v) => fold_emit(host, v, IntBinop::Or, leaves, size, mask, before, block),
+        Expr::Xor(v) => fold_emit(host, v, IntBinop::Xor, leaves, size, mask, before, block),
+        Expr::Add(v) => fold_emit(host, v, IntBinop::Add, leaves, size, mask, before, block),
+        Expr::Mul(v) => fold_emit(host, v, IntBinop::Mul, leaves, size, mask, before, block),
     }
 }
 
 #[allow(clippy::too_many_arguments)]
-fn fold_emit(
-    ctx: &mut Context,
+fn fold_emit<'str, H: HostMut<'str>>(
+    host: &mut H,
     operands: &[Expr],
     op: IntBinop,
     leaves: &[ValueId],
@@ -474,18 +482,18 @@ fn fold_emit(
             IntBinop::Mul => 1,
             _ => 0,
         };
-        return ctx.get_const(id, size).id();
+        return host.shared().get_const(id, size).id();
     }
-    let mut acc = emit(ctx, &operands[0], leaves, size, mask, before, block);
+    let mut acc = emit(host, &operands[0], leaves, size, mask, before, block);
     for e in &operands[1..] {
-        let rhs = emit(ctx, e, leaves, size, mask, before, block);
-        acc = push_binop(ctx, op, acc, rhs, size, before, block);
+        let rhs = emit(host, e, leaves, size, mask, before, block);
+        acc = push_binop(host, op, acc, rhs, size, before, block);
     }
     acc
 }
 
-fn push_binop(
-    ctx: &mut Context,
+fn push_binop<'str, H: HostMut<'str>>(
+    host: &mut H,
     op: IntBinop,
     lhs: ValueId,
     rhs: ValueId,
@@ -494,7 +502,7 @@ fn push_binop(
     block: BlockId,
 ) -> ValueId {
     push_insn(
-        ctx,
+        host,
         Mnemonic::Binop(Binary {
             op: Binop::Int(op),
             lhs,
@@ -506,28 +514,32 @@ fn push_binop(
     )
 }
 
-fn push_insn(
-    ctx: &mut Context,
+fn push_insn<'str, H: HostMut<'str>>(
+    host: &mut H,
     mnemonic: Mnemonic,
     size: usize,
     before: InstructionId,
     block: BlockId,
 ) -> ValueId {
-    let id = InstructionRef::from_mnemonic(ctx, block.func, mnemonic, size).id;
-    BasicBlock::from_id_mut(ctx, block).insert_insn_before(before, id);
+    let id = host.push_mnemonic(block.func, mnemonic, size);
+    host.insert_insn_before(block, before, id);
     ValueId::Instruction(id)
 }
 
 /// Remove `iid` and any operand subtree that becomes userless once it is gone.
-fn prune_dead(ctx: &mut Context, iid: InstructionId) {
-    if !ctx.users(ValueId::Instruction(iid)).is_empty() {
+fn prune_dead<'str, H: HostMut<'str>>(host: &mut H, iid: InstructionId) {
+    if !users_of(host.read_host(), ValueId::Instruction(iid)).is_empty() {
         return;
     }
-    let operands = Instruction::from_id(ctx, iid).mnemonic().args();
-    ctx.remove_instruction(iid);
+    let operands = InstructionRef::new(host.read_host(), iid)
+        .mnemonic()
+        .args()
+        .into_iter()
+        .collect::<Vec<_>>();
+    host.remove_instruction(iid);
     for op in operands {
         if let ValueId::Instruction(child) = op {
-            prune_dead(ctx, child);
+            prune_dead(host, child);
         }
     }
 }
@@ -544,11 +556,11 @@ fn int_op(op: &Binop) -> Option<IntBinop> {
 /// An MBA child of `v` to inline (instruction, same width, modelable op, used
 /// only here), or `None` if `v` should be an opaque leaf. Callers handle
 /// constants before reaching this.
-fn inlinable_child(ctx: &Context, region: usize, v: ValueId) -> Option<InstructionId> {
+fn inlinable_child(host: HostRef, region: usize, v: ValueId) -> Option<InstructionId> {
     if let ValueId::Instruction(iid) = v
-        && value_size(ctx, v) == region
-        && is_mba_insn(ctx, iid)
-        && ctx.users(v).len() == 1
+        && value_size(host, v) == region
+        && is_mba_insn(host, iid)
+        && users_of(host, v).len() == 1
     {
         return Some(iid);
     }
@@ -556,8 +568,8 @@ fn inlinable_child(ctx: &Context, region: usize, v: ValueId) -> Option<Instructi
 }
 
 /// The MBA half an instruction's operator belongs to (`None` if not modelable).
-fn mba_class(ctx: &Context, iid: InstructionId) -> Option<OpClass> {
-    match Instruction::from_id(ctx, iid).mnemonic() {
+fn mba_class(host: HostRef, iid: InstructionId) -> Option<OpClass> {
+    match InstructionRef::new(host, iid).mnemonic() {
         Mnemonic::Binop(b) => match int_op(&b.op)? {
             IntBinop::Add | IntBinop::Sub | IntBinop::Mul | IntBinop::ShiftLeft => {
                 Some(OpClass::Arith)
@@ -576,8 +588,8 @@ fn mba_class(ctx: &Context, iid: InstructionId) -> Option<OpClass> {
 
 /// Is `iid` an integer op this pass can model? `shl` qualifies only with a
 /// constant shift below the operand width (so it is exactly `x * 2^c`).
-fn is_mba_insn(ctx: &Context, iid: InstructionId) -> bool {
-    match Instruction::from_id(ctx, iid).mnemonic() {
+fn is_mba_insn(host: HostRef, iid: InstructionId) -> bool {
+    match InstructionRef::new(host, iid).mnemonic() {
         Mnemonic::Binop(b) => match b.op {
             Binop::Int(o) => match o {
                 IntBinop::Add
@@ -587,8 +599,8 @@ fn is_mba_insn(ctx: &Context, iid: InstructionId) -> bool {
                 | IntBinop::Or
                 | IntBinop::Xor => true,
                 IntBinop::ShiftLeft => {
-                    let bits = (insn_size(ctx, iid) * 8) as u64;
-                    matches!(numeric_const(ctx, b.rhs), Some(c) if c < bits)
+                    let bits = (insn_size(host, iid) * 8) as u64;
+                    matches!(numeric_const(host, b.rhs), Some(c) if c < bits)
                 }
                 _ => false,
             },
@@ -600,9 +612,9 @@ fn is_mba_insn(ctx: &Context, iid: InstructionId) -> bool {
 }
 
 /// The constant value of `v`, if it is a plain (non-symbolic) integer literal.
-fn numeric_const(ctx: &Context, v: ValueId) -> Option<u64> {
+fn numeric_const(host: HostRef, v: ValueId) -> Option<u64> {
     if let ValueId::Literal(id) = v {
-        let lit = &ctx.values.literals[id];
+        let lit = &host.shared().values.literals[id];
         if lit.symbolic.is_none() {
             return Some(lit.value);
         }
@@ -610,18 +622,22 @@ fn numeric_const(ctx: &Context, v: ValueId) -> Option<u64> {
     None
 }
 
-fn insn_size(ctx: &Context, iid: InstructionId) -> usize {
-    Instruction::from_id(ctx, iid).size()
+fn insn_size(host: HostRef, iid: InstructionId) -> usize {
+    InstructionRef::new(host, iid).size()
 }
 
-fn value_size(ctx: &Context, v: ValueId) -> usize {
-    ValueRef::new(v, ctx).size()
+fn value_size(host: HostRef, v: ValueId) -> usize {
+    ValueRef::from_host(host, v).size()
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use qcode::value::insn::Mnemonic;
+    use qcode::{
+        context::Context,
+        value::{BasicBlock, Function, Instruction},
+    };
     use qcode_emulator::{SizedValue, StandaloneEmulator};
     use qcode_macro::qcode;
 
@@ -729,7 +745,7 @@ mod tests {
         let before = sample(&ctx, r1);
         let n_before = insn_total(&ctx, r1);
 
-        assert!(mba_simplify(&mut ctx, r1));
+        assert!(mba_simplify(&mut &mut ctx, r1));
 
         // Return is now a single `~a`.
         let ret = return_value(&ctx, r1);
@@ -771,7 +787,7 @@ mod tests {
         let before = sample(&ctx, r2);
         let n_before = insn_total(&ctx, r2);
 
-        assert!(mba_simplify(&mut ctx, r2));
+        assert!(mba_simplify(&mut &mut ctx, r2));
 
         let ret = return_value(&ctx, r2);
         let ValueId::Instruction(iid) = ret else {
@@ -812,7 +828,7 @@ mod tests {
             "
         );
         let before = sample(&ctx, r2k);
-        assert!(mba_simplify(&mut ctx, r2k));
+        assert!(mba_simplify(&mut &mut ctx, r2k));
         assert_eq!(sample(&ctx, r2k), before);
         // a * K at 32 bits.
         let k = 0x6c07_8965u64;
@@ -831,7 +847,7 @@ mod tests {
                 return %r;
             "
         );
-        assert!(!mba_simplify(&mut ctx, single));
+        assert!(!mba_simplify(&mut &mut ctx, single));
     }
 
     #[test]
@@ -848,7 +864,7 @@ mod tests {
                 return %r;
             "
         );
-        assert!(!mba_simplify(&mut ctx, arith));
+        assert!(!mba_simplify(&mut &mut ctx, arith));
     }
 
     #[test]
@@ -866,6 +882,6 @@ mod tests {
                 return %r;
             "
         );
-        assert!(!mba_simplify(&mut ctx, bits));
+        assert!(!mba_simplify(&mut &mut ctx, bits));
     }
 }

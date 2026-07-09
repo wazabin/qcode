@@ -445,7 +445,7 @@ mod tests {
         // And/Or results and hide the boolean half of the MBA.
         let root = Function::from_id(&ctx, mtmul).root().expect("root").id;
         while crate::dce::remove_dead_insns(&mut ctx, root) {}
-        assert!(mba_simplify(&mut ctx, mtmul));
+        assert!(mba_simplify(&mut &mut ctx, mtmul));
 
         assert_eq!(sample(&ctx, mtmul), before);
         let k = 0x6c07_8965u64;

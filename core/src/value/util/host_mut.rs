@@ -164,6 +164,34 @@ pub trait HostMut<'str> {
         BlockParamId::new(func, local)
     }
 
+    /// Mint a fresh `Int(size)`-typed instruction with `mnemonic` into `func`'s
+    /// arena (host-routed equivalent of `InstructionRef::from_mnemonic`): the type
+    /// is minted in shared storage through the interner's `&self` path.
+    fn push_mnemonic(
+        &mut self,
+        func: FunctionId,
+        mnemonic: Mnemonic,
+        size: usize,
+    ) -> InstructionId {
+        let type_id = self.shared().types.get_or_make_int(size);
+        let insn = Instruction::new(type_id, mnemonic);
+        self.push_insn(func, insn)
+    }
+
+    /// Insert `insn` immediately before `before` in `block`, setting its parent.
+    /// Panics if `before` is not in `block`.
+    fn insert_insn_before(&mut self, block: BlockId, before: InstructionId, insn: InstructionId) {
+        let index = self
+            .read_host()
+            .block(block)
+            .instructions
+            .iter()
+            .position(|&i| i == before)
+            .expect("before not in block");
+        self.instruction_mut(insn).parent = Some(block);
+        self.block_mut(block).instructions.insert(index, insn);
+    }
+
     // ---- CFG / use-map verbs (mirror the `Context` inherent methods) ---------
 
     /// Whether this host may mutate `block`'s arena. Always `true` on the module
