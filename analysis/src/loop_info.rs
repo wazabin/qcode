@@ -21,9 +21,9 @@ use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
 use qcode::{
     context::Context,
     value::{
-        BasicBlock, BlockId, BlockRef, FunctionId, FunctionRef, ValueId,
-        insn::{Binary, Binop, Branch, CBranch, IntBinop, Mnemonic},
-        util::base_ref::HostRef,
+        BlockId, BlockRef, FunctionId, FunctionRef, ValueId,
+        insn::{Binary, Binop, Branch, CBranch, InstructionId, IntBinop, Mnemonic},
+        util::{base_ref::HostRef, host_mut::HostMut},
     },
 };
 
@@ -151,8 +151,12 @@ pub(crate) fn incoming<'a, 'str: 'a>(
 /// is the successor that is **not** itself a header predecessor, and the "stay"
 /// (loop-body side) is the other. `None` if the header does not end in a
 /// `CBranch`, or neither/both successors are header predecessors.
-pub(crate) fn cbranch_exit(ctx: &Context, header: BlockId) -> Option<(BlockId, BlockId)> {
-    let hterm = BasicBlock::from_id(ctx, header).iter().last()?;
+pub(crate) fn cbranch_exit<'a, 'str: 'a>(
+    host: impl Into<HostRef<'a, 'str>>,
+    header: BlockId,
+) -> Option<(BlockId, BlockId)> {
+    let host = host.into();
+    let hterm = BlockRef::new(host, header).iter().last()?;
     let Mnemonic::CBranch(CBranch {
         success_block: sb,
         failure_block: fb,
@@ -162,7 +166,7 @@ pub(crate) fn cbranch_exit(ctx: &Context, header: BlockId) -> Option<(BlockId, B
         return None;
     };
     let (sb, fb) = (*sb, *fb);
-    let preds: HashSet<BlockId> = BasicBlock::from_id(ctx, header)
+    let preds: HashSet<BlockId> = BlockRef::new(host, header)
         .predecessors()
         .map(|(_, p)| p)
         .collect();
@@ -175,20 +179,34 @@ pub(crate) fn cbranch_exit(ctx: &Context, header: BlockId) -> Option<(BlockId, B
     }
 }
 
+/// The instructions using SSA value `v`, read from its owning function through
+/// the host (empty for shared values — literals/varnodes — which the loop
+/// helpers never define).
+pub(crate) fn users_of<'a, 'str: 'a>(host: HostRef<'a, 'str>, v: ValueId) -> &'a [InstructionId] {
+    match v.owning_function() {
+        Some(f) => host.function(f).users_of(v),
+        None => &[],
+    }
+}
+
 /// `true` if the loop is wholly private: every value defined by `blocks` (params
 /// and instructions) is used only inside `blocks`. Such a loop computes nothing
 /// observable outside it once its escaping values have been rerouted, so it can
 /// be deleted.
-pub(crate) fn is_loop_private(ctx: &Context, blocks: &[BlockId]) -> bool {
+pub(crate) fn is_loop_private<'a, 'str: 'a>(
+    host: impl Into<HostRef<'a, 'str>>,
+    blocks: &[BlockId],
+) -> bool {
+    let host = host.into();
     let in_loop = |v: ValueId| {
-        ctx.users(v).iter().all(|&u| {
-            ctx.get_insn(u)
+        users_of(host, v).iter().all(|&u| {
+            qcode::value::InstructionRef::new(host, u)
                 .parent()
                 .is_some_and(|b| blocks.contains(&b.id))
         })
     };
     blocks.iter().all(|&blk| {
-        let b = BasicBlock::from_id(ctx, blk);
+        let b = BlockRef::new(host, blk);
         b.params().all(|p| in_loop(p.id())) && b.iter().all(|i| in_loop(ValueId::Instruction(i.id)))
     })
 }
@@ -198,30 +216,30 @@ pub(crate) fn is_loop_private(ctx: &Context, blocks: &[BlockId]) -> bool {
 /// preheader-available values), add the new CFG edge, then delete the loop
 /// `blocks`. `preheader` is assumed to end in a terminator; if it somehow does
 /// not, the reroute is skipped but the blocks are still deleted.
-pub(crate) fn delete_private_loop(
-    ctx: &mut Context,
+pub(crate) fn delete_private_loop<'str, H: HostMut<'str>>(
+    host: &mut H,
     fid: FunctionId,
     preheader: BlockId,
     blocks: &[BlockId],
     exit: BlockId,
     exit_args: Vec<ValueId>,
 ) {
-    if let Some(term_id) = BasicBlock::from_id(ctx, preheader)
+    if let Some(term_id) = BlockRef::new(host.read_host(), preheader)
         .iter()
         .last()
         .map(|t| t.id)
     {
-        ctx.replace_instruction_mnemonic(
+        host.replace_instruction_mnemonic(
             term_id,
             Mnemonic::Branch(Branch {
                 target: exit,
                 args: exit_args,
             }),
         );
-        ctx.add_cfg_edge(preheader, exit);
+        host.add_cfg_edge(preheader, exit);
     }
     for &blk in blocks {
-        BasicBlock::from_id_mut(ctx, blk).delete(fid);
+        host.delete_block(blk, fid);
     }
 }
 
@@ -576,6 +594,7 @@ mod tests {
     use qcode_macro::qcode;
 
     use super::*;
+    use qcode::value::BasicBlock;
 
     fn param(ctx: &Context, block: BlockId, name: &str) -> ValueId {
         BasicBlock::from_id(ctx, block)

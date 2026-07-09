@@ -12,11 +12,11 @@
 //! own semantics on top.
 
 use qcode::{
-    context::Context,
     types::TypeId,
     value::{
-        BasicBlock, BlockId, Function, FunctionId, ValueId,
+        BlockId, BlockRef, FunctionId, FunctionRef, InstructionRef, ValueId,
         insn::{InstructionId, IntrinsicApp, IntrinsicId, Mnemonic},
+        util::base_ref::HostRef,
     },
 };
 
@@ -53,28 +53,32 @@ pub(crate) struct CarriedArray {
 
 /// Find the unique carried array in `fid`. Returns None when there is no
 /// carried array OR more than one (not the canonical shape).
-pub(crate) fn find_carried_array(ctx: &mut Context, fid: FunctionId) -> Option<CarriedArray> {
+pub(crate) fn find_carried_array<'a, 'str: 'a>(
+    host: impl Into<HostRef<'a, 'str>>,
+    fid: FunctionId,
+) -> Option<CarriedArray> {
+    let host = host.into();
     let insert_id = IntrinsicId::from_name("insert")?;
 
     let mut found: Option<CarriedArray> = None;
-    let blocks: Vec<BlockId> = Function::from_id(ctx, fid).iter().map(|b| b.id).collect();
+    let blocks: Vec<BlockId> = FunctionRef::new(host, fid).iter().map(|b| b.id).collect();
     for header in blocks {
-        let params: Vec<ValueId> = BasicBlock::from_id(ctx, header)
+        let params: Vec<ValueId> = BlockRef::new(host, header)
             .params()
             .map(|p| p.id())
             .collect();
         for arr_h in params {
-            let arr_ty = ctx.type_of(arr_h);
-            let Some((elem_ty, count)) = ctx.types.array_of(arr_ty) else {
+            let arr_ty = host.type_of(arr_h);
+            let Some((elem_ty, count)) = host.shared().types.array_of(arr_ty) else {
                 continue;
             };
             if count == 0 {
                 continue;
             }
-            let Some(k) = param_pos(&*ctx, header, arr_h) else {
+            let Some(k) = param_pos(host, header, arr_h) else {
                 continue;
             };
-            let incs = incoming(&*ctx, header, k);
+            let incs = incoming(host, header, k);
             if incs.len() != 2 {
                 continue;
             }
@@ -96,7 +100,7 @@ pub(crate) fn find_carried_array(ctx: &mut Context, fid: FunctionId) -> Option<C
                 // lane-0 seed (non-param base); every other array value is init.
                 if let ValueId::Instruction(iid) = v
                     && let Mnemonic::Intrinsic(IntrinsicApp { id, args }) =
-                        ctx.get_insn(iid).mnemonic()
+                        host.instruction(iid).mnemonic()
                     && *id == insert_id
                     && args.len() == 3
                 {
@@ -109,12 +113,14 @@ pub(crate) fn find_carried_array(ctx: &mut Context, fid: FunctionId) -> Option<C
                             ok = false;
                             break;
                         }
-                        let Some(insert_block) = ctx.get_insn(iid).parent().map(|b| b.id) else {
+                        let Some(insert_block) =
+                            InstructionRef::new(host, iid).parent().map(|b| b.id)
+                        else {
                             ok = false;
                             break;
                         };
                         carry = Some((arr0, val, idx, insert_block));
-                    } else if literal(&*ctx, idx) == Some(0) {
+                    } else if literal(host, idx) == Some(0) {
                         if seed.is_some() || init.is_some() {
                             ok = false;
                             break;
@@ -148,7 +154,7 @@ pub(crate) fn find_carried_array(ctx: &mut Context, fid: FunctionId) -> Option<C
             // carry's header (header-carried — the shape redundant-φ elimination
             // leaves). Consumers compare both by `ValueId`, never by parent.
             let param_of_loop = |v: ValueId| {
-                let p = param_parent(&*ctx, v);
+                let p = param_parent(host, v);
                 p == Some(body) || p == Some(header)
             };
             if !param_of_loop(arr_b) {
@@ -158,13 +164,13 @@ pub(crate) fn find_carried_array(ctx: &mut Context, fid: FunctionId) -> Option<C
                 continue;
             }
             // The body must be a predecessor of the header (the back-edge).
-            let is_back_edge = BasicBlock::from_id(ctx, header)
+            let is_back_edge = BlockRef::new(host, header)
                 .predecessors()
                 .any(|(_, p)| p == body);
             if !is_back_edge {
                 continue;
             }
-            if param_parent(&*ctx, arr_h) != Some(header) {
+            if param_parent(host, arr_h) != Some(header) {
                 continue;
             }
 
@@ -198,9 +204,13 @@ pub(crate) struct BodyReads {
 
 /// Classify the body's `at(arr_b, ·)` reads on the single carried array.
 /// `None` if any `at(arr_b, ·)` has an unrecognized index, or a class repeats.
-pub(crate) fn classify_body_reads(ctx: &mut Context, ca: &CarriedArray) -> Option<BodyReads> {
+pub(crate) fn classify_body_reads<'a, 'str: 'a>(
+    host: impl Into<HostRef<'a, 'str>>,
+    ca: &CarriedArray,
+) -> Option<BodyReads> {
+    let host = host.into();
     let at_id = IntrinsicId::from_name("at")?;
-    let arr_b_ats: Vec<(InstructionId, ValueId)> = BasicBlock::from_id(ctx, ca.body)
+    let arr_b_ats: Vec<(InstructionId, ValueId)> = BlockRef::new(host, ca.body)
         .iter()
         .filter_map(|insn| match insn.mnemonic() {
             Mnemonic::Intrinsic(IntrinsicApp { id, args })
@@ -211,12 +221,12 @@ pub(crate) fn classify_body_reads(ctx: &mut Context, ca: &CarriedArray) -> Optio
             _ => None,
         })
         .collect();
-    let idx_ty = ctx.type_of(ca.index);
-    let idx_width = ctx.types.size_of(idx_ty);
+    let idx_ty = host.type_of(ca.index);
+    let idx_width = host.shared().types.size_of(idx_ty);
     let mut prev = None;
     let mut own = None;
     for (id, e_idx) in arr_b_ats {
-        if is_decrement(&*ctx, e_idx, ca.index, idx_width) {
+        if is_decrement(host, e_idx, ca.index, idx_width) {
             if prev.is_some() {
                 return None;
             }
@@ -236,14 +246,16 @@ pub(crate) fn classify_body_reads(ctx: &mut Context, ca: &CarriedArray) -> Optio
 /// The value the exit block sees for the carried array: an exit pass-through
 /// param copying `arr_h` on the header→exit edge, or `arr_h` itself when gvn
 /// coalesced the pass-through.
-pub(crate) fn exit_view(ctx: &Context, ca: &CarriedArray, exit: BlockId) -> ValueId {
-    let exit_params: Vec<ValueId> = BasicBlock::from_id(ctx, exit)
-        .params()
-        .map(|p| p.id())
-        .collect();
+pub(crate) fn exit_view<'a, 'str: 'a>(
+    host: impl Into<HostRef<'a, 'str>>,
+    ca: &CarriedArray,
+    exit: BlockId,
+) -> ValueId {
+    let host = host.into();
+    let exit_params: Vec<ValueId> = BlockRef::new(host, exit).params().map(|p| p.id()).collect();
     for p in exit_params {
-        if let Some(kp) = param_pos(ctx, exit, p)
-            && incoming(ctx, exit, kp)[..] == [ca.arr_h]
+        if let Some(kp) = param_pos(host, exit, p)
+            && incoming(host, exit, kp)[..] == [ca.arr_h]
         {
             return p;
         }
@@ -256,6 +268,11 @@ mod tests {
     use qcode_macro::qcode;
 
     use super::*;
+    use qcode::{
+        context::Context,
+        value::{BasicBlock, Function},
+    };
+
     use crate::mem::array_promote::ArrayPromote;
     use crate::test_util::run_function_pass_v2;
 
@@ -296,10 +313,10 @@ mod tests {
             run_function_pass_v2::<ArrayPromote>(&mut ctx, prefix).unwrap(),
             "array_promote should promote the prefix sum"
         );
-        let ca = find_carried_array(&mut ctx, prefix).expect("carried array found");
+        let ca = find_carried_array(&ctx, prefix).expect("carried array found");
         assert!(ca.seed.is_some(), "prefix sum is the seeded scan shape");
         assert!(ca.init.is_none());
-        let reads = classify_body_reads(&mut ctx, &ca).expect("body reads classify");
+        let reads = classify_body_reads(&ctx, &ca).expect("body reads classify");
         assert!(reads.prev.is_some(), "carry read at(arr, j-1)");
         assert!(reads.own.is_some(), "own-lane read at(arr, j)");
     }
@@ -342,14 +359,14 @@ mod tests {
     fn header_carried_index_accepted() {
         let mut ctx = Context::new();
         let f = promote_header_carried_fill(&mut ctx);
-        let ca = find_carried_array(&mut ctx, f).expect("header-carried index accepted");
+        let ca = find_carried_array(&ctx, f).expect("header-carried index accepted");
         assert_ne!(ca.header, ca.body, "split shape");
         assert_eq!(
             param_parent(&ctx, ca.index),
             Some(ca.header),
             "the index is the header induction param itself"
         );
-        let reads = classify_body_reads(&mut ctx, &ca).expect("body reads classify");
+        let reads = classify_body_reads(&ctx, &ca).expect("body reads classify");
         assert!(reads.prev.is_none(), "no accumulator carry read");
         assert!(reads.own.is_some(), "own-lane read at(arr, i)");
     }
@@ -361,7 +378,7 @@ mod tests {
     fn foreign_block_index_rejected() {
         let mut ctx = Context::new();
         let f = promote_header_carried_fill(&mut ctx);
-        let ca = find_carried_array(&mut ctx, f).expect("promoted shape matches");
+        let ca = find_carried_array(&ctx, f).expect("promoted shape matches");
         // Rewrite the carry insert's index to a fresh param of the entry block.
         let insert_id = IntrinsicId::from_name("insert").unwrap();
         let carry = BasicBlock::from_id(&ctx, ca.body)
@@ -385,7 +402,7 @@ mod tests {
         args[1] = foreign;
         ctx.replace_instruction_mnemonic(carry, m);
         assert!(
-            find_carried_array(&mut ctx, f).is_none(),
+            find_carried_array(&ctx, f).is_none(),
             "a foreign-block index param must not match"
         );
     }
@@ -419,7 +436,7 @@ mod tests {
             "
         );
         assert!(run_function_pass_v2::<ArrayPromote>(&mut ctx, reg_rot).unwrap());
-        let ca = find_carried_array(&mut ctx, reg_rot).expect("rotated carry matches");
+        let ca = find_carried_array(&ctx, reg_rot).expect("rotated carry matches");
         assert_eq!(ca.header, ca.body, "rotated: the body is its own header");
         assert_eq!(param_parent(&ctx, ca.index), Some(ca.body));
     }

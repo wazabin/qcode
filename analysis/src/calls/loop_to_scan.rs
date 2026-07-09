@@ -37,10 +37,10 @@
 
 use qcode::{
     builder::Builder,
-    context::Context,
     value::{
-        BasicBlock, BlockId, Function, FunctionId, InstructionRef, ValueId,
+        BlockId, BlockRef, FunctionId, FunctionRef, InstructionRef, ValueId,
         insn::{InstructionId, IntrinsicApp, IntrinsicId, Mnemonic},
+        util::{base_ref::BaseRef, base_ref::HostRef, host_mut::HostMut},
     },
 };
 
@@ -50,7 +50,8 @@ use crate::loop_info::{
     cbranch_exit, delete_private_loop, incoming, is_increment, is_loop_private, literal,
     param_parent, param_pos,
 };
-use crate::{FunctionPass, PipelineEnv};
+use crate::pipeline::{FunctionBody, ModuleView};
+use crate::{FunctionPassV2, register_function_pass_v2};
 
 #[derive(Default)]
 pub struct LoopToScan;
@@ -92,10 +93,10 @@ struct ScanMatch {
 }
 
 /// Recognize the `insert`/`at` fill loop in `fid`.
-fn try_match(ctx: &mut Context, fid: FunctionId) -> Option<ScanMatch> {
+fn try_match(host: HostRef, fid: FunctionId) -> Option<ScanMatch> {
     // Anchor on the shared carried-array matcher, then narrow to the scan shape:
     // a lane-0 accumulator seed insert must exist (`ca.seed`).
-    let ca = find_carried_array(ctx, fid)?;
+    let ca = find_carried_array(host, fid)?;
     // The shared matcher also accepts a *header-carried* index (`ca.index` a
     // param of `ca.header`, not of `ca.body`). Scan v1 is audited for the
     // body-copied shape only — gate the other out explicitly so the relaxed
@@ -103,7 +104,7 @@ fn try_match(ctx: &mut Context, fid: FunctionId) -> Option<ScanMatch> {
     // TODO(loop-fold-header-index): fold header-carried scans by moving this
     // recognizer's induction walk onto `NaturalLoop::unit_induction`, mirroring
     // `loop_to_map::try_match`.
-    if param_parent(&*ctx, ca.index) != Some(ca.body) {
+    if param_parent(host, ca.index) != Some(ca.body) {
         return None;
     }
     let (seed_val, seed_arr0) = ca.seed?;
@@ -118,17 +119,17 @@ fn try_match(ctx: &mut Context, fid: FunctionId) -> Option<ScanMatch> {
     // successor is the loop exit. `header`'s terminator is the `CBranch` guard
     // (rotated: it lives on the body/header itself; split: on the distinct guard).
     // The exit is the guard successor that is not itself a header predecessor.
-    let (exit, _stay) = cbranch_exit(ctx, header)?;
+    let (exit, _stay) = cbranch_exit(host, header)?;
 
     // The array value as the exit block sees it: an exit pass-through param that
     // copies `arr_h` on the header→exit edge, or `arr_h` itself when gvn coalesced
     // that trivial pass-through away (then the exit reads the header param directly).
-    let arr_src = exit_view(ctx, &ca, exit);
+    let arr_src = exit_view(host, &ca, exit);
 
     // The body's `at(arr_b, ·)` reads on the single carried array: the carry
     // `at(arr_b, index-1)` (always present) and, for an original-array scan, the
     // own-lane original read `at(arr_b, index)`.
-    let reads = classify_body_reads(ctx, &ca)?;
+    let reads = classify_body_reads(host, &ca)?;
     let prev_id = reads.prev?;
     let prev_val = ValueId::Instruction(prev_id);
     let elem_read = reads.own;
@@ -146,7 +147,7 @@ fn try_match(ctx: &mut Context, fid: FunctionId) -> Option<ScanMatch> {
             let ValueId::Instruction(a0) = seed_arr0 else {
                 return None;
             };
-            if !matches!(ctx.get_insn(a0).mnemonic(), Mnemonic::Load(_)) {
+            if !matches!(host.instruction(a0).mnemonic(), Mnemonic::Load(_)) {
                 return None;
             }
             Some((e_read, seed_arr0))
@@ -159,26 +160,26 @@ fn try_match(ctx: &mut Context, fid: FunctionId) -> Option<ScanMatch> {
     // param's own two incomings are the preheader init and the back-edge
     // increment; in the split shape `index` copies a header param, whose incomings
     // carry the init and increment.
-    let k_index = param_pos(&*ctx, body, index)?;
+    let k_index = param_pos(host, body, index)?;
     let feeds = if body == header {
-        incoming(&*ctx, body, k_index)
+        incoming(host, body, k_index)
     } else {
-        let [hp] = incoming(&*ctx, body, k_index)[..] else {
+        let [hp] = incoming(host, body, k_index)[..] else {
             return None;
         };
-        if param_parent(&*ctx, hp) != Some(header) {
+        if param_parent(host, hp) != Some(header) {
             return None;
         }
-        let k_hp = param_pos(&*ctx, header, hp)?;
-        incoming(&*ctx, header, k_hp)
+        let k_hp = param_pos(host, header, hp)?;
+        incoming(host, header, k_hp)
     };
-    if !feeds.iter().any(|&v| is_increment(&*ctx, v, index)) {
+    if !feeds.iter().any(|&v| is_increment(host, v, index)) {
         return None;
     }
     let inits: Vec<i64> = feeds
         .iter()
-        .filter(|&&v| !is_increment(&*ctx, v, index))
-        .filter_map(|&v| literal(&*ctx, v).map(|x| x as i64))
+        .filter(|&&v| !is_increment(host, v, index))
+        .filter_map(|&v| literal(host, v).map(|x| x as i64))
         .collect();
     let [index_start] = inits[..] else {
         return None;
@@ -203,41 +204,42 @@ fn try_match(ctx: &mut Context, fid: FunctionId) -> Option<ScanMatch> {
 /// Rewrite a matched fill loop: outline the `(acc, index)` body and replace the
 /// wide exit store with `store(ram, base <- concat(singleton(seed), scanl @body
 /// seed iota(N-1)))`. The residual loop is left for `dce`.
-fn apply(ctx: &mut Context, fid: FunctionId, m: &ScanMatch) -> bool {
-    let index_ty = ctx.type_of(m.index);
-    let i64_ty = ctx.types.get_or_make_int(8);
+fn apply<'str>(mv: &ModuleView<'_, 'str>, body: &mut FunctionBody<'str>, m: &ScanMatch) -> bool {
+    let fid = body.id();
+    let (index_ty, i64_ty, name) = {
+        let host = body.read_host(mv);
+        (
+            host.type_of(m.index),
+            host.shared().types.get_or_make_int(8),
+            format!("{}_scan_body", FunctionRef::new(host, fid).name()),
+        )
+    };
     let n1 = m.count - 1;
 
     let iota_id = IntrinsicId::from_name("iota").expect("iota registered");
     let singleton_id = IntrinsicId::from_name("singleton").expect("singleton registered");
     let concat_id = IntrinsicId::from_name("concat").expect("concat registered");
 
-    let name = format!("{}_scan_body", Function::from_id(ctx, fid).name());
-
-    // Anchor every new instruction before the exit block's *first* instruction,
-    // not just before the wide store: `array_promote` may have rewritten other
-    // exit loads to `at(arr_exit, k)` earlier in the block, and those get
-    // redirected to the folded array below — which must therefore dominate them.
-    let Some(anchor) = BasicBlock::from_id(ctx, m.exit).iter().next().map(|i| i.id) else {
-        return false;
-    };
-    // Pre-existing exit instructions whose `arr_exit` uses are redirected.
-    let preexisting: Vec<InstructionId> = BasicBlock::from_id(ctx, m.exit)
-        .iter()
-        .map(|i| i.id)
-        .collect();
-
-    // Two source shapes. When the body reads the region's original element
-    // (`m.elem`), the scan ranges over the *original array* `l0[1..]` and the body
-    // is `f(acc, x)` over that data element. Otherwise it is a pure generation and
-    // the scan ranges over `iota(N-1)`, whose element is the loop index (no
-    // original memory read — the property is then syntactic).
-    let (body_fn, src) = match m.elem {
+    // Outline the `(acc, ·)` body before any rewrite (a non-closed body or an
+    // exhausted mint pool leaves the loop untouched), keeping the src shape.
+    enum Src {
+        /// `l0[1..]` slice of the original array (data-input scan).
+        Slice { l0_exit: ValueId, esz: usize },
+        /// A fresh `iota(N-1)` (pure generation).
+        Iota,
+    }
+    let (body_fn, src_kind, src_arr_ty) = match m.elem {
         Some((elem_read, l0_exit)) => {
-            let esz = ctx.types.size_of(m.elem_ty);
-            let src_arr_ty = ctx.types.get_or_make_array(m.elem_ty, n1);
+            let (esz, src_arr_ty) = {
+                let types = &body.read_host(mv).shared().types;
+                (
+                    types.size_of(m.elem_ty),
+                    types.get_or_make_array(m.elem_ty, n1),
+                )
+            };
             let Some(body_fn) = outline_scan_body(
-                ctx,
+                mv,
+                body,
                 &name,
                 m.stored_val,
                 m.prev_val,
@@ -250,26 +252,17 @@ fn apply(ctx: &mut Context, fid: FunctionId, m: &ScanMatch) -> bool {
             ) else {
                 return false;
             };
-            // `l0[1..]` — the original elements at lanes `1..N`, a byte-slice of the
-            // snapshot array from element 1 (length `N-1`).
-            let slice = InstructionRef::from_mnemonic_with_type(
-                ctx,
-                fid,
-                Mnemonic::Range(qcode::value::insn::Range {
-                    src: l0_exit,
-                    start: esz,
-                    size: n1 * esz,
-                }),
-                src_arr_ty,
-            )
-            .id;
-            BasicBlock::from_id_mut(ctx, m.exit).insert_insn_before(anchor, slice);
-            (body_fn, ValueId::Instruction(slice))
+            (body_fn, Src::Slice { l0_exit, esz }, src_arr_ty)
         }
         None => {
-            let src_arr_ty = ctx.types.get_or_make_array(i64_ty, n1);
+            let src_arr_ty = body
+                .read_host(mv)
+                .shared()
+                .types
+                .get_or_make_array(i64_ty, n1);
             let Some(body_fn) = outline_scan_body(
-                ctx,
+                mv,
+                body,
                 &name,
                 m.stored_val,
                 m.prev_val,
@@ -282,26 +275,63 @@ fn apply(ctx: &mut Context, fid: FunctionId, m: &ScanMatch) -> bool {
             ) else {
                 return false;
             };
-            // `iota(N-1)` typed to the concrete `[i64; N-1]` (construction does not fold).
-            let n1_const = ctx.get_const(n1 as u64, 8).id();
-            let iota_id_insn = InstructionRef::from_mnemonic_with_type(
-                ctx,
+            (body_fn, Src::Iota, src_arr_ty)
+        }
+    };
+
+    let mut host = body.host(mv);
+
+    // Anchor every new instruction before the exit block's *first* instruction,
+    // not just before the wide store: `array_promote` may have rewritten other
+    // exit loads to `at(arr_exit, k)` earlier in the block, and those get
+    // redirected to the folded array below — which must therefore dominate them.
+    let Some(anchor) = BlockRef::new(host.read_host(), m.exit)
+        .iter()
+        .next()
+        .map(|i| i.id)
+    else {
+        return false;
+    };
+    // Pre-existing exit instructions whose `arr_exit` uses are redirected.
+    let preexisting: Vec<InstructionId> = BlockRef::new(host.read_host(), m.exit)
+        .iter()
+        .map(|i| i.id)
+        .collect();
+
+    // Materialize the scan source. Data-input: the `l0[1..]` byte-slice from
+    // element 1 (length `N-1`). Pure generation: `iota(N-1)` typed `[i64; N-1]`.
+    let src = match src_kind {
+        Src::Slice { l0_exit, esz } => {
+            let slice = host.push_mnemonic_with_type(
+                fid,
+                Mnemonic::Range(qcode::value::insn::Range {
+                    src: l0_exit,
+                    start: esz,
+                    size: n1 * esz,
+                }),
+                src_arr_ty,
+            );
+            host.insert_insn_before(m.exit, anchor, slice);
+            ValueId::Instruction(slice)
+        }
+        Src::Iota => {
+            let n1_const = host.shared().get_const(n1 as u64, 8).id();
+            let iota = host.push_mnemonic_with_type(
                 fid,
                 Mnemonic::Intrinsic(IntrinsicApp {
                     id: iota_id,
                     args: vec![n1_const],
                 }),
                 src_arr_ty,
-            )
-            .id;
-            BasicBlock::from_id_mut(ctx, m.exit).insert_insn_before(anchor, iota_id_insn);
-            (body_fn, ValueId::Instruction(iota_id_insn))
+            );
+            host.insert_insn_before(m.exit, anchor, iota);
+            ValueId::Instruction(iota)
         }
     };
 
     // scan(iota) → singleton(seed) → concat, ahead of every exit use.
     let full = {
-        let mut b = Builder::from_block(BasicBlock::from_id_mut(ctx, m.exit));
+        let mut b = Builder::from_block(BaseRef::new(host.reborrow_host(), m.exit));
         b.set_insert_point_before(anchor);
         let scan = b.push_scan(body_fn, m.seed_val, src, Vec::new()).id();
         let sing = b.push_intrinsic(singleton_id, vec![m.seed_val]).id();
@@ -312,9 +342,9 @@ fn apply(ctx: &mut Context, fid: FunctionId, m: &ScanMatch) -> bool {
     // `at(arr, k)` reads `array_promote` left for exit loads — to the folded
     // array, leaving the loop's own array dead for `dce`.
     for id in preexisting {
-        let mut mn = ctx.get_insn(id).mnemonic().clone();
+        let mut mn = host.read_host().instruction(id).mnemonic().clone();
         mn.replace_value(m.arr_exit, full);
-        ctx.replace_instruction_mnemonic(id, mn);
+        host.replace_instruction_mnemonic(id, mn);
     }
 
     // Delete the residual loop when it is now wholly private (mirrors
@@ -329,11 +359,10 @@ fn apply(ctx: &mut Context, fid: FunctionId, m: &ScanMatch) -> bool {
     } else {
         vec![m.header, m.body]
     };
-    let private = is_loop_private(ctx, &loop_blocks);
-    let defined_in_loop = |ctx: &Context, v: ValueId| match v {
-        ValueId::BlockParam(_) => param_parent(ctx, v).is_some_and(|b| loop_blocks.contains(&b)),
-        ValueId::Instruction(id) => ctx
-            .get_insn(id)
+    let private = is_loop_private(host.read_host(), &loop_blocks);
+    let defined_in_loop = |host: HostRef, v: ValueId| match v {
+        ValueId::BlockParam(_) => param_parent(host, v).is_some_and(|b| loop_blocks.contains(&b)),
+        ValueId::Instruction(id) => InstructionRef::new(host, id)
             .parent()
             .is_some_and(|b| loop_blocks.contains(&b.id)),
         _ => false,
@@ -342,26 +371,27 @@ fn apply(ctx: &mut Context, fid: FunctionId, m: &ScanMatch) -> bool {
     // coalesced) must be re-fed from a preheader-available value: its
     // header-edge incoming directly if loop-invariant, or — when it copies a
     // loop param — that param's own loop-invariant (preheader) incoming.
-    let exit_args: Option<Vec<ValueId>> = BasicBlock::from_id(ctx, m.exit)
+    let exit_args: Option<Vec<ValueId>> = BlockRef::new(host.read_host(), m.exit)
         .params()
         .map(|p| p.id())
         .collect::<Vec<_>>()
         .into_iter()
         .map(|p| {
-            let k = param_pos(&*ctx, m.exit, p)?;
-            let [v] = incoming(&*ctx, m.exit, k)[..] else {
+            let rh = host.read_host();
+            let k = param_pos(rh, m.exit, p)?;
+            let [v] = incoming(rh, m.exit, k)[..] else {
                 return None;
             };
-            if !defined_in_loop(ctx, v) {
+            if !defined_in_loop(rh, v) {
                 return Some(v);
             }
             if !matches!(v, ValueId::BlockParam(_)) {
                 return None;
             }
-            let kv = param_pos(&*ctx, m.header, v)?;
-            let init: Vec<ValueId> = incoming(&*ctx, m.header, kv)
+            let kv = param_pos(rh, m.header, v)?;
+            let init: Vec<ValueId> = incoming(rh, m.header, kv)
                 .into_iter()
-                .filter(|&w| !defined_in_loop(ctx, w))
+                .filter(|&w| !defined_in_loop(rh, w))
                 .collect();
             match init[..] {
                 [w] => Some(w),
@@ -370,47 +400,49 @@ fn apply(ctx: &mut Context, fid: FunctionId, m: &ScanMatch) -> bool {
         })
         .collect();
     if private && let Some(exit_args) = exit_args {
-        let preheaders: Vec<BlockId> = BasicBlock::from_id(ctx, m.header)
+        let preheaders: Vec<BlockId> = BlockRef::new(host.read_host(), m.header)
             .predecessors()
             .map(|(_, p)| p)
             .filter(|p| !loop_blocks.contains(p))
             .collect();
         if let [preheader] = preheaders[..] {
-            delete_private_loop(ctx, fid, preheader, &loop_blocks, m.exit, exit_args);
+            delete_private_loop(&mut host, fid, preheader, &loop_blocks, m.exit, exit_args);
         }
     }
     true
 }
 
-impl FunctionPass for LoopToScan {
+impl FunctionPassV2 for LoopToScan {
     const NAME: &'static str = "loop_to_scan";
+    const MINTS: bool = true;
 
     fn description(&self) -> &'static str {
         "Fold the value-carried insert/at fill loop from array_promote into a scanl"
     }
 
-    fn run(
+    fn run<'str>(
         &self,
-        ctx: &mut Context,
-        fun_id: FunctionId,
-        _env: &PipelineEnv,
+        m: &ModuleView<'_, 'str>,
+        f: &mut FunctionBody<'str>,
     ) -> Result<bool, String> {
-        if let Some(m) = try_match(ctx, fun_id) {
-            return Ok(apply(ctx, fun_id, &m));
+        if let Some(sm) = try_match(f.read_host(m), f.id()) {
+            return Ok(apply(m, f, &sm));
         }
         Ok(false)
     }
 }
 
-crate::register_function_pass!(LoopToScan);
+register_function_pass_v2!(LoopToScan);
 
 #[cfg(test)]
 mod tests {
     use qcode_macro::qcode;
 
     use super::*;
+    use qcode::{context::Context, value::Function};
+
     use crate::mem::array_promote::ArrayPromote;
-    use crate::test_util::{run_function_pass, run_function_pass_v2};
+    use crate::test_util::run_function_pass_v2;
 
     // The exact seam this rewrite touches: `array_promote` promotes the seeded
     // prefix sum `out[0]=seed; out[i]=out[i-1]+l[i]` into a single carried array
@@ -453,7 +485,7 @@ mod tests {
             "array_promote should promote the prefix sum"
         );
         assert!(
-            run_function_pass::<LoopToScan>(&mut ctx, prefix).unwrap(),
+            run_function_pass_v2::<LoopToScan>(&mut ctx, prefix).unwrap(),
             "loop_to_scan should fold the promoted single-array loop"
         );
         let ir = format!("{}", Function::from_id(&ctx, prefix));
@@ -504,7 +536,7 @@ mod tests {
             "the header-carried prefix sum should promote"
         );
         assert!(
-            !run_function_pass::<LoopToScan>(&mut ctx, prefix).unwrap(),
+            !run_function_pass_v2::<LoopToScan>(&mut ctx, prefix).unwrap(),
             "scan v1 must decline the header-carried index shape"
         );
         let ir = format!("{}", Function::from_id(&ctx, prefix));

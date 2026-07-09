@@ -11,11 +11,11 @@
 
 use qcode::{
     builder::Builder,
-    context::Context,
     space::{Space, SpaceType},
     value::{
-        BasicBlock, BlockId, Function, FunctionId, ValueId,
+        BlockId, BlockRef, FunctionId, FunctionRef, InstructionRef, ValueId,
         insn::{InstructionId, IntrinsicId, Mnemonic},
+        util::{base_ref::BaseRef, base_ref::HostRef, host_mut::HostMut},
     },
 };
 
@@ -23,9 +23,10 @@ use super::carried_array::{CarriedArray, classify_body_reads, exit_view, find_ca
 use super::outline::{outline_expression, outline_tupled, pure_slice};
 use crate::loop_info::{
     cbranch_exit, delete_private_loop, incoming, is_loop_private, param_parent, param_pos,
-    recognize_loops,
+    recognize_loops, users_of,
 };
-use crate::{Pass, PipelineEnv};
+use crate::pipeline::{FunctionBody, ModuleView};
+use crate::{FunctionPassV2, register_function_pass_v2};
 
 // ===========================================================================
 // Total-map recognizer
@@ -88,11 +89,11 @@ struct MapMatch {
 
 /// Match the canonical total-map loop in `fid` on the shared carried-array form,
 /// or `None` for any other shape (the function is then left untouched).
-fn try_match(ctx: &mut Context, fid: FunctionId) -> Option<MapMatch> {
+fn try_match(host: HostRef, fid: FunctionId) -> Option<MapMatch> {
     // A map is a carried array with no lane-0 accumulator seed (a seed is the scan
     // shape, `loop_to_scan`'s pattern — the two are mutually exclusive here) and a
     // real initial array to range over.
-    let ca = find_carried_array(ctx, fid)?;
+    let ca = find_carried_array(host, fid)?;
     if ca.seed.is_some() {
         return None;
     }
@@ -100,7 +101,7 @@ fn try_match(ctx: &mut Context, fid: FunctionId) -> Option<MapMatch> {
 
     // No accumulator carry read (`at(arr_b, index-1)`); the own-lane original read
     // (`at(arr_b, index)`) is optional.
-    let reads = classify_body_reads(ctx, &ca)?;
+    let reads = classify_body_reads(host, &ca)?;
     if reads.prev.is_some() {
         return None;
     }
@@ -119,10 +120,10 @@ fn try_match(ctx: &mut Context, fid: FunctionId) -> Option<MapMatch> {
     // which accepts both split-loop index shapes (body-copied and header-carried)
     // so this recognizer never learns the difference. Its trip bound comes from
     // the guard; it must agree with the coverage proof's lane count.
-    let lp = recognize_loops(&*ctx, fid)
+    let lp = recognize_loops(host, fid)
         .into_iter()
         .find(|l| l.header == ca.header && l.body == ca.body)?;
-    let ind = lp.unit_induction(&*ctx, ca.index)?;
+    let ind = lp.unit_induction(host, ca.index)?;
     if ind.start != 0 {
         return None; // v1 maps tile [0, N) from index 0
     }
@@ -132,8 +133,8 @@ fn try_match(ctx: &mut Context, fid: FunctionId) -> Option<MapMatch> {
 
     // Exit discovery: the header terminator is the loop guard; the exit is the
     // successor that is not itself a header predecessor.
-    let (exit, _stay) = cbranch_exit(ctx, ca.header)?;
-    let arr_exit = exit_view(ctx, &ca, exit);
+    let (exit, _stay) = cbranch_exit(host, ca.header)?;
+    let arr_exit = exit_view(host, &ca, exit);
 
     // The map ranges over `init_arr` and reproduces the loop for *any* init value:
     // in-order coverage (array_promote's proof) makes lane `j` read before it is
@@ -144,11 +145,11 @@ fn try_match(ctx: &mut Context, fid: FunctionId) -> Option<MapMatch> {
     // Consumer: a RAM store of the carried array's exit view (real memory). When
     // absent (private argpromote shadow, wide temp store already dce'd) the exit
     // uses of `arr_exit` are the return envelope — the rewrite just replaces them.
-    let store_id = BasicBlock::from_id(ctx, exit)
+    let store_id = BlockRef::new(host, exit)
         .iter()
         .find_map(|i| match i.mnemonic() {
             Mnemonic::Store(s)
-                if matches!(Space::from_id(ctx, s.space).ty, SpaceType::Ram)
+                if matches!(Space::from_id(host.shared(), s.space).ty, SpaceType::Ram)
                     && s.src == arr_exit =>
             {
                 Some(i.id)
@@ -173,7 +174,7 @@ fn try_match(ctx: &mut Context, fid: FunctionId) -> Option<MapMatch> {
 /// Does the per-element body actually read the loop index? `enumerate` is only
 /// worth inserting when it does; a value-only body maps directly over the array.
 fn body_uses_index(
-    ctx: &Context,
+    host: HostRef,
     stored_val: ValueId,
     index: ValueId,
     elem_read: Option<ValueId>,
@@ -183,10 +184,10 @@ fn body_uses_index(
     }
     let mut inputs = vec![index];
     inputs.extend(elem_read);
-    match pure_slice(ctx, stored_val, &inputs) {
+    match pure_slice(host, stored_val, &inputs) {
         Some(slice) => slice
             .iter()
-            .any(|&iid| ctx.get_insn(iid).mnemonic().args().contains(&index)),
+            .any(|&iid| host.instruction(iid).mnemonic().args().contains(&index)),
         None => false,
     }
 }
@@ -201,26 +202,39 @@ fn body_uses_index(
 /// `map(body, enumerate(arr0))`, `body(tuple)` unpacking it. Returns `false` if
 /// the body is not a closed pure expression of `(index, element?)` (then nothing
 /// is changed — outlining is all-or-nothing and runs before any rewrite).
-fn apply(ctx: &mut Context, fid: FunctionId, m: &MapMatch) -> bool {
-    let name = format!("{}_map_body", Function::from_id(ctx, fid).name());
+fn apply<'str>(m: &ModuleView<'_, 'str>, body: &mut FunctionBody<'str>, mm: &MapMatch) -> bool {
+    let fid = body.id();
     let enum_id = IntrinsicId::from_name("enumerate").expect("enumerate registered");
-    let uses_index = body_uses_index(ctx, m.ca.stored_val, m.ca.index, m.elem_read);
-
-    // Outline the body before any rewrite, so a non-closed body leaves the loop
-    // untouched.
-    let body_fn = if uses_index {
-        let arr_ty = ctx.type_of(m.init_arr);
-        let enum_ty = enum_id.desc().result_type(&ctx.types, &[arr_ty]);
-        let Some((tuple_ty, _)) = ctx.types.array_of(enum_ty) else {
-            return false;
+    let (name, uses_index, tuple_ty) = {
+        let host = body.read_host(m);
+        let name = format!("{}_map_body", FunctionRef::new(host, fid).name());
+        let uses_index = body_uses_index(host, mm.ca.stored_val, mm.ca.index, mm.elem_read);
+        // The enumerate element type is needed before outlining (an index-aware
+        // body unpacks the `(index, elem)` tuple); resolve it while only reading.
+        let tuple_ty = if uses_index {
+            let arr_ty = host.type_of(mm.init_arr);
+            let enum_ty = enum_id.desc().result_type(&host.shared().types, &[arr_ty]);
+            match host.shared().types.array_of(enum_ty) {
+                Some((tuple_ty, _)) => Some(tuple_ty),
+                None => return false,
+            }
+        } else {
+            None
         };
+        (name, uses_index, tuple_ty)
+    };
+
+    // Outline the body before any rewrite, so a non-closed body (or an exhausted
+    // mint pool) leaves the loop untouched.
+    let body_fn = if uses_index {
         match outline_tupled(
-            ctx,
+            m,
+            body,
             &name,
-            m.ca.stored_val,
-            m.ca.index,
-            m.elem_read,
-            tuple_ty,
+            mm.ca.stored_val,
+            mm.ca.index,
+            mm.elem_read,
+            tuple_ty.expect("index-aware body has a tuple type"),
         ) {
             Some(f) => f,
             None => return false,
@@ -228,29 +242,34 @@ fn apply(ctx: &mut Context, fid: FunctionId, m: &MapMatch) -> bool {
     } else {
         // A value-only body needs an element to map over; without an own-lane read
         // there is nothing to bind (a pure constant fill is out of v1 scope).
-        let Some(elem) = m.elem_read else {
+        let Some(elem) = mm.elem_read else {
             return false;
         };
-        match outline_expression(ctx, &name, m.ca.stored_val, &[elem]) {
+        match outline_expression(m, body, &name, mm.ca.stored_val, &[elem]) {
             Some(f) => f,
             None => return false,
         }
     };
 
+    let mut host = body.host(m);
+
     // Build `map(body, enumerate(arr0))` (index-aware) or `map(body, arr0)`
     // (value-only) ahead of the consumer, then forward the exit view to it.
-    let anchor = m
-        .store_id
-        .or_else(|| BasicBlock::from_id(ctx, m.exit).iter().next().map(|i| i.id));
+    let anchor = mm.store_id.or_else(|| {
+        BlockRef::new(host.read_host(), mm.exit)
+            .iter()
+            .next()
+            .map(|i| i.id)
+    });
     let map_val = {
-        let mut b = Builder::from_block(BasicBlock::from_id_mut(ctx, m.exit));
+        let mut b = Builder::from_block(BaseRef::new(host.reborrow_host(), mm.exit));
         if let Some(at) = anchor {
             b.set_insert_point_before(at);
         }
         let src = if uses_index {
-            b.push_intrinsic(enum_id, vec![m.init_arr]).id()
+            b.push_intrinsic(enum_id, vec![mm.init_arr]).id()
         } else {
-            m.init_arr
+            mm.init_arr
         };
         b.push_map(body_fn, src, Vec::new()).id()
     };
@@ -261,19 +280,18 @@ fn apply(ctx: &mut Context, fid: FunctionId, m: &MapMatch) -> bool {
     // dominate them). So redirect only uses outside the loop; when the exit view
     // is a distinct exit param (the uncollapsed case) it has no in-loop uses and
     // this is exactly `replace_all_uses_with`.
-    let loop_blocks = [m.ca.header, m.ca.body];
-    let exit_users: Vec<InstructionId> = ctx.users(m.arr_exit).to_vec();
+    let loop_blocks = [mm.ca.header, mm.ca.body];
+    let exit_users: Vec<InstructionId> = users_of(host.read_host(), mm.arr_exit).to_vec();
     for id in exit_users {
-        if ctx
-            .get_insn(id)
+        if InstructionRef::new(host.read_host(), id)
             .parent()
             .is_some_and(|b| loop_blocks.contains(&b.id))
         {
             continue;
         }
-        let mut mn = ctx.get_insn(id).mnemonic().clone();
-        mn.replace_value(m.arr_exit, map_val);
-        ctx.replace_instruction_mnemonic(id, mn);
+        let mut mn = host.read_host().instruction(id).mnemonic().clone();
+        mn.replace_value(mm.arr_exit, map_val);
+        host.replace_instruction_mnemonic(id, mn);
     }
 
     // Deletability must reflect the *post-redirect* state. The redirect above moved
@@ -283,39 +301,39 @@ fn apply(ctx: &mut Context, fid: FunctionId, m: &MapMatch) -> bool {
     // rewrite would wrongly see that escaping use and keep the loop — and nothing
     // later deletes it: a self-carried loop's own guard and back-edge keep the index
     // and array live through the CFG, so no ordinary dce can collect the cycle.
-    let deletable = is_loop_private(ctx, &loop_blocks);
+    let deletable = is_loop_private(host.read_host(), &loop_blocks);
 
     // Delete the residual loop when wholly private (mirrors `loop_to_scan::apply`):
     // reroute the single preheader straight to the exit, re-feeding each exit param
     // from a preheader-available value, then delete the loop blocks.
-    let defined_in_loop = |ctx: &Context, v: ValueId| match v {
-        ValueId::BlockParam(_) => param_parent(ctx, v).is_some_and(|b| loop_blocks.contains(&b)),
-        ValueId::Instruction(id) => ctx
-            .get_insn(id)
+    let defined_in_loop = |host: HostRef, v: ValueId| match v {
+        ValueId::BlockParam(_) => param_parent(host, v).is_some_and(|b| loop_blocks.contains(&b)),
+        ValueId::Instruction(id) => InstructionRef::new(host, id)
             .parent()
             .is_some_and(|b| loop_blocks.contains(&b.id)),
         _ => false,
     };
-    let exit_args: Option<Vec<ValueId>> = BasicBlock::from_id(ctx, m.exit)
+    let exit_args: Option<Vec<ValueId>> = BlockRef::new(host.read_host(), mm.exit)
         .params()
         .map(|p| p.id())
         .collect::<Vec<_>>()
         .into_iter()
         .map(|p| {
-            let k = param_pos(&*ctx, m.exit, p)?;
-            let [v] = incoming(&*ctx, m.exit, k)[..] else {
+            let rh = host.read_host();
+            let k = param_pos(rh, mm.exit, p)?;
+            let [v] = incoming(rh, mm.exit, k)[..] else {
                 return None;
             };
-            if !defined_in_loop(ctx, v) {
+            if !defined_in_loop(rh, v) {
                 return Some(v);
             }
             if !matches!(v, ValueId::BlockParam(_)) {
                 return None;
             }
-            let kv = param_pos(&*ctx, m.ca.header, v)?;
-            let init: Vec<ValueId> = incoming(&*ctx, m.ca.header, kv)
+            let kv = param_pos(rh, mm.ca.header, v)?;
+            let init: Vec<ValueId> = incoming(rh, mm.ca.header, kv)
                 .into_iter()
-                .filter(|&w| !defined_in_loop(ctx, w))
+                .filter(|&w| !defined_in_loop(rh, w))
                 .collect();
             match init[..] {
                 [w] => Some(w),
@@ -324,52 +342,64 @@ fn apply(ctx: &mut Context, fid: FunctionId, m: &MapMatch) -> bool {
         })
         .collect();
     if deletable && let Some(exit_args) = exit_args {
-        let preheaders: Vec<BlockId> = BasicBlock::from_id(ctx, m.ca.header)
+        let preheaders: Vec<BlockId> = BlockRef::new(host.read_host(), mm.ca.header)
             .predecessors()
             .map(|(_, p)| p)
             .filter(|p| !loop_blocks.contains(p))
             .collect();
         if let [preheader] = preheaders[..] {
-            delete_private_loop(ctx, fid, preheader, &loop_blocks, m.exit, exit_args);
+            delete_private_loop(&mut host, fid, preheader, &loop_blocks, mm.exit, exit_args);
         }
     }
     true
 }
 
-/// Recognize total-map loops across all pure functions, rewriting each to a
-/// `map`. Returns `true` if anything changed.
-pub(crate) fn recognize_total_maps(ctx: &mut Context) -> bool {
-    let fids: Vec<FunctionId> = ctx.function_ids();
-    let mut changed = false;
-    for fid in fids {
-        if !Function::from_id(ctx, fid).is_pure() {
-            continue;
-        }
-        if let Some(m) = try_match(ctx, fid) {
-            changed |= apply(ctx, fid, &m);
-        }
+/// Recognize a total-map loop in this function and fold it to a `map`, outlining
+/// the per-element body into a fresh minted pure function. Only pure functions
+/// are considered (the recognizer's coverage/totality reasoning relies on
+/// `array_promote` having functionalized the region). Returns `true` if changed.
+pub(crate) fn recognize_total_map<'str>(
+    m: &ModuleView<'_, 'str>,
+    body: &mut FunctionBody<'str>,
+) -> bool {
+    let fid = body.id();
+    if !FunctionRef::new(body.read_host(m), fid).is_pure() {
+        return false;
     }
-    changed
+    let Some(mm) = try_match(body.read_host(m), fid) else {
+        return false;
+    };
+    apply(m, body, &mm)
 }
+
 #[derive(Default)]
 pub struct LoopToMap;
 
-impl Pass for LoopToMap {
+impl FunctionPassV2 for LoopToMap {
     const NAME: &'static str = "loop_to_map";
+    const MINTS: bool = true;
     fn description(&self) -> &'static str {
         "Rewrite a total element-wise array loop as a single map"
     }
-    fn run(&self, ctx: &mut Context, _env: &PipelineEnv) -> Result<bool, String> {
-        Ok(recognize_total_maps(ctx))
+    fn run<'str>(
+        &self,
+        m: &ModuleView<'_, 'str>,
+        f: &mut FunctionBody<'str>,
+    ) -> Result<bool, String> {
+        Ok(recognize_total_map(m, f))
     }
 }
 
-crate::register_module_pass!(LoopToMap);
+register_function_pass_v2!(LoopToMap);
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use qcode::value::insn::{Binop, IntBinop, Mnemonic};
+    use qcode::{
+        context::Context,
+        value::{BasicBlock, Function},
+    };
     use qcode_macro::qcode;
 
     use crate::AliasResult;
@@ -383,7 +413,7 @@ mod tests {
     fn promote_then_map(ctx: &mut Context, fid: FunctionId) -> (bool, bool) {
         let promoted = run_function_pass_v2::<ArrayPromote>(ctx, fid).unwrap();
         Function::from_id_mut(ctx, fid).set_is_pure(true);
-        let folded = recognize_total_maps(ctx);
+        let folded = run_function_pass_v2::<LoopToMap>(ctx, fid).unwrap();
         (promoted, folded)
     }
 
@@ -400,7 +430,7 @@ mod tests {
         let root = Function::from_id(ctx, fid).root().map(|b| b.id);
         while remove_dead_block_args(ctx, &blocks, root) {}
         Function::from_id_mut(ctx, fid).set_is_pure(true);
-        let folded = recognize_total_maps(ctx);
+        let folded = run_function_pass_v2::<LoopToMap>(ctx, fid).unwrap();
         (promoted, folded)
     }
 
@@ -824,7 +854,7 @@ mod tests {
 
         Function::from_id_mut(&mut ctx, xorbuf).set_is_pure(true);
         assert!(
-            recognize_total_maps(&mut ctx),
+            run_function_pass_v2::<LoopToMap>(&mut ctx, xorbuf).unwrap(),
             "a param-init own-lane map must fold (the deleted Load-only guard blocked it)"
         );
         let ir = format!("{}", Function::from_id(&ctx, xorbuf));
@@ -875,7 +905,7 @@ mod tests {
         assert!(run_function_pass_v2::<ArrayPromote>(&mut ctx, prefix).unwrap());
         Function::from_id_mut(&mut ctx, prefix).set_is_pure(true);
         assert!(
-            !recognize_total_maps(&mut ctx),
+            !run_function_pass_v2::<LoopToMap>(&mut ctx, prefix).unwrap(),
             "a seeded scan is not a map"
         );
     }
@@ -910,7 +940,7 @@ mod tests {
         run_function_pass_v2::<ArrayPromote>(&mut ctx, impure).unwrap();
         Function::from_id_mut(&mut ctx, impure).set_is_pure(true);
         assert!(
-            !recognize_total_maps(&mut ctx),
+            !run_function_pass_v2::<LoopToMap>(&mut ctx, impure).unwrap(),
             "an impure body must not fold to a map"
         );
     }

@@ -19,21 +19,22 @@ use rustc_hash::FxHashSet as HashSet;
 
 use qcode::{
     builder::Builder,
-    context::Context,
     space::{Space, SpaceId, SpaceType},
     value::{
-        BasicBlock, BlockId, Function, FunctionId, ValueId,
+        BlockId, BlockRef, FunctionId, FunctionRef, InstructionRef, ValueId,
         insn::{
             Binop, Branch, CBranch, InstructionId, IntBinop, IntrinsicApp, IntrinsicId, Mnemonic,
         },
+        util::{base_ref::BaseRef, base_ref::HostRef, host_mut::HostMut},
     },
 };
 
-use crate::loop_info::{delete_private_loop, incoming, is_increment, literal};
-use crate::{Pass, PipelineEnv};
+use crate::loop_info::{delete_private_loop, incoming, is_increment, literal, users_of};
+use crate::pipeline::{FunctionBody, ModuleView};
+use crate::{FunctionPassV2, register_function_pass_v2};
 
-fn is_temp(ctx: &Context, s: SpaceId) -> bool {
-    matches!(Space::from_id(ctx, s).ty, SpaceType::Temporary)
+fn is_temp(host: HostRef, s: SpaceId) -> bool {
+    matches!(Space::from_id(host.shared(), s).ty, SpaceType::Temporary)
 }
 
 // ===========================================================================
@@ -85,39 +86,42 @@ struct StrlenMatch {
 /// (`Some(false)`), or not a zero-test of `elem` at all (`None`). Handles the bare
 /// byte used as a predicate, `elem != 0` / `elem == 0` (either operand order), and
 /// the `bool`-migration negation wrapper `sub == false` / `sub != false`.
-fn nonzero_polarity(ctx: &Context, cond: ValueId, elem: ValueId) -> Option<bool> {
+fn nonzero_polarity(host: HostRef, cond: ValueId, elem: ValueId) -> Option<bool> {
     if cond == elem {
         return Some(true); // the raw byte as a bool: true ⟺ nonzero
     }
     let ValueId::Instruction(id) = cond else {
         return None;
     };
-    let is_bool = |v: ValueId| ctx.stored_type_of(v).is_some_and(|t| ctx.types.is_bool(t));
+    let is_bool = |v: ValueId| {
+        host.stored_type_of(v)
+            .is_some_and(|t| host.shared().types.is_bool(t))
+    };
     let bool_const = |v: ValueId| {
         (is_bool(v) && matches!(v, ValueId::Literal(_)))
-            .then(|| literal(ctx, v))
+            .then(|| literal(host, v))
             .flatten()
             .map(|c| c != 0)
     };
-    match ctx.get_insn(id).mnemonic() {
+    match host.instruction(id).mnemonic() {
         Mnemonic::Binop(b) if matches!(b.op, Binop::Int(IntBinop::Equal | IntBinop::NotEqual)) => {
             // Negation wrapper: `sub == c` / `sub != c` over a bool sub-condition.
             // If `sub` has polarity `p`, then `sub == c` has polarity `p == c`
             // and `sub != c` has polarity `p != c`.
             let is_eq = matches!(b.op, Binop::Int(IntBinop::Equal));
             if let Some(c) = bool_const(b.rhs)
-                && let Some(p) = nonzero_polarity(ctx, b.lhs, elem)
+                && let Some(p) = nonzero_polarity(host, b.lhs, elem)
             {
                 return Some(if is_eq { p == c } else { p != c });
             }
             if let Some(c) = bool_const(b.lhs)
-                && let Some(p) = nonzero_polarity(ctx, b.rhs, elem)
+                && let Some(p) = nonzero_polarity(host, b.rhs, elem)
             {
                 return Some(if is_eq { p == c } else { p != c });
             }
             // Direct zero-test of `elem`.
-            let zero_test = (b.lhs == elem && literal(ctx, b.rhs) == Some(0))
-                || (b.rhs == elem && literal(ctx, b.lhs) == Some(0));
+            let zero_test = (b.lhs == elem && literal(host, b.rhs) == Some(0))
+                || (b.rhs == elem && literal(host, b.lhs) == Some(0));
             if !zero_test {
                 return None;
             }
@@ -128,10 +132,10 @@ fn nonzero_polarity(ctx: &Context, cond: ValueId, elem: ValueId) -> Option<bool>
 }
 
 /// Match a bounded NUL-scan in `fid`, or `None` for any other shape.
-fn try_match_strlen(ctx: &Context, fid: FunctionId) -> Option<StrlenMatch> {
+fn try_match_strlen(host: HostRef, fid: FunctionId) -> Option<StrlenMatch> {
     let at_id = IntrinsicId::from_name("at")?;
     let insert_id = IntrinsicId::from_name("insert")?;
-    let root_params: Vec<ValueId> = Function::from_id(ctx, fid)
+    let root_params: Vec<ValueId> = FunctionRef::new(host, fid)
         .root()?
         .params()
         .map(|p| p.id())
@@ -142,7 +146,7 @@ fn try_match_strlen(ctx: &Context, fid: FunctionId) -> Option<StrlenMatch> {
     // one `at` on that array (or any `insert` into it) means the loop is not a plain
     // read-only NUL scan, so bail.
     let mut lane: Option<(InstructionId, ValueId, ValueId)> = None; // (at id, arr, idx)
-    for block in Function::from_id(ctx, fid).iter() {
+    for block in FunctionRef::new(host, fid).iter() {
         for insn in block.iter() {
             let Mnemonic::Intrinsic(IntrinsicApp { id, args }) = insn.mnemonic() else {
                 continue;
@@ -153,10 +157,10 @@ fn try_match_strlen(ctx: &Context, fid: FunctionId) -> Option<StrlenMatch> {
             if *id != at_id || args.len() != 2 || !is_root(args[0]) {
                 continue;
             }
-            let byte_array = ctx
+            let byte_array = host
                 .stored_type_of(args[0])
-                .and_then(|t| ctx.types.array_of(t))
-                .is_some_and(|(elem, _)| ctx.types.size_of(elem) == 1);
+                .and_then(|t| host.shared().types.array_of(t))
+                .is_some_and(|(elem, _)| host.shared().types.size_of(elem) == 1);
             if !byte_array {
                 continue;
             }
@@ -175,27 +179,27 @@ fn try_match_strlen(ctx: &Context, fid: FunctionId) -> Option<StrlenMatch> {
     let ValueId::BlockParam(pid) = index else {
         return None;
     };
-    let header = ctx.values.block_param(pid).parent?;
+    let header = host.block_param(pid).parent?;
     // The lane read must live in the header: the NUL test that governs the loop
     // reads it there, and the count is the index at that test.
-    if ctx.get_insn(at_insn).parent().map(|b| b.id) != Some(header) {
+    if InstructionRef::new(host, at_insn).parent().map(|b| b.id) != Some(header) {
         return None;
     }
-    let k = BasicBlock::from_id(ctx, header)
+    let k = BlockRef::new(host, header)
         .params()
         .position(|p| p.id() == index)?;
     // The index must start at 0 on *every* entry edge and step by +1 on the
     // back-edge: each non-increment (preheader) incoming has to be the literal 0,
     // or some entry could start the count off-zero and the rewrite would be wrong.
-    let incoming = incoming(ctx, header, k);
+    let incoming = incoming(host, header, k);
     let inits: Vec<ValueId> = incoming
         .iter()
         .copied()
-        .filter(|&v| !is_increment(ctx, v, index))
+        .filter(|&v| !is_increment(host, v, index))
         .collect();
     if inits.is_empty()
-        || !inits.iter().all(|&v| literal(ctx, v) == Some(0))
-        || !incoming.iter().any(|&v| is_increment(ctx, v, index))
+        || !inits.iter().all(|&v| literal(host, v) == Some(0))
+        || !incoming.iter().any(|&v| is_increment(host, v, index))
     {
         return None;
     }
@@ -206,7 +210,7 @@ fn try_match_strlen(ctx: &Context, fid: FunctionId) -> Option<StrlenMatch> {
     // length. Keying on the *header*'s terminator (not any matching CBranch in the
     // function) ensures the NUL test is the loop's governing exit.
     {
-        let term = BasicBlock::from_id(ctx, header).iter().last()?;
+        let term = BlockRef::new(host, header).iter().last()?;
         let Mnemonic::CBranch(CBranch {
             condition,
             success_block,
@@ -217,7 +221,7 @@ fn try_match_strlen(ctx: &Context, fid: FunctionId) -> Option<StrlenMatch> {
         else {
             return None;
         };
-        let nonzero_continues = nonzero_polarity(ctx, *condition, elem_val)?;
+        let nonzero_continues = nonzero_polarity(host, *condition, elem_val)?;
         // The exit edge is the one taken when the byte is zero.
         let (exit_block, exit_args) = if nonzero_continues {
             (*failure_block, failure_args)
@@ -226,7 +230,7 @@ fn try_match_strlen(ctx: &Context, fid: FunctionId) -> Option<StrlenMatch> {
         };
         // The exit edge must carry the index (the count) to an exit-block param.
         let kx = exit_args.iter().position(|&v| v == index)?;
-        let count_param = BasicBlock::from_id(ctx, exit_block)
+        let count_param = BlockRef::new(host, exit_block)
             .params()
             .nth(kx)
             .map(|p| p.id())?;
@@ -246,7 +250,7 @@ fn try_match_strlen(ctx: &Context, fid: FunctionId) -> Option<StrlenMatch> {
         // the back-edge is the only way out of the body, so the header's NUL test is
         // the loop's *sole* data-dependent exit. Without this, a second `break`
         // (e.g. on another byte value) would make the count not the first-zero index.
-        let back_ok = BasicBlock::from_id(ctx, body_block).iter().last().is_some_and(|t| {
+        let back_ok = BlockRef::new(host, body_block).iter().last().is_some_and(|t| {
             matches!(t.mnemonic(), Mnemonic::Branch(Branch { target, .. }) if *target == header)
         });
         if !back_ok {
@@ -255,7 +259,7 @@ fn try_match_strlen(ctx: &Context, fid: FunctionId) -> Option<StrlenMatch> {
 
         // The preheader is the header's sole out-of-loop predecessor: the reroute
         // source when the dead loop is deleted (there is no seed store to key on).
-        let out_of_loop: Vec<BlockId> = BasicBlock::from_id(ctx, header)
+        let out_of_loop: Vec<BlockId> = BlockRef::new(host, header)
             .predecessors()
             .map(|(_, p)| p)
             .filter(|&p| p != body_block)
@@ -268,18 +272,18 @@ fn try_match_strlen(ctx: &Context, fid: FunctionId) -> Option<StrlenMatch> {
         // only the count, and every value the loop defines is used only inside it.
         let loop_blocks = [header, body_block];
         let in_loop = |v: ValueId| {
-            ctx.users(v).iter().all(|&u| {
-                ctx.get_insn(u)
+            users_of(host, v).iter().all(|&u| {
+                InstructionRef::new(host, u)
                     .parent()
                     .is_some_and(|b| loop_blocks.contains(&b.id))
             })
         };
-        let exit_only_count = BasicBlock::from_id(ctx, exit_block)
+        let exit_only_count = BlockRef::new(host, exit_block)
             .params()
             .all(|p| p.id() == count_param);
         let deletable = exit_only_count
             && loop_blocks.iter().all(|&blk| {
-                let b = BasicBlock::from_id(ctx, blk);
+                let b = BlockRef::new(host, blk);
                 b.params().all(|p| p.id() == index || in_loop(p.id()))
                     && b.iter().all(|i| in_loop(ValueId::Instruction(i.id)))
             });
@@ -299,23 +303,23 @@ fn try_match_strlen(ctx: &Context, fid: FunctionId) -> Option<StrlenMatch> {
 /// Rewrite a matched NUL-scan: replace the escaping count with
 /// `len(take_while(@arr))`, then (when the scan is wholly private) strip the seed
 /// and delete the dead loop.
-fn apply_strlen(ctx: &mut Context, fid: FunctionId, m: &StrlenMatch) -> bool {
+fn apply_strlen<'str, H: HostMut<'str>>(host: &mut H, fid: FunctionId, m: &StrlenMatch) -> bool {
     // take_while(@arr) then len(...) of it, inserted at the top of the exit block.
     let tw_id = IntrinsicId::from_name("take_while").expect("take_while registered");
     let len_id = IntrinsicId::from_name("len").expect("len registered");
-    let first = BasicBlock::from_id(ctx, m.exit_block)
+    let first = BlockRef::new(host.read_host(), m.exit_block)
         .iter()
         .next()
         .map(|i| i.id);
     let len_val = {
-        let mut b = Builder::from_block(BasicBlock::from_id_mut(ctx, m.exit_block));
+        let mut b = Builder::from_block(BaseRef::new(host.reborrow_host(), m.exit_block));
         if let Some(at) = first {
             b.set_insert_point_before(at);
         }
         let tw = b.push_intrinsic(tw_id, vec![m.arr]).id();
         b.push_intrinsic(len_id, vec![tw]).id()
     };
-    ctx.replace_all_uses_with(m.count_param, len_val);
+    host.replace_all_uses_with(m.count_param, len_val);
 
     if m.deletable {
         // The count was the loop's only escape and is now forwarded to `len`, so the
@@ -325,16 +329,20 @@ fn apply_strlen(ctx: &mut Context, fid: FunctionId, m: &StrlenMatch) -> bool {
         //   2. reroute the preheader straight to the (now param-less) exit,
         //   3. delete the dead loop blocks. (There is no seed store to strip — the
         //      `at`-form scan reads the root array param directly.)
-        let kx = BasicBlock::from_id(ctx, m.exit_block)
+        let kx = BlockRef::new(host.read_host(), m.exit_block)
             .params()
             .position(|p| p.id() == m.count_param);
         if let Some(kx) = kx {
-            crate::dce::remove_params_from_block(ctx, m.exit_block, &HashSet::from_iter([kx]));
+            crate::dce::remove_params_from_block_host(
+                host,
+                m.exit_block,
+                &HashSet::from_iter([kx]),
+            );
         }
         // Reroute the preheader straight to the (now param-less) exit and delete the
         // dead loop blocks (body before header, as they were emitted).
         delete_private_loop(
-            ctx,
+            host,
             fid,
             m.preheader,
             &[m.body_block, m.header_block],
@@ -347,20 +355,17 @@ fn apply_strlen(ctx: &mut Context, fid: FunctionId, m: &StrlenMatch) -> bool {
     true
 }
 
-/// Recognize bounded NUL-scan loops across all pure functions, rewriting each
-/// escaping count to `len(take_while(arr))`. Returns `true` if anything changed.
-pub(crate) fn recognize_strlens(ctx: &mut Context) -> bool {
-    let fids: Vec<FunctionId> = ctx.function_ids();
-    let mut changed = false;
-    for fid in fids {
-        if !Function::from_id(ctx, fid).is_pure() {
-            continue;
-        }
-        if let Some(m) = try_match_strlen(ctx, fid) {
-            changed |= apply_strlen(ctx, fid, &m);
-        }
+/// Recognize a bounded NUL-scan in this (pure) function, rewriting its escaping
+/// count to `len(take_while(arr))`. Returns `true` if changed.
+fn recognize_strlen_at<'str>(m: &ModuleView<'_, 'str>, body: &mut FunctionBody<'str>) -> bool {
+    let fid = body.id();
+    if !FunctionRef::new(body.read_host(m), fid).is_pure() {
+        return false;
     }
-    changed
+    let Some(sm) = try_match_strlen(body.read_host(m), fid) else {
+        return false;
+    };
+    apply_strlen(&mut body.host(m), fid, &sm)
 }
 
 // ===========================================================================
@@ -398,10 +403,10 @@ struct StrlenPtrMatch {
 }
 
 /// Match a raw-pointer NUL-scan in `fid`, or `None` for any other shape.
-fn try_match_strlen_ptr(ctx: &Context, fid: FunctionId) -> Option<StrlenPtrMatch> {
-    for block in Function::from_id(ctx, fid).iter() {
+fn try_match_strlen_ptr(host: HostRef, fid: FunctionId) -> Option<StrlenPtrMatch> {
+    for block in FunctionRef::new(host, fid).iter() {
         let header = block.id;
-        let params: Vec<ValueId> = BasicBlock::from_id(ctx, header)
+        let params: Vec<ValueId> = BlockRef::new(host, header)
             .params()
             .map(|p| p.id())
             .collect();
@@ -410,14 +415,14 @@ fn try_match_strlen_ptr(ctx: &Context, fid: FunctionId) -> Option<StrlenPtrMatch
             // single base pointer `@s0`. Requiring *exactly one* non-increment
             // incoming pins the base unambiguously — with two entry pointers, the
             // `end - base` length would only be `strlen` on the matching entry.
-            let incoming = incoming(ctx, header, k);
-            if !incoming.iter().any(|&v| is_increment(ctx, v, s)) {
+            let incoming = incoming(host, header, k);
+            if !incoming.iter().any(|&v| is_increment(host, v, s)) {
                 continue;
             }
             let bases: Vec<ValueId> = incoming
                 .iter()
                 .copied()
-                .filter(|&v| !is_increment(ctx, v, s))
+                .filter(|&v| !is_increment(host, v, s))
                 .collect();
             let [base] = bases[..] else {
                 continue;
@@ -425,10 +430,10 @@ fn try_match_strlen_ptr(ctx: &Context, fid: FunctionId) -> Option<StrlenPtrMatch
 
             // A byte load at the pointer, in real memory (not a shadow snapshot —
             // that is Layer 1's `is_temp` region).
-            let load = BasicBlock::from_id(ctx, header)
+            let load = BlockRef::new(host, header)
                 .iter()
                 .find_map(|i| match i.mnemonic() {
-                    Mnemonic::Load(l) if l.ptr == s && l.size == 1 && !is_temp(ctx, l.space) => {
+                    Mnemonic::Load(l) if l.ptr == s && l.size == 1 && !is_temp(host, l.space) => {
                         Some(i.id)
                     }
                     _ => None,
@@ -440,7 +445,7 @@ fn try_match_strlen_ptr(ctx: &Context, fid: FunctionId) -> Option<StrlenPtrMatch
 
             // The header's terminator is the NUL test; its continue edge re-enters
             // the loop and its other edge leaves, carrying the end pointer.
-            let Some(term) = BasicBlock::from_id(ctx, header).iter().last() else {
+            let Some(term) = BlockRef::new(host, header).iter().last() else {
                 continue;
             };
             let Mnemonic::CBranch(CBranch {
@@ -453,7 +458,7 @@ fn try_match_strlen_ptr(ctx: &Context, fid: FunctionId) -> Option<StrlenPtrMatch
             else {
                 continue;
             };
-            let Some(nonzero_continues) = nonzero_polarity(ctx, *condition, elem_val) else {
+            let Some(nonzero_continues) = nonzero_polarity(host, *condition, elem_val) else {
                 continue;
             };
             let (exit_block, exit_args, body_block) = if nonzero_continues {
@@ -470,7 +475,7 @@ fn try_match_strlen_ptr(ctx: &Context, fid: FunctionId) -> Option<StrlenPtrMatch
             }
             // The body is an unconditional back-edge: the NUL test is the loop's
             // sole exit (else `end - base` is not the first-zero offset).
-            let back_ok = BasicBlock::from_id(ctx, body_block).iter().last().is_some_and(|t| {
+            let back_ok = BlockRef::new(host, body_block).iter().last().is_some_and(|t| {
                 matches!(t.mnemonic(), Mnemonic::Branch(Branch { target, .. }) if *target == header)
             });
             if !back_ok {
@@ -481,11 +486,11 @@ fn try_match_strlen_ptr(ctx: &Context, fid: FunctionId) -> Option<StrlenPtrMatch
             // end pointer is the exit-block param fed the induction pointer. Matched
             // by `lhs - base` with `lhs` an exit param carrying `s`.
             let kx = exit_args.iter().position(|&v| v == s)?;
-            let end_param = BasicBlock::from_id(ctx, exit_block)
+            let end_param = BlockRef::new(host, exit_block)
                 .params()
                 .nth(kx)
                 .map(|p| p.id())?;
-            for b2 in Function::from_id(ctx, fid).iter() {
+            for b2 in FunctionRef::new(host, fid).iter() {
                 let bid = b2.id;
                 for i in b2.iter() {
                     if let Mnemonic::Binop(bin) = i.mnemonic()
@@ -508,60 +513,61 @@ fn try_match_strlen_ptr(ctx: &Context, fid: FunctionId) -> Option<StrlenPtrMatch
 
 /// Rewrite a matched raw-pointer scan: replace its `end - base` difference with
 /// `len(take_while(@base))` over the unbounded string at `@base`.
-fn apply_strlen_ptr(ctx: &mut Context, m: &StrlenPtrMatch) -> bool {
+fn apply_strlen_ptr<'str, H: HostMut<'str>>(host: &mut H, m: &StrlenPtrMatch) -> bool {
     let tw_id = IntrinsicId::from_name("take_while").expect("take_while registered");
     let len_id = IntrinsicId::from_name("len").expect("len registered");
     let len_val = {
-        let mut b = Builder::from_block(BasicBlock::from_id_mut(ctx, m.diff_block));
+        let mut b = Builder::from_block(BaseRef::new(host.reborrow_host(), m.diff_block));
         b.set_insert_point_before(m.diff_id);
         let tw = b.push_intrinsic(tw_id, vec![m.base]).id();
         b.push_intrinsic(len_id, vec![tw]).id()
     };
-    ctx.replace_all_uses_with(ValueId::Instruction(m.diff_id), len_val);
-    ctx.remove_instruction(m.diff_id);
+    host.replace_all_uses_with(ValueId::Instruction(m.diff_id), len_val);
+    host.remove_instruction(m.diff_id);
     // The scan now produces nothing used outside it; later DCE removes the dead loop.
     true
 }
 
-/// Recognize raw-pointer NUL-scan loops across all functions, rewriting each
-/// `end - base` length to `len(take_while(base))`. Returns `true` if anything changed.
-pub(crate) fn recognize_strlens_ptr(ctx: &mut Context) -> bool {
-    let fids: Vec<FunctionId> = ctx.function_ids();
-    let mut changed = false;
-    for fid in fids {
-        if let Some(m) = try_match_strlen_ptr(ctx, fid) {
-            changed |= apply_strlen_ptr(ctx, &m);
-        }
-    }
-    changed
+/// Recognize a raw-pointer NUL-scan in this function, rewriting its `end - base`
+/// length to `len(take_while(base))`. Returns `true` if changed.
+fn recognize_strlen_ptr<'str>(m: &ModuleView<'_, 'str>, body: &mut FunctionBody<'str>) -> bool {
+    let Some(sm) = try_match_strlen_ptr(body.read_host(m), body.id()) else {
+        return false;
+    };
+    apply_strlen_ptr(&mut body.host(m), &sm)
 }
 
 #[derive(Default)]
 pub struct Strlen;
 
-impl Pass for Strlen {
+impl FunctionPassV2 for Strlen {
     const NAME: &'static str = "strlen";
     fn description(&self) -> &'static str {
         "Rewrite a bounded NUL-scan as len(take_while(arr)) (snapshot and raw-pointer forms)"
     }
-    fn run(&self, ctx: &mut Context, _env: &PipelineEnv) -> Result<bool, String> {
+    fn run<'str>(
+        &self,
+        m: &ModuleView<'_, 'str>,
+        f: &mut FunctionBody<'str>,
+    ) -> Result<bool, String> {
         // Layer 1 (at-form snapshot) then Layer 2 (raw char*); mutually exclusive
         // on any one function.
-        let mut changed = recognize_strlens(ctx);
-        changed |= recognize_strlens_ptr(ctx);
+        let mut changed = recognize_strlen_at(m, f);
+        changed |= recognize_strlen_ptr(m, f);
         Ok(changed)
     }
 }
 
-crate::register_module_pass!(Strlen);
+register_function_pass_v2!(Strlen);
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use qcode::{
         builder::Builder,
+        context::Context,
         testing::TestContext,
-        value::{Value, insn::Mnemonic},
+        value::{BasicBlock, Function, Value, insn::Mnemonic},
     };
 
     use crate::test_util::run_function_pass_v2;
@@ -793,7 +799,7 @@ mod tests {
             "array_reads promotes the read-only shadow snapshot to at(@arr, i)"
         );
         assert!(
-            recognize_strlens(&mut tc.ctx),
+            run_function_pass_v2::<Strlen>(&mut tc.ctx, fid).unwrap(),
             "bounded NUL-scan must recognize on the at-form"
         );
         assert_eq!(
@@ -820,7 +826,7 @@ mod tests {
 
         run_function_pass_v2::<crate::mem::array_reads::ArrayReads>(&mut tc.ctx, fid).unwrap();
         assert!(
-            !recognize_strlens(&mut tc.ctx),
+            !run_function_pass_v2::<Strlen>(&mut tc.ctx, fid).unwrap(),
             "a loop with a second exit is not a NUL-scan strlen"
         );
         assert_eq!(
@@ -843,7 +849,7 @@ mod tests {
             "array_reads declines a region with a store"
         );
         assert!(
-            !recognize_strlens(&mut tc.ctx),
+            !run_function_pass_v2::<Strlen>(&mut tc.ctx, fid).unwrap(),
             "a loop that stores is not a read-only NUL-scan"
         );
         assert_eq!(
@@ -933,10 +939,10 @@ mod tests {
     #[test]
     fn raw_pointer_nul_scan_recognized_as_len_take_while() {
         let mut tc = TestContext::new();
-        let (_fid, exit, s0) = build_strlen_ptr_loop(&mut tc, /*with_diff*/ true);
+        let (fid, exit, s0) = build_strlen_ptr_loop(&mut tc, /*with_diff*/ true);
 
         assert!(
-            recognize_strlens_ptr(&mut tc.ctx),
+            run_function_pass_v2::<Strlen>(&mut tc.ctx, fid).unwrap(),
             "raw-pointer NUL-scan must recognize"
         );
         assert_eq!(
@@ -965,10 +971,10 @@ mod tests {
     #[test]
     fn raw_pointer_scan_without_difference_declined() {
         let mut tc = TestContext::new();
-        let (_fid, exit, _s0) = build_strlen_ptr_loop(&mut tc, /*with_diff*/ false);
+        let (fid, exit, _s0) = build_strlen_ptr_loop(&mut tc, /*with_diff*/ false);
 
         assert!(
-            !recognize_strlens_ptr(&mut tc.ctx),
+            !run_function_pass_v2::<Strlen>(&mut tc.ctx, fid).unwrap(),
             "no end-base difference means nothing to rewrite"
         );
         assert_eq!(

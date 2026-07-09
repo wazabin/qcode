@@ -9,19 +9,20 @@
 //! [`loop_to_scan`](super::loop_to_scan), and the element-projection rewrite; they
 //! know nothing about any particular recognizer's shape.
 
-use std::borrow::Cow;
-
 use rustc_hash::FxHashMap as HashMap;
 
 use qcode::{
     context::Context,
     types::TypeId,
     value::{
-        BasicBlock, BlockId, Function, FunctionId, Instruction, InstructionRef, Renameable,
-        ValueId,
+        BasicBlock, BlockId, Function, FunctionId, FunctionKind, InstructionRef, ValueId,
+        block_param::BlockParam,
         insn::{Binary, Binop, Extract, InstructionId, IntBinop, Mnemonic, Range, Return},
+        util::{base_ref::BaseRef, base_ref::HostRef, host_mut::HostMut},
     },
 };
+
+use crate::pipeline::{FunctionBody, ModuleView};
 
 /// Whether `m` is a pure value-computing op that may appear inside an outlined
 /// per-element body: arithmetic, casts, bit ops, aggregate projection. Anything
@@ -46,11 +47,12 @@ fn is_pure_expr_op(m: &Mnemonic) -> bool {
 /// **closed** over `inputs` + literals: it reaches a free block-param, a raw
 /// varnode, a function ref, or an impure op. A value in `inputs` is a leaf (it
 /// becomes a parameter); a literal is a leaf (referenced directly).
-pub(crate) fn pure_slice(
-    ctx: &Context,
+pub(crate) fn pure_slice<'a, 'str: 'a>(
+    host: impl Into<HostRef<'a, 'str>>,
     result: ValueId,
     inputs: &[ValueId],
 ) -> Option<Vec<InstructionId>> {
+    let host = host.into();
     let is_input = |v: ValueId| inputs.contains(&v);
     let mut order: Vec<InstructionId> = Vec::new();
     let mut seen: HashMap<ValueId, ()> = HashMap::default();
@@ -73,7 +75,7 @@ pub(crate) fn pure_slice(
             // A free block-param, varnode, or function ref: not closed.
             return None;
         };
-        let m = ctx.get_insn(id).mnemonic().clone();
+        let m = host.instruction(id).mnemonic().clone();
         if !is_pure_expr_op(&m) {
             return None;
         }
@@ -94,23 +96,22 @@ pub(crate) fn pure_slice(
 ///
 /// Returns `None` if the expression is not closed over `inputs` + literals (see
 /// [`pure_slice`]) — the caller then leaves the loop unrecognized.
-pub(crate) fn outline_expression(
-    ctx: &mut Context,
+pub(crate) fn outline_expression<'str>(
+    m: &ModuleView<'_, 'str>,
+    body: &mut FunctionBody<'str>,
     name: &str,
     result: ValueId,
     inputs: &[ValueId],
 ) -> Option<FunctionId> {
-    let slice = pure_slice(ctx, result, inputs)?;
+    let slice = pure_slice(body.read_host(m), result, inputs)?;
     let inputs = inputs.to_vec();
-    outline_core(ctx, name, result, &slice, move |ctx, root| {
+    outline_core(m, body, name, result, &slice, move |own, minted, root| {
         // Parameters, in input order, typed as the host inputs.
         let mut value_map: HashMap<ValueId, ValueId> = HashMap::default();
         for inp in inputs {
-            let ty = ctx.type_of(inp);
-            let size = ctx.types.size_of(ty);
-            let pid = BasicBlock::from_id_mut(ctx, root).push_param(size).id;
-            ctx.values.block_param_mut(pid).type_id = ty;
-            value_map.insert(inp, ValueId::BlockParam(pid));
+            let ty = own.type_of(inp);
+            let pid = push_param_into(minted, root, ty);
+            value_map.insert(inp, pid);
         }
         value_map
     })
@@ -128,8 +129,9 @@ pub(crate) fn outline_expression(
 ///
 /// Returns `None` if the expression is not closed over `(index, elem?)` + literals
 /// (see [`pure_slice`]).
-pub(crate) fn outline_tupled(
-    ctx: &mut Context,
+pub(crate) fn outline_tupled<'str>(
+    m: &ModuleView<'_, 'str>,
+    body: &mut FunctionBody<'str>,
     name: &str,
     result: ValueId,
     index_input: ValueId,
@@ -138,34 +140,30 @@ pub(crate) fn outline_tupled(
 ) -> Option<FunctionId> {
     let mut inputs = vec![index_input];
     inputs.extend(elem_input);
-    let slice = pure_slice(ctx, result, &inputs)?;
-    outline_core(ctx, name, result, &slice, move |ctx, root| {
+    let slice = pure_slice(body.read_host(m), result, &inputs)?;
+    outline_core(m, body, name, result, &slice, move |own, minted, root| {
         let mut value_map: HashMap<ValueId, ValueId> = HashMap::default();
-        let tsz = ctx.types.size_of(tuple_ty);
-        let pid = BasicBlock::from_id_mut(ctx, root).push_param(tsz).id;
-        ctx.values.block_param_mut(pid).type_id = tuple_ty;
-        let tuple = ValueId::BlockParam(pid);
+        let tuple = push_param_into(minted, root, tuple_ty);
         // index = t.0, elem = t.1 — the extracts the body unpacks. `elem` is only
         // extracted when the body actually consumes the lane element.
         let fields = [(0usize, Some(index_input)), (1usize, elem_input)];
         for (field, input) in fields {
             let Some(input) = input else { continue };
-            let fty = ctx
+            let fty = own
+                .shared()
                 .types
                 .field_type(tuple_ty, field)
                 .expect("enumerate tuple field");
-            let ex = InstructionRef::from_mnemonic_with_type(
-                ctx,
-                root.func,
+            let ex = push_insn_into(
+                minted,
+                root,
                 Mnemonic::Extract(Extract {
                     agg: tuple,
                     index: field,
                 }),
                 fty,
-            )
-            .id;
-            BasicBlock::from_id_mut(ctx, root).push_insn(ex);
-            value_map.insert(input, ValueId::Instruction(ex));
+            );
+            value_map.insert(input, ex);
         }
         value_map
     })
@@ -199,8 +197,9 @@ pub(crate) enum ScanElem {
 /// Returns `None` if the expression is not closed over those inputs + literals,
 /// or if `elem_input` is given in scalar mode.
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn outline_scan_body(
-    ctx: &mut Context,
+pub(crate) fn outline_scan_body<'str>(
+    m: &ModuleView<'_, 'str>,
+    body: &mut FunctionBody<'str>,
     name: &str,
     result: ValueId,
     acc_input: ValueId,
@@ -223,14 +222,12 @@ pub(crate) fn outline_scan_body(
         // the index is not exposed.
         ScanElem::Data(_) => vec![acc_input, elem_input?],
     };
-    let slice = pure_slice(ctx, result, &inputs)?;
-    outline_core(ctx, name, result, &slice, move |ctx, root| {
+    let slice = pure_slice(body.read_host(m), result, &inputs)?;
+    outline_core(m, body, name, result, &slice, move |own, minted, root| {
         let mut value_map: HashMap<ValueId, ValueId> = HashMap::default();
         // Param 0: the accumulator.
-        let acc_sz = ctx.types.size_of(acc_ty);
-        let apid = BasicBlock::from_id_mut(ctx, root).push_param(acc_sz).id;
-        ctx.values.block_param_mut(apid).type_id = acc_ty;
-        value_map.insert(acc_input, ValueId::BlockParam(apid));
+        let apid = push_param_into(minted, root, acc_ty);
+        value_map.insert(acc_input, apid);
         // Param 1: the per-lane input. The body's loop index is
         // `(index_ty)(raw) + index_start` — the `i64` driver value narrowed to the
         // loop index's width, shifted so element 0 maps to the loop's first index
@@ -241,10 +238,7 @@ pub(crate) fn outline_scan_body(
             ScanElem::Scalar(elem_ty) => elem_ty,
             ScanElem::Data(elem_ty) => elem_ty,
         };
-        let psz = ctx.types.size_of(param_ty);
-        let pid = BasicBlock::from_id_mut(ctx, root).push_param(psz).id;
-        ctx.values.block_param_mut(pid).type_id = param_ty;
-        let param = ValueId::BlockParam(pid);
+        let param = push_param_into(minted, root, param_ty);
         // Data mode: the param *is* the element; bind it and skip index derivation.
         if let ScanElem::Data(_) = elem {
             value_map.insert(elem_input.expect("data mode requires elem_input"), param);
@@ -258,22 +252,21 @@ pub(crate) fn outline_scan_body(
             // Data mode returned above.
             ScanElem::Data(_) => unreachable!("data mode handled above"),
         };
+        let types = &own.shared().types;
         // Narrow `i64` index → loop index width.
-        let isz = ctx.types.size_of(index_ty);
-        if isz < ctx.types.size_of(fty) {
-            let r = InstructionRef::from_mnemonic_with_type(
-                ctx,
-                root.func,
+        let isz = types.size_of(index_ty);
+        if isz < types.size_of(fty) {
+            let r = push_insn_into(
+                minted,
+                root,
                 Mnemonic::Range(Range {
                     src: idx,
                     start: 0,
                     size: isz,
                 }),
                 index_ty,
-            )
-            .id;
-            BasicBlock::from_id_mut(ctx, root).push_insn(r);
-            idx = ValueId::Instruction(r);
+            );
+            idx = r;
         }
         // Shift by the start index.
         if index_start != 0 {
@@ -282,89 +275,137 @@ pub(crate) fn outline_scan_body(
             } else {
                 (1u64 << (isz * 8)) - 1
             };
-            let c = ctx.get_const((index_start as u64) & mask, isz).id();
-            let add = InstructionRef::from_mnemonic_with_type(
-                ctx,
-                root.func,
+            let c = own
+                .shared()
+                .get_const((index_start as u64) & mask, isz)
+                .id();
+            let add = push_insn_into(
+                minted,
+                root,
                 Mnemonic::Binop(Binary {
                     lhs: idx,
                     rhs: c,
                     op: Binop::Int(IntBinop::Add),
                 }),
                 index_ty,
-            )
-            .id;
-            BasicBlock::from_id_mut(ctx, root).push_insn(add);
-            idx = ValueId::Instruction(add);
+            );
+            idx = add;
         }
         value_map.insert(index_input, idx);
         value_map
     })
 }
 
-/// Build a fresh single-block pure function `name` returning `result`, cloning
-/// the pure `slice` (in definition order) with operands remapped through the
-/// value map that `seed` installs. `seed` creates the root block's parameters
-/// (and any unpacking instructions) and returns the initial input→value map.
-fn outline_core(
-    ctx: &mut Context,
+/// Push a fresh param typed `ty` onto `block` in the minted host (host-routed
+/// mirror of `BasicBlock::push_param` + the `type_id` write). Returns its value.
+fn push_param_into<'str, H: HostMut<'str>>(host: &mut H, block: BlockId, ty: TypeId) -> ValueId {
+    let index = host.read_host().block(block).params.len();
+    let pid = host.push_block_param(
+        block.func,
+        BlockParam {
+            index,
+            type_id: ty,
+            parent: Some(block),
+            name: None,
+            origin: None,
+            protected: false,
+        },
+    );
+    host.block_mut(block).params.push(pid);
+    ValueId::BlockParam(pid)
+}
+
+/// Mint an instruction with an explicit result type into the minted host and
+/// append it to `block` (host-routed mirror of `InstructionRef::from_mnemonic_with_type`
+/// + `push_insn`). Returns its value.
+fn push_insn_into<'str, H: HostMut<'str>>(
+    host: &mut H,
+    block: BlockId,
+    mnemonic: Mnemonic,
+    ty: TypeId,
+) -> ValueId {
+    let id = host.push_mnemonic_with_type(block.func, mnemonic, ty);
+    BaseRef::new(host.reborrow_host(), block).push_insn(id);
+    ValueId::Instruction(id)
+}
+
+/// Build a fresh single-block pure function `name` returning `result` by
+/// [minting](FunctionBody::mint_function) it (kind `Machine`, `is_pure`),
+/// cloning the pure `slice` (read from `body`'s own function, in definition
+/// order) with operands remapped through the value map that `seed` installs.
+/// `seed` receives a read view of the owning function and the minted mutation
+/// host, creates the root block's parameters (and any unpacking instructions),
+/// and returns the initial input→value map. Returns `None` when the mint pool is
+/// exhausted (the caller then leaves the loop unrecognized).
+fn outline_core<'str>(
+    m: &ModuleView<'_, 'str>,
+    body: &mut FunctionBody<'str>,
     name: &str,
     result: ValueId,
     slice: &[InstructionId],
-    seed: impl FnOnce(&mut Context, BlockId) -> HashMap<ValueId, ValueId>,
+    seed: impl for<'a> FnOnce(
+        HostRef<'a, 'str>,
+        &mut qcode::value::util::host_mut::CheckedOut<'a, 'str>,
+        BlockId,
+    ) -> HashMap<ValueId, ValueId>,
 ) -> Option<FunctionId> {
-    let fid = Function::make(ctx, Cow::Owned(name.to_owned())).ok()?.id;
-    let root = Function::from_id_mut(ctx, fid).make_root().id;
+    // Fully pure: a deterministic function of its params. `is_pure` (with the
+    // implied `pure_reg`) is set by `mint_function`; the GUI purity badge keys
+    // off `pure_reg`.
+    let fid = body.mint_function(
+        std::borrow::Cow::Owned(name.to_owned()),
+        FunctionKind::Machine,
+        /*pure*/ true,
+    )?;
 
-    // Give the root block a name so it renders with a real label in the GUI
-    // (otherwise it falls back to an opaque `<bb_N>`). Block names are
-    // function-scoped, so deduplicate within the new function's own table.
-    let block_name = ctx.get_unique_name_in(fid, Cow::Owned(format!("{name}_entry")));
-    BasicBlock::from_id_mut(ctx, root)
-        .rename(block_name)
-        .expect("name was deduplicated");
+    // Read the slice mnemonics/types from the owning function up front, so the
+    // minted-host borrow below does not overlap the owner read.
+    let cloned: Vec<(InstructionId, Mnemonic, TypeId)> = {
+        let own = body.read_host(m);
+        slice
+            .iter()
+            .map(|&iid| {
+                let r = InstructionRef::new(own, iid);
+                (iid, r.mnemonic().clone(), r.type_id())
+            })
+            .collect()
+    };
+    let dummy_ptr = m.ctx().get_const(0, 8).id();
+    let ret_ty = m.ctx().types.get_or_make_int(1);
+
+    let (own, mut minted) = body.host_with_minted(m, fid);
+    // Root block, set as the minted function's entry, named for display (block
+    // names are function-scoped, so uniqueness is within the new function).
+    let root = minted.make_block(fid);
+    minted.function_mut(fid).root = Some(root);
+    let block_name = format!("{name}_entry");
+    let _ = BaseRef::new(minted.reborrow(), root).rename_local(std::borrow::Cow::Owned(block_name));
 
     // Params / unpacking, installed by the caller; seeds the input→value map.
-    let mut value_map = seed(ctx, root);
+    let mut value_map = seed(own, &mut minted, root);
 
     // Clone the slice in definition order, remapping operands through the map.
-    for &iid in slice {
-        let (mut m, ty) = {
-            let insn = Instruction::from_id(ctx, iid);
-            (insn.mnemonic().clone(), insn.type_id())
-        };
-        for a in m.args() {
+    for (iid, mut mn, ty) in cloned {
+        for a in mn.args() {
             if let Some(&n) = value_map.get(&a) {
-                m.replace_value(a, n);
+                mn.replace_value(a, n);
             }
         }
-        let new_id = InstructionRef::from_mnemonic_with_type(ctx, root.func, m, ty).id;
-        BasicBlock::from_id_mut(ctx, root).push_insn(new_id);
-        value_map.insert(ValueId::Instruction(iid), ValueId::Instruction(new_id));
+        let new = push_insn_into(&mut minted, root, mn, ty);
+        value_map.insert(ValueId::Instruction(iid), new);
     }
 
     // Return the element value. `ptr` is the (irrelevant) return-address slot.
     let ret_val = value_map.get(&result).copied().unwrap_or(result);
-    let dummy_ptr = ctx.get_const(0, 8).id();
-    let ret_ty = ctx.types.get_or_make_int(1);
-    let ret = InstructionRef::from_mnemonic_with_type(
-        ctx,
-        root.func,
+    push_insn_into(
+        &mut minted,
+        root,
         Mnemonic::Return(Return {
             ptr: dummy_ptr,
             value: Some(ret_val),
         }),
         ret_ty,
-    )
-    .id;
-    BasicBlock::from_id_mut(ctx, root).push_insn(ret);
-
-    // Fully pure: a deterministic function of its params. `is_pure` is the strong
-    // flag; also set `pure_reg` (which it implies) so the GUI — whose purity badge
-    // keys off `is_pure_reg` — marks the outlined body as functionalized.
-    let mut body = Function::from_id_mut(ctx, fid);
-    body.set_is_pure(true);
-    body.set_pure_reg(true);
+    );
     Some(fid)
 }
 
@@ -439,10 +480,7 @@ mod tests {
     fn outlines_closed_pure_expression() {
         let mut tc = TestContext::new();
         let host = Function::make(&mut tc.ctx, "host".into()).unwrap().id;
-        let entry = {
-            let __f = tc.ctx.anon_function();
-            tc.ctx.get_or_make_block(0x1000, __f)
-        };
+        let entry = tc.ctx.get_or_make_block(0x1000, host);
         {
             let mut f = Function::from_id_mut(&mut tc.ctx, host);
             f.set_root(entry).unwrap();
@@ -457,8 +495,10 @@ mod tests {
             (idx, elem, result)
         };
 
-        let body = outline_expression(&mut tc.ctx, "body", result, &[idx, elem])
-            .expect("expression is closed over (idx, elem)");
+        let body = crate::test_util::with_minting(&mut tc.ctx, host, |m, body| {
+            outline_expression(m, body, "body", result, &[idx, elem])
+        })
+        .expect("expression is closed over (idx, elem)");
 
         // Two params, in input order, with the input widths.
         let params: Vec<usize> = Function::from_id(&tc.ctx, body)
@@ -498,10 +538,7 @@ mod tests {
     fn refuses_open_expression_with_load() {
         let mut tc = TestContext::new();
         let host = Function::make(&mut tc.ctx, "host".into()).unwrap().id;
-        let entry = {
-            let __f = tc.ctx.anon_function();
-            tc.ctx.get_or_make_block(0x1000, __f)
-        };
+        let entry = tc.ctx.get_or_make_block(0x1000, host);
         {
             let mut f = Function::from_id_mut(&mut tc.ctx, host);
             f.set_root(entry).unwrap();
@@ -518,7 +555,10 @@ mod tests {
         };
 
         assert!(
-            outline_expression(&mut tc.ctx, "body", result, &[idx]).is_none(),
+            crate::test_util::with_minting(&mut tc.ctx, host, |m, body| {
+                outline_expression(m, body, "body", result, &[idx])
+            })
+            .is_none(),
             "an expression reaching a load must not outline"
         );
     }
@@ -529,10 +569,7 @@ mod tests {
     fn outlines_tupled_index_aware_body() {
         let mut tc = TestContext::new();
         let host = Function::make(&mut tc.ctx, "host".into()).unwrap().id;
-        let entry = {
-            let __f = tc.ctx.anon_function();
-            tc.ctx.get_or_make_block(0x1000, __f)
-        };
+        let entry = tc.ctx.get_or_make_block(0x1000, host);
         {
             let mut f = Function::from_id_mut(&mut tc.ctx, host);
             f.set_root(entry).unwrap();
@@ -554,8 +591,10 @@ mod tests {
         let enum_ty = enum_id.desc().result_type(&tc.ctx.types, &[arr_ty]);
         let (tuple_ty, _) = tc.ctx.types.array_of(enum_ty).unwrap();
 
-        let body = outline_tupled(&mut tc.ctx, "body", result, idx, Some(elem), tuple_ty)
-            .expect("expression is closed over (idx, elem)");
+        let body = crate::test_util::with_minting(&mut tc.ctx, host, |m, body| {
+            outline_tupled(m, body, "body", result, idx, Some(elem), tuple_ty)
+        })
+        .expect("expression is closed over (idx, elem)");
 
         // A single param — the tuple — sized to the `(i64, i8)` aggregate.
         let params: Vec<usize> = Function::from_id(&tc.ctx, body)

@@ -1209,10 +1209,9 @@ impl MintPool {
     fn reserve(&mut self, ctx: &mut Context, n: usize) -> Vec<FunctionId> {
         (0..n)
             .map(|_| {
-                self.available.pop_front().unwrap_or_else(|| {
-                    ctx.values
-                        .push_function(qcode::value::Function::sentinel())
-                })
+                self.available
+                    .pop_front()
+                    .unwrap_or_else(|| ctx.values.push_function(qcode::value::Function::sentinel()))
             })
             .collect()
     }

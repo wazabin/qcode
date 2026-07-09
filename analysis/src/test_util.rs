@@ -44,3 +44,33 @@ pub(crate) fn run_function_pass_v2<P: FunctionPassV2 + Send + Sync>(
 ) -> Result<bool, String> {
     DynFunctionPass::run(&V2Adapter::<P>::default(), ctx, fun, &dummy_env())
 }
+
+/// Check `fun` out, run `f` against its [`FunctionBody`] (carrying two reserved
+/// minting ids), then install any minted functions and check it back in — the
+/// same check-out/mint/install dance the driver performs, so a test can exercise
+/// the outlining helpers directly and inspect the minted function afterwards.
+/// Returns whatever `f` returns.
+pub(crate) fn with_minting<'str, R>(
+    ctx: &mut Context<'str>,
+    fun: FunctionId,
+    f: impl for<'a> FnOnce(
+        &crate::pipeline::ModuleView<'a, 'str>,
+        &mut crate::pipeline::FunctionBody<'str>,
+    ) -> R,
+) -> R {
+    use crate::pipeline::{FunctionBody, ModuleView};
+    let reserved: Vec<FunctionId> = (0..2)
+        .map(|_| ctx.values.push_function(qcode::value::Function::sentinel()))
+        .collect();
+    let env = dummy_env();
+    let fun_value = ctx.checkout_function(fun);
+    let mut body = FunctionBody::new(fun, fun_value, reserved);
+    let out = {
+        let view = ModuleView::new(ctx, &env);
+        f(&view, &mut body)
+    };
+    let (fun_value, _effects, minted, _unused) = body.into_parts();
+    crate::pipeline::install_minted_for_test(ctx, minted);
+    ctx.checkin_function(fun, fun_value);
+    out
+}

@@ -2512,7 +2512,11 @@ mod tests {
         )
         .unwrap();
         assert!(
-            crate::calls::loop_to_map::recognize_total_maps(&mut tc.ctx),
+            crate::test_util::run_function_pass_v2::<crate::calls::loop_to_map::LoopToMap>(
+                &mut tc.ctx,
+                f
+            )
+            .unwrap(),
             "the loop should be recognized as a map"
         );
         let has_map = Function::from_id(&tc.ctx, f)
@@ -2743,7 +2747,11 @@ mod tests {
         .unwrap();
         eprintln!("AFTER ARRAYPROMOTE:\n{}", Function::from_id(&tc.ctx, f));
         assert!(
-            crate::calls::loop_to_map::recognize_total_maps(&mut tc.ctx),
+            crate::test_util::run_function_pass_v2::<crate::calls::loop_to_map::LoopToMap>(
+                &mut tc.ctx,
+                f
+            )
+            .unwrap(),
             "the total-map loop should be recognized"
         );
         eprintln!("AFTER MAP:\n{}", Function::from_id(&tc.ctx, f));
@@ -2870,7 +2878,11 @@ mod tests {
         )
         .unwrap();
         assert!(
-            crate::calls::loop_to_map::recognize_total_maps(&mut tc.ctx),
+            crate::test_util::run_function_pass_v2::<crate::calls::loop_to_map::LoopToMap>(
+                &mut tc.ctx,
+                f
+            )
+            .unwrap(),
             "the array channel should be recognized as a map even though @acc escapes"
         );
 
@@ -2994,7 +3006,11 @@ mod tests {
         )
         .unwrap();
         assert!(
-            crate::calls::loop_to_map::recognize_total_maps(&mut tc.ctx),
+            crate::test_util::run_function_pass_v2::<crate::calls::loop_to_map::LoopToMap>(
+                &mut tc.ctx,
+                f
+            )
+            .unwrap(),
             "the array channel is a clean total map even though the element feeds @acc"
         );
 

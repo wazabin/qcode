@@ -26,6 +26,17 @@ pub use config::{
 };
 pub use lifter::{LiftOutcome, LiftSummary, Lifter, PipelineServices};
 pub use module_view::{Effects, FunctionBody, ModuleView};
+
+/// Install a set of minted functions into their reserved slots (test-only shim
+/// over the check-in installer, so `test_util::with_minting` can exercise the
+/// outlining helpers without the full driver). Panics on a name collision.
+#[cfg(test)]
+pub(crate) fn install_minted_for_test<'str>(
+    ctx: &mut qcode::context::Context<'str>,
+    minted: Vec<(FunctionId, qcode::value::Function<'str>)>,
+) {
+    pass::install_minted(ctx, "test", minted).expect("minted install");
+}
 pub use pass::{
     DecompilePass, DynDecompilePass, DynFunctionPass, DynPass, FunctionPass, FunctionPassV2, Pass,
     PassRegistration, PipelineEnv, RegisteredPass, V2Adapter, known_pass_names, make_pass,
