@@ -3553,7 +3553,7 @@ impl FunctionPass for Mem2RegPass {
         // it to this function's pointers, yielding an identical `AliasResult` to the
         // former `simple_for_function` (which did `RegisterBase::build` + the same
         // `for_function`). mem2reg deliberately does not apply gvn's frame-freshness.
-        let aliases = env.alias_base(ctx).for_function(ctx, fun_id);
+        let aliases = env.alias_base(ctx).for_function(&*ctx, fun_id);
         // Resolve `@SP` so canonical `@SP ± N` slots are recognised; `None` when
         // the function has no incoming stack-pointer param (legacy literal path).
         let sp_reg = ctx.registers[&env.cfg.stack_pointer];

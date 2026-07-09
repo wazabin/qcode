@@ -4,8 +4,9 @@ use qcode::{
     context::Context,
     space::{SpaceId, SpaceType},
     value::{
-        FunctionId, FunctionRef, ValueId, ValueRef, Varnode,
+        FunctionId, FunctionRef, InstructionRef, ValueId, ValueRef, Varnode,
         insn::{Binop, IntBinop, Mnemonic},
+        util::base_ref::HostRef,
     },
 };
 
@@ -88,8 +89,8 @@ impl UnionFind {
 }
 
 /// Mutable scratch state threaded through the analysis passes.
-struct Analysis<'a> {
-    ctx: &'a Context<'a>,
+struct Analysis<'a, 'str> {
+    host: HostRef<'a, 'str>,
 
     /// Maps each tracked value to its equivalence-class root. Seeded from the
     /// shared [`RegisterBase`] (varnode entries), then grown with this function's
@@ -120,7 +121,7 @@ struct Analysis<'a> {
     uf: UnionFind,
 }
 
-impl<'a> Analysis<'a> {
+impl<'a, 'str> Analysis<'a, 'str> {
     fn canonical_root(&mut self, root: NodeId) -> NodeId {
         match root {
             NodeId::Unknown => NodeId::Unknown,
@@ -163,7 +164,7 @@ impl<'a> Analysis<'a> {
             return self.canonical_root(root);
         }
 
-        let Some((start, end)) = literal_interval(self.ctx, literal, size) else {
+        let Some((start, end)) = literal_interval(self.host.shared(), literal, size) else {
             return NodeId::Unknown;
         };
 
@@ -213,7 +214,7 @@ impl<'a> Analysis<'a> {
         match value {
             ValueId::Varnode(id) => {
                 let (varnode_space_id, start, vn_size) = {
-                    let vn = Varnode::from_id(self.ctx, id);
+                    let vn = Varnode::from_id(self.host.shared(), id);
                     (vn.space().id, vn.address() as u64, vn.size() as u64)
                 };
                 if varnode_space_id != space {
@@ -236,7 +237,7 @@ impl<'a> Analysis<'a> {
                 // Decide what to peel while the ctx borrow from `mnemonic()` is live,
                 // copying out only the owned operands needed, then act after it ends
                 // (the recursive resolve takes `&mut self`).
-                let action = match self.ctx.get_insn(id).mnemonic() {
+                let action = match InstructionRef::new(self.host, id).mnemonic() {
                     Mnemonic::Binop(bin)
                         if matches!(bin.op, Binop::Int(IntBinop::Add | IntBinop::Sub)) =>
                     {
@@ -246,7 +247,7 @@ impl<'a> Analysis<'a> {
                     // any align-down) names the same location as `p` for aliasing: the
                     // mask only lowers the address. Peel to the non-mask operand.
                     Mnemonic::Binop(bin) if matches!(bin.op, Binop::Int(IntBinop::And)) => {
-                        match align_peel_target(self.ctx, bin.lhs, bin.rhs) {
+                        match align_peel_target(self.host.shared(), bin.lhs, bin.rhs) {
                             Some(base) => PeelAction::Peel(base),
                             None => PeelAction::Unknown,
                         }
@@ -263,11 +264,13 @@ impl<'a> Analysis<'a> {
 
                 match action {
                     PeelAction::AddSub(op, lhs, rhs) => {
-                        if ValueRef::from_id(self.ctx, value).space().map(|s| s.id) != Some(space) {
+                        if ValueRef::from_host(self.host, value).space().map(|s| s.id)
+                            != Some(space)
+                        {
                             return NodeId::Unknown;
                         }
-                        let lhs_space = ValueRef::from_id(self.ctx, lhs).space().map(|s| s.id);
-                        let rhs_space = ValueRef::from_id(self.ctx, rhs).space().map(|s| s.id);
+                        let lhs_space = ValueRef::from_host(self.host, lhs).space().map(|s| s.id);
+                        let rhs_space = ValueRef::from_host(self.host, rhs).space().map(|s| s.id);
 
                         if lhs_space == Some(space) && rhs_space != Some(space) {
                             self.resolve_pointer_root(lhs, space, size)
@@ -289,7 +292,7 @@ impl<'a> Analysis<'a> {
                     // pointer) or has none (an untyped/scalar carrier); a source in a
                     // *different* space would be an unrelated location.
                     PeelAction::Peel(src) => {
-                        let src_space = ValueRef::from_id(self.ctx, src).space().map(|s| s.id);
+                        let src_space = ValueRef::from_host(self.host, src).space().map(|s| s.id);
                         if src_space == Some(space) || src_space.is_none() {
                             self.resolve_pointer_root(src, space, size)
                         } else {
@@ -458,9 +461,9 @@ impl RegisterBase {
 
     /// Finish the analysis ("Part B") for the given load/store `pointer_uses`,
     /// resolving each against a private clone of this shared base.
-    fn resolve(&self, ctx: &Context, pointer_uses: Vec<(ValueId, SpaceId, usize)>) -> AliasResult {
+    fn resolve(&self, host: HostRef, pointer_uses: Vec<(ValueId, SpaceId, usize)>) -> AliasResult {
         let mut a = Analysis {
-            ctx,
+            host,
             value_to_root: self.value_to_root.clone(),
             by_space: &self.by_space,
             literal_ranges: HashMap::default(),
@@ -509,11 +512,16 @@ impl RegisterBase {
     /// Finish Part B for a single function: resolve only the pointers used by
     /// `fun_id`'s own loads/stores, so the module-wide instruction scan is not
     /// repeated for every function. This is the per-function GVN entry point.
-    pub fn for_function(&self, ctx: &Context, fun_id: FunctionId) -> AliasResult {
+    pub fn for_function<'a, 'str: 'a>(
+        &self,
+        host: impl Into<HostRef<'a, 'str>>,
+        fun_id: FunctionId,
+    ) -> AliasResult {
+        let host = host.into();
         let mut pointer_uses: Vec<(ValueId, SpaceId, usize)> = Vec::new();
-        for block in FunctionRef::from_id(ctx, fun_id).blocks() {
+        for block in FunctionRef::new(host, fun_id).blocks() {
             for &iid in block.instruction_ids() {
-                match ctx.get_insn(iid).mnemonic() {
+                match InstructionRef::new(host, iid).mnemonic() {
                     Mnemonic::Load(load) => pointer_uses.push((load.ptr, load.space, load.size)),
                     Mnemonic::Store(store) => {
                         pointer_uses.push((store.ptr, store.space, store.size))
@@ -522,7 +530,7 @@ impl RegisterBase {
                 }
             }
         }
-        self.resolve(ctx, pointer_uses)
+        self.resolve(host, pointer_uses)
     }
 }
 
@@ -544,7 +552,7 @@ impl AliasResult {
                 _ => None,
             })
             .collect();
-        RegisterBase::build(ctx).resolve(ctx, pointer_uses)
+        RegisterBase::build(ctx).resolve(HostRef::Module(ctx), pointer_uses)
     }
 
     /// Like [`simple`](Self::simple), but only scans `function_id`'s own

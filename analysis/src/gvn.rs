@@ -183,7 +183,7 @@ impl FunctionPass for Gvn {
         let sp_reg = ctx.registers.get(&env.cfg.stack_pointer).copied();
         let aliases = env
             .alias_base(ctx)
-            .for_function(ctx, fun_id)
+            .for_function(&*ctx, fun_id)
             .with_frame_freshness(ctx, fun_id, sp_reg);
         changed |= gvn_function(ctx, fun_id, Some(&aliases));
         Ok(changed)
