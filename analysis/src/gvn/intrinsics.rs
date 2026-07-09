@@ -46,7 +46,7 @@ impl<'str, H: HostMut<'str>> SubPass<'str, H> for Recognize {
         let mut ctx = host.as_module_mut().expect(MODULE_ONLY);
 
         for &id in recognizers_for(root) {
-            if let Some(args) = id.desc().recognize(ctx, ic.insn_id) {
+            if let Some(args) = id.desc().recognize((&*ctx).into(), ic.insn_id) {
                 // Recognized intrinsics (rol/ror) are width-preserving, so the
                 // root's width is the result width.
                 ed.replace_with_new_insn(

@@ -13,11 +13,11 @@
 //!
 //! This is the missing half of `strlen`: `strlen(s) = len(take_while(s))`.
 
-use crate::context::Context;
 use crate::register_intrinsic;
 use crate::types::{TypeId, TypeManager};
 use crate::value::ValueId;
 use crate::value::insn::{Intrinsic, IntrinsicId, Mnemonic, Simplified};
+use crate::value::util::base_ref::HostRef;
 
 /// `len` — the element count of a sequence.
 struct Len;
@@ -45,7 +45,7 @@ impl Intrinsic for Len {
 
     fn simplify(
         &self,
-        ctx: &mut Context,
+        host: HostRef,
         _id: IntrinsicId,
         out_size: usize,
         args: &[ValueId],
@@ -56,16 +56,16 @@ impl Intrinsic for Len {
         // A fixed array has a statically known length → fold to that constant.
         // A list's length is data-dependent (the NUL position for a string) and
         // stays symbolic.
-        let ty = ctx.type_of(seq);
-        if let Some((_, n)) = ctx.types.array_of(ty) {
-            let lit = ctx.get_const(n as u64, out_size).id();
+        let ty = host.type_of(seq);
+        if let Some((_, n)) = host.shared().types.array_of(ty) {
+            let lit = host.shared().get_const(n as u64, out_size).id();
             return Some(Simplified::Value(lit));
         }
         // `len(iota n) = n`: the length of an as-yet-unfolded index driver is its
         // own operand, recovered symbolically even when `n` is not constant. (A
         // constant `iota` would already have folded to a fixed array above.)
         if let ValueId::Instruction(iid) = seq
-            && let Mnemonic::Intrinsic(app) = ctx.get_insn(iid).mnemonic()
+            && let Mnemonic::Intrinsic(app) = host.instruction(iid).mnemonic()
             && app.id.name() == "iota"
         {
             return Some(Simplified::Value(app.args[0]));
@@ -79,6 +79,7 @@ register_intrinsic!(Len);
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::context::Context;
     use crate::value::insn::IntrinsicId;
     use crate::value::{BasicBlock, ValueId};
 
@@ -124,7 +125,7 @@ mod tests {
         // Array → folds to the literal 6.
         match id
             .desc()
-            .simplify(&mut ctx, id, 8, &[ValueId::BlockParam(ap)])
+            .simplify((&ctx).into(), id, 8, &[ValueId::BlockParam(ap)])
         {
             Some(Simplified::Value(ValueId::Literal(lid))) => {
                 assert_eq!(ctx.values.literals[lid].value, 6);
@@ -135,7 +136,7 @@ mod tests {
         // List → stays symbolic.
         assert!(
             id.desc()
-                .simplify(&mut ctx, id, 8, &[ValueId::BlockParam(lp)])
+                .simplify((&ctx).into(), id, 8, &[ValueId::BlockParam(lp)])
                 .is_none(),
             "len of a list must not fold (data-dependent length)"
         );

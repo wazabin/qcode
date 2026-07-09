@@ -11,11 +11,11 @@
 //! larger splats stay `$splat(x, n)`. `at(splat(x, _)) = x` (see `at.rs`) recovers
 //! any lane without ever expanding the array.
 
-use crate::context::Context;
 use crate::register_intrinsic;
 use crate::types::{TypeId, TypeManager};
 use crate::value::ValueId;
 use crate::value::insn::{Intrinsic, IntrinsicId, Simplified};
+use crate::value::util::base_ref::HostRef;
 
 /// Lane count at or below which a constant `splat` folds to a `Bytes` literal.
 /// Above it the array stays a symbolic `$splat` so dumps remain readable.
@@ -48,7 +48,7 @@ impl Intrinsic for Splat {
 
     fn simplify(
         &self,
-        ctx: &mut Context,
+        host: HostRef,
         _id: IntrinsicId,
         _out_size: usize,
         args: &[ValueId],
@@ -61,6 +61,7 @@ impl Intrinsic for Splat {
         let (ValueId::Literal(vlid), ValueId::Literal(clid)) = (val, count) else {
             return None;
         };
+        let ctx = host.shared();
         let n = ctx.values.literals[clid].value as usize;
         if n == 0 || n > SPLAT_LITERAL_MAX {
             return None;
@@ -74,10 +75,7 @@ impl Intrinsic for Splat {
         for _ in 0..n {
             data.extend_from_slice(&bits.to_le_bytes()[..esz]);
         }
-        let bid = ctx.get_bytes(data).id();
-        if let ValueId::Bytes(b) = bid {
-            ctx.values.bytes[b].type_id = arr_ty;
-        }
+        let bid = ctx.get_typed_bytes(data, arr_ty).id();
         Some(Simplified::Value(bid))
     }
 }

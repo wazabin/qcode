@@ -82,6 +82,30 @@ impl<'a, 'str> HostRef<'a, 'str> {
     pub fn edge(self, id: EdgeId) -> &'a EdgeData {
         &self.function(id.func).edges[id.local]
     }
+
+    /// The [`TypeId`] of `id`, routing arena-cluster values (instruction,
+    /// block-param) to their owning function and reading shared leaves (literal,
+    /// bytes, varnode) from the module. The [`HostRef`] mirror of
+    /// [`Context::type_of`], so a checked-out pass resolves its own SSA values'
+    /// types correctly.
+    ///
+    /// [`Context::type_of`]: crate::context::Context::type_of
+    pub fn type_of(self, id: ValueId) -> crate::types::TypeId {
+        let shared = self.shared();
+        match id {
+            ValueId::Literal(lid) => shared.values.literals[lid].type_id,
+            ValueId::Bytes(bid) => shared.values.bytes[bid].type_id,
+            ValueId::Instruction(iid) => self.instruction(iid).type_id,
+            ValueId::BlockParam(pid) => self.block_param(pid).type_id,
+            ValueId::Varnode(vid) => {
+                if let Some(&ty) = shared.values.varnode_types.get(&vid) {
+                    return ty;
+                }
+                shared.types.get_or_make_int(shared.values.varnodes[vid].size_bytes())
+            }
+            ValueId::BasicBlock(_) | ValueId::Function(_) => shared.types.get_or_make_int(0),
+        }
+    }
 }
 
 impl<'a, 'str> From<&'a Context<'str>> for HostRef<'a, 'str> {

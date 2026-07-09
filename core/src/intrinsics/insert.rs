@@ -11,11 +11,11 @@
 //! DCE/GVN/alias treat it correctly with no special classification. Its dual
 //! reader `at(arr, i)` forwards through it: `at(insert(a, i, v), i) = v`.
 
-use crate::context::Context;
 use crate::register_intrinsic;
 use crate::types::{TypeId, TypeManager};
 use crate::value::ValueId;
 use crate::value::insn::{Intrinsic, IntrinsicId, Simplified};
+use crate::value::util::base_ref::HostRef;
 
 /// `insert` — functional single-lane array update.
 struct Insert;
@@ -42,7 +42,7 @@ impl Intrinsic for Insert {
 
     fn simplify(
         &self,
-        ctx: &mut Context,
+        host: HostRef,
         _id: IntrinsicId,
         _out_size: usize,
         args: &[ValueId],
@@ -57,6 +57,7 @@ impl Intrinsic for Insert {
         else {
             return None;
         };
+        let ctx = host.shared();
         let arr_ty = ctx.values.bytes[bid].type_id;
         let (elem, count) = ctx.types.array_of(arr_ty)?;
         let esz = ctx.types.size_of(elem);
@@ -69,10 +70,7 @@ impl Intrinsic for Insert {
         let off = i * esz;
         let v_bytes = v.to_le_bytes();
         data[off..off + esz].copy_from_slice(&v_bytes[..esz]);
-        let nid = ctx.get_bytes(data).id();
-        if let ValueId::Bytes(b) = nid {
-            ctx.values.bytes[b].type_id = arr_ty;
-        }
+        let nid = ctx.get_typed_bytes(data, arr_ty).id();
         Some(Simplified::Value(nid))
     }
 }
@@ -82,6 +80,7 @@ register_intrinsic!(Insert);
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::context::Context;
     use crate::value::insn::IntrinsicId;
 
     #[test]
@@ -113,7 +112,7 @@ mod tests {
         let v = ctx.get_const(0xaa, 4).id();
         let id = IntrinsicId::from_name("insert").unwrap();
         let Some(Simplified::Value(ValueId::Bytes(nb))) =
-            id.desc().simplify(&mut ctx, id, 12, &[bid, i, v])
+            id.desc().simplify((&ctx).into(), id, 12, &[bid, i, v])
         else {
             panic!("insert into const Bytes should fold");
         };

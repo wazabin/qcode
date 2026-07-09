@@ -975,6 +975,19 @@ impl<'str> Context<'str> {
     pub fn get_bytes(&self, data: Vec<u8>) -> crate::value::BytesRef<'str, '_> {
         let i8_ty = self.types.get_or_make_int(1);
         let type_id = self.types.get_or_make_array(i8_ty, data.len());
+        self.get_typed_bytes(data, type_id)
+    }
+
+    /// Like [`get_bytes`](Self::get_bytes) but stamps the blob with an explicit
+    /// array/sequence [`TypeId`] instead of the default `Array(i8, len)`. Mints
+    /// through the `&self` append path (no post-hoc `type_id` write), so a
+    /// checked-out function pass reading through a [`HostRef`] can materialize a
+    /// typed constant array without mutable access to the shared registry.
+    pub fn get_typed_bytes(
+        &self,
+        data: Vec<u8>,
+        type_id: crate::types::TypeId,
+    ) -> crate::value::BytesRef<'str, '_> {
         let id = self
             .values
             .bytes

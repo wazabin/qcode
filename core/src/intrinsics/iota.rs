@@ -12,11 +12,11 @@
 //!   `emulate_map` constant-projection path exactly like any other constant
 //!   array. Any start offset is baked into the scanned body, so `iota` is unary.
 
-use crate::context::Context;
 use crate::register_intrinsic;
 use crate::types::{TypeId, TypeManager};
 use crate::value::ValueId;
 use crate::value::insn::{Intrinsic, IntrinsicId, Simplified};
+use crate::value::util::base_ref::HostRef;
 
 /// `iota` — the index driver array `[0, 1, …, n-1]` of `i64` elements.
 struct Iota;
@@ -46,7 +46,7 @@ impl Intrinsic for Iota {
 
     fn simplify(
         &self,
-        ctx: &mut Context,
+        host: HostRef,
         _id: IntrinsicId,
         _out_size: usize,
         args: &[ValueId],
@@ -59,6 +59,7 @@ impl Intrinsic for Iota {
         let ValueId::Literal(lid) = n_val else {
             return None;
         };
+        let ctx = host.shared();
         let n = ctx.values.literals[lid].value as usize;
 
         let i64_ty = ctx.types.get_or_make_int(8);
@@ -78,10 +79,7 @@ impl Intrinsic for Iota {
             };
             return Some(Simplified::Value(ctx.get_typed_const(value, arr_ty).id()));
         }
-        let bid = ctx.get_bytes(data).id();
-        if let ValueId::Bytes(b) = bid {
-            ctx.values.bytes[b].type_id = arr_ty;
-        }
+        let bid = ctx.get_typed_bytes(data, arr_ty).id();
         Some(Simplified::Value(bid))
     }
 }
@@ -91,6 +89,7 @@ register_intrinsic!(Iota);
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::context::Context;
     use crate::value::insn::IntrinsicId;
 
     #[test]
@@ -112,11 +111,11 @@ mod tests {
     /// A constant `n` folds `iota(n)` to a `Bytes` array `[i64; n]` = `0,1,…,n-1`.
     #[test]
     fn iota_of_const_folds_to_bytes_array() {
-        let mut ctx = Context::new();
+        let ctx = Context::new();
         let n = ctx.get_const(3, 8).id();
         let id = IntrinsicId::from_name("iota").unwrap();
         let Some(Simplified::Value(ValueId::Bytes(bid))) =
-            id.desc().simplify(&mut ctx, id, 24, &[n])
+            id.desc().simplify((&ctx).into(), id, 24, &[n])
         else {
             panic!("iota(3) should fold to a Bytes array");
         };
@@ -143,7 +142,7 @@ mod tests {
         let id = IntrinsicId::from_name("iota").unwrap();
         assert!(
             id.desc()
-                .simplify(&mut ctx, id, 8, &[ValueId::BlockParam(p)])
+                .simplify((&ctx).into(), id, 8, &[ValueId::BlockParam(p)])
                 .is_none()
         );
     }

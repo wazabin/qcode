@@ -60,7 +60,7 @@ impl<'str, H: HostMut<'str>> SubPass<'str, H> for Identities {
         if let Mnemonic::Intrinsic(intr) = ic.mnemonic {
             let id = intr.id;
             let args = intr.args.clone();
-            match id.desc().simplify(ctx, id, ic.size, &args) {
+            match id.desc().simplify((&*ctx).into(), id, ic.size, &args) {
                 Some(Simplified::Value(repl)) => {
                     ed.replace(&mut ctx, ic.insn_id, repl);
                     return Claim::Done;

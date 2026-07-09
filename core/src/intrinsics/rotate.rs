@@ -4,14 +4,15 @@
 //! `rol` additionally recognizes the `(x << c1) | (x >> c2)` idiom; `ror`'s
 //! constant form shares that shape and is normalised into a `rol`.
 
-use crate::context::Context;
 use crate::register_intrinsic;
 use crate::types::{TypeId, TypeManager};
-use crate::value::ValueId;
 use crate::value::insn::intrinsic::{as_int_binop, const_u64, mask_for};
 use crate::value::insn::{
-    InstructionId, IntBinop, Intrinsic, IntrinsicApp, IntrinsicId, Mnemonic, RootOp, Simplified,
+    InstructionId, InstructionRef, IntBinop, Intrinsic, IntrinsicApp, IntrinsicId, Mnemonic,
+    RootOp, Simplified,
 };
+use crate::value::util::base_ref::HostRef;
+use crate::value::ValueId;
 
 fn eval_rotate(args: &[(u128, usize)], out_size: usize, left: bool) -> Option<u128> {
     let (x, _) = *args.first()?;
@@ -47,16 +48,16 @@ fn eval_ror(args: &[(u128, usize)], out_size: usize) -> Option<u128> {
 /// shift count and `amount` is the existing literal for it when the source was
 /// a shift (so the caller can reuse it), or `None` for the multiply form (whose
 /// amount must be materialized).
-fn as_shl_idiom(ctx: &Context, v: ValueId) -> Option<(ValueId, u64, Option<ValueId>)> {
+fn as_shl_idiom(host: HostRef, v: ValueId) -> Option<(ValueId, u64, Option<ValueId>)> {
     // Canonical shift form: `x << c1`.
-    if let Some((x, c)) = as_int_binop(ctx, v, IntBinop::ShiftLeft) {
-        let cv = const_u64(ctx, c)?;
+    if let Some((x, c)) = as_int_binop(host, v, IntBinop::ShiftLeft) {
+        let cv = const_u64(host, c)?;
         return Some((x, cv, Some(c)));
     }
     // Strength-reduced form: `x * 2^c1` (or `2^c1 * x`). Recover the shift count
     // as the log2 of the power-of-two multiplier.
-    if let Some((a, b)) = as_int_binop(ctx, v, IntBinop::Mul) {
-        let (x, m) = match (const_u64(ctx, b), const_u64(ctx, a)) {
+    if let Some((a, b)) = as_int_binop(host, v, IntBinop::Mul) {
+        let (x, m) = match (const_u64(host, b), const_u64(host, a)) {
             (Some(m), _) => (a, m),
             (None, Some(m)) => (b, m),
             _ => return None,
@@ -74,27 +75,27 @@ fn as_shl_idiom(ctx: &Context, v: ValueId) -> Option<(ValueId, u64, Option<Value
 /// `x * 2^c1` in place of `x << c1` (see [`as_shl_idiom`]). The constant ror
 /// idiom is captured here too: `ror(x, c2)` has the same shape and is
 /// represented as `rol(x, bits - c2)`.
-fn recognize_rol(ctx: &mut Context, root: crate::value::InstructionId) -> Option<Vec<ValueId>> {
-    let root_size = ctx.get_insn(root).size();
+fn recognize_rol(host: HostRef, root: crate::value::InstructionId) -> Option<Vec<ValueId>> {
+    let root_size = InstructionRef::new(host, root).size();
     let bits = (root_size * 8) as u64;
     if bits == 0 {
         return None;
     }
 
-    let (lhs, rhs) = as_int_binop(ctx, ValueId::Instruction(root), IntBinop::Or)?;
+    let (lhs, rhs) = as_int_binop(host, ValueId::Instruction(root), IntBinop::Or)?;
 
     // (shl_side, shr_side) — try both orderings of the commutative `or`.
     for (shl_side, shr_side) in [(lhs, rhs), (rhs, lhs)] {
-        let Some((x1, c1v, c1_amount)) = as_shl_idiom(ctx, shl_side) else {
+        let Some((x1, c1v, c1_amount)) = as_shl_idiom(host, shl_side) else {
             continue;
         };
-        let Some((x2, c2)) = as_int_binop(ctx, shr_side, IntBinop::ShiftRight) else {
+        let Some((x2, c2)) = as_int_binop(host, shr_side, IntBinop::ShiftRight) else {
             continue;
         };
         if x1 != x2 {
             continue;
         }
-        let Some(c2v) = const_u64(ctx, c2) else {
+        let Some(c2v) = const_u64(host, c2) else {
             continue;
         };
         if c1v == 0 || c2v == 0 || c1v + c2v != bits {
@@ -106,9 +107,8 @@ fn recognize_rol(ctx: &mut Context, root: crate::value::InstructionId) -> Option
         let amount = match c1_amount {
             Some(existing) => existing,
             None => {
-                let amt_ty = ctx.type_of(c2);
-                let amt_size = ctx.types.size_of(amt_ty);
-                ctx.get_const(c1v, amt_size).id()
+                let amt_size = host.shared().types.size_of(host.type_of(c2));
+                host.shared().get_const(c1v, amt_size).id()
             }
         };
         return Some(vec![x1, amount]);
@@ -117,11 +117,11 @@ fn recognize_rol(ctx: &mut Context, root: crate::value::InstructionId) -> Option
 }
 
 /// If `v` is defined by a rotate intrinsic, return `(name, x, k)`.
-fn as_rotate(ctx: &Context, v: ValueId) -> Option<(&'static str, ValueId, ValueId)> {
+fn as_rotate(host: HostRef, v: ValueId) -> Option<(&'static str, ValueId, ValueId)> {
     let ValueId::Instruction(id) = v else {
         return None;
     };
-    let Mnemonic::Intrinsic(intr) = ctx.get_insn(id).mnemonic() else {
+    let Mnemonic::Intrinsic(intr) = host.instruction(id).mnemonic() else {
         return None;
     };
     let name = intr.id.name();
@@ -145,7 +145,7 @@ fn as_rotate(ctx: &Context, v: ValueId) -> Option<(&'static str, ValueId, ValueI
 ///   `c` that is a multiple of the width collapses to `x`; otherwise the rotate
 ///   is rebuilt on the reduced amount (e.g. `rol(a, 33) → rol(a, 1)` at 32 bits).
 fn simplify_rotate(
-    ctx: &mut Context,
+    host: HostRef,
     id: IntrinsicId,
     out_size: usize,
     args: &[ValueId],
@@ -159,12 +159,12 @@ fn simplify_rotate(
     }
 
     // Inverse cancellation: op(inv_op(a, k2), k) → a when k and k2 agree.
-    if let Some((inner_name, a, k2)) = as_rotate(ctx, x) {
+    if let Some((inner_name, a, k2)) = as_rotate(host, x) {
         let outer_name = id.name();
         let is_inverse = (outer_name == "rol" && inner_name == "ror")
             || (outer_name == "ror" && inner_name == "rol");
         let same_amount = k == k2
-            || match (const_u64(ctx, k), const_u64(ctx, k2)) {
+            || match (const_u64(host, k), const_u64(host, k2)) {
                 (Some(a), Some(b)) => a % bits == b % bits,
                 _ => false,
             };
@@ -174,7 +174,7 @@ fn simplify_rotate(
     }
 
     // Modulo-width normalisation of a constant amount.
-    if let Some(c) = const_u64(ctx, k) {
+    if let Some(c) = const_u64(host, k) {
         let r = c % bits;
         if r == 0 {
             // A whole number of turns: the rotate is the identity.
@@ -183,9 +183,8 @@ fn simplify_rotate(
         if r != c {
             // Rebuild the same rotate on the reduced amount. The amount keeps
             // the operand's width.
-            let k_size = ctx.type_of(k);
-            let k_size = ctx.types.size_of(k_size);
-            let reduced = ctx.get_const(r, k_size).id();
+            let k_size = host.shared().types.size_of(host.type_of(k));
+            let reduced = host.shared().get_const(r, k_size).id();
             let rotate = IntrinsicApp {
                 id,
                 args: vec![x, reduced],
@@ -221,17 +220,17 @@ impl Intrinsic for Rol {
     fn root_op(&self) -> Option<RootOp> {
         Some(RootOp::IntBinop(IntBinop::Or))
     }
-    fn recognize(&self, ctx: &mut Context, at: InstructionId) -> Option<Vec<ValueId>> {
-        recognize_rol(ctx, at)
+    fn recognize(&self, host: HostRef, at: InstructionId) -> Option<Vec<ValueId>> {
+        recognize_rol(host, at)
     }
     fn simplify(
         &self,
-        ctx: &mut Context,
+        host: HostRef,
         id: IntrinsicId,
         out_size: usize,
         args: &[ValueId],
     ) -> Option<Simplified> {
-        simplify_rotate(ctx, id, out_size, args)
+        simplify_rotate(host, id, out_size, args)
     }
 }
 
@@ -254,12 +253,12 @@ impl Intrinsic for Ror {
     }
     fn simplify(
         &self,
-        ctx: &mut Context,
+        host: HostRef,
         id: IntrinsicId,
         out_size: usize,
         args: &[ValueId],
     ) -> Option<Simplified> {
-        simplify_rotate(ctx, id, out_size, args)
+        simplify_rotate(host, id, out_size, args)
     }
 }
 
