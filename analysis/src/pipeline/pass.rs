@@ -32,7 +32,7 @@ use std::cell::{Ref, RefCell};
 use qcode::{
     context::Context,
     space::Space,
-    value::{FunctionId, RegisterId, Varnode, VarnodeId},
+    value::{Function, FunctionId, RegisterId, Renameable, Varnode, VarnodeId},
 };
 
 use super::{ArchConfig, CallingConvention, FunctionBody, ModuleView};
@@ -235,7 +235,7 @@ impl<T: FunctionPassV2> DynFunctionPass for V2Adapter<T> {
         };
         let (fun, effects, minted, _reserved) = body.into_parts();
         ctx.checkin_function(fun_id, fun);
-        replay_effects(ctx, T::NAME, effects, minted)?;
+        replay_effects(ctx, T::NAME, fun_id, effects, minted)?;
         Ok(changed)
     }
 }
@@ -248,11 +248,12 @@ impl<T: FunctionPassV2> DynFunctionPass for V2Adapter<T> {
 /// Effect kinds are wired as the passes that produce them are ported (each port
 /// commit lands its replay arm). An unwired effect surfaces as a hard error rather
 /// than a silent drop, so a mis-ordered port fails loudly instead of miscompiling.
-fn replay_effects(
-    ctx: &mut Context,
+fn replay_effects<'str>(
+    ctx: &mut Context<'str>,
     pass: &'static str,
-    effects: super::Effects,
-    minted: Vec<qcode::value::Function>,
+    fun_id: FunctionId,
+    effects: super::Effects<'str>,
+    minted: Vec<qcode::value::Function<'str>>,
 ) -> Result<bool, String> {
     let mut changed = false;
     for (prop, value) in effects.assumptions {
@@ -262,10 +263,16 @@ fn replay_effects(
     for discovery in effects.discoveries {
         changed |= ctx.discover(discovery);
     }
-    if effects.self_rename.is_some() {
-        return Err(format!(
-            "{pass}: V2 self-rename replay not wired yet (port cpp_demangle/name_thunks first)"
-        ));
+    // A buffered self-rename (cpp_demangle / name_thunks): the function is already
+    // checked in, so resolve the requested name against the now-complete global
+    // map (`get_unique_name` suffixes on collision) and apply it exactly as a
+    // `FunctionMutRef::rename` would — the same global-name-map update.
+    if let Some(name) = effects.self_rename {
+        let unique = ctx.get_unique_name(name);
+        Function::from_id_mut(ctx, fun_id)
+            .rename(unique)
+            .map_err(|e| format!("{pass}: self-rename replay failed: {e}"))?;
+        changed = true;
     }
     if !effects.address_claims.is_empty() {
         return Err(format!(
