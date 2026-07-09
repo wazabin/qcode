@@ -24,11 +24,11 @@ use std::any::Any;
 use super::affine::{NormalForm, Numbering, arith_form, key_for, materialize};
 use super::walk::{Claim, Editor, InsnCtx, SubPass};
 
+/// CSE numbers pure values down a whole dominator tree. Fully host-routed (the
+/// value-numbering reads through a [`HostRef`](qcode::value::util::base_ref::HostRef)
+/// and rebuilds canonical forms through the [`HostMut`] verbs), so it runs over
+/// either the module or a checked-out function.
 pub(super) struct Cse;
-
-/// CSE numbers pure values down a whole dominator tree and is dispatched only by
-/// the module `gvn` pass, so it runs on the module host.
-const MODULE_ONLY: &str = "Cse is dispatched only by the module gvn pass";
 
 impl<'str, H: HostMut<'str>> SubPass<'str, H> for Cse {
     fn init_state(&self) -> Box<dyn Any> {
@@ -68,11 +68,10 @@ impl<'str, H: HostMut<'str>> SubPass<'str, H> for Cse {
         if ic.mnemonic.is_terminator() || ic.size == 0 {
             return Claim::Pass;
         }
-        let mut ctx = host.as_module_mut().expect(MODULE_ONLY);
         let state = state.downcast_mut::<Numbering>().expect("cse state");
 
         // Arithmetic view (used to compose consumers) and the value-numbering key.
-        let form = arith_form((&*ctx).into(), ic.id, ic.mnemonic, ic.size, state);
+        let form = arith_form(host.read_host(), ic.id, ic.mnemonic, ic.size, state);
         state.record_form(ic.id, form.clone());
         let key = key_for(&form, ic.id, ic.mnemonic);
 
@@ -89,7 +88,7 @@ impl<'str, H: HostMut<'str>> SubPass<'str, H> for Cse {
         // A dominating value already computes this form: forward to it.
         if let Some(leader) = state.lookup(&key) {
             if leader != ic.id {
-                ed.replace(&mut ctx, ic.insn_id, leader);
+                ed.replace(host, ic.insn_id, leader);
             }
             return Claim::Done;
         }
@@ -101,9 +100,9 @@ impl<'str, H: HostMut<'str>> SubPass<'str, H> for Cse {
             // reusing dominating sub-results. `materialize` returns `ic.id` when
             // the instruction is already canonical.
             _ => {
-                let root_ty = ctx.type_of(ic.id);
+                let root_ty = host.read_host().type_of(ic.id);
                 let v = materialize(
-                    ctx,
+                    host,
                     ic.block_id,
                     ic.insn_id,
                     ic.mnemonic,
@@ -112,7 +111,7 @@ impl<'str, H: HostMut<'str>> SubPass<'str, H> for Cse {
                     state,
                 );
                 if v != ic.id {
-                    ed.replace(&mut ctx, ic.insn_id, v);
+                    ed.replace(host, ic.insn_id, v);
                 }
             }
         }

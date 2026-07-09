@@ -33,12 +33,12 @@ use jstd::graph::analysis::DominatorTree;
 use crate::AliasResult;
 use qcode::{
     assumption::Proposition,
-    context::Context,
     space::{Space, SpaceId, SpaceType},
     value::{
-        BasicBlock, Function, Value, ValueId, ValueRef, Varnode, VarnodeId,
-        block::BlockId,
+        FunctionRef, Value, ValueId, ValueRef, Varnode, VarnodeId,
+        block::{BlockId, BlockRef},
         insn::{Binary, Binop, InstructionRef, IntBinop, Load, Mnemonic, Range, Store, Zext},
+        util::{base_ref::HostRef, host_mut::HostMut},
     },
 };
 
@@ -112,10 +112,10 @@ fn locate(
 /// info (isolated values) or an `Unknown` class is **not** proof: such pairs
 /// are treated as possibly-aliasing, so a forwarded cell is dropped on any
 /// doubt.
-fn proven_disjoint(ctx: &Context, aliases: Option<&AliasResult>, a: ValueId, b: ValueId) -> bool {
+fn proven_disjoint(host: HostRef, aliases: Option<&AliasResult>, a: ValueId, b: ValueId) -> bool {
     let Some(aliases) = aliases else { return false };
     // Frame freshness: an own-frame local and an incoming pointer never alias.
-    if aliases.provably_disjoint(ctx, a, b) {
+    if aliases.provably_disjoint(host, a, b) {
         return true;
     }
     matches!(
@@ -129,7 +129,7 @@ fn proven_disjoint(ctx: &Context, aliases: Option<&AliasResult>, a: ValueId, b: 
 /// Only meaningful when `cb != base`. Conservative: returns `false` (not
 /// disjoint) whenever disjointness cannot be proven.
 fn cross_base_disjoint(
-    ctx: &Context,
+    host: HostRef,
     aliases: Option<&AliasResult>,
     ptr: ValueId,
     base: Base,
@@ -142,10 +142,10 @@ fn cross_base_disjoint(
     match (base, cb) {
         // Symbolic vs symbolic: disjoint only if the oracle proves the base
         // values occupy different locations.
-        (Base::Symbolic(_, sv), Base::Symbolic(_, ov)) => proven_disjoint(ctx, aliases, sv, ov),
+        (Base::Symbolic(_, sv), Base::Symbolic(_, ov)) => proven_disjoint(host, aliases, sv, ov),
         // Pinned access vs a symbolic cell: compare the access pointer against
         // the cell's base value.
-        (Base::Pinned(_), Base::Symbolic(_, ov)) => proven_disjoint(ctx, aliases, ptr, ov),
+        (Base::Pinned(_), Base::Symbolic(_, ov)) => proven_disjoint(host, aliases, ptr, ov),
         // Symbolic access vs a pinned cell: the cell's absolute address has no
         // value to query, so we cannot prove disjointness.
         (Base::Symbolic(_, _), Base::Pinned(_)) => false,
@@ -163,9 +163,9 @@ pub(super) struct MemForward {
 
 impl MemForward {
     /// Update state for `store`, invalidating any forwarded value it overwrites.
-    pub(super) fn record_store(
+    pub(super) fn record_store<'str, H: HostMut<'str>>(
         &mut self,
-        ctx: &mut Context,
+        host: &mut H,
         store: &Store,
         aliases: Option<&AliasResult>,
         numbering: &Numbering,
@@ -176,7 +176,7 @@ impl MemForward {
         // Drop cells at *other* bases this store may overwrite (cross-base
         // aliasing); same-base cells are handled by the explicit clear below.
         self.byte_map.retain(|&(cb, _), _| {
-            cb == base || cross_base_disjoint(ctx, aliases, store.ptr, base, cb)
+            cb == base || cross_base_disjoint(host.read_host(), aliases, store.ptr, base, cb)
         });
 
         // The store always overwrites the bytes at its own base, so clear them.
@@ -187,7 +187,9 @@ impl MemForward {
         // than the location (e.g. `MOV ESI, imm32`, whose store width is the full
         // 8-byte RSI), the store zero-extends: the upper bytes are zero, so model
         // them with a zero constant rather than leaving them unmapped.
-        let covered = ValueRef::new(store.src, ctx).size().min(store.size);
+        let covered = ValueRef::from_host(host.read_host(), store.src)
+            .size()
+            .min(store.size);
         for (i, off) in (start..start + covered as i64).enumerate() {
             self.byte_map.insert(
                 (base, off),
@@ -198,7 +200,7 @@ impl MemForward {
             );
         }
         if covered < store.size {
-            let zero = ctx.get_const(0, store.size - covered).id();
+            let zero = host.shared().get_const(0, store.size - covered).id();
             for (i, off) in (start + covered as i64..end).enumerate() {
                 self.byte_map.insert(
                     (base, off),
@@ -213,9 +215,9 @@ impl MemForward {
 
     /// The value `load` forwards to, materializing any rebuild instructions
     /// before `insn_id` in `block_id`, or `None` if it is not fully covered.
-    pub(super) fn try_load(
+    pub(super) fn try_load<'str, H: HostMut<'str>>(
         &mut self,
-        ctx: &mut Context,
+        host: &mut H,
         block_id: BlockId,
         insn_id: qcode::value::InstructionId,
         load: &Load,
@@ -233,7 +235,7 @@ impl MemForward {
             && segments[0].load_off == 0
             && segments[0].size == load_size
             && segments[0].src_off == 0
-            && ValueRef::new(segments[0].src, ctx).size() == load_size
+            && ValueRef::from_host(host.read_host(), segments[0].src).size() == load_size
         {
             // Exact whole-location forward: reuse the stored value directly.
             segments[0].src
@@ -242,9 +244,9 @@ impl MemForward {
             // and cannot represent the result. Assemble a byte blob instead, but
             // only when every covering byte comes from a constant (numeric
             // literal or byte blob); otherwise there is nothing to fold to.
-            self.rebuild_bytes(ctx, &segments, load_size)?
+            self.rebuild_bytes(host, &segments, load_size)?
         } else {
-            self.rebuild(ctx, block_id, insn_id, &segments, load_size)
+            self.rebuild(host, block_id, insn_id, &segments, load_size)
         };
         Some(value)
     }
@@ -298,9 +300,9 @@ impl MemForward {
     /// extracted (`Range`), widened (`Zext`), shifted into place (`<<`), and the
     /// pieces are OR-ed together. Reuses `Range`/`Zext`/`<<`/`|`; constant pieces
     /// fold away in [`super::fold`].
-    fn rebuild(
+    fn rebuild<'str, H: HostMut<'str>>(
         &self,
-        ctx: &mut Context,
+        host: &mut H,
         block_id: BlockId,
         insn_id: qcode::value::InstructionId,
         segments: &[Segment],
@@ -308,12 +310,11 @@ impl MemForward {
     ) -> ValueId {
         let mut acc: Option<ValueId> = None;
         for seg in segments {
-            let piece = self.build_piece(ctx, block_id, insn_id, seg, load_size);
+            let piece = self.build_piece(host, block_id, insn_id, seg, load_size);
             acc = Some(match acc {
                 None => piece,
                 Some(lhs) => {
-                    let or = InstructionRef::from_mnemonic(
-                        ctx,
+                    let or = host.push_mnemonic(
                         block_id.func,
                         Mnemonic::Binop(Binary {
                             op: Binop::Int(IntBinop::Or),
@@ -321,9 +322,8 @@ impl MemForward {
                             rhs: piece,
                         }),
                         load_size,
-                    )
-                    .id;
-                    BasicBlock::from_id_mut(ctx, block_id).insert_insn_before(insn_id, or);
+                    );
+                    host.insert_insn_before(block_id, insn_id, or);
                     or.into()
                 }
             });
@@ -335,12 +335,13 @@ impl MemForward {
     /// memory order, when every segment's source is a compile-time constant.
     /// Returns `None` if any segment is non-constant (the all-constant-or-bail
     /// rule) or out of bounds.
-    fn rebuild_bytes(
+    fn rebuild_bytes<'str, H: HostMut<'str>>(
         &self,
-        ctx: &mut Context,
+        host: &mut H,
         segments: &[Segment],
         load_size: usize,
     ) -> Option<ValueId> {
+        let ctx = host.shared();
         let mut buf = vec![0u8; load_size];
         for seg in segments {
             let bytes: Vec<u8> = match seg.src {
@@ -371,20 +372,19 @@ impl MemForward {
     /// segment already equals the whole source), `Zext` to the load width
     /// (skipped when already that wide), then `<< load_off*8` (skipped at offset
     /// 0).
-    fn build_piece(
+    fn build_piece<'str, H: HostMut<'str>>(
         &self,
-        ctx: &mut Context,
+        host: &mut H,
         block_id: BlockId,
         insn_id: qcode::value::InstructionId,
         seg: &Segment,
         load_size: usize,
     ) -> ValueId {
-        let src_size = ValueRef::new(seg.src, ctx).size();
+        let src_size = ValueRef::from_host(host.read_host(), seg.src).size();
         let extracted = if seg.src_off == 0 && src_size == seg.size {
             seg.src
         } else {
-            let r = InstructionRef::from_mnemonic(
-                ctx,
+            let r = host.push_mnemonic(
                 block_id.func,
                 Mnemonic::Range(Range {
                     src: seg.src,
@@ -392,35 +392,34 @@ impl MemForward {
                     size: seg.size,
                 }),
                 seg.size,
-            )
-            .id;
-            BasicBlock::from_id_mut(ctx, block_id).insert_insn_before(insn_id, r);
+            );
+            host.insert_insn_before(block_id, insn_id, r);
             r.into()
         };
 
         let widened = if seg.size == load_size {
             extracted
         } else {
-            let z = InstructionRef::from_mnemonic(
-                ctx,
+            let z = host.push_mnemonic(
                 block_id.func,
                 Mnemonic::Zext(Zext {
                     src: extracted,
                     size: load_size,
                 }),
                 load_size,
-            )
-            .id;
-            BasicBlock::from_id_mut(ctx, block_id).insert_insn_before(insn_id, z);
+            );
+            host.insert_insn_before(block_id, insn_id, z);
             z.into()
         };
 
         if seg.load_off == 0 {
             return widened;
         }
-        let shamt = ctx.get_const((seg.load_off * 8) as u64, load_size).id();
-        let s = InstructionRef::from_mnemonic(
-            ctx,
+        let shamt = host
+            .shared()
+            .get_const((seg.load_off * 8) as u64, load_size)
+            .id();
+        let s = host.push_mnemonic(
             block_id.func,
             Mnemonic::Binop(Binary {
                 op: Binop::Int(IntBinop::ShiftLeft),
@@ -428,9 +427,8 @@ impl MemForward {
                 rhs: shamt,
             }),
             load_size,
-        )
-        .id;
-        BasicBlock::from_id_mut(ctx, block_id).insert_insn_before(insn_id, s);
+        );
+        host.insert_insn_before(block_id, insn_id, s);
         s.into()
     }
 
@@ -438,11 +436,11 @@ impl MemForward {
     /// no forwarded register value survives across it. Non-call blocks are no-ops.
     pub(super) fn prune_clobbered_by_call(
         &mut self,
-        ctx: &Context,
+        host: HostRef,
         block_id: BlockId,
         aliases: Option<&AliasResult>,
     ) {
-        let term = BasicBlock::from_id(ctx, block_id)
+        let term = BlockRef::new(host, block_id)
             .iter()
             .last()
             .map(|i| i.mnemonic().clone());
@@ -465,7 +463,7 @@ impl MemForward {
         // This is what lets a functionalized callee that writes only its own
         // private scratch space leave the caller's spilled-pointer cell intact.
         let callee_written_spaces: Option<Vec<SpaceId>> = match &term {
-            Some(Mnemonic::Call(call)) => Function::from_id(ctx, call.target)
+            Some(Mnemonic::Call(call)) => FunctionRef::new(host, call.target)
                 .written_spaces()
                 .map(<[_]>::to_vec),
             _ => None,
@@ -474,7 +472,7 @@ impl MemForward {
         let (clobbers, escaping, unknown_callee): (CallClobbers, Vec<ValueId>, bool) = match &term {
             Some(Mnemonic::CallInd(call)) => (CallClobbers::AllRegisters, call.args.clone(), true),
             Some(Mnemonic::Call(call)) => {
-                let callee = Function::from_id(ctx, call.target);
+                let callee = FunctionRef::new(host, call.target);
                 let regs = match callee.clobbered_regs() {
                     Some(regs) => CallClobbers::Regs(regs.to_vec()),
                     None => CallClobbers::AllRegisters,
@@ -520,7 +518,7 @@ impl MemForward {
             })
         };
 
-        let is_reg = |space| matches!(Space::from_id(ctx, space).ty, SpaceType::Register);
+        let is_reg = |space| matches!(Space::from_id(host.shared(), space).ty, SpaceType::Register);
 
         // PROTOTYPE (realigned-frame): frame freshness extended from stores to
         // calls. A symbolic RAM cell whose base is an own-frame local the callee
@@ -536,7 +534,7 @@ impl MemForward {
                 return false;
             }
             let Some(a) = aliases else { return false };
-            a.is_own_frame_local(bv) && escaping.iter().all(|&p| a.provably_disjoint(ctx, p, bv))
+            a.is_own_frame_local(bv) && escaping.iter().all(|&p| a.provably_disjoint(host, p, bv))
         };
 
         self.byte_map.retain(|&(base, off), _| {
@@ -567,7 +565,7 @@ impl MemForward {
                 Base::Pinned(_) => match &clobbers {
                     CallClobbers::AllRegisters => false,
                     CallClobbers::Regs(regs) => !regs.iter().any(|&r| {
-                        let vn = Varnode::from_id(ctx, r);
+                        let vn = Varnode::from_id(host.shared(), r);
                         vn.space().id == space
                             && vn.address() <= off
                             && off < vn.address() + vn.size() as i64
@@ -576,7 +574,7 @@ impl MemForward {
                 Base::Symbolic(_, bv) => match &clobbers {
                     CallClobbers::AllRegisters => false,
                     CallClobbers::Regs(regs) => !regs.iter().any(|&r| match aliases {
-                        Some(a) => a.may_alias(ctx, bv, ValueId::Varnode(r)),
+                        Some(a) => a.may_alias(host, bv, ValueId::Varnode(r)),
                         None => true,
                     }),
                 },
@@ -589,12 +587,13 @@ impl MemForward {
     /// a slot is disjoint from that slot — no self-referential `*pp == &pp`), the
     /// same assumption the alias oracle's spilled-reload rules use. Off → the
     /// conservative opaque-pointer prune.
-    pub(super) fn loaded_ptr_peeling(ctx: &Context, block_id: BlockId) -> bool {
-        BasicBlock::from_id(ctx, block_id)
+    pub(super) fn loaded_ptr_peeling(host: HostRef, block_id: BlockId) -> bool {
+        BlockRef::new(host, block_id)
             .function()
             .map(|f| f.id)
             .is_some_and(|fid| {
-                ctx.truth(Proposition::LoadedPointerDisjointFromSlot(fid))
+                host.shared()
+                    .truth(Proposition::LoadedPointerDisjointFromSlot(fid))
                     .is_some_and(|t| t.value)
             })
     }
@@ -605,7 +604,7 @@ impl MemForward {
     /// here to peel a spilled-pointer reload before disjointness testing.
     fn reload_forwards_to(
         &self,
-        ctx: &Context,
+        host: HostRef,
         v: ValueId,
         aliases: Option<&AliasResult>,
         numbering: &Numbering,
@@ -613,7 +612,7 @@ impl MemForward {
         let ValueId::Instruction(id) = v else {
             return None;
         };
-        let Mnemonic::Load(load) = InstructionRef::from_id(ctx, id).mnemonic().clone() else {
+        let Mnemonic::Load(load) = InstructionRef::new(host, id).mnemonic().clone() else {
             return None;
         };
         let (base, start) = locate(load.ptr, load.space, aliases, numbering);
@@ -622,7 +621,7 @@ impl MemForward {
         (seg.load_off == 0
             && seg.size == load.size
             && seg.src_off == 0
-            && ValueRef::new(seg.src, ctx).size() == load.size)
+            && ValueRef::from_host(host, seg.src).size() == load.size)
             .then_some(seg.src)
     }
 
@@ -638,7 +637,7 @@ impl MemForward {
     /// reload needs to forward.
     fn resolve_loaded_ptr(
         &self,
-        ctx: &Context,
+        host: HostRef,
         ptr: ValueId,
         space: SpaceId,
         aliases: Option<&AliasResult>,
@@ -654,7 +653,7 @@ impl MemForward {
             let Base::Symbolic(_, basev) = base else {
                 break;
             };
-            let Some(value) = self.reload_forwards_to(ctx, basev, aliases, numbering) else {
+            let Some(value) = self.reload_forwards_to(host, basev, aliases, numbering) else {
                 break;
             };
             let (b2, o2) = locate(value, space, aliases, numbering);
@@ -668,14 +667,14 @@ impl MemForward {
     /// overwrite on a later iteration. Non-headers are left untouched.
     pub(super) fn prune_loop_carried(
         &mut self,
-        ctx: &Context,
+        host: HostRef,
         block_id: BlockId,
         tree: &DominatorTree<BlockId>,
         aliases: Option<&AliasResult>,
         numbering: &Numbering,
     ) {
         // `dominates` is reflexive, so a self-loop also counts.
-        let is_loop_header = BasicBlock::from_id(ctx, block_id)
+        let is_loop_header = BlockRef::new(host, block_id)
             .predecessors()
             .any(|(_, pred)| tree.dominates(block_id, pred));
         if !is_loop_header || self.byte_map.is_empty() {
@@ -712,7 +711,7 @@ impl MemForward {
         let stores: Vec<Store> = body
             .iter()
             .flat_map(|&b| {
-                BasicBlock::from_id(ctx, b)
+                BlockRef::new(host, b)
                     .iter()
                     .filter_map(|insn| match insn.mnemonic() {
                         Mnemonic::Store(s) => Some(s.clone()),
@@ -722,7 +721,7 @@ impl MemForward {
             })
             .collect();
 
-        let peel = Self::loaded_ptr_peeling(ctx, block_id);
+        let peel = Self::loaded_ptr_peeling(host, block_id);
 
         // Resolve each store's location once, peeling spilled-pointer reloads
         // against the inherited byte map (see `resolve_loaded_ptr`). `rep` is the
@@ -732,7 +731,7 @@ impl MemForward {
             .iter()
             .map(|store| {
                 let (sb, s) =
-                    self.resolve_loaded_ptr(ctx, store.ptr, store.space, aliases, numbering, peel);
+                    self.resolve_loaded_ptr(host, store.ptr, store.space, aliases, numbering, peel);
                 let rep = match sb {
                     Base::Symbolic(_, bv) => bv,
                     Base::Pinned(_) => store.ptr,
@@ -748,7 +747,7 @@ impl MemForward {
                     s <= off && off < s + size
                 } else {
                     // Other base: may overwrite unless provably disjoint.
-                    !cross_base_disjoint(ctx, aliases, rep, sb, base)
+                    !cross_base_disjoint(host, aliases, rep, sb, base)
                 }
             })
         });
@@ -764,7 +763,9 @@ impl MemForward {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use qcode::context::Context;
     use qcode::testing::TestContext;
+    use qcode::value::{BasicBlock, Function};
 
     /// A store of `src` (width = location width) to varnode `vn`.
     fn store_to(tc: &TestContext, vn: VarnodeId, src: ValueId) -> Store {
@@ -859,8 +860,8 @@ mod tests {
         let byte_store = store_to(&tc, tc.r0_byte0, byte);
         let nb = Numbering::default();
         let mut mf = MemForward::default();
-        mf.record_store(&mut tc.ctx, &wide_store, Some(&aliases), &nb);
-        mf.record_store(&mut tc.ctx, &byte_store, Some(&aliases), &nb);
+        mf.record_store(&mut &mut tc.ctx, &wide_store, Some(&aliases), &nb);
+        mf.record_store(&mut &mut tc.ctx, &byte_store, Some(&aliases), &nb);
 
         assert_eq!(mf.byte_map[&(base, start)].src, byte, "byte 0 overwritten");
         assert_eq!(
@@ -965,7 +966,7 @@ mod tests {
         let nb = precompute_forms(&tc.ctx, fid);
 
         let mut mf = MemForward::default();
-        mf.record_store(&mut tc.ctx, &slot_store, Some(&aliases), &nb);
+        mf.record_store(&mut &mut tc.ctx, &slot_store, Some(&aliases), &nb);
         // A plain caller-frame `@SP - 4` cell, for contrast: its base is the `@SP`
         // param (classified CallerFrame), so it is not own-frame-private.
         let caller_slot = Base::Symbolic(ram, sp);
@@ -983,7 +984,7 @@ mod tests {
             "spill recorded at the realigned own-frame base"
         );
 
-        mf.prune_clobbered_by_call(&tc.ctx, root, Some(&aliases));
+        mf.prune_clobbered_by_call((&tc.ctx).into(), root, Some(&aliases));
 
         assert!(
             mf.byte_map.contains_key(&(realigned, -0x78)),
@@ -1014,7 +1015,12 @@ mod tests {
         let base = Base::Pinned(space);
         let start = start as i64;
         let mut mf = MemForward::default();
-        mf.record_store(&mut tc.ctx, &store, Some(&aliases), &Numbering::default());
+        mf.record_store(
+            &mut &mut tc.ctx,
+            &store,
+            Some(&aliases),
+            &Numbering::default(),
+        );
 
         assert_eq!(mf.byte_map.len(), 4, "all four written bytes are defined");
         assert_eq!(mf.byte_map[&(base, start)].src, narrow);
@@ -1050,14 +1056,21 @@ mod tests {
         let store = store_to(&tc, tc.r0_lo32, src);
         let nb = Numbering::default();
         let mut mf = MemForward::default();
-        mf.record_store(&mut tc.ctx, &store, Some(&aliases), &nb);
+        mf.record_store(&mut &mut tc.ctx, &store, Some(&aliases), &nb);
 
         let load = load_of(&tc, tc.r0_lo32);
         // A dummy instruction id to insert before; none is created here because
         // an exact forward materializes nothing.
         let dummy = qcode::value::InstructionId::default();
         let forwarded = mf
-            .try_load(&mut tc.ctx, block_id, dummy, &load, Some(&aliases), &nb)
+            .try_load(
+                &mut &mut tc.ctx,
+                block_id,
+                dummy,
+                &load,
+                Some(&aliases),
+                &nb,
+            )
             .expect("exact forward");
         assert_eq!(forwarded, src);
     }
@@ -1096,7 +1109,7 @@ mod tests {
         mf.byte_map.insert((symbolic, 0), Cell { src, src_off: 0 });
         mf.byte_map.insert((pinned, 0x40), Cell { src, src_off: 0 });
 
-        mf.prune_clobbered_by_call(&tc.ctx, block, None);
+        mf.prune_clobbered_by_call((&tc.ctx).into(), block, None);
 
         assert!(
             !mf.byte_map.contains_key(&(symbolic, 0)),
@@ -1175,7 +1188,7 @@ mod tests {
         let src = ValueId::Varnode(tc.r2);
         let mut mf = MemForward::default();
         mf.byte_map.insert((pinned, 0x40), Cell { src, src_off: 0 });
-        mf.prune_clobbered_by_call(&tc.ctx, block, Some(&aliases));
+        mf.prune_clobbered_by_call((&tc.ctx).into(), block, Some(&aliases));
         mf.byte_map.contains_key(&(pinned, 0x40))
     }
 
@@ -1255,7 +1268,7 @@ mod tests {
         mf.byte_map
             .insert((scratch_cell, 0), Cell { src, src_off: 0 });
 
-        mf.prune_clobbered_by_call(&tc.ctx, block, None);
+        mf.prune_clobbered_by_call((&tc.ctx).into(), block, None);
 
         assert!(
             mf.byte_map.contains_key(&(ram_cell, 0)),

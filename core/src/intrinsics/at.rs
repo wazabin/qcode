@@ -13,8 +13,8 @@
 
 use crate::register_intrinsic;
 use crate::types::{TypeId, TypeManager};
-use crate::value::insn::{Intrinsic, IntrinsicId, Mnemonic, Simplified};
 use crate::value::ValueId;
+use crate::value::insn::{Intrinsic, IntrinsicId, Mnemonic, Simplified};
 use crate::value::util::base_ref::HostRef;
 
 /// `at` — read a sequence lane at a dynamic index.
@@ -82,12 +82,7 @@ impl Intrinsic for At {
 /// re-issued `at` would be materialized verbatim (e.g. `at(concat(singleton(v),
 /// scan), 0)` narrows to `at(singleton(v), 0)` but stops there instead of folding
 /// to `v`), leaving the seed read un-concretized and its array live.
-fn simplify_at(
-    host: HostRef,
-    out_size: usize,
-    arr: ValueId,
-    index: ValueId,
-) -> Option<Simplified> {
+fn simplify_at(host: HostRef, out_size: usize, arr: ValueId, index: ValueId) -> Option<Simplified> {
     {
         // Read straight out of a constant `Bytes` array at a constant index.
         if let (ValueId::Bytes(bid), ValueId::Literal(ilit)) = (arr, index) {
@@ -168,8 +163,8 @@ register_intrinsic!(At);
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::context::Context;
     use crate::builder::Builder;
+    use crate::context::Context;
     use crate::value::insn::IntrinsicId;
     use crate::value::{BasicBlock, ValueId};
 
@@ -206,7 +201,10 @@ mod tests {
             b.push_intrinsic(insert_id, vec![ValueId::BlockParam(a), i, v])
                 .id()
         };
-        match at_id().desc().simplify((&ctx).into(), at_id(), 4, &[ins, i]) {
+        match at_id()
+            .desc()
+            .simplify((&ctx).into(), at_id(), 4, &[ins, i])
+        {
             Some(Simplified::Value(got)) => assert_eq!(got, v),
             other => panic!("expected v, got {other:?}"),
         }
@@ -233,7 +231,10 @@ mod tests {
             b.push_intrinsic(insert_id, vec![ValueId::BlockParam(a), i, v])
                 .id()
         };
-        match at_id().desc().simplify((&ctx).into(), at_id(), 4, &[ins, j]) {
+        match at_id()
+            .desc()
+            .simplify((&ctx).into(), at_id(), 4, &[ins, j])
+        {
             Some(Simplified::Expression(Mnemonic::Intrinsic(app))) => {
                 assert_eq!(app.id.name(), "at");
                 assert_eq!(app.args, vec![ValueId::BlockParam(a), j]);
@@ -257,7 +258,10 @@ mod tests {
             b.push_intrinsic(sing_id, vec![v]).id()
         };
         let idx = ctx.get_const(0, 8).id();
-        match at_id().desc().simplify((&ctx).into(), at_id(), 4, &[sing, idx]) {
+        match at_id()
+            .desc()
+            .simplify((&ctx).into(), at_id(), 4, &[sing, idx])
+        {
             Some(Simplified::Value(got)) => assert_eq!(got, v),
             other => panic!("expected v, got {other:?}"),
         }
@@ -290,7 +294,10 @@ mod tests {
         };
         // Lane 0 → left operand `a`, same index.
         let j0 = ctx.get_const(0, 8).id();
-        match at_id().desc().simplify((&ctx).into(), at_id(), 4, &[cat, j0]) {
+        match at_id()
+            .desc()
+            .simplify((&ctx).into(), at_id(), 4, &[cat, j0])
+        {
             Some(Simplified::Expression(Mnemonic::Intrinsic(app))) => {
                 assert_eq!(app.id.name(), "at");
                 assert_eq!(app.args, vec![ValueId::BlockParam(a), j0]);
@@ -299,7 +306,10 @@ mod tests {
         }
         // Lane 2 → right operand `b`, index shifted by len(a)=1 → 1.
         let j2 = ctx.get_const(2, 8).id();
-        match at_id().desc().simplify((&ctx).into(), at_id(), 4, &[cat, j2]) {
+        match at_id()
+            .desc()
+            .simplify((&ctx).into(), at_id(), 4, &[cat, j2])
+        {
             Some(Simplified::Expression(Mnemonic::Intrinsic(app))) => {
                 assert_eq!(app.id.name(), "at");
                 let ValueId::Literal(l) = app.args[1] else {
@@ -326,7 +336,10 @@ mod tests {
             ctx.values.bytes[b].type_id = arr_ty;
         }
         let idx = ctx.get_const(2, 8).id();
-        match at_id().desc().simplify((&ctx).into(), at_id(), 4, &[bid, idx]) {
+        match at_id()
+            .desc()
+            .simplify((&ctx).into(), at_id(), 4, &[bid, idx])
+        {
             Some(Simplified::Value(ValueId::Literal(l))) => {
                 assert_eq!(ctx.values.literals[l].value, 0x33);
             }

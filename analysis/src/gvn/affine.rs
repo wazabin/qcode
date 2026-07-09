@@ -28,15 +28,12 @@
 
 use rustc_hash::FxHashMap as HashMap;
 
-use qcode::{
-    context::Context,
-    value::{
-        BasicBlock, BlockRef, FunctionRef, ValueId,
-        block::BlockId,
-        function::FunctionId,
-        insn::{Binary, Binop, InstructionId, InstructionRef, IntBinop, Mnemonic, Unary, Unop},
-        util::base_ref::HostRef,
-    },
+use qcode::value::{
+    BlockRef, FunctionRef, ValueId,
+    block::BlockId,
+    function::FunctionId,
+    insn::{Binary, Binop, InstructionId, InstructionRef, IntBinop, Mnemonic, Unary, Unop},
+    util::{base_ref::HostRef, host_mut::HostMut},
 };
 
 use super::cse::{normalize, value_id_key};
@@ -369,23 +366,23 @@ pub(super) fn key_for(form: &NormalForm, id: ValueId, mnemonic: &Mnemonic) -> No
 // ---------------------------------------------------------------------------
 
 /// Insert a fresh instruction `(mnemonic, type)` before `at` in `block`.
-fn emit(
-    ctx: &mut Context,
+fn emit<'str, H: HostMut<'str>>(
+    host: &mut H,
     block: BlockId,
     at: InstructionId,
     mnemonic: Mnemonic,
     ty: qcode::types::TypeId,
 ) -> ValueId {
-    let new = InstructionRef::from_mnemonic_with_type(ctx, block.func, mnemonic, ty).id;
-    BasicBlock::from_id_mut(ctx, block).insert_insn_before(at, new);
+    let new = host.push_mnemonic_with_type(block.func, mnemonic, ty);
+    host.insert_insn_before(block, at, new);
     ValueId::Instruction(new)
 }
 
 /// Reuse-or-create the value computing `form` (a sub-expression). Trivial forms
 /// resolve to a literal or the bare term; otherwise a dominating leader is reused
 /// if present, else the canonical instruction is emitted and registered.
-fn build_value(
-    ctx: &mut Context,
+fn build_value<'str, H: HostMut<'str>>(
+    host: &mut H,
     block: BlockId,
     at: InstructionId,
     form: &NormalForm,
@@ -398,7 +395,7 @@ fn build_value(
     } = form
     {
         if terms.is_empty() {
-            return ctx.get_const(*constant, *width).id();
+            return host.shared().get_const(*constant, *width).id();
         }
         if terms.len() == 1 && terms[0].1 == 1 && *constant == 0 {
             return terms[0].0;
@@ -409,12 +406,12 @@ fn build_value(
     }
     let int_ty = match form {
         NormalForm::Affine { width, .. } | NormalForm::Mask { width, .. } => {
-            ctx.types.get_or_make_int(*width)
+            host.shared().types.get_or_make_int(*width)
         }
         NormalForm::Opaque(_) => unreachable!("opaque forms are never materialized"),
     };
-    let m = canonical_mnemonic(ctx, block, at, form, state);
-    let vid = emit(ctx, block, at, m, int_ty);
+    let m = canonical_mnemonic(host, block, at, form, state);
+    let vid = emit(host, block, at, m, int_ty);
     state.leaders.insert(form.clone(), vid);
     state.forms.insert(vid, form.clone());
     vid
@@ -423,8 +420,8 @@ fn build_value(
 /// The single-level canonical mnemonic for `form`, building its operands via
 /// [`build_value`] (which reuses dominating sub-results). Deterministic: terms in
 /// `value_id_key` order, negatives rendered as `sub`, the constant applied last.
-fn canonical_mnemonic(
-    ctx: &mut Context,
+fn canonical_mnemonic<'str, H: HostMut<'str>>(
+    host: &mut H,
     block: BlockId,
     at: InstructionId,
     form: &NormalForm,
@@ -439,7 +436,7 @@ fn canonical_mnemonic(
         } => Mnemonic::Binop(Binary {
             op: Binop::Int(*op),
             lhs: *term,
-            rhs: ctx.get_const(*mask, *width).id(),
+            rhs: host.shared().get_const(*mask, *width).id(),
         }),
         NormalForm::Affine {
             width,
@@ -458,8 +455,8 @@ fn canonical_mnemonic(
                     constant: 0,
                     terms: terms.clone(),
                 };
-                let pv = build_value(ctx, block, at, &prefix, state);
-                let (op, lit) = signed_lit(ctx, signed(constant, width), width);
+                let pv = build_value(host, block, at, &prefix, state);
+                let (op, lit) = signed_lit(host, signed(constant, width), width);
                 return Mnemonic::Binop(Binary {
                     op: Binop::Int(op),
                     lhs: pv,
@@ -499,7 +496,7 @@ fn canonical_mnemonic(
                 return Mnemonic::Binop(Binary {
                     op: Binop::Int(IntBinop::Mul),
                     lhs: last_v,
-                    rhs: ctx.get_const(last_k, width).id(),
+                    rhs: host.shared().get_const(last_k, width).id(),
                 });
             }
 
@@ -508,14 +505,14 @@ fn canonical_mnemonic(
                 constant: 0,
                 terms: prefix_terms,
             };
-            let pv = build_value(ctx, block, at, &prefix, state);
+            let pv = build_value(host, block, at, &prefix, state);
             let s = signed(last_k, width);
             let (op, mag) = if s < 0 {
                 (IntBinop::Sub, s.unsigned_abs() & mask_for(width))
             } else {
                 (IntBinop::Add, last_k)
             };
-            let tv = scaled_value(ctx, block, at, last_v, mag, width, state);
+            let tv = scaled_value(host, block, at, last_v, mag, width, state);
             Mnemonic::Binop(Binary {
                 op: Binop::Int(op),
                 lhs: pv,
@@ -528,8 +525,8 @@ fn canonical_mnemonic(
 
 /// The value of `mag·term` (a positive magnitude): the bare term when `mag == 1`,
 /// else a reused-or-created `mul`.
-fn scaled_value(
-    ctx: &mut Context,
+fn scaled_value<'str, H: HostMut<'str>>(
+    host: &mut H,
     block: BlockId,
     at: InstructionId,
     term: ValueId,
@@ -545,21 +542,24 @@ fn scaled_value(
         constant: 0,
         terms: vec![(term, mag)],
     };
-    build_value(ctx, block, at, &form, state)
+    build_value(host, block, at, &form, state)
 }
 
 /// `(op, literal)` for adding a signed constant: `sub |s|` when negative.
-fn signed_lit(ctx: &mut Context, s: i64, width: usize) -> (IntBinop, ValueId) {
+fn signed_lit<'str, H: HostMut<'str>>(host: &mut H, s: i64, width: usize) -> (IntBinop, ValueId) {
     if s < 0 {
         (
             IntBinop::Sub,
-            ctx.get_const(s.unsigned_abs() & mask_for(width), width)
+            host.shared()
+                .get_const(s.unsigned_abs() & mask_for(width), width)
                 .id(),
         )
     } else {
         (
             IntBinop::Add,
-            ctx.get_const(s as u64 & mask_for(width), width).id(),
+            host.shared()
+                .get_const(s as u64 & mask_for(width), width)
+                .id(),
         )
     }
 }
@@ -570,8 +570,8 @@ fn signed_lit(ctx: &mut Context, s: i64, width: usize) -> (IntBinop, ValueId) {
 ///
 /// `root_ty` is the result type to give a newly created root instruction so that
 /// StackAddress/symbolic typing is preserved.
-pub(super) fn materialize(
-    ctx: &mut Context,
+pub(super) fn materialize<'str, H: HostMut<'str>>(
+    host: &mut H,
     block: BlockId,
     at: InstructionId,
     at_mnemonic: &Mnemonic,
@@ -587,7 +587,7 @@ pub(super) fn materialize(
     } = key
     {
         if terms.is_empty() {
-            return ctx.get_const(*constant, *width).id();
+            return host.shared().get_const(*constant, *width).id();
         }
         if terms.len() == 1 && terms[0].1 == 1 && *constant == 0 {
             return terms[0].0;
@@ -599,13 +599,13 @@ pub(super) fn materialize(
     }
     // Build the canonical root; if it matches the current instruction, the value
     // is already canonical — leave it in place.
-    let m = canonical_mnemonic(ctx, block, at, key, state);
+    let m = canonical_mnemonic(host, block, at, key, state);
     if &m == at_mnemonic {
         let vid = ValueId::Instruction(at);
         state.leaders.insert(key.clone(), vid);
         return vid;
     }
-    let vid = emit(ctx, block, at, m, root_ty);
+    let vid = emit(host, block, at, m, root_ty);
     state.leaders.insert(key.clone(), vid);
     state.forms.insert(vid, key.clone());
     vid

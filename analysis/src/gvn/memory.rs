@@ -17,12 +17,12 @@ use std::any::Any;
 use super::mem_forward::MemForward;
 use super::walk::{Claim, Editor, InsnCtx, SubPass};
 
-pub(super) struct MemoryForwarding;
-
 /// Memory forwarding reasons across a whole function (loop-header pruning,
-/// post-call clobbers) and is dispatched only by the module `gvn` pass, so it
-/// runs on the module host; it unwraps [`HostMut::as_module_mut`] once.
-const MODULE_ONLY: &str = "MemoryForwarding is dispatched only by the module gvn pass";
+/// post-call clobbers). Fully host-routed — every read goes through a
+/// [`HostRef`](qcode::value::util::base_ref::HostRef) and every rebuild through
+/// the [`HostMut`] verbs — so it runs over either the module or a checked-out
+/// function.
+pub(super) struct MemoryForwarding;
 
 impl<'str, H: HostMut<'str>> SubPass<'str, H> for MemoryForwarding {
     fn init_state(&self) -> Box<dyn Any> {
@@ -48,26 +48,31 @@ impl<'str, H: HostMut<'str>> SubPass<'str, H> for MemoryForwarding {
         numbering: &Numbering,
         is_shared: bool,
     ) {
-        let ctx = host.as_module_mut().expect(MODULE_ONLY);
         let state = state.downcast_mut::<MemForward>().expect("memory state");
         if is_shared {
             state.clear();
         }
-        state.prune_loop_carried(ctx, block_id, tree, aliases, numbering);
+        state.prune_loop_carried(host.read_host(), block_id, tree, aliases, numbering);
     }
 
     fn on_insn(&self, host: &mut H, state: &mut dyn Any, ic: &InsnCtx, ed: &mut Editor) -> Claim {
-        let mut ctx = host.as_module_mut().expect(MODULE_ONLY);
         let state = state.downcast_mut::<MemForward>().expect("memory state");
         match ic.mnemonic {
             Mnemonic::Store(store) => {
-                state.record_store(ctx, store, ic.aliases, ic.numbering);
+                state.record_store(host, store, ic.aliases, ic.numbering);
                 Claim::Done
             }
             Mnemonic::Load(load) => {
-                match state.try_load(ctx, ic.block_id, ic.insn_id, load, ic.aliases, ic.numbering) {
+                match state.try_load(
+                    host,
+                    ic.block_id,
+                    ic.insn_id,
+                    load,
+                    ic.aliases,
+                    ic.numbering,
+                ) {
                     Some(value) => {
-                        ed.replace(&mut ctx, ic.insn_id, value);
+                        ed.replace(host, ic.insn_id, value);
                         state.define_load(load, value, ic.aliases, ic.numbering);
                     }
                     None => state.define_load(load, ic.id, ic.aliases, ic.numbering),
@@ -90,9 +95,8 @@ impl<'str, H: HostMut<'str>> SubPass<'str, H> for MemoryForwarding {
         aliases: Option<&AliasResult>,
         _numbering: &Numbering,
     ) {
-        let ctx = host.as_module_mut().expect(MODULE_ONLY);
         let state = state.downcast_mut::<MemForward>().expect("memory state");
-        state.prune_clobbered_by_call(ctx, block_id, aliases);
+        state.prune_clobbered_by_call(host.read_host(), block_id, aliases);
     }
 }
 

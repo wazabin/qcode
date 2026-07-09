@@ -16,10 +16,7 @@
 //! `Extract`-of-tuple folds) settles. The literal/inlined expressions it leaves
 //! are folded by the next `gvn` in the stage.
 
-use qcode::{
-    context::Context,
-    value::function::FunctionId,
-};
+use qcode::{context::Context, value::function::FunctionId};
 
 use super::array_project::ArrayProject;
 use super::emulate_map::EmulateMap;
@@ -32,8 +29,7 @@ use crate::{Pass, PipelineEnv};
 /// [`super::gvn_passes`] (emulate-map before array-project before pure-call). All
 /// three run on the module host only, so the walk is instantiated at
 /// `H = &mut Context`.
-fn concretize_passes<'a, 'str>()
--> Vec<Box<dyn walk::SubPass<'str, &'a mut Context<'str>>>> {
+fn concretize_passes<'a, 'str>() -> Vec<Box<dyn walk::SubPass<'str, &'a mut Context<'str>>>> {
     vec![
         Box::new(EmulateMap),
         Box::new(ArrayProject),

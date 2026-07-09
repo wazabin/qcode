@@ -6,13 +6,13 @@
 
 use crate::register_intrinsic;
 use crate::types::{TypeId, TypeManager};
+use crate::value::ValueId;
 use crate::value::insn::intrinsic::{as_int_binop, const_u64, mask_for};
 use crate::value::insn::{
     InstructionId, InstructionRef, IntBinop, Intrinsic, IntrinsicApp, IntrinsicId, Mnemonic,
     RootOp, Simplified,
 };
 use crate::value::util::base_ref::HostRef;
-use crate::value::ValueId;
 
 fn eval_rotate(args: &[(u128, usize)], out_size: usize, left: bool) -> Option<u128> {
     let (x, _) = *args.first()?;

@@ -1,12 +1,9 @@
 //! Flag-idiom sub-pass: collapse x86 signed-compare flag chains.
 
-use qcode::{
-    context::Context,
-    value::{
-        ValueId,
-        insn::{Binary, Binop, IntBinop, Mnemonic},
-        util::host_mut::HostMut,
-    },
+use qcode::value::{
+    ValueId,
+    insn::{Binary, Binop, IntBinop, Mnemonic},
+    util::{base_ref::HostRef, host_mut::HostMut},
 };
 
 use super::fold::const_value;
@@ -14,13 +11,10 @@ use std::any::Any;
 
 use super::walk::{Claim, Editor, InsnCtx, SubPass};
 
-/// Flag-idiom collapse reads through the module only; it is dispatched only by
-/// the module `gvn` pass and runs on the module host.
-const MODULE_ONLY: &str = "FlagIdiom is dispatched only by the module gvn pass";
-
 /// Collapse the signed-compare flag idiom into a single `s<`, materializing the
 /// replacement before the matched instruction and forwarding its uses; the
-/// dead flag math falls to DCE.
+/// dead flag math falls to DCE. Fully host-routed (own-function reads only), so
+/// it runs over either the module or a checked-out function.
 pub(super) struct FlagIdiom;
 
 impl<'str, H: HostMut<'str>> SubPass<'str, H> for FlagIdiom {
@@ -36,10 +30,9 @@ impl<'str, H: HostMut<'str>> SubPass<'str, H> for FlagIdiom {
         if ic.mnemonic.is_terminator() || ic.size == 0 {
             return Claim::Pass;
         }
-        let mut ctx = host.as_module_mut().expect(MODULE_ONLY);
-        match simplify_flag_idiom(ctx, ic.mnemonic) {
+        match simplify_flag_idiom(host.read_host(), ic.mnemonic) {
             Some(new_mnemonic) => {
-                ed.replace_with_new_insn(&mut ctx, ic.block_id, ic.insn_id, new_mnemonic, ic.size);
+                ed.replace_with_new_insn(host, ic.block_id, ic.insn_id, new_mnemonic, ic.size);
                 Claim::Done
             }
             None => Claim::Pass,
@@ -48,11 +41,11 @@ impl<'str, H: HostMut<'str>> SubPass<'str, H> for FlagIdiom {
 }
 
 /// If `v` is defined by an `IntBinop::want` binop, return its `(lhs, rhs)`.
-fn as_int_binop(ctx: &Context, v: ValueId, want: IntBinop) -> Option<(ValueId, ValueId)> {
+fn as_int_binop(host: HostRef, v: ValueId, want: IntBinop) -> Option<(ValueId, ValueId)> {
     let ValueId::Instruction(id) = v else {
         return None;
     };
-    match ctx.get_insn(id).mnemonic() {
+    match host.instruction(id).mnemonic() {
         Mnemonic::Binop(Binary {
             lhs,
             rhs,
@@ -63,11 +56,11 @@ fn as_int_binop(ctx: &Context, v: ValueId, want: IntBinop) -> Option<(ValueId, V
 }
 
 /// If `v` is defined by an `sborrow`, return its `(lhs, rhs)`.
-fn as_sborrow(ctx: &Context, v: ValueId) -> Option<(ValueId, ValueId)> {
+fn as_sborrow(host: HostRef, v: ValueId) -> Option<(ValueId, ValueId)> {
     let ValueId::Instruction(id) = v else {
         return None;
     };
-    match ctx.get_insn(id).mnemonic() {
+    match host.instruction(id).mnemonic() {
         Mnemonic::SBorrow(sb) => Some((sb.lhs, sb.rhs)),
         _ => None,
     }
@@ -84,7 +77,7 @@ fn as_sborrow(ctx: &Context, v: ValueId) -> Option<(ValueId, ValueId)> {
 /// ```
 /// Returns the rewritten `SLess(a, b)` mnemonic. The original `sborrow`/`sub`/
 /// `slt` instructions are left for DCE to remove once their last use is gone.
-pub(super) fn simplify_flag_idiom(ctx: &Context, m: &Mnemonic) -> Option<Mnemonic> {
+pub(super) fn simplify_flag_idiom(host: HostRef, m: &Mnemonic) -> Option<Mnemonic> {
     let &Mnemonic::Binop(Binary {
         lhs,
         rhs,
@@ -97,12 +90,12 @@ pub(super) fn simplify_flag_idiom(ctx: &Context, m: &Mnemonic) -> Option<Mnemoni
     // The `!=` is commutative (and GVN may have normalized it), so try both
     // assignments of which side is the sborrow and which is the `s< 0`.
     let resolve = |sborrow_side: ValueId, slt_side: ValueId| -> Option<(ValueId, ValueId)> {
-        let (a, b) = as_sborrow(ctx, sborrow_side)?;
-        let (sub_v, zero) = as_int_binop(ctx, slt_side, IntBinop::SLess)?;
-        if const_value(ctx, zero) != Some(0) {
+        let (a, b) = as_sborrow(host, sborrow_side)?;
+        let (sub_v, zero) = as_int_binop(host, slt_side, IntBinop::SLess)?;
+        if const_value(host.shared(), zero) != Some(0) {
             return None;
         }
-        let (sa, sb) = as_int_binop(ctx, sub_v, IntBinop::Sub)?;
+        let (sa, sb) = as_int_binop(host, sub_v, IntBinop::Sub)?;
         (sa == a && sb == b).then_some((a, b))
     };
 

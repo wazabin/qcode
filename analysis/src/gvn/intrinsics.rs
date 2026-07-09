@@ -20,11 +20,10 @@ use std::any::Any;
 
 use super::walk::{Claim, Editor, InsnCtx, SubPass};
 
-/// Idiom recognition reads through the module only; it is dispatched only by the
-/// module `gvn` pass and runs on the module host.
-const MODULE_ONLY: &str = "Recognize is dispatched only by the module gvn pass";
-
-/// Rewrite recognized idioms into intrinsics.
+/// Rewrite recognized idioms into intrinsics. Fully host-routed: the recognizer
+/// reads through a [`HostRef`](qcode::value::util::base_ref::HostRef) (own SSA
+/// values resolve on a checked-out function) and mints derived-operand literals
+/// through the shared interner.
 pub(super) struct Recognize;
 
 impl<'str, H: HostMut<'str>> SubPass<'str, H> for Recognize {
@@ -43,14 +42,13 @@ impl<'str, H: HostMut<'str>> SubPass<'str, H> for Recognize {
         let Some(root) = root_op_of(ic.mnemonic) else {
             return Claim::Pass;
         };
-        let mut ctx = host.as_module_mut().expect(MODULE_ONLY);
 
         for &id in recognizers_for(root) {
-            if let Some(args) = id.desc().recognize((&*ctx).into(), ic.insn_id) {
+            if let Some(args) = id.desc().recognize(host.read_host(), ic.insn_id) {
                 // Recognized intrinsics (rol/ror) are width-preserving, so the
                 // root's width is the result width.
                 ed.replace_with_new_insn(
-                    &mut ctx,
+                    host,
                     ic.block_id,
                     ic.insn_id,
                     Mnemonic::Intrinsic(IntrinsicApp { id, args }),

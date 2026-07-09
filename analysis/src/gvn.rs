@@ -141,12 +141,26 @@ pub fn gvn_function(
     func_id: FunctionId,
     aliases: Option<&AliasResult>,
 ) -> bool {
-    run_dominator_walk(&mut ctx, func_id, &gvn_passes(), aliases)
+    gvn_host(&mut ctx, func_id, aliases)
+}
+
+/// Host-generic core of [`gvn_function`]: runs the full GVN sub-pass chain over
+/// the dominator tree of `func_id`, on either the whole module (`&mut Context`)
+/// or a single checked-out function ([`CheckedOut`]).
+///
+/// [`CheckedOut`]: qcode::value::util::host_mut::CheckedOut
+pub(crate) fn gvn_host<'str, H: HostMut<'str>>(
+    host: &mut H,
+    func_id: FunctionId,
+    aliases: Option<&AliasResult>,
+) -> bool {
+    run_dominator_walk(host, func_id, &gvn_passes(), aliases)
 }
 
 // ----- passes ----------------------------------------------------------------
 
-use crate::{FunctionBody, FunctionPass, FunctionPassV2, ModuleView, PipelineEnv};
+use crate::{FunctionBody, FunctionPassV2, ModuleView};
+use qcode::value::util::base_ref::HostRef;
 
 #[derive(Default)]
 pub struct ConstFold;
@@ -190,36 +204,49 @@ impl FunctionPassV2 for Narrow {
 
 crate::register_function_pass_v2!(Narrow);
 
+/// Build the per-function alias oracle exactly as the V1 `Gvn` pass did, but over
+/// the checked-out body (read through `host`). Reuses the shared, function-
+/// independent register/varnode alias base and finishes it for just this
+/// function's pointers, then supplies the stack pointer so the oracle applies
+/// frame freshness (a function's own locals never alias an incoming pointer). The
+/// stack pointer is `None` in arch-agnostic envs, leaving frame freshness inert.
+fn build_gvn_aliases<'a, 'str: 'a>(
+    m: &ModuleView<'_, 'str>,
+    host: HostRef<'a, 'str>,
+    fun_id: FunctionId,
+) -> AliasResult {
+    let ctx = m.ctx();
+    let sp_reg = ctx.registers.get(&m.env().cfg.stack_pointer).copied();
+    m.env()
+        .alias_base(ctx)
+        .for_function(host, fun_id)
+        .with_frame_freshness(host, fun_id, sp_reg)
+}
+
 #[derive(Default)]
 pub struct Gvn;
 
-impl FunctionPass for Gvn {
+impl FunctionPassV2 for Gvn {
     const NAME: &'static str = "gvn";
     fn description(&self) -> &'static str {
         "Global value numbering and constant folding"
     }
-    fn run(
+    fn run<'str>(
         &self,
-        ctx: &mut Context,
-        fun_id: FunctionId,
-        env: &PipelineEnv,
+        m: &ModuleView<'_, 'str>,
+        f: &mut FunctionBody<'str>,
     ) -> Result<bool, String> {
+        let fun_id = f.id();
+        let mut host = f.host(m);
         // Canonicalize pointer arithmetic *before* building the alias oracle, so it
         // sees per-slot `@SP`-rooted stack locations.
-        let mut changed = constant_fold_function(ctx, fun_id);
-        // Reuse the shared, function-independent register/varnode alias base (built
-        // once per varnode set) and finish it for just this function's pointers,
-        // instead of rebuilding the whole-module oracle on every function. Then
-        // supply the stack pointer so the oracle can apply frame freshness (a
-        // function's own locals never alias an incoming pointer).
-        let sp_reg = ctx.registers.get(&env.cfg.stack_pointer).copied();
-        let aliases = env
-            .alias_base(ctx)
-            .for_function(&*ctx, fun_id)
-            .with_frame_freshness(&*ctx, fun_id, sp_reg);
-        changed |= gvn_function(ctx, fun_id, Some(&aliases));
+        let mut changed = constant_fold_host(&mut host, fun_id);
+        // Build the oracle over the (now-canonicalized) checked-out body, then run
+        // the dominator-tree GVN against it.
+        let aliases = build_gvn_aliases(m, host.read_host(), fun_id);
+        changed |= gvn_host(&mut host, fun_id, Some(&aliases));
         Ok(changed)
     }
 }
 
-crate::register_function_pass!(Gvn);
+crate::register_function_pass_v2!(Gvn);

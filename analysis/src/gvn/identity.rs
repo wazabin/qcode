@@ -18,13 +18,10 @@
 //!   (a | b) + (a & b)         →  a + b
 //! ```
 
-use qcode::{
-    context::Context,
-    value::{
-        Value, ValueId, ValueRef,
-        insn::{Binary, Binop, IntBinop, Mnemonic, Simplified},
-        util::host_mut::HostMut,
-    },
+use qcode::value::{
+    Value, ValueId, ValueRef,
+    insn::{Binary, Binop, IntBinop, Mnemonic, Simplified},
+    util::{base_ref::HostRef, host_mut::HostMut},
 };
 
 use super::fold::{all_ones, const_value};
@@ -32,13 +29,11 @@ use std::any::Any;
 
 use super::walk::{Claim, Editor, InsnCtx, SubPass};
 
-/// The multi-instruction identities read through the module only; this sub-pass
-/// is dispatched only by the module `gvn` pass and runs on the module host.
-const MODULE_ONLY: &str = "Identities is dispatched only by the module gvn pass";
-
 /// Recognize the add/and/shift (and or/and) idioms and rewrite the root
 /// instruction to the single `^`/`+` it computes. The now-unused sub-expressions
-/// are left for DCE.
+/// are left for DCE. Fully host-routed: every read goes through a [`HostRef`] and
+/// every folded constant is minted through the shared interner, so it runs over
+/// either the module or a checked-out function.
 pub(super) struct Identities;
 
 impl<'str, H: HostMut<'str>> SubPass<'str, H> for Identities {
@@ -54,37 +49,36 @@ impl<'str, H: HostMut<'str>> SubPass<'str, H> for Identities {
         if ic.mnemonic.is_terminator() || ic.size == 0 {
             return Claim::Pass;
         }
-        let mut ctx = host.as_module_mut().expect(MODULE_ONLY);
         // Pure intrinsics carry their own algebraic simplifier (e.g.
         // `rol(x, 0) → x`), which forwards uses to an existing value.
         if let Mnemonic::Intrinsic(intr) = ic.mnemonic {
             let id = intr.id;
             let args = intr.args.clone();
-            match id.desc().simplify((&*ctx).into(), id, ic.size, &args) {
+            match id.desc().simplify(host.read_host(), id, ic.size, &args) {
                 Some(Simplified::Value(repl)) => {
-                    ed.replace(&mut ctx, ic.insn_id, repl);
+                    ed.replace(host, ic.insn_id, repl);
                     return Claim::Done;
                 }
                 Some(Simplified::Expression(mnemonic)) => {
-                    ed.replace_with_new_insn(&mut ctx, ic.block_id, ic.insn_id, mnemonic, ic.size);
+                    ed.replace_with_new_insn(host, ic.block_id, ic.insn_id, mnemonic, ic.size);
                     return Claim::Done;
                 }
                 None => {}
             }
         }
-        if let Some(new_mnemonic) = simplify_identity(ctx, ic.mnemonic) {
-            ed.replace_with_new_insn(&mut ctx, ic.block_id, ic.insn_id, new_mnemonic, ic.size);
+        if let Some(new_mnemonic) = simplify_identity(host.read_host(), ic.mnemonic) {
+            ed.replace_with_new_insn(host, ic.block_id, ic.insn_id, new_mnemonic, ic.size);
             return Claim::Done;
         }
-        // Constant-absorbing / De Morgan rewrites need `&mut Context` (they intern
-        // a folded constant), so they live outside the borrow-only
+        // Constant-absorbing / De Morgan rewrites intern a folded constant (through
+        // the shared interner), so they live outside the read-only
         // `simplify_identity`. They canonicalize obfuscated bit math — e.g. an
         // `i & 1` emitted as `~(~i | ~1)` with a redundant outer mask — back into
         // the plain `&`/`^` the full-adder idioms above then recognize.
-        if simplify_bitwise(ctx, ic, ed) {
+        if simplify_bitwise(host, ic, ed) {
             return Claim::Done;
         }
-        if simplify_compare(ctx, ic, ed) {
+        if simplify_compare(host, ic, ed) {
             return Claim::Done;
         }
         Claim::Pass
@@ -92,11 +86,11 @@ impl<'str, H: HostMut<'str>> SubPass<'str, H> for Identities {
 }
 
 /// If `v` is defined by an `IntBinop::want` binop, return its `(lhs, rhs)`.
-fn as_int_binop(ctx: &Context, v: ValueId, want: IntBinop) -> Option<(ValueId, ValueId)> {
+fn as_int_binop(host: HostRef, v: ValueId, want: IntBinop) -> Option<(ValueId, ValueId)> {
     let ValueId::Instruction(id) = v else {
         return None;
     };
-    match ctx.get_insn(id).mnemonic() {
+    match host.instruction(id).mnemonic() {
         Mnemonic::Binop(Binary {
             lhs,
             rhs,
@@ -114,17 +108,17 @@ fn same_operands(p: (ValueId, ValueId), q: (ValueId, ValueId)) -> bool {
 }
 
 /// If `v` computes `x * 2` — as `x << 1`, `x * 2`, or `2 * x` — return `x`.
-fn as_doubled(ctx: &Context, v: ValueId) -> Option<ValueId> {
-    if let Some((x, amt)) = as_int_binop(ctx, v, IntBinop::ShiftLeft)
-        && const_value(ctx, amt) == Some(1)
+fn as_doubled(host: HostRef, v: ValueId) -> Option<ValueId> {
+    if let Some((x, amt)) = as_int_binop(host, v, IntBinop::ShiftLeft)
+        && const_value(host.shared(), amt) == Some(1)
     {
         return Some(x);
     }
-    if let Some((x, y)) = as_int_binop(ctx, v, IntBinop::Mul) {
-        if const_value(ctx, y) == Some(2) {
+    if let Some((x, y)) = as_int_binop(host, v, IntBinop::Mul) {
+        if const_value(host.shared(), y) == Some(2) {
             return Some(x);
         }
-        if const_value(ctx, x) == Some(2) {
+        if const_value(host.shared(), x) == Some(2) {
             return Some(y);
         }
     }
@@ -132,8 +126,8 @@ fn as_doubled(ctx: &Context, v: ValueId) -> Option<ValueId> {
 }
 
 /// If `v` is `(a & b) * 2`, return `(a, b)`.
-fn as_doubled_and(ctx: &Context, v: ValueId) -> Option<(ValueId, ValueId)> {
-    as_int_binop(ctx, as_doubled(ctx, v)?, IntBinop::And)
+fn as_doubled_and(host: HostRef, v: ValueId) -> Option<(ValueId, ValueId)> {
+    as_int_binop(host, as_doubled(host, v)?, IntBinop::And)
 }
 
 fn int_binop(lhs: ValueId, rhs: ValueId, op: IntBinop) -> Mnemonic {
@@ -146,7 +140,7 @@ fn int_binop(lhs: ValueId, rhs: ValueId, op: IntBinop) -> Mnemonic {
 
 /// Collapse a bitwise/arithmetic identity rooted at `m`, returning the
 /// equivalent single-operation mnemonic, or `None` if no pattern matches.
-pub(super) fn simplify_identity(ctx: &Context, m: &Mnemonic) -> Option<Mnemonic> {
+pub(super) fn simplify_identity(host: HostRef, m: &Mnemonic) -> Option<Mnemonic> {
     let &Mnemonic::Binop(Binary {
         lhs,
         rhs,
@@ -161,14 +155,14 @@ pub(super) fn simplify_identity(ctx: &Context, m: &Mnemonic) -> Option<Mnemonic>
         // (a | b) - (a & b)         →  a ^ b
         // `-` is not commutative: the reducible term is always the rhs.
         IntBinop::Sub => {
-            if let Some((a, b)) = as_int_binop(ctx, lhs, IntBinop::Add)
-                && let Some(cd) = as_doubled_and(ctx, rhs)
+            if let Some((a, b)) = as_int_binop(host, lhs, IntBinop::Add)
+                && let Some(cd) = as_doubled_and(host, rhs)
                 && same_operands((a, b), cd)
             {
                 return Some(int_binop(a, b, IntBinop::Xor));
             }
-            if let Some((a, b)) = as_int_binop(ctx, lhs, IntBinop::Or)
-                && let Some(cd) = as_int_binop(ctx, rhs, IntBinop::And)
+            if let Some((a, b)) = as_int_binop(host, lhs, IntBinop::Or)
+                && let Some(cd) = as_int_binop(host, rhs, IntBinop::And)
                 && same_operands((a, b), cd)
             {
                 return Some(int_binop(a, b, IntBinop::Xor));
@@ -180,14 +174,14 @@ pub(super) fn simplify_identity(ctx: &Context, m: &Mnemonic) -> Option<Mnemonic>
         // `+` is commutative, so the base and extra term may appear on either side.
         IntBinop::Add => {
             for (base, extra) in [(lhs, rhs), (rhs, lhs)] {
-                if let Some((a, b)) = as_int_binop(ctx, base, IntBinop::Xor)
-                    && let Some(cd) = as_doubled_and(ctx, extra)
+                if let Some((a, b)) = as_int_binop(host, base, IntBinop::Xor)
+                    && let Some(cd) = as_doubled_and(host, extra)
                     && same_operands((a, b), cd)
                 {
                     return Some(int_binop(a, b, IntBinop::Add));
                 }
-                if let Some((a, b)) = as_int_binop(ctx, base, IntBinop::Or)
-                    && let Some(cd) = as_int_binop(ctx, extra, IntBinop::And)
+                if let Some((a, b)) = as_int_binop(host, base, IntBinop::Or)
+                    && let Some(cd) = as_int_binop(host, extra, IntBinop::And)
                     && same_operands((a, b), cd)
                 {
                     return Some(int_binop(a, b, IntBinop::Add));
@@ -214,15 +208,15 @@ fn align_mask_bits(mask: u64, size: usize) -> Option<u32> {
 /// stack-realigning prologues build on top of one `sp & ~7`; `depth` bounds the
 /// walk (straight-line SSA has no operand cycles, but loops over block params
 /// could, so the bound is load-bearing). Every case is a sound *under*-estimate.
-fn known_align(ctx: &Context, v: ValueId, depth: u32) -> u32 {
+fn known_align(host: HostRef, v: ValueId, depth: u32) -> u32 {
     if depth == 0 {
         return 0;
     }
-    if let Some(c) = const_value(ctx, v) {
+    if let Some(c) = const_value(host.shared(), v) {
         // A constant's alignment is its trailing-zero count; `0` is aligned to
         // its full width.
         return if c == 0 {
-            (size_bits(ctx, v)).min(64)
+            (size_bits(host, v)).min(64)
         } else {
             c.trailing_zeros()
         };
@@ -234,13 +228,13 @@ fn known_align(ctx: &Context, v: ValueId, depth: u32) -> u32 {
         lhs,
         rhs,
         op: Binop::Int(op),
-    }) = ctx.get_insn(id).mnemonic()
+    }) = host.instruction(id).mnemonic()
     else {
         return 0;
     };
     let (a, b) = (
-        || known_align(ctx, lhs, depth - 1),
-        || known_align(ctx, rhs, depth - 1),
+        || known_align(host, lhs, depth - 1),
+        || known_align(host, rhs, depth - 1),
     );
     match op {
         // `&` keeps a low bit zero if it is zero in *either* operand — so a mask
@@ -249,7 +243,7 @@ fn known_align(ctx: &Context, v: ValueId, depth: u32) -> u32 {
         // `|`/`^`/`+`/`-` keep a low bit zero only if it is zero in *both*.
         IntBinop::Or | IntBinop::Xor | IntBinop::Add | IntBinop::Sub => a().min(b()),
         // A left shift by a constant appends that many trailing zeros.
-        IntBinop::ShiftLeft => match const_value(ctx, rhs) {
+        IntBinop::ShiftLeft => match const_value(host.shared(), rhs) {
             Some(s) => a().saturating_add(s as u32),
             None => 0,
         },
@@ -260,8 +254,8 @@ fn known_align(ctx: &Context, v: ValueId, depth: u32) -> u32 {
 }
 
 /// The bit width of `v`'s output.
-fn size_bits(ctx: &Context, v: ValueId) -> u32 {
-    (value_size(ctx, v) as u32).saturating_mul(8)
+fn size_bits(host: HostRef, v: ValueId) -> u32 {
+    (value_size(host, v) as u32).saturating_mul(8)
 }
 
 /// Bound on the recursion `known_align` does back through a realignment cascade.
@@ -272,12 +266,12 @@ const ALIGN_DEPTH: u32 = 64;
 /// The `(constant, other_operand)` pairs of a binop — one entry per side that is
 /// a numeric constant (both-constant binops are handled by [`super::fold`] before
 /// this sub-pass, so in practice at most one side is constant here).
-fn const_operands(ctx: &Context, lhs: ValueId, rhs: ValueId) -> Vec<(u64, ValueId)> {
+fn const_operands(host: HostRef, lhs: ValueId, rhs: ValueId) -> Vec<(u64, ValueId)> {
     let mut out = Vec::new();
-    if let Some(c) = const_value(ctx, rhs) {
+    if let Some(c) = const_value(host.shared(), rhs) {
         out.push((c, lhs));
     }
-    if let Some(c) = const_value(ctx, lhs) {
+    if let Some(c) = const_value(host.shared(), lhs) {
         out.push((c, rhs));
     }
     out
@@ -285,9 +279,9 @@ fn const_operands(ctx: &Context, lhs: ValueId, rhs: ValueId) -> Vec<(u64, ValueI
 
 /// If `v` is `x OP c` (or `c OP x`) for integer op `want` with a numeric constant
 /// `c`, return `(x, c)`.
-fn binop_const(ctx: &Context, v: ValueId, want: IntBinop) -> Option<(ValueId, u64)> {
-    let (lhs, rhs) = as_int_binop(ctx, v, want)?;
-    const_operands(ctx, lhs, rhs)
+fn binop_const(host: HostRef, v: ValueId, want: IntBinop) -> Option<(ValueId, u64)> {
+    let (lhs, rhs) = as_int_binop(host, v, want)?;
+    const_operands(host, lhs, rhs)
         .into_iter()
         .next()
         .map(|(c, x)| (x, c))
@@ -297,12 +291,12 @@ fn binop_const(ctx: &Context, v: ValueId, want: IntBinop) -> Option<(ValueId, u6
 /// constant when `v` is constant, or `x` when `v` is `x ^ ~0` (double-negation).
 /// `None` when representing `~v` would need a new instruction — the caller then
 /// declines the rewrite, keeping it strictly size-reducing.
-fn simplify_not(ctx: &mut Context, v: ValueId, size: usize) -> Option<ValueId> {
+fn simplify_not(host: HostRef, v: ValueId, size: usize) -> Option<ValueId> {
     let all = all_ones(size);
-    if let Some(c) = const_value(ctx, v) {
-        return Some(ctx.get_const((!c) & all, size).id());
+    if let Some(c) = const_value(host.shared(), v) {
+        return Some(host.shared().get_const((!c) & all, size).id());
     }
-    if let Some((x, c)) = binop_const(ctx, v, IntBinop::Xor)
+    if let Some((x, c)) = binop_const(host, v, IntBinop::Xor)
         && (c & all) == all
     {
         return Some(x);
@@ -325,7 +319,7 @@ fn simplify_not(ctx: &mut Context, v: ValueId, size: usize) -> Option<ValueId> {
 /// double-negation (so no new xor is created), which is exactly the shape
 /// compilers emit for `a & const` as `~(~a | ~const)`. Returns whether it
 /// rewrote the root.
-fn simplify_bitwise(mut ctx: &mut Context, ic: &InsnCtx, ed: &mut Editor) -> bool {
+fn simplify_bitwise<'str, H: HostMut<'str>>(host: &mut H, ic: &InsnCtx, ed: &mut Editor) -> bool {
     let &Mnemonic::Binop(Binary {
         lhs,
         rhs,
@@ -340,16 +334,17 @@ fn simplify_bitwise(mut ctx: &mut Context, ic: &InsnCtx, ed: &mut Editor) -> boo
     match op {
         // (x & c1) & c2 → x & (c1 & c2), and dropping a redundant alignment mask.
         IntBinop::And => {
-            for (outer, inner) in const_operands(ctx, lhs, rhs) {
+            for (outer, inner) in const_operands(host.read_host(), lhs, rhs) {
                 // `b & 1 → b` when `b` is a boolean (its value is already `{0,1}`),
                 // and through a zext: `zext(b) & 1 → zext(b)`. This is what lets a
                 // lifted `(i < N) & 1 != 0` header guard collapse to the bare
                 // comparison, unblocking `guard_bound`/`array_promote`/`loop_to_map`.
                 if outer == 1
-                    && (is_boolean(ctx, inner)
-                        || as_zext(ctx, inner).is_some_and(|(src, _)| is_boolean(ctx, src)))
+                    && (is_boolean(host.read_host(), inner)
+                        || as_zext(host.read_host(), inner)
+                            .is_some_and(|(src, _)| is_boolean(host.read_host(), src)))
                 {
-                    ed.replace(&mut ctx, ic.insn_id, inner);
+                    ed.replace(host, ic.insn_id, inner);
                     return true;
                 }
                 // `inner & mask → inner` when `inner` is already aligned to the
@@ -358,15 +353,15 @@ fn simplify_bitwise(mut ctx: &mut Context, ic: &InsnCtx, ed: &mut Editor) -> boo
                 // first sits on a base already proven 8-aligned minus an
                 // 8-multiple, so it is a no-op.
                 if let Some(k) = align_mask_bits(outer, size)
-                    && known_align(ctx, inner, ALIGN_DEPTH) >= k
+                    && known_align(host.read_host(), inner, ALIGN_DEPTH) >= k
                 {
-                    ed.replace(&mut ctx, ic.insn_id, inner);
+                    ed.replace(host, ic.insn_id, inner);
                     return true;
                 }
-                if let Some((x, c1)) = binop_const(ctx, inner, IntBinop::And) {
-                    let folded = ctx.get_const((c1 & outer) & all, size).id();
+                if let Some((x, c1)) = binop_const(host.read_host(), inner, IntBinop::And) {
+                    let folded = host.shared().get_const((c1 & outer) & all, size).id();
                     ed.replace_with_new_insn(
-                        &mut ctx,
+                        host,
                         ic.block_id,
                         ic.insn_id,
                         int_binop(x, folded, IntBinop::And),
@@ -378,12 +373,12 @@ fn simplify_bitwise(mut ctx: &mut Context, ic: &InsnCtx, ed: &mut Editor) -> boo
             false
         }
         IntBinop::Xor => {
-            for (outer, inner) in const_operands(ctx, lhs, rhs) {
+            for (outer, inner) in const_operands(host.read_host(), lhs, rhs) {
                 // (x ^ c1) ^ c2 → x ^ (c1 ^ c2)
-                if let Some((x, c1)) = binop_const(ctx, inner, IntBinop::Xor) {
-                    let folded = ctx.get_const((c1 ^ outer) & all, size).id();
+                if let Some((x, c1)) = binop_const(host.read_host(), inner, IntBinop::Xor) {
+                    let folded = host.shared().get_const((c1 ^ outer) & all, size).id();
                     ed.replace_with_new_insn(
-                        &mut ctx,
+                        host,
                         ic.block_id,
                         ic.insn_id,
                         int_binop(x, folded, IntBinop::Xor),
@@ -398,16 +393,17 @@ fn simplify_bitwise(mut ctx: &mut Context, ic: &InsnCtx, ed: &mut Editor) -> boo
                 for (dual_in, dual_out) in
                     [(IntBinop::Or, IntBinop::And), (IntBinop::And, IntBinop::Or)]
                 {
-                    let Some((a, b)) = as_int_binop(ctx, inner, dual_in) else {
+                    let Some((a, b)) = as_int_binop(host.read_host(), inner, dual_in) else {
                         continue;
                     };
-                    let (Some(na), Some(nb)) =
-                        (simplify_not(ctx, a, size), simplify_not(ctx, b, size))
-                    else {
+                    let (Some(na), Some(nb)) = (
+                        simplify_not(host.read_host(), a, size),
+                        simplify_not(host.read_host(), b, size),
+                    ) else {
                         continue;
                     };
                     ed.replace_with_new_insn(
-                        &mut ctx,
+                        host,
                         ic.block_id,
                         ic.insn_id,
                         int_binop(na, nb, dual_out),
@@ -423,25 +419,26 @@ fn simplify_bitwise(mut ctx: &mut Context, ic: &InsnCtx, ed: &mut Editor) -> boo
 }
 
 /// The byte width of `v`'s output.
-fn value_size(ctx: &Context, v: ValueId) -> usize {
-    ValueRef::new(v, ctx).size()
+fn value_size(host: HostRef, v: ValueId) -> usize {
+    ValueRef::from_host(host, v).size()
 }
 
 /// If `v` is `zext(src)`, returns `(src, src_width)`.
-fn as_zext(ctx: &Context, v: ValueId) -> Option<(ValueId, usize)> {
+fn as_zext(host: HostRef, v: ValueId) -> Option<(ValueId, usize)> {
     let ValueId::Instruction(id) = v else {
         return None;
     };
-    match ctx.get_insn(id).mnemonic() {
-        Mnemonic::Zext(z) => Some((z.src, value_size(ctx, z.src))),
+    match host.instruction(id).mnemonic() {
+        Mnemonic::Zext(z) => Some((z.src, value_size(host, z.src))),
         _ => None,
     }
 }
 
 /// Whether `v` always yields `0` or `1` — now simply whether it is `bool`-typed
 /// (comparisons and logical `And`/`Or`/`Xor` over bool all carry the type).
-fn is_boolean(ctx: &Context, v: ValueId) -> bool {
-    ctx.stored_type_of(v).is_some_and(|t| ctx.types.is_bool(t))
+fn is_boolean(host: HostRef, v: ValueId) -> bool {
+    host.stored_type_of(v)
+        .is_some_and(|t| host.shared().types.is_bool(t))
 }
 
 /// The negation of an equality comparison: `==`↔`!=`. Ordering comparisons are
@@ -468,24 +465,24 @@ fn negated_compare(op: IntBinop) -> Option<IntBinop> {
 ///
 /// Together these collapse `zext(!(x == 0)) != 0` down to `x != 0`. Returns
 /// whether the root was rewritten.
-fn simplify_compare(mut ctx: &mut Context, ic: &InsnCtx, ed: &mut Editor) -> bool {
+fn simplify_compare<'str, H: HostMut<'str>>(host: &mut H, ic: &InsnCtx, ed: &mut Editor) -> bool {
     match *ic.mnemonic {
         Mnemonic::Binop(Binary {
             lhs,
             rhs,
             op: Binop::Int(op),
         }) if matches!(op, IntBinop::Equal | IntBinop::NotEqual) => {
-            for (c, other) in const_operands(ctx, lhs, rhs) {
+            for (c, other) in const_operands(host.read_host(), lhs, rhs) {
                 if c != 0 {
                     continue;
                 }
                 // `zext(v) ==/!= 0` → `v ==/!= 0`: comparing a zero-extended
                 // value against 0 is comparing the source against 0.
-                if let Some((src, src_size)) = as_zext(ctx, other) {
-                    let zero = ctx.get_const(0, src_size).id();
-                    let bool_ty = ctx.types.get_or_make_bool();
+                if let Some((src, src_size)) = as_zext(host.read_host(), other) {
+                    let zero = host.shared().get_const(0, src_size).id();
+                    let bool_ty = host.shared().types.get_or_make_bool();
                     ed.replace_with_new_insn_typed(
-                        &mut ctx,
+                        host,
                         ic.block_id,
                         ic.insn_id,
                         int_binop(src, zero, op),
@@ -498,10 +495,12 @@ fn simplify_compare(mut ctx: &mut Context, ic: &InsnCtx, ed: &mut Editor) -> boo
                 // an equality comparison, fold the double negation:
                 // `(a == c) == false` → `a != c`. The width must match so the
                 // forwarded/negated value is a drop-in for the comparison result.
-                if is_boolean(ctx, other) && value_size(ctx, other) == ic.size {
+                if is_boolean(host.read_host(), other)
+                    && value_size(host.read_host(), other) == ic.size
+                {
                     match op {
                         IntBinop::NotEqual => {
-                            ed.replace(&mut ctx, ic.insn_id, other);
+                            ed.replace(host, ic.insn_id, other);
                             return true;
                         }
                         // `(a == c) == false` → `a != c` / `(a != c) == false`
@@ -513,12 +512,12 @@ fn simplify_compare(mut ctx: &mut Context, ic: &InsnCtx, ed: &mut Editor) -> boo
                                     lhs: a,
                                     rhs: b,
                                     op: Binop::Int(inner),
-                                }) = ctx.get_insn(id).mnemonic()
+                                }) = host.read_host().instruction(id).mnemonic()
                                 && let Some(flipped) = negated_compare(inner)
                             {
-                                let bool_ty = ctx.types.get_or_make_bool();
+                                let bool_ty = host.shared().types.get_or_make_bool();
                                 ed.replace_with_new_insn_typed(
-                                    &mut ctx,
+                                    host,
                                     ic.block_id,
                                     ic.insn_id,
                                     int_binop(a, b, flipped),

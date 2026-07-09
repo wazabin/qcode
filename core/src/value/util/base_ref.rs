@@ -101,9 +101,29 @@ impl<'a, 'str> HostRef<'a, 'str> {
                 if let Some(&ty) = shared.values.varnode_types.get(&vid) {
                     return ty;
                 }
-                shared.types.get_or_make_int(shared.values.varnodes[vid].size_bytes())
+                shared
+                    .types
+                    .get_or_make_int(shared.values.varnodes[vid].size_bytes())
             }
             ValueId::BasicBlock(_) | ValueId::Function(_) => shared.types.get_or_make_int(0),
+        }
+    }
+
+    /// The stored [`TypeId`] of `id` (routed like [`type_of`](Self::type_of)),
+    /// never interning a fallback integer type. The [`HostRef`] mirror of
+    /// [`Context::stored_type_of`]; varnodes without an override, blocks, and
+    /// functions return `None`.
+    ///
+    /// [`Context::stored_type_of`]: crate::context::Context::stored_type_of
+    pub fn stored_type_of(self, id: ValueId) -> Option<crate::types::TypeId> {
+        let shared = self.shared();
+        match id {
+            ValueId::Literal(lid) => Some(shared.values.literals[lid].type_id),
+            ValueId::Bytes(bid) => Some(shared.values.bytes[bid].type_id),
+            ValueId::Instruction(iid) => Some(self.instruction(iid).type_id),
+            ValueId::BlockParam(pid) => Some(self.block_param(pid).type_id),
+            ValueId::Varnode(vid) => shared.values.varnode_types.get(&vid).copied(),
+            ValueId::BasicBlock(_) | ValueId::Function(_) => None,
         }
     }
 }
