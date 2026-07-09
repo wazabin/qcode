@@ -16,61 +16,67 @@
 
 use std::borrow::Cow;
 
-use qcode::{
-    context::Context,
-    value::{
-        BasicBlock, Function, FunctionId, Renameable,
-        insn::{Branch, Mnemonic},
-    },
+use qcode::value::{
+    BlockRef, FunctionId, FunctionRef,
+    insn::{Branch, Mnemonic},
+    util::{base_ref::HostRef, host_mut::HostMut},
 };
 
-use crate::{FunctionPass, PipelineEnv};
+use crate::{FunctionBody, FunctionPassV2, ModuleView};
 
 #[derive(Default)]
 pub struct NameThunks;
 
-impl FunctionPass for NameThunks {
+impl FunctionPassV2 for NameThunks {
     const NAME: &'static str = "name_thunks";
 
     fn description(&self) -> &'static str {
         "Name single-jump thunks after the function they forward to"
     }
 
-    fn run(
+    fn run<'str>(
         &self,
-        ctx: &mut Context,
-        fun_id: FunctionId,
-        _env: &PipelineEnv,
+        m: &ModuleView<'_, 'str>,
+        f: &mut FunctionBody<'str>,
     ) -> Result<bool, String> {
-        let function = Function::from_id(ctx, fun_id);
+        let fid = f.id();
+        // Read-only analysis of the checked-out body and the callee's *interface*
+        // (its published name, read from the shared context), then release the
+        // host before buffering the self-rename.
+        let new_name: Option<String> = {
+            let host = f.host(m);
+            let hr = host.read_host();
+            let function = FunctionRef::new(hr, fid);
 
-        // Only rename functions still carrying their generated `fn_<addr>` name;
-        // a real symbol (export / demangled name) is authoritative and kept.
-        let Some(addr) = function.address() else {
-            return Ok(false);
+            // Only rename functions still carrying their generated `fn_<addr>`
+            // name; a real symbol (export / demangled name) is authoritative.
+            match function.address() {
+                Some(addr) if function.name() == format!("fn_{addr:x}") => {
+                    // A thunk is a lone block jumping to another function.
+                    thunk_target(hr, fid).map(|callee_id| {
+                        let callee = FunctionRef::new(hr, callee_id).name();
+                        format!("thunk_{callee}")
+                    })
+                }
+                _ => None,
+            }
         };
-        if function.name() != format!("fn_{addr:x}") {
-            return Ok(false);
+
+        match new_name {
+            Some(name) => {
+                // Buffered; the driver uniquifies and applies it at check-in.
+                f.effects_mut().rename_self(Cow::Owned(name));
+                Ok(true)
+            }
+            None => Ok(false),
         }
-
-        // A thunk is a lone block whose terminator jumps to another function.
-        let Some(callee_id) = thunk_target(ctx, fun_id) else {
-            return Ok(false);
-        };
-
-        let callee = Function::from_id(ctx, callee_id).name().to_string();
-        let name = ctx.get_unique_name(Cow::Owned(format!("thunk_{callee}")));
-        Function::from_id_mut(ctx, fun_id)
-            .rename(name)
-            .map_err(|e| e.to_string())?;
-        Ok(true)
     }
 }
 
 /// If `fun_id` is a single-block function ending in an unconditional `Branch` to
 /// a *different* function's entry, return that callee. Otherwise `None`.
-fn thunk_target(ctx: &Context, fun_id: FunctionId) -> Option<FunctionId> {
-    let function = Function::from_id(ctx, fun_id);
+fn thunk_target(host: HostRef, fun_id: FunctionId) -> Option<FunctionId> {
+    let function = FunctionRef::new(host, fun_id);
 
     let mut blocks = function.blocks();
     let block = blocks.next()?;
@@ -82,18 +88,19 @@ fn thunk_target(ctx: &Context, fun_id: FunctionId) -> Option<FunctionId> {
         return None;
     };
 
-    let callee = BasicBlock::from_id(ctx, *target).function()?;
+    let callee = BlockRef::new(host, *target).function()?;
     (callee.id != fun_id).then_some(callee.id)
 }
 
-crate::register_function_pass!(NameThunks);
+crate::register_function_pass_v2!(NameThunks);
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::test_util::run_function_pass;
+    use crate::test_util::run_function_pass_v2;
     use qcode::builder::Builder;
-    use qcode::value::BlockId;
+    use qcode::context::Context;
+    use qcode::value::{BasicBlock, BlockId, Function};
 
     /// A bodyless callee `name` at 0x2000 to forward to; returns its entry block.
     fn make_callee(ctx: &mut Context, name: &str) -> BlockId {
@@ -123,7 +130,7 @@ mod tests {
         let callee = make_callee(&mut ctx, "realfunc");
         let f = make_thunk(&mut ctx, "fn_1000", callee);
 
-        let changed = run_function_pass::<NameThunks>(&mut ctx, f).unwrap();
+        let changed = run_function_pass_v2::<NameThunks>(&mut ctx, f).unwrap();
         assert!(changed);
         assert_eq!(Function::from_id(&ctx, f).name(), "thunk_realfunc");
     }
@@ -135,7 +142,7 @@ mod tests {
         let callee = make_callee(&mut ctx, "realfunc");
         let f = make_thunk(&mut ctx, "helper", callee);
 
-        let changed = run_function_pass::<NameThunks>(&mut ctx, f).unwrap();
+        let changed = run_function_pass_v2::<NameThunks>(&mut ctx, f).unwrap();
         assert!(!changed);
         assert_eq!(Function::from_id(&ctx, f).name(), "helper");
     }
@@ -146,16 +153,10 @@ mod tests {
         let mut ctx = Context::new();
         let callee = make_callee(&mut ctx, "realfunc");
         let f = make_thunk(&mut ctx, "fn_1000", callee);
-        // A second block means it is no longer a lone-jump thunk.
-        let extra = {
-            let __f = ctx.anon_function();
-            BasicBlock::make(&mut ctx, __f)
-        }
-        .with_address(0x1008)
-        .id;
-        Function::from_id_mut(&mut ctx, f).add_block(extra);
+        // A second block (owned by `f`) means it is no longer a lone-jump thunk.
+        let _extra = BasicBlock::make(&mut ctx, f).with_address(0x1008).id;
 
-        let changed = run_function_pass::<NameThunks>(&mut ctx, f).unwrap();
+        let changed = run_function_pass_v2::<NameThunks>(&mut ctx, f).unwrap();
         assert!(!changed);
     }
 }
