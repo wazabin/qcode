@@ -527,6 +527,25 @@ where
         self.ctx.block_mut(self.id).comment = comment;
     }
 
+    /// Sets this block's name and registers it in the owning function's local name
+    /// table (own-block edit, host-routed). Mirrors the `Renameable` impls for the
+    /// concrete module / checked-out block refs, but works over any [`HostMut`], so
+    /// a `FunctionPassV2` can name the blocks it mints. Returns an error only on a
+    /// duplicate name.
+    pub fn rename_local(&mut self, name: Cow<'str, str>) -> crate::error::Result<()> {
+        let old_name = self
+            .ctx
+            .read_host()
+            .block(self.id)
+            .name
+            .as_deref()
+            .map(str::to_owned);
+        self.ctx
+            .register_local_name(self.id.into(), name.clone(), old_name.as_deref())?;
+        self.ctx.block_mut(self.id).name = Some(name);
+        Ok(())
+    }
+
     fn insert_insn(&mut self, index: usize, insn_id: InstructionId) {
         self.ctx.instruction_mut(insn_id).parent = Some(self.id);
         self.ctx

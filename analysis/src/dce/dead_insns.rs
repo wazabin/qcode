@@ -92,7 +92,7 @@ pub fn remove_dead_pure_call(ctx: &mut Context, block_id: BlockId) -> bool {
         return false;
     };
 
-    replace_terminator_with_branch(ctx, block_id, fallthrough, vec![]);
+    replace_terminator_with_branch(&mut &mut *ctx, block_id, fallthrough, vec![]);
     true
 }
 
@@ -679,7 +679,7 @@ fn remove_dead_counted_loop(ctx: &mut Context, fun_id: FunctionId) -> bool {
         .collect();
     for header in headers {
         if let Some(dl) = match_dead_loop(ctx, header) {
-            replace_terminator_with_branch(ctx, dl.preheader, dl.exit, vec![]);
+            replace_terminator_with_branch(&mut &mut *ctx, dl.preheader, dl.exit, vec![]);
             return true;
         }
     }

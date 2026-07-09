@@ -168,6 +168,12 @@ pub trait HostMut<'str> {
         id
     }
 
+    /// Mint a fresh empty block into `func`'s arena, parented to `func` and
+    /// rostered (host-routed equivalent of [`BasicBlock::make`]).
+    fn make_block(&mut self, func: FunctionId) -> BlockId {
+        self.push_block(func, BasicBlock::detached(func))
+    }
+
     /// Push a fresh block parameter into `func`'s arena.
     fn push_block_param(&mut self, func: FunctionId, param: BlockParam<'str>) -> BlockParamId {
         let local = self.function_mut(func).params.push(param);
