@@ -296,6 +296,21 @@ pub(crate) fn outline_scan_body<'str>(
     })
 }
 
+/// The result type of a `map`/`scan` over `src` whose body returns `body_ret`,
+/// mirroring [`Builder::push_map`](crate::builder::Builder::push_map)'s type rule
+/// (a sequence of `body_ret` with the source's length/kind, falling back to the
+/// source type). The pass must compute this itself: the Builder derives it by
+/// reading the body function's return type, but a *minted* body is not yet
+/// installed (its registry slot is a sentinel), so it would read a wrong
+/// fallback and mis-type the node.
+pub(crate) fn seq_result_type(host: HostRef, src: ValueId, body_ret: TypeId) -> TypeId {
+    let src_ty = host.type_of(src);
+    match host.shared().types.seq_of(src_ty) {
+        Some((_, len, is_list)) => host.shared().types.get_or_make_seq(body_ret, len, is_list),
+        None => src_ty,
+    }
+}
+
 /// Push a fresh param typed `ty` onto `block` in the minted host (host-routed
 /// mirror of `BasicBlock::push_param` + the `type_id` write). Returns its value.
 fn push_param_into<'str, H: HostMut<'str>>(host: &mut H, block: BlockId, ty: TypeId) -> ValueId {

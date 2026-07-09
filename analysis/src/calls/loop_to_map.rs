@@ -261,17 +261,38 @@ fn apply<'str>(m: &ModuleView<'_, 'str>, body: &mut FunctionBody<'str>, mm: &Map
             .next()
             .map(|i| i.id)
     });
-    let map_val = {
+    // The map source (`enumerate(arr0)` when index-aware, else `arr0`), built
+    // ahead of the consumer.
+    let src = if uses_index {
         let mut b = Builder::from_block(BaseRef::new(host.reborrow_host(), mm.exit));
         if let Some(at) = anchor {
             b.set_insert_point_before(at);
         }
-        let src = if uses_index {
-            b.push_intrinsic(enum_id, vec![mm.init_arr]).id()
-        } else {
-            mm.init_arr
-        };
-        b.push_map(body_fn, src, Vec::new()).id()
+        b.push_intrinsic(enum_id, vec![mm.init_arr]).id()
+    } else {
+        mm.init_arr
+    };
+    // Build the `map` node with an explicit result type: the body is a *minted*
+    // function, so `push_map`'s "read the body's return type" cannot see it — the
+    // element type is the loop's stored value.
+    let map_val = {
+        let body_ret = host.read_host().type_of(mm.ca.stored_val);
+        let ty = crate::calls::outline::seq_result_type(host.read_host(), src, body_ret);
+        let id = host.push_mnemonic_with_type(
+            fid,
+            Mnemonic::Map(qcode::value::insn::Map {
+                body: body_fn,
+                src,
+                captures: Vec::new(),
+            }),
+            ty,
+        );
+        // Insert right where the source (or the anchor) sits, before the consumer.
+        match anchor {
+            Some(at) => host.insert_insn_before(mm.exit, at, id),
+            None => BaseRef::new(host.reborrow_host(), mm.exit).push_insn(id),
+        }
+        ValueId::Instruction(id)
     };
     // Redirect the exit view of the carried array to the map. When redundant-φ
     // elimination collapsed the exit pass-through, the exit view *is* the header

@@ -329,11 +329,29 @@ fn apply<'str>(mv: &ModuleView<'_, 'str>, body: &mut FunctionBody<'str>, m: &Sca
         }
     };
 
-    // scan(iota) → singleton(seed) → concat, ahead of every exit use.
+    // scan(iota) → singleton(seed) → concat, ahead of every exit use. The scan's
+    // body is a *minted* function `push_scan` cannot read for its result type, so
+    // build the node with an explicit type: a sequence of the accumulator
+    // (stored-value) type with the source's length/kind.
+    let scan = {
+        let body_ret = host.read_host().type_of(m.stored_val);
+        let ty = crate::calls::outline::seq_result_type(host.read_host(), src, body_ret);
+        let id = host.push_mnemonic_with_type(
+            fid,
+            Mnemonic::Scan(qcode::value::insn::Scan {
+                body: body_fn,
+                init: m.seed_val,
+                src,
+                captures: Vec::new(),
+            }),
+            ty,
+        );
+        host.insert_insn_before(m.exit, anchor, id);
+        ValueId::Instruction(id)
+    };
     let full = {
         let mut b = Builder::from_block(BaseRef::new(host.reborrow_host(), m.exit));
         b.set_insert_point_before(anchor);
-        let scan = b.push_scan(body_fn, m.seed_val, src, Vec::new()).id();
         let sing = b.push_intrinsic(singleton_id, vec![m.seed_val]).id();
         b.push_intrinsic(concat_id, vec![sing, scan]).id()
     };
