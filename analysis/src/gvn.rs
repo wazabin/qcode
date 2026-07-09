@@ -173,22 +173,23 @@ crate::register_function_pass_v2!(ConstFold);
 #[derive(Default)]
 pub struct Narrow;
 
-impl FunctionPass for Narrow {
+impl FunctionPassV2 for Narrow {
     const NAME: &'static str = "narrow";
     fn description(&self) -> &'static str {
         "Sink low-word truncations through arithmetic, cancelling widenings"
     }
-    fn run(
+    fn run<'str>(
         &self,
-        ctx: &mut Context,
-        fun_id: FunctionId,
-        _env: &PipelineEnv,
+        m: &ModuleView<'_, 'str>,
+        f: &mut FunctionBody<'str>,
     ) -> Result<bool, String> {
-        Ok(narrow_function(ctx, fun_id))
+        let fun_id = f.id();
+        let mut host = f.host(m);
+        Ok(narrow_host(&mut host, fun_id))
     }
 }
 
-crate::register_function_pass!(Narrow);
+crate::register_function_pass_v2!(Narrow);
 
 #[derive(Default)]
 pub struct Gvn;
