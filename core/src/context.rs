@@ -566,6 +566,172 @@ impl<'str> Context<'str> {
         BasicBlock::from_id_mut(self, to).remove_edge(edge_id);
     }
 
+    /// Relocate every block in `olds` — each owned by `target` but *stored* in a
+    /// different function's arenas (a "reattributed" block, see
+    /// `reattribute_blocks`) — into `target`'s own arenas, so that ownership and
+    /// storage agree (`block.id.func == block.parent`).
+    ///
+    /// This is a pure storage move: the resulting IR is semantically identical.
+    /// Every relocated block is deep-cloned into `target` (preserving instruction
+    /// types, machine addresses, and labels), all intra-set value/block references
+    /// are remapped to the clones, the incident CFG edges are rebuilt between the
+    /// new blocks (and their unmoved neighbours), the block addresses and the
+    /// function root are re-pointed, and the originals are deleted. `target`'s
+    /// reverse-use map is rebuilt from its live instructions afterwards.
+    ///
+    /// Assumes (as guaranteed by the splitter after it strips cross-function CFG
+    /// edges) that the relocated set is closed: every reference from a relocated
+    /// block resolves to another relocated block, an unmoved block of `target`, or
+    /// a shared value. A reference that would cross into a *third* function is a
+    /// Make every function checkout-safe by relocating each "reattributed" block —
+    /// one whose *owner* (`parent`) differs from its *storage* (`id.func`) — into
+    /// its owner's arenas, so that `id.func == parent` holds for every live block.
+    ///
+    /// Reattribution (a block owned by one function but stored in another) is
+    /// produced both by recursive disassembly (a block first lifted as one
+    /// function's target, later attached to the function that truly owns it) and by
+    /// `split_overlapping_functions`. A [`checked-out`](Self::checkout_function)
+    /// function moves only its own [`Function`] out of the module, so a roster block
+    /// living in a *different* function's arena would be inaccessible — hence this
+    /// must run before any checkout. It is a pure storage move (see
+    /// [`rehome_owned_blocks`](Self::rehome_owned_blocks)); the IR is unchanged.
+    /// Returns `true` if anything was relocated.
+    pub fn normalize_block_storage(&mut self) -> bool {
+        // Group each owner's foreign blocks so the whole set relocates together and
+        // its internal references remap in one pass.
+        let mut foreign_by_owner: HashMap<FunctionId, Vec<BlockId>> = HashMap::default();
+        for id in self.block_ids() {
+            if let Some(owner) = self.values.block(id).parent
+                && owner != id.func
+            {
+                foreign_by_owner.entry(owner).or_default().push(id);
+            }
+        }
+        if foreign_by_owner.is_empty() {
+            return false;
+        }
+        for (owner, olds) in foreign_by_owner {
+            log::debug!(
+                target: "split",
+                "re-homing {} reattributed block(s) into {owner:?}",
+                olds.len(),
+            );
+            self.rehome_owned_blocks(owner, &olds);
+        }
+        true
+    }
+
+    /// bug upstream; debug builds assert against it.
+    pub fn rehome_owned_blocks(&mut self, target: FunctionId, olds: &[BlockId]) {
+        // Phase 1: structurally clone every block into `target`, accumulating the
+        // old -> new value and block maps.
+        let mut value_map: HashMap<ValueId, ValueId> = HashMap::default();
+        let mut block_map: HashMap<BlockId, BlockId> = HashMap::default();
+        for &old in olds {
+            let new = BasicBlock::clone_block_into(self, old, target, &mut value_map);
+            block_map.insert(old, new);
+        }
+
+        // Phase 2: with the full map known, remap the clones' operands and block
+        // targets (this resolves forward references between relocated blocks).
+        for &new in block_map.values() {
+            let insns = self.values.block(new).instructions.clone();
+            for insn_id in insns {
+                let mut mnemonic = self.values.instruction(insn_id).mnemonic().clone();
+                for arg in mnemonic.args() {
+                    if let Some(&new_val) = value_map.get(&arg) {
+                        mnemonic.replace_value(arg, new_val);
+                    } else {
+                        // An operand not in the map must resolve to `target` itself
+                        // (an unmoved own block) or to a shared value — never into a
+                        // third function. A cross-function data dependence would mean
+                        // the split left the set non-closed (a bug upstream).
+                        debug_assert!(
+                            arg.owning_function().is_none_or(|f| f == target),
+                            "rehome: relocated block references a value in another \
+                             function ({arg:?}); the relocated set is not closed",
+                        );
+                    }
+                }
+                remap_block_targets(&mut mnemonic, &block_map);
+                *self.values.instruction_mut(insn_id).mnemonic_mut() = mnemonic;
+            }
+        }
+
+        // Phase 3: rebuild every CFG edge incident to a relocated block, retargeting
+        // the moved endpoint(s) to the clone. Collect the incident edge ids first
+        // (an edge between two relocated blocks appears in both edge sets — the set
+        // dedups it).
+        let mut incident: HashSet<EdgeId> = HashSet::default();
+        for &old in olds {
+            incident.extend(self.values.block(old).edges.iter().copied());
+        }
+        for edge in incident {
+            let EdgeData { from, to } = *self.values.edge(edge);
+            let new_from = block_map.get(&from).copied().unwrap_or(from);
+            let new_to = block_map.get(&to).copied().unwrap_or(to);
+            self.add_cfg_edge(new_from, new_to);
+        }
+
+        // Phase 4: move each block's machine address onto its clone.
+        for &old in olds {
+            let Some(addr) = self.values.block(old).address else {
+                continue;
+            };
+            let new = block_map[&old];
+            let extra = self.values.block(old).extra_addresses.clone();
+            self.values.block_mut(new).extra_addresses = extra;
+            self.values.block_mut(new).address = Some(addr);
+            match self.address_map.get(&addr).copied() {
+                // A function and its entry block share an address; the map keeps the
+                // function, so only the block's `address` field and the root pointer
+                // (fixed in phase 5) need to move.
+                Some(ValueId::Function(_)) => {}
+                // The block itself is mapped: repoint it at the clone.
+                _ => {
+                    self.address_map.insert(addr, ValueId::BasicBlock(new));
+                }
+            }
+        }
+
+        // Phase 5: re-point the function root if it was relocated.
+        if let Some(root) = self.values.functions[target].root
+            && let Some(&new_root) = block_map.get(&root)
+        {
+            self.values.functions[target].root = Some(new_root);
+        }
+
+        // Phase 6: delete the originals (unlinks their old edges, removes their
+        // instructions from the storing function's use-lists, and tombstones them).
+        for &old in olds {
+            BasicBlock::from_id_mut(self, old).delete(target);
+        }
+
+        // Phase 7: rebuild `target`'s reverse-use map from its live instructions,
+        // since phase 2 rewrote operands in place. `call_sites` is left untouched:
+        // the clones registered their sites when created, and the deletions in phase
+        // 6 dropped the originals'.
+        self.rebuild_users(target);
+    }
+
+    /// Rebuild `func`'s reverse-use map (`users`) from scratch by scanning its live
+    /// instructions' operands. Mirrors the per-operand recording in
+    /// [`ValueRegistry::push_insn`](crate::value::registry::ValueRegistry::push_insn).
+    fn rebuild_users(&mut self, func: FunctionId) {
+        let live: Vec<InstructionId> = Function::from_id(self, func).instruction_ids();
+        let users = &mut self.values.functions[func].users;
+        users.clear();
+        for id in live {
+            let args = self.values.functions[func].insns[id.local]
+                .mnemonic()
+                .args();
+            let users = &mut self.values.functions[func].users;
+            for arg in args {
+                users.entry(arg).or_default().push(id);
+            }
+        }
+    }
+
     /// Assumes `prop` is true. Returns `false` (and records nothing) if the
     /// proposition is already assumed or known false; returns `true` if it was
     /// recorded or already held with the same polarity (idempotent). The
@@ -1142,6 +1308,26 @@ fn split_generated_suffix(name: &str) -> Option<(&str, u32)> {
         return None;
     }
     Some((base, digits.parse().ok()?))
+}
+
+/// Retarget a terminator's static block targets through `block_map` (used by
+/// [`Context::rehome_owned_blocks`] to point relocated branches at the clones).
+/// Value operands are handled separately via [`Mnemonic::replace_value`]; this
+/// only rewrites the [`BlockId`] targets, which are not value operands.
+fn remap_block_targets(mnemonic: &mut Mnemonic, block_map: &HashMap<BlockId, BlockId>) {
+    let remap = |b: &mut BlockId| {
+        if let Some(&new) = block_map.get(b) {
+            *b = new;
+        }
+    };
+    match mnemonic {
+        Mnemonic::Branch(branch) => remap(&mut branch.target),
+        Mnemonic::CBranch(cbranch) => {
+            remap(&mut cbranch.success_block);
+            remap(&mut cbranch.failure_block);
+        }
+        _ => {}
+    }
 }
 
 impl Display for Context<'_> {

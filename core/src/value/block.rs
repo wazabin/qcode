@@ -149,6 +149,80 @@ impl<'str> BasicBlock<'str> {
         }
     }
 
+    /// Structurally clone the block at `orig` into a fresh block owned by (and
+    /// stored in) `target`, *without* remapping operands.
+    ///
+    /// This is the storage-move sibling of [`clone_into_ctx`](Self::clone_into_ctx):
+    /// where `clone_into_ctx` builds a semantically independent copy inside the
+    /// *same* function (used by the tracer), this reproduces `orig` verbatim in a
+    /// *different* function's arenas — preserving each instruction's exact result
+    /// [`TypeId`] and machine address, and the block's own name — so a caller
+    /// relocating a reattributed block can then fix up the references in a single
+    /// whole-function pass. It records `orig`'s params and instruction results in
+    /// `value_map` (old id -> new id) but leaves the new instructions' operands and
+    /// block targets pointing at the *originals*; the caller remaps them once the
+    /// full map is known (so forward references between relocated blocks resolve).
+    pub fn clone_block_into(
+        ctx: &mut Context<'str>,
+        orig: BlockId,
+        target: FunctionId,
+        value_map: &mut HashMap<ValueId, ValueId>,
+    ) -> BlockId {
+        let new_block_id = BasicBlock::make(ctx, target).id;
+
+        // Preserve the original label, deduplicated within the target function's
+        // own (function-scoped) name table.
+        let name = ctx.values.block(orig).name.clone().unwrap_or_else(|| {
+            Cow::Owned(format!(
+                "clone_{:x}",
+                ctx.values.block(orig).address.unwrap_or(0)
+            ))
+        });
+        let unique_name = ctx.get_unique_name_in(target, name);
+        BasicBlock::from_id_mut(ctx, new_block_id)
+            .rename(unique_name)
+            .expect("name was deduplicated");
+
+        // Clone parameters verbatim (parent re-pointed at the new block).
+        for old_param_id in &ctx.values.block(orig).params.clone() {
+            let old_param = ctx.values.block_param(*old_param_id).clone();
+            let new_param_id = ctx.values.push_block_param(
+                target,
+                BlockParam {
+                    parent: Some(new_block_id),
+                    ..old_param
+                },
+            );
+            BasicBlock::from_id_mut(ctx, new_block_id).push_existing_param(new_param_id);
+            value_map.insert(
+                ValueId::BlockParam(*old_param_id),
+                ValueId::BlockParam(new_param_id),
+            );
+        }
+
+        // Clone instructions verbatim, preserving the exact result type and the
+        // machine address. Operands are copied as-is; the caller remaps them.
+        let orig_insns = ctx.values.block(orig).instructions.clone();
+        for &old_insn_id in orig_insns.iter() {
+            let (mnemonic, type_id, address) = {
+                let insn = Instruction::from_id(&*ctx, old_insn_id);
+                (insn.mnemonic().clone(), insn.type_id(), insn.address())
+            };
+            let new_insn_id =
+                InstructionRef::from_mnemonic_with_type(ctx, target, mnemonic, type_id).id;
+            if let Some(addr) = address {
+                ctx.values.instruction_mut(new_insn_id).set_address(addr);
+            }
+            BasicBlock::from_id_mut(ctx, new_block_id).push_insn(new_insn_id);
+            value_map.insert(
+                ValueId::Instruction(old_insn_id),
+                ValueId::Instruction(new_insn_id),
+            );
+        }
+
+        new_block_id
+    }
+
     /// Deep-clone the block at `orig` into a new block in the same context.
     /// Updates `value_map` with parameters and instructions remapping.
     pub fn clone_into_ctx(
