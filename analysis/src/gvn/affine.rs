@@ -31,10 +31,11 @@ use rustc_hash::FxHashMap as HashMap;
 use qcode::{
     context::Context,
     value::{
-        BasicBlock, Function, ValueId,
+        BasicBlock, BlockRef, FunctionRef, ValueId,
         block::BlockId,
         function::FunctionId,
         insn::{Binary, Binop, InstructionId, InstructionRef, IntBinop, Mnemonic, Unary, Unop},
+        util::base_ref::HostRef,
     },
 };
 
@@ -143,7 +144,7 @@ fn scale_terms(terms: &[(ValueId, u64)], k: u64, m: u64) -> Vec<(ValueId, u64)> 
 /// The arithmetic view of an operand: its stored affine form, a constant, or an
 /// opaque leaf `1·v`. Mask/opaque values are treated as opaque leaves.
 fn affine_view(
-    ctx: &Context,
+    host: HostRef,
     v: ValueId,
     width: usize,
     state: &Numbering,
@@ -157,7 +158,7 @@ fn affine_view(
     {
         return (*constant, terms.clone());
     }
-    if let Some(c) = const_value(ctx, v) {
+    if let Some(c) = const_value(host.shared(), v) {
         return (c & mask_for(width), vec![]);
     }
     (0, vec![(v, 1)])
@@ -188,7 +189,7 @@ fn is_self_leaf(form: &NormalForm, id: ValueId) -> bool {
 /// Compute the arithmetic view of the value `id` produced by `mnemonic`. Returns
 /// an `Affine`/`Mask` form for covered ops, else the opaque leaf `1·id`.
 pub(super) fn arith_form(
-    ctx: &Context,
+    host: HostRef,
     id: ValueId,
     mnemonic: &Mnemonic,
     width: usize,
@@ -206,8 +207,8 @@ pub(super) fn arith_form(
             rhs,
         }) => match op {
             IntBinop::Add => {
-                let (cl, tl) = affine_view(ctx, *lhs, width, state);
-                let (cr, tr) = affine_view(ctx, *rhs, width, state);
+                let (cl, tl) = affine_view(host, *lhs, width, state);
+                let (cr, tr) = affine_view(host, *rhs, width, state);
                 NormalForm::Affine {
                     width,
                     constant: cl.wrapping_add(cr) & m,
@@ -215,8 +216,8 @@ pub(super) fn arith_form(
                 }
             }
             IntBinop::Sub => {
-                let (cl, tl) = affine_view(ctx, *lhs, width, state);
-                let (cr, tr) = affine_view(ctx, *rhs, width, state);
+                let (cl, tl) = affine_view(host, *lhs, width, state);
+                let (cr, tr) = affine_view(host, *rhs, width, state);
                 NormalForm::Affine {
                     width,
                     constant: cl.wrapping_sub(cr) & m,
@@ -225,27 +226,27 @@ pub(super) fn arith_form(
             }
             IntBinop::Mul => {
                 // Affine only when exactly one side is a constant scale.
-                if let Some(k) = const_value(ctx, *rhs) {
-                    scale_affine(ctx, *lhs, k & m, width, state)
-                } else if let Some(k) = const_value(ctx, *lhs) {
-                    scale_affine(ctx, *rhs, k & m, width, state)
+                if let Some(k) = const_value(host.shared(), *rhs) {
+                    scale_affine(host, *lhs, k & m, width, state)
+                } else if let Some(k) = const_value(host.shared(), *lhs) {
+                    scale_affine(host, *rhs, k & m, width, state)
                 } else {
                     leaf(id, width)
                 }
             }
             IntBinop::ShiftLeft => {
                 // x << s  ==  x * 2^s  (constant amount, in range).
-                match const_value(ctx, *rhs) {
+                match const_value(host.shared(), *rhs) {
                     Some(s) if s < (width as u64 * 8) && s < 64 => {
-                        scale_affine(ctx, *lhs, (1u64 << s) & m, width, state)
+                        scale_affine(host, *lhs, (1u64 << s) & m, width, state)
                     }
                     _ => leaf(id, width),
                 }
             }
             IntBinop::And | IntBinop::Or | IntBinop::Xor => {
-                if let Some(k) = const_value(ctx, *rhs) {
+                if let Some(k) = const_value(host.shared(), *rhs) {
                     mask_form(*lhs, *op, k & m, width, state)
-                } else if let Some(k) = const_value(ctx, *lhs) {
+                } else if let Some(k) = const_value(host.shared(), *lhs) {
                     mask_form(*rhs, *op, k & m, width, state)
                 } else {
                     leaf(id, width)
@@ -257,7 +258,7 @@ pub(super) fn arith_form(
             op: Unop::IntNegate,
             src,
         }) => {
-            scale_affine(ctx, *src, m /* -1 */, width, state)
+            scale_affine(host, *src, m /* -1 */, width, state)
         }
         // `gep(base, off)` ≡ `base + off` (a constant byte offset). Decompose it
         // like an `Add` so a field address numbers the same as the equivalent
@@ -266,7 +267,7 @@ pub(super) fn arith_form(
         // syntactic (never rewritten into an add) by [`key_for`], which forces a
         // `Gep` mnemonic to an opaque key.
         Mnemonic::Gep(g) => {
-            let (c, t) = affine_view(ctx, g.base, width, state);
+            let (c, t) = affine_view(host, g.base, width, state);
             NormalForm::Affine {
                 width,
                 constant: c.wrapping_add(g.offset as u64) & m,
@@ -277,9 +278,9 @@ pub(super) fn arith_form(
     }
 }
 
-fn scale_affine(ctx: &Context, v: ValueId, k: u64, width: usize, state: &Numbering) -> NormalForm {
+fn scale_affine(host: HostRef, v: ValueId, k: u64, width: usize, state: &Numbering) -> NormalForm {
     let m = mask_for(width);
-    let (c, t) = affine_view(ctx, v, width, state);
+    let (c, t) = affine_view(host, v, width, state);
     NormalForm::Affine {
         width,
         constant: c.wrapping_mul(k) & m,
@@ -764,9 +765,13 @@ impl Numbering {
 /// read-only with sub-passes that need a pointer's base identity before the
 /// dominator walk reaches the pointer's definition (see memory forwarding). Only
 /// `forms` is populated; `leaders` stay empty (they are dominance-sensitive).
-pub(crate) fn precompute_forms(ctx: &Context, func_id: FunctionId) -> Numbering {
+pub(crate) fn precompute_forms<'a, 'str: 'a>(
+    host: impl Into<HostRef<'a, 'str>>,
+    func_id: FunctionId,
+) -> Numbering {
+    let host = host.into();
     let mut numbering = Numbering::default();
-    let ids: Vec<ValueId> = Function::from_id(ctx, func_id)
+    let ids: Vec<ValueId> = FunctionRef::new(host, func_id)
         .iter()
         .flat_map(|block| {
             block
@@ -777,7 +782,7 @@ pub(crate) fn precompute_forms(ctx: &Context, func_id: FunctionId) -> Numbering 
         })
         .collect();
     for id in ids {
-        ensure_form(ctx, id, &mut numbering);
+        ensure_form(host, id, &mut numbering);
     }
     numbering
 }
@@ -785,12 +790,16 @@ pub(crate) fn precompute_forms(ctx: &Context, func_id: FunctionId) -> Numbering 
 /// Like [`precompute_forms`] but seeded from an explicit block set rather than a
 /// whole function. Operand recursion follows the SSA graph regardless of block,
 /// so passing a function's full block list is equivalent to `precompute_forms`.
-pub(crate) fn precompute_forms_for_blocks(ctx: &Context, blocks: &[BlockId]) -> Numbering {
+pub(crate) fn precompute_forms_for_blocks<'a, 'str: 'a>(
+    host: impl Into<HostRef<'a, 'str>>,
+    blocks: &[BlockId],
+) -> Numbering {
+    let host = host.into();
     let mut numbering = Numbering::default();
     let ids: Vec<ValueId> = blocks
         .iter()
         .flat_map(|&b| {
-            BasicBlock::from_id(ctx, b)
+            BlockRef::new(host, b)
                 .instruction_ids()
                 .iter()
                 .map(|&id| ValueId::Instruction(id))
@@ -798,7 +807,7 @@ pub(crate) fn precompute_forms_for_blocks(ctx: &Context, blocks: &[BlockId]) -> 
         })
         .collect();
     for id in ids {
-        ensure_form(ctx, id, &mut numbering);
+        ensure_form(host, id, &mut numbering);
     }
     numbering
 }
@@ -976,20 +985,20 @@ mod spike {
 /// Memoize the affine form of `v`, recursing into operands first so that nested
 /// pointer arithmetic (e.g. `(p + 4) - 4`) fully decomposes. A placeholder leaf
 /// is inserted before recursing to break any operand cycle.
-fn ensure_form(ctx: &Context, v: ValueId, numbering: &mut Numbering) {
+fn ensure_form(host: HostRef, v: ValueId, numbering: &mut Numbering) {
     if numbering.forms.contains_key(&v) {
         return;
     }
     let ValueId::Instruction(id) = v else {
         return;
     };
-    let insn = ctx.get_insn(id);
+    let insn = InstructionRef::new(host, id);
     let width = insn.size();
     let mnemonic = insn.mnemonic().clone();
     numbering.forms.insert(v, leaf(v, width));
     for arg in mnemonic.args() {
-        ensure_form(ctx, arg, numbering);
+        ensure_form(host, arg, numbering);
     }
-    let form = arith_form(ctx, v, &mnemonic, width, numbering);
+    let form = arith_form(host, v, &mnemonic, width, numbering);
     numbering.forms.insert(v, form);
 }

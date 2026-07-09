@@ -273,7 +273,7 @@ fn try_promote(
     // The affine view of every value, and the function's full real-ram load/store
     // list — both shared across all params so the per-param decomposition can peel
     // a strided `param + idx*scale + const` address (see [`relate_address`]).
-    let numbering = precompute_forms(ctx, fid);
+    let numbering = precompute_forms(&*ctx, fid);
     let ram = ctx.default_space;
     let accesses_in: Vec<MemoryAccess> = Function::from_id(ctx, fid)
         .iter()
@@ -715,7 +715,7 @@ fn apply(
     // value and replays a no-op — sound on any control flow, no dominance needed.
     // `(base_param, base_size, offset, size)`.
     let own_frame = OwnFrame::new(ctx, fid, sp_reg);
-    let numbering = precompute_forms(ctx, fid);
+    let numbering = precompute_forms(&*ctx, fid);
     // `(base_param, base_size, signed offset, size)`. A negative offset (`base - k`,
     // e.g. an own-frame slot when there is no stack-pointer to recognise it) is
     // encoded two's-complement into the address const, so `base + offset` wraps to

@@ -75,7 +75,7 @@ impl SubPass for Cse {
         let state = state.downcast_mut::<Numbering>().expect("cse state");
 
         // Arithmetic view (used to compose consumers) and the value-numbering key.
-        let form = arith_form(ctx, ic.id, ic.mnemonic, ic.size, state);
+        let form = arith_form((&*ctx).into(), ic.id, ic.mnemonic, ic.size, state);
         state.record_form(ic.id, form.clone());
         let key = key_for(&form, ic.id, ic.mnemonic);
 

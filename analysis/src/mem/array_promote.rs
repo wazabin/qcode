@@ -138,7 +138,7 @@ fn try_match(ctx: &mut Context, fid: FunctionId) -> Option<PromoteMatch> {
     }
 
     let loops = crate::loop_info::recognize_loops(ctx, fid);
-    let numbering = precompute_forms(ctx, fid);
+    let numbering = precompute_forms(&*ctx, fid);
     let val_root = crate::loop_info::value_roots(ctx, fid);
     let root_of = |v: ValueId| -> Option<ValueId> { val_root.get(&v).copied() };
 

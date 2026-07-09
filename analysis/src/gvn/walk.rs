@@ -395,7 +395,7 @@ pub(super) fn run_dominator_walk(
 
     // Function-wide affine views, computed once and shared read-only with every
     // entry's walk (a value's arithmetic view is dominance-independent).
-    let numbering = super::affine::precompute_forms(ctx, func_id);
+    let numbering = super::affine::precompute_forms(&*ctx, func_id);
 
     let mut changed = false;
     for entry in std::iter::once(root).chain(entries) {
