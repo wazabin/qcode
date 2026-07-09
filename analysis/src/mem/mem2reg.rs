@@ -2208,7 +2208,7 @@ mod tests {
         let mut tc = qcode::testing::TestContext::new();
         let (fun_id, sp, sp_reg) = sp_slot_function(&mut tc);
 
-        canonicalize_sp_slots(&mut tc.ctx, fun_id, sp_reg);
+        canonicalize_sp_slots(&mut &mut tc.ctx, fun_id, sp_reg);
         let aliases = AliasResult::simple(&tc.ctx);
         let changed = mem2reg_framed(&mut tc.ctx, fun_id, &aliases, Some(sp));
 
@@ -2280,7 +2280,7 @@ mod tests {
             .filter(|i| matches!(i.mnemonic(), Mnemonic::Load(_)))
             .count();
 
-        canonicalize_sp_slots(&mut tc.ctx, fun_id, sp_reg);
+        canonicalize_sp_slots(&mut &mut tc.ctx, fun_id, sp_reg);
         let aliases = AliasResult::simple(&tc.ctx);
         mem2reg_framed(&mut tc.ctx, fun_id, &aliases, Some(sp));
 

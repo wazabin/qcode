@@ -796,7 +796,7 @@ mod tests {
 
         let promote = |tc: &mut TestContext, fun: FunctionId| {
             let sp_param = incoming_sp_param(&tc.ctx, fun, sp).unwrap();
-            canonicalize_sp_slots(&mut tc.ctx, fun, sp);
+            canonicalize_sp_slots(&mut &mut tc.ctx, fun, sp);
             let aliases = AliasResult::simple(&tc.ctx);
             mem2reg_framed(&mut tc.ctx, fun, &aliases, Some(sp_param));
         };

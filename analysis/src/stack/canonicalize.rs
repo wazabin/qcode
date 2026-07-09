@@ -20,8 +20,11 @@ use std::collections::{BTreeSet, HashMap};
 
 use qcode::{
     builder::Builder,
-    context::Context,
-    value::{BasicBlock, Function, FunctionId, ValueId, Varnode, VarnodeId, insn::Mnemonic},
+    value::{
+        FunctionId, FunctionRef, ValueId, Varnode, VarnodeId,
+        insn::Mnemonic,
+        util::{base_ref::BaseRef, host_mut::HostMut},
+    },
 };
 
 use super::frame::incoming_sp_param;
@@ -29,18 +32,22 @@ use crate::gvn::affine::precompute_forms;
 
 /// Rewrite every fixed `@SP ± N` load/store address in `fid` to a single
 /// root-block representative per offset `N`. Returns whether anything changed.
-pub fn canonicalize_sp_slots(ctx: &mut Context, fid: FunctionId, sp_reg: VarnodeId) -> bool {
-    let numbering = precompute_forms(&*ctx, fid);
-    let Some(sp_param) = incoming_sp_param(&*ctx, fid, sp_reg) else {
+pub fn canonicalize_sp_slots<'str, H: HostMut<'str>>(
+    host: &mut H,
+    fid: FunctionId,
+    sp_reg: VarnodeId,
+) -> bool {
+    let numbering = precompute_forms(host.read_host(), fid);
+    let Some(sp_param) = incoming_sp_param(host.read_host(), fid, sp_reg) else {
         return false;
     };
-    let Some(root) = Function::from_id(&*ctx, fid).root().map(|b| b.id) else {
+    let Some(root) = FunctionRef::new(host.read_host(), fid).root().map(|b| b.id) else {
         return false;
     };
 
     // Each distinct load/store pointer that is `@SP ± N` with a fixed offset.
     let mut ptr_offset: HashMap<ValueId, i64> = HashMap::new();
-    for block in Function::from_id(&*ctx, fid).blocks() {
+    for block in FunctionRef::new(host.read_host(), fid).blocks() {
         for insn in block.iter() {
             let ptr = match insn.mnemonic() {
                 Mnemonic::Load(load) => load.ptr,
@@ -58,7 +65,7 @@ pub fn canonicalize_sp_slots(ctx: &mut Context, fid: FunctionId, sp_reg: Varnode
         return false;
     }
 
-    let ptr_width = Varnode::from_id(&*ctx, sp_reg).size();
+    let ptr_width = Varnode::from_id(host.shared(), sp_reg).size();
     let offsets: BTreeSet<i64> = ptr_offset.values().copied().collect();
 
     // Reuse a prior run's representatives so this pass is idempotent: the first
@@ -68,7 +75,11 @@ pub fn canonicalize_sp_slots(ctx: &mut Context, fid: FunctionId, sp_reg: Varnode
     if offsets.contains(&0) {
         repr.insert(0, sp_param);
     }
-    for insn in Function::from_id(&*ctx, fid).root().unwrap().iter() {
+    for insn in FunctionRef::new(host.read_host(), fid)
+        .root()
+        .unwrap()
+        .iter()
+    {
         let v = ValueId::Instruction(insn.id);
         if let Some((base, off)) = numbering.base_offset(v)
             && base == sp_param
@@ -85,13 +96,10 @@ pub fn canonicalize_sp_slots(ctx: &mut Context, fid: FunctionId, sp_reg: Varnode
         .filter(|o| !repr.contains_key(o))
         .collect();
     if !missing.is_empty() {
-        let mut b = Builder::from_block(BasicBlock::from_id_mut(ctx, root));
+        let mut b = Builder::from_block(BaseRef::new(host.reborrow_host(), root));
         b.set_insert_point_to_start();
         for off in missing {
-            let mag = b
-                .context_mut()
-                .get_const(off.unsigned_abs(), ptr_width)
-                .id();
+            let mag = b.context().get_const(off.unsigned_abs(), ptr_width).id();
             let rep = if off > 0 {
                 b.push_add(sp_param, mag).id()
             } else {
@@ -108,7 +116,7 @@ pub fn canonicalize_sp_slots(ctx: &mut Context, fid: FunctionId, sp_reg: Varnode
     for (ptr, off) in ptr_offset {
         let rep = repr[&off];
         if ptr != rep {
-            ctx.replace_all_uses_with(ptr, rep);
+            host.replace_all_uses_with(ptr, rep);
             changed = true;
         }
     }
@@ -117,7 +125,7 @@ pub fn canonicalize_sp_slots(ctx: &mut Context, fid: FunctionId, sp_reg: Varnode
 
 // ----- pass ------------------------------------------------------------------
 
-use crate::{FunctionPass, PipelineEnv};
+use crate::{FunctionBody, FunctionPassV2, ModuleView};
 
 /// Runs [`canonicalize_sp_slots`] over a function, resolving `@SP` from the
 /// configured stack-pointer register. Replaces the legacy `brighten`/`lower_stack`
@@ -127,30 +135,32 @@ use crate::{FunctionPass, PipelineEnv};
 #[derive(Default)]
 pub struct CanonicalizeSpSlots;
 
-impl FunctionPass for CanonicalizeSpSlots {
+impl FunctionPassV2 for CanonicalizeSpSlots {
     const NAME: &'static str = "canonicalize_sp_slots";
     fn description(&self) -> &'static str {
         "Canonicalize @SP±N stack slots to one representative per offset"
     }
-    fn run(
+    fn run<'str>(
         &self,
-        ctx: &mut Context,
-        fun_id: FunctionId,
-        env: &PipelineEnv,
+        m: &ModuleView<'_, 'str>,
+        f: &mut FunctionBody<'str>,
     ) -> std::result::Result<bool, String> {
-        let sp_reg = ctx.registers[&env.cfg.stack_pointer];
-        Ok(canonicalize_sp_slots(ctx, fun_id, sp_reg))
+        let sp_reg = m.ctx().registers[&m.env().cfg.stack_pointer];
+        let fid = f.id();
+        let mut host = f.host(m);
+        Ok(canonicalize_sp_slots(&mut host, fid, sp_reg))
     }
 }
 
-crate::register_function_pass!(CanonicalizeSpSlots);
+crate::register_function_pass_v2!(CanonicalizeSpSlots);
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use qcode::{
+        context::Context,
         testing::TestContext,
-        value::{BasicBlock, Value},
+        value::{BasicBlock, Function, Value},
     };
 
     /// Two `load(@SP - 8)` in different blocks become one shared pointer after
@@ -208,7 +218,7 @@ mod tests {
             "distinct before canonicalization"
         );
 
-        assert!(canonicalize_sp_slots(&mut tc.ctx, fid, sp_reg));
+        assert!(canonicalize_sp_slots(&mut &mut tc.ctx, fid, sp_reg));
 
         assert_eq!(
             ptr_of(&tc, l0),
@@ -219,7 +229,7 @@ mod tests {
         // Idempotent: a second run reuses the representative and reports no change.
         let shared = ptr_of(&tc, l0);
         assert!(
-            !canonicalize_sp_slots(&mut tc.ctx, fid, sp_reg),
+            !canonicalize_sp_slots(&mut &mut tc.ctx, fid, sp_reg),
             "second run must be a no-op"
         );
         assert_eq!(

@@ -83,6 +83,16 @@ impl<'a, 'str> CheckedOut<'a, 'str> {
 /// [`read_host`](HostMut::read_host) (a [`HostRef`]); everything mutable — arena
 /// writes, births, the CFG/use-map verbs, local-name registration — routes here.
 pub trait HostMut<'str> {
+    /// A shorter-lived reborrow of this host, so a value that owns its host by
+    /// value — a [`Builder`](crate::builder::Builder) or a mutation `BaseRef` — can
+    /// be built from `&mut self` without consuming the original. `&mut Context`
+    /// reborrows to `&mut Context`; [`CheckedOut`] to a shorter [`CheckedOut`].
+    type Reborrowed<'b>: HostMut<'str>
+    where
+        Self: 'b;
+    /// Reborrow this host (see [`Reborrowed`](HostMut::Reborrowed)).
+    fn reborrow_host(&mut self) -> Self::Reborrowed<'_>;
+
     /// The owning function's storage (write). Panics if `f` is not routable by
     /// this host (a checked-out host only owns its one function).
     fn function_mut<'b>(&'b mut self, f: FunctionId) -> &'b mut Function<'str>;
@@ -506,6 +516,13 @@ pub trait HostMut<'str> {
 }
 
 impl<'str> HostMut<'str> for &mut Context<'str> {
+    type Reborrowed<'b>
+        = &'b mut Context<'str>
+    where
+        Self: 'b;
+    fn reborrow_host(&mut self) -> &mut Context<'str> {
+        self
+    }
     fn function_mut(&mut self, f: FunctionId) -> &mut Function<'str> {
         &mut self.values.functions[f]
     }
@@ -532,6 +549,13 @@ impl<'str> HostMut<'str> for &mut Context<'str> {
 }
 
 impl<'a, 'str> HostMut<'str> for CheckedOut<'a, 'str> {
+    type Reborrowed<'b>
+        = CheckedOut<'b, 'str>
+    where
+        Self: 'b;
+    fn reborrow_host(&mut self) -> CheckedOut<'_, 'str> {
+        self.reborrow()
+    }
     fn function_mut(&mut self, f: FunctionId) -> &mut Function<'str> {
         assert_eq!(
             f, self.id,
