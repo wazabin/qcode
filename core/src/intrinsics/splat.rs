@@ -33,7 +33,7 @@ impl Intrinsic for Splat {
         2
     }
 
-    fn result_type(&self, types: &mut TypeManager, args: &[TypeId]) -> TypeId {
+    fn result_type(&self, types: &TypeManager, args: &[TypeId]) -> TypeId {
         // The lane count is `n`'s *value*, invisible to the type layer, so the
         // pre-fold type is the length-erased `[T;*]`. A constant fold recovers a
         // fixed `[T; n]` (either the `Bytes` literal below or the explicit type the

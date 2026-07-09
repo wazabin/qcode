@@ -339,6 +339,21 @@ impl<'str, 'ctx, Ctx: HostMut<'str>> Builder<'str, 'ctx, Ctx> {
         self.push_instruction_with_type(mnemonic, type_id)
     }
 
+    /// Adds an instruction with an explicit result type, for callers that compute
+    /// the type themselves. Needed by passes that reference a *minted*
+    /// (not-yet-installed) function from a `Map`/`Scan`/`Apply`: the typed
+    /// `push_map`/`push_scan`/`push_apply` read the body function's return type
+    /// through the shared context, where a minted callee's slot is still a
+    /// sentinel — so the pass supplies the type it already knows instead.
+    #[track_caller]
+    pub fn push_mnemonic_with_type(
+        &mut self,
+        mnemonic: Mnemonic,
+        type_id: TypeId,
+    ) -> InstructionRef<'str, '_> {
+        self.push_instruction_with_type(mnemonic, type_id)
+    }
+
     #[track_caller]
     fn push_instruction_in_space(
         &mut self,
@@ -1220,7 +1235,7 @@ impl<'str, 'ctx, Ctx: HostMut<'str>> Builder<'str, 'ctx, Ctx> {
             .iter()
             .map(|&arg| self.type_of(arg))
             .collect::<Vec<_>>();
-        let type_id = desc.result_type(&mut self.context_mut().types, &arg_types);
+        let type_id = desc.result_type(&self.context().types, &arg_types);
 
         self.push_instruction_with_type(Mnemonic::Intrinsic(IntrinsicApp { id, args }), type_id)
     }

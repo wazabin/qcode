@@ -29,7 +29,7 @@ impl Intrinsic for Insert {
         3
     }
 
-    fn result_type(&self, _types: &mut TypeManager, args: &[TypeId]) -> TypeId {
+    fn result_type(&self, _types: &TypeManager, args: &[TypeId]) -> TypeId {
         // Same shape as the array being updated.
         args[0]
     }
@@ -95,7 +95,7 @@ mod tests {
         let i32 = types.get_or_make_int(4);
         let arr = types.get_or_make_array(i32, 5);
         let id = IntrinsicId::from_name("insert").unwrap();
-        assert_eq!(id.desc().result_type(&mut types, &[arr, i32, i32]), arr);
+        assert_eq!(id.desc().result_type(&types, &[arr, i32, i32]), arr);
     }
 
     /// `insert(Bytes[i32;3], 1, 0xaa)` patches lane 1 of the constant blob.

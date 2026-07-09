@@ -197,7 +197,7 @@ fn simplify_rotate(
 }
 
 /// A rotate's result is the same sized integer as its first operand.
-fn rotate_result_type(types: &mut TypeManager, args: &[TypeId]) -> TypeId {
+fn rotate_result_type(types: &TypeManager, args: &[TypeId]) -> TypeId {
     types.get_or_make_int(types.size_of(args[0]))
 }
 
@@ -211,7 +211,7 @@ impl Intrinsic for Rol {
     fn arity(&self) -> usize {
         2
     }
-    fn result_type(&self, types: &mut TypeManager, args: &[TypeId]) -> TypeId {
+    fn result_type(&self, types: &TypeManager, args: &[TypeId]) -> TypeId {
         rotate_result_type(types, args)
     }
     fn eval(&self, args: &[(u128, usize)], out_size: usize) -> Option<u128> {
@@ -245,7 +245,7 @@ impl Intrinsic for Ror {
     fn arity(&self) -> usize {
         2
     }
-    fn result_type(&self, types: &mut TypeManager, args: &[TypeId]) -> TypeId {
+    fn result_type(&self, types: &TypeManager, args: &[TypeId]) -> TypeId {
         rotate_result_type(types, args)
     }
     fn eval(&self, args: &[(u128, usize)], out_size: usize) -> Option<u128> {

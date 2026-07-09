@@ -27,7 +27,7 @@ impl Intrinsic for Concat {
         2
     }
 
-    fn result_type(&self, types: &mut TypeManager, args: &[TypeId]) -> TypeId {
+    fn result_type(&self, types: &TypeManager, args: &[TypeId]) -> TypeId {
         let (a_elem, a_len, a_list) =
             seq_or_list(types, args[0]).expect("concat lhs must be a sequence");
         let (b_elem, b_len, b_list) =
@@ -71,7 +71,7 @@ mod tests {
         let b = types.get_or_make_array(i32, 5);
 
         let id = IntrinsicId::from_name("concat").unwrap();
-        let result = id.desc().result_type(&mut types, &[a, b]);
+        let result = id.desc().result_type(&types, &[a, b]);
 
         assert_eq!(types.array_of(result), Some((i32, 8)));
         assert_eq!(types.size_of(result), 32);
@@ -85,7 +85,7 @@ mod tests {
         let b = types.get_or_make_list(i8, 5);
 
         let id = IntrinsicId::from_name("concat").unwrap();
-        let result = id.desc().result_type(&mut types, &[a, b]);
+        let result = id.desc().result_type(&types, &[a, b]);
 
         assert_eq!(types.list_of(result), Some((i8, Some(8))));
         assert_eq!(types.array_of(result), None);
@@ -99,7 +99,7 @@ mod tests {
         let b = types.get_or_make_array(i8, 5);
 
         let id = IntrinsicId::from_name("concat").unwrap();
-        let result = id.desc().result_type(&mut types, &[a, b]);
+        let result = id.desc().result_type(&types, &[a, b]);
 
         assert_eq!(types.list_of(result), Some((i8, None)));
     }

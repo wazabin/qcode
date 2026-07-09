@@ -50,7 +50,7 @@ impl Intrinsic for TakeWhile {
         1
     }
 
-    fn result_type(&self, types: &mut TypeManager, args: &[TypeId]) -> TypeId {
+    fn result_type(&self, types: &TypeManager, args: &[TypeId]) -> TypeId {
         // A *sequence* source of `T` becomes a `List<T>` with the source's bound: an
         // array `[T; N]` makes the finite-array → list transition (bound `N`), a list
         // keeps its bound (a prefix is no longer). A *pointer* source — a `char*`
@@ -94,7 +94,7 @@ mod tests {
         let arr = types.get_or_make_array(i8, 7);
 
         let id = IntrinsicId::from_name("take_while").unwrap();
-        let result = id.desc().result_type(&mut types, &[arr]);
+        let result = id.desc().result_type(&types, &[arr]);
 
         // `[i8; 7]` in → `List<i8>` bound 7: a list, NOT a fixed array.
         assert_eq!(types.array_of(result), None, "result is not a fixed array");
@@ -114,7 +114,7 @@ mod tests {
         let ptr = types.get_or_make_int(8); // a raw pointer, not a sequence
 
         let id = IntrinsicId::from_name("take_while").unwrap();
-        let result = id.desc().result_type(&mut types, &[ptr]);
+        let result = id.desc().result_type(&types, &[ptr]);
 
         assert_eq!(types.array_of(result), None, "result is not a fixed array");
         let (elem, bound) = types.list_of(result).expect("result is a list");
@@ -131,7 +131,7 @@ mod tests {
         let list = types.get_or_make_list(i8, 5);
 
         let id = IntrinsicId::from_name("take_while").unwrap();
-        let result = id.desc().result_type(&mut types, &[list]);
+        let result = id.desc().result_type(&types, &[list]);
 
         let (elem, bound) = types.list_of(result).expect("result is a list");
         assert_eq!((elem, bound), (i8, Some(5)));

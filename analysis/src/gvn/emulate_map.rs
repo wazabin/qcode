@@ -532,7 +532,7 @@ mod tests {
         // The enumerate tuple type for an `[i8; N]` source.
         let i8 = tc.ctx.types.get_or_make_int(1);
         let arr_ty = tc.ctx.types.get_or_make_array(i8, 3);
-        let enum_result_ty = enum_id.desc().result_type(&mut tc.ctx.types, &[arr_ty]);
+        let enum_result_ty = enum_id.desc().result_type(&tc.ctx.types, &[arr_ty]);
         let (tuple_ty, _) = tc.ctx.types.array_of(enum_result_ty).unwrap();
         let body = build_index_body(&mut tc, tuple_ty);
 
@@ -614,7 +614,7 @@ mod tests {
 
         let i8 = tc.ctx.types.get_or_make_int(1);
         let arr_ty = tc.ctx.types.get_or_make_array(i8, 3);
-        let enum_result_ty = enum_id.desc().result_type(&mut tc.ctx.types, &[arr_ty]);
+        let enum_result_ty = enum_id.desc().result_type(&tc.ctx.types, &[arr_ty]);
         let (tuple_ty, _) = tc.ctx.types.array_of(enum_result_ty).unwrap();
         let body = build_sum_body(&mut tc, tuple_ty);
 

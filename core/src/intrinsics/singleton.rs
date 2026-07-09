@@ -22,7 +22,7 @@ impl Intrinsic for Singleton {
         1
     }
 
-    fn result_type(&self, types: &mut TypeManager, args: &[TypeId]) -> TypeId {
+    fn result_type(&self, types: &TypeManager, args: &[TypeId]) -> TypeId {
         // `[T; 1]` where `T` is the operand's own type.
         types.get_or_make_array(args[0], 1)
     }
@@ -52,7 +52,7 @@ mod tests {
         let mut types = TypeManager::default();
         let i32 = types.get_or_make_int(4);
         let id = IntrinsicId::from_name("singleton").unwrap();
-        let ty = id.desc().result_type(&mut types, &[i32]);
+        let ty = id.desc().result_type(&types, &[i32]);
         assert_eq!(types.array_of(ty), Some((i32, 1)));
     }
 

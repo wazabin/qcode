@@ -98,7 +98,7 @@ pub trait Intrinsic: Sync {
     /// integer is just a type, so a width-only intrinsic returns
     /// `types.get_or_make_int(width)`; an array-producing one returns the array
     /// type.
-    fn result_type(&self, types: &mut TypeManager, args: &[TypeId]) -> TypeId;
+    fn result_type(&self, types: &TypeManager, args: &[TypeId]) -> TypeId;
 
     /// Evaluate on concrete operands `(bits, byte_width)`, producing an
     /// `out_size`-byte result. `None` means "not foldable / trap" — constant

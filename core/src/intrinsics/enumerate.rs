@@ -25,7 +25,7 @@ impl Intrinsic for Enumerate {
         1
     }
 
-    fn result_type(&self, types: &mut TypeManager, args: &[TypeId]) -> TypeId {
+    fn result_type(&self, types: &TypeManager, args: &[TypeId]) -> TypeId {
         // `[(index: i64, elem: T)]` from a sequence of `T`, preserving the kind:
         // an array of `T` enumerates to an array of tuples, a list to a list.
         let (elem, len, is_list) = types
@@ -72,7 +72,7 @@ mod tests {
         let list = types.get_or_make_list(i8, 4);
 
         let id = IntrinsicId::from_name("enumerate").unwrap();
-        let result = id.desc().result_type(&mut types, &[list]);
+        let result = id.desc().result_type(&types, &[list]);
 
         // A list (not a fixed array) of `(index, elem)` tuples, same bound.
         assert_eq!(types.array_of(result), None);
@@ -89,7 +89,7 @@ mod tests {
         let arr = types.get_or_make_array(i8, 4);
 
         let id = IntrinsicId::from_name("enumerate").unwrap();
-        let result = id.desc().result_type(&mut types, &[arr]);
+        let result = id.desc().result_type(&types, &[arr]);
 
         // `[(index: i64, elem: i8); 4]`.
         let (tuple, count) = types.array_of(result).expect("result is an array");

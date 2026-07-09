@@ -648,7 +648,7 @@ mod tests {
 
         // The enumerate tuple type `(index: i64, elem: i8)`, via enumerate's own
         // result-type rule, so the body's param matches the lane the map yields.
-        let enum_result_ty = enum_id.desc().result_type(&mut tc.ctx.types, &[arr_ty]);
+        let enum_result_ty = enum_id.desc().result_type(&tc.ctx.types, &[arr_ty]);
         let (tuple_ty, _) = tc.ctx.types.array_of(enum_result_ty).unwrap();
         let body = build_unpack_elem_body(&mut tc, tuple_ty);
 

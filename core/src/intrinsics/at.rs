@@ -50,7 +50,7 @@ impl Intrinsic for At {
         2
     }
 
-    fn result_type(&self, types: &mut TypeManager, args: &[TypeId]) -> TypeId {
+    fn result_type(&self, types: &TypeManager, args: &[TypeId]) -> TypeId {
         // The sequence's element type. Falls back to the operand type itself for a
         // non-sequence (defensive; the builder only emits `at` over sequences).
         types.seq_elem_of(args[0]).unwrap_or(args[0])
@@ -178,7 +178,7 @@ mod tests {
         let i32 = types.get_or_make_int(4);
         let arr = types.get_or_make_array(i32, 5);
         let i64 = types.get_or_make_int(8);
-        assert_eq!(at_id().desc().result_type(&mut types, &[arr, i64]), i32);
+        assert_eq!(at_id().desc().result_type(&types, &[arr, i64]), i32);
     }
 
     /// `at(insert(a, i, v), i) = v`.

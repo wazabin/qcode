@@ -551,7 +551,7 @@ mod tests {
         let i8 = tc.ctx.types.get_or_make_int(1);
         let arr_ty = tc.ctx.types.get_or_make_array(i8, 1);
         let enum_id = IntrinsicId::from_name("enumerate").unwrap();
-        let enum_ty = enum_id.desc().result_type(&mut tc.ctx.types, &[arr_ty]);
+        let enum_ty = enum_id.desc().result_type(&tc.ctx.types, &[arr_ty]);
         let (tuple_ty, _) = tc.ctx.types.array_of(enum_ty).unwrap();
 
         let body = outline_tupled(&mut tc.ctx, "body", result, idx, Some(elem), tuple_ty)

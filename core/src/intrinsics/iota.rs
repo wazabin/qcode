@@ -30,7 +30,7 @@ impl Intrinsic for Iota {
         1
     }
 
-    fn result_type(&self, types: &mut TypeManager, _args: &[TypeId]) -> TypeId {
+    fn result_type(&self, types: &TypeManager, _args: &[TypeId]) -> TypeId {
         // The element count is `n`'s *value*, invisible to the type layer, so the
         // pre-fold type is the length-erased `[i64;*]`. A constant `n` recovers a
         // fixed `[i64; n]` in `simplify` (below).
@@ -104,7 +104,7 @@ mod tests {
         let mut types = TypeManager::default();
         let i64_ty = types.get_or_make_int(8);
         let id = IntrinsicId::from_name("iota").unwrap();
-        let ty = id.desc().result_type(&mut types, &[i64_ty]);
+        let ty = id.desc().result_type(&types, &[i64_ty]);
         assert_eq!(types.list_of(ty), Some((i64_ty, None)));
     }
 

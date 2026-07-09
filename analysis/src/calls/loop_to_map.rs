@@ -210,7 +210,7 @@ fn apply(ctx: &mut Context, fid: FunctionId, m: &MapMatch) -> bool {
     // untouched.
     let body_fn = if uses_index {
         let arr_ty = ctx.type_of(m.init_arr);
-        let enum_ty = enum_id.desc().result_type(&mut ctx.types, &[arr_ty]);
+        let enum_ty = enum_id.desc().result_type(&ctx.types, &[arr_ty]);
         let Some((tuple_ty, _)) = ctx.types.array_of(enum_ty) else {
             return false;
         };
