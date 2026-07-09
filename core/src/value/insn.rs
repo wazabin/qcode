@@ -231,6 +231,48 @@ where
     }
 }
 
+// Own-instruction mutations written once against any [`HostMut`], so a
+// `FunctionPassV2` can retype and rename the instructions it owns whether the
+// function lives in the module registry or has been checked out. Mirror the
+// `&mut Context`-only [`InstructionMutRef::set_type`] / `Renameable` impls.
+impl<'str, Ctx> BaseRef<Ctx, InstructionId>
+where
+    Ctx: crate::value::util::host_mut::HostMut<'str>,
+{
+    /// Sets this instruction's result type (own-instruction edit, host-routed).
+    /// Panics on an incompatible same-nonzero-size change, exactly like
+    /// [`InstructionMutRef::set_type`].
+    pub fn set_result_type(&mut self, new_type: TypeId) {
+        let current = self.ctx.read_host().instruction(self.id).type_id;
+        let (current_size, new_size) = {
+            let types = &self.ctx.shared().types;
+            (types.size_of(current), types.size_of(new_type))
+        };
+        assert!(
+            current_size == 0 || current_size == new_size,
+            "cannot change instruction result type: size {current_size} → {new_size}",
+        );
+        self.ctx.instruction_mut(self.id).type_id = new_type;
+    }
+
+    /// Renames this instruction in its owning function's local name table
+    /// (own-instruction edit, host-routed). Mirrors the `Renameable` impl for
+    /// [`InstructionMutRef`]. Errors only on a duplicate name.
+    pub fn rename_local(&mut self, name: Cow<'str, str>) -> Result<()> {
+        let old_name = self
+            .ctx
+            .read_host()
+            .instruction(self.id)
+            .name
+            .as_deref()
+            .map(str::to_owned);
+        self.ctx
+            .register_local_name(self.id.into(), name.clone(), old_name.as_deref())?;
+        self.ctx.instruction_mut(self.id).name = Some(name);
+        Ok(())
+    }
+}
+
 pub type InstructionRef<'str, 'ctx> = BaseRef<HostRef<'ctx, 'str>, InstructionId>;
 
 impl<'str, 'ctx> InstructionRef<'str, 'ctx> {

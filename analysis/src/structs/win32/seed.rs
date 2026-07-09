@@ -149,7 +149,7 @@ mod tests {
 
     use super::*;
     use crate::structs::typing::StructTyping;
-    use crate::test_util::run_function_pass;
+    use crate::test_util::run_function_pass_v2;
 
     /// The `teb.h` layout parses to the expected offsets and pointer field.
     #[test]
@@ -198,7 +198,7 @@ mod tests {
         let ty = ctx.type_of(ValueId::Varnode(fs));
         assert!(ctx.types.pointee_of(ty).is_some());
 
-        run_function_pass::<StructTyping>(&mut ctx, f).unwrap();
+        run_function_pass_v2::<StructTyping>(&mut ctx, f).unwrap();
 
         // `&fs + 0x30` became the named field access `gep(fs.ProcessEnvironmentBlock)`.
         let gep = Function::from_id(&ctx, f)

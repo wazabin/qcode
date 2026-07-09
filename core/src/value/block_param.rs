@@ -253,6 +253,23 @@ where
         let type_id = self.ctx.shared().types.get_or_make_int(size);
         self.ctx.block_param_mut(self.id).type_id = type_id;
     }
+
+    /// Renames this parameter in its owning function's local name table
+    /// (own-param edit, host-routed). Mirrors the `Renameable` impl for
+    /// [`BlockParamMutRef`]. Errors only on a duplicate name.
+    pub fn rename_local(&mut self, name: Cow<'str, str>) -> Result<()> {
+        let old_name = self
+            .ctx
+            .read_host()
+            .block_param(self.id)
+            .name
+            .as_deref()
+            .map(str::to_owned);
+        self.ctx
+            .register_local_name(self.id.into(), name.clone(), old_name.as_deref())?;
+        self.ctx.block_param_mut(self.id).name = Some(name);
+        Ok(())
+    }
 }
 
 impl<'s, 'ctx: 's, 'str: 'ctx> WithCtx<'s, 's, 'str> for BlockParamMutRef<'str, 'ctx> {

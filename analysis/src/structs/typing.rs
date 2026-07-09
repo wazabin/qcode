@@ -20,100 +20,122 @@
 use std::borrow::Cow;
 
 use qcode::{
-    context::Context,
     space::{Space, SpaceId, SpaceType},
     types::TypeId,
     value::{
-        BlockParam, Function, FunctionId, Instruction, Renameable, ValueId,
+        BlockParamRef, FunctionId, FunctionRef, InstructionRef, ValueId,
         insn::{Binary, Binop, Gep, InstructionId, IntBinop, Mnemonic},
+        util::{
+            base_ref::{BaseRef, HostRef},
+            host_mut::HostMut,
+        },
     },
 };
 
-use crate::{FunctionPass, PipelineEnv};
+use crate::{FunctionBody, FunctionPassV2, ModuleView};
 
 #[derive(Default)]
 pub struct StructTyping;
 
-impl FunctionPass for StructTyping {
+impl FunctionPassV2 for StructTyping {
     const NAME: &'static str = "struct_typing";
 
     fn description(&self) -> &'static str {
         "Recover named struct-field accesses from segment/struct-pointer arithmetic"
     }
 
-    fn run(
+    fn run<'str>(
         &self,
-        ctx: &mut Context,
-        fun_id: FunctionId,
-        _env: &PipelineEnv,
+        m: &ModuleView<'_, 'str>,
+        f: &mut FunctionBody<'str>,
     ) -> Result<bool, String> {
-        // Nothing this pass does can fire unless some value or operand reachable in
-        // the function already carries a struct / struct-pointer type: add→gep,
-        // register-read, and load typing all key on a struct-pointer-typed operand,
-        // and renaming keys on a struct-typed value. On a function with no complex
-        // types (the common case) the whole fixpoint + rename sweep is a guaranteed
-        // no-op, so bail before allocating or scanning it twice. Per-function so it
-        // stays correct once non-Windows struct recovery lands.
-        if !function_has_struct_types(ctx, fun_id) {
-            return Ok(false);
-        }
+        let fid = f.id();
+        let mut host = f.host(m);
+        Ok(struct_typing(&mut host, fid))
+    }
+}
 
-        let insn_ids: Vec<InstructionId> = Function::from_id(ctx, fun_id)
-            .blocks()
-            .flat_map(|b| b.iter().map(|i| i.id).collect::<Vec<_>>())
-            .collect();
+/// Recover struct-field accesses in `fun_id`, mutating the function through
+/// `host` (see the module docs). Returns `true` if the IR changed.
+pub fn struct_typing<'str, H: HostMut<'str>>(host: &mut H, fun_id: FunctionId) -> bool {
+    // Nothing this pass does can fire unless some value or operand reachable in
+    // the function already carries a struct / struct-pointer type: add→gep,
+    // register-read, and load typing all key on a struct-pointer-typed operand,
+    // and renaming keys on a struct-typed value. On a function with no complex
+    // types (the common case) the whole fixpoint + rename sweep is a guaranteed
+    // no-op, so bail before allocating or scanning it twice. Per-function so it
+    // stays correct once non-Windows struct recovery lands.
+    if !function_has_struct_types(host.read_host(), fun_id) {
+        return false;
+    }
 
-        let mut changed_any = false;
-        loop {
-            let mut changed = false;
-            for &id in &insn_ids {
-                if type_instruction(ctx, id) {
-                    changed = true;
-                    changed_any = true;
-                }
+    let insn_ids: Vec<InstructionId> = FunctionRef::new(host.read_host(), fun_id)
+        .blocks()
+        .flat_map(|b| b.instruction_ids().to_vec())
+        .collect();
+
+    let mut changed_any = false;
+    loop {
+        let mut changed = false;
+        for &id in &insn_ids {
+            if type_instruction(host, id) {
+                changed = true;
+                changed_any = true;
             }
-            if !changed {
-                break;
-            }
         }
+        if !changed {
+            break;
+        }
+    }
 
-        // Once the types have settled, rename every struct-typed SSA value and
-        // argument after the struct it (points to): a value of type `PEB*`
-        // becomes `%peb`. This runs over the whole function so it also picks up
-        // arguments typed by an upstream seed.
-        changed_any |= rename_struct_values(ctx, fun_id);
+    // Once the types have settled, rename every struct-typed SSA value and
+    // argument after the struct it (points to): a value of type `PEB*`
+    // becomes `%peb`. This runs over the whole function so it also picks up
+    // arguments typed by an upstream seed.
+    changed_any |= rename_struct_values(host, fun_id);
 
-        Ok(changed_any)
+    changed_any
+}
+
+/// The stored [`TypeId`] of `id`, host-routed: a checked-out function's
+/// instruction/param types live in its owned arena, other kinds in shared data.
+fn stored_type_of<'str>(host: HostRef<'_, 'str>, id: ValueId) -> Option<TypeId> {
+    match id {
+        ValueId::Instruction(iid) => Some(InstructionRef::new(host, iid).type_id()),
+        ValueId::BlockParam(pid) => Some(BlockParamRef::new(host, pid).type_id()),
+        other => host.shared().stored_type_of(other),
     }
 }
 
 /// Renames struct-typed SSA values and block parameters after the struct they
 /// reference (e.g. a `PEB*` value becomes `%peb`), keeping names unique within
 /// the function. Returns `true` if any value was renamed.
-fn rename_struct_values(ctx: &mut Context, fun_id: FunctionId) -> bool {
-    let fun = Function::from_id(ctx, fun_id);
-    let values: Vec<ValueId> = fun
+fn rename_struct_values<'str, H: HostMut<'str>>(host: &mut H, fun_id: FunctionId) -> bool {
+    let values: Vec<ValueId> = FunctionRef::new(host.read_host(), fun_id)
         .blocks()
         .flat_map(|b| {
             b.params()
                 .map(|p| p.id())
-                .chain(b.iter().map(|i| ValueId::Instruction(i.id)))
+                .chain(b.instruction_ids().iter().map(|&i| ValueId::Instruction(i)))
                 .collect::<Vec<_>>()
         })
         .collect();
 
     let mut changed = false;
     for value in values {
-        let Some(base) = ctx
-            .stored_type_of(value)
-            .and_then(|t| struct_base_name(ctx, t))
+        let Some(base) = stored_type_of(host.read_host(), value)
+            .and_then(|t| struct_base_name(host.read_host(), t))
         else {
             continue;
         };
-        if let Some(name) = unique_name(ctx, value, &base) {
+        if let Some(name) = unique_name(host.read_host(), fun_id, value, &base) {
             let renamed = match value {
-                ValueId::Instruction(id) => Instruction::from_id_mut(ctx, id).rename(name).is_ok(),
-                ValueId::BlockParam(id) => BlockParam::from_id_mut(ctx, id).rename(name).is_ok(),
+                ValueId::Instruction(id) => BaseRef::new(host.reborrow_host(), id)
+                    .rename_local(name)
+                    .is_ok(),
+                ValueId::BlockParam(id) => BaseRef::new(host.reborrow_host(), id)
+                    .rename_local(name)
+                    .is_ok(),
                 _ => false,
             };
             changed |= renamed;
@@ -125,14 +147,21 @@ fn rename_struct_values(ctx: &mut Context, fun_id: FunctionId) -> bool {
 /// The lowercased struct name a value of type `ty` should be named after: the
 /// pointee's name when `ty` is a struct pointer, or the struct's own name when
 /// `ty` is a struct value. `None` for non-struct types.
-fn struct_base_name(ctx: &Context, ty: TypeId) -> Option<String> {
-    let struct_ty = ctx.types.pointee_of(ty).unwrap_or(ty);
-    ctx.types.struct_name_of(struct_ty).map(str::to_lowercase)
+fn struct_base_name(host: HostRef, ty: TypeId) -> Option<String> {
+    let types = &host.shared().types;
+    let struct_ty = types.pointee_of(ty).unwrap_or(ty);
+    types.struct_name_of(struct_ty).map(str::to_lowercase)
 }
 
 /// Picks a unique name for `value` from `base`, `base1`, `base2`, … Returns
 /// `None` if `value` is already named with such a candidate (nothing to do).
-fn unique_name<'str>(ctx: &Context, value: ValueId, base: &str) -> Option<Cow<'str, str>> {
+fn unique_name<'str>(
+    host: HostRef,
+    fun_id: FunctionId,
+    value: ValueId,
+    base: &str,
+) -> Option<Cow<'str, str>> {
+    let function = FunctionRef::new(host, fun_id);
     for n in 0.. {
         let candidate = if n == 0 {
             base.to_string()
@@ -140,8 +169,8 @@ fn unique_name<'str>(ctx: &Context, value: ValueId, base: &str) -> Option<Cow<'s
             format!("{base}{n}")
         };
         // `value` is an SSA def (its name is function-scoped), so check the
-        // candidate for freedom in its owning function's table, not globally.
-        match ctx.get_named_in_scope(value, &candidate) {
+        // candidate for freedom in this function's table, not globally.
+        match function.local_named(&candidate) {
             Some(owner) if owner == value => return None,
             Some(_) => continue,
             None => return Some(Cow::Owned(candidate)),
@@ -156,13 +185,14 @@ fn unique_name<'str>(ctx: &Context, value: ValueId, base: &str) -> Option<Cow<'s
 /// instruction results, block params, *and* operands, because the seed can live on
 /// an operand varnode (the Windows TEB seed retypes the `FS_OFFSET` register that a
 /// `load(register, reg)` reads) rather than on a value the function defines.
-fn function_has_struct_types(ctx: &Context, fun_id: FunctionId) -> bool {
+fn function_has_struct_types(host: HostRef, fun_id: FunctionId) -> bool {
     let is_struct_ish = |v: ValueId| {
-        ctx.stored_type_of(v).is_some_and(|t| {
-            ctx.types.pointee_of(t).is_some() || ctx.types.struct_name_of(t).is_some()
+        stored_type_of(host, v).is_some_and(|t| {
+            let types = &host.shared().types;
+            types.pointee_of(t).is_some() || types.struct_name_of(t).is_some()
         })
     };
-    Function::from_id(ctx, fun_id).blocks().any(|b| {
+    FunctionRef::new(host, fun_id).blocks().any(|b| {
         b.params().any(|p| is_struct_ish(p.id()))
             || b.iter().any(|i| {
                 is_struct_ish(ValueId::Instruction(i.id))
@@ -173,68 +203,85 @@ fn function_has_struct_types(ctx: &Context, fun_id: FunctionId) -> bool {
 
 /// Attempts one typing step on instruction `id`. Returns `true` if it changed
 /// the IR (rewrote an add to a gep, or retyped a load result).
-fn type_instruction(ctx: &mut Context, id: InstructionId) -> bool {
-    match ctx.values.instruction(id).mnemonic().clone() {
+fn type_instruction<'str, H: HostMut<'str>>(host: &mut H, id: InstructionId) -> bool {
+    match host.read_host().instruction(id).mnemonic().clone() {
         Mnemonic::Binop(Binary {
             op: Binop::Int(IntBinop::Add),
             lhs,
             rhs,
-        }) => try_add_to_gep(ctx, id, lhs, rhs),
+        }) => try_add_to_gep(host, id, lhs, rhs),
         // A register read (`load` from the register space) yields the register's
         // own value type — which the TEB seed overrode to `PtrTo<TEB>`. A normal
         // RAM load dereferences a field pointer.
-        Mnemonic::Load(load) if is_register_space(ctx, load.space) => {
-            try_type_register_read(ctx, id, load.ptr, load.size)
+        Mnemonic::Load(load) if is_register_space(host.read_host(), load.space) => {
+            try_type_register_read(host, id, load.ptr, load.size)
         }
-        Mnemonic::Load(load) => try_type_load(ctx, id, load.ptr, load.size),
+        Mnemonic::Load(load) => try_type_load(host, id, load.ptr, load.size),
         _ => false,
     }
 }
 
 /// Whether `space` is the processor register file.
-fn is_register_space(ctx: &Context, space: SpaceId) -> bool {
-    matches!(Space::from_id(ctx, space).ty, SpaceType::Register)
+fn is_register_space(host: HostRef, space: SpaceId) -> bool {
+    matches!(Space::from_id(host.shared(), space).ty, SpaceType::Register)
 }
 
 /// `load(register, reg)` is a register read: its result takes the register's own
 /// value type. Only acts when that type is a (struct) pointer — i.e. the TEB
 /// seed overrode `FS_OFFSET` to `PtrTo<TEB>`; plain integer registers are left
 /// untouched. Exact-size match only.
-fn try_type_register_read(ctx: &mut Context, id: InstructionId, reg: ValueId, size: usize) -> bool {
-    let Some(reg_ty) = ctx.stored_type_of(reg) else {
+fn try_type_register_read<'str, H: HostMut<'str>>(
+    host: &mut H,
+    id: InstructionId,
+    reg: ValueId,
+    size: usize,
+) -> bool {
+    let Some(reg_ty) = stored_type_of(host.read_host(), reg) else {
         return false;
     };
-    if ctx.types.pointee_of(reg_ty).is_none() || ctx.types.size_of(reg_ty) != size {
+    let (is_ptr, reg_size) = {
+        let types = &host.shared().types;
+        (types.pointee_of(reg_ty).is_some(), types.size_of(reg_ty))
+    };
+    if !is_ptr || reg_size != size {
         return false;
     }
-    if ctx.stored_type_of(ValueId::Instruction(id)) == Some(reg_ty) {
+    if stored_type_of(host.read_host(), ValueId::Instruction(id)) == Some(reg_ty) {
         return false;
     }
-    Instruction::from_id_mut(ctx, id).set_type(reg_ty);
+    BaseRef::new(host.reborrow_host(), id).set_result_type(reg_ty);
     true
 }
 
 /// `int_add(base, const)` with `base : PtrTo<S>` and `const` an exact field
 /// offset of `S` → `gep(base, off)` typed `PtrTo<field.type>`.
-fn try_add_to_gep(ctx: &mut Context, id: InstructionId, lhs: ValueId, rhs: ValueId) -> bool {
+fn try_add_to_gep<'str, H: HostMut<'str>>(
+    host: &mut H,
+    id: InstructionId,
+    lhs: ValueId,
+    rhs: ValueId,
+) -> bool {
     for (base, off_op) in [(lhs, rhs), (rhs, lhs)] {
-        let Some(pointee) = ctx
-            .stored_type_of(base)
-            .and_then(|t| ctx.types.pointee_of(t))
-        else {
+        let Some(base_ty) = stored_type_of(host.read_host(), base) else {
             continue;
         };
-        let Some(offset) = const_offset(ctx, off_op) else {
+        let Some(pointee) = host.shared().types.pointee_of(base_ty) else {
             continue;
         };
-        let Some((_, field)) = ctx.types.field_by_offset(pointee, offset) else {
+        let Some(offset) = const_offset(host.read_host(), off_op) else {
             continue;
         };
-        let field_ty = field.type_id;
-        let width = ctx.types.size_of(ctx.stored_type_of(base).unwrap());
-        let result_ty = ctx.types.get_or_make_struct_pointer(width, field_ty);
-        ctx.replace_instruction_mnemonic(id, Mnemonic::Gep(Gep { base, offset }));
-        Instruction::from_id_mut(ctx, id).set_type(result_ty);
+        let field_ty = match host.shared().types.field_by_offset(pointee, offset) {
+            Some((_, field)) => field.type_id,
+            None => continue,
+        };
+        let width = host.shared().types.size_of(base_ty);
+        let result_ty = host
+            .shared()
+            .types
+            .get_or_make_struct_pointer(width, field_ty);
+        host.replace_instruction_mnemonic(id, Mnemonic::Gep(Gep { base, offset }));
+        BaseRef::new(host.reborrow_host(), id).set_result_type(result_ty);
         return true;
     }
     false
@@ -242,37 +289,42 @@ fn try_add_to_gep(ctx: &mut Context, id: InstructionId, lhs: ValueId, rhs: Value
 
 /// `load(ptr)` with `ptr : PtrTo<F>` and `load.size == size_of(F)` → result
 /// retyped to `F`. Exact-size match only; otherwise left as an integer read.
-fn try_type_load(ctx: &mut Context, id: InstructionId, ptr: ValueId, size: usize) -> bool {
-    let Some(field_ty) = ctx
-        .stored_type_of(ptr)
-        .and_then(|t| ctx.types.pointee_of(t))
-    else {
+fn try_type_load<'str, H: HostMut<'str>>(
+    host: &mut H,
+    id: InstructionId,
+    ptr: ValueId,
+    size: usize,
+) -> bool {
+    let Some(ptr_ty) = stored_type_of(host.read_host(), ptr) else {
         return false;
     };
-    if ctx.types.size_of(field_ty) != size {
+    let Some(field_ty) = host.shared().types.pointee_of(ptr_ty) else {
+        return false;
+    };
+    if host.shared().types.size_of(field_ty) != size {
         return false;
     }
-    if ctx.stored_type_of(ValueId::Instruction(id)) == Some(field_ty) {
+    if stored_type_of(host.read_host(), ValueId::Instruction(id)) == Some(field_ty) {
         return false;
     }
-    Instruction::from_id_mut(ctx, id).set_type(field_ty);
+    BaseRef::new(host.reborrow_host(), id).set_result_type(field_ty);
     true
 }
 
 /// The concrete constant value of `op` as a byte offset, or `None` if `op` is
 /// not a plain (non-symbolic) integer literal.
-fn const_offset(ctx: &Context, op: ValueId) -> Option<usize> {
+fn const_offset(host: HostRef, op: ValueId) -> Option<usize> {
     let ValueId::Literal(lid) = op else {
         return None;
     };
-    let lit = &ctx.values.literals[lid];
+    let lit = &host.shared().values.literals[lid];
     if lit.symbolic.is_some() {
         return None;
     }
     Some(lit.value as usize)
 }
 
-crate::register_function_pass!(StructTyping);
+crate::register_function_pass_v2!(StructTyping);
 
 #[cfg(test)]
 mod tests {
@@ -280,7 +332,7 @@ mod tests {
     use qcode_macro::qcode;
 
     use super::*;
-    use crate::test_util::run_function_pass;
+    use crate::test_util::run_function_pass_v2;
     use qcode::context::Context;
 
     /// Collect the `gep` statements of a function in program order.
@@ -318,7 +370,7 @@ mod tests {
             "
         );
 
-        let changed = run_function_pass::<StructTyping>(&mut ctx, f).unwrap();
+        let changed = run_function_pass_v2::<StructTyping>(&mut ctx, f).unwrap();
         assert!(changed);
 
         // Both hops became named geps.
@@ -368,7 +420,7 @@ mod tests {
             "
         );
 
-        run_function_pass::<StructTyping>(&mut ctx, f).unwrap();
+        run_function_pass_v2::<StructTyping>(&mut ctx, f).unwrap();
 
         // The `Root*` value `%x` and the `Inner*` value `%y` are renamed after
         // the structs they reference. Value names are function-scoped, so resolve
@@ -399,7 +451,7 @@ mod tests {
             "
         );
 
-        run_function_pass::<StructTyping>(&mut ctx, f).unwrap();
+        run_function_pass_v2::<StructTyping>(&mut ctx, f).unwrap();
 
         // No field at 0x99 and a non-constant offset: neither is lowered to gep.
         assert!(gep_strings(&ctx, f).is_empty());
