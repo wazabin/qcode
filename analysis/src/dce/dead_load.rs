@@ -1023,7 +1023,7 @@ pub fn remove_dead_load_insns(
             dead.extend(unread_frame_local_stores(ctx, function_id, aliases));
             dead.extend(postdominated_dead_ram_stores(ctx, function_id, aliases));
             let liveness =
-                crate::mem::compute_memory_liveness(ctx, function_id, aliases, dead_regs);
+                crate::mem::compute_memory_liveness(&*ctx, function_id, aliases, dead_regs);
             for &block_id in &block_ids {
                 dead.extend(dead_load_insns_seeded(
                     ctx,

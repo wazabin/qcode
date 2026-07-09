@@ -21,9 +21,8 @@
 
 use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
 
-use qcode::{
-    context::Context,
-    value::{BasicBlock, BlockId, Function, FunctionId, ValueId},
+use qcode::value::{
+    BlockId, FunctionId, FunctionRef, ValueId, block::BlockRef, util::base_ref::HostRef,
 };
 
 use crate::AliasResult;
@@ -47,8 +46,8 @@ impl MemLiveness {
     }
 }
 
-fn successors(ctx: &Context, block: BlockId) -> Vec<BlockId> {
-    BasicBlock::from_id(ctx, block)
+fn successors(host: HostRef, block: BlockId) -> Vec<BlockId> {
+    BlockRef::new(host, block)
         .successors()
         .map(|(_, succ)| succ)
         .collect()
@@ -87,9 +86,9 @@ fn intersect_killed(succs: &[BlockId], killed_in: &HashMap<BlockId, KilledSet>) 
 
 /// Restrict liveness facts to register/temp spaces; RAM/global stores are never
 /// propagated across blocks (they may be observed outside the function).
-fn retain_tracked(ctx: &Context, live: &mut LiveSet, killed: &mut KilledSet) {
-    live.retain(|l| is_tracked_space(ctx, l.space));
-    killed.retain(|k| is_tracked_space(ctx, k.space));
+fn retain_tracked(host: HostRef, live: &mut LiveSet, killed: &mut KilledSet) {
+    live.retain(|l| is_tracked_space(host.shared(), l.space));
+    killed.retain(|k| is_tracked_space(host.shared(), k.space));
 }
 
 fn live_changed(old: &LiveSet, new: &LiveSet) -> bool {
@@ -105,13 +104,14 @@ fn killed_changed(old: &KilledSet, new: &KilledSet) -> bool {
 }
 
 /// Run the backward memory-liveness dataflow over `function_id`.
-pub fn compute_memory_liveness(
-    ctx: &Context,
+pub fn compute_memory_liveness<'a, 'str: 'a>(
+    host: impl Into<HostRef<'a, 'str>>,
     function_id: FunctionId,
     aliases: &AliasResult,
     dead_regs: &[ValueId],
 ) -> MemLiveness {
-    let blocks: Vec<BlockId> = Function::from_id(ctx, function_id)
+    let host = host.into();
+    let blocks: Vec<BlockId> = FunctionRef::new(host, function_id)
         .iter()
         .map(|block| block.id)
         .collect();
@@ -125,7 +125,7 @@ pub fn compute_memory_liveness(
     let mut preds: HashMap<BlockId, Vec<BlockId>> =
         blocks.iter().map(|&b| (b, Vec::new())).collect();
     for &block in &blocks {
-        for succ in successors(ctx, block) {
+        for succ in successors(host, block) {
             if let Some(entry) = preds.get_mut(&succ) {
                 entry.push(block);
             }
@@ -140,13 +140,19 @@ pub fn compute_memory_liveness(
     let mut queued: HashSet<BlockId> = blocks.iter().copied().collect();
     while let Some(block) = worklist.pop() {
         queued.remove(&block);
-        let succs = successors(ctx, block);
+        let succs = successors(host, block);
         let live_out = union_live(&succs, &live_in);
         let killed_out = intersect_killed(&succs, &killed_in);
 
-        let (mut new_live_in, mut new_killed_in) =
-            block_transfer(ctx, block, aliases, dead_regs, &live_out, &killed_out);
-        retain_tracked(ctx, &mut new_live_in, &mut new_killed_in);
+        let (mut new_live_in, mut new_killed_in) = block_transfer(
+            host.shared(),
+            block,
+            aliases,
+            dead_regs,
+            &live_out,
+            &killed_out,
+        );
+        retain_tracked(host, &mut new_live_in, &mut new_killed_in);
 
         let mut block_changed = false;
         if live_changed(&live_in[&block], &new_live_in) {
@@ -169,7 +175,7 @@ pub fn compute_memory_liveness(
     let mut live_out = HashMap::default();
     let mut killed_out = HashMap::default();
     for &block in &blocks {
-        let succs = successors(ctx, block);
+        let succs = successors(host, block);
         live_out.insert(block, union_live(&succs, &live_in));
         killed_out.insert(block, intersect_killed(&succs, &killed_in));
     }
@@ -185,7 +191,13 @@ mod tests {
     use super::*;
     use crate::AliasResult;
     use crate::dce::dead_load::dead_load_insns_seeded;
-    use qcode::value::insn::{InstructionId, Mnemonic};
+    use qcode::{
+        context::Context,
+        value::{
+            BasicBlock,
+            insn::{InstructionId, Mnemonic},
+        },
+    };
     use qcode_macro::qcode;
     use rustc_hash::FxHashSet as HashSet;
 
