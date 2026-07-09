@@ -507,18 +507,25 @@ impl<'str> Context<'str> {
     }
 
     /// Check a function *out* of the module: move its [`Function`] out of the
-    /// registry, leaving an empty [`Function::sentinel`] in its slot, and return
-    /// the owned function. The caller then owns it exclusively and can mutate it in
-    /// isolation from the rest of the module — the primitive a pass driver uses to
-    /// hand a function to a worker (see `PARALLEL_PASSES.md`). The id and every
-    /// other function's stable address are untouched (segmented registry storage).
+    /// registry, leaving an [`interface shell`](Function::interface_shell) in its
+    /// slot, and return the owned function. The caller then owns it exclusively and
+    /// can mutate it in isolation from the rest of the module — the primitive a
+    /// pass driver uses to hand a function to a worker (see `PARALLEL_PASSES.md`).
+    /// The id and every other function's stable address are untouched (segmented
+    /// registry storage).
     ///
-    /// While a function is checked out, reading it back through this context
-    /// observes the sentinel, so a checked-out function must always be reinstalled
-    /// with [`checkin_function`](Self::checkin_function) before anything else looks
-    /// at that slot.
+    /// The slot holds an *interface shell* (not a blank sentinel) so that under
+    /// the parallel driver a worker reading a co-checked-out callee's published
+    /// interface (name, address, signature, purity, clobber/write summaries)
+    /// through the shared `&Context` sees the callee's real interface. The shell's
+    /// *body* is empty — a checked-out function's body is never a legitimate read.
+    /// Sequentially this is invisible: interface reads of a checked-out function
+    /// never occurred. The function must still be reinstalled with
+    /// [`checkin_function`](Self::checkin_function) before anything relies on its
+    /// body again.
     pub fn checkout_function(&mut self, id: FunctionId) -> Function<'str> {
-        self.values.functions.replace(id, Function::sentinel())
+        let shell = self.values.functions[id].interface_shell();
+        self.values.functions.replace(id, shell)
     }
 
     /// Reinstall a function previously taken with
@@ -1400,12 +1407,13 @@ mod tests {
         let alpha = make_fn_with_blocks(&mut ctx, "alpha", 2);
         let beta = make_fn_with_blocks(&mut ctx, "beta", 1);
 
-        // Check `alpha` out: the slot now holds an empty sentinel, and we own the
-        // real function with all its blocks.
+        // Check `alpha` out: the slot now holds an interface shell (its name and
+        // published interface preserved, its body empty), and we own the real
+        // function with all its blocks.
         let fun = ctx.checkout_function(alpha);
         assert_eq!(fun.name, "alpha");
         assert_eq!(fun.roster.len(), 2);
-        assert_eq!(FunctionRef::from_id(&ctx, alpha).name(), "");
+        assert_eq!(FunctionRef::from_id(&ctx, alpha).name(), "alpha");
         assert_eq!(FunctionRef::from_id(&ctx, alpha).blocks().count(), 0);
         // A sibling is entirely undisturbed while `alpha` is out.
         assert_eq!(FunctionRef::from_id(&ctx, beta).name(), "beta");

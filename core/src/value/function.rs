@@ -150,6 +150,40 @@ impl<'str> Function<'str> {
         Self::new(Cow::Borrowed(""))
     }
 
+    /// A checkout placeholder that preserves this function's *published
+    /// interface* — everything a *caller* reads about it — while carrying an
+    /// empty body. Unlike [`sentinel`](Self::sentinel), which is a blank slot,
+    /// this shell answers interface queries (`name`, `address`, `is_external`,
+    /// `signature` and everything under it: purity, `clobbered_regs`,
+    /// `written_spaces`, `param_attr`, `input_regs`, `is_externally_resolved`,
+    /// and `kind`) exactly as the real function would.
+    ///
+    /// Under the parallel driver a worker reading a co-checked-out callee's
+    /// interface through the shared `&Context` must see the callee's real
+    /// interface, not a blank sentinel. The body arenas stay empty because a
+    /// checked-out function's *body* is never a legitimate read (V2 passes never
+    /// read another function's body except the stage-invariant pure-bodies view).
+    /// Sequentially this changes nothing: interface reads of a checked-out
+    /// function never occurred.
+    pub fn interface_shell(&self) -> Self {
+        Self {
+            name: self.name.clone(),
+            address: self.address,
+            root: None,
+            insns: Registry::default(),
+            blocks: Registry::default(),
+            roster: Vec::new(),
+            params: Registry::default(),
+            edges: Registry::default(),
+            instruction_addrs: BTreeSet::new(),
+            is_external: self.is_external,
+            signature: self.signature.clone(),
+            kind: self.kind,
+            names: crate::context::NameTable::default(),
+            users: FxHashMap::default(),
+        }
+    }
+
     /// This function's instructions that use `value` as an operand (see
     /// [`users`](Self::users)). Empty for a value this function never uses.
     pub fn users_of(&self, value: ValueId) -> &[InstructionId] {
