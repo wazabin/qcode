@@ -1179,30 +1179,12 @@ impl<'str> Graph for Context<'str> {
     where
         Self: 'a;
 
-    type NodeMut<'a>
-        = BlockMutRef<'str, 'a>
-    where
-        Self: 'a;
-
-    type EdgeMut<'a>
-        = EdgeMutRef<'str, 'a>
-    where
-        Self: 'a;
-
     fn get_node(&self, id: Self::NodeId) -> Option<Self::Node<'_>> {
         Some(BasicBlock::from_id(self, id))
     }
 
-    fn get_node_mut(&mut self, id: Self::NodeId) -> Option<Self::NodeMut<'_>> {
-        Some(BasicBlock::from_id_mut(self, id))
-    }
-
     fn get_edge(&self, id: Self::EdgeId) -> Option<Self::Edge<'_>> {
         Some(EdgeRef::new(self, id))
-    }
-
-    fn get_edge_mut(&mut self, id: Self::EdgeId) -> Option<Self::EdgeMut<'_>> {
-        Some(EdgeMutRef::new(self, id))
     }
 
     fn nodes(&self) -> impl Iterator<Item = Self::Node<'_>> + '_ {
@@ -1214,6 +1196,26 @@ impl<'str> Graph for Context<'str> {
     fn edges(&self) -> impl Iterator<Item = Self::Edge<'_>> + '_ {
         let ids: Vec<EdgeId> = self.functions().flat_map(|f| f.edge_ids()).collect();
         ids.into_iter().map(move |id| EdgeRef::new(self, id))
+    }
+}
+
+impl<'str> jstd::graph::GraphMut for Context<'str> {
+    type NodeMut<'a>
+        = BlockMutRef<'str, 'a>
+    where
+        Self: 'a;
+
+    type EdgeMut<'a>
+        = EdgeMutRef<'str, 'a>
+    where
+        Self: 'a;
+
+    fn get_node_mut(&mut self, id: Self::NodeId) -> Option<Self::NodeMut<'_>> {
+        Some(BasicBlock::from_id_mut(self, id))
+    }
+
+    fn get_edge_mut(&mut self, id: Self::EdgeId) -> Option<Self::EdgeMut<'_>> {
+        Some(EdgeMutRef::new(self, id))
     }
 }
 
