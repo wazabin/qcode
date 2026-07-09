@@ -27,7 +27,7 @@
 //! [`DynFunctionPass`] shim, which every `FunctionPass` gets for free via a blanket
 //! impl.
 
-use std::cell::{Ref, RefCell};
+use std::sync::OnceLock;
 
 use qcode::{
     context::Context,
@@ -47,11 +47,12 @@ pub struct PipelineEnv {
     /// The stack-pointer *varnode* (`cfg.stack_pointer` resolved through
     /// `ctx.registers`), cached so passes don't re-resolve it each call.
     pub sp_varnode: VarnodeId,
-    /// Function-independent register/varnode alias base, built lazily and shared
-    /// across the per-function GVN runs (see [`PipelineEnv::alias_base`]). Behind a
-    /// `RefCell` because passes hold `&PipelineEnv`; sound because the function-pass
-    /// runner is single-threaded.
-    alias_base: RefCell<Option<RegisterBase>>,
+    /// Function-independent register/varnode alias base, built once on first use and
+    /// shared by reference across the per-function GVN/LICM/DCE/mem2reg runs (see
+    /// [`PipelineEnv::alias_base`]). A `OnceLock` (not `RefCell`) so `&PipelineEnv`
+    /// is `Sync` and can be shared across worker threads (Stage 6); the base is
+    /// immutable once built and never rebuilt.
+    alias_base: OnceLock<RegisterBase>,
 }
 
 impl PipelineEnv {
@@ -89,27 +90,33 @@ impl PipelineEnv {
         Self {
             cfg,
             sp_varnode,
-            alias_base: RefCell::new(None),
+            alias_base: OnceLock::new(),
         }
     }
 
     /// The shared register/varnode alias base ("Part A" of the simple alias
-    /// analysis) for `ctx`. Built on first use and reused while the varnode set is
-    /// unchanged; rebuilt only when a varnode is added mid-run (the registry is
-    /// append-only, so a changed `varnode_count` is the validity key). The
-    /// per-function GVN pass finishes it with [`RegisterBase::for_function`], so the
-    /// O(varnodes·log) base build no longer runs on every function.
-    pub fn alias_base(&self, ctx: &Context) -> Ref<'_, RegisterBase> {
-        let valid = matches!(
-            &*self.alias_base.borrow(),
-            Some(base) if base.varnode_count() == ctx.varnode_count()
+    /// analysis) for `ctx`. Built once on first use and returned by reference
+    /// thereafter; the per-function GVN/LICM/DCE/mem2reg passes finish it with
+    /// [`RegisterBase::for_function`], so the O(varnodes·log) base build runs once
+    /// per pipeline run instead of once per function.
+    ///
+    /// The base is never rebuilt. The register/global varnode set is established at
+    /// lift time and does not grow during the optimization passes that consult the
+    /// oracle, so the base built on first use stays valid for the whole run. (The
+    /// old code rebuilt it whenever `ctx.varnode_count()` changed; instrumentation
+    /// showed that rebuild never fired across the entire test suite.) Any varnodes a
+    /// pass mints mid-run live in fresh temporary spaces that are disjoint from the
+    /// register file and are resolved per-function in "Part B", not by this shared
+    /// base — so a stale count would still be sound, but the `debug_assert` below
+    /// catches an unexpected mid-run mint loudly rather than silently.
+    pub fn alias_base(&self, ctx: &Context) -> &RegisterBase {
+        let base = self.alias_base.get_or_init(|| RegisterBase::build(ctx));
+        debug_assert_eq!(
+            base.varnode_count(),
+            ctx.varnode_count(),
+            "register alias base built from a stale varnode set; a pass minted varnodes mid-run"
         );
-        if !valid {
-            *self.alias_base.borrow_mut() = Some(RegisterBase::build(ctx));
-        }
-        Ref::map(self.alias_base.borrow(), |o| {
-            o.as_ref().expect("alias_base just built")
-        })
+        base
     }
 }
 
@@ -544,6 +551,12 @@ pub fn known_pass_names() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn pipeline_env_is_sync() {
+        fn assert_sync<T: Sync>() {}
+        assert_sync::<PipelineEnv>();
+    }
 
     #[test]
     fn registered_names_are_unique() {
