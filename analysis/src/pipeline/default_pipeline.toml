@@ -282,11 +282,12 @@ passes = ["gvn", "dead_store", "dce"]
 #   * `mark_pure` asserts `is_pure` on functions whose returns are now a
 #     deterministic function of their params (a pure call to an already-pure
 #     callee is permitted, so a caller settles once its callees are flagged);
-#   * `module(gvn)` emulates those pure callees at constant-argument call sites,
-#     replacing the projecting `extract` with the computed literal — which can
-#     turn a previously call-derived address (e.g. a deobfuscated `FS:<canary>`
-#     offset) into a constant, and forwards argpromote's shadow seeds into the
-#     loads that read them back;
+#   * `module(gvn)` folds/canonicalizes and `concretize` emulates those pure
+#     callees at constant-argument call sites, replacing the projecting `extract`
+#     with the computed literal — which can turn a previously call-derived address
+#     (e.g. a deobfuscated `FS:<canary>` offset) into a constant, and forwards
+#     argpromote's shadow seeds into the loads that read them back (`concretize`
+#     is the module home of gvn's three pure-callee body-reading sub-passes);
 #   * `module(dce)` / `module(dead_store)` sweep the folded extracts, now-dead
 #     calls, and unread shadow stores;
 #   * `argpromote` then re-runs: with the address now constant, the load it had to
@@ -297,7 +298,7 @@ passes = ["gvn", "dead_store", "dce"]
 [[stage]]
 name = "mark-pure"
 scope = "module"
-passes = ["mark_pure", "module(gvn)", "module(dce)", "module(dead_store)", "assume_arg_frame", "argpromote"]
+passes = ["mark_pure", "module(gvn)", "concretize", "module(dce)", "module(dead_store)", "assume_arg_frame", "argpromote"]
 repeat_until = "no_change"
 
 # Promote bounded memory regions in pure functions to first-class array values so
@@ -321,12 +322,14 @@ passes = ["array_promote", "array_reads", "gvn", "dce", "dead_store"]
 # mutually exclusive on any one function (seed insert present → scan; seedless carry
 # insert → map; sole `at` NUL scan / no snapshot → strlen), so order does not affect
 # correctness. Runs after `mark-pure`/`array-promote` because they only consider
-# `is_pure` callees. The `Extract`/`Range`-of-`map` rewrite in the `gvn` below then
-# projects an element back to a `body(k, in[k])` call at the caller.
+# `is_pure` callees. The `Extract`/`Range`-of-`map` projection back to a
+# `body(k, in[k])` element at the caller is done by `concretize` (appended here,
+# the module home of gvn's body-reading sub-passes); `final-canonicalize`'s `gvn`
+# then folds the inlined bodies.
 [[stage]]
 name = "loop-fold"
 scope = "module"
-passes = ["module(loop_to_scan)", "loop_to_map", "strlen"]
+passes = ["module(loop_to_scan)", "loop_to_map", "strlen", "concretize"]
 
 # Infer per-parameter `readonly` / `nocapture` pointer attributes bottom-up over
 # the now-functionalized (`pure_reg`) functions, whose positional arguments align

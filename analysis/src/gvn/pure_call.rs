@@ -21,7 +21,6 @@ use qcode::{
     value::{
         Function, ValueId,
         insn::{Call, Extract, Mnemonic, Tuple},
-        util::host_mut::HostMut,
     },
 };
 
@@ -39,14 +38,12 @@ use super::walk::{Claim, Editor, InsnCtx, SubPass};
 /// slipping that invariant past the verifier.
 const STEP_BUDGET: usize = 100_000;
 
-/// Folding a pure call emulates the *callee*'s IR (read through the module), so
-/// this is dispatched only by the module `gvn` pass and runs on the module host.
-const MODULE_ONLY: &str = "PureCall is dispatched only by the module gvn pass";
-
 /// Replace `extract` of a constant pure-call field with the emulated literal.
+/// Reads the pure *callee*'s body directly, so it runs only on the module host
+/// (dispatched by the [`concretize`](super::concretize) module pass).
 pub(super) struct PureCall;
 
-impl<'str, H: HostMut<'str>> SubPass<'str, H> for PureCall {
+impl<'a, 'str> SubPass<'str, &'a mut Context<'str>> for PureCall {
     fn init_state(&self) -> Box<dyn Any> {
         Box::new(())
     }
@@ -55,8 +52,14 @@ impl<'str, H: HostMut<'str>> SubPass<'str, H> for PureCall {
         Box::new(())
     }
 
-    fn on_insn(&self, host: &mut H, _state: &mut dyn Any, ic: &InsnCtx, ed: &mut Editor) -> Claim {
-        let mut ctx = host.as_module_mut().expect(MODULE_ONLY);
+    fn on_insn(
+        &self,
+        host: &mut &'a mut Context<'str>,
+        _state: &mut dyn Any,
+        ic: &InsnCtx,
+        ed: &mut Editor,
+    ) -> Claim {
+        let mut ctx: &mut Context = host;
         let Mnemonic::Extract(Extract { agg, index }) = *ic.mnemonic else {
             return Claim::Pass;
         };
@@ -309,8 +312,7 @@ mod tests {
         let (g, cont) = build_caller(&mut tc, foo, Some(7));
         let r1 = ValueId::Varnode(tc.r1);
 
-        let aliases = crate::AliasResult::simple(&tc.ctx);
-        super::super::gvn_function(&mut tc.ctx, g, Some(&aliases));
+        super::super::concretize::concretize_function(&mut tc.ctx, g);
 
         assert_eq!(
             stored_const(&tc, cont, r1),
@@ -453,8 +455,7 @@ mod tests {
         let (g, cont) = build_decoder_caller(&mut tc, dec);
         let r1 = ValueId::Varnode(tc.r1);
 
-        let aliases = crate::AliasResult::simple(&tc.ctx);
-        super::super::gvn_function(&mut tc.ctx, g, Some(&aliases));
+        super::super::concretize::concretize_function(&mut tc.ctx, g);
 
         assert_eq!(
             stored_const(&tc, cont, r1),
@@ -476,8 +477,7 @@ mod tests {
         let foo = build_pure_foo(&mut tc);
         let (g, cont) = build_caller(&mut tc, foo, None);
 
-        let aliases = crate::AliasResult::simple(&tc.ctx);
-        super::super::gvn_function(&mut tc.ctx, g, Some(&aliases));
+        super::super::concretize::concretize_function(&mut tc.ctx, g);
 
         assert_eq!(
             extract_count(&tc, cont),

@@ -19,6 +19,7 @@ use qcode::{
 
 pub(crate) mod affine;
 mod array_project;
+pub(crate) mod concretize;
 pub(crate) mod congruence;
 mod cse;
 mod emulate_map;
@@ -32,32 +33,30 @@ mod narrow;
 mod pure_call;
 mod walk;
 
-use array_project::ArrayProject;
 use cse::Cse;
-use emulate_map::EmulateMap;
 use flag_idiom::FlagIdiom;
 use fold::Fold;
 use identity::Identities;
 use intrinsics::Recognize;
 use memory::MemoryForwarding;
 use narrow::NarrowTrunc;
-use pure_call::PureCall;
 use walk::{run_dominator_walk, run_flat_fixpoint, run_single_block};
 
 /// The full GVN sub-pass chain. Order is load-bearing: memory forwarding must
 /// see loads/stores first, folding must run before idiom recognition (so shift
-/// amounts and multipliers are constants), pure-call folding before intrinsic
-/// recognition, intrinsic recognition before the algebraic identities that
-/// simplify the intrinsics it produces, and CSE last over already-simplified
-/// mnemonics.
+/// amounts and multipliers are constants), intrinsic recognition before the
+/// algebraic identities that simplify the intrinsics it produces, and CSE last
+/// over already-simplified mnemonics.
+///
+/// The three body-reading sub-passes (`PureCall`, `EmulateMap`, `ArrayProject`)
+/// that used to sit between `NarrowTrunc` and `Recognize` are **not** here: they
+/// read pure *callee* bodies, an interprocedural read the parallel-safe function
+/// pass contract forbids, so they live in the [`concretize`] module pass.
 fn gvn_passes<'str, H: HostMut<'str>>() -> Vec<Box<dyn walk::SubPass<'str, H>>> {
     vec![
         Box::new(MemoryForwarding),
         Box::new(Fold),
         Box::new(NarrowTrunc),
-        Box::new(EmulateMap),
-        Box::new(ArrayProject),
-        Box::new(PureCall),
         Box::new(Recognize),
         Box::new(FlagIdiom),
         Box::new(Identities),

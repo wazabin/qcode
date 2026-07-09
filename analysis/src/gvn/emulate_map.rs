@@ -21,7 +21,6 @@ use qcode::{
     value::{
         ValueId,
         insn::{Map, Mnemonic, Scan},
-        util::host_mut::HostMut,
     },
 };
 
@@ -38,15 +37,12 @@ use super::walk::{Claim, Editor, InsnCtx, SubPass};
 /// expressions, so this only guards against a degenerate body.
 const STEP_BUDGET: usize = 100_000;
 
-/// Emulating a map reads the pure *body callee*'s IR through the module, so it is
-/// dispatched only by the module `gvn` pass and runs on the module host.
-const MODULE_ONLY: &str = "EmulateMap is dispatched only by the module gvn pass";
-
 /// Replace `body <$> b"…"` / `body <$> enumerate(b"…")` with the emulated
-/// constant `Bytes` array.
+/// constant `Bytes` array. Reads the pure *body callee*'s IR, so it runs only on
+/// the module host (dispatched by the [`concretize`](super::concretize) pass).
 pub(super) struct EmulateMap;
 
-impl<'str, H: HostMut<'str>> SubPass<'str, H> for EmulateMap {
+impl<'a, 'str> SubPass<'str, &'a mut Context<'str>> for EmulateMap {
     fn init_state(&self) -> Box<dyn Any> {
         Box::new(())
     }
@@ -55,8 +51,14 @@ impl<'str, H: HostMut<'str>> SubPass<'str, H> for EmulateMap {
         Box::new(())
     }
 
-    fn on_insn(&self, host: &mut H, _state: &mut dyn Any, ic: &InsnCtx, ed: &mut Editor) -> Claim {
-        let mut ctx = host.as_module_mut().expect(MODULE_ONLY);
+    fn on_insn(
+        &self,
+        host: &mut &'a mut Context<'str>,
+        _state: &mut dyn Any,
+        ic: &InsnCtx,
+        ed: &mut Editor,
+    ) -> Claim {
+        let mut ctx: &mut Context = host;
         let folded = match ic.mnemonic.clone() {
             Mnemonic::Map(map) => self.emulate(ctx, ic, &map),
             Mnemonic::Scan(scan) => self.emulate_scan(ctx, ic, &scan),
@@ -474,8 +476,7 @@ mod tests {
         };
         return_value(&mut tc, entry, map_val);
 
-        let aliases = crate::AliasResult::simple(&tc.ctx);
-        while super::super::gvn_function(&mut tc.ctx, host, Some(&aliases)) {}
+        super::super::concretize::concretize_function(&mut tc.ctx, host);
 
         assert_eq!(
             map_bytes(&tc, host),
@@ -512,8 +513,7 @@ mod tests {
         };
         return_value(&mut tc, entry, map_val);
 
-        let aliases = crate::AliasResult::simple(&tc.ctx);
-        while super::super::gvn_function(&mut tc.ctx, host, Some(&aliases)) {}
+        super::super::concretize::concretize_function(&mut tc.ctx, host);
 
         assert_eq!(
             map_bytes(&tc, host),
@@ -554,8 +554,7 @@ mod tests {
         };
         return_value(&mut tc, entry, map_val);
 
-        let aliases = crate::AliasResult::simple(&tc.ctx);
-        while super::super::gvn_function(&mut tc.ctx, host, Some(&aliases)) {}
+        super::super::concretize::concretize_function(&mut tc.ctx, host);
 
         assert_eq!(
             map_bytes(&tc, host),
@@ -638,8 +637,7 @@ mod tests {
         };
         return_value(&mut tc, entry, scan_val);
 
-        let aliases = crate::AliasResult::simple(&tc.ctx);
-        while super::super::gvn_function(&mut tc.ctx, host, Some(&aliases)) {}
+        super::super::concretize::concretize_function(&mut tc.ctx, host);
 
         assert_eq!(
             map_bytes(&tc, host),

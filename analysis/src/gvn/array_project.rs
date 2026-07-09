@@ -26,7 +26,6 @@ use qcode::{
     value::{
         BasicBlock, InstructionRef, ValueId,
         insn::{Extract, Mnemonic, Range, Tuple},
-        util::host_mut::HostMut,
     },
 };
 
@@ -36,14 +35,12 @@ use std::any::Any;
 
 use super::walk::{Claim, Editor, InsnCtx, SubPass};
 
+/// Projecting a lane out of a `map` inlines the pure *body callee*'s IR, so this
+/// runs only on the module host (dispatched by the
+/// [`concretize`](super::concretize) module pass).
 pub(super) struct ArrayProject;
 
-/// Projecting a lane out of a `map` inlines the pure *body callee*'s IR (read
-/// through the module), so this is dispatched only by the module `gvn` pass and
-/// runs on the module host.
-const MODULE_ONLY: &str = "ArrayProject is dispatched only by the module gvn pass";
-
-impl<'str, H: HostMut<'str>> SubPass<'str, H> for ArrayProject {
+impl<'a, 'str> SubPass<'str, &'a mut Context<'str>> for ArrayProject {
     fn init_state(&self) -> Box<dyn Any> {
         Box::new(())
     }
@@ -52,8 +49,14 @@ impl<'str, H: HostMut<'str>> SubPass<'str, H> for ArrayProject {
         Box::new(())
     }
 
-    fn on_insn(&self, host: &mut H, _state: &mut dyn Any, ic: &InsnCtx, ed: &mut Editor) -> Claim {
-        let ctx = host.as_module_mut().expect(MODULE_ONLY);
+    fn on_insn(
+        &self,
+        host: &mut &'a mut Context<'str>,
+        _state: &mut dyn Any,
+        ic: &InsnCtx,
+        ed: &mut Editor,
+    ) -> Claim {
+        let ctx: &mut Context = host;
         match *ic.mnemonic {
             Mnemonic::Range(Range { src, start, size }) => {
                 self.project_range(ctx, ic, ed, src, start, size)
@@ -391,8 +394,7 @@ mod tests {
             b.push_return(ptr);
         }
 
-        let aliases = crate::AliasResult::simple(&tc.ctx);
-        super::super::gvn_function(&mut tc.ctx, host, Some(&aliases));
+        super::super::concretize::concretize_function(&mut tc.ctx, host);
 
         // No Range-of-Map remains; the body was inlined (an int_add appears), and
         // the surviving Range now slices the array source directly (`src[2]`).
@@ -494,8 +496,7 @@ mod tests {
             b.push_return(ptr);
         }
 
-        let aliases = crate::AliasResult::simple(&tc.ctx);
-        super::super::gvn_function(&mut tc.ctx, host, Some(&aliases));
+        super::super::concretize::concretize_function(&mut tc.ctx, host);
 
         let insns: Vec<Mnemonic> = BasicBlock::from_id(&tc.ctx, entry)
             .iter()
@@ -567,8 +568,7 @@ mod tests {
             builder.push_return(ptr);
         }
 
-        let aliases = crate::AliasResult::simple(&tc.ctx);
-        super::super::gvn_function(&mut tc.ctx, host, Some(&aliases));
+        super::super::concretize::concretize_function(&mut tc.ctx, host);
 
         let insns: Vec<Mnemonic> = BasicBlock::from_id(&tc.ctx, entry)
             .iter()
@@ -685,8 +685,7 @@ mod tests {
         // Each projection inserts instructions a later GVN sweep reduces (the map
         // lane inlines the body, whose `Extract(enumerate[2])` then projects and
         // folds), so iterate to a fixpoint as the real pass pipeline does.
-        let aliases = crate::AliasResult::simple(&tc.ctx);
-        while super::super::gvn_function(&mut tc.ctx, host, Some(&aliases)) {}
+        super::super::concretize::concretize_function(&mut tc.ctx, host);
 
         let insns: Vec<Mnemonic> = BasicBlock::from_id(&tc.ctx, entry)
             .iter()
