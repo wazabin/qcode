@@ -1595,7 +1595,6 @@ impl<'str, 'ctx, Ctx: HostMut<'str>> Drop for Builder<'str, 'ctx, Ctx> {
 
 #[cfg(test)]
 mod tests {
-    use jstd::graph::{Graph, Node};
     use qcode_macro::qcode;
 
     use super::*;

@@ -1,10 +1,8 @@
 // TODO: use a modified baseRef
 
-use std::collections::HashSet;
-
 use jstd::{
     Identifier,
-    graph::{Edge, FxBuildHasher, Graph, Node},
+    graph::{Cfg, FxBuildHasher},
 };
 
 use crate::{
@@ -75,116 +73,28 @@ impl<'s, 'ctx: 's, 'str: 'ctx> WithCtx<'s, 's, 'str> for EdgeMutRef<'str, 'ctx> 
 }
 
 // ---------------------------------------------------------------------------
-// A CFG graph rooted at a single function.
+// A CFG rooted at a single function.
 //
-// The CFG is inherently per-function: its nodes are the function's own blocks
-// and its edges the function's own edge arena. Implementing `Graph` on
-// [`FunctionRef`] (rather than on `Context`, whose `nodes()` spanned every block
-// in the module) both scopes the graph correctly and — because `FunctionRef`
-// carries a [`HostRef`](crate::value::util::base_ref::HostRef) — reads a
-// *checked-out* function through its host, so dominator analysis works inside a
-// `FunctionPassV2`.
-//
-// jstd's `Node`/`Edge` hand `&'graph Self::Graph` around to build sibling views,
-// so the node/edge handles borrow the `FunctionRef`; every arena access routes
-// through `graph.host()`.
+// The CFG is inherently per-function: its nodes are the function's own blocks.
+// Dominator analysis needs only the successor relation (see jstd's `Cfg`), which
+// [`BlockRef::successors`] already routes through the function's [`HostRef`], so
+// it reads a *checked-out* function correctly inside a `FunctionPassV2`.
 // ---------------------------------------------------------------------------
 
-/// Node view for the per-function CFG [`Graph`].
-pub struct CfgNode<'g, 'str, 'ctx> {
-    graph: &'g FunctionRef<'str, 'ctx>,
-    id: BlockId,
-}
-
-/// Edge view for the per-function CFG [`Graph`].
-pub struct CfgEdge<'g, 'str, 'ctx> {
-    graph: &'g FunctionRef<'str, 'ctx>,
-    id: EdgeId,
-}
-
-impl<'g, 'str: 'g, 'ctx: 'g> Node<'g> for CfgNode<'g, 'str, 'ctx> {
-    type Graph = FunctionRef<'str, 'ctx>;
-
-    fn new(id: BlockId, graph: &'g FunctionRef<'str, 'ctx>) -> Self {
-        Self { graph, id }
-    }
-
-    fn id(&self) -> BlockId {
-        self.id
-    }
-
-    fn graph(&self) -> &'g FunctionRef<'str, 'ctx> {
-        self.graph
-    }
-
-    fn edge_ids(&self) -> &'g HashSet<EdgeId, FxBuildHasher> {
-        &self.graph.host().block(self.id).edges
-    }
-
-    fn edge_count(&self) -> usize {
-        self.graph.host().block(self.id).edges.len()
-    }
-}
-
-impl<'g, 'str: 'g, 'ctx: 'g> Edge<'g> for CfgEdge<'g, 'str, 'ctx> {
-    type Graph = FunctionRef<'str, 'ctx>;
-
-    fn new(id: EdgeId, graph: &'g FunctionRef<'str, 'ctx>) -> Self {
-        Self { graph, id }
-    }
-
-    fn id(&self) -> EdgeId {
-        self.id
-    }
-
-    fn graph(&self) -> &'g FunctionRef<'str, 'ctx> {
-        self.graph
-    }
-
-    fn from_id(&self) -> BlockId {
-        self.graph.host().edge(self.id).from
-    }
-
-    fn to_id(&self) -> BlockId {
-        self.graph.host().edge(self.id).to
-    }
-}
-
-impl<'str, 'ctx> Graph for FunctionRef<'str, 'ctx> {
+impl<'str, 'ctx> Cfg for FunctionRef<'str, 'ctx> {
     type NodeId = BlockId;
-    type EdgeId = EdgeId;
 
-    // Same fixed-seed hasher as the module `Graph for Context` impl, so a block's
-    // incident-edge set iterates deterministically (see that impl's note).
+    // Fixed-seed hasher (not std's `RandomState`), so a block's incident-edge set
+    // — and thus `successors()` iteration — is deterministic across runs; per-run
+    // nondeterminism would otherwise leak into borderline mem2reg promotions and
+    // hence into the lifted IR.
     type Hasher = FxBuildHasher;
 
-    type Node<'g>
-        = CfgNode<'g, 'str, 'ctx>
-    where
-        Self: 'g;
-
-    type Edge<'g>
-        = CfgEdge<'g, 'str, 'ctx>
-    where
-        Self: 'g;
-
-    fn get_node(&self, id: BlockId) -> Option<CfgNode<'_, 'str, 'ctx>> {
-        Some(CfgNode { graph: self, id })
-    }
-
-    fn get_edge(&self, id: EdgeId) -> Option<CfgEdge<'_, 'str, 'ctx>> {
-        Some(CfgEdge { graph: self, id })
-    }
-
-    fn nodes(&self) -> impl Iterator<Item = CfgNode<'_, 'str, 'ctx>> + '_ {
-        self.block_ids()
-            .into_iter()
-            .map(move |id| CfgNode { graph: self, id })
-    }
-
-    fn edges(&self) -> impl Iterator<Item = CfgEdge<'_, 'str, 'ctx>> + '_ {
-        self.edge_ids()
-            .into_iter()
-            .map(move |id| CfgEdge { graph: self, id })
+    fn successors(&self, b: BlockId) -> impl Iterator<Item = BlockId> + '_ {
+        let succs: Vec<BlockId> = BlockRef::new(self.host(), b)
+            .successors()
+            .map(|(_, s)| s)
+            .collect();
+        succs.into_iter()
     }
 }
