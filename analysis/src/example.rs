@@ -12,7 +12,11 @@ impl FunctionPassV2 for ExamplePass {
         "Example Pass, lists functions"
     }
 
-    fn run(&self, _m: &ModuleView, f: &mut FunctionBody) -> Result<bool, String> {
+    fn run<'str>(
+        &self,
+        _m: &ModuleView<'_, 'str>,
+        f: &mut FunctionBody<'str>,
+    ) -> Result<bool, String> {
         let _name = f.function().name.to_string();
 
         // TODO: log!(name)

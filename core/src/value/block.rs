@@ -14,7 +14,7 @@ use crate::{
     },
 };
 use core::slice;
-use jstd::graph::{FxBuildHasher, Graph};
+use jstd::graph::FxBuildHasher;
 use std::{
     borrow::Cow,
     collections::HashSet,
@@ -548,6 +548,20 @@ where
             .len();
         self.insert_insn(len, id);
     }
+
+    /// Removes this block from its function (full cleanup + tombstone). Delegates
+    /// to [`HostMut::delete_block`].
+    pub fn delete(&mut self, function_id: FunctionId) {
+        let id = self.id;
+        self.ctx.delete_block(id, function_id);
+    }
+
+    /// Absorbs `other` into this block. Delegates to [`HostMut::absorb_block`];
+    /// `edge_ab` must be the direct edge from this block to `other`.
+    pub fn absorb_block(&mut self, other: BlockId, edge_ab: EdgeId, function_id: FunctionId) {
+        let id = self.id;
+        self.ctx.absorb_block(id, other, edge_ab, function_id);
+    }
 }
 
 impl Display for BlockMutRef<'_, '_> {
@@ -699,126 +713,6 @@ impl<'str, 'ctx> BlockMutRef<'str, 'ctx> {
     /// Appends a slice of instruction ids to this block.
     pub fn extend_insns(&mut self, insns: &[InstructionId]) {
         self.inner_mut().instructions.extend_from_slice(insns);
-    }
-
-    /// Removes this block from `function_id`'s block list, unlinks every CFG
-    /// edge incident to it, and clears its parent.
-    ///
-    /// Detaching the edges is what keeps a deleted block from leaving phantom
-    /// predecessors/successors on its neighbours (e.g. an unrolled-away loop
-    /// body whose stale exit edge would otherwise inflate the exit block's
-    /// predecessor count and block `simplify_cfg` from merging it).
-    pub fn delete(&mut self, function_id: FunctionId) {
-        // Snapshot first: `remove_cfg_edge` mutates this block's edge set. A
-        // self-loop appears once in the set and unlinks cleanly (both endpoints
-        // are this block, so the second remove is a no-op).
-        let edges: Vec<EdgeId> = self.inner().edges.iter().copied().collect();
-        for edge in edges {
-            self.ctx.remove_cfg_edge(edge);
-        }
-
-        // Remove the block's instructions, not just the block. Otherwise they
-        // linger in the value arena: still registered in their operands' use-lists,
-        // so `ctx.users(v)` keeps returning a deleted block's `load`/`store`/etc.
-        // even though the block is gone from the CFG. Arena-global analyses (e.g.
-        // `argpromote`'s `analyze_param`, which scans `ctx.users`) would then see
-        // phantom accesses from the deleted block. `remove_instruction` updates the
-        // use-lists (via `remove_instructions`) and clears each instruction's
-        // parent; outgoing edges were already dropped above.
-        let insns: Vec<InstructionId> = self.inner().instructions.clone();
-        for insn in insns {
-            self.ctx.remove_instruction(insn);
-        }
-
-        // Detach the block's parameters too. They are value defs (e.g. a loop's
-        // induction variable) just like instruction results; leaving them with a
-        // stale `parent` pointing at the now-deleted block would dangle the same
-        // way a tombstoned instruction would. Callers must already have unlinked
-        // their uses (the params have no live readers once the block is gone).
-        let params: Vec<BlockParamId> = self.inner().params.clone();
-        for param in params {
-            // The param's user entry (if any) lives in its own function's map.
-            self.ctx.values.functions[param.func]
-                .users
-                .remove(&ValueId::BlockParam(param));
-            self.ctx.values.block_param_mut(param).parent = None;
-        }
-
-        // Tombstone the block: drop it from its owner's roster (append-only
-        // arena slot is never reclaimed).
-        let _ = function_id;
-        let id = self.id;
-        self.ctx.values.unroster_block(id);
-        let block = self.inner_mut();
-        block.parent = None;
-        block.deleted = true;
-    }
-
-    /// Absorbs `other` into this block: removes the terminal branch, appends
-    /// `other`'s instructions, rehomes `other`'s outgoing edges to this block,
-    /// removes `other` from `function_id`, and transfers `other`'s addresses.
-    ///
-    /// `edge_ab` must be the direct edge from this block to `other`.
-    pub fn absorb_block(&mut self, other: BlockId, edge_ab: EdgeId, function_id: FunctionId) {
-        let branch_args = self
-            .inner()
-            .instructions
-            .last()
-            .and_then(|&id| match self.ctx.values.instruction(id).mnemonic() {
-                crate::value::insn::Mnemonic::Branch(branch) if branch.target == other => {
-                    Some(branch.args.clone())
-                }
-                _ => None,
-            })
-            .unwrap_or_default();
-        let other_params = self.ctx.values.block(other).params.clone();
-        if !other_params.is_empty() {
-            assert_eq!(
-                other_params.len(),
-                branch_args.len(),
-                "cannot absorb block with {} params through branch with {} args",
-                other_params.len(),
-                branch_args.len()
-            );
-            for (param, arg) in other_params.into_iter().zip(branch_args) {
-                self.ctx.replace_all_uses_with(param, arg);
-            }
-        }
-
-        // Remove terminal branch.
-        self.inner_mut().instructions.pop();
-
-        // Move other's instructions into this block, updating their parent. The
-        // source list must be drained, not just copied: leaving the ids in
-        // `other.instructions` would put every absorbed instruction in two
-        // blocks at once, so a later `remove_instruction` (which unlinks via the
-        // instruction's `parent`) clears it from one block while it lingers in
-        // the other — corrupting block membership.
-        let b_insns = std::mem::take(&mut self.ctx.values.block_mut(other).instructions);
-        let self_id = self.id;
-        for &insn_id in &b_insns {
-            self.ctx.values.instruction_mut(insn_id).parent = Some(self_id);
-        }
-        self.inner_mut().instructions.extend(b_insns);
-
-        // Rehome other's edges to this block at the graph level.
-        self.ctx.merge_nodes(self.id, other, edge_ab);
-
-        // Tombstone `other`: with per-function block arenas, removal from the
-        // function is a `deleted` flag (the arena slot is never reclaimed).
-        let _ = function_id;
-        let b_addr = self.ctx.values.block(other).address;
-        let b_extra = self.ctx.values.block(other).extra_addresses.clone();
-        self.ctx.values.unroster_block(other);
-        {
-            let other_block = self.ctx.values.block_mut(other);
-            other_block.parent = None;
-            other_block.deleted = true;
-        }
-        if let Some(addr) = b_addr {
-            self.inner_mut().extra_addresses.push(addr);
-        }
-        self.inner_mut().extra_addresses.extend(b_extra);
     }
 
     /// Associates this block with `addr` in the context address map.

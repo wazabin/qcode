@@ -250,7 +250,7 @@ where
     Ctx: HostMut<'str>,
 {
     pub fn set_size(&mut self, size: usize) {
-        let type_id = self.ctx.shared_mut().types.get_or_make_int(size);
+        let type_id = self.ctx.shared().types.get_or_make_int(size);
         self.ctx.block_param_mut(self.id).type_id = type_id;
     }
 }

@@ -829,7 +829,7 @@ mod tests {
     use qcode_macro::qcode;
 
     use super::*;
-    use crate::test_util::run_function_pass;
+    use crate::test_util::{run_function_pass, run_function_pass_v2};
 
     #[test]
     fn annotates_simple_constant_bound_induction_loop() {
@@ -1137,7 +1137,7 @@ mod tests {
         // pipeline) merges the now-single-pred exit into its predecessor: the
         // live-out use must be rewritten to the incoming value, never left dangling
         // on the removed exit param.
-        let _ = run_function_pass::<crate::cfg::SimplifyCfg>(&mut ctx, test);
+        let _ = run_function_pass_v2::<crate::cfg::SimplifyCfg>(&mut ctx, test);
         let defined: rustc_hash::FxHashSet<ValueId> = Function::from_id(&ctx, test)
             .iter()
             .flat_map(|b| {
@@ -1223,7 +1223,7 @@ mod tests {
 
         assert!(run_function_pass::<UnrollSimpleLoops>(&mut ctx, test).unwrap());
         assert_no_dangling(&ctx, test);
-        let _ = run_function_pass::<crate::cfg::SimplifyCfg>(&mut ctx, test);
+        let _ = run_function_pass_v2::<crate::cfg::SimplifyCfg>(&mut ctx, test);
         assert_no_dangling(&ctx, test);
     }
 

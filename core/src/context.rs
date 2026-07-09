@@ -725,7 +725,7 @@ impl<'str> Context<'str> {
     }
 
     /// Creates a [`Value`] representing an integer constant of the given byte width.
-    pub fn get_const(&mut self, value: u64, size: usize) -> LiteralRef<'str, '_> {
+    pub fn get_const(&self, value: u64, size: usize) -> LiteralRef<'str, '_> {
         let type_id = self.types.get_or_make_int(size);
         let id = self.values.get_or_make_typed_literal(value, type_id, size);
         LiteralRef::new(self, id)
@@ -733,7 +733,7 @@ impl<'str> Context<'str> {
 
     /// Creates a `bool`-typed constant (`true`/`false`), byte-stored with value
     /// `1`/`0`. This is the only way to mint a `bool` literal.
-    pub fn get_bool_const(&mut self, value: bool) -> LiteralRef<'str, '_> {
+    pub fn get_bool_const(&self, value: bool) -> LiteralRef<'str, '_> {
         let type_id = self.types.get_or_make_bool();
         let id = self
             .values
@@ -777,7 +777,7 @@ impl<'str> Context<'str> {
     ///
     /// Varnodes are typed as `Int(varnode.size())`. Blocks, functions, and other
     /// non-data values return `Int(0)`.
-    pub fn type_of(&mut self, id: ValueId) -> crate::types::TypeId {
+    pub fn type_of(&self, id: ValueId) -> crate::types::TypeId {
         match id {
             ValueId::Literal(lid) => self.values.literals[lid].type_id,
             ValueId::Bytes(bid) => self.values.bytes[bid].type_id,
@@ -1464,7 +1464,7 @@ mod tests {
 
         let mut fun = ctx_b.checkout_function(fid_b);
         {
-            let mut host = CheckedOut::new(&mut fun, fid_b, &mut ctx_b);
+            let mut host = CheckedOut::new(&mut fun, fid_b, &ctx_b);
             let mut r = BaseRef::new(host.reborrow(), entry_b);
             r.set_comment(Some("c".into()));
             let mut r = BaseRef::new(host.reborrow(), entry_b);

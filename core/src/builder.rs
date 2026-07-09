@@ -207,7 +207,7 @@ impl<'str, 'ctx, Ctx: HostMut<'str>> Builder<'str, 'ctx, Ctx> {
         let dst = match value {
             ValueRef::Literal(literal) => {
                 let value = literal.value();
-                self.context_mut().get_const(value, range.len()).into()
+                self.context().get_const(value, range.len()).into()
             }
 
             ValueRef::Varnode(varnode_ref) => {
@@ -310,10 +310,7 @@ impl<'str, 'ctx, Ctx: HostMut<'str>> Builder<'str, 'ctx, Ctx> {
         }
         let cur_type = self.block.host_mut().instruction_mut(id).type_id;
         let size = self.context().types.size_of(cur_type);
-        let type_id = self
-            .context_mut()
-            .types
-            .get_or_make_space_address(size, space);
+        let type_id = self.context().types.get_or_make_space_address(size, space);
         self.block.host_mut().instruction_mut(id).type_id = type_id;
     }
 
@@ -338,7 +335,7 @@ impl<'str, 'ctx, Ctx: HostMut<'str>> Builder<'str, 'ctx, Ctx> {
     /// Panics if the block is already terminated (ends with a branch/call/return).
     #[track_caller]
     fn push_instruction(&mut self, mnemonic: Mnemonic, size: usize) -> InstructionRef<'str, '_> {
-        let type_id = self.context_mut().types.get_or_make_int(size);
+        let type_id = self.context().types.get_or_make_int(size);
         self.push_instruction_with_type(mnemonic, type_id)
     }
 
@@ -349,7 +346,7 @@ impl<'str, 'ctx, Ctx: HostMut<'str>> Builder<'str, 'ctx, Ctx> {
         size: usize,
         _space: Option<SpaceId>,
     ) -> InstructionRef<'str, '_> {
-        let type_id = self.context_mut().types.get_or_make_int(size);
+        let type_id = self.context().types.get_or_make_int(size);
         self.push_instruction_with_type(mnemonic, type_id)
     }
 
@@ -401,7 +398,7 @@ impl<'str, 'ctx, Ctx: HostMut<'str>> Builder<'str, 'ctx, Ctx> {
         match id {
             ValueId::Instruction(iid) => self.block.host_ref().read_host().instruction(iid).type_id,
             ValueId::BlockParam(pid) => self.block.host_ref().read_host().block_param(pid).type_id,
-            other => self.block.host_mut().shared_mut().type_of(other),
+            other => self.block.host_ref().shared().type_of(other),
         }
     }
 
@@ -447,7 +444,7 @@ impl<'str, 'ctx, Ctx: HostMut<'str>> Builder<'str, 'ctx, Ctx> {
         if current_size == size || literal.symbolic.is_some() {
             return id;
         }
-        self.context_mut().get_const(literal.value, size).id()
+        self.context().get_const(literal.value, size).id()
     }
 
     pub fn get_or_make_local_label(&mut self, name: Cow<'str, str>) -> BlockId {
@@ -576,7 +573,7 @@ impl<'str, 'ctx, Ctx: HostMut<'str>> Builder<'str, 'ctx, Ctx> {
             match src {
                 ValueRef::Literal(lit) => {
                     let value = lit.value();
-                    self.context_mut().get_const(value, size).into()
+                    self.context().get_const(value, size).into()
                 }
 
                 _ => panic!("Expected literal value for CONST space load"),
@@ -636,7 +633,7 @@ impl<'str, 'ctx, Ctx: HostMut<'str>> Builder<'str, 'ctx, Ctx> {
                 .is_some_and(|t| self.context().types.is_bool(t)),
             "push_bool_not: operand must be bool-typed"
         );
-        let f = self.context_mut().get_bool_const(false).id();
+        let f = self.context().get_bool_const(false).id();
         self.push_binop(Binop::Int(IntBinop::Equal), src, f, Some(1))
     }
 
@@ -690,16 +687,14 @@ impl<'str, 'ctx, Ctx: HostMut<'str>> Builder<'str, 'ctx, Ctx> {
         let result_type = {
             let lhs_type = self.type_of(lhs);
             let rhs_type = self.type_of(rhs);
-            self.context_mut()
-                .types
-                .binop_result(lhs_type, op, rhs_type)
+            self.context().types.binop_result(lhs_type, op, rhs_type)
         };
 
         // Comparisons always override the result size to 1.
         let result_type = if let Some(forced_size) = size {
             let current_size = self.context().types.size_of(result_type);
             if forced_size != current_size {
-                self.context_mut().types.get_or_make_int(forced_size)
+                self.context().types.get_or_make_int(forced_size)
             } else {
                 result_type
             }
@@ -723,9 +718,7 @@ impl<'str, 'ctx, Ctx: HostMut<'str>> Builder<'str, 'ctx, Ctx> {
                     ) =>
                 {
                     let size = self.context().types.size_of(result_type);
-                    self.context_mut()
-                        .types
-                        .get_or_make_space_address(size, space)
+                    self.context().types.get_or_make_space_address(size, space)
                 }
                 _ => result_type,
             }
@@ -963,7 +956,7 @@ impl<'str, 'ctx, Ctx: HostMut<'str>> Builder<'str, 'ctx, Ctx> {
             .map(|((name, _), type_id)| AggregateField::new(name.clone(), type_id))
             .collect();
         let ty = self
-            .context_mut()
+            .context()
             .types
             .get_or_make_named_aggregate(aggregate_fields);
         let values = fields.into_iter().map(|(_, value)| value).collect();
@@ -1007,7 +1000,7 @@ impl<'str, 'ctx, Ctx: HostMut<'str>> Builder<'str, 'ctx, Ctx> {
         let ret_ty = self.map_body_return_type(body);
         let ty = match (seq, ret_ty) {
             (Some((_, len, is_list)), Some(rt)) => {
-                self.context_mut().types.get_or_make_seq(rt, len, is_list)
+                self.context().types.get_or_make_seq(rt, len, is_list)
             }
             _ => src_ty,
         };
@@ -1046,7 +1039,7 @@ impl<'str, 'ctx, Ctx: HostMut<'str>> Builder<'str, 'ctx, Ctx> {
         let ret_ty = self.map_body_return_type(body);
         let ty = match (seq, ret_ty) {
             (Some((_, len, is_list)), Some(rt)) => {
-                self.context_mut().types.get_or_make_seq(rt, len, is_list)
+                self.context().types.get_or_make_seq(rt, len, is_list)
             }
             _ => src_ty,
         };
@@ -1072,7 +1065,7 @@ impl<'str, 'ctx, Ctx: HostMut<'str>> Builder<'str, 'ctx, Ctx> {
         let ty = self.lambda_return_type(target).unwrap_or_else(|| {
             args.first()
                 .map(|&arg| self.type_of(arg))
-                .unwrap_or_else(|| self.context_mut().types.get_or_make_int(0))
+                .unwrap_or_else(|| self.context().types.get_or_make_int(0))
         });
         self.push_instruction_with_type(Mnemonic::Apply(Apply { target, args }), ty)
     }
@@ -1117,7 +1110,7 @@ impl<'str, 'ctx, Ctx: HostMut<'str>> Builder<'str, 'ctx, Ctx> {
             .map(|(_, field)| field.type_id)
             .expect("push_gep: no field at that offset in the pointee struct");
         let ty = self
-            .context_mut()
+            .context()
             .types
             .get_or_make_struct_pointer(ptr_width, field_ty);
         self.push_instruction_with_type(Mnemonic::Gep(Gep { base, offset }), ty)
@@ -1308,8 +1301,11 @@ impl<'str, 'ctx, Ctx: HostMut<'str>> Builder<'str, 'ctx, Ctx> {
                 let lowered = name.to_lowercase();
                 let func = self.block.id.func;
                 let name = self
-                    .context_mut()
-                    .get_unique_name_in(func, Cow::Owned(lowered));
+                    .block
+                    .host_mut()
+                    .function_mut(func)
+                    .names
+                    .unique(Cow::Owned(lowered));
                 self.rename_insn(id, name)
                     .expect("This name was deduplicated");
             }
@@ -1612,16 +1608,15 @@ mod tests {
             util::host_mut::CheckedOut,
         };
 
-        // The same body over any host: temp + const, a couple of binops, a load
-        // from a temp pointer, then a branch to a freshly minted local-label block.
+        // The same body over any host: consts and a couple of binops (exercising
+        // type + literal minting through the interners' `&self` paths), then a
+        // branch to a freshly minted local-label block. No varnode/temp-space
+        // minting — a checked-out host has read-only shared access.
         fn body<'str, 'ctx, Ctx: HostMut<'str>>(b: &mut Builder<'str, 'ctx, Ctx>) {
-            let c1 = b.context_mut().get_const(7, 8).id();
-            let c2 = b.context_mut().get_const(9, 8).id();
+            let c1 = b.context().get_const(7, 8).id();
+            let c2 = b.context().get_const(9, 8).id();
             let sum = b.push_add(c1, c2).id();
             let _doubled = b.push_add(sum, sum).id();
-            let ptr = b.make_temp(8);
-            let space = Varnode::from_id(b.context(), ptr).space().id;
-            let _loaded = b.push_load::<false>(ValueId::Varnode(ptr), 8, space).id();
             let lbl = b.get_or_make_local_label("next".into());
             b.push_branch(lbl);
         }
@@ -1673,7 +1668,7 @@ mod tests {
         let entry_b = Function::from_id_mut(&mut ctx_b, fid_b).make_root().id;
         let mut fun = ctx_b.checkout_function(fid_b);
         {
-            let mut host = CheckedOut::new(&mut fun, fid_b, &mut ctx_b);
+            let mut host = CheckedOut::new(&mut fun, fid_b, &ctx_b);
             let mut b = Builder::from_block(BaseRef::new(host.reborrow(), entry_b));
             body(&mut b);
         }

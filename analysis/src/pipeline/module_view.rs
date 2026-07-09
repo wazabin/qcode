@@ -19,7 +19,7 @@ use qcode::{
     assumption::Proposition,
     context::Context,
     discovery::Discovery,
-    value::{Function, FunctionId, ValueId},
+    value::{Function, FunctionId, ValueId, util::host_mut::CheckedOut},
 };
 
 use super::PipelineEnv;
@@ -159,6 +159,16 @@ impl<'str> FunctionBody<'str> {
     /// The owned function (mutate).
     pub fn function_mut(&mut self) -> &mut Function<'str> {
         &mut self.fun
+    }
+
+    /// A [`CheckedOut`] mutation host over this body's owned function and the
+    /// module's read-only shared context. This is how a `FunctionPassV2` reads
+    /// (via [`CheckedOut::read_host`]) and mutates (via the [`HostMut`] surface)
+    /// its function — construct block/instruction refs and `Builder`s over it.
+    ///
+    /// [`HostMut`]: qcode::value::util::host_mut::HostMut
+    pub fn host<'a>(&'a mut self, m: &'a ModuleView<'_, 'str>) -> CheckedOut<'a, 'str> {
+        CheckedOut::new(&mut self.fun, self.id, m.ctx())
     }
 
     /// The effect buffer (mutate) — passes push assumption/discovery/rename/

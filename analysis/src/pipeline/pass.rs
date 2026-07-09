@@ -179,7 +179,11 @@ impl<T: FunctionPass> DynFunctionPass for T {
 pub trait FunctionPassV2: Default {
     const NAME: &'static str;
     fn description(&self) -> &'static str;
-    fn run(&self, m: &ModuleView, f: &mut FunctionBody) -> Result<bool, String>;
+    fn run<'str>(
+        &self,
+        m: &ModuleView<'_, 'str>,
+        f: &mut FunctionBody<'str>,
+    ) -> Result<bool, String>;
 }
 
 /// Adapts a [`FunctionPassV2`] to the object-safe [`DynFunctionPass`] the registry
