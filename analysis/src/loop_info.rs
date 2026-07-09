@@ -314,7 +314,7 @@ pub fn recognize_loops(ctx: &Context, fid: FunctionId) -> Vec<NaturalLoop> {
         return Vec::new();
     };
     let block_ids: Vec<BlockId> = function.iter().map(|b| b.id).collect();
-    let doms = compute_dominators(ctx, root);
+    let doms = compute_dominators(&function, root);
 
     let mut loops = Vec::new();
     for &latch in &block_ids {

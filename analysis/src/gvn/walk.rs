@@ -399,7 +399,7 @@ pub(super) fn run_dominator_walk(
 
     let mut changed = false;
     for entry in std::iter::once(root).chain(entries) {
-        let tree = compute_dominators(ctx, entry);
+        let tree = compute_dominators(&qcode::value::Function::from_id(ctx, entry.func), entry);
         let mut walk = Walk {
             passes,
             func_id,

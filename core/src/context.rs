@@ -12,17 +12,14 @@ use crate::{
     types::TypeManager,
     value::{
         BasicBlock, Function, FunctionId, FunctionRef, Instruction, ValueId,
-        block::{BlockId, BlockMutRef, BlockRef, EdgeData, EdgeId, EdgeMutRef, EdgeRef},
+        block::{BlockId, BlockRef, EdgeData, EdgeId},
         insn::{InstructionId, InstructionRef, Mnemonic, PCodeOpId},
         literal::{LiteralId, LiteralRef},
         registry::ValueRegistry,
         varnode::{Varnode, VarnodeId, VarnodeRef, register::RegisterId},
     },
 };
-use jstd::{
-    graph::Graph,
-    registry::{self, Registry},
-};
+use jstd::registry::{self, Registry};
 
 /// The central arena that owns all IR state.
 ///
@@ -1154,68 +1151,6 @@ impl Display for Context<'_> {
         self.blocks()
             .filter(|block| block.parent().is_none())
             .try_for_each(|block| block.fmt(f))
-    }
-}
-
-impl<'str> Graph for Context<'str> {
-    type NodeId = BlockId;
-
-    type EdgeId = EdgeId;
-
-    // Fixed-seed hasher so a block's incident-edge set iterates in a
-    // deterministic order. This is what makes `predecessors()`/`successors()`
-    // (and thus borderline mem2reg promotions) reproducible across runs; the
-    // std default (`RandomState`) reseeds per process and leaks that
-    // nondeterminism into the lifted IR.
-    type Hasher = jstd::graph::FxBuildHasher;
-
-    type Node<'a>
-        = BlockRef<'str, 'a>
-    where
-        Self: 'a;
-
-    type Edge<'a>
-        = EdgeRef<'str, 'a>
-    where
-        Self: 'a;
-
-    fn get_node(&self, id: Self::NodeId) -> Option<Self::Node<'_>> {
-        Some(BasicBlock::from_id(self, id))
-    }
-
-    fn get_edge(&self, id: Self::EdgeId) -> Option<Self::Edge<'_>> {
-        Some(EdgeRef::new(self, id))
-    }
-
-    fn nodes(&self) -> impl Iterator<Item = Self::Node<'_>> + '_ {
-        self.block_ids()
-            .into_iter()
-            .map(move |id| BasicBlock::from_id(self, id))
-    }
-
-    fn edges(&self) -> impl Iterator<Item = Self::Edge<'_>> + '_ {
-        let ids: Vec<EdgeId> = self.functions().flat_map(|f| f.edge_ids()).collect();
-        ids.into_iter().map(move |id| EdgeRef::new(self, id))
-    }
-}
-
-impl<'str> jstd::graph::GraphMut for Context<'str> {
-    type NodeMut<'a>
-        = BlockMutRef<'str, 'a>
-    where
-        Self: 'a;
-
-    type EdgeMut<'a>
-        = EdgeMutRef<'str, 'a>
-    where
-        Self: 'a;
-
-    fn get_node_mut(&mut self, id: Self::NodeId) -> Option<Self::NodeMut<'_>> {
-        Some(BasicBlock::from_id_mut(self, id))
-    }
-
-    fn get_edge_mut(&mut self, id: Self::EdgeId) -> Option<Self::EdgeMut<'_>> {
-        Some(EdgeMutRef::new(self, id))
     }
 }
 

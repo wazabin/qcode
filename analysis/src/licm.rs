@@ -97,7 +97,7 @@ fn back_edges(ctx: &Context, fun_id: FunctionId) -> Vec<(BlockId, BlockId)> {
         return Vec::new();
     };
     let block_ids = function.iter().map(|b| b.id).collect::<Vec<_>>();
-    let dominators = compute_dominators(ctx, root);
+    let dominators = compute_dominators(&function, root);
 
     let mut edges = Vec::new();
     for &latch in &block_ids {

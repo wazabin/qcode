@@ -758,7 +758,7 @@ fn postdominated_dead_register_stores(
     if exit_set.is_empty() {
         return HashSet::default();
     }
-    let pdom = compute_postdominators(ctx, &blocks, &node_set, &exit_set);
+    let pdom = compute_postdominators(&function, &blocks, &node_set, &exit_set);
 
     let mut stores = Vec::new();
     let mut loads = Vec::new();
@@ -908,8 +908,8 @@ fn postdominated_dead_ram_stores(
     if exit_set.is_empty() {
         return HashSet::default();
     }
-    let pdom = compute_postdominators(ctx, &blocks, &node_set, &exit_set);
-    let dom = compute_dominators(ctx, entry);
+    let pdom = compute_postdominators(&function, &blocks, &node_set, &exit_set);
+    let dom = compute_dominators(&function, entry);
 
     let mut stores: Vec<RamAccess> = Vec::new();
     let mut loads: Vec<RamAccess> = Vec::new();

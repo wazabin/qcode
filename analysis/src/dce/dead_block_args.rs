@@ -290,7 +290,7 @@ fn find_congruent_param(
     root: Option<BlockId>,
 ) -> Option<(BlockId, usize, BlockParamId, ValueId)> {
     let root = root?;
-    let dom = compute_dominators(ctx, root);
+    let dom = compute_dominators(&qcode::value::Function::from_id(ctx, root.func), root);
     let mut cong = Congruence::new(precompute_forms_for_blocks(ctx, block_ids));
 
     for &block in block_ids {

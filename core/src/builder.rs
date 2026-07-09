@@ -1745,8 +1745,8 @@ mod tests {
         "
         );
         // entry + done + 1001 = 3 nodes; entry -> done, done -> 1001 = 2 edges
-        assert_eq!(ctx.nodes().count(), 3);
-        assert_eq!(ctx.edges().count(), 2);
+        assert_eq!(ctx.block_ids().len(), 3);
+        assert_eq!(ctx.functions().flat_map(|f| f.edge_ids()).count(), 2);
     }
 
     #[test]
@@ -1770,8 +1770,8 @@ mod tests {
         );
         // entry + then_lbl + else_lbl + 1001 = 4 nodes
         // entry->then_lbl, entry->else_lbl, then_lbl->1001, else_lbl->1001 = 4 edges
-        assert_eq!(ctx.nodes().count(), 4);
-        assert_eq!(ctx.edges().count(), 4);
+        assert_eq!(ctx.block_ids().len(), 4);
+        assert_eq!(ctx.functions().flat_map(|f| f.edge_ids()).count(), 4);
     }
 
     #[test]
@@ -1786,10 +1786,10 @@ mod tests {
         "
         );
 
-        assert_eq!(ctx.nodes().count(), 1);
-        assert_eq!(ctx.edges().count(), 0);
+        assert_eq!(ctx.block_ids().len(), 1);
+        assert_eq!(ctx.functions().flat_map(|f| f.edge_ids()).count(), 0);
 
-        assert_eq!(BasicBlock::from_id(&ctx, entry).children().count(), 0);
+        assert_eq!(BasicBlock::from_id(&ctx, entry).successors().count(), 0);
     }
 
     #[test]
@@ -1803,9 +1803,9 @@ mod tests {
                 return at ptr;
         "
         );
-        assert_eq!(ctx.nodes().count(), 1);
-        assert_eq!(ctx.edges().count(), 0);
-        assert_eq!(BasicBlock::from_id(&ctx, entry).children().count(), 0);
+        assert_eq!(ctx.block_ids().len(), 1);
+        assert_eq!(ctx.functions().flat_map(|f| f.edge_ids()).count(), 0);
+        assert_eq!(BasicBlock::from_id(&ctx, entry).successors().count(), 0);
     }
 
     #[test]
@@ -1827,8 +1827,8 @@ mod tests {
 
         // entry + body + 1001 = 3 nodes
         // entry -> body, body -> 1001 = 2 edges
-        assert_eq!(ctx.nodes().count(), 3);
-        assert_eq!(ctx.edges().count(), 2);
+        assert_eq!(ctx.block_ids().len(), 3);
+        assert_eq!(ctx.functions().flat_map(|f| f.edge_ids()).count(), 2);
     }
 
     #[test]

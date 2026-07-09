@@ -291,7 +291,7 @@ pub(crate) fn depipeline(ctx: &mut Context) -> bool {
         };
         // CFG edges are unchanged by param removal, so the dominator tree stays
         // valid across the per-function fixpoint.
-        let dom = compute_dominators(ctx, root);
+        let dom = compute_dominators(&qcode::value::Function::from_id(ctx, fid), root);
         while let Some(p) = find_pipelined(ctx, fid, &dom) {
             apply(ctx, fid, &p);
             changed = true;

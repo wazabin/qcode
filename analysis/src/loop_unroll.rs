@@ -506,8 +506,9 @@ impl LoopAnalysis {
             return None;
         }
 
-        let dominators = compute_dominators(ctx, root);
-        let postdominators = compute_postdominators(ctx, &block_ids, &node_set, &exit_set);
+        let cfg = qcode::value::Function::from_id(ctx, fun_id);
+        let dominators = compute_dominators(&cfg, root);
+        let postdominators = compute_postdominators(&cfg, &block_ids, &node_set, &exit_set);
         let mut backedges = Vec::new();
         for &latch in &block_ids {
             let successors = BasicBlock::from_id(ctx, latch)

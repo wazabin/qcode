@@ -782,8 +782,13 @@ mod tests {
         );
         let entry = BasicBlock::from_name(&ctx, "entry").unwrap();
         let children: Vec<_> = entry
-            .children()
-            .map(|b| b.node().name().unwrap_or("").to_string())
+            .successors()
+            .map(|(_, b)| {
+                BasicBlock::from_id(&ctx, b)
+                    .name()
+                    .unwrap_or("")
+                    .to_string()
+            })
             .collect();
         assert_eq!(children, ["body"]);
     }

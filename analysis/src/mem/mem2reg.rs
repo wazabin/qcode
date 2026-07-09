@@ -109,7 +109,10 @@ impl<'ctx, 'str> Mem2Reg<'ctx, 'str> {
         }
 
         let root_id = self.root_id();
-        let dom = compute_dominators(&*self.ctx, root_id);
+        let dom = compute_dominators(
+            &qcode::value::Function::from_id(&*self.ctx, root_id.func),
+            root_id,
+        );
         let frontier = dom.dominator_frontier().clone();
         let InsertedBlockParams {
             by_block: var_params,
@@ -1845,7 +1848,7 @@ mod tests {
         );
 
         let function = Function::from_id(&ctx, test);
-        let dom = compute_dominators(&ctx, function.root().unwrap().id);
+        let dom = compute_dominators(&function, function.root().unwrap().id);
         let frontier = dom.dominator_frontier();
         let aliases = AliasResult::simple(&ctx);
         let sliced = HashSet::default();
@@ -2090,7 +2093,7 @@ mod tests {
         );
 
         let function = Function::from_id(&ctx, test);
-        let dom = compute_dominators(&ctx, function.root().unwrap().id);
+        let dom = compute_dominators(&function, function.root().unwrap().id);
         let frontier = dom.dominator_frontier();
         let aliases = AliasResult::simple(&ctx);
         let sliced = HashSet::default();
