@@ -2506,7 +2506,7 @@ mod tests {
         assert!(has_array_param, "the buffer region became an Array input");
 
         mark_pure_functions(&mut tc.ctx);
-        crate::test_util::run_function_pass::<crate::mem::array_promote::ArrayPromote>(
+        crate::test_util::run_function_pass_v2::<crate::mem::array_promote::ArrayPromote>(
             &mut tc.ctx,
             f,
         )
@@ -2736,7 +2736,7 @@ mod tests {
 
         assert!(argpromote(&mut tc.ctx), "step 1 region promotion");
         mark_pure_functions(&mut tc.ctx);
-        crate::test_util::run_function_pass::<crate::mem::array_promote::ArrayPromote>(
+        crate::test_util::run_function_pass_v2::<crate::mem::array_promote::ArrayPromote>(
             &mut tc.ctx,
             f,
         )
@@ -2864,7 +2864,7 @@ mod tests {
 
         assert!(argpromote(&mut tc.ctx), "step 1 region promotion");
         mark_pure_functions(&mut tc.ctx);
-        crate::test_util::run_function_pass::<crate::mem::array_promote::ArrayPromote>(
+        crate::test_util::run_function_pass_v2::<crate::mem::array_promote::ArrayPromote>(
             &mut tc.ctx,
             f,
         )
@@ -2988,7 +2988,7 @@ mod tests {
 
         assert!(argpromote(&mut tc.ctx), "step 1 region promotion");
         mark_pure_functions(&mut tc.ctx);
-        crate::test_util::run_function_pass::<crate::mem::array_promote::ArrayPromote>(
+        crate::test_util::run_function_pass_v2::<crate::mem::array_promote::ArrayPromote>(
             &mut tc.ctx,
             f,
         )

@@ -103,7 +103,7 @@ fn try_match(ctx: &mut Context, fid: FunctionId) -> Option<ScanMatch> {
     // TODO(loop-fold-header-index): fold header-carried scans by moving this
     // recognizer's induction walk onto `NaturalLoop::unit_induction`, mirroring
     // `loop_to_map::try_match`.
-    if param_parent(ctx, ca.index) != Some(ca.body) {
+    if param_parent(&*ctx, ca.index) != Some(ca.body) {
         return None;
     }
     let (seed_val, seed_arr0) = ca.seed?;
@@ -159,26 +159,26 @@ fn try_match(ctx: &mut Context, fid: FunctionId) -> Option<ScanMatch> {
     // param's own two incomings are the preheader init and the back-edge
     // increment; in the split shape `index` copies a header param, whose incomings
     // carry the init and increment.
-    let k_index = param_pos(ctx, body, index)?;
+    let k_index = param_pos(&*ctx, body, index)?;
     let feeds = if body == header {
         incoming(&*ctx, body, k_index)
     } else {
         let [hp] = incoming(&*ctx, body, k_index)[..] else {
             return None;
         };
-        if param_parent(ctx, hp) != Some(header) {
+        if param_parent(&*ctx, hp) != Some(header) {
             return None;
         }
-        let k_hp = param_pos(ctx, header, hp)?;
+        let k_hp = param_pos(&*ctx, header, hp)?;
         incoming(&*ctx, header, k_hp)
     };
-    if !feeds.iter().any(|&v| is_increment(ctx, v, index)) {
+    if !feeds.iter().any(|&v| is_increment(&*ctx, v, index)) {
         return None;
     }
     let inits: Vec<i64> = feeds
         .iter()
-        .filter(|&&v| !is_increment(ctx, v, index))
-        .filter_map(|&v| literal(ctx, v).map(|x| x as i64))
+        .filter(|&&v| !is_increment(&*ctx, v, index))
+        .filter_map(|&v| literal(&*ctx, v).map(|x| x as i64))
         .collect();
     let [index_start] = inits[..] else {
         return None;
@@ -348,7 +348,7 @@ fn apply(ctx: &mut Context, fid: FunctionId, m: &ScanMatch) -> bool {
         .collect::<Vec<_>>()
         .into_iter()
         .map(|p| {
-            let k = param_pos(ctx, m.exit, p)?;
+            let k = param_pos(&*ctx, m.exit, p)?;
             let [v] = incoming(&*ctx, m.exit, k)[..] else {
                 return None;
             };
@@ -358,7 +358,7 @@ fn apply(ctx: &mut Context, fid: FunctionId, m: &ScanMatch) -> bool {
             if !matches!(v, ValueId::BlockParam(_)) {
                 return None;
             }
-            let kv = param_pos(ctx, m.header, v)?;
+            let kv = param_pos(&*ctx, m.header, v)?;
             let init: Vec<ValueId> = incoming(&*ctx, m.header, kv)
                 .into_iter()
                 .filter(|&w| !defined_in_loop(ctx, w))
@@ -410,7 +410,7 @@ mod tests {
 
     use super::*;
     use crate::mem::array_promote::ArrayPromote;
-    use crate::test_util::run_function_pass;
+    use crate::test_util::{run_function_pass, run_function_pass_v2};
 
     // The exact seam this rewrite touches: `array_promote` promotes the seeded
     // prefix sum `out[0]=seed; out[i]=out[i-1]+l[i]` into a single carried array
@@ -449,7 +449,7 @@ mod tests {
             "
         );
         assert!(
-            run_function_pass::<ArrayPromote>(&mut ctx, prefix).unwrap(),
+            run_function_pass_v2::<ArrayPromote>(&mut ctx, prefix).unwrap(),
             "array_promote should promote the prefix sum"
         );
         assert!(
@@ -500,7 +500,7 @@ mod tests {
             "
         );
         assert!(
-            run_function_pass::<ArrayPromote>(&mut ctx, prefix).unwrap(),
+            run_function_pass_v2::<ArrayPromote>(&mut ctx, prefix).unwrap(),
             "the header-carried prefix sum should promote"
         );
         assert!(

@@ -26,18 +26,20 @@ use rustc_hash::FxHashSet as HashSet;
 
 use qcode::{
     builder::Builder,
-    context::Context,
     space::{Space, SpaceId, SpaceType},
     types::TypeId,
     value::{
-        BasicBlock, BlockId, Function, FunctionId, InstructionRef, ValueId,
+        BlockId, BlockRef, FunctionId, FunctionRef, ValueId,
         insn::{Branch, CBranch, InstructionId, IntrinsicApp, IntrinsicId, Load, Mnemonic},
+        util::{
+            base_ref::{BaseRef, HostRef},
+            host_mut::HostMut,
+        },
     },
 };
 
 use crate::gvn::affine::precompute_forms;
 use crate::sequence::{affine_base_const, affine_strided_lane};
-use crate::{FunctionPass, PipelineEnv};
 
 #[derive(Default)]
 pub struct ArrayPromote;
@@ -82,9 +84,9 @@ struct Seed {
 }
 
 /// Recognize the in-place array-fill loop in `fid`.
-fn try_match(ctx: &mut Context, fid: FunctionId) -> Option<PromoteMatch> {
+fn try_match(host: HostRef, fid: FunctionId) -> Option<PromoteMatch> {
     // Reject anything with a call: another routine could observe/mutate the region.
-    for block in Function::from_id(ctx, fid).iter() {
+    for block in FunctionRef::new(host, fid).iter() {
         for insn in block.iter() {
             if matches!(
                 insn.mnemonic(),
@@ -105,18 +107,18 @@ fn try_match(ctx: &mut Context, fid: FunctionId) -> Option<PromoteMatch> {
         space: SpaceId,
         stored: Option<ValueId>,
     }
-    let is_ram = |ctx: &Context, sp: SpaceId| {
+    let is_ram = |sp: SpaceId| {
         matches!(
-            Space::from_id(ctx, sp).ty,
+            Space::from_id(host.shared(), sp).ty,
             SpaceType::Ram | SpaceType::Temporary
         )
     };
     let mut accesses: Vec<Acc> = Vec::new();
-    for block in Function::from_id(ctx, fid).iter() {
+    for block in FunctionRef::new(host, fid).iter() {
         let bid = block.id;
         for insn in block.iter() {
             match insn.mnemonic() {
-                Mnemonic::Load(l) if is_ram(ctx, l.space) => accesses.push(Acc {
+                Mnemonic::Load(l) if is_ram(l.space) => accesses.push(Acc {
                     id: insn.id,
                     block: bid,
                     ptr: l.ptr,
@@ -124,7 +126,7 @@ fn try_match(ctx: &mut Context, fid: FunctionId) -> Option<PromoteMatch> {
                     space: l.space,
                     stored: None,
                 }),
-                Mnemonic::Store(s) if is_ram(ctx, s.space) => accesses.push(Acc {
+                Mnemonic::Store(s) if is_ram(s.space) => accesses.push(Acc {
                     id: insn.id,
                     block: bid,
                     ptr: s.ptr,
@@ -137,9 +139,9 @@ fn try_match(ctx: &mut Context, fid: FunctionId) -> Option<PromoteMatch> {
         }
     }
 
-    let loops = crate::loop_info::recognize_loops(ctx, fid);
-    let numbering = precompute_forms(&*ctx, fid);
-    let val_root = crate::loop_info::value_roots(&*ctx, fid);
+    let loops = crate::loop_info::recognize_loops(host, fid);
+    let numbering = precompute_forms(host, fid);
+    let val_root = crate::loop_info::value_roots(host, fid);
     let root_of = |v: ValueId| -> Option<ValueId> { val_root.get(&v).copied() };
 
     // The single strided lane store establishes (base_root, elem_size, index) and
@@ -194,7 +196,7 @@ fn try_match(ctx: &mut Context, fid: FunctionId) -> Option<PromoteMatch> {
         return None;
     }
     // v1 works in bytes, so require a byte-addressed region.
-    if Space::from_id(ctx, region_space).word_size != 1 {
+    if Space::from_id(host.shared(), region_space).word_size != 1 {
         return None;
     }
     let in_region = |a: &Acc| a.space == region_space;
@@ -224,7 +226,7 @@ fn try_match(ctx: &mut Context, fid: FunctionId) -> Option<PromoteMatch> {
     // --- Loop structure (from the shared recognizer) ---
     let lp = loops.iter().find(|l| l.body == body)?;
     let (preheader, header, exit, rotated) = (lp.preheader, lp.header, lp.exit, lp.rotated);
-    let ind = lp.unit_induction(ctx, index)?;
+    let ind = lp.unit_induction(host, index)?;
     let s = ind.start;
     let n = ind.count;
     // The seed store runs once, before the loop.
@@ -252,10 +254,7 @@ fn try_match(ctx: &mut Context, fid: FunctionId) -> Option<PromoteMatch> {
     }
 
     // Body instruction order, for the program-order check below.
-    let body_order: Vec<InstructionId> = BasicBlock::from_id(ctx, body)
-        .iter()
-        .map(|i| i.id)
-        .collect();
+    let body_order: Vec<InstructionId> = BlockRef::new(host, body).iter().map(|i| i.id).collect();
     let store_pos = body_order.iter().position(|&id| id == lane_store_id)?;
 
     // Strided region loads at `index + od`: one uniform list, each rewritten to
@@ -391,8 +390,8 @@ fn try_match(ctx: &mut Context, fid: FunctionId) -> Option<PromoteMatch> {
 }
 
 /// Append `arg` to the branch terminator of `from` on the edge to `to`.
-fn append_edge_arg(ctx: &mut Context, from: BlockId, to: BlockId, arg: ValueId) {
-    let Some(term) = BasicBlock::from_id(ctx, from).iter().last() else {
+fn append_edge_arg<'str, H: HostMut<'str>>(host: &mut H, from: BlockId, to: BlockId, arg: ValueId) {
+    let Some(term) = BlockRef::new(host.read_host(), from).iter().last() else {
         return;
     };
     let term_id = term.id;
@@ -415,21 +414,24 @@ fn append_edge_arg(ctx: &mut Context, from: BlockId, to: BlockId, arg: ValueId) 
         }
         _ => return,
     }
-    ctx.replace_instruction_mnemonic(term_id, m);
+    host.replace_instruction_mnemonic(term_id, m);
 }
 
 /// Build `index + delta` (as `index`, `index - 1`, or `index + c`) at `index`'s
 /// own width, so the arithmetic wraps exactly as the lifted address did. The
 /// `index - 1` form is emitted verbatim as a `sub` so `loop_to_scan`'s
 /// `is_decrement` recognizes it.
-fn index_plus(b: &mut Builder, index: ValueId, delta: i64) -> ValueId {
+fn index_plus<'str, 'ctx, Ctx: HostMut<'str>>(
+    b: &mut Builder<'str, 'ctx, Ctx>,
+    index: ValueId,
+    delta: i64,
+    width: usize,
+) -> ValueId {
     if delta == 0 {
         return index;
     }
-    let ty = b.context_mut().type_of(index);
-    let width = b.context_mut().types.size_of(ty);
     if delta == -1 {
-        let one = b.context_mut().get_const(1, width).id();
+        let one = b.context().get_const(1, width).id();
         return b.push_sub(index, one).id();
     }
     let mask = if width >= 8 {
@@ -437,54 +439,108 @@ fn index_plus(b: &mut Builder, index: ValueId, delta: i64) -> ValueId {
     } else {
         (1u64 << (width * 8)) - 1
     };
-    let c = b.context_mut().get_const(delta as u64 & mask, width).id();
+    let c = b.context().get_const(delta as u64 & mask, width).id();
     b.push_add(index, c).id()
-}
-
-/// A builder on `block` positioned immediately before `before`.
-fn builder_before<'str, 'a>(
-    ctx: &'a mut Context<'str>,
-    block: BlockId,
-    before: InstructionId,
-) -> Builder<'str, 'a> {
-    let mut b = Builder::from_block(BasicBlock::from_id_mut(ctx, block));
-    b.set_insert_point_before(before);
-    b
 }
 
 /// The region base pointer `base_root (+ origin_word*esz)`, pushing the offset add
 /// through `b` when the origin is nonzero.
-fn region_base(b: &mut Builder, base_root: ValueId, origin_word: i64, esz: usize) -> ValueId {
+fn region_base<'str, 'ctx, Ctx: HostMut<'str>>(
+    b: &mut Builder<'str, 'ctx, Ctx>,
+    base_root: ValueId,
+    origin_word: i64,
+    esz: usize,
+    width: usize,
+) -> ValueId {
     if origin_word == 0 {
         return base_root;
     }
-    let ty = b.context_mut().type_of(base_root);
-    let width = b.context_mut().types.size_of(ty);
     let off = b
-        .context_mut()
+        .context()
         .get_const((origin_word * esz as i64) as u64, width)
         .id();
     b.push_add(base_root, off).id()
 }
 
-/// Create a typed instruction and insert it before `block`'s first instruction
-/// (or append when the block is empty).
-fn insert_at_top(ctx: &mut Context, block: BlockId, mnemonic: Mnemonic, ty: TypeId) -> ValueId {
-    let first = BasicBlock::from_id(ctx, block).iter().next().map(|i| i.id);
-    let id = InstructionRef::from_mnemonic_with_type(ctx, block.func, mnemonic, ty).id;
-    match first {
-        Some(f) => BasicBlock::from_id_mut(ctx, block).insert_insn_before(f, id),
-        None => {
-            BasicBlock::from_id_mut(ctx, block).push_insn(id);
+/// The byte width of a value's type, routed through the host so a checked-out
+/// function's own instruction/param results are read from its owned arena rather
+/// than the (sentinel) shared registry slot.
+fn width_of<'str, H: HostMut<'str>>(host: &H, v: ValueId) -> usize {
+    let ty = match v {
+        ValueId::Instruction(iid) => {
+            qcode::value::InstructionRef::new(host.read_host(), iid).type_id()
         }
-    }
+        ValueId::BlockParam(pid) => host.read_host().block_param(pid).type_id,
+        other => host
+            .shared()
+            .stored_type_of(other)
+            .expect("value has a stored type"),
+    };
+    host.shared().types.size_of(ty)
+}
+
+/// Push an `index_plus(index, delta)` value into `block` before `before`, through
+/// a checkout-safe builder (const/add/sub only). Returns the index value.
+fn make_index<'str, H: HostMut<'str>>(
+    host: &mut H,
+    block: BlockId,
+    before: InstructionId,
+    index: ValueId,
+    delta: i64,
+) -> ValueId {
+    let width = width_of(host, index);
+    let mut b = Builder::from_block(BaseRef::new(host.reborrow_host(), block));
+    b.set_insert_point_before(before);
+    let v = index_plus(&mut b, index, delta, width);
+    unsafe { b.dont_finalize() };
+    v
+}
+
+/// Create a typed instruction with `mnemonic` and splice it before `before` in
+/// `block` (avoids the Builder's `context_mut` type-mint path).
+fn insert_before<'str, H: HostMut<'str>>(
+    host: &mut H,
+    block: BlockId,
+    before: InstructionId,
+    mnemonic: Mnemonic,
+    ty: TypeId,
+) -> ValueId {
+    let id = host.push_mnemonic_with_type(block.func, mnemonic, ty);
+    host.insert_insn_before(block, before, id);
     ValueId::Instruction(id)
 }
 
-fn apply(ctx: &mut Context, m: &PromoteMatch) -> bool {
+/// Create a typed instruction and insert it before `block`'s first instruction.
+/// The preheader always ends in a `goto header`, so it is never empty here.
+fn insert_at_top<'str, H: HostMut<'str>>(
+    host: &mut H,
+    block: BlockId,
+    mnemonic: Mnemonic,
+    ty: TypeId,
+) -> ValueId {
+    let first = BlockRef::new(host.read_host(), block)
+        .iter()
+        .next()
+        .expect("preheader has a terminator")
+        .id;
+    let id = host.push_mnemonic_with_type(block.func, mnemonic, ty);
+    host.insert_insn_before(block, first, id);
+    ValueId::Instruction(id)
+}
+
+/// The last instruction id of `block`.
+fn last_insn<'str, H: HostMut<'str>>(host: &H, block: BlockId) -> InstructionId {
+    BlockRef::new(host.read_host(), block)
+        .iter()
+        .last()
+        .unwrap()
+        .id
+}
+
+fn apply<'str, H: HostMut<'str>>(host: &mut H, m: &PromoteMatch) -> bool {
     let esz = m.elem_size;
-    let elem_ty = ctx.types.get_or_make_int(esz);
-    let arr_ty = ctx.types.get_or_make_array(elem_ty, m.count);
+    let elem_ty = host.shared().types.get_or_make_int(esz);
+    let arr_ty = host.shared().types.get_or_make_array(elem_ty, m.count);
     let arr_sz = m.count * esz;
 
     let insert_id = IntrinsicId::from_name("insert").expect("insert registered");
@@ -492,35 +548,49 @@ fn apply(ctx: &mut Context, m: &PromoteMatch) -> bool {
 
     // New carried-array params (pushed last so appended edge args line up). In the
     // rotated shape the header *is* the body, so they share one param.
-    let new_param = |ctx: &mut Context, bid: BlockId| {
-        let pid = BasicBlock::from_id_mut(ctx, bid).push_param(arr_sz).id;
-        ctx.values.block_param_mut(pid).type_id = arr_ty;
+    // Push a fresh array-typed param onto `bid` (host-routed mirror of
+    // `BasicBlock::push_param` followed by the original's `type_id = arr_ty`).
+    let new_param = |host: &mut H, bid: BlockId| {
+        let index = host.read_host().block(bid).params.len();
+        let pid = host.push_block_param(
+            bid.func,
+            qcode::value::block_param::BlockParam {
+                index,
+                type_id: arr_ty,
+                parent: Some(bid),
+                name: None,
+                origin: None,
+                protected: false,
+            },
+        );
+        host.block_mut(bid).params.push(pid);
         ValueId::BlockParam(pid)
     };
-    let arr_h = new_param(ctx, m.header);
+    let arr_h = new_param(host, m.header);
     let arr_b = if m.rotated {
         arr_h
     } else {
-        new_param(ctx, m.body)
+        new_param(host, m.body)
     };
-    let arr_e = new_param(ctx, m.exit);
+    let arr_e = new_param(host, m.exit);
 
     // Snapshot at the *end* of the preheader — after every preheader store, so the
     // carried array starts from the region's fully-initialized contents — when any
     // original lane is read; else a symbolic zero splat (no new observable read).
     let arr0 = if m.reads_original {
-        let term_id = BasicBlock::from_id(ctx, m.preheader)
-            .iter()
-            .last()
-            .unwrap()
-            .id;
+        let term_id = last_insn(host, m.preheader);
+        let base_width = width_of(host, m.base_root);
         let dst = {
-            let mut b = builder_before(ctx, m.preheader, term_id);
-            region_base(&mut b, m.base_root, m.origin_word, esz)
+            let mut b = Builder::from_block(BaseRef::new(host.reborrow_host(), m.preheader));
+            b.set_insert_point_before(term_id);
+            let dst = region_base(&mut b, m.base_root, m.origin_word, esz, base_width);
+            unsafe { b.dont_finalize() };
+            dst
         };
-        let ld = InstructionRef::from_mnemonic_with_type(
-            ctx,
-            m.preheader.func,
+        insert_before(
+            host,
+            m.preheader,
+            term_id,
             Mnemonic::Load(Load {
                 space: m.region_space,
                 ptr: dst,
@@ -528,15 +598,12 @@ fn apply(ctx: &mut Context, m: &PromoteMatch) -> bool {
             }),
             arr_ty,
         )
-        .id;
-        BasicBlock::from_id_mut(ctx, m.preheader).insert_insn_before(term_id, ld);
-        ValueId::Instruction(ld)
     } else {
         let splat_id = IntrinsicId::from_name("splat").expect("splat registered");
-        let zero_elem = ctx.get_const(0, esz).id();
-        let count_const = ctx.get_const(m.count as u64, 8).id();
+        let zero_elem = host.shared().get_const(0, esz).id();
+        let count_const = host.shared().get_const(m.count as u64, 8).id();
         insert_at_top(
-            ctx,
+            host,
             m.preheader,
             Mnemonic::Intrinsic(IntrinsicApp {
                 id: splat_id,
@@ -549,103 +616,138 @@ fn apply(ctx: &mut Context, m: &PromoteMatch) -> bool {
     // Seed: arr1 = insert(arr0, 0, seed_val) before the preheader terminator, else arr0.
     let arr1 = match &m.seed {
         Some(seed) => {
-            let term_id = BasicBlock::from_id(ctx, m.preheader)
-                .iter()
-                .last()
-                .unwrap()
-                .id;
-            let mut b = builder_before(ctx, m.preheader, term_id);
-            let idx0 = b.context_mut().get_const(0, 8).id();
-            b.push_intrinsic(insert_id, vec![arr0, idx0, seed.val]).id()
+            let term_id = last_insn(host, m.preheader);
+            let idx0 = host.shared().get_const(0, 8).id();
+            insert_before(
+                host,
+                m.preheader,
+                term_id,
+                Mnemonic::Intrinsic(IntrinsicApp {
+                    id: insert_id,
+                    args: vec![arr0, idx0, seed.val],
+                }),
+                arr_ty,
+            )
         }
         None => arr0,
     };
 
     // Body reads: each region load at `index+od` becomes `at(arr_b, index+od)`.
     for &(load_id, od) in &m.region_reads {
-        let at_val = {
-            let mut b = builder_before(ctx, m.body, load_id);
-            let idx = index_plus(&mut b, m.index, od);
-            b.push_intrinsic(at_id, vec![arr_b, idx]).id()
-        };
-        ctx.replace_all_uses_with(ValueId::Instruction(load_id), at_val);
-        ctx.remove_instruction(load_id);
+        let idx = make_index(host, m.body, load_id, m.index, od);
+        let at_val = insert_before(
+            host,
+            m.body,
+            load_id,
+            Mnemonic::Intrinsic(IntrinsicApp {
+                id: at_id,
+                args: vec![arr_b, idx],
+            }),
+            elem_ty,
+        );
+        host.replace_all_uses_with(ValueId::Instruction(load_id), at_val);
+        host.remove_instruction(load_id);
     }
 
     // Body write: arr_next = insert(arr_b, index+store_delta, stored_val), before the branch.
     let arr_next = {
-        let term_id = BasicBlock::from_id(ctx, m.body).iter().last().unwrap().id;
-        let mut b = builder_before(ctx, m.body, term_id);
-        let idx = index_plus(&mut b, m.index, m.store_delta);
-        b.push_intrinsic(insert_id, vec![arr_b, idx, m.stored_val])
-            .id()
+        let term_id = last_insn(host, m.body);
+        let idx = make_index(host, m.body, term_id, m.index, m.store_delta);
+        insert_before(
+            host,
+            m.body,
+            term_id,
+            Mnemonic::Intrinsic(IntrinsicApp {
+                id: insert_id,
+                args: vec![arr_b, idx, m.stored_val],
+            }),
+            arr_ty,
+        )
     };
 
     // Exit const reads: rewrite to `at(arr_e, element)`.
     for &(load_id, elem) in &m.extra_loads {
-        let at_val = {
-            let mut b = builder_before(ctx, m.exit, load_id);
-            let idx = b.context_mut().get_const(elem as u64, 8).id();
-            b.push_intrinsic(at_id, vec![arr_e, idx]).id()
-        };
-        ctx.replace_all_uses_with(ValueId::Instruction(load_id), at_val);
-        ctx.remove_instruction(load_id);
+        let idx = host.shared().get_const(elem as u64, 8).id();
+        let at_val = insert_before(
+            host,
+            m.exit,
+            load_id,
+            Mnemonic::Intrinsic(IntrinsicApp {
+                id: at_id,
+                args: vec![arr_e, idx],
+            }),
+            elem_ty,
+        );
+        host.replace_all_uses_with(ValueId::Instruction(load_id), at_val);
+        host.remove_instruction(load_id);
     }
 
     // Exit write-back: store(region, base(+origin) <- arr_e) at the *top* of the exit
     // block, so any whole-region exit load left in place reads the promoted result.
     {
-        let first_id = BasicBlock::from_id(ctx, m.exit).iter().next().unwrap().id;
-        let mut b = builder_before(ctx, m.exit, first_id);
-        let dst = region_base(&mut b, m.base_root, m.origin_word, esz);
+        let first_id = BlockRef::new(host.read_host(), m.exit)
+            .iter()
+            .next()
+            .unwrap()
+            .id;
+        let base_width = width_of(host, m.base_root);
+        let mut b = Builder::from_block(BaseRef::new(host.reborrow_host(), m.exit));
+        b.set_insert_point_before(first_id);
+        let dst = region_base(&mut b, m.base_root, m.origin_word, esz, base_width);
         b.push_store(arr_e, dst, m.region_space);
+        unsafe { b.dont_finalize() };
     }
 
     // Drop the now-dead memory traffic. (Region loads were removed inline above.)
-    ctx.remove_instruction(m.lane_store_id);
+    host.remove_instruction(m.lane_store_id);
     if let Some(seed) = &m.seed {
-        ctx.remove_instruction(seed.id);
+        host.remove_instruction(seed.id);
     }
 
     // Thread the carried array through every loop edge.
-    append_edge_arg(ctx, m.preheader, m.header, arr1);
-    append_edge_arg(ctx, m.body, m.header, arr_next);
+    append_edge_arg(host, m.preheader, m.header, arr1);
+    append_edge_arg(host, m.body, m.header, arr_next);
     if !m.rotated {
-        append_edge_arg(ctx, m.header, m.body, arr_h);
+        append_edge_arg(host, m.header, m.body, arr_h);
     }
-    append_edge_arg(ctx, m.header, m.exit, arr_h);
+    append_edge_arg(host, m.header, m.exit, arr_h);
 
     true
 }
 
-impl FunctionPass for ArrayPromote {
+use crate::{FunctionBody, FunctionPassV2, ModuleView};
+
+impl FunctionPassV2 for ArrayPromote {
     const NAME: &'static str = "array_promote";
 
     fn description(&self) -> &'static str {
         "Promote in-place strided RAM array-fill loops to a value-carried array (insert/at)"
     }
 
-    fn run(
+    fn run<'str>(
         &self,
-        ctx: &mut Context,
-        fun_id: FunctionId,
-        _env: &PipelineEnv,
+        m: &ModuleView<'_, 'str>,
+        f: &mut FunctionBody<'str>,
     ) -> Result<bool, String> {
-        match try_match(ctx, fun_id) {
-            Some(m) => Ok(apply(ctx, &m)),
+        let fid = f.id();
+        let mut host = f.host(m);
+        match try_match(host.read_host(), fid) {
+            Some(matched) => Ok(apply(&mut host, &matched)),
             None => Ok(false),
         }
     }
 }
 
-crate::register_function_pass!(ArrayPromote);
+crate::register_function_pass_v2!(ArrayPromote);
 
 #[cfg(test)]
 mod tests {
     use qcode_macro::qcode;
 
     use super::*;
-    use crate::test_util::run_function_pass;
+    use crate::test_util::run_function_pass_v2;
+    use qcode::context::Context;
+    use qcode::value::{BasicBlock, Function};
 
     // A seeded, memory-carried strided fill: `out[0] = seed`, `out[i] =
     // out[i-1] + i` reloading the previous lane. The reload is a *carry* read
@@ -680,7 +782,7 @@ mod tests {
                 return at i64 0x0;
             "
         );
-        let changed = run_function_pass::<ArrayPromote>(&mut ctx, fill).unwrap();
+        let changed = run_function_pass_v2::<ArrayPromote>(&mut ctx, fill).unwrap();
         assert!(changed, "the memory-carried fill should be recognized");
         let ir = format!("{}", Function::from_id(&ctx, fill));
         assert!(ir.contains("$at("), "lane load should become at(): {ir}");
@@ -729,7 +831,7 @@ mod tests {
                 return at i64 0x0;
             "
         );
-        let changed = run_function_pass::<ArrayPromote>(&mut ctx, reg_rot).unwrap();
+        let changed = run_function_pass_v2::<ArrayPromote>(&mut ctx, reg_rot).unwrap();
         let ir = format!("{}", Function::from_id(&ctx, reg_rot));
         assert!(
             changed,
@@ -773,7 +875,7 @@ mod tests {
                 return at i64 0x0;
             "
         );
-        let changed = run_function_pass::<ArrayPromote>(&mut ctx, reg_split).unwrap();
+        let changed = run_function_pass_v2::<ArrayPromote>(&mut ctx, reg_split).unwrap();
         let ir = format!("{}", Function::from_id(&ctx, reg_split));
         assert!(
             changed,
@@ -814,7 +916,7 @@ mod tests {
                 return at i64 0x0;
             "
         );
-        let changed = run_function_pass::<ArrayPromote>(&mut ctx, generate).unwrap();
+        let changed = run_function_pass_v2::<ArrayPromote>(&mut ctx, generate).unwrap();
         let ir = format!("{}", Function::from_id(&ctx, generate));
         assert!(changed, "a write-only generated fill should promote: {ir}");
         assert!(
@@ -860,7 +962,7 @@ mod tests {
                 return at i64 0x0;
             "
         );
-        let changed = run_function_pass::<ArrayPromote>(&mut ctx, mix).unwrap();
+        let changed = run_function_pass_v2::<ArrayPromote>(&mut ctx, mix).unwrap();
         let ir = format!("{}", Function::from_id(&ctx, mix));
         assert!(changed, "the enveloped byte fill should promote: {ir}");
         assert!(ir.contains("$at("), "lane load becomes at(): {ir}");
@@ -912,7 +1014,7 @@ mod tests {
                 return at i64 %r;
             "
         );
-        let changed = run_function_pass::<ArrayPromote>(&mut ctx, mix).unwrap();
+        let changed = run_function_pass_v2::<ArrayPromote>(&mut ctx, mix).unwrap();
         let ir = format!("{}", Function::from_id(&ctx, mix));
         assert!(changed, "should promote: {ir}");
         assert!(
@@ -961,7 +1063,7 @@ mod tests {
                 return at i64 0x0;
             "
         );
-        let changed = run_function_pass::<ArrayPromote>(&mut ctx, f).unwrap();
+        let changed = run_function_pass_v2::<ArrayPromote>(&mut ctx, f).unwrap();
         let ir = format!("{}", Function::from_id(&ctx, f));
         assert!(changed, "header-carried byte fill should promote: {ir}");
         assert!(ir.contains("$at("), "lane load becomes at(): {ir}");
@@ -1003,7 +1105,7 @@ mod tests {
                 return at i64 0x0;
             "
         );
-        let changed = run_function_pass::<ArrayPromote>(&mut ctx, f).unwrap();
+        let changed = run_function_pass_v2::<ArrayPromote>(&mut ctx, f).unwrap();
         let ir = format!("{}", Function::from_id(&ctx, f));
         assert!(
             changed,
@@ -1047,7 +1149,7 @@ mod tests {
                 return at i64 0x0;
             "
         );
-        let changed = run_function_pass::<ArrayPromote>(&mut ctx, mix).unwrap();
+        let changed = run_function_pass_v2::<ArrayPromote>(&mut ctx, mix).unwrap();
         let ir = format!("{}", Function::from_id(&ctx, mix));
         assert!(changed, "a partial pre-loop store should not block: {ir}");
         assert!(ir.contains("$insert("), "lane store becomes insert(): {ir}");
@@ -1081,7 +1183,7 @@ mod tests {
                 return at i64 0x0;
             "
         );
-        let changed = run_function_pass::<ArrayPromote>(&mut ctx, mix).unwrap();
+        let changed = run_function_pass_v2::<ArrayPromote>(&mut ctx, mix).unwrap();
         assert!(
             !changed,
             "a whole-region store in the body must block promotion"
@@ -1118,9 +1220,9 @@ mod tests {
                 return at i64 0x0;
             "
         );
-        assert!(run_function_pass::<ArrayPromote>(&mut ctx, fill).unwrap());
+        assert!(run_function_pass_v2::<ArrayPromote>(&mut ctx, fill).unwrap());
         assert!(
-            !run_function_pass::<ArrayPromote>(&mut ctx, fill).unwrap(),
+            !run_function_pass_v2::<ArrayPromote>(&mut ctx, fill).unwrap(),
             "second run should find nothing to promote"
         );
     }
@@ -1160,7 +1262,7 @@ mod tests {
             "
         );
         assert!(
-            run_function_pass::<ArrayPromote>(&mut ctx, reads_orig).unwrap(),
+            run_function_pass_v2::<ArrayPromote>(&mut ctx, reads_orig).unwrap(),
             "an original-lane read should promote via an original init"
         );
         let ir = format!("{}", Function::from_id(&ctx, reads_orig));
@@ -1207,7 +1309,7 @@ mod tests {
             "
         );
         assert!(
-            run_function_pass::<ArrayPromote>(&mut ctx, reads_enum).unwrap(),
+            run_function_pass_v2::<ArrayPromote>(&mut ctx, reads_enum).unwrap(),
             "a seedless indexed map over the original array should promote"
         );
         let ir = format!("{}", Function::from_id(&ctx, reads_enum));
@@ -1258,7 +1360,7 @@ mod tests {
                 return at i64 0x0;
             "
         );
-        assert!(run_function_pass::<ArrayPromote>(&mut ctx, shared).unwrap());
+        assert!(run_function_pass_v2::<ArrayPromote>(&mut ctx, shared).unwrap());
         // Count array-typed params reaching the body: exactly one carried array.
         let body = Function::from_id(&ctx, shared)
             .iter()
@@ -1310,7 +1412,7 @@ mod tests {
         // A single lane store, then an own-lane load *after* it: the load no longer
         // observes the original value, so the program-order check declines.
         assert!(
-            !run_function_pass::<ArrayPromote>(&mut ctx, after).unwrap(),
+            !run_function_pass_v2::<ArrayPromote>(&mut ctx, after).unwrap(),
             "an own-lane read after the lane store must not promote"
         );
     }

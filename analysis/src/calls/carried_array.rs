@@ -71,7 +71,7 @@ pub(crate) fn find_carried_array(ctx: &mut Context, fid: FunctionId) -> Option<C
             if count == 0 {
                 continue;
             }
-            let Some(k) = param_pos(ctx, header, arr_h) else {
+            let Some(k) = param_pos(&*ctx, header, arr_h) else {
                 continue;
             };
             let incs = incoming(&*ctx, header, k);
@@ -114,7 +114,7 @@ pub(crate) fn find_carried_array(ctx: &mut Context, fid: FunctionId) -> Option<C
                             break;
                         };
                         carry = Some((arr0, val, idx, insert_block));
-                    } else if literal(ctx, idx) == Some(0) {
+                    } else if literal(&*ctx, idx) == Some(0) {
                         if seed.is_some() || init.is_some() {
                             ok = false;
                             break;
@@ -148,7 +148,7 @@ pub(crate) fn find_carried_array(ctx: &mut Context, fid: FunctionId) -> Option<C
             // carry's header (header-carried — the shape redundant-φ elimination
             // leaves). Consumers compare both by `ValueId`, never by parent.
             let param_of_loop = |v: ValueId| {
-                let p = param_parent(ctx, v);
+                let p = param_parent(&*ctx, v);
                 p == Some(body) || p == Some(header)
             };
             if !param_of_loop(arr_b) {
@@ -164,7 +164,7 @@ pub(crate) fn find_carried_array(ctx: &mut Context, fid: FunctionId) -> Option<C
             if !is_back_edge {
                 continue;
             }
-            if param_parent(ctx, arr_h) != Some(header) {
+            if param_parent(&*ctx, arr_h) != Some(header) {
                 continue;
             }
 
@@ -216,7 +216,7 @@ pub(crate) fn classify_body_reads(ctx: &mut Context, ca: &CarriedArray) -> Optio
     let mut prev = None;
     let mut own = None;
     for (id, e_idx) in arr_b_ats {
-        if is_decrement(ctx, e_idx, ca.index, idx_width) {
+        if is_decrement(&*ctx, e_idx, ca.index, idx_width) {
             if prev.is_some() {
                 return None;
             }
@@ -257,7 +257,7 @@ mod tests {
 
     use super::*;
     use crate::mem::array_promote::ArrayPromote;
-    use crate::test_util::run_function_pass;
+    use crate::test_util::run_function_pass_v2;
 
     // Reuse ArrayPromote to *produce* the promoted single-array shape from the
     // prefix-sum IR, so the matcher is tested against the exact IR array_promote
@@ -293,7 +293,7 @@ mod tests {
             "
         );
         assert!(
-            run_function_pass::<ArrayPromote>(&mut ctx, prefix).unwrap(),
+            run_function_pass_v2::<ArrayPromote>(&mut ctx, prefix).unwrap(),
             "array_promote should promote the prefix sum"
         );
         let ca = find_carried_array(&mut ctx, prefix).expect("carried array found");
@@ -332,7 +332,7 @@ mod tests {
             "
         );
         assert!(
-            run_function_pass::<ArrayPromote>(ctx, xorbuf).unwrap(),
+            run_function_pass_v2::<ArrayPromote>(ctx, xorbuf).unwrap(),
             "the header-carried fill should promote"
         );
         xorbuf
@@ -418,7 +418,7 @@ mod tests {
                 return at i64 0x0;
             "
         );
-        assert!(run_function_pass::<ArrayPromote>(&mut ctx, reg_rot).unwrap());
+        assert!(run_function_pass_v2::<ArrayPromote>(&mut ctx, reg_rot).unwrap());
         let ca = find_carried_array(&mut ctx, reg_rot).expect("rotated carry matches");
         assert_eq!(ca.header, ca.body, "rotated: the body is its own header");
         assert_eq!(param_parent(&ctx, ca.index), Some(ca.body));

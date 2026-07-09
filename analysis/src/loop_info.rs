@@ -21,7 +21,7 @@ use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
 use qcode::{
     context::Context,
     value::{
-        BasicBlock, BlockId, BlockRef, Function, FunctionId, FunctionRef, ValueId, ValueRef,
+        BasicBlock, BlockId, BlockRef, FunctionId, FunctionRef, ValueId,
         insn::{Binary, Binop, Branch, CBranch, IntBinop, Mnemonic},
         util::base_ref::HostRef,
     },
@@ -32,33 +32,45 @@ use qcode::{
 // ===========================================================================
 
 /// `c` if `v` is the integer literal `c`, else `None`.
-pub(crate) fn literal(ctx: &Context, v: ValueId) -> Option<u64> {
-    match ValueRef::new(v, ctx) {
-        ValueRef::Literal(l) => Some(l.value()),
+pub(crate) fn literal<'a, 'str: 'a>(host: impl Into<HostRef<'a, 'str>>, v: ValueId) -> Option<u64> {
+    let host = host.into();
+    match v {
+        ValueId::Literal(lid) => Some(host.shared().values.literals[lid].value),
         _ => None,
     }
 }
 
 /// `true` if `v` is `idx + 1` (either operand order) — a unit step of `idx`.
-pub(crate) fn is_increment(ctx: &Context, v: ValueId, idx: ValueId) -> bool {
+pub(crate) fn is_increment<'a, 'str: 'a>(
+    host: impl Into<HostRef<'a, 'str>>,
+    v: ValueId,
+    idx: ValueId,
+) -> bool {
+    let host = host.into();
     let ValueId::Instruction(id) = v else {
         return false;
     };
-    let Mnemonic::Binop(Binary { lhs, rhs, op }) = ctx.get_insn(id).mnemonic() else {
+    let Mnemonic::Binop(Binary { lhs, rhs, op }) = host.instruction(id).mnemonic() else {
         return false;
     };
-    let one = |x: ValueId| literal(ctx, x) == Some(1);
+    let one = |x: ValueId| literal(host, x) == Some(1);
     matches!(op, Binop::Int(IntBinop::Add))
         && ((*lhs == idx && one(*rhs)) || (*rhs == idx && one(*lhs)))
 }
 
 /// `true` if `v` is `idx - 1`, expressed either as `idx - 1` or as `idx + (-1)`
 /// (the wrapping representation `array_promote` emits for a back-index).
-pub(crate) fn is_decrement(ctx: &Context, v: ValueId, idx: ValueId, idx_width: usize) -> bool {
+pub(crate) fn is_decrement<'a, 'str: 'a>(
+    host: impl Into<HostRef<'a, 'str>>,
+    v: ValueId,
+    idx: ValueId,
+    idx_width: usize,
+) -> bool {
+    let host = host.into();
     let ValueId::Instruction(id) = v else {
         return false;
     };
-    let Mnemonic::Binop(Binary { lhs, rhs, op }) = ctx.get_insn(id).mnemonic() else {
+    let Mnemonic::Binop(Binary { lhs, rhs, op }) = host.instruction(id).mnemonic() else {
         return false;
     };
     let (lhs, rhs, op) = (*lhs, *rhs, *op);
@@ -68,28 +80,35 @@ pub(crate) fn is_decrement(ctx: &Context, v: ValueId, idx: ValueId, idx_width: u
         (1u64 << (idx_width * 8)) - 1
     };
     match op {
-        Binop::Int(IntBinop::Sub) => lhs == idx && literal(ctx, rhs) == Some(1),
+        Binop::Int(IntBinop::Sub) => lhs == idx && literal(host, rhs) == Some(1),
         Binop::Int(IntBinop::Add) => {
-            (lhs == idx && literal(ctx, rhs) == Some(neg_one))
-                || (rhs == idx && literal(ctx, lhs) == Some(neg_one))
+            (lhs == idx && literal(host, rhs) == Some(neg_one))
+                || (rhs == idx && literal(host, lhs) == Some(neg_one))
         }
         _ => false,
     }
 }
 
 /// Index of block-param `p` within `block`'s parameter list.
-pub(crate) fn param_pos(ctx: &Context, block: BlockId, p: ValueId) -> Option<usize> {
-    BasicBlock::from_id(ctx, block)
+pub(crate) fn param_pos<'a, 'str: 'a>(
+    host: impl Into<HostRef<'a, 'str>>,
+    block: BlockId,
+    p: ValueId,
+) -> Option<usize> {
+    BlockRef::new(host.into(), block)
         .params()
         .position(|q| q.id() == p)
 }
 
 /// Parent block of a block-param value (`None` if `v` is not a block param).
-pub(crate) fn param_parent(ctx: &Context, v: ValueId) -> Option<BlockId> {
+pub(crate) fn param_parent<'a, 'str: 'a>(
+    host: impl Into<HostRef<'a, 'str>>,
+    v: ValueId,
+) -> Option<BlockId> {
     let ValueId::BlockParam(pid) = v else {
         return None;
     };
-    ctx.values.block_param(pid).parent
+    host.into().block_param(pid).parent
 }
 
 /// Values feeding block-param index `k` of `block` from every predecessor edge.
@@ -315,8 +334,12 @@ pub struct Induction {
 }
 
 /// Recognize every canonical counted loop in `fid`.
-pub fn recognize_loops(ctx: &Context, fid: FunctionId) -> Vec<NaturalLoop> {
-    let function = Function::from_id(ctx, fid);
+pub fn recognize_loops<'a, 'str: 'a>(
+    host: impl Into<HostRef<'a, 'str>>,
+    fid: FunctionId,
+) -> Vec<NaturalLoop> {
+    let host = host.into();
+    let function = FunctionRef::new(host, fid);
     let Some(root) = function.root().map(|b| b.id) else {
         return Vec::new();
     };
@@ -325,7 +348,7 @@ pub fn recognize_loops(ctx: &Context, fid: FunctionId) -> Vec<NaturalLoop> {
 
     let mut loops = Vec::new();
     for &latch in &block_ids {
-        let succs: Vec<BlockId> = BasicBlock::from_id(ctx, latch)
+        let succs: Vec<BlockId> = BlockRef::new(host, latch)
             .successors()
             .map(|(_, s)| s)
             .collect();
@@ -333,7 +356,7 @@ pub fn recognize_loops(ctx: &Context, fid: FunctionId) -> Vec<NaturalLoop> {
             if !doms.dominates(header, latch) {
                 continue;
             }
-            if let Some(l) = build_loop(ctx, latch, header) {
+            if let Some(l) = build_loop(host, latch, header) {
                 loops.push(l);
             }
         }
@@ -343,7 +366,7 @@ pub fn recognize_loops(ctx: &Context, fid: FunctionId) -> Vec<NaturalLoop> {
 
 /// Build the [`NaturalLoop`] for a back-edge `latch -> header`, or `None` if it is
 /// not the canonical single-body counted shape.
-fn build_loop(ctx: &Context, latch: BlockId, header: BlockId) -> Option<NaturalLoop> {
+fn build_loop(host: HostRef, latch: BlockId, header: BlockId) -> Option<NaturalLoop> {
     // The natural loop: header + every block reaching the latch without going
     // *through* the header. In the rotated self-loop (`latch == header`) that is
     // just the header itself — the walk must not step back into the header's own
@@ -355,7 +378,7 @@ fn build_loop(ctx: &Context, latch: BlockId, header: BlockId) -> Option<NaturalL
         worklist.push(latch);
     }
     while let Some(block) = worklist.pop() {
-        for (_, pred) in BasicBlock::from_id(ctx, block).predecessors() {
+        for (_, pred) in BlockRef::new(host, block).predecessors() {
             if pred != header && nodes.insert(pred) {
                 worklist.push(pred);
             }
@@ -369,7 +392,7 @@ fn build_loop(ctx: &Context, latch: BlockId, header: BlockId) -> Option<NaturalL
     }
     // Unique preheader: the single out-of-loop predecessor of the header.
     let preheader = {
-        let out_of_loop: Vec<BlockId> = BasicBlock::from_id(ctx, header)
+        let out_of_loop: Vec<BlockId> = BlockRef::new(host, header)
             .predecessors()
             .map(|(_, p)| p)
             .filter(|p| !nodes.contains(p))
@@ -379,11 +402,11 @@ fn build_loop(ctx: &Context, latch: BlockId, header: BlockId) -> Option<NaturalL
         };
         p
     };
-    if !ends_with_goto(ctx, preheader, header) {
+    if !ends_with_goto(host, preheader, header) {
         return None;
     }
     // The guard lives on the header; its non-loop successor is the exit.
-    let hterm = BasicBlock::from_id(ctx, header).iter().last()?;
+    let hterm = BlockRef::new(host, header).iter().last()?;
     let Mnemonic::CBranch(cb) = hterm.mnemonic() else {
         return None;
     };
@@ -394,11 +417,11 @@ fn build_loop(ctx: &Context, latch: BlockId, header: BlockId) -> Option<NaturalL
         _ => return None,
     };
     // The split-shape body must end in `goto header`.
-    if !rotated && !ends_with_goto(ctx, latch, header) {
+    if !rotated && !ends_with_goto(host, latch, header) {
         return None;
     }
     // The exit must be entered only from the guard (header).
-    let exit_preds: Vec<BlockId> = BasicBlock::from_id(ctx, exit)
+    let exit_preds: Vec<BlockId> = BlockRef::new(host, exit)
         .predecessors()
         .map(|(_, p)| p)
         .collect();
@@ -416,9 +439,9 @@ fn build_loop(ctx: &Context, latch: BlockId, header: BlockId) -> Option<NaturalL
 }
 
 /// `true` if `block`'s terminator is `goto target` (an unconditional branch).
-fn ends_with_goto(ctx: &Context, block: BlockId, target: BlockId) -> bool {
+fn ends_with_goto(host: HostRef, block: BlockId, target: BlockId) -> bool {
     matches!(
-        BasicBlock::from_id(ctx, block).iter().last().map(|t| t.mnemonic()),
+        BlockRef::new(host, block).iter().last().map(|t| t.mnemonic()),
         Some(Mnemonic::Branch(b)) if b.target == target
     )
 }
@@ -459,8 +482,13 @@ impl NaturalLoop {
     ///   tests that header param.
     ///
     /// The trip bound `N` comes from the header guard.
-    pub fn unit_induction(&self, ctx: &Context, var: ValueId) -> Option<Induction> {
-        let parent = param_parent(ctx, var)?;
+    pub fn unit_induction<'a, 'str: 'a>(
+        &self,
+        host: impl Into<HostRef<'a, 'str>>,
+        var: ValueId,
+    ) -> Option<Induction> {
+        let host = host.into();
+        let parent = param_parent(host, var)?;
         // Resolve the feed set (init + increment), the value the guard compares,
         // and whether it compares the plain index or the incremented one.
         let (feeds, guard_key, guard_uses_inc) = if self.rotated {
@@ -468,30 +496,33 @@ impl NaturalLoop {
             if parent != self.header {
                 return None;
             }
-            let k = param_pos(ctx, self.header, var)?;
-            (incoming(ctx, self.header, k), var, true)
+            let k = param_pos(host, self.header, var)?;
+            (incoming(host, self.header, k), var, true)
         } else if parent == self.header {
             // Split loop whose body reads the header induction param directly.
-            let k = param_pos(ctx, self.header, var)?;
-            (incoming(ctx, self.header, k), var, false)
+            let k = param_pos(host, self.header, var)?;
+            (incoming(host, self.header, k), var, false)
         } else if parent == self.body {
             // Split loop where `var` is a body param copying a header param.
-            let [hp] = incoming(ctx, self.body, param_pos(ctx, self.body, var)?)[..] else {
+            let [hp] = incoming(host, self.body, param_pos(host, self.body, var)?)[..] else {
                 return None;
             };
-            if param_parent(ctx, hp) != Some(self.header) {
+            if param_parent(host, hp) != Some(self.header) {
                 return None;
             }
-            let kh = param_pos(ctx, self.header, hp)?;
-            (incoming(ctx, self.header, kh), hp, false)
+            let kh = param_pos(host, self.header, hp)?;
+            (incoming(host, self.header, kh), hp, false)
         } else {
             return None;
         };
-        let inc = feeds.iter().copied().find(|&v| is_increment(ctx, v, var))?;
+        let inc = feeds
+            .iter()
+            .copied()
+            .find(|&v| is_increment(host, v, var))?;
         let inits: Vec<i64> = feeds
             .iter()
             .filter(|&&v| v != inc)
-            .filter_map(|&v| literal(ctx, v).map(|x| x as i64))
+            .filter_map(|&v| literal(host, v).map(|x| x as i64))
             .collect();
         let [start] = inits[..] else {
             return None;
@@ -499,9 +530,9 @@ impl NaturalLoop {
         // Rotated guards compare the *incremented* index (`i+1`) since the body has
         // already run at `i`; split guards compare the header param itself.
         let count = if guard_uses_inc {
-            self.guard_bound(ctx, inc)?
+            self.guard_bound(host, inc)?
         } else {
-            self.guard_bound(ctx, guard_key)?
+            self.guard_bound(host, guard_key)?
         };
         Some(Induction { var, start, count })
     }
@@ -509,8 +540,8 @@ impl NaturalLoop {
     /// The trip bound `N` from the header guard `key <cmp> N`. Accepts the two
     /// canonical polarities: `key == N` exiting the loop on true, or `key < N`
     /// (unsigned/signed) continuing on true.
-    fn guard_bound(&self, ctx: &Context, key: ValueId) -> Option<i64> {
-        let hterm = BasicBlock::from_id(ctx, self.header).iter().last()?;
+    fn guard_bound(&self, host: HostRef, key: ValueId) -> Option<i64> {
+        let hterm = BlockRef::new(host, self.header).iter().last()?;
         let Mnemonic::CBranch(cb) = hterm.mnemonic() else {
             return None;
         };
@@ -518,7 +549,7 @@ impl NaturalLoop {
         let ValueId::Instruction(id) = cb.condition else {
             return None;
         };
-        let Mnemonic::Binop(Binary { lhs, rhs, op }) = ctx.get_insn(id).mnemonic() else {
+        let Mnemonic::Binop(Binary { lhs, rhs, op }) = host.instruction(id).mnemonic() else {
             return None;
         };
         let konst = if *lhs == key {
@@ -536,7 +567,7 @@ impl NaturalLoop {
         if !ok {
             return None;
         }
-        Some(literal(ctx, konst)? as i64)
+        Some(literal(host, konst)? as i64)
     }
 }
 

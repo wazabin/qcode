@@ -119,10 +119,10 @@ fn try_match(ctx: &mut Context, fid: FunctionId) -> Option<MapMatch> {
     // which accepts both split-loop index shapes (body-copied and header-carried)
     // so this recognizer never learns the difference. Its trip bound comes from
     // the guard; it must agree with the coverage proof's lane count.
-    let lp = recognize_loops(ctx, fid)
+    let lp = recognize_loops(&*ctx, fid)
         .into_iter()
         .find(|l| l.header == ca.header && l.body == ca.body)?;
-    let ind = lp.unit_induction(ctx, ca.index)?;
+    let ind = lp.unit_induction(&*ctx, ca.index)?;
     if ind.start != 0 {
         return None; // v1 maps tile [0, N) from index 0
     }
@@ -302,7 +302,7 @@ fn apply(ctx: &mut Context, fid: FunctionId, m: &MapMatch) -> bool {
         .collect::<Vec<_>>()
         .into_iter()
         .map(|p| {
-            let k = param_pos(ctx, m.exit, p)?;
+            let k = param_pos(&*ctx, m.exit, p)?;
             let [v] = incoming(&*ctx, m.exit, k)[..] else {
                 return None;
             };
@@ -312,7 +312,7 @@ fn apply(ctx: &mut Context, fid: FunctionId, m: &MapMatch) -> bool {
             if !matches!(v, ValueId::BlockParam(_)) {
                 return None;
             }
-            let kv = param_pos(ctx, m.ca.header, v)?;
+            let kv = param_pos(&*ctx, m.ca.header, v)?;
             let init: Vec<ValueId> = incoming(&*ctx, m.ca.header, kv)
                 .into_iter()
                 .filter(|&w| !defined_in_loop(ctx, w))
@@ -375,13 +375,13 @@ mod tests {
     use crate::AliasResult;
     use crate::gvn::gvn_function;
     use crate::mem::array_promote::ArrayPromote;
-    use crate::test_util::run_function_pass;
+    use crate::test_util::run_function_pass_v2;
 
     /// Promote `fid`, mark it pure (the real pipeline functionalizes it before
     /// `loop_to_map`, which gates on purity), then fold its total map. Returns
     /// `(promoted, folded)`.
     fn promote_then_map(ctx: &mut Context, fid: FunctionId) -> (bool, bool) {
-        let promoted = run_function_pass::<ArrayPromote>(ctx, fid).unwrap();
+        let promoted = run_function_pass_v2::<ArrayPromote>(ctx, fid).unwrap();
         Function::from_id_mut(ctx, fid).set_is_pure(true);
         let folded = recognize_total_maps(ctx);
         (promoted, folded)
@@ -395,7 +395,7 @@ mod tests {
     /// that the recognizer sees in practice.
     fn promote_collapse_map(ctx: &mut Context, fid: FunctionId) -> (bool, bool) {
         use crate::dce::remove_dead_block_args;
-        let promoted = run_function_pass::<ArrayPromote>(ctx, fid).unwrap();
+        let promoted = run_function_pass_v2::<ArrayPromote>(ctx, fid).unwrap();
         let blocks: Vec<BlockId> = Function::from_id(ctx, fid).iter().map(|b| b.id).collect();
         let root = Function::from_id(ctx, fid).root().map(|b| b.id);
         while remove_dead_block_args(ctx, &blocks, root) {}
@@ -784,7 +784,7 @@ mod tests {
         );
         // Promote + redundant-φ elimination → the fully header-carried, `Load`-init
         // map loop (identical to `fully_header_carried_fill_folds_after_collapse`).
-        assert!(run_function_pass::<ArrayPromote>(&mut ctx, xorbuf).unwrap());
+        assert!(run_function_pass_v2::<ArrayPromote>(&mut ctx, xorbuf).unwrap());
         let blocks: Vec<BlockId> = Function::from_id(&ctx, xorbuf)
             .iter()
             .map(|b| b.id)
@@ -872,7 +872,7 @@ mod tests {
                 return at i64 0x0;
             "
         );
-        assert!(run_function_pass::<ArrayPromote>(&mut ctx, prefix).unwrap());
+        assert!(run_function_pass_v2::<ArrayPromote>(&mut ctx, prefix).unwrap());
         Function::from_id_mut(&mut ctx, prefix).set_is_pure(true);
         assert!(
             !recognize_total_maps(&mut ctx),
@@ -907,7 +907,7 @@ mod tests {
                 return at i64 0x0;
             "
         );
-        run_function_pass::<ArrayPromote>(&mut ctx, impure).unwrap();
+        run_function_pass_v2::<ArrayPromote>(&mut ctx, impure).unwrap();
         Function::from_id_mut(&mut ctx, impure).set_is_pure(true);
         assert!(
             !recognize_total_maps(&mut ctx),

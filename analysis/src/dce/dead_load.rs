@@ -2035,7 +2035,7 @@ mod tests {
     fn array_promote_leftover_init_store_is_swept() {
         use crate::gvn::Gvn;
         use crate::mem::array_promote::ArrayPromote;
-        use crate::test_util::run_function_pass;
+        use crate::test_util::{run_function_pass, run_function_pass_v2};
 
         let mut ctx = Context::new();
         qcode!(
@@ -2062,7 +2062,7 @@ mod tests {
             "
         );
         assert!(
-            run_function_pass::<ArrayPromote>(&mut ctx, mix).unwrap(),
+            run_function_pass_v2::<ArrayPromote>(&mut ctx, mix).unwrap(),
             "the enveloped byte fill should promote"
         );
         run_function_pass::<Gvn>(&mut ctx, mix).unwrap();
