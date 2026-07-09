@@ -203,9 +203,7 @@ fn try_merge_block<'str, H: HostMut<'str>>(
     // shared CRT stubs, thunks) — must not be absorbed: `absorb_block` →
     // `unroster_block` mutates the *owner*'s roster, which a checked-out pass may
     // not do. A cross-function successor (thunk/tail-call) is likewise left as-is.
-    if b_id.func != function_id
-        || host.read_host().block(b_id).parent != Some(function_id)
-    {
+    if b_id.func != function_id || host.read_host().block(b_id).parent != Some(function_id) {
         return false;
     }
     host.absorb_block(a_id, b_id, edge_ab, function_id);

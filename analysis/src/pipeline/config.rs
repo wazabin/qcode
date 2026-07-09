@@ -21,8 +21,9 @@ use qcode::{
 use super::lifter::PipelineServices;
 use super::pass::{
     DynFunctionPass, DynPass, PipelineEnv, RegisteredPass, known_pass_names, make_pass,
+    replay_effects,
 };
-use super::{PipelineProgress, ProgressSink, YieldSignal};
+use super::{FunctionBody, ModuleView, PipelineProgress, ProgressSink, YieldSignal};
 
 /// The canonical default pipeline, compiled into the binary. Used by
 /// `analyze_default` and as the GUI's starting pipeline.
@@ -1152,6 +1153,15 @@ impl FixpointCache {
 /// `String` of the whole body is ever built, so the cost is the formatting
 /// walk alone.
 pub(super) fn function_fingerprint(ctx: &Context, fun_id: FunctionId) -> u64 {
+    fingerprint_display(FunctionRef::from_id(ctx, fun_id))
+}
+
+/// Hash a renderable value (a `FunctionRef` over *any* host) by streaming its
+/// `Display` output straight into the hasher — no intermediate `String`. Used to
+/// fingerprint a function whether it is live in the module ([`function_fingerprint`])
+/// or checked out of it (the per-function fixpoint tracer, which renders the body
+/// through its `CheckedOut` host).
+pub(super) fn fingerprint_display(d: impl std::fmt::Display) -> u64 {
     use std::fmt::Write as _;
     use std::hash::Hasher;
 
@@ -1164,8 +1174,7 @@ pub(super) fn function_fingerprint(ctx: &Context, fun_id: FunctionId) -> u64 {
     }
 
     let mut writer = HashWriter(std::collections::hash_map::DefaultHasher::new());
-    write!(writer, "{}", FunctionRef::from_id(ctx, fun_id))
-        .expect("writing into a hasher cannot fail");
+    write!(writer, "{d}").expect("writing into a hasher cannot fail");
     writer.0.finish()
 }
 
@@ -1307,8 +1316,15 @@ async fn run_function_stage(
 
     let mut dirty = HashSet::default();
 
+    // A stage all of whose passes are V2 can be driven over a checked-out body
+    // (`run_one_function`) — the shape Stage 6 runs on worker threads. A stage that
+    // still contains a legacy `FunctionPass` (gvn, handle_jump_tables, the loop
+    // outliners) takes the classic in-place path below, unchanged.
+    let all_v2 = passes.iter().all(|p| p.is_v2());
+
     for (index, fun_id) in fun_ids.into_iter().enumerate() {
         let function: std::sync::Arc<str> = FunctionRef::from_id(ctx, fun_id).name().into();
+        /*
         let mut iters = 0;
         let mut function_changed = false;
         // Engaged only once this function's fixpoint is clearly struggling
@@ -1393,6 +1409,60 @@ async fn run_function_stage(
                 return Err(nonconvergence_error(&stage.name, Some(&function)));
             }
         }
+        */
+        let function_changed = if all_v2 {
+            // Check the function out, run its whole pass fixpoint on the owned body,
+            // then reinstall it and replay any buffered effects — the sequential
+            // form of the parallel check-in protocol.
+            let fun = ctx.checkout_function(fun_id);
+            let mut body = FunctionBody::new(fun_id, fun, Vec::new());
+            let function_changed = {
+                let view = ModuleView::new(ctx, env);
+                run_one_function(
+                    passes,
+                    &view,
+                    &mut body,
+                    cache,
+                    &mut elapsed,
+                    &stage.name,
+                    &function,
+                    stage.repeat_until.is_some(),
+                    |pass| {
+                        progress(PipelineProgress::FunctionPass {
+                            round,
+                            stage: stage_name.clone(),
+                            function: function.clone(),
+                            index: index + 1,
+                            total,
+                            pass,
+                        });
+                    },
+                )?
+            };
+            let (fun, effects, minted, _reserved) = body.into_parts();
+            ctx.checkin_function(fun_id, fun);
+            replay_effects(ctx, &stage.name, fun_id, effects, minted)?;
+            // Between-stage invariant check happens in `verify_after_stage`; per-pass
+            // verification is skipped on the checked-out path (the function is absent
+            // from `ctx` mid-fixpoint).
+            function_changed
+        } else {
+            run_legacy_function(
+                ctx,
+                env,
+                stage,
+                passes,
+                fun_id,
+                &function,
+                &stage_name,
+                index,
+                total,
+                round,
+                cache,
+                &mut elapsed,
+                progress,
+            )?
+        };
         if function_changed {
             dirty.insert(fun_id);
         }
@@ -1417,6 +1487,209 @@ async fn run_function_stage(
         }
     }
     Ok(dirty)
+}
+
+/// Run one function's per-stage pass fixpoint over a body the driver has already
+/// checked out — every pass must be V2. Reads the module through `m`, mutates only
+/// `body`, updates the per-function fixpoint `cache` and the per-pass `elapsed`
+/// table, and calls `on_pass(name)` before each pass (the caller emits / forwards
+/// the progress event). Returns whether the function changed.
+///
+/// This is the reusable unit Stage 6's parallel driver runs on worker threads over
+/// disjoint `&mut FunctionBody`s; the sequential driver calls it one function at a
+/// time. It touches no global mutable state — the driver reinstalls the body and
+/// replays its buffered effects at check-in. The `MAX_FIXPOINT_ITERS`
+/// non-convergence guard and the per-function `FixpointTracer` cycle detection are
+/// preserved exactly as on the in-place path.
+#[allow(clippy::too_many_arguments)]
+fn run_one_function<'str>(
+    passes: &[Box<dyn DynFunctionPass>],
+    m: &ModuleView<'_, 'str>,
+    body: &mut FunctionBody<'str>,
+    cache: &mut FixpointCache,
+    elapsed: &mut HashMap<&'static str, (std::time::Duration, usize, usize)>,
+    stage_name: &str,
+    function_name: &str,
+    repeat_until: bool,
+    mut on_pass: impl FnMut(&'static str),
+) -> Result<bool, String> {
+    let fun_id = body.id();
+    let mut iters = 0;
+    let mut function_changed = false;
+    let mut tracer = FixpointTracer::default();
+    let tracer_label = format!("stage {stage_name} fn {function_name}");
+    'fixpoint: loop {
+        let watching = repeat_until && iters >= FIXPOINT_WATCH_ITERS;
+        let mut changed = false;
+        for p in passes {
+            if cache.is_clean(fun_id, p.name()) {
+                continue;
+            }
+            on_pass(p.name());
+            let _scope = qcode::pass_scope::enter(p.name());
+            #[cfg(not(target_arch = "wasm32"))]
+            let started = std::time::Instant::now();
+            let v2 = p
+                .as_v2()
+                .expect("run_one_function requires an all-V2 stage");
+            let pass_changed = v2
+                .run_checked(m, body)
+                .map_err(|e| format!("{}: {e}", p.name()))?;
+            if pass_changed {
+                cache.mark_dirty(fun_id);
+            } else {
+                cache.mark_clean(fun_id, p.name());
+            }
+            let entry = elapsed.entry(p.name()).or_default();
+            #[cfg(not(target_arch = "wasm32"))]
+            {
+                entry.0 += started.elapsed();
+            }
+            entry.1 += 1;
+            entry.2 += pass_changed as usize;
+            if watching && pass_changed {
+                // Fingerprint the checked-out body through its own host (it is
+                // absent from `ctx`, so `function_fingerprint` cannot see it).
+                let fp = fingerprint_display(qcode::value::FunctionRef::new(
+                    qcode::value::util::host_mut::HostMut::read_host(&body.host(m)),
+                    fun_id,
+                ));
+                if tracer.observe(&tracer_label, iters + 1, p.name(), fp) {
+                    log::warn!(
+                        target: "pipeline::fixpoint",
+                        "stage {stage_name} fn {function_name}: stopping best-effort on the \
+                         proven cycle at iteration {}",
+                        iters + 1,
+                    );
+                    function_changed = true;
+                    break 'fixpoint;
+                }
+            }
+            changed |= pass_changed;
+        }
+        function_changed |= changed;
+        iters += 1;
+        if !repeat_until || !changed {
+            break;
+        }
+        if iters >= MAX_FIXPOINT_ITERS {
+            log::warn!(
+                target: "pipeline::fixpoint",
+                "stage {stage_name} fn {function_name} hit the {MAX_FIXPOINT_ITERS}-iteration \
+                 cap; see the `pipeline::fixpoint` trace above for the fighting passes",
+            );
+            return Err(nonconvergence_error(stage_name, Some(function_name)));
+        }
+    }
+    Ok(function_changed)
+}
+
+/// Run one function's per-stage pass fixpoint in place on `&mut ctx` — the classic
+/// path for a stage that still contains a legacy [`FunctionPass`] (which needs
+/// whole-`Context` access and cannot run over a checked-out body). Byte-for-byte
+/// the pre-parallelization loop, including per-pass `verify_after` and the fixpoint
+/// tracer. Returns whether the function changed.
+#[allow(clippy::too_many_arguments)]
+fn run_legacy_function(
+    ctx: &mut Context,
+    env: &PipelineEnv,
+    stage: &Stage,
+    passes: &[Box<dyn DynFunctionPass>],
+    fun_id: FunctionId,
+    function: &std::sync::Arc<str>,
+    stage_name: &std::sync::Arc<str>,
+    index: usize,
+    total: usize,
+    round: usize,
+    cache: &mut FixpointCache,
+    elapsed: &mut HashMap<&'static str, (std::time::Duration, usize, usize)>,
+    progress: &mut impl FnMut(PipelineProgress),
+) -> Result<bool, String> {
+    let mut iters = 0;
+    let mut function_changed = false;
+    // Engaged only once this function's fixpoint is clearly struggling
+    // (`FIXPOINT_WATCH_ITERS`); traces which passes keep moving the IR and
+    // flags a proven cycle. Cheap on the common path (never allocates until a
+    // pass changes the IR past the threshold).
+    let mut tracer = FixpointTracer::default();
+    let tracer_label = format!("stage {} fn {function}", stage.name);
+    'fixpoint: loop {
+        let watching = stage.repeat_until.is_some() && iters >= FIXPOINT_WATCH_ITERS;
+        let mut changed = false;
+        for p in passes {
+            // Skip a pass that already reached a fixpoint on this function and
+            // has not been dirtied since (by an earlier pass this iteration, a
+            // prior stage, or — via `invalidate_all` — a module pass).
+            if cache.is_clean(fun_id, p.name()) {
+                continue;
+            }
+            progress(PipelineProgress::FunctionPass {
+                round,
+                stage: stage_name.clone(),
+                function: function.clone(),
+                index: index + 1,
+                total,
+                pass: p.name(),
+            });
+            let _scope = qcode::pass_scope::enter(p.name());
+            #[cfg(not(target_arch = "wasm32"))]
+            let started = std::time::Instant::now();
+            let pass_changed = p
+                .run(ctx, fun_id, env)
+                .map_err(|e| format!("{}: {e}", p.name()))?;
+            if pass_changed {
+                // The function moved: invalidate every pass's fixpoint mark.
+                cache.mark_dirty(fun_id);
+            } else {
+                cache.mark_clean(fun_id, p.name());
+            }
+            let entry = elapsed.entry(p.name()).or_default();
+            #[cfg(not(target_arch = "wasm32"))]
+            {
+                entry.0 += started.elapsed();
+            }
+            entry.1 += 1;
+            entry.2 += pass_changed as usize;
+            // Between-pass invariant check (opt-in via `QCODE_VERIFY`).
+            crate::verify::verify_after(ctx, p.name());
+            // Trace the fingerprint after every pass that moved the IR, so a
+            // struggling fixpoint reveals which passes keep fighting and whether
+            // the IR is truly cycling (a recurring fingerprint) vs. slowly churning.
+            if watching && pass_changed {
+                let fp = function_fingerprint(ctx, fun_id);
+                if tracer.observe(&tracer_label, iters + 1, p.name(), fp) {
+                    // A proven cycle cannot converge; leave this function at
+                    // the recurring state and move on to the next one instead
+                    // of spinning to the iteration cap.
+                    log::warn!(
+                        target: "pipeline::fixpoint",
+                        "stage {} fn {function}: stopping best-effort on the proven \
+                         cycle at iteration {}",
+                        stage.name,
+                        iters + 1,
+                    );
+                    function_changed = true;
+                    break 'fixpoint;
+                }
+            }
+            changed |= pass_changed;
+        }
+        function_changed |= changed;
+        iters += 1;
+        if stage.repeat_until.is_none() || !changed {
+            break;
+        }
+        if iters >= MAX_FIXPOINT_ITERS {
+            log::warn!(
+                target: "pipeline::fixpoint",
+                "stage {} fn {function} hit the {MAX_FIXPOINT_ITERS}-iteration cap; \
+                 see the `pipeline::fixpoint` trace above for the fighting passes",
+                stage.name,
+            );
+            return Err(nonconvergence_error(&stage.name, Some(function)));
+        }
+    }
+    Ok(function_changed)
 }
 
 #[cfg(test)]

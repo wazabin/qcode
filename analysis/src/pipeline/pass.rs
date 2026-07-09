@@ -148,6 +148,21 @@ pub trait DynFunctionPass {
     fn description(&self) -> &'static str;
     fn run(&self, ctx: &mut Context, fun_id: FunctionId, env: &PipelineEnv)
     -> Result<bool, String>;
+
+    /// Whether this pass is a [`FunctionPassV2`] (wrapped in a [`V2Adapter`]).
+    /// A stage all of whose passes are V2 can be driven over checked-out bodies —
+    /// the precondition for the parallel driver (Stage 6). Legacy [`FunctionPass`]
+    /// passes answer `false`.
+    fn is_v2(&self) -> bool {
+        false
+    }
+
+    /// If this is a V2 pass, a handle that runs it on a body the caller has
+    /// *already* checked out (no internal checkout), so the driver owns the
+    /// check-out/check-in protocol. `None` for a legacy [`FunctionPass`].
+    fn as_v2(&self) -> Option<&dyn CheckedV2Pass> {
+        None
+    }
 }
 
 impl<T: FunctionPass> DynFunctionPass for T {
@@ -165,6 +180,21 @@ impl<T: FunctionPass> DynFunctionPass for T {
     ) -> Result<bool, String> {
         FunctionPass::run(self, ctx, fun_id, env)
     }
+}
+
+/// A [`FunctionPassV2`] driven over a [`FunctionBody`] the caller already checked
+/// out — no internal checkout. This is the surface the parallel driver (and the
+/// sequential all-V2 fixpoint) use to run a V2 pass on a body they own; buffered
+/// [`Effects`] replay and the check-in protocol are the driver's job, not this
+/// method's.
+///
+/// [`Effects`]: super::Effects
+pub trait CheckedV2Pass {
+    fn run_checked<'str>(
+        &self,
+        m: &ModuleView<'_, 'str>,
+        body: &mut FunctionBody<'str>,
+    ) -> Result<bool, String>;
 }
 
 /// The parallel-safe successor to [`FunctionPass`] (Stage 5 of the
@@ -217,12 +247,28 @@ impl<T: FunctionPassV2> Default for V2Adapter<T> {
     }
 }
 
+impl<T: FunctionPassV2> CheckedV2Pass for V2Adapter<T> {
+    fn run_checked<'str>(
+        &self,
+        m: &ModuleView<'_, 'str>,
+        body: &mut FunctionBody<'str>,
+    ) -> Result<bool, String> {
+        FunctionPassV2::run(&self.inner, m, body)
+    }
+}
+
 impl<T: FunctionPassV2> DynFunctionPass for V2Adapter<T> {
     fn name(&self) -> &'static str {
         T::NAME
     }
     fn description(&self) -> &'static str {
         FunctionPassV2::description(&self.inner)
+    }
+    fn is_v2(&self) -> bool {
+        true
+    }
+    fn as_v2(&self) -> Option<&dyn CheckedV2Pass> {
+        Some(self)
     }
     fn run(
         &self,
@@ -238,7 +284,7 @@ impl<T: FunctionPassV2> DynFunctionPass for V2Adapter<T> {
         let mut body = FunctionBody::new(fun_id, fun, Vec::new());
         let changed = {
             let view = ModuleView::new(ctx, env);
-            FunctionPassV2::run(&self.inner, &view, &mut body)?
+            self.run_checked(&view, &mut body)?
         };
         let (fun, effects, minted, _reserved) = body.into_parts();
         ctx.checkin_function(fun_id, fun);
@@ -255,9 +301,9 @@ impl<T: FunctionPassV2> DynFunctionPass for V2Adapter<T> {
 /// Effect kinds are wired as the passes that produce them are ported (each port
 /// commit lands its replay arm). An unwired effect surfaces as a hard error rather
 /// than a silent drop, so a mis-ordered port fails loudly instead of miscompiling.
-fn replay_effects<'str>(
+pub(super) fn replay_effects<'str>(
     ctx: &mut Context<'str>,
-    pass: &'static str,
+    pass: &str,
     fun_id: FunctionId,
     effects: super::Effects<'str>,
     minted: Vec<qcode::value::Function<'str>>,
