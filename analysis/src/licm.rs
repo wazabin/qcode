@@ -39,38 +39,42 @@ use rustc_hash::FxHashSet as HashSet;
 use std::collections::VecDeque;
 
 use jstd::graph::analysis::compute_dominators;
-use qcode::{
-    context::Context,
-    value::{
-        BasicBlock, BlockParam, Function, FunctionId, InstructionRef, ValueId,
-        block::BlockId,
-        insn::{InstructionId, Mnemonic},
-    },
+use qcode::value::{
+    FunctionId, FunctionRef, InstructionRef, ValueId,
+    block::{BlockId, BlockRef},
+    insn::{InstructionId, Mnemonic},
+    util::{base_ref::HostRef, host_mut::HostMut},
 };
 
-use crate::{AliasResult, FunctionPass, PipelineEnv};
+use crate::{AliasResult, FunctionBody, FunctionPassV2, ModuleView};
 
 #[derive(Default)]
 pub struct Licm;
 
-impl FunctionPass for Licm {
+impl FunctionPassV2 for Licm {
     const NAME: &'static str = "licm";
 
     fn description(&self) -> &'static str {
         "Hoist loop-invariant computations into the loop preheader"
     }
 
-    fn run(
+    fn run<'str>(
         &self,
-        ctx: &mut Context,
-        fun_id: FunctionId,
-        env: &PipelineEnv,
+        m: &ModuleView<'_, 'str>,
+        f: &mut FunctionBody<'str>,
     ) -> Result<bool, String> {
-        Ok(hoist_loop_invariants(ctx, fun_id, env))
+        let fid = f.id();
+        let aliases = build_aliases(m, f.host(m).read_host(), fid);
+        let mut host = f.host(m);
+        Ok(hoist_loop_invariants_with_aliases(
+            &mut host,
+            fid,
+            aliases.as_ref(),
+        ))
     }
 }
 
-crate::register_function_pass!(Licm);
+crate::register_function_pass_v2!(Licm);
 
 /// Whether `m` is a side-effect-free value-computing op (mirrors the predicate
 /// used by `loop_to_map`/`partial_inline`). Loads are deliberately *excluded*
@@ -91,8 +95,8 @@ fn is_pure_expr_op(m: &Mnemonic) -> bool {
 
 /// The back-edges of `fun_id` as `(latch, header)` pairs, where `header`
 /// dominates `latch`.
-fn back_edges(ctx: &Context, fun_id: FunctionId) -> Vec<(BlockId, BlockId)> {
-    let function = Function::from_id(ctx, fun_id);
+fn back_edges(host: HostRef, fun_id: FunctionId) -> Vec<(BlockId, BlockId)> {
+    let function = FunctionRef::new(host, fun_id);
     let Some(root) = function.root().map(|b| b.id) else {
         return Vec::new();
     };
@@ -101,7 +105,7 @@ fn back_edges(ctx: &Context, fun_id: FunctionId) -> Vec<(BlockId, BlockId)> {
 
     let mut edges = Vec::new();
     for &latch in &block_ids {
-        let successors = BasicBlock::from_id(ctx, latch)
+        let successors = BlockRef::new(host, latch)
             .successors()
             .map(|(_, header)| header)
             .collect::<Vec<_>>();
@@ -117,11 +121,11 @@ fn back_edges(ctx: &Context, fun_id: FunctionId) -> Vec<(BlockId, BlockId)> {
 /// Every block in the natural loop of the back-edge `latch -> header`: the
 /// header plus every block that reaches the latch without passing through the
 /// header.
-fn natural_loop(ctx: &Context, latch: BlockId, header: BlockId) -> HashSet<BlockId> {
+fn natural_loop(host: HostRef, latch: BlockId, header: BlockId) -> HashSet<BlockId> {
     let mut nodes = HashSet::from_iter([header, latch]);
     let mut worklist = VecDeque::from([latch]);
     while let Some(block) = worklist.pop_front() {
-        for (_, pred) in BasicBlock::from_id(ctx, block).predecessors() {
+        for (_, pred) in BlockRef::new(host, block).predecessors() {
             if nodes.insert(pred) && pred != header {
                 worklist.push_back(pred);
             }
@@ -133,11 +137,11 @@ fn natural_loop(ctx: &Context, latch: BlockId, header: BlockId) -> HashSet<Block
 /// The loop's unique preheader: the single predecessor of `header` that is not
 /// itself in the loop. `None` if there is zero or more than one such block.
 fn loop_preheader(
-    ctx: &Context,
+    host: HostRef,
     header: BlockId,
     loop_nodes: &HashSet<BlockId>,
 ) -> Option<BlockId> {
-    let header_ref = BasicBlock::from_id(ctx, header);
+    let header_ref = BlockRef::new(host, header);
     let mut preheaders = header_ref
         .predecessors()
         .filter_map(|(_, pred)| (!loop_nodes.contains(&pred)).then_some(pred));
@@ -148,7 +152,7 @@ fn loop_preheader(
 /// Whether the value `v` is loop-invariant given the set of instructions already
 /// known invariant.
 fn value_is_invariant(
-    ctx: &Context,
+    host: HostRef,
     v: ValueId,
     loop_nodes: &HashSet<BlockId>,
     invariant: &HashSet<InstructionId>,
@@ -163,12 +167,12 @@ fn value_is_invariant(
             // A block param defined outside the loop is invariant; one belonging
             // to a loop block is loop-carried (fed across the back-edge), hence
             // variant.
-            match BlockParam::from_id(ctx, p).parent().map(|b| b.id) {
+            match host.block_param(p).parent {
                 Some(block) => !loop_nodes.contains(&block),
                 None => true,
             }
         }
-        ValueId::Instruction(i) => match ctx.get_insn(i).parent().map(|b| b.id) {
+        ValueId::Instruction(i) => match InstructionRef::new(host, i).parent().map(|b| b.id) {
             Some(block) if loop_nodes.contains(&block) => invariant.contains(&i),
             _ => true,
         },
@@ -183,12 +187,13 @@ struct LoopMemory {
     has_clobber: bool,
 }
 
-fn loop_memory(ctx: &Context, loop_nodes: &HashSet<BlockId>) -> LoopMemory {
+fn loop_memory(host: HostRef, loop_nodes: &HashSet<BlockId>) -> LoopMemory {
     let mut store_ptrs = Vec::new();
     let mut has_clobber = false;
     for &block in loop_nodes {
-        for &id in BasicBlock::from_id(ctx, block).instruction_ids() {
-            match ctx.get_insn(id).mnemonic() {
+        let insns = BlockRef::new(host, block).instruction_ids().to_vec();
+        for id in insns {
+            match host.instruction(id).mnemonic() {
                 Mnemonic::Store(s) => store_ptrs.push(s.ptr),
                 Mnemonic::Call(_) | Mnemonic::CallInd(_) | Mnemonic::PCodeOp(_) => {
                     has_clobber = true;
@@ -206,7 +211,7 @@ fn loop_memory(ctx: &Context, loop_nodes: &HashSet<BlockId>) -> LoopMemory {
 /// Whether a loop load through `ptr` keeps its value across every iteration: no
 /// opaque clobber, and no loop store that may-alias `ptr`.
 fn load_is_safe(
-    ctx: &Context,
+    host: HostRef,
     aliases: Option<&AliasResult>,
     ptr: ValueId,
     mem: &LoopMemory,
@@ -220,12 +225,12 @@ fn load_is_safe(
     };
     !mem.store_ptrs
         .iter()
-        .any(|&store| aliases.may_alias(ctx, ptr, store))
+        .any(|&store| aliases.may_alias(host, ptr, store))
 }
 
 /// Grow the set of loop-invariant instructions to a fixpoint.
 fn invariant_instructions(
-    ctx: &Context,
+    host: HostRef,
     loop_nodes: &HashSet<BlockId>,
     aliases: Option<&AliasResult>,
     mem: &LoopMemory,
@@ -234,11 +239,12 @@ fn invariant_instructions(
     loop {
         let mut changed = false;
         for &block in loop_nodes {
-            for &id in BasicBlock::from_id(ctx, block).instruction_ids() {
+            let insns = BlockRef::new(host, block).instruction_ids().to_vec();
+            for id in insns {
                 if invariant.contains(&id) {
                     continue;
                 }
-                let m = ctx.get_insn(id).mnemonic();
+                let m = host.instruction(id).mnemonic();
                 let is_load = matches!(m, Mnemonic::Load(_));
                 if !is_load && !is_pure_expr_op(m) {
                     continue;
@@ -246,12 +252,12 @@ fn invariant_instructions(
                 let operands_invariant = m
                     .args()
                     .into_iter()
-                    .all(|op| value_is_invariant(ctx, op, loop_nodes, &invariant));
+                    .all(|op| value_is_invariant(host, op, loop_nodes, &invariant));
                 if !operands_invariant {
                     continue;
                 }
                 if let Mnemonic::Load(load) = m
-                    && !load_is_safe(ctx, aliases, load.ptr, mem)
+                    && !load_is_safe(host, aliases, load.ptr, mem)
                 {
                     continue;
                 }
@@ -270,7 +276,7 @@ fn invariant_instructions(
 /// depends on (post-order over the dependency DAG), giving a placement order
 /// that keeps definitions before uses in the preheader.
 fn emission_order(
-    ctx: &Context,
+    host: HostRef,
     loop_nodes: &HashSet<BlockId>,
     invariant: &HashSet<InstructionId>,
 ) -> Vec<InstructionId> {
@@ -279,7 +285,7 @@ fn emission_order(
     // Iterate blocks/instructions for a deterministic starting order.
     let mut roots: Vec<InstructionId> = Vec::new();
     for &block in loop_nodes {
-        for &id in BasicBlock::from_id(ctx, block).instruction_ids() {
+        for &id in BlockRef::new(host, block).instruction_ids() {
             if invariant.contains(&id) {
                 roots.push(id);
             }
@@ -302,7 +308,7 @@ fn emission_order(
                 continue;
             }
             stack.push((id, true));
-            for op in ctx.get_insn(id).mnemonic().args() {
+            for op in host.instruction(id).mnemonic().args() {
                 if let ValueId::Instruction(o) = op
                     && invariant.contains(&o)
                     && !done.contains(&o)
@@ -318,32 +324,36 @@ fn emission_order(
 /// Hoist invariant instructions of one loop into `preheader`, in `order`. Each
 /// instruction is rebuilt in the preheader (before its terminator), its uses are
 /// redirected to the rebuilt copy, and the original is deleted.
-fn hoist_into_preheader(ctx: &mut Context, preheader: BlockId, order: &[InstructionId]) -> bool {
+fn hoist_into_preheader<'str, H: HostMut<'str>>(
+    host: &mut H,
+    preheader: BlockId,
+    order: &[InstructionId],
+) -> bool {
     let mut hoisted = false;
     for &old in order {
-        let mnemonic = ctx.get_insn(old).mnemonic().clone();
-        let type_id = ctx.get_insn(old).type_id();
-        let new =
-            InstructionRef::from_mnemonic_with_type(ctx, preheader.func, mnemonic, type_id).id;
+        let old_ref = InstructionRef::new(host.read_host(), old);
+        let mnemonic = old_ref.mnemonic().clone();
+        let type_id = old_ref.type_id();
+        let new = host.push_mnemonic_with_type(preheader.func, mnemonic, type_id);
 
-        let term = *BasicBlock::from_id(ctx, preheader)
-            .instruction_ids()
+        let term = *host
+            .read_host()
+            .block(preheader)
+            .instructions
             .last()
             .expect("preheader must have a terminator");
-        BasicBlock::from_id_mut(ctx, preheader).insert_insn_before(term, new);
+        host.insert_insn_before(preheader, term, new);
 
         // Redirect every remaining use (in the loop and beyond) to the hoisted
         // copy. Processing in dependency order means a later invariant operand
         // already points at its hoisted copy when we clone the consumer.
-        ctx.replace_all_uses_with(ValueId::Instruction(old), ValueId::Instruction(new));
+        host.replace_all_uses_with(ValueId::Instruction(old), ValueId::Instruction(new));
         hoisted = true;
     }
 
     // Delete the now-dead originals from their loop blocks.
     for &old in order {
-        if let Some(block) = ctx.get_insn(old).parent().map(|b| b.id) {
-            BasicBlock::from_id_mut(ctx, block).retain_insns(|&i| i != old);
-        }
+        host.remove_instruction(old);
     }
     hoisted
 }
@@ -351,29 +361,31 @@ fn hoist_into_preheader(ctx: &mut Context, preheader: BlockId, order: &[Instruct
 /// Build the per-function alias oracle the same way [`crate::gvn::Gvn`] does, so
 /// load hoisting sees per-slot stack locations and frame freshness. Returns
 /// `None` when no stack pointer is registered (arch-agnostic test envs).
-fn build_aliases(ctx: &Context, fun_id: FunctionId, env: &PipelineEnv) -> Option<AliasResult> {
+fn build_aliases<'a, 'str: 'a>(
+    m: &ModuleView<'_, 'str>,
+    host: HostRef<'a, 'str>,
+    fun_id: FunctionId,
+) -> Option<AliasResult> {
+    let ctx = m.ctx();
+    let env = m.env();
     let sp_reg = ctx.registers.get(&env.cfg.stack_pointer).copied()?;
     Some(
         env.alias_base(ctx)
-            .for_function(ctx, fun_id)
-            .with_frame_freshness(ctx, fun_id, Some(sp_reg)),
+            .for_function(host, fun_id)
+            .with_frame_freshness(host, fun_id, Some(sp_reg)),
     )
-}
-
-pub fn hoist_loop_invariants(ctx: &mut Context, fun_id: FunctionId, env: &PipelineEnv) -> bool {
-    let aliases = build_aliases(ctx, fun_id, env);
-    hoist_loop_invariants_with_aliases(ctx, fun_id, aliases.as_ref())
 }
 
 /// Hoisting core, parameterized on an already-built alias oracle (or `None` for
 /// the conservative path where any loop store blocks load hoisting). Exposed for
-/// tests that supply their own oracle.
-fn hoist_loop_invariants_with_aliases(
-    ctx: &mut Context,
+/// tests that supply their own oracle. Reads and mutates the function through the
+/// generic mutation host.
+fn hoist_loop_invariants_with_aliases<'str, H: HostMut<'str>>(
+    host: &mut H,
     fun_id: FunctionId,
     aliases: Option<&AliasResult>,
 ) -> bool {
-    let edges = back_edges(ctx, fun_id);
+    let edges = back_edges(host.read_host(), fun_id);
     if edges.is_empty() {
         return false;
     }
@@ -382,22 +394,22 @@ fn hoist_loop_invariants_with_aliases(
     // changes the CFG, so dominators / loop membership stay valid throughout.
     let mut plans: Vec<(BlockId, Vec<InstructionId>)> = Vec::new();
     for (latch, header) in edges {
-        let loop_nodes = natural_loop(ctx, latch, header);
-        let Some(preheader) = loop_preheader(ctx, header, &loop_nodes) else {
+        let loop_nodes = natural_loop(host.read_host(), latch, header);
+        let Some(preheader) = loop_preheader(host.read_host(), header, &loop_nodes) else {
             continue;
         };
-        let mem = loop_memory(ctx, &loop_nodes);
-        let invariant = invariant_instructions(ctx, &loop_nodes, aliases, &mem);
+        let mem = loop_memory(host.read_host(), &loop_nodes);
+        let invariant = invariant_instructions(host.read_host(), &loop_nodes, aliases, &mem);
         if invariant.is_empty() {
             continue;
         }
-        let order = emission_order(ctx, &loop_nodes, &invariant);
+        let order = emission_order(host.read_host(), &loop_nodes, &invariant);
         plans.push((preheader, order));
     }
 
     let mut changed = false;
     for (preheader, order) in plans {
-        changed |= hoist_into_preheader(ctx, preheader, &order);
+        changed |= hoist_into_preheader(host, preheader, &order);
     }
     changed
 }

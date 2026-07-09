@@ -188,6 +188,19 @@ pub trait HostMut<'str> {
         self.push_insn(func, insn)
     }
 
+    /// Mint an instruction with `mnemonic` and an explicit result `type_id` into
+    /// `func`'s arena (host-routed equivalent of `InstructionRef::from_mnemonic_with_type`),
+    /// preserving a non-`Int` result type (e.g. a hoisted load's aggregate type).
+    fn push_mnemonic_with_type(
+        &mut self,
+        func: FunctionId,
+        mnemonic: Mnemonic,
+        type_id: crate::types::TypeId,
+    ) -> InstructionId {
+        let insn = Instruction::new(type_id, mnemonic);
+        self.push_insn(func, insn)
+    }
+
     /// Insert `insn` immediately before `before` in `block`, setting its parent.
     /// Panics if `before` is not in `block`.
     fn insert_insn_before(&mut self, block: BlockId, before: InstructionId, insn: InstructionId) {

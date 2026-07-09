@@ -66,7 +66,7 @@ pub use verify::{PureRegCallArgsViolation, Verify, verify, verify_ir, verify_pur
 pub mod loop_info;
 
 pub mod licm;
-pub use licm::{Licm, hoist_loop_invariants};
+pub use licm::Licm;
 
 pub mod loop_unroll;
 pub use loop_unroll::{
