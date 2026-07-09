@@ -15,7 +15,7 @@
 
 use qcode::{
     context::Context,
-    value::{Function, FunctionId, ValueId, VarnodeId},
+    value::{FunctionId, FunctionRef, ValueId, VarnodeId, util::base_ref::HostRef},
 };
 
 use crate::gvn::affine::Numbering;
@@ -38,12 +38,12 @@ pub(crate) enum FrameClass {
 /// The incoming stack-pointer root parameter of `fid`: the root-block param whose
 /// `origin` is the stack-pointer register `sp_reg`. `None` if the function has no
 /// such param (e.g. it never touched the stack, or registers were not promoted).
-pub(crate) fn incoming_sp_param(
-    ctx: &Context,
+pub(crate) fn incoming_sp_param<'a, 'str: 'a>(
+    host: impl Into<HostRef<'a, 'str>>,
     fid: FunctionId,
     sp_reg: VarnodeId,
 ) -> Option<ValueId> {
-    Function::from_id(ctx, fid)
+    FunctionRef::new(host.into(), fid)
         .root()?
         .params()
         .find(|p| p.origin() == Some(ValueId::Varnode(sp_reg)))

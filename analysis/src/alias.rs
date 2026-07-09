@@ -4,11 +4,11 @@ use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
 
 use qcode::{
     assumption::Proposition,
-    context::Context,
     space::SpaceId,
     value::{
-        BlockId, BlockParam, Function, FunctionId, Instruction, ValueId, ValueRef, VarnodeId,
+        BlockId, BlockParamRef, FunctionId, FunctionRef, ValueId, ValueRef, VarnodeId,
         insn::{Binop, IntBinop, Mnemonic},
+        util::base_ref::HostRef,
     },
 };
 
@@ -153,13 +153,19 @@ impl AliasResult {
     /// (an untracked value carries no no-alias guarantee, so it must answer
     /// may-alias). Only the earlier layers — the different-space
     /// short-circuit and [`Self::provably_disjoint`] — can return `false`.
-    pub fn may_alias(&self, ctx: &Context, a: ValueId, b: ValueId) -> bool {
+    pub fn may_alias<'a, 'str: 'a>(
+        &self,
+        host: impl Into<HostRef<'a, 'str>>,
+        a: ValueId,
+        b: ValueId,
+    ) -> bool {
+        let host = host.into();
         // If a and b don't share the same address space they can't alias.
         // Note this deliberately overrides `NodeId::Unknown` below: aliasing
         // means "same storage location", and values in different spaces can
         // never occupy the same location, however unknown their class is.
-        let a_space = ValueRef::new(a, ctx).space().map(|s| s.id);
-        let b_space = ValueRef::new(b, ctx).space().map(|s| s.id);
+        let a_space = ValueRef::from_host(host, a).space().map(|s| s.id);
+        let b_space = ValueRef::from_host(host, b).space().map(|s| s.id);
         if let (Some(sa), Some(sb)) = (a_space, b_space)
             && sa != sb
         {
@@ -170,7 +176,7 @@ impl AliasResult {
         // (sound), and a caller-frame slot is disjoint from one under the recorded
         // `ArgsDisjointFromCallerFrame` assumption (see `provably_disjoint`). Answer
         // "no" before the alias graph collapses both partitions to `Unknown`.
-        if self.provably_disjoint(ctx, a, b) {
+        if self.provably_disjoint(host, a, b) {
             return false;
         }
 
@@ -207,12 +213,18 @@ impl AliasResult {
     ///
     /// Inert (`false`) unless the result was built with
     /// [`AliasResult::with_frame_freshness`].
-    pub fn provably_disjoint(&self, ctx: &Context, a: ValueId, b: ValueId) -> bool {
+    pub fn provably_disjoint<'a, 'str: 'a>(
+        &self,
+        host: impl Into<HostRef<'a, 'str>>,
+        a: ValueId,
+        b: ValueId,
+    ) -> bool {
         let Some(frame) = &self.frame else {
             return false;
         };
-        let pa = frame.provenance(ctx, a);
-        let pb = frame.provenance(ctx, b);
+        let host = host.into();
+        let pa = frame.provenance(host, a);
+        let pb = frame.provenance(host, b);
         frame.disjoint_by_provenance(pa, pb) || frame.disjoint_by_provenance(pb, pa)
     }
 
@@ -228,39 +240,42 @@ impl AliasResult {
     /// stack-pointer register varnode `sp_reg` (resolved from the arch config). A
     /// no-op when `sp_reg` is `None` or the function has no incoming `@SP` param,
     /// leaving [`AliasResult::provably_disjoint`] inert.
-    pub fn with_frame_freshness(
+    pub fn with_frame_freshness<'a, 'str: 'a>(
         mut self,
-        ctx: &Context,
+        host: impl Into<HostRef<'a, 'str>>,
         fid: FunctionId,
         sp_reg: Option<VarnodeId>,
     ) -> Self {
+        let host = host.into();
         let Some(sp_reg) = sp_reg else {
             return self;
         };
-        let Some(sp) = incoming_sp_param(ctx, fid, sp_reg) else {
+        let Some(sp) = incoming_sp_param(host, fid, sp_reg) else {
             return self;
         };
-        let numbering = precompute_forms(ctx, fid);
+        let numbering = precompute_forms(host, fid);
         let mut own_frame_locals = HashSet::default();
-        for block in Function::from_id(ctx, fid).blocks() {
+        for block in FunctionRef::new(host, fid).blocks() {
             for insn in block.iter() {
                 let v = ValueId::Instruction(insn.id);
-                if let Some(FrameClass::Local) = frame_class(ctx, &numbering, sp, v) {
+                if let Some(FrameClass::Local) = frame_class(host.shared(), &numbering, sp, v) {
                     own_frame_locals.insert(v);
                 }
             }
         }
-        let root_block = Function::from_id(ctx, fid).root().map(|r| r.id);
+        let root_block = FunctionRef::new(host, fid).root().map(|r| r.id);
         // Hoist the assumption lookups: they are fixed once the result is built
         // (a pass sets assumptions before building the oracle). A test that flips
         // an assumption after building must rebuild the result.
-        let caller_frame_assumed = ctx
+        let caller_frame_assumed = host
+            .shared()
             .truth(Proposition::ArgsDisjointFromCallerFrame(fid))
             .is_some_and(|t| t.value);
-        let loaded_ptr_assumed = ctx
+        let loaded_ptr_assumed = host
+            .shared()
             .truth(Proposition::LoadedPointerDisjointFromSlot(fid))
             .is_some_and(|t| t.value);
-        let frame_uncaptured = !frame_is_captured(ctx, fid, &numbering, sp);
+        let frame_uncaptured = !frame_is_captured(host, fid, &numbering, sp);
         self.frame = Some(FrameInfo {
             root_block,
             sp_param: sp,
@@ -292,10 +307,14 @@ impl AliasResult {
 /// loaded through, offset, or *returned* is not captured: a return hands the
 /// address back as a call *result* in the caller (classified via
 /// [`FrameInfo::classify`]'s call arm), never into this function's memory.
-fn frame_is_captured(ctx: &Context, fid: FunctionId, numbering: &Numbering, sp: ValueId) -> bool {
-    let is_own_frame =
-        |v: ValueId| matches!(frame_class(ctx, numbering, sp, v), Some(FrameClass::Local));
-    for block in Function::from_id(ctx, fid).blocks() {
+fn frame_is_captured(host: HostRef, fid: FunctionId, numbering: &Numbering, sp: ValueId) -> bool {
+    let is_own_frame = |v: ValueId| {
+        matches!(
+            frame_class(host.shared(), numbering, sp, v),
+            Some(FrameClass::Local)
+        )
+    };
+    for block in FunctionRef::new(host, fid).blocks() {
         for insn in block.iter() {
             match insn.mnemonic() {
                 Mnemonic::Store(s) if is_own_frame(s.src) => {
@@ -304,7 +323,7 @@ fn frame_is_captured(ctx: &Context, fid: FunctionId, numbering: &Numbering, sp: 
                 Mnemonic::Call(c) => {
                     for (j, &arg) in c.args.iter().enumerate() {
                         if is_own_frame(arg)
-                            && !Function::from_id(ctx, c.target)
+                            && !FunctionRef::new(host, c.target)
                                 .param_attr(j)
                                 .is_some_and(|a| a.nocapture)
                         {
@@ -334,25 +353,25 @@ impl FrameInfo {
     /// Provenance of `v`, memoized. A peel cycle contributes nothing: the
     /// in-progress value is seeded with the empty set before recursing, then
     /// overwritten with the final classification.
-    fn provenance(&self, ctx: &Context, v: ValueId) -> Provenance {
+    fn provenance(&self, host: HostRef, v: ValueId) -> Provenance {
         if let Some(&p) = self.provenance.borrow().get(&v) {
             return p;
         }
         self.provenance
             .borrow_mut()
             .insert(v, Provenance::default());
-        let p = self.classify(ctx, v);
+        let p = self.classify(host, v);
         self.provenance.borrow_mut().insert(v, p);
         p
     }
 
     /// The uncached classification of `v` — the union over its peel tree (see
     /// [`Provenance`]).
-    fn classify(&self, ctx: &Context, v: ValueId) -> Provenance {
+    fn classify(&self, host: HostRef, v: ValueId) -> Provenance {
         use Provenance as P;
         // Stack provenance first: `@SP ± k`, realigned frames, and the bare `@SP`
         // param (offset 0 → caller frame).
-        if let Some(fc) = frame_class(ctx, &self.numbering, self.sp_param, v) {
+        if let Some(fc) = frame_class(host.shared(), &self.numbering, self.sp_param, v) {
             return match fc {
                 FrameClass::Local => P::OWN_FRAME,
                 FrameClass::CallerFrame => P::CALLER_FRAME,
@@ -361,14 +380,14 @@ impl FrameInfo {
         match v {
             ValueId::Literal(_) => P::GLOBAL_STATIC,
             ValueId::BlockParam(pid) => {
-                let bp = BlockParam::from_id(ctx, pid);
+                let bp = BlockParamRef::new(host, pid);
                 match bp.origin() {
                     // A globalized-global slot (`@glob_<addr>`): origin is the literal.
                     Some(ValueId::Literal(_)) => P::GLOBAL_STATIC,
                     // A partial-promotion snapshot of `*slot` (origin = the global
                     // slot param) — the materialized loaded pointer.
                     Some(o @ ValueId::BlockParam(_))
-                        if self.provenance(ctx, o).is_pure(P::GLOBAL_STATIC) =>
+                        if self.provenance(host, o).is_pure(P::GLOBAL_STATIC) =>
                     {
                         P::LOADED
                     }
@@ -381,21 +400,21 @@ impl FrameInfo {
                     _ => P::OPAQUE,
                 }
             }
-            ValueId::Instruction(id) => match Instruction::from_id(ctx, id).mnemonic() {
+            ValueId::Instruction(id) => match host.instruction(id).mnemonic() {
                 Mnemonic::Load(_) => P::LOADED,
-                Mnemonic::Call(c) => self.classify_call_result(ctx, c),
-                Mnemonic::Zext(z) => self.provenance(ctx, z.src),
-                Mnemonic::Sext(s) => self.provenance(ctx, s.src),
-                Mnemonic::Range(r) => self.provenance(ctx, r.src),
+                Mnemonic::Call(c) => self.classify_call_result(host, c),
+                Mnemonic::Zext(z) => self.provenance(host, z.src),
+                Mnemonic::Sext(s) => self.provenance(host, s.src),
+                Mnemonic::Range(r) => self.provenance(host, r.src),
                 Mnemonic::Binop(b) if matches!(b.op, Binop::Int(IntBinop::Add | IntBinop::Sub)) => {
-                    self.peel_addsub(ctx, b.lhs, b.rhs)
+                    self.peel_addsub(host, b.lhs, b.rhs)
                 }
                 // Affine `base + const` over a global base — the old
                 // `is_global_static` fallback for a global reached via a non-add op.
                 _ => {
                     if let Some((base, _)) = self.numbering.base_offset(v)
                         && base != v
-                        && self.provenance(ctx, base).is_pure(P::GLOBAL_STATIC)
+                        && self.provenance(host, base).is_pure(P::GLOBAL_STATIC)
                     {
                         P::GLOBAL_STATIC
                     } else {
@@ -420,9 +439,9 @@ impl FrameInfo {
     /// a `nocapture` param, then handed back), the union carries `OWN_FRAME`, so
     /// the result is *not* a subset of rule A's `INPUT|LOADED|GLOBAL_STATIC` mask
     /// and stays correctly non-disjoint from the frame.
-    fn classify_call_result(&self, ctx: &Context, c: &qcode::value::insn::Call) -> Provenance {
+    fn classify_call_result(&self, host: HostRef, c: &qcode::value::insn::Call) -> Provenance {
         use Provenance as P;
-        let callee = Function::from_id(ctx, c.target);
+        let callee = FunctionRef::new(host, c.target);
         let all_nocapture = c.clobbers.is_empty()
             && (0..c.args.len()).all(|j| callee.param_attr(j).is_some_and(|a| a.nocapture));
         if !all_nocapture {
@@ -430,7 +449,7 @@ impl FrameInfo {
         }
         let mut acc = P::LOADED.union(P::GLOBAL_STATIC);
         for &arg in &c.args {
-            acc = acc.union(self.provenance(ctx, arg));
+            acc = acc.union(self.provenance(host, arg));
         }
         acc
     }
@@ -440,14 +459,14 @@ impl FrameInfo {
     /// non-pointer). Both are *offsets*, not sources of the pointer, so they must
     /// not poison the result — matching the old peel, which contributed nothing
     /// for such operands.
-    fn peel_addsub(&self, ctx: &Context, lhs: ValueId, rhs: ValueId) -> Provenance {
+    fn peel_addsub(&self, host: HostRef, lhs: ValueId, rhs: ValueId) -> Provenance {
         use Provenance as P;
         let mut acc = P::default();
         for operand in [lhs, rhs] {
             if matches!(operand, ValueId::Literal(_)) {
                 continue;
             }
-            let p = self.provenance(ctx, operand);
+            let p = self.provenance(host, operand);
             if p.is_pure(P::OPAQUE) {
                 continue;
             }

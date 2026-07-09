@@ -1777,9 +1777,9 @@ impl Mem2Reg<'_, '_> {
                     }
                     Some(clobbered) => register_vars()
                         .filter(|&v| {
-                            clobbered
-                                .iter()
-                                .any(|&c| self.aliases.may_alias(self.ctx, ValueId::Varnode(c), v))
+                            clobbered.iter().any(|&c| {
+                                self.aliases.may_alias(&*self.ctx, ValueId::Varnode(c), v)
+                            })
                         })
                         .collect(),
                 }
@@ -3557,7 +3557,7 @@ impl FunctionPass for Mem2RegPass {
         // Resolve `@SP` so canonical `@SP ± N` slots are recognised; `None` when
         // the function has no incoming stack-pointer param (legacy literal path).
         let sp_reg = ctx.registers[&env.cfg.stack_pointer];
-        let sp_param = incoming_sp_param(ctx, fun_id, sp_reg);
+        let sp_param = incoming_sp_param(&*ctx, fun_id, sp_reg);
         Ok(mem2reg_framed(ctx, fun_id, &aliases, sp_param))
     }
 }
