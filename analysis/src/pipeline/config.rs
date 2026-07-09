@@ -34,6 +34,11 @@ const DEFAULT_PIPELINE_FILE: &str = "default.toml";
 /// Guard against a `repeat_until` stage that never converges.
 const MAX_FIXPOINT_ITERS: usize = 100;
 
+/// Minimum worklist size before an all-V2 stage fans out across threads. Below
+/// this the thread-spawn + check-out/check-in overhead outweighs the win, so the
+/// stage runs sequentially (identical output either way).
+const PARALLEL_THRESHOLD: usize = 4;
+
 /// Iteration count at which a `repeat_until` stage starts *tracing* itself to
 /// diagnose non-convergence. A healthy stage settles in a handful of iterations,
 /// so tracing engages only once a stage is clearly struggling — keeping the
@@ -1112,6 +1117,35 @@ impl FixpointCache {
         *self.generation.entry(f).or_insert(0) += 1;
     }
 
+    /// A private cache holding only `funcs`' entries, for a parallel worker to
+    /// mutate in isolation. Workers own disjoint function sets, so their local
+    /// caches touch disjoint keys and merge back conflict-free via
+    /// [`absorb`](Self::absorb).
+    fn extract(&self, funcs: &HashSet<FunctionId>) -> FixpointCache {
+        FixpointCache {
+            generation: self
+                .generation
+                .iter()
+                .filter(|(f, _)| funcs.contains(f))
+                .map(|(f, g)| (*f, *g))
+                .collect(),
+            clean: self
+                .clean
+                .iter()
+                .filter(|((f, _), _)| funcs.contains(f))
+                .map(|(k, v)| (*k, *v))
+                .collect(),
+        }
+    }
+
+    /// Fold a worker's local cache back in. Clean marks are only ever added or
+    /// bumped (never removed) during a stage, and each worker owns a disjoint
+    /// function set, so overwriting keys with the worker's final values is exact.
+    fn absorb(&mut self, other: FixpointCache) {
+        self.generation.extend(other.generation);
+        self.clean.extend(other.clean);
+    }
+
     /// The functions that currently hold at least one fixpoint mark — the only ones
     /// a module stage could wrongly let us skip, so the only ones worth fingerprinting.
     fn clean_function_ids(&self) -> HashSet<FunctionId> {
@@ -1322,6 +1356,7 @@ async fn run_function_stage(
     // outliners) takes the classic in-place path below, unchanged.
     let all_v2 = passes.iter().all(|p| p.is_v2());
 
+    /*
     for (index, fun_id) in fun_ids.into_iter().enumerate() {
         let function: std::sync::Arc<str> = FunctionRef::from_id(ctx, fun_id).name().into();
         /*
@@ -1419,52 +1454,113 @@ async fn run_function_stage(
             let function_changed = {
                 let view = ModuleView::new(ctx, env);
                 run_one_function(
+    */
+    // Parallelize an all-V2 stage across threads once the worklist is worth the
+    // fan-out cost. Functions tied to another by a cross-function CFG edge (a
+    // thunk/tail-call `Branch` into another function's entry) are held back for the
+    // sequential lane: a worker reading such an edge would reach into a
+    // co-checked-out function's (empty) shell arena. Everything else — mixed
+    // stages, tiny worklists, `QCODE_THREADS=1`, wasm — runs the sequential loop
+    // below, byte-for-byte identical.
+    let threads = resolve_threads();
+    let parallel_set: HashSet<FunctionId> =
+        if all_v2 && threads > 1 && fun_ids.len() >= PARALLEL_THRESHOLD {
+            let entangled = entangled_functions(ctx, &fun_ids);
+            let eligible: Vec<FunctionId> = fun_ids
+                .iter()
+                .copied()
+                .filter(|f| !entangled.contains(f))
+                .collect();
+            if eligible.len() >= PARALLEL_THRESHOLD {
+                run_stage_parallel(
+                    ctx,
+                    env,
+                    stage,
                     passes,
-                    &view,
-                    &mut body,
+                    &eligible,
+                    &stage_name,
+                    total,
+                    round,
                     cache,
                     &mut elapsed,
-                    &stage.name,
+                    &mut dirty,
+                    threads,
+                    progress,
+                )?;
+                eligible.into_iter().collect()
+            } else {
+                HashSet::default()
+            }
+        } else {
+            HashSet::default()
+        };
+
+    // The sequential lane: functions not handled in parallel above (all of them
+    // when the stage did not parallelize; only the entangled remainder when it did).
+    {
+        for (index, fun_id) in fun_ids.into_iter().enumerate() {
+            if parallel_set.contains(&fun_id) {
+                continue;
+            }
+            let function: std::sync::Arc<str> = FunctionRef::from_id(ctx, fun_id).name().into();
+            let function_changed = if all_v2 {
+                // Check the function out, run its whole pass fixpoint on the owned
+                // body, then reinstall it, rebuild `call_sites`, and replay any
+                // buffered effects — the sequential form of the parallel check-in.
+                let before_targets = ctx.direct_call_targets(fun_id);
+                let fun = ctx.checkout_function(fun_id);
+                let mut body = FunctionBody::new(fun_id, fun, Vec::new());
+                let function_changed = {
+                    let view = ModuleView::new(ctx, env);
+                    run_one_function(
+                        passes,
+                        &view,
+                        &mut body,
+                        cache,
+                        &mut elapsed,
+                        &stage.name,
+                        &function,
+                        stage.repeat_until.is_some(),
+                        |pass| {
+                            progress(PipelineProgress::FunctionPass {
+                                round,
+                                stage: stage_name.clone(),
+                                function: function.clone(),
+                                index: index + 1,
+                                total,
+                                pass,
+                            });
+                        },
+                    )?
+                };
+                let (fun, effects, minted, _reserved) = body.into_parts();
+                ctx.checkin_function(fun_id, fun);
+                ctx.resync_call_sites(fun_id, &before_targets);
+                replay_effects(ctx, &stage.name, fun_id, effects, minted)?;
+                // Between-stage invariant check happens in `verify_after_stage`;
+                // per-pass verification is skipped on the checked-out path (the
+                // function is absent from `ctx` mid-fixpoint).
+                function_changed
+            } else {
+                run_legacy_function(
+                    ctx,
+                    env,
+                    stage,
+                    passes,
+                    fun_id,
                     &function,
-                    stage.repeat_until.is_some(),
-                    |pass| {
-                        progress(PipelineProgress::FunctionPass {
-                            round,
-                            stage: stage_name.clone(),
-                            function: function.clone(),
-                            index: index + 1,
-                            total,
-                            pass,
-                        });
-                    },
+                    &stage_name,
+                    index,
+                    total,
+                    round,
+                    cache,
+                    &mut elapsed,
+                    progress,
                 )?
             };
-            let (fun, effects, minted, _reserved) = body.into_parts();
-            ctx.checkin_function(fun_id, fun);
-            replay_effects(ctx, &stage.name, fun_id, effects, minted)?;
-            // Between-stage invariant check happens in `verify_after_stage`; per-pass
-            // verification is skipped on the checked-out path (the function is absent
-            // from `ctx` mid-fixpoint).
-            function_changed
-        } else {
-            run_legacy_function(
-                ctx,
-                env,
-                stage,
-                passes,
-                fun_id,
-                &function,
-                &stage_name,
-                index,
-                total,
-                round,
-                cache,
-                &mut elapsed,
-                progress,
-            )?
-        };
-        if function_changed {
-            dirty.insert(fun_id);
+            if function_changed {
+                dirty.insert(fun_id);
+            }
         }
 
         // Cooperative yield point: one per function (never per pass). The default
@@ -1690,6 +1786,224 @@ fn run_legacy_function(
         }
     }
     Ok(function_changed)
+}
+
+/// How many worker threads an all-V2 stage may use. `QCODE_THREADS` overrides the
+/// default (`available_parallelism`); `QCODE_THREADS=1` forces the sequential path.
+/// wasm has no threads, so it is always `1`.
+fn resolve_threads() -> usize {
+    #[cfg(target_arch = "wasm32")]
+    {
+        1
+    }
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        if let Ok(v) = std::env::var("QCODE_THREADS")
+            && let Ok(n) = v.parse::<usize>()
+        {
+            return n.max(1);
+        }
+        std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(1)
+    }
+}
+
+/// The worklist functions tied to another function by a cross-function CFG edge —
+/// a thunk / tail-call `Branch` whose edge is stored in one function's arena but
+/// referenced by the other's block. Such an edge is unreadable once *both* incident
+/// functions are checked out (the storage owner's arena is an empty shell), so
+/// these run on the sequential lane where at most one is out at a time. Detection
+/// reads only live functions (nothing is checked out yet), so no shell is touched.
+fn entangled_functions(ctx: &Context, fun_ids: &[FunctionId]) -> HashSet<FunctionId> {
+    let mut entangled = HashSet::default();
+    for &fid in fun_ids {
+        let crosses = FunctionRef::from_id(ctx, fid).blocks().any(|b| {
+            // A cross-function CFG edge (either direction), or a branch instruction
+            // whose static target block lives in another function (a tail call /
+            // thunk `Branch` a pass like mem2reg reads directly off the mnemonic,
+            // not via the CFG edge set).
+            b.successors().any(|(_, s)| s.func != fid)
+                || b.predecessors().any(|(_, p)| p.func != fid)
+                || b.instructions()
+                    .any(|i| i.mnemonic().target_blocks().iter().any(|t| t.func != fid))
+        });
+        if crosses {
+            entangled.insert(fid);
+        }
+    }
+    entangled
+}
+
+/// One checked-out worklist function on its way through a parallel stage: its
+/// identity, the checkout-time call-target snapshot (for the check-in `call_sites`
+/// diff), the owned body a worker mutates, and whether the worker changed it.
+struct ParallelEntry<'str> {
+    index: usize,
+    fun_id: FunctionId,
+    name: std::sync::Arc<str>,
+    before_targets: Vec<FunctionId>,
+    body: FunctionBody<'str>,
+    changed: bool,
+}
+
+/// What one worker thread accumulates locally and hands back for deterministic
+/// merge on the master thread. The mutated bodies travel back through the shared
+/// `&mut [ParallelEntry]` slice, not here.
+struct WorkerOutput {
+    cache: FixpointCache,
+    elapsed: HashMap<&'static str, (std::time::Duration, usize, usize)>,
+    stats: Vec<((&'static str, &'static str), u64)>,
+}
+
+/// Run an all-V2 stage across `threads` worker threads (Stage 6 of the
+/// parallel-passes plan). Checks out the whole worklist, runs each function's pass
+/// fixpoint on a disjoint `&mut FunctionBody` on a `std::thread::scope` worker over
+/// the `&`-shared [`ModuleView`], then checks the results back in **in worklist
+/// order**. Output is byte-identical to the sequential path: the frozen module
+/// view, deterministic (contiguous, worklist-ordered) work assignment, and
+/// worklist-ordered check-in leave nothing to run-to-run chance.
+#[allow(clippy::too_many_arguments)]
+fn run_stage_parallel(
+    ctx: &mut Context,
+    env: &PipelineEnv,
+    stage: &Stage,
+    passes: &[Box<dyn DynFunctionPass>],
+    fun_ids: &[FunctionId],
+    stage_name: &std::sync::Arc<str>,
+    total: usize,
+    round: usize,
+    cache: &mut FixpointCache,
+    elapsed: &mut HashMap<&'static str, (std::time::Duration, usize, usize)>,
+    dirty: &mut HashSet<FunctionId>,
+    threads: usize,
+    progress: &mut impl FnMut(PipelineProgress),
+) -> Result<(), String> {
+    // 1. Check out every worklist function up front (each leaves an interface shell
+    //    in the module), snapshotting its call targets first for the check-in diff.
+    let mut entries: Vec<ParallelEntry> = Vec::with_capacity(fun_ids.len());
+    for (index, &fun_id) in fun_ids.iter().enumerate() {
+        let name: std::sync::Arc<str> = FunctionRef::from_id(ctx, fun_id).name().into();
+        let before_targets = ctx.direct_call_targets(fun_id);
+        let fun = ctx.checkout_function(fun_id);
+        entries.push(ParallelEntry {
+            index,
+            fun_id,
+            name,
+            before_targets,
+            body: FunctionBody::new(fun_id, fun, Vec::new()),
+            changed: false,
+        });
+    }
+
+    // 2. Contiguous, worklist-ordered chunks — deterministic assignment.
+    let chunk_size = entries.len().div_ceil(threads).max(1);
+    let repeat_until = stage.repeat_until.is_some();
+    let stage_label = stage.name.clone();
+
+    // 3. Run workers on one shared read-only view; forward progress over a channel
+    //    the master thread pumps live while the workers compute.
+    let (tx, rx) = std::sync::mpsc::channel::<PipelineProgress>();
+    let outcomes: Vec<Result<WorkerOutput, String>> = {
+        let view = ModuleView::new(ctx, env);
+        let view = &view;
+        let stage_label = &stage_label;
+        std::thread::scope(|scope| {
+            let mut handles = Vec::new();
+            for chunk in entries.chunks_mut(chunk_size) {
+                let funcs: HashSet<FunctionId> = chunk.iter().map(|e| e.fun_id).collect();
+                let mut local_cache = cache.extract(&funcs);
+                let tx = tx.clone();
+                let stage_name = stage_name.clone();
+                let handle = scope.spawn(move || -> Result<WorkerOutput, String> {
+                    let mut local_elapsed: HashMap<
+                        &'static str,
+                        (std::time::Duration, usize, usize),
+                    > = HashMap::default();
+                    for e in chunk.iter_mut() {
+                        let index = e.index;
+                        let name = e.name.clone();
+                        let stage_name = stage_name.clone();
+                        let tx = &tx;
+                        let changed = run_one_function(
+                            passes,
+                            view,
+                            &mut e.body,
+                            &mut local_cache,
+                            &mut local_elapsed,
+                            stage_label,
+                            &name,
+                            repeat_until,
+                            |pass| {
+                                // Send failure only means the master stopped pumping
+                                // (it never does before join); ignore it.
+                                let _ = tx.send(PipelineProgress::FunctionPass {
+                                    round,
+                                    stage: stage_name.clone(),
+                                    function: name.clone(),
+                                    index: index + 1,
+                                    total,
+                                    pass,
+                                });
+                            },
+                        )?;
+                        e.changed = changed;
+                    }
+                    // Drain this thread's `stat!` counters before it exits — the
+                    // thread-local table is otherwise lost — for master re-absorption.
+                    Ok(WorkerOutput {
+                        cache: local_cache,
+                        elapsed: local_elapsed,
+                        stats: qcode::pass_scope::drain_stats(),
+                    })
+                });
+                handles.push(handle);
+            }
+            // The master holds no sender: once every worker's sender drops the
+            // channel closes and the pump loop ends.
+            drop(tx);
+            while let Ok(event) = rx.recv() {
+                progress(event);
+            }
+            handles
+                .into_iter()
+                .map(|h| h.join().expect("function-pass worker panicked"))
+                .collect()
+        })
+    };
+
+    // 4. Merge worker-local state deterministically (worklist / chunk order).
+    for outcome in outcomes {
+        let out = outcome?;
+        cache.absorb(out.cache);
+        for (pass, (dur, runs, changes)) in out.elapsed {
+            let entry = elapsed.entry(pass).or_default();
+            entry.0 += dur;
+            entry.1 += runs;
+            entry.2 += changes;
+        }
+        qcode::pass_scope::absorb_stats(out.stats);
+    }
+
+    // 5. Check every function back in, in worklist order: reinstall the body,
+    //    rebuild `call_sites`, replay buffered effects, and record dirtiness.
+    for entry in entries {
+        let ParallelEntry {
+            fun_id,
+            before_targets,
+            body,
+            changed,
+            ..
+        } = entry;
+        let (fun, effects, minted, _reserved) = body.into_parts();
+        ctx.checkin_function(fun_id, fun);
+        ctx.resync_call_sites(fun_id, &before_targets);
+        replay_effects(ctx, &stage.name, fun_id, effects, minted)?;
+        if changed {
+            dirty.insert(fun_id);
+        }
+    }
+    Ok(())
 }
 
 #[cfg(test)]

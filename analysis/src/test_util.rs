@@ -38,7 +38,7 @@ pub(crate) fn run_function_pass<P: FunctionPass>(
 /// Run a [`FunctionPassV2`] once over `fun` through the real [`V2Adapter`] path
 /// (check-out → run → check-in → effect replay) with a [`dummy_env`], so a unit
 /// test exercises the same plumbing the sequential driver uses.
-pub(crate) fn run_function_pass_v2<P: FunctionPassV2>(
+pub(crate) fn run_function_pass_v2<P: FunctionPassV2 + Send + Sync>(
     ctx: &mut Context,
     fun: FunctionId,
 ) -> Result<bool, String> {

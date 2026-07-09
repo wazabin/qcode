@@ -535,6 +535,45 @@ impl<'str> Context<'str> {
         self.values.functions.replace(id, fun);
     }
 
+    /// The distinct direct-call *targets* of `fun_id`'s live instructions — a cheap
+    /// snapshot taken at checkout so [`resync_call_sites`](Self::resync_call_sites)
+    /// can rebuild the `call_sites` cache at check-in (ruling 6 of the
+    /// parallel-passes plan). The function must be checked in.
+    pub fn direct_call_targets(&self, fun_id: FunctionId) -> Vec<FunctionId> {
+        let mut targets: Vec<FunctionId> = FunctionRef::from_id(self, fun_id)
+            .blocks()
+            .flat_map(|b| b.instructions())
+            .filter_map(|i| i.mnemonic().call_target())
+            .collect();
+        targets.sort_unstable();
+        targets.dedup();
+        targets
+    }
+
+    /// Rebuild the global `call_sites` cache for `fun_id` after a pass has (possibly)
+    /// rewritten its outgoing calls. `before_targets` is the checkout snapshot from
+    /// [`direct_call_targets`](Self::direct_call_targets); the function must be
+    /// checked back in first. For every callee that `fun_id` called before or calls
+    /// now, its site list is stripped of `fun_id`'s entries and repopulated from the
+    /// function's current instructions — a pure diff of derivable data, so the cache
+    /// ends identical regardless of check-in order (ruling 6).
+    pub fn resync_call_sites(&mut self, fun_id: FunctionId, before_targets: &[FunctionId]) {
+        let after: Vec<(FunctionId, InstructionId)> = FunctionRef::from_id(self, fun_id)
+            .blocks()
+            .flat_map(|b| b.instructions())
+            .filter_map(|i| i.mnemonic().call_target().map(|t| (t, i.id)))
+            .collect();
+        let mut affected: Vec<FunctionId> = before_targets.to_vec();
+        affected.extend(after.iter().map(|(t, _)| *t));
+        affected.sort_unstable();
+        affected.dedup();
+        for target in affected {
+            let sites = self.values.call_sites.entry(target).or_default();
+            sites.retain(|site| site.func != fun_id);
+            sites.extend(after.iter().filter(|(t, _)| *t == target).map(|(_, s)| *s));
+        }
+    }
+
     pub fn varnodes(&self) -> impl Iterator<Item = VarnodeRef<'str, '_>> + '_ {
         self.values
             .varnodes

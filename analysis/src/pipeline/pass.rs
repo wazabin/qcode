@@ -143,7 +143,7 @@ pub trait FunctionPass: Default {
 /// and `NAME` associated const are both non-object-safe. This shim mirrors it as
 /// instance methods and is blanket-impl'd for every `FunctionPass`, so the registry
 /// can store `Box<dyn DynFunctionPass>`.
-pub trait DynFunctionPass {
+pub trait DynFunctionPass: Send + Sync {
     fn name(&self) -> &'static str;
     fn description(&self) -> &'static str;
     fn run(&self, ctx: &mut Context, fun_id: FunctionId, env: &PipelineEnv)
@@ -165,7 +165,7 @@ pub trait DynFunctionPass {
     }
 }
 
-impl<T: FunctionPass> DynFunctionPass for T {
+impl<T: FunctionPass + Send + Sync> DynFunctionPass for T {
     fn name(&self) -> &'static str {
         T::NAME
     }
@@ -257,7 +257,7 @@ impl<T: FunctionPassV2> CheckedV2Pass for V2Adapter<T> {
     }
 }
 
-impl<T: FunctionPassV2> DynFunctionPass for V2Adapter<T> {
+impl<T: FunctionPassV2 + Send + Sync> DynFunctionPass for V2Adapter<T> {
     fn name(&self) -> &'static str {
         T::NAME
     }

@@ -63,6 +63,19 @@ pub fn drain_stats() -> Vec<((&'static str, &'static str), u64)> {
     STATS.with_borrow_mut(std::mem::take).into_iter().collect()
 }
 
+/// Fold `entries` (as produced by [`drain_stats`]) back into this thread's
+/// counters. The parallel function-pass driver drains each worker thread's
+/// counters before the thread exits (thread-local state would otherwise be lost)
+/// and re-absorbs them on the master thread, so the per-round statistics table is
+/// identical to a sequential run.
+pub fn absorb_stats(entries: impl IntoIterator<Item = ((&'static str, &'static str), u64)>) {
+    STATS.with_borrow_mut(|stats| {
+        for (key, n) in entries {
+            *stats.entry(key).or_insert(0) += n;
+        }
+    });
+}
+
 /// Log a message attributed to the current pass: the `log` target is the pass
 /// name (so `RUST_LOG=mem2reg=debug` filters per pass) and the message is
 /// prefixed with it.

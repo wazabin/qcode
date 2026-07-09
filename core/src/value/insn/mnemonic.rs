@@ -206,6 +206,19 @@ impl Mnemonic {
         }
     }
 
+    /// The statically-known CFG target blocks this mnemonic branches to — the
+    /// `Branch` target and both `CBranch` arms. Empty for non-branch or indirect
+    /// terminators (a `BranchInd` resolves to computed addresses, not a static
+    /// block). Used to detect cross-function branches (thunks / tail calls) whose
+    /// target lives in another function's arena.
+    pub fn target_blocks(&self) -> smallvec::SmallVec<[crate::value::block::BlockId; 2]> {
+        match self {
+            Mnemonic::Branch(b) => smallvec::smallvec![b.target],
+            Mnemonic::CBranch(c) => smallvec::smallvec![c.success_block, c.failure_block],
+            _ => smallvec::SmallVec::new(),
+        }
+    }
+
     pub fn fmt(&self, f: &mut Formatter<'_>, ctx: &Context<'_>) -> std::fmt::Result {
         // The textual rendering is defined once, as tokens, in `segment`; the
         // `Display` form is those tokens concatenated.
