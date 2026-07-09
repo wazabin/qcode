@@ -2,23 +2,37 @@ use rustc_hash::FxHashSet as HashSet;
 
 use qcode::{
     context::Context,
-    value::{BasicBlock, BlockId, Function, FunctionId, InstructionId, insn::Mnemonic},
+    value::{
+        BlockId, BlockRef, FunctionId, FunctionRef, InstructionId, ValueId,
+        insn::Mnemonic,
+        util::{base_ref::HostRef, host_mut::HostMut},
+    },
 };
 
 use crate::loop_unroll::replace_terminator_with_branch;
 
+/// This host's users of `v` (its owning function's reverse-use list), or `&[]`
+/// for a shared value with no owning function. Mirrors [`Context::users`].
+fn host_users<'a, 'str>(host: HostRef<'a, 'str>, v: ValueId) -> &'a [InstructionId] {
+    match v.owning_function() {
+        Some(f) => host.function(f).users_of(v),
+        None => &[],
+    }
+}
+
 /// Returns instructions in `block_id` that are pure and have no users.
-pub fn dead_insns(ctx: &Context, block_id: BlockId) -> HashSet<InstructionId> {
+pub fn dead_insns<'a, 'str: 'a>(
+    host: impl Into<HostRef<'a, 'str>>,
+    block_id: BlockId,
+) -> HashSet<InstructionId> {
+    let host = host.into();
     let mut dead = HashSet::default();
-    let insn_ids: Vec<InstructionId> = BasicBlock::from_id(ctx, block_id)
-        .instruction_ids()
-        .to_vec();
+    let insn_ids: Vec<InstructionId> = BlockRef::new(host, block_id).instruction_ids().to_vec();
     for id in insn_ids {
-        let insn = ctx.get_insn(id);
-        let mnemonic = insn.mnemonic();
+        let mnemonic = host.instruction(id).mnemonic();
         let side_effects = mnemonic.has_side_effects();
 
-        if !side_effects && ctx.users(id).is_empty() {
+        if !side_effects && host_users(host, ValueId::Instruction(id)).is_empty() {
             dead.insert(id);
         }
     }
@@ -27,21 +41,26 @@ pub fn dead_insns(ctx: &Context, block_id: BlockId) -> HashSet<InstructionId> {
 
 /// Removes dead pure instructions from `block_id` iteratively until fixed point,
 /// updating the users reverse map after each round.
-pub fn remove_dead_insns(ctx: &mut Context, block_id: BlockId) -> bool {
+pub fn remove_dead_insns(mut ctx: &mut Context, block_id: BlockId) -> bool {
+    remove_dead_insns_host(&mut ctx, block_id)
+}
+
+/// Host-generic core of [`remove_dead_insns`]; see that function.
+pub fn remove_dead_insns_host<'str, H: HostMut<'str>>(host: &mut H, block_id: BlockId) -> bool {
     let mut changed = false;
     loop {
-        let dead = dead_insns(ctx, block_id);
+        let dead = dead_insns(host.read_host(), block_id);
         if dead.is_empty() {
             break;
         }
 
         changed = true;
         for id in &dead {
-            ctx.remove_instruction(*id);
+            host.remove_instruction(*id);
         }
     }
 
-    let params_changed = remove_unused_no_pred_block_params(ctx, block_id);
+    let params_changed = remove_unused_no_pred_block_params_host(host, block_id);
     changed || params_changed
 }
 
@@ -55,8 +74,14 @@ pub fn remove_dead_insns(ctx: &mut Context, block_id: BlockId) -> bool {
 /// `Branch` to that fall-through successor, preserving the CFG minus the call.
 /// The fall-through has no params fed by the call, so the branch carries no
 /// arguments.
-pub fn remove_dead_pure_call(ctx: &mut Context, block_id: BlockId) -> bool {
-    let Some(term_id) = BasicBlock::from_id(ctx, block_id)
+#[cfg(test)]
+pub fn remove_dead_pure_call(mut ctx: &mut Context, block_id: BlockId) -> bool {
+    remove_dead_pure_call_host(&mut ctx, block_id)
+}
+
+/// Host-generic core of [`remove_dead_pure_call`]; see that function.
+fn remove_dead_pure_call_host<'str, H: HostMut<'str>>(host: &mut H, block_id: BlockId) -> bool {
+    let Some(term_id) = BlockRef::new(host.read_host(), block_id)
         .instruction_ids()
         .last()
         .copied()
@@ -64,22 +89,22 @@ pub fn remove_dead_pure_call(ctx: &mut Context, block_id: BlockId) -> bool {
         return false;
     };
 
-    let Mnemonic::Call(call) = ctx.get_insn(term_id).mnemonic() else {
-        return false;
+    let (clobbers_empty, target) = match host.read_host().instruction(term_id).mnemonic() {
+        Mnemonic::Call(call) => (call.clobbers.is_empty(), call.target),
+        _ => return false,
     };
-    if !call.clobbers.is_empty() {
+    if !clobbers_empty {
         return false;
     }
-    let target = call.target;
-    if !Function::from_id(ctx, target).is_pure() {
+    if !FunctionRef::new(host.read_host(), target).is_pure() {
         return false;
     }
-    if !ctx.users(term_id).is_empty() {
+    if !host_users(host.read_host(), ValueId::Instruction(term_id)).is_empty() {
         return false;
     }
 
     // A pure call's block has exactly one successor: its fall-through.
-    let successors: Vec<BlockId> = BasicBlock::from_id(ctx, block_id)
+    let successors: Vec<BlockId> = BlockRef::new(host.read_host(), block_id)
         .successors()
         .map(|(_, b)| b)
         .collect();
@@ -92,7 +117,7 @@ pub fn remove_dead_pure_call(ctx: &mut Context, block_id: BlockId) -> bool {
         return false;
     };
 
-    replace_terminator_with_branch(&mut &mut *ctx, block_id, fallthrough, vec![]);
+    replace_terminator_with_branch(host, block_id, fallthrough, vec![]);
     true
 }
 
@@ -100,8 +125,11 @@ pub fn remove_dead_pure_call(ctx: &mut Context, block_id: BlockId) -> bool {
 /// control-flow edges. This covers function-entry params introduced for
 /// load-before-store registers that later become dead, without touching join
 /// blocks whose predecessor terminators carry positional arguments.
-pub fn remove_unused_no_pred_block_params(ctx: &mut Context, block_id: BlockId) -> bool {
-    if BasicBlock::from_id(ctx, block_id)
+pub fn remove_unused_no_pred_block_params_host<'str, H: HostMut<'str>>(
+    host: &mut H,
+    block_id: BlockId,
+) -> bool {
+    if BlockRef::new(host.read_host(), block_id)
         .predecessors()
         .next()
         .is_some()
@@ -117,28 +145,30 @@ pub fn remove_unused_no_pred_block_params(ctx: &mut Context, block_id: BlockId) 
     // this per-function sweep. A function pass must not reach across functions, so
     // leave pure_reg entry params for `dead_signature`; the *local* fallback below
     // would silently drop the param and break the interface alignment.
-    let is_pure_reg_entry = BasicBlock::from_id(ctx, block_id)
+    let is_pure_reg_entry = BlockRef::new(host.read_host(), block_id)
         .function()
         .is_some_and(|f| f.is_pure_reg() && f.root().map(|b| b.id) == Some(block_id));
     if is_pure_reg_entry {
         return false;
     }
 
-    let params = ctx.values.block(block_id).params.clone();
+    let params = host.read_host().block(block_id).params.clone();
     let mut kept = Vec::with_capacity(params.len());
     let mut changed = false;
     for param in params {
-        if ctx.users(param).is_empty() && !ctx.values.block_param(param).protected {
-            ctx.values.block_param_mut(param).parent = None;
+        if host_users(host.read_host(), ValueId::BlockParam(param)).is_empty()
+            && !host.read_host().block_param(param).protected
+        {
+            host.block_param_mut(param).parent = None;
             changed = true;
         } else {
-            ctx.values.block_param_mut(param).index = kept.len();
+            host.block_param_mut(param).index = kept.len();
             kept.push(param);
         }
     }
 
     if changed {
-        ctx.values.block_mut(block_id).params = kept;
+        host.block_mut(block_id).params = kept;
     }
     changed
 }
@@ -153,7 +183,7 @@ mod tests {
         space::SpaceId,
         testing::TestContext,
         value::{
-            BlockId, Function, ValueId,
+            BasicBlock, BlockId, Function, ValueId,
             insn::{Mnemonic, PCodeOpId},
         },
     };
@@ -485,10 +515,7 @@ mod tests {
 
 // ----- dead counted loop -----------------------------------------------------
 
-use qcode::value::{
-    FunctionRef, ValueId, ValueRef,
-    insn::{Binary, Binop, IntBinop},
-};
+use qcode::value::insn::{Binary, Binop, IntBinop};
 
 /// A recognized dead, provably-terminating counted loop (see
 /// [`remove_dead_counted_loop`]).
@@ -500,43 +527,43 @@ struct DeadLoop {
 }
 
 /// `c` if `v` is the integer literal `c`, else `None`.
-fn dl_literal(ctx: &Context, v: ValueId) -> Option<u64> {
-    match ValueRef::new(v, ctx) {
-        ValueRef::Literal(l) => Some(l.value()),
+fn dl_literal(host: HostRef, v: ValueId) -> Option<u64> {
+    match v {
+        ValueId::Literal(lid) => Some(host.shared().values.literals[lid].value),
         _ => None,
     }
 }
 
 /// `true` if `v` is `iv + 1` (either operand order).
-fn dl_is_unit_inc(ctx: &Context, v: ValueId, iv: ValueId) -> bool {
+fn dl_is_unit_inc(host: HostRef, v: ValueId, iv: ValueId) -> bool {
     let ValueId::Instruction(id) = v else {
         return false;
     };
-    let Mnemonic::Binop(Binary { lhs, rhs, op }) = ctx.get_insn(id).mnemonic() else {
+    let Mnemonic::Binop(Binary { lhs, rhs, op }) = host.instruction(id).mnemonic() else {
         return false;
     };
-    let one = |x: ValueId| dl_literal(ctx, x) == Some(1);
+    let one = |x: ValueId| dl_literal(host, x) == Some(1);
     matches!(op, Binop::Int(IntBinop::Add))
         && ((*lhs == iv && one(*rhs)) || (*rhs == iv && one(*lhs)))
 }
 
 /// `true` if `cond` is `iv == <literal>` (either operand order).
-fn dl_is_eq_const(ctx: &Context, cond: ValueId, iv: ValueId) -> bool {
+fn dl_is_eq_const(host: HostRef, cond: ValueId, iv: ValueId) -> bool {
     let ValueId::Instruction(id) = cond else {
         return false;
     };
-    let Mnemonic::Binop(Binary { lhs, rhs, op }) = ctx.get_insn(id).mnemonic() else {
+    let Mnemonic::Binop(Binary { lhs, rhs, op }) = host.instruction(id).mnemonic() else {
         return false;
     };
     matches!(op, Binop::Int(IntBinop::Equal))
-        && ((*lhs == iv && dl_literal(ctx, *rhs).is_some())
-            || (*rhs == iv && dl_literal(ctx, *lhs).is_some()))
+        && ((*lhs == iv && dl_literal(host, *rhs).is_some())
+            || (*rhs == iv && dl_literal(host, *lhs).is_some()))
 }
 
 /// Distinct predecessor blocks of `b`.
-fn dl_preds(ctx: &Context, b: BlockId) -> Vec<BlockId> {
+fn dl_preds(host: HostRef, b: BlockId) -> Vec<BlockId> {
     let mut seen = HashSet::default();
-    BasicBlock::from_id(ctx, b)
+    BlockRef::new(host, b)
         .predecessors()
         .map(|(_, p)| p)
         .filter(|&p| seen.insert(p))
@@ -544,17 +571,14 @@ fn dl_preds(ctx: &Context, b: BlockId) -> Vec<BlockId> {
 }
 
 /// Terminator instruction of `b`, if any.
-fn dl_term(ctx: &Context, b: BlockId) -> Option<InstructionId> {
-    BasicBlock::from_id(ctx, b)
-        .instruction_ids()
-        .last()
-        .copied()
+fn dl_term(host: HostRef, b: BlockId) -> Option<InstructionId> {
+    BlockRef::new(host, b).instruction_ids().last().copied()
 }
 
 /// `true` if every user of `v` lives in one of `region`'s blocks.
-fn dl_users_confined(ctx: &Context, v: ValueId, region: &[BlockId]) -> bool {
-    ctx.users(v).to_vec().iter().all(|&u| {
-        ctx.get_insn(u)
+fn dl_users_confined(host: HostRef, v: ValueId, region: &[BlockId]) -> bool {
+    host_users(host, v).iter().all(|&u| {
+        qcode::value::InstructionRef::new(host, u)
             .parent()
             .is_some_and(|p| region.contains(&p.id))
     })
@@ -571,9 +595,9 @@ fn dl_users_confined(ctx: &Context, v: ValueId, region: &[BlockId]) -> bool {
 ///
 /// with region `{H, B}` side-effect-free, the exit edge `H→E` carrying no
 /// arguments, and no value defined in the region used outside it.
-fn match_dead_loop(ctx: &Context, header: BlockId) -> Option<DeadLoop> {
-    let term = dl_term(ctx, header)?;
-    let Mnemonic::CBranch(cb) = ctx.get_insn(term).mnemonic() else {
+fn match_dead_loop(host: HostRef, header: BlockId) -> Option<DeadLoop> {
+    let term = dl_term(host, header)?;
+    let Mnemonic::CBranch(cb) = host.instruction(term).mnemonic() else {
         return None;
     };
     let (condition, exit, body) = (cb.condition, cb.success_block, cb.failure_block);
@@ -585,32 +609,32 @@ fn match_dead_loop(ctx: &Context, header: BlockId) -> Option<DeadLoop> {
     if exit == header || body == header || exit == body {
         return None;
     }
-    if !ctx.values.block(exit).params.is_empty() {
+    if !host.block(exit).params.is_empty() {
         return None;
     }
 
     // Body: a single unconditional back-edge to the header, reached only from it.
-    let bterm = dl_term(ctx, body)?;
-    let Mnemonic::Branch(bbr) = ctx.get_insn(bterm).mnemonic() else {
+    let bterm = dl_term(host, body)?;
+    let Mnemonic::Branch(bbr) = host.instruction(bterm).mnemonic() else {
         return None;
     };
     if bbr.target != header {
         return None;
     }
     let back_args = bbr.args.clone();
-    let bpreds = dl_preds(ctx, body);
+    let bpreds = dl_preds(host, body);
     if bpreds != [header] {
         return None;
     }
 
     // Header preds: exactly the back-edge plus one external preheader.
-    let hpreds = dl_preds(ctx, header);
+    let hpreds = dl_preds(host, header);
     if hpreds.len() != 2 || !hpreds.contains(&body) {
         return None;
     }
     let preheader = *hpreds.iter().find(|&&p| p != body)?;
-    let pterm = dl_term(ctx, preheader)?;
-    let Mnemonic::Branch(pbr) = ctx.get_insn(pterm).mnemonic() else {
+    let pterm = dl_term(host, preheader)?;
+    let Mnemonic::Branch(pbr) = host.instruction(pterm).mnemonic() else {
         return None;
     };
     if pbr.target != header {
@@ -621,9 +645,9 @@ fn match_dead_loop(ctx: &Context, header: BlockId) -> Option<DeadLoop> {
     // The region's non-terminator instructions must all be pure.
     let region = [header, body];
     for &blk in &region {
-        for id in BasicBlock::from_id(ctx, blk).instruction_ids().to_vec() {
-            let m = ctx.get_insn(id).mnemonic();
-            if !m.is_terminator() && has_side_effects(m) {
+        for id in BlockRef::new(host, blk).instruction_ids().to_vec() {
+            let m = host.instruction(id).mnemonic();
+            if !m.is_terminator() && m.has_side_effects() {
                 return None;
             }
         }
@@ -632,13 +656,13 @@ fn match_dead_loop(ctx: &Context, header: BlockId) -> Option<DeadLoop> {
     // No live-out: every region-defined value (instruction results and block
     // params) is used only within the region.
     for &blk in &region {
-        for id in BasicBlock::from_id(ctx, blk).instruction_ids().to_vec() {
-            if !dl_users_confined(ctx, ValueId::Instruction(id), &region) {
+        for id in BlockRef::new(host, blk).instruction_ids().to_vec() {
+            if !dl_users_confined(host, ValueId::Instruction(id), &region) {
                 return None;
             }
         }
-        for &pid in &ctx.values.block(blk).params {
-            if !dl_users_confined(ctx, ValueId::BlockParam(pid), &region) {
+        for &pid in &host.block(blk).params {
+            if !dl_users_confined(host, ValueId::BlockParam(pid), &region) {
                 return None;
             }
         }
@@ -647,16 +671,16 @@ fn match_dead_loop(ctx: &Context, header: BlockId) -> Option<DeadLoop> {
     // Termination: some header param is a unit-stride induction variable that
     // starts at a literal and drives the `iv == N` exit test, so the loop always
     // reaches the exit within `2^width` iterations.
-    let hparams = ctx.values.block(header).params.clone();
+    let hparams = host.block(header).params.clone();
     let counted = hparams.iter().enumerate().any(|(k, &pid)| {
         let iv = ValueId::BlockParam(pid);
         back_args
             .get(k)
-            .is_some_and(|&be| dl_is_unit_inc(ctx, be, iv))
+            .is_some_and(|&be| dl_is_unit_inc(host, be, iv))
             && init_args
                 .get(k)
-                .is_some_and(|&ini| dl_literal(ctx, ini).is_some())
-            && dl_is_eq_const(ctx, condition, iv)
+                .is_some_and(|&ini| dl_literal(host, ini).is_some())
+            && dl_is_eq_const(host, condition, iv)
     });
     if !counted {
         return None;
@@ -672,14 +696,20 @@ fn match_dead_loop(ctx: &Context, header: BlockId) -> Option<DeadLoop> {
 /// This is the region-level counterpart to the local pure-instruction sweep: a
 /// loop-carried value is never locally dead (its back-edge is a self-use), so a
 /// dead loop can only be recognized by reasoning over the whole cyclic region.
-fn remove_dead_counted_loop(ctx: &mut Context, fun_id: FunctionId) -> bool {
-    let headers: Vec<BlockId> = FunctionRef::from_id(ctx, fun_id)
+#[cfg(test)]
+fn remove_dead_counted_loop(mut ctx: &mut Context, fun_id: FunctionId) -> bool {
+    remove_dead_counted_loop_host(&mut ctx, fun_id)
+}
+
+/// Host-generic core of [`remove_dead_counted_loop`]; see that function.
+fn remove_dead_counted_loop_host<'str, H: HostMut<'str>>(host: &mut H, fun_id: FunctionId) -> bool {
+    let headers: Vec<BlockId> = FunctionRef::new(host.read_host(), fun_id)
         .blocks()
         .map(|b| b.id)
         .collect();
     for header in headers {
-        if let Some(dl) = match_dead_loop(ctx, header) {
-            replace_terminator_with_branch(&mut &mut *ctx, dl.preheader, dl.exit, vec![]);
+        if let Some(dl) = match_dead_loop(host.read_host(), header) {
+            replace_terminator_with_branch(host, dl.preheader, dl.exit, vec![]);
             return true;
         }
     }
@@ -688,49 +718,59 @@ fn remove_dead_counted_loop(ctx: &mut Context, fun_id: FunctionId) -> bool {
 
 // ----- pass ------------------------------------------------------------------
 
-use crate::{FunctionPass, PipelineEnv};
+use crate::{FunctionBody, FunctionPassV2, ModuleView};
 
 #[derive(Default)]
 pub struct Dce;
 
-impl FunctionPass for Dce {
+impl FunctionPassV2 for Dce {
     const NAME: &'static str = "dce";
     fn description(&self) -> &'static str {
         "Remove unused pure instructions"
     }
-    fn run(
+    fn run<'str>(
         &self,
-        ctx: &mut Context,
-        fun_id: FunctionId,
-        _env: &PipelineEnv,
+        m: &ModuleView<'_, 'str>,
+        f: &mut FunctionBody<'str>,
     ) -> Result<bool, String> {
-        let root = FunctionRef::from_id(ctx, fun_id).root().map(|b| b.id);
-        let block_ids: Vec<_> = FunctionRef::from_id(ctx, fun_id)
-            .blocks()
-            .map(|b| b.id)
-            .collect();
-        let mut changed = false;
-        // Loop to fixed point: rewriting a dead pure call into a branch can make
-        // its argument-producing instructions (Extracts, etc.) unused, which the
-        // dead-instruction sweep then removes, and so on. Dropping a useless block
-        // argument likewise strips the predecessor's arg-producing value, which
-        // can then become dead — so the block-arg sweep joins the same fixpoint.
-        loop {
-            let mut round = false;
-            for &block_id in &block_ids {
-                round |= remove_dead_pure_call(ctx, block_id);
-                round |= remove_dead_insns(ctx, block_id);
-            }
-            round |= super::remove_dead_block_args(ctx, &block_ids, root);
-            round |= super::remove_dead_block_params(ctx, &block_ids, root);
-            round |= remove_dead_counted_loop(ctx, fun_id);
-            if !round {
-                break;
-            }
-            changed = true;
-        }
-        Ok(changed)
+        let fun_id = f.id();
+        let mut host = f.host(m);
+        Ok(dce_core(&mut host, fun_id))
     }
 }
 
-crate::register_function_pass!(Dce);
+/// Host-generic core of the [`Dce`] pass: the fixpoint over per-block dead-pure-call
+/// / dead-instruction sweeps, redundant/dead block-argument elimination, and dead
+/// counted-loop removal.
+fn dce_core<'str, H: HostMut<'str>>(host: &mut H, fun_id: FunctionId) -> bool {
+    let root = FunctionRef::new(host.read_host(), fun_id)
+        .root()
+        .map(|b| b.id);
+    let block_ids: Vec<_> = FunctionRef::new(host.read_host(), fun_id)
+        .blocks()
+        .map(|b| b.id)
+        .collect();
+    let mut changed = false;
+    // Loop to fixed point: rewriting a dead pure call into a branch can make
+    // its argument-producing instructions (Extracts, etc.) unused, which the
+    // dead-instruction sweep then removes, and so on. Dropping a useless block
+    // argument likewise strips the predecessor's arg-producing value, which
+    // can then become dead — so the block-arg sweep joins the same fixpoint.
+    loop {
+        let mut round = false;
+        for &block_id in &block_ids {
+            round |= remove_dead_pure_call_host(host, block_id);
+            round |= remove_dead_insns_host(host, block_id);
+        }
+        round |= super::remove_dead_block_args_host(host, &block_ids, root);
+        round |= super::remove_dead_block_params_host(host, &block_ids, root);
+        round |= remove_dead_counted_loop_host(host, fun_id);
+        if !round {
+            break;
+        }
+        changed = true;
+    }
+    changed
+}
+
+crate::register_function_pass_v2!(Dce);

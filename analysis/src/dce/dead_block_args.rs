@@ -30,8 +30,9 @@ use jstd::graph::analysis::{DominatorTree, compute_dominators};
 use qcode::{
     context::Context,
     value::{
-        BasicBlock, BlockId, BlockParamId, ValueId,
+        BlockId, BlockParamId, BlockRef, FunctionRef, ValueId,
         insn::{Branch, CBranch, Mnemonic},
+        util::{base_ref::HostRef, host_mut::HostMut},
     },
 };
 
@@ -46,21 +47,21 @@ use crate::gvn::congruence::{Congruence, SymId};
 /// param collapses to — and `None` when the param is a genuine merge of two or
 /// more distinct values (not redundant) or has no non-self incoming value.
 fn unique_incoming(
-    ctx: &Context,
+    host: HostRef,
     block: BlockId,
     index: usize,
     self_val: ValueId,
 ) -> Option<ValueId> {
     // Dedup predecessor blocks: a `CBranch` whose two edges both target `block`
     // shows up twice but its terminator is read once below (handling both arms).
-    let preds: HashSet<BlockId> = BasicBlock::from_id(ctx, block)
+    let preds: HashSet<BlockId> = BlockRef::new(host, block)
         .predecessors()
         .map(|(_, b)| b)
         .collect();
 
     let mut found: Option<ValueId> = None;
     for pred in preds {
-        let Some(&term_id) = ctx.values.block(pred).instructions.last() else {
+        let Some(&term_id) = host.block(pred).instructions.last() else {
             continue;
         };
         let mut consider = |arg: ValueId| -> bool {
@@ -77,7 +78,7 @@ fn unique_incoming(
             }
         };
 
-        let ok = match ctx.get_insn(term_id).mnemonic() {
+        let ok = match host.instruction(term_id).mnemonic() {
             Mnemonic::Branch(b) if b.target == block => {
                 b.args.get(index).copied().is_some_and(&mut consider)
             }
@@ -118,7 +119,16 @@ fn unique_incoming(
 ///
 /// Returns whether anything was removed.
 pub fn remove_dead_block_args(
-    ctx: &mut Context,
+    mut ctx: &mut Context,
+    block_ids: &[BlockId],
+    root: Option<BlockId>,
+) -> bool {
+    remove_dead_block_args_host(&mut ctx, block_ids, root)
+}
+
+/// Host-generic core of [`remove_dead_block_args`]; see that function.
+pub fn remove_dead_block_args_host<'str, H: HostMut<'str>>(
+    host: &mut H,
     block_ids: &[BlockId],
     root: Option<BlockId>,
 ) -> bool {
@@ -127,16 +137,16 @@ pub fn remove_dead_block_args(
         // Cheap syntactic pass first (no value numbering); only when it is
         // exhausted do we build the dominator tree + congruence engine to catch
         // params whose incoming arguments are *congruent* but not identical.
-        let found = find_redundant_param(ctx, block_ids, root)
-            .or_else(|| find_congruent_param(ctx, block_ids, root));
+        let found = find_redundant_param(host.read_host(), block_ids, root)
+            .or_else(|| find_congruent_param(host.read_host(), block_ids, root));
         let Some((block, index, param, repl)) = found else {
             break;
         };
 
         // `p ≡ repl`: rewrite every use, then strip the param and the now-removed
         // column of arguments from each predecessor.
-        ctx.replace_all_uses_with(ValueId::BlockParam(param), repl);
-        remove_params_from_block(ctx, block, &HashSet::from_iter([index]));
+        host.replace_all_uses_with(ValueId::BlockParam(param), repl);
+        remove_params_from_block_host(host, block, &HashSet::from_iter([index]));
         changed = true;
     }
     changed
@@ -169,7 +179,16 @@ pub fn remove_dead_block_args(
 ///
 /// Returns whether anything was removed.
 pub fn remove_dead_block_params(
-    ctx: &mut Context,
+    mut ctx: &mut Context,
+    block_ids: &[BlockId],
+    root: Option<BlockId>,
+) -> bool {
+    remove_dead_block_params_host(&mut ctx, block_ids, root)
+}
+
+/// Host-generic core of [`remove_dead_block_params`]; see that function.
+pub fn remove_dead_block_params_host<'str, H: HostMut<'str>>(
+    host: &mut H,
     block_ids: &[BlockId],
     root: Option<BlockId>,
 ) -> bool {
@@ -185,21 +204,33 @@ pub fn remove_dead_block_params(
     };
 
     for &block in block_ids {
-        let insns: Vec<_> = BasicBlock::from_id(ctx, block)
+        let insns: Vec<_> = BlockRef::new(host.read_host(), block)
             .iter()
             .map(|i| i.id)
             .collect();
         for id in insns {
-            match ctx.get_insn(id).mnemonic() {
-                Mnemonic::Branch(b) => forward_edges(ctx, &b.args, b.target, &mut edges),
+            match host.read_host().instruction(id).mnemonic() {
+                Mnemonic::Branch(b) => {
+                    forward_edges(host.read_host(), &b.args, b.target, &mut edges)
+                }
                 Mnemonic::CBranch(c) => {
                     // The condition is a real read; only the per-target argument
                     // lists are forwarding edges.
                     if let ValueId::BlockParam(p) = c.condition {
                         live.insert(p);
                     }
-                    forward_edges(ctx, &c.success_args, c.success_block, &mut edges);
-                    forward_edges(ctx, &c.failure_args, c.failure_block, &mut edges);
+                    forward_edges(
+                        host.read_host(),
+                        &c.success_args,
+                        c.success_block,
+                        &mut edges,
+                    );
+                    forward_edges(
+                        host.read_host(),
+                        &c.failure_args,
+                        c.failure_block,
+                        &mut edges,
+                    );
                 }
                 // Every other instruction (incl. indirect branch/call pointers,
                 // call args, the return slot) observes all of its operands.
@@ -215,12 +246,12 @@ pub fn remove_dead_block_params(
     // Seed root + protected params live, then propagate liveness backwards along
     // the forwarding edges to a fixpoint: a param feeding a live param is live.
     if let Some(root) = root {
-        for &p in &ctx.values.block(root).params {
+        for &p in &host.read_host().block(root).params {
             live.insert(p);
         }
     }
     for &(src, _) in &edges {
-        if ctx.values.block_param(src).protected {
+        if host.read_host().block_param(src).protected {
             live.insert(src);
         }
     }
@@ -240,7 +271,7 @@ pub fn remove_dead_block_params(
     // they never appear here; root params likewise).
     let mut dead_by_block: rustc_hash::FxHashMap<BlockId, HashSet<usize>> = Default::default();
     for &block in block_ids {
-        let params = ctx.values.block(block).params.clone();
+        let params = host.read_host().block(block).params.clone();
         for (index, &p) in params.iter().enumerate() {
             if !live.contains(&p) {
                 dead_by_block.entry(block).or_default().insert(index);
@@ -252,7 +283,7 @@ pub fn remove_dead_block_params(
         return false;
     }
     for (block, indices) in dead_by_block {
-        remove_params_from_block(ctx, block, &indices);
+        remove_params_from_block_host(host, block, &indices);
     }
     true
 }
@@ -260,12 +291,12 @@ pub fn remove_dead_block_params(
 /// Record a forwarding edge `src_param -> target_param` for each branch argument
 /// at `target`'s matching param slot that is itself a block parameter.
 fn forward_edges(
-    ctx: &Context,
+    host: HostRef,
     args: &[ValueId],
     target: BlockId,
     edges: &mut Vec<(BlockParamId, BlockParamId)>,
 ) {
-    let params = &ctx.values.block(target).params;
+    let params = &host.block(target).params;
     for (i, &a) in args.iter().enumerate() {
         if let (ValueId::BlockParam(src), Some(&tgt)) = (a, params.get(i)) {
             edges.push((src, tgt));
@@ -285,32 +316,28 @@ fn forward_edges(
 /// and calls stay identity leaves in the congruence, so no value that depends on
 /// mutable memory is ever assumed stable across iterations.
 fn find_congruent_param(
-    ctx: &Context,
+    host: HostRef,
     block_ids: &[BlockId],
     root: Option<BlockId>,
 ) -> Option<(BlockId, usize, BlockParamId, ValueId)> {
     let root = root?;
-    let dom = compute_dominators(&qcode::value::Function::from_id(ctx, root.func), root);
-    let mut cong = Congruence::new(precompute_forms_for_blocks(ctx, block_ids));
+    let dom = compute_dominators(&FunctionRef::new(host, root.func), root);
+    let mut cong = Congruence::new(precompute_forms_for_blocks(host, block_ids));
 
     for &block in block_ids {
         if block == root {
             continue;
         }
-        if BasicBlock::from_id(ctx, block)
-            .predecessors()
-            .next()
-            .is_none()
-        {
+        if BlockRef::new(host, block).predecessors().next().is_none() {
             continue;
         }
-        let params = ctx.values.block(block).params.clone();
+        let params = host.block(block).params.clone();
         for (index, &param) in params.iter().enumerate() {
-            if ctx.values.block_param(param).protected {
+            if host.block_param(param).protected {
                 continue;
             }
             if let Some(repl) = congruent_incoming(
-                ctx,
+                host,
                 &mut cong,
                 &dom,
                 block,
@@ -334,18 +361,18 @@ fn find_congruent_param(
 /// sound. Returns `None` for a genuine merge of distinct values or when no
 /// dominating predecessor carries the value.
 fn congruent_incoming(
-    ctx: &Context,
+    host: HostRef,
     cong: &mut Congruence,
     dom: &DominatorTree<BlockId>,
     block: BlockId,
     index: usize,
     self_val: ValueId,
 ) -> Option<ValueId> {
-    let self_sym = cong.id(ctx, self_val);
+    let self_sym = cong.id(host, self_val);
 
     // Dedup predecessor blocks (a `CBranch` with both edges to `block` lists it
     // twice but its terminator is read once, covering both arms).
-    let preds: HashSet<BlockId> = BasicBlock::from_id(ctx, block)
+    let preds: HashSet<BlockId> = BlockRef::new(host, block)
         .predecessors()
         .map(|(_, b)| b)
         .collect();
@@ -354,11 +381,11 @@ fn congruent_incoming(
     let mut dom_repl: Option<ValueId> = None;
 
     for pred in preds {
-        let Some(&term_id) = ctx.values.block(pred).instructions.last() else {
+        let Some(&term_id) = host.block(pred).instructions.last() else {
             continue;
         };
-        for arg in incoming_args(ctx, term_id, block, index) {
-            let s = cong.id(ctx, arg);
+        for arg in incoming_args(host, term_id, block, index) {
+            let s = cong.id(host, arg);
             if s == self_sym {
                 continue; // self / congruent-to-self: a pass-through edge
             }
@@ -380,13 +407,13 @@ fn congruent_incoming(
 /// The argument bound to position `index` of `block` by `term_id` (a
 /// predecessor's terminator), considering both arms of a `CBranch`.
 fn incoming_args(
-    ctx: &Context,
+    host: HostRef,
     term_id: qcode::value::insn::InstructionId,
     block: BlockId,
     index: usize,
 ) -> Vec<ValueId> {
     let mut out = Vec::new();
-    match ctx.get_insn(term_id).mnemonic() {
+    match host.instruction(term_id).mnemonic() {
         Mnemonic::Branch(b) if b.target == block => out.extend(b.args.get(index).copied()),
         Mnemonic::CBranch(c) => {
             if c.success_block == block {
@@ -404,7 +431,7 @@ fn incoming_args(
 /// Scan for the first redundant param: a non-root, non-protected param on a block
 /// with predecessors whose incoming arguments reduce to a single value `repl`.
 fn find_redundant_param(
-    ctx: &Context,
+    host: HostRef,
     block_ids: &[BlockId],
     root: Option<BlockId>,
 ) -> Option<(BlockId, usize, BlockParamId, ValueId)> {
@@ -412,19 +439,15 @@ fn find_redundant_param(
         if Some(block) == root {
             continue;
         }
-        if BasicBlock::from_id(ctx, block)
-            .predecessors()
-            .next()
-            .is_none()
-        {
+        if BlockRef::new(host, block).predecessors().next().is_none() {
             continue;
         }
-        let params = ctx.values.block(block).params.clone();
+        let params = host.block(block).params.clone();
         for (index, &param) in params.iter().enumerate() {
-            if ctx.values.block_param(param).protected {
+            if host.block_param(param).protected {
                 continue;
             }
-            if let Some(repl) = unique_incoming(ctx, block, index, ValueId::BlockParam(param)) {
+            if let Some(repl) = unique_incoming(host, block, index, ValueId::BlockParam(param)) {
                 return Some((block, index, param, repl));
             }
         }
@@ -435,34 +458,43 @@ fn find_redundant_param(
 /// Drop the params at `dead_indices` from `block`, reindexing the survivors, and
 /// strip the matching positional argument from every predecessor terminator.
 pub(crate) fn remove_params_from_block(
-    ctx: &mut Context,
+    mut ctx: &mut Context,
     block: BlockId,
     dead_indices: &HashSet<usize>,
 ) {
-    let params = ctx.values.block(block).params.clone();
+    remove_params_from_block_host(&mut ctx, block, dead_indices);
+}
+
+/// Host-generic core of [`remove_params_from_block`]; see that function.
+pub(crate) fn remove_params_from_block_host<'str, H: HostMut<'str>>(
+    host: &mut H,
+    block: BlockId,
+    dead_indices: &HashSet<usize>,
+) {
+    let params = host.read_host().block(block).params.clone();
     let mut kept = Vec::with_capacity(params.len());
     for (i, &p) in params.iter().enumerate() {
         if dead_indices.contains(&i) {
-            ctx.values.block_param_mut(p).parent = None;
+            host.block_param_mut(p).parent = None;
         } else {
-            ctx.values.block_param_mut(p).index = kept.len();
+            host.block_param_mut(p).index = kept.len();
             kept.push(p);
         }
     }
-    ctx.values.block_mut(block).params = kept;
+    host.block_mut(block).params = kept;
 
     // A predecessor reaching `block` through both edges of a `CBranch` appears
     // twice; dedup so we rewrite its terminator exactly once.
-    let preds: HashSet<BlockId> = BasicBlock::from_id(ctx, block)
+    let preds: HashSet<BlockId> = BlockRef::new(host.read_host(), block)
         .predecessors()
         .map(|(_, b)| b)
         .collect();
 
     for pred in preds {
-        let Some(&term_id) = ctx.values.block(pred).instructions.last() else {
+        let Some(term_id) = host.read_host().block(pred).instructions.last().copied() else {
             continue;
         };
-        let new = match ctx.get_insn(term_id).mnemonic().clone() {
+        let new = match host.read_host().instruction(term_id).mnemonic().clone() {
             Mnemonic::Branch(b) if b.target == block => Mnemonic::Branch(Branch {
                 target: b.target,
                 args: filter_kept(&b.args, dead_indices),
@@ -486,7 +518,7 @@ pub(crate) fn remove_params_from_block(
             // reached that way has no params to feed and never reaches here.
             _ => continue,
         };
-        ctx.replace_instruction_mnemonic(term_id, new);
+        host.replace_instruction_mnemonic(term_id, new);
     }
 }
 
@@ -502,7 +534,7 @@ fn filter_kept(args: &[ValueId], drop: &HashSet<usize>) -> Vec<ValueId> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use qcode::value::FunctionRef;
+    use qcode::value::BasicBlock;
     use qcode_macro::qcode;
 
     /// All block ids of `fun`, used to drive the standalone sweep in tests.

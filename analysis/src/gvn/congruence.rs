@@ -17,10 +17,7 @@
 
 use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
 
-use qcode::{
-    context::Context,
-    value::{ValueId, insn::Mnemonic},
-};
+use qcode::value::{ValueId, insn::Mnemonic, util::base_ref::HostRef};
 
 use super::affine::{NormalForm, Numbering};
 use super::cse::is_commutative;
@@ -73,7 +70,7 @@ impl Congruence {
     }
 
     /// The structural id of `v`. Equal ids ⟺ provably the same value.
-    pub(crate) fn id(&mut self, ctx: &Context, v: impl Into<ValueId>) -> SymId {
+    pub(crate) fn id(&mut self, host: HostRef<'_, '_>, v: impl Into<ValueId>) -> SymId {
         let v = v.into();
         if let Some(&s) = self.memo.get(&v) {
             return s;
@@ -82,7 +79,7 @@ impl Congruence {
             // A cycle (should not arise in acyclic SSA): treat as opaque.
             return self.intern(Sym::Leaf(v));
         }
-        let s = self.compute(ctx, v);
+        let s = self.compute(host, v);
         self.building.remove(&v);
         self.memo.insert(v, s);
         s
@@ -90,14 +87,15 @@ impl Congruence {
 
     /// Whether `a` and `b` are structurally congruent. Test-only helper.
     #[cfg(test)]
-    pub(crate) fn congruent(
+    pub(crate) fn congruent<'a, 'str: 'a>(
         &mut self,
-        ctx: &Context,
+        host: impl Into<HostRef<'a, 'str>>,
         a: impl Into<ValueId>,
         b: impl Into<ValueId>,
     ) -> bool {
+        let host = host.into();
         let (a, b) = (a.into(), b.into());
-        a == b || self.id(ctx, a) == self.id(ctx, b)
+        a == b || self.id(host, a) == self.id(host, b)
     }
 
     fn intern(&mut self, s: Sym) -> SymId {
@@ -110,7 +108,7 @@ impl Congruence {
         id
     }
 
-    fn compute(&mut self, ctx: &Context, v: ValueId) -> SymId {
+    fn compute(&mut self, host: HostRef<'_, '_>, v: ValueId) -> SymId {
         // Affine values flatten arithmetic structure (and unify reassociations).
         // A self-leaf (`1·v + 0`) means the op did not decompose — fall through
         // to op/leaf classification.
@@ -122,7 +120,7 @@ impl Congruence {
             && !(constant == 0 && terms.len() == 1 && terms[0] == (v, 1))
         {
             let mut ts: Vec<(SymId, u64)> =
-                terms.iter().map(|&(t, c)| (self.id(ctx, t), c)).collect();
+                terms.iter().map(|&(t, c)| (self.id(host, t), c)).collect();
             // Distinct term `ValueId`s may collapse to one `SymId` (congruent
             // terms): re-merge their coefficients so the form stays canonical.
             ts = merge_sym_terms(ts, width);
@@ -130,12 +128,12 @@ impl Congruence {
         }
 
         if let ValueId::Instruction(id) = v {
-            let insn = ctx.get_insn(id);
+            let insn = qcode::value::InstructionRef::new(host, id);
             let mnemonic = insn.mnemonic().clone();
             let size = insn.size();
             if is_pure_value_op(&mnemonic) {
                 let args = mnemonic.args();
-                let mut arg_syms: Vec<SymId> = args.iter().map(|&a| self.id(ctx, a)).collect();
+                let mut arg_syms: Vec<SymId> = args.iter().map(|&a| self.id(host, a)).collect();
                 if let Mnemonic::Binop(b) = &mnemonic
                     && is_commutative(&b.op)
                     && arg_syms.len() == 2
@@ -212,6 +210,7 @@ fn is_pure_value_op(m: &Mnemonic) -> bool {
 mod tests {
     use super::super::affine::precompute_forms_for_blocks;
     use super::*;
+    use qcode::context::Context;
     use qcode::value::{BlockId, FunctionId, FunctionRef};
     use qcode_macro::qcode;
 
