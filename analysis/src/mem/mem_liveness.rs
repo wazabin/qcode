@@ -144,14 +144,8 @@ pub fn compute_memory_liveness<'a, 'str: 'a>(
         let live_out = union_live(&succs, &live_in);
         let killed_out = intersect_killed(&succs, &killed_in);
 
-        let (mut new_live_in, mut new_killed_in) = block_transfer(
-            host.shared(),
-            block,
-            aliases,
-            dead_regs,
-            &live_out,
-            &killed_out,
-        );
+        let (mut new_live_in, mut new_killed_in) =
+            block_transfer(host, block, aliases, dead_regs, &live_out, &killed_out);
         retain_tracked(host, &mut new_live_in, &mut new_killed_in);
 
         let mut block_changed = false;
