@@ -163,6 +163,13 @@ pub trait DynFunctionPass: Send + Sync {
     fn as_v2(&self) -> Option<&dyn CheckedV2Pass> {
         None
     }
+
+    /// Whether this pass may mint functions (see [`FunctionPassV2::MINTS`]).
+    /// The driver reserves per-function id pools only for stages that contain a
+    /// minting pass. Legacy passes create functions directly and answer `false`.
+    fn mints(&self) -> bool {
+        false
+    }
 }
 
 impl<T: FunctionPass + Send + Sync> DynFunctionPass for T {
@@ -215,6 +222,11 @@ pub trait CheckedV2Pass {
 /// flight.
 pub trait FunctionPassV2: Default {
     const NAME: &'static str;
+    /// Whether this pass may mint new functions via
+    /// [`FunctionBody::mint_function`] (the loop outliners are the only ones).
+    /// The driver reserves a per-function id pool only for stages containing
+    /// such a pass, so a non-minting pass costs nothing.
+    const MINTS: bool = false;
     fn description(&self) -> &'static str;
     fn run<'str>(
         &self,
@@ -270,27 +282,79 @@ impl<T: FunctionPassV2 + Send + Sync> DynFunctionPass for V2Adapter<T> {
     fn as_v2(&self) -> Option<&dyn CheckedV2Pass> {
         Some(self)
     }
+    fn mints(&self) -> bool {
+        T::MINTS
+    }
     fn run(
         &self,
         ctx: &mut Context,
         fun_id: FunctionId,
         env: &PipelineEnv,
     ) -> Result<bool, String> {
+        // A minting pass run through the adapter (unit tests, `module(...)`
+        // spellings) reserves its own throwaway ids — there is no driver pool on
+        // this path. Unused ones stay behind as sentinel tombstones (never
+        // observed, never rendered); the stage driver's pooled path recycles.
+        let reserved: Vec<FunctionId> = if T::MINTS {
+            (0..MINT_RESERVE)
+                .map(|_| ctx.values.push_function(Function::sentinel()))
+                .collect()
+        } else {
+            Vec::new()
+        };
         // Check out: the pass owns its function exclusively; the context it reads
         // through `ModuleView` no longer holds (and so cannot alias) that function.
+        let before_targets = ctx.direct_call_targets(fun_id);
         let fun = ctx.checkout_function(fun_id);
-        // Sequential bridge: no reserved ids yet (function minting is wired with
-        // the first V2 outliner port). A V2 pass that mints is guarded below.
-        let mut body = FunctionBody::new(fun_id, fun, Vec::new());
+        let mut body = FunctionBody::new(fun_id, fun, reserved);
         let changed = {
             let view = ModuleView::new(ctx, env);
             self.run_checked(&view, &mut body)?
         };
-        let (fun, effects, minted, _reserved) = body.into_parts();
+        let (fun, effects, minted, _unused) = body.into_parts();
+        // Check-in protocol, in the driver's order: install minted callees first
+        // (so the owner's new call sites resolve), reinstall the owner, rebuild
+        // its `call_sites` diff, then replay buffered effects.
+        install_minted(ctx, T::NAME, minted)?;
         ctx.checkin_function(fun_id, fun);
-        replay_effects(ctx, T::NAME, fun_id, effects, minted)?;
+        ctx.resync_call_sites(fun_id, &before_targets);
+        replay_effects(ctx, T::NAME, fun_id, effects)?;
         Ok(changed)
     }
+}
+
+/// How many function ids are reserved per checked-out function for minting
+/// (`PARALLEL_PASSES.md` ruling 3). Every current outliner mints at most one
+/// function per run; a pass needing more simply stops promoting when the pool
+/// runs dry.
+pub(super) const MINT_RESERVE: usize = 2;
+
+/// Install a pass's minted functions into their reserved registry slots at
+/// check-in (master thread, worklist order): uniquify each buffered raw name
+/// against the global map, replace the sentinel slot, and register the name.
+/// Returns the installed ids so the driver can mark them dirty for downstream
+/// `only_dirty` stages. Must run *before* the owning function's
+/// `resync_call_sites`, so its new call sites resolve against real callees.
+pub(super) fn install_minted<'str>(
+    ctx: &mut Context<'str>,
+    pass: &str,
+    minted: Vec<(FunctionId, qcode::value::Function<'str>)>,
+) -> Result<Vec<FunctionId>, String> {
+    let mut installed = Vec::with_capacity(minted.len());
+    for (id, mut fun) in minted {
+        debug_assert!(
+            ctx.values.functions[id].is_sentinel(),
+            "{pass}: minted id {id:?} does not hold a reserved sentinel slot"
+        );
+        let name = std::mem::take(&mut fun.name);
+        let unique = ctx.get_unique_name(name);
+        fun.name = unique.clone();
+        ctx.values.functions.replace(id, fun);
+        ctx.update_name(unique, id.into(), None)
+            .map_err(|e| format!("{pass}: minted-function name registration failed: {e}"))?;
+        installed.push(id);
+    }
+    Ok(installed)
 }
 
 /// Replay a V2 pass's buffered [`Effects`] into the context at check-in. Runs on
@@ -306,7 +370,6 @@ pub(super) fn replay_effects<'str>(
     pass: &str,
     fun_id: FunctionId,
     effects: super::Effects<'str>,
-    minted: Vec<qcode::value::Function<'str>>,
 ) -> Result<bool, String> {
     let mut changed = false;
     for (prop, value) in effects.assumptions {
@@ -330,11 +393,6 @@ pub(super) fn replay_effects<'str>(
     if !effects.address_claims.is_empty() {
         return Err(format!(
             "{pass}: V2 address-claim replay not wired yet (port handle_jump_tables first)"
-        ));
-    }
-    if !minted.is_empty() {
-        return Err(format!(
-            "{pass}: V2 function minting not wired yet (port the loop outliners first)"
         ));
     }
     Ok(changed)

@@ -20,8 +20,8 @@ use qcode::{
 
 use super::lifter::PipelineServices;
 use super::pass::{
-    DynFunctionPass, DynPass, PipelineEnv, RegisteredPass, known_pass_names, make_pass,
-    replay_effects,
+    DynFunctionPass, DynPass, MINT_RESERVE, PipelineEnv, RegisteredPass, install_minted,
+    known_pass_names, make_pass, replay_effects,
 };
 use super::{FunctionBody, ModuleView, PipelineProgress, ProgressSink, YieldSignal};
 
@@ -495,6 +495,7 @@ impl Pipeline {
         let end = self.barrier_index().unwrap_or(self.stages.len());
         let mut dirty_functions = Some(HashSet::default());
         let mut cache = FixpointCache::default();
+        let mut pool = MintPool::default();
         for stage in &self.stages[..end] {
             match &stage.passes {
                 StagePasses::Module(passes) => {
@@ -516,6 +517,7 @@ impl Pipeline {
                             dirty_functions.as_ref(),
                             None,
                             &mut cache,
+                            &mut pool,
                             round,
                             progress,
                         )
@@ -568,6 +570,7 @@ impl Pipeline {
         let start = self.barrier_index().map(|i| i + 1).unwrap_or(0);
         let mut dirty_functions = Some(HashSet::default());
         let mut cache = FixpointCache::default();
+        let mut pool = MintPool::default();
         for stage in &self.stages[start..] {
             match &stage.passes {
                 StagePasses::Function(passes) => {
@@ -582,6 +585,7 @@ impl Pipeline {
                             dirty_functions.as_ref(),
                             restrict,
                             &mut cache,
+                            &mut pool,
                             round,
                             progress,
                         )
@@ -610,6 +614,7 @@ impl Pipeline {
     ) -> Result<(), String> {
         let mut dirty_functions = Some(HashSet::default());
         let mut cache = FixpointCache::default();
+        let mut pool = MintPool::default();
         for stage in &self.stages[range] {
             match &stage.passes {
                 StagePasses::Module(passes) => {
@@ -631,6 +636,7 @@ impl Pipeline {
                             dirty_functions.as_ref(),
                             None,
                             &mut cache,
+                            &mut pool,
                             round,
                             progress,
                         )
@@ -1179,6 +1185,44 @@ impl FixpointCache {
     }
 }
 
+/// The reservation pool for function minting (`PARALLEL_PASSES.md` ruling 3).
+///
+/// A checked-out function pass cannot push into the global function registry, so
+/// the driver pre-materializes never-observed sentinel slots and hands each
+/// worklist function [`MINT_RESERVE`] of their ids at checkout — assigned in
+/// worklist order, identically on the sequential and parallel lanes, so minted
+/// ids (and therefore the registry-ordered module dump) are byte-identical
+/// across lanes. Ids a function did not use return here at the end of the stage
+/// (again in worklist order) and are consumed by the *next* stage before any new
+/// sentinel is pushed. Scope is one pipeline run, like [`FixpointCache`];
+/// pipeline-end leftovers stay behind as sentinel tombstones.
+#[derive(Default)]
+struct MintPool {
+    /// Recycled reserved ids, FIFO. Never consumed by the stage that returned
+    /// them (all of a stage's reservations happen before its first check-in).
+    available: std::collections::VecDeque<FunctionId>,
+}
+
+impl MintPool {
+    /// Draw `n` reserved ids: recycled ones first, then fresh sentinel slots
+    /// pushed into the registry.
+    fn reserve(&mut self, ctx: &mut Context, n: usize) -> Vec<FunctionId> {
+        (0..n)
+            .map(|_| {
+                self.available.pop_front().unwrap_or_else(|| {
+                    ctx.values
+                        .push_function(qcode::value::Function::sentinel())
+                })
+            })
+            .collect()
+    }
+
+    /// Return a check-in's unused reserved ids for the next stage to consume.
+    fn recycle(&mut self, ids: Vec<FunctionId>) {
+        self.available.extend(ids);
+    }
+}
+
 /// A fingerprint of one function's rendered body, used to detect whether a
 /// module stage modified it. Rendering the IR captures operand rewrites,
 /// insertions/removals, retypes, and CFG edits; block order is address-sorted
@@ -1315,6 +1359,7 @@ async fn run_function_stage(
     // discoveries, so re-optimizing it is pure waste. `None` processes all functions.
     restrict: Option<&HashSet<FunctionId>>,
     cache: &mut FixpointCache,
+    pool: &mut MintPool,
     round: usize,
     progress: &mut impl ProgressSink,
 ) -> Result<HashSet<FunctionId>, String> {
@@ -1352,10 +1397,11 @@ async fn run_function_stage(
 
     // A stage all of whose passes are V2 can be driven over a checked-out body
     // (`run_one_function`) — the shape Stage 6 runs on worker threads. A stage that
-    // still contains a legacy `FunctionPass` (gvn, handle_jump_tables, the loop
-    // outliners) takes the classic in-place path below, unchanged.
+    // still contains a legacy `FunctionPass` (handle_jump_tables) takes the classic
+    // in-place path below, unchanged.
     let all_v2 = passes.iter().all(|p| p.is_v2());
 
+    /*
     /*
     for (index, fun_id) in fun_ids.into_iter().enumerate() {
         let function: std::sync::Arc<str> = FunctionRef::from_id(ctx, fun_id).name().into();
@@ -1455,6 +1501,22 @@ async fn run_function_stage(
                 let view = ModuleView::new(ctx, env);
                 run_one_function(
     */
+    */
+    // Function-minting reservations (`PARALLEL_PASSES.md` ruling 3): when a stage
+    // contains a minting pass, reserve `MINT_RESERVE` ids per worklist function up
+    // front, in worklist order — the identical discipline on both lanes, so minted
+    // ids are byte-identical between the sequential and parallel runs. Unused ids
+    // are collected per function at check-in and recycled (in worklist order) at
+    // the end of the stage, for the next stage to consume.
+    let mut reservations: HashMap<FunctionId, Vec<FunctionId>> = HashMap::default();
+    let mut leftover: HashMap<FunctionId, Vec<FunctionId>> = HashMap::default();
+    if all_v2 && passes.iter().any(|p| p.mints()) {
+        for &fun_id in &fun_ids {
+            let ids = pool.reserve(ctx, MINT_RESERVE);
+            reservations.insert(fun_id, ids);
+        }
+    }
+
     // Parallelize an all-V2 stage across threads once the worklist is worth the
     // fan-out cost. Functions tied to another by a cross-function CFG edge (a
     // thunk/tail-call `Branch` into another function's entry) are held back for the
@@ -1484,6 +1546,8 @@ async fn run_function_stage(
                     cache,
                     &mut elapsed,
                     &mut dirty,
+                    &mut reservations,
+                    &mut leftover,
                     threads,
                     progress,
                 )?;
@@ -1498,7 +1562,7 @@ async fn run_function_stage(
     // The sequential lane: functions not handled in parallel above (all of them
     // when the stage did not parallelize; only the entangled remainder when it did).
     {
-        for (index, fun_id) in fun_ids.into_iter().enumerate() {
+        for (index, fun_id) in fun_ids.iter().copied().enumerate() {
             if parallel_set.contains(&fun_id) {
                 continue;
             }
@@ -1509,7 +1573,8 @@ async fn run_function_stage(
                 // buffered effects — the sequential form of the parallel check-in.
                 let before_targets = ctx.direct_call_targets(fun_id);
                 let fun = ctx.checkout_function(fun_id);
-                let mut body = FunctionBody::new(fun_id, fun, Vec::new());
+                let reserved = reservations.remove(&fun_id).unwrap_or_default();
+                let mut body = FunctionBody::new(fun_id, fun, reserved);
                 let function_changed = {
                     let view = ModuleView::new(ctx, env);
                     run_one_function(
@@ -1533,10 +1598,16 @@ async fn run_function_stage(
                         },
                     )?
                 };
-                let (fun, effects, minted, _reserved) = body.into_parts();
+                let (fun, effects, minted, unused) = body.into_parts();
+                // Install minted callees before the owner checks in and its call
+                // sites resync, so the new calls resolve against real functions.
+                let installed = install_minted(ctx, &stage.name, minted)?;
                 ctx.checkin_function(fun_id, fun);
                 ctx.resync_call_sites(fun_id, &before_targets);
-                replay_effects(ctx, &stage.name, fun_id, effects, minted)?;
+                replay_effects(ctx, &stage.name, fun_id, effects)?;
+                // Minted functions are new work for downstream `only_dirty` stages.
+                dirty.extend(installed);
+                leftover.insert(fun_id, unused);
                 // Between-stage invariant check happens in `verify_after_stage`;
                 // per-pass verification is skipped on the checked-out path (the
                 // function is absent from `ctx` mid-fixpoint).
@@ -1568,6 +1639,14 @@ async fn run_function_stage(
         // and can cancel, in which case we stop early and return the work done so far.
         if let YieldSignal::Cancelled = progress.yield_now().await {
             return Ok(dirty);
+        }
+    }
+
+    // Recycle unused reservations in worklist order — deterministic and identical
+    // on both lanes regardless of which lane checked a function in.
+    for fun_id in &fun_ids {
+        if let Some(ids) = leftover.remove(fun_id) {
+            pool.recycle(ids);
         }
     }
 
@@ -1876,22 +1955,26 @@ fn run_stage_parallel(
     cache: &mut FixpointCache,
     elapsed: &mut HashMap<&'static str, (std::time::Duration, usize, usize)>,
     dirty: &mut HashSet<FunctionId>,
+    reservations: &mut HashMap<FunctionId, Vec<FunctionId>>,
+    leftover: &mut HashMap<FunctionId, Vec<FunctionId>>,
     threads: usize,
     progress: &mut impl FnMut(PipelineProgress),
 ) -> Result<(), String> {
     // 1. Check out every worklist function up front (each leaves an interface shell
     //    in the module), snapshotting its call targets first for the check-in diff.
+    //    Each carries the minting reservations assigned to it in worklist order.
     let mut entries: Vec<ParallelEntry> = Vec::with_capacity(fun_ids.len());
     for (index, &fun_id) in fun_ids.iter().enumerate() {
         let name: std::sync::Arc<str> = FunctionRef::from_id(ctx, fun_id).name().into();
         let before_targets = ctx.direct_call_targets(fun_id);
         let fun = ctx.checkout_function(fun_id);
+        let reserved = reservations.remove(&fun_id).unwrap_or_default();
         entries.push(ParallelEntry {
             index,
             fun_id,
             name,
             before_targets,
-            body: FunctionBody::new(fun_id, fun, Vec::new()),
+            body: FunctionBody::new(fun_id, fun, reserved),
             changed: false,
         });
     }
@@ -1995,10 +2078,15 @@ fn run_stage_parallel(
             changed,
             ..
         } = entry;
-        let (fun, effects, minted, _reserved) = body.into_parts();
+        let (fun, effects, minted, unused) = body.into_parts();
+        // Install minted callees before the owner checks in and its call sites
+        // resync, so the new calls resolve against real functions.
+        let installed = install_minted(ctx, &stage.name, minted)?;
         ctx.checkin_function(fun_id, fun);
         ctx.resync_call_sites(fun_id, &before_targets);
-        replay_effects(ctx, &stage.name, fun_id, effects, minted)?;
+        replay_effects(ctx, &stage.name, fun_id, effects)?;
+        dirty.extend(installed);
+        leftover.insert(fun_id, unused);
         if changed {
             dirty.insert(fun_id);
         }

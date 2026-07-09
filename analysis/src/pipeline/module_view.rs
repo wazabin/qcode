@@ -19,7 +19,10 @@ use qcode::{
     assumption::Proposition,
     context::Context,
     discovery::Discovery,
-    value::{Function, FunctionId, ValueId, util::host_mut::CheckedOut},
+    value::{
+        Function, FunctionId, FunctionKind, ValueId,
+        util::{base_ref::HostRef, host_mut::CheckedOut},
+    },
 };
 
 use super::PipelineEnv;
@@ -129,8 +132,9 @@ pub struct FunctionBody<'str> {
     /// functions into (loop outliners mint exactly one). Unused ids return to the
     /// driver's pool at check-in.
     reserved_ids: Vec<FunctionId>,
-    /// Functions built this run against `reserved_ids`, installed at check-in.
-    minted: Vec<Function<'str>>,
+    /// Functions built this run against drawn `reserved_ids` (paired with the id
+    /// each was drawn for), installed by the driver at check-in.
+    minted: Vec<(FunctionId, Function<'str>)>,
 }
 
 impl<'str> FunctionBody<'str> {
@@ -182,6 +186,76 @@ impl<'str> FunctionBody<'str> {
         self.reserved_ids.len()
     }
 
+    /// A `Copy` read view over this body's owned function and the shared context
+    /// — the recognizer-side twin of [`host`](Self::host) for passes that only
+    /// need to *read* while holding other borrows.
+    pub fn read_host<'a>(&'a self, m: &'a ModuleView<'_, 'str>) -> HostRef<'a, 'str> {
+        HostRef::Checked {
+            fun: &self.fun,
+            shared: m.ctx(),
+            id: self.id,
+        }
+    }
+
+    /// Mint a new function (`PARALLEL_PASSES.md` ruling 3): draw one reserved id
+    /// from the pool the driver assigned this checkout, create a detached
+    /// [`Function`] shell under `name` (buffered **raw** — global uniquification
+    /// happens when the driver installs it at check-in) with the given `kind`,
+    /// and return its id. `pure` marks it a deterministic pure function
+    /// (`is_pure` + the implied `pure_reg`), which every current outliner's body
+    /// is. Build the body through [`host_with_minted`](Self::host_with_minted).
+    ///
+    /// Returns `None` when the reservation pool is exhausted — the calling pass
+    /// then simply stops promoting (skips its remaining candidates).
+    pub fn mint_function(
+        &mut self,
+        name: Cow<'str, str>,
+        kind: FunctionKind,
+        pure: bool,
+    ) -> Option<FunctionId> {
+        if self.reserved_ids.is_empty() {
+            return None;
+        }
+        let id = self.reserved_ids.remove(0);
+        let mut fun = Function::detached(name);
+        fun.kind = kind;
+        if pure {
+            let sig = fun.signature.get_or_insert_default();
+            sig.is_pure = true;
+            // Full purity implies register purity — the GUI badge keys off the
+            // latter (mirrors `outline_core` / `make_lambda`).
+            sig.pure_reg = true;
+        }
+        self.minted.push((id, fun));
+        Some(id)
+    }
+
+    /// Split this body into a read view of the *own* function and an exclusive
+    /// [`CheckedOut`] mutation host over the minted function `minted` (a
+    /// [`mint_function`](Self::mint_function) result). This is how an outliner
+    /// builds a minted body: it clones expression slices out of its own function
+    /// (read) into the minted one (write), both against the same shared context.
+    ///
+    /// Panics if `minted` was not minted by this body.
+    pub fn host_with_minted<'a>(
+        &'a mut self,
+        m: &'a ModuleView<'_, 'str>,
+        minted: FunctionId,
+    ) -> (HostRef<'a, 'str>, CheckedOut<'a, 'str>) {
+        let own = HostRef::Checked {
+            fun: &self.fun,
+            shared: m.ctx(),
+            id: self.id,
+        };
+        let fun = self
+            .minted
+            .iter_mut()
+            .find(|(id, _)| *id == minted)
+            .map(|(_, f)| f)
+            .expect("host_with_minted: not a function minted by this body");
+        (own, CheckedOut::new(fun, minted, m.ctx()))
+    }
+
     /// Consume the body at check-in, yielding the reinstallable function, its
     /// buffered effects, the functions it minted, and any unused reserved ids
     /// (returned to the driver's pool).
@@ -190,7 +264,7 @@ impl<'str> FunctionBody<'str> {
     ) -> (
         Function<'str>,
         Effects<'str>,
-        Vec<Function<'str>>,
+        Vec<(FunctionId, Function<'str>)>,
         Vec<FunctionId>,
     ) {
         (self.fun, self.effects, self.minted, self.reserved_ids)
