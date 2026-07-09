@@ -147,27 +147,28 @@ pub fn gvn_function(
 
 // ----- passes ----------------------------------------------------------------
 
-use crate::{FunctionPass, PipelineEnv};
+use crate::{FunctionBody, FunctionPass, FunctionPassV2, ModuleView, PipelineEnv};
 
 #[derive(Default)]
 pub struct ConstFold;
 
-impl FunctionPass for ConstFold {
+impl FunctionPassV2 for ConstFold {
     const NAME: &'static str = "const_fold";
     fn description(&self) -> &'static str {
         "Fold pointer/integer arithmetic into literals"
     }
-    fn run(
+    fn run<'str>(
         &self,
-        ctx: &mut Context,
-        fun_id: FunctionId,
-        _env: &PipelineEnv,
+        m: &ModuleView<'_, 'str>,
+        f: &mut FunctionBody<'str>,
     ) -> Result<bool, String> {
-        Ok(constant_fold_function(ctx, fun_id))
+        let fun_id = f.id();
+        let mut host = f.host(m);
+        Ok(constant_fold_host(&mut host, fun_id))
     }
 }
 
-crate::register_function_pass!(ConstFold);
+crate::register_function_pass_v2!(ConstFold);
 
 #[derive(Default)]
 pub struct Narrow;
