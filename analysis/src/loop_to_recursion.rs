@@ -80,29 +80,33 @@ pub(crate) struct LoopModel {
 }
 
 pub fn loop_to_recursion(ctx: &mut Context, fun_id: FunctionId) -> bool {
-    let Some(model) = recognize_loop(ctx, fun_id) else {
+    let Some(model) = recognize_loop(&*ctx, fun_id) else {
         return false;
     };
     transform(ctx, fun_id, &model);
     true
 }
 
-pub(crate) fn recognize_loop(ctx: &Context, fun_id: FunctionId) -> Option<LoopModel> {
-    let fun = Function::from_id(ctx, fun_id);
+pub(crate) fn recognize_loop<'a, 'str: 'a>(
+    host: impl Into<qcode::value::util::base_ref::HostRef<'a, 'str>>,
+    fun_id: FunctionId,
+) -> Option<LoopModel> {
+    let host = host.into();
+    let fun = qcode::value::FunctionRef::new(host, fun_id);
     if !fun.is_lambda() {
         return None;
     }
     let root = fun.root()?.id;
 
     // The entry must unconditionally branch into the header, carrying `init`.
-    let (head, init_args) = match terminator_mnemonic(ctx, root)? {
+    let (head, init_args) = match terminator_mnemonic(host, root)? {
         Mnemonic::Branch(Branch { target, args }) => (*target, args.clone()),
         _ => return None,
     };
     if head == root {
         return None;
     }
-    let arity = block_param_count(ctx, head);
+    let arity = block_param_count(host, head);
     if init_args.len() != arity {
         return None;
     }
@@ -110,7 +114,7 @@ pub(crate) fn recognize_loop(ctx: &Context, fun_id: FunctionId) -> Option<LoopMo
     // The loop is the header and everything it dominates. Since `root`'s only
     // successor is `head`, the region is reachable solely through the header, so
     // moving it out cannot strand any code the entry still needs.
-    let region = reachable_from(ctx, fun_id, head);
+    let region = reachable_from(host, fun_id, head);
     if region.contains(&root) {
         return None;
     }
@@ -119,7 +123,7 @@ pub(crate) fn recognize_loop(ctx: &Context, fun_id: FunctionId) -> Option<LoopMo
     // back-edge must be a clean latch (`goto head(next...)`) so we can rewrite
     // it into a recursive call without disturbing other control flow.
     let mut back_edges = Vec::new();
-    for (_edge, pred) in BasicBlock::from_id(ctx, head).predecessors() {
+    for (_edge, pred) in qcode::value::BlockRef::new(host, head).predecessors() {
         if pred == root {
             continue;
         }
@@ -127,7 +131,7 @@ pub(crate) fn recognize_loop(ctx: &Context, fun_id: FunctionId) -> Option<LoopMo
             // An entry into the loop from outside the region we are extracting.
             return None;
         }
-        match terminator_mnemonic(ctx, pred)? {
+        match terminator_mnemonic(host, pred)? {
             Mnemonic::Branch(Branch { target, args }) if *target == head => {
                 if args.len() != arity {
                     return None;
@@ -186,7 +190,7 @@ fn replace_terminator_with_apply(
     target: FunctionId,
     args: Vec<ValueId>,
 ) {
-    if let Some(term) = terminator_id(ctx, block) {
+    if let Some(term) = terminator_id((&*ctx).into(), block) {
         ctx.remove_instruction(term);
     }
     let mut b = Builder::from_block(BasicBlock::from_id_mut(ctx, block));
@@ -195,15 +199,19 @@ fn replace_terminator_with_apply(
 }
 
 /// Blocks reachable from `start` within `fun_id`, following CFG successors.
-fn reachable_from(ctx: &Context, fun_id: FunctionId, start: BlockId) -> HashSet<BlockId> {
+fn reachable_from<'a, 'str: 'a>(
+    host: qcode::value::util::base_ref::HostRef<'a, 'str>,
+    fun_id: FunctionId,
+    start: BlockId,
+) -> HashSet<BlockId> {
     let mut seen = HashSet::new();
     let mut stack = vec![start];
     while let Some(block) = stack.pop() {
         if !seen.insert(block) {
             continue;
         }
-        for (_edge, succ) in BasicBlock::from_id(ctx, block).successors() {
-            let same_fun = BasicBlock::from_id(ctx, succ)
+        for (_edge, succ) in qcode::value::BlockRef::new(host, block).successors() {
+            let same_fun = qcode::value::BlockRef::new(host, succ)
                 .function()
                 .is_some_and(|f| f.id == fun_id);
             if same_fun {
@@ -214,20 +222,33 @@ fn reachable_from(ctx: &Context, fun_id: FunctionId, start: BlockId) -> HashSet<
     seen
 }
 
-fn block_param_count(ctx: &Context, block: BlockId) -> usize {
-    BasicBlock::from_id(ctx, block).params().count()
+fn block_param_count<'a, 'str: 'a>(
+    host: qcode::value::util::base_ref::HostRef<'a, 'str>,
+    block: BlockId,
+) -> usize {
+    qcode::value::BlockRef::new(host, block).params().count()
 }
 
 /// The id of `block`'s terminator instruction, if it ends in one.
-fn terminator_id(ctx: &Context, block: BlockId) -> Option<InstructionId> {
-    let &id = BasicBlock::from_id(ctx, block).instruction_ids().last()?;
-    ctx.get_insn(id).is_terminator().then_some(id)
+fn terminator_id<'a, 'str: 'a>(
+    host: qcode::value::util::base_ref::HostRef<'a, 'str>,
+    block: BlockId,
+) -> Option<InstructionId> {
+    let &id = qcode::value::BlockRef::new(host, block)
+        .instruction_ids()
+        .last()?;
+    qcode::value::InstructionRef::new(host, id)
+        .is_terminator()
+        .then_some(id)
 }
 
 /// A borrow of `block`'s terminator mnemonic, avoiding a full clone.
-fn terminator_mnemonic<'a>(ctx: &'a Context, block: BlockId) -> Option<&'a Mnemonic> {
-    let id = terminator_id(ctx, block)?;
-    Some(ctx.get_insn(id).mnemonic())
+fn terminator_mnemonic<'a, 'str: 'a>(
+    host: qcode::value::util::base_ref::HostRef<'a, 'str>,
+    block: BlockId,
+) -> Option<&'a Mnemonic> {
+    let id = terminator_id(host, block)?;
+    Some(host.instruction(id).mnemonic())
 }
 
 #[cfg(test)]
@@ -238,7 +259,7 @@ mod tests {
 
     fn run(ctx: &Context, fun: FunctionId, n: u64) -> Option<u64> {
         let root = Function::from_id(ctx, fun).root().expect("root").id;
-        let ret = match terminator_mnemonic(ctx, root)? {
+        let ret = match terminator_mnemonic((&*ctx).into(), root)? {
             Mnemonic::ReturnValue(r) => r.value,
             _ => return None,
         };

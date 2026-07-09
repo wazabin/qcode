@@ -47,53 +47,71 @@ use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
 use qcode::{
     builder::Builder,
     context::Context,
+    types::TypeId,
     value::{
-        BasicBlock, Function, FunctionId, Instruction, InstructionRef, Renameable, ValueId,
+        BlockRef, FunctionId, FunctionKind, FunctionRef, InstructionRef, ValueId,
         block::BlockId,
-        block_param::BlockParamId,
-        insn::{CBranch, Mnemonic},
+        block_param::{BlockParam, BlockParamId},
+        insn::{Apply, CBranch, Extract, Mnemonic},
+        util::{
+            base_ref::{BaseRef, HostRef},
+            host_mut::{CheckedOut, HostMut},
+        },
     },
 };
 
 use crate::loop_to_recursion::recognize_loop;
-use crate::{FunctionPass, PipelineEnv};
+use crate::pipeline::{FunctionBody, ModuleView};
+use crate::{FunctionPassV2, register_function_pass_v2};
 
 #[derive(Default)]
 pub struct AccumulatorElim;
 
-impl FunctionPass for AccumulatorElim {
+impl FunctionPassV2 for AccumulatorElim {
     const NAME: &'static str = "accumulator_elim";
+    const MINTS: bool = true;
 
     fn description(&self) -> &'static str {
         "Eliminate loop-carried accumulators by returning them as a tuple"
     }
 
-    fn run(
+    fn run<'str>(
         &self,
-        ctx: &mut Context,
-        fun_id: FunctionId,
-        _env: &PipelineEnv,
+        m: &ModuleView<'_, 'str>,
+        f: &mut FunctionBody<'str>,
     ) -> Result<bool, String> {
-        Ok(accumulator_elim(ctx, fun_id))
+        Ok(accumulator_elim(m, f))
     }
 }
 
-crate::register_function_pass!(AccumulatorElim);
+register_function_pass_v2!(AccumulatorElim);
 
-pub fn accumulator_elim(ctx: &mut Context, host: FunctionId) -> bool {
-    let Some(model) = recognize_loop(ctx, host) else {
+pub fn accumulator_elim<'str>(m: &ModuleView<'_, 'str>, body: &mut FunctionBody<'str>) -> bool {
+    let host = body.id();
+    let Some((model, plan)) = classify(body.read_host(m), host) else {
         return false;
     };
+    transform(m, body, &model, &plan);
+    true
+}
+
+/// Recognize the accumulator-elimination shape in `host` and, if it fires, return
+/// the loop model and the rewrite plan. Reads only — the mutation is
+/// [`transform`]'s.
+fn classify(
+    host: HostRef,
+    host_fid: FunctionId,
+) -> Option<(crate::loop_to_recursion::LoopModel, Plan)> {
+    let ctx = host;
+    let model = recognize_loop(host, host_fid)?;
     // v1 handles the canonical single-latch counted loop.
     if model.back_edges.len() != 1 {
-        return false;
+        return None;
     }
     let head = model.head;
     let (latch, next_args) = model.back_edges[0].clone();
 
-    let Some(cbranch) = header_cbranch(ctx, head) else {
-        return false;
-    };
+    let cbranch = header_cbranch(ctx, head)?;
     // The loop *continues* through whichever header edge enters the latch
     // directly; the other edge exits. (Multi-block bodies are out of scope.)
     let (cont_args, exit_block, exit_args, cond_true_is_exit) = if cbranch.success_block == latch {
@@ -111,17 +129,17 @@ pub fn accumulator_elim(ctx: &mut Context, host: FunctionId) -> bool {
             true,
         )
     } else {
-        return false;
+        return None;
     };
 
     // State slots = header parameters.
-    let head_info: Vec<(BlockParamId, usize)> = BasicBlock::from_id(ctx, head)
+    let head_info: Vec<(BlockParamId, usize)> = BlockRef::new(ctx, head)
         .params()
         .map(|p| (p.id, p.size()))
         .collect();
     let m = head_info.len();
     if m == 0 || next_args.len() != m || model.init_args.len() != m {
-        return false;
+        return None;
     }
     let head_params: Vec<BlockParamId> = head_info.iter().map(|&(id, _)| id).collect();
     let head_sizes: Vec<usize> = head_info.iter().map(|&(_, sz)| sz).collect();
@@ -133,12 +151,10 @@ pub fn accumulator_elim(ctx: &mut Context, host: FunctionId) -> bool {
 
     // Resolve the body's next-state expressions (latch scope) back to header
     // params by binding each latch param to the value the header passed for it.
-    let latch_params: Vec<BlockParamId> = BasicBlock::from_id(ctx, latch)
-        .params()
-        .map(|p| p.id)
-        .collect();
+    let latch_params: Vec<BlockParamId> =
+        BlockRef::new(ctx, latch).params().map(|p| p.id).collect();
     if latch_params.len() != cont_args.len() {
-        return false;
+        return None;
     }
     let body_bindings: HashMap<BlockParamId, ValueId> = latch_params
         .iter()
@@ -148,14 +164,14 @@ pub fn accumulator_elim(ctx: &mut Context, host: FunctionId) -> bool {
 
     // The exit returns a single value; we project it from the result tuple.
     let Some(ret_val) = block_return_value(ctx, exit_block) else {
-        return false;
+        return None;
     };
-    let exit_params: Vec<BlockParamId> = BasicBlock::from_id(ctx, exit_block)
+    let exit_params: Vec<BlockParamId> = BlockRef::new(ctx, exit_block)
         .params()
         .map(|p| p.id)
         .collect();
     if exit_params.len() != exit_args.len() {
-        return false;
+        return None;
     }
     let exit_bindings: HashMap<BlockParamId, ValueId> = exit_params
         .iter()
@@ -202,26 +218,24 @@ pub fn accumulator_elim(ctx: &mut Context, host: FunctionId) -> bool {
     let d_slots: Vec<usize> = (0..m).filter(|&i| is_driver[i]).collect();
     let a_slots: Vec<usize> = (0..m).filter(|&i| !is_driver[i]).collect();
     if a_slots.is_empty() {
-        return false; // nothing to eliminate
+        return None; // nothing to eliminate
     }
 
     // Gate: the returned value must be a function of accumulators only.
     let ret_deps = head_param_deps(ctx, ret_val, &exit_bindings, &head_index);
     if ret_deps.iter().any(|&i| is_driver[i]) {
-        return false;
+        return None;
     }
     // Gate: accumulator initial values become the base case, so must be constant.
     for &i in &a_slots {
         if !is_const_literal(ctx, model.init_args[i]) {
-            return false;
+            return None;
         }
     }
 
-    transform(
-        ctx,
-        host,
-        &model,
-        &Plan {
+    Some((
+        model,
+        Plan {
             head_params,
             head_sizes,
             next_args,
@@ -233,8 +247,7 @@ pub fn accumulator_elim(ctx: &mut Context, host: FunctionId) -> bool {
             d_slots,
             a_slots,
         },
-    );
-    true
+    ))
 }
 
 struct Plan {
@@ -250,168 +263,246 @@ struct Plan {
     a_slots: Vec<usize>,
 }
 
-fn transform(
-    ctx: &mut Context,
-    host: FunctionId,
+fn transform<'str>(
+    m: &ModuleView<'_, 'str>,
+    body: &mut FunctionBody<'str>,
     model: &crate::loop_to_recursion::LoopModel,
     p: &Plan,
 ) {
-    let host_name = Function::from_id(ctx, host).name().to_owned();
-    let g_name = ctx.get_unique_name(Cow::Owned(format!("{host_name}_acc")));
-    let g = Function::make_lambda(ctx, g_name.clone())
-        .expect("accumulator lambda name was deduplicated")
-        .id;
-
-    // Three fresh blocks: header (root, drivers in), base case, recursive case.
-    let g_head = BasicBlock::make(ctx, g).id;
-    let base = BasicBlock::make(ctx, g).id;
-    let rec = BasicBlock::make(ctx, g).id;
-    for &b in &[g_head, base, rec] {
-        Function::from_id_mut(ctx, g).add_block(b);
-    }
-    let base_name = ctx_unique(ctx, format!("{g_name}_base"));
-    let _ = BasicBlock::from_id_mut(ctx, base).rename(base_name);
-    let rec_name = ctx_unique(ctx, format!("{g_name}_rec"));
-    let _ = BasicBlock::from_id_mut(ctx, rec).rename(rec_name);
-    Function::from_id_mut(ctx, g)
-        .set_root(g_head)
-        .expect("fresh header has no conflicting address");
-
-    // g's parameters: the drivers only. Map each driver header-param to its new
-    // counterpart so cloned `cond`/`stepD` expressions read g's params.
-    let mut driver_subst: HashMap<ValueId, ValueId> = HashMap::default();
-    {
-        let mut b = Builder::from_block(BasicBlock::from_id_mut(ctx, g_head));
-        unsafe { b.dont_finalize() };
-        for &i in &p.d_slots {
-            let pid = b.push_param(p.head_sizes[i]).id;
-            driver_subst.insert(
-                ValueId::BlockParam(p.head_params[i]),
-                ValueId::BlockParam(pid),
-            );
-        }
-    }
-
-    // Header: recompute the loop condition over g's drivers, then branch.
-    let cond = clone_value(
-        ctx,
-        p.cbranch.condition,
-        &mut driver_subst,
-        &p.body_bindings,
-        g_head,
+    let host_fid = body.id();
+    let base_name = format!(
+        "{}_acc",
+        FunctionRef::new(body.read_host(m), host_fid).name()
     );
-    {
-        let mut b = Builder::from_block(BasicBlock::from_id_mut(ctx, g_head));
-        if p.cond_true_is_exit {
-            b.push_cbranch(cond, base, rec);
-        } else {
-            b.push_cbranch(cond, rec, base);
+    // Mint the driver-only recursive lambda (name buffered raw; the driver
+    // uniquifies it at check-in). `None` (pool exhausted) leaves the loop alone.
+    let Some(g) = body.mint_function(Cow::Owned(base_name.clone()), FunctionKind::Lambda, true)
+    else {
+        return;
+    };
+
+    // --- Build the lambda body: read the host expressions, write the minted one.
+    let tuple_ty = {
+        let (own, mut minted) = body.host_with_minted(m, g);
+
+        // Three fresh blocks: header (root, drivers in), base case, recursive case.
+        let g_head = minted.make_block(g);
+        let base = minted.make_block(g);
+        let rec = minted.make_block(g);
+        minted.function_mut(g).root = Some(g_head);
+        let _ = BaseRef::new(minted.reborrow(), base)
+            .rename_local(Cow::Owned(format!("{base_name}_base")));
+        let _ = BaseRef::new(minted.reborrow(), rec)
+            .rename_local(Cow::Owned(format!("{base_name}_rec")));
+
+        // g's parameters: the drivers only. Map each driver header-param to its new
+        // counterpart so cloned `cond`/`stepD` expressions read g's params.
+        let mut driver_subst: HashMap<ValueId, ValueId> = HashMap::default();
+        for &i in &p.d_slots {
+            let ty = minted.shared().types.get_or_make_int(p.head_sizes[i]);
+            let pid = push_param(&mut minted, g_head, ty);
+            driver_subst.insert(ValueId::BlockParam(p.head_params[i]), pid);
         }
-    }
 
-    // Base case: return the initial accumulator tuple (constants).
-    {
-        let base_fields: Vec<ValueId> = p
-            .a_slots
-            .iter()
-            .map(|&i| const_at_size(ctx, model.init_args[i], p.head_sizes[i]))
-            .collect();
-        let mut b = Builder::from_block(BasicBlock::from_id_mut(ctx, base));
-        let tuple = b.push_tuple(base_fields).id();
-        b.push_return_value(tuple);
-    }
+        // Header: recompute the loop condition over g's drivers, then branch.
+        let cond = clone_cross(
+            own,
+            &mut minted,
+            p.cbranch.condition,
+            &mut driver_subst,
+            &p.body_bindings,
+            g_head,
+        );
+        {
+            let mut b = Builder::from_block(BaseRef::new(minted.reborrow_host(), g_head));
+            if p.cond_true_is_exit {
+                b.push_cbranch(cond, base, rec);
+            } else {
+                b.push_cbranch(cond, rec, base);
+            }
+        }
 
-    // Recursive case: recurse on the drivers' next values, unpack the deeper
-    // accumulators, apply the accumulator update, return the new tuple.
-    {
-        // stepD: driver-next values (read only drivers).
-        let driver_next: Vec<ValueId> = p
-            .d_slots
-            .iter()
-            .map(|&i| {
-                clone_value(
-                    ctx,
-                    p.next_args[i],
-                    &mut driver_subst,
-                    &p.body_bindings,
-                    rec,
-                )
-            })
-            .collect();
-
-        let (deep, acc_vals) = {
-            let mut b = Builder::from_block(BasicBlock::from_id_mut(ctx, rec));
-            unsafe { b.dont_finalize() };
-            let deep = b.push_apply(g, driver_next).id();
-            let acc_vals: Vec<ValueId> = (0..p.a_slots.len())
-                .map(|pos| b.push_extract(deep, pos).id())
+        // Base case: return the initial accumulator tuple (constants). Its type is
+        // the recursion's return type — reused for the (minted, uninstalled)
+        // `apply g` nodes below and in the host, which `push_apply` cannot type.
+        let tuple_ty = {
+            let base_fields: Vec<ValueId> = p
+                .a_slots
+                .iter()
+                .map(|&i| const_at_size(minted.shared(), model.init_args[i], p.head_sizes[i]))
                 .collect();
-            (deep, acc_vals)
+            let mut b = Builder::from_block(BaseRef::new(minted.reborrow_host(), base));
+            let tuple = b.push_tuple(base_fields);
+            let ty = tuple.type_id();
+            let tuple = tuple.id();
+            b.push_return_value(tuple);
+            ty
         };
-        let _ = deep;
 
-        // stepA: accumulator-next, reading the unpacked accumulators.
-        let mut acc_subst: HashMap<ValueId, ValueId> = HashMap::default();
-        for (pos, &i) in p.a_slots.iter().enumerate() {
-            acc_subst.insert(ValueId::BlockParam(p.head_params[i]), acc_vals[pos]);
+        // Recursive case: recurse on the drivers' next values, unpack the deeper
+        // accumulators, apply the accumulator update, return the new tuple.
+        {
+            // stepD: driver-next values (read only drivers).
+            let driver_next: Vec<ValueId> = p
+                .d_slots
+                .iter()
+                .map(|&i| {
+                    clone_cross(
+                        own,
+                        &mut minted,
+                        p.next_args[i],
+                        &mut driver_subst,
+                        &p.body_bindings,
+                        rec,
+                    )
+                })
+                .collect();
+
+            // `apply g(driver_next)` — g is the minted (uninstalled) lambda, so
+            // type the node explicitly with the tuple type; the extracts then read
+            // that type off the arena.
+            let deep = push_typed(
+                &mut minted,
+                rec,
+                Mnemonic::Apply(Apply {
+                    target: g,
+                    args: driver_next,
+                }),
+                tuple_ty,
+            );
+            let acc_vals: Vec<ValueId> = {
+                let mut b = Builder::from_block(BaseRef::new(minted.reborrow_host(), rec));
+                (0..p.a_slots.len())
+                    .map(|pos| b.push_extract(deep, pos).id())
+                    .collect()
+            };
+
+            // stepA: accumulator-next, reading the unpacked accumulators.
+            let mut acc_subst: HashMap<ValueId, ValueId> = HashMap::default();
+            for (pos, &i) in p.a_slots.iter().enumerate() {
+                acc_subst.insert(ValueId::BlockParam(p.head_params[i]), acc_vals[pos]);
+            }
+            let new_acc: Vec<ValueId> = p
+                .a_slots
+                .iter()
+                .map(|&i| {
+                    clone_cross(
+                        own,
+                        &mut minted,
+                        p.next_args[i],
+                        &mut acc_subst,
+                        &p.body_bindings,
+                        rec,
+                    )
+                })
+                .collect();
+
+            let mut b = Builder::from_block(BaseRef::new(minted.reborrow_host(), rec));
+            let tuple = b.push_tuple(new_acc).id();
+            b.push_return_value(tuple);
         }
-        let new_acc: Vec<ValueId> = p
-            .a_slots
-            .iter()
-            .map(|&i| clone_value(ctx, p.next_args[i], &mut acc_subst, &p.body_bindings, rec))
-            .collect();
 
-        let mut b = Builder::from_block(BasicBlock::from_id_mut(ctx, rec));
-        let tuple = b.push_tuple(new_acc).id();
-        b.push_return_value(tuple);
-    }
+        tuple_ty
+    };
 
     // --- Host: seed g and project the original return value out of the tuple.
+    let mut host = body.host(m);
     let root = model.root;
-    if let Some(term) = block_terminator(ctx, root) {
-        ctx.remove_instruction(term);
+    if let Some(term) = block_terminator(host.read_host(), root) {
+        host.remove_instruction(term);
     }
     let driver_init: Vec<ValueId> = p.d_slots.iter().map(|&i| model.init_args[i]).collect();
-    let result = {
-        let mut b = Builder::from_block(BasicBlock::from_id_mut(ctx, root));
-        unsafe { b.dont_finalize() };
-        let t = b.push_apply(g, driver_init).id();
-        let mut host_subst: HashMap<ValueId, ValueId> = HashMap::default();
-        for (pos, &i) in p.a_slots.iter().enumerate() {
-            let field = b.push_extract(t, pos).id();
-            host_subst.insert(ValueId::BlockParam(p.head_params[i]), field);
-        }
-        // Drop the builder before the raw clone, then reconstruct `ret`.
-        drop(b);
-        clone_value(ctx, p.ret_val, &mut host_subst, &p.exit_bindings, root)
-    };
+    // `apply g(driver_init)` typed explicitly (g uninstalled), then unpack each
+    // accumulator field the original return reads.
+    let t = push_typed(
+        &mut host,
+        root,
+        Mnemonic::Apply(Apply {
+            target: g,
+            args: driver_init,
+        }),
+        tuple_ty,
+    );
+    let mut host_subst: HashMap<ValueId, ValueId> = HashMap::default();
+    for (pos, &i) in p.a_slots.iter().enumerate() {
+        let field_ty = host
+            .shared()
+            .types
+            .field_type(tuple_ty, pos)
+            .expect("accumulator tuple field");
+        let field = push_typed(
+            &mut host,
+            root,
+            Mnemonic::Extract(Extract { agg: t, index: pos }),
+            field_ty,
+        );
+        host_subst.insert(ValueId::BlockParam(p.head_params[i]), field);
+    }
+    let result = clone_self(
+        &mut host,
+        p.ret_val,
+        &mut host_subst,
+        &p.exit_bindings,
+        root,
+    );
     {
-        let mut b = Builder::from_block(BasicBlock::from_id_mut(ctx, root));
+        let mut b = Builder::from_block(BaseRef::new(host.reborrow_host(), root));
         b.push_return_value(result);
     }
 
     // The original loop region is now unreachable from the host; delete it.
     for &b in &model.region {
-        BasicBlock::from_id_mut(ctx, b).delete(host);
+        BaseRef::new(host.reborrow_host(), b).delete(host_fid);
     }
+}
+
+/// Push a driver param typed `ty` onto `block` in the minted host, returning its
+/// value (host-routed `BasicBlock::push_param` + the `type_id` write).
+fn push_param<'str, H: HostMut<'str>>(host: &mut H, block: BlockId, ty: TypeId) -> ValueId {
+    let index = host.read_host().block(block).params.len();
+    let pid = host.push_block_param(
+        block.func,
+        BlockParam {
+            index,
+            type_id: ty,
+            parent: Some(block),
+            name: None,
+            origin: None,
+            protected: false,
+        },
+    );
+    host.block_mut(block).params.push(pid);
+    ValueId::BlockParam(pid)
+}
+
+/// Mint an instruction with an explicit result type and append it to `block`.
+fn push_typed<'str, H: HostMut<'str>>(
+    host: &mut H,
+    block: BlockId,
+    mnemonic: Mnemonic,
+    ty: TypeId,
+) -> ValueId {
+    let id = host.push_mnemonic_with_type(block.func, mnemonic, ty);
+    BaseRef::new(host.reborrow_host(), block).push_insn(id);
+    ValueId::Instruction(id)
 }
 
 /// Head-param slot indices that `val` transitively reads, resolving block-param
 /// references (latch/exit params) through `bindings`.
 fn head_param_deps(
-    ctx: &Context,
+    host: HostRef,
     val: ValueId,
     bindings: &HashMap<BlockParamId, ValueId>,
     head_index: &HashMap<BlockParamId, usize>,
 ) -> HashSet<usize> {
     let mut out = HashSet::default();
     let mut seen = HashSet::default();
-    collect_deps(ctx, val, bindings, head_index, &mut out, &mut seen);
+    collect_deps(host, val, bindings, head_index, &mut out, &mut seen);
     out
 }
 
 fn collect_deps(
-    ctx: &Context,
+    host: HostRef,
     val: ValueId,
     bindings: &HashMap<BlockParamId, ValueId>,
     head_index: &HashMap<BlockParamId, usize>,
@@ -426,12 +517,12 @@ fn collect_deps(
             if let Some(&idx) = head_index.get(&p) {
                 out.insert(idx);
             } else if let Some(&bound) = bindings.get(&p) {
-                collect_deps(ctx, bound, bindings, head_index, out, seen);
+                collect_deps(host, bound, bindings, head_index, out, seen);
             }
         }
         ValueId::Instruction(id) => {
-            for op in Instruction::from_id(ctx, id).mnemonic().args() {
-                collect_deps(ctx, op, bindings, head_index, out, seen);
+            for op in host.instruction(id).mnemonic().args() {
+                collect_deps(host, op, bindings, head_index, out, seen);
             }
         }
         // Literals, byte blobs, varnodes, function/block refs read no state.
@@ -439,11 +530,12 @@ fn collect_deps(
     }
 }
 
-/// Rebuilds the expression DAG rooted at `val` into `target`, substituting
-/// seeded leaves via `subst` and resolving block-param references via
-/// `bindings`. Returns the value in the new graph. Memoizes into `subst`.
-fn clone_value(
-    ctx: &mut Context,
+/// Rebuild the expression DAG rooted at `val` (read from `read`, the *host*
+/// function) into `target` (a block of the *minted* lambda `write`), substituting
+/// seeded leaves via `subst` and resolving block-param references via `bindings`.
+fn clone_cross<'str>(
+    read: HostRef<'_, 'str>,
+    write: &mut CheckedOut<'_, 'str>,
     val: ValueId,
     subst: &mut HashMap<ValueId, ValueId>,
     bindings: &HashMap<BlockParamId, ValueId>,
@@ -454,86 +546,116 @@ fn clone_value(
     }
     let result = match val {
         ValueId::BlockParam(p) => match bindings.get(&p) {
-            // Resolve a latch/exit param to the value its predecessor passed.
-            Some(&bound) => clone_value(ctx, bound, subst, bindings, target),
-            // Gates guarantee every reachable header param is seeded in `subst`.
+            Some(&bound) => clone_cross(read, write, bound, subst, bindings, target),
             None => val,
         },
         ValueId::Instruction(id) => {
             let (mnemonic, type_id) = {
-                let insn = Instruction::from_id(ctx, id);
-                (insn.mnemonic().clone(), insn.type_id())
+                let r = InstructionRef::new(read, id);
+                (r.mnemonic().clone(), r.type_id())
             };
             let mut remapped = mnemonic.clone();
             for op in mnemonic.args() {
-                let new_op = clone_value(ctx, op, subst, bindings, target);
+                let new_op = clone_cross(read, write, op, subst, bindings, target);
                 if new_op != op {
                     remapped.replace_value(op, new_op);
                 }
             }
-            let new_id =
-                InstructionRef::from_mnemonic_with_type(ctx, target.func, remapped, type_id).id;
-            let idx = BasicBlock::from_id(ctx, target).instruction_ids().len();
-            BasicBlock::from_id_mut(ctx, target).insert_insn_at_index(idx, new_id);
-            ValueId::Instruction(new_id)
+            push_typed(write, target, remapped, type_id)
         }
-        // Literals, byte blobs, varnodes, function/block refs are context-global.
         _ => val,
     };
     subst.insert(val, result);
     result
 }
 
-fn header_cbranch(ctx: &Context, header: BlockId) -> Option<CBranch> {
-    let term = block_terminator(ctx, header)?;
-    match Instruction::from_id(ctx, term).mnemonic() {
+/// Like [`clone_cross`] but source and target are the *same* (host) function;
+/// reads route through the host's own read view.
+fn clone_self<'str, H: HostMut<'str>>(
+    host: &mut H,
+    val: ValueId,
+    subst: &mut HashMap<ValueId, ValueId>,
+    bindings: &HashMap<BlockParamId, ValueId>,
+    target: BlockId,
+) -> ValueId {
+    if let Some(&v) = subst.get(&val) {
+        return v;
+    }
+    let result = match val {
+        ValueId::BlockParam(p) => match bindings.get(&p) {
+            Some(&bound) => clone_self(host, bound, subst, bindings, target),
+            None => val,
+        },
+        ValueId::Instruction(id) => {
+            let (mnemonic, type_id) = {
+                let r = InstructionRef::new(host.read_host(), id);
+                (r.mnemonic().clone(), r.type_id())
+            };
+            let mut remapped = mnemonic.clone();
+            for op in mnemonic.args() {
+                let new_op = clone_self(host, op, subst, bindings, target);
+                if new_op != op {
+                    remapped.replace_value(op, new_op);
+                }
+            }
+            push_typed(host, target, remapped, type_id)
+        }
+        _ => val,
+    };
+    subst.insert(val, result);
+    result
+}
+
+fn header_cbranch(host: HostRef, header: BlockId) -> Option<CBranch> {
+    let term = block_terminator(host, header)?;
+    match host.instruction(term).mnemonic() {
         Mnemonic::CBranch(cbranch) => Some(cbranch.clone()),
         _ => None,
     }
 }
 
-fn block_return_value(ctx: &Context, block: BlockId) -> Option<ValueId> {
-    let term = block_terminator(ctx, block)?;
-    match Instruction::from_id(ctx, term).mnemonic() {
+fn block_return_value(host: HostRef, block: BlockId) -> Option<ValueId> {
+    let term = block_terminator(host, block)?;
+    match host.instruction(term).mnemonic() {
         Mnemonic::ReturnValue(rv) => Some(rv.value),
         _ => None,
     }
 }
 
-fn block_terminator(ctx: &Context, block: BlockId) -> Option<qcode::value::insn::InstructionId> {
-    let &id = BasicBlock::from_id(ctx, block).instruction_ids().last()?;
-    Instruction::from_id(ctx, id).is_terminator().then_some(id)
+fn block_terminator(host: HostRef, block: BlockId) -> Option<qcode::value::insn::InstructionId> {
+    let &id = BlockRef::new(host, block).instruction_ids().last()?;
+    InstructionRef::new(host, id).is_terminator().then_some(id)
 }
 
-fn is_const_literal(ctx: &Context, val: ValueId) -> bool {
-    matches!(val, ValueId::Literal(id) if ctx.values.literals[id].symbolic.is_none())
+fn is_const_literal(host: HostRef, val: ValueId) -> bool {
+    matches!(val, ValueId::Literal(id) if host.shared().values.literals[id].symbolic.is_none())
 }
 
 /// Reinterprets a constant literal at `size` bytes, so a base-case accumulator
 /// matches its slot width; non-literals pass through unchanged.
-fn const_at_size(ctx: &mut Context, val: ValueId, size: usize) -> ValueId {
+fn const_at_size(shared: &Context, val: ValueId, size: usize) -> ValueId {
     if let ValueId::Literal(id) = val {
-        let lit = ctx.values.literals[id].clone();
+        let lit = shared.values.literals[id].clone();
         if lit.symbolic.is_none() {
-            return ctx.get_const(lit.value, size).id();
+            return shared.get_const(lit.value, size).id();
         }
     }
     val
 }
 
-fn ctx_unique<'str>(ctx: &mut Context<'str>, name: String) -> Cow<'str, str> {
-    ctx.get_unique_name(Cow::Owned(name))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use qcode::value::{Function, Instruction};
     use qcode_emulator::{SizedValue, StandaloneEmulator};
     use qcode_macro::qcode;
 
+    use crate::test_util::run_function_pass_v2;
+
     fn run(ctx: &Context, fun: FunctionId, n: u64) -> Option<u64> {
         let root = Function::from_id(ctx, fun).root().expect("root").id;
-        let ret = match Instruction::from_id(ctx, block_terminator(ctx, root)?).mnemonic() {
+        let term = block_terminator(HostRef::Module(ctx), root)?;
+        let ret = match Instruction::from_id(ctx, term).mnemonic() {
             Mnemonic::ReturnValue(r) => r.value,
             _ => return None,
         };
@@ -567,7 +689,7 @@ mod tests {
             "
         );
 
-        assert!(accumulator_elim(&mut ctx, fib_loop));
+        assert!(run_function_pass_v2::<AccumulatorElim>(&mut ctx, fib_loop).unwrap());
 
         let g = Function::from_name(&ctx, "fib_loop_acc").expect("accumulator lambda exists");
         assert!(g.is_lambda());
@@ -608,7 +730,7 @@ mod tests {
             "
         );
 
-        assert!(!accumulator_elim(&mut ctx, sum_up));
+        assert!(!run_function_pass_v2::<AccumulatorElim>(&mut ctx, sum_up).unwrap());
     }
 
     #[test]
@@ -623,6 +745,6 @@ mod tests {
                 return %x;
             "
         );
-        assert!(!accumulator_elim(&mut ctx, straight));
+        assert!(!run_function_pass_v2::<AccumulatorElim>(&mut ctx, straight).unwrap());
     }
 }
