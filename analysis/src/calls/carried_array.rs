@@ -74,7 +74,7 @@ pub(crate) fn find_carried_array(ctx: &mut Context, fid: FunctionId) -> Option<C
             let Some(k) = param_pos(ctx, header, arr_h) else {
                 continue;
             };
-            let incs = incoming(ctx, header, k);
+            let incs = incoming(&*ctx, header, k);
             if incs.len() != 2 {
                 continue;
             }

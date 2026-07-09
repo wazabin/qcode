@@ -303,7 +303,7 @@ fn apply(ctx: &mut Context, fid: FunctionId, m: &MapMatch) -> bool {
         .into_iter()
         .map(|p| {
             let k = param_pos(ctx, m.exit, p)?;
-            let [v] = incoming(ctx, m.exit, k)[..] else {
+            let [v] = incoming(&*ctx, m.exit, k)[..] else {
                 return None;
             };
             if !defined_in_loop(ctx, v) {
@@ -313,7 +313,7 @@ fn apply(ctx: &mut Context, fid: FunctionId, m: &MapMatch) -> bool {
                 return None;
             }
             let kv = param_pos(ctx, m.ca.header, v)?;
-            let init: Vec<ValueId> = incoming(ctx, m.ca.header, kv)
+            let init: Vec<ValueId> = incoming(&*ctx, m.ca.header, kv)
                 .into_iter()
                 .filter(|&w| !defined_in_loop(ctx, w))
                 .collect();

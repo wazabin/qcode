@@ -161,16 +161,16 @@ fn try_match(ctx: &mut Context, fid: FunctionId) -> Option<ScanMatch> {
     // carry the init and increment.
     let k_index = param_pos(ctx, body, index)?;
     let feeds = if body == header {
-        incoming(ctx, body, k_index)
+        incoming(&*ctx, body, k_index)
     } else {
-        let [hp] = incoming(ctx, body, k_index)[..] else {
+        let [hp] = incoming(&*ctx, body, k_index)[..] else {
             return None;
         };
         if param_parent(ctx, hp) != Some(header) {
             return None;
         }
         let k_hp = param_pos(ctx, header, hp)?;
-        incoming(ctx, header, k_hp)
+        incoming(&*ctx, header, k_hp)
     };
     if !feeds.iter().any(|&v| is_increment(ctx, v, index)) {
         return None;
@@ -349,7 +349,7 @@ fn apply(ctx: &mut Context, fid: FunctionId, m: &ScanMatch) -> bool {
         .into_iter()
         .map(|p| {
             let k = param_pos(ctx, m.exit, p)?;
-            let [v] = incoming(ctx, m.exit, k)[..] else {
+            let [v] = incoming(&*ctx, m.exit, k)[..] else {
                 return None;
             };
             if !defined_in_loop(ctx, v) {
@@ -359,7 +359,7 @@ fn apply(ctx: &mut Context, fid: FunctionId, m: &ScanMatch) -> bool {
                 return None;
             }
             let kv = param_pos(ctx, m.header, v)?;
-            let init: Vec<ValueId> = incoming(ctx, m.header, kv)
+            let init: Vec<ValueId> = incoming(&*ctx, m.header, kv)
                 .into_iter()
                 .filter(|&w| !defined_in_loop(ctx, w))
                 .collect();

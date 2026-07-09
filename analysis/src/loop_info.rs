@@ -21,8 +21,9 @@ use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
 use qcode::{
     context::Context,
     value::{
-        BasicBlock, BlockId, Function, FunctionId, ValueId, ValueRef,
+        BasicBlock, BlockId, BlockRef, Function, FunctionId, FunctionRef, ValueId, ValueRef,
         insn::{Binary, Binop, Branch, CBranch, IntBinop, Mnemonic},
+        util::base_ref::HostRef,
     },
 };
 
@@ -92,14 +93,19 @@ pub(crate) fn param_parent(ctx: &Context, v: ValueId) -> Option<BlockId> {
 }
 
 /// Values feeding block-param index `k` of `block` from every predecessor edge.
-pub(crate) fn incoming(ctx: &Context, block: BlockId, k: usize) -> Vec<ValueId> {
+pub(crate) fn incoming<'a, 'str: 'a>(
+    host: impl Into<HostRef<'a, 'str>>,
+    block: BlockId,
+    k: usize,
+) -> Vec<ValueId> {
+    let host = host.into();
     let mut out = Vec::new();
-    let preds: Vec<BlockId> = BasicBlock::from_id(ctx, block)
+    let preds: Vec<BlockId> = BlockRef::new(host, block)
         .predecessors()
         .map(|(_, p)| p)
         .collect();
     for pred in preds {
-        let Some(term) = BasicBlock::from_id(ctx, pred).iter().last() else {
+        let Some(term) = BlockRef::new(host, pred).iter().last() else {
             continue;
         };
         match term.mnemonic() {
@@ -234,26 +240,27 @@ impl Uf {
 /// pass-through phi class contains exactly one such root. Two threaded pointers
 /// name the same loop-invariant base iff they map to the same root. A class with
 /// zero or several roots is omitted (ambiguous → not resolvable).
-pub fn value_roots(ctx: &Context, fid: FunctionId) -> HashMap<ValueId, ValueId> {
+pub fn value_roots<'a, 'str: 'a>(
+    host: impl Into<HostRef<'a, 'str>>,
+    fid: FunctionId,
+) -> HashMap<ValueId, ValueId> {
+    let host = host.into();
     let mut uf = Uf::default();
     // A representative is only ever stored as a parent *value*, never a key, so
     // track membership explicitly rather than relying on `parent.keys()`.
     let mut nodes: HashSet<ValueId> = HashSet::default();
-    let blocks: Vec<BlockId> = Function::from_id(ctx, fid).iter().map(|b| b.id).collect();
+    let blocks: Vec<BlockId> = FunctionRef::new(host, fid).iter().map(|b| b.id).collect();
     for &bid in &blocks {
-        let params: Vec<ValueId> = BasicBlock::from_id(ctx, bid)
-            .params()
-            .map(|p| p.id())
-            .collect();
+        let params: Vec<ValueId> = BlockRef::new(host, bid).params().map(|p| p.id()).collect();
         for (k, p) in params.into_iter().enumerate() {
-            for v in incoming(ctx, bid, k) {
+            for v in incoming(host, bid, k) {
                 uf.union(p, v);
                 nodes.insert(p);
                 nodes.insert(v);
             }
         }
     }
-    let roots: Vec<ValueId> = Function::from_id(ctx, fid)
+    let roots: Vec<ValueId> = FunctionRef::new(host, fid)
         .root()
         .map(|r| r.params().map(|p| p.id()).collect())
         .unwrap_or_default();

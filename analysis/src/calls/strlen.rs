@@ -564,7 +564,7 @@ mod tests {
         value::{Value, insn::Mnemonic},
     };
 
-    use crate::test_util::run_function_pass;
+    use crate::test_util::run_function_pass_v2;
 
     // ===== recognizer (two-buffer) =========================================
 
@@ -591,22 +591,10 @@ mod tests {
         let ram = tc.ctx.default_space;
 
         let fid = Function::make(&mut tc.ctx, "copy".into()).unwrap().id;
-        let entry = {
-            let __f = tc.ctx.anon_function();
-            tc.ctx.get_or_make_block(0x1000, __f)
-        };
-        let header = {
-            let __f = tc.ctx.anon_function();
-            tc.ctx.get_or_make_block(0x1010, __f)
-        };
-        let body = {
-            let __f = tc.ctx.anon_function();
-            tc.ctx.get_or_make_block(0x1020, __f)
-        };
-        let exit = {
-            let __f = tc.ctx.anon_function();
-            tc.ctx.get_or_make_block(0x1030, __f)
-        };
+        let entry = tc.ctx.get_or_make_block(0x1000, fid);
+        let header = tc.ctx.get_or_make_block(0x1010, fid);
+        let body = tc.ctx.get_or_make_block(0x1020, fid);
+        let exit = tc.ctx.get_or_make_block(0x1030, fid);
         {
             let mut f = Function::from_id_mut(&mut tc.ctx, fid);
             f.set_root(entry).unwrap();
@@ -703,22 +691,10 @@ mod tests {
         let ram = tc.ctx.default_space;
 
         let fid = Function::make(&mut tc.ctx, "slen".into()).unwrap().id;
-        let entry = {
-            let __f = tc.ctx.anon_function();
-            tc.ctx.get_or_make_block(0x1000, __f)
-        };
-        let header = {
-            let __f = tc.ctx.anon_function();
-            tc.ctx.get_or_make_block(0x1010, __f)
-        };
-        let body = {
-            let __f = tc.ctx.anon_function();
-            tc.ctx.get_or_make_block(0x1020, __f)
-        };
-        let exit = {
-            let __f = tc.ctx.anon_function();
-            tc.ctx.get_or_make_block(0x1030, __f)
-        };
+        let entry = tc.ctx.get_or_make_block(0x1000, fid);
+        let header = tc.ctx.get_or_make_block(0x1010, fid);
+        let body = tc.ctx.get_or_make_block(0x1020, fid);
+        let exit = tc.ctx.get_or_make_block(0x1030, fid);
         {
             let mut f = Function::from_id_mut(&mut tc.ctx, fid);
             f.set_root(entry).unwrap();
@@ -813,7 +789,7 @@ mod tests {
         let (fid, exit, arr) = build_strlen_loop(&mut tc, /*extra_break*/ false);
 
         assert!(
-            run_function_pass::<crate::mem::array_reads::ArrayReads>(&mut tc.ctx, fid).unwrap(),
+            run_function_pass_v2::<crate::mem::array_reads::ArrayReads>(&mut tc.ctx, fid).unwrap(),
             "array_reads promotes the read-only shadow snapshot to at(@arr, i)"
         );
         assert!(
@@ -842,7 +818,7 @@ mod tests {
         let mut tc = TestContext::new();
         let (fid, exit, _arr) = build_strlen_loop(&mut tc, /*extra_break*/ true);
 
-        run_function_pass::<crate::mem::array_reads::ArrayReads>(&mut tc.ctx, fid).unwrap();
+        run_function_pass_v2::<crate::mem::array_reads::ArrayReads>(&mut tc.ctx, fid).unwrap();
         assert!(
             !recognize_strlens(&mut tc.ctx),
             "a loop with a second exit is not a NUL-scan strlen"
@@ -863,7 +839,7 @@ mod tests {
             build_copy_loop(&mut tc, /*distinct_dst*/ true, /*stray*/ false);
 
         assert!(
-            !run_function_pass::<crate::mem::array_reads::ArrayReads>(&mut tc.ctx, fid).unwrap(),
+            !run_function_pass_v2::<crate::mem::array_reads::ArrayReads>(&mut tc.ctx, fid).unwrap(),
             "array_reads declines a region with a store"
         );
         assert!(
@@ -896,22 +872,10 @@ mod tests {
     ) -> (FunctionId, BlockId, ValueId) {
         let ram = tc.ctx.default_space;
         let fid = Function::make(&mut tc.ctx, "strlen".into()).unwrap().id;
-        let entry = {
-            let __f = tc.ctx.anon_function();
-            tc.ctx.get_or_make_block(0x2000, __f)
-        };
-        let header = {
-            let __f = tc.ctx.anon_function();
-            tc.ctx.get_or_make_block(0x2010, __f)
-        };
-        let body = {
-            let __f = tc.ctx.anon_function();
-            tc.ctx.get_or_make_block(0x2020, __f)
-        };
-        let exit = {
-            let __f = tc.ctx.anon_function();
-            tc.ctx.get_or_make_block(0x2030, __f)
-        };
+        let entry = tc.ctx.get_or_make_block(0x2000, fid);
+        let header = tc.ctx.get_or_make_block(0x2010, fid);
+        let body = tc.ctx.get_or_make_block(0x2020, fid);
+        let exit = tc.ctx.get_or_make_block(0x2030, fid);
         {
             let mut f = Function::from_id_mut(&mut tc.ctx, fid);
             f.set_root(entry).unwrap();
