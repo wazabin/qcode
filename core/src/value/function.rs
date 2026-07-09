@@ -119,6 +119,15 @@ pub enum FunctionKind {
     #[default]
     Machine,
     Lambda,
+    /// A never-observed placeholder holding a registry slot: a reserved id in the
+    /// function-minting pool (see `PARALLEL_PASSES.md`, ruling 3), or a
+    /// pipeline-end leftover of one. Every function-iteration surface
+    /// ([`Context::function_ids`](crate::context::Context::function_ids),
+    /// [`Context::functions`](crate::context::Context::functions), and everything
+    /// built on them — module-pass loops, the textual module dump, the GUI
+    /// listing, the verifier) skips these, so a sentinel is never visible to a
+    /// pass or rendered.
+    Sentinel,
 }
 
 impl<'str> Function<'str> {
@@ -141,13 +150,31 @@ impl<'str> Function<'str> {
         }
     }
 
-    /// An empty placeholder function, used to hold a registry slot while its real
-    /// occupant is *checked out* for exclusive mutation (see
-    /// [`Context::checkout_function`](crate::context::Context::checkout_function)).
-    /// It is never observed by a pass: the checked-out function is swapped back in
-    /// before anything reads the slot again.
+    /// An empty placeholder function holding a registry slot for a reserved
+    /// function id (the minting pool, `PARALLEL_PASSES.md` ruling 3). Tagged
+    /// [`FunctionKind::Sentinel`] so every function-iteration surface skips it —
+    /// it is never observed by a pass and never rendered.
     pub fn sentinel() -> Self {
-        Self::new(Cow::Borrowed(""))
+        let mut f = Self::new(Cow::Borrowed(""));
+        f.kind = FunctionKind::Sentinel;
+        f
+    }
+
+    /// A detached function shell for [minting] inside a checked-out function
+    /// pass: named (raw — global uniquification happens when the driver installs
+    /// it at check-in), empty-bodied, registered nowhere. The minting machinery
+    /// builds its body through a `CheckedOut` host over its reserved id and
+    /// installs it into the registry at check-in.
+    ///
+    /// [minting]: crate::value::Function#method.sentinel
+    pub fn detached(name: Cow<'str, str>) -> Self {
+        Self::new(name)
+    }
+
+    /// Whether this is a never-observed placeholder holding a reserved registry
+    /// slot (see [`FunctionKind::Sentinel`]).
+    pub fn is_sentinel(&self) -> bool {
+        self.kind == FunctionKind::Sentinel
     }
 
     /// A checkout placeholder that preserves this function's *published
@@ -717,6 +744,9 @@ where
         let keyword = match self.kind() {
             FunctionKind::Machine => "fn",
             FunctionKind::Lambda => "lambda",
+            // Never rendered: every iteration surface skips sentinels. Kept inert
+            // (not a panic) so a raw debug print of a reserved slot stays harmless.
+            FunctionKind::Sentinel => "fn",
         };
         writeln!(f, "{keyword} {}:", self.name())?;
         for block in self.blocks() {

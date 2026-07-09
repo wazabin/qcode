@@ -448,9 +448,16 @@ impl<'str> Context<'str> {
         self.functions().flat_map(|f| f.instruction_ids()).collect()
     }
 
-    /// Returns a list of all functions in the context
+    /// Returns a list of all functions in the context. Reserved minting-pool
+    /// sentinels (never-observed placeholder slots; see
+    /// [`Function::sentinel`]) are skipped — they are not functions.
     pub fn function_ids(&self) -> Vec<FunctionId> {
-        self.values.functions.iter().map(|f| f.id).collect()
+        self.values
+            .functions
+            .iter()
+            .filter(|f| !f.is_sentinel())
+            .map(|f| f.id)
+            .collect()
     }
 
     /// Mints a fresh, uniquely-named anonymous function and returns its id.
@@ -1408,8 +1415,11 @@ impl<'str, 'ctx> Iterator for FunctionIter<'str, 'ctx> {
     type Item = FunctionRef<'str, 'ctx>;
 
     fn next(&mut self) -> Option<Self::Item> {
+        // Reserved minting-pool sentinels hold registry slots but are not
+        // functions; no iteration surface may observe them.
         self.inner
-            .next()
+            .by_ref()
+            .find(|f| !f.is_sentinel())
             .map(|f| FunctionRef::from_id(self.ctx, f.id))
     }
 }
