@@ -284,6 +284,12 @@ struct Walk<'a, 'str, H: HostMut<'str>> {
     aliases: Option<&'a AliasResult>,
     numbering: &'a Numbering,
     shared: &'a HashSet<BlockId>,
+    /// The function being walked. A cross-function CFG successor (a jump-table
+    /// case or tail-call/thunk `Branch` into another function) is **not**
+    /// descended into: a function pass mutates only its own function, and a
+    /// checked-out host cannot even reach a foreign block's arena for writing.
+    /// The foreign block is optimized when its own function is walked.
+    owner: FunctionId,
     changed: bool,
 }
 
@@ -333,18 +339,35 @@ impl<'str, H: HostMut<'str>> Walk<'_, 'str, H> {
             pass.after_block(host, state.as_mut(), block_id, self.aliases, self.numbering);
         }
         for &child in self.tree.children_of(block_id) {
-            self.rec(host, child, &states);
+            // Stay within the walked function: a dominator-tree child *owned* by
+            // another function is a cross-function CFG target and is left to that
+            // function's own walk. Keyed on ownership (`parent`), not storage
+            // (`id.func`), so a reattributed own block (owner == walked function,
+            // stored elsewhere) is still descended into.
+            if host.read_host().block(child).parent == Some(self.owner) {
+                self.rec(host, child, &states);
+            }
         }
     }
 }
 
-/// All blocks reachable from `entry` via CFG successor edges (including `entry`).
-fn reachable_from<'str>(host: HostRef<'_, 'str>, entry: BlockId) -> HashSet<BlockId> {
+/// All blocks reachable from `entry` via CFG successor edges (including `entry`),
+/// **confined to `owner`'s own blocks**: a cross-function successor edge is not
+/// crossed, so the reachable set — and every walk seeded from it — stays inside
+/// the function being optimized.
+fn reachable_from<'str>(
+    host: HostRef<'_, 'str>,
+    entry: BlockId,
+    owner: FunctionId,
+) -> HashSet<BlockId> {
     let mut seen = HashSet::from_iter([entry]);
     let mut stack = vec![entry];
     while let Some(block) = stack.pop() {
         for (_, succ) in BlockRef::new(host, block).successors() {
-            if seen.insert(succ) {
+            // Ownership, not storage: a reattributed own block (owner == the
+            // walked function, stored in a foreign arena pre-normalization) is
+            // followed; a block owned by another function is not.
+            if host.block(succ).parent == Some(owner) && seen.insert(succ) {
                 stack.push(succ);
             }
         }
@@ -379,7 +402,7 @@ pub(super) fn run_dominator_walk<'str, H: HostMut<'str>>(
         None => return false,
     };
 
-    let root_reachable = reachable_from(host.read_host(), root);
+    let root_reachable = reachable_from(host.read_host(), root, func_id);
     let entries: Vec<BlockId> = FunctionRef::new(host.read_host(), func_id)
         .iter()
         .filter(|block| !root_reachable.contains(&block.id))
@@ -389,7 +412,7 @@ pub(super) fn run_dominator_walk<'str, H: HostMut<'str>>(
 
     let mut seen_count: HashMap<BlockId, u32> = HashMap::default();
     for &entry in std::iter::once(&root).chain(&entries) {
-        for block in reachable_from(host.read_host(), entry) {
+        for block in reachable_from(host.read_host(), entry, func_id) {
             *seen_count.entry(block).or_default() += 1;
         }
     }
@@ -412,6 +435,7 @@ pub(super) fn run_dominator_walk<'str, H: HostMut<'str>>(
             aliases,
             numbering: &numbering,
             shared: &shared,
+            owner: func_id,
             changed: false,
         };
         walk.rec(host, entry, &init_states(passes));
