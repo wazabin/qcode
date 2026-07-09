@@ -10,7 +10,11 @@ use crate::AliasResult;
 
 use qcode::{
     context::Context,
-    value::{block::BlockMutRef, function::FunctionId, util::base_ref::WithCtxMut},
+    value::{
+        block::BlockMutRef,
+        function::FunctionId,
+        util::{base_ref::WithCtxMut, host_mut::HostMut},
+    },
 };
 
 pub(crate) mod affine;
@@ -46,7 +50,7 @@ use walk::{run_dominator_walk, run_flat_fixpoint, run_single_block};
 /// recognition, intrinsic recognition before the algebraic identities that
 /// simplify the intrinsics it produces, and CSE last over already-simplified
 /// mnemonics.
-fn gvn_passes() -> Vec<Box<dyn walk::SubPass>> {
+fn gvn_passes<'str, H: HostMut<'str>>() -> Vec<Box<dyn walk::SubPass<'str, H>>> {
     vec![
         Box::new(MemoryForwarding),
         Box::new(Fold),
@@ -76,18 +80,40 @@ fn gvn_passes() -> Vec<Box<dyn walk::SubPass>> {
 ///
 /// Folding only — no CSE or load/store forwarding. Returns `true` if anything
 /// changed.
-pub fn constant_fold_function(ctx: &mut Context, func_id: FunctionId) -> bool {
-    run_flat_fixpoint(ctx, func_id, &[Box::new(Fold) as Box<dyn walk::SubPass>])
+pub fn constant_fold_function(mut ctx: &mut Context, func_id: FunctionId) -> bool {
+    constant_fold_host(&mut ctx, func_id)
+}
+
+/// Host-generic core of [`constant_fold_function`]: runs the [`Fold`] sub-pass to
+/// a fixpoint over either the whole module (`&mut Context`) or a single
+/// checked-out function ([`CheckedOut`]).
+///
+/// [`CheckedOut`]: qcode::value::util::host_mut::CheckedOut
+pub(crate) fn constant_fold_host<'str, H: HostMut<'str>>(
+    host: &mut H,
+    func_id: FunctionId,
+) -> bool {
+    run_flat_fixpoint(
+        host,
+        func_id,
+        &[Box::new(Fold) as Box<dyn walk::SubPass<'str, H>>],
+    )
 }
 
 /// Sink low-word truncations through arithmetic, cancelling widenings, to a
 /// fixpoint. Standalone composition of the [`NarrowTrunc`] sub-pass — the same
 /// shape as [`constant_fold_function`]. Returns `true` if anything changed.
-pub fn narrow_function(ctx: &mut Context, func_id: FunctionId) -> bool {
+pub fn narrow_function(mut ctx: &mut Context, func_id: FunctionId) -> bool {
+    narrow_host(&mut ctx, func_id)
+}
+
+/// Host-generic core of [`narrow_function`]: runs the [`NarrowTrunc`] sub-pass to
+/// a fixpoint over either the whole module or a single checked-out function.
+pub(crate) fn narrow_host<'str, H: HostMut<'str>>(host: &mut H, func_id: FunctionId) -> bool {
     run_flat_fixpoint(
-        ctx,
+        host,
         func_id,
-        &[Box::new(NarrowTrunc) as Box<dyn walk::SubPass>],
+        &[Box::new(NarrowTrunc) as Box<dyn walk::SubPass<'str, H>>],
     )
 }
 
@@ -99,7 +125,8 @@ pub fn narrow_function(ctx: &mut Context, func_id: FunctionId) -> bool {
 /// Terminators, calls, and `PCodeOp` are excluded.
 pub fn gvn(block: &mut BlockMutRef, aliases: Option<&AliasResult>) {
     let block_id = block.id;
-    run_single_block(block.ctx_mut(), block_id, &gvn_passes(), aliases);
+    let mut ctx = block.ctx_mut();
+    run_single_block(&mut ctx, block_id, &gvn_passes(), aliases);
 }
 
 /// Dominator-tree GVN over an entire function.
@@ -110,8 +137,12 @@ pub fn gvn(block: &mut BlockMutRef, aliases: Option<&AliasResult>) {
 /// eliminated. Store/load invalidation follows the same alias-aware rules as the
 /// single-block pass.
 /// Returns `true` if anything changed.
-pub fn gvn_function(ctx: &mut Context, func_id: FunctionId, aliases: Option<&AliasResult>) -> bool {
-    run_dominator_walk(ctx, func_id, &gvn_passes(), aliases)
+pub fn gvn_function(
+    mut ctx: &mut Context,
+    func_id: FunctionId,
+    aliases: Option<&AliasResult>,
+) -> bool {
+    run_dominator_walk(&mut ctx, func_id, &gvn_passes(), aliases)
 }
 
 // ----- passes ----------------------------------------------------------------

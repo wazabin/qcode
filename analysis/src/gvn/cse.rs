@@ -13,12 +13,10 @@
 //! unless it is already canonical. See [`super::affine`] for the normal form,
 //! key/emit split, and idempotence argument.
 
-use qcode::{
-    context::Context,
-    value::{
-        ValueId,
-        insn::{Binop, FloatBinop, IntBinop, Mnemonic},
-    },
+use qcode::value::{
+    ValueId,
+    insn::{Binop, FloatBinop, IntBinop, Mnemonic},
+    util::host_mut::HostMut,
 };
 
 use std::any::Any;
@@ -28,7 +26,11 @@ use super::walk::{Claim, Editor, InsnCtx, SubPass};
 
 pub(super) struct Cse;
 
-impl SubPass for Cse {
+/// CSE numbers pure values down a whole dominator tree and is dispatched only by
+/// the module `gvn` pass, so it runs on the module host.
+const MODULE_ONLY: &str = "Cse is dispatched only by the module gvn pass";
+
+impl<'str, H: HostMut<'str>> SubPass<'str, H> for Cse {
     fn init_state(&self) -> Box<dyn Any> {
         Box::new(Numbering::default())
     }
@@ -44,7 +46,7 @@ impl SubPass for Cse {
 
     fn on_block_entry(
         &self,
-        _ctx: &mut Context,
+        _host: &mut H,
         state: &mut dyn Any,
         _block_id: qcode::value::block::BlockId,
         _tree: &jstd::graph::analysis::DominatorTree<qcode::value::block::BlockId>,
@@ -62,16 +64,11 @@ impl SubPass for Cse {
         }
     }
 
-    fn on_insn(
-        &self,
-        ctx: &mut Context,
-        state: &mut dyn Any,
-        ic: &InsnCtx,
-        ed: &mut Editor,
-    ) -> Claim {
+    fn on_insn(&self, host: &mut H, state: &mut dyn Any, ic: &InsnCtx, ed: &mut Editor) -> Claim {
         if ic.mnemonic.is_terminator() || ic.size == 0 {
             return Claim::Pass;
         }
+        let mut ctx = host.as_module_mut().expect(MODULE_ONLY);
         let state = state.downcast_mut::<Numbering>().expect("cse state");
 
         // Arithmetic view (used to compose consumers) and the value-numbering key.
@@ -92,7 +89,7 @@ impl SubPass for Cse {
         // A dominating value already computes this form: forward to it.
         if let Some(leader) = state.lookup(&key) {
             if leader != ic.id {
-                ed.replace(ctx, ic.insn_id, leader);
+                ed.replace(&mut ctx, ic.insn_id, leader);
             }
             return Claim::Done;
         }
@@ -115,7 +112,7 @@ impl SubPass for Cse {
                     state,
                 );
                 if v != ic.id {
-                    ed.replace(ctx, ic.insn_id, v);
+                    ed.replace(&mut ctx, ic.insn_id, v);
                 }
             }
         }
@@ -181,6 +178,7 @@ pub(super) fn normalize(m: &mut Mnemonic) {
 mod tests {
     use super::*;
     use crate::gvn::{gvn, gvn_function};
+    use qcode::context::Context;
     use qcode::value::{BasicBlock, InstructionId, insn::Binary};
     use qcode_macro::qcode;
 

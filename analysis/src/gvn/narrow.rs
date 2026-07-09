@@ -35,17 +35,21 @@ use rustc_hash::FxHashMap as HashMap;
 use qcode::{
     context::Context,
     value::{
-        BasicBlock, Instruction, InstructionRef, Value, ValueId, ValueRef,
+        Value, ValueId, ValueRef,
         block::BlockId,
         insn::{Binary, Binop, InstructionId, IntBinop, Mnemonic, Range, Sext, Unary, Unop, Zext},
+        util::{base_ref::HostRef, host_mut::HostMut},
     },
 };
 
 use super::walk::{Claim, Editor, InsnCtx, SubPass};
 
+/// Fully host-routed: reads resolve through a [`HostRef`], the narrow values it
+/// materializes are pushed into the (possibly checked-out) function's own arena,
+/// and constants are minted through the shared interners.
 pub(super) struct NarrowTrunc;
 
-impl SubPass for NarrowTrunc {
+impl<'str, H: HostMut<'str>> SubPass<'str, H> for NarrowTrunc {
     fn init_state(&self) -> Box<dyn Any> {
         Box::new(())
     }
@@ -54,13 +58,7 @@ impl SubPass for NarrowTrunc {
         Box::new(())
     }
 
-    fn on_insn(
-        &self,
-        ctx: &mut Context,
-        _state: &mut dyn Any,
-        ic: &InsnCtx,
-        ed: &mut Editor,
-    ) -> Claim {
+    fn on_insn(&self, host: &mut H, _state: &mut dyn Any, ic: &InsnCtx, ed: &mut Editor) -> Claim {
         let Mnemonic::Range(Range {
             src,
             start: 0,
@@ -72,28 +70,28 @@ impl SubPass for NarrowTrunc {
         let (src, w) = (*src, *size);
         // Only act when there is something to push through (a same-width no-op
         // truncation, or a sinkable producer); otherwise leave the `Range`.
-        if value_size(ctx, src) != w && !src_transformable(ctx, src) {
+        if value_size(host.read_host(), src) != w && !src_transformable(host.read_host(), src) {
             return Claim::Pass;
         }
         let mut memo: HashMap<ValueId, ValueId> = HashMap::default();
-        let narrowed = narrow_to(ctx, src, w, ic.insn_id, ic.block_id, &mut memo);
+        let narrowed = narrow_to(host, src, w, ic.insn_id, ic.block_id, &mut memo);
         if narrowed == ic.id {
             return Claim::Pass;
         }
-        ed.replace(ctx, ic.insn_id, narrowed);
+        ed.replace(host, ic.insn_id, narrowed);
         Claim::Done
     }
 }
 
 /// Will [`narrow_to`] push through `v` rather than just wrap it in a `Range`?
-fn src_transformable(ctx: &Context, v: ValueId) -> bool {
-    if numeric_const(ctx, v).is_some() {
+fn src_transformable(host: HostRef, v: ValueId) -> bool {
+    if numeric_const(host.shared(), v).is_some() {
         return true;
     }
     let ValueId::Instruction(iid) = v else {
         return false;
     };
-    match Instruction::from_id(ctx, iid).mnemonic() {
+    match host.instruction(iid).mnemonic() {
         Mnemonic::Binop(b) => matches!(
             b.op,
             Binop::Int(
@@ -115,15 +113,15 @@ fn src_transformable(ctx: &Context, v: ValueId) -> bool {
 /// Returns a width-`w` value equal to the low `w` bytes of `v`, materializing
 /// instructions before `before`. Memoized within a single rewrite (so `w` is
 /// fixed and the key is just `v`).
-fn narrow_to(
-    ctx: &mut Context,
+fn narrow_to<'str, H: HostMut<'str>>(
+    host: &mut H,
     v: ValueId,
     w: usize,
     before: InstructionId,
     block: BlockId,
     memo: &mut HashMap<ValueId, ValueId>,
 ) -> ValueId {
-    if value_size(ctx, v) == w {
+    if value_size(host.read_host(), v) == w {
         return v; // already the right width — truncation is a no-op here
     }
     if let Some(&cached) = memo.get(&v) {
@@ -131,16 +129,16 @@ fn narrow_to(
     }
 
     let result = match v {
-        ValueId::Instruction(iid) => match Instruction::from_id(ctx, iid).mnemonic().clone() {
+        ValueId::Instruction(iid) => match host.read_host().instruction(iid).mnemonic().clone() {
             Mnemonic::Binop(Binary {
                 op: Binop::Int(o),
                 lhs,
                 rhs,
             }) if distributive(o) => {
-                let l = narrow_to(ctx, lhs, w, before, block, memo);
-                let rr = narrow_to(ctx, rhs, w, before, block, memo);
+                let l = narrow_to(host, lhs, w, before, block, memo);
+                let rr = narrow_to(host, rhs, w, before, block, memo);
                 push_insn(
-                    ctx,
+                    host,
                     Mnemonic::Binop(Binary {
                         op: Binop::Int(o),
                         lhs: l,
@@ -152,30 +150,30 @@ fn narrow_to(
                 )
             }
             Mnemonic::Unop(Unary { op, src }) if matches!(op, Unop::IntNot | Unop::IntNegate) => {
-                let s = narrow_to(ctx, src, w, before, block, memo);
-                push_insn(ctx, Mnemonic::Unop(Unary { op, src: s }), w, before, block)
+                let s = narrow_to(host, src, w, before, block, memo);
+                push_insn(host, Mnemonic::Unop(Unary { op, src: s }), w, before, block)
             }
             // Widening, then truncating back below the widened width: the
             // extension is irrelevant to the low word.
             Mnemonic::Sext(Sext { src, .. }) => {
-                narrow_extension(ctx, src, w, true, before, block, memo)
+                narrow_extension(host, src, w, true, before, block, memo)
             }
             Mnemonic::Zext(Zext { src, .. }) => {
-                narrow_extension(ctx, src, w, false, before, block, memo)
+                narrow_extension(host, src, w, false, before, block, memo)
             }
             // Low-word of a low-word slice is just a narrower low-word slice.
             Mnemonic::Range(Range { src, start: 0, .. }) => {
-                narrow_to(ctx, src, w, before, block, memo)
+                narrow_to(host, src, w, before, block, memo)
             }
             // Anything else: low `w` bytes are opaque — extract them.
-            _ => push_insn(ctx, range_low(v, w), w, before, block),
+            _ => push_insn(host, range_low(v, w), w, before, block),
         },
-        _ if numeric_const(ctx, v).is_some() => {
-            let folded = numeric_const(ctx, v).unwrap() & low_mask(w);
-            ctx.get_const(folded, w).id()
+        _ if numeric_const(host.shared(), v).is_some() => {
+            let folded = numeric_const(host.shared(), v).unwrap() & low_mask(w);
+            host.shared().get_const(folded, w).id()
         }
         // Block params, varnodes, …: extract the low bytes.
-        _ => push_insn(ctx, range_low(v, w), w, before, block),
+        _ => push_insn(host, range_low(v, w), w, before, block),
     };
 
     memo.insert(v, result);
@@ -185,8 +183,8 @@ fn narrow_to(
 /// Low `w` bytes of `ext_kind(src)`. If `src` already has at least `w` bytes the
 /// extension is discarded (recurse into `src`); otherwise a *narrower* extension
 /// of `src` up to `w` reproduces the low word exactly.
-fn narrow_extension(
-    ctx: &mut Context,
+fn narrow_extension<'str, H: HostMut<'str>>(
+    host: &mut H,
     src: ValueId,
     w: usize,
     sext: bool,
@@ -194,15 +192,15 @@ fn narrow_extension(
     block: BlockId,
     memo: &mut HashMap<ValueId, ValueId>,
 ) -> ValueId {
-    if value_size(ctx, src) >= w {
-        return narrow_to(ctx, src, w, before, block, memo);
+    if value_size(host.read_host(), src) >= w {
+        return narrow_to(host, src, w, before, block, memo);
     }
     let m = if sext {
         Mnemonic::Sext(Sext { src, size: w })
     } else {
         Mnemonic::Zext(Zext { src, size: w })
     };
-    push_insn(ctx, m, w, before, block)
+    push_insn(host, m, w, before, block)
 }
 
 fn distributive(op: IntBinop) -> bool {
@@ -225,15 +223,15 @@ fn range_low(src: ValueId, size: usize) -> Mnemonic {
     })
 }
 
-fn push_insn(
-    ctx: &mut Context,
+fn push_insn<'str, H: HostMut<'str>>(
+    host: &mut H,
     mnemonic: Mnemonic,
     size: usize,
     before: InstructionId,
     block: BlockId,
 ) -> ValueId {
-    let id = InstructionRef::from_mnemonic(ctx, block.func, mnemonic, size).id;
-    BasicBlock::from_id_mut(ctx, block).insert_insn_before(before, id);
+    let id = host.push_mnemonic(block.func, mnemonic, size);
+    host.insert_insn_before(block, before, id);
     ValueId::Instruction(id)
 }
 
@@ -256,8 +254,8 @@ fn numeric_const(ctx: &Context, v: ValueId) -> Option<u64> {
     None
 }
 
-fn value_size(ctx: &Context, v: ValueId) -> usize {
-    ValueRef::new(v, ctx).size()
+fn value_size(host: HostRef, v: ValueId) -> usize {
+    ValueRef::from_host(host, v).size()
 }
 
 #[cfg(test)]
@@ -265,6 +263,7 @@ mod tests {
     use super::value_size;
     use crate::gvn::narrow_function;
     use crate::mba_simplify::mba_simplify;
+    use qcode::value::util::base_ref::HostRef;
     use qcode::{
         context::Context,
         value::{BasicBlock, Function, FunctionId, Instruction, ValueId, insn::Mnemonic},
@@ -345,7 +344,10 @@ mod tests {
                 ..
             })
         ));
-        assert_eq!(value_size(&ctx, return_value(&ctx, widemul)), 4);
+        assert_eq!(
+            value_size(HostRef::from(&ctx), return_value(&ctx, widemul)),
+            4
+        );
         assert_eq!(sample(&ctx, widemul), before);
     }
 
@@ -366,7 +368,7 @@ mod tests {
         );
         let before = sample(&ctx, z);
         assert!(narrow_function(&mut ctx, z));
-        assert_eq!(value_size(&ctx, return_value(&ctx, z)), 4);
+        assert_eq!(value_size(HostRef::from(&ctx), return_value(&ctx, z)), 4);
         assert!(!matches!(return_def(&ctx, z), Mnemonic::Range(_)));
         assert_eq!(sample(&ctx, z), before);
     }

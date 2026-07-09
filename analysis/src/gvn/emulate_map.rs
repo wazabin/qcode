@@ -21,6 +21,7 @@ use qcode::{
     value::{
         ValueId,
         insn::{Map, Mnemonic, Scan},
+        util::host_mut::HostMut,
     },
 };
 
@@ -37,11 +38,15 @@ use super::walk::{Claim, Editor, InsnCtx, SubPass};
 /// expressions, so this only guards against a degenerate body.
 const STEP_BUDGET: usize = 100_000;
 
+/// Emulating a map reads the pure *body callee*'s IR through the module, so it is
+/// dispatched only by the module `gvn` pass and runs on the module host.
+const MODULE_ONLY: &str = "EmulateMap is dispatched only by the module gvn pass";
+
 /// Replace `body <$> b"…"` / `body <$> enumerate(b"…")` with the emulated
 /// constant `Bytes` array.
 pub(super) struct EmulateMap;
 
-impl SubPass for EmulateMap {
+impl<'str, H: HostMut<'str>> SubPass<'str, H> for EmulateMap {
     fn init_state(&self) -> Box<dyn Any> {
         Box::new(())
     }
@@ -50,13 +55,8 @@ impl SubPass for EmulateMap {
         Box::new(())
     }
 
-    fn on_insn(
-        &self,
-        ctx: &mut Context,
-        _state: &mut dyn Any,
-        ic: &InsnCtx,
-        ed: &mut Editor,
-    ) -> Claim {
+    fn on_insn(&self, host: &mut H, _state: &mut dyn Any, ic: &InsnCtx, ed: &mut Editor) -> Claim {
+        let mut ctx = host.as_module_mut().expect(MODULE_ONLY);
         let folded = match ic.mnemonic.clone() {
             Mnemonic::Map(map) => self.emulate(ctx, ic, &map),
             Mnemonic::Scan(scan) => self.emulate_scan(ctx, ic, &scan),
@@ -64,7 +64,7 @@ impl SubPass for EmulateMap {
         };
         match folded {
             Some(bytes) => {
-                ed.replace(ctx, ic.insn_id, bytes);
+                ed.replace(&mut ctx, ic.insn_id, bytes);
                 Claim::Done
             }
             None => Claim::Pass,

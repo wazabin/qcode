@@ -23,6 +23,7 @@ use qcode::{
     value::{
         Value, ValueId, ValueRef,
         insn::{Binary, Binop, IntBinop, Mnemonic, Simplified},
+        util::host_mut::HostMut,
     },
 };
 
@@ -31,12 +32,16 @@ use std::any::Any;
 
 use super::walk::{Claim, Editor, InsnCtx, SubPass};
 
+/// The multi-instruction identities read through the module only; this sub-pass
+/// is dispatched only by the module `gvn` pass and runs on the module host.
+const MODULE_ONLY: &str = "Identities is dispatched only by the module gvn pass";
+
 /// Recognize the add/and/shift (and or/and) idioms and rewrite the root
 /// instruction to the single `^`/`+` it computes. The now-unused sub-expressions
 /// are left for DCE.
 pub(super) struct Identities;
 
-impl SubPass for Identities {
+impl<'str, H: HostMut<'str>> SubPass<'str, H> for Identities {
     fn init_state(&self) -> Box<dyn Any> {
         Box::new(())
     }
@@ -45,16 +50,11 @@ impl SubPass for Identities {
         Box::new(())
     }
 
-    fn on_insn(
-        &self,
-        ctx: &mut Context,
-        _state: &mut dyn Any,
-        ic: &InsnCtx,
-        ed: &mut Editor,
-    ) -> Claim {
+    fn on_insn(&self, host: &mut H, _state: &mut dyn Any, ic: &InsnCtx, ed: &mut Editor) -> Claim {
         if ic.mnemonic.is_terminator() || ic.size == 0 {
             return Claim::Pass;
         }
+        let mut ctx = host.as_module_mut().expect(MODULE_ONLY);
         // Pure intrinsics carry their own algebraic simplifier (e.g.
         // `rol(x, 0) → x`), which forwards uses to an existing value.
         if let Mnemonic::Intrinsic(intr) = ic.mnemonic {
@@ -62,18 +62,18 @@ impl SubPass for Identities {
             let args = intr.args.clone();
             match id.desc().simplify(ctx, id, ic.size, &args) {
                 Some(Simplified::Value(repl)) => {
-                    ed.replace(ctx, ic.insn_id, repl);
+                    ed.replace(&mut ctx, ic.insn_id, repl);
                     return Claim::Done;
                 }
                 Some(Simplified::Expression(mnemonic)) => {
-                    ed.replace_with_new_insn(ctx, ic.block_id, ic.insn_id, mnemonic, ic.size);
+                    ed.replace_with_new_insn(&mut ctx, ic.block_id, ic.insn_id, mnemonic, ic.size);
                     return Claim::Done;
                 }
                 None => {}
             }
         }
         if let Some(new_mnemonic) = simplify_identity(ctx, ic.mnemonic) {
-            ed.replace_with_new_insn(ctx, ic.block_id, ic.insn_id, new_mnemonic, ic.size);
+            ed.replace_with_new_insn(&mut ctx, ic.block_id, ic.insn_id, new_mnemonic, ic.size);
             return Claim::Done;
         }
         // Constant-absorbing / De Morgan rewrites need `&mut Context` (they intern
@@ -325,7 +325,7 @@ fn simplify_not(ctx: &mut Context, v: ValueId, size: usize) -> Option<ValueId> {
 /// double-negation (so no new xor is created), which is exactly the shape
 /// compilers emit for `a & const` as `~(~a | ~const)`. Returns whether it
 /// rewrote the root.
-fn simplify_bitwise(ctx: &mut Context, ic: &InsnCtx, ed: &mut Editor) -> bool {
+fn simplify_bitwise(mut ctx: &mut Context, ic: &InsnCtx, ed: &mut Editor) -> bool {
     let &Mnemonic::Binop(Binary {
         lhs,
         rhs,
@@ -349,7 +349,7 @@ fn simplify_bitwise(ctx: &mut Context, ic: &InsnCtx, ed: &mut Editor) -> bool {
                     && (is_boolean(ctx, inner)
                         || as_zext(ctx, inner).is_some_and(|(src, _)| is_boolean(ctx, src)))
                 {
-                    ed.replace(ctx, ic.insn_id, inner);
+                    ed.replace(&mut ctx, ic.insn_id, inner);
                     return true;
                 }
                 // `inner & mask → inner` when `inner` is already aligned to the
@@ -360,13 +360,13 @@ fn simplify_bitwise(ctx: &mut Context, ic: &InsnCtx, ed: &mut Editor) -> bool {
                 if let Some(k) = align_mask_bits(outer, size)
                     && known_align(ctx, inner, ALIGN_DEPTH) >= k
                 {
-                    ed.replace(ctx, ic.insn_id, inner);
+                    ed.replace(&mut ctx, ic.insn_id, inner);
                     return true;
                 }
                 if let Some((x, c1)) = binop_const(ctx, inner, IntBinop::And) {
                     let folded = ctx.get_const((c1 & outer) & all, size).id();
                     ed.replace_with_new_insn(
-                        ctx,
+                        &mut ctx,
                         ic.block_id,
                         ic.insn_id,
                         int_binop(x, folded, IntBinop::And),
@@ -383,7 +383,7 @@ fn simplify_bitwise(ctx: &mut Context, ic: &InsnCtx, ed: &mut Editor) -> bool {
                 if let Some((x, c1)) = binop_const(ctx, inner, IntBinop::Xor) {
                     let folded = ctx.get_const((c1 ^ outer) & all, size).id();
                     ed.replace_with_new_insn(
-                        ctx,
+                        &mut ctx,
                         ic.block_id,
                         ic.insn_id,
                         int_binop(x, folded, IntBinop::Xor),
@@ -407,7 +407,7 @@ fn simplify_bitwise(ctx: &mut Context, ic: &InsnCtx, ed: &mut Editor) -> bool {
                         continue;
                     };
                     ed.replace_with_new_insn(
-                        ctx,
+                        &mut ctx,
                         ic.block_id,
                         ic.insn_id,
                         int_binop(na, nb, dual_out),
@@ -468,7 +468,7 @@ fn negated_compare(op: IntBinop) -> Option<IntBinop> {
 ///
 /// Together these collapse `zext(!(x == 0)) != 0` down to `x != 0`. Returns
 /// whether the root was rewritten.
-fn simplify_compare(ctx: &mut Context, ic: &InsnCtx, ed: &mut Editor) -> bool {
+fn simplify_compare(mut ctx: &mut Context, ic: &InsnCtx, ed: &mut Editor) -> bool {
     match *ic.mnemonic {
         Mnemonic::Binop(Binary {
             lhs,
@@ -485,7 +485,7 @@ fn simplify_compare(ctx: &mut Context, ic: &InsnCtx, ed: &mut Editor) -> bool {
                     let zero = ctx.get_const(0, src_size).id();
                     let bool_ty = ctx.types.get_or_make_bool();
                     ed.replace_with_new_insn_typed(
-                        ctx,
+                        &mut ctx,
                         ic.block_id,
                         ic.insn_id,
                         int_binop(src, zero, op),
@@ -501,7 +501,7 @@ fn simplify_compare(ctx: &mut Context, ic: &InsnCtx, ed: &mut Editor) -> bool {
                 if is_boolean(ctx, other) && value_size(ctx, other) == ic.size {
                     match op {
                         IntBinop::NotEqual => {
-                            ed.replace(ctx, ic.insn_id, other);
+                            ed.replace(&mut ctx, ic.insn_id, other);
                             return true;
                         }
                         // `(a == c) == false` → `a != c` / `(a != c) == false`
@@ -518,7 +518,7 @@ fn simplify_compare(ctx: &mut Context, ic: &InsnCtx, ed: &mut Editor) -> bool {
                             {
                                 let bool_ty = ctx.types.get_or_make_bool();
                                 ed.replace_with_new_insn_typed(
-                                    ctx,
+                                    &mut ctx,
                                     ic.block_id,
                                     ic.insn_id,
                                     int_binop(a, b, flipped),

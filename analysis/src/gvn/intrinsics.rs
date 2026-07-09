@@ -11,19 +11,23 @@
 //! A matched root is rewritten to the intrinsic; the now-unused shift/or math
 //! it subsumed becomes pure-dead and is reclaimed by DCE.
 
-use qcode::{
-    context::Context,
-    value::insn::{Binop, IntrinsicApp, Mnemonic, RootOp, recognizers_for},
+use qcode::value::{
+    insn::{Binop, IntrinsicApp, Mnemonic, RootOp, recognizers_for},
+    util::host_mut::HostMut,
 };
 
 use std::any::Any;
 
 use super::walk::{Claim, Editor, InsnCtx, SubPass};
 
+/// Idiom recognition reads through the module only; it is dispatched only by the
+/// module `gvn` pass and runs on the module host.
+const MODULE_ONLY: &str = "Recognize is dispatched only by the module gvn pass";
+
 /// Rewrite recognized idioms into intrinsics.
 pub(super) struct Recognize;
 
-impl SubPass for Recognize {
+impl<'str, H: HostMut<'str>> SubPass<'str, H> for Recognize {
     fn init_state(&self) -> Box<dyn Any> {
         Box::new(())
     }
@@ -32,26 +36,21 @@ impl SubPass for Recognize {
         Box::new(())
     }
 
-    fn on_insn(
-        &self,
-        ctx: &mut Context,
-        _state: &mut dyn Any,
-        ic: &InsnCtx,
-        ed: &mut Editor,
-    ) -> Claim {
+    fn on_insn(&self, host: &mut H, _state: &mut dyn Any, ic: &InsnCtx, ed: &mut Editor) -> Claim {
         if ic.size == 0 {
             return Claim::Pass;
         }
         let Some(root) = root_op_of(ic.mnemonic) else {
             return Claim::Pass;
         };
+        let mut ctx = host.as_module_mut().expect(MODULE_ONLY);
 
         for &id in recognizers_for(root) {
             if let Some(args) = id.desc().recognize(ctx, ic.insn_id) {
                 // Recognized intrinsics (rol/ror) are width-preserving, so the
                 // root's width is the result width.
                 ed.replace_with_new_insn(
-                    ctx,
+                    &mut ctx,
                     ic.block_id,
                     ic.insn_id,
                     Mnemonic::Intrinsic(IntrinsicApp { id, args }),

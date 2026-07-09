@@ -26,6 +26,7 @@ use qcode::{
     value::{
         BasicBlock, InstructionRef, ValueId,
         insn::{Extract, Mnemonic, Range, Tuple},
+        util::host_mut::HostMut,
     },
 };
 
@@ -37,7 +38,12 @@ use super::walk::{Claim, Editor, InsnCtx, SubPass};
 
 pub(super) struct ArrayProject;
 
-impl SubPass for ArrayProject {
+/// Projecting a lane out of a `map` inlines the pure *body callee*'s IR (read
+/// through the module), so this is dispatched only by the module `gvn` pass and
+/// runs on the module host.
+const MODULE_ONLY: &str = "ArrayProject is dispatched only by the module gvn pass";
+
+impl<'str, H: HostMut<'str>> SubPass<'str, H> for ArrayProject {
     fn init_state(&self) -> Box<dyn Any> {
         Box::new(())
     }
@@ -46,13 +52,8 @@ impl SubPass for ArrayProject {
         Box::new(())
     }
 
-    fn on_insn(
-        &self,
-        ctx: &mut Context,
-        _state: &mut dyn Any,
-        ic: &InsnCtx,
-        ed: &mut Editor,
-    ) -> Claim {
+    fn on_insn(&self, host: &mut H, _state: &mut dyn Any, ic: &InsnCtx, ed: &mut Editor) -> Claim {
+        let ctx = host.as_module_mut().expect(MODULE_ONLY);
         match *ic.mnemonic {
             Mnemonic::Range(Range { src, start, size }) => {
                 self.project_range(ctx, ic, ed, src, start, size)
@@ -98,7 +99,7 @@ impl ArrayProject {
     /// `Range(Map(body, src), k·osz, osz)` ⇒ inlined `body(src[k], captures…)`.
     fn project_map(
         &self,
-        ctx: &mut Context,
+        mut ctx: &mut Context,
         ic: &InsnCtx,
         ed: &mut Editor,
         map_id: qcode::value::InstructionId,
@@ -158,7 +159,7 @@ impl ArrayProject {
             return Claim::Pass;
         };
 
-        ed.replace(ctx, ic.insn_id, result);
+        ed.replace(&mut ctx, ic.insn_id, result);
         Claim::Done
     }
 
@@ -166,7 +167,7 @@ impl ArrayProject {
     #[allow(clippy::too_many_arguments)]
     fn project_enumerate(
         &self,
-        ctx: &mut Context,
+        mut ctx: &mut Context,
         ic: &InsnCtx,
         ed: &mut Editor,
         enum_val: ValueId,
@@ -232,7 +233,7 @@ impl ArrayProject {
             ValueId::Instruction(t)
         };
 
-        ed.replace(ctx, ic.insn_id, tuple);
+        ed.replace(&mut ctx, ic.insn_id, tuple);
         Claim::Done
     }
 
@@ -240,7 +241,7 @@ impl ArrayProject {
     /// `a`, or `Range(b, off - sizeof(a), size)` when wholly in `b`.
     fn project_concat(
         &self,
-        ctx: &mut Context,
+        mut ctx: &mut Context,
         ic: &InsnCtx,
         ed: &mut Editor,
         args: &[ValueId],
@@ -276,14 +277,14 @@ impl ArrayProject {
         )
         .id;
         BasicBlock::from_id_mut(ctx, ic.block_id).insert_insn_before(ic.insn_id, r);
-        ed.replace(ctx, ic.insn_id, ValueId::Instruction(r));
+        ed.replace(&mut ctx, ic.insn_id, ValueId::Instruction(r));
         Claim::Done
     }
 
     /// `Extract(Tuple{fields…}, i)` ⇒ `fields[i]`.
     fn fold_extract_tuple(
         &self,
-        ctx: &mut Context,
+        mut ctx: &mut Context,
         ic: &InsnCtx,
         ed: &mut Editor,
         agg: ValueId,
@@ -298,7 +299,7 @@ impl ArrayProject {
         let Some(&field) = fields.get(index) else {
             return Claim::Pass;
         };
-        ed.replace(ctx, ic.insn_id, field);
+        ed.replace(&mut ctx, ic.insn_id, field);
         Claim::Done
     }
 }

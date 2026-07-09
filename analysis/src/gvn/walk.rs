@@ -17,14 +17,12 @@ use crate::AliasResult;
 
 use super::affine::Numbering;
 
-use qcode::{
-    context::Context,
-    value::{
-        BasicBlock, Function, ValueId,
-        block::BlockId,
-        function::FunctionId,
-        insn::{InstructionId, InstructionRef, Mnemonic},
-    },
+use qcode::value::{
+    ValueId,
+    block::{BlockId, BlockRef},
+    function::{FunctionId, FunctionRef},
+    insn::{InstructionId, InstructionRef, Mnemonic},
+    util::{base_ref::HostRef, host_mut::HostMut},
 };
 
 /// What a sub-pass did with an instruction.
@@ -66,51 +64,55 @@ impl Editor {
     }
 
     /// Forward all uses of `insn` to `with` and mark `insn` redundant.
-    pub(super) fn replace(&mut self, ctx: &mut Context, insn: InstructionId, with: ValueId) {
-        ctx.replace_all_uses_with(insn, with);
+    pub(super) fn replace<'str, H: HostMut<'str>>(
+        &mut self,
+        host: &mut H,
+        insn: InstructionId,
+        with: ValueId,
+    ) {
+        host.replace_all_uses_with(ValueId::Instruction(insn), with);
         self.redundant.insert(insn);
     }
 
     /// Materialize `mnemonic` as a new instruction inserted before `at`, then
     /// forward all uses of `at` to it and mark `at` redundant.
-    pub(super) fn replace_with_new_insn(
+    pub(super) fn replace_with_new_insn<'str, H: HostMut<'str>>(
         &mut self,
-        ctx: &mut Context,
+        host: &mut H,
         block_id: BlockId,
         at: InstructionId,
         mnemonic: Mnemonic,
         size: usize,
     ) -> InstructionId {
-        let type_id = ctx.types.get_or_make_int(size);
-        self.replace_with_new_insn_typed(ctx, block_id, at, mnemonic, type_id)
+        let type_id = host.shared().types.get_or_make_int(size);
+        self.replace_with_new_insn_typed(host, block_id, at, mnemonic, type_id)
     }
 
     /// Like [`replace_with_new_insn`](Self::replace_with_new_insn) but with an
     /// explicit result [`TypeId`] — used when the new instruction is a comparison
     /// (which must be `bool`-typed, not a plain `iN`).
-    pub(super) fn replace_with_new_insn_typed(
+    pub(super) fn replace_with_new_insn_typed<'str, H: HostMut<'str>>(
         &mut self,
-        ctx: &mut Context,
+        host: &mut H,
         block_id: BlockId,
         at: InstructionId,
         mnemonic: Mnemonic,
         type_id: qcode::types::TypeId,
     ) -> InstructionId {
-        let new_id =
-            InstructionRef::from_mnemonic_with_type(ctx, block_id.func, mnemonic, type_id).id;
-        BasicBlock::from_id_mut(ctx, block_id).insert_insn_before(at, new_id);
-        ctx.replace_all_uses_with(at, new_id);
+        let new_id = host.push_mnemonic_with_type(block_id.func, mnemonic, type_id);
+        host.insert_insn_before(block_id, at, new_id);
+        host.replace_all_uses_with(ValueId::Instruction(at), ValueId::Instruction(new_id));
         self.redundant.insert(at);
         new_id
     }
 
-    /// Drop the redundant instructions from `block_id`; returns whether
-    /// anything was rewritten.
-    fn finish(self, ctx: &mut Context, block_id: BlockId) -> bool {
+    /// Drop the redundant instructions from their block; returns whether
+    /// anything was rewritten. Every redundant instruction has already had its
+    /// uses forwarded, so removing it prunes only its own operand use-lists.
+    fn finish<'str, H: HostMut<'str>>(self, host: &mut H) -> bool {
         let changed = !self.redundant.is_empty();
-        if changed {
-            BasicBlock::from_id_mut(ctx, block_id)
-                .retain_insns(|insn| !self.redundant.contains(insn));
+        for insn in self.redundant {
+            host.remove_instruction(insn);
         }
         changed
     }
@@ -121,7 +123,15 @@ impl Editor {
 /// [`Claim::Done`]. Per-sub-pass state is type-erased as `Box<dyn Any>`: each
 /// pass mints it in [`SubPass::init_state`], clones it down the dominator tree
 /// in [`SubPass::clone_state`], and downcasts it in the visit hooks.
-pub(super) trait SubPass {
+///
+/// The trait is generic over the mutation host `H`: [`Fold`](super::fold::Fold)
+/// and [`NarrowTrunc`](super::narrow::NarrowTrunc) are fully host-routed and run
+/// over any `H` (module or a checked-out function), while the remaining sub-passes
+/// are dispatched only by the module `gvn` pass and reach the whole [`Context`]
+/// through [`HostMut::as_module_mut`].
+///
+/// [`Context`]: qcode::context::Context
+pub(super) trait SubPass<'str, H: HostMut<'str>> {
     /// Fresh per-walk state, cloned down the dominator tree (a value available
     /// in a dominator is available in every block it dominates). Stateless
     /// sub-passes return `Box::new(())`.
@@ -138,7 +148,7 @@ pub(super) trait SubPass {
     #[allow(clippy::too_many_arguments)]
     fn on_block_entry(
         &self,
-        _ctx: &mut Context,
+        _host: &mut H,
         _state: &mut dyn Any,
         _block_id: BlockId,
         _tree: &DominatorTree<BlockId>,
@@ -149,18 +159,12 @@ pub(super) trait SubPass {
     }
 
     /// Visit one instruction. Rewrites go through `ed`.
-    fn on_insn(
-        &self,
-        ctx: &mut Context,
-        state: &mut dyn Any,
-        ic: &InsnCtx,
-        ed: &mut Editor,
-    ) -> Claim;
+    fn on_insn(&self, host: &mut H, state: &mut dyn Any, ic: &InsnCtx, ed: &mut Editor) -> Claim;
 
     /// Called after the block's instructions, before its dominated children.
     fn after_block(
         &self,
-        _ctx: &Context,
+        _host: &mut H,
         _state: &mut dyn Any,
         _block_id: BlockId,
         _aliases: Option<&AliasResult>,
@@ -170,12 +174,15 @@ pub(super) trait SubPass {
 }
 
 /// One fresh erased state slot per sub-pass, in array order.
-fn init_states(passes: &[Box<dyn SubPass>]) -> Vec<Box<dyn Any>> {
+fn init_states<'str, H: HostMut<'str>>(passes: &[Box<dyn SubPass<'str, H>>]) -> Vec<Box<dyn Any>> {
     passes.iter().map(|p| p.init_state()).collect()
 }
 
 /// Clone a state vector for a dominated child, each pass cloning its own slot.
-fn clone_states(passes: &[Box<dyn SubPass>], states: &[Box<dyn Any>]) -> Vec<Box<dyn Any>> {
+fn clone_states<'str, H: HostMut<'str>>(
+    passes: &[Box<dyn SubPass<'str, H>>],
+    states: &[Box<dyn Any>],
+) -> Vec<Box<dyn Any>> {
     passes
         .iter()
         .zip(states)
@@ -189,24 +196,22 @@ fn clone_states(passes: &[Box<dyn SubPass>], states: &[Box<dyn Any>]) -> Vec<Box
 
 /// Run the sub-pass chain over every instruction of `block_id`, then drop the
 /// instructions it made redundant. Returns whether anything was rewritten.
-fn run_block(
-    ctx: &mut Context,
+fn run_block<'str, H: HostMut<'str>>(
+    host: &mut H,
     block_id: BlockId,
-    passes: &[Box<dyn SubPass>],
+    passes: &[Box<dyn SubPass<'str, H>>],
     states: &mut [Box<dyn Any>],
     aliases: Option<&AliasResult>,
     numbering: &Numbering,
 ) -> bool {
     let mut ed = Editor::new();
-    let insns = BasicBlock::from_id(ctx, block_id)
-        .instruction_ids()
-        .to_vec();
+    let insns: Vec<InstructionId> = host.read_host().block(block_id).instructions.clone();
 
     for insn_id in insns {
-        let insn = ctx.get_insn(insn_id);
-        let id = insn.id();
-        let size = insn.size();
-        let mnemonic = insn.mnemonic().clone();
+        let (id, size, mnemonic) = {
+            let insn = InstructionRef::new(host.read_host(), insn_id);
+            (insn.id(), insn.size(), insn.mnemonic().clone())
+        };
         let ic = InsnCtx {
             block_id,
             insn_id,
@@ -218,39 +223,39 @@ fn run_block(
         };
         // Try each sub-pass in array order; the first `Done` claims the insn.
         for (pass, state) in passes.iter().zip(states.iter_mut()) {
-            if let Claim::Done = pass.on_insn(ctx, state.as_mut(), &ic, &mut ed) {
+            if let Claim::Done = pass.on_insn(host, state.as_mut(), &ic, &mut ed) {
                 break;
             }
         }
     }
 
-    ed.finish(ctx, block_id)
+    ed.finish(host)
 }
 
 /// Run the sub-passes over a single block with fresh state and no block-boundary
 /// hooks (no dominator tree exists for a lone block).
-pub(super) fn run_single_block(
-    ctx: &mut Context,
+pub(super) fn run_single_block<'str, H: HostMut<'str>>(
+    host: &mut H,
     block_id: BlockId,
-    passes: &[Box<dyn SubPass>],
+    passes: &[Box<dyn SubPass<'str, H>>],
     aliases: Option<&AliasResult>,
 ) -> bool {
     // No function context for a lone block: memory forwarding falls back to
     // degenerate per-pointer bases (exact-match only).
     let numbering = Numbering::default();
     let mut states = init_states(passes);
-    run_block(ctx, block_id, passes, &mut states, aliases, &numbering)
+    run_block(host, block_id, passes, &mut states, aliases, &numbering)
 }
 
 /// Iterate the sub-passes over every block of `func_id` in flat order with
 /// fresh per-block state, repeating until a full sweep changes nothing. No
 /// block-boundary hooks run. Returns whether anything changed.
-pub(super) fn run_flat_fixpoint(
-    ctx: &mut Context,
+pub(super) fn run_flat_fixpoint<'str, H: HostMut<'str>>(
+    host: &mut H,
     func_id: FunctionId,
-    passes: &[Box<dyn SubPass>],
+    passes: &[Box<dyn SubPass<'str, H>>],
 ) -> bool {
-    let block_ids: Vec<BlockId> = Function::from_id(ctx, func_id)
+    let block_ids: Vec<BlockId> = FunctionRef::new(host.read_host(), func_id)
         .iter()
         .map(|block| block.id)
         .collect();
@@ -261,7 +266,7 @@ pub(super) fn run_flat_fixpoint(
         let mut changed = false;
         for &block_id in &block_ids {
             let mut states = init_states(passes);
-            changed |= run_block(ctx, block_id, passes, &mut states, None, &numbering);
+            changed |= run_block(host, block_id, passes, &mut states, None, &numbering);
         }
         changed_any |= changed;
         if !changed {
@@ -272,8 +277,8 @@ pub(super) fn run_flat_fixpoint(
 }
 
 /// The per-entry invariants of one dominator-tree walk.
-struct Walk<'a> {
-    passes: &'a [Box<dyn SubPass>],
+struct Walk<'a, 'str, H: HostMut<'str>> {
+    passes: &'a [Box<dyn SubPass<'str, H>>],
     func_id: FunctionId,
     tree: &'a DominatorTree<BlockId>,
     aliases: Option<&'a AliasResult>,
@@ -282,8 +287,8 @@ struct Walk<'a> {
     changed: bool,
 }
 
-impl Walk<'_> {
-    fn rec(&mut self, ctx: &mut Context, block_id: BlockId, inherited: &[Box<dyn Any>]) {
+impl<'str, H: HostMut<'str>> Walk<'_, 'str, H> {
+    fn rec(&mut self, host: &mut H, block_id: BlockId, inherited: &[Box<dyn Any>]) {
         // Stay inside the function being processed. A tail-call edge is a real CFG
         // edge, so the dominator tree can reach blocks owned by the callee — but
         // the per-function alias oracle does not describe them, and following a
@@ -297,9 +302,9 @@ impl Walk<'_> {
         // blocks — so returning outright would leave that owned block with no GVN
         // at all. Skip processing the foreign block, but keep recursing (threading
         // the inherited state through unchanged) so owned descendants still run.
-        if ctx.values.basic_blocks[block_id].parent != Some(self.func_id) {
+        if host.read_host().block(block_id).parent != Some(self.func_id) {
             for &child in self.tree.children_of(block_id) {
-                self.rec(ctx, child, inherited);
+                self.rec(host, child, inherited);
             }
             return;
         }
@@ -307,7 +312,7 @@ impl Walk<'_> {
         let is_shared = self.shared.contains(&block_id);
         for (pass, state) in self.passes.iter().zip(states.iter_mut()) {
             pass.on_block_entry(
-                ctx,
+                host,
                 state.as_mut(),
                 block_id,
                 self.tree,
@@ -317,7 +322,7 @@ impl Walk<'_> {
             );
         }
         self.changed |= run_block(
-            ctx,
+            host,
             block_id,
             self.passes,
             &mut states,
@@ -325,20 +330,20 @@ impl Walk<'_> {
             self.numbering,
         );
         for (pass, state) in self.passes.iter().zip(states.iter_mut()) {
-            pass.after_block(ctx, state.as_mut(), block_id, self.aliases, self.numbering);
+            pass.after_block(host, state.as_mut(), block_id, self.aliases, self.numbering);
         }
         for &child in self.tree.children_of(block_id) {
-            self.rec(ctx, child, &states);
+            self.rec(host, child, &states);
         }
     }
 }
 
 /// All blocks reachable from `entry` via CFG successor edges (including `entry`).
-fn reachable_from(ctx: &Context, entry: BlockId) -> HashSet<BlockId> {
+fn reachable_from<'str>(host: HostRef<'_, 'str>, entry: BlockId) -> HashSet<BlockId> {
     let mut seen = HashSet::from_iter([entry]);
     let mut stack = vec![entry];
     while let Some(block) = stack.pop() {
-        for (_, succ) in BasicBlock::from_id(ctx, block).successors() {
+        for (_, succ) in BlockRef::new(host, block).successors() {
             if seen.insert(succ) {
                 stack.push(succ);
             }
@@ -363,19 +368,19 @@ fn reachable_from(ctx: &Context, entry: BlockId) -> HashSet<BlockId> {
 /// [`SubPass::on_block_entry`]: each walk's dominator tree only sees its own
 /// entry's edges, so its dominance claims are invalid for blocks the other
 /// entries can also reach.
-pub(super) fn run_dominator_walk(
-    ctx: &mut Context,
+pub(super) fn run_dominator_walk<'str, H: HostMut<'str>>(
+    host: &mut H,
     func_id: FunctionId,
-    passes: &[Box<dyn SubPass>],
+    passes: &[Box<dyn SubPass<'str, H>>],
     aliases: Option<&AliasResult>,
 ) -> bool {
-    let root = match ctx.values.functions[func_id].root {
-        Some(r) => r,
+    let root = match FunctionRef::new(host.read_host(), func_id).root() {
+        Some(r) => r.id,
         None => return false,
     };
 
-    let root_reachable = reachable_from(ctx, root);
-    let entries: Vec<BlockId> = Function::from_id(ctx, func_id)
+    let root_reachable = reachable_from(host.read_host(), root);
+    let entries: Vec<BlockId> = FunctionRef::new(host.read_host(), func_id)
         .iter()
         .filter(|block| !root_reachable.contains(&block.id))
         .filter(|block| block.predecessors().next().is_none())
@@ -384,7 +389,7 @@ pub(super) fn run_dominator_walk(
 
     let mut seen_count: HashMap<BlockId, u32> = HashMap::default();
     for &entry in std::iter::once(&root).chain(&entries) {
-        for block in reachable_from(ctx, entry) {
+        for block in reachable_from(host.read_host(), entry) {
             *seen_count.entry(block).or_default() += 1;
         }
     }
@@ -395,11 +400,11 @@ pub(super) fn run_dominator_walk(
 
     // Function-wide affine views, computed once and shared read-only with every
     // entry's walk (a value's arithmetic view is dominance-independent).
-    let numbering = super::affine::precompute_forms(&*ctx, func_id);
+    let numbering = super::affine::precompute_forms(host.read_host(), func_id);
 
     let mut changed = false;
     for entry in std::iter::once(root).chain(entries) {
-        let tree = compute_dominators(&qcode::value::Function::from_id(ctx, entry.func), entry);
+        let tree = compute_dominators(&FunctionRef::new(host.read_host(), entry.func), entry);
         let mut walk = Walk {
             passes,
             func_id,
@@ -409,7 +414,7 @@ pub(super) fn run_dominator_walk(
             shared: &shared,
             changed: false,
         };
-        walk.rec(ctx, entry, &init_states(passes));
+        walk.rec(host, entry, &init_states(passes));
         changed |= walk.changed;
     }
     changed

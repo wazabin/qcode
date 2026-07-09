@@ -5,6 +5,7 @@ use qcode::{
     value::{
         ValueId,
         insn::{Binary, Binop, IntBinop, Mnemonic},
+        util::host_mut::HostMut,
     },
 };
 
@@ -13,12 +14,16 @@ use std::any::Any;
 
 use super::walk::{Claim, Editor, InsnCtx, SubPass};
 
+/// Flag-idiom collapse reads through the module only; it is dispatched only by
+/// the module `gvn` pass and runs on the module host.
+const MODULE_ONLY: &str = "FlagIdiom is dispatched only by the module gvn pass";
+
 /// Collapse the signed-compare flag idiom into a single `s<`, materializing the
 /// replacement before the matched instruction and forwarding its uses; the
 /// dead flag math falls to DCE.
 pub(super) struct FlagIdiom;
 
-impl SubPass for FlagIdiom {
+impl<'str, H: HostMut<'str>> SubPass<'str, H> for FlagIdiom {
     fn init_state(&self) -> Box<dyn Any> {
         Box::new(())
     }
@@ -27,19 +32,14 @@ impl SubPass for FlagIdiom {
         Box::new(())
     }
 
-    fn on_insn(
-        &self,
-        ctx: &mut Context,
-        _state: &mut dyn Any,
-        ic: &InsnCtx,
-        ed: &mut Editor,
-    ) -> Claim {
+    fn on_insn(&self, host: &mut H, _state: &mut dyn Any, ic: &InsnCtx, ed: &mut Editor) -> Claim {
         if ic.mnemonic.is_terminator() || ic.size == 0 {
             return Claim::Pass;
         }
+        let mut ctx = host.as_module_mut().expect(MODULE_ONLY);
         match simplify_flag_idiom(ctx, ic.mnemonic) {
             Some(new_mnemonic) => {
-                ed.replace_with_new_insn(ctx, ic.block_id, ic.insn_id, new_mnemonic, ic.size);
+                ed.replace_with_new_insn(&mut ctx, ic.block_id, ic.insn_id, new_mnemonic, ic.size);
                 Claim::Done
             }
             None => Claim::Pass,

@@ -21,6 +21,7 @@ use qcode::{
     value::{
         Function, ValueId,
         insn::{Call, Extract, Mnemonic, Tuple},
+        util::host_mut::HostMut,
     },
 };
 
@@ -38,10 +39,14 @@ use super::walk::{Claim, Editor, InsnCtx, SubPass};
 /// slipping that invariant past the verifier.
 const STEP_BUDGET: usize = 100_000;
 
+/// Folding a pure call emulates the *callee*'s IR (read through the module), so
+/// this is dispatched only by the module `gvn` pass and runs on the module host.
+const MODULE_ONLY: &str = "PureCall is dispatched only by the module gvn pass";
+
 /// Replace `extract` of a constant pure-call field with the emulated literal.
 pub(super) struct PureCall;
 
-impl SubPass for PureCall {
+impl<'str, H: HostMut<'str>> SubPass<'str, H> for PureCall {
     fn init_state(&self) -> Box<dyn Any> {
         Box::new(())
     }
@@ -50,13 +55,8 @@ impl SubPass for PureCall {
         Box::new(())
     }
 
-    fn on_insn(
-        &self,
-        ctx: &mut Context,
-        _state: &mut dyn Any,
-        ic: &InsnCtx,
-        ed: &mut Editor,
-    ) -> Claim {
+    fn on_insn(&self, host: &mut H, _state: &mut dyn Any, ic: &InsnCtx, ed: &mut Editor) -> Claim {
+        let mut ctx = host.as_module_mut().expect(MODULE_ONLY);
         let Mnemonic::Extract(Extract { agg, index }) = *ic.mnemonic else {
             return Claim::Pass;
         };
@@ -123,7 +123,7 @@ impl SubPass for PureCall {
         };
 
         let lit = ctx.get_const(value, ic.size).id();
-        ed.replace(ctx, ic.insn_id, lit);
+        ed.replace(&mut ctx, ic.insn_id, lit);
         Claim::Done
     }
 }

@@ -744,7 +744,7 @@ impl<'str> Context<'str> {
     /// allowing StackAddress constants (e.g. the stack base) to preserve their
     /// type through constant folding.
     pub fn get_typed_const(
-        &mut self,
+        &self,
         value: u64,
         type_id: crate::types::TypeId,
     ) -> LiteralRef<'str, '_> {
@@ -760,7 +760,7 @@ impl<'str> Context<'str> {
     /// byte blobs are **not interned**: every call produces a fresh
     /// [`BytesId`](crate::value::BytesId). Use this for constants wider than a
     /// `u64` (SSE/AVX pools, wide stack/memory reads, coalesced constant stores).
-    pub fn get_bytes(&mut self, data: Vec<u8>) -> crate::value::BytesRef<'str, '_> {
+    pub fn get_bytes(&self, data: Vec<u8>) -> crate::value::BytesRef<'str, '_> {
         let i8_ty = self.types.get_or_make_int(1);
         let type_id = self.types.get_or_make_array(i8_ty, data.len());
         let id = self
