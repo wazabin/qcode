@@ -197,9 +197,15 @@ fn try_merge_block<'str, H: HostMut<'str>>(
     let Some((edge_ab, b_id)) = merge_candidate(host, a_id) else {
         return false;
     };
-    // Intra-function only (see the note above): a cross-function successor is a
-    // thunk/tail-call and is left as-is.
-    if b_id.func != function_id {
+    // Intra-function only (see the note above): B must be both *stored in* and
+    // *owned by* this function. A block stored in this function's arena but
+    // reattributed — owned/rostered by another function (common in real binaries:
+    // shared CRT stubs, thunks) — must not be absorbed: `absorb_block` →
+    // `unroster_block` mutates the *owner*'s roster, which a checked-out pass may
+    // not do. A cross-function successor (thunk/tail-call) is likewise left as-is.
+    if b_id.func != function_id
+        || host.read_host().block(b_id).parent != Some(function_id)
+    {
         return false;
     }
     host.absorb_block(a_id, b_id, edge_ab, function_id);
