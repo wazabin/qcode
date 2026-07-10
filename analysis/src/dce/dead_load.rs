@@ -1,6 +1,6 @@
 use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
 
-use crate::AliasResult;
+use crate::{AliasResult, ContextView, FunctionBody};
 use jstd::graph::analysis::{compute_dominators, compute_postdominators};
 use qcode::{
     context::Context,
@@ -997,20 +997,19 @@ fn postdominated_dead_ram_stores(
 /// stores that are dead *across* basic-block boundaries — overwritten before
 /// being read on every path, or written to a `dead_reg` and never read — are
 /// removed. Without `aliases` each block is treated independently.
+/// TODO(5b-ii): Takes Context; migrate to FunctionBody/ContextView when public API stabilizes.
 pub fn remove_dead_load_insns(
     mut ctx: &mut Context,
     function_id: FunctionId,
     aliases: Option<&AliasResult>,
     dead_regs: &[ValueId],
 ) -> bool {
-    remove_dead_load_insns_host(&mut ctx, function_id, aliases, dead_regs)
+    remove_dead_load_insns_generic(&mut ctx, function_id, aliases, dead_regs)
 }
 
-/// Host-generic core of [`remove_dead_load_insns`], routing every read through
-/// `host.read_host()` and every removal through [`HostMut::remove_instruction`],
-/// so it operates identically on the whole module (`&mut Context`) or a single
-/// checked-out function ([`crate::pipeline`]'s `FunctionBody` host).
-pub fn remove_dead_load_insns_host<'str, H: HostMut<'str>>(
+/// Generic host-based core of [`remove_dead_load_insns`].
+/// TODO(5b-ii): For backwards compatibility; prefer concrete version for new code.
+pub fn remove_dead_load_insns_generic<'str, H: HostMut<'str>>(
     host: &mut H,
     function_id: FunctionId,
     aliases: Option<&AliasResult>,
@@ -1069,6 +1068,80 @@ pub fn remove_dead_load_insns_host<'str, H: HostMut<'str>>(
     let changed = !dead.is_empty();
     for id in &dead {
         host.remove_instruction(*id);
+    }
+    changed
+}
+
+/// Host-generic core of [`remove_dead_load_insns`], routing every read through
+/// `body.read_host(cx)` and every removal through [`body.remove_instruction`],
+/// so it operates identically on the whole module (`&mut Context`) or a single
+/// checked-out function ([`crate::pipeline`]'s `FunctionBody`).
+/// This is the concrete version for FunctionBody/ContextView (stage 5b).
+pub fn remove_dead_load_insns_host<'a, 'str>(
+    body: &'a mut FunctionBody<'str>,
+    cx: ContextView<'a, 'str>,
+    function_id: FunctionId,
+    aliases: Option<&AliasResult>,
+    dead_regs: &[ValueId],
+) -> bool {
+    let block_ids: Vec<BlockId> = body
+        .function_ref(cx, function_id)
+        .iter()
+        .map(|block| block.id)
+        .collect();
+
+    let mut dead = HashSet::default();
+    dead.extend(unread_temp_space_stores(body.read_host(cx), function_id));
+
+    match aliases {
+        Some(aliases) => {
+            dead.extend(postdominated_dead_register_stores(
+                body.read_host(cx),
+                function_id,
+                aliases,
+            ));
+            dead.extend(unread_frame_local_stores(
+                body.read_host(cx),
+                function_id,
+                aliases,
+            ));
+            dead.extend(postdominated_dead_ram_stores(
+                body.read_host(cx),
+                function_id,
+                aliases,
+            ));
+            let liveness = crate::mem::compute_memory_liveness(
+                body.read_host(cx),
+                function_id,
+                aliases,
+                dead_regs,
+            );
+            for &block_id in &block_ids {
+                dead.extend(dead_load_insns_seeded(
+                    body.read_host(cx),
+                    block_id,
+                    aliases,
+                    dead_regs,
+                    liveness.live_out(block_id),
+                    liveness.killed_out(block_id),
+                ));
+            }
+        }
+        None => {
+            for &block_id in &block_ids {
+                dead.extend(dead_load_insns(
+                    body.read_host(cx),
+                    block_id,
+                    None,
+                    dead_regs,
+                ));
+            }
+        }
+    }
+
+    let changed = !dead.is_empty();
+    for id in &dead {
+        body.remove_instruction(cx, *id);
     }
     changed
 }
@@ -2120,7 +2193,7 @@ mod tests {
 
 // ----- pass ------------------------------------------------------------------
 
-use crate::{ContextView, FunctionBody, FunctionPass};
+use crate::FunctionPass;
 
 #[derive(Default)]
 pub struct DeadLoad;
@@ -2136,14 +2209,8 @@ impl FunctionPass for DeadLoad {
         m: ContextView<'_, 'str>,
     ) -> Result<bool, String> {
         let fid = f.id();
-        let mut host = f.host(m);
-        let aliases = frame_aware_aliases(m, host.read_host(), fid);
-        Ok(remove_dead_load_insns_host(
-            &mut host,
-            fid,
-            Some(&aliases),
-            &[],
-        ))
+        let aliases = frame_aware_aliases(m, f.read_host(m), fid);
+        Ok(remove_dead_load_insns_host(f, m, fid, Some(&aliases), &[]))
     }
 }
 
@@ -2167,10 +2234,10 @@ impl FunctionPass for DeadStore {
     ) -> Result<bool, String> {
         let fid = f.id();
         let dead_regs = m.env().cfg.dead_flag_regs.clone();
-        let mut host = f.host(m);
-        let aliases = frame_aware_aliases(m, host.read_host(), fid);
+        let aliases = frame_aware_aliases(m, f.read_host(m), fid);
         Ok(remove_dead_load_insns_host(
-            &mut host,
+            f,
+            m,
             fid,
             Some(&aliases),
             &dead_regs,

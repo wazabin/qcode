@@ -336,7 +336,7 @@ fn apply_strlen<'str, H: HostMut<'str>>(host: &mut H, fid: FunctionId, m: &Strle
             .params()
             .position(|p| p.id() == m.count_param);
         if let Some(kx) = kx {
-            crate::dce::remove_params_from_block_host(
+            crate::dce::remove_params_from_block_host_generic(
                 host,
                 m.exit_block,
                 &HashSet::from_iter([kx]),

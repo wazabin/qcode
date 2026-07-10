@@ -36,6 +36,10 @@ use qcode::{
     },
 };
 
+use crate::{ContextView, FunctionBody};
+
+// TODO(5b-ii): Public functions below are thin wrappers marked for future migration
+
 use crate::gvn::affine::precompute_forms_for_blocks;
 use crate::gvn::congruence::{Congruence, SymId};
 
@@ -119,16 +123,18 @@ fn unique_incoming(
 /// chains and cycles collapse. Leaves `root`'s params untouched.
 ///
 /// Returns whether anything was removed.
+/// TODO(5b-ii): Takes Context; migrate to FunctionBody/ContextView when public API stabilizes.
 pub fn remove_dead_block_args(
     mut ctx: &mut Context,
     block_ids: &[BlockId],
     root: Option<BlockId>,
 ) -> bool {
-    remove_dead_block_args_host(&mut ctx, block_ids, root)
+    remove_dead_block_args_generic(&mut ctx, block_ids, root)
 }
 
-/// Host-generic core of [`remove_dead_block_args`]; see that function.
-pub fn remove_dead_block_args_host<'str, H: HostMut<'str>>(
+/// Generic version of [`remove_dead_block_args`] core accepting any HostMut.
+/// TODO(5b-ii): For backwards compatibility; prefer concrete version for new code.
+pub fn remove_dead_block_args_generic<'str, H: HostMut<'str>>(
     host: &mut H,
     block_ids: &[BlockId],
     root: Option<BlockId>,
@@ -147,7 +153,35 @@ pub fn remove_dead_block_args_host<'str, H: HostMut<'str>>(
         // `p ≡ repl`: rewrite every use, then strip the param and the now-removed
         // column of arguments from each predecessor.
         host.replace_all_uses_with(ValueId::BlockParam(param), repl);
-        remove_params_from_block_host(host, block, &HashSet::from_iter([index]));
+        remove_params_from_block_generic(host, block, &HashSet::from_iter([index]));
+        changed = true;
+    }
+    changed
+}
+
+/// Host-generic core of [`remove_dead_block_args`]; see that function.
+/// This is the concrete version for FunctionBody/ContextView (stage 5b).
+pub fn remove_dead_block_args_host<'a, 'str>(
+    body: &'a mut FunctionBody<'str>,
+    cx: ContextView<'a, 'str>,
+    block_ids: &[BlockId],
+    root: Option<BlockId>,
+) -> bool {
+    let mut changed = false;
+    loop {
+        // Cheap syntactic pass first (no value numbering); only when it is
+        // exhausted do we build the dominator tree + congruence engine to catch
+        // params whose incoming arguments are *congruent* but not identical.
+        let found = find_redundant_param(body.read_host(cx), block_ids, root)
+            .or_else(|| find_congruent_param(body.read_host(cx), block_ids, root));
+        let Some((block, index, param, repl)) = found else {
+            break;
+        };
+
+        // `p ≡ repl`: rewrite every use, then strip the param and the now-removed
+        // column of arguments from each predecessor.
+        body.replace_all_uses_with(cx, ValueId::BlockParam(param), repl);
+        remove_params_from_block_host(body, cx, block, &HashSet::from_iter([index]));
         changed = true;
     }
     changed
@@ -179,16 +213,18 @@ pub fn remove_dead_block_args_host<'str, H: HostMut<'str>>(
 /// stays dead, stripping the matching predecessor argument columns.
 ///
 /// Returns whether anything was removed.
+/// TODO(5b-ii): Takes Context; migrate to FunctionBody/ContextView when public API stabilizes.
 pub fn remove_dead_block_params(
     mut ctx: &mut Context,
     block_ids: &[BlockId],
     root: Option<BlockId>,
 ) -> bool {
-    remove_dead_block_params_host(&mut ctx, block_ids, root)
+    remove_dead_block_params_generic(&mut ctx, block_ids, root)
 }
 
-/// Host-generic core of [`remove_dead_block_params`]; see that function.
-pub fn remove_dead_block_params_host<'str, H: HostMut<'str>>(
+/// Generic version of [`remove_dead_block_params`] core accepting any HostMut.
+/// TODO(5b-ii): For backwards compatibility; prefer concrete version for new code.
+pub fn remove_dead_block_params_generic<'str, H: HostMut<'str>>(
     host: &mut H,
     block_ids: &[BlockId],
     root: Option<BlockId>,
@@ -281,7 +317,108 @@ pub fn remove_dead_block_params_host<'str, H: HostMut<'str>>(
         return false;
     }
     for (block, indices) in dead_by_block {
-        remove_params_from_block_host(host, block, &indices);
+        remove_params_from_block_generic(host, block, &indices);
+    }
+    true
+}
+
+/// Host-generic core of [`remove_dead_block_params`]; see that function.
+/// This is the concrete version for FunctionBody/ContextView (stage 5b).
+pub fn remove_dead_block_params_host<'a, 'str>(
+    body: &'a mut FunctionBody<'str>,
+    cx: ContextView<'a, 'str>,
+    block_ids: &[BlockId],
+    root: Option<BlockId>,
+) -> bool {
+    // Seed: directly-used params. Edges: forwarding (src param -> target param) on
+    // every branch-argument slot.
+    let mut live: HashSet<BlockParamId> = HashSet::default();
+    let mut edges: Vec<(BlockParamId, BlockParamId)> = Vec::new();
+
+    let mark = |v: ValueId, live: &mut HashSet<BlockParamId>| {
+        if let ValueId::BlockParam(p) = v {
+            live.insert(p);
+        }
+    };
+
+    for &block in block_ids {
+        let insns: Vec<_> = body.block_ref(cx, block).iter().map(|i| i.id).collect();
+        for id in insns {
+            match body.insn_ref(cx, id).mnemonic() {
+                Mnemonic::Branch(b) => {
+                    forward_edges(body.read_host(cx), &b.args, b.target, &mut edges)
+                }
+                Mnemonic::CBranch(c) => {
+                    // The condition is a real read; only the per-target argument
+                    // lists are forwarding edges.
+                    if let ValueId::BlockParam(p) = c.condition {
+                        live.insert(p);
+                    }
+                    forward_edges(
+                        body.read_host(cx),
+                        &c.success_args,
+                        c.success_block,
+                        &mut edges,
+                    );
+                    forward_edges(
+                        body.read_host(cx),
+                        &c.failure_args,
+                        c.failure_block,
+                        &mut edges,
+                    );
+                }
+                // Every other instruction (incl. indirect branch/call pointers,
+                // call args, the return slot) observes all of its operands.
+                other => {
+                    for v in other.args() {
+                        mark(v, &mut live);
+                    }
+                }
+            }
+        }
+    }
+
+    // Seed root + protected params live, then propagate liveness backwards along
+    // the forwarding edges to a fixpoint: a param feeding a live param is live.
+    if let Some(root) = root {
+        for &p in &body.read_host(cx).block(root).params {
+            live.insert(p);
+        }
+    }
+    for &(src, _) in &edges {
+        if body.read_host(cx).block_param(src).protected {
+            live.insert(src);
+        }
+    }
+    loop {
+        let mut grew = false;
+        for &(src, tgt) in &edges {
+            if live.contains(&tgt) && live.insert(src) {
+                grew = true;
+            }
+        }
+        if !grew {
+            break;
+        }
+    }
+
+    // Collect dead params per block (protected params are always seeded live, so
+    // they never appear here; root params likewise).
+    let mut dead_by_block: rustc_hash::FxHashMap<BlockId, HashSet<usize>> = Default::default();
+    for &block in block_ids {
+        let params = body.read_host(cx).block(block).params.clone();
+        for (index, &p) in params.iter().enumerate() {
+            if !live.contains(&p) {
+                dead_by_block.entry(block).or_default().insert(index);
+            }
+        }
+    }
+
+    if dead_by_block.is_empty() {
+        return false;
+    }
+    for (block, indices) in dead_by_block {
+        remove_params_from_block_host(body, cx, block, &indices);
     }
     true
 }
@@ -461,11 +598,12 @@ pub(crate) fn remove_params_from_block(
     block: BlockId,
     dead_indices: &HashSet<usize>,
 ) {
-    remove_params_from_block_host(&mut ctx, block, dead_indices);
+    remove_params_from_block_generic(&mut ctx, block, dead_indices);
 }
 
-/// Host-generic core of [`remove_params_from_block`]; see that function.
-pub(crate) fn remove_params_from_block_host<'str, H: HostMut<'str>>(
+/// Generic version of [`remove_params_from_block`] accepting any HostMut.
+/// TODO(5b-ii): For backwards compatibility; prefer concrete version for new code.
+pub(crate) fn remove_params_from_block_generic<'str, H: HostMut<'str>>(
     host: &mut H,
     block: BlockId,
     dead_indices: &HashSet<usize>,
@@ -522,6 +660,66 @@ pub(crate) fn remove_params_from_block_host<'str, H: HostMut<'str>>(
     }
 }
 
+/// Host-generic core of [`remove_params_from_block`]; see that function.
+/// This is the concrete version for FunctionBody/ContextView (stage 5b).
+pub(crate) fn remove_params_from_block_host<'a, 'str>(
+    body: &'a mut FunctionBody<'str>,
+    cx: ContextView<'a, 'str>,
+    block: BlockId,
+    dead_indices: &HashSet<usize>,
+) {
+    let params = body.read_host(cx).block(block).params.clone();
+    let mut kept = Vec::with_capacity(params.len());
+    for (i, &p) in params.iter().enumerate() {
+        if dead_indices.contains(&i) {
+            body.block_param_mut(p).parent = None;
+        } else {
+            body.block_param_mut(p).index = kept.len();
+            kept.push(p);
+        }
+    }
+    body.block_mut(block).params = kept;
+
+    // A predecessor reaching `block` through both edges of a `CBranch` appears
+    // twice; dedup so we rewrite its terminator exactly once.
+    let preds: HashSet<BlockId> = body
+        .block_ref(cx, block)
+        .predecessors()
+        .map(|(_, b)| b)
+        .collect();
+
+    for pred in preds {
+        let Some(term_id) = body.read_host(cx).block(pred).instructions.last().copied() else {
+            continue;
+        };
+        let new = match body.read_host(cx).instruction(term_id).mnemonic().clone() {
+            Mnemonic::Branch(b) if b.target == block => Mnemonic::Branch(Branch {
+                target: b.target,
+                args: filter_kept(&b.args, dead_indices),
+            }),
+            Mnemonic::CBranch(c) => Mnemonic::CBranch(CBranch {
+                condition: c.condition,
+                success_block: c.success_block,
+                success_args: if c.success_block == block {
+                    filter_kept(&c.success_args, dead_indices)
+                } else {
+                    c.success_args
+                },
+                failure_block: c.failure_block,
+                failure_args: if c.failure_block == block {
+                    filter_kept(&c.failure_args, dead_indices)
+                } else {
+                    c.failure_args
+                },
+            }),
+            // Indirect terminators carry no per-target argument list, so a block
+            // reached that way has no params to feed and never reaches here.
+            _ => continue,
+        };
+        body.replace_instruction_mnemonic(cx, term_id, new);
+    }
+}
+
 /// Return `args` with the entries at `drop` positions removed.
 fn filter_kept(args: &[ValueId], drop: &HashSet<usize>) -> Vec<ValueId> {
     args.iter()
@@ -529,6 +727,17 @@ fn filter_kept(args: &[ValueId], drop: &HashSet<usize>) -> Vec<ValueId> {
         .filter(|(i, _)| !drop.contains(i))
         .map(|(_, &a)| a)
         .collect()
+}
+
+// TODO(5b-ii): Adapter for cross-module callers (strlen.rs) still using HostMut.
+// This will be removed when strlen.rs is migrated to FunctionBody/ContextView.
+/// Generic wrapper for [`remove_params_from_block_host_generic`].
+pub(crate) fn remove_params_from_block_host_generic<'str, H: HostMut<'str>>(
+    host: &mut H,
+    block: BlockId,
+    dead_indices: &HashSet<usize>,
+) {
+    remove_params_from_block_generic(host, block, dead_indices);
 }
 
 #[cfg(test)]
