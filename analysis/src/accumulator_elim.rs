@@ -49,7 +49,7 @@ use qcode::{
     context::Context,
     types::TypeId,
     value::{
-        BlockRef, FunctionId, FunctionKind, FunctionRef, InstructionRef, ValueId,
+        FunctionId, FunctionKind, ValueId,
         block::BlockId,
         block_param::{BlockParam, BlockParamId},
         insn::{Apply, CBranch, Extract, Mnemonic},
@@ -133,7 +133,7 @@ fn classify(
     };
 
     // State slots = header parameters.
-    let head_info: Vec<(BlockParamId, usize)> = BlockRef::new(ctx, head)
+    let head_info: Vec<(BlockParamId, usize)> = ctx.block_ref(head)
         .params()
         .map(|p| (p.id, p.size()))
         .collect();
@@ -152,7 +152,7 @@ fn classify(
     // Resolve the body's next-state expressions (latch scope) back to header
     // params by binding each latch param to the value the header passed for it.
     let latch_params: Vec<BlockParamId> =
-        BlockRef::new(ctx, latch).params().map(|p| p.id).collect();
+        ctx.block_ref(latch).params().map(|p| p.id).collect();
     if latch_params.len() != cont_args.len() {
         return None;
     }
@@ -164,7 +164,7 @@ fn classify(
 
     // The exit returns a single value; we project it from the result tuple.
     let ret_val = block_return_value(ctx, exit_block)?;
-    let exit_params: Vec<BlockParamId> = BlockRef::new(ctx, exit_block)
+    let exit_params: Vec<BlockParamId> = ctx.block_ref(exit_block)
         .params()
         .map(|p| p.id)
         .collect();
@@ -270,7 +270,7 @@ fn transform<'str>(
     let host_fid = body.id();
     let base_name = format!(
         "{}_acc",
-        FunctionRef::new(body.read_host(m), host_fid).name()
+        body.read_host(m).function_ref(host_fid).name()
     );
     // Mint the driver-only recursive lambda (name buffered raw; the driver
     // uniquifies it at check-in). `None` (pool exhausted) leaves the loop alone.
@@ -457,7 +457,7 @@ fn transform<'str>(
 /// Push a driver param typed `ty` onto `block` in the minted host, returning its
 /// value (host-routed `BasicBlock::push_param` + the `type_id` write).
 fn push_param<'str, H: HostMut<'str>>(host: &mut H, block: BlockId, ty: TypeId) -> ValueId {
-    let index = host.read_host().block(block).params.len();
+    let index = host.block_ref(block).num_params();
     let pid = host.push_block_param(
         block.func,
         BlockParam {
@@ -519,7 +519,7 @@ fn collect_deps(
             }
         }
         ValueId::Instruction(id) => {
-            for op in host.instruction(id).mnemonic().args() {
+            for op in host.insn_ref(id).mnemonic().args() {
                 collect_deps(host, op, bindings, head_index, out, seen);
             }
         }
@@ -549,7 +549,7 @@ fn clone_cross<'str>(
         },
         ValueId::Instruction(id) => {
             let (mnemonic, type_id) = {
-                let r = InstructionRef::new(read, id);
+                let r = read.insn_ref(id);
                 (r.mnemonic().clone(), r.type_id())
             };
             let mut remapped = mnemonic.clone();
@@ -586,7 +586,7 @@ fn clone_self<'str, H: HostMut<'str>>(
         },
         ValueId::Instruction(id) => {
             let (mnemonic, type_id) = {
-                let r = InstructionRef::new(host.read_host(), id);
+                let r = host.insn_ref(id);
                 (r.mnemonic().clone(), r.type_id())
             };
             let mut remapped = mnemonic.clone();
@@ -606,7 +606,7 @@ fn clone_self<'str, H: HostMut<'str>>(
 
 fn header_cbranch(host: HostRef, header: BlockId) -> Option<CBranch> {
     let term = block_terminator(host, header)?;
-    match host.instruction(term).mnemonic() {
+    match host.insn_ref(term).mnemonic() {
         Mnemonic::CBranch(cbranch) => Some(cbranch.clone()),
         _ => None,
     }
@@ -614,15 +614,15 @@ fn header_cbranch(host: HostRef, header: BlockId) -> Option<CBranch> {
 
 fn block_return_value(host: HostRef, block: BlockId) -> Option<ValueId> {
     let term = block_terminator(host, block)?;
-    match host.instruction(term).mnemonic() {
+    match host.insn_ref(term).mnemonic() {
         Mnemonic::ReturnValue(rv) => Some(rv.value),
         _ => None,
     }
 }
 
 fn block_terminator(host: HostRef, block: BlockId) -> Option<qcode::value::insn::InstructionId> {
-    let &id = BlockRef::new(host, block).instruction_ids().last()?;
-    InstructionRef::new(host, id).is_terminator().then_some(id)
+    let &id = host.block_ref(block).instruction_ids().last()?;
+    host.insn_ref(id).is_terminator().then_some(id)
 }
 
 fn is_const_literal(host: HostRef, val: ValueId) -> bool {

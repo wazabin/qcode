@@ -40,8 +40,8 @@ use std::collections::VecDeque;
 
 use jstd::graph::analysis::compute_dominators;
 use qcode::value::{
-    FunctionId, FunctionRef, InstructionRef, ValueId,
-    block::{BlockId, BlockRef},
+    FunctionId, ValueId,
+    block::BlockId,
     insn::{InstructionId, Mnemonic},
     util::{base_ref::HostRef, host_mut::HostMut},
 };
@@ -96,7 +96,7 @@ fn is_pure_expr_op(m: &Mnemonic) -> bool {
 /// The back-edges of `fun_id` as `(latch, header)` pairs, where `header`
 /// dominates `latch`.
 fn back_edges(host: HostRef, fun_id: FunctionId) -> Vec<(BlockId, BlockId)> {
-    let function = FunctionRef::new(host, fun_id);
+    let function = host.function_ref(fun_id);
     let Some(root) = function.root().map(|b| b.id) else {
         return Vec::new();
     };
@@ -105,7 +105,7 @@ fn back_edges(host: HostRef, fun_id: FunctionId) -> Vec<(BlockId, BlockId)> {
 
     let mut edges = Vec::new();
     for &latch in &block_ids {
-        let successors = BlockRef::new(host, latch)
+        let successors = host.block_ref(latch)
             .successors()
             .map(|(_, header)| header)
             .collect::<Vec<_>>();
@@ -125,7 +125,7 @@ fn natural_loop(host: HostRef, latch: BlockId, header: BlockId) -> HashSet<Block
     let mut nodes = HashSet::from_iter([header, latch]);
     let mut worklist = VecDeque::from([latch]);
     while let Some(block) = worklist.pop_front() {
-        for (_, pred) in BlockRef::new(host, block).predecessors() {
+        for (_, pred) in host.block_ref(block).predecessors() {
             if nodes.insert(pred) && pred != header {
                 worklist.push_back(pred);
             }
@@ -141,7 +141,7 @@ fn loop_preheader(
     header: BlockId,
     loop_nodes: &HashSet<BlockId>,
 ) -> Option<BlockId> {
-    let header_ref = BlockRef::new(host, header);
+    let header_ref = host.block_ref(header);
     let mut preheaders = header_ref
         .predecessors()
         .filter_map(|(_, pred)| (!loop_nodes.contains(&pred)).then_some(pred));
@@ -172,7 +172,7 @@ fn value_is_invariant(
                 None => true,
             }
         }
-        ValueId::Instruction(i) => match InstructionRef::new(host, i).parent().map(|b| b.id) {
+        ValueId::Instruction(i) => match host.insn_ref(i).parent().map(|b| b.id) {
             Some(block) if loop_nodes.contains(&block) => invariant.contains(&i),
             _ => true,
         },
@@ -191,9 +191,9 @@ fn loop_memory(host: HostRef, loop_nodes: &HashSet<BlockId>) -> LoopMemory {
     let mut store_ptrs = Vec::new();
     let mut has_clobber = false;
     for &block in loop_nodes {
-        let insns = BlockRef::new(host, block).instruction_ids().to_vec();
+        let insns = host.block_ref(block).instruction_ids().to_vec();
         for id in insns {
-            match host.instruction(id).mnemonic() {
+            match host.insn_ref(id).mnemonic() {
                 Mnemonic::Store(s) => store_ptrs.push(s.ptr),
                 Mnemonic::Call(_) | Mnemonic::CallInd(_) | Mnemonic::PCodeOp(_) => {
                     has_clobber = true;
@@ -239,12 +239,12 @@ fn invariant_instructions(
     loop {
         let mut changed = false;
         for &block in loop_nodes {
-            let insns = BlockRef::new(host, block).instruction_ids().to_vec();
+            let insns = host.block_ref(block).instruction_ids().to_vec();
             for id in insns {
                 if invariant.contains(&id) {
                     continue;
                 }
-                let m = host.instruction(id).mnemonic();
+                let m = host.insn_ref(id).mnemonic();
                 let is_load = matches!(m, Mnemonic::Load(_));
                 if !is_load && !is_pure_expr_op(m) {
                     continue;
@@ -285,7 +285,7 @@ fn emission_order(
     // Iterate blocks/instructions for a deterministic starting order.
     let mut roots: Vec<InstructionId> = Vec::new();
     for &block in loop_nodes {
-        for &id in BlockRef::new(host, block).instruction_ids() {
+        for &id in host.block_ref(block).instruction_ids() {
             if invariant.contains(&id) {
                 roots.push(id);
             }
@@ -308,7 +308,7 @@ fn emission_order(
                 continue;
             }
             stack.push((id, true));
-            for op in host.instruction(id).mnemonic().args() {
+            for op in host.insn_ref(id).mnemonic().args() {
                 if let ValueId::Instruction(o) = op
                     && invariant.contains(&o)
                     && !done.contains(&o)
@@ -331,15 +331,14 @@ fn hoist_into_preheader<'str, H: HostMut<'str>>(
 ) -> bool {
     let mut hoisted = false;
     for &old in order {
-        let old_ref = InstructionRef::new(host.read_host(), old);
+        let old_ref = host.insn_ref(old);
         let mnemonic = old_ref.mnemonic().clone();
         let type_id = old_ref.type_id();
         let new = host.push_mnemonic_with_type(preheader.func, mnemonic, type_id);
 
         let term = *host
-            .read_host()
-            .block(preheader)
-            .instructions
+            .block_ref(preheader)
+            .instruction_ids()
             .last()
             .expect("preheader must have a terminator");
         host.insert_insn_before(preheader, term, new);
