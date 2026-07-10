@@ -26,10 +26,7 @@ use qcode::{
         block_param::{BlockParam, BlockParamId},
         function::FunctionInterface,
         insn::{Instruction, InstructionId, Mnemonic},
-        util::{
-            base_ref::HostRef,
-            host_mut::{CheckedOut, HostMut},
-        },
+        util::{base_ref::HostRef, host_mut::CheckedOut},
     },
 };
 
@@ -288,22 +285,22 @@ impl<'str> FunctionBody<'str> {
         cx: ContextView<'_, 'str>,
         insn: Instruction<'str>,
     ) -> InstructionId {
-        let func = self.id;
-        HostMut::push_insn(&mut self.host(cx), func, insn)
+        let _ = cx;
+        self.fun.push_insn(self.id, insn)
     }
 
     /// Push a fresh block into this body's arena and onto its roster. Mirrors
     /// [`HostMut::push_block`] with `func = self.id()`.
     pub fn push_block(&mut self, cx: ContextView<'_, 'str>, block: BasicBlock<'str>) -> BlockId {
-        let func = self.id;
-        HostMut::push_block(&mut self.host(cx), func, block)
+        let _ = cx;
+        self.fun.push_block(self.id, block)
     }
 
     /// Mint a fresh empty block, parented to this body and rostered. Mirrors
     /// [`HostMut::make_block`] with `func = self.id()`.
     pub fn make_block(&mut self, cx: ContextView<'_, 'str>) -> BlockId {
-        let func = self.id;
-        HostMut::make_block(&mut self.host(cx), func)
+        let _ = cx;
+        self.fun.make_block(self.id)
     }
 
     /// Push a fresh block parameter into this body's arena. Mirrors
@@ -313,8 +310,8 @@ impl<'str> FunctionBody<'str> {
         cx: ContextView<'_, 'str>,
         param: BlockParam<'str>,
     ) -> BlockParamId {
-        let func = self.id;
-        HostMut::push_block_param(&mut self.host(cx), func, param)
+        let _ = cx;
+        self.fun.push_block_param(self.id, param)
     }
 
     /// Mint an `Int(size)`-typed instruction with `mnemonic`. Mirrors
@@ -325,8 +322,8 @@ impl<'str> FunctionBody<'str> {
         mnemonic: Mnemonic,
         size: usize,
     ) -> InstructionId {
-        let func = self.id;
-        HostMut::push_mnemonic(&mut self.host(cx), func, mnemonic, size)
+        self.fun
+            .push_mnemonic(self.id, cx.shared_ctx(), mnemonic, size)
     }
 
     /// Mint an instruction with `mnemonic` and an explicit result `type_id`.
@@ -337,8 +334,8 @@ impl<'str> FunctionBody<'str> {
         mnemonic: Mnemonic,
         type_id: TypeId,
     ) -> InstructionId {
-        let func = self.id;
-        HostMut::push_mnemonic_with_type(&mut self.host(cx), func, mnemonic, type_id)
+        let _ = cx;
+        self.fun.push_mnemonic_with_type(self.id, mnemonic, type_id)
     }
 
     /// Insert `insn` immediately before `before` in `block`. Mirrors
@@ -350,7 +347,8 @@ impl<'str> FunctionBody<'str> {
         before: InstructionId,
         insn: InstructionId,
     ) {
-        HostMut::insert_insn_before(&mut self.host(cx), block, before, insn)
+        let _ = cx;
+        self.fun.insert_insn_before(block, before, insn)
     }
 
     // ---- CFG / use-map verbs ------------------------------------------------
@@ -362,26 +360,29 @@ impl<'str> FunctionBody<'str> {
         from: BlockId,
         to: BlockId,
     ) -> EdgeId {
-        HostMut::add_cfg_edge(&mut self.host(cx), from, to)
+        let _ = cx;
+        self.fun.add_cfg_edge(from, to)
     }
 
     /// Remove CFG edge `edge_id` from this body. Mirrors
     /// [`HostMut::remove_cfg_edge`] with `func = self.id()`.
     pub fn remove_cfg_edge(&mut self, cx: ContextView<'_, 'str>, edge_id: EdgeId) {
-        let func = self.id;
-        HostMut::remove_cfg_edge(&mut self.host(cx), func, edge_id)
+        let _ = cx;
+        self.fun.remove_cfg_edge(self.id, edge_id)
     }
 
     /// Replace every use of `old` with `new` across this body. Mirrors
     /// [`HostMut::replace_all_uses_with`].
     pub fn replace_all_uses_with(&mut self, cx: ContextView<'_, 'str>, old: ValueId, new: ValueId) {
-        HostMut::replace_all_uses_with(&mut self.host(cx), old, new)
+        let _ = cx;
+        self.fun.replace_all_uses_with(old, new)
     }
 
     /// Remove instruction `id` from this body (unlink edges, tombstone, prune
     /// uses). Mirrors [`HostMut::remove_instruction`].
     pub fn remove_instruction(&mut self, cx: ContextView<'_, 'str>, id: InstructionId) {
-        HostMut::remove_instruction(&mut self.host(cx), id)
+        let _ = cx;
+        self.fun.remove_instruction(id)
     }
 
     /// Rehome `remove`'s outgoing edges onto `keep` and drop the direct edge.
@@ -393,7 +394,8 @@ impl<'str> FunctionBody<'str> {
         remove: BlockId,
         direct_edge: EdgeId,
     ) {
-        HostMut::merge_nodes(&mut self.host(cx), keep, remove, direct_edge)
+        let _ = cx;
+        self.fun.merge_nodes(keep, remove, direct_edge)
     }
 
     /// Replace an instruction's mnemonic in place, keeping use/call-site maps in
@@ -404,19 +406,21 @@ impl<'str> FunctionBody<'str> {
         id: InstructionId,
         mnemonic: Mnemonic,
     ) {
-        HostMut::replace_instruction_mnemonic(&mut self.host(cx), id, mnemonic)
+        let _ = cx;
+        self.fun.replace_instruction_mnemonic(id, mnemonic)
     }
 
     /// Drop `block` from its owner's roster. Mirrors [`HostMut::unroster_block`].
     pub fn unroster_block(&mut self, cx: ContextView<'_, 'str>, block: BlockId) {
-        HostMut::unroster_block(&mut self.host(cx), block)
+        let _ = cx;
+        self.fun.unroster_block(block)
     }
 
     /// Remove `block` from this body (unlink edges, remove insns, detach params,
     /// tombstone). Mirrors [`HostMut::delete_block`] with `function_id = self.id()`.
     pub fn delete_block(&mut self, cx: ContextView<'_, 'str>, block: BlockId) {
-        let func = self.id;
-        HostMut::delete_block(&mut self.host(cx), block, func)
+        let _ = cx;
+        self.fun.delete_block(block)
     }
 
     /// Absorb `other` into `keep` across the direct edge `edge_ab`. Mirrors
@@ -428,8 +432,8 @@ impl<'str> FunctionBody<'str> {
         other: BlockId,
         edge_ab: EdgeId,
     ) {
-        let func = self.id;
-        HostMut::absorb_block(&mut self.host(cx), keep, other, edge_ab, func)
+        let _ = cx;
+        self.fun.absorb_block(keep, other, edge_ab)
     }
 
     /// Register `name` for `id` in the owning table (function-local for
@@ -441,7 +445,8 @@ impl<'str> FunctionBody<'str> {
         name: std::borrow::Cow<'str, str>,
         old_name: Option<&str>,
     ) -> Result<()> {
-        HostMut::register_local_name(&mut self.host(cx), id, name, old_name)
+        self.fun
+            .register_local_name(cx.shared_ctx(), id, name, old_name)
     }
 
     // ---- mutable arena accessors --------------------------------------------

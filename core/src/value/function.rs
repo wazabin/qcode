@@ -249,6 +249,338 @@ impl<'str> Function<'str> {
         &self.edges[id]
     }
 
+    // ---- structural mutation verbs (context-split stage 5b-ii(b)) -----------
+    //
+    // The single-homed IR mutation surface for a function *body* (design ruling
+    // 6). Each verb operates directly on this body's own arenas, reading shared
+    // data (types for minting) through an explicit `&Context` where needed. These
+    // are the algorithm bodies formerly living on `HostMut`'s checked-out path
+    // (`value::util::host_mut`), ported here with the routing indirection dropped:
+    // `self.function_mut(f)` collapses to `self`, `self.read_host()` to `self`'s
+    // own arena accessors, and the global call-site cache maintenance is omitted
+    // (the driver rebuilds `call_sites` by diffing at each barrier, exactly as the
+    // checked-out path did). `func` is the body's own [`FunctionId`], supplied by
+    // the caller (the body does not store its id).
+
+    /// Push a fresh instruction into this body's arena, recording each operand's
+    /// use in the reverse-use map. (No call-site maintenance — see the module
+    /// note.)
+    pub fn push_insn(&mut self, func: FunctionId, insn: Instruction<'str>) -> InstructionId {
+        let args: Vec<ValueId> = insn.mnemonic().args().into_iter().collect();
+        let local = self.insns.push(insn);
+        let id = InstructionId::new(func, local);
+        for arg in args {
+            self.users.entry(arg).or_default().push(id);
+        }
+        id
+    }
+
+    /// Push a fresh block into this body's arena and onto its ownership roster.
+    pub fn push_block(&mut self, func: FunctionId, block: BasicBlock<'str>) -> BlockId {
+        let local = self.blocks.push(block);
+        let id = BlockId::new(func, local);
+        self.roster.push(id);
+        id
+    }
+
+    /// Mint a fresh empty block, parented to `func` and rostered.
+    pub fn make_block(&mut self, func: FunctionId) -> BlockId {
+        self.push_block(func, BasicBlock::detached(func))
+    }
+
+    /// Push a fresh block parameter into this body's arena.
+    pub fn push_block_param(&mut self, func: FunctionId, param: BlockParam<'str>) -> BlockParamId {
+        let local = self.params.push(param);
+        BlockParamId::new(func, local)
+    }
+
+    /// Mint an `Int(size)`-typed instruction with `mnemonic` (the type is minted
+    /// in `shared`'s interner through its `&self` path).
+    pub fn push_mnemonic(
+        &mut self,
+        func: FunctionId,
+        shared: &Context<'str>,
+        mnemonic: Mnemonic,
+        size: usize,
+    ) -> InstructionId {
+        let type_id = shared.types.get_or_make_int(size);
+        let insn = Instruction::new(type_id, mnemonic);
+        self.push_insn(func, insn)
+    }
+
+    /// Mint an instruction with `mnemonic` and an explicit result `type_id`.
+    pub fn push_mnemonic_with_type(
+        &mut self,
+        func: FunctionId,
+        mnemonic: Mnemonic,
+        type_id: crate::types::TypeId,
+    ) -> InstructionId {
+        let insn = Instruction::new(type_id, mnemonic);
+        self.push_insn(func, insn)
+    }
+
+    /// Insert `insn` immediately before `before` in `block`. Panics if `before`
+    /// is not in `block`.
+    pub fn insert_insn_before(
+        &mut self,
+        block: BlockId,
+        before: InstructionId,
+        insn: InstructionId,
+    ) {
+        let index = self
+            .block(block)
+            .instructions
+            .iter()
+            .position(|&i| i == before)
+            .expect("before not in block");
+        self.insn_mut(insn).parent = Some(block);
+        self.block_mut(block).instructions.insert(index, insn);
+    }
+
+    /// Add a directed CFG edge `from -> to`, stored in this body's edge arena and
+    /// linked into both incident blocks' edge sets.
+    pub fn add_cfg_edge(&mut self, from: BlockId, to: BlockId) -> EdgeId {
+        let edge_id = self.edges.push(EdgeData { from, to });
+        self.block_mut(from).edges.insert((from.func, edge_id));
+        self.block_mut(to).edges.insert((from.func, edge_id));
+        edge_id
+    }
+
+    /// Remove CFG edge `edge_id`, unlinking it from both incident blocks. The
+    /// backing `EdgeData` slot is left dangling.
+    pub fn remove_cfg_edge(&mut self, func: FunctionId, edge_id: EdgeId) {
+        let EdgeData { from, to } = *self.edge(edge_id);
+        self.block_mut(from).edges.remove(&(func, edge_id));
+        self.block_mut(to).edges.remove(&(func, edge_id));
+    }
+
+    /// Replace every use of `old` with `new` across this body's instructions and
+    /// update the reverse use-map (SSA defs only; `old` is intra-function).
+    pub fn replace_all_uses_with(&mut self, old: ValueId, new: ValueId) {
+        if old == new {
+            return;
+        }
+        if old.owning_function().is_none() {
+            return;
+        }
+        let users: Vec<InstructionId> = self.users_of(old).to_vec();
+        for user in users {
+            self.insn_mut(user).mnemonic_mut().replace_value(old, new);
+            self.users.entry(new).or_default().push(user);
+        }
+        self.users.remove(&old);
+    }
+
+    /// Remove instruction `id` from its block, unlink its outgoing CFG edges if a
+    /// terminator, clear its name, tombstone it, and prune its operand use-lists.
+    pub fn remove_instruction(&mut self, id: InstructionId) {
+        let (parent, name, is_terminator, args) = {
+            let insn = self.insn(id);
+            (
+                insn.parent,
+                insn.name.clone(),
+                insn.mnemonic().is_terminator(),
+                insn.mnemonic().args().into_iter().collect::<Vec<_>>(),
+            )
+        };
+
+        if let Some(block_id) = parent {
+            self.block_mut(block_id).instructions.retain(|&i| i != id);
+            if is_terminator {
+                let succ: Vec<EdgeId> = {
+                    let block = self.block(block_id);
+                    block
+                        .edges
+                        .iter()
+                        .copied()
+                        .filter(|&(_f, e)| self.edge(e).from == block_id)
+                        .map(|(_, e)| e)
+                        .collect()
+                };
+                for edge_id in succ {
+                    self.remove_cfg_edge(block_id.func, edge_id);
+                }
+            }
+        }
+
+        self.insn_mut(id).parent = None;
+
+        if let Some(n) = name {
+            self.names.forget(n.as_ref());
+        }
+        self.insn_mut(id).name = None;
+
+        self.insn_mut(id).deleted = true;
+        for arg in args {
+            if let Some(users) = self.users.get_mut(&arg) {
+                users.retain(|u| *u != id);
+            }
+        }
+    }
+
+    /// Rehome `remove`'s outgoing CFG edges onto `keep` and drop the direct edge
+    /// between them. The caller tombstones `remove`.
+    pub fn merge_nodes(&mut self, keep: BlockId, remove: BlockId, direct_edge: EdgeId) {
+        let func = keep.func;
+        self.block_mut(keep).edges.remove(&(func, direct_edge));
+        self.block_mut(remove).edges.remove(&(func, direct_edge));
+        let outgoing: Vec<EdgeId> = {
+            let block = self.block(remove);
+            block
+                .edges
+                .iter()
+                .copied()
+                .filter(|&(_f, e)| self.edge(e).from == remove)
+                .map(|(_, e)| e)
+                .collect()
+        };
+        for eid in outgoing {
+            self.edges[eid].from = keep;
+            self.block_mut(keep).edges.insert((func, eid));
+            self.block_mut(remove).edges.remove(&(func, eid));
+        }
+    }
+
+    /// Replace an instruction's mnemonic in place, keeping the reverse use-map in
+    /// sync.
+    pub fn replace_instruction_mnemonic(&mut self, id: InstructionId, mnemonic: Mnemonic) {
+        let old_args = self
+            .insn(id)
+            .mnemonic()
+            .args()
+            .into_iter()
+            .collect::<Vec<_>>();
+        for arg in old_args {
+            let now_empty = if let Some(users) = self.users.get_mut(&arg) {
+                users.retain(|&u| u != id);
+                users.is_empty()
+            } else {
+                false
+            };
+            if now_empty {
+                self.users.remove(&arg);
+            }
+        }
+        *self.insn_mut(id).mnemonic_mut() = mnemonic;
+        let new_args = self
+            .insn(id)
+            .mnemonic()
+            .args()
+            .into_iter()
+            .collect::<Vec<_>>();
+        for arg in new_args {
+            self.users.entry(arg).or_default().push(id);
+        }
+    }
+
+    /// Drop `block` from this body's ownership roster.
+    pub fn unroster_block(&mut self, block: BlockId) {
+        self.roster.retain(|&b| b != block);
+    }
+
+    /// Remove `block` from this body: unlink every incident CFG edge, remove its
+    /// instructions, detach its params, and tombstone it.
+    pub fn delete_block(&mut self, block: BlockId) {
+        let edges: Vec<(FunctionId, EdgeId)> = self.block(block).edges.iter().copied().collect();
+        for (func, edge) in edges {
+            self.remove_cfg_edge(func, edge);
+        }
+        let insns: Vec<InstructionId> = self.block(block).instructions.clone();
+        for insn in insns {
+            self.remove_instruction(insn);
+        }
+        let params: Vec<BlockParamId> = self.block(block).params.clone();
+        for param in params {
+            self.users.remove(&ValueId::BlockParam(param));
+            self.block_param_mut(param).parent = None;
+        }
+        self.unroster_block(block);
+        let b = self.block_mut(block);
+        b.parent = None;
+        b.deleted = true;
+    }
+
+    /// Absorb `other` into `keep`: drop `keep`'s terminal branch, append `other`'s
+    /// instructions, rehome its outgoing edges, and tombstone it. `edge_ab` is the
+    /// direct edge `keep -> other`.
+    pub fn absorb_block(&mut self, keep: BlockId, other: BlockId, edge_ab: EdgeId) {
+        let branch_args = self
+            .block(keep)
+            .instructions
+            .last()
+            .and_then(|&id| match self.insn(id).mnemonic() {
+                Mnemonic::Branch(branch) if branch.target == other => Some(branch.args.clone()),
+                _ => None,
+            })
+            .unwrap_or_default();
+        let other_params = self.block(other).params.clone();
+        if !other_params.is_empty() {
+            assert_eq!(
+                other_params.len(),
+                branch_args.len(),
+                "cannot absorb block with {} params through branch with {} args",
+                other_params.len(),
+                branch_args.len()
+            );
+            for (param, arg) in other_params.into_iter().zip(branch_args) {
+                self.replace_all_uses_with(ValueId::BlockParam(param), arg);
+            }
+        }
+        self.block_mut(keep).instructions.pop();
+        let b_insns = std::mem::take(&mut self.block_mut(other).instructions);
+        for &insn_id in &b_insns {
+            self.insn_mut(insn_id).parent = Some(keep);
+        }
+        self.block_mut(keep).instructions.extend(b_insns);
+        self.merge_nodes(keep, other, edge_ab);
+        let (b_addr, b_extra) = {
+            let b = self.block(other);
+            (b.address, b.extra_addresses.clone())
+        };
+        self.unroster_block(other);
+        {
+            let ob = self.block_mut(other);
+            ob.parent = None;
+            ob.deleted = true;
+        }
+        if let Some(addr) = b_addr {
+            self.block_mut(keep).extra_addresses.push(addr);
+        }
+        self.block_mut(keep).extra_addresses.extend(b_extra);
+    }
+
+    /// Register `name` for `id` in this body's local name table (block/instruction/
+    /// param). A global-scoped `id` reads `shared` for the duplicate check but
+    /// cannot be *registered* through a body (its shared table is read-only here);
+    /// no body verb reaches that arm.
+    pub fn register_local_name(
+        &mut self,
+        shared: &Context<'str>,
+        id: ValueId,
+        name: Cow<'str, str>,
+        old_name: Option<&str>,
+    ) -> Result<()> {
+        let existing = match id.name_scope_function() {
+            Some(_) => self.names.get(&name),
+            None => shared.get_named(&name),
+        };
+        if let Some(existing) = existing {
+            return if existing == id {
+                Ok(())
+            } else {
+                Err(Error::spanless(ErrorTy::DuplicateName(name.to_string())))
+            };
+        }
+        match id.name_scope_function() {
+            Some(_) => self.names.register(name, id, old_name),
+            None => {
+                unimplemented!(
+                    "a function body cannot register a global name (shared is read-only)"
+                )
+            }
+        }
+    }
+
     /// Gets a reference to a function from its ID
     pub fn from_id<'ctx>(ctx: &'ctx Context<'str>, id: FunctionId) -> FunctionRef<'str, 'ctx> {
         FunctionRef::new(HostRef::Module(ctx), id)
