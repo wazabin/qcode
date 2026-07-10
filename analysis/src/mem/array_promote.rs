@@ -29,7 +29,7 @@ use qcode::{
     space::{Space, SpaceId, SpaceType},
     types::TypeId,
     value::{
-        BlockId, BlockRef, FunctionId, FunctionRef, ValueId,
+        BlockId, FunctionId, ValueId,
         insn::{Branch, CBranch, InstructionId, IntrinsicApp, IntrinsicId, Load, Mnemonic},
         util::{
             base_ref::{BaseRef, HostRef},
@@ -86,7 +86,7 @@ struct Seed {
 /// Recognize the in-place array-fill loop in `fid`.
 fn try_match(host: HostRef, fid: FunctionId) -> Option<PromoteMatch> {
     // Reject anything with a call: another routine could observe/mutate the region.
-    for block in FunctionRef::new(host, fid).iter() {
+    for block in host.function_ref(fid).iter() {
         for insn in block.iter() {
             if matches!(
                 insn.mnemonic(),
@@ -114,7 +114,7 @@ fn try_match(host: HostRef, fid: FunctionId) -> Option<PromoteMatch> {
         )
     };
     let mut accesses: Vec<Acc> = Vec::new();
-    for block in FunctionRef::new(host, fid).iter() {
+    for block in host.function_ref(fid).iter() {
         let bid = block.id;
         for insn in block.iter() {
             match insn.mnemonic() {
@@ -254,7 +254,7 @@ fn try_match(host: HostRef, fid: FunctionId) -> Option<PromoteMatch> {
     }
 
     // Body instruction order, for the program-order check below.
-    let body_order: Vec<InstructionId> = BlockRef::new(host, body).iter().map(|i| i.id).collect();
+    let body_order: Vec<InstructionId> = host.block_ref(body).iter().map(|i| i.id).collect();
     let store_pos = body_order.iter().position(|&id| id == lane_store_id)?;
 
     // Strided region loads at `index + od`: one uniform list, each rewritten to
@@ -391,7 +391,7 @@ fn try_match(host: HostRef, fid: FunctionId) -> Option<PromoteMatch> {
 
 /// Append `arg` to the branch terminator of `from` on the edge to `to`.
 fn append_edge_arg<'str, H: HostMut<'str>>(host: &mut H, from: BlockId, to: BlockId, arg: ValueId) {
-    let Some(term) = BlockRef::new(host.read_host(), from).iter().last() else {
+    let Some(term) = host.block_ref(from).iter().last() else {
         return;
     };
     let term_id = term.id;
@@ -468,9 +468,9 @@ fn region_base<'str, 'ctx, Ctx: HostMut<'str>>(
 fn width_of<'str, H: HostMut<'str>>(host: &H, v: ValueId) -> usize {
     let ty = match v {
         ValueId::Instruction(iid) => {
-            qcode::value::InstructionRef::new(host.read_host(), iid).type_id()
+            host.insn_ref(iid).type_id()
         }
-        ValueId::BlockParam(pid) => host.read_host().block_param(pid).type_id,
+        ValueId::BlockParam(pid) => host.param_ref(pid).type_id(),
         other => host
             .shared()
             .stored_type_of(other)
@@ -518,7 +518,7 @@ fn insert_at_top<'str, H: HostMut<'str>>(
     mnemonic: Mnemonic,
     ty: TypeId,
 ) -> ValueId {
-    let first = BlockRef::new(host.read_host(), block)
+    let first = host.block_ref(block)
         .iter()
         .next()
         .expect("preheader has a terminator")
@@ -530,7 +530,7 @@ fn insert_at_top<'str, H: HostMut<'str>>(
 
 /// The last instruction id of `block`.
 fn last_insn<'str, H: HostMut<'str>>(host: &H, block: BlockId) -> InstructionId {
-    BlockRef::new(host.read_host(), block)
+    host.block_ref(block)
         .iter()
         .last()
         .unwrap()
@@ -551,7 +551,7 @@ fn apply<'str, H: HostMut<'str>>(host: &mut H, m: &PromoteMatch) -> bool {
     // Push a fresh array-typed param onto `bid` (host-routed mirror of
     // `BasicBlock::push_param` followed by the original's `type_id = arr_ty`).
     let new_param = |host: &mut H, bid: BlockId| {
-        let index = host.read_host().block(bid).params.len();
+        let index = host.block_ref(bid).num_params();
         let pid = host.push_block_param(
             bid.func,
             qcode::value::block_param::BlockParam {
@@ -685,7 +685,7 @@ fn apply<'str, H: HostMut<'str>>(host: &mut H, m: &PromoteMatch) -> bool {
     // Exit write-back: store(region, base(+origin) <- arr_e) at the *top* of the exit
     // block, so any whole-region exit load left in place reads the promoted result.
     {
-        let first_id = BlockRef::new(host.read_host(), m.exit)
+        let first_id = host.block_ref(m.exit)
             .iter()
             .next()
             .unwrap()

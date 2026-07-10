@@ -26,7 +26,7 @@ use qcode::{
     space::{Space, SpaceId, SpaceType},
     types::TypeId,
     value::{
-        FunctionId, FunctionRef, InstructionRef, ValueId,
+        FunctionId, ValueId,
         insn::{InstructionId, IntrinsicApp, IntrinsicId, Mnemonic},
         util::{
             base_ref::{BaseRef, HostRef},
@@ -47,7 +47,7 @@ fn stored_type_of(host: HostRef, id: ValueId) -> Option<TypeId> {
     match id {
         // Instruction/param results live in the (possibly checked-out) function
         // arena, so route them through the host.
-        ValueId::Instruction(iid) => Some(qcode::value::InstructionRef::new(host, iid).type_id()),
+        ValueId::Instruction(iid) => Some(host.insn_ref(iid).type_id()),
         ValueId::BlockParam(pid) => Some(host.block_param(pid).type_id),
         // Everything else is shared data; the Context method reads it directly.
         other => host.shared().stored_type_of(other),
@@ -83,7 +83,7 @@ struct Acc {
 
 fn try_match(host: HostRef, fid: FunctionId) -> Option<ReadsMatch> {
     // v1 conservatism (mirrors `array_promote`): no calls/indirect control flow.
-    for block in FunctionRef::new(host, fid).iter() {
+    for block in host.function_ref(fid).iter() {
         for insn in block.iter() {
             if matches!(
                 insn.mnemonic(),
@@ -98,7 +98,7 @@ fn try_match(host: HostRef, fid: FunctionId) -> Option<ReadsMatch> {
     let is_temp =
         |sp: SpaceId| matches!(Space::from_id(host.shared(), sp).ty, SpaceType::Temporary);
     let mut accesses: Vec<Acc> = Vec::new();
-    for block in FunctionRef::new(host, fid).iter() {
+    for block in host.function_ref(fid).iter() {
         for insn in block.iter() {
             match insn.mnemonic() {
                 Mnemonic::Load(l) if is_temp(l.space) => accesses.push(Acc {
@@ -122,7 +122,7 @@ fn try_match(host: HostRef, fid: FunctionId) -> Option<ReadsMatch> {
 
     // Seed store: `store(region, base <- arr)`, `arr` a root `[elem; N]` param,
     // `base` a root param, size `N * size_of(elem)`.
-    let root_params: Vec<ValueId> = FunctionRef::new(host, fid)
+    let root_params: Vec<ValueId> = host.function_ref(fid)
         .root()?
         .params()
         .map(|p| p.id())
@@ -227,7 +227,7 @@ fn apply<'str, H: HostMut<'str>>(host: &mut H, m: &ReadsMatch) -> bool {
         .or(arr_ty)
         .expect("seeded array value has a type");
     for (load_id, lane) in &m.loads {
-        let block = InstructionRef::new(host.read_host(), *load_id)
+        let block = host.insn_ref(*load_id)
             .parent()
             .map(|b| b.id);
         let Some(block) = block else { continue };
@@ -298,7 +298,7 @@ impl FunctionPass for ArrayReads {
     ) -> Result<bool, String> {
         let fid = f.id();
         let mut host = f.host(m);
-        if !FunctionRef::new(host.read_host(), fid).is_pure() {
+        if !host.function_ref(fid).is_pure() {
             return Ok(false);
         }
         Ok(match try_match(host.read_host(), fid) {

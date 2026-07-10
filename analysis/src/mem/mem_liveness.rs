@@ -22,7 +22,7 @@
 use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
 
 use qcode::value::{
-    BlockId, FunctionId, FunctionRef, ValueId, block::BlockRef, util::base_ref::HostRef,
+    BlockId, FunctionId, ValueId, util::base_ref::HostRef,
 };
 
 use crate::AliasResult;
@@ -47,7 +47,7 @@ impl MemLiveness {
 }
 
 fn successors(host: HostRef, block: BlockId) -> Vec<BlockId> {
-    BlockRef::new(host, block)
+    host.block_ref(block)
         .successors()
         .map(|(_, succ)| succ)
         .collect()
@@ -111,7 +111,7 @@ pub fn compute_memory_liveness<'a, 'str: 'a>(
     dead_regs: &[ValueId],
 ) -> MemLiveness {
     let host = host.into();
-    let blocks: Vec<BlockId> = FunctionRef::new(host, function_id)
+    let blocks: Vec<BlockId> = host.function_ref(function_id)
         .iter()
         .map(|block| block.id)
         .collect();
