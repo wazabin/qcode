@@ -30,8 +30,103 @@ use qcode::{
 use super::frame::incoming_sp_param;
 use crate::gvn::affine::precompute_forms;
 
+// TODO(5b-ii): Public functions below are thin wrappers marked for future migration
+
+/// Concrete version for FunctionBody/ContextView (stage 5b).
 /// Rewrite every fixed `@SP ± N` load/store address in `fid` to a single
 /// root-block representative per offset `N`. Returns whether anything changed.
+pub fn canonicalize_sp_slots_concrete<'a, 'str>(
+    body: &'a mut FunctionBody<'str>,
+    cx: ContextView<'a, 'str>,
+    fid: FunctionId,
+    sp_reg: VarnodeId,
+) -> bool {
+    let numbering = precompute_forms(body.read_host(cx), fid);
+    let Some(sp_param) = incoming_sp_param(body.read_host(cx), fid, sp_reg) else {
+        return false;
+    };
+    let Some(root) = body.function_ref(cx, fid).root().map(|b| b.id) else {
+        return false;
+    };
+
+    // Each distinct load/store pointer that is `@SP ± N` with a fixed offset.
+    let mut ptr_offset: HashMap<ValueId, i64> = HashMap::new();
+    for block in body.function_ref(cx, fid).blocks() {
+        for insn in block.iter() {
+            let ptr = match insn.mnemonic() {
+                Mnemonic::Load(load) => load.ptr,
+                Mnemonic::Store(store) => store.ptr,
+                _ => continue,
+            };
+            if let Some((base, off)) = numbering.base_offset(ptr)
+                && base == sp_param
+            {
+                ptr_offset.insert(ptr, off);
+            }
+        }
+    }
+    if ptr_offset.is_empty() {
+        return false;
+    }
+
+    let ptr_width = Varnode::from_id(cx.shared_ctx(), sp_reg).size();
+    let offsets: BTreeSet<i64> = ptr_offset.values().copied().collect();
+
+    // Reuse a prior run's representatives so this pass is idempotent: the first
+    // root-block `@SP ± N` instruction per offset (in program order) dominates
+    // every use of that slot. Offset 0 is `@SP` itself.
+    let mut repr: HashMap<i64, ValueId> = HashMap::new();
+    if offsets.contains(&0) {
+        repr.insert(0, sp_param);
+    }
+    for insn in body.function_ref(cx, fid).root().unwrap().iter() {
+        let v = ValueId::Instruction(insn.id);
+        if let Some((base, off)) = numbering.base_offset(v)
+            && base == sp_param
+            && offsets.contains(&off)
+        {
+            repr.entry(off).or_insert(v);
+        }
+    }
+
+    // Materialize the rest at the entry-block start (which dominates everything).
+    let missing: Vec<i64> = offsets
+        .iter()
+        .copied()
+        .filter(|o| !repr.contains_key(o))
+        .collect();
+    if !missing.is_empty() {
+        let host_borrow = body.host(cx);
+        let mut b = Builder::from_block(BaseRef::new(host_borrow, root));
+        b.set_insert_point_to_start();
+        for off in missing {
+            let mag = b.context().get_const(off.unsigned_abs(), ptr_width).id();
+            let rep = if off > 0 {
+                b.push_add(sp_param, mag).id()
+            } else {
+                b.push_sub(sp_param, mag).id()
+            };
+            repr.insert(off, rep);
+        }
+        unsafe { b.dont_finalize() };
+    }
+
+    // Point every occurrence at its representative; the now-dead per-site
+    // address instructions are reclaimed by DCE.
+    let mut changed = false;
+    for (ptr, off) in ptr_offset {
+        let rep = repr[&off];
+        if ptr != rep {
+            body.replace_all_uses_with(cx, ptr, rep);
+            changed = true;
+        }
+    }
+    changed
+}
+
+/// Generic wrapper for backwards compatibility; see concrete [`canonicalize_sp_slots_concrete`].
+/// TODO(5b-ii): Remove after callers migrate to FunctionBody/ContextView.
+#[allow(dead_code)]
 pub fn canonicalize_sp_slots<'str, H: HostMut<'str>>(
     host: &mut H,
     fid: FunctionId,
@@ -139,12 +234,11 @@ impl FunctionPass for CanonicalizeSpSlots {
     fn run<'str>(
         &self,
         f: &mut FunctionBody<'str>,
-        m: ContextView<'_, 'str>,
+        cx: ContextView<'_, 'str>,
     ) -> std::result::Result<bool, String> {
-        let sp_reg = m.shared_ctx().registers[&m.env().cfg.stack_pointer];
+        let sp_reg = cx.shared_ctx().registers[&cx.env().cfg.stack_pointer];
         let fid = f.id();
-        let mut host = f.host(m);
-        Ok(canonicalize_sp_slots(&mut host, fid, sp_reg))
+        Ok(canonicalize_sp_slots_concrete(f, cx, fid, sp_reg))
     }
 }
 

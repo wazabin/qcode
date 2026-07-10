@@ -34,6 +34,8 @@ use qcode::{
 
 use crate::{ContextView, FunctionBody, FunctionPass};
 
+// TODO(5b-ii): Public functions below are thin wrappers marked for future migration
+
 #[derive(Default)]
 pub struct StructTyping;
 
@@ -47,17 +49,62 @@ impl FunctionPass for StructTyping {
     fn run<'str>(
         &self,
         f: &mut FunctionBody<'str>,
-        m: ContextView<'_, 'str>,
+        cx: ContextView<'_, 'str>,
     ) -> Result<bool, String> {
         let fid = f.id();
-        let mut host = f.host(m);
-        Ok(struct_typing(&mut host, fid))
+        Ok(struct_typing(f, cx, fid))
     }
 }
 
 /// Recover struct-field accesses in `fun_id`, mutating the function through
-/// `host` (see the module docs). Returns `true` if the IR changed.
-pub fn struct_typing<'str, H: HostMut<'str>>(host: &mut H, fun_id: FunctionId) -> bool {
+/// concrete `(body, cx)` (see the module docs). Returns `true` if the IR changed.
+pub fn struct_typing<'a, 'str>(
+    body: &'a mut FunctionBody<'str>,
+    cx: ContextView<'a, 'str>,
+    fun_id: FunctionId,
+) -> bool {
+    // Nothing this pass does can fire unless some value or operand reachable in
+    // the function already carries a struct / struct-pointer type: add→gep,
+    // register-read, and load typing all key on a struct-pointer-typed operand,
+    // and renaming keys on a struct-typed value. On a function with no complex
+    // types (the common case) the whole fixpoint + rename sweep is a guaranteed
+    // no-op, so bail before allocating or scanning it twice. Per-function so it
+    // stays correct once non-Windows struct recovery lands.
+    if !function_has_struct_types(body.read_host(cx), fun_id) {
+        return false;
+    }
+
+    let insn_ids: Vec<InstructionId> = body
+        .function_ref(cx, fun_id)
+        .blocks()
+        .flat_map(|b| b.instruction_ids().to_vec())
+        .collect();
+
+    let mut changed_any = false;
+    loop {
+        let mut changed = false;
+        for &id in &insn_ids {
+            if type_instruction(body, cx, id) {
+                changed = true;
+                changed_any = true;
+            }
+        }
+        if !changed {
+            break;
+        }
+    }
+
+    // Once the types have settled, rename every struct-typed SSA value and
+    // argument after the struct it (points to): a value of type `PEB*`
+    // becomes `%peb`. This runs over the whole function so it also picks up
+    // arguments typed by an upstream seed.
+    changed_any |= rename_struct_values(body, cx, fun_id);
+
+    changed_any
+}
+
+/// Generic wrapper for backwards compatibility; see concrete [`struct_typing`].
+pub fn struct_typing_generic<'str, H: HostMut<'str>>(host: &mut H, fun_id: FunctionId) -> bool {
     // Nothing this pass does can fire unless some value or operand reachable in
     // the function already carries a struct / struct-pointer type: add→gep,
     // register-read, and load typing all key on a struct-pointer-typed operand,
@@ -79,7 +126,7 @@ pub fn struct_typing<'str, H: HostMut<'str>>(host: &mut H, fun_id: FunctionId) -
     loop {
         let mut changed = false;
         for &id in &insn_ids {
-            if type_instruction(host, id) {
+            if type_instruction_generic(host, id) {
                 changed = true;
                 changed_any = true;
             }
@@ -93,7 +140,7 @@ pub fn struct_typing<'str, H: HostMut<'str>>(host: &mut H, fun_id: FunctionId) -
     // argument after the struct it (points to): a value of type `PEB*`
     // becomes `%peb`. This runs over the whole function so it also picks up
     // arguments typed by an upstream seed.
-    changed_any |= rename_struct_values(host, fun_id);
+    changed_any |= rename_struct_values_generic(host, fun_id);
 
     changed_any
 }
@@ -111,7 +158,47 @@ fn stored_type_of<'str>(host: HostRef<'_, 'str>, id: ValueId) -> Option<TypeId> 
 /// Renames struct-typed SSA values and block parameters after the struct they
 /// reference (e.g. a `PEB*` value becomes `%peb`), keeping names unique within
 /// the function. Returns `true` if any value was renamed.
-fn rename_struct_values<'str, H: HostMut<'str>>(host: &mut H, fun_id: FunctionId) -> bool {
+fn rename_struct_values<'a, 'str>(
+    body: &'a mut FunctionBody<'str>,
+    cx: ContextView<'a, 'str>,
+    fun_id: FunctionId,
+) -> bool {
+    let values: Vec<ValueId> = body
+        .function_ref(cx, fun_id)
+        .blocks()
+        .flat_map(|b| {
+            b.params()
+                .map(|p| p.id())
+                .chain(b.instruction_ids().iter().map(|&i| ValueId::Instruction(i)))
+                .collect::<Vec<_>>()
+        })
+        .collect();
+
+    let mut changed = false;
+    for value in values {
+        let Some(base) = stored_type_of(body.read_host(cx), value)
+            .and_then(|t| struct_base_name(body.read_host(cx), t))
+        else {
+            continue;
+        };
+        if let Some(name) = unique_name(body.read_host(cx), fun_id, value, &base) {
+            let renamed = match value {
+                ValueId::Instruction(id) => {
+                    BaseRef::new(body.host(cx), id).rename_local(name).is_ok()
+                }
+                ValueId::BlockParam(id) => {
+                    BaseRef::new(body.host(cx), id).rename_local(name).is_ok()
+                }
+                _ => false,
+            };
+            changed |= renamed;
+        }
+    }
+    changed
+}
+
+/// Generic wrapper for backwards compatibility; see concrete [`rename_struct_values`].
+fn rename_struct_values_generic<'str, H: HostMut<'str>>(host: &mut H, fun_id: FunctionId) -> bool {
     let values: Vec<ValueId> = host
         .function_ref(fun_id)
         .blocks()
@@ -205,20 +292,43 @@ fn function_has_struct_types(host: HostRef, fun_id: FunctionId) -> bool {
 
 /// Attempts one typing step on instruction `id`. Returns `true` if it changed
 /// the IR (rewrote an add to a gep, or retyped a load result).
-fn type_instruction<'str, H: HostMut<'str>>(host: &mut H, id: InstructionId) -> bool {
+fn type_instruction<'a, 'str>(
+    body: &'a mut FunctionBody<'str>,
+    cx: ContextView<'a, 'str>,
+    id: InstructionId,
+) -> bool {
+    match body.insn_ref(cx, id).mnemonic().clone() {
+        Mnemonic::Binop(Binary {
+            op: Binop::Int(IntBinop::Add),
+            lhs,
+            rhs,
+        }) => try_add_to_gep(body, cx, id, lhs, rhs),
+        // A register read (`load` from the register space) yields the register's
+        // own value type — which the TEB seed overrode to `PtrTo<TEB>`. A normal
+        // RAM load dereferences a field pointer.
+        Mnemonic::Load(load) if is_register_space(body.read_host(cx), load.space) => {
+            try_type_register_read(body, cx, id, load.ptr, load.size)
+        }
+        Mnemonic::Load(load) => try_type_load(body, cx, id, load.ptr, load.size),
+        _ => false,
+    }
+}
+
+/// Generic wrapper for backwards compatibility; see concrete [`type_instruction`].
+fn type_instruction_generic<'str, H: HostMut<'str>>(host: &mut H, id: InstructionId) -> bool {
     match host.insn_ref(id).mnemonic().clone() {
         Mnemonic::Binop(Binary {
             op: Binop::Int(IntBinop::Add),
             lhs,
             rhs,
-        }) => try_add_to_gep(host, id, lhs, rhs),
+        }) => try_add_to_gep_generic(host, id, lhs, rhs),
         // A register read (`load` from the register space) yields the register's
         // own value type — which the TEB seed overrode to `PtrTo<TEB>`. A normal
         // RAM load dereferences a field pointer.
         Mnemonic::Load(load) if is_register_space(host.read_host(), load.space) => {
-            try_type_register_read(host, id, load.ptr, load.size)
+            try_type_register_read_generic(host, id, load.ptr, load.size)
         }
-        Mnemonic::Load(load) => try_type_load(host, id, load.ptr, load.size),
+        Mnemonic::Load(load) => try_type_load_generic(host, id, load.ptr, load.size),
         _ => false,
     }
 }
@@ -232,7 +342,32 @@ fn is_register_space(host: HostRef, space: SpaceId) -> bool {
 /// value type. Only acts when that type is a (struct) pointer — i.e. the TEB
 /// seed overrode `FS_OFFSET` to `PtrTo<TEB>`; plain integer registers are left
 /// untouched. Exact-size match only.
-fn try_type_register_read<'str, H: HostMut<'str>>(
+fn try_type_register_read<'a, 'str>(
+    body: &'a mut FunctionBody<'str>,
+    cx: ContextView<'a, 'str>,
+    id: InstructionId,
+    reg: ValueId,
+    size: usize,
+) -> bool {
+    let Some(reg_ty) = stored_type_of(body.read_host(cx), reg) else {
+        return false;
+    };
+    let (is_ptr, reg_size) = {
+        let types = &cx.shared_ctx().types;
+        (types.pointee_of(reg_ty).is_some(), types.size_of(reg_ty))
+    };
+    if !is_ptr || reg_size != size {
+        return false;
+    }
+    if stored_type_of(body.read_host(cx), ValueId::Instruction(id)) == Some(reg_ty) {
+        return false;
+    }
+    BaseRef::new(body.host(cx), id).set_result_type(reg_ty);
+    true
+}
+
+/// Generic wrapper for backwards compatibility; see concrete [`try_type_register_read`].
+fn try_type_register_read_generic<'str, H: HostMut<'str>>(
     host: &mut H,
     id: InstructionId,
     reg: ValueId,
@@ -257,7 +392,41 @@ fn try_type_register_read<'str, H: HostMut<'str>>(
 
 /// `int_add(base, const)` with `base : PtrTo<S>` and `const` an exact field
 /// offset of `S` → `gep(base, off)` typed `PtrTo<field.type>`.
-fn try_add_to_gep<'str, H: HostMut<'str>>(
+fn try_add_to_gep<'a, 'str>(
+    body: &'a mut FunctionBody<'str>,
+    cx: ContextView<'a, 'str>,
+    id: InstructionId,
+    lhs: ValueId,
+    rhs: ValueId,
+) -> bool {
+    for (base, off_op) in [(lhs, rhs), (rhs, lhs)] {
+        let Some(base_ty) = stored_type_of(body.read_host(cx), base) else {
+            continue;
+        };
+        let Some(pointee) = cx.shared_ctx().types.pointee_of(base_ty) else {
+            continue;
+        };
+        let Some(offset) = const_offset(body.read_host(cx), off_op) else {
+            continue;
+        };
+        let field_ty = match cx.shared_ctx().types.field_by_offset(pointee, offset) {
+            Some((_, field)) => field.type_id,
+            None => continue,
+        };
+        let width = cx.shared_ctx().types.size_of(base_ty);
+        let result_ty = cx
+            .shared_ctx()
+            .types
+            .get_or_make_struct_pointer(width, field_ty);
+        body.replace_instruction_mnemonic(cx, id, Mnemonic::Gep(Gep { base, offset }));
+        BaseRef::new(body.host(cx), id).set_result_type(result_ty);
+        return true;
+    }
+    false
+}
+
+/// Generic wrapper for backwards compatibility; see concrete [`try_add_to_gep`].
+fn try_add_to_gep_generic<'str, H: HostMut<'str>>(
     host: &mut H,
     id: InstructionId,
     lhs: ValueId,
@@ -291,7 +460,31 @@ fn try_add_to_gep<'str, H: HostMut<'str>>(
 
 /// `load(ptr)` with `ptr : PtrTo<F>` and `load.size == size_of(F)` → result
 /// retyped to `F`. Exact-size match only; otherwise left as an integer read.
-fn try_type_load<'str, H: HostMut<'str>>(
+fn try_type_load<'a, 'str>(
+    body: &'a mut FunctionBody<'str>,
+    cx: ContextView<'a, 'str>,
+    id: InstructionId,
+    ptr: ValueId,
+    size: usize,
+) -> bool {
+    let Some(ptr_ty) = stored_type_of(body.read_host(cx), ptr) else {
+        return false;
+    };
+    let Some(field_ty) = cx.shared_ctx().types.pointee_of(ptr_ty) else {
+        return false;
+    };
+    if cx.shared_ctx().types.size_of(field_ty) != size {
+        return false;
+    }
+    if stored_type_of(body.read_host(cx), ValueId::Instruction(id)) == Some(field_ty) {
+        return false;
+    }
+    BaseRef::new(body.host(cx), id).set_result_type(field_ty);
+    true
+}
+
+/// Generic wrapper for backwards compatibility; see concrete [`try_type_load`].
+fn try_type_load_generic<'str, H: HostMut<'str>>(
     host: &mut H,
     id: InstructionId,
     ptr: ValueId,

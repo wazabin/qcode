@@ -6,6 +6,8 @@ use qcode::value::{
 
 use crate::{ContextView, FunctionBody, FunctionPass};
 
+// TODO(5b-ii): Public functions below are thin wrappers marked for future migration
+
 #[derive(Default)]
 pub struct SimplifyCfg;
 
@@ -19,11 +21,10 @@ impl FunctionPass for SimplifyCfg {
     fn run<'str>(
         &self,
         body: &mut FunctionBody<'str>,
-        m: ContextView<'_, 'str>,
+        cx: ContextView<'_, 'str>,
     ) -> Result<bool, String> {
         let fid = body.id();
-        let mut host = body.host(m);
-        Ok(simplify_cfg(&mut host, fid))
+        Ok(simplify_cfg_concrete(body, cx, fid))
     }
 }
 
@@ -47,17 +48,21 @@ crate::register_function_pass!(SimplifyCfg);
 /// e.g. the residual loop left behind once `dce` bypasses a dead loop.
 ///
 /// The pass repeats until a full scan applies no transform.
-pub fn simplify_cfg<'str, H: HostMut<'str>>(host: &mut H, function_id: FunctionId) -> bool {
+pub fn simplify_cfg_concrete<'a, 'str>(
+    body: &'a mut FunctionBody<'str>,
+    cx: ContextView<'a, 'str>,
+    function_id: FunctionId,
+) -> bool {
     let mut changed = false;
 
     loop {
-        let blocks = host.function_ref(function_id).block_ids();
-        let mut progress = prune_unreachable(host, function_id);
+        let blocks = body.function_ref(cx, function_id).block_ids();
+        let mut progress = prune_unreachable_concrete(body, cx, function_id);
 
         for block_id in blocks {
-            if try_fold_cbranch(host, block_id)
-                || try_bypass_empty_block(host, function_id, block_id)
-                || try_merge_block(host, function_id, block_id)
+            if try_fold_cbranch_concrete(body, cx, block_id)
+                || try_bypass_empty_block_concrete(body, cx, function_id, block_id)
+                || try_merge_block_concrete(body, cx, function_id, block_id)
             {
                 progress = true;
                 break;
@@ -74,16 +79,42 @@ pub fn simplify_cfg<'str, H: HostMut<'str>>(host: &mut H, function_id: FunctionI
     changed
 }
 
-/// Deletes every block of `function_id` not reachable from the entry, along
-/// with its instructions (which detaches CFG edges and clears use records) and
-/// params. Removing the terminator of an unreachable block only drops edges into
-/// *other* unreachable blocks, so a single pass suffices; returns `true` if any
-/// block was removed.
-///
-/// Sound with no side conditions: a block with no path from the entry executes
-/// on no run, so nothing it computes or branches to is observable. This is what
-/// lets a dead loop, once `dce` reroutes its preheader past it, disappear.
-fn prune_unreachable<'str, H: HostMut<'str>>(host: &mut H, function_id: FunctionId) -> bool {
+/// Generic wrapper for backwards compatibility; see concrete [`simplify_cfg_concrete`].
+/// TODO(5b-ii): Remove after callers migrate to FunctionBody/ContextView.
+#[allow(dead_code)]
+pub fn simplify_cfg<'str, H: HostMut<'str>>(host: &mut H, function_id: FunctionId) -> bool {
+    let mut changed = false;
+
+    loop {
+        let blocks = host.function_ref(function_id).block_ids();
+        let mut progress = prune_unreachable_generic(host, function_id);
+
+        for block_id in blocks {
+            if try_fold_cbranch_generic(host, block_id)
+                || try_bypass_empty_block_generic(host, function_id, block_id)
+                || try_merge_block_generic(host, function_id, block_id)
+            {
+                progress = true;
+                break;
+            }
+        }
+
+        if progress {
+            changed = true;
+        } else {
+            break;
+        }
+    }
+
+    changed
+}
+
+/// Generic wrapper for [`prune_unreachable`]; see that function.
+#[allow(dead_code)]
+fn prune_unreachable_generic<'str, H: HostMut<'str>>(
+    host: &mut H,
+    function_id: FunctionId,
+) -> bool {
     let Some(root) = host.function_ref(function_id).root().map(|b| b.id) else {
         return false;
     };
@@ -117,15 +148,9 @@ fn prune_unreachable<'str, H: HostMut<'str>>(host: &mut H, function_id: Function
     true
 }
 
-/// If `a_id` is the tail of a straight-line chain — exactly one successor `B`,
-/// `B` has exactly one predecessor (`a_id`), `a_id` ends with an unconditional
-/// `Branch { target: B }`, and the branch supplies one arg per B-param — returns
-/// the `(edge, B)` to absorb. Otherwise `None`.
-///
-/// This inspects only the CFG structure and does *not* check whether `B` lives in
-/// the same function as `a_id`; [`try_merge_block`] applies that gate (a
-/// checked-out pass merges only within its own function).
-fn merge_candidate<'str, H: HostMut<'str>>(
+/// Generic wrapper for [`merge_candidate`]; see that function.
+#[allow(dead_code)]
+fn merge_candidate_generic<'str, H: HostMut<'str>>(
     host: &mut H,
     a_id: BlockId,
 ) -> Option<(qcode::value::block::EdgeId, BlockId)> {
@@ -174,18 +199,14 @@ fn merge_candidate<'str, H: HostMut<'str>>(
     Some((edge_ab, b_id))
 }
 
-/// Merges `a_id` with its unique successor when the straight-line conditions hold
-/// **and the successor is in the same function**. The cross-function (thunk /
-/// tail-call) case is intentionally *not* handled: a checked-out function pass may
-/// not mutate another function, and absorbing another function's block would drag
-/// its instructions (which stay in that function's arena) into this one. Returns
-/// `true` if a merge happened.
-fn try_merge_block<'str, H: HostMut<'str>>(
+/// Generic wrapper for [`try_merge_block`]; see that function.
+#[allow(dead_code)]
+fn try_merge_block_generic<'str, H: HostMut<'str>>(
     host: &mut H,
     function_id: FunctionId,
     a_id: BlockId,
 ) -> bool {
-    let Some((edge_ab, b_id)) = merge_candidate(host, a_id) else {
+    let Some((edge_ab, b_id)) = merge_candidate_generic(host, a_id) else {
         return false;
     };
     // Intra-function only (see the note above): B must be both *stored in* and
@@ -203,13 +224,9 @@ fn try_merge_block<'str, H: HostMut<'str>>(
     true
 }
 
-/// Rewrites a conditional branch whose two arms are indistinguishable — same
-/// target block *and* same per-arm arguments — into an unconditional `Branch`,
-/// discarding the now-irrelevant condition. Returns `true` if it fired.
-///
-/// The `CBranch` contributed two parallel CFG edges to the shared target; one
-/// is dropped so the edge multiplicity matches the new single-successor branch.
-fn try_fold_cbranch<'str, H: HostMut<'str>>(host: &mut H, block_id: BlockId) -> bool {
+/// Generic wrapper for [`try_fold_cbranch`]; see that function.
+#[allow(dead_code)]
+fn try_fold_cbranch_generic<'str, H: HostMut<'str>>(host: &mut H, block_id: BlockId) -> bool {
     let Some(term_id) = host.block_ref(block_id).instruction_ids().last().copied() else {
         return false;
     };
@@ -239,24 +256,9 @@ fn try_fold_cbranch<'str, H: HostMut<'str>>(host: &mut H, block_id: BlockId) -> 
     true
 }
 
-/// Splices out an *empty forwarding block* `b_id` — one whose only instruction
-/// is an unconditional `Branch { target, .. }` — by redirecting each predecessor
-/// straight to `target`, then deleting `b_id`. Returns `true` if it fired.
-///
-/// Block arguments are threaded per predecessor: if B declares params and its
-/// branch forwards them (`<b @x> goto <t @y=@x>`), each predecessor's incoming
-/// argument is substituted for the corresponding param in the rewritten branch,
-/// so `p: goto <b @x=v>` becomes `p: goto <t @y=v>`.
-///
-/// Conservative guards (any failure leaves the block untouched):
-/// * B is not the function entry (the root must remain).
-/// * `target != b_id` (a self-loop cannot be bypassed).
-/// * B's params are referenced only by B's own branch — otherwise the
-///   substitution would leave dangling references.
-/// * Every predecessor reaches B through a *static* `Branch`/`CBranch` that
-///   names B with a matching argument count. Call continuations, indirect
-///   branches, and jump-table edges carry no rewritable target and are skipped.
-fn try_bypass_empty_block<'str, H: HostMut<'str>>(
+/// Generic wrapper for [`try_bypass_empty_block`]; see that function.
+#[allow(dead_code)]
+fn try_bypass_empty_block_generic<'str, H: HostMut<'str>>(
     host: &mut H,
     function_id: FunctionId,
     b_id: BlockId,
@@ -418,6 +420,363 @@ fn try_bypass_empty_block<'str, H: HostMut<'str>>(
     true
 }
 
+/// Deletes every block of `function_id` not reachable from the entry, along
+/// with its instructions (which detaches CFG edges and clears use records) and
+/// params. Removing the terminator of an unreachable block only drops edges into
+/// *other* unreachable blocks, so a single pass suffices; returns `true` if any
+/// block was removed.
+///
+/// Sound with no side conditions: a block with no path from the entry executes
+/// on no run, so nothing it computes or branches to is observable. This is what
+/// lets a dead loop, once `dce` reroutes its preheader past it, disappear.
+fn prune_unreachable_concrete<'a, 'str>(
+    body: &'a mut FunctionBody<'str>,
+    cx: ContextView<'a, 'str>,
+    function_id: FunctionId,
+) -> bool {
+    let Some(root) = body.function_ref(cx, function_id).root().map(|b| b.id) else {
+        return false;
+    };
+
+    // Mark reachable blocks by CFG walk from the entry.
+    let mut reachable = rustc_hash::FxHashSet::default();
+    let mut stack = vec![root];
+    while let Some(b) = stack.pop() {
+        if !reachable.insert(b) {
+            continue;
+        }
+        let succs: Vec<BlockId> = body.block_ref(cx, b).successors().map(|(_, s)| s).collect();
+        stack.extend(succs);
+    }
+
+    let dead: Vec<BlockId> = body
+        .function_ref(cx, function_id)
+        .block_ids()
+        .into_iter()
+        .filter(|b| !reachable.contains(b))
+        .collect();
+    if dead.is_empty() {
+        return false;
+    }
+
+    for block in dead {
+        // `delete_block` unwinds CFG edges, removes the block's instructions
+        // (clearing their use records) and detaches its params — the full cleanup.
+        body.delete_block(cx, block);
+    }
+    true
+}
+
+/// If `a_id` is the tail of a straight-line chain — exactly one successor `B`,
+/// `B` has exactly one predecessor (`a_id`), `a_id` ends with an unconditional
+/// `Branch { target: B }`, and the branch supplies one arg per B-param — returns
+/// the `(edge, B)` to absorb. Otherwise `None`.
+///
+/// This inspects only the CFG structure and does *not* check whether `B` lives in
+/// the same function as `a_id`; [`try_merge_block`] applies that gate (a
+/// checked-out pass merges only within its own function).
+fn merge_candidate_concrete<'a, 'str>(
+    body: &'a FunctionBody<'str>,
+    cx: ContextView<'a, 'str>,
+    a_id: BlockId,
+) -> Option<(qcode::value::block::EdgeId, BlockId)> {
+    // Collect at most 2 successors to check the "exactly one" condition.
+    // Collecting eagerly releases the immutable borrow before any mutation.
+    let a_succs: Vec<_> = body.block_ref(cx, a_id).successors().take(2).collect();
+
+    let &(edge_ab, b_id) = a_succs.first()?;
+    if a_succs.len() != 1 || b_id == a_id {
+        return None; // more than one successor, or a self-loop
+    }
+    if body.block_ref(cx, b_id).predecessors().count() != 1 {
+        return None;
+    }
+
+    // A's terminal must be an unconditional Branch to B.
+    let a_terminal = body.block_ref(cx, a_id).instruction_ids().last().copied();
+    let is_branch_to_b = a_terminal
+        .map(|id| {
+            matches!(
+                body.insn_ref(cx, id).mnemonic(),
+                Mnemonic::Branch(b) if b.target == b_id
+            )
+        })
+        .unwrap_or(false);
+    if !is_branch_to_b {
+        return None;
+    }
+
+    // Merging rewrites B's params to the branch's args, so the branch must
+    // supply one arg per param. A mismatch means a malformed edge — e.g. a
+    // CRT stub's tail `jmp` into another routine that mem2reg gave a param,
+    // lifted as an intra-function `goto` carrying no args. Leave such edges
+    // unmerged rather than absorbing an unsatisfiable param.
+    let b_params = body.block_ref(cx, b_id).num_params();
+    let branch_args = a_terminal
+        .and_then(|id| match body.insn_ref(cx, id).mnemonic() {
+            Mnemonic::Branch(b) => Some(b.args.len()),
+            _ => None,
+        })
+        .unwrap_or(0);
+    if b_params != branch_args {
+        return None;
+    }
+
+    Some((edge_ab, b_id))
+}
+
+/// Merges `a_id` with its unique successor when the straight-line conditions hold
+/// **and the successor is in the same function**. The cross-function (thunk /
+/// tail-call) case is intentionally *not* handled: a checked-out function pass may
+/// not mutate another function, and absorbing another function's block would drag
+/// its instructions (which stay in that function's arena) into this one. Returns
+/// `true` if a merge happened.
+fn try_merge_block_concrete<'a, 'str>(
+    body: &'a mut FunctionBody<'str>,
+    cx: ContextView<'a, 'str>,
+    function_id: FunctionId,
+    a_id: BlockId,
+) -> bool {
+    let Some((edge_ab, b_id)) = merge_candidate_concrete(body, cx, a_id) else {
+        return false;
+    };
+    // Intra-function only (see the note above): B must be both *stored in* and
+    // *owned by* this function. A block stored in this function's arena but
+    // reattributed — owned/rostered by another function (common in real binaries:
+    // shared CRT stubs, thunks) — must not be absorbed: `absorb_block` →
+    // `unroster_block` mutates the *owner*'s roster, which a checked-out pass may
+    // not do. A cross-function successor (thunk/tail-call) is likewise left as-is.
+    if b_id.func != function_id || body.read_host(cx).block(b_id).parent != Some(function_id) {
+        return false;
+    }
+    body.absorb_block(cx, a_id, b_id, edge_ab);
+    true
+}
+
+/// Rewrites a conditional branch whose two arms are indistinguishable — same
+/// target block *and* same per-arm arguments — into an unconditional `Branch`,
+/// discarding the now-irrelevant condition. Returns `true` if it fired.
+///
+/// The `CBranch` contributed two parallel CFG edges to the shared target; one
+/// is dropped so the edge multiplicity matches the new single-successor branch.
+fn try_fold_cbranch_concrete<'a, 'str>(
+    body: &'a mut FunctionBody<'str>,
+    cx: ContextView<'a, 'str>,
+    block_id: BlockId,
+) -> bool {
+    let Some(term_id) = body
+        .block_ref(cx, block_id)
+        .instruction_ids()
+        .last()
+        .copied()
+    else {
+        return false;
+    };
+    let (target, args) = {
+        let Mnemonic::CBranch(cb) = body.insn_ref(cx, term_id).mnemonic() else {
+            return false;
+        };
+        if cb.success_block != cb.failure_block || cb.success_args != cb.failure_args {
+            return false;
+        }
+        (cb.success_block, cb.success_args.clone())
+    };
+    body.replace_instruction_mnemonic(cx, term_id, Mnemonic::Branch(Branch { target, args }));
+
+    // Collapse the two parallel `block -> target` edges into one: keep the
+    // first, drop the second.
+    let dup_edge = body
+        .block_ref(cx, block_id)
+        .successors()
+        .filter(|&(_, to)| to == target)
+        .map(|(e, _)| e)
+        .nth(1);
+    if let Some(dup_edge) = dup_edge {
+        body.remove_cfg_edge(cx, dup_edge);
+    }
+
+    true
+}
+
+/// Splices out an *empty forwarding block* `b_id` — one whose only instruction
+/// is an unconditional `Branch { target, .. }` — by redirecting each predecessor
+/// straight to `target`, then deleting `b_id`. Returns `true` if it fired.
+///
+/// Block arguments are threaded per predecessor: if B declares params and its
+/// branch forwards them (`<b @x> goto <t @y=@x>`), each predecessor's incoming
+/// argument is substituted for the corresponding param in the rewritten branch,
+/// so `p: goto <b @x=v>` becomes `p: goto <t @y=v>`.
+///
+/// Conservative guards (any failure leaves the block untouched):
+/// * B is not the function entry (the root must remain).
+/// * `target != b_id` (a self-loop cannot be bypassed).
+/// * B's params are referenced only by B's own branch — otherwise the
+///   substitution would leave dangling references.
+/// * Every predecessor reaches B through a *static* `Branch`/`CBranch` that
+///   names B with a matching argument count. Call continuations, indirect
+///   branches, and jump-table edges carry no rewritable target and are skipped.
+fn try_bypass_empty_block_concrete<'a, 'str>(
+    body: &'a mut FunctionBody<'str>,
+    cx: ContextView<'a, 'str>,
+    function_id: FunctionId,
+    b_id: BlockId,
+) -> bool {
+    // The entry block dominates everything; deleting it would orphan the body.
+    if body
+        .read_host(cx)
+        .function_ref(function_id)
+        .root()
+        .map(|r| r.id)
+        == Some(b_id)
+    {
+        return false;
+    }
+
+    // B must hold exactly one instruction, an unconditional branch.
+    let (term_id, target, b_args) = {
+        let b = body.read_host(cx).block(b_id);
+        if b.instructions.len() != 1 {
+            return false;
+        }
+        let term_id = b.instructions[0];
+        match body.insn(cx, term_id).mnemonic() {
+            Mnemonic::Branch(br) => (term_id, br.target, br.args.clone()),
+            _ => return false,
+        }
+    };
+    if target == b_id {
+        return false; // bypassing `goto self` is meaningless and unsound
+    }
+    // Intra-function only: bypassing a block that forwards into another function
+    // (a thunk) is a cross-function edit — left to the module pass.
+    if target.func != function_id {
+        return false;
+    }
+
+    let params: Vec<BlockParamId> = body.read_host(cx).block(b_id).params.clone();
+
+    // B's params must flow nowhere but B's own terminator. In valid SSA a block
+    // param is only visible inside dominated blocks via forwarded args, so this
+    // normally holds; bail if it doesn't rather than risk a dangling use.
+    for &p in &params {
+        if body
+            .users_of(ValueId::BlockParam(p))
+            .iter()
+            .any(|&u| u != term_id)
+        {
+            return false;
+        }
+    }
+
+    // Distinct predecessors of B.
+    let preds: Vec<BlockId> = {
+        let mut seen = rustc_hash::FxHashSet::default();
+        body.block_ref(cx, b_id)
+            .predecessors()
+            .map(|(_, p)| p)
+            .filter(|&p| seen.insert(p))
+            .collect()
+    };
+
+    // A forwarding block with no predecessors is unreachable dead code. Splicing
+    // is about removing a block *on a path*; deleting unreachable blocks is a
+    // separate concern, so leave it to a dedicated pass.
+    if preds.is_empty() {
+        return false;
+    }
+
+    // Intra-function only: a predecessor in another function (a tail-call into B)
+    // cannot be rewritten by a checked-out pass. Leave such blocks untouched.
+    if preds.iter().any(|p| p.func != function_id) {
+        return false;
+    }
+
+    // Pre-validate every predecessor before mutating anything: each must reach B
+    // through a rewritable terminator that names B with a matching arg count on
+    // each arm that targets B.
+    for &p in &preds {
+        let Some(p_term) = body.read_host(cx).block(p).instructions.last().copied() else {
+            return false;
+        };
+        match body.insn(cx, p_term).mnemonic() {
+            Mnemonic::Branch(br) => {
+                if br.target != b_id || br.args.len() != params.len() {
+                    return false;
+                }
+            }
+            Mnemonic::CBranch(cb) => {
+                let mut names_b = false;
+                if cb.success_block == b_id {
+                    if cb.success_args.len() != params.len() {
+                        return false;
+                    }
+                    names_b = true;
+                }
+                if cb.failure_block == b_id {
+                    if cb.failure_args.len() != params.len() {
+                        return false;
+                    }
+                    names_b = true;
+                }
+                if !names_b {
+                    return false;
+                }
+            }
+            _ => return false,
+        }
+    }
+
+    // Rewrite each predecessor to branch straight to `target`, substituting B's
+    // params with the arguments that predecessor supplied.
+    for &p in &preds {
+        let p_term = body
+            .read_host(cx)
+            .block(p)
+            .instructions
+            .last()
+            .copied()
+            .unwrap();
+        let new_mnemonic = match body.insn(cx, p_term).mnemonic().clone() {
+            Mnemonic::Branch(br) => Mnemonic::Branch(Branch {
+                target,
+                args: substitute(&b_args, &params, &br.args),
+            }),
+            Mnemonic::CBranch(mut cb) => {
+                if cb.success_block == b_id {
+                    cb.success_args = substitute(&b_args, &params, &cb.success_args);
+                    cb.success_block = target;
+                }
+                if cb.failure_block == b_id {
+                    cb.failure_args = substitute(&b_args, &params, &cb.failure_args);
+                    cb.failure_block = target;
+                }
+                Mnemonic::CBranch(cb)
+            }
+            _ => unreachable!("predecessor terminator validated above"),
+        };
+
+        // Rehome the `p -> b` edges to `p -> target`, preserving multiplicity
+        // (a CBranch with both arms on B contributes two edges).
+        let redirect: Vec<_> = body
+            .block_ref(cx, p)
+            .successors()
+            .filter(|&(_, to)| to == b_id)
+            .map(|(e, _)| e)
+            .collect();
+        body.replace_instruction_mnemonic(cx, p_term, new_mnemonic);
+        for &edge in &redirect {
+            body.remove_cfg_edge(cx, edge);
+        }
+        for _ in &redirect {
+            body.add_cfg_edge(cx, p, target);
+        }
+    }
+
+    // B has no predecessors left; delete it (drops its branch and `b -> target`).
+    body.delete_block(cx, b_id);
+    true
+}
+
 /// Maps each value of `template` (an empty block's forwarded branch args)
 /// through one predecessor's incoming arguments: a value that is one of the
 /// block's `params` is replaced by the predecessor's argument at the same index;
@@ -449,7 +808,8 @@ mod tests {
     use qcode_macro::qcode;
 
     use super::{
-        prune_unreachable, simplify_cfg, try_bypass_empty_block, try_fold_cbranch, try_merge_block,
+        prune_unreachable_generic, simplify_cfg, try_bypass_empty_block_generic,
+        try_fold_cbranch_generic, try_merge_block_generic,
     };
 
     fn make_ctx() -> Context<'static> {
@@ -503,7 +863,7 @@ mod tests {
         );
 
         assert!(
-            !prune_unreachable(&mut &mut ctx, f),
+            !prune_unreachable_generic(&mut &mut ctx, f),
             "no unreachable blocks means no change"
         );
     }
@@ -601,7 +961,7 @@ mod tests {
         // Isolate the merge guard: `<d>` is unreachable, so a full `simplify_cfg`
         // run would prune it, leaving B single-predecessor and mergeable.
         assert!(
-            !try_merge_block(&mut &mut ctx, f, a),
+            !try_merge_block_generic(&mut &mut ctx, f, a),
             "B has two predecessors, should not merge"
         );
     }
@@ -826,7 +1186,7 @@ mod tests {
 
         // Bypass in isolation: `<d>` is unreachable, so a full `simplify_cfg`
         // run would prune it (and then splice the forwarding `<a>`/`<d>`).
-        try_bypass_empty_block(&mut &mut ctx, f, b);
+        try_bypass_empty_block_generic(&mut &mut ctx, f, b);
 
         // b is gone; a and d both branch straight to t.
         assert!(
@@ -868,7 +1228,7 @@ mod tests {
 
         // Bypass in isolation (see `bypasses_empty_block_with_two_predecessors`):
         // a full run would prune the unreachable `<d>` predecessor.
-        try_bypass_empty_block(&mut &mut ctx, f, b);
+        try_bypass_empty_block_generic(&mut &mut ctx, f, b);
 
         assert!(
             BasicBlock::from_id(&ctx, b).parent().is_none(),
@@ -1040,7 +1400,7 @@ mod tests {
         // Exercise the fold in isolation: a full `simplify_cfg` run would prune
         // the unreachable `<d>`, then merge the folded `goto <t>` into t, hiding
         // the very Branch this test inspects.
-        try_fold_cbranch(&mut &mut ctx, a);
+        try_fold_cbranch_generic(&mut &mut ctx, a);
 
         let term = BasicBlock::from_id(&ctx, a)
             .iter()
