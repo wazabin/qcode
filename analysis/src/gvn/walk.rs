@@ -368,7 +368,7 @@ fn reachable_from<'str>(
             // Ownership, not storage: a reattributed own block (owner == the
             // walked function, stored in a foreign arena pre-normalization) is
             // followed; a block owned by another function is not.
-            if host.function(owner).block(succ).parent == Some(owner) && seen.insert(succ) {
+            if host.block(succ).parent == Some(owner) && seen.insert(succ) {
                 stack.push(succ);
             }
         }
