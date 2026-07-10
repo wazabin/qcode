@@ -4,7 +4,7 @@ use qcode::{
     context::Context,
     space::{SpaceId, SpaceType},
     value::{
-        FunctionId, FunctionRef, InstructionRef, ValueId, ValueRef, Varnode,
+        FunctionId, ValueId, ValueRef, Varnode,
         insn::{Binop, IntBinop, Mnemonic},
         util::base_ref::HostRef,
     },
@@ -237,7 +237,7 @@ impl<'a, 'str> Analysis<'a, 'str> {
                 // Decide what to peel while the ctx borrow from `mnemonic()` is live,
                 // copying out only the owned operands needed, then act after it ends
                 // (the recursive resolve takes `&mut self`).
-                let action = match InstructionRef::new(self.host, id).mnemonic() {
+                let action = match self.host.insn_ref(id).mnemonic() {
                     Mnemonic::Binop(bin)
                         if matches!(bin.op, Binop::Int(IntBinop::Add | IntBinop::Sub)) =>
                     {
@@ -519,9 +519,9 @@ impl RegisterBase {
     ) -> AliasResult {
         let host = host.into();
         let mut pointer_uses: Vec<(ValueId, SpaceId, usize)> = Vec::new();
-        for block in FunctionRef::new(host, fun_id).blocks() {
+        for block in host.function_ref(fun_id).blocks() {
             for &iid in block.instruction_ids() {
-                match InstructionRef::new(host, iid).mnemonic() {
+                match host.insn_ref(iid).mnemonic() {
                     Mnemonic::Load(load) => pointer_uses.push((load.ptr, load.space, load.size)),
                     Mnemonic::Store(store) => {
                         pointer_uses.push((store.ptr, store.space, store.size))

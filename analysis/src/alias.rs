@@ -6,7 +6,7 @@ use qcode::{
     assumption::Proposition,
     space::SpaceId,
     value::{
-        BlockId, BlockParamRef, FunctionId, FunctionRef, ValueId, ValueRef, VarnodeId,
+        BlockId, FunctionId, ValueId, ValueRef, VarnodeId,
         insn::{Binop, IntBinop, Mnemonic},
         util::base_ref::HostRef,
     },
@@ -255,7 +255,7 @@ impl AliasResult {
         };
         let numbering = precompute_forms(host, fid);
         let mut own_frame_locals = HashSet::default();
-        for block in FunctionRef::new(host, fid).blocks() {
+        for block in host.function_ref(fid).blocks() {
             for insn in block.iter() {
                 let v = ValueId::Instruction(insn.id);
                 if let Some(FrameClass::Local) = frame_class(host.shared(), &numbering, sp, v) {
@@ -263,7 +263,7 @@ impl AliasResult {
                 }
             }
         }
-        let root_block = FunctionRef::new(host, fid).root().map(|r| r.id);
+        let root_block = host.function_ref(fid).root().map(|r| r.id);
         // Hoist the assumption lookups: they are fixed once the result is built
         // (a pass sets assumptions before building the oracle). A test that flips
         // an assumption after building must rebuild the result.
@@ -314,7 +314,7 @@ fn frame_is_captured(host: HostRef, fid: FunctionId, numbering: &Numbering, sp: 
             Some(FrameClass::Local)
         )
     };
-    for block in FunctionRef::new(host, fid).blocks() {
+    for block in host.function_ref(fid).blocks() {
         for insn in block.iter() {
             match insn.mnemonic() {
                 Mnemonic::Store(s) if is_own_frame(s.src) => {
@@ -323,7 +323,7 @@ fn frame_is_captured(host: HostRef, fid: FunctionId, numbering: &Numbering, sp: 
                 Mnemonic::Call(c) => {
                     for (j, &arg) in c.args.iter().enumerate() {
                         if is_own_frame(arg)
-                            && !FunctionRef::new(host, c.target)
+                            && !host.function_ref(c.target)
                                 .param_attr(j)
                                 .is_some_and(|a| a.nocapture)
                         {
@@ -380,7 +380,7 @@ impl FrameInfo {
         match v {
             ValueId::Literal(_) => P::GLOBAL_STATIC,
             ValueId::BlockParam(pid) => {
-                let bp = BlockParamRef::new(host, pid);
+                let bp = host.param_ref(pid);
                 match bp.origin() {
                     // A globalized-global slot (`@glob_<addr>`): origin is the literal.
                     Some(ValueId::Literal(_)) => P::GLOBAL_STATIC,
@@ -400,7 +400,7 @@ impl FrameInfo {
                     _ => P::OPAQUE,
                 }
             }
-            ValueId::Instruction(id) => match host.instruction(id).mnemonic() {
+            ValueId::Instruction(id) => match host.insn_ref(id).mnemonic() {
                 Mnemonic::Load(_) => P::LOADED,
                 Mnemonic::Call(c) => self.classify_call_result(host, c),
                 Mnemonic::Zext(z) => self.provenance(host, z.src),
@@ -441,7 +441,7 @@ impl FrameInfo {
     /// and stays correctly non-disjoint from the frame.
     fn classify_call_result(&self, host: HostRef, c: &qcode::value::insn::Call) -> Provenance {
         use Provenance as P;
-        let callee = FunctionRef::new(host, c.target);
+        let callee = host.function_ref(c.target);
         let all_nocapture = c.clobbers.is_empty()
             && (0..c.args.len()).all(|j| callee.param_attr(j).is_some_and(|a| a.nocapture));
         if !all_nocapture {
