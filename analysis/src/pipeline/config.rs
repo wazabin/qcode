@@ -23,7 +23,9 @@ use super::pass::{
     DynFunctionPass, DynPass, MINT_RESERVE, PipelineEnv, RegisteredPass, install_minted,
     known_pass_names, make_pass, replay_effects,
 };
-use super::{FunctionBody, ModuleView, PipelineProgress, ProgressSink, YieldSignal};
+use super::{
+    ContextView, FunctionBody, ModuleView, PipelineProgress, ProgressSink, YieldSignal,
+};
 
 /// The canonical default pipeline, compiled into the binary. Used by
 /// `analyze_default` and as the GUI's starting pipeline.
@@ -1568,11 +1570,11 @@ async fn run_function_stage(
             let reserved = reservations.remove(&fun_id).unwrap_or_default();
             let mut body = FunctionBody::new(fun_id, fun, reserved);
             let function_changed = {
-                let view = ModuleView::new(ctx, env);
+                let view = ContextView::new(ctx, env);
                 run_one_function(
                     passes,
-                    &view,
                     &mut body,
+                    view,
                     cache,
                     &mut elapsed,
                     &stage.name,
@@ -1655,8 +1657,8 @@ async fn run_function_stage(
 #[allow(clippy::too_many_arguments)]
 fn run_one_function<'str>(
     passes: &[Box<dyn DynFunctionPass>],
-    m: &ModuleView<'_, 'str>,
     body: &mut FunctionBody<'str>,
+    cx: ContextView<'_, 'str>,
     cache: &mut FixpointCache,
     elapsed: &mut HashMap<&'static str, (std::time::Duration, usize, usize)>,
     stage_name: &str,
@@ -1681,7 +1683,7 @@ fn run_one_function<'str>(
             #[cfg(not(target_arch = "wasm32"))]
             let started = std::time::Instant::now();
             let pass_changed = p
-                .run_checked(m, body)
+                .run_checked(body, cx)
                 .map_err(|e| format!("{}: {e}", p.name()))?;
             if pass_changed {
                 cache.mark_dirty(fun_id);
@@ -1699,7 +1701,7 @@ fn run_one_function<'str>(
                 // Fingerprint the checked-out body through its own host (it is
                 // absent from `ctx`, so `function_fingerprint` cannot see it).
                 let fp = fingerprint_display(qcode::value::FunctionRef::new(
-                    qcode::value::util::host_mut::HostMut::read_host(&body.host(m)),
+                    qcode::value::util::host_mut::HostMut::read_host(&body.host(cx)),
                     fun_id,
                 ));
                 if tracer.observe(&tracer_label, iters + 1, p.name(), fp) {
@@ -1827,8 +1829,7 @@ fn run_stage_parallel(
     //    the master thread pumps live while the workers compute.
     let (tx, rx) = std::sync::mpsc::channel::<PipelineProgress>();
     let outcomes: Vec<Result<WorkerOutput, String>> = {
-        let view = ModuleView::new(ctx, env);
-        let view = &view;
+        let view = ContextView::new(ctx, env);
         let stage_label = &stage_label;
         std::thread::scope(|scope| {
             let mut handles = Vec::new();
@@ -1849,8 +1850,8 @@ fn run_stage_parallel(
                         let tx = &tx;
                         let changed = run_one_function(
                             passes,
-                            view,
                             &mut e.body,
+                            view,
                             &mut local_cache,
                             &mut local_elapsed,
                             stage_label,

@@ -46,7 +46,7 @@ use qcode::value::{
     util::{base_ref::HostRef, host_mut::HostMut},
 };
 
-use crate::{AliasResult, FunctionBody, FunctionPass, ModuleView};
+use crate::{AliasResult, ContextView, FunctionBody, FunctionPass};
 
 #[derive(Default)]
 pub struct Licm;
@@ -60,8 +60,8 @@ impl FunctionPass for Licm {
 
     fn run<'str>(
         &self,
-        m: &ModuleView<'_, 'str>,
         f: &mut FunctionBody<'str>,
+        m: ContextView<'_, 'str>,
     ) -> Result<bool, String> {
         let fid = f.id();
         let aliases = build_aliases(m, f.host(m).read_host(), fid);
@@ -362,7 +362,7 @@ fn hoist_into_preheader<'str, H: HostMut<'str>>(
 /// load hoisting sees per-slot stack locations and frame freshness. Returns
 /// `None` when no stack pointer is registered (arch-agnostic test envs).
 fn build_aliases<'a, 'str: 'a>(
-    m: &ModuleView<'_, 'str>,
+    m: ContextView<'_, 'str>,
     host: HostRef<'a, 'str>,
     fun_id: FunctionId,
 ) -> Option<AliasResult> {

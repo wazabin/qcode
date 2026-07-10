@@ -35,7 +35,7 @@ use qcode::{
     value::{Function, FunctionId, RegisterId, Renameable, Varnode, VarnodeId},
 };
 
-use super::{ArchConfig, CallingConvention, FunctionBody, ModuleView};
+use super::{ArchConfig, CallingConvention, ContextView, FunctionBody, ModuleView};
 use crate::structure::Program;
 use crate::RegisterBase;
 
@@ -146,8 +146,8 @@ pub trait DynFunctionPass: Send + Sync {
     /// [`Effects`]: super::Effects
     fn run_checked<'str>(
         &self,
-        m: &ModuleView<'_, 'str>,
         body: &mut FunctionBody<'str>,
+        cx: ContextView<'_, 'str>,
     ) -> Result<bool, String>;
 
     /// Whether this pass may mint functions (see [`FunctionPass::MINTS`]).
@@ -183,8 +183,8 @@ pub trait FunctionPass: Default {
     fn description(&self) -> &'static str;
     fn run<'str>(
         &self,
-        m: &ModuleView<'_, 'str>,
         f: &mut FunctionBody<'str>,
+        cx: ContextView<'_, 'str>,
     ) -> Result<bool, String>;
 }
 
@@ -221,10 +221,10 @@ impl<T: FunctionPass + Send + Sync> DynFunctionPass for FunctionPassAdapter<T> {
     }
     fn run_checked<'str>(
         &self,
-        m: &ModuleView<'_, 'str>,
         body: &mut FunctionBody<'str>,
+        cx: ContextView<'_, 'str>,
     ) -> Result<bool, String> {
-        FunctionPass::run(&self.inner, m, body)
+        FunctionPass::run(&self.inner, body, cx)
     }
     fn mints(&self) -> bool {
         T::MINTS
@@ -252,8 +252,8 @@ impl<T: FunctionPass + Send + Sync> DynFunctionPass for FunctionPassAdapter<T> {
         let fun = ctx.checkout_function(fun_id);
         let mut body = FunctionBody::new(fun_id, fun, reserved);
         let changed = {
-            let view = ModuleView::new(ctx, env);
-            self.run_checked(&view, &mut body)?
+            let view = ContextView::new(ctx, env);
+            self.run_checked(&mut body, view)?
         };
         let (fun, effects, minted, _unused) = body.into_parts();
         // Check-in protocol, in the driver's order: install minted callees first

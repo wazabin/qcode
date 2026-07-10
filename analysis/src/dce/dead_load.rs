@@ -2120,7 +2120,7 @@ mod tests {
 
 // ----- pass ------------------------------------------------------------------
 
-use crate::{FunctionBody, FunctionPass, ModuleView};
+use crate::{ContextView, FunctionBody, FunctionPass};
 
 #[derive(Default)]
 pub struct DeadLoad;
@@ -2132,8 +2132,8 @@ impl FunctionPass for DeadLoad {
     }
     fn run<'str>(
         &self,
-        m: &ModuleView<'_, 'str>,
         f: &mut FunctionBody<'str>,
+        m: ContextView<'_, 'str>,
     ) -> Result<bool, String> {
         let fid = f.id();
         let mut host = f.host(m);
@@ -2162,8 +2162,8 @@ impl FunctionPass for DeadStore {
     }
     fn run<'str>(
         &self,
-        m: &ModuleView<'_, 'str>,
         f: &mut FunctionBody<'str>,
+        m: ContextView<'_, 'str>,
     ) -> Result<bool, String> {
         let fid = f.id();
         let dead_regs = m.env().cfg.dead_flag_regs.clone();
@@ -2187,7 +2187,7 @@ crate::register_function_pass!(DeadStore);
 /// checked-out `host`; the module-wide alias base and stack-pointer register come
 /// from the [`ModuleView`].
 fn frame_aware_aliases<'a, 'str: 'a>(
-    m: &ModuleView<'_, 'str>,
+    m: ContextView<'_, 'str>,
     host: HostRef<'a, 'str>,
     fun_id: FunctionId,
 ) -> AliasResult {

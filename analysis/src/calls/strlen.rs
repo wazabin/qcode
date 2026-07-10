@@ -30,7 +30,7 @@ use qcode::{
 };
 
 use crate::loop_info::{delete_private_loop, incoming, is_increment, literal, users_of};
-use crate::pipeline::{FunctionBody, ModuleView};
+use crate::pipeline::{ContextView, FunctionBody};
 use crate::{FunctionPass, register_function_pass};
 
 fn is_temp(host: HostRef, s: SpaceId) -> bool {
@@ -360,7 +360,7 @@ fn apply_strlen<'str, H: HostMut<'str>>(host: &mut H, fid: FunctionId, m: &Strle
 
 /// Recognize a bounded NUL-scan in this (pure) function, rewriting its escaping
 /// count to `len(take_while(arr))`. Returns `true` if changed.
-fn recognize_strlen_at<'str>(m: &ModuleView<'_, 'str>, body: &mut FunctionBody<'str>) -> bool {
+fn recognize_strlen_at<'str>(m: ContextView<'_, 'str>, body: &mut FunctionBody<'str>) -> bool {
     let fid = body.id();
     if !body.read_host(m).function_ref(fid).is_pure() {
         return false;
@@ -532,7 +532,7 @@ fn apply_strlen_ptr<'str, H: HostMut<'str>>(host: &mut H, m: &StrlenPtrMatch) ->
 
 /// Recognize a raw-pointer NUL-scan in this function, rewriting its `end - base`
 /// length to `len(take_while(base))`. Returns `true` if changed.
-fn recognize_strlen_ptr<'str>(m: &ModuleView<'_, 'str>, body: &mut FunctionBody<'str>) -> bool {
+fn recognize_strlen_ptr<'str>(m: ContextView<'_, 'str>, body: &mut FunctionBody<'str>) -> bool {
     let Some(sm) = try_match_strlen_ptr(body.read_host(m), body.id()) else {
         return false;
     };
@@ -549,8 +549,8 @@ impl FunctionPass for Strlen {
     }
     fn run<'str>(
         &self,
-        m: &ModuleView<'_, 'str>,
         f: &mut FunctionBody<'str>,
+        m: ContextView<'_, 'str>,
     ) -> Result<bool, String> {
         // Layer 1 (at-form snapshot) then Layer 2 (raw char*); mutually exclusive
         // on any one function.

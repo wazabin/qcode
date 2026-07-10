@@ -281,7 +281,7 @@ fn build_index<'str, 'ctx, Ctx: HostMut<'str>>(
 
 // ----- pass ------------------------------------------------------------------
 
-use crate::{FunctionBody, FunctionPass, ModuleView};
+use crate::{ContextView, FunctionBody, FunctionPass};
 
 impl FunctionPass for ArrayReads {
     const NAME: &'static str = "array_reads";
@@ -292,8 +292,8 @@ impl FunctionPass for ArrayReads {
 
     fn run<'str>(
         &self,
-        m: &ModuleView<'_, 'str>,
         f: &mut FunctionBody<'str>,
+        m: ContextView<'_, 'str>,
     ) -> Result<bool, String> {
         let fid = f.id();
         let mut host = f.host(m);

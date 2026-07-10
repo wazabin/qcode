@@ -4,7 +4,7 @@ use qcode::value::{
     util::host_mut::HostMut,
 };
 
-use crate::{FunctionBody, FunctionPass, ModuleView};
+use crate::{ContextView, FunctionBody, FunctionPass};
 
 #[derive(Default)]
 pub struct SimplifyCfg;
@@ -18,8 +18,8 @@ impl FunctionPass for SimplifyCfg {
 
     fn run<'str>(
         &self,
-        m: &ModuleView<'_, 'str>,
         body: &mut FunctionBody<'str>,
+        m: ContextView<'_, 'str>,
     ) -> Result<bool, String> {
         let fid = body.id();
         let mut host = body.host(m);

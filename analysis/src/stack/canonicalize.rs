@@ -121,7 +121,7 @@ pub fn canonicalize_sp_slots<'str, H: HostMut<'str>>(
 
 // ----- pass ------------------------------------------------------------------
 
-use crate::{FunctionBody, FunctionPass, ModuleView};
+use crate::{ContextView, FunctionBody, FunctionPass};
 
 /// Runs [`canonicalize_sp_slots`] over a function, resolving `@SP` from the
 /// configured stack-pointer register. Replaces the legacy `brighten`/`lower_stack`
@@ -138,8 +138,8 @@ impl FunctionPass for CanonicalizeSpSlots {
     }
     fn run<'str>(
         &self,
-        m: &ModuleView<'_, 'str>,
         f: &mut FunctionBody<'str>,
+        m: ContextView<'_, 'str>,
     ) -> std::result::Result<bool, String> {
         let sp_reg = m.ctx().registers[&m.env().cfg.stack_pointer];
         let fid = f.id();

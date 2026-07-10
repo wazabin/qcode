@@ -25,7 +25,7 @@ use crate::loop_info::{
     cbranch_exit, delete_private_loop, incoming, is_loop_private, param_parent, param_pos,
     recognize_loops, users_of,
 };
-use crate::pipeline::{FunctionBody, ModuleView};
+use crate::pipeline::{ContextView, FunctionBody};
 use crate::{FunctionPass, register_function_pass};
 
 // ===========================================================================
@@ -203,7 +203,7 @@ fn body_uses_index(
 /// `map(body, enumerate(arr0))`, `body(tuple)` unpacking it. Returns `false` if
 /// the body is not a closed pure expression of `(index, element?)` (then nothing
 /// is changed — outlining is all-or-nothing and runs before any rewrite).
-fn apply<'str>(m: &ModuleView<'_, 'str>, body: &mut FunctionBody<'str>, mm: &MapMatch) -> bool {
+fn apply<'str>(m: ContextView<'_, 'str>, body: &mut FunctionBody<'str>, mm: &MapMatch) -> bool {
     let fid = body.id();
     let enum_id = IntrinsicId::from_name("enumerate").expect("enumerate registered");
     let (name, uses_index, tuple_ty) = {
@@ -382,7 +382,7 @@ fn apply<'str>(m: &ModuleView<'_, 'str>, body: &mut FunctionBody<'str>, mm: &Map
 /// are considered (the recognizer's coverage/totality reasoning relies on
 /// `array_promote` having functionalized the region). Returns `true` if changed.
 pub(crate) fn recognize_total_map<'str>(
-    m: &ModuleView<'_, 'str>,
+    m: ContextView<'_, 'str>,
     body: &mut FunctionBody<'str>,
 ) -> bool {
     let fid = body.id();
@@ -406,8 +406,8 @@ impl FunctionPass for LoopToMap {
     }
     fn run<'str>(
         &self,
-        m: &ModuleView<'_, 'str>,
         f: &mut FunctionBody<'str>,
+        m: ContextView<'_, 'str>,
     ) -> Result<bool, String> {
         Ok(recognize_total_map(m, f))
     }

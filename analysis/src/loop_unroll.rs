@@ -24,7 +24,7 @@ use qcode::value::{
     },
 };
 
-use crate::{FunctionBody, FunctionPass, ModuleView};
+use crate::{ContextView, FunctionBody, FunctionPass};
 
 const COMMENT_PREFIX: &str = "loop_unroll:";
 const MAX_UNROLL_ITERATIONS: u64 = 10;
@@ -68,8 +68,8 @@ impl FunctionPass for RecognizeSimpleLoops {
 
     fn run<'str>(
         &self,
-        m: &ModuleView<'_, 'str>,
         f: &mut FunctionBody<'str>,
+        m: ContextView<'_, 'str>,
     ) -> Result<bool, String> {
         let fid = f.id();
         let mut host = f.host(m);
@@ -88,8 +88,8 @@ impl FunctionPass for UnrollSimpleLoops {
 
     fn run<'str>(
         &self,
-        m: &ModuleView<'_, 'str>,
         f: &mut FunctionBody<'str>,
+        m: ContextView<'_, 'str>,
     ) -> Result<bool, String> {
         let fid = f.id();
         let mut host = f.host(m);

@@ -166,8 +166,8 @@ impl<'str> FunctionBody<'str> {
     /// its function — construct block/instruction refs and `Builder`s over it.
     ///
     /// [`HostMut`]: qcode::value::util::host_mut::HostMut
-    pub fn host<'a>(&'a mut self, m: &'a ModuleView<'_, 'str>) -> CheckedOut<'a, 'str> {
-        CheckedOut::new(&mut self.fun, self.id, m.ctx())
+    pub fn host<'a>(&'a mut self, cx: ContextView<'a, 'str>) -> CheckedOut<'a, 'str> {
+        CheckedOut::new(&mut self.fun, self.id, cx.shared_ctx())
     }
 
     /// The effect buffer (mutate) — passes push a self-rename claim here instead of
@@ -179,10 +179,10 @@ impl<'str> FunctionBody<'str> {
     /// A `Copy` read view over this body's owned function and the shared context
     /// — the recognizer-side twin of [`host`](Self::host) for passes that only
     /// need to *read* while holding other borrows.
-    pub fn read_host<'a>(&'a self, m: &'a ModuleView<'_, 'str>) -> HostRef<'a, 'str> {
+    pub fn read_host<'a>(&'a self, cx: ContextView<'a, 'str>) -> HostRef<'a, 'str> {
         HostRef::Checked {
             fun: &self.fun,
-            shared: m.ctx(),
+            shared: cx.shared_ctx(),
             id: self.id,
         }
     }
@@ -229,12 +229,12 @@ impl<'str> FunctionBody<'str> {
     /// Panics if `minted` was not minted by this body.
     pub fn host_with_minted<'a>(
         &'a mut self,
-        m: &'a ModuleView<'_, 'str>,
+        cx: ContextView<'a, 'str>,
         minted: FunctionId,
     ) -> (HostRef<'a, 'str>, CheckedOut<'a, 'str>) {
         let own = HostRef::Checked {
             fun: &self.fun,
-            shared: m.ctx(),
+            shared: cx.shared_ctx(),
             id: self.id,
         };
         let fun = self
@@ -243,7 +243,7 @@ impl<'str> FunctionBody<'str> {
             .find(|(id, _, _)| *id == minted)
             .map(|(_, _, f)| f)
             .expect("host_with_minted: not a function minted by this body");
-        (own, CheckedOut::new(fun, minted, m.ctx()))
+        (own, CheckedOut::new(fun, minted, cx.shared_ctx()))
     }
 
     /// Consume the body at check-in, yielding the reinstallable function, its

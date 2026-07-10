@@ -61,7 +61,7 @@ use qcode::{
 };
 
 use crate::loop_to_recursion::recognize_loop;
-use crate::pipeline::{FunctionBody, ModuleView};
+use crate::pipeline::{ContextView, FunctionBody};
 use crate::{FunctionPass, register_function_pass};
 
 #[derive(Default)]
@@ -77,8 +77,8 @@ impl FunctionPass for AccumulatorElim {
 
     fn run<'str>(
         &self,
-        m: &ModuleView<'_, 'str>,
         f: &mut FunctionBody<'str>,
+        m: ContextView<'_, 'str>,
     ) -> Result<bool, String> {
         Ok(accumulator_elim(m, f))
     }
@@ -86,7 +86,7 @@ impl FunctionPass for AccumulatorElim {
 
 register_function_pass!(AccumulatorElim);
 
-pub fn accumulator_elim<'str>(m: &ModuleView<'_, 'str>, body: &mut FunctionBody<'str>) -> bool {
+pub fn accumulator_elim<'str>(m: ContextView<'_, 'str>, body: &mut FunctionBody<'str>) -> bool {
     let host = body.id();
     let Some((model, plan)) = classify(body.read_host(m), host) else {
         return false;
@@ -259,7 +259,7 @@ struct Plan {
 }
 
 fn transform<'str>(
-    m: &ModuleView<'_, 'str>,
+    m: ContextView<'_, 'str>,
     body: &mut FunctionBody<'str>,
     model: &crate::loop_to_recursion::LoopModel,
     p: &Plan,

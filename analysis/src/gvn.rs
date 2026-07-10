@@ -159,7 +159,7 @@ pub(crate) fn gvn_host<'str, H: HostMut<'str>>(
 
 // ----- passes ----------------------------------------------------------------
 
-use crate::{FunctionBody, FunctionPass, ModuleView};
+use crate::{ContextView, FunctionBody, FunctionPass};
 use qcode::value::util::base_ref::HostRef;
 
 #[derive(Default)]
@@ -172,8 +172,8 @@ impl FunctionPass for ConstFold {
     }
     fn run<'str>(
         &self,
-        m: &ModuleView<'_, 'str>,
         f: &mut FunctionBody<'str>,
+        m: ContextView<'_, 'str>,
     ) -> Result<bool, String> {
         let fun_id = f.id();
         let mut host = f.host(m);
@@ -193,8 +193,8 @@ impl FunctionPass for Narrow {
     }
     fn run<'str>(
         &self,
-        m: &ModuleView<'_, 'str>,
         f: &mut FunctionBody<'str>,
+        m: ContextView<'_, 'str>,
     ) -> Result<bool, String> {
         let fun_id = f.id();
         let mut host = f.host(m);
@@ -211,7 +211,7 @@ crate::register_function_pass!(Narrow);
 /// frame freshness (a function's own locals never alias an incoming pointer). The
 /// stack pointer is `None` in arch-agnostic envs, leaving frame freshness inert.
 fn build_gvn_aliases<'a, 'str: 'a>(
-    m: &ModuleView<'_, 'str>,
+    m: ContextView<'_, 'str>,
     host: HostRef<'a, 'str>,
     fun_id: FunctionId,
 ) -> AliasResult {
@@ -233,8 +233,8 @@ impl FunctionPass for Gvn {
     }
     fn run<'str>(
         &self,
-        m: &ModuleView<'_, 'str>,
         f: &mut FunctionBody<'str>,
+        m: ContextView<'_, 'str>,
     ) -> Result<bool, String> {
         let fun_id = f.id();
         let mut host = f.host(m);

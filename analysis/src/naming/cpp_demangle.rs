@@ -14,7 +14,7 @@ use std::borrow::Cow;
 use cpp_demangle::DemangleOptions;
 use qcode::value::{FunctionRef, util::host_mut::HostMut};
 
-use crate::{FunctionBody, FunctionPass, ModuleView};
+use crate::{ContextView, FunctionBody, FunctionPass};
 
 pub struct CppDemangle {
     /// Precomputed in `Default`: rendered names omit parameter lists
@@ -41,8 +41,8 @@ impl FunctionPass for CppDemangle {
     // This pass doesn't need to be, but it's good practice to track changes in case you later add more functionality
     fn run<'str>(
         &self,
-        m: &ModuleView<'_, 'str>,
         f: &mut FunctionBody<'str>,
+        m: ContextView<'_, 'str>,
     ) -> Result<bool, String> {
         let fid = f.id();
         // Read the (checked-out) function's own name, decide the demangled form,

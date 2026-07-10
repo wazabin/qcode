@@ -22,7 +22,7 @@ use qcode::value::{
     util::{base_ref::HostRef, host_mut::HostMut},
 };
 
-use crate::{FunctionBody, FunctionPass, ModuleView};
+use crate::{ContextView, FunctionBody, FunctionPass};
 
 #[derive(Default)]
 pub struct NameThunks;
@@ -36,8 +36,8 @@ impl FunctionPass for NameThunks {
 
     fn run<'str>(
         &self,
-        m: &ModuleView<'_, 'str>,
         f: &mut FunctionBody<'str>,
+        m: ContextView<'_, 'str>,
     ) -> Result<bool, String> {
         let fid = f.id();
         // Read-only analysis of the checked-out body and the callee's *interface*

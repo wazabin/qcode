@@ -709,7 +709,7 @@ fn remove_dead_counted_loop_host<'str, H: HostMut<'str>>(host: &mut H, fun_id: F
 
 // ----- pass ------------------------------------------------------------------
 
-use crate::{FunctionBody, FunctionPass, ModuleView};
+use crate::{ContextView, FunctionBody, FunctionPass};
 
 #[derive(Default)]
 pub struct Dce;
@@ -721,8 +721,8 @@ impl FunctionPass for Dce {
     }
     fn run<'str>(
         &self,
-        m: &ModuleView<'_, 'str>,
         f: &mut FunctionBody<'str>,
+        m: ContextView<'_, 'str>,
     ) -> Result<bool, String> {
         let fun_id = f.id();
         let mut host = f.host(m);

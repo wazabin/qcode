@@ -45,7 +45,7 @@ use qcode::{
     },
 };
 
-use crate::pipeline::{FunctionBody, ModuleView};
+use crate::pipeline::{ContextView, FunctionBody};
 use crate::{FunctionPass, register_function_pass};
 
 #[derive(Default)]
@@ -61,8 +61,8 @@ impl FunctionPass for LoopToRecursion {
 
     fn run<'str>(
         &self,
-        m: &ModuleView<'_, 'str>,
         f: &mut FunctionBody<'str>,
+        m: ContextView<'_, 'str>,
     ) -> Result<bool, String> {
         Ok(loop_to_recursion(m, f))
     }
@@ -85,7 +85,7 @@ pub(crate) struct LoopModel {
     pub(crate) back_edges: Vec<(BlockId, Vec<ValueId>)>,
 }
 
-pub fn loop_to_recursion<'str>(m: &ModuleView<'_, 'str>, body: &mut FunctionBody<'str>) -> bool {
+pub fn loop_to_recursion<'str>(m: ContextView<'_, 'str>, body: &mut FunctionBody<'str>) -> bool {
     let Some(model) = recognize_loop(body.read_host(m), body.id()) else {
         return false;
     };
@@ -163,7 +163,7 @@ pub(crate) fn recognize_loop<'a, 'str: 'a>(
 }
 
 fn transform<'str>(
-    m: &ModuleView<'_, 'str>,
+    m: ContextView<'_, 'str>,
     body: &mut FunctionBody<'str>,
     model: &LoopModel,
 ) -> bool {

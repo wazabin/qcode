@@ -32,7 +32,7 @@ use qcode::{
     },
 };
 
-use crate::{FunctionBody, FunctionPass, ModuleView};
+use crate::{ContextView, FunctionBody, FunctionPass};
 
 #[derive(Default)]
 pub struct StructTyping;
@@ -46,8 +46,8 @@ impl FunctionPass for StructTyping {
 
     fn run<'str>(
         &self,
-        m: &ModuleView<'_, 'str>,
         f: &mut FunctionBody<'str>,
+        m: ContextView<'_, 'str>,
     ) -> Result<bool, String> {
         let fid = f.id();
         let mut host = f.host(m);

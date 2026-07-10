@@ -50,7 +50,7 @@ use crate::loop_info::{
     cbranch_exit, delete_private_loop, incoming, is_increment, is_loop_private, literal,
     param_parent, param_pos,
 };
-use crate::pipeline::{FunctionBody, ModuleView};
+use crate::pipeline::{ContextView, FunctionBody};
 use crate::{FunctionPass, register_function_pass};
 
 #[derive(Default)]
@@ -204,7 +204,7 @@ fn try_match(host: HostRef, fid: FunctionId) -> Option<ScanMatch> {
 /// Rewrite a matched fill loop: outline the `(acc, index)` body and replace the
 /// wide exit store with `store(ram, base <- concat(singleton(seed), scanl @body
 /// seed iota(N-1)))`. The residual loop is left for `dce`.
-fn apply<'str>(mv: &ModuleView<'_, 'str>, body: &mut FunctionBody<'str>, m: &ScanMatch) -> bool {
+fn apply<'str>(mv: ContextView<'_, 'str>, body: &mut FunctionBody<'str>, m: &ScanMatch) -> bool {
     let fid = body.id();
     let (index_ty, i64_ty, name) = {
         let host = body.read_host(mv);
@@ -436,8 +436,8 @@ impl FunctionPass for LoopToScan {
 
     fn run<'str>(
         &self,
-        m: &ModuleView<'_, 'str>,
         f: &mut FunctionBody<'str>,
+        m: ContextView<'_, 'str>,
     ) -> Result<bool, String> {
         if let Some(sm) = try_match(f.read_host(m), f.id()) {
             return Ok(apply(m, f, &sm));

@@ -57,7 +57,7 @@ use rumba_core::{
     varint::{VarInt, make_mask},
 };
 
-use crate::{FunctionBody, FunctionPass, ModuleView};
+use crate::{ContextView, FunctionBody, FunctionPass};
 
 #[derive(Default)]
 pub struct MbaSimplify;
@@ -71,8 +71,8 @@ impl FunctionPass for MbaSimplify {
 
     fn run<'str>(
         &self,
-        m: &ModuleView<'_, 'str>,
         body: &mut FunctionBody<'str>,
+        m: ContextView<'_, 'str>,
     ) -> Result<bool, String> {
         let fid = body.id();
         let mut host = body.host(m);

@@ -3597,7 +3597,7 @@ mod tests {
 
 // ----- pass ------------------------------------------------------------------
 
-use crate::{FunctionBody, FunctionPass, ModuleView};
+use crate::{ContextView, FunctionBody, FunctionPass};
 
 #[derive(Default)]
 pub struct Mem2RegPass;
@@ -3609,8 +3609,8 @@ impl FunctionPass for Mem2RegPass {
     }
     fn run<'str>(
         &self,
-        m: &ModuleView<'_, 'str>,
         f: &mut FunctionBody<'str>,
+        m: ContextView<'_, 'str>,
     ) -> Result<bool, String> {
         let fun_id = f.id();
         let ctx = m.ctx();

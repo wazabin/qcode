@@ -22,7 +22,7 @@ use qcode::{
     },
 };
 
-use crate::pipeline::{FunctionBody, ModuleView};
+use crate::pipeline::{ContextView, FunctionBody};
 
 /// Whether `m` is a pure value-computing op that may appear inside an outlined
 /// per-element body: arithmetic, casts, bit ops, aggregate projection. Anything
@@ -97,7 +97,7 @@ pub(crate) fn pure_slice<'a, 'str: 'a>(
 /// Returns `None` if the expression is not closed over `inputs` + literals (see
 /// [`pure_slice`]) — the caller then leaves the loop unrecognized.
 pub(crate) fn outline_expression<'str>(
-    m: &ModuleView<'_, 'str>,
+    m: ContextView<'_, 'str>,
     body: &mut FunctionBody<'str>,
     name: &str,
     result: ValueId,
@@ -130,7 +130,7 @@ pub(crate) fn outline_expression<'str>(
 /// Returns `None` if the expression is not closed over `(index, elem?)` + literals
 /// (see [`pure_slice`]).
 pub(crate) fn outline_tupled<'str>(
-    m: &ModuleView<'_, 'str>,
+    m: ContextView<'_, 'str>,
     body: &mut FunctionBody<'str>,
     name: &str,
     result: ValueId,
@@ -198,7 +198,7 @@ pub(crate) enum ScanElem {
 /// or if `elem_input` is given in scalar mode.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn outline_scan_body<'str>(
-    m: &ModuleView<'_, 'str>,
+    m: ContextView<'_, 'str>,
     body: &mut FunctionBody<'str>,
     name: &str,
     result: ValueId,
@@ -353,7 +353,7 @@ fn push_insn_into<'str, H: HostMut<'str>>(
 /// and returns the initial input→value map. Returns `None` when the mint pool is
 /// exhausted (the caller then leaves the loop unrecognized).
 fn outline_core<'str>(
-    m: &ModuleView<'_, 'str>,
+    m: ContextView<'_, 'str>,
     body: &mut FunctionBody<'str>,
     name: &str,
     result: ValueId,
