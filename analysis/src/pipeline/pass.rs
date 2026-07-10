@@ -241,7 +241,7 @@ impl<T: FunctionPass + Send + Sync> DynFunctionPass for FunctionPassAdapter<T> {
         // observed, never rendered); the stage driver's pooled path recycles.
         let reserved: Vec<FunctionId> = if T::MINTS {
             (0..MINT_RESERVE)
-                .map(|_| ctx.values.push_function(Function::sentinel()))
+                .map(|_| ctx.push_sentinel_function())
                 .collect()
         } else {
             Vec::new()
@@ -282,18 +282,19 @@ pub(super) const MINT_RESERVE: usize = 2;
 pub(super) fn install_minted<'str>(
     ctx: &mut Context<'str>,
     pass: &str,
-    minted: Vec<(FunctionId, qcode::value::Function<'str>)>,
+    minted: Vec<super::Minted<'str>>,
 ) -> Result<Vec<FunctionId>, String> {
     let mut installed = Vec::with_capacity(minted.len());
-    for (id, mut fun) in minted {
+    for (id, mut interface, body) in minted {
         debug_assert!(
-            ctx.values.functions[id].is_sentinel(),
+            ctx.values.interfaces[id].is_sentinel(),
             "{pass}: minted id {id:?} does not hold a reserved sentinel slot"
         );
-        let name = std::mem::take(&mut fun.name);
+        let name = std::mem::take(&mut interface.name);
         let unique = ctx.get_unique_name(name);
-        fun.name = unique.clone();
-        ctx.values.functions.replace(id, fun);
+        interface.name = unique.clone();
+        ctx.values.functions.replace(id, body);
+        ctx.values.interfaces.replace(id, interface);
         ctx.update_name(unique, id.into(), None)
             .map_err(|e| format!("{pass}: minted-function name registration failed: {e}"))?;
         installed.push(id);

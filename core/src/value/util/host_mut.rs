@@ -7,8 +7,8 @@
 //! implemented for both the whole module (`&mut Context`, behaviour-identical to
 //! today) and a single checked-out function ([`CheckedOut`]).
 //!
-//! A checked-out function has been swapped out of the module registry (its slot
-//! holds a [`Function::sentinel`]); its arenas live in an owned `&mut Function`,
+//! A checked-out function's body has been swapped out of the module registry (its
+//! slot holds an empty body); its arenas live in an owned `&mut Function`,
 //! and all *shared* data (types, varnodes, spaces, registers, name map) stays in
 //! the module. `HostMut` routes each composite-id write to the arena that owns it:
 //! the owned function when `id.func` is the checked-out one, and it **panics** on
@@ -33,8 +33,8 @@ use crate::{
 use super::base_ref::HostRef;
 
 /// A single function checked out of `shared` for exclusive mutation. `fun`'s slot
-/// in `shared.values.functions[id]` currently holds a [`Function::sentinel`]; its
-/// real arenas are owned here.
+/// in `shared.values.functions[id]` currently holds an empty body (its interface
+/// stays in `shared.values.interfaces[id]`); its real arenas are owned here.
 ///
 /// Out of scope (and asserted against on construction): a function with
 /// *reattributed* blocks — a roster block stored in, or parented to, a different

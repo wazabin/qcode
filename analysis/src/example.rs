@@ -17,7 +17,7 @@ impl FunctionPass for ExamplePass {
         _m: &ModuleView<'_, 'str>,
         f: &mut FunctionBody<'str>,
     ) -> Result<bool, String> {
-        let _name = f.function().name.to_string();
+        let _name = _m.ctx().values.interfaces[f.id()].name.to_string();
 
         // TODO: log!(name)
 

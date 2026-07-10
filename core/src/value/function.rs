@@ -38,9 +38,11 @@ pub struct FunctionId(u32);
 /// function *body* (arenas, roster, users, local names) — everything only the
 /// function's own passes touch.
 ///
-/// In this stage the interface lives inline inside [`Function`] (which
-/// [`Deref`](std::ops::Deref)s to it so existing `function.name` / `.signature`
-/// call sites are untouched); a later stage hoists it into its own registry.
+/// Interfaces are stored in their own
+/// [`ValueRegistry::interfaces`](crate::value::registry::ValueRegistry::interfaces)
+/// registry, held in lockstep with the function bodies under the same
+/// [`FunctionId`] and never checked out — so a caller always reads the real
+/// interface even while a callee's body is checked out to a worker.
 #[derive(Clone, Default, serde::Serialize, serde::Deserialize)]
 pub struct FunctionInterface<'str> {
     /// The function's name.
@@ -64,13 +66,12 @@ pub struct FunctionInterface<'str> {
     pub kind: FunctionKind,
 }
 
+/// A function *body*: arenas, roster, root, reverse use-def, local names. The
+/// caller-reasoning surface lives separately in [`FunctionInterface`], stored in
+/// [`ValueRegistry::interfaces`](crate::value::registry::ValueRegistry::interfaces)
+/// under the same [`FunctionId`].
 #[derive(Clone, serde::Serialize, serde::Deserialize)]
 pub struct Function<'str> {
-    /// The caller-reasoning surface (name, address, kind, external-ness,
-    /// signature). [`Function`] derefs to this, so `f.name`, `f.signature`, etc.
-    /// resolve here transparently.
-    pub interface: FunctionInterface<'str>,
-
     /// The entry block (dominates all other blocks in this function).
     pub root: Option<BlockId>,
 
@@ -148,86 +149,40 @@ pub enum FunctionKind {
     Sentinel,
 }
 
-impl<'str> std::ops::Deref for Function<'str> {
-    type Target = FunctionInterface<'str>;
-    fn deref(&self) -> &Self::Target {
-        &self.interface
+impl<'str> FunctionInterface<'str> {
+    /// A fresh interface named `name`, with default (empty) signature/kind.
+    pub fn new(name: Cow<'str, str>) -> Self {
+        Self {
+            name,
+            address: None,
+            is_external: false,
+            signature: None,
+            kind: FunctionKind::Machine,
+        }
     }
-}
 
-impl std::ops::DerefMut for Function<'_> {
-    fn deref_mut(&mut self) -> &mut Self::Target {
-        &mut self.interface
+    /// The interface of a never-observed placeholder holding a reserved registry
+    /// slot (the minting pool, ruling 5). Tagged [`FunctionKind::Sentinel`] so
+    /// every function-iteration surface skips it.
+    pub fn sentinel() -> Self {
+        Self {
+            kind: FunctionKind::Sentinel,
+            ..Self::new(Cow::Borrowed(""))
+        }
+    }
+
+    /// Whether this is a never-observed placeholder slot (see
+    /// [`FunctionKind::Sentinel`]).
+    pub fn is_sentinel(&self) -> bool {
+        self.kind == FunctionKind::Sentinel
     }
 }
 
 impl<'str> Function<'str> {
-    fn new(name: Cow<'str, str>) -> Self {
+    /// An empty function *body*: no root, empty arenas. The interface lives
+    /// separately in [`ValueRegistry::interfaces`](crate::value::registry::ValueRegistry::interfaces).
+    pub fn empty_body() -> Self {
         Self {
-            interface: FunctionInterface {
-                name,
-                address: None,
-                is_external: false,
-                signature: None,
-                kind: FunctionKind::Machine,
-            },
-            root: None,
-            insns: Registry::default(),
-            blocks: Registry::default(),
-            roster: Vec::new(),
-            params: Registry::default(),
-            edges: Registry::default(),
-            instruction_addrs: BTreeSet::new(),
-            names: crate::context::NameTable::default(),
-            users: FxHashMap::default(),
-        }
-    }
-
-    /// An empty placeholder function holding a registry slot for a reserved
-    /// function id (the minting pool, `PARALLEL_PASSES.md` ruling 3). Tagged
-    /// [`FunctionKind::Sentinel`] so every function-iteration surface skips it —
-    /// it is never observed by a pass and never rendered.
-    pub fn sentinel() -> Self {
-        let mut f = Self::new(Cow::Borrowed(""));
-        f.kind = FunctionKind::Sentinel;
-        f
-    }
-
-    /// A detached function shell for [minting] inside a checked-out function
-    /// pass: named (raw — global uniquification happens when the driver installs
-    /// it at check-in), empty-bodied, registered nowhere. The minting machinery
-    /// builds its body through a `CheckedOut` host over its reserved id and
-    /// installs it into the registry at check-in.
-    ///
-    /// [minting]: crate::value::Function#method.sentinel
-    pub fn detached(name: Cow<'str, str>) -> Self {
-        Self::new(name)
-    }
-
-    /// Whether this is a never-observed placeholder holding a reserved registry
-    /// slot (see [`FunctionKind::Sentinel`]).
-    pub fn is_sentinel(&self) -> bool {
-        self.kind == FunctionKind::Sentinel
-    }
-
-    /// A checkout placeholder that preserves this function's *published
-    /// interface* — everything a *caller* reads about it — while carrying an
-    /// empty body. Unlike [`sentinel`](Self::sentinel), which is a blank slot,
-    /// this shell answers interface queries (`name`, `address`, `is_external`,
-    /// `signature` and everything under it: purity, `clobbered_regs`,
-    /// `written_spaces`, `param_attr`, `input_regs`, `is_externally_resolved`,
-    /// and `kind`) exactly as the real function would.
-    ///
-    /// Under the parallel driver a worker reading a co-checked-out callee's
-    /// interface through the shared `&Context` must see the callee's real
-    /// interface, not a blank sentinel. The body arenas stay empty because a
-    /// checked-out function's *body* is never a legitimate read (V2 passes never
-    /// read another function's body except the stage-invariant pure-bodies view).
-    /// Sequentially this changes nothing: interface reads of a checked-out
-    /// function never occurred.
-    pub fn interface_shell(&self) -> Self {
-        Self {
-            interface: self.interface.clone(),
             root: None,
             insns: Registry::default(),
             blocks: Registry::default(),
@@ -297,7 +252,9 @@ impl<'str> Function<'str> {
         ctx: &'ctx mut Context<'str>,
         name: Cow<'str, str>,
     ) -> Result<FunctionMutRef<'str, 'ctx>> {
-        let id = ctx.values.push_function(Function::new(name.clone()));
+        let id = ctx
+            .values
+            .push_function(FunctionInterface::new(name.clone()), Function::empty_body());
         ctx.update_name(name, id.into(), None)?;
         Ok(Self::from_id_mut(ctx, id))
     }
@@ -308,7 +265,7 @@ impl<'str> Function<'str> {
         name: Cow<'str, str>,
     ) -> Result<FunctionMutRef<'str, 'ctx>> {
         let mut function = Self::make(ctx, name)?;
-        function.inner_mut().kind = FunctionKind::Lambda;
+        function.interface_mut().kind = FunctionKind::Lambda;
         function.set_is_pure(true);
         function.set_pure_reg(true);
         Ok(function)
@@ -325,7 +282,9 @@ impl<'str> Function<'str> {
             None => Cow::Owned(format!("fn_{address:x}")),
         };
 
-        let id = ctx.values.push_function(Function::new(name.clone()));
+        let id = ctx
+            .values
+            .push_function(FunctionInterface::new(name.clone()), Function::empty_body());
 
         Self::from_id_mut(ctx, id)
             .with_name(name)
@@ -344,7 +303,7 @@ impl<'str> Function<'str> {
         name: Option<Cow<'str, str>>,
     ) -> FunctionMutRef<'str, 'ctx> {
         let mut f = Self::make_at_addr(ctx, address, name);
-        f.inner_mut().is_external = true;
+        f.interface_mut().is_external = true;
         f
     }
 
@@ -368,23 +327,29 @@ where
         self.host().function(self.id)
     }
 
+    /// This function's published interface (never checked out; always read from
+    /// the shared registry).
+    fn interface(&'s self) -> &'ctx FunctionInterface<'str> {
+        self.host().interface(self.id)
+    }
+
     fn size(&self) -> usize {
         0
     }
 
     /// The `address` of the inner `Function`.
     pub fn address(&'s self) -> Option<u64> {
-        self.inner().address
+        self.interface().address
     }
 
     /// Whether the inner `Function` is external.
     pub fn is_external(&'s self) -> bool {
-        self.inner().is_external
+        self.interface().is_external
     }
 
     /// A reference to the signature of the inner `Function`, if any.
     pub fn signature(&'s self) -> Option<&'ctx FunctionSignature> {
-        self.inner().signature.as_ref()
+        self.interface().signature.as_ref()
     }
 
     /// This function's instructions that use `value` as an operand. See
@@ -411,7 +376,7 @@ where
     /// exactly its [`clobbered_regs`](Self::clobbered_regs). See
     /// [`FunctionSignature::externally_resolved`].
     pub fn is_externally_resolved(&'s self) -> bool {
-        self.inner()
+        self.interface()
             .signature
             .as_ref()
             .is_some_and(|s| s.externally_resolved)
@@ -422,7 +387,7 @@ where
     /// argument escapes and may be written through). See
     /// [`FunctionSignature::param_attrs`].
     pub fn param_attr(&'s self, index: usize) -> Option<ParamAttrs> {
-        self.inner()
+        self.interface()
             .signature
             .as_ref()
             .and_then(|s| s.param_attrs.as_ref())
@@ -432,7 +397,7 @@ where
 
     /// The full per-parameter attribute vector, if analyzed.
     pub fn param_attrs(&'s self) -> Option<&'ctx [ParamAttrs]> {
-        self.inner()
+        self.interface()
             .signature
             .as_ref()
             .and_then(|s| s.param_attrs.as_deref())
@@ -440,7 +405,7 @@ where
 
     /// Registers concretely written by this function, as set by analysis.
     pub fn clobbered_regs(&'s self) -> Option<&'ctx [VarnodeId]> {
-        self.inner()
+        self.interface()
             .signature
             .as_ref()
             .and_then(|s| s.clobbered.as_deref())
@@ -451,7 +416,7 @@ where
     /// written); `None` means unknown/unbounded. See
     /// [`FunctionSignature::written_spaces`].
     pub fn written_spaces(&'s self) -> Option<&'ctx [crate::space::SpaceId]> {
-        self.inner()
+        self.interface()
             .signature
             .as_ref()
             .and_then(|s| s.written_spaces.as_deref())
@@ -461,7 +426,10 @@ where
     /// side effects into a pure value function. See
     /// [`FunctionSignature::pure_reg`].
     pub fn is_pure_reg(&'s self) -> bool {
-        self.inner().signature.as_ref().is_some_and(|s| s.pure_reg)
+        self.interface()
+            .signature
+            .as_ref()
+            .is_some_and(|s| s.pure_reg)
     }
 
     /// Whether argpromote has functionalized *every* side-effect channel of this
@@ -469,16 +437,19 @@ where
     /// touching no caller-visible memory or registers. Strictly stronger than
     /// [`is_pure_reg`](Self::is_pure_reg). See [`FunctionSignature::is_pure`].
     pub fn is_pure(&'s self) -> bool {
-        self.inner().signature.as_ref().is_some_and(|s| s.is_pure)
+        self.interface()
+            .signature
+            .as_ref()
+            .is_some_and(|s| s.is_pure)
     }
 
     /// Whether this is a pure value-level lambda rather than a machine function.
     pub fn is_lambda(&'s self) -> bool {
-        self.inner().kind == FunctionKind::Lambda
+        self.interface().kind == FunctionKind::Lambda
     }
 
     pub fn kind(&'s self) -> FunctionKind {
-        self.inner().kind
+        self.interface().kind
     }
 
     /// Registers read before written (function inputs), as inferred by analysis.
@@ -493,7 +464,7 @@ where
                 as the call interface; this remains only for the conventional/external path."
     )]
     pub fn input_regs(&'s self) -> Option<&'ctx [VarnodeId]> {
-        self.inner()
+        self.interface()
             .signature
             .as_ref()
             .and_then(|s| s.inputs.as_deref())
@@ -526,7 +497,7 @@ where
         // `return_address` slot). The source of truth for bodyless externals,
         // which have neither a root block nor an inferred input-register list.
         if let Some(name) = self
-            .inner()
+            .interface()
             .signature
             .as_ref()
             .and_then(|s| s.input_names.as_ref())
@@ -556,7 +527,7 @@ where
     /// Registers saved and restored unchanged (preserved across calls), as
     /// inferred by analysis.
     pub fn saved_regs(&'s self) -> Option<&'ctx [VarnodeId]> {
-        self.inner()
+        self.interface()
             .signature
             .as_ref()
             .and_then(|s| s.saved.as_deref())
@@ -565,14 +536,17 @@ where
     /// The net change this function applies to the stack pointer between entry
     /// and return, as inferred by analysis. See [`FunctionSignature::stack_delta`].
     pub fn stack_delta(&'s self) -> Option<i64> {
-        self.inner().signature.as_ref().and_then(|s| s.stack_delta)
+        self.interface()
+            .signature
+            .as_ref()
+            .and_then(|s| s.stack_delta)
     }
 
     /// Whether this function performs an unresolved/dynamic stack read (or
     /// forwards a stack pointer into one). See
     /// [`FunctionSignature::reads_unbounded_stack`].
     pub fn reads_unbounded_stack(&'s self) -> bool {
-        self.inner()
+        self.interface()
             .signature
             .as_ref()
             .is_some_and(|s| s.reads_unbounded_stack)
@@ -582,7 +556,7 @@ where
     /// may read it unboundedly. See
     /// [`FunctionSignature::frame_escapes_to_unbounded`].
     pub fn frame_escapes_to_unbounded(&'s self) -> bool {
-        self.inner()
+        self.interface()
             .signature
             .as_ref()
             .is_some_and(|s| s.frame_escapes_to_unbounded)
@@ -590,7 +564,7 @@ where
 
     /// The name of the inner `Function`.
     pub fn name(&'s self) -> &'ctx str {
-        self.inner().name.as_ref()
+        self.interface().name.as_ref()
     }
 
     /// The addresses of every machine instruction lifted into this function, in
@@ -820,7 +794,7 @@ impl<'s, 'ctx: 's, 'str: 'ctx> WithHost<'s, 'ctx, 'str> for FunctionRef<'str, 'c
 
 impl Named for FunctionRef<'_, '_> {
     fn name(&self) -> Option<&str> {
-        Some(self.ctx.function(self.id).name.as_ref())
+        Some(self.ctx.interface(self.id).name.as_ref())
     }
 }
 
@@ -900,16 +874,16 @@ impl<'ctx, 'str> Value<'str, 'ctx> for FunctionMutRef<'str, 'ctx> {
 
 impl Named for FunctionMutRef<'_, '_> {
     fn name(&self) -> Option<&str> {
-        Some(self.ctx.values.functions[self.id].name.as_ref())
+        Some(self.ctx.values.interfaces[self.id].name.as_ref())
     }
 }
 
 impl<'str, 'ctx> Renameable<'str, 'ctx> for FunctionMutRef<'str, 'ctx> {
     fn rename(&mut self, name: Cow<'str, str>) -> Result<()> {
         let id = self.id();
-        let old_name = self.ctx.values.functions[self.id].name.as_ref().to_owned();
+        let old_name = self.ctx.values.interfaces[self.id].name.as_ref().to_owned();
         update_context_name(id, self.ctx, name.clone(), Some(old_name.as_ref()))?;
-        self.ctx.values.functions[self.id].name = name;
+        self.ctx.values.interfaces[self.id].name = name;
         Ok(())
     }
 }
@@ -919,8 +893,14 @@ impl<'str, 'ctx> FunctionMutRef<'str, 'ctx> {
         &mut self.ctx.values.functions[self.id]
     }
 
+    /// This function's published interface (mutable). Interface writes are
+    /// module-scope only; this is the write path for the setters below.
+    pub(crate) fn interface_mut(&mut self) -> &mut FunctionInterface<'str> {
+        &mut self.ctx.values.interfaces[self.id]
+    }
+
     fn set_address(&mut self, address: u64) -> Result<()> {
-        self.inner_mut().address = Some(address);
+        self.interface_mut().address = Some(address);
         self.ctx.set_address(address, self.id.into())
     }
 
@@ -983,7 +963,7 @@ impl<'str, 'ctx> FunctionMutRef<'str, 'ctx> {
     }
 
     pub fn set_external(&mut self, is_external: bool) {
-        self.inner_mut().is_external = is_external;
+        self.interface_mut().is_external = is_external;
         assert!(
             self.inner().blocks.is_empty(),
             "External functions should not have blocks"
@@ -991,7 +971,7 @@ impl<'str, 'ctx> FunctionMutRef<'str, 'ctx> {
     }
 
     pub fn set_kind(&mut self, kind: FunctionKind) {
-        self.inner_mut().kind = kind;
+        self.interface_mut().kind = kind;
         if kind == FunctionKind::Lambda {
             self.set_is_pure(true);
             self.set_pure_reg(true);
@@ -999,13 +979,13 @@ impl<'str, 'ctx> FunctionMutRef<'str, 'ctx> {
     }
 
     pub fn set_signature(&mut self, sig: FunctionSignature) {
-        self.ctx.values.functions[self.id].signature = Some(sig);
+        self.ctx.values.interfaces[self.id].signature = Some(sig);
     }
 
     /// Records the inferred per-parameter pointer attributes on this function.
     /// See [`FunctionSignature::param_attrs`].
     pub fn set_param_attrs(&mut self, attrs: Vec<ParamAttrs>) {
-        self.inner_mut()
+        self.interface_mut()
             .signature
             .get_or_insert_default()
             .param_attrs = Some(attrs);
@@ -1014,21 +994,24 @@ impl<'str, 'ctx> FunctionMutRef<'str, 'ctx> {
     /// Drops any inferred per-parameter attributes (e.g. after a signature
     /// rewrite changed the parameter list, invalidating the index alignment).
     pub fn clear_param_attrs(&mut self) {
-        if let Some(sig) = self.inner_mut().signature.as_mut() {
+        if let Some(sig) = self.interface_mut().signature.as_mut() {
             sig.param_attrs = None;
         }
     }
 
     /// Records the analysis-computed clobbered register set on this function.
     pub fn set_clobbered_regs(&mut self, regs: Vec<VarnodeId>) {
-        self.inner_mut().signature.get_or_insert_default().clobbered = Some(regs);
+        self.interface_mut()
+            .signature
+            .get_or_insert_default()
+            .clobbered = Some(regs);
     }
 
     /// Records the analysis-computed set of non-register spaces this function may
     /// write (`None` = unknown/unbounded). See
     /// [`FunctionSignature::written_spaces`].
     pub fn set_written_spaces(&mut self, spaces: Option<Vec<crate::space::SpaceId>>) {
-        self.inner_mut()
+        self.interface_mut()
             .signature
             .get_or_insert_default()
             .written_spaces = spaces;
@@ -1038,7 +1021,7 @@ impl<'str, 'ctx> FunctionMutRef<'str, 'ctx> {
     /// interface — reads no registers, writes exactly its clobbered set. See
     /// [`FunctionSignature::externally_resolved`].
     pub fn set_externally_resolved(&mut self, value: bool) {
-        self.inner_mut()
+        self.interface_mut()
             .signature
             .get_or_insert_default()
             .externally_resolved = value;
@@ -1053,7 +1036,10 @@ impl<'str, 'ctx> FunctionMutRef<'str, 'ctx> {
                 as the call interface; this remains only for the conventional/external path."
     )]
     pub fn set_input_regs(&mut self, regs: Vec<VarnodeId>) {
-        self.inner_mut().signature.get_or_insert_default().inputs = Some(regs);
+        self.interface_mut()
+            .signature
+            .get_or_insert_default()
+            .inputs = Some(regs);
     }
 
     /// Records display names for this function's positional call arguments, one
@@ -1061,7 +1047,7 @@ impl<'str, 'ctx> FunctionMutRef<'str, 'ctx> {
     /// for callees (chiefly externals) whose argument names come from a C
     /// prototype rather than a register or promoted stack param.
     pub fn set_input_arg_names(&mut self, names: Vec<Option<Box<str>>>) {
-        self.inner_mut()
+        self.interface_mut()
             .signature
             .get_or_insert_default()
             .input_names = Some(names);
@@ -1070,29 +1056,38 @@ impl<'str, 'ctx> FunctionMutRef<'str, 'ctx> {
     /// Marks this function as fully functionalized over its register channel.
     /// See [`FunctionSignature::pure_reg`].
     pub fn set_pure_reg(&mut self, value: bool) {
-        self.inner_mut().signature.get_or_insert_default().pure_reg = value;
+        self.interface_mut()
+            .signature
+            .get_or_insert_default()
+            .pure_reg = value;
     }
 
     /// Marks this function as fully functionalized over *every* side-effect
     /// channel — a deterministic pure function of its params. See
     /// [`FunctionSignature::is_pure`].
     pub fn set_is_pure(&mut self, value: bool) {
-        self.inner_mut().signature.get_or_insert_default().is_pure = value;
+        self.interface_mut()
+            .signature
+            .get_or_insert_default()
+            .is_pure = value;
     }
 
     /// Records the analysis-inferred saved (preserved) register set on this function.
     pub fn set_saved_regs(&mut self, regs: Vec<VarnodeId>) {
-        self.inner_mut().signature.get_or_insert_default().saved = Some(regs);
+        self.interface_mut().signature.get_or_insert_default().saved = Some(regs);
     }
 
     /// Records the output (return-value) register set on this function.
     pub fn set_output_regs(&mut self, regs: Vec<VarnodeId>) {
-        self.inner_mut().signature.get_or_insert_default().outputs = Some(regs);
+        self.interface_mut()
+            .signature
+            .get_or_insert_default()
+            .outputs = Some(regs);
     }
 
     /// Records the analysis-inferred net stack-pointer delta on this function.
     pub fn set_stack_delta(&mut self, delta: i64) {
-        self.inner_mut()
+        self.interface_mut()
             .signature
             .get_or_insert_default()
             .stack_delta = Some(delta);
@@ -1101,7 +1096,7 @@ impl<'str, 'ctx> FunctionMutRef<'str, 'ctx> {
     /// Records whether this function performs an unresolved/dynamic stack read.
     /// See [`FunctionSignature::reads_unbounded_stack`].
     pub fn set_reads_unbounded_stack(&mut self, value: bool) {
-        self.inner_mut()
+        self.interface_mut()
             .signature
             .get_or_insert_default()
             .reads_unbounded_stack = value;
@@ -1111,7 +1106,7 @@ impl<'str, 'ctx> FunctionMutRef<'str, 'ctx> {
     /// callee that may read it unboundedly. See
     /// [`FunctionSignature::frame_escapes_to_unbounded`].
     pub fn set_frame_escapes_to_unbounded(&mut self, value: bool) {
-        self.inner_mut()
+        self.interface_mut()
             .signature
             .get_or_insert_default()
             .frame_escapes_to_unbounded = value;

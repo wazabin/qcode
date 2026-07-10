@@ -20,8 +20,8 @@ use crate::{
 /// `&Context`, so the same ref code reads correctly whether the target function
 /// lives in the module registry ([`Module`](Self::Module)) or has been *checked
 /// out* by a pass ([`Checked`](Self::Checked)). Because a checked-out function's
-/// registry slot holds a [`sentinel`](Function::sentinel), reads of its arenas
-/// must come from the owned `&Function`, not from `shared`.
+/// body slot holds an empty body, reads of its arenas must come from the owned
+/// `&Function`, not from `shared`.
 ///
 /// It is `Copy` (it holds only shared references), which is what lets a read ref
 /// hand the same host to every sub-ref it constructs.
@@ -53,14 +53,21 @@ impl<'a, 'str> HostRef<'a, 'str> {
         }
     }
 
-    /// The function `f`, from `fun` if it is the checked-out one, else from the
-    /// shared registry.
+    /// The function *body* `f`, from `fun` if it is the checked-out one, else from
+    /// the shared registry.
     pub fn function(self, f: FunctionId) -> &'a Function<'str> {
         match self {
             HostRef::Module(c) => &c.values.functions[f],
             HostRef::Checked { fun, id, .. } if f == id => fun,
             HostRef::Checked { shared, .. } => &shared.values.functions[f],
         }
+    }
+
+    /// The function *interface* of `f`. Interfaces are never checked out, so this
+    /// always reads the shared registry — the real interface even for a
+    /// co-checked-out function.
+    pub fn interface(self, f: FunctionId) -> &'a crate::value::function::FunctionInterface<'str> {
+        &self.shared().values.interfaces[f]
     }
 
     /// The instruction `id`, routed to its owning function's arena.

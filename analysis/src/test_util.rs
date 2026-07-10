@@ -49,9 +49,7 @@ pub(crate) fn with_minting<'str, R>(
     ) -> R,
 ) -> R {
     use crate::pipeline::{FunctionBody, ModuleView};
-    let reserved: Vec<FunctionId> = (0..2)
-        .map(|_| ctx.values.push_function(qcode::value::Function::sentinel()))
-        .collect();
+    let reserved: Vec<FunctionId> = (0..2).map(|_| ctx.push_sentinel_function()).collect();
     let env = dummy_env();
     let fun_value = ctx.checkout_function(fun);
     let mut body = FunctionBody::new(fun, fun_value, reserved);

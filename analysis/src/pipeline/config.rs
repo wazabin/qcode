@@ -1225,7 +1225,7 @@ impl MintPool {
             .map(|_| {
                 self.available
                     .pop_front()
-                    .unwrap_or_else(|| ctx.values.push_function(qcode::value::Function::sentinel()))
+                    .unwrap_or_else(|| ctx.push_sentinel_function())
             })
             .collect()
     }

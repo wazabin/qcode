@@ -450,13 +450,14 @@ impl<'str> Context<'str> {
 
     /// Returns a list of all functions in the context. Reserved minting-pool
     /// sentinels (never-observed placeholder slots; see
-    /// [`Function::sentinel`]) are skipped — they are not functions.
+    /// [`FunctionInterface::sentinel`](crate::value::function::FunctionInterface::sentinel))
+    /// are skipped — they are not functions.
     pub fn function_ids(&self) -> Vec<FunctionId> {
         self.values
-            .functions
+            .interfaces
             .iter()
-            .filter(|f| !f.is_sentinel())
-            .map(|f| f.id)
+            .filter(|i| !i.is_sentinel())
+            .map(|i| i.id)
             .collect()
     }
 
@@ -513,26 +514,33 @@ impl<'str> Context<'str> {
         self.functions()
     }
 
-    /// Check a function *out* of the module: move its [`Function`] out of the
-    /// registry, leaving an [`interface shell`](Function::interface_shell) in its
-    /// slot, and return the owned function. The caller then owns it exclusively and
-    /// can mutate it in isolation from the rest of the module — the primitive a
-    /// pass driver uses to hand a function to a worker (see `PARALLEL_PASSES.md`).
-    /// The id and every other function's stable address are untouched (segmented
-    /// registry storage).
+    /// Check a function *out* of the module: move its [`Function`] *body* out of
+    /// the registry, leaving an empty body in its slot, and return the owned body.
+    /// The caller then owns it exclusively and can mutate it in isolation from the
+    /// rest of the module — the primitive a pass driver uses to hand a function to
+    /// a worker (see `PARALLEL_PASSES.md`). The id and every other function's
+    /// stable address are untouched (segmented registry storage).
     ///
-    /// The slot holds an *interface shell* (not a blank sentinel) so that under
-    /// the parallel driver a worker reading a co-checked-out callee's published
-    /// interface (name, address, signature, purity, clobber/write summaries)
-    /// through the shared `&Context` sees the callee's real interface. The shell's
-    /// *body* is empty — a checked-out function's body is never a legitimate read.
-    /// Sequentially this is invisible: interface reads of a checked-out function
-    /// never occurred. The function must still be reinstalled with
-    /// [`checkin_function`](Self::checkin_function) before anything relies on its
-    /// body again.
+    /// The function's [`interface`](crate::value::registry::ValueRegistry::interfaces)
+    /// is never checked out: it stays in the always-present interfaces registry, so
+    /// a worker reading a co-checked-out callee's published interface (name,
+    /// address, signature, purity, clobber/write summaries) through the shared
+    /// `&Context` sees the callee's real interface. The body must be reinstalled
+    /// with [`checkin_function`](Self::checkin_function) before anything relies on
+    /// it again.
     pub fn checkout_function(&mut self, id: FunctionId) -> Function<'str> {
-        let shell = self.values.functions[id].interface_shell();
-        self.values.functions.replace(id, shell)
+        self.values.functions.replace(id, Function::empty_body())
+    }
+
+    /// Push a never-observed reserved slot (sentinel interface + empty body) into
+    /// the function registries, returning its [`FunctionId`]. The minting pool
+    /// draws ids from these; they are skipped by every iteration surface until a
+    /// minted function is installed over them.
+    pub fn push_sentinel_function(&mut self) -> FunctionId {
+        self.values.push_function(
+            crate::value::function::FunctionInterface::sentinel(),
+            Function::empty_body(),
+        )
     }
 
     /// Reinstall a function previously taken with
@@ -1417,10 +1425,11 @@ impl<'str, 'ctx> Iterator for FunctionIter<'str, 'ctx> {
     fn next(&mut self) -> Option<Self::Item> {
         // Reserved minting-pool sentinels hold registry slots but are not
         // functions; no iteration surface may observe them.
+        let ctx = self.ctx;
         self.inner
             .by_ref()
-            .find(|f| !f.is_sentinel())
-            .map(|f| FunctionRef::from_id(self.ctx, f.id))
+            .find(|f| !ctx.values.interfaces[f.id].is_sentinel())
+            .map(|f| FunctionRef::from_id(ctx, f.id))
     }
 }
 
@@ -1469,11 +1478,10 @@ mod tests {
         let alpha = make_fn_with_blocks(&mut ctx, "alpha", 2);
         let beta = make_fn_with_blocks(&mut ctx, "beta", 1);
 
-        // Check `alpha` out: the slot now holds an interface shell (its name and
-        // published interface preserved, its body empty), and we own the real
-        // function with all its blocks.
+        // Check `alpha` out: the body slot now holds an empty body while its
+        // interface stays in the always-present interfaces registry, and we own
+        // the real body with all its blocks.
         let fun = ctx.checkout_function(alpha);
-        assert_eq!(fun.name, "alpha");
         assert_eq!(fun.roster.len(), 2);
         assert_eq!(FunctionRef::from_id(&ctx, alpha).name(), "alpha");
         assert_eq!(FunctionRef::from_id(&ctx, alpha).blocks().count(), 0);

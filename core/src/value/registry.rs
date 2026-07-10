@@ -71,10 +71,19 @@ pub struct ValueRegistry<'str> {
     #[serde(default)]
     pub(crate) varnode_types: HashMap<VarnodeId, TypeId>,
 
-    /// Function storage. Each function owns its instruction/block/param/edge
-    /// arenas; the composite-ID accessors ([`instruction`](Self::instruction)
-    /// etc.) route through here.
+    /// Function *body* storage. Each function owns its instruction/block/param/
+    /// edge arenas; the composite-ID accessors ([`instruction`](Self::instruction)
+    /// etc.) route through here. A checked-out function's body is moved out of its
+    /// slot (leaving an empty body); its [`interface`](Self::interfaces) stays put,
+    /// so callers always read the real interface.
     pub functions: Registry<FunctionId, Function<'str>>,
+
+    /// Function *interface* storage — the caller-reasoning surface (name, address,
+    /// kind, external-ness, signature) held in lockstep with
+    /// [`functions`](Self::functions) under the same [`FunctionId`] space. Never
+    /// checked out: a co-checked-out callee answers interface queries from here.
+    #[serde(default)]
+    pub interfaces: Registry<FunctionId, crate::value::function::FunctionInterface<'str>>,
 
     /// Truth map of the assumption system: what each [`Proposition`] is
     /// currently assumed or known to be (see [`crate::assumption`]). Accessed
@@ -320,7 +329,20 @@ impl<'str> ValueRegistry<'str> {
         self.varnodes.push(varnode)
     }
 
-    pub fn push_function(&mut self, f: Function<'str>) -> FunctionId {
-        self.functions.push(f)
+    /// Push a function's interface and body in lockstep, returning the shared
+    /// [`FunctionId`]. Both registries must always grow together.
+    pub fn push_function(
+        &mut self,
+        interface: crate::value::function::FunctionInterface<'str>,
+        body: Function<'str>,
+    ) -> FunctionId {
+        let id = self.functions.push(body);
+        let iid = self.interfaces.push(interface);
+        debug_assert_eq!(
+            Into::<usize>::into(id),
+            Into::<usize>::into(iid),
+            "function body/interface registries drifted"
+        );
+        id
     }
 }

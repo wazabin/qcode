@@ -19,11 +19,16 @@ use qcode::{
     context::Context,
     value::{
         Function, FunctionId, FunctionKind,
+        function::FunctionInterface,
         util::{base_ref::HostRef, host_mut::CheckedOut},
     },
 };
 
 use super::PipelineEnv;
+
+/// A function minted by a pass this run: its reserved id, its interface, and its
+/// body. Installed into the reserved slot by the driver at check-in.
+pub type Minted<'str> = (FunctionId, FunctionInterface<'str>, Function<'str>);
 
 /// Global effects a function pass requests, buffered for the driver to apply at
 /// check-in (in worklist order). The self-rename is a first-writer-wins claim, so
@@ -97,8 +102,9 @@ pub struct FunctionBody<'str> {
     /// driver's pool at check-in.
     reserved_ids: Vec<FunctionId>,
     /// Functions built this run against drawn `reserved_ids` (paired with the id
-    /// each was drawn for), installed by the driver at check-in.
-    minted: Vec<(FunctionId, Function<'str>)>,
+    /// each was drawn for, and its interface), installed by the driver at
+    /// check-in.
+    minted: Vec<Minted<'str>>,
 }
 
 impl<'str> FunctionBody<'str> {
@@ -171,16 +177,16 @@ impl<'str> FunctionBody<'str> {
             return None;
         }
         let id = self.reserved_ids.remove(0);
-        let mut fun = Function::detached(name);
-        fun.kind = kind;
+        let mut interface = FunctionInterface::new(name);
+        interface.kind = kind;
         if pure {
-            let sig = fun.signature.get_or_insert_default();
+            let sig = interface.signature.get_or_insert_default();
             sig.is_pure = true;
             // Full purity implies register purity — the GUI badge keys off the
             // latter (mirrors `outline_core` / `make_lambda`).
             sig.pure_reg = true;
         }
-        self.minted.push((id, fun));
+        self.minted.push((id, interface, Function::empty_body()));
         Some(id)
     }
 
@@ -204,8 +210,8 @@ impl<'str> FunctionBody<'str> {
         let fun = self
             .minted
             .iter_mut()
-            .find(|(id, _)| *id == minted)
-            .map(|(_, f)| f)
+            .find(|(id, _, _)| *id == minted)
+            .map(|(_, _, f)| f)
             .expect("host_with_minted: not a function minted by this body");
         (own, CheckedOut::new(fun, minted, m.ctx()))
     }
@@ -218,7 +224,7 @@ impl<'str> FunctionBody<'str> {
     ) -> (
         Function<'str>,
         Effects<'str>,
-        Vec<(FunctionId, Function<'str>)>,
+        Vec<Minted<'str>>,
         Vec<FunctionId>,
     ) {
         (self.fun, self.effects, self.minted, self.reserved_ids)
