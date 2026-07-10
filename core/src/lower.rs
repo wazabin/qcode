@@ -381,14 +381,35 @@ struct Lowerer<'a, 'str, 'ctx> {
 
 impl Lowerer<'_, '_, '_> {
     fn block(&mut self, label: &Label) -> Result<BlockId, String> {
-        match label {
+        let resolved = match label {
             Label::Named { name, .. } => self
                 .block_ids
                 .get(name)
                 .copied()
-                .ok_or_else(|| format!("unknown block <{name}>")),
-            Label::Address { value, .. } => Ok(self.b.get_or_make_block(*value)),
+                .ok_or_else(|| format!("unknown block <{name}>"))?,
+            Label::Address { value, .. } => self.b.get_or_make_block(*value),
+        };
+        // Strict IR locality (context-split ruling 2): a control-flow target must
+        // be a block of the *current* function. Named labels resolve through the
+        // function-local `block_ids` map, so they can never be foreign; the only
+        // way textual qcode can name another function's block is an address label
+        // (`goto <0xADDR>` or a `// -> <0xADDR>` edge hint) that the global address
+        // map already owns for a different function. Reject it — cross-function
+        // control flow is a `call` / tail call, never a foreign block target.
+        let current = self.b.current_block().func;
+        let owner = BasicBlock::from_id(self.b.context(), resolved)
+            .parent()
+            .map(|f| f.id);
+        if let Some(owner) = owner
+            && owner != current
+        {
+            return Err(format!(
+                "control-flow target {label:?} resolves to a block owned by {owner:?}, \
+                 but the branch is in {current:?}; cross-function control flow must be a \
+                 call/tail call, not a foreign block target",
+            ));
         }
+        Ok(resolved)
     }
 
     /// Add CFG edges from the just-terminated current block to each label in a
@@ -1028,5 +1049,37 @@ mod tests {
         assert!(text.contains("lambda fib_loop"));
         assert!(text.contains("i64 @hn == i64 0x0"));
         assert!(text.contains("i64 @x + i64 @y"));
+    }
+
+    /// Strict IR locality (context-split ruling 2): named labels are
+    /// function-scoped, so the only way textual qcode can name another function's
+    /// block is an *address* goto (`goto <0xADDR>`) that resolves — through the
+    /// global address map — to a block already owned by a different function. The
+    /// lowerer must reject it: cross-function control flow is a call/tail call.
+    #[test]
+    fn rejects_cross_function_address_branch() {
+        use std::borrow::Cow;
+
+        let mut ctx = Context::new();
+        // A pre-existing function `g` owning a block at 0x2000.
+        let g = Function::make_at_addr(&mut ctx, 0x2000, Some(Cow::Borrowed("g"))).id;
+        let g_blk = BasicBlock::make(&mut ctx, g).with_address(0x2000).id;
+        Function::from_id_mut(&mut ctx, g).set_root(g_blk).unwrap();
+
+        // Lowering a function `f` that branches to address 0x2000 must fail: the
+        // address resolves to g's block, a foreign target.
+        let err = lower_str(
+            &mut ctx,
+            "
+            fn f:
+            <entry>
+                goto <0x2000>;
+            ",
+        )
+        .expect_err("cross-function address goto must be rejected");
+        assert!(
+            err.contains("cross-function control flow"),
+            "unexpected error: {err}"
+        );
     }
 }
