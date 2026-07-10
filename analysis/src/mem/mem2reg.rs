@@ -17,6 +17,7 @@ use std::borrow::Cow;
 
 use crate::AliasResult;
 use crate::gvn::affine::{Numbering, precompute_forms};
+use crate::pipeline::{ContextView, FunctionBody};
 use crate::stack::frame::{frame_offset, incoming_sp_param};
 
 /// Returns `true` if any variables were promoted.
@@ -34,15 +35,30 @@ pub fn mem2reg_framed(
     aliases: &AliasResult,
     sp_param: Option<ValueId>,
 ) -> bool {
-    mem2reg_host(&mut ctx, function_id, aliases, sp_param)
+    mem2reg_host_generic(&mut ctx, function_id, aliases, sp_param)
+}
+
+/// Concrete core of [`mem2reg_framed`] using FunctionBody+ContextView (stage 5b-ii).
+/// Preferred implementation for function passes; generic version kept for backwards compatibility.
+pub fn mem2reg_host<'str>(
+    body: &mut FunctionBody<'str>,
+    cx: ContextView<'_, 'str>,
+    function_id: FunctionId,
+    aliases: &AliasResult,
+    sp_param: Option<ValueId>,
+) -> bool {
+    // Build a CheckedOut from the body and delegate to the generic implementation
+    let mut host = body.host(cx);
+    mem2reg_host_generic(&mut host, function_id, aliases, sp_param)
 }
 
 /// Host-generic core of [`mem2reg_framed`]. Reads and mutates the function through
 /// the generic mutation host, so it runs over either the whole module
 /// (`&mut Context`) or a single checked-out function ([`CheckedOut`]).
 ///
+/// TODO(5b-ii): For backwards compatibility; prefer concrete version for new code.
 /// [`CheckedOut`]: qcode::value::util::host_mut::CheckedOut
-fn mem2reg_host<'str, H: HostMut<'str>>(
+fn mem2reg_host_generic<'str, H: HostMut<'str>>(
     host: &mut H,
     function_id: FunctionId,
     aliases: &AliasResult,
@@ -3597,7 +3613,7 @@ mod tests {
 
 // ----- pass ------------------------------------------------------------------
 
-use crate::{ContextView, FunctionBody, FunctionPass};
+use crate::FunctionPass;
 
 #[derive(Default)]
 pub struct Mem2RegPass;
@@ -3639,8 +3655,7 @@ impl FunctionPass for Mem2RegPass {
             (aliases, sp_param)
         };
 
-        let mut host = f.host(m);
-        Ok(mem2reg_host(&mut host, fun_id, &aliases, sp_param))
+        Ok(mem2reg_host(f, m, fun_id, &aliases, sp_param))
     }
 }
 
