@@ -19,9 +19,9 @@ use super::affine::Numbering;
 
 use qcode::value::{
     ValueId,
-    block::{BlockId, BlockRef},
-    function::{FunctionId, FunctionRef},
-    insn::{InstructionId, InstructionRef, Mnemonic},
+    block::BlockId,
+    function::FunctionId,
+    insn::{InstructionId, Mnemonic},
     util::{base_ref::HostRef, host_mut::HostMut},
 };
 
@@ -209,7 +209,7 @@ fn run_block<'str, H: HostMut<'str>>(
 
     for insn_id in insns {
         let (id, size, mnemonic) = {
-            let insn = InstructionRef::new(host.read_host(), insn_id);
+            let insn = host.insn_ref(insn_id);
             (insn.id(), insn.size(), insn.mnemonic().clone())
         };
         let ic = InsnCtx {
@@ -255,7 +255,7 @@ pub(super) fn run_flat_fixpoint<'str, H: HostMut<'str>>(
     func_id: FunctionId,
     passes: &[Box<dyn SubPass<'str, H>>],
 ) -> bool {
-    let block_ids: Vec<BlockId> = FunctionRef::new(host.read_host(), func_id)
+    let block_ids: Vec<BlockId> = host.function_ref(func_id)
         .iter()
         .map(|block| block.id)
         .collect();
@@ -363,11 +363,11 @@ fn reachable_from<'str>(
     let mut seen = HashSet::from_iter([entry]);
     let mut stack = vec![entry];
     while let Some(block) = stack.pop() {
-        for (_, succ) in BlockRef::new(host, block).successors() {
+        for (_, succ) in host.block_ref(block).successors() {
             // Ownership, not storage: a reattributed own block (owner == the
             // walked function, stored in a foreign arena pre-normalization) is
             // followed; a block owned by another function is not.
-            if host.block(succ).parent == Some(owner) && seen.insert(succ) {
+            if host.function(owner).block(succ).parent == Some(owner) && seen.insert(succ) {
                 stack.push(succ);
             }
         }
@@ -397,13 +397,13 @@ pub(super) fn run_dominator_walk<'str, H: HostMut<'str>>(
     passes: &[Box<dyn SubPass<'str, H>>],
     aliases: Option<&AliasResult>,
 ) -> bool {
-    let root = match FunctionRef::new(host.read_host(), func_id).root() {
+    let root = match host.function_ref(func_id).root() {
         Some(r) => r.id,
         None => return false,
     };
 
     let root_reachable = reachable_from(host.read_host(), root, func_id);
-    let entries: Vec<BlockId> = FunctionRef::new(host.read_host(), func_id)
+    let entries: Vec<BlockId> = host.function_ref(func_id)
         .iter()
         .filter(|block| !root_reachable.contains(&block.id))
         .filter(|block| block.predecessors().next().is_none())
@@ -427,7 +427,7 @@ pub(super) fn run_dominator_walk<'str, H: HostMut<'str>>(
 
     let mut changed = false;
     for entry in std::iter::once(root).chain(entries) {
-        let tree = compute_dominators(&FunctionRef::new(host.read_host(), entry.func), entry);
+        let tree = compute_dominators(&host.function_ref(entry.func), entry);
         let mut walk = Walk {
             passes,
             func_id,

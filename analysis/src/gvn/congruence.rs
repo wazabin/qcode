@@ -128,7 +128,7 @@ impl Congruence {
         }
 
         if let ValueId::Instruction(id) = v {
-            let insn = qcode::value::InstructionRef::new(host, id);
+            let insn = host.insn_ref(id);
             let mnemonic = insn.mnemonic().clone();
             let size = insn.size();
             if is_pure_value_op(&mnemonic) {
