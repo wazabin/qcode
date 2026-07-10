@@ -35,9 +35,9 @@ use qcode::{
     assumption::Proposition,
     space::{Space, SpaceId, SpaceType},
     value::{
-        FunctionRef, Value, ValueId, ValueRef, Varnode, VarnodeId,
-        block::{BlockId, BlockRef},
-        insn::{Binary, Binop, InstructionRef, IntBinop, Load, Mnemonic, Range, Store, Zext},
+        Value, ValueId, ValueRef, Varnode, VarnodeId,
+        block::BlockId,
+        insn::{Binary, Binop, IntBinop, Load, Mnemonic, Range, Store, Zext},
         util::{base_ref::HostRef, host_mut::HostMut},
     },
 };
@@ -440,7 +440,7 @@ impl MemForward {
         block_id: BlockId,
         aliases: Option<&AliasResult>,
     ) {
-        let term = BlockRef::new(host, block_id)
+        let term = host.block_ref(block_id)
             .iter()
             .last()
             .map(|i| i.mnemonic().clone());
@@ -463,7 +463,7 @@ impl MemForward {
         // This is what lets a functionalized callee that writes only its own
         // private scratch space leave the caller's spilled-pointer cell intact.
         let callee_written_spaces: Option<Vec<SpaceId>> = match &term {
-            Some(Mnemonic::Call(call)) => FunctionRef::new(host, call.target)
+            Some(Mnemonic::Call(call)) => host.function_ref(call.target)
                 .written_spaces()
                 .map(<[_]>::to_vec),
             _ => None,
@@ -472,7 +472,7 @@ impl MemForward {
         let (clobbers, escaping, unknown_callee): (CallClobbers, Vec<ValueId>, bool) = match &term {
             Some(Mnemonic::CallInd(call)) => (CallClobbers::AllRegisters, call.args.clone(), true),
             Some(Mnemonic::Call(call)) => {
-                let callee = FunctionRef::new(host, call.target);
+                let callee = host.function_ref(call.target);
                 let regs = match callee.clobbered_regs() {
                     Some(regs) => CallClobbers::Regs(regs.to_vec()),
                     None => CallClobbers::AllRegisters,
@@ -588,7 +588,7 @@ impl MemForward {
     /// same assumption the alias oracle's spilled-reload rules use. Off → the
     /// conservative opaque-pointer prune.
     pub(super) fn loaded_ptr_peeling(host: HostRef, block_id: BlockId) -> bool {
-        BlockRef::new(host, block_id)
+        host.block_ref(block_id)
             .function()
             .map(|f| f.id)
             .is_some_and(|fid| {
@@ -612,7 +612,7 @@ impl MemForward {
         let ValueId::Instruction(id) = v else {
             return None;
         };
-        let Mnemonic::Load(load) = InstructionRef::new(host, id).mnemonic().clone() else {
+        let Mnemonic::Load(load) = host.insn_ref(id).mnemonic().clone() else {
             return None;
         };
         let (base, start) = locate(load.ptr, load.space, aliases, numbering);
@@ -674,7 +674,7 @@ impl MemForward {
         numbering: &Numbering,
     ) {
         // `dominates` is reflexive, so a self-loop also counts.
-        let is_loop_header = BlockRef::new(host, block_id)
+        let is_loop_header = host.block_ref(block_id)
             .predecessors()
             .any(|(_, pred)| tree.dominates(block_id, pred));
         if !is_loop_header || self.byte_map.is_empty() {
@@ -711,7 +711,7 @@ impl MemForward {
         let stores: Vec<Store> = body
             .iter()
             .flat_map(|&b| {
-                BlockRef::new(host, b)
+                host.block_ref(b)
                     .iter()
                     .filter_map(|insn| match insn.mnemonic() {
                         Mnemonic::Store(s) => Some(s.clone()),
