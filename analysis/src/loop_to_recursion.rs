@@ -37,7 +37,7 @@ use rustc_hash::FxHashMap as HashMap;
 use qcode::{
     builder::Builder,
     value::{
-        BlockRef, FunctionId, FunctionKind, FunctionRef, InstructionRef, ValueId,
+        FunctionId, FunctionKind, ValueId,
         block::BlockId,
         block_param::BlockParam,
         insn::{Branch, InstructionId, Mnemonic},
@@ -97,7 +97,7 @@ pub(crate) fn recognize_loop<'a, 'str: 'a>(
     fun_id: FunctionId,
 ) -> Option<LoopModel> {
     let host = host.into();
-    let fun = qcode::value::FunctionRef::new(host, fun_id);
+    let fun = host.function_ref(fun_id);
     if !fun.is_lambda() {
         return None;
     }
@@ -128,7 +128,7 @@ pub(crate) fn recognize_loop<'a, 'str: 'a>(
     // back-edge must be a clean latch (`goto head(next...)`) so we can rewrite
     // it into a recursive call without disturbing other control flow.
     let mut back_edges = Vec::new();
-    for (_edge, pred) in qcode::value::BlockRef::new(host, head).predecessors() {
+    for (_edge, pred) in host.block_ref(head).predecessors() {
         if pred == root {
             continue;
         }
@@ -170,7 +170,7 @@ fn transform<'str>(
     let host_fid = body.id();
     let name = format!(
         "{}_rec",
-        FunctionRef::new(body.read_host(m), host_fid).name()
+        body.read_host(m).function_ref(host_fid).name()
     );
     // Mint the recursive lambda (name buffered raw; the driver uniquifies it at
     // check-in). `None` (pool exhausted) leaves the loop alone.
@@ -196,14 +196,14 @@ fn transform<'str>(
         for &ob in &model.region {
             let nb = minted.make_block(rec);
             block_map.insert(ob, nb);
-            if let Some(name) = BlockRef::new(own, ob).name() {
+            if let Some(name) = own.block_ref(ob).name() {
                 let _ =
                     BaseRef::new(minted.reborrow(), nb).rename_local(Cow::Owned(name.to_owned()));
             }
             let params: Vec<(
                 qcode::value::block_param::BlockParamId,
                 qcode::types::TypeId,
-            )> = BlockRef::new(own, ob)
+            )> = own.block_ref(ob)
                 .params()
                 .map(|p| {
                     let pid = match p.id() {
@@ -226,14 +226,14 @@ fn transform<'str>(
         let mut cloned: Vec<InstructionId> = Vec::new();
         for &ob in &model.region {
             let nb = block_map[&ob];
-            let insns: Vec<InstructionId> = BlockRef::new(own, ob).iter().map(|i| i.id).collect();
+            let insns: Vec<InstructionId> = own.block_ref(ob).iter().map(|i| i.id).collect();
             let last = insns.last().copied();
             for iid in insns {
                 let is_latch_term = latches.contains(&ob) && Some(iid) == last;
                 if is_latch_term {
                     continue; // becomes `apply rec(next…); return` in pass 4
                 }
-                let r = InstructionRef::new(own, iid);
+                let r = own.insn_ref(iid);
                 let mut mn = r.mnemonic().clone();
                 let ty = r.type_id();
                 remap_block_targets(&mut mn, &block_map);
@@ -247,7 +247,7 @@ fn transform<'str>(
         // Pass 3: remap value operands of the cloned instructions (region params
         // and defs), and add CFG edges for the cloned (non-latch) terminators.
         for &new_id in &cloned {
-            let mut mn = minted.read_host().instruction(new_id).mnemonic().clone();
+            let mut mn = minted.insn_ref(new_id).mnemonic().clone();
             let mut touched = false;
             for a in mn.args() {
                 if let Some(&n) = value_map.get(&a) {
@@ -265,7 +265,7 @@ fn transform<'str>(
                 continue;
             }
             let nb = block_map[&ob];
-            let succs: Vec<BlockId> = BlockRef::new(own, ob)
+            let succs: Vec<BlockId> = own.block_ref(ob)
                 .successors()
                 .map(|(_, s)| s)
                 .collect();
@@ -312,7 +312,7 @@ fn push_param<'str, H: HostMut<'str>>(
     block: BlockId,
     ty: qcode::types::TypeId,
 ) -> ValueId {
-    let index = host.read_host().block(block).params.len();
+    let index = host.block_ref(block).num_params();
     let pid = host.push_block_param(
         block.func,
         BlockParam {
@@ -358,8 +358,8 @@ fn reachable_from<'a, 'str: 'a>(
         if !seen.insert(block) {
             continue;
         }
-        for (_edge, succ) in qcode::value::BlockRef::new(host, block).successors() {
-            let same_fun = qcode::value::BlockRef::new(host, succ)
+        for (_edge, succ) in host.block_ref(block).successors() {
+            let same_fun = host.block_ref(succ)
                 .function()
                 .is_some_and(|f| f.id == fun_id);
             if same_fun {
@@ -374,7 +374,7 @@ fn block_param_count<'a, 'str: 'a>(
     host: qcode::value::util::base_ref::HostRef<'a, 'str>,
     block: BlockId,
 ) -> usize {
-    qcode::value::BlockRef::new(host, block).params().count()
+    host.block_ref(block).params().count()
 }
 
 /// The id of `block`'s terminator instruction, if it ends in one.
@@ -382,10 +382,10 @@ fn terminator_id<'a, 'str: 'a>(
     host: qcode::value::util::base_ref::HostRef<'a, 'str>,
     block: BlockId,
 ) -> Option<InstructionId> {
-    let &id = qcode::value::BlockRef::new(host, block)
+    let &id = host.block_ref(block)
         .instruction_ids()
         .last()?;
-    qcode::value::InstructionRef::new(host, id)
+    host.insn_ref(id)
         .is_terminator()
         .then_some(id)
 }
@@ -396,7 +396,7 @@ fn terminator_mnemonic<'a, 'str: 'a>(
     block: BlockId,
 ) -> Option<&'a Mnemonic> {
     let id = terminator_id(host, block)?;
-    Some(host.instruction(id).mnemonic())
+    Some(host.insn_ref(id).mnemonic())
 }
 
 #[cfg(test)]
