@@ -3,11 +3,11 @@
 //!
 //! A function pass reads the module's *published interface* through a shared
 //! [`ModuleView`] and mutates *only its own function* through a `&mut`
-//! [`FunctionBody`]. Effects on global state that a few passes legitimately need
-//! (assumptions, discoveries, self-renames, address claims) are **buffered** in
-//! [`Effects`] and drained by the driver at check-in, so the pass itself touches
-//! no global mutable state — which is what lets workers run in parallel with the
-//! `ModuleView` `&`-shared and the bodies disjoint `&mut`.
+//! [`FunctionBody`]. The one effect on global state a pass legitimately needs (a
+//! self-rename) is **buffered** in [`Effects`] and drained by the driver at
+//! check-in, so the pass itself touches no global mutable state — which is what
+//! lets workers run in parallel with the `ModuleView` `&`-shared and the bodies
+//! disjoint `&mut`.
 //!
 //! In Stage 5 the driver drives this sequentially (checkout → run → check-in for
 //! one function at a time); Stage 6 runs the checkouts on `std::thread::scope`
@@ -16,11 +16,9 @@
 use std::borrow::Cow;
 
 use qcode::{
-    assumption::Proposition,
     context::Context,
-    discovery::Discovery,
     value::{
-        Function, FunctionId, FunctionKind, ValueId,
+        Function, FunctionId, FunctionKind,
         util::{base_ref::HostRef, host_mut::CheckedOut},
     },
 };
@@ -28,54 +26,20 @@ use qcode::{
 use super::PipelineEnv;
 
 /// Global effects a function pass requests, buffered for the driver to apply at
-/// check-in (in worklist order). Everything here is either an idempotent keyed
-/// insert or a first-writer-wins claim, so replay is deterministic and needs no
-/// merge heuristics.
+/// check-in (in worklist order). The self-rename is a first-writer-wins claim, so
+/// replay is deterministic and needs no merge heuristics.
 #[derive(Default)]
 pub struct Effects<'str> {
-    /// `assume_true(prop)` / `assume(prop, value)` requests (from
-    /// `handle_jump_tables`' `ImmutableMemory` assumption).
-    pub assumptions: Vec<(Proposition, bool)>,
-    /// `discover_code` requests (keyed, idempotent) — new code addresses the
-    /// jump-table pass resolved.
-    pub discoveries: Vec<Discovery>,
     /// A buffered self-rename claim (from `cpp_demangle` / `name_thunks`),
     /// applied as a `get_unique_name` claim at check-in.
     pub self_rename: Option<Cow<'str, str>>,
-    /// New machine-address → value claims (blocks minted at a machine address),
-    /// applied into `address_map` with `set_address`'s priority rule.
-    pub address_claims: Vec<(u64, ValueId)>,
 }
 
 impl<'str> Effects<'str> {
-    /// Whether nothing has been buffered (the common case — most passes request
-    /// no global effects at all).
-    pub fn is_empty(&self) -> bool {
-        self.assumptions.is_empty()
-            && self.discoveries.is_empty()
-            && self.self_rename.is_none()
-            && self.address_claims.is_empty()
-    }
-
-    /// Buffer an `assume_true(prop)` request.
-    pub fn assume_true(&mut self, prop: Proposition) {
-        self.assumptions.push((prop, true));
-    }
-
-    /// Buffer a `discover` request.
-    pub fn discover(&mut self, discovery: Discovery) {
-        self.discoveries.push(discovery);
-    }
-
     /// Buffer a self-rename claim (last writer wins within one run; the driver
     /// resolves it to a unique name at check-in).
     pub fn rename_self(&mut self, name: Cow<'str, str>) {
         self.self_rename = Some(name);
-    }
-
-    /// Buffer a machine-address claim for a value defined this run.
-    pub fn claim_address(&mut self, addr: u64, value: ValueId) {
-        self.address_claims.push((addr, value));
     }
 }
 
@@ -160,11 +124,6 @@ impl<'str> FunctionBody<'str> {
         &self.fun
     }
 
-    /// The owned function (mutate).
-    pub fn function_mut(&mut self) -> &mut Function<'str> {
-        &mut self.fun
-    }
-
     /// A [`CheckedOut`] mutation host over this body's owned function and the
     /// module's read-only shared context. This is how a `FunctionPassV2` reads
     /// (via [`CheckedOut::read_host`]) and mutates (via the [`HostMut`] surface)
@@ -175,15 +134,10 @@ impl<'str> FunctionBody<'str> {
         CheckedOut::new(&mut self.fun, self.id, m.ctx())
     }
 
-    /// The effect buffer (mutate) — passes push assumption/discovery/rename/
-    /// address claims here instead of touching global state.
+    /// The effect buffer (mutate) — passes push a self-rename claim here instead of
+    /// touching global state.
     pub fn effects_mut(&mut self) -> &mut Effects<'str> {
         &mut self.effects
-    }
-
-    /// How many reserved ids remain for minting.
-    pub fn reserved_remaining(&self) -> usize {
-        self.reserved_ids.len()
     }
 
     /// A `Copy` read view over this body's owned function and the shared context

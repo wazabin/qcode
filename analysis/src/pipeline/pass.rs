@@ -164,8 +164,8 @@ pub trait DynFunctionPass: Send + Sync {
 /// The litmus test the signature enforces: **a function pass may read the
 /// module's published interface and mutate its own function — nothing else.** It
 /// reads the module through a `&`-shared [`ModuleView`] and mutates only its own
-/// [`FunctionBody`], buffering the few legitimate global effects (assumptions,
-/// discoveries, self-renames, address claims) for the driver to replay at
+/// [`FunctionBody`], buffering the one legitimate global effect (a self-rename)
+/// for the driver to replay at
 /// check-in. With no path to global mutable state, workers can run these in
 /// parallel (Stage 6) with the `ModuleView` shared and the bodies disjoint.
 ///
@@ -301,14 +301,9 @@ pub(super) fn install_minted<'str>(
     Ok(installed)
 }
 
-/// Replay a V2 pass's buffered [`Effects`] into the context at check-in. Runs on
-/// the master thread in worklist order; every item is an idempotent keyed insert
-/// or a first-writer-wins claim, so the order within one pass's buffer is
-/// immaterial.
-///
-/// Effect kinds are wired as the passes that produce them are ported (each port
-/// commit lands its replay arm). An unwired effect surfaces as a hard error rather
-/// than a silent drop, so a mis-ordered port fails loudly instead of miscompiling.
+/// Replay a function pass's buffered [`Effects`] into the context at check-in.
+/// Runs on the master thread in worklist order; the buffered self-rename is a
+/// first-writer-wins claim, so the order within one pass's buffer is immaterial.
 pub(super) fn replay_effects<'str>(
     ctx: &mut Context<'str>,
     pass: &str,
@@ -316,13 +311,6 @@ pub(super) fn replay_effects<'str>(
     effects: super::Effects<'str>,
 ) -> Result<bool, String> {
     let mut changed = false;
-    for (prop, value) in effects.assumptions {
-        debug_assert!(value, "only assume_true is buffered");
-        changed |= ctx.assume_true(prop);
-    }
-    for discovery in effects.discoveries {
-        changed |= ctx.discover(discovery);
-    }
     // A buffered self-rename (cpp_demangle / name_thunks): the function is already
     // checked in, so resolve the requested name against the now-complete global
     // map (`get_unique_name` suffixes on collision) and apply it exactly as a
@@ -333,11 +321,6 @@ pub(super) fn replay_effects<'str>(
             .rename(unique)
             .map_err(|e| format!("{pass}: self-rename replay failed: {e}"))?;
         changed = true;
-    }
-    if !effects.address_claims.is_empty() {
-        return Err(format!(
-            "{pass}: V2 address-claim replay not wired yet (port handle_jump_tables first)"
-        ));
     }
     Ok(changed)
 }
