@@ -17,10 +17,19 @@ use std::borrow::Cow;
 
 use qcode::{
     context::Context,
+    error::Result,
+    types::TypeId,
     value::{
-        Function, FunctionId, FunctionKind,
+        BlockParamRef, BlockRef, Function, FunctionId, FunctionKind, FunctionRef, InstructionRef,
+        ValueId,
+        block::{BasicBlock, BlockId, EdgeId},
+        block_param::{BlockParam, BlockParamId},
         function::FunctionInterface,
-        util::{base_ref::HostRef, host_mut::CheckedOut},
+        insn::{Instruction, InstructionId, Mnemonic},
+        util::{
+            base_ref::HostRef,
+            host_mut::{CheckedOut, HostMut},
+        },
     },
 };
 
@@ -244,5 +253,300 @@ impl<'str> FunctionBody<'str> {
         Vec<FunctionId>,
     ) {
         (self.fun, self.effects, self.minted, self.reserved_ids)
+    }
+}
+
+/// Inherent verb + read-accessor surface (context-split stage 5b-ii(a)).
+///
+/// Every mutation verb of [`HostMut`] and every read accessor of [`HostRef`] a
+/// function pass calls today through `f.host(cx)` / `f.read_host(cx)` is mirrored
+/// here as an inherent method on the body itself: `body.verb(cx, …)` instead of
+/// `host.verb(…)`. This commit is **purely additive** — each method is a
+/// behaviour-identical delegation to a freshly built [`CheckedOut`] (for the
+/// verbs) or [`HostRef`] (for the reads); no call site changes yet. Follow-on
+/// commits migrate helpers off the generic `H: HostMut` onto this surface, and a
+/// later commit reimplements the verb bodies directly on `self`'s arenas, at
+/// which point the delegation disappears.
+///
+/// Where a `HostMut` verb takes an explicit `func: FunctionId` for the pass's own
+/// function, the inherent method drops that parameter and supplies
+/// [`self.id()`](Self::id) instead — a function pass only ever mints/mutates into
+/// its own body.
+impl<'str> FunctionBody<'str> {
+    // ---- births -------------------------------------------------------------
+    //
+    // `push_edge` (`HostMut::push_edge`) is intentionally NOT mirrored: its
+    // `EdgeData` parameter is `pub(crate)` in `qcode::value::block`, so it cannot
+    // be named from this crate without making `EdgeData` public (a core design
+    // change, out of this commit's additive scope). No pass calls `push_edge`
+    // directly — edges are created through `add_cfg_edge` — so nothing needs it.
+
+    /// Push a fresh instruction into this body's arena (recording operand uses and
+    /// the call-site cache). Mirrors [`HostMut::push_insn`] with `func = self.id()`.
+    pub fn push_insn(
+        &mut self,
+        cx: ContextView<'_, 'str>,
+        insn: Instruction<'str>,
+    ) -> InstructionId {
+        let func = self.id;
+        HostMut::push_insn(&mut self.host(cx), func, insn)
+    }
+
+    /// Push a fresh block into this body's arena and onto its roster. Mirrors
+    /// [`HostMut::push_block`] with `func = self.id()`.
+    pub fn push_block(&mut self, cx: ContextView<'_, 'str>, block: BasicBlock<'str>) -> BlockId {
+        let func = self.id;
+        HostMut::push_block(&mut self.host(cx), func, block)
+    }
+
+    /// Mint a fresh empty block, parented to this body and rostered. Mirrors
+    /// [`HostMut::make_block`] with `func = self.id()`.
+    pub fn make_block(&mut self, cx: ContextView<'_, 'str>) -> BlockId {
+        let func = self.id;
+        HostMut::make_block(&mut self.host(cx), func)
+    }
+
+    /// Push a fresh block parameter into this body's arena. Mirrors
+    /// [`HostMut::push_block_param`] with `func = self.id()`.
+    pub fn push_block_param(
+        &mut self,
+        cx: ContextView<'_, 'str>,
+        param: BlockParam<'str>,
+    ) -> BlockParamId {
+        let func = self.id;
+        HostMut::push_block_param(&mut self.host(cx), func, param)
+    }
+
+    /// Mint an `Int(size)`-typed instruction with `mnemonic`. Mirrors
+    /// [`HostMut::push_mnemonic`] with `func = self.id()`.
+    pub fn push_mnemonic(
+        &mut self,
+        cx: ContextView<'_, 'str>,
+        mnemonic: Mnemonic,
+        size: usize,
+    ) -> InstructionId {
+        let func = self.id;
+        HostMut::push_mnemonic(&mut self.host(cx), func, mnemonic, size)
+    }
+
+    /// Mint an instruction with `mnemonic` and an explicit result `type_id`.
+    /// Mirrors [`HostMut::push_mnemonic_with_type`] with `func = self.id()`.
+    pub fn push_mnemonic_with_type(
+        &mut self,
+        cx: ContextView<'_, 'str>,
+        mnemonic: Mnemonic,
+        type_id: TypeId,
+    ) -> InstructionId {
+        let func = self.id;
+        HostMut::push_mnemonic_with_type(&mut self.host(cx), func, mnemonic, type_id)
+    }
+
+    /// Insert `insn` immediately before `before` in `block`. Mirrors
+    /// [`HostMut::insert_insn_before`].
+    pub fn insert_insn_before(
+        &mut self,
+        cx: ContextView<'_, 'str>,
+        block: BlockId,
+        before: InstructionId,
+        insn: InstructionId,
+    ) {
+        HostMut::insert_insn_before(&mut self.host(cx), block, before, insn)
+    }
+
+    // ---- CFG / use-map verbs ------------------------------------------------
+
+    /// Add a directed CFG edge `from -> to`. Mirrors [`HostMut::add_cfg_edge`].
+    pub fn add_cfg_edge(
+        &mut self,
+        cx: ContextView<'_, 'str>,
+        from: BlockId,
+        to: BlockId,
+    ) -> EdgeId {
+        HostMut::add_cfg_edge(&mut self.host(cx), from, to)
+    }
+
+    /// Remove CFG edge `edge_id` from this body. Mirrors
+    /// [`HostMut::remove_cfg_edge`] with `func = self.id()`.
+    pub fn remove_cfg_edge(&mut self, cx: ContextView<'_, 'str>, edge_id: EdgeId) {
+        let func = self.id;
+        HostMut::remove_cfg_edge(&mut self.host(cx), func, edge_id)
+    }
+
+    /// Replace every use of `old` with `new` across this body. Mirrors
+    /// [`HostMut::replace_all_uses_with`].
+    pub fn replace_all_uses_with(&mut self, cx: ContextView<'_, 'str>, old: ValueId, new: ValueId) {
+        HostMut::replace_all_uses_with(&mut self.host(cx), old, new)
+    }
+
+    /// Remove instruction `id` from this body (unlink edges, tombstone, prune
+    /// uses). Mirrors [`HostMut::remove_instruction`].
+    pub fn remove_instruction(&mut self, cx: ContextView<'_, 'str>, id: InstructionId) {
+        HostMut::remove_instruction(&mut self.host(cx), id)
+    }
+
+    /// Rehome `remove`'s outgoing edges onto `keep` and drop the direct edge.
+    /// Mirrors [`HostMut::merge_nodes`].
+    pub fn merge_nodes(
+        &mut self,
+        cx: ContextView<'_, 'str>,
+        keep: BlockId,
+        remove: BlockId,
+        direct_edge: EdgeId,
+    ) {
+        HostMut::merge_nodes(&mut self.host(cx), keep, remove, direct_edge)
+    }
+
+    /// Replace an instruction's mnemonic in place, keeping use/call-site maps in
+    /// sync. Mirrors [`HostMut::replace_instruction_mnemonic`].
+    pub fn replace_instruction_mnemonic(
+        &mut self,
+        cx: ContextView<'_, 'str>,
+        id: InstructionId,
+        mnemonic: Mnemonic,
+    ) {
+        HostMut::replace_instruction_mnemonic(&mut self.host(cx), id, mnemonic)
+    }
+
+    /// Drop `block` from its owner's roster. Mirrors [`HostMut::unroster_block`].
+    pub fn unroster_block(&mut self, cx: ContextView<'_, 'str>, block: BlockId) {
+        HostMut::unroster_block(&mut self.host(cx), block)
+    }
+
+    /// Remove `block` from this body (unlink edges, remove insns, detach params,
+    /// tombstone). Mirrors [`HostMut::delete_block`] with `function_id = self.id()`.
+    pub fn delete_block(&mut self, cx: ContextView<'_, 'str>, block: BlockId) {
+        let func = self.id;
+        HostMut::delete_block(&mut self.host(cx), block, func)
+    }
+
+    /// Absorb `other` into `keep` across the direct edge `edge_ab`. Mirrors
+    /// [`HostMut::absorb_block`] with `function_id = self.id()`.
+    pub fn absorb_block(
+        &mut self,
+        cx: ContextView<'_, 'str>,
+        keep: BlockId,
+        other: BlockId,
+        edge_ab: EdgeId,
+    ) {
+        let func = self.id;
+        HostMut::absorb_block(&mut self.host(cx), keep, other, edge_ab, func)
+    }
+
+    /// Register `name` for `id` in the owning table (function-local for
+    /// block/insn/param, else global). Mirrors [`HostMut::register_local_name`].
+    pub fn register_local_name(
+        &mut self,
+        cx: ContextView<'_, 'str>,
+        id: ValueId,
+        name: std::borrow::Cow<'str, str>,
+        old_name: Option<&str>,
+    ) -> Result<()> {
+        HostMut::register_local_name(&mut self.host(cx), id, name, old_name)
+    }
+
+    // ---- mutable arena accessors --------------------------------------------
+    //
+    // These return `&mut` borrows *into this body*, so they cannot be routed
+    // through a freshly built `CheckedOut` (the temporary host would be dropped
+    // before the borrow is returned). They delegate straight to the underlying
+    // `Function` arena accessors — behaviour-identical to [`HostMut`]'s versions,
+    // which resolve to the same `self.fun.<arena>[id.local]` — and take no `cx`.
+
+    /// The instruction `id`, mutably. Mirror of [`HostMut::instruction_mut`].
+    pub fn instruction_mut(&mut self, id: InstructionId) -> &mut Instruction<'str> {
+        self.fun.insn_mut(id)
+    }
+
+    /// The block `id`, mutably. Mirror of [`HostMut::block_mut`].
+    pub fn block_mut(&mut self, id: BlockId) -> &mut BasicBlock<'str> {
+        self.fun.block_mut(id)
+    }
+
+    /// The block parameter `id`, mutably. Mirror of [`HostMut::block_param_mut`].
+    pub fn block_param_mut(&mut self, id: BlockParamId) -> &mut BlockParam<'str> {
+        self.fun.block_param_mut(id)
+    }
+
+    // ---- read accessors -----------------------------------------------------
+
+    /// The block `id`, routed to this body's arena. Mirror of [`HostRef::block`].
+    pub fn block<'a>(&'a self, cx: ContextView<'a, 'str>, id: BlockId) -> &'a BasicBlock<'str> {
+        self.read_host(cx).block(id)
+    }
+
+    /// The instruction `id`, routed to this body's arena. Mirror of
+    /// [`HostRef::instruction`].
+    pub fn insn<'a>(
+        &'a self,
+        cx: ContextView<'a, 'str>,
+        id: InstructionId,
+    ) -> &'a Instruction<'str> {
+        self.read_host(cx).instruction(id)
+    }
+
+    /// The block parameter `id`, routed to this body's arena. Mirror of
+    /// [`HostRef::block_param`].
+    pub fn block_param<'a>(
+        &'a self,
+        cx: ContextView<'a, 'str>,
+        id: BlockParamId,
+    ) -> &'a BlockParam<'str> {
+        self.read_host(cx).block_param(id)
+    }
+
+    // NB: the `edge` read accessor (`HostRef::edge`, returning `&EdgeData`) is
+    // intentionally NOT mirrored — `EdgeData` is `pub(crate)` in core, so it
+    // cannot be named from this crate (see the `push_edge` note above). No pass
+    // reads a raw `&EdgeData`; edge endpoints are reached through the wrapper-ref
+    // surface (`BlockRef::successors`, …).
+
+    /// This body's instructions that use `value` as an operand. Mirror of
+    /// [`Function::users_of`]; body-local, so it needs no `cx`.
+    pub fn users_of(&self, value: ValueId) -> &[InstructionId] {
+        self.fun.users_of(value)
+    }
+
+    // ---- wrapper-ref constructors -------------------------------------------
+
+    /// A [`BlockRef`] over `id`, routed to this body. Mirror of
+    /// [`HostRef::block_ref`].
+    pub fn block_ref<'a>(&'a self, cx: ContextView<'a, 'str>, id: BlockId) -> BlockRef<'str, 'a> {
+        self.read_host(cx).block_ref(id)
+    }
+
+    /// An [`InstructionRef`] over `id`, routed to this body. Mirror of
+    /// [`HostRef::insn_ref`].
+    pub fn insn_ref<'a>(
+        &'a self,
+        cx: ContextView<'a, 'str>,
+        id: InstructionId,
+    ) -> InstructionRef<'str, 'a> {
+        self.read_host(cx).insn_ref(id)
+    }
+
+    /// A [`BlockParamRef`] over `id`, routed to this body. Mirror of
+    /// [`HostRef::param_ref`].
+    pub fn param_ref<'a>(
+        &'a self,
+        cx: ContextView<'a, 'str>,
+        id: BlockParamId,
+    ) -> BlockParamRef<'str, 'a> {
+        self.read_host(cx).param_ref(id)
+    }
+
+    /// A [`FunctionRef`] over `f` (interface-routed for a foreign function).
+    /// Mirror of [`HostRef::function_ref`].
+    pub fn function_ref<'a>(
+        &'a self,
+        cx: ContextView<'a, 'str>,
+        f: FunctionId,
+    ) -> FunctionRef<'str, 'a> {
+        self.read_host(cx).function_ref(f)
+    }
+
+    /// A [`FunctionRef`] over this body's *own* function. The self-directed twin
+    /// of [`function_ref`](Self::function_ref).
+    pub fn self_ref<'a>(&'a self, cx: ContextView<'a, 'str>) -> FunctionRef<'str, 'a> {
+        self.read_host(cx).function_ref(self.id)
     }
 }
