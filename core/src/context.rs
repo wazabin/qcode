@@ -611,8 +611,8 @@ impl<'str> Context<'str> {
         // a legitimate cross-function edge. Composite `EdgeId` routing lets both
         // incident blocks reference it regardless of which arena holds it.
         let edge_id = self.values.push_edge(from.func, EdgeData { from, to });
-        BasicBlock::from_id_mut(self, from).add_edge(edge_id);
-        BasicBlock::from_id_mut(self, to).add_edge(edge_id);
+        BasicBlock::from_id_mut(self, from).add_edge(from.func, edge_id);
+        BasicBlock::from_id_mut(self, to).add_edge(from.func, edge_id);
         edge_id
     }
 
@@ -621,10 +621,10 @@ impl<'str> Context<'str> {
     /// The backing [`EdgeData`] slot in the append-only registry is left in
     /// place (dangling), consistent with how removed instructions are handled;
     /// per-block traversal reads the block edge sets, which this updates.
-    pub fn remove_cfg_edge(&mut self, edge_id: EdgeId) {
-        let &EdgeData { from, to } = self.values.edge(edge_id);
-        BasicBlock::from_id_mut(self, from).remove_edge(edge_id);
-        BasicBlock::from_id_mut(self, to).remove_edge(edge_id);
+    pub fn remove_cfg_edge(&mut self, func: FunctionId, edge_id: EdgeId) {
+        let &EdgeData { from, to } = self.values.edge(func, edge_id);
+        BasicBlock::from_id_mut(self, from).remove_edge(func, edge_id);
+        BasicBlock::from_id_mut(self, to).remove_edge(func, edge_id);
     }
 
     /// Relocate every block in `olds` — each owned by `target` but *stored* in a
@@ -723,12 +723,14 @@ impl<'str> Context<'str> {
         // the moved endpoint(s) to the clone. Collect the incident edge ids first
         // (an edge between two relocated blocks appears in both edge sets — the set
         // dedups it).
-        let mut incident: HashSet<EdgeId> = HashSet::default();
+        // Each incident edge is already tagged with the function whose arena stores
+        // it (a block's edge set holds `(FunctionId, EdgeId)` pairs).
+        let mut incident: HashSet<(FunctionId, EdgeId)> = HashSet::default();
         for &old in olds {
             incident.extend(self.values.block(old).edges.iter().copied());
         }
-        for edge in incident {
-            let EdgeData { from, to } = *self.values.edge(edge);
+        for (edge_func, edge) in incident {
+            let EdgeData { from, to } = *self.values.edge(edge_func, edge);
             let new_from = block_map.get(&from).copied().unwrap_or(from);
             let new_to = block_map.get(&to).copied().unwrap_or(to);
             self.add_cfg_edge(new_from, new_to);
@@ -1197,7 +1199,7 @@ impl<'str> Context<'str> {
                 }
 
                 for edge_id in edges_to_remove {
-                    self.remove_cfg_edge(edge_id);
+                    self.remove_cfg_edge(block_id.func, edge_id);
                 }
             }
         }
@@ -1669,7 +1671,7 @@ mod tests {
             .rename("start".into())
             .unwrap();
         let e = ctx_a.add_cfg_edge(entry, bb1);
-        ctx_a.remove_cfg_edge(e);
+        ctx_a.remove_cfg_edge(entry.func, e);
         ctx_a.replace_all_uses_with(ValueId::Instruction(a), ValueId::Instruction(b));
         ctx_a.remove_instruction(a);
         BlockParam::from_id_mut(&mut ctx_a, param).set_size(4);
@@ -1689,7 +1691,7 @@ mod tests {
             let mut r = BaseRef::new(host.reborrow(), entry_b);
             r.rename("start".into()).unwrap();
             let e = host.add_cfg_edge(entry_b, bb1_b);
-            host.remove_cfg_edge(e);
+            host.remove_cfg_edge(entry_b.func, e);
             host.replace_all_uses_with(ValueId::Instruction(a_b), ValueId::Instruction(b_b));
             host.remove_instruction(a_b);
             let mut r = BaseRef::new(host.reborrow(), param_b);
@@ -2119,7 +2121,7 @@ mod tests {
             vec![(edge, a)]
         );
 
-        ctx.remove_cfg_edge(edge);
+        ctx.remove_cfg_edge(a.func, edge);
         assert!(BasicBlock::from_id(&ctx, a).successors().next().is_none());
         assert!(BasicBlock::from_id(&ctx, b).predecessors().next().is_none());
     }

@@ -24,7 +24,7 @@ use std::{
 use rustc_hash::FxHashMap as HashMap;
 
 pub(crate) use self::cfg::EdgeData;
-pub use self::cfg::{BlockId, EdgeId, EdgeMutRef, EdgeRef};
+pub use self::cfg::{BlockId, EdgeId};
 pub mod cfg;
 
 /// A block of instructions.
@@ -44,11 +44,20 @@ pub struct BasicBlock<'str> {
     /// The ids of the instructions in this block
     pub instructions: Vec<InstructionId>,
 
-    /// The set of edges that this block is incident to.
+    /// The set of edges that this block is incident to, each paired with the
+    /// function whose arena stores it (its `from` block's function — see
+    /// [`add_cfg_edge`](crate::context::Context::add_cfg_edge)).
+    ///
+    /// Since a plain body-local [`EdgeId`] no longer carries its owning function
+    /// (stage 4), the pair is what makes an incident edge globally resolvable: a
+    /// block's set may mix its own outgoing edges (stored here) with incoming
+    /// edges from predecessors in *other* functions (a transient cross-function
+    /// edge during discovery, stored there), whose local ids could otherwise
+    /// collide.
     ///
     /// Uses a fixed-seed hasher (matching `Context`'s `Graph::Hasher`) so that
     /// `predecessors()`/`successors()` iterate deterministically across runs.
-    pub edges: HashSet<EdgeId, FxBuildHasher>,
+    pub edges: HashSet<(FunctionId, EdgeId), FxBuildHasher>,
 
     /// The address of this block, if it corresponds to a machine address.
     pub address: Option<u64>,
@@ -321,10 +330,14 @@ where
     pub fn successors(&'s self) -> impl Iterator<Item = (EdgeId, BlockId)> + 's {
         let host = self.host();
         let id = self.id;
-        self.inner().edges.iter().copied().filter_map(move |edge| {
-            let e = host.edge(edge);
-            (e.from == id).then_some((edge, e.to))
-        })
+        self.inner()
+            .edges
+            .iter()
+            .copied()
+            .filter_map(move |(func, edge)| {
+                let e = host.edge(func, edge);
+                (e.from == id).then_some((edge, e.to))
+            })
     }
 
     /// Iterates over incoming `(edge_id, predecessor_block_id)` pairs. See
@@ -332,10 +345,14 @@ where
     pub fn predecessors(&'s self) -> impl Iterator<Item = (EdgeId, BlockId)> + 's {
         let host = self.host();
         let id = self.id;
-        self.inner().edges.iter().copied().filter_map(move |edge| {
-            let e = host.edge(edge);
-            (e.to == id).then_some((edge, e.from))
-        })
+        self.inner()
+            .edges
+            .iter()
+            .copied()
+            .filter_map(move |(func, edge)| {
+                let e = host.edge(func, edge);
+                (e.to == id).then_some((edge, e.from))
+            })
     }
 
     pub fn name(&'s self) -> Option<&'ctx str> {
@@ -779,16 +796,16 @@ impl<'str, 'ctx> BlockMutRef<'str, 'ctx> {
         }
     }
 
-    /// Adds an edge to this block's edge set.
+    /// Adds an edge (stored in function `func`) to this block's edge set.
     /// DO NOT USE THIS
-    pub(crate) fn add_edge(&mut self, edge_id: EdgeId) {
-        self.inner_mut().edges.insert(edge_id);
+    pub(crate) fn add_edge(&mut self, func: FunctionId, edge_id: EdgeId) {
+        self.inner_mut().edges.insert((func, edge_id));
     }
 
-    /// Removes an edge from this block's edge set.
+    /// Removes an edge (stored in function `func`) from this block's edge set.
     /// DO NOT USE THIS
-    pub(crate) fn remove_edge(&mut self, edge_id: EdgeId) {
-        self.inner_mut().edges.remove(&edge_id);
+    pub(crate) fn remove_edge(&mut self, func: FunctionId, edge_id: EdgeId) {
+        self.inner_mut().edges.remove(&(func, edge_id));
     }
 
     /// Removes the last instruction from this block.

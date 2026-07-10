@@ -74,7 +74,7 @@ macro_rules! composite_id {
     };
 }
 
-pub use block::cfg::{LocalBlockId, LocalEdgeId};
+pub use block::cfg::LocalBlockId;
 pub use block::{BasicBlock, BlockId, BlockMutRef, BlockRef};
 pub use block_param::{BlockParam, BlockParamId, BlockParamMutRef, BlockParamRef, LocalParamId};
 pub use bytes::{

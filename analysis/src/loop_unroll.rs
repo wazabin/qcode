@@ -462,7 +462,7 @@ pub(crate) fn replace_terminator_with_branch<'str, H: HostMut<'str>>(
         .map(|(edge, _)| edge)
         .collect::<Vec<_>>();
     for edge in old_successors {
-        host.remove_cfg_edge(edge);
+        host.remove_cfg_edge(block.func, edge);
     }
 
     // Reuse the existing terminator only if the block actually ends in one. The

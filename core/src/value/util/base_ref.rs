@@ -85,9 +85,9 @@ impl<'a, 'str> HostRef<'a, 'str> {
         &self.function(id.func).params[id.local]
     }
 
-    /// The CFG edge `id`, routed to its owning function's arena.
-    pub fn edge(self, id: EdgeId) -> &'a EdgeData {
-        &self.function(id.func).edges[id.local]
+    /// The CFG edge `id`, stored in function `func`'s edge arena.
+    pub fn edge(self, func: FunctionId, id: EdgeId) -> &'a EdgeData {
+        &self.function(func).edges[id]
     }
 
     /// The [`TypeId`] of `id`, routing arena-cluster values (instruction,

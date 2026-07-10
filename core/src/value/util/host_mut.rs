@@ -175,8 +175,7 @@ pub trait HostMut<'str> {
     // ---- births -------------------------------------------------------------
 
     fn push_edge(&mut self, func: FunctionId, edge: EdgeData) -> EdgeId {
-        let local = self.function_mut(func).edges.push(edge);
-        EdgeId::new(func, local)
+        self.function_mut(func).edges.push(edge)
     }
 
     /// Push a fresh instruction into `func`'s arena, recording each operand's use
@@ -271,17 +270,17 @@ pub trait HostMut<'str> {
     /// are always updated.
     fn add_cfg_edge(&mut self, from: BlockId, to: BlockId) -> EdgeId {
         let edge_id = self.push_edge(from.func, EdgeData { from, to });
-        self.block_mut(from).edges.insert(edge_id);
-        self.block_mut(to).edges.insert(edge_id);
+        self.block_mut(from).edges.insert((from.func, edge_id));
+        self.block_mut(to).edges.insert((from.func, edge_id));
         edge_id
     }
 
     /// Removes a CFG edge, unlinking it from both incident blocks. The backing
     /// `EdgeData` slot is left dangling. Mirrors [`Context::remove_cfg_edge`].
-    fn remove_cfg_edge(&mut self, edge_id: EdgeId) {
-        let EdgeData { from, to } = *self.read_host().edge(edge_id);
-        self.block_mut(from).edges.remove(&edge_id);
-        self.block_mut(to).edges.remove(&edge_id);
+    fn remove_cfg_edge(&mut self, func: FunctionId, edge_id: EdgeId) {
+        let EdgeData { from, to } = *self.read_host().edge(func, edge_id);
+        self.block_mut(from).edges.remove(&(func, edge_id));
+        self.block_mut(to).edges.remove(&(func, edge_id));
     }
 
     /// Replaces every use of `old` with `new` across its owning function's
@@ -338,11 +337,12 @@ pub trait HostMut<'str> {
                         .edges
                         .iter()
                         .copied()
-                        .filter(|&e| host.edge(e).from == block_id)
+                        .filter(|&(f, e)| host.edge(f, e).from == block_id)
+                        .map(|(_, e)| e)
                         .collect()
                 };
                 for edge_id in succ {
-                    self.remove_cfg_edge(edge_id);
+                    self.remove_cfg_edge(block_id.func, edge_id);
                 }
             }
         }
@@ -371,21 +371,25 @@ pub trait HostMut<'str> {
     /// between them (host-routed mirror of `jstd`'s `Graph::merge_nodes`, which
     /// operates over the whole-context graph). The caller tombstones `remove`.
     fn merge_nodes(&mut self, keep: BlockId, remove: BlockId, direct_edge: EdgeId) {
-        self.block_mut(keep).edges.remove(&direct_edge);
-        self.block_mut(remove).edges.remove(&direct_edge);
+        // Both blocks and every edge here belong to one function (a merge is
+        // intra-function), so `keep.func` names the arena storing them all.
+        let func = keep.func;
+        self.block_mut(keep).edges.remove(&(func, direct_edge));
+        self.block_mut(remove).edges.remove(&(func, direct_edge));
         let outgoing: Vec<EdgeId> = {
             let host = self.read_host();
             host.block(remove)
                 .edges
                 .iter()
                 .copied()
-                .filter(|&e| host.edge(e).from == remove)
+                .filter(|&(f, e)| host.edge(f, e).from == remove)
+                .map(|(_, e)| e)
                 .collect()
         };
         for eid in outgoing {
-            self.function_mut(eid.func).edges[eid.local].from = keep;
-            self.block_mut(keep).edges.insert(eid);
-            self.block_mut(remove).edges.remove(&eid);
+            self.function_mut(func).edges[eid].from = keep;
+            self.block_mut(keep).edges.insert((func, eid));
+            self.block_mut(remove).edges.remove(&(func, eid));
         }
     }
 
@@ -442,15 +446,15 @@ pub trait HostMut<'str> {
     /// its instructions, detach its params, and tombstone it. Host-routed port of
     /// the former `BlockMutRef::delete`.
     fn delete_block(&mut self, block: BlockId, _function_id: FunctionId) {
-        let edges: Vec<EdgeId> = self
+        let edges: Vec<(FunctionId, EdgeId)> = self
             .read_host()
             .block(block)
             .edges
             .iter()
             .copied()
             .collect();
-        for edge in edges {
-            self.remove_cfg_edge(edge);
+        for (func, edge) in edges {
+            self.remove_cfg_edge(func, edge);
         }
         let insns: Vec<InstructionId> = self.read_host().block(block).instructions.clone();
         for insn in insns {

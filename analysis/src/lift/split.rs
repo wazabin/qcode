@@ -148,8 +148,10 @@ fn convert_cross_function_tail_calls(ctx: &mut Context) -> bool {
     // needs a fresh intra-function trampoline block ending in a `TailCall`, since a
     // `TailCall` is unconditional and cannot itself be a `CBranch` arm.
     let mut cond_calls: Vec<(qcode::value::insn::InstructionId, BlockId, FunctionId)> = Vec::new();
-    // Every cross-function CFG edge, converted or residual, is stripped.
-    let mut stale: Vec<EdgeId> = Vec::new();
+    // Every cross-function CFG edge, converted or residual, is stripped. Each is
+    // paired with the function whose arena stores it (its `from` block's storage
+    // function) so the plain body-local `EdgeId` can be resolved on removal.
+    let mut stale: Vec<(FunctionId, EdgeId)> = Vec::new();
 
     // Resolve a static terminator target to the foreign function whose *entry* it is
     // (the only cross-function shape that survives after `promote_cross_function_landings`
@@ -171,7 +173,7 @@ fn convert_cross_function_tail_calls(ctx: &mut Context) -> bool {
                 continue;
             };
             if succ_owner != owner {
-                stale.push(edge);
+                stale.push((block.id.func, edge));
             }
         }
 
@@ -241,8 +243,8 @@ fn convert_cross_function_tail_calls(ctx: &mut Context) -> bool {
         }
         ctx.replace_instruction_mnemonic(insn, Mnemonic::CBranch(cb));
     }
-    for edge in stale {
-        ctx.remove_cfg_edge(edge);
+    for (func, edge) in stale {
+        ctx.remove_cfg_edge(func, edge);
     }
     changed
 }

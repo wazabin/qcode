@@ -283,7 +283,7 @@ fn clear_successors(ctx: &mut Context, from: BlockId) {
         .map(|(edge, _)| edge)
         .collect();
     for edge in edges {
-        ctx.remove_cfg_edge(edge);
+        ctx.remove_cfg_edge(from.func, edge);
     }
 }
 

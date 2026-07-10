@@ -204,14 +204,14 @@ impl<'str> ValueRegistry<'str> {
         &mut self.functions[id.func].params[id.local]
     }
 
-    /// Borrows the CFG edge `id`.
-    pub fn edge(&self, id: EdgeId) -> &EdgeData {
-        &self.functions[id.func].edges[id.local]
+    /// Borrows the CFG edge `id`, stored in function `func`'s edge arena.
+    pub fn edge(&self, func: FunctionId, id: EdgeId) -> &EdgeData {
+        &self.functions[func].edges[id]
     }
 
-    /// Mutably borrows the CFG edge `id`.
-    pub fn edge_mut(&mut self, id: EdgeId) -> &mut EdgeData {
-        &mut self.functions[id.func].edges[id.local]
+    /// Mutably borrows the CFG edge `id`, stored in function `func`'s edge arena.
+    pub fn edge_mut(&mut self, func: FunctionId, id: EdgeId) -> &mut EdgeData {
+        &mut self.functions[func].edges[id]
     }
 
     /// Returns the instructions that use `value` as an operand, read from
@@ -321,8 +321,7 @@ impl<'str> ValueRegistry<'str> {
     }
 
     pub fn push_edge(&mut self, func: FunctionId, edge: EdgeData) -> EdgeId {
-        let local = self.functions[func].edges.push(edge);
-        EdgeId::new(func, local)
+        self.functions[func].edges.push(edge)
     }
 
     pub fn push_varnode(&mut self, varnode: Varnode<'str>) -> VarnodeId {

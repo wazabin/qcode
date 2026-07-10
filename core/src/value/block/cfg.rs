@@ -5,25 +5,21 @@ use jstd::{
     graph::{Cfg, FxBuildHasher},
 };
 
-use crate::{
-    context::Context,
-    value::{
-        BasicBlock, BlockRef,
-        function::FunctionRef,
-        util::base_ref::{BaseRef, WithCtx, WithHost},
-    },
-};
+use crate::value::{BlockRef, function::FunctionRef, util::base_ref::WithHost};
 
 /// Function-local block index (indexes the owning [`Function`]'s block arena).
 #[derive(Identifier)]
 pub struct LocalBlockId(u32);
 
-/// Function-local CFG-edge index (indexes the owning [`Function`]'s edge arena).
-#[derive(Identifier)]
-pub struct LocalEdgeId(u32);
-
 crate::composite_id!(BlockId, LocalBlockId);
-crate::composite_id!(EdgeId, LocalEdgeId);
+
+/// Function-local CFG-edge index. A plain body-local id (stage 4): it indexes
+/// the owning [`Function`]'s edge arena directly and carries **no** function
+/// qualifier. Global addressing of an edge is the explicit pair
+/// `(FunctionId, EdgeId)`; every edge is stored in its `from` block's function,
+/// so the owning function is recoverable from either incident block.
+#[derive(Identifier)]
+pub struct EdgeId(u32);
 
 #[derive(Debug, Default, Clone, serde::Serialize, serde::Deserialize)]
 pub struct EdgeData {
@@ -31,46 +27,12 @@ pub struct EdgeData {
     pub to: BlockId,
 }
 
-impl<'s, 'ctx: 's, 'str: 'ctx, Ctx> BaseRef<Ctx, EdgeId>
-where
-    Self: WithCtx<'s, 'ctx, 'str>,
-{
-    fn inner(&'s self) -> &'ctx EdgeData {
-        self.ctx().values.edge(self.id)
-    }
-
-    pub fn from(&'s self) -> BlockRef<'str, 'ctx> {
-        let from = self.inner().from;
-        BasicBlock::from_id(self.ctx(), from)
-    }
-
-    pub fn to(&'s self) -> BlockRef<'str, 'ctx> {
-        let to = self.inner().to;
-        BasicBlock::from_id(self.ctx(), to)
-    }
-}
-
-pub type EdgeRef<'str, 'ctx> = BaseRef<&'ctx Context<'str>, EdgeId>;
-
-impl<'s, 'ctx: 's, 'str: 'ctx> WithCtx<'s, 's, 'str> for EdgeRef<'str, 'ctx> {
-    fn ctx(&'s self) -> &'s Context<'str> {
-        self.ctx
-    }
-}
-
-pub type EdgeMutRef<'str, 'ctx> = BaseRef<&'ctx mut Context<'str>, EdgeId>;
-
-impl<'str, 'ctx> EdgeMutRef<'str, 'ctx> {
-    pub fn inner_mut(&mut self) -> &mut EdgeData {
-        self.ctx.values.edge_mut(self.id)
-    }
-}
-
-impl<'s, 'ctx: 's, 'str: 'ctx> WithCtx<'s, 's, 'str> for EdgeMutRef<'str, 'ctx> {
-    fn ctx(&'s self) -> &'s Context<'str> {
-        self.ctx
-    }
-}
+// A plain body-local [`EdgeId`] no longer self-describes its owning function, so
+// the old whole-context `EdgeRef`/`EdgeMutRef` wrappers (which resolved
+// `values.edge(id)` without a function) are gone. Edges are read through
+// `Function::edge(id)` / `HostRef::edge(func, id)` with the owning function named
+// explicitly. `EdgeData`'s `from`/`to` are still `BlockId`s, so an edge's
+// endpoints resolve as blocks directly.
 
 // ---------------------------------------------------------------------------
 // A CFG rooted at a single function.

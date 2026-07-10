@@ -94,7 +94,7 @@ pub fn assume_call_returns(ctx: &mut Context) -> usize {
                 .map(|(edge, _)| edge)
                 .collect();
             for edge in edges {
-                ctx.remove_cfg_edge(edge);
+                ctx.remove_cfg_edge(call_block.func, edge);
                 count += 1;
             }
         }

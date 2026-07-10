@@ -233,7 +233,7 @@ fn try_fold_cbranch<'str, H: HostMut<'str>>(host: &mut H, block_id: BlockId) -> 
         .map(|(e, _)| e)
         .nth(1);
     if let Some(dup_edge) = dup_edge {
-        host.remove_cfg_edge(dup_edge);
+        host.remove_cfg_edge(block_id.func, dup_edge);
     }
 
     true
@@ -406,7 +406,7 @@ fn try_bypass_empty_block<'str, H: HostMut<'str>>(
             .collect();
         host.replace_instruction_mnemonic(p_term, new_mnemonic);
         for &edge in &redirect {
-            host.remove_cfg_edge(edge);
+            host.remove_cfg_edge(p.func, edge);
         }
         for _ in &redirect {
             host.add_cfg_edge(p, target);

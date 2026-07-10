@@ -18,7 +18,7 @@ use crate::{
         BasicBlock, BlockId, BlockRef, Instruction, InstructionId, Value, ValueId, Varnode,
         VarnodeId,
         block::EdgeData,
-        block::cfg::{EdgeId, LocalBlockId, LocalEdgeId},
+        block::cfg::{EdgeId, LocalBlockId},
         block_param::{BlockParam, BlockParamId, LocalParamId},
         insn::{Branch, LocalInsnId, Mnemonic},
         util::{
@@ -100,8 +100,9 @@ pub struct Function<'str> {
     /// Block-parameter storage for this function.
     pub(crate) params: Registry<LocalParamId, BlockParam<'str>>,
 
-    /// CFG-edge storage for this function.
-    pub(crate) edges: Registry<LocalEdgeId, EdgeData>,
+    /// CFG-edge storage for this function. Keyed by the plain body-local
+    /// [`EdgeId`](crate::value::block::EdgeId) (stage 4).
+    pub(crate) edges: Registry<EdgeId, EdgeData>,
 
     /// Addresses of every machine instruction lifted into this function, in
     /// ascending order. Recorded during recursive disassembly and preserved
@@ -245,7 +246,7 @@ impl<'str> Function<'str> {
     }
     /// The CFG edge `id`, by its function-local index.
     pub fn edge(&self, id: EdgeId) -> &EdgeData {
-        &self.edges[id.local]
+        &self.edges[id]
     }
 
     /// Gets a reference to a function from its ID
@@ -764,12 +765,7 @@ where
     /// Includes dangling edges (removal leaves the `EdgeData` slot in place),
     /// matching the previous whole-context `Graph::edges` behavior.
     pub fn edge_ids(&'s self) -> Vec<crate::value::block::EdgeId> {
-        let func = self.id;
-        self.inner()
-            .edges
-            .iter()
-            .map(|e| crate::value::block::EdgeId::new(func, e.id))
-            .collect()
+        self.inner().edges.iter().map(|e| e.id).collect()
     }
 
     /// Iterates over the (live) blocks in this function in arena order (i.e. not
