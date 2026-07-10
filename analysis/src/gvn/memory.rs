@@ -15,7 +15,9 @@ use super::affine::Numbering;
 use std::any::Any;
 
 use super::mem_forward::MemForward;
-use super::walk::{Claim, Editor, InsnCtx, SubPass};
+use super::walk::{Claim, Editor, InsnCtx, SubPass, SubPassC};
+
+use crate::{ContextView, FunctionBody};
 
 /// Memory forwarding reasons across a whole function (loop-header pruning,
 /// post-call clobbers). Fully host-routed — every read goes through a
@@ -97,6 +99,100 @@ impl<'str, H: HostMut<'str>> SubPass<'str, H> for MemoryForwarding {
     ) {
         let state = state.downcast_mut::<MemForward>().expect("memory state");
         state.prune_clobbered_by_call(host.read_host(), block_id, aliases);
+    }
+}
+
+/// Concrete twin of the [`SubPass`] impl above (context-split stage 5b-ii):
+/// reads route through `body.read_host(cx)`, the load forward through `Editor`'s
+/// `_c` method, and the [`MemForward`] rebuild/record helpers (`record_store`,
+/// `try_load`) are reached through a scoped `body.host(cx)` — they stay generic
+/// because the generic path shares them.
+impl<'str> SubPassC<'str> for MemoryForwarding {
+    fn init_state(&self) -> Box<dyn Any> {
+        Box::new(MemForward::default())
+    }
+
+    fn clone_state(&self, state: &dyn Any) -> Box<dyn Any> {
+        Box::new(
+            state
+                .downcast_ref::<MemForward>()
+                .expect("memory state")
+                .clone(),
+        )
+    }
+
+    fn on_block_entry(
+        &self,
+        body: &mut FunctionBody<'str>,
+        cx: ContextView<'_, 'str>,
+        state: &mut dyn Any,
+        block_id: BlockId,
+        tree: &DominatorTree<BlockId>,
+        aliases: Option<&AliasResult>,
+        numbering: &Numbering,
+        is_shared: bool,
+    ) {
+        let state = state.downcast_mut::<MemForward>().expect("memory state");
+        if is_shared {
+            state.clear();
+        }
+        state.prune_loop_carried(body.read_host(cx), block_id, tree, aliases, numbering);
+    }
+
+    fn on_insn(
+        &self,
+        body: &mut FunctionBody<'str>,
+        cx: ContextView<'_, 'str>,
+        state: &mut dyn Any,
+        ic: &InsnCtx,
+        ed: &mut Editor,
+    ) -> Claim {
+        let state = state.downcast_mut::<MemForward>().expect("memory state");
+        match ic.mnemonic {
+            Mnemonic::Store(store) => {
+                // `record_store` is a shared HostMut helper; reach it through a
+                // scoped host. TODO(5b-ii): migrate MemForward off HostMut.
+                let mut host = body.host(cx);
+                state.record_store(&mut host, store, ic.aliases, ic.numbering);
+                Claim::Done
+            }
+            Mnemonic::Load(load) => {
+                // TODO(5b-ii): `try_load` is a shared HostMut helper; scoped host.
+                let forwarded = {
+                    let mut host = body.host(cx);
+                    state.try_load(
+                        &mut host,
+                        ic.block_id,
+                        ic.insn_id,
+                        load,
+                        ic.aliases,
+                        ic.numbering,
+                    )
+                };
+                match forwarded {
+                    Some(value) => {
+                        ed.replace_c(body, cx, ic.insn_id, value);
+                        state.define_load(load, value, ic.aliases, ic.numbering);
+                    }
+                    None => state.define_load(load, ic.id, ic.aliases, ic.numbering),
+                }
+                Claim::Done
+            }
+            _ => Claim::Pass,
+        }
+    }
+
+    fn after_block(
+        &self,
+        body: &mut FunctionBody<'str>,
+        cx: ContextView<'_, 'str>,
+        state: &mut dyn Any,
+        block_id: BlockId,
+        aliases: Option<&AliasResult>,
+        _numbering: &Numbering,
+    ) {
+        let state = state.downcast_mut::<MemForward>().expect("memory state");
+        state.prune_clobbered_by_call(body.read_host(cx), block_id, aliases);
     }
 }
 
