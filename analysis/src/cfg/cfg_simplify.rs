@@ -1,6 +1,5 @@
 use qcode::value::{
-    BlockId, BlockParamId, FunctionId, FunctionRef, ValueId,
-    block::BlockRef,
+    BlockId, BlockParamId, FunctionId, ValueId,
     insn::{Branch, Mnemonic},
     util::host_mut::HostMut,
 };
@@ -52,7 +51,7 @@ pub fn simplify_cfg<'str, H: HostMut<'str>>(host: &mut H, function_id: FunctionI
     let mut changed = false;
 
     loop {
-        let blocks = FunctionRef::new(host.read_host(), function_id).block_ids();
+        let blocks = host.function_ref(function_id).block_ids();
         let mut progress = prune_unreachable(host, function_id);
 
         for block_id in blocks {
@@ -85,10 +84,7 @@ pub fn simplify_cfg<'str, H: HostMut<'str>>(host: &mut H, function_id: FunctionI
 /// on no run, so nothing it computes or branches to is observable. This is what
 /// lets a dead loop, once `dce` reroutes its preheader past it, disappear.
 fn prune_unreachable<'str, H: HostMut<'str>>(host: &mut H, function_id: FunctionId) -> bool {
-    let Some(root) = FunctionRef::new(host.read_host(), function_id)
-        .root()
-        .map(|b| b.id)
-    else {
+    let Some(root) = host.function_ref(function_id).root().map(|b| b.id) else {
         return false;
     };
 
@@ -99,14 +95,12 @@ fn prune_unreachable<'str, H: HostMut<'str>>(host: &mut H, function_id: Function
         if !reachable.insert(b) {
             continue;
         }
-        let succs: Vec<BlockId> = BlockRef::new(host.read_host(), b)
-            .successors()
-            .map(|(_, s)| s)
-            .collect();
+        let succs: Vec<BlockId> = host.block_ref(b).successors().map(|(_, s)| s).collect();
         stack.extend(succs);
     }
 
-    let dead: Vec<BlockId> = FunctionRef::new(host.read_host(), function_id)
+    let dead: Vec<BlockId> = host
+        .function_ref(function_id)
         .block_ids()
         .into_iter()
         .filter(|b| !reachable.contains(b))
@@ -137,25 +131,22 @@ fn merge_candidate<'str, H: HostMut<'str>>(
 ) -> Option<(qcode::value::block::EdgeId, BlockId)> {
     // Collect at most 2 successors to check the "exactly one" condition.
     // Collecting eagerly releases the immutable borrow before any mutation.
-    let a_succs: Vec<_> = BlockRef::new(host.read_host(), a_id)
-        .successors()
-        .take(2)
-        .collect();
+    let a_succs: Vec<_> = host.block_ref(a_id).successors().take(2).collect();
 
     let &(edge_ab, b_id) = a_succs.first()?;
     if a_succs.len() != 1 || b_id == a_id {
         return None; // more than one successor, or a self-loop
     }
-    if BlockRef::new(host.read_host(), b_id).predecessors().count() != 1 {
+    if host.block_ref(b_id).predecessors().count() != 1 {
         return None;
     }
 
     // A's terminal must be an unconditional Branch to B.
-    let a_terminal = host.read_host().block(a_id).instructions.last().copied();
+    let a_terminal = host.block_ref(a_id).instruction_ids().last().copied();
     let is_branch_to_b = a_terminal
         .map(|id| {
             matches!(
-                host.read_host().instruction(id).mnemonic(),
+                host.insn_ref(id).mnemonic(),
                 Mnemonic::Branch(b) if b.target == b_id
             )
         })
@@ -169,9 +160,9 @@ fn merge_candidate<'str, H: HostMut<'str>>(
     // CRT stub's tail `jmp` into another routine that mem2reg gave a param,
     // lifted as an intra-function `goto` carrying no args. Leave such edges
     // unmerged rather than absorbing an unsatisfiable param.
-    let b_params = host.read_host().block(b_id).params.len();
+    let b_params = host.block_ref(b_id).num_params();
     let branch_args = a_terminal
-        .and_then(|id| match host.read_host().instruction(id).mnemonic() {
+        .and_then(|id| match host.insn_ref(id).mnemonic() {
             Mnemonic::Branch(b) => Some(b.args.len()),
             _ => None,
         })
@@ -203,7 +194,9 @@ fn try_merge_block<'str, H: HostMut<'str>>(
     // shared CRT stubs, thunks) — must not be absorbed: `absorb_block` →
     // `unroster_block` mutates the *owner*'s roster, which a checked-out pass may
     // not do. A cross-function successor (thunk/tail-call) is likewise left as-is.
-    if b_id.func != function_id || host.read_host().block(b_id).parent != Some(function_id) {
+    if b_id.func != function_id
+        || host.function(function_id).block(b_id).parent != Some(function_id)
+    {
         return false;
     }
     host.absorb_block(a_id, b_id, edge_ab, function_id);
@@ -217,18 +210,11 @@ fn try_merge_block<'str, H: HostMut<'str>>(
 /// The `CBranch` contributed two parallel CFG edges to the shared target; one
 /// is dropped so the edge multiplicity matches the new single-successor branch.
 fn try_fold_cbranch<'str, H: HostMut<'str>>(host: &mut H, block_id: BlockId) -> bool {
-    let Some(term_id) = host
-        .read_host()
-        .block(block_id)
-        .instructions
-        .last()
-        .copied()
-    else {
+    let Some(term_id) = host.block_ref(block_id).instruction_ids().last().copied() else {
         return false;
     };
     let (target, args) = {
-        let host_ref = host.read_host();
-        let Mnemonic::CBranch(cb) = host_ref.instruction(term_id).mnemonic() else {
+        let Mnemonic::CBranch(cb) = host.insn_ref(term_id).mnemonic() else {
             return false;
         };
         if cb.success_block != cb.failure_block || cb.success_args != cb.failure_args {
@@ -240,7 +226,8 @@ fn try_fold_cbranch<'str, H: HostMut<'str>>(host: &mut H, block_id: BlockId) -> 
 
     // Collapse the two parallel `block -> target` edges into one: keep the
     // first, drop the second.
-    let dup_edge = BlockRef::new(host.read_host(), block_id)
+    let dup_edge = host
+        .block_ref(block_id)
         .successors()
         .filter(|&(_, to)| to == target)
         .map(|(e, _)| e)
@@ -275,19 +262,18 @@ fn try_bypass_empty_block<'str, H: HostMut<'str>>(
     b_id: BlockId,
 ) -> bool {
     // The entry block dominates everything; deleting it would orphan the body.
-    if host.read_host().function(function_id).root == Some(b_id) {
+    if host.function(function_id).root == Some(b_id) {
         return false;
     }
 
     // B must hold exactly one instruction, an unconditional branch.
     let (term_id, target, b_args) = {
-        let host_ref = host.read_host();
-        let b = host_ref.block(b_id);
+        let b = host.function(function_id).block(b_id);
         if b.instructions.len() != 1 {
             return false;
         }
         let term_id = b.instructions[0];
-        match host_ref.instruction(term_id).mnemonic() {
+        match host.function(function_id).insn(term_id).mnemonic() {
             Mnemonic::Branch(br) => (term_id, br.target, br.args.clone()),
             _ => return false,
         }
@@ -301,15 +287,14 @@ fn try_bypass_empty_block<'str, H: HostMut<'str>>(
         return false;
     }
 
-    let params: Vec<BlockParamId> = host.read_host().block(b_id).params.clone();
+    let params: Vec<BlockParamId> = host.function(function_id).block(b_id).params.clone();
 
     // B's params must flow nowhere but B's own terminator. In valid SSA a block
     // param is only visible inside dominated blocks via forwarded args, so this
     // normally holds; bail if it doesn't rather than risk a dangling use.
     for &p in &params {
         if host
-            .read_host()
-            .function(p.func)
+            .function(function_id)
             .users_of(ValueId::BlockParam(p))
             .iter()
             .any(|&u| u != term_id)
@@ -321,7 +306,7 @@ fn try_bypass_empty_block<'str, H: HostMut<'str>>(
     // Distinct predecessors of B.
     let preds: Vec<BlockId> = {
         let mut seen = rustc_hash::FxHashSet::default();
-        BlockRef::new(host.read_host(), b_id)
+        host.block_ref(b_id)
             .predecessors()
             .map(|(_, p)| p)
             .filter(|&p| seen.insert(p))
@@ -345,10 +330,16 @@ fn try_bypass_empty_block<'str, H: HostMut<'str>>(
     // through a rewritable terminator that names B with a matching arg count on
     // each arm that targets B.
     for &p in &preds {
-        let Some(p_term) = host.read_host().block(p).instructions.last().copied() else {
+        let Some(p_term) = host
+            .function(function_id)
+            .block(p)
+            .instructions
+            .last()
+            .copied()
+        else {
             return false;
         };
-        match host.read_host().instruction(p_term).mnemonic() {
+        match host.function(function_id).insn(p_term).mnemonic() {
             Mnemonic::Branch(br) => {
                 if br.target != b_id || br.args.len() != params.len() {
                     return false;
@@ -380,13 +371,13 @@ fn try_bypass_empty_block<'str, H: HostMut<'str>>(
     // params with the arguments that predecessor supplied.
     for &p in &preds {
         let p_term = host
-            .read_host()
+            .function(function_id)
             .block(p)
             .instructions
             .last()
             .copied()
             .unwrap();
-        let new_mnemonic = match host.read_host().instruction(p_term).mnemonic().clone() {
+        let new_mnemonic = match host.function(function_id).insn(p_term).mnemonic().clone() {
             Mnemonic::Branch(br) => Mnemonic::Branch(Branch {
                 target,
                 args: substitute(&b_args, &params, &br.args),
@@ -407,7 +398,8 @@ fn try_bypass_empty_block<'str, H: HostMut<'str>>(
 
         // Rehome the `p -> b` edges to `p -> target`, preserving multiplicity
         // (a CBranch with both arms on B contributes two edges).
-        let redirect: Vec<_> = BlockRef::new(host.read_host(), p)
+        let redirect: Vec<_> = host
+            .block_ref(p)
             .successors()
             .filter(|&(_, to)| to == b_id)
             .map(|(e, _)| e)
