@@ -39,6 +39,7 @@ use qcode::{
 };
 
 use crate::gvn::affine::precompute_forms;
+use crate::pipeline::{ContextView, FunctionBody};
 use crate::sequence::{affine_base_const, affine_strided_lane};
 
 #[derive(Default)]
@@ -532,7 +533,15 @@ fn last_insn<'str, H: HostMut<'str>>(host: &H, block: BlockId) -> InstructionId 
     host.block_ref(block).iter().last().unwrap().id
 }
 
-fn apply<'str, H: HostMut<'str>>(host: &mut H, m: &PromoteMatch) -> bool {
+/// Concrete version of array_promote core using FunctionBody+ContextView (stage 5b-ii).
+fn apply<'str>(body: &mut FunctionBody<'str>, cx: ContextView<'_, 'str>, m: &PromoteMatch) -> bool {
+    let mut host = body.host(cx);
+    apply_generic(&mut host, m)
+}
+
+/// Host-generic version of apply; kept for backwards compatibility.
+/// TODO(5b-ii): For backwards compatibility; prefer concrete version for new code.
+fn apply_generic<'str, H: HostMut<'str>>(host: &mut H, m: &PromoteMatch) -> bool {
     let esz = m.elem_size;
     let elem_ty = host.shared().types.get_or_make_int(esz);
     let arr_ty = host.shared().types.get_or_make_array(elem_ty, m.count);
@@ -706,7 +715,7 @@ fn apply<'str, H: HostMut<'str>>(host: &mut H, m: &PromoteMatch) -> bool {
     true
 }
 
-use crate::{ContextView, FunctionBody, FunctionPass};
+use crate::FunctionPass;
 
 impl FunctionPass for ArrayPromote {
     const NAME: &'static str = "array_promote";
@@ -721,9 +730,8 @@ impl FunctionPass for ArrayPromote {
         m: ContextView<'_, 'str>,
     ) -> Result<bool, String> {
         let fid = f.id();
-        let mut host = f.host(m);
-        match try_match(host.read_host(), fid) {
-            Some(matched) => Ok(apply(&mut host, &matched)),
+        match try_match(f.read_host(m), fid) {
+            Some(matched) => Ok(apply(f, m, &matched)),
             None => Ok(false),
         }
     }

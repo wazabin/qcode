@@ -36,6 +36,7 @@ use qcode::{
 };
 
 use crate::gvn::affine::precompute_forms;
+use crate::pipeline::{ContextView, FunctionBody};
 use crate::sequence::{affine_base_const, affine_strided_lane};
 
 #[derive(Default)]
@@ -217,7 +218,46 @@ fn try_match(host: HostRef, fid: FunctionId) -> Option<ReadsMatch> {
 }
 
 /// Rewrite each matched lane load to `at(arr, word)` and drop the seed store.
-fn apply<'str, H: HostMut<'str>>(host: &mut H, m: &ReadsMatch) -> bool {
+/// Concrete version of array_reads core using FunctionBody+ContextView (stage 5b-ii).
+fn apply<'str>(body: &mut FunctionBody<'str>, cx: ContextView<'_, 'str>, m: &ReadsMatch) -> bool {
+    let at_id = IntrinsicId::from_name("at").expect("at registered");
+    // The `at(arr, i)` result type is the array's element type. Compute it through
+    // the shared type interner's `&self` path (no `shared_mut`, so it holds on a
+    // checked-out host); this mirrors `at`'s `result_type`.
+    let arr_ty = stored_type_of(body.read_host(cx), m.arr);
+    let at_ty = arr_ty
+        .and_then(|t| cx.shared_ctx().types.seq_elem_of(t))
+        .or(arr_ty)
+        .expect("seeded array value has a type");
+    for (load_id, lane) in &m.loads {
+        let block = body.insn_ref(cx, *load_id).parent().map(|b| b.id);
+        let Some(block) = block else { continue };
+        // Materialize the word index (checkout-safe builder: const/add only).
+        let idx = {
+            let mut host = body.host(cx);
+            let mut b = Builder::from_block(BaseRef::new(host.reborrow_host(), block));
+            b.set_insert_point_before(*load_id);
+            let idx = build_index(&mut b, lane);
+            unsafe { b.dont_finalize() };
+            idx
+        };
+        // Build `at(arr, idx)` with the explicit element type and splice it before
+        // the load (avoids the Builder's `context_mut` type-mint path).
+        let at_val = body.push_mnemonic_with_type(cx, Mnemonic::Intrinsic(IntrinsicApp {
+            id: at_id,
+            args: vec![m.arr, idx],
+        }), at_ty);
+        body.insert_insn_before(cx, block, *load_id, at_val);
+        body.replace_all_uses_with(cx, ValueId::Instruction(*load_id), ValueId::Instruction(at_val));
+        body.remove_instruction(cx, *load_id);
+    }
+    body.remove_instruction(cx, m.seed_id);
+    true
+}
+
+/// Host-generic version of apply; kept for backwards compatibility.
+/// TODO(5b-ii): For backwards compatibility; prefer concrete version for new code.
+fn apply_generic<'str, H: HostMut<'str>>(host: &mut H, m: &ReadsMatch) -> bool {
     let at_id = IntrinsicId::from_name("at").expect("at registered");
     // The `at(arr, i)` result type is the array's element type. Compute it through
     // the shared type interner's `&self` path (no `shared_mut`, so it holds on a
@@ -281,7 +321,7 @@ fn build_index<'str, 'ctx, Ctx: HostMut<'str>>(
 
 // ----- pass ------------------------------------------------------------------
 
-use crate::{ContextView, FunctionBody, FunctionPass};
+use crate::FunctionPass;
 
 impl FunctionPass for ArrayReads {
     const NAME: &'static str = "array_reads";
@@ -296,12 +336,11 @@ impl FunctionPass for ArrayReads {
         m: ContextView<'_, 'str>,
     ) -> Result<bool, String> {
         let fid = f.id();
-        let mut host = f.host(m);
-        if !host.function_ref(fid).is_pure() {
+        if !f.function_ref(m, fid).is_pure() {
             return Ok(false);
         }
-        Ok(match try_match(host.read_host(), fid) {
-            Some(matched) => apply(&mut host, &matched),
+        Ok(match try_match(f.read_host(m), fid) {
+            Some(matched) => apply(f, m, &matched),
             None => false,
         })
     }
