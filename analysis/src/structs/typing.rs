@@ -23,7 +23,7 @@ use qcode::{
     space::{Space, SpaceId, SpaceType},
     types::TypeId,
     value::{
-        BlockParamRef, FunctionId, FunctionRef, InstructionRef, ValueId,
+        FunctionId, ValueId,
         insn::{Binary, Binop, Gep, InstructionId, IntBinop, Mnemonic},
         util::{
             base_ref::{BaseRef, HostRef},
@@ -69,7 +69,7 @@ pub fn struct_typing<'str, H: HostMut<'str>>(host: &mut H, fun_id: FunctionId) -
         return false;
     }
 
-    let insn_ids: Vec<InstructionId> = FunctionRef::new(host.read_host(), fun_id)
+    let insn_ids: Vec<InstructionId> = host.function_ref(fun_id)
         .blocks()
         .flat_map(|b| b.instruction_ids().to_vec())
         .collect();
@@ -101,8 +101,8 @@ pub fn struct_typing<'str, H: HostMut<'str>>(host: &mut H, fun_id: FunctionId) -
 /// instruction/param types live in its owned arena, other kinds in shared data.
 fn stored_type_of<'str>(host: HostRef<'_, 'str>, id: ValueId) -> Option<TypeId> {
     match id {
-        ValueId::Instruction(iid) => Some(InstructionRef::new(host, iid).type_id()),
-        ValueId::BlockParam(pid) => Some(BlockParamRef::new(host, pid).type_id()),
+        ValueId::Instruction(iid) => Some(host.insn_ref(iid).type_id()),
+        ValueId::BlockParam(pid) => Some(host.param_ref(pid).type_id()),
         other => host.shared().stored_type_of(other),
     }
 }
@@ -111,7 +111,7 @@ fn stored_type_of<'str>(host: HostRef<'_, 'str>, id: ValueId) -> Option<TypeId> 
 /// reference (e.g. a `PEB*` value becomes `%peb`), keeping names unique within
 /// the function. Returns `true` if any value was renamed.
 fn rename_struct_values<'str, H: HostMut<'str>>(host: &mut H, fun_id: FunctionId) -> bool {
-    let values: Vec<ValueId> = FunctionRef::new(host.read_host(), fun_id)
+    let values: Vec<ValueId> = host.function_ref(fun_id)
         .blocks()
         .flat_map(|b| {
             b.params()
@@ -161,7 +161,7 @@ fn unique_name<'str>(
     value: ValueId,
     base: &str,
 ) -> Option<Cow<'str, str>> {
-    let function = FunctionRef::new(host, fun_id);
+    let function = host.function_ref(fun_id);
     for n in 0.. {
         let candidate = if n == 0 {
             base.to_string()
@@ -192,7 +192,7 @@ fn function_has_struct_types(host: HostRef, fun_id: FunctionId) -> bool {
             types.pointee_of(t).is_some() || types.struct_name_of(t).is_some()
         })
     };
-    FunctionRef::new(host, fun_id).blocks().any(|b| {
+    host.function_ref(fun_id).blocks().any(|b| {
         b.params().any(|p| is_struct_ish(p.id()))
             || b.iter().any(|i| {
                 is_struct_ish(ValueId::Instruction(i.id))
@@ -204,7 +204,7 @@ fn function_has_struct_types(host: HostRef, fun_id: FunctionId) -> bool {
 /// Attempts one typing step on instruction `id`. Returns `true` if it changed
 /// the IR (rewrote an add to a gep, or retyped a load result).
 fn type_instruction<'str, H: HostMut<'str>>(host: &mut H, id: InstructionId) -> bool {
-    match host.read_host().instruction(id).mnemonic().clone() {
+    match host.insn_ref(id).mnemonic().clone() {
         Mnemonic::Binop(Binary {
             op: Binop::Int(IntBinop::Add),
             lhs,

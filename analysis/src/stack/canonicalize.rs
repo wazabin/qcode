@@ -21,7 +21,7 @@ use std::collections::{BTreeSet, HashMap};
 use qcode::{
     builder::Builder,
     value::{
-        FunctionId, FunctionRef, ValueId, Varnode, VarnodeId,
+        FunctionId, ValueId, Varnode, VarnodeId,
         insn::Mnemonic,
         util::{base_ref::BaseRef, host_mut::HostMut},
     },
@@ -41,13 +41,13 @@ pub fn canonicalize_sp_slots<'str, H: HostMut<'str>>(
     let Some(sp_param) = incoming_sp_param(host.read_host(), fid, sp_reg) else {
         return false;
     };
-    let Some(root) = FunctionRef::new(host.read_host(), fid).root().map(|b| b.id) else {
+    let Some(root) = host.function_ref(fid).root().map(|b| b.id) else {
         return false;
     };
 
     // Each distinct load/store pointer that is `@SP ± N` with a fixed offset.
     let mut ptr_offset: HashMap<ValueId, i64> = HashMap::new();
-    for block in FunctionRef::new(host.read_host(), fid).blocks() {
+    for block in host.function_ref(fid).blocks() {
         for insn in block.iter() {
             let ptr = match insn.mnemonic() {
                 Mnemonic::Load(load) => load.ptr,
@@ -75,7 +75,7 @@ pub fn canonicalize_sp_slots<'str, H: HostMut<'str>>(
     if offsets.contains(&0) {
         repr.insert(0, sp_param);
     }
-    for insn in FunctionRef::new(host.read_host(), fid)
+    for insn in host.function_ref(fid)
         .root()
         .unwrap()
         .iter()
