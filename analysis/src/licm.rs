@@ -43,8 +43,11 @@ use qcode::value::{
     FunctionId, ValueId,
     block::BlockId,
     insn::{InstructionId, Mnemonic},
-    util::{base_ref::HostRef, host_mut::HostMut},
+    util::base_ref::HostRef,
 };
+
+#[cfg(test)]
+use qcode::value::util::host_mut::HostMut;
 
 use crate::{AliasResult, ContextView, FunctionBody, FunctionPass};
 
@@ -64,10 +67,10 @@ impl FunctionPass for Licm {
         m: ContextView<'_, 'str>,
     ) -> Result<bool, String> {
         let fid = f.id();
-        let aliases = build_aliases(m, f.host(m).read_host(), fid);
-        let mut host = f.host(m);
+        let aliases = build_aliases(m, f.read_host(m), fid);
         Ok(hoist_loop_invariants_with_aliases(
-            &mut host,
+            f,
+            m,
             fid,
             aliases.as_ref(),
         ))
@@ -325,7 +328,45 @@ fn emission_order(
 /// Hoist invariant instructions of one loop into `preheader`, in `order`. Each
 /// instruction is rebuilt in the preheader (before its terminator), its uses are
 /// redirected to the rebuilt copy, and the original is deleted.
-fn hoist_into_preheader<'str, H: HostMut<'str>>(
+fn hoist_into_preheader<'a, 'str>(
+    body: &'a mut FunctionBody<'str>,
+    cx: ContextView<'a, 'str>,
+    preheader: BlockId,
+    order: &[InstructionId],
+) -> bool {
+    let mut hoisted = false;
+    for &old in order {
+        let old_ref = body.insn_ref(cx, old);
+        let mnemonic = old_ref.mnemonic().clone();
+        let type_id = old_ref.type_id();
+        let new = body.push_mnemonic_with_type(cx, mnemonic, type_id);
+
+        let term = *body
+            .block_ref(cx, preheader)
+            .instruction_ids()
+            .last()
+            .expect("preheader must have a terminator");
+        body.insert_insn_before(cx, preheader, term, new);
+
+        // Redirect every remaining use (in the loop and beyond) to the hoisted
+        // copy. Processing in dependency order means a later invariant operand
+        // already points at its hoisted copy when we clone the consumer.
+        body.replace_all_uses_with(cx, ValueId::Instruction(old), ValueId::Instruction(new));
+        hoisted = true;
+    }
+
+    // Delete the now-dead originals from their loop blocks.
+    for &old in order {
+        body.remove_instruction(cx, old);
+    }
+    hoisted
+}
+
+/// Generic host-based version of [`hoist_into_preheader`], kept for the
+/// `&mut Context` test entry point below.
+/// TODO(5b-ii): remove once tests migrate off `HostMut`.
+#[cfg(test)]
+fn hoist_into_preheader_generic<'str, H: HostMut<'str>>(
     host: &mut H,
     preheader: BlockId,
     order: &[InstructionId],
@@ -377,10 +418,49 @@ fn build_aliases<'a, 'str: 'a>(
 }
 
 /// Hoisting core, parameterized on an already-built alias oracle (or `None` for
-/// the conservative path where any loop store blocks load hoisting). Exposed for
-/// tests that supply their own oracle. Reads and mutates the function through the
-/// generic mutation host.
-fn hoist_loop_invariants_with_aliases<'str, H: HostMut<'str>>(
+/// the conservative path where any loop store blocks load hoisting). Reads and
+/// mutates the function through the concrete pass surface.
+fn hoist_loop_invariants_with_aliases<'a, 'str>(
+    body: &'a mut FunctionBody<'str>,
+    cx: ContextView<'a, 'str>,
+    fun_id: FunctionId,
+    aliases: Option<&AliasResult>,
+) -> bool {
+    let edges = back_edges(body.read_host(cx), fun_id);
+    if edges.is_empty() {
+        return false;
+    }
+
+    // Plan all hoists first (read-only), then apply. Moving instructions never
+    // changes the CFG, so dominators / loop membership stay valid throughout.
+    let mut plans: Vec<(BlockId, Vec<InstructionId>)> = Vec::new();
+    for (latch, header) in edges {
+        let loop_nodes = natural_loop(body.read_host(cx), latch, header);
+        let Some(preheader) = loop_preheader(body.read_host(cx), header, &loop_nodes) else {
+            continue;
+        };
+        let mem = loop_memory(body.read_host(cx), &loop_nodes);
+        let invariant = invariant_instructions(body.read_host(cx), &loop_nodes, aliases, &mem);
+        if invariant.is_empty() {
+            continue;
+        }
+        let order = emission_order(body.read_host(cx), &loop_nodes, &invariant);
+        plans.push((preheader, order));
+    }
+
+    let mut changed = false;
+    for (preheader, order) in plans {
+        changed |= hoist_into_preheader(body, cx, preheader, &order);
+    }
+    changed
+}
+
+/// Generic host-based version of [`hoist_loop_invariants_with_aliases`]; kept
+/// for tests that drive the hoist over a bare `&mut Context` with their own
+/// oracle.
+/// TODO(5b-ii): remove once tests migrate off `HostMut`.
+#[cfg(test)]
+fn hoist_loop_invariants_with_aliases_generic<'str, H: HostMut<'str>>(
     host: &mut H,
     fun_id: FunctionId,
     aliases: Option<&AliasResult>,
@@ -409,7 +489,7 @@ fn hoist_loop_invariants_with_aliases<'str, H: HostMut<'str>>(
 
     let mut changed = false;
     for (preheader, order) in plans {
-        changed |= hoist_into_preheader(host, preheader, &order);
+        changed |= hoist_into_preheader_generic(host, preheader, &order);
     }
     changed
 }

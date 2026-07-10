@@ -398,12 +398,14 @@ fn transform<'str>(
     };
 
     // --- Host: seed g and project the original return value out of the tuple.
-    let mut host = body.host(m);
     let root = model.root;
-    if let Some(term) = block_terminator(host.read_host(), root) {
-        host.remove_instruction(term);
+    if let Some(term) = block_terminator(body.read_host(m), root) {
+        body.remove_instruction(m, term);
     }
     let driver_init: Vec<ValueId> = p.d_slots.iter().map(|&i| model.init_args[i]).collect();
+    // TODO(5b-ii): the seeding below runs on a temporary host because
+    // `push_typed`/`clone_self` stay generic for the minted `CheckedOut` path.
+    let mut host = body.host(m);
     // `apply g(driver_init)` typed explicitly (g uninstalled), then unpack each
     // accumulator field the original return reads.
     let t = push_typed(
@@ -417,8 +419,8 @@ fn transform<'str>(
     );
     let mut host_subst: HashMap<ValueId, ValueId> = HashMap::default();
     for (pos, &i) in p.a_slots.iter().enumerate() {
-        let field_ty = host
-            .shared()
+        let field_ty = m
+            .shared_ctx()
             .types
             .field_type(tuple_ty, pos)
             .expect("accumulator tuple field");
@@ -444,7 +446,7 @@ fn transform<'str>(
 
     // The original loop region is now unreachable from the host; delete it.
     for &b in &model.region {
-        BaseRef::new(host.reborrow_host(), b).delete(host_fid);
+        body.delete_block(m, b);
     }
 }
 
