@@ -6,8 +6,7 @@ use qcode::{
 };
 
 use crate::{
-    ArchConfig, CallingConvention, DynFunctionPass, FunctionPass, FunctionPassV2, PipelineEnv,
-    V2Adapter,
+    ArchConfig, CallingConvention, DynFunctionPass, FunctionPassV2, PipelineEnv, V2Adapter,
 };
 
 /// A throwaway [`PipelineEnv`] for passes that don't touch architecture state
@@ -24,15 +23,6 @@ pub(crate) fn dummy_env() -> PipelineEnv {
         },
         VarnodeId::from(0usize),
     )
-}
-
-/// Construct `P` via [`Default`] and run it once over `fun` with a [`dummy_env`],
-/// returning whether the pass reported a change.
-pub(crate) fn run_function_pass<P: FunctionPass>(
-    ctx: &mut Context,
-    fun: FunctionId,
-) -> Result<bool, String> {
-    P::default().run(ctx, fun, &dummy_env())
 }
 
 /// Run a [`FunctionPassV2`] once over `fun` through the real [`V2Adapter`] path

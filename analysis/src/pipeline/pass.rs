@@ -2,7 +2,8 @@
 //!
 //! Every pass that can appear in a pipeline TOML implements one of two traits:
 //!
-//! - [`FunctionPass`] — operates on a single function. Most optimizations
+//! - [`FunctionPassV2`] — operates on a single function through the restricted,
+//!   parallel-safe [`ModuleView`]/[`FunctionBody`] surface. Most optimizations
 //!   (mem2reg, gvn, dce, …) are these. Function-scoped TOML stages run them
 //!   function-major and can loop them to a per-function fixpoint.
 //! - [`Pass`] — operates on the whole program (`Context`). The interprocedural
@@ -15,17 +16,16 @@
 //! ## Adding a pass
 //!
 //! A pass lives entirely in its own module file: define the struct, implement
-//! [`FunctionPass`] (or [`Pass`]) for it, and register it with one
+//! [`FunctionPassV2`] (or [`Pass`]) for it, and register it with one
 //! [`inventory::submit!`] of a [`PassRegistration`]. Nothing in this file needs to
 //! change. See [`crate::naming::cpp_demangle::CppDemangle`] for the smallest
 //! possible example pass.
 //!
-//! [`FunctionPass`] requires [`Default`], so a pass can precompute and store
+//! [`FunctionPassV2`] requires [`Default`], so a pass can precompute and store
 //! expensive values once at construction (see the `CppDemangle` example, which
 //! builds its `DemangleOptions` in `Default`). Because a `Default` supertrait makes
 //! a trait non-object-safe, the registry stores passes behind the object-safe
-//! [`DynFunctionPass`] shim, which every `FunctionPass` gets for free via a blanket
-//! impl.
+//! [`DynFunctionPass`] shim via the [`V2Adapter`] wrapper.
 
 use std::sync::OnceLock;
 
@@ -120,91 +120,45 @@ impl PipelineEnv {
     }
 }
 
-/// A pass over a single function. `run` returns `Ok(true)` if it changed the IR,
-/// so a function-scoped stage can loop it to a fixpoint. Passes that don't track
-/// change return `Ok(false)` and must not be placed in a `repeat_until` stage.
+/// Object-safe dispatch shim for [`FunctionPassV2`].
 ///
-/// The [`Default`] bound lets a pass precompute and store values once at
-/// construction; the registry builds every pass with `Default::default()`. [`NAME`]
-/// is the single source of truth for the pipeline name — `register_function_pass!`
-/// reads it, so it never needs repeating.
-///
-/// [`NAME`]: FunctionPass::NAME
-pub trait FunctionPass: Default {
-    const NAME: &'static str;
-    fn description(&self) -> &'static str;
-    fn run(&self, ctx: &mut Context, fun_id: FunctionId, env: &PipelineEnv)
-    -> Result<bool, String>;
-}
-
-/// Object-safe dispatch shim for [`FunctionPass`].
-///
-/// [`FunctionPass`] can't be made into a trait object — its [`Default`] supertrait
+/// [`FunctionPassV2`] can't be made into a trait object — its [`Default`] supertrait
 /// and `NAME` associated const are both non-object-safe. This shim mirrors it as
-/// instance methods and is blanket-impl'd for every `FunctionPass`, so the registry
-/// can store `Box<dyn DynFunctionPass>`.
+/// instance methods and is implemented by [`V2Adapter`], so the registry can store
+/// `Box<dyn DynFunctionPass>`.
 pub trait DynFunctionPass: Send + Sync {
     fn name(&self) -> &'static str;
     fn description(&self) -> &'static str;
+
+    /// Run the pass through the whole check-out/check-in protocol on `ctx`: check
+    /// the function out, run it on the owned body, then check in and replay buffered
+    /// effects. Used by the `module(<fn>)` adapter and unit tests, which have no
+    /// driver-owned checked-out worklist to run on.
     fn run(&self, ctx: &mut Context, fun_id: FunctionId, env: &PipelineEnv)
     -> Result<bool, String>;
 
-    /// Whether this pass is a [`FunctionPassV2`] (wrapped in a [`V2Adapter`]).
-    /// A stage all of whose passes are V2 can be driven over checked-out bodies —
-    /// the precondition for the parallel driver (Stage 6). Legacy [`FunctionPass`]
-    /// passes answer `false`.
-    fn is_v2(&self) -> bool {
-        false
-    }
-
-    /// If this is a V2 pass, a handle that runs it on a body the caller has
-    /// *already* checked out (no internal checkout), so the driver owns the
-    /// check-out/check-in protocol. `None` for a legacy [`FunctionPass`].
-    fn as_v2(&self) -> Option<&dyn CheckedV2Pass> {
-        None
-    }
-
-    /// Whether this pass may mint functions (see [`FunctionPassV2::MINTS`]).
-    /// The driver reserves per-function id pools only for stages that contain a
-    /// minting pass. Legacy passes create functions directly and answer `false`.
-    fn mints(&self) -> bool {
-        false
-    }
-}
-
-impl<T: FunctionPass + Send + Sync> DynFunctionPass for T {
-    fn name(&self) -> &'static str {
-        T::NAME
-    }
-    fn description(&self) -> &'static str {
-        FunctionPass::description(self)
-    }
-    fn run(
-        &self,
-        ctx: &mut Context,
-        fun_id: FunctionId,
-        env: &PipelineEnv,
-    ) -> Result<bool, String> {
-        FunctionPass::run(self, ctx, fun_id, env)
-    }
-}
-
-/// A [`FunctionPassV2`] driven over a [`FunctionBody`] the caller already checked
-/// out — no internal checkout. This is the surface the parallel driver (and the
-/// sequential all-V2 fixpoint) use to run a V2 pass on a body they own; buffered
-/// [`Effects`] replay and the check-in protocol are the driver's job, not this
-/// method's.
-///
-/// [`Effects`]: super::Effects
-pub trait CheckedV2Pass {
+    /// Run the pass on a [`FunctionBody`] the caller has *already* checked out (no
+    /// internal checkout), so the driver owns the check-out/check-in protocol. This
+    /// is the surface the parallel driver (and the sequential fixpoint) use to run a
+    /// pass on a body they own; buffered [`Effects`] replay and the check-in
+    /// protocol are the driver's job, not this method's.
+    ///
+    /// [`Effects`]: super::Effects
     fn run_checked<'str>(
         &self,
         m: &ModuleView<'_, 'str>,
         body: &mut FunctionBody<'str>,
     ) -> Result<bool, String>;
+
+    /// Whether this pass may mint functions (see [`FunctionPassV2::MINTS`]).
+    /// The driver reserves per-function id pools only for stages that contain a
+    /// minting pass.
+    fn mints(&self) -> bool {
+        false
+    }
 }
 
-/// The parallel-safe successor to [`FunctionPass`] (Stage 5 of the
+/// The parallel-safe function pass trait (Stage 5 of the
 /// parallel-function-passes plan; see `PARALLEL_PASSES.md`).
 ///
 /// The litmus test the signature enforces: **a function pass may read the
@@ -215,11 +169,10 @@ pub trait CheckedV2Pass {
 /// check-in. With no path to global mutable state, workers can run these in
 /// parallel (Stage 6) with the `ModuleView` shared and the bodies disjoint.
 ///
-/// A pass migrates from [`FunctionPass`] to this trait one at a time; the
-/// [`V2Adapter`] lets a `FunctionPassV2` be stored and driven exactly like a
-/// legacy [`FunctionPass`] (it performs the checkout → run → check-in dance
-/// internally), so the sequential pipeline needs no changes while the port is in
-/// flight.
+/// The [`V2Adapter`] lets a `FunctionPassV2` be stored and driven through the
+/// object-safe [`DynFunctionPass`] the registry speaks (it performs the checkout →
+/// run → check-in dance internally), so a `module(<fn>)` stage and unit tests can
+/// run one straight over a `&mut Context`.
 pub trait FunctionPassV2: Default {
     const NAME: &'static str;
     /// Whether this pass may mint new functions via
@@ -244,9 +197,9 @@ pub trait FunctionPassV2: Default {
 ///    the owned [`FunctionBody`].
 /// 3. Check the function back in and replay any buffered [`Effects`] in place.
 ///
-/// Stage 6's parallel driver will instead check out a whole worklist and call the
-/// `FunctionPassV2` directly on each disjoint body; the adapter is the sequential
-/// bridge that keeps the pipeline running identically during the incremental port.
+/// The parallel driver instead checks out a whole worklist and calls
+/// [`DynFunctionPass::run_checked`] directly on each disjoint body; the adapter's
+/// `run` is the whole-`Context` bridge for the `module(<fn>)` spelling and tests.
 pub struct V2Adapter<T: FunctionPassV2> {
     inner: T,
 }
@@ -259,16 +212,6 @@ impl<T: FunctionPassV2> Default for V2Adapter<T> {
     }
 }
 
-impl<T: FunctionPassV2> CheckedV2Pass for V2Adapter<T> {
-    fn run_checked<'str>(
-        &self,
-        m: &ModuleView<'_, 'str>,
-        body: &mut FunctionBody<'str>,
-    ) -> Result<bool, String> {
-        FunctionPassV2::run(&self.inner, m, body)
-    }
-}
-
 impl<T: FunctionPassV2 + Send + Sync> DynFunctionPass for V2Adapter<T> {
     fn name(&self) -> &'static str {
         T::NAME
@@ -276,11 +219,12 @@ impl<T: FunctionPassV2 + Send + Sync> DynFunctionPass for V2Adapter<T> {
     fn description(&self) -> &'static str {
         FunctionPassV2::description(&self.inner)
     }
-    fn is_v2(&self) -> bool {
-        true
-    }
-    fn as_v2(&self) -> Option<&dyn CheckedV2Pass> {
-        Some(self)
+    fn run_checked<'str>(
+        &self,
+        m: &ModuleView<'_, 'str>,
+        body: &mut FunctionBody<'str>,
+    ) -> Result<bool, String> {
+        FunctionPassV2::run(&self.inner, m, body)
     }
     fn mints(&self) -> bool {
         T::MINTS
@@ -567,31 +511,10 @@ impl DynPass for ModuleFnAdapter {
     }
 }
 
-/// Register a per-function pass. Place one call in the pass's own module; the
-/// registry builds the pass with [`Default`] each time it resolves the name, which
-/// it reads from the pass's [`FunctionPass::NAME`].
-///
-/// ```ignore
-/// register_function_pass!(CppDemangle);
-/// ```
-#[macro_export]
-macro_rules! register_function_pass {
-    ($ty:ty) => {
-        inventory::submit! {
-            $crate::PassRegistration {
-                name: <$ty as $crate::FunctionPass>::NAME,
-                make: || $crate::RegisteredPass::Function(::std::boxed::Box::new(
-                    <$ty as ::core::default::Default>::default(),
-                )),
-            }
-        }
-    };
-}
-
 /// Register a [`FunctionPassV2`] under its `NAME`, wrapping it in a [`V2Adapter`]
-/// so the registry stores it as an ordinary [`DynFunctionPass`]. Drop-in
-/// replacement for [`register_function_pass!`] used as each pass is ported; the
-/// pipeline TOML and the driver are none the wiser.
+/// so the registry stores it as an ordinary [`DynFunctionPass`]. Place one call in
+/// the pass's own module; the registry builds the pass with [`Default`] each time
+/// it resolves the name, which it reads from the pass's [`FunctionPassV2::NAME`].
 ///
 /// ```ignore
 /// register_function_pass_v2!(ExamplePass);
@@ -610,8 +533,9 @@ macro_rules! register_function_pass_v2 {
     };
 }
 
-/// Register a whole-program ([`Pass`]) milestone. Like [`register_function_pass!`],
-/// but for module-scoped passes; reads the name from [`Pass::NAME`].
+/// Register a whole-program ([`Pass`]) milestone. Like
+/// [`register_function_pass_v2!`], but for module-scoped passes; reads the name
+/// from [`Pass::NAME`].
 #[macro_export]
 macro_rules! register_module_pass {
     ($ty:ty) => {

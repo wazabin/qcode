@@ -34,7 +34,7 @@ const DEFAULT_PIPELINE_FILE: &str = "default.toml";
 /// Guard against a `repeat_until` stage that never converges.
 const MAX_FIXPOINT_ITERS: usize = 100;
 
-/// Minimum worklist size before an all-V2 stage fans out across threads. Below
+/// Minimum worklist size before a stage fans out across threads. Below
 /// this the thread-spawn + check-out/check-in overhead outweighs the win, so the
 /// stage runs sequentially (identical output either way).
 const PARALLEL_THRESHOLD: usize = 4;
@@ -1408,12 +1408,8 @@ async fn run_function_stage(
 
     let mut dirty = HashSet::default();
 
-    // A stage all of whose passes are V2 can be driven over a checked-out body
-    // (`run_one_function`) — the shape Stage 6 runs on worker threads. A stage that
-    // still contains a legacy non-V2 `FunctionPass` takes the classic in-place path
-    // below, unchanged. (No such pass ships today; the fallback is kept live for any
-    // future one.)
-    let all_v2 = passes.iter().all(|p| p.is_v2());
+    // Every function pass is driven over a checked-out body (`run_one_function`) —
+    // the shape Stage 6 runs on worker threads.
 
     /*
     /*
@@ -1524,23 +1520,22 @@ async fn run_function_stage(
     // the end of the stage, for the next stage to consume.
     let mut reservations: HashMap<FunctionId, Vec<FunctionId>> = HashMap::default();
     let mut leftover: HashMap<FunctionId, Vec<FunctionId>> = HashMap::default();
-    if all_v2 && passes.iter().any(|p| p.mints()) {
+    if passes.iter().any(|p| p.mints()) {
         for &fun_id in &fun_ids {
             let ids = pool.reserve(ctx, MINT_RESERVE);
             reservations.insert(fun_id, ids);
         }
     }
 
-    // Parallelize an all-V2 stage across threads once the worklist is worth the
-    // fan-out cost. Functions tied to another by a cross-function CFG edge (a
-    // thunk/tail-call `Branch` into another function's entry) are held back for the
-    // sequential lane: a worker reading such an edge would reach into a
-    // co-checked-out function's (empty) shell arena. Everything else — mixed
-    // stages, tiny worklists, `QCODE_THREADS=1`, wasm — runs the sequential loop
-    // below, byte-for-byte identical.
+    // Parallelize the stage across threads once the worklist is worth the fan-out
+    // cost. Functions tied to another by a cross-function CFG edge (a thunk/tail-call
+    // `Branch` into another function's entry) are held back for the sequential lane:
+    // a worker reading such an edge would reach into a co-checked-out function's
+    // (empty) shell arena. Everything else — tiny worklists, `QCODE_THREADS=1`,
+    // wasm — runs the sequential loop below, byte-for-byte identical.
     let threads = resolve_threads();
     let parallel_set: HashSet<FunctionId> =
-        if all_v2 && threads > 1 && fun_ids.len() >= PARALLEL_THRESHOLD {
+        if threads > 1 && fun_ids.len() >= PARALLEL_THRESHOLD {
             let entangled = entangled_functions(ctx, &fun_ids);
             let eligible: Vec<FunctionId> = fun_ids
                 .iter()
@@ -1581,68 +1576,51 @@ async fn run_function_stage(
                 continue;
             }
             let function: std::sync::Arc<str> = FunctionRef::from_id(ctx, fun_id).name().into();
-            let function_changed = if all_v2 {
-                // Check the function out, run its whole pass fixpoint on the owned
-                // body, then reinstall it, rebuild `call_sites`, and replay any
-                // buffered effects — the sequential form of the parallel check-in.
-                let before_targets = ctx.direct_call_targets(fun_id);
-                let fun = ctx.checkout_function(fun_id);
-                let reserved = reservations.remove(&fun_id).unwrap_or_default();
-                let mut body = FunctionBody::new(fun_id, fun, reserved);
-                let function_changed = {
-                    let view = ModuleView::new(ctx, env);
-                    run_one_function(
-                        passes,
-                        &view,
-                        &mut body,
-                        cache,
-                        &mut elapsed,
-                        &stage.name,
-                        &function,
-                        stage.repeat_until.is_some(),
-                        |pass| {
-                            progress(PipelineProgress::FunctionPass {
-                                round,
-                                stage: stage_name.clone(),
-                                function: function.clone(),
-                                index: index + 1,
-                                total,
-                                pass,
-                            });
-                        },
-                    )?
-                };
-                let (fun, effects, minted, unused) = body.into_parts();
-                // Install minted callees before the owner checks in and its call
-                // sites resync, so the new calls resolve against real functions.
-                let installed = install_minted(ctx, &stage.name, minted)?;
-                ctx.checkin_function(fun_id, fun);
-                ctx.resync_call_sites(fun_id, &before_targets);
-                replay_effects(ctx, &stage.name, fun_id, effects)?;
-                // Minted functions are new work for downstream `only_dirty` stages.
-                dirty.extend(installed);
-                leftover.insert(fun_id, unused);
-                // Between-stage invariant check happens in `verify_after_stage`;
-                // per-pass verification is skipped on the checked-out path (the
-                // function is absent from `ctx` mid-fixpoint).
-                function_changed
-            } else {
-                run_legacy_function(
-                    ctx,
-                    env,
-                    stage,
+            // Check the function out, run its whole pass fixpoint on the owned body,
+            // then reinstall it, rebuild `call_sites`, and replay any buffered
+            // effects — the sequential form of the parallel check-in.
+            let before_targets = ctx.direct_call_targets(fun_id);
+            let fun = ctx.checkout_function(fun_id);
+            let reserved = reservations.remove(&fun_id).unwrap_or_default();
+            let mut body = FunctionBody::new(fun_id, fun, reserved);
+            let function_changed = {
+                let view = ModuleView::new(ctx, env);
+                run_one_function(
                     passes,
-                    fun_id,
-                    &function,
-                    &stage_name,
-                    index,
-                    total,
-                    round,
+                    &view,
+                    &mut body,
                     cache,
                     &mut elapsed,
-                    progress,
+                    &stage.name,
+                    &function,
+                    stage.repeat_until.is_some(),
+                    |pass| {
+                        progress(PipelineProgress::FunctionPass {
+                            round,
+                            stage: stage_name.clone(),
+                            function: function.clone(),
+                            index: index + 1,
+                            total,
+                            pass,
+                        });
+                    },
                 )?
             };
+            let (fun, effects, minted, unused) = body.into_parts();
+            // Install minted callees before the owner checks in and its call sites
+            // resync, so the new calls resolve against real functions.
+            let installed = install_minted(ctx, &stage.name, minted)?;
+            ctx.checkin_function(fun_id, fun);
+            ctx.resync_call_sites(fun_id, &before_targets);
+            replay_effects(ctx, &stage.name, fun_id, effects)?;
+            // Minted functions are new work for downstream `only_dirty` stages.
+            dirty.extend(installed);
+            leftover.insert(fun_id, unused);
+            // Per-pass `verify_after` can't run mid-fixpoint (the function is absent
+            // from `ctx` on the checked-out path), so run the opt-in `QCODE_VERIFY`
+            // check once here, after check-in reinstalls the function — pinning any
+            // invariant break to this stage. A no-op unless `QCODE_VERIFY` is set.
+            crate::verify::verify_after(ctx, &stage.name);
             if function_changed {
                 dirty.insert(fun_id);
             }
@@ -1679,7 +1657,7 @@ async fn run_function_stage(
 }
 
 /// Run one function's per-stage pass fixpoint over a body the driver has already
-/// checked out — every pass must be V2. Reads the module through `m`, mutates only
+/// checked out. Reads the module through `m`, mutates only
 /// `body`, updates the per-function fixpoint `cache` and the per-pass `elapsed`
 /// table, and calls `on_pass(name)` before each pass (the caller emits / forwards
 /// the progress event). Returns whether the function changed.
@@ -1718,10 +1696,7 @@ fn run_one_function<'str>(
             let _scope = qcode::pass_scope::enter(p.name());
             #[cfg(not(target_arch = "wasm32"))]
             let started = std::time::Instant::now();
-            let v2 = p
-                .as_v2()
-                .expect("run_one_function requires an all-V2 stage");
-            let pass_changed = v2
+            let pass_changed = p
                 .run_checked(m, body)
                 .map_err(|e| format!("{}: {e}", p.name()))?;
             if pass_changed {
@@ -1773,115 +1748,7 @@ fn run_one_function<'str>(
     Ok(function_changed)
 }
 
-/// Run one function's per-stage pass fixpoint in place on `&mut ctx` — the classic
-/// path for a stage that still contains a legacy [`FunctionPass`] (which needs
-/// whole-`Context` access and cannot run over a checked-out body). Byte-for-byte
-/// the pre-parallelization loop, including per-pass `verify_after` and the fixpoint
-/// tracer. Returns whether the function changed.
-#[allow(clippy::too_many_arguments)]
-fn run_legacy_function(
-    ctx: &mut Context,
-    env: &PipelineEnv,
-    stage: &Stage,
-    passes: &[Box<dyn DynFunctionPass>],
-    fun_id: FunctionId,
-    function: &std::sync::Arc<str>,
-    stage_name: &std::sync::Arc<str>,
-    index: usize,
-    total: usize,
-    round: usize,
-    cache: &mut FixpointCache,
-    elapsed: &mut HashMap<&'static str, (std::time::Duration, usize, usize)>,
-    progress: &mut impl FnMut(PipelineProgress),
-) -> Result<bool, String> {
-    let mut iters = 0;
-    let mut function_changed = false;
-    // Engaged only once this function's fixpoint is clearly struggling
-    // (`FIXPOINT_WATCH_ITERS`); traces which passes keep moving the IR and
-    // flags a proven cycle. Cheap on the common path (never allocates until a
-    // pass changes the IR past the threshold).
-    let mut tracer = FixpointTracer::default();
-    let tracer_label = format!("stage {} fn {function}", stage.name);
-    'fixpoint: loop {
-        let watching = stage.repeat_until.is_some() && iters >= FIXPOINT_WATCH_ITERS;
-        let mut changed = false;
-        for p in passes {
-            // Skip a pass that already reached a fixpoint on this function and
-            // has not been dirtied since (by an earlier pass this iteration, a
-            // prior stage, or — via `invalidate_all` — a module pass).
-            if cache.is_clean(fun_id, p.name()) {
-                continue;
-            }
-            progress(PipelineProgress::FunctionPass {
-                round,
-                stage: stage_name.clone(),
-                function: function.clone(),
-                index: index + 1,
-                total,
-                pass: p.name(),
-            });
-            let _scope = qcode::pass_scope::enter(p.name());
-            #[cfg(not(target_arch = "wasm32"))]
-            let started = std::time::Instant::now();
-            let pass_changed = p
-                .run(ctx, fun_id, env)
-                .map_err(|e| format!("{}: {e}", p.name()))?;
-            if pass_changed {
-                // The function moved: invalidate every pass's fixpoint mark.
-                cache.mark_dirty(fun_id);
-            } else {
-                cache.mark_clean(fun_id, p.name());
-            }
-            let entry = elapsed.entry(p.name()).or_default();
-            #[cfg(not(target_arch = "wasm32"))]
-            {
-                entry.0 += started.elapsed();
-            }
-            entry.1 += 1;
-            entry.2 += pass_changed as usize;
-            // Between-pass invariant check (opt-in via `QCODE_VERIFY`).
-            crate::verify::verify_after(ctx, p.name());
-            // Trace the fingerprint after every pass that moved the IR, so a
-            // struggling fixpoint reveals which passes keep fighting and whether
-            // the IR is truly cycling (a recurring fingerprint) vs. slowly churning.
-            if watching && pass_changed {
-                let fp = function_fingerprint(ctx, fun_id);
-                if tracer.observe(&tracer_label, iters + 1, p.name(), fp) {
-                    // A proven cycle cannot converge; leave this function at
-                    // the recurring state and move on to the next one instead
-                    // of spinning to the iteration cap.
-                    log::warn!(
-                        target: "pipeline::fixpoint",
-                        "stage {} fn {function}: stopping best-effort on the proven \
-                         cycle at iteration {}",
-                        stage.name,
-                        iters + 1,
-                    );
-                    function_changed = true;
-                    break 'fixpoint;
-                }
-            }
-            changed |= pass_changed;
-        }
-        function_changed |= changed;
-        iters += 1;
-        if stage.repeat_until.is_none() || !changed {
-            break;
-        }
-        if iters >= MAX_FIXPOINT_ITERS {
-            log::warn!(
-                target: "pipeline::fixpoint",
-                "stage {} fn {function} hit the {MAX_FIXPOINT_ITERS}-iteration cap; \
-                 see the `pipeline::fixpoint` trace above for the fighting passes",
-                stage.name,
-            );
-            return Err(nonconvergence_error(&stage.name, Some(function)));
-        }
-    }
-    Ok(function_changed)
-}
-
-/// How many worker threads an all-V2 stage may use. `QCODE_THREADS` overrides the
+/// How many worker threads a stage may use. `QCODE_THREADS` overrides the
 /// default (`available_parallelism`); `QCODE_THREADS=1` forces the sequential path.
 /// wasm has no threads, so it is always `1`.
 fn resolve_threads() -> usize {
@@ -1949,7 +1816,7 @@ struct WorkerOutput {
     stats: Vec<((&'static str, &'static str), u64)>,
 }
 
-/// Run an all-V2 stage across `threads` worker threads (Stage 6 of the
+/// Run a stage across `threads` worker threads (Stage 6 of the
 /// parallel-passes plan). Checks out the whole worklist, runs each function's pass
 /// fixpoint on a disjoint `&mut FunctionBody` on a `std::thread::scope` worker over
 /// the `&`-shared [`ModuleView`], then checks the results back in **in worklist
@@ -2101,6 +1968,9 @@ fn run_stage_parallel(
         replay_effects(ctx, &stage.name, fun_id, effects)?;
         dirty.extend(installed);
         leftover.insert(fun_id, unused);
+        // Opt-in `QCODE_VERIFY` check once the function is back in `ctx` (it was
+        // absent from it mid-fixpoint on the worker). A no-op unless enabled.
+        crate::verify::verify_after(ctx, &stage.name);
         if changed {
             dirty.insert(fun_id);
         }
