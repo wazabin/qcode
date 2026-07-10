@@ -97,7 +97,7 @@ mod tests {
 
         // The Phase 0 question: do the value passes survive an aggregate-typed,
         // opaque call result? (A panic here fails the test.)
-        let aliases = crate::AliasResult::simple(&tc.ctx);
+        let aliases = crate::AliasResult::simple_for_function(&tc.ctx, g);
         let _ = crate::mem2reg(&mut tc.ctx, g, &aliases);
         let _ = crate::gvn_function(&mut tc.ctx, g, Some(&aliases));
 
@@ -765,7 +765,7 @@ mod tests {
         // forward the redirected *shadow* gep-load from the entry seed store (both
         // resolve to base @param + 0x30). Without gep-aware affine numbering the
         // load reads un-seeded shadow and survives — the reported PEB bug.
-        let aliases = crate::AliasResult::simple(&tc.ctx);
+        let aliases = crate::AliasResult::simple_for_function(&tc.ctx, f);
         crate::gvn::gvn_function(&mut tc.ctx, f, Some(&aliases));
 
         let ram = tc.ctx.default_space;
@@ -2402,8 +2402,11 @@ mod tests {
             .assume_true(Proposition::ArgsDisjointFromCallerFrame(f));
         tc.ctx
             .assume_true(Proposition::LoadedPointerDisjointFromSlot(f));
-        let aliases =
-            crate::AliasResult::simple(&tc.ctx).with_frame_freshness(&tc.ctx, f, Some(sp_reg));
+        let aliases = crate::AliasResult::simple_for_function(&tc.ctx, f).with_frame_freshness(
+            &tc.ctx,
+            f,
+            Some(sp_reg),
+        );
         crate::gvn::gvn_function(&mut tc.ctx, f, Some(&aliases));
 
         // The in-loop reload of the buffer pointer is forwarded away: no load of

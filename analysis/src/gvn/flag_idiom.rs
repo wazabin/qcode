@@ -141,7 +141,7 @@ mod tests {
                 "
         );
 
-        let aliases = AliasResult::simple(&ctx);
+        let aliases = AliasResult::simple_for_function(&ctx, ctx.function_ids()[0]);
         gvn_function(&mut ctx, cmp, Some(&aliases));
 
         assert!(

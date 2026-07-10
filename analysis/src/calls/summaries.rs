@@ -630,7 +630,7 @@ mod tests {
             b.push_store(v, ValueId::Varnode(r1), reg);
         });
 
-        let aliases = crate::AliasResult::simple(&tc.ctx);
+        let aliases = crate::AliasResult::simple_for_function(&tc.ctx, fun);
         crate::mem2reg(&mut tc.ctx, fun, &aliases);
         // The load is gone; r0 now flows in via a root param.
         assert!(
@@ -746,7 +746,7 @@ mod tests {
             let ret = b.push_zext(loaded, 8).id();
             b.push_return(ret);
         });
-        let aliases = AliasResult::simple(&tc.ctx);
+        let aliases = AliasResult::simple_for_function(&tc.ctx, callee);
         crate::mem2reg(&mut tc.ctx, callee, &aliases);
         set_function_summaries(&mut tc.ctx, callee, sp);
 
@@ -797,7 +797,7 @@ mod tests {
         let promote = |tc: &mut TestContext, fun: FunctionId| {
             let sp_param = incoming_sp_param(&tc.ctx, fun, sp).unwrap();
             canonicalize_sp_slots(&mut &mut tc.ctx, fun, sp);
-            let aliases = AliasResult::simple(&tc.ctx);
+            let aliases = AliasResult::simple_for_function(&tc.ctx, fun);
             mem2reg_framed(&mut tc.ctx, fun, &aliases, Some(sp_param));
         };
 

@@ -1918,7 +1918,7 @@ mod tests {
         let function = Function::from_id(&ctx, test);
         let dom = compute_dominators(&function, function.root().unwrap().id);
         let frontier = dom.dominator_frontier();
-        let aliases = AliasResult::simple(&ctx);
+        let aliases = AliasResult::simple_for_function(&ctx, test);
         let sliced = HashSet::default();
         let mut cache = LiveInBlocks::new(&ctx, test);
         let live_in = cache.get(&ctx, A.into(), &sliced, &aliases);
@@ -1958,7 +1958,7 @@ mod tests {
         "
         );
 
-        let aliases = AliasResult::simple(&ctx);
+        let aliases = AliasResult::simple_for_function(&ctx, test);
         mem2reg(&mut ctx, test, &aliases);
 
         let Mnemonic::Binop(masked_mnemonic) = Instruction::from_id(&ctx, masked).mnemonic() else {
@@ -1997,7 +1997,7 @@ mod tests {
         "
         );
 
-        let aliases = AliasResult::simple(&ctx);
+        let aliases = AliasResult::simple_for_function(&ctx, test);
         mem2reg(&mut ctx, test, &aliases);
 
         // exit block should have exactly one block param for A
@@ -2086,7 +2086,7 @@ mod tests {
         "
         );
 
-        let aliases = AliasResult::simple(&ctx);
+        let aliases = AliasResult::simple_for_function(&ctx, test);
         mem2reg(&mut ctx, test, &aliases);
 
         // No block params anywhere
@@ -2163,7 +2163,7 @@ mod tests {
         let function = Function::from_id(&ctx, test);
         let dom = compute_dominators(&function, function.root().unwrap().id);
         let frontier = dom.dominator_frontier();
-        let aliases = AliasResult::simple(&ctx);
+        let aliases = AliasResult::simple_for_function(&ctx, test);
         let sliced = HashSet::default();
         let mut cache = LiveInBlocks::new(&ctx, test);
         let live_in = cache.get(&ctx, A.into(), &sliced, &aliases);
@@ -2220,7 +2220,7 @@ mod tests {
             unsafe { b.dont_finalize() };
         }
 
-        let aliases = AliasResult::simple(&tc.ctx);
+        let aliases = AliasResult::simple_for_function(&tc.ctx, fun_id);
         mem2reg(&mut tc.ctx, fun_id, &aliases);
 
         let params: Vec<_> = BasicBlock::from_id(&tc.ctx, block_id).params().collect();
@@ -2280,7 +2280,7 @@ mod tests {
         let (fun_id, sp, sp_reg) = sp_slot_function(&mut tc);
 
         canonicalize_sp_slots(&mut &mut tc.ctx, fun_id, sp_reg);
-        let aliases = AliasResult::simple(&tc.ctx);
+        let aliases = AliasResult::simple_for_function(&tc.ctx, fun_id);
         let changed = mem2reg_framed(&mut tc.ctx, fun_id, &aliases, Some(sp));
 
         assert!(changed, "the @SP-8 slot should be promoted");
@@ -2298,7 +2298,7 @@ mod tests {
         let mut tc = qcode::testing::TestContext::new();
         let (fun_id, _sp, _sp_reg) = sp_slot_function(&mut tc);
 
-        let aliases = AliasResult::simple(&tc.ctx);
+        let aliases = AliasResult::simple_for_function(&tc.ctx, fun_id);
         mem2reg_framed(&mut tc.ctx, fun_id, &aliases, None);
 
         assert!(
@@ -2352,7 +2352,7 @@ mod tests {
             .count();
 
         canonicalize_sp_slots(&mut &mut tc.ctx, fun_id, sp_reg);
-        let aliases = AliasResult::simple(&tc.ctx);
+        let aliases = AliasResult::simple_for_function(&tc.ctx, fun_id);
         mem2reg_framed(&mut tc.ctx, fun_id, &aliases, Some(sp));
 
         let loads_after = Function::from_id(&tc.ctx, fun_id)
@@ -2403,7 +2403,7 @@ mod tests {
             unsafe { b.dont_finalize() };
         }
 
-        let aliases = AliasResult::simple(&tc.ctx);
+        let aliases = AliasResult::simple_for_function(&tc.ctx, fun_id);
         mem2reg(&mut tc.ctx, fun_id, &aliases);
 
         let ValueId::Instruction(full_load_id) = full_load else {
@@ -2461,7 +2461,7 @@ mod tests {
             unsafe { b.dont_finalize() };
         }
 
-        let aliases = AliasResult::simple(&tc.ctx);
+        let aliases = AliasResult::simple_for_function(&tc.ctx, fun_id);
         mem2reg(&mut tc.ctx, fun_id, &aliases);
 
         let block = BasicBlock::from_id(&tc.ctx, block_id);
@@ -2519,7 +2519,7 @@ mod tests {
             "
         );
 
-        let aliases = AliasResult::simple(&tc.ctx);
+        let aliases = AliasResult::simple_for_function(&tc.ctx, func);
         let changed = mem2reg(&mut tc.ctx, func, &aliases);
         assert!(changed, "the sliced AL should be promoted");
 
@@ -2582,7 +2582,7 @@ mod tests {
             "
         );
 
-        let aliases = AliasResult::simple(&tc.ctx);
+        let aliases = AliasResult::simple_for_function(&tc.ctx, func);
         assert!(
             mem2reg(&mut tc.ctx, func, &aliases),
             "the sliced widened byte should promote to a 1-byte phi"
@@ -2592,7 +2592,7 @@ mod tests {
         // re-run below sees exactly the IR the stage would hand back.
         crate::gvn::constant_fold_function(&mut tc.ctx, func);
 
-        let aliases = AliasResult::simple(&tc.ctx);
+        let aliases = AliasResult::simple_for_function(&tc.ctx, func);
         assert!(
             !mem2reg(&mut tc.ctx, func, &aliases),
             "mem2reg must converge after const_fold — not re-mint the zext(v)[0:1] \
@@ -2632,7 +2632,7 @@ mod tests {
             "
         );
 
-        let aliases = AliasResult::simple(&tc.ctx);
+        let aliases = AliasResult::simple_for_function(&tc.ctx, func);
         mem2reg(&mut tc.ctx, func, &aliases);
 
         let body_block = BasicBlock::from_id(&tc.ctx, body);
@@ -2716,7 +2716,7 @@ mod tests {
         }
         tc.ctx.add_cfg_edge(entry, cont);
 
-        let aliases = AliasResult::simple(&tc.ctx);
+        let aliases = AliasResult::simple_for_function(&tc.ctx, caller);
         mem2reg(&mut tc.ctx, caller, &aliases);
 
         let ValueId::Instruction(post_load_id) = post_load else {
@@ -2791,7 +2791,7 @@ mod tests {
             unsafe { b.dont_finalize() };
         }
 
-        let aliases = AliasResult::simple(&tc.ctx);
+        let aliases = AliasResult::simple_for_function(&tc.ctx, f);
         mem2reg(&mut tc.ctx, f, &aliases);
 
         let entry_block = BasicBlock::from_id(&tc.ctx, entry);
@@ -2866,7 +2866,7 @@ mod tests {
         }
         tc.ctx.add_cfg_edge(entry, cont);
 
-        let aliases = AliasResult::simple(&tc.ctx);
+        let aliases = AliasResult::simple_for_function(&tc.ctx, caller);
         mem2reg(&mut tc.ctx, caller, &aliases);
 
         let entry_block = BasicBlock::from_id(&tc.ctx, entry);
@@ -2934,7 +2934,7 @@ mod tests {
         }
         tc.ctx.add_cfg_edge(entry, cont);
 
-        let aliases = AliasResult::simple(&tc.ctx);
+        let aliases = AliasResult::simple_for_function(&tc.ctx, caller);
         mem2reg(&mut tc.ctx, caller, &aliases);
 
         let entry_block = BasicBlock::from_id(&tc.ctx, entry);
@@ -3029,7 +3029,7 @@ mod tests {
             b.push_return(ret);
         }
 
-        let aliases = AliasResult::simple(&tc.ctx);
+        let aliases = AliasResult::simple_for_function(&tc.ctx, caller);
         mem2reg(&mut tc.ctx, caller, &aliases);
 
         let left_cont_block = BasicBlock::from_id(&tc.ctx, left_cont);
@@ -3090,7 +3090,7 @@ mod tests {
         tc.ctx.add_cfg_edge(clobbered_path, clobbered_cont);
         crate::set_all_call_clobbered_regs(&mut tc.ctx);
 
-        let aliases = AliasResult::simple(&tc.ctx);
+        let aliases = AliasResult::simple_for_function(&tc.ctx, caller);
         mem2reg(&mut tc.ctx, caller, &aliases);
         // mem2reg must NOT mint a root param for a live-in register input (here r0,
         // live-in via the non-clobbered path): the call interface is argpromote's.
@@ -3157,7 +3157,7 @@ mod tests {
                 .count()
         };
 
-        let aliases = AliasResult::simple(&tc.ctx);
+        let aliases = AliasResult::simple_for_function(&tc.ctx, caller);
         assert!(mem2reg(&mut tc.ctx, caller, &aliases));
         assert_eq!(
             edge_reload_count(&tc.ctx),
@@ -3165,7 +3165,7 @@ mod tests {
             "the clobbered edge should get one r0 reload before the join branch"
         );
 
-        let aliases = AliasResult::simple(&tc.ctx);
+        let aliases = AliasResult::simple_for_function(&tc.ctx, caller);
         assert!(
             !mem2reg(&mut tc.ctx, caller, &aliases),
             "the second run should converge instead of inserting another edge reload"
@@ -3226,7 +3226,7 @@ mod tests {
         tc.ctx.add_cfg_edge(clobbered_path, clobbered_cont);
         crate::set_all_call_clobbered_regs(&mut tc.ctx);
 
-        let aliases = AliasResult::simple(&tc.ctx);
+        let aliases = AliasResult::simple_for_function(&tc.ctx, caller);
         mem2reg(&mut tc.ctx, caller, &aliases);
         // mem2reg must NOT mint a root param for a live-in register input: the call
         // interface is argpromote's. The unnamed register stays a plain load.
@@ -3298,7 +3298,7 @@ mod tests {
             b.push_return(ret);
         }
 
-        let aliases = AliasResult::simple(&tc.ctx);
+        let aliases = AliasResult::simple_for_function(&tc.ctx, f);
         mem2reg(&mut tc.ctx, f, &aliases);
 
         let entry_block = BasicBlock::from_id(&tc.ctx, entry);
@@ -3387,7 +3387,7 @@ mod tests {
             b.push_return(ret);
         }
 
-        let aliases = AliasResult::simple(&tc.ctx);
+        let aliases = AliasResult::simple_for_function(&tc.ctx, f);
         mem2reg(&mut tc.ctx, f, &aliases);
 
         for (sink, name) in [(sink1, "s1"), (sink2, "s2")] {
@@ -3435,7 +3435,7 @@ mod tests {
             b.push_return(ret);
         }
 
-        let aliases = AliasResult::simple(&tc.ctx);
+        let aliases = AliasResult::simple_for_function(&tc.ctx, f);
         mem2reg(&mut tc.ctx, f, &aliases);
 
         let ValueId::Instruction(load_id) = mismatched_load else {
@@ -3506,7 +3506,7 @@ mod tests {
             b.push_return(ret);
         }
 
-        let aliases = AliasResult::simple(&tc.ctx);
+        let aliases = AliasResult::simple_for_function(&tc.ctx, f);
         mem2reg(&mut tc.ctx, f, &aliases);
 
         let ValueId::Instruction(load_id) = join_load else {
@@ -3571,7 +3571,7 @@ mod tests {
             load
         };
 
-        let aliases = AliasResult::simple(&tc.ctx);
+        let aliases = AliasResult::simple_for_function(&tc.ctx, f);
         mem2reg(&mut tc.ctx, f, &aliases);
 
         let ValueId::Instruction(load_id) = load_id else {

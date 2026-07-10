@@ -50,7 +50,7 @@ fn separate_varnodes_do_not_alias() {
     "
     );
 
-    let result = AliasResult::simple(&ctx);
+    let result = AliasResult::simple_for_function(&ctx, ctx.function_ids()[0]);
     assert!(
         !result.may_alias(&ctx, A.into(), B.into()),
         "distinct non-overlapping varnodes in the same space must not alias"
@@ -75,7 +75,7 @@ fn complex_operations_in_same_space_become_may_alias() {
     "
     );
 
-    let result = AliasResult::simple(&ctx);
+    let result = AliasResult::simple_for_function(&ctx, ctx.function_ids()[0]);
     assert!(
         result.may_alias(&ctx, ptr.into(), A.into()),
         "IR-derived pointer expressions should conservatively become may-alias"
@@ -100,7 +100,7 @@ fn complex_operations_in_other_space_do_not_alias() {
     "
     );
 
-    let result = AliasResult::simple(&ctx);
+    let result = AliasResult::simple_for_function(&ctx, ctx.function_ids()[0]);
     assert!(
         !result.may_alias(&ctx, ptr.into(), B.into()),
         "IR-derived pointer expressions in other spaces should not become may-alias"
@@ -114,9 +114,12 @@ fn overlapping_registers_alias() {
     let r0 = test_ctx.r0;
     let r0_lo32 = test_ctx.r0_lo32;
 
-    let ctx = test_ctx.ctx;
+    let mut ctx = test_ctx.ctx;
 
-    let result = AliasResult::simple(&ctx);
+    // This context has no body of its own; the aliasing is a pure varnode-range
+    // overlap, so scope the result to an empty (freshly minted) function.
+    let fid = ctx.anon_function();
+    let result = AliasResult::simple_for_function(&ctx, fid);
     assert!(
         result.may_alias(&ctx, r0.into(), r0_lo32.into()),
         "overlapping registers in the same space must alias"
@@ -138,7 +141,7 @@ fn irrelevant_instructions_and_constants_do_not_appear() {
 
     let one = ctx.get_const(1, 4).id();
 
-    let result = AliasResult::simple(&ctx);
+    let result = AliasResult::simple_for_function(&ctx, ctx.function_ids()[0]);
 
     assert_eq!(
         result.alias_class(one),
@@ -174,7 +177,7 @@ fn pointer_literals_are_tracked() {
     unsafe { builder.dont_finalize() };
     drop(builder);
 
-    let result = AliasResult::simple(&ctx);
+    let result = AliasResult::simple_for_function(&ctx, ctx.function_ids()[0]);
     assert!(
         result.alias_class(literal_ptr).is_some(),
         "pointer literals used for memory accesses should appear in alias analysis"
@@ -211,7 +214,7 @@ fn aligned_sp_peels_to_base() {
     });
     let vn = vn.unwrap();
     let aligned = aligned.unwrap();
-    let result = AliasResult::simple(&ctx);
+    let result = AliasResult::simple_for_function(&ctx, ctx.function_ids()[0]);
     assert!(matches!(result.alias_class(aligned), Some(NodeId::Id(_))));
     assert_eq!(result.alias_class(aligned), result.alias_class(vn.into()));
     assert!(
@@ -233,7 +236,7 @@ fn non_align_mask_does_not_peel() {
         masked = Some(p);
     });
     let masked = masked.unwrap();
-    let result = AliasResult::simple(&ctx);
+    let result = AliasResult::simple_for_function(&ctx, ctx.function_ids()[0]);
     assert_eq!(
         result.alias_class(masked),
         Some(NodeId::Unknown),
@@ -263,7 +266,7 @@ fn repeated_literal_uses_share_one_range_entry() {
     let a = a_id.unwrap();
     let l1 = l1.unwrap();
     let l2 = l2.unwrap();
-    let result = AliasResult::simple(&ctx);
+    let result = AliasResult::simple_for_function(&ctx, ctx.function_ids()[0]);
 
     assert!(result.may_alias(&ctx, l1, a.into()), "l1 overlaps A");
     assert!(
@@ -297,7 +300,7 @@ fn same_literal_wider_second_use_still_merges() {
     });
     let a = a_id.unwrap();
     let lit = lit.unwrap();
-    let result = AliasResult::simple(&ctx);
+    let result = AliasResult::simple_for_function(&ctx, ctx.function_ids()[0]);
 
     assert!(
         result.may_alias(&ctx, lit, a.into()),
@@ -331,7 +334,7 @@ fn literal_straddles_two_disjoint_varnode_classes_joins_them() {
     let a = a.unwrap();
     let b = b.unwrap();
     let literal_ptr = literal_ptr.unwrap();
-    let result = AliasResult::simple(&ctx);
+    let result = AliasResult::simple_for_function(&ctx, ctx.function_ids()[0]);
 
     assert!(result.may_alias(&ctx, literal_ptr, a.into()));
     assert!(result.may_alias(&ctx, literal_ptr, b.into()));
@@ -357,7 +360,7 @@ fn two_literal_pointers_same_addr_alias_without_varnode() {
         lit2 = Some(second);
     });
 
-    let result = AliasResult::simple(&ctx);
+    let result = AliasResult::simple_for_function(&ctx, ctx.function_ids()[0]);
     assert!(result.may_alias(&ctx, lit1.unwrap(), lit2.unwrap()));
 }
 
@@ -377,7 +380,7 @@ fn two_literal_pointers_overlapping_ranges_alias() {
         lit2 = Some(second);
     });
 
-    let result = AliasResult::simple(&ctx);
+    let result = AliasResult::simple_for_function(&ctx, ctx.function_ids()[0]);
     assert!(result.may_alias(&ctx, lit1.unwrap(), lit2.unwrap()));
 }
 
@@ -403,7 +406,7 @@ fn two_literal_pointers_different_spaces_do_not_alias() {
     unsafe { builder.dont_finalize() };
     drop(builder);
 
-    let result = AliasResult::simple(&ctx);
+    let result = AliasResult::simple_for_function(&ctx, ctx.function_ids()[0]);
     assert!(!result.may_alias(&ctx, lit1, lit2));
 }
 
@@ -427,7 +430,7 @@ fn same_pointer_used_in_multiple_spaces_degrades_to_unknown() {
 
     // A literal interned across two spaces must not panic; the pointer degrades
     // to Unknown (may-alias everything) rather than killing the process.
-    let result = AliasResult::simple(&ctx);
+    let result = AliasResult::simple_for_function(&ctx, ctx.function_ids()[0]);
     assert_eq!(result.alias_class(ptr), Some(NodeId::Unknown));
 }
 
@@ -458,7 +461,7 @@ fn odd_pointer_arithmetic_degrades_to_unknown() {
     let vn_a = vn_a.unwrap();
     let r = r.unwrap();
     let _ = vn_b;
-    let result = AliasResult::simple(&ctx);
+    let result = AliasResult::simple_for_function(&ctx, ctx.function_ids()[0]);
 
     assert_eq!(result.alias_class(r.into()), Some(NodeId::Unknown));
     assert!(
@@ -483,7 +486,7 @@ fn unresolvable_load_ptr_becomes_unknown_and_aliases_everything() {
     "
     );
 
-    let result = AliasResult::simple(&ctx);
+    let result = AliasResult::simple_for_function(&ctx, ctx.function_ids()[0]);
     assert_eq!(result.alias_class(ptr1.into()), Some(NodeId::Unknown));
     assert!(result.may_alias(&ctx, ptr1.into(), ptr2.into()));
 }
@@ -505,7 +508,7 @@ fn unresolvable_load_ptr_in_register_space_does_not_alias_registers() {
     "
     );
 
-    let result = AliasResult::simple(&test_ctx.ctx);
+    let result = AliasResult::simple_for_function(&test_ctx.ctx, test_ctx.ctx.function_ids()[0]);
     let alias_class = result.alias_class(ptr.into());
     assert!(matches!(alias_class, Some(NodeId::Unknown)));
     assert!(
@@ -534,7 +537,7 @@ fn store_then_load_invalidation_is_conservative_for_unknown_ptr() {
     "
     );
 
-    let aliases = AliasResult::simple(&ctx);
+    let aliases = AliasResult::simple_for_function(&ctx, ctx.function_ids()[0]);
     assert!(aliases.may_alias(&ctx, A.into(), ptr.into()));
 
     let mut block = BasicBlock::from_id_mut(&mut ctx, block);
@@ -570,7 +573,7 @@ fn literal_with_high_bit_set_aliases_overlapping_literals() {
         lit2 = Some(second);
     });
 
-    let result = AliasResult::simple(&ctx);
+    let result = AliasResult::simple_for_function(&ctx, ctx.function_ids()[0]);
     assert!(result.may_alias(&ctx, lit1.unwrap(), lit2.unwrap()));
 }
 
@@ -592,7 +595,7 @@ fn literal_with_upper_junk_bits_is_masked_to_size() {
         literal_ptr = Some(ptr);
     });
 
-    let result = AliasResult::simple(&ctx);
+    let result = AliasResult::simple_for_function(&ctx, ctx.function_ids()[0]);
     assert!(result.may_alias(&ctx, literal_ptr.unwrap(), a.unwrap().into()));
 }
 
@@ -614,7 +617,7 @@ fn untracked_value_may_alias_conservatively() {
     unsafe { builder.dont_finalize() };
     drop(builder);
 
-    let result = AliasResult::simple(&ctx);
+    let result = AliasResult::simple_for_function(&ctx, ctx.function_ids()[0]);
 
     // Append an instruction the analysis never saw.
     let mut builder = Builder::from_context(&mut ctx, 0x1000);
@@ -648,7 +651,7 @@ fn many_overlapping_subregisters_still_join_in_one_class() {
         }
     });
 
-    let result = AliasResult::simple(&ctx);
+    let result = AliasResult::simple_for_function(&ctx, ctx.function_ids()[0]);
     let first = varnodes[0];
 
     for &varnode in &varnodes[1..] {

@@ -143,7 +143,7 @@ mod tests {
                 "
         );
 
-        let aliases = AliasResult::simple(&ctx);
+        let aliases = AliasResult::simple_for_function(&ctx, ctx.function_ids()[0]);
         gvn_function(&mut ctx, loop_load, Some(&aliases));
 
         assert!(
@@ -182,7 +182,7 @@ mod tests {
                 "
         );
 
-        let aliases = AliasResult::simple(&ctx);
+        let aliases = AliasResult::simple_for_function(&ctx, ctx.function_ids()[0]);
         gvn_function(&mut ctx, loop_load, Some(&aliases));
 
         assert!(
@@ -220,7 +220,7 @@ mod tests {
                 "
         );
 
-        let aliases = AliasResult::simple(&ctx);
+        let aliases = AliasResult::simple_for_function(&ctx, ctx.function_ids()[0]);
         gvn_function(&mut ctx, self_loop, Some(&aliases));
 
         assert!(
@@ -291,7 +291,7 @@ mod tests {
             panic!("expected a call");
         }
 
-        let aliases = AliasResult::simple(&ctx);
+        let aliases = AliasResult::simple_for_function(&ctx, caller);
         gvn_function(&mut ctx, caller, Some(&aliases));
 
         assert!(
@@ -309,7 +309,7 @@ mod tests {
         let mut ctx = Context::new();
         let (caller, reload, v, _store_ptr, _call_id) = build_store_call_reload(&mut ctx);
 
-        let aliases = AliasResult::simple(&ctx);
+        let aliases = AliasResult::simple_for_function(&ctx, caller);
         gvn_function(&mut ctx, caller, Some(&aliases));
 
         assert!(
@@ -339,7 +339,7 @@ mod tests {
                     goto <0x1001>;"
         );
 
-        let aliases = AliasResult::simple(&ctx);
+        let aliases = AliasResult::simple_for_function(&ctx, ctx.function_ids()[0]);
 
         let mut block = BasicBlock::from_id_mut(&mut ctx, block);
 
@@ -380,7 +380,7 @@ mod tests {
                 "
         );
 
-        let aliases = AliasResult::simple(&tc.ctx);
+        let aliases = AliasResult::simple_for_function(&tc.ctx, func);
         gvn_function(&mut tc.ctx, func, Some(&aliases));
 
         assert!(
@@ -398,7 +398,7 @@ mod tests {
     fn optimize(ctx: &mut Context, fun_id: FunctionId) {
         loop {
             let mut changed = constant_fold_function(ctx, fun_id);
-            let aliases = AliasResult::simple(ctx);
+            let aliases = AliasResult::simple_for_function(ctx, fun_id);
             changed |= gvn_function(ctx, fun_id, Some(&aliases));
             if !changed {
                 break;

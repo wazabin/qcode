@@ -632,7 +632,7 @@ mod tests {
         let teb_ptr = ctx.types.get_or_make_struct_pointer(4, teb);
         ctx.set_varnode_type(fs, teb_ptr);
 
-        let aliases = AliasResult::simple(&ctx);
+        let aliases = AliasResult::simple_for_function(&ctx, ctx.function_ids()[0]);
         gvn_function(&mut ctx, f, Some(&aliases));
 
         // `0x31 + 0x32` must fold to 0x63 — so the address add reads `fs + 0x63`,
@@ -683,7 +683,7 @@ mod tests {
             "
         );
 
-        let aliases = AliasResult::simple(&ctx);
+        let aliases = AliasResult::simple_for_function(&ctx, ctx.function_ids()[0]);
         gvn_function(&mut ctx, f, Some(&aliases));
 
         // The stored value must be the folded constant 0x30.
@@ -734,7 +734,7 @@ mod tests {
         let teb_ptr = ctx.types.get_or_make_struct_pointer(4, teb);
         ctx.set_varnode_type(fs, teb_ptr);
 
-        let aliases = AliasResult::simple(&ctx);
+        let aliases = AliasResult::simple_for_function(&ctx, ctx.function_ids()[0]);
         gvn_function(&mut ctx, f, Some(&aliases));
 
         let addr_rhs = Function::from_id(&ctx, f)
@@ -777,7 +777,7 @@ mod tests {
             "
         );
 
-        let aliases = AliasResult::simple(&ctx);
+        let aliases = AliasResult::simple_for_function(&ctx, ctx.function_ids()[0]);
         let mut block = BasicBlock::from_id_mut(&mut ctx, block);
         assert!(block.instruction_ids().contains(&v));
 
@@ -810,7 +810,7 @@ mod tests {
             "
         );
 
-        let aliases = AliasResult::simple(&ctx);
+        let aliases = AliasResult::simple_for_function(&ctx, ctx.function_ids()[0]);
         let mut block = BasicBlock::from_id_mut(&mut ctx, block);
 
         gvn(&mut block, Some(&aliases));
@@ -839,7 +839,7 @@ mod tests {
             "
         );
 
-        let aliases = AliasResult::simple(&ctx);
+        let aliases = AliasResult::simple_for_function(&ctx, ctx.function_ids()[0]);
         let mut block = BasicBlock::from_id_mut(&mut ctx, block);
 
         gvn(&mut block, Some(&aliases));
@@ -878,7 +878,7 @@ mod tests {
             "
         );
 
-        let aliases = AliasResult::simple(&ctx);
+        let aliases = AliasResult::simple_for_function(&ctx, ctx.function_ids()[0]);
         gvn_function(&mut ctx, f, Some(&aliases));
 
         let stored = Function::from_id(&ctx, f)
@@ -916,7 +916,7 @@ mod tests {
             "
         );
 
-        let aliases = AliasResult::simple(&ctx);
+        let aliases = AliasResult::simple_for_function(&ctx, ctx.function_ids()[0]);
         gvn_function(&mut ctx, f, Some(&aliases));
 
         let stored = Function::from_id(&ctx, f)
@@ -955,7 +955,7 @@ mod tests {
             "
         );
 
-        let aliases = AliasResult::simple(&ctx);
+        let aliases = AliasResult::simple_for_function(&ctx, ctx.function_ids()[0]);
         gvn_function(&mut ctx, f, Some(&aliases));
 
         let stored = Function::from_id(&ctx, f)

@@ -1209,7 +1209,7 @@ mod tests {
             unread_temp_space_stores(&ctx, fid).contains(&store_id),
             "temp-space store to base+0 is dead when only base+8 is read"
         );
-        let aliases = AliasResult::simple(&ctx);
+        let aliases = AliasResult::simple_for_function(&ctx, fid);
         assert!(
             remove_dead_load_insns(&mut ctx, fid, Some(&aliases), &[]),
             "the dead shadow store should be removed end-to-end"
@@ -1301,7 +1301,7 @@ mod tests {
             "
         );
         let block_id = block;
-        let aliases = AliasResult::simple(&ctx);
+        let aliases = AliasResult::simple_for_function(&ctx, ctx.function_ids()[0]);
         let dead = dead_load_insns(&ctx, block_id, Some(&aliases), &[]);
         let stores = ram_stores(&ctx, block_id);
         let which: Vec<bool> = stores.iter().map(|s| dead.contains(s)).collect();
@@ -1352,7 +1352,7 @@ mod tests {
     #[test]
     fn ram_stores_covered_by_wide_store_are_dead() {
         let (ctx, block_id) = array_build_block(false);
-        let aliases = AliasResult::simple(&ctx);
+        let aliases = AliasResult::simple_for_function(&ctx, ctx.function_ids()[0]);
         let dead = dead_load_insns(&ctx, block_id, Some(&aliases), &[]);
 
         let stores = ram_stores(&ctx, block_id);
@@ -1373,7 +1373,7 @@ mod tests {
     #[test]
     fn ram_store_kept_only_for_read_offset() {
         let (ctx, block_id) = array_build_block(true);
-        let aliases = AliasResult::simple(&ctx);
+        let aliases = AliasResult::simple_for_function(&ctx, ctx.function_ids()[0]);
         let dead = dead_load_insns(&ctx, block_id, Some(&aliases), &[]);
 
         // Stores in program order: base+0, base+4, base+8, [read's reg store], cover.
@@ -1431,7 +1431,10 @@ mod tests {
             Function::from_id_mut(ctx, callee).set_clobbered_regs(vec![r0]);
             Function::from_id_mut(ctx, callee).set_externally_resolved(true);
         });
-        let aliases = AliasResult::simple(&ctx);
+        let aliases = AliasResult::simple_for_function(
+            &ctx,
+            BasicBlock::from_id(&ctx, block).function().unwrap().id,
+        );
         let dead = dead_load_insns(&ctx, block, Some(&aliases), &[]);
         assert!(
             dead.contains(&store_id),
@@ -1448,7 +1451,10 @@ mod tests {
             // Clobbers r0 but is *not* marked resolved.
             Function::from_id_mut(ctx, callee).set_clobbered_regs(vec![r0]);
         });
-        let aliases = AliasResult::simple(&ctx);
+        let aliases = AliasResult::simple_for_function(
+            &ctx,
+            BasicBlock::from_id(&ctx, block).function().unwrap().id,
+        );
         let dead = dead_load_insns(&ctx, block, Some(&aliases), &[]);
         assert!(
             !dead.contains(&store_id),
@@ -1538,7 +1544,7 @@ mod tests {
         let (s1, s2) = (store_ids[0], store_ids[1]);
 
         // Without frame freshness the global load pins the redundant store.
-        let plain = crate::AliasResult::simple(&tc.ctx);
+        let plain = crate::AliasResult::simple_for_function(&tc.ctx, fid);
         let dead_plain = dead_load_insns(&tc.ctx, root, Some(&plain), &[]);
         assert!(
             !dead_plain.contains(&s1),
@@ -1546,8 +1552,11 @@ mod tests {
         );
 
         // With frame freshness, stack ⊥ global, so S1 is correctly dead.
-        let r =
-            crate::AliasResult::simple(&tc.ctx).with_frame_freshness(&tc.ctx, fid, Some(sp_reg));
+        let r = crate::AliasResult::simple_for_function(&tc.ctx, fid).with_frame_freshness(
+            &tc.ctx,
+            fid,
+            Some(sp_reg),
+        );
         let dead = dead_load_insns(&tc.ctx, root, Some(&r), &[]);
         assert!(dead.contains(&s1), "the redundant first store is dead");
         assert!(!dead.contains(&s2), "the surviving last store is kept");
@@ -1603,8 +1612,11 @@ mod tests {
             .collect();
         let (s_local, s_caller, s_read) = (stores[0], stores[1], stores[2]);
 
-        let r =
-            crate::AliasResult::simple(&tc.ctx).with_frame_freshness(&tc.ctx, fid, Some(sp_reg));
+        let r = crate::AliasResult::simple_for_function(&tc.ctx, fid).with_frame_freshness(
+            &tc.ctx,
+            fid,
+            Some(sp_reg),
+        );
         let dead = unread_frame_local_stores(&tc.ctx, fid, &r);
 
         assert!(
@@ -1703,7 +1715,7 @@ mod tests {
         );
         let block_id = block;
 
-        let aliases = crate::AliasResult::simple(&ctx);
+        let aliases = crate::AliasResult::simple_for_function(&ctx, ctx.function_ids()[0]);
         let dead = dead_load_insns(&ctx, block_id, Some(&aliases), &[]);
         let store_ids: Vec<_> = BasicBlock::from_id(&ctx, block_id)
             .instruction_ids()
@@ -1735,7 +1747,7 @@ mod tests {
         );
         let block_id = block;
 
-        let aliases = crate::AliasResult::simple(&ctx);
+        let aliases = crate::AliasResult::simple_for_function(&ctx, ctx.function_ids()[0]);
         let dead = dead_load_insns(&ctx, block_id, Some(&aliases), &[]);
         let store_a_ids: Vec<_> = BasicBlock::from_id(&ctx, block_id)
             .instruction_ids()
@@ -1779,7 +1791,7 @@ mod tests {
             b.push_store(wide_val, ValueId::Varnode(r0), space);
         });
 
-        let aliases = crate::AliasResult::simple(&ctx);
+        let aliases = crate::AliasResult::simple_for_function(&ctx, ctx.function_ids()[0]);
         let dead = dead_load_insns(&ctx, block_id, Some(&aliases), &[]);
 
         let store_ids: Vec<_> = BasicBlock::from_id(&ctx, block_id)
@@ -1826,7 +1838,7 @@ mod tests {
             "
         );
 
-        let aliases = crate::AliasResult::simple(&tc.ctx);
+        let aliases = crate::AliasResult::simple_for_function(&tc.ctx, test);
         let entry_store = *BasicBlock::from_id(&tc.ctx, entry)
             .instruction_ids()
             .iter()
@@ -1893,7 +1905,7 @@ mod tests {
                 return at i64 0x0;
             "
         );
-        let aliases = crate::AliasResult::simple(&ctx);
+        let aliases = crate::AliasResult::simple_for_function(&ctx, mix);
         remove_dead_load_insns(&mut ctx, mix, Some(&aliases), &[]);
         // Only the exit write-back survives; the load from the *unrelated* `@src`
         // pointer, ordered before the store, must not keep it alive.
@@ -1919,7 +1931,7 @@ mod tests {
                 return at i64 0x0;
             "
         );
-        let aliases = crate::AliasResult::simple(&ctx);
+        let aliases = crate::AliasResult::simple_for_function(&ctx, mix);
         remove_dead_load_insns(&mut ctx, mix, Some(&aliases), &[]);
         assert_eq!(
             ram_store_count(&ctx, mix),
@@ -1952,7 +1964,7 @@ mod tests {
                 return at i64 0x0;
             "
         );
-        let aliases = crate::AliasResult::simple(&ctx);
+        let aliases = crate::AliasResult::simple_for_function(&ctx, mix);
         remove_dead_load_insns(&mut ctx, mix, Some(&aliases), &[]);
         // Both `@base` stores stay: the loop reads `@base` before the cover. (`@sink`
         // may alias `@base`, so its store is conservatively kept too.)
@@ -1981,7 +1993,7 @@ mod tests {
                 return at i64 0x0;
             "
         );
-        let aliases = crate::AliasResult::simple(&ctx);
+        let aliases = crate::AliasResult::simple_for_function(&ctx, mix);
         remove_dead_load_insns(&mut ctx, mix, Some(&aliases), &[]);
         // The entry store dies; the exit cover and the `@sink` store remain (2).
         assert_eq!(
@@ -2018,7 +2030,7 @@ mod tests {
                 return at i64 0x0;
             "
         );
-        let aliases = crate::AliasResult::simple(&ctx);
+        let aliases = crate::AliasResult::simple_for_function(&ctx, mix);
         remove_dead_load_insns(&mut ctx, mix, Some(&aliases), &[]);
         assert_eq!(
             ram_store_count(&ctx, mix),
@@ -2066,7 +2078,7 @@ mod tests {
             "the enveloped byte fill should promote"
         );
         run_function_pass::<Gvn>(&mut ctx, mix).unwrap();
-        let aliases = crate::AliasResult::simple(&ctx);
+        let aliases = crate::AliasResult::simple_for_function(&ctx, mix);
         remove_dead_load_insns(&mut ctx, mix, Some(&aliases), &[]);
         // Only the exit write-back of the carried array survives; the init store and
         // the (forwarded) snapshot load of `@base` are gone.
@@ -2100,7 +2112,7 @@ mod tests {
                 goto [i64 @p];
             "
         );
-        let aliases = crate::AliasResult::simple(&ctx);
+        let aliases = crate::AliasResult::simple_for_function(&ctx, mix);
         remove_dead_load_insns(&mut ctx, mix, Some(&aliases), &[]);
         assert_eq!(
             ram_store_count(&ctx, mix),

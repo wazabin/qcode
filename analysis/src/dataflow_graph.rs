@@ -459,7 +459,7 @@ mod tests {
                     return %v;
             "
         );
-        let aliases = AliasResult::simple(&ctx);
+        let aliases = AliasResult::simple_for_function(&ctx, ctx.function_ids()[0]);
         let graph = build_dataflow(
             &ctx,
             ValueId::Instruction(v),
@@ -486,7 +486,7 @@ mod tests {
                     return %b;
             "
         );
-        let aliases = AliasResult::simple(&ctx);
+        let aliases = AliasResult::simple_for_function(&ctx, ctx.function_ids()[0]);
         let graph = build_dataflow(
             &ctx,
             ValueId::Instruction(b),
@@ -521,7 +521,7 @@ mod tests {
                     return %v;
             "
         );
-        let aliases = AliasResult::simple(&ctx);
+        let aliases = AliasResult::simple_for_function(&ctx, ctx.function_ids()[0]);
         let graph = build_dataflow(
             &ctx,
             ValueId::Instruction(v),

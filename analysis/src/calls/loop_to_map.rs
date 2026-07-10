@@ -630,7 +630,7 @@ mod tests {
         );
 
         // Collapse the masked guard to the bare `i < 16` first.
-        let aliases = AliasResult::simple(&ctx);
+        let aliases = AliasResult::simple_for_function(&ctx, xorbuf);
         while gvn_function(&mut ctx, xorbuf, Some(&aliases)) {}
         let header = format!("{}", Function::from_id(&ctx, xorbuf));
         assert!(

@@ -537,27 +537,14 @@ impl RegisterBase {
 impl AliasResult {
     /// A location-based aliasing result that only reasons about known varnode
     /// ranges. Overlapping varnodes in the same space are joined; only pointer
-    /// values that actually participate in loads/stores are added.
+    /// values that actually participate in `function_id`'s own loads/stores are
+    /// added.
     ///
-    /// Whole-context entry point (every load/store in `ctx`), preserved for callers
-    /// and tests that analyze a context as a unit. The per-function GVN pass instead
-    /// goes through [`RegisterBase::for_function`], which neither rebuilds Part A nor
-    /// rescans the whole module per function.
-    pub fn simple(ctx: &Context) -> Self {
-        let pointer_uses: Vec<(ValueId, SpaceId, usize)> = ctx
-            .instructions()
-            .filter_map(|insn| match insn.mnemonic() {
-                Mnemonic::Load(load) => Some((load.ptr, load.space, load.size)),
-                Mnemonic::Store(store) => Some((store.ptr, store.space, store.size)),
-                _ => None,
-            })
-            .collect();
-        RegisterBase::build(ctx).resolve(HostRef::Module(ctx), pointer_uses)
-    }
-
-    /// Like [`simple`](Self::simple), but only scans `function_id`'s own
-    /// instructions. Convenience wrapper over [`RegisterBase`] for callers
-    /// (e.g. `mem2reg`, dead-load tests) that lack a shared base to reuse.
+    /// Function-scoped entry point: builds a fresh [`RegisterBase`] and resolves
+    /// only `function_id`'s pointers, so a whole-module instruction scan is never
+    /// performed. Convenience wrapper for callers (e.g. `mem2reg`, dead-load
+    /// tests) that lack a shared base to reuse; the per-function GVN pass reuses a
+    /// shared base directly via [`RegisterBase::for_function`].
     pub fn simple_for_function(ctx: &Context, function_id: FunctionId) -> Self {
         RegisterBase::build(ctx).for_function(ctx, function_id)
     }

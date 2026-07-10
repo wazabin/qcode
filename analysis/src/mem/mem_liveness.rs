@@ -242,7 +242,7 @@ mod tests {
             "
         );
 
-        let aliases = AliasResult::simple(&ctx);
+        let aliases = AliasResult::simple_for_function(&ctx, ctx.function_ids()[0]);
         let dead = dead_in(&ctx, test, bb1, &aliases, &[]);
         assert!(
             dead.contains(&store_ids(&ctx, bb1)[0]),
@@ -277,7 +277,7 @@ mod tests {
             "
         );
 
-        let aliases = AliasResult::simple(&ctx);
+        let aliases = AliasResult::simple_for_function(&ctx, ctx.function_ids()[0]);
         let dead = dead_in(&ctx, test, bb1, &aliases, &[]);
         assert!(
             !dead.contains(&store_ids(&ctx, bb1)[0]),
@@ -310,7 +310,7 @@ mod tests {
             "
         );
 
-        let aliases = AliasResult::simple(&ctx);
+        let aliases = AliasResult::simple_for_function(&ctx, ctx.function_ids()[0]);
         let dead = dead_in(&ctx, test, bb1, &aliases, &[]);
         assert!(
             !dead.contains(&store_ids(&ctx, bb1)[0]),
@@ -341,7 +341,7 @@ mod tests {
             "
         );
 
-        let aliases = AliasResult::simple(&ctx);
+        let aliases = AliasResult::simple_for_function(&ctx, ctx.function_ids()[0]);
         let dead = dead_in(&ctx, test, bb1, &aliases, &[]);
         assert!(
             !dead.contains(&store_ids(&ctx, bb1)[0]),
@@ -367,7 +367,7 @@ mod tests {
             "
         );
 
-        let aliases = AliasResult::simple(&ctx);
+        let aliases = AliasResult::simple_for_function(&ctx, ctx.function_ids()[0]);
         let dead_regs = vec![ValueId::from(A)];
         let dead = dead_in(&ctx, test, bb1, &aliases, &dead_regs);
         assert!(

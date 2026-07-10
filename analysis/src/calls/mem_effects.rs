@@ -265,7 +265,7 @@ fn callee:
         }
         for _ in 0..2 {
             constant_fold_function(&mut ctx, caller);
-            let aliases = AliasResult::simple(&ctx);
+            let aliases = AliasResult::simple_for_function(&ctx, caller);
             gvn_function(&mut ctx, caller, Some(&aliases));
         }
         format!("{}", Function::from_id(&ctx, caller))
@@ -284,7 +284,7 @@ fn callee:
         }
         for _ in 0..3 {
             constant_fold_function(&mut ctx, caller);
-            let aliases = AliasResult::simple(&ctx);
+            let aliases = AliasResult::simple_for_function(&ctx, caller);
             gvn_function(&mut ctx, caller, Some(&aliases));
         }
         format!("{}", Function::from_id(&ctx, caller))

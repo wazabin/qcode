@@ -962,7 +962,11 @@ mod tests {
             (aligned, store, val)
         };
 
-        let aliases = AliasResult::simple(&tc.ctx).with_frame_freshness(&tc.ctx, fid, Some(sp_reg));
+        let aliases = AliasResult::simple_for_function(&tc.ctx, fid).with_frame_freshness(
+            &tc.ctx,
+            fid,
+            Some(sp_reg),
+        );
         let nb = precompute_forms(&tc.ctx, fid);
 
         let mut mf = MemForward::default();

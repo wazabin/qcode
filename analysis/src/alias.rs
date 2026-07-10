@@ -656,7 +656,11 @@ mod tests {
             (local, caller_arg, arg_plus)
         };
 
-        let r = AliasResult::simple(&tc.ctx).with_frame_freshness(&tc.ctx, fid, Some(sp_reg));
+        let r = AliasResult::simple_for_function(&tc.ctx, fid).with_frame_freshness(
+            &tc.ctx,
+            fid,
+            Some(sp_reg),
+        );
 
         assert!(
             r.provably_disjoint(&tc.ctx, local, arg),
@@ -684,7 +688,7 @@ mod tests {
         );
 
         // Inert without the frame-freshness context.
-        let plain = AliasResult::simple(&tc.ctx);
+        let plain = AliasResult::simple_for_function(&tc.ctx, fid);
         assert!(!plain.provably_disjoint(&tc.ctx, local, arg));
     }
 
@@ -731,7 +735,11 @@ mod tests {
         };
         tc.ctx.values.block_param_mut(glob_pid).origin = Some(glob_addr);
 
-        let r = AliasResult::simple(&tc.ctx).with_frame_freshness(&tc.ctx, fid, Some(sp_reg));
+        let r = AliasResult::simple_for_function(&tc.ctx, fid).with_frame_freshness(
+            &tc.ctx,
+            fid,
+            Some(sp_reg),
+        );
 
         assert!(
             r.provably_disjoint(&tc.ctx, local, glob),
@@ -767,7 +775,7 @@ mod tests {
         );
 
         // Inert without the frame-freshness context.
-        let plain = AliasResult::simple(&tc.ctx);
+        let plain = AliasResult::simple_for_function(&tc.ctx, fid);
         assert!(!plain.provably_disjoint(&tc.ctx, local, lit_addr));
     }
 
@@ -818,7 +826,11 @@ mod tests {
         };
         tc.ctx.values.block_param_mut(glob_pid).origin = Some(glob_addr);
 
-        let r = AliasResult::simple(&tc.ctx).with_frame_freshness(&tc.ctx, fid, Some(sp_reg));
+        let r = AliasResult::simple_for_function(&tc.ctx, fid).with_frame_freshness(
+            &tc.ctx,
+            fid,
+            Some(sp_reg),
+        );
 
         // Without the assumption, the reload-through store is opaque.
         assert!(
@@ -830,7 +842,11 @@ mod tests {
         // recording it.
         tc.ctx
             .assume_true(Proposition::LoadedPointerDisjointFromSlot(fid));
-        let r = AliasResult::simple(&tc.ctx).with_frame_freshness(&tc.ctx, fid, Some(sp_reg));
+        let r = AliasResult::simple_for_function(&tc.ctx, fid).with_frame_freshness(
+            &tc.ctx,
+            fid,
+            Some(sp_reg),
+        );
         assert!(
             r.provably_disjoint(&tc.ctx, glob, store_addr),
             "@glob ⊥ a store through load(@glob) under the assumption"
@@ -893,7 +909,11 @@ mod tests {
         // loaded-pointer assumption, so the deref is not yet input-derived.
         tc.ctx
             .assume_true(Proposition::ArgsDisjointFromCallerFrame(fid));
-        let r = AliasResult::simple(&tc.ctx).with_frame_freshness(&tc.ctx, fid, Some(sp_reg));
+        let r = AliasResult::simple_for_function(&tc.ctx, fid).with_frame_freshness(
+            &tc.ctx,
+            fid,
+            Some(sp_reg),
+        );
         assert!(
             !r.provably_disjoint(&tc.ctx, addr, sp),
             "the spilled reload is opaque without LoadedPointerDisjointFromSlot"
@@ -902,7 +922,11 @@ mod tests {
         // With both assumptions, the deref counts as incoming and misses the frame.
         tc.ctx
             .assume_true(Proposition::LoadedPointerDisjointFromSlot(fid));
-        let r = AliasResult::simple(&tc.ctx).with_frame_freshness(&tc.ctx, fid, Some(sp_reg));
+        let r = AliasResult::simple_for_function(&tc.ctx, fid).with_frame_freshness(
+            &tc.ctx,
+            fid,
+            Some(sp_reg),
+        );
         assert!(
             r.provably_disjoint(&tc.ctx, addr, sp),
             "load(@SP+4) + 4 ⊥ @SP under both assumptions"
@@ -949,7 +973,11 @@ mod tests {
             (caller_arg, arg_plus)
         };
 
-        let r = AliasResult::simple(&tc.ctx).with_frame_freshness(&tc.ctx, fid, Some(sp_reg));
+        let r = AliasResult::simple_for_function(&tc.ctx, fid).with_frame_freshness(
+            &tc.ctx,
+            fid,
+            Some(sp_reg),
+        );
 
         // Without the assumption, a caller-frame slot may alias an incoming pointer.
         assert!(
@@ -960,7 +988,11 @@ mod tests {
         // The assumption is hoisted at build time, so rebuild after recording it.
         tc.ctx
             .assume_true(Proposition::ArgsDisjointFromCallerFrame(fid));
-        let r = AliasResult::simple(&tc.ctx).with_frame_freshness(&tc.ctx, fid, Some(sp_reg));
+        let r = AliasResult::simple_for_function(&tc.ctx, fid).with_frame_freshness(
+            &tc.ctx,
+            fid,
+            Some(sp_reg),
+        );
 
         assert!(
             r.provably_disjoint(&tc.ctx, caller_arg, arg),
@@ -1017,7 +1049,11 @@ mod tests {
             (local, mix, arg_plus)
         };
 
-        let r = AliasResult::simple(&tc.ctx).with_frame_freshness(&tc.ctx, fid, Some(sp_reg));
+        let r = AliasResult::simple_for_function(&tc.ctx, fid).with_frame_freshness(
+            &tc.ctx,
+            fid,
+            Some(sp_reg),
+        );
 
         assert!(
             !r.provably_disjoint(&tc.ctx, local, mix),
@@ -1078,7 +1114,11 @@ mod tests {
         // via the sound Refinement A — this activation captures nothing, so no
         // caller pointer or loaded value can name a slot of its frame. The
         // caller-frame slot, by contrast, still needs the assumed rule 2 below.
-        let r = AliasResult::simple(&tc.ctx).with_frame_freshness(&tc.ctx, fid, Some(sp_reg));
+        let r = AliasResult::simple_for_function(&tc.ctx, fid).with_frame_freshness(
+            &tc.ctx,
+            fid,
+            Some(sp_reg),
+        );
         assert!(
             r.provably_disjoint(&tc.ctx, local, mix),
             "own-frame ⊥ input|loaded when the frame is uncaptured (Refinement A)"
@@ -1088,7 +1128,11 @@ mod tests {
         // Only the caller-frame assumption: still opaque (the load is not admitted).
         tc.ctx
             .assume_true(Proposition::ArgsDisjointFromCallerFrame(fid));
-        let r = AliasResult::simple(&tc.ctx).with_frame_freshness(&tc.ctx, fid, Some(sp_reg));
+        let r = AliasResult::simple_for_function(&tc.ctx, fid).with_frame_freshness(
+            &tc.ctx,
+            fid,
+            Some(sp_reg),
+        );
         assert!(
             !r.provably_disjoint(&tc.ctx, caller_arg, mix),
             "the loaded operand is not admitted without LoadedPointerDisjointFromSlot"
@@ -1097,7 +1141,11 @@ mod tests {
         // Both assumptions: the caller-frame slot is disjoint from arg + load(p).
         tc.ctx
             .assume_true(Proposition::LoadedPointerDisjointFromSlot(fid));
-        let r = AliasResult::simple(&tc.ctx).with_frame_freshness(&tc.ctx, fid, Some(sp_reg));
+        let r = AliasResult::simple_for_function(&tc.ctx, fid).with_frame_freshness(
+            &tc.ctx,
+            fid,
+            Some(sp_reg),
+        );
         assert!(
             r.provably_disjoint(&tc.ctx, caller_arg, mix),
             "@SP+8 ⊥ arg + load(p) under both assumptions"
@@ -1145,7 +1193,11 @@ mod tests {
             (local, deep)
         };
 
-        let r = AliasResult::simple(&tc.ctx).with_frame_freshness(&tc.ctx, fid, Some(sp_reg));
+        let r = AliasResult::simple_for_function(&tc.ctx, fid).with_frame_freshness(
+            &tc.ctx,
+            fid,
+            Some(sp_reg),
+        );
         assert!(r.provably_disjoint(&tc.ctx, local, deep));
         let after_first = r.frame.as_ref().unwrap().provenance.borrow().len();
         assert!(r.provably_disjoint(&tc.ctx, local, deep));
@@ -1226,7 +1278,11 @@ mod tests {
             (local, loaded)
         };
 
-        let r = AliasResult::simple(&tc.ctx).with_frame_freshness(&tc.ctx, fid, Some(sp_reg));
+        let r = AliasResult::simple_for_function(&tc.ctx, fid).with_frame_freshness(
+            &tc.ctx,
+            fid,
+            Some(sp_reg),
+        );
         assert!(
             r.frame.as_ref().unwrap().frame_uncaptured,
             "nothing captures the frame"
@@ -1260,7 +1316,11 @@ mod tests {
             (local, loaded)
         };
 
-        let r = AliasResult::simple(&tc.ctx).with_frame_freshness(&tc.ctx, fid, Some(sp_reg));
+        let r = AliasResult::simple_for_function(&tc.ctx, fid).with_frame_freshness(
+            &tc.ctx,
+            fid,
+            Some(sp_reg),
+        );
         assert!(
             !r.frame.as_ref().unwrap().frame_uncaptured,
             "storing the frame address captures the frame"
@@ -1317,7 +1377,11 @@ mod tests {
                 })
             };
             tc.ctx.replace_instruction_mnemonic(cid, mn);
-            let r = AliasResult::simple(&tc.ctx).with_frame_freshness(&tc.ctx, fid, Some(sp_reg));
+            let r = AliasResult::simple_for_function(&tc.ctx, fid).with_frame_freshness(
+                &tc.ctx,
+                fid,
+                Some(sp_reg),
+            );
             r.frame.as_ref().unwrap().frame_uncaptured
         }
 
@@ -1376,7 +1440,11 @@ mod tests {
                     clobbers: vec![],
                 }),
             );
-            let r = AliasResult::simple(&tc.ctx).with_frame_freshness(&tc.ctx, fid, Some(sp_reg));
+            let r = AliasResult::simple_for_function(&tc.ctx, fid).with_frame_freshness(
+                &tc.ctx,
+                fid,
+                Some(sp_reg),
+            );
             assert!(
                 r.frame.as_ref().unwrap().frame_uncaptured,
                 "an INPUT arg does not capture the frame"
@@ -1429,7 +1497,11 @@ mod tests {
 
         // Without the assumptions, rule 2 is inert and rule 1b cannot fire (mixed
         // is not a pure global).
-        let plain = AliasResult::simple(&tc.ctx).with_frame_freshness(&tc.ctx, fid, Some(sp_reg));
+        let plain = AliasResult::simple_for_function(&tc.ctx, fid).with_frame_freshness(
+            &tc.ctx,
+            fid,
+            Some(sp_reg),
+        );
         assert!(
             !plain.provably_disjoint(&tc.ctx, caller_slot, mixed),
             "no caller-frame disjointness without the assumptions"
@@ -1439,7 +1511,11 @@ mod tests {
             .assume_true(Proposition::ArgsDisjointFromCallerFrame(fid));
         tc.ctx
             .assume_true(Proposition::LoadedPointerDisjointFromSlot(fid));
-        let r = AliasResult::simple(&tc.ctx).with_frame_freshness(&tc.ctx, fid, Some(sp_reg));
+        let r = AliasResult::simple_for_function(&tc.ctx, fid).with_frame_freshness(
+            &tc.ctx,
+            fid,
+            Some(sp_reg),
+        );
         assert!(
             r.provably_disjoint(&tc.ctx, caller_slot, mixed),
             "caller-frame slot ⊥ INPUT|GLOBAL_STATIC under the assumptions (widened mask)"

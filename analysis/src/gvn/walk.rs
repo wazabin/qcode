@@ -502,7 +502,7 @@ mod tests {
             unsafe { b.dont_finalize() };
         }
 
-        let aliases = AliasResult::simple(&tc.ctx);
+        let aliases = AliasResult::simple_for_function(&tc.ctx, fun_id);
         gvn_function(&mut tc.ctx, fun_id, Some(&aliases));
 
         let ValueId::Instruction(load_insn) = load_id else {
@@ -548,7 +548,7 @@ mod tests {
                 "
         );
 
-        let aliases = AliasResult::simple(&ctx);
+        let aliases = AliasResult::simple_for_function(&ctx, ctx.function_ids()[0]);
         gvn_function(&mut ctx, shared_orphans, Some(&aliases));
 
         assert!(
@@ -582,7 +582,7 @@ mod tests {
                 "
         );
 
-        let aliases = AliasResult::simple(&ctx);
+        let aliases = AliasResult::simple_for_function(&ctx, ctx.function_ids()[0]);
         assert!(
             gvn_function(&mut ctx, g, Some(&aliases)),
             "eliminating the duplicate binop must be reported as a change"

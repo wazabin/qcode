@@ -566,7 +566,7 @@ mod tests {
                 "
         );
 
-        let aliases = AliasResult::simple(&ctx);
+        let aliases = AliasResult::simple_for_function(&ctx, ctx.function_ids()[0]);
         gvn_function(&mut ctx, f, Some(&aliases));
 
         assert!(
@@ -606,7 +606,7 @@ mod tests {
                 "
         );
 
-        let aliases = AliasResult::simple(&ctx);
+        let aliases = AliasResult::simple_for_function(&ctx, ctx.function_ids()[0]);
         gvn_function(&mut ctx, f, Some(&aliases));
         crate::remove_dead_insns(&mut ctx, entry);
         let text = BasicBlock::from_id(&ctx, entry).to_string();
@@ -638,7 +638,7 @@ mod tests {
                 "
         );
 
-        let aliases = AliasResult::simple(&ctx);
+        let aliases = AliasResult::simple_for_function(&ctx, ctx.function_ids()[0]);
         gvn_function(&mut ctx, f, Some(&aliases));
         crate::remove_dead_insns(&mut ctx, entry);
         let text = BasicBlock::from_id(&ctx, entry).to_string();
@@ -677,7 +677,7 @@ mod tests {
                 "
         );
 
-        let aliases = AliasResult::simple(&ctx);
+        let aliases = AliasResult::simple_for_function(&ctx, ctx.function_ids()[0]);
         gvn_function(&mut ctx, f, Some(&aliases));
         crate::remove_dead_insns(&mut ctx, entry);
         let text = BasicBlock::from_id(&ctx, entry).to_string();
@@ -717,7 +717,7 @@ mod tests {
                 "
         );
 
-        let aliases = AliasResult::simple(&ctx);
+        let aliases = AliasResult::simple_for_function(&ctx, ctx.function_ids()[0]);
         while gvn_function(&mut ctx, f, Some(&aliases)) {}
         crate::remove_dead_insns(&mut ctx, entry);
         let text = BasicBlock::from_id(&ctx, entry).to_string();
@@ -758,7 +758,7 @@ mod tests {
                 "
         );
 
-        let aliases = AliasResult::simple(&ctx);
+        let aliases = AliasResult::simple_for_function(&ctx, ctx.function_ids()[0]);
         while gvn_function(&mut ctx, f, Some(&aliases)) {}
         crate::remove_dead_insns(&mut ctx, entry);
         let text = BasicBlock::from_id(&ctx, entry).to_string();
@@ -798,7 +798,7 @@ mod tests {
                 "
         );
 
-        let aliases = AliasResult::simple(&ctx);
+        let aliases = AliasResult::simple_for_function(&ctx, ctx.function_ids()[0]);
         while gvn_function(&mut ctx, f, Some(&aliases)) {}
         crate::remove_dead_insns(&mut ctx, entry);
         let text = BasicBlock::from_id(&ctx, entry).to_string();
@@ -839,7 +839,7 @@ mod tests {
                 "
         );
 
-        let aliases = AliasResult::simple(&ctx);
+        let aliases = AliasResult::simple_for_function(&ctx, ctx.function_ids()[0]);
         while gvn_function(&mut ctx, f, Some(&aliases)) {}
         crate::remove_dead_insns(&mut ctx, entry);
         let text = BasicBlock::from_id(&ctx, entry).to_string();
@@ -871,7 +871,7 @@ mod tests {
                 "
         );
 
-        let aliases = AliasResult::simple(&ctx);
+        let aliases = AliasResult::simple_for_function(&ctx, ctx.function_ids()[0]);
         while gvn_function(&mut ctx, f, Some(&aliases)) {}
         let text = BasicBlock::from_id(&ctx, entry).to_string();
         assert_eq!(
@@ -902,7 +902,7 @@ mod tests {
                 "
         );
 
-        let aliases = AliasResult::simple(&ctx);
+        let aliases = AliasResult::simple_for_function(&ctx, ctx.function_ids()[0]);
         gvn_function(&mut ctx, f, Some(&aliases));
         let text = BasicBlock::from_id(&ctx, entry).to_string();
         assert!(
