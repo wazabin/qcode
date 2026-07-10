@@ -29,6 +29,7 @@ use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
 use std::collections::{BTreeSet, VecDeque};
 
 use qcode::{
+    builder::Builder,
     context::Context,
     value::{BasicBlock, BlockId, Function, FunctionId, block::EdgeId},
 };
@@ -49,6 +50,16 @@ pub fn split_overlapping_functions(ctx: &mut Context) -> bool {
             continue;
         }
         if reattribute_blocks(ctx) {
+            changed_any = true;
+            continue;
+        }
+        // A terminator that targets the *middle* of another function (a `jmp`/`jcc`
+        // into a non-entry block of a sibling routine) is a genuine inter-procedural
+        // landing that the IR must not encode as a foreign `BlockId`. Force a
+        // function split at that landing: promote it to its own function's entry so
+        // `reattribute_blocks` re-claims the tail below it, and the incoming edge
+        // becomes an into-entry tail call the conversion step can honestly encode.
+        if promote_cross_function_landings(ctx) {
             changed_any = true;
             continue;
         }
@@ -82,15 +93,17 @@ pub fn split_overlapping_functions(ctx: &mut Context) -> bool {
 /// another function's entry — a tail call, or a thunk's `jmp realfunc` — is an
 /// *inter*-procedural control transfer. Two things must be repaired:
 ///
-/// 1. **The terminator.** An unconditional `Branch` into another function's
-///    *entry* is the thunk / tail-call shape. Its target is a foreign `BlockId` —
-///    exactly the cross-function reference the context-split design (ruling 2)
-///    forbids. Rewrite it to a function-level [`TailCall`] carrying the callee's
-///    `FunctionId`; the IR then holds no foreign block reference and the reverse
-///    call graph picks the edge up through `call_target`/`call_sites`. (A
-///    *conditional* cross-function arm, or a jump into the *middle* of another
-///    function, is left as a foreign `Branch`/`CBranch` for now — those functions
-///    stay on the sequential lane; see `entangled_functions`.)
+/// 1. **The terminator.** Its target is a foreign `BlockId` — exactly the
+///    cross-function reference the context-split design (ruling 2) forbids. By the
+///    time this runs, [`promote_cross_function_landings`] has forced every
+///    mid-function landing to become its own function's entry, so every surviving
+///    cross-function target is a foreign *entry*. An unconditional `Branch` into a
+///    foreign entry (the thunk / tail-call shape) is rewritten to a function-level
+///    [`TailCall`] carrying the callee's `FunctionId`. A *conditional* arm into a
+///    foreign entry is routed through a fresh intra-function trampoline block that
+///    ends in a `TailCall` (a `TailCall` is unconditional and cannot be a `CBranch`
+///    arm). Either way the IR holds no foreign block reference and the reverse call
+///    graph picks the edge up through `call_target`/`call_sites`.
 /// 2. **The CFG edge.** Whether or not the terminator was rewritten, the
 ///    inter-procedural *edge* has no intra-procedural meaning: leaving it in makes
 ///    every per-function analysis that walks `successors`/`predecessors`
@@ -101,13 +114,27 @@ pub fn split_overlapping_functions(ctx: &mut Context) -> bool {
 ///
 /// Returns `true` if any terminator was rewritten or any edge removed.
 fn convert_cross_function_tail_calls(ctx: &mut Context) -> bool {
-    use qcode::value::insn::{Branch, Mnemonic, TailCall};
+    use qcode::value::insn::{Branch, CBranch, Mnemonic, TailCall};
 
-    // An unconditional `Branch` into a foreign function's *entry*: the terminator
-    // instruction and the callee it tail-jumps to.
+    // An unconditional `Branch` into a foreign function's entry: the terminator
+    // instruction and the callee it tail-jumps to. Rewritten in place to `TailCall`.
     let mut tail_calls: Vec<(qcode::value::insn::InstructionId, FunctionId)> = Vec::new();
+    // A conditional arm (`CBranch`) into a foreign function's entry: the terminator,
+    // the block that owns it, and — per arm — the callee that arm jumps to. Each
+    // needs a fresh intra-function trampoline block ending in a `TailCall`, since a
+    // `TailCall` is unconditional and cannot itself be a `CBranch` arm.
+    let mut cond_calls: Vec<(qcode::value::insn::InstructionId, BlockId, FunctionId)> = Vec::new();
     // Every cross-function CFG edge, converted or residual, is stripped.
     let mut stale: Vec<EdgeId> = Vec::new();
+
+    // Resolve a static terminator target to the foreign function whose *entry* it is
+    // (the only cross-function shape that survives after `promote_cross_function_landings`
+    // has forced every mid-function landing to become its own entry).
+    let foreign_entry = |ctx: &Context, target: BlockId, owner: FunctionId| -> Option<FunctionId> {
+        let callee = BasicBlock::from_id(ctx, target).parent().map(|f| f.id)?;
+        (callee != owner && Function::from_id(ctx, callee).root().map(|r| r.id) == Some(target))
+            .then_some(callee)
+    };
 
     for block in ctx.blocks() {
         let Some(owner) = block.parent().map(|f| f.id) else {
@@ -124,21 +151,35 @@ fn convert_cross_function_tail_calls(ctx: &mut Context) -> bool {
             }
         }
 
-        // Recognize the unconditional tail jump into another function's entry.
-        if let Some(term) = block.instructions().last()
-            && let Mnemonic::Branch(Branch { target, .. }) = term.mnemonic()
-        {
-            let callee = BasicBlock::from_id(ctx, *target).parent().map(|f| f.id);
-            if let Some(callee) = callee
-                && callee != owner
-                && Function::from_id(ctx, callee).root().map(|r| r.id) == Some(*target)
-            {
-                tail_calls.push((term.id, callee));
+        match block.instructions().last().map(|t| (t.id, t.mnemonic())) {
+            // Unconditional tail jump into another function's entry.
+            Some((id, Mnemonic::Branch(Branch { target, .. }))) => {
+                if let Some(callee) = foreign_entry(ctx, *target, owner) {
+                    tail_calls.push((id, callee));
+                }
             }
+            // A conditional arm into another function's entry. Each arm is handled
+            // independently; a self-loop / intra arm is left untouched.
+            Some((
+                id,
+                Mnemonic::CBranch(CBranch {
+                    success_block,
+                    failure_block,
+                    ..
+                }),
+            )) => {
+                if let Some(callee) = foreign_entry(ctx, *success_block, owner) {
+                    cond_calls.push((id, block.id, callee));
+                }
+                if let Some(callee) = foreign_entry(ctx, *failure_block, owner) {
+                    cond_calls.push((id, block.id, callee));
+                }
+            }
+            _ => {}
         }
     }
 
-    let changed = !tail_calls.is_empty() || !stale.is_empty();
+    let changed = !tail_calls.is_empty() || !cond_calls.is_empty() || !stale.is_empty();
 
     for (insn, callee) in tail_calls {
         ctx.replace_instruction_mnemonic(
@@ -149,10 +190,85 @@ fn convert_cross_function_tail_calls(ctx: &mut Context) -> bool {
             }),
         );
     }
+    // Route each conditional cross-function arm through a fresh trampoline block in
+    // the arm's own function that ends in a `TailCall`. The `CBranch` arm is
+    // repointed at the trampoline (an intra-function target); the trampoline's tail
+    // call carries the callee's id, so no foreign `BlockId` survives. On the clean
+    // IR (split runs pre-mem2reg) target blocks have no params, so the arm carries
+    // no block arguments to forward.
+    for (insn, owner_block, callee) in cond_calls {
+        let owner = BasicBlock::from_id(ctx, owner_block)
+            .parent()
+            .map(|f| f.id)
+            .expect("cbranch block has an owner");
+        let tramp = BasicBlock::make(ctx, owner).id;
+        Builder::from_block(BasicBlock::from_id_mut(ctx, tramp)).push_tail_call(callee);
+        ctx.add_cfg_edge(owner_block, tramp);
+
+        let Mnemonic::CBranch(mut cb) = ctx.values.instruction(insn).mnemonic().clone() else {
+            continue;
+        };
+        // Repoint whichever arm(s) targeted this callee's entry at the trampoline.
+        if foreign_entry(ctx, cb.success_block, owner) == Some(callee) {
+            cb.success_block = tramp;
+        }
+        if foreign_entry(ctx, cb.failure_block, owner) == Some(callee) {
+            cb.failure_block = tramp;
+        }
+        ctx.replace_instruction_mnemonic(insn, Mnemonic::CBranch(cb));
+    }
     for edge in stale {
         ctx.remove_cfg_edge(edge);
     }
     changed
+}
+
+/// Force a function split at every terminator target that lands in the *middle* of
+/// another function. After [`reattribute_blocks`] settles ownership, a terminator in
+/// function `F` may still statically target a block owned by a different function
+/// `G` that is not `G`'s entry — a `jmp`/`jcc` into the middle of `G`. Strict IR
+/// locality (context-split ruling 2) forbids the resulting foreign `BlockId`, so the
+/// landing is promoted to its own function: it becomes an entry, the next
+/// [`reattribute_blocks`] round re-claims the tail below it, and
+/// [`convert_cross_function_tail_calls`] then encodes the incoming edge as an
+/// into-entry tail call (unconditional) or a trampoline (conditional). No block is
+/// cloned. Returns `true` if a function was created.
+fn promote_cross_function_landings(ctx: &mut Context) -> bool {
+    let mut to_promote: Vec<u64> = Vec::new();
+    let mut seen: HashSet<u64> = HashSet::default();
+
+    for block in ctx.blocks() {
+        let Some(owner) = block.parent().map(|f| f.id) else {
+            continue;
+        };
+        let Some(term) = block.instructions().last() else {
+            continue;
+        };
+        for target in term.mnemonic().target_blocks() {
+            let tb = BasicBlock::from_id(ctx, target);
+            let Some(g) = tb.parent().map(|f| f.id) else {
+                continue;
+            };
+            // Only a cross-function target that is *not* already `G`'s entry needs a
+            // forced split; an into-entry edge is handled by the conversion step.
+            if g == owner || Function::from_id(ctx, g).root().map(|r| r.id) == Some(target) {
+                continue;
+            }
+            if let Some(addr) = tb.address()
+                && Function::from_addr(ctx, addr).is_none()
+                && seen.insert(addr)
+            {
+                to_promote.push(addr);
+            }
+        }
+    }
+
+    let promoted = !to_promote.is_empty();
+    for addr in to_promote {
+        Function::make_at_addr(ctx, addr, None);
+        log::debug!(target: "split", "forced function split at cross-function landing {addr:#x}");
+    }
+    promoted
 }
 
 /// Map every block that carries a machine address to its id. Addresses are unique
@@ -333,7 +449,6 @@ fn recompute_instruction_addrs(ctx: &mut Context, func: FunctionId) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use qcode::builder::Builder;
     use qcode::value::{Function, FunctionId, Instruction};
     use std::borrow::Cow;
 
@@ -532,6 +647,109 @@ mod tests {
         let _ = g_entry;
 
         // Idempotent: nothing left to strip.
+        assert!(!split_overlapping_functions(&mut ctx));
+    }
+
+    /// Append a `cbranch` to `block`: taken -> `success`, fall-through -> `failure`,
+    /// tagged with machine `addr`. Wires both CFG edges (via `push_cbranch`).
+    fn cbranch_at(
+        ctx: &mut Context,
+        block: BlockId,
+        success: BlockId,
+        failure: BlockId,
+        addr: u64,
+    ) {
+        let cond = ctx.get_const(1, 1).id();
+        let id = Builder::from_block(BasicBlock::from_id_mut(ctx, block))
+            .push_cbranch(cond, success, failure)
+            .id;
+        Instruction::from_id_mut(ctx, id).set_address(addr);
+    }
+
+    /// A *conditional* arm into another function's entry cannot become a `TailCall`
+    /// in place (a tail call is unconditional). The splitter routes it through a
+    /// fresh intra-function trampoline block ending in a `TailCall`: the `CBranch`
+    /// arm is repointed at the trampoline, the cross-function edge is stripped, and
+    /// no foreign `BlockId` survives. The intra-function fall-through arm is intact.
+    #[test]
+    fn routes_conditional_cross_function_arm_through_trampoline() {
+        use qcode::value::insn::{CBranch, Mnemonic, TailCall};
+
+        let mut ctx = Context::new();
+
+        // F@0x1000: entry(0x1000) if cond -> g_entry(0x2000) else -> cont(0x1008).
+        let entry = block_at(&mut ctx, 0x1000);
+        let cont = block_at(&mut ctx, 0x1008);
+        let g_entry = block_at(&mut ctx, 0x2000);
+
+        cbranch_at(&mut ctx, entry, g_entry, cont, 0x1000);
+        return_at(&mut ctx, cont, 0x1008);
+        return_at(&mut ctx, g_entry, 0x2000);
+
+        let f = Function::make_at_addr(&mut ctx, 0x1000, Some(Cow::Borrowed("f"))).id;
+        {
+            let mut func = Function::from_id_mut(&mut ctx, f);
+            func.set_root(entry).unwrap();
+            func.add_block(cont);
+        }
+        let g = Function::make_at_addr(&mut ctx, 0x2000, Some(Cow::Borrowed("g"))).id;
+        Function::from_id_mut(&mut ctx, g)
+            .set_root(g_entry)
+            .unwrap();
+
+        assert!(split_overlapping_functions(&mut ctx));
+
+        // A trampoline block was minted into F (entry + cont + trampoline = 3).
+        let f_blocks = Function::from_id(&ctx, f).block_ids();
+        assert_eq!(f_blocks.len(), 3, "F gains one trampoline block");
+        assert_block_set(&ctx, g, &[g_entry]);
+
+        // The CBranch's success arm now points at an intra-F trampoline; the
+        // fall-through arm is unchanged. No arm references a foreign block.
+        let Mnemonic::CBranch(CBranch {
+            success_block,
+            failure_block,
+            ..
+        }) = BasicBlock::from_id(&ctx, entry)
+            .instructions()
+            .last()
+            .unwrap()
+            .mnemonic()
+            .clone()
+        else {
+            panic!("entry must still end in a cbranch");
+        };
+        assert_eq!(failure_block, cont, "the intra-function arm is untouched");
+        assert_ne!(success_block, g_entry, "the foreign arm was repointed");
+        assert_eq!(
+            BasicBlock::from_id(&ctx, success_block)
+                .parent()
+                .map(|f| f.id),
+            Some(f),
+            "the trampoline lives in F",
+        );
+
+        // The trampoline ends in a TailCall to G; no foreign block reference.
+        let term = BasicBlock::from_id(&ctx, success_block)
+            .instructions()
+            .last()
+            .map(|i| i.mnemonic().clone());
+        assert!(
+            matches!(term, Some(Mnemonic::TailCall(TailCall { target, .. })) if target == g),
+            "trampoline must tail-call G, got {term:?}",
+        );
+
+        // No cross-function CFG edge remains out of entry: it reaches the trampoline
+        // and cont, both in F.
+        for (_, s) in BasicBlock::from_id(&ctx, entry).successors() {
+            assert_eq!(
+                BasicBlock::from_id(&ctx, s).parent().map(|f| f.id),
+                Some(f),
+                "every successor of entry is owned by F",
+            );
+        }
+
+        // Idempotent: nothing left to route.
         assert!(!split_overlapping_functions(&mut ctx));
     }
 
