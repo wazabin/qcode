@@ -243,12 +243,20 @@ fn apply<'str>(body: &mut FunctionBody<'str>, cx: ContextView<'_, 'str>, m: &Rea
         };
         // Build `at(arr, idx)` with the explicit element type and splice it before
         // the load (avoids the Builder's `context_mut` type-mint path).
-        let at_val = body.push_mnemonic_with_type(cx, Mnemonic::Intrinsic(IntrinsicApp {
-            id: at_id,
-            args: vec![m.arr, idx],
-        }), at_ty);
+        let at_val = body.push_mnemonic_with_type(
+            cx,
+            Mnemonic::Intrinsic(IntrinsicApp {
+                id: at_id,
+                args: vec![m.arr, idx],
+            }),
+            at_ty,
+        );
         body.insert_insn_before(cx, block, *load_id, at_val);
-        body.replace_all_uses_with(cx, ValueId::Instruction(*load_id), ValueId::Instruction(at_val));
+        body.replace_all_uses_with(
+            cx,
+            ValueId::Instruction(*load_id),
+            ValueId::Instruction(at_val),
+        );
         body.remove_instruction(cx, *load_id);
     }
     body.remove_instruction(cx, m.seed_id);
