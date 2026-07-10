@@ -45,7 +45,7 @@ fn as_int_binop(host: HostRef, v: ValueId, want: IntBinop) -> Option<(ValueId, V
     let ValueId::Instruction(id) = v else {
         return None;
     };
-    match host.instruction(id).mnemonic() {
+    match host.insn_ref(id).mnemonic() {
         Mnemonic::Binop(Binary {
             lhs,
             rhs,
@@ -60,7 +60,7 @@ fn as_sborrow(host: HostRef, v: ValueId) -> Option<(ValueId, ValueId)> {
     let ValueId::Instruction(id) = v else {
         return None;
     };
-    match host.instruction(id).mnemonic() {
+    match host.insn_ref(id).mnemonic() {
         Mnemonic::SBorrow(sb) => Some((sb.lhs, sb.rhs)),
         _ => None,
     }

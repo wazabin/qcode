@@ -29,10 +29,10 @@
 use rustc_hash::FxHashMap as HashMap;
 
 use qcode::value::{
-    BlockRef, FunctionRef, ValueId,
+    ValueId,
     block::BlockId,
     function::FunctionId,
-    insn::{Binary, Binop, InstructionId, InstructionRef, IntBinop, Mnemonic, Unary, Unop},
+    insn::{Binary, Binop, InstructionId, IntBinop, Mnemonic, Unary, Unop},
     util::{base_ref::HostRef, host_mut::HostMut},
 };
 
@@ -771,7 +771,7 @@ pub(crate) fn precompute_forms<'a, 'str: 'a>(
 ) -> Numbering {
     let host = host.into();
     let mut numbering = Numbering::default();
-    let ids: Vec<ValueId> = FunctionRef::new(host, func_id)
+    let ids: Vec<ValueId> = host.function_ref(func_id)
         .iter()
         .flat_map(|block| {
             block
@@ -799,7 +799,7 @@ pub(crate) fn precompute_forms_for_blocks<'a, 'str: 'a>(
     let ids: Vec<ValueId> = blocks
         .iter()
         .flat_map(|&b| {
-            BlockRef::new(host, b)
+            host.block_ref(b)
                 .instruction_ids()
                 .iter()
                 .map(|&id| ValueId::Instruction(id))
@@ -992,7 +992,7 @@ fn ensure_form(host: HostRef, v: ValueId, numbering: &mut Numbering) {
     let ValueId::Instruction(id) = v else {
         return;
     };
-    let insn = InstructionRef::new(host, id);
+    let insn = host.insn_ref(id);
     let width = insn.size();
     let mnemonic = insn.mnemonic().clone();
     numbering.forms.insert(v, leaf(v, width));

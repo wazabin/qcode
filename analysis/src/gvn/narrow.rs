@@ -91,7 +91,7 @@ fn src_transformable(host: HostRef, v: ValueId) -> bool {
     let ValueId::Instruction(iid) = v else {
         return false;
     };
-    match host.instruction(iid).mnemonic() {
+    match host.insn_ref(iid).mnemonic() {
         Mnemonic::Binop(b) => matches!(
             b.op,
             Binop::Int(
@@ -129,7 +129,7 @@ fn narrow_to<'str, H: HostMut<'str>>(
     }
 
     let result = match v {
-        ValueId::Instruction(iid) => match host.read_host().instruction(iid).mnemonic().clone() {
+        ValueId::Instruction(iid) => match host.insn_ref(iid).mnemonic().clone() {
             Mnemonic::Binop(Binary {
                 op: Binop::Int(o),
                 lhs,

@@ -347,7 +347,7 @@ pub(super) fn cast_identity(host: HostRef, m: &Mnemonic) -> Option<ValueId> {
             // `N` bytes of the zext are `inner` untouched, so the extract peels
             // the widening back off.
             if let ValueId::Instruction(id) = range.src
-                && let Mnemonic::Zext(inner) = host.instruction(id).mnemonic()
+                && let Mnemonic::Zext(inner) = host.insn_ref(id).mnemonic()
                 && value_size(host, inner.src) == range.size
             {
                 return Some(inner.src);
@@ -392,7 +392,7 @@ fn value_detail(host: HostRef, value: ValueId) -> String {
             )
         }
         ValueId::Instruction(id) => {
-            let insn = qcode::value::insn::InstructionRef::new(host, id);
+            let insn = host.insn_ref(id);
             let address = insn
                 .address()
                 .map(|addr| format!("{addr:#x}"))
@@ -418,7 +418,7 @@ fn fold_location(host: HostRef, location: Option<&InsnCtx>) -> String {
     let Some(ic) = location else {
         return "unknown instruction".to_string();
     };
-    let insn = qcode::value::insn::InstructionRef::new(host, ic.insn_id);
+    let insn = host.insn_ref(ic.insn_id);
     let address = insn
         .address()
         .map(|addr| format!("{addr:#x}"))

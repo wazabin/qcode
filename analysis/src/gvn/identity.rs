@@ -90,7 +90,7 @@ fn as_int_binop(host: HostRef, v: ValueId, want: IntBinop) -> Option<(ValueId, V
     let ValueId::Instruction(id) = v else {
         return None;
     };
-    match host.instruction(id).mnemonic() {
+    match host.insn_ref(id).mnemonic() {
         Mnemonic::Binop(Binary {
             lhs,
             rhs,
@@ -228,7 +228,7 @@ fn known_align(host: HostRef, v: ValueId, depth: u32) -> u32 {
         lhs,
         rhs,
         op: Binop::Int(op),
-    }) = host.instruction(id).mnemonic()
+    }) = host.insn_ref(id).mnemonic()
     else {
         return 0;
     };
@@ -428,7 +428,7 @@ fn as_zext(host: HostRef, v: ValueId) -> Option<(ValueId, usize)> {
     let ValueId::Instruction(id) = v else {
         return None;
     };
-    match host.instruction(id).mnemonic() {
+    match host.insn_ref(id).mnemonic() {
         Mnemonic::Zext(z) => Some((z.src, value_size(host, z.src))),
         _ => None,
     }
@@ -512,7 +512,7 @@ fn simplify_compare<'str, H: HostMut<'str>>(host: &mut H, ic: &InsnCtx, ed: &mut
                                     lhs: a,
                                     rhs: b,
                                     op: Binop::Int(inner),
-                                }) = host.read_host().instruction(id).mnemonic()
+                                }) = host.insn_ref(id).mnemonic()
                                 && let Some(flipped) = negated_compare(inner)
                             {
                                 let bool_ty = host.shared().types.get_or_make_bool();
