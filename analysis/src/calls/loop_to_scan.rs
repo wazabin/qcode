@@ -279,24 +279,22 @@ fn apply<'str>(mv: ContextView<'_, 'str>, body: &mut FunctionBody<'str>, m: &Sca
         }
     };
 
-    let mut host = body.host(mv);
-
     // Anchor every new instruction before the exit block's *first* instruction,
     // not just before the wide store: `array_promote` may have rewritten other
     // exit loads to `at(arr_exit, k)` earlier in the block, and those get
     // redirected to the folded array below — which must therefore dominate them.
-    let Some(anchor) = host.block_ref(m.exit).iter().next().map(|i| i.id) else {
+    let Some(anchor) = body.block_ref(mv, m.exit).iter().next().map(|i| i.id) else {
         return false;
     };
     // Pre-existing exit instructions whose `arr_exit` uses are redirected.
-    let preexisting: Vec<InstructionId> = host.block_ref(m.exit).iter().map(|i| i.id).collect();
+    let preexisting: Vec<InstructionId> = body.block_ref(mv, m.exit).iter().map(|i| i.id).collect();
 
     // Materialize the scan source. Data-input: the `l0[1..]` byte-slice from
     // element 1 (length `N-1`). Pure generation: `iota(N-1)` typed `[i64; N-1]`.
     let src = match src_kind {
         Src::Slice { l0_exit, esz } => {
-            let slice = host.push_mnemonic_with_type(
-                fid,
+            let slice = body.push_mnemonic_with_type(
+                mv,
                 Mnemonic::Range(qcode::value::insn::Range {
                     src: l0_exit,
                     start: esz,
@@ -304,20 +302,20 @@ fn apply<'str>(mv: ContextView<'_, 'str>, body: &mut FunctionBody<'str>, m: &Sca
                 }),
                 src_arr_ty,
             );
-            host.insert_insn_before(m.exit, anchor, slice);
+            body.insert_insn_before(mv, m.exit, anchor, slice);
             ValueId::Instruction(slice)
         }
         Src::Iota => {
-            let n1_const = host.shared().get_const(n1 as u64, 8).id();
-            let iota = host.push_mnemonic_with_type(
-                fid,
+            let n1_const = mv.shared_ctx().get_const(n1 as u64, 8).id();
+            let iota = body.push_mnemonic_with_type(
+                mv,
                 Mnemonic::Intrinsic(IntrinsicApp {
                     id: iota_id,
                     args: vec![n1_const],
                 }),
                 src_arr_ty,
             );
-            host.insert_insn_before(m.exit, anchor, iota);
+            body.insert_insn_before(mv, m.exit, anchor, iota);
             ValueId::Instruction(iota)
         }
     };
@@ -327,10 +325,10 @@ fn apply<'str>(mv: ContextView<'_, 'str>, body: &mut FunctionBody<'str>, m: &Sca
     // build the node with an explicit type: a sequence of the accumulator
     // (stored-value) type with the source's length/kind.
     let scan = {
-        let body_ret = host.read_host().type_of(m.stored_val);
-        let ty = crate::calls::outline::seq_result_type(host.read_host(), src, body_ret);
-        let id = host.push_mnemonic_with_type(
-            fid,
+        let body_ret = body.read_host(mv).type_of(m.stored_val);
+        let ty = crate::calls::outline::seq_result_type(body.read_host(mv), src, body_ret);
+        let id = body.push_mnemonic_with_type(
+            mv,
             Mnemonic::Scan(qcode::value::insn::Scan {
                 body: body_fn,
                 init: m.seed_val,
@@ -339,10 +337,11 @@ fn apply<'str>(mv: ContextView<'_, 'str>, body: &mut FunctionBody<'str>, m: &Sca
             }),
             ty,
         );
-        host.insert_insn_before(m.exit, anchor, id);
+        body.insert_insn_before(mv, m.exit, anchor, id);
         ValueId::Instruction(id)
     };
     let full = {
+        let mut host = body.host(mv);
         let mut b = Builder::from_block(BaseRef::new(host.reborrow_host(), m.exit));
         b.set_insert_point_before(anchor);
         let sing = b.push_intrinsic(singleton_id, vec![m.seed_val]).id();
@@ -353,9 +352,9 @@ fn apply<'str>(mv: ContextView<'_, 'str>, body: &mut FunctionBody<'str>, m: &Sca
     // `at(arr, k)` reads `array_promote` left for exit loads — to the folded
     // array, leaving the loop's own array dead for `dce`.
     for id in preexisting {
-        let mut mn = host.insn_ref(id).mnemonic().clone();
+        let mut mn = body.insn_ref(mv, id).mnemonic().clone();
         mn.replace_value(m.arr_exit, full);
-        host.replace_instruction_mnemonic(id, mn);
+        body.replace_instruction_mnemonic(mv, id, mn);
     }
 
     // Delete the residual loop when it is now wholly private (mirrors
@@ -370,7 +369,7 @@ fn apply<'str>(mv: ContextView<'_, 'str>, body: &mut FunctionBody<'str>, m: &Sca
     } else {
         vec![m.header, m.body]
     };
-    let private = is_loop_private(host.read_host(), &loop_blocks);
+    let private = is_loop_private(body.read_host(mv), &loop_blocks);
     let defined_in_loop = |host: HostRef, v: ValueId| match v {
         ValueId::BlockParam(_) => param_parent(host, v).is_some_and(|b| loop_blocks.contains(&b)),
         ValueId::Instruction(id) => host
@@ -383,14 +382,14 @@ fn apply<'str>(mv: ContextView<'_, 'str>, body: &mut FunctionBody<'str>, m: &Sca
     // coalesced) must be re-fed from a preheader-available value: its
     // header-edge incoming directly if loop-invariant, or — when it copies a
     // loop param — that param's own loop-invariant (preheader) incoming.
-    let exit_args: Option<Vec<ValueId>> = host
-        .block_ref(m.exit)
+    let exit_args: Option<Vec<ValueId>> = body
+        .block_ref(mv, m.exit)
         .params()
         .map(|p| p.id())
         .collect::<Vec<_>>()
         .into_iter()
         .map(|p| {
-            let rh = host.read_host();
+            let rh = body.read_host(mv);
             let k = param_pos(rh, m.exit, p)?;
             let [v] = incoming(rh, m.exit, k)[..] else {
                 return None;
@@ -413,13 +412,16 @@ fn apply<'str>(mv: ContextView<'_, 'str>, body: &mut FunctionBody<'str>, m: &Sca
         })
         .collect();
     if private && let Some(exit_args) = exit_args {
-        let preheaders: Vec<BlockId> = host
-            .block_ref(m.header)
+        let preheaders: Vec<BlockId> = body
+            .block_ref(mv, m.header)
             .predecessors()
             .map(|(_, p)| p)
             .filter(|p| !loop_blocks.contains(p))
             .collect();
         if let [preheader] = preheaders[..] {
+            // `delete_private_loop` is still host-generic (a cross-module helper,
+            // migrated in its own chunk), so drive it through a scoped host.
+            let mut host = body.host(mv);
             delete_private_loop(&mut host, fid, preheader, &loop_blocks, m.exit, exit_args);
         }
     }

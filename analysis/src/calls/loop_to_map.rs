@@ -252,16 +252,15 @@ fn apply<'str>(m: ContextView<'_, 'str>, body: &mut FunctionBody<'str>, mm: &Map
         }
     };
 
-    let mut host = body.host(m);
-
     // Build `map(body, enumerate(arr0))` (index-aware) or `map(body, arr0)`
     // (value-only) ahead of the consumer, then forward the exit view to it.
     let anchor = mm
         .store_id
-        .or_else(|| host.block_ref(mm.exit).iter().next().map(|i| i.id));
+        .or_else(|| body.block_ref(m, mm.exit).iter().next().map(|i| i.id));
     // The map source (`enumerate(arr0)` when index-aware, else `arr0`), built
-    // ahead of the consumer.
+    // ahead of the consumer through a scoped Builder over `body.host(m)`.
     let src = if uses_index {
+        let mut host = body.host(m);
         let mut b = Builder::from_block(BaseRef::new(host.reborrow_host(), mm.exit));
         if let Some(at) = anchor {
             b.set_insert_point_before(at);
@@ -274,10 +273,10 @@ fn apply<'str>(m: ContextView<'_, 'str>, body: &mut FunctionBody<'str>, mm: &Map
     // function, so `push_map`'s "read the body's return type" cannot see it — the
     // element type is the loop's stored value.
     let map_val = {
-        let body_ret = host.read_host().type_of(mm.ca.stored_val);
-        let ty = crate::calls::outline::seq_result_type(host.read_host(), src, body_ret);
-        let id = host.push_mnemonic_with_type(
-            fid,
+        let body_ret = body.read_host(m).type_of(mm.ca.stored_val);
+        let ty = crate::calls::outline::seq_result_type(body.read_host(m), src, body_ret);
+        let id = body.push_mnemonic_with_type(
+            m,
             Mnemonic::Map(qcode::value::insn::Map {
                 body: body_fn,
                 src,
@@ -287,8 +286,11 @@ fn apply<'str>(m: ContextView<'_, 'str>, body: &mut FunctionBody<'str>, mm: &Map
         );
         // Insert right where the source (or the anchor) sits, before the consumer.
         match anchor {
-            Some(at) => host.insert_insn_before(mm.exit, at, id),
-            None => BaseRef::new(host.reborrow_host(), mm.exit).push_insn(id),
+            Some(at) => body.insert_insn_before(m, mm.exit, at, id),
+            None => {
+                let mut host = body.host(m);
+                BaseRef::new(host.reborrow_host(), mm.exit).push_insn(id);
+            }
         }
         ValueId::Instruction(id)
     };
@@ -300,18 +302,18 @@ fn apply<'str>(m: ContextView<'_, 'str>, body: &mut FunctionBody<'str>, mm: &Map
     // is a distinct exit param (the uncollapsed case) it has no in-loop uses and
     // this is exactly `replace_all_uses_with`.
     let loop_blocks = [mm.ca.header, mm.ca.body];
-    let exit_users: Vec<InstructionId> = users_of(host.read_host(), mm.arr_exit).to_vec();
+    let exit_users: Vec<InstructionId> = users_of(body.read_host(m), mm.arr_exit).to_vec();
     for id in exit_users {
-        if host
-            .insn_ref(id)
+        if body
+            .insn_ref(m, id)
             .parent()
             .is_some_and(|b| loop_blocks.contains(&b.id))
         {
             continue;
         }
-        let mut mn = host.insn_ref(id).mnemonic().clone();
+        let mut mn = body.insn_ref(m, id).mnemonic().clone();
         mn.replace_value(mm.arr_exit, map_val);
-        host.replace_instruction_mnemonic(id, mn);
+        body.replace_instruction_mnemonic(m, id, mn);
     }
 
     // Deletability must reflect the *post-redirect* state. The redirect above moved
@@ -321,7 +323,7 @@ fn apply<'str>(m: ContextView<'_, 'str>, body: &mut FunctionBody<'str>, mm: &Map
     // rewrite would wrongly see that escaping use and keep the loop — and nothing
     // later deletes it: a self-carried loop's own guard and back-edge keep the index
     // and array live through the CFG, so no ordinary dce can collect the cycle.
-    let deletable = is_loop_private(host.read_host(), &loop_blocks);
+    let deletable = is_loop_private(body.read_host(m), &loop_blocks);
 
     // Delete the residual loop when wholly private (mirrors `loop_to_scan::apply`):
     // reroute the single preheader straight to the exit, re-feeding each exit param
@@ -334,14 +336,14 @@ fn apply<'str>(m: ContextView<'_, 'str>, body: &mut FunctionBody<'str>, mm: &Map
             .is_some_and(|b| loop_blocks.contains(&b.id)),
         _ => false,
     };
-    let exit_args: Option<Vec<ValueId>> = host
-        .block_ref(mm.exit)
+    let exit_args: Option<Vec<ValueId>> = body
+        .block_ref(m, mm.exit)
         .params()
         .map(|p| p.id())
         .collect::<Vec<_>>()
         .into_iter()
         .map(|p| {
-            let rh = host.read_host();
+            let rh = body.read_host(m);
             let k = param_pos(rh, mm.exit, p)?;
             let [v] = incoming(rh, mm.exit, k)[..] else {
                 return None;
@@ -364,13 +366,16 @@ fn apply<'str>(m: ContextView<'_, 'str>, body: &mut FunctionBody<'str>, mm: &Map
         })
         .collect();
     if deletable && let Some(exit_args) = exit_args {
-        let preheaders: Vec<BlockId> = host
-            .block_ref(mm.ca.header)
+        let preheaders: Vec<BlockId> = body
+            .block_ref(m, mm.ca.header)
             .predecessors()
             .map(|(_, p)| p)
             .filter(|p| !loop_blocks.contains(p))
             .collect();
         if let [preheader] = preheaders[..] {
+            // `delete_private_loop` is still host-generic (a cross-module helper,
+            // migrated in its own chunk), so drive it through a scoped host.
+            let mut host = body.host(m);
             delete_private_loop(&mut host, fid, preheader, &loop_blocks, mm.exit, exit_args);
         }
     }
