@@ -56,10 +56,13 @@ pub fn split_overlapping_functions(ctx: &mut Context) -> bool {
     }
     // Ownership has settled. A `jmp`/`jcc` into another function's entry (a tail
     // call, or the thunk `jmp realfunc` that seeded a boundary above) left an
-    // inter-procedural CFG edge behind. Strip those so every function's
-    // successor/predecessor graph is closed over its own blocks — see
-    // [`remove_cross_function_edges`].
-    if remove_cross_function_edges(ctx) {
+    // inter-procedural CFG edge behind, and its terminator still carries a foreign
+    // `BlockId`. Rewrite an unconditional `jmp` into another function's *entry* to
+    // a function-level [`TailCall`] terminator (strict IR locality — no foreign
+    // block reference), and strip every remaining cross-function CFG edge so each
+    // function's successor/predecessor graph is closed over its own blocks — see
+    // [`convert_cross_function_tail_calls`].
+    if convert_cross_function_tail_calls(ctx) {
         changed_any = true;
     }
     // Ownership and the CFG are now settled and each function's graph is closed
@@ -72,43 +75,80 @@ pub fn split_overlapping_functions(ctx: &mut Context) -> bool {
     changed_any
 }
 
-/// Remove every CFG edge whose endpoints belong to different functions.
+/// Rewrite cross-function tail jumps to [`TailCall`] terminators and remove every
+/// CFG edge whose endpoints belong to different functions.
 ///
 /// After [`reattribute_blocks`] settles ownership, a terminator that jumps to
 /// another function's entry — a tail call, or a thunk's `jmp realfunc` — is an
-/// *inter*-procedural control transfer. The terminator still records the target
-/// (so thunk naming still sees it; the call graph is built from `Call`
-/// instructions, not CFG edges, so it is unaffected either way), but the CFG
-/// *edge* has no intra-procedural meaning: leaving it in makes every per-function
-/// analysis that walks `successors`/`predecessors` (dominators, liveness, GVN,
-/// mem2reg's rename walk) silently traverse into a foreign function's blocks.
-/// The splitter's own reach
-/// walk ([`claimed_from`]) already stops at these boundaries, so removing the
-/// edges cannot change ownership — it only closes each function's CFG over its
-/// own blocks. Returns `true` if any edge was removed.
-fn remove_cross_function_edges(ctx: &mut Context) -> bool {
-    let stale: Vec<EdgeId> = ctx
-        .blocks()
-        .filter_map(|block| {
-            let owner = block.parent()?.id;
-            let doomed: Vec<EdgeId> = block
-                .successors()
-                .filter(|&(_, succ)| {
-                    // Keep an edge only when the successor is owned by the same
-                    // function. A successor with no owner (an orphan) is left
-                    // alone — orphans are handled by `reattribute_blocks`.
-                    BasicBlock::from_id(ctx, succ)
-                        .parent()
-                        .is_some_and(|f| f.id != owner)
-                })
-                .map(|(edge, _)| edge)
-                .collect();
-            (!doomed.is_empty()).then_some(doomed)
-        })
-        .flatten()
-        .collect();
+/// *inter*-procedural control transfer. Two things must be repaired:
+///
+/// 1. **The terminator.** An unconditional `Branch` into another function's
+///    *entry* is the thunk / tail-call shape. Its target is a foreign `BlockId` —
+///    exactly the cross-function reference the context-split design (ruling 2)
+///    forbids. Rewrite it to a function-level [`TailCall`] carrying the callee's
+///    `FunctionId`; the IR then holds no foreign block reference and the reverse
+///    call graph picks the edge up through `call_target`/`call_sites`. (A
+///    *conditional* cross-function arm, or a jump into the *middle* of another
+///    function, is left as a foreign `Branch`/`CBranch` for now — those functions
+///    stay on the sequential lane; see `entangled_functions`.)
+/// 2. **The CFG edge.** Whether or not the terminator was rewritten, the
+///    inter-procedural *edge* has no intra-procedural meaning: leaving it in makes
+///    every per-function analysis that walks `successors`/`predecessors`
+///    (dominators, liveness, GVN, mem2reg's rename walk) silently traverse into a
+///    foreign function's blocks. The splitter's own reach walk ([`claimed_from`])
+///    already stops at these boundaries, so removing the edges cannot change
+///    ownership — it only closes each function's CFG over its own blocks.
+///
+/// Returns `true` if any terminator was rewritten or any edge removed.
+fn convert_cross_function_tail_calls(ctx: &mut Context) -> bool {
+    use qcode::value::insn::{Branch, Mnemonic, TailCall};
 
-    let changed = !stale.is_empty();
+    // An unconditional `Branch` into a foreign function's *entry*: the terminator
+    // instruction and the callee it tail-jumps to.
+    let mut tail_calls: Vec<(qcode::value::insn::InstructionId, FunctionId)> = Vec::new();
+    // Every cross-function CFG edge, converted or residual, is stripped.
+    let mut stale: Vec<EdgeId> = Vec::new();
+
+    for block in ctx.blocks() {
+        let Some(owner) = block.parent().map(|f| f.id) else {
+            continue;
+        };
+        for (edge, succ) in block.successors() {
+            // Keep an edge only when the successor is owned by the same function.
+            // A successor with no owner (an orphan) is left alone.
+            let Some(succ_owner) = BasicBlock::from_id(ctx, succ).parent().map(|f| f.id) else {
+                continue;
+            };
+            if succ_owner != owner {
+                stale.push(edge);
+            }
+        }
+
+        // Recognize the unconditional tail jump into another function's entry.
+        if let Some(term) = block.instructions().last()
+            && let Mnemonic::Branch(Branch { target, .. }) = term.mnemonic()
+        {
+            let callee = BasicBlock::from_id(ctx, *target).parent().map(|f| f.id);
+            if let Some(callee) = callee
+                && callee != owner
+                && Function::from_id(ctx, callee).root().map(|r| r.id) == Some(*target)
+            {
+                tail_calls.push((term.id, callee));
+            }
+        }
+    }
+
+    let changed = !tail_calls.is_empty() || !stale.is_empty();
+
+    for (insn, callee) in tail_calls {
+        ctx.replace_instruction_mnemonic(
+            insn,
+            Mnemonic::TailCall(TailCall {
+                target: callee,
+                args: vec![],
+            }),
+        );
+    }
     for edge in stale {
         ctx.remove_cfg_edge(edge);
     }
@@ -425,14 +465,15 @@ mod tests {
         );
     }
 
-    /// A `jmp` from one function into another's entry (a tail call) leaves an
-    /// inter-procedural CFG edge that must be stripped once ownership settles:
-    /// the edge has no intra-procedural meaning and would make every per-function
-    /// analysis wander into foreign blocks. The terminator's target is preserved,
-    /// and intra-function edges are untouched.
+    /// A `jmp` from one function into another's entry (a tail call) is rewritten
+    /// to a function-level [`TailCall`] terminator carrying the callee's id, and
+    /// its inter-procedural CFG edge is stripped: the edge has no intra-procedural
+    /// meaning and would make every per-function analysis wander into foreign
+    /// blocks. The IR then holds no cross-function block reference. Intra-function
+    /// edges are untouched.
     #[test]
     fn strips_tail_call_edge_into_another_function() {
-        use qcode::value::insn::{Branch, Mnemonic};
+        use qcode::value::insn::{Mnemonic, TailCall};
 
         let mut ctx = Context::new();
 
@@ -478,15 +519,17 @@ mod tests {
             "the intra-function edge must be preserved",
         );
 
-        // The terminator still records the jump target — only the CFG edge went.
+        // The terminator is now a function-level `TailCall` carrying the callee's
+        // id — no foreign block reference survives in the IR.
         let term = BasicBlock::from_id(&ctx, tail)
             .instructions()
             .last()
             .map(|i| i.mnemonic().clone());
         assert!(
-            matches!(term, Some(Mnemonic::Branch(Branch { target, .. })) if target == g_entry),
-            "the tail-call terminator target must be preserved, got {term:?}",
+            matches!(term, Some(Mnemonic::TailCall(TailCall { target, .. })) if target == g),
+            "the tail jump must become a TailCall to G, got {term:?}",
         );
+        let _ = g_entry;
 
         // Idempotent: nothing left to strip.
         assert!(!split_overlapping_functions(&mut ctx));

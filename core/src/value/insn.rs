@@ -51,7 +51,9 @@ pub use memory::{Load, Store};
 pub use mnemonic::Mnemonic;
 pub use pcode_op::{PCodeOp, PCodeOpId};
 pub use scan::Scan;
-pub use terminator::{Apply, Branch, BranchInd, CBranch, Call, CallInd, Return, ReturnValue, TailCall};
+pub use terminator::{
+    Apply, Branch, BranchInd, CBranch, Call, CallInd, Return, ReturnValue, TailCall,
+};
 pub use unop::{Unary, Unop};
 
 /// Function-local instruction index. Storage detail: indexes the owning

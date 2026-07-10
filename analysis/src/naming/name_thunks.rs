@@ -84,12 +84,15 @@ fn thunk_target(host: HostRef, fun_id: FunctionId) -> Option<FunctionId> {
         return None;
     }
 
-    let Mnemonic::Branch(Branch { target, .. }) = block.instructions().last()?.mnemonic() else {
-        return None;
+    let callee = match block.instructions().last()?.mnemonic() {
+        // Post-split, a tail jump into another function's entry is a function-level
+        // `TailCall` carrying the callee's id directly.
+        Mnemonic::TailCall(tc) => tc.target,
+        // A raw `jmp realfunc` not yet rewritten by `split_overlapping_functions`.
+        Mnemonic::Branch(Branch { target, .. }) => BlockRef::new(host, *target).function()?.id,
+        _ => return None,
     };
-
-    let callee = BlockRef::new(host, *target).function()?;
-    (callee.id != fun_id).then_some(callee.id)
+    (callee != fun_id).then_some(callee)
 }
 
 crate::register_function_pass!(NameThunks);
