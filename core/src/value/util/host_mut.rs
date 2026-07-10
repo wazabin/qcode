@@ -119,6 +119,44 @@ pub trait HostMut<'str> {
     /// Drop `site` from `target`'s call-site list. No-op for a checked-out host.
     fn forget_call_site(&mut self, target: FunctionId, site: InstructionId);
 
+    // ---- function-scoped read wrappers (context-split stage 5a) -------------
+    //
+    // Sugar over `self.read_host().block_ref(id)` etc., so a host-generic pass
+    // reads its own function's IR through one body-routed accessor —
+    // `host.block_ref(id)` — instead of the globally routed
+    // `BasicBlock::from_id(ctx, id)` / `BlockRef::new(host.read_host(), id)`
+    // spellings. Same names, same wrappers as the [`HostRef`] constructors. The
+    // call form is stable across stage 5b (only the receiver's origin changes).
+    // Writes still go through the verbs below (`block_mut`, `remove_instruction`,
+    // …); a checked-out host has no `&mut Context` to hand a mutable wrapper ref.
+
+    /// A read [`BlockRef`](crate::value::BlockRef) over `id`, body-routed through
+    /// this host. Replaces `BasicBlock::from_id(ctx, id)` in a host-generic pass.
+    fn block_ref(&self, id: BlockId) -> super::base_ref::BaseRef<HostRef<'_, 'str>, BlockId> {
+        self.read_host().block_ref(id)
+    }
+    /// A read [`InstructionRef`](crate::value::InstructionRef) over `id`,
+    /// body-routed. Replaces `Instruction::from_id(ctx, id)`.
+    fn insn_ref(
+        &self,
+        id: InstructionId,
+    ) -> super::base_ref::BaseRef<HostRef<'_, 'str>, InstructionId> {
+        self.read_host().insn_ref(id)
+    }
+    /// A read [`BlockParamRef`](crate::value::BlockParamRef) over `id`,
+    /// body-routed. Replaces `BlockParam::from_id(ctx, id)`.
+    fn param_ref(
+        &self,
+        id: BlockParamId,
+    ) -> super::base_ref::BaseRef<HostRef<'_, 'str>, BlockParamId> {
+        self.read_host().param_ref(id)
+    }
+    /// A read [`FunctionRef`](crate::value::FunctionRef) over `id`, body-routed.
+    /// Replaces `Function::from_id(ctx, id)`.
+    fn function_ref(&self, id: FunctionId) -> super::base_ref::BaseRef<HostRef<'_, 'str>, FunctionId> {
+        self.read_host().function_ref(id)
+    }
+
     // ---- derived arena accessors -------------------------------------------
 
     fn instruction_mut(&mut self, id: InstructionId) -> &mut Instruction<'str> {

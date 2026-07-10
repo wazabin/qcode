@@ -18,8 +18,8 @@ use crate::{
         BasicBlock, BlockId, BlockRef, Instruction, InstructionId, Value, ValueId, Varnode,
         VarnodeId,
         block::EdgeData,
-        block::cfg::{LocalBlockId, LocalEdgeId},
-        block_param::{BlockParam, LocalParamId},
+        block::cfg::{EdgeId, LocalBlockId, LocalEdgeId},
+        block_param::{BlockParam, BlockParamId, LocalParamId},
         insn::{Branch, LocalInsnId, Mnemonic},
         util::{
             base_ref::{BaseRef, HostRef, WithCtx, WithCtxMut, WithHost},
@@ -205,6 +205,47 @@ impl<'str> Function<'str> {
     /// Read-only; used by the users-map consistency verifier.
     pub fn user_map_entries(&self) -> impl Iterator<Item = (ValueId, &[InstructionId])> {
         self.users.iter().map(|(v, u)| (*v, u.as_slice()))
+    }
+
+    // ---- function-local raw arena accessors (context-split stage 5a) --------
+    //
+    // Resolve a composite id against *this* body by its `local` half alone,
+    // ignoring `id.func`. Under strict IR locality a body only ever stores its
+    // own values, so `id.func` is always this function's id; naming the body
+    // explicitly (`ctx.body(fid).block(id)`) instead of routing through
+    // `id.func` (`BasicBlock::from_id(ctx, id)`) is what makes the stage-4
+    // `func`-strip mechanical — after it, `id` *is* the local index and these
+    // bodies are unchanged. These return raw `&`/`&mut` arena values; for the
+    // wrapper-ref surface (`successors()`, `name()`, …) use the `*_ref`
+    // constructors on [`HostRef`]/[`HostMut`] or a [`FunctionRef`].
+
+    /// The block `id`, by its function-local index (see the note above).
+    pub fn block(&self, id: BlockId) -> &BasicBlock<'str> {
+        &self.blocks[id.local]
+    }
+    /// The block `id`, mutably.
+    pub fn block_mut(&mut self, id: BlockId) -> &mut BasicBlock<'str> {
+        &mut self.blocks[id.local]
+    }
+    /// The instruction `id`, by its function-local index.
+    pub fn insn(&self, id: InstructionId) -> &Instruction<'str> {
+        &self.insns[id.local]
+    }
+    /// The instruction `id`, mutably.
+    pub fn insn_mut(&mut self, id: InstructionId) -> &mut Instruction<'str> {
+        &mut self.insns[id.local]
+    }
+    /// The block parameter `id`, by its function-local index.
+    pub fn block_param(&self, id: BlockParamId) -> &BlockParam<'str> {
+        &self.params[id.local]
+    }
+    /// The block parameter `id`, mutably.
+    pub fn block_param_mut(&mut self, id: BlockParamId) -> &mut BlockParam<'str> {
+        &mut self.params[id.local]
+    }
+    /// The CFG edge `id`, by its function-local index.
+    pub fn edge(&self, id: EdgeId) -> &EdgeData {
+        &self.edges[id.local]
     }
 
     /// Gets a reference to a function from its ID

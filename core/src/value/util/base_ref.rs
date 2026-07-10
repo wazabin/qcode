@@ -135,6 +135,47 @@ impl<'a, 'str> HostRef<'a, 'str> {
     }
 }
 
+/// Function-scoped wrapper-ref constructors (context-split stage 5a).
+///
+/// These are the single convention for reading IR under the context-split
+/// migration: at a call site they replace the *globally routed*
+/// `BasicBlock::from_id(ctx, id)` / `BlockRef::new(host, id)` spellings with one
+/// body-routed accessor, `view.block(id)` (and siblings), that returns the same
+/// wrapper ref the rest of the code already speaks. The wrapper is unchanged —
+/// only the routing behind it (module registry vs. checked-out body) is now
+/// explicit in *where the `HostRef` came from*.
+///
+/// The call form is deliberately stable across the stage-5b split: after bodies
+/// are held directly, the identical `.block(id)` / `.insn(id)` methods move onto
+/// the body-view type, and only *how the receiver is obtained* changes
+/// (`host.read_host()` → `&FunctionBody` + `ContextView`). Converted sites do not
+/// otherwise move.
+impl<'a, 'str> HostRef<'a, 'str> {
+    /// A [`BlockRef`](crate::value::BlockRef) over `id`, routed to its owning
+    /// function's arena through this view. Replaces `BasicBlock::from_id(ctx, id)`.
+    pub fn block_ref(self, id: BlockId) -> BaseRef<HostRef<'a, 'str>, BlockId> {
+        BaseRef::new(self, id)
+    }
+
+    /// An [`InstructionRef`](crate::value::InstructionRef) over `id`, body-routed.
+    /// Replaces `Instruction::from_id(ctx, id)`.
+    pub fn insn_ref(self, id: InstructionId) -> BaseRef<HostRef<'a, 'str>, InstructionId> {
+        BaseRef::new(self, id)
+    }
+
+    /// A [`BlockParamRef`](crate::value::BlockParamRef) over `id`, body-routed.
+    /// Replaces `BlockParam::from_id(ctx, id)`.
+    pub fn param_ref(self, id: BlockParamId) -> BaseRef<HostRef<'a, 'str>, BlockParamId> {
+        BaseRef::new(self, id)
+    }
+
+    /// A [`FunctionRef`](crate::value::FunctionRef) over `id`, body-routed.
+    /// Replaces `Function::from_id(ctx, id)`.
+    pub fn function_ref(self, id: FunctionId) -> BaseRef<HostRef<'a, 'str>, FunctionId> {
+        BaseRef::new(self, id)
+    }
+}
+
 impl<'a, 'str> From<&'a Context<'str>> for HostRef<'a, 'str> {
     fn from(ctx: &'a Context<'str>) -> Self {
         HostRef::Module(ctx)

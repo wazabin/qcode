@@ -942,6 +942,24 @@ impl<'str> Context<'str> {
         InstructionRef::from_id(self, id)
     }
 
+    /// The function *body* `fid` (context-split stage 5a bridging accessor).
+    ///
+    /// Names the owning function explicitly so IR reads route through the body's
+    /// function-local raw accessors — `ctx.body(fid).block(id)` in place of the
+    /// globally routed `BasicBlock::from_id(ctx, id)`. This is the module-scope
+    /// (`&Context`) obtain-form; a function pass reaches the same body accessors
+    /// through its checked-out host. After the stage-4 `func`-strip only this
+    /// obtain step changes (the caller already holds `&FunctionBody`); the
+    /// `.block(id)` call on the result is unchanged.
+    pub fn body(&self, fid: FunctionId) -> &crate::value::Function<'str> {
+        &self.values.functions[fid]
+    }
+
+    /// The function *body* `fid`, mutably (see [`Context::body`]).
+    pub fn body_mut(&mut self, fid: FunctionId) -> &mut crate::value::Function<'str> {
+        &mut self.values.functions[fid]
+    }
+
     /// Returns an immutable reference to the varnode mapped to the named
     /// register `id`.
     pub fn get_register(&self, id: RegisterId) -> VarnodeRef<'str, '_> {
