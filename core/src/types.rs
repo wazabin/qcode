@@ -462,6 +462,17 @@ impl Type for ListType {
 // TypeManager
 // ---------------------------------------------------------------------------
 
+/// The default `field1`, `field2`, ... naming applied when an aggregate is
+/// built from bare types. Shared by the interner's hit-path probe and the
+/// mint path so both key the cache identically.
+fn default_named_fields(fields: Vec<TypeId>) -> Vec<AggregateField> {
+    fields
+        .into_iter()
+        .enumerate()
+        .map(|(i, type_id)| AggregateField::new(format!("field{}", i + 1), type_id))
+        .collect()
+}
+
 /// Registry that owns all [`Type`] objects and hands out interned [`TypeId`]s.
 ///
 /// Types are created once (at context construction or when the architecture is
@@ -556,17 +567,6 @@ impl TypeManagerInner {
         let id = self.register(Box::new(SpaceAddress { size, space }));
         self.space_address.insert((size, space), id);
         id
-    }
-
-    /// Returns the [`TypeId`] for an [`AggregateType`] with default field names
-    /// (`field1`, `field2`, ...), creating it if it does not yet exist.
-    pub fn get_or_make_aggregate(&mut self, fields: Vec<TypeId>) -> TypeId {
-        let fields = fields
-            .into_iter()
-            .enumerate()
-            .map(|(i, type_id)| AggregateField::new(format!("field{}", i + 1), type_id))
-            .collect();
-        self.get_or_make_named_aggregate(fields)
     }
 
     /// Returns the [`TypeId`] for an [`AggregateType`] with the given ordered,
@@ -721,17 +721,6 @@ impl TypeManagerInner {
         None
     }
 
-    /// Build the sequence type of the given kind: a [`List`](Self::get_or_make_list)
-    /// when `is_list`, else a fixed [`Array`](Self::get_or_make_array). The inverse
-    /// of [`seq_of`](Self::seq_of).
-    pub fn get_or_make_seq(&mut self, elem: TypeId, len: usize, is_list: bool) -> TypeId {
-        if is_list {
-            self.get_or_make_list(elem, len)
-        } else {
-            self.get_or_make_array(elem, len)
-        }
-    }
-
     /// A short display name for `id`, used by the IR formatters in place of the
     /// raw `i<bits>` width. Nominal structs print their name and struct pointers
     /// print `Pointee*`; everything else (integers, stack/space addresses, and
@@ -796,7 +785,19 @@ impl TypeManagerInner {
     /// (this *is* logical and/or/xor); every other integer/float op preserves the
     /// left operand's type (so a pointer-typed operand keeps its space provenance
     /// through `ptr + offset`).
-    pub fn binop_result(&mut self, lhs: TypeId, op: Binop, _rhs: TypeId) -> TypeId {
+    pub fn binop_result(&mut self, lhs: TypeId, op: Binop, rhs: TypeId) -> TypeId {
+        // `None` only when the result is `bool` and `bool` isn't interned yet.
+        if let Some(id) = self.binop_result_probe(lhs, op, rhs) {
+            id
+        } else {
+            self.get_or_make_bool()
+        }
+    }
+
+    /// The read-only arm of [`binop_result`](Self::binop_result): resolves the
+    /// result type without minting, returning `None` exactly when the result is
+    /// `bool` and `bool` has not been interned yet (the caller then mints it).
+    fn binop_result_probe(&self, lhs: TypeId, op: Binop, _rhs: TypeId) -> Option<TypeId> {
         match op {
             Binop::Int(int_op) => match int_op {
                 IntBinop::Equal
@@ -804,17 +805,17 @@ impl TypeManagerInner {
                 | IntBinop::Less
                 | IntBinop::LessEqual
                 | IntBinop::SLess
-                | IntBinop::SLessEqual => self.get_or_make_bool(),
+                | IntBinop::SLessEqual => self.bool_id,
                 // Bitwise and/or/xor over bool operands is logical and/or/xor and
                 // preserves the bool type; over ints it preserves the int type.
-                IntBinop::And | IntBinop::Or | IntBinop::Xor if self.is_bool(lhs) => lhs,
-                _ => lhs,
+                IntBinop::And | IntBinop::Or | IntBinop::Xor if self.is_bool(lhs) => Some(lhs),
+                _ => Some(lhs),
             },
             Binop::Float(float_op) => {
                 if float_op.is_comparison() {
-                    self.get_or_make_bool()
+                    self.bool_id
                 } else {
-                    lhs
+                    Some(lhs)
                 }
             }
         }
@@ -824,7 +825,8 @@ impl TypeManagerInner {
 /// The type interner: a global, append-only table of interned [`Type`]s behind a
 /// [`RwLock`] so that types can be minted through a shared `&` reference (a
 /// prerequisite for running function passes in parallel against a shared
-/// `ModuleView`). Reads take a read lock; the rare mint path takes a write lock.
+/// `ModuleView`). Reads — including the `get_or_make_*` hit path — take a read
+/// lock; only a cache miss takes the write lock (and re-checks under it).
 /// Interned [`TypeId`]s are globally stable and never remapped.
 pub struct TypeManager {
     inner: RwLock<TypeManagerInner>,
@@ -859,21 +861,40 @@ impl TypeManager {
         self.inner.write().expect("type manager RwLock poisoned")
     }
 
-    // --- mint path (write lock) ------------------------------------------
+    // --- mint path (double-checked: read-lock hit, write-lock miss) -------
+    //
+    // Types are minted rarely and reused constantly, so each `get_or_make_*`
+    // probes its cache under the read lock first and only takes the write lock
+    // on a miss. The inner method re-checks its cache under the write lock, so
+    // two racing minters agree on one id.
 
     pub fn get_or_make_int(&self, size: usize) -> TypeId {
+        if let Some(&id) = self.read().int_by_size.get(&size) {
+            return id;
+        }
         self.write().get_or_make_int(size)
     }
     pub fn get_or_make_bool(&self) -> TypeId {
+        if let Some(id) = self.read().bool_id {
+            return id;
+        }
         self.write().get_or_make_bool()
     }
     pub fn get_or_make_space_address(&self, size: usize, space: SpaceId) -> TypeId {
+        if let Some(&id) = self.read().space_address.get(&(size, space)) {
+            return id;
+        }
         self.write().get_or_make_space_address(size, space)
     }
+    /// Returns the [`TypeId`] for an [`AggregateType`] with default field names
+    /// (`field1`, `field2`, ...), creating it if it does not yet exist.
     pub fn get_or_make_aggregate(&self, fields: Vec<TypeId>) -> TypeId {
-        self.write().get_or_make_aggregate(fields)
+        self.get_or_make_named_aggregate(default_named_fields(fields))
     }
     pub fn get_or_make_named_aggregate(&self, fields: Vec<AggregateField>) -> TypeId {
+        if let Some(&id) = self.read().aggregate_by_fields.get(&fields) {
+            return id;
+        }
         self.write().get_or_make_named_aggregate(fields)
     }
     pub fn get_or_make_struct(
@@ -882,24 +903,50 @@ impl TypeManager {
         size: usize,
         fields: Vec<AggregateField>,
     ) -> TypeId {
+        let name = name.into();
+        if let Some(&id) = self.read().struct_by_name.get(&name) {
+            return id;
+        }
         self.write().get_or_make_struct(name, size, fields)
     }
     pub fn get_or_make_struct_pointer(&self, size: usize, pointee: TypeId) -> TypeId {
+        if let Some(&id) = self.read().struct_pointer.get(&(size, pointee)) {
+            return id;
+        }
         self.write().get_or_make_struct_pointer(size, pointee)
     }
     pub fn get_or_make_array(&self, elem: TypeId, count: usize) -> TypeId {
+        if let Some(&id) = self.read().array_by_elem_count.get(&(elem, count)) {
+            return id;
+        }
         self.write().get_or_make_array(elem, count)
     }
     pub fn get_or_make_list(&self, elem: TypeId, bound: usize) -> TypeId {
+        if let Some(&id) = self.read().list_by_elem_bound.get(&(elem, Some(bound))) {
+            return id;
+        }
         self.write().get_or_make_list(elem, bound)
     }
     pub fn get_or_make_unbounded_list(&self, elem: TypeId) -> TypeId {
+        if let Some(&id) = self.read().list_by_elem_bound.get(&(elem, None)) {
+            return id;
+        }
         self.write().get_or_make_unbounded_list(elem)
     }
+    /// Build the sequence type of the given kind: a [`List`](Self::get_or_make_list)
+    /// when `is_list`, else a fixed [`Array`](Self::get_or_make_array). The inverse
+    /// of [`seq_of`](Self::seq_of).
     pub fn get_or_make_seq(&self, elem: TypeId, len: usize, is_list: bool) -> TypeId {
-        self.write().get_or_make_seq(elem, len, is_list)
+        if is_list {
+            self.get_or_make_list(elem, len)
+        } else {
+            self.get_or_make_array(elem, len)
+        }
     }
     pub fn binop_result(&self, lhs: TypeId, op: Binop, rhs: TypeId) -> TypeId {
+        if let Some(id) = self.read().binop_result_probe(lhs, op, rhs) {
+            return id;
+        }
         self.write().binop_result(lhs, op, rhs)
     }
 
