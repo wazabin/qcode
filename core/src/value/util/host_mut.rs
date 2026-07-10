@@ -153,7 +153,10 @@ pub trait HostMut<'str> {
     }
     /// A read [`FunctionRef`](crate::value::FunctionRef) over `id`, body-routed.
     /// Replaces `Function::from_id(ctx, id)`.
-    fn function_ref(&self, id: FunctionId) -> super::base_ref::BaseRef<HostRef<'_, 'str>, FunctionId> {
+    fn function_ref(
+        &self,
+        id: FunctionId,
+    ) -> super::base_ref::BaseRef<HostRef<'_, 'str>, FunctionId> {
         self.read_host().function_ref(id)
     }
 
