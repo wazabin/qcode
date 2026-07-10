@@ -97,12 +97,16 @@ pub fn split_overlapping_functions(ctx: &mut Context) -> bool {
         changed_any = true;
     }
     // Ownership and the CFG are now settled and each function's graph is closed
-    // over its own blocks. `reattribute_blocks` moved *ownership* (a block's
-    // `parent`/roster) without moving *storage* (`id.func`), so a function can own
-    // a block that lives in another function's arena. Callers that then check a
-    // function out for a function pass must first re-home those blocks so storage
-    // matches ownership — see [`Context::normalize_block_storage`], invoked at the
-    // pipeline's discovery-round boundary and after the initial recursive lift.
+    // over its own blocks, but `reattribute_blocks` moved *ownership* (a block's
+    // `parent`/roster) without moving *storage* (`id.func`): a function can still
+    // own a block that lives in another function's arena. Discharge that here so
+    // split always hands back strictly local IR — every block self-stored, the
+    // invariant `CheckedOut::new` asserts at every checkout. A pure storage move
+    // (the IR is semantically identical), and a cheap no-op scan once storage
+    // already matches ownership (the steady state after the first round).
+    if ctx.normalize_block_storage() {
+        changed_any = true;
+    }
     changed_any
 }
 
@@ -530,14 +534,21 @@ mod tests {
 
         assert!(split_overlapping_functions(&mut ctx));
 
-        assert_block_set(&ctx, f, &[b0]);
-        assert_block_set(&ctx, g, &[b1, b2]);
-        assert_eq!(ctx.values.block(b1).parent, Some(g));
-        assert_eq!(ctx.values.block(b2).parent, Some(g));
-        assert_eq!(ctx.values.functions[g].root, Some(b1));
+        // Split settled ownership and then re-homed the absorbed blocks into G's
+        // arena, so identify them by address (their pre-split ids are tombstoned).
+        assert_block_addrs(&ctx, f, &[0x1000]);
+        assert_block_addrs(&ctx, g, &[0x2000, 0x2005]);
+        let g_entry = block_at_addr(&ctx, g, 0x2000);
+        assert_eq!(ctx.values.block(g_entry).parent, Some(g));
+        assert_eq!(
+            ctx.values.block(block_at_addr(&ctx, g, 0x2005)).parent,
+            Some(g)
+        );
+        assert_eq!(ctx.values.functions[g].root, Some(g_entry));
 
         assert_eq!(addrs(&ctx, f), vec![0x1000]);
         assert_eq!(addrs(&ctx, g), vec![0x2000, 0x2005]);
+        let _ = (b0, b1, b2);
 
         // Idempotent: nothing left to split.
         assert!(!split_overlapping_functions(&mut ctx));
@@ -591,13 +602,15 @@ mod tests {
 
         assert!(split_overlapping_functions(&mut ctx));
 
-        assert_block_set(&ctx, f, &[b0]);
-        assert_block_set(&ctx, g, &[b1, b2]);
+        // Blocks are re-homed into G by split's tail; identify them by address.
+        assert_block_addrs(&ctx, f, &[0x1000]);
+        assert_block_addrs(&ctx, g, &[0x2000, 0x2005]);
         assert_eq!(
-            ctx.values.block(b2).parent,
+            ctx.values.block(block_at_addr(&ctx, g, 0x2005)).parent,
             Some(g),
             "the post-call block must be claimed via the materialized fall-through edge",
         );
+        let _ = (b0, b1, b2);
     }
 
     /// A `jmp` from one function into another's entry (a tail call) is rewritten
@@ -635,9 +648,12 @@ mod tests {
 
         assert!(split_overlapping_functions(&mut ctx));
 
-        // Ownership is already correct; the only change is the stripped edge.
-        assert_block_set(&ctx, f, &[entry, tail]);
-        assert_block_set(&ctx, g, &[g_entry]);
+        // Ownership was already correct; split stripped the cross-function edge and
+        // re-homed the blocks. Identify them by address (pre-split ids are stale).
+        assert_block_addrs(&ctx, f, &[0x1000, 0x1008]);
+        assert_block_addrs(&ctx, g, &[0x2000]);
+        let entry = block_at_addr(&ctx, f, 0x1000);
+        let tail = block_at_addr(&ctx, f, 0x1008);
 
         // The cross-function edge is gone; the intra-function edge survives.
         assert_eq!(
@@ -720,9 +736,12 @@ mod tests {
         assert!(split_overlapping_functions(&mut ctx));
 
         // A trampoline block was minted into F (entry + cont + trampoline = 3).
+        // The absorbed blocks are re-homed by split's tail, so resolve by address.
         let f_blocks = Function::from_id(&ctx, f).block_ids();
         assert_eq!(f_blocks.len(), 3, "F gains one trampoline block");
-        assert_block_set(&ctx, g, &[g_entry]);
+        assert_block_addrs(&ctx, g, &[0x2000]);
+        let entry = block_at_addr(&ctx, f, 0x1000);
+        let cont = block_at_addr(&ctx, f, 0x1008);
 
         // The CBranch's success arm now points at an intra-F trampoline; the
         // fall-through arm is unchanged. No arm references a foreign block.
@@ -740,7 +759,11 @@ mod tests {
             panic!("entry must still end in a cbranch");
         };
         assert_eq!(failure_block, cont, "the intra-function arm is untouched");
-        assert_ne!(success_block, g_entry, "the foreign arm was repointed");
+        assert_ne!(
+            BasicBlock::from_id(&ctx, success_block).address(),
+            Some(0x2000),
+            "the foreign arm was repointed away from G's entry",
+        );
         assert_eq!(
             BasicBlock::from_id(&ctx, success_block)
                 .parent()
@@ -773,16 +796,29 @@ mod tests {
         assert!(!split_overlapping_functions(&mut ctx));
     }
 
-    fn assert_block_set(ctx: &Context, func: FunctionId, expected: &[BlockId]) {
-        let blocks = Function::from_id(ctx, func).block_ids();
-        assert_eq!(
-            blocks.len(),
-            expected.len(),
-            "block count mismatch for {func:?}"
-        );
-        for b in expected {
-            assert!(blocks.contains(b), "{func:?} missing block {b:?}");
-        }
+    /// Assert `func`'s roster is exactly the blocks at these machine addresses.
+    /// Split's tail re-homes reattributed blocks into fresh arena slots, so tests
+    /// must identify post-split blocks by their stable machine address, never by a
+    /// pre-split `BlockId` (which relocation tombstones).
+    fn assert_block_addrs(ctx: &Context, func: FunctionId, expected: &[u64]) {
+        let mut got: Vec<u64> = Function::from_id(ctx, func)
+            .block_ids()
+            .into_iter()
+            .filter_map(|b| ctx.values.block(b).address)
+            .collect();
+        got.sort_unstable();
+        let mut want = expected.to_vec();
+        want.sort_unstable();
+        assert_eq!(got, want, "block-address set mismatch for {func:?}");
+    }
+
+    /// Resolve the (post-split, possibly relocated) block of `func` at `addr`.
+    fn block_at_addr(ctx: &Context, func: FunctionId, addr: u64) -> BlockId {
+        Function::from_id(ctx, func)
+            .block_ids()
+            .into_iter()
+            .find(|b| ctx.values.block(*b).address == Some(addr))
+            .unwrap_or_else(|| panic!("{func:?} has no block at {addr:#x}"))
     }
 
     fn addrs(ctx: &Context, func: FunctionId) -> Vec<u64> {
@@ -794,11 +830,12 @@ mod tests {
     }
 
     /// A block *owned* by `F` but *stored* in another function's arena — exactly
-    /// the reattributed state `reattribute_blocks`/`lift_block` produce — must be
-    /// re-homed into `F`'s arena so ownership and storage agree, leaving the IR
-    /// (successors, opcodes) intact and the function checkout-safe.
+    /// the reattributed state `reattribute_blocks`/`lift_block` produce — is
+    /// re-homed into `F`'s arena by `split_overlapping_functions`'s tail so that
+    /// split always hands back strictly local IR: ownership and storage agree, the
+    /// IR (successors, opcodes) is intact, and every function is checkout-safe.
     #[test]
-    fn normalize_rehomes_reattributed_block() {
+    fn split_rehomes_reattributed_block() {
         use qcode::value::insn::Mnemonic;
         use qcode::value::util::host_mut::CheckedOut;
 
@@ -822,7 +859,12 @@ mod tests {
         assert_eq!(body.func, g);
         assert_eq!(ctx.values.block(body).parent, Some(f));
 
-        assert!(ctx.normalize_block_storage(), "expected a relocation");
+        // Ownership already matches the CFG, so split's only work is discharging
+        // strict locality at its tail — which reports a change (the storage move).
+        assert!(
+            split_overlapping_functions(&mut ctx),
+            "expected split to re-home the reattributed block",
+        );
 
         // (a) Every one of F's roster blocks is now self-stored.
         let f_blocks = Function::from_id(&ctx, f).block_ids();

@@ -1376,17 +1376,11 @@ async fn run_function_stage(
     round: usize,
     progress: &mut impl ProgressSink,
 ) -> Result<HashSet<FunctionId>, String> {
-    // Recursive disassembly and `split_overlapping_functions` reassign block
-    // *ownership* (a block's `parent`/roster) without moving its *storage*
-    // (`id.func`), leaving some functions owning a block that lives in another
-    // function's arena. This stage checks each function out one at a time, and a
-    // checked-out function cannot reach a roster block stored in a foreign arena
-    // (`CheckedOut::new` requires every roster block to be self-stored). Re-home
-    // those blocks into their owners first — a pure storage move that leaves the IR
-    // identical and is a no-op (a cheap scan) once storage already matches
-    // ownership, which is the steady state after the first stage.
-    ctx.normalize_block_storage();
-
+    // Every producer of reattributed blocks (the recursive lifter, and
+    // `split_overlapping_functions` during discovery rounds) discharges strict
+    // locality at its own tail, so every function reaching this stage is already
+    // self-stored — the invariant `CheckedOut::new` asserts at checkout. No
+    // storage normalization is needed here.
     dump_stage_inputs(ctx, &stage.dump, &stage.name);
     let fun_ids: Vec<FunctionId> = ctx
         .functions()
