@@ -30,7 +30,7 @@ use jstd::graph::analysis::{DominatorTree, compute_dominators};
 use qcode::{
     context::Context,
     value::{
-        BlockId, BlockParamId, BlockRef, FunctionRef, ValueId,
+        BlockId, BlockParamId, ValueId,
         insn::{Branch, CBranch, Mnemonic},
         util::{base_ref::HostRef, host_mut::HostMut},
     },
@@ -54,7 +54,7 @@ fn unique_incoming(
 ) -> Option<ValueId> {
     // Dedup predecessor blocks: a `CBranch` whose two edges both target `block`
     // shows up twice but its terminator is read once below (handling both arms).
-    let preds: HashSet<BlockId> = BlockRef::new(host, block)
+    let preds: HashSet<BlockId> = host.block_ref(block)
         .predecessors()
         .map(|(_, b)| b)
         .collect();
@@ -78,7 +78,7 @@ fn unique_incoming(
             }
         };
 
-        let ok = match host.instruction(term_id).mnemonic() {
+        let ok = match host.insn_ref(term_id).mnemonic() {
             Mnemonic::Branch(b) if b.target == block => {
                 b.args.get(index).copied().is_some_and(&mut consider)
             }
@@ -204,12 +204,12 @@ pub fn remove_dead_block_params_host<'str, H: HostMut<'str>>(
     };
 
     for &block in block_ids {
-        let insns: Vec<_> = BlockRef::new(host.read_host(), block)
+        let insns: Vec<_> = host.block_ref(block)
             .iter()
             .map(|i| i.id)
             .collect();
         for id in insns {
-            match host.read_host().instruction(id).mnemonic() {
+            match host.insn_ref(id).mnemonic() {
                 Mnemonic::Branch(b) => {
                     forward_edges(host.read_host(), &b.args, b.target, &mut edges)
                 }
@@ -321,14 +321,14 @@ fn find_congruent_param(
     root: Option<BlockId>,
 ) -> Option<(BlockId, usize, BlockParamId, ValueId)> {
     let root = root?;
-    let dom = compute_dominators(&FunctionRef::new(host, root.func), root);
+    let dom = compute_dominators(&host.function_ref(root.func), root);
     let mut cong = Congruence::new(precompute_forms_for_blocks(host, block_ids));
 
     for &block in block_ids {
         if block == root {
             continue;
         }
-        if BlockRef::new(host, block).predecessors().next().is_none() {
+        if host.block_ref(block).predecessors().next().is_none() {
             continue;
         }
         let params = host.block(block).params.clone();
@@ -372,7 +372,7 @@ fn congruent_incoming(
 
     // Dedup predecessor blocks (a `CBranch` with both edges to `block` lists it
     // twice but its terminator is read once, covering both arms).
-    let preds: HashSet<BlockId> = BlockRef::new(host, block)
+    let preds: HashSet<BlockId> = host.block_ref(block)
         .predecessors()
         .map(|(_, b)| b)
         .collect();
@@ -413,7 +413,7 @@ fn incoming_args(
     index: usize,
 ) -> Vec<ValueId> {
     let mut out = Vec::new();
-    match host.instruction(term_id).mnemonic() {
+    match host.insn_ref(term_id).mnemonic() {
         Mnemonic::Branch(b) if b.target == block => out.extend(b.args.get(index).copied()),
         Mnemonic::CBranch(c) => {
             if c.success_block == block {
@@ -439,7 +439,7 @@ fn find_redundant_param(
         if Some(block) == root {
             continue;
         }
-        if BlockRef::new(host, block).predecessors().next().is_none() {
+        if host.block_ref(block).predecessors().next().is_none() {
             continue;
         }
         let params = host.block(block).params.clone();
@@ -485,7 +485,7 @@ pub(crate) fn remove_params_from_block_host<'str, H: HostMut<'str>>(
 
     // A predecessor reaching `block` through both edges of a `CBranch` appears
     // twice; dedup so we rewrite its terminator exactly once.
-    let preds: HashSet<BlockId> = BlockRef::new(host.read_host(), block)
+    let preds: HashSet<BlockId> = host.block_ref(block)
         .predecessors()
         .map(|(_, b)| b)
         .collect();
@@ -534,7 +534,7 @@ fn filter_kept(args: &[ValueId], drop: &HashSet<usize>) -> Vec<ValueId> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use qcode::value::BasicBlock;
+    use qcode::value::{BasicBlock, FunctionRef};
     use qcode_macro::qcode;
 
     /// All block ids of `fun`, used to drive the standalone sweep in tests.

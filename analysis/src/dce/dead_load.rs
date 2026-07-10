@@ -6,8 +6,7 @@ use qcode::{
     context::Context,
     space::{Space, SpaceId, SpaceType},
     value::{
-        BlockId, FunctionId, FunctionRef, ValueId, Varnode,
-        block::BlockRef,
+        BlockId, FunctionId, ValueId, Varnode,
         insn::{InstructionId, Mnemonic},
         util::{base_ref::HostRef, host_mut::HostMut},
     },
@@ -54,7 +53,7 @@ pub(crate) fn is_reg_space(ctx: &Context, space_id: SpaceId) -> bool {
 /// caller-saved register set), as kills for the backward scan. Empty for a
 /// callee with no recorded clobber set.
 fn call_clobber_intervals(host: HostRef, target: FunctionId) -> Vec<KilledInterval> {
-    let Some(clobbered) = FunctionRef::new(host, target).clobbered_regs() else {
+    let Some(clobbered) = host.function_ref(target).clobbered_regs() else {
         return Vec::new();
     };
     clobbered
@@ -117,12 +116,12 @@ fn base_plus_offset(host: HostRef, ptr: ValueId) -> (ValueId, i64) {
         // a literal `add` so a field deref `gep(p.field)` compares offset-precisely
         // against the equivalent `p + off` arithmetic (e.g. an argpromote seed
         // store written to `p + off`).
-        if let Mnemonic::Gep(g) = host.instruction(id).mnemonic() {
+        if let Mnemonic::Gep(g) = host.insn_ref(id).mnemonic() {
             acc += g.offset as i64;
             cur = g.base;
             continue;
         }
-        let Mnemonic::Binop(b) = host.instruction(id).mnemonic() else {
+        let Mnemonic::Binop(b) = host.insn_ref(id).mnemonic() else {
             break;
         };
         let (op, lhs, rhs) = (b.op, b.lhs, b.rhs);
@@ -328,7 +327,7 @@ pub fn dead_load_insns<'a, 'str: 'a>(
     dead_regs: &[ValueId],
 ) -> HashSet<InstructionId> {
     let host = host.into();
-    let insns: Vec<InstructionId> = BlockRef::new(host, block_id).instruction_ids().to_vec();
+    let insns: Vec<InstructionId> = host.block_ref(block_id).instruction_ids().to_vec();
     let mut dead = block_dead_loads(host, block_id);
 
     if let Some(aliases) = aliases {
@@ -342,7 +341,7 @@ pub fn dead_load_insns<'a, 'str: 'a>(
         let mut killed: Vec<(i64, i64)> = Vec::new();
 
         for &id in insns.iter().rev() {
-            match host.instruction(id).mnemonic() {
+            match host.insn_ref(id).mnemonic() {
                 Mnemonic::Load(load)
                     if is_reg_space(host.shared(), load.space) && !dead.contains(&id) =>
                 {
@@ -376,9 +375,9 @@ pub fn dead_load_insns<'a, 'str: 'a>(
 /// Loads in `block_id` whose result has no users (dead in any address space).
 fn block_dead_loads(host: HostRef, block_id: BlockId) -> HashSet<InstructionId> {
     let mut dead = HashSet::default();
-    let insns = BlockRef::new(host, block_id).instruction_ids().to_vec();
+    let insns = host.block_ref(block_id).instruction_ids().to_vec();
     for id in insns {
-        if let Mnemonic::Load(_) = host.instruction(id).mnemonic()
+        if let Mnemonic::Load(_) = host.insn_ref(id).mnemonic()
             && host
                 .function(id.func)
                 .users_of(ValueId::Instruction(id))
@@ -438,7 +437,7 @@ fn scan_block_aliased(
     live_seed: &[LiveLoc],
     killed_seed: &[KilledInterval],
 ) -> (LiveSet, KilledSet) {
-    let insns: Vec<InstructionId> = BlockRef::new(host, block_id).instruction_ids().to_vec();
+    let insns: Vec<InstructionId> = host.block_ref(block_id).instruction_ids().to_vec();
     let mut live = live_seed.to_vec();
     let mut killed = killed_seed.to_vec();
     // Block-local overwrite tracking for instruction-computed pointers (which
@@ -453,12 +452,12 @@ fn scan_block_aliased(
     // Like `dead_reg`s (and unlike `is_killed`) this does not require a covering
     // store, so it also sees through the call barrier below. Sound *only* for
     // `pure_reg`: otherwise registers are live-out per the calling convention.
-    let regs_dead_at_exit = BlockRef::new(host, block_id)
+    let regs_dead_at_exit = host.block_ref(block_id)
         .function()
         .is_some_and(|f| f.is_pure_reg());
 
     for &id in insns.iter().rev() {
-        match host.instruction(id).mnemonic() {
+        match host.insn_ref(id).mnemonic() {
             Mnemonic::Load(load) if !dead.contains(&id) => {
                 match aliases.interval(load.ptr) {
                     Some(iv) => punch_killed(&mut killed, KilledInterval::from_alias(iv)),
@@ -523,7 +522,7 @@ fn scan_block_aliased(
             // does not clobber (callee-saved) it neither reads nor writes, so their
             // existing kills pass through untouched.
             Mnemonic::Call(call)
-                if FunctionRef::new(host, call.target).is_externally_resolved() =>
+                if host.function_ref(call.target).is_externally_resolved() =>
             {
                 for iv in call_clobber_intervals(host, call.target) {
                     live.retain(|l| l.space != iv.space || !killed_covers_loc(host, iv, l));
@@ -638,13 +637,13 @@ fn unread_temp_space_stores<'a, 'str: 'a>(
     function_id: FunctionId,
 ) -> HashSet<InstructionId> {
     let host = host.into();
-    let fun = FunctionRef::new(host, function_id);
+    let fun = host.function_ref(function_id);
     let mut loads: Vec<TempLoad> = Vec::new();
     let mut candidate_stores: Vec<TempStore> = Vec::new();
 
     for block in &fun {
         for &insn_id in block.instruction_ids() {
-            match host.instruction(insn_id).mnemonic() {
+            match host.insn_ref(insn_id).mnemonic() {
                 Mnemonic::Load(load) if is_temp_space(host.shared(), load.space) => {
                     loads.push((load.space, load.ptr, load.size));
                 }
@@ -689,7 +688,7 @@ fn unread_frame_local_stores<'a, 'str: 'a>(
     aliases: &AliasResult,
 ) -> HashSet<InstructionId> {
     let host = host.into();
-    let fun = FunctionRef::new(host, function_id);
+    let fun = host.function_ref(function_id);
     if fun.iter().flat_map(|block| block.iter()).any(|insn| {
         matches!(
             insn.mnemonic(),
@@ -703,7 +702,7 @@ fn unread_frame_local_stores<'a, 'str: 'a>(
     let mut stores: Vec<(InstructionId, ValueId, usize)> = Vec::new();
     for block in &fun {
         for &id in block.instruction_ids() {
-            match host.instruction(id).mnemonic() {
+            match host.insn_ref(id).mnemonic() {
                 Mnemonic::Load(load) => loads.push((load.ptr, load.size)),
                 Mnemonic::Store(store) if aliases.is_own_frame_local(store.ptr) => {
                     stores.push((id, store.ptr, store.size))
@@ -743,7 +742,7 @@ fn postdominated_dead_register_stores(
     function_id: FunctionId,
     aliases: &AliasResult,
 ) -> HashSet<InstructionId> {
-    let function = FunctionRef::new(host, function_id);
+    let function = host.function_ref(function_id);
     let blocks: Vec<BlockId> = function.iter().map(|block| block.id).collect();
     if blocks.is_empty() {
         return HashSet::default();
@@ -763,7 +762,7 @@ fn postdominated_dead_register_stores(
     let exit_set: HashSet<BlockId> = blocks
         .iter()
         .copied()
-        .filter(|&block| BlockRef::new(host, block).successors().next().is_none())
+        .filter(|&block| host.block_ref(block).successors().next().is_none())
         .collect();
     if exit_set.is_empty() {
         return HashSet::default();
@@ -773,9 +772,9 @@ fn postdominated_dead_register_stores(
     let mut stores = Vec::new();
     let mut loads = Vec::new();
     for block in &blocks {
-        let insns = BlockRef::new(host, *block).instruction_ids().to_vec();
+        let insns = host.block_ref(*block).instruction_ids().to_vec();
         for id in insns {
-            match host.instruction(id).mnemonic() {
+            match host.insn_ref(id).mnemonic() {
                 Mnemonic::Store(store) if is_reg_space(host.shared(), store.space) => {
                     stores.push(RegisterStore {
                         id,
@@ -847,13 +846,13 @@ struct RamAccess {
 /// included only when it lies on a cycle).
 fn forward_reachable(host: HostRef, start: BlockId) -> HashSet<BlockId> {
     let mut seen: HashSet<BlockId> = HashSet::default();
-    let mut stack: Vec<BlockId> = BlockRef::new(host, start)
+    let mut stack: Vec<BlockId> = host.block_ref(start)
         .successors()
         .map(|(_, s)| s)
         .collect();
     while let Some(b) = stack.pop() {
         if seen.insert(b) {
-            stack.extend(BlockRef::new(host, b).successors().map(|(_, s)| s));
+            stack.extend(host.block_ref(b).successors().map(|(_, s)| s));
         }
     }
     seen
@@ -887,7 +886,7 @@ fn postdominated_dead_ram_stores(
     function_id: FunctionId,
     aliases: &AliasResult,
 ) -> HashSet<InstructionId> {
-    let function = FunctionRef::new(host, function_id);
+    let function = host.function_ref(function_id);
     let blocks: Vec<BlockId> = function.iter().map(|block| block.id).collect();
     let Some(&entry) = blocks.first() else {
         return HashSet::default();
@@ -909,7 +908,7 @@ fn postdominated_dead_ram_stores(
     let exit_set: HashSet<BlockId> = blocks
         .iter()
         .copied()
-        .filter(|&block| BlockRef::new(host, block).successors().next().is_none())
+        .filter(|&block| host.block_ref(block).successors().next().is_none())
         .collect();
     if exit_set.is_empty() {
         return HashSet::default();
@@ -920,9 +919,9 @@ fn postdominated_dead_ram_stores(
     let mut stores: Vec<RamAccess> = Vec::new();
     let mut loads: Vec<RamAccess> = Vec::new();
     for &block in &blocks {
-        let insns = BlockRef::new(host, block).instruction_ids().to_vec();
+        let insns = host.block_ref(block).instruction_ids().to_vec();
         for (pos, id) in insns.into_iter().enumerate() {
-            match host.instruction(id).mnemonic() {
+            match host.insn_ref(id).mnemonic() {
                 Mnemonic::Store(store) if store.space == ram => stores.push(RamAccess {
                     id,
                     block,
@@ -1021,7 +1020,7 @@ pub fn remove_dead_load_insns_host<'str, H: HostMut<'str>>(
     aliases: Option<&AliasResult>,
     dead_regs: &[ValueId],
 ) -> bool {
-    let block_ids: Vec<BlockId> = FunctionRef::new(host.read_host(), function_id)
+    let block_ids: Vec<BlockId> = host.function_ref(function_id)
         .iter()
         .map(|block| block.id)
         .collect();

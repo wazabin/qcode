@@ -3,7 +3,7 @@ use rustc_hash::FxHashSet as HashSet;
 use qcode::{
     context::Context,
     value::{
-        BlockId, BlockRef, FunctionId, FunctionRef, InstructionId, ValueId,
+        BlockId, FunctionId, InstructionId, ValueId,
         insn::Mnemonic,
         util::{base_ref::HostRef, host_mut::HostMut},
     },
@@ -27,7 +27,7 @@ pub fn dead_insns<'a, 'str: 'a>(
 ) -> HashSet<InstructionId> {
     let host = host.into();
     let mut dead = HashSet::default();
-    let insn_ids: Vec<InstructionId> = BlockRef::new(host, block_id).instruction_ids().to_vec();
+    let insn_ids: Vec<InstructionId> = host.block_ref(block_id).instruction_ids().to_vec();
     for id in insn_ids {
         let mnemonic = host.instruction(id).mnemonic();
         let side_effects = mnemonic.has_side_effects();
@@ -81,7 +81,7 @@ pub fn remove_dead_pure_call(mut ctx: &mut Context, block_id: BlockId) -> bool {
 
 /// Host-generic core of [`remove_dead_pure_call`]; see that function.
 fn remove_dead_pure_call_host<'str, H: HostMut<'str>>(host: &mut H, block_id: BlockId) -> bool {
-    let Some(term_id) = BlockRef::new(host.read_host(), block_id)
+    let Some(term_id) = host.block_ref(block_id)
         .instruction_ids()
         .last()
         .copied()
@@ -89,14 +89,14 @@ fn remove_dead_pure_call_host<'str, H: HostMut<'str>>(host: &mut H, block_id: Bl
         return false;
     };
 
-    let (clobbers_empty, target) = match host.read_host().instruction(term_id).mnemonic() {
+    let (clobbers_empty, target) = match host.insn_ref(term_id).mnemonic() {
         Mnemonic::Call(call) => (call.clobbers.is_empty(), call.target),
         _ => return false,
     };
     if !clobbers_empty {
         return false;
     }
-    if !FunctionRef::new(host.read_host(), target).is_pure() {
+    if !host.function_ref(target).is_pure() {
         return false;
     }
     if !host_users(host.read_host(), ValueId::Instruction(term_id)).is_empty() {
@@ -104,7 +104,7 @@ fn remove_dead_pure_call_host<'str, H: HostMut<'str>>(host: &mut H, block_id: Bl
     }
 
     // A pure call's block has exactly one successor: its fall-through.
-    let successors: Vec<BlockId> = BlockRef::new(host.read_host(), block_id)
+    let successors: Vec<BlockId> = host.block_ref(block_id)
         .successors()
         .map(|(_, b)| b)
         .collect();
@@ -129,7 +129,7 @@ pub fn remove_unused_no_pred_block_params_host<'str, H: HostMut<'str>>(
     host: &mut H,
     block_id: BlockId,
 ) -> bool {
-    if BlockRef::new(host.read_host(), block_id)
+    if host.block_ref(block_id)
         .predecessors()
         .next()
         .is_some()
@@ -145,7 +145,7 @@ pub fn remove_unused_no_pred_block_params_host<'str, H: HostMut<'str>>(
     // this per-function sweep. A function pass must not reach across functions, so
     // leave pure_reg entry params for `dead_signature`; the *local* fallback below
     // would silently drop the param and break the interface alignment.
-    let is_pure_reg_entry = BlockRef::new(host.read_host(), block_id)
+    let is_pure_reg_entry = host.block_ref(block_id)
         .function()
         .is_some_and(|f| f.is_pure_reg() && f.root().map(|b| b.id) == Some(block_id));
     if is_pure_reg_entry {
@@ -563,7 +563,7 @@ fn dl_is_eq_const(host: HostRef, cond: ValueId, iv: ValueId) -> bool {
 /// Distinct predecessor blocks of `b`.
 fn dl_preds(host: HostRef, b: BlockId) -> Vec<BlockId> {
     let mut seen = HashSet::default();
-    BlockRef::new(host, b)
+    host.block_ref(b)
         .predecessors()
         .map(|(_, p)| p)
         .filter(|&p| seen.insert(p))
@@ -572,7 +572,7 @@ fn dl_preds(host: HostRef, b: BlockId) -> Vec<BlockId> {
 
 /// Terminator instruction of `b`, if any.
 fn dl_term(host: HostRef, b: BlockId) -> Option<InstructionId> {
-    BlockRef::new(host, b).instruction_ids().last().copied()
+    host.block_ref(b).instruction_ids().last().copied()
 }
 
 /// `true` if every user of `v` lives in one of `region`'s blocks.
@@ -645,7 +645,7 @@ fn match_dead_loop(host: HostRef, header: BlockId) -> Option<DeadLoop> {
     // The region's non-terminator instructions must all be pure.
     let region = [header, body];
     for &blk in &region {
-        for id in BlockRef::new(host, blk).instruction_ids().to_vec() {
+        for id in host.block_ref(blk).instruction_ids().to_vec() {
             let m = host.instruction(id).mnemonic();
             if !m.is_terminator() && m.has_side_effects() {
                 return None;
@@ -656,7 +656,7 @@ fn match_dead_loop(host: HostRef, header: BlockId) -> Option<DeadLoop> {
     // No live-out: every region-defined value (instruction results and block
     // params) is used only within the region.
     for &blk in &region {
-        for id in BlockRef::new(host, blk).instruction_ids().to_vec() {
+        for id in host.block_ref(blk).instruction_ids().to_vec() {
             if !dl_users_confined(host, ValueId::Instruction(id), &region) {
                 return None;
             }
@@ -703,7 +703,7 @@ fn remove_dead_counted_loop(mut ctx: &mut Context, fun_id: FunctionId) -> bool {
 
 /// Host-generic core of [`remove_dead_counted_loop`]; see that function.
 fn remove_dead_counted_loop_host<'str, H: HostMut<'str>>(host: &mut H, fun_id: FunctionId) -> bool {
-    let headers: Vec<BlockId> = FunctionRef::new(host.read_host(), fun_id)
+    let headers: Vec<BlockId> = host.function_ref(fun_id)
         .blocks()
         .map(|b| b.id)
         .collect();
@@ -743,10 +743,10 @@ impl FunctionPass for Dce {
 /// / dead-instruction sweeps, redundant/dead block-argument elimination, and dead
 /// counted-loop removal.
 fn dce_core<'str, H: HostMut<'str>>(host: &mut H, fun_id: FunctionId) -> bool {
-    let root = FunctionRef::new(host.read_host(), fun_id)
+    let root = host.function_ref(fun_id)
         .root()
         .map(|b| b.id);
-    let block_ids: Vec<_> = FunctionRef::new(host.read_host(), fun_id)
+    let block_ids: Vec<_> = host.function_ref(fun_id)
         .blocks()
         .map(|b| b.id)
         .collect();
