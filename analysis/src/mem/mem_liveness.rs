@@ -21,9 +21,7 @@
 
 use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
 
-use qcode::value::{
-    BlockId, FunctionId, ValueId, util::base_ref::HostRef,
-};
+use qcode::value::{BlockId, FunctionId, ValueId, util::base_ref::HostRef};
 
 use crate::AliasResult;
 use crate::dce::dead_load::{
@@ -111,7 +109,8 @@ pub fn compute_memory_liveness<'a, 'str: 'a>(
     dead_regs: &[ValueId],
 ) -> MemLiveness {
     let host = host.into();
-    let blocks: Vec<BlockId> = host.function_ref(function_id)
+    let blocks: Vec<BlockId> = host
+        .function_ref(function_id)
         .iter()
         .map(|block| block.id)
         .collect();

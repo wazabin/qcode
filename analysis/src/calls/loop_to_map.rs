@@ -145,7 +145,8 @@ fn try_match(host: HostRef, fid: FunctionId) -> Option<MapMatch> {
     // Consumer: a RAM store of the carried array's exit view (real memory). When
     // absent (private argpromote shadow, wide temp store already dce'd) the exit
     // uses of `arr_exit` are the return envelope — the rewrite just replaces them.
-    let store_id = host.block_ref(exit)
+    let store_id = host
+        .block_ref(exit)
         .iter()
         .find_map(|i| match i.mnemonic() {
             Mnemonic::Store(s)
@@ -255,12 +256,9 @@ fn apply<'str>(m: &ModuleView<'_, 'str>, body: &mut FunctionBody<'str>, mm: &Map
 
     // Build `map(body, enumerate(arr0))` (index-aware) or `map(body, arr0)`
     // (value-only) ahead of the consumer, then forward the exit view to it.
-    let anchor = mm.store_id.or_else(|| {
-        host.block_ref(mm.exit)
-            .iter()
-            .next()
-            .map(|i| i.id)
-    });
+    let anchor = mm
+        .store_id
+        .or_else(|| host.block_ref(mm.exit).iter().next().map(|i| i.id));
     // The map source (`enumerate(arr0)` when index-aware, else `arr0`), built
     // ahead of the consumer.
     let src = if uses_index {
@@ -304,7 +302,8 @@ fn apply<'str>(m: &ModuleView<'_, 'str>, body: &mut FunctionBody<'str>, mm: &Map
     let loop_blocks = [mm.ca.header, mm.ca.body];
     let exit_users: Vec<InstructionId> = users_of(host.read_host(), mm.arr_exit).to_vec();
     for id in exit_users {
-        if host.insn_ref(id)
+        if host
+            .insn_ref(id)
             .parent()
             .is_some_and(|b| loop_blocks.contains(&b.id))
         {
@@ -329,12 +328,14 @@ fn apply<'str>(m: &ModuleView<'_, 'str>, body: &mut FunctionBody<'str>, mm: &Map
     // from a preheader-available value, then delete the loop blocks.
     let defined_in_loop = |host: HostRef, v: ValueId| match v {
         ValueId::BlockParam(_) => param_parent(host, v).is_some_and(|b| loop_blocks.contains(&b)),
-        ValueId::Instruction(id) => host.insn_ref(id)
+        ValueId::Instruction(id) => host
+            .insn_ref(id)
             .parent()
             .is_some_and(|b| loop_blocks.contains(&b.id)),
         _ => false,
     };
-    let exit_args: Option<Vec<ValueId>> = host.block_ref(mm.exit)
+    let exit_args: Option<Vec<ValueId>> = host
+        .block_ref(mm.exit)
         .params()
         .map(|p| p.id())
         .collect::<Vec<_>>()
@@ -363,7 +364,8 @@ fn apply<'str>(m: &ModuleView<'_, 'str>, body: &mut FunctionBody<'str>, mm: &Map
         })
         .collect();
     if deletable && let Some(exit_args) = exit_args {
-        let preheaders: Vec<BlockId> = host.block_ref(mm.ca.header)
+        let preheaders: Vec<BlockId> = host
+            .block_ref(mm.ca.header)
             .predecessors()
             .map(|(_, p)| p)
             .filter(|p| !loop_blocks.contains(p))

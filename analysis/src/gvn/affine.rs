@@ -771,7 +771,8 @@ pub(crate) fn precompute_forms<'a, 'str: 'a>(
 ) -> Numbering {
     let host = host.into();
     let mut numbering = Numbering::default();
-    let ids: Vec<ValueId> = host.function_ref(func_id)
+    let ids: Vec<ValueId> = host
+        .function_ref(func_id)
         .iter()
         .flat_map(|block| {
             block

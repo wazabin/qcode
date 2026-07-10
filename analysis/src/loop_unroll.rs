@@ -122,9 +122,7 @@ pub fn recognize_simple_loops<'str, H: HostMut<'str>>(host: &mut H, fun_id: Func
             let loop_comment = recognized.get(&block).and_then(|loops| {
                 (loops.len() == 1).then(|| format_loop_comment(host.read_host(), &loops[0]))
             });
-            let current = host.block_ref(block)
-                .comment()
-                .map(str::to_owned);
+            let current = host.block_ref(block).comment().map(str::to_owned);
             (
                 block,
                 merge_loop_comment(current.as_deref(), loop_comment.as_deref()),
@@ -134,9 +132,7 @@ pub fn recognize_simple_loops<'str, H: HostMut<'str>>(host: &mut H, fun_id: Func
 
     let mut changed = false;
     for (block, comment) in updates {
-        let current = host.block_ref(block)
-            .comment()
-            .map(str::to_owned);
+        let current = host.block_ref(block).comment().map(str::to_owned);
         if current != comment {
             BaseRef::new(host.reborrow_host(), block).set_comment(comment);
             changed = true;
@@ -254,9 +250,7 @@ fn apply_unroll_plan<'str, H: HostMut<'str>>(
                 replace_terminator_with_branch(host, previous, new_block, Vec::new());
             }
 
-            let old_insns = host.block_ref(old_block)
-                .instruction_ids()
-                .to_vec();
+            let old_insns = host.block_ref(old_block).instruction_ids().to_vec();
             let Some((&terminator, body_insns)) = old_insns.split_last() else {
                 return false;
             };
@@ -270,9 +264,7 @@ fn apply_unroll_plan<'str, H: HostMut<'str>>(
                     )
                 };
                 let new_insn = host.push_mnemonic_with_type(fun_id, mnemonic, type_id);
-                let insert_at = host.block_ref(new_block)
-                    .instruction_ids()
-                    .len();
+                let insert_at = host.block_ref(new_block).instruction_ids().len();
                 BaseRef::new(host.reborrow_host(), new_block)
                     .insert_insn_at_index(insert_at, new_insn);
                 value_map.insert(
@@ -326,7 +318,8 @@ fn apply_unroll_plan<'str, H: HostMut<'str>>(
     // order, each param's value at loop exit (the last latch's args; the initial
     // values when the loop ran zero times). Uses inside the about-to-be-deleted loop
     // blocks are rewritten too, harmlessly.
-    let header_params: Vec<BlockParamId> = host.block_ref(plan.lp.header)
+    let header_params: Vec<BlockParamId> = host
+        .block_ref(plan.lp.header)
         .params()
         .map(|param| param.id)
         .collect();
@@ -463,7 +456,8 @@ pub(crate) fn replace_terminator_with_branch<'str, H: HostMut<'str>>(
     target: BlockId,
     args: Vec<ValueId>,
 ) {
-    let old_successors = host.block_ref(block)
+    let old_successors = host
+        .block_ref(block)
         .successors()
         .map(|(edge, _)| edge)
         .collect::<Vec<_>>();
@@ -477,7 +471,8 @@ pub(crate) fn replace_terminator_with_branch<'str, H: HostMut<'str>>(
     // increment), which must not be clobbered into the branch — doing so destroys
     // that value and, when it is the exit argument, yields a branch that passes
     // itself. In that case append the branch instead.
-    let term_id = host.block_ref(block)
+    let term_id = host
+        .block_ref(block)
         .instruction_ids()
         .last()
         .copied()
@@ -486,9 +481,7 @@ pub(crate) fn replace_terminator_with_branch<'str, H: HostMut<'str>>(
         host.replace_instruction_mnemonic(term_id, Mnemonic::Branch(Branch { target, args }));
     } else {
         let branch = host.push_mnemonic(block.func, Mnemonic::Branch(Branch { target, args }), 0);
-        let end = host.block_ref(block)
-            .instruction_ids()
-            .len();
+        let end = host.block_ref(block).instruction_ids().len();
         BaseRef::new(host.reborrow_host(), block).insert_insn_at_index(end, branch);
     }
     host.add_cfg_edge(block, target);
@@ -518,7 +511,8 @@ impl LoopAnalysis {
         let postdominators = compute_postdominators(&cfg, &block_ids, &node_set, &exit_set);
         let mut backedges = Vec::new();
         for &latch in &block_ids {
-            let successors = host.block_ref(latch)
+            let successors = host
+                .block_ref(latch)
                 .successors()
                 .map(|(_, header)| header)
                 .collect::<Vec<_>>();
@@ -557,7 +551,8 @@ fn recognize_simple_loop(
     let header = edge.header;
     let cbranch = header_cbranch(host, header)?;
     let (induction, bound, signed) = condition_bound(host, cbranch.condition)?;
-    let header_params = host.block_ref(header)
+    let header_params = host
+        .block_ref(header)
         .params()
         .map(|param| param.id)
         .collect::<Vec<_>>();
@@ -796,11 +791,13 @@ fn numeric_const(host: HostRef, value: ValueId) -> Option<u64> {
 
 fn format_loop_comment(host: HostRef, lp: &SimpleLoop) -> String {
     let induction = host.param_ref(lp.induction);
-    let body = host.block_ref(lp.body)
+    let body = host
+        .block_ref(lp.body)
         .name()
         .map(str::to_owned)
         .unwrap_or_else(|| format!("bb_{:x}", usize::from(lp.body.local)));
-    let latch = host.block_ref(lp.latch)
+    let latch = host
+        .block_ref(lp.latch)
         .name()
         .map(str::to_owned)
         .unwrap_or_else(|| format!("bb_{:x}", usize::from(lp.latch.local)));

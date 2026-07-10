@@ -122,7 +122,8 @@ fn try_match(host: HostRef, fid: FunctionId) -> Option<ReadsMatch> {
 
     // Seed store: `store(region, base <- arr)`, `arr` a root `[elem; N]` param,
     // `base` a root param, size `N * size_of(elem)`.
-    let root_params: Vec<ValueId> = host.function_ref(fid)
+    let root_params: Vec<ValueId> = host
+        .function_ref(fid)
         .root()?
         .params()
         .map(|p| p.id())
@@ -227,9 +228,7 @@ fn apply<'str, H: HostMut<'str>>(host: &mut H, m: &ReadsMatch) -> bool {
         .or(arr_ty)
         .expect("seeded array value has a type");
     for (load_id, lane) in &m.loads {
-        let block = host.insn_ref(*load_id)
-            .parent()
-            .map(|b| b.id);
+        let block = host.insn_ref(*load_id).parent().map(|b| b.id);
         let Some(block) = block else { continue };
         // Materialize the word index (checkout-safe builder: const/add only).
         let idx = {

@@ -75,11 +75,7 @@ pub fn canonicalize_sp_slots<'str, H: HostMut<'str>>(
     if offsets.contains(&0) {
         repr.insert(0, sp_param);
     }
-    for insn in host.function_ref(fid)
-        .root()
-        .unwrap()
-        .iter()
-    {
+    for insn in host.function_ref(fid).root().unwrap().iter() {
         let v = ValueId::Instruction(insn.id);
         if let Some((base, off)) = numbering.base_offset(v)
             && base == sp_param

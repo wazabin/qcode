@@ -452,7 +452,8 @@ fn scan_block_aliased(
     // Like `dead_reg`s (and unlike `is_killed`) this does not require a covering
     // store, so it also sees through the call barrier below. Sound *only* for
     // `pure_reg`: otherwise registers are live-out per the calling convention.
-    let regs_dead_at_exit = host.block_ref(block_id)
+    let regs_dead_at_exit = host
+        .block_ref(block_id)
         .function()
         .is_some_and(|f| f.is_pure_reg());
 
@@ -521,9 +522,7 @@ fn scan_block_aliased(
             // call's own output, not the caller's pre-call value). Registers it
             // does not clobber (callee-saved) it neither reads nor writes, so their
             // existing kills pass through untouched.
-            Mnemonic::Call(call)
-                if host.function_ref(call.target).is_externally_resolved() =>
-            {
+            Mnemonic::Call(call) if host.function_ref(call.target).is_externally_resolved() => {
                 for iv in call_clobber_intervals(host, call.target) {
                     live.retain(|l| l.space != iv.space || !killed_covers_loc(host, iv, l));
                     killed.push(iv);
@@ -846,10 +845,7 @@ struct RamAccess {
 /// included only when it lies on a cycle).
 fn forward_reachable(host: HostRef, start: BlockId) -> HashSet<BlockId> {
     let mut seen: HashSet<BlockId> = HashSet::default();
-    let mut stack: Vec<BlockId> = host.block_ref(start)
-        .successors()
-        .map(|(_, s)| s)
-        .collect();
+    let mut stack: Vec<BlockId> = host.block_ref(start).successors().map(|(_, s)| s).collect();
     while let Some(b) = stack.pop() {
         if seen.insert(b) {
             stack.extend(host.block_ref(b).successors().map(|(_, s)| s));
@@ -1020,7 +1016,8 @@ pub fn remove_dead_load_insns_host<'str, H: HostMut<'str>>(
     aliases: Option<&AliasResult>,
     dead_regs: &[ValueId],
 ) -> bool {
-    let block_ids: Vec<BlockId> = host.function_ref(function_id)
+    let block_ids: Vec<BlockId> = host
+        .function_ref(function_id)
         .iter()
         .map(|block| block.id)
         .collect();

@@ -105,7 +105,8 @@ fn back_edges(host: HostRef, fun_id: FunctionId) -> Vec<(BlockId, BlockId)> {
 
     let mut edges = Vec::new();
     for &latch in &block_ids {
-        let successors = host.block_ref(latch)
+        let successors = host
+            .block_ref(latch)
             .successors()
             .map(|(_, header)| header)
             .collect::<Vec<_>>();

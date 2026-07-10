@@ -285,18 +285,11 @@ fn apply<'str>(mv: &ModuleView<'_, 'str>, body: &mut FunctionBody<'str>, m: &Sca
     // not just before the wide store: `array_promote` may have rewritten other
     // exit loads to `at(arr_exit, k)` earlier in the block, and those get
     // redirected to the folded array below — which must therefore dominate them.
-    let Some(anchor) = host.block_ref(m.exit)
-        .iter()
-        .next()
-        .map(|i| i.id)
-    else {
+    let Some(anchor) = host.block_ref(m.exit).iter().next().map(|i| i.id) else {
         return false;
     };
     // Pre-existing exit instructions whose `arr_exit` uses are redirected.
-    let preexisting: Vec<InstructionId> = host.block_ref(m.exit)
-        .iter()
-        .map(|i| i.id)
-        .collect();
+    let preexisting: Vec<InstructionId> = host.block_ref(m.exit).iter().map(|i| i.id).collect();
 
     // Materialize the scan source. Data-input: the `l0[1..]` byte-slice from
     // element 1 (length `N-1`). Pure generation: `iota(N-1)` typed `[i64; N-1]`.
@@ -380,7 +373,8 @@ fn apply<'str>(mv: &ModuleView<'_, 'str>, body: &mut FunctionBody<'str>, m: &Sca
     let private = is_loop_private(host.read_host(), &loop_blocks);
     let defined_in_loop = |host: HostRef, v: ValueId| match v {
         ValueId::BlockParam(_) => param_parent(host, v).is_some_and(|b| loop_blocks.contains(&b)),
-        ValueId::Instruction(id) => host.insn_ref(id)
+        ValueId::Instruction(id) => host
+            .insn_ref(id)
             .parent()
             .is_some_and(|b| loop_blocks.contains(&b.id)),
         _ => false,
@@ -389,7 +383,8 @@ fn apply<'str>(mv: &ModuleView<'_, 'str>, body: &mut FunctionBody<'str>, m: &Sca
     // coalesced) must be re-fed from a preheader-available value: its
     // header-edge incoming directly if loop-invariant, or — when it copies a
     // loop param — that param's own loop-invariant (preheader) incoming.
-    let exit_args: Option<Vec<ValueId>> = host.block_ref(m.exit)
+    let exit_args: Option<Vec<ValueId>> = host
+        .block_ref(m.exit)
         .params()
         .map(|p| p.id())
         .collect::<Vec<_>>()
@@ -418,7 +413,8 @@ fn apply<'str>(mv: &ModuleView<'_, 'str>, body: &mut FunctionBody<'str>, m: &Sca
         })
         .collect();
     if private && let Some(exit_args) = exit_args {
-        let preheaders: Vec<BlockId> = host.block_ref(m.header)
+        let preheaders: Vec<BlockId> = host
+            .block_ref(m.header)
             .predecessors()
             .map(|(_, p)| p)
             .filter(|p| !loop_blocks.contains(p))

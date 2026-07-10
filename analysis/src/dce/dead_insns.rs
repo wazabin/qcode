@@ -81,11 +81,7 @@ pub fn remove_dead_pure_call(mut ctx: &mut Context, block_id: BlockId) -> bool {
 
 /// Host-generic core of [`remove_dead_pure_call`]; see that function.
 fn remove_dead_pure_call_host<'str, H: HostMut<'str>>(host: &mut H, block_id: BlockId) -> bool {
-    let Some(term_id) = host.block_ref(block_id)
-        .instruction_ids()
-        .last()
-        .copied()
-    else {
+    let Some(term_id) = host.block_ref(block_id).instruction_ids().last().copied() else {
         return false;
     };
 
@@ -104,7 +100,8 @@ fn remove_dead_pure_call_host<'str, H: HostMut<'str>>(host: &mut H, block_id: Bl
     }
 
     // A pure call's block has exactly one successor: its fall-through.
-    let successors: Vec<BlockId> = host.block_ref(block_id)
+    let successors: Vec<BlockId> = host
+        .block_ref(block_id)
         .successors()
         .map(|(_, b)| b)
         .collect();
@@ -129,11 +126,7 @@ pub fn remove_unused_no_pred_block_params_host<'str, H: HostMut<'str>>(
     host: &mut H,
     block_id: BlockId,
 ) -> bool {
-    if host.block_ref(block_id)
-        .predecessors()
-        .next()
-        .is_some()
-    {
+    if host.block_ref(block_id).predecessors().next().is_some() {
         return false;
     }
 
@@ -145,7 +138,8 @@ pub fn remove_unused_no_pred_block_params_host<'str, H: HostMut<'str>>(
     // this per-function sweep. A function pass must not reach across functions, so
     // leave pure_reg entry params for `dead_signature`; the *local* fallback below
     // would silently drop the param and break the interface alignment.
-    let is_pure_reg_entry = host.block_ref(block_id)
+    let is_pure_reg_entry = host
+        .block_ref(block_id)
         .function()
         .is_some_and(|f| f.is_pure_reg() && f.root().map(|b| b.id) == Some(block_id));
     if is_pure_reg_entry {
@@ -703,10 +697,7 @@ fn remove_dead_counted_loop(mut ctx: &mut Context, fun_id: FunctionId) -> bool {
 
 /// Host-generic core of [`remove_dead_counted_loop`]; see that function.
 fn remove_dead_counted_loop_host<'str, H: HostMut<'str>>(host: &mut H, fun_id: FunctionId) -> bool {
-    let headers: Vec<BlockId> = host.function_ref(fun_id)
-        .blocks()
-        .map(|b| b.id)
-        .collect();
+    let headers: Vec<BlockId> = host.function_ref(fun_id).blocks().map(|b| b.id).collect();
     for header in headers {
         if let Some(dl) = match_dead_loop(host.read_host(), header) {
             replace_terminator_with_branch(host, dl.preheader, dl.exit, vec![]);
@@ -743,13 +734,8 @@ impl FunctionPass for Dce {
 /// / dead-instruction sweeps, redundant/dead block-argument elimination, and dead
 /// counted-loop removal.
 fn dce_core<'str, H: HostMut<'str>>(host: &mut H, fun_id: FunctionId) -> bool {
-    let root = host.function_ref(fun_id)
-        .root()
-        .map(|b| b.id);
-    let block_ids: Vec<_> = host.function_ref(fun_id)
-        .blocks()
-        .map(|b| b.id)
-        .collect();
+    let root = host.function_ref(fun_id).root().map(|b| b.id);
+    let block_ids: Vec<_> = host.function_ref(fun_id).blocks().map(|b| b.id).collect();
     let mut changed = false;
     // Loop to fixed point: rewriting a dead pure call into a branch can make
     // its argument-producing instructions (Extracts, etc.) unused, which the

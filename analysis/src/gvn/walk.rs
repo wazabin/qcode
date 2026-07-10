@@ -255,7 +255,8 @@ pub(super) fn run_flat_fixpoint<'str, H: HostMut<'str>>(
     func_id: FunctionId,
     passes: &[Box<dyn SubPass<'str, H>>],
 ) -> bool {
-    let block_ids: Vec<BlockId> = host.function_ref(func_id)
+    let block_ids: Vec<BlockId> = host
+        .function_ref(func_id)
         .iter()
         .map(|block| block.id)
         .collect();
@@ -403,7 +404,8 @@ pub(super) fn run_dominator_walk<'str, H: HostMut<'str>>(
     };
 
     let root_reachable = reachable_from(host.read_host(), root, func_id);
-    let entries: Vec<BlockId> = host.function_ref(func_id)
+    let entries: Vec<BlockId> = host
+        .function_ref(func_id)
         .iter()
         .filter(|block| !root_reachable.contains(&block.id))
         .filter(|block| block.predecessors().next().is_none())

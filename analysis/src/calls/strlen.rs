@@ -135,7 +135,8 @@ fn nonzero_polarity(host: HostRef, cond: ValueId, elem: ValueId) -> Option<bool>
 fn try_match_strlen(host: HostRef, fid: FunctionId) -> Option<StrlenMatch> {
     let at_id = IntrinsicId::from_name("at")?;
     let insert_id = IntrinsicId::from_name("insert")?;
-    let root_params: Vec<ValueId> = host.function_ref(fid)
+    let root_params: Vec<ValueId> = host
+        .function_ref(fid)
         .root()?
         .params()
         .map(|p| p.id())
@@ -185,7 +186,8 @@ fn try_match_strlen(host: HostRef, fid: FunctionId) -> Option<StrlenMatch> {
     if host.insn_ref(at_insn).parent().map(|b| b.id) != Some(header) {
         return None;
     }
-    let k = host.block_ref(header)
+    let k = host
+        .block_ref(header)
         .params()
         .position(|p| p.id() == index)?;
     // The index must start at 0 on *every* entry edge and step by +1 on the
@@ -230,7 +232,8 @@ fn try_match_strlen(host: HostRef, fid: FunctionId) -> Option<StrlenMatch> {
         };
         // The exit edge must carry the index (the count) to an exit-block param.
         let kx = exit_args.iter().position(|&v| v == index)?;
-        let count_param = host.block_ref(exit_block)
+        let count_param = host
+            .block_ref(exit_block)
             .params()
             .nth(kx)
             .map(|p| p.id())?;
@@ -259,7 +262,8 @@ fn try_match_strlen(host: HostRef, fid: FunctionId) -> Option<StrlenMatch> {
 
         // The preheader is the header's sole out-of-loop predecessor: the reroute
         // source when the dead loop is deleted (there is no seed store to key on).
-        let out_of_loop: Vec<BlockId> = host.block_ref(header)
+        let out_of_loop: Vec<BlockId> = host
+            .block_ref(header)
             .predecessors()
             .map(|(_, p)| p)
             .filter(|&p| p != body_block)
@@ -278,7 +282,8 @@ fn try_match_strlen(host: HostRef, fid: FunctionId) -> Option<StrlenMatch> {
                     .is_some_and(|b| loop_blocks.contains(&b.id))
             })
         };
-        let exit_only_count = host.block_ref(exit_block)
+        let exit_only_count = host
+            .block_ref(exit_block)
             .params()
             .all(|p| p.id() == count_param);
         let deletable = exit_only_count
@@ -307,10 +312,7 @@ fn apply_strlen<'str, H: HostMut<'str>>(host: &mut H, fid: FunctionId, m: &Strle
     // take_while(@arr) then len(...) of it, inserted at the top of the exit block.
     let tw_id = IntrinsicId::from_name("take_while").expect("take_while registered");
     let len_id = IntrinsicId::from_name("len").expect("len registered");
-    let first = host.block_ref(m.exit_block)
-        .iter()
-        .next()
-        .map(|i| i.id);
+    let first = host.block_ref(m.exit_block).iter().next().map(|i| i.id);
     let len_val = {
         let mut b = Builder::from_block(BaseRef::new(host.reborrow_host(), m.exit_block));
         if let Some(at) = first {
@@ -329,7 +331,8 @@ fn apply_strlen<'str, H: HostMut<'str>>(host: &mut H, fid: FunctionId, m: &Strle
         //   2. reroute the preheader straight to the (now param-less) exit,
         //   3. delete the dead loop blocks. (There is no seed store to strip — the
         //      `at`-form scan reads the root array param directly.)
-        let kx = host.block_ref(m.exit_block)
+        let kx = host
+            .block_ref(m.exit_block)
             .params()
             .position(|p| p.id() == m.count_param);
         if let Some(kx) = kx {
@@ -406,10 +409,7 @@ struct StrlenPtrMatch {
 fn try_match_strlen_ptr(host: HostRef, fid: FunctionId) -> Option<StrlenPtrMatch> {
     for block in host.function_ref(fid).iter() {
         let header = block.id;
-        let params: Vec<ValueId> = host.block_ref(header)
-            .params()
-            .map(|p| p.id())
-            .collect();
+        let params: Vec<ValueId> = host.block_ref(header).params().map(|p| p.id()).collect();
         for (k, &s) in params.iter().enumerate() {
             // Induction pointer: stepped by +1 on the back-edge, initialised to a
             // single base pointer `@s0`. Requiring *exactly one* non-increment
@@ -430,7 +430,8 @@ fn try_match_strlen_ptr(host: HostRef, fid: FunctionId) -> Option<StrlenPtrMatch
 
             // A byte load at the pointer, in real memory (not a shadow snapshot —
             // that is Layer 1's `is_temp` region).
-            let load = host.block_ref(header)
+            let load = host
+                .block_ref(header)
                 .iter()
                 .find_map(|i| match i.mnemonic() {
                     Mnemonic::Load(l) if l.ptr == s && l.size == 1 && !is_temp(host, l.space) => {
@@ -486,7 +487,8 @@ fn try_match_strlen_ptr(host: HostRef, fid: FunctionId) -> Option<StrlenPtrMatch
             // end pointer is the exit-block param fed the induction pointer. Matched
             // by `lhs - base` with `lhs` an exit param carrying `s`.
             let kx = exit_args.iter().position(|&v| v == s)?;
-            let end_param = host.block_ref(exit_block)
+            let end_param = host
+                .block_ref(exit_block)
                 .params()
                 .nth(kx)
                 .map(|p| p.id())?;

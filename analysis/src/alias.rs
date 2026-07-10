@@ -323,7 +323,8 @@ fn frame_is_captured(host: HostRef, fid: FunctionId, numbering: &Numbering, sp: 
                 Mnemonic::Call(c) => {
                     for (j, &arg) in c.args.iter().enumerate() {
                         if is_own_frame(arg)
-                            && !host.function_ref(c.target)
+                            && !host
+                                .function_ref(c.target)
                                 .param_attr(j)
                                 .is_some_and(|a| a.nocapture)
                         {

@@ -440,7 +440,8 @@ impl MemForward {
         block_id: BlockId,
         aliases: Option<&AliasResult>,
     ) {
-        let term = host.block_ref(block_id)
+        let term = host
+            .block_ref(block_id)
             .iter()
             .last()
             .map(|i| i.mnemonic().clone());
@@ -463,7 +464,8 @@ impl MemForward {
         // This is what lets a functionalized callee that writes only its own
         // private scratch space leave the caller's spilled-pointer cell intact.
         let callee_written_spaces: Option<Vec<SpaceId>> = match &term {
-            Some(Mnemonic::Call(call)) => host.function_ref(call.target)
+            Some(Mnemonic::Call(call)) => host
+                .function_ref(call.target)
                 .written_spaces()
                 .map(<[_]>::to_vec),
             _ => None,
@@ -674,7 +676,8 @@ impl MemForward {
         numbering: &Numbering,
     ) {
         // `dominates` is reflexive, so a self-loop also counts.
-        let is_loop_header = host.block_ref(block_id)
+        let is_loop_header = host
+            .block_ref(block_id)
             .predecessors()
             .any(|(_, pred)| tree.dominates(block_id, pred));
         if !is_loop_header || self.byte_map.is_empty() {

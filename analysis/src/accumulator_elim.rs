@@ -133,7 +133,8 @@ fn classify(
     };
 
     // State slots = header parameters.
-    let head_info: Vec<(BlockParamId, usize)> = ctx.block_ref(head)
+    let head_info: Vec<(BlockParamId, usize)> = ctx
+        .block_ref(head)
         .params()
         .map(|p| (p.id, p.size()))
         .collect();
@@ -151,8 +152,7 @@ fn classify(
 
     // Resolve the body's next-state expressions (latch scope) back to header
     // params by binding each latch param to the value the header passed for it.
-    let latch_params: Vec<BlockParamId> =
-        ctx.block_ref(latch).params().map(|p| p.id).collect();
+    let latch_params: Vec<BlockParamId> = ctx.block_ref(latch).params().map(|p| p.id).collect();
     if latch_params.len() != cont_args.len() {
         return None;
     }
@@ -164,10 +164,7 @@ fn classify(
 
     // The exit returns a single value; we project it from the result tuple.
     let ret_val = block_return_value(ctx, exit_block)?;
-    let exit_params: Vec<BlockParamId> = ctx.block_ref(exit_block)
-        .params()
-        .map(|p| p.id)
-        .collect();
+    let exit_params: Vec<BlockParamId> = ctx.block_ref(exit_block).params().map(|p| p.id).collect();
     if exit_params.len() != exit_args.len() {
         return None;
     }
@@ -268,10 +265,7 @@ fn transform<'str>(
     p: &Plan,
 ) {
     let host_fid = body.id();
-    let base_name = format!(
-        "{}_acc",
-        body.read_host(m).function_ref(host_fid).name()
-    );
+    let base_name = format!("{}_acc", body.read_host(m).function_ref(host_fid).name());
     // Mint the driver-only recursive lambda (name buffered raw; the driver
     // uniquifies it at check-in). `None` (pool exhausted) leaves the loop alone.
     let Some(g) = body.mint_function(Cow::Owned(base_name.clone()), FunctionKind::Lambda, true)

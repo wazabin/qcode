@@ -168,10 +168,7 @@ fn transform<'str>(
     model: &LoopModel,
 ) -> bool {
     let host_fid = body.id();
-    let name = format!(
-        "{}_rec",
-        body.read_host(m).function_ref(host_fid).name()
-    );
+    let name = format!("{}_rec", body.read_host(m).function_ref(host_fid).name());
     // Mint the recursive lambda (name buffered raw; the driver uniquifies it at
     // check-in). `None` (pool exhausted) leaves the loop alone.
     let Some(rec) = body.mint_function(Cow::Owned(name), FunctionKind::Lambda, true) else {
@@ -203,7 +200,8 @@ fn transform<'str>(
             let params: Vec<(
                 qcode::value::block_param::BlockParamId,
                 qcode::types::TypeId,
-            )> = own.block_ref(ob)
+            )> = own
+                .block_ref(ob)
                 .params()
                 .map(|p| {
                     let pid = match p.id() {
@@ -265,10 +263,7 @@ fn transform<'str>(
                 continue;
             }
             let nb = block_map[&ob];
-            let succs: Vec<BlockId> = own.block_ref(ob)
-                .successors()
-                .map(|(_, s)| s)
-                .collect();
+            let succs: Vec<BlockId> = own.block_ref(ob).successors().map(|(_, s)| s).collect();
             for s in succs {
                 if let Some(&ns) = block_map.get(&s) {
                     minted.add_cfg_edge(nb, ns);
@@ -359,7 +354,8 @@ fn reachable_from<'a, 'str: 'a>(
             continue;
         }
         for (_edge, succ) in host.block_ref(block).successors() {
-            let same_fun = host.block_ref(succ)
+            let same_fun = host
+                .block_ref(succ)
                 .function()
                 .is_some_and(|f| f.id == fun_id);
             if same_fun {
@@ -382,12 +378,8 @@ fn terminator_id<'a, 'str: 'a>(
     host: qcode::value::util::base_ref::HostRef<'a, 'str>,
     block: BlockId,
 ) -> Option<InstructionId> {
-    let &id = host.block_ref(block)
-        .instruction_ids()
-        .last()?;
-    host.insn_ref(id)
-        .is_terminator()
-        .then_some(id)
+    let &id = host.block_ref(block).instruction_ids().last()?;
+    host.insn_ref(id).is_terminator().then_some(id)
 }
 
 /// A borrow of `block`'s terminator mnemonic, avoiding a full clone.

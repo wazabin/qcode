@@ -69,7 +69,8 @@ pub fn struct_typing<'str, H: HostMut<'str>>(host: &mut H, fun_id: FunctionId) -
         return false;
     }
 
-    let insn_ids: Vec<InstructionId> = host.function_ref(fun_id)
+    let insn_ids: Vec<InstructionId> = host
+        .function_ref(fun_id)
         .blocks()
         .flat_map(|b| b.instruction_ids().to_vec())
         .collect();
@@ -111,7 +112,8 @@ fn stored_type_of<'str>(host: HostRef<'_, 'str>, id: ValueId) -> Option<TypeId> 
 /// reference (e.g. a `PEB*` value becomes `%peb`), keeping names unique within
 /// the function. Returns `true` if any value was renamed.
 fn rename_struct_values<'str, H: HostMut<'str>>(host: &mut H, fun_id: FunctionId) -> bool {
-    let values: Vec<ValueId> = host.function_ref(fun_id)
+    let values: Vec<ValueId> = host
+        .function_ref(fun_id)
         .blocks()
         .flat_map(|b| {
             b.params()

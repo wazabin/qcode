@@ -467,9 +467,7 @@ fn region_base<'str, 'ctx, Ctx: HostMut<'str>>(
 /// than the (sentinel) shared registry slot.
 fn width_of<'str, H: HostMut<'str>>(host: &H, v: ValueId) -> usize {
     let ty = match v {
-        ValueId::Instruction(iid) => {
-            host.insn_ref(iid).type_id()
-        }
+        ValueId::Instruction(iid) => host.insn_ref(iid).type_id(),
         ValueId::BlockParam(pid) => host.param_ref(pid).type_id(),
         other => host
             .shared()
@@ -518,7 +516,8 @@ fn insert_at_top<'str, H: HostMut<'str>>(
     mnemonic: Mnemonic,
     ty: TypeId,
 ) -> ValueId {
-    let first = host.block_ref(block)
+    let first = host
+        .block_ref(block)
         .iter()
         .next()
         .expect("preheader has a terminator")
@@ -530,11 +529,7 @@ fn insert_at_top<'str, H: HostMut<'str>>(
 
 /// The last instruction id of `block`.
 fn last_insn<'str, H: HostMut<'str>>(host: &H, block: BlockId) -> InstructionId {
-    host.block_ref(block)
-        .iter()
-        .last()
-        .unwrap()
-        .id
+    host.block_ref(block).iter().last().unwrap().id
 }
 
 fn apply<'str, H: HostMut<'str>>(host: &mut H, m: &PromoteMatch) -> bool {
@@ -685,11 +680,7 @@ fn apply<'str, H: HostMut<'str>>(host: &mut H, m: &PromoteMatch) -> bool {
     // Exit write-back: store(region, base(+origin) <- arr_e) at the *top* of the exit
     // block, so any whole-region exit load left in place reads the promoted result.
     {
-        let first_id = host.block_ref(m.exit)
-            .iter()
-            .next()
-            .unwrap()
-            .id;
+        let first_id = host.block_ref(m.exit).iter().next().unwrap().id;
         let base_width = width_of(host, m.base_root);
         let mut b = Builder::from_block(BaseRef::new(host.reborrow_host(), m.exit));
         b.set_insert_point_before(first_id);

@@ -54,7 +54,8 @@ fn unique_incoming(
 ) -> Option<ValueId> {
     // Dedup predecessor blocks: a `CBranch` whose two edges both target `block`
     // shows up twice but its terminator is read once below (handling both arms).
-    let preds: HashSet<BlockId> = host.block_ref(block)
+    let preds: HashSet<BlockId> = host
+        .block_ref(block)
         .predecessors()
         .map(|(_, b)| b)
         .collect();
@@ -204,10 +205,7 @@ pub fn remove_dead_block_params_host<'str, H: HostMut<'str>>(
     };
 
     for &block in block_ids {
-        let insns: Vec<_> = host.block_ref(block)
-            .iter()
-            .map(|i| i.id)
-            .collect();
+        let insns: Vec<_> = host.block_ref(block).iter().map(|i| i.id).collect();
         for id in insns {
             match host.insn_ref(id).mnemonic() {
                 Mnemonic::Branch(b) => {
@@ -372,7 +370,8 @@ fn congruent_incoming(
 
     // Dedup predecessor blocks (a `CBranch` with both edges to `block` lists it
     // twice but its terminator is read once, covering both arms).
-    let preds: HashSet<BlockId> = host.block_ref(block)
+    let preds: HashSet<BlockId> = host
+        .block_ref(block)
         .predecessors()
         .map(|(_, b)| b)
         .collect();
@@ -485,7 +484,8 @@ pub(crate) fn remove_params_from_block_host<'str, H: HostMut<'str>>(
 
     // A predecessor reaching `block` through both edges of a `CBranch` appears
     // twice; dedup so we rewrite its terminator exactly once.
-    let preds: HashSet<BlockId> = host.block_ref(block)
+    let preds: HashSet<BlockId> = host
+        .block_ref(block)
         .predecessors()
         .map(|(_, b)| b)
         .collect();
