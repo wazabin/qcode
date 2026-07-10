@@ -14,7 +14,7 @@ use std::borrow::Cow;
 use cpp_demangle::DemangleOptions;
 use qcode::value::{FunctionRef, util::host_mut::HostMut};
 
-use crate::{FunctionBody, FunctionPassV2, ModuleView};
+use crate::{FunctionBody, FunctionPass, ModuleView};
 
 pub struct CppDemangle {
     /// Precomputed in `Default`: rendered names omit parameter lists
@@ -30,7 +30,7 @@ impl Default for CppDemangle {
     }
 }
 
-impl FunctionPassV2 for CppDemangle {
+impl FunctionPass for CppDemangle {
     const NAME: &'static str = "cpp_demangle";
 
     fn description(&self) -> &'static str {
@@ -72,7 +72,7 @@ impl FunctionPassV2 for CppDemangle {
     }
 }
 
-crate::register_function_pass_v2!(CppDemangle);
+crate::register_function_pass!(CppDemangle);
 
 #[cfg(test)]
 mod tests {
@@ -81,7 +81,7 @@ mod tests {
     use qcode_macro::qcode;
 
     use super::*;
-    use crate::test_util::run_function_pass_v2;
+    use crate::test_util::run_function_pass;
 
     #[test]
     fn unmangled_name_is_not_changed() {
@@ -96,7 +96,7 @@ mod tests {
             "
         );
 
-        run_function_pass_v2::<CppDemangle>(&mut ctx, foo).unwrap();
+        run_function_pass::<CppDemangle>(&mut ctx, foo).unwrap();
 
         assert_eq!(Function::from_id(&ctx, foo).name(), "foo");
     }
@@ -114,7 +114,7 @@ mod tests {
             "
         );
 
-        run_function_pass_v2::<CppDemangle>(&mut ctx, _ZN5space3fooEibc).unwrap();
+        run_function_pass::<CppDemangle>(&mut ctx, _ZN5space3fooEibc).unwrap();
 
         assert_eq!(
             Function::from_id(&ctx, _ZN5space3fooEibc).name(),
@@ -141,7 +141,7 @@ mod tests {
             .rename("_ZNSsixEj@@GLIBCXX_3.4".into())
             .unwrap();
 
-        run_function_pass_v2::<CppDemangle>(&mut ctx, placeholder).unwrap();
+        run_function_pass::<CppDemangle>(&mut ctx, placeholder).unwrap();
 
         assert_eq!(
             Function::from_id(&ctx, placeholder).name(),

@@ -62,12 +62,12 @@ use qcode::{
 
 use crate::loop_to_recursion::recognize_loop;
 use crate::pipeline::{FunctionBody, ModuleView};
-use crate::{FunctionPassV2, register_function_pass_v2};
+use crate::{FunctionPass, register_function_pass};
 
 #[derive(Default)]
 pub struct AccumulatorElim;
 
-impl FunctionPassV2 for AccumulatorElim {
+impl FunctionPass for AccumulatorElim {
     const NAME: &'static str = "accumulator_elim";
     const MINTS: bool = true;
 
@@ -84,7 +84,7 @@ impl FunctionPassV2 for AccumulatorElim {
     }
 }
 
-register_function_pass_v2!(AccumulatorElim);
+register_function_pass!(AccumulatorElim);
 
 pub fn accumulator_elim<'str>(m: &ModuleView<'_, 'str>, body: &mut FunctionBody<'str>) -> bool {
     let host = body.id();
@@ -648,7 +648,7 @@ mod tests {
     use qcode_emulator::{SizedValue, StandaloneEmulator};
     use qcode_macro::qcode;
 
-    use crate::test_util::run_function_pass_v2;
+    use crate::test_util::run_function_pass;
 
     fn run(ctx: &Context, fun: FunctionId, n: u64) -> Option<u64> {
         let root = Function::from_id(ctx, fun).root().expect("root").id;
@@ -687,7 +687,7 @@ mod tests {
             "
         );
 
-        assert!(run_function_pass_v2::<AccumulatorElim>(&mut ctx, fib_loop).unwrap());
+        assert!(run_function_pass::<AccumulatorElim>(&mut ctx, fib_loop).unwrap());
 
         let g = Function::from_name(&ctx, "fib_loop_acc").expect("accumulator lambda exists");
         assert!(g.is_lambda());
@@ -728,7 +728,7 @@ mod tests {
             "
         );
 
-        assert!(!run_function_pass_v2::<AccumulatorElim>(&mut ctx, sum_up).unwrap());
+        assert!(!run_function_pass::<AccumulatorElim>(&mut ctx, sum_up).unwrap());
     }
 
     #[test]
@@ -743,6 +743,6 @@ mod tests {
                 return %x;
             "
         );
-        assert!(!run_function_pass_v2::<AccumulatorElim>(&mut ctx, straight).unwrap());
+        assert!(!run_function_pass::<AccumulatorElim>(&mut ctx, straight).unwrap());
     }
 }

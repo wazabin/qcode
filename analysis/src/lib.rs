@@ -89,9 +89,10 @@ pub mod pipeline;
 pub use pipeline::{
     ArchConfig, CallingConvention, DEFAULT_PIPELINE_TOML, DecompilePass, DynDecompilePass,
     DynFunctionPass, DynPass, Effects,
-    FunctionBody, FunctionPassV2, GpReg, LiftOutcome, LiftSummary, ModuleView, Pass,
+    FunctionBody, FunctionPass, FunctionPassAdapter, GpReg, LiftOutcome, LiftSummary, ModuleView,
+    Pass,
     PassRegistration, Pipeline, PipelineEnv, PipelineServices, ProgressSink, RegisteredPass,
-    V2Adapter, YieldSignal,
+    YieldSignal,
     analyze_and_lift_with_progress, analyze_default, analyze_with_pipeline, known_pass_names,
     make_pass,
 };

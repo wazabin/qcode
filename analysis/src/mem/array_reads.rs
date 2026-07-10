@@ -282,9 +282,9 @@ fn build_index<'str, 'ctx, Ctx: HostMut<'str>>(
 
 // ----- pass ------------------------------------------------------------------
 
-use crate::{FunctionBody, FunctionPassV2, ModuleView};
+use crate::{FunctionBody, FunctionPass, ModuleView};
 
-impl FunctionPassV2 for ArrayReads {
+impl FunctionPass for ArrayReads {
     const NAME: &'static str = "array_reads";
 
     fn description(&self) -> &'static str {
@@ -308,7 +308,7 @@ impl FunctionPassV2 for ArrayReads {
     }
 }
 
-crate::register_function_pass_v2!(ArrayReads);
+crate::register_function_pass!(ArrayReads);
 
 #[cfg(test)]
 mod tests {
@@ -320,7 +320,7 @@ mod tests {
         value::{BasicBlock, Function, Value},
     };
 
-    use crate::test_util::run_function_pass_v2;
+    use crate::test_util::run_function_pass;
 
     /// Extra region traffic injected into the built function, to exercise the gates.
     #[derive(Clone, Copy, PartialEq)]
@@ -413,7 +413,7 @@ mod tests {
     fn read_only_region_promoted() {
         let mut tc = TestContext::new();
         let fid = build(&mut tc, /*ram*/ false, Extra::None);
-        assert!(run_function_pass_v2::<ArrayReads>(&mut tc.ctx, fid).unwrap());
+        assert!(run_function_pass::<ArrayReads>(&mut tc.ctx, fid).unwrap());
         assert_eq!(temp_load_count(&tc.ctx, fid), 0, "lane loads become at()");
         assert_eq!(at_count(&tc.ctx, fid), 2, "both lanes rewritten to at()");
     }
@@ -423,7 +423,7 @@ mod tests {
         let mut tc = TestContext::new();
         let fid = build(&mut tc, /*ram*/ false, Extra::Store);
         assert!(
-            !run_function_pass_v2::<ArrayReads>(&mut tc.ctx, fid).unwrap(),
+            !run_function_pass::<ArrayReads>(&mut tc.ctx, fid).unwrap(),
             "a non-seed store is array_promote's territory"
         );
         assert_eq!(at_count(&tc.ctx, fid), 0, "IR unchanged");
@@ -434,7 +434,7 @@ mod tests {
         let mut tc = TestContext::new();
         let fid = build(&mut tc, /*ram*/ true, Extra::None);
         assert!(
-            !run_function_pass_v2::<ArrayReads>(&mut tc.ctx, fid).unwrap(),
+            !run_function_pass::<ArrayReads>(&mut tc.ctx, fid).unwrap(),
             "real RAM reads must stay loads"
         );
         assert_eq!(at_count(&tc.ctx, fid), 0, "IR unchanged");
@@ -445,7 +445,7 @@ mod tests {
         let mut tc = TestContext::new();
         let fid = build(&mut tc, /*ram*/ false, Extra::Unknown);
         assert!(
-            !run_function_pass_v2::<ArrayReads>(&mut tc.ctx, fid).unwrap(),
+            !run_function_pass::<ArrayReads>(&mut tc.ctx, fid).unwrap(),
             "an unmodelled region address declines the promotion"
         );
         assert_eq!(at_count(&tc.ctx, fid), 0, "IR unchanged");

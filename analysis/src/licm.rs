@@ -46,12 +46,12 @@ use qcode::value::{
     util::{base_ref::HostRef, host_mut::HostMut},
 };
 
-use crate::{AliasResult, FunctionBody, FunctionPassV2, ModuleView};
+use crate::{AliasResult, FunctionBody, FunctionPass, ModuleView};
 
 #[derive(Default)]
 pub struct Licm;
 
-impl FunctionPassV2 for Licm {
+impl FunctionPass for Licm {
     const NAME: &'static str = "licm";
 
     fn description(&self) -> &'static str {
@@ -74,7 +74,7 @@ impl FunctionPassV2 for Licm {
     }
 }
 
-crate::register_function_pass_v2!(Licm);
+crate::register_function_pass!(Licm);
 
 /// Whether `m` is a side-effect-free value-computing op (mirrors the predicate
 /// used by `loop_to_map`/`partial_inline`). Loads are deliberately *excluded*

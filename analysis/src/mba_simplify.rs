@@ -57,12 +57,12 @@ use rumba_core::{
     varint::{VarInt, make_mask},
 };
 
-use crate::{FunctionBody, FunctionPassV2, ModuleView};
+use crate::{FunctionBody, FunctionPass, ModuleView};
 
 #[derive(Default)]
 pub struct MbaSimplify;
 
-impl FunctionPassV2 for MbaSimplify {
+impl FunctionPass for MbaSimplify {
     const NAME: &'static str = "mba_simplify";
 
     fn description(&self) -> &'static str {
@@ -80,7 +80,7 @@ impl FunctionPassV2 for MbaSimplify {
     }
 }
 
-crate::register_function_pass_v2!(MbaSimplify);
+crate::register_function_pass!(MbaSimplify);
 
 /// This function's instructions that use `v` (which must be a function-scoped
 /// SSA value — instruction or param). Routed through the read host.

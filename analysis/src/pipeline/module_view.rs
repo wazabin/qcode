@@ -125,7 +125,7 @@ impl<'str> FunctionBody<'str> {
     }
 
     /// A [`CheckedOut`] mutation host over this body's owned function and the
-    /// module's read-only shared context. This is how a `FunctionPassV2` reads
+    /// module's read-only shared context. This is how a `FunctionPass` reads
     /// (via [`CheckedOut::read_host`]) and mutates (via the [`HostMut`] surface)
     /// its function — construct block/instruction refs and `Builder`s over it.
     ///

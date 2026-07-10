@@ -46,12 +46,12 @@ use qcode::{
 };
 
 use crate::pipeline::{FunctionBody, ModuleView};
-use crate::{FunctionPassV2, register_function_pass_v2};
+use crate::{FunctionPass, register_function_pass};
 
 #[derive(Default)]
 pub struct LoopToRecursion;
 
-impl FunctionPassV2 for LoopToRecursion {
+impl FunctionPass for LoopToRecursion {
     const NAME: &'static str = "loop_to_recursion";
     const MINTS: bool = true;
 
@@ -68,7 +68,7 @@ impl FunctionPassV2 for LoopToRecursion {
     }
 }
 
-register_function_pass_v2!(LoopToRecursion);
+register_function_pass!(LoopToRecursion);
 
 #[derive(Debug, Clone)]
 pub(crate) struct LoopModel {
@@ -406,7 +406,7 @@ mod tests {
     use qcode_emulator::{SizedValue, StandaloneEmulator};
     use qcode_macro::qcode;
 
-    use crate::test_util::run_function_pass_v2;
+    use crate::test_util::run_function_pass;
 
     fn run(ctx: &Context, fun: FunctionId, n: u64) -> Option<u64> {
         let root = Function::from_id(ctx, fun).root().expect("root").id;
@@ -444,7 +444,7 @@ mod tests {
             "
         );
 
-        assert!(run_function_pass_v2::<LoopToRecursion>(&mut ctx, fib_loop).unwrap());
+        assert!(run_function_pass::<LoopToRecursion>(&mut ctx, fib_loop).unwrap());
 
         // The host entry is now just `apply rec(init); return`.
         let fib = Function::from_id(&ctx, fib_loop);
@@ -492,7 +492,7 @@ mod tests {
             "
         );
 
-        assert!(run_function_pass_v2::<LoopToRecursion>(&mut ctx, fact).unwrap());
+        assert!(run_function_pass::<LoopToRecursion>(&mut ctx, fact).unwrap());
         assert!(Function::from_name(&ctx, "fact_rec").unwrap().is_lambda());
 
         assert_eq!(run(&ctx, fact, 5), Some(120));
@@ -527,7 +527,7 @@ mod tests {
             "
         );
 
-        assert!(run_function_pass_v2::<LoopToRecursion>(&mut ctx, sum_up).unwrap());
+        assert!(run_function_pass::<LoopToRecursion>(&mut ctx, sum_up).unwrap());
         // 0+1+2+3+4 = 10
         assert_eq!(run(&ctx, sum_up, 5), Some(10));
         assert_eq!(run(&ctx, sum_up, 1), Some(0));
@@ -545,6 +545,6 @@ mod tests {
                 return %x;
             "
         );
-        assert!(!run_function_pass_v2::<LoopToRecursion>(&mut ctx, straight).unwrap());
+        assert!(!run_function_pass::<LoopToRecursion>(&mut ctx, straight).unwrap());
     }
 }

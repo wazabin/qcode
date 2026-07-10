@@ -11,7 +11,7 @@ use qcode::{
 use qcode_macro::qcode;
 
 use super::Licm;
-use crate::test_util::run_function_pass_v2;
+use crate::test_util::run_function_pass;
 
 /// Number of integer `add` instructions in `block`.
 fn count_adds(ctx: &Context, block: BlockId) -> usize {
@@ -67,7 +67,7 @@ fn hoists_invariant_arithmetic() {
     assert_eq!(count_adds(&ctx, entry), 0, "entry starts with no adds");
     assert_eq!(count_adds(&ctx, body), 2, "body starts with z and i_next");
 
-    assert!(run_function_pass_v2::<Licm>(&mut ctx, f).unwrap());
+    assert!(run_function_pass::<Licm>(&mut ctx, f).unwrap());
 
     assert_eq!(
         count_adds(&ctx, entry),
@@ -117,7 +117,7 @@ fn hoists_transitive_chain() {
         "
     );
 
-    assert!(run_function_pass_v2::<Licm>(&mut ctx, f).unwrap());
+    assert!(run_function_pass::<Licm>(&mut ctx, f).unwrap());
 
     for v in [s, t, u] {
         assert!(
@@ -160,7 +160,7 @@ fn keeps_loop_variant_in_body() {
     );
 
     assert!(
-        !run_function_pass_v2::<Licm>(&mut ctx, f).unwrap(),
+        !run_function_pass::<Licm>(&mut ctx, f).unwrap(),
         "nothing is invariant: %v depends on the loop counter @i"
     );
     assert!(
@@ -198,7 +198,7 @@ fn hoists_invariant_load() {
     assert_eq!(count_loads(&ctx, entry), 0);
     assert_eq!(count_loads(&ctx, body), 1);
 
-    assert!(run_function_pass_v2::<Licm>(&mut ctx, f).unwrap());
+    assert!(run_function_pass::<Licm>(&mut ctx, f).unwrap());
 
     assert_eq!(
         count_loads(&ctx, entry),
@@ -236,7 +236,7 @@ fn keeps_load_with_aliasing_store() {
     );
 
     assert!(
-        !run_function_pass_v2::<Licm>(&mut ctx, f).unwrap(),
+        !run_function_pass::<Licm>(&mut ctx, f).unwrap(),
         "the loop stores into the loaded location, so the load is not invariant"
     );
     assert_eq!(count_loads(&ctx, body), 1, "the load stays in the body");
@@ -344,7 +344,7 @@ fn skips_loop_without_preheader() {
     );
 
     assert!(
-        !run_function_pass_v2::<Licm>(&mut ctx, f).unwrap(),
+        !run_function_pass::<Licm>(&mut ctx, f).unwrap(),
         "the header has two preheaders, so no hoist target exists"
     );
     assert!(
@@ -384,11 +384,11 @@ fn is_idempotent() {
     );
 
     assert!(
-        run_function_pass_v2::<Licm>(&mut ctx, f).unwrap(),
+        run_function_pass::<Licm>(&mut ctx, f).unwrap(),
         "first run hoists"
     );
     assert!(
-        !run_function_pass_v2::<Licm>(&mut ctx, f).unwrap(),
+        !run_function_pass::<Licm>(&mut ctx, f).unwrap(),
         "second run finds nothing to hoist"
     );
 }
@@ -423,7 +423,7 @@ fn rewires_uses_to_hoisted_copy() {
         "
     );
 
-    assert!(run_function_pass_v2::<Licm>(&mut ctx, f).unwrap());
+    assert!(run_function_pass::<Licm>(&mut ctx, f).unwrap());
 
     // The store in the body must now read an add that lives in the preheader.
     let store_id = *BasicBlock::from_id(&ctx, body)

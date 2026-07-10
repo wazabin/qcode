@@ -24,7 +24,7 @@ use qcode::value::{
     },
 };
 
-use crate::{FunctionBody, FunctionPassV2, ModuleView};
+use crate::{FunctionBody, FunctionPass, ModuleView};
 
 const COMMENT_PREFIX: &str = "loop_unroll:";
 const MAX_UNROLL_ITERATIONS: u64 = 10;
@@ -59,7 +59,7 @@ struct LoopAnalysis {
     backedges: Vec<BackEdge>,
 }
 
-impl FunctionPassV2 for RecognizeSimpleLoops {
+impl FunctionPass for RecognizeSimpleLoops {
     const NAME: &'static str = "recognize_simple_loops";
 
     fn description(&self) -> &'static str {
@@ -77,9 +77,9 @@ impl FunctionPassV2 for RecognizeSimpleLoops {
     }
 }
 
-crate::register_function_pass_v2!(RecognizeSimpleLoops);
+crate::register_function_pass!(RecognizeSimpleLoops);
 
-impl FunctionPassV2 for UnrollSimpleLoops {
+impl FunctionPass for UnrollSimpleLoops {
     const NAME: &'static str = "unroll_simple_loops";
 
     fn description(&self) -> &'static str {
@@ -97,7 +97,7 @@ impl FunctionPassV2 for UnrollSimpleLoops {
     }
 }
 
-crate::register_function_pass_v2!(UnrollSimpleLoops);
+crate::register_function_pass!(UnrollSimpleLoops);
 
 pub fn recognize_simple_loops<'str, H: HostMut<'str>>(host: &mut H, fun_id: FunctionId) -> bool {
     let Some(analysis) = LoopAnalysis::compute(host.read_host(), fun_id) else {
@@ -834,7 +834,7 @@ mod tests {
     use qcode_macro::qcode;
 
     use super::*;
-    use crate::test_util::run_function_pass_v2;
+    use crate::test_util::run_function_pass;
 
     #[test]
     fn annotates_simple_constant_bound_induction_loop() {
@@ -857,7 +857,7 @@ mod tests {
             "
         );
 
-        assert!(run_function_pass_v2::<RecognizeSimpleLoops>(&mut ctx, test).unwrap());
+        assert!(run_function_pass::<RecognizeSimpleLoops>(&mut ctx, test).unwrap());
 
         let header = BasicBlock::from_id(&ctx, header);
         let comment = header.comment().expect("header should be annotated");
@@ -892,7 +892,7 @@ mod tests {
             "
         );
 
-        assert!(run_function_pass_v2::<RecognizeSimpleLoops>(&mut ctx, test).unwrap());
+        assert!(run_function_pass::<RecognizeSimpleLoops>(&mut ctx, test).unwrap());
 
         let header = BasicBlock::from_id(&ctx, header);
         let comment = header.comment().expect("header should be annotated");
@@ -925,7 +925,7 @@ mod tests {
             "
         );
 
-        assert!(run_function_pass_v2::<RecognizeSimpleLoops>(&mut ctx, test).unwrap());
+        assert!(run_function_pass::<RecognizeSimpleLoops>(&mut ctx, test).unwrap());
 
         let header = BasicBlock::from_id(&ctx, header);
         let comment = header.comment().expect("header should be annotated");
@@ -955,7 +955,7 @@ mod tests {
             "
         );
 
-        assert!(!run_function_pass_v2::<RecognizeSimpleLoops>(&mut ctx, test).unwrap());
+        assert!(!run_function_pass::<RecognizeSimpleLoops>(&mut ctx, test).unwrap());
         assert!(BasicBlock::from_id(&ctx, header).comment().is_none());
     }
 
@@ -984,7 +984,7 @@ mod tests {
             "
         );
 
-        assert!(!run_function_pass_v2::<RecognizeSimpleLoops>(&mut ctx, test).unwrap());
+        assert!(!run_function_pass::<RecognizeSimpleLoops>(&mut ctx, test).unwrap());
         assert!(BasicBlock::from_id(&ctx, header).comment().is_none());
     }
 
@@ -1008,7 +1008,7 @@ mod tests {
             "
         );
 
-        assert!(!run_function_pass_v2::<RecognizeSimpleLoops>(&mut ctx, test).unwrap());
+        assert!(!run_function_pass::<RecognizeSimpleLoops>(&mut ctx, test).unwrap());
         assert!(BasicBlock::from_id(&ctx, header).comment().is_none());
     }
 
@@ -1033,7 +1033,7 @@ mod tests {
             "
         );
 
-        assert!(run_function_pass_v2::<UnrollSimpleLoops>(&mut ctx, test).unwrap());
+        assert!(run_function_pass::<UnrollSimpleLoops>(&mut ctx, test).unwrap());
 
         let blocks = Function::from_id(&ctx, test)
             .iter()
@@ -1071,7 +1071,7 @@ mod tests {
             "
         );
 
-        assert!(run_function_pass_v2::<UnrollSimpleLoops>(&mut ctx, test).unwrap());
+        assert!(run_function_pass::<UnrollSimpleLoops>(&mut ctx, test).unwrap());
 
         let blocks = Function::from_id(&ctx, test)
             .iter()
@@ -1118,7 +1118,7 @@ mod tests {
             "
         );
 
-        assert!(run_function_pass_v2::<UnrollSimpleLoops>(&mut ctx, test).unwrap());
+        assert!(run_function_pass::<UnrollSimpleLoops>(&mut ctx, test).unwrap());
 
         // The exit block (which holds the live-out use) survives and keeps a param,
         // and every predecessor edge into it carries an argument for that param —
@@ -1142,7 +1142,7 @@ mod tests {
         // pipeline) merges the now-single-pred exit into its predecessor: the
         // live-out use must be rewritten to the incoming value, never left dangling
         // on the removed exit param.
-        let _ = run_function_pass_v2::<crate::cfg::SimplifyCfg>(&mut ctx, test);
+        let _ = run_function_pass::<crate::cfg::SimplifyCfg>(&mut ctx, test);
         let defined: rustc_hash::FxHashSet<ValueId> = Function::from_id(&ctx, test)
             .iter()
             .flat_map(|b| {
@@ -1226,9 +1226,9 @@ mod tests {
             "
         );
 
-        assert!(run_function_pass_v2::<UnrollSimpleLoops>(&mut ctx, test).unwrap());
+        assert!(run_function_pass::<UnrollSimpleLoops>(&mut ctx, test).unwrap());
         assert_no_dangling(&ctx, test);
-        let _ = run_function_pass_v2::<crate::cfg::SimplifyCfg>(&mut ctx, test);
+        let _ = run_function_pass::<crate::cfg::SimplifyCfg>(&mut ctx, test);
         assert_no_dangling(&ctx, test);
     }
 
@@ -1252,7 +1252,7 @@ mod tests {
             "
         );
 
-        assert!(!run_function_pass_v2::<UnrollSimpleLoops>(&mut ctx, test).unwrap());
+        assert!(!run_function_pass::<UnrollSimpleLoops>(&mut ctx, test).unwrap());
         let blocks = Function::from_id(&ctx, test)
             .iter()
             .map(|block| block.id)

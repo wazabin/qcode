@@ -718,12 +718,12 @@ fn remove_dead_counted_loop_host<'str, H: HostMut<'str>>(host: &mut H, fun_id: F
 
 // ----- pass ------------------------------------------------------------------
 
-use crate::{FunctionBody, FunctionPassV2, ModuleView};
+use crate::{FunctionBody, FunctionPass, ModuleView};
 
 #[derive(Default)]
 pub struct Dce;
 
-impl FunctionPassV2 for Dce {
+impl FunctionPass for Dce {
     const NAME: &'static str = "dce";
     fn description(&self) -> &'static str {
         "Remove unused pure instructions"
@@ -773,4 +773,4 @@ fn dce_core<'str, H: HostMut<'str>>(host: &mut H, fun_id: FunctionId) -> bool {
     changed
 }
 
-crate::register_function_pass_v2!(Dce);
+crate::register_function_pass!(Dce);

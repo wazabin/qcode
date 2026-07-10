@@ -26,7 +26,7 @@ use crate::loop_info::{
     recognize_loops, users_of,
 };
 use crate::pipeline::{FunctionBody, ModuleView};
-use crate::{FunctionPassV2, register_function_pass_v2};
+use crate::{FunctionPass, register_function_pass};
 
 // ===========================================================================
 // Total-map recognizer
@@ -396,7 +396,7 @@ pub(crate) fn recognize_total_map<'str>(
 #[derive(Default)]
 pub struct LoopToMap;
 
-impl FunctionPassV2 for LoopToMap {
+impl FunctionPass for LoopToMap {
     const NAME: &'static str = "loop_to_map";
     const MINTS: bool = true;
     fn description(&self) -> &'static str {
@@ -411,7 +411,7 @@ impl FunctionPassV2 for LoopToMap {
     }
 }
 
-register_function_pass_v2!(LoopToMap);
+register_function_pass!(LoopToMap);
 
 #[cfg(test)]
 mod tests {
@@ -426,15 +426,15 @@ mod tests {
     use crate::AliasResult;
     use crate::gvn::gvn_function;
     use crate::mem::array_promote::ArrayPromote;
-    use crate::test_util::run_function_pass_v2;
+    use crate::test_util::run_function_pass;
 
     /// Promote `fid`, mark it pure (the real pipeline functionalizes it before
     /// `loop_to_map`, which gates on purity), then fold its total map. Returns
     /// `(promoted, folded)`.
     fn promote_then_map(ctx: &mut Context, fid: FunctionId) -> (bool, bool) {
-        let promoted = run_function_pass_v2::<ArrayPromote>(ctx, fid).unwrap();
+        let promoted = run_function_pass::<ArrayPromote>(ctx, fid).unwrap();
         Function::from_id_mut(ctx, fid).set_is_pure(true);
-        let folded = run_function_pass_v2::<LoopToMap>(ctx, fid).unwrap();
+        let folded = run_function_pass::<LoopToMap>(ctx, fid).unwrap();
         (promoted, folded)
     }
 
@@ -446,12 +446,12 @@ mod tests {
     /// that the recognizer sees in practice.
     fn promote_collapse_map(ctx: &mut Context, fid: FunctionId) -> (bool, bool) {
         use crate::dce::remove_dead_block_args;
-        let promoted = run_function_pass_v2::<ArrayPromote>(ctx, fid).unwrap();
+        let promoted = run_function_pass::<ArrayPromote>(ctx, fid).unwrap();
         let blocks: Vec<BlockId> = Function::from_id(ctx, fid).iter().map(|b| b.id).collect();
         let root = Function::from_id(ctx, fid).root().map(|b| b.id);
         while remove_dead_block_args(ctx, &blocks, root) {}
         Function::from_id_mut(ctx, fid).set_is_pure(true);
-        let folded = run_function_pass_v2::<LoopToMap>(ctx, fid).unwrap();
+        let folded = run_function_pass::<LoopToMap>(ctx, fid).unwrap();
         (promoted, folded)
     }
 
@@ -835,7 +835,7 @@ mod tests {
         );
         // Promote + redundant-φ elimination → the fully header-carried, `Load`-init
         // map loop (identical to `fully_header_carried_fill_folds_after_collapse`).
-        assert!(run_function_pass_v2::<ArrayPromote>(&mut ctx, xorbuf).unwrap());
+        assert!(run_function_pass::<ArrayPromote>(&mut ctx, xorbuf).unwrap());
         let blocks: Vec<BlockId> = Function::from_id(&ctx, xorbuf)
             .iter()
             .map(|b| b.id)
@@ -875,7 +875,7 @@ mod tests {
 
         Function::from_id_mut(&mut ctx, xorbuf).set_is_pure(true);
         assert!(
-            run_function_pass_v2::<LoopToMap>(&mut ctx, xorbuf).unwrap(),
+            run_function_pass::<LoopToMap>(&mut ctx, xorbuf).unwrap(),
             "a param-init own-lane map must fold (the deleted Load-only guard blocked it)"
         );
         let ir = format!("{}", Function::from_id(&ctx, xorbuf));
@@ -923,10 +923,10 @@ mod tests {
                 return at i64 0x0;
             "
         );
-        assert!(run_function_pass_v2::<ArrayPromote>(&mut ctx, prefix).unwrap());
+        assert!(run_function_pass::<ArrayPromote>(&mut ctx, prefix).unwrap());
         Function::from_id_mut(&mut ctx, prefix).set_is_pure(true);
         assert!(
-            !run_function_pass_v2::<LoopToMap>(&mut ctx, prefix).unwrap(),
+            !run_function_pass::<LoopToMap>(&mut ctx, prefix).unwrap(),
             "a seeded scan is not a map"
         );
     }
@@ -958,10 +958,10 @@ mod tests {
                 return at i64 0x0;
             "
         );
-        run_function_pass_v2::<ArrayPromote>(&mut ctx, impure).unwrap();
+        run_function_pass::<ArrayPromote>(&mut ctx, impure).unwrap();
         Function::from_id_mut(&mut ctx, impure).set_is_pure(true);
         assert!(
-            !run_function_pass_v2::<LoopToMap>(&mut ctx, impure).unwrap(),
+            !run_function_pass::<LoopToMap>(&mut ctx, impure).unwrap(),
             "an impure body must not fold to a map"
         );
     }

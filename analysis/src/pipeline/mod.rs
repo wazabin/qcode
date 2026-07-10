@@ -38,8 +38,9 @@ pub(crate) fn install_minted_for_test<'str>(
     pass::install_minted(ctx, "test", minted).expect("minted install");
 }
 pub use pass::{
-    DecompilePass, DynDecompilePass, DynFunctionPass, DynPass, FunctionPassV2, Pass,
-    PassRegistration, PipelineEnv, RegisteredPass, V2Adapter, known_pass_names, make_pass,
+    DecompilePass, DynDecompilePass, DynFunctionPass, DynPass, FunctionPass, FunctionPassAdapter,
+    Pass, PassRegistration,
+    PipelineEnv, RegisteredPass, known_pass_names, make_pass,
 };
 
 use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};

@@ -1,11 +1,11 @@
-//! Example pass. The smallest [`FunctionPassV2`]: it reads its own function's
+//! Example pass. The smallest [`FunctionPass`]: it reads its own function's
 //! interface and mutates nothing.
-use crate::{FunctionBody, FunctionPassV2, ModuleView};
+use crate::{FunctionBody, FunctionPass, ModuleView};
 
 #[derive(Default)]
 pub struct ExamplePass;
 
-impl FunctionPassV2 for ExamplePass {
+impl FunctionPass for ExamplePass {
     const NAME: &'static str = "example";
 
     fn description(&self) -> &'static str {
@@ -26,7 +26,7 @@ impl FunctionPassV2 for ExamplePass {
     }
 }
 
-crate::register_function_pass_v2!(ExamplePass);
+crate::register_function_pass!(ExamplePass);
 
 #[cfg(test)]
 mod tests {
@@ -34,7 +34,7 @@ mod tests {
     use qcode_macro::qcode;
 
     use super::*;
-    use crate::test_util::run_function_pass_v2;
+    use crate::test_util::run_function_pass;
 
     #[test]
     fn named_functions() {
@@ -49,6 +49,6 @@ mod tests {
             "
         );
 
-        run_function_pass_v2::<ExamplePass>(&mut ctx, foo).unwrap();
+        run_function_pass::<ExamplePass>(&mut ctx, foo).unwrap();
     }
 }

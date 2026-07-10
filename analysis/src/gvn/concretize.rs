@@ -5,7 +5,7 @@
 //! [`EmulateMap`](super::emulate_map::EmulateMap), and
 //! [`ArrayProject`](super::array_project::ArrayProject) all read (emulate/inline)
 //! a *pure callee's* body — an interprocedural read the parallel-safe
-//! [`FunctionPassV2`](crate::FunctionPassV2) contract forbids a function pass
+//! [`FunctionPass`](crate::FunctionPass) contract forbids a function pass
 //! from doing. They are therefore a module pass: it owns `&mut Context` and may
 //! read any function's body directly.
 //!

@@ -232,7 +232,7 @@ where
 }
 
 // Own-instruction mutations written once against any [`HostMut`], so a
-// `FunctionPassV2` can retype and rename the instructions it owns whether the
+// `FunctionPass` can retype and rename the instructions it owns whether the
 // function lives in the module registry or has been checked out. Mirror the
 // `&mut Context`-only [`InstructionMutRef::set_type`] / `Renameable` impls.
 impl<'str, Ctx> BaseRef<Ctx, InstructionId>

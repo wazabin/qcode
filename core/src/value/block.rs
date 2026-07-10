@@ -604,7 +604,7 @@ where
     /// Sets this block's name and registers it in the owning function's local name
     /// table (own-block edit, host-routed). Mirrors the `Renameable` impls for the
     /// concrete module / checked-out block refs, but works over any [`HostMut`], so
-    /// a `FunctionPassV2` can name the blocks it mints. Returns an error only on a
+    /// a `FunctionPass` can name the blocks it mints. Returns an error only on a
     /// duplicate name.
     pub fn rename_local(&mut self, name: Cow<'str, str>) -> crate::error::Result<()> {
         let old_name = self

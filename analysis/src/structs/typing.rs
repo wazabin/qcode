@@ -32,12 +32,12 @@ use qcode::{
     },
 };
 
-use crate::{FunctionBody, FunctionPassV2, ModuleView};
+use crate::{FunctionBody, FunctionPass, ModuleView};
 
 #[derive(Default)]
 pub struct StructTyping;
 
-impl FunctionPassV2 for StructTyping {
+impl FunctionPass for StructTyping {
     const NAME: &'static str = "struct_typing";
 
     fn description(&self) -> &'static str {
@@ -324,7 +324,7 @@ fn const_offset(host: HostRef, op: ValueId) -> Option<usize> {
     Some(lit.value as usize)
 }
 
-crate::register_function_pass_v2!(StructTyping);
+crate::register_function_pass!(StructTyping);
 
 #[cfg(test)]
 mod tests {
@@ -332,7 +332,7 @@ mod tests {
     use qcode_macro::qcode;
 
     use super::*;
-    use crate::test_util::run_function_pass_v2;
+    use crate::test_util::run_function_pass;
     use qcode::context::Context;
 
     /// Collect the `gep` statements of a function in program order.
@@ -370,7 +370,7 @@ mod tests {
             "
         );
 
-        let changed = run_function_pass_v2::<StructTyping>(&mut ctx, f).unwrap();
+        let changed = run_function_pass::<StructTyping>(&mut ctx, f).unwrap();
         assert!(changed);
 
         // Both hops became named geps.
@@ -420,7 +420,7 @@ mod tests {
             "
         );
 
-        run_function_pass_v2::<StructTyping>(&mut ctx, f).unwrap();
+        run_function_pass::<StructTyping>(&mut ctx, f).unwrap();
 
         // The `Root*` value `%x` and the `Inner*` value `%y` are renamed after
         // the structs they reference. Value names are function-scoped, so resolve
@@ -451,7 +451,7 @@ mod tests {
             "
         );
 
-        run_function_pass_v2::<StructTyping>(&mut ctx, f).unwrap();
+        run_function_pass::<StructTyping>(&mut ctx, f).unwrap();
 
         // No field at 0x99 and a non-constant offset: neither is lowered to gep.
         assert!(gep_strings(&ctx, f).is_empty());

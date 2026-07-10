@@ -274,7 +274,7 @@ mod tests {
     };
 
     use crate::mem::array_promote::ArrayPromote;
-    use crate::test_util::run_function_pass_v2;
+    use crate::test_util::run_function_pass;
 
     // Reuse ArrayPromote to *produce* the promoted single-array shape from the
     // prefix-sum IR, so the matcher is tested against the exact IR array_promote
@@ -310,7 +310,7 @@ mod tests {
             "
         );
         assert!(
-            run_function_pass_v2::<ArrayPromote>(&mut ctx, prefix).unwrap(),
+            run_function_pass::<ArrayPromote>(&mut ctx, prefix).unwrap(),
             "array_promote should promote the prefix sum"
         );
         let ca = find_carried_array(&ctx, prefix).expect("carried array found");
@@ -349,7 +349,7 @@ mod tests {
             "
         );
         assert!(
-            run_function_pass_v2::<ArrayPromote>(ctx, xorbuf).unwrap(),
+            run_function_pass::<ArrayPromote>(ctx, xorbuf).unwrap(),
             "the header-carried fill should promote"
         );
         xorbuf
@@ -435,7 +435,7 @@ mod tests {
                 return at i64 0x0;
             "
         );
-        assert!(run_function_pass_v2::<ArrayPromote>(&mut ctx, reg_rot).unwrap());
+        assert!(run_function_pass::<ArrayPromote>(&mut ctx, reg_rot).unwrap());
         let ca = find_carried_array(&ctx, reg_rot).expect("rotated carry matches");
         assert_eq!(ca.header, ca.body, "rotated: the body is its own header");
         assert_eq!(param_parent(&ctx, ca.index), Some(ca.body));

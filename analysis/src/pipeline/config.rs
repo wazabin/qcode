@@ -1534,39 +1534,38 @@ async fn run_function_stage(
     // (empty) shell arena. Everything else — tiny worklists, `QCODE_THREADS=1`,
     // wasm — runs the sequential loop below, byte-for-byte identical.
     let threads = resolve_threads();
-    let parallel_set: HashSet<FunctionId> =
-        if threads > 1 && fun_ids.len() >= PARALLEL_THRESHOLD {
-            let entangled = entangled_functions(ctx, &fun_ids);
-            let eligible: Vec<FunctionId> = fun_ids
-                .iter()
-                .copied()
-                .filter(|f| !entangled.contains(f))
-                .collect();
-            if eligible.len() >= PARALLEL_THRESHOLD {
-                run_stage_parallel(
-                    ctx,
-                    env,
-                    stage,
-                    passes,
-                    &eligible,
-                    &stage_name,
-                    total,
-                    round,
-                    cache,
-                    &mut elapsed,
-                    &mut dirty,
-                    &mut reservations,
-                    &mut leftover,
-                    threads,
-                    progress,
-                )?;
-                eligible.into_iter().collect()
-            } else {
-                HashSet::default()
-            }
+    let parallel_set: HashSet<FunctionId> = if threads > 1 && fun_ids.len() >= PARALLEL_THRESHOLD {
+        let entangled = entangled_functions(ctx, &fun_ids);
+        let eligible: Vec<FunctionId> = fun_ids
+            .iter()
+            .copied()
+            .filter(|f| !entangled.contains(f))
+            .collect();
+        if eligible.len() >= PARALLEL_THRESHOLD {
+            run_stage_parallel(
+                ctx,
+                env,
+                stage,
+                passes,
+                &eligible,
+                &stage_name,
+                total,
+                round,
+                cache,
+                &mut elapsed,
+                &mut dirty,
+                &mut reservations,
+                &mut leftover,
+                threads,
+                progress,
+            )?;
+            eligible.into_iter().collect()
         } else {
             HashSet::default()
-        };
+        }
+    } else {
+        HashSet::default()
+    };
 
     // The sequential lane: functions not handled in parallel above (all of them
     // when the stage did not parallelize; only the entangled remainder when it did).

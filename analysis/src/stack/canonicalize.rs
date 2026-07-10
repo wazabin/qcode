@@ -125,7 +125,7 @@ pub fn canonicalize_sp_slots<'str, H: HostMut<'str>>(
 
 // ----- pass ------------------------------------------------------------------
 
-use crate::{FunctionBody, FunctionPassV2, ModuleView};
+use crate::{FunctionBody, FunctionPass, ModuleView};
 
 /// Runs [`canonicalize_sp_slots`] over a function, resolving `@SP` from the
 /// configured stack-pointer register. Replaces the legacy `brighten`/`lower_stack`
@@ -135,7 +135,7 @@ use crate::{FunctionBody, FunctionPassV2, ModuleView};
 #[derive(Default)]
 pub struct CanonicalizeSpSlots;
 
-impl FunctionPassV2 for CanonicalizeSpSlots {
+impl FunctionPass for CanonicalizeSpSlots {
     const NAME: &'static str = "canonicalize_sp_slots";
     fn description(&self) -> &'static str {
         "Canonicalize @SP±N stack slots to one representative per offset"
@@ -152,7 +152,7 @@ impl FunctionPassV2 for CanonicalizeSpSlots {
     }
 }
 
-crate::register_function_pass_v2!(CanonicalizeSpSlots);
+crate::register_function_pass!(CanonicalizeSpSlots);
 
 #[cfg(test)]
 mod tests {

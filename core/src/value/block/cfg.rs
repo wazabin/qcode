@@ -78,7 +78,7 @@ impl<'s, 'ctx: 's, 'str: 'ctx> WithCtx<'s, 's, 'str> for EdgeMutRef<'str, 'ctx> 
 // The CFG is inherently per-function: its nodes are the function's own blocks.
 // Dominator analysis needs only the successor relation (see jstd's `Cfg`), which
 // [`BlockRef::successors`] already routes through the function's [`HostRef`], so
-// it reads a *checked-out* function correctly inside a `FunctionPassV2`.
+// it reads a *checked-out* function correctly inside a `FunctionPass`.
 // ---------------------------------------------------------------------------
 
 impl<'str, 'ctx> Cfg for FunctionRef<'str, 'ctx> {

@@ -715,9 +715,9 @@ fn apply<'str, H: HostMut<'str>>(host: &mut H, m: &PromoteMatch) -> bool {
     true
 }
 
-use crate::{FunctionBody, FunctionPassV2, ModuleView};
+use crate::{FunctionBody, FunctionPass, ModuleView};
 
-impl FunctionPassV2 for ArrayPromote {
+impl FunctionPass for ArrayPromote {
     const NAME: &'static str = "array_promote";
 
     fn description(&self) -> &'static str {
@@ -738,14 +738,14 @@ impl FunctionPassV2 for ArrayPromote {
     }
 }
 
-crate::register_function_pass_v2!(ArrayPromote);
+crate::register_function_pass!(ArrayPromote);
 
 #[cfg(test)]
 mod tests {
     use qcode_macro::qcode;
 
     use super::*;
-    use crate::test_util::run_function_pass_v2;
+    use crate::test_util::run_function_pass;
     use qcode::context::Context;
     use qcode::value::{BasicBlock, Function};
 
@@ -782,7 +782,7 @@ mod tests {
                 return at i64 0x0;
             "
         );
-        let changed = run_function_pass_v2::<ArrayPromote>(&mut ctx, fill).unwrap();
+        let changed = run_function_pass::<ArrayPromote>(&mut ctx, fill).unwrap();
         assert!(changed, "the memory-carried fill should be recognized");
         let ir = format!("{}", Function::from_id(&ctx, fill));
         assert!(ir.contains("$at("), "lane load should become at(): {ir}");
@@ -831,7 +831,7 @@ mod tests {
                 return at i64 0x0;
             "
         );
-        let changed = run_function_pass_v2::<ArrayPromote>(&mut ctx, reg_rot).unwrap();
+        let changed = run_function_pass::<ArrayPromote>(&mut ctx, reg_rot).unwrap();
         let ir = format!("{}", Function::from_id(&ctx, reg_rot));
         assert!(
             changed,
@@ -875,7 +875,7 @@ mod tests {
                 return at i64 0x0;
             "
         );
-        let changed = run_function_pass_v2::<ArrayPromote>(&mut ctx, reg_split).unwrap();
+        let changed = run_function_pass::<ArrayPromote>(&mut ctx, reg_split).unwrap();
         let ir = format!("{}", Function::from_id(&ctx, reg_split));
         assert!(
             changed,
@@ -916,7 +916,7 @@ mod tests {
                 return at i64 0x0;
             "
         );
-        let changed = run_function_pass_v2::<ArrayPromote>(&mut ctx, generate).unwrap();
+        let changed = run_function_pass::<ArrayPromote>(&mut ctx, generate).unwrap();
         let ir = format!("{}", Function::from_id(&ctx, generate));
         assert!(changed, "a write-only generated fill should promote: {ir}");
         assert!(
@@ -962,7 +962,7 @@ mod tests {
                 return at i64 0x0;
             "
         );
-        let changed = run_function_pass_v2::<ArrayPromote>(&mut ctx, mix).unwrap();
+        let changed = run_function_pass::<ArrayPromote>(&mut ctx, mix).unwrap();
         let ir = format!("{}", Function::from_id(&ctx, mix));
         assert!(changed, "the enveloped byte fill should promote: {ir}");
         assert!(ir.contains("$at("), "lane load becomes at(): {ir}");
@@ -1014,7 +1014,7 @@ mod tests {
                 return at i64 %r;
             "
         );
-        let changed = run_function_pass_v2::<ArrayPromote>(&mut ctx, mix).unwrap();
+        let changed = run_function_pass::<ArrayPromote>(&mut ctx, mix).unwrap();
         let ir = format!("{}", Function::from_id(&ctx, mix));
         assert!(changed, "should promote: {ir}");
         assert!(
@@ -1063,7 +1063,7 @@ mod tests {
                 return at i64 0x0;
             "
         );
-        let changed = run_function_pass_v2::<ArrayPromote>(&mut ctx, f).unwrap();
+        let changed = run_function_pass::<ArrayPromote>(&mut ctx, f).unwrap();
         let ir = format!("{}", Function::from_id(&ctx, f));
         assert!(changed, "header-carried byte fill should promote: {ir}");
         assert!(ir.contains("$at("), "lane load becomes at(): {ir}");
@@ -1105,7 +1105,7 @@ mod tests {
                 return at i64 0x0;
             "
         );
-        let changed = run_function_pass_v2::<ArrayPromote>(&mut ctx, f).unwrap();
+        let changed = run_function_pass::<ArrayPromote>(&mut ctx, f).unwrap();
         let ir = format!("{}", Function::from_id(&ctx, f));
         assert!(
             changed,
@@ -1149,7 +1149,7 @@ mod tests {
                 return at i64 0x0;
             "
         );
-        let changed = run_function_pass_v2::<ArrayPromote>(&mut ctx, mix).unwrap();
+        let changed = run_function_pass::<ArrayPromote>(&mut ctx, mix).unwrap();
         let ir = format!("{}", Function::from_id(&ctx, mix));
         assert!(changed, "a partial pre-loop store should not block: {ir}");
         assert!(ir.contains("$insert("), "lane store becomes insert(): {ir}");
@@ -1183,7 +1183,7 @@ mod tests {
                 return at i64 0x0;
             "
         );
-        let changed = run_function_pass_v2::<ArrayPromote>(&mut ctx, mix).unwrap();
+        let changed = run_function_pass::<ArrayPromote>(&mut ctx, mix).unwrap();
         assert!(
             !changed,
             "a whole-region store in the body must block promotion"
@@ -1220,9 +1220,9 @@ mod tests {
                 return at i64 0x0;
             "
         );
-        assert!(run_function_pass_v2::<ArrayPromote>(&mut ctx, fill).unwrap());
+        assert!(run_function_pass::<ArrayPromote>(&mut ctx, fill).unwrap());
         assert!(
-            !run_function_pass_v2::<ArrayPromote>(&mut ctx, fill).unwrap(),
+            !run_function_pass::<ArrayPromote>(&mut ctx, fill).unwrap(),
             "second run should find nothing to promote"
         );
     }
@@ -1262,7 +1262,7 @@ mod tests {
             "
         );
         assert!(
-            run_function_pass_v2::<ArrayPromote>(&mut ctx, reads_orig).unwrap(),
+            run_function_pass::<ArrayPromote>(&mut ctx, reads_orig).unwrap(),
             "an original-lane read should promote via an original init"
         );
         let ir = format!("{}", Function::from_id(&ctx, reads_orig));
@@ -1309,7 +1309,7 @@ mod tests {
             "
         );
         assert!(
-            run_function_pass_v2::<ArrayPromote>(&mut ctx, reads_enum).unwrap(),
+            run_function_pass::<ArrayPromote>(&mut ctx, reads_enum).unwrap(),
             "a seedless indexed map over the original array should promote"
         );
         let ir = format!("{}", Function::from_id(&ctx, reads_enum));
@@ -1360,7 +1360,7 @@ mod tests {
                 return at i64 0x0;
             "
         );
-        assert!(run_function_pass_v2::<ArrayPromote>(&mut ctx, shared).unwrap());
+        assert!(run_function_pass::<ArrayPromote>(&mut ctx, shared).unwrap());
         // Count array-typed params reaching the body: exactly one carried array.
         let body = Function::from_id(&ctx, shared)
             .iter()
@@ -1412,7 +1412,7 @@ mod tests {
         // A single lane store, then an own-lane load *after* it: the load no longer
         // observes the original value, so the program-order check declines.
         assert!(
-            !run_function_pass_v2::<ArrayPromote>(&mut ctx, after).unwrap(),
+            !run_function_pass::<ArrayPromote>(&mut ctx, after).unwrap(),
             "an own-lane read after the lane store must not promote"
         );
     }

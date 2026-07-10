@@ -5,12 +5,12 @@ use qcode::value::{
     util::host_mut::HostMut,
 };
 
-use crate::{FunctionBody, FunctionPassV2, ModuleView};
+use crate::{FunctionBody, FunctionPass, ModuleView};
 
 #[derive(Default)]
 pub struct SimplifyCfg;
 
-impl FunctionPassV2 for SimplifyCfg {
+impl FunctionPass for SimplifyCfg {
     const NAME: &'static str = "simplify_cfg";
 
     fn description(&self) -> &'static str {
@@ -28,7 +28,7 @@ impl FunctionPassV2 for SimplifyCfg {
     }
 }
 
-crate::register_function_pass_v2!(SimplifyCfg);
+crate::register_function_pass!(SimplifyCfg);
 
 /// Simplifies the CFG of `function_id` to a fixpoint. Each round applies, in
 /// priority order, the first transform that fits any block:

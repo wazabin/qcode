@@ -2035,7 +2035,7 @@ mod tests {
     fn array_promote_leftover_init_store_is_swept() {
         use crate::gvn::Gvn;
         use crate::mem::array_promote::ArrayPromote;
-        use crate::test_util::run_function_pass_v2;
+        use crate::test_util::run_function_pass;
 
         let mut ctx = Context::new();
         qcode!(
@@ -2062,10 +2062,10 @@ mod tests {
             "
         );
         assert!(
-            run_function_pass_v2::<ArrayPromote>(&mut ctx, mix).unwrap(),
+            run_function_pass::<ArrayPromote>(&mut ctx, mix).unwrap(),
             "the enveloped byte fill should promote"
         );
-        run_function_pass_v2::<Gvn>(&mut ctx, mix).unwrap();
+        run_function_pass::<Gvn>(&mut ctx, mix).unwrap();
         let aliases = crate::AliasResult::simple(&ctx);
         remove_dead_load_insns(&mut ctx, mix, Some(&aliases), &[]);
         // Only the exit write-back of the carried array survives; the init store and
@@ -2112,12 +2112,12 @@ mod tests {
 
 // ----- pass ------------------------------------------------------------------
 
-use crate::{FunctionBody, FunctionPassV2, ModuleView};
+use crate::{FunctionBody, FunctionPass, ModuleView};
 
 #[derive(Default)]
 pub struct DeadLoad;
 
-impl FunctionPassV2 for DeadLoad {
+impl FunctionPass for DeadLoad {
     const NAME: &'static str = "dead_load";
     fn description(&self) -> &'static str {
         "Remove dead memory loads"
@@ -2139,7 +2139,7 @@ impl FunctionPassV2 for DeadLoad {
     }
 }
 
-crate::register_function_pass_v2!(DeadLoad);
+crate::register_function_pass!(DeadLoad);
 
 /// Lives here (not in the orphaned `dead_store.rs`) because it shares
 /// [`remove_dead_load_insns_host`] with [`DeadLoad`]; the only difference is that
@@ -2147,7 +2147,7 @@ crate::register_function_pass_v2!(DeadLoad);
 #[derive(Default)]
 pub struct DeadStore;
 
-impl FunctionPassV2 for DeadStore {
+impl FunctionPass for DeadStore {
     const NAME: &'static str = "dead_store";
     fn description(&self) -> &'static str {
         "Remove dead register loads and overwritten flag stores"
@@ -2170,7 +2170,7 @@ impl FunctionPassV2 for DeadStore {
     }
 }
 
-crate::register_function_pass_v2!(DeadStore);
+crate::register_function_pass!(DeadStore);
 
 /// Build a per-function alias oracle with frame-freshness populated (the same way
 /// [`crate::gvn::Gvn`] does), so the dead-store/dead-load scans get the

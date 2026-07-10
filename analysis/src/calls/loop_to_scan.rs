@@ -51,7 +51,7 @@ use crate::loop_info::{
     param_parent, param_pos,
 };
 use crate::pipeline::{FunctionBody, ModuleView};
-use crate::{FunctionPassV2, register_function_pass_v2};
+use crate::{FunctionPass, register_function_pass};
 
 #[derive(Default)]
 pub struct LoopToScan;
@@ -430,7 +430,7 @@ fn apply<'str>(mv: &ModuleView<'_, 'str>, body: &mut FunctionBody<'str>, m: &Sca
     true
 }
 
-impl FunctionPassV2 for LoopToScan {
+impl FunctionPass for LoopToScan {
     const NAME: &'static str = "loop_to_scan";
     const MINTS: bool = true;
 
@@ -450,7 +450,7 @@ impl FunctionPassV2 for LoopToScan {
     }
 }
 
-register_function_pass_v2!(LoopToScan);
+register_function_pass!(LoopToScan);
 
 #[cfg(test)]
 mod tests {
@@ -460,7 +460,7 @@ mod tests {
     use qcode::{context::Context, value::Function};
 
     use crate::mem::array_promote::ArrayPromote;
-    use crate::test_util::run_function_pass_v2;
+    use crate::test_util::run_function_pass;
 
     // The exact seam this rewrite touches: `array_promote` promotes the seeded
     // prefix sum `out[0]=seed; out[i]=out[i-1]+l[i]` into a single carried array
@@ -499,11 +499,11 @@ mod tests {
             "
         );
         assert!(
-            run_function_pass_v2::<ArrayPromote>(&mut ctx, prefix).unwrap(),
+            run_function_pass::<ArrayPromote>(&mut ctx, prefix).unwrap(),
             "array_promote should promote the prefix sum"
         );
         assert!(
-            run_function_pass_v2::<LoopToScan>(&mut ctx, prefix).unwrap(),
+            run_function_pass::<LoopToScan>(&mut ctx, prefix).unwrap(),
             "loop_to_scan should fold the promoted single-array loop"
         );
         let ir = format!("{}", Function::from_id(&ctx, prefix));
@@ -550,11 +550,11 @@ mod tests {
             "
         );
         assert!(
-            run_function_pass_v2::<ArrayPromote>(&mut ctx, prefix).unwrap(),
+            run_function_pass::<ArrayPromote>(&mut ctx, prefix).unwrap(),
             "the header-carried prefix sum should promote"
         );
         assert!(
-            !run_function_pass_v2::<LoopToScan>(&mut ctx, prefix).unwrap(),
+            !run_function_pass::<LoopToScan>(&mut ctx, prefix).unwrap(),
             "scan v1 must decline the header-carried index shape"
         );
         let ir = format!("{}", Function::from_id(&ctx, prefix));

@@ -31,7 +31,7 @@ use qcode::{
 
 use crate::loop_info::{delete_private_loop, incoming, is_increment, literal, users_of};
 use crate::pipeline::{FunctionBody, ModuleView};
-use crate::{FunctionPassV2, register_function_pass_v2};
+use crate::{FunctionPass, register_function_pass};
 
 fn is_temp(host: HostRef, s: SpaceId) -> bool {
     matches!(Space::from_id(host.shared(), s).ty, SpaceType::Temporary)
@@ -540,7 +540,7 @@ fn recognize_strlen_ptr<'str>(m: &ModuleView<'_, 'str>, body: &mut FunctionBody<
 #[derive(Default)]
 pub struct Strlen;
 
-impl FunctionPassV2 for Strlen {
+impl FunctionPass for Strlen {
     const NAME: &'static str = "strlen";
     fn description(&self) -> &'static str {
         "Rewrite a bounded NUL-scan as len(take_while(arr)) (snapshot and raw-pointer forms)"
@@ -558,7 +558,7 @@ impl FunctionPassV2 for Strlen {
     }
 }
 
-register_function_pass_v2!(Strlen);
+register_function_pass!(Strlen);
 
 #[cfg(test)]
 mod tests {
@@ -570,7 +570,7 @@ mod tests {
         value::{BasicBlock, Function, Value, insn::Mnemonic},
     };
 
-    use crate::test_util::run_function_pass_v2;
+    use crate::test_util::run_function_pass;
 
     // ===== recognizer (two-buffer) =========================================
 
@@ -795,11 +795,11 @@ mod tests {
         let (fid, exit, arr) = build_strlen_loop(&mut tc, /*extra_break*/ false);
 
         assert!(
-            run_function_pass_v2::<crate::mem::array_reads::ArrayReads>(&mut tc.ctx, fid).unwrap(),
+            run_function_pass::<crate::mem::array_reads::ArrayReads>(&mut tc.ctx, fid).unwrap(),
             "array_reads promotes the read-only shadow snapshot to at(@arr, i)"
         );
         assert!(
-            run_function_pass_v2::<Strlen>(&mut tc.ctx, fid).unwrap(),
+            run_function_pass::<Strlen>(&mut tc.ctx, fid).unwrap(),
             "bounded NUL-scan must recognize on the at-form"
         );
         assert_eq!(
@@ -824,9 +824,9 @@ mod tests {
         let mut tc = TestContext::new();
         let (fid, exit, _arr) = build_strlen_loop(&mut tc, /*extra_break*/ true);
 
-        run_function_pass_v2::<crate::mem::array_reads::ArrayReads>(&mut tc.ctx, fid).unwrap();
+        run_function_pass::<crate::mem::array_reads::ArrayReads>(&mut tc.ctx, fid).unwrap();
         assert!(
-            !run_function_pass_v2::<Strlen>(&mut tc.ctx, fid).unwrap(),
+            !run_function_pass::<Strlen>(&mut tc.ctx, fid).unwrap(),
             "a loop with a second exit is not a NUL-scan strlen"
         );
         assert_eq!(
@@ -845,11 +845,11 @@ mod tests {
             build_copy_loop(&mut tc, /*distinct_dst*/ true, /*stray*/ false);
 
         assert!(
-            !run_function_pass_v2::<crate::mem::array_reads::ArrayReads>(&mut tc.ctx, fid).unwrap(),
+            !run_function_pass::<crate::mem::array_reads::ArrayReads>(&mut tc.ctx, fid).unwrap(),
             "array_reads declines a region with a store"
         );
         assert!(
-            !run_function_pass_v2::<Strlen>(&mut tc.ctx, fid).unwrap(),
+            !run_function_pass::<Strlen>(&mut tc.ctx, fid).unwrap(),
             "a loop that stores is not a read-only NUL-scan"
         );
         assert_eq!(
@@ -942,7 +942,7 @@ mod tests {
         let (fid, exit, s0) = build_strlen_ptr_loop(&mut tc, /*with_diff*/ true);
 
         assert!(
-            run_function_pass_v2::<Strlen>(&mut tc.ctx, fid).unwrap(),
+            run_function_pass::<Strlen>(&mut tc.ctx, fid).unwrap(),
             "raw-pointer NUL-scan must recognize"
         );
         assert_eq!(
@@ -974,7 +974,7 @@ mod tests {
         let (fid, exit, _s0) = build_strlen_ptr_loop(&mut tc, /*with_diff*/ false);
 
         assert!(
-            !run_function_pass_v2::<Strlen>(&mut tc.ctx, fid).unwrap(),
+            !run_function_pass::<Strlen>(&mut tc.ctx, fid).unwrap(),
             "no end-base difference means nothing to rewrite"
         );
         assert_eq!(

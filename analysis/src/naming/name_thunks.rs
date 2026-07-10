@@ -22,12 +22,12 @@ use qcode::value::{
     util::{base_ref::HostRef, host_mut::HostMut},
 };
 
-use crate::{FunctionBody, FunctionPassV2, ModuleView};
+use crate::{FunctionBody, FunctionPass, ModuleView};
 
 #[derive(Default)]
 pub struct NameThunks;
 
-impl FunctionPassV2 for NameThunks {
+impl FunctionPass for NameThunks {
     const NAME: &'static str = "name_thunks";
 
     fn description(&self) -> &'static str {
@@ -92,12 +92,12 @@ fn thunk_target(host: HostRef, fun_id: FunctionId) -> Option<FunctionId> {
     (callee.id != fun_id).then_some(callee.id)
 }
 
-crate::register_function_pass_v2!(NameThunks);
+crate::register_function_pass!(NameThunks);
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::test_util::run_function_pass_v2;
+    use crate::test_util::run_function_pass;
     use qcode::builder::Builder;
     use qcode::context::Context;
     use qcode::value::{BasicBlock, BlockId, Function};
@@ -130,7 +130,7 @@ mod tests {
         let callee = make_callee(&mut ctx, "realfunc");
         let f = make_thunk(&mut ctx, "fn_1000", callee);
 
-        let changed = run_function_pass_v2::<NameThunks>(&mut ctx, f).unwrap();
+        let changed = run_function_pass::<NameThunks>(&mut ctx, f).unwrap();
         assert!(changed);
         assert_eq!(Function::from_id(&ctx, f).name(), "thunk_realfunc");
     }
@@ -142,7 +142,7 @@ mod tests {
         let callee = make_callee(&mut ctx, "realfunc");
         let f = make_thunk(&mut ctx, "helper", callee);
 
-        let changed = run_function_pass_v2::<NameThunks>(&mut ctx, f).unwrap();
+        let changed = run_function_pass::<NameThunks>(&mut ctx, f).unwrap();
         assert!(!changed);
         assert_eq!(Function::from_id(&ctx, f).name(), "helper");
     }
@@ -156,7 +156,7 @@ mod tests {
         // A second block (owned by `f`) means it is no longer a lone-jump thunk.
         let _extra = BasicBlock::make(&mut ctx, f).with_address(0x1008).id;
 
-        let changed = run_function_pass_v2::<NameThunks>(&mut ctx, f).unwrap();
+        let changed = run_function_pass::<NameThunks>(&mut ctx, f).unwrap();
         assert!(!changed);
     }
 }

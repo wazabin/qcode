@@ -3600,12 +3600,12 @@ mod tests {
 
 // ----- pass ------------------------------------------------------------------
 
-use crate::{FunctionBody, FunctionPassV2, ModuleView};
+use crate::{FunctionBody, FunctionPass, ModuleView};
 
 #[derive(Default)]
 pub struct Mem2RegPass;
 
-impl FunctionPassV2 for Mem2RegPass {
+impl FunctionPass for Mem2RegPass {
     const NAME: &'static str = "mem2reg";
     fn description(&self) -> &'static str {
         "Promote memory loads/stores to SSA block params"
@@ -3647,4 +3647,4 @@ impl FunctionPassV2 for Mem2RegPass {
     }
 }
 
-crate::register_function_pass_v2!(Mem2RegPass);
+crate::register_function_pass!(Mem2RegPass);

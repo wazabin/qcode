@@ -159,13 +159,13 @@ pub(crate) fn gvn_host<'str, H: HostMut<'str>>(
 
 // ----- passes ----------------------------------------------------------------
 
-use crate::{FunctionBody, FunctionPassV2, ModuleView};
+use crate::{FunctionBody, FunctionPass, ModuleView};
 use qcode::value::util::base_ref::HostRef;
 
 #[derive(Default)]
 pub struct ConstFold;
 
-impl FunctionPassV2 for ConstFold {
+impl FunctionPass for ConstFold {
     const NAME: &'static str = "const_fold";
     fn description(&self) -> &'static str {
         "Fold pointer/integer arithmetic into literals"
@@ -181,12 +181,12 @@ impl FunctionPassV2 for ConstFold {
     }
 }
 
-crate::register_function_pass_v2!(ConstFold);
+crate::register_function_pass!(ConstFold);
 
 #[derive(Default)]
 pub struct Narrow;
 
-impl FunctionPassV2 for Narrow {
+impl FunctionPass for Narrow {
     const NAME: &'static str = "narrow";
     fn description(&self) -> &'static str {
         "Sink low-word truncations through arithmetic, cancelling widenings"
@@ -202,7 +202,7 @@ impl FunctionPassV2 for Narrow {
     }
 }
 
-crate::register_function_pass_v2!(Narrow);
+crate::register_function_pass!(Narrow);
 
 /// Build the per-function alias oracle exactly as the V1 `Gvn` pass did, but over
 /// the checked-out body (read through `host`). Reuses the shared, function-
@@ -226,7 +226,7 @@ fn build_gvn_aliases<'a, 'str: 'a>(
 #[derive(Default)]
 pub struct Gvn;
 
-impl FunctionPassV2 for Gvn {
+impl FunctionPass for Gvn {
     const NAME: &'static str = "gvn";
     fn description(&self) -> &'static str {
         "Global value numbering and constant folding"
@@ -249,4 +249,4 @@ impl FunctionPassV2 for Gvn {
     }
 }
 
-crate::register_function_pass_v2!(Gvn);
+crate::register_function_pass!(Gvn);
