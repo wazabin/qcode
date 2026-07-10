@@ -4,4 +4,4 @@ mod discovery;
 mod split;
 
 pub use discovery::{discover_addresses_in_binary, lift_new_addresses};
-pub use split::split_overlapping_functions;
+pub use split::{has_cross_function_reference, split_overlapping_functions};

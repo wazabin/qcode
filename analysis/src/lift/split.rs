@@ -37,6 +37,26 @@ use qcode::{
 /// Safety cap on fixpoint rounds (promotion + reattribution both monotonic).
 const MAX_ROUNDS: usize = 64;
 
+/// Whether any block references a block owned by (or stored in) a *different*
+/// function — a cross-function CFG edge or a terminator whose static target block
+/// belongs to another function (a thunk / tail-call `Branch`, a cross-function
+/// `jcc`). This is precisely the state [`split_overlapping_functions`] normalizes
+/// away (strict IR locality, context-split ruling 2); the optimization entry uses
+/// it to skip a needless clone+normalize on IR that is already local (every
+/// lifter-driven discovery round leaves the clean IR in that state).
+pub fn has_cross_function_reference(ctx: &Context) -> bool {
+    let owner_of = |b: BlockId| BasicBlock::from_id(ctx, b).parent().map(|f| f.id);
+    ctx.blocks().any(|b| {
+        let Some(owner) = b.parent().map(|f| f.id) else {
+            return false;
+        };
+        let foreign = |t: BlockId| owner_of(t).is_some_and(|o| o != owner);
+        b.successors().any(|(_, s)| foreign(s))
+            || b.instructions()
+                .any(|i| i.mnemonic().target_blocks().iter().any(|&t| foreign(t)))
+    })
+}
+
 /// Recompute function ownership from the CFG until it settles. Returns `true` if
 /// anything changed (so the caller replays analysis).
 pub fn split_overlapping_functions(ctx: &mut Context) -> bool {

@@ -560,6 +560,30 @@ async fn run_analysis_fixpoint<'s>(
     overrides: &std::collections::HashMap<Proposition, bool>,
     progress: &mut impl ProgressSink,
 ) -> Result<Context<'s>, PipelineError> {
+    // Entry normalization (context-split stage 3, strict IR locality — ruling 2).
+    // The lifter-driven discovery loop splits the persistent clean IR every round
+    // (`split_overlapping_functions`), but every *pre-lifted* optimization entry —
+    // `analyze_default` with no lifter (the differential gate), `qcode-pass` on
+    // textual IR, wasm — reaches this fixpoint without it, so a thunk's `Branch`
+    // into a foreign function's entry would carry a foreign `BlockId` into the
+    // function stages (where a checked-out worker cannot reach the foreign block).
+    // Normalize once here, the single choke point every optimization entry shares:
+    // rewrite cross-function tail jumps to `TailCall` terminators and force splits
+    // at any mid-function landing, so no foreign block reference survives. `baseline`
+    // is the raw clean IR (the fixpoint re-clones it each round and runs the pipeline
+    // once, never on its own output), so the splitter's clean-IR assumptions hold.
+    // Skip the clone when the IR is already local — the steady state on the lifter
+    // path and any input with no cross-function edges.
+    let normalized;
+    let baseline = if crate::has_cross_function_reference(baseline) {
+        let mut owned = baseline.clone();
+        crate::split_overlapping_functions(&mut owned);
+        normalized = owned;
+        &normalized
+    } else {
+        baseline
+    };
+
     let env = PipelineEnv::new(baseline, cfg.clone());
     let bounded = !overrides.is_empty();
     // User overrides carry a synthetic "override" provenance so the converged
