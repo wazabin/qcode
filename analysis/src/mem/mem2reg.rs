@@ -3,10 +3,10 @@ use qcode::space::SpaceType;
 #[cfg(test)]
 use qcode::value::block::BlockRef;
 use qcode::value::{
-    BlockId, BlockParam, BlockParamId, BlockParamRef, BlockRef, Function, FunctionId, FunctionRef,
+    BlockId, BlockParam, BlockParamId, Function, FunctionId,
     Value, ValueId, ValueRef, Varnode, VarnodeId,
     insn::{
-        Branch, CBranch, InstructionId, InstructionRef, Load, Mnemonic, Range, Sext, Store, Zext,
+        Branch, CBranch, InstructionId, Load, Mnemonic, Range, Sext, Store, Zext,
     },
     util::{
         base_ref::{BaseRef, HostRef},
@@ -74,7 +74,7 @@ impl<'ctx, 'str, H: HostMut<'str>> Mem2Reg<'ctx, 'str, H> {
         aliases: &'ctx AliasResult,
         sp_param: Option<ValueId>,
     ) -> Self {
-        let root_id = FunctionRef::new(host.read_host(), function_id)
+        let root_id = host.function_ref(function_id)
             .root()
             .map(|b| b.id);
         let numbering = precompute_forms(host.read_host(), function_id);
@@ -137,7 +137,7 @@ impl<'ctx, 'str, H: HostMut<'str>> Mem2Reg<'ctx, 'str, H> {
         }
 
         let root_id = self.root_id();
-        let dom = compute_dominators(&FunctionRef::new(self.read(), root_id.func), root_id);
+        let dom = compute_dominators(&self.read().function_ref(root_id.func), root_id);
         let frontier = dom.dominator_frontier().clone();
         let InsertedBlockParams {
             by_block: var_params,
@@ -214,7 +214,7 @@ impl<'ctx, 'str, H: HostMut<'str>> Mem2Reg<'ctx, 'str, H> {
         if value_size > load_size
             && let ValueId::Instruction(iid) = value
         {
-            let src = match InstructionRef::new(self.read(), iid).mnemonic() {
+            let src = match self.read().insn_ref(iid).mnemonic() {
                 Mnemonic::Zext(Zext { src, .. }) | Mnemonic::Sext(Sext { src, .. }) => Some(*src),
                 _ => None,
             };
@@ -367,7 +367,7 @@ fn register_clobber_index(
     }
 
     let mut store_ptrs = HashSet::default();
-    for block in FunctionRef::new(host, function_id).blocks() {
+    for block in host.function_ref(function_id).blocks() {
         for insn in block.iter() {
             if let Mnemonic::Store(Store { ptr, .. }) = insn.mnemonic()
                 && register_varnode(host, *ptr).is_some()
@@ -524,7 +524,7 @@ impl<'str, H: HostMut<'str>> Mem2Reg<'_, 'str, H> {
         var: ValueId,
     ) -> Option<BlockParamId> {
         let var_offset = self.slot_offset(var);
-        BlockRef::new(self.read(), block_id)
+        self.read().block_ref(block_id)
             .params()
             .find(|param| {
                 param.size() == size
@@ -598,7 +598,7 @@ impl<'str, H: HostMut<'str>> Mem2Reg<'_, 'str, H> {
         // from the previous checkpoint+replay round): that callee may have written
         // any slot, so none may be promoted across it.
         let mut dynamic_stack =
-            FunctionRef::new(self.read(), self.function_id).frame_escapes_to_unbounded();
+            self.read().function_ref(self.function_id).frame_escapes_to_unbounded();
         // Locations disqualified because an access mis-sizes the stored value:
         //   - a store whose source is narrower than the access (e.g. the
         //     `MOV ESI, imm32` lift, an 8-byte RSI store of a 4-byte literal); or
@@ -609,7 +609,7 @@ impl<'str, H: HostMut<'str>> Mem2Reg<'_, 'str, H> {
 
         let mut sliced: HashSet<ValueId> = HashSet::default();
 
-        for block in FunctionRef::new(self.read(), self.function_id).blocks() {
+        for block in self.read().function_ref(self.function_id).blocks() {
             for insn in block.iter() {
                 let Some(access) = MemoryAccess::from_mnemonic(insn.mnemonic()) else {
                     continue;
@@ -889,7 +889,7 @@ impl<'str, H: HostMut<'str>> Mem2Reg<'_, 'str, H> {
                 !live_in.contains(&self.root_id()),
                 "mem2reg must not promote a root-live-in var ({var:?} in {}): the call \
                  interface is argpromote's",
-                FunctionRef::new(self.read(), self.function_id).name(),
+                self.read().function_ref(self.function_id).name(),
             );
         }
 
@@ -906,10 +906,10 @@ impl<'str, H: HostMut<'str>> Mem2Reg<'_, 'str, H> {
     /// fall-through or a `BranchInd` jump-table edge is a bare CFG edge. A
     /// predecessor with no terminator is treated as implicit (conservative).
     fn has_implicit_edge_predecessor(&self, block: BlockId) -> bool {
-        BlockRef::new(self.read(), block)
+        self.read().block_ref(block)
             .predecessors()
             .any(|(_, pred)| {
-                let term = BlockRef::new(self.read(), pred)
+                let term = self.read().block_ref(pred)
                     .iter()
                     .last()
                     .map(|i| i.mnemonic().clone());
@@ -987,7 +987,7 @@ impl LiveInBlocks {
         let mut call_blocks = Vec::new();
         let mut stored_here: HashSet<ValueId> = HashSet::default();
 
-        for block in FunctionRef::new(host, function_id).blocks() {
+        for block in host.function_ref(function_id).blocks() {
             let block_id = block.id;
             stored_here.clear();
             for insn in block.iter() {
@@ -1006,7 +1006,7 @@ impl LiveInBlocks {
             match block.iter().last().map(|i| i.mnemonic().clone()) {
                 Some(Mnemonic::CallInd(_)) => call_blocks.push((block_id, CallClobber::All)),
                 Some(Mnemonic::Call(call)) => {
-                    let callee = FunctionRef::new(host, call.target);
+                    let callee = host.function_ref(call.target);
                     let clobber = match callee.clobbered_regs() {
                         Some(regs) => CallClobber::Regs(regs.to_vec()),
                         // A resolved callee with no recorded set clobbers nothing
@@ -1106,7 +1106,7 @@ impl LiveInBlocks {
         // re-sweep to a fixpoint.
         let mut worklist: Vec<BlockId> = live_in.iter().copied().collect();
         while let Some(block_id) = worklist.pop() {
-            for (_, pred) in BlockRef::new(host, block_id).predecessors() {
+            for (_, pred) in host.block_ref(block_id).predecessors() {
                 if !defined.contains(&pred) && live_in.insert(pred) {
                     worklist.push(pred);
                 }
@@ -1122,7 +1122,7 @@ impl LiveInBlocks {
     fn sliced_seeds(&self, host: HostRef, var: ValueId) -> (HashSet<BlockId>, HashSet<BlockId>) {
         let mut defined = HashSet::default();
         let mut upward_exposed = HashSet::default();
-        for block in FunctionRef::new(host, self.function_id).blocks() {
+        for block in host.function_ref(self.function_id).blocks() {
             let block_id = block.id;
             let mut has_def = false;
             for insn in block.iter() {
@@ -1170,7 +1170,7 @@ impl<'str, H: HostMut<'str>> Mem2Reg<'_, 'str, H> {
         edge: BranchEdge<'_>,
         state: &mut RenameState<'_>,
     ) -> Vec<ValueId> {
-        let param_count = BlockRef::new(self.read(), edge.target).params().count();
+        let param_count = self.read().block_ref(edge.target).params().count();
 
         // Seed every slot with the argument already on the branch (from a prior run).
         let mut slots: Vec<Option<ValueId>> = (0..param_count)
@@ -1222,7 +1222,7 @@ impl<'str, H: HostMut<'str>> Mem2Reg<'_, 'str, H> {
             // The emulator binds branch args to params without resizing, so the
             // edge value must already match the param width. Resize before the
             // branch, mirroring the load-forwarding path. A no-op when widths match.
-            let param_size = BlockParamRef::new(self.read(), param_id).size();
+            let param_size = self.read().param_ref(param_id).size();
             let val = self.resize_forwarded_load_value(
                 edge.source_block,
                 edge.branch_insn,
@@ -1271,7 +1271,7 @@ impl<'str, H: HostMut<'str>> Mem2Reg<'_, 'str, H> {
         let ValueId::Instruction(insn_id) = value else {
             return false;
         };
-        let insn = InstructionRef::new(self.read(), insn_id);
+        let insn = self.read().insn_ref(insn_id);
         if insn.parent().map(|b| b.id) != Some(block) {
             return false;
         }
@@ -1289,7 +1289,7 @@ impl<'str, H: HostMut<'str>> Mem2Reg<'_, 'str, H> {
         preserved_stores: &HashSet<InstructionId>,
     ) -> bool {
         let mut changed = false;
-        let block_ids: Vec<BlockId> = FunctionRef::new(self.read(), self.function_id)
+        let block_ids: Vec<BlockId> = self.read().function_ref(self.function_id)
             .blocks()
             .map(|b| b.id)
             .collect();
@@ -1310,9 +1310,9 @@ impl<'str, H: HostMut<'str>> Mem2Reg<'_, 'str, H> {
         // silently discarding the value the wider store carried.
         let mut unpromoted_register_loads: Vec<ValueId> = Vec::new();
         for &block_id in &block_ids {
-            for &insn_id in BlockRef::new(self.read(), block_id).instruction_ids() {
+            for &insn_id in self.read().block_ref(block_id).instruction_ids() {
                 if let Mnemonic::Load(Load { ptr, .. }) =
-                    InstructionRef::new(self.read(), insn_id).mnemonic()
+                    self.read().insn_ref(insn_id).mnemonic()
                 {
                     if vars.contains(ptr) {
                         vars_with_surviving_loads.insert(*ptr);
@@ -1324,12 +1324,12 @@ impl<'str, H: HostMut<'str>> Mem2Reg<'_, 'str, H> {
         }
 
         for block_id in block_ids {
-            let insn_ids: Vec<InstructionId> = BlockRef::new(self.read(), block_id)
+            let insn_ids: Vec<InstructionId> = self.read().block_ref(block_id)
                 .instruction_ids()
                 .to_vec();
 
             for insn_id in insn_ids {
-                let mnemonic = InstructionRef::new(self.read(), insn_id).mnemonic();
+                let mnemonic = self.read().insn_ref(insn_id).mnemonic();
                 let Mnemonic::Store(Store { ptr, .. }) = mnemonic else {
                     continue;
                 };
@@ -1605,12 +1605,12 @@ impl<'str, H: HostMut<'str>> Mem2Reg<'_, 'str, H> {
         }
 
         let insn_ids: Vec<InstructionId> =
-            BlockRef::new(self.read(), block).instruction_ids().to_vec();
+            self.read().block_ref(block).instruction_ids().to_vec();
 
         for insn_id in insn_ids {
             // Clone the mnemonic so we can release the immutable borrow on ctx
             // before taking mutable borrows in each arm.
-            let mnemonic = InstructionRef::new(self.read(), insn_id).mnemonic().clone();
+            let mnemonic = self.read().insn_ref(insn_id).mnemonic().clone();
 
             match mnemonic {
                 Mnemonic::Store(Store { ptr, src, .. }) => {
@@ -1794,7 +1794,7 @@ impl<'str, H: HostMut<'str>> Mem2Reg<'_, 'str, H> {
     }
 
     fn visit_successors(&mut self, block: BlockId, state: &mut RenameState<'_>) {
-        let successors: Vec<BlockId> = BlockRef::new(self.read(), block)
+        let successors: Vec<BlockId> = self.read().block_ref(block)
             .successors()
             .map(|(_, id)| id)
             .collect();
@@ -1828,7 +1828,7 @@ impl<'str, H: HostMut<'str>> Mem2Reg<'_, 'str, H> {
         match call {
             Mnemonic::CallInd(_) => register_vars().collect(),
             Mnemonic::Call(call) => {
-                let callee = FunctionRef::new(self.read(), call.target);
+                let callee = self.read().function_ref(call.target);
                 let resolved = callee.is_externally_resolved();
                 let clobbered = callee.clobbered_regs().map(<[VarnodeId]>::to_vec);
                 match clobbered {
