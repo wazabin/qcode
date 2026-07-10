@@ -22,7 +22,9 @@ use qcode::value::{
 use std::any::Any;
 
 use super::affine::{NormalForm, Numbering, arith_form, key_for, materialize};
-use super::walk::{Claim, Editor, InsnCtx, SubPass};
+use super::walk::{Claim, Editor, InsnCtx, SubPass, SubPassC};
+
+use crate::{ContextView, FunctionBody};
 
 /// CSE numbers pure values down a whole dominator tree. Fully host-routed (the
 /// value-numbering reads through a [`HostRef`](qcode::value::util::base_ref::HostRef)
@@ -112,6 +114,95 @@ impl<'str, H: HostMut<'str>> SubPass<'str, H> for Cse {
                 );
                 if v != ic.id {
                     ed.replace(host, ic.insn_id, v);
+                }
+            }
+        }
+        Claim::Done
+    }
+}
+
+/// Concrete twin of the [`SubPass`] impl above (context-split stage 5b-ii): reads
+/// route through `body.read_host(cx)`, shallow forwards through `Editor`'s `_c`
+/// methods, and the in-place canonical rebuild is reached through a scoped
+/// `body.host(cx)` (`materialize` stays generic — the generic path shares it).
+impl<'str> SubPassC<'str> for Cse {
+    fn init_state(&self) -> Box<dyn Any> {
+        Box::new(Numbering::default())
+    }
+
+    fn clone_state(&self, state: &dyn Any) -> Box<dyn Any> {
+        Box::new(
+            state
+                .downcast_ref::<Numbering>()
+                .expect("cse state")
+                .clone(),
+        )
+    }
+
+    fn on_block_entry(
+        &self,
+        _body: &mut FunctionBody<'str>,
+        _cx: ContextView<'_, 'str>,
+        state: &mut dyn Any,
+        _block_id: qcode::value::block::BlockId,
+        _tree: &jstd::graph::analysis::DominatorTree<qcode::value::block::BlockId>,
+        _aliases: Option<&crate::AliasResult>,
+        _numbering: &Numbering,
+        is_shared: bool,
+    ) {
+        let state = state.downcast_mut::<Numbering>().expect("cse state");
+        if is_shared {
+            state.clear_leaders();
+        }
+    }
+
+    fn on_insn(
+        &self,
+        body: &mut FunctionBody<'str>,
+        cx: ContextView<'_, 'str>,
+        state: &mut dyn Any,
+        ic: &InsnCtx,
+        ed: &mut Editor,
+    ) -> Claim {
+        if ic.mnemonic.is_terminator() || ic.size == 0 {
+            return Claim::Pass;
+        }
+        let state = state.downcast_mut::<Numbering>().expect("cse state");
+
+        let form = arith_form(body.read_host(cx), ic.id, ic.mnemonic, ic.size, state);
+        state.record_form(ic.id, form.clone());
+        let key = key_for(&form, ic.id, ic.mnemonic);
+
+        state.seed_operand_leaders(ic.mnemonic.args());
+
+        if let Some(leader) = state.lookup(&key) {
+            if leader != ic.id {
+                ed.replace_c(body, cx, ic.insn_id, leader);
+            }
+            return Claim::Done;
+        }
+
+        match key {
+            NormalForm::Opaque(_) => state.claim(key, ic.id),
+            _ => {
+                let root_ty = body.read_host(cx).type_of(ic.id);
+                // `materialize` is a shared HostMut helper (the generic path uses
+                // it too); reach it through a scoped host. TODO(5b-ii): migrate
+                // `materialize` off HostMut.
+                let v = {
+                    let mut host = body.host(cx);
+                    materialize(
+                        &mut host,
+                        ic.block_id,
+                        ic.insn_id,
+                        ic.mnemonic,
+                        &key,
+                        root_ty,
+                        state,
+                    )
+                };
+                if v != ic.id {
+                    ed.replace_c(body, cx, ic.insn_id, v);
                 }
             }
         }

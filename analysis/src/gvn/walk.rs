@@ -446,6 +446,334 @@ pub(super) fn run_dominator_walk<'str, H: HostMut<'str>>(
     changed
 }
 
+// ===========================================================================
+// Concrete (host-free) twins — context-split stage 5b-ii(a).
+//
+// The generic `SubPass`/driver machinery above stays alive: it drives the module
+// `concretize` pass (its three body-reading sub-passes run on `H = &mut Context`)
+// and the whole-`Context` public entry points (`gvn_function`, `constant_fold_
+// function`, `narrow_function`), which have external callers.
+//
+// These concrete twins drive the *function-pass* GVN chain over a checked-out
+// `(&mut FunctionBody, ContextView)` with no threaded mutation host: reads route
+// through `body.read_host(cx)`, shallow rewrites through the inherent
+// `body.verb(cx, …)` surface (via `Editor`'s `_c` methods). The large shared
+// mutation helpers (`materialize`, `MemForward::{record_store,try_load}`,
+// `narrow_to`, `simplify_bitwise`/`simplify_compare`) are still reached through a
+// scoped `body.host(cx)` — the same pattern the dce sibling (8cbc4b2) uses for
+// `replace_terminator_with_branch`; they stay generic because the generic path
+// above shares them.
+// ===========================================================================
+
+use crate::{ContextView, FunctionBody};
+
+impl Editor {
+    /// Concrete twin of [`replace`](Self::replace).
+    pub(super) fn replace_c<'str>(
+        &mut self,
+        body: &mut FunctionBody<'str>,
+        cx: ContextView<'_, 'str>,
+        insn: InstructionId,
+        with: ValueId,
+    ) {
+        body.replace_all_uses_with(cx, ValueId::Instruction(insn), with);
+        self.redundant.insert(insn);
+    }
+
+    /// Concrete twin of [`replace_with_new_insn`](Self::replace_with_new_insn).
+    #[allow(dead_code)] // first used by the a.11 sub-passes (identity/flag_idiom/intrinsics)
+    pub(super) fn replace_with_new_insn_c<'str>(
+        &mut self,
+        body: &mut FunctionBody<'str>,
+        cx: ContextView<'_, 'str>,
+        block_id: BlockId,
+        at: InstructionId,
+        mnemonic: Mnemonic,
+        size: usize,
+    ) -> InstructionId {
+        let type_id = body.read_host(cx).shared().types.get_or_make_int(size);
+        self.replace_with_new_insn_typed_c(body, cx, block_id, at, mnemonic, type_id)
+    }
+
+    /// Concrete twin of
+    /// [`replace_with_new_insn_typed`](Self::replace_with_new_insn_typed).
+    #[allow(dead_code)] // first used by the a.11 sub-passes (identity/flag_idiom/intrinsics)
+    pub(super) fn replace_with_new_insn_typed_c<'str>(
+        &mut self,
+        body: &mut FunctionBody<'str>,
+        cx: ContextView<'_, 'str>,
+        block_id: BlockId,
+        at: InstructionId,
+        mnemonic: Mnemonic,
+        type_id: qcode::types::TypeId,
+    ) -> InstructionId {
+        // `func = body.id` (own function); `block_id.func == body.id` here, so this
+        // is behaviour-identical to the generic `push_mnemonic_with_type(block_id.func, …)`.
+        let new_id = body.push_mnemonic_with_type(cx, mnemonic, type_id);
+        body.insert_insn_before(cx, block_id, at, new_id);
+        body.replace_all_uses_with(cx, ValueId::Instruction(at), ValueId::Instruction(new_id));
+        self.redundant.insert(at);
+        new_id
+    }
+
+    /// Concrete twin of [`finish`](Self::finish).
+    fn finish_c<'str>(self, body: &mut FunctionBody<'str>, cx: ContextView<'_, 'str>) -> bool {
+        let changed = !self.redundant.is_empty();
+        for insn in self.redundant {
+            body.remove_instruction(cx, insn);
+        }
+        changed
+    }
+}
+
+/// Concrete twin of [`SubPass`]: one composable GVN concern over a checked-out
+/// `(&mut FunctionBody, ContextView)`. Implemented by the seven function-pass
+/// sub-passes ([`Fold`](super::fold::Fold), [`NarrowTrunc`](super::narrow::NarrowTrunc),
+/// [`Recognize`](super::intrinsics::Recognize), [`FlagIdiom`](super::flag_idiom::FlagIdiom),
+/// [`Identities`](super::identity::Identities), [`MemoryForwarding`](super::memory::MemoryForwarding),
+/// [`Cse`](super::cse::Cse)); the three body-reading sub-passes keep only the
+/// generic [`SubPass`] impl (they run on the module `concretize` path).
+pub(super) trait SubPassC<'str> {
+    /// See [`SubPass::init_state`].
+    fn init_state(&self) -> Box<dyn Any>;
+
+    /// See [`SubPass::clone_state`].
+    fn clone_state(&self, state: &dyn Any) -> Box<dyn Any>;
+
+    /// See [`SubPass::on_block_entry`].
+    #[allow(clippy::too_many_arguments)]
+    fn on_block_entry(
+        &self,
+        _body: &mut FunctionBody<'str>,
+        _cx: ContextView<'_, 'str>,
+        _state: &mut dyn Any,
+        _block_id: BlockId,
+        _tree: &DominatorTree<BlockId>,
+        _aliases: Option<&AliasResult>,
+        _numbering: &Numbering,
+        _is_shared: bool,
+    ) {
+    }
+
+    /// See [`SubPass::on_insn`].
+    fn on_insn(
+        &self,
+        body: &mut FunctionBody<'str>,
+        cx: ContextView<'_, 'str>,
+        state: &mut dyn Any,
+        ic: &InsnCtx,
+        ed: &mut Editor,
+    ) -> Claim;
+
+    /// See [`SubPass::after_block`].
+    fn after_block(
+        &self,
+        _body: &mut FunctionBody<'str>,
+        _cx: ContextView<'_, 'str>,
+        _state: &mut dyn Any,
+        _block_id: BlockId,
+        _aliases: Option<&AliasResult>,
+        _numbering: &Numbering,
+    ) {
+    }
+}
+
+/// Concrete twin of [`init_states`].
+#[allow(dead_code)] // wired by the gvn.rs concrete driver in stage 5b-ii a.12
+fn init_states_c<'str>(passes: &[Box<dyn SubPassC<'str>>]) -> Vec<Box<dyn Any>> {
+    passes.iter().map(|p| p.init_state()).collect()
+}
+
+/// Concrete twin of [`clone_states`].
+#[allow(dead_code)] // wired by the gvn.rs concrete driver in stage 5b-ii a.12
+fn clone_states_c<'str>(
+    passes: &[Box<dyn SubPassC<'str>>],
+    states: &[Box<dyn Any>],
+) -> Vec<Box<dyn Any>> {
+    passes
+        .iter()
+        .zip(states)
+        .map(|(p, s)| p.clone_state(s.as_ref()))
+        .collect()
+}
+
+/// Concrete twin of [`run_block`].
+#[allow(dead_code)] // wired by the gvn.rs concrete driver in stage 5b-ii a.12
+fn run_block_c<'str>(
+    body: &mut FunctionBody<'str>,
+    cx: ContextView<'_, 'str>,
+    block_id: BlockId,
+    passes: &[Box<dyn SubPassC<'str>>],
+    states: &mut [Box<dyn Any>],
+    aliases: Option<&AliasResult>,
+    numbering: &Numbering,
+) -> bool {
+    let mut ed = Editor::new();
+    let insns: Vec<InstructionId> = body.read_host(cx).block(block_id).instructions.clone();
+
+    for insn_id in insns {
+        let (id, size, mnemonic) = {
+            let insn = body.insn_ref(cx, insn_id);
+            (insn.id(), insn.size(), insn.mnemonic().clone())
+        };
+        let ic = InsnCtx {
+            block_id,
+            insn_id,
+            id,
+            size,
+            mnemonic: &mnemonic,
+            aliases,
+            numbering,
+        };
+        for (pass, state) in passes.iter().zip(states.iter_mut()) {
+            if let Claim::Done = pass.on_insn(body, cx, state.as_mut(), &ic, &mut ed) {
+                break;
+            }
+        }
+    }
+
+    ed.finish_c(body, cx)
+}
+
+/// Concrete twin of [`run_flat_fixpoint`].
+#[allow(dead_code)] // wired by the gvn.rs concrete driver in stage 5b-ii a.12
+pub(super) fn run_flat_fixpoint_c<'str>(
+    body: &mut FunctionBody<'str>,
+    cx: ContextView<'_, 'str>,
+    func_id: FunctionId,
+    passes: &[Box<dyn SubPassC<'str>>],
+) -> bool {
+    let block_ids: Vec<BlockId> = body
+        .read_host(cx)
+        .function_ref(func_id)
+        .iter()
+        .map(|block| block.id)
+        .collect();
+
+    let numbering = Numbering::default();
+    let mut changed_any = false;
+    loop {
+        let mut changed = false;
+        for &block_id in &block_ids {
+            let mut states = init_states_c(passes);
+            changed |= run_block_c(body, cx, block_id, passes, &mut states, None, &numbering);
+        }
+        changed_any |= changed;
+        if !changed {
+            break;
+        }
+    }
+    changed_any
+}
+
+/// Concrete twin of [`Walk`].
+struct WalkC<'a, 'str> {
+    passes: &'a [Box<dyn SubPassC<'str>>],
+    tree: &'a DominatorTree<BlockId>,
+    aliases: Option<&'a AliasResult>,
+    numbering: &'a Numbering,
+    shared: &'a HashSet<BlockId>,
+    owner: FunctionId,
+    changed: bool,
+}
+
+impl<'str> WalkC<'_, 'str> {
+    fn rec(
+        &mut self,
+        body: &mut FunctionBody<'str>,
+        cx: ContextView<'_, 'str>,
+        block_id: BlockId,
+        inherited: &[Box<dyn Any>],
+    ) {
+        let mut states = clone_states_c(self.passes, inherited);
+        let is_shared = self.shared.contains(&block_id);
+        for (pass, state) in self.passes.iter().zip(states.iter_mut()) {
+            pass.on_block_entry(
+                body,
+                cx,
+                state.as_mut(),
+                block_id,
+                self.tree,
+                self.aliases,
+                self.numbering,
+                is_shared,
+            );
+        }
+        self.changed |= run_block_c(
+            body,
+            cx,
+            block_id,
+            self.passes,
+            &mut states,
+            self.aliases,
+            self.numbering,
+        );
+        for (pass, state) in self.passes.iter().zip(states.iter_mut()) {
+            pass.after_block(body, cx, state.as_mut(), block_id, self.aliases, self.numbering);
+        }
+        for &child in self.tree.children_of(block_id) {
+            if body.read_host(cx).block(child).parent == Some(self.owner) {
+                self.rec(body, cx, child, &states);
+            }
+        }
+    }
+}
+
+/// Concrete twin of [`run_dominator_walk`].
+#[allow(dead_code)] // wired by the gvn.rs concrete driver in stage 5b-ii a.12
+pub(super) fn run_dominator_walk_c<'str>(
+    body: &mut FunctionBody<'str>,
+    cx: ContextView<'_, 'str>,
+    func_id: FunctionId,
+    passes: &[Box<dyn SubPassC<'str>>],
+    aliases: Option<&AliasResult>,
+) -> bool {
+    let root = match body.read_host(cx).function_ref(func_id).root() {
+        Some(r) => r.id,
+        None => return false,
+    };
+
+    let root_reachable = reachable_from(body.read_host(cx), root, func_id);
+    let entries: Vec<BlockId> = body
+        .read_host(cx)
+        .function_ref(func_id)
+        .iter()
+        .filter(|block| !root_reachable.contains(&block.id))
+        .filter(|block| block.predecessors().next().is_none())
+        .map(|block| block.id)
+        .collect();
+
+    let mut seen_count: HashMap<BlockId, u32> = HashMap::default();
+    for &entry in std::iter::once(&root).chain(&entries) {
+        for block in reachable_from(body.read_host(cx), entry, func_id) {
+            *seen_count.entry(block).or_default() += 1;
+        }
+    }
+    let shared: HashSet<BlockId> = seen_count
+        .into_iter()
+        .filter_map(|(block, count)| (count > 1).then_some(block))
+        .collect();
+
+    let numbering = super::affine::precompute_forms(body.read_host(cx), func_id);
+
+    let mut changed = false;
+    for entry in std::iter::once(root).chain(entries) {
+        let tree = compute_dominators(&body.read_host(cx).function_ref(entry.func), entry);
+        let mut walk = WalkC {
+            passes,
+            tree: &tree,
+            aliases,
+            numbering: &numbering,
+            shared: &shared,
+            owner: func_id,
+            changed: false,
+        };
+        walk.rec(body, cx, entry, &init_states_c(passes));
+        changed |= walk.changed;
+    }
+    changed
+}
+
 #[cfg(test)]
 mod tests {
     use crate::AliasResult;
