@@ -40,7 +40,10 @@ use identity::Identities;
 use intrinsics::Recognize;
 use memory::MemoryForwarding;
 use narrow::NarrowTrunc;
-use walk::{run_dominator_walk, run_flat_fixpoint, run_single_block};
+use walk::{
+    SubPassC, run_dominator_walk, run_dominator_walk_c, run_flat_fixpoint, run_flat_fixpoint_c,
+    run_single_block,
+};
 
 /// The full GVN sub-pass chain. Order is load-bearing: memory forwarding must
 /// see loads/stores first, folding must run before idiom recognition (so shift
@@ -53,6 +56,21 @@ use walk::{run_dominator_walk, run_flat_fixpoint, run_single_block};
 /// read pure *callee* bodies, an interprocedural read the parallel-safe function
 /// pass contract forbids, so they live in the [`concretize`] module pass.
 fn gvn_passes<'str, H: HostMut<'str>>() -> Vec<Box<dyn walk::SubPass<'str, H>>> {
+    vec![
+        Box::new(MemoryForwarding),
+        Box::new(Fold),
+        Box::new(NarrowTrunc),
+        Box::new(Recognize),
+        Box::new(FlagIdiom),
+        Box::new(Identities),
+        Box::new(Cse),
+    ]
+}
+
+/// Concrete twin of [`gvn_passes`] (context-split stage 5b-ii): the same chain in
+/// the same order, over the host-free [`SubPassC`] surface, driving the
+/// function-pass GVN chain on a checked-out `(&mut FunctionBody, ContextView)`.
+fn gvn_passes_c<'str>() -> Vec<Box<dyn SubPassC<'str>>> {
     vec![
         Box::new(MemoryForwarding),
         Box::new(Fold),
@@ -99,6 +117,17 @@ pub(crate) fn constant_fold_host<'str, H: HostMut<'str>>(
     )
 }
 
+/// Concrete twin of [`constant_fold_host`] (context-split stage 5b-ii): runs the
+/// [`Fold`] sub-pass to a fixpoint over a checked-out `(&mut FunctionBody,
+/// ContextView)` with no threaded mutation host.
+fn constant_fold_body<'str>(
+    body: &mut FunctionBody<'str>,
+    cx: ContextView<'_, 'str>,
+    func_id: FunctionId,
+) -> bool {
+    run_flat_fixpoint_c(body, cx, func_id, &[Box::new(Fold) as Box<dyn SubPassC>])
+}
+
 /// Sink low-word truncations through arithmetic, cancelling widenings, to a
 /// fixpoint. Standalone composition of the [`NarrowTrunc`] sub-pass — the same
 /// shape as [`constant_fold_function`]. Returns `true` if anything changed.
@@ -113,6 +142,22 @@ pub(crate) fn narrow_host<'str, H: HostMut<'str>>(host: &mut H, func_id: Functio
         host,
         func_id,
         &[Box::new(NarrowTrunc) as Box<dyn walk::SubPass<'str, H>>],
+    )
+}
+
+/// Concrete twin of [`narrow_host`] (context-split stage 5b-ii): runs the
+/// [`NarrowTrunc`] sub-pass to a fixpoint over a checked-out `(&mut FunctionBody,
+/// ContextView)`.
+fn narrow_body<'str>(
+    body: &mut FunctionBody<'str>,
+    cx: ContextView<'_, 'str>,
+    func_id: FunctionId,
+) -> bool {
+    run_flat_fixpoint_c(
+        body,
+        cx,
+        func_id,
+        &[Box::new(NarrowTrunc) as Box<dyn SubPassC>],
     )
 }
 
@@ -157,6 +202,18 @@ pub(crate) fn gvn_host<'str, H: HostMut<'str>>(
     run_dominator_walk(host, func_id, &gvn_passes(), aliases)
 }
 
+/// Concrete twin of [`gvn_host`] (context-split stage 5b-ii): runs the full GVN
+/// sub-pass chain over the dominator tree of `func_id` on a checked-out
+/// `(&mut FunctionBody, ContextView)` with no threaded mutation host.
+fn gvn_body<'str>(
+    body: &mut FunctionBody<'str>,
+    cx: ContextView<'_, 'str>,
+    func_id: FunctionId,
+    aliases: Option<&AliasResult>,
+) -> bool {
+    run_dominator_walk_c(body, cx, func_id, &gvn_passes_c(), aliases)
+}
+
 // ----- passes ----------------------------------------------------------------
 
 use crate::{ContextView, FunctionBody, FunctionPass};
@@ -176,8 +233,7 @@ impl FunctionPass for ConstFold {
         m: ContextView<'_, 'str>,
     ) -> Result<bool, String> {
         let fun_id = f.id();
-        let mut host = f.host(m);
-        Ok(constant_fold_host(&mut host, fun_id))
+        Ok(constant_fold_body(f, m, fun_id))
     }
 }
 
@@ -197,8 +253,7 @@ impl FunctionPass for Narrow {
         m: ContextView<'_, 'str>,
     ) -> Result<bool, String> {
         let fun_id = f.id();
-        let mut host = f.host(m);
-        Ok(narrow_host(&mut host, fun_id))
+        Ok(narrow_body(f, m, fun_id))
     }
 }
 
@@ -237,14 +292,13 @@ impl FunctionPass for Gvn {
         m: ContextView<'_, 'str>,
     ) -> Result<bool, String> {
         let fun_id = f.id();
-        let mut host = f.host(m);
         // Canonicalize pointer arithmetic *before* building the alias oracle, so it
         // sees per-slot `@SP`-rooted stack locations.
-        let mut changed = constant_fold_host(&mut host, fun_id);
-        // Build the oracle over the (now-canonicalized) checked-out body, then run
-        // the dominator-tree GVN against it.
-        let aliases = build_gvn_aliases(m, host.read_host(), fun_id);
-        changed |= gvn_host(&mut host, fun_id, Some(&aliases));
+        let mut changed = constant_fold_body(f, m, fun_id);
+        // Build the oracle over the (now-canonicalized) body, then run the
+        // dominator-tree GVN against it.
+        let aliases = build_gvn_aliases(m, f.read_host(m), fun_id);
+        changed |= gvn_body(f, m, fun_id, Some(&aliases));
         Ok(changed)
     }
 }

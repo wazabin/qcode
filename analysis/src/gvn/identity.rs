@@ -121,7 +121,14 @@ impl<'str> SubPassC<'str> for Identities {
                     return Claim::Done;
                 }
                 Some(Simplified::Expression(mnemonic)) => {
-                    ed.replace_with_new_insn_c(body, cx, ic.block_id, ic.insn_id, mnemonic, ic.size);
+                    ed.replace_with_new_insn_c(
+                        body,
+                        cx,
+                        ic.block_id,
+                        ic.insn_id,
+                        mnemonic,
+                        ic.size,
+                    );
                     return Claim::Done;
                 }
                 None => {}
@@ -133,16 +140,18 @@ impl<'str> SubPassC<'str> for Identities {
         }
         // TODO(5b-ii): `simplify_bitwise`/`simplify_compare` are shared HostMut
         // helpers; reach them through a scoped host.
-        if {
+        let bitwise = {
             let mut host = body.host(cx);
             simplify_bitwise(&mut host, ic, ed)
-        } {
+        };
+        if bitwise {
             return Claim::Done;
         }
-        if {
+        let compare = {
             let mut host = body.host(cx);
             simplify_compare(&mut host, ic, ed)
-        } {
+        };
+        if compare {
             return Claim::Done;
         }
         Claim::Pass

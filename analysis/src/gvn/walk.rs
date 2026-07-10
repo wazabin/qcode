@@ -577,13 +577,11 @@ pub(super) trait SubPassC<'str> {
 }
 
 /// Concrete twin of [`init_states`].
-#[allow(dead_code)] // wired by the gvn.rs concrete driver in stage 5b-ii a.12
 fn init_states_c<'str>(passes: &[Box<dyn SubPassC<'str>>]) -> Vec<Box<dyn Any>> {
     passes.iter().map(|p| p.init_state()).collect()
 }
 
 /// Concrete twin of [`clone_states`].
-#[allow(dead_code)] // wired by the gvn.rs concrete driver in stage 5b-ii a.12
 fn clone_states_c<'str>(
     passes: &[Box<dyn SubPassC<'str>>],
     states: &[Box<dyn Any>],
@@ -596,7 +594,6 @@ fn clone_states_c<'str>(
 }
 
 /// Concrete twin of [`run_block`].
-#[allow(dead_code)] // wired by the gvn.rs concrete driver in stage 5b-ii a.12
 fn run_block_c<'str>(
     body: &mut FunctionBody<'str>,
     cx: ContextView<'_, 'str>,
@@ -634,7 +631,6 @@ fn run_block_c<'str>(
 }
 
 /// Concrete twin of [`run_flat_fixpoint`].
-#[allow(dead_code)] // wired by the gvn.rs concrete driver in stage 5b-ii a.12
 pub(super) fn run_flat_fixpoint_c<'str>(
     body: &mut FunctionBody<'str>,
     cx: ContextView<'_, 'str>,
@@ -707,7 +703,14 @@ impl<'str> WalkC<'_, 'str> {
             self.numbering,
         );
         for (pass, state) in self.passes.iter().zip(states.iter_mut()) {
-            pass.after_block(body, cx, state.as_mut(), block_id, self.aliases, self.numbering);
+            pass.after_block(
+                body,
+                cx,
+                state.as_mut(),
+                block_id,
+                self.aliases,
+                self.numbering,
+            );
         }
         for &child in self.tree.children_of(block_id) {
             if body.read_host(cx).block(child).parent == Some(self.owner) {
@@ -718,7 +721,6 @@ impl<'str> WalkC<'_, 'str> {
 }
 
 /// Concrete twin of [`run_dominator_walk`].
-#[allow(dead_code)] // wired by the gvn.rs concrete driver in stage 5b-ii a.12
 pub(super) fn run_dominator_walk_c<'str>(
     body: &mut FunctionBody<'str>,
     cx: ContextView<'_, 'str>,

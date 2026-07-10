@@ -67,7 +67,14 @@ impl<'str> SubPassC<'str> for FlagIdiom {
         }
         match simplify_flag_idiom(body.read_host(cx), ic.mnemonic) {
             Some(new_mnemonic) => {
-                ed.replace_with_new_insn_c(body, cx, ic.block_id, ic.insn_id, new_mnemonic, ic.size);
+                ed.replace_with_new_insn_c(
+                    body,
+                    cx,
+                    ic.block_id,
+                    ic.insn_id,
+                    new_mnemonic,
+                    ic.size,
+                );
                 Claim::Done
             }
             None => Claim::Pass,
