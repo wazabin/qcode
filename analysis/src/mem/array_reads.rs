@@ -265,6 +265,7 @@ fn apply<'str>(body: &mut FunctionBody<'str>, cx: ContextView<'_, 'str>, m: &Rea
 
 /// Host-generic version of apply; kept for backwards compatibility.
 /// TODO(5b-ii): For backwards compatibility; prefer concrete version for new code.
+#[allow(dead_code)]
 fn apply_generic<'str, H: HostMut<'str>>(host: &mut H, m: &ReadsMatch) -> bool {
     let at_id = IntrinsicId::from_name("at").expect("at registered");
     // The `at(arr, i)` result type is the array's element type. Compute it through
