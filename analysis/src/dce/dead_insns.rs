@@ -10,6 +10,8 @@ use qcode::{
 };
 
 use crate::loop_unroll::replace_terminator_with_branch;
+#[cfg(test)]
+use crate::loop_unroll::replace_terminator_with_branch_generic;
 
 /// This host's users of `v` (its owning function's reverse-use list), or `&[]`
 /// for a shared value with no owning function. Mirrors [`Context::users`].
@@ -141,7 +143,7 @@ fn remove_dead_pure_call_generic<'str, H: HostMut<'str>>(host: &mut H, block_id:
         return false;
     };
 
-    replace_terminator_with_branch(host, block_id, fallthrough, vec![]);
+    replace_terminator_with_branch_generic(host, block_id, fallthrough, vec![]);
     true
 }
 
@@ -189,9 +191,7 @@ fn remove_dead_pure_call_host<'a, 'str>(
         return false;
     };
 
-    // Build a temporary host for calling replace_terminator_with_branch which still takes H: HostMut
-    let mut host = body.host(cx);
-    replace_terminator_with_branch(&mut host, block_id, fallthrough, vec![]);
+    replace_terminator_with_branch(body, cx, block_id, fallthrough, vec![]);
     true
 }
 
@@ -834,7 +834,7 @@ fn remove_dead_counted_loop_generic<'str, H: HostMut<'str>>(
     let headers: Vec<BlockId> = host.function_ref(fun_id).blocks().map(|b| b.id).collect();
     for header in headers {
         if let Some(dl) = match_dead_loop(host.read_host(), header) {
-            replace_terminator_with_branch(host, dl.preheader, dl.exit, vec![]);
+            replace_terminator_with_branch_generic(host, dl.preheader, dl.exit, vec![]);
             return true;
         }
     }
@@ -854,8 +854,7 @@ fn remove_dead_counted_loop_host<'a, 'str>(
         .collect();
     for header in headers {
         if let Some(dl) = match_dead_loop(body.read_host(cx), header) {
-            let mut host = body.host(cx);
-            replace_terminator_with_branch(&mut host, dl.preheader, dl.exit, vec![]);
+            replace_terminator_with_branch(body, cx, dl.preheader, dl.exit, vec![]);
             return true;
         }
     }

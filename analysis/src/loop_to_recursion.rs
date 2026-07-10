@@ -183,6 +183,8 @@ fn transform<'str>(
     //     host blocks into another function — that would leave `rec` owning
     //     host-stored blocks, which the checked-out invariant forbids — so the
     //     region is reproduced, and the host copy deleted below).
+    // TODO(5b-ii): function minting (`host_with_minted`) stays on the host path
+    // until the minting chunk lands.
     {
         let (own, mut minted) = body.host_with_minted(m, rec);
 
@@ -285,17 +287,19 @@ fn transform<'str>(
     }
 
     // --- Host: the entry seeds the recursion and returns it; delete the region.
-    let mut host = body.host(m);
-    if let Some(term) = terminator_id(host.read_host(), model.root) {
-        host.remove_instruction(term);
+    if let Some(term) = terminator_id(body.read_host(m), model.root) {
+        body.remove_instruction(m, term);
     }
     {
+        // TODO(5b-ii): `Builder` drives a `BaseRef`, which is not mirrored on
+        // `FunctionBody`; go through a temporary host.
+        let mut host = body.host(m);
         let mut b = Builder::from_block(BaseRef::new(host.reborrow_host(), model.root));
         let out = b.push_apply(rec, model.init_args.clone()).id();
         b.push_return_value(out);
     }
     for &blk in &model.region {
-        BaseRef::new(host.reborrow_host(), blk).delete(host_fid);
+        body.delete_block(m, blk);
     }
     true
 }
