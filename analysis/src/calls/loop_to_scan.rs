@@ -38,7 +38,7 @@
 use qcode::{
     builder::Builder,
     value::{
-        BlockId, BlockRef, FunctionId, FunctionRef, InstructionRef, ValueId,
+        BlockId, FunctionId, ValueId,
         insn::{InstructionId, IntrinsicApp, IntrinsicId, Mnemonic},
         util::{base_ref::BaseRef, base_ref::HostRef, host_mut::HostMut},
     },
@@ -147,7 +147,7 @@ fn try_match(host: HostRef, fid: FunctionId) -> Option<ScanMatch> {
             let ValueId::Instruction(a0) = seed_arr0 else {
                 return None;
             };
-            if !matches!(host.instruction(a0).mnemonic(), Mnemonic::Load(_)) {
+            if !matches!(host.insn_ref(a0).mnemonic(), Mnemonic::Load(_)) {
                 return None;
             }
             Some((e_read, seed_arr0))
@@ -211,7 +211,7 @@ fn apply<'str>(mv: &ModuleView<'_, 'str>, body: &mut FunctionBody<'str>, m: &Sca
         (
             host.type_of(m.index),
             host.shared().types.get_or_make_int(8),
-            format!("{}_scan_body", FunctionRef::new(host, fid).name()),
+            format!("{}_scan_body", host.function_ref(fid).name()),
         )
     };
     let n1 = m.count - 1;
@@ -285,7 +285,7 @@ fn apply<'str>(mv: &ModuleView<'_, 'str>, body: &mut FunctionBody<'str>, m: &Sca
     // not just before the wide store: `array_promote` may have rewritten other
     // exit loads to `at(arr_exit, k)` earlier in the block, and those get
     // redirected to the folded array below — which must therefore dominate them.
-    let Some(anchor) = BlockRef::new(host.read_host(), m.exit)
+    let Some(anchor) = host.block_ref(m.exit)
         .iter()
         .next()
         .map(|i| i.id)
@@ -293,7 +293,7 @@ fn apply<'str>(mv: &ModuleView<'_, 'str>, body: &mut FunctionBody<'str>, m: &Sca
         return false;
     };
     // Pre-existing exit instructions whose `arr_exit` uses are redirected.
-    let preexisting: Vec<InstructionId> = BlockRef::new(host.read_host(), m.exit)
+    let preexisting: Vec<InstructionId> = host.block_ref(m.exit)
         .iter()
         .map(|i| i.id)
         .collect();
@@ -360,7 +360,7 @@ fn apply<'str>(mv: &ModuleView<'_, 'str>, body: &mut FunctionBody<'str>, m: &Sca
     // `at(arr, k)` reads `array_promote` left for exit loads — to the folded
     // array, leaving the loop's own array dead for `dce`.
     for id in preexisting {
-        let mut mn = host.read_host().instruction(id).mnemonic().clone();
+        let mut mn = host.insn_ref(id).mnemonic().clone();
         mn.replace_value(m.arr_exit, full);
         host.replace_instruction_mnemonic(id, mn);
     }
@@ -380,7 +380,7 @@ fn apply<'str>(mv: &ModuleView<'_, 'str>, body: &mut FunctionBody<'str>, m: &Sca
     let private = is_loop_private(host.read_host(), &loop_blocks);
     let defined_in_loop = |host: HostRef, v: ValueId| match v {
         ValueId::BlockParam(_) => param_parent(host, v).is_some_and(|b| loop_blocks.contains(&b)),
-        ValueId::Instruction(id) => InstructionRef::new(host, id)
+        ValueId::Instruction(id) => host.insn_ref(id)
             .parent()
             .is_some_and(|b| loop_blocks.contains(&b.id)),
         _ => false,
@@ -389,7 +389,7 @@ fn apply<'str>(mv: &ModuleView<'_, 'str>, body: &mut FunctionBody<'str>, m: &Sca
     // coalesced) must be re-fed from a preheader-available value: its
     // header-edge incoming directly if loop-invariant, or — when it copies a
     // loop param — that param's own loop-invariant (preheader) incoming.
-    let exit_args: Option<Vec<ValueId>> = BlockRef::new(host.read_host(), m.exit)
+    let exit_args: Option<Vec<ValueId>> = host.block_ref(m.exit)
         .params()
         .map(|p| p.id())
         .collect::<Vec<_>>()
@@ -418,7 +418,7 @@ fn apply<'str>(mv: &ModuleView<'_, 'str>, body: &mut FunctionBody<'str>, m: &Sca
         })
         .collect();
     if private && let Some(exit_args) = exit_args {
-        let preheaders: Vec<BlockId> = BlockRef::new(host.read_host(), m.header)
+        let preheaders: Vec<BlockId> = host.block_ref(m.header)
             .predecessors()
             .map(|(_, p)| p)
             .filter(|p| !loop_blocks.contains(p))

@@ -13,7 +13,7 @@ use qcode::{
     builder::Builder,
     space::{Space, SpaceType},
     value::{
-        BlockId, BlockRef, FunctionId, FunctionRef, InstructionRef, ValueId,
+        BlockId, FunctionId, ValueId,
         insn::{InstructionId, IntrinsicId, Mnemonic},
         util::{base_ref::BaseRef, base_ref::HostRef, host_mut::HostMut},
     },
@@ -145,7 +145,7 @@ fn try_match(host: HostRef, fid: FunctionId) -> Option<MapMatch> {
     // Consumer: a RAM store of the carried array's exit view (real memory). When
     // absent (private argpromote shadow, wide temp store already dce'd) the exit
     // uses of `arr_exit` are the return envelope — the rewrite just replaces them.
-    let store_id = BlockRef::new(host, exit)
+    let store_id = host.block_ref(exit)
         .iter()
         .find_map(|i| match i.mnemonic() {
             Mnemonic::Store(s)
@@ -187,7 +187,7 @@ fn body_uses_index(
     match pure_slice(host, stored_val, &inputs) {
         Some(slice) => slice
             .iter()
-            .any(|&iid| host.instruction(iid).mnemonic().args().contains(&index)),
+            .any(|&iid| host.insn_ref(iid).mnemonic().args().contains(&index)),
         None => false,
     }
 }
@@ -207,7 +207,7 @@ fn apply<'str>(m: &ModuleView<'_, 'str>, body: &mut FunctionBody<'str>, mm: &Map
     let enum_id = IntrinsicId::from_name("enumerate").expect("enumerate registered");
     let (name, uses_index, tuple_ty) = {
         let host = body.read_host(m);
-        let name = format!("{}_map_body", FunctionRef::new(host, fid).name());
+        let name = format!("{}_map_body", host.function_ref(fid).name());
         let uses_index = body_uses_index(host, mm.ca.stored_val, mm.ca.index, mm.elem_read);
         // The enumerate element type is needed before outlining (an index-aware
         // body unpacks the `(index, elem)` tuple); resolve it while only reading.
@@ -256,7 +256,7 @@ fn apply<'str>(m: &ModuleView<'_, 'str>, body: &mut FunctionBody<'str>, mm: &Map
     // Build `map(body, enumerate(arr0))` (index-aware) or `map(body, arr0)`
     // (value-only) ahead of the consumer, then forward the exit view to it.
     let anchor = mm.store_id.or_else(|| {
-        BlockRef::new(host.read_host(), mm.exit)
+        host.block_ref(mm.exit)
             .iter()
             .next()
             .map(|i| i.id)
@@ -304,13 +304,13 @@ fn apply<'str>(m: &ModuleView<'_, 'str>, body: &mut FunctionBody<'str>, mm: &Map
     let loop_blocks = [mm.ca.header, mm.ca.body];
     let exit_users: Vec<InstructionId> = users_of(host.read_host(), mm.arr_exit).to_vec();
     for id in exit_users {
-        if InstructionRef::new(host.read_host(), id)
+        if host.insn_ref(id)
             .parent()
             .is_some_and(|b| loop_blocks.contains(&b.id))
         {
             continue;
         }
-        let mut mn = host.read_host().instruction(id).mnemonic().clone();
+        let mut mn = host.insn_ref(id).mnemonic().clone();
         mn.replace_value(mm.arr_exit, map_val);
         host.replace_instruction_mnemonic(id, mn);
     }
@@ -329,12 +329,12 @@ fn apply<'str>(m: &ModuleView<'_, 'str>, body: &mut FunctionBody<'str>, mm: &Map
     // from a preheader-available value, then delete the loop blocks.
     let defined_in_loop = |host: HostRef, v: ValueId| match v {
         ValueId::BlockParam(_) => param_parent(host, v).is_some_and(|b| loop_blocks.contains(&b)),
-        ValueId::Instruction(id) => InstructionRef::new(host, id)
+        ValueId::Instruction(id) => host.insn_ref(id)
             .parent()
             .is_some_and(|b| loop_blocks.contains(&b.id)),
         _ => false,
     };
-    let exit_args: Option<Vec<ValueId>> = BlockRef::new(host.read_host(), mm.exit)
+    let exit_args: Option<Vec<ValueId>> = host.block_ref(mm.exit)
         .params()
         .map(|p| p.id())
         .collect::<Vec<_>>()
@@ -363,7 +363,7 @@ fn apply<'str>(m: &ModuleView<'_, 'str>, body: &mut FunctionBody<'str>, mm: &Map
         })
         .collect();
     if deletable && let Some(exit_args) = exit_args {
-        let preheaders: Vec<BlockId> = BlockRef::new(host.read_host(), mm.ca.header)
+        let preheaders: Vec<BlockId> = host.block_ref(mm.ca.header)
             .predecessors()
             .map(|(_, p)| p)
             .filter(|p| !loop_blocks.contains(p))
@@ -384,7 +384,7 @@ pub(crate) fn recognize_total_map<'str>(
     body: &mut FunctionBody<'str>,
 ) -> bool {
     let fid = body.id();
-    if !FunctionRef::new(body.read_host(m), fid).is_pure() {
+    if !body.read_host(m).function_ref(fid).is_pure() {
         return false;
     }
     let Some(mm) = try_match(body.read_host(m), fid) else {

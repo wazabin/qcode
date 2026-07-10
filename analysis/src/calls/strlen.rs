@@ -21,7 +21,7 @@ use qcode::{
     builder::Builder,
     space::{Space, SpaceId, SpaceType},
     value::{
-        BlockId, BlockRef, FunctionId, FunctionRef, InstructionRef, ValueId,
+        BlockId, FunctionId, ValueId,
         insn::{
             Binop, Branch, CBranch, InstructionId, IntBinop, IntrinsicApp, IntrinsicId, Mnemonic,
         },
@@ -103,7 +103,7 @@ fn nonzero_polarity(host: HostRef, cond: ValueId, elem: ValueId) -> Option<bool>
             .flatten()
             .map(|c| c != 0)
     };
-    match host.instruction(id).mnemonic() {
+    match host.insn_ref(id).mnemonic() {
         Mnemonic::Binop(b) if matches!(b.op, Binop::Int(IntBinop::Equal | IntBinop::NotEqual)) => {
             // Negation wrapper: `sub == c` / `sub != c` over a bool sub-condition.
             // If `sub` has polarity `p`, then `sub == c` has polarity `p == c`
@@ -135,7 +135,7 @@ fn nonzero_polarity(host: HostRef, cond: ValueId, elem: ValueId) -> Option<bool>
 fn try_match_strlen(host: HostRef, fid: FunctionId) -> Option<StrlenMatch> {
     let at_id = IntrinsicId::from_name("at")?;
     let insert_id = IntrinsicId::from_name("insert")?;
-    let root_params: Vec<ValueId> = FunctionRef::new(host, fid)
+    let root_params: Vec<ValueId> = host.function_ref(fid)
         .root()?
         .params()
         .map(|p| p.id())
@@ -146,7 +146,7 @@ fn try_match_strlen(host: HostRef, fid: FunctionId) -> Option<StrlenMatch> {
     // one `at` on that array (or any `insert` into it) means the loop is not a plain
     // read-only NUL scan, so bail.
     let mut lane: Option<(InstructionId, ValueId, ValueId)> = None; // (at id, arr, idx)
-    for block in FunctionRef::new(host, fid).iter() {
+    for block in host.function_ref(fid).iter() {
         for insn in block.iter() {
             let Mnemonic::Intrinsic(IntrinsicApp { id, args }) = insn.mnemonic() else {
                 continue;
@@ -182,10 +182,10 @@ fn try_match_strlen(host: HostRef, fid: FunctionId) -> Option<StrlenMatch> {
     let header = host.block_param(pid).parent?;
     // The lane read must live in the header: the NUL test that governs the loop
     // reads it there, and the count is the index at that test.
-    if InstructionRef::new(host, at_insn).parent().map(|b| b.id) != Some(header) {
+    if host.insn_ref(at_insn).parent().map(|b| b.id) != Some(header) {
         return None;
     }
-    let k = BlockRef::new(host, header)
+    let k = host.block_ref(header)
         .params()
         .position(|p| p.id() == index)?;
     // The index must start at 0 on *every* entry edge and step by +1 on the
@@ -210,7 +210,7 @@ fn try_match_strlen(host: HostRef, fid: FunctionId) -> Option<StrlenMatch> {
     // length. Keying on the *header*'s terminator (not any matching CBranch in the
     // function) ensures the NUL test is the loop's governing exit.
     {
-        let term = BlockRef::new(host, header).iter().last()?;
+        let term = host.block_ref(header).iter().last()?;
         let Mnemonic::CBranch(CBranch {
             condition,
             success_block,
@@ -230,7 +230,7 @@ fn try_match_strlen(host: HostRef, fid: FunctionId) -> Option<StrlenMatch> {
         };
         // The exit edge must carry the index (the count) to an exit-block param.
         let kx = exit_args.iter().position(|&v| v == index)?;
-        let count_param = BlockRef::new(host, exit_block)
+        let count_param = host.block_ref(exit_block)
             .params()
             .nth(kx)
             .map(|p| p.id())?;
@@ -250,7 +250,7 @@ fn try_match_strlen(host: HostRef, fid: FunctionId) -> Option<StrlenMatch> {
         // the back-edge is the only way out of the body, so the header's NUL test is
         // the loop's *sole* data-dependent exit. Without this, a second `break`
         // (e.g. on another byte value) would make the count not the first-zero index.
-        let back_ok = BlockRef::new(host, body_block).iter().last().is_some_and(|t| {
+        let back_ok = host.block_ref(body_block).iter().last().is_some_and(|t| {
             matches!(t.mnemonic(), Mnemonic::Branch(Branch { target, .. }) if *target == header)
         });
         if !back_ok {
@@ -259,7 +259,7 @@ fn try_match_strlen(host: HostRef, fid: FunctionId) -> Option<StrlenMatch> {
 
         // The preheader is the header's sole out-of-loop predecessor: the reroute
         // source when the dead loop is deleted (there is no seed store to key on).
-        let out_of_loop: Vec<BlockId> = BlockRef::new(host, header)
+        let out_of_loop: Vec<BlockId> = host.block_ref(header)
             .predecessors()
             .map(|(_, p)| p)
             .filter(|&p| p != body_block)
@@ -273,17 +273,17 @@ fn try_match_strlen(host: HostRef, fid: FunctionId) -> Option<StrlenMatch> {
         let loop_blocks = [header, body_block];
         let in_loop = |v: ValueId| {
             users_of(host, v).iter().all(|&u| {
-                InstructionRef::new(host, u)
+                host.insn_ref(u)
                     .parent()
                     .is_some_and(|b| loop_blocks.contains(&b.id))
             })
         };
-        let exit_only_count = BlockRef::new(host, exit_block)
+        let exit_only_count = host.block_ref(exit_block)
             .params()
             .all(|p| p.id() == count_param);
         let deletable = exit_only_count
             && loop_blocks.iter().all(|&blk| {
-                let b = BlockRef::new(host, blk);
+                let b = host.block_ref(blk);
                 b.params().all(|p| p.id() == index || in_loop(p.id()))
                     && b.iter().all(|i| in_loop(ValueId::Instruction(i.id)))
             });
@@ -307,7 +307,7 @@ fn apply_strlen<'str, H: HostMut<'str>>(host: &mut H, fid: FunctionId, m: &Strle
     // take_while(@arr) then len(...) of it, inserted at the top of the exit block.
     let tw_id = IntrinsicId::from_name("take_while").expect("take_while registered");
     let len_id = IntrinsicId::from_name("len").expect("len registered");
-    let first = BlockRef::new(host.read_host(), m.exit_block)
+    let first = host.block_ref(m.exit_block)
         .iter()
         .next()
         .map(|i| i.id);
@@ -329,7 +329,7 @@ fn apply_strlen<'str, H: HostMut<'str>>(host: &mut H, fid: FunctionId, m: &Strle
         //   2. reroute the preheader straight to the (now param-less) exit,
         //   3. delete the dead loop blocks. (There is no seed store to strip — the
         //      `at`-form scan reads the root array param directly.)
-        let kx = BlockRef::new(host.read_host(), m.exit_block)
+        let kx = host.block_ref(m.exit_block)
             .params()
             .position(|p| p.id() == m.count_param);
         if let Some(kx) = kx {
@@ -359,7 +359,7 @@ fn apply_strlen<'str, H: HostMut<'str>>(host: &mut H, fid: FunctionId, m: &Strle
 /// count to `len(take_while(arr))`. Returns `true` if changed.
 fn recognize_strlen_at<'str>(m: &ModuleView<'_, 'str>, body: &mut FunctionBody<'str>) -> bool {
     let fid = body.id();
-    if !FunctionRef::new(body.read_host(m), fid).is_pure() {
+    if !body.read_host(m).function_ref(fid).is_pure() {
         return false;
     }
     let Some(sm) = try_match_strlen(body.read_host(m), fid) else {
@@ -404,9 +404,9 @@ struct StrlenPtrMatch {
 
 /// Match a raw-pointer NUL-scan in `fid`, or `None` for any other shape.
 fn try_match_strlen_ptr(host: HostRef, fid: FunctionId) -> Option<StrlenPtrMatch> {
-    for block in FunctionRef::new(host, fid).iter() {
+    for block in host.function_ref(fid).iter() {
         let header = block.id;
-        let params: Vec<ValueId> = BlockRef::new(host, header)
+        let params: Vec<ValueId> = host.block_ref(header)
             .params()
             .map(|p| p.id())
             .collect();
@@ -430,7 +430,7 @@ fn try_match_strlen_ptr(host: HostRef, fid: FunctionId) -> Option<StrlenPtrMatch
 
             // A byte load at the pointer, in real memory (not a shadow snapshot —
             // that is Layer 1's `is_temp` region).
-            let load = BlockRef::new(host, header)
+            let load = host.block_ref(header)
                 .iter()
                 .find_map(|i| match i.mnemonic() {
                     Mnemonic::Load(l) if l.ptr == s && l.size == 1 && !is_temp(host, l.space) => {
@@ -445,7 +445,7 @@ fn try_match_strlen_ptr(host: HostRef, fid: FunctionId) -> Option<StrlenPtrMatch
 
             // The header's terminator is the NUL test; its continue edge re-enters
             // the loop and its other edge leaves, carrying the end pointer.
-            let Some(term) = BlockRef::new(host, header).iter().last() else {
+            let Some(term) = host.block_ref(header).iter().last() else {
                 continue;
             };
             let Mnemonic::CBranch(CBranch {
@@ -475,7 +475,7 @@ fn try_match_strlen_ptr(host: HostRef, fid: FunctionId) -> Option<StrlenPtrMatch
             }
             // The body is an unconditional back-edge: the NUL test is the loop's
             // sole exit (else `end - base` is not the first-zero offset).
-            let back_ok = BlockRef::new(host, body_block).iter().last().is_some_and(|t| {
+            let back_ok = host.block_ref(body_block).iter().last().is_some_and(|t| {
                 matches!(t.mnemonic(), Mnemonic::Branch(Branch { target, .. }) if *target == header)
             });
             if !back_ok {
@@ -486,11 +486,11 @@ fn try_match_strlen_ptr(host: HostRef, fid: FunctionId) -> Option<StrlenPtrMatch
             // end pointer is the exit-block param fed the induction pointer. Matched
             // by `lhs - base` with `lhs` an exit param carrying `s`.
             let kx = exit_args.iter().position(|&v| v == s)?;
-            let end_param = BlockRef::new(host, exit_block)
+            let end_param = host.block_ref(exit_block)
                 .params()
                 .nth(kx)
                 .map(|p| p.id())?;
-            for b2 in FunctionRef::new(host, fid).iter() {
+            for b2 in host.function_ref(fid).iter() {
                 let bid = b2.id;
                 for i in b2.iter() {
                     if let Mnemonic::Binop(bin) = i.mnemonic()
