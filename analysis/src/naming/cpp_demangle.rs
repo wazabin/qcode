@@ -12,7 +12,6 @@
 use std::borrow::Cow;
 
 use cpp_demangle::DemangleOptions;
-use qcode::value::{FunctionRef, util::host_mut::HostMut};
 
 use crate::{ContextView, FunctionBody, FunctionPass};
 
@@ -44,12 +43,10 @@ impl FunctionPass for CppDemangle {
         f: &mut FunctionBody<'str>,
         m: ContextView<'_, 'str>,
     ) -> Result<bool, String> {
-        let fid = f.id();
-        // Read the (checked-out) function's own name, decide the demangled form,
-        // then release the read host before buffering the rename.
+        // Read the function's own name, decide the demangled form, then buffer
+        // the rename.
         let demangled: Option<String> = {
-            let host = f.host(m);
-            let name = FunctionRef::new(host.read_host(), fid).name().to_string();
+            let name = f.self_ref(m).name().to_string();
             // ELF symbol-version suffixes (`foo@@GLIBCXX_3.4`, `foo@CXXABI_1.3`)
             // aren't part of the Itanium mangling, and `Symbol::new` rejects them
             // as not well-formed. Strip from the first `@` — a mangled name never

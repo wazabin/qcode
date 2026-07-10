@@ -19,7 +19,7 @@ use std::borrow::Cow;
 use qcode::value::{
     BlockRef, FunctionId, FunctionRef,
     insn::{Branch, Mnemonic},
-    util::{base_ref::HostRef, host_mut::HostMut},
+    util::base_ref::HostRef,
 };
 
 use crate::{ContextView, FunctionBody, FunctionPass};
@@ -40,12 +40,11 @@ impl FunctionPass for NameThunks {
         m: ContextView<'_, 'str>,
     ) -> Result<bool, String> {
         let fid = f.id();
-        // Read-only analysis of the checked-out body and the callee's *interface*
-        // (its published name, read from the shared context), then release the
-        // host before buffering the self-rename.
+        // Read-only analysis of the body and the callee's *interface* (its
+        // published name, read from the shared context), then buffer the
+        // self-rename.
         let new_name: Option<String> = {
-            let host = f.host(m);
-            let hr = host.read_host();
+            let hr = f.read_host(m);
             let function = FunctionRef::new(hr, fid);
 
             // Only rename functions still carrying their generated `fn_<addr>`
