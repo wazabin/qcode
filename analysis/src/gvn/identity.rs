@@ -27,7 +27,9 @@ use qcode::value::{
 use super::fold::{all_ones, const_value};
 use std::any::Any;
 
-use super::walk::{Claim, Editor, InsnCtx, SubPass};
+use super::walk::{Claim, Editor, InsnCtx, SubPass, SubPassC};
+
+use crate::{ContextView, FunctionBody};
 
 /// Recognize the add/and/shift (and or/and) idioms and rewrite the root
 /// instruction to the single `^`/`+` it computes. The now-unused sub-expressions
@@ -79,6 +81,68 @@ impl<'str, H: HostMut<'str>> SubPass<'str, H> for Identities {
             return Claim::Done;
         }
         if simplify_compare(host, ic, ed) {
+            return Claim::Done;
+        }
+        Claim::Pass
+    }
+}
+
+/// Concrete twin of the [`SubPass`] impl above (context-split stage 5b-ii):
+/// reads route through `body.read_host(cx)`, the intrinsic/identity rewrites
+/// through `Editor`'s `_c` methods, and the constant-interning
+/// `simplify_bitwise`/`simplify_compare` helpers are reached through a scoped
+/// `body.host(cx)` (they stay generic — the generic path shares them).
+impl<'str> SubPassC<'str> for Identities {
+    fn init_state(&self) -> Box<dyn Any> {
+        Box::new(())
+    }
+
+    fn clone_state(&self, _state: &dyn Any) -> Box<dyn Any> {
+        Box::new(())
+    }
+
+    fn on_insn(
+        &self,
+        body: &mut FunctionBody<'str>,
+        cx: ContextView<'_, 'str>,
+        _state: &mut dyn Any,
+        ic: &InsnCtx,
+        ed: &mut Editor,
+    ) -> Claim {
+        if ic.mnemonic.is_terminator() || ic.size == 0 {
+            return Claim::Pass;
+        }
+        if let Mnemonic::Intrinsic(intr) = ic.mnemonic {
+            let id = intr.id;
+            let args = intr.args.clone();
+            match id.desc().simplify(body.read_host(cx), id, ic.size, &args) {
+                Some(Simplified::Value(repl)) => {
+                    ed.replace_c(body, cx, ic.insn_id, repl);
+                    return Claim::Done;
+                }
+                Some(Simplified::Expression(mnemonic)) => {
+                    ed.replace_with_new_insn_c(body, cx, ic.block_id, ic.insn_id, mnemonic, ic.size);
+                    return Claim::Done;
+                }
+                None => {}
+            }
+        }
+        if let Some(new_mnemonic) = simplify_identity(body.read_host(cx), ic.mnemonic) {
+            ed.replace_with_new_insn_c(body, cx, ic.block_id, ic.insn_id, new_mnemonic, ic.size);
+            return Claim::Done;
+        }
+        // TODO(5b-ii): `simplify_bitwise`/`simplify_compare` are shared HostMut
+        // helpers; reach them through a scoped host.
+        if {
+            let mut host = body.host(cx);
+            simplify_bitwise(&mut host, ic, ed)
+        } {
+            return Claim::Done;
+        }
+        if {
+            let mut host = body.host(cx);
+            simplify_compare(&mut host, ic, ed)
+        } {
             return Claim::Done;
         }
         Claim::Pass

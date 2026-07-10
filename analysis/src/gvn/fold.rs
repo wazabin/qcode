@@ -12,7 +12,9 @@ use qcode::{
 
 use std::any::Any;
 
-use super::walk::{Claim, Editor, InsnCtx, SubPass};
+use super::walk::{Claim, Editor, InsnCtx, SubPass, SubPassC};
+
+use crate::{ContextView, FunctionBody};
 
 /// Fold constant arithmetic and algebraic identities into interned literals.
 ///
@@ -37,6 +39,39 @@ impl<'str, H: HostMut<'str>> SubPass<'str, H> for Fold {
         match try_fold_insn(host.read_host(), ic) {
             Some(folded) => {
                 ed.replace(host, ic.insn_id, folded);
+                Claim::Done
+            }
+            None => Claim::Pass,
+        }
+    }
+}
+
+/// Concrete twin of the [`SubPass`] impl above (context-split stage 5b-ii):
+/// `try_fold_insn` reads through `body.read_host(cx)` and the fold forwards
+/// through `Editor::replace_c`.
+impl<'str> SubPassC<'str> for Fold {
+    fn init_state(&self) -> Box<dyn Any> {
+        Box::new(())
+    }
+
+    fn clone_state(&self, _state: &dyn Any) -> Box<dyn Any> {
+        Box::new(())
+    }
+
+    fn on_insn(
+        &self,
+        body: &mut FunctionBody<'str>,
+        cx: ContextView<'_, 'str>,
+        _state: &mut dyn Any,
+        ic: &InsnCtx,
+        ed: &mut Editor,
+    ) -> Claim {
+        if ic.mnemonic.is_terminator() || ic.size == 0 {
+            return Claim::Pass;
+        }
+        match try_fold_insn(body.read_host(cx), ic) {
+            Some(folded) => {
+                ed.replace_c(body, cx, ic.insn_id, folded);
                 Claim::Done
             }
             None => Claim::Pass,

@@ -481,7 +481,6 @@ impl Editor {
     }
 
     /// Concrete twin of [`replace_with_new_insn`](Self::replace_with_new_insn).
-    #[allow(dead_code)] // first used by the a.11 sub-passes (identity/flag_idiom/intrinsics)
     pub(super) fn replace_with_new_insn_c<'str>(
         &mut self,
         body: &mut FunctionBody<'str>,
@@ -497,7 +496,6 @@ impl Editor {
 
     /// Concrete twin of
     /// [`replace_with_new_insn_typed`](Self::replace_with_new_insn_typed).
-    #[allow(dead_code)] // first used by the a.11 sub-passes (identity/flag_idiom/intrinsics)
     pub(super) fn replace_with_new_insn_typed_c<'str>(
         &mut self,
         body: &mut FunctionBody<'str>,

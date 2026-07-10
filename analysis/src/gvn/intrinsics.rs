@@ -18,7 +18,9 @@ use qcode::value::{
 
 use std::any::Any;
 
-use super::walk::{Claim, Editor, InsnCtx, SubPass};
+use super::walk::{Claim, Editor, InsnCtx, SubPass, SubPassC};
+
+use crate::{ContextView, FunctionBody};
 
 /// Rewrite recognized idioms into intrinsics. Fully host-routed: the recognizer
 /// reads through a [`HostRef`](qcode::value::util::base_ref::HostRef) (own SSA
@@ -49,6 +51,50 @@ impl<'str, H: HostMut<'str>> SubPass<'str, H> for Recognize {
                 // root's width is the result width.
                 ed.replace_with_new_insn(
                     host,
+                    ic.block_id,
+                    ic.insn_id,
+                    Mnemonic::Intrinsic(IntrinsicApp { id, args }),
+                    ic.size,
+                );
+                return Claim::Done;
+            }
+        }
+        Claim::Pass
+    }
+}
+
+/// Concrete twin of the [`SubPass`] impl above (context-split stage 5b-ii): the
+/// recognizer reads through `body.read_host(cx)` and the match rewrites through
+/// `Editor::replace_with_new_insn_c`.
+impl<'str> SubPassC<'str> for Recognize {
+    fn init_state(&self) -> Box<dyn Any> {
+        Box::new(())
+    }
+
+    fn clone_state(&self, _state: &dyn Any) -> Box<dyn Any> {
+        Box::new(())
+    }
+
+    fn on_insn(
+        &self,
+        body: &mut FunctionBody<'str>,
+        cx: ContextView<'_, 'str>,
+        _state: &mut dyn Any,
+        ic: &InsnCtx,
+        ed: &mut Editor,
+    ) -> Claim {
+        if ic.size == 0 {
+            return Claim::Pass;
+        }
+        let Some(root) = root_op_of(ic.mnemonic) else {
+            return Claim::Pass;
+        };
+
+        for &id in recognizers_for(root) {
+            if let Some(args) = id.desc().recognize(body.read_host(cx), ic.insn_id) {
+                ed.replace_with_new_insn_c(
+                    body,
+                    cx,
                     ic.block_id,
                     ic.insn_id,
                     Mnemonic::Intrinsic(IntrinsicApp { id, args }),

@@ -42,7 +42,9 @@ use qcode::{
     },
 };
 
-use super::walk::{Claim, Editor, InsnCtx, SubPass};
+use super::walk::{Claim, Editor, InsnCtx, SubPass, SubPassC};
+
+use crate::{ContextView, FunctionBody};
 
 /// Fully host-routed: reads resolve through a [`HostRef`], the narrow values it
 /// materializes are pushed into the (possibly checked-out) function's own arena,
@@ -79,6 +81,53 @@ impl<'str, H: HostMut<'str>> SubPass<'str, H> for NarrowTrunc {
             return Claim::Pass;
         }
         ed.replace(host, ic.insn_id, narrowed);
+        Claim::Done
+    }
+}
+
+/// Concrete twin of the [`SubPass`] impl above (context-split stage 5b-ii):
+/// eligibility reads through `body.read_host(cx)`, the recursive `narrow_to`
+/// rewrite is reached through a scoped `body.host(cx)` (it stays generic — the
+/// generic path shares it), and the forward goes through `Editor::replace_c`.
+impl<'str> SubPassC<'str> for NarrowTrunc {
+    fn init_state(&self) -> Box<dyn Any> {
+        Box::new(())
+    }
+
+    fn clone_state(&self, _state: &dyn Any) -> Box<dyn Any> {
+        Box::new(())
+    }
+
+    fn on_insn(
+        &self,
+        body: &mut FunctionBody<'str>,
+        cx: ContextView<'_, 'str>,
+        _state: &mut dyn Any,
+        ic: &InsnCtx,
+        ed: &mut Editor,
+    ) -> Claim {
+        let Mnemonic::Range(Range {
+            src,
+            start: 0,
+            size,
+        }) = ic.mnemonic
+        else {
+            return Claim::Pass;
+        };
+        let (src, w) = (*src, *size);
+        if value_size(body.read_host(cx), src) != w && !src_transformable(body.read_host(cx), src) {
+            return Claim::Pass;
+        }
+        let mut memo: HashMap<ValueId, ValueId> = HashMap::default();
+        // TODO(5b-ii): `narrow_to` is a shared HostMut helper; scoped host.
+        let narrowed = {
+            let mut host = body.host(cx);
+            narrow_to(&mut host, src, w, ic.insn_id, ic.block_id, &mut memo)
+        };
+        if narrowed == ic.id {
+            return Claim::Pass;
+        }
+        ed.replace_c(body, cx, ic.insn_id, narrowed);
         Claim::Done
     }
 }

@@ -9,7 +9,9 @@ use qcode::value::{
 use super::fold::const_value;
 use std::any::Any;
 
-use super::walk::{Claim, Editor, InsnCtx, SubPass};
+use super::walk::{Claim, Editor, InsnCtx, SubPass, SubPassC};
+
+use crate::{ContextView, FunctionBody};
 
 /// Collapse the signed-compare flag idiom into a single `s<`, materializing the
 /// replacement before the matched instruction and forwarding its uses; the
@@ -33,6 +35,39 @@ impl<'str, H: HostMut<'str>> SubPass<'str, H> for FlagIdiom {
         match simplify_flag_idiom(host.read_host(), ic.mnemonic) {
             Some(new_mnemonic) => {
                 ed.replace_with_new_insn(host, ic.block_id, ic.insn_id, new_mnemonic, ic.size);
+                Claim::Done
+            }
+            None => Claim::Pass,
+        }
+    }
+}
+
+/// Concrete twin of the [`SubPass`] impl above (context-split stage 5b-ii):
+/// `simplify_flag_idiom` reads through `body.read_host(cx)` and the rewrite
+/// materializes through `Editor::replace_with_new_insn_c`.
+impl<'str> SubPassC<'str> for FlagIdiom {
+    fn init_state(&self) -> Box<dyn Any> {
+        Box::new(())
+    }
+
+    fn clone_state(&self, _state: &dyn Any) -> Box<dyn Any> {
+        Box::new(())
+    }
+
+    fn on_insn(
+        &self,
+        body: &mut FunctionBody<'str>,
+        cx: ContextView<'_, 'str>,
+        _state: &mut dyn Any,
+        ic: &InsnCtx,
+        ed: &mut Editor,
+    ) -> Claim {
+        if ic.mnemonic.is_terminator() || ic.size == 0 {
+            return Claim::Pass;
+        }
+        match simplify_flag_idiom(body.read_host(cx), ic.mnemonic) {
+            Some(new_mnemonic) => {
+                ed.replace_with_new_insn_c(body, cx, ic.block_id, ic.insn_id, new_mnemonic, ic.size);
                 Claim::Done
             }
             None => Claim::Pass,
