@@ -7,7 +7,7 @@ use crate::{
             Apply, Assert, Binary, Branch, BranchInd, CBranch, Call, CallInd, Carry, Extract,
             FloatToFloat, FloatToInt, Gep, IntToFloat, IntrinsicApp, IsFloatNaN, Load, LzCount,
             Map, PCodeOp, PopCount, Range, Return, ReturnValue, SBorrow, SCarry, Scan, Sext, Store,
-            Tuple, Unary, Zext,
+            TailCall, Tuple, Unary, Zext,
         },
     },
 };
@@ -75,6 +75,10 @@ pub enum Mnemonic {
     BranchInd(BranchInd),
     /// Direct call to a known function.
     Call(Call),
+    /// Tail call: a function-level transfer of control to another function's
+    /// entry (thunk / tail jump). Carries a [`FunctionId`], never a foreign
+    /// block — see [`TailCall`].
+    TailCall(TailCall),
     /// Value-level application of a pure lambda function.
     Apply(Apply),
     /// Indirect call through a computed function pointer.
@@ -140,6 +144,7 @@ impl Mnemonic {
             Mnemonic::CBranch(m) => m,
             Mnemonic::BranchInd(m) => m,
             Mnemonic::Call(m) => m,
+            Mnemonic::TailCall(m) => m,
             Mnemonic::Apply(m) => m,
             Mnemonic::CallInd(m) => m,
             Mnemonic::Return(m) => m,
@@ -199,6 +204,7 @@ impl Mnemonic {
     pub fn call_target(&self) -> Option<FunctionId> {
         match self {
             Mnemonic::Call(call) => Some(call.target),
+            Mnemonic::TailCall(tc) => Some(tc.target),
             Mnemonic::Apply(apply) => Some(apply.target),
             Mnemonic::Map(map) => Some(map.body),
             Mnemonic::Scan(scan) => Some(scan.body),
@@ -269,6 +275,13 @@ impl Mnemonic {
                 }
             }
             Mnemonic::Call(m) => {
+                m.args.iter_mut().for_each(|a| {
+                    if *a == old {
+                        *a = new;
+                    }
+                });
+            }
+            Mnemonic::TailCall(m) => {
                 m.args.iter_mut().for_each(|a| {
                     if *a == old {
                         *a = new;

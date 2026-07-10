@@ -50,7 +50,7 @@ use crate::{
             Extract, FloatBinop, FloatToFloat, FloatToInt, Gep, InstructionId, InstructionRef,
             IntBinop, IntToFloat, IntrinsicApp, IntrinsicId, IsFloatNaN, Load, LzCount, Map,
             Mnemonic, PCodeOp, PCodeOpId, PopCount, Range, Return, ReturnValue, SBorrow, SCarry,
-            Scan, Sext, Store, Tuple, Unary, Unop, Zext,
+            Scan, Sext, Store, TailCall, Tuple, Unary, Unop, Zext,
         },
         util::{base_ref::BaseRef, host_mut::HostMut},
         varnode::{Varnode, VarnodeId},
@@ -1462,6 +1462,26 @@ impl<'str, 'ctx, Ctx: HostMut<'str>> Builder<'str, 'ctx, Ctx> {
                 }),
                 0,
             )
+            .id;
+        self.is_terminated = true;
+        self.context().get_insn(id)
+    }
+
+    /// Tail call to another function's entry — a function-level terminator with
+    /// no intra-function CFG successor (see [`TailCall`](crate::value::insn::TailCall)).
+    /// Unlike [`push_branch`](Self::push_branch), this wires no CFG edge: control
+    /// leaves the function.
+    pub fn push_tail_call(&mut self, target: FunctionId) -> InstructionRef<'str, '_> {
+        self.push_tail_call_with_args(target, vec![])
+    }
+
+    pub fn push_tail_call_with_args(
+        &mut self,
+        target: FunctionId,
+        args: Vec<ValueId>,
+    ) -> InstructionRef<'str, '_> {
+        let id = self
+            .push_instruction(Mnemonic::TailCall(TailCall { target, args }), 0)
             .id;
         self.is_terminated = true;
         self.context().get_insn(id)

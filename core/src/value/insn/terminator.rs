@@ -43,6 +43,36 @@ impl MnemonicKind for BranchInd {
     }
 }
 
+/// A tail call: an unconditional transfer of control to another *function's*
+/// entry (a thunk `jmp realfunc`, or a tail `jmp`/`jcc` that the disassembler
+/// resolved to a sibling function). Unlike [`Branch`], whose target is a
+/// [`BlockId`] *within the same function*, a `TailCall` carries a
+/// [`FunctionId`]: it is a function-level terminator with no intra-function CFG
+/// successor. This is the honest encoding of cross-function control flow — the
+/// IR never stores a foreign [`BlockId`]. See the context-split design, ruling
+/// 2 ("strict IR locality").
+#[derive(Debug, Clone, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+pub struct TailCall {
+    pub target: FunctionId,
+    /// Values passed to the callee, one per inferred callee input, in order.
+    /// Empty on the freshly-lifted IR; populated once the call interface is known.
+    pub args: Vec<ValueId>,
+}
+
+impl MnemonicKind for TailCall {
+    fn opcode(&self) -> &'static str {
+        "tailcall"
+    }
+
+    fn is_terminator(&self) -> bool {
+        true
+    }
+
+    fn args(&self) -> Args {
+        SmallVec::from_vec(self.args.clone())
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub struct Apply {
     pub target: FunctionId,
@@ -189,6 +219,29 @@ mod tests {
         testing::TestContext,
         value::{BasicBlock, Function, Instruction, insn::Mnemonic},
     };
+
+    #[test]
+    fn tail_call_is_a_function_level_terminator() {
+        use crate::value::{BasicBlock, Function};
+
+        let mut ctx = Context::new();
+        let callee = Function::make_at_addr(&mut ctx, 0x2000, None).id;
+        let block = {
+            let f = ctx.anon_function();
+            BasicBlock::make(&mut ctx, f).id
+        };
+        let insn = Builder::from_block(BasicBlock::from_id_mut(&mut ctx, block))
+            .push_tail_call(callee)
+            .id;
+
+        let insn = Instruction::from_id(&ctx, insn);
+        assert!(insn.is_terminator());
+        // A tail call carries a FunctionId, is a call-graph edge, and exposes no
+        // static block target (strict IR locality: no foreign BlockId).
+        assert_eq!(insn.mnemonic().call_target(), Some(callee));
+        assert!(insn.mnemonic().target_blocks().is_empty());
+        assert_eq!(insn.as_statement().to_string(), "tailcall fn fn_2000();");
+    }
 
     #[test]
     fn qcode_emits_branch() {

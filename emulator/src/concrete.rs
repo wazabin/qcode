@@ -1140,6 +1140,21 @@ impl StandaloneEmulator {
                 return Ok(StepEvent::DirectCallEntered(target));
             }
 
+            Mnemonic::TailCall(tc) => {
+                // A tail call pops our frame and transfers to the callee's entry;
+                // the callee's `Return` returns directly to *our* caller. Mirror the
+                // old tail-`Branch`-into-entry behavior: jump to the callee root
+                // without pushing a call frame.
+                let target = tc.target;
+                self.block = Function::from_id(ctx, target)
+                    .root()
+                    .ok_or_else(|| {
+                        self.make_error(ctx, EmulatorErrorKind::EmptyFunctionRoot(target))
+                    })?
+                    .id;
+                self.idx = 0;
+            }
+
             Mnemonic::Apply(apply) => {
                 const APPLY_STEP_BUDGET: usize = 100_000;
                 let args = self

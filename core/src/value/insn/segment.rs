@@ -360,6 +360,22 @@ fn mnemonic_segments(seg: &mut Seg, m: &Mnemonic) {
             }
             seg.punct(");");
         }
+        Mnemonic::TailCall(tc) => {
+            seg.kw("tailcall fn ");
+            seg.push(
+                Function::from_id(seg.ctx, tc.target).name().to_string(),
+                TokenKind::Function,
+                Some(Link::Function(tc.target)),
+            );
+            seg.punct("(");
+            for (i, &arg) in tc.args.iter().enumerate() {
+                if i > 0 {
+                    seg.punct(", ");
+                }
+                seg.value(arg);
+            }
+            seg.punct(");");
+        }
         Mnemonic::CallInd(c) => {
             seg.kw("call ");
             seg.punct("[");
