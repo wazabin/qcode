@@ -215,7 +215,7 @@ fn build_gvn_aliases<'a, 'str: 'a>(
     host: HostRef<'a, 'str>,
     fun_id: FunctionId,
 ) -> AliasResult {
-    let ctx = m.ctx();
+    let ctx = m.shared_ctx();
     let sp_reg = ctx.registers.get(&m.env().cfg.stack_pointer).copied();
     m.env()
         .alias_base(ctx)

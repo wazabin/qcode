@@ -2,11 +2,11 @@
 //! world (Stage 5 of the parallel-function-passes plan; see `PARALLEL_PASSES.md`).
 //!
 //! A function pass reads the module's *published interface* through a shared
-//! [`ModuleView`] and mutates *only its own function* through a `&mut`
+//! [`ContextView`] and mutates *only its own function* through a `&mut`
 //! [`FunctionBody`]. The one effect on global state a pass legitimately needs (a
 //! self-rename) is **buffered** in [`Effects`] and drained by the driver at
 //! check-in, so the pass itself touches no global mutable state — which is what
-//! lets workers run in parallel with the `ModuleView` `&`-shared and the bodies
+//! lets workers run in parallel with the `ContextView` `&`-shared and the bodies
 //! disjoint `&mut`.
 //!
 //! In Stage 5 the driver drives this sequentially (checkout → run → check-in for
@@ -69,10 +69,6 @@ pub struct ContextView<'ctx, 'str> {
     env: &'ctx PipelineEnv,
 }
 
-/// Transitional alias: the old name for [`ContextView`]. Removed once every call
-/// site is migrated (stage 5b-i.3).
-pub type ModuleView<'ctx, 'str> = ContextView<'ctx, 'str>;
-
 impl<'ctx, 'str> ContextView<'ctx, 'str> {
     /// Build a view over `ctx` (with the pass's own function checked out) and the
     /// pipeline environment.
@@ -99,16 +95,6 @@ impl<'ctx, 'str> ContextView<'ctx, 'str> {
     /// yet have a narrowed accessor. Narrowed to `&Shared` in stage 5b-ii; every
     /// caller that still needs the whole context is a migration TODO.
     pub fn shared_ctx(&self) -> &'ctx Context<'str> {
-        self.ctx
-    }
-
-    /// The underlying context, for the read-only module queries a pass makes
-    /// (interners, registers, spaces, memory image, other functions' published
-    /// interface, truths). The pass's own function is absent here.
-    ///
-    /// Transitional twin of [`shared_ctx`](Self::shared_ctx); call sites migrate
-    /// to `shared_ctx` in stage 5b-i.3, after which this method is removed.
-    pub fn ctx(&self) -> &'ctx Context<'str> {
         self.ctx
     }
 }

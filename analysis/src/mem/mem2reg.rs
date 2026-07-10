@@ -3613,7 +3613,7 @@ impl FunctionPass for Mem2RegPass {
         m: ContextView<'_, 'str>,
     ) -> Result<bool, String> {
         let fun_id = f.id();
-        let ctx = m.ctx();
+        let ctx = m.shared_ctx();
         let env = m.env();
 
         // Per-function pass: scope the alias oracle to this function so the stage

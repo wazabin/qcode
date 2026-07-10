@@ -825,7 +825,7 @@ impl TypeManagerInner {
 /// The type interner: a global, append-only table of interned [`Type`]s behind a
 /// [`RwLock`] so that types can be minted through a shared `&` reference (a
 /// prerequisite for running function passes in parallel against a shared
-/// `ModuleView`). Reads — including the `get_or_make_*` hit path — take a read
+/// `ContextView`). Reads — including the `get_or_make_*` hit path — take a read
 /// lock; only a cache miss takes the write lock (and re-checks under it).
 /// Interned [`TypeId`]s are globally stable and never remapped.
 pub struct TypeManager {

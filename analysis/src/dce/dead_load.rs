@@ -2185,13 +2185,13 @@ crate::register_function_pass!(DeadStore);
 /// stack-vs-global and own-frame disjointness rules. Falls back to an inert frame
 /// when no stack-pointer register is registered. Reads the function through the
 /// checked-out `host`; the module-wide alias base and stack-pointer register come
-/// from the [`ModuleView`].
+/// from the [`ContextView`].
 fn frame_aware_aliases<'a, 'str: 'a>(
     m: ContextView<'_, 'str>,
     host: HostRef<'a, 'str>,
     fun_id: FunctionId,
 ) -> AliasResult {
-    let ctx = m.ctx();
+    let ctx = m.shared_ctx();
     let env = m.env();
     let sp_reg = ctx.registers.get(&env.cfg.stack_pointer).copied();
     env.alias_base(ctx)

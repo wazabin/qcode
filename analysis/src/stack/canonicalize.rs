@@ -141,7 +141,7 @@ impl FunctionPass for CanonicalizeSpSlots {
         f: &mut FunctionBody<'str>,
         m: ContextView<'_, 'str>,
     ) -> std::result::Result<bool, String> {
-        let sp_reg = m.ctx().registers[&m.env().cfg.stack_pointer];
+        let sp_reg = m.shared_ctx().registers[&m.env().cfg.stack_pointer];
         let fid = f.id();
         let mut host = f.host(m);
         Ok(canonicalize_sp_slots(&mut host, fid, sp_reg))

@@ -3,7 +3,7 @@
 //! Every pass that can appear in a pipeline TOML implements one of two traits:
 //!
 //! - [`FunctionPass`] — operates on a single function through the restricted,
-//!   parallel-safe [`ModuleView`]/[`FunctionBody`] surface. Most optimizations
+//!   parallel-safe [`ContextView`]/[`FunctionBody`] surface. Most optimizations
 //!   (mem2reg, gvn, dce, …) are these. Function-scoped TOML stages run them
 //!   function-major and can loop them to a per-function fixpoint.
 //! - [`Pass`] — operates on the whole program (`Context`). The interprocedural
@@ -163,11 +163,11 @@ pub trait DynFunctionPass: Send + Sync {
 ///
 /// The litmus test the signature enforces: **a function pass may read the
 /// module's published interface and mutate its own function — nothing else.** It
-/// reads the module through a `&`-shared [`ModuleView`] and mutates only its own
+/// reads the module through a `&`-shared [`ContextView`] and mutates only its own
 /// [`FunctionBody`], buffering the one legitimate global effect (a self-rename)
 /// for the driver to replay at
 /// check-in. With no path to global mutable state, workers can run these in
-/// parallel (Stage 6) with the `ModuleView` shared and the bodies disjoint.
+/// parallel (Stage 6) with the `ContextView` shared and the bodies disjoint.
 ///
 /// The [`FunctionPassAdapter`] lets a `FunctionPass` be stored and driven through the
 /// object-safe [`DynFunctionPass`] the registry speaks (it performs the checkout →
@@ -193,7 +193,7 @@ pub trait FunctionPass: Default {
 /// protocol in one place:
 ///
 /// 1. Check the target function out of the context ([`Context::checkout_function`]).
-/// 2. Build a [`ModuleView`] over the now-disjoint `&Context` and run the pass on
+/// 2. Build a [`ContextView`] over the now-disjoint `&Context` and run the pass on
 ///    the owned [`FunctionBody`].
 /// 3. Check the function back in and replay any buffered [`Effects`] in place.
 ///
@@ -247,7 +247,7 @@ impl<T: FunctionPass + Send + Sync> DynFunctionPass for FunctionPassAdapter<T> {
             Vec::new()
         };
         // Check out: the pass owns its function exclusively; the context it reads
-        // through `ModuleView` no longer holds (and so cannot alias) that function.
+        // through `ContextView` no longer holds (and so cannot alias) that function.
         let before_targets = ctx.direct_call_targets(fun_id);
         let fun = ctx.checkout_function(fun_id);
         let mut body = FunctionBody::new(fun_id, fun, reserved);

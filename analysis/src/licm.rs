@@ -366,7 +366,7 @@ fn build_aliases<'a, 'str: 'a>(
     host: HostRef<'a, 'str>,
     fun_id: FunctionId,
 ) -> Option<AliasResult> {
-    let ctx = m.ctx();
+    let ctx = m.shared_ctx();
     let env = m.env();
     let sp_reg = ctx.registers.get(&env.cfg.stack_pointer).copied()?;
     Some(

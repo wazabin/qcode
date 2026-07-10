@@ -1,7 +1,7 @@
 //! Append-only interners for constants (literals and byte blobs), wrapped in an
 //! `RwLock` so they can be **minted through a shared `&` reference** — the
 //! prerequisite for a function pass creating a constant while it holds only
-//! `&ModuleView`. Interned ids are globally stable and never remapped.
+//! a `ContextView`. Interned ids are globally stable and never remapped.
 //!
 //! Reads (`Index`) return a `&T` that outlives the read guard. This is sound
 //! because the backing [`Registry`] is *address-stable*: it never moves an

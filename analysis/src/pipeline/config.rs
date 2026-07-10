@@ -1779,7 +1779,7 @@ struct WorkerOutput {
 /// Run a stage across `threads` worker threads (Stage 6 of the
 /// parallel-passes plan). Checks out the whole worklist, runs each function's pass
 /// fixpoint on a disjoint `&mut FunctionBody` on a `std::thread::scope` worker over
-/// the `&`-shared [`ModuleView`], then checks the results back in **in worklist
+/// the `&`-shared [`ContextView`], then checks the results back in **in worklist
 /// order**. Output is byte-identical to the sequential path: the frozen module
 /// view, deterministic (contiguous, worklist-ordered) work assignment, and
 /// worklist-ordered check-in leave nothing to run-to-run chance.
