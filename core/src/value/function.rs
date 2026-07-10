@@ -31,13 +31,45 @@ use crate::{
 #[derive(Identifier)]
 pub struct FunctionId(u32);
 
-#[derive(Clone, serde::Serialize, serde::Deserialize)]
-pub struct Function<'str> {
+/// Everything a *caller* reasons about a function: its name, address, semantic
+/// kind, external-ness, and ABI/analysis signature. This is the caller-reasoning
+/// surface (ruling 1 of the context-split design): it is precisely the data a
+/// function pass may read about *another* function. Its counterpart is the
+/// function *body* (arenas, roster, users, local names) — everything only the
+/// function's own passes touch.
+///
+/// In this stage the interface lives inline inside [`Function`] (which
+/// [`Deref`](std::ops::Deref)s to it so existing `function.name` / `.signature`
+/// call sites are untouched); a later stage hoists it into its own registry.
+#[derive(Clone, Default, serde::Serialize, serde::Deserialize)]
+pub struct FunctionInterface<'str> {
     /// The function's name.
     pub name: Cow<'str, str>,
 
     /// Optional entry address (from binary).
     pub address: Option<u64>,
+
+    /// Whether this is an external (imported) function.
+    ///
+    /// External functions have no lifted body — they are stubs for calls that
+    /// go outside the binary (e.g. PLT thunks for shared-library functions).
+    /// The recursive disassembler will not attempt to lift their body.
+    pub is_external: bool,
+
+    /// Optional ABI description used by alias analysis.
+    pub signature: Option<FunctionSignature>,
+
+    /// What semantic class this function belongs to.
+    #[serde(default)]
+    pub kind: FunctionKind,
+}
+
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
+pub struct Function<'str> {
+    /// The caller-reasoning surface (name, address, kind, external-ness,
+    /// signature). [`Function`] derefs to this, so `f.name`, `f.signature`, etc.
+    /// resolve here transparently.
+    pub interface: FunctionInterface<'str>,
 
     /// The entry block (dominates all other blocks in this function).
     pub root: Option<BlockId>,
@@ -75,20 +107,6 @@ pub struct Function<'str> {
     /// across optimization (which merges blocks and rewrites the IR), so the
     /// raw disassembly view can be reconstructed regardless of CFG changes.
     pub instruction_addrs: BTreeSet<u64>,
-
-    /// Whether this is an external (imported) function.
-    ///
-    /// External functions have no lifted body — they are stubs for calls that
-    /// go outside the binary (e.g. PLT thunks for shared-library functions).
-    /// The recursive disassembler will not attempt to lift their body.
-    pub is_external: bool,
-
-    /// Optional ABI description used by alias analysis.
-    pub signature: Option<FunctionSignature>,
-
-    /// What semantic class this function belongs to.
-    #[serde(default)]
-    pub kind: FunctionKind,
 
     /// Function-local name table for this function's block, instruction, and
     /// block-param names (ruling 1 of the parallel-passes plan). Keeping these
@@ -130,11 +148,29 @@ pub enum FunctionKind {
     Sentinel,
 }
 
+impl<'str> std::ops::Deref for Function<'str> {
+    type Target = FunctionInterface<'str>;
+    fn deref(&self) -> &Self::Target {
+        &self.interface
+    }
+}
+
+impl std::ops::DerefMut for Function<'_> {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.interface
+    }
+}
+
 impl<'str> Function<'str> {
     fn new(name: Cow<'str, str>) -> Self {
         Self {
-            name,
-            address: None,
+            interface: FunctionInterface {
+                name,
+                address: None,
+                is_external: false,
+                signature: None,
+                kind: FunctionKind::Machine,
+            },
             root: None,
             insns: Registry::default(),
             blocks: Registry::default(),
@@ -142,9 +178,6 @@ impl<'str> Function<'str> {
             params: Registry::default(),
             edges: Registry::default(),
             instruction_addrs: BTreeSet::new(),
-            is_external: false,
-            signature: None,
-            kind: FunctionKind::Machine,
             names: crate::context::NameTable::default(),
             users: FxHashMap::default(),
         }
@@ -194,8 +227,7 @@ impl<'str> Function<'str> {
     /// function never occurred.
     pub fn interface_shell(&self) -> Self {
         Self {
-            name: self.name.clone(),
-            address: self.address,
+            interface: self.interface.clone(),
             root: None,
             insns: Registry::default(),
             blocks: Registry::default(),
@@ -203,9 +235,6 @@ impl<'str> Function<'str> {
             params: Registry::default(),
             edges: Registry::default(),
             instruction_addrs: BTreeSet::new(),
-            is_external: self.is_external,
-            signature: self.signature.clone(),
-            kind: self.kind,
             names: crate::context::NameTable::default(),
             users: FxHashMap::default(),
         }
