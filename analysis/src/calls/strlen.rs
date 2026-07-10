@@ -308,12 +308,18 @@ fn try_match_strlen(host: HostRef, fid: FunctionId) -> Option<StrlenMatch> {
 /// Rewrite a matched NUL-scan: replace the escaping count with
 /// `len(take_while(@arr))`, then (when the scan is wholly private) strip the seed
 /// and delete the dead loop.
-fn apply_strlen<'str, H: HostMut<'str>>(host: &mut H, fid: FunctionId, m: &StrlenMatch) -> bool {
+fn apply_strlen<'str>(
+    body: &mut FunctionBody<'str>,
+    cx: ContextView<'_, 'str>,
+    fid: FunctionId,
+    m: &StrlenMatch,
+) -> bool {
     // take_while(@arr) then len(...) of it, inserted at the top of the exit block.
     let tw_id = IntrinsicId::from_name("take_while").expect("take_while registered");
     let len_id = IntrinsicId::from_name("len").expect("len registered");
-    let first = host.block_ref(m.exit_block).iter().next().map(|i| i.id);
+    let first = body.block_ref(cx, m.exit_block).iter().next().map(|i| i.id);
     let len_val = {
+        let mut host = body.host(cx);
         let mut b = Builder::from_block(BaseRef::new(host.reborrow_host(), m.exit_block));
         if let Some(at) = first {
             b.set_insert_point_before(at);
@@ -321,7 +327,7 @@ fn apply_strlen<'str, H: HostMut<'str>>(host: &mut H, fid: FunctionId, m: &Strle
         let tw = b.push_intrinsic(tw_id, vec![m.arr]).id();
         b.push_intrinsic(len_id, vec![tw]).id()
     };
-    host.replace_all_uses_with(m.count_param, len_val);
+    body.replace_all_uses_with(cx, m.count_param, len_val);
 
     if m.deletable {
         // The count was the loop's only escape and is now forwarded to `len`, so the
@@ -331,13 +337,17 @@ fn apply_strlen<'str, H: HostMut<'str>>(host: &mut H, fid: FunctionId, m: &Strle
         //   2. reroute the preheader straight to the (now param-less) exit,
         //   3. delete the dead loop blocks. (There is no seed store to strip — the
         //      `at`-form scan reads the root array param directly.)
+        // `remove_params_from_block` and `delete_private_loop` are still host-generic
+        // (cross-module helpers, migrated in their own chunks), so drive them through a
+        // scoped `body.host(cx)`.
+        let mut host = body.host(cx);
         let kx = host
             .block_ref(m.exit_block)
             .params()
             .position(|p| p.id() == m.count_param);
         if let Some(kx) = kx {
             crate::dce::remove_params_from_block_host_generic(
-                host,
+                &mut host,
                 m.exit_block,
                 &HashSet::from_iter([kx]),
             );
@@ -345,7 +355,7 @@ fn apply_strlen<'str, H: HostMut<'str>>(host: &mut H, fid: FunctionId, m: &Strle
         // Reroute the preheader straight to the (now param-less) exit and delete the
         // dead loop blocks (body before header, as they were emitted).
         delete_private_loop(
-            host,
+            &mut host,
             fid,
             m.preheader,
             &[m.body_block, m.header_block],
@@ -368,7 +378,7 @@ fn recognize_strlen_at<'str>(m: ContextView<'_, 'str>, body: &mut FunctionBody<'
     let Some(sm) = try_match_strlen(body.read_host(m), fid) else {
         return false;
     };
-    apply_strlen(&mut body.host(m), fid, &sm)
+    apply_strlen(body, m, fid, &sm)
 }
 
 // ===========================================================================
@@ -515,17 +525,22 @@ fn try_match_strlen_ptr(host: HostRef, fid: FunctionId) -> Option<StrlenPtrMatch
 
 /// Rewrite a matched raw-pointer scan: replace its `end - base` difference with
 /// `len(take_while(@base))` over the unbounded string at `@base`.
-fn apply_strlen_ptr<'str, H: HostMut<'str>>(host: &mut H, m: &StrlenPtrMatch) -> bool {
+fn apply_strlen_ptr<'str>(
+    body: &mut FunctionBody<'str>,
+    cx: ContextView<'_, 'str>,
+    m: &StrlenPtrMatch,
+) -> bool {
     let tw_id = IntrinsicId::from_name("take_while").expect("take_while registered");
     let len_id = IntrinsicId::from_name("len").expect("len registered");
     let len_val = {
+        let mut host = body.host(cx);
         let mut b = Builder::from_block(BaseRef::new(host.reborrow_host(), m.diff_block));
         b.set_insert_point_before(m.diff_id);
         let tw = b.push_intrinsic(tw_id, vec![m.base]).id();
         b.push_intrinsic(len_id, vec![tw]).id()
     };
-    host.replace_all_uses_with(ValueId::Instruction(m.diff_id), len_val);
-    host.remove_instruction(m.diff_id);
+    body.replace_all_uses_with(cx, ValueId::Instruction(m.diff_id), len_val);
+    body.remove_instruction(cx, m.diff_id);
     // The scan now produces nothing used outside it; later DCE removes the dead loop.
     true
 }
@@ -536,7 +551,7 @@ fn recognize_strlen_ptr<'str>(m: ContextView<'_, 'str>, body: &mut FunctionBody<
     let Some(sm) = try_match_strlen_ptr(body.read_host(m), body.id()) else {
         return false;
     };
-    apply_strlen_ptr(&mut body.host(m), &sm)
+    apply_strlen_ptr(body, m, &sm)
 }
 
 #[derive(Default)]
