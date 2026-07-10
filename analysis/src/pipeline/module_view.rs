@@ -57,12 +57,23 @@ impl<'str> Effects<'str> {
 /// v1 wraps `&Context` and `&PipelineEnv`. Because the driver checks the pass's
 /// own function *out* of the context before building the view, reading the
 /// context here never aliases the `&mut FunctionBody` the pass also holds.
-pub struct ModuleView<'ctx, 'str> {
+///
+/// This is the target `ContextView` of the context-split migration (stage 5b):
+/// morally a bodies-free view of the module (arch, interners, interfaces, env),
+/// transitionally still wrapping a whole `&Context` until the `split()` reshape
+/// (5b-ii) narrows it to `&Shared`. It is `Copy` (it holds only shared
+/// references), so a worker hands the same view to every helper and sub-ref.
+#[derive(Clone, Copy)]
+pub struct ContextView<'ctx, 'str> {
     ctx: &'ctx Context<'str>,
     env: &'ctx PipelineEnv,
 }
 
-impl<'ctx, 'str> ModuleView<'ctx, 'str> {
+/// Transitional alias: the old name for [`ContextView`]. Removed once every call
+/// site is migrated (stage 5b-i.3).
+pub type ModuleView<'ctx, 'str> = ContextView<'ctx, 'str>;
+
+impl<'ctx, 'str> ContextView<'ctx, 'str> {
     /// Build a view over `ctx` (with the pass's own function checked out) and the
     /// pipeline environment.
     pub fn new(ctx: &'ctx Context<'str>, env: &'ctx PipelineEnv) -> Self {
@@ -75,9 +86,28 @@ impl<'ctx, 'str> ModuleView<'ctx, 'str> {
         self.env
     }
 
+    /// The published interface of function `f` (name, address, signature, purity,
+    /// clobber/write summaries) — the caller-reasoning surface. Interfaces are
+    /// never checked out, so this always reads the shared registry.
+    pub fn interface(&self, f: FunctionId) -> &'ctx FunctionInterface<'str> {
+        &self.ctx.values.interfaces[f]
+    }
+
+    /// The underlying whole `&Context` — the transitional escape hatch for the
+    /// read-only module queries a pass makes (interners, registers, spaces,
+    /// memory image, other functions' published interface, truths) that do not
+    /// yet have a narrowed accessor. Narrowed to `&Shared` in stage 5b-ii; every
+    /// caller that still needs the whole context is a migration TODO.
+    pub fn shared_ctx(&self) -> &'ctx Context<'str> {
+        self.ctx
+    }
+
     /// The underlying context, for the read-only module queries a pass makes
     /// (interners, registers, spaces, memory image, other functions' published
     /// interface, truths). The pass's own function is absent here.
+    ///
+    /// Transitional twin of [`shared_ctx`](Self::shared_ctx); call sites migrate
+    /// to `shared_ctx` in stage 5b-i.3, after which this method is removed.
     pub fn ctx(&self) -> &'ctx Context<'str> {
         self.ctx
     }

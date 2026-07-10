@@ -25,7 +25,7 @@ pub use config::{
     list_user_pipelines_in, load_named_user_pipeline_in,
 };
 pub use lifter::{LiftOutcome, LiftSummary, Lifter, PipelineServices};
-pub use module_view::{Effects, FunctionBody, Minted, ModuleView};
+pub use module_view::{ContextView, Effects, FunctionBody, Minted, ModuleView};
 
 /// Install a set of minted functions into their reserved slots (test-only shim
 /// over the check-in installer, so `test_util::with_minting` can exercise the
