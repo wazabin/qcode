@@ -163,9 +163,7 @@ fn classify(
         .collect();
 
     // The exit returns a single value; we project it from the result tuple.
-    let Some(ret_val) = block_return_value(ctx, exit_block) else {
-        return None;
-    };
+    let ret_val = block_return_value(ctx, exit_block)?;
     let exit_params: Vec<BlockParamId> = BlockRef::new(ctx, exit_block)
         .params()
         .map(|p| p.id)

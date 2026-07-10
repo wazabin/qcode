@@ -17,52 +17,58 @@
 //! ```
 //!
 //! The header `<head>` together with everything reachable from it (the body
-//! region and the exit/return blocks) is moved verbatim into a fresh lambda
-//! whose root is `<head>` and whose parameters are the loop-carried state `S`.
-//! Each back-edge `goto <head @s0=next...>` is rewritten into
-//! `%r = apply rec(next...); return %r`, turning one loop iteration into one
-//! recursive call. The original entry becomes `%r = apply rec(init...);
-//! return %r`.
+//! region and the exit/return blocks) is cloned into a fresh lambda whose root is
+//! the cloned `<head>` and whose parameters are the loop-carried state `S`. Each
+//! back-edge `goto <head @s0=next...>` becomes `%r = apply rec(next...); return
+//! %r` in the clone, turning one loop iteration into one recursive call. The
+//! original entry becomes `%r = apply rec(init...); return %r`, and the host copy
+//! of the region is deleted.
 //!
-//! Because the header/body/exit blocks are reused unchanged, the transform is
-//! correct by construction — there is no recurrence to derive and get wrong.
+//! (As a checked-out function pass it *clones* rather than moves the region: a
+//! minted lambda may not own blocks stored in the host's arena.) Because the
+//! region is reproduced verbatim except for the back-edge rewrite, the transform
+//! is correct by construction — there is no recurrence to derive and get wrong.
 
 use std::borrow::Cow;
 use std::collections::HashSet;
 
+use rustc_hash::FxHashMap as HashMap;
+
 use qcode::{
     builder::Builder,
-    context::Context,
     value::{
-        BasicBlock, Function, FunctionId, ValueId,
+        BlockRef, FunctionId, FunctionKind, FunctionRef, InstructionRef, ValueId,
         block::BlockId,
+        block_param::BlockParam,
         insn::{Branch, InstructionId, Mnemonic},
+        util::{base_ref::BaseRef, host_mut::HostMut},
     },
 };
 
-use crate::{FunctionPass, PipelineEnv};
+use crate::pipeline::{FunctionBody, ModuleView};
+use crate::{FunctionPassV2, register_function_pass_v2};
 
 #[derive(Default)]
 pub struct LoopToRecursion;
 
-impl FunctionPass for LoopToRecursion {
+impl FunctionPassV2 for LoopToRecursion {
     const NAME: &'static str = "loop_to_recursion";
+    const MINTS: bool = true;
 
     fn description(&self) -> &'static str {
         "Recover counted loops as recursive lambda applications"
     }
 
-    fn run(
+    fn run<'str>(
         &self,
-        ctx: &mut Context,
-        fun_id: FunctionId,
-        _env: &PipelineEnv,
+        m: &ModuleView<'_, 'str>,
+        f: &mut FunctionBody<'str>,
     ) -> Result<bool, String> {
-        Ok(loop_to_recursion(ctx, fun_id))
+        Ok(loop_to_recursion(m, f))
     }
 }
 
-crate::register_function_pass!(LoopToRecursion);
+register_function_pass_v2!(LoopToRecursion);
 
 #[derive(Debug, Clone)]
 pub(crate) struct LoopModel {
@@ -79,12 +85,11 @@ pub(crate) struct LoopModel {
     pub(crate) back_edges: Vec<(BlockId, Vec<ValueId>)>,
 }
 
-pub fn loop_to_recursion(ctx: &mut Context, fun_id: FunctionId) -> bool {
-    let Some(model) = recognize_loop(&*ctx, fun_id) else {
+pub fn loop_to_recursion<'str>(m: &ModuleView<'_, 'str>, body: &mut FunctionBody<'str>) -> bool {
+    let Some(model) = recognize_loop(body.read_host(m), body.id()) else {
         return false;
     };
-    transform(ctx, fun_id, &model);
-    true
+    transform(m, body, &model)
 }
 
 pub(crate) fn recognize_loop<'a, 'str: 'a>(
@@ -157,45 +162,188 @@ pub(crate) fn recognize_loop<'a, 'str: 'a>(
     })
 }
 
-fn transform(ctx: &mut Context, host: FunctionId, model: &LoopModel) {
-    let host_name = Function::from_id(ctx, host).name().to_owned();
-    let name = ctx.get_unique_name(Cow::Owned(format!("{host_name}_rec")));
-    let rec = Function::make_lambda(ctx, name)
-        .expect("recursive lambda name was deduplicated")
-        .id;
+fn transform<'str>(
+    m: &ModuleView<'_, 'str>,
+    body: &mut FunctionBody<'str>,
+    model: &LoopModel,
+) -> bool {
+    let host_fid = body.id();
+    let name = format!(
+        "{}_rec",
+        FunctionRef::new(body.read_host(m), host_fid).name()
+    );
+    // Mint the recursive lambda (name buffered raw; the driver uniquifies it at
+    // check-in). `None` (pool exhausted) leaves the loop alone.
+    let Some(rec) = body.mint_function(Cow::Owned(name), FunctionKind::Lambda, true) else {
+        return false;
+    };
 
-    // Move the header/body/exit region out of the host and into the new lambda.
-    // `add_block` re-homes: it drops the block from the host's ownership roster
-    // and claims it for `rec` (calling `remove_block` first would *tombstone* it).
-    for &block in &model.region {
-        Function::from_id_mut(ctx, rec).add_block(block);
+    // The set of back-edge latch blocks: their `goto head` terminator becomes an
+    // `apply rec(next…); return` in the clone, so it is cloned specially.
+    let latches: HashSet<BlockId> = model.back_edges.iter().map(|(p, _)| *p).collect();
+
+    // --- Clone the region into the lambda (a checked-out pass may not *move*
+    //     host blocks into another function — that would leave `rec` owning
+    //     host-stored blocks, which the checked-out invariant forbids — so the
+    //     region is reproduced, and the host copy deleted below).
+    {
+        let (own, mut minted) = body.host_with_minted(m, rec);
+
+        // Pass 1: a fresh block per region block, with its params cloned. Names
+        // and the head-as-root are set here so later passes can reference them.
+        let mut block_map: HashMap<BlockId, BlockId> = HashMap::default();
+        let mut value_map: HashMap<ValueId, ValueId> = HashMap::default();
+        for &ob in &model.region {
+            let nb = minted.make_block(rec);
+            block_map.insert(ob, nb);
+            if let Some(name) = BlockRef::new(own, ob).name() {
+                let _ =
+                    BaseRef::new(minted.reborrow(), nb).rename_local(Cow::Owned(name.to_owned()));
+            }
+            let params: Vec<(
+                qcode::value::block_param::BlockParamId,
+                qcode::types::TypeId,
+            )> = BlockRef::new(own, ob)
+                .params()
+                .map(|p| {
+                    let pid = match p.id() {
+                        ValueId::BlockParam(pid) => pid,
+                        _ => unreachable!("block params are BlockParam values"),
+                    };
+                    (pid, own.block_param(pid).type_id)
+                })
+                .collect();
+            for (pid, ty) in params {
+                let np = push_param(&mut minted, nb, ty);
+                value_map.insert(ValueId::BlockParam(pid), np);
+            }
+        }
+        minted.function_mut(rec).root = Some(block_map[&model.head]);
+
+        // Pass 2: clone every non-terminator instruction (and the terminator of a
+        // non-latch block), remapping block targets now (the map is complete) and
+        // recording the value map so operands are remapped once all defs exist.
+        let mut cloned: Vec<InstructionId> = Vec::new();
+        for &ob in &model.region {
+            let nb = block_map[&ob];
+            let insns: Vec<InstructionId> = BlockRef::new(own, ob).iter().map(|i| i.id).collect();
+            let last = insns.last().copied();
+            for iid in insns {
+                let is_latch_term = latches.contains(&ob) && Some(iid) == last;
+                if is_latch_term {
+                    continue; // becomes `apply rec(next…); return` in pass 4
+                }
+                let r = InstructionRef::new(own, iid);
+                let mut mn = r.mnemonic().clone();
+                let ty = r.type_id();
+                remap_block_targets(&mut mn, &block_map);
+                let new_id = minted.push_mnemonic_with_type(rec, mn, ty);
+                BaseRef::new(minted.reborrow(), nb).push_insn(new_id);
+                value_map.insert(ValueId::Instruction(iid), ValueId::Instruction(new_id));
+                cloned.push(new_id);
+            }
+        }
+
+        // Pass 3: remap value operands of the cloned instructions (region params
+        // and defs), and add CFG edges for the cloned (non-latch) terminators.
+        for &new_id in &cloned {
+            let mut mn = minted.read_host().instruction(new_id).mnemonic().clone();
+            let mut touched = false;
+            for a in mn.args() {
+                if let Some(&n) = value_map.get(&a) {
+                    mn.replace_value(a, n);
+                    touched = true;
+                }
+            }
+            if touched {
+                // Keeps the minted function's reverse-use map in sync.
+                minted.replace_instruction_mnemonic(new_id, mn);
+            }
+        }
+        for &ob in &model.region {
+            if latches.contains(&ob) {
+                continue;
+            }
+            let nb = block_map[&ob];
+            let succs: Vec<BlockId> = BlockRef::new(own, ob)
+                .successors()
+                .map(|(_, s)| s)
+                .collect();
+            for s in succs {
+                if let Some(&ns) = block_map.get(&s) {
+                    minted.add_cfg_edge(nb, ns);
+                }
+            }
+        }
+
+        // Pass 4: each latch's `goto head` becomes `%r = apply rec(next…); return %r`.
+        for (pred, next_args) in &model.back_edges {
+            let nb = block_map[pred];
+            let args: Vec<ValueId> = next_args
+                .iter()
+                .map(|a| value_map.get(a).copied().unwrap_or(*a))
+                .collect();
+            let mut b = Builder::from_block(BaseRef::new(minted.reborrow_host(), nb));
+            let out = b.push_apply(rec, args).id();
+            b.push_return_value(out);
+        }
     }
-    Function::from_id_mut(ctx, rec)
-        .set_root(model.head)
-        .expect("header has no conflicting address");
 
-    // Each back-edge becomes a recursive call: one loop iteration per frame.
-    for (pred, next_args) in &model.back_edges {
-        replace_terminator_with_apply(ctx, *pred, rec, next_args.clone());
+    // --- Host: the entry seeds the recursion and returns it; delete the region.
+    let mut host = body.host(m);
+    if let Some(term) = terminator_id(host.read_host(), model.root) {
+        host.remove_instruction(term);
     }
-
-    // The host entry seeds the recursion with the initial state and returns it.
-    replace_terminator_with_apply(ctx, model.root, rec, model.init_args.clone());
+    {
+        let mut b = Builder::from_block(BaseRef::new(host.reborrow_host(), model.root));
+        let out = b.push_apply(rec, model.init_args.clone()).id();
+        b.push_return_value(out);
+    }
+    for &blk in &model.region {
+        BaseRef::new(host.reborrow_host(), blk).delete(host_fid);
+    }
+    true
 }
 
-/// Drops `block`'s terminator and appends `%r = apply target(args); return %r`.
-fn replace_terminator_with_apply(
-    ctx: &mut Context,
+/// Push a cloned param typed `ty` onto `block`, returning its value (host-routed
+/// `BasicBlock::push_param` + the `type_id` write).
+fn push_param<'str, H: HostMut<'str>>(
+    host: &mut H,
     block: BlockId,
-    target: FunctionId,
-    args: Vec<ValueId>,
-) {
-    if let Some(term) = terminator_id((&*ctx).into(), block) {
-        ctx.remove_instruction(term);
+    ty: qcode::types::TypeId,
+) -> ValueId {
+    let index = host.read_host().block(block).params.len();
+    let pid = host.push_block_param(
+        block.func,
+        BlockParam {
+            index,
+            type_id: ty,
+            parent: Some(block),
+            name: None,
+            origin: None,
+            protected: false,
+        },
+    );
+    host.block_mut(block).params.push(pid);
+    ValueId::BlockParam(pid)
+}
+
+/// Rewrite the block targets of a cloned terminator through `block_map` (value
+/// operands are remapped separately, once every region def is cloned).
+fn remap_block_targets(mn: &mut Mnemonic, block_map: &HashMap<BlockId, BlockId>) {
+    let remap = |b: &mut BlockId| {
+        if let Some(&nb) = block_map.get(b) {
+            *b = nb;
+        }
+    };
+    match mn {
+        Mnemonic::Branch(br) => remap(&mut br.target),
+        Mnemonic::CBranch(cb) => {
+            remap(&mut cb.success_block);
+            remap(&mut cb.failure_block);
+        }
+        _ => {}
     }
-    let mut b = Builder::from_block(BasicBlock::from_id_mut(ctx, block));
-    let out = b.push_apply(target, args).id();
-    b.push_return_value(out);
 }
 
 /// Blocks reachable from `start` within `fun_id`, following CFG successors.
@@ -254,8 +402,11 @@ fn terminator_mnemonic<'a, 'str: 'a>(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use qcode::{context::Context, value::Function};
     use qcode_emulator::{SizedValue, StandaloneEmulator};
     use qcode_macro::qcode;
+
+    use crate::test_util::run_function_pass_v2;
 
     fn run(ctx: &Context, fun: FunctionId, n: u64) -> Option<u64> {
         let root = Function::from_id(ctx, fun).root().expect("root").id;
@@ -293,7 +444,7 @@ mod tests {
             "
         );
 
-        assert!(loop_to_recursion(&mut ctx, fib_loop));
+        assert!(run_function_pass_v2::<LoopToRecursion>(&mut ctx, fib_loop).unwrap());
 
         // The host entry is now just `apply rec(init); return`.
         let fib = Function::from_id(&ctx, fib_loop);
@@ -341,7 +492,7 @@ mod tests {
             "
         );
 
-        assert!(loop_to_recursion(&mut ctx, fact));
+        assert!(run_function_pass_v2::<LoopToRecursion>(&mut ctx, fact).unwrap());
         assert!(Function::from_name(&ctx, "fact_rec").unwrap().is_lambda());
 
         assert_eq!(run(&ctx, fact, 5), Some(120));
@@ -376,7 +527,7 @@ mod tests {
             "
         );
 
-        assert!(loop_to_recursion(&mut ctx, sum_up));
+        assert!(run_function_pass_v2::<LoopToRecursion>(&mut ctx, sum_up).unwrap());
         // 0+1+2+3+4 = 10
         assert_eq!(run(&ctx, sum_up, 5), Some(10));
         assert_eq!(run(&ctx, sum_up, 1), Some(0));
@@ -394,6 +545,6 @@ mod tests {
                 return %x;
             "
         );
-        assert!(!loop_to_recursion(&mut ctx, straight));
+        assert!(!run_function_pass_v2::<LoopToRecursion>(&mut ctx, straight).unwrap());
     }
 }
