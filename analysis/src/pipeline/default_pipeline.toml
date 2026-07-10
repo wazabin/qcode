@@ -146,9 +146,11 @@ passes = ["struct_typing"]
 # Resolve jump tables now that gvn has const-folded the dispatch address into the
 # recognizable `table_base + index*scale` + load shape, so the indirect branch
 # gains real CFG successors before the binding and cleanup stages run.
+# Module-scoped because it is interprocedural: it queues cross-function code
+# discoveries and re-homes resolved target blocks into their owning functions.
 [[stage]]
 name = "jump-tables"
-scope = "function"
+scope = "module"
 passes = ["handle_jump_tables"]
 
 # Simplify so the lifter's straight-line goto-chains are merged into single

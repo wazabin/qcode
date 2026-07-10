@@ -36,7 +36,7 @@ use qcode::{
     },
 };
 
-use crate::{FunctionPass, PipelineEnv, value_range::value_range};
+use crate::{Pass, PipelineEnv, value_range::value_range};
 
 /// Largest table the pass will materialize. Guards against a mis-bounded index
 /// turning into millions of bogus edges.
@@ -80,19 +80,40 @@ struct MakeCBranch {
     false_target: u64,
 }
 
-impl FunctionPass for HandleJumpTables {
+impl Pass for HandleJumpTables {
     const NAME: &'static str = "handle_jump_tables";
 
     fn description(&self) -> &'static str {
         "Resolves jump tables, connecting indirect branches to their targets"
     }
 
-    fn run(
-        &self,
-        ctx: &mut Context,
-        fun_id: FunctionId,
-        _env: &PipelineEnv,
-    ) -> Result<bool, String> {
+    /// Jump-table resolution is interprocedural — it queues cross-function code
+    /// discoveries ([`Context::discover_code`]), installs global
+    /// [`Proposition::ImmutableMemory`] assumptions, and re-homes resolved target
+    /// blocks into their owning functions — so it is a whole-program module pass,
+    /// not a per-function one. Drive the per-function body over every non-external,
+    /// non-ignored function, matching a `scope = "function"` stage's eligibility.
+    fn run(&self, ctx: &mut Context, _env: &PipelineEnv) -> Result<bool, String> {
+        let fun_ids: Vec<FunctionId> = ctx
+            .functions()
+            .filter(|f| !f.is_external())
+            .filter(|f| !ctx.is_function_ignored(f.address()))
+            .map(|f| f.id)
+            .collect();
+        let mut changed = false;
+        for fun_id in fun_ids {
+            changed |= Self::resolve_function(ctx, fun_id)?;
+        }
+        Ok(changed)
+    }
+}
+
+impl HandleJumpTables {
+    /// Resolve every jump table in the single function `fun_id`, connecting each
+    /// indirect branch to its recovered CFG successors. Returns whether the IR
+    /// changed. This is the body that ran once per function while the pass was a
+    /// `FunctionPass`.
+    fn resolve_function(ctx: &mut Context, fun_id: FunctionId) -> Result<bool, String> {
         let function = Function::from_id(ctx, fun_id);
 
         // Nothing resolves in a function with no indirect branch. The vast majority
@@ -613,14 +634,13 @@ fn sign_extend(raw: u64, size: usize) -> u64 {
     (((raw << shift) as i64) >> shift) as u64
 }
 
-crate::register_function_pass!(HandleJumpTables);
+crate::register_module_pass!(HandleJumpTables);
 
 #[cfg(test)]
 mod tests {
     use qcode_macro::qcode;
 
     use super::*;
-    use crate::test_util::run_function_pass;
 
     /// Number of CFG successors of `block`.
     fn successor_count(ctx: &Context, block: BlockId) -> usize {
@@ -671,7 +691,7 @@ mod tests {
         }
         add_rodata(&mut ctx, 0x2000, table);
 
-        let changed = run_function_pass::<HandleJumpTables>(&mut ctx, fun).unwrap();
+        let changed = HandleJumpTables::resolve_function(&mut ctx, fun).unwrap();
         assert!(changed);
 
         // The dispatch block gained one successor per case target.
@@ -692,7 +712,7 @@ mod tests {
         // every fixpoint iteration. Re-running against the already-connected
         // block must be a no-op reporting no change — otherwise any
         // `repeat_until` stage containing this pass never converges.
-        let changed = run_function_pass::<HandleJumpTables>(&mut ctx, fun).unwrap();
+        let changed = HandleJumpTables::resolve_function(&mut ctx, fun).unwrap();
         assert!(
             !changed,
             "re-resolving an already-connected table reported a change"
@@ -721,7 +741,7 @@ mod tests {
         add_code(&mut ctx, 0x1000, 0x1000);
         add_rodata(&mut ctx, 0x2000, 0x1100u64.to_le_bytes().to_vec());
 
-        let changed = run_function_pass::<HandleJumpTables>(&mut ctx, fun).unwrap();
+        let changed = HandleJumpTables::resolve_function(&mut ctx, fun).unwrap();
         assert!(changed);
 
         // The indirect branch is now a direct jump to the one resolved target.
@@ -771,7 +791,7 @@ mod tests {
         }
         add_rodata(&mut ctx, 0x5000, table);
 
-        let changed = run_function_pass::<HandleJumpTables>(&mut ctx, fun).unwrap();
+        let changed = HandleJumpTables::resolve_function(&mut ctx, fun).unwrap();
         assert!(changed);
 
         assert_eq!(successor_count(&ctx, disp), 3);
@@ -801,7 +821,7 @@ mod tests {
         add_code(&mut ctx, 0x1000, 0x1000);
         add_rodata(&mut ctx, 0x2000, vec![0u8; 0x100]);
 
-        let changed = run_function_pass::<HandleJumpTables>(&mut ctx, fun).unwrap();
+        let changed = HandleJumpTables::resolve_function(&mut ctx, fun).unwrap();
         assert!(!changed);
         assert_eq!(successor_count(&ctx, disp), 0);
     }
@@ -843,7 +863,7 @@ mod tests {
         add_code(&mut ctx, 0x1000, 0x1000);
         add_rodata(&mut ctx, 0x2000, 0x1100u64.to_le_bytes().to_vec());
 
-        let changed = run_function_pass::<HandleJumpTables>(&mut ctx, fun).unwrap();
+        let changed = HandleJumpTables::resolve_function(&mut ctx, fun).unwrap();
         assert!(changed);
 
         // BranchInd became a direct Branch to the single target.
@@ -888,7 +908,7 @@ mod tests {
         }
         add_rodata(&mut ctx, 0x2000, table);
 
-        let changed = run_function_pass::<HandleJumpTables>(&mut ctx, fun).unwrap();
+        let changed = HandleJumpTables::resolve_function(&mut ctx, fun).unwrap();
         assert!(changed);
 
         assert_eq!(successor_count(&ctx, disp), 2);
@@ -936,7 +956,7 @@ mod tests {
         }
         add_rodata(&mut ctx, 0x2000, table);
 
-        let changed = run_function_pass::<HandleJumpTables>(&mut ctx, fun).unwrap();
+        let changed = HandleJumpTables::resolve_function(&mut ctx, fun).unwrap();
         assert!(changed);
 
         assert_eq!(successor_count(&ctx, disp), 2);
@@ -993,7 +1013,7 @@ mod tests {
         }
         assert_eq!(successor_count(&ctx, disp), 2);
 
-        let changed = run_function_pass::<HandleJumpTables>(&mut ctx, fun).unwrap();
+        let changed = HandleJumpTables::resolve_function(&mut ctx, fun).unwrap();
         assert!(changed);
 
         // Rewritten to a CBranch with exactly two successors (no doubling).
@@ -1035,7 +1055,7 @@ mod tests {
         table[6 * 8..7 * 8].copy_from_slice(&0x1200u64.to_le_bytes());
         add_rodata(&mut ctx, 0x2000, table);
 
-        let changed = run_function_pass::<HandleJumpTables>(&mut ctx, fun).unwrap();
+        let changed = HandleJumpTables::resolve_function(&mut ctx, fun).unwrap();
         assert!(changed);
 
         assert_eq!(successor_count(&ctx, disp), 2);

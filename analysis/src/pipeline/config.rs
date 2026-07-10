@@ -596,7 +596,21 @@ impl Pipeline {
                         return Ok(());
                     }
                 }
-                StagePasses::Module(_) => {
+                StagePasses::Module(passes) => {
+                    // Module stages are normally skipped during discovery (address
+                    // discovery is function-local). The lone exception is the
+                    // module-scoped jump-table stage, which is itself the discovery
+                    // pass: it queues `discover_code` targets, so it must run here.
+                    // Like the function branch above, stop once it has run — later
+                    // stages are for the final optimization phase, not discovery. It
+                    // ignores `restrict` and scans every function, but a function with
+                    // no indirect branch bails cheaply and re-queued targets were
+                    // already drained, so re-running an unchanged function is a no-op.
+                    if passes.iter().any(|p| p.name() == ADDRESS_DISCOVERY_PASS) {
+                        run_module_stage(ctx, env, stage, passes, round, progress)?;
+                        self.verify_after_stage(ctx, stage)?;
+                        return Ok(());
+                    }
                     self.verify_after_stage(ctx, stage)?;
                 }
             }
@@ -1396,8 +1410,9 @@ async fn run_function_stage(
 
     // A stage all of whose passes are V2 can be driven over a checked-out body
     // (`run_one_function`) — the shape Stage 6 runs on worker threads. A stage that
-    // still contains a legacy `FunctionPass` (handle_jump_tables) takes the classic
-    // in-place path below, unchanged.
+    // still contains a legacy non-V2 `FunctionPass` takes the classic in-place path
+    // below, unchanged. (No such pass ships today; the fallback is kept live for any
+    // future one.)
     let all_v2 = passes.iter().all(|p| p.is_v2());
 
     /*
