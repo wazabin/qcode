@@ -1528,47 +1528,38 @@ async fn run_function_stage(
     }
 
     // Parallelize the stage across threads once the worklist is worth the fan-out
-    // cost. Functions tied to another by a cross-function CFG edge (a thunk/tail-call
-    // `Branch` into another function's entry) are held back for the sequential lane:
-    // a worker reading such an edge would reach into a co-checked-out function's
-    // (empty) shell arena. Everything else — tiny worklists, `QCODE_THREADS=1`,
-    // wasm — runs the sequential loop below, byte-for-byte identical.
+    // cost. Strict IR locality (context-split ruling 2) is established at the
+    // optimization entry and every discovery round, so every function body is
+    // closed over its own blocks — there are no cross-function edges to entangle
+    // two checked-out bodies, and every function is parallel-eligible. Tiny
+    // worklists, `QCODE_THREADS=1`, and wasm fall through to the sequential loop
+    // below, byte-for-byte identical.
     let threads = resolve_threads();
     let parallel_set: HashSet<FunctionId> = if threads > 1 && fun_ids.len() >= PARALLEL_THRESHOLD {
-        let entangled = entangled_functions(ctx, &fun_ids);
-        let eligible: Vec<FunctionId> = fun_ids
-            .iter()
-            .copied()
-            .filter(|f| !entangled.contains(f))
-            .collect();
-        if eligible.len() >= PARALLEL_THRESHOLD {
-            run_stage_parallel(
-                ctx,
-                env,
-                stage,
-                passes,
-                &eligible,
-                &stage_name,
-                total,
-                round,
-                cache,
-                &mut elapsed,
-                &mut dirty,
-                &mut reservations,
-                &mut leftover,
-                threads,
-                progress,
-            )?;
-            eligible.into_iter().collect()
-        } else {
-            HashSet::default()
-        }
+        run_stage_parallel(
+            ctx,
+            env,
+            stage,
+            passes,
+            &fun_ids,
+            &stage_name,
+            total,
+            round,
+            cache,
+            &mut elapsed,
+            &mut dirty,
+            &mut reservations,
+            &mut leftover,
+            threads,
+            progress,
+        )?;
+        fun_ids.iter().copied().collect()
     } else {
         HashSet::default()
     };
 
-    // The sequential lane: functions not handled in parallel above (all of them
-    // when the stage did not parallelize; only the entangled remainder when it did).
+    // The sequential lane: every function when the stage did not parallelize;
+    // nothing when it did (all were handled in parallel above).
     {
         for (index, fun_id) in fun_ids.iter().copied().enumerate() {
             if parallel_set.contains(&fun_id) {
@@ -1766,32 +1757,6 @@ fn resolve_threads() -> usize {
             .map(|n| n.get())
             .unwrap_or(1)
     }
-}
-
-/// The worklist functions tied to another function by a cross-function CFG edge —
-/// a thunk / tail-call `Branch` whose edge is stored in one function's arena but
-/// referenced by the other's block. Such an edge is unreadable once *both* incident
-/// functions are checked out (the storage owner's arena is an empty shell), so
-/// these run on the sequential lane where at most one is out at a time. Detection
-/// reads only live functions (nothing is checked out yet), so no shell is touched.
-fn entangled_functions(ctx: &Context, fun_ids: &[FunctionId]) -> HashSet<FunctionId> {
-    let mut entangled = HashSet::default();
-    for &fid in fun_ids {
-        let crosses = FunctionRef::from_id(ctx, fid).blocks().any(|b| {
-            // A cross-function CFG edge (either direction), or a branch instruction
-            // whose static target block lives in another function (a tail call /
-            // thunk `Branch` a pass like mem2reg reads directly off the mnemonic,
-            // not via the CFG edge set).
-            b.successors().any(|(_, s)| s.func != fid)
-                || b.predecessors().any(|(_, p)| p.func != fid)
-                || b.instructions()
-                    .any(|i| i.mnemonic().target_blocks().iter().any(|t| t.func != fid))
-        });
-        if crosses {
-            entangled.insert(fid);
-        }
-    }
-    entangled
 }
 
 /// One checked-out worklist function on its way through a parallel stage: its

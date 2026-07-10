@@ -498,6 +498,17 @@ async fn lift_and_discover_until_quiet(
         // Discoveries found here are the only durable output; analysis residue is
         // discarded so newly lifted blocks invalidate the whole owning function.
         let mut ctx = clean.clone();
+        // Strict IR locality before the discovery-phase function stages check
+        // functions out. The durable `clean` is split at the end of each round
+        // (below), so round 1's disposable `ctx` is still un-split and may hold a
+        // thunk's Branch into a foreign entry; normalize it here so no function
+        // stage ever checks out a body carrying a foreign block reference (every
+        // function is parallel-eligible — there is no entangled-function fallback).
+        // Disposable: only drained discoveries survive, and `clean`'s own split
+        // below keeps the durable IR identical whether or not this ran.
+        if crate::has_cross_function_reference(&ctx) {
+            crate::split_overlapping_functions(&mut ctx);
+        }
         let analysis_env = PipelineEnv::new(clean, cfg.clone());
         if let Err(e) = pipeline
             .run_address_discovery_phase_async(

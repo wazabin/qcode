@@ -1569,15 +1569,10 @@ fn decide_variable_value(var: ValueId, frames: &[Frame]) -> Option<FrameEntry> {
 
 impl<'str, H: HostMut<'str>> Mem2Reg<'_, 'str, H> {
     fn decide_values_start_from(&mut self, block: BlockId, state: &mut RenameState<'_>) {
-        // The renamer follows CFG successors, which for a thunk/tail-call `Branch`
-        // or a jump-table `BranchInd` may leave this function and land in another
-        // function's block. A checked-out pass owns only its own function, so it
-        // must not rewrite (forward loads, drop stores in) a foreign block. Skip any
-        // successor this host does not own. On the whole-module path `owns_block` is
-        // always `true`, so behaviour there is unchanged.
-        if !self.host.owns_block(block) {
-            return;
-        }
+        // The renamer follows CFG successors. Strict IR locality (context-split
+        // ruling 2) guarantees every successor is a block of this function — a
+        // cross-function tail jump is a `TailCall` terminator with no CFG edge, not
+        // a `Branch` into a foreign block — so the walk never leaves the function.
         if state.visited.contains(&block) {
             return;
         }

@@ -223,42 +223,24 @@ pub trait HostMut<'str> {
 
     // ---- CFG / use-map verbs (mirror the `Context` inherent methods) ---------
 
-    /// Whether this host may mutate `block`'s arena. Always `true` on the module
-    /// path; on a checked-out host, only the checked-out function's own blocks.
-    /// Used to skip the *other* endpoint of a cross-function CFG edge (a
-    /// thunk/tail-call `Branch` into another function): a checked-out pass leaves
-    /// the foreign block's edge set untouched rather than panicking. The module
-    /// path (which owns every function) updates both, exactly as before.
-    fn owns_block(&self, block: BlockId) -> bool {
-        let _ = block;
-        true
-    }
-
     /// Adds a directed CFG edge `from -> to`, stored in `from`'s edge arena and
     /// linked into both incident blocks' edge sets. Mirrors
-    /// [`Context::add_cfg_edge`]. `from` must be owned (the edge lives in its
-    /// arena); the `to` endpoint is skipped if it is a foreign block.
+    /// [`Context::add_cfg_edge`]. Strict IR locality (context-split ruling 2)
+    /// guarantees both endpoints belong to the host's function, so both edge sets
+    /// are always updated.
     fn add_cfg_edge(&mut self, from: BlockId, to: BlockId) -> EdgeId {
         let edge_id = self.push_edge(from.func, EdgeData { from, to });
-        if self.owns_block(from) {
-            self.block_mut(from).edges.insert(edge_id);
-        }
-        if self.owns_block(to) {
-            self.block_mut(to).edges.insert(edge_id);
-        }
+        self.block_mut(from).edges.insert(edge_id);
+        self.block_mut(to).edges.insert(edge_id);
         edge_id
     }
 
-    /// Removes a CFG edge, unlinking it from both incident blocks it owns. The
-    /// backing `EdgeData` slot is left dangling. Mirrors [`Context::remove_cfg_edge`].
+    /// Removes a CFG edge, unlinking it from both incident blocks. The backing
+    /// `EdgeData` slot is left dangling. Mirrors [`Context::remove_cfg_edge`].
     fn remove_cfg_edge(&mut self, edge_id: EdgeId) {
         let EdgeData { from, to } = *self.read_host().edge(edge_id);
-        if self.owns_block(from) {
-            self.block_mut(from).edges.remove(&edge_id);
-        }
-        if self.owns_block(to) {
-            self.block_mut(to).edges.remove(&edge_id);
-        }
+        self.block_mut(from).edges.remove(&edge_id);
+        self.block_mut(to).edges.remove(&edge_id);
     }
 
     /// Replaces every use of `old` with `new` across its owning function's
@@ -605,9 +587,6 @@ impl<'a, 'str> HostMut<'str> for CheckedOut<'a, 'str> {
     }
     fn shared(&self) -> &Context<'str> {
         self.shared
-    }
-    fn owns_block(&self, block: BlockId) -> bool {
-        block.func == self.id
     }
     // `shared_mut` intentionally not implemented: a checked-out host is read-only
     // on shared data (it uses the defaulted panic).
