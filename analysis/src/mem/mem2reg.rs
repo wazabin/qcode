@@ -109,7 +109,7 @@ impl<'ctx, 'str> Mem2RegGeneric<'ctx, 'str> {
     /// stack-pointer param or `ptr` is not an `@SP ± N` slot.
     fn slot_offset(&self, ptr: ValueId) -> Option<i64> {
         let sp = self.sp_param?;
-        frame_offset(self.read().shared(), &self.numbering, sp, ptr)
+        frame_offset(self.read().shr(), &self.numbering, sp, ptr)
     }
 
     /// Whether `ptr` is `@SP`-derived but *not* a fixed slot offset — a
@@ -202,11 +202,7 @@ impl<'ctx, 'str> Mem2RegGeneric<'ctx, 'str> {
         if let ValueId::Literal(id) = value {
             let literal = self.read().shr().values.literals[id].clone();
             if literal.symbolic.is_none() {
-                return self
-                    .read()
-                    .shared()
-                    .get_const(literal.value, load_size)
-                    .id();
+                return self.read().shr().get_const(literal.value, load_size);
             }
         }
 
@@ -304,7 +300,7 @@ fn register_varnode(host: HostRef, value: ValueId) -> Option<VarnodeId> {
         return None;
     };
     matches!(
-        Varnode::from_id(host.shared(), vn_id).space().ty,
+        Varnode::from_id(host.shr(), vn_id).space().ty,
         SpaceType::Register
     )
     .then_some(vn_id)
@@ -316,8 +312,8 @@ fn wider_register_store_contains(host: HostRef, store: ValueId, var: ValueId) ->
         return false;
     };
     let (store, var) = (
-        Varnode::from_id(host.shared(), store),
-        Varnode::from_id(host.shared(), var),
+        Varnode::from_id(host.shr(), store),
+        Varnode::from_id(host.shr(), var),
     );
     if store.space().id != var.space().id || store.size() <= var.size() {
         return false;
@@ -343,8 +339,8 @@ fn register_store_low_aligned_contains(host: HostRef, store: ValueId, var: Value
         return false;
     };
     let (store, var) = (
-        Varnode::from_id(host.shared(), store),
-        Varnode::from_id(host.shared(), var),
+        Varnode::from_id(host.shr(), store),
+        Varnode::from_id(host.shr(), var),
     );
     store.space().id == var.space().id
         && store.size() > var.size()
@@ -509,7 +505,7 @@ struct InsertedBlockParams {
 impl<'str> Mem2RegGeneric<'_, 'str> {
     fn block_param_name_for_var(&self, var: ValueId) -> Option<String> {
         match var {
-            ValueId::Varnode(varnode_id) => Varnode::from_id(self.read().shared(), varnode_id)
+            ValueId::Varnode(varnode_id) => Varnode::from_id(self.read().shr(), varnode_id)
                 .name()
                 .map(|n| n.to_owned()),
             _ => self.slot_offset(var).map(|off| format!("stack_{off:x}")),
@@ -642,14 +638,14 @@ impl<'str> Mem2RegGeneric<'_, 'str> {
                 }
 
                 if let ValueId::Varnode(vn_id) = access.ptr {
-                    if access.size != Varnode::from_id(self.read().shared(), vn_id).size() {
+                    if access.size != Varnode::from_id(self.read().shr(), vn_id).size() {
                         mixed_width.insert(access.ptr);
                     }
                     if access.is_store() {
                         stored.insert(access.ptr);
                         *store_counts.entry(access.ptr).or_insert(0) += 1;
                         if matches!(
-                            Varnode::from_id(self.read().shared(), vn_id).space().ty,
+                            Varnode::from_id(self.read().shr(), vn_id).space().ty,
                             SpaceType::Register
                         ) {
                             register_stores.insert(access.ptr);
@@ -691,7 +687,7 @@ impl<'str> Mem2RegGeneric<'_, 'str> {
         for &var in stored.union(&loaded) {
             if let ValueId::Varnode(vn_id) = var
                 && matches!(
-                    Varnode::from_id(self.read().shared(), vn_id).space().ty,
+                    Varnode::from_id(self.read().shr(), vn_id).space().ty,
                     SpaceType::Register
                 )
             {
@@ -850,7 +846,7 @@ impl<'str> Mem2RegGeneric<'_, 'str> {
             // (consistent) access size recorded during collection.
             let size = match var {
                 ValueId::Varnode(varnode_id) => {
-                    Varnode::from_id(self.read().shared(), varnode_id).size()
+                    Varnode::from_id(self.read().shr(), varnode_id).size()
                 }
                 _ => match sizes.get(&var) {
                     Some(&size) => size,
@@ -1264,7 +1260,7 @@ impl<'str> Mem2RegGeneric<'_, 'str> {
         vn_id: VarnodeId,
     ) -> ValueId {
         let (space, size) = {
-            let vn = Varnode::from_id(self.read().shared(), vn_id);
+            let vn = Varnode::from_id(self.read().shr(), vn_id);
             (vn.space().id, vn.size())
         };
         let mut builder = Builder::from_block(BaseRef::new(&mut *self.host, branch_block));
@@ -1368,7 +1364,7 @@ impl<'str> Mem2RegGeneric<'_, 'str> {
                 // the conservative frame analysis did not flag) are safe to remove.
                 // Stack-slot literals keep the unconditional removal.
                 let guarded = if let ValueId::Varnode(vn_id) = ptr {
-                    match Varnode::from_id(self.read().shared(), *vn_id).space().ty {
+                    match Varnode::from_id(self.read().shr(), *vn_id).space().ty {
                         SpaceType::Register => true,
                         SpaceType::Temporary => vars_with_surviving_loads.contains(ptr),
                         _ => false,
@@ -1920,7 +1916,7 @@ impl<'ctx, 'str> Mem2Reg<'ctx, 'str> {
     /// stack-pointer param or `ptr` is not an `@SP ± N` slot.
     fn slot_offset(&self, ptr: ValueId) -> Option<i64> {
         let sp = self.sp_param?;
-        frame_offset(self.read().shared(), &self.numbering, sp, ptr)
+        frame_offset(self.read().shr(), &self.numbering, sp, ptr)
     }
 
     /// Whether `ptr` is `@SP`-derived but *not* a fixed slot offset — a
@@ -2013,11 +2009,7 @@ impl<'ctx, 'str> Mem2Reg<'ctx, 'str> {
         if let ValueId::Literal(id) = value {
             let literal = self.read().shr().values.literals[id].clone();
             if literal.symbolic.is_none() {
-                return self
-                    .read()
-                    .shared()
-                    .get_const(literal.value, load_size)
-                    .id();
+                return self.read().shr().get_const(literal.value, load_size);
             }
         }
 
@@ -2066,7 +2058,7 @@ impl<'ctx, 'str> Mem2Reg<'ctx, 'str> {
 impl<'str> Mem2Reg<'_, 'str> {
     fn block_param_name_for_var(&self, var: ValueId) -> Option<String> {
         match var {
-            ValueId::Varnode(varnode_id) => Varnode::from_id(self.read().shared(), varnode_id)
+            ValueId::Varnode(varnode_id) => Varnode::from_id(self.read().shr(), varnode_id)
                 .name()
                 .map(|n| n.to_owned()),
             _ => self.slot_offset(var).map(|off| format!("stack_{off:x}")),
@@ -2199,14 +2191,14 @@ impl<'str> Mem2Reg<'_, 'str> {
                 }
 
                 if let ValueId::Varnode(vn_id) = access.ptr {
-                    if access.size != Varnode::from_id(self.read().shared(), vn_id).size() {
+                    if access.size != Varnode::from_id(self.read().shr(), vn_id).size() {
                         mixed_width.insert(access.ptr);
                     }
                     if access.is_store() {
                         stored.insert(access.ptr);
                         *store_counts.entry(access.ptr).or_insert(0) += 1;
                         if matches!(
-                            Varnode::from_id(self.read().shared(), vn_id).space().ty,
+                            Varnode::from_id(self.read().shr(), vn_id).space().ty,
                             SpaceType::Register
                         ) {
                             register_stores.insert(access.ptr);
@@ -2248,7 +2240,7 @@ impl<'str> Mem2Reg<'_, 'str> {
         for &var in stored.union(&loaded) {
             if let ValueId::Varnode(vn_id) = var
                 && matches!(
-                    Varnode::from_id(self.read().shared(), vn_id).space().ty,
+                    Varnode::from_id(self.read().shr(), vn_id).space().ty,
                     SpaceType::Register
                 )
             {
@@ -2407,7 +2399,7 @@ impl<'str> Mem2Reg<'_, 'str> {
             // (consistent) access size recorded during collection.
             let size = match var {
                 ValueId::Varnode(varnode_id) => {
-                    Varnode::from_id(self.read().shared(), varnode_id).size()
+                    Varnode::from_id(self.read().shr(), varnode_id).size()
                 }
                 _ => match sizes.get(&var) {
                     Some(&size) => size,
@@ -2598,7 +2590,7 @@ impl<'str> Mem2Reg<'_, 'str> {
         vn_id: VarnodeId,
     ) -> ValueId {
         let (space, size) = {
-            let vn = Varnode::from_id(self.read().shared(), vn_id);
+            let vn = Varnode::from_id(self.read().shr(), vn_id);
             (vn.space().id, vn.size())
         };
         let mut host = self.body.host(self.cx);
@@ -2703,7 +2695,7 @@ impl<'str> Mem2Reg<'_, 'str> {
                 // the conservative frame analysis did not flag) are safe to remove.
                 // Stack-slot literals keep the unconditional removal.
                 let guarded = if let ValueId::Varnode(vn_id) = ptr {
-                    match Varnode::from_id(self.read().shared(), *vn_id).space().ty {
+                    match Varnode::from_id(self.read().shr(), *vn_id).space().ty {
                         SpaceType::Register => true,
                         SpaceType::Temporary => vars_with_surviving_loads.contains(ptr),
                         _ => false,

@@ -1,11 +1,12 @@
 use rustc_hash::FxHashMap as HashMap;
 
 use qcode::{
-    context::Context,
+    context::{Context, Shared},
     space::{SpaceId, SpaceType},
     value::{
         FunctionId, ValueId, ValueRef, Varnode,
         insn::{Binop, IntBinop, Mnemonic},
+        literal::LiteralRef,
         util::base_ref::HostRef,
     },
 };
@@ -164,7 +165,7 @@ impl<'a, 'str> Analysis<'a, 'str> {
             return self.canonical_root(root);
         }
 
-        let Some((start, end)) = literal_interval(self.host.shared(), literal, size) else {
+        let Some((start, end)) = literal_interval(self.host.shr(), literal, size) else {
             return NodeId::Unknown;
         };
 
@@ -214,7 +215,7 @@ impl<'a, 'str> Analysis<'a, 'str> {
         match value {
             ValueId::Varnode(id) => {
                 let (varnode_space_id, start, vn_size) = {
-                    let vn = Varnode::from_id(self.host.shared(), id);
+                    let vn = Varnode::from_id(self.host.shr(), id);
                     (vn.space().id, vn.address() as u64, vn.size() as u64)
                 };
                 if varnode_space_id != space {
@@ -247,7 +248,7 @@ impl<'a, 'str> Analysis<'a, 'str> {
                     // any align-down) names the same location as `p` for aliasing: the
                     // mask only lowers the address. Peel to the non-mask operand.
                     Mnemonic::Binop(bin) if matches!(bin.op, Binop::Int(IntBinop::And)) => {
-                        match align_peel_target(self.host.shared(), bin.lhs, bin.rhs) {
+                        match align_peel_target(self.host.shr(), bin.lhs, bin.rhs) {
                             Some(base) => PeelAction::Peel(base),
                             None => PeelAction::Unknown,
                         }
@@ -320,9 +321,9 @@ enum PeelAction {
 }
 
 /// The literal value of `v`, if it is a literal.
-fn literal_value(ctx: &Context, v: ValueId) -> Option<u64> {
-    match ValueRef::new(v, ctx) {
-        ValueRef::Literal(l) => Some(l.value()),
+fn literal_value(shared: &Shared, v: ValueId) -> Option<u64> {
+    match v {
+        ValueId::Literal(id) => Some(LiteralRef::from_id(shared, id).value()),
         _ => None,
     }
 }
@@ -336,8 +337,8 @@ fn is_align_mask(m: u64) -> bool {
 
 /// For an `and`, the non-mask operand when the other is an alignment mask
 /// (`p & -2^k`). `None` if neither operand is such a mask.
-fn align_peel_target(ctx: &Context, lhs: ValueId, rhs: ValueId) -> Option<ValueId> {
-    match (literal_value(ctx, lhs), literal_value(ctx, rhs)) {
+fn align_peel_target(shared: &Shared, lhs: ValueId, rhs: ValueId) -> Option<ValueId> {
+    match (literal_value(shared, lhs), literal_value(shared, rhs)) {
         (Some(m), _) if is_align_mask(m) => Some(rhs),
         (_, Some(m)) if is_align_mask(m) => Some(lhs),
         _ => None,
@@ -348,12 +349,12 @@ fn overlaps(start_a: u64, end_a: u64, start_b: u64, end_b: u64) -> bool {
     start_a < end_b && start_b < end_a
 }
 
-fn literal_interval(ctx: &Context, literal: ValueId, size: usize) -> Option<(u64, u64)> {
-    let ValueRef::Literal(literal) = ValueRef::new(literal, ctx) else {
+fn literal_interval(shared: &Shared, literal: ValueId, size: usize) -> Option<(u64, u64)> {
+    let ValueId::Literal(id) = literal else {
         unreachable!("literal_interval must only be called for literals");
     };
 
-    let start = literal.value();
+    let start = LiteralRef::from_id(shared, id).value();
     let size = u64::try_from(size).ok()?;
     let end = start.checked_add(size)?;
     Some((start, end))

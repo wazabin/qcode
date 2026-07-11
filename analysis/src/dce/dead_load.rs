@@ -45,8 +45,11 @@ pub(crate) type LiveSet = Vec<LiveLoc>;
 /// Byte intervals overwritten before any read.
 pub(crate) type KilledSet = Vec<KilledInterval>;
 
-pub(crate) fn is_reg_space(ctx: &Context, space_id: SpaceId) -> bool {
-    matches!(Space::from_id(ctx, space_id).ty, SpaceType::Register)
+pub(crate) fn is_reg_space<'a, 'str: 'a>(
+    src: impl qcode::value::util::base_ref::AsShared<'a, 'str>,
+    space_id: SpaceId,
+) -> bool {
+    matches!(Space::from_id(src, space_id).ty, SpaceType::Register)
 }
 
 /// The byte intervals a resolved external `target` clobbers (its recorded
@@ -59,7 +62,7 @@ fn call_clobber_intervals(host: HostRef, target: FunctionId) -> Vec<KilledInterv
     clobbered
         .iter()
         .map(|&vn| {
-            let v = Varnode::from_id(host.shared(), vn);
+            let v = Varnode::from_id(host.shr(), vn);
             let start = v.address() as u64;
             KilledInterval {
                 space: v.space().id,
@@ -78,7 +81,7 @@ fn killed_covers_loc(host: HostRef, iv: KilledInterval, l: &LiveLoc) -> bool {
     let ValueId::Varnode(vn) = l.ptr else {
         return false;
     };
-    let v = Varnode::from_id(host.shared(), vn);
+    let v = Varnode::from_id(host.shr(), vn);
     if v.space().id != iv.space {
         return false;
     }
@@ -87,16 +90,24 @@ fn killed_covers_loc(host: HostRef, iv: KilledInterval, l: &LiveLoc) -> bool {
     iv.start <= start && end <= iv.end
 }
 
-pub(crate) fn is_temp_space(ctx: &Context, space_id: SpaceId) -> bool {
-    !is_reg_space(ctx, space_id) && space_id != ctx.shared.default_space
+pub(crate) fn is_temp_space<'a, 'str: 'a>(
+    src: impl qcode::value::util::base_ref::AsShared<'a, 'str>,
+    space_id: SpaceId,
+) -> bool {
+    let shared = src.as_shared();
+    !is_reg_space(shared, space_id) && space_id != shared.default_space
 }
 
 /// True for spaces whose stores are eligible for cross-block dead-store
 /// elimination: register space and function-scoped temp spaces. The default
 /// (RAM/global) space is excluded because such stores may be observed outside
 /// the function.
-pub(crate) fn is_tracked_space(ctx: &Context, space_id: SpaceId) -> bool {
-    is_reg_space(ctx, space_id) || is_temp_space(ctx, space_id)
+pub(crate) fn is_tracked_space<'a, 'str: 'a>(
+    src: impl qcode::value::util::base_ref::AsShared<'a, 'str>,
+    space_id: SpaceId,
+) -> bool {
+    let shared = src.as_shared();
+    is_reg_space(shared, space_id) || is_temp_space(shared, space_id)
 }
 
 /// Decompose `ptr` into `(base, byte_offset)` by peeling literal `+`/`-` terms,
@@ -202,7 +213,7 @@ fn disjoint_access(
 
 fn ptr_offset(host: HostRef, ptr: ValueId) -> Option<i64> {
     match ptr {
-        ValueId::Varnode(id) => Some(Varnode::from_id(host.shared(), id).address()),
+        ValueId::Varnode(id) => Some(Varnode::from_id(host.shr(), id).address()),
         ValueId::Literal(lid) => Some(host.shr().values.literals[lid].value as i64),
         _ => None,
     }
@@ -343,14 +354,14 @@ pub fn dead_load_insns<'a, 'str: 'a>(
         for &id in insns.iter().rev() {
             match host.insn_ref(id).mnemonic() {
                 Mnemonic::Load(load)
-                    if is_reg_space(host.shared(), load.space) && !dead.contains(&id) =>
+                    if is_reg_space(host.shr(), load.space) && !dead.contains(&id) =>
                 {
                     if let Some(offset) = ptr_offset(host, load.ptr) {
                         let range = (offset, offset + load.size as i64);
                         live.push(range);
                     }
                 }
-                Mnemonic::Store(store) if is_reg_space(host.shared(), store.space) => {
+                Mnemonic::Store(store) if is_reg_space(host.shr(), store.space) => {
                     if let Some(offset) = ptr_offset(host, store.ptr) {
                         let range = (offset, offset + store.size as i64);
                         let is_dead_reg = dead_regs.contains(&store.ptr);
@@ -496,7 +507,7 @@ fn scan_block_aliased(
                 let is_killed = ptr_iv.is_some_and(|iv| fully_covered_iv(&killed, iv))
                     || rel_fully_covered(&rel_killed, store.space, sb, rel_range);
                 let is_dead_reg = dead_regs.contains(&ptr)
-                    || (regs_dead_at_exit && is_reg_space(host.shared(), store.space));
+                    || (regs_dead_at_exit && is_reg_space(host.shr(), store.space));
                 if no_live_reader && (is_killed || is_dead_reg) {
                     dead.insert(id);
                 } else {
@@ -539,7 +550,7 @@ fn scan_block_aliased(
             // stack-pointer decrement (see call_summary::decrement_stack_pointer)
             // alive so the callee's entry stack pointer is seeded correctly.
             Mnemonic::Call(_) | Mnemonic::CallInd(_) => {
-                killed.retain(|k| !is_reg_space(host.shared(), k.space));
+                killed.retain(|k| !is_reg_space(host.shr(), k.space));
                 // The callee may read any memory it can reach (pointer args,
                 // globals), so drop every relative overwrite at the barrier.
                 rel_killed.clear();
@@ -643,10 +654,10 @@ fn unread_temp_space_stores<'a, 'str: 'a>(
     for block in &fun {
         for &insn_id in block.instruction_ids() {
             match host.insn_ref(insn_id).mnemonic() {
-                Mnemonic::Load(load) if is_temp_space(host.shared(), load.space) => {
+                Mnemonic::Load(load) if is_temp_space(host.shr(), load.space) => {
                     loads.push((load.space, load.ptr, load.size));
                 }
-                Mnemonic::Store(store) if is_temp_space(host.shared(), store.space) => {
+                Mnemonic::Store(store) if is_temp_space(host.shr(), store.space) => {
                     candidate_stores.push((insn_id, store.space, store.ptr, store.size));
                 }
                 _ => {}
@@ -774,7 +785,7 @@ fn postdominated_dead_register_stores(
         let insns = host.block_ref(*block).instruction_ids().to_vec();
         for id in insns {
             match host.insn_ref(id).mnemonic() {
-                Mnemonic::Store(store) if is_reg_space(host.shared(), store.space) => {
+                Mnemonic::Store(store) if is_reg_space(host.shr(), store.space) => {
                     stores.push(RegisterStore {
                         id,
                         block: *block,
@@ -782,7 +793,7 @@ fn postdominated_dead_register_stores(
                         space: store.space,
                     });
                 }
-                Mnemonic::Load(load) if is_reg_space(host.shared(), load.space) => {
+                Mnemonic::Load(load) if is_reg_space(host.shr(), load.space) => {
                     loads.push((load.ptr, load.space));
                 }
                 _ => {}

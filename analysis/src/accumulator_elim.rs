@@ -46,7 +46,6 @@ use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
 
 use qcode::{
     builder::Builder,
-    context::Context,
     types::TypeId,
     value::{
         FunctionId, FunctionKind, ValueId,
@@ -291,11 +290,7 @@ fn transform<'str>(
         // counterpart so cloned `cond`/`stepD` expressions read g's params.
         let mut driver_subst: HashMap<ValueId, ValueId> = HashMap::default();
         for &i in &p.d_slots {
-            let ty = minted
-                .shared()
-                .shared
-                .types
-                .get_or_make_int(p.head_sizes[i]);
+            let ty = minted.shr().types.get_or_make_int(p.head_sizes[i]);
             let pid = push_param(&mut minted, g_head, ty);
             driver_subst.insert(ValueId::BlockParam(p.head_params[i]), pid);
         }
@@ -325,7 +320,7 @@ fn transform<'str>(
             let base_fields: Vec<ValueId> = p
                 .a_slots
                 .iter()
-                .map(|&i| const_at_size(minted.shared(), model.init_args[i], p.head_sizes[i]))
+                .map(|&i| const_at_size(minted.shr(), model.init_args[i], p.head_sizes[i]))
                 .collect();
             let mut b = Builder::from_block(BaseRef::new(minted.reborrow(), base));
             let tuple = b.push_tuple(base_fields);
@@ -632,11 +627,11 @@ fn is_const_literal(host: HostRef, val: ValueId) -> bool {
 
 /// Reinterprets a constant literal at `size` bytes, so a base-case accumulator
 /// matches its slot width; non-literals pass through unchanged.
-fn const_at_size(shared: &Context, val: ValueId, size: usize) -> ValueId {
+fn const_at_size(shared: &qcode::context::Shared, val: ValueId, size: usize) -> ValueId {
     if let ValueId::Literal(id) = val {
-        let lit = shared.shared.values.literals[id].clone();
+        let lit = shared.values.literals[id].clone();
         if lit.symbolic.is_none() {
-            return shared.get_const(lit.value, size).id();
+            return shared.get_const(lit.value, size);
         }
     }
     val
@@ -645,6 +640,7 @@ fn const_at_size(shared: &Context, val: ValueId, size: usize) -> ValueId {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use qcode::context::Context;
     use qcode::value::{Function, Instruction};
     use qcode_emulator::{SizedValue, StandaloneEmulator};
     use qcode_macro::qcode;

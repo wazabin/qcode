@@ -141,7 +141,7 @@ pub(super) fn simplify_flag_idiom(host: HostRef, m: &Mnemonic) -> Option<Mnemoni
     let resolve = |sborrow_side: ValueId, slt_side: ValueId| -> Option<(ValueId, ValueId)> {
         let (a, b) = as_sborrow(host, sborrow_side)?;
         let (sub_v, zero) = as_int_binop(host, slt_side, IntBinop::SLess)?;
-        if const_value(host.shared(), zero) != Some(0) {
+        if const_value(host.shr(), zero) != Some(0) {
             return None;
         }
         let (sa, sb) = as_int_binop(host, sub_v, IntBinop::Sub)?;

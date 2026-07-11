@@ -150,8 +150,7 @@ pub(crate) fn outline_tupled<'str>(
         for (field, input) in fields {
             let Some(input) = input else { continue };
             let fty = own
-                .shared()
-                .shared
+                .shr()
                 .types
                 .field_type(tuple_ty, field)
                 .expect("enumerate tuple field");
@@ -276,10 +275,7 @@ pub(crate) fn outline_scan_body<'str>(
             } else {
                 (1u64 << (isz * 8)) - 1
             };
-            let c = own
-                .shared()
-                .get_const((index_start as u64) & mask, isz)
-                .id();
+            let c = own.shr().get_const((index_start as u64) & mask, isz);
             let add = push_insn_into(
                 minted,
                 root,
@@ -307,11 +303,7 @@ pub(crate) fn outline_scan_body<'str>(
 pub(crate) fn seq_result_type(host: HostRef, src: ValueId, body_ret: TypeId) -> TypeId {
     let src_ty = host.type_of(src);
     match host.shr().types.seq_of(src_ty) {
-        Some((_, len, is_list)) => host
-            .shared()
-            .shared
-            .types
-            .get_or_make_seq(body_ret, len, is_list),
+        Some((_, len, is_list)) => host.shr().types.get_or_make_seq(body_ret, len, is_list),
         None => src_ty,
     }
 }

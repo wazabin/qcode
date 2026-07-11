@@ -215,6 +215,13 @@ impl<'str> Shared<'str> {
             .unwrap_or_default()
     }
 
+    /// The recorded [`Truth`] of `prop`, if any. Shared-only
+    /// mirror of [`Context::truth`] (truths live in the phase-mutable shared
+    /// maps), for `&Shared`-served pass reads.
+    pub fn truth(&self, prop: Proposition) -> Option<Truth> {
+        self.values.truths.get(&prop).copied()
+    }
+
     /// The stored [`TypeId`] of a **shared-leaf** value (literal, bytes, or
     /// varnode-with-override). Shared-only mirror of [`Context::stored_type_of`]:
     /// instruction/block-param/block/function ids live in function bodies and are

@@ -110,7 +110,7 @@ fn try_match(host: HostRef, fid: FunctionId) -> Option<PromoteMatch> {
     }
     let is_ram = |sp: SpaceId| {
         matches!(
-            Space::from_id(host.shared(), sp).ty,
+            Space::from_id(host.shr(), sp).ty,
             SpaceType::Ram | SpaceType::Temporary
         )
     };
@@ -197,7 +197,7 @@ fn try_match(host: HostRef, fid: FunctionId) -> Option<PromoteMatch> {
         return None;
     }
     // v1 works in bytes, so require a byte-addressed region.
-    if Space::from_id(host.shared(), region_space).word_size != 1 {
+    if Space::from_id(host.shr(), region_space).word_size != 1 {
         return None;
     }
     let in_region = |a: &Acc| a.space == region_space;
@@ -476,7 +476,7 @@ fn width_of<'str>(host: &PassBacking<'_, 'str>, v: ValueId) -> usize {
         ValueId::Instruction(iid) => host.insn_ref(iid).type_id(),
         ValueId::BlockParam(pid) => host.param_ref(pid).type_id(),
         other => host
-            .shared()
+            .shr()
             .stored_type_of(other)
             .expect("value has a stored type"),
     };
@@ -549,11 +549,7 @@ fn apply<'str>(body: &mut FunctionBody<'str>, cx: ContextView<'_, 'str>, m: &Pro
 fn apply_generic<'str>(host: &mut PassBacking<'_, 'str>, m: &PromoteMatch) -> bool {
     let esz = m.elem_size;
     let elem_ty = host.shr().types.get_or_make_int(esz);
-    let arr_ty = host
-        .shared()
-        .shared
-        .types
-        .get_or_make_array(elem_ty, m.count);
+    let arr_ty = host.shr().types.get_or_make_array(elem_ty, m.count);
     let arr_sz = m.count * esz;
 
     let insert_id = IntrinsicId::from_name("insert").expect("insert registered");

@@ -157,7 +157,7 @@ pub fn canonicalize_sp_slots<'str>(
         return false;
     }
 
-    let ptr_width = Varnode::from_id(host.shared(), sp_reg).size();
+    let ptr_width = Varnode::from_id(host.shr(), sp_reg).size();
     let offsets: BTreeSet<i64> = ptr_offset.values().copied().collect();
 
     // Reuse a prior run's representatives so this pass is idempotent: the first

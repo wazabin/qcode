@@ -258,7 +258,7 @@ impl AliasResult {
         for block in host.function_ref(fid).blocks() {
             for insn in block.iter() {
                 let v = ValueId::Instruction(insn.id);
-                if let Some(FrameClass::Local) = frame_class(host.shared(), &numbering, sp, v) {
+                if let Some(FrameClass::Local) = frame_class(host.shr(), &numbering, sp, v) {
                     own_frame_locals.insert(v);
                 }
             }
@@ -268,11 +268,11 @@ impl AliasResult {
         // (a pass sets assumptions before building the oracle). A test that flips
         // an assumption after building must rebuild the result.
         let caller_frame_assumed = host
-            .shared()
+            .shr()
             .truth(Proposition::ArgsDisjointFromCallerFrame(fid))
             .is_some_and(|t| t.value);
         let loaded_ptr_assumed = host
-            .shared()
+            .shr()
             .truth(Proposition::LoadedPointerDisjointFromSlot(fid))
             .is_some_and(|t| t.value);
         let frame_uncaptured = !frame_is_captured(host, fid, &numbering, sp);
@@ -310,7 +310,7 @@ impl AliasResult {
 fn frame_is_captured(host: HostRef, fid: FunctionId, numbering: &Numbering, sp: ValueId) -> bool {
     let is_own_frame = |v: ValueId| {
         matches!(
-            frame_class(host.shared(), numbering, sp, v),
+            frame_class(host.shr(), numbering, sp, v),
             Some(FrameClass::Local)
         )
     };
@@ -372,7 +372,7 @@ impl FrameInfo {
         use Provenance as P;
         // Stack provenance first: `@SP ± k`, realigned frames, and the bare `@SP`
         // param (offset 0 → caller frame).
-        if let Some(fc) = frame_class(host.shared(), &self.numbering, self.sp_param, v) {
+        if let Some(fc) = frame_class(host.shr(), &self.numbering, self.sp_param, v) {
             return match fc {
                 FrameClass::Local => P::OWN_FRAME,
                 FrameClass::CallerFrame => P::CALLER_FRAME,

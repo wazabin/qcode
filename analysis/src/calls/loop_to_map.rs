@@ -150,7 +150,7 @@ fn try_match(host: HostRef, fid: FunctionId) -> Option<MapMatch> {
         .iter()
         .find_map(|i| match i.mnemonic() {
             Mnemonic::Store(s)
-                if matches!(Space::from_id(host.shared(), s.space).ty, SpaceType::Ram)
+                if matches!(Space::from_id(host.shr(), s.space).ty, SpaceType::Ram)
                     && s.src == arr_exit =>
             {
                 Some(i.id)
@@ -214,9 +214,7 @@ fn apply<'str>(m: ContextView<'_, 'str>, body: &mut FunctionBody<'str>, mm: &Map
         // body unpacks the `(index, elem)` tuple); resolve it while only reading.
         let tuple_ty = if uses_index {
             let arr_ty = host.type_of(mm.init_arr);
-            let enum_ty = enum_id
-                .desc()
-                .result_type(&host.shr().types, &[arr_ty]);
+            let enum_ty = enum_id.desc().result_type(&host.shr().types, &[arr_ty]);
             match host.shr().types.array_of(enum_ty) {
                 Some((tuple_ty, _)) => Some(tuple_ty),
                 None => return false,

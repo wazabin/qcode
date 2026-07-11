@@ -80,7 +80,7 @@ impl<'str> ModuleSubPass<'str> for PureCall {
         let literal_indices: HashSet<usize> = args
             .iter()
             .enumerate()
-            .filter(|&(_, &a)| const_value(ctx, a).is_some())
+            .filter(|&(_, &a)| const_value(&*ctx, a).is_some())
             .map(|(i, _)| i)
             .collect();
         if literal_indices.is_empty() {
@@ -110,7 +110,7 @@ impl<'str> ModuleSubPass<'str> for PureCall {
         let arg_values: Vec<SizedValue> = args
             .iter()
             .zip(&param_sizes)
-            .map(|(&a, &size)| SizedValue::new(const_value(ctx, a).unwrap_or(0), size))
+            .map(|(&a, &size)| SizedValue::new(const_value(&*ctx, a).unwrap_or(0), size))
             .collect();
 
         // Emulate the callee on the concrete arguments and read the field back.

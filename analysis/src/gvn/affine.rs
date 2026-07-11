@@ -158,7 +158,7 @@ fn affine_view(
     {
         return (*constant, terms.clone());
     }
-    if let Some(c) = const_value(host.shared(), v) {
+    if let Some(c) = const_value(host.shr(), v) {
         return (c & mask_for(width), vec![]);
     }
     (0, vec![(v, 1)])
@@ -226,9 +226,9 @@ pub(super) fn arith_form(
             }
             IntBinop::Mul => {
                 // Affine only when exactly one side is a constant scale.
-                if let Some(k) = const_value(host.shared(), *rhs) {
+                if let Some(k) = const_value(host.shr(), *rhs) {
                     scale_affine(host, *lhs, k & m, width, state)
-                } else if let Some(k) = const_value(host.shared(), *lhs) {
+                } else if let Some(k) = const_value(host.shr(), *lhs) {
                     scale_affine(host, *rhs, k & m, width, state)
                 } else {
                     leaf(id, width)
@@ -236,7 +236,7 @@ pub(super) fn arith_form(
             }
             IntBinop::ShiftLeft => {
                 // x << s  ==  x * 2^s  (constant amount, in range).
-                match const_value(host.shared(), *rhs) {
+                match const_value(host.shr(), *rhs) {
                     Some(s) if s < (width as u64 * 8) && s < 64 => {
                         scale_affine(host, *lhs, (1u64 << s) & m, width, state)
                     }
@@ -244,9 +244,9 @@ pub(super) fn arith_form(
                 }
             }
             IntBinop::And | IntBinop::Or | IntBinop::Xor => {
-                if let Some(k) = const_value(host.shared(), *rhs) {
+                if let Some(k) = const_value(host.shr(), *rhs) {
                     mask_form(*lhs, *op, k & m, width, state)
-                } else if let Some(k) = const_value(host.shared(), *lhs) {
+                } else if let Some(k) = const_value(host.shr(), *lhs) {
                     mask_form(*rhs, *op, k & m, width, state)
                 } else {
                     leaf(id, width)
@@ -553,16 +553,13 @@ fn signed_lit<'str>(host: &mut Context<'str>, s: i64, width: usize) -> (IntBinop
     if s < 0 {
         (
             IntBinop::Sub,
-            host.shared()
-                .get_const(s.unsigned_abs() & mask_for(width), width)
-                .id(),
+            host.shr()
+                .get_const(s.unsigned_abs() & mask_for(width), width),
         )
     } else {
         (
             IntBinop::Add,
-            host.shared()
-                .get_const(s as u64 & mask_for(width), width)
-                .id(),
+            host.shr().get_const(s as u64 & mask_for(width), width),
         )
     }
 }
@@ -651,11 +648,7 @@ fn build_value_c<'str>(
     } = form
     {
         if terms.is_empty() {
-            return body
-                .read_host(cx)
-                .shared()
-                .get_const(*constant, *width)
-                .id();
+            return body.read_host(cx).shr().get_const(*constant, *width);
         }
         if terms.len() == 1 && terms[0].1 == 1 && *constant == 0 {
             return terms[0].0;
@@ -665,12 +658,9 @@ fn build_value_c<'str>(
         return leader;
     }
     let int_ty = match form {
-        NormalForm::Affine { width, .. } | NormalForm::Mask { width, .. } => body
-            .read_host(cx)
-            .shared()
-            .shared
-            .types
-            .get_or_make_int(*width),
+        NormalForm::Affine { width, .. } | NormalForm::Mask { width, .. } => {
+            body.read_host(cx).shr().types.get_or_make_int(*width)
+        }
         NormalForm::Opaque(_) => unreachable!("opaque forms are never materialized"),
     };
     let m = canonical_mnemonic_c(body, cx, block, at, form, state);
@@ -810,17 +800,15 @@ fn signed_lit_c<'str>(
         (
             IntBinop::Sub,
             body.read_host(cx)
-                .shared()
-                .get_const(s.unsigned_abs() & mask_for(width), width)
-                .id(),
+                .shr()
+                .get_const(s.unsigned_abs() & mask_for(width), width),
         )
     } else {
         (
             IntBinop::Add,
             body.read_host(cx)
-                .shared()
-                .get_const(s as u64 & mask_for(width), width)
-                .id(),
+                .shr()
+                .get_const(s as u64 & mask_for(width), width),
         )
     }
 }
@@ -844,11 +832,7 @@ pub(super) fn materialize_c<'str>(
     } = key
     {
         if terms.is_empty() {
-            return body
-                .read_host(cx)
-                .shared()
-                .get_const(*constant, *width)
-                .id();
+            return body.read_host(cx).shr().get_const(*constant, *width);
         }
         if terms.len() == 1 && terms[0].1 == 1 && *constant == 0 {
             return terms[0].0;

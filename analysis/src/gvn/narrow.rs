@@ -136,7 +136,7 @@ impl<'str> SubPassC<'str> for NarrowTrunc {
 
 /// Will [`narrow_to`] push through `v` rather than just wrap it in a `Range`?
 fn src_transformable(host: HostRef, v: ValueId) -> bool {
-    if numeric_const(host.shared(), v).is_some() {
+    if numeric_const(host.shr(), v).is_some() {
         return true;
     }
     let ValueId::Instruction(iid) = v else {
@@ -219,8 +219,8 @@ fn narrow_to<'str>(
             // Anything else: low `w` bytes are opaque — extract them.
             _ => push_insn(host, range_low(v, w), w, before, block),
         },
-        _ if numeric_const(host.shared(), v).is_some() => {
-            let folded = numeric_const(host.shared(), v).unwrap() & low_mask(w);
+        _ if numeric_const(host.shr(), v).is_some() => {
+            let folded = numeric_const(host.shr(), v).unwrap() & low_mask(w);
             host.shr().get_const(folded, w)
         }
         // Block params, varnodes, …: extract the low bytes.
@@ -351,8 +351,8 @@ fn narrow_to_c<'str>(
             }
             _ => push_insn_c(body, cx, range_low(v, w), w, before, block),
         },
-        _ if numeric_const(body.read_host(cx).shared(), v).is_some() => {
-            let folded = numeric_const(body.read_host(cx).shared(), v).unwrap() & low_mask(w);
+        _ if numeric_const(body.read_host(cx).shr(), v).is_some() => {
+            let folded = numeric_const(body.read_host(cx).shr(), v).unwrap() & low_mask(w);
             body.read_host(cx).shr().get_const(folded, w)
         }
         _ => push_insn_c(body, cx, range_low(v, w), w, before, block),
@@ -408,9 +408,9 @@ fn low_mask(w_bytes: usize) -> u64 {
     }
 }
 
-fn numeric_const(ctx: &Context, v: ValueId) -> Option<u64> {
+fn numeric_const(shared: &qcode::context::Shared, v: ValueId) -> Option<u64> {
     if let ValueId::Literal(id) = v {
-        let lit = &ctx.shared.values.literals[id];
+        let lit = &shared.values.literals[id];
         if lit.symbolic.is_none() {
             return Some(lit.value);
         }

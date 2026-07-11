@@ -235,7 +235,7 @@ fn type_instruction<'a, 'str>(
 
 /// Whether `space` is the processor register file.
 fn is_register_space(host: HostRef, space: SpaceId) -> bool {
-    matches!(Space::from_id(host.shared(), space).ty, SpaceType::Register)
+    matches!(Space::from_id(host.shr(), space).ty, SpaceType::Register)
 }
 
 /// `load(register, reg)` is a register read: its result takes the register's own

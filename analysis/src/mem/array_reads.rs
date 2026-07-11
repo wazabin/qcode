@@ -93,8 +93,7 @@ fn try_match(host: HostRef, fid: FunctionId) -> Option<ReadsMatch> {
     }
 
     // Collect every access in an argpromote shadow (`Temporary`) space.
-    let is_temp =
-        |sp: SpaceId| matches!(Space::from_id(host.shared(), sp).ty, SpaceType::Temporary);
+    let is_temp = |sp: SpaceId| matches!(Space::from_id(host.shr(), sp).ty, SpaceType::Temporary);
     let mut accesses: Vec<Acc> = Vec::new();
     for block in host.function_ref(fid).iter() {
         for insn in block.iter() {
@@ -139,11 +138,7 @@ fn try_match(host: HostRef, fid: FunctionId) -> Option<ReadsMatch> {
     let base = seed.ptr;
     let region_space = seed.space;
     let seed_id = seed.id;
-    let (elem_ty, count) = host
-        .shared()
-        .shared
-        .types
-        .array_of(stored_type_of(host, arr)?)?;
+    let (elem_ty, count) = host.shr().types.array_of(stored_type_of(host, arr)?)?;
     let esz = host.shr().types.size_of(elem_ty);
     if esz == 0 || count == 0 || seed.size != count * esz {
         return None;

@@ -116,7 +116,7 @@ impl EmulateMap {
         // Every capture must be a constant for the body to be fully evaluable.
         let mut capture_args: Vec<BodyArg> = Vec::with_capacity(map.captures.len());
         for (&cap, &size) in map.captures.iter().zip(&param_sizes[1..]) {
-            let value = const_value(ctx, cap)?;
+            let value = const_value(&*ctx, cap)?;
             capture_args.push(BodyArg::Scalar(SizedValue::new(value, size)));
         }
 
@@ -202,7 +202,7 @@ impl EmulateMap {
         // Every capture must be a constant for the body to be fully evaluable.
         let mut capture_args: Vec<BodyArg> = Vec::with_capacity(scan.captures.len());
         for (&cap, &size) in scan.captures.iter().zip(&param_sizes[2..]) {
-            let value = const_value(ctx, cap)?;
+            let value = const_value(&*ctx, cap)?;
             capture_args.push(BodyArg::Scalar(SizedValue::new(value, size)));
         }
 

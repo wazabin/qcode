@@ -180,15 +180,15 @@ fn same_operands(p: (ValueId, ValueId), q: (ValueId, ValueId)) -> bool {
 /// If `v` computes `x * 2` — as `x << 1`, `x * 2`, or `2 * x` — return `x`.
 fn as_doubled(host: HostRef, v: ValueId) -> Option<ValueId> {
     if let Some((x, amt)) = as_int_binop(host, v, IntBinop::ShiftLeft)
-        && const_value(host.shared(), amt) == Some(1)
+        && const_value(host.shr(), amt) == Some(1)
     {
         return Some(x);
     }
     if let Some((x, y)) = as_int_binop(host, v, IntBinop::Mul) {
-        if const_value(host.shared(), y) == Some(2) {
+        if const_value(host.shr(), y) == Some(2) {
             return Some(x);
         }
-        if const_value(host.shared(), x) == Some(2) {
+        if const_value(host.shr(), x) == Some(2) {
             return Some(y);
         }
     }
@@ -282,7 +282,7 @@ fn known_align(host: HostRef, v: ValueId, depth: u32) -> u32 {
     if depth == 0 {
         return 0;
     }
-    if let Some(c) = const_value(host.shared(), v) {
+    if let Some(c) = const_value(host.shr(), v) {
         // A constant's alignment is its trailing-zero count; `0` is aligned to
         // its full width.
         return if c == 0 {
@@ -313,7 +313,7 @@ fn known_align(host: HostRef, v: ValueId, depth: u32) -> u32 {
         // `|`/`^`/`+`/`-` keep a low bit zero only if it is zero in *both*.
         IntBinop::Or | IntBinop::Xor | IntBinop::Add | IntBinop::Sub => a().min(b()),
         // A left shift by a constant appends that many trailing zeros.
-        IntBinop::ShiftLeft => match const_value(host.shared(), rhs) {
+        IntBinop::ShiftLeft => match const_value(host.shr(), rhs) {
             Some(s) => a().saturating_add(s as u32),
             None => 0,
         },
@@ -338,10 +338,10 @@ const ALIGN_DEPTH: u32 = 64;
 /// this sub-pass, so in practice at most one side is constant here).
 fn const_operands(host: HostRef, lhs: ValueId, rhs: ValueId) -> Vec<(u64, ValueId)> {
     let mut out = Vec::new();
-    if let Some(c) = const_value(host.shared(), rhs) {
+    if let Some(c) = const_value(host.shr(), rhs) {
         out.push((c, lhs));
     }
-    if let Some(c) = const_value(host.shared(), lhs) {
+    if let Some(c) = const_value(host.shr(), lhs) {
         out.push((c, rhs));
     }
     out
@@ -363,7 +363,7 @@ fn binop_const(host: HostRef, v: ValueId, want: IntBinop) -> Option<(ValueId, u6
 /// declines the rewrite, keeping it strictly size-reducing.
 fn simplify_not(host: HostRef, v: ValueId, size: usize) -> Option<ValueId> {
     let all = all_ones(size);
-    if let Some(c) = const_value(host.shared(), v) {
+    if let Some(c) = const_value(host.shr(), v) {
         return Some(host.shr().get_const((!c) & all, size));
     }
     if let Some((x, c)) = binop_const(host, v, IntBinop::Xor)
@@ -644,11 +644,7 @@ fn simplify_bitwise_c<'str>(
                     return true;
                 }
                 if let Some((x, c1)) = binop_const(body.read_host(cx), inner, IntBinop::And) {
-                    let folded = body
-                        .read_host(cx)
-                        .shared()
-                        .get_const((c1 & outer) & all, size)
-                        .id();
+                    let folded = body.read_host(cx).shr().get_const((c1 & outer) & all, size);
                     ed.replace_with_new_insn_c(
                         body,
                         cx,
@@ -665,11 +661,7 @@ fn simplify_bitwise_c<'str>(
         IntBinop::Xor => {
             for (outer, inner) in const_operands(body.read_host(cx), lhs, rhs) {
                 if let Some((x, c1)) = binop_const(body.read_host(cx), inner, IntBinop::Xor) {
-                    let folded = body
-                        .read_host(cx)
-                        .shared()
-                        .get_const((c1 ^ outer) & all, size)
-                        .id();
+                    let folded = body.read_host(cx).shr().get_const((c1 ^ outer) & all, size);
                     ed.replace_with_new_insn_c(
                         body,
                         cx,
@@ -759,8 +751,7 @@ fn simplify_compare_c<'str>(
                                 }) = body.read_host(cx).insn_ref(id).mnemonic()
                                 && let Some(flipped) = negated_compare(inner)
                             {
-                                let bool_ty =
-                                    body.read_host(cx).shr().types.get_or_make_bool();
+                                let bool_ty = body.read_host(cx).shr().types.get_or_make_bool();
                                 ed.replace_with_new_insn_typed_c(
                                     body,
                                     cx,

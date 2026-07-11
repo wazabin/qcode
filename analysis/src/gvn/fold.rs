@@ -6,7 +6,7 @@ use qcode::{
         Value, ValueId, ValueRef,
         insn::{Binary, Binop, IntBinop, Mnemonic, Unop},
         literal::LiteralRef,
-        util::base_ref::HostRef,
+        util::base_ref::{AsShared, HostRef},
     },
 };
 
@@ -228,11 +228,7 @@ fn constant_folding_with_location(
             };
 
             // Preserve the semantic type (e.g. StackAddress) through folding.
-            let out_type = host
-                .shared()
-                .shared
-                .types
-                .binop_result(lhs_type, op, rhs_type);
+            let out_type = host.shr().types.binop_result(lhs_type, op, rhs_type);
             let out_type = if host.shr().types.size_of(out_type) == output_size {
                 out_type
             } else {
@@ -276,9 +272,8 @@ fn constant_folding_with_location(
                 (((src.value() << (64 - src_bits)) as i64) >> (64 - src_bits)) as u64
             };
             Some(
-                host.shared()
-                    .get_const(extended & all_ones(sext.size), sext.size)
-                    .id(),
+                host.shr()
+                    .get_const(extended & all_ones(sext.size), sext.size),
             )
         }
 
@@ -296,11 +291,7 @@ fn constant_folding_with_location(
                     // numeric pipeline as an ordinary literal.
                     let mut buf = [0u8; 8];
                     buf[..slice.len()].copy_from_slice(slice);
-                    return Some(
-                        host.shared()
-                            .get_const(u64::from_le_bytes(buf), range.size)
-                            .id(),
-                    );
+                    return Some(host.shr().get_const(u64::from_le_bytes(buf), range.size));
                 }
                 // Still wider than a u64: a narrower byte blob.
                 return Some(host.shr().get_bytes(slice.to_vec()));
@@ -308,9 +299,8 @@ fn constant_folding_with_location(
             let src = get_numeric_const(host, range.src)?;
             let shifted = src.value().overflowing_shr(range.start as u32 * 8).0;
             Some(
-                host.shared()
-                    .get_const(shifted & all_ones(range.size), range.size)
-                    .id(),
+                host.shr()
+                    .get_const(shifted & all_ones(range.size), range.size),
             )
         }
 
@@ -354,11 +344,19 @@ fn signed_value(value: u64, size: usize) -> i64 {
 
 /// Concrete value of `v` when it is a non-symbolic literal, else `None`.
 ///
-/// Non-symbolic literals live in shared storage, so a bare `&Context` suffices;
-/// a non-literal (including a checked-out function's own instructions) is not a
-/// constant and yields `None` without needing arena routing.
-pub(super) fn const_value(ctx: &Context, v: ValueId) -> Option<u64> {
-    get_numeric_const(HostRef::from(ctx), v).map(|c| c.value())
+/// Non-symbolic literals live in shared storage, so a bare `&Shared` suffices
+/// (a `&Context` narrows via [`AsShared`]); a non-literal (including a
+/// checked-out function's own instructions) is not a constant and yields `None`
+/// without needing arena routing.
+pub(super) fn const_value<'a, 'str: 'a>(src: impl AsShared<'a, 'str>, v: ValueId) -> Option<u64> {
+    let shared = src.as_shared();
+    let ValueId::Literal(id) = v else {
+        return None;
+    };
+    if shared.values.literals[id].symbolic.is_some() {
+        return None;
+    }
+    Some(LiteralRef::from_id(shared, id).value())
 }
 
 fn try_fold_insn(host: HostRef, ic: &InsnCtx) -> Option<ValueId> {
@@ -503,8 +501,8 @@ pub(super) fn algebraic_identity(
         }
     }
 
-    let l = const_value(host.shared(), lhs);
-    let r = const_value(host.shared(), rhs);
+    let l = const_value(host.shr(), lhs);
+    let r = const_value(host.shr(), rhs);
 
     match op {
         // x + 0 = x ; 0 + x = x ; x - 0 = x  (Sub is not commutative)

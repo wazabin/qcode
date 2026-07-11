@@ -13,9 +13,9 @@
 //! agnostic replacement for matching `StackAddress` literals directly, and the
 //! foundation for the frame-freshness alias rule.
 
-use qcode::{
-    context::Context,
-    value::{FunctionId, FunctionRef, ValueId, VarnodeId, util::base_ref::HostRef},
+use qcode::value::{
+    FunctionId, FunctionRef, ValueId, VarnodeId,
+    util::base_ref::{AsShared, HostRef},
 };
 
 use crate::gvn::affine::Numbering;
@@ -83,8 +83,8 @@ fn is_aligned_sp(numbering: &Numbering, sp_param: ValueId, base: ValueId, depth:
 ///
 /// Returns `None` for a realigned (`@SP & -mask`) base — which has no stable
 /// `@SP`-relative offset — and for any non-stack pointer.
-pub(crate) fn frame_offset(
-    _ctx: &Context,
+pub(crate) fn frame_offset<'a, 'str: 'a>(
+    _src: impl AsShared<'a, 'str>,
     numbering: &Numbering,
     sp_param: ValueId,
     v: ValueId,
@@ -97,14 +97,14 @@ pub(crate) fn frame_offset(
 /// Classify pointer `v` against the frame whose incoming stack pointer is
 /// `sp_param`, decomposing `@SP ± k` through `numbering`. Returns `None` when `v`
 /// is not stack-pointer-rooted.
-pub(crate) fn frame_class(
-    ctx: &Context,
+pub(crate) fn frame_class<'a, 'str: 'a>(
+    src: impl AsShared<'a, 'str>,
     numbering: &Numbering,
     sp_param: ValueId,
     v: ValueId,
 ) -> Option<FrameClass> {
     // An `@SP`/`@stack_base`-relative slot: classify by the sign of its offset.
-    if let Some(off) = frame_offset(ctx, numbering, sp_param, v) {
+    if let Some(off) = frame_offset(src, numbering, sp_param, v) {
         return Some(by_sign(off));
     }
     // A realigned frame base (`@SP & -mask`, possibly cascaded): everything offset

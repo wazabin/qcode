@@ -342,13 +342,13 @@ impl MemForward {
         segments: &[Segment],
         load_size: usize,
     ) -> Option<ValueId> {
-        let ctx = host.shared();
+        let ctx = host.shr();
         let mut buf = vec![0u8; load_size];
         for seg in segments {
             let bytes: Vec<u8> = match seg.src {
                 ValueId::Literal(lid) => {
                     // Numeric literal: bail on symbolic refs; take the LE bytes.
-                    let lit = &ctx.shared.values.literals[lid];
+                    let lit = &ctx.values.literals[lid];
                     if lit.symbolic.is_some() {
                         return None;
                     }
@@ -357,7 +357,7 @@ impl MemForward {
                     le.get(seg.src_off..seg.src_off + seg.size)?.to_vec()
                 }
                 ValueId::Bytes(bid) => {
-                    let data = &ctx.shared.values.bytes[bid].data;
+                    let data = &ctx.values.bytes[bid].data;
                     data.get(seg.src_off..seg.src_off + seg.size)?.to_vec()
                 }
                 // Non-constant source: nothing to fold to.
@@ -366,7 +366,7 @@ impl MemForward {
             buf.get_mut(seg.load_off..seg.load_off + seg.size)?
                 .copy_from_slice(&bytes);
         }
-        Some(ctx.get_bytes(buf).id())
+        Some(ctx.get_bytes(buf))
     }
 
     /// Build one segment's contribution: `Range` of the source (skipped when the
@@ -416,10 +416,7 @@ impl MemForward {
         if seg.load_off == 0 {
             return widened;
         }
-        let shamt = host
-            .shared()
-            .get_const((seg.load_off * 8) as u64, load_size)
-            .id();
+        let shamt = host.shr().get_const((seg.load_off * 8) as u64, load_size);
         let s = host.push_mnemonic(
             block_id.func,
             Mnemonic::Binop(Binary {
@@ -469,11 +466,7 @@ impl MemForward {
             );
         }
         if covered < store.size {
-            let zero = body
-                .read_host(cx)
-                .shared()
-                .get_const(0, store.size - covered)
-                .id();
+            let zero = body.read_host(cx).shr().get_const(0, store.size - covered);
             for (i, off) in (start + covered as i64..end).enumerate() {
                 self.byte_map.insert(
                     (base, off),
@@ -559,12 +552,12 @@ impl MemForward {
         segments: &[Segment],
         load_size: usize,
     ) -> Option<ValueId> {
-        let ctx = body.read_host(cx).shared();
+        let ctx = body.read_host(cx).shr();
         let mut buf = vec![0u8; load_size];
         for seg in segments {
             let bytes: Vec<u8> = match seg.src {
                 ValueId::Literal(lid) => {
-                    let lit = &ctx.shared.values.literals[lid];
+                    let lit = &ctx.values.literals[lid];
                     if lit.symbolic.is_some() {
                         return None;
                     }
@@ -573,7 +566,7 @@ impl MemForward {
                     le.get(seg.src_off..seg.src_off + seg.size)?.to_vec()
                 }
                 ValueId::Bytes(bid) => {
-                    let data = &ctx.shared.values.bytes[bid].data;
+                    let data = &ctx.values.bytes[bid].data;
                     data.get(seg.src_off..seg.src_off + seg.size)?.to_vec()
                 }
                 _ => return None,
@@ -581,7 +574,7 @@ impl MemForward {
             buf.get_mut(seg.load_off..seg.load_off + seg.size)?
                 .copy_from_slice(&bytes);
         }
-        Some(ctx.get_bytes(buf).id())
+        Some(ctx.get_bytes(buf))
     }
 
     /// Concrete pass twin of [`build_piece`](Self::build_piece).
@@ -631,9 +624,8 @@ impl MemForward {
         }
         let shamt = body
             .read_host(cx)
-            .shared()
-            .get_const((seg.load_off * 8) as u64, load_size)
-            .id();
+            .shr()
+            .get_const((seg.load_off * 8) as u64, load_size);
         let s = body.push_mnemonic(
             cx,
             Mnemonic::Binop(Binary {
@@ -735,7 +727,7 @@ impl MemForward {
             })
         };
 
-        let is_reg = |space| matches!(Space::from_id(host.shared(), space).ty, SpaceType::Register);
+        let is_reg = |space| matches!(Space::from_id(host.shr(), space).ty, SpaceType::Register);
 
         // PROTOTYPE (realigned-frame): frame freshness extended from stores to
         // calls. A symbolic RAM cell whose base is an own-frame local the callee
@@ -782,7 +774,7 @@ impl MemForward {
                 Base::Pinned(_) => match &clobbers {
                     CallClobbers::AllRegisters => false,
                     CallClobbers::Regs(regs) => !regs.iter().any(|&r| {
-                        let vn = Varnode::from_id(host.shared(), r);
+                        let vn = Varnode::from_id(host.shr(), r);
                         vn.space().id == space
                             && vn.address() <= off
                             && off < vn.address() + vn.size() as i64
@@ -809,7 +801,7 @@ impl MemForward {
             .function()
             .map(|f| f.id)
             .is_some_and(|fid| {
-                host.shared()
+                host.shr()
                     .truth(Proposition::LoadedPointerDisjointFromSlot(fid))
                     .is_some_and(|t| t.value)
             })

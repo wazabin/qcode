@@ -34,7 +34,7 @@ use crate::pipeline::{ContextView, FunctionBody};
 use crate::{FunctionPass, register_function_pass};
 
 fn is_temp(host: HostRef, s: SpaceId) -> bool {
-    matches!(Space::from_id(host.shared(), s).ty, SpaceType::Temporary)
+    matches!(Space::from_id(host.shr(), s).ty, SpaceType::Temporary)
 }
 
 // ===========================================================================

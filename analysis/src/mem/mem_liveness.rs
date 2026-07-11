@@ -85,8 +85,8 @@ fn intersect_killed(succs: &[BlockId], killed_in: &HashMap<BlockId, KilledSet>) 
 /// Restrict liveness facts to register/temp spaces; RAM/global stores are never
 /// propagated across blocks (they may be observed outside the function).
 fn retain_tracked(host: HostRef, live: &mut LiveSet, killed: &mut KilledSet) {
-    live.retain(|l| is_tracked_space(host.shared(), l.space));
-    killed.retain(|k| is_tracked_space(host.shared(), k.space));
+    live.retain(|l| is_tracked_space(host.shr(), l.space));
+    killed.retain(|k| is_tracked_space(host.shr(), k.space));
 }
 
 fn live_changed(old: &LiveSet, new: &LiveSet) -> bool {

@@ -255,12 +255,7 @@ fn apply<'str>(mv: ContextView<'_, 'str>, body: &mut FunctionBody<'str>, m: &Sca
             (body_fn, Src::Slice { l0_exit, esz }, src_arr_ty)
         }
         None => {
-            let src_arr_ty = body
-                .read_host(mv)
-                .shared()
-                .shared
-                .types
-                .get_or_make_array(i64_ty, n1);
+            let src_arr_ty = body.read_host(mv).shr().types.get_or_make_array(i64_ty, n1);
             let Some(body_fn) = outline_scan_body(
                 mv,
                 body,

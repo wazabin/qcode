@@ -498,12 +498,7 @@ impl Editor {
         mnemonic: Mnemonic,
         size: usize,
     ) -> InstructionId {
-        let type_id = body
-            .read_host(cx)
-            .shared()
-            .shared
-            .types
-            .get_or_make_int(size);
+        let type_id = body.read_host(cx).shr().types.get_or_make_int(size);
         self.replace_with_new_insn_typed_c(body, cx, block_id, at, mnemonic, type_id)
     }
 
