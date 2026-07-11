@@ -559,17 +559,6 @@ pub trait HostMut<'str> {
             None => self.shared_mut().update_name(name, id, old_name),
         }
     }
-
-    /// The whole module, if this host *is* the module (`&mut Context`), else `None`
-    /// for a checked-out host. An escape hatch for module-only algorithms that were
-    /// written against `&mut Context` and are only ever dispatched on the module
-    /// path (e.g. the GVN sub-passes that read pure *callee* bodies, run only under
-    /// the module `gvn` pass): they unwrap this once and operate on the context
-    /// directly. A checked-out caller reaching this is a bug, so the `None` arm must
-    /// be a loud `expect`, never a silent fallback.
-    fn as_module_mut(&mut self) -> Option<&mut Context<'str>> {
-        None
-    }
 }
 
 impl<'str> HostMut<'str> for &mut Context<'str> {
@@ -607,9 +596,6 @@ impl<'str> HostMut<'str> for &mut Context<'str> {
         if let Some(sites) = self.shared.values.call_sites.get_mut(&target) {
             sites.retain(|s| *s != site);
         }
-    }
-    fn as_module_mut(&mut self) -> Option<&mut Context<'str>> {
-        Some(self)
     }
 }
 
