@@ -1,16 +1,14 @@
-//! The exclusive *mutation* host for a checked-out function pass
-//! ([`PassBacking`]).
+//! The exclusive *mutation* host for a function pass ([`PassBacking`]).
 //!
-//! [`HostRef`](super::base_ref::HostRef) gave the read layer a `Copy` view that
-//! routes arena reads to a checked-out function. [`PassBacking`] is its mutable
-//! sibling: a single function's arenas checked out of the module for exclusive
-//! mutation by one worker.
+//! [`HostRef`](super::base_ref::HostRef) gives the read layer a `Copy` view that
+//! routes arena reads to the pass's own function. [`PassBacking`] is its mutable
+//! sibling: a single function's arenas borrowed `&mut` in place from
+//! `Context.bodies[id]` for exclusive mutation by one worker (the driver's
+//! `Context::split` hands out disjoint body borrows).
 //!
-//! A checked-out function's body has been swapped out of the module registry (its
-//! slot holds an empty body); its arenas live in an owned `&mut Function`, and all
-//! *shared* data (types, varnodes, spaces, registers, name map) stays in the
-//! module, reachable read-only. The inherent verb + read methods below route each
-//! write to the owned function's arena; a function pass must not mutate another
+//! All *shared* data (types, varnodes, spaces, registers, name map) stays behind
+//! the `&Shared` view, reachable read-only. The inherent verb + read methods below
+//! route each write to the borrowed function's arena; a function pass must not mutate another
 //! function (asserted). The module-scope twin of every verb is an inherent method
 //! on [`Context`](crate::context::Context); the shorter-lived reborrow needed to
 //! hand the host to a value that owns it by value (a [`Builder`](crate::builder::Builder)
@@ -29,9 +27,9 @@ use crate::{
 
 use super::base_ref::HostRef;
 
-/// A single function checked out of `shared` for exclusive mutation. `fun`'s slot
-/// in `shared.bodies[id]` currently holds an empty body (its interface
-/// stays in `shared.interfaces[id]`); its real arenas are owned here.
+/// A single function borrowed `&mut` in place from `Context.bodies[id]` for
+/// exclusive mutation (its interface stays in `Context.interfaces[id]`,
+/// reachable read-only through `interfaces`).
 ///
 /// Out of scope (and asserted against on construction): a function with
 /// *reattributed* blocks — a roster block stored in, or parented to, a different

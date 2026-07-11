@@ -41,12 +41,12 @@ pub fn dead_insns<'a, 'str: 'a>(
 /// updating the users reverse map after each round.
 /// TODO(5b-ii): Takes Context; migrate to FunctionBody/ContextView when public API stabilizes.
 pub fn remove_dead_insns(ctx: &mut Context, block_id: BlockId) -> bool {
-    remove_dead_insns_generic(ctx, block_id)
+    remove_dead_insns_module(ctx, block_id)
 }
 
 /// Generic host-based version of [`remove_dead_insns`]; see that function.
 /// TODO(5b-ii): For backwards compatibility; prefer concrete version for new code.
-pub fn remove_dead_insns_generic<'str>(host: &mut Context<'str>, block_id: BlockId) -> bool {
+pub fn remove_dead_insns_module<'str>(host: &mut Context<'str>, block_id: BlockId) -> bool {
     let mut changed = false;
     loop {
         let dead = dead_insns(host.read_host(), block_id);
@@ -100,12 +100,12 @@ pub fn remove_dead_insns_host<'a, 'str>(
 /// arguments.
 #[cfg(test)]
 pub fn remove_dead_pure_call(ctx: &mut Context, block_id: BlockId) -> bool {
-    remove_dead_pure_call_generic(ctx, block_id)
+    remove_dead_pure_call_module(ctx, block_id)
 }
 
 /// Generic version of remove_dead_pure_call for test use.
 #[cfg(test)]
-fn remove_dead_pure_call_generic<'str>(host: &mut Context<'str>, block_id: BlockId) -> bool {
+fn remove_dead_pure_call_module<'str>(host: &mut Context<'str>, block_id: BlockId) -> bool {
     let Some(term_id) = host.block_ref(block_id).instruction_ids().last().copied() else {
         return false;
     };
@@ -818,12 +818,12 @@ fn match_dead_loop(host: HostRef, header: BlockId) -> Option<DeadLoop> {
 /// dead loop can only be recognized by reasoning over the whole cyclic region.
 #[cfg(test)]
 fn remove_dead_counted_loop(ctx: &mut Context, fun_id: FunctionId) -> bool {
-    remove_dead_counted_loop_generic(ctx, fun_id)
+    remove_dead_counted_loop_module(ctx, fun_id)
 }
 
 /// Generic version of remove_dead_counted_loop for test use.
 #[cfg(test)]
-fn remove_dead_counted_loop_generic<'str>(host: &mut Context<'str>, fun_id: FunctionId) -> bool {
+fn remove_dead_counted_loop_module<'str>(host: &mut Context<'str>, fun_id: FunctionId) -> bool {
     let headers: Vec<BlockId> = host.function_ref(fun_id).blocks().map(|b| b.id).collect();
     for header in headers {
         if let Some(dl) = match_dead_loop(host.read_host(), header) {
