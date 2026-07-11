@@ -1422,16 +1422,16 @@ impl<'str> Context<'str> {
 
     // ---- module read/mint surface (context-split stage 5b-ii Pin A) ----------
     //
-    // Inherent mirrors of the [`HostMut`](crate::value::util::host_mut::HostMut)
-    // read accessors and the type-minting verbs, so the module walker and the
-    // module-scope GVN sub-passes read/mint over `&mut Context` without the trait
-    // in scope. `function{,_mut}` alias the existing `body{,_mut}`.
+    // Module-scope read accessors and type-minting verbs, mirrored on the
+    // checked-out `CheckedOut` pass host, so the module walker and the
+    // module-scope GVN sub-passes read/mint over `&mut Context` directly.
+    // `function{,_mut}` alias the existing `body{,_mut}`.
 
     /// A `Copy` read view over the whole module (for the mutation refs' reads).
     pub fn read_host(&self) -> HostRef<'_, 'str> {
         HostRef::Module(self)
     }
-    /// The module's shared data (read) — returns `self`; mirrors `HostMut::shared`.
+    /// The module's shared data (read) — returns `self`.
     pub fn shared(&self) -> &Context<'str> {
         self
     }
@@ -1462,7 +1462,6 @@ impl<'str> Context<'str> {
     }
 
     /// Mint an `Int(size)`-typed instruction with `mnemonic` into `func`'s arena.
-    /// Mirrors [`HostMut::push_mnemonic`].
     pub fn push_mnemonic(
         &mut self,
         func: FunctionId,
@@ -1474,7 +1473,7 @@ impl<'str> Context<'str> {
     }
 
     /// Mint an instruction with `mnemonic` and explicit result `type_id` into
-    /// `func`'s arena. Mirrors [`HostMut::push_mnemonic_with_type`].
+    /// `func`'s arena.
     pub fn push_mnemonic_with_type(
         &mut self,
         func: FunctionId,
@@ -1485,7 +1484,6 @@ impl<'str> Context<'str> {
     }
 
     /// Insert `insn` immediately before `before` in `block`, setting its parent.
-    /// Mirrors [`HostMut::insert_insn_before`].
     pub fn insert_insn_before(
         &mut self,
         block: BlockId,
@@ -1504,13 +1502,12 @@ impl<'str> Context<'str> {
     }
 
     /// Mint a fresh empty block into `func`'s arena, parented and rostered.
-    /// Mirrors [`HostMut::make_block`](crate::value::util::host_mut::HostMut::make_block).
+    /// The module-scope mint of a fresh empty block.
     pub fn make_block(&mut self, func: FunctionId) -> BlockId {
         self.push_block(func, BasicBlock::detached(func))
     }
 
     /// Rehome `remove`'s outgoing CFG edges onto `keep` and drop the direct edge.
-    /// Mirrors [`HostMut::merge_nodes`](crate::value::util::host_mut::HostMut::merge_nodes).
     pub fn merge_nodes(&mut self, keep: BlockId, remove: BlockId, direct_edge: EdgeId) {
         let func = keep.func;
         self.block_mut(keep).edges.remove(&(func, direct_edge));
@@ -1533,8 +1530,7 @@ impl<'str> Context<'str> {
     }
 
     /// Remove `block` from its function (unlink edges, remove instructions,
-    /// detach params, tombstone). Mirrors
-    /// [`HostMut::delete_block`](crate::value::util::host_mut::HostMut::delete_block).
+    /// detach params, tombstone).
     pub fn delete_block(&mut self, block: BlockId, _function_id: FunctionId) {
         let edges: Vec<(FunctionId, EdgeId)> = self
             .read_host()
@@ -1563,8 +1559,7 @@ impl<'str> Context<'str> {
         b.deleted = true;
     }
 
-    /// Absorb `other` into `keep`. Mirrors
-    /// [`HostMut::absorb_block`](crate::value::util::host_mut::HostMut::absorb_block).
+    /// Absorb `other` into `keep`.
     pub fn absorb_block(
         &mut self,
         keep: BlockId,
@@ -1620,8 +1615,7 @@ impl<'str> Context<'str> {
     }
 
     /// Register `name` for `id` in the table that owns its kind (function-local
-    /// for block/insn/param, global otherwise). Mirrors
-    /// [`HostMut::register_local_name`](crate::value::util::host_mut::HostMut::register_local_name).
+    /// for block/insn/param, global otherwise).
     pub fn register_local_name(
         &mut self,
         id: ValueId,

@@ -588,7 +588,7 @@ impl<'str, 'ctx> Renameable<'str, 'ctx> for BlockMutRef<'str, 'ctx> {
 }
 
 // Naming/renaming a block through a checked-out host (concrete: a generic
-// `Ctx: HostMut` can't prove `'str` outlives the returned `&str`). Block names are
+// a fully generic backing can't prove `'str` outlives the returned `&str`). Block names are
 // function-local, so this reads/writes the owned function's arena directly.
 impl<'a, 'str> Named for BaseRef<CheckedOut<'a, 'str>, BlockId> {
     fn name(&self) -> Option<&str> {
@@ -613,7 +613,7 @@ impl<'a, 'str> Renameable<'str, 'a> for BaseRef<CheckedOut<'a, 'str>, BlockId> {
 // The own-block mutation verbs, emitted for each concrete mutation backing —
 // `&mut Context` (module) and `CheckedOut` (checked-out function pass). Both
 // bodies are identical (they call the backing's inherent verbs); the macro keeps
-// the pair in lockstep without a `HostMut` bound.
+// the pair in lockstep without a shared trait bound.
 macro_rules! impl_block_mut_verbs {
     (<$($l:lifetime),*> $ctx:ty) => {
         impl<$($l),*> BaseRef<$ctx, BlockId> {

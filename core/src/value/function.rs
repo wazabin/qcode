@@ -218,7 +218,7 @@ impl<'str> Function<'str> {
     // `func`-strip mechanical — after it, `id` *is* the local index and these
     // bodies are unchanged. These return raw `&`/`&mut` arena values; for the
     // wrapper-ref surface (`successors()`, `name()`, …) use the `*_ref`
-    // constructors on [`HostRef`]/[`HostMut`] or a [`FunctionRef`].
+    // constructors on [`HostRef`] or a [`FunctionRef`].
 
     /// The block `id`, by its function-local index (see the note above).
     pub fn block(&self, id: BlockId) -> &BasicBlock<'str> {
@@ -254,7 +254,7 @@ impl<'str> Function<'str> {
     // The single-homed IR mutation surface for a function *body* (design ruling
     // 6). Each verb operates directly on this body's own arenas, reading shared
     // data (types for minting) through an explicit `&Context` where needed. These
-    // are the algorithm bodies formerly living on `HostMut`'s checked-out path
+    // are the algorithm bodies formerly living on the checked-out mutation path
     // (`value::util::host_mut`), ported here with the routing indirection dropped:
     // `self.function_mut(f)` collapses to `self`, `self.read_host()` to `self`'s
     // own arena accessors, and the global call-site cache maintenance is omitted

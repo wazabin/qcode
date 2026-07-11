@@ -272,7 +272,7 @@ impl<'str> FunctionBody<'str> {
 impl<'str> FunctionBody<'str> {
     // ---- births -------------------------------------------------------------
     //
-    // `push_edge` (`HostMut::push_edge`) is intentionally NOT mirrored: its
+    // `push_edge` (`Context::push_edge`) is intentionally NOT mirrored: its
     // `EdgeData` parameter is `pub(crate)` in `qcode::value::block`, so it cannot
     // be named from this crate without making `EdgeData` public (a core design
     // change, out of this commit's additive scope). No pass calls `push_edge`
@@ -454,7 +454,7 @@ impl<'str> FunctionBody<'str> {
     // These return `&mut` borrows *into this body*, so they cannot be routed
     // through a freshly built `CheckedOut` (the temporary host would be dropped
     // before the borrow is returned). They delegate straight to the underlying
-    // `Function` arena accessors — behaviour-identical to [`HostMut`]'s versions,
+    // `Function` arena accessors — behaviour-identical to the `Context` versions,
     // which resolve to the same `self.fun.<arena>[id.local]` — and take no `cx`.
 
     /// The instruction `id`, mutably. Mirror of [`HostMut::instruction_mut`].
