@@ -6,10 +6,7 @@ use qcode::value::{
     BlockId, BlockParam, BlockParamId, Function, FunctionId, Value, ValueId, ValueRef, Varnode,
     VarnodeId,
     insn::{Branch, CBranch, InstructionId, Load, Mnemonic, Range, Sext, Store, Zext},
-    util::{
-        base_ref::{BaseRef, HostRef},
-        host_mut::HostMut,
-    },
+    util::base_ref::{BaseRef, HostRef},
 };
 use qcode::{builder::Builder, context::Context};
 use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
@@ -1270,8 +1267,7 @@ impl<'str> Mem2RegGeneric<'_, 'str> {
             let vn = Varnode::from_id(self.read().shared(), vn_id);
             (vn.space().id, vn.size())
         };
-        let mut builder =
-            Builder::from_block(BaseRef::new(self.host.reborrow_host(), branch_block));
+        let mut builder = Builder::from_block(BaseRef::new(&mut *self.host, branch_block));
         builder.set_insert_point_before(branch_insn);
         let id = builder
             .push_load::<false>(ValueId::Varnode(vn_id), size, space)
@@ -2606,7 +2602,7 @@ impl<'str> Mem2Reg<'_, 'str> {
             (vn.space().id, vn.size())
         };
         let mut host = self.body.host(self.cx);
-        let mut builder = Builder::from_block(BaseRef::new(host.reborrow_host(), branch_block));
+        let mut builder = Builder::from_block(BaseRef::new(host.reborrow(), branch_block));
         builder.set_insert_point_before(branch_insn);
         let id = builder
             .push_load::<false>(ValueId::Varnode(vn_id), size, space)

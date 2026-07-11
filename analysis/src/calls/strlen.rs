@@ -25,7 +25,7 @@ use qcode::{
         insn::{
             Binop, Branch, CBranch, InstructionId, IntBinop, IntrinsicApp, IntrinsicId, Mnemonic,
         },
-        util::{base_ref::BaseRef, base_ref::HostRef, host_mut::HostMut},
+        util::{base_ref::BaseRef, base_ref::HostRef},
     },
 };
 
@@ -320,7 +320,7 @@ fn apply_strlen<'str>(
     let first = body.block_ref(cx, m.exit_block).iter().next().map(|i| i.id);
     let len_val = {
         let mut host = body.host(cx);
-        let mut b = Builder::from_block(BaseRef::new(host.reborrow_host(), m.exit_block));
+        let mut b = Builder::from_block(BaseRef::new(host.reborrow(), m.exit_block));
         if let Some(at) = first {
             b.set_insert_point_before(at);
         }
@@ -534,7 +534,7 @@ fn apply_strlen_ptr<'str>(
     let len_id = IntrinsicId::from_name("len").expect("len registered");
     let len_val = {
         let mut host = body.host(cx);
-        let mut b = Builder::from_block(BaseRef::new(host.reborrow_host(), m.diff_block));
+        let mut b = Builder::from_block(BaseRef::new(host.reborrow(), m.diff_block));
         b.set_insert_point_before(m.diff_id);
         let tw = b.push_intrinsic(tw_id, vec![m.base]).id();
         b.push_intrinsic(len_id, vec![tw]).id()

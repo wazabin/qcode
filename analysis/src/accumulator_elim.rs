@@ -55,7 +55,7 @@ use qcode::{
         insn::{Apply, CBranch, Extract, Mnemonic},
         util::{
             base_ref::{BaseRef, HostRef},
-            host_mut::{CheckedOut, HostMut},
+            host_mut::CheckedOut,
         },
     },
 };
@@ -310,7 +310,7 @@ fn transform<'str>(
             g_head,
         );
         {
-            let mut b = Builder::from_block(BaseRef::new(minted.reborrow_host(), g_head));
+            let mut b = Builder::from_block(BaseRef::new(minted.reborrow(), g_head));
             if p.cond_true_is_exit {
                 b.push_cbranch(cond, base, rec);
             } else {
@@ -327,7 +327,7 @@ fn transform<'str>(
                 .iter()
                 .map(|&i| const_at_size(minted.shared(), model.init_args[i], p.head_sizes[i]))
                 .collect();
-            let mut b = Builder::from_block(BaseRef::new(minted.reborrow_host(), base));
+            let mut b = Builder::from_block(BaseRef::new(minted.reborrow(), base));
             let tuple = b.push_tuple(base_fields);
             let ty = tuple.type_id();
             let tuple = tuple.id();
@@ -367,7 +367,7 @@ fn transform<'str>(
                 tuple_ty,
             );
             let acc_vals: Vec<ValueId> = {
-                let mut b = Builder::from_block(BaseRef::new(minted.reborrow_host(), rec));
+                let mut b = Builder::from_block(BaseRef::new(minted.reborrow(), rec));
                 (0..p.a_slots.len())
                     .map(|pos| b.push_extract(deep, pos).id())
                     .collect()
@@ -393,7 +393,7 @@ fn transform<'str>(
                 })
                 .collect();
 
-            let mut b = Builder::from_block(BaseRef::new(minted.reborrow_host(), rec));
+            let mut b = Builder::from_block(BaseRef::new(minted.reborrow(), rec));
             let tuple = b.push_tuple(new_acc).id();
             b.push_return_value(tuple);
         }
@@ -445,7 +445,7 @@ fn transform<'str>(
         root,
     );
     {
-        let mut b = Builder::from_block(BaseRef::new(host.reborrow_host(), root));
+        let mut b = Builder::from_block(BaseRef::new(host.reborrow(), root));
         b.push_return_value(result);
     }
 
@@ -482,7 +482,7 @@ fn push_typed<'str>(
     ty: TypeId,
 ) -> ValueId {
     let id = host.push_mnemonic_with_type(block.func, mnemonic, ty);
-    BaseRef::new(host.reborrow_host(), block).push_insn(id);
+    BaseRef::new(host.reborrow(), block).push_insn(id);
     ValueId::Instruction(id)
 }
 

@@ -2028,10 +2028,7 @@ mod tests {
             BlockParam, FunctionId, FunctionRef, InstructionId, Renameable,
             block::BlockId,
             block_param::BlockParamId,
-            util::{
-                base_ref::BaseRef,
-                host_mut::{CheckedOut, HostMut},
-            },
+            util::{base_ref::BaseRef, host_mut::CheckedOut},
         };
 
         fn build(mut ctx: &mut Context<'static>) -> (FunctionId, BlockId, BlockId, InstructionId) {

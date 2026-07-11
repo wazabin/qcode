@@ -15,7 +15,7 @@ use qcode::{
     value::{
         BlockId, FunctionId, ValueId,
         insn::{InstructionId, IntrinsicId, Mnemonic},
-        util::{base_ref::BaseRef, base_ref::HostRef, host_mut::HostMut},
+        util::{base_ref::BaseRef, base_ref::HostRef},
     },
 };
 
@@ -263,7 +263,7 @@ fn apply<'str>(m: ContextView<'_, 'str>, body: &mut FunctionBody<'str>, mm: &Map
     // ahead of the consumer through a scoped Builder over `body.host(m)`.
     let src = if uses_index {
         let mut host = body.host(m);
-        let mut b = Builder::from_block(BaseRef::new(host.reborrow_host(), mm.exit));
+        let mut b = Builder::from_block(BaseRef::new(host.reborrow(), mm.exit));
         if let Some(at) = anchor {
             b.set_insert_point_before(at);
         }
@@ -291,7 +291,7 @@ fn apply<'str>(m: ContextView<'_, 'str>, body: &mut FunctionBody<'str>, mm: &Map
             Some(at) => body.insert_insn_before(m, mm.exit, at, id),
             None => {
                 let mut host = body.host(m);
-                BaseRef::new(host.reborrow_host(), mm.exit).push_insn(id);
+                BaseRef::new(host.reborrow(), mm.exit).push_insn(id);
             }
         }
         ValueId::Instruction(id)

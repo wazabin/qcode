@@ -18,10 +18,7 @@ use qcode::value::{
     BlockParamId, FunctionId, ValueId,
     block::BlockId,
     insn::{Binary, Binop, Branch, CBranch, InstructionId, IntBinop, Mnemonic},
-    util::{
-        base_ref::{BaseRef, HostRef},
-        host_mut::HostMut,
-    },
+    util::base_ref::{BaseRef, HostRef},
 };
 
 use crate::{ContextView, FunctionBody, FunctionPass};
@@ -141,7 +138,7 @@ pub fn recognize_simple_loops_host<'a, 'str>(
             // TODO(5b-ii): `BaseRef::set_comment` is not mirrored on
             // `FunctionBody`; go through a temporary host.
             let mut host = body.host(cx);
-            BaseRef::new(host.reborrow_host(), block).set_comment(comment);
+            BaseRef::new(host.reborrow(), block).set_comment(comment);
             changed = true;
         }
     }
@@ -253,7 +250,7 @@ fn apply_unroll_plan<'a, 'str>(
                 // TODO(5b-ii): `BaseRef::rename_local` is not mirrored on
                 // `FunctionBody`; go through a temporary host.
                 let mut host = body.host(cx);
-                let _ = BaseRef::new(host.reborrow_host(), new_block).rename_local(
+                let _ = BaseRef::new(host.reborrow(), new_block).rename_local(
                     format!(
                         "unroll_{:x}_{iteration}_{path_index}",
                         usize::from(old_block.local)
@@ -287,7 +284,7 @@ fn apply_unroll_plan<'a, 'str>(
                     // TODO(5b-ii): `BaseRef::insert_insn_at_index` is not mirrored
                     // on `FunctionBody`; go through a temporary host.
                     let mut host = body.host(cx);
-                    BaseRef::new(host.reborrow_host(), new_block)
+                    BaseRef::new(host.reborrow(), new_block)
                         .insert_insn_at_index(insert_at, new_insn);
                 }
                 value_map.insert(
@@ -510,7 +507,7 @@ pub(crate) fn replace_terminator_with_branch<'a, 'str>(
             // TODO(5b-ii): `BaseRef::insert_insn_at_index` is not mirrored on
             // `FunctionBody`; go through a temporary host.
             let mut host = body.host(cx);
-            BaseRef::new(host.reborrow_host(), block).insert_insn_at_index(end, branch);
+            BaseRef::new(host.reborrow(), block).insert_insn_at_index(end, branch);
         }
     }
     body.add_cfg_edge(cx, block, target);
@@ -520,7 +517,7 @@ pub(crate) fn replace_terminator_with_branch<'a, 'str>(
 /// `#[cfg(test)]` module-path twins.
 #[cfg(test)]
 pub(crate) fn replace_terminator_with_branch_generic<'str>(
-    mut host: &mut qcode::context::Context<'str>,
+    host: &mut qcode::context::Context<'str>,
     block: BlockId,
     target: BlockId,
     args: Vec<ValueId>,
@@ -551,7 +548,7 @@ pub(crate) fn replace_terminator_with_branch_generic<'str>(
     } else {
         let branch = host.push_mnemonic(block.func, Mnemonic::Branch(Branch { target, args }), 0);
         let end = host.block_ref(block).instruction_ids().len();
-        BaseRef::new(host.reborrow_host(), block).insert_insn_at_index(end, branch);
+        BaseRef::new(&mut *host, block).insert_insn_at_index(end, branch);
     }
     host.add_cfg_edge(block, target);
 }

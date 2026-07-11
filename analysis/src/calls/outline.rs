@@ -18,11 +18,7 @@ use qcode::{
         BasicBlock, BlockId, Function, FunctionId, FunctionKind, InstructionRef, ValueId,
         block_param::BlockParam,
         insn::{Binary, Binop, Extract, InstructionId, IntBinop, Mnemonic, Range, Return},
-        util::{
-            base_ref::BaseRef,
-            base_ref::HostRef,
-            host_mut::{CheckedOut, HostMut},
-        },
+        util::{base_ref::BaseRef, base_ref::HostRef, host_mut::CheckedOut},
     },
 };
 
@@ -349,7 +345,7 @@ fn push_insn_into<'str>(
     ty: TypeId,
 ) -> ValueId {
     let id = host.push_mnemonic_with_type(block.func, mnemonic, ty);
-    BaseRef::new(host.reborrow_host(), block).push_insn(id);
+    BaseRef::new(host.reborrow(), block).push_insn(id);
     ValueId::Instruction(id)
 }
 

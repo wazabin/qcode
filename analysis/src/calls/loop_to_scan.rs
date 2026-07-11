@@ -40,7 +40,7 @@ use qcode::{
     value::{
         BlockId, FunctionId, ValueId,
         insn::{InstructionId, IntrinsicApp, IntrinsicId, Mnemonic},
-        util::{base_ref::BaseRef, base_ref::HostRef, host_mut::HostMut},
+        util::{base_ref::BaseRef, base_ref::HostRef},
     },
 };
 
@@ -343,7 +343,7 @@ fn apply<'str>(mv: ContextView<'_, 'str>, body: &mut FunctionBody<'str>, m: &Sca
     };
     let full = {
         let mut host = body.host(mv);
-        let mut b = Builder::from_block(BaseRef::new(host.reborrow_host(), m.exit));
+        let mut b = Builder::from_block(BaseRef::new(host.reborrow(), m.exit));
         b.set_insert_point_before(anchor);
         let sing = b.push_intrinsic(singleton_id, vec![m.seed_val]).id();
         b.push_intrinsic(concat_id, vec![sing, scan]).id()

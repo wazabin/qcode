@@ -41,10 +41,7 @@ use qcode::{
         block::BlockId,
         block_param::BlockParam,
         insn::{Branch, InstructionId, Mnemonic},
-        util::{
-            base_ref::BaseRef,
-            host_mut::{CheckedOut, HostMut},
-        },
+        util::{base_ref::BaseRef, host_mut::CheckedOut},
     },
 };
 
@@ -283,7 +280,7 @@ fn transform<'str>(
                 .iter()
                 .map(|a| value_map.get(a).copied().unwrap_or(*a))
                 .collect();
-            let mut b = Builder::from_block(BaseRef::new(minted.reborrow_host(), nb));
+            let mut b = Builder::from_block(BaseRef::new(minted.reborrow(), nb));
             let out = b.push_apply(rec, args).id();
             b.push_return_value(out);
         }
@@ -297,7 +294,7 @@ fn transform<'str>(
         // TODO(5b-ii): `Builder` drives a `BaseRef`, which is not mirrored on
         // `FunctionBody`; go through a temporary host.
         let mut host = body.host(m);
-        let mut b = Builder::from_block(BaseRef::new(host.reborrow_host(), model.root));
+        let mut b = Builder::from_block(BaseRef::new(host.reborrow(), model.root));
         let out = b.push_apply(rec, model.init_args.clone()).id();
         b.push_return_value(out);
     }

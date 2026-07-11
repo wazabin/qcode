@@ -21,11 +21,7 @@ use std::collections::{BTreeSet, HashMap};
 use qcode::{
     builder::Builder,
     context::Context,
-    value::{
-        FunctionId, ValueId, Varnode, VarnodeId,
-        insn::Mnemonic,
-        util::{base_ref::BaseRef, host_mut::HostMut},
-    },
+    value::{FunctionId, ValueId, Varnode, VarnodeId, insn::Mnemonic, util::base_ref::BaseRef},
 };
 
 use super::frame::incoming_sp_param;
@@ -129,7 +125,7 @@ pub fn canonicalize_sp_slots_concrete<'a, 'str>(
 /// TODO(5b-ii): Remove after callers migrate to FunctionBody/ContextView.
 #[allow(dead_code)]
 pub fn canonicalize_sp_slots<'str>(
-    mut host: &mut Context<'str>,
+    host: &mut Context<'str>,
     fid: FunctionId,
     sp_reg: VarnodeId,
 ) -> bool {
@@ -188,7 +184,7 @@ pub fn canonicalize_sp_slots<'str>(
         .filter(|o| !repr.contains_key(o))
         .collect();
     if !missing.is_empty() {
-        let mut b = Builder::from_block(BaseRef::new(host.reborrow_host(), root));
+        let mut b = Builder::from_block(BaseRef::new(&mut *host, root));
         b.set_insert_point_to_start();
         for off in missing {
             let mag = b.context().get_const(off.unsigned_abs(), ptr_width).id();
