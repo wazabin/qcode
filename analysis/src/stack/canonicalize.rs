@@ -20,6 +20,7 @@ use std::collections::{BTreeSet, HashMap};
 
 use qcode::{
     builder::Builder,
+    context::Context,
     value::{
         FunctionId, ValueId, Varnode, VarnodeId,
         insn::Mnemonic,
@@ -127,8 +128,8 @@ pub fn canonicalize_sp_slots_concrete<'a, 'str>(
 /// Generic wrapper for backwards compatibility; see concrete [`canonicalize_sp_slots_concrete`].
 /// TODO(5b-ii): Remove after callers migrate to FunctionBody/ContextView.
 #[allow(dead_code)]
-pub fn canonicalize_sp_slots<'str, H: HostMut<'str>>(
-    host: &mut H,
+pub fn canonicalize_sp_slots<'str>(
+    mut host: &mut Context<'str>,
     fid: FunctionId,
     sp_reg: VarnodeId,
 ) -> bool {
@@ -308,7 +309,7 @@ mod tests {
             "distinct before canonicalization"
         );
 
-        assert!(canonicalize_sp_slots(&mut &mut tc.ctx, fid, sp_reg));
+        assert!(canonicalize_sp_slots(&mut tc.ctx, fid, sp_reg));
 
         assert_eq!(
             ptr_of(&tc, l0),
@@ -319,7 +320,7 @@ mod tests {
         // Idempotent: a second run reuses the representative and reports no change.
         let shared = ptr_of(&tc, l0);
         assert!(
-            !canonicalize_sp_slots(&mut &mut tc.ctx, fid, sp_reg),
+            !canonicalize_sp_slots(&mut tc.ctx, fid, sp_reg),
             "second run must be a no-op"
         );
         assert_eq!(
