@@ -132,7 +132,7 @@ pub fn remove_dead_block_args(
     remove_dead_block_args_generic(ctx, block_ids, root)
 }
 
-/// Generic version of [`remove_dead_block_args`] core accepting any HostMut.
+/// The `&mut Context` version of [`remove_dead_block_args`]'s core.
 /// TODO(5b-ii): For backwards compatibility; prefer concrete version for new code.
 pub fn remove_dead_block_args_generic<'str>(
     host: &mut Context<'str>,
@@ -222,7 +222,7 @@ pub fn remove_dead_block_params(
     remove_dead_block_params_generic(ctx, block_ids, root)
 }
 
-/// Generic version of [`remove_dead_block_params`] core accepting any HostMut.
+/// The `&mut Context` version of [`remove_dead_block_params`]'s core.
 /// TODO(5b-ii): For backwards compatibility; prefer concrete version for new code.
 pub fn remove_dead_block_params_generic<'str>(
     host: &mut Context<'str>,

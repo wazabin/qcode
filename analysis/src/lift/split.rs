@@ -101,7 +101,7 @@ pub fn split_overlapping_functions(ctx: &mut Context) -> bool {
     // `parent`/roster) without moving *storage* (`id.func`): a function can still
     // own a block that lives in another function's arena. Discharge that here so
     // split always hands back strictly local IR — every block self-stored, the
-    // invariant `PassBacking::new` asserts at every checkout. A pure storage move
+    // invariant `PassBacking::new` asserts at construction. A pure storage move
     // (the IR is semantically identical), and a cheap no-op scan once storage
     // already matches ownership (the steady state after the first round).
     if ctx.normalize_block_storage() {
@@ -828,7 +828,7 @@ mod tests {
     /// the reattributed state `reattribute_blocks`/`lift_block` produce — is
     /// re-homed into `F`'s arena by `split_overlapping_functions`'s tail so that
     /// split always hands back strictly local IR: ownership and storage agree, the
-    /// IR (successors, opcodes) is intact, and every function is checkout-safe.
+    /// IR (successors, opcodes) is intact, and every function is self-stored.
     #[test]
     fn split_rehomes_reattributed_block() {
         use qcode::value::insn::Mnemonic;
@@ -900,6 +900,5 @@ mod tests {
         // (c) F is now self-stored: `PassBacking::new`'s debug-assert holds when
         // the body is borrowed in place.
         let _co = PassBacking::new(&mut ctx.bodies[f], f, &ctx.shared, &ctx.interfaces);
-        drop(_co);
     }
 }

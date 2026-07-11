@@ -232,7 +232,7 @@ fn apply<'str>(
     for (load_id, lane) in &m.loads {
         let block = body.insn_ref(cx, *load_id).parent().map(|b| b.id);
         let Some(block) = block else { continue };
-        // Materialize the word index (checkout-safe builder: const/add only).
+        // Materialize the word index (pass builder: const/add only).
         let idx = {
             let mut host = body.host(cx);
             let mut b = Builder::from_block(BaseRef::new(host.reborrow(), block));

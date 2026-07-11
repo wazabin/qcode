@@ -173,7 +173,7 @@ fn transform<'str>(
     let host_fid = body.id();
     let name = format!("{}_rec", body.read_host(m).function_ref(host_fid).name());
     // Mint the recursive lambda (name buffered raw; the driver uniquifies it at
-    // check-in). `None` (pool exhausted) leaves the loop alone.
+    // the barrier). `None` (pool exhausted) leaves the loop alone.
     let Some(rec) = body.mint_function(Cow::Owned(name), FunctionKind::Lambda, true) else {
         return false;
     };
@@ -409,7 +409,7 @@ mod tests {
 
     fn run(ctx: &Context, fun: FunctionId, n: u64) -> Option<u64> {
         let root = Function::from_id(ctx, fun).root().expect("root").id;
-        let ret = match terminator_mnemonic((&*ctx).into(), root)? {
+        let ret = match terminator_mnemonic(ctx.into(), root)? {
             Mnemonic::ReturnValue(r) => r.value,
             _ => return None,
         };

@@ -628,8 +628,8 @@ macro_rules! impl_block_mut_verbs {
     }
 
     /// Sets this block's name and registers it in the owning function's local name
-    /// table (own-block edit, host-routed). Mirrors the `Renameable` impls for the
-    /// concrete module / checked-out block refs, but works over any [`HostMut`], so
+    /// table (own-block edit, backing-routed). Mirrors the `Renameable` impls for the
+    /// concrete module / pass block refs, but works over either backing, so
     /// a `FunctionPass` can name the blocks it mints. Returns an error only on a
     /// duplicate name.
     pub fn rename_local(&mut self, name: Cow<'str, str>) -> crate::error::Result<()> {
@@ -669,20 +669,20 @@ macro_rules! impl_block_mut_verbs {
     }
 
     /// Inserts `insn_id` immediately before `before_id`. Panics if `before_id` is
-    /// not in this block. Delegates to [`HostMut::insert_insn_before`].
+    /// not in this block. Delegates to the backing's `insert_insn_before` verb.
     pub fn insert_insn_before(&mut self, before_id: InstructionId, insn_id: InstructionId) {
         let id = self.id;
         self.ctx.insert_insn_before(id, before_id, insn_id);
     }
 
     /// Removes this block from its function (full cleanup + tombstone). Delegates
-    /// to [`HostMut::delete_block`].
+    /// to the backing's `delete_block` verb.
     pub fn delete(&mut self, function_id: FunctionId) {
         let id = self.id;
         self.ctx.delete_block(id, function_id);
     }
 
-    /// Absorbs `other` into this block. Delegates to [`HostMut::absorb_block`];
+    /// Absorbs `other` into this block. Delegates to the backing's `absorb_block` verb;
     /// `edge_ab` must be the direct edge from this block to `other`.
     pub fn absorb_block(&mut self, other: BlockId, edge_ab: EdgeId, function_id: FunctionId) {
         let id = self.id;

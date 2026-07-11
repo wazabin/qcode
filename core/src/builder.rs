@@ -61,27 +61,23 @@ use crate::{
 };
 
 /// The IR mutation surface the [`Builder`] needs, named with a `bb_` prefix so a
-/// backing type that *also* implements [`HostMut`] (e.g. `&mut Context`) exposes
-/// both without method-name ambiguity.
+/// backing type exposes it without method-name ambiguity.
 ///
-/// This is the seam that decouples the fluent builder from the
-/// `HostMut`/`PassBacking` host machinery (context-split Option A, item #2): the
-/// [`Builder`] is generic over `B: BuilderBacking` and performs *every* mutation
-/// through these methods, never naming `HostMut` directly. Two backings exist —
-/// the **module** builder over `&mut Context` (the lifter / lowering / emulator
+/// This is the seam that decouples the fluent builder from its backing
+/// (context-split Option A): the [`Builder`] is generic over `B: BuilderBacking`
+/// and performs *every* mutation through these methods. Two backings exist — the
+/// **module** builder over `&mut Context` (the lifter / lowering / emulator
 /// construction path, which additionally mints temp spaces via
-/// [`Builder::make_temp`]) and the **function-pass** builder over a checked-out
-/// body. Both are supplied transitionally by the blanket delegation to [`HostMut`]
-/// below; when the host is retired (item #3) that blanket is replaced by two
-/// direct impls and the builder is untouched.
+/// [`Builder::make_temp`]) and the **function-pass** builder over a `PassBacking`
+/// (a pass's own body borrowed in place). Each is a direct impl below.
 #[doc(hidden)]
 pub trait BuilderBacking<'str> {
     /// The module's shared IR state (read) — types, literals, spaces, registers,
     /// maps.
     fn bb_shr(&self) -> &crate::context::Shared<'str>;
     /// The module's shared data (write), for temp/varnode minting. Only the module
-    /// backing (`&mut Context`) provides it; a pass backing panics (mirrors the
-    /// checked-out host's runtime guard).
+    /// backing (`&mut Context`) provides it; a pass backing panics — it holds only
+    /// `&Shared`.
     fn bb_shared_mut(&mut self) -> &mut Context<'str> {
         unimplemented!("temp/varnode minting requires the module Builder (&mut Context)")
     }
@@ -124,8 +120,7 @@ pub trait BuilderBacking<'str> {
 /// The **module** builder backing (`&mut Context`): the lifter / lowering /
 /// emulator construction path, which additionally mints temp spaces (concrete
 /// `Builder<&mut Context>`, see [`Builder::make_temp`]). Every method routes
-/// through `Context`'s inherent verbs — the builder no longer needs the `HostMut`
-/// host trait.
+/// through `Context`'s inherent verbs — the builder no longer needs a host trait.
 impl<'str> BuilderBacking<'str> for &mut Context<'str> {
     fn bb_shr(&self) -> &crate::context::Shared<'str> {
         &self.shared
@@ -340,9 +335,8 @@ impl<'str, 'ctx, Ctx: BuilderBacking<'str>> Builder<'str, 'ctx, Ctx> {
         }
     }
 
-    /// A `Copy` read view over the builder's backing, for arena reads. Replaces
-    /// the former `BaseRef<Ctx, BlockId>` block-ref reads, which required
-    /// `Ctx: HostMut`; the builder now reads through the backing's `HostRef`.
+    /// A `Copy` read view over the builder's backing, for arena reads. The builder
+    /// reads through the backing's [`HostRef`].
     pub fn read_host(&self) -> HostRef<'_, 'str> {
         self.block.host_ref().bb_read_host()
     }

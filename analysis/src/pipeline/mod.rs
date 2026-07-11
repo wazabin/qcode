@@ -28,7 +28,7 @@ pub use lifter::{LiftOutcome, LiftSummary, Lifter, PipelineServices};
 pub use module_view::{ContextSplit, ContextView, Effects, FunctionBody, Minted};
 
 /// Install a set of minted functions into their reserved slots (test-only shim
-/// over the check-in installer, so `test_util::with_minting` can exercise the
+/// over the barrier installer, so `test_util::with_minting` can exercise the
 /// outlining helpers without the full driver). Panics on a name collision.
 #[cfg(test)]
 pub(crate) fn install_minted_for_test<'str>(

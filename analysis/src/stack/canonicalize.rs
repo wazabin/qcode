@@ -245,7 +245,6 @@ crate::register_function_pass!(CanonicalizeSpSlots);
 mod tests {
     use super::*;
     use qcode::{
-        context::Context,
         testing::TestContext,
         value::{BasicBlock, Function, Value},
     };

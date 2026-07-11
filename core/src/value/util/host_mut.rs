@@ -142,8 +142,8 @@ impl<'a, 'str> PassBacking<'a, 'str> {
             id: self.id,
         }
     }
-    /// A checked-out pass never touches the global call-site cache; the driver
-    /// rebuilds it by diffing outgoing calls at check-in.
+    /// A pass body never touches the global call-site cache; the driver
+    /// rebuilds it by diffing outgoing calls at the barrier.
     fn record_call_site(&mut self, _target: FunctionId, _site: InstructionId) {}
     fn forget_call_site(&mut self, _target: FunctionId, _site: InstructionId) {}
 

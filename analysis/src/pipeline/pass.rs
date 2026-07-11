@@ -130,18 +130,19 @@ pub trait DynFunctionPass: Send + Sync {
     fn name(&self) -> &'static str;
     fn description(&self) -> &'static str;
 
-    /// Run the pass through the whole check-out/check-in protocol on `ctx`: check
-    /// the function out, run it on the owned body, then check in and replay buffered
-    /// effects. Used by the `module(<fn>)` adapter and unit tests, which have no
-    /// driver-owned checked-out worklist to run on.
+    /// Run the pass over one function of `ctx`: split the context, run the pass on
+    /// the body borrowed in place from the bodies registry, then run the barrier
+    /// (replay buffered effects, install any minted functions, resync call sites).
+    /// Used by the `module(<fn>)` adapter and unit tests, which have no driver-owned
+    /// worklist to run on.
     fn run(&self, ctx: &mut Context, fun_id: FunctionId, env: &PipelineEnv)
     -> Result<bool, String>;
 
-    /// Run the pass on a [`FunctionBody`] the caller has *already* checked out (no
-    /// internal checkout), so the driver owns the check-out/check-in protocol. This
-    /// is the surface the parallel driver (and the sequential fixpoint) use to run a
-    /// pass on a body they own; buffered [`Effects`] replay and the check-in
-    /// protocol are the driver's job, not this method's.
+    /// Run the pass on a [`FunctionBody`] the driver has *already* borrowed from the
+    /// bodies registry, so the driver owns the barrier. This is the surface the
+    /// parallel driver (and the sequential fixpoint) use to run a pass on a body they
+    /// hold `&mut`; buffered [`Effects`] replay and the barrier are the driver's job,
+    /// not this method's.
     ///
     /// [`Effects`]: super::Effects
     fn run_checked<'str>(
@@ -165,13 +166,13 @@ pub trait DynFunctionPass: Send + Sync {
 /// module's published interface and mutate its own function — nothing else.** It
 /// reads the module through a `&`-shared [`ContextView`] and mutates only its own
 /// [`FunctionBody`], buffering the one legitimate global effect (a self-rename)
-/// for the driver to replay at
-/// check-in. With no path to global mutable state, workers can run these in
+/// for the driver to replay at the
+/// barrier. With no path to global mutable state, workers can run these in
 /// parallel (Stage 6) with the `ContextView` shared and the bodies disjoint.
 ///
 /// The [`FunctionPassAdapter`] lets a `FunctionPass` be stored and driven through the
-/// object-safe [`DynFunctionPass`] the registry speaks (it performs the checkout →
-/// run → check-in dance internally), so a `module(<fn>)` stage and unit tests can
+/// object-safe [`DynFunctionPass`] the registry speaks (it performs the split →
+/// run → barrier dance internally), so a `module(<fn>)` stage and unit tests can
 /// run one straight over a `&mut Context`.
 pub trait FunctionPass: Default {
     const NAME: &'static str;
@@ -319,14 +320,14 @@ fn detached_env() -> PipelineEnv {
     )
 }
 
-/// How many function ids are reserved per checked-out function for minting
+/// How many function ids are reserved per worklist function for minting
 /// (`PARALLEL_PASSES.md` ruling 3). Every current outliner mints at most one
 /// function per run; a pass needing more simply stops promoting when the pool
 /// runs dry.
 pub(super) const MINT_RESERVE: usize = 2;
 
-/// Install a pass's minted functions into their reserved registry slots at
-/// check-in (master thread, worklist order): uniquify each buffered raw name
+/// Install a pass's minted functions into their reserved registry slots at the
+/// barrier (master thread, worklist order): uniquify each buffered raw name
 /// against the global map, replace the sentinel slot, and register the name.
 /// Returns the installed ids so the driver can mark them dirty for downstream
 /// `only_dirty` stages. Must run *before* the owning function's
@@ -354,7 +355,7 @@ pub(super) fn install_minted<'str>(
     Ok(installed)
 }
 
-/// Replay a function pass's buffered [`Effects`] into the context at check-in.
+/// Replay a function pass's buffered [`Effects`] into the context at the barrier.
 /// Runs on the master thread in worklist order; the buffered self-rename is a
 /// first-writer-wins claim, so the order within one pass's buffer is immaterial.
 pub(super) fn replay_effects<'str>(

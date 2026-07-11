@@ -243,8 +243,8 @@ impl<Ctx, Id: Copy> BaseRef<Ctx, Id> {
         BaseRef { id, ctx }
     }
 
-    /// The underlying host/context handle (read). Crate-internal: the `Builder`
-    /// (a sibling module) reaches the `HostMut` through this.
+    /// The underlying backing handle (read). Crate-internal: the `Builder`
+    /// (a sibling module) reaches its backing through this.
     pub(crate) fn host_ref(&self) -> &Ctx {
         &self.ctx
     }

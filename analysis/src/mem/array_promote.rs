@@ -481,7 +481,7 @@ fn width_of<'str>(host: &PassBacking<'_, 'str>, v: ValueId) -> usize {
 }
 
 /// Push an `index_plus(index, delta)` value into `block` before `before`, through
-/// a checkout-safe builder (const/add/sub only). Returns the index value.
+/// a pass builder (const/add/sub only). Returns the index value.
 fn make_index<'str>(
     host: &mut PassBacking<'_, 'str>,
     block: BlockId,

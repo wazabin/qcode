@@ -266,7 +266,7 @@ fn transform<'str>(
     let host_fid = body.id();
     let base_name = format!("{}_acc", body.read_host(m).function_ref(host_fid).name());
     // Mint the driver-only recursive lambda (name buffered raw; the driver
-    // uniquifies it at check-in). `None` (pool exhausted) leaves the loop alone.
+    // uniquifies it at the barrier). `None` (pool exhausted) leaves the loop alone.
     let Some(g) = body.mint_function(Cow::Owned(base_name.clone()), FunctionKind::Lambda, true)
     else {
         return;

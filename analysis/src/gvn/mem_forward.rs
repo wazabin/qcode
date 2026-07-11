@@ -775,11 +775,12 @@ mod tests {
         }
     }
 
-    /// Check `fid` out and run `f` against its `(&mut FunctionBody, ContextView)`
-    /// — the only surface [`MemForward::record_store_c`]/[`MemForward::try_load_c`]
-    /// speak now that the `&mut Context` module twins are gone. The `MemForward`
-    /// state under test is owned by the caller (captured by `f`), so it outlives
-    /// the checkout and can be inspected afterwards.
+    /// Borrow `fid`'s body in place and run `f` against its
+    /// `(&mut FunctionBody, ContextView)` — the only surface
+    /// [`MemForward::record_store_c`]/[`MemForward::try_load_c`] speak now that the
+    /// `&mut Context` module twins are gone. The `MemForward` state under test is
+    /// owned by the caller (captured by `f`), so it outlives the borrow and can be
+    /// inspected afterwards.
     fn with_body<R>(
         tc: &mut TestContext,
         fid: qcode::value::FunctionId,
@@ -912,9 +913,7 @@ mod tests {
             }
             !regs.iter().any(|&r| {
                 let vn = Varnode::from_id(&tc.ctx, r);
-                vn.space().id == sp
-                    && (vn.address() as i64) <= off
-                    && off < vn.address() as i64 + vn.size() as i64
+                vn.space().id == sp && vn.address() <= off && off < vn.address() + vn.size() as i64
             })
         });
 

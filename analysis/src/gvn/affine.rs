@@ -811,6 +811,27 @@ pub(crate) fn precompute_forms_for_blocks<'a, 'str: 'a>(
     numbering
 }
 
+/// Memoize the affine form of `v`, recursing into operands first so that nested
+/// pointer arithmetic (e.g. `(p + 4) - 4`) fully decomposes. A placeholder leaf
+/// is inserted before recursing to break any operand cycle.
+fn ensure_form(host: HostRef, v: ValueId, numbering: &mut Numbering) {
+    if numbering.forms.contains_key(&v) {
+        return;
+    }
+    let ValueId::Instruction(id) = v else {
+        return;
+    };
+    let insn = host.insn_ref(id);
+    let width = insn.size();
+    let mnemonic = insn.mnemonic().clone();
+    numbering.forms.insert(v, leaf(v, width));
+    for arg in mnemonic.args() {
+        ensure_form(host, arg, numbering);
+    }
+    let form = arith_form(host, v, &mnemonic, width, numbering);
+    numbering.forms.insert(v, form);
+}
+
 #[cfg(test)]
 mod spike {
     //! Throwaway probe for the brighten/lower removal: does the affine numbering
@@ -979,25 +1000,4 @@ mod spike {
         // The gep is still recognised as built on `p`.
         assert!(nb.affine_mentions(gep, p));
     }
-}
-
-/// Memoize the affine form of `v`, recursing into operands first so that nested
-/// pointer arithmetic (e.g. `(p + 4) - 4`) fully decomposes. A placeholder leaf
-/// is inserted before recursing to break any operand cycle.
-fn ensure_form(host: HostRef, v: ValueId, numbering: &mut Numbering) {
-    if numbering.forms.contains_key(&v) {
-        return;
-    }
-    let ValueId::Instruction(id) = v else {
-        return;
-    };
-    let insn = host.insn_ref(id);
-    let width = insn.size();
-    let mnemonic = insn.mnemonic().clone();
-    numbering.forms.insert(v, leaf(v, width));
-    for arg in mnemonic.args() {
-        ensure_form(host, arg, numbering);
-    }
-    let form = arith_form(host, v, &mnemonic, width, numbering);
-    numbering.forms.insert(v, form);
 }

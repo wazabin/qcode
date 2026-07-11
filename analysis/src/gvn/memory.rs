@@ -20,9 +20,9 @@ use super::walk::{Claim, Editor, InsnCtx, SubPassC};
 use crate::{ContextView, FunctionBody};
 
 /// Memory forwarding reasons across a whole function (loop-header pruning,
-/// post-call clobbers). Fully host-routed — every read goes through a
+/// post-call clobbers). Fully backing-routed — every read goes through a
 /// [`HostRef`](qcode::value::util::base_ref::HostRef) and every rebuild through
-/// the [`HostMut`] verbs — so it runs on the checked-out function-pass path.
+/// the body's inherent verbs — so it runs on the function-pass path.
 pub(super) struct MemoryForwarding;
 
 /// The function-pass [`SubPassC`] impl (context-split stage 5b-ii):

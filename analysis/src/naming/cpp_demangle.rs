@@ -60,7 +60,7 @@ impl FunctionPass for CppDemangle {
 
         match demangled {
             Some(demangled) => {
-                // Buffered; the driver applies it (uniquified) at check-in.
+                // Buffered; the driver applies it (uniquified) at the barrier.
                 f.effects_mut().rename_self(Cow::Owned(demangled));
                 Ok(true)
             }

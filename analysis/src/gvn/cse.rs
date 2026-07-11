@@ -28,9 +28,9 @@ use qcode::context::Context;
 
 use crate::{ContextView, FunctionBody};
 
-/// CSE numbers pure values down a whole dominator tree. Fully host-routed (the
+/// CSE numbers pure values down a whole dominator tree. Fully backing-routed (the
 /// value-numbering reads through a [`HostRef`](qcode::value::util::base_ref::HostRef)
-/// and rebuilds canonical forms through the [`HostMut`] verbs), so it runs on the checked-out function-pass path.
+/// and rebuilds canonical forms through the body's inherent verbs), so it runs on the function-pass path.
 pub(super) struct Cse;
 
 /// The function-pass [`SubPassC`] impl (context-split stage 5b-ii): reads

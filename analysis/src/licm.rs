@@ -362,12 +362,12 @@ fn hoist_into_preheader<'a, 'str>(
     hoisted
 }
 
-/// Generic host-based version of [`hoist_into_preheader`], kept for the
+/// The `&mut Context` version of [`hoist_into_preheader`], kept for the
 /// `&mut Context` test entry point below.
-/// TODO(5b-ii): remove once tests migrate off `HostMut`.
+/// TODO(5b-ii): remove once tests migrate off the `&mut Context` helper.
 #[cfg(test)]
 fn hoist_into_preheader_generic<'str>(
-    mut host: &mut Context<'str>,
+    host: &mut Context<'str>,
     preheader: BlockId,
     order: &[InstructionId],
 ) -> bool {
@@ -455,10 +455,10 @@ fn hoist_loop_invariants_with_aliases<'a, 'str>(
     changed
 }
 
-/// Generic host-based version of [`hoist_loop_invariants_with_aliases`]; kept
+/// The `&mut Context` version of [`hoist_loop_invariants_with_aliases`]; kept
 /// for tests that drive the hoist over a bare `&mut Context` with their own
 /// oracle.
-/// TODO(5b-ii): remove once tests migrate off `HostMut`.
+/// TODO(5b-ii): remove once tests migrate off the `&mut Context` helper.
 #[cfg(test)]
 fn hoist_loop_invariants_with_aliases_generic<'str>(
     host: &mut Context<'str>,

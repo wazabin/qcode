@@ -695,12 +695,12 @@ impl<'str> Context<'str> {
     }
 
     /// Rebuild the global `call_sites` cache for `fun_id` after a pass has (possibly)
-    /// rewritten its outgoing calls. `before_targets` is the checkout snapshot from
-    /// [`direct_call_targets`](Self::direct_call_targets); the function must be
-    /// checked back in first. For every callee that `fun_id` called before or calls
-    /// now, its site list is stripped of `fun_id`'s entries and repopulated from the
-    /// function's current instructions — a pure diff of derivable data, so the cache
-    /// ends identical regardless of check-in order (ruling 6).
+    /// rewritten its outgoing calls. `before_targets` is the pre-run snapshot from
+    /// [`direct_call_targets`](Self::direct_call_targets), taken before the pass ran;
+    /// the pass's run must have completed first. For every callee that `fun_id` called
+    /// before or calls now, its site list is stripped of `fun_id`'s entries and
+    /// repopulated from the function's current instructions — a pure diff of derivable
+    /// data, so the cache ends identical regardless of barrier order (ruling 6).
     pub fn resync_call_sites(&mut self, fun_id: FunctionId, before_targets: &[FunctionId]) {
         let after: Vec<(FunctionId, InstructionId)> = FunctionRef::from_id(self, fun_id)
             .blocks()
@@ -770,7 +770,7 @@ impl<'str> Context<'str> {
     /// edges) that the relocated set is closed: every reference from a relocated
     /// block resolves to another relocated block, an unmoved block of `target`, or
     /// a shared value. A reference that would cross into a *third* function is a
-    /// Make every function checkout-safe by relocating each "reattributed" block —
+    /// Make every function self-stored by relocating each "reattributed" block —
     /// one whose *owner* (`parent`) differs from its *storage* (`id.func`) — into
     /// its owner's arenas, so that `id.func == parent` holds for every live block.
     ///

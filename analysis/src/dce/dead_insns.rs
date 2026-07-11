@@ -105,7 +105,7 @@ pub fn remove_dead_pure_call(ctx: &mut Context, block_id: BlockId) -> bool {
 
 /// Generic version of remove_dead_pure_call for test use.
 #[cfg(test)]
-fn remove_dead_pure_call_generic<'str>(mut host: &mut Context<'str>, block_id: BlockId) -> bool {
+fn remove_dead_pure_call_generic<'str>(host: &mut Context<'str>, block_id: BlockId) -> bool {
     let Some(term_id) = host.block_ref(block_id).instruction_ids().last().copied() else {
         return false;
     };
@@ -139,7 +139,7 @@ fn remove_dead_pure_call_generic<'str>(mut host: &mut Context<'str>, block_id: B
         return false;
     };
 
-    replace_terminator_with_branch_generic(&mut host, block_id, fallthrough, vec![]);
+    replace_terminator_with_branch_generic(host, block_id, fallthrough, vec![]);
     true
 }
 
@@ -195,7 +195,7 @@ fn remove_dead_pure_call_host<'a, 'str>(
 /// control-flow edges. This covers function-entry params introduced for
 /// load-before-store registers that later become dead, without touching join
 /// blocks whose predecessor terminators carry positional arguments.
-/// Generic version accepting any HostMut.
+/// The `&mut Context` version.
 /// TODO(5b-ii): For backwards compatibility; prefer concrete version for new code.
 pub fn remove_unused_no_pred_block_params_generic<'str>(
     host: &mut Context<'str>,
@@ -823,14 +823,11 @@ fn remove_dead_counted_loop(ctx: &mut Context, fun_id: FunctionId) -> bool {
 
 /// Generic version of remove_dead_counted_loop for test use.
 #[cfg(test)]
-fn remove_dead_counted_loop_generic<'str>(
-    mut host: &mut Context<'str>,
-    fun_id: FunctionId,
-) -> bool {
+fn remove_dead_counted_loop_generic<'str>(host: &mut Context<'str>, fun_id: FunctionId) -> bool {
     let headers: Vec<BlockId> = host.function_ref(fun_id).blocks().map(|b| b.id).collect();
     for header in headers {
         if let Some(dl) = match_dead_loop(host.read_host(), header) {
-            replace_terminator_with_branch_generic(&mut host, dl.preheader, dl.exit, vec![]);
+            replace_terminator_with_branch_generic(host, dl.preheader, dl.exit, vec![]);
             return true;
         }
     }

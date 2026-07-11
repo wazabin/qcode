@@ -281,7 +281,7 @@ mod tests {
     use qcode::{
         builder::Builder,
         testing::TestContext,
-        value::{BasicBlock, Function, Value, insn::Return},
+        value::{BasicBlock, Function, insn::Return},
     };
 
     /// Set a return instruction's value channel to `value` (the builder's

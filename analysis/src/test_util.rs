@@ -26,7 +26,7 @@ pub(crate) fn dummy_env() -> PipelineEnv {
 }
 
 /// Run a [`FunctionPass`] once over `fun` through the real [`FunctionPassAdapter`] path
-/// (check-out → run → check-in → effect replay) with a [`dummy_env`], so a unit
+/// (split → run → barrier → effect replay) with a [`dummy_env`], so a unit
 /// test exercises the same plumbing the sequential driver uses.
 pub(crate) fn run_function_pass<P: FunctionPass + Send + Sync>(
     ctx: &mut Context,
@@ -35,9 +35,9 @@ pub(crate) fn run_function_pass<P: FunctionPass + Send + Sync>(
     DynFunctionPass::run(&FunctionPassAdapter::<P>::default(), ctx, fun, &dummy_env())
 }
 
-/// Check `fun` out, run `f` against its [`FunctionBody`] (carrying two reserved
-/// minting ids), then install any minted functions and check it back in — the
-/// same check-out/mint/install dance the driver performs, so a test can exercise
+/// Borrow `fun`'s body in place, run `f` against its [`FunctionBody`] (carrying two
+/// reserved minting ids), then install any minted functions — the
+/// same split/mint/install dance the driver performs, so a test can exercise
 /// the outlining helpers directly and inspect the minted function afterwards.
 /// Returns whatever `f` returns.
 pub(crate) fn with_minting<'str, R>(

@@ -63,7 +63,7 @@ impl FunctionPass for NameThunks {
 
         match new_name {
             Some(name) => {
-                // Buffered; the driver uniquifies and applies it at check-in.
+                // Buffered; the driver uniquifies and applies it at the barrier.
                 f.effects_mut().rename_self(Cow::Owned(name));
                 Ok(true)
             }

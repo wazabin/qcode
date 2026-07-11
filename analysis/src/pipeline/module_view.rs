@@ -37,22 +37,22 @@ use qcode::{
 use super::PipelineEnv;
 
 /// A function minted by a pass this run: its reserved id, its interface, and its
-/// body. Installed into the reserved slot by the driver at check-in.
+/// body. Installed into the reserved slot by the driver at the barrier.
 pub type Minted<'str> = (FunctionId, FunctionInterface<'str>, Function<'str>);
 
 /// Global effects a function pass requests, buffered for the driver to apply at
-/// check-in (in worklist order). The self-rename is a first-writer-wins claim, so
+/// the barrier (in worklist order). The self-rename is a first-writer-wins claim, so
 /// replay is deterministic and needs no merge heuristics.
 #[derive(Default)]
 pub struct Effects<'str> {
     /// A buffered self-rename claim (from `cpp_demangle` / `name_thunks`),
-    /// applied as a `get_unique_name` claim at check-in.
+    /// applied as a `get_unique_name` claim at the barrier.
     pub self_rename: Option<Cow<'str, str>>,
 }
 
 impl<'str> Effects<'str> {
     /// Buffer a self-rename claim (last writer wins within one run; the driver
-    /// resolves it to a unique name at check-in).
+    /// resolves it to a unique name at the barrier).
     pub fn rename_self(&mut self, name: Cow<'str, str>) {
         self.self_rename = Some(name);
     }
@@ -80,7 +80,7 @@ pub struct ContextView<'ctx, 'str> {
 impl<'ctx, 'str> ContextView<'ctx, 'str> {
     /// Build a view over `ctx`'s shared state + interfaces and the pipeline
     /// environment. Takes the whole `&Context` for caller convenience (the
-    /// checkout driver) and narrows; [`Context`]'s bodies are NOT captured —
+    /// driver) and narrows; [`Context`]'s bodies are NOT captured —
     /// prefer [`split`](ContextSplit::split), which proves that with a
     /// simultaneous `&mut` bodies borrow.
     pub fn new(ctx: &'ctx Context<'str>, env: &'ctx PipelineEnv) -> Self {
@@ -166,15 +166,15 @@ pub struct FunctionBody<'a, 'str> {
     /// the registry — the `&mut` is what gives the pass exclusive access while the
     /// frozen [`ContextView`] shares the rest of the module.
     fun: &'a mut Function<'str>,
-    /// Global effects buffered this run (drained by the driver at check-in).
+    /// Global effects buffered this run (drained by the driver at the barrier).
     effects: Effects<'str>,
     /// Never-observed placeholder [`FunctionId`]s the pass may materialize new
     /// functions into (loop outliners mint exactly one). Unused ids return to the
-    /// driver's pool at check-in.
+    /// driver's pool at the barrier.
     reserved_ids: Vec<FunctionId>,
     /// Functions built this run against drawn `reserved_ids` (paired with the id
     /// each was drawn for, and its interface), installed by the driver at
-    /// check-in.
+    /// the barrier.
     minted: Vec<Minted<'str>>,
 }
 
@@ -228,9 +228,9 @@ impl<'a, 'str> FunctionBody<'a, 'str> {
     }
 
     /// Mint a new function (`PARALLEL_PASSES.md` ruling 3): draw one reserved id
-    /// from the pool the driver assigned this checkout, create a detached
+    /// from the pool the driver assigned this run, create a detached
     /// [`Function`] shell under `name` (buffered **raw** — global uniquification
-    /// happens when the driver installs it at check-in) with the given `kind`,
+    /// happens when the driver installs it at the barrier) with the given `kind`,
     /// and return its id. `pure` marks it a deterministic pure function
     /// (`is_pure` + the implied `pure_reg`), which every current outliner's body
     /// is. Build the body through [`host_with_minted`](Self::host_with_minted).
@@ -299,19 +299,15 @@ impl<'a, 'str> FunctionBody<'a, 'str> {
     }
 }
 
-/// Inherent verb + read-accessor surface (context-split stage 5b-ii(a)).
+/// Inherent verb + read-accessor surface (context-split stage 5b-ii).
 ///
-/// Every mutation verb of [`HostMut`] and every read accessor of [`HostRef`] a
-/// function pass calls today through `f.host(cx)` / `f.read_host(cx)` is mirrored
-/// here as an inherent method on the body itself: `body.verb(cx, …)` instead of
-/// `host.verb(…)`. This commit is **purely additive** — each method is a
-/// behaviour-identical delegation to a freshly built [`PassBacking`] (for the
-/// verbs) or [`HostRef`] (for the reads); no call site changes yet. Follow-on
-/// commits migrate helpers off the generic `H: HostMut` onto this surface, and a
-/// later commit reimplements the verb bodies directly on `self`'s arenas, at
-/// which point the delegation disappears.
+/// Every mutation a function pass makes and every read accessor it needs is an
+/// inherent method on the body itself: `body.verb(cx, …)`. The mutation verbs
+/// delegate to the owning [`Function`]'s inherent verbs (supplying the ambient
+/// [`id`](Self::id)); the read accessors route through a [`HostRef`] built from
+/// `self.fun` + `cx`.
 ///
-/// Where a `HostMut` verb takes an explicit `func: FunctionId` for the pass's own
+/// Where a [`Function`] verb takes an explicit `func: FunctionId` for the pass's own
 /// function, the inherent method drops that parameter and supplies
 /// [`self.id()`](Self::id) instead — a function pass only ever mints/mutates into
 /// its own body.
@@ -325,7 +321,7 @@ impl<'body, 'str> FunctionBody<'body, 'str> {
     // directly — edges are created through `add_cfg_edge` — so nothing needs it.
 
     /// Push a fresh instruction into this body's arena (recording operand uses and
-    /// the call-site cache). Mirrors [`HostMut::push_insn`] with `func = self.id()`.
+    /// the call-site cache). Mirrors [`Function::push_insn`] with `func = self.id()`.
     pub fn push_insn(
         &mut self,
         cx: ContextView<'_, 'str>,
@@ -336,21 +332,21 @@ impl<'body, 'str> FunctionBody<'body, 'str> {
     }
 
     /// Push a fresh block into this body's arena and onto its roster. Mirrors
-    /// [`HostMut::push_block`] with `func = self.id()`.
+    /// [`Function::push_block`] with `func = self.id()`.
     pub fn push_block(&mut self, cx: ContextView<'_, 'str>, block: BasicBlock<'str>) -> BlockId {
         let _ = cx;
         self.fun.push_block(self.id, block)
     }
 
     /// Mint a fresh empty block, parented to this body and rostered. Mirrors
-    /// [`HostMut::make_block`] with `func = self.id()`.
+    /// [`Function::make_block`] with `func = self.id()`.
     pub fn make_block(&mut self, cx: ContextView<'_, 'str>) -> BlockId {
         let _ = cx;
         self.fun.make_block(self.id)
     }
 
     /// Push a fresh block parameter into this body's arena. Mirrors
-    /// [`HostMut::push_block_param`] with `func = self.id()`.
+    /// [`Function::push_block_param`] with `func = self.id()`.
     pub fn push_block_param(
         &mut self,
         cx: ContextView<'_, 'str>,
@@ -361,7 +357,7 @@ impl<'body, 'str> FunctionBody<'body, 'str> {
     }
 
     /// Mint an `Int(size)`-typed instruction with `mnemonic`. Mirrors
-    /// [`HostMut::push_mnemonic`] with `func = self.id()`.
+    /// [`Function::push_mnemonic`] with `func = self.id()`.
     pub fn push_mnemonic(
         &mut self,
         cx: ContextView<'_, 'str>,
@@ -372,7 +368,7 @@ impl<'body, 'str> FunctionBody<'body, 'str> {
     }
 
     /// Mint an instruction with `mnemonic` and an explicit result `type_id`.
-    /// Mirrors [`HostMut::push_mnemonic_with_type`] with `func = self.id()`.
+    /// Mirrors [`Function::push_mnemonic_with_type`] with `func = self.id()`.
     pub fn push_mnemonic_with_type(
         &mut self,
         cx: ContextView<'_, 'str>,
@@ -384,7 +380,7 @@ impl<'body, 'str> FunctionBody<'body, 'str> {
     }
 
     /// Insert `insn` immediately before `before` in `block`. Mirrors
-    /// [`HostMut::insert_insn_before`].
+    /// [`Function::insert_insn_before`].
     pub fn insert_insn_before(
         &mut self,
         cx: ContextView<'_, 'str>,
@@ -398,7 +394,7 @@ impl<'body, 'str> FunctionBody<'body, 'str> {
 
     // ---- CFG / use-map verbs ------------------------------------------------
 
-    /// Add a directed CFG edge `from -> to`. Mirrors [`HostMut::add_cfg_edge`].
+    /// Add a directed CFG edge `from -> to`. Mirrors [`Function::add_cfg_edge`].
     pub fn add_cfg_edge(
         &mut self,
         cx: ContextView<'_, 'str>,
@@ -410,28 +406,28 @@ impl<'body, 'str> FunctionBody<'body, 'str> {
     }
 
     /// Remove CFG edge `edge_id` from this body. Mirrors
-    /// [`HostMut::remove_cfg_edge`] with `func = self.id()`.
+    /// [`Function::remove_cfg_edge`] with `func = self.id()`.
     pub fn remove_cfg_edge(&mut self, cx: ContextView<'_, 'str>, edge_id: EdgeId) {
         let _ = cx;
         self.fun.remove_cfg_edge(self.id, edge_id)
     }
 
     /// Replace every use of `old` with `new` across this body. Mirrors
-    /// [`HostMut::replace_all_uses_with`].
+    /// [`Function::replace_all_uses_with`].
     pub fn replace_all_uses_with(&mut self, cx: ContextView<'_, 'str>, old: ValueId, new: ValueId) {
         let _ = cx;
         self.fun.replace_all_uses_with(old, new)
     }
 
     /// Remove instruction `id` from this body (unlink edges, tombstone, prune
-    /// uses). Mirrors [`HostMut::remove_instruction`].
+    /// uses). Mirrors [`Function::remove_instruction`].
     pub fn remove_instruction(&mut self, cx: ContextView<'_, 'str>, id: InstructionId) {
         let _ = cx;
         self.fun.remove_instruction(id)
     }
 
     /// Rehome `remove`'s outgoing edges onto `keep` and drop the direct edge.
-    /// Mirrors [`HostMut::merge_nodes`].
+    /// Mirrors [`Function::merge_nodes`].
     pub fn merge_nodes(
         &mut self,
         cx: ContextView<'_, 'str>,
@@ -444,7 +440,7 @@ impl<'body, 'str> FunctionBody<'body, 'str> {
     }
 
     /// Replace an instruction's mnemonic in place, keeping use/call-site maps in
-    /// sync. Mirrors [`HostMut::replace_instruction_mnemonic`].
+    /// sync. Mirrors [`Function::replace_instruction_mnemonic`].
     pub fn replace_instruction_mnemonic(
         &mut self,
         cx: ContextView<'_, 'str>,
@@ -455,21 +451,21 @@ impl<'body, 'str> FunctionBody<'body, 'str> {
         self.fun.replace_instruction_mnemonic(id, mnemonic)
     }
 
-    /// Drop `block` from its owner's roster. Mirrors [`HostMut::unroster_block`].
+    /// Drop `block` from its owner's roster. Mirrors [`Function::unroster_block`].
     pub fn unroster_block(&mut self, cx: ContextView<'_, 'str>, block: BlockId) {
         let _ = cx;
         self.fun.unroster_block(block)
     }
 
     /// Remove `block` from this body (unlink edges, remove insns, detach params,
-    /// tombstone). Mirrors [`HostMut::delete_block`] with `function_id = self.id()`.
+    /// tombstone). Mirrors [`Function::delete_block`] with `function_id = self.id()`.
     pub fn delete_block(&mut self, cx: ContextView<'_, 'str>, block: BlockId) {
         let _ = cx;
         self.fun.delete_block(block)
     }
 
     /// Absorb `other` into `keep` across the direct edge `edge_ab`. Mirrors
-    /// [`HostMut::absorb_block`] with `function_id = self.id()`.
+    /// [`Function::absorb_block`] with `function_id = self.id()`.
     pub fn absorb_block(
         &mut self,
         cx: ContextView<'_, 'str>,
@@ -482,7 +478,7 @@ impl<'body, 'str> FunctionBody<'body, 'str> {
     }
 
     /// Register `name` for `id` in the owning table (function-local for
-    /// block/insn/param, else global). Mirrors [`HostMut::register_local_name`].
+    /// block/insn/param, else global). Mirrors [`Function::register_local_name`].
     pub fn register_local_name(
         &mut self,
         cx: ContextView<'_, 'str>,
@@ -501,17 +497,17 @@ impl<'body, 'str> FunctionBody<'body, 'str> {
     // `Function` arena accessors — behaviour-identical to the `Context` versions,
     // which resolve to the same `self.fun.<arena>[id.local]` — and take no `cx`.
 
-    /// The instruction `id`, mutably. Mirror of [`HostMut::instruction_mut`].
+    /// The instruction `id`, mutably. Mirror of [`Function::insn_mut`].
     pub fn instruction_mut(&mut self, id: InstructionId) -> &mut Instruction<'str> {
         self.fun.insn_mut(id)
     }
 
-    /// The block `id`, mutably. Mirror of [`HostMut::block_mut`].
+    /// The block `id`, mutably. Mirror of [`Function::block_mut`].
     pub fn block_mut(&mut self, id: BlockId) -> &mut BasicBlock<'str> {
         self.fun.block_mut(id)
     }
 
-    /// The block parameter `id`, mutably. Mirror of [`HostMut::block_param_mut`].
+    /// The block parameter `id`, mutably. Mirror of [`Function::block_param_mut`].
     pub fn block_param_mut(&mut self, id: BlockParamId) -> &mut BlockParam<'str> {
         self.fun.block_param_mut(id)
     }

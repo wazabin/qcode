@@ -37,7 +37,7 @@ const DEFAULT_PIPELINE_FILE: &str = "default.toml";
 const MAX_FIXPOINT_ITERS: usize = 100;
 
 /// Minimum worklist size before a stage fans out across threads. Below
-/// this the thread-spawn + check-out/check-in overhead outweighs the win, so the
+/// this the thread-spawn + split/barrier overhead outweighs the win, so the
 /// stage runs sequentially (identical output either way).
 const PARALLEL_THRESHOLD: usize = 4;
 
@@ -1203,9 +1203,9 @@ impl FixpointCache {
 
 /// The reservation pool for function minting (`PARALLEL_PASSES.md` ruling 3).
 ///
-/// A checked-out function pass cannot push into the global function registry, so
+/// A function pass cannot push into the global function registry, so
 /// the driver pre-materializes never-observed sentinel slots and hands each
-/// worklist function [`MINT_RESERVE`] of their ids at checkout — assigned in
+/// worklist function [`MINT_RESERVE`] of their ids before its run — assigned in
 /// worklist order, identically on the sequential and parallel lanes, so minted
 /// ids (and therefore the registry-ordered module dump) are byte-identical
 /// across lanes. Ids a function did not use return here at the end of the stage
@@ -1215,7 +1215,7 @@ impl FixpointCache {
 #[derive(Default)]
 struct MintPool {
     /// Recycled reserved ids, FIFO. Never consumed by the stage that returned
-    /// them (all of a stage's reservations happen before its first check-in).
+    /// them (all of a stage's reservations happen before its first barrier).
     available: std::collections::VecDeque<FunctionId>,
 }
 
@@ -1232,7 +1232,7 @@ impl MintPool {
             .collect()
     }
 
-    /// Return a check-in's unused reserved ids for the next stage to consume.
+    /// Return a barrier's unused reserved ids for the next stage to consume.
     fn recycle(&mut self, ids: Vec<FunctionId>) {
         self.available.extend(ids);
     }
@@ -1381,7 +1381,7 @@ async fn run_function_stage(
     // Every producer of reattributed blocks (the recursive lifter, and
     // `split_overlapping_functions` during discovery rounds) discharges strict
     // locality at its own tail, so every function reaching this stage is already
-    // self-stored — the invariant `PassBacking::new` asserts at checkout. No
+    // self-stored — the invariant `PassBacking::new` asserts at construction. No
     // storage normalization is needed here.
     dump_stage_inputs(ctx, &stage.dump, &stage.name);
     let fun_ids: Vec<FunctionId> = ctx
@@ -1404,8 +1404,8 @@ async fn run_function_stage(
 
     let mut dirty = HashSet::default();
 
-    // Every function pass is driven over a checked-out body (`run_one_function`) —
-    // the shape Stage 6 runs on worker threads.
+    // Every function pass is driven over a body borrowed in place from the bodies
+    // registry (`run_one_function`) — the shape Stage 6 runs on worker threads.
 
     /*
     /*
@@ -1512,7 +1512,7 @@ async fn run_function_stage(
     // contains a minting pass, reserve `MINT_RESERVE` ids per worklist function up
     // front, in worklist order — the identical discipline on both lanes, so minted
     // ids are byte-identical between the sequential and parallel runs. Unused ids
-    // are collected per function at check-in and recycled (in worklist order) at
+    // are collected per function at the barrier and recycled (in worklist order) at
     // the end of the stage, for the next stage to consume.
     let mut reservations: HashMap<FunctionId, Vec<FunctionId>> = HashMap::default();
     let mut leftover: HashMap<FunctionId, Vec<FunctionId>> = HashMap::default();
@@ -1651,8 +1651,8 @@ async fn run_function_stage(
 ///
 /// This is the reusable unit Stage 6's parallel driver runs on worker threads over
 /// disjoint `&mut FunctionBody`s; the sequential driver calls it one function at a
-/// time. It touches no global mutable state — the driver reinstalls the body and
-/// replays its buffered effects at check-in. The `MAX_FIXPOINT_ITERS`
+/// time. It touches no global mutable state — the driver replays its buffered
+/// effects at the barrier after the run. The `MAX_FIXPOINT_ITERS`
 /// non-convergence guard and the per-function `FixpointTracer` cycle detection are
 /// preserved exactly as on the in-place path.
 #[allow(clippy::too_many_arguments)]
@@ -1789,10 +1789,10 @@ struct WorkerOutput {
 /// Run a stage across `threads` worker threads (Stage 6 of the
 /// parallel-passes plan). Checks out the whole worklist, runs each function's pass
 /// fixpoint on a disjoint `&mut FunctionBody` on a `std::thread::scope` worker over
-/// the `&`-shared [`ContextView`], then checks the results back in **in worklist
+/// the `&`-shared [`ContextView`], then runs the barrier **in worklist
 /// order**. Output is byte-identical to the sequential path: the frozen module
-/// view, deterministic (contiguous, worklist-ordered) work assignment, and
-/// worklist-ordered check-in leave nothing to run-to-run chance.
+/// view, deterministic (contiguous, worklist-ordered) work assignment, and the
+/// worklist-ordered barrier leave nothing to run-to-run chance.
 #[allow(clippy::too_many_arguments)]
 fn run_stage_parallel(
     ctx: &mut Context,
