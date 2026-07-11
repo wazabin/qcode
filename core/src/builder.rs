@@ -102,6 +102,51 @@ macro_rules! cmp_pair {
     };
 }
 
+/// Temp-space minting is a **module-Builder-only** capability (context-split
+/// Option A): a fresh temporary address space is a `&mut Shared` push, so only
+/// the Builder instantiated over `&mut Context` (the lifter / lowering / emulator
+/// construction path) can mint one. A parallel-safe function-pass Builder holds a
+/// frozen shared view and therefore cannot — and, per the audit, never needs to
+/// (every temp-minting call site is on the `&mut Context` path). Restricting
+/// these to the concrete instantiation makes that boundary a compile-time fact
+/// instead of a runtime `unimplemented!()` on the checked-out host.
+impl<'str, 'ctx> Builder<'str, 'ctx, &'ctx mut Context<'str>> {
+    pub fn make_temp(&mut self, size: usize) -> VarnodeId {
+        let space = self.context_mut().make_temp_space();
+        Varnode::make(self.context_mut(), 0, size, space).id
+    }
+
+    /// Creates a new temporary value with the given name and size.
+    /// This value is a memory value so does not need to follow any SSA rules.
+    /// The name is deduplicated with a numeric suffix if already taken in the context.
+    pub fn make_named_temp(&mut self, name: Cow<'str, str>, size: usize) -> VarnodeId {
+        let space = self.context_mut().make_temp_space();
+        let id = Varnode::make(self.context_mut(), 0, size, space).id;
+        let unique_name = self.context_mut().get_unique_name(name);
+        Varnode::from_id_mut(self.context_mut(), id)
+            .rename(unique_name.clone())
+            .expect("This name was deduplicated");
+        self.context_mut().shared.spaces[space].name = Some(unique_name.as_ref().into());
+        id
+    }
+
+    /// Creates a new temporary value identified by an integer `label`, used to
+    /// derive its display name (`v{label}`) lazily.
+    ///
+    /// Unlike [`make_named_temp`](Self::make_named_temp), this does not allocate a
+    /// name `String`, probe for a unique name, or insert into the context's name
+    /// map — so it stays off the per-instruction hot path. The temporary's
+    /// identity is its [`VarnodeId`]; callers that need distinct temporaries are
+    /// responsible for using distinct varnodes (the emitter keys them by
+    /// `(size, local)`), so no name-uniqueness check is needed.
+    pub fn make_temp_labeled(&mut self, label: u32, size: usize) -> VarnodeId {
+        let space = self.context_mut().make_temp_space();
+        let id = Varnode::make(self.context_mut(), 0, size, space).id;
+        Varnode::from_id_mut(self.context_mut(), id).set_label(label);
+        id
+    }
+}
+
 impl<'str, 'ctx, Ctx: HostMut<'str>> Builder<'str, 'ctx, Ctx> {
     /// Creates a builder positioned at `block`.
     ///
@@ -496,41 +541,6 @@ impl<'str, 'ctx, Ctx: HostMut<'str>> Builder<'str, 'ctx, Ctx> {
             .block_mut(id)
             .set_name(Some(unique_name));
         self.local_labels.insert(name, id);
-        id
-    }
-
-    pub fn make_temp(&mut self, size: usize) -> VarnodeId {
-        let space = self.context_mut().make_temp_space();
-        Varnode::make(self.context_mut(), 0, size, space).id
-    }
-
-    /// Creates a new temporary value with the given name and size.
-    /// This value is a memory value so does not need to follow any SSA rules.
-    /// The name is deduplicated with a numeric suffix if already taken in the context.
-    pub fn make_named_temp(&mut self, name: Cow<'str, str>, size: usize) -> VarnodeId {
-        let space = self.context_mut().make_temp_space();
-        let id = Varnode::make(self.context_mut(), 0, size, space).id;
-        let unique_name = self.context_mut().get_unique_name(name);
-        Varnode::from_id_mut(self.context_mut(), id)
-            .rename(unique_name.clone())
-            .expect("This name was deduplicated");
-        self.context_mut().shared.spaces[space].name = Some(unique_name.as_ref().into());
-        id
-    }
-
-    /// Creates a new temporary value identified by an integer `label`, used to
-    /// derive its display name (`v{label}`) lazily.
-    ///
-    /// Unlike [`make_named_temp`](Self::make_named_temp), this does not allocate a
-    /// name `String`, probe for a unique name, or insert into the context's name
-    /// map — so it stays off the per-instruction hot path. The temporary's
-    /// identity is its [`VarnodeId`]; callers that need distinct temporaries are
-    /// responsible for using distinct varnodes (the emitter keys them by
-    /// `(size, local)`), so no name-uniqueness check is needed.
-    pub fn make_temp_labeled(&mut self, label: u32, size: usize) -> VarnodeId {
-        let space = self.context_mut().make_temp_space();
-        let id = Varnode::make(self.context_mut(), 0, size, space).id;
-        Varnode::from_id_mut(self.context_mut(), id).set_label(label);
         id
     }
 
