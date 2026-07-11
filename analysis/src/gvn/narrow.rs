@@ -125,11 +125,7 @@ impl<'str> SubPassC<'str> for NarrowTrunc {
             return Claim::Pass;
         }
         let mut memo: HashMap<ValueId, ValueId> = HashMap::default();
-        // TODO(5b-ii): `narrow_to` is a shared HostMut helper; scoped host.
-        let narrowed = {
-            let mut host = body.host(cx);
-            narrow_to(&mut host, src, w, ic.insn_id, ic.block_id, &mut memo)
-        };
+        let narrowed = narrow_to_c(body, cx, src, w, ic.insn_id, ic.block_id, &mut memo);
         if narrowed == ic.id {
             return Claim::Pass;
         }
@@ -287,6 +283,119 @@ fn push_insn<'str, H: HostMut<'str>>(
 ) -> ValueId {
     let id = host.push_mnemonic(block.func, mnemonic, size);
     host.insert_insn_before(block, before, id);
+    ValueId::Instruction(id)
+}
+
+// ---------------------------------------------------------------------------
+// Concrete pass twins over (&mut FunctionBody, ContextView) — 5b-ii Pin A step 2.
+// ---------------------------------------------------------------------------
+
+/// Concrete pass twin of [`narrow_to`].
+fn narrow_to_c<'str>(
+    body: &mut FunctionBody<'str>,
+    cx: ContextView<'_, 'str>,
+    v: ValueId,
+    w: usize,
+    before: InstructionId,
+    block: BlockId,
+    memo: &mut HashMap<ValueId, ValueId>,
+) -> ValueId {
+    if value_size(body.read_host(cx), v) == w {
+        return v;
+    }
+    if let Some(&cached) = memo.get(&v) {
+        return cached;
+    }
+
+    let result = match v {
+        ValueId::Instruction(iid) => match body.read_host(cx).insn_ref(iid).mnemonic().clone() {
+            Mnemonic::Binop(Binary {
+                op: Binop::Int(o),
+                lhs,
+                rhs,
+            }) if distributive(o) => {
+                let l = narrow_to_c(body, cx, lhs, w, before, block, memo);
+                let rr = narrow_to_c(body, cx, rhs, w, before, block, memo);
+                push_insn_c(
+                    body,
+                    cx,
+                    Mnemonic::Binop(Binary {
+                        op: Binop::Int(o),
+                        lhs: l,
+                        rhs: rr,
+                    }),
+                    w,
+                    before,
+                    block,
+                )
+            }
+            Mnemonic::Unop(Unary { op, src }) if matches!(op, Unop::IntNot | Unop::IntNegate) => {
+                let s = narrow_to_c(body, cx, src, w, before, block, memo);
+                push_insn_c(
+                    body,
+                    cx,
+                    Mnemonic::Unop(Unary { op, src: s }),
+                    w,
+                    before,
+                    block,
+                )
+            }
+            Mnemonic::Sext(Sext { src, .. }) => {
+                narrow_extension_c(body, cx, src, w, true, before, block, memo)
+            }
+            Mnemonic::Zext(Zext { src, .. }) => {
+                narrow_extension_c(body, cx, src, w, false, before, block, memo)
+            }
+            Mnemonic::Range(Range { src, start: 0, .. }) => {
+                narrow_to_c(body, cx, src, w, before, block, memo)
+            }
+            _ => push_insn_c(body, cx, range_low(v, w), w, before, block),
+        },
+        _ if numeric_const(body.read_host(cx).shared(), v).is_some() => {
+            let folded = numeric_const(body.read_host(cx).shared(), v).unwrap() & low_mask(w);
+            body.read_host(cx).shared().get_const(folded, w).id()
+        }
+        _ => push_insn_c(body, cx, range_low(v, w), w, before, block),
+    };
+
+    memo.insert(v, result);
+    result
+}
+
+/// Concrete pass twin of [`narrow_extension`].
+#[allow(clippy::too_many_arguments)]
+fn narrow_extension_c<'str>(
+    body: &mut FunctionBody<'str>,
+    cx: ContextView<'_, 'str>,
+    src: ValueId,
+    w: usize,
+    sext: bool,
+    before: InstructionId,
+    block: BlockId,
+    memo: &mut HashMap<ValueId, ValueId>,
+) -> ValueId {
+    if value_size(body.read_host(cx), src) >= w {
+        return narrow_to_c(body, cx, src, w, before, block, memo);
+    }
+    let m = if sext {
+        Mnemonic::Sext(Sext { src, size: w })
+    } else {
+        Mnemonic::Zext(Zext { src, size: w })
+    };
+    push_insn_c(body, cx, m, w, before, block)
+}
+
+/// Concrete pass twin of [`push_insn`].
+fn push_insn_c<'str>(
+    body: &mut FunctionBody<'str>,
+    cx: ContextView<'_, 'str>,
+    mnemonic: Mnemonic,
+    size: usize,
+    before: InstructionId,
+    block: BlockId,
+) -> ValueId {
+    let id = body.push_mnemonic(cx, mnemonic, size);
+    body.insert_insn_before(cx, block, before, id);
     ValueId::Instruction(id)
 }
 
