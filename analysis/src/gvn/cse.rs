@@ -17,7 +17,6 @@ use qcode::context::Context;
 use qcode::value::{
     ValueId,
     insn::{Binop, FloatBinop, IntBinop, Mnemonic},
-    util::host_mut::HostMut,
 };
 
 use std::any::Any;
@@ -69,7 +68,7 @@ impl<'str> ModuleSubPass<'str> for Cse {
 
     fn on_insn(
         &self,
-        mut host: &mut Context<'str>,
+        host: &mut Context<'str>,
         state: &mut dyn Any,
         ic: &InsnCtx,
         ed: &mut Editor,
@@ -97,7 +96,7 @@ impl<'str> ModuleSubPass<'str> for Cse {
         // A dominating value already computes this form: forward to it.
         if let Some(leader) = state.lookup(&key) {
             if leader != ic.id {
-                ed.replace(&mut host, ic.insn_id, leader);
+                ed.replace(host, ic.insn_id, leader);
             }
             return Claim::Done;
         }
@@ -111,7 +110,7 @@ impl<'str> ModuleSubPass<'str> for Cse {
             _ => {
                 let root_ty = host.read_host().type_of(ic.id);
                 let v = materialize(
-                    &mut host,
+                    host,
                     ic.block_id,
                     ic.insn_id,
                     ic.mnemonic,
@@ -120,7 +119,7 @@ impl<'str> ModuleSubPass<'str> for Cse {
                     state,
                 );
                 if v != ic.id {
-                    ed.replace(&mut host, ic.insn_id, v);
+                    ed.replace(host, ic.insn_id, v);
                 }
             }
         }

@@ -59,7 +59,7 @@ impl<'str> ModuleSubPass<'str> for PureCall {
         ic: &InsnCtx,
         ed: &mut Editor,
     ) -> Claim {
-        let mut ctx: &mut Context = host;
+        let ctx: &mut Context = host;
         let Mnemonic::Extract(Extract { agg, index }) = *ic.mnemonic else {
             return Claim::Pass;
         };
@@ -126,7 +126,7 @@ impl<'str> ModuleSubPass<'str> for PureCall {
         };
 
         let lit = ctx.get_const(value, ic.size).id();
-        ed.replace(&mut ctx, ic.insn_id, lit);
+        ed.replace(ctx, ic.insn_id, lit);
         Claim::Done
     }
 }

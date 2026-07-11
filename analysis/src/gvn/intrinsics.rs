@@ -12,10 +12,7 @@
 //! it subsumed becomes pure-dead and is reclaimed by DCE.
 
 use qcode::context::Context;
-use qcode::value::{
-    insn::{Binop, IntrinsicApp, Mnemonic, RootOp, recognizers_for},
-    util::host_mut::HostMut,
-};
+use qcode::value::insn::{Binop, IntrinsicApp, Mnemonic, RootOp, recognizers_for};
 
 use std::any::Any;
 
@@ -40,7 +37,7 @@ impl<'str> ModuleSubPass<'str> for Recognize {
 
     fn on_insn(
         &self,
-        mut host: &mut Context<'str>,
+        host: &mut Context<'str>,
         _state: &mut dyn Any,
         ic: &InsnCtx,
         ed: &mut Editor,
@@ -57,7 +54,7 @@ impl<'str> ModuleSubPass<'str> for Recognize {
                 // Recognized intrinsics (rol/ror) are width-preserving, so the
                 // root's width is the result width.
                 ed.replace_with_new_insn(
-                    &mut host,
+                    host,
                     ic.block_id,
                     ic.insn_id,
                     Mnemonic::Intrinsic(IntrinsicApp { id, args }),

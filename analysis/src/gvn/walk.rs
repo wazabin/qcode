@@ -23,7 +23,7 @@ use qcode::value::{
     block::BlockId,
     function::FunctionId,
     insn::{InstructionId, Mnemonic},
-    util::{base_ref::HostRef, host_mut::HostMut},
+    util::base_ref::HostRef,
 };
 
 /// What a sub-pass did with an instruction.
@@ -65,9 +65,9 @@ impl Editor {
     }
 
     /// Forward all uses of `insn` to `with` and mark `insn` redundant.
-    pub(super) fn replace<'str, H: HostMut<'str>>(
+    pub(super) fn replace<'str>(
         &mut self,
-        host: &mut H,
+        host: &mut Context<'str>,
         insn: InstructionId,
         with: ValueId,
     ) {
@@ -77,9 +77,9 @@ impl Editor {
 
     /// Materialize `mnemonic` as a new instruction inserted before `at`, then
     /// forward all uses of `at` to it and mark `at` redundant.
-    pub(super) fn replace_with_new_insn<'str, H: HostMut<'str>>(
+    pub(super) fn replace_with_new_insn<'str>(
         &mut self,
-        host: &mut H,
+        host: &mut Context<'str>,
         block_id: BlockId,
         at: InstructionId,
         mnemonic: Mnemonic,
@@ -92,9 +92,9 @@ impl Editor {
     /// Like [`replace_with_new_insn`](Self::replace_with_new_insn) but with an
     /// explicit result [`TypeId`] — used when the new instruction is a comparison
     /// (which must be `bool`-typed, not a plain `iN`).
-    pub(super) fn replace_with_new_insn_typed<'str, H: HostMut<'str>>(
+    pub(super) fn replace_with_new_insn_typed<'str>(
         &mut self,
-        host: &mut H,
+        host: &mut Context<'str>,
         block_id: BlockId,
         at: InstructionId,
         mnemonic: Mnemonic,
@@ -110,7 +110,7 @@ impl Editor {
     /// Drop the redundant instructions from their block; returns whether
     /// anything was rewritten. Every redundant instruction has already had its
     /// uses forwarded, so removing it prunes only its own operand use-lists.
-    fn finish<'str, H: HostMut<'str>>(self, host: &mut H) -> bool {
+    fn finish<'str>(self, host: &mut Context<'str>) -> bool {
         let changed = !self.redundant.is_empty();
         for insn in self.redundant {
             host.remove_instruction(insn);
@@ -205,7 +205,7 @@ fn clone_states<'str>(
 /// Run the sub-pass chain over every instruction of `block_id`, then drop the
 /// instructions it made redundant. Returns whether anything was rewritten.
 fn run_block<'str>(
-    mut host: &mut Context<'str>,
+    host: &mut Context<'str>,
     block_id: BlockId,
     passes: &[Box<dyn ModuleSubPass<'str>>],
     states: &mut [Box<dyn Any>],
@@ -237,7 +237,7 @@ fn run_block<'str>(
         }
     }
 
-    ed.finish(&mut host)
+    ed.finish(host)
 }
 
 /// Run the sub-passes over a single block with fresh state and no block-boundary

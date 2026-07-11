@@ -31,6 +31,7 @@ use rustc_hash::FxHashMap as HashMap;
 use jstd::graph::analysis::DominatorTree;
 
 use crate::{AliasResult, ContextView, FunctionBody};
+use qcode::context::Context;
 use qcode::{
     assumption::Proposition,
     space::{Space, SpaceId, SpaceType},
@@ -38,7 +39,7 @@ use qcode::{
         Value, ValueId, ValueRef, Varnode, VarnodeId,
         block::BlockId,
         insn::{Binary, Binop, IntBinop, Load, Mnemonic, Range, Store, Zext},
-        util::{base_ref::HostRef, host_mut::HostMut},
+        util::base_ref::HostRef,
     },
 };
 
@@ -163,9 +164,9 @@ pub(super) struct MemForward {
 
 impl MemForward {
     /// Update state for `store`, invalidating any forwarded value it overwrites.
-    pub(super) fn record_store<'str, H: HostMut<'str>>(
+    pub(super) fn record_store<'str>(
         &mut self,
-        host: &mut H,
+        host: &mut Context<'str>,
         store: &Store,
         aliases: Option<&AliasResult>,
         numbering: &Numbering,
@@ -215,9 +216,9 @@ impl MemForward {
 
     /// The value `load` forwards to, materializing any rebuild instructions
     /// before `insn_id` in `block_id`, or `None` if it is not fully covered.
-    pub(super) fn try_load<'str, H: HostMut<'str>>(
+    pub(super) fn try_load<'str>(
         &mut self,
-        host: &mut H,
+        host: &mut Context<'str>,
         block_id: BlockId,
         insn_id: qcode::value::InstructionId,
         load: &Load,
@@ -300,9 +301,9 @@ impl MemForward {
     /// extracted (`Range`), widened (`Zext`), shifted into place (`<<`), and the
     /// pieces are OR-ed together. Reuses `Range`/`Zext`/`<<`/`|`; constant pieces
     /// fold away in [`super::fold`].
-    fn rebuild<'str, H: HostMut<'str>>(
+    fn rebuild<'str>(
         &self,
-        host: &mut H,
+        host: &mut Context<'str>,
         block_id: BlockId,
         insn_id: qcode::value::InstructionId,
         segments: &[Segment],
@@ -335,9 +336,9 @@ impl MemForward {
     /// memory order, when every segment's source is a compile-time constant.
     /// Returns `None` if any segment is non-constant (the all-constant-or-bail
     /// rule) or out of bounds.
-    fn rebuild_bytes<'str, H: HostMut<'str>>(
+    fn rebuild_bytes<'str>(
         &self,
-        host: &mut H,
+        host: &mut Context<'str>,
         segments: &[Segment],
         load_size: usize,
     ) -> Option<ValueId> {
@@ -372,9 +373,9 @@ impl MemForward {
     /// segment already equals the whole source), `Zext` to the load width
     /// (skipped when already that wide), then `<< load_off*8` (skipped at offset
     /// 0).
-    fn build_piece<'str, H: HostMut<'str>>(
+    fn build_piece<'str>(
         &self,
-        host: &mut H,
+        host: &mut Context<'str>,
         block_id: BlockId,
         insn_id: qcode::value::InstructionId,
         seg: &Segment,
@@ -1077,8 +1078,8 @@ mod tests {
         let byte_store = store_to(&tc, tc.r0_byte0, byte);
         let nb = Numbering::default();
         let mut mf = MemForward::default();
-        mf.record_store(&mut &mut tc.ctx, &wide_store, Some(&aliases), &nb);
-        mf.record_store(&mut &mut tc.ctx, &byte_store, Some(&aliases), &nb);
+        mf.record_store(&mut tc.ctx, &wide_store, Some(&aliases), &nb);
+        mf.record_store(&mut tc.ctx, &byte_store, Some(&aliases), &nb);
 
         assert_eq!(mf.byte_map[&(base, start)].src, byte, "byte 0 overwritten");
         assert_eq!(
@@ -1187,7 +1188,7 @@ mod tests {
         let nb = precompute_forms(&tc.ctx, fid);
 
         let mut mf = MemForward::default();
-        mf.record_store(&mut &mut tc.ctx, &slot_store, Some(&aliases), &nb);
+        mf.record_store(&mut tc.ctx, &slot_store, Some(&aliases), &nb);
         // A plain caller-frame `@SP - 4` cell, for contrast: its base is the `@SP`
         // param (classified CallerFrame), so it is not own-frame-private.
         let caller_slot = Base::Symbolic(ram, sp);
@@ -1236,12 +1237,7 @@ mod tests {
         let base = Base::Pinned(space);
         let start = start as i64;
         let mut mf = MemForward::default();
-        mf.record_store(
-            &mut &mut tc.ctx,
-            &store,
-            Some(&aliases),
-            &Numbering::default(),
-        );
+        mf.record_store(&mut tc.ctx, &store, Some(&aliases), &Numbering::default());
 
         assert_eq!(mf.byte_map.len(), 4, "all four written bytes are defined");
         assert_eq!(mf.byte_map[&(base, start)].src, narrow);
@@ -1277,21 +1273,14 @@ mod tests {
         let store = store_to(&tc, tc.r0_lo32, src);
         let nb = Numbering::default();
         let mut mf = MemForward::default();
-        mf.record_store(&mut &mut tc.ctx, &store, Some(&aliases), &nb);
+        mf.record_store(&mut tc.ctx, &store, Some(&aliases), &nb);
 
         let load = load_of(&tc, tc.r0_lo32);
         // A dummy instruction id to insert before; none is created here because
         // an exact forward materializes nothing.
         let dummy = qcode::value::InstructionId::default();
         let forwarded = mf
-            .try_load(
-                &mut &mut tc.ctx,
-                block_id,
-                dummy,
-                &load,
-                Some(&aliases),
-                &nb,
-            )
+            .try_load(&mut tc.ctx, block_id, dummy, &load, Some(&aliases), &nb)
             .expect("exact forward");
         assert_eq!(forwarded, src);
     }

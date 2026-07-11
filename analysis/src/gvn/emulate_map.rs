@@ -58,7 +58,7 @@ impl<'str> ModuleSubPass<'str> for EmulateMap {
         ic: &InsnCtx,
         ed: &mut Editor,
     ) -> Claim {
-        let mut ctx: &mut Context = host;
+        let ctx: &mut Context = host;
         let folded = match ic.mnemonic.clone() {
             Mnemonic::Map(map) => self.emulate(ctx, ic, &map),
             Mnemonic::Scan(scan) => self.emulate_scan(ctx, ic, &scan),
@@ -66,7 +66,7 @@ impl<'str> ModuleSubPass<'str> for EmulateMap {
         };
         match folded {
             Some(bytes) => {
-                ed.replace(&mut ctx, ic.insn_id, bytes);
+                ed.replace(ctx, ic.insn_id, bytes);
                 Claim::Done
             }
             None => Claim::Pass,

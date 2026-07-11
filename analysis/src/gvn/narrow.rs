@@ -38,7 +38,7 @@ use qcode::{
         Value, ValueId, ValueRef,
         block::BlockId,
         insn::{Binary, Binop, InstructionId, IntBinop, Mnemonic, Range, Sext, Unary, Unop, Zext},
-        util::{base_ref::HostRef, host_mut::HostMut},
+        util::base_ref::HostRef,
     },
 };
 
@@ -62,7 +62,7 @@ impl<'str> ModuleSubPass<'str> for NarrowTrunc {
 
     fn on_insn(
         &self,
-        mut host: &mut Context<'str>,
+        host: &mut Context<'str>,
         _state: &mut dyn Any,
         ic: &InsnCtx,
         ed: &mut Editor,
@@ -82,11 +82,11 @@ impl<'str> ModuleSubPass<'str> for NarrowTrunc {
             return Claim::Pass;
         }
         let mut memo: HashMap<ValueId, ValueId> = HashMap::default();
-        let narrowed = narrow_to(&mut host, src, w, ic.insn_id, ic.block_id, &mut memo);
+        let narrowed = narrow_to(host, src, w, ic.insn_id, ic.block_id, &mut memo);
         if narrowed == ic.id {
             return Claim::Pass;
         }
-        ed.replace(&mut host, ic.insn_id, narrowed);
+        ed.replace(host, ic.insn_id, narrowed);
         Claim::Done
     }
 }
@@ -164,8 +164,8 @@ fn src_transformable(host: HostRef, v: ValueId) -> bool {
 /// Returns a width-`w` value equal to the low `w` bytes of `v`, materializing
 /// instructions before `before`. Memoized within a single rewrite (so `w` is
 /// fixed and the key is just `v`).
-fn narrow_to<'str, H: HostMut<'str>>(
-    host: &mut H,
+fn narrow_to<'str>(
+    host: &mut Context<'str>,
     v: ValueId,
     w: usize,
     before: InstructionId,
@@ -234,8 +234,8 @@ fn narrow_to<'str, H: HostMut<'str>>(
 /// Low `w` bytes of `ext_kind(src)`. If `src` already has at least `w` bytes the
 /// extension is discarded (recurse into `src`); otherwise a *narrower* extension
 /// of `src` up to `w` reproduces the low word exactly.
-fn narrow_extension<'str, H: HostMut<'str>>(
-    host: &mut H,
+fn narrow_extension<'str>(
+    host: &mut Context<'str>,
     src: ValueId,
     w: usize,
     sext: bool,
@@ -274,8 +274,8 @@ fn range_low(src: ValueId, size: usize) -> Mnemonic {
     })
 }
 
-fn push_insn<'str, H: HostMut<'str>>(
-    host: &mut H,
+fn push_insn<'str>(
+    host: &mut Context<'str>,
     mnemonic: Mnemonic,
     size: usize,
     before: InstructionId,

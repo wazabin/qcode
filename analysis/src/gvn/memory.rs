@@ -10,7 +10,7 @@ use jstd::graph::analysis::DominatorTree;
 
 use crate::AliasResult;
 use qcode::context::Context;
-use qcode::value::{block::BlockId, insn::Mnemonic, util::host_mut::HostMut};
+use qcode::value::{block::BlockId, insn::Mnemonic};
 
 use super::affine::Numbering;
 use std::any::Any;
@@ -60,7 +60,7 @@ impl<'str> ModuleSubPass<'str> for MemoryForwarding {
 
     fn on_insn(
         &self,
-        mut host: &mut Context<'str>,
+        host: &mut Context<'str>,
         state: &mut dyn Any,
         ic: &InsnCtx,
         ed: &mut Editor,
@@ -68,12 +68,12 @@ impl<'str> ModuleSubPass<'str> for MemoryForwarding {
         let state = state.downcast_mut::<MemForward>().expect("memory state");
         match ic.mnemonic {
             Mnemonic::Store(store) => {
-                state.record_store(&mut host, store, ic.aliases, ic.numbering);
+                state.record_store(host, store, ic.aliases, ic.numbering);
                 Claim::Done
             }
             Mnemonic::Load(load) => {
                 match state.try_load(
-                    &mut host,
+                    host,
                     ic.block_id,
                     ic.insn_id,
                     load,
@@ -81,7 +81,7 @@ impl<'str> ModuleSubPass<'str> for MemoryForwarding {
                     ic.numbering,
                 ) {
                     Some(value) => {
-                        ed.replace(&mut host, ic.insn_id, value);
+                        ed.replace(host, ic.insn_id, value);
                         state.define_load(load, value, ic.aliases, ic.numbering);
                     }
                     None => state.define_load(load, ic.id, ic.aliases, ic.numbering),

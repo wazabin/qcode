@@ -6,7 +6,7 @@ use qcode::{
         Value, ValueId, ValueRef,
         insn::{Binary, Binop, IntBinop, Mnemonic, Unop},
         literal::LiteralRef,
-        util::{base_ref::HostRef, host_mut::HostMut},
+        util::base_ref::HostRef,
     },
 };
 
@@ -34,7 +34,7 @@ impl<'str> ModuleSubPass<'str> for Fold {
 
     fn on_insn(
         &self,
-        mut host: &mut Context<'str>,
+        host: &mut Context<'str>,
         _state: &mut dyn Any,
         ic: &InsnCtx,
         ed: &mut Editor,
@@ -44,7 +44,7 @@ impl<'str> ModuleSubPass<'str> for Fold {
         }
         match try_fold_insn(host.read_host(), ic) {
             Some(folded) => {
-                ed.replace(&mut host, ic.insn_id, folded);
+                ed.replace(host, ic.insn_id, folded);
                 Claim::Done
             }
             None => Claim::Pass,

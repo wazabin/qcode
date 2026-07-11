@@ -28,12 +28,13 @@
 
 use rustc_hash::FxHashMap as HashMap;
 
+use qcode::context::Context;
 use qcode::value::{
     ValueId,
     block::BlockId,
     function::FunctionId,
     insn::{Binary, Binop, InstructionId, IntBinop, Mnemonic, Unary, Unop},
-    util::{base_ref::HostRef, host_mut::HostMut},
+    util::base_ref::HostRef,
 };
 
 use super::cse::{normalize, value_id_key};
@@ -368,8 +369,8 @@ pub(super) fn key_for(form: &NormalForm, id: ValueId, mnemonic: &Mnemonic) -> No
 // ---------------------------------------------------------------------------
 
 /// Insert a fresh instruction `(mnemonic, type)` before `at` in `block`.
-fn emit<'str, H: HostMut<'str>>(
-    host: &mut H,
+fn emit<'str>(
+    host: &mut Context<'str>,
     block: BlockId,
     at: InstructionId,
     mnemonic: Mnemonic,
@@ -383,8 +384,8 @@ fn emit<'str, H: HostMut<'str>>(
 /// Reuse-or-create the value computing `form` (a sub-expression). Trivial forms
 /// resolve to a literal or the bare term; otherwise a dominating leader is reused
 /// if present, else the canonical instruction is emitted and registered.
-fn build_value<'str, H: HostMut<'str>>(
-    host: &mut H,
+fn build_value<'str>(
+    host: &mut Context<'str>,
     block: BlockId,
     at: InstructionId,
     form: &NormalForm,
@@ -422,8 +423,8 @@ fn build_value<'str, H: HostMut<'str>>(
 /// The single-level canonical mnemonic for `form`, building its operands via
 /// [`build_value`] (which reuses dominating sub-results). Deterministic: terms in
 /// `value_id_key` order, negatives rendered as `sub`, the constant applied last.
-fn canonical_mnemonic<'str, H: HostMut<'str>>(
-    host: &mut H,
+fn canonical_mnemonic<'str>(
+    host: &mut Context<'str>,
     block: BlockId,
     at: InstructionId,
     form: &NormalForm,
@@ -527,8 +528,8 @@ fn canonical_mnemonic<'str, H: HostMut<'str>>(
 
 /// The value of `mag·term` (a positive magnitude): the bare term when `mag == 1`,
 /// else a reused-or-created `mul`.
-fn scaled_value<'str, H: HostMut<'str>>(
-    host: &mut H,
+fn scaled_value<'str>(
+    host: &mut Context<'str>,
     block: BlockId,
     at: InstructionId,
     term: ValueId,
@@ -548,7 +549,7 @@ fn scaled_value<'str, H: HostMut<'str>>(
 }
 
 /// `(op, literal)` for adding a signed constant: `sub |s|` when negative.
-fn signed_lit<'str, H: HostMut<'str>>(host: &mut H, s: i64, width: usize) -> (IntBinop, ValueId) {
+fn signed_lit<'str>(host: &mut Context<'str>, s: i64, width: usize) -> (IntBinop, ValueId) {
     if s < 0 {
         (
             IntBinop::Sub,
@@ -572,8 +573,8 @@ fn signed_lit<'str, H: HostMut<'str>>(host: &mut H, s: i64, width: usize) -> (In
 ///
 /// `root_ty` is the result type to give a newly created root instruction so that
 /// StackAddress/symbolic typing is preserved.
-pub(super) fn materialize<'str, H: HostMut<'str>>(
-    host: &mut H,
+pub(super) fn materialize<'str>(
+    host: &mut Context<'str>,
     block: BlockId,
     at: InstructionId,
     at_mnemonic: &Mnemonic,

@@ -4,7 +4,7 @@ use qcode::context::Context;
 use qcode::value::{
     ValueId,
     insn::{Binary, Binop, IntBinop, Mnemonic},
-    util::{base_ref::HostRef, host_mut::HostMut},
+    util::base_ref::HostRef,
 };
 
 use super::fold::const_value;
@@ -31,7 +31,7 @@ impl<'str> ModuleSubPass<'str> for FlagIdiom {
 
     fn on_insn(
         &self,
-        mut host: &mut Context<'str>,
+        host: &mut Context<'str>,
         _state: &mut dyn Any,
         ic: &InsnCtx,
         ed: &mut Editor,
@@ -41,7 +41,7 @@ impl<'str> ModuleSubPass<'str> for FlagIdiom {
         }
         match simplify_flag_idiom(host.read_host(), ic.mnemonic) {
             Some(new_mnemonic) => {
-                ed.replace_with_new_insn(&mut host, ic.block_id, ic.insn_id, new_mnemonic, ic.size);
+                ed.replace_with_new_insn(host, ic.block_id, ic.insn_id, new_mnemonic, ic.size);
                 Claim::Done
             }
             None => Claim::Pass,

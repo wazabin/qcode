@@ -102,7 +102,7 @@ impl ArrayProject {
     /// `Range(Map(body, src), k·osz, osz)` ⇒ inlined `body(src[k], captures…)`.
     fn project_map(
         &self,
-        mut ctx: &mut Context,
+        ctx: &mut Context,
         ic: &InsnCtx,
         ed: &mut Editor,
         map_id: qcode::value::InstructionId,
@@ -162,7 +162,7 @@ impl ArrayProject {
             return Claim::Pass;
         };
 
-        ed.replace(&mut ctx, ic.insn_id, result);
+        ed.replace(ctx, ic.insn_id, result);
         Claim::Done
     }
 
@@ -170,7 +170,7 @@ impl ArrayProject {
     #[allow(clippy::too_many_arguments)]
     fn project_enumerate(
         &self,
-        mut ctx: &mut Context,
+        ctx: &mut Context,
         ic: &InsnCtx,
         ed: &mut Editor,
         enum_val: ValueId,
@@ -237,7 +237,7 @@ impl ArrayProject {
             ValueId::Instruction(t)
         };
 
-        ed.replace(&mut ctx, ic.insn_id, tuple);
+        ed.replace(ctx, ic.insn_id, tuple);
         Claim::Done
     }
 
@@ -245,7 +245,7 @@ impl ArrayProject {
     /// `a`, or `Range(b, off - sizeof(a), size)` when wholly in `b`.
     fn project_concat(
         &self,
-        mut ctx: &mut Context,
+        ctx: &mut Context,
         ic: &InsnCtx,
         ed: &mut Editor,
         args: &[ValueId],
@@ -281,14 +281,14 @@ impl ArrayProject {
         )
         .id;
         BasicBlock::from_id_mut(ctx, ic.block_id).insert_insn_before(ic.insn_id, r);
-        ed.replace(&mut ctx, ic.insn_id, ValueId::Instruction(r));
+        ed.replace(ctx, ic.insn_id, ValueId::Instruction(r));
         Claim::Done
     }
 
     /// `Extract(Tuple{fields…}, i)` ⇒ `fields[i]`.
     fn fold_extract_tuple(
         &self,
-        mut ctx: &mut Context,
+        ctx: &mut Context,
         ic: &InsnCtx,
         ed: &mut Editor,
         agg: ValueId,
@@ -303,7 +303,7 @@ impl ArrayProject {
         let Some(&field) = fields.get(index) else {
             return Claim::Pass;
         };
-        ed.replace(&mut ctx, ic.insn_id, field);
+        ed.replace(ctx, ic.insn_id, field);
         Claim::Done
     }
 }
