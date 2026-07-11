@@ -91,7 +91,7 @@ pub(crate) use pipeline::with_checked_out_body;
 pub use pipeline::{
     ArchConfig, CallingConvention, ContextSplit, ContextView, DEFAULT_PIPELINE_TOML, DecompilePass,
     DynDecompilePass,
-    DynFunctionPass, DynPass, Effects,
+    DynFunctionPass, DynPass,
     FunctionBody, FunctionPass, FunctionPassAdapter, GpReg, LiftOutcome, LiftSummary, Outcome, Pass,
     PassRegistration, Pipeline, PipelineEnv, PipelineServices, ProgressSink, RegisteredPass,
     YieldSignal,

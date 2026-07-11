@@ -55,7 +55,7 @@ pub(crate) fn with_minting<'str, R>(
         let (bodies, view) = ctx.split(&env);
         let mut body = FunctionBody::new(fun, &mut bodies[fun], reserved);
         let out = f(view, &mut body);
-        let (_effects, minted, _unused) = body.into_parts();
+        let (minted, _unused) = body.into_parts();
         (out, minted)
     };
     crate::pipeline::install_minted_for_test(ctx, minted);

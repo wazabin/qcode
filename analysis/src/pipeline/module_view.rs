@@ -5,9 +5,9 @@
 //! [`ContextView`] and mutates *only its own function* through a `&mut`
 //! [`FunctionBody`] — the body borrowed `&mut` in place from the bodies registry
 //! by the driver's [`split`](ContextSplit::split). The one effect on global state
-//! a pass legitimately needs (a self-rename) is **buffered** in [`Effects`] and
-//! drained by the driver at the post-run barrier, so the pass itself touches no
-//! global mutable state — which is what lets workers run in parallel with the
+//! a pass legitimately needs (a self-rename) is **returned** in [`Outcome::rename`]
+//! and applied by the driver at the post-run barrier, so the pass itself touches
+//! no global mutable state — which is what lets workers run in parallel with the
 //! `ContextView` `&`-shared and the bodies disjoint `&mut`.
 //!
 //! The driver `split`s the context once, borrows every worklist body disjointly
@@ -40,29 +40,11 @@ use super::PipelineEnv;
 /// body. Installed into the reserved slot by the driver at the barrier.
 pub type Minted<'str> = (FunctionId, FunctionInterface<'str>, Function<'str>);
 
-/// Global effects a function pass requests, buffered for the driver to apply at
-/// the barrier (in worklist order). The self-rename is a first-writer-wins claim, so
-/// replay is deterministic and needs no merge heuristics.
-#[derive(Default)]
-pub struct Effects<'str> {
-    /// A buffered self-rename claim (from `cpp_demangle` / `name_thunks`),
-    /// applied as a `get_unique_name` claim at the barrier.
-    pub self_rename: Option<Cow<'str, str>>,
-}
-
-impl<'str> Effects<'str> {
-    /// Buffer a self-rename claim (last writer wins within one run; the driver
-    /// resolves it to a unique name at the barrier).
-    pub fn rename_self(&mut self, name: Cow<'str, str>) {
-        self.self_rename = Some(name);
-    }
-}
-
 /// The result of one function-pass run (context-split ruling 3): whether it
 /// changed the IR, an optional self-rename claim, and any functions it minted.
 ///
 /// Returned **by value** from [`FunctionPass::run`](super::FunctionPass::run), so
-/// a pass touches no wrapper scratch: `rename` subsumes the old [`Effects`] buffer
+/// a pass touches no wrapper scratch: `rename` subsumes the old `Effects` buffer
 /// and `minted` subsumes the old `FunctionBody.minted` field. The driver replays
 /// `rename` and installs `minted` at the post-run barrier in worklist order,
 /// exactly as it drained the wrapper before — the transport changes, the barrier
@@ -206,12 +188,13 @@ impl<'str> ContextSplit<'str> for Context<'str> {
 }
 
 /// The pass's own function, borrowed `&mut` in place from the bodies registry so
-/// the pass owns it exclusively, plus the [`Effects`] buffer and the
-/// function-minting pool.
+/// the pass owns it exclusively, plus the function-minting pool.
 ///
 /// The body is borrowed by the driver's [`split`](ContextSplit::split) and never
 /// leaves the registry; the exclusive `&mut` is what lets parallel workers hold
-/// disjoint `&mut FunctionBody`s over the same frozen [`ContextView`].
+/// disjoint `&mut FunctionBody`s over the same frozen [`ContextView`]. The one
+/// global effect a pass legitimately requests — a self-rename — is returned in
+/// [`Outcome::rename`] and applied by the driver at the barrier.
 pub struct FunctionBody<'a, 'str> {
     /// This function's id (the registry key; a [`Function`] does not store its
     /// own id).
@@ -221,8 +204,6 @@ pub struct FunctionBody<'a, 'str> {
     /// the registry — the `&mut` is what gives the pass exclusive access while the
     /// frozen [`ContextView`] shares the rest of the module.
     fun: &'a mut Function<'str>,
-    /// Global effects buffered this run (drained by the driver at the barrier).
-    effects: Effects<'str>,
     /// Never-observed placeholder [`FunctionId`]s the pass may materialize new
     /// functions into (loop outliners mint exactly one). Unused ids return to the
     /// driver's pool at the barrier.
@@ -240,7 +221,6 @@ impl<'a, 'str> FunctionBody<'a, 'str> {
         Self {
             id,
             fun,
-            effects: Effects::default(),
             reserved_ids,
             minted: Vec::new(),
         }
@@ -262,12 +242,6 @@ impl<'a, 'str> FunctionBody<'a, 'str> {
     /// block/instruction refs and `Builder`s over it.
     pub fn host<'b>(&'b mut self, cx: ContextView<'b, 'str>) -> PassBacking<'b, 'str> {
         PassBacking::new(&mut *self.fun, self.id, cx.shr(), cx.interfaces())
-    }
-
-    /// The effect buffer (mutate) — passes push a self-rename claim here instead of
-    /// touching global state.
-    pub fn effects_mut(&mut self) -> &mut Effects<'str> {
-        &mut self.effects
     }
 
     /// A `Copy` read view over this body's borrowed function and the shared
@@ -345,12 +319,12 @@ impl<'a, 'str> FunctionBody<'a, 'str> {
         )
     }
 
-    /// Consume the body at the barrier, yielding its buffered effects, the
-    /// functions it minted, and any unused reserved ids (returned to the driver's
-    /// pool). The function itself stays borrowed in place in the registry — there
-    /// is no body to reinstall.
-    pub fn into_parts(self) -> (Effects<'str>, Vec<Minted<'str>>, Vec<FunctionId>) {
-        (self.effects, self.minted, self.reserved_ids)
+    /// Consume the body at the barrier, yielding the functions it minted and any
+    /// unused reserved ids (returned to the driver's pool). The self-rename claim
+    /// travels in [`Outcome::rename`], not here. The function itself stays borrowed
+    /// in place in the registry — there is no body to reinstall.
+    pub fn into_parts(self) -> (Vec<Minted<'str>>, Vec<FunctionId>) {
+        (self.minted, self.reserved_ids)
     }
 }
 

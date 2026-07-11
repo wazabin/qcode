@@ -141,10 +141,8 @@ pub trait DynFunctionPass: Send + Sync {
     /// Run the pass on a [`FunctionBody`] the driver has *already* borrowed from the
     /// bodies registry, so the driver owns the barrier. This is the surface the
     /// parallel driver (and the sequential fixpoint) use to run a pass on a body they
-    /// hold `&mut`; buffered [`Effects`] replay and the barrier are the driver's job,
-    /// not this method's.
-    ///
-    /// [`Effects`]: super::Effects
+    /// hold `&mut`; the returned [`Outcome`]'s rename replay and the barrier are the
+    /// driver's job, not this method's.
     fn run_checked<'str>(
         &self,
         body: &mut FunctionBody<'_, 'str>,
@@ -197,7 +195,7 @@ pub trait FunctionPass: Default {
 ///    in place alongside the bodies-free [`ContextView`].
 /// 2. Run the pass on the borrowed [`FunctionBody`].
 /// 3. Drop the split borrow, then install any minted callees, resync the owner's
-///    call sites, and replay buffered [`Effects`].
+///    call sites, and apply the returned [`Outcome`]'s self-rename.
 ///
 /// The parallel driver instead borrows a whole worklist of bodies disjointly and
 /// calls [`DynFunctionPass::run_checked`] directly on each; the adapter's `run` is
@@ -252,21 +250,21 @@ impl<T: FunctionPass + Send + Sync> DynFunctionPass for FunctionPassAdapter<T> {
         // pass over the frozen module view; the view is bodies-free, so it cannot
         // alias the borrowed body.
         let before_targets = ctx.direct_call_targets(fun_id);
-        let (changed, effects, minted) = {
+        let (outcome, minted) = {
             let (bodies, view) = ctx.split(env);
             let mut body = FunctionBody::new(fun_id, &mut bodies[fun_id], reserved);
-            let changed = self.run_checked(&mut body, view)?.changed;
-            let (effects, minted, _unused) = body.into_parts();
-            (changed, effects, minted)
+            let outcome = self.run_checked(&mut body, view)?;
+            let (minted, _unused) = body.into_parts();
+            (outcome, minted)
         };
         // Barrier, in the driver's order: install minted callees first (so the
         // owner's new call sites resolve), rebuild its `call_sites` diff, then
-        // replay buffered effects. The body was mutated in place — nothing to
-        // reinstall.
+        // apply the returned self-rename. The body was mutated in place — nothing
+        // to reinstall.
         install_minted(ctx, T::NAME, minted)?;
         ctx.resync_call_sites(fun_id, &before_targets);
-        replay_effects(ctx, T::NAME, fun_id, effects)?;
-        Ok(changed)
+        replay_rename(ctx, T::NAME, fun_id, outcome.rename)?;
+        Ok(outcome.changed)
     }
 }
 
@@ -355,21 +353,23 @@ pub(super) fn install_minted<'str>(
     Ok(installed)
 }
 
-/// Replay a function pass's buffered [`Effects`] into the context at the barrier.
-/// Runs on the master thread in worklist order; the buffered self-rename is a
-/// first-writer-wins claim, so the order within one pass's buffer is immaterial.
-pub(super) fn replay_effects<'str>(
+/// Apply a function pass's returned self-rename claim ([`Outcome::rename`]) into
+/// the context at the barrier. Runs on the master thread in worklist order; the
+/// claim is a last-writer-wins request the pass already resolved for its run.
+///
+/// [`Outcome::rename`]: super::Outcome::rename
+pub(super) fn replay_rename<'str>(
     ctx: &mut Context<'str>,
     pass: &str,
     fun_id: FunctionId,
-    effects: super::Effects<'str>,
+    rename: Option<std::borrow::Cow<'str, str>>,
 ) -> Result<bool, String> {
     let mut changed = false;
-    // A buffered self-rename (cpp_demangle / name_thunks): the function is already
-    // checked in, so resolve the requested name against the now-complete global
+    // A returned self-rename (cpp_demangle / name_thunks): the function is live in
+    // the module, so resolve the requested name against the now-complete global
     // map (`get_unique_name` suffixes on collision) and apply it exactly as a
     // `FunctionMutRef::rename` would — the same global-name-map update.
-    if let Some(name) = effects.self_rename {
+    if let Some(name) = rename {
         let unique = ctx.get_unique_name(name);
         Function::from_id_mut(ctx, fun_id)
             .rename(unique)

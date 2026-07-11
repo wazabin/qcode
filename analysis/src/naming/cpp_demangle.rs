@@ -60,9 +60,8 @@ impl FunctionPass for CppDemangle {
 
         match demangled {
             Some(demangled) => {
-                // Buffered; the driver applies it (uniquified) at the barrier.
-                f.effects_mut().rename_self(Cow::Owned(demangled));
-                Ok(Outcome::changed(true))
+                // Returned; the driver applies it (uniquified) at the barrier.
+                Ok(Outcome::renamed(Cow::Owned(demangled)))
             }
             None => Ok(Outcome::unchanged()),
         }

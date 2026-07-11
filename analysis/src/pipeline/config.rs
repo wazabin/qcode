@@ -21,7 +21,7 @@ use qcode::{
 use super::lifter::PipelineServices;
 use super::pass::{
     DynFunctionPass, DynPass, MINT_RESERVE, PipelineEnv, RegisteredPass, install_minted,
-    known_pass_names, make_pass, replay_effects,
+    known_pass_names, make_pass, replay_rename,
 };
 use super::{
     ContextSplit, ContextView, FunctionBody, Outcome, PipelineProgress, ProgressSink, YieldSignal,
@@ -1570,10 +1570,10 @@ async fn run_function_stage(
             // split so `resync_call_sites` can diff it afterwards.
             let before_targets = ctx.direct_call_targets(fun_id);
             let reserved = reservations.remove(&fun_id).unwrap_or_default();
-            let (function_changed, effects, minted, unused) = {
+            let (outcome, minted, unused) = {
                 let (bodies, view) = ctx.split(env);
                 let mut body = FunctionBody::new(fun_id, &mut bodies[fun_id], reserved);
-                let function_changed = run_one_function(
+                let outcome = run_one_function(
                     passes,
                     &mut body,
                     view,
@@ -1592,16 +1592,15 @@ async fn run_function_stage(
                             pass,
                         });
                     },
-                )?
-                .changed;
-                let (effects, minted, unused) = body.into_parts();
-                (function_changed, effects, minted, unused)
+                )?;
+                let (minted, unused) = body.into_parts();
+                (outcome, minted, unused)
             };
             // Install minted callees before the owner's call sites resync, so the
             // new calls resolve against real functions.
             let installed = install_minted(ctx, &stage.name, minted)?;
             ctx.resync_call_sites(fun_id, &before_targets);
-            replay_effects(ctx, &stage.name, fun_id, effects)?;
+            replay_rename(ctx, &stage.name, fun_id, outcome.rename)?;
             // Minted functions are new work for downstream `only_dirty` stages.
             dirty.extend(installed);
             leftover.insert(fun_id, unused);
@@ -1609,7 +1608,7 @@ async fn run_function_stage(
             // is reachable through `ctx` again — pinning any invariant break to this
             // stage. A no-op unless `QCODE_VERIFY` is set.
             crate::verify::verify_after(ctx, &stage.name);
-            if function_changed {
+            if outcome.changed {
                 dirty.insert(fun_id);
             }
         }
@@ -1781,15 +1780,15 @@ type FnMeta = (
 
 /// One worklist function on its way through a parallel stage: its identity, the
 /// pre-run call-target snapshot (for the barrier `call_sites` diff), the body a
-/// worker mutates (borrowed `&mut` in place from the bodies registry), and whether
-/// the worker changed it.
+/// worker mutates (borrowed `&mut` in place from the bodies registry), and the
+/// [`Outcome`] the worker produced (changed / rename / minted).
 struct ParallelEntry<'a, 'str> {
     index: usize,
     fun_id: FunctionId,
     name: std::sync::Arc<str>,
     before_targets: Vec<FunctionId>,
     body: FunctionBody<'a, 'str>,
-    changed: bool,
+    outcome: Outcome<'str>,
 }
 
 /// What one worker thread accumulates locally and hands back for deterministic
@@ -1862,7 +1861,7 @@ fn run_stage_parallel(
                     name,
                     before_targets,
                     body: FunctionBody::new(fun_id, slot, reserved),
-                    changed: false,
+                    outcome: Outcome::default(),
                 },
             )
             .collect();
@@ -1890,7 +1889,7 @@ fn run_stage_parallel(
                             let name = e.name.clone();
                             let stage_name = stage_name.clone();
                             let tx = &tx;
-                            let changed = run_one_function(
+                            let outcome = run_one_function(
                                 passes,
                                 &mut e.body,
                                 view,
@@ -1911,9 +1910,8 @@ fn run_stage_parallel(
                                         pass,
                                     });
                                 },
-                            )?
-                            .changed;
-                            e.changed = changed;
+                            )?;
+                            e.outcome = outcome;
                         }
                         // Drain this thread's `stat!` counters before it exits — the
                         // thread-local table is otherwise lost — for re-absorption.
@@ -1956,33 +1954,26 @@ fn run_stage_parallel(
         entries
             .into_iter()
             .map(|e| {
-                let (effects, minted, unused) = e.body.into_parts();
-                (
-                    e.fun_id,
-                    e.before_targets,
-                    e.changed,
-                    effects,
-                    minted,
-                    unused,
-                )
+                let (minted, unused) = e.body.into_parts();
+                (e.fun_id, e.before_targets, e.outcome, minted, unused)
             })
             .collect::<Vec<_>>()
     };
 
     // 6. Barrier (master, worklist order): install minted callees before the
-    //    owner's call sites resync, rebuild `call_sites`, replay buffered effects,
-    //    and record dirtiness. The bodies were mutated in place, so there is
-    //    nothing to reinstall.
-    for (fun_id, before_targets, changed, effects, minted, unused) in results {
+    //    owner's call sites resync, rebuild `call_sites`, apply the returned
+    //    self-rename, and record dirtiness. The bodies were mutated in place, so
+    //    there is nothing to reinstall.
+    for (fun_id, before_targets, outcome, minted, unused) in results {
         let installed = install_minted(ctx, &stage.name, minted)?;
         ctx.resync_call_sites(fun_id, &before_targets);
-        replay_effects(ctx, &stage.name, fun_id, effects)?;
+        replay_rename(ctx, &stage.name, fun_id, outcome.rename)?;
         dirty.extend(installed);
         leftover.insert(fun_id, unused);
         // Opt-in `QCODE_VERIFY` check once the split borrow has ended. A no-op
         // unless enabled.
         crate::verify::verify_after(ctx, &stage.name);
-        if changed {
+        if outcome.changed {
             dirty.insert(fun_id);
         }
     }
