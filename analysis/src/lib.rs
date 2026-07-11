@@ -69,9 +69,7 @@ pub mod licm;
 pub use licm::Licm;
 
 pub mod loop_unroll;
-pub use loop_unroll::{
-    RecognizeSimpleLoops, UnrollSimpleLoops, recognize_simple_loops, unroll_simple_loops,
-};
+pub use loop_unroll::{RecognizeSimpleLoops, UnrollSimpleLoops};
 
 pub mod loop_to_recursion;
 pub use loop_to_recursion::{LoopToRecursion, loop_to_recursion};

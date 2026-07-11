@@ -97,51 +97,6 @@ impl FunctionPass for UnrollSimpleLoops {
 
 crate::register_function_pass!(UnrollSimpleLoops);
 
-/// Generic host-based version of [`recognize_simple_loops_host`], kept for the
-/// public `HostMut`-driven API (exported from `lib.rs`).
-/// TODO(5b-ii): For backwards compatibility; prefer concrete version for new code.
-pub fn recognize_simple_loops<'str, H: HostMut<'str>>(host: &mut H, fun_id: FunctionId) -> bool {
-    let Some(analysis) = LoopAnalysis::compute(host.read_host(), fun_id) else {
-        return false;
-    };
-    let block_ids = analysis.block_ids();
-    let recognized = analysis
-        .backedges
-        .iter()
-        .filter_map(|&edge| recognize_simple_loop(host.read_host(), &analysis, edge))
-        .fold(
-            HashMap::<BlockId, Vec<SimpleLoop>>::default(),
-            |mut acc, lp| {
-                acc.entry(lp.header()).or_default().push(lp);
-                acc
-            },
-        );
-
-    let updates = block_ids
-        .iter()
-        .map(|&block| {
-            let loop_comment = recognized.get(&block).and_then(|loops| {
-                (loops.len() == 1).then(|| format_loop_comment(host.read_host(), &loops[0]))
-            });
-            let current = host.block_ref(block).comment().map(str::to_owned);
-            (
-                block,
-                merge_loop_comment(current.as_deref(), loop_comment.as_deref()),
-            )
-        })
-        .collect::<Vec<_>>();
-
-    let mut changed = false;
-    for (block, comment) in updates {
-        let current = host.block_ref(block).comment().map(str::to_owned);
-        if current != comment {
-            BaseRef::new(host.reborrow_host(), block).set_comment(comment);
-            changed = true;
-        }
-    }
-    changed
-}
-
 /// Concrete `FunctionBody`/`ContextView` version of [`recognize_simple_loops`]
 /// (stage 5b).
 pub fn recognize_simple_loops_host<'a, 'str>(
@@ -190,36 +145,6 @@ pub fn recognize_simple_loops_host<'a, 'str>(
             changed = true;
         }
     }
-    changed
-}
-
-/// Generic host-based version of [`unroll_simple_loops_host`], kept for the
-/// public `HostMut`-driven API (exported from `lib.rs`).
-/// TODO(5b-ii): For backwards compatibility; prefer concrete version for new code.
-pub fn unroll_simple_loops<'str, H: HostMut<'str>>(host: &mut H, fun_id: FunctionId) -> bool {
-    let Some(analysis) = LoopAnalysis::compute(host.read_host(), fun_id) else {
-        return false;
-    };
-
-    let candidates = analysis
-        .backedges
-        .iter()
-        .filter_map(|&edge| {
-            let lp = recognize_simple_loop(host.read_host(), &analysis, edge)?;
-            (lp.iterations < MAX_UNROLL_ITERATIONS).then_some((edge, lp))
-        })
-        .collect::<Vec<_>>();
-
-    let mut changed = false;
-    for (edge, lp) in candidates {
-        let Some(plan) = UnrollPlan::build(host.read_host(), &analysis, edge, lp) else {
-            continue;
-        };
-        if apply_unroll_plan_generic(host, fun_id, plan) {
-            changed = true;
-        }
-    }
-
     changed
 }
 
@@ -432,122 +357,6 @@ fn apply_unroll_plan<'a, 'str>(
     !created_blocks.is_empty() || plan.lp.iterations == 0
 }
 
-/// Generic host-based version of [`apply_unroll_plan`], kept for the public
-/// `HostMut`-driven [`unroll_simple_loops`].
-/// TODO(5b-ii): For backwards compatibility; prefer concrete version for new code.
-fn apply_unroll_plan_generic<'str, H: HostMut<'str>>(
-    host: &mut H,
-    fun_id: FunctionId,
-    plan: UnrollPlan,
-) -> bool {
-    let mut carried = plan.preheader_args.clone();
-    let mut first_new_block = None;
-    let mut previous_new_block = None;
-    let mut created_blocks = Vec::new();
-
-    for iteration in 0..plan.lp.iterations {
-        let mut value_map = header_value_map(host.read_host(), plan.lp.header, &carried);
-
-        for (path_index, &old_block) in plan.path.iter().enumerate() {
-            let new_block = host.make_block(fun_id);
-            let _ = BaseRef::new(host.reborrow_host(), new_block).rename_local(
-                format!(
-                    "unroll_{:x}_{iteration}_{path_index}",
-                    usize::from(old_block.local)
-                )
-                .into(),
-            );
-            created_blocks.push(new_block);
-            first_new_block.get_or_insert(new_block);
-
-            if let Some(previous) = previous_new_block {
-                replace_terminator_with_branch_generic(host, previous, new_block, Vec::new());
-            }
-
-            let old_insns = host.block_ref(old_block).instruction_ids().to_vec();
-            let Some((&terminator, body_insns)) = old_insns.split_last() else {
-                return false;
-            };
-
-            for old_insn in body_insns.iter().copied() {
-                let (type_id, mnemonic) = {
-                    let old_ref = host.insn_ref(old_insn);
-                    (
-                        old_ref.type_id(),
-                        remap_mnemonic(old_ref.mnemonic(), &value_map),
-                    )
-                };
-                let new_insn = host.push_mnemonic_with_type(fun_id, mnemonic, type_id);
-                let insert_at = host.block_ref(new_block).instruction_ids().len();
-                BaseRef::new(host.reborrow_host(), new_block)
-                    .insert_insn_at_index(insert_at, new_insn);
-                value_map.insert(
-                    ValueId::Instruction(old_insn),
-                    ValueId::Instruction(new_insn),
-                );
-            }
-
-            let is_latch = path_index + 1 == plan.path.len();
-            if is_latch {
-                let Some(next_carried) = remapped_branch_args_to(
-                    host.read_host(),
-                    terminator,
-                    plan.lp.header,
-                    &value_map,
-                ) else {
-                    return false;
-                };
-                carried = next_carried;
-                previous_new_block = Some(new_block);
-            } else {
-                previous_new_block = Some(new_block);
-            }
-        }
-    }
-
-    let final_target = first_new_block.unwrap_or(plan.exit);
-    let preheader_args = if first_new_block.is_some() {
-        Vec::new()
-    } else {
-        remap_values(
-            &plan.exit_args,
-            &header_value_map(host.read_host(), plan.lp.header, &plan.preheader_args),
-        )
-    };
-    replace_terminator_with_branch_generic(host, plan.preheader, final_target, preheader_args);
-
-    if let Some(last_new_block) = previous_new_block {
-        let exit_args = remap_values(
-            &plan.exit_args,
-            &header_value_map(host.read_host(), plan.lp.header, &carried),
-        );
-        replace_terminator_with_branch_generic(host, last_new_block, plan.exit, exit_args);
-    }
-
-    // A header param may be read *directly* outside the loop: the header dominates
-    // the exit, so a live-out can use the param without an exit-block param (e.g. a
-    // returned register write-set referencing the loop counter — `fn_449740`'s
-    // `pack(ECX=@counter)`). Deleting the header would dangle such uses, so rewrite
-    // every header param to its final loop-carried value. `carried` holds, in param
-    // order, each param's value at loop exit (the last latch's args; the initial
-    // values when the loop ran zero times). Uses inside the about-to-be-deleted loop
-    // blocks are rewritten too, harmlessly.
-    let header_params: Vec<BlockParamId> = host
-        .block_ref(plan.lp.header)
-        .params()
-        .map(|param| param.id)
-        .collect();
-    for (&param, &final_value) in header_params.iter().zip(carried.iter()) {
-        host.replace_all_uses_with(ValueId::BlockParam(param), final_value);
-    }
-
-    for block in plan.loop_nodes {
-        BaseRef::new(host.reborrow_host(), block).delete(fun_id);
-    }
-
-    !created_blocks.is_empty() || plan.lp.iterations == 0
-}
-
 fn loop_preheader(
     host: HostRef,
     header: BlockId,
@@ -707,11 +516,11 @@ pub(crate) fn replace_terminator_with_branch<'a, 'str>(
     body.add_cfg_edge(cx, block, target);
 }
 
-/// Generic host-based version of [`replace_terminator_with_branch`], kept for
-/// the public `HostMut`-driven [`unroll_simple_loops`] and dce's generic twins.
-/// TODO(5b-ii): For backwards compatibility; prefer concrete version for new code.
-pub(crate) fn replace_terminator_with_branch_generic<'str, H: HostMut<'str>>(
-    host: &mut H,
+/// `&mut Context` twin of [`replace_terminator_with_branch`], kept for dce's
+/// `#[cfg(test)]` module-path twins.
+#[cfg(test)]
+pub(crate) fn replace_terminator_with_branch_generic<'str>(
+    mut host: &mut qcode::context::Context<'str>,
     block: BlockId,
     target: BlockId,
     args: Vec<ValueId>,
