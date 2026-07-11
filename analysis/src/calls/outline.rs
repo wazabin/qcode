@@ -18,7 +18,11 @@ use qcode::{
         BasicBlock, BlockId, Function, FunctionId, FunctionKind, InstructionRef, ValueId,
         block_param::BlockParam,
         insn::{Binary, Binop, Extract, InstructionId, IntBinop, Mnemonic, Range, Return},
-        util::{base_ref::BaseRef, base_ref::HostRef, host_mut::HostMut},
+        util::{
+            base_ref::BaseRef,
+            base_ref::HostRef,
+            host_mut::{CheckedOut, HostMut},
+        },
     },
 };
 
@@ -318,7 +322,7 @@ pub(crate) fn seq_result_type(host: HostRef, src: ValueId, body_ret: TypeId) -> 
 
 /// Push a fresh param typed `ty` onto `block` in the minted host (host-routed
 /// mirror of `BasicBlock::push_param` + the `type_id` write). Returns its value.
-fn push_param_into<'str, H: HostMut<'str>>(host: &mut H, block: BlockId, ty: TypeId) -> ValueId {
+fn push_param_into<'str>(host: &mut CheckedOut<'_, 'str>, block: BlockId, ty: TypeId) -> ValueId {
     let index = host.read_host().block(block).params.len();
     let pid = host.push_block_param(
         block.func,
@@ -338,8 +342,8 @@ fn push_param_into<'str, H: HostMut<'str>>(host: &mut H, block: BlockId, ty: Typ
 /// Mint an instruction with an explicit result type into the minted host and
 /// append it to `block` (host-routed mirror of `InstructionRef::from_mnemonic_with_type`
 /// + `push_insn`). Returns its value.
-fn push_insn_into<'str, H: HostMut<'str>>(
-    host: &mut H,
+fn push_insn_into<'str>(
+    host: &mut CheckedOut<'_, 'str>,
     block: BlockId,
     mnemonic: Mnemonic,
     ty: TypeId,

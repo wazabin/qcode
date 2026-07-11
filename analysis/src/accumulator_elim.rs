@@ -457,7 +457,7 @@ fn transform<'str>(
 
 /// Push a driver param typed `ty` onto `block` in the minted host, returning its
 /// value (host-routed `BasicBlock::push_param` + the `type_id` write).
-fn push_param<'str, H: HostMut<'str>>(host: &mut H, block: BlockId, ty: TypeId) -> ValueId {
+fn push_param<'str>(host: &mut CheckedOut<'_, 'str>, block: BlockId, ty: TypeId) -> ValueId {
     let index = host.block_ref(block).num_params();
     let pid = host.push_block_param(
         block.func,
@@ -475,8 +475,8 @@ fn push_param<'str, H: HostMut<'str>>(host: &mut H, block: BlockId, ty: TypeId) 
 }
 
 /// Mint an instruction with an explicit result type and append it to `block`.
-fn push_typed<'str, H: HostMut<'str>>(
-    host: &mut H,
+fn push_typed<'str>(
+    host: &mut CheckedOut<'_, 'str>,
     block: BlockId,
     mnemonic: Mnemonic,
     ty: TypeId,
@@ -570,8 +570,8 @@ fn clone_cross<'str>(
 
 /// Like [`clone_cross`] but source and target are the *same* (host) function;
 /// reads route through the host's own read view.
-fn clone_self<'str, H: HostMut<'str>>(
-    host: &mut H,
+fn clone_self<'str>(
+    host: &mut CheckedOut<'_, 'str>,
     val: ValueId,
     subst: &mut HashMap<ValueId, ValueId>,
     bindings: &HashMap<BlockParamId, ValueId>,

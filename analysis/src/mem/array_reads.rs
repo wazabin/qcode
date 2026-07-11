@@ -22,16 +22,13 @@
 //! then unconditionally sound.
 
 use qcode::{
-    builder::Builder,
+    builder::{Builder, BuilderBacking},
     space::{Space, SpaceId, SpaceType},
     types::TypeId,
     value::{
         FunctionId, ValueId,
         insn::{InstructionId, IntrinsicApp, IntrinsicId, Mnemonic},
-        util::{
-            base_ref::{BaseRef, HostRef},
-            host_mut::HostMut,
-        },
+        util::base_ref::{BaseRef, HostRef},
     },
 };
 
@@ -239,7 +236,7 @@ fn apply<'str>(body: &mut FunctionBody<'str>, cx: ContextView<'_, 'str>, m: &Rea
         // Materialize the word index (checkout-safe builder: const/add only).
         let idx = {
             let mut host = body.host(cx);
-            let mut b = Builder::from_block(BaseRef::new(host.reborrow_host(), block));
+            let mut b = Builder::from_block(BaseRef::new(host.reborrow(), block));
             b.set_insert_point_before(*load_id);
             let idx = build_index(&mut b, lane);
             unsafe { b.dont_finalize() };
@@ -269,7 +266,7 @@ fn apply<'str>(body: &mut FunctionBody<'str>, cx: ContextView<'_, 'str>, m: &Rea
 
 /// Materialize the word index of a lane load: a literal for a constant word, or
 /// `idx (+ od)` at the index's own width for a dynamic lane.
-fn build_index<'str, 'ctx, Ctx: HostMut<'str>>(
+fn build_index<'str, 'ctx, Ctx: BuilderBacking<'str>>(
     b: &mut Builder<'str, 'ctx, Ctx>,
     lane: &LaneIdx,
 ) -> ValueId {
