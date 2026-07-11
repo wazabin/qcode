@@ -216,10 +216,13 @@ impl HandleJumpTables {
             clear_successors(ctx, from);
             let from_addr = BasicBlock::from_id(ctx, from).address();
             for Edit { target, .. } in edits {
-                let tb = ctx.get_or_make_block(target, fun_id);
-                Function::from_id_mut(ctx, fun_id).add_block(tb);
-
-                ctx.add_cfg_edge(from, tb);
+                // A cross-function switch target carries no intra-function edge
+                // (strict IR locality); a mid-function landing is split off inside
+                // `resolve_local_target`. The `BranchInd` keeps its indirect form and
+                // the resolution is recorded for disassembly via `discover`.
+                if let LocalTarget::Local(tb) = resolve_local_target(ctx, target, fun_id) {
+                    ctx.add_cfg_edge(from, tb);
+                }
                 discover(ctx, fn_entry, from_addr, target);
             }
         }
@@ -228,13 +231,21 @@ impl HandleJumpTables {
         // unconditional jump. Replace `BranchInd` with a direct `Branch`.
         for MakeBranch { from, target } in single_branches {
             let from_addr = BasicBlock::from_id(ctx, from).address();
-            let target_block = ctx.get_or_make_block(target, fun_id);
-            Function::from_id_mut(ctx, fun_id).add_block(target_block);
-
+            let resolved = resolve_local_target(ctx, target, fun_id);
             clear_successors(ctx, from);
             let mut block = BasicBlock::from_id_mut(ctx, from);
             block.pop_insn();
-            Builder::from_block(block).push_branch(target_block);
+            {
+                let mut builder = Builder::from_block(block);
+                match resolved {
+                    LocalTarget::Local(target_block) => {
+                        builder.push_branch(target_block);
+                    }
+                    LocalTarget::Foreign(g) => {
+                        builder.push_tail_call(g);
+                    }
+                }
+            }
             discover(ctx, fn_entry, from_addr, target);
         }
 
@@ -247,10 +258,13 @@ impl HandleJumpTables {
         } in branches
         {
             let from_addr = BasicBlock::from_id(ctx, from).address();
-            let true_block = ctx.get_or_make_block(true_target, fun_id);
-            let false_block = ctx.get_or_make_block(false_target, fun_id);
-            Function::from_id_mut(ctx, fun_id).add_block(true_block);
-            Function::from_id_mut(ctx, fun_id).add_block(false_block);
+            // Each arm is materialized as an intra-function block: the resolved
+            // target, or a trampoline tail-calling a foreign function (strict IR
+            // locality — a `CBranch` arm is never a foreign block reference).
+            let true_target_resolved = resolve_local_target(ctx, true_target, fun_id);
+            let false_target_resolved = resolve_local_target(ctx, false_target, fun_id);
+            let true_block = arm_block(ctx, fun_id, true_target_resolved);
+            let false_block = arm_block(ctx, fun_id, false_target_resolved);
             discover(ctx, fn_entry, from_addr, true_target);
             discover(ctx, fn_entry, from_addr, false_target);
 
@@ -270,6 +284,51 @@ impl HandleJumpTables {
             qcode::stat!("jump_table_edges", 1);
         }
         Ok(changed)
+    }
+}
+
+/// The strict-local resolution of a jump-table target address (context-split
+/// ruling 2): either an intra-function block to wire an edge/branch to, or a
+/// foreign function the transfer tail-calls into. A target landing mid-another-
+/// function is split into its own function first ([`Context::split_function_at`]);
+/// a target that is (or becomes) another function's entry is foreign. No
+/// cross-function CFG edge is ever created.
+enum LocalTarget {
+    Local(BlockId),
+    Foreign(FunctionId),
+}
+
+fn resolve_local_target(ctx: &mut Context, addr: u64, fun_id: FunctionId) -> LocalTarget {
+    let tb = ctx.get_or_make_block(addr, fun_id);
+    match BasicBlock::from_id(ctx, tb).parent().map(|f| f.id) {
+        Some(owner) if owner != fun_id => {
+            let is_entry =
+                Function::from_addr(ctx, addr).and_then(|f| f.root().map(|r| r.id)) == Some(tb);
+            let g = if is_entry {
+                owner
+            } else {
+                ctx.split_function_at(tb)
+            };
+            LocalTarget::Foreign(g)
+        }
+        _ => {
+            Function::from_id_mut(ctx, fun_id).add_block(tb);
+            LocalTarget::Local(tb)
+        }
+    }
+}
+
+/// Materialize a jump-table arm as an intra-function block: the resolved target
+/// block itself, or a fresh trampoline block that tail-calls the foreign function
+/// (a `CBranch` arm must be intra-function; the tail call carries control across).
+fn arm_block(ctx: &mut Context, fun_id: FunctionId, target: LocalTarget) -> BlockId {
+    match target {
+        LocalTarget::Local(b) => b,
+        LocalTarget::Foreign(g) => {
+            let tramp = BasicBlock::make(ctx, fun_id).id;
+            Builder::from_block(BasicBlock::from_id_mut(ctx, tramp)).push_tail_call(g);
+            tramp
+        }
     }
 }
 
