@@ -23,10 +23,7 @@ use qcode::{
     value::{
         BlockId, BlockRef, FunctionId, FunctionRef, ValueId,
         insn::{Binary, Binop, Branch, CBranch, InstructionId, IntBinop, Mnemonic},
-        util::{
-            base_ref::HostRef,
-            host_mut::CheckedOut,
-        },
+        util::{base_ref::HostRef, host_mut::CheckedOut},
     },
 };
 

@@ -145,20 +145,10 @@ impl<'str> SubPassC<'str> for Identities {
             ed.replace_with_new_insn_c(body, cx, ic.block_id, ic.insn_id, new_mnemonic, ic.size);
             return Claim::Done;
         }
-        // TODO(5b-ii): `simplify_bitwise`/`simplify_compare` are shared HostMut
-        // helpers; reach them through a scoped host.
-        let bitwise = {
-            let mut host = body.host(cx);
-            simplify_bitwise(&mut host, ic, ed)
-        };
-        if bitwise {
+        if simplify_bitwise_c(body, cx, ic, ed) {
             return Claim::Done;
         }
-        let compare = {
-            let mut host = body.host(cx);
-            simplify_compare(&mut host, ic, ed)
-        };
-        if compare {
+        if simplify_compare_c(body, cx, ic, ed) {
             return Claim::Done;
         }
         Claim::Pass
@@ -598,6 +588,182 @@ fn simplify_compare<'str, H: HostMut<'str>>(host: &mut H, ic: &InsnCtx, ed: &mut
                                 let bool_ty = host.shared().shared.types.get_or_make_bool();
                                 ed.replace_with_new_insn_typed(
                                     host,
+                                    ic.block_id,
+                                    ic.insn_id,
+                                    int_binop(a, b, flipped),
+                                    bool_ty,
+                                );
+                                return true;
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            false
+        }
+        _ => false,
+    }
+}
+
+/// Concrete pass twin of [`simplify_bitwise`] over a checked-out
+/// `(&mut FunctionBody, ContextView)` (context-split stage 5b-ii Pin A): reads
+/// route through `body.read_host(cx)`, rewrites through `Editor`'s `_c` methods.
+fn simplify_bitwise_c<'str>(
+    body: &mut FunctionBody<'str>,
+    cx: ContextView<'_, 'str>,
+    ic: &InsnCtx,
+    ed: &mut Editor,
+) -> bool {
+    let &Mnemonic::Binop(Binary {
+        lhs,
+        rhs,
+        op: Binop::Int(op),
+    }) = ic.mnemonic
+    else {
+        return false;
+    };
+    let size = ic.size;
+    let all = all_ones(size);
+
+    match op {
+        IntBinop::And => {
+            for (outer, inner) in const_operands(body.read_host(cx), lhs, rhs) {
+                if outer == 1
+                    && (is_boolean(body.read_host(cx), inner)
+                        || as_zext(body.read_host(cx), inner)
+                            .is_some_and(|(src, _)| is_boolean(body.read_host(cx), src)))
+                {
+                    ed.replace_c(body, cx, ic.insn_id, inner);
+                    return true;
+                }
+                if let Some(k) = align_mask_bits(outer, size)
+                    && known_align(body.read_host(cx), inner, ALIGN_DEPTH) >= k
+                {
+                    ed.replace_c(body, cx, ic.insn_id, inner);
+                    return true;
+                }
+                if let Some((x, c1)) = binop_const(body.read_host(cx), inner, IntBinop::And) {
+                    let folded = body
+                        .read_host(cx)
+                        .shared()
+                        .get_const((c1 & outer) & all, size)
+                        .id();
+                    ed.replace_with_new_insn_c(
+                        body,
+                        cx,
+                        ic.block_id,
+                        ic.insn_id,
+                        int_binop(x, folded, IntBinop::And),
+                        size,
+                    );
+                    return true;
+                }
+            }
+            false
+        }
+        IntBinop::Xor => {
+            for (outer, inner) in const_operands(body.read_host(cx), lhs, rhs) {
+                if let Some((x, c1)) = binop_const(body.read_host(cx), inner, IntBinop::Xor) {
+                    let folded = body
+                        .read_host(cx)
+                        .shared()
+                        .get_const((c1 ^ outer) & all, size)
+                        .id();
+                    ed.replace_with_new_insn_c(
+                        body,
+                        cx,
+                        ic.block_id,
+                        ic.insn_id,
+                        int_binop(x, folded, IntBinop::Xor),
+                        size,
+                    );
+                    return true;
+                }
+                if outer != all {
+                    continue;
+                }
+                for (dual_in, dual_out) in
+                    [(IntBinop::Or, IntBinop::And), (IntBinop::And, IntBinop::Or)]
+                {
+                    let Some((a, b)) = as_int_binop(body.read_host(cx), inner, dual_in) else {
+                        continue;
+                    };
+                    let (Some(na), Some(nb)) = (
+                        simplify_not(body.read_host(cx), a, size),
+                        simplify_not(body.read_host(cx), b, size),
+                    ) else {
+                        continue;
+                    };
+                    ed.replace_with_new_insn_c(
+                        body,
+                        cx,
+                        ic.block_id,
+                        ic.insn_id,
+                        int_binop(na, nb, dual_out),
+                        size,
+                    );
+                    return true;
+                }
+            }
+            false
+        }
+        _ => false,
+    }
+}
+
+/// Concrete pass twin of [`simplify_compare`] (see [`simplify_bitwise_c`]).
+fn simplify_compare_c<'str>(
+    body: &mut FunctionBody<'str>,
+    cx: ContextView<'_, 'str>,
+    ic: &InsnCtx,
+    ed: &mut Editor,
+) -> bool {
+    match *ic.mnemonic {
+        Mnemonic::Binop(Binary {
+            lhs,
+            rhs,
+            op: Binop::Int(op),
+        }) if matches!(op, IntBinop::Equal | IntBinop::NotEqual) => {
+            for (c, other) in const_operands(body.read_host(cx), lhs, rhs) {
+                if c != 0 {
+                    continue;
+                }
+                if let Some((src, src_size)) = as_zext(body.read_host(cx), other) {
+                    let zero = body.read_host(cx).shared().get_const(0, src_size).id();
+                    let bool_ty = body.read_host(cx).shared().shared.types.get_or_make_bool();
+                    ed.replace_with_new_insn_typed_c(
+                        body,
+                        cx,
+                        ic.block_id,
+                        ic.insn_id,
+                        int_binop(src, zero, op),
+                        bool_ty,
+                    );
+                    return true;
+                }
+                if is_boolean(body.read_host(cx), other)
+                    && value_size(body.read_host(cx), other) == ic.size
+                {
+                    match op {
+                        IntBinop::NotEqual => {
+                            ed.replace_c(body, cx, ic.insn_id, other);
+                            return true;
+                        }
+                        IntBinop::Equal => {
+                            if let ValueId::Instruction(id) = other
+                                && let &Mnemonic::Binop(Binary {
+                                    lhs: a,
+                                    rhs: b,
+                                    op: Binop::Int(inner),
+                                }) = body.read_host(cx).insn_ref(id).mnemonic()
+                                && let Some(flipped) = negated_compare(inner)
+                            {
+                                let bool_ty =
+                                    body.read_host(cx).shared().shared.types.get_or_make_bool();
+                                ed.replace_with_new_insn_typed_c(
+                                    body,
+                                    cx,
                                     ic.block_id,
                                     ic.insn_id,
                                     int_binop(a, b, flipped),
