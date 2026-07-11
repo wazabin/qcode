@@ -48,7 +48,7 @@ use qcode::value::{
     FunctionId, FunctionRef, InstructionRef, Value, ValueId, ValueRef,
     block::BlockId,
     insn::{Binary, Binop, InstructionId, IntBinop, Mnemonic, Unary, Unop},
-    util::{base_ref::HostRef, host_mut::HostMut},
+    util::{base_ref::HostRef, host_mut::CheckedOut},
 };
 
 use rumba_core::{
@@ -94,7 +94,7 @@ fn users_of<'a>(host: HostRef<'a, '_>, v: ValueId) -> &'a [InstructionId] {
 /// Maximum width rumba can model. Wider roots are skipped.
 const MAX_WIDTH_BYTES: usize = 8;
 
-pub fn mba_simplify<'str, H: HostMut<'str>>(host: &mut H, fun: FunctionId) -> bool {
+pub fn mba_simplify<'str>(host: &mut CheckedOut<'_, 'str>, fun: FunctionId) -> bool {
     let roots: Vec<InstructionId> = FunctionRef::new(host.read_host(), fun)
         .blocks()
         .flat_map(|b| b.instruction_ids().to_vec())
@@ -127,7 +127,7 @@ fn is_root(host: HostRef, iid: InstructionId) -> bool {
     true
 }
 
-fn try_simplify_root<'str, H: HostMut<'str>>(host: &mut H, root: InstructionId) -> bool {
+fn try_simplify_root<'str>(host: &mut CheckedOut<'_, 'str>, root: InstructionId) -> bool {
     let size = insn_size(host.read_host(), root);
     if size == 0 || size > MAX_WIDTH_BYTES {
         return false;
@@ -419,8 +419,8 @@ fn cost(e: &Expr, mask: u64) -> usize {
 // --- rumba Expr -> qcode subgraph ------------------------------------------
 
 #[allow(clippy::too_many_arguments)]
-fn emit<'str, H: HostMut<'str>>(
-    host: &mut H,
+fn emit<'str>(
+    host: &mut CheckedOut<'_, 'str>,
     e: &Expr,
     leaves: &[ValueId],
     size: usize,
@@ -465,8 +465,8 @@ fn emit<'str, H: HostMut<'str>>(
 }
 
 #[allow(clippy::too_many_arguments)]
-fn fold_emit<'str, H: HostMut<'str>>(
-    host: &mut H,
+fn fold_emit<'str>(
+    host: &mut CheckedOut<'_, 'str>,
     operands: &[Expr],
     op: IntBinop,
     leaves: &[ValueId],
@@ -492,8 +492,8 @@ fn fold_emit<'str, H: HostMut<'str>>(
     acc
 }
 
-fn push_binop<'str, H: HostMut<'str>>(
-    host: &mut H,
+fn push_binop<'str>(
+    host: &mut CheckedOut<'_, 'str>,
     op: IntBinop,
     lhs: ValueId,
     rhs: ValueId,
@@ -514,8 +514,8 @@ fn push_binop<'str, H: HostMut<'str>>(
     )
 }
 
-fn push_insn<'str, H: HostMut<'str>>(
-    host: &mut H,
+fn push_insn<'str>(
+    host: &mut CheckedOut<'_, 'str>,
     mnemonic: Mnemonic,
     size: usize,
     before: InstructionId,
@@ -527,7 +527,7 @@ fn push_insn<'str, H: HostMut<'str>>(
 }
 
 /// Remove `iid` and any operand subtree that becomes userless once it is gone.
-fn prune_dead<'str, H: HostMut<'str>>(host: &mut H, iid: InstructionId) {
+fn prune_dead<'str>(host: &mut CheckedOut<'_, 'str>, iid: InstructionId) {
     if !users_of(host.read_host(), ValueId::Instruction(iid)).is_empty() {
         return;
     }
@@ -641,6 +641,18 @@ mod tests {
     use qcode_emulator::{SizedValue, StandaloneEmulator};
     use qcode_macro::qcode;
 
+    /// Run [`mba_simplify`] on `fid` through a checkout — the pass surface is
+    /// checked-out only — leaving the rewritten body back in `ctx`.
+    fn run_mba(ctx: &mut Context, fid: FunctionId) -> bool {
+        let mut fun = ctx.checkout_function(fid);
+        let changed = {
+            let mut host = CheckedOut::new(&mut fun, fid, ctx);
+            mba_simplify(&mut host, fid)
+        };
+        ctx.checkin_function(fid, fun);
+        changed
+    }
+
     fn return_value(ctx: &Context, fun: FunctionId) -> ValueId {
         let root = Function::from_id(ctx, fun).root().expect("root").id;
         let &term = BasicBlock::from_id(ctx, root)
@@ -745,7 +757,7 @@ mod tests {
         let before = sample(&ctx, r1);
         let n_before = insn_total(&ctx, r1);
 
-        assert!(mba_simplify(&mut &mut ctx, r1));
+        assert!(run_mba(&mut ctx, r1));
 
         // Return is now a single `~a`.
         let ret = return_value(&ctx, r1);
@@ -787,7 +799,7 @@ mod tests {
         let before = sample(&ctx, r2);
         let n_before = insn_total(&ctx, r2);
 
-        assert!(mba_simplify(&mut &mut ctx, r2));
+        assert!(run_mba(&mut ctx, r2));
 
         let ret = return_value(&ctx, r2);
         let ValueId::Instruction(iid) = ret else {
@@ -828,7 +840,7 @@ mod tests {
             "
         );
         let before = sample(&ctx, r2k);
-        assert!(mba_simplify(&mut &mut ctx, r2k));
+        assert!(run_mba(&mut ctx, r2k));
         assert_eq!(sample(&ctx, r2k), before);
         // a * K at 32 bits.
         let k = 0x6c07_8965u64;
@@ -847,7 +859,7 @@ mod tests {
                 return %r;
             "
         );
-        assert!(!mba_simplify(&mut &mut ctx, single));
+        assert!(!run_mba(&mut ctx, single));
     }
 
     #[test]
@@ -864,7 +876,7 @@ mod tests {
                 return %r;
             "
         );
-        assert!(!mba_simplify(&mut &mut ctx, arith));
+        assert!(!run_mba(&mut ctx, arith));
     }
 
     #[test]
@@ -882,6 +894,6 @@ mod tests {
                 return %r;
             "
         );
-        assert!(!mba_simplify(&mut &mut ctx, bits));
+        assert!(!run_mba(&mut ctx, bits));
     }
 }

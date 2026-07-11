@@ -611,7 +611,17 @@ mod tests {
         // And/Or results and hide the boolean half of the MBA.
         let root = Function::from_id(&ctx, mtmul).root().expect("root").id;
         while crate::dce::remove_dead_insns(&mut ctx, root) {}
-        assert!(mba_simplify(&mut &mut ctx, mtmul));
+        // mba_simplify's surface is checked-out only; run it through a checkout.
+        let mba_changed = {
+            let mut fun = ctx.checkout_function(mtmul);
+            let c = {
+                let mut host = qcode::value::util::host_mut::CheckedOut::new(&mut fun, mtmul, &ctx);
+                mba_simplify(&mut host, mtmul)
+            };
+            ctx.checkin_function(mtmul, fun);
+            c
+        };
+        assert!(mba_changed);
 
         assert_eq!(sample(&ctx, mtmul), before);
         let k = 0x6c07_8965u64;
