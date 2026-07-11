@@ -1503,6 +1503,148 @@ impl<'str> Context<'str> {
         self.block_mut(block).instructions.insert(index, insn);
     }
 
+    /// Mint a fresh empty block into `func`'s arena, parented and rostered.
+    /// Mirrors [`HostMut::make_block`](crate::value::util::host_mut::HostMut::make_block).
+    pub fn make_block(&mut self, func: FunctionId) -> BlockId {
+        self.push_block(func, BasicBlock::detached(func))
+    }
+
+    /// Rehome `remove`'s outgoing CFG edges onto `keep` and drop the direct edge.
+    /// Mirrors [`HostMut::merge_nodes`](crate::value::util::host_mut::HostMut::merge_nodes).
+    pub fn merge_nodes(&mut self, keep: BlockId, remove: BlockId, direct_edge: EdgeId) {
+        let func = keep.func;
+        self.block_mut(keep).edges.remove(&(func, direct_edge));
+        self.block_mut(remove).edges.remove(&(func, direct_edge));
+        let outgoing: Vec<EdgeId> = {
+            let host = self.read_host();
+            host.block(remove)
+                .edges
+                .iter()
+                .copied()
+                .filter(|&(f, e)| host.edge(f, e).from == remove)
+                .map(|(_, e)| e)
+                .collect()
+        };
+        for eid in outgoing {
+            self.function_mut(func).edges[eid].from = keep;
+            self.block_mut(keep).edges.insert((func, eid));
+            self.block_mut(remove).edges.remove(&(func, eid));
+        }
+    }
+
+    /// Remove `block` from its function (unlink edges, remove instructions,
+    /// detach params, tombstone). Mirrors
+    /// [`HostMut::delete_block`](crate::value::util::host_mut::HostMut::delete_block).
+    pub fn delete_block(&mut self, block: BlockId, _function_id: FunctionId) {
+        let edges: Vec<(FunctionId, EdgeId)> = self
+            .read_host()
+            .block(block)
+            .edges
+            .iter()
+            .copied()
+            .collect();
+        for (func, edge) in edges {
+            self.remove_cfg_edge(func, edge);
+        }
+        let insns: Vec<InstructionId> = self.read_host().block(block).instructions.clone();
+        for insn in insns {
+            self.remove_instruction(insn);
+        }
+        let params: Vec<BlockParamId> = self.read_host().block(block).params.clone();
+        for param in params {
+            self.function_mut(param.func)
+                .users
+                .remove(&ValueId::BlockParam(param));
+            self.block_param_mut(param).parent = None;
+        }
+        self.unroster_block(block);
+        let b = self.block_mut(block);
+        b.parent = None;
+        b.deleted = true;
+    }
+
+    /// Absorb `other` into `keep`. Mirrors
+    /// [`HostMut::absorb_block`](crate::value::util::host_mut::HostMut::absorb_block).
+    pub fn absorb_block(
+        &mut self,
+        keep: BlockId,
+        other: BlockId,
+        edge_ab: EdgeId,
+        _function_id: FunctionId,
+    ) {
+        let branch_args = {
+            let host = self.read_host();
+            host.block(keep)
+                .instructions
+                .last()
+                .and_then(|&id| match host.instruction(id).mnemonic() {
+                    Mnemonic::Branch(branch) if branch.target == other => Some(branch.args.clone()),
+                    _ => None,
+                })
+                .unwrap_or_default()
+        };
+        let other_params = self.read_host().block(other).params.clone();
+        if !other_params.is_empty() {
+            assert_eq!(
+                other_params.len(),
+                branch_args.len(),
+                "cannot absorb block with {} params through branch with {} args",
+                other_params.len(),
+                branch_args.len()
+            );
+            for (param, arg) in other_params.into_iter().zip(branch_args) {
+                self.replace_all_uses_with(ValueId::BlockParam(param), arg);
+            }
+        }
+        self.block_mut(keep).instructions.pop();
+        let b_insns = std::mem::take(&mut self.block_mut(other).instructions);
+        for &insn_id in &b_insns {
+            self.instruction_mut(insn_id).parent = Some(keep);
+        }
+        self.block_mut(keep).instructions.extend(b_insns);
+        self.merge_nodes(keep, other, edge_ab);
+        let (b_addr, b_extra) = {
+            let b = self.read_host().block(other);
+            (b.address, b.extra_addresses.clone())
+        };
+        self.unroster_block(other);
+        {
+            let ob = self.block_mut(other);
+            ob.parent = None;
+            ob.deleted = true;
+        }
+        if let Some(addr) = b_addr {
+            self.block_mut(keep).extra_addresses.push(addr);
+        }
+        self.block_mut(keep).extra_addresses.extend(b_extra);
+    }
+
+    /// Register `name` for `id` in the table that owns its kind (function-local
+    /// for block/insn/param, global otherwise). Mirrors
+    /// [`HostMut::register_local_name`](crate::value::util::host_mut::HostMut::register_local_name).
+    pub fn register_local_name(
+        &mut self,
+        id: ValueId,
+        name: Cow<'str, str>,
+        old_name: Option<&str>,
+    ) -> Result<()> {
+        let existing = match id.name_scope_function() {
+            Some(func) => self.function(func).names.get(&name),
+            None => self.get_named(&name),
+        };
+        if let Some(existing) = existing {
+            return if existing == id {
+                Ok(())
+            } else {
+                Err(Error::spanless(ErrorTy::DuplicateName(name.to_string())))
+            };
+        }
+        match id.name_scope_function() {
+            Some(func) => self.function_mut(func).names.register(name, id, old_name),
+            None => self.update_name(name, id, old_name),
+        }
+    }
+
     /// Associates `addr` with `id` in the address map.
     ///
     /// Returns `Err(Error::DuplicateAddress(addr))` if the address is already

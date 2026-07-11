@@ -234,14 +234,14 @@ where
     }
 }
 
-// Own-instruction mutations written once against any [`HostMut`], so a
+// Own-instruction mutations, emitted for each concrete mutation backing —
+// `&mut Context` (module) and `CheckedOut` (checked-out function pass) — so a
 // `FunctionPass` can retype and rename the instructions it owns whether the
 // function lives in the module registry or has been checked out. Mirror the
 // `&mut Context`-only [`InstructionMutRef::set_type`] / `Renameable` impls.
-impl<'str, Ctx> BaseRef<Ctx, InstructionId>
-where
-    Ctx: crate::value::util::host_mut::HostMut<'str>,
-{
+macro_rules! impl_insn_mut_verbs {
+    (<$($l:lifetime),*> $ctx:ty) => {
+        impl<$($l),*> BaseRef<$ctx, InstructionId> {
     /// Sets this instruction's result type (own-instruction edit, host-routed).
     /// Panics on an incompatible same-nonzero-size change, exactly like
     /// [`InstructionMutRef::set_type`].
@@ -274,7 +274,12 @@ where
         self.ctx.instruction_mut(self.id).name = Some(name);
         Ok(())
     }
+        }
+    };
 }
+
+impl_insn_mut_verbs!(<'c, 'str> &'c mut Context<'str>);
+impl_insn_mut_verbs!(<'a, 'str> crate::value::util::host_mut::CheckedOut<'a, 'str>);
 
 pub type InstructionRef<'str, 'ctx> = BaseRef<HostRef<'ctx, 'str>, InstructionId>;
 

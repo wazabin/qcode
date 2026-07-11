@@ -8,7 +8,7 @@ use crate::{
         insn::{InstructionId, InstructionRef},
         util::{
             base_ref::{BaseRef, HostRef, WithCtx, WithCtxMut, WithHost},
-            host_mut::{CheckedOut, HostMut},
+            host_mut::CheckedOut,
             named::{Named, Renameable, update_context_name},
         },
     },
@@ -533,12 +533,20 @@ impl<'s, 'ctx: 's, 'str: 'ctx> WithCtxMut<'s, 'str> for BlockMutRef<'str, 'ctx> 
     }
 }
 
-// Read access over any mutation host (covers `BlockMutRef` over `&mut Context` and
-// the checked-out block mut ref): shared reads via the host's shared context, the
-// read view via its `HostRef` so the arena cluster's read methods route correctly.
-impl<'s, 'str, Ctx> WithCtx<'s, 's, 'str> for BaseRef<Ctx, BlockId>
+// Read access over a mutation host: shared reads via the host's shared context,
+// the read view via its `HostRef`. Two concrete backings — `&mut Context`
+// (module) and `CheckedOut` (checked-out function pass) — each routing through
+// the backing's inherent `shared`/`read_host`.
+impl<'s, 'str> WithCtx<'s, 's, 'str> for BaseRef<&mut Context<'str>, BlockId>
 where
-    Ctx: HostMut<'str>,
+    'str: 's,
+{
+    fn ctx(&'s self) -> &'s Context<'str> {
+        self.ctx.shared()
+    }
+}
+impl<'s, 'a, 'str> WithCtx<'s, 's, 'str> for BaseRef<CheckedOut<'a, 'str>, BlockId>
+where
     'str: 's,
 {
     fn ctx(&'s self) -> &'s Context<'str> {
@@ -546,9 +554,16 @@ where
     }
 }
 
-impl<'s, 'str, Ctx> WithHost<'s, 's, 'str> for BaseRef<Ctx, BlockId>
+impl<'s, 'str> WithHost<'s, 's, 'str> for BaseRef<&mut Context<'str>, BlockId>
 where
-    Ctx: HostMut<'str>,
+    'str: 's,
+{
+    fn host(&'s self) -> HostRef<'s, 'str> {
+        self.ctx.read_host()
+    }
+}
+impl<'s, 'a, 'str> WithHost<'s, 's, 'str> for BaseRef<CheckedOut<'a, 'str>, BlockId>
+where
     'str: 's,
 {
     fn host(&'s self) -> HostRef<'s, 'str> {
@@ -595,12 +610,13 @@ impl<'a, 'str> Renameable<'str, 'a> for BaseRef<CheckedOut<'a, 'str>, BlockId> {
     }
 }
 
-// Comment editing has no borrowed-lifetime subtlety, so it is written once over
-// any mutation host.
-impl<'str, Ctx> BaseRef<Ctx, BlockId>
-where
-    Ctx: HostMut<'str>,
-{
+// The own-block mutation verbs, emitted for each concrete mutation backing —
+// `&mut Context` (module) and `CheckedOut` (checked-out function pass). Both
+// bodies are identical (they call the backing's inherent verbs); the macro keeps
+// the pair in lockstep without a `HostMut` bound.
+macro_rules! impl_block_mut_verbs {
+    (<$($l:lifetime),*> $ctx:ty) => {
+        impl<$($l),*> BaseRef<$ctx, BlockId> {
     /// Sets (or clears) this block's comment. Own-block edit, host-routed.
     pub fn set_comment(&mut self, comment: Option<String>) {
         self.ctx.block_mut(self.id).comment = comment;
@@ -667,7 +683,12 @@ where
         let id = self.id;
         self.ctx.absorb_block(id, other, edge_ab, function_id);
     }
+        }
+    };
 }
+
+impl_block_mut_verbs!(<'c, 'str> &'c mut Context<'str>);
+impl_block_mut_verbs!(<'a, 'str> CheckedOut<'a, 'str>);
 
 impl Display for BlockMutRef<'_, '_> {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {

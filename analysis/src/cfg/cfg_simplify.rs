@@ -112,7 +112,7 @@ pub fn simplify_cfg<'str>(host: &mut Context<'str>, function_id: FunctionId) -> 
 
 /// Generic wrapper for [`prune_unreachable`]; see that function.
 #[allow(dead_code)]
-fn prune_unreachable_generic<'str>(mut host: &mut Context<'str>, function_id: FunctionId) -> bool {
+fn prune_unreachable_generic<'str>(host: &mut Context<'str>, function_id: FunctionId) -> bool {
     let Some(root) = host.function_ref(function_id).root().map(|b| b.id) else {
         return false;
     };
@@ -200,7 +200,7 @@ fn merge_candidate_generic<'str>(
 /// Generic wrapper for [`try_merge_block`]; see that function.
 #[allow(dead_code)]
 fn try_merge_block_generic<'str>(
-    mut host: &mut Context<'str>,
+    host: &mut Context<'str>,
     function_id: FunctionId,
     a_id: BlockId,
 ) -> bool {
@@ -257,7 +257,7 @@ fn try_fold_cbranch_generic<'str>(host: &mut Context<'str>, block_id: BlockId) -
 /// Generic wrapper for [`try_bypass_empty_block`]; see that function.
 #[allow(dead_code)]
 fn try_bypass_empty_block_generic<'str>(
-    mut host: &mut Context<'str>,
+    host: &mut Context<'str>,
     function_id: FunctionId,
     b_id: BlockId,
 ) -> bool {

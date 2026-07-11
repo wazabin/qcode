@@ -7,7 +7,7 @@ use crate::{
         block::{BlockId, BlockRef},
         util::{
             base_ref::{BaseRef, HostRef, WithCtx, WithCtxMut, WithHost},
-            host_mut::HostMut,
+            host_mut::CheckedOut,
             named::{Named, Renameable, update_context_name},
         },
     },
@@ -241,14 +241,13 @@ impl<'str, 'ctx> BlockParamMutRef<'str, 'ctx> {
     }
 }
 
-// Resizing a block parameter is the same over any mutation host (mint an int type
-// in shared storage, retype the param in its owning function's arena), so it is
-// written once against `HostMut` — covering `BlockParamMutRef` and the checked-out
-// mut ref.
-impl<'str, Ctx> BaseRef<Ctx, BlockParamId>
-where
-    Ctx: HostMut<'str>,
-{
+// Resizing a block parameter is the same over each concrete mutation backing
+// (mint an int type in shared storage, retype the param in its owning function's
+// arena), so it is emitted for `&mut Context` (module) and `CheckedOut`
+// (checked-out function pass) by the macro below.
+macro_rules! impl_param_mut_verbs {
+    (<$($l:lifetime),*> $ctx:ty) => {
+        impl<$($l),*> BaseRef<$ctx, BlockParamId> {
     pub fn set_size(&mut self, size: usize) {
         let type_id = self.ctx.shared().shared.types.get_or_make_int(size);
         self.ctx.block_param_mut(self.id).type_id = type_id;
@@ -270,7 +269,12 @@ where
         self.ctx.block_param_mut(self.id).name = Some(name);
         Ok(())
     }
+        }
+    };
 }
+
+impl_param_mut_verbs!(<'c, 'str> &'c mut Context<'str>);
+impl_param_mut_verbs!(<'a, 'str> CheckedOut<'a, 'str>);
 
 impl<'s, 'ctx: 's, 'str: 'ctx> WithCtx<'s, 's, 'str> for BlockParamMutRef<'str, 'ctx> {
     fn ctx(&'s self) -> &'s Context<'str> {
