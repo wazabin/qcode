@@ -45,7 +45,7 @@ impl FunctionPass for StructTyping {
 
     fn run<'str>(
         &self,
-        f: &mut FunctionBody<'str>,
+        f: &mut FunctionBody<'_, 'str>,
         cx: ContextView<'_, 'str>,
     ) -> Result<bool, String> {
         let fid = f.id();
@@ -56,7 +56,7 @@ impl FunctionPass for StructTyping {
 /// Recover struct-field accesses in `fun_id`, mutating the function through
 /// concrete `(body, cx)` (see the module docs). Returns `true` if the IR changed.
 pub fn struct_typing<'a, 'str>(
-    body: &'a mut FunctionBody<'str>,
+    body: &'a mut FunctionBody<'_, 'str>,
     cx: ContextView<'a, 'str>,
     fun_id: FunctionId,
 ) -> bool {
@@ -114,7 +114,7 @@ fn stored_type_of<'str>(host: HostRef<'_, 'str>, id: ValueId) -> Option<TypeId> 
 /// reference (e.g. a `PEB*` value becomes `%peb`), keeping names unique within
 /// the function. Returns `true` if any value was renamed.
 fn rename_struct_values<'a, 'str>(
-    body: &'a mut FunctionBody<'str>,
+    body: &'a mut FunctionBody<'_, 'str>,
     cx: ContextView<'a, 'str>,
     fun_id: FunctionId,
 ) -> bool {
@@ -212,7 +212,7 @@ fn function_has_struct_types(host: HostRef, fun_id: FunctionId) -> bool {
 /// Attempts one typing step on instruction `id`. Returns `true` if it changed
 /// the IR (rewrote an add to a gep, or retyped a load result).
 fn type_instruction<'a, 'str>(
-    body: &'a mut FunctionBody<'str>,
+    body: &'a mut FunctionBody<'_, 'str>,
     cx: ContextView<'a, 'str>,
     id: InstructionId,
 ) -> bool {
@@ -243,7 +243,7 @@ fn is_register_space(host: HostRef, space: SpaceId) -> bool {
 /// seed overrode `FS_OFFSET` to `PtrTo<TEB>`; plain integer registers are left
 /// untouched. Exact-size match only.
 fn try_type_register_read<'a, 'str>(
-    body: &'a mut FunctionBody<'str>,
+    body: &'a mut FunctionBody<'_, 'str>,
     cx: ContextView<'a, 'str>,
     id: InstructionId,
     reg: ValueId,
@@ -269,7 +269,7 @@ fn try_type_register_read<'a, 'str>(
 /// `int_add(base, const)` with `base : PtrTo<S>` and `const` an exact field
 /// offset of `S` → `gep(base, off)` typed `PtrTo<field.type>`.
 fn try_add_to_gep<'a, 'str>(
-    body: &'a mut FunctionBody<'str>,
+    body: &'a mut FunctionBody<'_, 'str>,
     cx: ContextView<'a, 'str>,
     id: InstructionId,
     lhs: ValueId,
@@ -301,7 +301,7 @@ fn try_add_to_gep<'a, 'str>(
 /// `load(ptr)` with `ptr : PtrTo<F>` and `load.size == size_of(F)` → result
 /// retyped to `F`. Exact-size match only; otherwise left as an integer read.
 fn try_type_load<'a, 'str>(
-    body: &'a mut FunctionBody<'str>,
+    body: &'a mut FunctionBody<'_, 'str>,
     cx: ContextView<'a, 'str>,
     id: InstructionId,
     ptr: ValueId,

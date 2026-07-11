@@ -45,20 +45,19 @@ pub(crate) fn with_minting<'str, R>(
     fun: FunctionId,
     f: impl for<'a> FnOnce(
         crate::pipeline::ContextView<'a, 'str>,
-        &mut crate::pipeline::FunctionBody<'str>,
+        &mut crate::pipeline::FunctionBody<'_, 'str>,
     ) -> R,
 ) -> R {
-    use crate::pipeline::{ContextView, FunctionBody};
+    use crate::pipeline::{ContextSplit, FunctionBody};
     let reserved: Vec<FunctionId> = (0..2).map(|_| ctx.push_sentinel_function()).collect();
     let env = dummy_env();
-    let fun_value = ctx.checkout_function(fun);
-    let mut body = FunctionBody::new(fun, fun_value, reserved);
-    let out = {
-        let view = ContextView::new(ctx, &env);
-        f(view, &mut body)
+    let (out, minted) = {
+        let (bodies, view) = ctx.split(&env);
+        let mut body = FunctionBody::new(fun, &mut bodies[fun], reserved);
+        let out = f(view, &mut body);
+        let (_effects, minted, _unused) = body.into_parts();
+        (out, minted)
     };
-    let (fun_value, _effects, minted, _unused) = body.into_parts();
     crate::pipeline::install_minted_for_test(ctx, minted);
-    ctx.checkin_function(fun, fun_value);
     out
 }

@@ -98,7 +98,7 @@ pub(crate) fn pure_slice<'a, 'str: 'a>(
 /// [`pure_slice`]) — the caller then leaves the loop unrecognized.
 pub(crate) fn outline_expression<'str>(
     m: ContextView<'_, 'str>,
-    body: &mut FunctionBody<'str>,
+    body: &mut FunctionBody<'_, 'str>,
     name: &str,
     result: ValueId,
     inputs: &[ValueId],
@@ -131,7 +131,7 @@ pub(crate) fn outline_expression<'str>(
 /// (see [`pure_slice`]).
 pub(crate) fn outline_tupled<'str>(
     m: ContextView<'_, 'str>,
-    body: &mut FunctionBody<'str>,
+    body: &mut FunctionBody<'_, 'str>,
     name: &str,
     result: ValueId,
     index_input: ValueId,
@@ -199,7 +199,7 @@ pub(crate) enum ScanElem {
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn outline_scan_body<'str>(
     m: ContextView<'_, 'str>,
-    body: &mut FunctionBody<'str>,
+    body: &mut FunctionBody<'_, 'str>,
     name: &str,
     result: ValueId,
     acc_input: ValueId,
@@ -351,7 +351,7 @@ fn push_insn_into<'str>(
 /// exhausted (the caller then leaves the loop unrecognized).
 fn outline_core<'str>(
     m: ContextView<'_, 'str>,
-    body: &mut FunctionBody<'str>,
+    body: &mut FunctionBody<'_, 'str>,
     name: &str,
     result: ValueId,
     slice: &[InstructionId],

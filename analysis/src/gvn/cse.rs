@@ -53,7 +53,7 @@ impl<'str> SubPassC<'str> for Cse {
 
     fn on_block_entry(
         &self,
-        _body: &mut FunctionBody<'str>,
+        _body: &mut FunctionBody<'_, 'str>,
         _cx: ContextView<'_, 'str>,
         state: &mut dyn Any,
         _block_id: qcode::value::block::BlockId,
@@ -70,7 +70,7 @@ impl<'str> SubPassC<'str> for Cse {
 
     fn on_insn(
         &self,
-        body: &mut FunctionBody<'str>,
+        body: &mut FunctionBody<'_, 'str>,
         cx: ContextView<'_, 'str>,
         state: &mut dyn Any,
         ic: &InsnCtx,

@@ -216,7 +216,7 @@ impl MemForward {
     /// Concrete pass twin of [`record_store`](Self::record_store).
     pub(super) fn record_store_c<'str>(
         &mut self,
-        body: &mut FunctionBody<'str>,
+        body: &mut FunctionBody<'_, 'str>,
         cx: ContextView<'_, 'str>,
         store: &Store,
         aliases: Option<&AliasResult>,
@@ -262,7 +262,7 @@ impl MemForward {
     #[allow(clippy::too_many_arguments)]
     pub(super) fn try_load_c<'str>(
         &mut self,
-        body: &mut FunctionBody<'str>,
+        body: &mut FunctionBody<'_, 'str>,
         cx: ContextView<'_, 'str>,
         block_id: BlockId,
         insn_id: qcode::value::InstructionId,
@@ -293,7 +293,7 @@ impl MemForward {
     /// Concrete pass twin of [`rebuild`](Self::rebuild).
     fn rebuild_c<'str>(
         &self,
-        body: &mut FunctionBody<'str>,
+        body: &mut FunctionBody<'_, 'str>,
         cx: ContextView<'_, 'str>,
         block_id: BlockId,
         insn_id: qcode::value::InstructionId,
@@ -326,7 +326,7 @@ impl MemForward {
     /// Concrete pass twin of [`rebuild_bytes`](Self::rebuild_bytes).
     fn rebuild_bytes_c<'str>(
         &self,
-        body: &mut FunctionBody<'str>,
+        body: &mut FunctionBody<'_, 'str>,
         cx: ContextView<'_, 'str>,
         segments: &[Segment],
         load_size: usize,
@@ -359,7 +359,7 @@ impl MemForward {
     /// Concrete pass twin of [`build_piece`](Self::build_piece).
     fn build_piece_c<'str>(
         &self,
-        body: &mut FunctionBody<'str>,
+        body: &mut FunctionBody<'_, 'str>,
         cx: ContextView<'_, 'str>,
         block_id: BlockId,
         insn_id: qcode::value::InstructionId,
@@ -783,18 +783,16 @@ mod tests {
     fn with_body<R>(
         tc: &mut TestContext,
         fid: qcode::value::FunctionId,
-        f: impl FnOnce(&mut FunctionBody<'static>, ContextView<'_, 'static>) -> R,
+        f: impl FnOnce(&mut FunctionBody<'_, 'static>, ContextView<'_, 'static>) -> R,
     ) -> R {
+        use crate::pipeline::ContextSplit;
         let env = crate::test_util::dummy_env();
         let before = tc.ctx.direct_call_targets(fid);
-        let fun = tc.ctx.checkout_function(fid);
-        let mut body = FunctionBody::new(fid, fun, Vec::new());
         let out = {
-            let view = ContextView::new(&tc.ctx, &env);
+            let (bodies, view) = tc.ctx.split(&env);
+            let mut body = FunctionBody::new(fid, &mut bodies[fid], Vec::new());
             f(&mut body, view)
         };
-        let (fun, _, _, _) = body.into_parts();
-        tc.ctx.checkin_function(fid, fun);
         tc.ctx.resync_call_sites(fid, &before);
         out
     }

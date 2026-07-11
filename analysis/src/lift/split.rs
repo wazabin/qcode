@@ -897,10 +897,9 @@ mod tests {
             "relocated body must still end in a return, got {last:?}",
         );
 
-        // (c) F is now checkout-safe: `PassBacking::new`'s debug-assert holds.
-        let mut fun = ctx.checkout_function(f);
-        let _co = PassBacking::from_ctx(&mut fun, f, &ctx);
+        // (c) F is now self-stored: `PassBacking::new`'s debug-assert holds when
+        // the body is borrowed in place.
+        let _co = PassBacking::new(&mut ctx.bodies[f], f, &ctx.shared, &ctx.interfaces);
         drop(_co);
-        ctx.checkin_function(f, fun);
     }
 }

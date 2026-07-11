@@ -204,7 +204,11 @@ fn try_match(host: HostRef, fid: FunctionId) -> Option<ScanMatch> {
 /// Rewrite a matched fill loop: outline the `(acc, index)` body and replace the
 /// wide exit store with `store(ram, base <- concat(singleton(seed), scanl @body
 /// seed iota(N-1)))`. The residual loop is left for `dce`.
-fn apply<'str>(mv: ContextView<'_, 'str>, body: &mut FunctionBody<'str>, m: &ScanMatch) -> bool {
+fn apply<'str>(
+    mv: ContextView<'_, 'str>,
+    body: &mut FunctionBody<'_, 'str>,
+    m: &ScanMatch,
+) -> bool {
     let fid = body.id();
     let (index_ty, i64_ty, name) = {
         let host = body.read_host(mv);
@@ -434,7 +438,7 @@ impl FunctionPass for LoopToScan {
 
     fn run<'str>(
         &self,
-        f: &mut FunctionBody<'str>,
+        f: &mut FunctionBody<'_, 'str>,
         m: ContextView<'_, 'str>,
     ) -> Result<bool, String> {
         if let Some(sm) = try_match(f.read_host(m), f.id()) {

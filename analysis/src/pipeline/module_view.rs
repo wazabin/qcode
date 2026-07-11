@@ -3,15 +3,18 @@
 //!
 //! A function pass reads the module's *published interface* through a shared
 //! [`ContextView`] and mutates *only its own function* through a `&mut`
-//! [`FunctionBody`]. The one effect on global state a pass legitimately needs (a
-//! self-rename) is **buffered** in [`Effects`] and drained by the driver at
-//! check-in, so the pass itself touches no global mutable state — which is what
-//! lets workers run in parallel with the `ContextView` `&`-shared and the bodies
-//! disjoint `&mut`.
+//! [`FunctionBody`] — the body borrowed `&mut` in place from the bodies registry
+//! by the driver's [`split`](ContextSplit::split). The one effect on global state
+//! a pass legitimately needs (a self-rename) is **buffered** in [`Effects`] and
+//! drained by the driver at the post-run barrier, so the pass itself touches no
+//! global mutable state — which is what lets workers run in parallel with the
+//! `ContextView` `&`-shared and the bodies disjoint `&mut`.
 //!
-//! In Stage 5 the driver drives this sequentially (checkout → run → check-in for
-//! one function at a time); Stage 6 runs the checkouts on `std::thread::scope`
-//! workers. The types are identical either way.
+//! The driver `split`s the context once, borrows every worklist body disjointly
+//! (worklist order) via [`select_mut`](jstd::registry::Registry::select_mut), runs
+//! each function's pass fixpoint — sequentially or on `std::thread::scope` workers
+//! — then drops the split borrow and does the barrier work in worklist order. The
+//! types are identical either way.
 
 use std::borrow::Cow;
 
@@ -147,18 +150,22 @@ impl<'str> ContextSplit<'str> for Context<'str> {
     }
 }
 
-/// The pass's own function, checked out of the module so the pass owns it
-/// exclusively, plus the [`Effects`] buffer and the function-minting pool.
+/// The pass's own function, borrowed `&mut` in place from the bodies registry so
+/// the pass owns it exclusively, plus the [`Effects`] buffer and the
+/// function-minting pool.
 ///
-/// The function is moved out of the registry at checkout and reinstalled at
-/// check-in; this exclusive ownership is what lets parallel workers hold disjoint
-/// `&mut FunctionBody`s.
-pub struct FunctionBody<'str> {
-    /// This function's id (the registry key; a checked-out [`Function`] does not
-    /// store its own id).
+/// The body is borrowed by the driver's [`split`](ContextSplit::split) and never
+/// leaves the registry; the exclusive `&mut` is what lets parallel workers hold
+/// disjoint `&mut FunctionBody`s over the same frozen [`ContextView`].
+pub struct FunctionBody<'a, 'str> {
+    /// This function's id (the registry key; a [`Function`] does not store its
+    /// own id).
     id: FunctionId,
-    /// The checked-out function (its arenas, roster, root, users, names).
-    fun: Function<'str>,
+    /// The function being optimized, borrowed **in place** from the bodies
+    /// registry (its arenas, roster, root, users, names). The body never leaves
+    /// the registry — the `&mut` is what gives the pass exclusive access while the
+    /// frozen [`ContextView`] shares the rest of the module.
+    fun: &'a mut Function<'str>,
     /// Global effects buffered this run (drained by the driver at check-in).
     effects: Effects<'str>,
     /// Never-observed placeholder [`FunctionId`]s the pass may materialize new
@@ -171,10 +178,10 @@ pub struct FunctionBody<'str> {
     minted: Vec<Minted<'str>>,
 }
 
-impl<'str> FunctionBody<'str> {
-    /// Wrap the checked-out function `fun` (id `id`), carrying `reserved_ids` for
-    /// any function it mints.
-    pub fn new(id: FunctionId, fun: Function<'str>, reserved_ids: Vec<FunctionId>) -> Self {
+impl<'a, 'str> FunctionBody<'a, 'str> {
+    /// Wrap the function `fun` (id `id`) borrowed in place from the bodies
+    /// registry, carrying `reserved_ids` for any function it mints.
+    pub fn new(id: FunctionId, fun: &'a mut Function<'str>, reserved_ids: Vec<FunctionId>) -> Self {
         Self {
             id,
             fun,
@@ -189,19 +196,17 @@ impl<'str> FunctionBody<'str> {
         self.id
     }
 
-    /// The owned function (read).
+    /// The borrowed function (read).
     pub fn function(&self) -> &Function<'str> {
-        &self.fun
+        &*self.fun
     }
 
-    /// A [`PassBacking`] mutation host over this body's owned function and the
+    /// A [`PassBacking`] mutation host over this body's borrowed function and the
     /// module's read-only shared context. This is how a `FunctionPass` reads
-    /// (via [`PassBacking::read_host`]) and mutates (via the [`HostMut`] surface)
-    /// its function — construct block/instruction refs and `Builder`s over it.
-    ///
-    /// [`HostMut`]: qcode::value::util::host_mut::HostMut
-    pub fn host<'a>(&'a mut self, cx: ContextView<'a, 'str>) -> PassBacking<'a, 'str> {
-        PassBacking::new(&mut self.fun, self.id, cx.shr(), cx.interfaces())
+    /// (via [`PassBacking::read_host`]) and mutates its function — construct
+    /// block/instruction refs and `Builder`s over it.
+    pub fn host<'b>(&'b mut self, cx: ContextView<'b, 'str>) -> PassBacking<'b, 'str> {
+        PassBacking::new(&mut *self.fun, self.id, cx.shr(), cx.interfaces())
     }
 
     /// The effect buffer (mutate) — passes push a self-rename claim here instead of
@@ -210,12 +215,12 @@ impl<'str> FunctionBody<'str> {
         &mut self.effects
     }
 
-    /// A `Copy` read view over this body's owned function and the shared context
-    /// — the recognizer-side twin of [`host`](Self::host) for passes that only
-    /// need to *read* while holding other borrows.
-    pub fn read_host<'a>(&'a self, cx: ContextView<'a, 'str>) -> HostRef<'a, 'str> {
+    /// A `Copy` read view over this body's borrowed function and the shared
+    /// context — the recognizer-side twin of [`host`](Self::host) for passes that
+    /// only need to *read* while holding other borrows.
+    pub fn read_host<'b>(&'b self, cx: ContextView<'b, 'str>) -> HostRef<'b, 'str> {
         HostRef::Checked {
-            fun: &self.fun,
+            fun: &*self.fun,
             shared: cx.shr(),
             interfaces: cx.interfaces(),
             id: self.id,
@@ -262,13 +267,13 @@ impl<'str> FunctionBody<'str> {
     /// (read) into the minted one (write), both against the same shared context.
     ///
     /// Panics if `minted` was not minted by this body.
-    pub fn host_with_minted<'a>(
-        &'a mut self,
-        cx: ContextView<'a, 'str>,
+    pub fn host_with_minted<'b>(
+        &'b mut self,
+        cx: ContextView<'b, 'str>,
         minted: FunctionId,
-    ) -> (HostRef<'a, 'str>, PassBacking<'a, 'str>) {
+    ) -> (HostRef<'b, 'str>, PassBacking<'b, 'str>) {
         let own = HostRef::Checked {
-            fun: &self.fun,
+            fun: &*self.fun,
             shared: cx.shr(),
             interfaces: cx.interfaces(),
             id: self.id,
@@ -285,18 +290,12 @@ impl<'str> FunctionBody<'str> {
         )
     }
 
-    /// Consume the body at check-in, yielding the reinstallable function, its
-    /// buffered effects, the functions it minted, and any unused reserved ids
-    /// (returned to the driver's pool).
-    pub fn into_parts(
-        self,
-    ) -> (
-        Function<'str>,
-        Effects<'str>,
-        Vec<Minted<'str>>,
-        Vec<FunctionId>,
-    ) {
-        (self.fun, self.effects, self.minted, self.reserved_ids)
+    /// Consume the body at the barrier, yielding its buffered effects, the
+    /// functions it minted, and any unused reserved ids (returned to the driver's
+    /// pool). The function itself stays borrowed in place in the registry — there
+    /// is no body to reinstall.
+    pub fn into_parts(self) -> (Effects<'str>, Vec<Minted<'str>>, Vec<FunctionId>) {
+        (self.effects, self.minted, self.reserved_ids)
     }
 }
 
@@ -316,7 +315,7 @@ impl<'str> FunctionBody<'str> {
 /// function, the inherent method drops that parameter and supplies
 /// [`self.id()`](Self::id) instead — a function pass only ever mints/mutates into
 /// its own body.
-impl<'str> FunctionBody<'str> {
+impl<'body, 'str> FunctionBody<'body, 'str> {
     // ---- births -------------------------------------------------------------
     //
     // `push_edge` (`Context::push_edge`) is intentionally NOT mirrored: its

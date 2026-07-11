@@ -33,7 +33,7 @@ use crate::gvn::affine::precompute_forms;
 /// Rewrite every fixed `@SP ± N` load/store address in `fid` to a single
 /// root-block representative per offset `N`. Returns whether anything changed.
 pub fn canonicalize_sp_slots_concrete<'a, 'str>(
-    body: &'a mut FunctionBody<'str>,
+    body: &'a mut FunctionBody<'_, 'str>,
     cx: ContextView<'a, 'str>,
     fid: FunctionId,
     sp_reg: VarnodeId,
@@ -230,7 +230,7 @@ impl FunctionPass for CanonicalizeSpSlots {
     }
     fn run<'str>(
         &self,
-        f: &mut FunctionBody<'str>,
+        f: &mut FunctionBody<'_, 'str>,
         cx: ContextView<'_, 'str>,
     ) -> std::result::Result<bool, String> {
         let sp_reg = cx.shr().registers[&cx.env().cfg.stack_pointer];

@@ -63,7 +63,7 @@ impl FunctionPass for Licm {
 
     fn run<'str>(
         &self,
-        f: &mut FunctionBody<'str>,
+        f: &mut FunctionBody<'_, 'str>,
         m: ContextView<'_, 'str>,
     ) -> Result<bool, String> {
         let fid = f.id();
@@ -329,7 +329,7 @@ fn emission_order(
 /// instruction is rebuilt in the preheader (before its terminator), its uses are
 /// redirected to the rebuilt copy, and the original is deleted.
 fn hoist_into_preheader<'a, 'str>(
-    body: &'a mut FunctionBody<'str>,
+    body: &'a mut FunctionBody<'_, 'str>,
     cx: ContextView<'a, 'str>,
     preheader: BlockId,
     order: &[InstructionId],
@@ -421,7 +421,7 @@ fn build_aliases<'a, 'str: 'a>(
 /// the conservative path where any loop store blocks load hoisting). Reads and
 /// mutates the function through the concrete pass surface.
 fn hoist_loop_invariants_with_aliases<'a, 'str>(
-    body: &'a mut FunctionBody<'str>,
+    body: &'a mut FunctionBody<'_, 'str>,
     cx: ContextView<'a, 'str>,
     fun_id: FunctionId,
     aliases: Option<&AliasResult>,

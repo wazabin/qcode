@@ -375,7 +375,7 @@ pub(super) fn key_for(form: &NormalForm, id: ValueId, mnemonic: &Mnemonic) -> No
 
 /// Concrete pass twin of [`emit`].
 fn emit_c<'str>(
-    body: &mut FunctionBody<'str>,
+    body: &mut FunctionBody<'_, 'str>,
     cx: ContextView<'_, 'str>,
     block: BlockId,
     at: InstructionId,
@@ -390,7 +390,7 @@ fn emit_c<'str>(
 
 /// Concrete pass twin of [`build_value`].
 fn build_value_c<'str>(
-    body: &mut FunctionBody<'str>,
+    body: &mut FunctionBody<'_, 'str>,
     cx: ContextView<'_, 'str>,
     block: BlockId,
     at: InstructionId,
@@ -428,7 +428,7 @@ fn build_value_c<'str>(
 
 /// Concrete pass twin of [`canonical_mnemonic`].
 fn canonical_mnemonic_c<'str>(
-    body: &mut FunctionBody<'str>,
+    body: &mut FunctionBody<'_, 'str>,
     cx: ContextView<'_, 'str>,
     block: BlockId,
     at: InstructionId,
@@ -525,7 +525,7 @@ fn canonical_mnemonic_c<'str>(
 /// Concrete pass twin of [`scaled_value`].
 #[allow(clippy::too_many_arguments)]
 fn scaled_value_c<'str>(
-    body: &mut FunctionBody<'str>,
+    body: &mut FunctionBody<'_, 'str>,
     cx: ContextView<'_, 'str>,
     block: BlockId,
     at: InstructionId,
@@ -547,7 +547,7 @@ fn scaled_value_c<'str>(
 
 /// Concrete pass twin of [`signed_lit`].
 fn signed_lit_c<'str>(
-    body: &mut FunctionBody<'str>,
+    body: &mut FunctionBody<'_, 'str>,
     cx: ContextView<'_, 'str>,
     s: i64,
     width: usize,
@@ -572,7 +572,7 @@ fn signed_lit_c<'str>(
 /// Concrete pass twin of [`materialize`].
 #[allow(clippy::too_many_arguments)]
 pub(super) fn materialize_c<'str>(
-    body: &mut FunctionBody<'str>,
+    body: &mut FunctionBody<'_, 'str>,
     cx: ContextView<'_, 'str>,
     block: BlockId,
     at: InstructionId,

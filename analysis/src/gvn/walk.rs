@@ -402,7 +402,7 @@ impl Editor {
     /// Concrete twin of [`replace`](Self::replace).
     pub(super) fn replace_c<'str>(
         &mut self,
-        body: &mut FunctionBody<'str>,
+        body: &mut FunctionBody<'_, 'str>,
         cx: ContextView<'_, 'str>,
         insn: InstructionId,
         with: ValueId,
@@ -414,7 +414,7 @@ impl Editor {
     /// Concrete twin of [`replace_with_new_insn`](Self::replace_with_new_insn).
     pub(super) fn replace_with_new_insn_c<'str>(
         &mut self,
-        body: &mut FunctionBody<'str>,
+        body: &mut FunctionBody<'_, 'str>,
         cx: ContextView<'_, 'str>,
         block_id: BlockId,
         at: InstructionId,
@@ -429,7 +429,7 @@ impl Editor {
     /// [`replace_with_new_insn_typed`](Self::replace_with_new_insn_typed).
     pub(super) fn replace_with_new_insn_typed_c<'str>(
         &mut self,
-        body: &mut FunctionBody<'str>,
+        body: &mut FunctionBody<'_, 'str>,
         cx: ContextView<'_, 'str>,
         block_id: BlockId,
         at: InstructionId,
@@ -446,7 +446,7 @@ impl Editor {
     }
 
     /// Concrete twin of [`finish`](Self::finish).
-    fn finish_c<'str>(self, body: &mut FunctionBody<'str>, cx: ContextView<'_, 'str>) -> bool {
+    fn finish_c<'str>(self, body: &mut FunctionBody<'_, 'str>, cx: ContextView<'_, 'str>) -> bool {
         let changed = !self.redundant.is_empty();
         for insn in self.redundant {
             body.remove_instruction(cx, insn);
@@ -473,7 +473,7 @@ pub(super) trait SubPassC<'str> {
     #[allow(clippy::too_many_arguments)]
     fn on_block_entry(
         &self,
-        _body: &mut FunctionBody<'str>,
+        _body: &mut FunctionBody<'_, 'str>,
         _cx: ContextView<'_, 'str>,
         _state: &mut dyn Any,
         _block_id: BlockId,
@@ -487,7 +487,7 @@ pub(super) trait SubPassC<'str> {
     /// See [`SubPass::on_insn`].
     fn on_insn(
         &self,
-        body: &mut FunctionBody<'str>,
+        body: &mut FunctionBody<'_, 'str>,
         cx: ContextView<'_, 'str>,
         state: &mut dyn Any,
         ic: &InsnCtx,
@@ -497,7 +497,7 @@ pub(super) trait SubPassC<'str> {
     /// See [`SubPass::after_block`].
     fn after_block(
         &self,
-        _body: &mut FunctionBody<'str>,
+        _body: &mut FunctionBody<'_, 'str>,
         _cx: ContextView<'_, 'str>,
         _state: &mut dyn Any,
         _block_id: BlockId,
@@ -526,7 +526,7 @@ fn clone_states_c<'str>(
 
 /// Concrete twin of [`run_block`].
 fn run_block_c<'str>(
-    body: &mut FunctionBody<'str>,
+    body: &mut FunctionBody<'_, 'str>,
     cx: ContextView<'_, 'str>,
     block_id: BlockId,
     passes: &[Box<dyn SubPassC<'str>>],
@@ -565,7 +565,7 @@ fn run_block_c<'str>(
 /// hooks (no dominator tree exists for a lone block), over a checked-out
 /// `(&mut FunctionBody, ContextView)`.
 pub(super) fn run_single_block_c<'str>(
-    body: &mut FunctionBody<'str>,
+    body: &mut FunctionBody<'_, 'str>,
     cx: ContextView<'_, 'str>,
     block_id: BlockId,
     passes: &[Box<dyn SubPassC<'str>>],
@@ -580,7 +580,7 @@ pub(super) fn run_single_block_c<'str>(
 
 /// Concrete single-function-scope twin of the flat fixpoint driver.
 pub(super) fn run_flat_fixpoint_c<'str>(
-    body: &mut FunctionBody<'str>,
+    body: &mut FunctionBody<'_, 'str>,
     cx: ContextView<'_, 'str>,
     func_id: FunctionId,
     passes: &[Box<dyn SubPassC<'str>>],
@@ -622,7 +622,7 @@ struct WalkC<'a, 'str> {
 impl<'str> WalkC<'_, 'str> {
     fn rec(
         &mut self,
-        body: &mut FunctionBody<'str>,
+        body: &mut FunctionBody<'_, 'str>,
         cx: ContextView<'_, 'str>,
         block_id: BlockId,
         inherited: &[Box<dyn Any>],
@@ -670,7 +670,7 @@ impl<'str> WalkC<'_, 'str> {
 
 /// Concrete twin of [`run_dominator_walk`].
 pub(super) fn run_dominator_walk_c<'str>(
-    body: &mut FunctionBody<'str>,
+    body: &mut FunctionBody<'_, 'str>,
     cx: ContextView<'_, 'str>,
     func_id: FunctionId,
     passes: &[Box<dyn SubPassC<'str>>],

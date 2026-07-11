@@ -35,7 +35,7 @@ use qcode::{
     value::{Function, FunctionId, RegisterId, Renameable, Varnode, VarnodeId},
 };
 
-use super::{ArchConfig, CallingConvention, ContextView, FunctionBody, ModuleView};
+use super::{ArchConfig, CallingConvention, ContextSplit, ContextView, FunctionBody};
 use crate::structure::Program;
 use crate::RegisterBase;
 
@@ -146,7 +146,7 @@ pub trait DynFunctionPass: Send + Sync {
     /// [`Effects`]: super::Effects
     fn run_checked<'str>(
         &self,
-        body: &mut FunctionBody<'str>,
+        body: &mut FunctionBody<'_, 'str>,
         cx: ContextView<'_, 'str>,
     ) -> Result<bool, String>;
 
@@ -183,23 +183,24 @@ pub trait FunctionPass: Default {
     fn description(&self) -> &'static str;
     fn run<'str>(
         &self,
-        f: &mut FunctionBody<'str>,
+        f: &mut FunctionBody<'_, 'str>,
         cx: ContextView<'_, 'str>,
     ) -> Result<bool, String>;
 }
 
 /// Adapts a [`FunctionPass`] to the object-safe [`DynFunctionPass`] the registry
-/// and the sequential driver speak, encapsulating the whole check-out/check-in
-/// protocol in one place:
+/// and the sequential driver speak, encapsulating the whole run + barrier protocol
+/// in one place:
 ///
-/// 1. Check the target function out of the context ([`Context::checkout_function`]).
-/// 2. Build a [`ContextView`] over the now-disjoint `&Context` and run the pass on
-///    the owned [`FunctionBody`].
-/// 3. Check the function back in and replay any buffered [`Effects`] in place.
+/// 1. [`split`](ContextSplit::split) the context and borrow the target body `&mut`
+///    in place alongside the bodies-free [`ContextView`].
+/// 2. Run the pass on the borrowed [`FunctionBody`].
+/// 3. Drop the split borrow, then install any minted callees, resync the owner's
+///    call sites, and replay buffered [`Effects`].
 ///
-/// The parallel driver instead checks out a whole worklist and calls
-/// [`DynFunctionPass::run_checked`] directly on each disjoint body; the adapter's
-/// `run` is the whole-`Context` bridge for the `module(<fn>)` spelling and tests.
+/// The parallel driver instead borrows a whole worklist of bodies disjointly and
+/// calls [`DynFunctionPass::run_checked`] directly on each; the adapter's `run` is
+/// the whole-`Context` bridge for the `module(<fn>)` spelling and tests.
 pub struct FunctionPassAdapter<T: FunctionPass> {
     inner: T,
 }
@@ -221,7 +222,7 @@ impl<T: FunctionPass + Send + Sync> DynFunctionPass for FunctionPassAdapter<T> {
     }
     fn run_checked<'str>(
         &self,
-        body: &mut FunctionBody<'str>,
+        body: &mut FunctionBody<'_, 'str>,
         cx: ContextView<'_, 'str>,
     ) -> Result<bool, String> {
         FunctionPass::run(&self.inner, body, cx)
@@ -246,30 +247,32 @@ impl<T: FunctionPass + Send + Sync> DynFunctionPass for FunctionPassAdapter<T> {
         } else {
             Vec::new()
         };
-        // Check out: the pass owns its function exclusively; the context it reads
-        // through `ContextView` no longer holds (and so cannot alias) that function.
+        // Split the context: borrow the target body `&mut` in place and run the
+        // pass over the frozen module view; the view is bodies-free, so it cannot
+        // alias the borrowed body.
         let before_targets = ctx.direct_call_targets(fun_id);
-        let fun = ctx.checkout_function(fun_id);
-        let mut body = FunctionBody::new(fun_id, fun, reserved);
-        let changed = {
-            let view = ContextView::new(ctx, env);
-            self.run_checked(&mut body, view)?
+        let (changed, effects, minted) = {
+            let (bodies, view) = ctx.split(env);
+            let mut body = FunctionBody::new(fun_id, &mut bodies[fun_id], reserved);
+            let changed = self.run_checked(&mut body, view)?;
+            let (effects, minted, _unused) = body.into_parts();
+            (changed, effects, minted)
         };
-        let (fun, effects, minted, _unused) = body.into_parts();
-        // Check-in protocol, in the driver's order: install minted callees first
-        // (so the owner's new call sites resolve), reinstall the owner, rebuild
-        // its `call_sites` diff, then replay buffered effects.
+        // Barrier, in the driver's order: install minted callees first (so the
+        // owner's new call sites resolve), rebuild its `call_sites` diff, then
+        // replay buffered effects. The body was mutated in place — nothing to
+        // reinstall.
         install_minted(ctx, T::NAME, minted)?;
-        ctx.checkin_function(fun_id, fun);
         ctx.resync_call_sites(fun_id, &before_targets);
         replay_effects(ctx, T::NAME, fun_id, effects)?;
         Ok(changed)
     }
 }
 
-/// Run `f` over a checked-out `(&mut FunctionBody, ContextView)` for `fid`, then
-/// check the body back in and resync its call sites — the check-out/check-in
-/// protocol of [`FunctionPassAdapter::run`], minus minting.
+/// Run `f` over a `(&mut FunctionBody, ContextView)` for `fid` — the body borrowed
+/// `&mut` in place via [`split`](ContextSplit::split) — then drop the split borrow
+/// and resync the body's call sites: the run + barrier protocol of
+/// [`FunctionPassAdapter::run`], minus minting.
 ///
 /// This is the bridge the whole-`Context` optimization entry points
 /// (`gvn_function`, `constant_fold_function`, `narrow_function`, `mem2reg`,
@@ -285,19 +288,17 @@ impl<T: FunctionPass + Send + Sync> DynFunctionPass for FunctionPassAdapter<T> {
 pub(crate) fn with_checked_out_body<'str, R>(
     ctx: &mut Context<'str>,
     fid: FunctionId,
-    f: impl FnOnce(&mut FunctionBody<'str>, ContextView<'_, 'str>) -> R,
+    f: impl FnOnce(&mut FunctionBody<'_, 'str>, ContextView<'_, 'str>) -> R,
 ) -> R {
     let env = detached_env();
     let before_targets = ctx.direct_call_targets(fid);
-    let fun = ctx.checkout_function(fid);
-    let mut body = FunctionBody::new(fid, fun, Vec::new());
     let out = {
-        let view = ContextView::new(ctx, &env);
+        let (bodies, view) = ctx.split(&env);
+        let mut body = FunctionBody::new(fid, &mut bodies[fid], Vec::new());
+        // These entry points buffer no effects and mint nothing, so the drained
+        // scratch is discarded.
         f(&mut body, view)
     };
-    // These entry points buffer no effects and mint nothing.
-    let (fun, _effects, _minted, _unused) = body.into_parts();
-    ctx.checkin_function(fid, fun);
     ctx.resync_call_sites(fid, &before_targets);
     out
 }

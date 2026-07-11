@@ -67,7 +67,7 @@ pub fn remove_dead_insns_generic<'str>(host: &mut Context<'str>, block_id: Block
 /// Host-generic core of [`remove_dead_insns`]; see that function.
 /// This is the concrete version for FunctionBody/ContextView (stage 5b).
 pub fn remove_dead_insns_host<'a, 'str>(
-    body: &'a mut FunctionBody<'str>,
+    body: &'a mut FunctionBody<'_, 'str>,
     cx: ContextView<'a, 'str>,
     block_id: BlockId,
 ) -> bool {
@@ -145,7 +145,7 @@ fn remove_dead_pure_call_generic<'str>(mut host: &mut Context<'str>, block_id: B
 
 /// Host-generic core of [`remove_dead_pure_call`]; see that function.
 fn remove_dead_pure_call_host<'a, 'str>(
-    body: &'a mut FunctionBody<'str>,
+    body: &'a mut FunctionBody<'_, 'str>,
     cx: ContextView<'a, 'str>,
     block_id: BlockId,
 ) -> bool {
@@ -248,7 +248,7 @@ pub fn remove_unused_no_pred_block_params_generic<'str>(
 /// blocks whose predecessor terminators carry positional arguments.
 /// Concrete version for FunctionBody/ContextView (stage 5b).
 pub fn remove_unused_no_pred_block_params_host<'a, 'str>(
-    body: &'a mut FunctionBody<'str>,
+    body: &'a mut FunctionBody<'_, 'str>,
     cx: ContextView<'a, 'str>,
     block_id: BlockId,
 ) -> bool {
@@ -839,7 +839,7 @@ fn remove_dead_counted_loop_generic<'str>(
 
 /// Host-generic core of [`remove_dead_counted_loop`]; see that function.
 fn remove_dead_counted_loop_host<'a, 'str>(
-    body: &'a mut FunctionBody<'str>,
+    body: &'a mut FunctionBody<'_, 'str>,
     cx: ContextView<'a, 'str>,
     fun_id: FunctionId,
 ) -> bool {
@@ -871,7 +871,7 @@ impl FunctionPass for Dce {
     }
     fn run<'str>(
         &self,
-        f: &mut FunctionBody<'str>,
+        f: &mut FunctionBody<'_, 'str>,
         m: ContextView<'_, 'str>,
     ) -> Result<bool, String> {
         let fun_id = f.id();
@@ -883,7 +883,7 @@ impl FunctionPass for Dce {
 /// / dead-instruction sweeps, redundant/dead block-argument elimination, and dead
 /// counted-loop removal.
 fn dce_core<'a, 'str>(
-    body: &'a mut FunctionBody<'str>,
+    body: &'a mut FunctionBody<'_, 'str>,
     cx: ContextView<'a, 'str>,
     fun_id: FunctionId,
 ) -> bool {

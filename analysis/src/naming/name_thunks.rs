@@ -36,7 +36,7 @@ impl FunctionPass for NameThunks {
 
     fn run<'str>(
         &self,
-        f: &mut FunctionBody<'str>,
+        f: &mut FunctionBody<'_, 'str>,
         m: ContextView<'_, 'str>,
     ) -> Result<bool, String> {
         let fid = f.id();

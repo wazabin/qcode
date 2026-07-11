@@ -40,7 +40,7 @@ impl FunctionPass for CppDemangle {
     // This pass doesn't need to be, but it's good practice to track changes in case you later add more functionality
     fn run<'str>(
         &self,
-        f: &mut FunctionBody<'str>,
+        f: &mut FunctionBody<'_, 'str>,
         m: ContextView<'_, 'str>,
     ) -> Result<bool, String> {
         // Read the function's own name, decide the demangled form, then buffer

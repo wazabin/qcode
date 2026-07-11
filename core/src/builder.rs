@@ -1908,13 +1908,16 @@ mod tests {
         let mut ctx_b = Context::new();
         let fid_b = Function::make(&mut ctx_b, "foo".into()).unwrap().id;
         let entry_b = Function::from_id_mut(&mut ctx_b, fid_b).make_root().id;
-        let mut fun = ctx_b.checkout_function(fid_b);
         {
-            let mut host = PassBacking::from_ctx(&mut fun, fid_b, &ctx_b);
+            let mut host = PassBacking::new(
+                &mut ctx_b.bodies[fid_b],
+                fid_b,
+                &ctx_b.shared,
+                &ctx_b.interfaces,
+            );
             let mut b = Builder::from_block(BaseRef::new(host.reborrow(), entry_b));
             body(&mut b);
         }
-        ctx_b.checkin_function(fid_b, fun);
         let snap_b = snap(&ctx_b, fid_b);
 
         assert_eq!(

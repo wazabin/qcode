@@ -45,7 +45,7 @@ impl<'str> SubPassC<'str> for MemoryForwarding {
 
     fn on_block_entry(
         &self,
-        body: &mut FunctionBody<'str>,
+        body: &mut FunctionBody<'_, 'str>,
         cx: ContextView<'_, 'str>,
         state: &mut dyn Any,
         block_id: BlockId,
@@ -63,7 +63,7 @@ impl<'str> SubPassC<'str> for MemoryForwarding {
 
     fn on_insn(
         &self,
-        body: &mut FunctionBody<'str>,
+        body: &mut FunctionBody<'_, 'str>,
         cx: ContextView<'_, 'str>,
         state: &mut dyn Any,
         ic: &InsnCtx,
@@ -100,7 +100,7 @@ impl<'str> SubPassC<'str> for MemoryForwarding {
 
     fn after_block(
         &self,
-        body: &mut FunctionBody<'str>,
+        body: &mut FunctionBody<'_, 'str>,
         cx: ContextView<'_, 'str>,
         state: &mut dyn Any,
         block_id: BlockId,

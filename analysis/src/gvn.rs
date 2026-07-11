@@ -89,7 +89,7 @@ pub fn constant_fold_function(ctx: &mut Context, func_id: FunctionId) -> bool {
 /// the [`Fold`] sub-pass to a fixpoint over a checked-out `(&mut FunctionBody,
 /// ContextView)` with no threaded mutation host.
 fn constant_fold_body<'str>(
-    body: &mut FunctionBody<'str>,
+    body: &mut FunctionBody<'_, 'str>,
     cx: ContextView<'_, 'str>,
     func_id: FunctionId,
 ) -> bool {
@@ -107,7 +107,7 @@ pub fn narrow_function(ctx: &mut Context, func_id: FunctionId) -> bool {
 /// [`NarrowTrunc`] sub-pass to a fixpoint over a checked-out `(&mut FunctionBody,
 /// ContextView)`.
 fn narrow_body<'str>(
-    body: &mut FunctionBody<'str>,
+    body: &mut FunctionBody<'_, 'str>,
     cx: ContextView<'_, 'str>,
     func_id: FunctionId,
 ) -> bool {
@@ -154,7 +154,7 @@ pub fn gvn_function(ctx: &mut Context, func_id: FunctionId, aliases: Option<&Ali
 /// GVN sub-pass chain over the dominator tree of `func_id` on a checked-out
 /// `(&mut FunctionBody, ContextView)` with no threaded mutation host.
 fn gvn_body<'str>(
-    body: &mut FunctionBody<'str>,
+    body: &mut FunctionBody<'_, 'str>,
     cx: ContextView<'_, 'str>,
     func_id: FunctionId,
     aliases: Option<&AliasResult>,
@@ -177,7 +177,7 @@ impl FunctionPass for ConstFold {
     }
     fn run<'str>(
         &self,
-        f: &mut FunctionBody<'str>,
+        f: &mut FunctionBody<'_, 'str>,
         m: ContextView<'_, 'str>,
     ) -> Result<bool, String> {
         let fun_id = f.id();
@@ -197,7 +197,7 @@ impl FunctionPass for Narrow {
     }
     fn run<'str>(
         &self,
-        f: &mut FunctionBody<'str>,
+        f: &mut FunctionBody<'_, 'str>,
         m: ContextView<'_, 'str>,
     ) -> Result<bool, String> {
         let fun_id = f.id();
@@ -236,7 +236,7 @@ impl FunctionPass for Gvn {
     }
     fn run<'str>(
         &self,
-        f: &mut FunctionBody<'str>,
+        f: &mut FunctionBody<'_, 'str>,
         m: ContextView<'_, 'str>,
     ) -> Result<bool, String> {
         let fun_id = f.id();

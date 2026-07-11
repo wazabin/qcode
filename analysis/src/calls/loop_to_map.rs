@@ -203,7 +203,7 @@ fn body_uses_index(
 /// `map(body, enumerate(arr0))`, `body(tuple)` unpacking it. Returns `false` if
 /// the body is not a closed pure expression of `(index, element?)` (then nothing
 /// is changed — outlining is all-or-nothing and runs before any rewrite).
-fn apply<'str>(m: ContextView<'_, 'str>, body: &mut FunctionBody<'str>, mm: &MapMatch) -> bool {
+fn apply<'str>(m: ContextView<'_, 'str>, body: &mut FunctionBody<'_, 'str>, mm: &MapMatch) -> bool {
     let fid = body.id();
     let enum_id = IntrinsicId::from_name("enumerate").expect("enumerate registered");
     let (name, uses_index, tuple_ty) = {
@@ -388,7 +388,7 @@ fn apply<'str>(m: ContextView<'_, 'str>, body: &mut FunctionBody<'str>, mm: &Map
 /// `array_promote` having functionalized the region). Returns `true` if changed.
 pub(crate) fn recognize_total_map<'str>(
     m: ContextView<'_, 'str>,
-    body: &mut FunctionBody<'str>,
+    body: &mut FunctionBody<'_, 'str>,
 ) -> bool {
     let fid = body.id();
     if !body.read_host(m).function_ref(fid).is_pure() {
@@ -411,7 +411,7 @@ impl FunctionPass for LoopToMap {
     }
     fn run<'str>(
         &self,
-        f: &mut FunctionBody<'str>,
+        f: &mut FunctionBody<'_, 'str>,
         m: ContextView<'_, 'str>,
     ) -> Result<bool, String> {
         Ok(recognize_total_map(m, f))

@@ -63,7 +63,7 @@ impl<'str> SubPassC<'str> for NarrowTrunc {
 
     fn on_insn(
         &self,
-        body: &mut FunctionBody<'str>,
+        body: &mut FunctionBody<'_, 'str>,
         cx: ContextView<'_, 'str>,
         _state: &mut dyn Any,
         ic: &InsnCtx,
@@ -144,7 +144,7 @@ fn range_low(src: ValueId, size: usize) -> Mnemonic {
 
 /// Concrete pass twin of [`narrow_to`].
 fn narrow_to_c<'str>(
-    body: &mut FunctionBody<'str>,
+    body: &mut FunctionBody<'_, 'str>,
     cx: ContextView<'_, 'str>,
     v: ValueId,
     w: usize,
@@ -217,7 +217,7 @@ fn narrow_to_c<'str>(
 /// Concrete pass twin of [`narrow_extension`].
 #[allow(clippy::too_many_arguments)]
 fn narrow_extension_c<'str>(
-    body: &mut FunctionBody<'str>,
+    body: &mut FunctionBody<'_, 'str>,
     cx: ContextView<'_, 'str>,
     src: ValueId,
     w: usize,
@@ -239,7 +239,7 @@ fn narrow_extension_c<'str>(
 
 /// Concrete pass twin of [`push_insn`].
 fn push_insn_c<'str>(
-    body: &mut FunctionBody<'str>,
+    body: &mut FunctionBody<'_, 'str>,
     cx: ContextView<'_, 'str>,
     mnemonic: Mnemonic,
     size: usize,
@@ -463,16 +463,16 @@ mod tests {
         // And/Or results and hide the boolean half of the MBA.
         let root = Function::from_id(&ctx, mtmul).root().expect("root").id;
         while crate::dce::remove_dead_insns(&mut ctx, root) {}
-        // mba_simplify's surface is checked-out only; run it through a checkout.
+        // mba_simplify's surface is pass-scoped; run it over a `PassBacking`
+        // borrowing the body in place alongside the read-only shared state.
         let mba_changed = {
-            let mut fun = ctx.checkout_function(mtmul);
-            let c = {
-                let mut host =
-                    qcode::value::util::host_mut::PassBacking::from_ctx(&mut fun, mtmul, &ctx);
-                mba_simplify(&mut host, mtmul)
-            };
-            ctx.checkin_function(mtmul, fun);
-            c
+            let mut host = qcode::value::util::host_mut::PassBacking::new(
+                &mut ctx.bodies[mtmul],
+                mtmul,
+                &ctx.shared,
+                &ctx.interfaces,
+            );
+            mba_simplify(&mut host, mtmul)
         };
         assert!(mba_changed);
 

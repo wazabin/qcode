@@ -536,7 +536,11 @@ fn last_insn<'str>(host: &PassBacking<'_, 'str>, block: BlockId) -> InstructionI
 }
 
 /// Concrete version of array_promote core using FunctionBody+ContextView (stage 5b-ii).
-fn apply<'str>(body: &mut FunctionBody<'str>, cx: ContextView<'_, 'str>, m: &PromoteMatch) -> bool {
+fn apply<'str>(
+    body: &mut FunctionBody<'_, 'str>,
+    cx: ContextView<'_, 'str>,
+    m: &PromoteMatch,
+) -> bool {
     let mut host = body.host(cx);
     apply_generic(&mut host, m)
 }
@@ -728,7 +732,7 @@ impl FunctionPass for ArrayPromote {
 
     fn run<'str>(
         &self,
-        f: &mut FunctionBody<'str>,
+        f: &mut FunctionBody<'_, 'str>,
         m: ContextView<'_, 'str>,
     ) -> Result<bool, String> {
         let fid = f.id();

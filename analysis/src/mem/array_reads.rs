@@ -215,7 +215,11 @@ fn try_match(host: HostRef, fid: FunctionId) -> Option<ReadsMatch> {
 
 /// Rewrite each matched lane load to `at(arr, word)` and drop the seed store.
 /// Concrete version of array_reads core using FunctionBody+ContextView (stage 5b-ii).
-fn apply<'str>(body: &mut FunctionBody<'str>, cx: ContextView<'_, 'str>, m: &ReadsMatch) -> bool {
+fn apply<'str>(
+    body: &mut FunctionBody<'_, 'str>,
+    cx: ContextView<'_, 'str>,
+    m: &ReadsMatch,
+) -> bool {
     let at_id = IntrinsicId::from_name("at").expect("at registered");
     // The `at(arr, i)` result type is the array's element type. Compute it through
     // the shared type interner's `&self` path (no `shared_mut`, so it holds on a
@@ -295,7 +299,7 @@ impl FunctionPass for ArrayReads {
 
     fn run<'str>(
         &self,
-        f: &mut FunctionBody<'str>,
+        f: &mut FunctionBody<'_, 'str>,
         m: ContextView<'_, 'str>,
     ) -> Result<bool, String> {
         let fid = f.id();

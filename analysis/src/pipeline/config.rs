@@ -24,7 +24,7 @@ use super::pass::{
     known_pass_names, make_pass, replay_effects,
 };
 use super::{
-    ContextView, FunctionBody, ModuleView, PipelineProgress, ProgressSink, YieldSignal,
+    ContextSplit, ContextView, FunctionBody, PipelineProgress, ProgressSink, YieldSignal,
 };
 
 /// The canonical default pipeline, compiled into the binary. Used by
@@ -1562,16 +1562,18 @@ async fn run_function_stage(
                 continue;
             }
             let function: std::sync::Arc<str> = FunctionRef::from_id(ctx, fun_id).name().into();
-            // Check the function out, run its whole pass fixpoint on the owned body,
-            // then reinstall it, rebuild `call_sites`, and replay any buffered
-            // effects — the sequential form of the parallel check-in.
+            // Split the context: borrow this function's body `&mut` in place from
+            // the bodies registry and run its whole pass fixpoint on it over the
+            // frozen module view; then drop the split borrow and do the barrier work
+            // (install minted callees, rebuild `call_sites`, replay buffered
+            // effects). The snapshot of outgoing call targets is taken before the
+            // split so `resync_call_sites` can diff it afterwards.
             let before_targets = ctx.direct_call_targets(fun_id);
-            let fun = ctx.checkout_function(fun_id);
             let reserved = reservations.remove(&fun_id).unwrap_or_default();
-            let mut body = FunctionBody::new(fun_id, fun, reserved);
-            let function_changed = {
-                let view = ContextView::new(ctx, env);
-                run_one_function(
+            let (function_changed, effects, minted, unused) = {
+                let (bodies, view) = ctx.split(env);
+                let mut body = FunctionBody::new(fun_id, &mut bodies[fun_id], reserved);
+                let function_changed = run_one_function(
                     passes,
                     &mut body,
                     view,
@@ -1590,22 +1592,21 @@ async fn run_function_stage(
                             pass,
                         });
                     },
-                )?
+                )?;
+                let (effects, minted, unused) = body.into_parts();
+                (function_changed, effects, minted, unused)
             };
-            let (fun, effects, minted, unused) = body.into_parts();
-            // Install minted callees before the owner checks in and its call sites
-            // resync, so the new calls resolve against real functions.
+            // Install minted callees before the owner's call sites resync, so the
+            // new calls resolve against real functions.
             let installed = install_minted(ctx, &stage.name, minted)?;
-            ctx.checkin_function(fun_id, fun);
             ctx.resync_call_sites(fun_id, &before_targets);
             replay_effects(ctx, &stage.name, fun_id, effects)?;
             // Minted functions are new work for downstream `only_dirty` stages.
             dirty.extend(installed);
             leftover.insert(fun_id, unused);
-            // Per-pass `verify_after` can't run mid-fixpoint (the function is absent
-            // from `ctx` on the checked-out path), so run the opt-in `QCODE_VERIFY`
-            // check once here, after check-in reinstalls the function — pinning any
-            // invariant break to this stage. A no-op unless `QCODE_VERIFY` is set.
+            // Opt-in `QCODE_VERIFY` check once the split borrow has ended — the body
+            // is reachable through `ctx` again — pinning any invariant break to this
+            // stage. A no-op unless `QCODE_VERIFY` is set.
             crate::verify::verify_after(ctx, &stage.name);
             if function_changed {
                 dirty.insert(fun_id);
@@ -1657,7 +1658,7 @@ async fn run_function_stage(
 #[allow(clippy::too_many_arguments)]
 fn run_one_function<'str>(
     passes: &[Box<dyn DynFunctionPass>],
-    body: &mut FunctionBody<'str>,
+    body: &mut FunctionBody<'_, 'str>,
     cx: ContextView<'_, 'str>,
     cache: &mut FixpointCache,
     elapsed: &mut HashMap<&'static str, (std::time::Duration, usize, usize)>,
@@ -1753,15 +1754,26 @@ fn resolve_threads() -> usize {
     }
 }
 
-/// One checked-out worklist function on its way through a parallel stage: its
-/// identity, the checkout-time call-target snapshot (for the check-in `call_sites`
-/// diff), the owned body a worker mutates, and whether the worker changed it.
-struct ParallelEntry<'str> {
+/// Per-function driver metadata snapshotted before the split borrow: the id, the
+/// display name, the pre-run call-target set (for the barrier `call_sites` diff),
+/// and the minting reservations assigned in worklist order.
+type FnMeta = (
+    FunctionId,
+    std::sync::Arc<str>,
+    Vec<FunctionId>,
+    Vec<FunctionId>,
+);
+
+/// One worklist function on its way through a parallel stage: its identity, the
+/// pre-run call-target snapshot (for the barrier `call_sites` diff), the body a
+/// worker mutates (borrowed `&mut` in place from the bodies registry), and whether
+/// the worker changed it.
+struct ParallelEntry<'a, 'str> {
     index: usize,
     fun_id: FunctionId,
     name: std::sync::Arc<str>,
     before_targets: Vec<FunctionId>,
-    body: FunctionBody<'str>,
+    body: FunctionBody<'a, 'str>,
     changed: bool,
 }
 
@@ -1799,134 +1811,160 @@ fn run_stage_parallel(
     threads: usize,
     progress: &mut impl FnMut(PipelineProgress),
 ) -> Result<(), String> {
-    // 1. Check out every worklist function up front (each leaves an interface shell
-    //    in the module), snapshotting its call targets first for the check-in diff.
-    //    Each carries the minting reservations assigned to it in worklist order.
-    let mut entries: Vec<ParallelEntry> = Vec::with_capacity(fun_ids.len());
-    for (index, &fun_id) in fun_ids.iter().enumerate() {
+    // 1. Snapshot per-function driver metadata that needs `&ctx` — the display
+    //    name, the pre-run call-target set (for the barrier `call_sites` diff), and
+    //    the minting reservations assigned in worklist order — before the split
+    //    borrow freezes the context.
+    let mut metas: Vec<FnMeta> = Vec::with_capacity(fun_ids.len());
+    for &fun_id in fun_ids {
         let name: std::sync::Arc<str> = FunctionRef::from_id(ctx, fun_id).name().into();
         let before_targets = ctx.direct_call_targets(fun_id);
-        let fun = ctx.checkout_function(fun_id);
         let reserved = reservations.remove(&fun_id).unwrap_or_default();
-        entries.push(ParallelEntry {
-            index,
-            fun_id,
-            name,
-            before_targets,
-            body: FunctionBody::new(fun_id, fun, reserved),
-            changed: false,
-        });
+        metas.push((fun_id, name, before_targets, reserved));
     }
 
-    // 2. Contiguous, worklist-ordered chunks — deterministic assignment.
-    let chunk_size = entries.len().div_ceil(threads).max(1);
+    let chunk_size = fun_ids.len().div_ceil(threads).max(1);
     let repeat_until = stage.repeat_until.is_some();
     let stage_label = stage.name.clone();
 
-    // 3. Run workers on one shared read-only view; forward progress over a channel
-    //    the master thread pumps live while the workers compute.
-    let (tx, rx) = std::sync::mpsc::channel::<PipelineProgress>();
-    let outcomes: Vec<Result<WorkerOutput, String>> = {
-        let view = ContextView::new(ctx, env);
-        let stage_label = &stage_label;
-        std::thread::scope(|scope| {
-            let mut handles = Vec::new();
-            for chunk in entries.chunks_mut(chunk_size) {
-                let funcs: HashSet<FunctionId> = chunk.iter().map(|e| e.fun_id).collect();
-                let mut local_cache = cache.extract(&funcs);
-                let tx = tx.clone();
-                let stage_name = stage_name.clone();
-                let handle = scope.spawn(move || -> Result<WorkerOutput, String> {
-                    let mut local_elapsed: HashMap<
-                        &'static str,
-                        (std::time::Duration, usize, usize),
-                    > = HashMap::default();
-                    for e in chunk.iter_mut() {
-                        let index = e.index;
-                        let name = e.name.clone();
-                        let stage_name = stage_name.clone();
-                        let tx = &tx;
-                        let changed = run_one_function(
-                            passes,
-                            &mut e.body,
-                            view,
-                            &mut local_cache,
-                            &mut local_elapsed,
-                            stage_label,
-                            &name,
-                            repeat_until,
-                            |pass| {
-                                // Send failure only means the master stopped pumping
-                                // (it never does before join); ignore it.
-                                let _ = tx.send(PipelineProgress::FunctionPass {
-                                    round,
-                                    stage: stage_name.clone(),
-                                    function: name.clone(),
-                                    index: index + 1,
-                                    total,
-                                    pass,
-                                });
-                            },
-                        )?;
-                        e.changed = changed;
-                    }
-                    // Drain this thread's `stat!` counters before it exits — the
-                    // thread-local table is otherwise lost — for master re-absorption.
-                    Ok(WorkerOutput {
-                        cache: local_cache,
-                        elapsed: local_elapsed,
-                        stats: qcode::pass_scope::drain_stats(),
-                    })
-                });
-                handles.push(handle);
+    // 2-5. Under the split borrow: borrow every worklist body `&mut` in place
+    //    (disjoint, worklist order), run the workers over the frozen view, merge
+    //    their local state, then drain each body into an owned per-function
+    //    outcome. The split borrow ends with this block, releasing `ctx` for the
+    //    barrier.
+    let results = {
+        let (bodies, view) = ctx.split(env);
+        // Disjoint `&mut` borrows of every worklist body, in worklist order.
+        let slots = bodies.select_mut(fun_ids);
+        let mut entries: Vec<ParallelEntry> = metas
+            .into_iter()
+            .zip(slots)
+            .enumerate()
+            .map(
+                |(index, ((fun_id, name, before_targets, reserved), slot))| ParallelEntry {
+                    index,
+                    fun_id,
+                    name,
+                    before_targets,
+                    body: FunctionBody::new(fun_id, slot, reserved),
+                    changed: false,
+                },
+            )
+            .collect();
+
+        // Contiguous, worklist-ordered chunks — deterministic assignment. Run
+        // workers on one shared read-only view; forward progress over a channel the
+        // master thread pumps live while the workers compute.
+        let (tx, rx) = std::sync::mpsc::channel::<PipelineProgress>();
+        let worker_outputs: Vec<Result<WorkerOutput, String>> = {
+            let stage_label = &stage_label;
+            std::thread::scope(|scope| {
+                let mut handles = Vec::new();
+                for chunk in entries.chunks_mut(chunk_size) {
+                    let funcs: HashSet<FunctionId> = chunk.iter().map(|e| e.fun_id).collect();
+                    let mut local_cache = cache.extract(&funcs);
+                    let tx = tx.clone();
+                    let stage_name = stage_name.clone();
+                    let handle = scope.spawn(move || -> Result<WorkerOutput, String> {
+                        let mut local_elapsed: HashMap<
+                            &'static str,
+                            (std::time::Duration, usize, usize),
+                        > = HashMap::default();
+                        for e in chunk.iter_mut() {
+                            let index = e.index;
+                            let name = e.name.clone();
+                            let stage_name = stage_name.clone();
+                            let tx = &tx;
+                            let changed = run_one_function(
+                                passes,
+                                &mut e.body,
+                                view,
+                                &mut local_cache,
+                                &mut local_elapsed,
+                                stage_label,
+                                &name,
+                                repeat_until,
+                                |pass| {
+                                    // Send failure only means the master stopped
+                                    // pumping (it never does before join); ignore it.
+                                    let _ = tx.send(PipelineProgress::FunctionPass {
+                                        round,
+                                        stage: stage_name.clone(),
+                                        function: name.clone(),
+                                        index: index + 1,
+                                        total,
+                                        pass,
+                                    });
+                                },
+                            )?;
+                            e.changed = changed;
+                        }
+                        // Drain this thread's `stat!` counters before it exits — the
+                        // thread-local table is otherwise lost — for re-absorption.
+                        Ok(WorkerOutput {
+                            cache: local_cache,
+                            elapsed: local_elapsed,
+                            stats: qcode::pass_scope::drain_stats(),
+                        })
+                    });
+                    handles.push(handle);
+                }
+                // The master holds no sender: once every worker's sender drops the
+                // channel closes and the pump loop ends.
+                drop(tx);
+                while let Ok(event) = rx.recv() {
+                    progress(event);
+                }
+                handles
+                    .into_iter()
+                    .map(|h| h.join().expect("function-pass worker panicked"))
+                    .collect()
+            })
+        };
+
+        // Merge worker-local state deterministically (worklist / chunk order).
+        for outcome in worker_outputs {
+            let out = outcome?;
+            cache.absorb(out.cache);
+            for (pass, (dur, runs, changes)) in out.elapsed {
+                let entry = elapsed.entry(pass).or_default();
+                entry.0 += dur;
+                entry.1 += runs;
+                entry.2 += changes;
             }
-            // The master holds no sender: once every worker's sender drops the
-            // channel closes and the pump loop ends.
-            drop(tx);
-            while let Ok(event) = rx.recv() {
-                progress(event);
-            }
-            handles
-                .into_iter()
-                .map(|h| h.join().expect("function-pass worker panicked"))
-                .collect()
-        })
+            qcode::pass_scope::absorb_stats(out.stats);
+        }
+
+        // Drain each body into an owned outcome (releasing its `&mut` borrow), in
+        // worklist order, for the barrier below.
+        entries
+            .into_iter()
+            .map(|e| {
+                let (effects, minted, unused) = e.body.into_parts();
+                (
+                    e.fun_id,
+                    e.before_targets,
+                    e.changed,
+                    effects,
+                    minted,
+                    unused,
+                )
+            })
+            .collect::<Vec<_>>()
     };
 
-    // 4. Merge worker-local state deterministically (worklist / chunk order).
-    for outcome in outcomes {
-        let out = outcome?;
-        cache.absorb(out.cache);
-        for (pass, (dur, runs, changes)) in out.elapsed {
-            let entry = elapsed.entry(pass).or_default();
-            entry.0 += dur;
-            entry.1 += runs;
-            entry.2 += changes;
-        }
-        qcode::pass_scope::absorb_stats(out.stats);
-    }
-
-    // 5. Check every function back in, in worklist order: reinstall the body,
-    //    rebuild `call_sites`, replay buffered effects, and record dirtiness.
-    for entry in entries {
-        let ParallelEntry {
-            fun_id,
-            before_targets,
-            body,
-            changed,
-            ..
-        } = entry;
-        let (fun, effects, minted, unused) = body.into_parts();
-        // Install minted callees before the owner checks in and its call sites
-        // resync, so the new calls resolve against real functions.
+    // 6. Barrier (master, worklist order): install minted callees before the
+    //    owner's call sites resync, rebuild `call_sites`, replay buffered effects,
+    //    and record dirtiness. The bodies were mutated in place, so there is
+    //    nothing to reinstall.
+    for (fun_id, before_targets, changed, effects, minted, unused) in results {
         let installed = install_minted(ctx, &stage.name, minted)?;
-        ctx.checkin_function(fun_id, fun);
         ctx.resync_call_sites(fun_id, &before_targets);
         replay_effects(ctx, &stage.name, fun_id, effects)?;
         dirty.extend(installed);
         leftover.insert(fun_id, unused);
-        // Opt-in `QCODE_VERIFY` check once the function is back in `ctx` (it was
-        // absent from it mid-fixpoint on the worker). A no-op unless enabled.
+        // Opt-in `QCODE_VERIFY` check once the split borrow has ended. A no-op
+        // unless enabled.
         crate::verify::verify_after(ctx, &stage.name);
         if changed {
             dirty.insert(fun_id);

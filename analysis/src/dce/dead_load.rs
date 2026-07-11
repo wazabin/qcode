@@ -1089,7 +1089,7 @@ pub fn remove_dead_load_insns_generic<'str>(
 /// checked-out function ([`crate::pipeline`]'s `FunctionBody`).
 /// This is the concrete version for FunctionBody/ContextView (stage 5b).
 pub fn remove_dead_load_insns_host<'a, 'str>(
-    body: &'a mut FunctionBody<'str>,
+    body: &'a mut FunctionBody<'_, 'str>,
     cx: ContextView<'a, 'str>,
     function_id: FunctionId,
     aliases: Option<&AliasResult>,
@@ -2216,7 +2216,7 @@ impl FunctionPass for DeadLoad {
     }
     fn run<'str>(
         &self,
-        f: &mut FunctionBody<'str>,
+        f: &mut FunctionBody<'_, 'str>,
         m: ContextView<'_, 'str>,
     ) -> Result<bool, String> {
         let fid = f.id();
@@ -2240,7 +2240,7 @@ impl FunctionPass for DeadStore {
     }
     fn run<'str>(
         &self,
-        f: &mut FunctionBody<'str>,
+        f: &mut FunctionBody<'_, 'str>,
         m: ContextView<'_, 'str>,
     ) -> Result<bool, String> {
         let fid = f.id();

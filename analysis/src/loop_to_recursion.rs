@@ -61,7 +61,7 @@ impl FunctionPass for LoopToRecursion {
 
     fn run<'str>(
         &self,
-        f: &mut FunctionBody<'str>,
+        f: &mut FunctionBody<'_, 'str>,
         m: ContextView<'_, 'str>,
     ) -> Result<bool, String> {
         Ok(loop_to_recursion(m, f))
@@ -85,7 +85,10 @@ pub(crate) struct LoopModel {
     pub(crate) back_edges: Vec<(BlockId, Vec<ValueId>)>,
 }
 
-pub fn loop_to_recursion<'str>(m: ContextView<'_, 'str>, body: &mut FunctionBody<'str>) -> bool {
+pub fn loop_to_recursion<'str>(
+    m: ContextView<'_, 'str>,
+    body: &mut FunctionBody<'_, 'str>,
+) -> bool {
     let Some(model) = recognize_loop(body.read_host(m), body.id()) else {
         return false;
     };
@@ -164,7 +167,7 @@ pub(crate) fn recognize_loop<'a, 'str: 'a>(
 
 fn transform<'str>(
     m: ContextView<'_, 'str>,
-    body: &mut FunctionBody<'str>,
+    body: &mut FunctionBody<'_, 'str>,
     model: &LoopModel,
 ) -> bool {
     let host_fid = body.id();

@@ -309,7 +309,7 @@ fn try_match_strlen(host: HostRef, fid: FunctionId) -> Option<StrlenMatch> {
 /// `len(take_while(@arr))`, then (when the scan is wholly private) strip the seed
 /// and delete the dead loop.
 fn apply_strlen<'str>(
-    body: &mut FunctionBody<'str>,
+    body: &mut FunctionBody<'_, 'str>,
     cx: ContextView<'_, 'str>,
     fid: FunctionId,
     m: &StrlenMatch,
@@ -370,7 +370,7 @@ fn apply_strlen<'str>(
 
 /// Recognize a bounded NUL-scan in this (pure) function, rewriting its escaping
 /// count to `len(take_while(arr))`. Returns `true` if changed.
-fn recognize_strlen_at<'str>(m: ContextView<'_, 'str>, body: &mut FunctionBody<'str>) -> bool {
+fn recognize_strlen_at<'str>(m: ContextView<'_, 'str>, body: &mut FunctionBody<'_, 'str>) -> bool {
     let fid = body.id();
     if !body.read_host(m).function_ref(fid).is_pure() {
         return false;
@@ -526,7 +526,7 @@ fn try_match_strlen_ptr(host: HostRef, fid: FunctionId) -> Option<StrlenPtrMatch
 /// Rewrite a matched raw-pointer scan: replace its `end - base` difference with
 /// `len(take_while(@base))` over the unbounded string at `@base`.
 fn apply_strlen_ptr<'str>(
-    body: &mut FunctionBody<'str>,
+    body: &mut FunctionBody<'_, 'str>,
     cx: ContextView<'_, 'str>,
     m: &StrlenPtrMatch,
 ) -> bool {
@@ -547,7 +547,7 @@ fn apply_strlen_ptr<'str>(
 
 /// Recognize a raw-pointer NUL-scan in this function, rewriting its `end - base`
 /// length to `len(take_while(base))`. Returns `true` if changed.
-fn recognize_strlen_ptr<'str>(m: ContextView<'_, 'str>, body: &mut FunctionBody<'str>) -> bool {
+fn recognize_strlen_ptr<'str>(m: ContextView<'_, 'str>, body: &mut FunctionBody<'_, 'str>) -> bool {
     let Some(sm) = try_match_strlen_ptr(body.read_host(m), body.id()) else {
         return false;
     };
@@ -564,7 +564,7 @@ impl FunctionPass for Strlen {
     }
     fn run<'str>(
         &self,
-        f: &mut FunctionBody<'str>,
+        f: &mut FunctionBody<'_, 'str>,
         m: ContextView<'_, 'str>,
     ) -> Result<bool, String> {
         // Layer 1 (at-form snapshot) then Layer 2 (raw char*); mutually exclusive

@@ -668,24 +668,6 @@ impl<'str> Context<'str> {
         self.functions()
     }
 
-    /// Check a function *out* of the module: move its [`Function`] *body* out of
-    /// the registry, leaving an empty body in its slot, and return the owned body.
-    /// The caller then owns it exclusively and can mutate it in isolation from the
-    /// rest of the module — the primitive a pass driver uses to hand a function to
-    /// a worker (see `PARALLEL_PASSES.md`). The id and every other function's
-    /// stable address are untouched (segmented registry storage).
-    ///
-    /// The function's [`interface`](crate::context::Context::interfaces)
-    /// is never checked out: it stays in the always-present interfaces registry, so
-    /// a worker reading a co-checked-out callee's published interface (name,
-    /// address, signature, purity, clobber/write summaries) through the shared
-    /// `&Context` sees the callee's real interface. The body must be reinstalled
-    /// with [`checkin_function`](Self::checkin_function) before anything relies on
-    /// it again.
-    pub fn checkout_function(&mut self, id: FunctionId) -> Function<'str> {
-        self.bodies.replace(id, Function::empty_body())
-    }
-
     /// Push a never-observed reserved slot (sentinel interface + empty body) into
     /// the function registries, returning its [`FunctionId`]. The minting pool
     /// draws ids from these; they are skipped by every iteration surface until a
@@ -697,17 +679,10 @@ impl<'str> Context<'str> {
         )
     }
 
-    /// Reinstall a function previously taken with
-    /// [`checkout_function`](Self::checkout_function), discarding the sentinel that
-    /// held its slot. The function's id must be the one it was checked out under.
-    pub fn checkin_function(&mut self, id: FunctionId, fun: Function<'str>) {
-        self.bodies.replace(id, fun);
-    }
-
     /// The distinct direct-call *targets* of `fun_id`'s live instructions — a cheap
-    /// snapshot taken at checkout so [`resync_call_sites`](Self::resync_call_sites)
-    /// can rebuild the `call_sites` cache at check-in (ruling 6 of the
-    /// parallel-passes plan). The function must be checked in.
+    /// snapshot taken before a function-pass run so
+    /// [`resync_call_sites`](Self::resync_call_sites) can rebuild the `call_sites`
+    /// cache afterwards (ruling 6 of the parallel-passes plan).
     pub fn direct_call_targets(&self, fun_id: FunctionId) -> Vec<FunctionId> {
         let mut targets: Vec<FunctionId> = FunctionRef::from_id(self, fun_id)
             .blocks()
@@ -802,10 +777,10 @@ impl<'str> Context<'str> {
     /// Reattribution (a block owned by one function but stored in another) is
     /// produced both by recursive disassembly (a block first lifted as one
     /// function's target, later attached to the function that truly owns it) and by
-    /// `split_overlapping_functions`. A [`checked-out`](Self::checkout_function)
-    /// function moves only its own [`Function`] out of the module, so a roster block
-    /// living in a *different* function's arena would be inaccessible — hence this
-    /// must run before any checkout. It is a pure storage move (see
+    /// `split_overlapping_functions`. A function pass borrows only its own
+    /// [`Function`] `&mut` from the bodies registry, so a roster block living in a
+    /// *different* function's arena would be inaccessible — hence this must run
+    /// before the function-pass stage. It is a pure storage move (see
     /// [`rehome_owned_blocks`](Self::rehome_owned_blocks)); the IR is unchanged.
     /// Returns `true` if anything was relocated.
     pub fn normalize_block_storage(&mut self) -> bool {
@@ -2038,30 +2013,6 @@ mod tests {
     }
 
     #[test]
-    fn checkout_checkin_round_trips_a_function() {
-        let mut ctx = Context::new();
-        let alpha = make_fn_with_blocks(&mut ctx, "alpha", 2);
-        let beta = make_fn_with_blocks(&mut ctx, "beta", 1);
-
-        // Check `alpha` out: the body slot now holds an empty body while its
-        // interface stays in the always-present interfaces registry, and we own
-        // the real body with all its blocks.
-        let fun = ctx.checkout_function(alpha);
-        assert_eq!(fun.roster.len(), 2);
-        assert_eq!(FunctionRef::from_id(&ctx, alpha).name(), "alpha");
-        assert_eq!(FunctionRef::from_id(&ctx, alpha).blocks().count(), 0);
-        // A sibling is entirely undisturbed while `alpha` is out.
-        assert_eq!(FunctionRef::from_id(&ctx, beta).name(), "beta");
-        assert_eq!(FunctionRef::from_id(&ctx, beta).blocks().count(), 1);
-
-        // Check it back in: the function is whole again.
-        ctx.checkin_function(alpha, fun);
-        assert_eq!(FunctionRef::from_id(&ctx, alpha).name(), "alpha");
-        assert_eq!(FunctionRef::from_id(&ctx, alpha).blocks().count(), 2);
-        assert_eq!(FunctionRef::from_id(&ctx, beta).name(), "beta");
-    }
-
-    #[test]
     fn checked_host_reads_match_module_reads() {
         use crate::value::{
             FunctionId, FunctionRef,
@@ -2117,13 +2068,10 @@ mod tests {
         let module_snap = snapshot(HostRef::Module(&ctx), fid);
         assert!(!module_snap.1.is_empty(), "sanity: foo has blocks");
 
-        // Check the function out; its registry slot is now an empty sentinel, so a
-        // plain module read sees nothing — only `Checked` routing recovers it.
-        let fun = ctx.checkout_function(fid);
-        assert_eq!(FunctionRef::from_id(&ctx, fid).blocks().count(), 0);
-
+        // A `Checked` host over the body borrowed in place must read identically to
+        // the module path — both route through the same ref code.
         let checked = HostRef::Checked {
-            fun: &fun,
+            fun: &ctx.bodies[fid],
             shared: &ctx.shared,
             interfaces: &ctx.interfaces,
             id: fid,
@@ -2131,11 +2079,8 @@ mod tests {
         let checked_snap = snapshot(checked, fid);
         assert_eq!(
             module_snap, checked_snap,
-            "reads through a Checked host must match the pre-checkout module reads"
+            "reads through a Checked host must match the module reads"
         );
-
-        ctx.checkin_function(fid, fun);
-        assert_eq!(FunctionRef::from_id(&ctx, fid).blocks().count(), 3);
     }
 
     #[test]
@@ -2226,9 +2171,13 @@ mod tests {
         let param_b = add_param(&mut ctx_b, bb1_b);
         let b_b = BasicBlock::from_id(&ctx_b, entry_b).instruction_ids()[1];
 
-        let mut fun = ctx_b.checkout_function(fid_b);
         {
-            let mut host = PassBacking::from_ctx(&mut fun, fid_b, &ctx_b);
+            let mut host = PassBacking::new(
+                &mut ctx_b.bodies[fid_b],
+                fid_b,
+                &ctx_b.shared,
+                &ctx_b.interfaces,
+            );
             let mut r = BaseRef::new(host.reborrow(), entry_b);
             r.set_comment(Some("c".into()));
             let mut r = BaseRef::new(host.reborrow(), entry_b);
@@ -2240,12 +2189,11 @@ mod tests {
             let mut r = BaseRef::new(host.reborrow(), param_b);
             r.set_size(4);
         }
-        ctx_b.checkin_function(fid_b, fun);
         let snap_b = snap(&ctx_b, fid_b);
 
         assert_eq!(
             snap_a, snap_b,
-            "mutations through a checked-out host must match the module-path mutations"
+            "mutations through a pass-scoped host must match the module-path mutations"
         );
     }
 

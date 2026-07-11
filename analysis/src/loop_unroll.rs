@@ -65,7 +65,7 @@ impl FunctionPass for RecognizeSimpleLoops {
 
     fn run<'str>(
         &self,
-        f: &mut FunctionBody<'str>,
+        f: &mut FunctionBody<'_, 'str>,
         m: ContextView<'_, 'str>,
     ) -> Result<bool, String> {
         let fid = f.id();
@@ -84,7 +84,7 @@ impl FunctionPass for UnrollSimpleLoops {
 
     fn run<'str>(
         &self,
-        f: &mut FunctionBody<'str>,
+        f: &mut FunctionBody<'_, 'str>,
         m: ContextView<'_, 'str>,
     ) -> Result<bool, String> {
         let fid = f.id();
@@ -97,7 +97,7 @@ crate::register_function_pass!(UnrollSimpleLoops);
 /// Concrete `FunctionBody`/`ContextView` version of [`recognize_simple_loops`]
 /// (stage 5b).
 pub fn recognize_simple_loops_host<'a, 'str>(
-    body: &'a mut FunctionBody<'str>,
+    body: &'a mut FunctionBody<'_, 'str>,
     cx: ContextView<'a, 'str>,
     fun_id: FunctionId,
 ) -> bool {
@@ -148,7 +148,7 @@ pub fn recognize_simple_loops_host<'a, 'str>(
 /// Concrete `FunctionBody`/`ContextView` version of [`unroll_simple_loops`]
 /// (stage 5b).
 pub fn unroll_simple_loops_host<'a, 'str>(
-    body: &'a mut FunctionBody<'str>,
+    body: &'a mut FunctionBody<'_, 'str>,
     cx: ContextView<'a, 'str>,
     fun_id: FunctionId,
 ) -> bool {
@@ -232,7 +232,7 @@ impl UnrollPlan {
 }
 
 fn apply_unroll_plan<'a, 'str>(
-    body: &'a mut FunctionBody<'str>,
+    body: &'a mut FunctionBody<'_, 'str>,
     cx: ContextView<'a, 'str>,
     plan: UnrollPlan,
 ) -> bool {
@@ -471,7 +471,7 @@ fn remap_mnemonic(mnemonic: &Mnemonic, value_map: &HashMap<ValueId, ValueId>) ->
 }
 
 pub(crate) fn replace_terminator_with_branch<'a, 'str>(
-    body: &'a mut FunctionBody<'str>,
+    body: &'a mut FunctionBody<'_, 'str>,
     cx: ContextView<'a, 'str>,
     block: BlockId,
     target: BlockId,

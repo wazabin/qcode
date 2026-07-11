@@ -71,7 +71,7 @@ impl FunctionPass for MbaSimplify {
 
     fn run<'str>(
         &self,
-        body: &mut FunctionBody<'str>,
+        body: &mut FunctionBody<'_, 'str>,
         m: ContextView<'_, 'str>,
     ) -> Result<bool, String> {
         let fid = body.id();
@@ -641,16 +641,11 @@ mod tests {
     use qcode_emulator::{SizedValue, StandaloneEmulator};
     use qcode_macro::qcode;
 
-    /// Run [`mba_simplify`] on `fid` through a checkout — the pass surface is
-    /// checked-out only — leaving the rewritten body back in `ctx`.
+    /// Run [`mba_simplify`] on `fid` over a `PassBacking` borrowing the body in
+    /// place — the pass surface is pass-scoped — leaving the rewritten body in `ctx`.
     fn run_mba(ctx: &mut Context, fid: FunctionId) -> bool {
-        let mut fun = ctx.checkout_function(fid);
-        let changed = {
-            let mut host = PassBacking::from_ctx(&mut fun, fid, ctx);
-            mba_simplify(&mut host, fid)
-        };
-        ctx.checkin_function(fid, fun);
-        changed
+        let mut host = PassBacking::new(&mut ctx.bodies[fid], fid, &ctx.shared, &ctx.interfaces);
+        mba_simplify(&mut host, fid)
     }
 
     fn return_value(ctx: &Context, fun: FunctionId) -> ValueId {

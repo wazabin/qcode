@@ -20,7 +20,7 @@ impl FunctionPass for SimplifyCfg {
 
     fn run<'str>(
         &self,
-        body: &mut FunctionBody<'str>,
+        body: &mut FunctionBody<'_, 'str>,
         cx: ContextView<'_, 'str>,
     ) -> Result<bool, String> {
         let fid = body.id();
@@ -49,7 +49,7 @@ crate::register_function_pass!(SimplifyCfg);
 ///
 /// The pass repeats until a full scan applies no transform.
 pub fn simplify_cfg_concrete<'a, 'str>(
-    body: &'a mut FunctionBody<'str>,
+    body: &'a mut FunctionBody<'_, 'str>,
     cx: ContextView<'a, 'str>,
     function_id: FunctionId,
 ) -> bool {
@@ -427,7 +427,7 @@ fn try_bypass_empty_block_generic<'str>(
 /// on no run, so nothing it computes or branches to is observable. This is what
 /// lets a dead loop, once `dce` reroutes its preheader past it, disappear.
 fn prune_unreachable_concrete<'a, 'str>(
-    body: &'a mut FunctionBody<'str>,
+    body: &'a mut FunctionBody<'_, 'str>,
     cx: ContextView<'a, 'str>,
     function_id: FunctionId,
 ) -> bool {
@@ -473,7 +473,7 @@ fn prune_unreachable_concrete<'a, 'str>(
 /// the same function as `a_id`; [`try_merge_block`] applies that gate (a
 /// checked-out pass merges only within its own function).
 fn merge_candidate_concrete<'a, 'str>(
-    body: &'a FunctionBody<'str>,
+    body: &'a FunctionBody<'_, 'str>,
     cx: ContextView<'a, 'str>,
     a_id: BlockId,
 ) -> Option<(qcode::value::block::EdgeId, BlockId)> {
@@ -529,7 +529,7 @@ fn merge_candidate_concrete<'a, 'str>(
 /// its instructions (which stay in that function's arena) into this one. Returns
 /// `true` if a merge happened.
 fn try_merge_block_concrete<'a, 'str>(
-    body: &'a mut FunctionBody<'str>,
+    body: &'a mut FunctionBody<'_, 'str>,
     cx: ContextView<'a, 'str>,
     function_id: FunctionId,
     a_id: BlockId,
@@ -557,7 +557,7 @@ fn try_merge_block_concrete<'a, 'str>(
 /// The `CBranch` contributed two parallel CFG edges to the shared target; one
 /// is dropped so the edge multiplicity matches the new single-successor branch.
 fn try_fold_cbranch_concrete<'a, 'str>(
-    body: &'a mut FunctionBody<'str>,
+    body: &'a mut FunctionBody<'_, 'str>,
     cx: ContextView<'a, 'str>,
     block_id: BlockId,
 ) -> bool {
@@ -613,7 +613,7 @@ fn try_fold_cbranch_concrete<'a, 'str>(
 ///   names B with a matching argument count. Call continuations, indirect
 ///   branches, and jump-table edges carry no rewritable target and are skipped.
 fn try_bypass_empty_block_concrete<'a, 'str>(
-    body: &'a mut FunctionBody<'str>,
+    body: &'a mut FunctionBody<'_, 'str>,
     cx: ContextView<'a, 'str>,
     function_id: FunctionId,
     b_id: BlockId,

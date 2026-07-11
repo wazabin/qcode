@@ -162,7 +162,7 @@ pub fn remove_dead_block_args_generic<'str>(
 /// Host-generic core of [`remove_dead_block_args`]; see that function.
 /// This is the concrete version for FunctionBody/ContextView (stage 5b).
 pub fn remove_dead_block_args_host<'a, 'str>(
-    body: &'a mut FunctionBody<'str>,
+    body: &'a mut FunctionBody<'_, 'str>,
     cx: ContextView<'a, 'str>,
     block_ids: &[BlockId],
     root: Option<BlockId>,
@@ -325,7 +325,7 @@ pub fn remove_dead_block_params_generic<'str>(
 /// Host-generic core of [`remove_dead_block_params`]; see that function.
 /// This is the concrete version for FunctionBody/ContextView (stage 5b).
 pub fn remove_dead_block_params_host<'a, 'str>(
-    body: &'a mut FunctionBody<'str>,
+    body: &'a mut FunctionBody<'_, 'str>,
     cx: ContextView<'a, 'str>,
     block_ids: &[BlockId],
     root: Option<BlockId>,
@@ -663,7 +663,7 @@ pub(crate) fn remove_params_from_block_generic<'str>(
 /// Host-generic core of [`remove_params_from_block`]; see that function.
 /// This is the concrete version for FunctionBody/ContextView (stage 5b).
 pub(crate) fn remove_params_from_block_host<'a, 'str>(
-    body: &'a mut FunctionBody<'str>,
+    body: &'a mut FunctionBody<'_, 'str>,
     cx: ContextView<'a, 'str>,
     block: BlockId,
     dead_indices: &HashSet<usize>,

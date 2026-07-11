@@ -39,7 +39,7 @@ impl<'str> SubPassC<'str> for Recognize {
 
     fn on_insn(
         &self,
-        body: &mut FunctionBody<'str>,
+        body: &mut FunctionBody<'_, 'str>,
         cx: ContextView<'_, 'str>,
         _state: &mut dyn Any,
         ic: &InsnCtx,

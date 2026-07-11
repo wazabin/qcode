@@ -46,7 +46,7 @@ pub fn mem2reg_framed(
 ///
 /// [`with_checked_out_body`]: crate::with_checked_out_body
 pub fn mem2reg_host<'ctx, 'str>(
-    body: &'ctx mut FunctionBody<'str>,
+    body: &'ctx mut FunctionBody<'_, 'str>,
     cx: ContextView<'ctx, 'str>,
     function_id: FunctionId,
     aliases: &AliasResult,
@@ -631,8 +631,8 @@ fn decide_variable_value(var: ValueId, frames: &[Frame]) -> Option<FrameEntry> {
 /// mutations through the inherent `body.verb(cx, ...)` surface. This is the sole
 /// implementation; the whole-`Context` entry points (`mem2reg` / `mem2reg_framed`)
 /// reach it through a check-out shim.
-struct Mem2Reg<'ctx, 'str> {
-    body: &'ctx mut FunctionBody<'str>,
+struct Mem2Reg<'ctx, 'body, 'str> {
+    body: &'ctx mut FunctionBody<'body, 'str>,
     cx: ContextView<'ctx, 'str>,
     function_id: FunctionId,
     root_id: Option<BlockId>,
@@ -645,9 +645,9 @@ struct Mem2Reg<'ctx, 'str> {
     sp_param: Option<ValueId>,
 }
 
-impl<'ctx, 'str> Mem2Reg<'ctx, 'str> {
+impl<'ctx, 'body, 'str> Mem2Reg<'ctx, 'body, 'str> {
     fn new(
-        body: &'ctx mut FunctionBody<'str>,
+        body: &'ctx mut FunctionBody<'body, 'str>,
         cx: ContextView<'ctx, 'str>,
         function_id: FunctionId,
         aliases: &'ctx AliasResult,
@@ -816,7 +816,7 @@ impl<'ctx, 'str> Mem2Reg<'ctx, 'str> {
     }
 }
 
-impl<'str> Mem2Reg<'_, 'str> {
+impl<'str> Mem2Reg<'_, '_, 'str> {
     fn block_param_name_for_var(&self, var: ValueId) -> Option<String> {
         match var {
             ValueId::Varnode(varnode_id) => Varnode::from_id(self.read().shr(), varnode_id)
@@ -1255,7 +1255,7 @@ impl<'str> Mem2Reg<'_, 'str> {
     }
 }
 
-impl<'str> Mem2Reg<'_, 'str> {
+impl<'str> Mem2Reg<'_, '_, 'str> {
     /// Computes the full argument list for a branch into `target`, by index.
     ///
     /// `mem2reg` runs repeatedly (interleaved with constant-folding), and each run
@@ -1574,7 +1574,7 @@ impl<'str> Mem2Reg<'_, 'str> {
     }
 }
 
-impl<'str> Mem2Reg<'_, 'str> {
+impl<'str> Mem2Reg<'_, '_, 'str> {
     fn decide_values_start_from(&mut self, block: BlockId, state: &mut RenameState<'_>) {
         // The renamer follows CFG successors. Strict IR locality (context-split
         // ruling 2) guarantees every successor is a block of this function — a
@@ -3515,7 +3515,7 @@ impl FunctionPass for Mem2RegPass {
     }
     fn run<'str>(
         &self,
-        f: &mut FunctionBody<'str>,
+        f: &mut FunctionBody<'_, 'str>,
         m: ContextView<'_, 'str>,
     ) -> Result<bool, String> {
         let fun_id = f.id();

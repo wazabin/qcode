@@ -53,7 +53,7 @@ impl<'str> SubPassC<'str> for Identities {
 
     fn on_insn(
         &self,
-        body: &mut FunctionBody<'str>,
+        body: &mut FunctionBody<'_, 'str>,
         cx: ContextView<'_, 'str>,
         _state: &mut dyn Any,
         ic: &InsnCtx,
@@ -354,7 +354,7 @@ fn negated_compare(op: IntBinop) -> Option<IntBinop> {
 /// `(&mut FunctionBody, ContextView)` (context-split stage 5b-ii Pin A): reads
 /// route through `body.read_host(cx)`, rewrites through `Editor`'s `_c` methods.
 fn simplify_bitwise_c<'str>(
-    body: &mut FunctionBody<'str>,
+    body: &mut FunctionBody<'_, 'str>,
     cx: ContextView<'_, 'str>,
     ic: &InsnCtx,
     ed: &mut Editor,
@@ -450,7 +450,7 @@ fn simplify_bitwise_c<'str>(
 
 /// Concrete pass twin of [`simplify_compare`] (see [`simplify_bitwise_c`]).
 fn simplify_compare_c<'str>(
-    body: &mut FunctionBody<'str>,
+    body: &mut FunctionBody<'_, 'str>,
     cx: ContextView<'_, 'str>,
     ic: &InsnCtx,
     ed: &mut Editor,

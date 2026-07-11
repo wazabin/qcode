@@ -76,7 +76,7 @@ impl FunctionPass for AccumulatorElim {
 
     fn run<'str>(
         &self,
-        f: &mut FunctionBody<'str>,
+        f: &mut FunctionBody<'_, 'str>,
         m: ContextView<'_, 'str>,
     ) -> Result<bool, String> {
         Ok(accumulator_elim(m, f))
@@ -85,7 +85,7 @@ impl FunctionPass for AccumulatorElim {
 
 register_function_pass!(AccumulatorElim);
 
-pub fn accumulator_elim<'str>(m: ContextView<'_, 'str>, body: &mut FunctionBody<'str>) -> bool {
+pub fn accumulator_elim<'str>(m: ContextView<'_, 'str>, body: &mut FunctionBody<'_, 'str>) -> bool {
     let host = body.id();
     let Some((model, plan)) = classify(body.read_host(m), host) else {
         return false;
@@ -259,7 +259,7 @@ struct Plan {
 
 fn transform<'str>(
     m: ContextView<'_, 'str>,
-    body: &mut FunctionBody<'str>,
+    body: &mut FunctionBody<'_, 'str>,
     model: &crate::loop_to_recursion::LoopModel,
     p: &Plan,
 ) {
