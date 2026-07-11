@@ -197,7 +197,8 @@ mod tests {
         // The synthetic edge is keyed by `main`'s address.
         assert!(
             tc.ctx
-                .shared.values
+                .shared
+                .values
                 .synthetic_callees_of(entry_id)
                 .any(|addr| addr == 0x2000)
         );

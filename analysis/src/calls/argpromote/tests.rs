@@ -2098,9 +2098,10 @@ mod tests {
 
         // The callee gains one `[i32; 20]` region snapshot param: element width 4
         // (the `*4` stride) and 20 elements (the `[0,20)` index bound).
-        let array = Function::from_id(&tc.ctx, f)
-            .root()
-            .and_then(|b| b.params().find_map(|p| tc.ctx.shared.types.array_of(p.type_id())));
+        let array = Function::from_id(&tc.ctx, f).root().and_then(|b| {
+            b.params()
+                .find_map(|p| tc.ctx.shared.types.array_of(p.type_id()))
+        });
         let (elem_ty, count) = array.expect("callee must gain an Array region param");
         assert_eq!(
             tc.ctx.shared.types.size_of(elem_ty),

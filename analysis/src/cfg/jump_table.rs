@@ -649,13 +649,16 @@ mod tests {
 
     /// Seed `ctx` with an executable code region `[start, start+len)`.
     fn add_code(ctx: &mut Context, start: u64, len: usize) {
-        ctx.shared.memory_image
+        ctx.shared
+            .memory_image
             .add_segment(start, vec![0u8; len], true, false);
     }
 
     /// Seed `ctx` with a read-only data region holding `bytes`.
     fn add_rodata(ctx: &mut Context, start: u64, bytes: Vec<u8>) {
-        ctx.shared.memory_image.add_segment(start, bytes, false, false);
+        ctx.shared
+            .memory_image
+            .add_segment(start, bytes, false, false);
     }
 
     /// An absolute table: each 8-byte slot holds the target address directly.

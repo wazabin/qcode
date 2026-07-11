@@ -221,7 +221,10 @@ mod tests {
     ) -> (FunctionId, qcode::value::block::BlockId) {
         let agg_ty = {
             let i64_ty = tc.ctx.shared.types.get_or_make_int(8);
-            tc.ctx.shared.types.get_or_make_aggregate(vec![i64_ty, i64_ty])
+            tc.ctx
+                .shared
+                .types
+                .get_or_make_aggregate(vec![i64_ty, i64_ty])
         };
         let gid = Function::make(&mut tc.ctx, "g".into()).unwrap().id;
         let entry = {
@@ -394,7 +397,10 @@ mod tests {
     ) -> (FunctionId, qcode::value::block::BlockId) {
         let agg_ty = {
             let i32_ty = tc.ctx.shared.types.get_or_make_int(4);
-            tc.ctx.shared.types.get_or_make_aggregate(vec![i32_ty, i32_ty])
+            tc.ctx
+                .shared
+                .types
+                .get_or_make_aggregate(vec![i32_ty, i32_ty])
         };
         let gid = Function::make(&mut tc.ctx, "g".into()).unwrap().id;
         let entry = {

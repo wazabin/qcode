@@ -2401,11 +2401,7 @@ mod tests {
         let (restored, _): (Context<'static>, usize) =
             bincode::serde::decode_from_slice(&bytes, config).expect("decode");
         assert_eq!(
-            restored
-                
-                .discoveries()
-                .map(|d| d.target)
-                .collect::<Vec<_>>(),
+            restored.discoveries().map(|d| d.target).collect::<Vec<_>>(),
             targets
         );
     }
