@@ -54,7 +54,7 @@ use crate::{
         },
         util::{
             base_ref::{BaseRef, HostRef},
-            host_mut::CheckedOut,
+            host_mut::PassBacking,
         },
         varnode::{Varnode, VarnodeId},
     },
@@ -65,7 +65,7 @@ use crate::{
 /// both without method-name ambiguity.
 ///
 /// This is the seam that decouples the fluent builder from the
-/// `HostMut`/`CheckedOut` host machinery (context-split Option A, item #2): the
+/// `HostMut`/`PassBacking` host machinery (context-split Option A, item #2): the
 /// [`Builder`] is generic over `B: BuilderBacking` and performs *every* mutation
 /// through these methods, never naming `HostMut` directly. Two backings exist —
 /// the **module** builder over `&mut Context` (the lifter / lowering / emulator
@@ -182,7 +182,7 @@ impl<'str> BuilderBacking<'str> for &mut Context<'str> {
 /// through the owned `Function`'s inherent verbs plus the read-only shared context.
 /// `bb_shared_mut` is intentionally left as the defaulted panic — a pass-time
 /// builder holds a frozen shared view and cannot mint temp spaces.
-impl<'str> BuilderBacking<'str> for CheckedOut<'_, 'str> {
+impl<'str> BuilderBacking<'str> for PassBacking<'_, 'str> {
     fn bb_shared(&self) -> &Context<'str> {
         self.shared
     }
@@ -1848,7 +1848,7 @@ mod tests {
     fn checked_builder_matches_module_builder() {
         use crate::value::{
             FunctionId, FunctionRef, block::BasicBlock, function::Function,
-            util::host_mut::CheckedOut,
+            util::host_mut::PassBacking,
         };
 
         // The same body over any host: consts and a couple of binops (exercising
@@ -1911,7 +1911,7 @@ mod tests {
         let entry_b = Function::from_id_mut(&mut ctx_b, fid_b).make_root().id;
         let mut fun = ctx_b.checkout_function(fid_b);
         {
-            let mut host = CheckedOut::new(&mut fun, fid_b, &ctx_b);
+            let mut host = PassBacking::new(&mut fun, fid_b, &ctx_b);
             let mut b = Builder::from_block(BaseRef::new(host.reborrow(), entry_b));
             body(&mut b);
         }

@@ -1,8 +1,8 @@
 //! The exclusive *mutation* host for a checked-out function pass
-//! ([`CheckedOut`]).
+//! ([`PassBacking`]).
 //!
 //! [`HostRef`](super::base_ref::HostRef) gave the read layer a `Copy` view that
-//! routes arena reads to a checked-out function. [`CheckedOut`] is its mutable
+//! routes arena reads to a checked-out function. [`PassBacking`] is its mutable
 //! sibling: a single function's arenas checked out of the module for exclusive
 //! mutation by one worker.
 //!
@@ -14,7 +14,7 @@
 //! function (asserted). The module-scope twin of every verb is an inherent method
 //! on [`Context`](crate::context::Context); the shorter-lived reborrow needed to
 //! hand the host to a value that owns it by value (a [`Builder`](crate::builder::Builder)
-//! or a mutation `BaseRef`) is [`CheckedOut::reborrow`].
+//! or a mutation `BaseRef`) is [`PassBacking::reborrow`].
 
 use crate::{
     context::Context,
@@ -36,7 +36,7 @@ use super::base_ref::HostRef;
 /// Out of scope (and asserted against on construction): a function with
 /// *reattributed* blocks — a roster block stored in, or parented to, a different
 /// function. Those functions go through the sequential (module) path.
-pub struct CheckedOut<'a, 'str> {
+pub struct PassBacking<'a, 'str> {
     pub fun: &'a mut Function<'str>,
     pub id: FunctionId,
     /// The rest of the module, **read-only**. A checked-out function pass reaches
@@ -47,7 +47,7 @@ pub struct CheckedOut<'a, 'str> {
     pub shared: &'a Context<'str>,
 }
 
-impl<'a, 'str> CheckedOut<'a, 'str> {
+impl<'a, 'str> PassBacking<'a, 'str> {
     /// Wrap `fun` (checked out of `shared` under `id`). Debug-asserts the function
     /// owns only self-stored, self-parented blocks (no reattribution).
     pub fn new(fun: &'a mut Function<'str>, id: FunctionId, shared: &'a Context<'str>) -> Self {
@@ -59,16 +59,16 @@ impl<'a, 'str> CheckedOut<'a, 'str> {
                     blk.deleted || blk.parent == Some(id)
                 }
             }),
-            "CheckedOut requires a function with no reattributed blocks"
+            "PassBacking requires a function with no reattributed blocks"
         );
         Self { fun, id, shared }
     }
 
-    /// A shorter-lived `CheckedOut` reborrowing this one's exclusive references, so
+    /// A shorter-lived `PassBacking` reborrowing this one's exclusive references, so
     /// the host can be handed to a mutation ref (which owns its host by value)
     /// without consuming the original.
-    pub fn reborrow(&mut self) -> CheckedOut<'_, 'str> {
-        CheckedOut {
+    pub fn reborrow(&mut self) -> PassBacking<'_, 'str> {
+        PassBacking {
             fun: &mut *self.fun,
             id: self.id,
             shared: self.shared,
@@ -81,7 +81,7 @@ impl<'a, 'str> CheckedOut<'a, 'str> {
 /// each verb is an inherent method on [`Context`](crate::context::Context); the
 /// primitives below (`function{,_mut}`/`shared`/`read_host`, and the no-op
 /// call-site cache) are the checked-out specializations.
-impl<'a, 'str> CheckedOut<'a, 'str> {
+impl<'a, 'str> PassBacking<'a, 'str> {
     // ---- primitives ---------------------------------------------------------
 
     /// The owned function's storage (write). Panics if `f` is not this function.

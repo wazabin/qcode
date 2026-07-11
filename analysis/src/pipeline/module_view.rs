@@ -26,7 +26,7 @@ use qcode::{
         block_param::{BlockParam, BlockParamId},
         function::FunctionInterface,
         insn::{Instruction, InstructionId, Mnemonic},
-        util::{base_ref::HostRef, host_mut::CheckedOut},
+        util::{base_ref::HostRef, host_mut::PassBacking},
     },
 };
 
@@ -152,14 +152,14 @@ impl<'str> FunctionBody<'str> {
         &self.fun
     }
 
-    /// A [`CheckedOut`] mutation host over this body's owned function and the
+    /// A [`PassBacking`] mutation host over this body's owned function and the
     /// module's read-only shared context. This is how a `FunctionPass` reads
-    /// (via [`CheckedOut::read_host`]) and mutates (via the [`HostMut`] surface)
+    /// (via [`PassBacking::read_host`]) and mutates (via the [`HostMut`] surface)
     /// its function — construct block/instruction refs and `Builder`s over it.
     ///
     /// [`HostMut`]: qcode::value::util::host_mut::HostMut
-    pub fn host<'a>(&'a mut self, cx: ContextView<'a, 'str>) -> CheckedOut<'a, 'str> {
-        CheckedOut::new(&mut self.fun, self.id, cx.shared_ctx())
+    pub fn host<'a>(&'a mut self, cx: ContextView<'a, 'str>) -> PassBacking<'a, 'str> {
+        PassBacking::new(&mut self.fun, self.id, cx.shared_ctx())
     }
 
     /// The effect buffer (mutate) — passes push a self-rename claim here instead of
@@ -213,7 +213,7 @@ impl<'str> FunctionBody<'str> {
     }
 
     /// Split this body into a read view of the *own* function and an exclusive
-    /// [`CheckedOut`] mutation host over the minted function `minted` (a
+    /// [`PassBacking`] mutation host over the minted function `minted` (a
     /// [`mint_function`](Self::mint_function) result). This is how an outliner
     /// builds a minted body: it clones expression slices out of its own function
     /// (read) into the minted one (write), both against the same shared context.
@@ -223,7 +223,7 @@ impl<'str> FunctionBody<'str> {
         &'a mut self,
         cx: ContextView<'a, 'str>,
         minted: FunctionId,
-    ) -> (HostRef<'a, 'str>, CheckedOut<'a, 'str>) {
+    ) -> (HostRef<'a, 'str>, PassBacking<'a, 'str>) {
         let own = HostRef::Checked {
             fun: &self.fun,
             shared: cx.shared_ctx(),
@@ -235,7 +235,7 @@ impl<'str> FunctionBody<'str> {
             .find(|(id, _, _)| *id == minted)
             .map(|(_, _, f)| f)
             .expect("host_with_minted: not a function minted by this body");
-        (own, CheckedOut::new(fun, minted, cx.shared_ctx()))
+        (own, PassBacking::new(fun, minted, cx.shared_ctx()))
     }
 
     /// Consume the body at check-in, yielding the reinstallable function, its
@@ -259,7 +259,7 @@ impl<'str> FunctionBody<'str> {
 /// function pass calls today through `f.host(cx)` / `f.read_host(cx)` is mirrored
 /// here as an inherent method on the body itself: `body.verb(cx, …)` instead of
 /// `host.verb(…)`. This commit is **purely additive** — each method is a
-/// behaviour-identical delegation to a freshly built [`CheckedOut`] (for the
+/// behaviour-identical delegation to a freshly built [`PassBacking`] (for the
 /// verbs) or [`HostRef`] (for the reads); no call site changes yet. Follow-on
 /// commits migrate helpers off the generic `H: HostMut` onto this surface, and a
 /// later commit reimplements the verb bodies directly on `self`'s arenas, at
@@ -452,7 +452,7 @@ impl<'str> FunctionBody<'str> {
     // ---- mutable arena accessors --------------------------------------------
     //
     // These return `&mut` borrows *into this body*, so they cannot be routed
-    // through a freshly built `CheckedOut` (the temporary host would be dropped
+    // through a freshly built `PassBacking` (the temporary host would be dropped
     // before the borrow is returned). They delegate straight to the underlying
     // `Function` arena accessors — behaviour-identical to the `Context` versions,
     // which resolve to the same `self.fun.<arena>[id.local]` — and take no `cx`.

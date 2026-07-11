@@ -41,7 +41,7 @@ use qcode::{
         block::BlockId,
         block_param::BlockParam,
         insn::{Branch, InstructionId, Mnemonic},
-        util::{base_ref::BaseRef, host_mut::CheckedOut},
+        util::{base_ref::BaseRef, host_mut::PassBacking},
     },
 };
 
@@ -307,7 +307,7 @@ fn transform<'str>(
 /// Push a cloned param typed `ty` onto `block`, returning its value (host-routed
 /// `BasicBlock::push_param` + the `type_id` write).
 fn push_param<'str>(
-    host: &mut CheckedOut<'_, 'str>,
+    host: &mut PassBacking<'_, 'str>,
     block: BlockId,
     ty: qcode::types::TypeId,
 ) -> ValueId {

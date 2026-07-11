@@ -37,10 +37,10 @@ pub fn mem2reg_framed(
 
 /// Host-generic core of [`mem2reg_framed`]. Reads and mutates the function through
 /// the generic mutation host, so it runs over either the whole module
-/// (`&mut Context`) or a single checked-out function ([`CheckedOut`]).
+/// (`&mut Context`) or a single checked-out function ([`PassBacking`]).
 ///
 /// TODO(5b-ii): For backwards compatibility; prefer concrete version for new code.
-/// [`CheckedOut`]: qcode::value::util::host_mut::CheckedOut
+/// [`PassBacking`]: qcode::value::util::host_mut::PassBacking
 fn mem2reg_host_generic<'str>(
     host: &mut Context<'str>,
     function_id: FunctionId,

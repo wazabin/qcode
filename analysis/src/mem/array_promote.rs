@@ -33,7 +33,7 @@ use qcode::{
         insn::{Branch, CBranch, InstructionId, IntrinsicApp, IntrinsicId, Load, Mnemonic},
         util::{
             base_ref::{BaseRef, HostRef},
-            host_mut::CheckedOut,
+            host_mut::PassBacking,
         },
     },
 };
@@ -392,7 +392,7 @@ fn try_match(host: HostRef, fid: FunctionId) -> Option<PromoteMatch> {
 
 /// Append `arg` to the branch terminator of `from` on the edge to `to`.
 fn append_edge_arg<'str>(
-    host: &mut CheckedOut<'_, 'str>,
+    host: &mut PassBacking<'_, 'str>,
     from: BlockId,
     to: BlockId,
     arg: ValueId,
@@ -471,7 +471,7 @@ fn region_base<'str, 'ctx, Ctx: BuilderBacking<'str>>(
 /// The byte width of a value's type, routed through the host so a checked-out
 /// function's own instruction/param results are read from its owned arena rather
 /// than the (sentinel) shared registry slot.
-fn width_of<'str>(host: &CheckedOut<'_, 'str>, v: ValueId) -> usize {
+fn width_of<'str>(host: &PassBacking<'_, 'str>, v: ValueId) -> usize {
     let ty = match v {
         ValueId::Instruction(iid) => host.insn_ref(iid).type_id(),
         ValueId::BlockParam(pid) => host.param_ref(pid).type_id(),
@@ -486,7 +486,7 @@ fn width_of<'str>(host: &CheckedOut<'_, 'str>, v: ValueId) -> usize {
 /// Push an `index_plus(index, delta)` value into `block` before `before`, through
 /// a checkout-safe builder (const/add/sub only). Returns the index value.
 fn make_index<'str>(
-    host: &mut CheckedOut<'_, 'str>,
+    host: &mut PassBacking<'_, 'str>,
     block: BlockId,
     before: InstructionId,
     index: ValueId,
@@ -503,7 +503,7 @@ fn make_index<'str>(
 /// Create a typed instruction with `mnemonic` and splice it before `before` in
 /// `block` (avoids the Builder's `context_mut` type-mint path).
 fn insert_before<'str>(
-    host: &mut CheckedOut<'_, 'str>,
+    host: &mut PassBacking<'_, 'str>,
     block: BlockId,
     before: InstructionId,
     mnemonic: Mnemonic,
@@ -517,7 +517,7 @@ fn insert_before<'str>(
 /// Create a typed instruction and insert it before `block`'s first instruction.
 /// The preheader always ends in a `goto header`, so it is never empty here.
 fn insert_at_top<'str>(
-    host: &mut CheckedOut<'_, 'str>,
+    host: &mut PassBacking<'_, 'str>,
     block: BlockId,
     mnemonic: Mnemonic,
     ty: TypeId,
@@ -534,7 +534,7 @@ fn insert_at_top<'str>(
 }
 
 /// The last instruction id of `block`.
-fn last_insn<'str>(host: &CheckedOut<'_, 'str>, block: BlockId) -> InstructionId {
+fn last_insn<'str>(host: &PassBacking<'_, 'str>, block: BlockId) -> InstructionId {
     host.block_ref(block).iter().last().unwrap().id
 }
 
@@ -546,7 +546,7 @@ fn apply<'str>(body: &mut FunctionBody<'str>, cx: ContextView<'_, 'str>, m: &Pro
 
 /// Rewrites the matched region onto array intrinsics, over the pass's checked-out
 /// body.
-fn apply_generic<'str>(host: &mut CheckedOut<'_, 'str>, m: &PromoteMatch) -> bool {
+fn apply_generic<'str>(host: &mut PassBacking<'_, 'str>, m: &PromoteMatch) -> bool {
     let esz = m.elem_size;
     let elem_ty = host.shared().shared.types.get_or_make_int(esz);
     let arr_ty = host
@@ -563,7 +563,7 @@ fn apply_generic<'str>(host: &mut CheckedOut<'_, 'str>, m: &PromoteMatch) -> boo
     // rotated shape the header *is* the body, so they share one param.
     // Push a fresh array-typed param onto `bid` (host-routed mirror of
     // `BasicBlock::push_param` followed by the original's `type_id = arr_ty`).
-    let new_param = |host: &mut CheckedOut<'_, 'str>, bid: BlockId| {
+    let new_param = |host: &mut PassBacking<'_, 'str>, bid: BlockId| {
         let index = host.block_ref(bid).num_params();
         let pid = host.push_block_param(
             bid.func,

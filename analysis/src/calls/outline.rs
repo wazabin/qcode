@@ -18,7 +18,7 @@ use qcode::{
         BasicBlock, BlockId, Function, FunctionId, FunctionKind, InstructionRef, ValueId,
         block_param::BlockParam,
         insn::{Binary, Binop, Extract, InstructionId, IntBinop, Mnemonic, Range, Return},
-        util::{base_ref::BaseRef, base_ref::HostRef, host_mut::CheckedOut},
+        util::{base_ref::BaseRef, base_ref::HostRef, host_mut::PassBacking},
     },
 };
 
@@ -318,7 +318,7 @@ pub(crate) fn seq_result_type(host: HostRef, src: ValueId, body_ret: TypeId) -> 
 
 /// Push a fresh param typed `ty` onto `block` in the minted host (host-routed
 /// mirror of `BasicBlock::push_param` + the `type_id` write). Returns its value.
-fn push_param_into<'str>(host: &mut CheckedOut<'_, 'str>, block: BlockId, ty: TypeId) -> ValueId {
+fn push_param_into<'str>(host: &mut PassBacking<'_, 'str>, block: BlockId, ty: TypeId) -> ValueId {
     let index = host.read_host().block(block).params.len();
     let pid = host.push_block_param(
         block.func,
@@ -339,7 +339,7 @@ fn push_param_into<'str>(host: &mut CheckedOut<'_, 'str>, block: BlockId, ty: Ty
 /// append it to `block` (host-routed mirror of `InstructionRef::from_mnemonic_with_type`
 /// + `push_insn`). Returns its value.
 fn push_insn_into<'str>(
-    host: &mut CheckedOut<'_, 'str>,
+    host: &mut PassBacking<'_, 'str>,
     block: BlockId,
     mnemonic: Mnemonic,
     ty: TypeId,
@@ -365,7 +365,7 @@ fn outline_core<'str>(
     slice: &[InstructionId],
     seed: impl for<'a> FnOnce(
         HostRef<'a, 'str>,
-        &mut qcode::value::util::host_mut::CheckedOut<'a, 'str>,
+        &mut qcode::value::util::host_mut::PassBacking<'a, 'str>,
         BlockId,
     ) -> HashMap<ValueId, ValueId>,
 ) -> Option<FunctionId> {

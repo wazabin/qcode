@@ -1423,7 +1423,7 @@ impl<'str> Context<'str> {
     // ---- module read/mint surface (context-split stage 5b-ii Pin A) ----------
     //
     // Module-scope read accessors and type-minting verbs, mirrored on the
-    // checked-out `CheckedOut` pass host, so the module walker and the
+    // checked-out `PassBacking` pass host, so the module walker and the
     // module-scope GVN sub-passes read/mint over `&mut Context` directly.
     // `function{,_mut}` alias the existing `body{,_mut}`.
 
@@ -2022,7 +2022,7 @@ mod tests {
             BlockParam, FunctionId, FunctionRef, InstructionId, Renameable,
             block::BlockId,
             block_param::BlockParamId,
-            util::{base_ref::BaseRef, host_mut::CheckedOut},
+            util::{base_ref::BaseRef, host_mut::PassBacking},
         };
 
         fn build(mut ctx: &mut Context<'static>) -> (FunctionId, BlockId, BlockId, InstructionId) {
@@ -2106,7 +2106,7 @@ mod tests {
 
         let mut fun = ctx_b.checkout_function(fid_b);
         {
-            let mut host = CheckedOut::new(&mut fun, fid_b, &ctx_b);
+            let mut host = PassBacking::new(&mut fun, fid_b, &ctx_b);
             let mut r = BaseRef::new(host.reborrow(), entry_b);
             r.set_comment(Some("c".into()));
             let mut r = BaseRef::new(host.reborrow(), entry_b);

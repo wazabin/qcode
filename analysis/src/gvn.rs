@@ -99,9 +99,9 @@ pub fn constant_fold_function(ctx: &mut Context, func_id: FunctionId) -> bool {
 
 /// Host-generic core of [`constant_fold_function`]: runs the [`Fold`] sub-pass to
 /// a fixpoint over either the whole module (`&mut Context`) or a single
-/// checked-out function ([`CheckedOut`]).
+/// checked-out function ([`PassBacking`]).
 ///
-/// [`CheckedOut`]: qcode::value::util::host_mut::CheckedOut
+/// [`PassBacking`]: qcode::value::util::host_mut::PassBacking
 pub(crate) fn constant_fold_host<'str>(host: &mut Context<'str>, func_id: FunctionId) -> bool {
     run_flat_fixpoint(
         host,
@@ -180,9 +180,9 @@ pub fn gvn_function(ctx: &mut Context, func_id: FunctionId, aliases: Option<&Ali
 
 /// Host-generic core of [`gvn_function`]: runs the full GVN sub-pass chain over
 /// the dominator tree of `func_id`, on either the whole module (`&mut Context`)
-/// or a single checked-out function ([`CheckedOut`]).
+/// or a single checked-out function ([`PassBacking`]).
 ///
-/// [`CheckedOut`]: qcode::value::util::host_mut::CheckedOut
+/// [`PassBacking`]: qcode::value::util::host_mut::PassBacking
 pub(crate) fn gvn_host<'str>(
     host: &mut Context<'str>,
     func_id: FunctionId,

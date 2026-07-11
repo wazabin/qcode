@@ -615,7 +615,8 @@ mod tests {
         let mba_changed = {
             let mut fun = ctx.checkout_function(mtmul);
             let c = {
-                let mut host = qcode::value::util::host_mut::CheckedOut::new(&mut fun, mtmul, &ctx);
+                let mut host =
+                    qcode::value::util::host_mut::PassBacking::new(&mut fun, mtmul, &ctx);
                 mba_simplify(&mut host, mtmul)
             };
             ctx.checkin_function(mtmul, fun);

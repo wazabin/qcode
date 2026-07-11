@@ -32,7 +32,7 @@ use qcode::{
     value::{
         BlockId, BlockParamId, ValueId,
         insn::{Branch, CBranch, Mnemonic},
-        util::{base_ref::HostRef, host_mut::CheckedOut},
+        util::{base_ref::HostRef, host_mut::PassBacking},
     },
 };
 
@@ -730,10 +730,10 @@ fn filter_kept(args: &[ValueId], drop: &HashSet<usize>) -> Vec<ValueId> {
 }
 
 /// Concrete pass twin of [`remove_params_from_block`] over a checked-out function
-/// (`&mut CheckedOut`), for the pass-path caller strlen. Mirrors
+/// (`&mut PassBacking`), for the pass-path caller strlen. Mirrors
 /// [`remove_params_from_block_generic`]; the module path keeps the generic.
 pub(crate) fn remove_params_from_block_c<'str>(
-    host: &mut CheckedOut<'_, 'str>,
+    host: &mut PassBacking<'_, 'str>,
     block: BlockId,
     dead_indices: &HashSet<usize>,
 ) {

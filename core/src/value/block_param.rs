@@ -7,7 +7,7 @@ use crate::{
         block::{BlockId, BlockRef},
         util::{
             base_ref::{BaseRef, HostRef, WithCtx, WithCtxMut, WithHost},
-            host_mut::CheckedOut,
+            host_mut::PassBacking,
             named::{Named, Renameable, update_context_name},
         },
     },
@@ -243,7 +243,7 @@ impl<'str, 'ctx> BlockParamMutRef<'str, 'ctx> {
 
 // Resizing a block parameter is the same over each concrete mutation backing
 // (mint an int type in shared storage, retype the param in its owning function's
-// arena), so it is emitted for `&mut Context` (module) and `CheckedOut`
+// arena), so it is emitted for `&mut Context` (module) and `PassBacking`
 // (checked-out function pass) by the macro below.
 macro_rules! impl_param_mut_verbs {
     (<$($l:lifetime),*> $ctx:ty) => {
@@ -274,7 +274,7 @@ macro_rules! impl_param_mut_verbs {
 }
 
 impl_param_mut_verbs!(<'c, 'str> &'c mut Context<'str>);
-impl_param_mut_verbs!(<'a, 'str> CheckedOut<'a, 'str>);
+impl_param_mut_verbs!(<'a, 'str> PassBacking<'a, 'str>);
 
 impl<'s, 'ctx: 's, 'str: 'ctx> WithCtx<'s, 's, 'str> for BlockParamMutRef<'str, 'ctx> {
     fn ctx(&'s self) -> &'s Context<'str> {
