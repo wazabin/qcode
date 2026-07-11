@@ -42,7 +42,7 @@ use crate::{
     types::{AggregateField, TypeId},
     value::{
         Function, Instruction, Renameable, Value, ValueId, ValueRef,
-        block::{BasicBlock, BlockId},
+        block::{BasicBlock, BlockId, EdgeId},
         block_param::BlockParamMutRef,
         function::FunctionId,
         insn::{
@@ -52,15 +52,120 @@ use crate::{
             Mnemonic, PCodeOp, PCodeOpId, PopCount, Range, Return, ReturnValue, SBorrow, SCarry,
             Scan, Sext, Store, TailCall, Tuple, Unary, Unop, Zext,
         },
-        util::{base_ref::BaseRef, host_mut::HostMut},
+        util::{
+            base_ref::{BaseRef, HostRef},
+            host_mut::HostMut,
+        },
         varnode::{Varnode, VarnodeId},
     },
 };
 
+/// The IR mutation surface the [`Builder`] needs, named with a `bb_` prefix so a
+/// backing type that *also* implements [`HostMut`] (e.g. `&mut Context`) exposes
+/// both without method-name ambiguity.
+///
+/// This is the seam that decouples the fluent builder from the
+/// `HostMut`/`CheckedOut` host machinery (context-split Option A, item #2): the
+/// [`Builder`] is generic over `B: BuilderBacking` and performs *every* mutation
+/// through these methods, never naming `HostMut` directly. Two backings exist —
+/// the **module** builder over `&mut Context` (the lifter / lowering / emulator
+/// construction path, which additionally mints temp spaces via
+/// [`Builder::make_temp`]) and the **function-pass** builder over a checked-out
+/// body. Both are supplied transitionally by the blanket delegation to [`HostMut`]
+/// below; when the host is retired (item #3) that blanket is replaced by two
+/// direct impls and the builder is untouched.
+#[doc(hidden)]
+pub trait BuilderBacking<'str> {
+    /// The module's shared data (read) — types, literals, spaces, registers, maps.
+    fn bb_shared(&self) -> &Context<'str>;
+    /// The module's shared data (write), for temp/varnode minting. Only the module
+    /// backing (`&mut Context`) provides it; a pass backing panics (mirrors the
+    /// checked-out host's runtime guard).
+    fn bb_shared_mut(&mut self) -> &mut Context<'str> {
+        unimplemented!("temp/varnode minting requires the module Builder (&mut Context)")
+    }
+    /// A `Copy` read view for the builder's arena reads (`ValueRef::from_host`,
+    /// instruction/block-param/block reads).
+    fn bb_read_host(&self) -> HostRef<'_, 'str>;
+    /// The owning function's storage (write).
+    fn bb_function_mut(&mut self, f: FunctionId) -> &mut Function<'str>;
+    /// The instruction `id`, routed to its owning function's arena (write).
+    fn bb_instruction_mut(&mut self, id: InstructionId) -> &mut Instruction<'str>;
+    /// The block `id`, routed to its owning function's arena (write).
+    fn bb_block_mut(&mut self, id: BlockId) -> &mut BasicBlock<'str>;
+    /// Register a function-local (block/instruction/param) or global name.
+    fn bb_register_local_name(
+        &mut self,
+        id: ValueId,
+        name: Cow<'str, str>,
+        old: Option<&str>,
+    ) -> crate::error::Result<()>;
+    /// Push a fresh instruction into `func`'s arena (use-map + call-site upkeep).
+    fn bb_push_insn(&mut self, func: FunctionId, insn: Instruction<'str>) -> InstructionId;
+    /// Push a fresh block into `func`'s arena and onto its roster.
+    fn bb_push_block(&mut self, func: FunctionId, block: BasicBlock<'str>) -> BlockId;
+    /// Add a directed CFG edge `from -> to`, stored in `from`'s edge arena.
+    fn bb_add_cfg_edge(&mut self, from: BlockId, to: BlockId) -> EdgeId;
+
+    /// Append `id` to the end of `block`, setting its parent.
+    fn bb_block_append_insn(&mut self, block: BlockId, id: InstructionId) {
+        self.bb_instruction_mut(id).parent = Some(block);
+        self.bb_block_mut(block).instructions.push(id);
+    }
+    /// Insert `id` at `index` in `block`, shifting later instructions right, and
+    /// set its parent.
+    fn bb_block_insert_insn_at(&mut self, block: BlockId, index: usize, id: InstructionId) {
+        self.bb_instruction_mut(id).parent = Some(block);
+        self.bb_block_mut(block).instructions.insert(index, id);
+    }
+}
+
+/// Transitional blanket: every [`HostMut`] is a [`BuilderBacking`] by pure
+/// delegation, so both the module (`&mut Context`) and function-pass
+/// (`CheckedOut`) hosts back a builder with no call-site change. Item #3 replaces
+/// this with two direct impls when [`HostMut`] is deleted.
+impl<'str, T: HostMut<'str>> BuilderBacking<'str> for T {
+    fn bb_shared(&self) -> &Context<'str> {
+        self.shared()
+    }
+    fn bb_shared_mut(&mut self) -> &mut Context<'str> {
+        self.shared_mut()
+    }
+    fn bb_read_host(&self) -> HostRef<'_, 'str> {
+        self.read_host()
+    }
+    fn bb_function_mut(&mut self, f: FunctionId) -> &mut Function<'str> {
+        self.function_mut(f)
+    }
+    fn bb_instruction_mut(&mut self, id: InstructionId) -> &mut Instruction<'str> {
+        self.instruction_mut(id)
+    }
+    fn bb_block_mut(&mut self, id: BlockId) -> &mut BasicBlock<'str> {
+        self.block_mut(id)
+    }
+    fn bb_register_local_name(
+        &mut self,
+        id: ValueId,
+        name: Cow<'str, str>,
+        old: Option<&str>,
+    ) -> crate::error::Result<()> {
+        self.register_local_name(id, name, old)
+    }
+    fn bb_push_insn(&mut self, func: FunctionId, insn: Instruction<'str>) -> InstructionId {
+        self.push_insn(func, insn)
+    }
+    fn bb_push_block(&mut self, func: FunctionId, block: BasicBlock<'str>) -> BlockId {
+        self.push_block(func, block)
+    }
+    fn bb_add_cfg_edge(&mut self, from: BlockId, to: BlockId) -> EdgeId {
+        self.add_cfg_edge(from, to)
+    }
+}
+
 /// A builder for constructing instructions in a block.
 /// This provides a convenient API for creating instructions, and automatically
 /// manages temporary values and labels.
-pub struct Builder<'str, 'ctx, Ctx: HostMut<'str> = &'ctx mut Context<'str>> {
+pub struct Builder<'str, 'ctx, Ctx: BuilderBacking<'str> = &'ctx mut Context<'str>> {
     pub block: BaseRef<Ctx, BlockId>,
 
     /// Converts from names to value IDs in the current scope.
@@ -147,14 +252,19 @@ impl<'str, 'ctx> Builder<'str, 'ctx, &'ctx mut Context<'str>> {
     }
 }
 
-impl<'str, 'ctx, Ctx: HostMut<'str>> Builder<'str, 'ctx, Ctx> {
+impl<'str, 'ctx, Ctx: BuilderBacking<'str>> Builder<'str, 'ctx, Ctx> {
     /// Creates a builder positioned at `block`.
     ///
     /// The block is borrowed mutably for the lifetime `'ctx`. New instructions
     /// will be appended to the end of `block`.
     pub fn from_block(block: BaseRef<Ctx, BlockId>) -> Self {
+        let is_terminated = block
+            .host_ref()
+            .bb_read_host()
+            .block_ref(block.id)
+            .is_terminated();
         Self {
-            is_terminated: block.is_terminated(),
+            is_terminated,
             verify_terminated: true,
             block,
             namespace: HashMap::default(),
@@ -165,9 +275,16 @@ impl<'str, 'ctx, Ctx: HostMut<'str>> Builder<'str, 'ctx, Ctx> {
         }
     }
 
+    /// A `Copy` read view over the builder's backing, for arena reads. Replaces
+    /// the former `BaseRef<Ctx, BlockId>` block-ref reads, which required
+    /// `Ctx: HostMut`; the builder now reads through the backing's `HostRef`.
+    fn read_host(&self) -> HostRef<'_, 'str> {
+        self.block.host_ref().bb_read_host()
+    }
+
     /// Returns `true` if the current block ends with a terminator instruction.
     pub fn is_terminated(&self) -> bool {
-        self.block.is_terminated()
+        self.read_host().block_ref(self.block.id).is_terminated()
     }
 
     /// Sets the current address for instructions added by this builder.
@@ -204,7 +321,8 @@ impl<'str, 'ctx, Ctx: HostMut<'str>> Builder<'str, 'ctx, Ctx> {
     /// Panics if `before_id` is not an instruction in the current block.
     pub fn set_insert_point_before(&mut self, before_id: InstructionId) {
         let index = self
-            .block
+            .read_host()
+            .block_ref(self.block.id)
             .instruction_ids()
             .iter()
             .position(|&id| id == before_id)
@@ -319,7 +437,7 @@ impl<'str, 'ctx, Ctx: HostMut<'str>> Builder<'str, 'ctx, Ctx> {
 
     pub fn switch_to_block(&mut self, block: BlockId) {
         self.block.id = block;
-        self.is_terminated = self.block.is_terminated();
+        self.is_terminated = self.read_host().block_ref(block).is_terminated();
     }
 
     /// The block the builder is currently appending to.
@@ -336,11 +454,11 @@ impl<'str, 'ctx, Ctx: HostMut<'str>> Builder<'str, 'ctx, Ctx> {
     /// through the host, so a checked-out builder mints into shared storage while
     /// arena writes stay in the owned function.
     pub fn context_mut(&mut self) -> &mut Context<'str> {
-        self.block.host_mut().shared_mut()
+        self.block.host_mut().bb_shared_mut()
     }
 
     pub fn context(&self) -> &Context<'str> {
-        self.block.host_ref().shared()
+        self.block.host_ref().bb_shared()
     }
 
     /// Retype an instruction's result as a pointer into `space` (host-routed
@@ -353,27 +471,27 @@ impl<'str, 'ctx, Ctx: HostMut<'str>> Builder<'str, 'ctx, Ctx> {
         ) {
             return;
         }
-        let cur_type = self.block.host_mut().instruction_mut(id).type_id;
+        let cur_type = self.block.host_mut().bb_instruction_mut(id).type_id;
         let size = self.context().shared.types.size_of(cur_type);
         let type_id = self
             .context()
             .shared
             .types
             .get_or_make_space_address(size, space);
-        self.block.host_mut().instruction_mut(id).type_id = type_id;
+        self.block.host_mut().bb_instruction_mut(id).type_id = type_id;
     }
 
     /// Rename an instruction's result (host-routed mirror of the instruction
     /// `Renameable`): registers the (function-local) name in the owning function's
     /// table and sets the arena field.
     fn rename_insn(&mut self, id: InstructionId, name: Cow<'str, str>) -> crate::error::Result<()> {
-        let old = self.block.host_mut().instruction_mut(id).name.clone();
-        self.block.host_mut().register_local_name(
+        let old = self.block.host_mut().bb_instruction_mut(id).name.clone();
+        self.block.host_mut().bb_register_local_name(
             ValueId::Instruction(id),
             name.clone(),
             old.as_deref(),
         )?;
-        self.block.host_mut().instruction_mut(id).name = Some(name);
+        self.block.host_mut().bb_instruction_mut(id).name = Some(name);
         Ok(())
     }
 
@@ -421,61 +539,62 @@ impl<'str, 'ctx, Ctx: HostMut<'str>> Builder<'str, 'ctx, Ctx> {
         type_id: TypeId,
     ) -> InstructionRef<'str, '_> {
         if self.is_terminated && self.insert_point.is_none() {
-            if let Some(address) = self.address.or_else(|| self.block.address()) {
+            let block_address = self.read_host().block_ref(self.block.id).address();
+            if let Some(address) = self.address.or(block_address) {
                 panic!("cannot append instruction to a terminated block at {address:#x}");
             }
             panic!("cannot append instruction to a terminated block");
         }
 
         let func = self.block.id.func;
+        let block_id = self.block.id;
         let insn = Instruction::new(type_id, mnemonic);
-        let id = self.block.host_mut().push_insn(func, insn);
+        let id = self.block.host_mut().bb_push_insn(func, insn);
 
         if let Some(address) = self.address {
             self.block
                 .host_mut()
-                .instruction_mut(id)
+                .bb_instruction_mut(id)
                 .set_address(address);
         }
 
         match self.insert_point {
-            None => self.block.push_insn(id),
+            None => self.block.host_mut().bb_block_append_insn(block_id, id),
             Some(ref mut pos) => {
-                self.block.insert_insn_at_index(*pos, id);
+                let index = *pos;
+                self.block
+                    .host_mut()
+                    .bb_block_insert_insn_at(block_id, index, id);
                 *pos += 1;
             }
         }
 
-        InstructionRef::new(self.block.host_ref().read_host(), id)
+        InstructionRef::new(self.block.host_ref().bb_read_host(), id)
     }
 
     fn get_value(&self, id: ValueId) -> ValueRef<'str, '_> {
         // Route through the host's read view so a checked-out builder resolves its
         // own function's SSA values (which live in the owned function, not the
         // shared context) correctly.
-        ValueRef::from_host(self.block.host_ref().read_host(), id)
+        ValueRef::from_host(self.read_host(), id)
     }
 
     /// The result type of `id`, host-routed (mirror of [`Context::type_of`]): a
     /// checked-out function's instruction/param types live in the owned arena.
     fn type_of(&mut self, id: ValueId) -> TypeId {
         match id {
-            ValueId::Instruction(iid) => self.block.host_ref().read_host().instruction(iid).type_id,
-            ValueId::BlockParam(pid) => self.block.host_ref().read_host().block_param(pid).type_id,
-            other => self.block.host_ref().shared().type_of(other),
+            ValueId::Instruction(iid) => self.read_host().instruction(iid).type_id,
+            ValueId::BlockParam(pid) => self.read_host().block_param(pid).type_id,
+            other => self.context().type_of(other),
         }
     }
 
     /// The stored type of `id`, host-routed (mirror of [`Context::stored_type_of`]).
     fn stored_type_of(&self, id: ValueId) -> Option<TypeId> {
         match id {
-            ValueId::Instruction(iid) => {
-                Some(self.block.host_ref().read_host().instruction(iid).type_id)
-            }
-            ValueId::BlockParam(pid) => {
-                Some(self.block.host_ref().read_host().block_param(pid).type_id)
-            }
-            other => self.block.host_ref().shared().stored_type_of(other),
+            ValueId::Instruction(iid) => Some(self.read_host().instruction(iid).type_id),
+            ValueId::BlockParam(pid) => Some(self.read_host().block_param(pid).type_id),
+            other => self.context().stored_type_of(other),
         }
     }
 
@@ -525,20 +644,20 @@ impl<'str, 'ctx, Ctx: HostMut<'str>> Builder<'str, 'ctx, Ctx> {
         let unique_name = self
             .block
             .host_mut()
-            .function_mut(func)
+            .bb_function_mut(func)
             .names
             .unique(name.clone());
         let id = self
             .block
             .host_mut()
-            .push_block(func, BasicBlock::detached(func));
+            .bb_push_block(func, BasicBlock::detached(func));
         self.block
             .host_mut()
-            .register_local_name(ValueId::BasicBlock(id), unique_name.clone(), None)
+            .bb_register_local_name(ValueId::BasicBlock(id), unique_name.clone(), None)
             .expect("name was deduplicated");
         self.block
             .host_mut()
-            .block_mut(id)
+            .bb_block_mut(id)
             .set_name(Some(unique_name));
         self.local_labels.insert(name, id);
         id
@@ -1345,7 +1464,7 @@ impl<'str, 'ctx, Ctx: HostMut<'str>> Builder<'str, 'ctx, Ctx> {
                 let name = self
                     .block
                     .host_mut()
-                    .function_mut(func)
+                    .bb_function_mut(func)
                     .names
                     .unique(Cow::Owned(lowered));
                 self.rename_insn(id, name)
@@ -1414,7 +1533,7 @@ impl<'str, 'ctx, Ctx: HostMut<'str>> Builder<'str, 'ctx, Ctx> {
         args: Vec<ValueId>,
     ) -> InstructionRef<'str, '_> {
         let current = self.block.id;
-        self.block.host_mut().add_cfg_edge(current, target);
+        self.block.host_mut().bb_add_cfg_edge(current, target);
         let id = self
             .push_instruction(Mnemonic::Branch(Branch { target, args }), 0)
             .id;
@@ -1445,8 +1564,8 @@ impl<'str, 'ctx, Ctx: HostMut<'str>> Builder<'str, 'ctx, Ctx> {
             "push_cbranch: varnode condition not allowed; load the value first"
         );
         let current = self.block.id;
-        self.block.host_mut().add_cfg_edge(current, target);
-        self.block.host_mut().add_cfg_edge(current, fallthrough);
+        self.block.host_mut().bb_add_cfg_edge(current, target);
+        self.block.host_mut().bb_add_cfg_edge(current, fallthrough);
         let id = self
             .push_instruction(
                 Mnemonic::CBranch(CBranch {
@@ -1637,7 +1756,7 @@ impl<'str, 'ctx> Builder<'str, 'ctx, &'ctx mut Context<'str>> {
     }
 }
 
-impl<'str, 'ctx, Ctx: HostMut<'str>> Drop for Builder<'str, 'ctx, Ctx> {
+impl<'str, 'ctx, Ctx: BuilderBacking<'str>> Drop for Builder<'str, 'ctx, Ctx> {
     fn drop(&mut self) {
         if std::thread::panicking() {
             return;
@@ -1645,7 +1764,7 @@ impl<'str, 'ctx, Ctx: HostMut<'str>> Drop for Builder<'str, 'ctx, Ctx> {
 
         if !self.is_terminated &&
         // I don't see how this can happen, but just in case, we also check if the block is actually terminated, to avoid panicking when dropping a builder that has already been finalized
-        !self.block.is_terminated()
+        !self.is_terminated()
         {
             // This is terrible and should be done at compile time, but this is seamingly impossible in rust ?
             // panic!(
