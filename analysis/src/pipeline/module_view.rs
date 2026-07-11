@@ -206,12 +206,9 @@ pub struct FunctionBody<'a, 'str> {
     fun: &'a mut Function<'str>,
     /// Never-observed placeholder [`FunctionId`]s the pass may materialize new
     /// functions into (loop outliners mint exactly one). Unused ids return to the
-    /// driver's pool at the barrier.
+    /// driver's pool at the barrier; drawn ids are paired with their built body in
+    /// the pass's `minted` buffer, destined for [`Outcome::minted`].
     reserved_ids: Vec<FunctionId>,
-    /// Functions built this run against drawn `reserved_ids` (paired with the id
-    /// each was drawn for, and its interface), installed by the driver at
-    /// the barrier.
-    minted: Vec<Minted<'str>>,
 }
 
 impl<'a, 'str> FunctionBody<'a, 'str> {
@@ -222,7 +219,6 @@ impl<'a, 'str> FunctionBody<'a, 'str> {
             id,
             fun,
             reserved_ids,
-            minted: Vec::new(),
         }
     }
 
@@ -260,14 +256,17 @@ impl<'a, 'str> FunctionBody<'a, 'str> {
     /// from the pool the driver assigned this run, create a detached
     /// [`Function`] shell under `name` (buffered **raw** — global uniquification
     /// happens when the driver installs it at the barrier) with the given `kind`,
-    /// and return its id. `pure` marks it a deterministic pure function
-    /// (`is_pure` + the implied `pure_reg`), which every current outliner's body
-    /// is. Build the body through [`host_with_minted`](Self::host_with_minted).
+    /// push it into the pass's `minted` buffer (destined for
+    /// [`Outcome::minted`]), and return its id. `pure` marks it a deterministic
+    /// pure function (`is_pure` + the implied `pure_reg`), which every current
+    /// outliner's body is. Build the body through
+    /// [`host_with_minted`](Self::host_with_minted).
     ///
     /// Returns `None` when the reservation pool is exhausted — the calling pass
     /// then simply stops promoting (skips its remaining candidates).
     pub fn mint_function(
         &mut self,
+        minted: &mut Vec<Minted<'str>>,
         name: Cow<'str, str>,
         kind: FunctionKind,
         pure: bool,
@@ -285,21 +284,24 @@ impl<'a, 'str> FunctionBody<'a, 'str> {
             // latter (mirrors `outline_core` / `make_lambda`).
             sig.pure_reg = true;
         }
-        self.minted.push((id, interface, Function::empty_body()));
+        minted.push((id, interface, Function::empty_body()));
         Some(id)
     }
 
-    /// Split this body into a read view of the *own* function and an exclusive
-    /// [`PassBacking`] mutation host over the minted function `minted` (a
-    /// [`mint_function`](Self::mint_function) result). This is how an outliner
-    /// builds a minted body: it clones expression slices out of its own function
-    /// (read) into the minted one (write), both against the same shared context.
+    /// Split into a read view of the *own* function and an exclusive
+    /// [`PassBacking`] mutation host over the minted function `fid` (a
+    /// [`mint_function`](Self::mint_function) result held in the `minted` buffer).
+    /// This is how an outliner builds a minted body: it clones expression slices
+    /// out of its own function (read) into the minted one (write), both against the
+    /// same shared context. The read view borrows `&self`; the mutation host
+    /// borrows the disjoint `minted` buffer, so the two coexist.
     ///
-    /// Panics if `minted` was not minted by this body.
+    /// Panics if `fid` is not in `minted`.
     pub fn host_with_minted<'b>(
-        &'b mut self,
+        &'b self,
+        minted: &'b mut Vec<Minted<'str>>,
         cx: ContextView<'b, 'str>,
-        minted: FunctionId,
+        fid: FunctionId,
     ) -> (HostRef<'b, 'str>, PassBacking<'b, 'str>) {
         let own = HostRef::Checked {
             fun: &*self.fun,
@@ -307,24 +309,21 @@ impl<'a, 'str> FunctionBody<'a, 'str> {
             interfaces: cx.interfaces(),
             id: self.id,
         };
-        let fun = self
-            .minted
+        let fun = minted
             .iter_mut()
-            .find(|(id, _, _)| *id == minted)
+            .find(|(id, _, _)| *id == fid)
             .map(|(_, _, f)| f)
-            .expect("host_with_minted: not a function minted by this body");
-        (
-            own,
-            PassBacking::new(fun, minted, cx.shr(), cx.interfaces()),
-        )
+            .expect("host_with_minted: not a function minted this run");
+        (own, PassBacking::new(fun, fid, cx.shr(), cx.interfaces()))
     }
 
-    /// Consume the body at the barrier, yielding the functions it minted and any
-    /// unused reserved ids (returned to the driver's pool). The self-rename claim
-    /// travels in [`Outcome::rename`], not here. The function itself stays borrowed
-    /// in place in the registry — there is no body to reinstall.
-    pub fn into_parts(self) -> (Vec<Minted<'str>>, Vec<FunctionId>) {
-        (self.minted, self.reserved_ids)
+    /// Consume the body at the barrier, yielding any unused reserved ids (returned
+    /// to the driver's pool). The functions the pass minted travel in
+    /// [`Outcome::minted`] and the self-rename claim in [`Outcome::rename`], not
+    /// here. The function itself stays borrowed in place in the registry — there is
+    /// no body to reinstall.
+    pub fn into_reserved(self) -> Vec<FunctionId> {
+        self.reserved_ids
     }
 }
 

@@ -36,8 +36,8 @@ pub(crate) fn run_function_pass<P: FunctionPass + Send + Sync>(
 }
 
 /// Borrow `fun`'s body in place, run `f` against its [`FunctionBody`] (carrying two
-/// reserved minting ids), then install any minted functions — the
-/// same split/mint/install dance the driver performs, so a test can exercise
+/// reserved minting ids) and a `minted` buffer, then install any minted functions
+/// — the same split/mint/install dance the driver performs, so a test can exercise
 /// the outlining helpers directly and inspect the minted function afterwards.
 /// Returns whatever `f` returns.
 pub(crate) fn with_minting<'str, R>(
@@ -46,16 +46,17 @@ pub(crate) fn with_minting<'str, R>(
     f: impl for<'a> FnOnce(
         crate::pipeline::ContextView<'a, 'str>,
         &mut crate::pipeline::FunctionBody<'_, 'str>,
+        &mut Vec<crate::pipeline::Minted<'str>>,
     ) -> R,
 ) -> R {
-    use crate::pipeline::{ContextSplit, FunctionBody};
+    use crate::pipeline::{ContextSplit, FunctionBody, Minted};
     let reserved: Vec<FunctionId> = (0..2).map(|_| ctx.push_sentinel_function()).collect();
     let env = dummy_env();
     let (out, minted) = {
         let (bodies, view) = ctx.split(&env);
         let mut body = FunctionBody::new(fun, &mut bodies[fun], reserved);
-        let out = f(view, &mut body);
-        let (minted, _unused) = body.into_parts();
+        let mut minted: Vec<Minted<'str>> = Vec::new();
+        let out = f(view, &mut body, &mut minted);
         (out, minted)
     };
     crate::pipeline::install_minted_for_test(ctx, minted);

@@ -1570,7 +1570,7 @@ async fn run_function_stage(
             // split so `resync_call_sites` can diff it afterwards.
             let before_targets = ctx.direct_call_targets(fun_id);
             let reserved = reservations.remove(&fun_id).unwrap_or_default();
-            let (outcome, minted, unused) = {
+            let (outcome, unused) = {
                 let (bodies, view) = ctx.split(env);
                 let mut body = FunctionBody::new(fun_id, &mut bodies[fun_id], reserved);
                 let outcome = run_one_function(
@@ -1593,12 +1593,12 @@ async fn run_function_stage(
                         });
                     },
                 )?;
-                let (minted, unused) = body.into_parts();
-                (outcome, minted, unused)
+                let unused = body.into_reserved();
+                (outcome, unused)
             };
             // Install minted callees before the owner's call sites resync, so the
             // new calls resolve against real functions.
-            let installed = install_minted(ctx, &stage.name, minted)?;
+            let installed = install_minted(ctx, &stage.name, outcome.minted)?;
             ctx.resync_call_sites(fun_id, &before_targets);
             replay_rename(ctx, &stage.name, fun_id, outcome.rename)?;
             // Minted functions are new work for downstream `only_dirty` stages.
@@ -1954,8 +1954,8 @@ fn run_stage_parallel(
         entries
             .into_iter()
             .map(|e| {
-                let (minted, unused) = e.body.into_parts();
-                (e.fun_id, e.before_targets, e.outcome, minted, unused)
+                let unused = e.body.into_reserved();
+                (e.fun_id, e.before_targets, e.outcome, unused)
             })
             .collect::<Vec<_>>()
     };
@@ -1964,8 +1964,8 @@ fn run_stage_parallel(
     //    owner's call sites resync, rebuild `call_sites`, apply the returned
     //    self-rename, and record dirtiness. The bodies were mutated in place, so
     //    there is nothing to reinstall.
-    for (fun_id, before_targets, outcome, minted, unused) in results {
-        let installed = install_minted(ctx, &stage.name, minted)?;
+    for (fun_id, before_targets, outcome, unused) in results {
+        let installed = install_minted(ctx, &stage.name, outcome.minted)?;
         ctx.resync_call_sites(fun_id, &before_targets);
         replay_rename(ctx, &stage.name, fun_id, outcome.rename)?;
         dirty.extend(installed);

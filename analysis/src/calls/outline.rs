@@ -22,7 +22,7 @@ use qcode::{
     },
 };
 
-use crate::pipeline::{ContextView, FunctionBody};
+use crate::pipeline::{ContextView, FunctionBody, Minted};
 
 /// Whether `m` is a pure value-computing op that may appear inside an outlined
 /// per-element body: arithmetic, casts, bit ops, aggregate projection. Anything
@@ -99,22 +99,31 @@ pub(crate) fn pure_slice<'a, 'str: 'a>(
 pub(crate) fn outline_expression<'str>(
     m: ContextView<'_, 'str>,
     body: &mut FunctionBody<'_, 'str>,
+    minted_out: &mut Vec<Minted<'str>>,
     name: &str,
     result: ValueId,
     inputs: &[ValueId],
 ) -> Option<FunctionId> {
     let slice = pure_slice(body.read_host(m), result, inputs)?;
     let inputs = inputs.to_vec();
-    outline_core(m, body, name, result, &slice, move |own, minted, root| {
-        // Parameters, in input order, typed as the host inputs.
-        let mut value_map: HashMap<ValueId, ValueId> = HashMap::default();
-        for inp in inputs {
-            let ty = own.type_of(inp);
-            let pid = push_param_into(minted, root, ty);
-            value_map.insert(inp, pid);
-        }
-        value_map
-    })
+    outline_core(
+        m,
+        body,
+        minted_out,
+        name,
+        result,
+        &slice,
+        move |own, minted, root| {
+            // Parameters, in input order, typed as the host inputs.
+            let mut value_map: HashMap<ValueId, ValueId> = HashMap::default();
+            for inp in inputs {
+                let ty = own.type_of(inp);
+                let pid = push_param_into(minted, root, ty);
+                value_map.insert(inp, pid);
+            }
+            value_map
+        },
+    )
 }
 
 /// Outline a body that takes a single `enumerate` tuple param `(index, elem)` and
@@ -129,9 +138,11 @@ pub(crate) fn outline_expression<'str>(
 ///
 /// Returns `None` if the expression is not closed over `(index, elem?)` + literals
 /// (see [`pure_slice`]).
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn outline_tupled<'str>(
     m: ContextView<'_, 'str>,
     body: &mut FunctionBody<'_, 'str>,
+    minted_out: &mut Vec<Minted<'str>>,
     name: &str,
     result: ValueId,
     index_input: ValueId,
@@ -141,32 +152,40 @@ pub(crate) fn outline_tupled<'str>(
     let mut inputs = vec![index_input];
     inputs.extend(elem_input);
     let slice = pure_slice(body.read_host(m), result, &inputs)?;
-    outline_core(m, body, name, result, &slice, move |own, minted, root| {
-        let mut value_map: HashMap<ValueId, ValueId> = HashMap::default();
-        let tuple = push_param_into(minted, root, tuple_ty);
-        // index = t.0, elem = t.1 — the extracts the body unpacks. `elem` is only
-        // extracted when the body actually consumes the lane element.
-        let fields = [(0usize, Some(index_input)), (1usize, elem_input)];
-        for (field, input) in fields {
-            let Some(input) = input else { continue };
-            let fty = own
-                .shr()
-                .types
-                .field_type(tuple_ty, field)
-                .expect("enumerate tuple field");
-            let ex = push_insn_into(
-                minted,
-                root,
-                Mnemonic::Extract(Extract {
-                    agg: tuple,
-                    index: field,
-                }),
-                fty,
-            );
-            value_map.insert(input, ex);
-        }
-        value_map
-    })
+    outline_core(
+        m,
+        body,
+        minted_out,
+        name,
+        result,
+        &slice,
+        move |own, minted, root| {
+            let mut value_map: HashMap<ValueId, ValueId> = HashMap::default();
+            let tuple = push_param_into(minted, root, tuple_ty);
+            // index = t.0, elem = t.1 — the extracts the body unpacks. `elem` is only
+            // extracted when the body actually consumes the lane element.
+            let fields = [(0usize, Some(index_input)), (1usize, elem_input)];
+            for (field, input) in fields {
+                let Some(input) = input else { continue };
+                let fty = own
+                    .shr()
+                    .types
+                    .field_type(tuple_ty, field)
+                    .expect("enumerate tuple field");
+                let ex = push_insn_into(
+                    minted,
+                    root,
+                    Mnemonic::Extract(Extract {
+                        agg: tuple,
+                        index: field,
+                    }),
+                    fty,
+                );
+                value_map.insert(input, ex);
+            }
+            value_map
+        },
+    )
 }
 
 /// How a [`Scan`](qcode::value::insn::Scan) body receives its per-lane input
@@ -200,6 +219,7 @@ pub(crate) enum ScanElem {
 pub(crate) fn outline_scan_body<'str>(
     m: ContextView<'_, 'str>,
     body: &mut FunctionBody<'_, 'str>,
+    minted_out: &mut Vec<Minted<'str>>,
     name: &str,
     result: ValueId,
     acc_input: ValueId,
@@ -223,74 +243,82 @@ pub(crate) fn outline_scan_body<'str>(
         ScanElem::Data(_) => vec![acc_input, elem_input?],
     };
     let slice = pure_slice(body.read_host(m), result, &inputs)?;
-    outline_core(m, body, name, result, &slice, move |own, minted, root| {
-        let mut value_map: HashMap<ValueId, ValueId> = HashMap::default();
-        // Param 0: the accumulator.
-        let apid = push_param_into(minted, root, acc_ty);
-        value_map.insert(acc_input, apid);
-        // Param 1: the per-lane input. The body's loop index is
-        // `(index_ty)(raw) + index_start` — the `i64` driver value narrowed to the
-        // loop index's width, shifted so element 0 maps to the loop's first index
-        // (it may count from 1 while the array is 0-based). In tuple mode `raw` is
-        // `t.0` of the `enumerate` element; in scalar mode `raw` is the param
-        // itself (the `iota` lane).
-        let param_ty = match elem {
-            ScanElem::Scalar(elem_ty) => elem_ty,
-            ScanElem::Data(elem_ty) => elem_ty,
-        };
-        let param = push_param_into(minted, root, param_ty);
-        // Data mode: the param *is* the element; bind it and skip index derivation.
-        if let ScanElem::Data(_) = elem {
-            value_map.insert(elem_input.expect("data mode requires elem_input"), param);
-            return value_map;
-        }
-        // `idx` is the raw index driver value before narrow/shift: in scalar mode
-        // the param itself (the `iota` lane), directly.
-        let (mut idx, fty): (ValueId, TypeId) = match elem {
-            // Scalar: the param is the index driver value directly.
-            ScanElem::Scalar(elem_ty) => (param, elem_ty),
-            // Data mode returned above.
-            ScanElem::Data(_) => unreachable!("data mode handled above"),
-        };
-        let types = &own.shr().types;
-        // Narrow `i64` index → loop index width.
-        let isz = types.size_of(index_ty);
-        if isz < types.size_of(fty) {
-            let r = push_insn_into(
-                minted,
-                root,
-                Mnemonic::Range(Range {
-                    src: idx,
-                    start: 0,
-                    size: isz,
-                }),
-                index_ty,
-            );
-            idx = r;
-        }
-        // Shift by the start index.
-        if index_start != 0 {
-            let mask = if isz >= 8 {
-                u64::MAX
-            } else {
-                (1u64 << (isz * 8)) - 1
+    outline_core(
+        m,
+        body,
+        minted_out,
+        name,
+        result,
+        &slice,
+        move |own, minted, root| {
+            let mut value_map: HashMap<ValueId, ValueId> = HashMap::default();
+            // Param 0: the accumulator.
+            let apid = push_param_into(minted, root, acc_ty);
+            value_map.insert(acc_input, apid);
+            // Param 1: the per-lane input. The body's loop index is
+            // `(index_ty)(raw) + index_start` — the `i64` driver value narrowed to the
+            // loop index's width, shifted so element 0 maps to the loop's first index
+            // (it may count from 1 while the array is 0-based). In tuple mode `raw` is
+            // `t.0` of the `enumerate` element; in scalar mode `raw` is the param
+            // itself (the `iota` lane).
+            let param_ty = match elem {
+                ScanElem::Scalar(elem_ty) => elem_ty,
+                ScanElem::Data(elem_ty) => elem_ty,
             };
-            let c = own.shr().get_const((index_start as u64) & mask, isz);
-            let add = push_insn_into(
-                minted,
-                root,
-                Mnemonic::Binop(Binary {
-                    lhs: idx,
-                    rhs: c,
-                    op: Binop::Int(IntBinop::Add),
-                }),
-                index_ty,
-            );
-            idx = add;
-        }
-        value_map.insert(index_input, idx);
-        value_map
-    })
+            let param = push_param_into(minted, root, param_ty);
+            // Data mode: the param *is* the element; bind it and skip index derivation.
+            if let ScanElem::Data(_) = elem {
+                value_map.insert(elem_input.expect("data mode requires elem_input"), param);
+                return value_map;
+            }
+            // `idx` is the raw index driver value before narrow/shift: in scalar mode
+            // the param itself (the `iota` lane), directly.
+            let (mut idx, fty): (ValueId, TypeId) = match elem {
+                // Scalar: the param is the index driver value directly.
+                ScanElem::Scalar(elem_ty) => (param, elem_ty),
+                // Data mode returned above.
+                ScanElem::Data(_) => unreachable!("data mode handled above"),
+            };
+            let types = &own.shr().types;
+            // Narrow `i64` index → loop index width.
+            let isz = types.size_of(index_ty);
+            if isz < types.size_of(fty) {
+                let r = push_insn_into(
+                    minted,
+                    root,
+                    Mnemonic::Range(Range {
+                        src: idx,
+                        start: 0,
+                        size: isz,
+                    }),
+                    index_ty,
+                );
+                idx = r;
+            }
+            // Shift by the start index.
+            if index_start != 0 {
+                let mask = if isz >= 8 {
+                    u64::MAX
+                } else {
+                    (1u64 << (isz * 8)) - 1
+                };
+                let c = own.shr().get_const((index_start as u64) & mask, isz);
+                let add = push_insn_into(
+                    minted,
+                    root,
+                    Mnemonic::Binop(Binary {
+                        lhs: idx,
+                        rhs: c,
+                        op: Binop::Int(IntBinop::Add),
+                    }),
+                    index_ty,
+                );
+                idx = add;
+            }
+            value_map.insert(index_input, idx);
+            value_map
+        },
+    )
 }
 
 /// The result type of a `map`/`scan` over `src` whose body returns `body_ret`,
@@ -352,6 +380,7 @@ fn push_insn_into<'str>(
 fn outline_core<'str>(
     m: ContextView<'_, 'str>,
     body: &mut FunctionBody<'_, 'str>,
+    minted_out: &mut Vec<Minted<'str>>,
     name: &str,
     result: ValueId,
     slice: &[InstructionId],
@@ -365,6 +394,7 @@ fn outline_core<'str>(
     // implied `pure_reg`) is set by `mint_function`; the GUI purity badge keys
     // off `pure_reg`.
     let fid = body.mint_function(
+        minted_out,
         std::borrow::Cow::Owned(name.to_owned()),
         FunctionKind::Machine,
         /*pure*/ true,
@@ -385,7 +415,7 @@ fn outline_core<'str>(
     let dummy_ptr = m.shr().get_const(0, 8);
     let ret_ty = m.shr().types.get_or_make_int(1);
 
-    let (own, mut minted) = body.host_with_minted(m, fid);
+    let (own, mut minted) = body.host_with_minted(minted_out, m, fid);
     // Root block, set as the minted function's entry, named for display (block
     // names are function-scoped, so uniqueness is within the new function).
     let root = minted.make_block(fid);
@@ -507,8 +537,8 @@ mod tests {
             (idx, elem, result)
         };
 
-        let body = crate::test_util::with_minting(&mut tc.ctx, host, |m, body| {
-            outline_expression(m, body, "body", result, &[idx, elem])
+        let body = crate::test_util::with_minting(&mut tc.ctx, host, |m, body, minted| {
+            outline_expression(m, body, minted, "body", result, &[idx, elem])
         })
         .expect("expression is closed over (idx, elem)");
 
@@ -567,8 +597,8 @@ mod tests {
         };
 
         assert!(
-            crate::test_util::with_minting(&mut tc.ctx, host, |m, body| {
-                outline_expression(m, body, "body", result, &[idx])
+            crate::test_util::with_minting(&mut tc.ctx, host, |m, body, minted| {
+                outline_expression(m, body, minted, "body", result, &[idx])
             })
             .is_none(),
             "an expression reaching a load must not outline"
@@ -603,8 +633,8 @@ mod tests {
         let enum_ty = enum_id.desc().result_type(&tc.ctx.shared.types, &[arr_ty]);
         let (tuple_ty, _) = tc.ctx.shared.types.array_of(enum_ty).unwrap();
 
-        let body = crate::test_util::with_minting(&mut tc.ctx, host, |m, body| {
-            outline_tupled(m, body, "body", result, idx, Some(elem), tuple_ty)
+        let body = crate::test_util::with_minting(&mut tc.ctx, host, |m, body, minted| {
+            outline_tupled(m, body, minted, "body", result, idx, Some(elem), tuple_ty)
         })
         .expect("expression is closed over (idx, elem)");
 

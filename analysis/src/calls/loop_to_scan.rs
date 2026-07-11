@@ -50,7 +50,7 @@ use crate::loop_info::{
     cbranch_exit, delete_private_loop, incoming, is_increment, is_loop_private, literal,
     param_parent, param_pos,
 };
-use crate::pipeline::{ContextView, FunctionBody, Outcome};
+use crate::pipeline::{ContextView, FunctionBody, Minted, Outcome};
 use crate::{FunctionPass, register_function_pass};
 
 #[derive(Default)]
@@ -207,6 +207,7 @@ fn try_match(host: HostRef, fid: FunctionId) -> Option<ScanMatch> {
 fn apply<'str>(
     mv: ContextView<'_, 'str>,
     body: &mut FunctionBody<'_, 'str>,
+    minted: &mut Vec<Minted<'str>>,
     m: &ScanMatch,
 ) -> bool {
     let fid = body.id();
@@ -244,6 +245,7 @@ fn apply<'str>(
             let Some(body_fn) = outline_scan_body(
                 mv,
                 body,
+                minted,
                 &name,
                 m.stored_val,
                 m.prev_val,
@@ -263,6 +265,7 @@ fn apply<'str>(
             let Some(body_fn) = outline_scan_body(
                 mv,
                 body,
+                minted,
                 &name,
                 m.stored_val,
                 m.prev_val,
@@ -442,7 +445,13 @@ impl FunctionPass for LoopToScan {
         m: ContextView<'_, 'str>,
     ) -> Result<Outcome<'str>, String> {
         if let Some(sm) = try_match(f.read_host(m), f.id()) {
-            return Ok(Outcome::changed(apply(m, f, &sm)));
+            let mut minted = Vec::new();
+            let changed = apply(m, f, &mut minted, &sm);
+            return Ok(Outcome {
+                changed,
+                rename: None,
+                minted,
+            });
         }
         Ok(Outcome::unchanged())
     }

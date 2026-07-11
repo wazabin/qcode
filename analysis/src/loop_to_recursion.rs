@@ -45,7 +45,7 @@ use qcode::{
     },
 };
 
-use crate::pipeline::{ContextView, FunctionBody, Outcome};
+use crate::pipeline::{ContextView, FunctionBody, Minted, Outcome};
 use crate::{FunctionPass, register_function_pass};
 
 #[derive(Default)]
@@ -64,7 +64,13 @@ impl FunctionPass for LoopToRecursion {
         f: &mut FunctionBody<'_, 'str>,
         m: ContextView<'_, 'str>,
     ) -> Result<Outcome<'str>, String> {
-        Ok(Outcome::changed(loop_to_recursion(m, f)))
+        let mut minted = Vec::new();
+        let changed = loop_to_recursion(m, f, &mut minted);
+        Ok(Outcome {
+            changed,
+            rename: None,
+            minted,
+        })
     }
 }
 
@@ -88,11 +94,12 @@ pub(crate) struct LoopModel {
 pub fn loop_to_recursion<'str>(
     m: ContextView<'_, 'str>,
     body: &mut FunctionBody<'_, 'str>,
+    minted: &mut Vec<Minted<'str>>,
 ) -> bool {
     let Some(model) = recognize_loop(body.read_host(m), body.id()) else {
         return false;
     };
-    transform(m, body, &model)
+    transform(m, body, minted, &model)
 }
 
 pub(crate) fn recognize_loop<'a, 'str: 'a>(
@@ -168,13 +175,15 @@ pub(crate) fn recognize_loop<'a, 'str: 'a>(
 fn transform<'str>(
     m: ContextView<'_, 'str>,
     body: &mut FunctionBody<'_, 'str>,
+    minted_out: &mut Vec<Minted<'str>>,
     model: &LoopModel,
 ) -> bool {
     let host_fid = body.id();
     let name = format!("{}_rec", body.read_host(m).function_ref(host_fid).name());
     // Mint the recursive lambda (name buffered raw; the driver uniquifies it at
     // the barrier). `None` (pool exhausted) leaves the loop alone.
-    let Some(rec) = body.mint_function(Cow::Owned(name), FunctionKind::Lambda, true) else {
+    let Some(rec) = body.mint_function(minted_out, Cow::Owned(name), FunctionKind::Lambda, true)
+    else {
         return false;
     };
 
@@ -189,7 +198,7 @@ fn transform<'str>(
     // TODO(5b-ii): function minting (`host_with_minted`) stays on the host path
     // until the minting chunk lands.
     {
-        let (own, mut minted) = body.host_with_minted(m, rec);
+        let (own, mut minted) = body.host_with_minted(minted_out, m, rec);
 
         // Pass 1: a fresh block per region block, with its params cloned. Names
         // and the head-as-root are set here so later passes can reference them.

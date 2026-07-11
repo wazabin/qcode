@@ -60,7 +60,7 @@ use qcode::{
 };
 
 use crate::loop_to_recursion::recognize_loop;
-use crate::pipeline::{ContextView, FunctionBody, Outcome};
+use crate::pipeline::{ContextView, FunctionBody, Minted, Outcome};
 use crate::{FunctionPass, register_function_pass};
 
 #[derive(Default)]
@@ -79,18 +79,28 @@ impl FunctionPass for AccumulatorElim {
         f: &mut FunctionBody<'_, 'str>,
         m: ContextView<'_, 'str>,
     ) -> Result<Outcome<'str>, String> {
-        Ok(Outcome::changed(accumulator_elim(m, f)))
+        let mut minted = Vec::new();
+        let changed = accumulator_elim(m, f, &mut minted);
+        Ok(Outcome {
+            changed,
+            rename: None,
+            minted,
+        })
     }
 }
 
 register_function_pass!(AccumulatorElim);
 
-pub fn accumulator_elim<'str>(m: ContextView<'_, 'str>, body: &mut FunctionBody<'_, 'str>) -> bool {
+pub fn accumulator_elim<'str>(
+    m: ContextView<'_, 'str>,
+    body: &mut FunctionBody<'_, 'str>,
+    minted: &mut Vec<Minted<'str>>,
+) -> bool {
     let host = body.id();
     let Some((model, plan)) = classify(body.read_host(m), host) else {
         return false;
     };
-    transform(m, body, &model, &plan);
+    transform(m, body, minted, &model, &plan);
     true
 }
 
@@ -260,6 +270,7 @@ struct Plan {
 fn transform<'str>(
     m: ContextView<'_, 'str>,
     body: &mut FunctionBody<'_, 'str>,
+    minted_out: &mut Vec<Minted<'str>>,
     model: &crate::loop_to_recursion::LoopModel,
     p: &Plan,
 ) {
@@ -267,14 +278,18 @@ fn transform<'str>(
     let base_name = format!("{}_acc", body.read_host(m).function_ref(host_fid).name());
     // Mint the driver-only recursive lambda (name buffered raw; the driver
     // uniquifies it at the barrier). `None` (pool exhausted) leaves the loop alone.
-    let Some(g) = body.mint_function(Cow::Owned(base_name.clone()), FunctionKind::Lambda, true)
-    else {
+    let Some(g) = body.mint_function(
+        minted_out,
+        Cow::Owned(base_name.clone()),
+        FunctionKind::Lambda,
+        true,
+    ) else {
         return;
     };
 
     // --- Build the lambda body: read the host expressions, write the minted one.
     let tuple_ty = {
-        let (own, mut minted) = body.host_with_minted(m, g);
+        let (own, mut minted) = body.host_with_minted(minted_out, m, g);
 
         // Three fresh blocks: header (root, drivers in), base case, recursive case.
         let g_head = minted.make_block(g);

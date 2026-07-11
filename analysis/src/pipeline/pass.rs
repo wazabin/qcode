@@ -250,18 +250,18 @@ impl<T: FunctionPass + Send + Sync> DynFunctionPass for FunctionPassAdapter<T> {
         // pass over the frozen module view; the view is bodies-free, so it cannot
         // alias the borrowed body.
         let before_targets = ctx.direct_call_targets(fun_id);
-        let (outcome, minted) = {
+        let outcome = {
             let (bodies, view) = ctx.split(env);
             let mut body = FunctionBody::new(fun_id, &mut bodies[fun_id], reserved);
-            let outcome = self.run_checked(&mut body, view)?;
-            let (minted, _unused) = body.into_parts();
-            (outcome, minted)
+            // The body is dropped at the block end; its unused reserved ids stay
+            // behind as sentinel tombstones (this adapter path has no driver pool).
+            self.run_checked(&mut body, view)?
         };
         // Barrier, in the driver's order: install minted callees first (so the
         // owner's new call sites resolve), rebuild its `call_sites` diff, then
         // apply the returned self-rename. The body was mutated in place — nothing
         // to reinstall.
-        install_minted(ctx, T::NAME, minted)?;
+        install_minted(ctx, T::NAME, outcome.minted)?;
         ctx.resync_call_sites(fun_id, &before_targets);
         replay_rename(ctx, T::NAME, fun_id, outcome.rename)?;
         Ok(outcome.changed)

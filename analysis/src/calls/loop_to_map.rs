@@ -25,7 +25,7 @@ use crate::loop_info::{
     cbranch_exit, delete_private_loop, incoming, is_loop_private, param_parent, param_pos,
     recognize_loops, users_of,
 };
-use crate::pipeline::{ContextView, FunctionBody, Outcome};
+use crate::pipeline::{ContextView, FunctionBody, Minted, Outcome};
 use crate::{FunctionPass, register_function_pass};
 
 // ===========================================================================
@@ -203,7 +203,12 @@ fn body_uses_index(
 /// `map(body, enumerate(arr0))`, `body(tuple)` unpacking it. Returns `false` if
 /// the body is not a closed pure expression of `(index, element?)` (then nothing
 /// is changed — outlining is all-or-nothing and runs before any rewrite).
-fn apply<'str>(m: ContextView<'_, 'str>, body: &mut FunctionBody<'_, 'str>, mm: &MapMatch) -> bool {
+fn apply<'str>(
+    m: ContextView<'_, 'str>,
+    body: &mut FunctionBody<'_, 'str>,
+    minted: &mut Vec<Minted<'str>>,
+    mm: &MapMatch,
+) -> bool {
     let fid = body.id();
     let enum_id = IntrinsicId::from_name("enumerate").expect("enumerate registered");
     let (name, uses_index, tuple_ty) = {
@@ -231,6 +236,7 @@ fn apply<'str>(m: ContextView<'_, 'str>, body: &mut FunctionBody<'_, 'str>, mm: 
         match outline_tupled(
             m,
             body,
+            minted,
             &name,
             mm.ca.stored_val,
             mm.ca.index,
@@ -246,7 +252,7 @@ fn apply<'str>(m: ContextView<'_, 'str>, body: &mut FunctionBody<'_, 'str>, mm: 
         let Some(elem) = mm.elem_read else {
             return false;
         };
-        match outline_expression(m, body, &name, mm.ca.stored_val, &[elem]) {
+        match outline_expression(m, body, minted, &name, mm.ca.stored_val, &[elem]) {
             Some(f) => f,
             None => return false,
         }
@@ -389,6 +395,7 @@ fn apply<'str>(m: ContextView<'_, 'str>, body: &mut FunctionBody<'_, 'str>, mm: 
 pub(crate) fn recognize_total_map<'str>(
     m: ContextView<'_, 'str>,
     body: &mut FunctionBody<'_, 'str>,
+    minted: &mut Vec<Minted<'str>>,
 ) -> bool {
     let fid = body.id();
     if !body.read_host(m).function_ref(fid).is_pure() {
@@ -397,7 +404,7 @@ pub(crate) fn recognize_total_map<'str>(
     let Some(mm) = try_match(body.read_host(m), fid) else {
         return false;
     };
-    apply(m, body, &mm)
+    apply(m, body, minted, &mm)
 }
 
 #[derive(Default)]
@@ -414,7 +421,13 @@ impl FunctionPass for LoopToMap {
         f: &mut FunctionBody<'_, 'str>,
         m: ContextView<'_, 'str>,
     ) -> Result<Outcome<'str>, String> {
-        Ok(Outcome::changed(recognize_total_map(m, f)))
+        let mut minted = Vec::new();
+        let changed = recognize_total_map(m, f, &mut minted);
+        Ok(Outcome {
+            changed,
+            rename: None,
+            minted,
+        })
     }
 }
 
