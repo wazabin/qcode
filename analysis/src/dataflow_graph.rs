@@ -3,7 +3,7 @@ use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
 use qcode::{
     context::Context,
     value::{
-        BasicBlock, BlockId, BlockParam, Function, FunctionId, Instruction, ValueId, ValueRef,
+        BasicBlock, BlockId, BlockParam, Function, FunctionId, Instruction, ValueId,
         insn::{Call, Mnemonic},
     },
 };
@@ -413,7 +413,13 @@ pub fn value_label(ctx: &Context, value: ValueId) -> String {
                 .unwrap_or_else(|| format!("%tmp{:x}", usize::from(id.local)))
         }
         ValueId::BlockParam(_) | ValueId::Varnode(_) | ValueId::Literal(_) | ValueId::Bytes(_) => {
-            ValueRef::new(value, ctx).to_string()
+            // Render through the whole-`&Context` token path so a symbolic
+            // block/function literal still resolves its target name (a
+            // `&Shared`-backed `ValueRef` cannot — context-split 5b-ii #1).
+            qcode::value::insn::segment::value_tokens(ctx, value)
+                .into_iter()
+                .map(|t| t.text)
+                .collect()
         }
         ValueId::Function(id) => Function::from_id(ctx, id).name().to_string(),
         ValueId::BasicBlock(id) => BasicBlock::from_id(ctx, id)

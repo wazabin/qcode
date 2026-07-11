@@ -16,13 +16,13 @@ use std::borrow::Cow;
 use jstd::Identifier;
 
 use crate::{
-    context::Context,
+    context::{Context, Shared},
     error::Result,
     space::{Space, SpaceId, SpaceRef},
     value::{
         Value, ValueId,
         util::{
-            base_ref::{BaseRef, WithCtx},
+            base_ref::{BaseRef, WithCtx, WithShared},
             named::{Named, Renameable, update_context_name},
         },
     },
@@ -90,9 +90,14 @@ impl<'str> Varnode<'str> {
         VarnodeMutRef::from_id(ctx, id)
     }
 
-    /// Retrieves an existing varnode from the context by its ID and returns an immutable reference to it.
-    pub fn from_id<'ctx>(ctx: &'ctx Context<'str>, id: VarnodeId) -> VarnodeRef<'str, 'ctx> {
-        VarnodeRef::from_id(ctx, id)
+    /// Retrieves an existing varnode by its ID and returns an immutable reference
+    /// to it. Accepts either a `&Context` or a bare `&Shared` (via
+    /// [`AsShared`](crate::value::util::base_ref::AsShared)).
+    pub fn from_id<'ctx>(
+        src: impl crate::value::util::base_ref::AsShared<'ctx, 'str>,
+        id: VarnodeId,
+    ) -> VarnodeRef<'str, 'ctx> {
+        VarnodeRef::from_id(src, id)
     }
 
     /// Retrieves an existing varnode from the context by its ID and returns a mutable reference to it.
@@ -106,10 +111,10 @@ impl<'str> Varnode<'str> {
 
 impl<'s, 'ctx: 's, 'str: 'ctx, Ctx> BaseRef<Ctx, VarnodeId>
 where
-    Self: WithCtx<'s, 'ctx, 'str>,
+    Self: WithShared<'s, 'ctx, 'str>,
 {
     fn inner(&'s self) -> &'ctx Varnode<'str> {
-        &self.ctx().shared.values.varnodes[self.id]
+        &self.shared().values.varnodes[self.id]
     }
 
     fn fmt(&'s self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -125,7 +130,7 @@ where
 
     /// The space this varnode belongs to.
     pub fn space(&'s self) -> SpaceRef<'ctx> {
-        Space::from_id(self.ctx(), self.inner().space)
+        Space::from_id(self.shared(), self.inner().space)
     }
 
     /// The address at which this varnode begins
@@ -152,10 +157,10 @@ where
     }
 }
 
-pub type VarnodeRef<'str, 'ctx> = BaseRef<&'ctx Context<'str>, VarnodeId>;
+pub type VarnodeRef<'str, 'ctx> = BaseRef<&'ctx Shared<'str>, VarnodeId>;
 
-impl<'s, 'ctx: 's, 'str: 'ctx> WithCtx<'s, 'ctx, 'str> for VarnodeRef<'str, 'ctx> {
-    fn ctx(&'s self) -> &'ctx Context<'str> {
+impl<'s, 'ctx: 's, 'str: 'ctx> WithShared<'s, 'ctx, 'str> for VarnodeRef<'str, 'ctx> {
+    fn shared(&'s self) -> &'ctx Shared<'str> {
         self.ctx
     }
 }
@@ -200,6 +205,12 @@ impl<'str, 'ctx> VarnodeMutRef<'str, 'ctx> {
 impl<'s, 'ctx: 's, 'str: 'ctx> WithCtx<'s, 's, 'str> for VarnodeMutRef<'str, 'ctx> {
     fn ctx(&'s self) -> &'s Context<'str> {
         self.ctx
+    }
+}
+
+impl<'s, 'ctx: 's, 'str: 'ctx> WithShared<'s, 's, 'str> for VarnodeMutRef<'str, 'ctx> {
+    fn shared(&'s self) -> &'s Shared<'str> {
+        &self.ctx.shared
     }
 }
 

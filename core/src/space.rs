@@ -11,7 +11,7 @@ use std::fmt::Display;
 use jstd::{Identifier, registry::Identified};
 use serde::{Deserialize, Serialize};
 
-use crate::context::Context;
+use crate::value::util::base_ref::AsShared;
 
 /// A stable, context-unique identifier for a [`Space`].
 #[derive(Identifier)]
@@ -67,9 +67,13 @@ impl Space {
         }
     }
 
-    /// Builds a space from an id
-    pub fn from_id<'ctx, 'str>(ctx: &'ctx Context<'str>, id: SpaceId) -> SpaceRef<'ctx> {
-        SpaceRef::new(id, &ctx.shared.spaces[id])
+    /// Builds a space from an id. Accepts either a `&Context` or a bare `&Shared`
+    /// (via [`AsShared`]).
+    pub fn from_id<'ctx, 'str: 'ctx>(
+        src: impl AsShared<'ctx, 'str>,
+        id: SpaceId,
+    ) -> SpaceRef<'ctx> {
+        SpaceRef::new(id, &src.as_shared().spaces[id])
     }
 }
 

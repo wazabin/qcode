@@ -203,6 +203,18 @@ impl<'str> Shared<'str> {
         )
     }
 
+    /// The forced rendering mode for a `Bytes` blob, or
+    /// [`BytesDisplay::Auto`](crate::value::BytesDisplay::Auto) if unset.
+    /// Shared-only mirror of [`Context::bytes_display`] (the override map lives in
+    /// the interners), for the `&Shared`-backed [`BytesRef`](crate::value::BytesRef).
+    pub fn bytes_display(&self, id: crate::value::BytesId) -> crate::value::BytesDisplay {
+        self.values
+            .bytes_display
+            .get(&id)
+            .copied()
+            .unwrap_or_default()
+    }
+
     /// The stored [`TypeId`] of a **shared-leaf** value (literal, bytes, or
     /// varnode-with-override). Shared-only mirror of [`Context::stored_type_of`]:
     /// instruction/block-param/block/function ids live in function bodies and are
@@ -703,7 +715,7 @@ impl<'str> Context<'str> {
             .values
             .varnodes
             .iter()
-            .map(|v| Varnode::from_id(self, v.id))
+            .map(|v| Varnode::from_id(&self.shared, v.id))
     }
 
     /// Number of varnodes in the context. The varnode registry is append-only, so
@@ -1247,7 +1259,7 @@ impl<'str> Context<'str> {
             .shared
             .values
             .get_or_make_typed_literal(value, type_id, size);
-        LiteralRef::new(self, id)
+        LiteralRef::from_id(self, id)
     }
 
     /// Creates a `bool`-typed constant (`true`/`false`), byte-stored with value
@@ -1258,7 +1270,7 @@ impl<'str> Context<'str> {
             .shared
             .values
             .get_or_make_typed_literal(u64::from(value), type_id, 1);
-        LiteralRef::new(self, id)
+        LiteralRef::from_id(self, id)
     }
 
     /// Creates a typed constant literal.
@@ -1276,7 +1288,7 @@ impl<'str> Context<'str> {
             .shared
             .values
             .get_or_make_typed_literal(value, type_id, size);
-        LiteralRef::new(self, id)
+        LiteralRef::from_id(self, id)
     }
 
     /// Creates an opaque byte-blob constant from a little-endian, memory-order
@@ -1307,7 +1319,7 @@ impl<'str> Context<'str> {
             .values
             .bytes
             .push(crate::value::Bytes { data, type_id });
-        crate::value::BytesRef::new(self, id)
+        crate::value::BytesRef::from_id(self, id)
     }
 
     /// Returns the [`TypeId`] of any [`ValueId`] in this context.

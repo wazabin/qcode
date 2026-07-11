@@ -10,7 +10,7 @@
 //! never drift.
 
 use crate::{
-    context::Context,
+    context::{Context, Shared},
     space::Space,
     value::{
         BasicBlock, BlockParam, Function, ValueId,
@@ -18,7 +18,7 @@ use crate::{
         bytes::BytesRef,
         function::FunctionId,
         insn::{InstructionRef, Mnemonic},
-        literal::LiteralRef,
+        literal::{LiteralId, LiteralRef, SymbolicRef},
         varnode::Varnode,
     },
 };
@@ -136,12 +136,15 @@ impl<'a, 'str> Seg<'a, 'str> {
                 self.push(block_param_atom(self.ctx, pid), TokenKind::BlockParam, link);
             }
             ValueId::Literal(lid) => {
-                let r = LiteralRef::new(self.ctx, lid);
+                let r = LiteralRef::from_id(self.ctx, lid);
                 self.ty(r.type_id());
-                self.push(r.to_string(), TokenKind::Literal, link);
+                // The literal *atom* is rendered from the whole `&Context`, so a
+                // symbolic block/function literal resolves its target name (a
+                // `&Shared`-backed `LiteralRef` cannot — context-split 5b-ii #1).
+                self.push(literal_atom(self.ctx, lid), TokenKind::Literal, link);
             }
             ValueId::Bytes(bid) => {
-                let r = BytesRef::new(self.ctx, bid);
+                let r = BytesRef::from_id(self.ctx, bid);
                 self.ty(r.type_id());
                 self.push(r.to_string(), TokenKind::Bytes, link);
             }
@@ -643,4 +646,71 @@ pub fn value_tokens(ctx: &Context<'_>, id: ValueId) -> Vec<Token> {
     };
     seg.value(id);
     seg.out
+}
+
+/// The rendered *atom* (no `<ty>` prefix) of the literal `id`, resolved against
+/// the whole `&Context` so symbolic block/function literals show their target
+/// name. This is the full-context twin of `LiteralRef`'s `Display` (which, being
+/// `&Shared`-backed, cannot reach body/interface names and falls back to the
+/// numeric form). Used by the instruction renderer and the dataflow graph.
+/// Concatenating with the type prefix reproduces the pre-narrowing rendering
+/// byte-for-byte (context-split stage 5b-ii item #1).
+pub fn literal_atom(ctx: &Context<'_>, id: LiteralId) -> String {
+    let literal = &ctx.shared.values.literals[id];
+    match &literal.symbolic {
+        Some(SymbolicRef::Block(bid)) => match BasicBlock::from_id(ctx, *bid).name() {
+            Some(name) => format!("&<{}>", name),
+            None => format!("&<0x{:x}>", literal.value),
+        },
+        Some(SymbolicRef::Function(fid)) => {
+            format!("&<{}>", Function::from_id(ctx, *fid).name())
+        }
+        Some(SymbolicRef::String(s)) => format!("&{:?}", s),
+        None if ctx.shared.types.is_bool(literal.type_id) => {
+            (if literal.value != 0 { "true" } else { "false" }).to_string()
+        }
+        None => format!("0x{:x}", literal.value),
+    }
+}
+
+/// The token stream for a **shared-leaf** value operand (literal, bytes, varnode),
+/// rendered from only the module's [`Shared`] IR state. The `&Shared` twin of
+/// [`value_tokens`] for the operands a `&Shared`-backed [`ValueRef`] can hold;
+/// symbolic block/function literals fall back to the numeric form (their names
+/// live in bodies/interfaces, out of a `&Shared`'s reach). Panics on
+/// arena-cluster ids, which a shared-leaf ref never carries.
+pub fn value_tokens_shared(shared: &Shared<'_>, id: ValueId) -> Vec<Token> {
+    let link = Some(Link::Value(id));
+    let mut out = Vec::new();
+    match id {
+        ValueId::Literal(lid) => {
+            let r = LiteralRef::from_id(shared, lid);
+            out.push(Token::new(
+                format!("{} ", shared.types.type_name(r.type_id())),
+                TokenKind::Type,
+                None,
+            ));
+            out.push(Token::new(r.to_string(), TokenKind::Literal, link));
+        }
+        ValueId::Bytes(bid) => {
+            let r = BytesRef::from_id(shared, bid);
+            out.push(Token::new(
+                format!("{} ", shared.types.type_name(r.type_id())),
+                TokenKind::Type,
+                None,
+            ));
+            out.push(Token::new(r.to_string(), TokenKind::Bytes, link));
+        }
+        ValueId::Varnode(vid) => {
+            let r = Varnode::from_id(shared, vid);
+            out.push(Token::new(
+                format!("i{} ", r.size() * 8),
+                TokenKind::Type,
+                None,
+            ));
+            out.push(Token::new(r.to_string(), TokenKind::Varnode, link));
+        }
+        _ => panic!("value_tokens_shared: not a shared-leaf value id"),
+    }
+    out
 }

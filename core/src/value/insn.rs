@@ -451,7 +451,10 @@ impl<'str, 'ctx> InstructionMutRef<'str, 'ctx> {
     /// register space).
     pub fn set_space(&mut self, space: SpaceId) {
         // Pointer arithmetic is not allowed in the register space.
-        if matches!(Space::from_id(self.ctx, space).ty, SpaceType::Register) {
+        if matches!(
+            Space::from_id(&self.ctx.shared, space).ty,
+            SpaceType::Register
+        ) {
             return;
         }
         let size = self.ctx.shared.types.size_of(self.inner().type_id);

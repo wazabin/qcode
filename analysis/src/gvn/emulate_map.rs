@@ -302,7 +302,7 @@ fn const_bytes(ctx: &Context, v: ValueId) -> Option<Vec<u8>> {
             if size == 0 || size > 8 {
                 return None;
             }
-            let value = qcode::value::LiteralRef::new(ctx, lid).value();
+            let value = qcode::value::LiteralRef::from_id(ctx, lid).value();
             Some(value.to_le_bytes()[..size].to_vec())
         }
         _ => None,

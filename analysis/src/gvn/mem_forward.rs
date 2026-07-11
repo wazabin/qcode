@@ -352,7 +352,7 @@ impl MemForward {
                     if lit.symbolic.is_some() {
                         return None;
                     }
-                    let masked = qcode::value::LiteralRef::new(ctx, lid).value();
+                    let masked = qcode::value::LiteralRef::from_id(ctx, lid).value();
                     let le = masked.to_le_bytes();
                     le.get(seg.src_off..seg.src_off + seg.size)?.to_vec()
                 }
@@ -568,7 +568,7 @@ impl MemForward {
                     if lit.symbolic.is_some() {
                         return None;
                     }
-                    let masked = qcode::value::LiteralRef::new(ctx, lid).value();
+                    let masked = qcode::value::LiteralRef::from_id(ctx, lid).value();
                     let le = masked.to_le_bytes();
                     le.get(seg.src_off..seg.src_off + seg.size)?.to_vec()
                 }

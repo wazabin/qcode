@@ -70,7 +70,7 @@ impl PipelineEnv {
     /// arch-agnostic transforms (e.g. `loop_to_recursion`, `gvn`, `dce`) are fine.
     pub fn headless(ctx: &mut Context) -> Self {
         let space = ctx.make_temp_space();
-        let bitness = (Space::from_id(ctx, ctx.shared.default_space).addr_size * 8) as u8;
+        let bitness = (Space::from_id(&*ctx, ctx.shared.default_space).addr_size * 8) as u8;
         let sp_varnode = Varnode::make(ctx, 0, (bitness / 8) as usize, space).id;
         let cfg = ArchConfig {
             // Unused by arch-agnostic passes; the real SP is `sp_varnode` above.

@@ -413,8 +413,8 @@ impl<'str, 'ctx> ValueRef<'str, 'ctx> {
 
     pub fn new(id: ValueId, ctx: &'ctx Context<'str>) -> Self {
         match id {
-            ValueId::Literal(lit_id) => ValueRef::Literal(LiteralRef::new(ctx, lit_id)),
-            ValueId::Bytes(bytes_id) => ValueRef::Bytes(BytesRef::new(ctx, bytes_id)),
+            ValueId::Literal(lit_id) => ValueRef::Literal(LiteralRef::from_id(ctx, lit_id)),
+            ValueId::Bytes(bytes_id) => ValueRef::Bytes(BytesRef::from_id(ctx, bytes_id)),
             ValueId::Instruction(insn_id) => {
                 ValueRef::Instruction(InstructionRef::from_id(ctx, insn_id))
             }
@@ -441,9 +441,9 @@ impl<'str, 'ctx> ValueRef<'str, 'ctx> {
             insn::InstructionRef,
         };
         match id {
-            ValueId::Literal(lit_id) => ValueRef::Literal(LiteralRef::new(host.shared(), lit_id)),
-            ValueId::Bytes(bytes_id) => ValueRef::Bytes(BytesRef::new(host.shared(), bytes_id)),
-            ValueId::Varnode(var_id) => ValueRef::Varnode(Varnode::from_id(host.shared(), var_id)),
+            ValueId::Literal(lit_id) => ValueRef::Literal(LiteralRef::from_id(host.shr(), lit_id)),
+            ValueId::Bytes(bytes_id) => ValueRef::Bytes(BytesRef::from_id(host.shr(), bytes_id)),
+            ValueId::Varnode(var_id) => ValueRef::Varnode(Varnode::from_id(host.shr(), var_id)),
             ValueId::Instruction(insn_id) => {
                 ValueRef::Instruction(InstructionRef::new(host, insn_id))
             }
@@ -473,16 +473,21 @@ impl Display for ValueRef<'_, '_> {
         // A value operand's rendering — `<ty> <atom>` uniformly, bare for value
         // references with no scalar type — is defined once, as tokens, in the
         // instruction `segment` module; `Display` is those tokens concatenated.
-        let ctx = match self {
-            ValueRef::Literal(r) => r.ctx,
-            ValueRef::Bytes(r) => r.ctx,
-            ValueRef::Instruction(r) => r.ctx.shared(),
-            ValueRef::BasicBlock(r) => r.ctx.shared(),
-            ValueRef::BlockParam(r) => r.ctx.shared(),
-            ValueRef::Varnode(r) => r.ctx,
-            ValueRef::Function(r) => r.ctx.shared(),
+        //
+        // Shared-leaf refs (literal, bytes, varnode) carry only a `&Shared`, so
+        // they render through the `&Shared` token path; the arena-cluster refs
+        // route their `HostRef` back to the whole `&Context` (context-split
+        // stage 5b-ii item #1).
+        let tokens = match self {
+            ValueRef::Literal(r) => insn::segment::value_tokens_shared(r.ctx, self.id()),
+            ValueRef::Bytes(r) => insn::segment::value_tokens_shared(r.ctx, self.id()),
+            ValueRef::Varnode(r) => insn::segment::value_tokens_shared(r.ctx, self.id()),
+            ValueRef::Instruction(r) => insn::segment::value_tokens(r.ctx.shared(), self.id()),
+            ValueRef::BasicBlock(r) => insn::segment::value_tokens(r.ctx.shared(), self.id()),
+            ValueRef::BlockParam(r) => insn::segment::value_tokens(r.ctx.shared(), self.id()),
+            ValueRef::Function(r) => insn::segment::value_tokens(r.ctx.shared(), self.id()),
         };
-        for token in insn::segment::value_tokens(ctx, self.id()) {
+        for token in tokens {
             write!(f, "{}", token.text)?;
         }
         Ok(())

@@ -1161,7 +1161,7 @@ mod tests {
         };
         // bytes 2..6 = 33 44 55 66, little-endian => 0x66554433
         assert_eq!(
-            qcode::value::LiteralRef::new(&ctx, lid).value(),
+            qcode::value::LiteralRef::from_id(&ctx, lid).value(),
             0x6655_4433
         );
     }

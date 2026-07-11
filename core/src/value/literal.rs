@@ -10,13 +10,13 @@
 //! folding.
 
 use crate::{
-    context::Context,
+    context::Shared,
     types::TypeId,
     value::{
-        Function, Value, ValueId,
-        block::{BasicBlock, BlockId},
+        Value, ValueId,
+        block::BlockId,
         function::FunctionId,
-        util::base_ref::{BaseRef, WithCtx},
+        util::base_ref::{BaseRef, WithShared},
     },
 };
 use jstd::Identifier;
@@ -54,24 +54,24 @@ pub struct Literal {
     pub symbolic: Option<SymbolicRef>,
 }
 
-pub type LiteralRef<'str, 'ctx> = BaseRef<&'ctx Context<'str>, LiteralId>;
+pub type LiteralRef<'str, 'ctx> = BaseRef<&'ctx Shared<'str>, LiteralId>;
 
-impl<'s, 'ctx: 's, 'str: 'ctx> WithCtx<'s, 'ctx, 'str> for LiteralRef<'str, 'ctx> {
-    fn ctx(&'s self) -> &'ctx Context<'str> {
+impl<'s, 'ctx: 's, 'str: 'ctx> WithShared<'s, 'ctx, 'str> for LiteralRef<'str, 'ctx> {
+    fn shared(&'s self) -> &'ctx Shared<'str> {
         self.ctx
     }
 }
 
 impl<'s, 'ctx: 's, 'str: 'ctx, Ctx> BaseRef<Ctx, LiteralId>
 where
-    Self: WithCtx<'s, 'ctx, 'str>,
+    Self: WithShared<'s, 'ctx, 'str>,
 {
     fn inner(&'s self) -> &'ctx Literal {
-        &self.ctx().shared.values.literals[self.id]
+        &self.shared().values.literals[self.id]
     }
 
     pub fn mask(&'s self) -> u64 {
-        let size = self.ctx().shared.types.size_of(self.inner().type_id);
+        let size = self.shared().types.size_of(self.inner().type_id);
         if size >= 8 {
             u64::MAX
         } else {
@@ -91,23 +91,20 @@ where
 
 impl std::fmt::Display for LiteralRef<'_, '_> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let literal = &self.ctx.shared.values.literals[self.id];
+        let literal = &self.ctx.values.literals[self.id];
         match &literal.symbolic {
-            Some(SymbolicRef::Block(bid)) => {
-                let block = BasicBlock::from_id(self.ctx, *bid);
-                match block.name() {
-                    Some(name) => write!(f, "&<{}>", name),
-                    None => write!(f, "&<0x{:x}>", literal.value),
-                }
-            }
-            Some(SymbolicRef::Function(fid)) => {
-                let fn_ref = Function::from_id(self.ctx, *fid);
-                write!(f, "&<{}>", fn_ref.name())
+            // Symbolic block/function names live in bodies/interfaces, which a
+            // `&Shared`-backed leaf ref cannot reach; the block/function *name*
+            // rendering is done by the full-context path (`segment::literal_atom`,
+            // used by the instruction renderer and the dataflow graph). Here we
+            // fall back to the numeric form. See context-split 5b-ii item #1.
+            Some(SymbolicRef::Block(_)) | Some(SymbolicRef::Function(_)) => {
+                write!(f, "&<0x{:x}>", literal.value)
             }
             Some(SymbolicRef::String(s)) => write!(f, "&{:?}", s),
             // A `bool` literal prints as `true`/`false`; the `bool` type token is
             // emitted by the operand's type prefix, so the round-trip is `bool true`.
-            None if self.ctx.shared.types.is_bool(literal.type_id) => {
+            None if self.ctx.types.is_bool(literal.type_id) => {
                 write!(f, "{}", if literal.value != 0 { "true" } else { "false" })
             }
             None => write!(f, "0x{:x}", literal.value),
@@ -122,8 +119,7 @@ impl<'str, 'ctx> Value<'str, 'ctx> for LiteralRef<'str, 'ctx> {
 
     fn size(&self) -> usize {
         self.ctx
-            .shared
             .types
-            .size_of(self.ctx.shared.values.literals[self.id].type_id)
+            .size_of(self.ctx.values.literals[self.id].type_id)
     }
 }

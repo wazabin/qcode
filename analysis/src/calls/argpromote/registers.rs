@@ -357,7 +357,7 @@ pub(crate) fn rewrite_registers(ctx: &mut Context, fid: FunctionId, eff: &Regist
         .inputs
         .iter()
         .map(|&r| {
-            let v = Varnode::from_id(ctx, r);
+            let v = Varnode::from_id(&*ctx, r);
             (
                 r,
                 v.size(),

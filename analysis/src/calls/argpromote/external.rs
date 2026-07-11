@@ -171,7 +171,7 @@ pub fn argpromote_external(ctx: &mut Context, env: &PipelineEnv) -> bool {
     let ptr_width = (env.cfg.bitness / 8).max(1) as usize;
     let stack_only = env.cfg.bitness == 32;
     let sp = env.sp_varnode;
-    let sp_space = Varnode::from_id(ctx, sp).space().id;
+    let sp_space = Varnode::from_id(&*ctx, sp).space().id;
     let default_space = ctx.shared.default_space;
 
     // Only externals that are actually *called* can gain arguments: both
@@ -235,8 +235,8 @@ fn return_slot(
 /// single ABI return register. Idempotent: a call whose continuation already
 /// stores its result to `ret` is left untouched.
 fn bind_external_return(ctx: &mut Context, fid: FunctionId, ret: VarnodeId) -> bool {
-    let ret_space = Varnode::from_id(ctx, ret).space().id;
-    let size = Varnode::from_id(ctx, ret).size();
+    let ret_space = Varnode::from_id(&*ctx, ret).space().id;
+    let size = Varnode::from_id(&*ctx, ret).size();
     let int_ty = ctx.shared.types.get_or_make_int(size);
 
     let call_sites: Vec<InstructionId> = ctx
