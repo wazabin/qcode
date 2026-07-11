@@ -125,17 +125,17 @@ fn unique_incoming(
 /// Returns whether anything was removed.
 /// TODO(5b-ii): Takes Context; migrate to FunctionBody/ContextView when public API stabilizes.
 pub fn remove_dead_block_args(
-    mut ctx: &mut Context,
+    ctx: &mut Context,
     block_ids: &[BlockId],
     root: Option<BlockId>,
 ) -> bool {
-    remove_dead_block_args_generic(&mut ctx, block_ids, root)
+    remove_dead_block_args_generic(ctx, block_ids, root)
 }
 
 /// Generic version of [`remove_dead_block_args`] core accepting any HostMut.
 /// TODO(5b-ii): For backwards compatibility; prefer concrete version for new code.
-pub fn remove_dead_block_args_generic<'str, H: HostMut<'str>>(
-    host: &mut H,
+pub fn remove_dead_block_args_generic<'str>(
+    mut host: &mut Context<'str>,
     block_ids: &[BlockId],
     root: Option<BlockId>,
 ) -> bool {
@@ -153,7 +153,7 @@ pub fn remove_dead_block_args_generic<'str, H: HostMut<'str>>(
         // `p ≡ repl`: rewrite every use, then strip the param and the now-removed
         // column of arguments from each predecessor.
         host.replace_all_uses_with(ValueId::BlockParam(param), repl);
-        remove_params_from_block_generic(host, block, &HashSet::from_iter([index]));
+        remove_params_from_block_generic(&mut host, block, &HashSet::from_iter([index]));
         changed = true;
     }
     changed
@@ -215,17 +215,17 @@ pub fn remove_dead_block_args_host<'a, 'str>(
 /// Returns whether anything was removed.
 /// TODO(5b-ii): Takes Context; migrate to FunctionBody/ContextView when public API stabilizes.
 pub fn remove_dead_block_params(
-    mut ctx: &mut Context,
+    ctx: &mut Context,
     block_ids: &[BlockId],
     root: Option<BlockId>,
 ) -> bool {
-    remove_dead_block_params_generic(&mut ctx, block_ids, root)
+    remove_dead_block_params_generic(ctx, block_ids, root)
 }
 
 /// Generic version of [`remove_dead_block_params`] core accepting any HostMut.
 /// TODO(5b-ii): For backwards compatibility; prefer concrete version for new code.
-pub fn remove_dead_block_params_generic<'str, H: HostMut<'str>>(
-    host: &mut H,
+pub fn remove_dead_block_params_generic<'str>(
+    mut host: &mut Context<'str>,
     block_ids: &[BlockId],
     root: Option<BlockId>,
 ) -> bool {
@@ -317,7 +317,7 @@ pub fn remove_dead_block_params_generic<'str, H: HostMut<'str>>(
         return false;
     }
     for (block, indices) in dead_by_block {
-        remove_params_from_block_generic(host, block, &indices);
+        remove_params_from_block_generic(&mut host, block, &indices);
     }
     true
 }
