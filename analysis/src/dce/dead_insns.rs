@@ -44,13 +44,13 @@ pub fn dead_insns<'a, 'str: 'a>(
 /// Removes dead pure instructions from `block_id` iteratively until fixed point,
 /// updating the users reverse map after each round.
 /// TODO(5b-ii): Takes Context; migrate to FunctionBody/ContextView when public API stabilizes.
-pub fn remove_dead_insns(mut ctx: &mut Context, block_id: BlockId) -> bool {
-    remove_dead_insns_generic(&mut ctx, block_id)
+pub fn remove_dead_insns(ctx: &mut Context, block_id: BlockId) -> bool {
+    remove_dead_insns_generic(ctx, block_id)
 }
 
 /// Generic host-based version of [`remove_dead_insns`]; see that function.
 /// TODO(5b-ii): For backwards compatibility; prefer concrete version for new code.
-pub fn remove_dead_insns_generic<'str, H: HostMut<'str>>(host: &mut H, block_id: BlockId) -> bool {
+pub fn remove_dead_insns_generic<'str>(host: &mut Context<'str>, block_id: BlockId) -> bool {
     let mut changed = false;
     loop {
         let dead = dead_insns(host.read_host(), block_id);
@@ -103,13 +103,13 @@ pub fn remove_dead_insns_host<'a, 'str>(
 /// The fall-through has no params fed by the call, so the branch carries no
 /// arguments.
 #[cfg(test)]
-pub fn remove_dead_pure_call(mut ctx: &mut Context, block_id: BlockId) -> bool {
-    remove_dead_pure_call_generic(&mut ctx, block_id)
+pub fn remove_dead_pure_call(ctx: &mut Context, block_id: BlockId) -> bool {
+    remove_dead_pure_call_generic(ctx, block_id)
 }
 
 /// Generic version of remove_dead_pure_call for test use.
 #[cfg(test)]
-fn remove_dead_pure_call_generic<'str, H: HostMut<'str>>(host: &mut H, block_id: BlockId) -> bool {
+fn remove_dead_pure_call_generic<'str>(mut host: &mut Context<'str>, block_id: BlockId) -> bool {
     let Some(term_id) = host.block_ref(block_id).instruction_ids().last().copied() else {
         return false;
     };
@@ -143,7 +143,7 @@ fn remove_dead_pure_call_generic<'str, H: HostMut<'str>>(host: &mut H, block_id:
         return false;
     };
 
-    replace_terminator_with_branch_generic(host, block_id, fallthrough, vec![]);
+    replace_terminator_with_branch_generic(&mut host, block_id, fallthrough, vec![]);
     true
 }
 
@@ -201,8 +201,8 @@ fn remove_dead_pure_call_host<'a, 'str>(
 /// blocks whose predecessor terminators carry positional arguments.
 /// Generic version accepting any HostMut.
 /// TODO(5b-ii): For backwards compatibility; prefer concrete version for new code.
-pub fn remove_unused_no_pred_block_params_generic<'str, H: HostMut<'str>>(
-    host: &mut H,
+pub fn remove_unused_no_pred_block_params_generic<'str>(
+    host: &mut Context<'str>,
     block_id: BlockId,
 ) -> bool {
     if host.block_ref(block_id).predecessors().next().is_some() {
@@ -821,20 +821,20 @@ fn match_dead_loop(host: HostRef, header: BlockId) -> Option<DeadLoop> {
 /// loop-carried value is never locally dead (its back-edge is a self-use), so a
 /// dead loop can only be recognized by reasoning over the whole cyclic region.
 #[cfg(test)]
-fn remove_dead_counted_loop(mut ctx: &mut Context, fun_id: FunctionId) -> bool {
-    remove_dead_counted_loop_generic(&mut ctx, fun_id)
+fn remove_dead_counted_loop(ctx: &mut Context, fun_id: FunctionId) -> bool {
+    remove_dead_counted_loop_generic(ctx, fun_id)
 }
 
 /// Generic version of remove_dead_counted_loop for test use.
 #[cfg(test)]
-fn remove_dead_counted_loop_generic<'str, H: HostMut<'str>>(
-    host: &mut H,
+fn remove_dead_counted_loop_generic<'str>(
+    mut host: &mut Context<'str>,
     fun_id: FunctionId,
 ) -> bool {
     let headers: Vec<BlockId> = host.function_ref(fun_id).blocks().map(|b| b.id).collect();
     for header in headers {
         if let Some(dl) = match_dead_loop(host.read_host(), header) {
-            replace_terminator_with_branch_generic(host, dl.preheader, dl.exit, vec![]);
+            replace_terminator_with_branch_generic(&mut host, dl.preheader, dl.exit, vec![]);
             return true;
         }
     }
