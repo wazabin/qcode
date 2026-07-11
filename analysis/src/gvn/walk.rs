@@ -255,36 +255,6 @@ pub(super) fn run_single_block<'str>(
     run_block(host, block_id, passes, &mut states, aliases, &numbering)
 }
 
-/// Iterate the sub-passes over every block of `func_id` in flat order with
-/// fresh per-block state, repeating until a full sweep changes nothing. No
-/// block-boundary hooks run. Returns whether anything changed.
-pub(super) fn run_flat_fixpoint<'str>(
-    host: &mut Context<'str>,
-    func_id: FunctionId,
-    passes: &[Box<dyn ModuleSubPass<'str>>],
-) -> bool {
-    let block_ids: Vec<BlockId> = host
-        .function_ref(func_id)
-        .iter()
-        .map(|block| block.id)
-        .collect();
-
-    let numbering = Numbering::default();
-    let mut changed_any = false;
-    loop {
-        let mut changed = false;
-        for &block_id in &block_ids {
-            let mut states = init_states(passes);
-            changed |= run_block(host, block_id, passes, &mut states, None, &numbering);
-        }
-        changed_any |= changed;
-        if !changed {
-            break;
-        }
-    }
-    changed_any
-}
-
 /// The per-entry invariants of one dominator-tree walk.
 struct Walk<'a, 'str> {
     passes: &'a [Box<dyn ModuleSubPass<'str>>],

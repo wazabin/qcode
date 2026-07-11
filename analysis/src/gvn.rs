@@ -6,11 +6,13 @@
 //! add it to the tuple in [`gvn_passes`] (order matters: earlier members see
 //! the instruction first).
 
-use crate::AliasResult;
+use crate::{AliasResult, ArchConfig, CallingConvention, PipelineEnv};
 
 use qcode::{
     context::Context,
-    value::{block::BlockMutRef, function::FunctionId, util::base_ref::WithCtxMut},
+    value::{
+        RegisterId, VarnodeId, block::BlockMutRef, function::FunctionId, util::base_ref::WithCtxMut,
+    },
 };
 
 pub(crate) mod affine;
@@ -36,10 +38,7 @@ use identity::Identities;
 use intrinsics::Recognize;
 use memory::MemoryForwarding;
 use narrow::NarrowTrunc;
-use walk::{
-    SubPassC, run_dominator_walk, run_dominator_walk_c, run_flat_fixpoint, run_flat_fixpoint_c,
-    run_single_block,
-};
+use walk::{SubPassC, run_dominator_walk_c, run_flat_fixpoint_c, run_single_block};
 
 /// The full GVN sub-pass chain. Order is load-bearing: memory forwarding must
 /// see loads/stores first, folding must run before idiom recognition (so shift
@@ -78,6 +77,60 @@ fn gvn_passes_c<'str>() -> Vec<Box<dyn SubPassC<'str>>> {
     ]
 }
 
+/// Bridge a whole-`Context` GVN entry point onto the concrete function-pass core.
+///
+/// The public entry points ([`gvn_function`], [`constant_fold_function`],
+/// [`narrow_function`]) take a `&mut Context` and a bare `func_id`; their callers
+/// (unit tests, a couple of module-pass helpers) hold neither a checked-out
+/// [`FunctionBody`] nor a [`PipelineEnv`]. This check-out shim runs the concrete
+/// `_body` core over `(&mut FunctionBody, ContextView)` — the *same* surface the
+/// parallel function-pass driver uses — then checks the body back in and resyncs
+/// its call sites, exactly as [`FunctionPassAdapter`](crate::FunctionPassAdapter)
+/// does (minus minting: these entry points mint nothing).
+///
+/// The [`ContextView`]'s [`PipelineEnv`] is a throwaway: the GVN `_body` cores
+/// never consult `env()` (their alias oracle is supplied by the caller). Because
+/// the concrete `PassBacking` path debug-asserts the body is self-stored, every
+/// caller must feed a function with no reattributed blocks — which, post the
+/// driver's `split_overlapping_functions` normalization, every production
+/// function is (audited 2026-07-11: all direct callers are `#[cfg(test)]`).
+fn with_checked_out_body<'str, R>(
+    ctx: &mut Context<'str>,
+    func_id: FunctionId,
+    f: impl FnOnce(&mut FunctionBody<'str>, ContextView<'_, 'str>) -> R,
+) -> R {
+    let env = throwaway_env();
+    let before_targets = ctx.direct_call_targets(func_id);
+    let fun = ctx.checkout_function(func_id);
+    let mut body = FunctionBody::new(func_id, fun, Vec::new());
+    let out = {
+        let view = ContextView::new(ctx, &env);
+        f(&mut body, view)
+    };
+    // GVN/fold/narrow buffer no effects and mint nothing, so `into_parts`'
+    // effects/minted are empty — drop them (the in-place module walker these
+    // entry points used had no effects concept at all).
+    let (fun, _effects, _minted, _unused) = body.into_parts();
+    ctx.checkin_function(func_id, fun);
+    ctx.resync_call_sites(func_id, &before_targets);
+    out
+}
+
+/// A throwaway [`PipelineEnv`] for the check-out shim: the GVN `_body` cores never
+/// read it, so its stack pointer / ABI are placeholders.
+fn throwaway_env() -> PipelineEnv {
+    PipelineEnv::from_parts(
+        ArchConfig {
+            stack_pointer: RegisterId::from(0usize),
+            dead_flag_regs: Vec::new(),
+            abi: CallingConvention::default(),
+            os: qcode::context::TargetOs::Unknown,
+            bitness: 64,
+        },
+        VarnodeId::from(0usize),
+    )
+}
+
 /// Constant-fold every foldable instruction in `func_id` to interned literals,
 /// iterating to a fixpoint.
 ///
@@ -94,24 +147,13 @@ fn gvn_passes_c<'str>() -> Vec<Box<dyn SubPassC<'str>>> {
 /// Folding only — no CSE or load/store forwarding. Returns `true` if anything
 /// changed.
 pub fn constant_fold_function(ctx: &mut Context, func_id: FunctionId) -> bool {
-    constant_fold_host(ctx, func_id)
+    with_checked_out_body(ctx, func_id, |body, cx| {
+        constant_fold_body(body, cx, func_id)
+    })
 }
 
-/// Host-generic core of [`constant_fold_function`]: runs the [`Fold`] sub-pass to
-/// a fixpoint over either the whole module (`&mut Context`) or a single
-/// checked-out function ([`PassBacking`]).
-///
-/// [`PassBacking`]: qcode::value::util::host_mut::PassBacking
-pub(crate) fn constant_fold_host<'str>(host: &mut Context<'str>, func_id: FunctionId) -> bool {
-    run_flat_fixpoint(
-        host,
-        func_id,
-        &[Box::new(Fold) as Box<dyn walk::ModuleSubPass<'str>>],
-    )
-}
-
-/// Concrete twin of [`constant_fold_host`] (context-split stage 5b-ii): runs the
-/// [`Fold`] sub-pass to a fixpoint over a checked-out `(&mut FunctionBody,
+/// Concrete core of [`constant_fold_function`] (context-split stage 5b-ii): runs
+/// the [`Fold`] sub-pass to a fixpoint over a checked-out `(&mut FunctionBody,
 /// ContextView)` with no threaded mutation host.
 fn constant_fold_body<'str>(
     body: &mut FunctionBody<'str>,
@@ -125,20 +167,10 @@ fn constant_fold_body<'str>(
 /// fixpoint. Standalone composition of the [`NarrowTrunc`] sub-pass — the same
 /// shape as [`constant_fold_function`]. Returns `true` if anything changed.
 pub fn narrow_function(ctx: &mut Context, func_id: FunctionId) -> bool {
-    narrow_host(ctx, func_id)
+    with_checked_out_body(ctx, func_id, |body, cx| narrow_body(body, cx, func_id))
 }
 
-/// Host-generic core of [`narrow_function`]: runs the [`NarrowTrunc`] sub-pass to
-/// a fixpoint over either the whole module or a single checked-out function.
-pub(crate) fn narrow_host<'str>(host: &mut Context<'str>, func_id: FunctionId) -> bool {
-    run_flat_fixpoint(
-        host,
-        func_id,
-        &[Box::new(NarrowTrunc) as Box<dyn walk::ModuleSubPass<'str>>],
-    )
-}
-
-/// Concrete twin of [`narrow_host`] (context-split stage 5b-ii): runs the
+/// Concrete core of [`narrow_function`] (context-split stage 5b-ii): runs the
 /// [`NarrowTrunc`] sub-pass to a fixpoint over a checked-out `(&mut FunctionBody,
 /// ContextView)`.
 fn narrow_body<'str>(
@@ -175,24 +207,13 @@ pub fn gvn(block: &mut BlockMutRef, aliases: Option<&AliasResult>) {
 /// single-block pass.
 /// Returns `true` if anything changed.
 pub fn gvn_function(ctx: &mut Context, func_id: FunctionId, aliases: Option<&AliasResult>) -> bool {
-    gvn_host(ctx, func_id, aliases)
+    with_checked_out_body(ctx, func_id, |body, cx| {
+        gvn_body(body, cx, func_id, aliases)
+    })
 }
 
-/// Host-generic core of [`gvn_function`]: runs the full GVN sub-pass chain over
-/// the dominator tree of `func_id`, on either the whole module (`&mut Context`)
-/// or a single checked-out function ([`PassBacking`]).
-///
-/// [`PassBacking`]: qcode::value::util::host_mut::PassBacking
-pub(crate) fn gvn_host<'str>(
-    host: &mut Context<'str>,
-    func_id: FunctionId,
-    aliases: Option<&AliasResult>,
-) -> bool {
-    run_dominator_walk(host, func_id, &gvn_passes(), aliases)
-}
-
-/// Concrete twin of [`gvn_host`] (context-split stage 5b-ii): runs the full GVN
-/// sub-pass chain over the dominator tree of `func_id` on a checked-out
+/// Concrete core of [`gvn_function`] (context-split stage 5b-ii): runs the full
+/// GVN sub-pass chain over the dominator tree of `func_id` on a checked-out
 /// `(&mut FunctionBody, ContextView)` with no threaded mutation host.
 fn gvn_body<'str>(
     body: &mut FunctionBody<'str>,
