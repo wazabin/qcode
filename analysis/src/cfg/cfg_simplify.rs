@@ -1,3 +1,4 @@
+use qcode::context::Context;
 use qcode::value::{
     BlockId, BlockParamId, FunctionId, ValueId,
     insn::{Branch, Mnemonic},
@@ -82,7 +83,7 @@ pub fn simplify_cfg_concrete<'a, 'str>(
 /// Generic wrapper for backwards compatibility; see concrete [`simplify_cfg_concrete`].
 /// TODO(5b-ii): Remove after callers migrate to FunctionBody/ContextView.
 #[allow(dead_code)]
-pub fn simplify_cfg<'str, H: HostMut<'str>>(host: &mut H, function_id: FunctionId) -> bool {
+pub fn simplify_cfg<'str>(host: &mut Context<'str>, function_id: FunctionId) -> bool {
     let mut changed = false;
 
     loop {
@@ -111,10 +112,7 @@ pub fn simplify_cfg<'str, H: HostMut<'str>>(host: &mut H, function_id: FunctionI
 
 /// Generic wrapper for [`prune_unreachable`]; see that function.
 #[allow(dead_code)]
-fn prune_unreachable_generic<'str, H: HostMut<'str>>(
-    host: &mut H,
-    function_id: FunctionId,
-) -> bool {
+fn prune_unreachable_generic<'str>(mut host: &mut Context<'str>, function_id: FunctionId) -> bool {
     let Some(root) = host.function_ref(function_id).root().map(|b| b.id) else {
         return false;
     };
@@ -150,8 +148,8 @@ fn prune_unreachable_generic<'str, H: HostMut<'str>>(
 
 /// Generic wrapper for [`merge_candidate`]; see that function.
 #[allow(dead_code)]
-fn merge_candidate_generic<'str, H: HostMut<'str>>(
-    host: &mut H,
+fn merge_candidate_generic<'str>(
+    host: &mut Context<'str>,
     a_id: BlockId,
 ) -> Option<(qcode::value::block::EdgeId, BlockId)> {
     // Collect at most 2 successors to check the "exactly one" condition.
@@ -201,8 +199,8 @@ fn merge_candidate_generic<'str, H: HostMut<'str>>(
 
 /// Generic wrapper for [`try_merge_block`]; see that function.
 #[allow(dead_code)]
-fn try_merge_block_generic<'str, H: HostMut<'str>>(
-    host: &mut H,
+fn try_merge_block_generic<'str>(
+    mut host: &mut Context<'str>,
     function_id: FunctionId,
     a_id: BlockId,
 ) -> bool {
@@ -226,7 +224,7 @@ fn try_merge_block_generic<'str, H: HostMut<'str>>(
 
 /// Generic wrapper for [`try_fold_cbranch`]; see that function.
 #[allow(dead_code)]
-fn try_fold_cbranch_generic<'str, H: HostMut<'str>>(host: &mut H, block_id: BlockId) -> bool {
+fn try_fold_cbranch_generic<'str>(host: &mut Context<'str>, block_id: BlockId) -> bool {
     let Some(term_id) = host.block_ref(block_id).instruction_ids().last().copied() else {
         return false;
     };
@@ -258,8 +256,8 @@ fn try_fold_cbranch_generic<'str, H: HostMut<'str>>(host: &mut H, block_id: Bloc
 
 /// Generic wrapper for [`try_bypass_empty_block`]; see that function.
 #[allow(dead_code)]
-fn try_bypass_empty_block_generic<'str, H: HostMut<'str>>(
-    host: &mut H,
+fn try_bypass_empty_block_generic<'str>(
+    mut host: &mut Context<'str>,
     function_id: FunctionId,
     b_id: BlockId,
 ) -> bool {
@@ -834,7 +832,7 @@ mod tests {
         );
 
         // `<dead>` has no path from the entry `<a>` — a full run removes it.
-        let changed = simplify_cfg(&mut &mut ctx, f);
+        let changed = simplify_cfg(&mut ctx, f);
         assert!(changed, "pruning an unreachable block reports progress");
         assert!(
             BasicBlock::from_id(&ctx, dead).parent().is_none(),
@@ -863,7 +861,7 @@ mod tests {
         );
 
         assert!(
-            !prune_unreachable_generic(&mut &mut ctx, f),
+            !prune_unreachable_generic(&mut ctx, f),
             "no unreachable blocks means no change"
         );
     }
@@ -882,7 +880,7 @@ mod tests {
             "
         );
 
-        simplify_cfg(&mut &mut ctx, f);
+        simplify_cfg(&mut ctx, f);
 
         let blocks: Vec<_> = Function::from_id(&ctx, f).blocks().map(|b| b.id).collect();
         assert_eq!(blocks.len(), 1, "two-block chain should merge into one");
@@ -905,7 +903,7 @@ mod tests {
             "
         );
 
-        simplify_cfg(&mut &mut ctx, f);
+        simplify_cfg(&mut ctx, f);
 
         let blocks: Vec<_> = Function::from_id(&ctx, f).blocks().map(|b| b.id).collect();
         assert_eq!(blocks.len(), 1, "three-block chain should collapse to one");
@@ -932,7 +930,7 @@ mod tests {
             "
         );
 
-        simplify_cfg(&mut &mut ctx, f);
+        simplify_cfg(&mut ctx, f);
 
         let blocks: Vec<_> = Function::from_id(&ctx, f).blocks().map(|b| b.id).collect();
         assert_eq!(blocks.len(), 3, "diamond entry should not be merged");
@@ -961,7 +959,7 @@ mod tests {
         // Isolate the merge guard: `<d>` is unreachable, so a full `simplify_cfg`
         // run would prune it, leaving B single-predecessor and mergeable.
         assert!(
-            !try_merge_block_generic(&mut &mut ctx, f, a),
+            !try_merge_block_generic(&mut ctx, f, a),
             "B has two predecessors, should not merge"
         );
     }
@@ -985,7 +983,7 @@ mod tests {
             assert!(b.parent().is_some(), "b should have parent before merge");
         }
 
-        simplify_cfg(&mut &mut ctx, f);
+        simplify_cfg(&mut ctx, f);
 
         {
             let a = BasicBlock::from_id(&ctx, a);
@@ -1014,7 +1012,7 @@ mod tests {
             "
         );
 
-        simplify_cfg(&mut &mut ctx, f);
+        simplify_cfg(&mut ctx, f);
 
         let blocks: Vec<_> = Function::from_id(&ctx, f).blocks().map(|b| b.id).collect();
         assert_eq!(blocks, [a], "branch-with-args chain should merge");
@@ -1043,7 +1041,7 @@ mod tests {
         );
 
         let y_insn = y;
-        simplify_cfg(&mut &mut ctx, f);
+        simplify_cfg(&mut ctx, f);
 
         let insn = ctx.get_insn(y_insn);
         let parent_id = insn.parent().map(|b| b.id());
@@ -1076,7 +1074,7 @@ mod tests {
             "
         );
 
-        simplify_cfg(&mut &mut ctx, f);
+        simplify_cfg(&mut ctx, f);
 
         assert!(
             ctx.block(b).instructions.is_empty(),
@@ -1107,7 +1105,7 @@ mod tests {
             "
         );
 
-        simplify_cfg(&mut &mut ctx, f);
+        simplify_cfg(&mut ctx, f);
 
         let mut seen = rustc_hash::FxHashSet::default();
         for block_id in ctx.block_ids() {
@@ -1142,7 +1140,7 @@ mod tests {
             "
         );
 
-        simplify_cfg(&mut &mut ctx, f);
+        simplify_cfg(&mut ctx, f);
 
         let blocks: Vec<_> = Function::from_id(&ctx, f)
             .iter()
@@ -1186,7 +1184,7 @@ mod tests {
 
         // Bypass in isolation: `<d>` is unreachable, so a full `simplify_cfg`
         // run would prune it (and then splice the forwarding `<a>`/`<d>`).
-        try_bypass_empty_block_generic(&mut &mut ctx, f, b);
+        try_bypass_empty_block_generic(&mut ctx, f, b);
 
         // b is gone; a and d both branch straight to t.
         assert!(
@@ -1228,7 +1226,7 @@ mod tests {
 
         // Bypass in isolation (see `bypasses_empty_block_with_two_predecessors`):
         // a full run would prune the unreachable `<d>` predecessor.
-        try_bypass_empty_block_generic(&mut &mut ctx, f, b);
+        try_bypass_empty_block_generic(&mut ctx, f, b);
 
         assert!(
             BasicBlock::from_id(&ctx, b).parent().is_none(),
@@ -1273,7 +1271,7 @@ mod tests {
             "
         );
 
-        simplify_cfg(&mut &mut ctx, f);
+        simplify_cfg(&mut ctx, f);
 
         assert!(
             BasicBlock::from_id(&ctx, b).parent().is_none(),
@@ -1305,7 +1303,7 @@ mod tests {
             "
         );
 
-        simplify_cfg(&mut &mut ctx, f);
+        simplify_cfg(&mut ctx, f);
 
         assert!(
             BasicBlock::from_id(&ctx, b).parent().is_some(),
@@ -1329,7 +1327,7 @@ mod tests {
             "
         );
 
-        simplify_cfg(&mut &mut ctx, f);
+        simplify_cfg(&mut ctx, f);
 
         assert!(
             BasicBlock::from_id(&ctx, a).parent().is_some(),
@@ -1362,7 +1360,7 @@ mod tests {
             "
         );
 
-        simplify_cfg(&mut &mut ctx, f);
+        simplify_cfg(&mut ctx, f);
 
         // `<orphan>` and `<t>` (reachable only via orphan) have no path from the
         // entry `<a>`; simplify_cfg now prunes such dead blocks itself.
@@ -1400,7 +1398,7 @@ mod tests {
         // Exercise the fold in isolation: a full `simplify_cfg` run would prune
         // the unreachable `<d>`, then merge the folded `goto <t>` into t, hiding
         // the very Branch this test inspects.
-        try_fold_cbranch_generic(&mut &mut ctx, a);
+        try_fold_cbranch_generic(&mut ctx, a);
 
         let term = BasicBlock::from_id(&ctx, a)
             .iter()
@@ -1434,7 +1432,7 @@ mod tests {
             "
         );
 
-        simplify_cfg(&mut &mut ctx, f);
+        simplify_cfg(&mut ctx, f);
 
         let term = BasicBlock::from_id(&ctx, a)
             .iter()
