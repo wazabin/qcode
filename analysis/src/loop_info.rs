@@ -25,7 +25,7 @@ use qcode::{
         insn::{Binary, Binop, Branch, CBranch, InstructionId, IntBinop, Mnemonic},
         util::{
             base_ref::HostRef,
-            host_mut::{CheckedOut, HostMut},
+            host_mut::CheckedOut,
         },
     },
 };

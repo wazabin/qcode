@@ -33,7 +33,7 @@ use qcode::{
         insn::{Branch, CBranch, InstructionId, IntrinsicApp, IntrinsicId, Load, Mnemonic},
         util::{
             base_ref::{BaseRef, HostRef},
-            host_mut::{CheckedOut, HostMut},
+            host_mut::CheckedOut,
         },
     },
 };
