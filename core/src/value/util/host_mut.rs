@@ -104,6 +104,13 @@ impl<'a, 'str> PassBacking<'a, 'str> {
     pub fn shared(&self) -> &Context<'str> {
         self.shared
     }
+    /// The module's shared IR state ([`Shared`]) — the narrowed twin of
+    /// [`shared`](Self::shared), for the context-split narrowing (item #1).
+    ///
+    /// [`Shared`]: crate::context::Shared
+    pub fn shr(&self) -> &crate::context::Shared<'str> {
+        &self.shared.shared
+    }
     /// A `Copy` read view over this host, for the mutation refs' read methods.
     pub fn read_host(&self) -> HostRef<'_, 'str> {
         HostRef::Checked {

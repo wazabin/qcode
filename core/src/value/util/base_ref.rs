@@ -53,6 +53,21 @@ impl<'a, 'str> HostRef<'a, 'str> {
         }
     }
 
+    /// The module's shared IR state ([`Shared`]) — the narrowed twin of
+    /// [`shared`](Self::shared). This is the transitional accessor consumers
+    /// migrate onto as [`ContextView`] narrows from `&Context` to `&Shared`
+    /// (context-split stage 5b-ii item #1): once no consumer reaches the whole
+    /// `&Context` through the read host, [`HostRef::Checked`]'s handle narrows to
+    /// `&Shared` and this becomes the only shared accessor.
+    ///
+    /// [`ContextView`]: crate
+    pub fn shr(self) -> &'a crate::context::Shared<'str> {
+        match self {
+            HostRef::Module(c) => &c.shared,
+            HostRef::Checked { shared, .. } => &shared.shared,
+        }
+    }
+
     /// The function *body* `f`, from `fun` if it is the checked-out one, else from
     /// the shared registry.
     pub fn function(self, f: FunctionId) -> &'a Function<'str> {

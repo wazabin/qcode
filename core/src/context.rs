@@ -149,6 +149,79 @@ pub struct Shared<'str> {
     pub(crate) ignored_functions: HashSet<u64>,
 }
 
+impl<'str> Shared<'str> {
+    /// The value id currently bound to the module-global `name`, if any.
+    /// Shared-only mirror of [`Context::get_named`].
+    pub fn get_named(&self, name: &str) -> Option<ValueId> {
+        self.name_map.get(name)
+    }
+
+    /// The varnode `id`. Shared-only accessor (varnodes live in the interners).
+    pub fn varnode(&self, id: VarnodeId) -> &crate::value::Varnode<'str> {
+        &self.values.varnodes[id]
+    }
+
+    /// The space `id`. Shared-only accessor (spaces are frozen architecture).
+    pub fn space(&self, id: SpaceId) -> &Space {
+        &self.spaces[id]
+    }
+
+    /// An interned integer constant of the given byte width, as a [`ValueId`].
+    /// Shared-only mirror of [`Context::get_const`] returning the id directly
+    /// (the `LiteralRef` wrapper needs a whole `&Context`).
+    pub fn get_const(&self, value: u64, size: usize) -> ValueId {
+        let type_id = self.types.get_or_make_int(size);
+        ValueId::Literal(self.values.get_or_make_typed_literal(value, type_id, size))
+    }
+
+    /// A `bool`-typed constant (`true`/`false`), byte-stored. Shared-only mirror
+    /// of [`Context::get_bool_const`] returning the id directly.
+    pub fn get_bool_const(&self, value: bool) -> ValueId {
+        let type_id = self.types.get_or_make_bool();
+        ValueId::Literal(
+            self.values
+                .get_or_make_typed_literal(u64::from(value), type_id, 1),
+        )
+    }
+
+    /// A typed constant literal. Shared-only mirror of
+    /// [`Context::get_typed_const`] returning the id directly.
+    pub fn get_typed_const(&self, value: u64, type_id: crate::types::TypeId) -> ValueId {
+        let size = self.types.size_of(type_id);
+        ValueId::Literal(self.values.get_or_make_typed_literal(value, type_id, size))
+    }
+
+    /// An opaque `Array(i8, len)` byte-blob constant, as a [`ValueId`].
+    /// Shared-only mirror of [`Context::get_bytes`] returning the id directly.
+    pub fn get_bytes(&self, data: Vec<u8>) -> ValueId {
+        let i8_ty = self.types.get_or_make_int(1);
+        let type_id = self.types.get_or_make_array(i8_ty, data.len());
+        ValueId::Bytes(
+            self.values
+                .bytes
+                .push(crate::value::Bytes { data, type_id }),
+        )
+    }
+
+    /// The stored [`TypeId`] of a **shared-leaf** value (literal, bytes, or
+    /// varnode-with-override). Shared-only mirror of [`Context::stored_type_of`]:
+    /// instruction/block-param/block/function ids live in function bodies and are
+    /// out of a `&Shared`'s reach, so they return `None` here (callers route those
+    /// through the body). Matches the actual call pattern, where only shared-leaf
+    /// ids are passed to the shared path.
+    pub fn stored_type_of(&self, id: ValueId) -> Option<crate::types::TypeId> {
+        match id {
+            ValueId::Literal(lid) => Some(self.values.literals[lid].type_id),
+            ValueId::Bytes(bid) => Some(self.values.bytes[bid].type_id),
+            ValueId::Varnode(vid) => self.values.varnode_types.get(&vid).copied(),
+            ValueId::Instruction(_)
+            | ValueId::BlockParam(_)
+            | ValueId::BasicBlock(_)
+            | ValueId::Function(_) => None,
+        }
+    }
+}
+
 /// The operating system of a loaded binary, inferred from its container format.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum TargetOs {
