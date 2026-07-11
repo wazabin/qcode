@@ -802,18 +802,16 @@ mod tests {
     fn test_register_forwarding_in_orphaned_post_call_block() {
         let mut tc = TestContext::new();
         let fun_id = Function::make(&mut tc.ctx, "test".into()).unwrap().id;
-        let entry = {
-            let __f = tc.ctx.anon_function();
-            tc.ctx.get_or_make_block(0x1000, __f)
-        };
-        let post_call = {
-            let __f = tc.ctx.anon_function();
-            tc.ctx.get_or_make_block(0x2000, __f)
-        };
+        // Both blocks are born into `fun_id`'s own arena (self-stored,
+        // self-parented). The orphan-ness of `post_call` is a *CFG* property — the
+        // `call` terminating `entry` grows no edge to it — not a storage one, so
+        // this fixture exercises the same orphan-region walk without the legacy
+        // reattributed-block shape (a block stored in a foreign arena).
+        let entry = tc.ctx.get_or_make_block(0x1000, fun_id);
+        let post_call = tc.ctx.get_or_make_block(0x2000, fun_id);
         {
             let mut f = Function::from_id_mut(&mut tc.ctx, fun_id);
             f.set_root(entry).unwrap();
-            f.add_block(entry);
             f.add_block(post_call);
         }
 
