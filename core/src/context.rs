@@ -17,6 +17,7 @@ use crate::{
         insn::{InstructionId, InstructionRef, Mnemonic, PCodeOpId},
         literal::{LiteralId, LiteralRef},
         registry::ValueRegistry,
+        util::base_ref::{BaseRef, HostRef},
         varnode::{Varnode, VarnodeId, VarnodeRef, register::RegisterId},
     },
 };
@@ -1417,6 +1418,89 @@ impl<'str> Context<'str> {
         self.instruction_mut(id).name = None;
 
         self.remove_instructions(&HashSet::from_iter([id]));
+    }
+
+    // ---- module read/mint surface (context-split stage 5b-ii Pin A) ----------
+    //
+    // Inherent mirrors of the [`HostMut`](crate::value::util::host_mut::HostMut)
+    // read accessors and the type-minting verbs, so the module walker and the
+    // module-scope GVN sub-passes read/mint over `&mut Context` without the trait
+    // in scope. `function{,_mut}` alias the existing `body{,_mut}`.
+
+    /// A `Copy` read view over the whole module (for the mutation refs' reads).
+    pub fn read_host(&self) -> HostRef<'_, 'str> {
+        HostRef::Module(self)
+    }
+    /// The module's shared data (read) — returns `self`; mirrors `HostMut::shared`.
+    pub fn shared(&self) -> &Context<'str> {
+        self
+    }
+    /// The owning function's storage (read). Alias of [`body`](Self::body).
+    pub fn function(&self, f: FunctionId) -> &Function<'str> {
+        &self.bodies[f]
+    }
+    /// The owning function's storage (write). Alias of [`body_mut`](Self::body_mut).
+    pub fn function_mut(&mut self, f: FunctionId) -> &mut Function<'str> {
+        &mut self.bodies[f]
+    }
+
+    /// A read [`BlockRef`](crate::value::BlockRef) over `id`, module-routed.
+    pub fn block_ref(&self, id: BlockId) -> BaseRef<HostRef<'_, 'str>, BlockId> {
+        self.read_host().block_ref(id)
+    }
+    /// A read [`InstructionRef`] over `id`, module-routed.
+    pub fn insn_ref(&self, id: InstructionId) -> BaseRef<HostRef<'_, 'str>, InstructionId> {
+        self.read_host().insn_ref(id)
+    }
+    /// A read [`BlockParamRef`](crate::value::BlockParamRef) over `id`.
+    pub fn param_ref(&self, id: BlockParamId) -> BaseRef<HostRef<'_, 'str>, BlockParamId> {
+        self.read_host().param_ref(id)
+    }
+    /// A read [`FunctionRef`] over `id`, module-routed.
+    pub fn function_ref(&self, id: FunctionId) -> BaseRef<HostRef<'_, 'str>, FunctionId> {
+        self.read_host().function_ref(id)
+    }
+
+    /// Mint an `Int(size)`-typed instruction with `mnemonic` into `func`'s arena.
+    /// Mirrors [`HostMut::push_mnemonic`].
+    pub fn push_mnemonic(
+        &mut self,
+        func: FunctionId,
+        mnemonic: Mnemonic,
+        size: usize,
+    ) -> InstructionId {
+        let type_id = self.shared.types.get_or_make_int(size);
+        self.push_insn(func, Instruction::new(type_id, mnemonic))
+    }
+
+    /// Mint an instruction with `mnemonic` and explicit result `type_id` into
+    /// `func`'s arena. Mirrors [`HostMut::push_mnemonic_with_type`].
+    pub fn push_mnemonic_with_type(
+        &mut self,
+        func: FunctionId,
+        mnemonic: Mnemonic,
+        type_id: crate::types::TypeId,
+    ) -> InstructionId {
+        self.push_insn(func, Instruction::new(type_id, mnemonic))
+    }
+
+    /// Insert `insn` immediately before `before` in `block`, setting its parent.
+    /// Mirrors [`HostMut::insert_insn_before`].
+    pub fn insert_insn_before(
+        &mut self,
+        block: BlockId,
+        before: InstructionId,
+        insn: InstructionId,
+    ) {
+        let index = self
+            .read_host()
+            .block(block)
+            .instructions
+            .iter()
+            .position(|&i| i == before)
+            .expect("before not in block");
+        self.instruction_mut(insn).parent = Some(block);
+        self.block_mut(block).instructions.insert(index, insn);
     }
 
     /// Associates `addr` with `id` in the address map.
