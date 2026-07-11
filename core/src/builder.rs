@@ -54,7 +54,7 @@ use crate::{
         },
         util::{
             base_ref::{BaseRef, HostRef},
-            host_mut::HostMut,
+            host_mut::CheckedOut,
         },
         varnode::{Varnode, VarnodeId},
     },
@@ -120,28 +120,29 @@ pub trait BuilderBacking<'str> {
     }
 }
 
-/// Transitional blanket: every [`HostMut`] is a [`BuilderBacking`] by pure
-/// delegation, so both the module (`&mut Context`) and function-pass
-/// (`CheckedOut`) hosts back a builder with no call-site change. Item #3 replaces
-/// this with two direct impls when [`HostMut`] is deleted.
-impl<'str, T: HostMut<'str>> BuilderBacking<'str> for T {
+/// The **module** builder backing (`&mut Context`): the lifter / lowering /
+/// emulator construction path, which additionally mints temp spaces (concrete
+/// `Builder<&mut Context>`, see [`Builder::make_temp`]). Every method routes
+/// through `Context`'s inherent verbs — the builder no longer needs the `HostMut`
+/// host trait.
+impl<'str> BuilderBacking<'str> for &mut Context<'str> {
     fn bb_shared(&self) -> &Context<'str> {
-        self.shared()
+        self
     }
     fn bb_shared_mut(&mut self) -> &mut Context<'str> {
-        self.shared_mut()
+        self
     }
     fn bb_read_host(&self) -> HostRef<'_, 'str> {
-        self.read_host()
+        HostRef::Module(self)
     }
     fn bb_function_mut(&mut self, f: FunctionId) -> &mut Function<'str> {
-        self.function_mut(f)
+        &mut self.bodies[f]
     }
     fn bb_instruction_mut(&mut self, id: InstructionId) -> &mut Instruction<'str> {
-        self.instruction_mut(id)
+        Context::instruction_mut(self, id)
     }
     fn bb_block_mut(&mut self, id: BlockId) -> &mut BasicBlock<'str> {
-        self.block_mut(id)
+        Context::block_mut(self, id)
     }
     fn bb_register_local_name(
         &mut self,
@@ -149,16 +150,78 @@ impl<'str, T: HostMut<'str>> BuilderBacking<'str> for T {
         name: Cow<'str, str>,
         old: Option<&str>,
     ) -> crate::error::Result<()> {
-        self.register_local_name(id, name, old)
+        use crate::error::{Error, ErrorTy};
+        let existing = match id.name_scope_function() {
+            Some(func) => self.bodies[func].names.get(&name),
+            None => self.get_named(&name),
+        };
+        if let Some(existing) = existing {
+            return if existing == id {
+                Ok(())
+            } else {
+                Err(Error::spanless(ErrorTy::DuplicateName(name.to_string())))
+            };
+        }
+        match id.name_scope_function() {
+            Some(func) => self.bodies[func].names.register(name, id, old),
+            None => self.update_name(name, id, old),
+        }
     }
     fn bb_push_insn(&mut self, func: FunctionId, insn: Instruction<'str>) -> InstructionId {
-        self.push_insn(func, insn)
+        Context::push_insn(self, func, insn)
     }
     fn bb_push_block(&mut self, func: FunctionId, block: BasicBlock<'str>) -> BlockId {
-        self.push_block(func, block)
+        Context::push_block(self, func, block)
     }
     fn bb_add_cfg_edge(&mut self, from: BlockId, to: BlockId) -> EdgeId {
-        self.add_cfg_edge(from, to)
+        Context::add_cfg_edge(self, from, to)
+    }
+}
+
+/// The **function-pass** builder backing (a checked-out body): every method routes
+/// through the owned `Function`'s inherent verbs plus the read-only shared context.
+/// `bb_shared_mut` is intentionally left as the defaulted panic — a pass-time
+/// builder holds a frozen shared view and cannot mint temp spaces.
+impl<'str> BuilderBacking<'str> for CheckedOut<'_, 'str> {
+    fn bb_shared(&self) -> &Context<'str> {
+        self.shared
+    }
+    fn bb_read_host(&self) -> HostRef<'_, 'str> {
+        HostRef::Checked {
+            fun: &*self.fun,
+            shared: self.shared,
+            id: self.id,
+        }
+    }
+    fn bb_function_mut(&mut self, f: FunctionId) -> &mut Function<'str> {
+        assert_eq!(
+            f, self.id,
+            "a checked-out function pass may not mutate another function"
+        );
+        self.fun
+    }
+    fn bb_instruction_mut(&mut self, id: InstructionId) -> &mut Instruction<'str> {
+        self.fun.insn_mut(id)
+    }
+    fn bb_block_mut(&mut self, id: BlockId) -> &mut BasicBlock<'str> {
+        self.fun.block_mut(id)
+    }
+    fn bb_register_local_name(
+        &mut self,
+        id: ValueId,
+        name: Cow<'str, str>,
+        old: Option<&str>,
+    ) -> crate::error::Result<()> {
+        self.fun.register_local_name(self.shared, id, name, old)
+    }
+    fn bb_push_insn(&mut self, func: FunctionId, insn: Instruction<'str>) -> InstructionId {
+        self.fun.push_insn(func, insn)
+    }
+    fn bb_push_block(&mut self, func: FunctionId, block: BasicBlock<'str>) -> BlockId {
+        self.fun.push_block(func, block)
+    }
+    fn bb_add_cfg_edge(&mut self, from: BlockId, to: BlockId) -> EdgeId {
+        self.fun.add_cfg_edge(from, to)
     }
 }
 
@@ -1792,7 +1855,7 @@ mod tests {
         // type + literal minting through the interners' `&self` paths), then a
         // branch to a freshly minted local-label block. No varnode/temp-space
         // minting — a checked-out host has read-only shared access.
-        fn body<'str, 'ctx, Ctx: HostMut<'str>>(b: &mut Builder<'str, 'ctx, Ctx>) {
+        fn body<'str, 'ctx, Ctx: BuilderBacking<'str>>(b: &mut Builder<'str, 'ctx, Ctx>) {
             let c1 = b.context().get_const(7, 8).id();
             let c2 = b.context().get_const(9, 8).id();
             let sum = b.push_add(c1, c2).id();
