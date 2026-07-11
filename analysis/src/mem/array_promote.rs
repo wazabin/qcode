@@ -480,7 +480,7 @@ fn width_of<'str>(host: &PassBacking<'_, 'str>, v: ValueId) -> usize {
             .stored_type_of(other)
             .expect("value has a stored type"),
     };
-    host.shared().shared.types.size_of(ty)
+    host.shr().types.size_of(ty)
 }
 
 /// Push an `index_plus(index, delta)` value into `block` before `before`, through
@@ -548,7 +548,7 @@ fn apply<'str>(body: &mut FunctionBody<'str>, cx: ContextView<'_, 'str>, m: &Pro
 /// body.
 fn apply_generic<'str>(host: &mut PassBacking<'_, 'str>, m: &PromoteMatch) -> bool {
     let esz = m.elem_size;
-    let elem_ty = host.shared().shared.types.get_or_make_int(esz);
+    let elem_ty = host.shr().types.get_or_make_int(esz);
     let arr_ty = host
         .shared()
         .shared
@@ -613,8 +613,8 @@ fn apply_generic<'str>(host: &mut PassBacking<'_, 'str>, m: &PromoteMatch) -> bo
         )
     } else {
         let splat_id = IntrinsicId::from_name("splat").expect("splat registered");
-        let zero_elem = host.shared().get_const(0, esz).id();
-        let count_const = host.shared().get_const(m.count as u64, 8).id();
+        let zero_elem = host.shr().get_const(0, esz);
+        let count_const = host.shr().get_const(m.count as u64, 8);
         insert_at_top(
             host,
             m.preheader,
@@ -630,7 +630,7 @@ fn apply_generic<'str>(host: &mut PassBacking<'_, 'str>, m: &PromoteMatch) -> bo
     let arr1 = match &m.seed {
         Some(seed) => {
             let term_id = last_insn(host, m.preheader);
-            let idx0 = host.shared().get_const(0, 8).id();
+            let idx0 = host.shr().get_const(0, 8);
             insert_before(
                 host,
                 m.preheader,
@@ -680,7 +680,7 @@ fn apply_generic<'str>(host: &mut PassBacking<'_, 'str>, m: &PromoteMatch) -> bo
 
     // Exit const reads: rewrite to `at(arr_e, element)`.
     for &(load_id, elem) in &m.extra_loads {
-        let idx = host.shared().get_const(elem as u64, 8).id();
+        let idx = host.shr().get_const(elem as u64, 8);
         let at_val = insert_before(
             host,
             m.exit,

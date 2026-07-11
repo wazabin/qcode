@@ -253,7 +253,7 @@ pub(crate) fn outline_scan_body<'str>(
             // Data mode returned above.
             ScanElem::Data(_) => unreachable!("data mode handled above"),
         };
-        let types = &own.shared().shared.types;
+        let types = &own.shr().types;
         // Narrow `i64` index → loop index width.
         let isz = types.size_of(index_ty);
         if isz < types.size_of(fty) {
@@ -306,7 +306,7 @@ pub(crate) fn outline_scan_body<'str>(
 /// fallback and mis-type the node.
 pub(crate) fn seq_result_type(host: HostRef, src: ValueId, body_ret: TypeId) -> TypeId {
     let src_ty = host.type_of(src);
-    match host.shared().shared.types.seq_of(src_ty) {
+    match host.shr().types.seq_of(src_ty) {
         Some((_, len, is_list)) => host
             .shared()
             .shared

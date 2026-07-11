@@ -430,7 +430,7 @@ fn emit<'str>(
 ) -> ValueId {
     match e {
         Expr::Var(VarId(i)) => leaves[*i],
-        Expr::Const(c) => host.shared().get_const(c.get(mask), size).id(),
+        Expr::Const(c) => host.shr().get_const(c.get(mask), size),
         Expr::Not(x) => {
             let xv = emit(host, x, leaves, size, mask, before, block);
             push_insn(
@@ -447,13 +447,13 @@ fn emit<'str>(
         Expr::Scale(c, x) => {
             let cv = c.get(mask);
             if cv == 0 {
-                return host.shared().get_const(0, size).id();
+                return host.shr().get_const(0, size);
             }
             let xv = emit(host, x, leaves, size, mask, before, block);
             if cv == 1 {
                 return xv;
             }
-            let cval = host.shared().get_const(cv, size).id();
+            let cval = host.shr().get_const(cv, size);
             push_binop(host, IntBinop::Mul, cval, xv, size, before, block)
         }
         Expr::And(v) => fold_emit(host, v, IntBinop::And, leaves, size, mask, before, block),
@@ -482,7 +482,7 @@ fn fold_emit<'str>(
             IntBinop::Mul => 1,
             _ => 0,
         };
-        return host.shared().get_const(id, size).id();
+        return host.shr().get_const(id, size);
     }
     let mut acc = emit(host, &operands[0], leaves, size, mask, before, block);
     for e in &operands[1..] {
@@ -614,7 +614,7 @@ fn is_mba_insn(host: HostRef, iid: InstructionId) -> bool {
 /// The constant value of `v`, if it is a plain (non-symbolic) integer literal.
 fn numeric_const(host: HostRef, v: ValueId) -> Option<u64> {
     if let ValueId::Literal(id) = v {
-        let lit = &host.shared().shared.values.literals[id];
+        let lit = &host.shr().values.literals[id];
         if lit.symbolic.is_none() {
             return Some(lit.value);
         }

@@ -627,7 +627,7 @@ fn block_terminator(host: HostRef, block: BlockId) -> Option<qcode::value::insn:
 }
 
 fn is_const_literal(host: HostRef, val: ValueId) -> bool {
-    matches!(val, ValueId::Literal(id) if host.shared().shared.values.literals[id].symbolic.is_none())
+    matches!(val, ValueId::Literal(id) if host.shr().values.literals[id].symbolic.is_none())
 }
 
 /// Reinterprets a constant literal at `size` bytes, so a base-case accumulator

@@ -364,7 +364,7 @@ fn binop_const(host: HostRef, v: ValueId, want: IntBinop) -> Option<(ValueId, u6
 fn simplify_not(host: HostRef, v: ValueId, size: usize) -> Option<ValueId> {
     let all = all_ones(size);
     if let Some(c) = const_value(host.shared(), v) {
-        return Some(host.shared().get_const((!c) & all, size).id());
+        return Some(host.shr().get_const((!c) & all, size));
     }
     if let Some((x, c)) = binop_const(host, v, IntBinop::Xor)
         && (c & all) == all
@@ -429,7 +429,7 @@ fn simplify_bitwise<'str>(host: &mut Context<'str>, ic: &InsnCtx, ed: &mut Edito
                     return true;
                 }
                 if let Some((x, c1)) = binop_const(host.read_host(), inner, IntBinop::And) {
-                    let folded = host.shared().get_const((c1 & outer) & all, size).id();
+                    let folded = host.shr().get_const((c1 & outer) & all, size);
                     ed.replace_with_new_insn(
                         host,
                         ic.block_id,
@@ -446,7 +446,7 @@ fn simplify_bitwise<'str>(host: &mut Context<'str>, ic: &InsnCtx, ed: &mut Edito
             for (outer, inner) in const_operands(host.read_host(), lhs, rhs) {
                 // (x ^ c1) ^ c2 → x ^ (c1 ^ c2)
                 if let Some((x, c1)) = binop_const(host.read_host(), inner, IntBinop::Xor) {
-                    let folded = host.shared().get_const((c1 ^ outer) & all, size).id();
+                    let folded = host.shr().get_const((c1 ^ outer) & all, size);
                     ed.replace_with_new_insn(
                         host,
                         ic.block_id,
@@ -508,7 +508,7 @@ fn as_zext(host: HostRef, v: ValueId) -> Option<(ValueId, usize)> {
 /// (comparisons and logical `And`/`Or`/`Xor` over bool all carry the type).
 fn is_boolean(host: HostRef, v: ValueId) -> bool {
     host.stored_type_of(v)
-        .is_some_and(|t| host.shared().shared.types.is_bool(t))
+        .is_some_and(|t| host.shr().types.is_bool(t))
 }
 
 /// The negation of an equality comparison: `==`↔`!=`. Ordering comparisons are
@@ -549,8 +549,8 @@ fn simplify_compare<'str>(host: &mut Context<'str>, ic: &InsnCtx, ed: &mut Edito
                 // `zext(v) ==/!= 0` → `v ==/!= 0`: comparing a zero-extended
                 // value against 0 is comparing the source against 0.
                 if let Some((src, src_size)) = as_zext(host.read_host(), other) {
-                    let zero = host.shared().get_const(0, src_size).id();
-                    let bool_ty = host.shared().shared.types.get_or_make_bool();
+                    let zero = host.shr().get_const(0, src_size);
+                    let bool_ty = host.shr().types.get_or_make_bool();
                     ed.replace_with_new_insn_typed(
                         host,
                         ic.block_id,
@@ -585,7 +585,7 @@ fn simplify_compare<'str>(host: &mut Context<'str>, ic: &InsnCtx, ed: &mut Edito
                                 }) = host.insn_ref(id).mnemonic()
                                 && let Some(flipped) = negated_compare(inner)
                             {
-                                let bool_ty = host.shared().shared.types.get_or_make_bool();
+                                let bool_ty = host.shr().types.get_or_make_bool();
                                 ed.replace_with_new_insn_typed(
                                     host,
                                     ic.block_id,
@@ -730,8 +730,8 @@ fn simplify_compare_c<'str>(
                     continue;
                 }
                 if let Some((src, src_size)) = as_zext(body.read_host(cx), other) {
-                    let zero = body.read_host(cx).shared().get_const(0, src_size).id();
-                    let bool_ty = body.read_host(cx).shared().shared.types.get_or_make_bool();
+                    let zero = body.read_host(cx).shr().get_const(0, src_size);
+                    let bool_ty = body.read_host(cx).shr().types.get_or_make_bool();
                     ed.replace_with_new_insn_typed_c(
                         body,
                         cx,
@@ -760,7 +760,7 @@ fn simplify_compare_c<'str>(
                                 && let Some(flipped) = negated_compare(inner)
                             {
                                 let bool_ty =
-                                    body.read_host(cx).shared().shared.types.get_or_make_bool();
+                                    body.read_host(cx).shr().types.get_or_make_bool();
                                 ed.replace_with_new_insn_typed_c(
                                     body,
                                     cx,

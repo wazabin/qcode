@@ -95,7 +95,7 @@ fn nonzero_polarity(host: HostRef, cond: ValueId, elem: ValueId) -> Option<bool>
     };
     let is_bool = |v: ValueId| {
         host.stored_type_of(v)
-            .is_some_and(|t| host.shared().shared.types.is_bool(t))
+            .is_some_and(|t| host.shr().types.is_bool(t))
     };
     let bool_const = |v: ValueId| {
         (is_bool(v) && matches!(v, ValueId::Literal(_)))
@@ -160,8 +160,8 @@ fn try_match_strlen(host: HostRef, fid: FunctionId) -> Option<StrlenMatch> {
             }
             let byte_array = host
                 .stored_type_of(args[0])
-                .and_then(|t| host.shared().shared.types.array_of(t))
-                .is_some_and(|(elem, _)| host.shared().shared.types.size_of(elem) == 1);
+                .and_then(|t| host.shr().types.array_of(t))
+                .is_some_and(|(elem, _)| host.shr().types.size_of(elem) == 1);
             if !byte_array {
                 continue;
             }

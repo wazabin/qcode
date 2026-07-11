@@ -1520,6 +1520,13 @@ impl<'str> Context<'str> {
     pub fn shared(&self) -> &Context<'str> {
         self
     }
+    /// The module's shared IR state ([`Shared`]) — the module-path twin of
+    /// [`HostRef::shr`]/[`PassBacking::shr`], so a `&mut Context` module walker and
+    /// a checked-out pass spell shared-data reads identically (context-split
+    /// stage 5b-ii item #1).
+    pub fn shr(&self) -> &Shared<'str> {
+        &self.shared
+    }
     /// The owning function's storage (read). Alias of [`body`](Self::body).
     pub fn function(&self, f: FunctionId) -> &Function<'str> {
         &self.bodies[f]

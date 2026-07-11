@@ -201,7 +201,7 @@ impl MemForward {
             );
         }
         if covered < store.size {
-            let zero = host.shared().get_const(0, store.size - covered).id();
+            let zero = host.shr().get_const(0, store.size - covered);
             for (i, off) in (start + covered as i64..end).enumerate() {
                 self.byte_map.insert(
                     (base, off),

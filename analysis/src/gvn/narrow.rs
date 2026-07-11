@@ -221,7 +221,7 @@ fn narrow_to<'str>(
         },
         _ if numeric_const(host.shared(), v).is_some() => {
             let folded = numeric_const(host.shared(), v).unwrap() & low_mask(w);
-            host.shared().get_const(folded, w).id()
+            host.shr().get_const(folded, w)
         }
         // Block params, varnodes, …: extract the low bytes.
         _ => push_insn(host, range_low(v, w), w, before, block),
@@ -353,7 +353,7 @@ fn narrow_to_c<'str>(
         },
         _ if numeric_const(body.read_host(cx).shared(), v).is_some() => {
             let folded = numeric_const(body.read_host(cx).shared(), v).unwrap() & low_mask(w);
-            body.read_host(cx).shared().get_const(folded, w).id()
+            body.read_host(cx).shr().get_const(folded, w)
         }
         _ => push_insn_c(body, cx, range_low(v, w), w, before, block),
     };

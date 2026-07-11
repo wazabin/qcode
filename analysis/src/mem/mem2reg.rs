@@ -200,7 +200,7 @@ impl<'ctx, 'str> Mem2RegGeneric<'ctx, 'str> {
         }
 
         if let ValueId::Literal(id) = value {
-            let literal = self.read().shared().shared.values.literals[id].clone();
+            let literal = self.read().shr().values.literals[id].clone();
             if literal.symbolic.is_none() {
                 return self
                     .read()
@@ -559,7 +559,7 @@ impl<'str> Mem2RegGeneric<'_, 'str> {
         // Host-routed mirror of `BasicBlock::push_param(size)`: mint an
         // `Int(size)`-typed param and append it to the block's param list.
         let index = self.read().block(block_id).params.len();
-        let type_id = self.read().shared().shared.types.get_or_make_int(size);
+        let type_id = self.read().shr().types.get_or_make_int(size);
         let param_id = self.host.push_block_param(
             block_id.func,
             BlockParam {
@@ -579,7 +579,7 @@ impl<'str> Mem2RegGeneric<'_, 'str> {
         // the default `Int(size)`. Width matches by construction (the override is
         // installed with the varnode's own width).
         if let ValueId::Varnode(_) = var
-            && let Some(ty) = self.read().shared().stored_type_of(var)
+            && let Some(ty) = self.read().shr().stored_type_of(var)
         {
             self.host.block_param_mut(param_id).type_id = ty;
         }
@@ -2011,7 +2011,7 @@ impl<'ctx, 'str> Mem2Reg<'ctx, 'str> {
         }
 
         if let ValueId::Literal(id) = value {
-            let literal = self.read().shared().shared.values.literals[id].clone();
+            let literal = self.read().shr().values.literals[id].clone();
             if literal.symbolic.is_none() {
                 return self
                     .read()
@@ -2116,7 +2116,7 @@ impl<'str> Mem2Reg<'_, 'str> {
         // Host-routed mirror of `BasicBlock::push_param(size)`: mint an
         // `Int(size)`-typed param and append it to the block's param list.
         let index = self.read().block(block_id).params.len();
-        let type_id = self.read().shared().shared.types.get_or_make_int(size);
+        let type_id = self.read().shr().types.get_or_make_int(size);
         let param_id = self.body.push_block_param(
             self.cx,
             BlockParam {
@@ -2136,7 +2136,7 @@ impl<'str> Mem2Reg<'_, 'str> {
         // the default `Int(size)`. Width matches by construction (the override is
         // installed with the varnode's own width).
         if let ValueId::Varnode(_) = var
-            && let Some(ty) = self.read().shared().stored_type_of(var)
+            && let Some(ty) = self.read().shr().stored_type_of(var)
         {
             self.body.block_param_mut(param_id).type_id = ty;
         }

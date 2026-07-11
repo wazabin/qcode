@@ -649,7 +649,7 @@ struct DeadLoop {
 /// `c` if `v` is the integer literal `c`, else `None`.
 fn dl_literal(host: HostRef, v: ValueId) -> Option<u64> {
     match v {
-        ValueId::Literal(lid) => Some(host.shared().shared.values.literals[lid].value),
+        ValueId::Literal(lid) => Some(host.shr().values.literals[lid].value),
         _ => None,
     }
 }

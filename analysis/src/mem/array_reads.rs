@@ -48,7 +48,7 @@ fn stored_type_of(host: HostRef, id: ValueId) -> Option<TypeId> {
         ValueId::Instruction(iid) => Some(host.insn_ref(iid).type_id()),
         ValueId::BlockParam(pid) => Some(host.block_param(pid).type_id),
         // Everything else is shared data; the Context method reads it directly.
-        other => host.shared().stored_type_of(other),
+        other => host.shr().stored_type_of(other),
     }
 }
 
@@ -131,7 +131,7 @@ fn try_match(host: HostRef, fid: FunctionId) -> Option<ReadsMatch> {
         a.stored.is_some_and(|src| {
             is_root(src)
                 && stored_type_of(host, src)
-                    .and_then(|t| host.shared().shared.types.array_of(t))
+                    .and_then(|t| host.shr().types.array_of(t))
                     .is_some()
         }) && is_root(a.ptr)
     })?;
@@ -144,7 +144,7 @@ fn try_match(host: HostRef, fid: FunctionId) -> Option<ReadsMatch> {
         .shared
         .types
         .array_of(stored_type_of(host, arr)?)?;
-    let esz = host.shared().shared.types.size_of(elem_ty);
+    let esz = host.shr().types.size_of(elem_ty);
     if esz == 0 || count == 0 || seed.size != count * esz {
         return None;
     }

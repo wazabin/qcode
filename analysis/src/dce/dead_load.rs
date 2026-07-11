@@ -126,7 +126,7 @@ fn base_plus_offset(host: HostRef, ptr: ValueId) -> (ValueId, i64) {
         };
         let (op, lhs, rhs) = (b.op, b.lhs, b.rhs);
         let lit = |v: ValueId| match v {
-            ValueId::Literal(lid) => Some(host.shared().shared.values.literals[lid].value as i64),
+            ValueId::Literal(lid) => Some(host.shr().values.literals[lid].value as i64),
             _ => None,
         };
         match op {
@@ -171,14 +171,14 @@ fn addr_key(host: HostRef, ptr: ValueId) -> (AddrBase, i64) {
     if let ValueId::Literal(lid) = ptr {
         return (
             AddrBase::Absolute,
-            host.shared().shared.values.literals[lid].value as i64,
+            host.shr().values.literals[lid].value as i64,
         );
     }
     let (base, off) = base_plus_offset(host, ptr);
     match base {
         ValueId::Literal(lid) => (
             AddrBase::Absolute,
-            host.shared().shared.values.literals[lid].value as i64 + off,
+            host.shr().values.literals[lid].value as i64 + off,
         ),
         other => (AddrBase::Sym(other), off),
     }
@@ -203,7 +203,7 @@ fn disjoint_access(
 fn ptr_offset(host: HostRef, ptr: ValueId) -> Option<i64> {
     match ptr {
         ValueId::Varnode(id) => Some(Varnode::from_id(host.shared(), id).address()),
-        ValueId::Literal(lid) => Some(host.shared().shared.values.literals[lid].value as i64),
+        ValueId::Literal(lid) => Some(host.shr().values.literals[lid].value as i64),
         _ => None,
     }
 }
@@ -899,7 +899,7 @@ fn postdominated_dead_ram_stores(
         return HashSet::default();
     }
 
-    let ram = host.shared().shared.default_space;
+    let ram = host.shr().default_space;
     let node_set: HashSet<BlockId> = blocks.iter().copied().collect();
     let exit_set: HashSet<BlockId> = blocks
         .iter()

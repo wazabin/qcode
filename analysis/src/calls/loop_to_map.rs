@@ -216,8 +216,8 @@ fn apply<'str>(m: ContextView<'_, 'str>, body: &mut FunctionBody<'str>, mm: &Map
             let arr_ty = host.type_of(mm.init_arr);
             let enum_ty = enum_id
                 .desc()
-                .result_type(&host.shared().shared.types, &[arr_ty]);
-            match host.shared().shared.types.array_of(enum_ty) {
+                .result_type(&host.shr().types, &[arr_ty]);
+            match host.shr().types.array_of(enum_ty) {
                 Some((tuple_ty, _)) => Some(tuple_ty),
                 None => return false,
             }

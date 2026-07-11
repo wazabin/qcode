@@ -106,7 +106,7 @@ fn stored_type_of<'str>(host: HostRef<'_, 'str>, id: ValueId) -> Option<TypeId> 
     match id {
         ValueId::Instruction(iid) => Some(host.insn_ref(iid).type_id()),
         ValueId::BlockParam(pid) => Some(host.param_ref(pid).type_id()),
-        other => host.shared().stored_type_of(other),
+        other => host.shr().stored_type_of(other),
     }
 }
 
@@ -156,7 +156,7 @@ fn rename_struct_values<'a, 'str>(
 /// pointee's name when `ty` is a struct pointer, or the struct's own name when
 /// `ty` is a struct value. `None` for non-struct types.
 fn struct_base_name(host: HostRef, ty: TypeId) -> Option<String> {
-    let types = &host.shared().shared.types;
+    let types = &host.shr().types;
     let struct_ty = types.pointee_of(ty).unwrap_or(ty);
     types.struct_name_of(struct_ty).map(str::to_lowercase)
 }
@@ -196,7 +196,7 @@ fn unique_name<'str>(
 fn function_has_struct_types(host: HostRef, fun_id: FunctionId) -> bool {
     let is_struct_ish = |v: ValueId| {
         stored_type_of(host, v).is_some_and(|t| {
-            let types = &host.shared().shared.types;
+            let types = &host.shr().types;
             types.pointee_of(t).is_some() || types.struct_name_of(t).is_some()
         })
     };
@@ -338,7 +338,7 @@ fn const_offset(host: HostRef, op: ValueId) -> Option<usize> {
     let ValueId::Literal(lid) = op else {
         return None;
     };
-    let lit = &host.shared().shared.values.literals[lid];
+    let lit = &host.shr().values.literals[lid];
     if lit.symbolic.is_some() {
         return None;
     }

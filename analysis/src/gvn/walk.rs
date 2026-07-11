@@ -85,7 +85,7 @@ impl Editor {
         mnemonic: Mnemonic,
         size: usize,
     ) -> InstructionId {
-        let type_id = host.shared().shared.types.get_or_make_int(size);
+        let type_id = host.shr().types.get_or_make_int(size);
         self.replace_with_new_insn_typed(host, block_id, at, mnemonic, type_id)
     }
 

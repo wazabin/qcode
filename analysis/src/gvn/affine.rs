@@ -398,7 +398,7 @@ fn build_value<'str>(
     } = form
     {
         if terms.is_empty() {
-            return host.shared().get_const(*constant, *width).id();
+            return host.shr().get_const(*constant, *width);
         }
         if terms.len() == 1 && terms[0].1 == 1 && *constant == 0 {
             return terms[0].0;
@@ -409,7 +409,7 @@ fn build_value<'str>(
     }
     let int_ty = match form {
         NormalForm::Affine { width, .. } | NormalForm::Mask { width, .. } => {
-            host.shared().shared.types.get_or_make_int(*width)
+            host.shr().types.get_or_make_int(*width)
         }
         NormalForm::Opaque(_) => unreachable!("opaque forms are never materialized"),
     };
@@ -439,7 +439,7 @@ fn canonical_mnemonic<'str>(
         } => Mnemonic::Binop(Binary {
             op: Binop::Int(*op),
             lhs: *term,
-            rhs: host.shared().get_const(*mask, *width).id(),
+            rhs: host.shr().get_const(*mask, *width),
         }),
         NormalForm::Affine {
             width,
@@ -499,7 +499,7 @@ fn canonical_mnemonic<'str>(
                 return Mnemonic::Binop(Binary {
                     op: Binop::Int(IntBinop::Mul),
                     lhs: last_v,
-                    rhs: host.shared().get_const(last_k, width).id(),
+                    rhs: host.shr().get_const(last_k, width),
                 });
             }
 
@@ -590,7 +590,7 @@ pub(super) fn materialize<'str>(
     } = key
     {
         if terms.is_empty() {
-            return host.shared().get_const(*constant, *width).id();
+            return host.shr().get_const(*constant, *width);
         }
         if terms.len() == 1 && terms[0].1 == 1 && *constant == 0 {
             return terms[0].0;
@@ -698,7 +698,7 @@ fn canonical_mnemonic_c<'str>(
         } => Mnemonic::Binop(Binary {
             op: Binop::Int(*op),
             lhs: *term,
-            rhs: body.read_host(cx).shared().get_const(*mask, *width).id(),
+            rhs: body.read_host(cx).shr().get_const(*mask, *width),
         }),
         NormalForm::Affine {
             width,
@@ -749,7 +749,7 @@ fn canonical_mnemonic_c<'str>(
                 return Mnemonic::Binop(Binary {
                     op: Binop::Int(IntBinop::Mul),
                     lhs: last_v,
-                    rhs: body.read_host(cx).shared().get_const(last_k, width).id(),
+                    rhs: body.read_host(cx).shr().get_const(last_k, width),
                 });
             }
 

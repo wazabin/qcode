@@ -843,11 +843,11 @@ fn induction_increment(host: HostRef, value: ValueId, induction: BlockParamId) -
 
 fn numeric_const(host: HostRef, value: ValueId) -> Option<u64> {
     let id = value.as_literal()?;
-    let literal = &host.shared().shared.values.literals[id];
+    let literal = &host.shr().values.literals[id];
     if literal.symbolic.is_some() {
         return None;
     }
-    let size = host.shared().shared.types.size_of(literal.type_id);
+    let size = host.shr().types.size_of(literal.type_id);
     Some(if size >= 8 {
         literal.value
     } else {

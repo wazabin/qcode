@@ -100,7 +100,7 @@ fn is_symbolic_literal(host: HostRef, v: ValueId) -> bool {
     let ValueId::Literal(id) = v else {
         return false;
     };
-    host.shared().shared.values.literals[id].symbolic.is_some()
+    host.shr().values.literals[id].symbolic.is_some()
 }
 
 /// `get_const`, but refusing Block/Function/String symbolic literals: those are
@@ -233,12 +233,12 @@ fn constant_folding_with_location(
                 .shared
                 .types
                 .binop_result(lhs_type, op, rhs_type);
-            let out_type = if host.shared().shared.types.size_of(out_type) == output_size {
+            let out_type = if host.shr().types.size_of(out_type) == output_size {
                 out_type
             } else {
-                host.shared().shared.types.get_or_make_int(output_size)
+                host.shr().types.get_or_make_int(output_size)
             };
-            Some(host.shared().get_typed_const(value, out_type).id())
+            Some(host.shr().get_typed_const(value, out_type))
         }
 
         Mnemonic::Unop(unop) => {
@@ -257,12 +257,12 @@ fn constant_folding_with_location(
                 }
             };
 
-            Some(host.shared().get_const(value & mask, size).id())
+            Some(host.shr().get_const(value & mask, size))
         }
 
         Mnemonic::Zext(zext) => {
             let src = get_numeric_const(host, zext.src)?;
-            Some(host.shared().get_const(src.value(), zext.size).id())
+            Some(host.shr().get_const(src.value(), zext.size))
         }
 
         Mnemonic::Sext(sext) => {
@@ -287,7 +287,7 @@ fn constant_folding_with_location(
             // constant. The source may be a numeric literal (e.g. EDI = low 4
             // bytes of a wide RDI literal) or an opaque byte blob.
             if let Some(bid) = range.src.as_bytes() {
-                let data = &host.shared().shared.values.bytes[bid].data;
+                let data = &host.shr().values.bytes[bid].data;
                 let start = range.start;
                 let end = start.checked_add(range.size)?;
                 let slice = data.get(start..end)?;
@@ -303,7 +303,7 @@ fn constant_folding_with_location(
                     );
                 }
                 // Still wider than a u64: a narrower byte blob.
-                return Some(host.shared().get_bytes(slice.to_vec()).id());
+                return Some(host.shr().get_bytes(slice.to_vec()));
             }
             let src = get_numeric_const(host, range.src)?;
             let shifted = src.value().overflowing_shr(range.start as u32 * 8).0;
@@ -323,7 +323,7 @@ fn constant_folding_with_location(
                 operands.push((u128::from(c.value()), c.size()));
             }
             let value = intr.id.desc().eval(&operands, output_size)?;
-            Some(host.shared().get_const(value as u64, output_size).id())
+            Some(host.shr().get_const(value as u64, output_size))
         }
 
         _ => None,
@@ -497,7 +497,7 @@ pub(super) fn algebraic_identity(
             IntBinop::And | IntBinop::Or => return Some(lhs),
             // x ^ x = 0 ; x - x = 0
             IntBinop::Xor | IntBinop::Sub => {
-                return Some(host.shared().get_const(0, output_size).id());
+                return Some(host.shr().get_const(0, output_size));
             }
             _ => {}
         }
@@ -531,7 +531,7 @@ pub(super) fn algebraic_identity(
         // x * 0 = 0 ; x * 1 = x
         IntBinop::Mul => {
             if l == Some(0) || r == Some(0) {
-                return Some(host.shared().get_const(0, output_size).id());
+                return Some(host.shr().get_const(0, output_size));
             }
             if r == Some(1) {
                 return Some(lhs);
@@ -543,7 +543,7 @@ pub(super) fn algebraic_identity(
         // x & 0 = 0 ; x & ~0 = x
         IntBinop::And => {
             if l == Some(0) || r == Some(0) {
-                return Some(host.shared().get_const(0, output_size).id());
+                return Some(host.shr().get_const(0, output_size));
             }
             if r == Some(all_ones(output_size)) {
                 return Some(lhs);
