@@ -32,7 +32,7 @@ use qcode::{
     value::{
         BlockId, BlockParamId, ValueId,
         insn::{Branch, CBranch, Mnemonic},
-        util::{base_ref::HostRef, host_mut::CheckedOut, host_mut::HostMut},
+        util::{base_ref::HostRef, host_mut::CheckedOut},
     },
 };
 
@@ -135,7 +135,7 @@ pub fn remove_dead_block_args(
 /// Generic version of [`remove_dead_block_args`] core accepting any HostMut.
 /// TODO(5b-ii): For backwards compatibility; prefer concrete version for new code.
 pub fn remove_dead_block_args_generic<'str>(
-    mut host: &mut Context<'str>,
+    host: &mut Context<'str>,
     block_ids: &[BlockId],
     root: Option<BlockId>,
 ) -> bool {
@@ -153,7 +153,7 @@ pub fn remove_dead_block_args_generic<'str>(
         // `p ≡ repl`: rewrite every use, then strip the param and the now-removed
         // column of arguments from each predecessor.
         host.replace_all_uses_with(ValueId::BlockParam(param), repl);
-        remove_params_from_block_generic(&mut host, block, &HashSet::from_iter([index]));
+        remove_params_from_block_generic(host, block, &HashSet::from_iter([index]));
         changed = true;
     }
     changed
@@ -225,7 +225,7 @@ pub fn remove_dead_block_params(
 /// Generic version of [`remove_dead_block_params`] core accepting any HostMut.
 /// TODO(5b-ii): For backwards compatibility; prefer concrete version for new code.
 pub fn remove_dead_block_params_generic<'str>(
-    mut host: &mut Context<'str>,
+    host: &mut Context<'str>,
     block_ids: &[BlockId],
     root: Option<BlockId>,
 ) -> bool {
@@ -317,7 +317,7 @@ pub fn remove_dead_block_params_generic<'str>(
         return false;
     }
     for (block, indices) in dead_by_block {
-        remove_params_from_block_generic(&mut host, block, &indices);
+        remove_params_from_block_generic(host, block, &indices);
     }
     true
 }
@@ -594,17 +594,17 @@ fn find_redundant_param(
 /// Drop the params at `dead_indices` from `block`, reindexing the survivors, and
 /// strip the matching positional argument from every predecessor terminator.
 pub(crate) fn remove_params_from_block(
-    mut ctx: &mut Context,
+    ctx: &mut Context,
     block: BlockId,
     dead_indices: &HashSet<usize>,
 ) {
-    remove_params_from_block_generic(&mut ctx, block, dead_indices);
+    remove_params_from_block_generic(ctx, block, dead_indices);
 }
 
-/// Generic version of [`remove_params_from_block`] accepting any HostMut.
-/// TODO(5b-ii): For backwards compatibility; prefer concrete version for new code.
-pub(crate) fn remove_params_from_block_generic<'str, H: HostMut<'str>>(
-    host: &mut H,
+/// Module (`&mut Context`) core of [`remove_params_from_block`]; the checked-out
+/// pass path uses [`remove_params_from_block_c`].
+pub(crate) fn remove_params_from_block_generic<'str>(
+    host: &mut Context<'str>,
     block: BlockId,
     dead_indices: &HashSet<usize>,
 ) {

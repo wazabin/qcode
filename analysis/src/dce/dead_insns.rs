@@ -2,11 +2,7 @@ use rustc_hash::FxHashSet as HashSet;
 
 use qcode::{
     context::Context,
-    value::{
-        BlockId, FunctionId, InstructionId, ValueId,
-        insn::Mnemonic,
-        util::{base_ref::HostRef, host_mut::HostMut},
-    },
+    value::{BlockId, FunctionId, InstructionId, ValueId, insn::Mnemonic, util::base_ref::HostRef},
 };
 
 use crate::loop_unroll::replace_terminator_with_branch;

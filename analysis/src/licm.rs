@@ -48,8 +48,6 @@ use qcode::value::{
 
 #[cfg(test)]
 use qcode::context::Context;
-#[cfg(test)]
-use qcode::value::util::host_mut::HostMut;
 
 use crate::{AliasResult, ContextView, FunctionBody, FunctionPass};
 

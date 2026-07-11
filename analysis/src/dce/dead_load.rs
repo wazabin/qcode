@@ -8,7 +8,7 @@ use qcode::{
     value::{
         BlockId, FunctionId, ValueId, Varnode,
         insn::{InstructionId, Mnemonic},
-        util::{base_ref::HostRef, host_mut::HostMut},
+        util::base_ref::HostRef,
     },
 };
 

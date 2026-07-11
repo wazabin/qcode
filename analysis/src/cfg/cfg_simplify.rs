@@ -2,7 +2,6 @@ use qcode::context::Context;
 use qcode::value::{
     BlockId, BlockParamId, FunctionId, ValueId,
     insn::{Branch, Mnemonic},
-    util::host_mut::HostMut,
 };
 
 use crate::{ContextView, FunctionBody, FunctionPass};
