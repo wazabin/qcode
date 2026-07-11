@@ -32,7 +32,7 @@ use qcode::{
     value::{
         BlockId, BlockParamId, ValueId,
         insn::{Branch, CBranch, Mnemonic},
-        util::{base_ref::HostRef, host_mut::HostMut},
+        util::{base_ref::HostRef, host_mut::CheckedOut, host_mut::HostMut},
     },
 };
 
@@ -729,15 +729,60 @@ fn filter_kept(args: &[ValueId], drop: &HashSet<usize>) -> Vec<ValueId> {
         .collect()
 }
 
-// TODO(5b-ii): Adapter for cross-module callers (strlen.rs) still using HostMut.
-// This will be removed when strlen.rs is migrated to FunctionBody/ContextView.
-/// Generic wrapper for [`remove_params_from_block_host_generic`].
-pub(crate) fn remove_params_from_block_host_generic<'str, H: HostMut<'str>>(
-    host: &mut H,
+/// Concrete pass twin of [`remove_params_from_block`] over a checked-out function
+/// (`&mut CheckedOut`), for the pass-path caller strlen. Mirrors
+/// [`remove_params_from_block_generic`]; the module path keeps the generic.
+pub(crate) fn remove_params_from_block_c<'str>(
+    host: &mut CheckedOut<'_, 'str>,
     block: BlockId,
     dead_indices: &HashSet<usize>,
 ) {
-    remove_params_from_block_generic(host, block, dead_indices);
+    let params = host.read_host().block(block).params.clone();
+    let mut kept = Vec::with_capacity(params.len());
+    for (i, &p) in params.iter().enumerate() {
+        if dead_indices.contains(&i) {
+            host.block_param_mut(p).parent = None;
+        } else {
+            host.block_param_mut(p).index = kept.len();
+            kept.push(p);
+        }
+    }
+    host.block_mut(block).params = kept;
+
+    let preds: HashSet<BlockId> = host
+        .block_ref(block)
+        .predecessors()
+        .map(|(_, b)| b)
+        .collect();
+
+    for pred in preds {
+        let Some(term_id) = host.read_host().block(pred).instructions.last().copied() else {
+            continue;
+        };
+        let new = match host.read_host().instruction(term_id).mnemonic().clone() {
+            Mnemonic::Branch(b) if b.target == block => Mnemonic::Branch(Branch {
+                target: b.target,
+                args: filter_kept(&b.args, dead_indices),
+            }),
+            Mnemonic::CBranch(c) => Mnemonic::CBranch(CBranch {
+                condition: c.condition,
+                success_block: c.success_block,
+                success_args: if c.success_block == block {
+                    filter_kept(&c.success_args, dead_indices)
+                } else {
+                    c.success_args
+                },
+                failure_block: c.failure_block,
+                failure_args: if c.failure_block == block {
+                    filter_kept(&c.failure_args, dead_indices)
+                } else {
+                    c.failure_args
+                },
+            }),
+            _ => continue,
+        };
+        host.replace_instruction_mnemonic(term_id, new);
+    }
 }
 
 #[cfg(test)]

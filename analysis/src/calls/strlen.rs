@@ -346,7 +346,7 @@ fn apply_strlen<'str>(
             .params()
             .position(|p| p.id() == m.count_param);
         if let Some(kx) = kx {
-            crate::dce::remove_params_from_block_host_generic(
+            crate::dce::remove_params_from_block_c(
                 &mut host,
                 m.exit_block,
                 &HashSet::from_iter([kx]),
