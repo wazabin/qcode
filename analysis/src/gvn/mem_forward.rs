@@ -30,7 +30,7 @@ use rustc_hash::FxHashMap as HashMap;
 
 use jstd::graph::analysis::DominatorTree;
 
-use crate::AliasResult;
+use crate::{AliasResult, ContextView, FunctionBody};
 use qcode::{
     assumption::Proposition,
     space::{Space, SpaceId, SpaceType},
@@ -429,6 +429,220 @@ impl MemForward {
             load_size,
         );
         host.insert_insn_before(block_id, insn_id, s);
+        s.into()
+    }
+
+    // -----------------------------------------------------------------------
+    // Concrete pass twins over (&mut FunctionBody, ContextView) — 5b-ii Pin A.
+    // -----------------------------------------------------------------------
+
+    /// Concrete pass twin of [`record_store`](Self::record_store).
+    pub(super) fn record_store_c<'str>(
+        &mut self,
+        body: &mut FunctionBody<'str>,
+        cx: ContextView<'_, 'str>,
+        store: &Store,
+        aliases: Option<&AliasResult>,
+        numbering: &Numbering,
+    ) {
+        let (base, start) = locate(store.ptr, store.space, aliases, numbering);
+        let end = start + store.size as i64;
+
+        self.byte_map.retain(|&(cb, _), _| {
+            cb == base || cross_base_disjoint(body.read_host(cx), aliases, store.ptr, base, cb)
+        });
+
+        for off in start..end {
+            self.byte_map.remove(&(base, off));
+        }
+        let covered = ValueRef::from_host(body.read_host(cx), store.src)
+            .size()
+            .min(store.size);
+        for (i, off) in (start..start + covered as i64).enumerate() {
+            self.byte_map.insert(
+                (base, off),
+                Cell {
+                    src: store.src,
+                    src_off: i,
+                },
+            );
+        }
+        if covered < store.size {
+            let zero = body
+                .read_host(cx)
+                .shared()
+                .get_const(0, store.size - covered)
+                .id();
+            for (i, off) in (start + covered as i64..end).enumerate() {
+                self.byte_map.insert(
+                    (base, off),
+                    Cell {
+                        src: zero,
+                        src_off: i,
+                    },
+                );
+            }
+        }
+    }
+
+    /// Concrete pass twin of [`try_load`](Self::try_load).
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn try_load_c<'str>(
+        &mut self,
+        body: &mut FunctionBody<'str>,
+        cx: ContextView<'_, 'str>,
+        block_id: BlockId,
+        insn_id: qcode::value::InstructionId,
+        load: &Load,
+        aliases: Option<&AliasResult>,
+        numbering: &Numbering,
+    ) -> Option<ValueId> {
+        let (base, start) = locate(load.ptr, load.space, aliases, numbering);
+        let end = start + load.size as i64;
+        let segments = self.segments(base, start, end)?;
+        let load_size = load.size;
+
+        let value = if segments.len() == 1
+            && segments[0].load_off == 0
+            && segments[0].size == load_size
+            && segments[0].src_off == 0
+            && ValueRef::from_host(body.read_host(cx), segments[0].src).size() == load_size
+        {
+            segments[0].src
+        } else if load_size > 8 {
+            self.rebuild_bytes_c(body, cx, &segments, load_size)?
+        } else {
+            self.rebuild_c(body, cx, block_id, insn_id, &segments, load_size)
+        };
+        Some(value)
+    }
+
+    /// Concrete pass twin of [`rebuild`](Self::rebuild).
+    fn rebuild_c<'str>(
+        &self,
+        body: &mut FunctionBody<'str>,
+        cx: ContextView<'_, 'str>,
+        block_id: BlockId,
+        insn_id: qcode::value::InstructionId,
+        segments: &[Segment],
+        load_size: usize,
+    ) -> ValueId {
+        let mut acc: Option<ValueId> = None;
+        for seg in segments {
+            let piece = self.build_piece_c(body, cx, block_id, insn_id, seg, load_size);
+            acc = Some(match acc {
+                None => piece,
+                Some(lhs) => {
+                    let or = body.push_mnemonic(
+                        cx,
+                        Mnemonic::Binop(Binary {
+                            op: Binop::Int(IntBinop::Or),
+                            lhs,
+                            rhs: piece,
+                        }),
+                        load_size,
+                    );
+                    body.insert_insn_before(cx, block_id, insn_id, or);
+                    or.into()
+                }
+            });
+        }
+        acc.expect("a fully-covered load has at least one segment")
+    }
+
+    /// Concrete pass twin of [`rebuild_bytes`](Self::rebuild_bytes).
+    fn rebuild_bytes_c<'str>(
+        &self,
+        body: &mut FunctionBody<'str>,
+        cx: ContextView<'_, 'str>,
+        segments: &[Segment],
+        load_size: usize,
+    ) -> Option<ValueId> {
+        let ctx = body.read_host(cx).shared();
+        let mut buf = vec![0u8; load_size];
+        for seg in segments {
+            let bytes: Vec<u8> = match seg.src {
+                ValueId::Literal(lid) => {
+                    let lit = &ctx.shared.values.literals[lid];
+                    if lit.symbolic.is_some() {
+                        return None;
+                    }
+                    let masked = qcode::value::LiteralRef::new(ctx, lid).value();
+                    let le = masked.to_le_bytes();
+                    le.get(seg.src_off..seg.src_off + seg.size)?.to_vec()
+                }
+                ValueId::Bytes(bid) => {
+                    let data = &ctx.shared.values.bytes[bid].data;
+                    data.get(seg.src_off..seg.src_off + seg.size)?.to_vec()
+                }
+                _ => return None,
+            };
+            buf.get_mut(seg.load_off..seg.load_off + seg.size)?
+                .copy_from_slice(&bytes);
+        }
+        Some(ctx.get_bytes(buf).id())
+    }
+
+    /// Concrete pass twin of [`build_piece`](Self::build_piece).
+    fn build_piece_c<'str>(
+        &self,
+        body: &mut FunctionBody<'str>,
+        cx: ContextView<'_, 'str>,
+        block_id: BlockId,
+        insn_id: qcode::value::InstructionId,
+        seg: &Segment,
+        load_size: usize,
+    ) -> ValueId {
+        let src_size = ValueRef::from_host(body.read_host(cx), seg.src).size();
+        let extracted = if seg.src_off == 0 && src_size == seg.size {
+            seg.src
+        } else {
+            let r = body.push_mnemonic(
+                cx,
+                Mnemonic::Range(Range {
+                    src: seg.src,
+                    start: seg.src_off,
+                    size: seg.size,
+                }),
+                seg.size,
+            );
+            body.insert_insn_before(cx, block_id, insn_id, r);
+            r.into()
+        };
+
+        let widened = if seg.size == load_size {
+            extracted
+        } else {
+            let z = body.push_mnemonic(
+                cx,
+                Mnemonic::Zext(Zext {
+                    src: extracted,
+                    size: load_size,
+                }),
+                load_size,
+            );
+            body.insert_insn_before(cx, block_id, insn_id, z);
+            z.into()
+        };
+
+        if seg.load_off == 0 {
+            return widened;
+        }
+        let shamt = body
+            .read_host(cx)
+            .shared()
+            .get_const((seg.load_off * 8) as u64, load_size)
+            .id();
+        let s = body.push_mnemonic(
+            cx,
+            Mnemonic::Binop(Binary {
+                op: Binop::Int(IntBinop::ShiftLeft),
+                lhs: widened,
+                rhs: shamt,
+            }),
+            load_size,
+        );
+        body.insert_insn_before(cx, block_id, insn_id, s);
         s.into()
     }
 

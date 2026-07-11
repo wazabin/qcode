@@ -157,25 +157,19 @@ impl<'str> SubPassC<'str> for MemoryForwarding {
         let state = state.downcast_mut::<MemForward>().expect("memory state");
         match ic.mnemonic {
             Mnemonic::Store(store) => {
-                // `record_store` is a shared HostMut helper; reach it through a
-                // scoped host. TODO(5b-ii): migrate MemForward off HostMut.
-                let mut host = body.host(cx);
-                state.record_store(&mut host, store, ic.aliases, ic.numbering);
+                state.record_store_c(body, cx, store, ic.aliases, ic.numbering);
                 Claim::Done
             }
             Mnemonic::Load(load) => {
-                // TODO(5b-ii): `try_load` is a shared HostMut helper; scoped host.
-                let forwarded = {
-                    let mut host = body.host(cx);
-                    state.try_load(
-                        &mut host,
-                        ic.block_id,
-                        ic.insn_id,
-                        load,
-                        ic.aliases,
-                        ic.numbering,
-                    )
-                };
+                let forwarded = state.try_load_c(
+                    body,
+                    cx,
+                    ic.block_id,
+                    ic.insn_id,
+                    load,
+                    ic.aliases,
+                    ic.numbering,
+                );
                 match forwarded {
                     Some(value) => {
                         ed.replace_c(body, cx, ic.insn_id, value);
