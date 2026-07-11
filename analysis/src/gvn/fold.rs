@@ -1,18 +1,18 @@
 //! Constant-folding sub-pass: arithmetic on literals and algebraic identities.
 
-use qcode::{
-    context::Context,
-    value::{
-        Value, ValueId, ValueRef,
-        insn::{Binary, Binop, IntBinop, Mnemonic, Unop},
-        literal::LiteralRef,
-        util::base_ref::{AsShared, HostRef},
-    },
+use qcode::value::{
+    Value, ValueId, ValueRef,
+    insn::{Binary, Binop, IntBinop, Mnemonic, Unop},
+    literal::LiteralRef,
+    util::base_ref::{AsShared, HostRef},
 };
 
 use std::any::Any;
 
-use super::walk::{Claim, Editor, InsnCtx, ModuleSubPass, SubPassC};
+use super::walk::{Claim, Editor, InsnCtx, SubPassC};
+
+#[cfg(test)]
+use qcode::context::Context;
 
 use crate::{ContextView, FunctionBody};
 
@@ -23,36 +23,7 @@ use crate::{ContextView, FunctionBody};
 /// through the interners' `&self` paths on the shared context.
 pub(super) struct Fold;
 
-impl<'str> ModuleSubPass<'str> for Fold {
-    fn init_state(&self) -> Box<dyn Any> {
-        Box::new(())
-    }
-
-    fn clone_state(&self, _state: &dyn Any) -> Box<dyn Any> {
-        Box::new(())
-    }
-
-    fn on_insn(
-        &self,
-        host: &mut Context<'str>,
-        _state: &mut dyn Any,
-        ic: &InsnCtx,
-        ed: &mut Editor,
-    ) -> Claim {
-        if ic.mnemonic.is_terminator() || ic.size == 0 {
-            return Claim::Pass;
-        }
-        match try_fold_insn(host.read_host(), ic) {
-            Some(folded) => {
-                ed.replace(host, ic.insn_id, folded);
-                Claim::Done
-            }
-            None => Claim::Pass,
-        }
-    }
-}
-
-/// Concrete twin of the [`SubPass`] impl above (context-split stage 5b-ii):
+/// The function-pass [`SubPassC`] impl (context-split stage 5b-ii):
 /// `try_fold_insn` reads through `body.read_host(cx)` and the fold forwards
 /// through `Editor::replace_c`.
 impl<'str> SubPassC<'str> for Fold {

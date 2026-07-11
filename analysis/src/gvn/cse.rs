@@ -13,7 +13,6 @@
 //! unless it is already canonical. See [`super::affine`] for the normal form,
 //! key/emit split, and idempotence argument.
 
-use qcode::context::Context;
 use qcode::value::{
     ValueId,
     insn::{Binop, FloatBinop, IntBinop, Mnemonic},
@@ -21,116 +20,23 @@ use qcode::value::{
 
 use std::any::Any;
 
-use super::affine::{NormalForm, Numbering, arith_form, key_for, materialize, materialize_c};
-use super::walk::{Claim, Editor, InsnCtx, ModuleSubPass, SubPassC};
+use super::affine::{NormalForm, Numbering, arith_form, key_for, materialize_c};
+use super::walk::{Claim, Editor, InsnCtx, SubPassC};
+
+#[cfg(test)]
+use qcode::context::Context;
 
 use crate::{ContextView, FunctionBody};
 
 /// CSE numbers pure values down a whole dominator tree. Fully host-routed (the
 /// value-numbering reads through a [`HostRef`](qcode::value::util::base_ref::HostRef)
-/// and rebuilds canonical forms through the [`HostMut`] verbs), so it runs over
-/// either the module or a checked-out function.
+/// and rebuilds canonical forms through the [`HostMut`] verbs), so it runs on the checked-out function-pass path.
 pub(super) struct Cse;
 
-impl<'str> ModuleSubPass<'str> for Cse {
-    fn init_state(&self) -> Box<dyn Any> {
-        Box::new(Numbering::default())
-    }
-
-    fn clone_state(&self, state: &dyn Any) -> Box<dyn Any> {
-        Box::new(
-            state
-                .downcast_ref::<Numbering>()
-                .expect("cse state")
-                .clone(),
-        )
-    }
-
-    fn on_block_entry(
-        &self,
-        _host: &mut Context<'str>,
-        state: &mut dyn Any,
-        _block_id: qcode::value::block::BlockId,
-        _tree: &jstd::graph::analysis::DominatorTree<qcode::value::block::BlockId>,
-        _aliases: Option<&crate::AliasResult>,
-        _numbering: &Numbering,
-        is_shared: bool,
-    ) {
-        let state = state.downcast_mut::<Numbering>().expect("cse state");
-        // A block reachable from more than one walk root has invalid inherited
-        // dominance claims: a leader from a per-entry dominator-tree ancestor
-        // need not actually dominate it, so forwarding to (or materializing
-        // against) it would be unsound. Drop them, like MemoryForwarding does.
-        if is_shared {
-            state.clear_leaders();
-        }
-    }
-
-    fn on_insn(
-        &self,
-        host: &mut Context<'str>,
-        state: &mut dyn Any,
-        ic: &InsnCtx,
-        ed: &mut Editor,
-    ) -> Claim {
-        if ic.mnemonic.is_terminator() || ic.size == 0 {
-            return Claim::Pass;
-        }
-        let state = state.downcast_mut::<Numbering>().expect("cse state");
-
-        // Arithmetic view (used to compose consumers) and the value-numbering key.
-        let form = arith_form(host.read_host(), ic.id, ic.mnemonic, ic.size, state);
-        state.record_form(ic.id, form.clone());
-        let key = key_for(&form, ic.id, ic.mnemonic);
-
-        // An instruction's own operands provably dominate it, so any composite
-        // arithmetic view they carry is a dominance-safe leader for this use — even
-        // on a `is_shared` block, where inherited leaders were dropped. Seeding them
-        // lets `materialize` rebuild against the existing operand instead of emitting
-        // a fresh duplicate. Without this, a loop-invariant value LICM hoisted into a
-        // (shared) preheader cannot be reused in the loop body: GVN re-materializes
-        // it locally, DCE deletes the hoist, and LICM re-hoists forever. Operands
-        // dominate every block this one dominates, so the seed stays valid downtree.
-        state.seed_operand_leaders(ic.mnemonic.args());
-
-        // A dominating value already computes this form: forward to it.
-        if let Some(leader) = state.lookup(&key) {
-            if leader != ic.id {
-                ed.replace(host, ic.insn_id, leader);
-            }
-            return Claim::Done;
-        }
-
-        match key {
-            // Opaque ops keep the syntactic-CSE behaviour: claim ourselves.
-            NormalForm::Opaque(_) => state.claim(key, ic.id),
-            // Covered forms: canonicalize in place (rebuild minimal subtree),
-            // reusing dominating sub-results. `materialize` returns `ic.id` when
-            // the instruction is already canonical.
-            _ => {
-                let root_ty = host.read_host().type_of(ic.id);
-                let v = materialize(
-                    host,
-                    ic.block_id,
-                    ic.insn_id,
-                    ic.mnemonic,
-                    &key,
-                    root_ty,
-                    state,
-                );
-                if v != ic.id {
-                    ed.replace(host, ic.insn_id, v);
-                }
-            }
-        }
-        Claim::Done
-    }
-}
-
-/// Concrete twin of the [`SubPass`] impl above (context-split stage 5b-ii): reads
+/// The function-pass [`SubPassC`] impl (context-split stage 5b-ii): reads
 /// route through `body.read_host(cx)`, shallow forwards through `Editor`'s `_c`
-/// methods, and the in-place canonical rebuild is reached through a scoped
-/// `body.host(cx)` (`materialize` stays generic — the generic path shares it).
+/// methods, and the in-place canonical rebuild runs through `materialize_c` over
+/// `&mut PassBacking`.
 impl<'str> SubPassC<'str> for Cse {
     fn init_state(&self) -> Box<dyn Any> {
         Box::new(Numbering::default())
@@ -269,7 +175,6 @@ pub(super) fn normalize(m: &mut Mnemonic) {
 mod tests {
     use super::*;
     use crate::gvn::{gvn, gvn_function};
-    use qcode::context::Context;
     use qcode::value::{BasicBlock, InstructionId, insn::Binary};
     use qcode_macro::qcode;
 

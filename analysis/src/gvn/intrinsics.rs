@@ -11,12 +11,11 @@
 //! A matched root is rewritten to the intrinsic; the now-unused shift/or math
 //! it subsumed becomes pure-dead and is reclaimed by DCE.
 
-use qcode::context::Context;
 use qcode::value::insn::{Binop, IntrinsicApp, Mnemonic, RootOp, recognizers_for};
 
 use std::any::Any;
 
-use super::walk::{Claim, Editor, InsnCtx, ModuleSubPass, SubPassC};
+use super::walk::{Claim, Editor, InsnCtx, SubPassC};
 
 use crate::{ContextView, FunctionBody};
 
@@ -26,48 +25,7 @@ use crate::{ContextView, FunctionBody};
 /// through the shared interner.
 pub(super) struct Recognize;
 
-impl<'str> ModuleSubPass<'str> for Recognize {
-    fn init_state(&self) -> Box<dyn Any> {
-        Box::new(())
-    }
-
-    fn clone_state(&self, _state: &dyn Any) -> Box<dyn Any> {
-        Box::new(())
-    }
-
-    fn on_insn(
-        &self,
-        host: &mut Context<'str>,
-        _state: &mut dyn Any,
-        ic: &InsnCtx,
-        ed: &mut Editor,
-    ) -> Claim {
-        if ic.size == 0 {
-            return Claim::Pass;
-        }
-        let Some(root) = root_op_of(ic.mnemonic) else {
-            return Claim::Pass;
-        };
-
-        for &id in recognizers_for(root) {
-            if let Some(args) = id.desc().recognize(host.read_host(), ic.insn_id) {
-                // Recognized intrinsics (rol/ror) are width-preserving, so the
-                // root's width is the result width.
-                ed.replace_with_new_insn(
-                    host,
-                    ic.block_id,
-                    ic.insn_id,
-                    Mnemonic::Intrinsic(IntrinsicApp { id, args }),
-                    ic.size,
-                );
-                return Claim::Done;
-            }
-        }
-        Claim::Pass
-    }
-}
-
-/// Concrete twin of the [`SubPass`] impl above (context-split stage 5b-ii): the
+/// The function-pass [`SubPassC`] impl (context-split stage 5b-ii): the
 /// recognizer reads through `body.read_host(cx)` and the match rewrites through
 /// `Editor::replace_with_new_insn_c`.
 impl<'str> SubPassC<'str> for Recognize {

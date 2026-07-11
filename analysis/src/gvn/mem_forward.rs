@@ -31,6 +31,7 @@ use rustc_hash::FxHashMap as HashMap;
 use jstd::graph::analysis::DominatorTree;
 
 use crate::{AliasResult, ContextView, FunctionBody};
+#[cfg(test)]
 use qcode::context::Context;
 use qcode::{
     assumption::Proposition,
@@ -163,95 +164,6 @@ pub(super) struct MemForward {
 }
 
 impl MemForward {
-    /// Update state for `store`, invalidating any forwarded value it overwrites.
-    pub(super) fn record_store<'str>(
-        &mut self,
-        host: &mut Context<'str>,
-        store: &Store,
-        aliases: Option<&AliasResult>,
-        numbering: &Numbering,
-    ) {
-        let (base, start) = locate(store.ptr, store.space, aliases, numbering);
-        let end = start + store.size as i64;
-
-        // Drop cells at *other* bases this store may overwrite (cross-base
-        // aliasing); same-base cells are handled by the explicit clear below.
-        self.byte_map.retain(|&(cb, _), _| {
-            cb == base || cross_base_disjoint(host.read_host(), aliases, store.ptr, base, cb)
-        });
-
-        // The store always overwrites the bytes at its own base, so clear them.
-        for off in start..end {
-            self.byte_map.remove(&(base, off));
-        }
-        // The low `src.size` bytes come from the value. When the src is narrower
-        // than the location (e.g. `MOV ESI, imm32`, whose store width is the full
-        // 8-byte RSI), the store zero-extends: the upper bytes are zero, so model
-        // them with a zero constant rather than leaving them unmapped.
-        let covered = ValueRef::from_host(host.read_host(), store.src)
-            .size()
-            .min(store.size);
-        for (i, off) in (start..start + covered as i64).enumerate() {
-            self.byte_map.insert(
-                (base, off),
-                Cell {
-                    src: store.src,
-                    src_off: i,
-                },
-            );
-        }
-        if covered < store.size {
-            let zero = host.shr().get_const(0, store.size - covered);
-            for (i, off) in (start + covered as i64..end).enumerate() {
-                self.byte_map.insert(
-                    (base, off),
-                    Cell {
-                        src: zero,
-                        src_off: i,
-                    },
-                );
-            }
-        }
-    }
-
-    /// The value `load` forwards to, materializing any rebuild instructions
-    /// before `insn_id` in `block_id`, or `None` if it is not fully covered.
-    pub(super) fn try_load<'str>(
-        &mut self,
-        host: &mut Context<'str>,
-        block_id: BlockId,
-        insn_id: qcode::value::InstructionId,
-        load: &Load,
-        aliases: Option<&AliasResult>,
-        numbering: &Numbering,
-    ) -> Option<ValueId> {
-        let (base, start) = locate(load.ptr, load.space, aliases, numbering);
-
-        // Cover the `load.size` bytes the load actually reads from the base.
-        let end = start + load.size as i64;
-        let segments = self.segments(base, start, end)?;
-        let load_size = load.size;
-
-        let value = if segments.len() == 1
-            && segments[0].load_off == 0
-            && segments[0].size == load_size
-            && segments[0].src_off == 0
-            && ValueRef::from_host(host.read_host(), segments[0].src).size() == load_size
-        {
-            // Exact whole-location forward: reuse the stored value directly.
-            segments[0].src
-        } else if load_size > 8 {
-            // Wider than a u64: the Zext/shift/or rebuild operates on u64 values
-            // and cannot represent the result. Assemble a byte blob instead, but
-            // only when every covering byte comes from a constant (numeric
-            // literal or byte blob); otherwise there is nothing to fold to.
-            self.rebuild_bytes(host, &segments, load_size)?
-        } else {
-            self.rebuild(host, block_id, insn_id, &segments, load_size)
-        };
-        Some(value)
-    }
-
     /// Record that, after this load executes, `value` is held at `load`'s
     /// location. Called for every load (forwarded or not) so a later identical
     /// load can reuse the result.
@@ -295,139 +207,6 @@ impl MemForward {
             }
         }
         Some(segments)
-    }
-
-    /// Materialize `segments` into a `load_size`-byte value: each segment is
-    /// extracted (`Range`), widened (`Zext`), shifted into place (`<<`), and the
-    /// pieces are OR-ed together. Reuses `Range`/`Zext`/`<<`/`|`; constant pieces
-    /// fold away in [`super::fold`].
-    fn rebuild<'str>(
-        &self,
-        host: &mut Context<'str>,
-        block_id: BlockId,
-        insn_id: qcode::value::InstructionId,
-        segments: &[Segment],
-        load_size: usize,
-    ) -> ValueId {
-        let mut acc: Option<ValueId> = None;
-        for seg in segments {
-            let piece = self.build_piece(host, block_id, insn_id, seg, load_size);
-            acc = Some(match acc {
-                None => piece,
-                Some(lhs) => {
-                    let or = host.push_mnemonic(
-                        block_id.func,
-                        Mnemonic::Binop(Binary {
-                            op: Binop::Int(IntBinop::Or),
-                            lhs,
-                            rhs: piece,
-                        }),
-                        load_size,
-                    );
-                    host.insert_insn_before(block_id, insn_id, or);
-                    or.into()
-                }
-            });
-        }
-        acc.expect("a fully-covered load has at least one segment")
-    }
-
-    /// Assemble a `load_size`-byte opaque blob from `segments`, in little-endian
-    /// memory order, when every segment's source is a compile-time constant.
-    /// Returns `None` if any segment is non-constant (the all-constant-or-bail
-    /// rule) or out of bounds.
-    fn rebuild_bytes<'str>(
-        &self,
-        host: &mut Context<'str>,
-        segments: &[Segment],
-        load_size: usize,
-    ) -> Option<ValueId> {
-        let ctx = host.shr();
-        let mut buf = vec![0u8; load_size];
-        for seg in segments {
-            let bytes: Vec<u8> = match seg.src {
-                ValueId::Literal(lid) => {
-                    // Numeric literal: bail on symbolic refs; take the LE bytes.
-                    let lit = &ctx.values.literals[lid];
-                    if lit.symbolic.is_some() {
-                        return None;
-                    }
-                    let masked = qcode::value::LiteralRef::from_id(ctx, lid).value();
-                    let le = masked.to_le_bytes();
-                    le.get(seg.src_off..seg.src_off + seg.size)?.to_vec()
-                }
-                ValueId::Bytes(bid) => {
-                    let data = &ctx.values.bytes[bid].data;
-                    data.get(seg.src_off..seg.src_off + seg.size)?.to_vec()
-                }
-                // Non-constant source: nothing to fold to.
-                _ => return None,
-            };
-            buf.get_mut(seg.load_off..seg.load_off + seg.size)?
-                .copy_from_slice(&bytes);
-        }
-        Some(ctx.get_bytes(buf))
-    }
-
-    /// Build one segment's contribution: `Range` of the source (skipped when the
-    /// segment already equals the whole source), `Zext` to the load width
-    /// (skipped when already that wide), then `<< load_off*8` (skipped at offset
-    /// 0).
-    fn build_piece<'str>(
-        &self,
-        host: &mut Context<'str>,
-        block_id: BlockId,
-        insn_id: qcode::value::InstructionId,
-        seg: &Segment,
-        load_size: usize,
-    ) -> ValueId {
-        let src_size = ValueRef::from_host(host.read_host(), seg.src).size();
-        let extracted = if seg.src_off == 0 && src_size == seg.size {
-            seg.src
-        } else {
-            let r = host.push_mnemonic(
-                block_id.func,
-                Mnemonic::Range(Range {
-                    src: seg.src,
-                    start: seg.src_off,
-                    size: seg.size,
-                }),
-                seg.size,
-            );
-            host.insert_insn_before(block_id, insn_id, r);
-            r.into()
-        };
-
-        let widened = if seg.size == load_size {
-            extracted
-        } else {
-            let z = host.push_mnemonic(
-                block_id.func,
-                Mnemonic::Zext(Zext {
-                    src: extracted,
-                    size: load_size,
-                }),
-                load_size,
-            );
-            host.insert_insn_before(block_id, insn_id, z);
-            z.into()
-        };
-
-        if seg.load_off == 0 {
-            return widened;
-        }
-        let shamt = host.shr().get_const((seg.load_off * 8) as u64, load_size);
-        let s = host.push_mnemonic(
-            block_id.func,
-            Mnemonic::Binop(Binary {
-                op: Binop::Int(IntBinop::ShiftLeft),
-                lhs: widened,
-                rhs: shamt,
-            }),
-            load_size,
-        );
-        host.insert_insn_before(block_id, insn_id, s);
-        s.into()
     }
 
     // -----------------------------------------------------------------------
@@ -973,7 +752,6 @@ impl MemForward {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use qcode::context::Context;
     use qcode::testing::TestContext;
     use qcode::value::{BasicBlock, Function};
 
@@ -995,6 +773,30 @@ mod tests {
             ptr: ValueId::Varnode(vn),
             size: v.size(),
         }
+    }
+
+    /// Check `fid` out and run `f` against its `(&mut FunctionBody, ContextView)`
+    /// — the only surface [`MemForward::record_store_c`]/[`MemForward::try_load_c`]
+    /// speak now that the `&mut Context` module twins are gone. The `MemForward`
+    /// state under test is owned by the caller (captured by `f`), so it outlives
+    /// the checkout and can be inspected afterwards.
+    fn with_body<R>(
+        tc: &mut TestContext,
+        fid: qcode::value::FunctionId,
+        f: impl FnOnce(&mut FunctionBody<'static>, ContextView<'_, 'static>) -> R,
+    ) -> R {
+        let env = crate::test_util::dummy_env();
+        let before = tc.ctx.direct_call_targets(fid);
+        let fun = tc.ctx.checkout_function(fid);
+        let mut body = FunctionBody::new(fid, fun, Vec::new());
+        let out = {
+            let view = ContextView::new(&tc.ctx, &env);
+            f(&mut body, view)
+        };
+        let (fun, _, _, _) = body.into_parts();
+        tc.ctx.checkin_function(fid, fun);
+        tc.ctx.resync_call_sites(fid, &before);
+        out
     }
 
     /// An [`AliasResult`] with a concrete interval for each listed varnode.
@@ -1070,8 +872,11 @@ mod tests {
         let byte_store = store_to(&tc, tc.r0_byte0, byte);
         let nb = Numbering::default();
         let mut mf = MemForward::default();
-        mf.record_store(&mut tc.ctx, &wide_store, Some(&aliases), &nb);
-        mf.record_store(&mut tc.ctx, &byte_store, Some(&aliases), &nb);
+        let fid = tc.ctx.anon_function();
+        with_body(&mut tc, fid, |body, cx| {
+            mf.record_store_c(body, cx, &wide_store, Some(&aliases), &nb);
+            mf.record_store_c(body, cx, &byte_store, Some(&aliases), &nb);
+        });
 
         assert_eq!(mf.byte_map[&(base, start)].src, byte, "byte 0 overwritten");
         assert_eq!(
@@ -1180,7 +985,9 @@ mod tests {
         let nb = precompute_forms(&tc.ctx, fid);
 
         let mut mf = MemForward::default();
-        mf.record_store(&mut tc.ctx, &slot_store, Some(&aliases), &nb);
+        with_body(&mut tc, fid, |body, cx| {
+            mf.record_store_c(body, cx, &slot_store, Some(&aliases), &nb);
+        });
         // A plain caller-frame `@SP - 4` cell, for contrast: its base is the `@SP`
         // param (classified CallerFrame), so it is not own-frame-private.
         let caller_slot = Base::Symbolic(ram, sp);
@@ -1229,7 +1036,10 @@ mod tests {
         let base = Base::Pinned(space);
         let start = start as i64;
         let mut mf = MemForward::default();
-        mf.record_store(&mut tc.ctx, &store, Some(&aliases), &Numbering::default());
+        let fid = tc.ctx.anon_function();
+        with_body(&mut tc, fid, |body, cx| {
+            mf.record_store_c(body, cx, &store, Some(&aliases), &Numbering::default());
+        });
 
         assert_eq!(mf.byte_map.len(), 4, "all four written bytes are defined");
         assert_eq!(mf.byte_map[&(base, start)].src, narrow);
@@ -1263,17 +1073,17 @@ mod tests {
         let aliases = manual_aliases(&tc, &[tc.r0_lo32]);
 
         let store = store_to(&tc, tc.r0_lo32, src);
-        let nb = Numbering::default();
-        let mut mf = MemForward::default();
-        mf.record_store(&mut tc.ctx, &store, Some(&aliases), &nb);
-
         let load = load_of(&tc, tc.r0_lo32);
+        let nb = Numbering::default();
         // A dummy instruction id to insert before; none is created here because
         // an exact forward materializes nothing.
         let dummy = qcode::value::InstructionId::default();
-        let forwarded = mf
-            .try_load(&mut tc.ctx, block_id, dummy, &load, Some(&aliases), &nb)
-            .expect("exact forward");
+        let mut mf = MemForward::default();
+        let forwarded = with_body(&mut tc, block_id.func, |body, cx| {
+            mf.record_store_c(body, cx, &store, Some(&aliases), &nb);
+            mf.try_load_c(body, cx, block_id, dummy, &load, Some(&aliases), &nb)
+        })
+        .expect("exact forward");
         assert_eq!(forwarded, src);
     }
 

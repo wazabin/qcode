@@ -75,38 +75,6 @@ impl Editor {
         self.redundant.insert(insn);
     }
 
-    /// Materialize `mnemonic` as a new instruction inserted before `at`, then
-    /// forward all uses of `at` to it and mark `at` redundant.
-    pub(super) fn replace_with_new_insn<'str>(
-        &mut self,
-        host: &mut Context<'str>,
-        block_id: BlockId,
-        at: InstructionId,
-        mnemonic: Mnemonic,
-        size: usize,
-    ) -> InstructionId {
-        let type_id = host.shr().types.get_or_make_int(size);
-        self.replace_with_new_insn_typed(host, block_id, at, mnemonic, type_id)
-    }
-
-    /// Like [`replace_with_new_insn`](Self::replace_with_new_insn) but with an
-    /// explicit result [`TypeId`] — used when the new instruction is a comparison
-    /// (which must be `bool`-typed, not a plain `iN`).
-    pub(super) fn replace_with_new_insn_typed<'str>(
-        &mut self,
-        host: &mut Context<'str>,
-        block_id: BlockId,
-        at: InstructionId,
-        mnemonic: Mnemonic,
-        type_id: qcode::types::TypeId,
-    ) -> InstructionId {
-        let new_id = host.push_mnemonic_with_type(block_id.func, mnemonic, type_id);
-        host.insert_insn_before(block_id, at, new_id);
-        host.replace_all_uses_with(ValueId::Instruction(at), ValueId::Instruction(new_id));
-        self.redundant.insert(at);
-        new_id
-    }
-
     /// Drop the redundant instructions from their block; returns whether
     /// anything was rewritten. Every redundant instruction has already had its
     /// uses forwarded, so removing it prunes only its own operand use-lists.

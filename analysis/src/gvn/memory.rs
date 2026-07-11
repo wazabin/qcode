@@ -9,111 +9,26 @@
 use jstd::graph::analysis::DominatorTree;
 
 use crate::AliasResult;
-use qcode::context::Context;
 use qcode::value::{block::BlockId, insn::Mnemonic};
 
 use super::affine::Numbering;
 use std::any::Any;
 
 use super::mem_forward::MemForward;
-use super::walk::{Claim, Editor, InsnCtx, ModuleSubPass, SubPassC};
+use super::walk::{Claim, Editor, InsnCtx, SubPassC};
 
 use crate::{ContextView, FunctionBody};
 
 /// Memory forwarding reasons across a whole function (loop-header pruning,
 /// post-call clobbers). Fully host-routed — every read goes through a
 /// [`HostRef`](qcode::value::util::base_ref::HostRef) and every rebuild through
-/// the [`HostMut`] verbs — so it runs over either the module or a checked-out
-/// function.
+/// the [`HostMut`] verbs — so it runs on the checked-out function-pass path.
 pub(super) struct MemoryForwarding;
 
-impl<'str> ModuleSubPass<'str> for MemoryForwarding {
-    fn init_state(&self) -> Box<dyn Any> {
-        Box::new(MemForward::default())
-    }
-
-    fn clone_state(&self, state: &dyn Any) -> Box<dyn Any> {
-        Box::new(
-            state
-                .downcast_ref::<MemForward>()
-                .expect("memory state")
-                .clone(),
-        )
-    }
-
-    fn on_block_entry(
-        &self,
-        host: &mut Context<'str>,
-        state: &mut dyn Any,
-        block_id: BlockId,
-        tree: &DominatorTree<BlockId>,
-        aliases: Option<&AliasResult>,
-        numbering: &Numbering,
-        is_shared: bool,
-    ) {
-        let state = state.downcast_mut::<MemForward>().expect("memory state");
-        if is_shared {
-            state.clear();
-        }
-        state.prune_loop_carried(host.read_host(), block_id, tree, aliases, numbering);
-    }
-
-    fn on_insn(
-        &self,
-        host: &mut Context<'str>,
-        state: &mut dyn Any,
-        ic: &InsnCtx,
-        ed: &mut Editor,
-    ) -> Claim {
-        let state = state.downcast_mut::<MemForward>().expect("memory state");
-        match ic.mnemonic {
-            Mnemonic::Store(store) => {
-                state.record_store(host, store, ic.aliases, ic.numbering);
-                Claim::Done
-            }
-            Mnemonic::Load(load) => {
-                match state.try_load(
-                    host,
-                    ic.block_id,
-                    ic.insn_id,
-                    load,
-                    ic.aliases,
-                    ic.numbering,
-                ) {
-                    Some(value) => {
-                        ed.replace(host, ic.insn_id, value);
-                        state.define_load(load, value, ic.aliases, ic.numbering);
-                    }
-                    None => state.define_load(load, ic.id, ic.aliases, ic.numbering),
-                }
-                Claim::Done
-            }
-            _ => Claim::Pass,
-        }
-    }
-
-    // A block that ends in a call clobbers registers: its dominated children
-    // run after the call, so register values the call clobbers must not be
-    // forwarded into them (e.g. a caller's post-call `RAX` read is the
-    // callee's result, not a value computed before the call).
-    fn after_block(
-        &self,
-        host: &mut Context<'str>,
-        state: &mut dyn Any,
-        block_id: BlockId,
-        aliases: Option<&AliasResult>,
-        _numbering: &Numbering,
-    ) {
-        let state = state.downcast_mut::<MemForward>().expect("memory state");
-        state.prune_clobbered_by_call(host.read_host(), block_id, aliases);
-    }
-}
-
-/// Concrete twin of the [`SubPass`] impl above (context-split stage 5b-ii):
+/// The function-pass [`SubPassC`] impl (context-split stage 5b-ii):
 /// reads route through `body.read_host(cx)`, the load forward through `Editor`'s
-/// `_c` method, and the [`MemForward`] rebuild/record helpers (`record_store`,
-/// `try_load`) are reached through a scoped `body.host(cx)` — they stay generic
-/// because the generic path shares them.
+/// `_c` method, and the [`MemForward`] rebuild/record helpers (`record_store_c`,
+/// `try_load_c`) run over `&mut PassBacking`.
 impl<'str> SubPassC<'str> for MemoryForwarding {
     fn init_state(&self) -> Box<dyn Any> {
         Box::new(MemForward::default())

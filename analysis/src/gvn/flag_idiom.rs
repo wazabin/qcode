@@ -1,6 +1,5 @@
 //! Flag-idiom sub-pass: collapse x86 signed-compare flag chains.
 
-use qcode::context::Context;
 use qcode::value::{
     ValueId,
     insn::{Binary, Binop, IntBinop, Mnemonic},
@@ -10,46 +9,16 @@ use qcode::value::{
 use super::fold::const_value;
 use std::any::Any;
 
-use super::walk::{Claim, Editor, InsnCtx, ModuleSubPass, SubPassC};
+use super::walk::{Claim, Editor, InsnCtx, SubPassC};
 
 use crate::{ContextView, FunctionBody};
 
 /// Collapse the signed-compare flag idiom into a single `s<`, materializing the
 /// replacement before the matched instruction and forwarding its uses; the
-/// dead flag math falls to DCE. Fully host-routed (own-function reads only), so
-/// it runs over either the module or a checked-out function.
+/// dead flag math falls to DCE. It runs on the checked-out function-pass path (own-function reads only).
 pub(super) struct FlagIdiom;
 
-impl<'str> ModuleSubPass<'str> for FlagIdiom {
-    fn init_state(&self) -> Box<dyn Any> {
-        Box::new(())
-    }
-
-    fn clone_state(&self, _state: &dyn Any) -> Box<dyn Any> {
-        Box::new(())
-    }
-
-    fn on_insn(
-        &self,
-        host: &mut Context<'str>,
-        _state: &mut dyn Any,
-        ic: &InsnCtx,
-        ed: &mut Editor,
-    ) -> Claim {
-        if ic.mnemonic.is_terminator() || ic.size == 0 {
-            return Claim::Pass;
-        }
-        match simplify_flag_idiom(host.read_host(), ic.mnemonic) {
-            Some(new_mnemonic) => {
-                ed.replace_with_new_insn(host, ic.block_id, ic.insn_id, new_mnemonic, ic.size);
-                Claim::Done
-            }
-            None => Claim::Pass,
-        }
-    }
-}
-
-/// Concrete twin of the [`SubPass`] impl above (context-split stage 5b-ii):
+/// The function-pass [`SubPassC`] impl (context-split stage 5b-ii):
 /// `simplify_flag_idiom` reads through `body.read_host(cx)` and the rewrite
 /// materializes through `Editor::replace_with_new_insn_c`.
 impl<'str> SubPassC<'str> for FlagIdiom {
