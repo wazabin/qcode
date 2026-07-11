@@ -30,12 +30,12 @@ pub fn mem2reg(ctx: &mut Context, function_id: FunctionId, aliases: &AliasResult
 /// literals. `sp_param` is `None` when the caller has no stack-pointer context
 /// (most unit tests), leaving only the literal path active.
 pub fn mem2reg_framed(
-    mut ctx: &mut Context,
+    ctx: &mut Context,
     function_id: FunctionId,
     aliases: &AliasResult,
     sp_param: Option<ValueId>,
 ) -> bool {
-    mem2reg_host_generic(&mut ctx, function_id, aliases, sp_param)
+    mem2reg_host_generic(ctx, function_id, aliases, sp_param)
 }
 
 /// Host-generic core of [`mem2reg_framed`]. Reads and mutates the function through
@@ -44,8 +44,8 @@ pub fn mem2reg_framed(
 ///
 /// TODO(5b-ii): For backwards compatibility; prefer concrete version for new code.
 /// [`CheckedOut`]: qcode::value::util::host_mut::CheckedOut
-fn mem2reg_host_generic<'str, H: HostMut<'str>>(
-    host: &mut H,
+fn mem2reg_host_generic<'str>(
+    host: &mut Context<'str>,
     function_id: FunctionId,
     aliases: &AliasResult,
     sp_param: Option<ValueId>,
@@ -67,8 +67,8 @@ pub fn mem2reg_host<'ctx, 'str>(
 
 /// Generic host-based version of mem2reg pass core (stage 5a).
 /// TODO(5b-ii): For backwards compatibility; prefer concrete version.
-struct Mem2RegGeneric<'ctx, 'str, H: HostMut<'str>> {
-    host: &'ctx mut H,
+struct Mem2RegGeneric<'ctx, 'str> {
+    host: &'ctx mut Context<'str>,
     function_id: FunctionId,
     root_id: Option<BlockId>,
     aliases: &'ctx AliasResult,
@@ -81,9 +81,9 @@ struct Mem2RegGeneric<'ctx, 'str, H: HostMut<'str>> {
     _marker: std::marker::PhantomData<&'str ()>,
 }
 
-impl<'ctx, 'str, H: HostMut<'str>> Mem2RegGeneric<'ctx, 'str, H> {
+impl<'ctx, 'str> Mem2RegGeneric<'ctx, 'str> {
     fn new(
-        host: &'ctx mut H,
+        host: &'ctx mut Context<'str>,
         function_id: FunctionId,
         aliases: &'ctx AliasResult,
         sp_param: Option<ValueId>,
@@ -509,7 +509,7 @@ struct InsertedBlockParams {
     excluded: HashSet<ValueId>,
 }
 
-impl<'str, H: HostMut<'str>> Mem2RegGeneric<'_, 'str, H> {
+impl<'str> Mem2RegGeneric<'_, 'str> {
     fn block_param_name_for_var(&self, var: ValueId) -> Option<String> {
         match var {
             ValueId::Varnode(varnode_id) => Varnode::from_id(self.read().shared(), varnode_id)
@@ -1171,7 +1171,7 @@ struct BranchEdge<'a> {
     existing_args: &'a [ValueId],
 }
 
-impl<'str, H: HostMut<'str>> Mem2RegGeneric<'_, 'str, H> {
+impl<'str> Mem2RegGeneric<'_, 'str> {
     /// Computes the full argument list for a branch into `target`, by index.
     ///
     /// `mem2reg` runs repeatedly (interleaved with constant-folding), and each run
@@ -1584,7 +1584,7 @@ fn decide_variable_value(var: ValueId, frames: &[Frame]) -> Option<FrameEntry> {
     None
 }
 
-impl<'str, H: HostMut<'str>> Mem2RegGeneric<'_, 'str, H> {
+impl<'str> Mem2RegGeneric<'_, 'str> {
     fn decide_values_start_from(&mut self, block: BlockId, state: &mut RenameState<'_>) {
         // The renamer follows CFG successors. Strict IR locality (context-split
         // ruling 2) guarantees every successor is a block of this function — a
