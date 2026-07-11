@@ -999,18 +999,18 @@ fn postdominated_dead_ram_stores(
 /// removed. Without `aliases` each block is treated independently.
 /// TODO(5b-ii): Takes Context; migrate to FunctionBody/ContextView when public API stabilizes.
 pub fn remove_dead_load_insns(
-    mut ctx: &mut Context,
+    ctx: &mut Context,
     function_id: FunctionId,
     aliases: Option<&AliasResult>,
     dead_regs: &[ValueId],
 ) -> bool {
-    remove_dead_load_insns_generic(&mut ctx, function_id, aliases, dead_regs)
+    remove_dead_load_insns_generic(ctx, function_id, aliases, dead_regs)
 }
 
 /// Generic host-based core of [`remove_dead_load_insns`].
 /// TODO(5b-ii): For backwards compatibility; prefer concrete version for new code.
-pub fn remove_dead_load_insns_generic<'str, H: HostMut<'str>>(
-    host: &mut H,
+pub fn remove_dead_load_insns_generic<'str>(
+    host: &mut Context<'str>,
     function_id: FunctionId,
     aliases: Option<&AliasResult>,
     dead_regs: &[ValueId],

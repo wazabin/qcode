@@ -47,6 +47,8 @@ use qcode::value::{
 };
 
 #[cfg(test)]
+use qcode::context::Context;
+#[cfg(test)]
 use qcode::value::util::host_mut::HostMut;
 
 use crate::{AliasResult, ContextView, FunctionBody, FunctionPass};
@@ -366,8 +368,8 @@ fn hoist_into_preheader<'a, 'str>(
 /// `&mut Context` test entry point below.
 /// TODO(5b-ii): remove once tests migrate off `HostMut`.
 #[cfg(test)]
-fn hoist_into_preheader_generic<'str, H: HostMut<'str>>(
-    host: &mut H,
+fn hoist_into_preheader_generic<'str>(
+    mut host: &mut Context<'str>,
     preheader: BlockId,
     order: &[InstructionId],
 ) -> bool {
@@ -460,8 +462,8 @@ fn hoist_loop_invariants_with_aliases<'a, 'str>(
 /// oracle.
 /// TODO(5b-ii): remove once tests migrate off `HostMut`.
 #[cfg(test)]
-fn hoist_loop_invariants_with_aliases_generic<'str, H: HostMut<'str>>(
-    host: &mut H,
+fn hoist_loop_invariants_with_aliases_generic<'str>(
+    host: &mut Context<'str>,
     fun_id: FunctionId,
     aliases: Option<&AliasResult>,
 ) -> bool {
