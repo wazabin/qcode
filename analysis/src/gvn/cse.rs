@@ -22,7 +22,7 @@ use qcode::value::{
 
 use std::any::Any;
 
-use super::affine::{NormalForm, Numbering, arith_form, key_for, materialize};
+use super::affine::{NormalForm, Numbering, arith_form, key_for, materialize, materialize_c};
 use super::walk::{Claim, Editor, InsnCtx, ModuleSubPass, SubPassC};
 
 use crate::{ContextView, FunctionBody};
@@ -193,21 +193,16 @@ impl<'str> SubPassC<'str> for Cse {
             NormalForm::Opaque(_) => state.claim(key, ic.id),
             _ => {
                 let root_ty = body.read_host(cx).type_of(ic.id);
-                // `materialize` is a shared HostMut helper (the generic path uses
-                // it too); reach it through a scoped host. TODO(5b-ii): migrate
-                // `materialize` off HostMut.
-                let v = {
-                    let mut host = body.host(cx);
-                    materialize(
-                        &mut host,
-                        ic.block_id,
-                        ic.insn_id,
-                        ic.mnemonic,
-                        &key,
-                        root_ty,
-                        state,
-                    )
-                };
+                let v = materialize_c(
+                    body,
+                    cx,
+                    ic.block_id,
+                    ic.insn_id,
+                    ic.mnemonic,
+                    &key,
+                    root_ty,
+                    state,
+                );
                 if v != ic.id {
                     ed.replace_c(body, cx, ic.insn_id, v);
                 }

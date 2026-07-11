@@ -39,6 +39,8 @@ use qcode::value::{
 use super::cse::{normalize, value_id_key};
 use super::fold::const_value;
 
+use crate::{ContextView, FunctionBody};
+
 /// The value-numbering key. `Affine`/`Mask` are also stored per value as the
 /// "arithmetic view" used to compose parents; `Opaque` is key-only.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -606,6 +608,261 @@ pub(super) fn materialize<'str, H: HostMut<'str>>(
         return vid;
     }
     let vid = emit(host, block, at, m, root_ty);
+    state.leaders.insert(key.clone(), vid);
+    state.forms.insert(vid, key.clone());
+    vid
+}
+
+// ---------------------------------------------------------------------------
+// Concrete pass twins over (&mut FunctionBody, ContextView) — 5b-ii Pin A step 2.
+// Mirror the generic materialize family; the pass path (cse's SubPassC) drives
+// `materialize_c`, the module path keeps the generic `materialize`.
+// ---------------------------------------------------------------------------
+
+/// Concrete pass twin of [`emit`].
+fn emit_c<'str>(
+    body: &mut FunctionBody<'str>,
+    cx: ContextView<'_, 'str>,
+    block: BlockId,
+    at: InstructionId,
+    mnemonic: Mnemonic,
+    ty: qcode::types::TypeId,
+) -> ValueId {
+    let _ = block; // func = body.id (own function); block.func == body.id here.
+    let new = body.push_mnemonic_with_type(cx, mnemonic, ty);
+    body.insert_insn_before(cx, block, at, new);
+    ValueId::Instruction(new)
+}
+
+/// Concrete pass twin of [`build_value`].
+fn build_value_c<'str>(
+    body: &mut FunctionBody<'str>,
+    cx: ContextView<'_, 'str>,
+    block: BlockId,
+    at: InstructionId,
+    form: &NormalForm,
+    state: &mut Numbering,
+) -> ValueId {
+    if let NormalForm::Affine {
+        width,
+        constant,
+        terms,
+    } = form
+    {
+        if terms.is_empty() {
+            return body
+                .read_host(cx)
+                .shared()
+                .get_const(*constant, *width)
+                .id();
+        }
+        if terms.len() == 1 && terms[0].1 == 1 && *constant == 0 {
+            return terms[0].0;
+        }
+    }
+    if let Some(&leader) = state.leaders.get(form) {
+        return leader;
+    }
+    let int_ty = match form {
+        NormalForm::Affine { width, .. } | NormalForm::Mask { width, .. } => body
+            .read_host(cx)
+            .shared()
+            .shared
+            .types
+            .get_or_make_int(*width),
+        NormalForm::Opaque(_) => unreachable!("opaque forms are never materialized"),
+    };
+    let m = canonical_mnemonic_c(body, cx, block, at, form, state);
+    let vid = emit_c(body, cx, block, at, m, int_ty);
+    state.leaders.insert(form.clone(), vid);
+    state.forms.insert(vid, form.clone());
+    vid
+}
+
+/// Concrete pass twin of [`canonical_mnemonic`].
+fn canonical_mnemonic_c<'str>(
+    body: &mut FunctionBody<'str>,
+    cx: ContextView<'_, 'str>,
+    block: BlockId,
+    at: InstructionId,
+    form: &NormalForm,
+    state: &mut Numbering,
+) -> Mnemonic {
+    match form {
+        NormalForm::Mask {
+            width,
+            term,
+            op,
+            mask,
+        } => Mnemonic::Binop(Binary {
+            op: Binop::Int(*op),
+            lhs: *term,
+            rhs: body.read_host(cx).shared().get_const(*mask, *width).id(),
+        }),
+        NormalForm::Affine {
+            width,
+            constant,
+            terms,
+        } => {
+            let width = *width;
+            let constant = *constant;
+
+            if constant != 0 {
+                let prefix = NormalForm::Affine {
+                    width,
+                    constant: 0,
+                    terms: terms.clone(),
+                };
+                let pv = build_value_c(body, cx, block, at, &prefix, state);
+                let (op, lit) = signed_lit_c(body, cx, signed(constant, width), width);
+                return Mnemonic::Binop(Binary {
+                    op: Binop::Int(op),
+                    lhs: pv,
+                    rhs: lit,
+                });
+            }
+
+            let last_neg = terms
+                .iter()
+                .rev()
+                .find(|(_, k)| signed(*k, width) < 0)
+                .copied();
+            let (last_v, last_k) = match last_neg {
+                Some(t) => t,
+                None => *terms.last().unwrap(),
+            };
+
+            let prefix_terms: Vec<(ValueId, u64)> = terms
+                .iter()
+                .copied()
+                .filter(|(v, _)| *v != last_v)
+                .collect();
+
+            if prefix_terms.is_empty() {
+                if signed(last_k, width) == -1 {
+                    return Mnemonic::Unop(Unary {
+                        op: Unop::IntNegate,
+                        src: last_v,
+                    });
+                }
+                return Mnemonic::Binop(Binary {
+                    op: Binop::Int(IntBinop::Mul),
+                    lhs: last_v,
+                    rhs: body.read_host(cx).shared().get_const(last_k, width).id(),
+                });
+            }
+
+            let prefix = NormalForm::Affine {
+                width,
+                constant: 0,
+                terms: prefix_terms,
+            };
+            let pv = build_value_c(body, cx, block, at, &prefix, state);
+            let s = signed(last_k, width);
+            let (op, mag) = if s < 0 {
+                (IntBinop::Sub, s.unsigned_abs() & mask_for(width))
+            } else {
+                (IntBinop::Add, last_k)
+            };
+            let tv = scaled_value_c(body, cx, block, at, last_v, mag, width, state);
+            Mnemonic::Binop(Binary {
+                op: Binop::Int(op),
+                lhs: pv,
+                rhs: tv,
+            })
+        }
+        NormalForm::Opaque(_) => unreachable!("opaque forms are never materialized"),
+    }
+}
+
+/// Concrete pass twin of [`scaled_value`].
+#[allow(clippy::too_many_arguments)]
+fn scaled_value_c<'str>(
+    body: &mut FunctionBody<'str>,
+    cx: ContextView<'_, 'str>,
+    block: BlockId,
+    at: InstructionId,
+    term: ValueId,
+    mag: u64,
+    width: usize,
+    state: &mut Numbering,
+) -> ValueId {
+    if mag == 1 {
+        return term;
+    }
+    let form = NormalForm::Affine {
+        width,
+        constant: 0,
+        terms: vec![(term, mag)],
+    };
+    build_value_c(body, cx, block, at, &form, state)
+}
+
+/// Concrete pass twin of [`signed_lit`].
+fn signed_lit_c<'str>(
+    body: &mut FunctionBody<'str>,
+    cx: ContextView<'_, 'str>,
+    s: i64,
+    width: usize,
+) -> (IntBinop, ValueId) {
+    if s < 0 {
+        (
+            IntBinop::Sub,
+            body.read_host(cx)
+                .shared()
+                .get_const(s.unsigned_abs() & mask_for(width), width)
+                .id(),
+        )
+    } else {
+        (
+            IntBinop::Add,
+            body.read_host(cx)
+                .shared()
+                .get_const(s as u64 & mask_for(width), width)
+                .id(),
+        )
+    }
+}
+
+/// Concrete pass twin of [`materialize`].
+#[allow(clippy::too_many_arguments)]
+pub(super) fn materialize_c<'str>(
+    body: &mut FunctionBody<'str>,
+    cx: ContextView<'_, 'str>,
+    block: BlockId,
+    at: InstructionId,
+    at_mnemonic: &Mnemonic,
+    key: &NormalForm,
+    root_ty: qcode::types::TypeId,
+    state: &mut Numbering,
+) -> ValueId {
+    if let NormalForm::Affine {
+        width,
+        constant,
+        terms,
+    } = key
+    {
+        if terms.is_empty() {
+            return body
+                .read_host(cx)
+                .shared()
+                .get_const(*constant, *width)
+                .id();
+        }
+        if terms.len() == 1 && terms[0].1 == 1 && *constant == 0 {
+            return terms[0].0;
+        }
+    }
+    if let Some(&leader) = state.leaders.get(key) {
+        return leader;
+    }
+    let m = canonical_mnemonic_c(body, cx, block, at, key, state);
+    if &m == at_mnemonic {
+        let vid = ValueId::Instruction(at);
+        state.leaders.insert(key.clone(), vid);
+        return vid;
+    }
+    let vid = emit_c(body, cx, block, at, m, root_ty);
     state.leaders.insert(key.clone(), vid);
     state.forms.insert(vid, key.clone());
     vid
