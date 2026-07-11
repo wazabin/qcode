@@ -57,20 +57,20 @@ impl Intrinsic for Insert {
         else {
             return None;
         };
-        let ctx = host.shared();
-        let arr_ty = ctx.shared.values.bytes[bid].type_id;
-        let (elem, count) = ctx.shared.types.array_of(arr_ty)?;
-        let esz = ctx.shared.types.size_of(elem);
-        let i = ctx.shared.values.literals[ilit].value as usize;
+        let ctx = host.shr();
+        let arr_ty = ctx.values.bytes[bid].type_id;
+        let (elem, count) = ctx.types.array_of(arr_ty)?;
+        let esz = ctx.types.size_of(elem);
+        let i = ctx.values.literals[ilit].value as usize;
         if i >= count {
             return None;
         }
-        let v = ctx.shared.values.literals[vlit].value;
-        let mut data = ctx.shared.values.bytes[bid].data.clone();
+        let v = ctx.values.literals[vlit].value;
+        let mut data = ctx.values.bytes[bid].data.clone();
         let off = i * esz;
         let v_bytes = v.to_le_bytes();
         data[off..off + esz].copy_from_slice(&v_bytes[..esz]);
-        let nid = ctx.get_typed_bytes(data, arr_ty).id();
+        let nid = ctx.get_typed_bytes(data, arr_ty);
         Some(Simplified::Value(nid))
     }
 }

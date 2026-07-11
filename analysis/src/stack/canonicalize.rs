@@ -97,7 +97,7 @@ pub fn canonicalize_sp_slots_concrete<'a, 'str>(
         let mut b = Builder::from_block(BaseRef::new(host_borrow, root));
         b.set_insert_point_to_start();
         for off in missing {
-            let mag = b.context().get_const(off.unsigned_abs(), ptr_width).id();
+            let mag = b.shr().get_const(off.unsigned_abs(), ptr_width);
             let rep = if off > 0 {
                 b.push_add(sp_param, mag).id()
             } else {
@@ -187,7 +187,7 @@ pub fn canonicalize_sp_slots<'str>(
         let mut b = Builder::from_block(BaseRef::new(&mut *host, root));
         b.set_insert_point_to_start();
         for off in missing {
-            let mag = b.context().get_const(off.unsigned_abs(), ptr_width).id();
+            let mag = b.shr().get_const(off.unsigned_abs(), ptr_width);
             let rep = if off > 0 {
                 b.push_add(sp_param, mag).id()
             } else {

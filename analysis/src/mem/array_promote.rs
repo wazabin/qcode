@@ -437,7 +437,7 @@ fn index_plus<'str, 'ctx, Ctx: BuilderBacking<'str>>(
         return index;
     }
     if delta == -1 {
-        let one = b.context().get_const(1, width).id();
+        let one = b.shr().get_const(1, width);
         return b.push_sub(index, one).id();
     }
     let mask = if width >= 8 {
@@ -445,7 +445,7 @@ fn index_plus<'str, 'ctx, Ctx: BuilderBacking<'str>>(
     } else {
         (1u64 << (width * 8)) - 1
     };
-    let c = b.context().get_const(delta as u64 & mask, width).id();
+    let c = b.shr().get_const(delta as u64 & mask, width);
     b.push_add(index, c).id()
 }
 
@@ -461,10 +461,7 @@ fn region_base<'str, 'ctx, Ctx: BuilderBacking<'str>>(
     if origin_word == 0 {
         return base_root;
     }
-    let off = b
-        .context()
-        .get_const((origin_word * esz as i64) as u64, width)
-        .id();
+    let off = b.shr().get_const((origin_word * esz as i64) as u64, width);
     b.push_add(base_root, off).id()
 }
 

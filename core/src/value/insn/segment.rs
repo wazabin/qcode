@@ -235,7 +235,7 @@ fn block_param_atom(ctx: &Context<'_>, id: crate::value::BlockParamId) -> String
 /// Render an instruction as colored, linkable tokens. Concatenating the tokens'
 /// text equals the instruction's `Display` (`as_statement()`) output.
 pub fn instruction_segments(insn: &InstructionRef<'_, '_>) -> Vec<Token> {
-    let ctx = insn.ctx.shared();
+    let ctx = insn.ctx.module_ctx();
     let mut seg = Seg {
         ctx,
         out: Vec::new(),

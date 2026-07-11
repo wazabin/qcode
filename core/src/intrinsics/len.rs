@@ -57,8 +57,8 @@ impl Intrinsic for Len {
         // A list's length is data-dependent (the NUL position for a string) and
         // stays symbolic.
         let ty = host.type_of(seq);
-        if let Some((_, n)) = host.shared().shared.types.array_of(ty) {
-            let lit = host.shared().get_const(n as u64, out_size).id();
+        if let Some((_, n)) = host.shr().types.array_of(ty) {
+            let lit = host.shr().get_const(n as u64, out_size);
             return Some(Simplified::Value(lit));
         }
         // `len(iota n) = n`: the length of an as-yet-unfolded index driver is its

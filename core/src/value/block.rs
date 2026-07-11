@@ -469,7 +469,10 @@ pub type BlockRef<'str, 'ctx> = BaseRef<HostRef<'ctx, 'str>, BlockId>;
 
 impl<'s, 'ctx: 's, 'str: 'ctx> WithCtx<'s, 'ctx, 'str> for BlockRef<'str, 'ctx> {
     fn ctx(&'s self) -> &'ctx Context<'str> {
-        self.ctx.shared()
+        // Module-scope-only escape hatch: shared-only reads go through
+        // `host().shr()`; only whole-module walks (callees/callers) reach here,
+        // and those panic on a checked-out host by design (context-split Pin B).
+        self.ctx.module_ctx()
     }
 }
 
@@ -550,7 +553,9 @@ where
     'str: 's,
 {
     fn ctx(&'s self) -> &'s Context<'str> {
-        self.ctx.shared()
+        // A checked-out pass backing carries no `&Context`; shared-only reads go
+        // through the host's `shr()`. Nothing on the pass path reaches this.
+        panic!("whole-context read on a checked-out mutation ref: module-scope only")
     }
 }
 

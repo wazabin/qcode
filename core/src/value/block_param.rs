@@ -122,7 +122,7 @@ where
 
     /// Size of this parameter's value in bytes.
     pub fn size(&'s self) -> usize {
-        self.ctx().shared.types.size_of(self.inner().type_id)
+        self.host().shr().types.size_of(self.inner().type_id)
     }
 
     /// The block this parameter belongs to, if any.
@@ -143,7 +143,7 @@ where
         // Surface a richer-than-integer type (e.g. a seeded `TEB*` segment base)
         // as a `Type ` prefix. Plain `Int` params stay bare `@name` so the many
         // existing signature assertions (`<f @ESP @EDI>`) are unaffected.
-        let types = &self.ctx().shared.types;
+        let types = &self.host().shr().types;
         let ty = types.type_name(self.type_id());
         if types.pointee_of(self.type_id()).is_some()
             || types.struct_name_of(self.type_id()).is_some()
@@ -165,7 +165,7 @@ where
     /// params (no parser syntax) and unnamed/untyped params fall back to the
     /// operand rendering.
     pub(crate) fn fmt_decl(&'s self, f: &mut Formatter<'_>) -> std::fmt::Result {
-        let types = &self.ctx().shared.types;
+        let types = &self.host().shr().types;
         let tid = self.type_id();
         let is_scalar = types.pointee_of(tid).is_none() && types.struct_name_of(tid).is_none();
         match (self.name(), is_scalar && self.size() > 0) {
@@ -179,7 +179,10 @@ pub type BlockParamRef<'str, 'ctx> = BaseRef<HostRef<'ctx, 'str>, BlockParamId>;
 
 impl<'s, 'ctx: 's, 'str: 'ctx> WithCtx<'s, 'ctx, 'str> for BlockParamRef<'str, 'ctx> {
     fn ctx(&'s self) -> &'ctx Context<'str> {
-        self.ctx.shared()
+        // Module-scope-only escape hatch: shared-only reads go through
+        // `host().shr()`; only whole-module walks (callees/callers) reach here,
+        // and those panic on a checked-out host by design (context-split Pin B).
+        self.ctx.module_ctx()
     }
 }
 
@@ -249,7 +252,7 @@ macro_rules! impl_param_mut_verbs {
     (<$($l:lifetime),*> $ctx:ty) => {
         impl<$($l),*> BaseRef<$ctx, BlockParamId> {
     pub fn set_size(&mut self, size: usize) {
-        let type_id = self.ctx.shared().shared.types.get_or_make_int(size);
+        let type_id = self.ctx.shr().types.get_or_make_int(size);
         self.ctx.block_param_mut(self.id).type_id = type_id;
     }
 

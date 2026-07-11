@@ -646,7 +646,7 @@ mod tests {
     fn run_mba(ctx: &mut Context, fid: FunctionId) -> bool {
         let mut fun = ctx.checkout_function(fid);
         let changed = {
-            let mut host = PassBacking::new(&mut fun, fid, ctx);
+            let mut host = PassBacking::from_ctx(&mut fun, fid, ctx);
             mba_simplify(&mut host, fid)
         };
         ctx.checkin_function(fid, fun);

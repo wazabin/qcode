@@ -215,6 +215,17 @@ impl<'str> Shared<'str> {
             .unwrap_or_default()
     }
 
+    /// Like [`get_bytes`](Self::get_bytes) but with an explicit array/sequence
+    /// [`TypeId`]. Shared-only mirror of [`Context::get_typed_bytes`] returning
+    /// the id directly.
+    pub fn get_typed_bytes(&self, data: Vec<u8>, type_id: crate::types::TypeId) -> ValueId {
+        ValueId::Bytes(
+            self.values
+                .bytes
+                .push(crate::value::Bytes { data, type_id }),
+        )
+    }
+
     /// The recorded [`Truth`] of `prop`, if any. Shared-only
     /// mirror of [`Context::truth`] (truths live in the phase-mutable shared
     /// maps), for `&Shared`-served pass reads.
@@ -2102,7 +2113,8 @@ mod tests {
 
         let checked = HostRef::Checked {
             fun: &fun,
-            shared: &ctx,
+            shared: &ctx.shared,
+            interfaces: &ctx.interfaces,
             id: fid,
         };
         let checked_snap = snapshot(checked, fid);
@@ -2205,7 +2217,7 @@ mod tests {
 
         let mut fun = ctx_b.checkout_function(fid_b);
         {
-            let mut host = PassBacking::new(&mut fun, fid_b, &ctx_b);
+            let mut host = PassBacking::from_ctx(&mut fun, fid_b, &ctx_b);
             let mut r = BaseRef::new(host.reborrow(), entry_b);
             r.set_comment(Some("c".into()));
             let mut r = BaseRef::new(host.reborrow(), entry_b);

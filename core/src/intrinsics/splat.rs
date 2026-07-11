@@ -61,21 +61,21 @@ impl Intrinsic for Splat {
         let (ValueId::Literal(vlid), ValueId::Literal(clid)) = (val, count) else {
             return None;
         };
-        let ctx = host.shared();
-        let n = ctx.shared.values.literals[clid].value as usize;
+        let ctx = host.shr();
+        let n = ctx.values.literals[clid].value as usize;
         if n == 0 || n > SPLAT_LITERAL_MAX {
             return None;
         }
-        let bits = ctx.shared.values.literals[vlid].value;
-        let elem_type_id = ctx.shared.values.literals[vlid].type_id;
-        let esz = ctx.shared.types.size_of(elem_type_id);
-        let elem_ty = ctx.shared.types.get_or_make_int(esz);
-        let arr_ty = ctx.shared.types.get_or_make_array(elem_ty, n);
+        let bits = ctx.values.literals[vlid].value;
+        let elem_type_id = ctx.values.literals[vlid].type_id;
+        let esz = ctx.types.size_of(elem_type_id);
+        let elem_ty = ctx.types.get_or_make_int(esz);
+        let arr_ty = ctx.types.get_or_make_array(elem_ty, n);
         let mut data = Vec::with_capacity(n * esz);
         for _ in 0..n {
             data.extend_from_slice(&bits.to_le_bytes()[..esz]);
         }
-        let bid = ctx.get_typed_bytes(data, arr_ty).id();
+        let bid = ctx.get_typed_bytes(data, arr_ty);
         Some(Simplified::Value(bid))
     }
 }

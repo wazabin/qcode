@@ -270,7 +270,7 @@ pub(crate) fn const_u64(host: HostRef, v: ValueId) -> Option<u64> {
             let ValueId::Literal(id) = v else {
                 return None;
             };
-            if host.shared().shared.values.literals[id].symbolic.is_some() {
+            if host.shr().values.literals[id].symbolic.is_some() {
                 return None;
             }
             Some(lit.value())

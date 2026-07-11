@@ -555,7 +555,7 @@ impl<'str> Function<'str> {
     /// no body verb reaches that arm.
     pub fn register_local_name(
         &mut self,
-        shared: &Context<'str>,
+        shared: &crate::context::Shared<'str>,
         id: ValueId,
         name: Cow<'str, str>,
         old_name: Option<&str>,
@@ -883,7 +883,7 @@ where
         // name (conventional functions, never `pure_reg`).
         #[allow(deprecated)]
         let input = self.input_regs()?.get(index).copied()?;
-        let vn = Varnode::from_id(self.ctx(), input);
+        let vn = Varnode::from_id(self.host().shr(), input);
         if let Some(name) = vn.name() {
             return Some(name.to_owned());
         }
@@ -1149,7 +1149,10 @@ pub type FunctionRef<'str, 'ctx> = BaseRef<HostRef<'ctx, 'str>, FunctionId>;
 
 impl<'s, 'ctx: 's, 'str: 'ctx> WithCtx<'s, 'ctx, 'str> for FunctionRef<'str, 'ctx> {
     fn ctx(&'s self) -> &'ctx Context<'str> {
-        self.ctx.shared()
+        // Module-scope-only escape hatch: shared-only reads go through
+        // `host().shr()`; only whole-module walks (callees/callers) reach here,
+        // and those panic on a checked-out host by design (context-split Pin B).
+        self.ctx.module_ctx()
     }
 }
 

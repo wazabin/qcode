@@ -31,50 +31,59 @@ pub enum HostRef<'a, 'str> {
     /// variant used outside a checked-out pass, and the one the existing suite
     /// exercises — its routing is identical to the pre-`HostRef` `&Context` path.
     Module(&'a Context<'str>),
-    /// A function checked out of `shared` for exclusive access: reads of `id`'s
-    /// arenas come from `fun`; every other function (and all shared data) from
-    /// `shared`.
+    /// A function checked out of the module for exclusive access: reads of `id`'s
+    /// arenas come from `fun`; shared data from `shared`; interface queries from
+    /// `interfaces`. Carries **no** `&Context` — in particular no reach into
+    /// other functions' bodies, which is the parallel-safety contract
+    /// (context-split stage 5b-ii Pin B).
     Checked {
         fun: &'a Function<'str>,
-        shared: &'a Context<'str>,
+        shared: &'a crate::context::Shared<'str>,
+        interfaces: &'a jstd::registry::Registry<
+            FunctionId,
+            crate::value::function::FunctionInterface<'str>,
+        >,
         id: FunctionId,
     },
 }
 
 impl<'a, 'str> HostRef<'a, 'str> {
-    /// The module's shared data (varnodes, literals, types, spaces, registers,
-    /// name/address maps). Both variants read these from the module — a
-    /// checked-out function's *arenas* live in `fun`, but everything else stays
-    /// in the shared context.
-    pub fn shared(self) -> &'a Context<'str> {
+    /// The whole `&Context`, for **module-scope-only** reads (cross-function
+    /// body walks such as `FunctionRef::callees`/`callers`). Panics on a
+    /// checked-out host, which by design carries no `&Context`.
+    pub fn module_ctx(self) -> &'a Context<'str> {
         match self {
             HostRef::Module(c) => c,
+            HostRef::Checked { .. } => {
+                panic!("whole-context read on a checked-out host: this query is module-scope only")
+            }
+        }
+    }
+
+    /// The module's shared IR state ([`Shared`]): varnodes, literals, types,
+    /// spaces, registers, name/address maps. Both variants read these from the
+    /// module — a checked-out function's *arenas* live in `fun`, but everything
+    /// else stays shared.
+    ///
+    /// [`Shared`]: crate::context::Shared
+    pub fn shr(self) -> &'a crate::context::Shared<'str> {
+        match self {
+            HostRef::Module(c) => &c.shared,
             HostRef::Checked { shared, .. } => shared,
         }
     }
 
-    /// The module's shared IR state ([`Shared`]) — the narrowed twin of
-    /// [`shared`](Self::shared). This is the transitional accessor consumers
-    /// migrate onto as [`ContextView`] narrows from `&Context` to `&Shared`
-    /// (context-split stage 5b-ii item #1): once no consumer reaches the whole
-    /// `&Context` through the read host, [`HostRef::Checked`]'s handle narrows to
-    /// `&Shared` and this becomes the only shared accessor.
-    ///
-    /// [`ContextView`]: crate
-    pub fn shr(self) -> &'a crate::context::Shared<'str> {
-        match self {
-            HostRef::Module(c) => &c.shared,
-            HostRef::Checked { shared, .. } => &shared.shared,
-        }
-    }
-
-    /// The function *body* `f`, from `fun` if it is the checked-out one, else from
-    /// the shared registry.
+    /// The function *body* `f`: the owned `fun` on a checked-out host, the
+    /// registry slot on a module host. A checked-out host holds only its own
+    /// body — a foreign-body read through it is the exact coupling the
+    /// context-split forbids, and panics.
     pub fn function(self, f: FunctionId) -> &'a Function<'str> {
         match self {
             HostRef::Module(c) => &c.bodies[f],
             HostRef::Checked { fun, id, .. } if f == id => fun,
-            HostRef::Checked { shared, .. } => &shared.bodies[f],
+            HostRef::Checked { .. } => panic!(
+                "foreign function-body read on a checked-out host: other bodies are module-scope only"
+            ),
         }
     }
 
@@ -82,7 +91,10 @@ impl<'a, 'str> HostRef<'a, 'str> {
     /// always reads the shared registry — the real interface even for a
     /// co-checked-out function.
     pub fn interface(self, f: FunctionId) -> &'a crate::value::function::FunctionInterface<'str> {
-        &self.shared().interfaces[f]
+        match self {
+            HostRef::Module(c) => &c.interfaces[f],
+            HostRef::Checked { interfaces, .. } => &interfaces[f],
+        }
     }
 
     /// The instruction `id`, routed to its owning function's arena.
@@ -113,22 +125,21 @@ impl<'a, 'str> HostRef<'a, 'str> {
     ///
     /// [`Context::type_of`]: crate::context::Context::type_of
     pub fn type_of(self, id: ValueId) -> crate::types::TypeId {
-        let shared = self.shared();
+        let shared = self.shr();
         match id {
-            ValueId::Literal(lid) => shared.shared.values.literals[lid].type_id,
-            ValueId::Bytes(bid) => shared.shared.values.bytes[bid].type_id,
+            ValueId::Literal(lid) => shared.values.literals[lid].type_id,
+            ValueId::Bytes(bid) => shared.values.bytes[bid].type_id,
             ValueId::Instruction(iid) => self.instruction(iid).type_id,
             ValueId::BlockParam(pid) => self.block_param(pid).type_id,
             ValueId::Varnode(vid) => {
-                if let Some(&ty) = shared.shared.values.varnode_types.get(&vid) {
+                if let Some(&ty) = shared.values.varnode_types.get(&vid) {
                     return ty;
                 }
                 shared
-                    .shared
                     .types
-                    .get_or_make_int(shared.shared.values.varnodes[vid].size_bytes())
+                    .get_or_make_int(shared.values.varnodes[vid].size_bytes())
             }
-            ValueId::BasicBlock(_) | ValueId::Function(_) => shared.shared.types.get_or_make_int(0),
+            ValueId::BasicBlock(_) | ValueId::Function(_) => shared.types.get_or_make_int(0),
         }
     }
 
@@ -139,13 +150,13 @@ impl<'a, 'str> HostRef<'a, 'str> {
     ///
     /// [`Context::stored_type_of`]: crate::context::Context::stored_type_of
     pub fn stored_type_of(self, id: ValueId) -> Option<crate::types::TypeId> {
-        let shared = self.shared();
+        let shared = self.shr();
         match id {
-            ValueId::Literal(lid) => Some(shared.shared.values.literals[lid].type_id),
-            ValueId::Bytes(bid) => Some(shared.shared.values.bytes[bid].type_id),
+            ValueId::Literal(lid) => Some(shared.values.literals[lid].type_id),
+            ValueId::Bytes(bid) => Some(shared.values.bytes[bid].type_id),
             ValueId::Instruction(iid) => Some(self.instruction(iid).type_id),
             ValueId::BlockParam(pid) => Some(self.block_param(pid).type_id),
-            ValueId::Varnode(vid) => shared.shared.values.varnode_types.get(&vid).copied(),
+            ValueId::Varnode(vid) => shared.values.varnode_types.get(&vid).copied(),
             ValueId::BasicBlock(_) | ValueId::Function(_) => None,
         }
     }

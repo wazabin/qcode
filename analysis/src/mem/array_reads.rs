@@ -266,17 +266,17 @@ fn build_index<'str, 'ctx, Ctx: BuilderBacking<'str>>(
     lane: &LaneIdx,
 ) -> ValueId {
     match *lane {
-        LaneIdx::Const(w) => b.context().get_const(w as u64, 8).id(),
+        LaneIdx::Const(w) => b.shr().get_const(w as u64, 8),
         LaneIdx::Strided(idx, 0) => idx,
         LaneIdx::Strided(idx, od) => {
-            let ty = b.context().type_of(idx);
-            let width = b.context().shared.types.size_of(ty);
+            let ty = b.read_host().type_of(idx);
+            let width = b.shr().types.size_of(ty);
             let mask = if width >= 8 {
                 u64::MAX
             } else {
                 (1u64 << (width * 8)) - 1
             };
-            let c = b.context().get_const(od as u64 & mask, width).id();
+            let c = b.shr().get_const(od as u64 & mask, width);
             b.push_add(idx, c).id()
         }
     }

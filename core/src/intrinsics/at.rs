@@ -32,9 +32,7 @@ fn index_rel(host: HostRef, a: ValueId, b: ValueId) -> IdxRel {
         return IdxRel::Equal;
     }
     if let (ValueId::Literal(x), ValueId::Literal(y)) = (a, b) {
-        return if host.shared().shared.values.literals[x].value
-            == host.shared().shared.values.literals[y].value
-        {
+        return if host.shr().values.literals[x].value == host.shr().values.literals[y].value {
             IdxRel::Equal
         } else {
             IdxRel::Distinct
@@ -88,17 +86,17 @@ fn simplify_at(host: HostRef, out_size: usize, arr: ValueId, index: ValueId) -> 
     {
         // Read straight out of a constant `Bytes` array at a constant index.
         if let (ValueId::Bytes(bid), ValueId::Literal(ilit)) = (arr, index) {
-            let arr_ty = host.shared().shared.values.bytes[bid].type_id;
-            if let Some((elem, count)) = host.shared().shared.types.array_of(arr_ty) {
-                let esz = host.shared().shared.types.size_of(elem);
-                let i = host.shared().shared.values.literals[ilit].value as usize;
+            let arr_ty = host.shr().values.bytes[bid].type_id;
+            if let Some((elem, count)) = host.shr().types.array_of(arr_ty) {
+                let esz = host.shr().types.size_of(elem);
+                let i = host.shr().values.literals[ilit].value as usize;
                 if i < count {
                     let off = i * esz;
-                    let data = &host.shared().shared.values.bytes[bid].data;
+                    let data = &host.shr().values.bytes[bid].data;
                     let mut buf = [0u8; 8];
                     buf[..esz].copy_from_slice(&data[off..off + esz]);
                     let v = u64::from_le_bytes(buf);
-                    return Some(Simplified::Value(host.shared().get_const(v, out_size).id()));
+                    return Some(Simplified::Value(host.shr().get_const(v, out_size)));
                 }
             }
         }
@@ -132,13 +130,13 @@ fn simplify_at(host: HostRef, out_size: usize, arr: ValueId, index: ValueId) -> 
                 let ValueId::Literal(jlit) = index else {
                     return None;
                 };
-                let j = host.shared().shared.values.literals[jlit].value;
+                let j = host.shr().values.literals[jlit].value;
                 let a_ty = host.type_of(a);
-                let (_, len_a) = host.shared().shared.types.array_of(a_ty)?;
+                let (_, len_a) = host.shr().types.array_of(a_ty)?;
                 if j < len_a as u64 {
                     Some(forward(host, out_size, a, index))
                 } else {
-                    let shifted = host.shared().get_const(j - len_a as u64, 8).id();
+                    let shifted = host.shr().get_const(j - len_a as u64, 8);
                     Some(forward(host, out_size, b, shifted))
                 }
             }

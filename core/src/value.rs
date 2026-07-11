@@ -482,10 +482,10 @@ impl Display for ValueRef<'_, '_> {
             ValueRef::Literal(r) => insn::segment::value_tokens_shared(r.ctx, self.id()),
             ValueRef::Bytes(r) => insn::segment::value_tokens_shared(r.ctx, self.id()),
             ValueRef::Varnode(r) => insn::segment::value_tokens_shared(r.ctx, self.id()),
-            ValueRef::Instruction(r) => insn::segment::value_tokens(r.ctx.shared(), self.id()),
-            ValueRef::BasicBlock(r) => insn::segment::value_tokens(r.ctx.shared(), self.id()),
-            ValueRef::BlockParam(r) => insn::segment::value_tokens(r.ctx.shared(), self.id()),
-            ValueRef::Function(r) => insn::segment::value_tokens(r.ctx.shared(), self.id()),
+            ValueRef::Instruction(r) => insn::segment::value_tokens(r.ctx.module_ctx(), self.id()),
+            ValueRef::BasicBlock(r) => insn::segment::value_tokens(r.ctx.module_ctx(), self.id()),
+            ValueRef::BlockParam(r) => insn::segment::value_tokens(r.ctx.module_ctx(), self.id()),
+            ValueRef::Function(r) => insn::segment::value_tokens(r.ctx.module_ctx(), self.id()),
         };
         for token in tokens {
             write!(f, "{}", token.text)?;

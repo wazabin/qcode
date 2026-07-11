@@ -164,7 +164,7 @@ where
 
     /// The size in bytes of the instruction's output value
     pub fn size(&'s self) -> usize {
-        self.ctx().shared.types.size_of(self.inner().type_id)
+        self.host().shr().types.size_of(self.inner().type_id)
     }
 
     /// The basic block that this instruction belongs to, if any.
@@ -203,11 +203,11 @@ where
     /// Returns `Some` only for instructions whose result type is a pointer to a
     /// known memory space (e.g. [`StackAddress`](crate::types::StackAddress)).
     pub fn space(&'s self) -> Option<SpaceRef<'ctx>> {
-        self.ctx()
-            .shared
+        self.host()
+            .shr()
             .types
             .space_of(self.inner().type_id)
-            .map(|id| Space::from_id(self.ctx(), id))
+            .map(|id| Space::from_id(self.host().shr(), id))
     }
 
     /// The opcode for this instruction
@@ -221,7 +221,7 @@ where
     }
 
     fn fmt(&'s self, f: &mut Formatter<'_>) -> std::fmt::Result {
-        let ty = self.ctx().shared.types.type_name(self.type_id());
+        let ty = self.host().shr().types.type_name(self.type_id());
 
         if let Some(name) = self.name() {
             write!(f, "{ty} %{name}")
@@ -248,7 +248,7 @@ macro_rules! impl_insn_mut_verbs {
     pub fn set_result_type(&mut self, new_type: TypeId) {
         let current = self.ctx.read_host().instruction(self.id).type_id;
         let (current_size, new_size) = {
-            let types = &self.ctx.shared().shared.types;
+            let types = &self.ctx.shr().types;
             (types.size_of(current), types.size_of(new_type))
         };
         assert!(
@@ -340,7 +340,10 @@ impl<'str, 'ctx> InstructionRef<'str, 'ctx> {
 
 impl<'s, 'ctx: 's, 'str: 'ctx> WithCtx<'s, 'ctx, 'str> for InstructionRef<'str, 'ctx> {
     fn ctx(&'s self) -> &'ctx Context<'str> {
-        self.ctx.shared()
+        // Module-scope-only escape hatch: shared-only reads go through
+        // `host().shr()`; only whole-module walks (callees/callers) reach here,
+        // and those panic on a checked-out host by design (context-split Pin B).
+        self.ctx.module_ctx()
     }
 }
 

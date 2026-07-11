@@ -59,11 +59,11 @@ impl Intrinsic for Iota {
         let ValueId::Literal(lid) = n_val else {
             return None;
         };
-        let ctx = host.shared();
-        let n = ctx.shared.values.literals[lid].value as usize;
+        let ctx = host.shr();
+        let n = ctx.values.literals[lid].value as usize;
 
-        let i64_ty = ctx.shared.types.get_or_make_int(8);
-        let arr_ty = ctx.shared.types.get_or_make_array(i64_ty, n);
+        let i64_ty = ctx.types.get_or_make_int(8);
+        let arr_ty = ctx.types.get_or_make_array(i64_ty, n);
 
         // `n == 0` is a degenerate empty array; `n == 1` (8 bytes) still fits a
         // numeric literal. Everything wider becomes a `Bytes` blob typed `[i64;n]`.
@@ -77,9 +77,9 @@ impl Intrinsic for Iota {
                 buf[..data.len()].copy_from_slice(&data);
                 u64::from_le_bytes(buf)
             };
-            return Some(Simplified::Value(ctx.get_typed_const(value, arr_ty).id()));
+            return Some(Simplified::Value(ctx.get_typed_const(value, arr_ty)));
         }
-        let bid = ctx.get_typed_bytes(data, arr_ty).id();
+        let bid = ctx.get_typed_bytes(data, arr_ty);
         Some(Simplified::Value(bid))
     }
 }

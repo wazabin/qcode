@@ -159,7 +159,7 @@ impl<'str> FunctionBody<'str> {
     ///
     /// [`HostMut`]: qcode::value::util::host_mut::HostMut
     pub fn host<'a>(&'a mut self, cx: ContextView<'a, 'str>) -> PassBacking<'a, 'str> {
-        PassBacking::new(&mut self.fun, self.id, cx.shared_ctx())
+        PassBacking::from_ctx(&mut self.fun, self.id, cx.shared_ctx())
     }
 
     /// The effect buffer (mutate) — passes push a self-rename claim here instead of
@@ -174,7 +174,8 @@ impl<'str> FunctionBody<'str> {
     pub fn read_host<'a>(&'a self, cx: ContextView<'a, 'str>) -> HostRef<'a, 'str> {
         HostRef::Checked {
             fun: &self.fun,
-            shared: cx.shared_ctx(),
+            shared: &cx.shared_ctx().shared,
+            interfaces: &cx.shared_ctx().interfaces,
             id: self.id,
         }
     }
@@ -226,7 +227,8 @@ impl<'str> FunctionBody<'str> {
     ) -> (HostRef<'a, 'str>, PassBacking<'a, 'str>) {
         let own = HostRef::Checked {
             fun: &self.fun,
-            shared: cx.shared_ctx(),
+            shared: &cx.shared_ctx().shared,
+            interfaces: &cx.shared_ctx().interfaces,
             id: self.id,
         };
         let fun = self
@@ -235,7 +237,7 @@ impl<'str> FunctionBody<'str> {
             .find(|(id, _, _)| *id == minted)
             .map(|(_, _, f)| f)
             .expect("host_with_minted: not a function minted by this body");
-        (own, PassBacking::new(fun, minted, cx.shared_ctx()))
+        (own, PassBacking::from_ctx(fun, minted, cx.shared_ctx()))
     }
 
     /// Consume the body at check-in, yielding the reinstallable function, its
@@ -446,7 +448,7 @@ impl<'str> FunctionBody<'str> {
         old_name: Option<&str>,
     ) -> Result<()> {
         self.fun
-            .register_local_name(cx.shared_ctx(), id, name, old_name)
+            .register_local_name(&cx.shared_ctx().shared, id, name, old_name)
     }
 
     // ---- mutable arena accessors --------------------------------------------

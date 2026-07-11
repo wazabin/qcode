@@ -76,8 +76,9 @@ use crate::{
 /// direct impls and the builder is untouched.
 #[doc(hidden)]
 pub trait BuilderBacking<'str> {
-    /// The module's shared data (read) — types, literals, spaces, registers, maps.
-    fn bb_shared(&self) -> &Context<'str>;
+    /// The module's shared IR state (read) — types, literals, spaces, registers,
+    /// maps.
+    fn bb_shr(&self) -> &crate::context::Shared<'str>;
     /// The module's shared data (write), for temp/varnode minting. Only the module
     /// backing (`&mut Context`) provides it; a pass backing panics (mirrors the
     /// checked-out host's runtime guard).
@@ -126,8 +127,8 @@ pub trait BuilderBacking<'str> {
 /// through `Context`'s inherent verbs — the builder no longer needs the `HostMut`
 /// host trait.
 impl<'str> BuilderBacking<'str> for &mut Context<'str> {
-    fn bb_shared(&self) -> &Context<'str> {
-        self
+    fn bb_shr(&self) -> &crate::context::Shared<'str> {
+        &self.shared
     }
     fn bb_shared_mut(&mut self) -> &mut Context<'str> {
         self
@@ -183,13 +184,14 @@ impl<'str> BuilderBacking<'str> for &mut Context<'str> {
 /// `bb_shared_mut` is intentionally left as the defaulted panic — a pass-time
 /// builder holds a frozen shared view and cannot mint temp spaces.
 impl<'str> BuilderBacking<'str> for PassBacking<'_, 'str> {
-    fn bb_shared(&self) -> &Context<'str> {
+    fn bb_shr(&self) -> &crate::context::Shared<'str> {
         self.shared
     }
     fn bb_read_host(&self) -> HostRef<'_, 'str> {
         HostRef::Checked {
             fun: &*self.fun,
             shared: self.shared,
+            interfaces: self.interfaces,
             id: self.id,
         }
     }
@@ -341,7 +343,7 @@ impl<'str, 'ctx, Ctx: BuilderBacking<'str>> Builder<'str, 'ctx, Ctx> {
     /// A `Copy` read view over the builder's backing, for arena reads. Replaces
     /// the former `BaseRef<Ctx, BlockId>` block-ref reads, which required
     /// `Ctx: HostMut`; the builder now reads through the backing's `HostRef`.
-    fn read_host(&self) -> HostRef<'_, 'str> {
+    pub fn read_host(&self) -> HostRef<'_, 'str> {
         self.block.host_ref().bb_read_host()
     }
 
@@ -433,7 +435,8 @@ impl<'str, 'ctx, Ctx: BuilderBacking<'str>> Builder<'str, 'ctx, Ctx> {
         let dst = match value {
             ValueRef::Literal(literal) => {
                 let value = literal.value();
-                self.context().get_const(value, range.len()).into()
+                let id = self.shr().get_const(value, range.len());
+                self.get_value(id)
             }
 
             ValueRef::Varnode(varnode_ref) => {
@@ -446,7 +449,7 @@ impl<'str, 'ctx, Ctx: BuilderBacking<'str>> Builder<'str, 'ctx, Ctx> {
 
                 let id = Varnode::make(self.context_mut(), base, range.len(), space).id;
 
-                Varnode::from_id(self.context(), id).into()
+                Varnode::from_id(self.shr(), id).into()
             }
 
             ValueRef::Instruction(insn) => {
@@ -520,27 +523,21 @@ impl<'str, 'ctx, Ctx: BuilderBacking<'str>> Builder<'str, 'ctx, Ctx> {
         self.block.host_mut().bb_shared_mut()
     }
 
-    pub fn context(&self) -> &Context<'str> {
-        self.block.host_ref().bb_shared()
+    /// The module's shared IR state (read) — types/literals/spaces/registers.
+    pub fn shr(&self) -> &crate::context::Shared<'str> {
+        self.block.host_ref().bb_shr()
     }
 
     /// Retype an instruction's result as a pointer into `space` (host-routed
     /// mirror of [`InstructionMutRef::set_space`]): the type mint is shared, the
     /// `type_id` write goes to the owning function's arena.
     fn set_insn_space(&mut self, id: InstructionId, space: SpaceId) {
-        if matches!(
-            Space::from_id(self.context(), space).ty,
-            SpaceType::Register
-        ) {
+        if matches!(Space::from_id(self.shr(), space).ty, SpaceType::Register) {
             return;
         }
         let cur_type = self.block.host_mut().bb_instruction_mut(id).type_id;
-        let size = self.context().shared.types.size_of(cur_type);
-        let type_id = self
-            .context()
-            .shared
-            .types
-            .get_or_make_space_address(size, space);
+        let size = self.shr().types.size_of(cur_type);
+        let type_id = self.shr().types.get_or_make_space_address(size, space);
         self.block.host_mut().bb_instruction_mut(id).type_id = type_id;
     }
 
@@ -565,7 +562,7 @@ impl<'str, 'ctx, Ctx: BuilderBacking<'str>> Builder<'str, 'ctx, Ctx> {
     /// Panics if the block is already terminated (ends with a branch/call/return).
     #[track_caller]
     fn push_instruction(&mut self, mnemonic: Mnemonic, size: usize) -> InstructionRef<'str, '_> {
-        let type_id = self.context().shared.types.get_or_make_int(size);
+        let type_id = self.shr().types.get_or_make_int(size);
         self.push_instruction_with_type(mnemonic, type_id)
     }
 
@@ -591,7 +588,7 @@ impl<'str, 'ctx, Ctx: BuilderBacking<'str>> Builder<'str, 'ctx, Ctx> {
         size: usize,
         _space: Option<SpaceId>,
     ) -> InstructionRef<'str, '_> {
-        let type_id = self.context().shared.types.get_or_make_int(size);
+        let type_id = self.shr().types.get_or_make_int(size);
         self.push_instruction_with_type(mnemonic, type_id)
     }
 
@@ -648,7 +645,7 @@ impl<'str, 'ctx, Ctx: BuilderBacking<'str>> Builder<'str, 'ctx, Ctx> {
         match id {
             ValueId::Instruction(iid) => self.read_host().instruction(iid).type_id,
             ValueId::BlockParam(pid) => self.read_host().block_param(pid).type_id,
-            other => self.context().type_of(other),
+            other => self.read_host().type_of(other),
         }
     }
 
@@ -657,7 +654,7 @@ impl<'str, 'ctx, Ctx: BuilderBacking<'str>> Builder<'str, 'ctx, Ctx> {
         match id {
             ValueId::Instruction(iid) => Some(self.read_host().instruction(iid).type_id),
             ValueId::BlockParam(pid) => Some(self.read_host().block_param(pid).type_id),
-            other => self.context().stored_type_of(other),
+            other => self.read_host().stored_type_of(other),
         }
     }
 
@@ -685,12 +682,12 @@ impl<'str, 'ctx, Ctx: BuilderBacking<'str>> Builder<'str, 'ctx, Ctx> {
         let ValueId::Literal(lit_id) = id else {
             return id;
         };
-        let literal = self.context().shared.values.literals[lit_id].clone();
-        let current_size = self.context().shared.types.size_of(literal.type_id);
+        let literal = self.shr().values.literals[lit_id].clone();
+        let current_size = self.shr().types.size_of(literal.type_id);
         if current_size == size || literal.symbolic.is_some() {
             return id;
         }
-        self.context().get_const(literal.value, size).id()
+        self.shr().get_const(literal.value, size)
     }
 
     pub fn get_or_make_local_label(&mut self, name: Cow<'str, str>) -> BlockId {
@@ -740,7 +737,7 @@ impl<'str, 'ctx, Ctx: BuilderBacking<'str>> Builder<'str, 'ctx, Ctx> {
                     .id();
 
                 // If the varnode has a name, give the temp a related name for easier debugging
-                if let Some(name) = Varnode::from_id(self.context(), node_id).name() {
+                if let Some(name) = Varnode::from_id(self.shr(), node_id).name() {
                     let lowered = name.to_lowercase();
                     let func = self.block.id.func;
                     let name = self.context_mut().get_unique_name_in(func, lowered.into());
@@ -784,7 +781,8 @@ impl<'str, 'ctx, Ctx: BuilderBacking<'str>> Builder<'str, 'ctx, Ctx> {
             match src {
                 ValueRef::Literal(lit) => {
                     let value = lit.value();
-                    self.context().get_const(value, size).into()
+                    let id = self.shr().get_const(value, size);
+                    self.get_value(id)
                 }
 
                 _ => panic!("Expected literal value for CONST space load"),
@@ -796,7 +794,7 @@ impl<'str, 'ctx, Ctx: BuilderBacking<'str>> Builder<'str, 'ctx, Ctx> {
 
             match src {
                 ValueId::Varnode(id) => {
-                    let varnode = Varnode::from_id(self.context(), id);
+                    let varnode = Varnode::from_id(self.shr(), id);
                     if varnode.space().id != space {
                         panic!(
                             "push_load: ptr is a varnode but its space {:?} does not match the load space {:?}; \
@@ -841,10 +839,10 @@ impl<'str, 'ctx, Ctx: BuilderBacking<'str>> Builder<'str, 'ctx, Ctx> {
     pub fn push_bool_not(&mut self, src: ValueId) -> InstructionRef<'str, '_> {
         debug_assert!(
             self.stored_type_of(src)
-                .is_some_and(|t| self.context().shared.types.is_bool(t)),
+                .is_some_and(|t| self.shr().types.is_bool(t)),
             "push_bool_not: operand must be bool-typed"
         );
-        let f = self.context().get_bool_const(false).id();
+        let f = self.shr().get_bool_const(false);
         self.push_binop(Binop::Int(IntBinop::Equal), src, f, Some(1))
     }
 
@@ -898,17 +896,14 @@ impl<'str, 'ctx, Ctx: BuilderBacking<'str>> Builder<'str, 'ctx, Ctx> {
         let result_type = {
             let lhs_type = self.type_of(lhs);
             let rhs_type = self.type_of(rhs);
-            self.context()
-                .shared
-                .types
-                .binop_result(lhs_type, op, rhs_type)
+            self.shr().types.binop_result(lhs_type, op, rhs_type)
         };
 
         // Comparisons always override the result size to 1.
         let result_type = if let Some(forced_size) = size {
-            let current_size = self.context().shared.types.size_of(result_type);
+            let current_size = self.shr().types.size_of(result_type);
             if forced_size != current_size {
-                self.context().shared.types.get_or_make_int(forced_size)
+                self.shr().types.get_or_make_int(forced_size)
             } else {
                 result_type
             }
@@ -921,21 +916,15 @@ impl<'str, 'ctx, Ctx: BuilderBacking<'str>> Builder<'str, 'ctx, Ctx> {
         // from a stack-base operand), `Add`/`Sub` inherit the space of whichever
         // operand carries one — so `&A + k` points into `A`'s space. Register
         // spaces are excluded (pointer arithmetic is not allowed there).
-        let result_type = if self.context().shared.types.space_of(result_type).is_none()
+        let result_type = if self.shr().types.space_of(result_type).is_none()
             && matches!(op, Binop::Int(IntBinop::Add | IntBinop::Sub))
         {
             match self.merge_space_ids(lhs, rhs) {
                 Some(space)
-                    if !matches!(
-                        Space::from_id(self.context(), space).ty,
-                        SpaceType::Register
-                    ) =>
+                    if !matches!(Space::from_id(self.shr(), space).ty, SpaceType::Register) =>
                 {
-                    let size = self.context().shared.types.size_of(result_type);
-                    self.context()
-                        .shared
-                        .types
-                        .get_or_make_space_address(size, space)
+                    let size = self.shr().types.size_of(result_type);
+                    self.shr().types.get_or_make_space_address(size, space)
                 }
                 _ => result_type,
             }
@@ -1073,7 +1062,7 @@ impl<'str, 'ctx, Ctx: BuilderBacking<'str>> Builder<'str, 'ctx, Ctx> {
     fn both_bool(&self, lhs: ValueId, rhs: ValueId) -> bool {
         let is_bool = |v: ValueId| {
             self.stored_type_of(v)
-                .is_some_and(|t| self.context().shared.types.is_bool(t))
+                .is_some_and(|t| self.shr().types.is_bool(t))
         };
         is_bool(lhs) && is_bool(rhs)
     }
@@ -1173,8 +1162,7 @@ impl<'str, 'ctx, Ctx: BuilderBacking<'str>> Builder<'str, 'ctx, Ctx> {
             .map(|((name, _), type_id)| AggregateField::new(name.clone(), type_id))
             .collect();
         let ty = self
-            .context()
-            .shared
+            .shr()
             .types
             .get_or_make_named_aggregate(aggregate_fields);
         let values = fields.into_iter().map(|(_, value)| value).collect();
@@ -1186,8 +1174,7 @@ impl<'str, 'ctx, Ctx: BuilderBacking<'str>> Builder<'str, 'ctx, Ctx> {
     pub fn push_extract(&mut self, agg: ValueId, index: usize) -> InstructionRef<'str, '_> {
         let agg_ty = self.type_of(agg);
         let ty = self
-            .context()
-            .shared
+            .shr()
             .types
             .field_type(agg_ty, index)
             .expect("push_extract: agg is not an aggregate with that field index");
@@ -1215,14 +1202,12 @@ impl<'str, 'ctx, Ctx: BuilderBacking<'str>> Builder<'str, 'ctx, Ctx> {
         let src_ty = self.type_of(src);
         // `map` preserves the source's sequence kind: an array maps to an array,
         // a list (e.g. `take_while`'s result) maps to a list of the same bound.
-        let seq = self.context().shared.types.seq_of(src_ty);
+        let seq = self.shr().types.seq_of(src_ty);
         let ret_ty = self.map_body_return_type(body);
         let ty = match (seq, ret_ty) {
-            (Some((_, len, is_list)), Some(rt)) => self
-                .context()
-                .shared
-                .types
-                .get_or_make_seq(rt, len, is_list),
+            (Some((_, len, is_list)), Some(rt)) => {
+                self.shr().types.get_or_make_seq(rt, len, is_list)
+            }
             _ => src_ty,
         };
         self.push_instruction_with_type(
@@ -1256,14 +1241,12 @@ impl<'str, 'ctx, Ctx: BuilderBacking<'str>> Builder<'str, 'ctx, Ctx> {
         let src_ty = self.type_of(src);
         // Like `map`, a scan preserves the source's sequence kind and takes its
         // element type from the body's return type (the accumulator type).
-        let seq = self.context().shared.types.seq_of(src_ty);
+        let seq = self.shr().types.seq_of(src_ty);
         let ret_ty = self.map_body_return_type(body);
         let ty = match (seq, ret_ty) {
-            (Some((_, len, is_list)), Some(rt)) => self
-                .context()
-                .shared
-                .types
-                .get_or_make_seq(rt, len, is_list),
+            (Some((_, len, is_list)), Some(rt)) => {
+                self.shr().types.get_or_make_seq(rt, len, is_list)
+            }
             _ => src_ty,
         };
         self.push_instruction_with_type(
@@ -1288,7 +1271,7 @@ impl<'str, 'ctx, Ctx: BuilderBacking<'str>> Builder<'str, 'ctx, Ctx> {
         let ty = self.lambda_return_type(target).unwrap_or_else(|| {
             args.first()
                 .map(|&arg| self.type_of(arg))
-                .unwrap_or_else(|| self.context().shared.types.get_or_make_int(0))
+                .unwrap_or_else(|| self.shr().types.get_or_make_int(0))
         });
         self.push_instruction_with_type(Mnemonic::Apply(Apply { target, args }), ty)
     }
@@ -1296,8 +1279,14 @@ impl<'str, 'ctx, Ctx: BuilderBacking<'str>> Builder<'str, 'ctx, Ctx> {
     /// The type of the value returned by `body`'s first `Return`, or `None` if
     /// `body` has no root or returns nothing — used to size a [`push_map`] result.
     fn map_body_return_type(&self, body: FunctionId) -> Option<TypeId> {
-        let root = Function::from_id(self.context(), body).root()?.id;
-        BasicBlock::from_id(self.context(), root)
+        // On a checked-out (pass) builder the target body is a reserved sentinel
+        // slot (empty) today, so no return type is recoverable — identical to the
+        // pre-narrowing behavior of reading the empty registry slot.
+        let HostRef::Module(ctx) = self.read_host() else {
+            return None;
+        };
+        let root = Function::from_id(ctx, body).root()?.id;
+        BasicBlock::from_id(ctx, root)
             .iter()
             .find_map(|i| match i.mnemonic() {
                 Mnemonic::Return(r) => r.value.and_then(|v| self.stored_type_of(v)),
@@ -1307,7 +1296,11 @@ impl<'str, 'ctx, Ctx: BuilderBacking<'str>> Builder<'str, 'ctx, Ctx> {
 
     /// The type of the first value returned by a lambda body.
     fn lambda_return_type(&self, body: FunctionId) -> Option<TypeId> {
-        Function::from_id(self.context(), body)
+        // See `map_body_return_type` on the checked-out fallback.
+        let HostRef::Module(ctx) = self.read_host() else {
+            return None;
+        };
+        Function::from_id(ctx, body)
             .iter()
             .flat_map(|block| block.iter())
             .find_map(|i| match i.mnemonic() {
@@ -1323,7 +1316,7 @@ impl<'str, 'ctx, Ctx: BuilderBacking<'str>> Builder<'str, 'ctx, Ctx> {
     /// (same width as `base`) to that field's type. Panics otherwise.
     pub fn push_gep(&mut self, base: ValueId, offset: usize) -> InstructionRef<'str, '_> {
         let base_ty = self.type_of(base);
-        let types = &self.context().shared.types;
+        let types = &self.shr().types;
         let ptr_width = types.size_of(base_ty);
         let pointee = types
             .pointee_of(base_ty)
@@ -1333,8 +1326,7 @@ impl<'str, 'ctx, Ctx: BuilderBacking<'str>> Builder<'str, 'ctx, Ctx> {
             .map(|(_, field)| field.type_id)
             .expect("push_gep: no field at that offset in the pointee struct");
         let ty = self
-            .context()
-            .shared
+            .shr()
             .types
             .get_or_make_struct_pointer(ptr_width, field_ty);
         self.push_instruction_with_type(Mnemonic::Gep(Gep { base, offset }), ty)
@@ -1345,7 +1337,7 @@ impl<'str, 'ctx, Ctx: BuilderBacking<'str>> Builder<'str, 'ctx, Ctx> {
     /// `base` is not a struct pointer or has no field of that name.
     pub fn push_gep_field(&mut self, base: ValueId, name: &str) -> InstructionRef<'str, '_> {
         let base_ty = self.type_of(base);
-        let types = &self.context().shared.types;
+        let types = &self.shr().types;
         let pointee = types
             .pointee_of(base_ty)
             .expect("push_gep_field: base is not a struct pointer");
@@ -1444,7 +1436,7 @@ impl<'str, 'ctx, Ctx: BuilderBacking<'str>> Builder<'str, 'ctx, Ctx> {
             .iter()
             .map(|&arg| self.type_of(arg))
             .collect::<Vec<_>>();
-        let type_id = desc.result_type(&self.context().shared.types, &arg_types);
+        let type_id = desc.result_type(&self.shr().types, &arg_types);
 
         self.push_instruction_with_type(Mnemonic::Intrinsic(IntrinsicApp { id, args }), type_id)
     }
@@ -1457,7 +1449,7 @@ impl<'str, 'ctx, Ctx: BuilderBacking<'str>> Builder<'str, 'ctx, Ctx> {
     /// If `src` is a varnode, we need to read from it first, then write to dst
     /// For values wider than 64 bits (e.g. XMM/YMM/ZMM registers), emits one store per 64-bit lane.
     pub fn push_copy(&mut self, src: ValueId, dst: VarnodeId) -> InstructionRef<'str, '_> {
-        let node = Varnode::from_id(self.context(), dst);
+        let node = Varnode::from_id(self.shr(), dst);
         let size = node.size();
         let space = node.space().id;
 
@@ -1495,7 +1487,7 @@ impl<'str, 'ctx, Ctx: BuilderBacking<'str>> Builder<'str, 'ctx, Ctx> {
                     )
                     .id;
 
-                if let Some(name) = Varnode::from_id(self.context(), dst).name() {
+                if let Some(name) = Varnode::from_id(self.shr(), dst).name() {
                     let name = Cow::Owned(format!("{}_lane{lane}", name.to_lowercase()));
                     let _ = self.rename_insn(id, name);
                 }
@@ -1503,7 +1495,7 @@ impl<'str, 'ctx, Ctx: BuilderBacking<'str>> Builder<'str, 'ctx, Ctx> {
                 first_id.get_or_insert(id);
             }
 
-            self.context().get_insn(first_id.unwrap())
+            InstructionRef::new(self.read_host(), first_id.unwrap())
         } else {
             let src = self.ensure_local(src);
             // If dst is a varnode, we need to emit a store from src to dst
@@ -1521,7 +1513,7 @@ impl<'str, 'ctx, Ctx: BuilderBacking<'str>> Builder<'str, 'ctx, Ctx> {
                 .id;
 
             // Add a name hint for the store instruction for easier debugging
-            if let Some(name) = Varnode::from_id(self.context(), dst).name() {
+            if let Some(name) = Varnode::from_id(self.shr(), dst).name() {
                 let lowered = name.to_lowercase();
                 let func = self.block.id.func;
                 let name = self
@@ -1534,7 +1526,7 @@ impl<'str, 'ctx, Ctx: BuilderBacking<'str>> Builder<'str, 'ctx, Ctx> {
                     .expect("This name was deduplicated");
             }
 
-            self.context().get_insn(id)
+            InstructionRef::new(self.read_host(), id)
         }
     }
 
@@ -1550,7 +1542,7 @@ impl<'str, 'ctx, Ctx: BuilderBacking<'str>> Builder<'str, 'ctx, Ctx> {
 
         match ptr {
             ValueId::Varnode(id) => {
-                let varnode = Varnode::from_id(self.context(), id);
+                let varnode = Varnode::from_id(self.shr(), id);
                 if varnode.space().id != space {
                     panic!(
                         "push_store: ptr is a varnode but its space {:?} does not match the store space {:?}; \
@@ -1601,7 +1593,7 @@ impl<'str, 'ctx, Ctx: BuilderBacking<'str>> Builder<'str, 'ctx, Ctx> {
             .push_instruction(Mnemonic::Branch(Branch { target, args }), 0)
             .id;
         self.is_terminated = true;
-        self.context().get_insn(id)
+        InstructionRef::new(self.read_host(), id)
     }
 
     pub fn push_cbranch(
@@ -1642,7 +1634,7 @@ impl<'str, 'ctx, Ctx: BuilderBacking<'str>> Builder<'str, 'ctx, Ctx> {
             )
             .id;
         self.is_terminated = true;
-        self.context().get_insn(id)
+        InstructionRef::new(self.read_host(), id)
     }
 
     pub fn push_branchind(&mut self, ptr: ValueId) -> InstructionRef<'str, '_> {
@@ -1650,7 +1642,7 @@ impl<'str, 'ctx, Ctx: BuilderBacking<'str>> Builder<'str, 'ctx, Ctx> {
             .push_instruction(Mnemonic::BranchInd(BranchInd { ptr }), 0)
             .id;
         self.is_terminated = true;
-        self.context().get_insn(id)
+        InstructionRef::new(self.read_host(), id)
     }
 
     pub fn push_call(&mut self, target: FunctionId) -> InstructionRef<'str, '_> {
@@ -1673,7 +1665,7 @@ impl<'str, 'ctx, Ctx: BuilderBacking<'str>> Builder<'str, 'ctx, Ctx> {
             )
             .id;
         self.is_terminated = true;
-        self.context().get_insn(id)
+        InstructionRef::new(self.read_host(), id)
     }
 
     /// Tail call to another function's entry — a function-level terminator with
@@ -1693,7 +1685,7 @@ impl<'str, 'ctx, Ctx: BuilderBacking<'str>> Builder<'str, 'ctx, Ctx> {
             .push_instruction(Mnemonic::TailCall(TailCall { target, args }), 0)
             .id;
         self.is_terminated = true;
-        self.context().get_insn(id)
+        InstructionRef::new(self.read_host(), id)
     }
 
     pub fn push_call_ind(&mut self, ptr: ValueId) -> InstructionRef<'str, '_> {
@@ -1709,7 +1701,7 @@ impl<'str, 'ctx, Ctx: BuilderBacking<'str>> Builder<'str, 'ctx, Ctx> {
             .push_instruction(Mnemonic::CallInd(CallInd { ptr, args }), 0)
             .id;
         self.is_terminated = true;
-        self.context().get_insn(id)
+        InstructionRef::new(self.read_host(), id)
     }
 
     pub fn push_return(&mut self, ptr: ValueId) -> InstructionRef<'str, '_> {
@@ -1729,7 +1721,7 @@ impl<'str, 'ctx, Ctx: BuilderBacking<'str>> Builder<'str, 'ctx, Ctx> {
             .push_instruction(Mnemonic::Return(Return { ptr, value }), 0)
             .id;
         self.is_terminated = true;
-        self.context().get_insn(id)
+        InstructionRef::new(self.read_host(), id)
     }
 
     pub fn push_return_value(&mut self, value: ValueId) -> InstructionRef<'str, '_> {
@@ -1737,7 +1729,7 @@ impl<'str, 'ctx, Ctx: BuilderBacking<'str>> Builder<'str, 'ctx, Ctx> {
             .push_instruction(Mnemonic::ReturnValue(ReturnValue { value }), 0)
             .id;
         self.is_terminated = true;
-        self.context().get_insn(id)
+        InstructionRef::new(self.read_host(), id)
     }
 
     // --- Assert ---
@@ -1753,6 +1745,13 @@ impl<'str, 'ctx, Ctx: BuilderBacking<'str>> Builder<'str, 'ctx, Ctx> {
 /// sense over a `&mut Context`. A checked-out builder appends into an existing
 /// owned block and mints owned blocks via [`Builder::get_or_make_local_label`].
 impl<'str, 'ctx> Builder<'str, 'ctx, &'ctx mut Context<'str>> {
+    /// The whole module `&Context` — module-builder-only (the lifter / lowering
+    /// path); the pass builder reads shared state via [`Builder::shr`] and its
+    /// own arenas via the read host.
+    pub fn context(&self) -> &Context<'str> {
+        self.block.host_ref()
+    }
+
     /// Creates a builder positioned at the block for machine `address`, creating
     /// the block (and an anonymous host function if nothing is mapped) if needed.
     pub fn from_context<'m>(ctx: &'m mut Context<'str>, address: u64) -> Builder<'str, 'm> {
@@ -1856,8 +1855,8 @@ mod tests {
         // branch to a freshly minted local-label block. No varnode/temp-space
         // minting — a checked-out host has read-only shared access.
         fn body<'str, 'ctx, Ctx: BuilderBacking<'str>>(b: &mut Builder<'str, 'ctx, Ctx>) {
-            let c1 = b.context().get_const(7, 8).id();
-            let c2 = b.context().get_const(9, 8).id();
+            let c1 = b.shr().get_const(7, 8);
+            let c2 = b.shr().get_const(9, 8);
             let sum = b.push_add(c1, c2).id();
             let _doubled = b.push_add(sum, sum).id();
             let lbl = b.get_or_make_local_label("next".into());
@@ -1911,7 +1910,7 @@ mod tests {
         let entry_b = Function::from_id_mut(&mut ctx_b, fid_b).make_root().id;
         let mut fun = ctx_b.checkout_function(fid_b);
         {
-            let mut host = PassBacking::new(&mut fun, fid_b, &ctx_b);
+            let mut host = PassBacking::from_ctx(&mut fun, fid_b, &ctx_b);
             let mut b = Builder::from_block(BaseRef::new(host.reborrow(), entry_b));
             body(&mut b);
         }

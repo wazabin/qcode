@@ -39,18 +39,32 @@ use super::base_ref::HostRef;
 pub struct PassBacking<'a, 'str> {
     pub fun: &'a mut Function<'str>,
     pub id: FunctionId,
-    /// The rest of the module, **read-only**. A checked-out function pass reaches
-    /// shared data (types, literals, spaces, registers, other functions'
-    /// interface) immutably; it mints types/literals through the interners'
-    /// `&self` paths, and mints no varnodes/temp-spaces (only the V1 argpromote
-    /// pass does, and it runs on the module path).
-    pub shared: &'a Context<'str>,
+    /// The module's shared IR state, **read-only**. A checked-out function pass
+    /// reaches shared data (types, literals, spaces, registers) immutably; it
+    /// mints types/literals through the interners' `&self` paths, and mints no
+    /// varnodes/temp-spaces (only the V1 argpromote pass does, and it runs on
+    /// the module path). Holds **no** `&Context` — bodies are out of reach by
+    /// construction (context-split stage 5b-ii Pin B).
+    pub shared: &'a crate::context::Shared<'str>,
+    /// Every function's published interface (never checked out): the
+    /// caller-reasoning surface a pass may consult about its callees.
+    pub interfaces:
+        &'a jstd::registry::Registry<FunctionId, crate::value::function::FunctionInterface<'str>>,
 }
 
 impl<'a, 'str> PassBacking<'a, 'str> {
-    /// Wrap `fun` (checked out of `shared` under `id`). Debug-asserts the function
-    /// owns only self-stored, self-parented blocks (no reattribution).
-    pub fn new(fun: &'a mut Function<'str>, id: FunctionId, shared: &'a Context<'str>) -> Self {
+    /// Wrap `fun` (checked out under `id`) over the module's shared state and
+    /// interface registry. Debug-asserts the function owns only self-stored,
+    /// self-parented blocks (no reattribution).
+    pub fn new(
+        fun: &'a mut Function<'str>,
+        id: FunctionId,
+        shared: &'a crate::context::Shared<'str>,
+        interfaces: &'a jstd::registry::Registry<
+            FunctionId,
+            crate::value::function::FunctionInterface<'str>,
+        >,
+    ) -> Self {
         debug_assert!(
             fun.roster.iter().all(|b| {
                 // Stored in this function's own arena, and (if live) parented to it.
@@ -61,7 +75,19 @@ impl<'a, 'str> PassBacking<'a, 'str> {
             }),
             "PassBacking requires a function with no reattributed blocks"
         );
-        Self { fun, id, shared }
+        Self {
+            fun,
+            id,
+            shared,
+            interfaces,
+        }
+    }
+
+    /// Wrap `fun` (checked out under `id`) over a whole module `&Context` — the
+    /// module/test-scope convenience constructor (narrows to the shared state +
+    /// interface registry).
+    pub fn from_ctx(fun: &'a mut Function<'str>, id: FunctionId, ctx: &'a Context<'str>) -> Self {
+        Self::new(fun, id, &ctx.shared, &ctx.interfaces)
     }
 
     /// A shorter-lived `PassBacking` reborrowing this one's exclusive references, so
@@ -72,6 +98,7 @@ impl<'a, 'str> PassBacking<'a, 'str> {
             fun: &mut *self.fun,
             id: self.id,
             shared: self.shared,
+            interfaces: self.interfaces,
         }
     }
 }
@@ -100,22 +127,18 @@ impl<'a, 'str> PassBacking<'a, 'str> {
         );
         self.fun
     }
-    /// The module's shared data (read).
-    pub fn shared(&self) -> &Context<'str> {
-        self.shared
-    }
-    /// The module's shared IR state ([`Shared`]) — the narrowed twin of
-    /// [`shared`](Self::shared), for the context-split narrowing (item #1).
+    /// The module's shared IR state ([`Shared`]) (read).
     ///
     /// [`Shared`]: crate::context::Shared
     pub fn shr(&self) -> &crate::context::Shared<'str> {
-        &self.shared.shared
+        self.shared
     }
     /// A `Copy` read view over this host, for the mutation refs' read methods.
     pub fn read_host(&self) -> HostRef<'_, 'str> {
         HostRef::Checked {
             fun: &*self.fun,
             shared: self.shared,
+            interfaces: self.interfaces,
             id: self.id,
         }
     }
@@ -210,7 +233,7 @@ impl<'a, 'str> PassBacking<'a, 'str> {
         mnemonic: Mnemonic,
         size: usize,
     ) -> InstructionId {
-        let type_id = self.shared().shared.types.get_or_make_int(size);
+        let type_id = self.shr().types.get_or_make_int(size);
         let insn = Instruction::new(type_id, mnemonic);
         self.push_insn(func, insn)
     }
@@ -486,7 +509,7 @@ impl<'a, 'str> PassBacking<'a, 'str> {
     ) -> Result<()> {
         let existing = match id.name_scope_function() {
             Some(func) => self.function(func).names.get(&name),
-            None => self.shared().get_named(&name),
+            None => self.shr().get_named(&name),
         };
         if let Some(existing) = existing {
             return if existing == id {

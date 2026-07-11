@@ -899,7 +899,7 @@ mod tests {
 
         // (c) F is now checkout-safe: `PassBacking::new`'s debug-assert holds.
         let mut fun = ctx.checkout_function(f);
-        let _co = PassBacking::new(&mut fun, f, &ctx);
+        let _co = PassBacking::from_ctx(&mut fun, f, &ctx);
         drop(_co);
         ctx.checkin_function(f, fun);
     }

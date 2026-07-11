@@ -88,7 +88,18 @@ fn thunk_target(host: HostRef, fun_id: FunctionId) -> Option<FunctionId> {
         // `TailCall` carrying the callee's id directly.
         Mnemonic::TailCall(tc) => tc.target,
         // A raw `jmp realfunc` not yet rewritten by `split_overlapping_functions`.
-        Mnemonic::Branch(Branch { target, .. }) => BlockRef::new(host, *target).function()?.id,
+        Mnemonic::Branch(Branch { target, .. }) => match host {
+            // Module scope sees every arena: read the target block's parent.
+            HostRef::Module(_) => BlockRef::new(host, *target).function()?.id,
+            // A checked-out host cannot read a foreign block's arena (context-split
+            // Pin B). The driver normalizes cross-function references away before
+            // every function stage (`split_overlapping_functions`), and strict
+            // locality parents a block to its storing function — so the id's
+            // owning-function qualifier *is* the callee when this arm is reached
+            // (unit-test adapter path).
+            HostRef::Checked { .. } if target.func != fun_id => target.func,
+            HostRef::Checked { .. } => BlockRef::new(host, *target).function()?.id,
+        },
         _ => return None,
     };
     (callee != fun_id).then_some(callee)
