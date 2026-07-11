@@ -222,7 +222,7 @@ fn apply<'str>(body: &mut FunctionBody<'str>, cx: ContextView<'_, 'str>, m: &Rea
     // checked-out host); this mirrors `at`'s `result_type`.
     let arr_ty = stored_type_of(body.read_host(cx), m.arr);
     let at_ty = arr_ty
-        .and_then(|t| cx.shared_ctx().shared.types.seq_elem_of(t))
+        .and_then(|t| cx.shr().types.seq_elem_of(t))
         .or(arr_ty)
         .expect("seeded array value has a type");
     for (load_id, lane) in &m.loads {

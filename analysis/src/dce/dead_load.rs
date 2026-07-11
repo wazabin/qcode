@@ -2269,10 +2269,10 @@ fn frame_aware_aliases<'a, 'str: 'a>(
     host: HostRef<'a, 'str>,
     fun_id: FunctionId,
 ) -> AliasResult {
-    let ctx = m.shared_ctx();
+    let shared = m.shr();
     let env = m.env();
-    let sp_reg = ctx.shared.registers.get(&env.cfg.stack_pointer).copied();
-    env.alias_base(ctx)
+    let sp_reg = shared.registers.get(&env.cfg.stack_pointer).copied();
+    env.alias_base(shared)
         .for_function(host, fun_id)
         .with_frame_freshness(host, fun_id, sp_reg)
 }

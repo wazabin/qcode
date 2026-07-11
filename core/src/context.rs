@@ -233,6 +233,21 @@ impl<'str> Shared<'str> {
         self.values.truths.get(&prop).copied()
     }
 
+    /// Iterate every varnode as a [`VarnodeRef`]. Shared-only mirror of
+    /// [`Context::varnodes`] (varnodes live in the interners).
+    pub fn varnodes(&self) -> impl Iterator<Item = crate::value::VarnodeRef<'str, '_>> + '_ {
+        self.values
+            .varnodes
+            .iter()
+            .map(move |v| crate::value::Varnode::from_id(self, v.id))
+    }
+
+    /// Number of varnodes. Shared-only mirror of [`Context::varnode_count`];
+    /// append-only, so an unchanged value means an unchanged varnode set.
+    pub fn varnode_count(&self) -> usize {
+        self.values.varnodes.len()
+    }
+
     /// The stored [`TypeId`] of a **shared-leaf** value (literal, bytes, or
     /// varnode-with-override). Shared-only mirror of [`Context::stored_type_of`]:
     /// instruction/block-param/block/function ids live in function bodies and are
@@ -729,11 +744,7 @@ impl<'str> Context<'str> {
     }
 
     pub fn varnodes(&self) -> impl Iterator<Item = VarnodeRef<'str, '_>> + '_ {
-        self.shared
-            .values
-            .varnodes
-            .iter()
-            .map(|v| Varnode::from_id(&self.shared, v.id))
+        self.shared.varnodes()
     }
 
     /// Number of varnodes in the context. The varnode registry is append-only, so
@@ -741,7 +752,7 @@ impl<'str> Context<'str> {
     /// used to validate caches keyed on the register/varnode layout (e.g. the
     /// alias [`RegisterBase`](../../qcode_analysis/alias/struct.RegisterBase.html)).
     pub fn varnode_count(&self) -> usize {
-        self.shared.values.varnodes.len()
+        self.shared.varnode_count()
     }
 
     /// Adds a directed edge in the CFG from `from` to `to`, returning its id.

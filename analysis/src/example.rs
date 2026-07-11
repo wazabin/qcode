@@ -17,7 +17,7 @@ impl FunctionPass for ExamplePass {
         f: &mut FunctionBody<'str>,
         _m: ContextView<'_, 'str>,
     ) -> Result<bool, String> {
-        let _name = _m.shared_ctx().interfaces[f.id()].name.to_string();
+        let _name = _m.interface(f.id()).name.to_string();
 
         // TODO: log!(name)
 

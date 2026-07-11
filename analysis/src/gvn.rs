@@ -259,14 +259,10 @@ fn build_gvn_aliases<'a, 'str: 'a>(
     host: HostRef<'a, 'str>,
     fun_id: FunctionId,
 ) -> AliasResult {
-    let ctx = m.shared_ctx();
-    let sp_reg = ctx
-        .shared
-        .registers
-        .get(&m.env().cfg.stack_pointer)
-        .copied();
+    let shared = m.shr();
+    let sp_reg = shared.registers.get(&m.env().cfg.stack_pointer).copied();
     m.env()
-        .alias_base(ctx)
+        .alias_base(shared)
         .for_function(host, fun_id)
         .with_frame_freshness(host, fun_id, sp_reg)
 }

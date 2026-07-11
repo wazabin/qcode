@@ -66,7 +66,7 @@ pub fn canonicalize_sp_slots_concrete<'a, 'str>(
         return false;
     }
 
-    let ptr_width = Varnode::from_id(cx.shared_ctx(), sp_reg).size();
+    let ptr_width = Varnode::from_id(cx.shr(), sp_reg).size();
     let offsets: BTreeSet<i64> = ptr_offset.values().copied().collect();
 
     // Reuse a prior run's representatives so this pass is idempotent: the first
@@ -233,7 +233,7 @@ impl FunctionPass for CanonicalizeSpSlots {
         f: &mut FunctionBody<'str>,
         cx: ContextView<'_, 'str>,
     ) -> std::result::Result<bool, String> {
-        let sp_reg = cx.shared_ctx().shared.registers[&cx.env().cfg.stack_pointer];
+        let sp_reg = cx.shr().registers[&cx.env().cfg.stack_pointer];
         let fid = f.id();
         Ok(canonicalize_sp_slots_concrete(f, cx, fid, sp_reg))
     }

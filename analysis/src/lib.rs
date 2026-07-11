@@ -88,7 +88,7 @@ pub use lift::{
 
 pub mod pipeline;
 pub use pipeline::{
-    ArchConfig, CallingConvention, ContextView, DEFAULT_PIPELINE_TOML, DecompilePass,
+    ArchConfig, CallingConvention, ContextSplit, ContextView, DEFAULT_PIPELINE_TOML, DecompilePass,
     DynDecompilePass,
     DynFunctionPass, DynPass, Effects,
     FunctionBody, FunctionPass, FunctionPassAdapter, GpReg, LiftOutcome, LiftSummary, Pass,

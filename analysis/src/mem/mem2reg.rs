@@ -4863,7 +4863,7 @@ impl FunctionPass for Mem2RegPass {
         m: ContextView<'_, 'str>,
     ) -> Result<bool, String> {
         let fun_id = f.id();
-        let ctx = m.shared_ctx();
+        let shared = m.shr();
         let env = m.env();
 
         // Per-function pass: scope the alias oracle to this function so the stage
@@ -4878,11 +4878,11 @@ impl FunctionPass for Mem2RegPass {
         // The alias oracle and `@SP` resolution both read this function's body, so
         // they go through the checked-out read host; the shared `RegisterBase` still
         // keys off the module context.
-        let sp_reg = ctx.shared.registers[&env.cfg.stack_pointer];
+        let sp_reg = shared.registers[&env.cfg.stack_pointer];
         let (aliases, sp_param) = {
             let host = f.host(m);
             let read = host.read_host();
-            let aliases = env.alias_base(ctx).for_function(read, fun_id);
+            let aliases = env.alias_base(shared).for_function(read, fun_id);
             // Resolve `@SP` so canonical `@SP ± N` slots are recognised; `None` when
             // the function has no incoming stack-pointer param (legacy literal path).
             let sp_param = incoming_sp_param(read, fun_id, sp_reg);

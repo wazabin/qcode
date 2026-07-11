@@ -382,8 +382,8 @@ fn outline_core<'str>(
             })
             .collect()
     };
-    let dummy_ptr = m.shared_ctx().get_const(0, 8).id();
-    let ret_ty = m.shared_ctx().shared.types.get_or_make_int(1);
+    let dummy_ptr = m.shr().get_const(0, 8);
+    let ret_ty = m.shr().types.get_or_make_int(1);
 
     let (own, mut minted) = body.host_with_minted(m, fid);
     // Root block, set as the minted function's entry, named for display (block

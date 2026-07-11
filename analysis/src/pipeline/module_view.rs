@@ -15,8 +15,9 @@
 
 use std::borrow::Cow;
 
+use jstd::registry::Registry;
 use qcode::{
-    context::Context,
+    context::{Context, Shared},
     error::Result,
     types::TypeId,
     value::{
@@ -60,26 +61,31 @@ impl<'str> Effects<'str> {
 /// summaries) — but **not** other functions' in-flight bodies (except the
 /// pure-bodies view, which is stage-invariant; added with the gvn port).
 ///
-/// v1 wraps `&Context` and `&PipelineEnv`. Because the driver checks the pass's
-/// own function *out* of the context before building the view, reading the
-/// context here never aliases the `&mut FunctionBody` the pass also holds.
-///
-/// This is the target `ContextView` of the context-split migration (stage 5b):
-/// morally a bodies-free view of the module (arch, interners, interfaces, env),
-/// transitionally still wrapping a whole `&Context` until the `split()` reshape
-/// (5b-ii) narrows it to `&Shared`. It is `Copy` (it holds only shared
-/// references), so a worker hands the same view to every helper and sub-ref.
+/// The **bodies-free** module view of the context-split design (stage 5b-ii):
+/// `{shared, interfaces, env}`. A function pass structurally cannot read another
+/// function's body through it — holding a `ContextView` is the proof that
+/// regimes 1–3 are frozen while workers hold disjoint `&mut` bodies. It is
+/// `Copy` (it holds only shared references), so a worker hands the same view to
+/// every helper and sub-ref.
 #[derive(Clone, Copy)]
 pub struct ContextView<'ctx, 'str> {
-    ctx: &'ctx Context<'str>,
+    shared: &'ctx Shared<'str>,
+    interfaces: &'ctx Registry<FunctionId, FunctionInterface<'str>>,
     env: &'ctx PipelineEnv,
 }
 
 impl<'ctx, 'str> ContextView<'ctx, 'str> {
-    /// Build a view over `ctx` (with the pass's own function checked out) and the
-    /// pipeline environment.
+    /// Build a view over `ctx`'s shared state + interfaces and the pipeline
+    /// environment. Takes the whole `&Context` for caller convenience (the
+    /// checkout driver) and narrows; [`Context`]'s bodies are NOT captured —
+    /// prefer [`split`](ContextSplit::split), which proves that with a
+    /// simultaneous `&mut` bodies borrow.
     pub fn new(ctx: &'ctx Context<'str>, env: &'ctx PipelineEnv) -> Self {
-        Self { ctx, env }
+        Self {
+            shared: &ctx.shared,
+            interfaces: &ctx.interfaces,
+            env,
+        }
     }
 
     /// The pipeline environment (register layout, ABI, OS, bitness, stack
@@ -92,16 +98,52 @@ impl<'ctx, 'str> ContextView<'ctx, 'str> {
     /// clobber/write summaries) — the caller-reasoning surface. Interfaces are
     /// never checked out, so this always reads the shared registry.
     pub fn interface(&self, f: FunctionId) -> &'ctx FunctionInterface<'str> {
-        &self.ctx.interfaces[f]
+        &self.interfaces[f]
     }
 
-    /// The underlying whole `&Context` — the transitional escape hatch for the
-    /// read-only module queries a pass makes (interners, registers, spaces,
-    /// memory image, other functions' published interface, truths) that do not
-    /// yet have a narrowed accessor. Narrowed to `&Shared` in stage 5b-ii; every
-    /// caller that still needs the whole context is a migration TODO.
-    pub fn shared_ctx(&self) -> &'ctx Context<'str> {
-        self.ctx
+    /// The module's shared IR state (interners, spaces, registers, name/address
+    /// maps, memory image, truths).
+    pub fn shr(&self) -> &'ctx Shared<'str> {
+        self.shared
+    }
+
+    /// The whole interface registry (for building a [`PassBacking`]/[`HostRef`]).
+    pub fn interfaces(&self) -> &'ctx Registry<FunctionId, FunctionInterface<'str>> {
+        self.interfaces
+    }
+}
+
+/// The driver-side disjoint borrow of the context-split design (00-overview):
+/// `&mut bodies` alongside a frozen, bodies-free [`ContextView`]. Rust's
+/// disjoint-field borrows prove the safety — no `unsafe`, no relocation.
+pub trait ContextSplit<'str> {
+    /// Split into the mutable bodies registry and the read-only module view.
+    /// `env` is threaded as an argument so `Context` stays env-free.
+    fn split<'a>(
+        &'a mut self,
+        env: &'a PipelineEnv,
+    ) -> (
+        &'a mut Registry<FunctionId, Function<'str>>,
+        ContextView<'a, 'str>,
+    );
+}
+
+impl<'str> ContextSplit<'str> for Context<'str> {
+    fn split<'a>(
+        &'a mut self,
+        env: &'a PipelineEnv,
+    ) -> (
+        &'a mut Registry<FunctionId, Function<'str>>,
+        ContextView<'a, 'str>,
+    ) {
+        (
+            &mut self.bodies,
+            ContextView {
+                shared: &self.shared,
+                interfaces: &self.interfaces,
+                env,
+            },
+        )
     }
 }
 
@@ -159,7 +201,7 @@ impl<'str> FunctionBody<'str> {
     ///
     /// [`HostMut`]: qcode::value::util::host_mut::HostMut
     pub fn host<'a>(&'a mut self, cx: ContextView<'a, 'str>) -> PassBacking<'a, 'str> {
-        PassBacking::from_ctx(&mut self.fun, self.id, cx.shared_ctx())
+        PassBacking::new(&mut self.fun, self.id, cx.shr(), cx.interfaces())
     }
 
     /// The effect buffer (mutate) — passes push a self-rename claim here instead of
@@ -174,8 +216,8 @@ impl<'str> FunctionBody<'str> {
     pub fn read_host<'a>(&'a self, cx: ContextView<'a, 'str>) -> HostRef<'a, 'str> {
         HostRef::Checked {
             fun: &self.fun,
-            shared: &cx.shared_ctx().shared,
-            interfaces: &cx.shared_ctx().interfaces,
+            shared: cx.shr(),
+            interfaces: cx.interfaces(),
             id: self.id,
         }
     }
@@ -227,8 +269,8 @@ impl<'str> FunctionBody<'str> {
     ) -> (HostRef<'a, 'str>, PassBacking<'a, 'str>) {
         let own = HostRef::Checked {
             fun: &self.fun,
-            shared: &cx.shared_ctx().shared,
-            interfaces: &cx.shared_ctx().interfaces,
+            shared: cx.shr(),
+            interfaces: cx.interfaces(),
             id: self.id,
         };
         let fun = self
@@ -237,7 +279,10 @@ impl<'str> FunctionBody<'str> {
             .find(|(id, _, _)| *id == minted)
             .map(|(_, _, f)| f)
             .expect("host_with_minted: not a function minted by this body");
-        (own, PassBacking::from_ctx(fun, minted, cx.shared_ctx()))
+        (
+            own,
+            PassBacking::new(fun, minted, cx.shr(), cx.interfaces()),
+        )
     }
 
     /// Consume the body at check-in, yielding the reinstallable function, its
@@ -324,8 +369,7 @@ impl<'str> FunctionBody<'str> {
         mnemonic: Mnemonic,
         size: usize,
     ) -> InstructionId {
-        self.fun
-            .push_mnemonic(self.id, cx.shared_ctx(), mnemonic, size)
+        self.fun.push_mnemonic(self.id, cx.shr(), mnemonic, size)
     }
 
     /// Mint an instruction with `mnemonic` and an explicit result `type_id`.
@@ -447,8 +491,7 @@ impl<'str> FunctionBody<'str> {
         name: std::borrow::Cow<'str, str>,
         old_name: Option<&str>,
     ) -> Result<()> {
-        self.fun
-            .register_local_name(&cx.shared_ctx().shared, id, name, old_name)
+        self.fun.register_local_name(cx.shr(), id, name, old_name)
     }
 
     // ---- mutable arena accessors --------------------------------------------
@@ -555,5 +598,59 @@ impl<'str> FunctionBody<'str> {
     /// of [`function_ref`](Self::function_ref).
     pub fn self_ref<'a>(&'a self, cx: ContextView<'a, 'str>) -> FunctionRef<'str, 'a> {
         self.read_host(cx).function_ref(self.id)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::test_util::dummy_env;
+    use qcode::value::insn::Mnemonic;
+    use qcode_macro::qcode;
+
+    /// The split's borrow story: hold `&mut bodies[fid]` (and mutate through the
+    /// inherent `Function` verbs) while simultaneously reading the module through
+    /// the bodies-free `ContextView` — interners, interfaces, env. Rust's
+    /// disjoint-field borrows prove no aliasing; no `unsafe` anywhere.
+    #[test]
+    fn split_borrows_bodies_and_view_disjointly() {
+        let mut ctx = Context::new();
+        qcode!(ctx, "fn callee: <c_entry> return at 0x2000;");
+        qcode!(ctx, "fn f: <entry> return at 0x1000;");
+        let env = dummy_env();
+
+        let insn_count_before;
+        {
+            let (bodies, view) = ctx.split(&env);
+            // Disjoint &mut borrows of two distinct bodies, worklist order.
+            let mut slots = bodies.select_mut(&[f, callee]);
+            let (own, rest) = slots.split_first_mut().unwrap();
+
+            // View reads while the body borrows are live.
+            assert_eq!(view.interface(callee).name.as_ref(), "callee");
+            let k = view.shr().get_const(42, 8);
+
+            // Mutate the own body through its inherent verbs, consuming the
+            // view-minted literal — the exact pass-shaped usage.
+            let root = own.root.expect("root");
+            insn_count_before = own.block(root).instructions.len();
+            let insn = own.push_mnemonic(
+                f,
+                view.shr(),
+                Mnemonic::Zext(qcode::value::insn::Zext { src: k, size: 8 }),
+                8,
+            );
+            let first = own.block(root).instructions[0];
+            own.insert_insn_before(root, first, insn);
+            let _ = rest;
+        }
+
+        // The split borrow has ended; the whole context is usable again.
+        let root = ctx.bodies[f].root.expect("root");
+        assert_eq!(
+            ctx.bodies[f].block(root).instructions.len(),
+            insn_count_before + 1
+        );
+        assert!(ctx.shared.values.literals.iter().any(|l| l.value == 42));
     }
 }

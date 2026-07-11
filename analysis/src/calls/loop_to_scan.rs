@@ -302,7 +302,7 @@ fn apply<'str>(mv: ContextView<'_, 'str>, body: &mut FunctionBody<'str>, m: &Sca
             ValueId::Instruction(slice)
         }
         Src::Iota => {
-            let n1_const = mv.shared_ctx().get_const(n1 as u64, 8).id();
+            let n1_const = mv.shr().get_const(n1 as u64, 8);
             let iota = body.push_mnemonic_with_type(
                 mv,
                 Mnemonic::Intrinsic(IntrinsicApp {

@@ -384,15 +384,15 @@ pub struct RegisterBase {
 }
 
 impl RegisterBase {
-    /// Build Part A from the whole context's varnode set.
-    pub fn build(ctx: &Context) -> Self {
+    /// Build Part A from the module's shared varnode set.
+    pub fn build(shared: &Shared) -> Self {
         let mut uf = UnionFind::new();
         let mut value_to_root: HashMap<ValueId, NodeId> = HashMap::default();
         let mut by_space: HashMap<SpaceId, Vec<SizedNode>> = HashMap::default();
         let mut varnode_count = 0usize;
 
         // Seed one union-find node per varnode and group by address space.
-        for varnode in ctx.varnodes() {
+        for varnode in shared.varnodes() {
             varnode_count += 1;
             let address = varnode.address();
             debug_assert!(
@@ -547,7 +547,7 @@ impl AliasResult {
     /// tests) that lack a shared base to reuse; the per-function GVN pass reuses a
     /// shared base directly via [`RegisterBase::for_function`].
     pub fn simple_for_function(ctx: &Context, function_id: FunctionId) -> Self {
-        RegisterBase::build(ctx).for_function(ctx, function_id)
+        RegisterBase::build(&ctx.shared).for_function(ctx, function_id)
     }
 }
 

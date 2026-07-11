@@ -299,11 +299,11 @@ impl<'str> Function<'str> {
     pub fn push_mnemonic(
         &mut self,
         func: FunctionId,
-        shared: &Context<'str>,
+        shared: &crate::context::Shared<'str>,
         mnemonic: Mnemonic,
         size: usize,
     ) -> InstructionId {
-        let type_id = shared.shared.types.get_or_make_int(size);
+        let type_id = shared.types.get_or_make_int(size);
         let insn = Instruction::new(type_id, mnemonic);
         self.push_insn(func, insn)
     }

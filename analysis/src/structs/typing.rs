@@ -253,7 +253,7 @@ fn try_type_register_read<'a, 'str>(
         return false;
     };
     let (is_ptr, reg_size) = {
-        let types = &cx.shared_ctx().shared.types;
+        let types = &cx.shr().types;
         (types.pointee_of(reg_ty).is_some(), types.size_of(reg_ty))
     };
     if !is_ptr || reg_size != size {
@@ -279,27 +279,18 @@ fn try_add_to_gep<'a, 'str>(
         let Some(base_ty) = stored_type_of(body.read_host(cx), base) else {
             continue;
         };
-        let Some(pointee) = cx.shared_ctx().shared.types.pointee_of(base_ty) else {
+        let Some(pointee) = cx.shr().types.pointee_of(base_ty) else {
             continue;
         };
         let Some(offset) = const_offset(body.read_host(cx), off_op) else {
             continue;
         };
-        let field_ty = match cx
-            .shared_ctx()
-            .shared
-            .types
-            .field_by_offset(pointee, offset)
-        {
+        let field_ty = match cx.shr().types.field_by_offset(pointee, offset) {
             Some((_, field)) => field.type_id,
             None => continue,
         };
-        let width = cx.shared_ctx().shared.types.size_of(base_ty);
-        let result_ty = cx
-            .shared_ctx()
-            .shared
-            .types
-            .get_or_make_struct_pointer(width, field_ty);
+        let width = cx.shr().types.size_of(base_ty);
+        let result_ty = cx.shr().types.get_or_make_struct_pointer(width, field_ty);
         body.replace_instruction_mnemonic(cx, id, Mnemonic::Gep(Gep { base, offset }));
         BaseRef::new(body.host(cx), id).set_result_type(result_ty);
         return true;
@@ -319,10 +310,10 @@ fn try_type_load<'a, 'str>(
     let Some(ptr_ty) = stored_type_of(body.read_host(cx), ptr) else {
         return false;
     };
-    let Some(field_ty) = cx.shared_ctx().shared.types.pointee_of(ptr_ty) else {
+    let Some(field_ty) = cx.shr().types.pointee_of(ptr_ty) else {
         return false;
     };
-    if cx.shared_ctx().shared.types.size_of(field_ty) != size {
+    if cx.shr().types.size_of(field_ty) != size {
         return false;
     }
     if stored_type_of(body.read_host(cx), ValueId::Instruction(id)) == Some(field_ty) {

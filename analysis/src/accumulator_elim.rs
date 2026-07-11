@@ -419,8 +419,7 @@ fn transform<'str>(
     let mut host_subst: HashMap<ValueId, ValueId> = HashMap::default();
     for (pos, &i) in p.a_slots.iter().enumerate() {
         let field_ty = m
-            .shared_ctx()
-            .shared
+            .shr()
             .types
             .field_type(tuple_ty, pos)
             .expect("accumulator tuple field");

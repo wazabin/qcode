@@ -109,11 +109,11 @@ impl PipelineEnv {
     /// register file and are resolved per-function in "Part B", not by this shared
     /// base — so a stale count would still be sound, but the `debug_assert` below
     /// catches an unexpected mid-run mint loudly rather than silently.
-    pub fn alias_base(&self, ctx: &Context) -> &RegisterBase {
-        let base = self.alias_base.get_or_init(|| RegisterBase::build(ctx));
+    pub fn alias_base(&self, shared: &qcode::context::Shared) -> &RegisterBase {
+        let base = self.alias_base.get_or_init(|| RegisterBase::build(shared));
         debug_assert_eq!(
             base.varnode_count(),
-            ctx.varnode_count(),
+            shared.varnode_count(),
             "register alias base built from a stale varnode set; a pass minted varnodes mid-run"
         );
         base
