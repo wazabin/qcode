@@ -37,6 +37,7 @@ pub(crate) fn install_minted_for_test<'str>(
 ) {
     pass::install_minted(ctx, "test", minted).expect("minted install");
 }
+pub(crate) use pass::with_checked_out_body;
 pub use pass::{
     DecompilePass, DynDecompilePass, DynFunctionPass, DynPass, FunctionPass, FunctionPassAdapter,
     Pass, PassRegistration,

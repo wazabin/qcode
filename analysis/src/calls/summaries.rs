@@ -525,10 +525,10 @@ mod tests {
         f: impl FnOnce(&mut Builder<'static, '_>),
     ) -> FunctionId {
         let fun_id = Function::make(&mut tc.ctx, name.into()).unwrap().id;
-        let block_id = {
-            let __f = tc.ctx.anon_function();
-            tc.ctx.get_or_make_block(addr, __f)
-        };
+        // Self-stored: the root block is born into `fun_id`'s own arena (no
+        // reattributed foreign-arena block), so the checked-out mem2reg path can
+        // run on it.
+        let block_id = tc.ctx.get_or_make_block(addr, fun_id);
         Function::from_id_mut(&mut tc.ctx, fun_id)
             .set_root(block_id)
             .unwrap();
@@ -551,10 +551,9 @@ mod tests {
         f: impl FnOnce(&mut Builder<'static, '_>, ValueId),
     ) -> FunctionId {
         let fun_id = Function::make(&mut tc.ctx, name.into()).unwrap().id;
-        let block_id = {
-            let __f = tc.ctx.anon_function();
-            tc.ctx.get_or_make_block(addr, __f)
-        };
+        // Self-stored root block (see `build_fn`), so mem2reg's checked-out path
+        // can run on it.
+        let block_id = tc.ctx.get_or_make_block(addr, fun_id);
         Function::from_id_mut(&mut tc.ctx, fun_id)
             .set_root(block_id)
             .unwrap();

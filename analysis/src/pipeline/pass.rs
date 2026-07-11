@@ -267,6 +267,57 @@ impl<T: FunctionPass + Send + Sync> DynFunctionPass for FunctionPassAdapter<T> {
     }
 }
 
+/// Run `f` over a checked-out `(&mut FunctionBody, ContextView)` for `fid`, then
+/// check the body back in and resync its call sites — the check-out/check-in
+/// protocol of [`FunctionPassAdapter::run`], minus minting.
+///
+/// This is the bridge the whole-`Context` optimization entry points
+/// (`gvn_function`, `constant_fold_function`, `narrow_function`, `mem2reg`,
+/// `mem2reg_framed`) use to reach the concrete function-pass core: their callers
+/// hold a `&mut Context` but neither a [`FunctionBody`] nor a [`PipelineEnv`], and
+/// they supply their own alias oracle, so the [`ContextView`]'s env is a
+/// throwaway the cores never read. Because the concrete [`PassBacking`] path
+/// debug-asserts the body is self-stored, every caller must feed a function with
+/// no reattributed blocks — which, post the driver's `split_overlapping_functions`
+/// normalization, every production function is.
+///
+/// [`PassBacking`]: qcode::value::util::host_mut::PassBacking
+pub(crate) fn with_checked_out_body<'str, R>(
+    ctx: &mut Context<'str>,
+    fid: FunctionId,
+    f: impl FnOnce(&mut FunctionBody<'str>, ContextView<'_, 'str>) -> R,
+) -> R {
+    let env = detached_env();
+    let before_targets = ctx.direct_call_targets(fid);
+    let fun = ctx.checkout_function(fid);
+    let mut body = FunctionBody::new(fid, fun, Vec::new());
+    let out = {
+        let view = ContextView::new(ctx, &env);
+        f(&mut body, view)
+    };
+    // These entry points buffer no effects and mint nothing.
+    let (fun, _effects, _minted, _unused) = body.into_parts();
+    ctx.checkin_function(fid, fun);
+    ctx.resync_call_sites(fid, &before_targets);
+    out
+}
+
+/// A throwaway [`PipelineEnv`] for [`with_checked_out_body`]: the concrete
+/// optimization cores never consult `env()`, so its stack pointer / ABI are
+/// placeholders.
+fn detached_env() -> PipelineEnv {
+    PipelineEnv::from_parts(
+        ArchConfig {
+            stack_pointer: RegisterId::from(0usize),
+            dead_flag_regs: Vec::new(),
+            abi: CallingConvention::default(),
+            os: qcode::context::TargetOs::Unknown,
+            bitness: 64,
+        },
+        VarnodeId::from(0usize),
+    )
+}
+
 /// How many function ids are reserved per checked-out function for minting
 /// (`PARALLEL_PASSES.md` ruling 3). Every current outliner mints at most one
 /// function per run; a pass needing more simply stops promoting when the pool
