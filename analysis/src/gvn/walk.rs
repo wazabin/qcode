@@ -17,6 +17,7 @@ use crate::AliasResult;
 
 use super::affine::Numbering;
 
+use qcode::context::Context;
 use qcode::value::{
     ValueId,
     block::BlockId,
@@ -124,14 +125,15 @@ impl Editor {
 /// pass mints it in [`SubPass::init_state`], clones it down the dominator tree
 /// in [`SubPass::clone_state`], and downcasts it in the visit hooks.
 ///
-/// The trait is generic over the mutation host `H`: [`Fold`](super::fold::Fold)
-/// and [`NarrowTrunc`](super::narrow::NarrowTrunc) are fully host-routed and run
-/// over any `H` (module or a checked-out function), while the remaining sub-passes
-/// are dispatched only by the module `gvn` pass and reach the whole [`Context`]
-/// through [`HostMut::as_module_mut`].
+/// The module-scope twin of [`SubPassC`]: one composable GVN concern driven over
+/// the whole [`Context`] (`&mut Context`). It backs the whole-`Context` public
+/// entry points ([`gvn_function`](super::gvn_function) &c) — which must tolerate
+/// reattributed/orphan-region bodies the checked-out `SubPassC` path forbids —
+/// and the module `concretize` pass (its three body-reading sub-passes read pure
+/// callee bodies through `&*ctx`).
 ///
 /// [`Context`]: qcode::context::Context
-pub(super) trait SubPass<'str, H: HostMut<'str>> {
+pub(super) trait ModuleSubPass<'str> {
     /// Fresh per-walk state, cloned down the dominator tree (a value available
     /// in a dominator is available in every block it dominates). Stateless
     /// sub-passes return `Box::new(())`.
@@ -148,7 +150,7 @@ pub(super) trait SubPass<'str, H: HostMut<'str>> {
     #[allow(clippy::too_many_arguments)]
     fn on_block_entry(
         &self,
-        _host: &mut H,
+        _host: &mut Context<'str>,
         _state: &mut dyn Any,
         _block_id: BlockId,
         _tree: &DominatorTree<BlockId>,
@@ -159,12 +161,18 @@ pub(super) trait SubPass<'str, H: HostMut<'str>> {
     }
 
     /// Visit one instruction. Rewrites go through `ed`.
-    fn on_insn(&self, host: &mut H, state: &mut dyn Any, ic: &InsnCtx, ed: &mut Editor) -> Claim;
+    fn on_insn(
+        &self,
+        host: &mut Context<'str>,
+        state: &mut dyn Any,
+        ic: &InsnCtx,
+        ed: &mut Editor,
+    ) -> Claim;
 
     /// Called after the block's instructions, before its dominated children.
     fn after_block(
         &self,
-        _host: &mut H,
+        _host: &mut Context<'str>,
         _state: &mut dyn Any,
         _block_id: BlockId,
         _aliases: Option<&AliasResult>,
@@ -174,13 +182,13 @@ pub(super) trait SubPass<'str, H: HostMut<'str>> {
 }
 
 /// One fresh erased state slot per sub-pass, in array order.
-fn init_states<'str, H: HostMut<'str>>(passes: &[Box<dyn SubPass<'str, H>>]) -> Vec<Box<dyn Any>> {
+fn init_states<'str>(passes: &[Box<dyn ModuleSubPass<'str>>]) -> Vec<Box<dyn Any>> {
     passes.iter().map(|p| p.init_state()).collect()
 }
 
 /// Clone a state vector for a dominated child, each pass cloning its own slot.
-fn clone_states<'str, H: HostMut<'str>>(
-    passes: &[Box<dyn SubPass<'str, H>>],
+fn clone_states<'str>(
+    passes: &[Box<dyn ModuleSubPass<'str>>],
     states: &[Box<dyn Any>],
 ) -> Vec<Box<dyn Any>> {
     passes
@@ -196,10 +204,10 @@ fn clone_states<'str, H: HostMut<'str>>(
 
 /// Run the sub-pass chain over every instruction of `block_id`, then drop the
 /// instructions it made redundant. Returns whether anything was rewritten.
-fn run_block<'str, H: HostMut<'str>>(
-    host: &mut H,
+fn run_block<'str>(
+    mut host: &mut Context<'str>,
     block_id: BlockId,
-    passes: &[Box<dyn SubPass<'str, H>>],
+    passes: &[Box<dyn ModuleSubPass<'str>>],
     states: &mut [Box<dyn Any>],
     aliases: Option<&AliasResult>,
     numbering: &Numbering,
@@ -229,15 +237,15 @@ fn run_block<'str, H: HostMut<'str>>(
         }
     }
 
-    ed.finish(host)
+    ed.finish(&mut host)
 }
 
 /// Run the sub-passes over a single block with fresh state and no block-boundary
 /// hooks (no dominator tree exists for a lone block).
-pub(super) fn run_single_block<'str, H: HostMut<'str>>(
-    host: &mut H,
+pub(super) fn run_single_block<'str>(
+    host: &mut Context<'str>,
     block_id: BlockId,
-    passes: &[Box<dyn SubPass<'str, H>>],
+    passes: &[Box<dyn ModuleSubPass<'str>>],
     aliases: Option<&AliasResult>,
 ) -> bool {
     // No function context for a lone block: memory forwarding falls back to
@@ -250,10 +258,10 @@ pub(super) fn run_single_block<'str, H: HostMut<'str>>(
 /// Iterate the sub-passes over every block of `func_id` in flat order with
 /// fresh per-block state, repeating until a full sweep changes nothing. No
 /// block-boundary hooks run. Returns whether anything changed.
-pub(super) fn run_flat_fixpoint<'str, H: HostMut<'str>>(
-    host: &mut H,
+pub(super) fn run_flat_fixpoint<'str>(
+    host: &mut Context<'str>,
     func_id: FunctionId,
-    passes: &[Box<dyn SubPass<'str, H>>],
+    passes: &[Box<dyn ModuleSubPass<'str>>],
 ) -> bool {
     let block_ids: Vec<BlockId> = host
         .function_ref(func_id)
@@ -278,8 +286,8 @@ pub(super) fn run_flat_fixpoint<'str, H: HostMut<'str>>(
 }
 
 /// The per-entry invariants of one dominator-tree walk.
-struct Walk<'a, 'str, H: HostMut<'str>> {
-    passes: &'a [Box<dyn SubPass<'str, H>>],
+struct Walk<'a, 'str> {
+    passes: &'a [Box<dyn ModuleSubPass<'str>>],
     func_id: FunctionId,
     tree: &'a DominatorTree<BlockId>,
     aliases: Option<&'a AliasResult>,
@@ -294,8 +302,8 @@ struct Walk<'a, 'str, H: HostMut<'str>> {
     changed: bool,
 }
 
-impl<'str, H: HostMut<'str>> Walk<'_, 'str, H> {
-    fn rec(&mut self, host: &mut H, block_id: BlockId, inherited: &[Box<dyn Any>]) {
+impl<'str> Walk<'_, 'str> {
+    fn rec(&mut self, host: &mut Context<'str>, block_id: BlockId, inherited: &[Box<dyn Any>]) {
         // Stay inside the function being processed. A tail-call edge is a real CFG
         // edge, so the dominator tree can reach blocks owned by the callee — but
         // the per-function alias oracle does not describe them, and following a
@@ -309,7 +317,7 @@ impl<'str, H: HostMut<'str>> Walk<'_, 'str, H> {
         // blocks — so returning outright would leave that owned block with no GVN
         // at all. Skip processing the foreign block, but keep recursing (threading
         // the inherited state through unchanged) so owned descendants still run.
-        if host.read_host().block(block_id).parent != Some(self.func_id) {
+        if host.values.basic_blocks[block_id].parent != Some(self.func_id) {
             for &child in self.tree.children_of(block_id) {
                 self.rec(host, child, inherited);
             }
@@ -392,10 +400,10 @@ fn reachable_from<'str>(
 /// [`SubPass::on_block_entry`]: each walk's dominator tree only sees its own
 /// entry's edges, so its dominance claims are invalid for blocks the other
 /// entries can also reach.
-pub(super) fn run_dominator_walk<'str, H: HostMut<'str>>(
-    host: &mut H,
+pub(super) fn run_dominator_walk<'str>(
+    host: &mut Context<'str>,
     func_id: FunctionId,
-    passes: &[Box<dyn SubPass<'str, H>>],
+    passes: &[Box<dyn ModuleSubPass<'str>>],
     aliases: Option<&AliasResult>,
 ) -> bool {
     let root = match host.function_ref(func_id).root() {

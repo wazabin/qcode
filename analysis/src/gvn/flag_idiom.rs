@@ -1,5 +1,6 @@
 //! Flag-idiom sub-pass: collapse x86 signed-compare flag chains.
 
+use qcode::context::Context;
 use qcode::value::{
     ValueId,
     insn::{Binary, Binop, IntBinop, Mnemonic},
@@ -9,7 +10,7 @@ use qcode::value::{
 use super::fold::const_value;
 use std::any::Any;
 
-use super::walk::{Claim, Editor, InsnCtx, SubPass, SubPassC};
+use super::walk::{Claim, Editor, InsnCtx, ModuleSubPass, SubPassC};
 
 use crate::{ContextView, FunctionBody};
 
@@ -19,7 +20,7 @@ use crate::{ContextView, FunctionBody};
 /// it runs over either the module or a checked-out function.
 pub(super) struct FlagIdiom;
 
-impl<'str, H: HostMut<'str>> SubPass<'str, H> for FlagIdiom {
+impl<'str> ModuleSubPass<'str> for FlagIdiom {
     fn init_state(&self) -> Box<dyn Any> {
         Box::new(())
     }
@@ -28,13 +29,19 @@ impl<'str, H: HostMut<'str>> SubPass<'str, H> for FlagIdiom {
         Box::new(())
     }
 
-    fn on_insn(&self, host: &mut H, _state: &mut dyn Any, ic: &InsnCtx, ed: &mut Editor) -> Claim {
+    fn on_insn(
+        &self,
+        mut host: &mut Context<'str>,
+        _state: &mut dyn Any,
+        ic: &InsnCtx,
+        ed: &mut Editor,
+    ) -> Claim {
         if ic.mnemonic.is_terminator() || ic.size == 0 {
             return Claim::Pass;
         }
         match simplify_flag_idiom(host.read_host(), ic.mnemonic) {
             Some(new_mnemonic) => {
-                ed.replace_with_new_insn(host, ic.block_id, ic.insn_id, new_mnemonic, ic.size);
+                ed.replace_with_new_insn(&mut host, ic.block_id, ic.insn_id, new_mnemonic, ic.size);
                 Claim::Done
             }
             None => Claim::Pass,

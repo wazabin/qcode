@@ -31,7 +31,7 @@ use crate::calls::return_field;
 use super::fold::const_value;
 use std::any::Any;
 
-use super::walk::{Claim, Editor, InsnCtx, SubPass};
+use super::walk::{Claim, Editor, InsnCtx, ModuleSubPass};
 
 /// Upper bound on emulated instructions per lane. Map bodies are loop-free pure
 /// expressions, so this only guards against a degenerate body.
@@ -42,7 +42,7 @@ const STEP_BUDGET: usize = 100_000;
 /// the module host (dispatched by the [`concretize`](super::concretize) pass).
 pub(super) struct EmulateMap;
 
-impl<'a, 'str> SubPass<'str, &'a mut Context<'str>> for EmulateMap {
+impl<'str> ModuleSubPass<'str> for EmulateMap {
     fn init_state(&self) -> Box<dyn Any> {
         Box::new(())
     }
@@ -53,7 +53,7 @@ impl<'a, 'str> SubPass<'str, &'a mut Context<'str>> for EmulateMap {
 
     fn on_insn(
         &self,
-        host: &mut &'a mut Context<'str>,
+        host: &mut Context<'str>,
         _state: &mut dyn Any,
         ic: &InsnCtx,
         ed: &mut Editor,

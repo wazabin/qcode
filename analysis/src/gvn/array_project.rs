@@ -33,14 +33,14 @@ use crate::calls::inline_pure_body;
 
 use std::any::Any;
 
-use super::walk::{Claim, Editor, InsnCtx, SubPass};
+use super::walk::{Claim, Editor, InsnCtx, ModuleSubPass};
 
 /// Projecting a lane out of a `map` inlines the pure *body callee*'s IR, so this
 /// runs only on the module host (dispatched by the
 /// [`concretize`](super::concretize) module pass).
 pub(super) struct ArrayProject;
 
-impl<'a, 'str> SubPass<'str, &'a mut Context<'str>> for ArrayProject {
+impl<'str> ModuleSubPass<'str> for ArrayProject {
     fn init_state(&self) -> Box<dyn Any> {
         Box::new(())
     }
@@ -51,7 +51,7 @@ impl<'a, 'str> SubPass<'str, &'a mut Context<'str>> for ArrayProject {
 
     fn on_insn(
         &self,
-        host: &mut &'a mut Context<'str>,
+        host: &mut Context<'str>,
         _state: &mut dyn Any,
         ic: &InsnCtx,
         ed: &mut Editor,

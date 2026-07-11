@@ -42,7 +42,7 @@ use qcode::{
     },
 };
 
-use super::walk::{Claim, Editor, InsnCtx, SubPass, SubPassC};
+use super::walk::{Claim, Editor, InsnCtx, ModuleSubPass, SubPassC};
 
 use crate::{ContextView, FunctionBody};
 
@@ -51,7 +51,7 @@ use crate::{ContextView, FunctionBody};
 /// and constants are minted through the shared interners.
 pub(super) struct NarrowTrunc;
 
-impl<'str, H: HostMut<'str>> SubPass<'str, H> for NarrowTrunc {
+impl<'str> ModuleSubPass<'str> for NarrowTrunc {
     fn init_state(&self) -> Box<dyn Any> {
         Box::new(())
     }
@@ -60,7 +60,13 @@ impl<'str, H: HostMut<'str>> SubPass<'str, H> for NarrowTrunc {
         Box::new(())
     }
 
-    fn on_insn(&self, host: &mut H, _state: &mut dyn Any, ic: &InsnCtx, ed: &mut Editor) -> Claim {
+    fn on_insn(
+        &self,
+        mut host: &mut Context<'str>,
+        _state: &mut dyn Any,
+        ic: &InsnCtx,
+        ed: &mut Editor,
+    ) -> Claim {
         let Mnemonic::Range(Range {
             src,
             start: 0,
@@ -76,11 +82,11 @@ impl<'str, H: HostMut<'str>> SubPass<'str, H> for NarrowTrunc {
             return Claim::Pass;
         }
         let mut memo: HashMap<ValueId, ValueId> = HashMap::default();
-        let narrowed = narrow_to(host, src, w, ic.insn_id, ic.block_id, &mut memo);
+        let narrowed = narrow_to(&mut host, src, w, ic.insn_id, ic.block_id, &mut memo);
         if narrowed == ic.id {
             return Claim::Pass;
         }
-        ed.replace(host, ic.insn_id, narrowed);
+        ed.replace(&mut host, ic.insn_id, narrowed);
         Claim::Done
     }
 }

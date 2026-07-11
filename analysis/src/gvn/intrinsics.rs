@@ -11,6 +11,7 @@
 //! A matched root is rewritten to the intrinsic; the now-unused shift/or math
 //! it subsumed becomes pure-dead and is reclaimed by DCE.
 
+use qcode::context::Context;
 use qcode::value::{
     insn::{Binop, IntrinsicApp, Mnemonic, RootOp, recognizers_for},
     util::host_mut::HostMut,
@@ -18,7 +19,7 @@ use qcode::value::{
 
 use std::any::Any;
 
-use super::walk::{Claim, Editor, InsnCtx, SubPass, SubPassC};
+use super::walk::{Claim, Editor, InsnCtx, ModuleSubPass, SubPassC};
 
 use crate::{ContextView, FunctionBody};
 
@@ -28,7 +29,7 @@ use crate::{ContextView, FunctionBody};
 /// through the shared interner.
 pub(super) struct Recognize;
 
-impl<'str, H: HostMut<'str>> SubPass<'str, H> for Recognize {
+impl<'str> ModuleSubPass<'str> for Recognize {
     fn init_state(&self) -> Box<dyn Any> {
         Box::new(())
     }
@@ -37,7 +38,13 @@ impl<'str, H: HostMut<'str>> SubPass<'str, H> for Recognize {
         Box::new(())
     }
 
-    fn on_insn(&self, host: &mut H, _state: &mut dyn Any, ic: &InsnCtx, ed: &mut Editor) -> Claim {
+    fn on_insn(
+        &self,
+        mut host: &mut Context<'str>,
+        _state: &mut dyn Any,
+        ic: &InsnCtx,
+        ed: &mut Editor,
+    ) -> Claim {
         if ic.size == 0 {
             return Claim::Pass;
         }
@@ -50,7 +57,7 @@ impl<'str, H: HostMut<'str>> SubPass<'str, H> for Recognize {
                 // Recognized intrinsics (rol/ror) are width-preserving, so the
                 // root's width is the result width.
                 ed.replace_with_new_insn(
-                    host,
+                    &mut host,
                     ic.block_id,
                     ic.insn_id,
                     Mnemonic::Intrinsic(IntrinsicApp { id, args }),

@@ -13,6 +13,7 @@
 //! unless it is already canonical. See [`super::affine`] for the normal form,
 //! key/emit split, and idempotence argument.
 
+use qcode::context::Context;
 use qcode::value::{
     ValueId,
     insn::{Binop, FloatBinop, IntBinop, Mnemonic},
@@ -22,7 +23,7 @@ use qcode::value::{
 use std::any::Any;
 
 use super::affine::{NormalForm, Numbering, arith_form, key_for, materialize};
-use super::walk::{Claim, Editor, InsnCtx, SubPass, SubPassC};
+use super::walk::{Claim, Editor, InsnCtx, ModuleSubPass, SubPassC};
 
 use crate::{ContextView, FunctionBody};
 
@@ -32,7 +33,7 @@ use crate::{ContextView, FunctionBody};
 /// either the module or a checked-out function.
 pub(super) struct Cse;
 
-impl<'str, H: HostMut<'str>> SubPass<'str, H> for Cse {
+impl<'str> ModuleSubPass<'str> for Cse {
     fn init_state(&self) -> Box<dyn Any> {
         Box::new(Numbering::default())
     }
@@ -48,7 +49,7 @@ impl<'str, H: HostMut<'str>> SubPass<'str, H> for Cse {
 
     fn on_block_entry(
         &self,
-        _host: &mut H,
+        _host: &mut Context<'str>,
         state: &mut dyn Any,
         _block_id: qcode::value::block::BlockId,
         _tree: &jstd::graph::analysis::DominatorTree<qcode::value::block::BlockId>,
@@ -66,7 +67,13 @@ impl<'str, H: HostMut<'str>> SubPass<'str, H> for Cse {
         }
     }
 
-    fn on_insn(&self, host: &mut H, state: &mut dyn Any, ic: &InsnCtx, ed: &mut Editor) -> Claim {
+    fn on_insn(
+        &self,
+        mut host: &mut Context<'str>,
+        state: &mut dyn Any,
+        ic: &InsnCtx,
+        ed: &mut Editor,
+    ) -> Claim {
         if ic.mnemonic.is_terminator() || ic.size == 0 {
             return Claim::Pass;
         }
@@ -90,7 +97,7 @@ impl<'str, H: HostMut<'str>> SubPass<'str, H> for Cse {
         // A dominating value already computes this form: forward to it.
         if let Some(leader) = state.lookup(&key) {
             if leader != ic.id {
-                ed.replace(host, ic.insn_id, leader);
+                ed.replace(&mut host, ic.insn_id, leader);
             }
             return Claim::Done;
         }
@@ -104,7 +111,7 @@ impl<'str, H: HostMut<'str>> SubPass<'str, H> for Cse {
             _ => {
                 let root_ty = host.read_host().type_of(ic.id);
                 let v = materialize(
-                    host,
+                    &mut host,
                     ic.block_id,
                     ic.insn_id,
                     ic.mnemonic,
@@ -113,7 +120,7 @@ impl<'str, H: HostMut<'str>> SubPass<'str, H> for Cse {
                     state,
                 );
                 if v != ic.id {
-                    ed.replace(host, ic.insn_id, v);
+                    ed.replace(&mut host, ic.insn_id, v);
                 }
             }
         }

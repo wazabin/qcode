@@ -12,7 +12,7 @@ use qcode::{
 
 use std::any::Any;
 
-use super::walk::{Claim, Editor, InsnCtx, SubPass, SubPassC};
+use super::walk::{Claim, Editor, InsnCtx, ModuleSubPass, SubPassC};
 
 use crate::{ContextView, FunctionBody};
 
@@ -23,7 +23,7 @@ use crate::{ContextView, FunctionBody};
 /// through the interners' `&self` paths on the shared context.
 pub(super) struct Fold;
 
-impl<'str, H: HostMut<'str>> SubPass<'str, H> for Fold {
+impl<'str> ModuleSubPass<'str> for Fold {
     fn init_state(&self) -> Box<dyn Any> {
         Box::new(())
     }
@@ -32,13 +32,19 @@ impl<'str, H: HostMut<'str>> SubPass<'str, H> for Fold {
         Box::new(())
     }
 
-    fn on_insn(&self, host: &mut H, _state: &mut dyn Any, ic: &InsnCtx, ed: &mut Editor) -> Claim {
+    fn on_insn(
+        &self,
+        mut host: &mut Context<'str>,
+        _state: &mut dyn Any,
+        ic: &InsnCtx,
+        ed: &mut Editor,
+    ) -> Claim {
         if ic.mnemonic.is_terminator() || ic.size == 0 {
             return Claim::Pass;
         }
         match try_fold_insn(host.read_host(), ic) {
             Some(folded) => {
-                ed.replace(host, ic.insn_id, folded);
+                ed.replace(&mut host, ic.insn_id, folded);
                 Claim::Done
             }
             None => Claim::Pass,

@@ -31,7 +31,7 @@ use crate::calls::{project_return, return_field};
 use super::fold::const_value;
 use std::any::Any;
 
-use super::walk::{Claim, Editor, InsnCtx, SubPass};
+use super::walk::{Claim, Editor, InsnCtx, ModuleSubPass};
 
 /// Upper bound on emulated instructions per harvested field. Pure functions are
 /// loop-free (an argpromote invariant), so this only guards against a function
@@ -43,7 +43,7 @@ const STEP_BUDGET: usize = 100_000;
 /// (dispatched by the [`concretize`](super::concretize) module pass).
 pub(super) struct PureCall;
 
-impl<'a, 'str> SubPass<'str, &'a mut Context<'str>> for PureCall {
+impl<'str> ModuleSubPass<'str> for PureCall {
     fn init_state(&self) -> Box<dyn Any> {
         Box::new(())
     }
@@ -54,7 +54,7 @@ impl<'a, 'str> SubPass<'str, &'a mut Context<'str>> for PureCall {
 
     fn on_insn(
         &self,
-        host: &mut &'a mut Context<'str>,
+        host: &mut Context<'str>,
         _state: &mut dyn Any,
         ic: &InsnCtx,
         ed: &mut Editor,

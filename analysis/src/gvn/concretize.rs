@@ -21,15 +21,15 @@ use qcode::{context::Context, value::function::FunctionId};
 use super::array_project::ArrayProject;
 use super::emulate_map::EmulateMap;
 use super::pure_call::PureCall;
-use super::walk::{self, run_dominator_walk};
+use super::walk::{ModuleSubPass, run_dominator_walk};
 
 use crate::{Pass, PipelineEnv};
 
 /// The three body-reading sub-passes, in the same relative order they held in
 /// [`super::gvn_passes`] (emulate-map before array-project before pure-call). All
-/// three run on the module host only, so the walk is instantiated at
-/// `H = &mut Context`.
-fn concretize_passes<'a, 'str>() -> Vec<Box<dyn walk::SubPass<'str, &'a mut Context<'str>>>> {
+/// three read pure callee bodies, so they run only on the module `&mut Context`
+/// walker ([`ModuleSubPass`]).
+fn concretize_passes<'str>() -> Vec<Box<dyn ModuleSubPass<'str>>> {
     vec![
         Box::new(EmulateMap),
         Box::new(ArrayProject),
@@ -40,9 +40,9 @@ fn concretize_passes<'a, 'str>() -> Vec<Box<dyn walk::SubPass<'str, &'a mut Cont
 /// Run the three body-reading sub-passes over `fun_id` to a local fixpoint.
 /// Returns whether anything changed. These sub-passes carry no dominance state
 /// and use no alias oracle, so the walk runs with `None` aliases.
-pub(crate) fn concretize_function(mut ctx: &mut Context, fun_id: FunctionId) -> bool {
+pub(crate) fn concretize_function(ctx: &mut Context, fun_id: FunctionId) -> bool {
     let mut changed = false;
-    while run_dominator_walk(&mut ctx, fun_id, &concretize_passes(), None) {
+    while run_dominator_walk(ctx, fun_id, &concretize_passes(), None) {
         changed = true;
     }
     changed

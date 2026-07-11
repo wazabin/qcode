@@ -10,11 +10,7 @@ use crate::AliasResult;
 
 use qcode::{
     context::Context,
-    value::{
-        block::BlockMutRef,
-        function::FunctionId,
-        util::{base_ref::WithCtxMut, host_mut::HostMut},
-    },
+    value::{block::BlockMutRef, function::FunctionId, util::base_ref::WithCtxMut},
 };
 
 pub(crate) mod affine;
@@ -55,7 +51,7 @@ use walk::{
 /// that used to sit between `NarrowTrunc` and `Recognize` are **not** here: they
 /// read pure *callee* bodies, an interprocedural read the parallel-safe function
 /// pass contract forbids, so they live in the [`concretize`] module pass.
-fn gvn_passes<'str, H: HostMut<'str>>() -> Vec<Box<dyn walk::SubPass<'str, H>>> {
+fn gvn_passes<'str>() -> Vec<Box<dyn walk::ModuleSubPass<'str>>> {
     vec![
         Box::new(MemoryForwarding),
         Box::new(Fold),
@@ -97,8 +93,8 @@ fn gvn_passes_c<'str>() -> Vec<Box<dyn SubPassC<'str>>> {
 ///
 /// Folding only — no CSE or load/store forwarding. Returns `true` if anything
 /// changed.
-pub fn constant_fold_function(mut ctx: &mut Context, func_id: FunctionId) -> bool {
-    constant_fold_host(&mut ctx, func_id)
+pub fn constant_fold_function(ctx: &mut Context, func_id: FunctionId) -> bool {
+    constant_fold_host(ctx, func_id)
 }
 
 /// Host-generic core of [`constant_fold_function`]: runs the [`Fold`] sub-pass to
@@ -106,14 +102,11 @@ pub fn constant_fold_function(mut ctx: &mut Context, func_id: FunctionId) -> boo
 /// checked-out function ([`CheckedOut`]).
 ///
 /// [`CheckedOut`]: qcode::value::util::host_mut::CheckedOut
-pub(crate) fn constant_fold_host<'str, H: HostMut<'str>>(
-    host: &mut H,
-    func_id: FunctionId,
-) -> bool {
+pub(crate) fn constant_fold_host<'str>(host: &mut Context<'str>, func_id: FunctionId) -> bool {
     run_flat_fixpoint(
         host,
         func_id,
-        &[Box::new(Fold) as Box<dyn walk::SubPass<'str, H>>],
+        &[Box::new(Fold) as Box<dyn walk::ModuleSubPass<'str>>],
     )
 }
 
@@ -131,17 +124,17 @@ fn constant_fold_body<'str>(
 /// Sink low-word truncations through arithmetic, cancelling widenings, to a
 /// fixpoint. Standalone composition of the [`NarrowTrunc`] sub-pass — the same
 /// shape as [`constant_fold_function`]. Returns `true` if anything changed.
-pub fn narrow_function(mut ctx: &mut Context, func_id: FunctionId) -> bool {
-    narrow_host(&mut ctx, func_id)
+pub fn narrow_function(ctx: &mut Context, func_id: FunctionId) -> bool {
+    narrow_host(ctx, func_id)
 }
 
 /// Host-generic core of [`narrow_function`]: runs the [`NarrowTrunc`] sub-pass to
 /// a fixpoint over either the whole module or a single checked-out function.
-pub(crate) fn narrow_host<'str, H: HostMut<'str>>(host: &mut H, func_id: FunctionId) -> bool {
+pub(crate) fn narrow_host<'str>(host: &mut Context<'str>, func_id: FunctionId) -> bool {
     run_flat_fixpoint(
         host,
         func_id,
-        &[Box::new(NarrowTrunc) as Box<dyn walk::SubPass<'str, H>>],
+        &[Box::new(NarrowTrunc) as Box<dyn walk::ModuleSubPass<'str>>],
     )
 }
 
@@ -169,8 +162,8 @@ fn narrow_body<'str>(
 /// Terminators, calls, and `PCodeOp` are excluded.
 pub fn gvn(block: &mut BlockMutRef, aliases: Option<&AliasResult>) {
     let block_id = block.id;
-    let mut ctx = block.ctx_mut();
-    run_single_block(&mut ctx, block_id, &gvn_passes(), aliases);
+    let ctx = block.ctx_mut();
+    run_single_block(ctx, block_id, &gvn_passes(), aliases);
 }
 
 /// Dominator-tree GVN over an entire function.
@@ -181,12 +174,8 @@ pub fn gvn(block: &mut BlockMutRef, aliases: Option<&AliasResult>) {
 /// eliminated. Store/load invalidation follows the same alias-aware rules as the
 /// single-block pass.
 /// Returns `true` if anything changed.
-pub fn gvn_function(
-    mut ctx: &mut Context,
-    func_id: FunctionId,
-    aliases: Option<&AliasResult>,
-) -> bool {
-    gvn_host(&mut ctx, func_id, aliases)
+pub fn gvn_function(ctx: &mut Context, func_id: FunctionId, aliases: Option<&AliasResult>) -> bool {
+    gvn_host(ctx, func_id, aliases)
 }
 
 /// Host-generic core of [`gvn_function`]: runs the full GVN sub-pass chain over
@@ -194,8 +183,8 @@ pub fn gvn_function(
 /// or a single checked-out function ([`CheckedOut`]).
 ///
 /// [`CheckedOut`]: qcode::value::util::host_mut::CheckedOut
-pub(crate) fn gvn_host<'str, H: HostMut<'str>>(
-    host: &mut H,
+pub(crate) fn gvn_host<'str>(
+    host: &mut Context<'str>,
     func_id: FunctionId,
     aliases: Option<&AliasResult>,
 ) -> bool {

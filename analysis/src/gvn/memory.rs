@@ -9,13 +9,14 @@
 use jstd::graph::analysis::DominatorTree;
 
 use crate::AliasResult;
+use qcode::context::Context;
 use qcode::value::{block::BlockId, insn::Mnemonic, util::host_mut::HostMut};
 
 use super::affine::Numbering;
 use std::any::Any;
 
 use super::mem_forward::MemForward;
-use super::walk::{Claim, Editor, InsnCtx, SubPass, SubPassC};
+use super::walk::{Claim, Editor, InsnCtx, ModuleSubPass, SubPassC};
 
 use crate::{ContextView, FunctionBody};
 
@@ -26,7 +27,7 @@ use crate::{ContextView, FunctionBody};
 /// function.
 pub(super) struct MemoryForwarding;
 
-impl<'str, H: HostMut<'str>> SubPass<'str, H> for MemoryForwarding {
+impl<'str> ModuleSubPass<'str> for MemoryForwarding {
     fn init_state(&self) -> Box<dyn Any> {
         Box::new(MemForward::default())
     }
@@ -42,7 +43,7 @@ impl<'str, H: HostMut<'str>> SubPass<'str, H> for MemoryForwarding {
 
     fn on_block_entry(
         &self,
-        host: &mut H,
+        host: &mut Context<'str>,
         state: &mut dyn Any,
         block_id: BlockId,
         tree: &DominatorTree<BlockId>,
@@ -57,16 +58,22 @@ impl<'str, H: HostMut<'str>> SubPass<'str, H> for MemoryForwarding {
         state.prune_loop_carried(host.read_host(), block_id, tree, aliases, numbering);
     }
 
-    fn on_insn(&self, host: &mut H, state: &mut dyn Any, ic: &InsnCtx, ed: &mut Editor) -> Claim {
+    fn on_insn(
+        &self,
+        mut host: &mut Context<'str>,
+        state: &mut dyn Any,
+        ic: &InsnCtx,
+        ed: &mut Editor,
+    ) -> Claim {
         let state = state.downcast_mut::<MemForward>().expect("memory state");
         match ic.mnemonic {
             Mnemonic::Store(store) => {
-                state.record_store(host, store, ic.aliases, ic.numbering);
+                state.record_store(&mut host, store, ic.aliases, ic.numbering);
                 Claim::Done
             }
             Mnemonic::Load(load) => {
                 match state.try_load(
-                    host,
+                    &mut host,
                     ic.block_id,
                     ic.insn_id,
                     load,
@@ -74,7 +81,7 @@ impl<'str, H: HostMut<'str>> SubPass<'str, H> for MemoryForwarding {
                     ic.numbering,
                 ) {
                     Some(value) => {
-                        ed.replace(host, ic.insn_id, value);
+                        ed.replace(&mut host, ic.insn_id, value);
                         state.define_load(load, value, ic.aliases, ic.numbering);
                     }
                     None => state.define_load(load, ic.id, ic.aliases, ic.numbering),
@@ -91,7 +98,7 @@ impl<'str, H: HostMut<'str>> SubPass<'str, H> for MemoryForwarding {
     // callee's result, not a value computed before the call).
     fn after_block(
         &self,
-        host: &mut H,
+        host: &mut Context<'str>,
         state: &mut dyn Any,
         block_id: BlockId,
         aliases: Option<&AliasResult>,

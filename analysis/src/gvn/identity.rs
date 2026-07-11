@@ -18,6 +18,7 @@
 //!   (a | b) + (a & b)         →  a + b
 //! ```
 
+use qcode::context::Context;
 use qcode::value::{
     Value, ValueId, ValueRef,
     insn::{Binary, Binop, IntBinop, Mnemonic, Simplified},
@@ -27,7 +28,7 @@ use qcode::value::{
 use super::fold::{all_ones, const_value};
 use std::any::Any;
 
-use super::walk::{Claim, Editor, InsnCtx, SubPass, SubPassC};
+use super::walk::{Claim, Editor, InsnCtx, ModuleSubPass, SubPassC};
 
 use crate::{ContextView, FunctionBody};
 
@@ -38,7 +39,7 @@ use crate::{ContextView, FunctionBody};
 /// either the module or a checked-out function.
 pub(super) struct Identities;
 
-impl<'str, H: HostMut<'str>> SubPass<'str, H> for Identities {
+impl<'str> ModuleSubPass<'str> for Identities {
     fn init_state(&self) -> Box<dyn Any> {
         Box::new(())
     }
@@ -47,7 +48,13 @@ impl<'str, H: HostMut<'str>> SubPass<'str, H> for Identities {
         Box::new(())
     }
 
-    fn on_insn(&self, host: &mut H, _state: &mut dyn Any, ic: &InsnCtx, ed: &mut Editor) -> Claim {
+    fn on_insn(
+        &self,
+        mut host: &mut Context<'str>,
+        _state: &mut dyn Any,
+        ic: &InsnCtx,
+        ed: &mut Editor,
+    ) -> Claim {
         if ic.mnemonic.is_terminator() || ic.size == 0 {
             return Claim::Pass;
         }
@@ -58,18 +65,18 @@ impl<'str, H: HostMut<'str>> SubPass<'str, H> for Identities {
             let args = intr.args.clone();
             match id.desc().simplify(host.read_host(), id, ic.size, &args) {
                 Some(Simplified::Value(repl)) => {
-                    ed.replace(host, ic.insn_id, repl);
+                    ed.replace(&mut host, ic.insn_id, repl);
                     return Claim::Done;
                 }
                 Some(Simplified::Expression(mnemonic)) => {
-                    ed.replace_with_new_insn(host, ic.block_id, ic.insn_id, mnemonic, ic.size);
+                    ed.replace_with_new_insn(&mut host, ic.block_id, ic.insn_id, mnemonic, ic.size);
                     return Claim::Done;
                 }
                 None => {}
             }
         }
         if let Some(new_mnemonic) = simplify_identity(host.read_host(), ic.mnemonic) {
-            ed.replace_with_new_insn(host, ic.block_id, ic.insn_id, new_mnemonic, ic.size);
+            ed.replace_with_new_insn(&mut host, ic.block_id, ic.insn_id, new_mnemonic, ic.size);
             return Claim::Done;
         }
         // Constant-absorbing / De Morgan rewrites intern a folded constant (through
@@ -77,10 +84,10 @@ impl<'str, H: HostMut<'str>> SubPass<'str, H> for Identities {
         // `simplify_identity`. They canonicalize obfuscated bit math — e.g. an
         // `i & 1` emitted as `~(~i | ~1)` with a redundant outer mask — back into
         // the plain `&`/`^` the full-adder idioms above then recognize.
-        if simplify_bitwise(host, ic, ed) {
+        if simplify_bitwise(&mut host, ic, ed) {
             return Claim::Done;
         }
-        if simplify_compare(host, ic, ed) {
+        if simplify_compare(&mut host, ic, ed) {
             return Claim::Done;
         }
         Claim::Pass
