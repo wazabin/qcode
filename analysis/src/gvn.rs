@@ -38,7 +38,7 @@ use identity::Identities;
 use intrinsics::Recognize;
 use memory::MemoryForwarding;
 use narrow::NarrowTrunc;
-use walk::{SubPassC, run_dominator_walk_c, run_flat_fixpoint_c, run_single_block};
+use walk::{SubPassC, run_dominator_walk_c, run_flat_fixpoint_c, run_single_block_c};
 
 /// The full GVN sub-pass chain. Order is load-bearing: memory forwarding must
 /// see loads/stores first, folding must run before idiom recognition (so shift
@@ -50,21 +50,10 @@ use walk::{SubPassC, run_dominator_walk_c, run_flat_fixpoint_c, run_single_block
 /// that used to sit between `NarrowTrunc` and `Recognize` are **not** here: they
 /// read pure *callee* bodies, an interprocedural read the parallel-safe function
 /// pass contract forbids, so they live in the [`concretize`] module pass.
-fn gvn_passes<'str>() -> Vec<Box<dyn walk::ModuleSubPass<'str>>> {
-    vec![
-        Box::new(MemoryForwarding),
-        Box::new(Fold),
-        Box::new(NarrowTrunc),
-        Box::new(Recognize),
-        Box::new(FlagIdiom),
-        Box::new(Identities),
-        Box::new(Cse),
-    ]
-}
-
-/// Concrete twin of [`gvn_passes`] (context-split stage 5b-ii): the same chain in
-/// the same order, over the host-free [`SubPassC`] surface, driving the
-/// function-pass GVN chain on a checked-out `(&mut FunctionBody, ContextView)`.
+///
+/// The chain runs over the host-free [`SubPassC`] surface on a checked-out
+/// `(&mut FunctionBody, ContextView)`; both the whole-function entry points and
+/// the single-block [`gvn`] drive it through the check-out shim.
 fn gvn_passes_c<'str>() -> Vec<Box<dyn SubPassC<'str>>> {
     vec![
         Box::new(MemoryForwarding),
@@ -194,8 +183,13 @@ fn narrow_body<'str>(
 /// Terminators, calls, and `PCodeOp` are excluded.
 pub fn gvn(block: &mut BlockMutRef, aliases: Option<&AliasResult>) {
     let block_id = block.id;
+    // The block's owning (storage) function — self-stored, so `id.func` is the
+    // function to check out and run the concrete single-block core against.
+    let func_id = block_id.func;
     let ctx = block.ctx_mut();
-    run_single_block(ctx, block_id, &gvn_passes(), aliases);
+    let _ = with_checked_out_body(ctx, func_id, |body, cx| {
+        run_single_block_c(body, cx, block_id, &gvn_passes_c(), aliases)
+    });
 }
 
 /// Dominator-tree GVN over an entire function.

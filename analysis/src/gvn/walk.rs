@@ -240,21 +240,6 @@ fn run_block<'str>(
     ed.finish(host)
 }
 
-/// Run the sub-passes over a single block with fresh state and no block-boundary
-/// hooks (no dominator tree exists for a lone block).
-pub(super) fn run_single_block<'str>(
-    host: &mut Context<'str>,
-    block_id: BlockId,
-    passes: &[Box<dyn ModuleSubPass<'str>>],
-    aliases: Option<&AliasResult>,
-) -> bool {
-    // No function context for a lone block: memory forwarding falls back to
-    // degenerate per-pointer bases (exact-match only).
-    let numbering = Numbering::default();
-    let mut states = init_states(passes);
-    run_block(host, block_id, passes, &mut states, aliases, &numbering)
-}
-
 /// The per-entry invariants of one dominator-tree walk.
 struct Walk<'a, 'str> {
     passes: &'a [Box<dyn ModuleSubPass<'str>>],
@@ -608,7 +593,24 @@ fn run_block_c<'str>(
     ed.finish_c(body, cx)
 }
 
-/// Concrete twin of [`run_flat_fixpoint`].
+/// Run the sub-passes over a single block with fresh state and no block-boundary
+/// hooks (no dominator tree exists for a lone block), over a checked-out
+/// `(&mut FunctionBody, ContextView)`.
+pub(super) fn run_single_block_c<'str>(
+    body: &mut FunctionBody<'str>,
+    cx: ContextView<'_, 'str>,
+    block_id: BlockId,
+    passes: &[Box<dyn SubPassC<'str>>],
+    aliases: Option<&AliasResult>,
+) -> bool {
+    // No function context for a lone block: memory forwarding falls back to
+    // degenerate per-pointer bases (exact-match only).
+    let numbering = Numbering::default();
+    let mut states = init_states_c(passes);
+    run_block_c(body, cx, block_id, passes, &mut states, aliases, &numbering)
+}
+
+/// Concrete single-function-scope twin of the flat fixpoint driver.
 pub(super) fn run_flat_fixpoint_c<'str>(
     body: &mut FunctionBody<'str>,
     cx: ContextView<'_, 'str>,
