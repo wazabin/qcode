@@ -220,14 +220,14 @@ mod tests {
 
         assert_eq!(
             ptr.space().map(|s| s.id),
-            Some(ctx.default_space),
+            Some(ctx.shared.default_space),
             "expected default space for pointer arithmetic without provenance"
         );
 
         let Mnemonic::Load(load) = value.mnemonic() else {
             panic!("expected load instruction");
         };
-        assert_eq!(load.space, ctx.default_space);
+        assert_eq!(load.space, ctx.shared.default_space);
         assert_eq!(
             value.as_statement().to_string(),
             "i64 %v = load(ram:8, i64 %ptr);"

@@ -347,7 +347,7 @@ impl MemForward {
             let bytes: Vec<u8> = match seg.src {
                 ValueId::Literal(lid) => {
                     // Numeric literal: bail on symbolic refs; take the LE bytes.
-                    let lit = &ctx.values.literals[lid];
+                    let lit = &ctx.shared.values.literals[lid];
                     if lit.symbolic.is_some() {
                         return None;
                     }
@@ -356,7 +356,7 @@ impl MemForward {
                     le.get(seg.src_off..seg.src_off + seg.size)?.to_vec()
                 }
                 ValueId::Bytes(bid) => {
-                    let data = &ctx.values.bytes[bid].data;
+                    let data = &ctx.shared.values.bytes[bid].data;
                     data.get(seg.src_off..seg.src_off + seg.size)?.to_vec()
                 }
                 // Non-constant source: nothing to fold to.
@@ -939,9 +939,9 @@ mod tests {
             f.add_block(root);
         }
         let pid = BasicBlock::from_id_mut(&mut tc.ctx, root).push_param(8).id;
-        tc.ctx.values.block_param_mut(pid).origin = Some(ValueId::Varnode(sp_reg));
+        tc.ctx.block_param_mut(pid).origin = Some(ValueId::Varnode(sp_reg));
         let sp = ValueId::BlockParam(pid);
-        let ram = tc.ctx.default_space;
+        let ram = tc.ctx.shared.default_space;
 
         // `slot = ((@SP - 0x10) & -8) - 0x78`; spill an 8-byte value into it, then
         // end the block with a direct call carrying no arguments (nothing escapes).
@@ -1044,7 +1044,7 @@ mod tests {
 
     fn literal_of(ctx: &Context, v: ValueId) -> Option<u64> {
         match v {
-            ValueId::Literal(lid) => Some(ctx.values.literals[lid].value),
+            ValueId::Literal(lid) => Some(ctx.shared.values.literals[lid].value),
             _ => None,
         }
     }
@@ -1107,7 +1107,7 @@ mod tests {
             unsafe { b.dont_finalize() };
         }
 
-        let ram = tc.ctx.default_space;
+        let ram = tc.ctx.shared.default_space;
         let symbolic = Base::Symbolic(ram, ValueId::Varnode(tc.r1));
         let pinned = Base::Pinned(ram);
         let src = ValueId::Varnode(tc.r2);
@@ -1139,7 +1139,7 @@ mod tests {
         use qcode::value::insn::Call;
 
         let mut tc = TestContext::new();
-        let ram = tc.ctx.default_space;
+        let ram = tc.ctx.shared.default_space;
         let callee = Function::make(&mut tc.ctx, "callee".into()).unwrap().id;
         // A resolved callee with an empty clobber set, so registers are irrelevant.
         Function::from_id_mut(&mut tc.ctx, callee).set_clobbered_regs(vec![]);
@@ -1255,7 +1255,7 @@ mod tests {
         // The callee's witnessed write-set is exactly its own scratch space — it
         // never writes real `ram`.
         let scratch = tc.ctx.make_temp_space();
-        let ram = tc.ctx.default_space;
+        let ram = tc.ctx.shared.default_space;
         Function::from_id_mut(&mut tc.ctx, callee).set_written_spaces(Some(vec![scratch]));
 
         // The caller block ends in a direct call to `callee`, passing a frame

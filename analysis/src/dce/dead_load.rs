@@ -88,7 +88,7 @@ fn killed_covers_loc(host: HostRef, iv: KilledInterval, l: &LiveLoc) -> bool {
 }
 
 pub(crate) fn is_temp_space(ctx: &Context, space_id: SpaceId) -> bool {
-    !is_reg_space(ctx, space_id) && space_id != ctx.default_space
+    !is_reg_space(ctx, space_id) && space_id != ctx.shared.default_space
 }
 
 /// True for spaces whose stores are eligible for cross-block dead-store
@@ -126,7 +126,7 @@ fn base_plus_offset(host: HostRef, ptr: ValueId) -> (ValueId, i64) {
         };
         let (op, lhs, rhs) = (b.op, b.lhs, b.rhs);
         let lit = |v: ValueId| match v {
-            ValueId::Literal(lid) => Some(host.shared().values.literals[lid].value as i64),
+            ValueId::Literal(lid) => Some(host.shared().shared.values.literals[lid].value as i64),
             _ => None,
         };
         match op {
@@ -171,14 +171,14 @@ fn addr_key(host: HostRef, ptr: ValueId) -> (AddrBase, i64) {
     if let ValueId::Literal(lid) = ptr {
         return (
             AddrBase::Absolute,
-            host.shared().values.literals[lid].value as i64,
+            host.shared().shared.values.literals[lid].value as i64,
         );
     }
     let (base, off) = base_plus_offset(host, ptr);
     match base {
         ValueId::Literal(lid) => (
             AddrBase::Absolute,
-            host.shared().values.literals[lid].value as i64 + off,
+            host.shared().shared.values.literals[lid].value as i64 + off,
         ),
         other => (AddrBase::Sym(other), off),
     }
@@ -203,7 +203,7 @@ fn disjoint_access(
 fn ptr_offset(host: HostRef, ptr: ValueId) -> Option<i64> {
     match ptr {
         ValueId::Varnode(id) => Some(Varnode::from_id(host.shared(), id).address()),
-        ValueId::Literal(lid) => Some(host.shared().values.literals[lid].value as i64),
+        ValueId::Literal(lid) => Some(host.shared().shared.values.literals[lid].value as i64),
         _ => None,
     }
 }
@@ -899,7 +899,7 @@ fn postdominated_dead_ram_stores(
         return HashSet::default();
     }
 
-    let ram = host.shared().default_space;
+    let ram = host.shared().shared.default_space;
     let node_set: HashSet<BlockId> = blocks.iter().copied().collect();
     let exit_set: HashSet<BlockId> = blocks
         .iter()
@@ -1313,7 +1313,7 @@ mod tests {
         build_block(|b| {
             let r1 = b.context().get_named("r1").unwrap().as_varnode().unwrap();
             let regsp = reg_space(b.context());
-            let ram = b.context().default_space;
+            let ram = b.context().shared.default_space;
             let base = b.push_load::<false>(ValueId::Varnode(r1), 8, regsp).id();
 
             let at = |b: &mut Builder<'static, '_>, off: u64| {
@@ -1584,10 +1584,10 @@ mod tests {
             f.add_block(root);
         }
         let sp_pid = BasicBlock::from_id_mut(&mut tc.ctx, root).push_param(8).id;
-        tc.ctx.values.block_param_mut(sp_pid).origin = Some(ValueId::Varnode(sp_reg));
+        tc.ctx.block_param_mut(sp_pid).origin = Some(ValueId::Varnode(sp_reg));
         let sp = ValueId::BlockParam(sp_pid);
 
-        let ram = tc.ctx.default_space;
+        let ram = tc.ctx.shared.default_space;
         {
             let mut b = Builder::from_block(BasicBlock::from_id_mut(&mut tc.ctx, root));
             let c18 = b.context_mut().get_const(0x18, 8).id();
@@ -1654,10 +1654,10 @@ mod tests {
             f.add_block(root);
         }
         let sp_pid = BasicBlock::from_id_mut(&mut tc.ctx, root).push_param(8).id;
-        tc.ctx.values.block_param_mut(sp_pid).origin = Some(ValueId::Varnode(sp_reg));
+        tc.ctx.block_param_mut(sp_pid).origin = Some(ValueId::Varnode(sp_reg));
         let sp = ValueId::BlockParam(sp_pid);
 
-        let ram = tc.ctx.default_space;
+        let ram = tc.ctx.shared.default_space;
         {
             let mut b = Builder::from_block(BasicBlock::from_id_mut(&mut tc.ctx, root));
             let c8 = b.context_mut().get_const(8, 8).id();
@@ -1943,7 +1943,7 @@ mod tests {
             .iter()
             .flat_map(|b| b.iter().map(|i| i.id).collect::<Vec<_>>())
             .filter(|&id| {
-                matches!(ctx.get_insn(id).mnemonic(), Mnemonic::Store(s) if s.space == ctx.default_space)
+                matches!(ctx.get_insn(id).mnemonic(), Mnemonic::Store(s) if s.space == ctx.shared.default_space)
             })
             .count()
     }
@@ -2260,7 +2260,7 @@ fn frame_aware_aliases<'a, 'str: 'a>(
 ) -> AliasResult {
     let ctx = m.shared_ctx();
     let env = m.env();
-    let sp_reg = ctx.registers.get(&env.cfg.stack_pointer).copied();
+    let sp_reg = ctx.shared.registers.get(&env.cfg.stack_pointer).copied();
     env.alias_base(ctx)
         .for_function(host, fun_id)
         .with_frame_freshness(host, fun_id, sp_reg)

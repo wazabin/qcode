@@ -60,10 +60,10 @@ impl Intrinsic for Iota {
             return None;
         };
         let ctx = host.shared();
-        let n = ctx.values.literals[lid].value as usize;
+        let n = ctx.shared.values.literals[lid].value as usize;
 
-        let i64_ty = ctx.types.get_or_make_int(8);
-        let arr_ty = ctx.types.get_or_make_array(i64_ty, n);
+        let i64_ty = ctx.shared.types.get_or_make_int(8);
+        let arr_ty = ctx.shared.types.get_or_make_array(i64_ty, n);
 
         // `n == 0` is a degenerate empty array; `n == 1` (8 bytes) still fits a
         // numeric literal. Everything wider becomes a `Bytes` blob typed `[i64;n]`.
@@ -119,13 +119,13 @@ mod tests {
         else {
             panic!("iota(3) should fold to a Bytes array");
         };
-        let bytes = &ctx.values.bytes[bid];
+        let bytes = &ctx.shared.values.bytes[bid];
         assert_eq!(bytes.data.len(), 24);
         assert_eq!(&bytes.data[0..8], &0u64.to_le_bytes());
         assert_eq!(&bytes.data[8..16], &1u64.to_le_bytes());
         assert_eq!(&bytes.data[16..24], &2u64.to_le_bytes());
-        let i64_ty = ctx.types.get_or_make_int(8);
-        assert_eq!(ctx.types.array_of(bytes.type_id), Some((i64_ty, 3)));
+        let i64_ty = ctx.shared.types.get_or_make_int(8);
+        assert_eq!(ctx.shared.types.array_of(bytes.type_id), Some((i64_ty, 3)));
     }
 
     /// A symbolic `n` does not fold.

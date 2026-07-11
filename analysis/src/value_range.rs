@@ -141,7 +141,7 @@ fn all_ones(size: usize) -> u64 {
 /// constants and must not participate in interval arithmetic.
 fn numeric_const(ctx: &Context, v: ValueId) -> Option<u64> {
     if let ValueId::Literal(id) = v
-        && ctx.values.literals[id].symbolic.is_some()
+        && ctx.shared.values.literals[id].symbolic.is_some()
     {
         return None;
     }
@@ -287,7 +287,7 @@ impl Solver<'_> {
         // A `bool`-typed result is pinned to `{0, 1}` by the type system — a
         // strict improvement over sniffing individual op patterns, and what keeps
         // a bitwise `bool & bool` switch index (lifted `ja`/`jbe`) bounded.
-        if ctx.types.is_bool(insn.type_id()) {
+        if ctx.shared.types.is_bool(insn.type_id()) {
             return ValueRange { min: 0, max: 1 };
         }
 
@@ -401,7 +401,7 @@ impl Solver<'_> {
         let ValueId::BlockParam(pid) = v else {
             return top;
         };
-        let Some(parent) = self.ctx.values.block_param(pid).parent else {
+        let Some(parent) = self.ctx.block_param(pid).parent else {
             return top;
         };
         let Some(k) = BasicBlock::from_id(self.ctx, parent)
@@ -703,7 +703,7 @@ impl Solver<'_> {
     fn is_bool_val(&self, v: ValueId) -> bool {
         self.ctx
             .stored_type_of(v)
-            .is_some_and(|t| self.ctx.types.is_bool(t))
+            .is_some_and(|t| self.ctx.shared.types.is_bool(t))
     }
 
     /// The value of `v` if it is a `bool` constant (`true`/`false`).

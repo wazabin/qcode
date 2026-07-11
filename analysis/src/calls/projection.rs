@@ -76,7 +76,7 @@ impl Projection {
 /// itself an aggregate is left to the caller's scalar-only handling; the slice is
 /// still computed over its components.
 pub fn project_return(ctx: &Context, fid: FunctionId, field: usize) -> Option<Projection> {
-    let root = ctx.values.functions[fid].root?;
+    let root = ctx.bodies[fid].root?;
 
     // Map every instruction to its block once, and collect the block list, for
     // control-dependence reachability below.
@@ -134,7 +134,7 @@ pub fn project_return(ctx: &Context, fid: FunctionId, field: usize) -> Option<Pr
                 }
                 ValueId::BlockParam(pid) => {
                     proj.block_params.insert(pid);
-                    let param = &ctx.values.block_param(pid);
+                    let param = &ctx.block_param(pid);
                     let Some(parent) = param.parent else {
                         proj.opaque = true;
                         continue;
@@ -303,7 +303,7 @@ mod tests {
         let ValueId::BlockParam(pid) = v else {
             panic!("expected a block param");
         };
-        ctx.values.block_param(pid).index
+        ctx.block_param(pid).index
     }
 
     /// `foo(a, b) = (a, b*69 + 42)` — a straight-line pure function. Field 0 is

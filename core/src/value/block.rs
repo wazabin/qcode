@@ -136,7 +136,7 @@ impl<'str> BasicBlock<'str> {
             parent: Some(func),
             ..BasicBlock::default()
         };
-        let id = ctx.values.push_block(func, block);
+        let id = ctx.push_block(func, block);
         BlockMutRef::new(ctx, id)
     }
 
@@ -181,11 +181,8 @@ impl<'str> BasicBlock<'str> {
 
         // Preserve the original label, deduplicated within the target function's
         // own (function-scoped) name table.
-        let name = ctx.values.block(orig).name.clone().unwrap_or_else(|| {
-            Cow::Owned(format!(
-                "clone_{:x}",
-                ctx.values.block(orig).address.unwrap_or(0)
-            ))
+        let name = ctx.block(orig).name.clone().unwrap_or_else(|| {
+            Cow::Owned(format!("clone_{:x}", ctx.block(orig).address.unwrap_or(0)))
         });
         let unique_name = ctx.get_unique_name_in(target, name);
         BasicBlock::from_id_mut(ctx, new_block_id)
@@ -193,9 +190,9 @@ impl<'str> BasicBlock<'str> {
             .expect("name was deduplicated");
 
         // Clone parameters verbatim (parent re-pointed at the new block).
-        for old_param_id in &ctx.values.block(orig).params.clone() {
-            let old_param = ctx.values.block_param(*old_param_id).clone();
-            let new_param_id = ctx.values.push_block_param(
+        for old_param_id in &ctx.block(orig).params.clone() {
+            let old_param = ctx.block_param(*old_param_id).clone();
+            let new_param_id = ctx.push_block_param(
                 target,
                 BlockParam {
                     parent: Some(new_block_id),
@@ -211,7 +208,7 @@ impl<'str> BasicBlock<'str> {
 
         // Clone instructions verbatim, preserving the exact result type and the
         // machine address. Operands are copied as-is; the caller remaps them.
-        let orig_insns = ctx.values.block(orig).instructions.clone();
+        let orig_insns = ctx.block(orig).instructions.clone();
         for &old_insn_id in orig_insns.iter() {
             let (mnemonic, type_id, address) = {
                 let insn = Instruction::from_id(&*ctx, old_insn_id);
@@ -220,7 +217,7 @@ impl<'str> BasicBlock<'str> {
             let new_insn_id =
                 InstructionRef::from_mnemonic_with_type(ctx, target, mnemonic, type_id).id;
             if let Some(addr) = address {
-                ctx.values.instruction_mut(new_insn_id).set_address(addr);
+                ctx.instruction_mut(new_insn_id).set_address(addr);
             }
             BasicBlock::from_id_mut(ctx, new_block_id).push_insn(new_insn_id);
             value_map.insert(
@@ -242,19 +239,16 @@ impl<'str> BasicBlock<'str> {
         // Create a fresh block in the same function as `orig`.
         let new_block_id = BasicBlock::make(ctx, orig.func).id;
 
-        let name = Cow::Owned(format!(
-            "clone_{:x}",
-            ctx.values.block(orig).address.unwrap_or(0)
-        ));
+        let name = Cow::Owned(format!("clone_{:x}", ctx.block(orig).address.unwrap_or(0)));
         let unique_name = ctx.get_unique_name_in(new_block_id.func, name);
         BasicBlock::from_id_mut(ctx, new_block_id)
             .rename(unique_name)
             .expect("name was deduplicated");
 
         // Clone parameters
-        for old_param_id in &ctx.values.block(orig).params.clone() {
-            let old_param = ctx.values.block_param(*old_param_id).clone();
-            let new_param_id = ctx.values.push_block_param(
+        for old_param_id in &ctx.block(orig).params.clone() {
+            let old_param = ctx.block_param(*old_param_id).clone();
+            let new_param_id = ctx.push_block_param(
                 new_block_id.func,
                 BlockParam {
                     parent: Some(new_block_id),
@@ -270,7 +264,7 @@ impl<'str> BasicBlock<'str> {
         }
 
         // Clone instructions
-        let orig_insns = ctx.values.block(orig).instructions.clone();
+        let orig_insns = ctx.block(orig).instructions.clone();
         for &old_insn_id in orig_insns.iter() {
             // Extract information from the old instruciton
             let insn_ref = Instruction::from_id(&*ctx, old_insn_id);
@@ -564,22 +558,16 @@ where
 
 impl Named for BlockMutRef<'_, '_> {
     fn name(&self) -> Option<&str> {
-        self.ctx.values.block(self.id).name.as_deref()
+        self.ctx.block(self.id).name.as_deref()
     }
 }
 
 impl<'str, 'ctx> Renameable<'str, 'ctx> for BlockMutRef<'str, 'ctx> {
     fn rename(&mut self, name: Cow<'str, str>) -> Result<()> {
         let id = self.id.into();
-        let old_name = self
-            .ctx
-            .values
-            .block(self.id)
-            .name
-            .as_deref()
-            .map(str::to_owned);
+        let old_name = self.ctx.block(self.id).name.as_deref().map(str::to_owned);
         update_context_name(id, self.ctx, name.clone(), old_name.as_deref())?;
-        self.ctx.values.block_mut(self.id).name = Some(name);
+        self.ctx.block_mut(self.id).name = Some(name);
         Ok(())
     }
 }
@@ -723,12 +711,11 @@ impl<'str, 'ctx> BlockMutRef<'str, 'ctx> {
     }
 
     pub(in crate::value) fn inner_mut(&mut self) -> &mut BasicBlock<'str> {
-        self.ctx.values.block_mut(self.id)
+        self.ctx.block_mut(self.id)
     }
 
     pub fn parent_mut(&mut self) -> Option<FunctionMutRef<'str, '_>> {
         self.ctx
-            .values
             .block(self.id)
             .parent
             .map(|fid| Function::from_id_mut(self.ctx, fid))
@@ -746,8 +733,8 @@ impl<'str, 'ctx> BlockMutRef<'str, 'ctx> {
     pub fn push_param(&mut self, size: usize) -> BlockParamMutRef<'str, '_> {
         let block_id = self.id;
         let index = self.inner().params.len();
-        let type_id = self.ctx.types.get_or_make_int(size);
-        let id = self.ctx.values.push_block_param(
+        let type_id = self.ctx.shared.types.get_or_make_int(size);
+        let id = self.ctx.push_block_param(
             block_id.func,
             BlockParam {
                 index,

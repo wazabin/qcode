@@ -95,7 +95,7 @@ fn nonzero_polarity(host: HostRef, cond: ValueId, elem: ValueId) -> Option<bool>
     };
     let is_bool = |v: ValueId| {
         host.stored_type_of(v)
-            .is_some_and(|t| host.shared().types.is_bool(t))
+            .is_some_and(|t| host.shared().shared.types.is_bool(t))
     };
     let bool_const = |v: ValueId| {
         (is_bool(v) && matches!(v, ValueId::Literal(_)))
@@ -160,8 +160,8 @@ fn try_match_strlen(host: HostRef, fid: FunctionId) -> Option<StrlenMatch> {
             }
             let byte_array = host
                 .stored_type_of(args[0])
-                .and_then(|t| host.shared().types.array_of(t))
-                .is_some_and(|(elem, _)| host.shared().types.size_of(elem) == 1);
+                .and_then(|t| host.shared().shared.types.array_of(t))
+                .is_some_and(|(elem, _)| host.shared().shared.types.size_of(elem) == 1);
             if !byte_array {
                 continue;
             }
@@ -608,10 +608,10 @@ mod tests {
         stray: bool,
     ) -> (FunctionId, BlockId, ValueId) {
         const N: usize = 4;
-        let i8 = tc.ctx.types.get_or_make_int(1);
-        let arr_ty = tc.ctx.types.get_or_make_array(i8, N);
+        let i8 = tc.ctx.shared.types.get_or_make_int(1);
+        let arr_ty = tc.ctx.shared.types.get_or_make_array(i8, N);
         let shadow = tc.ctx.make_temp_space();
-        let ram = tc.ctx.default_space;
+        let ram = tc.ctx.shared.default_space;
 
         let fid = Function::make(&mut tc.ctx, "copy".into()).unwrap().id;
         let entry = tc.ctx.get_or_make_block(0x1000, fid);
@@ -629,7 +629,7 @@ mod tests {
 
         // Root params: arr:[i8;N], base_src, base_dst (the call interface).
         let arr_pid = BasicBlock::from_id_mut(&mut tc.ctx, entry).push_param(N).id;
-        tc.ctx.values.block_param_mut(arr_pid).type_id = arr_ty;
+        tc.ctx.block_param_mut(arr_pid).type_id = arr_ty;
         let arr = ValueId::BlockParam(arr_pid);
         let base_src =
             ValueId::BlockParam(BasicBlock::from_id_mut(&mut tc.ctx, entry).push_param(8).id);
@@ -708,10 +708,10 @@ mod tests {
         extra_break: bool,
     ) -> (FunctionId, BlockId, ValueId) {
         const N: usize = 8;
-        let i8 = tc.ctx.types.get_or_make_int(1);
-        let arr_ty = tc.ctx.types.get_or_make_array(i8, N);
+        let i8 = tc.ctx.shared.types.get_or_make_int(1);
+        let arr_ty = tc.ctx.shared.types.get_or_make_array(i8, N);
         let shadow = tc.ctx.make_temp_space();
-        let ram = tc.ctx.default_space;
+        let ram = tc.ctx.shared.default_space;
 
         let fid = Function::make(&mut tc.ctx, "slen".into()).unwrap().id;
         let entry = tc.ctx.get_or_make_block(0x1000, fid);
@@ -728,7 +728,7 @@ mod tests {
         }
 
         let arr_pid = BasicBlock::from_id_mut(&mut tc.ctx, entry).push_param(N).id;
-        tc.ctx.values.block_param_mut(arr_pid).type_id = arr_ty;
+        tc.ctx.block_param_mut(arr_pid).type_id = arr_ty;
         let arr = ValueId::BlockParam(arr_pid);
         let base =
             ValueId::BlockParam(BasicBlock::from_id_mut(&mut tc.ctx, entry).push_param(8).id);
@@ -893,7 +893,7 @@ mod tests {
         tc: &mut TestContext,
         with_diff: bool,
     ) -> (FunctionId, BlockId, ValueId) {
-        let ram = tc.ctx.default_space;
+        let ram = tc.ctx.shared.default_space;
         let fid = Function::make(&mut tc.ctx, "strlen".into()).unwrap().id;
         let entry = tc.ctx.get_or_make_block(0x2000, fid);
         let header = tc.ctx.get_or_make_block(0x2010, fid);
@@ -977,7 +977,7 @@ mod tests {
             });
         let tw_ty = tw_ty.expect("a take_while was inserted");
         assert_eq!(
-            tc.ctx.types.list_of(tw_ty).map(|(_, b)| b),
+            tc.ctx.shared.types.list_of(tw_ty).map(|(_, b)| b),
             Some(None),
             "unbounded list"
         );

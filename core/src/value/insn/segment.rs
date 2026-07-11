@@ -113,7 +113,7 @@ impl<'a, 'str> Seg<'a, 'str> {
     /// `write!(f, "{} ", type_name)` in `ValueRef`'s `Display`.
     fn ty(&mut self, type_id: crate::types::TypeId) {
         self.push(
-            format!("{} ", self.ctx.types.type_name(type_id)),
+            format!("{} ", self.ctx.shared.types.type_name(type_id)),
             TokenKind::Type,
             None,
         );
@@ -214,7 +214,7 @@ impl<'a, 'str> Seg<'a, 'str> {
 
 /// The bare atom for an instruction result: `%name` or `%tmp<id>`.
 fn instruction_atom(ctx: &Context<'_>, id: crate::value::InstructionId) -> String {
-    match ctx.values.instruction(id).name.as_deref() {
+    match ctx.instruction(id).name.as_deref() {
         Some(name) => format!("%{name}"),
         None => format!("%tmp{:x}", usize::from(id.local)),
     }
@@ -267,6 +267,7 @@ fn tuple_with_type(seg: &mut Seg, t: &crate::value::insn::Tuple, type_id: crate:
         }
         let name = seg
             .ctx
+            .shared
             .types
             .field_name(type_id, i)
             .map(str::to_owned)
@@ -547,7 +548,7 @@ fn mnemonic_segments(seg: &mut Seg, m: &Mnemonic) {
             }
         }
         Mnemonic::PCodeOp(p) => {
-            let op = seg.ctx.pcode_ops[p.id].to_string();
+            let op = seg.ctx.shared.pcode_ops[p.id].to_string();
             if let Some(dst) = p.dst {
                 seg.value(dst);
                 seg.op(" = ");

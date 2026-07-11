@@ -210,7 +210,7 @@ fn apply<'str>(mv: ContextView<'_, 'str>, body: &mut FunctionBody<'str>, m: &Sca
         let host = body.read_host(mv);
         (
             host.type_of(m.index),
-            host.shared().types.get_or_make_int(8),
+            host.shared().shared.types.get_or_make_int(8),
             format!("{}_scan_body", host.function_ref(fid).name()),
         )
     };
@@ -231,7 +231,7 @@ fn apply<'str>(mv: ContextView<'_, 'str>, body: &mut FunctionBody<'str>, m: &Sca
     let (body_fn, src_kind, src_arr_ty) = match m.elem {
         Some((elem_read, l0_exit)) => {
             let (esz, src_arr_ty) = {
-                let types = &body.read_host(mv).shared().types;
+                let types = &body.read_host(mv).shared().shared.types;
                 (
                     types.size_of(m.elem_ty),
                     types.get_or_make_array(m.elem_ty, n1),
@@ -258,6 +258,7 @@ fn apply<'str>(mv: ContextView<'_, 'str>, body: &mut FunctionBody<'str>, m: &Sca
             let src_arr_ty = body
                 .read_host(mv)
                 .shared()
+                .shared
                 .types
                 .get_or_make_array(i64_ty, n1);
             let Some(body_fn) = outline_scan_body(

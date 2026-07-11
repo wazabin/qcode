@@ -56,7 +56,7 @@
 //!
 //! // Emit a load from memory
 //! let ptr = /* some ValueId */;
-//! let value = builder.push_load(ptr, 8, ctx.default_space);
+//! let value = builder.push_load(ptr, 8, ctx.shared.default_space);
 //!
 //! // Terminate the block: emit an unconditional branch to 0x1010
 //! builder.finalize(0x1010);

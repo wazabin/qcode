@@ -73,9 +73,9 @@ impl<'str> BlockParam<'str> {
         block_id: BlockId,
         size: usize,
     ) -> BlockParamMutRef<'str, 'ctx> {
-        let type_id = ctx.types.get_or_make_int(size);
-        let index = ctx.values.block(block_id).params.len();
-        let id = ctx.values.push_block_param(
+        let type_id = ctx.shared.types.get_or_make_int(size);
+        let index = ctx.block(block_id).params.len();
+        let id = ctx.push_block_param(
             block_id.func,
             BlockParam {
                 index,
@@ -122,7 +122,7 @@ where
 
     /// Size of this parameter's value in bytes.
     pub fn size(&'s self) -> usize {
-        self.ctx().types.size_of(self.inner().type_id)
+        self.ctx().shared.types.size_of(self.inner().type_id)
     }
 
     /// The block this parameter belongs to, if any.
@@ -143,7 +143,7 @@ where
         // Surface a richer-than-integer type (e.g. a seeded `TEB*` segment base)
         // as a `Type ` prefix. Plain `Int` params stay bare `@name` so the many
         // existing signature assertions (`<f @ESP @EDI>`) are unaffected.
-        let types = &self.ctx().types;
+        let types = &self.ctx().shared.types;
         let ty = types.type_name(self.type_id());
         if types.pointee_of(self.type_id()).is_some()
             || types.struct_name_of(self.type_id()).is_some()
@@ -165,7 +165,7 @@ where
     /// params (no parser syntax) and unnamed/untyped params fall back to the
     /// operand rendering.
     pub(crate) fn fmt_decl(&'s self, f: &mut Formatter<'_>) -> std::fmt::Result {
-        let types = &self.ctx().types;
+        let types = &self.ctx().shared.types;
         let tid = self.type_id();
         let is_scalar = types.pointee_of(tid).is_none() && types.struct_name_of(tid).is_none();
         match (self.name(), is_scalar && self.size() > 0) {
@@ -215,7 +215,7 @@ pub type BlockParamMutRef<'str, 'ctx> = BaseRef<&'ctx mut Context<'str>, BlockPa
 
 impl<'str, 'ctx> BlockParamMutRef<'str, 'ctx> {
     fn inner_mut(&mut self) -> &mut BlockParam<'str> {
-        self.ctx.values.block_param_mut(self.id)
+        self.ctx.block_param_mut(self.id)
     }
 
     /// Record the source value this param promotes (see [`BlockParam::origin`]).
@@ -250,7 +250,7 @@ where
     Ctx: HostMut<'str>,
 {
     pub fn set_size(&mut self, size: usize) {
-        let type_id = self.ctx.shared().types.get_or_make_int(size);
+        let type_id = self.ctx.shared().shared.types.get_or_make_int(size);
         self.ctx.block_param_mut(self.id).type_id = type_id;
     }
 
@@ -292,7 +292,7 @@ impl<'s, 'ctx: 's, 'str: 'ctx> WithCtxMut<'s, 'str> for BlockParamMutRef<'str, '
 
 impl Named for BlockParamMutRef<'_, '_> {
     fn name(&self) -> Option<&str> {
-        self.ctx.values.block_param(self.id).name.as_deref()
+        self.ctx.block_param(self.id).name.as_deref()
     }
 }
 
@@ -317,7 +317,7 @@ impl<'str, 'ctx> Renameable<'str, 'ctx> for BlockParamMutRef<'str, 'ctx> {
         let id = self.id.into();
         let old_name = self.inner_mut().name.take();
         update_context_name(id, self.ctx, name.clone(), old_name.as_deref())?;
-        self.ctx.values.block_param_mut(self.id).name = Some(name);
+        self.ctx.block_param_mut(self.id).name = Some(name);
         Ok(())
     }
 }

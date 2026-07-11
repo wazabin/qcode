@@ -164,7 +164,7 @@ where
 
     /// The size in bytes of the instruction's output value
     pub fn size(&'s self) -> usize {
-        self.ctx().types.size_of(self.inner().type_id)
+        self.ctx().shared.types.size_of(self.inner().type_id)
     }
 
     /// The basic block that this instruction belongs to, if any.
@@ -204,6 +204,7 @@ where
     /// known memory space (e.g. [`StackAddress`](crate::types::StackAddress)).
     pub fn space(&'s self) -> Option<SpaceRef<'ctx>> {
         self.ctx()
+            .shared
             .types
             .space_of(self.inner().type_id)
             .map(|id| Space::from_id(self.ctx(), id))
@@ -220,7 +221,7 @@ where
     }
 
     fn fmt(&'s self, f: &mut Formatter<'_>) -> std::fmt::Result {
-        let ty = self.ctx().types.type_name(self.type_id());
+        let ty = self.ctx().shared.types.type_name(self.type_id());
 
         if let Some(name) = self.name() {
             write!(f, "{ty} %{name}")
@@ -247,7 +248,7 @@ where
     pub fn set_result_type(&mut self, new_type: TypeId) {
         let current = self.ctx.read_host().instruction(self.id).type_id;
         let (current_size, new_size) = {
-            let types = &self.ctx.shared().types;
+            let types = &self.ctx.shared().shared.types;
             (types.size_of(current), types.size_of(new_type))
         };
         assert!(
@@ -287,9 +288,9 @@ impl<'str, 'ctx> InstructionRef<'str, 'ctx> {
         mnemonic: Mnemonic,
         size: usize,
     ) -> Self {
-        let type_id = ctx.types.get_or_make_int(size);
+        let type_id = ctx.shared.types.get_or_make_int(size);
         let insn = Instruction::new(type_id, mnemonic);
-        let id = ctx.values.push_insn(func, insn);
+        let id = ctx.push_insn(func, insn);
         InstructionRef::new(HostRef::Module(ctx), id)
     }
 
@@ -305,7 +306,7 @@ impl<'str, 'ctx> InstructionRef<'str, 'ctx> {
         type_id: TypeId,
     ) -> Self {
         let insn = Instruction::new(type_id, mnemonic);
-        let id = ctx.values.push_insn(func, insn);
+        let id = ctx.push_insn(func, insn);
         InstructionRef::new(HostRef::Module(ctx), id)
     }
 
@@ -320,9 +321,9 @@ impl<'str, 'ctx> InstructionRef<'str, 'ctx> {
         size: usize,
         _space: Option<SpaceId>,
     ) -> Self {
-        let type_id = ctx.types.get_or_make_int(size);
+        let type_id = ctx.shared.types.get_or_make_int(size);
         let insn = Instruction::new(type_id, mnemonic);
-        let id = ctx.values.push_insn(func, insn);
+        let id = ctx.push_insn(func, insn);
         InstructionRef::new(HostRef::Module(ctx), id)
     }
 
@@ -370,7 +371,7 @@ pub type InstructionMutRef<'str, 'ctx> = BaseRef<&'ctx mut Context<'str>, Instru
 
 impl<'str, 'ctx> InstructionMutRef<'str, 'ctx> {
     pub fn inner_mut(&mut self) -> &mut Instruction<'str> {
-        self.ctx.values.instruction_mut(self.id)
+        self.ctx.instruction_mut(self.id)
     }
 
     pub fn mnemonic_mut(&mut self) -> &mut Mnemonic {
@@ -386,13 +387,13 @@ impl<'str, 'ctx> InstructionMutRef<'str, 'ctx> {
         // Operand uses are recorded in this instruction's own function map.
         let func = self.id.func;
         for arg in old_args {
-            if let Some(users) = self.ctx.values.functions[func].users.get_mut(&arg) {
+            if let Some(users) = self.ctx.bodies[func].users.get_mut(&arg) {
                 users.retain(|&user| user != self.id);
             }
         }
 
         for arg in new_args {
-            self.ctx.values.functions[func]
+            self.ctx.bodies[func]
                 .users
                 .entry(arg)
                 .or_default()
@@ -416,8 +417,8 @@ impl<'str, 'ctx> InstructionMutRef<'str, 'ctx> {
     /// `new_type` (same size but different kind).
     pub fn set_type(&mut self, new_type: TypeId) {
         let current = self.inner().type_id;
-        let current_size = self.ctx.types.size_of(current);
-        let new_size = self.ctx.types.size_of(new_type);
+        let current_size = self.ctx.shared.types.size_of(current);
+        let new_size = self.ctx.shared.types.size_of(new_type);
         if current_size != 0 && current_size != new_size {
             panic!(
                 "Cannot change type of instruction {}: size {} → {}",
@@ -448,8 +449,8 @@ impl<'str, 'ctx> InstructionMutRef<'str, 'ctx> {
         if matches!(Space::from_id(self.ctx, space).ty, SpaceType::Register) {
             return;
         }
-        let size = self.ctx.types.size_of(self.inner().type_id);
-        let type_id = self.ctx.types.get_or_make_space_address(size, space);
+        let size = self.ctx.shared.types.size_of(self.inner().type_id);
+        let type_id = self.ctx.shared.types.get_or_make_space_address(size, space);
         self.inner_mut().type_id = type_id;
     }
 }
@@ -474,7 +475,7 @@ impl<'s, 'ctx: 's, 'str: 'ctx> WithHost<'s, 's, 'str> for InstructionMutRef<'str
 
 impl Named for InstructionMutRef<'_, '_> {
     fn name(&self) -> Option<&str> {
-        self.ctx.values.instruction(self.id).name.as_deref()
+        self.ctx.instruction(self.id).name.as_deref()
     }
 }
 

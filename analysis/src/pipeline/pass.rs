@@ -45,7 +45,7 @@ pub struct PipelineEnv {
     /// Register layout / calling convention, built by `harbinger::arch::arch_config`.
     pub cfg: ArchConfig,
     /// The stack-pointer *varnode* (`cfg.stack_pointer` resolved through
-    /// `ctx.registers`), cached so passes don't re-resolve it each call.
+    /// `ctx.shared.registers`), cached so passes don't re-resolve it each call.
     pub sp_varnode: VarnodeId,
     /// Function-independent register/varnode alias base, built once on first use and
     /// shared by reference across the per-function GVN/LICM/DCE/mem2reg runs (see
@@ -59,7 +59,7 @@ impl PipelineEnv {
     /// Resolve the stack-pointer varnode from `cfg` against `ctx` once. No lifter:
     /// the lifting passes will be inert.
     pub fn new(ctx: &Context, cfg: ArchConfig) -> Self {
-        let sp_varnode = ctx.registers[&cfg.stack_pointer];
+        let sp_varnode = ctx.shared.registers[&cfg.stack_pointer];
         Self::from_parts(cfg, sp_varnode)
     }
 
@@ -70,7 +70,7 @@ impl PipelineEnv {
     /// arch-agnostic transforms (e.g. `loop_to_recursion`, `gvn`, `dce`) are fine.
     pub fn headless(ctx: &mut Context) -> Self {
         let space = ctx.make_temp_space();
-        let bitness = (Space::from_id(ctx, ctx.default_space).addr_size * 8) as u8;
+        let bitness = (Space::from_id(ctx, ctx.shared.default_space).addr_size * 8) as u8;
         let sp_varnode = Varnode::make(ctx, 0, (bitness / 8) as usize, space).id;
         let cfg = ArchConfig {
             // Unused by arch-agnostic passes; the real SP is `sp_varnode` above.
@@ -287,14 +287,14 @@ pub(super) fn install_minted<'str>(
     let mut installed = Vec::with_capacity(minted.len());
     for (id, mut interface, body) in minted {
         debug_assert!(
-            ctx.values.interfaces[id].is_sentinel(),
+            ctx.interfaces[id].is_sentinel(),
             "{pass}: minted id {id:?} does not hold a reserved sentinel slot"
         );
         let name = std::mem::take(&mut interface.name);
         let unique = ctx.get_unique_name(name);
         interface.name = unique.clone();
-        ctx.values.functions.replace(id, body);
-        ctx.values.interfaces.replace(id, interface);
+        ctx.bodies.replace(id, body);
+        ctx.interfaces.replace(id, interface);
         ctx.update_name(unique, id.into(), None)
             .map_err(|e| format!("{pass}: minted-function name registration failed: {e}"))?;
         installed.push(id);

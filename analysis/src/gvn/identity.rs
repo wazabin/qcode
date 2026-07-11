@@ -511,7 +511,7 @@ fn as_zext(host: HostRef, v: ValueId) -> Option<(ValueId, usize)> {
 /// (comparisons and logical `And`/`Or`/`Xor` over bool all carry the type).
 fn is_boolean(host: HostRef, v: ValueId) -> bool {
     host.stored_type_of(v)
-        .is_some_and(|t| host.shared().types.is_bool(t))
+        .is_some_and(|t| host.shared().shared.types.is_bool(t))
 }
 
 /// The negation of an equality comparison: `==`↔`!=`. Ordering comparisons are
@@ -553,7 +553,7 @@ fn simplify_compare<'str, H: HostMut<'str>>(host: &mut H, ic: &InsnCtx, ed: &mut
                 // value against 0 is comparing the source against 0.
                 if let Some((src, src_size)) = as_zext(host.read_host(), other) {
                     let zero = host.shared().get_const(0, src_size).id();
-                    let bool_ty = host.shared().types.get_or_make_bool();
+                    let bool_ty = host.shared().shared.types.get_or_make_bool();
                     ed.replace_with_new_insn_typed(
                         host,
                         ic.block_id,
@@ -588,7 +588,7 @@ fn simplify_compare<'str, H: HostMut<'str>>(host: &mut H, ic: &InsnCtx, ed: &mut
                                 }) = host.insn_ref(id).mnemonic()
                                 && let Some(flipped) = negated_compare(inner)
                             {
-                                let bool_ty = host.shared().types.get_or_make_bool();
+                                let bool_ty = host.shared().shared.types.get_or_make_bool();
                                 ed.replace_with_new_insn_typed(
                                     host,
                                     ic.block_id,

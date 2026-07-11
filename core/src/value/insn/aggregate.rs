@@ -40,7 +40,7 @@ pub struct Extract {
 impl Extract {
     pub fn field_name<'a>(&self, ctx: &'a Context<'_>) -> Option<&'a str> {
         let agg_ty = ctx.stored_type_of(self.agg)?;
-        ctx.types.field_name(agg_ty, self.index)
+        ctx.shared.types.field_name(agg_ty, self.index)
     }
 }
 
@@ -76,8 +76,9 @@ impl Gep {
     /// pointer or the offset matches no field.
     pub fn field_name<'a>(&self, ctx: &'a Context<'_>) -> Option<&'a str> {
         let base_ty = ctx.stored_type_of(self.base)?;
-        let pointee = ctx.types.pointee_of(base_ty)?;
-        ctx.types
+        let pointee = ctx.shared.types.pointee_of(base_ty)?;
+        ctx.shared
+            .types
             .field_by_offset(pointee, self.offset)
             .map(|(_, field)| field.name.as_str())
     }
@@ -149,14 +150,15 @@ mod tests {
             .id;
         let agg_ty = ctx.type_of(ValueId::Instruction(tuple_id));
         let fields = ctx
+            .shared
             .types
             .aggregate_fields(agg_ty)
             .expect("tuple result is an aggregate");
         assert_eq!(fields.len(), 2);
         assert_eq!(fields[0].name, "lhs");
         assert_eq!(fields[1].name, "rhs");
-        assert_eq!(ctx.types.size_of(fields[0].type_id), 4);
-        assert_eq!(ctx.types.size_of(fields[1].type_id), 8);
+        assert_eq!(ctx.shared.types.size_of(fields[0].type_id), 4);
+        assert_eq!(ctx.shared.types.size_of(fields[1].type_id), 8);
 
         // The extract projects field 1, so its result is 8 bytes wide.
         let extract_id = BasicBlock::from_id(&ctx, block)
@@ -174,7 +176,7 @@ mod tests {
             "i64 %x = extract(%t.rhs);"
         );
         let extract_ty = ctx.type_of(ValueId::Instruction(extract_id));
-        assert_eq!(ctx.types.size_of(extract_ty), 8);
+        assert_eq!(ctx.shared.types.size_of(extract_ty), 8);
     }
 
     #[test]
@@ -207,11 +209,12 @@ mod tests {
 
         // Result type is a pointer (width 8) to the i32 field.
         let gep_ty = ctx.type_of(ValueId::Instruction(gep_id));
-        assert_eq!(ctx.types.size_of(gep_ty), 8);
+        assert_eq!(ctx.shared.types.size_of(gep_ty), 8);
         let pointee = ctx
+            .shared
             .types
             .pointee_of(gep_ty)
             .expect("gep result is a pointer");
-        assert_eq!(ctx.types.size_of(pointee), 4);
+        assert_eq!(ctx.shared.types.size_of(pointee), 4);
     }
 }

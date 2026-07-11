@@ -25,13 +25,14 @@ use qcode::{
 /// Whether `v` is a `bool`-typed value. Varnodes (which carry no stored type)
 /// and non-data values read as non-bool.
 fn is_bool(ctx: &Context, v: ValueId) -> bool {
-    ctx.stored_type_of(v).is_some_and(|t| ctx.types.is_bool(t))
+    ctx.stored_type_of(v)
+        .is_some_and(|t| ctx.shared.types.is_bool(t))
 }
 
 /// The literal value of `v` if it is a `bool`-typed literal, for domain checks.
 fn bool_literal_value(ctx: &Context, v: ValueId) -> Option<u64> {
     match v {
-        ValueId::Literal(lid) if is_bool(ctx, v) => Some(ctx.values.literals[lid].value),
+        ValueId::Literal(lid) if is_bool(ctx, v) => Some(ctx.shared.values.literals[lid].value),
         _ => None,
     }
 }

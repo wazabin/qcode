@@ -32,7 +32,9 @@ fn index_rel(host: HostRef, a: ValueId, b: ValueId) -> IdxRel {
         return IdxRel::Equal;
     }
     if let (ValueId::Literal(x), ValueId::Literal(y)) = (a, b) {
-        return if host.shared().values.literals[x].value == host.shared().values.literals[y].value {
+        return if host.shared().shared.values.literals[x].value
+            == host.shared().shared.values.literals[y].value
+        {
             IdxRel::Equal
         } else {
             IdxRel::Distinct
@@ -86,13 +88,13 @@ fn simplify_at(host: HostRef, out_size: usize, arr: ValueId, index: ValueId) -> 
     {
         // Read straight out of a constant `Bytes` array at a constant index.
         if let (ValueId::Bytes(bid), ValueId::Literal(ilit)) = (arr, index) {
-            let arr_ty = host.shared().values.bytes[bid].type_id;
-            if let Some((elem, count)) = host.shared().types.array_of(arr_ty) {
-                let esz = host.shared().types.size_of(elem);
-                let i = host.shared().values.literals[ilit].value as usize;
+            let arr_ty = host.shared().shared.values.bytes[bid].type_id;
+            if let Some((elem, count)) = host.shared().shared.types.array_of(arr_ty) {
+                let esz = host.shared().shared.types.size_of(elem);
+                let i = host.shared().shared.values.literals[ilit].value as usize;
                 if i < count {
                     let off = i * esz;
-                    let data = &host.shared().values.bytes[bid].data;
+                    let data = &host.shared().shared.values.bytes[bid].data;
                     let mut buf = [0u8; 8];
                     buf[..esz].copy_from_slice(&data[off..off + esz]);
                     let v = u64::from_le_bytes(buf);
@@ -130,9 +132,9 @@ fn simplify_at(host: HostRef, out_size: usize, arr: ValueId, index: ValueId) -> 
                 let ValueId::Literal(jlit) = index else {
                     return None;
                 };
-                let j = host.shared().values.literals[jlit].value;
+                let j = host.shared().shared.values.literals[jlit].value;
                 let a_ty = host.type_of(a);
-                let (_, len_a) = host.shared().types.array_of(a_ty)?;
+                let (_, len_a) = host.shared().shared.types.array_of(a_ty)?;
                 if j < len_a as u64 {
                     Some(forward(host, out_size, a, index))
                 } else {
@@ -185,14 +187,14 @@ mod tests {
     #[test]
     fn at_forwards_same_index() {
         let mut ctx = Context::new();
-        let i32 = ctx.types.get_or_make_int(4);
-        let arr_ty = ctx.types.get_or_make_array(i32, 4);
+        let i32 = ctx.shared.types.get_or_make_int(4);
+        let arr_ty = ctx.shared.types.get_or_make_array(i32, 4);
         let blk = {
             let __f = ctx.anon_function();
             ctx.get_or_make_block(0x1000, __f)
         };
         let a = BasicBlock::from_id_mut(&mut ctx, blk).push_param(16).id;
-        ctx.values.block_param_mut(a).type_id = arr_ty;
+        ctx.block_param_mut(a).type_id = arr_ty;
         let i = ctx.get_const(2, 8).id();
         let v = ctx.get_const(0x77, 4).id();
         let insert_id = IntrinsicId::from_name("insert").unwrap();
@@ -214,14 +216,14 @@ mod tests {
     #[test]
     fn at_bypasses_distinct_index() {
         let mut ctx = Context::new();
-        let i32 = ctx.types.get_or_make_int(4);
-        let arr_ty = ctx.types.get_or_make_array(i32, 4);
+        let i32 = ctx.shared.types.get_or_make_int(4);
+        let arr_ty = ctx.shared.types.get_or_make_array(i32, 4);
         let blk = {
             let __f = ctx.anon_function();
             ctx.get_or_make_block(0x1000, __f)
         };
         let a = BasicBlock::from_id_mut(&mut ctx, blk).push_param(16).id;
-        ctx.values.block_param_mut(a).type_id = arr_ty;
+        ctx.block_param_mut(a).type_id = arr_ty;
         let i = ctx.get_const(2, 8).id();
         let j = ctx.get_const(3, 8).id();
         let v = ctx.get_const(0x77, 4).id();
@@ -272,17 +274,17 @@ mod tests {
     #[test]
     fn at_picks_concat_side() {
         let mut ctx = Context::new();
-        let i32 = ctx.types.get_or_make_int(4);
-        let a_ty = ctx.types.get_or_make_array(i32, 1);
-        let b_ty = ctx.types.get_or_make_array(i32, 3);
+        let i32 = ctx.shared.types.get_or_make_int(4);
+        let a_ty = ctx.shared.types.get_or_make_array(i32, 1);
+        let b_ty = ctx.shared.types.get_or_make_array(i32, 3);
         let blk = {
             let __f = ctx.anon_function();
             ctx.get_or_make_block(0x1000, __f)
         };
         let a = BasicBlock::from_id_mut(&mut ctx, blk).push_param(4).id;
-        ctx.values.block_param_mut(a).type_id = a_ty;
+        ctx.block_param_mut(a).type_id = a_ty;
         let b = BasicBlock::from_id_mut(&mut ctx, blk).push_param(12).id;
-        ctx.values.block_param_mut(b).type_id = b_ty;
+        ctx.block_param_mut(b).type_id = b_ty;
         let concat_id = IntrinsicId::from_name("concat").unwrap();
         let cat = {
             let mut bl = Builder::from_block(BasicBlock::from_id_mut(&mut ctx, blk));
@@ -316,7 +318,7 @@ mod tests {
                     panic!("expected literal shifted index");
                 };
                 assert_eq!(app.args[0], ValueId::BlockParam(b));
-                assert_eq!(ctx.values.literals[l].value, 1);
+                assert_eq!(ctx.shared.values.literals[l].value, 1);
             }
             other => panic!("expected at(b, 1), got {other:?}"),
         }
@@ -325,15 +327,15 @@ mod tests {
     #[test]
     fn at_reads_constant_bytes() {
         let mut ctx = Context::new();
-        let i32 = ctx.types.get_or_make_int(4);
-        let arr_ty = ctx.types.get_or_make_array(i32, 3);
+        let i32 = ctx.shared.types.get_or_make_int(4);
+        let arr_ty = ctx.shared.types.get_or_make_array(i32, 3);
         let mut data = Vec::new();
         for w in [0x11u32, 0x22, 0x33] {
             data.extend_from_slice(&w.to_le_bytes());
         }
         let bid = ctx.get_bytes(data).id();
         if let ValueId::Bytes(b) = bid {
-            ctx.values.bytes[b].type_id = arr_ty;
+            ctx.shared.values.bytes[b].type_id = arr_ty;
         }
         let idx = ctx.get_const(2, 8).id();
         match at_id()
@@ -341,7 +343,7 @@ mod tests {
             .simplify((&ctx).into(), at_id(), 4, &[bid, idx])
         {
             Some(Simplified::Value(ValueId::Literal(l))) => {
-                assert_eq!(ctx.values.literals[l].value, 0x33);
+                assert_eq!(ctx.shared.values.literals[l].value, 0x33);
             }
             other => panic!("expected literal 0x33, got {other:?}"),
         }

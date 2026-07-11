@@ -81,8 +81,8 @@ mod tests {
         let _ = (f, g, r0, r1);
 
         // A one-field aggregate (the positional register write-set shape).
-        let i64_ty = tc.ctx.types.get_or_make_int(8);
-        let agg_ty = tc.ctx.types.get_or_make_aggregate(vec![i64_ty]);
+        let i64_ty = tc.ctx.shared.types.get_or_make_int(8);
+        let agg_ty = tc.ctx.shared.types.get_or_make_aggregate(vec![i64_ty]);
 
         // Make the call produce that aggregate, then replay field 0 into r3.
         let call_id = set_call(&mut tc, g_call, f, vec![]);
@@ -429,7 +429,7 @@ mod tests {
         );
         // Partial mode never touches shadow: every load/store stays in real ram, so
         // the unmodelled store cannot be collapsed across.
-        let ram = tc.ctx.default_space;
+        let ram = tc.ctx.shared.default_space;
         let all_ram = Function::from_id(&tc.ctx, f).blocks().all(|b| {
             b.iter().all(|i| match i.mnemonic() {
                 Mnemonic::Load(l) => l.space == ram,
@@ -714,13 +714,13 @@ mod tests {
 
         // Type the param as a struct pointer with a field at 0x30 and rewrite the
         // `param + 0x30` add into the `gep(param.field)` form the typing pass emits.
-        let i32_ty = tc.ctx.types.get_or_make_int(4);
-        let s_ty = tc.ctx.types.get_or_make_struct(
+        let i32_ty = tc.ctx.shared.types.get_or_make_int(4);
+        let s_ty = tc.ctx.shared.types.get_or_make_struct(
             "S",
             0x34,
             vec![AggregateField::new_at("peb", i32_ty, 0x30)],
         );
-        let ptr_ty = tc.ctx.types.get_or_make_struct_pointer(8, s_ty);
+        let ptr_ty = tc.ctx.shared.types.get_or_make_struct_pointer(8, s_ty);
         let root = Function::from_id(&tc.ctx, f).root().unwrap().id;
         let pid = BasicBlock::from_id(&tc.ctx, root)
             .params()
@@ -729,7 +729,7 @@ mod tests {
             .id();
         let param = pid;
         if let ValueId::BlockParam(bp) = param {
-            tc.ctx.values.block_param_mut(bp).type_id = ptr_ty;
+            tc.ctx.block_param_mut(bp).type_id = ptr_ty;
         }
         // Find the add and its load, replace the add with a gep.
         let add_id = BasicBlock::from_id(&tc.ctx, root)
@@ -768,7 +768,7 @@ mod tests {
         let aliases = crate::AliasResult::simple_for_function(&tc.ctx, f);
         crate::gvn::gvn_function(&mut tc.ctx, f, Some(&aliases));
 
-        let ram = tc.ctx.default_space;
+        let ram = tc.ctx.shared.default_space;
         let surviving_shadow_load = Function::from_id(&tc.ctx, f).iter().any(|blk| {
             blk.iter()
                 .any(|i| matches!(i.mnemonic(), Mnemonic::Load(l) if l.space != ram))
@@ -1240,7 +1240,7 @@ mod tests {
                 _ => unreachable!(),
             }
         };
-        tc.ctx.values.block_param_mut(pid).origin = Some(ValueId::Varnode(sp_vn));
+        tc.ctx.block_param_mut(pid).origin = Some(ValueId::Varnode(sp_vn));
         Function::from_id_mut(&mut tc.ctx, f).set_pure_reg(true);
 
         let sp_arg = tc.ctx.get_const(0x7000, 8).id();
@@ -1351,8 +1351,8 @@ mod tests {
         );
         // The append grew the call result past its original register-only size.
         let new_ty = tc.ctx.type_of(ValueId::Instruction(call_id));
-        let new_size = tc.ctx.types.size_of(new_ty);
-        let old_size = tc.ctx.types.size_of(reg_ty);
+        let new_size = tc.ctx.shared.types.size_of(new_ty);
+        let old_size = tc.ctx.shared.types.size_of(reg_ty);
         assert!(
             new_size > old_size,
             "call result must grow ({old_size} -> {new_size}) without panicking"
@@ -1984,7 +1984,7 @@ mod tests {
 
         // Step-1 guarantee: no access into the real (default) space remains —
         // every load/store was redirected into the shadow.
-        let ram = tc.ctx.default_space;
+        let ram = tc.ctx.shared.default_space;
         let real_access = Function::from_id(&tc.ctx, f).iter().any(|blk| {
             blk.iter().any(|i| match i.mnemonic() {
                 Mnemonic::Load(l) => l.space == ram,
@@ -2000,7 +2000,7 @@ mod tests {
         // The callee gains one `Array`-typed by-value snapshot param for the region.
         let has_array_param = Function::from_id(&tc.ctx, f).root().is_some_and(|b| {
             b.params()
-                .any(|p| tc.ctx.types.array_of(p.type_id()).is_some())
+                .any(|p| tc.ctx.shared.types.array_of(p.type_id()).is_some())
         });
         assert!(
             has_array_param,
@@ -2100,17 +2100,17 @@ mod tests {
         // (the `*4` stride) and 20 elements (the `[0,20)` index bound).
         let array = Function::from_id(&tc.ctx, f)
             .root()
-            .and_then(|b| b.params().find_map(|p| tc.ctx.types.array_of(p.type_id())));
+            .and_then(|b| b.params().find_map(|p| tc.ctx.shared.types.array_of(p.type_id())));
         let (elem_ty, count) = array.expect("callee must gain an Array region param");
         assert_eq!(
-            tc.ctx.types.size_of(elem_ty),
+            tc.ctx.shared.types.size_of(elem_ty),
             4,
             "element width is the *4 stride"
         );
         assert_eq!(count, 20, "20 elements over the bounded index");
 
         // No real-ram access survives — the strided store is redirected into shadow.
-        let ram = tc.ctx.default_space;
+        let ram = tc.ctx.shared.default_space;
         let real_access = Function::from_id(&tc.ctx, f).iter().any(|blk| {
             blk.iter().any(|i| match i.mnemonic() {
                 Mnemonic::Load(l) => l.space == ram,
@@ -2176,7 +2176,7 @@ mod tests {
 
         let has_array_param = Function::from_id(&tc.ctx, f).root().is_some_and(|b| {
             b.params()
-                .any(|p| tc.ctx.types.array_of(p.type_id()).is_some())
+                .any(|p| tc.ctx.shared.types.array_of(p.type_id()).is_some())
         });
         assert!(
             has_array_param,
@@ -2240,7 +2240,7 @@ mod tests {
 
         // Full shadow path: no real-ram access survives — including the scalar
         // write at offset 0x40, which is redirected into the shadow too.
-        let ram = tc.ctx.default_space;
+        let ram = tc.ctx.shared.default_space;
         let real_access = Function::from_id(&tc.ctx, f).iter().any(|blk| {
             blk.iter().any(|i| match i.mnemonic() {
                 Mnemonic::Load(l) => l.space == ram,
@@ -2256,7 +2256,7 @@ mod tests {
         // The region still becomes an `Array`-typed by-value snapshot param.
         let has_array_param = Function::from_id(&tc.ctx, f).root().is_some_and(|b| {
             b.params()
-                .any(|p| tc.ctx.types.array_of(p.type_id()).is_some())
+                .any(|p| tc.ctx.shared.types.array_of(p.type_id()).is_some())
         });
         assert!(
             has_array_param,
@@ -2312,7 +2312,7 @@ mod tests {
         // The crux: the buffer load must NOT have been redirected into a shadow
         // space. It stays a real-ram load (left for a later round once the index is
         // a constant, or genuinely unpromotable) — never an un-seeded shadow orphan.
-        let ram = tc.ctx.default_space;
+        let ram = tc.ctx.shared.default_space;
         let shadow_load = Function::from_id(&tc.ctx, f).iter().any(|blk| {
             blk.iter()
                 .any(|i| matches!(i.mnemonic(), Mnemonic::Load(l) if l.space != ram))
@@ -2325,7 +2325,7 @@ mod tests {
         // No `Array` snapshot param was minted for the failed region.
         let has_array_param = Function::from_id(&tc.ctx, f).root().is_some_and(|b| {
             b.params()
-                .any(|p| tc.ctx.types.array_of(p.type_id()).is_some())
+                .any(|p| tc.ctx.shared.types.array_of(p.type_id()).is_some())
         });
         assert!(
             !has_array_param,
@@ -2388,7 +2388,7 @@ mod tests {
             .unwrap()
             .id();
         if let ValueId::BlockParam(inner) = esp_pid {
-            tc.ctx.values.block_param_mut(inner).origin = Some(ValueId::Varnode(sp_reg));
+            tc.ctx.block_param_mut(inner).origin = Some(ValueId::Varnode(sp_reg));
         }
         Function::from_id_mut(&mut tc.ctx, f).set_pure_reg(true);
         let espv = tc.ctx.get_const(0x7000, 8).id();
@@ -2414,7 +2414,7 @@ mod tests {
         let slot_reload = Function::from_id(&tc.ctx, f).iter().any(|blk| {
             blk.iter().any(|i| {
                 matches!(i.mnemonic(), Mnemonic::Load(l)
-                    if l.size == 8 && l.space == tc.ctx.default_space)
+                    if l.size == 8 && l.space == tc.ctx.shared.default_space)
             })
         });
         assert!(
@@ -2485,7 +2485,7 @@ mod tests {
             .unwrap()
             .id();
         if let ValueId::BlockParam(inner) = esp_pid {
-            tc.ctx.values.block_param_mut(inner).origin = Some(ValueId::Varnode(sp_reg));
+            tc.ctx.block_param_mut(inner).origin = Some(ValueId::Varnode(sp_reg));
         }
         Function::from_id_mut(&mut tc.ctx, f).set_pure_reg(true);
         let espv = tc.ctx.get_const(0x7000, 8).id();
@@ -2504,7 +2504,7 @@ mod tests {
         // The buffer region snapshots as an Array param.
         let has_array_param = Function::from_id(&tc.ctx, f).root().is_some_and(|b| {
             b.params()
-                .any(|p| tc.ctx.types.array_of(p.type_id()).is_some())
+                .any(|p| tc.ctx.shared.types.array_of(p.type_id()).is_some())
         });
         assert!(has_array_param, "the buffer region became an Array input");
 
@@ -2579,7 +2579,7 @@ mod tests {
             .unwrap()
             .id();
         if let ValueId::BlockParam(inner) = esp_pid {
-            tc.ctx.values.block_param_mut(inner).origin = Some(ValueId::Varnode(sp_reg));
+            tc.ctx.block_param_mut(inner).origin = Some(ValueId::Varnode(sp_reg));
         }
         Function::from_id_mut(&mut tc.ctx, f).set_pure_reg(true);
         let espv = tc.ctx.get_const(0x7000, 8).id();
@@ -2593,7 +2593,7 @@ mod tests {
         let array_param = |tc: &qcode::testing::TestContext| {
             Function::from_id(&tc.ctx, f).root().is_some_and(|b| {
                 b.params()
-                    .any(|p| tc.ctx.types.array_of(p.type_id()).is_some())
+                    .any(|p| tc.ctx.shared.types.array_of(p.type_id()).is_some())
             })
         };
 
@@ -2666,7 +2666,7 @@ mod tests {
             .unwrap()
             .id();
         if let ValueId::BlockParam(inner) = esp_pid {
-            tc.ctx.values.block_param_mut(inner).origin = Some(ValueId::Varnode(sp_reg));
+            tc.ctx.block_param_mut(inner).origin = Some(ValueId::Varnode(sp_reg));
         }
         Function::from_id_mut(&mut tc.ctx, f).set_pure_reg(true);
         let espv = tc.ctx.get_const(0x7000, 4).id();
@@ -2685,7 +2685,7 @@ mod tests {
 
         let array_param = Function::from_id(&tc.ctx, f).root().is_some_and(|b| {
             b.params()
-                .any(|p| tc.ctx.types.array_of(p.type_id()).is_some())
+                .any(|p| tc.ctx.shared.types.array_of(p.type_id()).is_some())
         });
         assert!(
             array_param,
@@ -2770,7 +2770,7 @@ mod tests {
         assert!(
             tc.ctx
                 .stored_type_of(map_src)
-                .and_then(|t| tc.ctx.types.array_of(t))
+                .and_then(|t| tc.ctx.shared.types.array_of(t))
                 .is_some(),
             "the map source is the Array snapshot"
         );
@@ -2900,7 +2900,7 @@ mod tests {
         assert!(
             tc.ctx
                 .stored_type_of(map_src)
-                .and_then(|t| tc.ctx.types.array_of(t))
+                .and_then(|t| tc.ctx.shared.types.array_of(t))
                 .is_some(),
             "the map source is the Array snapshot"
         );

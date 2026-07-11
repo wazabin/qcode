@@ -406,7 +406,7 @@ fn build_value<'str, H: HostMut<'str>>(
     }
     let int_ty = match form {
         NormalForm::Affine { width, .. } | NormalForm::Mask { width, .. } => {
-            host.shared().types.get_or_make_int(*width)
+            host.shared().shared.types.get_or_make_int(*width)
         }
         NormalForm::Opaque(_) => unreachable!("opaque forms are never materialized"),
     };
@@ -884,7 +884,7 @@ mod spike {
     #[test]
     fn affine_mentions_catches_dynamic_and_aligned_sp() {
         let mut tc = TestContext::new();
-        let ram = tc.ctx.default_space;
+        let ram = tc.ctx.shared.default_space;
         let reg = tc.reg_space;
         let fun = Function::make(&mut tc.ctx, "f".into()).unwrap().id;
         let entry = {
@@ -952,15 +952,15 @@ mod spike {
             f.add_block(entry);
         }
         // A struct with a field at byte 0x60, so `push_gep` accepts the base.
-        let i64_ty = tc.ctx.types.get_or_make_int(8);
-        let s_ty = tc.ctx.types.get_or_make_struct(
+        let i64_ty = tc.ctx.shared.types.get_or_make_int(8);
+        let s_ty = tc.ctx.shared.types.get_or_make_struct(
             "S",
             0x68,
             vec![AggregateField::new_at("f", i64_ty, 0x60)],
         );
-        let ptr_ty = tc.ctx.types.get_or_make_struct_pointer(8, s_ty);
+        let ptr_ty = tc.ctx.shared.types.get_or_make_struct_pointer(8, s_ty);
         let pid = BasicBlock::from_id_mut(&mut tc.ctx, entry).push_param(8).id;
-        tc.ctx.values.block_param_mut(pid).type_id = ptr_ty;
+        tc.ctx.block_param_mut(pid).type_id = ptr_ty;
         let p = ValueId::BlockParam(pid);
 
         let (gep, add) = {

@@ -54,11 +54,10 @@ impl ResolvedPath {
             let new_block_id = BasicBlock::clone_into_ctx(ctx, orig_block_id, &mut value_map);
 
             let terminator = ctx
-                .values
                 .block(orig_block_id)
                 .instructions
                 .last()
-                .map(|&id| ctx.values.instruction(id).mnemonic().clone());
+                .map(|&id| ctx.instruction(id).mnemonic().clone());
 
             match terminator {
                 Some(Mnemonic::CBranch(cbranch)) => {
@@ -161,7 +160,7 @@ fn insert_trace_assert(
     // Generate the negation if needed — canonically `condition == false`.
     let condition = if negate {
         let f = ctx.get_bool_const(false).id();
-        let bool_ty = ctx.types.get_or_make_bool();
+        let bool_ty = ctx.shared.types.get_or_make_bool();
         let not_id = InstructionRef::from_mnemonic_with_type(
             ctx,
             block_id.func,

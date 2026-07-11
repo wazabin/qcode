@@ -57,7 +57,7 @@ impl Intrinsic for Len {
         // A list's length is data-dependent (the NUL position for a string) and
         // stays symbolic.
         let ty = host.type_of(seq);
-        if let Some((_, n)) = host.shared().types.array_of(ty) {
+        if let Some((_, n)) = host.shared().shared.types.array_of(ty) {
             let lit = host.shared().get_const(n as u64, out_size).id();
             return Some(Simplified::Value(lit));
         }
@@ -107,18 +107,18 @@ mod tests {
     #[test]
     fn len_of_array_folds_list_does_not() {
         let mut ctx = Context::new();
-        let i8 = ctx.types.get_or_make_int(1);
-        let arr = ctx.types.get_or_make_array(i8, 6);
-        let list = ctx.types.get_or_make_list(i8, 6);
+        let i8 = ctx.shared.types.get_or_make_int(1);
+        let arr = ctx.shared.types.get_or_make_array(i8, 6);
+        let list = ctx.shared.types.get_or_make_list(i8, 6);
 
         let blk = {
             let __f = ctx.anon_function();
             ctx.get_or_make_block(0x1000, __f)
         };
         let ap = BasicBlock::from_id_mut(&mut ctx, blk).push_param(6).id;
-        ctx.values.block_param_mut(ap).type_id = arr;
+        ctx.block_param_mut(ap).type_id = arr;
         let lp = BasicBlock::from_id_mut(&mut ctx, blk).push_param(6).id;
-        ctx.values.block_param_mut(lp).type_id = list;
+        ctx.block_param_mut(lp).type_id = list;
 
         let id = IntrinsicId::from_name("len").unwrap();
 
@@ -128,7 +128,7 @@ mod tests {
             .simplify((&ctx).into(), id, 8, &[ValueId::BlockParam(ap)])
         {
             Some(Simplified::Value(ValueId::Literal(lid))) => {
-                assert_eq!(ctx.values.literals[lid].value, 6);
+                assert_eq!(ctx.shared.values.literals[lid].value, 6);
             }
             other => panic!("len of an array must fold to the literal 6, got {other:?}"),
         }

@@ -67,11 +67,11 @@ where
     Self: WithCtx<'s, 'ctx, 'str>,
 {
     fn inner(&'s self) -> &'ctx Literal {
-        &self.ctx().values.literals[self.id]
+        &self.ctx().shared.values.literals[self.id]
     }
 
     pub fn mask(&'s self) -> u64 {
-        let size = self.ctx().types.size_of(self.inner().type_id);
+        let size = self.ctx().shared.types.size_of(self.inner().type_id);
         if size >= 8 {
             u64::MAX
         } else {
@@ -91,7 +91,7 @@ where
 
 impl std::fmt::Display for LiteralRef<'_, '_> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let literal = &self.ctx.values.literals[self.id];
+        let literal = &self.ctx.shared.values.literals[self.id];
         match &literal.symbolic {
             Some(SymbolicRef::Block(bid)) => {
                 let block = BasicBlock::from_id(self.ctx, *bid);
@@ -107,7 +107,7 @@ impl std::fmt::Display for LiteralRef<'_, '_> {
             Some(SymbolicRef::String(s)) => write!(f, "&{:?}", s),
             // A `bool` literal prints as `true`/`false`; the `bool` type token is
             // emitted by the operand's type prefix, so the round-trip is `bool true`.
-            None if self.ctx.types.is_bool(literal.type_id) => {
+            None if self.ctx.shared.types.is_bool(literal.type_id) => {
                 write!(f, "{}", if literal.value != 0 { "true" } else { "false" })
             }
             None => write!(f, "0x{:x}", literal.value),
@@ -122,7 +122,8 @@ impl<'str, 'ctx> Value<'str, 'ctx> for LiteralRef<'str, 'ctx> {
 
     fn size(&self) -> usize {
         self.ctx
+            .shared
             .types
-            .size_of(self.ctx.values.literals[self.id].type_id)
+            .size_of(self.ctx.shared.values.literals[self.id].type_id)
     }
 }

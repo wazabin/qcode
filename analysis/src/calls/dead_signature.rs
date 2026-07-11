@@ -166,11 +166,11 @@ fn trim_dead_args(
         return false;
     };
 
-    let params = ctx.values.block(root).params.clone();
+    let params = ctx.block(root).params.clone();
     let dead: Vec<usize> = params
         .iter()
         .enumerate()
-        .filter(|(_, p)| ctx.users(**p).is_empty() && !ctx.values.block_param(**p).protected)
+        .filter(|(_, p)| ctx.users(**p).is_empty() && !ctx.block_param(**p).protected)
         .map(|(i, _)| i)
         .collect();
     if dead.is_empty() {
@@ -214,7 +214,7 @@ fn trim_dead_return_fields(
     let Some(agg_ty) = ctx.stored_type_of(ValueId::Instruction(call_sites[0])) else {
         return false;
     };
-    let Some(fields) = ctx.types.aggregate_fields(agg_ty).map(<[_]>::to_vec) else {
+    let Some(fields) = ctx.shared.types.aggregate_fields(agg_ty).map(<[_]>::to_vec) else {
         return false;
     };
     let n = fields.len();
@@ -257,7 +257,7 @@ fn trim_dead_return_fields(
     // The trimmed aggregate type, shared by the call results and the callee
     // return tuples (same field names/types ⇒ same structural type).
     let new_fields: Vec<AggregateField> = kept.iter().map(|&i| fields[i].clone()).collect();
-    let new_ty = ctx.types.get_or_make_named_aggregate(new_fields);
+    let new_ty = ctx.shared.types.get_or_make_named_aggregate(new_fields);
 
     // Rewrite each callee return: trim the tuple to the kept fields, or drop the
     // returned value entirely when nothing survives.
@@ -457,8 +457,7 @@ mod tests {
             .collect();
         for (pv, name) in param_ids.iter().zip(["r0", "r1"]) {
             if let ValueId::BlockParam(pid) = pv {
-                tc.ctx.values.block_param_mut(*pid).name =
-                    Some(std::borrow::Cow::Owned(name.into()));
+                tc.ctx.block_param_mut(*pid).name = Some(std::borrow::Cow::Owned(name.into()));
             }
         }
         // f returns a one-field write-set of its r1 param; the r0 param is unused

@@ -2,24 +2,23 @@ use crate::{
     assumption::{KnownContradiction, Proposition, Truth, Violation},
     types::TypeId,
     value::{
-        ValueId,
-        block::{BasicBlock, BlockId, EdgeData, EdgeId},
-        block_param::{BlockParam, BlockParamId},
         bytes::{Bytes, BytesId},
-        function::{Function, FunctionId},
-        insn::{Instruction, InstructionId},
+        function::FunctionId,
+        insn::InstructionId,
         interner::{Interner, LiteralInterner},
         literal::{Literal, LiteralId},
         varnode::{Varnode, VarnodeId},
     },
 };
-// NOTE (IR-ownership refactor): instruction/block/param/edge *storage* now lives
-// in each `Function` (see `Function::insns/blocks/params/edges`). This registry
-// keeps only the global value arenas plus the cross-function maps (`users`,
-// `call_sites`, `synthetic_callees`). Composite IDs route through the owning
-// function via the `instruction()/block()/block_param()/edge()` accessors below.
+// NOTE (IR-ownership refactor): instruction/block/param/edge *storage* lives in
+// each `Function` (see `Function::insns/blocks/params/edges`), and the function
+// bodies/interfaces now live directly on [`Context`](crate::context::Context)
+// (`bodies`/`interfaces`). This registry keeps only the global value arenas
+// (literals, bytes, varnodes) plus the cross-function maps (`call_sites`,
+// `synthetic_callees`, truths). The composite-id routing accessors that consult
+// the function bodies moved onto `Context` in the context-split reshape.
 use jstd::registry::Registry;
-use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
+use rustc_hash::FxHashMap as HashMap;
 use std::collections::BTreeSet;
 
 /// Central storage arena for all IR values in a [`Context`](crate::context::Context).
@@ -42,7 +41,8 @@ use std::collections::BTreeSet;
 ///   it directly. Read it through
 ///   [`FunctionRef::users_of`](crate::value::FunctionRef::users_of) /
 ///   [`Context::users`](crate::context::Context::users), and remove dead
-///   instructions via [`remove_instructions`](Self::remove_instructions).
+///   instructions via
+///   [`Context::remove_instructions`](crate::context::Context::remove_instructions).
 #[derive(Clone, Default, serde::Serialize, serde::Deserialize)]
 pub struct ValueRegistry<'str> {
     /// Literal (constant) interner. Behind an `RwLock` (see
@@ -71,20 +71,6 @@ pub struct ValueRegistry<'str> {
     #[serde(default)]
     pub(crate) varnode_types: HashMap<VarnodeId, TypeId>,
 
-    /// Function *body* storage. Each function owns its instruction/block/param/
-    /// edge arenas; the composite-ID accessors ([`instruction`](Self::instruction)
-    /// etc.) route through here. A checked-out function's body is moved out of its
-    /// slot (leaving an empty body); its [`interface`](Self::interfaces) stays put,
-    /// so callers always read the real interface.
-    pub functions: Registry<FunctionId, Function<'str>>,
-
-    /// Function *interface* storage — the caller-reasoning surface (name, address,
-    /// kind, external-ness, signature) held in lockstep with
-    /// [`functions`](Self::functions) under the same [`FunctionId`] space. Never
-    /// checked out: a co-checked-out callee answers interface queries from here.
-    #[serde(default)]
-    pub interfaces: Registry<FunctionId, crate::value::function::FunctionInterface<'str>>,
-
     /// Truth map of the assumption system: what each [`Proposition`] is
     /// currently assumed or known to be (see [`crate::assumption`]). Accessed
     /// through [`Context::assume_true`](crate::context::Context::assume_true)
@@ -103,8 +89,8 @@ pub struct ValueRegistry<'str> {
 
     /// Reverse call graph: for each callee [`FunctionId`], the direct-call sites
     /// (instructions) that target it. Kept in sync alongside `users` by
-    /// [`push_insn`](Self::push_insn),
-    /// [`remove_instructions`](Self::remove_instructions), and
+    /// [`Context::push_insn`](crate::context::Context::push_insn),
+    /// [`Context::remove_instructions`](crate::context::Context::remove_instructions), and
     /// [`Context::replace_instruction_mnemonic`](crate::context::Context::replace_instruction_mnemonic).
     /// Indirect calls have no static target and are not recorded here.
     #[serde(default)]
@@ -143,90 +129,6 @@ impl<'str> ValueRegistry<'str> {
         self.literals.push_literal(literal)
     }
 
-    /// Appends an instruction and records all its operands in the `users` map.
-    ///
-    /// # Immutability invariant
-    ///
-    /// Instructions are considered immutable after this call. If you alter the
-    /// operands of an instruction after insertion the `users` map will be
-    /// stale. Rewrite operands through
-    /// [`Context::replace_all_uses_with`](crate::context::Context::replace_all_uses_with)
-    /// instead.
-    pub fn push_insn(&mut self, func: FunctionId, insn: Instruction<'str>) -> InstructionId {
-        let args = insn.mnemonic().args();
-        let call_target = insn.mnemonic().call_target();
-        let local = self.functions[func].insns.push(insn);
-        let id = InstructionId::new(func, local);
-        // Record each operand's use in *this* function's map. For SSA operands
-        // (instruction/param) the operand's own function is `func` by the SSA
-        // ownership invariant; for shared operands (literal/varnode) the entry
-        // lives with the using function, which is all any reader needs.
-        for arg in args {
-            self.functions[func].users.entry(arg).or_default().push(id);
-        }
-        // call_sites is the one remaining global reverse map (Stage 2): the
-        // parallel driver (Stage 6) will rebuild it from a per-function
-        // outgoing-call diff at check-in, at which point these direct writes move
-        // there. Until then it is maintained inline.
-        if let Some(target) = call_target {
-            self.call_sites.entry(target).or_default().push(id);
-        }
-        id
-    }
-
-    /// Borrows the instruction `id`, routing through its owning function's arena.
-    pub fn instruction(&self, id: InstructionId) -> &Instruction<'str> {
-        &self.functions[id.func].insns[id.local]
-    }
-
-    /// Mutably borrows the instruction `id`.
-    pub fn instruction_mut(&mut self, id: InstructionId) -> &mut Instruction<'str> {
-        &mut self.functions[id.func].insns[id.local]
-    }
-
-    /// Borrows the basic block `id`.
-    pub fn block(&self, id: BlockId) -> &BasicBlock<'str> {
-        &self.functions[id.func].blocks[id.local]
-    }
-
-    /// Mutably borrows the basic block `id`.
-    pub fn block_mut(&mut self, id: BlockId) -> &mut BasicBlock<'str> {
-        &mut self.functions[id.func].blocks[id.local]
-    }
-
-    /// Borrows the block parameter `id`.
-    pub fn block_param(&self, id: BlockParamId) -> &BlockParam<'str> {
-        &self.functions[id.func].params[id.local]
-    }
-
-    /// Mutably borrows the block parameter `id`.
-    pub fn block_param_mut(&mut self, id: BlockParamId) -> &mut BlockParam<'str> {
-        &mut self.functions[id.func].params[id.local]
-    }
-
-    /// Borrows the CFG edge `id`, stored in function `func`'s edge arena.
-    pub fn edge(&self, func: FunctionId, id: EdgeId) -> &EdgeData {
-        &self.functions[func].edges[id]
-    }
-
-    /// Mutably borrows the CFG edge `id`, stored in function `func`'s edge arena.
-    pub fn edge_mut(&mut self, func: FunctionId, id: EdgeId) -> &mut EdgeData {
-        &mut self.functions[func].edges[id]
-    }
-
-    /// Returns the instructions that use `value` as an operand, read from
-    /// `value`'s owning function. For an SSA def (instruction/param) that is the
-    /// complete user set (all uses are intra-function). For a shared value
-    /// (literal/bytes/varnode) there is no single owner, so this returns `&[]`;
-    /// scan [`Context::functions`](crate::context::Context::functions) with
-    /// [`Function::users_of`] to find a shared value's uses across functions.
-    pub fn users_of(&self, value: ValueId) -> &[InstructionId] {
-        match value.owning_function() {
-            Some(func) => self.functions[func].users_of(value),
-            None => &[],
-        }
-    }
-
     /// Returns the direct-call sites (instructions) targeting `callee`.
     pub fn call_sites_of(&self, callee: FunctionId) -> &[InstructionId] {
         self.call_sites
@@ -254,94 +156,7 @@ impl<'str> ValueRegistry<'str> {
             .copied()
     }
 
-    /// Removes a set of dead instructions from the use-def map.
-    ///
-    /// For every instruction in `dead`, each of its operands will have all
-    /// members of `dead` pruned from their user lists. Call this after
-    /// removing dead instructions from their basic blocks.
-    pub fn remove_instructions(&mut self, dead: &HashSet<InstructionId>) {
-        // Collect the distinct operands and call targets referenced by any dead
-        // instruction first, then prune each affected list exactly once. The
-        // retain condition (`!dead.contains(..)`) is independent of which dead
-        // instruction referenced the operand, so pruning per distinct operand
-        // yields the same result as pruning per (dead, operand) pair — but a
-        // value shared by K dead users has its list scanned once instead of K
-        // times. This is the dominant cost when large blocks are cleared.
-        // An operand's user entry lives in the *using* instruction's function
-        // map, so the affected map is keyed by the dead instruction's own func.
-        let mut affected_args: HashSet<(FunctionId, ValueId)> = HashSet::default();
-        let mut affected_targets: HashSet<FunctionId> = HashSet::default();
-        for &id in dead {
-            let mnemonic = self.instruction(id).mnemonic();
-            affected_args.extend(mnemonic.args().into_iter().map(|arg| (id.func, arg)));
-            if let Some(target) = mnemonic.call_target() {
-                affected_targets.insert(target);
-            }
-            // Tombstone it. Registry IDs are stable indices and cannot be reclaimed, so
-            // the entry stays in the arena; marking it deleted keeps `Context::instructions`
-            // (and any whole-program scan built on it) from yielding the stale operands it
-            // still carries.
-            self.instruction_mut(id).deleted = true;
-        }
-        for (func, arg) in affected_args {
-            if let Some(users) = self.functions[func].users.get_mut(&arg) {
-                users.retain(|u| !dead.contains(u));
-            }
-        }
-        for target in affected_targets {
-            if let Some(sites) = self.call_sites.get_mut(&target) {
-                sites.retain(|s| !dead.contains(s));
-            }
-        }
-    }
-
-    pub fn push_block(&mut self, func: FunctionId, block: BasicBlock<'str>) -> BlockId {
-        let local = self.functions[func].blocks.push(block);
-        let id = BlockId::new(func, local);
-        // A block is born owned by the function whose arena stores it.
-        self.functions[func].roster.push(id);
-        id
-    }
-
-    /// Removes `id` from its current owner's roster, if present. Storage (the
-    /// arena slot) is untouched. Used by reattribution and block deletion.
-    pub fn unroster_block(&mut self, id: BlockId) {
-        let owner = self.block(id).parent;
-        if let Some(f) = owner {
-            self.functions[f].roster.retain(|&b| b != id);
-        }
-        // Defensive: also drop from the storage function's roster in case
-        // ownership and storage diverged and both listed it.
-        self.functions[id.func].roster.retain(|&b| b != id);
-    }
-
-    pub fn push_block_param(&mut self, func: FunctionId, param: BlockParam<'str>) -> BlockParamId {
-        let local = self.functions[func].params.push(param);
-        BlockParamId::new(func, local)
-    }
-
-    pub fn push_edge(&mut self, func: FunctionId, edge: EdgeData) -> EdgeId {
-        self.functions[func].edges.push(edge)
-    }
-
     pub fn push_varnode(&mut self, varnode: Varnode<'str>) -> VarnodeId {
         self.varnodes.push(varnode)
-    }
-
-    /// Push a function's interface and body in lockstep, returning the shared
-    /// [`FunctionId`]. Both registries must always grow together.
-    pub fn push_function(
-        &mut self,
-        interface: crate::value::function::FunctionInterface<'str>,
-        body: Function<'str>,
-    ) -> FunctionId {
-        let id = self.functions.push(body);
-        let iid = self.interfaces.push(interface);
-        debug_assert_eq!(
-            Into::<usize>::into(id),
-            Into::<usize>::into(iid),
-            "function body/interface registries drifted"
-        );
-        id
     }
 }

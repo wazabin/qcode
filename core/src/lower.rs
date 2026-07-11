@@ -147,10 +147,13 @@ fn register_structs(ctx: &mut Context, structs: &[StructDecl]) {
         let mut fields = Vec::new();
         for field in &s.fields {
             let (size, ty) = match &field.ty {
-                StructFieldType::Int(n) => (*n, ctx.types.get_or_make_int(*n)),
+                StructFieldType::Int(n) => (*n, ctx.shared.types.get_or_make_int(*n)),
                 StructFieldType::StructPtr(target) => {
-                    let pointee = ctx.types.get_or_make_struct(target, 0, Vec::new());
-                    (8usize, ctx.types.get_or_make_struct_pointer(8, pointee))
+                    let pointee = ctx.shared.types.get_or_make_struct(target, 0, Vec::new());
+                    (
+                        8usize,
+                        ctx.shared.types.get_or_make_struct_pointer(8, pointee),
+                    )
                 }
             };
             if !field.is_padding() {
@@ -158,7 +161,7 @@ fn register_structs(ctx: &mut Context, structs: &[StructDecl]) {
             }
             offset += size;
         }
-        ctx.types.get_or_make_struct(&s.name, offset, fields);
+        ctx.shared.types.get_or_make_struct(&s.name, offset, fields);
     }
 }
 
@@ -453,14 +456,15 @@ impl Lowerer<'_, '_, '_> {
                 let _ = Instruction::from_id_mut(self.b.context_mut(), id)
                     .rename(Cow::Owned(name.clone()));
                 if let Some(struct_name) = decl_struct_ptr {
-                    let pointee =
-                        self.b
-                            .context_mut()
-                            .types
-                            .get_or_make_struct(struct_name, 0, Vec::new());
+                    let pointee = self.b.context_mut().shared.types.get_or_make_struct(
+                        struct_name,
+                        0,
+                        Vec::new(),
+                    );
                     let sp = self
                         .b
                         .context_mut()
+                        .shared
                         .types
                         .get_or_make_struct_pointer(8, pointee);
                     Instruction::from_id_mut(self.b.context_mut(), id).set_type(sp);
@@ -760,6 +764,7 @@ impl Lowerer<'_, '_, '_> {
                             .ok_or("extract: aggregate has no stored type")?;
                         self.b
                             .context()
+                            .shared
                             .types
                             .field_index(ty, name)
                             .ok_or_else(|| format!("extract: no field `{name}`"))?

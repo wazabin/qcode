@@ -57,9 +57,9 @@ impl<'a, 'str> HostRef<'a, 'str> {
     /// the shared registry.
     pub fn function(self, f: FunctionId) -> &'a Function<'str> {
         match self {
-            HostRef::Module(c) => &c.values.functions[f],
+            HostRef::Module(c) => &c.bodies[f],
             HostRef::Checked { fun, id, .. } if f == id => fun,
-            HostRef::Checked { shared, .. } => &shared.values.functions[f],
+            HostRef::Checked { shared, .. } => &shared.bodies[f],
         }
     }
 
@@ -67,7 +67,7 @@ impl<'a, 'str> HostRef<'a, 'str> {
     /// always reads the shared registry — the real interface even for a
     /// co-checked-out function.
     pub fn interface(self, f: FunctionId) -> &'a crate::value::function::FunctionInterface<'str> {
-        &self.shared().values.interfaces[f]
+        &self.shared().interfaces[f]
     }
 
     /// The instruction `id`, routed to its owning function's arena.
@@ -100,19 +100,20 @@ impl<'a, 'str> HostRef<'a, 'str> {
     pub fn type_of(self, id: ValueId) -> crate::types::TypeId {
         let shared = self.shared();
         match id {
-            ValueId::Literal(lid) => shared.values.literals[lid].type_id,
-            ValueId::Bytes(bid) => shared.values.bytes[bid].type_id,
+            ValueId::Literal(lid) => shared.shared.values.literals[lid].type_id,
+            ValueId::Bytes(bid) => shared.shared.values.bytes[bid].type_id,
             ValueId::Instruction(iid) => self.instruction(iid).type_id,
             ValueId::BlockParam(pid) => self.block_param(pid).type_id,
             ValueId::Varnode(vid) => {
-                if let Some(&ty) = shared.values.varnode_types.get(&vid) {
+                if let Some(&ty) = shared.shared.values.varnode_types.get(&vid) {
                     return ty;
                 }
                 shared
+                    .shared
                     .types
-                    .get_or_make_int(shared.values.varnodes[vid].size_bytes())
+                    .get_or_make_int(shared.shared.values.varnodes[vid].size_bytes())
             }
-            ValueId::BasicBlock(_) | ValueId::Function(_) => shared.types.get_or_make_int(0),
+            ValueId::BasicBlock(_) | ValueId::Function(_) => shared.shared.types.get_or_make_int(0),
         }
     }
 
@@ -125,11 +126,11 @@ impl<'a, 'str> HostRef<'a, 'str> {
     pub fn stored_type_of(self, id: ValueId) -> Option<crate::types::TypeId> {
         let shared = self.shared();
         match id {
-            ValueId::Literal(lid) => Some(shared.values.literals[lid].type_id),
-            ValueId::Bytes(bid) => Some(shared.values.bytes[bid].type_id),
+            ValueId::Literal(lid) => Some(shared.shared.values.literals[lid].type_id),
+            ValueId::Bytes(bid) => Some(shared.shared.values.bytes[bid].type_id),
             ValueId::Instruction(iid) => Some(self.instruction(iid).type_id),
             ValueId::BlockParam(pid) => Some(self.block_param(pid).type_id),
-            ValueId::Varnode(vid) => shared.values.varnode_types.get(&vid).copied(),
+            ValueId::Varnode(vid) => shared.shared.values.varnode_types.get(&vid).copied(),
             ValueId::BasicBlock(_) | ValueId::Function(_) => None,
         }
     }

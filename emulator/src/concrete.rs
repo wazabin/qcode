@@ -1175,7 +1175,7 @@ impl StandaloneEmulator {
                 if let Some(value) = nested.get_value(ctx, ret_value) {
                     let size = ctx
                         .stored_type_of(ret_value)
-                        .map(|ty| ctx.types.size_of(ty))
+                        .map(|ty| ctx.shared.types.size_of(ty))
                         .unwrap_or(8);
                     self.insn_values
                         .insert(insn_id, SizedValue::new(value, size));
@@ -1622,7 +1622,9 @@ impl StandaloneEmulator {
     /// [`array_values`](Self::array_values) rather than scalar `insn_values`).
     fn is_array_operand(&self, ctx: &Context<'_>, id: ValueId) -> bool {
         match ctx.stored_type_of(id) {
-            Some(ty) => ctx.types.array_of(ty).is_some() || ctx.types.list_of(ty).is_some(),
+            Some(ty) => {
+                ctx.shared.types.array_of(ty).is_some() || ctx.shared.types.list_of(ty).is_some()
+            }
             None => false,
         }
     }
@@ -1632,7 +1634,7 @@ impl StandaloneEmulator {
     /// materialized as a scalar literal/result.
     fn resolve_array(&mut self, ctx: &Context<'_>, id: ValueId) -> Option<Vec<u8>> {
         match id {
-            ValueId::Bytes(b) => Some(ctx.values.bytes[b].data.clone()),
+            ValueId::Bytes(b) => Some(ctx.shared.values.bytes[b].data.clone()),
             ValueId::Instruction(i) => self
                 .array_values
                 .get(&i)
@@ -1646,7 +1648,9 @@ impl StandaloneEmulator {
             // callers that lack the projection guarantee.
             ValueId::BlockParam(_) => {
                 let bytes = self.get_value_bytes(ctx, id)?;
-                let ty_size = ctx.stored_type_of(id).map(|ty| ctx.types.size_of(ty))?;
+                let ty_size = ctx
+                    .stored_type_of(id)
+                    .map(|ty| ctx.shared.types.size_of(ty))?;
                 (bytes.len() == ty_size).then_some(bytes)
             }
             _ => None,
@@ -1714,16 +1718,17 @@ impl StandaloneEmulator {
                 let src_ty = ctx
                     .stored_type_of(args[0])
                     .ok_or(EmulatorErrorKind::ValueError(0))?;
-                if matches!(ctx.types.list_of(src_ty), Some((_, None))) {
+                if matches!(ctx.shared.types.list_of(src_ty), Some((_, None))) {
                     return Err(EmulatorErrorKind::UnsupportedIntrinsic(Box::from(
                         "enumerate",
                     )));
                 }
                 let in_elem = ctx
+                    .shared
                     .types
                     .seq_elem_of(src_ty)
                     .ok_or(EmulatorErrorKind::ValueError(0))?;
-                let isz = ctx.types.size_of(in_elem).max(1);
+                let isz = ctx.shared.types.size_of(in_elem).max(1);
                 let buf = self
                     .resolve_array(ctx, args[0])
                     .ok_or(EmulatorErrorKind::ValueError(0))?;
@@ -1733,17 +1738,18 @@ impl StandaloneEmulator {
                 // elem). This is the same layout `eval_scan` splits back out.
                 let tuple_ty = ctx
                     .stored_type_of(ValueId::Instruction(insn_id))
-                    .and_then(|ty| ctx.types.seq_elem_of(ty))
+                    .and_then(|ty| ctx.shared.types.seq_elem_of(ty))
                     .ok_or(EmulatorErrorKind::ValueError(0))?;
                 let (idx_sz, elem_off) = {
                     let fields = ctx
+                        .shared
                         .types
                         .aggregate_fields(tuple_ty)
                         .ok_or(EmulatorErrorKind::ValueError(0))?;
                     let [idx_f, _elem_f] = fields else {
                         return Err(EmulatorErrorKind::ValueError(0));
                     };
-                    let idx_sz = ctx.types.size_of(idx_f.type_id).min(8);
+                    let idx_sz = ctx.shared.types.size_of(idx_f.type_id).min(8);
                     (idx_sz, idx_sz)
                 };
                 let tsz = idx_sz + isz;
@@ -1767,7 +1773,7 @@ impl StandaloneEmulator {
                     .ok_or(EmulatorErrorKind::ValueError(0))? as usize;
                 let esz = ctx
                     .stored_type_of(ValueId::Instruction(insn_id))
-                    .map(|ty| ctx.types.size_of(ty))
+                    .map(|ty| ctx.shared.types.size_of(ty))
                     .unwrap_or(8);
                 let off = i * esz;
                 let lane = buf
@@ -1802,14 +1808,14 @@ impl StandaloneEmulator {
         // fixed-array source and a symbolic-length `iota`.
         let in_elem = ctx
             .stored_type_of(scan.src)
-            .and_then(|ty| ctx.types.seq_elem_of(ty))
+            .and_then(|ty| ctx.shared.types.seq_elem_of(ty))
             .ok_or(EmulatorErrorKind::ValueError(0))?;
-        let isz = ctx.types.size_of(in_elem).max(1);
+        let isz = ctx.shared.types.size_of(in_elem).max(1);
         let out_elem = ctx
             .stored_type_of(ValueId::Instruction(insn_id))
-            .and_then(|ty| ctx.types.seq_elem_of(ty))
+            .and_then(|ty| ctx.shared.types.seq_elem_of(ty))
             .ok_or(EmulatorErrorKind::ValueError(0))?;
-        let osz = ctx.types.size_of(out_elem);
+        let osz = ctx.shared.types.size_of(out_elem);
         let count = src.len() / isz;
         if count == 0 {
             self.array_values.insert(insn_id, Vec::new());
@@ -1826,7 +1832,7 @@ impl StandaloneEmulator {
                     .ok_or(EmulatorErrorKind::ValueError(0))?;
                 let sz = ctx
                     .stored_type_of(c)
-                    .map(|ty| ctx.types.size_of(ty))
+                    .map(|ty| ctx.shared.types.size_of(ty))
                     .unwrap_or(8);
                 Ok(BodyArg::Scalar(SizedValue::new(v, sz)))
             })
@@ -1848,11 +1854,11 @@ impl StandaloneEmulator {
         // structural aggregate (fields addressed by index), so its bytes are laid
         // out sequentially by field size — the same layout `enumerate` writes.
         let elem_fields: Option<Vec<(usize, usize)>> =
-            ctx.types.aggregate_fields(in_elem).map(|fs| {
+            ctx.shared.types.aggregate_fields(in_elem).map(|fs| {
                 let mut off = 0;
                 fs.iter()
                     .map(|f| {
-                        let sz = ctx.types.size_of(f.type_id);
+                        let sz = ctx.shared.types.size_of(f.type_id);
                         let field = (off, sz);
                         off += sz;
                         field
@@ -1909,14 +1915,14 @@ impl StandaloneEmulator {
             .ok_or(EmulatorErrorKind::ValueError(0))?;
         let in_elem = ctx
             .stored_type_of(map.src)
-            .and_then(|ty| ctx.types.seq_elem_of(ty))
+            .and_then(|ty| ctx.shared.types.seq_elem_of(ty))
             .ok_or(EmulatorErrorKind::ValueError(0))?;
-        let isz = ctx.types.size_of(in_elem).max(1);
+        let isz = ctx.shared.types.size_of(in_elem).max(1);
         let out_elem = ctx
             .stored_type_of(ValueId::Instruction(insn_id))
-            .and_then(|ty| ctx.types.seq_elem_of(ty))
+            .and_then(|ty| ctx.shared.types.seq_elem_of(ty))
             .ok_or(EmulatorErrorKind::ValueError(0))?;
-        let osz = ctx.types.size_of(out_elem);
+        let osz = ctx.shared.types.size_of(out_elem);
         let count = src.len() / isz;
 
         let capture_args: Vec<BodyArg> = map
@@ -1928,7 +1934,7 @@ impl StandaloneEmulator {
                     .ok_or(EmulatorErrorKind::ValueError(0))?;
                 let sz = ctx
                     .stored_type_of(c)
-                    .map(|ty| ctx.types.size_of(ty))
+                    .map(|ty| ctx.shared.types.size_of(ty))
                     .unwrap_or(8);
                 Ok(BodyArg::Scalar(SizedValue::new(v, sz)))
             })
@@ -1937,11 +1943,11 @@ impl StandaloneEmulator {
         // The element may be an `enumerate` tuple `(index, elem)`; pass it as an
         // aggregate so the body's `Extract`s resolve (same layout as `eval_scan`).
         let elem_fields: Option<Vec<(usize, usize)>> =
-            ctx.types.aggregate_fields(in_elem).map(|fs| {
+            ctx.shared.types.aggregate_fields(in_elem).map(|fs| {
                 let mut off = 0;
                 fs.iter()
                     .map(|f| {
-                        let sz = ctx.types.size_of(f.type_id);
+                        let sz = ctx.shared.types.size_of(f.type_id);
                         let field = (off, sz);
                         off += sz;
                         field
@@ -2567,15 +2573,15 @@ mod tests {
             fm.add_block(entry);
         }
         // A fixed `[i64; 4]` source `[10, 20, 30, 40]`.
-        let i64_ty = ctx.types.get_or_make_int(8);
-        let arr_ty = ctx.types.get_or_make_array(i64_ty, 4);
+        let i64_ty = ctx.shared.types.get_or_make_int(8);
+        let arr_ty = ctx.shared.types.get_or_make_array(i64_ty, 4);
         let data: Vec<u8> = [10u64, 20, 30, 40]
             .iter()
             .flat_map(|w| w.to_le_bytes())
             .collect();
         let src = ctx.get_bytes(data).id();
         if let ValueId::Bytes(bid) = src {
-            ctx.values.bytes[bid].type_id = arr_ty;
+            ctx.shared.values.bytes[bid].type_id = arr_ty;
         }
         let enum_id = IntrinsicId::from_name("enumerate").unwrap();
         let e = {
@@ -2629,14 +2635,14 @@ mod tests {
             fm.set_root(entry).unwrap();
             fm.add_block(entry);
         }
-        let i8 = ctx.types.get_or_make_int(1);
-        let list_ty = ctx.types.get_or_make_unbounded_list(i8);
+        let i8 = ctx.shared.types.get_or_make_int(1);
+        let list_ty = ctx.shared.types.get_or_make_unbounded_list(i8);
         let src = {
             let mut b = Builder::from_block(BasicBlock::from_id_mut(&mut ctx, entry));
             b.push_param(8).id()
         };
         if let ValueId::BlockParam(pid) = src {
-            ctx.values.block_param_mut(pid).type_id = list_ty;
+            ctx.block_param_mut(pid).type_id = list_ty;
         }
         // Build `enumerate` over the unbounded list with an explicit result type:
         // its `result_type` declines an unbounded operand (no static length), so
@@ -2695,8 +2701,8 @@ mod tests {
 
         let mut ctx = Context::new();
         let arr_ty = {
-            let i8 = ctx.types.get_or_make_int(1);
-            ctx.types.get_or_make_array(i8, n)
+            let i8 = ctx.shared.types.get_or_make_int(1);
+            ctx.shared.types.get_or_make_array(i8, n)
         };
         let f = Function::make(&mut ctx, "f".into()).unwrap().id;
         let entry = {
@@ -2709,7 +2715,7 @@ mod tests {
             fm.add_block(entry);
         }
         let arr_pid = BasicBlock::from_id_mut(&mut ctx, entry).push_param(n).id;
-        ctx.values.block_param_mut(arr_pid).type_id = arr_ty;
+        ctx.block_param_mut(arr_pid).type_id = arr_ty;
 
         let at_id = IntrinsicId::from_name("at").unwrap();
         let (ret, ptr, lane);
@@ -3036,14 +3042,14 @@ mod tests {
 
         memory
             .write(
-                ctx.default_space,
+                ctx.shared.default_space,
                 SizedValue::from_u64(0x1000),
                 1,
                 SizedValue::new(0xaa, 1),
             )
             .unwrap();
         assert!(matches!(
-            memory.read(ctx.default_space, SizedValue::from_u64(0x1001), 1),
+            memory.read(ctx.shared.default_space, SizedValue::from_u64(0x1001), 1),
             Err(EmulatorErrorKind::MemoryReadError(0x1001))
         ));
     }
@@ -3058,7 +3064,7 @@ mod tests {
     #[test]
     fn swap_bytes_pcode_op_is_emulated() {
         let mut ctx = Context::new();
-        let op = ctx.pcode_ops.push(Box::from("swap_bytes"));
+        let op = ctx.shared.pcode_ops.push(Box::from("swap_bytes"));
         let block_id = {
             let __f = ctx.anon_function();
             ctx.get_or_make_block(0x1000, __f)
@@ -3118,7 +3124,7 @@ mod tests {
     #[test]
     fn unknown_pcode_op_returns_typed_error() {
         let mut ctx = Context::new();
-        let op = ctx.pcode_ops.push(Box::from("rdpmc"));
+        let op = ctx.shared.pcode_ops.push(Box::from("rdpmc"));
         let block_id = {
             let __f = ctx.anon_function();
             ctx.get_or_make_block(0x1000, __f)

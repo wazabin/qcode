@@ -231,7 +231,7 @@ fn convert_cross_function_tail_calls(ctx: &mut Context) -> bool {
         Builder::from_block(BasicBlock::from_id_mut(ctx, tramp)).push_tail_call(callee);
         ctx.add_cfg_edge(owner_block, tramp);
 
-        let Mnemonic::CBranch(mut cb) = ctx.values.instruction(insn).mnemonic().clone() else {
+        let Mnemonic::CBranch(mut cb) = ctx.instruction(insn).mnemonic().clone() else {
             continue;
         };
         // Repoint whichever arm(s) targeted this callee's entry at the trampoline.
@@ -372,7 +372,7 @@ fn promote_shared_blocks(ctx: &mut Context) -> bool {
 
     let mut promoted = false;
     for b in contested {
-        if let Some(addr) = ctx.values.block(b).address
+        if let Some(addr) = ctx.block(b).address
             && Function::from_addr(ctx, addr).is_none()
         {
             Function::make_at_addr(ctx, addr, None);
@@ -406,7 +406,7 @@ fn reattribute_blocks(ctx: &mut Context) -> bool {
     let mut changed = false;
     let mut owners_changed: HashSet<FunctionId> = HashSet::default();
     for id in ctx.block_ids() {
-        let cur = ctx.values.block(id).parent;
+        let cur = ctx.block(id).parent;
         let Some(desired) = new_owner.get(&id).copied().or(cur) else {
             continue;
         };
@@ -429,8 +429,8 @@ fn reattribute_blocks(ctx: &mut Context) -> bool {
     // Fix roots and instruction addresses on the affected functions. The
     // ownership rosters were maintained by `add_block` above.
     for &(entry, func) in &entries {
-        if owners_changed.contains(&func) && ctx.values.functions[func].root != Some(entry) {
-            ctx.values.functions[func].root = Some(entry);
+        if owners_changed.contains(&func) && ctx.bodies[func].root != Some(entry) {
+            ctx.bodies[func].root = Some(entry);
         }
     }
     // A function that only *lost* blocks (a `prev` owner) is in `owners_changed`
@@ -445,9 +445,9 @@ fn reattribute_blocks(ctx: &mut Context) -> bool {
             .block_ids()
             .into_iter()
             .collect();
-        let root = ctx.values.functions[func].root;
+        let root = ctx.bodies[func].root;
         if root.is_some_and(|r| !live.contains(&r)) {
-            ctx.values.functions[func].root = None;
+            ctx.bodies[func].root = None;
         }
     }
     for func in owners_changed {
@@ -469,7 +469,7 @@ fn recompute_instruction_addrs(ctx: &mut Context, func: FunctionId) {
             }
         }
     }
-    ctx.values.functions[func].instruction_addrs = addrs;
+    ctx.bodies[func].instruction_addrs = addrs;
 }
 
 #[cfg(test)]
@@ -541,12 +541,9 @@ mod tests {
         assert_block_addrs(&ctx, f, &[0x1000]);
         assert_block_addrs(&ctx, g, &[0x2000, 0x2005]);
         let g_entry = block_at_addr(&ctx, g, 0x2000);
-        assert_eq!(ctx.values.block(g_entry).parent, Some(g));
-        assert_eq!(
-            ctx.values.block(block_at_addr(&ctx, g, 0x2005)).parent,
-            Some(g)
-        );
-        assert_eq!(ctx.values.functions[g].root, Some(g_entry));
+        assert_eq!(ctx.block(g_entry).parent, Some(g));
+        assert_eq!(ctx.block(block_at_addr(&ctx, g, 0x2005)).parent, Some(g));
+        assert_eq!(ctx.bodies[g].root, Some(g_entry));
 
         assert_eq!(addrs(&ctx, f), vec![0x1000]);
         assert_eq!(addrs(&ctx, g), vec![0x2000, 0x2005]);
@@ -608,7 +605,7 @@ mod tests {
         assert_block_addrs(&ctx, f, &[0x1000]);
         assert_block_addrs(&ctx, g, &[0x2000, 0x2005]);
         assert_eq!(
-            ctx.values.block(block_at_addr(&ctx, g, 0x2005)).parent,
+            ctx.block(block_at_addr(&ctx, g, 0x2005)).parent,
             Some(g),
             "the post-call block must be claimed via the materialized fall-through edge",
         );
@@ -806,7 +803,7 @@ mod tests {
         let mut got: Vec<u64> = Function::from_id(ctx, func)
             .block_ids()
             .into_iter()
-            .filter_map(|b| ctx.values.block(b).address)
+            .filter_map(|b| ctx.block(b).address)
             .collect();
         got.sort_unstable();
         let mut want = expected.to_vec();
@@ -819,16 +816,12 @@ mod tests {
         Function::from_id(ctx, func)
             .block_ids()
             .into_iter()
-            .find(|b| ctx.values.block(*b).address == Some(addr))
+            .find(|b| ctx.block(*b).address == Some(addr))
             .unwrap_or_else(|| panic!("{func:?} has no block at {addr:#x}"))
     }
 
     fn addrs(ctx: &Context, func: FunctionId) -> Vec<u64> {
-        ctx.values.functions[func]
-            .instruction_addrs
-            .iter()
-            .copied()
-            .collect()
+        ctx.bodies[func].instruction_addrs.iter().copied().collect()
     }
 
     /// A block *owned* by `F` but *stored* in another function's arena — exactly
@@ -859,7 +852,7 @@ mod tests {
 
         // Precondition: `body` is reattributed (stored in G, owned by F).
         assert_eq!(body.func, g);
-        assert_eq!(ctx.values.block(body).parent, Some(f));
+        assert_eq!(ctx.block(body).parent, Some(f));
 
         // Ownership already matches the CFG, so split's only work is discharging
         // strict locality at its tail — which reports a change (the storage move).
@@ -876,14 +869,14 @@ mod tests {
                 b.func, f,
                 "F still owns a foreign-stored block {b:?} after normalization",
             );
-            assert_eq!(ctx.values.block(*b).parent, Some(f));
+            assert_eq!(ctx.block(*b).parent, Some(f));
         }
         // The old storage in G is tombstoned and no longer owned.
-        assert!(ctx.values.block(body).deleted);
+        assert!(ctx.block(body).deleted);
 
         // (b) The CFG and opcodes are preserved: entry still branches to a single
         // successor which is a `return` block, and F's root is still `entry`.
-        assert_eq!(ctx.values.functions[f].root, Some(entry));
+        assert_eq!(ctx.bodies[f].root, Some(entry));
         let succ: Vec<BlockId> = BasicBlock::from_id(&ctx, entry)
             .successors()
             .map(|(_, s)| s)
@@ -894,7 +887,7 @@ mod tests {
             new_body.func, f,
             "the relocated body must live in F's arena"
         );
-        assert_eq!(ctx.values.block(new_body).address, Some(0x1008));
+        assert_eq!(ctx.block(new_body).address, Some(0x1008));
         let last = BasicBlock::from_id(&ctx, new_body)
             .instructions()
             .last()

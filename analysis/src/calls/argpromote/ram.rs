@@ -274,7 +274,7 @@ fn try_promote(
     // list — both shared across all params so the per-param decomposition can peel
     // a strided `param + idx*scale + const` address (see [`relate_address`]).
     let numbering = precompute_forms(&*ctx, fid);
-    let ram = ctx.default_space;
+    let ram = ctx.shared.default_space;
     let accesses_in: Vec<MemoryAccess> = Function::from_id(ctx, fid)
         .iter()
         .flat_map(|b| {
@@ -312,7 +312,7 @@ fn try_promote(
             continue;
         };
         let base_ty = ctx.type_of(param);
-        let base_size = ctx.types.size_of(base_ty);
+        let base_size = ctx.shared.types.size_of(base_ty);
         promoted.push(Promoted {
             param,
             name,
@@ -387,7 +387,7 @@ fn try_promote(
 /// the check is idempotent. A single uncaptured ram access fails it: see the
 /// all-or-nothing rationale at the call site.
 fn all_accesses_modelled(ctx: &Context, fid: FunctionId, promoted: &[Promoted]) -> bool {
-    let ram = ctx.default_space;
+    let ram = ctx.shared.default_space;
     let captured: HashSet<InstructionId> = promoted
         .iter()
         .flat_map(|p| p.accesses.iter().copied())
@@ -693,7 +693,7 @@ fn apply(
         return false;
     }
 
-    let ram = ctx.default_space;
+    let ram = ctx.shared.default_space;
     // `shadow` is the module-wide argpromote shadow space (see `argpromote`): equal
     // addresses collide here, so aliasing among the pointers stays correct without
     // any anti-alias gate, and a function's snapshot seed shares the space of its
@@ -797,8 +797,8 @@ fn apply(
     // already covered and not double-seeded as a scalar.
     for p in &promoted {
         if let Some(r) = p.region {
-            let elem_ty = ctx.types.get_or_make_int(r.elem_size);
-            let array_ty = ctx.types.get_or_make_array(elem_ty, r.count);
+            let elem_ty = ctx.shared.types.get_or_make_int(r.elem_size);
+            let array_ty = ctx.shared.types.get_or_make_array(elem_ty, r.count);
             snaps.push(Snap {
                 arg_idx: p.arg_idx,
                 base: p.param,
@@ -968,7 +968,7 @@ fn apply_partial(ctx: &mut Context, fid: FunctionId, promoted: &[Promoted]) -> b
         return false;
     }
     let root = Function::from_id(ctx, fid).root().map(|b| b.id).unwrap();
-    let ram = ctx.default_space;
+    let ram = ctx.shared.default_space;
 
     // Existing root-param names, used to skip read fields already seeded by a
     // prior round (idempotence).
@@ -1015,7 +1015,7 @@ fn apply_partial(ctx: &mut Context, fid: FunctionId, promoted: &[Promoted]) -> b
     let mut seeds: Vec<(ValueId, usize, u64, ValueId)> = Vec::new();
     for ns in &new_snaps {
         let val_pid = BasicBlock::from_id_mut(ctx, root).push_param(ns.size).id;
-        ctx.values.block_param_mut(val_pid).name = Some(Cow::Owned(ns.name.clone()));
+        ctx.block_param_mut(val_pid).name = Some(Cow::Owned(ns.name.clone()));
         // An offset-0 snapshot *is* `*base` — record the base slot as its `origin`,
         // so when `base` is a global slot and this snapshot is used as a buffer
         // pointer, alias analysis can treat it as a pointer loaded from that slot
@@ -1023,7 +1023,7 @@ fn apply_partial(ctx: &mut Context, fid: FunctionId, promoted: &[Promoted]) -> b
         // the in-loop reload forward to this param so a later round region-promotes
         // the buffer. Only the offset-0 snapshot equals `*base` exactly.
         if ns.offset == 0 {
-            ctx.values.block_param_mut(val_pid).origin = Some(ns.base);
+            ctx.block_param_mut(val_pid).origin = Some(ns.base);
         }
         seeds.push((
             ns.base,
@@ -1111,7 +1111,7 @@ impl Pass for ArgPromote {
         "Promote by-reference in/out pointer parameters to by-value"
     }
     fn run(&self, ctx: &mut Context, env: &PipelineEnv) -> Result<bool, String> {
-        let sp_reg = ctx.registers.get(&env.cfg.stack_pointer).copied();
+        let sp_reg = ctx.shared.registers.get(&env.cfg.stack_pointer).copied();
         Ok(argpromote_with_sp(ctx, sp_reg))
     }
 }

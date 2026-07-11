@@ -172,7 +172,7 @@ pub fn argpromote_external(ctx: &mut Context, env: &PipelineEnv) -> bool {
     let stack_only = env.cfg.bitness == 32;
     let sp = env.sp_varnode;
     let sp_space = Varnode::from_id(ctx, sp).space().id;
-    let default_space = ctx.default_space;
+    let default_space = ctx.shared.default_space;
 
     // Only externals that are actually *called* can gain arguments: both
     // `bind_external_args` and `bind_external_return` key on a direct `Call` whose
@@ -183,7 +183,7 @@ pub fn argpromote_external(ctx: &mut Context, env: &PipelineEnv) -> bool {
         .functions()
         .filter(|f| f.is_external())
         .map(|f| f.id)
-        .filter(|&id| !ctx.values.call_sites_of(id).is_empty())
+        .filter(|&id| !ctx.shared.values.call_sites_of(id).is_empty())
         .collect();
 
     if externals.is_empty() {
@@ -237,7 +237,7 @@ fn return_slot(
 fn bind_external_return(ctx: &mut Context, fid: FunctionId, ret: VarnodeId) -> bool {
     let ret_space = Varnode::from_id(ctx, ret).space().id;
     let size = Varnode::from_id(ctx, ret).size();
-    let int_ty = ctx.types.get_or_make_int(size);
+    let int_ty = ctx.shared.types.get_or_make_int(size);
 
     let call_sites: Vec<InstructionId> = ctx
         .instructions()

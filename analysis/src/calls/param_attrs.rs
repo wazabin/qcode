@@ -413,7 +413,7 @@ mod tests {
     #[test]
     fn store_through_param_revokes_readonly_only() {
         let mut tc = TestContext::new();
-        let ram = tc.ctx.default_space;
+        let ram = tc.ctx.shared.default_space;
         let f = build_pure_fn(&mut tc, "f", 0x1000, 1, |b, p| {
             let v = b.context_mut().get_const(7, 8).id();
             b.push_store(v, p[0], ram);
@@ -429,7 +429,7 @@ mod tests {
         // f(dst, p): *dst = p — the pointer p is written to memory (captured),
         // but nothing is written *through* p.
         let mut tc = TestContext::new();
-        let ram = tc.ctx.default_space;
+        let ram = tc.ctx.shared.default_space;
         let f = build_pure_fn(&mut tc, "f", 0x1000, 2, |b, p| {
             b.push_store(p[1], p[0], ram);
         });
@@ -446,7 +446,7 @@ mod tests {
     fn read_only_param_keeps_both_bits() {
         // f(p): return *p — a pure read through p.
         let mut tc = TestContext::new();
-        let ram = tc.ctx.default_space;
+        let ram = tc.ctx.shared.default_space;
         let f = build_pure_fn(&mut tc, "f", 0x1000, 1, |b, p| {
             let x = b.push_load::<false>(p[0], 8, ram).id();
             b.push_return(x);
@@ -459,7 +459,7 @@ mod tests {
     #[test]
     fn forwarding_to_readonly_callee_preserves_readonly() {
         let mut tc = TestContext::new();
-        let ram = tc.ctx.default_space;
+        let ram = tc.ctx.shared.default_space;
         // callee(p): return *p — readonly + nocapture.
         let callee = build_pure_fn(&mut tc, "callee", 0x2000, 1, |b, p| {
             let x = b.push_load::<false>(p[0], 8, ram).id();
@@ -485,7 +485,7 @@ mod tests {
     #[test]
     fn forwarding_to_writing_callee_revokes_readonly() {
         let mut tc = TestContext::new();
-        let ram = tc.ctx.default_space;
+        let ram = tc.ctx.shared.default_space;
         // callee(p): *p = 7 — not readonly.
         let callee = build_pure_fn(&mut tc, "callee", 0x2000, 1, |b, p| {
             let v = b.context_mut().get_const(7, 8).id();

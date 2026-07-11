@@ -295,7 +295,7 @@ fn low_mask(w_bytes: usize) -> u64 {
 
 fn numeric_const(ctx: &Context, v: ValueId) -> Option<u64> {
     if let ValueId::Literal(id) = v {
-        let lit = &ctx.values.literals[id];
+        let lit = &ctx.shared.values.literals[id];
         if lit.symbolic.is_none() {
             return Some(lit.value);
         }

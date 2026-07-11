@@ -69,7 +69,7 @@ pub(crate) fn find_carried_array<'a, 'str: 'a>(
             .collect();
         for arr_h in params {
             let arr_ty = host.type_of(arr_h);
-            let Some((elem_ty, count)) = host.shared().types.array_of(arr_ty) else {
+            let Some((elem_ty, count)) = host.shared().shared.types.array_of(arr_ty) else {
                 continue;
             };
             if count == 0 {
@@ -222,7 +222,7 @@ pub(crate) fn classify_body_reads<'a, 'str: 'a>(
         })
         .collect();
     let idx_ty = host.type_of(ca.index);
-    let idx_width = host.shared().types.size_of(idx_ty);
+    let idx_width = host.shared().shared.types.size_of(idx_ty);
     let mut prev = None;
     let mut own = None;
     for (id, e_idx) in arr_b_ats {

@@ -134,7 +134,7 @@ fn try_match(host: HostRef, fid: FunctionId) -> Option<ReadsMatch> {
         a.stored.is_some_and(|src| {
             is_root(src)
                 && stored_type_of(host, src)
-                    .and_then(|t| host.shared().types.array_of(t))
+                    .and_then(|t| host.shared().shared.types.array_of(t))
                     .is_some()
         }) && is_root(a.ptr)
     })?;
@@ -142,8 +142,12 @@ fn try_match(host: HostRef, fid: FunctionId) -> Option<ReadsMatch> {
     let base = seed.ptr;
     let region_space = seed.space;
     let seed_id = seed.id;
-    let (elem_ty, count) = host.shared().types.array_of(stored_type_of(host, arr)?)?;
-    let esz = host.shared().types.size_of(elem_ty);
+    let (elem_ty, count) = host
+        .shared()
+        .shared
+        .types
+        .array_of(stored_type_of(host, arr)?)?;
+    let esz = host.shared().shared.types.size_of(elem_ty);
     if esz == 0 || count == 0 || seed.size != count * esz {
         return None;
     }
@@ -226,7 +230,7 @@ fn apply<'str>(body: &mut FunctionBody<'str>, cx: ContextView<'_, 'str>, m: &Rea
     // checked-out host); this mirrors `at`'s `result_type`.
     let arr_ty = stored_type_of(body.read_host(cx), m.arr);
     let at_ty = arr_ty
-        .and_then(|t| cx.shared_ctx().types.seq_elem_of(t))
+        .and_then(|t| cx.shared_ctx().shared.types.seq_elem_of(t))
         .or(arr_ty)
         .expect("seeded array value has a type");
     for (load_id, lane) in &m.loads {
@@ -273,7 +277,7 @@ fn apply_generic<'str, H: HostMut<'str>>(host: &mut H, m: &ReadsMatch) -> bool {
     // checked-out host); this mirrors `at`'s `result_type`.
     let arr_ty = stored_type_of(host.read_host(), m.arr);
     let at_ty = arr_ty
-        .and_then(|t| host.shared().types.seq_elem_of(t))
+        .and_then(|t| host.shared().shared.types.seq_elem_of(t))
         .or(arr_ty)
         .expect("seeded array value has a type");
     for (load_id, lane) in &m.loads {
@@ -316,7 +320,7 @@ fn build_index<'str, 'ctx, Ctx: HostMut<'str>>(
         LaneIdx::Strided(idx, 0) => idx,
         LaneIdx::Strided(idx, od) => {
             let ty = b.context().type_of(idx);
-            let width = b.context().types.size_of(ty);
+            let width = b.context().shared.types.size_of(ty);
             let mask = if width >= 8 {
                 u64::MAX
             } else {
@@ -384,14 +388,14 @@ mod tests {
     /// reading lanes `base+2` and `base+@i`, plus any `extra` traffic. Returns `fid`.
     fn build(tc: &mut TestContext, ram_region: bool, extra: Extra) -> FunctionId {
         const N: usize = 8;
-        let i8 = tc.ctx.types.get_or_make_int(1);
-        let arr_ty = tc.ctx.types.get_or_make_array(i8, N);
+        let i8 = tc.ctx.shared.types.get_or_make_int(1);
+        let arr_ty = tc.ctx.shared.types.get_or_make_array(i8, N);
         let space = if ram_region {
-            tc.ctx.default_space
+            tc.ctx.shared.default_space
         } else {
             tc.ctx.make_temp_space()
         };
-        let ram = tc.ctx.default_space;
+        let ram = tc.ctx.shared.default_space;
 
         let fid = Function::make(&mut tc.ctx, "f".into()).unwrap().id;
         // Build the entry block *owned by* `fid` (block.func == fid), so the pass
@@ -401,7 +405,7 @@ mod tests {
             .set_root(entry)
             .unwrap();
         let arr_pid = BasicBlock::from_id_mut(&mut tc.ctx, entry).push_param(N).id;
-        tc.ctx.values.block_param_mut(arr_pid).type_id = arr_ty;
+        tc.ctx.block_param_mut(arr_pid).type_id = arr_ty;
         let arr = ValueId::BlockParam(arr_pid);
         let base =
             ValueId::BlockParam(BasicBlock::from_id_mut(&mut tc.ctx, entry).push_param(8).id);

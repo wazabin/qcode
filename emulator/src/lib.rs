@@ -280,6 +280,7 @@ pub trait Interpreter {
     ) -> std::result::Result<Self::V, EmulatorErrorKind> {
         let id = *self
             .ctx()
+            .shared
             .registers
             .get(&reg_id)
             .ok_or(EmulatorErrorKind::UnknownRegister(reg_id))?;
@@ -294,6 +295,7 @@ pub trait Interpreter {
     ) -> std::result::Result<(), EmulatorErrorKind> {
         let id = *self
             .ctx()
+            .shared
             .registers
             .get(&reg_id)
             .ok_or(EmulatorErrorKind::UnknownRegister(reg_id))?;
@@ -461,7 +463,7 @@ pub trait Interpreter {
 
             // ===== Other operations =====
             Mnemonic::PCodeOp(op) => {
-                let name = self.ctx().pcode_ops[op.id].clone();
+                let name = self.ctx().shared.pcode_ops[op.id].clone();
                 match (name.as_ref(), op.args.as_slice()) {
                     ("swap_bytes", [src]) => Some(self.get_value(*src)?.byte_swap()?),
                     _ => return Err(EmulatorErrorKind::UnsupportedPCodeOp(name)),

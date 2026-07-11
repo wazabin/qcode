@@ -327,7 +327,7 @@ fn callee:
             .written_spaces()
             .expect("callee write-set is bounded");
         assert!(
-            !spaces.contains(&ctx.default_space),
+            !spaces.contains(&ctx.shared.default_space),
             "callee writes only scratch, never the default ram space"
         );
     }

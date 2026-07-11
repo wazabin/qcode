@@ -39,7 +39,7 @@ pub struct FunctionId(u32);
 /// function's own passes touch.
 ///
 /// Interfaces are stored in their own
-/// [`ValueRegistry::interfaces`](crate::value::registry::ValueRegistry::interfaces)
+/// [`Context::interfaces`](crate::context::Context::interfaces)
 /// registry, held in lockstep with the function bodies under the same
 /// [`FunctionId`] and never checked out — so a caller always reads the real
 /// interface even while a callee's body is checked out to a worker.
@@ -68,7 +68,7 @@ pub struct FunctionInterface<'str> {
 
 /// A function *body*: arenas, roster, root, reverse use-def, local names. The
 /// caller-reasoning surface lives separately in [`FunctionInterface`], stored in
-/// [`ValueRegistry::interfaces`](crate::value::registry::ValueRegistry::interfaces)
+/// [`Context::interfaces`](crate::context::Context::interfaces)
 /// under the same [`FunctionId`].
 #[derive(Clone, serde::Serialize, serde::Deserialize)]
 pub struct Function<'str> {
@@ -126,8 +126,8 @@ pub struct Function<'str> {
     /// (literals, varnodes) may be used by many functions; each records only its
     /// own uses, which is all any pass needs (no pass queries a shared value's
     /// users program-wide). Kept in sync by
-    /// [`push_insn`](crate::value::registry::ValueRegistry::push_insn),
-    /// [`remove_instructions`](crate::value::registry::ValueRegistry::remove_instructions),
+    /// [`push_insn`](crate::context::Context::push_insn),
+    /// [`remove_instructions`](crate::context::Context::remove_instructions),
     /// [`Context::replace_all_uses_with`](crate::context::Context::replace_all_uses_with),
     /// and [`Context::replace_instruction_mnemonic`](crate::context::Context::replace_instruction_mnemonic).
     #[serde(default)]
@@ -181,7 +181,7 @@ impl<'str> FunctionInterface<'str> {
 
 impl<'str> Function<'str> {
     /// An empty function *body*: no root, empty arenas. The interface lives
-    /// separately in [`ValueRegistry::interfaces`](crate::value::registry::ValueRegistry::interfaces).
+    /// separately in [`Context::interfaces`](crate::context::Context::interfaces).
     pub fn empty_body() -> Self {
         Self {
             root: None,
@@ -303,7 +303,7 @@ impl<'str> Function<'str> {
         mnemonic: Mnemonic,
         size: usize,
     ) -> InstructionId {
-        let type_id = shared.types.get_or_make_int(size);
+        let type_id = shared.shared.types.get_or_make_int(size);
         let insn = Instruction::new(type_id, mnemonic);
         self.push_insn(func, insn)
     }
@@ -626,9 +626,7 @@ impl<'str> Function<'str> {
         ctx: &'ctx mut Context<'str>,
         name: Cow<'str, str>,
     ) -> Result<FunctionMutRef<'str, 'ctx>> {
-        let id = ctx
-            .values
-            .push_function(FunctionInterface::new(name.clone()), Function::empty_body());
+        let id = ctx.push_function(FunctionInterface::new(name.clone()), Function::empty_body());
         ctx.update_name(name, id.into(), None)?;
         Ok(Self::from_id_mut(ctx, id))
     }
@@ -656,9 +654,7 @@ impl<'str> Function<'str> {
             None => Cow::Owned(format!("fn_{address:x}")),
         };
 
-        let id = ctx
-            .values
-            .push_function(FunctionInterface::new(name.clone()), Function::empty_body());
+        let id = ctx.push_function(FunctionInterface::new(name.clone()), Function::empty_body());
 
         Self::from_id_mut(ctx, id)
             .with_name(name)
@@ -972,7 +968,8 @@ where
         // backed by a direct call. Keyed by address; included once a function
         // exists at that address.
         callees.extend(
-            ctx.values
+            ctx.shared
+                .values
                 .synthetic_callees_of(self.id)
                 .filter_map(|addr| Function::from_addr(ctx, addr).map(|function| function.id)),
         );
@@ -1021,6 +1018,7 @@ where
     pub fn callers(&'s self) -> Vec<FunctionId> {
         let ctx = self.ctx();
         let mut callers = ctx
+            .shared
             .values
             .call_sites_of(self.id)
             .iter()
@@ -1243,29 +1241,29 @@ impl<'ctx, 'str> Value<'str, 'ctx> for FunctionMutRef<'str, 'ctx> {
 
 impl Named for FunctionMutRef<'_, '_> {
     fn name(&self) -> Option<&str> {
-        Some(self.ctx.values.interfaces[self.id].name.as_ref())
+        Some(self.ctx.interfaces[self.id].name.as_ref())
     }
 }
 
 impl<'str, 'ctx> Renameable<'str, 'ctx> for FunctionMutRef<'str, 'ctx> {
     fn rename(&mut self, name: Cow<'str, str>) -> Result<()> {
         let id = self.id();
-        let old_name = self.ctx.values.interfaces[self.id].name.as_ref().to_owned();
+        let old_name = self.ctx.interfaces[self.id].name.as_ref().to_owned();
         update_context_name(id, self.ctx, name.clone(), Some(old_name.as_ref()))?;
-        self.ctx.values.interfaces[self.id].name = name;
+        self.ctx.interfaces[self.id].name = name;
         Ok(())
     }
 }
 
 impl<'str, 'ctx> FunctionMutRef<'str, 'ctx> {
     pub(crate) fn inner_mut(&mut self) -> &mut Function<'str> {
-        &mut self.ctx.values.functions[self.id]
+        &mut self.ctx.bodies[self.id]
     }
 
     /// This function's published interface (mutable). Interface writes are
     /// module-scope only; this is the write path for the setters below.
     pub(crate) fn interface_mut(&mut self) -> &mut FunctionInterface<'str> {
-        &mut self.ctx.values.interfaces[self.id]
+        &mut self.ctx.interfaces[self.id]
     }
 
     fn set_address(&mut self, address: u64) -> Result<()> {
@@ -1348,7 +1346,7 @@ impl<'str, 'ctx> FunctionMutRef<'str, 'ctx> {
     }
 
     pub fn set_signature(&mut self, sig: FunctionSignature) {
-        self.ctx.values.interfaces[self.id].signature = Some(sig);
+        self.ctx.interfaces[self.id].signature = Some(sig);
     }
 
     /// Records the inferred per-parameter pointer attributes on this function.
@@ -1493,7 +1491,7 @@ impl<'str, 'ctx> FunctionMutRef<'str, 'ctx> {
     /// must equal `self.id`. This is now effectively an assertion plus a
     /// `parent` (re)assignment; it no longer moves storage between functions.
     pub fn add_block(&mut self, id: BlockId) {
-        let prev = self.ctx.values.block(id).parent;
+        let prev = self.ctx.block(id).parent;
         if prev == Some(self.id) {
             // Already owned; ensure the roster lists it exactly once (a freshly
             // `make`d block is auto-rostered, so this is usually a no-op).
@@ -1504,9 +1502,9 @@ impl<'str, 'ctx> FunctionMutRef<'str, 'ctx> {
         }
         // Re-home: drop from the previous owner's roster, claim it here.
         if let Some(prev) = prev {
-            self.ctx.values.functions[prev].roster.retain(|&b| b != id);
+            self.ctx.bodies[prev].roster.retain(|&b| b != id);
         }
-        self.ctx.values.block_mut(id).parent = Some(self.id);
+        self.ctx.block_mut(id).parent = Some(self.id);
         self.inner_mut().roster.push(id);
     }
 
@@ -1517,8 +1515,8 @@ impl<'str, 'ctx> FunctionMutRef<'str, 'ctx> {
     /// To *delete* a block with its CFG edges/instructions/params unwound, use
     /// [`BasicBlock::delete`].
     pub fn remove_block(&mut self, id: BlockId) {
-        self.ctx.values.unroster_block(id);
-        let block = self.ctx.values.block_mut(id);
+        self.ctx.unroster_block(id);
+        let block = self.ctx.block_mut(id);
         block.parent = None;
         block.deleted = true;
     }

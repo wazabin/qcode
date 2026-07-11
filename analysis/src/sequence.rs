@@ -393,7 +393,7 @@ mod tests {
     fn affine_strided_access_becomes_region() {
         let mut tc = TestContext::new();
         let (fid, body, base, i) = setup_loop(&mut tc);
-        let ram = tc.ctx.default_space;
+        let ram = tc.ctx.shared.default_space;
         let access = {
             let mut b = Builder::from_block(BasicBlock::from_id_mut(&mut tc.ctx, body));
             let four = b.context_mut().get_const(4, 8).id();
@@ -437,7 +437,7 @@ mod tests {
     fn disjoint_dynamic_regions_stay_separate() {
         let mut tc = TestContext::new();
         let (fid, body, base, i) = setup_loop(&mut tc);
-        let ram = tc.ctx.default_space;
+        let ram = tc.ctx.shared.default_space;
         let accesses = {
             let mut b = Builder::from_block(BasicBlock::from_id_mut(&mut tc.ctx, body));
             let one = b.context_mut().get_const(1, 8).id();
@@ -480,7 +480,7 @@ mod tests {
     fn overlapping_mismatched_width_rejects_region() {
         let mut tc = TestContext::new();
         let (fid, body, base, i) = setup_loop(&mut tc);
-        let ram = tc.ctx.default_space;
+        let ram = tc.ctx.shared.default_space;
         let accesses = {
             let mut b = Builder::from_block(BasicBlock::from_id_mut(&mut tc.ctx, body));
             let one = b.context_mut().get_const(1, 8).id();

@@ -59,7 +59,7 @@ fn function_writes_through_stack_arg(
     function_id: FunctionId,
     stack_ptr: VarnodeId,
 ) -> bool {
-    let ram = ctx.default_space;
+    let ram = ctx.shared.default_space;
     let frame = FrameCtx::new(ctx, function_id, stack_ptr);
     for block in Function::from_id(ctx, function_id).blocks() {
         for insn in block.iter() {
@@ -561,7 +561,7 @@ mod tests {
         let pid = BasicBlock::from_id_mut(&mut tc.ctx, block_id)
             .push_param(8)
             .id;
-        tc.ctx.values.block_param_mut(pid).origin = Some(ValueId::Varnode(sp));
+        tc.ctx.block_param_mut(pid).origin = Some(ValueId::Varnode(sp));
         let sp_param = ValueId::BlockParam(pid);
         let mut builder = Builder::from_context(&mut tc.ctx, addr);
         f(&mut builder, sp_param);
@@ -593,7 +593,7 @@ mod tests {
         let fun = build_fn(&mut tc, "stub", 0x1000, |b| {
             b.push_load::<false>(ValueId::Varnode(r0), 8, reg);
         });
-        let root = tc.ctx.values.functions[fun].root.unwrap();
+        let root = tc.ctx.bodies[fun].root.unwrap();
         // Orphan the root, as the splitter used to leave it.
         qcode::value::Function::from_id_mut(&mut tc.ctx, fun).remove_block(root);
         // Best-effort, and specifically no panic.
@@ -733,7 +733,7 @@ mod tests {
     fn dynamic_stack_frame_pointer_read_is_unbounded_stack_reader() {
         let mut tc = TestContext::new();
         let sp = tc.r3;
-        let ram = tc.ctx.default_space;
+        let ram = tc.ctx.shared.default_space;
         let reg = tc.reg_space;
         let r0 = tc.r0;
 
@@ -765,7 +765,7 @@ mod tests {
         // A normally-promotable local (stored then loaded) must stay in memory once
         // the function is flagged as letting a frame pointer escape unboundedly.
         let mut tc = TestContext::new();
-        let ram = tc.ctx.default_space;
+        let ram = tc.ctx.shared.default_space;
         let sp = tc.r3;
 
         // The only loads in the body are the stack-slot reload, so a plain RAM-load

@@ -94,7 +94,7 @@ fn is_symbolic_literal(host: HostRef, v: ValueId) -> bool {
     let ValueId::Literal(id) = v else {
         return false;
     };
-    host.shared().values.literals[id].symbolic.is_some()
+    host.shared().shared.values.literals[id].symbolic.is_some()
 }
 
 /// `get_const`, but refusing Block/Function/String symbolic literals: those are
@@ -222,11 +222,15 @@ fn constant_folding_with_location(
             };
 
             // Preserve the semantic type (e.g. StackAddress) through folding.
-            let out_type = host.shared().types.binop_result(lhs_type, op, rhs_type);
-            let out_type = if host.shared().types.size_of(out_type) == output_size {
+            let out_type = host
+                .shared()
+                .shared
+                .types
+                .binop_result(lhs_type, op, rhs_type);
+            let out_type = if host.shared().shared.types.size_of(out_type) == output_size {
                 out_type
             } else {
-                host.shared().types.get_or_make_int(output_size)
+                host.shared().shared.types.get_or_make_int(output_size)
             };
             Some(host.shared().get_typed_const(value, out_type).id())
         }
@@ -277,7 +281,7 @@ fn constant_folding_with_location(
             // constant. The source may be a numeric literal (e.g. EDI = low 4
             // bytes of a wide RDI literal) or an opaque byte blob.
             if let Some(bid) = range.src.as_bytes() {
-                let data = &host.shared().values.bytes[bid].data;
+                let data = &host.shared().shared.values.bytes[bid].data;
                 let start = range.start;
                 let end = start.checked_add(range.size)?;
                 let slice = data.get(start..end)?;
@@ -601,8 +605,13 @@ mod tests {
         let ValueId::Literal(lid) = folded else {
             panic!("folded result must be a literal");
         };
-        assert_eq!(ctx.types.size_of(ctx.values.literals[lid].type_id), 4);
-        assert_eq!(ctx.values.literals[lid].value, 0xff);
+        assert_eq!(
+            ctx.shared
+                .types
+                .size_of(ctx.shared.values.literals[lid].type_id),
+            4
+        );
+        assert_eq!(ctx.shared.values.literals[lid].value, 0xff);
     }
 
     /// Constant-folding `StructPointer + Int` (the shape `windows_teb_seed`
@@ -612,9 +621,10 @@ mod tests {
     #[test]
     fn constant_folding_on_pointer_addition() {
         let mut ctx = Context::new();
-        let teb = ctx.types.get_or_make_struct("TEB", 0x1000, vec![]);
-        let teb_ptr = ctx.types.get_or_make_struct_pointer(4, teb);
+        let teb = ctx.shared.types.get_or_make_struct("TEB", 0x1000, vec![]);
+        let teb_ptr = ctx.shared.types.get_or_make_struct_pointer(4, teb);
         let base = ctx
+            .shared
             .values
             .get_or_make_typed_literal(0x7ffd_f000, teb_ptr, 4);
         let base = ValueId::Literal(base);
@@ -634,9 +644,9 @@ mod tests {
         let ValueId::Literal(lid) = folded_id else {
             panic!("folded result must be a literal");
         };
-        assert_eq!(ctx.values.literals[lid].value, 0x7ffd_f030);
+        assert_eq!(ctx.shared.values.literals[lid].value, 0x7ffd_f030);
         assert_eq!(
-            ctx.values.literals[lid].type_id, teb_ptr,
+            ctx.shared.values.literals[lid].type_id, teb_ptr,
             "folded TEB* + Int must preserve the struct-pointer type"
         );
     }
@@ -663,8 +673,8 @@ mod tests {
             "
         );
         // Type `fs` as a struct pointer, exactly as `windows_teb_seed` does.
-        let teb = ctx.types.get_or_make_struct("TEB", 0x1000, vec![]);
-        let teb_ptr = ctx.types.get_or_make_struct_pointer(4, teb);
+        let teb = ctx.shared.types.get_or_make_struct("TEB", 0x1000, vec![]);
+        let teb_ptr = ctx.shared.types.get_or_make_struct_pointer(4, teb);
         ctx.set_varnode_type(fs, teb_ptr);
 
         let aliases = AliasResult::simple_for_function(&ctx, ctx.function_ids()[0]);
@@ -765,8 +775,8 @@ mod tests {
                     return at i32 0;
             "
         );
-        let teb = ctx.types.get_or_make_struct("TEB", 0x1000, vec![]);
-        let teb_ptr = ctx.types.get_or_make_struct_pointer(4, teb);
+        let teb = ctx.shared.types.get_or_make_struct("TEB", 0x1000, vec![]);
+        let teb_ptr = ctx.shared.types.get_or_make_struct_pointer(4, teb);
         ctx.set_varnode_type(fs, teb_ptr);
 
         let aliases = AliasResult::simple_for_function(&ctx, ctx.function_ids()[0]);
@@ -1024,7 +1034,7 @@ mod tests {
         let ValueId::Literal(lid) = folded else {
             panic!("folded result must be a literal");
         };
-        assert_eq!(ctx.values.literals[lid].value, 0xFFFF_FF80);
+        assert_eq!(ctx.shared.values.literals[lid].value, 0xFFFF_FF80);
 
         let src = ctx.get_const(0x7f, 1).id();
         let folded = constant_folding(&mut ctx, &Mnemonic::Sext(Sext { src, size: 8 }), 8)
@@ -1032,7 +1042,7 @@ mod tests {
         let ValueId::Literal(lid) = folded else {
             panic!("folded result must be a literal");
         };
-        assert_eq!(ctx.values.literals[lid].value, 0x7f);
+        assert_eq!(ctx.shared.values.literals[lid].value, 0x7f);
     }
 
     /// A constant zero divisor must not fold (and must not panic).
@@ -1079,7 +1089,10 @@ mod tests {
             let ValueId::Literal(lid) = folded else {
                 panic!("folded result must be a literal");
             };
-            assert_eq!(ctx.values.literals[lid].value, 0, "{op:?} by 64 must be 0");
+            assert_eq!(
+                ctx.shared.values.literals[lid].value, 0,
+                "{op:?} by 64 must be 0"
+            );
         }
     }
 
@@ -1088,12 +1101,15 @@ mod tests {
     #[test]
     fn constant_folding_does_not_fold_symbolic_literals_in_casts() {
         let mut ctx = Context::new();
-        let type_id = ctx.types.get_or_make_int(4);
-        let lid = ctx.values.push_literal(qcode::value::literal::Literal {
-            value: 0x1000,
-            type_id,
-            symbolic: Some(qcode::value::literal::SymbolicRef::String("s".into())),
-        });
+        let type_id = ctx.shared.types.get_or_make_int(4);
+        let lid = ctx
+            .shared
+            .values
+            .push_literal(qcode::value::literal::Literal {
+                value: 0x1000,
+                type_id,
+                symbolic: Some(qcode::value::literal::SymbolicRef::String("s".into())),
+            });
         let src = ValueId::Literal(lid);
 
         assert!(constant_folding(&mut ctx, &Mnemonic::Zext(Zext { src, size: 8 }), 8).is_none());
@@ -1164,6 +1180,9 @@ mod tests {
         let ValueId::Bytes(bid) = folded else {
             panic!("expected a byte blob, got {folded:?}");
         };
-        assert_eq!(ctx.values.bytes[bid].data, (2..14u8).collect::<Vec<_>>());
+        assert_eq!(
+            ctx.shared.values.bytes[bid].data,
+            (2..14u8).collect::<Vec<_>>()
+        );
     }
 }

@@ -537,7 +537,7 @@ mod tests {
     /// Helper: numeric value of a literal operand.
     fn lit_value(ctx: &Context, v: ValueId) -> Option<u64> {
         match v {
-            ValueId::Literal(id) => Some(ctx.values.literals[id].value),
+            ValueId::Literal(id) => Some(ctx.shared.values.literals[id].value),
             _ => None,
         }
     }

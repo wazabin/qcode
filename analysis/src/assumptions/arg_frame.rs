@@ -333,7 +333,7 @@ mod tests {
             .unwrap()
             .id();
         if let ValueId::BlockParam(inner) = pv {
-            tc.ctx.values.block_param_mut(inner).origin = Some(ValueId::Varnode(sp_reg));
+            tc.ctx.block_param_mut(inner).origin = Some(ValueId::Varnode(sp_reg));
         }
     }
 

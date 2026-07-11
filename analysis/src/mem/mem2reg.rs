@@ -203,7 +203,7 @@ impl<'ctx, 'str, H: HostMut<'str>> Mem2RegGeneric<'ctx, 'str, H> {
         }
 
         if let ValueId::Literal(id) = value {
-            let literal = self.read().shared().values.literals[id].clone();
+            let literal = self.read().shared().shared.values.literals[id].clone();
             if literal.symbolic.is_none() {
                 return self
                     .read()
@@ -562,7 +562,7 @@ impl<'str, H: HostMut<'str>> Mem2RegGeneric<'_, 'str, H> {
         // Host-routed mirror of `BasicBlock::push_param(size)`: mint an
         // `Int(size)`-typed param and append it to the block's param list.
         let index = self.read().block(block_id).params.len();
-        let type_id = self.read().shared().types.get_or_make_int(size);
+        let type_id = self.read().shared().shared.types.get_or_make_int(size);
         let param_id = self.host.push_block_param(
             block_id.func,
             BlockParam {
@@ -2015,7 +2015,7 @@ impl<'ctx, 'str> Mem2Reg<'ctx, 'str> {
         }
 
         if let ValueId::Literal(id) = value {
-            let literal = self.read().shared().values.literals[id].clone();
+            let literal = self.read().shared().shared.values.literals[id].clone();
             if literal.symbolic.is_none() {
                 return self
                     .read()
@@ -2120,7 +2120,7 @@ impl<'str> Mem2Reg<'_, 'str> {
         // Host-routed mirror of `BasicBlock::push_param(size)`: mint an
         // `Int(size)`-typed param and append it to the block's param list.
         let index = self.read().block(block_id).params.len();
-        let type_id = self.read().shared().types.get_or_make_int(size);
+        let type_id = self.read().shared().shared.types.get_or_make_int(size);
         let param_id = self.body.push_block_param(
             self.cx,
             BlockParam {
@@ -3463,7 +3463,7 @@ mod tests {
         let full_param = BasicBlock::from_id_mut(&mut tc.ctx, block_id)
             .push_param(8)
             .id;
-        tc.ctx.values.block_param_mut(full_param).name = Some("r0".into());
+        tc.ctx.block_param_mut(full_param).name = Some("r0".into());
 
         {
             let mut b = Builder::from_context(&mut tc.ctx, 0x1000);
@@ -3499,7 +3499,7 @@ mod tests {
     fn sp_slot_function(tc: &mut qcode::testing::TestContext) -> (FunctionId, ValueId, VarnodeId) {
         use qcode::builder::Builder;
         let sp_reg = tc.r0;
-        let ram = tc.ctx.default_space;
+        let ram = tc.ctx.shared.default_space;
         let fun_id = Function::make(&mut tc.ctx, "f".into()).unwrap().id;
         let block = {
             let __f = tc.ctx.anon_function();
@@ -3509,8 +3509,8 @@ mod tests {
             .set_root(block)
             .unwrap();
         let pid = BasicBlock::from_id_mut(&mut tc.ctx, block).push_param(8).id;
-        tc.ctx.values.block_param_mut(pid).origin = Some(ValueId::Varnode(sp_reg));
-        tc.ctx.values.block_param_mut(pid).name = Some("RSP".into());
+        tc.ctx.block_param_mut(pid).origin = Some(ValueId::Varnode(sp_reg));
+        tc.ctx.block_param_mut(pid).name = Some("RSP".into());
         let sp = ValueId::BlockParam(pid);
 
         let mut b = Builder::from_context(&mut tc.ctx, 0x1000);
@@ -3576,7 +3576,7 @@ mod tests {
 
         let mut tc = qcode::testing::TestContext::new();
         let sp_reg = tc.r0;
-        let ram = tc.ctx.default_space;
+        let ram = tc.ctx.shared.default_space;
         let fun_id = Function::make(&mut tc.ctx, "f".into()).unwrap().id;
         let block = {
             let __f = tc.ctx.anon_function();
@@ -3586,7 +3586,7 @@ mod tests {
             .set_root(block)
             .unwrap();
         let pid = BasicBlock::from_id_mut(&mut tc.ctx, block).push_param(8).id;
-        tc.ctx.values.block_param_mut(pid).origin = Some(ValueId::Varnode(sp_reg));
+        tc.ctx.block_param_mut(pid).origin = Some(ValueId::Varnode(sp_reg));
         let sp = ValueId::BlockParam(pid);
 
         {
@@ -3740,7 +3740,7 @@ mod tests {
             panic!("expected the sliced byte to fold to a constant, got {src:?}");
         };
         assert_eq!(
-            tc.ctx.values.literals[*lit].value, 0x78,
+            tc.ctx.shared.values.literals[*lit].value, 0x78,
             "the slice is the low byte of 0x12345678"
         );
     }
@@ -4890,7 +4890,7 @@ impl FunctionPass for Mem2RegPass {
         // The alias oracle and `@SP` resolution both read this function's body, so
         // they go through the checked-out read host; the shared `RegisterBase` still
         // keys off the module context.
-        let sp_reg = ctx.registers[&env.cfg.stack_pointer];
+        let sp_reg = ctx.shared.registers[&env.cfg.stack_pointer];
         let (aliases, sp_param) = {
             let host = f.host(m);
             let read = host.read_host();

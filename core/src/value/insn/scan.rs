@@ -88,8 +88,8 @@ mod tests {
             f.set_root(entry).unwrap();
             f.add_block(entry);
         }
-        let i32_ty = tc.ctx.types.get_or_make_int(4);
-        let array_ty = tc.ctx.types.get_or_make_array(i32_ty, 8);
+        let i32_ty = tc.ctx.shared.types.get_or_make_int(4);
+        let array_ty = tc.ctx.shared.types.get_or_make_array(i32_ty, 8);
         let (init, src, cap) = {
             let mut b = Builder::from_block(BasicBlock::from_id_mut(&mut tc.ctx, entry));
             (
@@ -99,7 +99,7 @@ mod tests {
             )
         };
         if let ValueId::BlockParam(pid) = src {
-            tc.ctx.values.block_param_mut(pid).type_id = array_ty;
+            tc.ctx.block_param_mut(pid).type_id = array_ty;
         }
 
         let plain = {
@@ -146,8 +146,8 @@ mod tests {
             f.set_root(entry).unwrap();
             f.add_block(entry);
         }
-        let i32_ty = tc.ctx.types.get_or_make_int(4);
-        let array_ty = tc.ctx.types.get_or_make_array(i32_ty, 20);
+        let i32_ty = tc.ctx.shared.types.get_or_make_int(4);
+        let array_ty = tc.ctx.shared.types.get_or_make_array(i32_ty, 20);
         let (init, src, cap) = {
             let mut b = Builder::from_block(BasicBlock::from_id_mut(&mut tc.ctx, entry));
             (
@@ -157,7 +157,7 @@ mod tests {
             )
         };
         if let ValueId::BlockParam(pid) = src {
-            tc.ctx.values.block_param_mut(pid).type_id = array_ty;
+            tc.ctx.block_param_mut(pid).type_id = array_ty;
         }
         let scan_val = {
             let mut b = Builder::from_block(BasicBlock::from_id_mut(&mut tc.ctx, entry));

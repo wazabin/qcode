@@ -97,7 +97,7 @@ impl<'a, 'str> SubPass<'str, &'a mut Context<'str>> for PureCall {
 
         // Build the positional argument vector: literal value, or poison (0) for a
         // symbolic argument the projection has proven irrelevant to this field.
-        let Some(root) = ctx.values.functions[target].root else {
+        let Some(root) = ctx.bodies[target].root else {
             return Claim::Pass;
         };
         let param_sizes: Vec<usize> = qcode::value::BasicBlock::from_id(ctx, root)
@@ -220,8 +220,8 @@ mod tests {
         b_const: Option<u64>,
     ) -> (FunctionId, qcode::value::block::BlockId) {
         let agg_ty = {
-            let i64_ty = tc.ctx.types.get_or_make_int(8);
-            tc.ctx.types.get_or_make_aggregate(vec![i64_ty, i64_ty])
+            let i64_ty = tc.ctx.shared.types.get_or_make_int(8);
+            tc.ctx.shared.types.get_or_make_aggregate(vec![i64_ty, i64_ty])
         };
         let gid = Function::make(&mut tc.ctx, "g".into()).unwrap().id;
         let entry = {
@@ -297,7 +297,7 @@ mod tests {
                 return None;
             }
             match src {
-                ValueId::Literal(lid) => Some(tc.ctx.values.literals[*lid].value),
+                ValueId::Literal(lid) => Some(tc.ctx.shared.values.literals[*lid].value),
                 _ => None,
             }
         })
@@ -332,8 +332,8 @@ mod tests {
     /// the `BlockParam` arm of `resolve_array`.
     fn build_pure_decoder(tc: &mut TestContext) -> FunctionId {
         let arr_ty = {
-            let i8_ty = tc.ctx.types.get_or_make_int(1);
-            tc.ctx.types.get_or_make_array(i8_ty, 4)
+            let i8_ty = tc.ctx.shared.types.get_or_make_int(1);
+            tc.ctx.shared.types.get_or_make_array(i8_ty, 4)
         };
         let fid = Function::make(&mut tc.ctx, "dec".into()).unwrap().id;
         let entry = {
@@ -350,7 +350,7 @@ mod tests {
         // only), so set its stored type directly, matching how argpromote does.
         let sp_pid = BasicBlock::from_id_mut(&mut tc.ctx, entry).push_param(4).id;
         let arr_pid = BasicBlock::from_id_mut(&mut tc.ctx, entry).push_param(4).id;
-        tc.ctx.values.block_param_mut(arr_pid).type_id = arr_ty;
+        tc.ctx.block_param_mut(arr_pid).type_id = arr_ty;
 
         let at_id = qcode::value::insn::IntrinsicId::from_name("at").expect("at registered");
         let (ret, ptr, tuple);
@@ -393,8 +393,8 @@ mod tests {
         dec: FunctionId,
     ) -> (FunctionId, qcode::value::block::BlockId) {
         let agg_ty = {
-            let i32_ty = tc.ctx.types.get_or_make_int(4);
-            tc.ctx.types.get_or_make_aggregate(vec![i32_ty, i32_ty])
+            let i32_ty = tc.ctx.shared.types.get_or_make_int(4);
+            tc.ctx.shared.types.get_or_make_aggregate(vec![i32_ty, i32_ty])
         };
         let gid = Function::make(&mut tc.ctx, "g".into()).unwrap().id;
         let entry = {

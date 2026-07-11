@@ -70,10 +70,10 @@ pub fn assume_call_returns(ctx: &mut Context) -> usize {
         let mut calls: Vec<(BlockId, FunctionId)> = Vec::new();
 
         for &call_block in &block_ids {
-            let Some(&call_site) = ctx.values.block(call_block).instructions.last() else {
+            let Some(&call_site) = ctx.block(call_block).instructions.last() else {
                 continue;
             };
-            let callee = match ctx.values.instruction(call_site).mnemonic() {
+            let callee = match ctx.instruction(call_site).mnemonic() {
                 Mnemonic::Call(call) => call.target,
                 _ => continue,
             };
@@ -221,10 +221,10 @@ fn function_returns(ctx: &Context, f: FunctionId) -> bool {
 /// known/assumed noreturn (the fall-through edge having been pruned by
 /// [`assume_call_returns`], leaving the block an exit).
 fn is_noreturn_call_block(ctx: &Context, block: BlockId) -> bool {
-    let Some(&last) = ctx.values.block(block).instructions.last() else {
+    let Some(&last) = ctx.block(block).instructions.last() else {
         return false;
     };
-    let Mnemonic::Call(call) = ctx.values.instruction(last).mnemonic() else {
+    let Mnemonic::Call(call) = ctx.instruction(last).mnemonic() else {
         return false;
     };
     // A recorded `FunctionReturns(callee) = false` (assumed or known) marks the

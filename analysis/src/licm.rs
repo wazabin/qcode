@@ -409,7 +409,7 @@ fn build_aliases<'a, 'str: 'a>(
 ) -> Option<AliasResult> {
     let ctx = m.shared_ctx();
     let env = m.env();
-    let sp_reg = ctx.registers.get(&env.cfg.stack_pointer).copied()?;
+    let sp_reg = ctx.shared.registers.get(&env.cfg.stack_pointer).copied()?;
     Some(
         env.alias_base(ctx)
             .for_function(host, fun_id)

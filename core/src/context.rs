@@ -13,6 +13,7 @@ use crate::{
     value::{
         BasicBlock, Function, FunctionId, FunctionRef, Instruction, ValueId,
         block::{BlockId, BlockRef, EdgeData, EdgeId},
+        block_param::{BlockParam, BlockParamId},
         insn::{InstructionId, InstructionRef, Mnemonic, PCodeOpId},
         literal::{LiteralId, LiteralRef},
         registry::ValueRegistry,
@@ -38,7 +39,7 @@ use jstd::registry::{self, Registry};
 /// use qcode_core::context::Context;
 ///
 /// let mut ctx = Context::new();
-/// // ctx.default_space is the RAM space created by new()
+/// // ctx.shared.default_space is the RAM space created by new()
 /// ```
 ///
 /// # Lifetime parameter `'str`
@@ -49,6 +50,37 @@ use jstd::registry::{self, Registry};
 /// `Cow::Borrowed` and must outlive the context.
 #[derive(Default, Clone, serde::Serialize, serde::Deserialize)]
 pub struct Context<'str> {
+    /// Module-shared IR state: everything that is **not** per-function interface
+    /// or body storage (regimes 1–3 of the context-split design — architecture,
+    /// interners, module maps, truths). Reached today behind `&mut Context`;
+    /// [`Context::split()`](Self) (stage 5b-ii c.2) will hand it out as a frozen
+    /// `&Shared` view while the bodies registry is borrowed mutably.
+    pub shared: Shared<'str>,
+
+    /// Per-function *interface* storage — the caller-reasoning surface (name,
+    /// address, kind, external-ness, signature) held in lockstep with
+    /// [`bodies`](Self::bodies) under the same [`FunctionId`] space. Never checked
+    /// out: a co-checked-out callee answers interface queries from here.
+    #[serde(default)]
+    pub interfaces: Registry<FunctionId, crate::value::function::FunctionInterface<'str>>,
+
+    /// Per-function *body* storage. Each function owns its instruction/block/param/
+    /// edge arenas; the composite-ID accessors ([`Context::instruction`] etc.)
+    /// route through here. A checked-out function's body is moved out of its slot
+    /// (leaving an empty body); its [`interface`](Self::interfaces) stays put, so
+    /// callers always read the real interface.
+    pub bodies: Registry<FunctionId, Function<'str>>,
+}
+
+/// Module-shared IR state: regimes 1–3 of the context-split design (see
+/// `docs/plans/context-split/00-overview.md`). Holds the frozen architecture
+/// (spaces, registers, memory image), the append-interned value arenas
+/// (literals, bytes, varnodes, types) inside [`values`](Self::values), and the
+/// phase-mutable module maps (names, addresses, truths, discoveries, call
+/// sites). Everything here is reachable through a frozen `&Shared` view; nothing
+/// per-function-body lives here.
+#[derive(Default, Clone, serde::Serialize, serde::Deserialize)]
+pub struct Shared<'str> {
     pub default_space: SpaceId,
 
     /// A mapping of space ids to their corresponding [`Space`]s.
@@ -65,10 +97,10 @@ pub struct Context<'str> {
     /// resolve them by name. Block/instruction/param names are **not** here — they
     /// live in each [`Function`](crate::value::Function)'s own [`NameTable`], so
     /// those namespaces stay independent across functions (see [`NameTable`]).
-    name_map: NameTable<'str>,
+    pub(crate) name_map: NameTable<'str>,
 
     /// Reverse mapping from addresses to value IDs
-    address_map: HashMap<u64, ValueId>,
+    pub(crate) address_map: HashMap<u64, ValueId>,
 
     /// A mapping of register IDs to their corresponding value IDs
     pub registers: HashMap<RegisterId, VarnodeId>,
@@ -89,7 +121,7 @@ pub struct Context<'str> {
     /// Analysis passes use this for narrow loader-shaped recognizers such as
     /// CRT startup recovery without depending on a binary-format crate.
     #[serde(default)]
-    primary_entrypoint: Option<u64>,
+    pub(crate) primary_entrypoint: Option<u64>,
 
     /// Code addresses discovered by lifting or analysis but not yet lifted.
     /// `qcode_analysis` cannot call the lifter (one-way crate dependency), so
@@ -98,14 +130,14 @@ pub struct Context<'str> {
     /// the (clean) IR. Rides through clone (so it survives checkpoint+replay
     /// rounds) and serialization.
     #[serde(default)]
-    discoveries: crate::discovery::DiscoveryQueue,
+    pub(crate) discoveries: crate::discovery::DiscoveryQueue,
 
     /// The operating system of the loaded binary, stamped by the loader from the
     /// binary format (PE → Windows, ELF → Linux). Platform-gated passes — e.g.
     /// TEB seeding, which only applies to Windows — read it. `Unknown` for
     /// synthetic contexts.
     #[serde(default)]
-    target_os: TargetOs,
+    pub(crate) target_os: TargetOs,
 
     /// Entry addresses of functions the user asked to skip optimizing (via the
     /// `--ignore` flag). Such functions are still lifted, but every per-function
@@ -113,7 +145,7 @@ pub struct Context<'str> {
     /// checkpoint+replay rounds, and through serialization so a saved session
     /// keeps honoring the request.
     #[serde(default)]
-    ignored_functions: HashSet<u64>,
+    pub(crate) ignored_functions: HashSet<u64>,
 }
 
 /// The operating system of a loaded binary, inferred from its container format.
@@ -134,17 +166,17 @@ impl<'str> Context<'str> {
     pub fn new() -> Self {
         let mut ctx = Self::default();
         // SPACE_CONST = SpaceId(0): virtual space for constant/immediate values
-        ctx.spaces.push(Space::new(Some("const"), 1, 8));
+        ctx.shared.spaces.push(Space::new(Some("const"), 1, 8));
         // default RAM space (SpaceId(1)); temp spaces start at SpaceId(2)
         let default_space = Space::new(Some("ram"), 1, 8);
-        ctx.default_space = ctx.spaces.push(default_space);
+        ctx.shared.default_space = ctx.shared.spaces.push(default_space);
         ctx
     }
 
     /// Returns the [`SpaceId`] for the named space, or `None` if it has not
     /// been registered.
     pub fn try_get_space(&self, name: &str) -> Option<SpaceId> {
-        self.named_spaces.get(name).copied()
+        self.shared.named_spaces.get(name).copied()
     }
 
     /// Resolve a space by name for textual lowering: an already-registered named
@@ -160,6 +192,7 @@ impl<'str> Context<'str> {
         // scan the registry by name before minting a fresh one. This keeps a
         // canonical `load(V0:4, V0)` bound to the same space as varnode `V0`.
         if let Some(found) = self
+            .shared
             .spaces
             .iter()
             .find(|s| s.name.as_deref() == Some(name))
@@ -167,81 +200,81 @@ impl<'str> Context<'str> {
         {
             return found;
         }
-        let default = &self.spaces[self.default_space];
+        let default = &self.shared.spaces[self.shared.default_space];
         let space = Space::new(Some(name), default.word_size, default.addr_size);
         self.add_space(space)
     }
 
     /// Creates a new temporary address space and returns its ID.
     pub fn make_temp_space(&mut self) -> SpaceId {
-        let default_space = &self.spaces[self.default_space];
+        let default_space = &self.shared.spaces[self.shared.default_space];
         let mut space = Space::new(None, default_space.word_size, default_space.addr_size);
         space.ty = crate::space::SpaceType::Temporary;
-        self.spaces.push(space)
+        self.shared.spaces.push(space)
     }
 
     /// Adds a space to the context, registering its name, and returns its ID.
     pub fn add_space(&mut self, space: Space) -> SpaceId {
         let name_key: Option<Box<str>> = space.name.clone();
-        let id = self.spaces.push(space);
+        let id = self.shared.spaces.push(space);
         if let Some(name) = name_key {
-            self.named_spaces.insert(name, id);
+            self.shared.named_spaces.insert(name, id);
         }
         id
     }
 
     /// Returns the number of spaces registered in this context.
     pub fn space_count(&self) -> usize {
-        self.spaces.len()
+        self.shared.spaces.len()
     }
 
     pub fn set_primary_entrypoint(&mut self, entrypoint: Option<u64>) {
-        self.primary_entrypoint = entrypoint;
+        self.shared.primary_entrypoint = entrypoint;
     }
 
     pub fn primary_entrypoint(&self) -> Option<u64> {
-        self.primary_entrypoint
+        self.shared.primary_entrypoint
     }
 
     /// Record the set of function entry addresses whose optimization the user
     /// asked to skip (`--ignore`). Per-function passes consult
     /// [`Context::is_function_ignored`] and skip these functions.
     pub fn set_ignored_functions(&mut self, addrs: HashSet<u64>) {
-        self.ignored_functions = addrs;
+        self.shared.ignored_functions = addrs;
     }
 
     /// The function entry addresses whose optimization is being skipped.
     pub fn ignored_functions(&self) -> &HashSet<u64> {
-        &self.ignored_functions
+        &self.shared.ignored_functions
     }
 
     /// Whether the function at `addr` was marked ignored (`--ignore`). A `None`
     /// address (synthetic functions with no entry) is never ignored.
     pub fn is_function_ignored(&self, addr: Option<u64>) -> bool {
-        addr.is_some_and(|a| self.ignored_functions.contains(&a))
+        addr.is_some_and(|a| self.shared.ignored_functions.contains(&a))
     }
 
     /// Records the loaded binary's operating system (set by the loader from the
     /// container format).
     pub fn set_target_os(&mut self, os: TargetOs) {
-        self.target_os = os;
+        self.shared.target_os = os;
     }
 
     /// The loaded binary's operating system, or [`TargetOs::Unknown`].
     pub fn target_os(&self) -> TargetOs {
-        self.target_os
+        self.shared.target_os
     }
 
     /// Replaces the spaces registry wholesale. Intended for initialization from a pre-built spec.
     pub fn load_spaces(&mut self, spaces: registry::Registry<SpaceId, Space>) {
-        self.spaces = spaces;
+        self.shared.spaces = spaces;
     }
 
     /// Creates a new named temporary address space and returns its ID.
     pub fn make_named_temp_space(&mut self, name: impl Into<Box<str>>) -> SpaceId {
-        let default_space = &self.spaces[self.default_space];
+        let default_space = &self.shared.spaces[self.shared.default_space];
         let (word_size, addr_size) = (default_space.word_size, default_space.addr_size);
-        self.spaces.push(Space {
+        self.shared.spaces.push(Space {
             name: Some(name.into()),
             word_size,
             addr_size,
@@ -254,7 +287,7 @@ impl<'str> Context<'str> {
     ///
     /// [`MemoryImage::read_bytes`]: crate::memory_image::MemoryImage::read_bytes
     pub fn read_bytes(&self, addr: u64, n: usize) -> Option<Vec<u8>> {
-        self.memory_image.read_bytes(addr, n)
+        self.shared.memory_image.read_bytes(addr, n)
     }
 
     /// Read a little-endian unsigned integer of `size` bytes from initialized
@@ -262,12 +295,12 @@ impl<'str> Context<'str> {
     ///
     /// [`MemoryImage::read_uint`]: crate::memory_image::MemoryImage::read_uint
     pub fn read_uint(&self, addr: u64, size: usize) -> Option<u64> {
-        self.memory_image.read_uint(addr, size)
+        self.shared.memory_image.read_uint(addr, size)
     }
 
     /// True if `addr` lies in an executable region of the loaded binary.
     pub fn is_executable_addr(&self, addr: u64) -> bool {
-        self.memory_image.is_executable(addr)
+        self.shared.memory_image.is_executable(addr)
     }
 
     /// True only if `addr` is in a region *known* to be writable (protections
@@ -277,14 +310,14 @@ impl<'str> Context<'str> {
     /// resolver stub, not the real target. See
     /// [`MemoryImage::is_known_writable`](crate::memory_image::MemoryImage::is_known_writable).
     pub fn is_known_writable_addr(&self, addr: u64) -> bool {
-        self.memory_image.is_known_writable(addr)
+        self.shared.memory_image.is_known_writable(addr)
     }
 
     /// Mark the binary's memory protections as established (the
     /// `memory_protections` pass has run), so executability checks narrow from the
     /// permissive default to the real per-segment flags.
     pub fn mark_protections_known(&mut self) {
-        self.memory_image.mark_protections_known();
+        self.shared.memory_image.mark_protections_known();
     }
 
     /// The lifter's pre-decode executability gate, modeling executability as a
@@ -307,13 +340,15 @@ impl<'str> Context<'str> {
     /// override seeded as known) wins over the raw segment flags, so the user can
     /// force a region executable or non-executable from the Assumptions panel.
     pub fn assume_executable(&mut self, addr: u64) -> bool {
-        let bounds = self.memory_image.segment_bounds(addr);
+        let bounds = self.shared.memory_image.segment_bounds(addr);
         if let Some((start, end)) = bounds
             && let Some(known) = self.known(Proposition::ExecutableMemory { start, end })
         {
             return known;
         }
-        if !self.memory_image.protections_known() || self.memory_image.is_executable(addr) {
+        if !self.shared.memory_image.protections_known()
+            || self.shared.memory_image.is_executable(addr)
+        {
             return true;
         }
         if let Some((start, end)) = bounds {
@@ -325,7 +360,7 @@ impl<'str> Context<'str> {
     /// Record a discovered code address (typed: a new function or a block within
     /// an existing function) for the `lift_new_addresses` pass to lift.
     pub fn discover(&mut self, discovery: crate::discovery::Discovery) -> bool {
-        self.discoveries.insert(discovery)
+        self.shared.discoveries.insert(discovery)
     }
 
     /// Convenience for the common case: the jump-table pass resolved a branch in
@@ -337,7 +372,7 @@ impl<'str> Context<'str> {
     /// clone, which would leave the target an orphan that function-splitting and
     /// reachability cannot follow).
     pub fn discover_code(&mut self, func_entry: u64, source_block: u64, target: u64) {
-        self.discoveries.insert(
+        self.shared.discoveries.insert(
             crate::discovery::Discovery::block(target, func_entry)
                 .with_edge_kind(crate::discovery::EdgeKind::JumpTableTarget)
                 .from_block_addr(source_block)
@@ -350,17 +385,17 @@ impl<'str> Context<'str> {
 
     /// Remove and return every pending discovery, leaving the queue empty.
     pub fn drain_discoveries(&mut self) -> Vec<crate::discovery::Discovery> {
-        self.discoveries.drain()
+        self.shared.discoveries.drain()
     }
 
     /// Iterate pending discoveries without consuming them.
     pub fn discoveries(&self) -> impl Iterator<Item = &crate::discovery::Discovery> + '_ {
-        self.discoveries.iter()
+        self.shared.discoveries.iter()
     }
 
     /// True if there are no pending discoveries.
     pub fn has_no_discoveries(&self) -> bool {
-        self.discoveries.is_empty()
+        self.shared.discoveries.is_empty()
     }
 
     /// Every code address lifted in this context, as portable [`CodeSeed`]s. Used
@@ -368,7 +403,7 @@ impl<'str> Context<'str> {
     ///
     /// [`CodeSeed`]: crate::discovery::CodeSeed
     pub fn lifted_code_seeds(&self) -> Vec<crate::discovery::CodeSeed> {
-        self.discoveries.lifted_seeds()
+        self.shared.discoveries.lifted_seeds()
     }
 
     /// Enqueue exported [`CodeSeed`]s as pending discoveries so the lifter reaches
@@ -378,12 +413,12 @@ impl<'str> Context<'str> {
     /// [`CodeSeed`]: crate::discovery::CodeSeed
     pub fn seed_code(&mut self, seeds: impl IntoIterator<Item = crate::discovery::CodeSeed>) {
         for seed in seeds {
-            self.discoveries.insert(seed.into_discovery());
+            self.shared.discoveries.insert(seed.into_discovery());
         }
     }
 
     pub fn mark_discovery_lifted(&mut self, key: crate::discovery::DiscoveryKey) {
-        self.discoveries.mark_lifted(key);
+        self.shared.discoveries.mark_lifted(key);
     }
 
     pub fn mark_discovery_failed(
@@ -391,7 +426,7 @@ impl<'str> Context<'str> {
         key: crate::discovery::DiscoveryKey,
         reason: impl Into<String>,
     ) {
-        self.discoveries.mark_failed(key, reason);
+        self.shared.discoveries.mark_failed(key, reason);
     }
 
     pub fn mark_discovery_skipped(
@@ -399,7 +434,7 @@ impl<'str> Context<'str> {
         key: crate::discovery::DiscoveryKey,
         reason: impl Into<String>,
     ) {
-        self.discoveries.mark_skipped(key, reason);
+        self.shared.discoveries.mark_skipped(key, reason);
     }
 
     /// Returns the [`BlockId`] for a block at `addr`, creating one if needed.
@@ -416,7 +451,8 @@ impl<'str> Context<'str> {
     /// The forced rendering mode for a `Bytes` blob, or
     /// [`BytesDisplay::Auto`](crate::value::BytesDisplay::Auto) if unset.
     pub fn bytes_display(&self, id: crate::value::BytesId) -> crate::value::BytesDisplay {
-        self.values
+        self.shared
+            .values
             .bytes_display
             .get(&id)
             .copied()
@@ -432,9 +468,9 @@ impl<'str> Context<'str> {
         mode: crate::value::BytesDisplay,
     ) {
         if mode == crate::value::BytesDisplay::Auto {
-            self.values.bytes_display.remove(&id);
+            self.shared.values.bytes_display.remove(&id);
         } else {
-            self.values.bytes_display.insert(id, mode);
+            self.shared.values.bytes_display.insert(id, mode);
         }
     }
 
@@ -453,8 +489,7 @@ impl<'str> Context<'str> {
     /// [`FunctionInterface::sentinel`](crate::value::function::FunctionInterface::sentinel))
     /// are skipped — they are not functions.
     pub fn function_ids(&self) -> Vec<FunctionId> {
-        self.values
-            .interfaces
+        self.interfaces
             .iter()
             .filter(|i| !i.is_sentinel())
             .map(|i| i.id)
@@ -479,7 +514,7 @@ impl<'str> Context<'str> {
     pub fn instruction_arena_stats(&self) -> (usize, usize) {
         let mut total = 0;
         let mut dead = 0;
-        for f in self.values.functions.iter() {
+        for f in self.bodies.iter() {
             total += f.insns.len();
             dead += f.insns.iter().filter(|i| i.deleted).count();
         }
@@ -504,7 +539,7 @@ impl<'str> Context<'str> {
     pub fn functions(&self) -> FunctionIter<'str, '_> {
         FunctionIter {
             ctx: self,
-            inner: self.values.functions.iter(),
+            inner: self.bodies.iter(),
         }
     }
 
@@ -521,7 +556,7 @@ impl<'str> Context<'str> {
     /// a worker (see `PARALLEL_PASSES.md`). The id and every other function's
     /// stable address are untouched (segmented registry storage).
     ///
-    /// The function's [`interface`](crate::value::registry::ValueRegistry::interfaces)
+    /// The function's [`interface`](crate::context::Context::interfaces)
     /// is never checked out: it stays in the always-present interfaces registry, so
     /// a worker reading a co-checked-out callee's published interface (name,
     /// address, signature, purity, clobber/write summaries) through the shared
@@ -529,7 +564,7 @@ impl<'str> Context<'str> {
     /// with [`checkin_function`](Self::checkin_function) before anything relies on
     /// it again.
     pub fn checkout_function(&mut self, id: FunctionId) -> Function<'str> {
-        self.values.functions.replace(id, Function::empty_body())
+        self.bodies.replace(id, Function::empty_body())
     }
 
     /// Push a never-observed reserved slot (sentinel interface + empty body) into
@@ -537,7 +572,7 @@ impl<'str> Context<'str> {
     /// draws ids from these; they are skipped by every iteration surface until a
     /// minted function is installed over them.
     pub fn push_sentinel_function(&mut self) -> FunctionId {
-        self.values.push_function(
+        self.push_function(
             crate::value::function::FunctionInterface::sentinel(),
             Function::empty_body(),
         )
@@ -547,7 +582,7 @@ impl<'str> Context<'str> {
     /// [`checkout_function`](Self::checkout_function), discarding the sentinel that
     /// held its slot. The function's id must be the one it was checked out under.
     pub fn checkin_function(&mut self, id: FunctionId, fun: Function<'str>) {
-        self.values.functions.replace(id, fun);
+        self.bodies.replace(id, fun);
     }
 
     /// The distinct direct-call *targets* of `fun_id`'s live instructions — a cheap
@@ -583,14 +618,15 @@ impl<'str> Context<'str> {
         affected.sort_unstable();
         affected.dedup();
         for target in affected {
-            let sites = self.values.call_sites.entry(target).or_default();
+            let sites = self.shared.values.call_sites.entry(target).or_default();
             sites.retain(|site| site.func != fun_id);
             sites.extend(after.iter().filter(|(t, _)| *t == target).map(|(_, s)| *s));
         }
     }
 
     pub fn varnodes(&self) -> impl Iterator<Item = VarnodeRef<'str, '_>> + '_ {
-        self.values
+        self.shared
+            .values
             .varnodes
             .iter()
             .map(|v| Varnode::from_id(self, v.id))
@@ -601,7 +637,7 @@ impl<'str> Context<'str> {
     /// used to validate caches keyed on the register/varnode layout (e.g. the
     /// alias [`RegisterBase`](../../qcode_analysis/alias/struct.RegisterBase.html)).
     pub fn varnode_count(&self) -> usize {
-        self.values.varnodes.len()
+        self.shared.values.varnodes.len()
     }
 
     /// Adds a directed edge in the CFG from `from` to `to`, returning its id.
@@ -610,7 +646,7 @@ impl<'str> Context<'str> {
         // but a thunk/tail-call `Branch` targets another function's entry block —
         // a legitimate cross-function edge. Composite `EdgeId` routing lets both
         // incident blocks reference it regardless of which arena holds it.
-        let edge_id = self.values.push_edge(from.func, EdgeData { from, to });
+        let edge_id = self.push_edge(from.func, EdgeData { from, to });
         BasicBlock::from_id_mut(self, from).add_edge(from.func, edge_id);
         BasicBlock::from_id_mut(self, to).add_edge(from.func, edge_id);
         edge_id
@@ -622,7 +658,7 @@ impl<'str> Context<'str> {
     /// place (dangling), consistent with how removed instructions are handled;
     /// per-block traversal reads the block edge sets, which this updates.
     pub fn remove_cfg_edge(&mut self, func: FunctionId, edge_id: EdgeId) {
-        let &EdgeData { from, to } = self.values.edge(func, edge_id);
+        let &EdgeData { from, to } = self.edge(func, edge_id);
         BasicBlock::from_id_mut(self, from).remove_edge(func, edge_id);
         BasicBlock::from_id_mut(self, to).remove_edge(func, edge_id);
     }
@@ -662,7 +698,7 @@ impl<'str> Context<'str> {
         // its internal references remap in one pass.
         let mut foreign_by_owner: HashMap<FunctionId, Vec<BlockId>> = HashMap::default();
         for id in self.block_ids() {
-            if let Some(owner) = self.values.block(id).parent
+            if let Some(owner) = self.block(id).parent
                 && owner != id.func
             {
                 foreign_by_owner.entry(owner).or_default().push(id);
@@ -696,9 +732,9 @@ impl<'str> Context<'str> {
         // Phase 2: with the full map known, remap the clones' operands and block
         // targets (this resolves forward references between relocated blocks).
         for &new in block_map.values() {
-            let insns = self.values.block(new).instructions.clone();
+            let insns = self.block(new).instructions.clone();
             for insn_id in insns {
-                let mut mnemonic = self.values.instruction(insn_id).mnemonic().clone();
+                let mut mnemonic = self.instruction(insn_id).mnemonic().clone();
                 for arg in mnemonic.args() {
                     if let Some(&new_val) = value_map.get(&arg) {
                         mnemonic.replace_value(arg, new_val);
@@ -715,7 +751,7 @@ impl<'str> Context<'str> {
                     }
                 }
                 remap_block_targets(&mut mnemonic, &block_map);
-                *self.values.instruction_mut(insn_id).mnemonic_mut() = mnemonic;
+                *self.instruction_mut(insn_id).mnemonic_mut() = mnemonic;
             }
         }
 
@@ -727,10 +763,10 @@ impl<'str> Context<'str> {
         // it (a block's edge set holds `(FunctionId, EdgeId)` pairs).
         let mut incident: HashSet<(FunctionId, EdgeId)> = HashSet::default();
         for &old in olds {
-            incident.extend(self.values.block(old).edges.iter().copied());
+            incident.extend(self.block(old).edges.iter().copied());
         }
         for (edge_func, edge) in incident {
-            let EdgeData { from, to } = *self.values.edge(edge_func, edge);
+            let EdgeData { from, to } = *self.edge(edge_func, edge);
             let new_from = block_map.get(&from).copied().unwrap_or(from);
             let new_to = block_map.get(&to).copied().unwrap_or(to);
             self.add_cfg_edge(new_from, new_to);
@@ -738,30 +774,32 @@ impl<'str> Context<'str> {
 
         // Phase 4: move each block's machine address onto its clone.
         for &old in olds {
-            let Some(addr) = self.values.block(old).address else {
+            let Some(addr) = self.block(old).address else {
                 continue;
             };
             let new = block_map[&old];
-            let extra = self.values.block(old).extra_addresses.clone();
-            self.values.block_mut(new).extra_addresses = extra;
-            self.values.block_mut(new).address = Some(addr);
-            match self.address_map.get(&addr).copied() {
+            let extra = self.block(old).extra_addresses.clone();
+            self.block_mut(new).extra_addresses = extra;
+            self.block_mut(new).address = Some(addr);
+            match self.shared.address_map.get(&addr).copied() {
                 // A function and its entry block share an address; the map keeps the
                 // function, so only the block's `address` field and the root pointer
                 // (fixed in phase 5) need to move.
                 Some(ValueId::Function(_)) => {}
                 // The block itself is mapped: repoint it at the clone.
                 _ => {
-                    self.address_map.insert(addr, ValueId::BasicBlock(new));
+                    self.shared
+                        .address_map
+                        .insert(addr, ValueId::BasicBlock(new));
                 }
             }
         }
 
         // Phase 5: re-point the function root if it was relocated.
-        if let Some(root) = self.values.functions[target].root
+        if let Some(root) = self.bodies[target].root
             && let Some(&new_root) = block_map.get(&root)
         {
-            self.values.functions[target].root = Some(new_root);
+            self.bodies[target].root = Some(new_root);
         }
 
         // Phase 6: delete the originals (unlinks their old edges, removes their
@@ -779,16 +817,14 @@ impl<'str> Context<'str> {
 
     /// Rebuild `func`'s reverse-use map (`users`) from scratch by scanning its live
     /// instructions' operands. Mirrors the per-operand recording in
-    /// [`ValueRegistry::push_insn`](crate::value::registry::ValueRegistry::push_insn).
+    /// [`Context::push_insn`](crate::context::Context::push_insn).
     fn rebuild_users(&mut self, func: FunctionId) {
         let live: Vec<InstructionId> = Function::from_id(self, func).instruction_ids();
-        let users = &mut self.values.functions[func].users;
+        let users = &mut self.bodies[func].users;
         users.clear();
         for id in live {
-            let args = self.values.functions[func].insns[id.local]
-                .mnemonic()
-                .args();
-            let users = &mut self.values.functions[func].users;
+            let args = self.bodies[func].insns[id.local].mnemonic().args();
+            let users = &mut self.bodies[func].users;
             for arg in args {
                 users.entry(arg).or_default().push(id);
             }
@@ -809,10 +845,10 @@ impl<'str> Context<'str> {
     }
 
     fn assume(&mut self, prop: Proposition, value: bool) -> bool {
-        match self.values.truths.get(&prop) {
+        match self.shared.values.truths.get(&prop) {
             Some(t) => t.value == value,
             None => {
-                self.values.truths.insert(
+                self.shared.values.truths.insert(
                     prop,
                     Truth {
                         value,
@@ -834,24 +870,27 @@ impl<'str> Context<'str> {
     /// an assumption): the driver replays when a round produced novel facts.
     pub fn set_known(&mut self, prop: Proposition, value: bool) -> bool {
         let pass = PassName(pass_scope::current_pass());
-        let novel = match self.values.truths.get(&prop) {
+        let novel = match self.shared.values.truths.get(&prop) {
             Some(prior) => {
                 // Proving the opposite of an already-*known* fact (e.g. a user
                 // override the analysis disproves) is not a replay signal: record
                 // it as a hard contradiction and keep the original known value so
                 // the driver can surface an error and terminate.
                 if prior.certainty == Certainty::Known && prior.value != value {
-                    self.values.known_contradictions.push(KnownContradiction {
-                        prop,
-                        known: prior.value,
-                        proven: value,
-                        known_pass: prior.pass,
-                        proven_pass: pass,
-                    });
+                    self.shared
+                        .values
+                        .known_contradictions
+                        .push(KnownContradiction {
+                            prop,
+                            known: prior.value,
+                            proven: value,
+                            known_pass: prior.pass,
+                            proven_pass: pass,
+                        });
                     return false;
                 }
                 if prior.certainty == Certainty::Assumed && prior.value != value {
-                    self.values.violations.push(Violation {
+                    self.shared.values.violations.push(Violation {
                         prop,
                         assumed: prior.value,
                         assuming_pass: prior.pass,
@@ -864,7 +903,7 @@ impl<'str> Context<'str> {
             }
             None => true,
         };
-        self.values.truths.insert(
+        self.shared.values.truths.insert(
             prop,
             Truth {
                 value,
@@ -885,7 +924,7 @@ impl<'str> Context<'str> {
     /// round boundary so the converged context still names the proving pass
     /// rather than the re-seeding driver.
     pub fn seed_known(&mut self, prop: Proposition, value: bool, pass: PassName) {
-        let prior = self.values.truths.insert(
+        let prior = self.shared.values.truths.insert(
             prop,
             Truth {
                 value,
@@ -898,7 +937,7 @@ impl<'str> Context<'str> {
 
     /// The recorded [`Truth`] of `prop`, if any.
     pub fn truth(&self, prop: Proposition) -> Option<Truth> {
-        self.values.truths.get(&prop).copied()
+        self.shared.values.truths.get(&prop).copied()
     }
 
     /// The proven value of `prop`: `Some` only for *known* entries.
@@ -910,7 +949,7 @@ impl<'str> Context<'str> {
 
     /// Iterates over every recorded truth (assumed and known).
     pub fn truths(&self) -> impl Iterator<Item = (Proposition, Truth)> + '_ {
-        self.values.truths.iter().map(|(&p, &t)| (p, t))
+        self.shared.values.truths.iter().map(|(&p, &t)| (p, t))
     }
 
     /// Iterates over the proven facts, for the replay driver to harvest into
@@ -924,19 +963,19 @@ impl<'str> Context<'str> {
     /// The violations recorded this round (proven facts that contradicted an
     /// assumption). Non-empty means derived IR may be wrong: replay.
     pub fn violations(&self) -> &[Violation] {
-        &self.values.violations
+        &self.shared.values.violations
     }
 
     /// Facts proven this round that contradicted an existing *known* fact (e.g. a
     /// user override the analysis disproved). Non-empty means the analysis cannot
     /// honor the forced value; the driver surfaces this as a hard error.
     pub fn known_contradictions(&self) -> &[KnownContradiction] {
-        &self.values.known_contradictions
+        &self.shared.values.known_contradictions
     }
 
     /// Returns the raw `u64` backing value of the literal `id`.
     pub fn get_literal_value(&self, id: LiteralId) -> u64 {
-        self.values.literals[id].value
+        self.shared.values.literals[id].value
     }
 
     /// Returns an immutable reference to the instruction identified by `id`.
@@ -954,32 +993,195 @@ impl<'str> Context<'str> {
     /// obtain step changes (the caller already holds `&FunctionBody`); the
     /// `.block(id)` call on the result is unchanged.
     pub fn body(&self, fid: FunctionId) -> &crate::value::Function<'str> {
-        &self.values.functions[fid]
+        &self.bodies[fid]
     }
 
     /// The function *body* `fid`, mutably (see [`Context::body`]).
     pub fn body_mut(&mut self, fid: FunctionId) -> &mut crate::value::Function<'str> {
-        &mut self.values.functions[fid]
+        &mut self.bodies[fid]
+    }
+
+    // ----- Composite-id arena routing (moved off `ValueRegistry` in the
+    // context-split reshape: function bodies now live in `Context.bodies`, so the
+    // accessors that route a `(FunctionId, Local)` id to its arena are inherent on
+    // `Context`). Each reads/writes `self.bodies[id.func]`. -----
+
+    /// Appends an instruction to `func`'s body and records all its operands in the
+    /// `users` map (and the `call_sites` cache for a direct call).
+    ///
+    /// # Immutability invariant
+    ///
+    /// Instructions are considered immutable after this call. If you alter the
+    /// operands of an instruction after insertion the `users` map will be stale.
+    /// Rewrite operands through [`replace_all_uses_with`](Self::replace_all_uses_with)
+    /// instead.
+    pub fn push_insn(&mut self, func: FunctionId, insn: Instruction<'str>) -> InstructionId {
+        let args = insn.mnemonic().args();
+        let call_target = insn.mnemonic().call_target();
+        let local = self.bodies[func].insns.push(insn);
+        let id = InstructionId::new(func, local);
+        for arg in args {
+            self.bodies[func].users.entry(arg).or_default().push(id);
+        }
+        if let Some(target) = call_target {
+            self.shared
+                .values
+                .call_sites
+                .entry(target)
+                .or_default()
+                .push(id);
+        }
+        id
+    }
+
+    /// Borrows the instruction `id`, routing through its owning function's arena.
+    pub fn instruction(&self, id: InstructionId) -> &Instruction<'str> {
+        &self.bodies[id.func].insns[id.local]
+    }
+
+    /// Mutably borrows the instruction `id`.
+    pub fn instruction_mut(&mut self, id: InstructionId) -> &mut Instruction<'str> {
+        &mut self.bodies[id.func].insns[id.local]
+    }
+
+    /// Borrows the basic block `id`.
+    pub fn block(&self, id: BlockId) -> &BasicBlock<'str> {
+        &self.bodies[id.func].blocks[id.local]
+    }
+
+    /// Mutably borrows the basic block `id`.
+    pub fn block_mut(&mut self, id: BlockId) -> &mut BasicBlock<'str> {
+        &mut self.bodies[id.func].blocks[id.local]
+    }
+
+    /// Borrows the block parameter `id`.
+    pub fn block_param(&self, id: BlockParamId) -> &BlockParam<'str> {
+        &self.bodies[id.func].params[id.local]
+    }
+
+    /// Mutably borrows the block parameter `id`.
+    pub fn block_param_mut(&mut self, id: BlockParamId) -> &mut BlockParam<'str> {
+        &mut self.bodies[id.func].params[id.local]
+    }
+
+    /// Borrows the CFG edge `id`, stored in function `func`'s edge arena.
+    pub fn edge(&self, func: FunctionId, id: EdgeId) -> &EdgeData {
+        &self.bodies[func].edges[id]
+    }
+
+    /// Mutably borrows the CFG edge `id`, stored in function `func`'s edge arena.
+    pub fn edge_mut(&mut self, func: FunctionId, id: EdgeId) -> &mut EdgeData {
+        &mut self.bodies[func].edges[id]
+    }
+
+    /// Returns the instructions that use `value` as an operand, read from
+    /// `value`'s owning function. For an SSA def (instruction/param) that is the
+    /// complete user set (all uses are intra-function). For a shared value
+    /// (literal/bytes/varnode) there is no single owner, so this returns `&[]`.
+    pub fn users_of(&self, value: ValueId) -> &[InstructionId] {
+        match value.owning_function() {
+            Some(func) => self.bodies[func].users_of(value),
+            None => &[],
+        }
+    }
+
+    /// Removes a set of dead instructions from the use-def map. For every
+    /// instruction in `dead`, each of its operands has all members of `dead`
+    /// pruned from their user lists. Call after removing them from their blocks.
+    pub fn remove_instructions(&mut self, dead: &HashSet<InstructionId>) {
+        let mut affected_args: HashSet<(FunctionId, ValueId)> = HashSet::default();
+        let mut affected_targets: HashSet<FunctionId> = HashSet::default();
+        for &id in dead {
+            let mnemonic = self.bodies[id.func].insns[id.local].mnemonic();
+            affected_args.extend(mnemonic.args().into_iter().map(|arg| (id.func, arg)));
+            if let Some(target) = mnemonic.call_target() {
+                affected_targets.insert(target);
+            }
+            // Tombstone it. Registry IDs are stable indices and cannot be
+            // reclaimed, so the entry stays in the arena; marking it deleted keeps
+            // whole-program scans from yielding the stale operands it still carries.
+            self.bodies[id.func].insns[id.local].deleted = true;
+        }
+        for (func, arg) in affected_args {
+            if let Some(users) = self.bodies[func].users.get_mut(&arg) {
+                users.retain(|u| !dead.contains(u));
+            }
+        }
+        for target in affected_targets {
+            if let Some(sites) = self.shared.values.call_sites.get_mut(&target) {
+                sites.retain(|s| !dead.contains(s));
+            }
+        }
+    }
+
+    pub fn push_block(&mut self, func: FunctionId, block: BasicBlock<'str>) -> BlockId {
+        let local = self.bodies[func].blocks.push(block);
+        let id = BlockId::new(func, local);
+        // A block is born owned by the function whose arena stores it.
+        self.bodies[func].roster.push(id);
+        id
+    }
+
+    /// Removes `id` from its current owner's roster, if present. Storage (the
+    /// arena slot) is untouched. Used by reattribution and block deletion.
+    pub fn unroster_block(&mut self, id: BlockId) {
+        let owner = self.bodies[id.func].blocks[id.local].parent;
+        if let Some(f) = owner {
+            self.bodies[f].roster.retain(|&b| b != id);
+        }
+        // Defensive: also drop from the storage function's roster in case
+        // ownership and storage diverged and both listed it.
+        self.bodies[id.func].roster.retain(|&b| b != id);
+    }
+
+    pub fn push_block_param(&mut self, func: FunctionId, param: BlockParam<'str>) -> BlockParamId {
+        let local = self.bodies[func].params.push(param);
+        BlockParamId::new(func, local)
+    }
+
+    pub fn push_edge(&mut self, func: FunctionId, edge: EdgeData) -> EdgeId {
+        self.bodies[func].edges.push(edge)
+    }
+
+    /// Push a function's interface and body in lockstep, returning the shared
+    /// [`FunctionId`]. Both registries must always grow together.
+    pub fn push_function(
+        &mut self,
+        interface: crate::value::function::FunctionInterface<'str>,
+        body: Function<'str>,
+    ) -> FunctionId {
+        let id = self.bodies.push(body);
+        let iid = self.interfaces.push(interface);
+        debug_assert_eq!(
+            Into::<usize>::into(id),
+            Into::<usize>::into(iid),
+            "function body/interface registries drifted"
+        );
+        id
     }
 
     /// Returns an immutable reference to the varnode mapped to the named
     /// register `id`.
     pub fn get_register(&self, id: RegisterId) -> VarnodeRef<'str, '_> {
-        Varnode::from_id(self, self.registers[&id])
+        Varnode::from_id(self, self.shared.registers[&id])
     }
 
     /// Creates a [`Value`] representing an integer constant of the given byte width.
     pub fn get_const(&self, value: u64, size: usize) -> LiteralRef<'str, '_> {
-        let type_id = self.types.get_or_make_int(size);
-        let id = self.values.get_or_make_typed_literal(value, type_id, size);
+        let type_id = self.shared.types.get_or_make_int(size);
+        let id = self
+            .shared
+            .values
+            .get_or_make_typed_literal(value, type_id, size);
         LiteralRef::new(self, id)
     }
 
     /// Creates a `bool`-typed constant (`true`/`false`), byte-stored with value
     /// `1`/`0`. This is the only way to mint a `bool` literal.
     pub fn get_bool_const(&self, value: bool) -> LiteralRef<'str, '_> {
-        let type_id = self.types.get_or_make_bool();
+        let type_id = self.shared.types.get_or_make_bool();
         let id = self
+            .shared
             .values
             .get_or_make_typed_literal(u64::from(value), type_id, 1);
         LiteralRef::new(self, id)
@@ -995,8 +1197,11 @@ impl<'str> Context<'str> {
         value: u64,
         type_id: crate::types::TypeId,
     ) -> LiteralRef<'str, '_> {
-        let size = self.types.size_of(type_id);
-        let id = self.values.get_or_make_typed_literal(value, type_id, size);
+        let size = self.shared.types.size_of(type_id);
+        let id = self
+            .shared
+            .values
+            .get_or_make_typed_literal(value, type_id, size);
         LiteralRef::new(self, id)
     }
 
@@ -1008,8 +1213,8 @@ impl<'str> Context<'str> {
     /// [`BytesId`](crate::value::BytesId). Use this for constants wider than a
     /// `u64` (SSE/AVX pools, wide stack/memory reads, coalesced constant stores).
     pub fn get_bytes(&self, data: Vec<u8>) -> crate::value::BytesRef<'str, '_> {
-        let i8_ty = self.types.get_or_make_int(1);
-        let type_id = self.types.get_or_make_array(i8_ty, data.len());
+        let i8_ty = self.shared.types.get_or_make_int(1);
+        let type_id = self.shared.types.get_or_make_array(i8_ty, data.len());
         self.get_typed_bytes(data, type_id)
     }
 
@@ -1024,6 +1229,7 @@ impl<'str> Context<'str> {
         type_id: crate::types::TypeId,
     ) -> crate::value::BytesRef<'str, '_> {
         let id = self
+            .shared
             .values
             .bytes
             .push(crate::value::Bytes { data, type_id });
@@ -1036,20 +1242,20 @@ impl<'str> Context<'str> {
     /// non-data values return `Int(0)`.
     pub fn type_of(&self, id: ValueId) -> crate::types::TypeId {
         match id {
-            ValueId::Literal(lid) => self.values.literals[lid].type_id,
-            ValueId::Bytes(bid) => self.values.bytes[bid].type_id,
-            ValueId::Instruction(iid) => self.values.instruction(iid).type_id,
-            ValueId::BlockParam(pid) => self.values.block_param(pid).type_id,
+            ValueId::Literal(lid) => self.shared.values.literals[lid].type_id,
+            ValueId::Bytes(bid) => self.shared.values.bytes[bid].type_id,
+            ValueId::Instruction(iid) => self.instruction(iid).type_id,
+            ValueId::BlockParam(pid) => self.block_param(pid).type_id,
             ValueId::Varnode(vid) => {
-                if let Some(&ty) = self.values.varnode_types.get(&vid) {
+                if let Some(&ty) = self.shared.values.varnode_types.get(&vid) {
                     return ty;
                 }
-                let size = self.values.varnodes[vid].size_bytes();
-                self.types.get_or_make_int(size)
+                let size = self.shared.values.varnodes[vid].size_bytes();
+                self.shared.types.get_or_make_int(size)
             }
             // Exhaustive on purpose: a new ValueId variant must decide its type
             // here rather than silently inheriting the zero-width sentinel.
-            ValueId::BasicBlock(_) | ValueId::Function(_) => self.types.get_or_make_int(0),
+            ValueId::BasicBlock(_) | ValueId::Function(_) => self.shared.types.get_or_make_int(0),
         }
     }
 
@@ -1060,11 +1266,11 @@ impl<'str> Context<'str> {
     /// blocks, and functions return `None`.
     pub fn stored_type_of(&self, id: ValueId) -> Option<crate::types::TypeId> {
         match id {
-            ValueId::Literal(lid) => Some(self.values.literals[lid].type_id),
-            ValueId::Bytes(bid) => Some(self.values.bytes[bid].type_id),
-            ValueId::Instruction(iid) => Some(self.values.instruction(iid).type_id),
-            ValueId::BlockParam(pid) => Some(self.values.block_param(pid).type_id),
-            ValueId::Varnode(vid) => self.values.varnode_types.get(&vid).copied(),
+            ValueId::Literal(lid) => Some(self.shared.values.literals[lid].type_id),
+            ValueId::Bytes(bid) => Some(self.shared.values.bytes[bid].type_id),
+            ValueId::Instruction(iid) => Some(self.instruction(iid).type_id),
+            ValueId::BlockParam(pid) => Some(self.block_param(pid).type_id),
+            ValueId::Varnode(vid) => self.shared.values.varnode_types.get(&vid).copied(),
             ValueId::BasicBlock(_) | ValueId::Function(_) => None,
         }
     }
@@ -1074,7 +1280,7 @@ impl<'str> Context<'str> {
     /// segment base as `PtrTo<TEB>` — so every use across all functions reads the
     /// richer type. Pass a type whose size matches the varnode's width.
     pub fn set_varnode_type(&mut self, varnode: VarnodeId, type_id: crate::types::TypeId) {
-        self.values.varnode_types.insert(varnode, type_id);
+        self.shared.values.varnode_types.insert(varnode, type_id);
     }
 
     /// Return all instructions that use `value` as an operand.
@@ -1085,7 +1291,7 @@ impl<'str> Context<'str> {
     /// their uses are tracked per using-function; use
     /// [`users_across_functions`](Self::users_across_functions) to find them.
     pub fn users(&self, value: impl Into<ValueId>) -> &[InstructionId] {
-        self.values.users_of(value.into())
+        self.users_of(value.into())
     }
 
     /// Every instruction across all functions that uses `value` as an operand.
@@ -1107,7 +1313,7 @@ impl<'str> Context<'str> {
         if old == new {
             return;
         }
-        let users: Vec<InstructionId> = self.values.users_of(old).to_vec();
+        let users: Vec<InstructionId> = self.users_of(old).to_vec();
         // `old`'s user list lives in its owning function's map; every user we are
         // rewriting is in that same function, so `new`'s new uses are recorded
         // there too. `old` is always an SSA def in practice (audited); a shared
@@ -1123,13 +1329,13 @@ impl<'str> Context<'str> {
             Instruction::from_id_mut(self, user_id)
                 .mnemonic_mut()
                 .replace_value(old, new);
-            self.values.functions[func]
+            self.bodies[func]
                 .users
                 .entry(new)
                 .or_default()
                 .push(user_id);
         }
-        self.values.functions[func].users.remove(&old);
+        self.bodies[func].users.remove(&old);
     }
 
     /// Replaces one instruction's mnemonic and keeps the reverse use map in sync.
@@ -1139,37 +1345,38 @@ impl<'str> Context<'str> {
     pub fn replace_instruction_mnemonic(&mut self, id: InstructionId, mnemonic: Mnemonic) {
         // Every operand's use is recorded in this instruction's own function map.
         let func = id.func;
-        let old_args = self.values.instruction(id).mnemonic().args();
+        let old_args = self.instruction(id).mnemonic().args();
         for arg in old_args {
             let mut remove_arg = false;
-            if let Some(users) = self.values.functions[func].users.get_mut(&arg) {
+            if let Some(users) = self.bodies[func].users.get_mut(&arg) {
                 users.retain(|&user| user != id);
                 remove_arg = users.is_empty();
             }
             if remove_arg {
-                self.values.functions[func].users.remove(&arg);
+                self.bodies[func].users.remove(&arg);
             }
         }
 
         // Drop this instruction's old call edge (if it was a direct call) before
         // overwriting the mnemonic; the new one's edge is recorded below.
-        if let Some(target) = self.values.instruction(id).mnemonic().call_target()
-            && let Some(sites) = self.values.call_sites.get_mut(&target)
+        if let Some(target) = self.instruction(id).mnemonic().call_target()
+            && let Some(sites) = self.shared.values.call_sites.get_mut(&target)
         {
             sites.retain(|&site| site != id);
         }
 
         *Instruction::from_id_mut(self, id).mnemonic_mut() = mnemonic;
 
-        for arg in self.values.instruction(id).mnemonic().args() {
-            self.values.functions[func]
-                .users
-                .entry(arg)
+        for arg in self.instruction(id).mnemonic().args() {
+            self.bodies[func].users.entry(arg).or_default().push(id);
+        }
+        if let Some(target) = self.instruction(id).mnemonic().call_target() {
+            self.shared
+                .values
+                .call_sites
+                .entry(target)
                 .or_default()
                 .push(id);
-        }
-        if let Some(target) = self.values.instruction(id).mnemonic().call_target() {
-            self.values.call_sites.entry(target).or_default().push(id);
         }
     }
 
@@ -1181,14 +1388,11 @@ impl<'str> Context<'str> {
     /// If the instruction has no parent block the block-list and parent steps are
     /// skipped, but name and users cleanup still runs.
     pub fn remove_instruction(&mut self, id: InstructionId) {
-        let parent = self.values.instruction(id).parent;
-        let name = self.values.instruction(id).name.clone();
+        let parent = self.instruction(id).parent;
+        let name = self.instruction(id).name.clone();
 
         if let Some(block_id) = parent {
-            self.values
-                .block_mut(block_id)
-                .instructions
-                .retain(|&i| i != id);
+            self.block_mut(block_id).instructions.retain(|&i| i != id);
 
             // If this instruction was a terminator instruction in a basic block,
             // remove cfg edges
@@ -1204,15 +1408,15 @@ impl<'str> Context<'str> {
             }
         }
 
-        self.values.instruction_mut(id).parent = None;
+        self.instruction_mut(id).parent = None;
 
         if let Some(ref n) = name {
             // The instruction's name lives in its own function's name table.
-            self.values.functions[id.func].names.forget(n.as_ref());
+            self.bodies[id.func].names.forget(n.as_ref());
         }
-        self.values.instruction_mut(id).name = None;
+        self.instruction_mut(id).name = None;
 
-        self.values.remove_instructions(&HashSet::from_iter([id]));
+        self.remove_instructions(&HashSet::from_iter([id]));
     }
 
     /// Associates `addr` with `id` in the address map.
@@ -1221,7 +1425,7 @@ impl<'str> Context<'str> {
     /// mapped. Callers that have already checked (e.g. via
     /// [`get_at_addr`](Self::get_at_addr)) may safely `.expect(...)` the result.
     pub(crate) fn set_address(&mut self, addr: u64, id: ValueId) -> crate::error::Result<()> {
-        if let Some(existing) = self.address_map.insert(addr, id) {
+        if let Some(existing) = self.shared.address_map.insert(addr, id) {
             // The only case where duplicates are allowed are for a function and its root block sharing an address
             // In that case, the function address should be kept.
 
@@ -1234,7 +1438,9 @@ impl<'str> Context<'str> {
                 | (ValueId::BasicBlock(block_id), ValueId::Function(func_id)) => {
                     let mut function = Function::from_id_mut(self, func_id);
                     function.ensure_root(block_id)?;
-                    self.address_map.insert(addr, ValueId::Function(func_id));
+                    self.shared
+                        .address_map
+                        .insert(addr, ValueId::Function(func_id));
                     return Ok(());
                 }
 
@@ -1256,10 +1462,8 @@ impl<'str> Context<'str> {
         old_name: Option<&str>,
     ) -> Result<()> {
         match id.name_scope_function() {
-            Some(func) => self.values.functions[func]
-                .names
-                .register(name, id, old_name),
-            None => self.name_map.register(name, id, old_name),
+            Some(func) => self.bodies[func].names.register(name, id, old_name),
+            None => self.shared.name_map.register(name, id, old_name),
         }
     }
 
@@ -1269,8 +1473,8 @@ impl<'str> Context<'str> {
     /// unique name for a known SSA value.
     pub fn get_named_in_scope(&self, id: ValueId, name: &str) -> Option<ValueId> {
         match id.name_scope_function() {
-            Some(func) => self.values.functions[func].names.get(name),
-            None => self.name_map.get(name),
+            Some(func) => self.bodies[func].names.get(name),
+            None => self.shared.name_map.get(name),
         }
     }
 
@@ -1283,12 +1487,12 @@ impl<'str> Context<'str> {
     /// resolved through their owning [`Function`] (see [`NameTable`]); this
     /// returns `None` for them.
     pub fn get_named(&self, name: &str) -> Option<ValueId> {
-        self.name_map.get(name)
+        self.shared.name_map.get(name)
     }
 
     /// Gets a value ID at a given address
     pub fn get_at_addr(&self, addr: &u64) -> Option<ValueId> {
-        self.address_map.get(addr).copied()
+        self.shared.address_map.get(addr).copied()
     }
 
     /// Gets a unique **global** name (functions, varnodes, spaces, …), appending
@@ -1296,14 +1500,14 @@ impl<'str> Context<'str> {
     /// [`get_unique_name_in`](Self::get_unique_name_in) so uniqueness is checked
     /// against the owning function's table.
     pub fn get_unique_name(&mut self, name: Cow<'str, str>) -> Cow<'str, str> {
-        self.name_map.unique(name)
+        self.shared.name_map.unique(name)
     }
 
     /// Gets a unique name within `func`'s function-local name table (for block,
     /// instruction, and block-param names). Two functions may thus reuse the same
     /// name independently.
     pub fn get_unique_name_in(&mut self, func: FunctionId, name: Cow<'str, str>) -> Cow<'str, str> {
-        self.values.functions[func].names.unique(name)
+        self.bodies[func].names.unique(name)
     }
 }
 
@@ -1448,7 +1652,7 @@ impl<'str, 'ctx> Iterator for FunctionIter<'str, 'ctx> {
         let ctx = self.ctx;
         self.inner
             .by_ref()
-            .find(|f| !ctx.values.interfaces[f.id].is_sentinel())
+            .find(|f| !ctx.interfaces[f.id].is_sentinel())
             .map(|f| FunctionRef::from_id(ctx, f.id))
     }
 }
@@ -1967,7 +2171,7 @@ mod tests {
         ));
 
         // Rewriting the indirect call into a direct one records the call edge.
-        assert_eq!(ctx.values.call_sites_of(target), &[call_id]);
+        assert_eq!(ctx.shared.values.call_sites_of(target), &[call_id]);
     }
 
     #[test]
@@ -1985,7 +2189,7 @@ mod tests {
         let target = Function::make(&mut ctx, "target".into()).unwrap().id;
 
         // Indirect calls have no static target, so nothing is recorded yet.
-        assert!(ctx.values.call_sites_of(target).is_empty());
+        assert!(ctx.shared.values.call_sites_of(target).is_empty());
 
         ctx.replace_instruction_mnemonic(
             call_id,
@@ -1995,11 +2199,11 @@ mod tests {
                 clobbers: vec![],
             }),
         );
-        assert_eq!(ctx.values.call_sites_of(target), &[call_id]);
+        assert_eq!(ctx.shared.values.call_sites_of(target), &[call_id]);
 
         // Removing the instruction prunes its call edge.
         ctx.remove_instruction(call_id);
-        assert!(ctx.values.call_sites_of(target).is_empty());
+        assert!(ctx.shared.values.call_sites_of(target).is_empty());
     }
 
     #[test]
@@ -2025,7 +2229,7 @@ mod tests {
         ctx.replace_instruction_mnemonic(
             load_id,
             Mnemonic::Load(Load {
-                space: ctx.default_space,
+                space: ctx.shared.default_space,
                 ptr: new_ptr,
                 size: 8,
             }),
@@ -2085,7 +2289,7 @@ mod tests {
 
         // Manually detach from block without using remove_instruction,
         // simulating an instruction with no parent.
-        ctx.values.instruction_mut(load_id).parent = None;
+        ctx.instruction_mut(load_id).parent = None;
 
         // Should not panic even though parent is None.
         ctx.remove_instruction(load_id);
@@ -2197,7 +2401,11 @@ mod tests {
         let (restored, _): (Context<'static>, usize) =
             bincode::serde::decode_from_slice(&bytes, config).expect("decode");
         assert_eq!(
-            restored.discoveries().map(|d| d.target).collect::<Vec<_>>(),
+            restored
+                
+                .discoveries()
+                .map(|d| d.target)
+                .collect::<Vec<_>>(),
             targets
         );
     }
@@ -2205,9 +2413,11 @@ mod tests {
     #[test]
     fn assume_executable_narrows_once_protections_known() {
         let mut ctx = Context::new();
-        ctx.memory_image
+        ctx.shared
+            .memory_image
             .add_segment(0x1000, vec![0u8; 4], true, false); // code
-        ctx.memory_image
+        ctx.shared
+            .memory_image
             .add_segment(0x2000, vec![0u8; 4], false, true); // data
 
         // Default r/x while protections unknown: everything is permissive, even
@@ -2239,9 +2449,11 @@ mod tests {
     #[test]
     fn assume_executable_honors_region_override() {
         let mut ctx = Context::new();
-        ctx.memory_image
+        ctx.shared
+            .memory_image
             .add_segment(0x1000, vec![0u8; 4], true, false); // code
-        ctx.memory_image
+        ctx.shared
+            .memory_image
             .add_segment(0x2000, vec![0u8; 4], false, true); // data
         ctx.mark_protections_known();
 
@@ -2290,8 +2502,8 @@ mod tests {
 
         // A SpaceAddress type exercises the custom TypeManager serialization.
         let some_space = ctx.make_named_temp_space("scratch");
-        let sa = ctx.types.get_or_make_space_address(8, some_space);
-        let sa_size = ctx.types.size_of(sa);
+        let sa = ctx.shared.types.get_or_make_space_address(8, some_space);
+        let sa_size = ctx.shared.types.size_of(sa);
 
         let blocks_before = ctx.block_ids().len();
         let insns_before = ctx.instruction_ids().len();
@@ -2306,8 +2518,8 @@ mod tests {
         assert_eq!(restored.instruction_ids().len(), insns_before);
         assert_eq!(restored.function_ids().len(), funcs_before);
         // The SpaceAddress type round-trips: same id, same size, same space.
-        assert_eq!(restored.types.size_of(sa), sa_size);
-        assert_eq!(restored.types.space_of(sa), Some(some_space));
+        assert_eq!(restored.shared.types.size_of(sa), sa_size);
+        assert_eq!(restored.shared.types.space_of(sa), Some(some_space));
     }
 
     #[test]

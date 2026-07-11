@@ -630,7 +630,7 @@ async fn run_analysis_fixpoint<'s>(
         // `@SP` param it keys on is minted mid-pipeline, so it cannot be assumed
         // here on the raw baseline. It is verified below (and rolled back if a
         // caller is proven to pass a colliding pointer).
-        let sp_reg = ctx.registers.get(&cfg.stack_pointer).copied();
+        let sp_reg = ctx.shared.registers.get(&cfg.stack_pointer).copied();
         progress.report(PipelineProgress::AssumptionsRecorded { round, count });
 
         if let Err(e) = pipeline.run_async(&mut ctx, &env, round, progress).await {

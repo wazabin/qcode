@@ -236,7 +236,7 @@ impl FunctionPass for CanonicalizeSpSlots {
         f: &mut FunctionBody<'str>,
         cx: ContextView<'_, 'str>,
     ) -> std::result::Result<bool, String> {
-        let sp_reg = cx.shared_ctx().registers[&cx.env().cfg.stack_pointer];
+        let sp_reg = cx.shared_ctx().shared.registers[&cx.env().cfg.stack_pointer];
         let fid = f.id();
         Ok(canonicalize_sp_slots_concrete(f, cx, fid, sp_reg))
     }
@@ -259,7 +259,7 @@ mod tests {
     fn unifies_same_slot_across_blocks() {
         let mut tc = TestContext::new();
         let sp_reg = tc.r0;
-        let ram = tc.ctx.default_space;
+        let ram = tc.ctx.shared.default_space;
         let fid = Function::make(&mut tc.ctx, "f".into()).unwrap().id;
         let root = {
             let __f = tc.ctx.anon_function();
@@ -276,7 +276,7 @@ mod tests {
             f.add_block(other);
         }
         let pid = BasicBlock::from_id_mut(&mut tc.ctx, root).push_param(8).id;
-        tc.ctx.values.block_param_mut(pid).origin = Some(ValueId::Varnode(sp_reg));
+        tc.ctx.block_param_mut(pid).origin = Some(ValueId::Varnode(sp_reg));
         let sp = ValueId::BlockParam(pid);
 
         // `load(@SP - 8)` in each block — distinct Sub ValueIds.

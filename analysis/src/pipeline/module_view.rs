@@ -92,7 +92,7 @@ impl<'ctx, 'str> ContextView<'ctx, 'str> {
     /// clobber/write summaries) — the caller-reasoning surface. Interfaces are
     /// never checked out, so this always reads the shared registry.
     pub fn interface(&self, f: FunctionId) -> &'ctx FunctionInterface<'str> {
-        &self.ctx.values.interfaces[f]
+        &self.ctx.interfaces[f]
     }
 
     /// The underlying whole `&Context` — the transitional escape hatch for the

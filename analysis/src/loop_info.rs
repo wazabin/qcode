@@ -35,7 +35,7 @@ use qcode::{
 pub(crate) fn literal<'a, 'str: 'a>(host: impl Into<HostRef<'a, 'str>>, v: ValueId) -> Option<u64> {
     let host = host.into();
     match v {
-        ValueId::Literal(lid) => Some(host.shared().values.literals[lid].value),
+        ValueId::Literal(lid) => Some(host.shared().shared.values.literals[lid].value),
         _ => None,
     }
 }

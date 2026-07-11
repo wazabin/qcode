@@ -74,14 +74,14 @@ mod tests {
             f.set_root(entry).unwrap();
             f.add_block(entry);
         }
-        let i8 = tc.ctx.types.get_or_make_int(1);
-        let array_ty = tc.ctx.types.get_or_make_array(i8, 8);
+        let i8 = tc.ctx.shared.types.get_or_make_int(1);
+        let array_ty = tc.ctx.shared.types.get_or_make_array(i8, 8);
         let (src, cap) = {
             let mut b = Builder::from_block(BasicBlock::from_id_mut(&mut tc.ctx, entry));
             (b.push_param(8).id(), b.push_param(4).id())
         };
         if let ValueId::BlockParam(pid) = src {
-            tc.ctx.values.block_param_mut(pid).type_id = array_ty;
+            tc.ctx.block_param_mut(pid).type_id = array_ty;
         }
 
         let plain = {
@@ -129,8 +129,8 @@ mod tests {
             f.set_root(entry).unwrap();
             f.add_block(entry);
         }
-        let i8 = tc.ctx.types.get_or_make_int(1);
-        let array_ty = tc.ctx.types.get_or_make_array(i8, 20);
+        let i8 = tc.ctx.shared.types.get_or_make_int(1);
+        let array_ty = tc.ctx.shared.types.get_or_make_array(i8, 20);
 
         let (src, cap) = {
             let mut b = Builder::from_block(BasicBlock::from_id_mut(&mut tc.ctx, entry));
@@ -139,7 +139,7 @@ mod tests {
         // Type the source as the array (params default to int of their width)
         // *before* building the map, so the map's result type picks it up.
         if let ValueId::BlockParam(pid) = src {
-            tc.ctx.values.block_param_mut(pid).type_id = array_ty;
+            tc.ctx.block_param_mut(pid).type_id = array_ty;
         }
         let map_val = {
             let mut b = Builder::from_block(BasicBlock::from_id_mut(&mut tc.ctx, entry));

@@ -82,7 +82,11 @@ impl<'str> Varnode<'str> {
         size: usize,
         space: SpaceId,
     ) -> VarnodeMutRef<'str, 'ctx> {
-        let id = ctx.values.varnodes.push(Varnode::new(base, size, space));
+        let id = ctx
+            .shared
+            .values
+            .varnodes
+            .push(Varnode::new(base, size, space));
         VarnodeMutRef::from_id(ctx, id)
     }
 
@@ -105,7 +109,7 @@ where
     Self: WithCtx<'s, 'ctx, 'str>,
 {
     fn inner(&'s self) -> &'ctx Varnode<'str> {
-        &self.ctx().values.varnodes[self.id]
+        &self.ctx().shared.values.varnodes[self.id]
     }
 
     fn fmt(&'s self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -182,7 +186,7 @@ pub type VarnodeMutRef<'str, 'ctx> = BaseRef<&'ctx mut Context<'str>, VarnodeId>
 
 impl<'str, 'ctx> VarnodeMutRef<'str, 'ctx> {
     fn inner_mut(&mut self) -> &mut Varnode<'str> {
-        &mut self.ctx.values.varnodes[self.id]
+        &mut self.ctx.shared.values.varnodes[self.id]
     }
 
     /// Sets the integer label used to derive a generated temporary's display
@@ -226,7 +230,7 @@ impl<'str, 'ctx> Renameable<'str, 'ctx> for VarnodeMutRef<'str, 'ctx> {
         let id = self.id.into();
         let old_name = self.inner_mut().name.take();
         update_context_name(id, self.ctx, name.clone(), old_name.as_deref())?;
-        self.ctx.values.varnodes[self.id].name = Some(name);
+        self.ctx.shared.values.varnodes[self.id].name = Some(name);
         Ok(())
     }
 }

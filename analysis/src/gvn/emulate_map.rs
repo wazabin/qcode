@@ -97,8 +97,8 @@ impl EmulateMap {
 
         // Output element width, from the map's result array type.
         let map_ty = ctx.type_of(ic.id);
-        let (out_elem, out_n) = ctx.types.array_of(map_ty)?;
-        let osz = ctx.types.size_of(out_elem);
+        let (out_elem, out_n) = ctx.shared.types.array_of(map_ty)?;
+        let osz = ctx.shared.types.size_of(out_elem);
         if osz == 0 || osz > 8 || out_n != n {
             return None;
         }
@@ -155,7 +155,7 @@ impl EmulateMap {
         }
         let bid = ctx.get_bytes(out).id();
         if let ValueId::Bytes(b) = bid {
-            ctx.values.bytes[b].type_id = map_ty;
+            ctx.shared.values.bytes[b].type_id = map_ty;
         }
         Some(bid)
     }
@@ -178,8 +178,8 @@ impl EmulateMap {
 
         // Output element width (also the accumulator width), from the result type.
         let scan_ty = ctx.type_of(ic.id);
-        let (out_elem, out_n) = ctx.types.array_of(scan_ty)?;
-        let osz = ctx.types.size_of(out_elem);
+        let (out_elem, out_n) = ctx.shared.types.array_of(scan_ty)?;
+        let osz = ctx.shared.types.size_of(out_elem);
         if osz == 0 || osz > 8 || out_n != n {
             return None;
         }
@@ -243,7 +243,7 @@ impl EmulateMap {
         }
         let bid = ctx.get_bytes(out).id();
         if let ValueId::Bytes(b) = bid {
-            ctx.values.bytes[b].type_id = scan_ty;
+            ctx.shared.values.bytes[b].type_id = scan_ty;
         }
         Some(bid)
     }
@@ -276,9 +276,15 @@ fn const_source(ctx: &Context, src: ValueId) -> Option<(Vec<u8>, Lane)> {
     // The element and index widths are fixed by `enumerate`'s result type
     // (`[(index, elem); n]`), independent of how the source constant is stored.
     let enum_ty = ctx.stored_type_of(src)?;
-    let (tuple_ty, _) = ctx.types.array_of(enum_ty)?;
-    let index_sz = ctx.types.size_of(ctx.types.field_type(tuple_ty, 0)?);
-    let esz = ctx.types.size_of(ctx.types.field_type(tuple_ty, 1)?);
+    let (tuple_ty, _) = ctx.shared.types.array_of(enum_ty)?;
+    let index_sz = ctx
+        .shared
+        .types
+        .size_of(ctx.shared.types.field_type(tuple_ty, 0)?);
+    let esz = ctx
+        .shared
+        .types
+        .size_of(ctx.shared.types.field_type(tuple_ty, 1)?);
     Some((data, Lane::Enumerate { esz, index_sz }))
 }
 
@@ -286,13 +292,13 @@ fn const_source(ctx: &Context, src: ValueId) -> Option<(Vec<u8>, Lane)> {
 /// `Bytes` blob or a non-symbolic numeric `Literal` (sized by its type).
 fn const_bytes(ctx: &Context, v: ValueId) -> Option<Vec<u8>> {
     match v {
-        ValueId::Bytes(bid) => Some(ctx.values.bytes[bid].data.clone()),
+        ValueId::Bytes(bid) => Some(ctx.shared.values.bytes[bid].data.clone()),
         ValueId::Literal(lid) => {
-            let lit = &ctx.values.literals[lid];
+            let lit = &ctx.shared.values.literals[lid];
             if lit.symbolic.is_some() {
                 return None;
             }
-            let size = ctx.types.size_of(lit.type_id);
+            let size = ctx.shared.types.size_of(lit.type_id);
             if size == 0 || size > 8 {
                 return None;
             }
@@ -305,8 +311,8 @@ fn const_bytes(ctx: &Context, v: ValueId) -> Option<Vec<u8>> {
 
 /// The element byte-width of an `Array(elem, n)` type.
 fn array_elem_size(ctx: &Context, ty: TypeId) -> Option<usize> {
-    let (elem, _) = ctx.types.array_of(ty)?;
-    Some(ctx.types.size_of(elem))
+    let (elem, _) = ctx.shared.types.array_of(ty)?;
+    Some(ctx.shared.types.size_of(elem))
 }
 
 /// Read `size` (≤ 8) little-endian bytes at `start` as a `u64`.
@@ -399,13 +405,13 @@ mod tests {
             f.set_root(entry).unwrap();
             f.add_block(entry);
         }
-        let tsz = tc.ctx.types.size_of(tuple_ty);
+        let tsz = tc.ctx.shared.types.size_of(tuple_ty);
         let t = {
             let mut b = Builder::from_block(BasicBlock::from_id_mut(&mut tc.ctx, entry));
             b.push_param(tsz).id()
         };
         if let ValueId::BlockParam(pid) = t {
-            tc.ctx.values.block_param_mut(pid).type_id = tuple_ty;
+            tc.ctx.block_param_mut(pid).type_id = tuple_ty;
         }
         let (sum, ptr, ret) = {
             let mut b = Builder::from_block(BasicBlock::from_id_mut(&mut tc.ctx, entry));
@@ -442,10 +448,10 @@ mod tests {
                 return None;
             };
             match v {
-                ValueId::Bytes(bid) => Some(tc.ctx.values.bytes[*bid].data.clone()),
+                ValueId::Bytes(bid) => Some(tc.ctx.shared.values.bytes[*bid].data.clone()),
                 ValueId::Literal(lid) => {
-                    let lit = &tc.ctx.values.literals[*lid];
-                    let size = tc.ctx.types.size_of(lit.type_id);
+                    let lit = &tc.ctx.shared.values.literals[*lid];
+                    let size = tc.ctx.shared.types.size_of(lit.type_id);
                     Some(lit.value.to_le_bytes()[..size].to_vec())
                 }
                 _ => None,
@@ -504,8 +510,8 @@ mod tests {
         }
         // A short `[i8;4]` array stored as a plain numeric literal (`0x1f1e1d2c`),
         // exactly as constprop hands it to `map` in the reported sample.
-        let i8 = tc.ctx.types.get_or_make_int(1);
-        let arr_ty = tc.ctx.types.get_or_make_array(i8, 4);
+        let i8 = tc.ctx.shared.types.get_or_make_int(1);
+        let arr_ty = tc.ctx.shared.types.get_or_make_array(i8, 4);
         let src = tc.ctx.get_typed_const(0x1f1e1d2c, arr_ty).id();
         let map_val = {
             let mut b = Builder::from_block(BasicBlock::from_id_mut(&mut tc.ctx, entry));
@@ -530,10 +536,10 @@ mod tests {
         let enum_id = IntrinsicId::from_name("enumerate").unwrap();
 
         // The enumerate tuple type for an `[i8; N]` source.
-        let i8 = tc.ctx.types.get_or_make_int(1);
-        let arr_ty = tc.ctx.types.get_or_make_array(i8, 3);
-        let enum_result_ty = enum_id.desc().result_type(&tc.ctx.types, &[arr_ty]);
-        let (tuple_ty, _) = tc.ctx.types.array_of(enum_result_ty).unwrap();
+        let i8 = tc.ctx.shared.types.get_or_make_int(1);
+        let arr_ty = tc.ctx.shared.types.get_or_make_array(i8, 3);
+        let enum_result_ty = enum_id.desc().result_type(&tc.ctx.shared.types, &[arr_ty]);
+        let (tuple_ty, _) = tc.ctx.shared.types.array_of(enum_result_ty).unwrap();
         let body = build_index_body(&mut tc, tuple_ty);
 
         let host = Function::make(&mut tc.ctx, "host".into()).unwrap().id;
@@ -576,13 +582,13 @@ mod tests {
             f.set_root(entry).unwrap();
             f.add_block(entry);
         }
-        let tsz = tc.ctx.types.size_of(tuple_ty);
+        let tsz = tc.ctx.shared.types.size_of(tuple_ty);
         let (sum, ptr, ret) = {
             let mut b = Builder::from_block(BasicBlock::from_id_mut(&mut tc.ctx, entry));
             let acc = b.push_param(1).id(); // param 0: accumulator (i8)
             let t = b.push_param(tsz).id(); // param 1: enumerate tuple
             if let ValueId::BlockParam(pid) = t {
-                b.context_mut().values.block_param_mut(pid).type_id = tuple_ty;
+                b.context_mut().block_param_mut(pid).type_id = tuple_ty;
             }
             let elem = b.push_extract(t, 1).id();
             let sum = b.push_add(acc, elem).id();
@@ -612,10 +618,10 @@ mod tests {
         let mut tc = TestContext::new();
         let enum_id = IntrinsicId::from_name("enumerate").unwrap();
 
-        let i8 = tc.ctx.types.get_or_make_int(1);
-        let arr_ty = tc.ctx.types.get_or_make_array(i8, 3);
-        let enum_result_ty = enum_id.desc().result_type(&tc.ctx.types, &[arr_ty]);
-        let (tuple_ty, _) = tc.ctx.types.array_of(enum_result_ty).unwrap();
+        let i8 = tc.ctx.shared.types.get_or_make_int(1);
+        let arr_ty = tc.ctx.shared.types.get_or_make_array(i8, 3);
+        let enum_result_ty = enum_id.desc().result_type(&tc.ctx.shared.types, &[arr_ty]);
+        let (tuple_ty, _) = tc.ctx.shared.types.array_of(enum_result_ty).unwrap();
         let body = build_sum_body(&mut tc, tuple_ty);
 
         let host = Function::make(&mut tc.ctx, "host".into()).unwrap().id;

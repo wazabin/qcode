@@ -309,8 +309,12 @@ impl<'str, 'ctx, Ctx: HostMut<'str>> Builder<'str, 'ctx, Ctx> {
             return;
         }
         let cur_type = self.block.host_mut().instruction_mut(id).type_id;
-        let size = self.context().types.size_of(cur_type);
-        let type_id = self.context().types.get_or_make_space_address(size, space);
+        let size = self.context().shared.types.size_of(cur_type);
+        let type_id = self
+            .context()
+            .shared
+            .types
+            .get_or_make_space_address(size, space);
         self.block.host_mut().instruction_mut(id).type_id = type_id;
     }
 
@@ -335,7 +339,7 @@ impl<'str, 'ctx, Ctx: HostMut<'str>> Builder<'str, 'ctx, Ctx> {
     /// Panics if the block is already terminated (ends with a branch/call/return).
     #[track_caller]
     fn push_instruction(&mut self, mnemonic: Mnemonic, size: usize) -> InstructionRef<'str, '_> {
-        let type_id = self.context().types.get_or_make_int(size);
+        let type_id = self.context().shared.types.get_or_make_int(size);
         self.push_instruction_with_type(mnemonic, type_id)
     }
 
@@ -361,7 +365,7 @@ impl<'str, 'ctx, Ctx: HostMut<'str>> Builder<'str, 'ctx, Ctx> {
         size: usize,
         _space: Option<SpaceId>,
     ) -> InstructionRef<'str, '_> {
-        let type_id = self.context().types.get_or_make_int(size);
+        let type_id = self.context().shared.types.get_or_make_int(size);
         self.push_instruction_with_type(mnemonic, type_id)
     }
 
@@ -454,8 +458,8 @@ impl<'str, 'ctx, Ctx: HostMut<'str>> Builder<'str, 'ctx, Ctx> {
         let ValueId::Literal(lit_id) = id else {
             return id;
         };
-        let literal = self.context().values.literals[lit_id].clone();
-        let current_size = self.context().types.size_of(literal.type_id);
+        let literal = self.context().shared.values.literals[lit_id].clone();
+        let current_size = self.context().shared.types.size_of(literal.type_id);
         if current_size == size || literal.symbolic.is_some() {
             return id;
         }
@@ -510,7 +514,7 @@ impl<'str, 'ctx, Ctx: HostMut<'str>> Builder<'str, 'ctx, Ctx> {
         Varnode::from_id_mut(self.context_mut(), id)
             .rename(unique_name.clone())
             .expect("This name was deduplicated");
-        self.context_mut().spaces[space].name = Some(unique_name.as_ref().into());
+        self.context_mut().shared.spaces[space].name = Some(unique_name.as_ref().into());
         id
     }
 
@@ -645,7 +649,7 @@ impl<'str, 'ctx, Ctx: HostMut<'str>> Builder<'str, 'ctx, Ctx> {
     pub fn push_bool_not(&mut self, src: ValueId) -> InstructionRef<'str, '_> {
         debug_assert!(
             self.stored_type_of(src)
-                .is_some_and(|t| self.context().types.is_bool(t)),
+                .is_some_and(|t| self.context().shared.types.is_bool(t)),
             "push_bool_not: operand must be bool-typed"
         );
         let f = self.context().get_bool_const(false).id();
@@ -702,14 +706,17 @@ impl<'str, 'ctx, Ctx: HostMut<'str>> Builder<'str, 'ctx, Ctx> {
         let result_type = {
             let lhs_type = self.type_of(lhs);
             let rhs_type = self.type_of(rhs);
-            self.context().types.binop_result(lhs_type, op, rhs_type)
+            self.context()
+                .shared
+                .types
+                .binop_result(lhs_type, op, rhs_type)
         };
 
         // Comparisons always override the result size to 1.
         let result_type = if let Some(forced_size) = size {
-            let current_size = self.context().types.size_of(result_type);
+            let current_size = self.context().shared.types.size_of(result_type);
             if forced_size != current_size {
-                self.context().types.get_or_make_int(forced_size)
+                self.context().shared.types.get_or_make_int(forced_size)
             } else {
                 result_type
             }
@@ -722,7 +729,7 @@ impl<'str, 'ctx, Ctx: HostMut<'str>> Builder<'str, 'ctx, Ctx> {
         // from a stack-base operand), `Add`/`Sub` inherit the space of whichever
         // operand carries one — so `&A + k` points into `A`'s space. Register
         // spaces are excluded (pointer arithmetic is not allowed there).
-        let result_type = if self.context().types.space_of(result_type).is_none()
+        let result_type = if self.context().shared.types.space_of(result_type).is_none()
             && matches!(op, Binop::Int(IntBinop::Add | IntBinop::Sub))
         {
             match self.merge_space_ids(lhs, rhs) {
@@ -732,8 +739,11 @@ impl<'str, 'ctx, Ctx: HostMut<'str>> Builder<'str, 'ctx, Ctx> {
                         SpaceType::Register
                     ) =>
                 {
-                    let size = self.context().types.size_of(result_type);
-                    self.context().types.get_or_make_space_address(size, space)
+                    let size = self.context().shared.types.size_of(result_type);
+                    self.context()
+                        .shared
+                        .types
+                        .get_or_make_space_address(size, space)
                 }
                 _ => result_type,
             }
@@ -871,7 +881,7 @@ impl<'str, 'ctx, Ctx: HostMut<'str>> Builder<'str, 'ctx, Ctx> {
     fn both_bool(&self, lhs: ValueId, rhs: ValueId) -> bool {
         let is_bool = |v: ValueId| {
             self.stored_type_of(v)
-                .is_some_and(|t| self.context().types.is_bool(t))
+                .is_some_and(|t| self.context().shared.types.is_bool(t))
         };
         is_bool(lhs) && is_bool(rhs)
     }
@@ -972,6 +982,7 @@ impl<'str, 'ctx, Ctx: HostMut<'str>> Builder<'str, 'ctx, Ctx> {
             .collect();
         let ty = self
             .context()
+            .shared
             .types
             .get_or_make_named_aggregate(aggregate_fields);
         let values = fields.into_iter().map(|(_, value)| value).collect();
@@ -984,6 +995,7 @@ impl<'str, 'ctx, Ctx: HostMut<'str>> Builder<'str, 'ctx, Ctx> {
         let agg_ty = self.type_of(agg);
         let ty = self
             .context()
+            .shared
             .types
             .field_type(agg_ty, index)
             .expect("push_extract: agg is not an aggregate with that field index");
@@ -1011,12 +1023,14 @@ impl<'str, 'ctx, Ctx: HostMut<'str>> Builder<'str, 'ctx, Ctx> {
         let src_ty = self.type_of(src);
         // `map` preserves the source's sequence kind: an array maps to an array,
         // a list (e.g. `take_while`'s result) maps to a list of the same bound.
-        let seq = self.context().types.seq_of(src_ty);
+        let seq = self.context().shared.types.seq_of(src_ty);
         let ret_ty = self.map_body_return_type(body);
         let ty = match (seq, ret_ty) {
-            (Some((_, len, is_list)), Some(rt)) => {
-                self.context().types.get_or_make_seq(rt, len, is_list)
-            }
+            (Some((_, len, is_list)), Some(rt)) => self
+                .context()
+                .shared
+                .types
+                .get_or_make_seq(rt, len, is_list),
             _ => src_ty,
         };
         self.push_instruction_with_type(
@@ -1050,12 +1064,14 @@ impl<'str, 'ctx, Ctx: HostMut<'str>> Builder<'str, 'ctx, Ctx> {
         let src_ty = self.type_of(src);
         // Like `map`, a scan preserves the source's sequence kind and takes its
         // element type from the body's return type (the accumulator type).
-        let seq = self.context().types.seq_of(src_ty);
+        let seq = self.context().shared.types.seq_of(src_ty);
         let ret_ty = self.map_body_return_type(body);
         let ty = match (seq, ret_ty) {
-            (Some((_, len, is_list)), Some(rt)) => {
-                self.context().types.get_or_make_seq(rt, len, is_list)
-            }
+            (Some((_, len, is_list)), Some(rt)) => self
+                .context()
+                .shared
+                .types
+                .get_or_make_seq(rt, len, is_list),
             _ => src_ty,
         };
         self.push_instruction_with_type(
@@ -1080,7 +1096,7 @@ impl<'str, 'ctx, Ctx: HostMut<'str>> Builder<'str, 'ctx, Ctx> {
         let ty = self.lambda_return_type(target).unwrap_or_else(|| {
             args.first()
                 .map(|&arg| self.type_of(arg))
-                .unwrap_or_else(|| self.context().types.get_or_make_int(0))
+                .unwrap_or_else(|| self.context().shared.types.get_or_make_int(0))
         });
         self.push_instruction_with_type(Mnemonic::Apply(Apply { target, args }), ty)
     }
@@ -1115,7 +1131,7 @@ impl<'str, 'ctx, Ctx: HostMut<'str>> Builder<'str, 'ctx, Ctx> {
     /// (same width as `base`) to that field's type. Panics otherwise.
     pub fn push_gep(&mut self, base: ValueId, offset: usize) -> InstructionRef<'str, '_> {
         let base_ty = self.type_of(base);
-        let types = &self.context().types;
+        let types = &self.context().shared.types;
         let ptr_width = types.size_of(base_ty);
         let pointee = types
             .pointee_of(base_ty)
@@ -1126,6 +1142,7 @@ impl<'str, 'ctx, Ctx: HostMut<'str>> Builder<'str, 'ctx, Ctx> {
             .expect("push_gep: no field at that offset in the pointee struct");
         let ty = self
             .context()
+            .shared
             .types
             .get_or_make_struct_pointer(ptr_width, field_ty);
         self.push_instruction_with_type(Mnemonic::Gep(Gep { base, offset }), ty)
@@ -1136,7 +1153,7 @@ impl<'str, 'ctx, Ctx: HostMut<'str>> Builder<'str, 'ctx, Ctx> {
     /// `base` is not a struct pointer or has no field of that name.
     pub fn push_gep_field(&mut self, base: ValueId, name: &str) -> InstructionRef<'str, '_> {
         let base_ty = self.type_of(base);
-        let types = &self.context().types;
+        let types = &self.context().shared.types;
         let pointee = types
             .pointee_of(base_ty)
             .expect("push_gep_field: base is not a struct pointer");
@@ -1235,7 +1252,7 @@ impl<'str, 'ctx, Ctx: HostMut<'str>> Builder<'str, 'ctx, Ctx> {
             .iter()
             .map(|&arg| self.type_of(arg))
             .collect::<Vec<_>>();
-        let type_id = desc.result_type(&self.context().types, &arg_types);
+        let type_id = desc.result_type(&self.context().shared.types, &arg_types);
 
         self.push_instruction_with_type(Mnemonic::Intrinsic(IntrinsicApp { id, args }), type_id)
     }
@@ -1722,7 +1739,7 @@ mod tests {
         use crate::value::{Function, insn::Return};
 
         let mut ctx = Context::new();
-        let i8 = ctx.types.get_or_make_int(1);
+        let i8 = ctx.shared.types.get_or_make_int(1);
 
         // body: fn(i8) -> i8 returning its param (so the map result elem is i8).
         let body = Function::make(&mut ctx, "body".into()).unwrap().id;
@@ -1744,9 +1761,9 @@ mod tests {
         // host: a value typed `List<i8>` (bound 4) to map over.
         let host = Function::make(&mut ctx, "host".into()).unwrap().id;
         let hentry = Function::from_id_mut(&mut ctx, host).make_root().id;
-        let list_ty = ctx.types.get_or_make_list(i8, 4);
+        let list_ty = ctx.shared.types.get_or_make_list(i8, 4);
         let src_pid = BasicBlock::from_id_mut(&mut ctx, hentry).push_param(4).id;
-        ctx.values.block_param_mut(src_pid).type_id = list_ty;
+        ctx.block_param_mut(src_pid).type_id = list_ty;
         let src = ValueId::BlockParam(src_pid);
 
         let map_ty = {
@@ -1755,12 +1772,12 @@ mod tests {
         };
 
         assert_eq!(
-            ctx.types.array_of(map_ty),
+            ctx.shared.types.array_of(map_ty),
             None,
             "map of a list is not an array"
         );
         assert_eq!(
-            ctx.types.list_of(map_ty),
+            ctx.shared.types.list_of(map_ty),
             Some((i8, Some(4))),
             "map of List<i8> (bound 4) is List<i8> (bound 4)"
         );

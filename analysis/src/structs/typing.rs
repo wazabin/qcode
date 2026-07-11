@@ -237,7 +237,7 @@ fn rename_struct_values_generic<'str, H: HostMut<'str>>(host: &mut H, fun_id: Fu
 /// pointee's name when `ty` is a struct pointer, or the struct's own name when
 /// `ty` is a struct value. `None` for non-struct types.
 fn struct_base_name(host: HostRef, ty: TypeId) -> Option<String> {
-    let types = &host.shared().types;
+    let types = &host.shared().shared.types;
     let struct_ty = types.pointee_of(ty).unwrap_or(ty);
     types.struct_name_of(struct_ty).map(str::to_lowercase)
 }
@@ -277,7 +277,7 @@ fn unique_name<'str>(
 fn function_has_struct_types(host: HostRef, fun_id: FunctionId) -> bool {
     let is_struct_ish = |v: ValueId| {
         stored_type_of(host, v).is_some_and(|t| {
-            let types = &host.shared().types;
+            let types = &host.shared().shared.types;
             types.pointee_of(t).is_some() || types.struct_name_of(t).is_some()
         })
     };
@@ -353,7 +353,7 @@ fn try_type_register_read<'a, 'str>(
         return false;
     };
     let (is_ptr, reg_size) = {
-        let types = &cx.shared_ctx().types;
+        let types = &cx.shared_ctx().shared.types;
         (types.pointee_of(reg_ty).is_some(), types.size_of(reg_ty))
     };
     if !is_ptr || reg_size != size {
@@ -377,7 +377,7 @@ fn try_type_register_read_generic<'str, H: HostMut<'str>>(
         return false;
     };
     let (is_ptr, reg_size) = {
-        let types = &host.shared().types;
+        let types = &host.shared().shared.types;
         (types.pointee_of(reg_ty).is_some(), types.size_of(reg_ty))
     };
     if !is_ptr || reg_size != size {
@@ -403,19 +403,25 @@ fn try_add_to_gep<'a, 'str>(
         let Some(base_ty) = stored_type_of(body.read_host(cx), base) else {
             continue;
         };
-        let Some(pointee) = cx.shared_ctx().types.pointee_of(base_ty) else {
+        let Some(pointee) = cx.shared_ctx().shared.types.pointee_of(base_ty) else {
             continue;
         };
         let Some(offset) = const_offset(body.read_host(cx), off_op) else {
             continue;
         };
-        let field_ty = match cx.shared_ctx().types.field_by_offset(pointee, offset) {
+        let field_ty = match cx
+            .shared_ctx()
+            .shared
+            .types
+            .field_by_offset(pointee, offset)
+        {
             Some((_, field)) => field.type_id,
             None => continue,
         };
-        let width = cx.shared_ctx().types.size_of(base_ty);
+        let width = cx.shared_ctx().shared.types.size_of(base_ty);
         let result_ty = cx
             .shared_ctx()
+            .shared
             .types
             .get_or_make_struct_pointer(width, field_ty);
         body.replace_instruction_mnemonic(cx, id, Mnemonic::Gep(Gep { base, offset }));
@@ -436,19 +442,20 @@ fn try_add_to_gep_generic<'str, H: HostMut<'str>>(
         let Some(base_ty) = stored_type_of(host.read_host(), base) else {
             continue;
         };
-        let Some(pointee) = host.shared().types.pointee_of(base_ty) else {
+        let Some(pointee) = host.shared().shared.types.pointee_of(base_ty) else {
             continue;
         };
         let Some(offset) = const_offset(host.read_host(), off_op) else {
             continue;
         };
-        let field_ty = match host.shared().types.field_by_offset(pointee, offset) {
+        let field_ty = match host.shared().shared.types.field_by_offset(pointee, offset) {
             Some((_, field)) => field.type_id,
             None => continue,
         };
-        let width = host.shared().types.size_of(base_ty);
+        let width = host.shared().shared.types.size_of(base_ty);
         let result_ty = host
             .shared()
+            .shared
             .types
             .get_or_make_struct_pointer(width, field_ty);
         host.replace_instruction_mnemonic(id, Mnemonic::Gep(Gep { base, offset }));
@@ -470,10 +477,10 @@ fn try_type_load<'a, 'str>(
     let Some(ptr_ty) = stored_type_of(body.read_host(cx), ptr) else {
         return false;
     };
-    let Some(field_ty) = cx.shared_ctx().types.pointee_of(ptr_ty) else {
+    let Some(field_ty) = cx.shared_ctx().shared.types.pointee_of(ptr_ty) else {
         return false;
     };
-    if cx.shared_ctx().types.size_of(field_ty) != size {
+    if cx.shared_ctx().shared.types.size_of(field_ty) != size {
         return false;
     }
     if stored_type_of(body.read_host(cx), ValueId::Instruction(id)) == Some(field_ty) {
@@ -493,10 +500,10 @@ fn try_type_load_generic<'str, H: HostMut<'str>>(
     let Some(ptr_ty) = stored_type_of(host.read_host(), ptr) else {
         return false;
     };
-    let Some(field_ty) = host.shared().types.pointee_of(ptr_ty) else {
+    let Some(field_ty) = host.shared().shared.types.pointee_of(ptr_ty) else {
         return false;
     };
-    if host.shared().types.size_of(field_ty) != size {
+    if host.shared().shared.types.size_of(field_ty) != size {
         return false;
     }
     if stored_type_of(host.read_host(), ValueId::Instruction(id)) == Some(field_ty) {
@@ -512,7 +519,7 @@ fn const_offset(host: HostRef, op: ValueId) -> Option<usize> {
     let ValueId::Literal(lid) = op else {
         return None;
     };
-    let lit = &host.shared().values.literals[lid];
+    let lit = &host.shared().shared.values.literals[lid];
     if lit.symbolic.is_some() {
         return None;
     }
@@ -592,7 +599,7 @@ mod tests {
             .expect("%inner exists");
         let inner_ty = ctx.stored_type_of(ValueId::Instruction(inner_id)).unwrap();
         assert!(
-            ctx.types.pointee_of(inner_ty).is_some(),
+            ctx.shared.types.pointee_of(inner_ty).is_some(),
             "%inner should be a struct pointer"
         );
     }

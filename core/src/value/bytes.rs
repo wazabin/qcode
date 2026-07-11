@@ -52,7 +52,7 @@ where
     Self: WithCtx<'s, 'ctx, 'str>,
 {
     fn inner(&'s self) -> &'ctx Bytes {
-        &self.ctx().values.bytes[self.id]
+        &self.ctx().shared.values.bytes[self.id]
     }
 
     /// The raw bytes in target memory order.
@@ -234,7 +234,7 @@ pub fn render_bytes_literal(data: &[u8], mode: BytesDisplay) -> String {
 
 impl std::fmt::Display for BytesRef<'_, '_> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let data = &self.ctx.values.bytes[self.id].data;
+        let data = &self.ctx.shared.values.bytes[self.id].data;
         let mode = self.ctx.bytes_display(self.id);
         if mode != BytesDisplay::Auto {
             return f.write_str(&render_bytes_literal(data, mode));
@@ -256,6 +256,6 @@ impl<'str, 'ctx> Value<'str, 'ctx> for BytesRef<'str, 'ctx> {
     }
 
     fn size(&self) -> usize {
-        self.ctx.values.bytes[self.id].data.len()
+        self.ctx.shared.values.bytes[self.id].data.len()
     }
 }

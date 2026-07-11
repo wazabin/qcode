@@ -56,7 +56,7 @@ pub fn discover_libc_main(ctx: &mut Context, env: &PipelineEnv) -> bool {
     // Keyed by address, this is independent of whether we (below) or the symbol
     // table materialize `main`, and it is idempotent across analyze rounds.
     if let Some(entry_id) = Function::from_addr(ctx, entry).map(|function| function.id) {
-        changed |= ctx.values.add_synthetic_callee(entry_id, main);
+        changed |= ctx.shared.values.add_synthetic_callee(entry_id, main);
     }
 
     // Materialize and name `main` only if nothing lives there yet: a function may
@@ -197,7 +197,7 @@ mod tests {
         // The synthetic edge is keyed by `main`'s address.
         assert!(
             tc.ctx
-                .values
+                .shared.values
                 .synthetic_callees_of(entry_id)
                 .any(|addr| addr == 0x2000)
         );

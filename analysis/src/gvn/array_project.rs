@@ -118,10 +118,10 @@ impl ArrayProject {
         // `map` over `enumerate(arr)` consumes `(index, elem)` tuples but produces
         // bare elements.
         let out_ty = ctx.type_of(ValueId::Instruction(map_id));
-        let Some((out_elem, _)) = ctx.types.array_of(out_ty) else {
+        let Some((out_elem, _)) = ctx.shared.types.array_of(out_ty) else {
             return Claim::Pass;
         };
-        let osz = ctx.types.size_of(out_elem);
+        let osz = ctx.shared.types.size_of(out_elem);
         if osz == 0 || size != osz || !start.is_multiple_of(osz) {
             return Claim::Pass;
         }
@@ -130,10 +130,10 @@ impl ArrayProject {
         // `src[k]` — the element fed to the body — is sliced at the *input*
         // element width `isz`.
         let in_ty = ctx.type_of(map.src);
-        let Some((in_elem, _)) = ctx.types.array_of(in_ty) else {
+        let Some((in_elem, _)) = ctx.shared.types.array_of(in_ty) else {
             return Claim::Pass;
         };
-        let isz = ctx.types.size_of(in_elem);
+        let isz = ctx.shared.types.size_of(in_elem);
         if isz == 0 {
             return Claim::Pass;
         }
@@ -181,15 +181,15 @@ impl ArrayProject {
         // The enumerate result type `[(index: i64, elem: T); N]` gives the tuple
         // width `tsz`; the operand array `[T; N]` gives the element width `esz`.
         let enum_ty = ctx.type_of(enum_val);
-        let Some((tuple_ty, _count)) = ctx.types.array_of(enum_ty) else {
+        let Some((tuple_ty, _count)) = ctx.shared.types.array_of(enum_ty) else {
             return Claim::Pass;
         };
-        let tsz = ctx.types.size_of(tuple_ty);
+        let tsz = ctx.shared.types.size_of(tuple_ty);
         let src_ty = ctx.type_of(src);
-        let Some((elem_ty, _)) = ctx.types.array_of(src_ty) else {
+        let Some((elem_ty, _)) = ctx.shared.types.array_of(src_ty) else {
             return Claim::Pass;
         };
-        let esz = ctx.types.size_of(elem_ty);
+        let esz = ctx.shared.types.size_of(elem_ty);
 
         // Lane alignment: exactly one tuple wide, starting on a lane boundary.
         if tsz == 0 || size != tsz || !start.is_multiple_of(tsz) {
@@ -199,10 +199,11 @@ impl ArrayProject {
 
         // `index = k`, an i64 (the field width fixed by `enumerate`).
         let index_ty = ctx
+            .shared
             .types
             .field_type(tuple_ty, 0)
             .expect("enumerate tuple has an index field");
-        let index = ctx.get_const(k, ctx.types.size_of(index_ty)).id();
+        let index = ctx.get_const(k, ctx.shared.types.size_of(index_ty)).id();
 
         // `elem = src[k]`, a one-element byte slice of the operand array.
         let element = {
@@ -255,10 +256,10 @@ impl ArrayProject {
             return Claim::Pass;
         };
         let lhs_ty = ctx.type_of(*lhs);
-        let Some((lhs_elem, lhs_len, _)) = ctx.types.seq_of(lhs_ty) else {
+        let Some((lhs_elem, lhs_len, _)) = ctx.shared.types.seq_of(lhs_ty) else {
             return Claim::Pass;
         };
-        let lhs_bytes = ctx.types.size_of(lhs_elem) * lhs_len;
+        let lhs_bytes = ctx.shared.types.size_of(lhs_elem) * lhs_len;
 
         let (src, rel_start) = if start + size <= lhs_bytes {
             (*lhs, start)
@@ -371,8 +372,8 @@ mod tests {
             f.set_root(entry).unwrap();
             f.add_block(entry);
         }
-        let i8 = tc.ctx.types.get_or_make_int(1);
-        let arr_ty = tc.ctx.types.get_or_make_array(i8, 4);
+        let i8 = tc.ctx.shared.types.get_or_make_int(1);
+        let arr_ty = tc.ctx.shared.types.get_or_make_array(i8, 4);
 
         // src param, typed as the array *before* the map captures its type.
         let src = {
@@ -380,7 +381,7 @@ mod tests {
             b.push_param(4).id()
         };
         if let ValueId::BlockParam(pid) = src {
-            tc.ctx.values.block_param_mut(pid).type_id = arr_ty;
+            tc.ctx.block_param_mut(pid).type_id = arr_ty;
         }
         let reg_space = tc.reg_space;
         let r0 = tc.r0;
@@ -431,7 +432,7 @@ mod tests {
                 return None;
             }
             match src {
-                ValueId::Literal(lid) => Some(tc.ctx.values.literals[*lid].value),
+                ValueId::Literal(lid) => Some(tc.ctx.shared.values.literals[*lid].value),
                 _ => None,
             }
         })
@@ -455,8 +456,8 @@ mod tests {
             f.set_root(entry).unwrap();
             f.add_block(entry);
         }
-        let i8 = tc.ctx.types.get_or_make_int(1);
-        let arr_ty = tc.ctx.types.get_or_make_array(i8, 4);
+        let i8 = tc.ctx.shared.types.get_or_make_int(1);
+        let arr_ty = tc.ctx.shared.types.get_or_make_array(i8, 4);
 
         // src param, typed as the array `[i8; 4]`.
         let src = {
@@ -464,7 +465,7 @@ mod tests {
             b.push_param(4).id()
         };
         if let ValueId::BlockParam(pid) = src {
-            tc.ctx.values.block_param_mut(pid).type_id = arr_ty;
+            tc.ctx.block_param_mut(pid).type_id = arr_ty;
         }
 
         // enumerate(src): `[(index: i64, elem: i8); 4]`, tuple width 9.
@@ -473,8 +474,8 @@ mod tests {
             b.push_intrinsic(enum_id, vec![src]).id()
         };
         let en_ty = tc.ctx.type_of(en);
-        let (tuple_ty, _) = tc.ctx.types.array_of(en_ty).unwrap();
-        let tsz = tc.ctx.types.size_of(tuple_ty);
+        let (tuple_ty, _) = tc.ctx.shared.types.array_of(en_ty).unwrap();
+        let tsz = tc.ctx.shared.types.size_of(tuple_ty);
 
         // The k=2 lane: a tuple-typed byte slice `enumerate(src)[2]`.
         let lane = {
@@ -542,19 +543,19 @@ mod tests {
             f.set_root(entry).unwrap();
             f.add_block(entry);
         }
-        let i8 = tc.ctx.types.get_or_make_int(1);
-        let a_ty = tc.ctx.types.get_or_make_array(i8, 3);
-        let b_ty = tc.ctx.types.get_or_make_array(i8, 5);
+        let i8 = tc.ctx.shared.types.get_or_make_int(1);
+        let a_ty = tc.ctx.shared.types.get_or_make_array(i8, 3);
+        let b_ty = tc.ctx.shared.types.get_or_make_array(i8, 5);
 
         let (a, b_src) = {
             let mut builder = Builder::from_block(BasicBlock::from_id_mut(&mut tc.ctx, entry));
             (builder.push_param(3).id(), builder.push_param(5).id())
         };
         if let ValueId::BlockParam(pid) = a {
-            tc.ctx.values.block_param_mut(pid).type_id = a_ty;
+            tc.ctx.block_param_mut(pid).type_id = a_ty;
         }
         if let ValueId::BlockParam(pid) = b_src {
-            tc.ctx.values.block_param_mut(pid).type_id = b_ty;
+            tc.ctx.block_param_mut(pid).type_id = b_ty;
         }
 
         let reg_space = tc.reg_space;
@@ -595,13 +596,13 @@ mod tests {
             f.set_root(entry).unwrap();
             f.add_block(entry);
         }
-        let tsz = tc.ctx.types.size_of(tuple_ty);
+        let tsz = tc.ctx.shared.types.size_of(tuple_ty);
         let t = {
             let mut b = Builder::from_block(BasicBlock::from_id_mut(&mut tc.ctx, entry));
             b.push_param(tsz).id()
         };
         if let ValueId::BlockParam(pid) = t {
-            tc.ctx.values.block_param_mut(pid).type_id = tuple_ty;
+            tc.ctx.block_param_mut(pid).type_id = tuple_ty;
         }
         let (elem, ptr, ret) = {
             let mut b = Builder::from_block(BasicBlock::from_id_mut(&mut tc.ctx, entry));
@@ -643,13 +644,13 @@ mod tests {
             f.set_root(entry).unwrap();
             f.add_block(entry);
         }
-        let i8 = tc.ctx.types.get_or_make_int(1);
-        let arr_ty = tc.ctx.types.get_or_make_array(i8, 4);
+        let i8 = tc.ctx.shared.types.get_or_make_int(1);
+        let arr_ty = tc.ctx.shared.types.get_or_make_array(i8, 4);
 
         // The enumerate tuple type `(index: i64, elem: i8)`, via enumerate's own
         // result-type rule, so the body's param matches the lane the map yields.
-        let enum_result_ty = enum_id.desc().result_type(&tc.ctx.types, &[arr_ty]);
-        let (tuple_ty, _) = tc.ctx.types.array_of(enum_result_ty).unwrap();
+        let enum_result_ty = enum_id.desc().result_type(&tc.ctx.shared.types, &[arr_ty]);
+        let (tuple_ty, _) = tc.ctx.shared.types.array_of(enum_result_ty).unwrap();
         let body = build_unpack_elem_body(&mut tc, tuple_ty);
 
         // src param `[i8; 4]`.
@@ -658,7 +659,7 @@ mod tests {
             b.push_param(4).id()
         };
         if let ValueId::BlockParam(pid) = src {
-            tc.ctx.values.block_param_mut(pid).type_id = arr_ty;
+            tc.ctx.block_param_mut(pid).type_id = arr_ty;
         }
 
         // map(unpack, enumerate(src)). The body returns `i8`, so `push_map` types

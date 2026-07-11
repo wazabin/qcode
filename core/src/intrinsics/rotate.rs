@@ -107,7 +107,7 @@ fn recognize_rol(host: HostRef, root: crate::value::InstructionId) -> Option<Vec
         let amount = match c1_amount {
             Some(existing) => existing,
             None => {
-                let amt_size = host.shared().types.size_of(host.type_of(c2));
+                let amt_size = host.shared().shared.types.size_of(host.type_of(c2));
                 host.shared().get_const(c1v, amt_size).id()
             }
         };
@@ -183,7 +183,7 @@ fn simplify_rotate(
         if r != c {
             // Rebuild the same rotate on the reduced amount. The amount keeps
             // the operand's width.
-            let k_size = host.shared().types.size_of(host.type_of(k));
+            let k_size = host.shared().shared.types.size_of(host.type_of(k));
             let reduced = host.shared().get_const(r, k_size).id();
             let rotate = IntrinsicApp {
                 id,

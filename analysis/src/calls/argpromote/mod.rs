@@ -175,7 +175,7 @@ pub(crate) fn add_input(
 ) -> Option<ValueId> {
     let param = append_entry_param(ctx, fid, size, name, origin, caller_value)?;
     if let (ValueId::BlockParam(pid), Some(ty)) = (param, type_id) {
-        ctx.values.block_param_mut(pid).type_id = ty;
+        ctx.block_param_mut(pid).type_id = ty;
     }
     let root = Function::from_id(ctx, fid).root().map(|b| b.id)?;
     let mut b = Builder::from_block(BasicBlock::from_id_mut(ctx, root));
@@ -327,6 +327,7 @@ fn surviving_writeset_fields(ctx: &mut Context, ret_id: InstructionId) -> Vec<(S
         .enumerate()
         .map(|(i, &v)| {
             let name = ctx
+                .shared
                 .types
                 .field_name(ty, i)
                 .map(str::to_owned)

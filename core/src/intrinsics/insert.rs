@@ -58,15 +58,15 @@ impl Intrinsic for Insert {
             return None;
         };
         let ctx = host.shared();
-        let arr_ty = ctx.values.bytes[bid].type_id;
-        let (elem, count) = ctx.types.array_of(arr_ty)?;
-        let esz = ctx.types.size_of(elem);
-        let i = ctx.values.literals[ilit].value as usize;
+        let arr_ty = ctx.shared.values.bytes[bid].type_id;
+        let (elem, count) = ctx.shared.types.array_of(arr_ty)?;
+        let esz = ctx.shared.types.size_of(elem);
+        let i = ctx.shared.values.literals[ilit].value as usize;
         if i >= count {
             return None;
         }
-        let v = ctx.values.literals[vlit].value;
-        let mut data = ctx.values.bytes[bid].data.clone();
+        let v = ctx.shared.values.literals[vlit].value;
+        let mut data = ctx.shared.values.bytes[bid].data.clone();
         let off = i * esz;
         let v_bytes = v.to_le_bytes();
         data[off..off + esz].copy_from_slice(&v_bytes[..esz]);
@@ -102,11 +102,11 @@ mod tests {
     #[test]
     fn insert_into_const_bytes_folds() {
         let mut ctx = Context::new();
-        let i32 = ctx.types.get_or_make_int(4);
-        let arr_ty = ctx.types.get_or_make_array(i32, 3);
+        let i32 = ctx.shared.types.get_or_make_int(4);
+        let arr_ty = ctx.shared.types.get_or_make_array(i32, 3);
         let bid = ctx.get_bytes(vec![0; 12]).id();
         if let ValueId::Bytes(b) = bid {
-            ctx.values.bytes[b].type_id = arr_ty;
+            ctx.shared.values.bytes[b].type_id = arr_ty;
         }
         let i = ctx.get_const(1, 8).id();
         let v = ctx.get_const(0xaa, 4).id();
@@ -116,6 +116,6 @@ mod tests {
         else {
             panic!("insert into const Bytes should fold");
         };
-        assert_eq!(&ctx.values.bytes[nb].data[4..8], &[0xaa, 0, 0, 0]);
+        assert_eq!(&ctx.shared.values.bytes[nb].data[4..8], &[0xaa, 0, 0, 0]);
     }
 }

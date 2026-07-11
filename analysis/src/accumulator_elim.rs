@@ -291,7 +291,11 @@ fn transform<'str>(
         // counterpart so cloned `cond`/`stepD` expressions read g's params.
         let mut driver_subst: HashMap<ValueId, ValueId> = HashMap::default();
         for &i in &p.d_slots {
-            let ty = minted.shared().types.get_or_make_int(p.head_sizes[i]);
+            let ty = minted
+                .shared()
+                .shared
+                .types
+                .get_or_make_int(p.head_sizes[i]);
             let pid = push_param(&mut minted, g_head, ty);
             driver_subst.insert(ValueId::BlockParam(p.head_params[i]), pid);
         }
@@ -421,6 +425,7 @@ fn transform<'str>(
     for (pos, &i) in p.a_slots.iter().enumerate() {
         let field_ty = m
             .shared_ctx()
+            .shared
             .types
             .field_type(tuple_ty, pos)
             .expect("accumulator tuple field");
@@ -622,14 +627,14 @@ fn block_terminator(host: HostRef, block: BlockId) -> Option<qcode::value::insn:
 }
 
 fn is_const_literal(host: HostRef, val: ValueId) -> bool {
-    matches!(val, ValueId::Literal(id) if host.shared().values.literals[id].symbolic.is_none())
+    matches!(val, ValueId::Literal(id) if host.shared().shared.values.literals[id].symbolic.is_none())
 }
 
 /// Reinterprets a constant literal at `size` bytes, so a base-case accumulator
 /// matches its slot width; non-literals pass through unchanged.
 fn const_at_size(shared: &Context, val: ValueId, size: usize) -> ValueId {
     if let ValueId::Literal(id) = val {
-        let lit = shared.values.literals[id].clone();
+        let lit = shared.shared.values.literals[id].clone();
         if lit.symbolic.is_none() {
             return shared.get_const(lit.value, size).id();
         }

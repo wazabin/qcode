@@ -475,7 +475,7 @@ fn width_of<'str, H: HostMut<'str>>(host: &H, v: ValueId) -> usize {
             .stored_type_of(other)
             .expect("value has a stored type"),
     };
-    host.shared().types.size_of(ty)
+    host.shared().shared.types.size_of(ty)
 }
 
 /// Push an `index_plus(index, delta)` value into `block` before `before`, through
@@ -543,8 +543,12 @@ fn apply<'str>(body: &mut FunctionBody<'str>, cx: ContextView<'_, 'str>, m: &Pro
 /// TODO(5b-ii): For backwards compatibility; prefer concrete version for new code.
 fn apply_generic<'str, H: HostMut<'str>>(host: &mut H, m: &PromoteMatch) -> bool {
     let esz = m.elem_size;
-    let elem_ty = host.shared().types.get_or_make_int(esz);
-    let arr_ty = host.shared().types.get_or_make_array(elem_ty, m.count);
+    let elem_ty = host.shared().shared.types.get_or_make_int(esz);
+    let arr_ty = host
+        .shared()
+        .shared
+        .types
+        .get_or_make_array(elem_ty, m.count);
     let arr_sz = m.count * esz;
 
     let insert_id = IntrinsicId::from_name("insert").expect("insert registered");
@@ -1373,7 +1377,7 @@ mod tests {
             .expect("body block");
         let arr_params = BasicBlock::from_id(&ctx, body)
             .params()
-            .filter(|p| ctx.types.array_of(p.type_id()).is_some())
+            .filter(|p| ctx.shared.types.array_of(p.type_id()).is_some())
             .count();
         assert_eq!(
             arr_params, 1,

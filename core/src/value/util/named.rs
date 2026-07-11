@@ -53,7 +53,7 @@ mod tests {
     #[test]
     fn test_update_name() {
         let mut ctx = Context::new();
-        let space_id = ctx.default_space;
+        let space_id = ctx.shared.default_space;
         let mut var = Varnode::make(&mut ctx, 0, 1, space_id);
 
         assert_eq!(var.ctx().get_named("var"), None);
@@ -67,7 +67,7 @@ mod tests {
     #[test]
     fn test_update_to_same_name() {
         let mut ctx = Context::new();
-        let space_id = ctx.default_space;
+        let space_id = ctx.shared.default_space;
         let mut var = Varnode::make(&mut ctx, 0, 1, space_id);
 
         assert_eq!(var.ctx().get_named("var"), None);
@@ -86,7 +86,7 @@ mod tests {
     #[test]
     fn test_update_name_conflict() {
         let mut ctx = Context::new();
-        let space_id = ctx.default_space;
+        let space_id = ctx.shared.default_space;
         let mut var1 = Varnode::make(&mut ctx, 0, 1, space_id);
         var1.rename("var".into()).unwrap();
 

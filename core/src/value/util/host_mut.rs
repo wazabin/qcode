@@ -33,8 +33,8 @@ use crate::{
 use super::base_ref::HostRef;
 
 /// A single function checked out of `shared` for exclusive mutation. `fun`'s slot
-/// in `shared.values.functions[id]` currently holds an empty body (its interface
-/// stays in `shared.values.interfaces[id]`); its real arenas are owned here.
+/// in `shared.bodies[id]` currently holds an empty body (its interface
+/// stays in `shared.interfaces[id]`); its real arenas are owned here.
 ///
 /// Out of scope (and asserted against on construction): a function with
 /// *reattributed* blocks — a roster block stored in, or parented to, a different
@@ -180,7 +180,7 @@ pub trait HostMut<'str> {
 
     /// Push a fresh instruction into `func`'s arena, recording each operand's use
     /// in that function's reverse-use map and (for a direct call) the call-site
-    /// cache. Mirrors [`crate::value::registry::ValueRegistry::push_insn`].
+    /// cache. Mirrors [`crate::context::Context::push_insn`].
     fn push_insn(&mut self, func: FunctionId, insn: Instruction<'str>) -> InstructionId {
         let args: Vec<ValueId> = insn.mnemonic().args().into_iter().collect();
         let call_target = insn.mnemonic().call_target();
@@ -200,7 +200,7 @@ pub trait HostMut<'str> {
     }
 
     /// Push a fresh block into `func`'s arena and onto its ownership roster.
-    /// Mirrors [`crate::value::registry::ValueRegistry::push_block`].
+    /// Mirrors [`crate::context::Context::push_block`].
     fn push_block(&mut self, func: FunctionId, block: BasicBlock<'str>) -> BlockId {
         let local = self.function_mut(func).blocks.push(block);
         let id = BlockId::new(func, local);
@@ -229,7 +229,7 @@ pub trait HostMut<'str> {
         mnemonic: Mnemonic,
         size: usize,
     ) -> InstructionId {
-        let type_id = self.shared().types.get_or_make_int(size);
+        let type_id = self.shared().shared.types.get_or_make_int(size);
         let insn = Instruction::new(type_id, mnemonic);
         self.push_insn(func, insn)
     }
@@ -310,7 +310,7 @@ pub trait HostMut<'str> {
     /// Removes an instruction from its block, unlinks its outgoing CFG edges if it
     /// was a terminator, clears its (function-local) name, tombstones it, and
     /// prunes it from its operands' use-lists. Mirrors [`Context::remove_instruction`]
-    /// composed with [`crate::value::registry::ValueRegistry::remove_instructions`],
+    /// composed with [`crate::context::Context::remove_instructions`],
     /// minus the global `call_sites` write on the checked-out path (see
     /// [`forget_call_site`](HostMut::forget_call_site)).
     fn remove_instruction(&mut self, id: InstructionId) {
@@ -581,10 +581,10 @@ impl<'str> HostMut<'str> for &mut Context<'str> {
         self
     }
     fn function_mut(&mut self, f: FunctionId) -> &mut Function<'str> {
-        &mut self.values.functions[f]
+        &mut self.bodies[f]
     }
     fn function(&self, f: FunctionId) -> &Function<'str> {
-        &self.values.functions[f]
+        &self.bodies[f]
     }
     fn shared(&self) -> &Context<'str> {
         self
@@ -596,10 +596,15 @@ impl<'str> HostMut<'str> for &mut Context<'str> {
         HostRef::Module(self)
     }
     fn record_call_site(&mut self, target: FunctionId, site: InstructionId) {
-        self.values.call_sites.entry(target).or_default().push(site);
+        self.shared
+            .values
+            .call_sites
+            .entry(target)
+            .or_default()
+            .push(site);
     }
     fn forget_call_site(&mut self, target: FunctionId, site: InstructionId) {
-        if let Some(sites) = self.values.call_sites.get_mut(&target) {
+        if let Some(sites) = self.shared.values.call_sites.get_mut(&target) {
             sites.retain(|s| *s != site);
         }
     }

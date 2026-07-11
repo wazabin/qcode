@@ -520,7 +520,7 @@ mod tests {
 
     fn literal_value(ctx: &Context, v: ValueId) -> Option<u64> {
         match v {
-            ValueId::Literal(lid) => Some(ctx.values.literals[lid].value),
+            ValueId::Literal(lid) => Some(ctx.shared.values.literals[lid].value),
             _ => None,
         }
     }

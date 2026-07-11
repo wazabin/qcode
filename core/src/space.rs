@@ -69,7 +69,7 @@ impl Space {
 
     /// Builds a space from an id
     pub fn from_id<'ctx, 'str>(ctx: &'ctx Context<'str>, id: SpaceId) -> SpaceRef<'ctx> {
-        SpaceRef::new(id, &ctx.spaces[id])
+        SpaceRef::new(id, &ctx.shared.spaces[id])
     }
 }
 

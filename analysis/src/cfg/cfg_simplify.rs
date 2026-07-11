@@ -1020,7 +1020,7 @@ mod tests {
         assert_eq!(blocks, [a], "branch-with-args chain should merge");
         assert!(BasicBlock::from_id(&ctx, b).parent().is_none());
 
-        let Mnemonic::Binop(Binary { lhs, .. }) = ctx.values.instruction(sum).mnemonic() else {
+        let Mnemonic::Binop(Binary { lhs, .. }) = ctx.instruction(sum).mnemonic() else {
             panic!("expected merged sum to be a binop");
         };
         assert_eq!(*lhs, ValueId::BlockParam(input));
@@ -1079,7 +1079,7 @@ mod tests {
         simplify_cfg(&mut &mut ctx, f);
 
         assert!(
-            ctx.values.block(b).instructions.is_empty(),
+            ctx.block(b).instructions.is_empty(),
             "absorbed block `b` must not retain its instructions after merge"
         );
     }
@@ -1111,7 +1111,7 @@ mod tests {
 
         let mut seen = rustc_hash::FxHashSet::default();
         for block_id in ctx.block_ids() {
-            for &insn in &ctx.values.block(block_id).instructions {
+            for &insn in &ctx.block(block_id).instructions {
                 assert!(
                     seen.insert(insn),
                     "instruction {insn:?} appears in more than one block after simplify_cfg"

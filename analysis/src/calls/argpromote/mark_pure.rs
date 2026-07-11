@@ -150,7 +150,7 @@ mod tests {
         let space = if to_shadow {
             tc.ctx.make_temp_space()
         } else {
-            tc.ctx.default_space
+            tc.ctx.shared.default_space
         };
         let mut b = Builder::from_block(BasicBlock::from_id_mut(&mut tc.ctx, root));
         let v = b.context_mut().get_const(0x1234, 4).id();

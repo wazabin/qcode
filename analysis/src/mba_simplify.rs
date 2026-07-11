@@ -614,7 +614,7 @@ fn is_mba_insn(host: HostRef, iid: InstructionId) -> bool {
 /// The constant value of `v`, if it is a plain (non-symbolic) integer literal.
 fn numeric_const(host: HostRef, v: ValueId) -> Option<u64> {
     if let ValueId::Literal(id) = v {
-        let lit = &host.shared().values.literals[id];
+        let lit = &host.shared().shared.values.literals[id];
         if lit.symbolic.is_none() {
             return Some(lit.value);
         }

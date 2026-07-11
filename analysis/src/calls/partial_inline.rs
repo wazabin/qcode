@@ -562,15 +562,15 @@ mod tests {
         let _ = g;
 
         // Type the input param as `[i8;8]` so the map's result is the array.
-        let i8 = tc.ctx.types.get_or_make_int(1);
-        let arr_ty = tc.ctx.types.get_or_make_array(i8, 8);
+        let i8 = tc.ctx.shared.types.get_or_make_int(1);
+        let arr_ty = tc.ctx.shared.types.get_or_make_array(i8, 8);
         let r0 = BasicBlock::from_id(&tc.ctx, f_entry)
             .params()
             .next()
             .unwrap()
             .id();
         if let ValueId::BlockParam(pid) = r0 {
-            tc.ctx.values.block_param_mut(pid).type_id = arr_ty;
+            tc.ctx.block_param_mut(pid).type_id = arr_ty;
         }
 
         // Build `%m = foobar <$> @r0; %agg = (%m,)` at the head of f_entry;

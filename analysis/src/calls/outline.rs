@@ -151,6 +151,7 @@ pub(crate) fn outline_tupled<'str>(
             let Some(input) = input else { continue };
             let fty = own
                 .shared()
+                .shared
                 .types
                 .field_type(tuple_ty, field)
                 .expect("enumerate tuple field");
@@ -252,7 +253,7 @@ pub(crate) fn outline_scan_body<'str>(
             // Data mode returned above.
             ScanElem::Data(_) => unreachable!("data mode handled above"),
         };
-        let types = &own.shared().types;
+        let types = &own.shared().shared.types;
         // Narrow `i64` index → loop index width.
         let isz = types.size_of(index_ty);
         if isz < types.size_of(fty) {
@@ -305,8 +306,12 @@ pub(crate) fn outline_scan_body<'str>(
 /// fallback and mis-type the node.
 pub(crate) fn seq_result_type(host: HostRef, src: ValueId, body_ret: TypeId) -> TypeId {
     let src_ty = host.type_of(src);
-    match host.shared().types.seq_of(src_ty) {
-        Some((_, len, is_list)) => host.shared().types.get_or_make_seq(body_ret, len, is_list),
+    match host.shared().shared.types.seq_of(src_ty) {
+        Some((_, len, is_list)) => host
+            .shared()
+            .shared
+            .types
+            .get_or_make_seq(body_ret, len, is_list),
         None => src_ty,
     }
 }
@@ -386,7 +391,7 @@ fn outline_core<'str>(
             .collect()
     };
     let dummy_ptr = m.shared_ctx().get_const(0, 8).id();
-    let ret_ty = m.shared_ctx().types.get_or_make_int(1);
+    let ret_ty = m.shared_ctx().shared.types.get_or_make_int(1);
 
     let (own, mut minted) = body.host_with_minted(m, fid);
     // Root block, set as the minted function's entry, named for display (block
@@ -559,7 +564,7 @@ mod tests {
             f.set_root(entry).unwrap();
             f.add_block(entry);
         }
-        let ram = tc.ctx.default_space;
+        let ram = tc.ctx.shared.default_space;
         let (idx, result) = {
             let mut b = Builder::from_block(BasicBlock::from_id_mut(&mut tc.ctx, entry));
             let idx = b.push_param(8).id();
@@ -600,11 +605,11 @@ mod tests {
         };
 
         // The enumerate tuple `(index: i64, elem: i8)`, via enumerate's own rule.
-        let i8 = tc.ctx.types.get_or_make_int(1);
-        let arr_ty = tc.ctx.types.get_or_make_array(i8, 1);
+        let i8 = tc.ctx.shared.types.get_or_make_int(1);
+        let arr_ty = tc.ctx.shared.types.get_or_make_array(i8, 1);
         let enum_id = IntrinsicId::from_name("enumerate").unwrap();
-        let enum_ty = enum_id.desc().result_type(&tc.ctx.types, &[arr_ty]);
-        let (tuple_ty, _) = tc.ctx.types.array_of(enum_ty).unwrap();
+        let enum_ty = enum_id.desc().result_type(&tc.ctx.shared.types, &[arr_ty]);
+        let (tuple_ty, _) = tc.ctx.shared.types.array_of(enum_ty).unwrap();
 
         let body = crate::test_util::with_minting(&mut tc.ctx, host, |m, body| {
             outline_tupled(m, body, "body", result, idx, Some(elem), tuple_ty)
@@ -618,7 +623,7 @@ mod tests {
             .params()
             .map(|p| p.size())
             .collect();
-        assert_eq!(params, vec![tc.ctx.types.size_of(tuple_ty)]);
+        assert_eq!(params, vec![tc.ctx.shared.types.size_of(tuple_ty)]);
 
         // The body unpacks the tuple (two extracts) and recomputes zext + add.
         let root = Function::from_id(&tc.ctx, body).root().unwrap().id;

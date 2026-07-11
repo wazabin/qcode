@@ -103,7 +103,7 @@ fn affine_step(ctx: &Context, v: ValueId, iv: ValueId) -> Option<u64> {
 
 /// The argument bound to position `k` of `header` by `pred`'s terminator.
 fn incoming_from(ctx: &Context, pred: BlockId, header: BlockId, k: usize) -> Option<ValueId> {
-    let &term = ctx.values.block(pred).instructions.last()?;
+    let &term = ctx.block(pred).instructions.last()?;
     match ctx.get_insn(term).mnemonic() {
         Mnemonic::Branch(b) if b.target == header => b.args.get(k).copied(),
         Mnemonic::CBranch(c) => {
@@ -172,7 +172,7 @@ fn find_pipelined(
             let ValueId::BlockParam(iv_pid) = ptr else {
                 continue;
             };
-            if ctx.values.block_param(iv_pid).parent != Some(header) {
+            if ctx.block_param(iv_pid).parent != Some(header) {
                 continue;
             }
             let Some(j) = params.iter().position(|&p| p == iv_pid) else {
@@ -238,11 +238,11 @@ fn find_pipelined(
 /// forward the carry's uses to it, drop the param, and record the disjointness
 /// assumption that justifies the re-read.
 fn apply(ctx: &mut Context, fid: FunctionId, p: &Pipelined) {
-    let first = *ctx.values.block(p.header).instructions.first().unwrap();
+    let first = *ctx.block(p.header).instructions.first().unwrap();
 
     // iv − step  (same width as the induction variable).
     let iv_ty = ctx.type_of(p.iv);
-    let width = ctx.types.size_of(iv_ty);
+    let width = ctx.shared.types.size_of(iv_ty);
     let step_lit = ctx.get_const(p.step, width).id();
     let sub = InstructionRef::from_mnemonic_with_type(
         ctx,
@@ -258,7 +258,7 @@ fn apply(ctx: &mut Context, fid: FunctionId, p: &Pipelined) {
     BasicBlock::from_id_mut(ctx, p.header).insert_insn_before(first, sub);
 
     // load(space, iv − step, size) — the previous iteration's byte, re-derived.
-    let load_ty = ctx.types.get_or_make_int(p.size);
+    let load_ty = ctx.shared.types.get_or_make_int(p.size);
     let prev = InstructionRef::from_mnemonic_with_type(
         ctx,
         p.header.func,
@@ -322,7 +322,7 @@ mod tests {
 
     /// Build the canonical pipelined strcpy loop and return `(fid, header)`.
     fn build_pipelined(tc: &mut TestContext) -> (FunctionId, BlockId) {
-        let ram = tc.ctx.default_space;
+        let ram = tc.ctx.shared.default_space;
         let fid = Function::make(&mut tc.ctx, "strcpy".into()).unwrap().id;
         let entry = {
             let __f = tc.ctx.anon_function();
@@ -440,7 +440,7 @@ mod tests {
     #[test]
     fn leaves_inconsistent_prologue_seed_alone() {
         let mut tc = TestContext::new();
-        let ram = tc.ctx.default_space;
+        let ram = tc.ctx.shared.default_space;
         let fid = Function::make(&mut tc.ctx, "notstrcpy".into()).unwrap().id;
         let entry = {
             let __f = tc.ctx.anon_function();
@@ -518,7 +518,7 @@ mod tests {
     #[test]
     fn leaves_non_pipelined_loop_alone() {
         let mut tc = TestContext::new();
-        let ram = tc.ctx.default_space;
+        let ram = tc.ctx.shared.default_space;
         let fid = Function::make(&mut tc.ctx, "sum".into()).unwrap().id;
         let entry = {
             let __f = tc.ctx.anon_function();

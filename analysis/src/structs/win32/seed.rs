@@ -52,18 +52,23 @@ pub fn register_teb_structs(ctx: &mut Context) -> HashMap<String, TypeId> {
             .iter()
             .map(|f| {
                 let type_id = match &f.kind {
-                    HFieldKind::Int { size } => ctx.types.get_or_make_int(*size),
+                    HFieldKind::Int { size } => ctx.shared.types.get_or_make_int(*size),
                     HFieldKind::StructPtr { pointee, width } => {
                         let pointee_ty = *by_name.get(pointee).unwrap_or_else(|| {
                             panic!("pointee struct {pointee} not yet registered")
                         });
-                        ctx.types.get_or_make_struct_pointer(*width, pointee_ty)
+                        ctx.shared
+                            .types
+                            .get_or_make_struct_pointer(*width, pointee_ty)
                     }
                 };
                 AggregateField::new_at(f.name.clone(), type_id, f.offset)
             })
             .collect();
-        let id = ctx.types.get_or_make_struct(s.name.clone(), s.size, fields);
+        let id = ctx
+            .shared
+            .types
+            .get_or_make_struct(s.name.clone(), s.size, fields);
         by_name.insert(s.name, id);
     }
     by_name
@@ -83,6 +88,7 @@ pub fn seed_teb_register(ctx: &mut Context, fs_offset: VarnodeId, bitness: u8) -
         return false;
     };
     let teb_ptr = ctx
+        .shared
         .types
         .get_or_make_struct_pointer(ptr_width(bitness), teb);
     ctx.set_varnode_type(fs_offset, teb_ptr);
@@ -93,7 +99,8 @@ pub fn seed_teb_register(ctx: &mut Context, fs_offset: VarnodeId, bitness: u8) -
 /// The varnode backing the named register (e.g. `"FS_OFFSET"`), if the context
 /// has it. Register varnodes carry their sleigh name.
 fn register_varnode(ctx: &Context, name: &str) -> Option<VarnodeId> {
-    ctx.registers
+    ctx.shared
+        .registers
         .values()
         .copied()
         .find(|&vid| Varnode::from_id(ctx, vid).name() == Some(name))
@@ -129,7 +136,7 @@ impl Pass for WindowsTebSeed {
         // The override is global; if it's already a pointer, nothing to do.
         if ctx
             .stored_type_of(ValueId::Varnode(fs))
-            .and_then(|t| ctx.types.pointee_of(t))
+            .and_then(|t| ctx.shared.types.pointee_of(t))
             .is_some()
         {
             return Ok(false);
@@ -158,22 +165,28 @@ mod tests {
         let structs = register_teb_structs(&mut ctx);
 
         let peb = structs["PEB"];
-        let (_, being_debugged) = ctx.types.field_by_offset(peb, 0x02).expect("BeingDebugged");
+        let (_, being_debugged) = ctx
+            .shared
+            .types
+            .field_by_offset(peb, 0x02)
+            .expect("BeingDebugged");
         assert_eq!(being_debugged.name, "BeingDebugged");
-        assert!(ctx.types.field_by_offset(peb, 0x18).is_some()); // ProcessHeap
-        assert!(ctx.types.field_by_offset(peb, 0x68).is_some()); // NtGlobalFlag
+        assert!(ctx.shared.types.field_by_offset(peb, 0x18).is_some()); // ProcessHeap
+        assert!(ctx.shared.types.field_by_offset(peb, 0x68).is_some()); // NtGlobalFlag
 
         // TEB.ProcessEnvironmentBlock @0x30 is a pointer to PEB.
         let teb = structs["TEB"];
         let (_, peb_field) = ctx
+            .shared
             .types
             .field_by_offset(teb, 0x30)
             .expect("PEB pointer @0x30");
         let pointee = ctx
+            .shared
             .types
             .pointee_of(peb_field.type_id)
             .expect("is a pointer");
-        assert_eq!(ctx.types.struct_name_of(pointee), Some("PEB"));
+        assert_eq!(ctx.shared.types.struct_name_of(pointee), Some("PEB"));
     }
 
     /// End-to-end: a typed `FS_OFFSET` register feeds struct typing. The lifted
@@ -196,7 +209,7 @@ mod tests {
         assert!(seed_teb_register(&mut ctx, fs, 32));
         // The register now reads as a TEB pointer everywhere.
         let ty = ctx.type_of(ValueId::Varnode(fs));
-        assert!(ctx.types.pointee_of(ty).is_some());
+        assert!(ctx.shared.types.pointee_of(ty).is_some());
 
         run_function_pass::<StructTyping>(&mut ctx, f).unwrap();
 
@@ -253,12 +266,12 @@ mod tests {
             "
         );
         // Register an `FS_OFFSET` register varnode (as the lifter would).
-        let space = ctx.default_space;
+        let space = ctx.shared.default_space;
         let fs = Varnode::make(&mut ctx, 0x110, 4, space).id;
         Varnode::from_id_mut(&mut ctx, fs)
             .rename(Cow::Borrowed("FS_OFFSET"))
             .unwrap();
-        ctx.registers.insert(RegisterId::from(0usize), fs);
+        ctx.shared.registers.insert(RegisterId::from(0usize), fs);
 
         // Wrong platform: no-op, register stays untyped.
         assert!(
@@ -267,7 +280,7 @@ mod tests {
                 .unwrap()
         );
         let t = ctx.type_of(ValueId::Varnode(fs));
-        assert!(ctx.types.pointee_of(t).is_none());
+        assert!(ctx.shared.types.pointee_of(t).is_none());
 
         // Windows x86: types the register and is idempotent on a second run.
         assert!(
@@ -276,7 +289,7 @@ mod tests {
                 .unwrap()
         );
         let t = ctx.type_of(ValueId::Varnode(fs));
-        assert!(ctx.types.pointee_of(t).is_some());
+        assert!(ctx.shared.types.pointee_of(t).is_some());
         assert!(
             !WindowsTebSeed
                 .run(&mut ctx, &env_for(TargetOs::Windows, 32))

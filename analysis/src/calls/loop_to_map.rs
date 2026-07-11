@@ -214,8 +214,10 @@ fn apply<'str>(m: ContextView<'_, 'str>, body: &mut FunctionBody<'str>, mm: &Map
         // body unpacks the `(index, elem)` tuple); resolve it while only reading.
         let tuple_ty = if uses_index {
             let arr_ty = host.type_of(mm.init_arr);
-            let enum_ty = enum_id.desc().result_type(&host.shared().types, &[arr_ty]);
-            match host.shared().types.array_of(enum_ty) {
+            let enum_ty = enum_id
+                .desc()
+                .result_type(&host.shared().shared.types, &[arr_ty]);
+            match host.shared().shared.types.array_of(enum_ty) {
                 Some((tuple_ty, _)) => Some(tuple_ty),
                 None => return false,
             }
@@ -868,16 +870,16 @@ mod tests {
             .into_iter()
             .find(|&id| {
                 let ty = ctx.type_of(ValueId::Instruction(id));
-                ctx.types.array_of(ty).is_some()
+                ctx.shared.types.array_of(ty).is_some()
             })
             .expect("array-typed preheader init load");
         let arr_ty = ctx.type_of(ValueId::Instruction(load_id));
-        let arr_sz = ctx.types.size_of(arr_ty);
+        let arr_sz = ctx.shared.types.size_of(arr_ty);
         let entry = Function::from_id(&ctx, xorbuf).root().unwrap().id;
         let pid = BasicBlock::from_id_mut(&mut ctx, entry)
             .push_param(arr_sz)
             .id;
-        ctx.values.block_param_mut(pid).type_id = arr_ty;
+        ctx.block_param_mut(pid).type_id = arr_ty;
         ctx.replace_all_uses_with(ValueId::Instruction(load_id), ValueId::BlockParam(pid));
 
         Function::from_id_mut(&mut ctx, xorbuf).set_is_pure(true);
