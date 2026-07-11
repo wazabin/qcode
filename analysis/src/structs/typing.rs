@@ -25,10 +25,7 @@ use qcode::{
     value::{
         FunctionId, ValueId,
         insn::{Binary, Binop, Gep, InstructionId, IntBinop, Mnemonic},
-        util::{
-            base_ref::{BaseRef, HostRef},
-            host_mut::HostMut,
-        },
+        util::base_ref::{BaseRef, HostRef},
     },
 };
 
@@ -103,48 +100,6 @@ pub fn struct_typing<'a, 'str>(
     changed_any
 }
 
-/// Generic wrapper for backwards compatibility; see concrete [`struct_typing`].
-pub fn struct_typing_generic<'str, H: HostMut<'str>>(host: &mut H, fun_id: FunctionId) -> bool {
-    // Nothing this pass does can fire unless some value or operand reachable in
-    // the function already carries a struct / struct-pointer type: add→gep,
-    // register-read, and load typing all key on a struct-pointer-typed operand,
-    // and renaming keys on a struct-typed value. On a function with no complex
-    // types (the common case) the whole fixpoint + rename sweep is a guaranteed
-    // no-op, so bail before allocating or scanning it twice. Per-function so it
-    // stays correct once non-Windows struct recovery lands.
-    if !function_has_struct_types(host.read_host(), fun_id) {
-        return false;
-    }
-
-    let insn_ids: Vec<InstructionId> = host
-        .function_ref(fun_id)
-        .blocks()
-        .flat_map(|b| b.instruction_ids().to_vec())
-        .collect();
-
-    let mut changed_any = false;
-    loop {
-        let mut changed = false;
-        for &id in &insn_ids {
-            if type_instruction_generic(host, id) {
-                changed = true;
-                changed_any = true;
-            }
-        }
-        if !changed {
-            break;
-        }
-    }
-
-    // Once the types have settled, rename every struct-typed SSA value and
-    // argument after the struct it (points to): a value of type `PEB*`
-    // becomes `%peb`. This runs over the whole function so it also picks up
-    // arguments typed by an upstream seed.
-    changed_any |= rename_struct_values_generic(host, fun_id);
-
-    changed_any
-}
-
 /// The stored [`TypeId`] of `id`, host-routed: a checked-out function's
 /// instruction/param types live in its owned arena, other kinds in shared data.
 fn stored_type_of<'str>(host: HostRef<'_, 'str>, id: ValueId) -> Option<TypeId> {
@@ -189,42 +144,6 @@ fn rename_struct_values<'a, 'str>(
                 ValueId::BlockParam(id) => {
                     BaseRef::new(body.host(cx), id).rename_local(name).is_ok()
                 }
-                _ => false,
-            };
-            changed |= renamed;
-        }
-    }
-    changed
-}
-
-/// Generic wrapper for backwards compatibility; see concrete [`rename_struct_values`].
-fn rename_struct_values_generic<'str, H: HostMut<'str>>(host: &mut H, fun_id: FunctionId) -> bool {
-    let values: Vec<ValueId> = host
-        .function_ref(fun_id)
-        .blocks()
-        .flat_map(|b| {
-            b.params()
-                .map(|p| p.id())
-                .chain(b.instruction_ids().iter().map(|&i| ValueId::Instruction(i)))
-                .collect::<Vec<_>>()
-        })
-        .collect();
-
-    let mut changed = false;
-    for value in values {
-        let Some(base) = stored_type_of(host.read_host(), value)
-            .and_then(|t| struct_base_name(host.read_host(), t))
-        else {
-            continue;
-        };
-        if let Some(name) = unique_name(host.read_host(), fun_id, value, &base) {
-            let renamed = match value {
-                ValueId::Instruction(id) => BaseRef::new(host.reborrow_host(), id)
-                    .rename_local(name)
-                    .is_ok(),
-                ValueId::BlockParam(id) => BaseRef::new(host.reborrow_host(), id)
-                    .rename_local(name)
-                    .is_ok(),
                 _ => false,
             };
             changed |= renamed;
@@ -314,25 +233,6 @@ fn type_instruction<'a, 'str>(
     }
 }
 
-/// Generic wrapper for backwards compatibility; see concrete [`type_instruction`].
-fn type_instruction_generic<'str, H: HostMut<'str>>(host: &mut H, id: InstructionId) -> bool {
-    match host.insn_ref(id).mnemonic().clone() {
-        Mnemonic::Binop(Binary {
-            op: Binop::Int(IntBinop::Add),
-            lhs,
-            rhs,
-        }) => try_add_to_gep_generic(host, id, lhs, rhs),
-        // A register read (`load` from the register space) yields the register's
-        // own value type — which the TEB seed overrode to `PtrTo<TEB>`. A normal
-        // RAM load dereferences a field pointer.
-        Mnemonic::Load(load) if is_register_space(host.read_host(), load.space) => {
-            try_type_register_read_generic(host, id, load.ptr, load.size)
-        }
-        Mnemonic::Load(load) => try_type_load_generic(host, id, load.ptr, load.size),
-        _ => false,
-    }
-}
-
 /// Whether `space` is the processor register file.
 fn is_register_space(host: HostRef, space: SpaceId) -> bool {
     matches!(Space::from_id(host.shared(), space).ty, SpaceType::Register)
@@ -363,30 +263,6 @@ fn try_type_register_read<'a, 'str>(
         return false;
     }
     BaseRef::new(body.host(cx), id).set_result_type(reg_ty);
-    true
-}
-
-/// Generic wrapper for backwards compatibility; see concrete [`try_type_register_read`].
-fn try_type_register_read_generic<'str, H: HostMut<'str>>(
-    host: &mut H,
-    id: InstructionId,
-    reg: ValueId,
-    size: usize,
-) -> bool {
-    let Some(reg_ty) = stored_type_of(host.read_host(), reg) else {
-        return false;
-    };
-    let (is_ptr, reg_size) = {
-        let types = &host.shared().shared.types;
-        (types.pointee_of(reg_ty).is_some(), types.size_of(reg_ty))
-    };
-    if !is_ptr || reg_size != size {
-        return false;
-    }
-    if stored_type_of(host.read_host(), ValueId::Instruction(id)) == Some(reg_ty) {
-        return false;
-    }
-    BaseRef::new(host.reborrow_host(), id).set_result_type(reg_ty);
     true
 }
 
@@ -431,40 +307,6 @@ fn try_add_to_gep<'a, 'str>(
     false
 }
 
-/// Generic wrapper for backwards compatibility; see concrete [`try_add_to_gep`].
-fn try_add_to_gep_generic<'str, H: HostMut<'str>>(
-    host: &mut H,
-    id: InstructionId,
-    lhs: ValueId,
-    rhs: ValueId,
-) -> bool {
-    for (base, off_op) in [(lhs, rhs), (rhs, lhs)] {
-        let Some(base_ty) = stored_type_of(host.read_host(), base) else {
-            continue;
-        };
-        let Some(pointee) = host.shared().shared.types.pointee_of(base_ty) else {
-            continue;
-        };
-        let Some(offset) = const_offset(host.read_host(), off_op) else {
-            continue;
-        };
-        let field_ty = match host.shared().shared.types.field_by_offset(pointee, offset) {
-            Some((_, field)) => field.type_id,
-            None => continue,
-        };
-        let width = host.shared().shared.types.size_of(base_ty);
-        let result_ty = host
-            .shared()
-            .shared
-            .types
-            .get_or_make_struct_pointer(width, field_ty);
-        host.replace_instruction_mnemonic(id, Mnemonic::Gep(Gep { base, offset }));
-        BaseRef::new(host.reborrow_host(), id).set_result_type(result_ty);
-        return true;
-    }
-    false
-}
-
 /// `load(ptr)` with `ptr : PtrTo<F>` and `load.size == size_of(F)` → result
 /// retyped to `F`. Exact-size match only; otherwise left as an integer read.
 fn try_type_load<'a, 'str>(
@@ -487,29 +329,6 @@ fn try_type_load<'a, 'str>(
         return false;
     }
     BaseRef::new(body.host(cx), id).set_result_type(field_ty);
-    true
-}
-
-/// Generic wrapper for backwards compatibility; see concrete [`try_type_load`].
-fn try_type_load_generic<'str, H: HostMut<'str>>(
-    host: &mut H,
-    id: InstructionId,
-    ptr: ValueId,
-    size: usize,
-) -> bool {
-    let Some(ptr_ty) = stored_type_of(host.read_host(), ptr) else {
-        return false;
-    };
-    let Some(field_ty) = host.shared().shared.types.pointee_of(ptr_ty) else {
-        return false;
-    };
-    if host.shared().shared.types.size_of(field_ty) != size {
-        return false;
-    }
-    if stored_type_of(host.read_host(), ValueId::Instruction(id)) == Some(field_ty) {
-        return false;
-    }
-    BaseRef::new(host.reborrow_host(), id).set_result_type(field_ty);
     true
 }
 
