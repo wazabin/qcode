@@ -58,6 +58,61 @@ impl<'str> Effects<'str> {
     }
 }
 
+/// The result of one function-pass run (context-split ruling 3): whether it
+/// changed the IR, an optional self-rename claim, and any functions it minted.
+///
+/// Returned **by value** from [`FunctionPass::run`](super::FunctionPass::run), so
+/// a pass touches no wrapper scratch: `rename` subsumes the old [`Effects`] buffer
+/// and `minted` subsumes the old `FunctionBody.minted` field. The driver replays
+/// `rename` and installs `minted` at the post-run barrier in worklist order,
+/// exactly as it drained the wrapper before — the transport changes, the barrier
+/// semantics do not.
+#[derive(Default)]
+pub struct Outcome<'str> {
+    /// Whether the pass changed the function's IR (the old `Ok(bool)`).
+    pub changed: bool,
+    /// A buffered self-rename claim (from `cpp_demangle` / `name_thunks`), applied
+    /// as a `get_unique_name` claim at the barrier. Last writer wins across a
+    /// function's pass fixpoint, so replay is deterministic.
+    pub rename: Option<Cow<'str, str>>,
+    /// Functions this run minted (the loop outliners), installed by the driver at
+    /// the barrier. Concatenated across a function's pass fixpoint.
+    pub minted: Vec<Minted<'str>>,
+}
+
+impl<'str> Outcome<'str> {
+    /// An unchanged outcome — no rename, no minted functions.
+    pub fn unchanged() -> Self {
+        Self::default()
+    }
+
+    /// An outcome reporting `changed`, with no rename or minted functions (the
+    /// common case for the mechanical `Ok(bool)` → `Ok(Outcome::changed(bool))`
+    /// sweep).
+    pub fn changed(changed: bool) -> Self {
+        Self {
+            changed,
+            ..Self::default()
+        }
+    }
+
+    /// A changed outcome carrying a self-rename claim (the driver uniquifies and
+    /// applies it at the barrier).
+    pub fn renamed(name: Cow<'str, str>) -> Self {
+        Self {
+            changed: true,
+            rename: Some(name),
+            minted: Vec::new(),
+        }
+    }
+}
+
+impl<'str> From<bool> for Outcome<'str> {
+    fn from(changed: bool) -> Self {
+        Self::changed(changed)
+    }
+}
+
 /// The read-only module interface a function pass may consult: architecture /
 /// ABI, the interners (mintable through `&self`), and every *other* function's
 /// published interface (name, address, signature, purity, clobber/write

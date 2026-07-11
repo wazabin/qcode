@@ -92,7 +92,7 @@ pub use pipeline::{
     ArchConfig, CallingConvention, ContextSplit, ContextView, DEFAULT_PIPELINE_TOML, DecompilePass,
     DynDecompilePass,
     DynFunctionPass, DynPass, Effects,
-    FunctionBody, FunctionPass, FunctionPassAdapter, GpReg, LiftOutcome, LiftSummary, Pass,
+    FunctionBody, FunctionPass, FunctionPassAdapter, GpReg, LiftOutcome, LiftSummary, Outcome, Pass,
     PassRegistration, Pipeline, PipelineEnv, PipelineServices, ProgressSink, RegisteredPass,
     YieldSignal,
     analyze_and_lift_with_progress, analyze_default, analyze_with_pipeline, known_pass_names,
