@@ -1,6 +1,6 @@
 use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
 
-use crate::{AliasResult, ContextView, FunctionBody};
+use crate::{AliasResult, ContextView, FunctionBody, Outcome};
 use jstd::graph::analysis::{compute_dominators, compute_postdominators};
 use qcode::{
     context::Context,
@@ -2218,10 +2218,16 @@ impl FunctionPass for DeadLoad {
         &self,
         f: &mut FunctionBody<'_, 'str>,
         m: ContextView<'_, 'str>,
-    ) -> Result<bool, String> {
+    ) -> Result<Outcome<'str>, String> {
         let fid = f.id();
         let aliases = frame_aware_aliases(m, f.read_host(m), fid);
-        Ok(remove_dead_load_insns_host(f, m, fid, Some(&aliases), &[]))
+        Ok(Outcome::changed(remove_dead_load_insns_host(
+            f,
+            m,
+            fid,
+            Some(&aliases),
+            &[],
+        )))
     }
 }
 
@@ -2242,17 +2248,17 @@ impl FunctionPass for DeadStore {
         &self,
         f: &mut FunctionBody<'_, 'str>,
         m: ContextView<'_, 'str>,
-    ) -> Result<bool, String> {
+    ) -> Result<Outcome<'str>, String> {
         let fid = f.id();
         let dead_regs = m.env().cfg.dead_flag_regs.clone();
         let aliases = frame_aware_aliases(m, f.read_host(m), fid);
-        Ok(remove_dead_load_insns_host(
+        Ok(Outcome::changed(remove_dead_load_insns_host(
             f,
             m,
             fid,
             Some(&aliases),
             &dead_regs,
-        ))
+        )))
     }
 }
 

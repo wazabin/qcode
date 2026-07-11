@@ -24,7 +24,7 @@ use super::pass::{
     known_pass_names, make_pass, replay_effects,
 };
 use super::{
-    ContextSplit, ContextView, FunctionBody, PipelineProgress, ProgressSink, YieldSignal,
+    ContextSplit, ContextView, FunctionBody, Outcome, PipelineProgress, ProgressSink, YieldSignal,
 };
 
 /// The canonical default pipeline, compiled into the binary. Used by
@@ -1592,7 +1592,8 @@ async fn run_function_stage(
                             pass,
                         });
                     },
-                )?;
+                )?
+                .changed;
                 let (effects, minted, unused) = body.into_parts();
                 (function_changed, effects, minted, unused)
             };
@@ -1666,10 +1667,15 @@ fn run_one_function<'str>(
     function_name: &str,
     repeat_until: bool,
     mut on_pass: impl FnMut(&'static str),
-) -> Result<bool, String> {
+) -> Result<Outcome<'str>, String> {
     let fun_id = body.id();
     let mut iters = 0;
     let mut function_changed = false;
+    // Aggregate the per-pass outcomes across the fixpoint: `rename` last-writer-wins
+    // (matching the old `Effects` overwrite), `minted` concatenated. `changed` is
+    // tracked as `function_changed` and folded in at return.
+    let mut agg_rename: Option<std::borrow::Cow<'str, str>> = None;
+    let mut agg_minted: Vec<super::Minted<'str>> = Vec::new();
     let mut tracer = FixpointTracer::default();
     let tracer_label = format!("stage {stage_name} fn {function_name}");
     'fixpoint: loop {
@@ -1683,9 +1689,14 @@ fn run_one_function<'str>(
             let _scope = qcode::pass_scope::enter(p.name());
             #[cfg(not(target_arch = "wasm32"))]
             let started = std::time::Instant::now();
-            let pass_changed = p
+            let outcome = p
                 .run_checked(body, cx)
                 .map_err(|e| format!("{}: {e}", p.name()))?;
+            let pass_changed = outcome.changed;
+            if outcome.rename.is_some() {
+                agg_rename = outcome.rename;
+            }
+            agg_minted.extend(outcome.minted);
             if pass_changed {
                 cache.mark_dirty(fun_id);
             } else {
@@ -1730,7 +1741,11 @@ fn run_one_function<'str>(
             return Err(nonconvergence_error(stage_name, Some(function_name)));
         }
     }
-    Ok(function_changed)
+    Ok(Outcome {
+        changed: function_changed,
+        rename: agg_rename,
+        minted: agg_minted,
+    })
 }
 
 /// How many worker threads a stage may use. `QCODE_THREADS` overrides the
@@ -1896,7 +1911,8 @@ fn run_stage_parallel(
                                         pass,
                                     });
                                 },
-                            )?;
+                            )?
+                            .changed;
                             e.changed = changed;
                         }
                         // Drain this thread's `stat!` counters before it exits — the

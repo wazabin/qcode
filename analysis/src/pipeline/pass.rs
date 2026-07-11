@@ -35,7 +35,7 @@ use qcode::{
     value::{Function, FunctionId, RegisterId, Renameable, Varnode, VarnodeId},
 };
 
-use super::{ArchConfig, CallingConvention, ContextSplit, ContextView, FunctionBody};
+use super::{ArchConfig, CallingConvention, ContextSplit, ContextView, FunctionBody, Outcome};
 use crate::structure::Program;
 use crate::RegisterBase;
 
@@ -149,7 +149,7 @@ pub trait DynFunctionPass: Send + Sync {
         &self,
         body: &mut FunctionBody<'_, 'str>,
         cx: ContextView<'_, 'str>,
-    ) -> Result<bool, String>;
+    ) -> Result<Outcome<'str>, String>;
 
     /// Whether this pass may mint functions (see [`FunctionPass::MINTS`]).
     /// The driver reserves per-function id pools only for stages that contain a
@@ -186,7 +186,7 @@ pub trait FunctionPass: Default {
         &self,
         f: &mut FunctionBody<'_, 'str>,
         cx: ContextView<'_, 'str>,
-    ) -> Result<bool, String>;
+    ) -> Result<Outcome<'str>, String>;
 }
 
 /// Adapts a [`FunctionPass`] to the object-safe [`DynFunctionPass`] the registry
@@ -225,7 +225,7 @@ impl<T: FunctionPass + Send + Sync> DynFunctionPass for FunctionPassAdapter<T> {
         &self,
         body: &mut FunctionBody<'_, 'str>,
         cx: ContextView<'_, 'str>,
-    ) -> Result<bool, String> {
+    ) -> Result<Outcome<'str>, String> {
         FunctionPass::run(&self.inner, body, cx)
     }
     fn mints(&self) -> bool {
@@ -255,7 +255,7 @@ impl<T: FunctionPass + Send + Sync> DynFunctionPass for FunctionPassAdapter<T> {
         let (changed, effects, minted) = {
             let (bodies, view) = ctx.split(env);
             let mut body = FunctionBody::new(fun_id, &mut bodies[fun_id], reserved);
-            let changed = self.run_checked(&mut body, view)?;
+            let changed = self.run_checked(&mut body, view)?.changed;
             let (effects, minted, _unused) = body.into_parts();
             (changed, effects, minted)
         };

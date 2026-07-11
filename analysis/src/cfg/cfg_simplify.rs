@@ -4,7 +4,7 @@ use qcode::value::{
     insn::{Branch, Mnemonic},
 };
 
-use crate::{ContextView, FunctionBody, FunctionPass};
+use crate::{ContextView, FunctionBody, FunctionPass, Outcome};
 
 // TODO(5b-ii): Public functions below are thin wrappers marked for future migration
 
@@ -22,9 +22,9 @@ impl FunctionPass for SimplifyCfg {
         &self,
         body: &mut FunctionBody<'_, 'str>,
         cx: ContextView<'_, 'str>,
-    ) -> Result<bool, String> {
+    ) -> Result<Outcome<'str>, String> {
         let fid = body.id();
-        Ok(simplify_cfg_concrete(body, cx, fid))
+        Ok(Outcome::changed(simplify_cfg_concrete(body, cx, fid)))
     }
 }
 

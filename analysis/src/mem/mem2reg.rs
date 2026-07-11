@@ -14,7 +14,7 @@ use std::borrow::Cow;
 
 use crate::AliasResult;
 use crate::gvn::affine::{Numbering, precompute_forms};
-use crate::pipeline::{ContextView, FunctionBody};
+use crate::pipeline::{ContextView, FunctionBody, Outcome};
 use crate::stack::frame::{frame_offset, incoming_sp_param};
 
 /// Returns `true` if any variables were promoted.
@@ -3517,7 +3517,7 @@ impl FunctionPass for Mem2RegPass {
         &self,
         f: &mut FunctionBody<'_, 'str>,
         m: ContextView<'_, 'str>,
-    ) -> Result<bool, String> {
+    ) -> Result<Outcome<'str>, String> {
         let fun_id = f.id();
         let shared = m.shr();
         let env = m.env();
@@ -3545,7 +3545,9 @@ impl FunctionPass for Mem2RegPass {
             (aliases, sp_param)
         };
 
-        Ok(mem2reg_host(f, m, fun_id, &aliases, sp_param))
+        Ok(Outcome::changed(mem2reg_host(
+            f, m, fun_id, &aliases, sp_param,
+        )))
     }
 }
 

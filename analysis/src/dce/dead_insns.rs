@@ -856,7 +856,7 @@ fn remove_dead_counted_loop_host<'a, 'str>(
 
 // ----- pass ------------------------------------------------------------------
 
-use crate::{ContextView, FunctionBody, FunctionPass};
+use crate::{ContextView, FunctionBody, FunctionPass, Outcome};
 
 #[derive(Default)]
 pub struct Dce;
@@ -870,9 +870,9 @@ impl FunctionPass for Dce {
         &self,
         f: &mut FunctionBody<'_, 'str>,
         m: ContextView<'_, 'str>,
-    ) -> Result<bool, String> {
+    ) -> Result<Outcome<'str>, String> {
         let fun_id = f.id();
-        Ok(dce_core(f, m, fun_id))
+        Ok(Outcome::changed(dce_core(f, m, fun_id)))
     }
 }
 

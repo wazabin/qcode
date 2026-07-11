@@ -22,7 +22,7 @@ use qcode::value::{
     util::base_ref::HostRef,
 };
 
-use crate::{ContextView, FunctionBody, FunctionPass};
+use crate::{ContextView, FunctionBody, FunctionPass, Outcome};
 
 #[derive(Default)]
 pub struct NameThunks;
@@ -38,7 +38,7 @@ impl FunctionPass for NameThunks {
         &self,
         f: &mut FunctionBody<'_, 'str>,
         m: ContextView<'_, 'str>,
-    ) -> Result<bool, String> {
+    ) -> Result<Outcome<'str>, String> {
         let fid = f.id();
         // Read-only analysis of the body and the callee's *interface* (its
         // published name, read from the shared context), then buffer the
@@ -65,9 +65,9 @@ impl FunctionPass for NameThunks {
             Some(name) => {
                 // Buffered; the driver uniquifies and applies it at the barrier.
                 f.effects_mut().rename_self(Cow::Owned(name));
-                Ok(true)
+                Ok(Outcome::changed(true))
             }
-            None => Ok(false),
+            None => Ok(Outcome::unchanged()),
         }
     }
 }

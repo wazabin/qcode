@@ -49,7 +49,7 @@ use qcode::value::{
 #[cfg(test)]
 use qcode::context::Context;
 
-use crate::{AliasResult, ContextView, FunctionBody, FunctionPass};
+use crate::{AliasResult, ContextView, FunctionBody, FunctionPass, Outcome};
 
 #[derive(Default)]
 pub struct Licm;
@@ -65,15 +65,15 @@ impl FunctionPass for Licm {
         &self,
         f: &mut FunctionBody<'_, 'str>,
         m: ContextView<'_, 'str>,
-    ) -> Result<bool, String> {
+    ) -> Result<Outcome<'str>, String> {
         let fid = f.id();
         let aliases = build_aliases(m, f.read_host(m), fid);
-        Ok(hoist_loop_invariants_with_aliases(
+        Ok(Outcome::changed(hoist_loop_invariants_with_aliases(
             f,
             m,
             fid,
             aliases.as_ref(),
-        ))
+        )))
     }
 }
 

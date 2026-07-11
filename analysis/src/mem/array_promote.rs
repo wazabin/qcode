@@ -39,7 +39,7 @@ use qcode::{
 };
 
 use crate::gvn::affine::precompute_forms;
-use crate::pipeline::{ContextView, FunctionBody};
+use crate::pipeline::{ContextView, FunctionBody, Outcome};
 use crate::sequence::{affine_base_const, affine_strided_lane};
 
 #[derive(Default)]
@@ -734,11 +734,11 @@ impl FunctionPass for ArrayPromote {
         &self,
         f: &mut FunctionBody<'_, 'str>,
         m: ContextView<'_, 'str>,
-    ) -> Result<bool, String> {
+    ) -> Result<Outcome<'str>, String> {
         let fid = f.id();
         match try_match(f.read_host(m), fid) {
-            Some(matched) => Ok(apply(f, m, &matched)),
-            None => Ok(false),
+            Some(matched) => Ok(Outcome::changed(apply(f, m, &matched))),
+            None => Ok(Outcome::unchanged()),
         }
     }
 }

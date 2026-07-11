@@ -45,7 +45,7 @@ use qcode::{
     },
 };
 
-use crate::pipeline::{ContextView, FunctionBody};
+use crate::pipeline::{ContextView, FunctionBody, Outcome};
 use crate::{FunctionPass, register_function_pass};
 
 #[derive(Default)]
@@ -63,8 +63,8 @@ impl FunctionPass for LoopToRecursion {
         &self,
         f: &mut FunctionBody<'_, 'str>,
         m: ContextView<'_, 'str>,
-    ) -> Result<bool, String> {
-        Ok(loop_to_recursion(m, f))
+    ) -> Result<Outcome<'str>, String> {
+        Ok(Outcome::changed(loop_to_recursion(m, f)))
     }
 }
 

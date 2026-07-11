@@ -50,7 +50,7 @@ use crate::loop_info::{
     cbranch_exit, delete_private_loop, incoming, is_increment, is_loop_private, literal,
     param_parent, param_pos,
 };
-use crate::pipeline::{ContextView, FunctionBody};
+use crate::pipeline::{ContextView, FunctionBody, Outcome};
 use crate::{FunctionPass, register_function_pass};
 
 #[derive(Default)]
@@ -440,11 +440,11 @@ impl FunctionPass for LoopToScan {
         &self,
         f: &mut FunctionBody<'_, 'str>,
         m: ContextView<'_, 'str>,
-    ) -> Result<bool, String> {
+    ) -> Result<Outcome<'str>, String> {
         if let Some(sm) = try_match(f.read_host(m), f.id()) {
-            return Ok(apply(m, f, &sm));
+            return Ok(Outcome::changed(apply(m, f, &sm)));
         }
-        Ok(false)
+        Ok(Outcome::unchanged())
     }
 }
 

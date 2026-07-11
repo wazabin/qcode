@@ -30,7 +30,7 @@ use qcode::{
 };
 
 use crate::loop_info::{delete_private_loop, incoming, is_increment, literal, users_of};
-use crate::pipeline::{ContextView, FunctionBody};
+use crate::pipeline::{ContextView, FunctionBody, Outcome};
 use crate::{FunctionPass, register_function_pass};
 
 fn is_temp(host: HostRef, s: SpaceId) -> bool {
@@ -566,12 +566,12 @@ impl FunctionPass for Strlen {
         &self,
         f: &mut FunctionBody<'_, 'str>,
         m: ContextView<'_, 'str>,
-    ) -> Result<bool, String> {
+    ) -> Result<Outcome<'str>, String> {
         // Layer 1 (at-form snapshot) then Layer 2 (raw char*); mutually exclusive
         // on any one function.
         let mut changed = recognize_strlen_at(m, f);
         changed |= recognize_strlen_ptr(m, f);
-        Ok(changed)
+        Ok(Outcome::changed(changed))
     }
 }
 

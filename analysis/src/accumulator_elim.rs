@@ -60,7 +60,7 @@ use qcode::{
 };
 
 use crate::loop_to_recursion::recognize_loop;
-use crate::pipeline::{ContextView, FunctionBody};
+use crate::pipeline::{ContextView, FunctionBody, Outcome};
 use crate::{FunctionPass, register_function_pass};
 
 #[derive(Default)]
@@ -78,8 +78,8 @@ impl FunctionPass for AccumulatorElim {
         &self,
         f: &mut FunctionBody<'_, 'str>,
         m: ContextView<'_, 'str>,
-    ) -> Result<bool, String> {
-        Ok(accumulator_elim(m, f))
+    ) -> Result<Outcome<'str>, String> {
+        Ok(Outcome::changed(accumulator_elim(m, f)))
     }
 }
 

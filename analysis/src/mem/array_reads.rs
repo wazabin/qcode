@@ -33,7 +33,7 @@ use qcode::{
 };
 
 use crate::gvn::affine::precompute_forms;
-use crate::pipeline::{ContextView, FunctionBody};
+use crate::pipeline::{ContextView, FunctionBody, Outcome};
 use crate::sequence::{affine_base_const, affine_strided_lane};
 
 #[derive(Default)]
@@ -301,15 +301,15 @@ impl FunctionPass for ArrayReads {
         &self,
         f: &mut FunctionBody<'_, 'str>,
         m: ContextView<'_, 'str>,
-    ) -> Result<bool, String> {
+    ) -> Result<Outcome<'str>, String> {
         let fid = f.id();
         if !f.function_ref(m, fid).is_pure() {
-            return Ok(false);
+            return Ok(Outcome::unchanged());
         }
-        Ok(match try_match(f.read_host(m), fid) {
+        Ok(Outcome::changed(match try_match(f.read_host(m), fid) {
             Some(matched) => apply(f, m, &matched),
             None => false,
-        })
+        }))
     }
 }
 

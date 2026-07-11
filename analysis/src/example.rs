@@ -1,6 +1,6 @@
 //! Example pass. The smallest [`FunctionPass`]: it reads its own function's
 //! interface and mutates nothing.
-use crate::{ContextView, FunctionBody, FunctionPass};
+use crate::{ContextView, FunctionBody, FunctionPass, Outcome};
 
 #[derive(Default)]
 pub struct ExamplePass;
@@ -16,13 +16,13 @@ impl FunctionPass for ExamplePass {
         &self,
         f: &mut FunctionBody<'_, 'str>,
         _m: ContextView<'_, 'str>,
-    ) -> Result<bool, String> {
+    ) -> Result<Outcome<'str>, String> {
         let _name = _m.interface(f.id()).name.to_string();
 
         // TODO: log!(name)
 
         // This pass did not mutate the IR
-        Ok(false)
+        Ok(Outcome::unchanged())
     }
 }
 

@@ -164,7 +164,7 @@ fn gvn_body<'str>(
 
 // ----- passes ----------------------------------------------------------------
 
-use crate::{ContextView, FunctionBody, FunctionPass};
+use crate::{ContextView, FunctionBody, FunctionPass, Outcome};
 use qcode::value::util::base_ref::HostRef;
 
 #[derive(Default)]
@@ -179,9 +179,9 @@ impl FunctionPass for ConstFold {
         &self,
         f: &mut FunctionBody<'_, 'str>,
         m: ContextView<'_, 'str>,
-    ) -> Result<bool, String> {
+    ) -> Result<Outcome<'str>, String> {
         let fun_id = f.id();
-        Ok(constant_fold_body(f, m, fun_id))
+        Ok(Outcome::changed(constant_fold_body(f, m, fun_id)))
     }
 }
 
@@ -199,9 +199,9 @@ impl FunctionPass for Narrow {
         &self,
         f: &mut FunctionBody<'_, 'str>,
         m: ContextView<'_, 'str>,
-    ) -> Result<bool, String> {
+    ) -> Result<Outcome<'str>, String> {
         let fun_id = f.id();
-        Ok(narrow_body(f, m, fun_id))
+        Ok(Outcome::changed(narrow_body(f, m, fun_id)))
     }
 }
 
@@ -238,7 +238,7 @@ impl FunctionPass for Gvn {
         &self,
         f: &mut FunctionBody<'_, 'str>,
         m: ContextView<'_, 'str>,
-    ) -> Result<bool, String> {
+    ) -> Result<Outcome<'str>, String> {
         let fun_id = f.id();
         // Canonicalize pointer arithmetic *before* building the alias oracle, so it
         // sees per-slot `@SP`-rooted stack locations.
@@ -247,7 +247,7 @@ impl FunctionPass for Gvn {
         // dominator-tree GVN against it.
         let aliases = build_gvn_aliases(m, f.read_host(m), fun_id);
         changed |= gvn_body(f, m, fun_id, Some(&aliases));
-        Ok(changed)
+        Ok(Outcome::changed(changed))
     }
 }
 

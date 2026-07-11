@@ -13,7 +13,7 @@ use std::borrow::Cow;
 
 use cpp_demangle::DemangleOptions;
 
-use crate::{ContextView, FunctionBody, FunctionPass};
+use crate::{ContextView, FunctionBody, FunctionPass, Outcome};
 
 pub struct CppDemangle {
     /// Precomputed in `Default`: rendered names omit parameter lists
@@ -42,7 +42,7 @@ impl FunctionPass for CppDemangle {
         &self,
         f: &mut FunctionBody<'_, 'str>,
         m: ContextView<'_, 'str>,
-    ) -> Result<bool, String> {
+    ) -> Result<Outcome<'str>, String> {
         // Read the function's own name, decide the demangled form, then buffer
         // the rename.
         let demangled: Option<String> = {
@@ -62,9 +62,9 @@ impl FunctionPass for CppDemangle {
             Some(demangled) => {
                 // Buffered; the driver applies it (uniquified) at the barrier.
                 f.effects_mut().rename_self(Cow::Owned(demangled));
-                Ok(true)
+                Ok(Outcome::changed(true))
             }
-            None => Ok(false),
+            None => Ok(Outcome::unchanged()),
         }
     }
 }

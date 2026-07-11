@@ -213,7 +213,7 @@ pub fn canonicalize_sp_slots<'str>(
 
 // ----- pass ------------------------------------------------------------------
 
-use crate::{ContextView, FunctionBody, FunctionPass};
+use crate::{ContextView, FunctionBody, FunctionPass, Outcome};
 
 /// Runs [`canonicalize_sp_slots`] over a function, resolving `@SP` from the
 /// configured stack-pointer register. Replaces the legacy `brighten`/`lower_stack`
@@ -232,10 +232,12 @@ impl FunctionPass for CanonicalizeSpSlots {
         &self,
         f: &mut FunctionBody<'_, 'str>,
         cx: ContextView<'_, 'str>,
-    ) -> std::result::Result<bool, String> {
+    ) -> std::result::Result<Outcome<'str>, String> {
         let sp_reg = cx.shr().registers[&cx.env().cfg.stack_pointer];
         let fid = f.id();
-        Ok(canonicalize_sp_slots_concrete(f, cx, fid, sp_reg))
+        Ok(Outcome::changed(canonicalize_sp_slots_concrete(
+            f, cx, fid, sp_reg,
+        )))
     }
 }
 

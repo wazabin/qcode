@@ -25,7 +25,7 @@ use crate::loop_info::{
     cbranch_exit, delete_private_loop, incoming, is_loop_private, param_parent, param_pos,
     recognize_loops, users_of,
 };
-use crate::pipeline::{ContextView, FunctionBody};
+use crate::pipeline::{ContextView, FunctionBody, Outcome};
 use crate::{FunctionPass, register_function_pass};
 
 // ===========================================================================
@@ -413,8 +413,8 @@ impl FunctionPass for LoopToMap {
         &self,
         f: &mut FunctionBody<'_, 'str>,
         m: ContextView<'_, 'str>,
-    ) -> Result<bool, String> {
-        Ok(recognize_total_map(m, f))
+    ) -> Result<Outcome<'str>, String> {
+        Ok(Outcome::changed(recognize_total_map(m, f)))
     }
 }
 
