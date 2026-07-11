@@ -499,17 +499,6 @@ async fn lift_and_discover_until_quiet(
         // Discoveries found here are the only durable output; analysis residue is
         // discarded so newly lifted blocks invalidate the whole owning function.
         let mut ctx = clean.clone();
-        // Strict IR locality before the discovery-phase function stages check
-        // functions out. The durable `clean` is split at the end of each round
-        // (below), so round 1's disposable `ctx` is still un-split and may hold a
-        // thunk's Branch into a foreign entry; normalize it here so no function
-        // stage ever checks out a body carrying a foreign block reference (every
-        // function is parallel-eligible — there is no entangled-function fallback).
-        // Disposable: only drained discoveries survive, and `clean`'s own split
-        // below keeps the durable IR identical whether or not this ran.
-        if crate::has_cross_function_reference(&ctx) {
-            crate::split_overlapping_functions(&mut ctx);
-        }
         let analysis_env = PipelineEnv::new(clean, cfg.clone());
         if let Err(e) = pipeline
             .run_address_discovery_phase_async(
@@ -528,13 +517,11 @@ async fn lift_and_discover_until_quiet(
             clean.discover(discovery);
         }
 
-        // Repair functions that absorbed another function's body before its entry
-        // was known (thunks/tail calls/late call targets). A split rewrites the
-        // clean IR's `blocks`/`instruction_addrs`, so treat it like a discovery:
-        // keep the loop going and let analysis replay over the corrected IR.
-        let split = crate::split_overlapping_functions(clean);
-
-        let pending = split || !clean.has_no_discoveries();
+        // Function boundaries are settled at construction: the lifter emits
+        // strict-local IR (tail calls for inter-procedural transfers, function
+        // splits at shared/mid-function landings — context-split ruling 2), so no
+        // round-end re-derivation of ownership is needed.
+        let pending = !clean.has_no_discoveries();
 
         log_round_stats(round);
         #[cfg(not(target_arch = "wasm32"))]
@@ -572,30 +559,11 @@ async fn run_analysis_fixpoint<'s>(
     overrides: &std::collections::HashMap<Proposition, bool>,
     progress: &mut impl ProgressSink,
 ) -> Result<Context<'s>, PipelineError> {
-    // Entry normalization (context-split stage 3, strict IR locality — ruling 2).
-    // The lifter-driven discovery loop splits the persistent clean IR every round
-    // (`split_overlapping_functions`), but every *pre-lifted* optimization entry —
-    // `analyze_default` with no lifter (the differential gate), `qcode-pass` on
-    // textual IR, wasm — reaches this fixpoint without it, so a thunk's `Branch`
-    // into a foreign function's entry would carry a foreign `BlockId` into the
-    // function stages (where a checked-out worker cannot reach the foreign block).
-    // Normalize once here, the single choke point every optimization entry shares:
-    // rewrite cross-function tail jumps to `TailCall` terminators and force splits
-    // at any mid-function landing, so no foreign block reference survives. `baseline`
-    // is the raw clean IR (the fixpoint re-clones it each round and runs the pipeline
-    // once, never on its own output), so the splitter's clean-IR assumptions hold.
-    // Skip the clone when the IR is already local — the steady state on the lifter
-    // path and any input with no cross-function edges.
-    let normalized;
-    let baseline = if crate::has_cross_function_reference(baseline) {
-        let mut owned = baseline.clone();
-        crate::split_overlapping_functions(&mut owned);
-        normalized = owned;
-        &normalized
-    } else {
-        baseline
-    };
-
+    // Strict IR locality (context-split ruling 2) is an invariant of construction:
+    // the lifter emits tail calls for inter-procedural transfers and splits at
+    // shared/mid-function landings, so `baseline` — whether lifted, parsed from
+    // textual IR, or wasm-produced — already holds no foreign block reference. No
+    // entry normalization is needed.
     let env = PipelineEnv::new(baseline, cfg.clone());
     let bounded = !overrides.is_empty();
     // User overrides carry a synthetic "override" provenance so the converged

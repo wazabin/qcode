@@ -753,62 +753,25 @@ impl<'str> Context<'str> {
         BasicBlock::from_id_mut(self, to).remove_edge(func, edge_id);
     }
 
-    /// Relocate every block in `olds` — each owned by `target` but *stored* in a
-    /// different function's arenas (a "reattributed" block, see
-    /// `reattribute_blocks`) — into `target`'s own arenas, so that ownership and
-    /// storage agree (`block.id.func == block.parent`).
+    /// Relocate every block in `olds` — currently owned by `target` but *stored*
+    /// in another function's arena — into `target`'s own arena, so that ownership
+    /// and storage agree (`block.id.func == block.parent`). This is the storage
+    /// mover [`split_function_at`](Self::split_function_at) uses to make a split-off
+    /// tail self-stored.
     ///
-    /// This is a pure storage move: the resulting IR is semantically identical.
-    /// Every relocated block is deep-cloned into `target` (preserving instruction
-    /// types, machine addresses, and labels), all intra-set value/block references
-    /// are remapped to the clones, the incident CFG edges are rebuilt between the
-    /// new blocks (and their unmoved neighbours), the block addresses and the
-    /// function root are re-pointed, and the originals are deleted. `target`'s
-    /// reverse-use map is rebuilt from its live instructions afterwards.
+    /// A pure storage move: the resulting IR is semantically identical. Every
+    /// relocated block is deep-cloned into `target` (preserving instruction types,
+    /// machine addresses, and labels), all intra-set value/block references are
+    /// remapped to the clones, the incident CFG edges are rebuilt between the new
+    /// blocks (and their unmoved neighbours), the block addresses and the function
+    /// root are re-pointed, and the originals are deleted. `target`'s reverse-use
+    /// map is rebuilt from its live instructions afterwards.
     ///
-    /// Assumes (as guaranteed by the splitter after it strips cross-function CFG
-    /// edges) that the relocated set is closed: every reference from a relocated
-    /// block resolves to another relocated block, an unmoved block of `target`, or
-    /// a shared value. A reference that would cross into a *third* function is a
-    /// Make every function self-stored by relocating each "reattributed" block —
-    /// one whose *owner* (`parent`) differs from its *storage* (`id.func`) — into
-    /// its owner's arenas, so that `id.func == parent` holds for every live block.
-    ///
-    /// Reattribution (a block owned by one function but stored in another) is
-    /// produced both by recursive disassembly (a block first lifted as one
-    /// function's target, later attached to the function that truly owns it) and by
-    /// `split_overlapping_functions`. A function pass borrows only its own
-    /// [`Function`] `&mut` from the bodies registry, so a roster block living in a
-    /// *different* function's arena would be inaccessible — hence this must run
-    /// before the function-pass stage. It is a pure storage move (see
-    /// [`rehome_owned_blocks`](Self::rehome_owned_blocks)); the IR is unchanged.
-    /// Returns `true` if anything was relocated.
-    pub fn normalize_block_storage(&mut self) -> bool {
-        // Group each owner's foreign blocks so the whole set relocates together and
-        // its internal references remap in one pass.
-        let mut foreign_by_owner: HashMap<FunctionId, Vec<BlockId>> = HashMap::default();
-        for id in self.block_ids() {
-            if let Some(owner) = self.block(id).parent
-                && owner != id.func
-            {
-                foreign_by_owner.entry(owner).or_default().push(id);
-            }
-        }
-        if foreign_by_owner.is_empty() {
-            return false;
-        }
-        for (owner, olds) in foreign_by_owner {
-            log::debug!(
-                target: "split",
-                "re-homing {} reattributed block(s) into {owner:?}",
-                olds.len(),
-            );
-            self.rehome_owned_blocks(owner, &olds);
-        }
-        true
-    }
-
-    /// bug upstream; debug builds assert against it.
+    /// Assumes the relocated set is closed (the caller strips every cross-function
+    /// CFG edge and rewrites foreign terminator targets to `TailCall`s first): every
+    /// reference from a relocated block resolves to another relocated block, an
+    /// unmoved block of `target`, or a shared value; a reference into a *third*
+    /// function is a bug upstream, and debug builds assert against it.
     pub fn rehome_owned_blocks(&mut self, target: FunctionId, olds: &[BlockId]) {
         // Phase 1: structurally clone every block into `target`, accumulating the
         // old -> new value and block maps.

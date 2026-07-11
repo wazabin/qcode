@@ -81,10 +81,7 @@ pub mod mba_simplify;
 pub use mba_simplify::{MbaSimplify, mba_simplify};
 
 pub mod lift;
-pub use lift::{
-    discover_addresses_in_binary, has_cross_function_reference, lift_new_addresses,
-    split_overlapping_functions,
-};
+pub use lift::{discover_addresses_in_binary, lift_new_addresses};
 
 pub mod pipeline;
 pub(crate) use pipeline::with_checked_out_body;
