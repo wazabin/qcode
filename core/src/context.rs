@@ -905,6 +905,254 @@ impl<'str> Context<'str> {
         self.rebuild_users(target);
     }
 
+    /// Is `block` the root (entry block) of the function registered at its machine
+    /// address? A function and its entry block share an address; the entry block is
+    /// the one at the function's address. Used as the tail-call boundary in
+    /// [`split_function_at`](Self::split_function_at)'s reach walk.
+    fn is_function_entry(&self, block: BlockId) -> bool {
+        self.block(block)
+            .address
+            .and_then(|addr| Function::from_addr(self, addr))
+            .and_then(|f| f.root().map(|r| r.id))
+            == Some(block)
+    }
+
+    /// Blocks reachable from `block` along CFG edges, stopping at any *other*
+    /// function's entry (the tail-call boundary). `block` itself is always included.
+    /// The walk is owner-agnostic: it crosses blocks regardless of which function
+    /// currently owns them (an absorbed tail is owned by the function that absorbed
+    /// it, not by `g`), exactly like the settle's `claimed_from`. `g` is the function
+    /// the tail is being reclaimed into, so `g`'s own entry (which is `block`) is not
+    /// a boundary. Deterministically ordered (by machine address, then id) so the
+    /// storage relocation that follows assigns ids reproducibly.
+    fn split_tail(&self, block: BlockId, g: FunctionId) -> Vec<BlockId> {
+        let mut seen: HashSet<BlockId> = HashSet::default();
+        seen.insert(block);
+        let mut queue = vec![block];
+        while let Some(b) = queue.pop() {
+            let succs: Vec<BlockId> = BasicBlock::from_id(self, b)
+                .successors()
+                .map(|(_, s)| s)
+                .collect();
+            for s in succs {
+                if seen.contains(&s) {
+                    continue;
+                }
+                // A different function's entry is a tail-call boundary — never
+                // crossed. `g`'s own entry is `block` (already seen), so this stops
+                // only at *foreign* entries.
+                if self.is_function_entry(s)
+                    && self
+                        .block(s)
+                        .address
+                        .and_then(|a| Function::from_addr(self, a))
+                        .map(|f| f.id)
+                        != Some(g)
+                {
+                    continue;
+                }
+                seen.insert(s);
+                queue.push(s);
+            }
+        }
+        let mut tail: Vec<BlockId> = seen.into_iter().collect();
+        tail.sort_unstable_by_key(|&b| (self.block(b).address, b.local, b.func));
+        tail
+    }
+
+    /// Split at `block`, returning the function `G` whose entry is `block`. This is
+    /// the strict-locality construction verb (context-split ruling 2): a control
+    /// transfer that lands mid-function is modelled as a *function split* — never a
+    /// foreign block reference.
+    ///
+    /// Concretely it: (i) reuses the function already registered at `block`'s address
+    /// (a stub minted by a `call`, which may already have adopted `block` as its
+    /// root) or mints a conventional `fn_<addr>` (synthesized interface, unknown ABI
+    /// — the optimization pipeline derives its purity/clobber/ABI facts later);
+    /// (ii) extracts the tail reachable from `block`, stopping at other function
+    /// entries ([`split_tail`](Self::split_tail)), and reassigns it to `G` (an
+    /// absorbed tail may currently be owned by the function that absorbed it);
+    /// (iii) rewrites every terminator that statically targeted `block` — in the
+    /// absorbing function and in any already-lifted caller — into a function-level
+    /// [`TailCall`](crate::value::insn::TailCall) (`G` for an unconditional `Branch`;
+    /// a fresh intra-function trampoline block ending in a `TailCall` for a
+    /// conditional `CBranch` arm), strips every cross-function CFG edge incident to
+    /// the moved tail, and rewrites any foreign back-edge out of the tail the same
+    /// way; (iv) relocates the tail into `G`'s own arena
+    /// ([`rehome_owned_blocks`](Self::rehome_owned_blocks)) so `G` is self-stored.
+    /// Afterwards no foreign block reference and no cross-function edge survives.
+    ///
+    /// `block` must carry a machine address.
+    pub fn split_function_at(&mut self, block: BlockId) -> FunctionId {
+        use crate::builder::Builder;
+        use crate::value::insn::{Branch, CBranch, TailCall};
+
+        let addr = self
+            .block(block)
+            .address
+            .expect("split_function_at: block has no machine address");
+
+        // G: reuse an existing function at this address (a call-minted stub, which
+        // may carry a symbol name and may already have adopted `block` as its root),
+        // else mint a conventional one. Minting registers the address, which — when a
+        // block already lives there — adopts it as `G`'s root via `set_address`.
+        let g = match Function::from_addr(self, addr).map(|f| f.id) {
+            Some(existing) => existing,
+            None => Function::make_at_addr(self, addr, None).id,
+        };
+
+        // The tail is computed on the pre-split CFG (cross-function edges intact) so
+        // the reach walk is exact — matching the settle's `claimed_from`.
+        let tail = self.split_tail(block, g);
+        let tail_set: HashSet<BlockId> = tail.iter().copied().collect();
+
+        // Every function that currently owns a tail block loses those blocks; record
+        // them so their `instruction_addrs` can be rebuilt afterwards.
+        let mut prev_owners: HashSet<FunctionId> = HashSet::default();
+        for &b in &tail {
+            if let Some(owner) = self.block(b).parent {
+                prev_owners.insert(owner);
+            }
+        }
+
+        // Reassign the tail's ownership to G (storage may still be elsewhere) and
+        // root G at `block`.
+        for &b in &tail {
+            Function::from_id_mut(self, g).add_block(b);
+        }
+        self.bodies[g].root = Some(block);
+
+        // Resolve a static terminator target to the foreign function whose *entry* it
+        // is, from the perspective of `owner`.
+        let foreign_entry =
+            |ctx: &Context, target: BlockId, owner: FunctionId| -> Option<FunctionId> {
+                let callee = ctx.block(target).parent?;
+                (callee != owner
+                    && Function::from_id(ctx, callee).root().map(|r| r.id) == Some(target))
+                .then_some(callee)
+            };
+
+        // Collect terminator rewrites: (a) any terminator that statically targets
+        // `block` (G's new entry) — the origin's own branch into the tail and any
+        // already-lifted caller; (b) any terminator in the moved tail whose target
+        // is now a foreign entry (a boundary tail-call, or a back-edge into the
+        // origin's retained entry). Both must become function-level `TailCall`s.
+        let mut tail_calls: Vec<(InstructionId, FunctionId)> = Vec::new();
+        let mut cond_calls: Vec<(InstructionId, BlockId, FunctionId)> = Vec::new();
+        let relevant: Vec<BlockId> = self.block_ids();
+        for b in relevant {
+            let Some(owner) = self.block(b).parent else {
+                continue;
+            };
+            let Some((term_id, mnemonic)) = BasicBlock::from_id(self, b)
+                .instructions()
+                .last()
+                .map(|t| (t.id, t.mnemonic().clone()))
+            else {
+                continue;
+            };
+            match mnemonic {
+                Mnemonic::Branch(Branch { target, .. }) => {
+                    if let Some(callee) = foreign_entry(self, target, owner) {
+                        tail_calls.push((term_id, callee));
+                    }
+                }
+                Mnemonic::CBranch(CBranch {
+                    success_block,
+                    failure_block,
+                    ..
+                }) => {
+                    if let Some(callee) = foreign_entry(self, success_block, owner) {
+                        cond_calls.push((term_id, b, callee));
+                    }
+                    if let Some(callee) = foreign_entry(self, failure_block, owner) {
+                        cond_calls.push((term_id, b, callee));
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        for (insn, callee) in tail_calls {
+            self.replace_instruction_mnemonic(
+                insn,
+                Mnemonic::TailCall(TailCall {
+                    target: callee,
+                    args: vec![],
+                }),
+            );
+        }
+        for (insn, owner_block, callee) in cond_calls {
+            let owner = self
+                .block(owner_block)
+                .parent
+                .expect("cbranch block has an owner");
+            let tramp = BasicBlock::make(self, owner).id;
+            Builder::from_block(BasicBlock::from_id_mut(self, tramp)).push_tail_call(callee);
+            self.add_cfg_edge(owner_block, tramp);
+
+            let Mnemonic::CBranch(mut cb) = self.instruction(insn).mnemonic().clone() else {
+                continue;
+            };
+            if foreign_entry(self, cb.success_block, owner) == Some(callee) {
+                cb.success_block = tramp;
+            }
+            if foreign_entry(self, cb.failure_block, owner) == Some(callee) {
+                cb.failure_block = tramp;
+            }
+            self.replace_instruction_mnemonic(insn, Mnemonic::CBranch(cb));
+        }
+
+        // Strip every cross-function CFG edge incident to a moved tail block; the
+        // reach walk already stopped at these boundaries, so removing them cannot
+        // change ownership — it only closes each function's graph over its own
+        // blocks (a precondition of the storage relocation below).
+        let mut stale: HashSet<(FunctionId, EdgeId)> = HashSet::default();
+        for &b in &tail {
+            for (edge_func, edge) in self.block(b).edges.iter().copied() {
+                let &EdgeData { from, to } = self.edge(edge_func, edge);
+                let cross = self.block(from).parent != self.block(to).parent;
+                let touches_tail = tail_set.contains(&from) || tail_set.contains(&to);
+                if cross && touches_tail {
+                    stale.insert((edge_func, edge));
+                }
+            }
+        }
+        for (func, edge) in stale {
+            self.remove_cfg_edge(func, edge);
+        }
+
+        // Storage move: relocate the tail into G's own arena (self-stored). The set
+        // is now closed (all cross-function edges stripped, foreign targets rewritten
+        // to `TailCall`s), so the relocation's closure assumptions hold.
+        self.rehome_owned_blocks(g, &tail);
+
+        // Rebuild `instruction_addrs` on G and on every function that lost blocks.
+        self.recompute_instruction_addrs(g);
+        for owner in prev_owners {
+            if owner != g {
+                self.recompute_instruction_addrs(owner);
+            }
+        }
+
+        g
+    }
+
+    /// Rebuild `func`'s `instruction_addrs` from the machine addresses of the
+    /// instructions in its current blocks.
+    fn recompute_instruction_addrs(&mut self, func: FunctionId) {
+        let blocks = Function::from_id(self, func).block_ids();
+        let mut addrs = std::collections::BTreeSet::new();
+        for b in blocks {
+            for insn in BasicBlock::from_id(self, b).instructions() {
+                if let Some(a) = insn.address() {
+                    addrs.insert(a);
+                }
+            }
+        }
+        self.bodies[func].instruction_addrs = addrs;
+    }
+
     /// Rebuild `func`'s reverse-use map (`users`) from scratch by scanning its live
     /// instructions' operands. Mirrors the per-operand recording in
     /// [`Context::push_insn`](crate::context::Context::push_insn).
@@ -2838,5 +3086,190 @@ mod tests {
         assert_eq!(take(&mut ctx, id, "tmp"), "tmp_1");
         // ...then continue past the still-taken suffixes.
         assert_eq!(take(&mut ctx, id, "tmp"), "tmp_4");
+    }
+
+    // --- split_function_at (strict-local construction verb, ruling 2) ---
+
+    mod split_function_at {
+        use super::*;
+        use crate::builder::Builder;
+        use crate::value::insn::{Mnemonic, TailCall};
+        use crate::value::{BasicBlock, Function, Instruction};
+        use std::borrow::Cow;
+
+        fn block_at(ctx: &mut Context<'static>, func: FunctionId, addr: u64) -> BlockId {
+            BasicBlock::make(ctx, func).with_address(addr).id
+        }
+
+        fn branch_at(ctx: &mut Context<'static>, block: BlockId, target: BlockId, addr: u64) {
+            let id = Builder::from_block(BasicBlock::from_id_mut(ctx, block))
+                .push_branch(target)
+                .id;
+            Instruction::from_id_mut(ctx, id).set_address(addr);
+        }
+
+        fn cbranch_at(
+            ctx: &mut Context<'static>,
+            block: BlockId,
+            success: BlockId,
+            failure: BlockId,
+            addr: u64,
+        ) {
+            let cond = ctx.get_const(1, 1).id();
+            let id = Builder::from_block(BasicBlock::from_id_mut(ctx, block))
+                .push_cbranch(cond, success, failure)
+                .id;
+            Instruction::from_id_mut(ctx, id).set_address(addr);
+        }
+
+        fn return_at(ctx: &mut Context<'static>, block: BlockId, addr: u64) {
+            let zero = ctx.get_const(0, 8).id();
+            let id = Builder::from_block(BasicBlock::from_id_mut(ctx, block))
+                .push_return(zero)
+                .id;
+            Instruction::from_id_mut(ctx, id).set_address(addr);
+        }
+
+        fn block_at_addr(ctx: &Context, func: FunctionId, addr: u64) -> BlockId {
+            Function::from_id(ctx, func)
+                .block_ids()
+                .into_iter()
+                .find(|b| ctx.block(*b).address == Some(addr))
+                .unwrap_or_else(|| panic!("{func:?} has no block at {addr:#x}"))
+        }
+
+        fn addrs(ctx: &Context, func: FunctionId) -> Vec<u64> {
+            let mut got: Vec<u64> = Function::from_id(ctx, func)
+                .block_ids()
+                .into_iter()
+                .filter_map(|b| ctx.block(b).address)
+                .collect();
+            got.sort_unstable();
+            got
+        }
+
+        /// F@0x1000 (`jmp 0x2000`) absorbed the body later found to be its own
+        /// function at 0x2000 (`0x2000: jmp 0x2005 ; 0x2005: ret`). Splitting at the
+        /// 0x2000 block reuses the stub `G`, moves 0x2000+0x2005 into `G` self-stored,
+        /// leaves only the thunk in `F`, and turns the thunk's branch into a `TailCall`.
+        #[test]
+        fn splits_absorbed_body_reusing_the_stub() {
+            let mut ctx = Context::new();
+            let f = Function::make_at_addr(&mut ctx, 0x1000, Some(Cow::Borrowed("thunk"))).id;
+            let b0 = block_at(&mut ctx, f, 0x1000);
+            let b1 = block_at(&mut ctx, f, 0x2000);
+            let b2 = block_at(&mut ctx, f, 0x2005);
+            branch_at(&mut ctx, b0, b1, 0x1000);
+            branch_at(&mut ctx, b1, b2, 0x2000);
+            return_at(&mut ctx, b2, 0x2005);
+            {
+                let mut func = Function::from_id_mut(&mut ctx, f);
+                func.set_root(b0).unwrap();
+            }
+            // A later `call 0x2000` minted the stub.
+            let g = Function::make_at_addr(&mut ctx, 0x2000, Some(Cow::Borrowed("real"))).id;
+
+            let split_g = ctx.split_function_at(b1);
+            assert_eq!(
+                split_g, g,
+                "the split must reuse the existing stub at 0x2000"
+            );
+
+            assert_eq!(addrs(&ctx, f), vec![0x1000]);
+            assert_eq!(addrs(&ctx, g), vec![0x2000, 0x2005]);
+            let g_entry = block_at_addr(&ctx, g, 0x2000);
+            assert_eq!(ctx.bodies[g].root, Some(g_entry));
+
+            // Every G block is self-stored.
+            for b in Function::from_id(&ctx, g).block_ids() {
+                assert_eq!(b.func, g);
+                assert_eq!(ctx.block(b).parent, Some(g));
+            }
+
+            // The thunk's branch into the tail became a TailCall(G); its edge is gone.
+            let f_entry = block_at_addr(&ctx, f, 0x1000);
+            assert_eq!(BasicBlock::from_id(&ctx, f_entry).successors().count(), 0);
+            let term = BasicBlock::from_id(&ctx, f_entry)
+                .instructions()
+                .last()
+                .map(|i| i.mnemonic().clone());
+            assert!(
+                matches!(term, Some(Mnemonic::TailCall(TailCall { target, .. })) if target == g),
+                "thunk branch must become TailCall(G), got {term:?}",
+            );
+        }
+
+        /// A conditional arm into the split block is routed through a fresh
+        /// intra-function trampoline ending in a `TailCall`; the fall-through arm is
+        /// untouched and no foreign block reference survives.
+        #[test]
+        fn conditional_arm_into_split_block_uses_a_trampoline() {
+            let mut ctx = Context::new();
+            let f = Function::make_at_addr(&mut ctx, 0x1000, Some(Cow::Borrowed("f"))).id;
+            let entry = block_at(&mut ctx, f, 0x1000);
+            let cont = block_at(&mut ctx, f, 0x1008);
+            let tail = block_at(&mut ctx, f, 0x2000);
+            cbranch_at(&mut ctx, entry, tail, cont, 0x1000);
+            return_at(&mut ctx, cont, 0x1008);
+            return_at(&mut ctx, tail, 0x2000);
+            Function::from_id_mut(&mut ctx, f).set_root(entry).unwrap();
+
+            let g = ctx.split_function_at(tail);
+
+            let entry = block_at_addr(&ctx, f, 0x1000);
+            let cont = block_at_addr(&ctx, f, 0x1008);
+            assert_eq!(addrs(&ctx, g), vec![0x2000]);
+
+            let Mnemonic::CBranch(cb) = BasicBlock::from_id(&ctx, entry)
+                .instructions()
+                .last()
+                .unwrap()
+                .mnemonic()
+                .clone()
+            else {
+                panic!("entry must still end in a cbranch");
+            };
+            assert_eq!(cb.failure_block, cont, "fall-through arm untouched");
+            let tramp = cb.success_block;
+            assert_eq!(
+                BasicBlock::from_id(&ctx, tramp).parent().map(|f| f.id),
+                Some(f),
+                "trampoline lives in F",
+            );
+            let term = BasicBlock::from_id(&ctx, tramp)
+                .instructions()
+                .last()
+                .map(|i| i.mnemonic().clone());
+            assert!(
+                matches!(term, Some(Mnemonic::TailCall(TailCall { target, .. })) if target == g),
+                "trampoline must tail-call G, got {term:?}",
+            );
+            // Every successor of entry is intra-F.
+            for (_, s) in BasicBlock::from_id(&ctx, entry).successors() {
+                assert_eq!(BasicBlock::from_id(&ctx, s).parent().map(|f| f.id), Some(f));
+            }
+        }
+
+        /// With no pre-existing stub at the landing address, the split mints a
+        /// conventional `fn_<addr>` and moves the tail into it self-stored.
+        #[test]
+        fn mints_a_conventional_function_when_no_stub_exists() {
+            let mut ctx = Context::new();
+            let f = Function::make_at_addr(&mut ctx, 0x1000, Some(Cow::Borrowed("f"))).id;
+            let entry = block_at(&mut ctx, f, 0x1000);
+            let mid = block_at(&mut ctx, f, 0x1008);
+            branch_at(&mut ctx, entry, mid, 0x1000);
+            return_at(&mut ctx, mid, 0x1008);
+            Function::from_id_mut(&mut ctx, f).set_root(entry).unwrap();
+
+            let g = ctx.split_function_at(mid);
+            assert_eq!(Function::from_id(&ctx, g).name(), "fn_1008");
+            assert_eq!(addrs(&ctx, f), vec![0x1000]);
+            assert_eq!(addrs(&ctx, g), vec![0x1008]);
+            assert_eq!(Function::from_addr(&ctx, 0x1008).map(|f| f.id), Some(g));
+            for b in Function::from_id(&ctx, g).block_ids() {
+                assert_eq!(b.func, g);
+            }
+        }
     }
 }
