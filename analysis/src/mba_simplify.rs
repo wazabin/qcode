@@ -301,7 +301,7 @@ impl Classify<'_, '_> {
             Some(OpClass::Bool) => self.has_bool = true,
             None => {}
         }
-        for op in InstructionRef::new(self.host, iid).mnemonic().args() {
+        for op in InstructionRef::new(self.host, iid).operands() {
             if numeric_const(self.host, op).is_some() {
                 continue;
             }
