@@ -66,7 +66,7 @@ fn unique_incoming(
 
     let mut found: Option<ValueId> = None;
     for pred in preds {
-        let Some(&term_id) = host.block(pred).instructions.last() else {
+        let Some(&term_id) = host.block_ref(pred).instruction_ids().last() else {
             continue;
         };
         let mut consider = |arg: ValueId| -> bool {
@@ -280,7 +280,7 @@ pub fn remove_dead_block_params_generic<'str>(
     // Seed root + protected params live, then propagate liveness backwards along
     // the forwarding edges to a fixpoint: a param feeding a live param is live.
     if let Some(root) = root {
-        for &p in &host.read_host().block(root).params {
+        for &p in host.read_host().block(root).param_ids() {
             live.insert(p);
         }
     }
@@ -305,7 +305,7 @@ pub fn remove_dead_block_params_generic<'str>(
     // they never appear here; root params likewise).
     let mut dead_by_block: rustc_hash::FxHashMap<BlockId, HashSet<usize>> = Default::default();
     for &block in block_ids {
-        let params = host.read_host().block(block).params.clone();
+        let params: Vec<_> = host.read_host().block(block).param_ids().to_vec();
         for (index, &p) in params.iter().enumerate() {
             if !live.contains(&p) {
                 dead_by_block.entry(block).or_default().insert(index);
@@ -381,7 +381,7 @@ pub fn remove_dead_block_params_host<'a, 'str>(
     // Seed root + protected params live, then propagate liveness backwards along
     // the forwarding edges to a fixpoint: a param feeding a live param is live.
     if let Some(root) = root {
-        for &p in &body.read_host(cx).block(root).params {
+        for &p in body.read_host(cx).block(root).param_ids() {
             live.insert(p);
         }
     }
@@ -406,7 +406,7 @@ pub fn remove_dead_block_params_host<'a, 'str>(
     // they never appear here; root params likewise).
     let mut dead_by_block: rustc_hash::FxHashMap<BlockId, HashSet<usize>> = Default::default();
     for &block in block_ids {
-        let params = body.read_host(cx).block(block).params.clone();
+        let params: Vec<_> = body.read_host(cx).block(block).param_ids().to_vec();
         for (index, &p) in params.iter().enumerate() {
             if !live.contains(&p) {
                 dead_by_block.entry(block).or_default().insert(index);

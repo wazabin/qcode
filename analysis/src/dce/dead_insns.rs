@@ -221,7 +221,7 @@ pub fn remove_unused_no_pred_block_params_generic<'str>(
         return false;
     }
 
-    let params = host.read_host().block(block_id).params.clone();
+    let params: Vec<_> = host.read_host().block(block_id).param_ids().to_vec();
     let mut kept = Vec::with_capacity(params.len());
     let mut changed = false;
     for param in params {
@@ -272,7 +272,7 @@ pub fn remove_unused_no_pred_block_params_host<'a, 'str>(
         return false;
     }
 
-    let params = body.read_host(cx).block(block_id).params.clone();
+    let params: Vec<_> = body.read_host(cx).block(block_id).param_ids().to_vec();
     let mut kept = Vec::with_capacity(params.len());
     let mut changed = false;
     for param in params {
