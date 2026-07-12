@@ -1065,12 +1065,10 @@ mod tests {
         add_rodata(&mut ctx, 0x2000, table);
 
         // Pre-connect the dispatch block to its targets, mimicking the edges the
-        // lifter materializes in the clean IR before this pass re-runs.
+        // lifter materializes in the clean IR before this pass re-runs. The targets
+        // live in the dispatch's own function (strict IR locality).
         for t in targets {
-            let tb = {
-                let __f = ctx.anon_function();
-                ctx.get_or_make_block(t, __f)
-            };
+            let tb = ctx.get_or_make_block(t, fun);
             ctx.add_cfg_edge(disp, tb);
         }
         assert_eq!(successor_count(&ctx, disp), 2);

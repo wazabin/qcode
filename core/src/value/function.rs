@@ -1531,90 +1531,34 @@ mod tests {
 
     use super::*;
 
-    /// A tail jump (`Branch`) into another function's entry is a call edge in
-    /// both directions of the graph, even though the IR has no `Call`.
+    /// A tail call into another function is a call edge in both directions of the
+    /// graph, even though the IR has no `Call` (strict IR locality: an inter-
+    /// procedural transfer is a `TailCall(FunctionId)`, never a foreign `Branch`).
     #[test]
-    fn tail_jump_into_entry_is_a_call_edge() {
+    fn tail_call_is_a_call_edge() {
         use crate::builder::Builder;
 
         let mut ctx = Context::new();
 
         // Callee at 0x2000: a single block that returns.
         let callee = Function::make_at_addr(&mut ctx, 0x2000, None).id;
-        let callee_entry = {
-            let __f = ctx.anon_function();
-            BasicBlock::make(&mut ctx, __f)
-        }
-        .with_address(0x2000)
-        .id;
+        let callee_entry = BasicBlock::make(&mut ctx, callee).with_address(0x2000).id;
         let zero = ctx.get_const(0, 8).id();
         Builder::from_block(BasicBlock::from_id_mut(&mut ctx, callee_entry)).push_return(zero);
         Function::from_id_mut(&mut ctx, callee)
             .set_root(callee_entry)
             .unwrap();
 
-        // Thunk at 0x1000: a lone `jmp` into the callee's entry.
+        // Thunk at 0x1000: a lone `TailCall` into the callee.
         let thunk = Function::make_at_addr(&mut ctx, 0x1000, None).id;
-        let thunk_entry = {
-            let __f = ctx.anon_function();
-            BasicBlock::make(&mut ctx, __f)
-        }
-        .with_address(0x1000)
-        .id;
-        Builder::from_block(BasicBlock::from_id_mut(&mut ctx, thunk_entry))
-            .push_branch(callee_entry);
-        ctx.add_cfg_edge(thunk_entry, callee_entry);
+        let thunk_entry = BasicBlock::make(&mut ctx, thunk).with_address(0x1000).id;
+        Builder::from_block(BasicBlock::from_id_mut(&mut ctx, thunk_entry)).push_tail_call(callee);
         Function::from_id_mut(&mut ctx, thunk)
             .set_root(thunk_entry)
             .unwrap();
 
         assert_eq!(Function::from_id(&ctx, thunk).callees(), vec![callee]);
         assert_eq!(Function::from_id(&ctx, callee).callers(), vec![thunk]);
-    }
-
-    /// A `Branch` into the *middle* of another function is not a call edge — a
-    /// call enters at the entry, not at an interior block.
-    #[test]
-    fn tail_jump_into_interior_block_is_not_a_call_edge() {
-        use crate::builder::Builder;
-
-        let mut ctx = Context::new();
-
-        let callee = Function::make_at_addr(&mut ctx, 0x2000, None).id;
-        let callee_entry = {
-            let __f = ctx.anon_function();
-            BasicBlock::make(&mut ctx, __f)
-        }
-        .with_address(0x2000)
-        .id;
-        let interior = {
-            let __f = ctx.anon_function();
-            BasicBlock::make(&mut ctx, __f)
-        }
-        .with_address(0x2008)
-        .id;
-        let zero = ctx.get_const(0, 8).id();
-        Builder::from_block(BasicBlock::from_id_mut(&mut ctx, interior)).push_return(zero);
-        Function::from_id_mut(&mut ctx, callee).add_block(interior);
-        Function::from_id_mut(&mut ctx, callee)
-            .set_root(callee_entry)
-            .unwrap();
-
-        let thunk = Function::make_at_addr(&mut ctx, 0x1000, None).id;
-        let thunk_entry = {
-            let __f = ctx.anon_function();
-            BasicBlock::make(&mut ctx, __f)
-        }
-        .with_address(0x1000)
-        .id;
-        Builder::from_block(BasicBlock::from_id_mut(&mut ctx, thunk_entry)).push_branch(interior);
-        ctx.add_cfg_edge(thunk_entry, interior);
-        Function::from_id_mut(&mut ctx, thunk)
-            .set_root(thunk_entry)
-            .unwrap();
-
-        assert!(Function::from_id(&ctx, thunk).callees().is_empty());
-        assert!(Function::from_id(&ctx, callee).callers().is_empty());
     }
 
     #[test]

@@ -170,10 +170,7 @@ mod tests {
     /// Build pure `foo(a, b) = (a, b*69 + 42)` and mark it `is_pure`.
     fn build_pure_foo(tc: &mut TestContext) -> FunctionId {
         let fid = Function::make(&mut tc.ctx, "foo".into()).unwrap().id;
-        let entry = {
-            let __f = tc.ctx.anon_function();
-            tc.ctx.get_or_make_block(0x1000, __f)
-        };
+        let entry = tc.ctx.get_or_make_block(0x1000, fid);
         {
             let mut f = Function::from_id_mut(&mut tc.ctx, fid);
             f.set_root(entry).unwrap();
@@ -227,14 +224,8 @@ mod tests {
                 .get_or_make_aggregate(vec![i64_ty, i64_ty])
         };
         let gid = Function::make(&mut tc.ctx, "g".into()).unwrap().id;
-        let entry = {
-            let __f = tc.ctx.anon_function();
-            tc.ctx.get_or_make_block(0x4000, __f)
-        };
-        let cont = {
-            let __f = tc.ctx.anon_function();
-            tc.ctx.get_or_make_block(0x4100, __f)
-        };
+        let entry = tc.ctx.get_or_make_block(0x4000, gid);
+        let cont = tc.ctx.get_or_make_block(0x4100, gid);
         {
             let mut f = Function::from_id_mut(&mut tc.ctx, gid);
             f.set_root(entry).unwrap();
@@ -339,10 +330,7 @@ mod tests {
             tc.ctx.shared.types.get_or_make_array(i8_ty, 4)
         };
         let fid = Function::make(&mut tc.ctx, "dec".into()).unwrap().id;
-        let entry = {
-            let __f = tc.ctx.anon_function();
-            tc.ctx.get_or_make_block(0x1000, __f)
-        };
+        let entry = tc.ctx.get_or_make_block(0x1000, fid);
         {
             let mut f = Function::from_id_mut(&mut tc.ctx, fid);
             f.set_root(entry).unwrap();
@@ -403,14 +391,8 @@ mod tests {
                 .get_or_make_aggregate(vec![i32_ty, i32_ty])
         };
         let gid = Function::make(&mut tc.ctx, "g".into()).unwrap().id;
-        let entry = {
-            let __f = tc.ctx.anon_function();
-            tc.ctx.get_or_make_block(0x4000, __f)
-        };
-        let cont = {
-            let __f = tc.ctx.anon_function();
-            tc.ctx.get_or_make_block(0x4100, __f)
-        };
+        let entry = tc.ctx.get_or_make_block(0x4000, gid);
+        let cont = tc.ctx.get_or_make_block(0x4100, gid);
         {
             let mut f = Function::from_id_mut(&mut tc.ctx, gid);
             f.set_root(entry).unwrap();

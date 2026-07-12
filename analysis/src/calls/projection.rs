@@ -312,10 +312,7 @@ mod tests {
     fn projection_data_dependencies_are_per_field() {
         let mut tc = TestContext::new();
         let fid = Function::make(&mut tc.ctx, "foo".into()).unwrap().id;
-        let entry = {
-            let __f = tc.ctx.anon_function();
-            tc.ctx.get_or_make_block(0x1000, __f)
-        };
+        let entry = tc.ctx.get_or_make_block(0x1000, fid);
         {
             let mut f = Function::from_id_mut(&mut tc.ctx, fid);
             f.set_root(entry).unwrap();
@@ -365,22 +362,10 @@ mod tests {
     fn projection_includes_control_dependence() {
         let mut tc = TestContext::new();
         let fid = Function::make(&mut tc.ctx, "g".into()).unwrap().id;
-        let entry = {
-            let __f = tc.ctx.anon_function();
-            tc.ctx.get_or_make_block(0x1000, __f)
-        };
-        let t = {
-            let __f = tc.ctx.anon_function();
-            tc.ctx.get_or_make_block(0x1100, __f)
-        };
-        let fb = {
-            let __f = tc.ctx.anon_function();
-            tc.ctx.get_or_make_block(0x1200, __f)
-        };
-        let m = {
-            let __f = tc.ctx.anon_function();
-            tc.ctx.get_or_make_block(0x1300, __f)
-        };
+        let entry = tc.ctx.get_or_make_block(0x1000, fid);
+        let t = tc.ctx.get_or_make_block(0x1100, fid);
+        let fb = tc.ctx.get_or_make_block(0x1200, fid);
+        let m = tc.ctx.get_or_make_block(0x1300, fid);
         {
             let mut f = Function::from_id_mut(&mut tc.ctx, fid);
             f.set_root(entry).unwrap();
@@ -438,10 +423,7 @@ mod tests {
     fn projection_opaque_on_varnode() {
         let mut tc = TestContext::new();
         let fid = Function::make(&mut tc.ctx, "h".into()).unwrap().id;
-        let entry = {
-            let __f = tc.ctx.anon_function();
-            tc.ctx.get_or_make_block(0x1000, __f)
-        };
+        let entry = tc.ctx.get_or_make_block(0x1000, fid);
         {
             let mut f = Function::from_id_mut(&mut tc.ctx, fid);
             f.set_root(entry).unwrap();

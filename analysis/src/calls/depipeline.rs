@@ -324,18 +324,9 @@ mod tests {
     fn build_pipelined(tc: &mut TestContext) -> (FunctionId, BlockId) {
         let ram = tc.ctx.shared.default_space;
         let fid = Function::make(&mut tc.ctx, "strcpy".into()).unwrap().id;
-        let entry = {
-            let __f = tc.ctx.anon_function();
-            tc.ctx.get_or_make_block(0x1000, __f)
-        };
-        let header = {
-            let __f = tc.ctx.anon_function();
-            tc.ctx.get_or_make_block(0x1010, __f)
-        };
-        let exit = {
-            let __f = tc.ctx.anon_function();
-            tc.ctx.get_or_make_block(0x1020, __f)
-        };
+        let entry = tc.ctx.get_or_make_block(0x1000, fid);
+        let header = tc.ctx.get_or_make_block(0x1010, fid);
+        let exit = tc.ctx.get_or_make_block(0x1020, fid);
         {
             let mut f = Function::from_id_mut(&mut tc.ctx, fid);
             f.set_root(entry).unwrap();
@@ -442,18 +433,9 @@ mod tests {
         let mut tc = TestContext::new();
         let ram = tc.ctx.shared.default_space;
         let fid = Function::make(&mut tc.ctx, "notstrcpy".into()).unwrap().id;
-        let entry = {
-            let __f = tc.ctx.anon_function();
-            tc.ctx.get_or_make_block(0x3000, __f)
-        };
-        let header = {
-            let __f = tc.ctx.anon_function();
-            tc.ctx.get_or_make_block(0x3010, __f)
-        };
-        let exit = {
-            let __f = tc.ctx.anon_function();
-            tc.ctx.get_or_make_block(0x3020, __f)
-        };
+        let entry = tc.ctx.get_or_make_block(0x3000, fid);
+        let header = tc.ctx.get_or_make_block(0x3010, fid);
+        let exit = tc.ctx.get_or_make_block(0x3020, fid);
         {
             let mut f = Function::from_id_mut(&mut tc.ctx, fid);
             f.set_root(entry).unwrap();
@@ -520,18 +502,9 @@ mod tests {
         let mut tc = TestContext::new();
         let ram = tc.ctx.shared.default_space;
         let fid = Function::make(&mut tc.ctx, "sum".into()).unwrap().id;
-        let entry = {
-            let __f = tc.ctx.anon_function();
-            tc.ctx.get_or_make_block(0x2000, __f)
-        };
-        let header = {
-            let __f = tc.ctx.anon_function();
-            tc.ctx.get_or_make_block(0x2010, __f)
-        };
-        let exit = {
-            let __f = tc.ctx.anon_function();
-            tc.ctx.get_or_make_block(0x2020, __f)
-        };
+        let entry = tc.ctx.get_or_make_block(0x2000, fid);
+        let header = tc.ctx.get_or_make_block(0x2010, fid);
+        let exit = tc.ctx.get_or_make_block(0x2020, fid);
         {
             let mut f = Function::from_id_mut(&mut tc.ctx, fid);
             f.set_root(entry).unwrap();

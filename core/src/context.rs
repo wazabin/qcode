@@ -731,11 +731,18 @@ impl<'str> Context<'str> {
     }
 
     /// Adds a directed edge in the CFG from `from` to `to`, returning its id.
+    ///
+    /// Both endpoints must belong to the same function: CFG edges are strictly
+    /// intra-function (context-split ruling 2). An inter-procedural transfer is a
+    /// function-level `TailCall`/`Call`, never an edge — the lifter emits those at
+    /// construction, so no producer creates a cross-function edge. The permanent
+    /// `debug_assert` below is the tripwire that keeps that invariant honest (it is
+    /// the probe from 06a §10, now a keeper because the invariant finally holds).
     pub fn add_cfg_edge(&mut self, from: BlockId, to: BlockId) -> EdgeId {
-        // The edge is stored in `from`'s edge arena. It is usually intra-function,
-        // but a thunk/tail-call `Branch` targets another function's entry block —
-        // a legitimate cross-function edge. Composite `EdgeId` routing lets both
-        // incident blocks reference it regardless of which arena holds it.
+        debug_assert_eq!(
+            from.func, to.func,
+            "cross-function CFG edge {from:?} -> {to:?} (strict IR locality, ruling 2)"
+        );
         let edge_id = self.push_edge(from.func, EdgeData { from, to });
         BasicBlock::from_id_mut(self, from).add_edge(from.func, edge_id);
         BasicBlock::from_id_mut(self, to).add_edge(from.func, edge_id);
@@ -2798,16 +2805,10 @@ mod tests {
     #[test]
     fn add_cfg_edge_returns_id_and_remove_unlinks_both_blocks() {
         let mut ctx = Context::new();
-        let a = {
-            let __f = ctx.anon_function();
-            BasicBlock::make(&mut ctx, __f)
-        }
-        .id;
-        let b = {
-            let __f = ctx.anon_function();
-            BasicBlock::make(&mut ctx, __f)
-        }
-        .id;
+        // CFG edges are intra-function (strict IR locality): both blocks in one func.
+        let f = ctx.anon_function();
+        let a = BasicBlock::make(&mut ctx, f).id;
+        let b = BasicBlock::make(&mut ctx, f).id;
 
         let edge = ctx.add_cfg_edge(a, b);
         assert_eq!(

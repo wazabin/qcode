@@ -2182,14 +2182,10 @@ mod tests {
     #[test]
     fn push_branch_with_args_via_builder() {
         let mut ctx = Context::new();
-        let src_id = {
-            let __f = ctx.anon_function();
-            ctx.get_or_make_block(0x1000, __f)
-        };
-        let dst_id = {
-            let __f = ctx.anon_function();
-            ctx.get_or_make_block(0x2000, __f)
-        };
+        // A branch edge is intra-function: source and target live in one function.
+        let f = ctx.anon_function();
+        let src_id = ctx.get_or_make_block(0x1000, f);
+        let dst_id = ctx.get_or_make_block(0x2000, f);
 
         let param_val = BasicBlock::from_id_mut(&mut ctx, dst_id).push_param(8).id();
 
