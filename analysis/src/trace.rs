@@ -53,11 +53,10 @@ impl ResolvedPath {
             // Deep clone the block
             let new_block_id = BasicBlock::clone_into_ctx(ctx, orig_block_id, &mut value_map);
 
-            let terminator = ctx
-                .block(orig_block_id)
-                .instructions
+            let terminator = BasicBlock::from_id(ctx, orig_block_id)
+                .instruction_ids()
                 .last()
-                .map(|&id| ctx.instruction(id).mnemonic().clone());
+                .map(|&id| Instruction::from_id(ctx, id).mnemonic().clone());
 
             match terminator {
                 Some(Mnemonic::CBranch(cbranch)) => {
