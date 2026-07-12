@@ -2648,11 +2648,14 @@ mod tests {
         // its `result_type` declines an unbounded operand (no static length), so
         // the intrinsic is only ever constructed this way, never via inference.
         let enum_id = IntrinsicId::from_name("enumerate").unwrap();
-        let host_fn = ctx.anon_function();
+        // Create the intrinsic in the block's own storage arena so the pushed
+        // instruction stays strict-local (its parent block lives in the same
+        // function) — a foreign instruction placement is a locality violation the
+        // in-body-id localization (ruling 2) forbids.
         let env = {
             let insn = InstructionRef::from_mnemonic_with_type(
                 &mut ctx,
-                host_fn,
+                entry.func,
                 Mnemonic::Intrinsic(IntrinsicApp {
                     id: enum_id,
                     args: vec![src],

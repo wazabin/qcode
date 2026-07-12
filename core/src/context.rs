@@ -1696,7 +1696,10 @@ impl<'str> Context<'str> {
     /// If the instruction has no parent block the block-list and parent steps are
     /// skipped, but name and users cleanup still runs.
     pub fn remove_instruction(&mut self, id: InstructionId) {
-        let parent = self.instruction(id).parent;
+        let parent = self
+            .instruction(id)
+            .parent
+            .map(|l| BlockId::new(id.func, l));
         let name = self.instruction(id).name.clone();
 
         if let Some(block_id) = parent {
@@ -1811,7 +1814,7 @@ impl<'str> Context<'str> {
             .iter()
             .position(|&i| i == before)
             .expect("before not in block");
-        self.instruction_mut(insn).parent = Some(block);
+        self.instruction_mut(insn).parent = Some(block.local);
         self.block_mut(block).instructions.insert(index, insn);
     }
 
@@ -1907,7 +1910,7 @@ impl<'str> Context<'str> {
         self.block_mut(keep).instructions.pop();
         let b_insns = std::mem::take(&mut self.block_mut(other).instructions);
         for &insn_id in &b_insns {
-            self.instruction_mut(insn_id).parent = Some(keep);
+            self.instruction_mut(insn_id).parent = Some(keep.local);
         }
         self.block_mut(keep).instructions.extend(b_insns);
         self.merge_nodes(keep, other, edge_ab);

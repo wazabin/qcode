@@ -8,7 +8,7 @@ use crate::{
     space::{Space, SpaceId, SpaceRef, SpaceType},
     types::TypeId,
     value::{
-        BlockId, BlockRef, FunctionId, FunctionRef, Value, ValueId,
+        BlockId, BlockRef, FunctionId, FunctionRef, LocalBlockId, Value, ValueId,
         util::{
             base_ref::{BaseRef, HostRef, WithCtx, WithCtxMut, WithHost},
             named::{Named, Renameable, update_context_name},
@@ -77,9 +77,11 @@ pub struct Instruction<'str> {
     /// The instruction which defines this value.
     mnemonic: Mnemonic,
 
-    /// The block that this instruction belongs to, if any.
+    /// The block that this instruction belongs to, if any (bare body-local index;
+    /// strict IR locality means the parent block lives in the same arena as the
+    /// instruction, so its owning `FunctionId` is the instruction's own `id.func`).
     /// Instructions that are not part of any block (e.g. lifted from data sections) have `None` here.
-    pub(crate) parent: Option<BlockId>,
+    pub(crate) parent: Option<LocalBlockId>,
 
     // Address of the binary instruction
     address: Option<u64>,
@@ -169,7 +171,9 @@ where
 
     /// The basic block that this instruction belongs to, if any.
     pub fn parent(&'s self) -> Option<BlockRef<'str, 'ctx>> {
-        self.inner().parent.map(|id| BlockRef::new(self.host(), id))
+        self.inner()
+            .parent
+            .map(|local| BlockRef::new(self.host(), BlockId::new(self.id.func, local)))
     }
 
     pub fn block(&'s self) -> Option<BlockRef<'str, 'ctx>> {

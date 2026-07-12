@@ -652,7 +652,7 @@ macro_rules! impl_block_mut_verbs {
     }
 
     fn insert_insn(&mut self, index: usize, insn_id: InstructionId) {
-        self.ctx.instruction_mut(insn_id).parent = Some(self.id);
+        self.ctx.instruction_mut(insn_id).parent = Some(self.id.local);
         self.ctx
             .block_mut(self.id)
             .instructions

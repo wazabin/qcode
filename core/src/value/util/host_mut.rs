@@ -259,7 +259,7 @@ impl<'a, 'str> PassBacking<'a, 'str> {
             .iter()
             .position(|&i| i == before)
             .expect("before not in block");
-        self.instruction_mut(insn).parent = Some(block);
+        self.instruction_mut(insn).parent = Some(block.local);
         self.block_mut(block).instructions.insert(index, insn);
     }
 
@@ -303,7 +303,7 @@ impl<'a, 'str> PassBacking<'a, 'str> {
         let (parent, name, is_terminator, args, target) = {
             let insn = self.read_host().instruction(id);
             (
-                insn.parent,
+                insn.parent.map(|l| BlockId::new(id.func, l)),
                 insn.name.clone(),
                 insn.mnemonic().is_terminator(),
                 insn.mnemonic().args().into_iter().collect::<Vec<_>>(),
@@ -475,7 +475,7 @@ impl<'a, 'str> PassBacking<'a, 'str> {
         self.block_mut(keep).instructions.pop();
         let b_insns = std::mem::take(&mut self.block_mut(other).instructions);
         for &insn_id in &b_insns {
-            self.instruction_mut(insn_id).parent = Some(keep);
+            self.instruction_mut(insn_id).parent = Some(keep.local);
         }
         self.block_mut(keep).instructions.extend(b_insns);
         self.merge_nodes(keep, other, edge_ab);

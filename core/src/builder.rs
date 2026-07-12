@@ -106,13 +106,13 @@ pub trait BuilderBacking<'str> {
 
     /// Append `id` to the end of `block`, setting its parent.
     fn bb_block_append_insn(&mut self, block: BlockId, id: InstructionId) {
-        self.bb_instruction_mut(id).parent = Some(block);
+        self.bb_instruction_mut(id).parent = Some(block.local);
         self.bb_block_mut(block).instructions.push(id);
     }
     /// Insert `id` at `index` in `block`, shifting later instructions right, and
     /// set its parent.
     fn bb_block_insert_insn_at(&mut self, block: BlockId, index: usize, id: InstructionId) {
-        self.bb_instruction_mut(id).parent = Some(block);
+        self.bb_instruction_mut(id).parent = Some(block.local);
         self.bb_block_mut(block).instructions.insert(index, id);
     }
 }

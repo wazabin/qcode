@@ -350,7 +350,7 @@ impl<'str> Function<'str> {
             .iter()
             .position(|&i| i == before)
             .expect("before not in block");
-        self.insn_mut(insn).parent = Some(block);
+        self.insn_mut(insn).parent = Some(block.local);
         self.block_mut(block).instructions.insert(index, insn);
     }
 
@@ -394,7 +394,7 @@ impl<'str> Function<'str> {
         let (parent, name, is_terminator, args) = {
             let insn = self.insn(id);
             (
-                insn.parent,
+                insn.parent.map(|l| BlockId::new(id.func, l)),
                 insn.name.clone(),
                 insn.mnemonic().is_terminator(),
                 insn.mnemonic().args().into_iter().collect::<Vec<_>>(),
@@ -543,7 +543,7 @@ impl<'str> Function<'str> {
         self.block_mut(keep).instructions.pop();
         let b_insns = std::mem::take(&mut self.block_mut(other).instructions);
         for &insn_id in &b_insns {
-            self.insn_mut(insn_id).parent = Some(keep);
+            self.insn_mut(insn_id).parent = Some(keep.local);
         }
         self.block_mut(keep).instructions.extend(b_insns);
         self.merge_nodes(keep, other, edge_ab);
