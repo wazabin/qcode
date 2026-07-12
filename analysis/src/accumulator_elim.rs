@@ -519,7 +519,7 @@ fn collect_deps(
             }
         }
         ValueId::Instruction(id) => {
-            for op in host.insn_ref(id).mnemonic().args() {
+            for op in host.insn_ref(id).operands() {
                 collect_deps(host, op, bindings, head_index, out, seen);
             }
         }

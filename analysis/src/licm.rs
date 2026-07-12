@@ -312,7 +312,7 @@ fn emission_order(
                 continue;
             }
             stack.push((id, true));
-            for op in host.insn_ref(id).mnemonic().args() {
+            for op in host.insn_ref(id).operands() {
                 if let ValueId::Instruction(o) = op
                     && invariant.contains(&o)
                     && !done.contains(&o)
