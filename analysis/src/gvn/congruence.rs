@@ -132,7 +132,7 @@ impl Congruence {
             let mnemonic = insn.mnemonic().clone();
             let size = insn.size();
             if is_pure_value_op(&mnemonic) {
-                let args = mnemonic.args();
+                let args = insn.operands();
                 let mut arg_syms: Vec<SymId> = args.iter().map(|&a| self.id(host, a)).collect();
                 if let Mnemonic::Binop(b) = &mnemonic
                     && is_commutative(&b.op)
