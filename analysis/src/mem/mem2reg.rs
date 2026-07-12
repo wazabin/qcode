@@ -2244,7 +2244,9 @@ mod tests {
             .set_root(block)
             .unwrap();
         let pid = BasicBlock::from_id_mut(&mut tc.ctx, block).push_param(8).id;
-        tc.ctx.block_param_mut(pid).set_origin_id(ValueId::Varnode(sp_reg));
+        tc.ctx
+            .block_param_mut(pid)
+            .set_origin_id(ValueId::Varnode(sp_reg));
         tc.ctx.block_param_mut(pid).name = Some("RSP".into());
         let sp = ValueId::BlockParam(pid);
 
@@ -2318,7 +2320,9 @@ mod tests {
             .set_root(block)
             .unwrap();
         let pid = BasicBlock::from_id_mut(&mut tc.ctx, block).push_param(8).id;
-        tc.ctx.block_param_mut(pid).set_origin_id(ValueId::Varnode(sp_reg));
+        tc.ctx
+            .block_param_mut(pid)
+            .set_origin_id(ValueId::Varnode(sp_reg));
         let sp = ValueId::BlockParam(pid);
 
         {

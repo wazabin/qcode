@@ -560,7 +560,9 @@ mod tests {
         let pid = BasicBlock::from_id_mut(&mut tc.ctx, block_id)
             .push_param(8)
             .id;
-        tc.ctx.block_param_mut(pid).set_origin_id(ValueId::Varnode(sp));
+        tc.ctx
+            .block_param_mut(pid)
+            .set_origin_id(ValueId::Varnode(sp));
         let sp_param = ValueId::BlockParam(pid);
         let mut builder = Builder::from_context(&mut tc.ctx, addr);
         f(&mut builder, sp_param);

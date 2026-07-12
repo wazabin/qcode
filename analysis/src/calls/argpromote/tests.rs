@@ -1240,7 +1240,9 @@ mod tests {
                 _ => unreachable!(),
             }
         };
-        tc.ctx.block_param_mut(pid).set_origin_id(ValueId::Varnode(sp_vn));
+        tc.ctx
+            .block_param_mut(pid)
+            .set_origin_id(ValueId::Varnode(sp_vn));
         Function::from_id_mut(&mut tc.ctx, f).set_pure_reg(true);
 
         let sp_arg = tc.ctx.get_const(0x7000, 8).id();
@@ -2389,7 +2391,9 @@ mod tests {
             .unwrap()
             .id();
         if let ValueId::BlockParam(inner) = esp_pid {
-            tc.ctx.block_param_mut(inner).set_origin_id(ValueId::Varnode(sp_reg));
+            tc.ctx
+                .block_param_mut(inner)
+                .set_origin_id(ValueId::Varnode(sp_reg));
         }
         Function::from_id_mut(&mut tc.ctx, f).set_pure_reg(true);
         let espv = tc.ctx.get_const(0x7000, 8).id();
@@ -2486,7 +2490,9 @@ mod tests {
             .unwrap()
             .id();
         if let ValueId::BlockParam(inner) = esp_pid {
-            tc.ctx.block_param_mut(inner).set_origin_id(ValueId::Varnode(sp_reg));
+            tc.ctx
+                .block_param_mut(inner)
+                .set_origin_id(ValueId::Varnode(sp_reg));
         }
         Function::from_id_mut(&mut tc.ctx, f).set_pure_reg(true);
         let espv = tc.ctx.get_const(0x7000, 8).id();
@@ -2580,7 +2586,9 @@ mod tests {
             .unwrap()
             .id();
         if let ValueId::BlockParam(inner) = esp_pid {
-            tc.ctx.block_param_mut(inner).set_origin_id(ValueId::Varnode(sp_reg));
+            tc.ctx
+                .block_param_mut(inner)
+                .set_origin_id(ValueId::Varnode(sp_reg));
         }
         Function::from_id_mut(&mut tc.ctx, f).set_pure_reg(true);
         let espv = tc.ctx.get_const(0x7000, 8).id();
@@ -2667,7 +2675,9 @@ mod tests {
             .unwrap()
             .id();
         if let ValueId::BlockParam(inner) = esp_pid {
-            tc.ctx.block_param_mut(inner).set_origin_id(ValueId::Varnode(sp_reg));
+            tc.ctx
+                .block_param_mut(inner)
+                .set_origin_id(ValueId::Varnode(sp_reg));
         }
         Function::from_id_mut(&mut tc.ctx, f).set_pure_reg(true);
         let espv = tc.ctx.get_const(0x7000, 4).id();
