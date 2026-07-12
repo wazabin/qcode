@@ -1583,6 +1583,7 @@ impl<'str, 'ctx, Ctx: BuilderBacking<'str>> Builder<'str, 'ctx, Ctx> {
     ) -> InstructionRef<'str, '_> {
         let current = self.block.id;
         self.block.host_mut().bb_add_cfg_edge(current, target);
+        let target = target.localize(current.func);
         let id = self
             .push_instruction(Mnemonic::Branch(Branch { target, args }), 0)
             .id;
@@ -1615,13 +1616,15 @@ impl<'str, 'ctx, Ctx: BuilderBacking<'str>> Builder<'str, 'ctx, Ctx> {
         let current = self.block.id;
         self.block.host_mut().bb_add_cfg_edge(current, target);
         self.block.host_mut().bb_add_cfg_edge(current, fallthrough);
+        let success_block = target.localize(current.func);
+        let failure_block = fallthrough.localize(current.func);
         let id = self
             .push_instruction(
                 Mnemonic::CBranch(CBranch {
-                    success_block: target,
+                    success_block,
                     success_args: target_args,
                     condition,
-                    failure_block: fallthrough,
+                    failure_block,
                     failure_args: fallthrough_args,
                 }),
                 0,
@@ -2199,7 +2202,7 @@ mod tests {
         let crate::value::insn::Mnemonic::Branch(branch) = last.mnemonic() else {
             panic!("expected branch");
         };
-        assert_eq!(branch.target, dst_id);
+        assert_eq!(branch.target, dst_id.local);
         assert_eq!(branch.args.len(), 1);
         assert_eq!(branch.args[0], param_val);
     }

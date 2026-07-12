@@ -434,15 +434,16 @@ impl Solver<'_> {
                 let Some(term) = BasicBlock::from_id(self.ctx, pred).iter().last() else {
                     return top;
                 };
+                let q = |t| BlockId::new(pred.func, t);
                 match term.mnemonic() {
                     Mnemonic::Branch(b) => b.args.get(k).copied().map(|inv| (inv, None)),
                     Mnemonic::CBranch(cb) => {
-                        if cb.success_block == parent {
+                        if q(cb.success_block) == parent {
                             cb.success_args
                                 .get(k)
                                 .copied()
                                 .map(|inv| (inv, Some((cb.condition, true))))
-                        } else if cb.failure_block == parent {
+                        } else if q(cb.failure_block) == parent {
                             cb.failure_args
                                 .get(k)
                                 .copied()
@@ -541,9 +542,9 @@ impl Solver<'_> {
             if let Some(term) = pred_block.iter().last()
                 && let Mnemonic::CBranch(cb) = term.mnemonic()
             {
-                let taken = if cb.success_block == cur {
+                let taken = if BlockId::new(pred.func, cb.success_block) == cur {
                     Some(true)
-                } else if cb.failure_block == cur {
+                } else if BlockId::new(pred.func, cb.failure_block) == cur {
                     Some(false)
                 } else {
                     None

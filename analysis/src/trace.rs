@@ -61,7 +61,9 @@ impl ResolvedPath {
             match terminator {
                 Some(Mnemonic::CBranch(cbranch)) => {
                     // Check for negation
-                    let Some(negate) = resolve_cbranch_negate(ctx, &cbranch, *next_addr) else {
+                    let Some(negate) =
+                        resolve_cbranch_negate(ctx, orig_block_id.func, &cbranch, *next_addr)
+                    else {
                         continue;
                     };
                     // CBranch is at the end of the cloned block
@@ -137,10 +139,20 @@ impl ResolvedPath {
 }
 
 /// Checks if a negate is needed for the CBranch conditional
-fn resolve_cbranch_negate(ctx: &Context, cbranch: &CBranch, next_addr: u64) -> Option<bool> {
-    if BasicBlock::from_id(ctx, cbranch.success_block).address() == Some(next_addr) {
+fn resolve_cbranch_negate(
+    ctx: &Context,
+    func: qcode::value::FunctionId,
+    cbranch: &CBranch,
+    next_addr: u64,
+) -> Option<bool> {
+    // The CBranch's targets are body-local indices in `func`'s arena.
+    if BasicBlock::from_id(ctx, BlockId::new(func, cbranch.success_block)).address()
+        == Some(next_addr)
+    {
         Some(false)
-    } else if BasicBlock::from_id(ctx, cbranch.failure_block).address() == Some(next_addr) {
+    } else if BasicBlock::from_id(ctx, BlockId::new(func, cbranch.failure_block)).address()
+        == Some(next_addr)
+    {
         Some(true)
     } else {
         eprintln!("[trace] error: next address {next_addr:#x} is neither success nor failure.");
@@ -196,7 +208,7 @@ fn wire_cbranch_to_next(ctx: &mut Context, block_id: BlockId, next_block_id: Blo
         ctx,
         block_id.func,
         Mnemonic::Branch(Branch {
-            target: next_block_id,
+            target: next_block_id.localize(block_id.func),
             args: vec![],
         }),
         0,
@@ -223,7 +235,7 @@ fn wire_branch_to_next(ctx: &mut Context, block_id: BlockId, next_block_id: Bloc
         ctx,
         block_id.func,
         Mnemonic::Branch(Branch {
-            target: next_block_id,
+            target: next_block_id.localize(block_id.func),
             args,
         }),
         0,
@@ -447,12 +459,13 @@ mod tests {
             let block = BasicBlock::from_id(&ctx, *block_id);
             match block.iter().last().map(|i| i.mnemonic().clone()) {
                 Some(Mnemonic::Branch(branch)) => {
+                    let target = BlockId::new(block_id.func, branch.target);
                     assert_eq!(
-                        branch.target, *next_id,
+                        target, *next_id,
                         "cloned branch must target the cloned successor"
                     );
                     assert!(
-                        cloned.contains(&branch.target),
+                        cloned.contains(&target),
                         "branch target must be a cloned block, not the original CFG"
                     );
                 }

@@ -234,7 +234,9 @@ fn predecessor_args(ctx: &Context, bid: BlockId, param_index: usize) -> Vec<Opti
     preds
         .into_iter()
         .map(|pred| match terminator_of(ctx, pred) {
-            Some(Mnemonic::Branch(Branch { target, args })) if target == bid => {
+            Some(Mnemonic::Branch(Branch { target, args }))
+                if BlockId::new(pred.func, target) == bid =>
+            {
                 args.get(param_index).copied()
             }
             Some(Mnemonic::CBranch(CBranch {
@@ -244,9 +246,9 @@ fn predecessor_args(ctx: &Context, bid: BlockId, param_index: usize) -> Vec<Opti
                 failure_args,
                 ..
             })) => {
-                if success_block == bid {
+                if BlockId::new(pred.func, success_block) == bid {
                     success_args.get(param_index).copied()
-                } else if failure_block == bid {
+                } else if BlockId::new(pred.func, failure_block) == bid {
                     failure_args.get(param_index).copied()
                 } else {
                     None

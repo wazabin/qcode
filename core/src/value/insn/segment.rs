@@ -13,7 +13,7 @@ use crate::{
     context::{Context, Shared},
     space::Space,
     value::{
-        BasicBlock, BlockParam, Function, ValueId,
+        BasicBlock, BlockParam, Function, LocalBlockId, ValueId,
         block::BlockId,
         bytes::BytesRef,
         function::FunctionId,
@@ -190,8 +190,11 @@ impl<'a, 'str> Seg<'a, 'str> {
     }
 
     /// A direct branch/cbranch target: `<name @p=arg …>`. Mirrors
-    /// `fmt_branch_target`.
-    fn branch_target(&mut self, target: BlockId, args: &[ValueId]) {
+    /// `fmt_branch_target`. The `target` is a bare body-local index; `func` is the
+    /// terminator's owning function (strict IR locality ⇒ the target lives in that
+    /// same arena), used to recover the full [`BlockId`].
+    fn branch_target(&mut self, func: FunctionId, target: LocalBlockId, args: &[ValueId]) {
+        let target = BlockId::new(func, target);
         let block = BasicBlock::from_id(self.ctx, target);
         let name = block.name().unwrap_or("unnamed");
         self.push(
@@ -255,7 +258,7 @@ pub fn instruction_segments(insn: &InstructionRef<'_, '_>) -> Vec<Token> {
 
     match insn.mnemonic() {
         Mnemonic::Tuple(t) => tuple_with_type(&mut seg, t, insn.type_id()),
-        m => mnemonic_segments(&mut seg, m),
+        m => mnemonic_segments(&mut seg, insn.id.func, m),
     }
 
     seg.out
@@ -282,7 +285,7 @@ fn tuple_with_type(seg: &mut Seg, t: &crate::value::insn::Tuple, type_id: crate:
     seg.punct(");");
 }
 
-fn mnemonic_segments(seg: &mut Seg, m: &Mnemonic) {
+fn mnemonic_segments(seg: &mut Seg, func: FunctionId, m: &Mnemonic) {
     use crate::value::insn::Unop;
     match m {
         Mnemonic::Load(l) => {
@@ -309,7 +312,7 @@ fn mnemonic_segments(seg: &mut Seg, m: &Mnemonic) {
         }
         Mnemonic::Branch(b) => {
             seg.kw("goto ");
-            seg.branch_target(b.target, &b.args);
+            seg.branch_target(func, b.target, &b.args);
             seg.punct(";");
         }
         Mnemonic::BranchInd(b) => {
@@ -322,9 +325,9 @@ fn mnemonic_segments(seg: &mut Seg, m: &Mnemonic) {
             seg.kw("if ");
             seg.value(cb.condition);
             seg.kw(" goto ");
-            seg.branch_target(cb.success_block, &cb.success_args);
+            seg.branch_target(func, cb.success_block, &cb.success_args);
             seg.kw(" else goto ");
-            seg.branch_target(cb.failure_block, &cb.failure_args);
+            seg.branch_target(func, cb.failure_block, &cb.failure_args);
             seg.punct(";");
         }
         Mnemonic::Apply(a) => {
@@ -622,18 +625,6 @@ fn call_arg_name(ctx: &Context<'_>, target: FunctionId, index: usize) -> String 
         Some(name) => format!("@{name}="),
         None => format!("@arg{index}="),
     }
-}
-
-/// The token stream for a mnemonic's rendering (the right-hand side, without the
-/// `<ty> %name = ` result binding). Concatenating the token text equals
-/// [`Mnemonic`]'s `Display` — `Mnemonic::fmt` is implemented by writing these.
-pub fn mnemonic_tokens(ctx: &Context<'_>, m: &Mnemonic) -> Vec<Token> {
-    let mut seg = Seg {
-        ctx,
-        out: Vec::new(),
-    };
-    mnemonic_segments(&mut seg, m);
-    seg.out
 }
 
 /// The token stream for a single value operand. Concatenating the token text

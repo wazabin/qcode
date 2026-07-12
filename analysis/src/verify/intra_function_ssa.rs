@@ -13,14 +13,14 @@ use qcode::{
 ///    as the instruction using them. A stray cross-function `ValueId` operand
 ///    means a pass leaked a handle across an outlining/split boundary without
 ///    remapping it.
-/// 2. **CFG block targets.** A terminator's static `target_blocks()` (a `Branch`
-///    target, both `CBranch` arms) must live in the instruction's own function.
-///    Cross-function control flow is modelled as a *function-level* `TailCall`
-///    terminator (which carries a `FunctionId`, not a block, so it is not a
-///    `target_blocks()` entry), never as a foreign `BlockId`. The lifter emits
-///    these tail calls at construction (context-split ruling 2), so no foreign
-///    block target may survive — a violation here means a pass minted or
-///    repointed a terminator at another function's block.
+/// 2. **CFG block targets** — *now type-proven, no runtime check.* A terminator's
+///    static targets (`Branch::target`, both `CBranch` arms) are stored as bare
+///    body-local `LocalBlockId`s (context-split stage 6a), so they cannot name a
+///    foreign function's block at all: every read qualifies with the terminator's
+///    own `id.func`. Cross-function control flow is modelled as a *function-level*
+///    `TailCall` terminator (which carries a `FunctionId`, not a block). The old
+///    dynamic check (`target.func == insn.func`) became vacuous under localization
+///    and is dropped — the type system now discharges this axis.
 /// 3. **CFG edges.** Every edge incident to a block is stored in that block's own
 ///    function (`from.func == to.func`). A cross-function edge would make every
 ///    per-function CFG walk (dominators, liveness, rename) wander into a foreign
@@ -32,7 +32,8 @@ use qcode::{
 ///    borrowing only its own body.
 ///
 /// With per-function IR ownership this turns the isolation goal into a checked
-/// invariant on all four axes.
+/// invariant on the operand, edge, and storage axes (the block-target axis is
+/// discharged by the `LocalBlockId` storage type).
 pub fn verify_intra_function_ssa(ctx: &Context) -> Vec<String> {
     let mut out = Vec::new();
     for insn in ctx.instructions() {
@@ -53,16 +54,9 @@ pub fn verify_intra_function_ssa(ctx: &Context) -> Vec<String> {
                 ));
             }
         }
-        for target in insn.mnemonic().target_blocks() {
-            if target.func != func {
-                out.push(format!(
-                    "instruction {:?} branches to cross-function block {target:?} \
-                     (owned by {:?}, used in {func:?}); cross-function control flow \
-                     must be a TailCall, not a foreign block target",
-                    insn.id, target.func,
-                ));
-            }
-        }
+        // Axis 2 (CFG block targets) is discharged by the `LocalBlockId` storage
+        // type: a terminator's targets are body-local indices in `insn.func`'s own
+        // arena and cannot reference another function's block.
     }
     for block in ctx.blocks() {
         // Axis 4: self-storage (arena == owner).
@@ -96,60 +90,14 @@ mod tests {
     use qcode::{
         builder::Builder,
         context::Context,
-        value::{
-            BasicBlock, Function,
-            insn::{Branch, Mnemonic},
-        },
+        value::{BasicBlock, Function},
     };
     use std::borrow::Cow;
 
-    /// A `Branch` whose target block is owned by a *different* function is a strict
-    /// IR locality violation (cross-function control flow must be a `TailCall`).
-    /// The forbidden shape is built by replacing a terminator's mnemonic directly
-    /// (never via `push_branch`, which would wire — and assert against — a
-    /// cross-function CFG edge).
-    #[test]
-    fn flags_cross_function_block_target() {
-        let mut ctx = Context::new();
-
-        let f = Function::make_at_addr(&mut ctx, 0x1000, Some(Cow::Borrowed("f"))).id;
-        let g = Function::make_at_addr(&mut ctx, 0x2000, Some(Cow::Borrowed("g"))).id;
-
-        let f_entry = BasicBlock::make(&mut ctx, f).with_address(0x1000).id;
-        Function::from_id_mut(&mut ctx, f)
-            .set_root(f_entry)
-            .unwrap();
-        let g_entry = BasicBlock::make(&mut ctx, g).with_address(0x2000).id;
-        Function::from_id_mut(&mut ctx, g)
-            .set_root(g_entry)
-            .unwrap();
-        {
-            let zero = ctx.get_const(0, 8).id();
-            Builder::from_block(BasicBlock::from_id_mut(&mut ctx, g_entry)).push_return(zero);
-        }
-
-        // f's entry terminator is repointed at g's block — a foreign BlockId target,
-        // installed without wiring a cross-function edge.
-        let zero = ctx.get_const(0, 8).id();
-        let term = Builder::from_block(BasicBlock::from_id_mut(&mut ctx, f_entry))
-            .push_return(zero)
-            .id;
-        ctx.replace_instruction_mnemonic(
-            term,
-            Mnemonic::Branch(Branch {
-                target: g_entry,
-                args: vec![],
-            }),
-        );
-
-        let diags = verify_intra_function_ssa(&ctx);
-        assert_eq!(
-            diags.len(),
-            1,
-            "expected one cross-function block-target diagnostic, got {diags:?}"
-        );
-        assert!(diags[0].contains("cross-function block"));
-    }
+    // The former `flags_cross_function_block_target` test is gone: a foreign block
+    // target is now unrepresentable. `Branch::target`/`CBranch` arms store a bare
+    // `LocalBlockId`, so there is no `BlockId` field to point at another function's
+    // block — the axis-2 invariant is discharged by the type, not a runtime check.
 
     /// A block owned by one function but stored in another's arena (a reattributed
     /// block) is a self-storage violation.

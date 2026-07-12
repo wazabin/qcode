@@ -115,7 +115,10 @@ pub(crate) fn recognize_loop<'a, 'str: 'a>(
 
     // The entry must unconditionally branch into the header, carrying `init`.
     let (head, init_args) = match terminator_mnemonic(host, root)? {
-        Mnemonic::Branch(Branch { target, args }) => (*target, args.clone()),
+        // The entry's branch target is a body-local index in `root`'s arena.
+        Mnemonic::Branch(Branch { target, args }) => {
+            (BlockId::new(root.func, *target), args.clone())
+        }
         _ => return None,
     };
     if head == root {
@@ -147,7 +150,9 @@ pub(crate) fn recognize_loop<'a, 'str: 'a>(
             return None;
         }
         match terminator_mnemonic(host, pred)? {
-            Mnemonic::Branch(Branch { target, args }) if *target == head => {
+            Mnemonic::Branch(Branch { target, args })
+                if BlockId::new(pred.func, *target) == head =>
+            {
                 if args.len() != arity {
                     return None;
                 }
@@ -250,7 +255,7 @@ fn transform<'str>(
                 let r = own.insn_ref(iid);
                 let mut mn = r.mnemonic().clone();
                 let ty = r.type_id();
-                remap_block_targets(&mut mn, &block_map);
+                remap_block_targets(&mut mn, ob.func, nb.func, &block_map);
                 let new_id = minted.push_mnemonic_with_type(rec, mn, ty);
                 BaseRef::new(minted.reborrow(), nb).push_insn(new_id);
                 value_map.insert(ValueId::Instruction(iid), ValueId::Instruction(new_id));
@@ -332,11 +337,19 @@ fn push_param<'str>(
 }
 
 /// Rewrite the block targets of a cloned terminator through `block_map` (value
-/// operands are remapped separately, once every region def is cloned).
-fn remap_block_targets(mn: &mut Mnemonic, block_map: &HashMap<BlockId, BlockId>) {
-    let remap = |b: &mut BlockId| {
-        if let Some(&nb) = block_map.get(b) {
-            *b = nb;
+/// operands are remapped separately, once every region def is cloned). Targets are
+/// bare body-local indices: a freshly cloned terminator still holds its source
+/// block's local target (`old_func`-relative), so qualify with `old_func` for the
+/// lookup and re-localize the mapped clone against its new arena `new_func`.
+fn remap_block_targets(
+    mn: &mut Mnemonic,
+    old_func: qcode::value::FunctionId,
+    new_func: qcode::value::FunctionId,
+    block_map: &HashMap<BlockId, BlockId>,
+) {
+    let remap = |b: &mut qcode::value::LocalBlockId| {
+        if let Some(&nb) = block_map.get(&BlockId::new(old_func, *b)) {
+            *b = nb.localize(new_func);
         }
     };
     match mn {

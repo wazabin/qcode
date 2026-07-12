@@ -224,11 +224,13 @@ fn try_match_strlen(host: HostRef, fid: FunctionId) -> Option<StrlenMatch> {
             return None;
         };
         let nonzero_continues = nonzero_polarity(host, *condition, elem_val)?;
+        // The CBranch targets are body-local indices in the header's arena.
+        let q = |t| BlockId::new(header.func, t);
         // The exit edge is the one taken when the byte is zero.
         let (exit_block, exit_args) = if nonzero_continues {
-            (*failure_block, failure_args)
+            (q(*failure_block), failure_args)
         } else {
-            (*success_block, success_args)
+            (q(*success_block), success_args)
         };
         // The exit edge must carry the index (the count) to an exit-block param.
         let kx = exit_args.iter().position(|&v| v == index)?;
@@ -241,9 +243,9 @@ fn try_match_strlen(host: HostRef, fid: FunctionId) -> Option<StrlenMatch> {
         // The body is the continue target; header/body/exit must be distinct so the
         // rewrite (and any deletion) can address them separately.
         let body_block = if nonzero_continues {
-            *success_block
+            q(*success_block)
         } else {
-            *failure_block
+            q(*failure_block)
         };
         if header == body_block || header == exit_block || body_block == exit_block {
             return None;
@@ -254,7 +256,7 @@ fn try_match_strlen(host: HostRef, fid: FunctionId) -> Option<StrlenMatch> {
         // the loop's *sole* data-dependent exit. Without this, a second `break`
         // (e.g. on another byte value) would make the count not the first-zero index.
         let back_ok = host.block_ref(body_block).iter().last().is_some_and(|t| {
-            matches!(t.mnemonic(), Mnemonic::Branch(Branch { target, .. }) if *target == header)
+            matches!(t.mnemonic(), Mnemonic::Branch(Branch { target, .. }) if BlockId::new(body_block.func, *target) == header)
         });
         if !back_ok {
             return None;
@@ -472,10 +474,11 @@ fn try_match_strlen_ptr(host: HostRef, fid: FunctionId) -> Option<StrlenPtrMatch
             let Some(nonzero_continues) = nonzero_polarity(host, *condition, elem_val) else {
                 continue;
             };
+            let q = |t| BlockId::new(header.func, t);
             let (exit_block, exit_args, body_block) = if nonzero_continues {
-                (*failure_block, failure_args, *success_block)
+                (q(*failure_block), failure_args, q(*success_block))
             } else {
-                (*success_block, success_args, *failure_block)
+                (q(*success_block), success_args, q(*failure_block))
             };
             // The exit edge must carry the induction pointer (the end pointer).
             if !exit_args.contains(&s) {
@@ -487,7 +490,7 @@ fn try_match_strlen_ptr(host: HostRef, fid: FunctionId) -> Option<StrlenPtrMatch
             // The body is an unconditional back-edge: the NUL test is the loop's
             // sole exit (else `end - base` is not the first-zero offset).
             let back_ok = host.block_ref(body_block).iter().last().is_some_and(|t| {
-                matches!(t.mnemonic(), Mnemonic::Branch(Branch { target, .. }) if *target == header)
+                matches!(t.mnemonic(), Mnemonic::Branch(Branch { target, .. }) if BlockId::new(body_block.func, *target) == header)
             });
             if !back_ok {
                 continue;

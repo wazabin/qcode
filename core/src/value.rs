@@ -54,6 +54,19 @@ macro_rules! composite_id {
             pub const fn new(func: $crate::value::FunctionId, local: $local) -> Self {
                 Self { func, local }
             }
+
+            /// Drop the qualifying function and yield the bare body-local index for
+            /// in-body storage, asserting (debug builds) that the id belongs to
+            /// `func` — the strict-locality tripwire. Use at every storage-flip
+            /// write site where the ambient owning function is known.
+            #[inline]
+            pub fn localize(self, func: $crate::value::FunctionId) -> $local {
+                debug_assert_eq!(
+                    self.func, func,
+                    concat!(stringify!($name), "::localize: foreign id"),
+                );
+                self.local
+            }
         }
 
         impl ::core::fmt::Debug for $name {

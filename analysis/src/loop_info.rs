@@ -127,13 +127,14 @@ pub(crate) fn incoming<'a, 'str: 'a>(
         let Some(term) = BlockRef::new(host, pred).iter().last() else {
             continue;
         };
+        let q = |t| BlockId::new(pred.func, t);
         match term.mnemonic() {
             Mnemonic::Branch(b) => out.extend(b.args.get(k).copied()),
             Mnemonic::CBranch(cb) => {
-                if cb.success_block == block {
+                if q(cb.success_block) == block {
                     out.extend(cb.success_args.get(k).copied());
                 }
-                if cb.failure_block == block {
+                if q(cb.failure_block) == block {
                     out.extend(cb.failure_args.get(k).copied());
                 }
             }
@@ -165,7 +166,11 @@ pub(crate) fn cbranch_exit<'a, 'str: 'a>(
     else {
         return None;
     };
-    let (sb, fb) = (*sb, *fb);
+    // The header's CBranch targets are body-local indices in the header's arena.
+    let (sb, fb) = (
+        BlockId::new(header.func, *sb),
+        BlockId::new(header.func, *fb),
+    );
     let preds: HashSet<BlockId> = BlockRef::new(host, header)
         .predecessors()
         .map(|(_, p)| p)
@@ -232,7 +237,7 @@ pub(crate) fn delete_private_loop<'str>(
         host.replace_instruction_mnemonic(
             term_id,
             Mnemonic::Branch(Branch {
-                target: exit,
+                target: exit.localize(preheader.func),
                 args: exit_args,
             }),
         );
@@ -428,7 +433,10 @@ fn build_loop(host: HostRef, latch: BlockId, header: BlockId) -> Option<NaturalL
     let Mnemonic::CBranch(cb) = hterm.mnemonic() else {
         return None;
     };
-    let (sb, fb) = (cb.success_block, cb.failure_block);
+    let (sb, fb) = (
+        BlockId::new(header.func, cb.success_block),
+        BlockId::new(header.func, cb.failure_block),
+    );
     let exit = match (nodes.contains(&sb), nodes.contains(&fb)) {
         (true, false) => fb,
         (false, true) => sb,
@@ -460,7 +468,7 @@ fn build_loop(host: HostRef, latch: BlockId, header: BlockId) -> Option<NaturalL
 fn ends_with_goto(host: HostRef, block: BlockId, target: BlockId) -> bool {
     matches!(
         BlockRef::new(host, block).iter().last().map(|t| t.mnemonic()),
-        Some(Mnemonic::Branch(b)) if b.target == target
+        Some(Mnemonic::Branch(b)) if BlockId::new(block.func, b.target) == target
     )
 }
 
@@ -563,7 +571,7 @@ impl NaturalLoop {
         let Mnemonic::CBranch(cb) = hterm.mnemonic() else {
             return None;
         };
-        let exit_on_true = cb.success_block == self.exit;
+        let exit_on_true = BlockId::new(self.header.func, cb.success_block) == self.exit;
         let ValueId::Instruction(id) = cb.condition else {
             return None;
         };

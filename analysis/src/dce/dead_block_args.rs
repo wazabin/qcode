@@ -83,20 +83,21 @@ fn unique_incoming(
             }
         };
 
+        let q = |t| BlockId::new(pred.func, t);
         let ok = match host.insn_ref(term_id).mnemonic() {
-            Mnemonic::Branch(b) if b.target == block => {
+            Mnemonic::Branch(b) if q(b.target) == block => {
                 b.args.get(index).copied().is_some_and(&mut consider)
             }
             Mnemonic::CBranch(c) => {
                 let mut ok = true;
-                if c.success_block == block {
+                if q(c.success_block) == block {
                     ok &= c
                         .success_args
                         .get(index)
                         .copied()
                         .is_some_and(&mut consider);
                 }
-                if c.failure_block == block {
+                if q(c.failure_block) == block {
                     ok &= c
                         .failure_args
                         .get(index)
@@ -244,9 +245,12 @@ pub fn remove_dead_block_params_generic<'str>(
         let insns: Vec<_> = host.block_ref(block).iter().map(|i| i.id).collect();
         for id in insns {
             match host.insn_ref(id).mnemonic() {
-                Mnemonic::Branch(b) => {
-                    forward_edges(host.read_host(), &b.args, b.target, &mut edges)
-                }
+                Mnemonic::Branch(b) => forward_edges(
+                    host.read_host(),
+                    &b.args,
+                    BlockId::new(block.func, b.target),
+                    &mut edges,
+                ),
                 Mnemonic::CBranch(c) => {
                     // The condition is a real read; only the per-target argument
                     // lists are forwarding edges.
@@ -256,13 +260,13 @@ pub fn remove_dead_block_params_generic<'str>(
                     forward_edges(
                         host.read_host(),
                         &c.success_args,
-                        c.success_block,
+                        BlockId::new(block.func, c.success_block),
                         &mut edges,
                     );
                     forward_edges(
                         host.read_host(),
                         &c.failure_args,
-                        c.failure_block,
+                        BlockId::new(block.func, c.failure_block),
                         &mut edges,
                     );
                 }
@@ -345,9 +349,12 @@ pub fn remove_dead_block_params_host<'a, 'str>(
         let insns: Vec<_> = body.block_ref(cx, block).iter().map(|i| i.id).collect();
         for id in insns {
             match body.insn_ref(cx, id).mnemonic() {
-                Mnemonic::Branch(b) => {
-                    forward_edges(body.read_host(cx), &b.args, b.target, &mut edges)
-                }
+                Mnemonic::Branch(b) => forward_edges(
+                    body.read_host(cx),
+                    &b.args,
+                    BlockId::new(block.func, b.target),
+                    &mut edges,
+                ),
                 Mnemonic::CBranch(c) => {
                     // The condition is a real read; only the per-target argument
                     // lists are forwarding edges.
@@ -357,13 +364,13 @@ pub fn remove_dead_block_params_host<'a, 'str>(
                     forward_edges(
                         body.read_host(cx),
                         &c.success_args,
-                        c.success_block,
+                        BlockId::new(block.func, c.success_block),
                         &mut edges,
                     );
                     forward_edges(
                         body.read_host(cx),
                         &c.failure_args,
-                        c.failure_block,
+                        BlockId::new(block.func, c.failure_block),
                         &mut edges,
                     );
                 }
@@ -549,13 +556,14 @@ fn incoming_args(
     index: usize,
 ) -> Vec<ValueId> {
     let mut out = Vec::new();
+    let q = |t| BlockId::new(term_id.func, t);
     match host.insn_ref(term_id).mnemonic() {
-        Mnemonic::Branch(b) if b.target == block => out.extend(b.args.get(index).copied()),
+        Mnemonic::Branch(b) if q(b.target) == block => out.extend(b.args.get(index).copied()),
         Mnemonic::CBranch(c) => {
-            if c.success_block == block {
+            if q(c.success_block) == block {
                 out.extend(c.success_args.get(index).copied());
             }
-            if c.failure_block == block {
+            if q(c.failure_block) == block {
                 out.extend(c.failure_args.get(index).copied());
             }
         }
@@ -633,20 +641,22 @@ pub(crate) fn remove_params_from_block_generic<'str>(
             continue;
         };
         let new = match host.read_host().instruction(term_id).mnemonic().clone() {
-            Mnemonic::Branch(b) if b.target == block => Mnemonic::Branch(Branch {
-                target: b.target,
-                args: filter_kept(&b.args, dead_indices),
-            }),
+            Mnemonic::Branch(b) if BlockId::new(pred.func, b.target) == block => {
+                Mnemonic::Branch(Branch {
+                    target: b.target,
+                    args: filter_kept(&b.args, dead_indices),
+                })
+            }
             Mnemonic::CBranch(c) => Mnemonic::CBranch(CBranch {
                 condition: c.condition,
                 success_block: c.success_block,
-                success_args: if c.success_block == block {
+                success_args: if BlockId::new(pred.func, c.success_block) == block {
                     filter_kept(&c.success_args, dead_indices)
                 } else {
                     c.success_args
                 },
                 failure_block: c.failure_block,
-                failure_args: if c.failure_block == block {
+                failure_args: if BlockId::new(pred.func, c.failure_block) == block {
                     filter_kept(&c.failure_args, dead_indices)
                 } else {
                     c.failure_args
@@ -693,20 +703,22 @@ pub(crate) fn remove_params_from_block_host<'a, 'str>(
             continue;
         };
         let new = match body.read_host(cx).instruction(term_id).mnemonic().clone() {
-            Mnemonic::Branch(b) if b.target == block => Mnemonic::Branch(Branch {
-                target: b.target,
-                args: filter_kept(&b.args, dead_indices),
-            }),
+            Mnemonic::Branch(b) if BlockId::new(pred.func, b.target) == block => {
+                Mnemonic::Branch(Branch {
+                    target: b.target,
+                    args: filter_kept(&b.args, dead_indices),
+                })
+            }
             Mnemonic::CBranch(c) => Mnemonic::CBranch(CBranch {
                 condition: c.condition,
                 success_block: c.success_block,
-                success_args: if c.success_block == block {
+                success_args: if BlockId::new(pred.func, c.success_block) == block {
                     filter_kept(&c.success_args, dead_indices)
                 } else {
                     c.success_args
                 },
                 failure_block: c.failure_block,
-                failure_args: if c.failure_block == block {
+                failure_args: if BlockId::new(pred.func, c.failure_block) == block {
                     filter_kept(&c.failure_args, dead_indices)
                 } else {
                     c.failure_args
@@ -760,20 +772,22 @@ pub(crate) fn remove_params_from_block_c<'str>(
             continue;
         };
         let new = match host.read_host().instruction(term_id).mnemonic().clone() {
-            Mnemonic::Branch(b) if b.target == block => Mnemonic::Branch(Branch {
-                target: b.target,
-                args: filter_kept(&b.args, dead_indices),
-            }),
+            Mnemonic::Branch(b) if BlockId::new(pred.func, b.target) == block => {
+                Mnemonic::Branch(Branch {
+                    target: b.target,
+                    args: filter_kept(&b.args, dead_indices),
+                })
+            }
             Mnemonic::CBranch(c) => Mnemonic::CBranch(CBranch {
                 condition: c.condition,
                 success_block: c.success_block,
-                success_args: if c.success_block == block {
+                success_args: if BlockId::new(pred.func, c.success_block) == block {
                     filter_kept(&c.success_args, dead_indices)
                 } else {
                     c.success_args
                 },
                 failure_block: c.failure_block,
-                failure_args: if c.failure_block == block {
+                failure_args: if BlockId::new(pred.func, c.failure_block) == block {
                     filter_kept(&c.failure_args, dead_indices)
                 } else {
                     c.failure_args

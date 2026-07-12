@@ -1682,11 +1682,14 @@ impl<'str> Mem2Reg<'_, '_, 'str> {
                     success_args: existing_success,
                     failure_args: existing_failure,
                 }) => {
+                    // The CBranch's targets are body-local indices in `block`'s arena.
+                    let sb = BlockId::new(block.func, success_block);
+                    let fb = BlockId::new(block.func, failure_block);
                     // Compute args before recursing; even if a target is already visited
                     // (back-edge), we still need to wire the correct values.
                     let success_args = self.merge_branch_args(
                         BranchEdge {
-                            target: success_block,
+                            target: sb,
                             source_block: block,
                             branch_insn: insn_id,
                             existing_args: &existing_success,
@@ -1695,7 +1698,7 @@ impl<'str> Mem2Reg<'_, '_, 'str> {
                     );
                     let failure_args = self.merge_branch_args(
                         BranchEdge {
-                            target: failure_block,
+                            target: fb,
                             source_block: block,
                             branch_insn: insn_id,
                             existing_args: &existing_failure,
@@ -1723,11 +1726,11 @@ impl<'str> Mem2Reg<'_, '_, 'str> {
                     }
 
                     state.frames.push(Frame::default());
-                    self.decide_values_start_from(success_block, state);
+                    self.decide_values_start_from(sb, state);
                     state.frames.pop();
 
                     state.frames.push(Frame::default());
-                    self.decide_values_start_from(failure_block, state);
+                    self.decide_values_start_from(fb, state);
                     state.frames.pop();
                 }
 
@@ -1735,9 +1738,10 @@ impl<'str> Mem2Reg<'_, '_, 'str> {
                     target,
                     args: existing,
                 }) => {
+                    let tgt = BlockId::new(block.func, target);
                     let args = self.merge_branch_args(
                         BranchEdge {
-                            target,
+                            target: tgt,
                             source_block: block,
                             branch_insn: insn_id,
                             existing_args: &existing,
@@ -1754,7 +1758,7 @@ impl<'str> Mem2Reg<'_, '_, 'str> {
                         );
                         state.changed = true;
                     }
-                    self.decide_values_start_from(target, state);
+                    self.decide_values_start_from(tgt, state);
                 }
 
                 call_mnemonic @ (Mnemonic::Call(_) | Mnemonic::CallInd(_)) => {

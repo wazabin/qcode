@@ -1,11 +1,15 @@
-use crate::value::{ValueId, block::BlockId, function::FunctionId};
+use crate::value::{LocalBlockId, ValueId, function::FunctionId};
 
 use super::mnemonic::{Args, MnemonicKind};
 use smallvec::{SmallVec, smallvec};
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub struct Branch {
-    pub target: BlockId,
+    /// The CFG successor, stored as a bare body-local block index. Strict IR
+    /// locality (context-split ruling 2) guarantees the target lives in the same
+    /// arena as this terminator, so its owning `FunctionId` is the terminator's
+    /// own `id.func`.
+    pub target: LocalBlockId,
     /// Arguments passed to the target block's parameters.
     pub args: Vec<ValueId>,
 }
@@ -141,10 +145,14 @@ impl MnemonicKind for CallInd {
 #[derive(Debug, Clone, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub struct CBranch {
     pub condition: ValueId,
-    pub success_block: BlockId,
+    /// Taken-arm CFG successor (bare body-local index; same arena as this
+    /// terminator — see [`Branch::target`]).
+    pub success_block: LocalBlockId,
     /// Arguments passed to `success_block`'s parameters when the branch is taken.
     pub success_args: Vec<ValueId>,
-    pub failure_block: BlockId,
+    /// Fall-through CFG successor (bare body-local index; same arena as this
+    /// terminator).
+    pub failure_block: LocalBlockId,
     /// Arguments passed to `failure_block`'s parameters when the branch falls through.
     pub failure_args: Vec<ValueId>,
 }
@@ -488,7 +496,7 @@ mod tests {
         let Mnemonic::Branch(branch) = entry_last.mnemonic() else {
             panic!("expected branch");
         };
-        let body = BasicBlock::from_id(&ctx, branch.target);
+        let body = BasicBlock::from_id(&ctx, crate::value::BlockId::new(block.func, branch.target));
         assert!(!body.is_empty());
     }
 
@@ -543,7 +551,7 @@ mod tests {
         let Mnemonic::Branch(branch) = last.mnemonic() else {
             panic!("expected branch");
         };
-        assert_eq!(branch.target, dst);
+        assert_eq!(branch.target, dst.local);
         assert_eq!(branch.args.len(), 1);
         assert_eq!(branch.args[0], ValueId::BlockParam(a));
     }

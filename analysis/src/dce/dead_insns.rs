@@ -510,7 +510,9 @@ mod tests {
         assert!(remove_dead_pure_call(&mut ctx, call_block));
 
         match terminator(&ctx, call_block) {
-            Mnemonic::Branch(br) => assert_eq!(br.target, cont, "branch must target fall-through"),
+            Mnemonic::Branch(br) => {
+                assert_eq!(br.target, cont.local, "branch must target fall-through")
+            }
             other => panic!("expected branch, got {other:?}"),
         }
         // The continuation is still reachable via exactly its one predecessor.
@@ -592,7 +594,7 @@ mod tests {
         let Mnemonic::Branch(br) = term.mnemonic() else {
             panic!("preheader should end in an unconditional branch to the exit");
         };
-        assert_eq!(br.target, exit);
+        assert_eq!(br.target, exit.local);
         assert!(
             BasicBlock::from_id(&ctx, head).predecessors().count() == 1,
             "header keeps only its now-unreachable back-edge"
@@ -720,7 +722,12 @@ fn match_dead_loop(host: HostRef, header: BlockId) -> Option<DeadLoop> {
     let Mnemonic::CBranch(cb) = host.instruction(term).mnemonic() else {
         return None;
     };
-    let (condition, exit, body) = (cb.condition, cb.success_block, cb.failure_block);
+    // The header CBranch's targets are body-local indices in the header's arena.
+    let (condition, exit, body) = (
+        cb.condition,
+        BlockId::new(header.func, cb.success_block),
+        BlockId::new(header.func, cb.failure_block),
+    );
     // The exit arm must carry no arguments and land on a param-less block, so the
     // rerouted preheader→exit branch stays well-formed and nothing escapes.
     if !cb.success_args.is_empty() {
@@ -738,7 +745,7 @@ fn match_dead_loop(host: HostRef, header: BlockId) -> Option<DeadLoop> {
     let Mnemonic::Branch(bbr) = host.instruction(bterm).mnemonic() else {
         return None;
     };
-    if bbr.target != header {
+    if BlockId::new(body.func, bbr.target) != header {
         return None;
     }
     let back_args = bbr.args.clone();
@@ -757,7 +764,7 @@ fn match_dead_loop(host: HostRef, header: BlockId) -> Option<DeadLoop> {
     let Mnemonic::Branch(pbr) = host.instruction(pterm).mnemonic() else {
         return None;
     };
-    if pbr.target != header {
+    if BlockId::new(preheader.func, pbr.target) != header {
         return None;
     }
     let init_args = pbr.args.clone();

@@ -532,7 +532,9 @@ impl<'str> Function<'str> {
             .instructions
             .last()
             .and_then(|&id| match self.insn(id).mnemonic() {
-                Mnemonic::Branch(branch) if branch.target == other => Some(branch.args.clone()),
+                Mnemonic::Branch(branch) if BlockId::new(keep.func, branch.target) == other => {
+                    Some(branch.args.clone())
+                }
                 _ => None,
             })
             .unwrap_or_default();
@@ -1166,8 +1168,10 @@ fn tail_call_target(ctx: &Context, block: BlockId) -> Option<FunctionId> {
         return None;
     };
     let caller = block.function()?.id;
-    let callee = BasicBlock::from_id(ctx, *target).function()?;
-    let enters_at_entry = callee.root().map(|root| root.id) == Some(*target);
+    // The target is a bare body-local index in this block's own arena.
+    let target = BlockId::new(block.id.func, *target);
+    let callee = BasicBlock::from_id(ctx, target).function()?;
+    let enters_at_entry = callee.root().map(|root| root.id) == Some(target);
     (enters_at_entry && callee.id != caller).then_some(callee.id)
 }
 

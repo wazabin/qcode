@@ -169,7 +169,7 @@ fn merge_candidate_generic<'str>(
         .map(|id| {
             matches!(
                 host.insn_ref(id).mnemonic(),
-                Mnemonic::Branch(b) if b.target == b_id
+                Mnemonic::Branch(b) if BlockId::new(a_id.func, b.target) == b_id
             )
         })
         .unwrap_or(false);
@@ -239,11 +239,12 @@ fn try_fold_cbranch_generic<'str>(host: &mut Context<'str>, block_id: BlockId) -
     host.replace_instruction_mnemonic(term_id, Mnemonic::Branch(Branch { target, args }));
 
     // Collapse the two parallel `block -> target` edges into one: keep the
-    // first, drop the second.
+    // first, drop the second. `target` is a body-local index in this block's arena.
+    let target_full = BlockId::new(block_id.func, target);
     let dup_edge = host
         .block_ref(block_id)
         .successors()
-        .filter(|&(_, to)| to == target)
+        .filter(|&(_, to)| to == target_full)
         .map(|(e, _)| e)
         .nth(1);
     if let Some(dup_edge) = dup_edge {
@@ -277,13 +278,12 @@ fn try_bypass_empty_block_generic<'str>(
             _ => return false,
         }
     };
-    if target == b_id {
+    // `target` is a body-local index in this function's arena (strict IR
+    // locality); a cross-function forward is a `TailCall`, never a `Branch`, so
+    // the old `target.func != function_id` guard is now tautological and dropped.
+    let target_full = BlockId::new(function_id, target);
+    if target_full == b_id {
         return false; // bypassing `goto self` is meaningless and unsound
-    }
-    // Intra-function only: bypassing a block that forwards into another function
-    // (a thunk) is a cross-function edit — left to the module pass.
-    if target.func != function_id {
-        return false;
     }
 
     let params: Vec<BlockParamId> = host.function(function_id).block(b_id).param_ids().to_vec();
@@ -340,19 +340,19 @@ fn try_bypass_empty_block_generic<'str>(
         };
         match host.function(function_id).insn(p_term).mnemonic() {
             Mnemonic::Branch(br) => {
-                if br.target != b_id || br.args.len() != params.len() {
+                if BlockId::new(function_id, br.target) != b_id || br.args.len() != params.len() {
                     return false;
                 }
             }
             Mnemonic::CBranch(cb) => {
                 let mut names_b = false;
-                if cb.success_block == b_id {
+                if BlockId::new(function_id, cb.success_block) == b_id {
                     if cb.success_args.len() != params.len() {
                         return false;
                     }
                     names_b = true;
                 }
-                if cb.failure_block == b_id {
+                if BlockId::new(function_id, cb.failure_block) == b_id {
                     if cb.failure_args.len() != params.len() {
                         return false;
                     }
@@ -382,11 +382,11 @@ fn try_bypass_empty_block_generic<'str>(
                 args: substitute(&b_args, &params, &br.args),
             }),
             Mnemonic::CBranch(mut cb) => {
-                if cb.success_block == b_id {
+                if BlockId::new(function_id, cb.success_block) == b_id {
                     cb.success_args = substitute(&b_args, &params, &cb.success_args);
                     cb.success_block = target;
                 }
-                if cb.failure_block == b_id {
+                if BlockId::new(function_id, cb.failure_block) == b_id {
                     cb.failure_args = substitute(&b_args, &params, &cb.failure_args);
                     cb.failure_block = target;
                 }
@@ -408,7 +408,7 @@ fn try_bypass_empty_block_generic<'str>(
             host.remove_cfg_edge(p.func, edge);
         }
         for _ in &redirect {
-            host.add_cfg_edge(p, target);
+            host.add_cfg_edge(p, target_full);
         }
     }
 
@@ -495,7 +495,7 @@ fn merge_candidate_concrete<'a, 'str>(
         .map(|id| {
             matches!(
                 body.insn_ref(cx, id).mnemonic(),
-                Mnemonic::Branch(b) if b.target == b_id
+                Mnemonic::Branch(b) if BlockId::new(a_id.func, b.target) == b_id
             )
         })
         .unwrap_or(false);
@@ -581,11 +581,12 @@ fn try_fold_cbranch_concrete<'a, 'str>(
     body.replace_instruction_mnemonic(cx, term_id, Mnemonic::Branch(Branch { target, args }));
 
     // Collapse the two parallel `block -> target` edges into one: keep the
-    // first, drop the second.
+    // first, drop the second. `target` is a body-local index in this arena.
+    let target_full = BlockId::new(block_id.func, target);
     let dup_edge = body
         .block_ref(cx, block_id)
         .successors()
-        .filter(|&(_, to)| to == target)
+        .filter(|&(_, to)| to == target_full)
         .map(|(e, _)| e)
         .nth(1);
     if let Some(dup_edge) = dup_edge {
@@ -641,13 +642,12 @@ fn try_bypass_empty_block_concrete<'a, 'str>(
             _ => return false,
         }
     };
-    if target == b_id {
+    // `target` is a body-local index in this function's arena (strict IR
+    // locality); a cross-function forward is a `TailCall`, never a `Branch`, so
+    // the old `target.func != function_id` guard is now tautological and dropped.
+    let target_full = BlockId::new(function_id, target);
+    if target_full == b_id {
         return false; // bypassing `goto self` is meaningless and unsound
-    }
-    // Intra-function only: bypassing a block that forwards into another function
-    // (a thunk) is a cross-function edit — left to the module pass.
-    if target.func != function_id {
-        return false;
     }
 
     let params: Vec<BlockParamId> = body.read_host(cx).block(b_id).param_ids().to_vec();
@@ -703,19 +703,19 @@ fn try_bypass_empty_block_concrete<'a, 'str>(
         };
         match body.insn(cx, p_term).mnemonic() {
             Mnemonic::Branch(br) => {
-                if br.target != b_id || br.args.len() != params.len() {
+                if BlockId::new(function_id, br.target) != b_id || br.args.len() != params.len() {
                     return false;
                 }
             }
             Mnemonic::CBranch(cb) => {
                 let mut names_b = false;
-                if cb.success_block == b_id {
+                if BlockId::new(function_id, cb.success_block) == b_id {
                     if cb.success_args.len() != params.len() {
                         return false;
                     }
                     names_b = true;
                 }
-                if cb.failure_block == b_id {
+                if BlockId::new(function_id, cb.failure_block) == b_id {
                     if cb.failure_args.len() != params.len() {
                         return false;
                     }
@@ -745,11 +745,11 @@ fn try_bypass_empty_block_concrete<'a, 'str>(
                 args: substitute(&b_args, &params, &br.args),
             }),
             Mnemonic::CBranch(mut cb) => {
-                if cb.success_block == b_id {
+                if BlockId::new(function_id, cb.success_block) == b_id {
                     cb.success_args = substitute(&b_args, &params, &cb.success_args);
                     cb.success_block = target;
                 }
-                if cb.failure_block == b_id {
+                if BlockId::new(function_id, cb.failure_block) == b_id {
                     cb.failure_args = substitute(&b_args, &params, &cb.failure_args);
                     cb.failure_block = target;
                 }
@@ -771,7 +771,7 @@ fn try_bypass_empty_block_concrete<'a, 'str>(
             body.remove_cfg_edge(cx, edge);
         }
         for _ in &redirect {
-            body.add_cfg_edge(cx, p, target);
+            body.add_cfg_edge(cx, p, target_full);
         }
     }
 
@@ -1204,7 +1204,7 @@ mod tests {
             let Mnemonic::Branch(br) = term.mnemonic() else {
                 panic!("predecessor should end in an unconditional branch");
             };
-            assert_eq!(br.target, t, "predecessor should target t directly");
+            assert_eq!(br.target, t.local, "predecessor should target t directly");
         }
     }
 
@@ -1247,7 +1247,7 @@ mod tests {
             let Mnemonic::Branch(br) = term.mnemonic() else {
                 panic!("expected branch");
             };
-            assert_eq!(br.target, t);
+            assert_eq!(br.target, t.local);
             br.args[0]
         };
         assert_eq!(arg_to_t(a), ValueId::BlockParam(av));
@@ -1289,8 +1289,8 @@ mod tests {
         let Mnemonic::CBranch(cb) = term.mnemonic() else {
             panic!("a should still be a conditional branch");
         };
-        assert_eq!(cb.success_block, t, "the b arm should now target t");
-        assert_eq!(cb.failure_block, other, "the other arm is untouched");
+        assert_eq!(cb.success_block, t.local, "the b arm should now target t");
+        assert_eq!(cb.failure_block, other.local, "the other arm is untouched");
     }
 
     /// A self-looping forwarding block (`goto self`) is never bypassed.
@@ -1412,7 +1412,7 @@ mod tests {
         let Mnemonic::Branch(br) = term.mnemonic() else {
             panic!("identical-armed cbranch should fold to an unconditional branch");
         };
-        assert_eq!(br.target, t);
+        assert_eq!(br.target, t.local);
         assert_eq!(
             BasicBlock::from_id(&ctx, a).successors().count(),
             1,

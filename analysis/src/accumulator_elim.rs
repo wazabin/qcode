@@ -123,17 +123,20 @@ fn classify(
     let cbranch = header_cbranch(ctx, head)?;
     // The loop *continues* through whichever header edge enters the latch
     // directly; the other edge exits. (Multi-block bodies are out of scope.)
-    let (cont_args, exit_block, exit_args, cond_true_is_exit) = if cbranch.success_block == latch {
+    // The header CBranch's targets are body-local indices in the header's arena.
+    let q = |t| BlockId::new(head.func, t);
+    let (cont_args, exit_block, exit_args, cond_true_is_exit) = if q(cbranch.success_block) == latch
+    {
         (
             cbranch.success_args.clone(),
-            cbranch.failure_block,
+            q(cbranch.failure_block),
             cbranch.failure_args.clone(),
             false,
         )
-    } else if cbranch.failure_block == latch {
+    } else if q(cbranch.failure_block) == latch {
         (
             cbranch.failure_args.clone(),
-            cbranch.success_block,
+            q(cbranch.success_block),
             cbranch.success_args.clone(),
             true,
         )

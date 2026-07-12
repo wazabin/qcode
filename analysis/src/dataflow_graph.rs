@@ -230,12 +230,13 @@ impl<'a, 'ctx> Builder<'a, 'ctx> {
             let Some(term) = BasicBlock::from_id(self.ctx, pred).instructions().last() else {
                 continue;
             };
+            let q = |t| BlockId::new(pred.func, t);
             let arg = match term.mnemonic() {
-                Mnemonic::Branch(branch) if branch.target == block => branch.args.get(index),
-                Mnemonic::CBranch(branch) if branch.success_block == block => {
+                Mnemonic::Branch(branch) if q(branch.target) == block => branch.args.get(index),
+                Mnemonic::CBranch(branch) if q(branch.success_block) == block => {
                     branch.success_args.get(index)
                 }
-                Mnemonic::CBranch(branch) if branch.failure_block == block => {
+                Mnemonic::CBranch(branch) if q(branch.failure_block) == block => {
                     branch.failure_args.get(index)
                 }
                 _ => None,
@@ -385,12 +386,15 @@ fn collect_root_params(
                 let Some(term) = BasicBlock::from_id(ctx, pred).instructions().last() else {
                     continue;
                 };
+                let q = |t| BlockId::new(pred.func, t);
                 let arg = match term.mnemonic() {
-                    Mnemonic::Branch(branch) if branch.target == block.id => branch.args.get(index),
-                    Mnemonic::CBranch(branch) if branch.success_block == block.id => {
+                    Mnemonic::Branch(branch) if q(branch.target) == block.id => {
+                        branch.args.get(index)
+                    }
+                    Mnemonic::CBranch(branch) if q(branch.success_block) == block.id => {
                         branch.success_args.get(index)
                     }
-                    Mnemonic::CBranch(branch) if branch.failure_block == block.id => {
+                    Mnemonic::CBranch(branch) if q(branch.failure_block) == block.id => {
                         branch.failure_args.get(index)
                     }
                     _ => None,

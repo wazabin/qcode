@@ -455,7 +455,9 @@ impl<'a, 'str> PassBacking<'a, 'str> {
                 .instructions
                 .last()
                 .and_then(|&id| match host.instruction(id).mnemonic() {
-                    Mnemonic::Branch(branch) if branch.target == other => Some(branch.args.clone()),
+                    Mnemonic::Branch(branch) if BlockId::new(keep.func, branch.target) == other => {
+                        Some(branch.args.clone())
+                    }
                     _ => None,
                 })
                 .unwrap_or_default()

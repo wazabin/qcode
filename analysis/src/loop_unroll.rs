@@ -198,7 +198,7 @@ impl UnrollPlan {
         let loop_nodes = natural_loop(host, edge);
         let preheader = loop_preheader(host, lp.header, &loop_nodes)?;
         let cbranch = header_cbranch(host, lp.header)?;
-        let (exit, exit_args) = header_exit(&loop_nodes, &cbranch)?;
+        let (exit, exit_args) = header_exit(lp.header.func, &loop_nodes, &cbranch)?;
         let preheader_args = branch_args_to(host, preheader, lp.header)?;
         let path = linear_loop_path(host, lp.body, lp.latch, &loop_nodes)?;
 
@@ -376,18 +376,22 @@ fn branch_args_to(host: HostRef, block: BlockId, target: BlockId) -> Option<Vec<
     else {
         return None;
     };
-    (*branch_target == target).then(|| args.clone())
+    (BlockId::new(block.func, *branch_target) == target).then(|| args.clone())
 }
 
 fn header_exit(
+    func: qcode::value::FunctionId,
     loop_nodes: &HashSet<BlockId>,
     cbranch: &CBranch,
 ) -> Option<(BlockId, Vec<ValueId>)> {
-    let success_is_body = loop_nodes.contains(&cbranch.success_block);
-    let failure_is_body = loop_nodes.contains(&cbranch.failure_block);
+    // The header CBranch's targets are body-local indices in `func`'s arena.
+    let sb = BlockId::new(func, cbranch.success_block);
+    let fb = BlockId::new(func, cbranch.failure_block);
+    let success_is_body = loop_nodes.contains(&sb);
+    let failure_is_body = loop_nodes.contains(&fb);
     match (success_is_body, failure_is_body) {
-        (true, false) => Some((cbranch.failure_block, cbranch.failure_args.clone())),
-        (false, true) => Some((cbranch.success_block, cbranch.success_args.clone())),
+        (true, false) => Some((fb, cbranch.failure_args.clone())),
+        (false, true) => Some((sb, cbranch.success_args.clone())),
         _ => None,
     }
 }
@@ -448,7 +452,7 @@ fn remapped_branch_args_to(
     else {
         return None;
     };
-    (*branch_target == target).then(|| remap_values(args, value_map))
+    (BlockId::new(terminator.func, *branch_target) == target).then(|| remap_values(args, value_map))
 }
 
 fn remap_values(values: &[ValueId], value_map: &HashMap<ValueId, ValueId>) -> Vec<ValueId> {
@@ -498,10 +502,25 @@ pub(crate) fn replace_terminator_with_branch<'a, 'str>(
         .last()
         .copied()
         .filter(|&id| body.insn_ref(cx, id).mnemonic().is_terminator());
+    let local_target = target.localize(block.func);
     if let Some(term_id) = term_id {
-        body.replace_instruction_mnemonic(cx, term_id, Mnemonic::Branch(Branch { target, args }));
+        body.replace_instruction_mnemonic(
+            cx,
+            term_id,
+            Mnemonic::Branch(Branch {
+                target: local_target,
+                args,
+            }),
+        );
     } else {
-        let branch = body.push_mnemonic(cx, Mnemonic::Branch(Branch { target, args }), 0);
+        let branch = body.push_mnemonic(
+            cx,
+            Mnemonic::Branch(Branch {
+                target: local_target,
+                args,
+            }),
+            0,
+        );
         let end = body.block_ref(cx, block).instruction_ids().len();
         {
             // TODO(5b-ii): `BaseRef::insert_insn_at_index` is not mirrored on
@@ -543,10 +562,24 @@ pub(crate) fn replace_terminator_with_branch_generic<'str>(
         .last()
         .copied()
         .filter(|&id| host.insn_ref(id).mnemonic().is_terminator());
+    let local_target = target.localize(block.func);
     if let Some(term_id) = term_id {
-        host.replace_instruction_mnemonic(term_id, Mnemonic::Branch(Branch { target, args }));
+        host.replace_instruction_mnemonic(
+            term_id,
+            Mnemonic::Branch(Branch {
+                target: local_target,
+                args,
+            }),
+        );
     } else {
-        let branch = host.push_mnemonic(block.func, Mnemonic::Branch(Branch { target, args }), 0);
+        let branch = host.push_mnemonic(
+            block.func,
+            Mnemonic::Branch(Branch {
+                target: local_target,
+                args,
+            }),
+            0,
+        );
         let end = host.block_ref(block).instruction_ids().len();
         BaseRef::new(&mut *host, block).insert_insn_at_index(end, branch);
     }
@@ -718,8 +751,11 @@ fn first_body_block(
         return None;
     }
 
-    let success_is_body = loop_nodes.contains(&cbranch.success_block);
-    let failure_is_body = loop_nodes.contains(&cbranch.failure_block);
+    // The header CBranch's targets are body-local indices in the header's arena.
+    let sb = BlockId::new(edge.header.func, cbranch.success_block);
+    let fb = BlockId::new(edge.header.func, cbranch.failure_block);
+    let success_is_body = loop_nodes.contains(&sb);
+    let failure_is_body = loop_nodes.contains(&fb);
 
     // The trip-count formula in `condition_bound` treats the header comparison
     // (`i < bound`) as the loop-*continue* condition, i.e. it assumes the body
@@ -728,7 +764,7 @@ fn first_body_block(
     // instead (body on the failure branch), the polarity is inverted and the
     // computed iteration count would be wrong, so refuse to recognize the loop.
     let body = match (success_is_body, failure_is_body) {
-        (true, false) => cbranch.success_block,
+        (true, false) => sb,
         _ => return None,
     };
 
@@ -769,7 +805,7 @@ fn loop_initial_value(
     let Mnemonic::Branch(Branch { target, args }) = host.insn_ref(term_id).mnemonic() else {
         return None;
     };
-    if *target != header {
+    if BlockId::new(preheader.func, *target) != header {
         return None;
     }
     numeric_const(host, *args.get(param_index)?)
@@ -812,7 +848,7 @@ fn latch_step(
     let Mnemonic::Branch(Branch { target, args }) = host.insn_ref(term_id).mnemonic() else {
         return None;
     };
-    if *target != header {
+    if BlockId::new(body.func, *target) != header {
         return None;
     }
     induction_increment(host, *args.get(param_index)?, induction)

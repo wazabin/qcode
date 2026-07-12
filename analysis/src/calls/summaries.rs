@@ -173,19 +173,20 @@ fn incoming_values(ctx: &Context, block: BlockId, index: usize) -> Vec<ValueId> 
         let Some(term) = BasicBlock::from_id(ctx, pred).iter().last() else {
             continue;
         };
+        let q = |t| BlockId::new(pred.func, t);
         match term.mnemonic() {
-            Mnemonic::Branch(br) if br.target == block => {
+            Mnemonic::Branch(br) if q(br.target) == block => {
                 if let Some(&a) = br.args.get(index) {
                     out.push(a);
                 }
             }
             Mnemonic::CBranch(cb) => {
-                if cb.success_block == block
+                if q(cb.success_block) == block
                     && let Some(&a) = cb.success_args.get(index)
                 {
                     out.push(a);
                 }
-                if cb.failure_block == block
+                if q(cb.failure_block) == block
                     && let Some(&a) = cb.failure_args.get(index)
                 {
                     out.push(a);

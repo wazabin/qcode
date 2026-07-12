@@ -250,7 +250,7 @@ fn propagate_block_params(
                 let Some(term) = BasicBlock::from_id(ctx, pred).iter().last() else {
                     continue;
                 };
-                for arg in incoming_args(term.mnemonic(), block.id, index) {
+                for arg in incoming_args(term.mnemonic(), pred.func, block.id, index) {
                     om |= taint.get(&arg).copied().unwrap_or(0);
                 }
             }
@@ -267,22 +267,29 @@ fn propagate_block_params(
     changed
 }
 
-/// The value(s) passed to param `index` of `target` by a terminator `m`.
-fn incoming_args(m: &Mnemonic, target: qcode::value::BlockId, index: usize) -> Vec<ValueId> {
+/// The value(s) passed to param `index` of `target` by a terminator `m` owned by
+/// function `func` (its arena, used to qualify the terminator's local targets).
+fn incoming_args(
+    m: &Mnemonic,
+    func: qcode::value::FunctionId,
+    target: qcode::value::BlockId,
+    index: usize,
+) -> Vec<ValueId> {
+    use qcode::value::BlockId;
     let mut out = Vec::new();
     match m {
-        Mnemonic::Branch(br) if br.target == target => {
+        Mnemonic::Branch(br) if BlockId::new(func, br.target) == target => {
             if let Some(&a) = br.args.get(index) {
                 out.push(a);
             }
         }
         Mnemonic::CBranch(cb) => {
-            if cb.success_block == target
+            if BlockId::new(func, cb.success_block) == target
                 && let Some(&a) = cb.success_args.get(index)
             {
                 out.push(a);
             }
-            if cb.failure_block == target
+            if BlockId::new(func, cb.failure_block) == target
                 && let Some(&a) = cb.failure_args.get(index)
             {
                 out.push(a);

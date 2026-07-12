@@ -1,18 +1,14 @@
-use crate::{
-    context::Context,
-    value::{
-        ValueId,
-        function::FunctionId,
-        insn::{
-            Apply, Assert, Binary, Branch, BranchInd, CBranch, Call, CallInd, Carry, Extract,
-            FloatToFloat, FloatToInt, Gep, IntToFloat, IntrinsicApp, IsFloatNaN, Load, LzCount,
-            Map, PCodeOp, PopCount, Range, Return, ReturnValue, SBorrow, SCarry, Scan, Sext, Store,
-            TailCall, Tuple, Unary, Zext,
-        },
+use crate::value::{
+    ValueId,
+    function::FunctionId,
+    insn::{
+        Apply, Assert, Binary, Branch, BranchInd, CBranch, Call, CallInd, Carry, Extract,
+        FloatToFloat, FloatToInt, Gep, IntToFloat, IntrinsicApp, IsFloatNaN, Load, LzCount, Map,
+        PCodeOp, PopCount, Range, Return, ReturnValue, SBorrow, SCarry, Scan, Sext, Store,
+        TailCall, Tuple, Unary, Zext,
     },
 };
 use smallvec::SmallVec;
-use std::fmt::Formatter;
 
 /// Operand list returned by [`MnemonicKind::args`]. Inline-stores up to two
 /// operands (covering every fixed-arity instruction — binops, casts, loads,
@@ -213,25 +209,18 @@ impl Mnemonic {
     }
 
     /// The statically-known CFG target blocks this mnemonic branches to — the
-    /// `Branch` target and both `CBranch` arms. Empty for non-branch or indirect
-    /// terminators (a `BranchInd` resolves to computed addresses, not a static
-    /// block). Used to detect cross-function branches (thunks / tail calls) whose
-    /// target lives in another function's arena.
-    pub fn target_blocks(&self) -> smallvec::SmallVec<[crate::value::block::BlockId; 2]> {
+    /// `Branch` target and both `CBranch` arms — as bare body-local indices. Empty
+    /// for non-branch or indirect terminators (a `BranchInd` resolves to computed
+    /// addresses, not a static block). Strict IR locality (context-split ruling 2)
+    /// guarantees each target lives in this terminator's own arena, so a caller
+    /// with the owning function in hand recovers the full `BlockId` via
+    /// `BlockId::new(func, local)`.
+    pub fn target_blocks(&self) -> smallvec::SmallVec<[crate::value::LocalBlockId; 2]> {
         match self {
             Mnemonic::Branch(b) => smallvec::smallvec![b.target],
             Mnemonic::CBranch(c) => smallvec::smallvec![c.success_block, c.failure_block],
             _ => smallvec::SmallVec::new(),
         }
-    }
-
-    pub fn fmt(&self, f: &mut Formatter<'_>, ctx: &Context<'_>) -> std::fmt::Result {
-        // The textual rendering is defined once, as tokens, in `segment`; the
-        // `Display` form is those tokens concatenated.
-        for token in super::segment::mnemonic_tokens(ctx, self) {
-            write!(f, "{}", token.text)?;
-        }
-        Ok(())
     }
 
     pub fn args(&self) -> Args {

@@ -104,12 +104,15 @@ fn affine_step(ctx: &Context, v: ValueId, iv: ValueId) -> Option<u64> {
 /// The argument bound to position `k` of `header` by `pred`'s terminator.
 fn incoming_from(ctx: &Context, pred: BlockId, header: BlockId, k: usize) -> Option<ValueId> {
     let &term = ctx.block(pred).instruction_ids().last()?;
+    // Terminator targets are body-local indices in the terminator's own arena
+    // (`pred.func`); qualify to compare against the full `header` id.
+    let q = |t| BlockId::new(pred.func, t);
     match ctx.get_insn(term).mnemonic() {
-        Mnemonic::Branch(b) if b.target == header => b.args.get(k).copied(),
+        Mnemonic::Branch(b) if q(b.target) == header => b.args.get(k).copied(),
         Mnemonic::CBranch(c) => {
-            if c.success_block == header {
+            if q(c.success_block) == header {
                 c.success_args.get(k).copied()
-            } else if c.failure_block == header {
+            } else if q(c.failure_block) == header {
                 c.failure_args.get(k).copied()
             } else {
                 None

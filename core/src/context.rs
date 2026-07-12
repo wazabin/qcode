@@ -790,8 +790,10 @@ impl<'str> Context<'str> {
         }
 
         // Phase 2: with the full map known, remap the clones' operands and block
-        // targets (this resolves forward references between relocated blocks).
-        for &new in block_map.values() {
+        // targets (this resolves forward references between relocated blocks). The
+        // cloned terminators still hold their source block's local targets, so the
+        // remap needs the *old* arena (`old.func`) to qualify them before lookup.
+        for (&old, &new) in &block_map {
             let insns = self.block(new).instructions.clone();
             for insn_id in insns {
                 let mut mnemonic = self.instruction(insn_id).mnemonic().clone();
@@ -810,7 +812,7 @@ impl<'str> Context<'str> {
                         );
                     }
                 }
-                remap_block_targets(&mut mnemonic, &block_map);
+                remap_block_targets(&mut mnemonic, old.func, new.func, &block_map);
                 *self.instruction_mut(insn_id).mnemonic_mut() = mnemonic;
             }
         }
@@ -1021,9 +1023,11 @@ impl<'str> Context<'str> {
             else {
                 continue;
             };
+            // Terminator targets are bare body-local indices in the block's own
+            // arena (`b.func`); qualify to recover the full `BlockId`.
             match mnemonic {
                 Mnemonic::Branch(Branch { target, .. }) => {
-                    if let Some(callee) = foreign_entry(self, target, owner) {
+                    if let Some(callee) = foreign_entry(self, BlockId::new(b.func, target), owner) {
                         tail_calls.push((term_id, callee));
                     }
                 }
@@ -1032,10 +1036,14 @@ impl<'str> Context<'str> {
                     failure_block,
                     ..
                 }) => {
-                    if let Some(callee) = foreign_entry(self, success_block, owner) {
+                    if let Some(callee) =
+                        foreign_entry(self, BlockId::new(b.func, success_block), owner)
+                    {
                         cond_calls.push((term_id, b, callee));
                     }
-                    if let Some(callee) = foreign_entry(self, failure_block, owner) {
+                    if let Some(callee) =
+                        foreign_entry(self, BlockId::new(b.func, failure_block), owner)
+                    {
                         cond_calls.push((term_id, b, callee));
                     }
                 }
@@ -1064,11 +1072,15 @@ impl<'str> Context<'str> {
             let Mnemonic::CBranch(mut cb) = self.instruction(insn).mnemonic().clone() else {
                 continue;
             };
-            if foreign_entry(self, cb.success_block, owner) == Some(callee) {
-                cb.success_block = tramp;
+            // The CBranch and its targets share the terminator's arena (`insn.func`);
+            // qualify the local targets to compare, localize `tramp` on the way in.
+            if foreign_entry(self, BlockId::new(insn.func, cb.success_block), owner) == Some(callee)
+            {
+                cb.success_block = tramp.localize(insn.func);
             }
-            if foreign_entry(self, cb.failure_block, owner) == Some(callee) {
-                cb.failure_block = tramp;
+            if foreign_entry(self, BlockId::new(insn.func, cb.failure_block), owner) == Some(callee)
+            {
+                cb.failure_block = tramp.localize(insn.func);
             }
             self.replace_instruction_mnemonic(insn, Mnemonic::CBranch(cb));
         }
@@ -1897,7 +1909,9 @@ impl<'str> Context<'str> {
                 .instructions
                 .last()
                 .and_then(|&id| match host.instruction(id).mnemonic() {
-                    Mnemonic::Branch(branch) if branch.target == other => Some(branch.args.clone()),
+                    Mnemonic::Branch(branch) if BlockId::new(keep.func, branch.target) == other => {
+                        Some(branch.args.clone())
+                    }
                     _ => None,
                 })
                 .unwrap_or_default()
@@ -2155,11 +2169,22 @@ fn split_generated_suffix(name: &str) -> Option<(&str, u32)> {
 /// Retarget a terminator's static block targets through `block_map` (used by
 /// [`Context::rehome_owned_blocks`] to point relocated branches at the clones).
 /// Value operands are handled separately via [`Mnemonic::replace_value`]; this
-/// only rewrites the [`BlockId`] targets, which are not value operands.
-fn remap_block_targets(mnemonic: &mut Mnemonic, block_map: &HashMap<BlockId, BlockId>) {
-    let remap = |b: &mut BlockId| {
-        if let Some(&new) = block_map.get(b) {
-            *b = new;
+/// only rewrites the block targets, which are not value operands.
+///
+/// Targets are stored as bare body-local indices. A freshly cloned instruction
+/// still holds its *source* block's local index (`old_func`-relative, strict IR
+/// locality ⇒ a terminator's target shares its arena); this qualifies with
+/// `old_func`, looks the full [`BlockId`] up in `block_map`, and re-localizes the
+/// mapped clone against its new arena `new_func`.
+fn remap_block_targets(
+    mnemonic: &mut Mnemonic,
+    old_func: FunctionId,
+    new_func: FunctionId,
+    block_map: &HashMap<BlockId, BlockId>,
+) {
+    let remap = |b: &mut crate::value::LocalBlockId| {
+        if let Some(&new) = block_map.get(&BlockId::new(old_func, *b)) {
+            *b = new.localize(new_func);
         }
     };
     match mnemonic {
@@ -3203,8 +3228,8 @@ mod tests {
             else {
                 panic!("entry must still end in a cbranch");
             };
-            assert_eq!(cb.failure_block, cont, "fall-through arm untouched");
-            let tramp = cb.success_block;
+            assert_eq!(cb.failure_block, cont.local, "fall-through arm untouched");
+            let tramp = BlockId::new(entry.func, cb.success_block);
             assert_eq!(
                 BasicBlock::from_id(&ctx, tramp).parent().map(|f| f.id),
                 Some(f),

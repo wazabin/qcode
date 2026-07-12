@@ -1116,9 +1116,12 @@ impl StandaloneEmulator {
 
         match insn.mnemonic() {
             Mnemonic::Branch(Branch { target, args }) => {
-                self.bind_block_args(ctx, *target, args)
+                // Terminator targets are bare body-local indices in the terminator's
+                // own arena (`id.func`); qualify to the current block's function.
+                let target = BlockId::new(id.func, *target);
+                self.bind_block_args(ctx, target, args)
                     .map_err(|kind| self.make_error(ctx, kind))?;
-                self.block = *target;
+                self.block = target;
                 self.idx = 0;
             }
 
@@ -1199,14 +1202,16 @@ impl StandaloneEmulator {
                 failure_args,
             }) => {
                 let cond_val = self.get_value(ctx, *condition).unwrap();
+                let target = BlockId::new(id.func, *target);
+                let fallthrough = BlockId::new(id.func, *fallthrough);
                 if cond_val != 0 {
-                    self.bind_block_args(ctx, *target, success_args)
+                    self.bind_block_args(ctx, target, success_args)
                         .map_err(|kind| self.make_error(ctx, kind))?;
-                    self.block = *target;
+                    self.block = target;
                 } else {
-                    self.bind_block_args(ctx, *fallthrough, failure_args)
+                    self.bind_block_args(ctx, fallthrough, failure_args)
                         .map_err(|kind| self.make_error(ctx, kind))?;
-                    self.block = *fallthrough;
+                    self.block = fallthrough;
                 }
                 self.idx = 0;
             }

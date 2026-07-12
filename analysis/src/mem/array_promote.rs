@@ -402,8 +402,10 @@ fn append_edge_arg<'str>(
     };
     let term_id = term.id;
     let mut m = term.mnemonic().clone();
+    // The terminator's targets are body-local indices in `from`'s arena.
+    let q = |t| BlockId::new(from.func, t);
     match &mut m {
-        Mnemonic::Branch(Branch { target, args }) if *target == to => args.push(arg),
+        Mnemonic::Branch(Branch { target, args }) if q(*target) == to => args.push(arg),
         Mnemonic::CBranch(CBranch {
             success_block,
             success_args,
@@ -411,10 +413,10 @@ fn append_edge_arg<'str>(
             failure_args,
             ..
         }) => {
-            if *success_block == to {
+            if q(*success_block) == to {
                 success_args.push(arg);
             }
-            if *failure_block == to {
+            if q(*failure_block) == to {
                 failure_args.push(arg);
             }
         }
