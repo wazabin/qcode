@@ -187,8 +187,8 @@ impl<'a, 'ctx> Builder<'a, 'ctx> {
                             self.walk_value(arg, local_sink);
                         }
                     }
-                    mnemonic => {
-                        for arg in mnemonic.args() {
+                    _ => {
+                        for arg in insn.operands() {
                             if is_const(arg) {
                                 continue;
                             }
