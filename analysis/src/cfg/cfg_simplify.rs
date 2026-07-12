@@ -268,10 +268,10 @@ fn try_bypass_empty_block_generic<'str>(
     // B must hold exactly one instruction, an unconditional branch.
     let (term_id, target, b_args) = {
         let b = host.function(function_id).block(b_id);
-        if b.instructions.len() != 1 {
+        if b.instruction_ids().len() != 1 {
             return false;
         }
-        let term_id = b.instructions[0];
+        let term_id = b.instruction_ids()[0];
         match host.function(function_id).insn(term_id).mnemonic() {
             Mnemonic::Branch(br) => (term_id, br.target, br.args.clone()),
             _ => return false,
@@ -286,7 +286,7 @@ fn try_bypass_empty_block_generic<'str>(
         return false;
     }
 
-    let params: Vec<BlockParamId> = host.function(function_id).block(b_id).params.clone();
+    let params: Vec<BlockParamId> = host.function(function_id).block(b_id).param_ids().to_vec();
 
     // B's params must flow nowhere but B's own terminator. In valid SSA a block
     // param is only visible inside dominated blocks via forwarded args, so this
@@ -632,10 +632,10 @@ fn try_bypass_empty_block_concrete<'a, 'str>(
     // B must hold exactly one instruction, an unconditional branch.
     let (term_id, target, b_args) = {
         let b = body.read_host(cx).block(b_id);
-        if b.instructions.len() != 1 {
+        if b.instruction_ids().len() != 1 {
             return false;
         }
-        let term_id = b.instructions[0];
+        let term_id = b.instruction_ids()[0];
         match body.insn(cx, term_id).mnemonic() {
             Mnemonic::Branch(br) => (term_id, br.target, br.args.clone()),
             _ => return false,
@@ -650,7 +650,7 @@ fn try_bypass_empty_block_concrete<'a, 'str>(
         return false;
     }
 
-    let params: Vec<BlockParamId> = body.read_host(cx).block(b_id).params.clone();
+    let params: Vec<BlockParamId> = body.read_host(cx).block(b_id).param_ids().to_vec();
 
     // B's params must flow nowhere but B's own terminator. In valid SSA a block
     // param is only visible inside dominated blocks via forwarded args, so this
@@ -692,7 +692,7 @@ fn try_bypass_empty_block_concrete<'a, 'str>(
     // through a rewritable terminator that names B with a matching arg count on
     // each arm that targets B.
     for &p in &preds {
-        let Some(p_term) = body.read_host(cx).block(p).instructions.last().copied() else {
+        let Some(p_term) = body.read_host(cx).block(p).instruction_ids().last().copied() else {
             return false;
         };
         match body.insn(cx, p_term).mnemonic() {
@@ -1076,7 +1076,7 @@ mod tests {
         simplify_cfg(&mut ctx, f);
 
         assert!(
-            ctx.block(b).instructions.is_empty(),
+            ctx.block(b).instruction_ids().is_empty(),
             "absorbed block `b` must not retain its instructions after merge"
         );
     }
