@@ -228,7 +228,7 @@ pub fn remove_unused_no_pred_block_params_generic<'str>(
         if host_users(host.read_host(), ValueId::BlockParam(param)).is_empty()
             && !host.read_host().block_param(param).protected
         {
-            host.block_param_mut(param).parent = None;
+            host.block_param_mut(param).clear_parent();
             changed = true;
         } else {
             host.block_param_mut(param).index = kept.len();
@@ -279,7 +279,7 @@ pub fn remove_unused_no_pred_block_params_host<'a, 'str>(
         if host_users(body.read_host(cx), ValueId::BlockParam(param)).is_empty()
             && !body.read_host(cx).block_param(param).protected
         {
-            body.block_param_mut(param).parent = None;
+            body.block_param_mut(param).clear_parent();
             changed = true;
         } else {
             body.block_param_mut(param).index = kept.len();

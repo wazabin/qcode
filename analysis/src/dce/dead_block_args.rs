@@ -612,7 +612,7 @@ pub(crate) fn remove_params_from_block_generic<'str>(
     let mut kept = Vec::with_capacity(params.len());
     for (i, &p) in params.iter().enumerate() {
         if dead_indices.contains(&i) {
-            host.block_param_mut(p).parent = None;
+            host.block_param_mut(p).clear_parent();
         } else {
             host.block_param_mut(p).index = kept.len();
             kept.push(p);
@@ -672,7 +672,7 @@ pub(crate) fn remove_params_from_block_host<'a, 'str>(
     let mut kept = Vec::with_capacity(params.len());
     for (i, &p) in params.iter().enumerate() {
         if dead_indices.contains(&i) {
-            body.block_param_mut(p).parent = None;
+            body.block_param_mut(p).clear_parent();
         } else {
             body.block_param_mut(p).index = kept.len();
             kept.push(p);
@@ -741,7 +741,7 @@ pub(crate) fn remove_params_from_block_c<'str>(
     let mut kept = Vec::with_capacity(params.len());
     for (i, &p) in params.iter().enumerate() {
         if dead_indices.contains(&i) {
-            host.block_param_mut(p).parent = None;
+            host.block_param_mut(p).clear_parent();
         } else {
             host.block_param_mut(p).index = kept.len();
             kept.push(p);

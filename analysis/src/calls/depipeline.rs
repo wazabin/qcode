@@ -172,7 +172,7 @@ fn find_pipelined(
             let ValueId::BlockParam(iv_pid) = ptr else {
                 continue;
             };
-            if ctx.block_param(iv_pid).parent != Some(header) {
+            if ctx.block_param(iv_pid).parent_id() != Some(header) {
                 continue;
             }
             let Some(j) = params.iter().position(|&p| p == iv_pid) else {

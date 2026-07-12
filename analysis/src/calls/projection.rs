@@ -135,7 +135,7 @@ pub fn project_return(ctx: &Context, fid: FunctionId, field: usize) -> Option<Pr
                 ValueId::BlockParam(pid) => {
                     proj.block_params.insert(pid);
                     let param = &ctx.block_param(pid);
-                    let Some(parent) = param.parent else {
+                    let Some(parent) = param.parent_id() else {
                         proj.opaque = true;
                         continue;
                     };

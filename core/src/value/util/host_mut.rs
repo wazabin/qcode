@@ -433,7 +433,7 @@ impl<'a, 'str> PassBacking<'a, 'str> {
             self.function_mut(param.func)
                 .users
                 .remove(&ValueId::BlockParam(param));
-            self.block_param_mut(param).parent = None;
+            self.block_param_mut(param).clear_parent();
         }
         self.unroster_block(block);
         let b = self.block_mut(block);

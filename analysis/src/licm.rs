@@ -171,7 +171,7 @@ fn value_is_invariant(
             // A block param defined outside the loop is invariant; one belonging
             // to a loop block is loop-carried (fed across the back-edge), hence
             // variant.
-            match host.block_param(p).parent {
+            match host.block_param(p).parent_id() {
                 Some(block) => !loop_nodes.contains(&block),
                 None => true,
             }

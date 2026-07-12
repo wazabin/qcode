@@ -43,8 +43,11 @@ pub struct BlockParam<'str> {
     /// The type of this parameter's value.
     pub type_id: TypeId,
 
-    /// The block this parameter belongs to.
-    pub parent: Option<BlockId>,
+    /// The block this parameter belongs to. `pub(crate)` (in-crate struct
+    /// construction only): foreign crates read via [`BlockParam::parent_id`] and
+    /// write via [`BlockParam::set_parent`] / [`BlockParam::clear_parent`]
+    /// (stage 6a §11 — full-private pends a cross-module constructor).
+    pub(crate) parent: Option<BlockId>,
 
     /// Optional debug name (displayed as `%name`).
     pub name: Option<Cow<'str, str>>,
@@ -87,6 +90,21 @@ impl<'str> BlockParam<'str> {
             },
         );
         BlockParamMutRef::from_id(ctx, id)
+    }
+
+    /// A detached, unnamed parameter of type `type_id` at position `index`,
+    /// attached to `parent`. Public constructor so foreign crates need not name
+    /// the private `parent` field (stage 6a §11); the caller pushes the returned
+    /// value through [`Context::push_block_param`](crate::context::Context::push_block_param).
+    pub fn new(index: usize, type_id: TypeId, parent: BlockId) -> Self {
+        Self {
+            index,
+            type_id,
+            parent: Some(parent),
+            name: None,
+            origin: None,
+            protected: false,
+        }
     }
 
     pub fn from_id<'ctx>(ctx: &'ctx Context<'str>, id: BlockParamId) -> BlockParamRef<'str, 'ctx> {

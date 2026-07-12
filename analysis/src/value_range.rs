@@ -401,7 +401,7 @@ impl Solver<'_> {
         let ValueId::BlockParam(pid) = v else {
             return top;
         };
-        let Some(parent) = self.ctx.block_param(pid).parent else {
+        let Some(parent) = self.ctx.block_param(pid).parent_id() else {
             return top;
         };
         let Some(k) = BasicBlock::from_id(self.ctx, parent)

@@ -135,7 +135,7 @@ pub fn remove_entry_param(ctx: &mut Context, fid: FunctionId, index: usize) {
         return;
     }
     let removed = params.remove(index);
-    ctx.block_param_mut(removed).parent = None;
+    ctx.block_param_mut(removed).clear_parent();
 
     // Any inferred per-param attributes are indexed by the old positions; drop
     // them rather than reindex. The `param_attrs` pass re-infers afterward.

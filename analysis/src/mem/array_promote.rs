@@ -564,14 +564,7 @@ fn apply_generic<'str>(host: &mut PassBacking<'_, 'str>, m: &PromoteMatch) -> bo
         let index = host.block_ref(bid).num_params();
         let pid = host.push_block_param(
             bid.func,
-            qcode::value::block_param::BlockParam {
-                index,
-                type_id: arr_ty,
-                parent: Some(bid),
-                name: None,
-                origin: None,
-                protected: false,
-            },
+            qcode::value::block_param::BlockParam::new(index, arr_ty, bid),
         );
         host.block_mut(bid).params.push(pid);
         ValueId::BlockParam(pid)

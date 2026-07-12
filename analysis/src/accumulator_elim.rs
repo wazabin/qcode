@@ -468,17 +468,7 @@ fn transform<'str>(
 /// value (host-routed `BasicBlock::push_param` + the `type_id` write).
 fn push_param<'str>(host: &mut PassBacking<'_, 'str>, block: BlockId, ty: TypeId) -> ValueId {
     let index = host.block_ref(block).num_params();
-    let pid = host.push_block_param(
-        block.func,
-        BlockParam {
-            index,
-            type_id: ty,
-            parent: Some(block),
-            name: None,
-            origin: None,
-            protected: false,
-        },
-    );
+    let pid = host.push_block_param(block.func, BlockParam::new(index, ty, block));
     host.block_mut(block).params.push(pid);
     ValueId::BlockParam(pid)
 }

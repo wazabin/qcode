@@ -180,7 +180,7 @@ fn try_match_strlen(host: HostRef, fid: FunctionId) -> Option<StrlenMatch> {
     let ValueId::BlockParam(pid) = index else {
         return None;
     };
-    let header = host.block_param(pid).parent?;
+    let header = host.block_param(pid).parent_id()?;
     // The lane read must live in the header: the NUL test that governs the loop
     // reads it there, and the count is the index at that test.
     if host.insn_ref(at_insn).parent().map(|b| b.id) != Some(header) {

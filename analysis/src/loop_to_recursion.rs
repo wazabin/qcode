@@ -326,17 +326,7 @@ fn push_param<'str>(
     ty: qcode::types::TypeId,
 ) -> ValueId {
     let index = host.block_ref(block).num_params();
-    let pid = host.push_block_param(
-        block.func,
-        BlockParam {
-            index,
-            type_id: ty,
-            parent: Some(block),
-            name: None,
-            origin: None,
-            protected: false,
-        },
-    );
+    let pid = host.push_block_param(block.func, BlockParam::new(index, ty, block));
     host.block_mut(block).params.push(pid);
     ValueId::BlockParam(pid)
 }

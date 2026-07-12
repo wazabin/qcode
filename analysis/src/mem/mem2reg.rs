@@ -870,17 +870,9 @@ impl<'str> Mem2Reg<'_, '_, 'str> {
         // `Int(size)`-typed param and append it to the block's param list.
         let index = self.read().block(block_id).params.len();
         let type_id = self.read().shr().types.get_or_make_int(size);
-        let param_id = self.body.push_block_param(
-            self.cx,
-            BlockParam {
-                index,
-                type_id,
-                parent: Some(block_id),
-                name: None,
-                origin: None,
-                protected: false,
-            },
-        );
+        let param_id = self
+            .body
+            .push_block_param(self.cx, BlockParam::new(index, type_id, block_id));
         self.body.block_mut(block_id).params.push(param_id);
         self.body.block_param_mut(param_id).origin = Some(var);
         // Carry a global varnode type override (e.g. the `FS_OFFSET` segment base
