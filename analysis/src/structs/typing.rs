@@ -204,7 +204,7 @@ fn function_has_struct_types(host: HostRef, fun_id: FunctionId) -> bool {
         b.params().any(|p| is_struct_ish(p.id()))
             || b.iter().any(|i| {
                 is_struct_ish(ValueId::Instruction(i.id))
-                    || i.mnemonic().args().iter().copied().any(is_struct_ish)
+                    || i.operands().iter().copied().any(is_struct_ish)
             })
     })
 }

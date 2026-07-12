@@ -26,7 +26,7 @@ pub fn verify_users_map(ctx: &Context) -> Vec<String> {
     let mut expected: FxHashMap<FunctionId, FxHashMap<ValueId, Vec<InstructionId>>> =
         FxHashMap::default();
     for insn in ctx.instructions() {
-        for arg in insn.mnemonic().args() {
+        for arg in insn.operands() {
             expected
                 .entry(insn.id.func)
                 .or_default()

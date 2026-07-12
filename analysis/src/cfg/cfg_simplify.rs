@@ -332,7 +332,7 @@ fn try_bypass_empty_block_generic<'str>(
         let Some(p_term) = host
             .function(function_id)
             .block(p)
-            .instructions
+            .instruction_ids()
             .last()
             .copied()
         else {
@@ -372,7 +372,7 @@ fn try_bypass_empty_block_generic<'str>(
         let p_term = host
             .function(function_id)
             .block(p)
-            .instructions
+            .instruction_ids()
             .last()
             .copied()
             .unwrap();
@@ -692,7 +692,13 @@ fn try_bypass_empty_block_concrete<'a, 'str>(
     // through a rewritable terminator that names B with a matching arg count on
     // each arm that targets B.
     for &p in &preds {
-        let Some(p_term) = body.read_host(cx).block(p).instruction_ids().last().copied() else {
+        let Some(p_term) = body
+            .read_host(cx)
+            .block(p)
+            .instruction_ids()
+            .last()
+            .copied()
+        else {
             return false;
         };
         match body.insn(cx, p_term).mnemonic() {
@@ -729,7 +735,7 @@ fn try_bypass_empty_block_concrete<'a, 'str>(
         let p_term = body
             .read_host(cx)
             .block(p)
-            .instructions
+            .instruction_ids()
             .last()
             .copied()
             .unwrap();
@@ -1108,7 +1114,7 @@ mod tests {
 
         let mut seen = rustc_hash::FxHashSet::default();
         for block_id in ctx.block_ids() {
-            for &insn in &ctx.block(block_id).instructions {
+            for &insn in ctx.block(block_id).instruction_ids() {
                 assert!(
                     seen.insert(insn),
                     "instruction {insn:?} appears in more than one block after simplify_cfg"

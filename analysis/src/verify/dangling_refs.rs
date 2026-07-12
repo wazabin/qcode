@@ -11,7 +11,7 @@ use qcode::{context::Context, value::ValueId};
 pub fn verify_no_dangling_refs(ctx: &Context) -> Vec<String> {
     let mut out = Vec::new();
     for insn in ctx.instructions() {
-        for arg in insn.mnemonic().args() {
+        for arg in insn.operands() {
             if let ValueId::Instruction(id) = arg
                 && ctx.get_insn(id).is_deleted()
             {

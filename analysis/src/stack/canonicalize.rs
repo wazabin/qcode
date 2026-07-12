@@ -274,7 +274,9 @@ mod tests {
             f.add_block(other);
         }
         let pid = BasicBlock::from_id_mut(&mut tc.ctx, root).push_param(8).id;
-        tc.ctx.block_param_mut(pid).origin = Some(ValueId::Varnode(sp_reg));
+        tc.ctx
+            .block_param_mut(pid)
+            .set_origin_id(ValueId::Varnode(sp_reg));
         let sp = ValueId::BlockParam(pid);
 
         // `load(@SP - 8)` in each block — distinct Sub ValueIds.
