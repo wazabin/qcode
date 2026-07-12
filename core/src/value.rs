@@ -314,6 +314,99 @@ impl Display for ValueId {
     }
 }
 
+/// The **body-local** twin of [`ValueId`]: the form an in-body operand holds once
+/// storage is localized (stage 6a, ruling 2).
+///
+/// It mirrors `ValueId` variant-for-variant, but its arena arms
+/// (`Instruction`/`BasicBlock`/`BlockParam`) carry a **bare function-local index**
+/// (`LocalInsnId`/`LocalBlockId`/`LocalParamId`) with **no** owning `FunctionId` —
+/// SSA is intra-function, so the owning function is the ambient body and does not
+/// need re-storing on every operand. The shared/module arms
+/// (`Literal`/`Bytes`/`Varnode`/`Function`) carry the exact same globally-interned
+/// or module ids as `ValueId` (they are already the boundary currency).
+///
+/// The two forms convert through [`LocalValueId::qualify`] (stamp the ambient
+/// `func`) and [`ValueId::localize`] (drop it, asserting it matched). `ValueId`
+/// stays the qualified boundary currency (module tables, refs, consumer crates);
+/// `LocalValueId` is confined to in-body storage.
+#[non_exhaustive]
+#[derive(Debug, Clone, Copy, Hash, PartialEq, Eq, Serialize, Deserialize)]
+pub enum LocalValueId {
+    /// A compile-time integer constant (module-interned; same id as `ValueId`).
+    Literal(LiteralId),
+    /// A compile-time opaque byte blob (module-interned; same id as `ValueId`).
+    Bytes(BytesId),
+    /// An SSA value produced by an [`Instruction`] — bare body-local index.
+    Instruction(LocalInsnId),
+    /// A control-flow node ([`BasicBlock`]) — bare body-local index.
+    BasicBlock(LocalBlockId),
+    /// A typed block-entry parameter — bare body-local index.
+    BlockParam(LocalParamId),
+    /// A named memory location ([`Varnode`]) (module id; same as `ValueId`).
+    Varnode(VarnodeId),
+    /// A lifted or external [`Function`] (module id; same as `ValueId`).
+    Function(FunctionId),
+}
+
+impl LocalValueId {
+    /// Qualify a body-local id back into the boundary [`ValueId`] by stamping the
+    /// owning function `func` onto the arena arms. Shared/module arms pass through
+    /// unchanged.
+    pub fn qualify(self, func: FunctionId) -> ValueId {
+        match self {
+            LocalValueId::Literal(id) => ValueId::Literal(id),
+            LocalValueId::Bytes(id) => ValueId::Bytes(id),
+            LocalValueId::Varnode(id) => ValueId::Varnode(id),
+            LocalValueId::Function(id) => ValueId::Function(id),
+            LocalValueId::Instruction(local) => {
+                ValueId::Instruction(InstructionId::new(func, local))
+            }
+            LocalValueId::BasicBlock(local) => ValueId::BasicBlock(BlockId::new(func, local)),
+            LocalValueId::BlockParam(local) => ValueId::BlockParam(BlockParamId::new(func, local)),
+        }
+    }
+}
+
+impl ValueId {
+    /// Localize a qualified id for storage inside `func`'s body, dropping the
+    /// owning `FunctionId` from the arena arms. In debug builds this asserts the
+    /// id's `func` equals `func` — the strict-locality tripwire (ruling 2): a
+    /// foreign operand is a bug and fires loudly here rather than misrouting.
+    /// Shared/module arms pass through unchanged.
+    pub fn localize(self, func: FunctionId) -> LocalValueId {
+        match self {
+            ValueId::Literal(id) => LocalValueId::Literal(id),
+            ValueId::Bytes(id) => LocalValueId::Bytes(id),
+            ValueId::Varnode(id) => LocalValueId::Varnode(id),
+            ValueId::Function(id) => LocalValueId::Function(id),
+            ValueId::Instruction(id) => {
+                debug_assert_eq!(
+                    id.func, func,
+                    "localize: foreign instruction operand {id:?} in function {func} \
+                     (strict IR locality, ruling 2)"
+                );
+                LocalValueId::Instruction(id.local)
+            }
+            ValueId::BasicBlock(id) => {
+                debug_assert_eq!(
+                    id.func, func,
+                    "localize: foreign block operand {id:?} in function {func} \
+                     (strict IR locality, ruling 2)"
+                );
+                LocalValueId::BasicBlock(id.local)
+            }
+            ValueId::BlockParam(id) => {
+                debug_assert_eq!(
+                    id.func, func,
+                    "localize: foreign block-param operand {id:?} in function {func} \
+                     (strict IR locality, ruling 2)"
+                );
+                LocalValueId::BlockParam(id.local)
+            }
+        }
+    }
+}
+
 /// Trait implemented by all typed value reference types.
 ///
 /// Provides a uniform interface to a value's [`ValueId`] and its size in bytes.
@@ -501,5 +594,53 @@ impl<'str, 'ctx> Value<'str, 'ctx> for ValueRef<'str, 'ctx> {
 
     fn size(&self) -> usize {
         self.inner().size()
+    }
+}
+
+#[cfg(test)]
+mod local_value_id_tests {
+    use super::*;
+
+    /// Every `ValueId` variant round-trips losslessly through
+    /// `localize(func).qualify(func)`, with the arena arms carrying the given
+    /// `func` and the shared/module arms ignoring it.
+    #[test]
+    fn qualify_localize_round_trips_every_variant() {
+        let func = FunctionId::from(7usize);
+        let other = FunctionId::from(3usize);
+
+        let arena: [ValueId; 3] = [
+            ValueId::Instruction(InstructionId::new(func, LocalInsnId::from(2usize))),
+            ValueId::BasicBlock(BlockId::new(func, LocalBlockId::from(5usize))),
+            ValueId::BlockParam(BlockParamId::new(func, LocalParamId::from(1usize))),
+        ];
+        for id in arena {
+            assert_eq!(id.localize(func).qualify(func), id, "{id:?}");
+        }
+
+        // Shared/module arms pass through regardless of the ambient func.
+        let shared: [ValueId; 4] = [
+            ValueId::Literal(LiteralId::from(0usize)),
+            ValueId::Bytes(BytesId::from(0usize)),
+            ValueId::Varnode(VarnodeId::from(0usize)),
+            ValueId::Function(other),
+        ];
+        for id in shared {
+            assert_eq!(id.localize(func).qualify(func), id, "{id:?}");
+            // Any func requalifies a shared arm to itself — it carries no func.
+            assert_eq!(id.localize(func).qualify(other), id, "{id:?}");
+        }
+    }
+
+    /// `localize` asserts the operand's func matches the ambient body (the
+    /// strict-locality tripwire). A foreign arena id panics in debug builds.
+    #[test]
+    #[should_panic(expected = "strict IR locality")]
+    #[cfg(debug_assertions)]
+    fn localize_rejects_foreign_arena_id() {
+        let func = FunctionId::from(7usize);
+        let foreign = FunctionId::from(9usize);
+        let id = ValueId::Instruction(InstructionId::new(foreign, LocalInsnId::from(0usize)));
+        let _ = id.localize(func);
     }
 }
