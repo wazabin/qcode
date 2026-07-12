@@ -341,17 +341,17 @@ impl<'str> Function<'str> {
     /// linked into both incident blocks' edge sets.
     pub fn add_cfg_edge(&mut self, from: BlockId, to: BlockId) -> EdgeId {
         let edge_id = self.edges.push(EdgeData { from, to });
-        self.block_mut(from).edges.insert((from.func, edge_id));
-        self.block_mut(to).edges.insert((from.func, edge_id));
+        self.block_mut(from).edges.insert(edge_id);
+        self.block_mut(to).edges.insert(edge_id);
         edge_id
     }
 
     /// Remove CFG edge `edge_id`, unlinking it from both incident blocks. The
     /// backing `EdgeData` slot is left dangling.
-    pub fn remove_cfg_edge(&mut self, func: FunctionId, edge_id: EdgeId) {
+    pub fn remove_cfg_edge(&mut self, _func: FunctionId, edge_id: EdgeId) {
         let EdgeData { from, to } = *self.edge(edge_id);
-        self.block_mut(from).edges.remove(&(func, edge_id));
-        self.block_mut(to).edges.remove(&(func, edge_id));
+        self.block_mut(from).edges.remove(&edge_id);
+        self.block_mut(to).edges.remove(&edge_id);
     }
 
     /// Replace every use of `old` with `new` across this body's instructions and
@@ -393,8 +393,7 @@ impl<'str> Function<'str> {
                         .edges
                         .iter()
                         .copied()
-                        .filter(|&(_f, e)| self.edge(e).from == block_id)
-                        .map(|(_, e)| e)
+                        .filter(|&e| self.edge(e).from == block_id)
                         .collect()
                 };
                 for edge_id in succ {
@@ -421,23 +420,21 @@ impl<'str> Function<'str> {
     /// Rehome `remove`'s outgoing CFG edges onto `keep` and drop the direct edge
     /// between them. The caller tombstones `remove`.
     pub fn merge_nodes(&mut self, keep: BlockId, remove: BlockId, direct_edge: EdgeId) {
-        let func = keep.func;
-        self.block_mut(keep).edges.remove(&(func, direct_edge));
-        self.block_mut(remove).edges.remove(&(func, direct_edge));
+        self.block_mut(keep).edges.remove(&direct_edge);
+        self.block_mut(remove).edges.remove(&direct_edge);
         let outgoing: Vec<EdgeId> = {
             let block = self.block(remove);
             block
                 .edges
                 .iter()
                 .copied()
-                .filter(|&(_f, e)| self.edge(e).from == remove)
-                .map(|(_, e)| e)
+                .filter(|&e| self.edge(e).from == remove)
                 .collect()
         };
         for eid in outgoing {
             self.edges[eid].from = keep;
-            self.block_mut(keep).edges.insert((func, eid));
-            self.block_mut(remove).edges.remove(&(func, eid));
+            self.block_mut(keep).edges.insert(eid);
+            self.block_mut(remove).edges.remove(&eid);
         }
     }
 
@@ -481,9 +478,9 @@ impl<'str> Function<'str> {
     /// Remove `block` from this body: unlink every incident CFG edge, remove its
     /// instructions, detach its params, and tombstone it.
     pub fn delete_block(&mut self, block: BlockId) {
-        let edges: Vec<(FunctionId, EdgeId)> = self.block(block).edges.iter().copied().collect();
-        for (func, edge) in edges {
-            self.remove_cfg_edge(func, edge);
+        let edges: Vec<EdgeId> = self.block(block).edges.iter().copied().collect();
+        for edge in edges {
+            self.remove_cfg_edge(block.func, edge);
         }
         let insns: Vec<InstructionId> = self.block(block).instructions.clone();
         for insn in insns {

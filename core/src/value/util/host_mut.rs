@@ -267,15 +267,15 @@ impl<'a, 'str> PassBacking<'a, 'str> {
 
     pub fn add_cfg_edge(&mut self, from: BlockId, to: BlockId) -> EdgeId {
         let edge_id = self.push_edge(from.func, EdgeData { from, to });
-        self.block_mut(from).edges.insert((from.func, edge_id));
-        self.block_mut(to).edges.insert((from.func, edge_id));
+        self.block_mut(from).edges.insert(edge_id);
+        self.block_mut(to).edges.insert(edge_id);
         edge_id
     }
 
     pub fn remove_cfg_edge(&mut self, func: FunctionId, edge_id: EdgeId) {
         let EdgeData { from, to } = *self.read_host().edge(func, edge_id);
-        self.block_mut(from).edges.remove(&(func, edge_id));
-        self.block_mut(to).edges.remove(&(func, edge_id));
+        self.block_mut(from).edges.remove(&edge_id);
+        self.block_mut(to).edges.remove(&edge_id);
     }
 
     pub fn replace_all_uses_with(&mut self, old: ValueId, new: ValueId) {
@@ -321,8 +321,7 @@ impl<'a, 'str> PassBacking<'a, 'str> {
                         .edges
                         .iter()
                         .copied()
-                        .filter(|&(f, e)| host.edge(f, e).from == block_id)
-                        .map(|(_, e)| e)
+                        .filter(|&e| host.edge(block_id.func, e).from == block_id)
                         .collect()
                 };
                 for edge_id in succ {
@@ -351,22 +350,21 @@ impl<'a, 'str> PassBacking<'a, 'str> {
 
     pub fn merge_nodes(&mut self, keep: BlockId, remove: BlockId, direct_edge: EdgeId) {
         let func = keep.func;
-        self.block_mut(keep).edges.remove(&(func, direct_edge));
-        self.block_mut(remove).edges.remove(&(func, direct_edge));
+        self.block_mut(keep).edges.remove(&direct_edge);
+        self.block_mut(remove).edges.remove(&direct_edge);
         let outgoing: Vec<EdgeId> = {
             let host = self.read_host();
             host.block(remove)
                 .edges
                 .iter()
                 .copied()
-                .filter(|&(f, e)| host.edge(f, e).from == remove)
-                .map(|(_, e)| e)
+                .filter(|&e| host.edge(func, e).from == remove)
                 .collect()
         };
         for eid in outgoing {
             self.function_mut(func).edges[eid].from = keep;
-            self.block_mut(keep).edges.insert((func, eid));
-            self.block_mut(remove).edges.remove(&(func, eid));
+            self.block_mut(keep).edges.insert(eid);
+            self.block_mut(remove).edges.remove(&eid);
         }
     }
 
@@ -416,15 +414,15 @@ impl<'a, 'str> PassBacking<'a, 'str> {
     }
 
     pub fn delete_block(&mut self, block: BlockId, _function_id: FunctionId) {
-        let edges: Vec<(FunctionId, EdgeId)> = self
+        let edges: Vec<EdgeId> = self
             .read_host()
             .block(block)
             .edges
             .iter()
             .copied()
             .collect();
-        for (func, edge) in edges {
-            self.remove_cfg_edge(func, edge);
+        for edge in edges {
+            self.remove_cfg_edge(block.func, edge);
         }
         let insns: Vec<InstructionId> = self.read_host().block(block).instructions.clone();
         for insn in insns {

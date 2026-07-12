@@ -744,8 +744,8 @@ impl<'str> Context<'str> {
             "cross-function CFG edge {from:?} -> {to:?} (strict IR locality, ruling 2)"
         );
         let edge_id = self.push_edge(from.func, EdgeData { from, to });
-        BasicBlock::from_id_mut(self, from).add_edge(from.func, edge_id);
-        BasicBlock::from_id_mut(self, to).add_edge(from.func, edge_id);
+        BasicBlock::from_id_mut(self, from).add_edge(edge_id);
+        BasicBlock::from_id_mut(self, to).add_edge(edge_id);
         edge_id
     }
 
@@ -756,8 +756,8 @@ impl<'str> Context<'str> {
     /// per-block traversal reads the block edge sets, which this updates.
     pub fn remove_cfg_edge(&mut self, func: FunctionId, edge_id: EdgeId) {
         let &EdgeData { from, to } = self.edge(func, edge_id);
-        BasicBlock::from_id_mut(self, from).remove_edge(func, edge_id);
-        BasicBlock::from_id_mut(self, to).remove_edge(func, edge_id);
+        BasicBlock::from_id_mut(self, from).remove_edge(edge_id);
+        BasicBlock::from_id_mut(self, to).remove_edge(edge_id);
     }
 
     /// Relocate every block in `olds` — currently owned by `target` but *stored*
@@ -819,11 +819,11 @@ impl<'str> Context<'str> {
         // the moved endpoint(s) to the clone. Collect the incident edge ids first
         // (an edge between two relocated blocks appears in both edge sets — the set
         // dedups it).
-        // Each incident edge is already tagged with the function whose arena stores
-        // it (a block's edge set holds `(FunctionId, EdgeId)` pairs).
+        // A block's edge set holds bare body-local `EdgeId`s; recover the storing
+        // function from the incident block itself (its own `id.func`).
         let mut incident: HashSet<(FunctionId, EdgeId)> = HashSet::default();
         for &old in olds {
-            incident.extend(self.block(old).edges.iter().copied());
+            incident.extend(self.block(old).edges.iter().map(|&e| (old.func, e)));
         }
         for (edge_func, edge) in incident {
             let EdgeData { from, to } = *self.edge(edge_func, edge);
@@ -1079,12 +1079,12 @@ impl<'str> Context<'str> {
         // blocks (a precondition of the storage relocation below).
         let mut stale: HashSet<(FunctionId, EdgeId)> = HashSet::default();
         for &b in &tail {
-            for (edge_func, edge) in self.block(b).edges.iter().copied() {
-                let &EdgeData { from, to } = self.edge(edge_func, edge);
+            for edge in self.block(b).edges.iter().copied() {
+                let &EdgeData { from, to } = self.edge(b.func, edge);
                 let cross = self.block(from).parent != self.block(to).parent;
                 let touches_tail = tail_set.contains(&from) || tail_set.contains(&to);
                 if cross && touches_tail {
-                    stale.insert((edge_func, edge));
+                    stale.insert((b.func, edge));
                 }
             }
         }
@@ -1824,37 +1824,36 @@ impl<'str> Context<'str> {
     /// Rehome `remove`'s outgoing CFG edges onto `keep` and drop the direct edge.
     pub fn merge_nodes(&mut self, keep: BlockId, remove: BlockId, direct_edge: EdgeId) {
         let func = keep.func;
-        self.block_mut(keep).edges.remove(&(func, direct_edge));
-        self.block_mut(remove).edges.remove(&(func, direct_edge));
+        self.block_mut(keep).edges.remove(&direct_edge);
+        self.block_mut(remove).edges.remove(&direct_edge);
         let outgoing: Vec<EdgeId> = {
             let host = self.read_host();
             host.block(remove)
                 .edges
                 .iter()
                 .copied()
-                .filter(|&(f, e)| host.edge(f, e).from == remove)
-                .map(|(_, e)| e)
+                .filter(|&e| host.edge(func, e).from == remove)
                 .collect()
         };
         for eid in outgoing {
             self.function_mut(func).edges[eid].from = keep;
-            self.block_mut(keep).edges.insert((func, eid));
-            self.block_mut(remove).edges.remove(&(func, eid));
+            self.block_mut(keep).edges.insert(eid);
+            self.block_mut(remove).edges.remove(&eid);
         }
     }
 
     /// Remove `block` from its function (unlink edges, remove instructions,
     /// detach params, tombstone).
     pub fn delete_block(&mut self, block: BlockId, _function_id: FunctionId) {
-        let edges: Vec<(FunctionId, EdgeId)> = self
+        let edges: Vec<EdgeId> = self
             .read_host()
             .block(block)
             .edges
             .iter()
             .copied()
             .collect();
-        for (func, edge) in edges {
-            self.remove_cfg_edge(func, edge);
+        for edge in edges {
+            self.remove_cfg_edge(block.func, edge);
         }
         let insns: Vec<InstructionId> = self.read_host().block(block).instructions.clone();
         for insn in insns {
