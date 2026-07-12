@@ -371,7 +371,7 @@ fn collect_root_params(
     }
     match value {
         ValueId::Instruction(id) => {
-            for arg in Instruction::from_id(ctx, id).mnemonic().args() {
+            for arg in Instruction::from_id(ctx, id).operands() {
                 collect_root_params(ctx, arg, root_params, seen, out);
             }
         }
