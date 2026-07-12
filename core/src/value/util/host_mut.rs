@@ -199,7 +199,7 @@ impl<'a, 'str> PassBacking<'a, 'str> {
         for arg in args {
             self.function_mut(func)
                 .users
-                .entry(arg)
+                .entry(arg.strip_func())
                 .or_default()
                 .push(id);
         }
@@ -292,11 +292,11 @@ impl<'a, 'str> PassBacking<'a, 'str> {
                 .replace_value(old, new);
             self.function_mut(func)
                 .users
-                .entry(new)
+                .entry(new.strip_func())
                 .or_default()
                 .push(user);
         }
-        self.function_mut(func).users.remove(&old);
+        self.function_mut(func).users.remove(&old.strip_func());
     }
 
     pub fn remove_instruction(&mut self, id: InstructionId) {
@@ -339,7 +339,7 @@ impl<'a, 'str> PassBacking<'a, 'str> {
 
         self.instruction_mut(id).deleted = true;
         for arg in args {
-            if let Some(users) = self.function_mut(id.func).users.get_mut(&arg) {
+            if let Some(users) = self.function_mut(id.func).users.get_mut(&arg.strip_func()) {
                 users.retain(|u| *u != id);
             }
         }
@@ -375,14 +375,15 @@ impl<'a, 'str> PassBacking<'a, 'str> {
             (m.args().into_iter().collect::<Vec<_>>(), m.call_target())
         };
         for arg in old_args {
-            let now_empty = if let Some(users) = self.function_mut(func).users.get_mut(&arg) {
-                users.retain(|&u| u != id);
-                users.is_empty()
-            } else {
-                false
-            };
+            let now_empty =
+                if let Some(users) = self.function_mut(func).users.get_mut(&arg.strip_func()) {
+                    users.retain(|&u| u != id);
+                    users.is_empty()
+                } else {
+                    false
+                };
             if now_empty {
-                self.function_mut(func).users.remove(&arg);
+                self.function_mut(func).users.remove(&arg.strip_func());
             }
         }
         if let Some(target) = old_target {
@@ -396,7 +397,7 @@ impl<'a, 'str> PassBacking<'a, 'str> {
         for arg in new_args {
             self.function_mut(func)
                 .users
-                .entry(arg)
+                .entry(arg.strip_func())
                 .or_default()
                 .push(id);
         }
@@ -432,7 +433,7 @@ impl<'a, 'str> PassBacking<'a, 'str> {
         for param in params {
             self.function_mut(param.func)
                 .users
-                .remove(&ValueId::BlockParam(param));
+                .remove(&ValueId::BlockParam(param).strip_func());
             self.block_param_mut(param).clear_parent();
         }
         self.unroster_block(block);

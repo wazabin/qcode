@@ -405,6 +405,25 @@ impl ValueId {
             }
         }
     }
+
+    /// Drop the owning `FunctionId` from the arena arms **without** a locality
+    /// check, using the id's *own* embedded func. Unlike [`localize`](Self::localize)
+    /// there is no ambient function to assert against: this is for keying a
+    /// per-function body map (e.g. `Function.users`) by a value that already
+    /// carries its own func. Within one body's map every arena key has that
+    /// body's func, so stripping it is injective and lookup-stable; shared/module
+    /// arms pass through unchanged.
+    pub fn strip_func(self) -> LocalValueId {
+        match self {
+            ValueId::Literal(id) => LocalValueId::Literal(id),
+            ValueId::Bytes(id) => LocalValueId::Bytes(id),
+            ValueId::Varnode(id) => LocalValueId::Varnode(id),
+            ValueId::Function(id) => LocalValueId::Function(id),
+            ValueId::Instruction(id) => LocalValueId::Instruction(id.local),
+            ValueId::BasicBlock(id) => LocalValueId::BasicBlock(id.local),
+            ValueId::BlockParam(id) => LocalValueId::BlockParam(id.local),
+        }
+    }
 }
 
 /// Trait implemented by all typed value reference types.

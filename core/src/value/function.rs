@@ -15,8 +15,8 @@ use crate::{
     context::Context,
     error::{Error, ErrorTy, Result},
     value::{
-        BasicBlock, BlockId, BlockRef, Instruction, InstructionId, Value, ValueId, Varnode,
-        VarnodeId,
+        BasicBlock, BlockId, BlockRef, Instruction, InstructionId, LocalValueId, Value, ValueId,
+        Varnode, VarnodeId,
         block::EdgeData,
         block::cfg::{EdgeId, LocalBlockId},
         block_param::{BlockParam, BlockParamId, LocalParamId},
@@ -132,8 +132,13 @@ pub struct Function<'str> {
     /// [`remove_instructions`](crate::context::Context::remove_instructions),
     /// [`Context::replace_all_uses_with`](crate::context::Context::replace_all_uses_with),
     /// and [`Context::replace_instruction_mnemonic`](crate::context::Context::replace_instruction_mnemonic).
+    ///
+    /// Keyed by the body-local [`LocalValueId`] form of each used value (the
+    /// owning func is this body's, so it is stripped — see
+    /// [`ValueId::strip_func`]); the value list stays composite
+    /// [`InstructionId`]s.
     #[serde(default)]
-    pub(crate) users: FxHashMap<ValueId, Vec<InstructionId>>,
+    pub(crate) users: FxHashMap<LocalValueId, Vec<InstructionId>>,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -201,12 +206,16 @@ impl<'str> Function<'str> {
     /// This function's instructions that use `value` as an operand (see
     /// [`users`](Self::users)). Empty for a value this function never uses.
     pub fn users_of(&self, value: ValueId) -> &[InstructionId] {
-        self.users.get(&value).map(Vec::as_slice).unwrap_or(&[])
+        self.users
+            .get(&value.strip_func())
+            .map(Vec::as_slice)
+            .unwrap_or(&[])
     }
 
-    /// Iterate this function's recorded `(value, users)` reverse-use entries.
-    /// Read-only; used by the users-map consistency verifier.
-    pub fn user_map_entries(&self) -> impl Iterator<Item = (ValueId, &[InstructionId])> {
+    /// Iterate this function's recorded `(value, users)` reverse-use entries, with
+    /// keys in their stored body-local form (qualify via the owning func at the
+    /// [`FunctionRef`] wrapper). Read-only; used by the users-map consistency verifier.
+    pub fn user_map_entries(&self) -> impl Iterator<Item = (LocalValueId, &[InstructionId])> {
         self.users.iter().map(|(v, u)| (*v, u.as_slice()))
     }
 
@@ -287,7 +296,7 @@ impl<'str> Function<'str> {
         let local = self.insns.push(insn);
         let id = InstructionId::new(func, local);
         for arg in args {
-            self.users.entry(arg).or_default().push(id);
+            self.users.entry(arg.strip_func()).or_default().push(id);
         }
         id
     }
@@ -383,9 +392,9 @@ impl<'str> Function<'str> {
         let users: Vec<InstructionId> = self.users_of(old).to_vec();
         for user in users {
             self.insn_mut(user).mnemonic_mut().replace_value(old, new);
-            self.users.entry(new).or_default().push(user);
+            self.users.entry(new.strip_func()).or_default().push(user);
         }
-        self.users.remove(&old);
+        self.users.remove(&old.strip_func());
     }
 
     /// Remove instruction `id` from its block, unlink its outgoing CFG edges if a
@@ -428,7 +437,7 @@ impl<'str> Function<'str> {
 
         self.insn_mut(id).deleted = true;
         for arg in args {
-            if let Some(users) = self.users.get_mut(&arg) {
+            if let Some(users) = self.users.get_mut(&arg.strip_func()) {
                 users.retain(|u| *u != id);
             }
         }
@@ -465,14 +474,14 @@ impl<'str> Function<'str> {
             .into_iter()
             .collect::<Vec<_>>();
         for arg in old_args {
-            let now_empty = if let Some(users) = self.users.get_mut(&arg) {
+            let now_empty = if let Some(users) = self.users.get_mut(&arg.strip_func()) {
                 users.retain(|&u| u != id);
                 users.is_empty()
             } else {
                 false
             };
             if now_empty {
-                self.users.remove(&arg);
+                self.users.remove(&arg.strip_func());
             }
         }
         *self.insn_mut(id).mnemonic_mut() = mnemonic;
@@ -483,7 +492,7 @@ impl<'str> Function<'str> {
             .into_iter()
             .collect::<Vec<_>>();
         for arg in new_args {
-            self.users.entry(arg).or_default().push(id);
+            self.users.entry(arg.strip_func()).or_default().push(id);
         }
     }
 
@@ -505,7 +514,7 @@ impl<'str> Function<'str> {
         }
         let params: Vec<BlockParamId> = self.block(block).params.clone();
         for param in params {
-            self.users.remove(&ValueId::BlockParam(param));
+            self.users.remove(&ValueId::BlockParam(param).strip_func());
             self.block_param_mut(param).clear_parent();
         }
         self.unroster_block(block);
@@ -746,7 +755,10 @@ where
     /// Iterate this function's recorded `(value, users)` reverse-use entries
     /// (see [`Function::user_map_entries`]).
     pub fn user_map_entries(&'s self) -> impl Iterator<Item = (ValueId, &'ctx [InstructionId])> {
-        self.inner().user_map_entries()
+        let func = self.id;
+        self.inner()
+            .user_map_entries()
+            .map(move |(v, u)| (v.qualify(func), u))
     }
 
     /// Resolve a block/instruction/param `name` within this function's local name

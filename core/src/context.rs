@@ -1134,7 +1134,7 @@ impl<'str> Context<'str> {
             let args = self.bodies[func].insns[id.local].mnemonic().args();
             let users = &mut self.bodies[func].users;
             for arg in args {
-                users.entry(arg).or_default().push(id);
+                users.entry(arg.strip_func()).or_default().push(id);
             }
         }
     }
@@ -1329,7 +1329,11 @@ impl<'str> Context<'str> {
         let local = self.bodies[func].insns.push(insn);
         let id = InstructionId::new(func, local);
         for arg in args {
-            self.bodies[func].users.entry(arg).or_default().push(id);
+            self.bodies[func]
+                .users
+                .entry(arg.strip_func())
+                .or_default()
+                .push(id);
         }
         if let Some(target) = call_target {
             self.shared
@@ -1411,7 +1415,7 @@ impl<'str> Context<'str> {
             self.bodies[id.func].insns[id.local].deleted = true;
         }
         for (func, arg) in affected_args {
-            if let Some(users) = self.bodies[func].users.get_mut(&arg) {
+            if let Some(users) = self.bodies[func].users.get_mut(&arg.strip_func()) {
                 users.retain(|u| !dead.contains(u));
             }
         }
@@ -1639,11 +1643,11 @@ impl<'str> Context<'str> {
                 .replace_value(old, new);
             self.bodies[func]
                 .users
-                .entry(new)
+                .entry(new.strip_func())
                 .or_default()
                 .push(user_id);
         }
-        self.bodies[func].users.remove(&old);
+        self.bodies[func].users.remove(&old.strip_func());
     }
 
     /// Replaces one instruction's mnemonic and keeps the reverse use map in sync.
@@ -1656,12 +1660,12 @@ impl<'str> Context<'str> {
         let old_args = self.instruction(id).mnemonic().args();
         for arg in old_args {
             let mut remove_arg = false;
-            if let Some(users) = self.bodies[func].users.get_mut(&arg) {
+            if let Some(users) = self.bodies[func].users.get_mut(&arg.strip_func()) {
                 users.retain(|&user| user != id);
                 remove_arg = users.is_empty();
             }
             if remove_arg {
-                self.bodies[func].users.remove(&arg);
+                self.bodies[func].users.remove(&arg.strip_func());
             }
         }
 
@@ -1676,7 +1680,11 @@ impl<'str> Context<'str> {
         *Instruction::from_id_mut(self, id).mnemonic_mut() = mnemonic;
 
         for arg in self.instruction(id).mnemonic().args() {
-            self.bodies[func].users.entry(arg).or_default().push(id);
+            self.bodies[func]
+                .users
+                .entry(arg.strip_func())
+                .or_default()
+                .push(id);
         }
         if let Some(target) = self.instruction(id).mnemonic().call_target() {
             self.shared
@@ -1866,7 +1874,7 @@ impl<'str> Context<'str> {
         for param in params {
             self.function_mut(param.func)
                 .users
-                .remove(&ValueId::BlockParam(param));
+                .remove(&ValueId::BlockParam(param).strip_func());
             self.block_param_mut(param).clear_parent();
         }
         self.unroster_block(block);

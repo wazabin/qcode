@@ -412,7 +412,7 @@ impl<'str, 'ctx> InstructionMutRef<'str, 'ctx> {
         // Operand uses are recorded in this instruction's own function map.
         let func = self.id.func;
         for arg in old_args {
-            if let Some(users) = self.ctx.bodies[func].users.get_mut(&arg) {
+            if let Some(users) = self.ctx.bodies[func].users.get_mut(&arg.strip_func()) {
                 users.retain(|&user| user != self.id);
             }
         }
@@ -420,7 +420,7 @@ impl<'str, 'ctx> InstructionMutRef<'str, 'ctx> {
         for arg in new_args {
             self.ctx.bodies[func]
                 .users
-                .entry(arg)
+                .entry(arg.strip_func())
                 .or_default()
                 .push(self.id);
         }
