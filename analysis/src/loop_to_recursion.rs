@@ -230,7 +230,9 @@ fn transform<'str>(
                 value_map.insert(ValueId::BlockParam(pid), np);
             }
         }
-        minted.function_mut(rec).root = Some(block_map[&model.head]);
+        minted
+            .function_mut(rec)
+            .set_root_id(Some(block_map[&model.head]));
 
         // Pass 2: clone every non-terminator instruction (and the terminator of a
         // non-latch block), remapping block targets now (the map is complete) and

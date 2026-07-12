@@ -73,7 +73,9 @@ pub struct FunctionInterface<'str> {
 #[derive(Clone, serde::Serialize, serde::Deserialize)]
 pub struct Function<'str> {
     /// The entry block (dominates all other blocks in this function).
-    pub root: Option<BlockId>,
+    /// Private: read via [`Function::root_id`], write via
+    /// [`Function::set_root_id`] (stage 6a §11).
+    root: Option<BlockId>,
 
     /// Instruction storage for this function. Function-scoped: the composite
     /// [`InstructionId`](crate::value::InstructionId) `{ func, local }` indexes

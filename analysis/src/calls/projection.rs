@@ -76,7 +76,7 @@ impl Projection {
 /// itself an aggregate is left to the caller's scalar-only handling; the slice is
 /// still computed over its components.
 pub fn project_return(ctx: &Context, fid: FunctionId, field: usize) -> Option<Projection> {
-    let root = ctx.bodies[fid].root?;
+    let root = ctx.bodies[fid].root_id()?;
 
     // Map every instruction to its block once, and collect the block list, for
     // control-dependence reachability below.

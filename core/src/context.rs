@@ -856,10 +856,10 @@ impl<'str> Context<'str> {
         }
 
         // Phase 5: re-point the function root if it was relocated.
-        if let Some(root) = self.bodies[target].root
+        if let Some(root) = self.bodies[target].root_id()
             && let Some(&new_root) = block_map.get(&root)
         {
-            self.bodies[target].root = Some(new_root);
+            self.bodies[target].set_root_id(Some(new_root));
         }
 
         // Phase 6: delete the originals (unlinks their old edges, removes their
@@ -990,7 +990,7 @@ impl<'str> Context<'str> {
         for &b in &tail {
             Function::from_id_mut(self, g).add_block(b);
         }
-        self.bodies[g].root = Some(block);
+        self.bodies[g].set_root_id(Some(block));
 
         // Resolve a static terminator target to the foreign function whose *entry* it
         // is, from the perspective of `owner`.
@@ -3141,7 +3141,7 @@ mod tests {
             assert_eq!(addrs(&ctx, f), vec![0x1000]);
             assert_eq!(addrs(&ctx, g), vec![0x2000, 0x2005]);
             let g_entry = block_at_addr(&ctx, g, 0x2000);
-            assert_eq!(ctx.bodies[g].root, Some(g_entry));
+            assert_eq!(ctx.bodies[g].root_id(), Some(g_entry));
 
             // Every G block is self-stored.
             for b in Function::from_id(&ctx, g).block_ids() {

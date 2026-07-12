@@ -592,7 +592,7 @@ mod tests {
         let fun = build_fn(&mut tc, "stub", 0x1000, |b| {
             b.push_load::<false>(ValueId::Varnode(r0), 8, reg);
         });
-        let root = tc.ctx.bodies[fun].root.unwrap();
+        let root = tc.ctx.bodies[fun].root_id().unwrap();
         // Orphan the root, as the splitter used to leave it.
         qcode::value::Function::from_id_mut(&mut tc.ctx, fun).remove_block(root);
         // Best-effort, and specifically no panic.
