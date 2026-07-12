@@ -1023,7 +1023,7 @@ fn apply_partial(ctx: &mut Context, fid: FunctionId, promoted: &[Promoted]) -> b
         // the in-loop reload forward to this param so a later round region-promotes
         // the buffer. Only the offset-0 snapshot equals `*base` exactly.
         if ns.offset == 0 {
-            ctx.block_param_mut(val_pid).origin = Some(ns.base);
+            ctx.block_param_mut(val_pid).set_origin_id(ns.base);
         }
         seeds.push((
             ns.base,

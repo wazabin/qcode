@@ -108,7 +108,7 @@ pub(crate) fn arg_index_of(ctx: &Context, fid: FunctionId, name: &str) -> Option
 pub(crate) fn address_taken_set(ctx: &Context) -> FxHashSet<FunctionId> {
     let mut set = FxHashSet::default();
     for insn in ctx.instructions() {
-        for arg in insn.mnemonic().args() {
+        for arg in insn.operands() {
             if let ValueId::Function(fid) = arg {
                 set.insert(fid);
             }
