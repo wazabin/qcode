@@ -99,6 +99,37 @@ impl<'str> BlockParam<'str> {
     ) -> BlockParamMutRef<'str, 'ctx> {
         BlockParamMutRef::from_id(ctx, id)
     }
+
+    /// The block this parameter belongs to, if any (raw `&BlockParam` accessor).
+    /// Routing target for the raw `.parent` field reads (stage 6a §11);
+    /// localizes behind this accessor at the storage flip.
+    pub fn parent_id(&self) -> Option<BlockId> {
+        self.parent
+    }
+
+    /// Attach this parameter to `block` (raw `&mut BlockParam` accessor).
+    pub fn set_parent(&mut self, block: BlockId) {
+        self.parent = Some(block);
+    }
+
+    /// Detach this parameter from its owning block (raw `&mut BlockParam`
+    /// accessor). Routing target for the raw `.parent = None` field writes.
+    pub fn clear_parent(&mut self) {
+        self.parent = None;
+    }
+
+    /// The source value this parameter was created to promote, if recorded (raw
+    /// `&BlockParam` accessor). Routing target for the raw `.origin` field reads
+    /// (stage 6a §11); localizes behind this accessor at the storage flip.
+    pub fn origin_id(&self) -> Option<ValueId> {
+        self.origin
+    }
+
+    /// Record the source value this parameter promotes (raw `&mut BlockParam`
+    /// accessor; see [`BlockParam::origin`]).
+    pub fn set_origin_id(&mut self, origin: ValueId) {
+        self.origin = Some(origin);
+    }
 }
 
 // Shared read-only methods available on both BlockParamRef and BlockParamMutRef

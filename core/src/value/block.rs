@@ -78,6 +78,21 @@ pub struct BasicBlock<'str> {
 }
 
 impl<'str> BasicBlock<'str> {
+    /// The ids of the instructions in this block, in order (raw `&BasicBlock`
+    /// accessor). Routing target for the raw `.instructions` field reads (stage
+    /// 6a §11); the field itself becomes private and localizes behind this
+    /// accessor at the storage flip.
+    pub fn instruction_ids(&self) -> &[InstructionId] {
+        &self.instructions
+    }
+
+    /// The ids of this block's parameters, in declaration order (raw
+    /// `&BasicBlock` accessor). Routing target for the raw `.params` field reads
+    /// (stage 6a §11).
+    pub fn param_ids(&self) -> &[BlockParamId] {
+        &self.params
+    }
+
     /// Gets a reference to a block from its ID
     pub fn from_id<'ctx>(ctx: &'ctx Context<'str>, id: BlockId) -> BlockRef<'str, 'ctx> {
         BlockRef::new(HostRef::Module(ctx), id)

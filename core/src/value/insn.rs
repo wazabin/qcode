@@ -186,6 +186,19 @@ where
         &self.inner().mnemonic
     }
 
+    /// The operands consumed by this instruction, as qualified [`ValueId`]s.
+    ///
+    /// This is the func-qualifying, pass-facing operand accessor (stage 6a §11,
+    /// option b): it is the routing target for the `insn.mnemonic().args()`
+    /// call sites. Today it forwards `MnemonicKind::args`
+    /// verbatim; once in-body operand storage flips to `LocalValueId`, only this
+    /// body changes — it qualifies each local operand with the owning function
+    /// (`self.id.func`), which a bare `&Mnemonic` cannot do — so every caller
+    /// keeps seeing qualified `ValueId`s unchanged.
+    pub fn operands(&'s self) -> mnemonic::Args {
+        self.mnemonic().args()
+    }
+
     /// The address of the corresponding instruction
     pub fn address(&'s self) -> Option<u64> {
         self.inner().address

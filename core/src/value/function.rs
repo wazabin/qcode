@@ -208,6 +208,21 @@ impl<'str> Function<'str> {
         self.users.iter().map(|(v, u)| (*v, u.as_slice()))
     }
 
+    /// This function's entry block id, if any (raw `&Function` accessor).
+    /// Routing target for the raw `.root` field reads (stage 6a §11); localizes
+    /// behind this accessor at the storage flip.
+    pub fn root_id(&self) -> Option<BlockId> {
+        self.root
+    }
+
+    /// Sets this function's entry block id directly, without the rostering /
+    /// address bookkeeping of [`FunctionMutRef::set_root`]. Routing target for
+    /// the raw `.root = …` field writes whose callers have already rostered the
+    /// block (stage 6a §11).
+    pub fn set_root_id(&mut self, root: Option<BlockId>) {
+        self.root = root;
+    }
+
     // ---- function-local raw arena accessors (context-split stage 5a) --------
     //
     // Resolve a composite id against *this* body by its `local` half alone,
