@@ -868,13 +868,13 @@ impl<'str> Mem2Reg<'_, '_, 'str> {
 
         // Host-routed mirror of `BasicBlock::push_param(size)`: mint an
         // `Int(size)`-typed param and append it to the block's param list.
-        let index = self.read().block(block_id).params.len();
+        let index = self.read().block(block_id).param_ids().len();
         let type_id = self.read().shr().types.get_or_make_int(size);
         let param_id = self
             .body
             .push_block_param(self.cx, BlockParam::new(index, type_id, block_id));
         self.body.block_mut(block_id).params.push(param_id);
-        self.body.block_param_mut(param_id).origin = Some(var);
+        self.body.block_param_mut(param_id).set_origin_id(var);
         // Carry a global varnode type override (e.g. the `FS_OFFSET` segment base
         // typed `PtrTo<TEB>` by `windows_teb_seed`) onto the promoted param, so the
         // ambient register's richer type survives mem2reg instead of decaying to
@@ -2244,7 +2244,7 @@ mod tests {
             .set_root(block)
             .unwrap();
         let pid = BasicBlock::from_id_mut(&mut tc.ctx, block).push_param(8).id;
-        tc.ctx.block_param_mut(pid).origin = Some(ValueId::Varnode(sp_reg));
+        tc.ctx.block_param_mut(pid).set_origin_id(ValueId::Varnode(sp_reg));
         tc.ctx.block_param_mut(pid).name = Some("RSP".into());
         let sp = ValueId::BlockParam(pid);
 
@@ -2318,7 +2318,7 @@ mod tests {
             .set_root(block)
             .unwrap();
         let pid = BasicBlock::from_id_mut(&mut tc.ctx, block).push_param(8).id;
-        tc.ctx.block_param_mut(pid).origin = Some(ValueId::Varnode(sp_reg));
+        tc.ctx.block_param_mut(pid).set_origin_id(ValueId::Varnode(sp_reg));
         let sp = ValueId::BlockParam(pid);
 
         {
