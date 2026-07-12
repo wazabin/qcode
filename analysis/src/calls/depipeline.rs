@@ -103,7 +103,7 @@ fn affine_step(ctx: &Context, v: ValueId, iv: ValueId) -> Option<u64> {
 
 /// The argument bound to position `k` of `header` by `pred`'s terminator.
 fn incoming_from(ctx: &Context, pred: BlockId, header: BlockId, k: usize) -> Option<ValueId> {
-    let &term = ctx.block(pred).instructions.last()?;
+    let &term = ctx.block(pred).instruction_ids().last()?;
     match ctx.get_insn(term).mnemonic() {
         Mnemonic::Branch(b) if b.target == header => b.args.get(k).copied(),
         Mnemonic::CBranch(c) => {
@@ -238,7 +238,7 @@ fn find_pipelined(
 /// forward the carry's uses to it, drop the param, and record the disjointness
 /// assumption that justifies the re-read.
 fn apply(ctx: &mut Context, fid: FunctionId, p: &Pipelined) {
-    let first = *ctx.block(p.header).instructions.first().unwrap();
+    let first = *ctx.block(p.header).instruction_ids().first().unwrap();
 
     // iv − step  (same width as the induction variable).
     let iv_ty = ctx.type_of(p.iv);

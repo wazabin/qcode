@@ -338,7 +338,7 @@ fn clone_expr(
     let mut map: HashMap<InstructionId, ValueId> = HashMap::default();
     for &iid in order {
         let mut m = ctx.get_insn(iid).mnemonic().clone();
-        for op in ctx.get_insn(iid).mnemonic().args() {
+        for op in ctx.get_insn(iid).operands() {
             let new = resolve(op, &map);
             if new != op {
                 m.replace_value(op, new);

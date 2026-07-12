@@ -128,7 +128,7 @@ pub fn project_return(ctx: &Context, fid: FunctionId, field: usize) -> Option<Pr
                     if let Some(&b) = insn_block.get(&id) {
                         sliced_blocks.insert(b);
                     }
-                    for arg in ctx.get_insn(id).mnemonic().args() {
+                    for arg in ctx.get_insn(id).operands() {
                         worklist.push(arg);
                     }
                 }

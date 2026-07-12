@@ -156,7 +156,7 @@ fn compute_function_attrs(
                 }
                 Mnemonic::BranchInd(b) => revoke_both(&mut result, m(b.ptr)),
                 Mnemonic::PCodeOp(_) | Mnemonic::Map(_) | Mnemonic::Scan(_) => {
-                    for arg in insn.mnemonic().args() {
+                    for arg in insn.operands() {
                         revoke_both(&mut result, m(arg));
                     }
                 }
@@ -194,7 +194,7 @@ fn compute_taint(ctx: &Context, fid: FunctionId, n_params: usize) -> HashMap<Val
                     continue;
                 }
                 let mut om: Mask = 0;
-                for arg in insn.mnemonic().args() {
+                for arg in insn.operands() {
                     om |= taint.get(&arg).copied().unwrap_or(0);
                 }
                 if om == 0 {

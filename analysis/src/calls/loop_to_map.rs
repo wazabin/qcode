@@ -188,7 +188,7 @@ fn body_uses_index(
     match pure_slice(host, stored_val, &inputs) {
         Some(slice) => slice
             .iter()
-            .any(|&iid| host.insn_ref(iid).mnemonic().args().contains(&index)),
+            .any(|&iid| host.insn_ref(iid).operands().contains(&index)),
         None => false,
     }
 }
