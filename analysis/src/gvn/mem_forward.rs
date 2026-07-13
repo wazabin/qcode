@@ -37,7 +37,7 @@ use qcode::{
     assumption::Proposition,
     space::{Space, SpaceId, SpaceType},
     value::{
-        Value, ValueId, ValueRef, Varnode, VarnodeId,
+        FunctionId, LocalValueId, Value, ValueId, ValueRef, Varnode, VarnodeId,
         block::BlockId,
         insn::{Binary, Binop, IntBinop, Load, Mnemonic, Range, Store, Zext},
         util::base_ref::HostRef,
@@ -169,12 +169,13 @@ impl MemForward {
     /// load can reuse the result.
     pub(super) fn define_load(
         &mut self,
+        func: FunctionId,
         load: &Load,
         value: ValueId,
         aliases: Option<&AliasResult>,
         numbering: &Numbering,
     ) {
-        let (base, start) = locate(load.ptr, load.space, aliases, numbering);
+        let (base, start) = locate(load.ptr.qualify(func), load.space, aliases, numbering);
         for (i, off) in (start..start + load.size as i64).enumerate() {
             self.byte_map.insert(
                 (base, off),
@@ -218,28 +219,31 @@ impl MemForward {
         &mut self,
         body: &mut FunctionBody<'_, 'str>,
         cx: ContextView<'_, 'str>,
+        func: FunctionId,
         store: &Store,
         aliases: Option<&AliasResult>,
         numbering: &Numbering,
     ) {
-        let (base, start) = locate(store.ptr, store.space, aliases, numbering);
+        let store_ptr = store.ptr.qualify(func);
+        let store_src = store.src.qualify(func);
+        let (base, start) = locate(store_ptr, store.space, aliases, numbering);
         let end = start + store.size as i64;
 
         self.byte_map.retain(|&(cb, _), _| {
-            cb == base || cross_base_disjoint(body.read_host(cx), aliases, store.ptr, base, cb)
+            cb == base || cross_base_disjoint(body.read_host(cx), aliases, store_ptr, base, cb)
         });
 
         for off in start..end {
             self.byte_map.remove(&(base, off));
         }
-        let covered = ValueRef::from_host(body.read_host(cx), store.src)
+        let covered = ValueRef::from_host(body.read_host(cx), store_src)
             .size()
             .min(store.size);
         for (i, off) in (start..start + covered as i64).enumerate() {
             self.byte_map.insert(
                 (base, off),
                 Cell {
-                    src: store.src,
+                    src: store_src,
                     src_off: i,
                 },
             );
@@ -270,7 +274,12 @@ impl MemForward {
         aliases: Option<&AliasResult>,
         numbering: &Numbering,
     ) -> Option<ValueId> {
-        let (base, start) = locate(load.ptr, load.space, aliases, numbering);
+        let (base, start) = locate(
+            load.ptr.qualify(insn_id.func),
+            load.space,
+            aliases,
+            numbering,
+        );
         let end = start + load.size as i64;
         let segments = self.segments(base, start, end)?;
         let load_size = load.size;
@@ -310,8 +319,8 @@ impl MemForward {
                         cx,
                         Mnemonic::Binop(Binary {
                             op: Binop::Int(IntBinop::Or),
-                            lhs,
-                            rhs: piece,
+                            lhs: lhs.localize(block_id.func),
+                            rhs: piece.localize(block_id.func),
                         }),
                         load_size,
                     );
@@ -373,7 +382,7 @@ impl MemForward {
             let r = body.push_mnemonic(
                 cx,
                 Mnemonic::Range(Range {
-                    src: seg.src,
+                    src: seg.src.localize(block_id.func),
                     start: seg.src_off,
                     size: seg.size,
                 }),
@@ -389,7 +398,7 @@ impl MemForward {
             let z = body.push_mnemonic(
                 cx,
                 Mnemonic::Zext(Zext {
-                    src: extracted,
+                    src: extracted.localize(block_id.func),
                     size: load_size,
                 }),
                 load_size,
@@ -409,8 +418,8 @@ impl MemForward {
             cx,
             Mnemonic::Binop(Binary {
                 op: Binop::Int(IntBinop::ShiftLeft),
-                lhs: widened,
-                rhs: shamt,
+                lhs: widened.localize(block_id.func),
+                rhs: shamt.localize(block_id.func),
             }),
             load_size,
         );
@@ -457,8 +466,13 @@ impl MemForward {
             _ => None,
         };
 
+        let qual = |v: LocalValueId| v.qualify(block_id.func);
         let (clobbers, escaping, unknown_callee): (CallClobbers, Vec<ValueId>, bool) = match &term {
-            Some(Mnemonic::CallInd(call)) => (CallClobbers::AllRegisters, call.args.clone(), true),
+            Some(Mnemonic::CallInd(call)) => (
+                CallClobbers::AllRegisters,
+                call.args.iter().map(|&a| qual(a)).collect(),
+                true,
+            ),
             Some(Mnemonic::Call(call)) => {
                 let callee = host.function_ref(call.target);
                 let regs = match callee.clobbered_regs() {
@@ -476,8 +490,8 @@ impl MemForward {
                     .iter()
                     .enumerate()
                     .filter(|&(j, _)| !callee.param_attr(j).is_some_and(|a| a.readonly))
-                    .map(|(_, &v)| v)
-                    .chain(call.clobbers.iter().copied())
+                    .map(|(_, &v)| qual(v))
+                    .chain(call.clobbers.iter().map(|&c| qual(c)))
                     .collect();
                 (regs, escaping, false)
             }
@@ -603,7 +617,7 @@ impl MemForward {
         let Mnemonic::Load(load) = host.insn_ref(id).mnemonic().clone() else {
             return None;
         };
-        let (base, start) = locate(load.ptr, load.space, aliases, numbering);
+        let (base, start) = locate(load.ptr.qualify(id.func), load.space, aliases, numbering);
         let segs = self.segments(base, start, start + load.size as i64)?;
         let [seg] = segs.as_slice() else { return None };
         (seg.load_off == 0
@@ -719,11 +733,12 @@ impl MemForward {
         let store_locs: Vec<(Base, i64, i64, ValueId)> = stores
             .iter()
             .map(|store| {
+                let store_ptr = store.ptr.qualify(block_id.func);
                 let (sb, s) =
-                    self.resolve_loaded_ptr(host, store.ptr, store.space, aliases, numbering, peel);
+                    self.resolve_loaded_ptr(host, store_ptr, store.space, aliases, numbering, peel);
                 let rep = match sb {
                     Base::Symbolic(_, bv) => bv,
-                    Base::Pinned(_) => store.ptr,
+                    Base::Pinned(_) => store_ptr,
                 };
                 (sb, s, store.size as i64, rep)
             })
@@ -756,21 +771,21 @@ mod tests {
     use qcode::value::{BasicBlock, Function};
 
     /// A store of `src` (width = location width) to varnode `vn`.
-    fn store_to(tc: &TestContext, vn: VarnodeId, src: ValueId) -> Store {
+    fn store_to(tc: &TestContext, func: FunctionId, vn: VarnodeId, src: ValueId) -> Store {
         let v = Varnode::from_id(&tc.ctx, vn);
         Store {
             space: v.space().id,
-            ptr: ValueId::Varnode(vn),
-            src,
+            ptr: ValueId::Varnode(vn).localize(func),
+            src: src.localize(func),
             size: v.size(),
         }
     }
 
-    fn load_of(tc: &TestContext, vn: VarnodeId) -> Load {
+    fn load_of(tc: &TestContext, func: FunctionId, vn: VarnodeId) -> Load {
         let v = Varnode::from_id(&tc.ctx, vn);
         Load {
             space: v.space().id,
-            ptr: ValueId::Varnode(vn),
+            ptr: ValueId::Varnode(vn).localize(func),
             size: v.size(),
         }
     }
@@ -864,17 +879,17 @@ mod tests {
         let byte = tc.ctx.get_const(0xAA, 1).id();
         let aliases = manual_aliases(&tc, &[tc.r0_lo32, tc.r0_byte0]);
         let (space, start, _) = aliases.interval(ValueId::Varnode(tc.r0_lo32)).unwrap();
+        let fid = tc.ctx.anon_function();
 
         let base = Base::Pinned(space);
         let start = start as i64;
-        let wide_store = store_to(&tc, tc.r0_lo32, wide);
-        let byte_store = store_to(&tc, tc.r0_byte0, byte);
+        let wide_store = store_to(&tc, fid, tc.r0_lo32, wide);
+        let byte_store = store_to(&tc, fid, tc.r0_byte0, byte);
         let nb = Numbering::default();
         let mut mf = MemForward::default();
-        let fid = tc.ctx.anon_function();
         with_body(&mut tc, fid, |body, cx| {
-            mf.record_store_c(body, cx, &wide_store, Some(&aliases), &nb);
-            mf.record_store_c(body, cx, &byte_store, Some(&aliases), &nb);
+            mf.record_store_c(body, cx, fid, &wide_store, Some(&aliases), &nb);
+            mf.record_store_c(body, cx, fid, &byte_store, Some(&aliases), &nb);
         });
 
         assert_eq!(mf.byte_map[&(base, start)].src, byte, "byte 0 overwritten");
@@ -965,8 +980,8 @@ mod tests {
             let slot = b.push_sub(aligned, c78).id();
             let store = Store {
                 space: ram,
-                ptr: slot,
-                src: val,
+                ptr: slot.localize(root.func),
+                src: val.localize(root.func),
                 size: 8,
             };
             b.push_call(callee);
@@ -983,7 +998,7 @@ mod tests {
 
         let mut mf = MemForward::default();
         with_body(&mut tc, fid, |body, cx| {
-            mf.record_store_c(body, cx, &slot_store, Some(&aliases), &nb);
+            mf.record_store_c(body, cx, root.func, &slot_store, Some(&aliases), &nb);
         });
         // A plain caller-frame `@SP - 4` cell, for contrast: its base is the `@SP`
         // param (classified CallerFrame), so it is not own-frame-private.
@@ -1023,19 +1038,19 @@ mod tests {
         let narrow = tc.ctx.get_const(0x1234, 2).id(); // 2-byte src
         let aliases = manual_aliases(&tc, &[tc.r0_lo32]);
         let (space, start, _) = aliases.interval(ValueId::Varnode(tc.r0_lo32)).unwrap();
+        let fid = tc.ctx.anon_function();
         // Hand-built 4-byte store of a 2-byte value (src width < store size).
         let store = Store {
             space,
-            ptr: ValueId::Varnode(tc.r0_lo32),
-            src: narrow,
+            ptr: ValueId::Varnode(tc.r0_lo32).localize(fid),
+            src: narrow.localize(fid),
             size: 4,
         };
         let base = Base::Pinned(space);
         let start = start as i64;
         let mut mf = MemForward::default();
-        let fid = tc.ctx.anon_function();
         with_body(&mut tc, fid, |body, cx| {
-            mf.record_store_c(body, cx, &store, Some(&aliases), &Numbering::default());
+            mf.record_store_c(body, cx, fid, &store, Some(&aliases), &Numbering::default());
         });
 
         assert_eq!(mf.byte_map.len(), 4, "all four written bytes are defined");
@@ -1069,15 +1084,15 @@ mod tests {
         let src = tc.ctx.get_const(0x42, 4).id();
         let aliases = manual_aliases(&tc, &[tc.r0_lo32]);
 
-        let store = store_to(&tc, tc.r0_lo32, src);
-        let load = load_of(&tc, tc.r0_lo32);
+        let store = store_to(&tc, block_id.func, tc.r0_lo32, src);
+        let load = load_of(&tc, block_id.func, tc.r0_lo32);
         let nb = Numbering::default();
         // A dummy instruction id to insert before; none is created here because
         // an exact forward materializes nothing.
         let dummy = qcode::value::InstructionId::default();
         let mut mf = MemForward::default();
         let forwarded = with_body(&mut tc, block_id.func, |body, cx| {
-            mf.record_store_c(body, cx, &store, Some(&aliases), &nb);
+            mf.record_store_c(body, cx, block_id.func, &store, Some(&aliases), &nb);
             mf.try_load_c(body, cx, block_id, dummy, &load, Some(&aliases), &nb)
         })
         .expect("exact forward");
@@ -1178,7 +1193,7 @@ mod tests {
             cid,
             Mnemonic::Call(Call {
                 target: callee,
-                args: vec![arg],
+                args: vec![arg.localize(cid.func)],
                 clobbers: vec![],
             }),
         );

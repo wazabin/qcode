@@ -232,7 +232,7 @@ pub(crate) fn relate_address(
     }
     if let ValueId::Instruction(id) = addr
         && let Mnemonic::Gep(g) = ctx.get_insn(id).mnemonic()
-        && g.base == base
+        && g.base.qualify(id.func) == base
     {
         return AddressRelation::Const(g.offset as i64);
     }

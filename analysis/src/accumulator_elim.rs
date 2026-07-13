@@ -59,7 +59,7 @@ use qcode::{
     },
 };
 
-use crate::loop_to_recursion::recognize_loop;
+use crate::loop_to_recursion::{recognize_loop, substitute_operands};
 use crate::pipeline::{ContextView, FunctionBody, Minted, Outcome};
 use crate::{FunctionPass, register_function_pass};
 
@@ -125,19 +125,22 @@ fn classify(
     // directly; the other edge exits. (Multi-block bodies are out of scope.)
     // The header CBranch's targets are body-local indices in the header's arena.
     let q = |t| BlockId::new(head.func, t);
+    let qa = |args: &[qcode::value::LocalValueId]| -> Vec<ValueId> {
+        args.iter().map(|a| a.qualify(head.func)).collect()
+    };
     let (cont_args, exit_block, exit_args, cond_true_is_exit) = if q(cbranch.success_block) == latch
     {
         (
-            cbranch.success_args.clone(),
+            qa(&cbranch.success_args),
             q(cbranch.failure_block),
-            cbranch.failure_args.clone(),
+            qa(&cbranch.failure_args),
             false,
         )
     } else if q(cbranch.failure_block) == latch {
         (
-            cbranch.failure_args.clone(),
+            qa(&cbranch.failure_args),
             q(cbranch.success_block),
-            cbranch.success_args.clone(),
+            qa(&cbranch.success_args),
             true,
         )
     } else {
@@ -191,7 +194,12 @@ fn classify(
         .iter()
         .map(|&arg| head_param_deps(ctx, arg, &body_bindings, &head_index))
         .collect();
-    let cond_deps = head_param_deps(ctx, cbranch.condition, &body_bindings, &head_index);
+    let cond_deps = head_param_deps(
+        ctx,
+        cbranch.condition.qualify(head.func),
+        &body_bindings,
+        &head_index,
+    );
 
     let mut is_driver = vec![false; m];
     for &i in &cond_deps {
@@ -317,7 +325,7 @@ fn transform<'str>(
         let cond = clone_cross(
             own,
             &mut minted,
-            p.cbranch.condition,
+            p.cbranch.condition.qualify(model.head.func),
             &mut driver_subst,
             &p.body_bindings,
             g_head,
@@ -375,7 +383,7 @@ fn transform<'str>(
                 rec,
                 Mnemonic::Apply(Apply {
                     target: g,
-                    args: driver_next,
+                    args: driver_next.into_iter().map(|a| a.localize(g)).collect(),
                 }),
                 tuple_ty,
             );
@@ -430,7 +438,10 @@ fn transform<'str>(
         root,
         Mnemonic::Apply(Apply {
             target: g,
-            args: driver_init,
+            args: driver_init
+                .into_iter()
+                .map(|a| a.localize(root.func))
+                .collect(),
         }),
         tuple_ty,
     );
@@ -444,7 +455,10 @@ fn transform<'str>(
         let field = push_typed(
             &mut host,
             root,
-            Mnemonic::Extract(Extract { agg: t, index: pos }),
+            Mnemonic::Extract(Extract {
+                agg: t.localize(root.func),
+                index: pos,
+            }),
             field_ty,
         );
         host_subst.insert(ValueId::BlockParam(p.head_params[i]), field);
@@ -556,12 +570,18 @@ fn clone_cross<'str>(
                 (r.mnemonic().clone(), r.type_id())
             };
             let mut remapped = mnemonic.clone();
-            for op in mnemonic.args() {
-                let new_op = clone_cross(read, write, op, subst, bindings, target);
-                if new_op != op {
-                    remapped.replace_value(op, new_op);
-                }
-            }
+            let pairs: Vec<_> = mnemonic
+                .args()
+                .into_iter()
+                .filter_map(|op| {
+                    // The operand is bare-local in the *read* function's arena; the
+                    // rebuilt value lives in the minted function's arena.
+                    let q = op.qualify(id.func);
+                    let new_op = clone_cross(read, write, q, subst, bindings, target);
+                    (new_op != q).then(|| (op, new_op.localize(target.func)))
+                })
+                .collect();
+            substitute_operands(&mut remapped, &pairs);
             push_typed(write, target, remapped, type_id)
         }
         _ => val,
@@ -593,12 +613,16 @@ fn clone_self<'str>(
                 (r.mnemonic().clone(), r.type_id())
             };
             let mut remapped = mnemonic.clone();
-            for op in mnemonic.args() {
-                let new_op = clone_self(host, op, subst, bindings, target);
-                if new_op != op {
-                    remapped.replace_value(op, new_op);
-                }
-            }
+            let pairs: Vec<_> = mnemonic
+                .args()
+                .into_iter()
+                .filter_map(|op| {
+                    let q = op.qualify(id.func);
+                    let new_op = clone_self(host, q, subst, bindings, target);
+                    (new_op != q).then(|| (op, new_op.localize(target.func)))
+                })
+                .collect();
+            substitute_operands(&mut remapped, &pairs);
             push_typed(host, target, remapped, type_id)
         }
         _ => val,
@@ -618,7 +642,7 @@ fn header_cbranch(host: HostRef, header: BlockId) -> Option<CBranch> {
 fn block_return_value(host: HostRef, block: BlockId) -> Option<ValueId> {
     let term = block_terminator(host, block)?;
     match host.insn_ref(term).mnemonic() {
-        Mnemonic::ReturnValue(rv) => Some(rv.value),
+        Mnemonic::ReturnValue(rv) => Some(rv.value.qualify(term.func)),
         _ => None,
     }
 }
@@ -658,7 +682,7 @@ mod tests {
         let root = Function::from_id(ctx, fun).root().expect("root").id;
         let term = block_terminator(HostRef::Module(ctx), root)?;
         let ret = match Instruction::from_id(ctx, term).mnemonic() {
-            Mnemonic::ReturnValue(r) => r.value,
+            Mnemonic::ReturnValue(r) => r.value.qualify(term.func),
             _ => return None,
         };
         let mut emu = StandaloneEmulator::new(root);

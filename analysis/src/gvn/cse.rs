@@ -14,7 +14,7 @@
 //! key/emit split, and idempotence argument.
 
 use qcode::value::{
-    ValueId,
+    LocalValueId, ValueId,
     insn::{Binop, FloatBinop, IntBinop, Mnemonic},
 };
 
@@ -85,7 +85,12 @@ impl<'str> SubPassC<'str> for Cse {
         state.record_form(ic.id, form.clone());
         let key = key_for(&form, ic.id, ic.mnemonic);
 
-        state.seed_operand_leaders(ic.mnemonic.args());
+        state.seed_operand_leaders(
+            ic.mnemonic
+                .args()
+                .into_iter()
+                .map(|a| a.qualify(ic.insn_id.func)),
+        );
 
         if let Some(leader) = state.lookup(&key) {
             if leader != ic.id {
@@ -163,11 +168,26 @@ pub(super) fn normalize(m: &mut Mnemonic) {
     if let Mnemonic::Binop(b) = m
         && is_commutative(&b.op)
     {
-        let l = value_id_key(b.lhs);
-        let r = value_id_key(b.rhs);
+        let l = value_id_key_local(b.lhs);
+        let r = value_id_key_local(b.rhs);
         if l > r {
             std::mem::swap(&mut b.lhs, &mut b.rhs);
         }
+    }
+}
+
+/// [`value_id_key`] over the bare-local operand form: same ranks, local indices.
+/// Within one body the two orders agree (the func component is constant).
+pub(super) fn value_id_key_local(v: LocalValueId) -> (u8, usize) {
+    match v {
+        LocalValueId::Literal(x) => (0, x.into()),
+        LocalValueId::Instruction(x) => (1, usize::from(x)),
+        LocalValueId::Varnode(x) => (2, x.into()),
+        LocalValueId::BasicBlock(x) => (3, usize::from(x)),
+        LocalValueId::Function(x) => (4, x.into()),
+        LocalValueId::BlockParam(x) => (5, usize::from(x)),
+        LocalValueId::Bytes(x) => (6, x.into()),
+        _ => (u8::MAX, usize::MAX),
     }
 }
 
@@ -182,8 +202,8 @@ mod tests {
     fn test_normalize() {
         let mut m = Mnemonic::Binop(Binary {
             op: Binop::Int(IntBinop::Add),
-            lhs: ValueId::Instruction(InstructionId::default()),
-            rhs: ValueId::Literal(0.into()),
+            lhs: ValueId::Instruction(InstructionId::default()).strip_func(),
+            rhs: ValueId::Literal(0.into()).strip_func(),
         });
 
         normalize(&mut m);
@@ -191,8 +211,8 @@ mod tests {
             m,
             Mnemonic::Binop(Binary {
                 op: Binop::Int(IntBinop::Add),
-                lhs: ValueId::Literal(0.into()),
-                rhs: ValueId::Instruction(InstructionId::default()),
+                lhs: ValueId::Literal(0.into()).strip_func(),
+                rhs: ValueId::Instruction(InstructionId::default()).strip_func(),
             }),
             "normalize should swap operands to canonicalize commutative binop"
         );
@@ -419,8 +439,8 @@ mod tests {
     /// `Instruction(0)`), otherwise `a + b` and `b + a` value-number differently.
     #[test]
     fn normalize_orders_equal_indices_across_value_id_variants() {
-        let a = ValueId::Literal(0usize.into());
-        let b = ValueId::Instruction(InstructionId::default());
+        let a = ValueId::Literal(0usize.into()).strip_func();
+        let b = ValueId::Instruction(InstructionId::default()).strip_func();
         let make = |lhs, rhs| {
             Mnemonic::Binop(Binary {
                 op: Binop::Int(IntBinop::Add),
@@ -567,7 +587,7 @@ mod tests {
         for &id in BasicBlock::from_id(&ctx, entry).instruction_ids() {
             for arg in ctx.get_insn(id).mnemonic().args() {
                 assert_ne!(
-                    lit_value(&ctx, arg),
+                    lit_value(&ctx, arg.qualify(id.func)),
                     Some(0xffff_fff8),
                     "rebuild must use signed `sub 8`, not `add 0xfffffff8`"
                 );
@@ -582,7 +602,7 @@ mod tests {
                 rhs,
                 ..
             }) = ctx.get_insn(id).mnemonic()
-                && lit_value(&ctx, *rhs) == Some(8)
+                && lit_value(&ctx, rhs.qualify(id.func)) == Some(8)
             {
                 found_sub_by_8 = true;
             }

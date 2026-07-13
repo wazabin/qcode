@@ -100,17 +100,17 @@ fn try_match(host: HostRef, fid: FunctionId) -> Option<ReadsMatch> {
             match insn.mnemonic() {
                 Mnemonic::Load(l) if is_temp(l.space) => accesses.push(Acc {
                     id: insn.id,
-                    ptr: l.ptr,
+                    ptr: l.ptr.qualify(insn.id.func),
                     size: l.size,
                     space: l.space,
                     stored: None,
                 }),
                 Mnemonic::Store(s) if is_temp(s.space) => accesses.push(Acc {
                     id: insn.id,
-                    ptr: s.ptr,
+                    ptr: s.ptr.qualify(insn.id.func),
                     size: s.size,
                     space: s.space,
-                    stored: Some(s.src),
+                    stored: Some(s.src.qualify(insn.id.func)),
                 }),
                 _ => {}
             }
@@ -247,7 +247,7 @@ fn apply<'str>(
             cx,
             Mnemonic::Intrinsic(IntrinsicApp {
                 id: at_id,
-                args: vec![m.arr, idx],
+                args: vec![m.arr.localize(load_id.func), idx.localize(load_id.func)],
             }),
             at_ty,
         );

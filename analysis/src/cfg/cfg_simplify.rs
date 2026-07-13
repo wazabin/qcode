@@ -1,6 +1,6 @@
 use qcode::context::Context;
 use qcode::value::{
-    BlockId, BlockParamId, FunctionId, ValueId,
+    BlockId, BlockParamId, FunctionId, LocalValueId, ValueId,
     insn::{Branch, Mnemonic},
 };
 
@@ -784,13 +784,19 @@ fn try_bypass_empty_block_concrete<'a, 'str>(
 /// through one predecessor's incoming arguments: a value that is one of the
 /// block's `params` is replaced by the predecessor's argument at the same index;
 /// any other value (e.g. one defined in a dominating block) is kept as-is.
-fn substitute(template: &[ValueId], params: &[BlockParamId], incoming: &[ValueId]) -> Vec<ValueId> {
+/// Everything here is one function's own operands, so it works in the bare-local
+/// domain end-to-end.
+fn substitute(
+    template: &[LocalValueId],
+    params: &[BlockParamId],
+    incoming: &[LocalValueId],
+) -> Vec<LocalValueId> {
     template
         .iter()
         .map(|&v| match v {
-            ValueId::BlockParam(p) => params
+            LocalValueId::BlockParam(p) => params
                 .iter()
-                .position(|&q| q == p)
+                .position(|&q| q.local == p)
                 .map(|idx| incoming[idx])
                 .unwrap_or(v),
             _ => v,
@@ -1026,7 +1032,7 @@ mod tests {
         let Mnemonic::Binop(Binary { lhs, .. }) = ctx.instruction(sum).mnemonic() else {
             panic!("expected merged sum to be a binop");
         };
-        assert_eq!(*lhs, ValueId::BlockParam(input));
+        assert_eq!(*lhs, ValueId::BlockParam(input).strip_func());
     }
 
     #[test]
@@ -1250,8 +1256,8 @@ mod tests {
             assert_eq!(br.target, t.local);
             br.args[0]
         };
-        assert_eq!(arg_to_t(a), ValueId::BlockParam(av));
-        assert_eq!(arg_to_t(d), ValueId::BlockParam(dv));
+        assert_eq!(arg_to_t(a), ValueId::BlockParam(av).strip_func());
+        assert_eq!(arg_to_t(d), ValueId::BlockParam(dv).strip_func());
     }
 
     /// A predecessor that reaches the empty block through one arm of a

@@ -1,18 +1,17 @@
 //! Verify SSA data operands, CFG block targets, CFG edges, and block storage all
 //! stay within a single function — strict IR locality (context-split ruling 2).
 
-use qcode::{
-    context::Context,
-    value::{BasicBlock, ValueId},
-};
+use qcode::{context::Context, value::BasicBlock};
 
 /// IR references are intra-function on four axes:
 ///
-/// 1. **Data operands.** An instruction's operands that are themselves
-///    instruction results or block parameters must belong to the same function
-///    as the instruction using them. A stray cross-function `ValueId` operand
-///    means a pass leaked a handle across an outlining/split boundary without
-///    remapping it.
+/// 1. **Data operands** — *now type-proven, no runtime check.* An instruction's
+///    operands are stored as bare body-local `LocalValueId`s (context-split stage
+///    6a): every operand read qualifies with the instruction's own `id.func`, so
+///    an operand cannot name another function's SSA value or block parameter at
+///    all. The old dynamic check (`operand.func == insn.func`) became vacuous
+///    under localization and is dropped — the type system now discharges this
+///    axis, exactly as it does the CFG-block-target axis below.
 /// 2. **CFG block targets** — *now type-proven, no runtime check.* A terminator's
 ///    static targets (`Branch::target`, both `CBranch` arms) are stored as bare
 ///    body-local `LocalBlockId`s (context-split stage 6a), so they cannot name a
@@ -32,32 +31,14 @@ use qcode::{
 ///    borrowing only its own body.
 ///
 /// With per-function IR ownership this turns the isolation goal into a checked
-/// invariant on the operand, edge, and storage axes (the block-target axis is
-/// discharged by the `LocalBlockId` storage type).
+/// invariant on the edge and storage axes (the operand and block-target axes are
+/// discharged by the `LocalValueId`/`LocalBlockId` storage types).
 pub fn verify_intra_function_ssa(ctx: &Context) -> Vec<String> {
     let mut out = Vec::new();
-    for insn in ctx.instructions() {
-        let func = insn.id.func;
-        for arg in insn.mnemonic().args() {
-            let operand_func = match arg {
-                ValueId::Instruction(id) => Some(id.func),
-                ValueId::BlockParam(id) => Some(id.func),
-                _ => None,
-            };
-            if let Some(operand_func) = operand_func
-                && operand_func != func
-            {
-                out.push(format!(
-                    "instruction {:?} uses cross-function SSA operand {arg} \
-                     (defined in {operand_func:?}, used in {func:?})",
-                    insn.id
-                ));
-            }
-        }
-        // Axis 2 (CFG block targets) is discharged by the `LocalBlockId` storage
-        // type: a terminator's targets are body-local indices in `insn.func`'s own
-        // arena and cannot reference another function's block.
-    }
+    // Axes 1 (data operands) and 2 (CFG block targets) are discharged by the
+    // `LocalValueId`/`LocalBlockId` storage types: an instruction's operands and a
+    // terminator's targets are body-local indices in `insn.func`'s own arena and
+    // cannot reference another function's value or block.
     for block in ctx.blocks() {
         // Axis 4: self-storage (arena == owner).
         if let Some(parent) = block.parent().map(|f| f.id)

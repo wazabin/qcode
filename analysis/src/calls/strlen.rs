@@ -109,19 +109,20 @@ fn nonzero_polarity(host: HostRef, cond: ValueId, elem: ValueId) -> Option<bool>
             // If `sub` has polarity `p`, then `sub == c` has polarity `p == c`
             // and `sub != c` has polarity `p != c`.
             let is_eq = matches!(b.op, Binop::Int(IntBinop::Equal));
-            if let Some(c) = bool_const(b.rhs)
-                && let Some(p) = nonzero_polarity(host, b.lhs, elem)
+            let (lhs, rhs) = (b.lhs.qualify(id.func), b.rhs.qualify(id.func));
+            if let Some(c) = bool_const(rhs)
+                && let Some(p) = nonzero_polarity(host, lhs, elem)
             {
                 return Some(if is_eq { p == c } else { p != c });
             }
-            if let Some(c) = bool_const(b.lhs)
-                && let Some(p) = nonzero_polarity(host, b.rhs, elem)
+            if let Some(c) = bool_const(lhs)
+                && let Some(p) = nonzero_polarity(host, rhs, elem)
             {
                 return Some(if is_eq { p == c } else { p != c });
             }
             // Direct zero-test of `elem`.
-            let zero_test = (b.lhs == elem && literal(host, b.rhs) == Some(0))
-                || (b.rhs == elem && literal(host, b.lhs) == Some(0));
+            let zero_test = (lhs == elem && literal(host, rhs) == Some(0))
+                || (rhs == elem && literal(host, lhs) == Some(0));
             if !zero_test {
                 return None;
             }
@@ -152,14 +153,15 @@ fn try_match_strlen(host: HostRef, fid: FunctionId) -> Option<StrlenMatch> {
             let Mnemonic::Intrinsic(IntrinsicApp { id, args }) = insn.mnemonic() else {
                 continue;
             };
-            if *id == insert_id && args.first().is_some_and(|&a| is_root(a)) {
+            let func = insn.id.func;
+            if *id == insert_id && args.first().is_some_and(|&a| is_root(a.qualify(func))) {
                 return None; // a write into a snapshot — not read-only
             }
-            if *id != at_id || args.len() != 2 || !is_root(args[0]) {
+            if *id != at_id || args.len() != 2 || !is_root(args[0].qualify(func)) {
                 continue;
             }
             let byte_array = host
-                .stored_type_of(args[0])
+                .stored_type_of(args[0].qualify(func))
                 .and_then(|t| host.shr().types.array_of(t))
                 .is_some_and(|(elem, _)| host.shr().types.size_of(elem) == 1);
             if !byte_array {
@@ -168,7 +170,7 @@ fn try_match_strlen(host: HostRef, fid: FunctionId) -> Option<StrlenMatch> {
             if lane.is_some() {
                 return None; // more than one lane read — not the canonical scan
             }
-            lane = Some((insn.id, args[0], args[1]));
+            lane = Some((insn.id, args[0].qualify(func), args[1].qualify(func)));
         }
     }
     let (at_insn, arr, index) = lane?;
@@ -223,7 +225,7 @@ fn try_match_strlen(host: HostRef, fid: FunctionId) -> Option<StrlenMatch> {
         else {
             return None;
         };
-        let nonzero_continues = nonzero_polarity(host, *condition, elem_val)?;
+        let nonzero_continues = nonzero_polarity(host, condition.qualify(header.func), elem_val)?;
         // The CBranch targets are body-local indices in the header's arena.
         let q = |t| BlockId::new(header.func, t);
         // The exit edge is the one taken when the byte is zero.
@@ -233,7 +235,9 @@ fn try_match_strlen(host: HostRef, fid: FunctionId) -> Option<StrlenMatch> {
             (q(*success_block), success_args)
         };
         // The exit edge must carry the index (the count) to an exit-block param.
-        let kx = exit_args.iter().position(|&v| v == index)?;
+        let kx = exit_args
+            .iter()
+            .position(|&v| v.qualify(header.func) == index)?;
         let count_param = host
             .block_ref(exit_block)
             .params()
@@ -446,7 +450,11 @@ fn try_match_strlen_ptr(host: HostRef, fid: FunctionId) -> Option<StrlenPtrMatch
                 .block_ref(header)
                 .iter()
                 .find_map(|i| match i.mnemonic() {
-                    Mnemonic::Load(l) if l.ptr == s && l.size == 1 && !is_temp(host, l.space) => {
+                    Mnemonic::Load(l)
+                        if l.ptr.qualify(i.id.func) == s
+                            && l.size == 1
+                            && !is_temp(host, l.space) =>
+                    {
                         Some(i.id)
                     }
                     _ => None,
@@ -471,7 +479,9 @@ fn try_match_strlen_ptr(host: HostRef, fid: FunctionId) -> Option<StrlenPtrMatch
             else {
                 continue;
             };
-            let Some(nonzero_continues) = nonzero_polarity(host, *condition, elem_val) else {
+            let Some(nonzero_continues) =
+                nonzero_polarity(host, condition.qualify(header.func), elem_val)
+            else {
                 continue;
             };
             let q = |t| BlockId::new(header.func, t);
@@ -481,7 +491,7 @@ fn try_match_strlen_ptr(host: HostRef, fid: FunctionId) -> Option<StrlenPtrMatch
                 (q(*success_block), success_args, q(*failure_block))
             };
             // The exit edge must carry the induction pointer (the end pointer).
-            if !exit_args.contains(&s) {
+            if !exit_args.iter().any(|&v| v.qualify(header.func) == s) {
                 continue;
             }
             if header == body_block || header == exit_block {
@@ -499,7 +509,9 @@ fn try_match_strlen_ptr(host: HostRef, fid: FunctionId) -> Option<StrlenPtrMatch
             // The escaping length is the pointer difference `end - base`, where the
             // end pointer is the exit-block param fed the induction pointer. Matched
             // by `lhs - base` with `lhs` an exit param carrying `s`.
-            let kx = exit_args.iter().position(|&v| v == s)?;
+            let kx = exit_args
+                .iter()
+                .position(|&v| v.qualify(header.func) == s)?;
             let end_param = host
                 .block_ref(exit_block)
                 .params()
@@ -510,8 +522,8 @@ fn try_match_strlen_ptr(host: HostRef, fid: FunctionId) -> Option<StrlenPtrMatch
                 for i in b2.iter() {
                     if let Mnemonic::Binop(bin) = i.mnemonic()
                         && matches!(bin.op, Binop::Int(IntBinop::Sub))
-                        && bin.lhs == end_param
-                        && bin.rhs == base
+                        && bin.lhs.qualify(i.id.func) == end_param
+                        && bin.rhs.qualify(i.id.func) == base
                     {
                         return Some(StrlenPtrMatch {
                             base,
@@ -796,11 +808,13 @@ mod tests {
             if len.id.name() != "len" {
                 return None;
             }
-            let ValueId::Instruction(tw_id) = *len.args.first()? else {
+            let ValueId::Instruction(tw_id) = len.args.first()?.qualify(i.id.func) else {
                 return None;
             };
             match ctx.get_insn(tw_id).mnemonic() {
-                Mnemonic::Intrinsic(tw) if tw.id.name() == "take_while" => tw.args.first().copied(),
+                Mnemonic::Intrinsic(tw) if tw.id.name() == "take_while" => {
+                    tw.args.first().map(|a| a.qualify(tw_id.func))
+                }
                 _ => None,
             }
         })

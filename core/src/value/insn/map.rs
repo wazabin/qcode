@@ -15,7 +15,7 @@
 //! `Range(Map(body, src), k·osz, osz) → body(Range(src, k·isz, isz), captures…)`
 //! recovers one element as an expression without materializing the whole array.
 
-use crate::value::{ValueId, function::FunctionId};
+use crate::value::{LocalValueId, function::FunctionId};
 
 use super::mnemonic::{Args, MnemonicKind};
 use smallvec::SmallVec;
@@ -28,10 +28,10 @@ pub struct Map {
     /// operand — exactly like a direct call's target. Unary in the element.
     pub body: FunctionId,
     /// The array value mapped over.
-    pub src: ValueId,
+    pub src: LocalValueId,
     /// Loop-invariant values the body closes over (the element is supplied
     /// per-lane by the map itself). Empty for a closed body.
-    pub captures: Vec<ValueId>,
+    pub captures: Vec<LocalValueId>,
 }
 
 impl MnemonicKind for Map {
@@ -158,11 +158,11 @@ mod tests {
         assert_eq!(m.body, body);
         assert_eq!(
             m.args().to_vec(),
-            vec![src, cap],
+            vec![src.strip_func(), cap.strip_func()],
             "src then captures are the operands"
         );
         assert!(
-            !m.args().contains(&ValueId::Function(body)),
+            !m.args().contains(&ValueId::Function(body).strip_func()),
             "body is not an operand"
         );
 
@@ -175,12 +175,12 @@ mod tests {
             b.push_param(20).id()
         };
         let mut rewritten = Mnemonic::Map(m);
-        rewritten.replace_value(src, new_src);
+        rewritten.replace_value(src.strip_func(), new_src.strip_func());
         let Mnemonic::Map(r) = rewritten else {
             unreachable!()
         };
-        assert_eq!(r.src, new_src);
+        assert_eq!(r.src, new_src.strip_func());
         assert_eq!(r.body, body, "body symbol is untouched by replace_value");
-        assert_eq!(r.captures, vec![cap]);
+        assert_eq!(r.captures, vec![cap.strip_func()]);
     }
 }

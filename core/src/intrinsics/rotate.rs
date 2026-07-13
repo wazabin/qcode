@@ -131,7 +131,8 @@ fn as_rotate(host: HostRef, v: ValueId) -> Option<(&'static str, ValueId, ValueI
     let &[x, k] = intr.args.as_slice() else {
         return None;
     };
-    Some((name, x, k))
+    // Operands are stored bare-local; qualify with the intrinsic's own function.
+    Some((name, x.qualify(id.func), k.qualify(id.func)))
 }
 
 /// Simplify a rotate `op(x, k)` (where `op` is `rol`/`ror`, named by `id`) over
@@ -187,7 +188,8 @@ fn simplify_rotate(
             let reduced = host.shr().get_const(r, k_size);
             let rotate = IntrinsicApp {
                 id,
-                args: vec![x, reduced],
+                // Expression operands live in the same body; store bare-local.
+                args: vec![x.strip_func(), reduced.strip_func()],
             };
             return Some(Simplified::Expression(Mnemonic::Intrinsic(rotate)));
         }

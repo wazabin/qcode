@@ -1,5 +1,5 @@
 use crate::value::{
-    ValueId,
+    LocalValueId,
     function::FunctionId,
     insn::{
         Apply, Assert, Binary, Branch, BranchInd, CBranch, Call, CallInd, Carry, Extract,
@@ -15,7 +15,7 @@ use smallvec::SmallVec;
 /// flags, …), so the pervasive per-instruction operand walks in the analysis
 /// passes don't heap-allocate. Variable-arity ops (calls, tuples, `scan`) spill
 /// to the heap only when they exceed two operands.
-pub type Args = SmallVec<[ValueId; 2]>;
+pub type Args = SmallVec<[LocalValueId; 2]>;
 
 /// Implemented by each concrete instruction type.
 ///
@@ -26,7 +26,7 @@ pub trait MnemonicKind {
     fn opcode(&self) -> &'static str;
 
     // TODO: replace with a visitor pattern to avoid the need for this method
-    /// Returns the [`ValueId`]s of all operands consumed by this instruction.
+    /// Returns the [`LocalValueId`]s of all operands consumed by this instruction.
     fn args(&self) -> Args;
 
     /// Returns `true` if this instruction ends a basic block.
@@ -228,7 +228,7 @@ impl Mnemonic {
     }
 
     /// Replace every occurrence of `old` with `new` in this instruction's operands.
-    pub fn replace_value(&mut self, old: ValueId, new: ValueId) {
+    pub fn replace_value(&mut self, old: LocalValueId, new: LocalValueId) {
         match self {
             Mnemonic::Load(m) => {
                 if m.ptr == old {

@@ -2,10 +2,10 @@ use crate::{
     context::Context,
     error::Result,
     value::{
-        Function, Instruction, Value, ValueId,
+        Function, Instruction, LocalValueId, Value, ValueId,
         block_param::{BlockParam, BlockParamId, BlockParamMutRef, BlockParamRef},
         function::{FunctionId, FunctionMutRef, FunctionRef},
-        insn::{InstructionId, InstructionRef},
+        insn::{InstructionId, InstructionRef, Mnemonic},
         util::{
             base_ref::{BaseRef, HostRef, WithCtx, WithCtxMut, WithHost},
             host_mut::PassBacking,
@@ -26,6 +26,35 @@ use rustc_hash::FxHashMap as HashMap;
 pub(crate) use self::cfg::EdgeData;
 pub use self::cfg::{BlockId, EdgeId};
 pub mod cfg;
+
+/// Simultaneously replace operands without allowing a target-arena local id to
+/// collide with a not-yet-replaced source-arena local id.
+pub(crate) fn substitute_operands(mnemonic: &mut Mnemonic, pairs: &[(LocalValueId, LocalValueId)]) {
+    let mut occupied: Vec<LocalValueId> = mnemonic
+        .args()
+        .into_iter()
+        .chain(pairs.iter().map(|&(_, new)| new))
+        .collect();
+    let mut sentinels = Vec::with_capacity(pairs.len());
+    let mut next = 0usize;
+    for _ in pairs {
+        let sentinel = loop {
+            let candidate = LocalValueId::Varnode(crate::value::VarnodeId::from(next));
+            next += 1;
+            if !occupied.contains(&candidate) {
+                occupied.push(candidate);
+                break candidate;
+            }
+        };
+        sentinels.push(sentinel);
+    }
+    for (&(old, _), &sentinel) in pairs.iter().zip(&sentinels) {
+        mnemonic.replace_value(old, sentinel);
+    }
+    for (&(_, new), &sentinel) in pairs.iter().zip(&sentinels) {
+        mnemonic.replace_value(sentinel, new);
+    }
+}
 
 /// A block of instructions.
 /// This is the basic unit of code in our IR.
@@ -291,11 +320,20 @@ impl<'str> BasicBlock<'str> {
             // avoids scanning the whole (trace-wide) `value_map` per instruction
             // and sidesteps chained `old -> new -> newer` replacements that a
             // full iteration could trigger.
-            for old in new_mnemonic.args() {
-                if let Some(&new) = value_map.get(&old) {
-                    new_mnemonic.replace_value(old, new);
-                }
-            }
+            let pairs: Vec<_> = new_mnemonic
+                .args()
+                .into_iter()
+                .filter_map(|old| {
+                    // The clone still holds the source arena's bare-local operands, so
+                    // qualify with `orig.func` for the map lookup and re-localize the
+                    // mapped replacement against the clone's own arena.
+                    let qualified = old.qualify(orig.func);
+                    value_map
+                        .get(&qualified)
+                        .map(|&new| (old, new.localize(new_block_id.func)))
+                })
+                .collect();
+            substitute_operands(&mut new_mnemonic, &pairs);
 
             let new_insn_id = InstructionRef::from_mnemonic_with_space(
                 ctx,
@@ -863,7 +901,27 @@ impl<'str, 'ctx> BlockMutRef<'str, 'ctx> {
 mod tests {
 
     use super::*;
+    use crate::value::insn::{Binary, Binop, IntBinop, LocalInsnId};
     use qcode_macro::qcode;
+
+    #[test]
+    fn simultaneous_operand_substitution_does_not_chain_local_ids() {
+        let a = LocalValueId::Instruction(LocalInsnId::from(1));
+        let b = LocalValueId::Instruction(LocalInsnId::from(2));
+        let c = LocalValueId::Instruction(LocalInsnId::from(3));
+        let mut mnemonic = Mnemonic::Binop(Binary {
+            op: Binop::Int(IntBinop::Add),
+            lhs: a,
+            rhs: b,
+        });
+
+        substitute_operands(&mut mnemonic, &[(a, b), (b, c)]);
+
+        let Mnemonic::Binop(binary) = mnemonic else {
+            unreachable!();
+        };
+        assert_eq!((binary.lhs, binary.rhs), (b, c));
+    }
 
     #[test]
     fn test_create_block_at_address() {
@@ -1248,7 +1306,7 @@ mod tests {
 
         // All operands in the clone must reference new (remapped) values, not the originals
         // so no value map key should be referenced
-        for arg in cloned.iter().flat_map(|i| i.mnemonic().args()) {
+        for arg in cloned.iter().flat_map(|i| i.operands()) {
             assert!(
                 !orig_value_ids.contains(&arg),
                 "cloned instruction still references original value {arg:?}"

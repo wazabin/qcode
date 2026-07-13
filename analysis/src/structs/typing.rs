@@ -221,14 +221,14 @@ fn type_instruction<'a, 'str>(
             op: Binop::Int(IntBinop::Add),
             lhs,
             rhs,
-        }) => try_add_to_gep(body, cx, id, lhs, rhs),
+        }) => try_add_to_gep(body, cx, id, lhs.qualify(id.func), rhs.qualify(id.func)),
         // A register read (`load` from the register space) yields the register's
         // own value type — which the TEB seed overrode to `PtrTo<TEB>`. A normal
         // RAM load dereferences a field pointer.
         Mnemonic::Load(load) if is_register_space(body.read_host(cx), load.space) => {
-            try_type_register_read(body, cx, id, load.ptr, load.size)
+            try_type_register_read(body, cx, id, load.ptr.qualify(id.func), load.size)
         }
-        Mnemonic::Load(load) => try_type_load(body, cx, id, load.ptr, load.size),
+        Mnemonic::Load(load) => try_type_load(body, cx, id, load.ptr.qualify(id.func), load.size),
         _ => false,
     }
 }
@@ -291,7 +291,14 @@ fn try_add_to_gep<'a, 'str>(
         };
         let width = cx.shr().types.size_of(base_ty);
         let result_ty = cx.shr().types.get_or_make_struct_pointer(width, field_ty);
-        body.replace_instruction_mnemonic(cx, id, Mnemonic::Gep(Gep { base, offset }));
+        body.replace_instruction_mnemonic(
+            cx,
+            id,
+            Mnemonic::Gep(Gep {
+                base: base.localize(id.func),
+                offset,
+            }),
+        );
         BaseRef::new(body.host(cx), id).set_result_type(result_ty);
         return true;
     }

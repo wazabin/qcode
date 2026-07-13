@@ -24,7 +24,7 @@
 //! parameter is the carried accumulator (typed as the result element), its second
 //! is the lane element of `src`.
 
-use crate::value::{ValueId, function::FunctionId};
+use crate::value::{LocalValueId, function::FunctionId};
 
 use super::mnemonic::{Args, MnemonicKind};
 use smallvec::SmallVec;
@@ -39,12 +39,12 @@ pub struct Scan {
     /// element)`.
     pub body: FunctionId,
     /// The initial accumulator value (`acc_0`).
-    pub init: ValueId,
+    pub init: LocalValueId,
     /// The array value scanned over.
-    pub src: ValueId,
+    pub src: LocalValueId,
     /// Loop-invariant values the body closes over (the accumulator and element
     /// are supplied per-lane by the scan itself). Empty for a closed body.
-    pub captures: Vec<ValueId>,
+    pub captures: Vec<LocalValueId>,
 }
 
 impl MnemonicKind for Scan {
@@ -173,11 +173,11 @@ mod tests {
         assert_eq!(m.body, body);
         assert_eq!(
             m.args().to_vec(),
-            vec![init, src, cap],
+            vec![init.strip_func(), src.strip_func(), cap.strip_func()],
             "init, src, then captures are the operands"
         );
         assert!(
-            !m.args().contains(&ValueId::Function(body)),
+            !m.args().contains(&ValueId::Function(body).strip_func()),
             "body is not an operand"
         );
         // Result type is the array type of `src` (same length, body return elem).
@@ -188,13 +188,13 @@ mod tests {
             b.push_param(80).id()
         };
         let mut rewritten = Mnemonic::Scan(m);
-        rewritten.replace_value(src, new_src);
+        rewritten.replace_value(src.strip_func(), new_src.strip_func());
         let Mnemonic::Scan(r) = rewritten else {
             unreachable!()
         };
-        assert_eq!(r.src, new_src);
+        assert_eq!(r.src, new_src.strip_func());
         assert_eq!(r.body, body, "body symbol is untouched by replace_value");
-        assert_eq!(r.init, init);
-        assert_eq!(r.captures, vec![cap]);
+        assert_eq!(r.init, init.strip_func());
+        assert_eq!(r.captures, vec![cap.strip_func()]);
     }
 }

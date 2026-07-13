@@ -72,10 +72,11 @@ impl ResolvedPath {
                         .last()
                         .unwrap();
 
+                    let orig_condition = cbranch.condition.qualify(orig_block_id.func);
                     let raw_condition = value_map
-                        .get(&cbranch.condition)
+                        .get(&orig_condition)
                         .copied()
-                        .unwrap_or(cbranch.condition);
+                        .unwrap_or(orig_condition);
 
                     // Add (negated) assert
                     insert_trace_assert(ctx, new_block_id, cbranch_id, raw_condition, negate);
@@ -177,8 +178,8 @@ fn insert_trace_assert(
             block_id.func,
             Mnemonic::Binop(Binary {
                 op: Binop::Int(IntBinop::Equal),
-                lhs: condition,
-                rhs: f,
+                lhs: condition.localize(block_id.func),
+                rhs: f.localize(block_id.func),
             }),
             bool_ty,
         )
@@ -193,7 +194,9 @@ fn insert_trace_assert(
     let assert_id = InstructionRef::from_mnemonic(
         ctx,
         block_id.func,
-        Mnemonic::Assert(Assert { condition }),
+        Mnemonic::Assert(Assert {
+            condition: condition.localize(block_id.func),
+        }),
         0,
     )
     .id;

@@ -308,10 +308,13 @@ pub trait Interpreter {
         &mut self,
         insn: &InstructionRef<'_, '_>,
     ) -> std::result::Result<Option<Self::V>, EmulatorErrorKind> {
+        // Operands are stored bare-local; qualify with the instruction's own
+        // function (strict IR locality: operands live in the same arena).
+        let func = insn.id.func;
         let v = match insn.mnemonic() {
             // ===== Memory operations =====
             &Mnemonic::Load(Load { space, ptr, size }) => {
-                let addr = self.get_value(ptr)?;
+                let addr = self.get_value(ptr.qualify(func))?;
                 Some(self.memory().read(space, addr, size)?)
             }
 
@@ -321,8 +324,8 @@ pub trait Interpreter {
                 size,
                 src,
             }) => {
-                let addr = self.get_value(ptr)?;
-                let value = self.get_value(src)?;
+                let addr = self.get_value(ptr.qualify(func))?;
+                let value = self.get_value(src.qualify(func))?;
                 self.memory().write(space, addr, size, value)?;
                 None
             }
@@ -339,7 +342,7 @@ pub trait Interpreter {
 
             // ===== Unary operations =====
             Mnemonic::Unop(Unary { op, src }) => {
-                let value = self.get_value(*src)?;
+                let value = self.get_value(src.qualify(func))?;
                 let v = match op {
                     Unop::IntNegate => value.int_negate(),
                     Unop::IntNot => value.int_not(),
@@ -356,8 +359,8 @@ pub trait Interpreter {
 
             // ===== Binary operations =====
             Mnemonic::Binop(Binary { op, lhs, rhs }) => {
-                let value1 = self.get_value(*lhs)?;
-                let value2 = self.get_value(*rhs)?;
+                let value1 = self.get_value(lhs.qualify(func))?;
+                let value2 = self.get_value(rhs.qualify(func))?;
                 let v = match *op {
                     Binop::Int(IntBinop::Equal) => value1.int_equal(&value2),
                     Binop::Int(IntBinop::NotEqual) => value1.int_not_equal(&value2),
@@ -394,60 +397,60 @@ pub trait Interpreter {
 
             // ===== Bit manipulation operations =====
             &Mnemonic::PopCount(PopCount { src }) => {
-                let value = self.get_value(src)?;
+                let value = self.get_value(src.qualify(func))?;
                 Some(value.pop_count()?)
             }
 
             &Mnemonic::LzCount(LzCount { src }) => {
-                let value = self.get_value(src)?;
+                let value = self.get_value(src.qualify(func))?;
                 Some(value.lz_count()?)
             }
 
             &Mnemonic::Carry(Carry { lhs, rhs }) => {
-                let value1 = self.get_value(lhs)?;
-                let value2 = self.get_value(rhs)?;
+                let value1 = self.get_value(lhs.qualify(func))?;
+                let value2 = self.get_value(rhs.qualify(func))?;
                 Some(value1.carry(&value2)?)
             }
 
             &Mnemonic::SCarry(SCarry { lhs, rhs }) => {
-                let value1 = self.get_value(lhs)?;
-                let value2 = self.get_value(rhs)?;
+                let value1 = self.get_value(lhs.qualify(func))?;
+                let value2 = self.get_value(rhs.qualify(func))?;
                 Some(value1.scarry(&value2)?)
             }
 
             &Mnemonic::SBorrow(SBorrow { lhs, rhs }) => {
-                let value1 = self.get_value(lhs)?;
-                let value2 = self.get_value(rhs)?;
+                let value1 = self.get_value(lhs.qualify(func))?;
+                let value2 = self.get_value(rhs.qualify(func))?;
                 Some(value1.sborrow(&value2)?)
             }
 
             // ===== Casting operations =====
             &Mnemonic::IsFloatNaN(IsFloatNaN { src }) => {
-                let value = self.get_value(src)?;
+                let value = self.get_value(src.qualify(func))?;
                 Some(value.is_float_nan()?)
             }
             &Mnemonic::IntToFloat(IntToFloat { src, size }) => {
-                let value = self.get_value(src)?;
+                let value = self.get_value(src.qualify(func))?;
                 Some(value.int_to_float(size)?)
             }
             &Mnemonic::FloatToFloat(FloatToFloat { src, size }) => {
-                let value = self.get_value(src)?;
+                let value = self.get_value(src.qualify(func))?;
                 Some(value.float_to_float(size)?)
             }
             &Mnemonic::FloatToInt(FloatToInt { src, size }) => {
-                let value = self.get_value(src)?;
+                let value = self.get_value(src.qualify(func))?;
                 Some(value.float_to_int(size)?)
             }
             &Mnemonic::Zext(Zext { src, size }) => {
-                let value = self.get_value(src)?;
+                let value = self.get_value(src.qualify(func))?;
                 Some(value.zext(size)?)
             }
             &Mnemonic::Sext(Sext { src, size }) => {
-                let value = self.get_value(src)?;
+                let value = self.get_value(src.qualify(func))?;
                 Some(value.sext(size)?)
             }
             &Mnemonic::Range(Range { src, start, size }) => {
-                let value = self.get_value(src)?;
+                let value = self.get_value(src.qualify(func))?;
                 Some(value.range(start, size)?)
             }
 
@@ -456,7 +459,7 @@ pub trait Interpreter {
             // offset. The width follows the base (int_add uses the lhs width),
             // so the immediate's default u64 width is harmless.
             &Mnemonic::Gep(Gep { base, offset }) => {
-                let base = self.get_value(base)?;
+                let base = self.get_value(base.qualify(func))?;
                 let offset = Self::V::from_u64(offset as u64);
                 Some(base.int_add(&offset)?)
             }
@@ -465,7 +468,7 @@ pub trait Interpreter {
             Mnemonic::PCodeOp(op) => {
                 let name = self.ctx().shared.pcode_ops[op.id].clone();
                 match (name.as_ref(), op.args.as_slice()) {
-                    ("swap_bytes", [src]) => Some(self.get_value(*src)?.byte_swap()?),
+                    ("swap_bytes", [src]) => Some(self.get_value(src.qualify(func))?.byte_swap()?),
                     _ => return Err(EmulatorErrorKind::UnsupportedPCodeOp(name)),
                 }
             }
@@ -474,7 +477,7 @@ pub trait Interpreter {
                 let out_size = insn.size();
                 let mut args = Vec::with_capacity(intr.args.len());
                 for &arg in &intr.args {
-                    args.push(self.get_value(arg)?);
+                    args.push(self.get_value(arg.qualify(func))?);
                 }
                 Some(Self::V::intrinsic(intr.id, &args, out_size)?)
             }

@@ -72,7 +72,7 @@ impl<'str> SubPassC<'str> for MemoryForwarding {
         let state = state.downcast_mut::<MemForward>().expect("memory state");
         match ic.mnemonic {
             Mnemonic::Store(store) => {
-                state.record_store_c(body, cx, store, ic.aliases, ic.numbering);
+                state.record_store_c(body, cx, ic.insn_id.func, store, ic.aliases, ic.numbering);
                 Claim::Done
             }
             Mnemonic::Load(load) => {
@@ -88,9 +88,11 @@ impl<'str> SubPassC<'str> for MemoryForwarding {
                 match forwarded {
                     Some(value) => {
                         ed.replace_c(body, cx, ic.insn_id, value);
-                        state.define_load(load, value, ic.aliases, ic.numbering);
+                        state.define_load(ic.insn_id.func, load, value, ic.aliases, ic.numbering);
                     }
-                    None => state.define_load(load, ic.id, ic.aliases, ic.numbering),
+                    None => {
+                        state.define_load(ic.insn_id.func, load, ic.id, ic.aliases, ic.numbering)
+                    }
                 }
                 Claim::Done
             }
@@ -277,7 +279,7 @@ mod tests {
             let mut call_id = None;
             for insn in BasicBlock::from_id(ctx, entry).iter() {
                 match insn.mnemonic() {
-                    Mnemonic::Store(s) => store_ptr = Some(s.ptr),
+                    Mnemonic::Store(s) => store_ptr = Some(s.ptr.qualify(caller)),
                     Mnemonic::Call(_) => call_id = Some(insn.id),
                     _ => {}
                 }
@@ -298,7 +300,7 @@ mod tests {
 
         // Record that `&A` escaped into the callee.
         if let Mnemonic::Call(call) = Instruction::from_id_mut(&mut ctx, call_id).mnemonic_mut() {
-            call.clobbers.push(store_ptr);
+            call.clobbers.push(store_ptr.localize(call_id.func));
         } else {
             panic!("expected a call");
         }
@@ -423,7 +425,7 @@ mod tests {
             panic!("expected an instruction value, got {store:?}");
         };
         match ctx.get_insn(id).mnemonic() {
-            Mnemonic::Store(s) => s.src,
+            Mnemonic::Store(s) => s.src.qualify(id.func),
             other => panic!("expected a store, got {other:?}"),
         }
     }
@@ -447,7 +449,7 @@ mod tests {
             .iter()
             .find(|i| {
                 matches!(i.mnemonic(), Mnemonic::Store(s)
-                    if matches!(s.ptr, ValueId::Varnode(v) if v == tc.r1))
+                    if matches!(s.ptr.qualify(block.func), ValueId::Varnode(v) if v == tc.r1))
             })
             .expect("store to r1")
             .id()
@@ -493,7 +495,11 @@ mod tests {
         };
         match tc.ctx.get_insn(zid).mnemonic() {
             Mnemonic::Zext(z) => {
-                assert_eq!(z.src, ValueId::Instruction(cc), "zext of the setnz byte")
+                assert_eq!(
+                    z.src.qualify(zid.func),
+                    ValueId::Instruction(cc),
+                    "zext of the setnz byte"
+                )
             }
             other => panic!("expected zext(%cc), got {other:?}"),
         }
@@ -668,7 +674,7 @@ mod tests {
         // A Range(%w, 1, 3) must have been materialized for the upper three bytes.
         let w = ValueId::Instruction(w);
         let has_upper_range = BasicBlock::from_id(&tc.ctx, block).iter().any(|i| {
-            matches!(i.mnemonic(), Mnemonic::Range(Range { src, start: 1, size: 3 }) if *src == w)
+            matches!(i.mnemonic(), Mnemonic::Range(Range { src, start: 1, size: 3 }) if src.qualify(i.id.func) == w)
         });
         assert!(
             has_upper_range,
@@ -707,7 +713,7 @@ mod tests {
         );
         let w = ValueId::Instruction(w);
         let has_range = BasicBlock::from_id(&tc.ctx, block).iter().any(|i| {
-            matches!(i.mnemonic(), Mnemonic::Range(Range { src, start: 1, size: 1 }) if *src == w)
+            matches!(i.mnemonic(), Mnemonic::Range(Range { src, start: 1, size: 1 }) if src.qualify(i.id.func) == w)
         });
         assert!(has_range, "expected Range(%w, 1, 1)");
     }
@@ -961,7 +967,7 @@ mod tests {
             .iter()
             .find(|i| {
                 matches!(i.mnemonic(), Mnemonic::Store(s)
-                if matches!(s.ptr, ValueId::Varnode(_)))
+                if matches!(s.ptr.qualify(block.func), ValueId::Varnode(_)))
             })
             .expect("store to &OUT")
             .id()

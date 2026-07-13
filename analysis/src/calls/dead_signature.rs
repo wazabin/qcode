@@ -230,7 +230,7 @@ fn trim_dead_return_fields(
         let result = ValueId::Instruction(call_id);
         for &u in ctx.users(result) {
             match ctx.get_insn(u).mnemonic() {
-                Mnemonic::Extract(e) if e.agg == result => {
+                Mnemonic::Extract(e) if e.agg.qualify(u.func) == result => {
                     if let Some(slot) = live.get_mut(e.index) {
                         *slot = true;
                     }
@@ -269,7 +269,7 @@ fn trim_dead_return_fields(
         else {
             continue;
         };
-        let ValueId::Instruction(tuple_id) = value else {
+        let ValueId::Instruction(tuple_id) = value.qualify(ret_id.func) else {
             continue;
         };
         let Mnemonic::Tuple(tuple) = ctx.get_insn(tuple_id).mnemonic().clone() else {
@@ -281,7 +281,7 @@ fn trim_dead_return_fields(
             continue;
         }
 
-        let new_tuple_fields: Vec<ValueId> = kept
+        let new_tuple_fields: Vec<qcode::value::LocalValueId> = kept
             .iter()
             .filter_map(|&i| tuple.fields.get(i).copied())
             .collect();
@@ -361,7 +361,10 @@ mod tests {
             call_id,
             Mnemonic::Call(Call {
                 target,
-                args,
+                args: args
+                    .into_iter()
+                    .map(|arg| arg.localize(call_id.func))
+                    .collect(),
                 clobbers: vec![],
             }),
         );
@@ -392,7 +395,7 @@ mod tests {
             ret_id,
             Mnemonic::Return(Return {
                 ptr,
-                value: Some(ValueId::Instruction(tuple)),
+                value: Some(ValueId::Instruction(tuple).localize(ret_id.func)),
             }),
         );
         Function::from_id_mut(&mut tc.ctx, fid).set_input_regs(inputs);
@@ -408,10 +411,10 @@ mod tests {
         else {
             return None;
         };
-        let ValueId::Instruction(t) = v else {
+        let qcode::value::LocalValueId::Instruction(t) = v else {
             return None;
         };
-        match tc.ctx.get_insn(*t).mnemonic() {
+        match tc.ctx.get_insn(InstructionId::new(ret.func, *t)).mnemonic() {
             Mnemonic::Tuple(t) => Some(t.fields.len()),
             _ => None,
         }
@@ -419,7 +422,7 @@ mod tests {
 
     fn call_args(tc: &qcode::testing::TestContext, call_id: InstructionId) -> Vec<ValueId> {
         match tc.ctx.get_insn(call_id).mnemonic() {
-            Mnemonic::Call(c) => c.args.clone(),
+            Mnemonic::Call(c) => c.args.iter().map(|arg| arg.qualify(call_id.func)).collect(),
             _ => unreachable!(),
         }
     }

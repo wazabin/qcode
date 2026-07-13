@@ -122,7 +122,7 @@ fn try_match(host: HostRef, fid: FunctionId) -> Option<PromoteMatch> {
                 Mnemonic::Load(l) if is_ram(l.space) => accesses.push(Acc {
                     id: insn.id,
                     block: bid,
-                    ptr: l.ptr,
+                    ptr: l.ptr.qualify(insn.id.func),
                     size: l.size,
                     space: l.space,
                     stored: None,
@@ -130,10 +130,10 @@ fn try_match(host: HostRef, fid: FunctionId) -> Option<PromoteMatch> {
                 Mnemonic::Store(s) if is_ram(s.space) => accesses.push(Acc {
                     id: insn.id,
                     block: bid,
-                    ptr: s.ptr,
+                    ptr: s.ptr.qualify(insn.id.func),
                     size: s.size,
                     space: s.space,
-                    stored: Some(s.src),
+                    stored: Some(s.src.qualify(insn.id.func)),
                 }),
                 _ => {}
             }
@@ -405,7 +405,9 @@ fn append_edge_arg<'str>(
     // The terminator's targets are body-local indices in `from`'s arena.
     let q = |t| BlockId::new(from.func, t);
     match &mut m {
-        Mnemonic::Branch(Branch { target, args }) if q(*target) == to => args.push(arg),
+        Mnemonic::Branch(Branch { target, args }) if q(*target) == to => {
+            args.push(arg.localize(term_id.func));
+        }
         Mnemonic::CBranch(CBranch {
             success_block,
             success_args,
@@ -414,10 +416,10 @@ fn append_edge_arg<'str>(
             ..
         }) => {
             if q(*success_block) == to {
-                success_args.push(arg);
+                success_args.push(arg.localize(term_id.func));
             }
             if q(*failure_block) == to {
-                failure_args.push(arg);
+                failure_args.push(arg.localize(term_id.func));
             }
         }
         _ => return,
@@ -598,7 +600,7 @@ fn apply_generic<'str>(host: &mut PassBacking<'_, 'str>, m: &PromoteMatch) -> bo
             term_id,
             Mnemonic::Load(Load {
                 space: m.region_space,
-                ptr: dst,
+                ptr: dst.localize(m.preheader.func),
                 size: arr_sz,
             }),
             arr_ty,
@@ -612,7 +614,10 @@ fn apply_generic<'str>(host: &mut PassBacking<'_, 'str>, m: &PromoteMatch) -> bo
             m.preheader,
             Mnemonic::Intrinsic(IntrinsicApp {
                 id: splat_id,
-                args: vec![zero_elem, count_const],
+                args: vec![
+                    zero_elem.localize(m.preheader.func),
+                    count_const.localize(m.preheader.func),
+                ],
             }),
             arr_ty,
         )
@@ -629,7 +634,11 @@ fn apply_generic<'str>(host: &mut PassBacking<'_, 'str>, m: &PromoteMatch) -> bo
                 term_id,
                 Mnemonic::Intrinsic(IntrinsicApp {
                     id: insert_id,
-                    args: vec![arr0, idx0, seed.val],
+                    args: vec![
+                        arr0.localize(m.preheader.func),
+                        idx0.localize(m.preheader.func),
+                        seed.val.localize(m.preheader.func),
+                    ],
                 }),
                 arr_ty,
             )
@@ -646,7 +655,7 @@ fn apply_generic<'str>(host: &mut PassBacking<'_, 'str>, m: &PromoteMatch) -> bo
             load_id,
             Mnemonic::Intrinsic(IntrinsicApp {
                 id: at_id,
-                args: vec![arr_b, idx],
+                args: vec![arr_b.localize(m.body.func), idx.localize(m.body.func)],
             }),
             elem_ty,
         );
@@ -664,7 +673,11 @@ fn apply_generic<'str>(host: &mut PassBacking<'_, 'str>, m: &PromoteMatch) -> bo
             term_id,
             Mnemonic::Intrinsic(IntrinsicApp {
                 id: insert_id,
-                args: vec![arr_b, idx, m.stored_val],
+                args: vec![
+                    arr_b.localize(m.body.func),
+                    idx.localize(m.body.func),
+                    m.stored_val.localize(m.body.func),
+                ],
             }),
             arr_ty,
         )
@@ -679,7 +692,7 @@ fn apply_generic<'str>(host: &mut PassBacking<'_, 'str>, m: &PromoteMatch) -> bo
             load_id,
             Mnemonic::Intrinsic(IntrinsicApp {
                 id: at_id,
-                args: vec![arr_e, idx],
+                args: vec![arr_e.localize(m.exit.func), idx.localize(m.exit.func)],
             }),
             elem_ty,
         );

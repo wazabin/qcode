@@ -6,7 +6,10 @@
 //! `Extract` *is* the field value it names), so no multi-result instruction is
 //! needed. `argpromote` uses them to return `(real_return, write-set)`.
 
-use crate::{context::Context, value::ValueId};
+use crate::{
+    context::Context,
+    value::{LocalValueId, function::FunctionId},
+};
 
 use super::mnemonic::{Args, MnemonicKind};
 use smallvec::{SmallVec, smallvec};
@@ -16,7 +19,7 @@ use smallvec::{SmallVec, smallvec};
 /// types.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub struct Tuple {
-    pub fields: Vec<ValueId>,
+    pub fields: Vec<LocalValueId>,
 }
 
 impl MnemonicKind for Tuple {
@@ -33,13 +36,13 @@ impl MnemonicKind for Tuple {
 /// type is that field's type.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub struct Extract {
-    pub agg: ValueId,
+    pub agg: LocalValueId,
     pub index: usize,
 }
 
 impl Extract {
-    pub fn field_name<'a>(&self, ctx: &'a Context<'_>) -> Option<&'a str> {
-        let agg_ty = ctx.stored_type_of(self.agg)?;
+    pub fn field_name<'a>(&self, ctx: &'a Context<'_>, func: FunctionId) -> Option<&'a str> {
+        let agg_ty = ctx.stored_type_of(self.agg.qualify(func))?;
         ctx.shared.types.field_name(agg_ty, self.index)
     }
 }
@@ -66,7 +69,7 @@ impl MnemonicKind for Extract {
 /// byte `offset`.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub struct Gep {
-    pub base: ValueId,
+    pub base: LocalValueId,
     pub offset: usize,
 }
 
@@ -74,8 +77,8 @@ impl Gep {
     /// The name of the field this `Gep` addresses, recovered from the nominal
     /// struct that `base` points at. `None` if `base` is not a typed struct
     /// pointer or the offset matches no field.
-    pub fn field_name<'a>(&self, ctx: &'a Context<'_>) -> Option<&'a str> {
-        let base_ty = ctx.stored_type_of(self.base)?;
+    pub fn field_name<'a>(&self, ctx: &'a Context<'_>, func: FunctionId) -> Option<&'a str> {
+        let base_ty = ctx.stored_type_of(self.base.qualify(func))?;
         let pointee = ctx.shared.types.pointee_of(base_ty)?;
         ctx.shared
             .types

@@ -3,7 +3,7 @@ use rustc_hash::FxHashSet as HashSet;
 use qcode::{
     context::Context,
     space::SpaceType,
-    value::{Function, FunctionId, ValueId, Varnode, VarnodeId, insn::Mnemonic},
+    value::{Function, FunctionId, LocalValueId, Varnode, VarnodeId, insn::Mnemonic},
 };
 
 /// Returns the set of register-space varnodes written by `function_id`.
@@ -17,7 +17,7 @@ pub fn compute_clobbered_regs(ctx: &Context, function_id: FunctionId) -> Vec<Var
     for block in Function::from_id(ctx, function_id).iter() {
         for insn in block.iter() {
             if let Mnemonic::Store(store) = insn.mnemonic()
-                && let ValueId::Varnode(vn_id) = store.ptr
+                && let LocalValueId::Varnode(vn_id) = store.ptr
                 && matches!(Varnode::from_id(ctx, vn_id).space().ty, SpaceType::Register)
                 && seen.insert(vn_id)
             {

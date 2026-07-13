@@ -1,4 +1,4 @@
-use crate::value::{LocalBlockId, ValueId, function::FunctionId};
+use crate::value::{LocalBlockId, LocalValueId, function::FunctionId};
 
 use super::mnemonic::{Args, MnemonicKind};
 use smallvec::{SmallVec, smallvec};
@@ -11,7 +11,7 @@ pub struct Branch {
     /// own `id.func`.
     pub target: LocalBlockId,
     /// Arguments passed to the target block's parameters.
-    pub args: Vec<ValueId>,
+    pub args: Vec<LocalValueId>,
 }
 
 impl MnemonicKind for Branch {
@@ -30,7 +30,7 @@ impl MnemonicKind for Branch {
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub struct BranchInd {
-    pub ptr: ValueId,
+    pub ptr: LocalValueId,
 }
 
 impl MnemonicKind for BranchInd {
@@ -60,7 +60,7 @@ pub struct TailCall {
     pub target: FunctionId,
     /// Values passed to the callee, one per inferred callee input, in order.
     /// Empty on the freshly-lifted IR; populated once the call interface is known.
-    pub args: Vec<ValueId>,
+    pub args: Vec<LocalValueId>,
 }
 
 impl MnemonicKind for TailCall {
@@ -81,7 +81,7 @@ impl MnemonicKind for TailCall {
 pub struct Apply {
     pub target: FunctionId,
     /// Values passed to the lambda, one per root block param, in order.
-    pub args: Vec<ValueId>,
+    pub args: Vec<LocalValueId>,
 }
 
 impl MnemonicKind for Apply {
@@ -98,12 +98,12 @@ impl MnemonicKind for Apply {
 pub struct Call {
     pub target: FunctionId,
     /// Values passed to the callee, one per inferred callee input, in order.
-    pub args: Vec<ValueId>,
+    pub args: Vec<LocalValueId>,
     /// Register / memory locations the call may write or alias (the callee's
     /// clobbered set plus escaping pointer arguments). These are *defs*, not
     /// reads: they are intentionally excluded from [`MnemonicKind::args`] so
     /// they do not participate in use-def bookkeeping.
-    pub clobbers: Vec<ValueId>,
+    pub clobbers: Vec<LocalValueId>,
 }
 
 impl MnemonicKind for Call {
@@ -122,8 +122,8 @@ impl MnemonicKind for Call {
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub struct CallInd {
-    pub ptr: ValueId,
-    pub args: Vec<ValueId>,
+    pub ptr: LocalValueId,
+    pub args: Vec<LocalValueId>,
 }
 
 impl MnemonicKind for CallInd {
@@ -144,17 +144,17 @@ impl MnemonicKind for CallInd {
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub struct CBranch {
-    pub condition: ValueId,
+    pub condition: LocalValueId,
     /// Taken-arm CFG successor (bare body-local index; same arena as this
     /// terminator — see [`Branch::target`]).
     pub success_block: LocalBlockId,
     /// Arguments passed to `success_block`'s parameters when the branch is taken.
-    pub success_args: Vec<ValueId>,
+    pub success_args: Vec<LocalValueId>,
     /// Fall-through CFG successor (bare body-local index; same arena as this
     /// terminator).
     pub failure_block: LocalBlockId,
     /// Arguments passed to `failure_block`'s parameters when the branch falls through.
-    pub failure_args: Vec<ValueId>,
+    pub failure_args: Vec<LocalValueId>,
 }
 
 impl MnemonicKind for CBranch {
@@ -176,8 +176,8 @@ impl MnemonicKind for CBranch {
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub struct Return {
-    pub ptr: ValueId,
-    pub value: Option<ValueId>,
+    pub ptr: LocalValueId,
+    pub value: Option<LocalValueId>,
 }
 
 impl MnemonicKind for Return {
@@ -200,7 +200,7 @@ impl MnemonicKind for Return {
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub struct ReturnValue {
-    pub value: ValueId,
+    pub value: LocalValueId,
 }
 
 impl MnemonicKind for ReturnValue {
@@ -350,7 +350,7 @@ mod tests {
             call_id,
             Mnemonic::Call(super::Call {
                 target: callee,
-                args: vec![first, second],
+                args: vec![first.strip_func(), second.strip_func()],
                 clobbers: vec![],
             }),
         );
@@ -390,7 +390,7 @@ mod tests {
             call_id,
             Mnemonic::Call(super::Call {
                 target: callee,
-                args: vec![arg],
+                args: vec![arg.strip_func()],
                 clobbers: vec![],
             }),
         );
@@ -553,7 +553,7 @@ mod tests {
         };
         assert_eq!(branch.target, dst.local);
         assert_eq!(branch.args.len(), 1);
-        assert_eq!(branch.args[0], ValueId::BlockParam(a));
+        assert_eq!(branch.args[0], ValueId::BlockParam(a).strip_func());
     }
 
     #[test]
@@ -578,8 +578,14 @@ mod tests {
         let Mnemonic::CBranch(cbranch) = insn.mnemonic() else {
             panic!("expected cbranch");
         };
-        assert_eq!(cbranch.success_args, [ValueId::BlockParam(then_arg)]);
-        assert_eq!(cbranch.failure_args, [ValueId::BlockParam(else_arg)]);
+        assert_eq!(
+            cbranch.success_args,
+            [ValueId::BlockParam(then_arg).strip_func()]
+        );
+        assert_eq!(
+            cbranch.failure_args,
+            [ValueId::BlockParam(else_arg).strip_func()]
+        );
         assert_ne!(cbranch.success_block, cbranch.failure_block);
     }
 
@@ -623,7 +629,10 @@ mod tests {
         };
         assert_eq!(
             branch.args,
-            [ValueId::BlockParam(b), ValueId::BlockParam(a)]
+            [
+                ValueId::BlockParam(b).strip_func(),
+                ValueId::BlockParam(a).strip_func()
+            ]
         );
         assert_eq!(
             last.as_statement().to_string(),

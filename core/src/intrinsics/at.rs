@@ -108,7 +108,10 @@ fn simplify_at(host: HostRef, out_size: usize, arr: ValueId, index: ValueId) -> 
         let Mnemonic::Intrinsic(app) = host.instruction(iid).mnemonic() else {
             return None;
         };
-        let (name, args) = (app.id.name(), app.args.clone());
+        let name = app.id.name();
+        // Operands are stored bare-local; qualify with the intrinsic's own function
+        // so the rest of this simplifier speaks the boundary `ValueId`.
+        let args: Vec<ValueId> = app.args.iter().map(|a| a.qualify(iid.func)).collect();
         match name {
             // `at(insert(a, i, v), j)`.
             "insert" => {
@@ -153,7 +156,9 @@ fn forward(host: HostRef, out_size: usize, base: ValueId, index: ValueId) -> Sim
     simplify_at(host, out_size, base, index).unwrap_or_else(|| {
         Simplified::Expression(Mnemonic::Intrinsic(crate::value::insn::IntrinsicApp {
             id: IntrinsicId::from_name("at").unwrap(),
-            args: vec![base, index],
+            // The expression's operands are all in `base`/`index`'s own body; strip
+            // the func to store them bare-local (no ambient func needed here).
+            args: vec![base.strip_func(), index.strip_func()],
         }))
     })
 }
@@ -166,7 +171,7 @@ mod tests {
     use crate::builder::Builder;
     use crate::context::Context;
     use crate::value::insn::IntrinsicId;
-    use crate::value::{BasicBlock, ValueId};
+    use crate::value::{BasicBlock, LocalValueId, ValueId};
 
     fn at_id() -> IntrinsicId {
         IntrinsicId::from_name("at").unwrap()
@@ -237,7 +242,10 @@ mod tests {
         {
             Some(Simplified::Expression(Mnemonic::Intrinsic(app))) => {
                 assert_eq!(app.id.name(), "at");
-                assert_eq!(app.args, vec![ValueId::BlockParam(a), j]);
+                assert_eq!(
+                    app.args,
+                    vec![ValueId::BlockParam(a).strip_func(), j.strip_func()]
+                );
             }
             other => panic!("expected at(a, j), got {other:?}"),
         }
@@ -300,7 +308,10 @@ mod tests {
         {
             Some(Simplified::Expression(Mnemonic::Intrinsic(app))) => {
                 assert_eq!(app.id.name(), "at");
-                assert_eq!(app.args, vec![ValueId::BlockParam(a), j0]);
+                assert_eq!(
+                    app.args,
+                    vec![ValueId::BlockParam(a).strip_func(), j0.strip_func()]
+                );
             }
             other => panic!("expected at(a, 0), got {other:?}"),
         }
@@ -312,10 +323,10 @@ mod tests {
         {
             Some(Simplified::Expression(Mnemonic::Intrinsic(app))) => {
                 assert_eq!(app.id.name(), "at");
-                let ValueId::Literal(l) = app.args[1] else {
+                let LocalValueId::Literal(l) = app.args[1] else {
                     panic!("expected literal shifted index");
                 };
-                assert_eq!(app.args[0], ValueId::BlockParam(b));
+                assert_eq!(app.args[0], ValueId::BlockParam(b).strip_func());
                 assert_eq!(ctx.shared.values.literals[l].value, 1);
             }
             other => panic!("expected at(b, 1), got {other:?}"),

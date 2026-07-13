@@ -240,7 +240,7 @@ impl Extract<'_, '_> {
     fn expand(&mut self, iid: InstructionId) -> Expr {
         match InstructionRef::new(self.host, iid).mnemonic() {
             Mnemonic::Binop(b) => {
-                let (lhs, rhs) = (b.lhs, b.rhs);
+                let (lhs, rhs) = (b.lhs.qualify(iid.func), b.rhs.qualify(iid.func));
                 match int_op(&b.op).expect("is_mba_insn gates the opset") {
                     IntBinop::Add => Expr::Add(vec![self.child(lhs), self.child(rhs)]),
                     IntBinop::Sub => {
@@ -262,7 +262,7 @@ impl Extract<'_, '_> {
                 }
             }
             Mnemonic::Unop(u) => {
-                let src = u.src;
+                let src = u.src.qualify(iid.func);
                 match u.op {
                     Unop::IntNot => Expr::Not(Box::new(self.child(src))),
                     Unop::IntNegate => Expr::Scale(VarInt::MAX, Box::new(self.child(src))),
@@ -437,7 +437,7 @@ fn emit<'str>(
                 host,
                 Mnemonic::Unop(Unary {
                     op: Unop::IntNot,
-                    src: xv,
+                    src: xv.localize(block.func),
                 }),
                 size,
                 before,
@@ -505,8 +505,8 @@ fn push_binop<'str>(
         host,
         Mnemonic::Binop(Binary {
             op: Binop::Int(op),
-            lhs,
-            rhs,
+            lhs: lhs.localize(block.func),
+            rhs: rhs.localize(block.func),
         }),
         size,
         before,
@@ -532,8 +532,7 @@ fn prune_dead<'str>(host: &mut PassBacking<'_, 'str>, iid: InstructionId) {
         return;
     }
     let operands = InstructionRef::new(host.read_host(), iid)
-        .mnemonic()
-        .args()
+        .operands()
         .into_iter()
         .collect::<Vec<_>>();
     host.remove_instruction(iid);
@@ -600,7 +599,7 @@ fn is_mba_insn(host: HostRef, iid: InstructionId) -> bool {
                 | IntBinop::Xor => true,
                 IntBinop::ShiftLeft => {
                     let bits = (insn_size(host, iid) * 8) as u64;
-                    matches!(numeric_const(host, b.rhs), Some(c) if c < bits)
+                    matches!(numeric_const(host, b.rhs.qualify(iid.func)), Some(c) if c < bits)
                 }
                 _ => false,
             },
@@ -655,7 +654,7 @@ mod tests {
             .last()
             .expect("terminator");
         match Instruction::from_id(ctx, term).mnemonic() {
-            Mnemonic::ReturnValue(r) => r.value,
+            Mnemonic::ReturnValue(r) => r.value.qualify(term.func),
             other => panic!("expected return, got {other:?}"),
         }
     }

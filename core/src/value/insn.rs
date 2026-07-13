@@ -199,8 +199,13 @@ where
     /// body changes — it qualifies each local operand with the owning function
     /// (`self.id.func`), which a bare `&Mnemonic` cannot do — so every caller
     /// keeps seeing qualified `ValueId`s unchanged.
-    pub fn operands(&'s self) -> mnemonic::Args {
-        self.mnemonic().args()
+    pub fn operands(&'s self) -> smallvec::SmallVec<[ValueId; 2]> {
+        let func = self.id.func;
+        self.mnemonic()
+            .args()
+            .into_iter()
+            .map(|v| v.qualify(func))
+            .collect()
     }
 
     /// The address of the corresponding instruction
@@ -412,7 +417,7 @@ impl<'str, 'ctx> InstructionMutRef<'str, 'ctx> {
         // Operand uses are recorded in this instruction's own function map.
         let func = self.id.func;
         for arg in old_args {
-            if let Some(users) = self.ctx.bodies[func].users.get_mut(&arg.strip_func()) {
+            if let Some(users) = self.ctx.bodies[func].users.get_mut(&arg) {
                 users.retain(|&user| user != self.id);
             }
         }
@@ -420,7 +425,7 @@ impl<'str, 'ctx> InstructionMutRef<'str, 'ctx> {
         for arg in new_args {
             self.ctx.bodies[func]
                 .users
-                .entry(arg.strip_func())
+                .entry(arg)
                 .or_default()
                 .push(self.id);
         }

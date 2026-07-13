@@ -13,7 +13,8 @@ use qcode::{
     context::Context,
     space::SpaceType,
     value::{
-        BasicBlock, BlockId, BlockParam, Function, FunctionId, ValueId, Varnode, VarnodeId,
+        BasicBlock, BlockId, BlockParam, Function, FunctionId, LocalValueId, ValueId, Varnode,
+        VarnodeId,
         insn::{Binop, IntBinop, Mnemonic},
     },
 };
@@ -67,7 +68,8 @@ fn function_writes_through_stack_arg(
                 && s.space == ram
             {
                 let mut visited = HashSet::default();
-                let (derives, dynamic) = trace_stack_arg_pointer(ctx, &frame, s.ptr, &mut visited);
+                let (derives, dynamic) =
+                    trace_stack_arg_pointer(ctx, &frame, s.ptr.qualify(insn.id.func), &mut visited);
                 if derives && dynamic {
                     return true;
                 }
@@ -141,16 +143,18 @@ fn trace_stack_arg_pointer(
         }
         ValueId::Instruction(iid) => match ctx.get_insn(iid).mnemonic().clone() {
             Mnemonic::Binop(b) if matches!(b.op, Binop::Int(IntBinop::Add | IntBinop::Sub)) => {
-                let (ld, ldyn) = trace_stack_arg_pointer(ctx, frame, b.lhs, visited);
-                let (rd, rdyn) = trace_stack_arg_pointer(ctx, frame, b.rhs, visited);
+                let (ld, ldyn) =
+                    trace_stack_arg_pointer(ctx, frame, b.lhs.qualify(iid.func), visited);
+                let (rd, rdyn) =
+                    trace_stack_arg_pointer(ctx, frame, b.rhs.qualify(iid.func), visited);
                 let derives = ld || rd;
                 // The operand that does not derive from the pointer is the offset;
                 // a non-constant offset makes the access unbounded.
                 let mut dynamic = ldyn || rdyn;
-                if ld && !matches!(b.rhs, ValueId::Literal(_)) {
+                if ld && !matches!(b.rhs, LocalValueId::Literal(_)) {
                     dynamic = true;
                 }
-                if rd && !matches!(b.lhs, ValueId::Literal(_)) {
+                if rd && !matches!(b.lhs, LocalValueId::Literal(_)) {
                     dynamic = true;
                 }
                 (derives, derives && dynamic)
@@ -177,19 +181,19 @@ fn incoming_values(ctx: &Context, block: BlockId, index: usize) -> Vec<ValueId> 
         match term.mnemonic() {
             Mnemonic::Branch(br) if q(br.target) == block => {
                 if let Some(&a) = br.args.get(index) {
-                    out.push(a);
+                    out.push(a.qualify(pred.func));
                 }
             }
             Mnemonic::CBranch(cb) => {
                 if q(cb.success_block) == block
                     && let Some(&a) = cb.success_args.get(index)
                 {
-                    out.push(a);
+                    out.push(a.qualify(pred.func));
                 }
                 if q(cb.failure_block) == block
                     && let Some(&a) = cb.failure_args.get(index)
                 {
-                    out.push(a);
+                    out.push(a.qualify(pred.func));
                 }
             }
             _ => {}
@@ -215,7 +219,7 @@ fn block_reg_flow(ctx: &Context, block: BlockId) -> (HashSet<VarnodeId>, HashSet
     for insn in BasicBlock::from_id(ctx, block).iter() {
         match insn.mnemonic() {
             Mnemonic::Load(load) => {
-                if let ValueId::Varnode(vn) = load.ptr
+                if let LocalValueId::Varnode(vn) = load.ptr
                     && is_register(ctx, vn)
                     && !written.contains(&vn)
                 {
@@ -223,7 +227,7 @@ fn block_reg_flow(ctx: &Context, block: BlockId) -> (HashSet<VarnodeId>, HashSet
                 }
             }
             Mnemonic::Store(store) => {
-                if let ValueId::Varnode(vn) = store.ptr
+                if let LocalValueId::Varnode(vn) = store.ptr
                     && is_register(ctx, vn)
                 {
                     written.insert(vn);
@@ -378,10 +382,11 @@ pub fn compute_stack_delta(
             let Mnemonic::Store(store) = insn.mnemonic() else {
                 continue;
             };
-            if store.ptr != sp {
+            if store.ptr.qualify(insn.id.func) != sp {
                 continue;
             }
-            if let Some(off) = frame_offset(ctx, &numbering, base, store.src) {
+            if let Some(off) = frame_offset(ctx, &numbering, base, store.src.qualify(insn.id.func))
+            {
                 block_delta = Some(off);
             }
         }

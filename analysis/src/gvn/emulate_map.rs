@@ -86,7 +86,7 @@ enum Lane {
 impl EmulateMap {
     fn emulate(&self, ctx: &mut Context, ic: &InsnCtx, map: &Map) -> Option<ValueId> {
         // The source must be a fully-known constant: `b"…"` or `enumerate(b"…")`.
-        let (data, lane) = const_source(ctx, map.src)?;
+        let (data, lane) = const_source(ctx, map.src.qualify(ic.insn_id.func))?;
         let esz = match lane {
             Lane::Scalar { esz } | Lane::Enumerate { esz, .. } => esz,
         };
@@ -116,7 +116,7 @@ impl EmulateMap {
         // Every capture must be a constant for the body to be fully evaluable.
         let mut capture_args: Vec<BodyArg> = Vec::with_capacity(map.captures.len());
         for (&cap, &size) in map.captures.iter().zip(&param_sizes[1..]) {
-            let value = const_value(&*ctx, cap)?;
+            let value = const_value(&*ctx, cap.qualify(ic.insn_id.func))?;
             capture_args.push(BodyArg::Scalar(SizedValue::new(value, size)));
         }
 
@@ -167,7 +167,7 @@ impl EmulateMap {
     /// element param 1 — so the per-lane args prepend `acc` to the element. Returns
     /// `None` unless the source, the captures, and `init` are all constant.
     fn emulate_scan(&self, ctx: &mut Context, ic: &InsnCtx, scan: &Scan) -> Option<ValueId> {
-        let (data, lane) = const_source(ctx, scan.src)?;
+        let (data, lane) = const_source(ctx, scan.src.qualify(ic.insn_id.func))?;
         let esz = match lane {
             Lane::Scalar { esz } | Lane::Enumerate { esz, .. } => esz,
         };
@@ -202,12 +202,12 @@ impl EmulateMap {
         // Every capture must be a constant for the body to be fully evaluable.
         let mut capture_args: Vec<BodyArg> = Vec::with_capacity(scan.captures.len());
         for (&cap, &size) in scan.captures.iter().zip(&param_sizes[2..]) {
-            let value = const_value(&*ctx, cap)?;
+            let value = const_value(&*ctx, cap.qualify(ic.insn_id.func))?;
             capture_args.push(BodyArg::Scalar(SizedValue::new(value, size)));
         }
 
         // The initial accumulator must be a constant.
-        let mut init_bytes = const_bytes(ctx, scan.init)?;
+        let mut init_bytes = const_bytes(ctx, scan.init.qualify(ic.insn_id.func))?;
         init_bytes.resize(acc_sz, 0);
         let mut acc = read_le(&init_bytes, 0, acc_sz);
 
@@ -272,7 +272,7 @@ fn const_source(ctx: &Context, src: ValueId) -> Option<(Vec<u8>, Lane)> {
     if intr.id.name() != "enumerate" {
         return None;
     }
-    let data = const_bytes(ctx, *intr.args.first()?)?;
+    let data = const_bytes(ctx, intr.args.first()?.qualify(id.func))?;
     // The element and index widths are fixed by `enumerate`'s result type
     // (`[(index, elem); n]`), independent of how the source constant is stored.
     let enum_ty = ctx.stored_type_of(src)?;
@@ -350,8 +350,8 @@ mod tests {
         tc.ctx.replace_instruction_mnemonic(
             rid,
             Mnemonic::Return(Return {
-                ptr,
-                value: Some(value),
+                ptr: ptr.localize(rid.func),
+                value: Some(value.localize(rid.func)),
             }),
         );
     }
@@ -384,8 +384,8 @@ mod tests {
         tc.ctx.replace_instruction_mnemonic(
             rid,
             Mnemonic::Return(Return {
-                ptr,
-                value: Some(inc),
+                ptr: ptr.localize(rid.func),
+                value: Some(inc.localize(rid.func)),
             }),
         );
         Function::from_id_mut(&mut tc.ctx, fid).set_is_pure(true);
@@ -430,8 +430,8 @@ mod tests {
         tc.ctx.replace_instruction_mnemonic(
             rid,
             Mnemonic::Return(Return {
-                ptr,
-                value: Some(sum),
+                ptr: ptr.localize(rid.func),
+                value: Some(sum.localize(rid.func)),
             }),
         );
         Function::from_id_mut(&mut tc.ctx, fid).set_is_pure(true);
@@ -447,10 +447,10 @@ mod tests {
             let Mnemonic::Return(Return { value: Some(v), .. }) = i.mnemonic() else {
                 return None;
             };
-            match v {
-                ValueId::Bytes(bid) => Some(tc.ctx.shared.values.bytes[*bid].data.clone()),
+            match v.qualify(root.func) {
+                ValueId::Bytes(bid) => Some(tc.ctx.shared.values.bytes[bid].data.clone()),
                 ValueId::Literal(lid) => {
-                    let lit = &tc.ctx.shared.values.literals[*lid];
+                    let lit = &tc.ctx.shared.values.literals[lid];
                     let size = tc.ctx.shared.types.size_of(lit.type_id);
                     Some(lit.value.to_le_bytes()[..size].to_vec())
                 }
@@ -603,8 +603,8 @@ mod tests {
         tc.ctx.replace_instruction_mnemonic(
             rid,
             Mnemonic::Return(Return {
-                ptr,
-                value: Some(sum),
+                ptr: ptr.localize(rid.func),
+                value: Some(sum.localize(rid.func)),
             }),
         );
         Function::from_id_mut(&mut tc.ctx, fid).set_is_pure(true);

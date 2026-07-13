@@ -370,7 +370,7 @@ fn resolve_block(mut block: BlockMutRef) -> Option<Vec<Edit>> {
     let Mnemonic::BranchInd(BranchInd { ptr }) = insn.mnemonic() else {
         return None;
     };
-    let ptr = *ptr;
+    let ptr = ptr.qualify(insn.id.func);
 
     log::trace!(
         target: "jump_table",
@@ -484,8 +484,8 @@ fn resolve_block(mut block: BlockMutRef) -> Option<Vec<Edit>> {
 /// path rewrites the `BranchInd` into a direct `Branch`.
 fn resolve_constant_load(block: &mut BlockMutRef, ptr: ValueId) -> Option<Vec<Edit>> {
     let ctx = block.ctx();
-    let load = as_load(ctx, ptr)?;
-    let addr = numeric_const(ctx, load.ptr)?;
+    let (load, load_func) = as_load(ctx, ptr)?;
+    let addr = numeric_const(ctx, load.ptr.qualify(load_func))?;
 
     // A load from writable memory is not a reliable constant: the canonical case
     // is `jmp *[GOT]` in a PLT stub, whose slot the dynamic linker rewrites at
@@ -542,8 +542,8 @@ struct Table {
     index: ValueId,
 }
 
-fn recognize_absolute_table(ctx: &Context, load: Load) -> Option<Table> {
-    let (base, scale, index) = decompose_address(ctx, load.ptr)?;
+fn recognize_absolute_table(ctx: &Context, load: Load, load_func: FunctionId) -> Option<Table> {
+    let (base, scale, index) = decompose_address(ctx, load.ptr.qualify(load_func))?;
 
     Some(Table {
         base,
@@ -560,26 +560,27 @@ fn recognize_absolute_table(ctx: &Context, load: Load) -> Option<Table> {
 /// Relative: `ptr = Add(rel_base, [s|z]ext(Load(base + index*scale)))`.
 fn recognize_table(ctx: &Context, ptr: ValueId) -> Option<Table> {
     // Absolute: the branch pointer is the loaded value itself.
-    if let Some(load) = as_load(ctx, ptr) {
-        return recognize_absolute_table(ctx, load);
+    if let Some((load, load_func)) = as_load(ctx, ptr) {
+        return recognize_absolute_table(ctx, load, load_func);
     }
 
     // Relative: `rel_base + ext(load)`. One operand is the constant base, the
     // other resolves (through an optional sext/zext) to a table load.
+    let ptr_func = ptr.owning_function()?;
     if let Mnemonic::Binop(Binary {
         op: Binop::Int(IntBinop::Add),
         lhs,
         rhs,
     }) = def_mnemonic(ctx, ptr)?
     {
-        let (lhs, rhs) = (*lhs, *rhs);
+        let (lhs, rhs) = (lhs.qualify(ptr_func), rhs.qualify(ptr_func));
         let (rel_base, offset) = match (numeric_const(ctx, lhs), numeric_const(ctx, rhs)) {
             (Some(c), _) => (c, rhs),
             (_, Some(c)) => (c, lhs),
             _ => return None,
         };
-        let load = as_load(ctx, strip_ext(ctx, offset))?;
-        let (base, scale, index) = decompose_address(ctx, load.ptr)?;
+        let (load, load_func) = as_load(ctx, strip_ext(ctx, offset))?;
+        let (base, scale, index) = decompose_address(ctx, load.ptr.qualify(load_func))?;
         return Some(Table {
             base,
             scale,
@@ -595,6 +596,7 @@ fn recognize_table(ctx: &Context, ptr: ValueId) -> Option<Table> {
 /// Decompose a table-element address `base + index*scale` into its parts.
 /// Accepts `base + index` (scale 1), `base + index*c`, and `base + index<<c`.
 fn decompose_address(ctx: &Context, addr: ValueId) -> Option<(u64, u64, ValueId)> {
+    let func = addr.owning_function()?;
     let Mnemonic::Binop(Binary {
         op: Binop::Int(IntBinop::Add),
         lhs,
@@ -604,6 +606,7 @@ fn decompose_address(ctx: &Context, addr: ValueId) -> Option<(u64, u64, ValueId)
         log::trace!(target: "jump_table", "not a table: no add");
         return None;
     };
+    let (lhs, rhs) = (lhs.qualify(func), rhs.qualify(func));
 
     // The base is the constant operand; the other is the (scaled) index.
     let (base, idx_expr) = match (numeric_const(ctx, lhs), numeric_const(ctx, rhs)) {
@@ -622,23 +625,25 @@ fn decompose_address(ctx: &Context, addr: ValueId) -> Option<(u64, u64, ValueId)
 
 /// Pull a constant scale out of `index*c` or `index<<c`; otherwise scale 1.
 fn decompose_scale(ctx: &Context, v: ValueId) -> (u64, ValueId) {
-    if let Some(Mnemonic::Binop(Binary {
-        op: Binop::Int(op),
-        lhs,
-        rhs,
-    })) = def_mnemonic(ctx, v)
+    if let Some(func) = v.owning_function()
+        && let Some(Mnemonic::Binop(Binary {
+            op: Binop::Int(op),
+            lhs,
+            rhs,
+        })) = def_mnemonic(ctx, v)
     {
+        let (lhs, rhs) = (lhs.qualify(func), rhs.qualify(func));
         match op {
-            IntBinop::Mul => match (numeric_const(ctx, *lhs), numeric_const(ctx, *rhs)) {
-                (Some(c), _) => return (c, *rhs),
-                (_, Some(c)) => return (c, *lhs),
+            IntBinop::Mul => match (numeric_const(ctx, lhs), numeric_const(ctx, rhs)) {
+                (Some(c), _) => return (c, rhs),
+                (_, Some(c)) => return (c, lhs),
                 _ => {}
             },
             IntBinop::ShiftLeft => {
-                if let Some(sh) = numeric_const(ctx, *rhs)
+                if let Some(sh) = numeric_const(ctx, rhs)
                     && sh < 64
                 {
-                    return (1u64 << sh, *lhs);
+                    return (1u64 << sh, lhs);
                 }
             }
             _ => {}
@@ -647,19 +652,27 @@ fn decompose_scale(ctx: &Context, v: ValueId) -> (u64, ValueId) {
     (1, v)
 }
 
-/// The `Load` defining `v`, if `v` is the result of a RAM load.
-fn as_load(ctx: &Context, v: ValueId) -> Option<Load> {
-    match def_mnemonic(ctx, v)? {
-        Mnemonic::Load(load) => Some(load.clone()),
+/// The `Load` defining `v` (paired with its owning function, which qualifies
+/// the load's bare-local operands), if `v` is the result of a RAM load.
+fn as_load(ctx: &Context, v: ValueId) -> Option<(Load, FunctionId)> {
+    let ValueId::Instruction(id) = v else {
+        return None;
+    };
+    match ctx.get_insn(id).mnemonic() {
+        Mnemonic::Load(load) => Some((load.clone(), id.func)),
         _ => None,
     }
 }
 
 /// Peel a single sign/zero-extension off `v`, returning its source.
 fn strip_ext(ctx: &Context, v: ValueId) -> ValueId {
+    let func = match v {
+        ValueId::Instruction(id) => id.func,
+        _ => return v,
+    };
     match def_mnemonic(ctx, v) {
-        Some(Mnemonic::Sext(s)) => s.src,
-        Some(Mnemonic::Zext(z)) => z.src,
+        Some(Mnemonic::Sext(s)) => s.src.qualify(func),
+        Some(Mnemonic::Zext(z)) => z.src.qualify(func),
         _ => v,
     }
 }
@@ -1139,7 +1152,7 @@ mod tests {
             {
                 [*lhs, *rhs]
                     .into_iter()
-                    .any(|v| numeric_const(ctx, v) == Some(value))
+                    .any(|v| numeric_const(ctx, v.qualify(insn.id.func)) == Some(value))
             } else {
                 false
             }

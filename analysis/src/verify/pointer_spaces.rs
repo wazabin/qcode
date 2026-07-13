@@ -19,8 +19,8 @@ pub fn verify_pointer_spaces(ctx: &Context) -> Vec<String> {
     let mut out = Vec::new();
     for insn in ctx.instructions() {
         let (ptr, space) = match insn.mnemonic() {
-            Mnemonic::Load(l) => (l.ptr, l.space),
-            Mnemonic::Store(s) => (s.ptr, s.space),
+            Mnemonic::Load(l) => (l.ptr.qualify(insn.id.func), l.space),
+            Mnemonic::Store(s) => (s.ptr.qualify(insn.id.func), s.space),
             _ => continue,
         };
         match seen.get(&ptr) {

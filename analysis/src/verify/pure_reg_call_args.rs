@@ -84,7 +84,7 @@ pub fn verify_pure_reg_call_args(ctx: &Context<'_>) -> Vec<PureRegCallArgsViolat
             }
 
             let size_mismatch = if call.args.len() == param_sizes.len() {
-                first_size_mismatch(ctx, &call.args, &param_sizes)
+                first_size_mismatch(ctx, &insn.operands(), &param_sizes)
             } else {
                 None
             };
@@ -174,7 +174,10 @@ mod tests {
             call_id,
             Mnemonic::Call(Call {
                 target: callee,
-                args,
+                args: args
+                    .into_iter()
+                    .map(|arg| arg.localize(call_id.func))
+                    .collect(),
                 clobbers: vec![],
             }),
         );

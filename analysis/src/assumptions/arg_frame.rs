@@ -42,7 +42,7 @@ fn address_taken_set(ctx: &Context) -> HashSet<FunctionId> {
     let mut set = HashSet::new();
     for insn in ctx.instructions() {
         for arg in insn.mnemonic().args().iter().copied() {
-            if let ValueId::Function(f) = arg {
+            if let qcode::value::LocalValueId::Function(f) = arg {
                 set.insert(f);
             }
         }
@@ -199,7 +199,7 @@ fn args_provably_collide(
             continue;
         };
         // The callee's frame base in caller `@SP` offsets, from the `@ESP` argument.
-        let Some(&base_arg) = c.args.get(esp_idx) else {
+        let Some(base_arg) = c.args.get(esp_idx).map(|a| a.qualify(call_id.func)) else {
             continue;
         };
         let Some(base_off) = frame_offset(ctx, numbering, *caller_sp, base_arg) else {
@@ -214,7 +214,8 @@ fn args_provably_collide(
                 continue;
             };
             // A non-`@SP`-rooted arg (global/heap) can't be shown to collide.
-            let Some(a_off) = frame_offset(ctx, numbering, *caller_sp, arg) else {
+            let Some(a_off) = frame_offset(ctx, numbering, *caller_sp, arg.qualify(call_id.func))
+            else {
                 continue;
             };
             // Resolved overlap of `[a_off, a_off+pe)` with `[base_off, base_off+frame_ext)`
@@ -234,8 +235,8 @@ fn caller_frame_extent(ctx: &Context, fid: FunctionId, sp: ValueId, numbering: &
     for block in Function::from_id(ctx, fid).blocks() {
         for insn in block.iter() {
             let (ptr, size) = match insn.mnemonic() {
-                Mnemonic::Load(l) => (l.ptr, l.size),
-                Mnemonic::Store(s) => (s.ptr, s.size),
+                Mnemonic::Load(l) => (l.ptr.qualify(insn.id.func), l.size),
+                Mnemonic::Store(s) => (s.ptr.qualify(insn.id.func), s.size),
                 _ => continue,
             };
             if frame_class(ctx, numbering, sp, ptr) == Some(FrameClass::CallerFrame)
@@ -261,8 +262,8 @@ fn param_access_extent(
     for block in Function::from_id(ctx, fid).blocks() {
         for insn in block.iter() {
             let (ptr, size) = match insn.mnemonic() {
-                Mnemonic::Load(l) => (l.ptr, l.size),
-                Mnemonic::Store(s) => (s.ptr, s.size),
+                Mnemonic::Load(l) => (l.ptr.qualify(insn.id.func), l.size),
+                Mnemonic::Store(s) => (s.ptr.qualify(insn.id.func), s.size),
                 _ => continue,
             };
             let (base, off) = numbering.base_offset(ptr).unwrap_or((ptr, 0));
@@ -350,7 +351,10 @@ mod tests {
             call_id,
             Mnemonic::Call(Call {
                 target,
-                args,
+                args: args
+                    .into_iter()
+                    .map(|arg| arg.localize(call_id.func))
+                    .collect(),
                 clobbers: vec![],
             }),
         );

@@ -171,15 +171,20 @@ impl<'a, 'ctx> Builder<'a, 'ctx> {
 
                 match insn.mnemonic() {
                     Mnemonic::Load(load) => {
-                        self.walk_value(load.ptr, local_sink);
+                        self.walk_value(load.ptr.qualify(id.func), local_sink);
                         if let Some(function) = insn.function() {
-                            self.add_local_stores(load.ptr, function.id, local_sink);
+                            self.add_local_stores(
+                                load.ptr.qualify(id.func),
+                                function.id,
+                                local_sink,
+                            );
                         }
                     }
-                    Mnemonic::Call(call) => self.add_call_flow(call, local_sink),
+                    Mnemonic::Call(call) => self.add_call_flow(call, id.func, local_sink),
                     Mnemonic::CallInd(call) => {
-                        self.walk_value(call.ptr, local_sink);
+                        self.walk_value(call.ptr.qualify(id.func), local_sink);
                         for (i, &arg) in call.args.iter().enumerate() {
+                            let arg = arg.qualify(id.func);
                             if is_const(arg) {
                                 continue;
                             }
@@ -241,11 +246,12 @@ impl<'a, 'ctx> Builder<'a, 'ctx> {
                 }
                 _ => None,
             };
-            if let Some(&arg) = arg
-                && !is_const(arg)
-            {
-                self.edge(sink, sink, arg, DfEdgeKind::Operand);
-                self.walk_value(arg, sink);
+            if let Some(&arg) = arg {
+                let arg = arg.qualify(pred.func);
+                if !is_const(arg) {
+                    self.edge(sink, sink, arg, DfEdgeKind::Operand);
+                    self.walk_value(arg, sink);
+                }
             }
         }
     }
@@ -276,9 +282,10 @@ impl<'a, 'ctx> Builder<'a, 'ctx> {
             .flat_map(|block| block.instructions().collect::<Vec<_>>())
             .filter_map(|insn| match insn.mnemonic() {
                 Mnemonic::Store(store)
-                    if !is_const(store.src) && self.may_overlap(ptr, store.ptr) =>
+                    if !is_const(store.src.qualify(insn.id.func))
+                        && self.may_overlap(ptr, store.ptr.qualify(insn.id.func)) =>
                 {
-                    Some(store.src)
+                    Some(store.src.qualify(insn.id.func))
                 }
                 _ => None,
             })
@@ -289,7 +296,7 @@ impl<'a, 'ctx> Builder<'a, 'ctx> {
         }
     }
 
-    fn add_call_flow(&mut self, call: &Call, sink: usize) {
+    fn add_call_flow(&mut self, call: &Call, caller: FunctionId, sink: usize) {
         let callee = Function::from_id(self.ctx, call.target);
         let callee_node = if callee.is_external() {
             self.node(DfNode::ExternCall(call.target))
@@ -318,6 +325,7 @@ impl<'a, 'ctx> Builder<'a, 'ctx> {
             let Some(&arg) = call.args.get(index) else {
                 continue;
             };
+            let arg = arg.qualify(caller);
             if is_const(arg) {
                 continue;
             }
@@ -340,9 +348,21 @@ impl<'a, 'ctx> Builder<'a, 'ctx> {
         for block in function.blocks() {
             for insn in block.instructions() {
                 if let Mnemonic::Return(ret) = insn.mnemonic() {
-                    collect_root_params(self.ctx, ret.ptr, &root_params, &mut seen, &mut params);
+                    collect_root_params(
+                        self.ctx,
+                        ret.ptr.qualify(insn.id.func),
+                        &root_params,
+                        &mut seen,
+                        &mut params,
+                    );
                     if let Some(value) = ret.value {
-                        collect_root_params(self.ctx, value, &root_params, &mut seen, &mut params);
+                        collect_root_params(
+                            self.ctx,
+                            value.qualify(insn.id.func),
+                            &root_params,
+                            &mut seen,
+                            &mut params,
+                        );
                     }
                 }
             }
@@ -400,7 +420,7 @@ fn collect_root_params(
                     _ => None,
                 };
                 if let Some(&arg) = arg {
-                    collect_root_params(ctx, arg, root_params, seen, out);
+                    collect_root_params(ctx, arg.qualify(pred.func), root_params, seen, out);
                 }
             }
         }

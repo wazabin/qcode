@@ -242,13 +242,21 @@ impl<'a, 'str> Analysis<'a, 'str> {
                     Mnemonic::Binop(bin)
                         if matches!(bin.op, Binop::Int(IntBinop::Add | IntBinop::Sub)) =>
                     {
-                        PeelAction::AddSub(bin.op, bin.lhs, bin.rhs)
+                        PeelAction::AddSub(
+                            bin.op,
+                            bin.lhs.qualify(id.func),
+                            bin.rhs.qualify(id.func),
+                        )
                     }
                     // A realigned pointer `p & -2^k` (a `sub rsp,-N` frame realign, or
                     // any align-down) names the same location as `p` for aliasing: the
                     // mask only lowers the address. Peel to the non-mask operand.
                     Mnemonic::Binop(bin) if matches!(bin.op, Binop::Int(IntBinop::And)) => {
-                        match align_peel_target(self.host.shr(), bin.lhs, bin.rhs) {
+                        match align_peel_target(
+                            self.host.shr(),
+                            bin.lhs.qualify(id.func),
+                            bin.rhs.qualify(id.func),
+                        ) {
                             Some(base) => PeelAction::Peel(base),
                             None => PeelAction::Unknown,
                         }
@@ -256,10 +264,10 @@ impl<'a, 'str> Analysis<'a, 'str> {
                     // A widened/narrowed or typed-arithmetic pointer names the same
                     // location as its source. Root propagation only *adds* may-alias
                     // edges, so this stays sound; no exact interval is recorded.
-                    Mnemonic::Zext(z) => PeelAction::Peel(z.src),
-                    Mnemonic::Sext(s) => PeelAction::Peel(s.src),
-                    Mnemonic::Range(r) => PeelAction::Peel(r.src),
-                    Mnemonic::Gep(g) => PeelAction::Peel(g.base),
+                    Mnemonic::Zext(z) => PeelAction::Peel(z.src.qualify(id.func)),
+                    Mnemonic::Sext(s) => PeelAction::Peel(s.src.qualify(id.func)),
+                    Mnemonic::Range(r) => PeelAction::Peel(r.src.qualify(id.func)),
+                    Mnemonic::Gep(g) => PeelAction::Peel(g.base.qualify(id.func)),
                     _ => PeelAction::Unknown,
                 };
 
@@ -523,9 +531,11 @@ impl RegisterBase {
         for block in host.function_ref(fun_id).blocks() {
             for &iid in block.instruction_ids() {
                 match host.insn_ref(iid).mnemonic() {
-                    Mnemonic::Load(load) => pointer_uses.push((load.ptr, load.space, load.size)),
+                    Mnemonic::Load(load) => {
+                        pointer_uses.push((load.ptr.qualify(iid.func), load.space, load.size))
+                    }
                     Mnemonic::Store(store) => {
-                        pointer_uses.push((store.ptr, store.space, store.size))
+                        pointer_uses.push((store.ptr.qualify(iid.func), store.space, store.size))
                     }
                     _ => {}
                 }

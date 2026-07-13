@@ -54,6 +54,10 @@ impl<'str> SubPassC<'str> for Recognize {
 
         for &id in recognizers_for(root) {
             if let Some(args) = id.desc().recognize(body.read_host(cx), ic.insn_id) {
+                let args = args
+                    .into_iter()
+                    .map(|a| a.localize(ic.insn_id.func))
+                    .collect();
                 ed.replace_with_new_insn_c(
                     body,
                     cx,
@@ -85,7 +89,7 @@ mod tests {
     use crate::gvn::{constant_fold_function, gvn_function};
     use qcode::{
         context::Context,
-        value::{ValueId, insn::Mnemonic},
+        value::{LocalValueId, insn::Mnemonic},
     };
     use qcode_macro::qcode;
 
@@ -114,7 +118,7 @@ mod tests {
                 return None;
             }
             match i.args[1] {
-                ValueId::Literal(lid) => Some(ctx.get_literal_value(lid)),
+                LocalValueId::Literal(lid) => Some(ctx.get_literal_value(lid)),
                 _ => None,
             }
         })

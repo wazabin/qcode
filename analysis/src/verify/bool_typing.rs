@@ -50,12 +50,13 @@ pub fn verify_bool_typing(ctx: &Context) -> Vec<String> {
     };
 
     for insn in ctx.instructions() {
+        let func = insn.id.func;
         match insn.mnemonic() {
             Mnemonic::Binop(b) => {
-                check_domain(b.lhs, &mut out);
-                check_domain(b.rhs, &mut out);
-                let lhs_bool = is_bool(ctx, b.lhs);
-                let rhs_bool = is_bool(ctx, b.rhs);
+                check_domain(b.lhs.qualify(func), &mut out);
+                check_domain(b.rhs.qualify(func), &mut out);
+                let lhs_bool = is_bool(ctx, b.lhs.qualify(func));
+                let rhs_bool = is_bool(ctx, b.rhs.qualify(func));
                 match b.op {
                     // Bitwise and/or/xor: logical when both bool, integer when
                     // neither, but never mixed.
@@ -79,12 +80,14 @@ pub fn verify_bool_typing(ctx: &Context) -> Vec<String> {
                     _ => {}
                 }
             }
-            Mnemonic::Unop(u) if matches!(u.op, Unop::IntNot) && is_bool(ctx, u.src) => {
+            Mnemonic::Unop(u)
+                if matches!(u.op, Unop::IntNot) && is_bool(ctx, u.src.qualify(func)) =>
+            {
                 out.push("bitwise `~` applied to a bool operand (use `x == false`)".to_string());
             }
             Mnemonic::CBranch(cb) => {
-                check_domain(cb.condition, &mut out);
-                if !is_bool(ctx, cb.condition) {
+                check_domain(cb.condition.qualify(func), &mut out);
+                if !is_bool(ctx, cb.condition.qualify(func)) {
                     out.push(format!(
                         "branch condition {:?} is not bool-typed",
                         cb.condition
@@ -92,7 +95,7 @@ pub fn verify_bool_typing(ctx: &Context) -> Vec<String> {
                 }
             }
             Mnemonic::Assert(a) => {
-                check_domain(a.condition, &mut out);
+                check_domain(a.condition.qualify(func), &mut out);
             }
             _ => {}
         }

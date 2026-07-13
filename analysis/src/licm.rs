@@ -198,7 +198,7 @@ fn loop_memory(host: HostRef, loop_nodes: &HashSet<BlockId>) -> LoopMemory {
         let insns = host.block_ref(block).instruction_ids().to_vec();
         for id in insns {
             match host.insn_ref(id).mnemonic() {
-                Mnemonic::Store(s) => store_ptrs.push(s.ptr),
+                Mnemonic::Store(s) => store_ptrs.push(s.ptr.qualify(id.func)),
                 Mnemonic::Call(_) | Mnemonic::CallInd(_) | Mnemonic::PCodeOp(_) => {
                     has_clobber = true;
                 }
@@ -253,15 +253,14 @@ fn invariant_instructions(
                 if !is_load && !is_pure_expr_op(m) {
                     continue;
                 }
-                let operands_invariant = m
-                    .args()
-                    .into_iter()
-                    .all(|op| value_is_invariant(host, op, loop_nodes, &invariant));
+                let operands_invariant = m.args().into_iter().all(|op| {
+                    value_is_invariant(host, op.qualify(id.func), loop_nodes, &invariant)
+                });
                 if !operands_invariant {
                     continue;
                 }
                 if let Mnemonic::Load(load) = m
-                    && !load_is_safe(host, aliases, load.ptr, mem)
+                    && !load_is_safe(host, aliases, load.ptr.qualify(id.func), mem)
                 {
                     continue;
                 }

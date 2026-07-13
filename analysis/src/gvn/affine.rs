@@ -198,6 +198,11 @@ pub(super) fn arith_form(
         return leaf(id, width);
     }
     let m = mask_for(width);
+    // Operand storage is bare-local; the producing instruction's own function
+    // qualifies them (an id without one produces no mnemonic and never gets here).
+    let Some(func) = id.owning_function() else {
+        return leaf(id, width);
+    };
 
     match mnemonic {
         Mnemonic::Binop(Binary {
@@ -206,8 +211,8 @@ pub(super) fn arith_form(
             rhs,
         }) => match op {
             IntBinop::Add => {
-                let (cl, tl) = affine_view(host, *lhs, width, state);
-                let (cr, tr) = affine_view(host, *rhs, width, state);
+                let (cl, tl) = affine_view(host, lhs.qualify(func), width, state);
+                let (cr, tr) = affine_view(host, rhs.qualify(func), width, state);
                 NormalForm::Affine {
                     width,
                     constant: cl.wrapping_add(cr) & m,
@@ -215,8 +220,8 @@ pub(super) fn arith_form(
                 }
             }
             IntBinop::Sub => {
-                let (cl, tl) = affine_view(host, *lhs, width, state);
-                let (cr, tr) = affine_view(host, *rhs, width, state);
+                let (cl, tl) = affine_view(host, lhs.qualify(func), width, state);
+                let (cr, tr) = affine_view(host, rhs.qualify(func), width, state);
                 NormalForm::Affine {
                     width,
                     constant: cl.wrapping_sub(cr) & m,
@@ -225,28 +230,28 @@ pub(super) fn arith_form(
             }
             IntBinop::Mul => {
                 // Affine only when exactly one side is a constant scale.
-                if let Some(k) = const_value(host.shr(), *rhs) {
-                    scale_affine(host, *lhs, k & m, width, state)
-                } else if let Some(k) = const_value(host.shr(), *lhs) {
-                    scale_affine(host, *rhs, k & m, width, state)
+                if let Some(k) = const_value(host.shr(), rhs.qualify(func)) {
+                    scale_affine(host, lhs.qualify(func), k & m, width, state)
+                } else if let Some(k) = const_value(host.shr(), lhs.qualify(func)) {
+                    scale_affine(host, rhs.qualify(func), k & m, width, state)
                 } else {
                     leaf(id, width)
                 }
             }
             IntBinop::ShiftLeft => {
                 // x << s  ==  x * 2^s  (constant amount, in range).
-                match const_value(host.shr(), *rhs) {
+                match const_value(host.shr(), rhs.qualify(func)) {
                     Some(s) if s < (width as u64 * 8) && s < 64 => {
-                        scale_affine(host, *lhs, (1u64 << s) & m, width, state)
+                        scale_affine(host, lhs.qualify(func), (1u64 << s) & m, width, state)
                     }
                     _ => leaf(id, width),
                 }
             }
             IntBinop::And | IntBinop::Or | IntBinop::Xor => {
-                if let Some(k) = const_value(host.shr(), *rhs) {
-                    mask_form(*lhs, *op, k & m, width, state)
-                } else if let Some(k) = const_value(host.shr(), *lhs) {
-                    mask_form(*rhs, *op, k & m, width, state)
+                if let Some(k) = const_value(host.shr(), rhs.qualify(func)) {
+                    mask_form(lhs.qualify(func), *op, k & m, width, state)
+                } else if let Some(k) = const_value(host.shr(), lhs.qualify(func)) {
+                    mask_form(rhs.qualify(func), *op, k & m, width, state)
                 } else {
                     leaf(id, width)
                 }
@@ -257,7 +262,7 @@ pub(super) fn arith_form(
             op: Unop::IntNegate,
             src,
         }) => {
-            scale_affine(host, *src, m /* -1 */, width, state)
+            scale_affine(host, src.qualify(func), m /* -1 */, width, state)
         }
         // `gep(base, off)` ≡ `base + off` (a constant byte offset). Decompose it
         // like an `Add` so a field address numbers the same as the equivalent
@@ -266,7 +271,7 @@ pub(super) fn arith_form(
         // syntactic (never rewritten into an add) by [`key_for`], which forces a
         // `Gep` mnemonic to an opaque key.
         Mnemonic::Gep(g) => {
-            let (c, t) = affine_view(host, g.base, width, state);
+            let (c, t) = affine_view(host, g.base.qualify(func), width, state);
             NormalForm::Affine {
                 width,
                 constant: c.wrapping_add(g.offset as u64) & m,
@@ -435,6 +440,7 @@ fn canonical_mnemonic_c<'str>(
     form: &NormalForm,
     state: &mut Numbering,
 ) -> Mnemonic {
+    let func = block.func;
     match form {
         NormalForm::Mask {
             width,
@@ -443,8 +449,12 @@ fn canonical_mnemonic_c<'str>(
             mask,
         } => Mnemonic::Binop(Binary {
             op: Binop::Int(*op),
-            lhs: *term,
-            rhs: body.read_host(cx).shr().get_const(*mask, *width),
+            lhs: term.localize(func),
+            rhs: body
+                .read_host(cx)
+                .shr()
+                .get_const(*mask, *width)
+                .localize(func),
         }),
         NormalForm::Affine {
             width,
@@ -464,8 +474,8 @@ fn canonical_mnemonic_c<'str>(
                 let (op, lit) = signed_lit_c(body, cx, signed(constant, width), width);
                 return Mnemonic::Binop(Binary {
                     op: Binop::Int(op),
-                    lhs: pv,
-                    rhs: lit,
+                    lhs: pv.localize(func),
+                    rhs: lit.localize(func),
                 });
             }
 
@@ -489,13 +499,17 @@ fn canonical_mnemonic_c<'str>(
                 if signed(last_k, width) == -1 {
                     return Mnemonic::Unop(Unary {
                         op: Unop::IntNegate,
-                        src: last_v,
+                        src: last_v.localize(func),
                     });
                 }
                 return Mnemonic::Binop(Binary {
                     op: Binop::Int(IntBinop::Mul),
-                    lhs: last_v,
-                    rhs: body.read_host(cx).shr().get_const(last_k, width),
+                    lhs: last_v.localize(func),
+                    rhs: body
+                        .read_host(cx)
+                        .shr()
+                        .get_const(last_k, width)
+                        .localize(func),
                 });
             }
 
@@ -514,8 +528,8 @@ fn canonical_mnemonic_c<'str>(
             let tv = scaled_value_c(body, cx, block, at, last_v, mag, width, state);
             Mnemonic::Binop(Binary {
                 op: Binop::Int(op),
-                lhs: pv,
-                rhs: tv,
+                lhs: pv.localize(func),
+                rhs: tv.localize(func),
             })
         }
         NormalForm::Opaque(_) => unreachable!("opaque forms are never materialized"),
@@ -826,7 +840,7 @@ fn ensure_form(host: HostRef, v: ValueId, numbering: &mut Numbering) {
     let mnemonic = insn.mnemonic().clone();
     numbering.forms.insert(v, leaf(v, width));
     for arg in mnemonic.args() {
-        ensure_form(host, arg, numbering);
+        ensure_form(host, arg.qualify(id.func), numbering);
     }
     let form = arith_form(host, v, &mnemonic, width, numbering);
     numbering.forms.insert(v, form);

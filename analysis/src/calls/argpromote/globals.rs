@@ -63,8 +63,8 @@ pub(super) fn globalize_constants(
     for block in Function::from_id(ctx, fid).iter() {
         for insn in block.iter() {
             let (space, ptr) = match insn.mnemonic() {
-                Mnemonic::Load(l) => (l.space, l.ptr),
-                Mnemonic::Store(s) => (s.space, s.ptr),
+                Mnemonic::Load(l) => (l.space, l.ptr.qualify(insn.id.func)),
+                Mnemonic::Store(s) => (s.space, s.ptr.qualify(insn.id.func)),
                 _ => continue,
             };
             if matches!(ptr, ValueId::Literal(_)) && is_real_ram(ctx, space) && seen.insert(ptr) {
@@ -106,15 +106,29 @@ fn rewrite_accesses(ctx: &mut Context, fid: FunctionId, addr: ValueId, param: Va
         .iter()
         .flat_map(|b| b.iter())
         .filter_map(|insn| match insn.mnemonic() {
-            Mnemonic::Load(l) if l.ptr == addr && is_real_ram(ctx, l.space) => Some(insn.id),
-            Mnemonic::Store(s) if s.ptr == addr && is_real_ram(ctx, s.space) => Some(insn.id),
+            Mnemonic::Load(l)
+                if l.ptr.qualify(insn.id.func) == addr && is_real_ram(ctx, l.space) =>
+            {
+                Some(insn.id)
+            }
+            Mnemonic::Store(s)
+                if s.ptr.qualify(insn.id.func) == addr && is_real_ram(ctx, s.space) =>
+            {
+                Some(insn.id)
+            }
             _ => None,
         })
         .collect();
     for id in ids {
         let new = match ctx.get_insn(id).mnemonic().clone() {
-            Mnemonic::Load(l) => Mnemonic::Load(Load { ptr: param, ..l }),
-            Mnemonic::Store(s) => Mnemonic::Store(Store { ptr: param, ..s }),
+            Mnemonic::Load(l) => Mnemonic::Load(Load {
+                ptr: param.localize(id.func),
+                ..l
+            }),
+            Mnemonic::Store(s) => Mnemonic::Store(Store {
+                ptr: param.localize(id.func),
+                ..s
+            }),
             _ => continue,
         };
         ctx.replace_instruction_mnemonic(id, new);

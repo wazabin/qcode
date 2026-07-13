@@ -297,7 +297,7 @@ impl Solver<'_> {
                 lhs,
                 rhs,
             }) => {
-                let (lhs, rhs) = (*lhs, *rhs);
+                let (lhs, rhs) = (lhs.qualify(id.func), rhs.qualify(id.func));
                 match *op {
                     IntBinop::Equal
                     | IntBinop::NotEqual
@@ -356,13 +356,13 @@ impl Solver<'_> {
 
             // Zero-extension preserves the unsigned value, and the source
             // interval always fits in the wider output mask.
-            Mnemonic::Zext(z) => self.range(z.src, depth + 1),
+            Mnemonic::Zext(z) => self.range(z.src.qualify(id.func), depth + 1),
             // Sign-extension preserves the value only when the whole source
             // interval has the sign bit clear; a straddling interval becomes
             // two disjoint unsigned intervals, which we cannot represent.
             Mnemonic::Sext(s) => {
-                let src_size = value_size(ctx, s.src);
-                let src = self.range(s.src, depth + 1);
+                let src_size = value_size(ctx, s.src.qualify(id.func));
+                let src = self.range(s.src.qualify(id.func), depth + 1);
                 let sign_bit = (all_ones(src_size) >> 1) + 1;
                 if src.max < sign_bit { src } else { top }
             }
@@ -371,7 +371,7 @@ impl Solver<'_> {
             // the start offset, then keep it only if it fits the result mask.
             // (`start == 0` is the plain low-bytes-fit-the-width case.)
             Mnemonic::Range(r) => {
-                let src = self.range(r.src, depth + 1);
+                let src = self.range(r.src.qualify(id.func), depth + 1);
                 let shifted = shr(src, (r.start as u64) * 8);
                 if shifted.max <= mask { shifted } else { top }
             }
@@ -436,18 +436,23 @@ impl Solver<'_> {
                 };
                 let q = |t| BlockId::new(pred.func, t);
                 match term.mnemonic() {
-                    Mnemonic::Branch(b) => b.args.get(k).copied().map(|inv| (inv, None)),
+                    Mnemonic::Branch(b) => b
+                        .args
+                        .get(k)
+                        .copied()
+                        .map(|inv| (inv.qualify(pred.func), None)),
                     Mnemonic::CBranch(cb) => {
+                        let cond = cb.condition.qualify(pred.func);
                         if q(cb.success_block) == parent {
                             cb.success_args
                                 .get(k)
                                 .copied()
-                                .map(|inv| (inv, Some((cb.condition, true))))
+                                .map(|inv| (inv.qualify(pred.func), Some((cond, true))))
                         } else if q(cb.failure_block) == parent {
                             cb.failure_args
                                 .get(k)
                                 .copied()
-                                .map(|inv| (inv, Some((cb.condition, false))))
+                                .map(|inv| (inv.qualify(pred.func), Some((cond, false))))
                         } else {
                             None
                         }
@@ -503,7 +508,7 @@ impl Solver<'_> {
         else {
             return false;
         };
-        let (lhs, rhs) = (*lhs, *rhs);
+        let (lhs, rhs) = (lhs.qualify(id.func), rhs.qualify(id.func));
         let other = if lhs == v {
             rhs
         } else if rhs == v {
@@ -550,7 +555,8 @@ impl Solver<'_> {
                     None
                 };
                 if let Some(taken) = taken
-                    && let Some(r) = self.refine_condition(cb.condition, v, taken, mask, 0)
+                    && let Some(r) =
+                        self.refine_condition(cb.condition.qualify(pred.func), v, taken, mask, 0)
                 {
                     acc = acc.intersect(r);
                 }
@@ -569,7 +575,7 @@ impl Solver<'_> {
         for _ in 0..RECURSE_CAP {
             let ValueId::Instruction(id) = v else { break };
             match self.ctx.get_insn(id).mnemonic() {
-                Mnemonic::Zext(z) => v = z.src,
+                Mnemonic::Zext(z) => v = z.src.qualify(id.func),
                 _ => break,
             }
         }
@@ -588,9 +594,9 @@ impl Solver<'_> {
             lhs,
             rhs,
         }) = self.ctx.get_insn(id).mnemonic()
-            && let Some(c) = numeric_const(self.ctx, *rhs)
+            && let Some(c) = numeric_const(self.ctx, rhs.qualify(id.func))
         {
-            return Some((*lhs, c));
+            return Some((lhs.qualify(id.func), c));
         }
         None
     }
@@ -630,9 +636,19 @@ impl Solver<'_> {
                 op: Binop::Int(op @ (IntBinop::And | IntBinop::Or)),
                 lhs,
                 rhs,
-            }) if self.is_bool_val(*lhs) && self.is_bool_val(*rhs) => {
+            }) if self.is_bool_val(lhs.qualify(id.func))
+                && self.is_bool_val(rhs.qualify(id.func)) =>
+            {
                 let is_or = *op == IntBinop::Or;
-                self.refine_connective(*lhs, *rhs, is_or, v, taken, mask, depth)
+                self.refine_connective(
+                    lhs.qualify(id.func),
+                    rhs.qualify(id.func),
+                    is_or,
+                    v,
+                    taken,
+                    mask,
+                    depth,
+                )
             }
 
             // `x == false` / `x != false` (or `== true`) over a `bool`
@@ -645,19 +661,20 @@ impl Solver<'_> {
                 lhs,
                 rhs,
             }) => {
+                let (lhs, rhs) = (lhs.qualify(id.func), rhs.qualify(id.func));
                 let sub_polarity = |sub: ValueId, c: bool| {
                     // `Equal` taken ⟺ sub == c; `sub` holds when it equals 1.
                     let holds = (*op == IntBinop::Equal) == c;
                     self.refine_condition(sub, v, taken == holds, mask, depth + 1)
                 };
-                if let Some(c) = self.bool_const(*rhs)
-                    && self.is_bool_val(*lhs)
+                if let Some(c) = self.bool_const(rhs)
+                    && self.is_bool_val(lhs)
                 {
-                    sub_polarity(*lhs, c)
-                } else if let Some(c) = self.bool_const(*lhs)
-                    && self.is_bool_val(*rhs)
+                    sub_polarity(lhs, c)
+                } else if let Some(c) = self.bool_const(lhs)
+                    && self.is_bool_val(rhs)
                 {
-                    sub_polarity(*rhs, c)
+                    sub_polarity(rhs, c)
                 } else {
                     self.refine_from_cmp(condition, v, taken, mask)
                 }
@@ -749,10 +766,11 @@ impl Solver<'_> {
         };
 
         // Split the comparison into its constant side and its value side.
+        let (lhs, rhs) = (lhs.qualify(cond_insn.func), rhs.qualify(cond_insn.func));
         let (mut cmp_base, mut k, v_is_lhs) =
-            match (numeric_const(self.ctx, *lhs), numeric_const(self.ctx, *rhs)) {
-                (None, Some(k)) => (*lhs, k, true),
-                (Some(k), None) => (*rhs, k, false),
+            match (numeric_const(self.ctx, lhs), numeric_const(self.ctx, rhs)) {
+                (None, Some(k)) => (lhs, k, true),
+                (Some(k), None) => (rhs, k, false),
                 _ => return None,
             };
 

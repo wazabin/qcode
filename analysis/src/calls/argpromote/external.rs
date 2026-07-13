@@ -266,7 +266,8 @@ fn bind_external_return(ctx: &mut Context, fid: FunctionId, ret: VarnodeId) -> b
             matches!(
                 insn.mnemonic(),
                 Mnemonic::Store(s)
-                    if s.src == result && s.ptr == ValueId::Varnode(ret)
+                    if s.src.qualify(insn.id.func) == result
+                        && s.ptr.qualify(insn.id.func) == ValueId::Varnode(ret)
             )
         });
         if already {

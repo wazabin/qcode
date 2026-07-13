@@ -258,7 +258,7 @@ pub(crate) fn append_outputs<S>(
         };
         let mut m = ctx.get_insn(ret_id).mnemonic().clone();
         if let Mnemonic::Return(ref mut r) = m {
-            r.value = Some(tuple);
+            r.value = Some(tuple.localize(ret_id.func));
         }
         ctx.replace_instruction_mnemonic(ret_id, m);
         writeset_ty = Some(ctx.type_of(tuple));
@@ -315,7 +315,7 @@ fn surviving_writeset_fields(ctx: &mut Context, ret_id: InstructionId) -> Vec<(S
     let Mnemonic::Return(r) = ctx.get_insn(ret_id).mnemonic().clone() else {
         return Vec::new();
     };
-    let Some(val @ ValueId::Instruction(tid)) = r.value else {
+    let Some(val @ ValueId::Instruction(tid)) = r.value.map(|v| v.qualify(ret_id.func)) else {
         return Vec::new();
     };
     let Mnemonic::Tuple(t) = ctx.get_insn(tid).mnemonic().clone() else {
@@ -332,7 +332,7 @@ fn surviving_writeset_fields(ctx: &mut Context, ret_id: InstructionId) -> Vec<(S
                 .field_name(ty, i)
                 .map(str::to_owned)
                 .unwrap_or_else(|| format!("field{}", i + 1));
-            (name, v)
+            (name, v.qualify(tid.func))
         })
         .filter(|(name, _)| !name.starts_with("write"))
         .collect()

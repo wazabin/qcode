@@ -1,11 +1,11 @@
-use crate::value::ValueId;
+use crate::value::LocalValueId;
 
 use super::mnemonic::{Args, MnemonicKind};
 use smallvec::smallvec;
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub struct Assert {
-    pub condition: ValueId,
+    pub condition: LocalValueId,
 }
 
 impl MnemonicKind for Assert {

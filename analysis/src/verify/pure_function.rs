@@ -11,7 +11,7 @@ use qcode::{
     context::Context,
     space::SpaceType,
     value::{
-        Function, FunctionId, Instruction, ValueId,
+        Function, FunctionId, Instruction, LocalValueId,
         insn::{InstructionId, Mnemonic},
     },
 };
@@ -83,7 +83,7 @@ fn impurity(ctx: &Context, m: &Mnemonic) -> Option<&'static str> {
         _ => m
             .args()
             .iter()
-            .any(|a| matches!(a, ValueId::Varnode(_)))
+            .any(|a| matches!(a, LocalValueId::Varnode(_)))
             .then_some("raw varnode read"),
     }
 }
@@ -117,7 +117,7 @@ mod tests {
     use qcode::{
         builder::Builder,
         testing::TestContext,
-        value::{BasicBlock, Value},
+        value::{BasicBlock, Value, ValueId},
     };
 
     /// Build a single-block function, mark it `is_pure`, and run `body` to fill it.

@@ -112,13 +112,14 @@ fn compute_function_attrs(
     //    derived values reach a write / capture / escape.
     for block in Function::from_id(ctx, fid).iter() {
         for insn in block.iter() {
+            let func = insn.id.func;
             match insn.mnemonic() {
                 // A store through a p-derived address writes through p (revoke
                 // readonly); a store *of* a p-derived value writes the pointer
                 // itself into memory (revoke nocapture).
                 Mnemonic::Store(s) => {
-                    revoke_readonly(&mut result, m(s.ptr));
-                    revoke_nocapture(&mut result, m(s.src));
+                    revoke_readonly(&mut result, m(s.ptr.qualify(func)));
+                    revoke_nocapture(&mut result, m(s.src.qualify(func)));
                 }
                 // A direct call: consult the callee's per-param attributes. An
                 // argument flowing into a non-readonly / non-nocapture param
@@ -127,7 +128,7 @@ fn compute_function_attrs(
                 // the callee writes through p (revoke readonly).
                 Mnemonic::Call(c) => {
                     for (j, &arg) in c.args.iter().enumerate() {
-                        let mask = m(arg);
+                        let mask = m(arg.qualify(func));
                         if mask == 0 {
                             continue;
                         }
@@ -144,17 +145,17 @@ fn compute_function_attrs(
                         }
                     }
                     for &cl in &c.clobbers {
-                        revoke_readonly(&mut result, m(cl));
+                        revoke_readonly(&mut result, m(cl.qualify(func)));
                     }
                 }
                 // Indirect call / opaque p-code / computed branch: the value
                 // escapes through an unanalyzable edge — revoke both bits.
                 Mnemonic::CallInd(c) => {
                     for &arg in &c.args {
-                        revoke_both(&mut result, m(arg));
+                        revoke_both(&mut result, m(arg.qualify(func)));
                     }
                 }
-                Mnemonic::BranchInd(b) => revoke_both(&mut result, m(b.ptr)),
+                Mnemonic::BranchInd(b) => revoke_both(&mut result, m(b.ptr.qualify(func))),
                 Mnemonic::PCodeOp(_) | Mnemonic::Map(_) | Mnemonic::Scan(_) => {
                     for arg in insn.operands() {
                         revoke_both(&mut result, m(arg));
@@ -280,19 +281,19 @@ fn incoming_args(
     match m {
         Mnemonic::Branch(br) if BlockId::new(func, br.target) == target => {
             if let Some(&a) = br.args.get(index) {
-                out.push(a);
+                out.push(a.qualify(func));
             }
         }
         Mnemonic::CBranch(cb) => {
             if BlockId::new(func, cb.success_block) == target
                 && let Some(&a) = cb.success_args.get(index)
             {
-                out.push(a);
+                out.push(a.qualify(func));
             }
             if BlockId::new(func, cb.failure_block) == target
                 && let Some(&a) = cb.failure_args.get(index)
             {
-                out.push(a);
+                out.push(a.qualify(func));
             }
         }
         _ => {}
@@ -411,7 +412,7 @@ mod tests {
             cid,
             Mnemonic::Call(Call {
                 target,
-                args,
+                args: args.into_iter().map(|arg| arg.localize(cid.func)).collect(),
                 clobbers: vec![],
             }),
         );
@@ -531,7 +532,7 @@ mod tests {
             cid,
             Mnemonic::CallInd(CallInd {
                 ptr,
-                args: vec![p0],
+                args: vec![p0.localize(cid.func)],
             }),
         );
         infer_param_attrs(&mut tc.ctx);

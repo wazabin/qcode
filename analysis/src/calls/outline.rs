@@ -15,7 +15,8 @@ use qcode::{
     context::Context,
     types::TypeId,
     value::{
-        BasicBlock, BlockId, Function, FunctionId, FunctionKind, InstructionRef, ValueId,
+        BasicBlock, BlockId, Function, FunctionId, FunctionKind, InstructionRef, LocalValueId,
+        ValueId, VarnodeId,
         block_param::BlockParam,
         insn::{Binary, Binop, Extract, InstructionId, IntBinop, Mnemonic, Range, Return},
         util::{base_ref::BaseRef, base_ref::HostRef, host_mut::PassBacking},
@@ -81,7 +82,7 @@ pub(crate) fn pure_slice<'a, 'str: 'a>(
         }
         stack.push((v, true));
         for a in m.args() {
-            stack.push((a, false));
+            stack.push((a.qualify(id.func), false));
         }
     }
     Some(order)
@@ -176,7 +177,7 @@ pub(crate) fn outline_tupled<'str>(
                     minted,
                     root,
                     Mnemonic::Extract(Extract {
-                        agg: tuple,
+                        agg: tuple.localize(root.func),
                         index: field,
                     }),
                     fty,
@@ -287,7 +288,7 @@ pub(crate) fn outline_scan_body<'str>(
                     minted,
                     root,
                     Mnemonic::Range(Range {
-                        src: idx,
+                        src: idx.localize(root.func),
                         start: 0,
                         size: isz,
                     }),
@@ -307,8 +308,8 @@ pub(crate) fn outline_scan_body<'str>(
                     minted,
                     root,
                     Mnemonic::Binop(Binary {
-                        lhs: idx,
-                        rhs: c,
+                        lhs: idx.localize(root.func),
+                        rhs: c.localize(root.func),
                         op: Binop::Int(IntBinop::Add),
                     }),
                     index_ty,
@@ -357,6 +358,23 @@ fn push_insn_into<'str>(
     let id = host.push_mnemonic_with_type(block.func, mnemonic, ty);
     BaseRef::new(host.reborrow(), block).push_insn(id);
     ValueId::Instruction(id)
+}
+
+/// Simultaneously substitute `pairs` (`old → new`) in `mn`'s operands. Plain
+/// sequential `replace_value` calls corrupt a **cross-arena** clone remap: bare
+/// body-local operands carry no function half, so a freshly-written target-arena
+/// local can numerically collide with a not-yet-processed source-arena key and
+/// get double-replaced. Route through unique varnode sentinels instead — a
+/// closed pure slice never carries a varnode operand ([`pure_slice`] rejects
+/// them), so the sentinels are guaranteed fresh.
+pub(crate) fn substitute_operands(mn: &mut Mnemonic, pairs: &[(LocalValueId, LocalValueId)]) {
+    let sentinel = |k: usize| LocalValueId::Varnode(VarnodeId::from(0x7fff_0000 + k));
+    for (k, &(old, _)) in pairs.iter().enumerate() {
+        mn.replace_value(old, sentinel(k));
+    }
+    for (k, &(_, new)) in pairs.iter().enumerate() {
+        mn.replace_value(sentinel(k), new);
+    }
 }
 
 /// Build a fresh single-block pure function `name` returning `result` by
@@ -417,12 +435,21 @@ fn outline_core<'str>(
     let mut value_map = seed(own, &mut minted, root);
 
     // Clone the slice in definition order, remapping operands through the map.
+    // The clone's operands are the *source* function's locals (qualify with
+    // `iid.func` for the map lookup); the replacements live in the minted
+    // function's arena (localize against `fid`). `pure_slice` guarantees every
+    // non-literal operand is in the map, so no source-local id survives.
     for (iid, mut mn, ty) in cloned {
-        for a in mn.args() {
-            if let Some(&n) = value_map.get(&a) {
-                mn.replace_value(a, n);
-            }
-        }
+        let pairs: Vec<(LocalValueId, LocalValueId)> = mn
+            .args()
+            .iter()
+            .filter_map(|&a| {
+                value_map
+                    .get(&a.qualify(iid.func))
+                    .map(|&n| (a, n.localize(fid)))
+            })
+            .collect();
+        substitute_operands(&mut mn, &pairs);
         let new = push_insn_into(&mut minted, root, mn, ty);
         value_map.insert(ValueId::Instruction(iid), new);
     }
@@ -433,8 +460,8 @@ fn outline_core<'str>(
         &mut minted,
         root,
         Mnemonic::Return(Return {
-            ptr: dummy_ptr,
-            value: Some(ret_val),
+            ptr: dummy_ptr.localize(fid),
+            value: Some(ret_val.localize(fid)),
         }),
         ret_ty,
     );
@@ -477,16 +504,23 @@ pub(crate) fn inline_pure_body(
     for iid in insns {
         let m = ctx.get_insn(iid).mnemonic().clone();
         if let Mnemonic::Return(r) = &m {
-            let v = r.value?;
+            let v = r.value?.qualify(iid.func);
             return Some(value_map.get(&v).copied().unwrap_or(v));
         }
         let ty = ctx.get_insn(iid).type_id();
         let mut nm = m;
-        for a in nm.args() {
-            if let Some(&n) = value_map.get(&a) {
-                nm.replace_value(a, n);
-            }
-        }
+        // The clone's operands are `body_fn`'s locals (qualify with `iid.func`
+        // for the lookup); the replacements live in the caller's arena.
+        let pairs: Vec<(LocalValueId, LocalValueId)> = nm
+            .args()
+            .iter()
+            .filter_map(|&a| {
+                value_map
+                    .get(&a.qualify(iid.func))
+                    .map(|&n| (a, n.localize(block.func)))
+            })
+            .collect();
+        substitute_operands(&mut nm, &pairs);
         let new_id = InstructionRef::from_mnemonic_with_type(ctx, block.func, nm, ty).id;
         BasicBlock::from_id_mut(ctx, block).insert_insn_before(at, new_id);
         value_map.insert(ValueId::Instruction(iid), ValueId::Instruction(new_id));

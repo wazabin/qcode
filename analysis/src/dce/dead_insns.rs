@@ -664,9 +664,9 @@ fn dl_is_unit_inc(host: HostRef, v: ValueId, iv: ValueId) -> bool {
     let Mnemonic::Binop(Binary { lhs, rhs, op }) = host.instruction(id).mnemonic() else {
         return false;
     };
+    let (lhs, rhs) = (lhs.qualify(id.func), rhs.qualify(id.func));
     let one = |x: ValueId| dl_literal(host, x) == Some(1);
-    matches!(op, Binop::Int(IntBinop::Add))
-        && ((*lhs == iv && one(*rhs)) || (*rhs == iv && one(*lhs)))
+    matches!(op, Binop::Int(IntBinop::Add)) && ((lhs == iv && one(rhs)) || (rhs == iv && one(lhs)))
 }
 
 /// `true` if `cond` is `iv == <literal>` (either operand order).
@@ -677,9 +677,10 @@ fn dl_is_eq_const(host: HostRef, cond: ValueId, iv: ValueId) -> bool {
     let Mnemonic::Binop(Binary { lhs, rhs, op }) = host.instruction(id).mnemonic() else {
         return false;
     };
+    let (lhs, rhs) = (lhs.qualify(id.func), rhs.qualify(id.func));
     matches!(op, Binop::Int(IntBinop::Equal))
-        && ((*lhs == iv && dl_literal(host, *rhs).is_some())
-            || (*rhs == iv && dl_literal(host, *lhs).is_some()))
+        && ((lhs == iv && dl_literal(host, rhs).is_some())
+            || (rhs == iv && dl_literal(host, lhs).is_some()))
 }
 
 /// Distinct predecessor blocks of `b`.
@@ -724,7 +725,7 @@ fn match_dead_loop(host: HostRef, header: BlockId) -> Option<DeadLoop> {
     };
     // The header CBranch's targets are body-local indices in the header's arena.
     let (condition, exit, body) = (
-        cb.condition,
+        cb.condition.qualify(header.func),
         BlockId::new(header.func, cb.success_block),
         BlockId::new(header.func, cb.failure_block),
     );
@@ -803,10 +804,10 @@ fn match_dead_loop(host: HostRef, header: BlockId) -> Option<DeadLoop> {
         let iv = ValueId::BlockParam(pid);
         back_args
             .get(k)
-            .is_some_and(|&be| dl_is_unit_inc(host, be, iv))
+            .is_some_and(|&be| dl_is_unit_inc(host, be.qualify(body.func), iv))
             && init_args
                 .get(k)
-                .is_some_and(|&ini| dl_literal(host, ini).is_some())
+                .is_some_and(|&ini| dl_literal(host, ini.qualify(preheader.func)).is_some())
             && dl_is_eq_const(host, condition, iv)
     });
     if !counted {

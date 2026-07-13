@@ -129,13 +129,13 @@ fn base_plus_offset(host: HostRef, ptr: ValueId) -> (ValueId, i64) {
         // store written to `p + off`).
         if let Mnemonic::Gep(g) = host.insn_ref(id).mnemonic() {
             acc += g.offset as i64;
-            cur = g.base;
+            cur = g.base.qualify(id.func);
             continue;
         }
         let Mnemonic::Binop(b) = host.insn_ref(id).mnemonic() else {
             break;
         };
-        let (op, lhs, rhs) = (b.op, b.lhs, b.rhs);
+        let (op, lhs, rhs) = (b.op, b.lhs.qualify(id.func), b.rhs.qualify(id.func));
         let lit = |v: ValueId| match v {
             ValueId::Literal(lid) => Some(host.shr().values.literals[lid].value as i64),
             _ => None,
@@ -356,15 +356,15 @@ pub fn dead_load_insns<'a, 'str: 'a>(
                 Mnemonic::Load(load)
                     if is_reg_space(host.shr(), load.space) && !dead.contains(&id) =>
                 {
-                    if let Some(offset) = ptr_offset(host, load.ptr) {
+                    if let Some(offset) = ptr_offset(host, load.ptr.qualify(id.func)) {
                         let range = (offset, offset + load.size as i64);
                         live.push(range);
                     }
                 }
                 Mnemonic::Store(store) if is_reg_space(host.shr(), store.space) => {
-                    if let Some(offset) = ptr_offset(host, store.ptr) {
+                    if let Some(offset) = ptr_offset(host, store.ptr.qualify(id.func)) {
                         let range = (offset, offset + store.size as i64);
-                        let is_dead_reg = dead_regs.contains(&store.ptr);
+                        let is_dead_reg = dead_regs.contains(&store.ptr.qualify(id.func));
                         if !any_overlap(&live, range)
                             && (fully_covered(&killed, range) || is_dead_reg)
                         {
@@ -471,23 +471,24 @@ fn scan_block_aliased(
     for &id in insns.iter().rev() {
         match host.insn_ref(id).mnemonic() {
             Mnemonic::Load(load) if !dead.contains(&id) => {
-                match aliases.interval(load.ptr) {
+                let load_ptr = load.ptr.qualify(id.func);
+                match aliases.interval(load_ptr) {
                     Some(iv) => punch_killed(&mut killed, KilledInterval::from_alias(iv)),
                     // Unknown read location: conservatively drop same-space kills.
                     None => killed.retain(|k| k.space != load.space),
                 }
                 // Relative path: a read of `base + off` clears any same-base
                 // overwrite it overlaps, and any incomparable same-space kill.
-                let (lb, lo) = addr_key(host, load.ptr);
+                let (lb, lo) = addr_key(host, load_ptr);
                 rel_punch_on_load(&mut rel_killed, load.space, lb, (lo, lo + load.size as i64));
                 live.push(LiveLoc {
-                    ptr: load.ptr,
+                    ptr: load_ptr,
                     size: load.size,
                     space: load.space,
                 });
             }
             Mnemonic::Store(store) => {
-                let ptr = store.ptr;
+                let ptr = store.ptr.qualify(id.func);
                 let ptr_iv = aliases.interval(ptr).map(KilledInterval::from_alias);
                 // A live load blocks the store only if it may-alias *and* is not
                 // provably offset-disjoint: `may_alias` is class-based (true for
@@ -655,10 +656,15 @@ fn unread_temp_space_stores<'a, 'str: 'a>(
         for &insn_id in block.instruction_ids() {
             match host.insn_ref(insn_id).mnemonic() {
                 Mnemonic::Load(load) if is_temp_space(host.shr(), load.space) => {
-                    loads.push((load.space, load.ptr, load.size));
+                    loads.push((load.space, load.ptr.qualify(insn_id.func), load.size));
                 }
                 Mnemonic::Store(store) if is_temp_space(host.shr(), store.space) => {
-                    candidate_stores.push((insn_id, store.space, store.ptr, store.size));
+                    candidate_stores.push((
+                        insn_id,
+                        store.space,
+                        store.ptr.qualify(insn_id.func),
+                        store.size,
+                    ));
                 }
                 _ => {}
             }
@@ -713,9 +719,11 @@ fn unread_frame_local_stores<'a, 'str: 'a>(
     for block in &fun {
         for &id in block.instruction_ids() {
             match host.insn_ref(id).mnemonic() {
-                Mnemonic::Load(load) => loads.push((load.ptr, load.size)),
-                Mnemonic::Store(store) if aliases.is_own_frame_local(store.ptr) => {
-                    stores.push((id, store.ptr, store.size))
+                Mnemonic::Load(load) => loads.push((load.ptr.qualify(id.func), load.size)),
+                Mnemonic::Store(store)
+                    if aliases.is_own_frame_local(store.ptr.qualify(id.func)) =>
+                {
+                    stores.push((id, store.ptr.qualify(id.func), store.size))
                 }
                 _ => {}
             }
@@ -789,12 +797,12 @@ fn postdominated_dead_register_stores(
                     stores.push(RegisterStore {
                         id,
                         block: *block,
-                        ptr: store.ptr,
+                        ptr: store.ptr.qualify(id.func),
                         space: store.space,
                     });
                 }
                 Mnemonic::Load(load) if is_reg_space(host.shr(), load.space) => {
-                    loads.push((load.ptr, load.space));
+                    loads.push((load.ptr.qualify(id.func), load.space));
                 }
                 _ => {}
             }
@@ -933,14 +941,14 @@ fn postdominated_dead_ram_stores(
                     id,
                     block,
                     pos,
-                    ptr: store.ptr,
+                    ptr: store.ptr.qualify(id.func),
                     size: store.size,
                 }),
                 Mnemonic::Load(load) if load.space == ram => loads.push(RamAccess {
                     id,
                     block,
                     pos,
-                    ptr: load.ptr,
+                    ptr: load.ptr.qualify(id.func),
                     size: load.size,
                 }),
                 _ => {}
@@ -1835,7 +1843,8 @@ mod tests {
             .copied()
             .filter(|&id| {
                 if let Mnemonic::Store(s) = ctx.get_insn(id).mnemonic() {
-                    s.ptr == ValueId::Varnode(ctx.get_named("A").unwrap().as_varnode().unwrap())
+                    s.ptr.qualify(id.func)
+                        == ValueId::Varnode(ctx.get_named("A").unwrap().as_varnode().unwrap())
                 } else {
                     false
                 }

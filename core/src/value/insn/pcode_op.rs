@@ -1,5 +1,5 @@
 use super::mnemonic::{Args, MnemonicKind};
-use crate::value::ValueId;
+use crate::value::LocalValueId;
 use jstd::Identifier;
 use serde::{Deserialize, Serialize};
 use smallvec::SmallVec;
@@ -10,8 +10,8 @@ pub struct PCodeOpId(usize);
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct PCodeOp {
     pub id: PCodeOpId,
-    pub args: Vec<ValueId>,
-    pub dst: Option<ValueId>,
+    pub args: Vec<LocalValueId>,
+    pub dst: Option<LocalValueId>,
 }
 
 impl MnemonicKind for PCodeOp {

@@ -376,7 +376,8 @@ fn branch_args_to(host: HostRef, block: BlockId, target: BlockId) -> Option<Vec<
     else {
         return None;
     };
-    (BlockId::new(block.func, *branch_target) == target).then(|| args.clone())
+    (BlockId::new(block.func, *branch_target) == target)
+        .then(|| args.iter().map(|a| a.qualify(block.func)).collect())
 }
 
 fn header_exit(
@@ -390,8 +391,22 @@ fn header_exit(
     let success_is_body = loop_nodes.contains(&sb);
     let failure_is_body = loop_nodes.contains(&fb);
     match (success_is_body, failure_is_body) {
-        (true, false) => Some((fb, cbranch.failure_args.clone())),
-        (false, true) => Some((sb, cbranch.success_args.clone())),
+        (true, false) => Some((
+            fb,
+            cbranch
+                .failure_args
+                .iter()
+                .map(|a| a.qualify(func))
+                .collect(),
+        )),
+        (false, true) => Some((
+            sb,
+            cbranch
+                .success_args
+                .iter()
+                .map(|a| a.qualify(func))
+                .collect(),
+        )),
         _ => None,
     }
 }
@@ -452,7 +467,10 @@ fn remapped_branch_args_to(
     else {
         return None;
     };
-    (BlockId::new(terminator.func, *branch_target) == target).then(|| remap_values(args, value_map))
+    (BlockId::new(terminator.func, *branch_target) == target).then(|| {
+        let args: Vec<ValueId> = args.iter().map(|a| a.qualify(terminator.func)).collect();
+        remap_values(&args, value_map)
+    })
 }
 
 fn remap_values(values: &[ValueId], value_map: &HashMap<ValueId, ValueId>) -> Vec<ValueId> {
@@ -469,7 +487,9 @@ fn remap_value(value: ValueId, value_map: &HashMap<ValueId, ValueId>) -> ValueId
 fn remap_mnemonic(mnemonic: &Mnemonic, value_map: &HashMap<ValueId, ValueId>) -> Mnemonic {
     let mut remapped = mnemonic.clone();
     for (&old, &new) in value_map {
-        remapped.replace_value(old, new);
+        // The map relates values within one function (the unrolled loop's own),
+        // so both sides strip to the same body's local domain.
+        remapped.replace_value(old.strip_func(), new.strip_func());
     }
     remapped
 }
@@ -503,6 +523,10 @@ pub(crate) fn replace_terminator_with_branch<'a, 'str>(
         .copied()
         .filter(|&id| body.insn_ref(cx, id).mnemonic().is_terminator());
     let local_target = target.localize(block.func);
+    let args: Vec<_> = args
+        .into_iter()
+        .map(|arg| arg.localize(block.func))
+        .collect();
     if let Some(term_id) = term_id {
         body.replace_instruction_mnemonic(
             cx,
@@ -563,6 +587,10 @@ pub(crate) fn replace_terminator_with_branch_generic<'str>(
         .copied()
         .filter(|&id| host.insn_ref(id).mnemonic().is_terminator());
     let local_target = target.localize(block.func);
+    let args: Vec<_> = args
+        .into_iter()
+        .map(|arg| arg.localize(block.func))
+        .collect();
     if let Some(term_id) = term_id {
         host.replace_instruction_mnemonic(
             term_id,
@@ -649,7 +677,7 @@ fn recognize_simple_loop(
 ) -> Option<SimpleLoop> {
     let header = edge.header;
     let cbranch = header_cbranch(host, header)?;
-    let (induction, bound, signed) = condition_bound(host, cbranch.condition)?;
+    let (induction, bound, signed) = condition_bound(host, cbranch.condition.qualify(header.func))?;
     let header_params = host
         .block_ref(header)
         .params()
@@ -735,8 +763,8 @@ fn condition_bound(host: HostRef, condition: ValueId) -> Option<(BlockParamId, u
     };
 
     let signed = matches!(op, Binop::Int(IntBinop::SLess));
-    let induction = lhs.as_block_param()?;
-    let bound = numeric_const(host, *rhs)?;
+    let induction = lhs.qualify(condition_id.func).as_block_param()?;
+    let bound = numeric_const(host, rhs.qualify(condition_id.func))?;
     Some((induction, bound, signed))
 }
 
@@ -808,7 +836,7 @@ fn loop_initial_value(
     if BlockId::new(preheader.func, *target) != header {
         return None;
     }
-    numeric_const(host, *args.get(param_index)?)
+    numeric_const(host, args.get(param_index)?.qualify(preheader.func))
 }
 
 fn can_reach(host: HostRef, from: BlockId, to: BlockId, allowed: &HashSet<BlockId>) -> bool {
@@ -851,7 +879,7 @@ fn latch_step(
     if BlockId::new(body.func, *target) != header {
         return None;
     }
-    induction_increment(host, *args.get(param_index)?, induction)
+    induction_increment(host, args.get(param_index)?.qualify(body.func), induction)
 }
 
 fn induction_increment(host: HostRef, value: ValueId, induction: BlockParamId) -> Option<u64> {
@@ -868,10 +896,11 @@ fn induction_increment(host: HostRef, value: ValueId, induction: BlockParamId) -
     };
 
     let induction_value = ValueId::BlockParam(induction);
-    if *lhs == induction_value {
-        numeric_const(host, *rhs)
-    } else if *rhs == induction_value {
-        numeric_const(host, *lhs)
+    let (lhs, rhs) = (lhs.qualify(id.func), rhs.qualify(id.func));
+    if lhs == induction_value {
+        numeric_const(host, rhs)
+    } else if rhs == induction_value {
+        numeric_const(host, lhs)
     } else {
         None
     }
@@ -1255,10 +1284,7 @@ mod tests {
             .iter()
             .flat_map(|b| b.instruction_ids().to_vec())
         {
-            for operand in qcode::value::Instruction::from_id(&ctx, insn)
-                .mnemonic()
-                .args()
-            {
+            for operand in qcode::value::Instruction::from_id(&ctx, insn).operands() {
                 if matches!(operand, ValueId::Instruction(_) | ValueId::BlockParam(_)) {
                     assert!(
                         defined.contains(&operand),
@@ -1285,10 +1311,7 @@ mod tests {
             .iter()
             .flat_map(|b| b.instruction_ids().to_vec())
         {
-            for operand in qcode::value::Instruction::from_id(ctx, insn)
-                .mnemonic()
-                .args()
-            {
+            for operand in qcode::value::Instruction::from_id(ctx, insn).operands() {
                 if matches!(operand, ValueId::Instruction(_) | ValueId::BlockParam(_)) {
                     assert!(
                         defined.contains(&operand),

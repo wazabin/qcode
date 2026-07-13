@@ -151,7 +151,7 @@ fn try_match(host: HostRef, fid: FunctionId) -> Option<MapMatch> {
         .find_map(|i| match i.mnemonic() {
             Mnemonic::Store(s)
                 if matches!(Space::from_id(host.shr(), s.space).ty, SpaceType::Ram)
-                    && s.src == arr_exit =>
+                    && s.src.qualify(i.id.func) == arr_exit =>
             {
                 Some(i.id)
             }
@@ -285,7 +285,7 @@ fn apply<'str>(
             m,
             Mnemonic::Map(qcode::value::insn::Map {
                 body: body_fn,
-                src,
+                src: src.localize(body.id()),
                 captures: Vec::new(),
             }),
             ty,
@@ -318,7 +318,7 @@ fn apply<'str>(
             continue;
         }
         let mut mn = body.insn_ref(m, id).mnemonic().clone();
-        mn.replace_value(mm.arr_exit, map_val);
+        mn.replace_value(mm.arr_exit.localize(id.func), map_val.localize(id.func));
         body.replace_instruction_mnemonic(m, id, mn);
     }
 

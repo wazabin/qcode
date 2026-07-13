@@ -19,7 +19,7 @@
 //! ```
 
 use qcode::value::{
-    Value, ValueId, ValueRef,
+    FunctionId, Value, ValueId, ValueRef,
     insn::{Binary, Binop, IntBinop, Mnemonic, Simplified},
     util::base_ref::HostRef,
 };
@@ -64,7 +64,11 @@ impl<'str> SubPassC<'str> for Identities {
         }
         if let Mnemonic::Intrinsic(intr) = ic.mnemonic {
             let id = intr.id;
-            let args = intr.args.clone();
+            let args: Vec<ValueId> = intr
+                .args
+                .iter()
+                .map(|a| a.qualify(ic.insn_id.func))
+                .collect();
             match id.desc().simplify(body.read_host(cx), id, ic.size, &args) {
                 Some(Simplified::Value(repl)) => {
                     ed.replace_c(body, cx, ic.insn_id, repl);
@@ -84,7 +88,9 @@ impl<'str> SubPassC<'str> for Identities {
                 None => {}
             }
         }
-        if let Some(new_mnemonic) = simplify_identity(body.read_host(cx), ic.mnemonic) {
+        if let Some(new_mnemonic) =
+            simplify_identity(body.read_host(cx), ic.insn_id.func, ic.mnemonic)
+        {
             ed.replace_with_new_insn_c(body, cx, ic.block_id, ic.insn_id, new_mnemonic, ic.size);
             return Claim::Done;
         }
@@ -108,7 +114,7 @@ fn as_int_binop(host: HostRef, v: ValueId, want: IntBinop) -> Option<(ValueId, V
             lhs,
             rhs,
             op: Binop::Int(op),
-        }) if *op == want => Some((*lhs, *rhs)),
+        }) if *op == want => Some((lhs.qualify(id.func), rhs.qualify(id.func))),
         _ => None,
     }
 }
@@ -144,16 +150,18 @@ fn as_doubled_and(host: HostRef, v: ValueId) -> Option<(ValueId, ValueId)> {
 }
 
 fn int_binop(lhs: ValueId, rhs: ValueId, op: IntBinop) -> Mnemonic {
+    // Both operands live in the body the mnemonic is inserted into; store them
+    // bare-local by stripping their own embedded func.
     Mnemonic::Binop(Binary {
-        lhs,
-        rhs,
+        lhs: lhs.strip_func(),
+        rhs: rhs.strip_func(),
         op: Binop::Int(op),
     })
 }
 
 /// Collapse a bitwise/arithmetic identity rooted at `m`, returning the
 /// equivalent single-operation mnemonic, or `None` if no pattern matches.
-pub(super) fn simplify_identity(host: HostRef, m: &Mnemonic) -> Option<Mnemonic> {
+pub(super) fn simplify_identity(host: HostRef, func: FunctionId, m: &Mnemonic) -> Option<Mnemonic> {
     let &Mnemonic::Binop(Binary {
         lhs,
         rhs,
@@ -162,6 +170,7 @@ pub(super) fn simplify_identity(host: HostRef, m: &Mnemonic) -> Option<Mnemonic>
     else {
         return None;
     };
+    let (lhs, rhs) = (lhs.qualify(func), rhs.qualify(func));
 
     match op {
         // (a + b) - ((a & b) << 1)  →  a ^ b
@@ -245,6 +254,7 @@ fn known_align(host: HostRef, v: ValueId, depth: u32) -> u32 {
     else {
         return 0;
     };
+    let (lhs, rhs) = (lhs.qualify(id.func), rhs.qualify(id.func));
     let (a, b) = (
         || known_align(host, lhs, depth - 1),
         || known_align(host, rhs, depth - 1),
@@ -328,7 +338,10 @@ fn as_zext(host: HostRef, v: ValueId) -> Option<(ValueId, usize)> {
         return None;
     };
     match host.insn_ref(id).mnemonic() {
-        Mnemonic::Zext(z) => Some((z.src, value_size(host, z.src))),
+        Mnemonic::Zext(z) => {
+            let src = z.src.qualify(id.func);
+            Some((src, value_size(host, src)))
+        }
         _ => None,
     }
 }
@@ -367,6 +380,7 @@ fn simplify_bitwise_c<'str>(
     else {
         return false;
     };
+    let (lhs, rhs) = (lhs.qualify(ic.insn_id.func), rhs.qualify(ic.insn_id.func));
     let size = ic.size;
     let all = all_ones(size);
 
@@ -461,6 +475,7 @@ fn simplify_compare_c<'str>(
             rhs,
             op: Binop::Int(op),
         }) if matches!(op, IntBinop::Equal | IntBinop::NotEqual) => {
+            let (lhs, rhs) = (lhs.qualify(ic.insn_id.func), rhs.qualify(ic.insn_id.func));
             for (c, other) in const_operands(body.read_host(cx), lhs, rhs) {
                 if c != 0 {
                     continue;
@@ -495,6 +510,7 @@ fn simplify_compare_c<'str>(
                                 }) = body.read_host(cx).insn_ref(id).mnemonic()
                                 && let Some(flipped) = negated_compare(inner)
                             {
+                                let (a, b) = (a.qualify(id.func), b.qualify(id.func));
                                 let bool_ty = body.read_host(cx).shr().types.get_or_make_bool();
                                 ed.replace_with_new_insn_typed_c(
                                     body,

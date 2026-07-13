@@ -6,8 +6,8 @@ use qcode::{
     context::Context,
     space::{Space, SpaceId, SpaceType},
     value::{
-        BasicBlock, BlockId, BlockParamId, BlockRef, Function, FunctionId, Instruction, Value,
-        ValueId, ValueRef, Varnode,
+        BasicBlock, BlockId, BlockParamId, BlockRef, Function, FunctionId, Instruction,
+        LocalValueId, Value, ValueId, ValueRef, Varnode,
         insn::{
             Branch, BranchInd, CBranch, Call, CallInd, Carry, Extract, InstructionId,
             InstructionRef, IntBinop, LzCount, Mnemonic, PopCount, Range, Return, SBorrow, SCarry,
@@ -1013,10 +1013,13 @@ impl StandaloneEmulator {
         Ok(())
     }
 
+    /// Resolve a terminator's bare-local argument list; `func` is the owning
+    /// function of the instruction the args came from (strict IR locality).
     fn collect_block_args(
         &mut self,
         ctx: &Context<'_>,
-        args: &[ValueId],
+        func: FunctionId,
+        args: &[LocalValueId],
     ) -> Result<Vec<SizedValue>, EmulatorErrorKind> {
         let mut tmp = TempInterpreter {
             memory: &mut self.memory,
@@ -1024,16 +1027,19 @@ impl StandaloneEmulator {
             block_param_values: &mut self.block_param_values,
             ctx,
         };
-        args.iter().map(|&arg| tmp.get_value(arg)).collect()
+        args.iter()
+            .map(|&arg| tmp.get_value(arg.qualify(func)))
+            .collect()
     }
 
     fn bind_block_args(
         &mut self,
         ctx: &Context<'_>,
+        func: FunctionId,
         target: BlockId,
-        args: &[ValueId],
+        args: &[LocalValueId],
     ) -> Result<(), EmulatorErrorKind> {
-        let values = self.collect_block_args(ctx, args)?;
+        let values = self.collect_block_args(ctx, func, args)?;
         let params = BasicBlock::from_id(ctx, target)
             .params()
             .map(|param| param.id)
@@ -1080,7 +1086,13 @@ impl StandaloneEmulator {
             instruction,
             block,
             target: call.target,
-            args: call.args.clone(),
+            // Operands are stored bare-local; the CallSite is a boundary object,
+            // so qualify with the call instruction's own function.
+            args: call
+                .args
+                .iter()
+                .map(|a| a.qualify(instruction.func))
+                .collect(),
         };
         let result = interceptor(ctx, self, &site);
         self.call_interceptor = Some(interceptor);
@@ -1119,7 +1131,7 @@ impl StandaloneEmulator {
                 // Terminator targets are bare body-local indices in the terminator's
                 // own arena (`id.func`); qualify to the current block's function.
                 let target = BlockId::new(id.func, *target);
-                self.bind_block_args(ctx, target, args)
+                self.bind_block_args(ctx, id.func, target, args)
                     .map_err(|kind| self.make_error(ctx, kind))?;
                 self.block = target;
                 self.idx = 0;
@@ -1161,7 +1173,7 @@ impl StandaloneEmulator {
             Mnemonic::Apply(apply) => {
                 const APPLY_STEP_BUDGET: usize = 100_000;
                 let args = self
-                    .collect_block_args(ctx, &apply.args)
+                    .collect_block_args(ctx, id.func, &apply.args)
                     .map_err(|kind| self.make_error(ctx, kind))?;
                 let root = Function::from_id(ctx, apply.target)
                     .root()
@@ -1201,15 +1213,15 @@ impl StandaloneEmulator {
                 failure_block: fallthrough,
                 failure_args,
             }) => {
-                let cond_val = self.get_value(ctx, *condition).unwrap();
+                let cond_val = self.get_value(ctx, condition.qualify(id.func)).unwrap();
                 let target = BlockId::new(id.func, *target);
                 let fallthrough = BlockId::new(id.func, *fallthrough);
                 if cond_val != 0 {
-                    self.bind_block_args(ctx, target, success_args)
+                    self.bind_block_args(ctx, id.func, target, success_args)
                         .map_err(|kind| self.make_error(ctx, kind))?;
                     self.block = target;
                 } else {
-                    self.bind_block_args(ctx, fallthrough, failure_args)
+                    self.bind_block_args(ctx, id.func, fallthrough, failure_args)
                         .map_err(|kind| self.make_error(ctx, kind))?;
                     self.block = fallthrough;
                 }
@@ -1217,7 +1229,7 @@ impl StandaloneEmulator {
             }
 
             Mnemonic::BranchInd(BranchInd { ptr }) => {
-                let addr = self.get_value(ctx, *ptr).unwrap();
+                let addr = self.get_value(ctx, ptr.qualify(id.func)).unwrap();
                 let target = BasicBlock::from_addr(ctx, addr)
                     .ok_or_else(|| {
                         self.make_error(ctx, EmulatorErrorKind::InvalidBlockAddress(addr))
@@ -1228,7 +1240,7 @@ impl StandaloneEmulator {
             }
 
             Mnemonic::CallInd(CallInd { ptr, .. }) => {
-                let addr = self.get_value(ctx, *ptr).unwrap();
+                let addr = self.get_value(ctx, ptr.qualify(id.func)).unwrap();
                 let target = BasicBlock::from_addr(ctx, addr)
                     .ok_or_else(|| {
                         self.make_error(ctx, EmulatorErrorKind::InvalidBlockAddress(addr))
@@ -1246,16 +1258,17 @@ impl StandaloneEmulator {
                 // field-wise; a scalar return is copied through. This is what makes
                 // a caller's `extract(call, i)` see the callee's effects.
                 if let Some(call_id) = self.call_site_stack.pop()
-                    && let Some(ValueId::Instruction(src)) = value
+                    && let Some(LocalValueId::Instruction(src_local)) = value
                 {
-                    if let Some(agg) = self.aggregate_values.get(src).cloned() {
+                    let src = InstructionId::new(id.func, *src_local);
+                    if let Some(agg) = self.aggregate_values.get(&src).cloned() {
                         self.aggregate_values.insert(call_id, agg);
-                    } else if let Some(scalar) = self.insn_values.get(src).copied() {
+                    } else if let Some(scalar) = self.insn_values.get(&src).copied() {
                         self.insn_values.insert(call_id, scalar);
                     }
                 }
 
-                let addr = self.get_value(ctx, *ptr).unwrap();
+                let addr = self.get_value(ctx, ptr.qualify(id.func)).unwrap();
                 let target = BasicBlock::from_addr(ctx, addr)
                     .ok_or_else(|| {
                         self.make_error(ctx, EmulatorErrorKind::InvalidBlockAddress(addr))
@@ -1284,7 +1297,7 @@ impl StandaloneEmulator {
                             block_param_values: &mut self.block_param_values,
                             ctx,
                         };
-                        tmp.get_value(f)
+                        tmp.get_value(f.qualify(id.func))
                     };
                     vals.push(val.map_err(|kind| self.make_error(ctx, kind))?);
                 }
@@ -1295,16 +1308,16 @@ impl StandaloneEmulator {
             // Aggregate projection: pull field `index` out of the stashed vector.
             Mnemonic::Extract(Extract { agg, index }) => {
                 let field = match agg {
-                    ValueId::Instruction(agg_id) => self
+                    LocalValueId::Instruction(agg_local) => self
                         .aggregate_values
-                        .get(agg_id)
+                        .get(&InstructionId::new(id.func, *agg_local))
                         .and_then(|v| v.get(*index))
                         .copied(),
                     // A `map` body's `enumerate` lane arrives as an aggregate
                     // block param seeded by `run_map_body`.
-                    ValueId::BlockParam(pid) => self
+                    LocalValueId::BlockParam(pid_local) => self
                         .block_param_aggregates
-                        .get(pid)
+                        .get(&BlockParamId::new(id.func, *pid_local))
                         .and_then(|v| v.get(*index))
                         .copied(),
                     _ => None,
@@ -1320,7 +1333,7 @@ impl StandaloneEmulator {
             // Its result is array-typed, so it lives in `array_values`; a scalar
             // load falls through to the generic interpreter below.
             Mnemonic::Load(load) if self.is_array_operand(ctx, ValueId::Instruction(insn_id)) => {
-                let (space, ptr, size) = (load.space, load.ptr, load.size);
+                let (space, ptr, size) = (load.space, load.ptr.qualify(id.func), load.size);
                 let addr = self
                     .get_value(ctx, ptr)
                     .ok_or_else(|| self.make_error(ctx, EmulatorErrorKind::ValueError(0)))?;
@@ -1334,8 +1347,12 @@ impl StandaloneEmulator {
             // Whole-array store: the promoted buffer written back to memory in one
             // shot (`store(ram, base <- arr)` at loop exit). A scalar store falls
             // through to the generic interpreter below.
-            Mnemonic::Store(store) if self.is_array_operand(ctx, store.src) => {
-                let (space, ptr, src) = (store.space, store.ptr, store.src);
+            Mnemonic::Store(store) if self.is_array_operand(ctx, store.src.qualify(id.func)) => {
+                let (space, ptr, src) = (
+                    store.space,
+                    store.ptr.qualify(id.func),
+                    store.src.qualify(id.func),
+                );
                 let buf = self
                     .resolve_array(ctx, src)
                     .ok_or_else(|| self.make_error(ctx, EmulatorErrorKind::ValueError(0)))?;
@@ -1369,8 +1386,8 @@ impl StandaloneEmulator {
             // sub-buffer (e.g. `l0[1..]`, the original-array scan source), kept in
             // the `array_values` domain. A scalar `Range` (bit-field extract) falls
             // through to the generic interpreter below.
-            Mnemonic::Range(range) if self.is_array_operand(ctx, range.src) => {
-                let (src, start, size) = (range.src, range.start, range.size);
+            Mnemonic::Range(range) if self.is_array_operand(ctx, range.src.qualify(id.func)) => {
+                let (src, start, size) = (range.src.qualify(id.func), range.start, range.size);
                 let buf = self
                     .resolve_array(ctx, src)
                     .ok_or_else(|| self.make_error(ctx, EmulatorErrorKind::ValueError(0)))?;
@@ -1386,7 +1403,7 @@ impl StandaloneEmulator {
             // generic interpreter.
             Mnemonic::Intrinsic(app) if is_array_intrinsic(app.id.name()) => {
                 let name = app.id.name();
-                let args = app.args.clone();
+                let args: Vec<ValueId> = app.args.iter().map(|a| a.qualify(id.func)).collect();
                 self.eval_array_intrinsic(ctx, insn_id, name, &args)
                     .map_err(|kind| self.make_error(ctx, kind))?;
                 self.idx += 1;
@@ -1514,7 +1531,7 @@ impl StandaloneEmulator {
             .iter()
             .zip(&params)
             .map(|(&arg, &(_, size))| {
-                let raw = self.get_value(ctx, arg).unwrap_or(0);
+                let raw = self.get_value(ctx, arg.qualify(call_id.func)).unwrap_or(0);
                 SizedValue::new(raw, size)
             })
             .collect();
@@ -1805,14 +1822,14 @@ impl StandaloneEmulator {
         const SCAN_STEP_BUDGET: usize = 100_000;
 
         let src = self
-            .resolve_array(ctx, scan.src)
+            .resolve_array(ctx, scan.src.qualify(insn_id.func))
             .ok_or(EmulatorErrorKind::ValueError(0))?;
         // Element sizes come from the operand/result element *types* (which are
         // known even for a length-erased `[T;*]` result); the lane count is the
         // source buffer's length in input elements. This handles both a folded
         // fixed-array source and a symbolic-length `iota`.
         let in_elem = ctx
-            .stored_type_of(scan.src)
+            .stored_type_of(scan.src.qualify(insn_id.func))
             .and_then(|ty| ctx.shared.types.seq_elem_of(ty))
             .ok_or(EmulatorErrorKind::ValueError(0))?;
         let isz = ctx.shared.types.size_of(in_elem).max(1);
@@ -1833,10 +1850,10 @@ impl StandaloneEmulator {
             .iter()
             .map(|&c| {
                 let v = self
-                    .get_value(ctx, c)
+                    .get_value(ctx, c.qualify(insn_id.func))
                     .ok_or(EmulatorErrorKind::ValueError(0))?;
                 let sz = ctx
-                    .stored_type_of(c)
+                    .stored_type_of(c.qualify(insn_id.func))
                     .map(|ty| ctx.shared.types.size_of(ty))
                     .unwrap_or(8);
                 Ok(BodyArg::Scalar(SizedValue::new(v, sz)))
@@ -1844,7 +1861,7 @@ impl StandaloneEmulator {
             .collect::<Result<_, EmulatorErrorKind>>()?;
 
         let init = self
-            .get_value(ctx, scan.init)
+            .get_value(ctx, scan.init.qualify(insn_id.func))
             .ok_or(EmulatorErrorKind::ValueError(0))?;
         let mut acc = SizedValue::new(init, osz);
 
@@ -1916,10 +1933,10 @@ impl StandaloneEmulator {
         const MAP_STEP_BUDGET: usize = 100_000;
 
         let src = self
-            .resolve_array(ctx, map.src)
+            .resolve_array(ctx, map.src.qualify(insn_id.func))
             .ok_or(EmulatorErrorKind::ValueError(0))?;
         let in_elem = ctx
-            .stored_type_of(map.src)
+            .stored_type_of(map.src.qualify(insn_id.func))
             .and_then(|ty| ctx.shared.types.seq_elem_of(ty))
             .ok_or(EmulatorErrorKind::ValueError(0))?;
         let isz = ctx.shared.types.size_of(in_elem).max(1);
@@ -1935,10 +1952,10 @@ impl StandaloneEmulator {
             .iter()
             .map(|&c| {
                 let v = self
-                    .get_value(ctx, c)
+                    .get_value(ctx, c.qualify(insn_id.func))
                     .ok_or(EmulatorErrorKind::ValueError(0))?;
                 let sz = ctx
-                    .stored_type_of(c)
+                    .stored_type_of(c.qualify(insn_id.func))
                     .map(|ty| ctx.shared.types.size_of(ty))
                     .unwrap_or(8);
                 Ok(BodyArg::Scalar(SizedValue::new(v, sz)))
@@ -2078,7 +2095,7 @@ impl StandaloneEmulator {
 fn lambda_return_value(ctx: &Context<'_>, block: BlockId) -> Option<ValueId> {
     let last = BasicBlock::from_id(ctx, block).iter().last()?;
     match last.mnemonic() {
-        Mnemonic::ReturnValue(ret) => Some(ret.value),
+        Mnemonic::ReturnValue(ret) => Some(ret.value.qualify(last.id.func)),
         _ => None,
     }
 }
@@ -2089,8 +2106,8 @@ fn lambda_return_value(ctx: &Context<'_>, block: BlockId) -> Option<ValueId> {
 fn body_return_value(ctx: &Context<'_>, block: BlockId) -> Option<ValueId> {
     let last = BasicBlock::from_id(ctx, block).iter().last()?;
     match last.mnemonic() {
-        Mnemonic::Return(ret) => ret.value,
-        Mnemonic::ReturnValue(ret) => Some(ret.value),
+        Mnemonic::Return(ret) => ret.value.map(|v| v.qualify(last.id.func)),
+        Mnemonic::ReturnValue(ret) => Some(ret.value.qualify(last.id.func)),
         _ => None,
     }
 }
@@ -2663,7 +2680,7 @@ mod tests {
                 entry.func,
                 Mnemonic::Intrinsic(IntrinsicApp {
                     id: enum_id,
-                    args: vec![src],
+                    args: vec![src.localize(entry.func)],
                 }),
                 list_ty,
             )
@@ -2681,8 +2698,8 @@ mod tests {
         ctx.replace_instruction_mnemonic(
             rid,
             Mnemonic::Return(Return {
-                ptr,
-                value: Some(env),
+                ptr: ptr.localize(rid.func),
+                value: Some(env.localize(rid.func)),
             }),
         );
 
@@ -2742,8 +2759,8 @@ mod tests {
         ctx.replace_instruction_mnemonic(
             rid,
             Mnemonic::Return(Return {
-                ptr,
-                value: Some(lane),
+                ptr: ptr.localize(rid.func),
+                value: Some(lane.localize(rid.func)),
             }),
         );
 

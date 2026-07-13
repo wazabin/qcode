@@ -82,8 +82,8 @@ fn find_libc_main_arg(ctx: &Context<'_>, entry: u64, main_reg: ValueId) -> Optio
     for block in function.blocks() {
         for insn in block.instructions() {
             match insn.mnemonic() {
-                Mnemonic::Store(store) if store.ptr == main_reg => {
-                    last_main = store.src.as_literal().map(|id| {
+                Mnemonic::Store(store) if store.ptr.qualify(insn.id.func) == main_reg => {
+                    last_main = store.src.qualify(insn.id.func).as_literal().map(|id| {
                         (
                             LiteralRef::from_id(ctx, id).value(),
                             insn.address().unwrap_or(entry),

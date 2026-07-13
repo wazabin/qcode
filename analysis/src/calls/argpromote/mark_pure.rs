@@ -1,6 +1,6 @@
 use qcode::{
     context::Context,
-    value::{Function, FunctionId, ValueId, insn::Mnemonic},
+    value::{Function, FunctionId, insn::Mnemonic},
 };
 
 use crate::{Pass, PipelineEnv};
@@ -99,7 +99,10 @@ fn mnemonic_is_pure(ctx: &Context, m: &Mnemonic) -> bool {
         ),
         // Every other op is a value computation or structured control flow; it is
         // pure as long as it reads no raw varnode (un-promoted register/global).
-        _ => m.args().iter().all(|a| !matches!(a, ValueId::Varnode(_))),
+        _ => m
+            .args()
+            .iter()
+            .all(|a| !matches!(a, qcode::value::LocalValueId::Varnode(_))),
     }
 }
 
@@ -124,7 +127,7 @@ mod tests {
     use qcode::{
         builder::Builder,
         testing::TestContext,
-        value::{BasicBlock, Function},
+        value::{BasicBlock, Function, ValueId},
     };
 
     /// Build a one-block function with a single store through a pointer param,

@@ -108,6 +108,13 @@ pub(crate) fn find_carried_array<'a, 'str: 'a>(
                         ok = false;
                         break;
                     };
+                    // Operands are stored bare-local; qualify with the insert's
+                    // own function (== this pass's ambient function).
+                    let (arr0, idx, val) = (
+                        arr0.qualify(iid.func),
+                        idx.qualify(iid.func),
+                        val.qualify(iid.func),
+                    );
                     if let ValueId::BlockParam(_) = arr0 {
                         if carry.is_some() {
                             ok = false;
@@ -214,9 +221,9 @@ pub(crate) fn classify_body_reads<'a, 'str: 'a>(
         .iter()
         .filter_map(|insn| match insn.mnemonic() {
             Mnemonic::Intrinsic(IntrinsicApp { id, args })
-                if *id == at_id && args.len() == 2 && args[0] == ca.arr_b =>
+                if *id == at_id && args.len() == 2 && args[0].qualify(insn.id.func) == ca.arr_b =>
             {
-                Some((insn.id, args[1]))
+                Some((insn.id, args[1].qualify(insn.id.func)))
             }
             _ => None,
         })
@@ -385,7 +392,7 @@ mod tests {
             .iter()
             .find_map(|i| match i.mnemonic() {
                 Mnemonic::Intrinsic(IntrinsicApp { id, args })
-                    if *id == insert_id && args[0] == ca.arr_b =>
+                    if *id == insert_id && args[0] == ca.arr_b.localize(i.id.func) =>
                 {
                     Some(i.id)
                 }
@@ -399,7 +406,7 @@ mod tests {
         let Mnemonic::Intrinsic(IntrinsicApp { args, .. }) = &mut m else {
             unreachable!("carry is an intrinsic");
         };
-        args[1] = foreign;
+        args[1] = foreign.localize(carry.func);
         ctx.replace_instruction_mnemonic(carry, m);
         assert!(
             find_carried_array(&ctx, f).is_none(),

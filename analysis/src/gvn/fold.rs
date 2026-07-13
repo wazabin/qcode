@@ -1,7 +1,7 @@
 //! Constant-folding sub-pass: arithmetic on literals and algebraic identities.
 
 use qcode::value::{
-    Value, ValueId, ValueRef,
+    FunctionId, Value, ValueId, ValueRef,
     insn::{Binary, Binop, IntBinop, Mnemonic, Unop},
     literal::LiteralRef,
     util::base_ref::{AsShared, HostRef},
@@ -94,17 +94,27 @@ pub(super) fn constant_folding(
     m: &Mnemonic,
     output_size: usize,
 ) -> Option<ValueId> {
-    constant_folding_with_location(HostRef::from(&*ctx), m, output_size, None)
+    // Test-only: the test mnemonics hold shared literal operands, which carry no
+    // function, so any func qualifies them unchanged.
+    constant_folding_with_location(
+        HostRef::from(&*ctx),
+        FunctionId::from(0usize),
+        m,
+        output_size,
+        None,
+    )
 }
 
 fn constant_folding_with_location(
     host: HostRef,
+    func: FunctionId,
     m: &Mnemonic,
     output_size: usize,
     location: Option<&InsnCtx>,
 ) -> Option<ValueId> {
     match m {
         &Mnemonic::Binop(Binary { lhs, rhs, op }) => {
+            let (lhs, rhs) = (lhs.qualify(func), rhs.qualify(func));
             // StackAddress-typed literals are foldable; their type is preserved
             // through the output type computed by binop_result below.
             let lhs_id = lhs;
@@ -209,7 +219,7 @@ fn constant_folding_with_location(
         }
 
         Mnemonic::Unop(unop) => {
-            let src = get_numeric_const(host, unop.src)?;
+            let src = get_numeric_const(host, unop.src.qualify(func))?;
 
             let v = src.value();
             let size = src.size();
@@ -228,12 +238,12 @@ fn constant_folding_with_location(
         }
 
         Mnemonic::Zext(zext) => {
-            let src = get_numeric_const(host, zext.src)?;
+            let src = get_numeric_const(host, zext.src.qualify(func))?;
             Some(host.shr().get_const(src.value(), zext.size))
         }
 
         Mnemonic::Sext(sext) => {
-            let src = get_numeric_const(host, sext.src)?;
+            let src = get_numeric_const(host, sext.src.qualify(func))?;
             // Sign-extend from the *source* width to 64 bits, then mask down to
             // the destination width.
             let src_bits = src.size() * 8;
@@ -252,7 +262,7 @@ fn constant_folding_with_location(
             // Extract `range.size` bytes starting at byte `range.start` of a
             // constant. The source may be a numeric literal (e.g. EDI = low 4
             // bytes of a wide RDI literal) or an opaque byte blob.
-            if let Some(bid) = range.src.as_bytes() {
+            if let Some(bid) = range.src.qualify(func).as_bytes() {
                 let data = &host.shr().values.bytes[bid].data;
                 let start = range.start;
                 let end = start.checked_add(range.size)?;
@@ -267,7 +277,7 @@ fn constant_folding_with_location(
                 // Still wider than a u64: a narrower byte blob.
                 return Some(host.shr().get_bytes(slice.to_vec()));
             }
-            let src = get_numeric_const(host, range.src)?;
+            let src = get_numeric_const(host, range.src.qualify(func))?;
             let shifted = src.value().overflowing_shr(range.start as u32 * 8).0;
             Some(
                 host.shr()
@@ -280,7 +290,7 @@ fn constant_folding_with_location(
         Mnemonic::Intrinsic(intr) => {
             let mut operands = Vec::with_capacity(intr.args.len());
             for &arg in &intr.args {
-                let c = get_numeric_const(host, arg)?;
+                let c = get_numeric_const(host, arg.qualify(func))?;
                 operands.push((u128::from(c.value()), c.size()));
             }
             let value = intr.id.desc().eval(&operands, output_size)?;
@@ -331,9 +341,10 @@ pub(super) fn const_value<'a, 'str: 'a>(src: impl AsShared<'a, 'str>, v: ValueId
 }
 
 fn try_fold_insn(host: HostRef, ic: &InsnCtx) -> Option<ValueId> {
-    constant_folding_with_location(host, ic.mnemonic, ic.size, Some(ic))
-        .or_else(|| algebraic_identity(host, ic.mnemonic, ic.size))
-        .or_else(|| cast_identity(host, ic.mnemonic))
+    let func = ic.insn_id.func;
+    constant_folding_with_location(host, func, ic.mnemonic, ic.size, Some(ic))
+        .or_else(|| algebraic_identity(host, func, ic.mnemonic, ic.size))
+        .or_else(|| cast_identity(host, func, ic.mnemonic))
 }
 
 /// The size in bytes of `v`'s output.
@@ -348,23 +359,27 @@ fn value_size(host: HostRef, v: ValueId) -> usize {
 /// * `zext(iN, v)` where `v` is already `N` bytes wide → `v`
 /// * `v[0:N]` (i.e. `Range { start: 0, size: N }`) where `v` is `N` bytes → `v`
 /// * `zext(_, v)[0:N]` where `v` is `N` bytes → `v` (e.g. `zext(i32, i1 v)[0:1]`)
-pub(super) fn cast_identity(host: HostRef, m: &Mnemonic) -> Option<ValueId> {
+pub(super) fn cast_identity(host: HostRef, func: FunctionId, m: &Mnemonic) -> Option<ValueId> {
     match m {
-        Mnemonic::Zext(zext) => (value_size(host, zext.src) == zext.size).then_some(zext.src),
+        Mnemonic::Zext(zext) => {
+            let src = zext.src.qualify(func);
+            (value_size(host, src) == zext.size).then_some(src)
+        }
         Mnemonic::Range(range) if range.start == 0 => {
+            let src = range.src.qualify(func);
             // `v[0:N]` keeps the low `N` bytes. If `v` is exactly `N` bytes the
             // extract is a no-op.
-            if value_size(host, range.src) == range.size {
-                return Some(range.src);
+            if value_size(host, src) == range.size {
+                return Some(src);
             }
             // `zext(_, inner)[0:N]` where `inner` is exactly `N` bytes: the low
             // `N` bytes of the zext are `inner` untouched, so the extract peels
             // the widening back off.
-            if let ValueId::Instruction(id) = range.src
+            if let ValueId::Instruction(id) = src
                 && let Mnemonic::Zext(inner) = host.insn_ref(id).mnemonic()
-                && value_size(host, inner.src) == range.size
+                && value_size(host, inner.src.qualify(id.func)) == range.size
             {
-                return Some(inner.src);
+                return Some(inner.src.qualify(id.func));
             }
             None
         }
@@ -449,12 +464,14 @@ fn fold_location(host: HostRef, location: Option<&InsnCtx>) -> String {
 /// operand or an interned constant) when a law applies.
 pub(super) fn algebraic_identity(
     host: HostRef,
+    func: FunctionId,
     m: &Mnemonic,
     output_size: usize,
 ) -> Option<ValueId> {
     let &Mnemonic::Binop(Binary { lhs, rhs, op }) = m else {
         return None;
     };
+    let (lhs, rhs) = (lhs.qualify(func), rhs.qualify(func));
     let Binop::Int(op) = op else {
         return None;
     };
@@ -546,8 +563,8 @@ mod tests {
     #[should_panic(expected = "type error in binop constant folding")]
     fn constant_folding_reports_mixed_size_literals() {
         let mut ctx = Context::new();
-        let lhs = ctx.get_const(0xf0, 4).id();
-        let rhs = ctx.get_const(0xff, 1).id();
+        let lhs = ctx.get_const(0xf0, 4).id().strip_func();
+        let rhs = ctx.get_const(0xff, 1).id().strip_func();
 
         let _ = constant_folding(
             &mut ctx,
@@ -563,8 +580,8 @@ mod tests {
     #[test]
     fn constant_folding_respects_instruction_result_width() {
         let mut ctx = Context::new();
-        let lhs = ctx.get_const(0xffff_ffff, 8).id();
-        let rhs = ctx.get_const(0x1_0000_00ff, 8).id();
+        let lhs = ctx.get_const(0xffff_ffff, 8).id().strip_func();
+        let rhs = ctx.get_const(0x1_0000_00ff, 8).id().strip_func();
 
         let folded = constant_folding(
             &mut ctx,
@@ -609,8 +626,8 @@ mod tests {
             &mut ctx,
             &Mnemonic::Binop(Binary {
                 op: Binop::Int(IntBinop::Add),
-                lhs: base,
-                rhs: offset,
+                lhs: base.strip_func(),
+                rhs: offset.strip_func(),
             }),
             4,
         );
@@ -670,7 +687,7 @@ mod tests {
             })
             .expect("an add survives");
         assert_eq!(
-            const_value(&ctx, *addr_rhs),
+            const_value(&ctx, addr_rhs.qualify(f)),
             Some(0x63),
             "the offset feeding the TEB* add must fold to 0x63"
         );
@@ -716,7 +733,7 @@ mod tests {
             })
             .expect("a store survives");
         assert_eq!(
-            const_value(&ctx, stored),
+            const_value(&ctx, stored.qualify(f)),
             Some(0x30),
             "the byte-assembly chain must fold to 0x30"
         );
@@ -770,7 +787,7 @@ mod tests {
             })
             .expect("an add survives");
         assert_eq!(
-            const_value(&ctx, addr_rhs),
+            const_value(&ctx, addr_rhs.qualify(f)),
             Some(0x30),
             "the forwarded byte offset feeding the TEB* add must fold to 0x30"
         );
@@ -910,7 +927,7 @@ mod tests {
             })
             .expect("a store survives");
         assert_eq!(
-            stored,
+            stored.qualify(f),
             ValueId::Instruction(a),
             "zext(i32, i32 v) must collapse to v"
         );
@@ -948,7 +965,7 @@ mod tests {
             })
             .expect("a store survives");
         assert_eq!(
-            stored,
+            stored.qualify(f),
             ValueId::Instruction(a),
             "v[0:4] for a 4-byte v must collapse to v"
         );
@@ -987,7 +1004,7 @@ mod tests {
             })
             .expect("a store survives");
         assert_eq!(
-            stored,
+            stored.qualify(f),
             ValueId::Instruction(a),
             "zext(i32, i1 v)[0:1] must collapse to v"
         );
@@ -1003,7 +1020,7 @@ mod tests {
     fn constant_folding_sext_extends_from_source_width() {
         let mut ctx = Context::new();
 
-        let src = ctx.get_const(0x80, 1).id();
+        let src = ctx.get_const(0x80, 1).id().strip_func();
         let folded = constant_folding(&mut ctx, &Mnemonic::Sext(Sext { src, size: 4 }), 4)
             .expect("sext of a constant must fold");
         let ValueId::Literal(lid) = folded else {
@@ -1011,7 +1028,7 @@ mod tests {
         };
         assert_eq!(ctx.shared.values.literals[lid].value, 0xFFFF_FF80);
 
-        let src = ctx.get_const(0x7f, 1).id();
+        let src = ctx.get_const(0x7f, 1).id().strip_func();
         let folded = constant_folding(&mut ctx, &Mnemonic::Sext(Sext { src, size: 8 }), 8)
             .expect("sext of a constant must fold");
         let ValueId::Literal(lid) = folded else {
@@ -1025,8 +1042,8 @@ mod tests {
     fn constant_folding_leaves_division_by_zero_unfolded() {
         for op in [IntBinop::Div, IntBinop::Rem] {
             let mut ctx = Context::new();
-            let lhs = ctx.get_const(42, 4).id();
-            let rhs = ctx.get_const(0, 4).id();
+            let lhs = ctx.get_const(42, 4).id().strip_func();
+            let rhs = ctx.get_const(0, 4).id().strip_func();
             let folded = constant_folding(
                 &mut ctx,
                 &Mnemonic::Binop(Binary {
@@ -1049,8 +1066,8 @@ mod tests {
     fn constant_folding_oversized_shift_counts_fold_to_zero() {
         for op in [IntBinop::ShiftLeft, IntBinop::ShiftRight] {
             let mut ctx = Context::new();
-            let lhs = ctx.get_const(1, 8).id();
-            let rhs = ctx.get_const(64, 8).id();
+            let lhs = ctx.get_const(1, 8).id().strip_func();
+            let rhs = ctx.get_const(64, 8).id().strip_func();
             let folded = constant_folding(
                 &mut ctx,
                 &Mnemonic::Binop(Binary {
@@ -1085,7 +1102,7 @@ mod tests {
                 type_id,
                 symbolic: Some(qcode::value::literal::SymbolicRef::String("s".into())),
             });
-        let src = ValueId::Literal(lid);
+        let src = ValueId::Literal(lid).strip_func();
 
         assert!(constant_folding(&mut ctx, &Mnemonic::Zext(Zext { src, size: 8 }), 8).is_none());
         assert!(constant_folding(&mut ctx, &Mnemonic::Sext(Sext { src, size: 8 }), 8).is_none());
@@ -1112,7 +1129,8 @@ mod tests {
             .get_bytes(vec![
                 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88, 0x99, 0xaa,
             ])
-            .id();
+            .id()
+            .strip_func();
 
         let folded = constant_folding(
             &mut ctx,
@@ -1139,7 +1157,7 @@ mod tests {
     #[test]
     fn range_of_bytes_keeps_wide_slice_as_bytes() {
         let mut ctx = Context::new();
-        let src = ctx.get_bytes((0..16u8).collect()).id();
+        let src = ctx.get_bytes((0..16u8).collect()).id().strip_func();
 
         let folded = constant_folding(
             &mut ctx,

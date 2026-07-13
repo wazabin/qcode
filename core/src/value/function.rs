@@ -292,11 +292,11 @@ impl<'str> Function<'str> {
     /// use in the reverse-use map. (No call-site maintenance — see the module
     /// note.)
     pub fn push_insn(&mut self, func: FunctionId, insn: Instruction<'str>) -> InstructionId {
-        let args: Vec<ValueId> = insn.mnemonic().args().into_iter().collect();
+        let args: Vec<LocalValueId> = insn.mnemonic().args().into_iter().collect();
         let local = self.insns.push(insn);
         let id = InstructionId::new(func, local);
         for arg in args {
-            self.users.entry(arg.strip_func()).or_default().push(id);
+            self.users.entry(arg).or_default().push(id);
         }
         id
     }
@@ -386,15 +386,17 @@ impl<'str> Function<'str> {
         if old == new {
             return;
         }
-        if old.owning_function().is_none() {
+        let Some(func) = old.owning_function() else {
             return;
-        }
+        };
         let users: Vec<InstructionId> = self.users_of(old).to_vec();
+        let old = old.localize(func);
+        let new = new.localize(func);
         for user in users {
             self.insn_mut(user).mnemonic_mut().replace_value(old, new);
-            self.users.entry(new.strip_func()).or_default().push(user);
+            self.users.entry(new).or_default().push(user);
         }
-        self.users.remove(&old.strip_func());
+        self.users.remove(&old);
     }
 
     /// Remove instruction `id` from its block, unlink its outgoing CFG edges if a
@@ -437,7 +439,7 @@ impl<'str> Function<'str> {
 
         self.insn_mut(id).deleted = true;
         for arg in args {
-            if let Some(users) = self.users.get_mut(&arg.strip_func()) {
+            if let Some(users) = self.users.get_mut(&arg) {
                 users.retain(|u| *u != id);
             }
         }
@@ -474,14 +476,14 @@ impl<'str> Function<'str> {
             .into_iter()
             .collect::<Vec<_>>();
         for arg in old_args {
-            let now_empty = if let Some(users) = self.users.get_mut(&arg.strip_func()) {
+            let now_empty = if let Some(users) = self.users.get_mut(&arg) {
                 users.retain(|&u| u != id);
                 users.is_empty()
             } else {
                 false
             };
             if now_empty {
-                self.users.remove(&arg.strip_func());
+                self.users.remove(&arg);
             }
         }
         *self.insn_mut(id).mnemonic_mut() = mnemonic;
@@ -492,7 +494,7 @@ impl<'str> Function<'str> {
             .into_iter()
             .collect::<Vec<_>>();
         for arg in new_args {
-            self.users.entry(arg.strip_func()).or_default().push(id);
+            self.users.entry(arg).or_default().push(id);
         }
     }
 
@@ -548,7 +550,7 @@ impl<'str> Function<'str> {
                 branch_args.len()
             );
             for (param, arg) in other_params.into_iter().zip(branch_args) {
-                self.replace_all_uses_with(ValueId::BlockParam(param), arg);
+                self.replace_all_uses_with(ValueId::BlockParam(param), arg.qualify(keep.func));
             }
         }
         self.block_mut(keep).instructions.pop();

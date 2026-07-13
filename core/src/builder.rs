@@ -453,7 +453,7 @@ impl<'str, 'ctx, Ctx: BuilderBacking<'str>> Builder<'str, 'ctx, Ctx> {
 
                 self.push_instruction_in_space(
                     Mnemonic::Range(Range {
-                        src,
+                        src: self.loc(src),
                         start: range.start,
                         size: range.len(),
                     }),
@@ -481,7 +481,15 @@ impl<'str, 'ctx, Ctx: BuilderBacking<'str>> Builder<'str, 'ctx, Ctx> {
         size: usize,
     ) -> InstructionRef<'str, '_> {
         let space = self.get_value(src).space().map(|s| s.id);
-        self.push_instruction_in_space(Mnemonic::Range(Range { src, start, size }), size, space)
+        self.push_instruction_in_space(
+            Mnemonic::Range(Range {
+                src: self.loc(src),
+                start,
+                size,
+            }),
+            size,
+            space,
+        )
     }
 
     /// Removes a name from the local namespace, freeing it for reuse.
@@ -631,6 +639,20 @@ impl<'str, 'ctx, Ctx: BuilderBacking<'str>> Builder<'str, 'ctx, Ctx> {
         // own function's SSA values (which live in the owned function, not the
         // shared context) correctly.
         ValueRef::from_host(self.read_host(), id)
+    }
+
+    /// Localize a qualified operand id for storage in a mnemonic built for this
+    /// builder's working block. Strict IR locality (context-split ruling 2)
+    /// guarantees the operand lives in this function's arena, so its owning
+    /// `FunctionId` is the block's own `id.func`.
+    fn loc(&self, id: ValueId) -> crate::value::LocalValueId {
+        id.localize(self.block.id.func)
+    }
+
+    /// Localize a whole operand list (call/branch/tuple/intrinsic args).
+    fn loc_vec(&self, ids: Vec<ValueId>) -> Vec<crate::value::LocalValueId> {
+        let func = self.block.id.func;
+        ids.into_iter().map(|v| v.localize(func)).collect()
     }
 
     /// The result type of `id`, host-routed (mirror of [`Context::type_of`]): a
@@ -808,7 +830,7 @@ impl<'str, 'ctx, Ctx: BuilderBacking<'str>> Builder<'str, 'ctx, Ctx> {
 
             self.push_instruction(
                 Mnemonic::Load(Load {
-                    ptr: src,
+                    ptr: self.loc(src),
                     space,
                     size,
                 }),
@@ -826,7 +848,13 @@ impl<'str, 'ctx, Ctx: BuilderBacking<'str>> Builder<'str, 'ctx, Ctx> {
             "push_unop: varnode operand is not allowed; use ensure_local or &name addressof syntax"
         );
         let size = self.get_value(src).size();
-        self.push_instruction(Mnemonic::Unop(Unary { op, src }), size)
+        self.push_instruction(
+            Mnemonic::Unop(Unary {
+                op,
+                src: self.loc(src),
+            }),
+            size,
+        )
     }
 
     /// Logical NOT of a `bool` value, canonically `src == false`.
@@ -926,7 +954,14 @@ impl<'str, 'ctx, Ctx: BuilderBacking<'str>> Builder<'str, 'ctx, Ctx> {
             result_type
         };
 
-        self.push_instruction_with_type(Mnemonic::Binop(Binary { op, lhs, rhs }), result_type)
+        self.push_instruction_with_type(
+            Mnemonic::Binop(Binary {
+                op,
+                lhs: self.loc(lhs),
+                rhs: self.loc(rhs),
+            }),
+            result_type,
+        )
     }
 
     // --- Arithmetic ---
@@ -1080,7 +1115,7 @@ impl<'str, 'ctx, Ctx: BuilderBacking<'str>> Builder<'str, 'ctx, Ctx> {
             !src.is_varnode(),
             "push_is_nan: varnode operand not allowed"
         );
-        self.push_instruction(Mnemonic::IsFloatNaN(IsFloatNaN { src }), 1)
+        self.push_instruction(Mnemonic::IsFloatNaN(IsFloatNaN { src: self.loc(src) }), 1)
     }
 
     pub fn push_abs(&mut self, src: ValueId) -> InstructionRef<'str, '_> {
@@ -1108,7 +1143,13 @@ impl<'str, 'ctx, Ctx: BuilderBacking<'str>> Builder<'str, 'ctx, Ctx> {
             !src.is_varnode(),
             "push_int_to_float: varnode operand not allowed"
         );
-        self.push_instruction(Mnemonic::IntToFloat(IntToFloat { src, size }), size)
+        self.push_instruction(
+            Mnemonic::IntToFloat(IntToFloat {
+                src: self.loc(src),
+                size,
+            }),
+            size,
+        )
     }
 
     pub fn push_float_to_float(&mut self, src: ValueId, size: usize) -> InstructionRef<'str, '_> {
@@ -1116,22 +1157,46 @@ impl<'str, 'ctx, Ctx: BuilderBacking<'str>> Builder<'str, 'ctx, Ctx> {
             !src.is_varnode(),
             "push_float_to_float: varnode operand not allowed"
         );
-        self.push_instruction(Mnemonic::FloatToFloat(FloatToFloat { src, size }), size)
+        self.push_instruction(
+            Mnemonic::FloatToFloat(FloatToFloat {
+                src: self.loc(src),
+                size,
+            }),
+            size,
+        )
     }
 
     pub fn push_trunc(&mut self, src: ValueId, size: usize) -> InstructionRef<'str, '_> {
         assert!(!src.is_varnode(), "push_trunc: varnode operand not allowed");
-        self.push_instruction(Mnemonic::FloatToInt(FloatToInt { src, size }), size)
+        self.push_instruction(
+            Mnemonic::FloatToInt(FloatToInt {
+                src: self.loc(src),
+                size,
+            }),
+            size,
+        )
     }
 
     pub fn push_zext(&mut self, src: ValueId, size: usize) -> InstructionRef<'str, '_> {
         assert!(!src.is_varnode(), "push_zext: varnode operand not allowed");
-        self.push_instruction(Mnemonic::Zext(Zext { src, size }), size)
+        self.push_instruction(
+            Mnemonic::Zext(Zext {
+                src: self.loc(src),
+                size,
+            }),
+            size,
+        )
     }
 
     pub fn push_sext(&mut self, src: ValueId, size: usize) -> InstructionRef<'str, '_> {
         assert!(!src.is_varnode(), "push_sext: varnode operand not allowed");
-        self.push_instruction(Mnemonic::Sext(Sext { src, size }), size)
+        self.push_instruction(
+            Mnemonic::Sext(Sext {
+                src: self.loc(src),
+                size,
+            }),
+            size,
+        )
     }
 
     /// Builds an aggregate value from `fields` using default field names
@@ -1160,7 +1225,12 @@ impl<'str, 'ctx, Ctx: BuilderBacking<'str>> Builder<'str, 'ctx, Ctx> {
             .types
             .get_or_make_named_aggregate(aggregate_fields);
         let values = fields.into_iter().map(|(_, value)| value).collect();
-        self.push_instruction_with_type(Mnemonic::Tuple(Tuple { fields: values }), ty)
+        self.push_instruction_with_type(
+            Mnemonic::Tuple(Tuple {
+                fields: self.loc_vec(values),
+            }),
+            ty,
+        )
     }
 
     /// Projects field `index` out of the aggregate value `agg`. The result type
@@ -1172,7 +1242,13 @@ impl<'str, 'ctx, Ctx: BuilderBacking<'str>> Builder<'str, 'ctx, Ctx> {
             .types
             .field_type(agg_ty, index)
             .expect("push_extract: agg is not an aggregate with that field index");
-        self.push_instruction_with_type(Mnemonic::Extract(Extract { agg, index }), ty)
+        self.push_instruction_with_type(
+            Mnemonic::Extract(Extract {
+                agg: self.loc(agg),
+                index,
+            }),
+            ty,
+        )
     }
 
     /// Builds a total element-wise map `out[i] = body(src[i], captures…)` over the
@@ -1207,8 +1283,8 @@ impl<'str, 'ctx, Ctx: BuilderBacking<'str>> Builder<'str, 'ctx, Ctx> {
         self.push_instruction_with_type(
             Mnemonic::Map(Map {
                 body,
-                src,
-                captures,
+                src: self.loc(src),
+                captures: self.loc_vec(captures),
             }),
             ty,
         )
@@ -1246,9 +1322,9 @@ impl<'str, 'ctx, Ctx: BuilderBacking<'str>> Builder<'str, 'ctx, Ctx> {
         self.push_instruction_with_type(
             Mnemonic::Scan(Scan {
                 body,
-                init,
-                src,
-                captures,
+                init: self.loc(init),
+                src: self.loc(src),
+                captures: self.loc_vec(captures),
             }),
             ty,
         )
@@ -1267,7 +1343,13 @@ impl<'str, 'ctx, Ctx: BuilderBacking<'str>> Builder<'str, 'ctx, Ctx> {
                 .map(|&arg| self.type_of(arg))
                 .unwrap_or_else(|| self.shr().types.get_or_make_int(0))
         });
-        self.push_instruction_with_type(Mnemonic::Apply(Apply { target, args }), ty)
+        self.push_instruction_with_type(
+            Mnemonic::Apply(Apply {
+                target,
+                args: self.loc_vec(args),
+            }),
+            ty,
+        )
     }
 
     /// The type of the value returned by `body`'s first `Return`, or `None` if
@@ -1283,7 +1365,9 @@ impl<'str, 'ctx, Ctx: BuilderBacking<'str>> Builder<'str, 'ctx, Ctx> {
         BasicBlock::from_id(ctx, root)
             .iter()
             .find_map(|i| match i.mnemonic() {
-                Mnemonic::Return(r) => r.value.and_then(|v| self.stored_type_of(v)),
+                Mnemonic::Return(r) => r
+                    .value
+                    .and_then(|v| self.stored_type_of(v.qualify(i.id.func))),
                 _ => None,
             })
     }
@@ -1298,7 +1382,7 @@ impl<'str, 'ctx, Ctx: BuilderBacking<'str>> Builder<'str, 'ctx, Ctx> {
             .iter()
             .flat_map(|block| block.iter())
             .find_map(|i| match i.mnemonic() {
-                Mnemonic::ReturnValue(r) => self.stored_type_of(r.value),
+                Mnemonic::ReturnValue(r) => self.stored_type_of(r.value.qualify(i.id.func)),
                 _ => None,
             })
     }
@@ -1323,7 +1407,13 @@ impl<'str, 'ctx, Ctx: BuilderBacking<'str>> Builder<'str, 'ctx, Ctx> {
             .shr()
             .types
             .get_or_make_struct_pointer(ptr_width, field_ty);
-        self.push_instruction_with_type(Mnemonic::Gep(Gep { base, offset }), ty)
+        self.push_instruction_with_type(
+            Mnemonic::Gep(Gep {
+                base: self.loc(base),
+                offset,
+            }),
+            ty,
+        )
     }
 
     /// Like [`push_gep`](Builder::push_gep) but selects the field by name,
@@ -1348,7 +1438,7 @@ impl<'str, 'ctx, Ctx: BuilderBacking<'str>> Builder<'str, 'ctx, Ctx> {
             !src.is_varnode(),
             "push_popcount: varnode operand not allowed"
         );
-        self.push_instruction(Mnemonic::PopCount(PopCount { src }), size)
+        self.push_instruction(Mnemonic::PopCount(PopCount { src: self.loc(src) }), size)
     }
 
     pub fn push_lzcount(&mut self, src: ValueId, size: usize) -> InstructionRef<'str, '_> {
@@ -1356,7 +1446,7 @@ impl<'str, 'ctx, Ctx: BuilderBacking<'str>> Builder<'str, 'ctx, Ctx> {
             !src.is_varnode(),
             "push_lzcount: varnode operand not allowed"
         );
-        self.push_instruction(Mnemonic::LzCount(LzCount { src }), size)
+        self.push_instruction(Mnemonic::LzCount(LzCount { src: self.loc(src) }), size)
     }
 
     pub fn push_carry(&mut self, lhs: ValueId, rhs: ValueId) -> InstructionRef<'str, '_> {
@@ -1364,7 +1454,13 @@ impl<'str, 'ctx, Ctx: BuilderBacking<'str>> Builder<'str, 'ctx, Ctx> {
             !lhs.is_varnode() && !rhs.is_varnode(),
             "push_carry: varnode operand not allowed"
         );
-        self.push_instruction(Mnemonic::Carry(Carry { lhs, rhs }), 1)
+        self.push_instruction(
+            Mnemonic::Carry(Carry {
+                lhs: self.loc(lhs),
+                rhs: self.loc(rhs),
+            }),
+            1,
+        )
     }
 
     pub fn push_scarry(&mut self, lhs: ValueId, rhs: ValueId) -> InstructionRef<'str, '_> {
@@ -1372,7 +1468,13 @@ impl<'str, 'ctx, Ctx: BuilderBacking<'str>> Builder<'str, 'ctx, Ctx> {
             !lhs.is_varnode() && !rhs.is_varnode(),
             "push_scarry: varnode operand not allowed"
         );
-        self.push_instruction(Mnemonic::SCarry(SCarry { lhs, rhs }), 1)
+        self.push_instruction(
+            Mnemonic::SCarry(SCarry {
+                lhs: self.loc(lhs),
+                rhs: self.loc(rhs),
+            }),
+            1,
+        )
     }
 
     pub fn push_sborrow(&mut self, lhs: ValueId, rhs: ValueId) -> InstructionRef<'str, '_> {
@@ -1380,7 +1482,13 @@ impl<'str, 'ctx, Ctx: BuilderBacking<'str>> Builder<'str, 'ctx, Ctx> {
             !lhs.is_varnode() && !rhs.is_varnode(),
             "push_sborrow: varnode operand not allowed"
         );
-        self.push_instruction(Mnemonic::SBorrow(SBorrow { lhs, rhs }), 1)
+        self.push_instruction(
+            Mnemonic::SBorrow(SBorrow {
+                lhs: self.loc(lhs),
+                rhs: self.loc(rhs),
+            }),
+            1,
+        )
     }
 
     pub fn push_pcode_op(
@@ -1395,7 +1503,14 @@ impl<'str, 'ctx, Ctx: BuilderBacking<'str>> Builder<'str, 'ctx, Ctx> {
             .map(|arg| self.ensure_local(arg))
             .collect::<Vec<_>>();
 
-        self.push_instruction(Mnemonic::PCodeOp(PCodeOp { id, args, dst }), size)
+        self.push_instruction(
+            Mnemonic::PCodeOp(PCodeOp {
+                id,
+                args: self.loc_vec(args),
+                dst: dst.map(|d| self.loc(d)),
+            }),
+            size,
+        )
     }
 
     /// Creates a pure intrinsic instruction (e.g. `rol`, `ror`, `enumerate`).
@@ -1432,7 +1547,13 @@ impl<'str, 'ctx, Ctx: BuilderBacking<'str>> Builder<'str, 'ctx, Ctx> {
             .collect::<Vec<_>>();
         let type_id = desc.result_type(&self.shr().types, &arg_types);
 
-        self.push_instruction_with_type(Mnemonic::Intrinsic(IntrinsicApp { id, args }), type_id)
+        self.push_instruction_with_type(
+            Mnemonic::Intrinsic(IntrinsicApp {
+                id,
+                args: self.loc_vec(args),
+            }),
+            type_id,
+        )
     }
 
     // --- Loads & Stores ---
@@ -1471,8 +1592,8 @@ impl<'str, 'ctx, Ctx: BuilderBacking<'str>> Builder<'str, 'ctx, Ctx> {
                 let id = self
                     .push_instruction_in_space(
                         Mnemonic::Store(Store {
-                            src: src_lane,
-                            ptr: dst_lane,
+                            src: self.loc(src_lane),
+                            ptr: self.loc(dst_lane),
                             space,
                             size: lane_size,
                         }),
@@ -1496,8 +1617,8 @@ impl<'str, 'ctx, Ctx: BuilderBacking<'str>> Builder<'str, 'ctx, Ctx> {
             let id = self
                 .push_instruction_in_space(
                     Mnemonic::Store(Store {
-                        src,
-                        ptr: dst.into(),
+                        src: self.loc(src),
+                        ptr: self.loc(dst.into()),
                         space,
                         size,
                     }),
@@ -1556,8 +1677,8 @@ impl<'str, 'ctx, Ctx: BuilderBacking<'str>> Builder<'str, 'ctx, Ctx> {
 
         self.push_instruction(
             Mnemonic::Store(Store {
-                src,
-                ptr,
+                src: self.loc(src),
+                ptr: self.loc(ptr),
                 space,
                 size,
             }),
@@ -1585,7 +1706,13 @@ impl<'str, 'ctx, Ctx: BuilderBacking<'str>> Builder<'str, 'ctx, Ctx> {
         self.block.host_mut().bb_add_cfg_edge(current, target);
         let target = target.localize(current.func);
         let id = self
-            .push_instruction(Mnemonic::Branch(Branch { target, args }), 0)
+            .push_instruction(
+                Mnemonic::Branch(Branch {
+                    target,
+                    args: self.loc_vec(args),
+                }),
+                0,
+            )
             .id;
         self.is_terminated = true;
         InstructionRef::new(self.read_host(), id)
@@ -1622,10 +1749,10 @@ impl<'str, 'ctx, Ctx: BuilderBacking<'str>> Builder<'str, 'ctx, Ctx> {
             .push_instruction(
                 Mnemonic::CBranch(CBranch {
                     success_block,
-                    success_args: target_args,
-                    condition,
+                    success_args: self.loc_vec(target_args),
+                    condition: self.loc(condition),
                     failure_block,
-                    failure_args: fallthrough_args,
+                    failure_args: self.loc_vec(fallthrough_args),
                 }),
                 0,
             )
@@ -1636,7 +1763,7 @@ impl<'str, 'ctx, Ctx: BuilderBacking<'str>> Builder<'str, 'ctx, Ctx> {
 
     pub fn push_branchind(&mut self, ptr: ValueId) -> InstructionRef<'str, '_> {
         let id = self
-            .push_instruction(Mnemonic::BranchInd(BranchInd { ptr }), 0)
+            .push_instruction(Mnemonic::BranchInd(BranchInd { ptr: self.loc(ptr) }), 0)
             .id;
         self.is_terminated = true;
         InstructionRef::new(self.read_host(), id)
@@ -1655,7 +1782,7 @@ impl<'str, 'ctx, Ctx: BuilderBacking<'str>> Builder<'str, 'ctx, Ctx> {
             .push_instruction(
                 Mnemonic::Call(Call {
                     target,
-                    args,
+                    args: self.loc_vec(args),
                     clobbers: vec![],
                 }),
                 0,
@@ -1679,7 +1806,13 @@ impl<'str, 'ctx, Ctx: BuilderBacking<'str>> Builder<'str, 'ctx, Ctx> {
         args: Vec<ValueId>,
     ) -> InstructionRef<'str, '_> {
         let id = self
-            .push_instruction(Mnemonic::TailCall(TailCall { target, args }), 0)
+            .push_instruction(
+                Mnemonic::TailCall(TailCall {
+                    target,
+                    args: self.loc_vec(args),
+                }),
+                0,
+            )
             .id;
         self.is_terminated = true;
         InstructionRef::new(self.read_host(), id)
@@ -1695,7 +1828,13 @@ impl<'str, 'ctx, Ctx: BuilderBacking<'str>> Builder<'str, 'ctx, Ctx> {
         args: Vec<ValueId>,
     ) -> InstructionRef<'str, '_> {
         let id = self
-            .push_instruction(Mnemonic::CallInd(CallInd { ptr, args }), 0)
+            .push_instruction(
+                Mnemonic::CallInd(CallInd {
+                    ptr: self.loc(ptr),
+                    args: self.loc_vec(args),
+                }),
+                0,
+            )
             .id;
         self.is_terminated = true;
         InstructionRef::new(self.read_host(), id)
@@ -1715,7 +1854,13 @@ impl<'str, 'ctx, Ctx: BuilderBacking<'str>> Builder<'str, 'ctx, Ctx> {
 
     fn push_return_at(&mut self, value: Option<ValueId>, ptr: ValueId) -> InstructionRef<'str, '_> {
         let id = self
-            .push_instruction(Mnemonic::Return(Return { ptr, value }), 0)
+            .push_instruction(
+                Mnemonic::Return(Return {
+                    ptr: self.loc(ptr),
+                    value: value.map(|v| self.loc(v)),
+                }),
+                0,
+            )
             .id;
         self.is_terminated = true;
         InstructionRef::new(self.read_host(), id)
@@ -1723,7 +1868,12 @@ impl<'str, 'ctx, Ctx: BuilderBacking<'str>> Builder<'str, 'ctx, Ctx> {
 
     pub fn push_return_value(&mut self, value: ValueId) -> InstructionRef<'str, '_> {
         let id = self
-            .push_instruction(Mnemonic::ReturnValue(ReturnValue { value }), 0)
+            .push_instruction(
+                Mnemonic::ReturnValue(ReturnValue {
+                    value: self.loc(value),
+                }),
+                0,
+            )
             .id;
         self.is_terminated = true;
         InstructionRef::new(self.read_host(), id)
@@ -1733,7 +1883,12 @@ impl<'str, 'ctx, Ctx: BuilderBacking<'str>> Builder<'str, 'ctx, Ctx> {
 
     /// Asserts that a condition holds at this point in execution
     pub fn push_assert(&mut self, condition: ValueId) -> InstructionRef<'str, '_> {
-        self.push_instruction(Mnemonic::Assert(Assert { condition }), 0)
+        self.push_instruction(
+            Mnemonic::Assert(Assert {
+                condition: self.loc(condition),
+            }),
+            0,
+        )
     }
 }
 
@@ -1941,8 +2096,8 @@ mod tests {
             &mut ctx,
             body,
             Mnemonic::Return(Return {
-                ptr: dummy,
-                value: Some(ValueId::BlockParam(bp)),
+                ptr: dummy.localize(body),
+                value: Some(ValueId::BlockParam(bp).localize(body)),
             }),
             i8,
         )
@@ -2204,7 +2359,7 @@ mod tests {
         };
         assert_eq!(branch.target, dst_id.local);
         assert_eq!(branch.args.len(), 1);
-        assert_eq!(branch.args[0], param_val);
+        assert_eq!(branch.args[0], param_val.strip_func());
     }
 
     #[test]

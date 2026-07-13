@@ -1,6 +1,6 @@
 use std::fmt::{Display, Formatter};
 
-use crate::value::{ValueId, insn::mnemonic::MnemonicKind};
+use crate::value::{LocalValueId, insn::mnemonic::MnemonicKind};
 use smallvec::smallvec;
 
 use super::mnemonic::Args;
@@ -55,7 +55,7 @@ impl Display for Unop {
 #[derive(Debug, Clone, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub struct Unary {
     pub op: Unop,
-    pub src: ValueId,
+    pub src: LocalValueId,
 }
 
 impl MnemonicKind for Unary {

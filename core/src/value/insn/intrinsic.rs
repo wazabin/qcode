@@ -29,7 +29,7 @@ use super::binop::IntBinop;
 use super::mnemonic::{Args, MnemonicKind};
 use crate::{
     types::{TypeId, TypeManager},
-    value::{InstructionId, ValueId, ValueRef, util::base_ref::HostRef},
+    value::{InstructionId, LocalValueId, ValueId, ValueRef, util::base_ref::HostRef},
 };
 use smallvec::SmallVec;
 
@@ -211,7 +211,7 @@ pub fn recognizers_for(root: RootOp) -> &'static [IntrinsicId] {
 #[derive(Debug, Clone, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub struct IntrinsicApp {
     pub id: IntrinsicId,
-    pub args: Vec<ValueId>,
+    pub args: Vec<LocalValueId>,
 }
 
 impl MnemonicKind for IntrinsicApp {
@@ -294,7 +294,7 @@ pub(crate) fn as_int_binop(
             lhs,
             rhs,
             op: Binop::Int(op),
-        }) if *op == want => Some((*lhs, *rhs)),
+        }) if *op == want => Some((lhs.qualify(id.func), rhs.qualify(id.func))),
         _ => None,
     }
 }

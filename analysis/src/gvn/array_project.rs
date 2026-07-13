@@ -59,10 +59,10 @@ impl<'str> ModuleSubPass<'str> for ArrayProject {
         let ctx: &mut Context = host;
         match *ic.mnemonic {
             Mnemonic::Range(Range { src, start, size }) => {
-                self.project_range(ctx, ic, ed, src, start, size)
+                self.project_range(ctx, ic, ed, src.qualify(ic.insn_id.func), start, size)
             }
             Mnemonic::Extract(Extract { agg, index }) => {
-                self.fold_extract_tuple(ctx, ic, ed, agg, index)
+                self.fold_extract_tuple(ctx, ic, ed, agg.qualify(ic.insn_id.func), index)
             }
             _ => Claim::Pass,
         }
@@ -86,11 +86,18 @@ impl ArrayProject {
         };
         match ctx.get_insn(src_id).mnemonic().clone() {
             Mnemonic::Map(_) => self.project_map(ctx, ic, ed, src_id, start, size),
-            Mnemonic::Intrinsic(intr) if intr.id.name() == "enumerate" => {
-                self.project_enumerate(ctx, ic, ed, src, intr.args[0], start, size)
-            }
+            Mnemonic::Intrinsic(intr) if intr.id.name() == "enumerate" => self.project_enumerate(
+                ctx,
+                ic,
+                ed,
+                src,
+                intr.args[0].qualify(src_id.func),
+                start,
+                size,
+            ),
             Mnemonic::Intrinsic(intr) if intr.id.name() == "concat" => {
-                self.project_concat(ctx, ic, ed, &intr.args, start, size)
+                let args: Vec<ValueId> = intr.args.iter().map(|a| a.qualify(src_id.func)).collect();
+                self.project_concat(ctx, ic, ed, &args, start, size)
             }
             // A `scan` is deliberately *not* projected: lane `k` is the `k`-th
             // accumulator, which depends on the whole prefix `0..=k`, not just
@@ -129,7 +136,7 @@ impl ArrayProject {
 
         // `src[k]` — the element fed to the body — is sliced at the *input*
         // element width `isz`.
-        let in_ty = ctx.type_of(map.src);
+        let in_ty = ctx.type_of(map.src.qualify(map_id.func));
         let Some((in_elem, _)) = ctx.shared.types.array_of(in_ty) else {
             return Claim::Pass;
         };
@@ -142,6 +149,8 @@ impl ArrayProject {
                 ctx,
                 ic.block_id.func,
                 Mnemonic::Range(Range {
+                    // Same-body relocation: the map and its projection live in one
+                    // function, so the map's local operand is valid here as-is.
                     src: map.src,
                     start: (k as usize) * isz,
                     size: isz,
@@ -157,7 +166,7 @@ impl ArrayProject {
         // unary in the element; index-aware bodies take an `enumerate` tuple as
         // that element and unpack it internally.
         let mut args = vec![element];
-        args.extend(map.captures.iter().copied());
+        args.extend(map.captures.iter().map(|c| c.qualify(map_id.func)));
         let Some(result) = inline_pure_body(ctx, map.body, &args, ic.block_id, ic.insn_id) else {
             return Claim::Pass;
         };
@@ -211,7 +220,7 @@ impl ArrayProject {
                 ctx,
                 ic.block_id.func,
                 Mnemonic::Range(Range {
-                    src,
+                    src: src.localize(ic.block_id.func),
                     start: (k as usize) * esz,
                     size: esz,
                 }),
@@ -228,7 +237,10 @@ impl ArrayProject {
                 ctx,
                 ic.block_id.func,
                 Mnemonic::Tuple(Tuple {
-                    fields: vec![index, element],
+                    fields: vec![
+                        index.localize(ic.block_id.func),
+                        element.localize(ic.block_id.func),
+                    ],
                 }),
                 tuple_ty,
             )
@@ -273,7 +285,7 @@ impl ArrayProject {
             ctx,
             ic.block_id.func,
             Mnemonic::Range(Range {
-                src,
+                src: src.localize(ic.block_id.func),
                 start: rel_start,
                 size,
             }),
@@ -303,7 +315,7 @@ impl ArrayProject {
         let Some(&field) = fields.get(index) else {
             return Claim::Pass;
         };
-        ed.replace(ctx, ic.insn_id, field);
+        ed.replace(ctx, ic.insn_id, field.qualify(tuple_id.func));
         Claim::Done
     }
 }
@@ -323,10 +335,7 @@ mod tests {
     /// `body(elem: i8) -> elem + 1`, marked pure. A unary map body.
     fn build_inc_body(tc: &mut TestContext) -> FunctionId {
         let fid = Function::make(&mut tc.ctx, "inc".into()).unwrap().id;
-        let entry = {
-            let __f = tc.ctx.anon_function();
-            tc.ctx.get_or_make_block(0x1000, __f)
-        };
+        let entry = tc.ctx.get_or_make_block(0x1000, fid);
         {
             let mut f = Function::from_id_mut(&mut tc.ctx, fid);
             f.set_root(entry).unwrap();
@@ -348,8 +357,8 @@ mod tests {
         tc.ctx.replace_instruction_mnemonic(
             rid,
             Mnemonic::Return(Return {
-                ptr,
-                value: Some(inc),
+                ptr: ptr.localize(rid.func),
+                value: Some(inc.localize(rid.func)),
             }),
         );
         Function::from_id_mut(&mut tc.ctx, fid).set_is_pure(true);
@@ -363,10 +372,7 @@ mod tests {
         let body = build_inc_body(&mut tc);
 
         let host = Function::make(&mut tc.ctx, "host".into()).unwrap().id;
-        let entry = {
-            let __f = tc.ctx.anon_function();
-            tc.ctx.get_or_make_block(0x5000, __f)
-        };
+        let entry = tc.ctx.get_or_make_block(0x5000, host);
         {
             let mut f = Function::from_id_mut(&mut tc.ctx, host);
             f.set_root(entry).unwrap();
@@ -404,7 +410,7 @@ mod tests {
             .map(|i| i.mnemonic().clone())
             .collect();
         let range_over_map = insns.iter().any(|m| {
-            matches!(m, Mnemonic::Range(r) if matches!(r.src, ValueId::Instruction(id)
+            matches!(m, Mnemonic::Range(r) if matches!(r.src.qualify(entry.func), ValueId::Instruction(id)
                 if matches!(BasicBlock::from_id(&tc.ctx, entry).iter().find(|i| i.id == id).map(|i| i.mnemonic().clone()), Some(Mnemonic::Map(_)))))
         });
         assert!(!range_over_map, "the Range-of-Map must be projected away");
@@ -414,7 +420,7 @@ mod tests {
         );
         let slices_src = insns
             .iter()
-            .any(|m| matches!(m, Mnemonic::Range(r) if r.src == src));
+            .any(|m| matches!(m, Mnemonic::Range(r) if r.src.qualify(entry.func) == src));
         assert!(slices_src, "a Range now slices the array source directly");
     }
 
@@ -428,11 +434,11 @@ mod tests {
             let Mnemonic::Store(Store { ptr, src, .. }) = i.mnemonic() else {
                 return None;
             };
-            if *ptr != reg {
+            if ptr.qualify(block.func) != reg {
                 return None;
             }
-            match src {
-                ValueId::Literal(lid) => Some(tc.ctx.shared.values.literals[*lid].value),
+            match src.qualify(block.func) {
+                ValueId::Literal(lid) => Some(tc.ctx.shared.values.literals[lid].value),
                 _ => None,
             }
         })
@@ -447,10 +453,7 @@ mod tests {
         let enum_id = IntrinsicId::from_name("enumerate").unwrap();
 
         let host = Function::make(&mut tc.ctx, "host".into()).unwrap().id;
-        let entry = {
-            let __f = tc.ctx.anon_function();
-            tc.ctx.get_or_make_block(0x6000, __f)
-        };
+        let entry = tc.ctx.get_or_make_block(0x6000, host);
         {
             let mut f = Function::from_id_mut(&mut tc.ctx, host);
             f.set_root(entry).unwrap();
@@ -507,7 +510,7 @@ mod tests {
         // The Range-of-enumerate is projected away.
         let range_over_enum = insns
             .iter()
-            .any(|m| matches!(m, Mnemonic::Range(r) if r.src == en));
+            .any(|m| matches!(m, Mnemonic::Range(r) if r.src.qualify(entry.func) == en));
         assert!(
             !range_over_enum,
             "the Range-of-enumerate must be projected away"
@@ -521,9 +524,9 @@ mod tests {
         );
 
         // `.elem` folded to a direct slice of the source array, `src[2]`.
-        let elem_slices_src = insns
-            .iter()
-            .any(|m| matches!(m, Mnemonic::Range(r) if r.src == src && r.start == 2));
+        let elem_slices_src = insns.iter().any(
+            |m| matches!(m, Mnemonic::Range(r) if r.src.qualify(entry.func) == src && r.start == 2),
+        );
         assert!(elem_slices_src, "the elem field must slice src[2] directly");
     }
 
@@ -534,10 +537,7 @@ mod tests {
         let concat_id = IntrinsicId::from_name("concat").unwrap();
 
         let host = Function::make(&mut tc.ctx, "host".into()).unwrap().id;
-        let entry = {
-            let __f = tc.ctx.anon_function();
-            tc.ctx.get_or_make_block(0x6800, __f)
-        };
+        let entry = tc.ctx.get_or_make_block(0x6800, host);
         {
             let mut f = Function::from_id_mut(&mut tc.ctx, host);
             f.set_root(entry).unwrap();
@@ -578,7 +578,7 @@ mod tests {
         assert!(
             insns
                 .iter()
-                .any(|m| matches!(m, Mnemonic::Range(r) if r.src == b_src && r.start == 1)),
+                .any(|m| matches!(m, Mnemonic::Range(r) if r.src.qualify(entry.func) == b_src && r.start == 1)),
             "concat lane 4 should project to rhs lane 1"
         );
     }
@@ -587,10 +587,7 @@ mod tests {
     /// index-aware map body: it takes the `enumerate` tuple and unpacks it.
     fn build_unpack_elem_body(tc: &mut TestContext, tuple_ty: TypeId) -> FunctionId {
         let fid = Function::make(&mut tc.ctx, "unpack".into()).unwrap().id;
-        let entry = {
-            let __f = tc.ctx.anon_function();
-            tc.ctx.get_or_make_block(0x2000, __f)
-        };
+        let entry = tc.ctx.get_or_make_block(0x2000, fid);
         {
             let mut f = Function::from_id_mut(&mut tc.ctx, fid);
             f.set_root(entry).unwrap();
@@ -618,8 +615,8 @@ mod tests {
         tc.ctx.replace_instruction_mnemonic(
             rid,
             Mnemonic::Return(Return {
-                ptr,
-                value: Some(elem),
+                ptr: ptr.localize(rid.func),
+                value: Some(elem.localize(rid.func)),
             }),
         );
         Function::from_id_mut(&mut tc.ctx, fid).set_is_pure(true);
@@ -635,10 +632,7 @@ mod tests {
         let enum_id = IntrinsicId::from_name("enumerate").unwrap();
 
         let host = Function::make(&mut tc.ctx, "host".into()).unwrap().id;
-        let entry = {
-            let __f = tc.ctx.anon_function();
-            tc.ctx.get_or_make_block(0x7000, __f)
-        };
+        let entry = tc.ctx.get_or_make_block(0x7000, host);
         {
             let mut f = Function::from_id_mut(&mut tc.ctx, host);
             f.set_root(entry).unwrap();
@@ -697,14 +691,14 @@ mod tests {
         // through to a direct `src[2]`.
         let range_over_derived = insns
             .iter()
-            .any(|m| matches!(m, Mnemonic::Range(r) if r.src == map_val || r.src == en));
+            .any(|m| matches!(m, Mnemonic::Range(r) if r.src.qualify(entry.func) == map_val || r.src.qualify(entry.func) == en));
         assert!(
             !range_over_derived,
             "map/enumerate slices must project away"
         );
-        let slices_src = insns
-            .iter()
-            .any(|m| matches!(m, Mnemonic::Range(r) if r.src == src && r.start == 2));
+        let slices_src = insns.iter().any(
+            |m| matches!(m, Mnemonic::Range(r) if r.src.qualify(entry.func) == src && r.start == 2),
+        );
         assert!(slices_src, "the lane must reduce to src[2]");
     }
 }

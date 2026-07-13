@@ -37,7 +37,7 @@ use rustc_hash::FxHashMap as HashMap;
 use qcode::{
     builder::Builder,
     value::{
-        FunctionId, FunctionKind, ValueId,
+        FunctionId, FunctionKind, LocalValueId, ValueId, VarnodeId,
         block::BlockId,
         block_param::BlockParam,
         insn::{Branch, InstructionId, Mnemonic},
@@ -47,6 +47,35 @@ use qcode::{
 
 use crate::pipeline::{ContextView, FunctionBody, Minted, Outcome};
 use crate::{FunctionPass, register_function_pass};
+
+/// Simultaneously replace operands across arenas without allowing a newly
+/// written local id to collide with a source local still awaiting replacement.
+pub(crate) fn substitute_operands(mnemonic: &mut Mnemonic, pairs: &[(LocalValueId, LocalValueId)]) {
+    let mut occupied: Vec<LocalValueId> = mnemonic
+        .args()
+        .into_iter()
+        .chain(pairs.iter().map(|&(_, new)| new))
+        .collect();
+    let mut sentinels = Vec::with_capacity(pairs.len());
+    let mut next = 0usize;
+    for _ in pairs {
+        let sentinel = loop {
+            let candidate = LocalValueId::Varnode(VarnodeId::from(next));
+            next += 1;
+            if !occupied.contains(&candidate) {
+                occupied.push(candidate);
+                break candidate;
+            }
+        };
+        sentinels.push(sentinel);
+    }
+    for (&(old, _), &sentinel) in pairs.iter().zip(&sentinels) {
+        mnemonic.replace_value(old, sentinel);
+    }
+    for (&(_, new), &sentinel) in pairs.iter().zip(&sentinels) {
+        mnemonic.replace_value(sentinel, new);
+    }
+}
 
 #[derive(Default)]
 pub struct LoopToRecursion;
@@ -116,9 +145,12 @@ pub(crate) fn recognize_loop<'a, 'str: 'a>(
     // The entry must unconditionally branch into the header, carrying `init`.
     let (head, init_args) = match terminator_mnemonic(host, root)? {
         // The entry's branch target is a body-local index in `root`'s arena.
-        Mnemonic::Branch(Branch { target, args }) => {
-            (BlockId::new(root.func, *target), args.clone())
-        }
+        Mnemonic::Branch(Branch { target, args }) => (
+            BlockId::new(root.func, *target),
+            args.iter()
+                .map(|a| a.qualify(root.func))
+                .collect::<Vec<_>>(),
+        ),
         _ => return None,
     };
     if head == root {
@@ -156,7 +188,7 @@ pub(crate) fn recognize_loop<'a, 'str: 'a>(
                 if args.len() != arity {
                     return None;
                 }
-                back_edges.push((pred, args.clone()));
+                back_edges.push((pred, args.iter().map(|a| a.qualify(pred.func)).collect()));
             }
             _ => return None,
         }
@@ -267,14 +299,20 @@ fn transform<'str>(
         // and defs), and add CFG edges for the cloned (non-latch) terminators.
         for &new_id in &cloned {
             let mut mn = minted.insn_ref(new_id).mnemonic().clone();
-            let mut touched = false;
-            for a in mn.args() {
-                if let Some(&n) = value_map.get(&a) {
-                    mn.replace_value(a, n);
-                    touched = true;
-                }
-            }
-            if touched {
+            let pairs: Vec<_> = mn
+                .args()
+                .into_iter()
+                .filter_map(|a| {
+                    // The clone still holds the source body's bare-local operands, so
+                    // qualify with the host function for the map lookup and store the
+                    // replacement local to the minted lambda's arena.
+                    value_map
+                        .get(&a.qualify(host_fid))
+                        .map(|&n| (a, n.localize(new_id.func)))
+                })
+                .collect();
+            if !pairs.is_empty() {
+                substitute_operands(&mut mn, &pairs);
                 // Keeps the minted function's reverse-use map in sync.
                 minted.replace_instruction_mnemonic(new_id, mn);
             }
@@ -424,7 +462,7 @@ mod tests {
     fn run(ctx: &Context, fun: FunctionId, n: u64) -> Option<u64> {
         let root = Function::from_id(ctx, fun).root().expect("root").id;
         let ret = match terminator_mnemonic(ctx.into(), root)? {
-            Mnemonic::ReturnValue(r) => r.value,
+            Mnemonic::ReturnValue(r) => r.value.qualify(root.func),
             _ => return None,
         };
         let mut emu = StandaloneEmulator::new(root);

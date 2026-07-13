@@ -299,7 +299,7 @@ fn apply<'str>(
             let slice = body.push_mnemonic_with_type(
                 mv,
                 Mnemonic::Range(qcode::value::insn::Range {
-                    src: l0_exit,
+                    src: l0_exit.localize(fid),
                     start: esz,
                     size: n1 * esz,
                 }),
@@ -314,7 +314,7 @@ fn apply<'str>(
                 mv,
                 Mnemonic::Intrinsic(IntrinsicApp {
                     id: iota_id,
-                    args: vec![n1_const],
+                    args: vec![n1_const.localize(fid)],
                 }),
                 src_arr_ty,
             );
@@ -334,8 +334,8 @@ fn apply<'str>(
             mv,
             Mnemonic::Scan(qcode::value::insn::Scan {
                 body: body_fn,
-                init: m.seed_val,
-                src,
+                init: m.seed_val.localize(fid),
+                src: src.localize(fid),
                 captures: Vec::new(),
             }),
             ty,
@@ -356,7 +356,7 @@ fn apply<'str>(
     // array, leaving the loop's own array dead for `dce`.
     for id in preexisting {
         let mut mn = body.insn_ref(mv, id).mnemonic().clone();
-        mn.replace_value(m.arr_exit, full);
+        mn.replace_value(m.arr_exit.localize(fid), full.localize(fid));
         body.replace_instruction_mnemonic(mv, id, mn);
     }
 

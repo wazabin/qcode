@@ -51,8 +51,8 @@ pub fn canonicalize_sp_slots_concrete<'a, 'str>(
     for block in body.function_ref(cx, fid).blocks() {
         for insn in block.iter() {
             let ptr = match insn.mnemonic() {
-                Mnemonic::Load(load) => load.ptr,
-                Mnemonic::Store(store) => store.ptr,
+                Mnemonic::Load(load) => load.ptr.qualify(insn.id.func),
+                Mnemonic::Store(store) => store.ptr.qualify(insn.id.func),
                 _ => continue,
             };
             if let Some((base, off)) = numbering.base_offset(ptr)
@@ -142,8 +142,8 @@ pub fn canonicalize_sp_slots<'str>(
     for block in host.function_ref(fid).blocks() {
         for insn in block.iter() {
             let ptr = match insn.mnemonic() {
-                Mnemonic::Load(load) => load.ptr,
-                Mnemonic::Store(store) => store.ptr,
+                Mnemonic::Load(load) => load.ptr.qualify(insn.id.func),
+                Mnemonic::Store(store) => store.ptr.qualify(insn.id.func),
                 _ => continue,
             };
             if let Some((base, off)) = numbering.base_offset(ptr)
@@ -259,14 +259,8 @@ mod tests {
         let sp_reg = tc.r0;
         let ram = tc.ctx.shared.default_space;
         let fid = Function::make(&mut tc.ctx, "f".into()).unwrap().id;
-        let root = {
-            let __f = tc.ctx.anon_function();
-            tc.ctx.get_or_make_block(0x1000, __f)
-        };
-        let other = {
-            let __f = tc.ctx.anon_function();
-            tc.ctx.get_or_make_block(0x2000, __f)
-        };
+        let root = tc.ctx.get_or_make_block(0x1000, fid);
+        let other = tc.ctx.get_or_make_block(0x2000, fid);
         {
             let mut f = Function::from_id_mut(&mut tc.ctx, fid);
             f.set_root(root).unwrap();

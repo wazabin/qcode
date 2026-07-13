@@ -316,13 +316,14 @@ fn frame_is_captured(host: HostRef, fid: FunctionId, numbering: &Numbering, sp: 
     };
     for block in host.function_ref(fid).blocks() {
         for insn in block.iter() {
+            let func = insn.id.func;
             match insn.mnemonic() {
-                Mnemonic::Store(s) if is_own_frame(s.src) => {
+                Mnemonic::Store(s) if is_own_frame(s.src.qualify(func)) => {
                     return true;
                 }
                 Mnemonic::Call(c) => {
                     for (j, &arg) in c.args.iter().enumerate() {
-                        if is_own_frame(arg)
+                        if is_own_frame(arg.qualify(func))
                             && !host
                                 .function_ref(c.target)
                                 .param_attr(j)
@@ -331,15 +332,17 @@ fn frame_is_captured(host: HostRef, fid: FunctionId, numbering: &Numbering, sp: 
                             return true;
                         }
                     }
-                    if c.clobbers.iter().any(|&cl| is_own_frame(cl)) {
+                    if c.clobbers.iter().any(|&cl| is_own_frame(cl.qualify(func))) {
                         return true;
                     }
                 }
-                Mnemonic::CallInd(c) if c.args.iter().any(|&arg| is_own_frame(arg)) => {
+                Mnemonic::CallInd(c)
+                    if c.args.iter().any(|&arg| is_own_frame(arg.qualify(func))) =>
+                {
                     return true;
                 }
                 Mnemonic::PCodeOp(_) | Mnemonic::Map(_) | Mnemonic::Scan(_)
-                    if insn.mnemonic().args().iter().any(|&arg| is_own_frame(arg)) =>
+                    if insn.operands().iter().any(|&arg| is_own_frame(arg)) =>
                 {
                     return true;
                 }
@@ -403,12 +406,12 @@ impl FrameInfo {
             }
             ValueId::Instruction(id) => match host.insn_ref(id).mnemonic() {
                 Mnemonic::Load(_) => P::LOADED,
-                Mnemonic::Call(c) => self.classify_call_result(host, c),
-                Mnemonic::Zext(z) => self.provenance(host, z.src),
-                Mnemonic::Sext(s) => self.provenance(host, s.src),
-                Mnemonic::Range(r) => self.provenance(host, r.src),
+                Mnemonic::Call(c) => self.classify_call_result(host, id.func, c),
+                Mnemonic::Zext(z) => self.provenance(host, z.src.qualify(id.func)),
+                Mnemonic::Sext(s) => self.provenance(host, s.src.qualify(id.func)),
+                Mnemonic::Range(r) => self.provenance(host, r.src.qualify(id.func)),
                 Mnemonic::Binop(b) if matches!(b.op, Binop::Int(IntBinop::Add | IntBinop::Sub)) => {
-                    self.peel_addsub(host, b.lhs, b.rhs)
+                    self.peel_addsub(host, b.lhs.qualify(id.func), b.rhs.qualify(id.func))
                 }
                 // Affine `base + const` over a global base — the old
                 // `is_global_static` fallback for a global reached via a non-add op.
@@ -440,7 +443,12 @@ impl FrameInfo {
     /// a `nocapture` param, then handed back), the union carries `OWN_FRAME`, so
     /// the result is *not* a subset of rule A's `INPUT|LOADED|GLOBAL_STATIC` mask
     /// and stays correctly non-disjoint from the frame.
-    fn classify_call_result(&self, host: HostRef, c: &qcode::value::insn::Call) -> Provenance {
+    fn classify_call_result(
+        &self,
+        host: HostRef,
+        func: FunctionId,
+        c: &qcode::value::insn::Call,
+    ) -> Provenance {
         use Provenance as P;
         let callee = host.function_ref(c.target);
         let all_nocapture = c.clobbers.is_empty()
@@ -450,7 +458,7 @@ impl FrameInfo {
         }
         let mut acc = P::LOADED.union(P::GLOBAL_STATIC);
         for &arg in &c.args {
-            acc = acc.union(self.provenance(host, arg));
+            acc = acc.union(self.provenance(host, arg.qualify(func)));
         }
         acc
     }
@@ -1386,12 +1394,12 @@ mod tests {
                         Mnemonic::CallInd(c) => c.ptr,
                         _ => unreachable!(),
                     },
-                    args: vec![local],
+                    args: vec![local.localize(cid.func)],
                 })
             } else {
                 Mnemonic::Call(Call {
                     target: callee,
-                    args: vec![local],
+                    args: vec![local.localize(cid.func)],
                     clobbers: vec![],
                 })
             };
@@ -1455,7 +1463,7 @@ mod tests {
                 call_result,
                 Mnemonic::Call(Call {
                     target: callee,
-                    args: vec![input], // g(input): INPUT arg, does not capture the frame
+                    args: vec![input.localize(call_result.func)], // g(input): INPUT arg, does not capture the frame
                     clobbers: vec![],
                 }),
             );

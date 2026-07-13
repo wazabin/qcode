@@ -1,6 +1,6 @@
 use std::fmt::{Display, Formatter};
 
-use crate::value::ValueId;
+use crate::value::LocalValueId;
 
 use super::mnemonic::{Args, MnemonicKind};
 use smallvec::smallvec;
@@ -8,8 +8,8 @@ use smallvec::smallvec;
 #[derive(Debug, Clone, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub struct Binary {
     pub op: Binop,
-    pub lhs: ValueId,
-    pub rhs: ValueId,
+    pub lhs: LocalValueId,
+    pub rhs: LocalValueId,
 }
 
 impl MnemonicKind for Binary {

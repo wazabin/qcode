@@ -1,7 +1,7 @@
 //! Flag-idiom sub-pass: collapse x86 signed-compare flag chains.
 
 use qcode::value::{
-    ValueId,
+    FunctionId, ValueId,
     insn::{Binary, Binop, IntBinop, Mnemonic},
     util::base_ref::HostRef,
 };
@@ -41,7 +41,7 @@ impl<'str> SubPassC<'str> for FlagIdiom {
         if ic.mnemonic.is_terminator() || ic.size == 0 {
             return Claim::Pass;
         }
-        match simplify_flag_idiom(body.read_host(cx), ic.mnemonic) {
+        match simplify_flag_idiom(body.read_host(cx), ic.insn_id.func, ic.mnemonic) {
             Some(new_mnemonic) => {
                 ed.replace_with_new_insn_c(
                     body,
@@ -68,7 +68,7 @@ fn as_int_binop(host: HostRef, v: ValueId, want: IntBinop) -> Option<(ValueId, V
             lhs,
             rhs,
             op: Binop::Int(op),
-        }) if *op == want => Some((*lhs, *rhs)),
+        }) if *op == want => Some((lhs.qualify(id.func), rhs.qualify(id.func))),
         _ => None,
     }
 }
@@ -79,7 +79,7 @@ fn as_sborrow(host: HostRef, v: ValueId) -> Option<(ValueId, ValueId)> {
         return None;
     };
     match host.insn_ref(id).mnemonic() {
-        Mnemonic::SBorrow(sb) => Some((sb.lhs, sb.rhs)),
+        Mnemonic::SBorrow(sb) => Some((sb.lhs.qualify(id.func), sb.rhs.qualify(id.func))),
         _ => None,
     }
 }
@@ -95,7 +95,11 @@ fn as_sborrow(host: HostRef, v: ValueId) -> Option<(ValueId, ValueId)> {
 /// ```
 /// Returns the rewritten `SLess(a, b)` mnemonic. The original `sborrow`/`sub`/
 /// `slt` instructions are left for DCE to remove once their last use is gone.
-pub(super) fn simplify_flag_idiom(host: HostRef, m: &Mnemonic) -> Option<Mnemonic> {
+pub(super) fn simplify_flag_idiom(
+    host: HostRef,
+    func: FunctionId,
+    m: &Mnemonic,
+) -> Option<Mnemonic> {
     let &Mnemonic::Binop(Binary {
         lhs,
         rhs,
@@ -104,6 +108,7 @@ pub(super) fn simplify_flag_idiom(host: HostRef, m: &Mnemonic) -> Option<Mnemoni
     else {
         return None;
     };
+    let (lhs, rhs) = (lhs.qualify(func), rhs.qualify(func));
 
     // The `!=` is commutative (and GVN may have normalized it), so try both
     // assignments of which side is the sborrow and which is the `s< 0`.
@@ -119,8 +124,8 @@ pub(super) fn simplify_flag_idiom(host: HostRef, m: &Mnemonic) -> Option<Mnemoni
 
     let (a, b) = resolve(lhs, rhs).or_else(|| resolve(rhs, lhs))?;
     Some(Mnemonic::Binop(Binary {
-        lhs: a,
-        rhs: b,
+        lhs: a.localize(func),
+        rhs: b.localize(func),
         op: Binop::Int(IntBinop::SLess),
     }))
 }

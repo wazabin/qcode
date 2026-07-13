@@ -797,21 +797,27 @@ impl<'str> Context<'str> {
             let insns = self.block(new).instructions.clone();
             for insn_id in insns {
                 let mut mnemonic = self.instruction(insn_id).mnemonic().clone();
+                let mut pairs = Vec::new();
                 for arg in mnemonic.args() {
-                    if let Some(&new_val) = value_map.get(&arg) {
-                        mnemonic.replace_value(arg, new_val);
+                    // The clone still holds its *source* arena's bare-local operands,
+                    // so qualify with `old.func` to look them up and re-localize the
+                    // mapped replacement against the clone's own arena (`new.func`).
+                    let qualified = arg.qualify(old.func);
+                    if let Some(&new_val) = value_map.get(&qualified) {
+                        pairs.push((arg, new_val.localize(new.func)));
                     } else {
                         // An operand not in the map must resolve to `target` itself
                         // (an unmoved own block) or to a shared value — never into a
                         // third function. A cross-function data dependence would mean
                         // the split left the set non-closed (a bug upstream).
                         debug_assert!(
-                            arg.owning_function().is_none_or(|f| f == target),
+                            qualified.owning_function().is_none_or(|f| f == target),
                             "rehome: relocated block references a value in another \
-                             function ({arg:?}); the relocated set is not closed",
+                             function ({qualified:?}); the relocated set is not closed",
                         );
                     }
                 }
+                crate::value::block::substitute_operands(&mut mnemonic, &pairs);
                 remap_block_targets(&mut mnemonic, old.func, new.func, &block_map);
                 *self.instruction_mut(insn_id).mnemonic_mut() = mnemonic;
             }
@@ -1146,7 +1152,7 @@ impl<'str> Context<'str> {
             let args = self.bodies[func].insns[id.local].mnemonic().args();
             let users = &mut self.bodies[func].users;
             for arg in args {
-                users.entry(arg.strip_func()).or_default().push(id);
+                users.entry(arg).or_default().push(id);
             }
         }
     }
@@ -1341,11 +1347,7 @@ impl<'str> Context<'str> {
         let local = self.bodies[func].insns.push(insn);
         let id = InstructionId::new(func, local);
         for arg in args {
-            self.bodies[func]
-                .users
-                .entry(arg.strip_func())
-                .or_default()
-                .push(id);
+            self.bodies[func].users.entry(arg).or_default().push(id);
         }
         if let Some(target) = call_target {
             self.shared
@@ -1413,7 +1415,8 @@ impl<'str> Context<'str> {
     /// instruction in `dead`, each of its operands has all members of `dead`
     /// pruned from their user lists. Call after removing them from their blocks.
     pub fn remove_instructions(&mut self, dead: &HashSet<InstructionId>) {
-        let mut affected_args: HashSet<(FunctionId, ValueId)> = HashSet::default();
+        let mut affected_args: HashSet<(FunctionId, crate::value::LocalValueId)> =
+            HashSet::default();
         let mut affected_targets: HashSet<FunctionId> = HashSet::default();
         for &id in dead {
             let mnemonic = self.bodies[id.func].insns[id.local].mnemonic();
@@ -1427,7 +1430,7 @@ impl<'str> Context<'str> {
             self.bodies[id.func].insns[id.local].deleted = true;
         }
         for (func, arg) in affected_args {
-            if let Some(users) = self.bodies[func].users.get_mut(&arg.strip_func()) {
+            if let Some(users) = self.bodies[func].users.get_mut(&arg) {
                 users.retain(|u| !dead.contains(u));
             }
         }
@@ -1649,17 +1652,19 @@ impl<'str> Context<'str> {
             );
             return;
         };
+        let old = old.localize(func);
+        let new = new.localize(func);
         for user_id in users {
             Instruction::from_id_mut(self, user_id)
                 .mnemonic_mut()
                 .replace_value(old, new);
             self.bodies[func]
                 .users
-                .entry(new.strip_func())
+                .entry(new)
                 .or_default()
                 .push(user_id);
         }
-        self.bodies[func].users.remove(&old.strip_func());
+        self.bodies[func].users.remove(&old);
     }
 
     /// Replaces one instruction's mnemonic and keeps the reverse use map in sync.
@@ -1672,12 +1677,12 @@ impl<'str> Context<'str> {
         let old_args = self.instruction(id).mnemonic().args();
         for arg in old_args {
             let mut remove_arg = false;
-            if let Some(users) = self.bodies[func].users.get_mut(&arg.strip_func()) {
+            if let Some(users) = self.bodies[func].users.get_mut(&arg) {
                 users.retain(|&user| user != id);
                 remove_arg = users.is_empty();
             }
             if remove_arg {
-                self.bodies[func].users.remove(&arg.strip_func());
+                self.bodies[func].users.remove(&arg);
             }
         }
 
@@ -1692,11 +1697,7 @@ impl<'str> Context<'str> {
         *Instruction::from_id_mut(self, id).mnemonic_mut() = mnemonic;
 
         for arg in self.instruction(id).mnemonic().args() {
-            self.bodies[func]
-                .users
-                .entry(arg.strip_func())
-                .or_default()
-                .push(id);
+            self.bodies[func].users.entry(arg).or_default().push(id);
         }
         if let Some(target) = self.instruction(id).mnemonic().call_target() {
             self.shared
@@ -1926,7 +1927,7 @@ impl<'str> Context<'str> {
                 branch_args.len()
             );
             for (param, arg) in other_params.into_iter().zip(branch_args) {
-                self.replace_all_uses_with(ValueId::BlockParam(param), arg);
+                self.replace_all_uses_with(ValueId::BlockParam(param), arg.qualify(keep.func));
             }
         }
         self.block_mut(keep).instructions.pop();
@@ -2681,7 +2682,7 @@ mod tests {
         );
         let call_id = BasicBlock::from_id(&ctx, block).instruction_ids()[0];
         let ptr = match ctx.get_insn(call_id).mnemonic() {
-            Mnemonic::CallInd(call) => call.ptr,
+            Mnemonic::CallInd(call) => call.ptr.qualify(call_id.func),
             other => panic!("expected CallInd, got {other:?}"),
         };
         // `ptr` is a shared varnode, so query its uses across functions.
@@ -2770,7 +2771,7 @@ mod tests {
             load_id,
             Mnemonic::Load(Load {
                 space: ctx.shared.default_space,
-                ptr: new_ptr,
+                ptr: new_ptr.localize(load_id.func),
                 size: 8,
             }),
         );
@@ -2800,8 +2801,8 @@ mod tests {
             load_id,
             Mnemonic::Binop(Binary {
                 op: Binop::Int(IntBinop::Add),
-                lhs: new_arg,
-                rhs: new_arg,
+                lhs: new_arg.localize(load_id.func),
+                rhs: new_arg.localize(load_id.func),
             }),
         );
 

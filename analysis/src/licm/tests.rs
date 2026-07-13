@@ -434,7 +434,7 @@ fn rewires_uses_to_hoisted_copy() {
     let Mnemonic::Store(store) = ctx.get_insn(store_id).mnemonic() else {
         unreachable!()
     };
-    let src = store.src;
+    let src = store.src.qualify(store_id.func);
     let qcode::value::ValueId::Instruction(src_id) = src else {
         panic!("store source should be the hoisted add")
     };

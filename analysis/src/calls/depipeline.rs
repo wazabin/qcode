@@ -91,10 +91,11 @@ fn affine_step(ctx: &Context, v: ValueId, iv: ValueId) -> Option<u64> {
     if !matches!(b.op, Binop::Int(IntBinop::Add)) {
         return None;
     }
-    let s = if b.lhs == iv {
-        literal(ctx, b.rhs)?
-    } else if b.rhs == iv {
-        literal(ctx, b.lhs)?
+    let (lhs, rhs) = (b.lhs.qualify(id.func), b.rhs.qualify(id.func));
+    let s = if lhs == iv {
+        literal(ctx, rhs)?
+    } else if rhs == iv {
+        literal(ctx, lhs)?
     } else {
         return None;
     };
@@ -108,12 +109,12 @@ fn incoming_from(ctx: &Context, pred: BlockId, header: BlockId, k: usize) -> Opt
     // (`pred.func`); qualify to compare against the full `header` id.
     let q = |t| BlockId::new(pred.func, t);
     match ctx.get_insn(term).mnemonic() {
-        Mnemonic::Branch(b) if q(b.target) == header => b.args.get(k).copied(),
+        Mnemonic::Branch(b) if q(b.target) == header => b.args.get(k).map(|a| a.qualify(pred.func)),
         Mnemonic::CBranch(c) => {
             if q(c.success_block) == header {
-                c.success_args.get(k).copied()
+                c.success_args.get(k).map(|a| a.qualify(pred.func))
             } else if q(c.failure_block) == header {
-                c.failure_args.get(k).copied()
+                c.failure_args.get(k).map(|a| a.qualify(pred.func))
             } else {
                 None
             }
@@ -171,6 +172,7 @@ fn find_pipelined(
             let Mnemonic::Load(Load { space, ptr, size }) = *ctx.get_insn(bv_id).mnemonic() else {
                 continue;
             };
+            let ptr = ptr.qualify(bv_id.func);
             // The load address must be a header param (the IV) stepping affinely.
             let ValueId::BlockParam(iv_pid) = ptr else {
                 continue;
@@ -217,7 +219,9 @@ fn find_pipelined(
                 else {
                     return false;
                 };
-                cs == space && csz == size && affine_step(ctx, iv_in, a) == Some(step)
+                cs == space
+                    && csz == size
+                    && affine_step(ctx, iv_in, a.qualify(carry_in.func)) == Some(step)
             });
             if !consistent {
                 continue;
@@ -252,8 +256,8 @@ fn apply(ctx: &mut Context, fid: FunctionId, p: &Pipelined) {
         p.header.func,
         Mnemonic::Binop(Binary {
             op: Binop::Int(IntBinop::Sub),
-            lhs: p.iv,
-            rhs: step_lit,
+            lhs: p.iv.localize(p.header.func),
+            rhs: step_lit.localize(p.header.func),
         }),
         iv_ty,
     )
@@ -267,7 +271,7 @@ fn apply(ctx: &mut Context, fid: FunctionId, p: &Pipelined) {
         p.header.func,
         Mnemonic::Load(Load {
             space: p.space,
-            ptr: ValueId::Instruction(sub),
+            ptr: ValueId::Instruction(sub).localize(p.header.func),
             size: p.size,
         }),
         load_ty,

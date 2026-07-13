@@ -221,7 +221,7 @@ pub(crate) fn scan_register_effects(
         for insn in block.iter() {
             match insn.mnemonic() {
                 Mnemonic::Load(l) => {
-                    if let ValueId::Varnode(vn) = l.ptr
+                    if let qcode::value::LocalValueId::Varnode(vn) = l.ptr
                         && is_register(ctx, vn)
                         && !loaded.contains(&vn)
                     {
@@ -229,7 +229,7 @@ pub(crate) fn scan_register_effects(
                     }
                 }
                 Mnemonic::Store(s) => {
-                    if let ValueId::Varnode(vn) = s.ptr
+                    if let qcode::value::LocalValueId::Varnode(vn) = s.ptr
                         && is_register(ctx, vn)
                         && !stored.contains(&vn)
                     {

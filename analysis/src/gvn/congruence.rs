@@ -143,7 +143,7 @@ impl Congruence {
                 // Blank the operands so the key carries only kind + immediates.
                 let mut key = mnemonic.clone();
                 for a in args.iter().copied().collect::<HashSet<_>>() {
-                    key.replace_value(a, operand_sentinel());
+                    key.replace_value(a.strip_func(), operand_sentinel().strip_func());
                 }
                 return self.intern(Sym::Op(key, size, arg_syms));
             }

@@ -143,11 +143,11 @@ fn return_tuple_fields(ctx: &Context, ret_id: InstructionId) -> Option<Vec<Value
     let Mnemonic::Return(r) = ctx.get_insn(ret_id).mnemonic() else {
         return None;
     };
-    let ValueId::Instruction(tuple_id) = r.value? else {
+    let ValueId::Instruction(tuple_id) = r.value?.qualify(ret_id.func) else {
         return None;
     };
     match ctx.get_insn(tuple_id).mnemonic() {
-        Mnemonic::Tuple(t) => Some(t.fields.clone()),
+        Mnemonic::Tuple(t) => Some(t.fields.iter().map(|f| f.qualify(tuple_id.func)).collect()),
         _ => None,
     }
 }
@@ -180,7 +180,7 @@ fn collect_expr(
                 return false;
             }
             for op in m.args() {
-                if !collect_expr(ctx, op, inputs, visited, order) {
+                if !collect_expr(ctx, op.qualify(iid.func), inputs, visited, order) {
                     return false;
                 }
             }
@@ -280,7 +280,7 @@ fn try_partial_inline(ctx: &mut Context, fid: FunctionId) -> bool {
         let Mnemonic::Call(c) = ctx.get_insn(call_id).mnemonic().clone() else {
             continue;
         };
-        let args = c.args;
+        let args: Vec<ValueId> = c.args.iter().map(|a| a.qualify(call_id.func)).collect();
         let result = ValueId::Instruction(call_id);
 
         for inl in &inlinable {
@@ -291,7 +291,7 @@ fn try_partial_inline(ctx: &mut Context, fid: FunctionId) -> bool {
                 .copied()
                 .filter(|&u| {
                     matches!(ctx.get_insn(u).mnemonic(),
-                        Mnemonic::Extract(Extract { agg, index }) if *agg == result && *index == inl.index)
+                        Mnemonic::Extract(Extract { agg, index }) if agg.qualify(u.func) == result && *index == inl.index)
                 })
                 .collect();
 
@@ -338,12 +338,18 @@ fn clone_expr(
     let mut map: HashMap<InstructionId, ValueId> = HashMap::default();
     for &iid in order {
         let mut m = ctx.get_insn(iid).mnemonic().clone();
-        for op in ctx.get_insn(iid).operands() {
-            let new = resolve(op, &map);
-            if new != op {
-                m.replace_value(op, new);
-            }
-        }
+        // Cross-arena clone remap (callee expression → caller block): substitute
+        // all operands simultaneously (see `outline::substitute_operands`).
+        let pairs: Vec<_> = ctx
+            .get_insn(iid)
+            .operands()
+            .iter()
+            .filter_map(|&op| {
+                let new = resolve(op, &map);
+                (new != op).then(|| (op.strip_func(), new.localize(block.func)))
+            })
+            .collect();
+        crate::calls::outline::substitute_operands(&mut m, &pairs);
         let ty = ctx
             .stored_type_of(ValueId::Instruction(iid))
             .unwrap_or_else(|| ctx.type_of(ValueId::Instruction(iid)));
@@ -397,7 +403,10 @@ mod tests {
             call_id,
             Mnemonic::Call(Call {
                 target,
-                args,
+                args: args
+                    .into_iter()
+                    .map(|arg| arg.localize(call_id.func))
+                    .collect(),
                 clobbers: vec![],
             }),
         );
@@ -434,7 +443,7 @@ mod tests {
                 ret_id,
                 Mnemonic::Return(qcode::value::insn::Return {
                     ptr: r.ptr,
-                    value: Some(ValueId::Instruction(tuple_id)),
+                    value: Some(ValueId::Instruction(tuple_id).localize(ret_id.func)),
                 }),
             );
             agg = Some(tc.ctx.type_of(ValueId::Instruction(tuple_id)));
@@ -466,7 +475,7 @@ mod tests {
         block: BlockId,
         call_id: InstructionId,
     ) -> usize {
-        let result = ValueId::Instruction(call_id);
+        let result = ValueId::Instruction(call_id).localize(block.func);
         BasicBlock::from_id(&tc.ctx, block)
             .iter()
             .filter(|i| matches!(i.mnemonic(), Mnemonic::Extract(e) if e.agg == result))
@@ -610,7 +619,8 @@ mod tests {
             .expect("the caller holds the projected map");
         assert_eq!(projected.body, body, "same outlined body symbol");
         assert_eq!(
-            projected.src, arg,
+            projected.src.qualify(g_cont.func),
+            arg,
             "the map source is substituted by the call argument"
         );
     }

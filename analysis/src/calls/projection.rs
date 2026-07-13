@@ -171,6 +171,7 @@ pub fn project_return(ctx: &Context, fid: FunctionId, field: usize) -> Option<Pr
             let Some(Mnemonic::CBranch(CBranch { condition, .. })) = terminator_of(ctx, bid) else {
                 continue;
             };
+            let condition = condition.qualify(bid.func);
             if seeded_conditions.contains(&condition) {
                 continue;
             }
@@ -198,7 +199,7 @@ pub fn return_field(ctx: &Context, bid: BlockId, field: usize) -> Option<ValueId
 /// The `value` of a block's `return`, if it ends in one carrying a value.
 fn return_value_of(ctx: &Context, bid: BlockId) -> Option<ValueId> {
     match terminator_of(ctx, bid)? {
-        Mnemonic::Return(Return { value, .. }) => value,
+        Mnemonic::Return(Return { value, .. }) => value.map(|v| v.qualify(bid.func)),
         _ => None,
     }
 }
@@ -209,7 +210,7 @@ fn aggregate_field(ctx: &Context, value: ValueId, field: usize) -> Option<ValueI
     if let ValueId::Instruction(id) = value
         && let Mnemonic::Tuple(Tuple { fields }) = ctx.get_insn(id).mnemonic()
     {
-        return fields.get(field).copied();
+        return fields.get(field).map(|f| f.qualify(id.func));
     }
     (field == 0).then_some(value)
 }
@@ -237,7 +238,7 @@ fn predecessor_args(ctx: &Context, bid: BlockId, param_index: usize) -> Vec<Opti
             Some(Mnemonic::Branch(Branch { target, args }))
                 if BlockId::new(pred.func, target) == bid =>
             {
-                args.get(param_index).copied()
+                args.get(param_index).map(|a| a.qualify(pred.func))
             }
             Some(Mnemonic::CBranch(CBranch {
                 success_block,
@@ -247,9 +248,9 @@ fn predecessor_args(ctx: &Context, bid: BlockId, param_index: usize) -> Vec<Opti
                 ..
             })) => {
                 if BlockId::new(pred.func, success_block) == bid {
-                    success_args.get(param_index).copied()
+                    success_args.get(param_index).map(|a| a.qualify(pred.func))
                 } else if BlockId::new(pred.func, failure_block) == bid {
-                    failure_args.get(param_index).copied()
+                    failure_args.get(param_index).map(|a| a.qualify(pred.func))
                 } else {
                     None
                 }
@@ -295,8 +296,8 @@ mod tests {
         ctx.replace_instruction_mnemonic(
             iid,
             Mnemonic::Return(Return {
-                ptr,
-                value: Some(value),
+                ptr: ptr.localize(iid.func),
+                value: Some(value.localize(iid.func)),
             }),
         );
     }

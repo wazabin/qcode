@@ -13,7 +13,7 @@ use crate::{
     context::{Context, Shared},
     space::Space,
     value::{
-        BasicBlock, BlockParam, Function, LocalBlockId, ValueId,
+        BasicBlock, BlockParam, Function, LocalBlockId, LocalValueId, ValueId,
         block::BlockId,
         bytes::BytesRef,
         function::FunctionId,
@@ -193,7 +193,7 @@ impl<'a, 'str> Seg<'a, 'str> {
     /// `fmt_branch_target`. The `target` is a bare body-local index; `func` is the
     /// terminator's owning function (strict IR locality ⇒ the target lives in that
     /// same arena), used to recover the full [`BlockId`].
-    fn branch_target(&mut self, func: FunctionId, target: LocalBlockId, args: &[ValueId]) {
+    fn branch_target(&mut self, func: FunctionId, target: LocalBlockId, args: &[LocalValueId]) {
         let target = BlockId::new(func, target);
         let block = BasicBlock::from_id(self.ctx, target);
         let name = block.name().unwrap_or("unnamed");
@@ -211,7 +211,7 @@ impl<'a, 'str> Seg<'a, 'str> {
                 None => self.push(format!("@arg{i}"), TokenKind::BlockParam, None),
             }
             self.op("=");
-            self.value(arg);
+            self.value(arg.qualify(func));
         }
 
         self.push(">", TokenKind::Label, None);
@@ -257,14 +257,19 @@ pub fn instruction_segments(insn: &InstructionRef<'_, '_>) -> Vec<Token> {
     }
 
     match insn.mnemonic() {
-        Mnemonic::Tuple(t) => tuple_with_type(&mut seg, t, insn.type_id()),
+        Mnemonic::Tuple(t) => tuple_with_type(&mut seg, insn.id.func, t, insn.type_id()),
         m => mnemonic_segments(&mut seg, insn.id.func, m),
     }
 
     seg.out
 }
 
-fn tuple_with_type(seg: &mut Seg, t: &crate::value::insn::Tuple, type_id: crate::types::TypeId) {
+fn tuple_with_type(
+    seg: &mut Seg,
+    func: FunctionId,
+    t: &crate::value::insn::Tuple,
+    type_id: crate::types::TypeId,
+) {
     seg.kw("pack");
     seg.punct("(");
     for (i, &field) in t.fields.iter().enumerate() {
@@ -280,7 +285,7 @@ fn tuple_with_type(seg: &mut Seg, t: &crate::value::insn::Tuple, type_id: crate:
             .unwrap_or_else(|| format!("field{}", i + 1));
         seg.push(name, TokenKind::Field, None);
         seg.op("=");
-        seg.value(field);
+        seg.value(field.qualify(func));
     }
     seg.punct(");");
 }
@@ -295,7 +300,7 @@ fn mnemonic_segments(seg: &mut Seg, func: FunctionId, m: &Mnemonic) {
             seg.punct(":");
             seg.push(l.size.to_string(), TokenKind::Type, None);
             seg.punct(", ");
-            seg.value(l.ptr);
+            seg.value(l.ptr.qualify(func));
             seg.punct(");");
         }
         Mnemonic::Store(s) => {
@@ -305,9 +310,9 @@ fn mnemonic_segments(seg: &mut Seg, func: FunctionId, m: &Mnemonic) {
             seg.punct(":");
             seg.push(s.size.to_string(), TokenKind::Type, None);
             seg.punct(", ");
-            seg.value(s.ptr);
+            seg.value(s.ptr.qualify(func));
             seg.op(" <- ");
-            seg.value(s.src);
+            seg.value(s.src.qualify(func));
             seg.punct(");");
         }
         Mnemonic::Branch(b) => {
@@ -318,12 +323,12 @@ fn mnemonic_segments(seg: &mut Seg, func: FunctionId, m: &Mnemonic) {
         Mnemonic::BranchInd(b) => {
             seg.kw("goto ");
             seg.punct("[");
-            seg.value(b.ptr);
+            seg.value(b.ptr.qualify(func));
             seg.punct("];");
         }
         Mnemonic::CBranch(cb) => {
             seg.kw("if ");
-            seg.value(cb.condition);
+            seg.value(cb.condition.qualify(func));
             seg.kw(" goto ");
             seg.branch_target(func, cb.success_block, &cb.success_args);
             seg.kw(" else goto ");
@@ -342,7 +347,7 @@ fn mnemonic_segments(seg: &mut Seg, func: FunctionId, m: &Mnemonic) {
                 if i > 0 {
                     seg.punct(", ");
                 }
-                seg.value(arg);
+                seg.value(arg.qualify(func));
             }
             seg.punct(");");
         }
@@ -363,7 +368,7 @@ fn mnemonic_segments(seg: &mut Seg, func: FunctionId, m: &Mnemonic) {
                     TokenKind::BlockParam,
                     None,
                 );
-                seg.value(arg);
+                seg.value(arg.qualify(func));
             }
             seg.punct(");");
         }
@@ -379,14 +384,14 @@ fn mnemonic_segments(seg: &mut Seg, func: FunctionId, m: &Mnemonic) {
                 if i > 0 {
                     seg.punct(", ");
                 }
-                seg.value(arg);
+                seg.value(arg.qualify(func));
             }
             seg.punct(");");
         }
         Mnemonic::CallInd(c) => {
             seg.kw("call ");
             seg.punct("[");
-            seg.value(c.ptr);
+            seg.value(c.ptr.qualify(func));
             seg.punct("]");
             if !c.args.is_empty() {
                 seg.punct("(");
@@ -394,7 +399,7 @@ fn mnemonic_segments(seg: &mut Seg, func: FunctionId, m: &Mnemonic) {
                     if i > 0 {
                         seg.punct(", ");
                     }
-                    seg.value(arg);
+                    seg.value(arg.qualify(func));
                 }
                 seg.punct(")");
             }
@@ -403,63 +408,63 @@ fn mnemonic_segments(seg: &mut Seg, func: FunctionId, m: &Mnemonic) {
         Mnemonic::Return(r) => match r.value {
             Some(value) => {
                 seg.kw("return ");
-                seg.value(value);
+                seg.value(value.qualify(func));
                 seg.kw(" at ");
-                seg.value(r.ptr);
+                seg.value(r.ptr.qualify(func));
                 seg.punct(";");
             }
             None => {
                 seg.kw("return at ");
-                seg.value(r.ptr);
+                seg.value(r.ptr.qualify(func));
                 seg.punct(";");
             }
         },
         Mnemonic::ReturnValue(r) => {
             seg.kw("return ");
-            seg.value(r.value);
+            seg.value(r.value.qualify(func));
             seg.punct(";");
         }
         Mnemonic::Unop(u) => match u.op {
             Unop::IntNegate | Unop::IntNot | Unop::FloatNegate => {
                 seg.op(format!("{} ", u.op));
-                seg.value(u.src);
+                seg.value(u.src.qualify(func));
                 seg.punct(";");
             }
             _ => {
                 seg.kw(&u.op.to_string());
                 seg.punct("(");
-                seg.value(u.src);
+                seg.value(u.src.qualify(func));
                 seg.punct(");");
             }
         },
         Mnemonic::Binop(b) => {
-            seg.value(b.lhs);
+            seg.value(b.lhs.qualify(func));
             seg.op(format!(" {} ", b.op));
-            seg.value(b.rhs);
+            seg.value(b.rhs.qualify(func));
             seg.punct(";");
         }
-        Mnemonic::Zext(z) => cast(seg, "zext", 'i', z.size, z.src),
-        Mnemonic::Sext(s) => cast(seg, "sext", 'i', s.size, s.src),
-        Mnemonic::IntToFloat(c) => cast(seg, "int2float", 'f', c.size, c.src),
-        Mnemonic::FloatToFloat(c) => cast(seg, "float2float", 'f', c.size, c.src),
-        Mnemonic::FloatToInt(c) => cast(seg, "trunc", 'i', c.size, c.src),
+        Mnemonic::Zext(z) => cast(seg, func, "zext", 'i', z.size, z.src),
+        Mnemonic::Sext(s) => cast(seg, func, "sext", 'i', s.size, s.src),
+        Mnemonic::IntToFloat(c) => cast(seg, func, "int2float", 'f', c.size, c.src),
+        Mnemonic::FloatToFloat(c) => cast(seg, func, "float2float", 'f', c.size, c.src),
+        Mnemonic::FloatToInt(c) => cast(seg, func, "trunc", 'i', c.size, c.src),
         Mnemonic::Range(r) => {
-            seg.value(r.src);
+            seg.value(r.src.qualify(func));
             seg.punct("[");
             seg.push(r.start.to_string(), TokenKind::Literal, None);
             seg.punct(":");
             seg.push((r.start + r.size).to_string(), TokenKind::Literal, None);
             seg.punct("];");
         }
-        Mnemonic::IsFloatNaN(o) => unary_call(seg, "nan", o.src),
-        Mnemonic::LzCount(o) => unary_call(seg, "lzcount", o.src),
-        Mnemonic::PopCount(o) => unary_call(seg, "popcount", o.src),
-        Mnemonic::Carry(o) => binary_call(seg, "carry", o.lhs, o.rhs),
-        Mnemonic::SCarry(o) => binary_call(seg, "scarry", o.lhs, o.rhs),
-        Mnemonic::SBorrow(o) => binary_call(seg, "sborrow", o.lhs, o.rhs),
+        Mnemonic::IsFloatNaN(o) => unary_call(seg, func, "nan", o.src),
+        Mnemonic::LzCount(o) => unary_call(seg, func, "lzcount", o.src),
+        Mnemonic::PopCount(o) => unary_call(seg, func, "popcount", o.src),
+        Mnemonic::Carry(o) => binary_call(seg, func, "carry", o.lhs, o.rhs),
+        Mnemonic::SCarry(o) => binary_call(seg, func, "scarry", o.lhs, o.rhs),
+        Mnemonic::SBorrow(o) => binary_call(seg, func, "sborrow", o.lhs, o.rhs),
         Mnemonic::Assert(a) => {
             seg.kw("assert ");
-            seg.value(a.condition);
+            seg.value(a.condition.qualify(func));
             seg.punct(";");
         }
         // `Tuple` is normally routed through `tuple_with_type` (it always has a
@@ -473,16 +478,16 @@ fn mnemonic_segments(seg: &mut Seg, func: FunctionId, m: &Mnemonic) {
                 }
                 seg.push(format!("field{}", i + 1), TokenKind::Field, None);
                 seg.op("=");
-                seg.value(field);
+                seg.value(field.qualify(func));
             }
             seg.punct(");");
         }
         Mnemonic::Extract(e) => {
             seg.kw("extract");
             seg.punct("(");
-            seg.bare_value(e.agg);
+            seg.bare_value(e.agg.qualify(func));
             let name = e
-                .field_name(seg.ctx)
+                .field_name(seg.ctx, func)
                 .map(str::to_owned)
                 .unwrap_or_else(|| format!("field{}", e.index + 1));
             seg.push(format!(".{name}"), TokenKind::Field, None);
@@ -491,8 +496,8 @@ fn mnemonic_segments(seg: &mut Seg, func: FunctionId, m: &Mnemonic) {
         Mnemonic::Gep(g) => {
             seg.kw("gep");
             seg.punct("(");
-            seg.bare_value(g.base);
-            match g.field_name(seg.ctx) {
+            seg.bare_value(g.base.qualify(func));
+            match g.field_name(seg.ctx, func) {
                 Some(name) => seg.push(format!(".{name}"), TokenKind::Field, None),
                 None => {
                     seg.op(" + ");
@@ -506,17 +511,17 @@ fn mnemonic_segments(seg: &mut Seg, func: FunctionId, m: &Mnemonic) {
             if map.captures.is_empty() {
                 seg.push(body, TokenKind::Function, Some(Link::Function(map.body)));
                 seg.op(" <$> ");
-                seg.value(map.src);
+                seg.value(map.src.qualify(func));
                 seg.punct(";");
             } else {
                 seg.punct("(");
                 seg.push(body, TokenKind::Function, Some(Link::Function(map.body)));
                 for &c in &map.captures {
                     seg.punct(" ");
-                    seg.value(c);
+                    seg.value(c.qualify(func));
                 }
                 seg.op(") <$> ");
-                seg.value(map.src);
+                seg.value(map.src.qualify(func));
                 seg.punct(";");
             }
         }
@@ -530,9 +535,9 @@ fn mnemonic_segments(seg: &mut Seg, func: FunctionId, m: &Mnemonic) {
                     Some(Link::Function(scan.body)),
                 );
                 seg.punct(" ");
-                seg.value(scan.init);
+                seg.value(scan.init.qualify(func));
                 seg.punct(" ");
-                seg.value(scan.src);
+                seg.value(scan.src.qualify(func));
                 seg.punct(";");
             } else {
                 seg.kw("scanl ");
@@ -544,19 +549,19 @@ fn mnemonic_segments(seg: &mut Seg, func: FunctionId, m: &Mnemonic) {
                 );
                 for &c in &scan.captures {
                     seg.punct(" ");
-                    seg.value(c);
+                    seg.value(c.qualify(func));
                 }
                 seg.punct(") ");
-                seg.value(scan.init);
+                seg.value(scan.init.qualify(func));
                 seg.punct(" ");
-                seg.value(scan.src);
+                seg.value(scan.src.qualify(func));
                 seg.punct(";");
             }
         }
         Mnemonic::PCodeOp(p) => {
             let op = seg.ctx.shared.pcode_ops[p.id].to_string();
             if let Some(dst) = p.dst {
-                seg.value(dst);
+                seg.value(dst.qualify(func));
                 seg.op(" = ");
             }
             seg.kw(&op);
@@ -565,7 +570,7 @@ fn mnemonic_segments(seg: &mut Seg, func: FunctionId, m: &Mnemonic) {
                 if i > 0 {
                     seg.punct(", ");
                 }
-                seg.value(arg);
+                seg.value(arg.qualify(func));
             }
             seg.punct(");");
         }
@@ -576,35 +581,35 @@ fn mnemonic_segments(seg: &mut Seg, func: FunctionId, m: &Mnemonic) {
                 if i > 0 {
                     seg.punct(", ");
                 }
-                seg.value(arg);
+                seg.value(arg.qualify(func));
             }
             seg.punct(");");
         }
     }
 }
 
-fn cast(seg: &mut Seg, kw: &str, prefix: char, size: usize, src: ValueId) {
+fn cast(seg: &mut Seg, func: FunctionId, kw: &str, prefix: char, size: usize, src: LocalValueId) {
     seg.kw(kw);
     seg.punct("(");
     seg.push(format!("{prefix}{}", size * 8), TokenKind::Type, None);
     seg.punct(", ");
-    seg.value(src);
+    seg.value(src.qualify(func));
     seg.punct(");");
 }
 
-fn unary_call(seg: &mut Seg, kw: &str, src: ValueId) {
+fn unary_call(seg: &mut Seg, func: FunctionId, kw: &str, src: LocalValueId) {
     seg.kw(kw);
     seg.punct("(");
-    seg.value(src);
+    seg.value(src.qualify(func));
     seg.punct(");");
 }
 
-fn binary_call(seg: &mut Seg, kw: &str, lhs: ValueId, rhs: ValueId) {
+fn binary_call(seg: &mut Seg, func: FunctionId, kw: &str, lhs: LocalValueId, rhs: LocalValueId) {
     seg.kw(kw);
     seg.punct("(");
-    seg.value(lhs);
+    seg.value(lhs.qualify(func));
     seg.punct(", ");
-    seg.value(rhs);
+    seg.value(rhs.qualify(func));
     seg.punct(");");
 }
 

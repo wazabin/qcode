@@ -660,7 +660,10 @@ mod tests {
             let insn = own.push_mnemonic(
                 f,
                 view.shr(),
-                Mnemonic::Zext(qcode::value::insn::Zext { src: k, size: 8 }),
+                Mnemonic::Zext(qcode::value::insn::Zext {
+                    src: k.localize(f),
+                    size: 8,
+                }),
                 8,
             );
             let first = own.block(root).instructions[0];

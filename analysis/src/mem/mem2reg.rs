@@ -89,7 +89,7 @@ pub(crate) fn has_dynamic_stack_pointer_deref(
     let numbering = precompute_forms(ctx, function_id);
     for block in Function::from_id(ctx, function_id).blocks() {
         for insn in block.iter() {
-            let Some(access) = MemoryAccess::from_mnemonic(insn.mnemonic()) else {
+            let Some(access) = MemoryAccess::from_mnemonic(insn.mnemonic(), insn.id.func) else {
                 continue;
             };
             if frame_offset(ctx, &numbering, sp, access.ptr).is_none()
@@ -182,9 +182,9 @@ fn register_clobber_index(
     for block in host.function_ref(function_id).blocks() {
         for insn in block.iter() {
             if let Mnemonic::Store(Store { ptr, .. }) = insn.mnemonic()
-                && register_varnode(host, *ptr).is_some()
+                && register_varnode(host, ptr.qualify(insn.id.func)).is_some()
             {
-                store_ptrs.insert(*ptr);
+                store_ptrs.insert(ptr.qualify(insn.id.func));
             }
         }
     }
@@ -229,15 +229,17 @@ struct MemoryAccess {
 }
 
 impl MemoryAccess {
-    fn from_mnemonic(mnemonic: &Mnemonic) -> Option<Self> {
+    fn from_mnemonic(mnemonic: &Mnemonic, func: FunctionId) -> Option<Self> {
         match mnemonic {
             Mnemonic::Store(Store { ptr, src, size, .. }) => Some(Self {
-                ptr: *ptr,
+                ptr: ptr.qualify(func),
                 size: *size,
-                kind: MemoryAccessKind::Store { src: *src },
+                kind: MemoryAccessKind::Store {
+                    src: src.qualify(func),
+                },
             }),
             Mnemonic::Load(Load { ptr, size, .. }) => Some(Self {
-                ptr: *ptr,
+                ptr: ptr.qualify(func),
                 size: *size,
                 kind: MemoryAccessKind::Load,
             }),
@@ -372,11 +374,17 @@ impl LiveInBlocks {
             for insn in block.iter() {
                 match insn.mnemonic() {
                     Mnemonic::Store(Store { ptr, .. }) => {
-                        store_blocks.entry(*ptr).or_default().insert(block_id);
-                        stored_here.insert(*ptr);
+                        let ptr = ptr.qualify(insn.id.func);
+                        store_blocks.entry(ptr).or_default().insert(block_id);
+                        stored_here.insert(ptr);
                     }
-                    Mnemonic::Load(Load { ptr, .. }) if !stored_here.contains(ptr) => {
-                        upward_exposed.entry(*ptr).or_default().insert(block_id);
+                    Mnemonic::Load(Load { ptr, .. })
+                        if !stored_here.contains(&ptr.qualify(insn.id.func)) =>
+                    {
+                        upward_exposed
+                            .entry(ptr.qualify(insn.id.func))
+                            .or_default()
+                            .insert(block_id);
                     }
                     _ => {}
                 }
@@ -507,11 +515,18 @@ impl LiveInBlocks {
             for insn in block.iter() {
                 match insn.mnemonic() {
                     Mnemonic::Store(Store { ptr, .. })
-                        if *ptr == var || register_store_low_aligned_contains(host, *ptr, var) =>
+                        if ptr.qualify(insn.id.func) == var
+                            || register_store_low_aligned_contains(
+                                host,
+                                ptr.qualify(insn.id.func),
+                                var,
+                            ) =>
                     {
                         has_def = true;
                     }
-                    Mnemonic::Load(Load { ptr, .. }) if *ptr == var && !has_def => {
+                    Mnemonic::Load(Load { ptr, .. })
+                        if ptr.qualify(insn.id.func) == var && !has_def =>
+                    {
                         upward_exposed.insert(block_id);
                     }
                     _ => {}
@@ -788,7 +803,9 @@ impl<'ctx, 'body, 'str> Mem2Reg<'ctx, 'body, 'str> {
             && let ValueId::Instruction(iid) = value
         {
             let src = match self.read().insn_ref(iid).mnemonic() {
-                Mnemonic::Zext(Zext { src, .. }) | Mnemonic::Sext(Sext { src, .. }) => Some(*src),
+                Mnemonic::Zext(Zext { src, .. }) | Mnemonic::Sext(Sext { src, .. }) => {
+                    Some(src.qualify(iid.func))
+                }
                 _ => None,
             };
             if let Some(src) = src
@@ -800,12 +817,12 @@ impl<'ctx, 'body, 'str> Mem2Reg<'ctx, 'body, 'str> {
 
         let mnemonic = if value_size < load_size {
             Mnemonic::Zext(Zext {
-                src: value,
+                src: value.localize(before.func),
                 size: load_size,
             })
         } else {
             Mnemonic::Range(Range {
-                src: value,
+                src: value.localize(before.func),
                 start: 0,
                 size: load_size,
             })
@@ -925,7 +942,8 @@ impl<'str> Mem2Reg<'_, '_, 'str> {
 
         for block in self.read().function_ref(self.function_id).blocks() {
             for insn in block.iter() {
-                let Some(access) = MemoryAccess::from_mnemonic(insn.mnemonic()) else {
+                let Some(access) = MemoryAccess::from_mnemonic(insn.mnemonic(), insn.id.func)
+                else {
                     continue;
                 };
                 // A store whose source width differs from the access width would
@@ -1371,7 +1389,7 @@ impl<'str> Mem2Reg<'_, '_, 'str> {
         }
         matches!(
             insn.mnemonic(),
-            Mnemonic::Load(Load { ptr, .. }) if *ptr == var
+            Mnemonic::Load(Load { ptr, .. }) if ptr.qualify(insn_id.func) == var
         )
     }
 
@@ -1408,10 +1426,11 @@ impl<'str> Mem2Reg<'_, '_, 'str> {
         for &block_id in &block_ids {
             for &insn_id in self.read().block_ref(block_id).instruction_ids() {
                 if let Mnemonic::Load(Load { ptr, .. }) = self.read().insn_ref(insn_id).mnemonic() {
-                    if vars.contains(ptr) {
-                        vars_with_surviving_loads.insert(*ptr);
-                    } else if register_varnode(self.read(), *ptr).is_some() {
-                        unpromoted_register_loads.push(*ptr);
+                    let ptr = ptr.qualify(insn_id.func);
+                    if vars.contains(&ptr) {
+                        vars_with_surviving_loads.insert(ptr);
+                    } else if register_varnode(self.read(), ptr).is_some() {
+                        unpromoted_register_loads.push(ptr);
                     }
                 }
             }
@@ -1426,15 +1445,16 @@ impl<'str> Mem2Reg<'_, '_, 'str> {
                 let Mnemonic::Store(Store { ptr, .. }) = mnemonic else {
                     continue;
                 };
-                if !vars.contains(ptr) {
+                let ptr = ptr.qualify(insn_id.func);
+                if !vars.contains(&ptr) {
                     continue;
                 }
                 // A wider register store an unpromoted narrow load overlaps is the
                 // slice source that load was deferred to — keep it (see above).
-                if register_varnode(self.read(), *ptr).is_some()
+                if register_varnode(self.read(), ptr).is_some()
                     && unpromoted_register_loads
                         .iter()
-                        .any(|&load| wider_register_store_contains(self.read(), *ptr, load))
+                        .any(|&load| wider_register_store_contains(self.read(), ptr, load))
                 {
                     continue;
                 }
@@ -1448,9 +1468,9 @@ impl<'str> Mem2Reg<'_, '_, 'str> {
                 // the conservative frame analysis did not flag) are safe to remove.
                 // Stack-slot literals keep the unconditional removal.
                 let guarded = if let ValueId::Varnode(vn_id) = ptr {
-                    match Varnode::from_id(self.read().shr(), *vn_id).space().ty {
+                    match Varnode::from_id(self.read().shr(), vn_id).space().ty {
                         SpaceType::Register => true,
-                        SpaceType::Temporary => vars_with_surviving_loads.contains(ptr),
+                        SpaceType::Temporary => vars_with_surviving_loads.contains(&ptr),
                         _ => false,
                     }
                 } else {
@@ -1612,6 +1632,8 @@ impl<'str> Mem2Reg<'_, '_, 'str> {
 
             match mnemonic {
                 Mnemonic::Store(Store { ptr, src, .. }) => {
+                    let ptr = ptr.qualify(insn_id.func);
+                    let src = src.qualify(insn_id.func);
                     if state.vars.contains(&ptr) {
                         // If the current reaching definition for this var was never consumed,
                         // it is being overwritten without being read — mark it as dead.
@@ -1641,7 +1663,10 @@ impl<'str> Mem2Reg<'_, '_, 'str> {
                     self.define_sliced_vars(block, ptr, src, state);
                 }
 
-                Mnemonic::Load(Load { ptr, size, .. }) if state.vars.contains(&ptr) => {
+                Mnemonic::Load(Load { ptr, size, .. })
+                    if state.vars.contains(&ptr.qualify(insn_id.func)) =>
+                {
+                    let ptr = ptr.qualify(insn_id.func);
                     let reaching = decide_variable_value(ptr, &state.frames);
                     let (mut load_value, store_insn) = match reaching {
                         Some(FrameEntry::Defined(reaching)) => {
@@ -1682,6 +1707,14 @@ impl<'str> Mem2Reg<'_, '_, 'str> {
                     success_args: existing_success,
                     failure_args: existing_failure,
                 }) => {
+                    let existing_success: Vec<ValueId> = existing_success
+                        .iter()
+                        .map(|arg| arg.qualify(insn_id.func))
+                        .collect();
+                    let existing_failure: Vec<ValueId> = existing_failure
+                        .iter()
+                        .map(|arg| arg.qualify(insn_id.func))
+                        .collect();
                     // The CBranch's targets are body-local indices in `block`'s arena.
                     let sb = BlockId::new(block.func, success_block);
                     let fb = BlockId::new(block.func, failure_block);
@@ -1717,9 +1750,15 @@ impl<'str> Mem2Reg<'_, '_, 'str> {
                             Mnemonic::CBranch(CBranch {
                                 condition,
                                 success_block,
-                                success_args,
+                                success_args: success_args
+                                    .into_iter()
+                                    .map(|arg| arg.localize(insn_id.func))
+                                    .collect(),
                                 failure_block,
-                                failure_args,
+                                failure_args: failure_args
+                                    .into_iter()
+                                    .map(|arg| arg.localize(insn_id.func))
+                                    .collect(),
                             }),
                         );
                         state.changed = true;
@@ -1738,6 +1777,10 @@ impl<'str> Mem2Reg<'_, '_, 'str> {
                     target,
                     args: existing,
                 }) => {
+                    let existing: Vec<ValueId> = existing
+                        .iter()
+                        .map(|arg| arg.qualify(insn_id.func))
+                        .collect();
                     let tgt = BlockId::new(block.func, target);
                     let args = self.merge_branch_args(
                         BranchEdge {
@@ -1754,7 +1797,13 @@ impl<'str> Mem2Reg<'_, '_, 'str> {
                         self.body.replace_instruction_mnemonic(
                             self.cx,
                             insn_id,
-                            Mnemonic::Branch(Branch { target, args }),
+                            Mnemonic::Branch(Branch {
+                                target,
+                                args: args
+                                    .into_iter()
+                                    .map(|arg| arg.localize(insn_id.func))
+                                    .collect(),
+                            }),
                         );
                         state.changed = true;
                     }
@@ -1868,7 +1917,7 @@ impl<'str> Mem2Reg<'_, '_, 'str> {
 mod tests {
 
     use jstd::graph::analysis::compute_dominators;
-    use qcode::value::{BasicBlock, Function, Instruction, insn::Mnemonic};
+    use qcode::value::{BasicBlock, Function, Instruction, LocalValueId, insn::Mnemonic};
     use qcode_macro::qcode;
 
     use super::*;
@@ -1968,8 +2017,14 @@ mod tests {
         let Mnemonic::Binop(masked_mnemonic) = Instruction::from_id(&ctx, masked).mnemonic() else {
             panic!("masked instruction should remain a binop");
         };
-        assert_eq!(ValueRef::new(masked_mnemonic.lhs, &ctx).size(), 8);
-        assert_eq!(ValueRef::new(masked_mnemonic.rhs, &ctx).size(), 8);
+        assert_eq!(
+            ValueRef::new(masked_mnemonic.lhs.qualify(masked.func), &ctx).size(),
+            8
+        );
+        assert_eq!(
+            ValueRef::new(masked_mnemonic.rhs.qualify(masked.func), &ctx).size(),
+            8
+        );
     }
 
     #[test]
@@ -2470,7 +2525,7 @@ mod tests {
         else {
             panic!("byte sink store vanished");
         };
-        let ValueId::Literal(lit) = src else {
+        let LocalValueId::Literal(lit) = src else {
             panic!("expected the sliced byte to fold to a constant, got {src:?}");
         };
         assert_eq!(
@@ -2528,7 +2583,7 @@ mod tests {
         assert!(
             !body_block.iter().any(|i| matches!(
                 i.mnemonic(),
-                Mnemonic::Load(Load { ptr, .. }) if *ptr == ValueId::Varnode(r0_byte0)
+                Mnemonic::Load(Load { ptr, .. }) if *ptr == LocalValueId::Varnode(r0_byte0)
             )),
             "the AL load should be sliced from the wider EAX store, not left in place:\n{body_block}"
         );
@@ -2632,7 +2687,7 @@ mod tests {
         assert!(
             body_block.iter().any(|i| matches!(
                 i.mnemonic(),
-                Mnemonic::Load(Load { ptr, .. }) if *ptr == ValueId::Varnode(r0_byte1)
+                Mnemonic::Load(Load { ptr, .. }) if *ptr == LocalValueId::Varnode(r0_byte1)
             )),
             "the non-low-aligned AH load must stay a register load:\n{body_block}"
         );
@@ -2979,7 +3034,7 @@ mod tests {
 
         let left_cont_block = BasicBlock::from_id(&tc.ctx, left_cont);
         let load_before_branch = left_cont_block.iter().any(|insn| {
-            matches!(insn.mnemonic(), Mnemonic::Load(load) if load.ptr == ValueId::Varnode(r0))
+            matches!(insn.mnemonic(), Mnemonic::Load(load) if load.ptr == LocalValueId::Varnode(r0))
         });
         assert!(
             load_before_branch,
@@ -2992,7 +3047,7 @@ mod tests {
         };
         assert_eq!(branch.args.len(), 1, "join branch should pass r0");
         assert!(
-            matches!(branch.args[0], ValueId::Instruction(_)),
+            matches!(branch.args[0], LocalValueId::Instruction(_)),
             "join branch should pass the inserted register load, got {:?}",
             branch.args[0]
         );
@@ -3096,7 +3151,7 @@ mod tests {
                 .filter(|insn| {
                     matches!(
                         insn.mnemonic(),
-                        Mnemonic::Load(Load { ptr, .. }) if *ptr == ValueId::Varnode(r0)
+                        Mnemonic::Load(Load { ptr, .. }) if *ptr == LocalValueId::Varnode(r0)
                     )
                 })
                 .count()
@@ -3317,7 +3372,8 @@ mod tests {
                 panic!("{name} sink should remain a store");
             };
             assert_eq!(
-                store.src, zero,
+                store.src,
+                zero.localize(sink.func),
                 "{name}'s load of r0 must resolve to the entry def (0), not the \
                  sibling successor's redefinition"
             );
@@ -3491,7 +3547,7 @@ mod tests {
         let entry_has_store = BasicBlock::from_id(&tc.ctx, entry).iter().any(|insn| {
             matches!(
                 insn.mnemonic(),
-                Mnemonic::Store(Store { ptr, .. }) if *ptr == ValueId::Varnode(temp)
+                Mnemonic::Store(Store { ptr, .. }) if *ptr == LocalValueId::Varnode(temp)
             )
         });
         assert!(

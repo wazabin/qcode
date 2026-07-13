@@ -53,9 +53,10 @@ pub(crate) fn is_increment<'a, 'str: 'a>(
     let Mnemonic::Binop(Binary { lhs, rhs, op }) = host.instruction(id).mnemonic() else {
         return false;
     };
+    let (lhs, rhs) = (lhs.qualify(id.func), rhs.qualify(id.func));
     let one = |x: ValueId| literal(host, x) == Some(1);
     matches!(op, Binop::Int(IntBinop::Add))
-        && ((*lhs == idx && one(*rhs)) || (*rhs == idx && one(*lhs)))
+        && ((lhs == idx && one(rhs)) || (rhs == idx && one(lhs)))
 }
 
 /// `true` if `v` is `idx - 1`, expressed either as `idx - 1` or as `idx + (-1)`
@@ -73,7 +74,7 @@ pub(crate) fn is_decrement<'a, 'str: 'a>(
     let Mnemonic::Binop(Binary { lhs, rhs, op }) = host.instruction(id).mnemonic() else {
         return false;
     };
-    let (lhs, rhs, op) = (*lhs, *rhs, *op);
+    let (lhs, rhs, op) = (lhs.qualify(id.func), rhs.qualify(id.func), *op);
     let neg_one = if idx_width >= 8 {
         u64::MAX
     } else {
@@ -129,13 +130,15 @@ pub(crate) fn incoming<'a, 'str: 'a>(
         };
         let q = |t| BlockId::new(pred.func, t);
         match term.mnemonic() {
-            Mnemonic::Branch(b) => out.extend(b.args.get(k).copied()),
+            Mnemonic::Branch(b) => {
+                out.extend(b.args.get(k).map(|a| a.qualify(pred.func)));
+            }
             Mnemonic::CBranch(cb) => {
                 if q(cb.success_block) == block {
-                    out.extend(cb.success_args.get(k).copied());
+                    out.extend(cb.success_args.get(k).map(|a| a.qualify(pred.func)));
                 }
                 if q(cb.failure_block) == block {
-                    out.extend(cb.failure_args.get(k).copied());
+                    out.extend(cb.failure_args.get(k).map(|a| a.qualify(pred.func)));
                 }
             }
             _ => {}
@@ -238,7 +241,10 @@ pub(crate) fn delete_private_loop<'str>(
             term_id,
             Mnemonic::Branch(Branch {
                 target: exit.localize(preheader.func),
-                args: exit_args,
+                args: exit_args
+                    .into_iter()
+                    .map(|a| a.localize(preheader.func))
+                    .collect(),
             }),
         );
         host.add_cfg_edge(preheader, exit);
@@ -572,22 +578,23 @@ impl NaturalLoop {
             return None;
         };
         let exit_on_true = BlockId::new(self.header.func, cb.success_block) == self.exit;
-        let ValueId::Instruction(id) = cb.condition else {
+        let ValueId::Instruction(id) = cb.condition.qualify(hterm.id.func) else {
             return None;
         };
         let Mnemonic::Binop(Binary { lhs, rhs, op }) = host.instruction(id).mnemonic() else {
             return None;
         };
-        let konst = if *lhs == key {
-            *rhs
-        } else if *rhs == key {
-            *lhs
+        let (lhs, rhs) = (lhs.qualify(id.func), rhs.qualify(id.func));
+        let konst = if lhs == key {
+            rhs
+        } else if rhs == key {
+            lhs
         } else {
             return None;
         };
         let ok = match op {
             Binop::Int(IntBinop::Equal) => exit_on_true,
-            Binop::Int(IntBinop::Less | IntBinop::SLess) => !exit_on_true && *lhs == key,
+            Binop::Int(IntBinop::Less | IntBinop::SLess) => !exit_on_true && lhs == key,
             _ => false,
         };
         if !ok {

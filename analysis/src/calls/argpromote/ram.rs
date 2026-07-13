@@ -284,14 +284,14 @@ fn try_promote(
                     id: insn.id,
                     block: bid,
                     is_store: false,
-                    ptr: l.ptr,
+                    ptr: l.ptr.qualify(insn.id.func),
                     size: l.size,
                 }),
                 Mnemonic::Store(s) if s.space == ram => Some(MemoryAccess {
                     id: insn.id,
                     block: bid,
                     is_store: true,
-                    ptr: s.ptr,
+                    ptr: s.ptr.qualify(insn.id.func),
                     size: s.size,
                 }),
                 _ => None,
@@ -867,7 +867,7 @@ fn apply(
                     Function::from_id(ctx, fid).name(),
                     pname,
                 );
-                let caller_base = call.args[arg_idx];
+                let caller_base = call.args[arg_idx].qualify(call_id.func);
                 let mut b = Builder::from_block(BasicBlock::from_id_mut(ctx, block));
                 b.set_insert_point_before(call_id);
                 let addr = seed_addr(&mut b, caller_base, base_size, offset);
@@ -1079,7 +1079,7 @@ fn apply_partial(ctx: &mut Context, fid: FunctionId, promoted: &[Promoted]) -> b
                     ns.arg_idx,
                     ns.name,
                 );
-                let base = args[ns.arg_idx];
+                let base = args[ns.arg_idx].qualify(call_id.func);
                 let addr = if ns.offset == 0 {
                     base
                 } else {
@@ -1087,7 +1087,7 @@ fn apply_partial(ctx: &mut Context, fid: FunctionId, promoted: &[Promoted]) -> b
                     b.push_add(base, k).id()
                 };
                 let snap = b.push_load::<false>(addr, ns.size, ram).id();
-                new_args.push(snap);
+                new_args.push(snap.localize(call_id.func));
             }
         }
         ctx.replace_instruction_mnemonic(

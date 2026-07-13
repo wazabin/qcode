@@ -2,7 +2,7 @@
 mod tests {
     use qcode::builder::Builder;
     use qcode::value::{
-        BasicBlock, BlockId, Function, Instruction, Value, Varnode, VarnodeId,
+        BasicBlock, BlockId, Function, Instruction, LocalValueId, Value, Varnode, VarnodeId,
         insn::{Binop, Call, InstructionId, IntBinop, Mnemonic},
     };
     use qcode_macro::qcode;
@@ -39,7 +39,10 @@ mod tests {
             call_id,
             Mnemonic::Call(Call {
                 target,
-                args,
+                args: args
+                    .into_iter()
+                    .map(|arg| arg.localize(call_id.func))
+                    .collect(),
                 clobbers: vec![],
             }),
         );
@@ -312,8 +315,8 @@ mod tests {
             .iter()
             .flat_map(|b| b.iter())
             .any(|i| match i.mnemonic() {
-                Mnemonic::Load(l) => matches!(l.ptr, ValueId::Literal(_)),
-                Mnemonic::Store(s) => matches!(s.ptr, ValueId::Literal(_)),
+                Mnemonic::Load(l) => matches!(l.ptr, LocalValueId::Literal(_)),
+                Mnemonic::Store(s) => matches!(s.ptr, LocalValueId::Literal(_)),
                 _ => false,
             });
         assert!(
@@ -327,7 +330,7 @@ mod tests {
         };
         assert_eq!(call.args.len(), 1, "address threaded to the caller");
         assert!(
-            matches!(call.args[0], ValueId::Literal(_)),
+            matches!(call.args[0], LocalValueId::Literal(_)),
             "caller passes the address literal"
         );
     }
@@ -500,8 +503,8 @@ mod tests {
             .iter()
             .flat_map(|b| b.iter())
             .any(|i| match i.mnemonic() {
-                Mnemonic::Load(l) => matches!(l.ptr, ValueId::Literal(_)),
-                Mnemonic::Store(s) => matches!(s.ptr, ValueId::Literal(_)),
+                Mnemonic::Load(l) => matches!(l.ptr, LocalValueId::Literal(_)),
+                Mnemonic::Store(s) => matches!(s.ptr, LocalValueId::Literal(_)),
                 _ => false,
             });
         assert!(!const_access, "no constant-address access remains in f");
@@ -510,19 +513,18 @@ mod tests {
         let Mnemonic::Call(call) = tc.ctx.get_insn(call_id).mnemonic().clone() else {
             panic!("g_call is a call");
         };
-        let passes_addr =
-            call.args
-                .iter()
-                .any(|&a| match qcode::value::ValueRef::new(a, &tc.ctx) {
-                    qcode::value::ValueRef::Literal(l) => l.value() == 0x9000,
-                    _ => false,
-                });
+        let passes_addr = call.args.iter().any(|&a| {
+            match qcode::value::ValueRef::new(a.qualify(call_id.func), &tc.ctx) {
+                qcode::value::ValueRef::Literal(l) => l.value() == 0x9000,
+                _ => false,
+            }
+        });
         assert!(passes_addr, "caller passes the global address literal");
 
         // … and replays the functionalized write-set out of the call result.
         let has_replay = Function::from_id(&tc.ctx, g).iter().any(|b| {
             b.iter().any(
-                |i| matches!(i.mnemonic(), Mnemonic::Extract(e) if e.agg == ValueId::Instruction(call_id)),
+                |i| matches!(i.mnemonic(), Mnemonic::Extract(e) if e.agg == LocalValueId::Instruction(call_id.local)),
             )
         });
         assert!(has_replay, "caller replays the returned global write-set");
@@ -1170,7 +1172,7 @@ mod tests {
         {
             let mut m = tc.ctx.get_insn(ret_id).mnemonic().clone();
             if let Mnemonic::Return(ref mut r) = m {
-                r.value = Some(reg_tuple);
+                r.value = Some(reg_tuple.localize(ret_id.func));
             }
             tc.ctx.replace_instruction_mnemonic(ret_id, m);
         }
@@ -1334,7 +1336,7 @@ mod tests {
         {
             let mut m = tc.ctx.get_insn(ret_id).mnemonic().clone();
             if let Mnemonic::Return(ref mut r) = m {
-                r.value = Some(reg_tuple);
+                r.value = Some(reg_tuple.localize(ret_id.func));
             }
             tc.ctx.replace_instruction_mnemonic(ret_id, m);
         }
@@ -1490,9 +1492,10 @@ mod tests {
             Mnemonic::Return(r) => r.value?,
             _ => return None,
         };
-        let ValueId::Instruction(tuple_id) = val else {
+        let LocalValueId::Instruction(tuple_local) = val else {
             return None;
         };
+        let tuple_id = InstructionId::new(ret.func, tuple_local);
         match tc.ctx.get_insn(tuple_id).mnemonic() {
             Mnemonic::Tuple(t) => Some(t.fields.len()),
             _ => None,
@@ -1556,7 +1559,7 @@ mod tests {
         assert_eq!(BasicBlock::from_id(&tc.ctx, entry).params().count(), 1);
         let first = BasicBlock::from_id(&tc.ctx, entry).iter().next().unwrap();
         assert!(
-            matches!(first.mnemonic(), Mnemonic::Store(s) if s.ptr == ValueId::Varnode(r0)),
+            matches!(first.mnemonic(), Mnemonic::Store(s) if s.ptr == LocalValueId::Varnode(r0)),
             "entry must begin by seeding r0 from its input param"
         );
         assert_eq!(register_writeset_len(&tc, f), Some(1));
@@ -1692,9 +1695,9 @@ mod tests {
             matches!(
                 i.mnemonic(),
                 Mnemonic::Store(s)
-                    if s.ptr == ValueId::Varnode(r0)
-                        && matches!(s.src, ValueId::Instruction(id)
-                            if matches!(tc.ctx.get_insn(id).mnemonic(), Mnemonic::Extract(_)))
+                    if s.ptr == LocalValueId::Varnode(r0)
+                        && matches!(s.src, LocalValueId::Instruction(id)
+                            if matches!(tc.ctx.get_insn(InstructionId::new(i.id.func, id)).mnemonic(), Mnemonic::Extract(_)))
             )
         });
         assert!(
@@ -2430,7 +2433,7 @@ mod tests {
         // The deref base is now the by-value pointer param directly.
         let base_is_param = Function::from_id(&tc.ctx, f).iter().any(|b| {
             b.iter().any(|i| matches!(i.mnemonic(), Mnemonic::Binop(bi)
-                if matches!(bi.op, Binop::Int(IntBinop::Add)) && matches!(bi.lhs, ValueId::BlockParam(_))))
+                if matches!(bi.op, Binop::Int(IntBinop::Add)) && matches!(bi.lhs, LocalValueId::BlockParam(_))))
         });
         assert!(base_is_param, "the buffer deref base is now a clean param");
     }
@@ -2780,7 +2783,7 @@ mod tests {
         let map_src = map_src.expect("f must contain a map");
         assert!(
             tc.ctx
-                .stored_type_of(map_src)
+                .stored_type_of(map_src.qualify(f))
                 .and_then(|t| tc.ctx.shared.types.array_of(t))
                 .is_some(),
             "the map source is the Array snapshot"
@@ -2792,7 +2795,7 @@ mod tests {
             .iter()
             .find_map(|b| {
                 b.iter().find_map(|i| match i.mnemonic() {
-                    Mnemonic::Map(_) => Some(ValueId::Instruction(i.id)),
+                    Mnemonic::Map(_) => Some(LocalValueId::Instruction(i.id.local)),
                     _ => None,
                 })
             })
@@ -2910,7 +2913,7 @@ mod tests {
         let map_src = map_src.expect("f must contain a map");
         assert!(
             tc.ctx
-                .stored_type_of(map_src)
+                .stored_type_of(map_src.qualify(f))
                 .and_then(|t| tc.ctx.shared.types.array_of(t))
                 .is_some(),
             "the map source is the Array snapshot"

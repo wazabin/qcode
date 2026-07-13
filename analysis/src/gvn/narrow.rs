@@ -33,7 +33,7 @@ use std::any::Any;
 use rustc_hash::FxHashMap as HashMap;
 
 use qcode::value::{
-    Value, ValueId, ValueRef,
+    FunctionId, Value, ValueId, ValueRef,
     block::BlockId,
     insn::{Binary, Binop, InstructionId, IntBinop, Mnemonic, Range, Sext, Unary, Unop, Zext},
     util::base_ref::HostRef,
@@ -77,7 +77,7 @@ impl<'str> SubPassC<'str> for NarrowTrunc {
         else {
             return Claim::Pass;
         };
-        let (src, w) = (*src, *size);
+        let (src, w) = (src.qualify(ic.insn_id.func), *size);
         if value_size(body.read_host(cx), src) != w && !src_transformable(body.read_host(cx), src) {
             return Claim::Pass;
         }
@@ -130,9 +130,9 @@ fn distributive(op: IntBinop) -> bool {
     )
 }
 
-fn range_low(src: ValueId, size: usize) -> Mnemonic {
+fn range_low(src: ValueId, size: usize, func: FunctionId) -> Mnemonic {
     Mnemonic::Range(Range {
-        src,
+        src: src.localize(func),
         start: 0,
         size,
     })
@@ -166,15 +166,15 @@ fn narrow_to_c<'str>(
                 lhs,
                 rhs,
             }) if distributive(o) => {
-                let l = narrow_to_c(body, cx, lhs, w, before, block, memo);
-                let rr = narrow_to_c(body, cx, rhs, w, before, block, memo);
+                let l = narrow_to_c(body, cx, lhs.qualify(iid.func), w, before, block, memo);
+                let rr = narrow_to_c(body, cx, rhs.qualify(iid.func), w, before, block, memo);
                 push_insn_c(
                     body,
                     cx,
                     Mnemonic::Binop(Binary {
                         op: Binop::Int(o),
-                        lhs: l,
-                        rhs: rr,
+                        lhs: l.localize(block.func),
+                        rhs: rr.localize(block.func),
                     }),
                     w,
                     before,
@@ -182,32 +182,49 @@ fn narrow_to_c<'str>(
                 )
             }
             Mnemonic::Unop(Unary { op, src }) if matches!(op, Unop::IntNot | Unop::IntNegate) => {
-                let s = narrow_to_c(body, cx, src, w, before, block, memo);
+                let s = narrow_to_c(body, cx, src.qualify(iid.func), w, before, block, memo);
                 push_insn_c(
                     body,
                     cx,
-                    Mnemonic::Unop(Unary { op, src: s }),
+                    Mnemonic::Unop(Unary {
+                        op,
+                        src: s.localize(block.func),
+                    }),
                     w,
                     before,
                     block,
                 )
             }
-            Mnemonic::Sext(Sext { src, .. }) => {
-                narrow_extension_c(body, cx, src, w, true, before, block, memo)
-            }
-            Mnemonic::Zext(Zext { src, .. }) => {
-                narrow_extension_c(body, cx, src, w, false, before, block, memo)
-            }
+            Mnemonic::Sext(Sext { src, .. }) => narrow_extension_c(
+                body,
+                cx,
+                src.qualify(iid.func),
+                w,
+                true,
+                before,
+                block,
+                memo,
+            ),
+            Mnemonic::Zext(Zext { src, .. }) => narrow_extension_c(
+                body,
+                cx,
+                src.qualify(iid.func),
+                w,
+                false,
+                before,
+                block,
+                memo,
+            ),
             Mnemonic::Range(Range { src, start: 0, .. }) => {
-                narrow_to_c(body, cx, src, w, before, block, memo)
+                narrow_to_c(body, cx, src.qualify(iid.func), w, before, block, memo)
             }
-            _ => push_insn_c(body, cx, range_low(v, w), w, before, block),
+            _ => push_insn_c(body, cx, range_low(v, w, block.func), w, before, block),
         },
         _ if numeric_const(body.read_host(cx).shr(), v).is_some() => {
             let folded = numeric_const(body.read_host(cx).shr(), v).unwrap() & low_mask(w);
             body.read_host(cx).shr().get_const(folded, w)
         }
-        _ => push_insn_c(body, cx, range_low(v, w), w, before, block),
+        _ => push_insn_c(body, cx, range_low(v, w, block.func), w, before, block),
     };
 
     memo.insert(v, result);
@@ -230,9 +247,15 @@ fn narrow_extension_c<'str>(
         return narrow_to_c(body, cx, src, w, before, block, memo);
     }
     let m = if sext {
-        Mnemonic::Sext(Sext { src, size: w })
+        Mnemonic::Sext(Sext {
+            src: src.localize(block.func),
+            size: w,
+        })
     } else {
-        Mnemonic::Zext(Zext { src, size: w })
+        Mnemonic::Zext(Zext {
+            src: src.localize(block.func),
+            size: w,
+        })
     };
     push_insn_c(body, cx, m, w, before, block)
 }
@@ -294,7 +317,7 @@ mod tests {
             .last()
             .expect("terminator");
         match Instruction::from_id(ctx, term).mnemonic() {
-            Mnemonic::ReturnValue(r) => r.value,
+            Mnemonic::ReturnValue(r) => r.value.qualify(term.func),
             other => panic!("expected return, got {other:?}"),
         }
     }

@@ -102,7 +102,7 @@ pub fn append_caller_arg(
             continue;
         };
         let mut args = call.args;
-        args.push(value);
+        args.push(value.localize(call_id.func));
         ctx.replace_instruction_mnemonic(
             call_id,
             Mnemonic::Call(Call {

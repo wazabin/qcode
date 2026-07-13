@@ -68,7 +68,7 @@ impl Intrinsic for Len {
             && let Mnemonic::Intrinsic(app) = host.instruction(iid).mnemonic()
             && app.id.name() == "iota"
         {
-            return Some(Simplified::Value(app.args[0]));
+            return Some(Simplified::Value(app.args[0].qualify(iid.func)));
         }
         None
     }

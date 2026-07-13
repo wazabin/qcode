@@ -1,11 +1,11 @@
-use crate::value::ValueId;
+use crate::value::LocalValueId;
 
 use super::mnemonic::{Args, MnemonicKind};
 use smallvec::smallvec;
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub struct IsFloatNaN {
-    pub src: ValueId,
+    pub src: LocalValueId,
 }
 
 impl MnemonicKind for IsFloatNaN {
@@ -20,7 +20,7 @@ impl MnemonicKind for IsFloatNaN {
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub struct LzCount {
-    pub src: ValueId,
+    pub src: LocalValueId,
 }
 
 impl LzCount {
@@ -55,7 +55,7 @@ impl MnemonicKind for LzCount {
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub struct PopCount {
-    pub src: ValueId,
+    pub src: LocalValueId,
 }
 
 impl PopCount {
@@ -78,8 +78,8 @@ impl MnemonicKind for PopCount {
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub struct Carry {
-    pub lhs: ValueId,
-    pub rhs: ValueId,
+    pub lhs: LocalValueId,
+    pub rhs: LocalValueId,
 }
 
 impl Carry {
@@ -110,8 +110,8 @@ impl MnemonicKind for Carry {
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub struct SCarry {
-    pub lhs: ValueId,
-    pub rhs: ValueId,
+    pub lhs: LocalValueId,
+    pub rhs: LocalValueId,
 }
 
 impl SCarry {
@@ -141,8 +141,8 @@ impl MnemonicKind for SCarry {
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub struct SBorrow {
-    pub lhs: ValueId,
-    pub rhs: ValueId,
+    pub lhs: LocalValueId,
+    pub rhs: LocalValueId,
 }
 
 impl SBorrow {

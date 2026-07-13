@@ -63,7 +63,7 @@ impl<'str> ModuleSubPass<'str> for PureCall {
         let Mnemonic::Extract(Extract { agg, index }) = *ic.mnemonic else {
             return Claim::Pass;
         };
-        let ValueId::Instruction(call_id) = agg else {
+        let ValueId::Instruction(call_id) = agg.qualify(ic.insn_id.func) else {
             return Claim::Pass;
         };
         // The aggregate must be a direct call to a fully pure function.
@@ -80,7 +80,7 @@ impl<'str> ModuleSubPass<'str> for PureCall {
         let literal_indices: HashSet<usize> = args
             .iter()
             .enumerate()
-            .filter(|&(_, &a)| const_value(&*ctx, a).is_some())
+            .filter(|&(_, &a)| const_value(&*ctx, a.qualify(ic.insn_id.func)).is_some())
             .map(|(i, _)| i)
             .collect();
         if literal_indices.is_empty() {
@@ -110,7 +110,12 @@ impl<'str> ModuleSubPass<'str> for PureCall {
         let arg_values: Vec<SizedValue> = args
             .iter()
             .zip(&param_sizes)
-            .map(|(&a, &size)| SizedValue::new(const_value(&*ctx, a).unwrap_or(0), size))
+            .map(|(&a, &size)| {
+                SizedValue::new(
+                    const_value(&*ctx, a.qualify(ic.insn_id.func)).unwrap_or(0),
+                    size,
+                )
+            })
             .collect();
 
         // Emulate the callee on the concrete arguments and read the field back.
@@ -161,7 +166,7 @@ mod tests {
         builder::Builder,
         testing::TestContext,
         value::{
-            BasicBlock, Function,
+            BasicBlock, Function, LocalValueId,
             function::{FunctionId, FunctionSignature},
             insn::{Return, Store},
         },
@@ -196,8 +201,8 @@ mod tests {
         tc.ctx.replace_instruction_mnemonic(
             iid,
             Mnemonic::Return(Return {
-                ptr,
-                value: Some(tuple),
+                ptr: ptr.localize(fid),
+                value: Some(tuple.localize(fid)),
             }),
         );
         Function::from_id_mut(&mut tc.ctx, fid).set_signature(FunctionSignature {
@@ -250,7 +255,7 @@ mod tests {
             call_id,
             Mnemonic::Call(Call {
                 target: foo,
-                args: vec![a_in, b_arg],
+                args: vec![a_in.localize(gid), b_arg.localize(gid)],
                 clobbers: vec![],
             }),
         );
@@ -287,11 +292,11 @@ mod tests {
             let Mnemonic::Store(Store { ptr, src, .. }) = i.mnemonic() else {
                 return None;
             };
-            if *ptr != reg {
+            if ptr.qualify(block.func) != reg {
                 return None;
             }
             match src {
-                ValueId::Literal(lid) => Some(tc.ctx.shared.values.literals[*lid].value),
+                LocalValueId::Literal(lid) => Some(tc.ctx.shared.values.literals[*lid].value),
                 _ => None,
             }
         })
@@ -365,8 +370,8 @@ mod tests {
         tc.ctx.replace_instruction_mnemonic(
             iid,
             Mnemonic::Return(Return {
-                ptr,
-                value: Some(tuple),
+                ptr: ptr.localize(fid),
+                value: Some(tuple.localize(fid)),
             }),
         );
         Function::from_id_mut(&mut tc.ctx, fid).set_signature(FunctionSignature {
@@ -414,7 +419,7 @@ mod tests {
             call_id,
             Mnemonic::Call(Call {
                 target: dec,
-                args: vec![sp_arg, arr_arg],
+                args: vec![sp_arg.localize(gid), arr_arg.localize(gid)],
                 clobbers: vec![],
             }),
         );
