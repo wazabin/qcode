@@ -116,6 +116,11 @@ impl<'a, 'str> HostRef<'a, 'str> {
         &self.function(id.func).params[id.local]
     }
 
+    /// Whether `id` currently names a live block-parameter payload.
+    pub fn contains_block_param(self, id: BlockParamId) -> bool {
+        self.function(id.func).params.contains(id.local)
+    }
+
     /// The CFG edge `id`, stored in function `func`'s edge arena.
     pub fn edge(self, func: FunctionId, id: EdgeId) -> &'a EdgeData {
         &self.function(func).edges[id]

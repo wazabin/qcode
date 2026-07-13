@@ -1495,6 +1495,19 @@ impl<'str> Context<'str> {
         &mut self.bodies[id.func].params[id.local]
     }
 
+    /// Whether `id` currently names a live block-parameter payload.
+    pub fn contains_block_param(&self, id: BlockParamId) -> bool {
+        Into::<usize>::into(id.func) < self.bodies.len()
+            && self.bodies[id.func].params.contains(id.local)
+    }
+
+    /// Physically removes a block parameter and its local bookkeeping.
+    /// Positional block and edge-argument rewrites belong to the caller and may
+    /// complete later in the same transformation.
+    pub fn remove_block_param(&mut self, id: BlockParamId) {
+        self.bodies[id.func].remove_block_param(id);
+    }
+
     /// Borrows the CFG edge `id`, stored in function `func`'s edge arena.
     pub fn edge(&self, func: FunctionId, id: EdgeId) -> &EdgeData {
         &self.bodies[func].edges[id]
@@ -2030,10 +2043,7 @@ impl<'str> Context<'str> {
             .map(|&local| BlockParamId::new(block.func, local))
             .collect();
         for param in params {
-            self.function_mut(param.func)
-                .users
-                .remove(&ValueId::BlockParam(param).strip_func());
-            self.block_param_mut(param).clear_parent();
+            self.remove_block_param(param);
         }
         self.unroster_block(block);
         let b = self.block_mut(block);
@@ -3370,6 +3380,52 @@ mod tests {
             fresh, removed,
             "removed instruction IDs must never be reused"
         );
+    }
+
+    #[test]
+    fn compact_param_arena_preserves_ids_across_round_trip() {
+        let mut ctx = Context::new();
+        let function = ctx.anon_function();
+        let block = BasicBlock::make(&mut ctx, function).id;
+        let first = BasicBlock::from_id_mut(&mut ctx, block).push_param(8).id;
+        let removed = BasicBlock::from_id_mut(&mut ctx, block).push_param(8).id;
+        let last = BasicBlock::from_id_mut(&mut ctx, block).push_param(8).id;
+
+        ctx.block_mut(block).params.remove(1);
+        ctx.block_param_mut(last).index = 1;
+        ctx.remove_block_param(removed);
+
+        let physical_order: Vec<_> = ctx.bodies[function]
+            .params
+            .iter()
+            .map(|param| param.id)
+            .collect();
+        assert_eq!(physical_order, vec![first.local, last.local]);
+        assert_eq!(ctx.block_param(first).index, 0);
+        assert_eq!(ctx.block_param(last).index, 1);
+
+        let config = bincode::config::standard();
+        let bytes = bincode::serde::encode_to_vec(&ctx, config).expect("encode");
+        let (mut restored, _): (Context<'static>, usize) =
+            bincode::serde::decode_from_slice(&bytes, config).expect("decode");
+
+        assert!(!restored.contains_block_param(removed));
+        assert_eq!(
+            restored.bodies[function]
+                .params
+                .iter()
+                .map(|param| param.id)
+                .collect::<Vec<_>>(),
+            physical_order,
+        );
+        assert!(restored.contains_block_param(first));
+        assert!(restored.contains_block_param(last));
+
+        let fresh = BasicBlock::from_id_mut(&mut restored, block)
+            .push_param(8)
+            .id;
+        assert!(fresh.local > last.local);
+        assert_ne!(fresh, removed, "removed parameter IDs must never be reused");
     }
 
     #[test]

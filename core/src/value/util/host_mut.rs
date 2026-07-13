@@ -181,6 +181,13 @@ impl<'a, 'str> PassBacking<'a, 'str> {
         &mut self.function_mut(id.func).params[id.local]
     }
 
+    /// Physically removes a block parameter and its local bookkeeping.
+    /// Positional block and edge-argument rewrites belong to the caller and may
+    /// complete later in the same transformation.
+    pub fn remove_block_param(&mut self, id: BlockParamId) {
+        self.function_mut(id.func).remove_block_param(id);
+    }
+
     // ---- births -------------------------------------------------------------
 
     pub fn push_edge(&mut self, func: FunctionId, edge: EdgeData) -> EdgeId {
@@ -452,10 +459,7 @@ impl<'a, 'str> PassBacking<'a, 'str> {
             .map(|&local| BlockParamId::new(block.func, local))
             .collect();
         for param in params {
-            self.function_mut(param.func)
-                .users
-                .remove(&ValueId::BlockParam(param).strip_func());
-            self.block_param_mut(param).clear_parent();
+            self.remove_block_param(param);
         }
         self.unroster_block(block);
         let b = self.block_mut(block);

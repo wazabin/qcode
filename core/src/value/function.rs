@@ -105,7 +105,7 @@ pub struct FunctionBody<'str> {
     pub(crate) roster: Vec<LocalBlockId>,
 
     /// Block-parameter storage for this function.
-    pub(crate) params: Registry<LocalParamId, BlockParam<'str>>,
+    pub(crate) params: StableArena<LocalParamId, BlockParam<'str>>,
 
     /// CFG-edge storage for this function. Keyed by the plain body-local
     /// [`EdgeId`](crate::value::block::EdgeId) (stage 4).
@@ -240,22 +240,13 @@ impl<'str> FunctionBody<'str> {
     /// Reports the current arena footprint and logical liveness.
     pub fn arena_stats(&self) -> BodyArenaStats {
         let live_blocks = self.blocks.iter().filter(|block| !block.deleted).count();
-        let live_params = self
-            .params
-            .iter()
-            .filter(|param| param.parent_id().is_some())
-            .count();
-
         BodyArenaStats {
             instructions: BodyArenaKindStats::stable_arena(&self.insns),
             blocks: BodyArenaKindStats::registry::<BasicBlock<'str>>(
                 self.blocks.len(),
                 live_blocks,
             ),
-            params: BodyArenaKindStats::registry::<BlockParam<'str>>(
-                self.params.len(),
-                live_params,
-            ),
+            params: BodyArenaKindStats::stable_arena(&self.params),
             edges: BodyArenaKindStats::stable_arena(&self.edges),
         }
     }
@@ -322,7 +313,7 @@ impl<'str> FunctionBody<'str> {
             insns: StableArena::default(),
             blocks: Registry::default(),
             roster: Vec::new(),
-            params: Registry::default(),
+            params: StableArena::default(),
             edges: StableArena::default(),
             instruction_addrs: BTreeSet::new(),
             names: crate::context::NameTable::default(),
@@ -439,6 +430,29 @@ impl<'str> FunctionBody<'str> {
             "block parameter belongs to another function"
         );
         &mut self.params[id.local]
+    }
+
+    /// Whether `id` currently names a live block-parameter payload in this body.
+    pub fn contains_block_param(&self, id: BlockParamId) -> bool {
+        id.func == self.id && self.params.contains(id.local)
+    }
+
+    /// Physically removes a block parameter and its local bookkeeping.
+    /// Positional block and edge-argument rewrites belong to the caller. Those
+    /// rewrites may occur later in the same transformation, so outstanding uses
+    /// are allowed while the transformation is in progress.
+    pub fn remove_block_param(&mut self, id: BlockParamId) {
+        assert!(
+            self.contains_block_param(id),
+            "cannot remove stale param {id:?}"
+        );
+        let key = ValueId::BlockParam(id).strip_func();
+        let name = self.params[id.local].name.clone();
+        if let Some(name) = name {
+            self.names.forget(name.as_ref());
+        }
+        self.users.remove(&key);
+        self.params.remove(id.local);
     }
     /// The CFG edge `id`, by its function-local index.
     pub fn edge(&self, id: EdgeId) -> &EdgeData {
@@ -723,8 +737,7 @@ impl<'str> FunctionBody<'str> {
             .map(|&local| BlockParamId::new(self.id, local))
             .collect();
         for param in params {
-            self.users.remove(&ValueId::BlockParam(param).strip_func());
-            self.block_param_mut(param).clear_parent();
+            self.remove_block_param(param);
         }
         self.unroster_block(block);
         let b = self.block_mut(block);

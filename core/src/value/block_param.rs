@@ -45,8 +45,8 @@ pub struct BlockParam<'str> {
 
     /// The block this parameter belongs to. `pub(crate)` (in-crate struct
     /// construction only): foreign crates read via [`BlockParam::parent_id`] and
-    /// write via [`BlockParam::set_parent`] / [`BlockParam::clear_parent`]
-    /// (stage 6a §11 — full-private pends a cross-module constructor).
+    /// write via [`BlockParam::set_parent`] (stage 6a §11 — full-private pends a
+    /// cross-module constructor).
     pub(crate) parent: Option<LocalBlockId>,
 
     /// Optional debug name (displayed as `%name`).
@@ -128,12 +128,6 @@ impl<'str> BlockParam<'str> {
     /// Attach this parameter to `block` (raw `&mut BlockParam` accessor).
     pub fn set_parent(&mut self, block: LocalBlockId) {
         self.parent = Some(block);
-    }
-
-    /// Detach this parameter from its owning block (raw `&mut BlockParam`
-    /// accessor). Routing target for the raw `.parent = None` field writes.
-    pub fn clear_parent(&mut self) {
-        self.parent = None;
     }
 
     /// The source value this parameter was created to promote, if recorded (raw

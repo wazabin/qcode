@@ -643,10 +643,11 @@ pub(crate) fn remove_params_from_block_generic<'str>(
 ) {
     let params = host.read_host().block(block).params.clone();
     let mut kept = Vec::with_capacity(params.len());
+    let mut removed = Vec::new();
     for (i, &local) in params.iter().enumerate() {
         let p = BlockParamId::new(block.func, local);
         if dead_indices.contains(&i) {
-            host.block_param_mut(p).clear_parent();
+            removed.push(p);
         } else {
             host.block_param_mut(p).index = kept.len();
             kept.push(local);
@@ -695,6 +696,9 @@ pub(crate) fn remove_params_from_block_generic<'str>(
         };
         host.replace_instruction_mnemonic(term_id, new);
     }
+    for param in removed {
+        host.remove_block_param(param);
+    }
 }
 
 /// Host-generic core of [`remove_params_from_block`]; see that function.
@@ -707,10 +711,11 @@ pub(crate) fn remove_params_from_block_host<'a, 'str>(
 ) {
     let params = cx.read_host(body).block(block).params.clone();
     let mut kept = Vec::with_capacity(params.len());
+    let mut removed = Vec::new();
     for (i, &local) in params.iter().enumerate() {
         let p = BlockParamId::new(block.func, local);
         if dead_indices.contains(&i) {
-            body.block_param_mut(p).clear_parent();
+            removed.push(p);
         } else {
             body.block_param_mut(p).index = kept.len();
             kept.push(local);
@@ -760,6 +765,9 @@ pub(crate) fn remove_params_from_block_host<'a, 'str>(
         };
         body.replace_instruction_mnemonic(term_id, new);
     }
+    for param in removed {
+        body.remove_block_param(param);
+    }
 }
 
 /// Return `args` with the entries at `drop` positions removed.
@@ -781,10 +789,11 @@ pub(crate) fn remove_params_from_block_c<'str>(
 ) {
     let params = host.read_host().block(block).params.clone();
     let mut kept = Vec::with_capacity(params.len());
+    let mut removed = Vec::new();
     for (i, &local) in params.iter().enumerate() {
         let p = BlockParamId::new(block.func, local);
         if dead_indices.contains(&i) {
-            host.block_param_mut(p).clear_parent();
+            removed.push(p);
         } else {
             host.block_param_mut(p).index = kept.len();
             kept.push(local);
@@ -828,6 +837,9 @@ pub(crate) fn remove_params_from_block_c<'str>(
             _ => continue,
         };
         host.replace_instruction_mnemonic(term_id, new);
+    }
+    for param in removed {
+        host.remove_block_param(param);
     }
 }
 
