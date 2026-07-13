@@ -145,6 +145,64 @@ pub struct FunctionBody<'str> {
     pub(crate) users: FxHashMap<LocalValueId, Vec<LocalInsnId>>,
 }
 
+/// Aggregate storage statistics for one kind of function-body entity.
+///
+/// `structural_bytes` counts the payload capacity reserved by the current body
+/// arenas. It deliberately excludes allocations owned by payload fields (for
+/// example mnemonic operands and block vectors); the Stage 7 probe measures
+/// those with allocator accounting in a separate process.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct BodyArenaKindStats {
+    pub issued: usize,
+    pub live: usize,
+    pub dead: usize,
+    pub capacity: usize,
+    pub structural_bytes: usize,
+}
+
+/// Aggregate statistics for all four append-only arenas across function bodies.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct BodyArenaStats {
+    pub instructions: BodyArenaKindStats,
+    pub blocks: BodyArenaKindStats,
+    pub params: BodyArenaKindStats,
+    pub edges: BodyArenaKindStats,
+}
+
+impl BodyArenaKindStats {
+    fn registry<T>(issued: usize, live: usize) -> Self {
+        // Registry allocates complete power-of-two chunks: 1, 2, 4, ... .
+        let capacity = issued
+            .checked_add(1)
+            .and_then(usize::checked_next_power_of_two)
+            .map_or(0, |next| next - 1);
+        Self {
+            issued,
+            live,
+            dead: issued - live,
+            capacity,
+            structural_bytes: capacity.saturating_mul(std::mem::size_of::<T>()),
+        }
+    }
+
+    fn add_assign(&mut self, other: Self) {
+        self.issued += other.issued;
+        self.live += other.live;
+        self.dead += other.dead;
+        self.capacity += other.capacity;
+        self.structural_bytes += other.structural_bytes;
+    }
+}
+
+impl BodyArenaStats {
+    pub(crate) fn add_assign(&mut self, other: Self) {
+        self.instructions.add_assign(other.instructions);
+        self.blocks.add_assign(other.blocks);
+        self.params.add_assign(other.params);
+        self.edges.add_assign(other.edges);
+    }
+}
+
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum FunctionKind {
     #[default]
@@ -166,6 +224,40 @@ impl<'str> FunctionInterface<'str> {
 }
 
 impl<'str> FunctionBody<'str> {
+    /// Reports the current append-only arena footprint and logical liveness.
+    pub fn arena_stats(&self) -> BodyArenaStats {
+        let live_instructions = self.insns.iter().filter(|insn| !insn.deleted).count();
+        let live_blocks = self.blocks.iter().filter(|block| !block.deleted).count();
+        let live_params = self
+            .params
+            .iter()
+            .filter(|param| param.parent_id().is_some())
+            .count();
+
+        // Removed edges retain payloads but are unlinked from block adjacency.
+        // Count the union because each ordinary edge is incident to two blocks.
+        let mut live_edges = rustc_hash::FxHashSet::default();
+        for block in self.blocks.iter().filter(|block| !block.deleted) {
+            live_edges.extend(block.edges.iter().copied());
+        }
+
+        BodyArenaStats {
+            instructions: BodyArenaKindStats::registry::<Instruction<'str>>(
+                self.insns.len(),
+                live_instructions,
+            ),
+            blocks: BodyArenaKindStats::registry::<BasicBlock<'str>>(
+                self.blocks.len(),
+                live_blocks,
+            ),
+            params: BodyArenaKindStats::registry::<BlockParam<'str>>(
+                self.params.len(),
+                live_params,
+            ),
+            edges: BodyArenaKindStats::registry::<EdgeData>(self.edges.len(), live_edges.len()),
+        }
+    }
+
     /// Rebind the temporary ambient function ID used while constructing a
     /// detached body to its installed registry ID.
     ///

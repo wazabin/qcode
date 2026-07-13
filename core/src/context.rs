@@ -680,6 +680,19 @@ impl<'str> Context<'str> {
         (total, dead)
     }
 
+    /// Aggregate issued/live/dead and structural capacity for every body arena.
+    ///
+    /// This is the stable reporting surface used by the Stage 7 before/after
+    /// probe. Keeping the aggregation here avoids exposing arena internals to
+    /// measurement binaries.
+    pub fn body_arena_stats(&self) -> crate::value::BodyArenaStats {
+        let mut total = crate::value::BodyArenaStats::default();
+        for body in self.bodies.iter() {
+            total.add_assign(body.arena_stats());
+        }
+        total
+    }
+
     /// Iterates over all the (live) instructions in the context.
     pub fn instructions(&self) -> impl Iterator<Item = InstructionRef<'str, '_>> + '_ {
         self.instruction_ids()

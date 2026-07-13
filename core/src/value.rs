@@ -95,7 +95,8 @@ pub use bytes::{
     render_bytes_literal,
 };
 pub use function::{
-    FunctionBody, FunctionId, FunctionKind, FunctionMutRef, FunctionRef, ParamAttrs,
+    BodyArenaKindStats, BodyArenaStats, FunctionBody, FunctionId, FunctionKind, FunctionMutRef,
+    FunctionRef, ParamAttrs,
 };
 pub use insn::LocalInsnId;
 pub use insn::{Instruction, InstructionId, InstructionRef};
