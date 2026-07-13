@@ -99,6 +99,7 @@
 //! [`Context::new`]:            crate::context::Context::new
 //! [`Builder`]:                 crate::builder::Builder
 
+pub mod address_index;
 pub mod assumption;
 pub mod builder;
 pub mod context;
