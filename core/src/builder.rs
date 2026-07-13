@@ -1940,6 +1940,34 @@ impl<'str, 'ctx> Builder<'str, 'ctx, &'ctx mut Context<'str>> {
         builder
     }
 
+    /// Indexed construction variant of [`from_context`](Self::from_context).
+    pub fn from_context_indexed<'m>(
+        ctx: &'m mut Context<'str>,
+        addresses: &mut crate::address_index::AddressIndex,
+        address: u64,
+    ) -> Builder<'str, 'm> {
+        use crate::address_index::AddressTarget;
+
+        let block_id = match addresses.get(address) {
+            Some(AddressTarget::Function(function)) => {
+                match FunctionBody::from_id(ctx, function).root() {
+                    Some(root) => root.id,
+                    None => ctx.get_or_make_block_indexed(addresses, address, function),
+                }
+            }
+            Some(AddressTarget::Block(block)) => block,
+            None => {
+                let function = FunctionBody::make(ctx, Cow::Owned(format!("blk_{address:x}")))
+                    .expect("anon host function")
+                    .id;
+                ctx.get_or_make_block_indexed(addresses, address, function)
+            }
+        };
+        let mut builder = Builder::from_block(BasicBlock::from_id_mut(ctx, block_id));
+        builder.set_address(address);
+        builder
+    }
+
     fn ensure_created_block_in_function(&mut self, block: BlockId) {
         if let Some(mut function) = self.block.parent_mut() {
             function.add_block(block);
@@ -1955,6 +1983,23 @@ impl<'str, 'ctx> Builder<'str, 'ctx, &'ctx mut Context<'str>> {
             self.ensure_created_block_in_function(id);
         }
 
+        id
+    }
+
+    /// Indexed construction variant of
+    /// [`get_or_make_block`](Self::get_or_make_block).
+    pub fn get_or_make_block_indexed(
+        &mut self,
+        addresses: &mut crate::address_index::AddressIndex,
+        addr: u64,
+    ) -> BlockId {
+        let function = self.block.id.func;
+        let id = self
+            .context_mut()
+            .get_or_make_block_indexed(addresses, addr, function);
+        if BasicBlock::from_id(self.context(), id).parent().is_none() {
+            self.ensure_created_block_in_function(id);
+        }
         id
     }
 

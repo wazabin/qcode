@@ -16,6 +16,7 @@ use std::borrow::Cow;
 use std::collections::HashMap;
 
 use crate::{
+    address_index::{AddressIndex, AddressTarget},
     builder::Builder,
     context::Context,
     types::AggregateField,
@@ -90,11 +91,19 @@ pub fn lower_program_with_externals(
 ) -> Result<Symbols, String> {
     let mut symbols = Symbols::default();
     register_structs(ctx, &program.structs);
+    let mut addresses = AddressIndex::analyze(ctx);
 
     match &program.kind {
         ProgramKind::Statements(statements) => {
             let mut locals = HashMap::new();
-            lower_statement_block(ctx, statements, &mut locals, &mut symbols, &externals)?;
+            lower_statement_block(
+                ctx,
+                &mut addresses,
+                statements,
+                &mut locals,
+                &mut symbols,
+                &externals,
+            )?;
         }
         ProgramKind::Functions { varnodes, fns } => {
             let mut globals = HashMap::new();
@@ -118,7 +127,15 @@ pub fn lower_program_with_externals(
             }
             for fn_decl in fns {
                 let fid = symbols.functions[&fn_decl.name];
-                lower_fn_body(ctx, fid, fn_decl, &globals, &mut symbols, &externals)?;
+                lower_fn_body(
+                    ctx,
+                    &mut addresses,
+                    fid,
+                    fn_decl,
+                    &globals,
+                    &mut symbols,
+                    &externals,
+                )?;
             }
         }
     }
@@ -203,6 +220,7 @@ fn collect_block_param_names(statements: &[Statement]) -> HashMap<String, Vec<St
 
 fn lower_fn_body(
     ctx: &mut Context,
+    addresses: &mut AddressIndex,
     fid: FunctionId,
     fn_decl: &FnDecl,
     globals: &HashMap<String, Local>,
@@ -240,13 +258,14 @@ fn lower_fn_body(
     create_blocks_and_params(ctx, statements, Some(fid), &entry, &mut block_ids, symbols);
 
     lower_body(
-        ctx, statements, &entry, &block_ids, globals, symbols, externals,
+        ctx, addresses, statements, &entry, &block_ids, globals, symbols, externals,
     )
 }
 
 /// Statement-mode program: no enclosing function; the first label is the entry.
 fn lower_statement_block(
     ctx: &mut Context,
+    addresses: &mut AddressIndex,
     statements: &[Statement],
     globals: &mut HashMap<String, Local>,
     symbols: &mut Symbols,
@@ -287,7 +306,9 @@ fn lower_statement_block(
     let host = ctx.anon_function();
     create_blocks_and_params(ctx, body, Some(host), "", &mut block_ids, symbols);
 
-    lower_body(ctx, body, &entry, &block_ids, globals, symbols, externals)
+    lower_body(
+        ctx, addresses, body, &entry, &block_ids, globals, symbols, externals,
+    )
 }
 
 /// Pre-creates all named blocks (except `skip_entry`, already made) and their
@@ -333,8 +354,10 @@ fn create_blocks_and_params(
     }
 }
 
+#[allow(clippy::too_many_arguments)] // Explicit construction index stays operation-scoped.
 fn lower_body(
     ctx: &mut Context,
+    addresses: &mut AddressIndex,
     statements: &[Statement],
     entry: &str,
     block_ids: &HashMap<String, BlockId>,
@@ -362,6 +385,7 @@ fn lower_body(
     let mut b = Builder::from_block(BasicBlock::from_id_mut(ctx, entry_id));
     let mut lw = Lowerer {
         b: &mut b,
+        addresses,
         locals: &mut locals,
         block_ids,
         block_param_names: &block_param_names,
@@ -376,6 +400,7 @@ fn lower_body(
 
 struct Lowerer<'a, 'str, 'ctx> {
     b: &'a mut Builder<'str, 'ctx>,
+    addresses: &'a mut AddressIndex,
     locals: &'a mut HashMap<String, Local>,
     block_ids: &'a HashMap<String, BlockId>,
     block_param_names: &'a HashMap<String, Vec<String>>,
@@ -393,11 +418,10 @@ impl Lowerer<'_, '_, '_> {
                 .ok_or_else(|| format!("unknown block <{name}>"))?,
             Label::Address { value, .. } => {
                 let current = self.b.current_block().func;
-                let foreign = match self.b.context().get_at_addr(value) {
-                    Some(ValueId::Function(owner)) if owner != current => Some(owner),
-                    _ => BasicBlock::from_addr(self.b.context(), *value)
-                        .map(|block| block.id.func)
-                        .filter(|&owner| owner != current),
+                let foreign = match self.addresses.get(*value) {
+                    Some(AddressTarget::Function(owner)) if owner != current => Some(owner),
+                    Some(AddressTarget::Block(block)) if block.func != current => Some(block.func),
+                    _ => None,
                 };
                 if let Some(owner) = foreign {
                     return Err(format!(
@@ -406,7 +430,7 @@ impl Lowerer<'_, '_, '_> {
                          call/tail call, not a foreign block target",
                     ));
                 }
-                self.b.get_or_make_block(*value)
+                self.b.get_or_make_block_indexed(self.addresses, *value)
             }
         };
         // Strict IR locality (context-split ruling 2): a control-flow target must
@@ -511,7 +535,7 @@ impl Lowerer<'_, '_, '_> {
                 label: Label::Address { value, .. },
                 ..
             } => {
-                let blk = self.b.get_or_make_block(*value);
+                let blk = self.b.get_or_make_block_indexed(self.addresses, *value);
                 self.b.switch_to_block(blk);
             }
 

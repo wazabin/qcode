@@ -8,7 +8,8 @@ use rustc_hash::FxHashMap;
 
 use crate::{
     context::Context,
-    value::{BlockId, FunctionId},
+    error::{Error, ErrorTy, Result},
+    value::{BlockId, FunctionBody, FunctionId, ValueId},
 };
 
 /// A live module entity selected by a machine address.
@@ -55,6 +56,48 @@ impl AddressIndex {
         Self { targets }
     }
 
+    /// Recomputes this index after a structural mutation that changes several
+    /// addresses at once (for example function splitting or block rehoming).
+    pub fn refresh(&mut self, ctx: &Context<'_>) {
+        *self = Self::analyze(ctx);
+    }
+
+    /// Registers one address-bearing entity during module construction.
+    ///
+    /// A function and one of its own blocks may intentionally share an entry
+    /// address; the function remains the indexed target and the block becomes
+    /// its root. Every other collision is rejected.
+    pub fn register(
+        &mut self,
+        ctx: &mut Context<'_>,
+        address: u64,
+        target: AddressTarget,
+    ) -> Result<()> {
+        let Some(existing) = self.targets.get(&address).copied() else {
+            self.targets.insert(address, target);
+            return Ok(());
+        };
+        if existing == target {
+            return Ok(());
+        }
+
+        match (existing, target) {
+            (AddressTarget::Function(function), AddressTarget::Block(block))
+            | (AddressTarget::Block(block), AddressTarget::Function(function))
+                if block.func == function =>
+            {
+                FunctionBody::from_id_mut(ctx, function).ensure_root(block)?;
+                self.targets
+                    .insert(address, AddressTarget::Function(function));
+                Ok(())
+            }
+            _ => Err(Error::spanless(ErrorTy::DuplicateAddress(
+                address,
+                existing.into(),
+            ))),
+        }
+    }
+
     /// Returns the live target registered at `address` in this snapshot.
     pub fn get(&self, address: u64) -> Option<AddressTarget> {
         self.targets.get(&address).copied()
@@ -87,6 +130,15 @@ impl AddressIndex {
     }
 }
 
+impl From<AddressTarget> for ValueId {
+    fn from(target: AddressTarget) -> Self {
+        match target {
+            AddressTarget::Function(id) => id.into(),
+            AddressTarget::Block(id) => id.into(),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -95,10 +147,12 @@ mod tests {
     #[test]
     fn function_wins_its_entry_block_collision() {
         let mut ctx = Context::new();
-        let function = FunctionBody::make_at_addr(&mut ctx, 0x1000, None).id;
-        let root = BasicBlock::make(&mut ctx, function).with_address(0x1000).id;
+        let mut index = AddressIndex::analyze(&ctx);
+        let function = FunctionBody::make_at_addr_indexed(&mut ctx, &mut index, 0x1000, None).id;
+        let root = BasicBlock::make(&mut ctx, function)
+            .with_address_indexed(&mut index, 0x1000)
+            .id;
 
-        let index = AddressIndex::analyze(&ctx);
         assert_eq!(index.get(0x1000), Some(AddressTarget::Function(function)));
         assert_eq!(index.function_at(0x1000), Some(function));
         assert_eq!(index.block_at(0x1000), None);
@@ -108,13 +162,16 @@ mod tests {
     #[test]
     fn indexes_primary_and_extra_block_addresses() {
         let mut ctx = Context::new();
+        let mut index = AddressIndex::analyze(&ctx);
         let function = ctx.anon_function();
-        let block = BasicBlock::make(&mut ctx, function).with_address(0x2000).id;
+        let block = BasicBlock::make(&mut ctx, function)
+            .with_address_indexed(&mut index, 0x2000)
+            .id;
         ctx.block_mut(block)
             .extra_addresses
             .extend([0x2001, 0x2002]);
 
-        let index = AddressIndex::analyze(&ctx);
+        index.refresh(&ctx);
         assert_eq!(index.block_at(0x2000), Some(block));
         assert_eq!(index.block_at(0x2001), Some(block));
         assert_eq!(index.block_at(0x2002), Some(block));
@@ -124,11 +181,14 @@ mod tests {
     #[test]
     fn excludes_deleted_body_shape() {
         let mut ctx = Context::new();
+        let mut index = AddressIndex::analyze(&ctx);
         let function = ctx.anon_function();
-        let block = BasicBlock::make(&mut ctx, function).with_address(0x3000).id;
+        let block = BasicBlock::make(&mut ctx, function)
+            .with_address_indexed(&mut index, 0x3000)
+            .id;
         ctx.delete_block(block, function);
 
-        let index = AddressIndex::analyze(&ctx);
+        index.refresh(&ctx);
         assert_eq!(index.get(0x3000), None);
         assert!(index.is_empty());
     }

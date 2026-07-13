@@ -614,6 +614,46 @@ impl<'str> Context<'str> {
         }
     }
 
+    /// Indexed construction variant of [`get_or_make_block`](Self::get_or_make_block).
+    /// The caller owns `addresses` for the duration of its lifting/lowering
+    /// operation and threads it through every address-bearing mutation.
+    pub fn get_or_make_block_indexed(
+        &mut self,
+        addresses: &mut crate::address_index::AddressIndex,
+        addr: u64,
+        func: FunctionId,
+    ) -> BlockId {
+        use crate::address_index::AddressTarget;
+
+        if let Some(AddressTarget::Function(owner)) = addresses.get(addr) {
+            assert_eq!(
+                owner, func,
+                "cannot create a block at an address owned by another function"
+            );
+        }
+        let existing = match addresses.get(addr) {
+            Some(AddressTarget::Block(block)) => Some(block),
+            Some(AddressTarget::Function(function)) => FunctionBody::from_id(self, function)
+                .root()
+                .map(|root| root.id),
+            None => None,
+        };
+        match existing {
+            Some(block) => {
+                assert_eq!(
+                    block.func, func,
+                    "cannot reuse a block stored in another function arena"
+                );
+                block
+            }
+            None => {
+                BasicBlock::make(self, func)
+                    .with_address_indexed(addresses, addr)
+                    .id
+            }
+        }
+    }
+
     /// The forced rendering mode for a `Bytes` blob, or
     /// [`BytesDisplay::Auto`](crate::value::BytesDisplay::Auto) if unset.
     pub fn bytes_display(&self, id: crate::value::BytesId) -> crate::value::BytesDisplay {
@@ -2124,6 +2164,21 @@ impl<'str> Context<'str> {
         } else {
             Ok(())
         }
+    }
+
+    /// Registers an address in a caller-owned construction index.
+    pub(crate) fn set_address_indexed(
+        &mut self,
+        addresses: &mut crate::address_index::AddressIndex,
+        addr: u64,
+        id: ValueId,
+    ) -> crate::error::Result<()> {
+        let target = match id {
+            ValueId::Function(id) => crate::address_index::AddressTarget::Function(id),
+            ValueId::BasicBlock(id) => crate::address_index::AddressTarget::Block(id),
+            _ => unreachable!("only functions and blocks have module addresses"),
+        };
+        addresses.register(self, addr, target)
     }
 
     /// Changes the name of a value, in the name table that owns its kind

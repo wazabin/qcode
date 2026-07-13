@@ -775,6 +775,17 @@ impl<'str, 'ctx> BlockMutRef<'str, 'ctx> {
         self
     }
 
+    /// Indexed construction variant of [`with_address`](Self::with_address).
+    pub fn with_address_indexed(
+        mut self,
+        addresses: &mut crate::address_index::AddressIndex,
+        addr: u64,
+    ) -> Self {
+        self.set_address_indexed(addresses, addr)
+            .expect("address is already mapped to a value");
+        self
+    }
+
     #[allow(unused_mut)]
     pub fn in_function(mut self, fun_id: FunctionId) -> Self {
         FunctionBody::from_id_mut(self.ctx, fun_id).add_block(self.id);
@@ -912,6 +923,31 @@ impl<'str, 'ctx> BlockMutRef<'str, 'ctx> {
             self.rename(label)?;
         }
 
+        Ok(())
+    }
+
+    /// Assigns an address through a caller-owned construction index.
+    pub fn set_address_indexed(
+        &mut self,
+        addresses: &mut crate::address_index::AddressIndex,
+        addr: u64,
+    ) -> Result<()> {
+        let old_address = self.inner().address;
+        self.inner_mut().address = Some(addr);
+        if let Err(error) = self
+            .ctx
+            .set_address_indexed(addresses, addr, self.id.into())
+        {
+            self.inner_mut().address = old_address;
+            return Err(error);
+        }
+
+        if self.name().is_none() {
+            let label = self
+                .ctx
+                .get_unique_name_in(self.id.func, Cow::Owned(format!("{addr:x}")));
+            self.rename(label)?;
+        }
         Ok(())
     }
 }

@@ -25,6 +25,7 @@
 //! addresses "close to" one another to recover the size heuristically.
 
 use qcode::{
+    address_index::AddressIndex,
     assumption::Proposition,
     builder::Builder,
     context::Context,
@@ -100,9 +101,10 @@ impl Pass for HandleJumpTables {
             .filter(|f| !ctx.is_function_ignored(f.address()))
             .map(|f| f.id)
             .collect();
+        let mut addresses = AddressIndex::analyze(ctx);
         let mut changed = false;
         for fun_id in fun_ids {
-            changed |= Self::resolve_function(ctx, fun_id)?;
+            changed |= Self::resolve_function_indexed(ctx, &mut addresses, fun_id)?;
         }
         Ok(changed)
     }
@@ -113,7 +115,20 @@ impl HandleJumpTables {
     /// indirect branch to its recovered CFG successors. Returns whether the IR
     /// changed. This is the body that ran once per function while the pass was a
     /// `FunctionPass`.
+    #[cfg(test)]
     fn resolve_function(ctx: &mut Context, fun_id: FunctionId) -> Result<bool, String> {
+        let mut addresses = AddressIndex::analyze(ctx);
+        Self::resolve_function_indexed(ctx, &mut addresses, fun_id)
+    }
+
+    /// Indexed implementation shared by the whole-module pass and focused
+    /// single-function tests. The caller owns one construction index for the
+    /// complete topology-mutation operation.
+    fn resolve_function_indexed(
+        ctx: &mut Context,
+        addresses: &mut AddressIndex,
+        fun_id: FunctionId,
+    ) -> Result<bool, String> {
         let function = FunctionBody::from_id(ctx, fun_id);
 
         // Nothing resolves in a function with no indirect branch. The vast majority
@@ -220,7 +235,8 @@ impl HandleJumpTables {
                 // (strict IR locality); a mid-function landing is split off inside
                 // `resolve_local_target`. The `BranchInd` keeps its indirect form and
                 // the resolution is recorded for disassembly via `discover`.
-                if let LocalTarget::Local(tb) = resolve_local_target(ctx, target, fun_id) {
+                if let LocalTarget::Local(tb) = resolve_local_target(ctx, addresses, target, fun_id)
+                {
                     ctx.add_cfg_edge(from, tb);
                 }
                 discover(ctx, fn_entry, from_addr, target);
@@ -231,7 +247,7 @@ impl HandleJumpTables {
         // unconditional jump. Replace `BranchInd` with a direct `Branch`.
         for MakeBranch { from, target } in single_branches {
             let from_addr = BasicBlock::from_id(ctx, from).address();
-            let resolved = resolve_local_target(ctx, target, fun_id);
+            let resolved = resolve_local_target(ctx, addresses, target, fun_id);
             clear_successors(ctx, from);
             let mut block = BasicBlock::from_id_mut(ctx, from);
             block.pop_insn();
@@ -261,8 +277,8 @@ impl HandleJumpTables {
             // Each arm is materialized as an intra-function block: the resolved
             // target, or a trampoline tail-calling a foreign function (strict IR
             // locality — a `CBranch` arm is never a foreign block reference).
-            let true_target_resolved = resolve_local_target(ctx, true_target, fun_id);
-            let false_target_resolved = resolve_local_target(ctx, false_target, fun_id);
+            let true_target_resolved = resolve_local_target(ctx, addresses, true_target, fun_id);
+            let false_target_resolved = resolve_local_target(ctx, addresses, false_target, fun_id);
             let true_block = arm_block(ctx, fun_id, true_target_resolved);
             let false_block = arm_block(ctx, fun_id, false_target_resolved);
             discover(ctx, fn_entry, from_addr, true_target);
@@ -298,16 +314,23 @@ enum LocalTarget {
     Foreign(FunctionId),
 }
 
-fn resolve_local_target(ctx: &mut Context, addr: u64, fun_id: FunctionId) -> LocalTarget {
-    let tb = ctx.get_or_make_block(addr, fun_id);
+fn resolve_local_target(
+    ctx: &mut Context,
+    addresses: &mut AddressIndex,
+    addr: u64,
+    fun_id: FunctionId,
+) -> LocalTarget {
+    let tb = ctx.get_or_make_block_indexed(addresses, addr, fun_id);
     match BasicBlock::from_id(ctx, tb).parent().map(|f| f.id) {
         Some(owner) if owner != fun_id => {
-            let is_entry =
-                FunctionBody::from_addr(ctx, addr).and_then(|f| f.root().map(|r| r.id)) == Some(tb);
+            let is_entry = addresses.function_at(addr) == Some(owner)
+                && FunctionBody::from_id(ctx, owner).root().map(|root| root.id) == Some(tb);
             let g = if is_entry {
                 owner
             } else {
-                ctx.split_function_at(tb)
+                let split = ctx.split_function_at(tb);
+                addresses.refresh(ctx);
+                split
             };
             LocalTarget::Foreign(g)
         }
@@ -771,8 +794,9 @@ mod tests {
 
         // The dispatch block gained one successor per case target.
         assert_eq!(successor_count(&ctx, disp), 3);
+        let addresses = AddressIndex::analyze(&ctx);
         for t in targets {
-            assert!(ctx.get_at_addr(&t).is_some(), "no block created for {t:#x}");
+            assert!(addresses.get(t).is_some(), "no block created for {t:#x}");
         }
         // Each slot read recorded an immutable-memory assumption.
         for i in 0..3u64 {
@@ -821,7 +845,10 @@ mod tests {
 
         // The indirect branch is now a direct jump to the one resolved target.
         assert_eq!(successor_count(&ctx, entry), 1);
-        assert!(ctx.get_at_addr(&0x1100).is_some(), "no block for target");
+        assert!(
+            AddressIndex::analyze(&ctx).get(0x1100).is_some(),
+            "no block for target"
+        );
 
         // The slot read recorded an immutable-memory assumption.
         let prop = Proposition::ImmutableMemory {
@@ -870,8 +897,9 @@ mod tests {
         assert!(changed);
 
         assert_eq!(successor_count(&ctx, disp), 3);
+        let addresses = AddressIndex::analyze(&ctx);
         for t in [0x3100u64, 0x3200, 0x3300] {
-            assert!(ctx.get_at_addr(&t).is_some(), "no block created for {t:#x}");
+            assert!(addresses.get(t).is_some(), "no block created for {t:#x}");
         }
     }
 
@@ -948,7 +976,7 @@ mod tests {
             "expected an unconditional Branch, got {:?}",
             terminator(&ctx, disp),
         );
-        assert!(ctx.get_at_addr(&0x1100).is_some());
+        assert!(AddressIndex::analyze(&ctx).get(0x1100).is_some());
     }
 
     /// Two targets with a zero case lower to `if index != 0` (the common shape).
@@ -1080,8 +1108,9 @@ mod tests {
         // Pre-connect the dispatch block to its targets, mimicking the edges the
         // lifter materializes in the clean IR before this pass re-runs. The targets
         // live in the dispatch's own function (strict IR locality).
+        let mut addresses = AddressIndex::analyze(&ctx);
         for t in targets {
-            let tb = ctx.get_or_make_block(t, fun);
+            let tb = ctx.get_or_make_block_indexed(&mut addresses, t, fun);
             ctx.add_cfg_edge(disp, tb);
         }
         assert_eq!(successor_count(&ctx, disp), 2);

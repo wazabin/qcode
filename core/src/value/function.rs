@@ -913,6 +913,28 @@ impl<'str> FunctionBody<'str> {
             .expect("Function address is not unique")
     }
 
+    /// Indexed construction variant of [`make_at_addr`](Self::make_at_addr).
+    pub fn make_at_addr_indexed<'ctx>(
+        ctx: &'ctx mut Context<'str>,
+        addresses: &mut crate::address_index::AddressIndex,
+        address: u64,
+        name: Option<Cow<'str, str>>,
+    ) -> FunctionMutRef<'str, 'ctx> {
+        let name = name.unwrap_or_else(|| Cow::Owned(format!("fn_{address:x}")));
+        let id = FunctionId::from(ctx.bodies.len());
+        let pushed = ctx.push_function(
+            FunctionInterface::new(name.clone()),
+            FunctionBody::empty_body(id),
+        );
+        debug_assert_eq!(pushed, id);
+
+        Self::from_id_mut(ctx, id)
+            .with_name(name)
+            .expect("Function name is not unique")
+            .with_address_indexed(addresses, address)
+            .expect("Function address is not unique")
+    }
+
     /// Like [`FunctionBody::make_at_addr`] but marks the result as external.
     ///
     /// External functions have no lifted body; the recursive disassembler will
@@ -927,6 +949,18 @@ impl<'str> FunctionBody<'str> {
         f
     }
 
+    /// Indexed construction variant of [`make_external`](Self::make_external).
+    pub fn make_external_indexed<'ctx>(
+        ctx: &'ctx mut Context<'str>,
+        addresses: &mut crate::address_index::AddressIndex,
+        address: u64,
+        name: Option<Cow<'str, str>>,
+    ) -> FunctionMutRef<'str, 'ctx> {
+        let mut function = Self::make_at_addr_indexed(ctx, addresses, address, name);
+        function.interface_mut().is_external = true;
+        function
+    }
+
     /// Returns the [`FunctionId`] for `addr`, creating a named stub if absent.
     pub fn from_addr_or_create<'ctx>(
         ctx: &'ctx mut Context<'str>,
@@ -935,6 +969,19 @@ impl<'str> FunctionBody<'str> {
         match ctx.get_at_addr(&address).and_then(ValueId::as_function) {
             Some(id) => Self::from_id_mut(ctx, id),
             None => Self::make_at_addr(ctx, address, None),
+        }
+    }
+
+    /// Indexed construction variant of
+    /// [`from_addr_or_create`](Self::from_addr_or_create).
+    pub fn from_addr_or_create_indexed<'ctx>(
+        ctx: &'ctx mut Context<'str>,
+        addresses: &mut crate::address_index::AddressIndex,
+        address: u64,
+    ) -> FunctionMutRef<'str, 'ctx> {
+        match addresses.function_at(address) {
+            Some(id) => Self::from_id_mut(ctx, id),
+            None => Self::make_at_addr_indexed(ctx, addresses, address, None),
         }
     }
 }
@@ -1539,6 +1586,32 @@ impl<'str, 'ctx> FunctionMutRef<'str, 'ctx> {
 
     fn with_address(mut self, address: u64) -> Result<Self> {
         self.set_address(address)?;
+        Ok(self)
+    }
+
+    fn set_address_indexed(
+        &mut self,
+        addresses: &mut crate::address_index::AddressIndex,
+        address: u64,
+    ) -> Result<()> {
+        let old_address = self.interface().address;
+        self.interface_mut().address = Some(address);
+        if let Err(error) = self
+            .ctx
+            .set_address_indexed(addresses, address, self.id.into())
+        {
+            self.interface_mut().address = old_address;
+            return Err(error);
+        }
+        Ok(())
+    }
+
+    fn with_address_indexed(
+        mut self,
+        addresses: &mut crate::address_index::AddressIndex,
+        address: u64,
+    ) -> Result<Self> {
+        self.set_address_indexed(addresses, address)?;
         Ok(self)
     }
 
