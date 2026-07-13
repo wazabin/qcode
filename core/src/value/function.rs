@@ -229,6 +229,30 @@ impl<'str> FunctionBody<'str> {
         }
     }
 
+    /// Releases structural capacity retained from peak analysis churn.
+    ///
+    /// Covers the four body arenas plus the block-owned instruction/parameter/
+    /// edge collections, the roster, and the reverse-use map. IDs, liveness,
+    /// ordering, and every semantic invariant are unchanged — this is an
+    /// allocator hint for explicit end-of-mutation boundaries, never a
+    /// correctness barrier.
+    pub fn shrink_to_fit(&mut self) {
+        self.insns.shrink_to_fit();
+        self.blocks.shrink_to_fit();
+        self.params.shrink_to_fit();
+        self.edges.shrink_to_fit();
+        self.roster.shrink_to_fit();
+        for mut block in self.blocks.iter_mut() {
+            block.instructions.shrink_to_fit();
+            block.params.shrink_to_fit();
+            block.edges.shrink_to_fit();
+        }
+        for insns in self.users.values_mut() {
+            insns.shrink_to_fit();
+        }
+        self.users.shrink_to_fit();
+    }
+
     /// Rebind the temporary ambient function ID used while constructing a
     /// detached body to its installed registry ID.
     ///

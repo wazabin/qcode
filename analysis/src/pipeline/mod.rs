@@ -686,6 +686,9 @@ async fn run_analysis_fixpoint<'s>(
         );
 
         if novel == 0 && ctx.violations().is_empty() {
+            // Analysis churn leaves the body arenas at peak capacity; release
+            // the slack once, at convergence, where no further mutation follows.
+            ctx.shrink_bodies_to_fit();
             return Ok(ctx);
         }
         if bounded && round >= MAX_OVERRIDE_ROUNDS {

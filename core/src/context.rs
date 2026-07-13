@@ -718,6 +718,18 @@ impl<'str> Context<'str> {
         total
     }
 
+    /// Releases body-arena capacity retained from peak analysis churn in every
+    /// function (see [`FunctionBody::shrink_to_fit`](crate::value::FunctionBody::shrink_to_fit)).
+    ///
+    /// Purely an allocator hint: IDs, ordering, and rendered IR are unchanged.
+    /// Called once at explicit end-of-mutation boundaries such as pipeline
+    /// convergence; nothing depends on it running.
+    pub fn shrink_bodies_to_fit(&mut self) {
+        for mut body in self.bodies.iter_mut() {
+            body.shrink_to_fit();
+        }
+    }
+
     /// Iterates over all the (live) instructions in the context.
     pub fn instructions(&self) -> impl Iterator<Item = InstructionRef<'str, '_>> + '_ {
         self.instruction_ids()
