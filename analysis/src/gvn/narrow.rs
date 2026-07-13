@@ -491,7 +491,6 @@ mod tests {
         let mba_changed = {
             let mut host = qcode::value::util::host_mut::PassBacking::new(
                 &mut ctx.bodies[mtmul],
-                mtmul,
                 &ctx.shared,
                 &ctx.interfaces,
             );

@@ -54,7 +54,7 @@ pub(crate) fn with_minting<'str, R>(
     let before_targets = ctx.direct_call_targets(fun);
     let (out, minted) = {
         let (bodies, view) = ctx.split(&env);
-        let mut body = FunctionBody::new(fun, &mut bodies[fun]);
+        let mut body = FunctionBody::new(&mut bodies[fun]);
         let mut minted: Vec<Minted<'str>> = Vec::new();
         let out = f(view, &mut body, &mut minted);
         (out, minted)

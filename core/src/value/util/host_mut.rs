@@ -36,7 +36,6 @@ use super::base_ref::HostRef;
 /// function. Those functions go through the sequential (module) path.
 pub struct PassBacking<'a, 'str> {
     pub fun: &'a mut Function<'str>,
-    pub id: FunctionId,
     /// The module's shared IR state, **read-only**. A checked-out function pass
     /// reaches shared data (types, literals, spaces, registers) immutably; it
     /// mints types/literals through the interners' `&self` paths, and mints no
@@ -51,18 +50,18 @@ pub struct PassBacking<'a, 'str> {
 }
 
 impl<'a, 'str> PassBacking<'a, 'str> {
-    /// Wrap `fun` (checked out under `id`) over the module's shared state and
+    /// Wrap `fun` over the module's shared state and
     /// interface registry. Debug-asserts the function owns only self-stored,
     /// self-parented blocks (no reattribution).
     pub fn new(
         fun: &'a mut Function<'str>,
-        id: FunctionId,
         shared: &'a crate::context::Shared<'str>,
         interfaces: &'a jstd::registry::Registry<
             FunctionId,
             crate::value::function::FunctionInterface<'str>,
         >,
     ) -> Self {
+        let id = fun.id();
         assert!(
             fun.roster.iter().all(|&local| {
                 // Stored in this function's own arena, and (if live) parented to it.
@@ -73,7 +72,6 @@ impl<'a, 'str> PassBacking<'a, 'str> {
         );
         Self {
             fun,
-            id,
             shared,
             interfaces,
         }
@@ -82,8 +80,8 @@ impl<'a, 'str> PassBacking<'a, 'str> {
     /// Wrap `fun` (checked out under `id`) over a whole module `&Context` — the
     /// module/test-scope convenience constructor (narrows to the shared state +
     /// interface registry).
-    pub fn from_ctx(fun: &'a mut Function<'str>, id: FunctionId, ctx: &'a Context<'str>) -> Self {
-        Self::new(fun, id, &ctx.shared, &ctx.interfaces)
+    pub fn from_ctx(fun: &'a mut Function<'str>, ctx: &'a Context<'str>) -> Self {
+        Self::new(fun, &ctx.shared, &ctx.interfaces)
     }
 
     /// A shorter-lived `PassBacking` reborrowing this one's exclusive references, so
@@ -92,7 +90,6 @@ impl<'a, 'str> PassBacking<'a, 'str> {
     pub fn reborrow(&mut self) -> PassBacking<'_, 'str> {
         PassBacking {
             fun: &mut *self.fun,
-            id: self.id,
             shared: self.shared,
             interfaces: self.interfaces,
         }
@@ -110,7 +107,8 @@ impl<'a, 'str> PassBacking<'a, 'str> {
     /// The owned function's storage (write). Panics if `f` is not this function.
     pub fn function_mut(&mut self, f: FunctionId) -> &mut Function<'str> {
         assert_eq!(
-            f, self.id,
+            f,
+            self.fun.id(),
             "a checked-out function pass may not mutate another function"
         );
         self.fun
@@ -118,7 +116,8 @@ impl<'a, 'str> PassBacking<'a, 'str> {
     /// The owned function's storage (read).
     pub fn function(&self, f: FunctionId) -> &Function<'str> {
         assert_eq!(
-            f, self.id,
+            f,
+            self.fun.id(),
             "a checked-out function pass may not read another function's arenas mutably"
         );
         self.fun
@@ -135,7 +134,6 @@ impl<'a, 'str> PassBacking<'a, 'str> {
             fun: &*self.fun,
             shared: self.shared,
             interfaces: self.interfaces,
-            id: self.id,
         }
     }
     /// A pass body never touches the global call-site cache; the driver

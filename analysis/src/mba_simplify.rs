@@ -643,7 +643,7 @@ mod tests {
     /// Run [`mba_simplify`] on `fid` over a `PassBacking` borrowing the body in
     /// place — the pass surface is pass-scoped — leaving the rewritten body in `ctx`.
     fn run_mba(ctx: &mut Context, fid: FunctionId) -> bool {
-        let mut host = PassBacking::new(&mut ctx.bodies[fid], fid, &ctx.shared, &ctx.interfaces);
+        let mut host = PassBacking::new(&mut ctx.bodies[fid], &ctx.shared, &ctx.interfaces);
         mba_simplify(&mut host, fid)
     }
 

@@ -191,12 +191,12 @@ impl<'str> BuilderBacking<'str> for PassBacking<'_, 'str> {
             fun: &*self.fun,
             shared: self.shared,
             interfaces: self.interfaces,
-            id: self.id,
         }
     }
     fn bb_function_mut(&mut self, f: FunctionId) -> &mut Function<'str> {
         assert_eq!(
-            f, self.id,
+            f,
+            self.fun.id(),
             "a checked-out function pass may not mutate another function"
         );
         self.fun
@@ -216,10 +216,12 @@ impl<'str> BuilderBacking<'str> for PassBacking<'_, 'str> {
         self.fun.register_local_name(self.shared, id, name, old)
     }
     fn bb_push_insn(&mut self, func: FunctionId, insn: Instruction<'str>) -> InstructionId {
-        self.fun.push_insn(func, insn)
+        assert_eq!(func, self.fun.id());
+        self.fun.push_insn(insn)
     }
     fn bb_push_block(&mut self, func: FunctionId, block: BasicBlock<'str>) -> BlockId {
-        self.fun.push_block(func, block)
+        assert_eq!(func, self.fun.id());
+        self.fun.push_block(block)
     }
     fn bb_add_cfg_edge(&mut self, from: BlockId, to: BlockId) -> EdgeId {
         self.fun.add_cfg_edge(from, to)
@@ -2078,12 +2080,8 @@ mod tests {
         let fid_b = Function::make(&mut ctx_b, "foo".into()).unwrap().id;
         let entry_b = Function::from_id_mut(&mut ctx_b, fid_b).make_root().id;
         {
-            let mut host = PassBacking::new(
-                &mut ctx_b.bodies[fid_b],
-                fid_b,
-                &ctx_b.shared,
-                &ctx_b.interfaces,
-            );
+            let mut host =
+                PassBacking::new(&mut ctx_b.bodies[fid_b], &ctx_b.shared, &ctx_b.interfaces);
             let mut b = Builder::from_block(BaseRef::new(host.reborrow(), entry_b));
             body(&mut b);
         }

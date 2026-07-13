@@ -43,7 +43,6 @@ pub enum HostRef<'a, 'str> {
             FunctionId,
             crate::value::function::FunctionInterface<'str>,
         >,
-        id: FunctionId,
     },
 }
 
@@ -80,7 +79,7 @@ impl<'a, 'str> HostRef<'a, 'str> {
     pub fn function(self, f: FunctionId) -> &'a Function<'str> {
         match self {
             HostRef::Module(c) => &c.bodies[f],
-            HostRef::Checked { fun, id, .. } if f == id => fun,
+            HostRef::Checked { fun, .. } if f == fun.id() => fun,
             HostRef::Checked { .. } => panic!(
                 "foreign function-body read on a checked-out host: other bodies are module-scope only"
             ),

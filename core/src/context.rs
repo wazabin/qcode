@@ -49,7 +49,7 @@ use jstd::registry::{self, Registry};
 /// and space identifiers. When names are owned (e.g. generated names), they
 /// are stored as `Cow::Owned`; when they are borrowed from source data they are
 /// `Cow::Borrowed` and must outlive the context.
-#[derive(Default, Clone, serde::Serialize, serde::Deserialize)]
+#[derive(Default, Clone, serde::Serialize)]
 pub struct Context<'str> {
     /// Module-shared IR state: everything that is **not** per-function interface
     /// or body storage (regimes 1–3 of the context-split design — architecture,
@@ -71,6 +71,41 @@ pub struct Context<'str> {
     /// (leaving an empty body); its [`interface`](Self::interfaces) stays put, so
     /// callers always read the real interface.
     pub bodies: Registry<FunctionId, Function<'str>>,
+}
+
+#[derive(serde::Deserialize)]
+struct ContextWire<'str> {
+    shared: Shared<'str>,
+    #[serde(default)]
+    interfaces: Registry<FunctionId, crate::value::function::FunctionInterface<'str>>,
+    bodies: Registry<FunctionId, Function<'str>>,
+}
+
+impl<'de, 'str> serde::Deserialize<'de> for Context<'str> {
+    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let ContextWire {
+            shared,
+            interfaces,
+            mut bodies,
+        } = ContextWire::deserialize(deserializer)?;
+        if interfaces.len() != bodies.len() {
+            return Err(serde::de::Error::custom(
+                "function body/interface registries drifted",
+            ));
+        }
+        for mut body in bodies.iter_mut() {
+            let id = body.id;
+            body.rehydrate_id(id);
+        }
+        Ok(Self {
+            shared,
+            interfaces,
+            bodies,
+        })
+    }
 }
 
 /// Module-shared IR state: regimes 1–3 of the context-split design (see
@@ -1496,6 +1531,12 @@ impl<'str> Context<'str> {
         interface: crate::value::function::FunctionInterface<'str>,
         body: Function<'str>,
     ) -> FunctionId {
+        let expected = FunctionId::from(self.bodies.len());
+        assert_eq!(
+            body.id(),
+            expected,
+            "function body id does not match its registry slot"
+        );
         let id = self.bodies.push(body);
         let iid = self.interfaces.push(interface);
         debug_assert_eq!(
@@ -2429,7 +2470,6 @@ mod tests {
             fun: &ctx.bodies[fid],
             shared: &ctx.shared,
             interfaces: &ctx.interfaces,
-            id: fid,
         };
         let checked_snap = snapshot(checked, fid);
         assert_eq!(
@@ -2527,12 +2567,8 @@ mod tests {
         let b_b = BasicBlock::from_id(&ctx_b, entry_b).instruction_ids()[1];
 
         {
-            let mut host = PassBacking::new(
-                &mut ctx_b.bodies[fid_b],
-                fid_b,
-                &ctx_b.shared,
-                &ctx_b.interfaces,
-            );
+            let mut host =
+                PassBacking::new(&mut ctx_b.bodies[fid_b], &ctx_b.shared, &ctx_b.interfaces);
             let mut r = BaseRef::new(host.reborrow(), entry_b);
             r.set_comment(Some("c".into()));
             let mut r = BaseRef::new(host.reborrow(), entry_b);
@@ -3180,6 +3216,9 @@ mod tests {
         assert_eq!(restored.block_ids().len(), blocks_before);
         assert_eq!(restored.instruction_ids().len(), insns_before);
         assert_eq!(restored.function_ids().len(), funcs_before);
+        for function_id in restored.function_ids() {
+            assert_eq!(restored.bodies[function_id].id(), function_id);
+        }
         // The SpaceAddress type round-trips: same id, same size, same space.
         assert_eq!(restored.shared.types.size_of(sa), sa_size);
         assert_eq!(restored.shared.types.space_of(sa), Some(some_space));

@@ -72,6 +72,10 @@ pub struct FunctionInterface<'str> {
 /// under the same [`FunctionId`].
 #[derive(Clone, serde::Serialize, serde::Deserialize)]
 pub struct Function<'str> {
+    /// Immutable identity of this body in the lockstep function registries.
+    #[serde(skip)]
+    id: FunctionId,
+
     /// The entry block (dominates all other blocks in this function).
     /// Private: read via [`Function::root_id`], write via
     /// [`Function::set_root_id`] (stage 6a §11).
@@ -167,6 +171,7 @@ impl<'str> Function<'str> {
     /// semantic cross-function references, not ownership metadata, and are
     /// deliberately left untouched.
     pub fn rebind_ambient_id(&mut self, from: FunctionId, to: FunctionId) {
+        assert_eq!(self.id, from, "detached body has an unexpected ambient id");
         if from == to {
             return;
         }
@@ -179,6 +184,7 @@ impl<'str> Function<'str> {
             block.parent = Some(to);
         }
         self.names.rebind_function(from, to);
+        self.id = to;
     }
 
     /// Resolve one pass-local callee slot throughout this detached or installed
@@ -202,8 +208,9 @@ impl<'str> Function<'str> {
 
     /// An empty function *body*: no root, empty arenas. The interface lives
     /// separately in [`Context::interfaces`](crate::context::Context::interfaces).
-    pub fn empty_body() -> Self {
+    pub fn empty_body(id: FunctionId) -> Self {
         Self {
+            id,
             root: None,
             insns: Registry::default(),
             blocks: Registry::default(),
@@ -214,6 +221,18 @@ impl<'str> Function<'str> {
             names: crate::context::NameTable::default(),
             users: FxHashMap::default(),
         }
+    }
+
+    /// This body's immutable function identity.
+    pub const fn id(&self) -> FunctionId {
+        self.id
+    }
+
+    /// Restore the skipped identity field from the body's registry key after
+    /// deserialization. Serialized function bodies remain wire-compatible with
+    /// sessions written before the identity became intrinsic.
+    pub(crate) fn rehydrate_id(&mut self, id: FunctionId) {
+        self.id = id;
     }
 
     /// This function's instructions that use `value` as an operand (see
@@ -296,13 +315,13 @@ impl<'str> Function<'str> {
     // `self.function_mut(f)` collapses to `self`, `self.read_host()` to `self`'s
     // own arena accessors, and the global call-site cache maintenance is omitted
     // (the driver rebuilds `call_sites` by diffing at each barrier, exactly as the
-    // checked-out path did). `func` is the body's own [`FunctionId`], supplied by
-    // the caller (the body does not store its id).
+    // checked-out path did). The owning [`FunctionId`] comes from [`id`](Self::id).
 
     /// Push a fresh instruction into this body's arena, recording each operand's
     /// use in the reverse-use map. (No call-site maintenance — see the module
     /// note.)
-    pub fn push_insn(&mut self, func: FunctionId, insn: Instruction<'str>) -> InstructionId {
+    pub fn push_insn(&mut self, insn: Instruction<'str>) -> InstructionId {
+        let func = self.id;
         let args: Vec<LocalValueId> = insn.mnemonic().args().into_iter().collect();
         let local = self.insns.push(insn);
         let id = InstructionId::new(func, local);
@@ -313,47 +332,46 @@ impl<'str> Function<'str> {
     }
 
     /// Push a fresh block into this body's arena and onto its ownership roster.
-    pub fn push_block(&mut self, func: FunctionId, block: BasicBlock<'str>) -> BlockId {
+    pub fn push_block(&mut self, block: BasicBlock<'str>) -> BlockId {
+        let func = self.id;
         let local = self.blocks.push(block);
         let id = BlockId::new(func, local);
         self.roster.push(local);
         id
     }
 
-    /// Mint a fresh empty block, parented to `func` and rostered.
-    pub fn make_block(&mut self, func: FunctionId) -> BlockId {
-        self.push_block(func, BasicBlock::detached(func))
+    /// Mint a fresh empty block, parented to this function and rostered.
+    pub fn make_block(&mut self) -> BlockId {
+        self.push_block(BasicBlock::detached(self.id))
     }
 
     /// Push a fresh block parameter into this body's arena.
-    pub fn push_block_param(&mut self, func: FunctionId, param: BlockParam<'str>) -> BlockParamId {
+    pub fn push_block_param(&mut self, param: BlockParam<'str>) -> BlockParamId {
         let local = self.params.push(param);
-        BlockParamId::new(func, local)
+        BlockParamId::new(self.id, local)
     }
 
     /// Mint an `Int(size)`-typed instruction with `mnemonic` (the type is minted
     /// in `shared`'s interner through its `&self` path).
     pub fn push_mnemonic(
         &mut self,
-        func: FunctionId,
         shared: &crate::context::Shared<'str>,
         mnemonic: Mnemonic,
         size: usize,
     ) -> InstructionId {
         let type_id = shared.types.get_or_make_int(size);
         let insn = Instruction::new(type_id, mnemonic);
-        self.push_insn(func, insn)
+        self.push_insn(insn)
     }
 
     /// Mint an instruction with `mnemonic` and an explicit result `type_id`.
     pub fn push_mnemonic_with_type(
         &mut self,
-        func: FunctionId,
         mnemonic: Mnemonic,
         type_id: crate::types::TypeId,
     ) -> InstructionId {
         let insn = Instruction::new(type_id, mnemonic);
-        self.push_insn(func, insn)
+        self.push_insn(insn)
     }
 
     /// Insert `insn` immediately before `before` in `block`. Panics if `before`
@@ -387,7 +405,7 @@ impl<'str> Function<'str> {
 
     /// Remove CFG edge `edge_id`, unlinking it from both incident blocks. The
     /// backing `EdgeData` slot is left dangling.
-    pub fn remove_cfg_edge(&mut self, _func: FunctionId, edge_id: EdgeId) {
+    pub fn remove_cfg_edge(&mut self, edge_id: EdgeId) {
         let EdgeData { from, to } = *self.edge(edge_id);
         self.block_mut(from).edges.remove(&edge_id);
         self.block_mut(to).edges.remove(&edge_id);
@@ -419,10 +437,11 @@ impl<'str> Function<'str> {
     /// Remove instruction `id` from its block, unlink its outgoing CFG edges if a
     /// terminator, clear its name, tombstone it, and prune its operand use-lists.
     pub fn remove_instruction(&mut self, id: InstructionId) {
+        assert_eq!(id.func, self.id, "instruction belongs to another function");
         let (parent, name, is_terminator, args) = {
             let insn = self.insn(id);
             (
-                insn.parent.map(|l| BlockId::new(id.func, l)),
+                insn.parent.map(|l| BlockId::new(self.id, l)),
                 insn.name.clone(),
                 insn.mnemonic().is_terminator(),
                 insn.mnemonic().args().into_iter().collect::<Vec<_>>(),
@@ -444,7 +463,7 @@ impl<'str> Function<'str> {
                         .collect()
                 };
                 for edge_id in succ {
-                    self.remove_cfg_edge(block_id.func, edge_id);
+                    self.remove_cfg_edge(edge_id);
                 }
             }
         }
@@ -459,7 +478,7 @@ impl<'str> Function<'str> {
         self.insn_mut(id).deleted = true;
         for arg in args {
             if let Some(users) = self.users.get_mut(&arg) {
-                users.retain(|&local| local != id.localize(id.func));
+                users.retain(|&local| local != id.localize(self.id));
             }
         }
     }
@@ -488,7 +507,8 @@ impl<'str> Function<'str> {
     /// Replace an instruction's mnemonic in place, keeping the reverse use-map in
     /// sync.
     pub fn replace_instruction_mnemonic(&mut self, id: InstructionId, mnemonic: Mnemonic) {
-        let func = id.func;
+        assert_eq!(id.func, self.id, "instruction belongs to another function");
+        let func = self.id;
         let old_args = self
             .insn(id)
             .mnemonic()
@@ -532,15 +552,16 @@ impl<'str> Function<'str> {
     /// Remove `block` from this body: unlink every incident CFG edge, remove its
     /// instructions, detach its params, and tombstone it.
     pub fn delete_block(&mut self, block: BlockId) {
+        assert_eq!(block.func, self.id, "block belongs to another function");
         let edges: Vec<EdgeId> = self.block(block).edges.iter().copied().collect();
         for edge in edges {
-            self.remove_cfg_edge(block.func, edge);
+            self.remove_cfg_edge(edge);
         }
         let insns: Vec<InstructionId> = self
             .block(block)
             .instructions
             .iter()
-            .map(|&local| InstructionId::new(block.func, local))
+            .map(|&local| InstructionId::new(self.id, local))
             .collect();
         for insn in insns {
             self.remove_instruction(insn);
@@ -549,7 +570,7 @@ impl<'str> Function<'str> {
             .block(block)
             .params
             .iter()
-            .map(|&local| BlockParamId::new(block.func, local))
+            .map(|&local| BlockParamId::new(self.id, local))
             .collect();
         for param in params {
             self.users.remove(&ValueId::BlockParam(param).strip_func());
@@ -700,7 +721,12 @@ impl<'str> Function<'str> {
         ctx: &'ctx mut Context<'str>,
         name: Cow<'str, str>,
     ) -> Result<FunctionMutRef<'str, 'ctx>> {
-        let id = ctx.push_function(FunctionInterface::new(name.clone()), Function::empty_body());
+        let id = FunctionId::from(ctx.bodies.len());
+        let pushed = ctx.push_function(
+            FunctionInterface::new(name.clone()),
+            Function::empty_body(id),
+        );
+        debug_assert_eq!(pushed, id);
         ctx.update_name(name, id.into(), None)?;
         Ok(Self::from_id_mut(ctx, id))
     }
@@ -728,7 +754,12 @@ impl<'str> Function<'str> {
             None => Cow::Owned(format!("fn_{address:x}")),
         };
 
-        let id = ctx.push_function(FunctionInterface::new(name.clone()), Function::empty_body());
+        let id = FunctionId::from(ctx.bodies.len());
+        let pushed = ctx.push_function(
+            FunctionInterface::new(name.clone()),
+            Function::empty_body(id),
+        );
+        debug_assert_eq!(pushed, id);
 
         Self::from_id_mut(ctx, id)
             .with_name(name)

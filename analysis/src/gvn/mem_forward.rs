@@ -818,7 +818,7 @@ mod tests {
         let before = tc.ctx.direct_call_targets(fid);
         let out = {
             let (bodies, view) = tc.ctx.split(&env);
-            let mut body = FunctionBody::new(fid, &mut bodies[fid]);
+            let mut body = FunctionBody::new(&mut bodies[fid]);
             f(&mut body, view)
         };
         tc.ctx.resync_call_sites(fid, &before);

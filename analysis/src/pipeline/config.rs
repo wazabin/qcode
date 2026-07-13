@@ -1527,7 +1527,7 @@ async fn run_function_stage(
             let before_targets = ctx.direct_call_targets(fun_id);
             let outcome = {
                 let (bodies, view) = ctx.split(env);
-                let mut body = FunctionBody::new(fun_id, &mut bodies[fun_id]);
+                let mut body = FunctionBody::new(&mut bodies[fun_id]);
                 run_one_function(
                     passes,
                     &mut body,
@@ -1796,7 +1796,7 @@ fn run_stage_parallel(
                     fun_id,
                     name,
                     before_targets,
-                    body: FunctionBody::new(fun_id, slot),
+                    body: FunctionBody::new(slot),
                     outcome: Outcome::default(),
                 },
             )

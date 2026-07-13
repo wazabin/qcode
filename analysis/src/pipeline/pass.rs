@@ -237,7 +237,7 @@ impl<T: FunctionPass + Send + Sync> DynFunctionPass for FunctionPassAdapter<T> {
         let before_targets = ctx.direct_call_targets(fun_id);
         let outcome = {
             let (bodies, view) = ctx.split(env);
-            let mut body = FunctionBody::new(fun_id, &mut bodies[fun_id]);
+            let mut body = FunctionBody::new(&mut bodies[fun_id]);
             self.run_checked(&mut body, view)?
         };
         // Barrier, in the driver's order: install minted callees first (so the
@@ -277,7 +277,7 @@ pub(crate) fn with_checked_out_body<'str, R>(
     let before_targets = ctx.direct_call_targets(fid);
     let out = {
         let (bodies, view) = ctx.split(&env);
-        let mut body = FunctionBody::new(fid, &mut bodies[fid]);
+        let mut body = FunctionBody::new(&mut bodies[fid]);
         // These entry points buffer no effects and mint nothing, so the drained
         // scratch is discarded.
         f(&mut body, view)

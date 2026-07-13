@@ -235,9 +235,6 @@ impl<'str> ContextSplit<'str> for Context<'str> {
 /// global effect a pass legitimately requests — a self-rename — is returned in
 /// [`Outcome::rename`] and applied by the driver at the barrier.
 pub struct FunctionBody<'a, 'str> {
-    /// This function's id (the registry key; a [`Function`] does not store its
-    /// own id).
-    id: FunctionId,
     /// The function being optimized, borrowed **in place** from the bodies
     /// registry (its arenas, roster, root, users, names). The body never leaves
     /// the registry — the `&mut` is what gives the pass exclusive access while the
@@ -249,11 +246,9 @@ pub struct FunctionBody<'a, 'str> {
 }
 
 impl<'a, 'str> FunctionBody<'a, 'str> {
-    /// Wrap the function `fun` (id `id`) borrowed in place from the bodies
-    /// registry.
-    pub fn new(id: FunctionId, fun: &'a mut Function<'str>) -> Self {
+    /// Wrap `fun` borrowed in place from the bodies registry.
+    pub fn new(fun: &'a mut Function<'str>) -> Self {
         Self {
-            id,
             fun,
             next_minted: 0,
         }
@@ -261,7 +256,7 @@ impl<'a, 'str> FunctionBody<'a, 'str> {
 
     /// This function's id.
     pub fn id(&self) -> FunctionId {
-        self.id
+        self.fun.id()
     }
 
     // `Function` owns a single local arena and therefore indexes parameter IDs
@@ -269,7 +264,8 @@ impl<'a, 'str> FunctionBody<'a, 'str> {
     // boundary so a foreign ID cannot alias an equal local slot in `self.fun`.
     fn assert_owns_block_param(&self, id: BlockParamId) {
         assert_eq!(
-            id.func, self.id,
+            id.func,
+            self.id(),
             "block parameter belongs to another function"
         );
     }
@@ -284,7 +280,7 @@ impl<'a, 'str> FunctionBody<'a, 'str> {
     /// (via [`PassBacking::read_host`]) and mutates its function — construct
     /// block/instruction refs and `Builder`s over it.
     pub fn host<'b>(&'b mut self, cx: ContextView<'b, 'str>) -> PassBacking<'b, 'str> {
-        PassBacking::new(&mut *self.fun, self.id, cx.shr(), cx.interfaces())
+        PassBacking::new(&mut *self.fun, cx.shr(), cx.interfaces())
     }
 
     /// A `Copy` read view over this body's borrowed function and the shared
@@ -295,7 +291,6 @@ impl<'a, 'str> FunctionBody<'a, 'str> {
             fun: &*self.fun,
             shared: cx.shr(),
             interfaces: cx.interfaces(),
-            id: self.id,
         }
     }
 
@@ -325,9 +320,9 @@ impl<'a, 'str> FunctionBody<'a, 'str> {
         }
         minted.push(Minted {
             slot,
-            ambient: self.id,
+            ambient: self.id(),
             interface,
-            body: Function::empty_body(),
+            body: Function::empty_body(self.id()),
         });
         Callee::Minted(slot)
     }
@@ -355,7 +350,6 @@ impl<'a, 'str> FunctionBody<'a, 'str> {
             fun: &*self.fun,
             shared: cx.shr(),
             interfaces: cx.interfaces(),
-            id: self.id,
         };
         let slot = callee
             .minted()
@@ -365,12 +359,13 @@ impl<'a, 'str> FunctionBody<'a, 'str> {
             .find(|entry| entry.slot == slot)
             .expect("host_with_minted: not a function minted this run");
         assert_eq!(
-            entry.ambient, self.id,
+            entry.ambient,
+            self.id(),
             "minted entry belongs to another owner"
         );
         (
             own,
-            PassBacking::new(&mut entry.body, self.id, cx.shr(), cx.interfaces()),
+            PassBacking::new(&mut entry.body, cx.shr(), cx.interfaces()),
         )
     }
 }
@@ -397,54 +392,54 @@ impl<'body, 'str> FunctionBody<'body, 'str> {
     // directly — edges are created through `add_cfg_edge` — so nothing needs it.
 
     /// Push a fresh instruction into this body's arena (recording operand uses and
-    /// the call-site cache). Mirrors [`Function::push_insn`] with `func = self.id()`.
+    /// the call-site cache). Mirrors [`Function::push_insn`].
     pub fn push_insn(
         &mut self,
         cx: ContextView<'_, 'str>,
         insn: Instruction<'str>,
     ) -> InstructionId {
         let _ = cx;
-        self.fun.push_insn(self.id, insn)
+        self.fun.push_insn(insn)
     }
 
     /// Push a fresh block into this body's arena and onto its roster. Mirrors
-    /// [`Function::push_block`] with `func = self.id()`.
+    /// [`Function::push_block`].
     pub fn push_block(&mut self, cx: ContextView<'_, 'str>, block: BasicBlock<'str>) -> BlockId {
         let _ = cx;
-        self.fun.push_block(self.id, block)
+        self.fun.push_block(block)
     }
 
     /// Mint a fresh empty block, parented to this body and rostered. Mirrors
-    /// [`Function::make_block`] with `func = self.id()`.
+    /// [`Function::make_block`].
     pub fn make_block(&mut self, cx: ContextView<'_, 'str>) -> BlockId {
         let _ = cx;
-        self.fun.make_block(self.id)
+        self.fun.make_block()
     }
 
     /// Push a fresh block parameter into this body's arena. Mirrors
-    /// [`Function::push_block_param`] with `func = self.id()`.
+    /// [`Function::push_block_param`].
     pub fn push_block_param(
         &mut self,
         cx: ContextView<'_, 'str>,
         param: BlockParam<'str>,
     ) -> BlockParamId {
         let _ = cx;
-        self.fun.push_block_param(self.id, param)
+        self.fun.push_block_param(param)
     }
 
     /// Mint an `Int(size)`-typed instruction with `mnemonic`. Mirrors
-    /// [`Function::push_mnemonic`] with `func = self.id()`.
+    /// [`Function::push_mnemonic`].
     pub fn push_mnemonic(
         &mut self,
         cx: ContextView<'_, 'str>,
         mnemonic: Mnemonic,
         size: usize,
     ) -> InstructionId {
-        self.fun.push_mnemonic(self.id, cx.shr(), mnemonic, size)
+        self.fun.push_mnemonic(cx.shr(), mnemonic, size)
     }
 
     /// Mint an instruction with `mnemonic` and an explicit result `type_id`.
-    /// Mirrors [`Function::push_mnemonic_with_type`] with `func = self.id()`.
+    /// Mirrors [`Function::push_mnemonic_with_type`].
     pub fn push_mnemonic_with_type(
         &mut self,
         cx: ContextView<'_, 'str>,
@@ -452,7 +447,7 @@ impl<'body, 'str> FunctionBody<'body, 'str> {
         type_id: TypeId,
     ) -> InstructionId {
         let _ = cx;
-        self.fun.push_mnemonic_with_type(self.id, mnemonic, type_id)
+        self.fun.push_mnemonic_with_type(mnemonic, type_id)
     }
 
     /// Insert `insn` immediately before `before` in `block`. Mirrors
@@ -482,10 +477,10 @@ impl<'body, 'str> FunctionBody<'body, 'str> {
     }
 
     /// Remove CFG edge `edge_id` from this body. Mirrors
-    /// [`Function::remove_cfg_edge`] with `func = self.id()`.
+    /// [`Function::remove_cfg_edge`].
     pub fn remove_cfg_edge(&mut self, cx: ContextView<'_, 'str>, edge_id: EdgeId) {
         let _ = cx;
-        self.fun.remove_cfg_edge(self.id, edge_id)
+        self.fun.remove_cfg_edge(edge_id)
     }
 
     /// Replace every use of `old` with `new` across this body. Mirrors
@@ -494,7 +489,8 @@ impl<'body, 'str> FunctionBody<'body, 'str> {
         let _ = cx;
         if let Some(owner) = old.owning_function() {
             assert_eq!(
-                owner, self.id,
+                owner,
+                self.id(),
                 "cannot replace uses of a value owned by another function"
             );
         }
@@ -632,7 +628,7 @@ impl<'body, 'str> FunctionBody<'body, 'str> {
     /// This body's instructions that use `value` as an operand. Mirror of
     /// [`Function::users_of`]; body-local, so it needs no `cx`.
     pub fn users_of(&self, value: ValueId) -> Vec<InstructionId> {
-        let func = self.id;
+        let func = self.id();
         if value.owning_function().is_some_and(|owner| owner != func) {
             return Vec::new();
         }
@@ -685,7 +681,7 @@ impl<'body, 'str> FunctionBody<'body, 'str> {
     /// A [`FunctionRef`] over this body's *own* function. The self-directed twin
     /// of [`function_ref`](Self::function_ref).
     pub fn self_ref<'a>(&'a self, cx: ContextView<'a, 'str>) -> FunctionRef<'str, 'a> {
-        self.read_host(cx).function_ref(self.id)
+        self.read_host(cx).function_ref(self.id())
     }
 }
 
@@ -707,7 +703,7 @@ mod tests {
         let (bodies, view) = ctx.split(&env);
         let mut slots = bodies.select_mut(&[mint_owner]);
         let (owner, _) = slots.split_first_mut().unwrap();
-        let mut owner = FunctionBody::new(mint_owner, owner);
+        let mut owner = FunctionBody::new(owner);
 
         // Model two pass outcomes aggregated across one stage fixpoint. The
         // counter belongs to FunctionBody, so a fresh outcome Vec cannot reset it.
@@ -780,7 +776,7 @@ mod tests {
         let (bodies, view) = ctx.split(&env);
         let mut slots = bodies.select_mut(&[rebind_owner]);
         let (owner_fun, _) = slots.split_first_mut().unwrap();
-        let mut owner = FunctionBody::new(rebind_owner, owner_fun);
+        let mut owner = FunctionBody::new(owner_fun);
         let mut outcome = Vec::new();
         let placeholder =
             owner.mint_function(&mut outcome, "detached".into(), FunctionKind::Lambda, true);
@@ -803,7 +799,7 @@ mod tests {
         assert_eq!(slot, 0);
         let root = BlockId::new(installed, detached.root_id().unwrap());
         assert_eq!(detached.block(root).parent, Some(installed));
-        let host = PassBacking::new(&mut detached, installed, view.shr(), view.interfaces());
+        let host = PassBacking::new(&mut detached, view.shr(), view.interfaces());
         assert_eq!(
             host.read_host()
                 .function_ref(installed)
@@ -887,7 +883,7 @@ mod tests {
         let (bodies, _view) = ctx.split(&env);
         let mut slots = bodies.select_mut(&[own_id]);
         let (own, _) = slots.split_first_mut().unwrap();
-        let mut own = FunctionBody::new(own_id, own);
+        let mut own = FunctionBody::new(own);
 
         let _ = own.block_param_mut(foreign);
     }
@@ -901,7 +897,7 @@ mod tests {
         let (bodies, view) = ctx.split(&env);
         let mut slots = bodies.select_mut(&[own_id]);
         let (own, _) = slots.split_first_mut().unwrap();
-        let own = FunctionBody::new(own_id, own);
+        let own = FunctionBody::new(own);
 
         let _ = own.block_param(view, foreign);
     }
@@ -915,7 +911,7 @@ mod tests {
         let (bodies, view) = ctx.split(&env);
         let mut slots = bodies.select_mut(&[own_id]);
         let (own, _) = slots.split_first_mut().unwrap();
-        let own = FunctionBody::new(own_id, own);
+        let own = FunctionBody::new(own);
 
         let _ = own.param_ref(view, foreign);
     }
@@ -928,7 +924,7 @@ mod tests {
         let (bodies, _view) = ctx.split(&env);
         let mut slots = bodies.select_mut(&[own_id]);
         let (own, _) = slots.split_first_mut().unwrap();
-        let own = FunctionBody::new(own_id, own);
+        let own = FunctionBody::new(own);
 
         assert!(own.users_of(ValueId::Instruction(foreign)).is_empty());
     }
@@ -942,7 +938,7 @@ mod tests {
         let (bodies, view) = ctx.split(&env);
         let mut slots = bodies.select_mut(&[own_id]);
         let (own, _) = slots.split_first_mut().unwrap();
-        let mut own = FunctionBody::new(own_id, own);
+        let mut own = FunctionBody::new(own);
 
         own.replace_all_uses_with(
             view,
@@ -978,7 +974,6 @@ mod tests {
             let root = BlockId::new(f, own.root_id().expect("root"));
             insn_count_before = own.block(root).instructions.len();
             let insn = own.push_mnemonic(
-                f,
                 view.shr(),
                 Mnemonic::Zext(qcode::value::insn::Zext {
                     src: k.localize(f),
