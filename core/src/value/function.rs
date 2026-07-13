@@ -9,8 +9,6 @@ use std::{
 mod signature;
 pub use signature::{FunctionSignature, ParamAttrs};
 
-use jstd::registry::Registry;
-
 use crate::{
     context::Context,
     error::{Error, ErrorTy, Result},
@@ -93,14 +91,13 @@ pub struct FunctionBody<'str> {
     pub(crate) insns: StableArena<LocalInsnId, Instruction<'str>>,
 
     /// Basic-block storage for this function. A block is born here and keeps its
-    /// `id.func` for life; Path A makes arena membership and ownership identical.
-    /// Use [`FunctionRef::blocks`] (which reads [`roster`](Self::roster)) to skip
-    /// detached/tombstoned arena entries.
-    pub(crate) blocks: Registry<LocalBlockId, BasicBlock<'str>>,
+    /// `id.func` for life; live payloads are dense while logical IDs remain
+    /// stable and are never reused.
+    pub(crate) blocks: StableArena<LocalBlockId, BasicBlock<'str>>,
 
     /// Body-local ids of the blocks this function owns, in order. Path A forbids
     /// cross-arena ownership, so every entry indexes this function's `blocks`
-    /// arena. Kept in sync with each block's `parent`; tombstones are filtered.
+    /// arena. Kept in sync with each block's `parent`.
     #[serde(default)]
     pub(crate) roster: Vec<LocalBlockId>,
 
@@ -171,21 +168,6 @@ pub struct BodyArenaStats {
 }
 
 impl BodyArenaKindStats {
-    fn registry<T>(issued: usize, live: usize) -> Self {
-        // Registry allocates complete power-of-two chunks: 1, 2, 4, ... .
-        let capacity = issued
-            .checked_add(1)
-            .and_then(usize::checked_next_power_of_two)
-            .map_or(0, |next| next - 1);
-        Self {
-            issued,
-            live,
-            dead: issued - live,
-            capacity,
-            structural_bytes: capacity.saturating_mul(std::mem::size_of::<T>()),
-        }
-    }
-
     fn stable_arena<Id: jstd::registry::Identifier, T>(arena: &StableArena<Id, T>) -> Self {
         let issued = arena.issued_len();
         let live = arena.len();
@@ -239,13 +221,9 @@ impl<'str> FunctionInterface<'str> {
 impl<'str> FunctionBody<'str> {
     /// Reports the current arena footprint and logical liveness.
     pub fn arena_stats(&self) -> BodyArenaStats {
-        let live_blocks = self.blocks.iter().filter(|block| !block.deleted).count();
         BodyArenaStats {
             instructions: BodyArenaKindStats::stable_arena(&self.insns),
-            blocks: BodyArenaKindStats::registry::<BasicBlock<'str>>(
-                self.blocks.len(),
-                live_blocks,
-            ),
+            blocks: BodyArenaKindStats::stable_arena(&self.blocks),
             params: BodyArenaKindStats::stable_arena(&self.params),
             edges: BodyArenaKindStats::stable_arena(&self.edges),
         }
@@ -265,7 +243,7 @@ impl<'str> FunctionBody<'str> {
         if from == to {
             return;
         }
-        for mut block in self.blocks.iter_mut().filter(|block| !block.deleted) {
+        for mut block in self.blocks.iter_mut() {
             assert_eq!(
                 block.parent,
                 Some(from),
@@ -311,7 +289,7 @@ impl<'str> FunctionBody<'str> {
             id,
             root: None,
             insns: StableArena::default(),
-            blocks: Registry::default(),
+            blocks: StableArena::default(),
             roster: Vec::new(),
             params: StableArena::default(),
             edges: StableArena::default(),
@@ -399,6 +377,11 @@ impl<'str> FunctionBody<'str> {
     pub fn block_mut(&mut self, id: BlockId) -> &mut BasicBlock<'str> {
         assert_eq!(id.func, self.id, "block belongs to another function");
         &mut self.blocks[id.local]
+    }
+
+    /// Whether `id` currently names a live block payload in this body.
+    pub fn contains_block(&self, id: BlockId) -> bool {
+        id.func == self.id && self.blocks.contains(id.local)
     }
     /// The instruction `id`, by its function-local index.
     pub fn insn(&self, id: InstructionId) -> &Instruction<'str> {
@@ -647,10 +630,9 @@ impl<'str> FunctionBody<'str> {
         self.insns.remove(id.local);
     }
 
-    /// Rehome `remove`'s outgoing CFG edges onto `keep` and drop the direct edge
-    /// between them. The caller tombstones `remove`.
-    pub fn merge_nodes(&mut self, keep: BlockId, remove: BlockId, direct_edge: EdgeId) {
-        self.remove_cfg_edge(direct_edge);
+    /// Rehome `remove`'s outgoing CFG edges onto `keep`. The direct edge and
+    /// `keep`'s forwarding terminator have already been removed by the caller.
+    pub fn rehome_outgoing_edges(&mut self, keep: BlockId, remove: BlockId) {
         let outgoing: Vec<EdgeId> = {
             let block = self.block(remove);
             block
@@ -713,7 +695,7 @@ impl<'str> FunctionBody<'str> {
     }
 
     /// Remove `block` from this body: unlink every incident CFG edge, remove its
-    /// instructions, detach its params, and tombstone it.
+    /// instructions and params, clear ownership metadata, then drop its payload.
     pub fn delete_block(&mut self, block: BlockId) {
         assert_eq!(block.func, self.id, "block belongs to another function");
         let mut edges: Vec<EdgeId> = self.block(block).edges.iter().copied().collect();
@@ -739,33 +721,38 @@ impl<'str> FunctionBody<'str> {
         for param in params {
             self.remove_block_param(param);
         }
+        let name = self.block(block).local_name().map(str::to_owned);
         self.unroster_block(block);
-        let b = self.block_mut(block);
-        b.parent = None;
-        b.deleted = true;
+        if self.root == Some(block.local) {
+            self.root = None;
+        }
+        if let Some(name) = name {
+            self.names.forget(&name);
+        }
+        self.blocks.remove(block.local);
     }
 
     /// Absorb `other` into `keep`: drop `keep`'s terminal branch, append `other`'s
-    /// instructions, rehome its outgoing edges, and tombstone it. `edge_ab` is the
+    /// instructions, rehome its outgoing edges, and remove it. `edge_ab` is the
     /// direct edge `keep -> other`.
     pub fn absorb_block(&mut self, keep: BlockId, other: BlockId, edge_ab: EdgeId) {
         assert_eq!(
             keep.func, other.func,
             "cannot absorb across function arenas"
         );
-        let branch_args = self
+        let (branch_id, branch_args) = self
             .block(keep)
             .instructions
             .last()
             .and_then(
                 |&local| match self.insn(InstructionId::new(keep.func, local)).mnemonic() {
                     Mnemonic::Branch(branch) if BlockId::new(keep.func, branch.target) == other => {
-                        Some(branch.args.clone())
+                        Some((InstructionId::new(keep.func, local), branch.args.clone()))
                     }
                     _ => None,
                 },
             )
-            .unwrap_or_default();
+            .expect("absorbed block must be reached by keep's terminal branch");
         let other_params: Vec<_> = self
             .block(other)
             .params
@@ -780,27 +767,37 @@ impl<'str> FunctionBody<'str> {
                 other_params.len(),
                 branch_args.len()
             );
-            for (param, arg) in other_params.into_iter().zip(branch_args) {
+            for (param, arg) in other_params.iter().copied().zip(branch_args) {
                 self.replace_all_uses_with(ValueId::BlockParam(param), arg.qualify(keep.func));
             }
         }
-        self.block_mut(keep).instructions.pop();
+        self.remove_cfg_edge(edge_ab);
+        self.remove_instruction(branch_id);
         let b_insns = std::mem::take(&mut self.block_mut(other).instructions);
         for &local in &b_insns {
             self.insn_mut(InstructionId::new(other.func, local)).parent = Some(keep.local);
         }
         self.block_mut(keep).instructions.extend(b_insns);
-        self.merge_nodes(keep, other, edge_ab);
-        let (b_addr, b_extra) = {
+        self.rehome_outgoing_edges(keep, other);
+        let (b_addr, b_extra, b_name) = {
             let b = self.block(other);
-            (b.address, b.extra_addresses.clone())
+            (
+                b.address,
+                b.extra_addresses.clone(),
+                b.local_name().map(str::to_owned),
+            )
         };
-        self.unroster_block(other);
-        {
-            let ob = self.block_mut(other);
-            ob.parent = None;
-            ob.deleted = true;
+        for param in other_params {
+            self.remove_block_param(param);
         }
+        self.unroster_block(other);
+        if self.root == Some(other.local) {
+            self.root = Some(keep.local);
+        }
+        if let Some(name) = b_name {
+            self.names.forget(&name);
+        }
+        self.blocks.remove(other.local);
         if let Some(addr) = b_addr {
             self.block_mut(keep).extra_addresses.push(addr);
         }
@@ -1361,17 +1358,14 @@ where
         ids.into_iter().map(move |id| BlockRef::new(ctx, id))
     }
 
-    /// The composite ids of this function's live (owned, non-tombstoned) blocks,
-    /// in roster order.
+    /// The composite ids of this function's live blocks, in roster order.
     pub fn block_ids(&'s self) -> Vec<BlockId> {
-        let host = self.host();
         let func = self.id;
         self.inner()
             .roster
             .iter()
             .copied()
             .map(|local| BlockId::new(func, local))
-            .filter(|&id| !host.block(id).deleted)
             .collect()
     }
 
@@ -1836,19 +1830,6 @@ impl<'str, 'ctx> FunctionMutRef<'str, 'ctx> {
         );
         self.ctx.block_mut(id).parent = Some(self.id);
         self.inner_mut().roster.push(local);
-    }
-
-    /// Removes `block` from this function: drops it from the ownership roster and
-    /// tombstones it. The arena slot is never reclaimed; the block is skipped by
-    /// [`blocks`](Self::blocks).
-    ///
-    /// To *delete* a block with its CFG edges/instructions/params unwound, use
-    /// [`BasicBlock::delete`].
-    pub fn remove_block(&mut self, id: BlockId) {
-        self.ctx.unroster_block(id);
-        let block = self.ctx.block_mut(id);
-        block.parent = None;
-        block.deleted = true;
     }
 }
 

@@ -57,8 +57,8 @@ pub fn simplify_cfg_concrete<'a, 'str>(
     let mut changed = false;
 
     loop {
-        let blocks = cx.read_host(body).function_ref(function_id).block_ids();
         let mut progress = prune_unreachable_concrete(body, cx, function_id);
+        let blocks = cx.read_host(body).function_ref(function_id).block_ids();
 
         for block_id in blocks {
             if try_fold_cbranch_concrete(body, cx, block_id)
@@ -87,8 +87,8 @@ pub fn simplify_cfg<'str>(host: &mut Context<'str>, function_id: FunctionId) -> 
     let mut changed = false;
 
     loop {
-        let blocks = host.function_ref(function_id).block_ids();
         let mut progress = prune_unreachable_generic(host, function_id);
+        let blocks = host.function_ref(function_id).block_ids();
 
         for block_id in blocks {
             if try_fold_cbranch_generic(host, block_id)
@@ -907,8 +907,16 @@ mod tests {
         let changed = simplify_cfg(&mut ctx, f);
         assert!(changed, "pruning an unreachable block reports progress");
         assert!(
-            BasicBlock::from_id(&ctx, dead).parent().is_none(),
+            !ctx.contains_block(dead),
             "unreachable block should be pruned"
+        );
+        assert!(
+            !ctx.contains_instruction(s),
+            "instructions owned by the unreachable block should be removed"
+        );
+        assert!(
+            !ctx.contains_block_param(x),
+            "parameters owned by the unreachable block should be removed"
         );
         assert!(
             BasicBlock::from_id(&ctx, a).parent().is_some(),
@@ -951,7 +959,6 @@ mod tests {
                 goto <0x1001>;
             "
         );
-
         simplify_cfg(&mut ctx, f);
 
         let blocks: Vec<_> = FunctionBody::from_id(&ctx, f)
@@ -1068,11 +1075,7 @@ mod tests {
 
         {
             let a = BasicBlock::from_id(&ctx, a);
-            let b = BasicBlock::from_id(&ctx, b);
-            assert!(
-                b.parent().is_none(),
-                "b's parent should be cleared after merge"
-            );
+            assert!(!ctx.contains_block(b), "b should be removed after merge");
             assert!(a.parent().is_some(), "a should still have a parent");
         }
     }
@@ -1100,7 +1103,11 @@ mod tests {
             .map(|b| b.id)
             .collect();
         assert_eq!(blocks, [a], "branch-with-args chain should merge");
-        assert!(BasicBlock::from_id(&ctx, b).parent().is_none());
+        assert!(!ctx.contains_block(b));
+        assert!(
+            !ctx.contains_block_param(x),
+            "the merged block parameter should be removed after substitution"
+        );
 
         let Mnemonic::Binop(Binary { lhs, .. }) = ctx.instruction(sum).mnemonic() else {
             panic!("expected merged sum to be a binop");
@@ -1157,12 +1164,30 @@ mod tests {
                 goto <0x1001>;
             "
         );
+        let forwarding = BasicBlock::from_id(&ctx, a)
+            .instructions()
+            .last()
+            .expect("a has a forwarding branch")
+            .id;
 
         simplify_cfg(&mut ctx, f);
 
         assert!(
-            ctx.block(b).instruction_ids().is_empty(),
-            "absorbed block `b` must not retain its instructions after merge"
+            !ctx.contains_block(b),
+            "absorbed block `b` must be removed after merge"
+        );
+        assert!(
+            ctx.contains_instruction(y),
+            "instructions absorbed from `b` must remain live"
+        );
+        assert!(
+            !ctx.contains_instruction(forwarding),
+            "the forwarding branch replaced by absorption must be removed"
+        );
+        assert_eq!(
+            ctx.get_insn(y).parent().map(|block| block.id()),
+            Some(ValueId::BasicBlock(a)),
+            "instructions absorbed from `b` must be reparented to `a`"
         );
     }
 
@@ -1269,12 +1294,19 @@ mod tests {
 
         // Bypass in isolation: `<d>` is unreachable, so a full `simplify_cfg`
         // run would prune it (and then splice the forwarding `<a>`/`<d>`).
+        let removed_insns = BasicBlock::from_id(&ctx, b).instruction_ids();
         try_bypass_empty_block_generic(&mut ctx, f, b);
 
         // b is gone; a and d both branch straight to t.
         assert!(
-            BasicBlock::from_id(&ctx, b).parent().is_none(),
+            !ctx.contains_block(b),
             "empty forwarding block b should be spliced out"
+        );
+        assert!(
+            removed_insns
+                .into_iter()
+                .all(|insn| !ctx.contains_instruction(insn)),
+            "the forwarding block's terminator should be removed"
         );
         for pred in [a, d] {
             let term = BasicBlock::from_id(&ctx, pred)
@@ -1349,11 +1381,22 @@ mod tests {
 
         // Bypass in isolation (see `bypasses_empty_block_with_two_predecessors`):
         // a full run would prune the unreachable `<d>` predecessor.
+        let removed_insns = BasicBlock::from_id(&ctx, b).instruction_ids();
         try_bypass_empty_block_generic(&mut ctx, f, b);
 
         assert!(
-            BasicBlock::from_id(&ctx, b).parent().is_none(),
+            !ctx.contains_block(b),
             "forwarding block b should be spliced out"
+        );
+        assert!(
+            !ctx.contains_block_param(x),
+            "the forwarding block's parameter should be removed"
+        );
+        assert!(
+            removed_insns
+                .into_iter()
+                .all(|insn| !ctx.contains_instruction(insn)),
+            "the forwarding block's terminator should be removed"
         );
 
         // a forwards its own @av straight to t; d forwards @dv.
@@ -1394,11 +1437,18 @@ mod tests {
             "
         );
 
+        let removed_insns = BasicBlock::from_id(&ctx, b).instruction_ids();
         simplify_cfg(&mut ctx, f);
 
         assert!(
-            BasicBlock::from_id(&ctx, b).parent().is_none(),
+            !ctx.contains_block(b),
             "empty block b should be spliced out"
+        );
+        assert!(
+            removed_insns
+                .into_iter()
+                .all(|insn| !ctx.contains_instruction(insn)),
+            "the forwarding block's terminator should be removed"
         );
         let term = BasicBlock::from_id(&ctx, a)
             .iter()
@@ -1483,17 +1533,27 @@ mod tests {
             "
         );
 
+        let removed_insns = [orphan, t]
+            .into_iter()
+            .flat_map(|block| BasicBlock::from_id(&ctx, block).instruction_ids())
+            .collect::<Vec<_>>();
         simplify_cfg(&mut ctx, f);
 
         // `<orphan>` and `<t>` (reachable only via orphan) have no path from the
         // entry `<a>`; simplify_cfg now prunes such dead blocks itself.
         assert!(
-            BasicBlock::from_id(&ctx, orphan).parent().is_none(),
+            !ctx.contains_block(orphan),
             "unreachable forwarding block should be pruned"
         );
         assert!(
-            BasicBlock::from_id(&ctx, t).parent().is_none(),
+            !ctx.contains_block(t),
             "block reachable only from an unreachable block should be pruned too"
+        );
+        assert!(
+            removed_insns
+                .into_iter()
+                .all(|insn| !ctx.contains_instruction(insn)),
+            "instructions owned by pruned blocks should be removed"
         );
     }
 

@@ -592,25 +592,6 @@ mod tests {
     }
 
     #[test]
-    fn compute_input_regs_tolerates_root_outside_block_set() {
-        // A boundary-splitting reattribution can leave a stub function whose
-        // `root` points at a block reassigned away — no longer in its block set.
-        // compute_input_regs must degrade to best-effort, not panic (regression
-        // for the whole-binary "no entry found for key" crash on /usr/bin/less).
-        let mut tc = TestContext::new();
-        let r0 = tc.r0;
-        let reg = tc.reg_space;
-        let fun = build_fn(&mut tc, "stub", 0x1000, |b| {
-            b.push_load::<false>(ValueId::Varnode(r0), 8, reg);
-        });
-        let root = qcode::value::BlockId::new(fun, tc.ctx.bodies[fun].root_id().unwrap());
-        // Orphan the root, as the splitter used to leave it.
-        qcode::value::FunctionBody::from_id_mut(&mut tc.ctx, fun).remove_block(root);
-        // Best-effort, and specifically no panic.
-        let _ = compute_input_regs(&tc.ctx, fun);
-    }
-
-    #[test]
     fn store_before_load_not_input() {
         let mut tc = TestContext::new();
         let r0 = tc.r0;

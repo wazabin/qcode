@@ -943,7 +943,7 @@ impl<'str> Context<'str> {
         }
 
         // Phase 5: delete the originals (unlinks their old edges, physically
-        // removes their instructions, and tombstones the blocks).
+        // removes their instructions and physical block payloads).
         for &old in olds {
             BasicBlock::from_id_mut(self, old).delete(target);
         }
@@ -1485,6 +1485,12 @@ impl<'str> Context<'str> {
         &mut self.bodies[id.func].blocks[id.local]
     }
 
+    /// Whether `id` currently names a live block payload.
+    pub fn contains_block(&self, id: BlockId) -> bool {
+        Into::<usize>::into(id.func) < self.bodies.len()
+            && self.bodies[id.func].blocks.contains(id.local)
+    }
+
     /// Borrows the block parameter `id`.
     pub fn block_param(&self, id: BlockParamId) -> &BlockParam<'str> {
         &self.bodies[id.func].params[id.local]
@@ -1991,10 +1997,10 @@ impl<'str> Context<'str> {
         self.push_block(func, BasicBlock::detached(func))
     }
 
-    /// Rehome `remove`'s outgoing CFG edges onto `keep` and drop the direct edge.
-    pub fn merge_nodes(&mut self, keep: BlockId, remove: BlockId, direct_edge: EdgeId) {
+    /// Rehome `remove`'s outgoing CFG edges onto `keep`. The direct edge and
+    /// forwarding terminator have already been removed by the caller.
+    pub fn rehome_outgoing_edges(&mut self, keep: BlockId, remove: BlockId) {
         let func = keep.func;
-        self.remove_cfg_edge(func, direct_edge);
         let outgoing: Vec<EdgeId> = {
             let host = self.read_host();
             host.block(remove)
@@ -2011,8 +2017,7 @@ impl<'str> Context<'str> {
         }
     }
 
-    /// Remove `block` from its function (unlink edges, remove instructions,
-    /// detach params, tombstone).
+    /// Remove `block` from its function, including its arena payload.
     pub fn delete_block(&mut self, block: BlockId, _function_id: FunctionId) {
         let mut edges: Vec<EdgeId> = self
             .read_host()
@@ -2045,10 +2050,15 @@ impl<'str> Context<'str> {
         for param in params {
             self.remove_block_param(param);
         }
+        let name = self.block(block).local_name().map(str::to_owned);
         self.unroster_block(block);
-        let b = self.block_mut(block);
-        b.parent = None;
-        b.deleted = true;
+        if self.bodies[block.func].root_id() == Some(block.local) {
+            self.bodies[block.func].set_root_id(None);
+        }
+        if let Some(name) = name {
+            self.bodies[block.func].names.forget(&name);
+        }
+        self.bodies[block.func].blocks.remove(block.local);
     }
 
     /// Absorb `other` into `keep`.
@@ -2063,7 +2073,7 @@ impl<'str> Context<'str> {
             keep.func, other.func,
             "cannot absorb across function arenas"
         );
-        let branch_args = {
+        let (branch_id, branch_args) = {
             let host = self.read_host();
             host.block(keep)
                 .instructions
@@ -2076,12 +2086,12 @@ impl<'str> Context<'str> {
                         Mnemonic::Branch(branch)
                             if BlockId::new(keep.func, branch.target) == other =>
                         {
-                            Some(branch.args.clone())
+                            Some((InstructionId::new(keep.func, local), branch.args.clone()))
                         }
                         _ => None,
                     }
                 })
-                .unwrap_or_default()
+                .expect("absorbed block must be reached by keep's terminal branch")
         };
         let other_params: Vec<_> = self
             .read_host()
@@ -2098,28 +2108,38 @@ impl<'str> Context<'str> {
                 other_params.len(),
                 branch_args.len()
             );
-            for (param, arg) in other_params.into_iter().zip(branch_args) {
+            for (param, arg) in other_params.iter().copied().zip(branch_args) {
                 self.replace_all_uses_with(ValueId::BlockParam(param), arg.qualify(keep.func));
             }
         }
-        self.block_mut(keep).instructions.pop();
+        self.remove_cfg_edge(keep.func, edge_ab);
+        self.remove_instruction(branch_id);
         let b_insns = std::mem::take(&mut self.block_mut(other).instructions);
         for &local in &b_insns {
             self.instruction_mut(InstructionId::new(other.func, local))
                 .parent = Some(keep.local);
         }
         self.block_mut(keep).instructions.extend(b_insns);
-        self.merge_nodes(keep, other, edge_ab);
-        let (b_addr, b_extra) = {
+        self.rehome_outgoing_edges(keep, other);
+        let (b_addr, b_extra, b_name) = {
             let b = self.read_host().block(other);
-            (b.address, b.extra_addresses.clone())
+            (
+                b.address,
+                b.extra_addresses.clone(),
+                b.local_name().map(str::to_owned),
+            )
         };
-        self.unroster_block(other);
-        {
-            let ob = self.block_mut(other);
-            ob.parent = None;
-            ob.deleted = true;
+        for param in other_params {
+            self.remove_block_param(param);
         }
+        self.unroster_block(other);
+        if self.bodies[other.func].root_id() == Some(other.local) {
+            self.bodies[other.func].set_root_id(Some(keep.local));
+        }
+        if let Some(name) = b_name {
+            self.bodies[other.func].names.forget(&name);
+        }
+        self.bodies[other.func].blocks.remove(other.local);
         if let Some(addr) = b_addr {
             self.block_mut(keep).extra_addresses.push(addr);
         }
@@ -3426,6 +3446,71 @@ mod tests {
             .id;
         assert!(fresh.local > last.local);
         assert_ne!(fresh, removed, "removed parameter IDs must never be reused");
+    }
+
+    #[test]
+    fn compact_block_arena_preserves_ids_across_round_trip() {
+        let mut ctx = Context::new();
+        let function = ctx.anon_function();
+        let first = BasicBlock::make(&mut ctx, function).id;
+        let removed = BasicBlock::make(&mut ctx, function).id;
+        let last = BasicBlock::make(&mut ctx, function).id;
+        FunctionBody::from_id_mut(&mut ctx, function)
+            .set_root(first)
+            .expect("set root");
+
+        ctx.delete_block(removed, function);
+
+        let physical_order: Vec<_> = ctx.bodies[function]
+            .blocks
+            .iter()
+            .map(|block| block.id)
+            .collect();
+        assert_eq!(physical_order, vec![first.local, last.local]);
+        assert_eq!(ctx.block_ids(), vec![first, last]);
+
+        let config = bincode::config::standard();
+        let bytes = bincode::serde::encode_to_vec(&ctx, config).expect("encode");
+        let (mut restored, _): (Context<'static>, usize) =
+            bincode::serde::decode_from_slice(&bytes, config).expect("decode");
+
+        assert!(!restored.contains_block(removed));
+        assert_eq!(
+            restored.bodies[function]
+                .blocks
+                .iter()
+                .map(|block| block.id)
+                .collect::<Vec<_>>(),
+            physical_order,
+        );
+        assert!(restored.contains_block(first));
+        assert!(restored.contains_block(last));
+        assert_eq!(
+            FunctionBody::from_id(&restored, function)
+                .root()
+                .map(|block| block.id),
+            Some(first),
+        );
+
+        let fresh = BasicBlock::make(&mut restored, function).id;
+        assert!(fresh.local > last.local);
+        assert_ne!(fresh, removed, "removed block IDs must never be reused");
+    }
+
+    #[test]
+    fn deleting_root_clears_function_root() {
+        let mut ctx = Context::new();
+        let function = ctx.anon_function();
+        let root = BasicBlock::make(&mut ctx, function).id;
+        FunctionBody::from_id_mut(&mut ctx, function)
+            .set_root(root)
+            .expect("set root");
+
+        ctx.delete_block(root, function);
+
+        assert!(!ctx.contains_block(root));
+        assert!(FunctionBody::from_id(&ctx, function).root().is_none());
+        assert!(ctx.block_ids().is_empty());
     }
 
     #[test]

@@ -111,6 +111,11 @@ impl<'a, 'str> HostRef<'a, 'str> {
         &self.function(id.func).blocks[id.local]
     }
 
+    /// Whether `id` currently names a live block payload.
+    pub fn contains_block(self, id: BlockId) -> bool {
+        self.function(id.func).blocks.contains(id.local)
+    }
+
     /// The block parameter `id`, routed to its owning function's arena.
     pub fn block_param(self, id: BlockParamId) -> &'a BlockParam<'str> {
         &self.function(id.func).params[id.local]

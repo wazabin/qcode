@@ -96,14 +96,6 @@ pub struct BasicBlock<'str> {
     /// `parent == Some(id.func)` — the arena that stores the block is its
     /// owning function.
     pub parent: Option<FunctionId>,
-
-    /// Tombstone flag. Per-function block arenas are append-only and never
-    /// compacted, so a removed block stays in its arena; this marks it as
-    /// logically deleted. Deleted blocks are skipped by
-    /// [`FunctionRef::blocks`](crate::value::FunctionRef::blocks) and the
-    /// whole-context block iterators.
-    #[serde(default)]
-    pub deleted: bool,
 }
 
 impl<'str> BasicBlock<'str> {
@@ -160,6 +152,11 @@ impl<'str> BasicBlock<'str> {
     /// responsible for registering the name in the owning function's name table.
     pub(crate) fn set_name(&mut self, name: Option<Cow<'str, str>>) {
         self.name = name;
+    }
+
+    /// The locally stored name, for owning-arena removal bookkeeping.
+    pub(crate) fn local_name(&self) -> Option<&str> {
+        self.name.as_deref()
     }
 
     /// A fresh, empty block value parented to `func` (crate-internal; the generic
@@ -703,7 +700,7 @@ macro_rules! impl_block_mut_verbs {
         self.ctx.insert_insn_before(id, before_id, insn_id);
     }
 
-    /// Removes this block from its function (full cleanup + tombstone). Delegates
+    /// Removes this block from its function, including its payload. Delegates
     /// to the backing's `delete_block` verb.
     pub fn delete(&mut self, function_id: FunctionId) {
         let id = self.id;
@@ -1368,7 +1365,10 @@ mod tests {
             1,
             "deleted block's edge must not linger as a phantom predecessor"
         );
-        assert_eq!(BasicBlock::from_id(&ctx, b).successors().count(), 0);
+        assert!(
+            !ctx.contains_block(b),
+            "deleted block payload must be absent"
+        );
     }
 
     /// A self-loop edge appears once in the block's edge set and must unlink
@@ -1395,10 +1395,9 @@ mod tests {
 
         BasicBlock::from_id_mut(&mut ctx, loop_hdr).delete(f);
 
-        assert_eq!(BasicBlock::from_id(&ctx, loop_hdr).successors().count(), 0);
-        assert_eq!(
-            BasicBlock::from_id(&ctx, loop_hdr).predecessors().count(),
-            0
+        assert!(
+            !ctx.contains_block(loop_hdr),
+            "deleted self-loop block payload must be absent"
         );
     }
 

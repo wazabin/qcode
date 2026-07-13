@@ -64,9 +64,9 @@ impl<'a, 'str> PassBacking<'a, 'str> {
         let id = fun.id();
         assert!(
             fun.roster.iter().all(|&local| {
-                // Stored in this function's own arena, and (if live) parented to it.
+                // Stored in this function's own arena and parented to it.
                 let blk = &fun.blocks[local];
-                blk.deleted || blk.parent == Some(id)
+                blk.parent == Some(id)
             }),
             "PassBacking requires a function with no reattributed blocks"
         );
@@ -360,9 +360,8 @@ impl<'a, 'str> PassBacking<'a, 'str> {
         self.function_mut(id.func).insns.remove(id.local);
     }
 
-    pub fn merge_nodes(&mut self, keep: BlockId, remove: BlockId, direct_edge: EdgeId) {
+    pub fn rehome_outgoing_edges(&mut self, keep: BlockId, remove: BlockId) {
         let func = keep.func;
-        self.remove_cfg_edge(func, direct_edge);
         let outgoing: Vec<EdgeId> = {
             let host = self.read_host();
             host.block(remove)
@@ -461,10 +460,19 @@ impl<'a, 'str> PassBacking<'a, 'str> {
         for param in params {
             self.remove_block_param(param);
         }
+        let name = self
+            .read_host()
+            .block(block)
+            .local_name()
+            .map(str::to_owned);
         self.unroster_block(block);
-        let b = self.block_mut(block);
-        b.parent = None;
-        b.deleted = true;
+        if self.function_mut(block.func).root_id() == Some(block.local) {
+            self.function_mut(block.func).set_root_id(None);
+        }
+        if let Some(name) = name {
+            self.function_mut(block.func).names.forget(&name);
+        }
+        self.function_mut(block.func).blocks.remove(block.local);
     }
 
     pub fn absorb_block(
@@ -478,7 +486,7 @@ impl<'a, 'str> PassBacking<'a, 'str> {
             keep.func, other.func,
             "cannot absorb across function arenas"
         );
-        let branch_args = {
+        let (branch_id, branch_args) = {
             let host = self.read_host();
             host.block(keep)
                 .instructions
@@ -491,12 +499,12 @@ impl<'a, 'str> PassBacking<'a, 'str> {
                         Mnemonic::Branch(branch)
                             if BlockId::new(keep.func, branch.target) == other =>
                         {
-                            Some(branch.args.clone())
+                            Some((InstructionId::new(keep.func, local), branch.args.clone()))
                         }
                         _ => None,
                     }
                 })
-                .unwrap_or_default()
+                .expect("absorbed block must be reached by keep's terminal branch")
         };
         let other_params: Vec<_> = self
             .read_host()
@@ -513,28 +521,38 @@ impl<'a, 'str> PassBacking<'a, 'str> {
                 other_params.len(),
                 branch_args.len()
             );
-            for (param, arg) in other_params.into_iter().zip(branch_args) {
+            for (param, arg) in other_params.iter().copied().zip(branch_args) {
                 self.replace_all_uses_with(ValueId::BlockParam(param), arg.qualify(keep.func));
             }
         }
-        self.block_mut(keep).instructions.pop();
+        self.remove_cfg_edge(keep.func, edge_ab);
+        self.remove_instruction(branch_id);
         let b_insns = std::mem::take(&mut self.block_mut(other).instructions);
         for &local in &b_insns {
             self.instruction_mut(InstructionId::new(other.func, local))
                 .parent = Some(keep.local);
         }
         self.block_mut(keep).instructions.extend(b_insns);
-        self.merge_nodes(keep, other, edge_ab);
-        let (b_addr, b_extra) = {
+        self.rehome_outgoing_edges(keep, other);
+        let (b_addr, b_extra, b_name) = {
             let b = self.read_host().block(other);
-            (b.address, b.extra_addresses.clone())
+            (
+                b.address,
+                b.extra_addresses.clone(),
+                b.local_name().map(str::to_owned),
+            )
         };
-        self.unroster_block(other);
-        {
-            let ob = self.block_mut(other);
-            ob.parent = None;
-            ob.deleted = true;
+        for param in other_params {
+            self.remove_block_param(param);
         }
+        self.unroster_block(other);
+        if self.function_mut(other.func).root_id() == Some(other.local) {
+            self.function_mut(other.func).set_root_id(Some(keep.local));
+        }
+        if let Some(name) = b_name {
+            self.function_mut(other.func).names.forget(&name);
+        }
+        self.function_mut(other.func).blocks.remove(other.local);
         if let Some(addr) = b_addr {
             self.block_mut(keep).extra_addresses.push(addr);
         }
