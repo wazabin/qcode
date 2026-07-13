@@ -27,15 +27,20 @@ pub use config::{
 pub use lifter::{LiftOutcome, LiftSummary, Lifter, PipelineServices};
 pub use module_view::{ContextSplit, ContextView, FunctionBody, Minted, Outcome};
 
-/// Install a set of minted functions into their reserved slots (test-only shim
-/// over the barrier installer, so `test_util::with_minting` can exercise the
-/// outlining helpers without the full driver). Panics on a name collision.
+/// Install a set of minted functions and resolve the owner's placeholders
+/// (test-only shim over the barrier, so `test_util::with_minting` can exercise
+/// outlining helpers without the full driver). Panics on an invalid slot or
+/// name collision.
 #[cfg(test)]
 pub(crate) fn install_minted_for_test<'str>(
     ctx: &mut qcode::context::Context<'str>,
+    owner: qcode::value::FunctionId,
+    before_targets: &[qcode::value::FunctionId],
     minted: Vec<Minted<'str>>,
 ) {
-    pass::install_minted(ctx, "test", minted).expect("minted install");
+    let installed = pass::install_minted(ctx, "test", minted).expect("minted install");
+    pass::resolve_minted_callees(ctx, "test", owner, &installed).expect("minted callee resolution");
+    ctx.resync_call_sites(owner, before_targets);
 }
 pub(crate) use pass::with_checked_out_body;
 pub use pass::{

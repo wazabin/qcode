@@ -132,6 +132,39 @@ pub enum Mnemonic {
 }
 
 impl Mnemonic {
+    /// The unresolved direct-callee slot carried by this mnemonic, if any.
+    pub fn minted_callee_slot(&self) -> Option<u32> {
+        match self {
+            Self::Call(call) => call.target.minted(),
+            Self::TailCall(call) => call.target.minted(),
+            Self::Apply(apply) => apply.target.minted(),
+            Self::Map(map) => map.body.minted(),
+            Self::Scan(scan) => scan.body.minted(),
+            _ => None,
+        }
+    }
+
+    /// Resolve one pass-local direct-callee placeholder to its installed
+    /// function ID. Returns whether this mnemonic contained that placeholder.
+    pub fn resolve_minted_callee(&mut self, slot: u32, real: FunctionId) -> bool {
+        let callee = match self {
+            Self::Call(call) => Some(&mut call.target),
+            Self::TailCall(call) => Some(&mut call.target),
+            Self::Apply(apply) => Some(&mut apply.target),
+            Self::Map(map) => Some(&mut map.body),
+            Self::Scan(scan) => Some(&mut scan.body),
+            _ => None,
+        };
+        let Some(callee) = callee else {
+            return false;
+        };
+        if *callee != super::Callee::Minted(slot) {
+            return false;
+        }
+        *callee = super::Callee::Real(real);
+        true
+    }
+
     fn as_kind(&self) -> &dyn MnemonicKind {
         match self {
             Mnemonic::Load(m) => m,

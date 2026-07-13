@@ -218,11 +218,9 @@ fn transform<'str>(
     let host_fid = body.id();
     let name = format!("{}_rec", body.read_host(m).function_ref(host_fid).name());
     // Mint the recursive lambda (name buffered raw; the driver uniquifies it at
-    // the barrier). `None` (pool exhausted) leaves the loop alone.
-    let Some(rec) = body.mint_function(minted_out, Cow::Owned(name), FunctionKind::Lambda, true)
-    else {
-        return false;
-    };
+    // the barrier). Keep the placeholder in both recursive and host references;
+    // the install barrier patches it to the materialized function id.
+    let rec = body.mint_function(minted_out, Cow::Owned(name), FunctionKind::Lambda, true);
 
     // The set of back-edge latch blocks: their `goto head` terminator becomes an
     // `apply rec(next…); return` in the clone, so it is cloned specially.
@@ -242,7 +240,7 @@ fn transform<'str>(
         let mut block_map: HashMap<BlockId, BlockId> = HashMap::default();
         let mut value_map: HashMap<ValueId, ValueId> = HashMap::default();
         for &ob in &model.region {
-            let nb = minted.make_block(rec);
+            let nb = minted.make_block(host_fid);
             block_map.insert(ob, nb);
             if let Some(name) = own.block_ref(ob).name() {
                 let _ =
@@ -268,7 +266,7 @@ fn transform<'str>(
             }
         }
         minted
-            .function_mut(rec)
+            .function_mut(host_fid)
             .set_root_id(Some(block_map[&model.head].local));
 
         // Pass 2: clone every non-terminator instruction (and the terminator of a
@@ -288,7 +286,7 @@ fn transform<'str>(
                 let mut mn = r.mnemonic().clone();
                 let ty = r.type_id();
                 remap_block_targets(&mut mn, ob.func, nb.func, &block_map);
-                let new_id = minted.push_mnemonic_with_type(rec, mn, ty);
+                let new_id = minted.push_mnemonic_with_type(host_fid, mn, ty);
                 BaseRef::new(minted.reborrow(), nb).push_insn(new_id);
                 value_map.insert(ValueId::Instruction(iid), ValueId::Instruction(new_id));
                 cloned.push(new_id);

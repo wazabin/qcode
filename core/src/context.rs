@@ -2169,6 +2169,26 @@ pub struct NameTable<'str> {
 }
 
 impl<'str> NameTable<'str> {
+    /// Rebind function-qualified values after a detached function body built
+    /// under `from` is installed under `to`. Function-local storage itself uses
+    /// local IDs; only this reverse lookup metadata carries the ambient owner.
+    pub(crate) fn rebind_function(&mut self, from: FunctionId, to: FunctionId) {
+        for value in self.map.values_mut() {
+            *value = match *value {
+                ValueId::Instruction(id) if id.func == from => {
+                    ValueId::Instruction(InstructionId::new(to, id.local))
+                }
+                ValueId::BasicBlock(id) if id.func == from => {
+                    ValueId::BasicBlock(BlockId::new(to, id.local))
+                }
+                ValueId::BlockParam(id) if id.func == from => {
+                    ValueId::BlockParam(BlockParamId::new(to, id.local))
+                }
+                other => other,
+            };
+        }
+    }
+
     /// The value currently holding `name`, if any.
     pub fn get(&self, name: &str) -> Option<ValueId> {
         self.map.get(name).copied()

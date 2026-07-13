@@ -225,8 +225,8 @@ fn apply<'str>(
     let singleton_id = IntrinsicId::from_name("singleton").expect("singleton registered");
     let concat_id = IntrinsicId::from_name("concat").expect("concat registered");
 
-    // Outline the `(acc, ·)` body before any rewrite (a non-closed body or an
-    // exhausted mint pool leaves the loop untouched), keeping the src shape.
+    // Outline the `(acc, ·)` body before any rewrite (a non-closed body leaves
+    // the loop untouched), keeping the src shape.
     enum Src {
         /// `l0[1..]` slice of the original array (data-input scan).
         Slice { l0_exit: ValueId, esz: usize },
@@ -333,7 +333,7 @@ fn apply<'str>(
         let id = body.push_mnemonic_with_type(
             mv,
             Mnemonic::Scan(qcode::value::insn::Scan {
-                body: qcode::value::insn::Callee::Real(body_fn),
+                body: body_fn,
                 init: m.seed_val.localize(fid),
                 src: src.localize(fid),
                 captures: Vec::new(),
@@ -517,6 +517,18 @@ mod tests {
         assert!(
             ir.contains("scanl"),
             "the promoted loop should fold to a scanl over the original array: {ir}"
+        );
+        let scan_body = Function::from_id(&ctx, prefix)
+            .iter()
+            .flat_map(|block| block.iter())
+            .find_map(|insn| match insn.mnemonic() {
+                Mnemonic::Scan(scan) => Some(scan.body),
+                _ => None,
+            })
+            .expect("folded function contains a scan");
+        assert!(
+            scan_body.real().is_some(),
+            "the install barrier must patch the minted scan body"
         );
     }
 

@@ -235,36 +235,24 @@ impl<T: FunctionPass + Send + Sync> DynFunctionPass for FunctionPassAdapter<T> {
         fun_id: FunctionId,
         env: &PipelineEnv,
     ) -> Result<bool, String> {
-        // A minting pass run through the adapter (unit tests, `module(...)`
-        // spellings) reserves its own throwaway ids — there is no driver pool on
-        // this path. Unused ones stay behind as sentinel tombstones (never
-        // observed, never rendered); the stage driver's pooled path recycles.
-        let reserved: Vec<FunctionId> = if T::MINTS {
-            (0..MINT_RESERVE)
-                .map(|_| ctx.push_sentinel_function())
-                .collect()
-        } else {
-            Vec::new()
-        };
         // Split the context: borrow the target body `&mut` in place and run the
         // pass over the frozen module view; the view is bodies-free, so it cannot
         // alias the borrowed body.
         let before_targets = ctx.direct_call_targets(fun_id);
         let outcome = {
             let (bodies, view) = ctx.split(env);
-            let mut body = FunctionBody::new(fun_id, &mut bodies[fun_id], reserved);
-            // The body is dropped at the block end; its unused reserved ids stay
-            // behind as sentinel tombstones (this adapter path has no driver pool).
+            let mut body = FunctionBody::new(fun_id, &mut bodies[fun_id]);
             self.run_checked(&mut body, view)?
         };
         // Barrier, in the driver's order: install minted callees first (so the
         // owner's new call sites resolve), rebuild its `call_sites` diff, then
         // apply the returned self-rename. The body was mutated in place — nothing
         // to reinstall.
-        install_minted(ctx, T::NAME, outcome.minted)?;
+        let installed = install_minted(ctx, T::NAME, outcome.minted)?;
+        let patched = resolve_minted_callees(ctx, T::NAME, fun_id, &installed)?;
         ctx.resync_call_sites(fun_id, &before_targets);
         replay_rename(ctx, T::NAME, fun_id, outcome.rename)?;
-        Ok(outcome.changed)
+        Ok(outcome.changed || patched)
     }
 }
 
@@ -293,7 +281,7 @@ pub(crate) fn with_checked_out_body<'str, R>(
     let before_targets = ctx.direct_call_targets(fid);
     let out = {
         let (bodies, view) = ctx.split(&env);
-        let mut body = FunctionBody::new(fid, &mut bodies[fid], Vec::new());
+        let mut body = FunctionBody::new(fid, &mut bodies[fid]);
         // These entry points buffer no effects and mint nothing, so the drained
         // scratch is discarded.
         f(&mut body, view)
@@ -322,11 +310,13 @@ fn detached_env() -> PipelineEnv {
 /// (`PARALLEL_PASSES.md` ruling 3). Every current outliner mints at most one
 /// function per run; a pass needing more simply stops promoting when the pool
 /// runs dry.
+#[allow(dead_code)]
 pub(super) const MINT_RESERVE: usize = 2;
 
-/// Install a pass's minted functions into their reserved registry slots at the
-/// barrier (master thread, worklist order): uniquify each buffered raw name
-/// against the global map, replace the sentinel slot, and register the name.
+/// Append a pass's detached minted functions to the real function registries at
+/// the barrier (master thread, worklist order): predict the next lockstep ID,
+/// rebind the body's ambient ownership metadata to it, uniquify the buffered raw
+/// name, append interface and body together, and register the name.
 /// Returns the installed ids so the driver can mark them dirty for downstream
 /// `only_dirty` stages. Must run *before* the owning function's
 /// `resync_call_sites`, so its new call sites resolve against real callees.
@@ -335,22 +325,166 @@ pub(super) fn install_minted<'str>(
     pass: &str,
     minted: Vec<super::Minted<'str>>,
 ) -> Result<Vec<FunctionId>, String> {
+    for (expected_slot, entry) in minted.iter().enumerate() {
+        let slot = entry.slot();
+        if slot as usize != expected_slot {
+            return Err(format!(
+                "{pass}: minted function slot #{slot} is out of order; expected #{expected_slot}"
+            ));
+        }
+    }
     let mut installed = Vec::with_capacity(minted.len());
-    for (id, mut interface, body) in minted {
-        debug_assert!(
-            ctx.interfaces[id].is_sentinel(),
-            "{pass}: minted id {id:?} does not hold a reserved sentinel slot"
-        );
+    for minted in minted {
+        let id = FunctionId::from(ctx.bodies.len());
+        let (_, mut interface, body) = minted.into_installed_parts(id);
         let name = std::mem::take(&mut interface.name);
         let unique = ctx.get_unique_name(name);
         interface.name = unique.clone();
-        ctx.bodies.replace(id, body);
-        ctx.interfaces.replace(id, interface);
+        let appended = ctx.push_function(interface, body);
+        debug_assert_eq!(appended, id, "function registry append returned wrong id");
         ctx.update_name(unique, id.into(), None)
             .map_err(|e| format!("{pass}: minted-function name registration failed: {e}"))?;
         installed.push(id);
     }
     Ok(installed)
+}
+
+/// Resolve pass-local callee placeholders in `owner` after its minted functions
+/// have been installed at the barrier. `installed[k]` is the real function for
+/// `Callee::Minted(k)`; both vectors are produced in deterministic mint order.
+///
+/// This must run after [`install_minted`] and before `resync_call_sites`: the
+/// reverse call graph only records installed [`FunctionId`] targets, never
+/// pass-local slots. Returns whether any owner or installed body was patched.
+pub(super) fn resolve_minted_callees(
+    ctx: &mut Context<'_>,
+    pass: &str,
+    owner: FunctionId,
+    installed: &[FunctionId],
+) -> Result<bool, String> {
+    let mut changed = false;
+    for (slot, &real) in installed.iter().enumerate() {
+        let slot = u32::try_from(slot).expect("more than u32::MAX minted functions installed");
+        changed |= ctx.bodies[owner].resolve_minted_callee(slot, real) != 0;
+        for &minted_id in installed {
+            changed |= ctx.bodies[minted_id].resolve_minted_callee(slot, real) != 0;
+        }
+    }
+    for fun_id in std::iter::once(owner).chain(installed.iter().copied()) {
+        let unresolved = Function::from_id(ctx, fun_id)
+            .blocks()
+            .flat_map(|block| block.iter())
+            .find_map(|insn| insn.mnemonic().minted_callee_slot());
+        if let Some(slot) = unresolved {
+            return Err(format!(
+                "{pass}: function {fun_id:?} references minted callee #{slot}, but only {} were installed",
+                installed.len()
+            ));
+        }
+    }
+    // Newly appended bodies have no prior reverse-call-graph entries. Publish
+    // their now-real direct callees after every sibling/self slot is resolved.
+    for &minted_id in installed {
+        ctx.resync_call_sites(minted_id, &[]);
+    }
+
+    Ok(changed)
+}
+
+#[cfg(test)]
+mod minted_barrier_tests {
+    use super::*;
+    use qcode::{
+        builder::Builder,
+        testing::TestContext,
+        value::{
+            BasicBlock,
+            insn::{Call, Callee, InstructionId, Mnemonic},
+        },
+    };
+
+    fn caller_with_minted_call(slot: u32) -> (TestContext, FunctionId, InstructionId, FunctionId) {
+        let mut tc = TestContext::new();
+        let caller = Function::make(&mut tc.ctx, "caller".into()).unwrap().id;
+        let callee = Function::make(&mut tc.ctx, "callee".into()).unwrap().id;
+        let block = tc.ctx.get_or_make_block(0x1000, caller);
+        Function::from_id_mut(&mut tc.ctx, caller)
+            .set_root(block)
+            .unwrap();
+        {
+            let mut builder = Builder::from_block(BasicBlock::from_id_mut(&mut tc.ctx, block));
+            builder.push_call(callee);
+            unsafe { builder.dont_finalize() };
+        }
+        let call_id = BasicBlock::from_id(&tc.ctx, block)
+            .iter()
+            .find(|insn| matches!(insn.mnemonic(), Mnemonic::Call(_)))
+            .unwrap()
+            .id;
+        tc.ctx.replace_instruction_mnemonic(
+            call_id,
+            Mnemonic::Call(Call {
+                target: Callee::Minted(slot),
+                args: Vec::new(),
+                clobbers: Vec::new(),
+            }),
+        );
+        (tc, caller, call_id, callee)
+    }
+
+    #[test]
+    fn minted_callee_is_patched_before_resync() {
+        let (mut tc, caller, call_id, callee) = caller_with_minted_call(0);
+
+        assert!(resolve_minted_callees(&mut tc.ctx, "test", caller, &[callee]).unwrap());
+        let Mnemonic::Call(call) = tc.ctx.get_insn(call_id).mnemonic() else {
+            panic!("call disappeared");
+        };
+        assert_eq!(call.target, Callee::Real(callee));
+    }
+
+    #[test]
+    fn minted_body_can_reference_a_sibling_slot() {
+        let (mut tc, caller, _, first) = caller_with_minted_call(0);
+        let sibling = Function::make(&mut tc.ctx, "sibling".into()).unwrap().id;
+        let block = tc.ctx.get_or_make_block(0x2000, first);
+        Function::from_id_mut(&mut tc.ctx, first)
+            .set_root(block)
+            .unwrap();
+        let sibling_call = {
+            let mut builder = Builder::from_block(BasicBlock::from_id_mut(&mut tc.ctx, block));
+            builder.push_call(sibling);
+            unsafe { builder.dont_finalize() };
+            drop(builder);
+            BasicBlock::from_id(&tc.ctx, block)
+                .iter()
+                .find(|insn| matches!(insn.mnemonic(), Mnemonic::Call(_)))
+                .unwrap()
+                .id
+        };
+        tc.ctx.replace_instruction_mnemonic(
+            sibling_call,
+            Mnemonic::Call(Call {
+                target: Callee::Minted(1),
+                args: Vec::new(),
+                clobbers: Vec::new(),
+            }),
+        );
+
+        assert!(resolve_minted_callees(&mut tc.ctx, "test", caller, &[first, sibling]).unwrap());
+        let Mnemonic::Call(call) = tc.ctx.get_insn(sibling_call).mnemonic() else {
+            panic!("call disappeared");
+        };
+        assert_eq!(call.target, Callee::Real(sibling));
+    }
+
+    #[test]
+    fn minted_callee_slot_must_have_an_installed_function() {
+        let (mut tc, caller, _, callee) = caller_with_minted_call(1);
+
+        let err = resolve_minted_callees(&mut tc.ctx, "test", caller, &[callee]).unwrap_err();
+        assert!(err.contains("minted callee #1"), "{err}");
+    }
 }
 
 /// Apply a function pass's returned self-rename claim ([`Outcome::rename`]) into

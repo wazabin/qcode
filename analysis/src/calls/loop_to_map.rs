@@ -230,8 +230,8 @@ fn apply<'str>(
         (name, uses_index, tuple_ty)
     };
 
-    // Outline the body before any rewrite, so a non-closed body (or an exhausted
-    // mint pool) leaves the loop untouched.
+    // Outline the body before any rewrite, so a non-closed body leaves the loop
+    // untouched.
     let body_fn = if uses_index {
         match outline_tupled(
             m,
@@ -284,7 +284,7 @@ fn apply<'str>(
         let id = body.push_mnemonic_with_type(
             m,
             Mnemonic::Map(qcode::value::insn::Map {
-                body: qcode::value::insn::Callee::Real(body_fn),
+                body: body_fn,
                 src: src.localize(body.id()),
                 captures: Vec::new(),
             }),
@@ -510,6 +510,18 @@ mod tests {
         assert!(folded, "the fully header-carried loop should fold to a map");
         let ir = format!("{}", Function::from_id(&ctx, xorbuf));
         assert!(ir.contains("<$>"), "folds to a map: {ir}");
+        let map_body = Function::from_id(&ctx, xorbuf)
+            .iter()
+            .flat_map(|block| block.iter())
+            .find_map(|insn| match insn.mnemonic() {
+                Mnemonic::Map(map) => Some(map.body),
+                _ => None,
+            })
+            .expect("folded function contains a map");
+        assert!(
+            map_body.real().is_some(),
+            "the install barrier must patch the minted map body"
+        );
         // The collapsed-exit form escapes the carried array to the wide store, so
         // deletability must be judged *after* the redirect — the dead loop (its carry
         // `$insert`) must be gone, not left behind for a dce that never collects it.

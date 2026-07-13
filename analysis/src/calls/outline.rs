@@ -18,7 +18,7 @@ use qcode::{
         BasicBlock, BlockId, Function, FunctionId, FunctionKind, InstructionRef, LocalValueId,
         ValueId, VarnodeId,
         block_param::BlockParam,
-        insn::{Binary, Binop, Extract, InstructionId, IntBinop, Mnemonic, Range, Return},
+        insn::{Binary, Binop, Callee, Extract, InstructionId, IntBinop, Mnemonic, Range, Return},
         util::{base_ref::BaseRef, base_ref::HostRef, host_mut::PassBacking},
     },
 };
@@ -104,7 +104,7 @@ pub(crate) fn outline_expression<'str>(
     name: &str,
     result: ValueId,
     inputs: &[ValueId],
-) -> Option<FunctionId> {
+) -> Option<Callee> {
     let slice = pure_slice(body.read_host(m), result, inputs)?;
     let inputs = inputs.to_vec();
     outline_core(
@@ -149,7 +149,7 @@ pub(crate) fn outline_tupled<'str>(
     index_input: ValueId,
     elem_input: Option<ValueId>,
     tuple_ty: TypeId,
-) -> Option<FunctionId> {
+) -> Option<Callee> {
     let mut inputs = vec![index_input];
     inputs.extend(elem_input);
     let slice = pure_slice(body.read_host(m), result, &inputs)?;
@@ -230,7 +230,7 @@ pub(crate) fn outline_scan_body<'str>(
     acc_ty: TypeId,
     index_ty: TypeId,
     elem: ScanElem,
-) -> Option<FunctionId> {
+) -> Option<Callee> {
     let inputs: Vec<ValueId> = match elem {
         // A scalar source has no separate data lane to bind.
         ScanElem::Scalar(_) => {
@@ -383,8 +383,8 @@ pub(crate) fn substitute_operands(mn: &mut Mnemonic, pairs: &[(LocalValueId, Loc
 /// order) with operands remapped through the value map that `seed` installs.
 /// `seed` receives a read view of the owning function and the minted mutation
 /// host, creates the root block's parameters (and any unpacking instructions),
-/// and returns the initial input→value map. Returns `None` when the mint pool is
-/// exhausted (the caller then leaves the loop unrecognized).
+/// and returns the initial input→value map. The returned callee remains a
+/// pass-local placeholder until the install barrier patches its owner sites.
 fn outline_core<'str>(
     m: ContextView<'_, 'str>,
     body: &mut FunctionBody<'_, 'str>,
@@ -397,16 +397,17 @@ fn outline_core<'str>(
         &mut qcode::value::util::host_mut::PassBacking<'a, 'str>,
         BlockId,
     ) -> HashMap<ValueId, ValueId>,
-) -> Option<FunctionId> {
+) -> Option<Callee> {
     // Fully pure: a deterministic function of its params. `is_pure` (with the
     // implied `pure_reg`) is set by `mint_function`; the GUI purity badge keys
     // off `pure_reg`.
-    let fid = body.mint_function(
+    let callee = body.mint_function(
         minted_out,
         std::borrow::Cow::Owned(name.to_owned()),
         FunctionKind::Machine,
         /*pure*/ true,
-    )?;
+    );
+    let fid = body.id();
 
     // Read the slice mnemonics/types from the owning function up front, so the
     // minted-host borrow below does not overlap the owner read.
@@ -423,7 +424,7 @@ fn outline_core<'str>(
     let dummy_ptr = m.shr().get_const(0, 8);
     let ret_ty = m.shr().types.get_or_make_int(1);
 
-    let (own, mut minted) = body.host_with_minted(minted_out, m, fid);
+    let (own, mut minted) = body.host_with_minted(minted_out, m, callee);
     // Root block, set as the minted function's entry, named for display (block
     // names are function-scoped, so uniqueness is within the new function).
     let root = minted.make_block(fid);
@@ -465,7 +466,7 @@ fn outline_core<'str>(
         }),
         ret_ty,
     );
-    Some(fid)
+    Some(callee)
 }
 
 /// Inline the pure straight-line body of `body_fn` (a single-block function
@@ -561,10 +562,13 @@ mod tests {
             (idx, elem, result)
         };
 
-        let body = crate::test_util::with_minting(&mut tc.ctx, host, |m, body, minted| {
+        let outlined = crate::test_util::with_minting(&mut tc.ctx, host, |m, body, minted| {
             outline_expression(m, body, minted, "body", result, &[idx, elem])
-        })
-        .expect("expression is closed over (idx, elem)");
+        });
+        assert!(outlined.is_some(), "expression is closed over (idx, elem)");
+        let body = Function::from_name(&tc.ctx, "body")
+            .expect("the mint barrier installs the outlined body")
+            .id;
 
         // Two params, in input order, with the input widths.
         let params: Vec<usize> = Function::from_id(&tc.ctx, body)
@@ -657,10 +661,13 @@ mod tests {
         let enum_ty = enum_id.desc().result_type(&tc.ctx.shared.types, &[arr_ty]);
         let (tuple_ty, _) = tc.ctx.shared.types.array_of(enum_ty).unwrap();
 
-        let body = crate::test_util::with_minting(&mut tc.ctx, host, |m, body, minted| {
+        let outlined = crate::test_util::with_minting(&mut tc.ctx, host, |m, body, minted| {
             outline_tupled(m, body, minted, "body", result, idx, Some(elem), tuple_ty)
-        })
-        .expect("expression is closed over (idx, elem)");
+        });
+        assert!(outlined.is_some(), "expression is closed over (idx, elem)");
+        let body = Function::from_name(&tc.ctx, "body")
+            .expect("the mint barrier installs the outlined body")
+            .id;
 
         // A single param — the tuple — sized to the `(i64, i8)` aggregate.
         let params: Vec<usize> = Function::from_id(&tc.ctx, body)

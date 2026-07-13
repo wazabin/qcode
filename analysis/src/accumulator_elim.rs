@@ -288,25 +288,26 @@ fn transform<'str>(
     let host_fid = body.id();
     let base_name = format!("{}_acc", body.read_host(m).function_ref(host_fid).name());
     // Mint the driver-only recursive lambda (name buffered raw; the driver
-    // uniquifies it at the barrier). `None` (pool exhausted) leaves the loop alone.
-    let Some(g) = body.mint_function(
+    // uniquifies it at the barrier). Keep the placeholder in every reference;
+    // the install barrier patches it to the materialized function id.
+    let g = body.mint_function(
         minted_out,
         Cow::Owned(base_name.clone()),
         FunctionKind::Lambda,
         true,
-    ) else {
-        return;
-    };
+    );
 
     // --- Build the lambda body: read the host expressions, write the minted one.
     let tuple_ty = {
         let (own, mut minted) = body.host_with_minted(minted_out, m, g);
 
         // Three fresh blocks: header (root, drivers in), base case, recursive case.
-        let g_head = minted.make_block(g);
-        let base = minted.make_block(g);
-        let rec = minted.make_block(g);
-        minted.function_mut(g).set_root_id(Some(g_head.local));
+        let g_head = minted.make_block(host_fid);
+        let base = minted.make_block(host_fid);
+        let rec = minted.make_block(host_fid);
+        minted
+            .function_mut(host_fid)
+            .set_root_id(Some(g_head.local));
         let _ = BaseRef::new(minted.reborrow(), base)
             .rename_local(Cow::Owned(format!("{base_name}_base")));
         let _ = BaseRef::new(minted.reborrow(), rec)
@@ -382,8 +383,11 @@ fn transform<'str>(
                 &mut minted,
                 rec,
                 Mnemonic::Apply(Apply {
-                    target: qcode::value::insn::Callee::Real(g),
-                    args: driver_next.into_iter().map(|a| a.localize(g)).collect(),
+                    target: g,
+                    args: driver_next
+                        .into_iter()
+                        .map(|a| a.localize(host_fid))
+                        .collect(),
                 }),
                 tuple_ty,
             );
@@ -437,7 +441,7 @@ fn transform<'str>(
         &mut host,
         root,
         Mnemonic::Apply(Apply {
-            target: qcode::value::insn::Callee::Real(g),
+            target: g,
             args: driver_init
                 .into_iter()
                 .map(|a| a.localize(root.func))

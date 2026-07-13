@@ -182,6 +182,49 @@ impl<'str> FunctionInterface<'str> {
 }
 
 impl<'str> Function<'str> {
+    /// Rebind the temporary ambient function ID used while constructing a
+    /// detached body to its installed registry ID.
+    ///
+    /// Function arenas, operands, CFG edges, roster entries, and use-def data
+    /// are body-local and need no remap. Only live block ownership metadata and
+    /// function-qualified entries in the local reverse-name table carry the
+    /// ambient ID. Real `Callee::Real` targets inside instruction mnemonics are
+    /// semantic cross-function references, not ownership metadata, and are
+    /// deliberately left untouched.
+    pub fn rebind_ambient_id(&mut self, from: FunctionId, to: FunctionId) {
+        if from == to {
+            return;
+        }
+        for mut block in self.blocks.iter_mut().filter(|block| !block.deleted) {
+            assert_eq!(
+                block.parent,
+                Some(from),
+                "detached function block has an unexpected ambient owner"
+            );
+            block.parent = Some(to);
+        }
+        self.names.rebind_function(from, to);
+    }
+
+    /// Resolve one pass-local callee slot throughout this detached or installed
+    /// body. Returns the number of call-like instructions patched.
+    pub fn resolve_minted_callee(&mut self, slot: u32, real: FunctionId) -> usize {
+        let mut patched = 0;
+        for mut insn in self.insns.iter_mut().filter(|insn| !insn.deleted) {
+            patched += usize::from(insn.mnemonic_mut().resolve_minted_callee(slot, real));
+        }
+        patched
+    }
+
+    /// Unresolved direct-callee slots still present in live instructions.
+    pub fn minted_callee_slots(&self) -> Vec<u32> {
+        self.insns
+            .iter()
+            .filter(|insn| !insn.deleted)
+            .filter_map(|insn| insn.mnemonic().minted_callee_slot())
+            .collect()
+    }
+
     /// An empty function *body*: no root, empty arenas. The interface lives
     /// separately in [`Context::interfaces`](crate::context::Context::interfaces).
     pub fn empty_body() -> Self {

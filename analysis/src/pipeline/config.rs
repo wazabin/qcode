@@ -20,8 +20,8 @@ use qcode::{
 
 use super::lifter::PipelineServices;
 use super::pass::{
-    DynFunctionPass, DynPass, MINT_RESERVE, PipelineEnv, RegisteredPass, install_minted,
-    known_pass_names, make_pass, replay_rename,
+    DynFunctionPass, DynPass, PipelineEnv, RegisteredPass, install_minted, known_pass_names,
+    make_pass, replay_rename, resolve_minted_callees,
 };
 use super::{
     ContextSplit, ContextView, FunctionBody, Outcome, PipelineProgress, ProgressSink, YieldSignal,
@@ -1212,6 +1212,7 @@ impl FixpointCache {
 /// (again in worklist order) and are consumed by the *next* stage before any new
 /// sentinel is pushed. Scope is one pipeline run, like [`FixpointCache`];
 /// pipeline-end leftovers stay behind as sentinel tombstones.
+#[allow(dead_code)]
 #[derive(Default)]
 struct MintPool {
     /// Recycled reserved ids, FIFO. Never consumed by the stage that returned
@@ -1219,6 +1220,7 @@ struct MintPool {
     available: std::collections::VecDeque<FunctionId>,
 }
 
+#[allow(dead_code)]
 impl MintPool {
     /// Draw `n` reserved ids: recycled ones first, then fresh sentinel slots
     /// pushed into the registry.
@@ -1374,7 +1376,7 @@ async fn run_function_stage(
     // discoveries, so re-optimizing it is pure waste. `None` processes all functions.
     restrict: Option<&HashSet<FunctionId>>,
     cache: &mut FixpointCache,
-    pool: &mut MintPool,
+    _pool: &mut MintPool,
     round: usize,
     progress: &mut impl ProgressSink,
 ) -> Result<HashSet<FunctionId>, String> {
@@ -1407,6 +1409,7 @@ async fn run_function_stage(
     // Every function pass is driven over a body borrowed in place from the bodies
     // registry (`run_one_function`) — the shape Stage 6 runs on worker threads.
 
+    /*
     /*
     /*
     for (index, fun_id) in fun_ids.into_iter().enumerate() {
@@ -1523,6 +1526,7 @@ async fn run_function_stage(
         }
     }
 
+    */
     // Parallelize the stage across threads once the worklist is worth the fan-out
     // cost. Strict IR locality (context-split ruling 2) is established at the
     // optimization entry and every discovery round, so every function body is
@@ -1544,8 +1548,6 @@ async fn run_function_stage(
             cache,
             &mut elapsed,
             &mut dirty,
-            &mut reservations,
-            &mut leftover,
             threads,
             progress,
         )?;
@@ -1569,11 +1571,10 @@ async fn run_function_stage(
             // effects). The snapshot of outgoing call targets is taken before the
             // split so `resync_call_sites` can diff it afterwards.
             let before_targets = ctx.direct_call_targets(fun_id);
-            let reserved = reservations.remove(&fun_id).unwrap_or_default();
-            let (outcome, unused) = {
+            let outcome = {
                 let (bodies, view) = ctx.split(env);
-                let mut body = FunctionBody::new(fun_id, &mut bodies[fun_id], reserved);
-                let outcome = run_one_function(
+                let mut body = FunctionBody::new(fun_id, &mut bodies[fun_id]);
+                run_one_function(
                     passes,
                     &mut body,
                     view,
@@ -1592,23 +1593,21 @@ async fn run_function_stage(
                             pass,
                         });
                     },
-                )?;
-                let unused = body.into_reserved();
-                (outcome, unused)
+                )?
             };
             // Install minted callees before the owner's call sites resync, so the
             // new calls resolve against real functions.
             let installed = install_minted(ctx, &stage.name, outcome.minted)?;
+            let patched = resolve_minted_callees(ctx, &stage.name, fun_id, &installed)?;
             ctx.resync_call_sites(fun_id, &before_targets);
             replay_rename(ctx, &stage.name, fun_id, outcome.rename)?;
             // Minted functions are new work for downstream `only_dirty` stages.
             dirty.extend(installed);
-            leftover.insert(fun_id, unused);
             // Opt-in `QCODE_VERIFY` check once the split borrow has ended — the body
             // is reachable through `ctx` again — pinning any invariant break to this
             // stage. A no-op unless `QCODE_VERIFY` is set.
             crate::verify::verify_after(ctx, &stage.name);
-            if outcome.changed {
+            if outcome.changed || patched {
                 dirty.insert(fun_id);
             }
         }
@@ -1618,14 +1617,6 @@ async fn run_function_stage(
         // and can cancel, in which case we stop early and return the work done so far.
         if let YieldSignal::Cancelled = progress.yield_now().await {
             return Ok(dirty);
-        }
-    }
-
-    // Recycle unused reservations in worklist order — deterministic and identical
-    // on both lanes regardless of which lane checked a function in.
-    for fun_id in &fun_ids {
-        if let Some(ids) = leftover.remove(fun_id) {
-            pool.recycle(ids);
         }
     }
 
@@ -1769,14 +1760,9 @@ fn resolve_threads() -> usize {
 }
 
 /// Per-function driver metadata snapshotted before the split borrow: the id, the
-/// display name, the pre-run call-target set (for the barrier `call_sites` diff),
-/// and the minting reservations assigned in worklist order.
-type FnMeta = (
-    FunctionId,
-    std::sync::Arc<str>,
-    Vec<FunctionId>,
-    Vec<FunctionId>,
-);
+/// display name, and the pre-run call-target set (for the barrier `call_sites`
+/// diff).
+type FnMeta = (FunctionId, std::sync::Arc<str>, Vec<FunctionId>);
 
 /// One worklist function on its way through a parallel stage: its identity, the
 /// pre-run call-target snapshot (for the barrier `call_sites` diff), the body a
@@ -1820,21 +1806,17 @@ fn run_stage_parallel(
     cache: &mut FixpointCache,
     elapsed: &mut HashMap<&'static str, (std::time::Duration, usize, usize)>,
     dirty: &mut HashSet<FunctionId>,
-    reservations: &mut HashMap<FunctionId, Vec<FunctionId>>,
-    leftover: &mut HashMap<FunctionId, Vec<FunctionId>>,
     threads: usize,
     progress: &mut impl FnMut(PipelineProgress),
 ) -> Result<(), String> {
     // 1. Snapshot per-function driver metadata that needs `&ctx` — the display
-    //    name, the pre-run call-target set (for the barrier `call_sites` diff), and
-    //    the minting reservations assigned in worklist order — before the split
-    //    borrow freezes the context.
+    //    name and the pre-run call-target set (for the barrier `call_sites` diff)
+    //    before the split borrow freezes the context.
     let mut metas: Vec<FnMeta> = Vec::with_capacity(fun_ids.len());
     for &fun_id in fun_ids {
         let name: std::sync::Arc<str> = FunctionRef::from_id(ctx, fun_id).name().into();
         let before_targets = ctx.direct_call_targets(fun_id);
-        let reserved = reservations.remove(&fun_id).unwrap_or_default();
-        metas.push((fun_id, name, before_targets, reserved));
+        metas.push((fun_id, name, before_targets));
     }
 
     let chunk_size = fun_ids.len().div_ceil(threads).max(1);
@@ -1855,12 +1837,12 @@ fn run_stage_parallel(
             .zip(slots)
             .enumerate()
             .map(
-                |(index, ((fun_id, name, before_targets, reserved), slot))| ParallelEntry {
+                |(index, ((fun_id, name, before_targets), slot))| ParallelEntry {
                     index,
                     fun_id,
                     name,
                     before_targets,
-                    body: FunctionBody::new(fun_id, slot, reserved),
+                    body: FunctionBody::new(fun_id, slot),
                     outcome: Outcome::default(),
                 },
             )
@@ -1949,14 +1931,11 @@ fn run_stage_parallel(
             qcode::pass_scope::absorb_stats(out.stats);
         }
 
-        // Drain each body into an owned outcome (releasing its `&mut` borrow), in
-        // worklist order, for the barrier below.
+        // Move each outcome out (releasing the entries and their body borrows),
+        // in worklist order, for the barrier below.
         entries
             .into_iter()
-            .map(|e| {
-                let unused = e.body.into_reserved();
-                (e.fun_id, e.before_targets, e.outcome, unused)
-            })
+            .map(|e| (e.fun_id, e.before_targets, e.outcome))
             .collect::<Vec<_>>()
     };
 
@@ -1964,16 +1943,16 @@ fn run_stage_parallel(
     //    owner's call sites resync, rebuild `call_sites`, apply the returned
     //    self-rename, and record dirtiness. The bodies were mutated in place, so
     //    there is nothing to reinstall.
-    for (fun_id, before_targets, outcome, unused) in results {
+    for (fun_id, before_targets, outcome) in results {
         let installed = install_minted(ctx, &stage.name, outcome.minted)?;
+        let patched = resolve_minted_callees(ctx, &stage.name, fun_id, &installed)?;
         ctx.resync_call_sites(fun_id, &before_targets);
         replay_rename(ctx, &stage.name, fun_id, outcome.rename)?;
         dirty.extend(installed);
-        leftover.insert(fun_id, unused);
         // Opt-in `QCODE_VERIFY` check once the split borrow has ended. A no-op
         // unless enabled.
         crate::verify::verify_after(ctx, &stage.name);
-        if outcome.changed {
+        if outcome.changed || patched {
             dirty.insert(fun_id);
         }
     }

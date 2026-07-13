@@ -29,16 +29,54 @@ use qcode::{
         block::{BasicBlock, BlockId, EdgeId},
         block_param::{BlockParam, BlockParamId},
         function::FunctionInterface,
-        insn::{Instruction, InstructionId, Mnemonic},
+        insn::{Callee, Instruction, InstructionId, Mnemonic},
         util::{base_ref::HostRef, host_mut::PassBacking},
     },
 };
 
 use super::PipelineEnv;
 
-/// A function minted by a pass this run: its reserved id, its interface, and its
-/// body. Installed into the reserved slot by the driver at the barrier.
-pub type Minted<'str> = (FunctionId, FunctionInterface<'str>, Function<'str>);
+/// A detached function minted by a pass this run.
+///
+/// `slot` is the pass-local [`Callee::Minted`] index used by the owner's IR;
+/// it is not a reserved registry ID. `ambient` is the owner's installed ID,
+/// borrowed temporarily while building the detached body's checked refs. The
+/// body stores local IR IDs, so installation only rebinds block ownership and
+/// local-name metadata through [`Function::rebind_ambient_id`].
+pub struct Minted<'str> {
+    slot: u32,
+    ambient: FunctionId,
+    pub interface: FunctionInterface<'str>,
+    pub body: Function<'str>,
+}
+
+impl<'str> Minted<'str> {
+    /// The pass-local placeholder carried by owner call-like instructions.
+    pub const fn callee(&self) -> Callee {
+        Callee::Minted(self.slot)
+    }
+
+    /// The placeholder's zero-based index in [`Outcome::minted`].
+    pub const fn slot(&self) -> u32 {
+        self.slot
+    }
+
+    /// The real owner ID temporarily used to qualify checked refs while this
+    /// detached body is being built.
+    pub const fn ambient_id(&self) -> FunctionId {
+        self.ambient
+    }
+
+    /// Consume this detached function for installation under `installed`.
+    /// No IR-local IDs are remapped; only ambient ownership metadata is rebound.
+    pub fn into_installed_parts(
+        mut self,
+        installed: FunctionId,
+    ) -> (u32, FunctionInterface<'str>, Function<'str>) {
+        self.body.rebind_ambient_id(self.ambient, installed);
+        (self.slot, self.interface, self.body)
+    }
+}
 
 /// The result of one function-pass run (context-split ruling 3): whether it
 /// changed the IR, an optional self-rename claim, and any functions it minted.
@@ -58,7 +96,8 @@ pub struct Outcome<'str> {
     /// function's pass fixpoint, so replay is deterministic.
     pub rename: Option<Cow<'str, str>>,
     /// Functions this run minted (the loop outliners), installed by the driver at
-    /// the barrier. Concatenated across a function's pass fixpoint.
+    /// the barrier. Concatenated across a function's pass fixpoint; entry `k`
+    /// carries slot `k`, because the slot counter lives on [`FunctionBody`].
     pub minted: Vec<Minted<'str>>,
 }
 
@@ -188,7 +227,7 @@ impl<'str> ContextSplit<'str> for Context<'str> {
 }
 
 /// The pass's own function, borrowed `&mut` in place from the bodies registry so
-/// the pass owns it exclusively, plus the function-minting pool.
+/// the pass owns it exclusively, plus its local minted-placeholder counter.
 ///
 /// The body is borrowed by the driver's [`split`](ContextSplit::split) and never
 /// leaves the registry; the exclusive `&mut` is what lets parallel workers hold
@@ -204,21 +243,19 @@ pub struct FunctionBody<'a, 'str> {
     /// the registry — the `&mut` is what gives the pass exclusive access while the
     /// frozen [`ContextView`] shares the rest of the module.
     fun: &'a mut Function<'str>,
-    /// Never-observed placeholder [`FunctionId`]s the pass may materialize new
-    /// functions into (loop outliners mint exactly one). Unused ids return to the
-    /// driver's pool at the barrier; drawn ids are paired with their built body in
-    /// the pass's `minted` buffer, destined for [`Outcome::minted`].
-    reserved_ids: Vec<FunctionId>,
+    /// Next placeholder slot. It lives on the checked-out body (not a single
+    /// pass outcome), so slots remain unique and ordered across a stage fixpoint.
+    next_minted: u32,
 }
 
 impl<'a, 'str> FunctionBody<'a, 'str> {
     /// Wrap the function `fun` (id `id`) borrowed in place from the bodies
-    /// registry, carrying `reserved_ids` for any function it mints.
-    pub fn new(id: FunctionId, fun: &'a mut Function<'str>, reserved_ids: Vec<FunctionId>) -> Self {
+    /// registry.
+    pub fn new(id: FunctionId, fun: &'a mut Function<'str>) -> Self {
         Self {
             id,
             fun,
-            reserved_ids,
+            next_minted: 0,
         }
     }
 
@@ -262,29 +299,21 @@ impl<'a, 'str> FunctionBody<'a, 'str> {
         }
     }
 
-    /// Mint a new function (`PARALLEL_PASSES.md` ruling 3): draw one reserved id
-    /// from the pool the driver assigned this run, create a detached
-    /// [`Function`] shell under `name` (buffered **raw** — global uniquification
-    /// happens when the driver installs it at the barrier) with the given `kind`,
-    /// push it into the pass's `minted` buffer (destined for
-    /// [`Outcome::minted`]), and return its id. `pure` marks it a deterministic
-    /// pure function (`is_pure` + the implied `pure_reg`), which every current
-    /// outliner's body is. Build the body through
-    /// [`host_with_minted`](Self::host_with_minted).
-    ///
-    /// Returns `None` when the reservation pool is exhausted — the calling pass
-    /// then simply stops promoting (skips its remaining candidates).
+    /// Mint a detached function and return its pass-local callee placeholder.
+    /// This is infallible and allocates no entry in the real function registry.
+    /// Raw names are uniquified only when the driver installs the outcome.
     pub fn mint_function(
         &mut self,
         minted: &mut Vec<Minted<'str>>,
         name: Cow<'str, str>,
         kind: FunctionKind,
         pure: bool,
-    ) -> Option<FunctionId> {
-        if self.reserved_ids.is_empty() {
-            return None;
-        }
-        let id = self.reserved_ids.remove(0);
+    ) -> Callee {
+        let slot = self.next_minted;
+        self.next_minted = self
+            .next_minted
+            .checked_add(1)
+            .expect("more than u32::MAX functions minted by one function run");
         let mut interface = FunctionInterface::new(name);
         interface.kind = kind;
         if pure {
@@ -294,24 +323,33 @@ impl<'a, 'str> FunctionBody<'a, 'str> {
             // latter (mirrors `outline_core` / `make_lambda`).
             sig.pure_reg = true;
         }
-        minted.push((id, interface, Function::empty_body()));
-        Some(id)
+        minted.push(Minted {
+            slot,
+            ambient: self.id,
+            interface,
+            body: Function::empty_body(),
+        });
+        Callee::Minted(slot)
     }
 
     /// Split into a read view of the *own* function and an exclusive
-    /// [`PassBacking`] mutation host over the minted function `fid` (a
+    /// [`PassBacking`] mutation host over the minted function `callee` (a
     /// [`mint_function`](Self::mint_function) result held in the `minted` buffer).
     /// This is how an outliner builds a minted body: it clones expression slices
     /// out of its own function (read) into the minted one (write), both against the
     /// same shared context. The read view borrows `&self`; the mutation host
     /// borrows the disjoint `minted` buffer, so the two coexist.
     ///
-    /// Panics if `fid` is not in `minted`.
+    /// The owner's real ID is used only as a safe temporary ambient ID for
+    /// checked refs. It never becomes the detached function's callee: callers
+    /// retain and insert the returned [`Callee::Minted`] handle.
+    ///
+    /// Panics if `callee` is real or is not in `minted`.
     pub fn host_with_minted<'b>(
         &'b self,
         minted: &'b mut Vec<Minted<'str>>,
         cx: ContextView<'b, 'str>,
-        fid: FunctionId,
+        callee: Callee,
     ) -> (HostRef<'b, 'str>, PassBacking<'b, 'str>) {
         let own = HostRef::Checked {
             fun: &*self.fun,
@@ -319,21 +357,21 @@ impl<'a, 'str> FunctionBody<'a, 'str> {
             interfaces: cx.interfaces(),
             id: self.id,
         };
-        let fun = minted
+        let slot = callee
+            .minted()
+            .expect("host_with_minted requires a minted callee placeholder");
+        let entry = minted
             .iter_mut()
-            .find(|(id, _, _)| *id == fid)
-            .map(|(_, _, f)| f)
+            .find(|entry| entry.slot == slot)
             .expect("host_with_minted: not a function minted this run");
-        (own, PassBacking::new(fun, fid, cx.shr(), cx.interfaces()))
-    }
-
-    /// Consume the body at the barrier, yielding any unused reserved ids (returned
-    /// to the driver's pool). The functions the pass minted travel in
-    /// [`Outcome::minted`] and the self-rename claim in [`Outcome::rename`], not
-    /// here. The function itself stays borrowed in place in the registry — there is
-    /// no body to reinstall.
-    pub fn into_reserved(self) -> Vec<FunctionId> {
-        self.reserved_ids
+        assert_eq!(
+            entry.ambient, self.id,
+            "minted entry belongs to another owner"
+        );
+        (
+            own,
+            PassBacking::new(&mut entry.body, self.id, cx.shr(), cx.interfaces()),
+        )
     }
 }
 
@@ -658,6 +696,123 @@ mod tests {
     use qcode::value::insn::Mnemonic;
     use qcode_macro::qcode;
 
+    #[test]
+    fn mint_slots_are_infallible_ordered_and_persist_across_outcomes() {
+        let mut ctx = Context::new();
+        qcode!(ctx, "fn mint_owner: <entry> return at i64 0;");
+        let installed_second = Function::make(&mut ctx, "installed_second".into())
+            .unwrap()
+            .id;
+        let env = dummy_env();
+        let (bodies, view) = ctx.split(&env);
+        let mut slots = bodies.select_mut(&[mint_owner]);
+        let (owner, _) = slots.split_first_mut().unwrap();
+        let mut owner = FunctionBody::new(mint_owner, owner);
+
+        // Model two pass outcomes aggregated across one stage fixpoint. The
+        // counter belongs to FunctionBody, so a fresh outcome Vec cannot reset it.
+        let mut first_outcome = Vec::new();
+        let first = owner.mint_function(
+            &mut first_outcome,
+            "first".into(),
+            FunctionKind::Lambda,
+            true,
+        );
+        let mut second_outcome = Vec::new();
+        let second = owner.mint_function(
+            &mut second_outcome,
+            "second".into(),
+            FunctionKind::Lambda,
+            true,
+        );
+        assert_eq!(first, Callee::Minted(0));
+        assert_eq!(second, Callee::Minted(1));
+
+        first_outcome.extend(second_outcome);
+        assert_eq!(
+            first_outcome.iter().map(Minted::slot).collect::<Vec<_>>(),
+            [0, 1]
+        );
+        assert!(
+            first_outcome
+                .iter()
+                .all(|entry| entry.ambient_id() == mint_owner)
+        );
+
+        // The temporary ambient ID qualifies checked refs only. A minted-to-
+        // minted call retains the placeholder and cannot silently become a real
+        // call back to the owner.
+        let ambient = owner.id();
+        {
+            let (_, mut host) = owner.host_with_minted(&mut first_outcome, view, first);
+            let call = host.push_mnemonic(
+                ambient,
+                Mnemonic::Call(qcode::value::insn::Call {
+                    target: second,
+                    args: Vec::new(),
+                    clobbers: Vec::new(),
+                }),
+                0,
+            );
+            assert!(matches!(
+                host.read_host().instruction(call).mnemonic(),
+                Mnemonic::Call(call) if call.target == Callee::Minted(1)
+            ));
+        }
+        assert_eq!(
+            first_outcome[0]
+                .body
+                .resolve_minted_callee(1, installed_second),
+            1
+        );
+    }
+
+    #[test]
+    fn minted_body_rebinds_only_ambient_metadata_with_colliding_locals() {
+        use qcode::value::util::base_ref::BaseRef;
+
+        let mut ctx = Context::new();
+        qcode!(ctx, "fn rebind_owner: <owner_block> return at i64 0;");
+        let installed = Function::make(&mut ctx, "installed".into()).unwrap().id;
+        let owner_root = Function::from_id(&ctx, rebind_owner).root().unwrap().id;
+
+        let env = dummy_env();
+        let (bodies, view) = ctx.split(&env);
+        let mut slots = bodies.select_mut(&[rebind_owner]);
+        let (owner_fun, _) = slots.split_first_mut().unwrap();
+        let mut owner = FunctionBody::new(rebind_owner, owner_fun);
+        let mut outcome = Vec::new();
+        let placeholder =
+            owner.mint_function(&mut outcome, "detached".into(), FunctionKind::Lambda, true);
+        let ambient = owner.id();
+        {
+            let (_, mut host) = owner.host_with_minted(&mut outcome, view, placeholder);
+            let root = host.make_block(ambient);
+            host.function_mut(ambient).set_root_id(Some(root.local));
+            BaseRef::new(host.reborrow(), root)
+                .rename_local("minted_root".into())
+                .unwrap();
+            assert_eq!(
+                root.local, owner_root.local,
+                "local IDs intentionally collide"
+            );
+        }
+
+        let minted = outcome.pop().unwrap();
+        let (slot, _, mut detached) = minted.into_installed_parts(installed);
+        assert_eq!(slot, 0);
+        let root = BlockId::new(installed, detached.root_id().unwrap());
+        assert_eq!(detached.block(root).parent, Some(installed));
+        let host = PassBacking::new(&mut detached, installed, view.shr(), view.interfaces());
+        assert_eq!(
+            host.read_host()
+                .function_ref(installed)
+                .local_named("minted_root"),
+            Some(ValueId::BasicBlock(root))
+        );
+        assert_ne!(root, owner_root);
+    }
+
     fn two_functions_with_users(
         mut ctx: &mut Context<'static>,
     ) -> (FunctionId, FunctionId, InstructionId) {
@@ -732,7 +887,7 @@ mod tests {
         let (bodies, _view) = ctx.split(&env);
         let mut slots = bodies.select_mut(&[own_id]);
         let (own, _) = slots.split_first_mut().unwrap();
-        let mut own = FunctionBody::new(own_id, own, Vec::new());
+        let mut own = FunctionBody::new(own_id, own);
 
         let _ = own.block_param_mut(foreign);
     }
@@ -746,7 +901,7 @@ mod tests {
         let (bodies, view) = ctx.split(&env);
         let mut slots = bodies.select_mut(&[own_id]);
         let (own, _) = slots.split_first_mut().unwrap();
-        let own = FunctionBody::new(own_id, own, Vec::new());
+        let own = FunctionBody::new(own_id, own);
 
         let _ = own.block_param(view, foreign);
     }
@@ -760,7 +915,7 @@ mod tests {
         let (bodies, view) = ctx.split(&env);
         let mut slots = bodies.select_mut(&[own_id]);
         let (own, _) = slots.split_first_mut().unwrap();
-        let own = FunctionBody::new(own_id, own, Vec::new());
+        let own = FunctionBody::new(own_id, own);
 
         let _ = own.param_ref(view, foreign);
     }
@@ -773,7 +928,7 @@ mod tests {
         let (bodies, _view) = ctx.split(&env);
         let mut slots = bodies.select_mut(&[own_id]);
         let (own, _) = slots.split_first_mut().unwrap();
-        let own = FunctionBody::new(own_id, own, Vec::new());
+        let own = FunctionBody::new(own_id, own);
 
         assert!(own.users_of(ValueId::Instruction(foreign)).is_empty());
     }
@@ -787,7 +942,7 @@ mod tests {
         let (bodies, view) = ctx.split(&env);
         let mut slots = bodies.select_mut(&[own_id]);
         let (own, _) = slots.split_first_mut().unwrap();
-        let mut own = FunctionBody::new(own_id, own, Vec::new());
+        let mut own = FunctionBody::new(own_id, own);
 
         own.replace_all_uses_with(
             view,
