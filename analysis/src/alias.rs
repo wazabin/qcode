@@ -404,6 +404,7 @@ impl FrameInfo {
                     _ => P::OPAQUE,
                 }
             }
+            ValueId::Instruction(id) if !host.contains_instruction(id) => P::OPAQUE,
             ValueId::Instruction(id) => match host.insn_ref(id).mnemonic() {
                 Mnemonic::Load(_) => P::LOADED,
                 Mnemonic::Call(c) => self.classify_call_result(host, id.func, c),

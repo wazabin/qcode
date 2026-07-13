@@ -86,12 +86,6 @@ pub struct Instruction<'str> {
     // Address of the binary instruction
     address: Option<u64>,
 
-    /// Tombstone flag. Registry IDs are stable indices and cannot be reclaimed, so a
-    /// removed instruction stays in the arena; this marks it as logically deleted.
-    /// Deleted instructions are skipped by [`Context::instructions`], so stale operands
-    /// they still carry (e.g. a `Load.ptr`) no longer pollute whole-program scans.
-    pub(crate) deleted: bool,
-
     _marker: std::marker::PhantomData<&'str ()>,
 }
 
@@ -103,7 +97,6 @@ impl<'str> Instruction<'str> {
             type_id,
             mnemonic,
             address: None,
-            deleted: false,
             _marker: std::marker::PhantomData,
         }
     }
@@ -122,13 +115,6 @@ impl<'str> Instruction<'str> {
     /// generic builder, which routes through the mutation host).
     pub(crate) fn set_address(&mut self, address: u64) {
         self.address = Some(address);
-    }
-
-    /// Whether this instruction has been logically deleted (tombstoned). A deleted
-    /// instruction is no longer part of the program: it is skipped by
-    /// [`Context::instructions`] and must not be treated as live.
-    pub fn is_deleted(&self) -> bool {
-        self.deleted
     }
 
     pub fn from_id<'ctx>(
@@ -211,13 +197,6 @@ where
     /// The address of the corresponding instruction
     pub fn address(&'s self) -> Option<u64> {
         self.inner().address
-    }
-
-    /// Whether this instruction has been logically deleted (tombstoned). A deleted
-    /// instruction is skipped by [`Context::instructions`] and must not be treated as
-    /// live.
-    pub fn is_deleted(&'s self) -> bool {
-        self.inner().deleted
     }
 
     /// The address-space provenance for this instruction's result, if any.

@@ -88,8 +88,9 @@ pub struct FunctionBody<'str> {
 
     /// Instruction storage for this function. Function-scoped: the composite
     /// [`InstructionId`](crate::value::InstructionId) `{ func, local }` indexes
-    /// here via `local`. Append-only with tombstones; never compacted.
-    pub(crate) insns: Registry<LocalInsnId, Instruction<'str>>,
+    /// here via `local`. Live payloads are dense; logical IDs are monotonic and
+    /// never reused after physical removal.
+    pub(crate) insns: StableArena<LocalInsnId, Instruction<'str>>,
 
     /// Basic-block storage for this function. A block is born here and keeps its
     /// `id.func` for life; Path A makes arena membership and ownership identical.
@@ -238,7 +239,6 @@ impl<'str> FunctionInterface<'str> {
 impl<'str> FunctionBody<'str> {
     /// Reports the current arena footprint and logical liveness.
     pub fn arena_stats(&self) -> BodyArenaStats {
-        let live_instructions = self.insns.iter().filter(|insn| !insn.deleted).count();
         let live_blocks = self.blocks.iter().filter(|block| !block.deleted).count();
         let live_params = self
             .params
@@ -247,10 +247,7 @@ impl<'str> FunctionBody<'str> {
             .count();
 
         BodyArenaStats {
-            instructions: BodyArenaKindStats::registry::<Instruction<'str>>(
-                self.insns.len(),
-                live_instructions,
-            ),
+            instructions: BodyArenaKindStats::stable_arena(&self.insns),
             blocks: BodyArenaKindStats::registry::<BasicBlock<'str>>(
                 self.blocks.len(),
                 live_blocks,
@@ -302,7 +299,7 @@ impl<'str> FunctionBody<'str> {
     /// body. Returns the number of call-like instructions patched.
     pub fn resolve_minted_callee(&mut self, slot: u32, real: FunctionId) -> usize {
         let mut patched = 0;
-        for mut insn in self.insns.iter_mut().filter(|insn| !insn.deleted) {
+        for mut insn in self.insns.iter_mut() {
             patched += usize::from(insn.mnemonic_mut().resolve_minted_callee(slot, real));
         }
         patched
@@ -312,7 +309,6 @@ impl<'str> FunctionBody<'str> {
     pub fn minted_callee_slots(&self) -> Vec<u32> {
         self.insns
             .iter()
-            .filter(|insn| !insn.deleted)
             .filter_map(|insn| insn.mnemonic().minted_callee_slot())
             .collect()
     }
@@ -323,7 +319,7 @@ impl<'str> FunctionBody<'str> {
         Self {
             id,
             root: None,
-            insns: Registry::default(),
+            insns: StableArena::default(),
             blocks: Registry::default(),
             roster: Vec::new(),
             params: Registry::default(),
@@ -422,6 +418,11 @@ impl<'str> FunctionBody<'str> {
     pub fn insn_mut(&mut self, id: InstructionId) -> &mut Instruction<'str> {
         assert_eq!(id.func, self.id, "instruction belongs to another function");
         &mut self.insns[id.local]
+    }
+
+    /// Whether `id` currently names a live instruction payload in this body.
+    pub fn contains_instruction(&self, id: InstructionId) -> bool {
+        id.func == self.id && self.insns.contains(id.local)
     }
     /// The block parameter `id`, by its function-local index.
     pub fn block_param(&self, id: BlockParamId) -> &BlockParam<'str> {
@@ -586,7 +587,8 @@ impl<'str> FunctionBody<'str> {
     }
 
     /// Remove instruction `id` from its block, unlink its outgoing CFG edges if a
-    /// terminator, clear its name, tombstone it, and prune its operand use-lists.
+    /// terminator, clear its name, prune its operand use-lists, and physically
+    /// drop its payload.
     pub fn remove_instruction(&mut self, id: InstructionId) {
         assert_eq!(id.func, self.id, "instruction belongs to another function");
         let (parent, name, is_terminator, args) = {
@@ -620,19 +622,15 @@ impl<'str> FunctionBody<'str> {
             }
         }
 
-        self.insn_mut(id).parent = None;
-
         if let Some(n) = name {
             self.names.forget(n.as_ref());
         }
-        self.insn_mut(id).name = None;
-
-        self.insn_mut(id).deleted = true;
         for arg in args {
             if let Some(users) = self.users.get_mut(&arg) {
                 users.retain(|&local| local != id.localize(self.id));
             }
         }
+        self.insns.remove(id.local);
     }
 
     /// Rehome `remove`'s outgoing CFG edges onto `keep` and drop the direct edge
@@ -1364,14 +1362,13 @@ where
             .collect()
     }
 
-    /// The composite ids of this function's live (non-tombstoned) instructions,
-    /// in arena order — including any currently detached (`parent == None`).
+    /// The composite IDs of this function's live instructions, in dense physical
+    /// order — including any currently detached (`parent == None`).
     pub fn instruction_ids(&'s self) -> Vec<InstructionId> {
         let func = self.id;
         self.inner()
             .insns
             .iter()
-            .filter(|i| !i.deleted)
             .map(|i| InstructionId::new(func, i.id))
             .collect()
     }

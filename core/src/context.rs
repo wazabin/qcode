@@ -668,9 +668,13 @@ impl<'str> Context<'str> {
         self.functions().flat_map(|f| f.block_ids()).collect()
     }
 
-    /// Returns a list of all live instructions in the context (across all functions).
+    /// Returns all live instructions across all functions in stable logical-ID
+    /// order. Function arenas iterate in dense physical order, so this explicit
+    /// sort preserves the observable whole-context order across compaction.
     pub fn instruction_ids(&self) -> Vec<InstructionId> {
-        self.functions().flat_map(|f| f.instruction_ids()).collect()
+        let mut ids: Vec<_> = self.functions().flat_map(|f| f.instruction_ids()).collect();
+        ids.sort_unstable();
+        ids
     }
 
     /// Returns a list of all functions in the context.
@@ -690,15 +694,13 @@ impl<'str> Context<'str> {
             .id
     }
 
-    /// `(total_slots, tombstones)` across every function's instruction arena.
-    /// Instruction storage is now per-function; this sums the arenas for the
-    /// whole-program fragmentation probe.
+    /// `(issued_ids, removed_ids)` across every function's instruction arena.
     pub fn instruction_arena_stats(&self) -> (usize, usize) {
         let mut total = 0;
         let mut dead = 0;
         for f in self.bodies.iter() {
-            total += f.insns.len();
-            dead += f.insns.iter().filter(|i| i.deleted).count();
+            total += f.insns.issued_len();
+            dead += f.insns.issued_len() - f.insns.len();
         }
         (total, dead)
     }
@@ -940,8 +942,8 @@ impl<'str> Context<'str> {
             self.block_mut(new).address = Some(addr);
         }
 
-        // Phase 5: delete the originals (unlinks their old edges, removes their
-        // instructions from the storing function's use-lists, and tombstones them).
+        // Phase 5: delete the originals (unlinks their old edges, physically
+        // removes their instructions, and tombstones the blocks).
         for &old in olds {
             BasicBlock::from_id_mut(self, old).delete(target);
         }
@@ -1467,6 +1469,12 @@ impl<'str> Context<'str> {
         &mut self.bodies[id.func].insns[id.local]
     }
 
+    /// Whether `id` currently names a live instruction payload.
+    pub fn contains_instruction(&self, id: InstructionId) -> bool {
+        Into::<usize>::into(id.func) < self.bodies.len()
+            && self.bodies[id.func].insns.contains(id.local)
+    }
+
     /// Borrows the basic block `id`.
     pub fn block(&self, id: BlockId) -> &BasicBlock<'str> {
         &self.bodies[id.func].blocks[id.local]
@@ -1508,23 +1516,26 @@ impl<'str> Context<'str> {
         }
     }
 
-    /// Removes a set of dead instructions from the use-def map. For every
-    /// instruction in `dead`, each of its operands has all members of `dead`
-    /// pruned from their user lists. Call after removing them from their blocks.
+    /// Physically removes a set of instructions after pruning their operands
+    /// from reverse-use maps and their direct-call entries from `call_sites`.
+    /// Call after removing them from their parent blocks and unlinking any CFG
+    /// edges owned by terminators.
     pub fn remove_instructions(&mut self, dead: &HashSet<InstructionId>) {
+        let mut ids: Vec<_> = dead.iter().copied().collect();
+        ids.sort_unstable();
         let mut affected_args: HashSet<(FunctionId, crate::value::LocalValueId)> =
             HashSet::default();
         let mut affected_targets: HashSet<FunctionId> = HashSet::default();
-        for &id in dead {
+        for &id in &ids {
+            assert!(
+                self.contains_instruction(id),
+                "cannot remove stale instruction {id:?}"
+            );
             let mnemonic = self.bodies[id.func].insns[id.local].mnemonic();
             affected_args.extend(mnemonic.args().into_iter().map(|arg| (id.func, arg)));
             if let Some(target) = mnemonic.call_target() {
                 affected_targets.insert(target);
             }
-            // Tombstone it. Registry IDs are stable indices and cannot be
-            // reclaimed, so the entry stays in the arena; marking it deleted keeps
-            // whole-program scans from yielding the stale operands it still carries.
-            self.bodies[id.func].insns[id.local].deleted = true;
         }
         for (func, arg) in affected_args {
             if let Some(users) = self.bodies[func].users.get_mut(&arg) {
@@ -1535,6 +1546,9 @@ impl<'str> Context<'str> {
             if let Some(sites) = self.shared.values.call_sites.get_mut(&target) {
                 sites.retain(|s| !dead.contains(s));
             }
+        }
+        for id in ids {
+            self.bodies[id.func].insns.remove(id.local);
         }
     }
 
@@ -2680,7 +2694,7 @@ mod tests {
     }
 
     #[test]
-    fn remove_instruction_clears_parent() {
+    fn remove_instruction_drops_payload() {
         let mut ctx = Context::new();
         qcode!(
             ctx,
@@ -2695,10 +2709,7 @@ mod tests {
 
         ctx.remove_instruction(load_id);
 
-        assert!(
-            ctx.get_insn(load_id).parent().is_none(),
-            "parent should be None after removal"
-        );
+        assert!(!ctx.contains_instruction(load_id));
     }
 
     #[test]
@@ -2726,10 +2737,7 @@ mod tests {
             ctx.get_named_in_scope(load_id.into(), "a").is_none(),
             "name should be gone after removal"
         );
-        assert!(
-            ctx.get_insn(load_id).name().is_none(),
-            "instruction name field should be cleared"
-        );
+        assert!(!ctx.contains_instruction(load_id));
     }
 
     #[test]
@@ -2796,11 +2804,10 @@ mod tests {
     }
 
     #[test]
-    fn removed_instruction_is_tombstoned_and_not_iterated() {
-        // Registry IDs are stable, so a removed instruction stays in the arena — but it
-        // must be tombstoned and skipped by `ctx.instructions()`, so the stale operands
-        // it still carries (e.g. its `Load.ptr`) never pollute a whole-program scan.
-        // Regression: a deleted ram load kept showing up in the alias pass's pointer
+    fn removed_instruction_is_absent_and_not_iterated() {
+        // Stable IDs survive payload compaction, while the removed payload itself must
+        // disappear so stale operands never pollute a whole-program scan.
+        // Regression: a removed ram load kept showing up in the alias pass's pointer
         // scan, faking a "pointer used in two spaces" invariant break.
         let mut ctx = Context::new();
         qcode!(
@@ -2823,10 +2830,7 @@ mod tests {
 
         ctx.remove_instruction(dead_id);
 
-        assert!(
-            ctx.get_insn(dead_id).is_deleted(),
-            "a removed instruction must be tombstoned"
-        );
+        assert!(!ctx.contains_instruction(dead_id));
         assert!(
             !ctx.instructions().any(|i| i.id == dead_id),
             "a deleted instruction must not be yielded by ctx.instructions()"
@@ -3315,6 +3319,57 @@ mod tests {
         let fresh = restored.add_cfg_edge(a, d);
         assert!(fresh > last);
         assert_ne!(fresh, removed, "removed edge IDs must never be reused");
+    }
+
+    #[test]
+    fn compact_instruction_arena_preserves_ids_across_round_trip() {
+        let mut ctx = Context::new();
+        qcode!(
+            ctx,
+            "
+            <block>
+                %first = i64 1 + i64 2;
+                %removed = i64 3 + i64 4;
+                return at %first;
+            "
+        );
+        let ids = BasicBlock::from_id(&ctx, block).instruction_ids();
+        let first = ids[0];
+        let removed = ids[1];
+        let last = ids[2];
+        ctx.remove_instruction(removed);
+
+        let physical_order: Vec<_> = ctx.bodies[first.func]
+            .insns
+            .iter()
+            .map(|insn| insn.id)
+            .collect();
+        assert_eq!(physical_order, vec![first.local, last.local]);
+
+        let config = bincode::config::standard();
+        let bytes = bincode::serde::encode_to_vec(&ctx, config).expect("encode");
+        let (mut restored, _): (Context<'static>, usize) =
+            bincode::serde::decode_from_slice(&bytes, config).expect("decode");
+
+        assert!(!restored.contains_instruction(removed));
+        assert_eq!(
+            restored.bodies[first.func]
+                .insns
+                .iter()
+                .map(|insn| insn.id)
+                .collect::<Vec<_>>(),
+            physical_order,
+        );
+        assert!(restored.contains_instruction(first));
+        assert!(restored.contains_instruction(last));
+
+        let template = restored.instruction(last).clone();
+        let fresh = restored.push_insn(first.func, template);
+        assert!(fresh.local > last.local);
+        assert_ne!(
+            fresh, removed,
+            "removed instruction IDs must never be reused"
+        );
     }
 
     #[test]

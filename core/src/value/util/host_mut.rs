@@ -339,14 +339,9 @@ impl<'a, 'str> PassBacking<'a, 'str> {
             }
         }
 
-        self.instruction_mut(id).parent = None;
-
         if let Some(n) = name {
             self.function_mut(id.func).names.forget(n.as_ref());
         }
-        self.instruction_mut(id).name = None;
-
-        self.instruction_mut(id).deleted = true;
         for arg in args {
             if let Some(users) = self.function_mut(id.func).users.get_mut(&arg) {
                 users.retain(|&local| local != id.localize(id.func));
@@ -355,6 +350,7 @@ impl<'a, 'str> PassBacking<'a, 'str> {
         if let Some(target) = target {
             self.forget_call_site(target, id);
         }
+        self.function_mut(id.func).insns.remove(id.local);
     }
 
     pub fn merge_nodes(&mut self, keep: BlockId, remove: BlockId, direct_edge: EdgeId) {

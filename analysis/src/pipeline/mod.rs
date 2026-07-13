@@ -667,13 +667,12 @@ async fn run_analysis_fixpoint<'s>(
                 v.asserting_pass, v.prop, v.assumed, v.assuming_pass, !v.assumed,
             );
         }
-        // Registry fragmentation probe: how much of the instruction arena is
-        // tombstones by the end of a round. Guides whether a compaction pass
-        // between rounds would pay off.
+        // Stable-arena churn probe: logical IDs remain issued after their dense
+        // payloads are removed.
         let (total_insns, dead_insns) = ctx.instruction_arena_stats();
         log::info!(
             target: "pipeline",
-            "round {round}: instruction arena {total_insns} slots, {} live, {dead_insns} tombstones ({:.1}% dead)",
+            "round {round}: instruction arena {total_insns} IDs issued, {} live payloads, {dead_insns} removed IDs ({:.1}% removed)",
             total_insns - dead_insns,
             if total_insns == 0 { 0.0 } else { 100.0 * dead_insns as f64 / total_insns as f64 },
         );

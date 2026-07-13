@@ -80,7 +80,9 @@ impl Editor {
     /// uses forwarded, so removing it prunes only its own operand use-lists.
     fn finish<'str>(self, host: &mut Context<'str>) -> bool {
         let changed = !self.redundant.is_empty();
-        for insn in self.redundant {
+        let mut redundant: Vec<_> = self.redundant.into_iter().collect();
+        redundant.sort_unstable();
+        for insn in redundant {
             host.remove_instruction(insn);
         }
         changed
@@ -448,7 +450,9 @@ impl Editor {
     /// Concrete twin of [`finish`](Self::finish).
     fn finish_c<'str>(self, body: &mut FunctionBody<'str>, _cx: ContextView<'_, 'str>) -> bool {
         let changed = !self.redundant.is_empty();
-        for insn in self.redundant {
+        let mut redundant: Vec<_> = self.redundant.into_iter().collect();
+        redundant.sort_unstable();
+        for insn in redundant {
             body.remove_instruction(insn);
         }
         changed

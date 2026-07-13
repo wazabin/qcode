@@ -624,12 +624,15 @@ pub fn remove_dead_load_insns_block(
     aliases: Option<&AliasResult>,
     dead_regs: &[ValueId],
 ) {
-    let dead = dead_load_insns(&*ctx, block_id, aliases, dead_regs);
+    let mut dead: Vec<_> = dead_load_insns(&*ctx, block_id, aliases, dead_regs)
+        .into_iter()
+        .collect();
     if dead.is_empty() {
         return;
     }
-    for id in &dead {
-        ctx.remove_instruction(*id);
+    dead.sort_unstable();
+    for id in dead {
+        ctx.remove_instruction(id);
     }
 }
 
@@ -1091,8 +1094,10 @@ pub fn remove_dead_load_insns_generic<'str>(
     }
 
     let changed = !dead.is_empty();
-    for id in &dead {
-        host.remove_instruction(*id);
+    let mut dead: Vec<_> = dead.into_iter().collect();
+    dead.sort_unstable();
+    for id in dead {
+        host.remove_instruction(id);
     }
     changed
 }
@@ -1166,8 +1171,10 @@ pub fn remove_dead_load_insns_host<'a, 'str>(
     }
 
     let changed = !dead.is_empty();
-    for id in &dead {
-        body.remove_instruction(*id);
+    let mut dead: Vec<_> = dead.into_iter().collect();
+    dead.sort_unstable();
+    for id in dead {
+        body.remove_instruction(id);
     }
     changed
 }
@@ -1310,8 +1317,8 @@ mod tests {
             "the dead shadow store should be removed end-to-end"
         );
         assert!(
-            ctx.get_insn(store_id).parent().is_none(),
-            "the dead shadow store is gone after DSE"
+            !ctx.contains_instruction(store_id),
+            "the dead shadow store payload is gone after DSE"
         );
     }
 

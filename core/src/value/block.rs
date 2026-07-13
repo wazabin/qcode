@@ -1443,8 +1443,8 @@ mod tests {
             "deleting b must unregister %y from %x's use-list, not orphan it"
         );
         assert!(
-            ctx.get_insn(y).parent().is_none(),
-            "deleted instruction must have its parent cleared"
+            !ctx.contains_instruction(y),
+            "deleted instruction payload must be physically absent"
         );
     }
 }

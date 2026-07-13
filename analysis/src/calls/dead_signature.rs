@@ -122,7 +122,7 @@ fn direct_call_sites(
         .into_iter()
         .flatten()
         .copied()
-        .filter(|&id| !ctx.get_insn(id).is_deleted())
+        .filter(|&id| ctx.contains_instruction(id))
         .collect()
 }
 

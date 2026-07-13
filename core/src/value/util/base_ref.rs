@@ -101,6 +101,11 @@ impl<'a, 'str> HostRef<'a, 'str> {
         &self.function(id.func).insns[id.local]
     }
 
+    /// Whether `id` currently names a live instruction payload.
+    pub fn contains_instruction(self, id: InstructionId) -> bool {
+        self.function(id.func).insns.contains(id.local)
+    }
+
     /// The block `id`, routed to its owning function's arena.
     pub fn block(self, id: BlockId) -> &'a BasicBlock<'str> {
         &self.function(id.func).blocks[id.local]

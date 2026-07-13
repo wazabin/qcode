@@ -49,14 +49,15 @@ pub fn remove_dead_insns(ctx: &mut Context, block_id: BlockId) -> bool {
 pub fn remove_dead_insns_module<'str>(host: &mut Context<'str>, block_id: BlockId) -> bool {
     let mut changed = false;
     loop {
-        let dead = dead_insns(host.read_host(), block_id);
+        let mut dead: Vec<_> = dead_insns(host.read_host(), block_id).into_iter().collect();
         if dead.is_empty() {
             break;
         }
 
+        dead.sort_unstable();
         changed = true;
-        for id in &dead {
-            host.remove_instruction(*id);
+        for id in dead {
+            host.remove_instruction(id);
         }
     }
 
@@ -73,14 +74,17 @@ pub fn remove_dead_insns_host<'a, 'str>(
 ) -> bool {
     let mut changed = false;
     loop {
-        let dead = dead_insns(cx.read_host(body), block_id);
+        let mut dead: Vec<_> = dead_insns(cx.read_host(body), block_id)
+            .into_iter()
+            .collect();
         if dead.is_empty() {
             break;
         }
 
+        dead.sort_unstable();
         changed = true;
-        for id in &dead {
-            body.remove_instruction(*id);
+        for id in dead {
+            body.remove_instruction(id);
         }
     }
 
