@@ -652,7 +652,7 @@ mod tests {
         let sp_pid = BasicBlock::from_id_mut(&mut tc.ctx, root).push_param(8).id;
         tc.ctx
             .block_param_mut(sp_pid)
-            .set_origin_id(ValueId::Varnode(sp_reg));
+            .set_origin_id(ValueId::Varnode(sp_reg).localize(sp_pid.func));
         let sp = ValueId::BlockParam(sp_pid);
         let arg_pid = BasicBlock::from_id_mut(&mut tc.ctx, root).push_param(8).id;
         let arg = ValueId::BlockParam(arg_pid);
@@ -729,7 +729,7 @@ mod tests {
         let sp_pid = BasicBlock::from_id_mut(&mut tc.ctx, root).push_param(8).id;
         tc.ctx
             .block_param_mut(sp_pid)
-            .set_origin_id(ValueId::Varnode(sp_reg));
+            .set_origin_id(ValueId::Varnode(sp_reg).localize(sp_pid.func));
         let sp = ValueId::BlockParam(sp_pid);
         // A globalized-global param (origin set to the address literal below).
         let glob_pid = BasicBlock::from_id_mut(&mut tc.ctx, root).push_param(8).id;
@@ -746,7 +746,9 @@ mod tests {
             unsafe { b.dont_finalize() };
             (local, caller_arg, glob_plus, lit_addr, glob_addr)
         };
-        tc.ctx.block_param_mut(glob_pid).set_origin_id(glob_addr);
+        tc.ctx
+            .block_param_mut(glob_pid)
+            .set_origin_id(glob_addr.localize(glob_pid.func));
 
         let r = AliasResult::simple_for_function(&tc.ctx, fid).with_frame_freshness(
             &tc.ctx,
@@ -819,13 +821,15 @@ mod tests {
         let sp_pid = BasicBlock::from_id_mut(&mut tc.ctx, root).push_param(8).id;
         tc.ctx
             .block_param_mut(sp_pid)
-            .set_origin_id(ValueId::Varnode(sp_reg));
+            .set_origin_id(ValueId::Varnode(sp_reg).localize(sp_pid.func));
         let glob_pid = BasicBlock::from_id_mut(&mut tc.ctx, root).push_param(4).id;
         let glob = ValueId::BlockParam(glob_pid);
         // A partial-promotion snapshot of `*@glob` (origin = the slot param), as
         // `apply_partial` materializes it.
         let snap_pid = BasicBlock::from_id_mut(&mut tc.ctx, root).push_param(4).id;
-        tc.ctx.block_param_mut(snap_pid).set_origin_id(glob);
+        tc.ctx
+            .block_param_mut(snap_pid)
+            .set_origin_id(glob.localize(snap_pid.func));
         let snap = ValueId::BlockParam(snap_pid);
 
         let ram = tc.ctx.shared.default_space;
@@ -839,7 +843,9 @@ mod tests {
             unsafe { b.dont_finalize() };
             (store_addr, snap_addr, glob_addr)
         };
-        tc.ctx.block_param_mut(glob_pid).set_origin_id(glob_addr);
+        tc.ctx
+            .block_param_mut(glob_pid)
+            .set_origin_id(glob_addr.localize(glob_pid.func));
 
         let r = AliasResult::simple_for_function(&tc.ctx, fid).with_frame_freshness(
             &tc.ctx,
@@ -908,7 +914,7 @@ mod tests {
         let sp_pid = BasicBlock::from_id_mut(&mut tc.ctx, root).push_param(8).id;
         tc.ctx
             .block_param_mut(sp_pid)
-            .set_origin_id(ValueId::Varnode(sp_reg));
+            .set_origin_id(ValueId::Varnode(sp_reg).localize(sp_pid.func));
         let sp = ValueId::BlockParam(sp_pid);
 
         let ram = tc.ctx.shared.default_space;
@@ -978,7 +984,7 @@ mod tests {
         let sp_pid = BasicBlock::from_id_mut(&mut tc.ctx, root).push_param(8).id;
         tc.ctx
             .block_param_mut(sp_pid)
-            .set_origin_id(ValueId::Varnode(sp_reg));
+            .set_origin_id(ValueId::Varnode(sp_reg).localize(sp_pid.func));
         let sp = ValueId::BlockParam(sp_pid);
         let arg_pid = BasicBlock::from_id_mut(&mut tc.ctx, root).push_param(8).id;
         let arg = ValueId::BlockParam(arg_pid);
@@ -1054,7 +1060,7 @@ mod tests {
         let sp_pid = BasicBlock::from_id_mut(&mut tc.ctx, root).push_param(8).id;
         tc.ctx
             .block_param_mut(sp_pid)
-            .set_origin_id(ValueId::Varnode(sp_reg));
+            .set_origin_id(ValueId::Varnode(sp_reg).localize(sp_pid.func));
         let sp = ValueId::BlockParam(sp_pid);
         let arg_pid = BasicBlock::from_id_mut(&mut tc.ctx, root).push_param(8).id;
         let arg = ValueId::BlockParam(arg_pid);
@@ -1114,7 +1120,7 @@ mod tests {
         let sp_pid = BasicBlock::from_id_mut(&mut tc.ctx, root).push_param(8).id;
         tc.ctx
             .block_param_mut(sp_pid)
-            .set_origin_id(ValueId::Varnode(sp_reg));
+            .set_origin_id(ValueId::Varnode(sp_reg).localize(sp_pid.func));
         let sp = ValueId::BlockParam(sp_pid);
         let arg_pid = BasicBlock::from_id_mut(&mut tc.ctx, root).push_param(8).id;
         let arg = ValueId::BlockParam(arg_pid);
@@ -1200,7 +1206,7 @@ mod tests {
         let sp_pid = BasicBlock::from_id_mut(&mut tc.ctx, root).push_param(8).id;
         tc.ctx
             .block_param_mut(sp_pid)
-            .set_origin_id(ValueId::Varnode(sp_reg));
+            .set_origin_id(ValueId::Varnode(sp_reg).localize(sp_pid.func));
         let sp = ValueId::BlockParam(sp_pid);
         let arg_pid = BasicBlock::from_id_mut(&mut tc.ctx, root).push_param(8).id;
         let arg = ValueId::BlockParam(arg_pid);
@@ -1259,7 +1265,7 @@ mod tests {
         let sp_pid = BasicBlock::from_id_mut(&mut tc.ctx, root).push_param(8).id;
         tc.ctx
             .block_param_mut(sp_pid)
-            .set_origin_id(ValueId::Varnode(sp_reg));
+            .set_origin_id(ValueId::Varnode(sp_reg).localize(sp_pid.func));
         (fid, root, ValueId::BlockParam(sp_pid))
     }
 
@@ -1520,7 +1526,9 @@ mod tests {
             unsafe { b.dont_finalize() };
             (caller_slot, mixed, glob_addr)
         };
-        tc.ctx.block_param_mut(glob_pid).set_origin_id(glob_addr);
+        tc.ctx
+            .block_param_mut(glob_pid)
+            .set_origin_id(glob_addr.localize(glob_pid.func));
 
         // Without the assumptions, rule 2 is inert and rule 1b cannot fire (mixed
         // is not a pure global).

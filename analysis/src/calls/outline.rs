@@ -341,7 +341,7 @@ pub(crate) fn seq_result_type(host: HostRef, src: ValueId, body_ret: TypeId) -> 
 /// mirror of `BasicBlock::push_param` + the `type_id` write). Returns its value.
 fn push_param_into<'str>(host: &mut PassBacking<'_, 'str>, block: BlockId, ty: TypeId) -> ValueId {
     let index = host.read_host().block(block).params.len();
-    let pid = host.push_block_param(block.func, BlockParam::new(index, ty, block));
+    let pid = host.push_block_param(block.func, BlockParam::new(index, ty, block.local));
     host.block_mut(block).params.push(pid.localize(block.func));
     ValueId::BlockParam(pid)
 }

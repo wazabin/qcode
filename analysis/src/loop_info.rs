@@ -109,7 +109,10 @@ pub(crate) fn param_parent<'a, 'str: 'a>(
     let ValueId::BlockParam(pid) = v else {
         return None;
     };
-    host.into().block_param(pid).parent_id()
+    host.into()
+        .block_param(pid)
+        .parent_id()
+        .map(|local| BlockId::new(pid.func, local))
 }
 
 /// Values feeding block-param index `k` of `block` from every predecessor edge.

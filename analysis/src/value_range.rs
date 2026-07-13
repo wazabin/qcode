@@ -404,6 +404,7 @@ impl Solver<'_> {
         let Some(parent) = self.ctx.block_param(pid).parent_id() else {
             return top;
         };
+        let parent = BlockId::new(pid.func, parent);
         let Some(k) = BasicBlock::from_id(self.ctx, parent)
             .params()
             .position(|p| p.id() == v)

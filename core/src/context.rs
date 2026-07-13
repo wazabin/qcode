@@ -794,6 +794,24 @@ impl<'str> Context<'str> {
         // cloned terminators still hold their source block's local targets, so the
         // remap needs the *old* arena (`old.func`) to qualify them before lookup.
         for (&old, &new) in &block_map {
+            let old_params = self.block(old).params.clone();
+            let new_params = self.block(new).params.clone();
+            for (old_local, new_local) in old_params.into_iter().zip(new_params) {
+                let old_param = BlockParamId::new(old.func, old_local);
+                let new_param = BlockParamId::new(new.func, new_local);
+                let Some(origin) = self.block_param(new_param).origin else {
+                    continue;
+                };
+                let qualified = origin.qualify(old.func);
+                let remapped = value_map.get(&qualified).copied().unwrap_or(qualified);
+                debug_assert!(
+                    remapped.owning_function().is_none_or(|f| f == target),
+                    "rehome: relocated block param {old_param:?} has an origin in another \
+                     function ({qualified:?}); the relocated set is not closed",
+                );
+                self.block_param_mut(new_param).origin = Some(remapped.localize(new.func));
+            }
+
             let insns = self.block(new).instructions.clone();
             for insn_local in insns {
                 let insn_id = InstructionId::new(new.func, insn_local);
@@ -3277,6 +3295,33 @@ mod tests {
                 matches!(term, Some(Mnemonic::TailCall(TailCall { target, .. })) if target == g),
                 "thunk branch must become TailCall(G), got {term:?}",
             );
+        }
+
+        #[test]
+        fn split_rehomes_block_param_origin_into_destination_arena() {
+            let mut ctx = Context::new();
+            let f = Function::make_at_addr(&mut ctx, 0x1000, Some(Cow::Borrowed("f"))).id;
+            let entry = block_at(&mut ctx, f, 0x1000);
+            let tail = block_at(&mut ctx, f, 0x2000);
+            let param = BasicBlock::from_id_mut(&mut ctx, tail).push_param(8).id;
+            crate::value::BlockParam::from_id_mut(&mut ctx, param)
+                .set_origin(ValueId::BlockParam(param));
+
+            let arg = ctx.get_const(7, 8).id();
+            let branch = Builder::from_block(BasicBlock::from_id_mut(&mut ctx, entry))
+                .push_branch_with_args(tail, vec![arg])
+                .id;
+            Instruction::from_id_mut(&mut ctx, branch).set_address(0x1000);
+            let ret = Builder::from_block(BasicBlock::from_id_mut(&mut ctx, tail))
+                .push_return(ValueId::BlockParam(param))
+                .id;
+            Instruction::from_id_mut(&mut ctx, ret).set_address(0x2000);
+            Function::from_id_mut(&mut ctx, f).set_root(entry).unwrap();
+
+            let g = ctx.split_function_at(tail);
+            let new_tail = block_at_addr(&ctx, g, 0x2000);
+            let new_param = BasicBlock::from_id(&ctx, new_tail).params().next().unwrap();
+            assert_eq!(new_param.origin(), Some(ValueId::BlockParam(new_param.id)));
         }
 
         /// A conditional arm into the split block is routed through a fresh

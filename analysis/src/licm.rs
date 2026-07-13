@@ -172,7 +172,7 @@ fn value_is_invariant(
             // to a loop block is loop-carried (fed across the back-edge), hence
             // variant.
             match host.block_param(p).parent_id() {
-                Some(block) => !loop_nodes.contains(&block),
+                Some(block) => !loop_nodes.contains(&BlockId::new(p.func, block)),
                 None => true,
             }
         }

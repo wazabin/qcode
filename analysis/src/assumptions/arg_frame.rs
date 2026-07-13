@@ -336,7 +336,7 @@ mod tests {
         if let ValueId::BlockParam(inner) = pv {
             tc.ctx
                 .block_param_mut(inner)
-                .set_origin_id(ValueId::Varnode(sp_reg));
+                .set_origin_id(ValueId::Varnode(sp_reg).localize(inner.func));
         }
     }
 

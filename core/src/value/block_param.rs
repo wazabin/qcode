@@ -3,7 +3,7 @@ use crate::{
     error::Result,
     types::TypeId,
     value::{
-        Value, ValueId,
+        LocalBlockId, LocalValueId, Value, ValueId,
         block::{BlockId, BlockRef},
         util::{
             base_ref::{BaseRef, HostRef, WithCtx, WithCtxMut, WithHost},
@@ -47,7 +47,7 @@ pub struct BlockParam<'str> {
     /// construction only): foreign crates read via [`BlockParam::parent_id`] and
     /// write via [`BlockParam::set_parent`] / [`BlockParam::clear_parent`]
     /// (stage 6a §11 — full-private pends a cross-module constructor).
-    pub(crate) parent: Option<BlockId>,
+    pub(crate) parent: Option<LocalBlockId>,
 
     /// Optional debug name (displayed as `%name`).
     pub name: Option<Cow<'str, str>>,
@@ -56,7 +56,7 @@ pub struct BlockParam<'str> {
     /// stack-slot literal). Not displayed; it is a stable cross-run identity that
     /// lets passes like mem2reg reuse an existing param instead of duplicating it,
     /// even for varnodes that have no `name`.
-    pub origin: Option<ValueId>,
+    pub origin: Option<LocalValueId>,
 
     /// When `true`, the dead-param sweeps must not collect this param even while
     /// it has no users. It marks a real input caught mid-transformation — most
@@ -83,7 +83,7 @@ impl<'str> BlockParam<'str> {
             BlockParam {
                 index,
                 type_id,
-                parent: Some(block_id),
+                parent: Some(block_id.local),
                 name: None,
                 origin: None,
                 protected: false,
@@ -93,10 +93,10 @@ impl<'str> BlockParam<'str> {
     }
 
     /// A detached, unnamed parameter of type `type_id` at position `index`,
-    /// attached to `parent`. Public constructor so foreign crates need not name
-    /// the private `parent` field (stage 6a §11); the caller pushes the returned
+    /// attached to body-local `parent`. Public constructor so foreign crates need
+    /// not name the private `parent` field (stage 6a §11); the caller pushes the returned
     /// value through [`Context::push_block_param`](crate::context::Context::push_block_param).
-    pub fn new(index: usize, type_id: TypeId, parent: BlockId) -> Self {
+    pub fn new(index: usize, type_id: TypeId, parent: LocalBlockId) -> Self {
         Self {
             index,
             type_id,
@@ -119,14 +119,14 @@ impl<'str> BlockParam<'str> {
     }
 
     /// The block this parameter belongs to, if any (raw `&BlockParam` accessor).
-    /// Routing target for the raw `.parent` field reads (stage 6a §11);
-    /// localizes behind this accessor at the storage flip.
-    pub fn parent_id(&self) -> Option<BlockId> {
+    /// Returns the body-local storage form; qualify it with the parameter's
+    /// function id at module/ref boundaries.
+    pub fn parent_id(&self) -> Option<LocalBlockId> {
         self.parent
     }
 
     /// Attach this parameter to `block` (raw `&mut BlockParam` accessor).
-    pub fn set_parent(&mut self, block: BlockId) {
+    pub fn set_parent(&mut self, block: LocalBlockId) {
         self.parent = Some(block);
     }
 
@@ -137,15 +137,15 @@ impl<'str> BlockParam<'str> {
     }
 
     /// The source value this parameter was created to promote, if recorded (raw
-    /// `&BlockParam` accessor). Routing target for the raw `.origin` field reads
-    /// (stage 6a §11); localizes behind this accessor at the storage flip.
-    pub fn origin_id(&self) -> Option<ValueId> {
+    /// `&BlockParam` accessor). Returns the body-local storage form; qualify it
+    /// with the parameter's function id at module/ref boundaries.
+    pub fn origin_id(&self) -> Option<LocalValueId> {
         self.origin
     }
 
     /// Record the source value this parameter promotes (raw `&mut BlockParam`
     /// accessor; see [`BlockParam::origin`]).
-    pub fn set_origin_id(&mut self, origin: ValueId) {
+    pub fn set_origin_id(&mut self, origin: LocalValueId) {
         self.origin = Some(origin);
     }
 }
@@ -176,7 +176,9 @@ where
 
     /// The block this parameter belongs to, if any.
     pub fn parent(&'s self) -> Option<BlockRef<'str, 'ctx>> {
-        self.inner().parent.map(|id| BlockRef::new(self.host(), id))
+        self.inner()
+            .parent
+            .map(|local| BlockRef::new(self.host(), BlockId::new(self.id.func, local)))
     }
 
     pub fn name(&'s self) -> Option<&'ctx str> {
@@ -185,7 +187,9 @@ where
 
     /// The source value this param was created to promote, if recorded.
     pub fn origin(&'s self) -> Option<ValueId> {
-        self.inner().origin
+        self.inner()
+            .origin
+            .map(|origin| origin.qualify(self.id.func))
     }
 
     fn fmt(&'s self, f: &mut Formatter<'_>) -> std::fmt::Result {
@@ -272,7 +276,8 @@ impl<'str, 'ctx> BlockParamMutRef<'str, 'ctx> {
 
     /// Record the source value this param promotes (see [`BlockParam::origin`]).
     pub fn set_origin(&mut self, origin: ValueId) {
-        self.inner_mut().origin = Some(origin);
+        let func = self.id.func;
+        self.inner_mut().origin = Some(origin.localize(func));
     }
 
     pub fn constrain_size(&mut self, size: usize) {
@@ -381,7 +386,48 @@ impl<'str, 'ctx> Renameable<'str, 'ctx> for BlockParamMutRef<'str, 'ctx> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{context::Context, value::BasicBlock};
+    use crate::{
+        context::Context,
+        value::{BasicBlock, Function},
+    };
+
+    #[test]
+    fn block_param_storage_is_local_and_refs_qualify_with_param_function() {
+        let mut ctx = Context::new();
+        let func = Function::make(&mut ctx, "local_param_storage".into())
+            .unwrap()
+            .id;
+        let block_id = BasicBlock::make(&mut ctx, func).id;
+        let param_id = BasicBlock::from_id_mut(&mut ctx, block_id).push_param(8).id;
+
+        BlockParam::from_id_mut(&mut ctx, param_id).set_origin(ValueId::BlockParam(param_id));
+
+        let raw = ctx.block_param(param_id);
+        assert_eq!(raw.parent_id(), Some(block_id.local));
+        assert_eq!(
+            raw.origin_id(),
+            Some(LocalValueId::BlockParam(param_id.local))
+        );
+
+        let param = BlockParam::from_id(&ctx, param_id);
+        assert_eq!(param.parent().map(|block| block.id), Some(block_id));
+        assert_eq!(param.origin(), Some(ValueId::BlockParam(param_id)));
+    }
+
+    #[test]
+    #[cfg(debug_assertions)]
+    #[should_panic(expected = "localize: foreign block-param operand")]
+    fn block_param_origin_rejects_foreign_function_value() {
+        let mut ctx = Context::new();
+        let a = Function::make(&mut ctx, "origin_a".into()).unwrap().id;
+        let b = Function::make(&mut ctx, "origin_b".into()).unwrap().id;
+        let a_block = BasicBlock::make(&mut ctx, a).id;
+        let b_block = BasicBlock::make(&mut ctx, b).id;
+        let a_param = BasicBlock::from_id_mut(&mut ctx, a_block).push_param(8).id;
+        let b_param = BasicBlock::from_id_mut(&mut ctx, b_block).push_param(8).id;
+
+        BlockParam::from_id_mut(&mut ctx, b_param).set_origin(ValueId::BlockParam(a_param));
+    }
 
     #[test]
     fn make_block_param_sets_index_and_size() {

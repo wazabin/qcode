@@ -1246,6 +1246,44 @@ mod tests {
         }
     }
 
+    #[test]
+    fn bypass_rejects_foreign_block_with_colliding_local_param_arena() {
+        let mut ctx = make_ctx();
+        qcode!(
+            ctx,
+            "
+            fn foreign:
+            <foreign_entry @input:i64>
+                goto <foreign_b @x=@input>;
+            <foreign_b @x:i64>
+                goto <foreign_target @y=@x>;
+            <foreign_target @y:i64>
+                return at @y;
+
+            fn own:
+            <own_entry @input:i64>
+                goto <own_b @x=@input>;
+            <own_b @x:i64>
+                goto <own_target @y=@x>;
+            <own_target @y:i64>
+                return at @y;
+            "
+        );
+        assert_eq!(
+            foreign_b.local, own_b.local,
+            "regression setup requires colliding local block ids"
+        );
+        assert_eq!(
+            ctx.block(foreign_b).param_ids()[0],
+            ctx.block(own_b).param_ids()[0],
+            "regression setup requires colliding local parameter ids"
+        );
+
+        assert!(!try_bypass_empty_block_generic(&mut ctx, own, foreign_b));
+        assert!(BasicBlock::from_id(&ctx, foreign_b).parent().is_some());
+        assert!(BasicBlock::from_id(&ctx, own_b).parent().is_some());
+    }
+
     /// When the empty block carries a parameter and forwards it, each
     /// predecessor's incoming argument is substituted into the rewritten branch.
     #[test]

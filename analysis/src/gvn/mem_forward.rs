@@ -963,7 +963,7 @@ mod tests {
             f.add_block(root);
         }
         let pid = BasicBlock::from_id_mut(&mut tc.ctx, root).push_param(8).id;
-        tc.ctx.block_param_mut(pid).origin = Some(ValueId::Varnode(sp_reg));
+        tc.ctx.block_param_mut(pid).origin = Some(ValueId::Varnode(sp_reg).localize(pid.func));
         let sp = ValueId::BlockParam(pid);
         let ram = tc.ctx.shared.default_space;
 

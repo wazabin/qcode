@@ -1603,7 +1603,8 @@ mod tests {
             f.add_block(root);
         }
         let sp_pid = BasicBlock::from_id_mut(&mut tc.ctx, root).push_param(8).id;
-        tc.ctx.block_param_mut(sp_pid).origin = Some(ValueId::Varnode(sp_reg));
+        tc.ctx.block_param_mut(sp_pid).origin =
+            Some(ValueId::Varnode(sp_reg).localize(sp_pid.func));
         let sp = ValueId::BlockParam(sp_pid);
 
         let ram = tc.ctx.shared.default_space;
@@ -1673,7 +1674,8 @@ mod tests {
             f.add_block(root);
         }
         let sp_pid = BasicBlock::from_id_mut(&mut tc.ctx, root).push_param(8).id;
-        tc.ctx.block_param_mut(sp_pid).origin = Some(ValueId::Varnode(sp_reg));
+        tc.ctx.block_param_mut(sp_pid).origin =
+            Some(ValueId::Varnode(sp_reg).localize(sp_pid.func));
         let sp = ValueId::BlockParam(sp_pid);
 
         let ram = tc.ctx.shared.default_space;

@@ -270,7 +270,7 @@ mod tests {
         let pid = BasicBlock::from_id_mut(&mut tc.ctx, root).push_param(8).id;
         tc.ctx
             .block_param_mut(pid)
-            .set_origin_id(ValueId::Varnode(sp_reg));
+            .set_origin_id(ValueId::Varnode(sp_reg).localize(pid.func));
         let sp = ValueId::BlockParam(pid);
 
         // `load(@SP - 8)` in each block — distinct Sub ValueIds.

@@ -60,7 +60,8 @@ pub fn append_entry_param(
         ctx.block_param_mut(pid).name = Some(Cow::Owned(name));
     }
     if let Some(origin) = origin {
-        ctx.block_param_mut(pid).set_origin_id(origin);
+        ctx.block_param_mut(pid)
+            .set_origin_id(origin.localize(pid.func));
     }
 
     // Append the matching positional argument at every direct call site.

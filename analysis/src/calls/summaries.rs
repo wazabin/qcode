@@ -568,7 +568,7 @@ mod tests {
             .id;
         tc.ctx
             .block_param_mut(pid)
-            .set_origin_id(ValueId::Varnode(sp));
+            .set_origin_id(ValueId::Varnode(sp).localize(pid.func));
         let sp_param = ValueId::BlockParam(pid);
         let mut builder = Builder::from_context(&mut tc.ctx, addr);
         f(&mut builder, sp_param);

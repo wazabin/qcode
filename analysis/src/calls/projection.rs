@@ -139,6 +139,7 @@ pub fn project_return(ctx: &Context, fid: FunctionId, field: usize) -> Option<Pr
                         proj.opaque = true;
                         continue;
                     };
+                    let parent = BlockId::new(pid.func, parent);
                     sliced_blocks.insert(parent);
                     if parent == root {
                         // A function input.

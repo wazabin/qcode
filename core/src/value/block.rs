@@ -238,7 +238,7 @@ impl<'str> BasicBlock<'str> {
             let new_param_id = ctx.push_block_param(
                 target,
                 BlockParam {
-                    parent: Some(new_block_id),
+                    parent: Some(new_block_id.local),
                     ..old_param
                 },
             );
@@ -296,7 +296,7 @@ impl<'str> BasicBlock<'str> {
             let new_param_id = ctx.push_block_param(
                 new_block_id.func,
                 BlockParam {
-                    parent: Some(new_block_id),
+                    parent: Some(new_block_id.local),
                     ..old_param
                 },
             );
@@ -820,7 +820,7 @@ impl<'str, 'ctx> BlockMutRef<'str, 'ctx> {
             BlockParam {
                 index,
                 type_id,
-                parent: Some(block_id),
+                parent: Some(block_id.local),
                 name: None,
                 origin: None,
                 protected: false,

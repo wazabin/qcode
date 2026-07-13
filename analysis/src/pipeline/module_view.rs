@@ -227,6 +227,16 @@ impl<'a, 'str> FunctionBody<'a, 'str> {
         self.id
     }
 
+    // `Function` owns a single local arena and therefore indexes parameter IDs
+    // by `.local`. Keep the composite owner check at this checked-out-body
+    // boundary so a foreign ID cannot alias an equal local slot in `self.fun`.
+    fn assert_owns_block_param(&self, id: BlockParamId) {
+        assert_eq!(
+            id.func, self.id,
+            "block parameter belongs to another function"
+        );
+    }
+
     /// The borrowed function (read).
     pub fn function(&self) -> &Function<'str> {
         &*self.fun
@@ -543,6 +553,7 @@ impl<'body, 'str> FunctionBody<'body, 'str> {
 
     /// The block parameter `id`, mutably. Mirror of [`Function::block_param_mut`].
     pub fn block_param_mut(&mut self, id: BlockParamId) -> &mut BlockParam<'str> {
+        self.assert_owns_block_param(id);
         self.fun.block_param_mut(id)
     }
 
@@ -570,6 +581,7 @@ impl<'body, 'str> FunctionBody<'body, 'str> {
         cx: ContextView<'a, 'str>,
         id: BlockParamId,
     ) -> &'a BlockParam<'str> {
+        self.assert_owns_block_param(id);
         self.read_host(cx).block_param(id)
     }
 
@@ -618,6 +630,7 @@ impl<'body, 'str> FunctionBody<'body, 'str> {
         cx: ContextView<'a, 'str>,
         id: BlockParamId,
     ) -> BlockParamRef<'str, 'a> {
+        self.assert_owns_block_param(id);
         self.read_host(cx).param_ref(id)
     }
 
@@ -670,6 +683,86 @@ mod tests {
             .unwrap()
             .instruction_ids()[0];
         (body_users_a, body_users_b, foreign)
+    }
+
+    fn two_functions_with_params(
+        mut ctx: &mut Context<'static>,
+    ) -> (FunctionId, BlockParamId, BlockParamId) {
+        qcode!(
+            ctx,
+            "
+            fn body_params_a:
+            <a_entry @a:i64>
+                return at @a;
+
+            fn body_params_b:
+            <b_entry @b:i64>
+                return at @b;
+            "
+        );
+        let foreign = ctx
+            .function_ref(body_params_a)
+            .root()
+            .unwrap()
+            .params()
+            .next()
+            .unwrap()
+            .id;
+        let own = ctx
+            .function_ref(body_params_b)
+            .root()
+            .unwrap()
+            .params()
+            .next()
+            .unwrap()
+            .id;
+        assert_eq!(
+            foreign.local, own.local,
+            "regression setup requires colliding local parameter ids"
+        );
+        (body_params_b, foreign, own)
+    }
+
+    #[test]
+    #[should_panic(expected = "block parameter belongs to another function")]
+    fn function_body_block_param_mut_rejects_foreign_id_with_colliding_local() {
+        let mut ctx = Context::new();
+        let (own_id, foreign, _) = two_functions_with_params(&mut ctx);
+        let env = dummy_env();
+        let (bodies, _view) = ctx.split(&env);
+        let mut slots = bodies.select_mut(&[own_id]);
+        let (own, _) = slots.split_first_mut().unwrap();
+        let mut own = FunctionBody::new(own_id, own, Vec::new());
+
+        let _ = own.block_param_mut(foreign);
+    }
+
+    #[test]
+    #[should_panic(expected = "block parameter belongs to another function")]
+    fn function_body_block_param_read_rejects_foreign_id_with_colliding_local() {
+        let mut ctx = Context::new();
+        let (own_id, foreign, _) = two_functions_with_params(&mut ctx);
+        let env = dummy_env();
+        let (bodies, view) = ctx.split(&env);
+        let mut slots = bodies.select_mut(&[own_id]);
+        let (own, _) = slots.split_first_mut().unwrap();
+        let own = FunctionBody::new(own_id, own, Vec::new());
+
+        let _ = own.block_param(view, foreign);
+    }
+
+    #[test]
+    #[should_panic(expected = "block parameter belongs to another function")]
+    fn function_body_param_ref_rejects_foreign_id_with_colliding_local() {
+        let mut ctx = Context::new();
+        let (own_id, foreign, _) = two_functions_with_params(&mut ctx);
+        let env = dummy_env();
+        let (bodies, view) = ctx.split(&env);
+        let mut slots = bodies.select_mut(&[own_id]);
+        let (own, _) = slots.split_first_mut().unwrap();
+        let own = FunctionBody::new(own_id, own, Vec::new());
+
+        let _ = own.param_ref(view, foreign);
     }
 
     #[test]

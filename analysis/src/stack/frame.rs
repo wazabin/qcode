@@ -152,7 +152,7 @@ mod tests {
         let pid = BasicBlock::from_id_mut(&mut tc.ctx, root).push_param(8).id;
         tc.ctx
             .block_param_mut(pid)
-            .set_origin_id(ValueId::Varnode(sp_reg));
+            .set_origin_id(ValueId::Varnode(sp_reg).localize(pid.func));
         (fid, ValueId::BlockParam(pid), sp_reg)
     }
 
