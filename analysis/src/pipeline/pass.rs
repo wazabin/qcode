@@ -150,8 +150,6 @@ pub trait DynFunctionPass: Send + Sync {
     ) -> Result<Outcome<'str>, String>;
 
     /// Whether this pass may mint functions (see [`FunctionPass::MINTS`]).
-    /// The driver reserves per-function id pools only for stages that contain a
-    /// minting pass.
     fn mints(&self) -> bool {
         false
     }
@@ -176,8 +174,6 @@ pub trait FunctionPass: Default {
     const NAME: &'static str;
     /// Whether this pass may mint new functions via
     /// [`FunctionBody::mint_function`] (the loop outliners are the only ones).
-    /// The driver reserves a per-function id pool only for stages containing
-    /// such a pass, so a non-minting pass costs nothing.
     const MINTS: bool = false;
     fn description(&self) -> &'static str;
     fn run<'str>(
@@ -305,13 +301,6 @@ fn detached_env() -> PipelineEnv {
         VarnodeId::from(0usize),
     )
 }
-
-/// How many function ids are reserved per worklist function for minting
-/// (`PARALLEL_PASSES.md` ruling 3). Every current outliner mints at most one
-/// function per run; a pass needing more simply stops promoting when the pool
-/// runs dry.
-#[allow(dead_code)]
-pub(super) const MINT_RESERVE: usize = 2;
 
 /// Append a pass's detached minted functions to the real function registries at
 /// the barrier (master thread, worklist order): predict the next lockstep ID,

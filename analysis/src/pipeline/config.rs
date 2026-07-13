@@ -497,7 +497,6 @@ impl Pipeline {
         let end = self.barrier_index().unwrap_or(self.stages.len());
         let mut dirty_functions = Some(HashSet::default());
         let mut cache = FixpointCache::default();
-        let mut pool = MintPool::default();
         for stage in &self.stages[..end] {
             match &stage.passes {
                 StagePasses::Module(passes) => {
@@ -519,7 +518,6 @@ impl Pipeline {
                             dirty_functions.as_ref(),
                             None,
                             &mut cache,
-                            &mut pool,
                             round,
                             progress,
                         )
@@ -572,7 +570,6 @@ impl Pipeline {
         let start = self.barrier_index().map(|i| i + 1).unwrap_or(0);
         let mut dirty_functions = Some(HashSet::default());
         let mut cache = FixpointCache::default();
-        let mut pool = MintPool::default();
         for stage in &self.stages[start..] {
             match &stage.passes {
                 StagePasses::Function(passes) => {
@@ -587,7 +584,6 @@ impl Pipeline {
                             dirty_functions.as_ref(),
                             restrict,
                             &mut cache,
-                            &mut pool,
                             round,
                             progress,
                         )
@@ -630,7 +626,6 @@ impl Pipeline {
     ) -> Result<(), String> {
         let mut dirty_functions = Some(HashSet::default());
         let mut cache = FixpointCache::default();
-        let mut pool = MintPool::default();
         for stage in &self.stages[range] {
             match &stage.passes {
                 StagePasses::Module(passes) => {
@@ -652,7 +647,6 @@ impl Pipeline {
                             dirty_functions.as_ref(),
                             None,
                             &mut cache,
-                            &mut pool,
                             round,
                             progress,
                         )
@@ -1201,45 +1195,6 @@ impl FixpointCache {
     }
 }
 
-/// The reservation pool for function minting (`PARALLEL_PASSES.md` ruling 3).
-///
-/// A function pass cannot push into the global function registry, so
-/// the driver pre-materializes never-observed sentinel slots and hands each
-/// worklist function [`MINT_RESERVE`] of their ids before its run — assigned in
-/// worklist order, identically on the sequential and parallel lanes, so minted
-/// ids (and therefore the registry-ordered module dump) are byte-identical
-/// across lanes. Ids a function did not use return here at the end of the stage
-/// (again in worklist order) and are consumed by the *next* stage before any new
-/// sentinel is pushed. Scope is one pipeline run, like [`FixpointCache`];
-/// pipeline-end leftovers stay behind as sentinel tombstones.
-#[allow(dead_code)]
-#[derive(Default)]
-struct MintPool {
-    /// Recycled reserved ids, FIFO. Never consumed by the stage that returned
-    /// them (all of a stage's reservations happen before its first barrier).
-    available: std::collections::VecDeque<FunctionId>,
-}
-
-#[allow(dead_code)]
-impl MintPool {
-    /// Draw `n` reserved ids: recycled ones first, then fresh sentinel slots
-    /// pushed into the registry.
-    fn reserve(&mut self, ctx: &mut Context, n: usize) -> Vec<FunctionId> {
-        (0..n)
-            .map(|_| {
-                self.available
-                    .pop_front()
-                    .unwrap_or_else(|| ctx.push_sentinel_function())
-            })
-            .collect()
-    }
-
-    /// Return a barrier's unused reserved ids for the next stage to consume.
-    fn recycle(&mut self, ids: Vec<FunctionId>) {
-        self.available.extend(ids);
-    }
-}
-
 /// A fingerprint of one function's rendered body, used to detect whether a
 /// module stage modified it. Rendering the IR captures operand rewrites,
 /// insertions/removals, retypes, and CFG edits; block order is address-sorted
@@ -1376,7 +1331,6 @@ async fn run_function_stage(
     // discoveries, so re-optimizing it is pure waste. `None` processes all functions.
     restrict: Option<&HashSet<FunctionId>>,
     cache: &mut FixpointCache,
-    _pool: &mut MintPool,
     round: usize,
     progress: &mut impl ProgressSink,
 ) -> Result<HashSet<FunctionId>, String> {

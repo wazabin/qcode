@@ -576,8 +576,8 @@ impl<'str, 'ctx, Ctx: BuilderBacking<'str>> Builder<'str, 'ctx, Ctx> {
     /// the type themselves. Needed by passes that reference a *minted*
     /// (not-yet-installed) function from a `Map`/`Scan`/`Apply`: the typed
     /// `push_map`/`push_scan`/`push_apply` read the body function's return type
-    /// through the shared context, where a minted callee's slot is still a
-    /// sentinel — so the pass supplies the type it already knows instead.
+    /// through the shared context, where a minted placeholder has no installed
+    /// body — so the pass supplies the type it already knows instead.
     #[track_caller]
     pub fn push_mnemonic_with_type(
         &mut self,
@@ -1365,9 +1365,8 @@ impl<'str, 'ctx, Ctx: BuilderBacking<'str>> Builder<'str, 'ctx, Ctx> {
     /// The type of the value returned by `body`'s first `Return`, or `None` if
     /// `body` has no root or returns nothing — used to size a [`push_map`] result.
     fn map_body_return_type(&self, body: FunctionId) -> Option<TypeId> {
-        // On a checked-out (pass) builder the target body is a reserved sentinel
-        // slot (empty) today, so no return type is recoverable — identical to the
-        // pre-narrowing behavior of reading the empty registry slot.
+        // A checked-out builder has no access to other function bodies, so no
+        // return type is recoverable through this path.
         let HostRef::Module(ctx) = self.read_host() else {
             return None;
         };

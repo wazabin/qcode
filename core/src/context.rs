@@ -615,16 +615,9 @@ impl<'str> Context<'str> {
         self.functions().flat_map(|f| f.instruction_ids()).collect()
     }
 
-    /// Returns a list of all functions in the context. Reserved minting-pool
-    /// sentinels (never-observed placeholder slots; see
-    /// [`FunctionInterface::sentinel`](crate::value::function::FunctionInterface::sentinel))
-    /// are skipped — they are not functions.
+    /// Returns a list of all functions in the context.
     pub fn function_ids(&self) -> Vec<FunctionId> {
-        self.interfaces
-            .iter()
-            .filter(|i| !i.is_sentinel())
-            .map(|i| i.id)
-            .collect()
+        self.interfaces.iter().map(|i| i.id).collect()
     }
 
     /// Mints a fresh, uniquely-named anonymous function and returns its id.
@@ -678,17 +671,6 @@ impl<'str> Context<'str> {
     /// alias for `functions()`
     pub fn iter(&self) -> FunctionIter<'str, '_> {
         self.functions()
-    }
-
-    /// Push a never-observed reserved slot (sentinel interface + empty body) into
-    /// the function registries, returning its [`FunctionId`]. The minting pool
-    /// draws ids from these; they are skipped by every iteration surface until a
-    /// minted function is installed over them.
-    pub fn push_sentinel_function(&mut self) -> FunctionId {
-        self.push_function(
-            crate::value::function::FunctionInterface::sentinel(),
-            Function::empty_body(),
-        )
     }
 
     /// The distinct direct-call *targets* of `fun_id`'s live instructions — a cheap
@@ -1618,7 +1600,7 @@ impl<'str> Context<'str> {
                 self.shared.types.get_or_make_int(size)
             }
             // Exhaustive on purpose: a new ValueId variant must decide its type
-            // here rather than silently inheriting the zero-width sentinel.
+            // here rather than silently inheriting the zero-width fallback.
             ValueId::BasicBlock(_) | ValueId::Function(_) => self.shared.types.get_or_make_int(0),
         }
     }
@@ -2314,13 +2296,8 @@ impl<'str, 'ctx> Iterator for FunctionIter<'str, 'ctx> {
     type Item = FunctionRef<'str, 'ctx>;
 
     fn next(&mut self) -> Option<Self::Item> {
-        // Reserved minting-pool sentinels hold registry slots but are not
-        // functions; no iteration surface may observe them.
         let ctx = self.ctx;
-        self.inner
-            .by_ref()
-            .find(|f| !ctx.interfaces[f.id].is_sentinel())
-            .map(|f| FunctionRef::from_id(ctx, f.id))
+        self.inner.next().map(|f| FunctionRef::from_id(ctx, f.id))
     }
 }
 
@@ -2379,13 +2356,15 @@ mod tests {
     #[test]
     fn functions_iter_yields_all_functions() {
         let mut ctx = Context::new();
-        make_fn_with_blocks(&mut ctx, "alpha", 1);
-        make_fn_with_blocks(&mut ctx, "beta", 1);
+        let alpha = make_fn_with_blocks(&mut ctx, "alpha", 1);
+        let beta = make_fn_with_blocks(&mut ctx, "beta", 1);
 
         let names: Vec<_> = ctx.functions().map(|f| f.name().to_string()).collect();
         assert!(names.contains(&"alpha".to_string()));
         assert!(names.contains(&"beta".to_string()));
         assert_eq!(names.len(), 2);
+        assert_eq!(ctx.function_ids(), vec![alpha, beta]);
+        assert_eq!(ctx.function_ids().len(), ctx.interfaces.len());
     }
 
     #[test]

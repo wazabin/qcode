@@ -327,8 +327,8 @@ pub(crate) fn outline_scan_body<'str>(
 /// (a sequence of `body_ret` with the source's length/kind, falling back to the
 /// source type). The pass must compute this itself: the Builder derives it by
 /// reading the body function's return type, but a *minted* body is not yet
-/// installed (its registry slot is a sentinel), so it would read a wrong
-/// fallback and mis-type the node.
+/// installed in the registry, so it cannot be queried there and the node would
+/// otherwise receive the wrong fallback type.
 pub(crate) fn seq_result_type(host: HostRef, src: ValueId, body_ret: TypeId) -> TypeId {
     let src_ty = host.type_of(src);
     match host.shr().types.seq_of(src_ty) {

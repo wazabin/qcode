@@ -141,15 +141,6 @@ pub enum FunctionKind {
     #[default]
     Machine,
     Lambda,
-    /// A never-observed placeholder holding a registry slot: a reserved id in the
-    /// function-minting pool (see `PARALLEL_PASSES.md`, ruling 3), or a
-    /// pipeline-end leftover of one. Every function-iteration surface
-    /// ([`Context::function_ids`](crate::context::Context::function_ids),
-    /// [`Context::functions`](crate::context::Context::functions), and everything
-    /// built on them — module-pass loops, the textual module dump, the GUI
-    /// listing, the verifier) skips these, so a sentinel is never visible to a
-    /// pass or rendered.
-    Sentinel,
 }
 
 impl<'str> FunctionInterface<'str> {
@@ -162,22 +153,6 @@ impl<'str> FunctionInterface<'str> {
             signature: None,
             kind: FunctionKind::Machine,
         }
-    }
-
-    /// The interface of a never-observed placeholder holding a reserved registry
-    /// slot (the minting pool, ruling 5). Tagged [`FunctionKind::Sentinel`] so
-    /// every function-iteration surface skips it.
-    pub fn sentinel() -> Self {
-        Self {
-            kind: FunctionKind::Sentinel,
-            ..Self::new(Cow::Borrowed(""))
-        }
-    }
-
-    /// Whether this is a never-observed placeholder slot (see
-    /// [`FunctionKind::Sentinel`]).
-    pub fn is_sentinel(&self) -> bool {
-        self.kind == FunctionKind::Sentinel
     }
 }
 
@@ -1231,9 +1206,6 @@ where
         let keyword = match self.kind() {
             FunctionKind::Machine => "fn",
             FunctionKind::Lambda => "lambda",
-            // Never rendered: every iteration surface skips sentinels. Kept inert
-            // (not a panic) so a raw debug print of a reserved slot stays harmless.
-            FunctionKind::Sentinel => "fn",
         };
         writeln!(f, "{keyword} {}:", self.name())?;
         for block in self.blocks() {

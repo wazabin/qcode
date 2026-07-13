@@ -327,7 +327,7 @@ passes = ["array_promote", "array_reads", "gvn", "dce", "dead_store"]
 # preserves semantics regardless of order. Runs after `mark-pure`/`array-promote`
 # because they only consider `is_pure` callees. As `FunctionPass` passes they run
 # over checked-out bodies (and in parallel when the worklist is large enough); the
-# outliners mint their per-element bodies from the driver's reserved id pool.
+# outliners return detached per-element bodies for ordered barrier installation.
 [[stage]]
 name = "loop-fold"
 scope = "function"
