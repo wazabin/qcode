@@ -328,9 +328,7 @@ fn resolve_local_target(
             let g = if is_entry {
                 owner
             } else {
-                let split = ctx.split_function_at(tb);
-                addresses.refresh(ctx);
-                split
+                ctx.split_function_at_indexed(addresses, tb)
             };
             LocalTarget::Foreign(g)
         }

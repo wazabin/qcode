@@ -112,7 +112,7 @@ impl<'de, 'str> serde::Deserialize<'de> for Context<'str> {
 /// `docs/plans/context-split/00-overview.md`). Holds the frozen architecture
 /// (spaces, registers, memory image), the append-interned value arenas
 /// (literals, bytes, varnodes, types) inside [`values`](Self::values), and the
-/// phase-mutable module maps (names, addresses, truths, discoveries, call
+/// phase-mutable module maps (names, truths, discoveries, call
 /// sites). Everything here is reachable through a frozen `&Shared` view; nothing
 /// per-function-body lives here.
 #[derive(Default, Clone, serde::Serialize, serde::Deserialize)]
@@ -134,9 +134,6 @@ pub struct Shared<'str> {
     /// live in each [`FunctionBody`](crate::value::FunctionBody)'s own [`NameTable`], so
     /// those namespaces stay independent across functions (see [`NameTable`]).
     pub(crate) name_map: NameTable<'str>,
-
-    /// Reverse mapping from addresses to value IDs
-    pub(crate) address_map: HashMap<u64, ValueId>,
 
     /// A mapping of register IDs to their corresponding value IDs
     pub registers: HashMap<RegisterId, VarnodeId>,
@@ -596,22 +593,8 @@ impl<'str> Context<'str> {
     /// The newly created block is named after the address in hex and registered
     /// in the address map.
     pub fn get_or_make_block(&mut self, addr: u64, func: FunctionId) -> BlockId {
-        if let Some(ValueId::Function(owner)) = self.get_at_addr(&addr) {
-            assert_eq!(
-                owner, func,
-                "cannot create a block at an address owned by another function"
-            );
-        }
-        match BasicBlock::from_addr(self, addr) {
-            Some(block) => {
-                assert_eq!(
-                    block.id.func, func,
-                    "cannot reuse a block stored in another function arena"
-                );
-                block.id
-            }
-            None => BasicBlock::make(self, func).with_address(addr).id,
-        }
+        let mut addresses = crate::address_index::AddressIndex::analyze(self);
+        self.get_or_make_block_indexed(&mut addresses, addr, func)
     }
 
     /// Indexed construction variant of [`get_or_make_block`](Self::get_or_make_block).
@@ -863,6 +846,7 @@ impl<'str> Context<'str> {
     /// function is a bug upstream, and debug builds assert against it.
     pub fn rehome_owned_blocks(
         &mut self,
+        addresses: &mut crate::address_index::AddressIndex,
         target: FunctionId,
         olds: &[BlockId],
     ) -> HashMap<BlockId, BlockId> {
@@ -954,18 +938,6 @@ impl<'str> Context<'str> {
             let extra = self.block(old).extra_addresses.clone();
             self.block_mut(new).extra_addresses = extra;
             self.block_mut(new).address = Some(addr);
-            match self.shared.address_map.get(&addr).copied() {
-                // A function and its entry block share an address; the map keeps the
-                // function, so only the block's `address` field and the root pointer
-                // (fixed in phase 5) need to move.
-                Some(ValueId::Function(_)) => {}
-                // The block itself is mapped: repoint it at the clone.
-                _ => {
-                    self.shared
-                        .address_map
-                        .insert(addr, ValueId::BasicBlock(new));
-                }
-            }
         }
 
         // Phase 5: delete the originals (unlinks their old edges, removes their
@@ -979,17 +951,21 @@ impl<'str> Context<'str> {
         // the clones registered their sites when created, and the deletions in phase
         // 6 dropped the originals'.
         self.rebuild_users(target);
+        addresses.refresh(self);
         block_map
     }
 
     /// The function registered at `block`'s machine address, if any. Registration
     /// is the entry-boundary signal even while the function is a rootless stub:
     /// Path A never adopts a foreign-storage block merely because addresses match.
-    fn function_registered_at_block(&self, block: BlockId) -> Option<FunctionId> {
+    fn function_registered_at_block(
+        &self,
+        addresses: &crate::address_index::AddressIndex,
+        block: BlockId,
+    ) -> Option<FunctionId> {
         self.block(block)
             .address
-            .and_then(|addr| FunctionBody::from_addr(self, addr))
-            .map(|f| f.id)
+            .and_then(|addr| addresses.function_at(addr))
     }
 
     /// Blocks reachable from `block` along CFG edges, stopping at any *other*
@@ -1000,7 +976,12 @@ impl<'str> Context<'str> {
     /// the tail is being reclaimed into, so `g`'s own entry (which is `block`) is not
     /// a boundary. Deterministically ordered (by machine address, then id) so the
     /// storage relocation that follows assigns ids reproducibly.
-    fn split_tail(&self, block: BlockId, g: FunctionId) -> Vec<BlockId> {
+    fn split_tail(
+        &self,
+        addresses: &crate::address_index::AddressIndex,
+        block: BlockId,
+        g: FunctionId,
+    ) -> Vec<BlockId> {
         let mut seen: HashSet<BlockId> = HashSet::default();
         seen.insert(block);
         let mut queue = vec![block];
@@ -1016,7 +997,7 @@ impl<'str> Context<'str> {
                 // A different function's entry is a tail-call boundary — never
                 // crossed. `g`'s own entry is `block` (already seen), so this stops
                 // only at *foreign* entries.
-                if let Some(entry_func) = self.function_registered_at_block(s)
+                if let Some(entry_func) = self.function_registered_at_block(addresses, s)
                     && entry_func != g
                 {
                     continue;
@@ -1054,6 +1035,17 @@ impl<'str> Context<'str> {
     ///
     /// `block` must carry a machine address.
     pub fn split_function_at(&mut self, block: BlockId) -> FunctionId {
+        let mut addresses = crate::address_index::AddressIndex::analyze(self);
+        self.split_function_at_indexed(&mut addresses, block)
+    }
+
+    /// Indexed construction variant of
+    /// [`split_function_at`](Self::split_function_at).
+    pub fn split_function_at_indexed(
+        &mut self,
+        addresses: &mut crate::address_index::AddressIndex,
+        block: BlockId,
+    ) -> FunctionId {
         use crate::builder::Builder;
         use crate::value::insn::{Branch, CBranch, Callee, TailCall};
 
@@ -1066,14 +1058,14 @@ impl<'str> Context<'str> {
         // may carry a symbol name), else mint a conventional one. A block already
         // stored elsewhere at this address is not adopted; relocation below creates
         // and roots a self-stored clone.
-        let g = match FunctionBody::from_addr(self, addr).map(|f| f.id) {
+        let g = match addresses.function_at(addr) {
             Some(existing) => existing,
-            None => FunctionBody::make_at_addr(self, addr, None).id,
+            None => FunctionBody::make_at_addr_indexed(self, addresses, addr, None).id,
         };
 
         // The tail is computed on the pre-split CFG (cross-function edges intact) so
         // the reach walk is exact — matching the settle's `claimed_from`.
-        let tail = self.split_tail(block, g);
+        let tail = self.split_tail(addresses, block, g);
         let tail_set: HashSet<BlockId> = tail.iter().copied().collect();
 
         // Every function that currently owns a tail block loses those blocks; record
@@ -1103,7 +1095,7 @@ impl<'str> Context<'str> {
                 let callee = if target == block {
                     g
                 } else {
-                    ctx.function_registered_at_block(target)?
+                    ctx.function_registered_at_block(addresses, target)?
                 };
                 (callee != owner).then_some(callee)
             };
@@ -1211,7 +1203,7 @@ impl<'str> Context<'str> {
         // Storage move: relocate the tail into G's own arena (self-stored). The set
         // is now closed (all cross-function edges stripped, foreign targets rewritten
         // to `TailCall`s), so the relocation's closure assumptions hold.
-        let moved = self.rehome_owned_blocks(g, &tail);
+        let moved = self.rehome_owned_blocks(addresses, g, &tail);
         self.bodies[g].set_root_id(Some(moved[&block].local));
 
         // Rebuild `instruction_addrs` on G and on every function that lost blocks.
@@ -2132,40 +2124,6 @@ impl<'str> Context<'str> {
         }
     }
 
-    /// Associates `addr` with `id` in the address map.
-    ///
-    /// Returns `Err(Error::DuplicateAddress(addr))` if the address is already
-    /// mapped. Callers that have already checked (e.g. via
-    /// [`get_at_addr`](Self::get_at_addr)) may safely `.expect(...)` the result.
-    pub(crate) fn set_address(&mut self, addr: u64, id: ValueId) -> crate::error::Result<()> {
-        if let Some(existing) = self.shared.address_map.insert(addr, id) {
-            // A function and a block may share an address. The function mapping is
-            // kept; only a self-stored block may also become its root.
-
-            match (existing, id) {
-                // A function and a self-stored entry block may share an address.
-                // A foreign-storage block at the same address is not adopted;
-                // split/rehome code must physically move it first.
-                (ValueId::Function(func_id), ValueId::BasicBlock(block_id))
-                | (ValueId::BasicBlock(block_id), ValueId::Function(func_id)) => {
-                    if block_id.func == func_id {
-                        FunctionBody::from_id_mut(self, func_id).ensure_root(block_id)?;
-                    }
-                    self.shared
-                        .address_map
-                        .insert(addr, ValueId::Function(func_id));
-                    return Ok(());
-                }
-
-                _ => {}
-            }
-
-            Err(Error::spanless(ErrorTy::DuplicateAddress(addr, existing)))
-        } else {
-            Ok(())
-        }
-    }
-
     /// Registers an address in a caller-owned construction index.
     pub(crate) fn set_address_indexed(
         &mut self,
@@ -2216,11 +2174,6 @@ impl<'str> Context<'str> {
     /// returns `None` for them.
     pub fn get_named(&self, name: &str) -> Option<ValueId> {
         self.shared.name_map.get(name)
-    }
-
-    /// Gets a value ID at a given address
-    pub fn get_at_addr(&self, addr: &u64) -> Option<ValueId> {
-        self.shared.address_map.get(addr).copied()
     }
 
     /// Gets a unique **global** name (functions, varnodes, spaces, …), appending
@@ -3578,7 +3531,8 @@ mod tests {
             assert_eq!(FunctionBody::from_id(&ctx, g).name(), "fn_1008");
             assert_eq!(addrs(&ctx, f), vec![0x1000]);
             assert_eq!(addrs(&ctx, g), vec![0x1008]);
-            assert_eq!(FunctionBody::from_addr(&ctx, 0x1008).map(|f| f.id), Some(g));
+            let addresses = crate::address_index::AddressIndex::analyze(&ctx);
+            assert_eq!(addresses.function_at(0x1008), Some(g));
             for b in FunctionBody::from_id(&ctx, g).block_ids() {
                 assert_eq!(b.func, g);
             }

@@ -144,33 +144,6 @@ impl<'str> BasicBlock<'str> {
             .map(|id| BasicBlock::from_id(ctx, id))
     }
 
-    /// Gets a reference to a block by address
-    /// A block and a function can share an address
-    pub fn from_addr<'ctx>(ctx: &'ctx Context<'str>, addr: u64) -> Option<BlockRef<'str, 'ctx>> {
-        ctx.get_at_addr(&addr).and_then(|id| match id {
-            ValueId::BasicBlock(block_id) => Some(BasicBlock::from_id(ctx, block_id)),
-            ValueId::Function(function_id) => FunctionBody::from_id(ctx, function_id).root(),
-            _ => None,
-        })
-    }
-
-    /// Gets a mutable reference to a block by address
-    /// A block and a function can share an address
-    pub fn from_addr_mut<'ctx>(
-        ctx: &'ctx mut Context<'str>,
-        addr: u64,
-    ) -> Option<BlockMutRef<'str, 'ctx>> {
-        ctx.get_at_addr(&addr)
-            .and_then(|id| match id {
-                ValueId::BasicBlock(block_id) => Some(block_id),
-                ValueId::Function(function_id) => FunctionBody::from_id(&*ctx, function_id)
-                    .root()
-                    .map(|root| root.id),
-                _ => None,
-            })
-            .map(|id| BasicBlock::from_id_mut(ctx, id))
-    }
-
     /// Create a new block, born into `func`'s block arena. Its `parent` is set
     /// to `func` (ownership == arena membership).
     pub fn make<'ctx>(ctx: &'ctx mut Context<'str>, func: FunctionId) -> BlockMutRef<'str, 'ctx> {
@@ -910,20 +883,8 @@ impl<'str, 'ctx> BlockMutRef<'str, 'ctx> {
     /// Names the block after `addr` if it doesn't already have a name.
     /// Returns `Err` if another value is already mapped to `addr`.
     pub fn set_address(&mut self, addr: u64) -> Result<()> {
-        self.inner_mut().address = Some(addr);
-        self.ctx.set_address(addr, self.id.into())?;
-
-        if self.name().is_none() {
-            // Give the block a hex-address label, deduplicated within this
-            // function's own name table (block names are function-scoped) so it
-            // can't collide with another label this function already carries.
-            let label = self
-                .ctx
-                .get_unique_name_in(self.id.func, Cow::Owned(format!("{addr:x}")));
-            self.rename(label)?;
-        }
-
-        Ok(())
+        let mut addresses = crate::address_index::AddressIndex::analyze(&*self.ctx);
+        self.set_address_indexed(&mut addresses, addr)
     }
 
     /// Assigns an address through a caller-owned construction index.
@@ -987,8 +948,13 @@ mod tests {
         }
         .with_address(0x2000)
         .id;
-        let block_by_addr =
-            BasicBlock::from_addr(&ctx, 0x2000).expect("block not found by address");
+        let addresses = crate::address_index::AddressIndex::analyze(&ctx);
+        let block_by_addr = BasicBlock::from_id(
+            &ctx,
+            addresses
+                .block_at(0x2000)
+                .expect("block not found by address"),
+        );
         assert_eq!(id, block_by_addr.id);
         assert_eq!(block_by_addr.address(), Some(0x2000));
     }

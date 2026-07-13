@@ -83,10 +83,13 @@ impl AddressIndex {
 
         match (existing, target) {
             (AddressTarget::Function(function), AddressTarget::Block(block))
-            | (AddressTarget::Block(block), AddressTarget::Function(function))
-                if block.func == function =>
-            {
-                FunctionBody::from_id_mut(ctx, function).ensure_root(block)?;
+            | (AddressTarget::Block(block), AddressTarget::Function(function)) => {
+                // A split first registers a rootless function over a block that
+                // is still stored in the old function. Root only once storage
+                // ownership matches; rehoming refreshes the index afterwards.
+                if block.func == function {
+                    FunctionBody::from_id_mut(ctx, function).ensure_root(block)?;
+                }
                 self.targets
                     .insert(address, AddressTarget::Function(function));
                 Ok(())

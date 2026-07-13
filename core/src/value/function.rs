@@ -844,23 +844,6 @@ impl<'str> FunctionBody<'str> {
             .map(|id| FunctionBody::from_id(ctx, id))
     }
 
-    /// Gets a reference to a function by address
-    pub fn from_addr<'ctx>(ctx: &'ctx Context<'str>, addr: u64) -> Option<FunctionRef<'str, 'ctx>> {
-        ctx.get_at_addr(&addr)
-            .and_then(ValueId::as_function)
-            .map(|id| FunctionBody::from_id(ctx, id))
-    }
-
-    /// Gets a mutable reference to a function by address
-    pub fn from_addr_mut<'ctx>(
-        ctx: &'ctx mut Context<'str>,
-        addr: u64,
-    ) -> Option<FunctionMutRef<'str, 'ctx>> {
-        ctx.get_at_addr(&addr)
-            .and_then(ValueId::as_function)
-            .map(|id| FunctionMutRef::new(ctx, id))
-    }
-
     /// Create a new function
     pub fn make<'ctx>(
         ctx: &'ctx mut Context<'str>,
@@ -894,23 +877,8 @@ impl<'str> FunctionBody<'str> {
         address: u64,
         name: Option<Cow<'str, str>>,
     ) -> FunctionMutRef<'str, 'ctx> {
-        let name = match name {
-            Some(name) => name,
-            None => Cow::Owned(format!("fn_{address:x}")),
-        };
-
-        let id = FunctionId::from(ctx.bodies.len());
-        let pushed = ctx.push_function(
-            FunctionInterface::new(name.clone()),
-            FunctionBody::empty_body(id),
-        );
-        debug_assert_eq!(pushed, id);
-
-        Self::from_id_mut(ctx, id)
-            .with_name(name)
-            .expect("Function name is not unique")
-            .with_address(address)
-            .expect("Function address is not unique")
+        let mut addresses = crate::address_index::AddressIndex::analyze(ctx);
+        Self::make_at_addr_indexed(ctx, &mut addresses, address, name)
     }
 
     /// Indexed construction variant of [`make_at_addr`](Self::make_at_addr).
@@ -966,10 +934,8 @@ impl<'str> FunctionBody<'str> {
         ctx: &'ctx mut Context<'str>,
         address: u64,
     ) -> FunctionMutRef<'str, 'ctx> {
-        match ctx.get_at_addr(&address).and_then(ValueId::as_function) {
-            Some(id) => Self::from_id_mut(ctx, id),
-            None => Self::make_at_addr(ctx, address, None),
-        }
+        let mut addresses = crate::address_index::AddressIndex::analyze(ctx);
+        Self::from_addr_or_create_indexed(ctx, &mut addresses, address)
     }
 
     /// Indexed construction variant of
@@ -1263,6 +1229,7 @@ where
     /// edge and is included; see [`tail_call_target`].
     pub fn callees(&'s self) -> Vec<FunctionId> {
         let ctx = self.ctx();
+        let addresses = crate::address_index::AddressIndex::analyze(ctx);
         let mut callees = self
             .blocks()
             .flat_map(|block| {
@@ -1280,7 +1247,7 @@ where
             ctx.shared
                 .values
                 .synthetic_callees_of(self.id)
-                .filter_map(|addr| FunctionBody::from_addr(ctx, addr).map(|function| function.id)),
+                .filter_map(|addr| addresses.function_at(addr)),
         );
         callees.sort_by_key(|&id| Into::<usize>::into(id));
         callees.dedup();
@@ -1580,13 +1547,8 @@ impl<'str, 'ctx> FunctionMutRef<'str, 'ctx> {
     }
 
     fn set_address(&mut self, address: u64) -> Result<()> {
-        self.interface_mut().address = Some(address);
-        self.ctx.set_address(address, self.id.into())
-    }
-
-    fn with_address(mut self, address: u64) -> Result<Self> {
-        self.set_address(address)?;
-        Ok(self)
+        let mut addresses = crate::address_index::AddressIndex::analyze(&*self.ctx);
+        self.set_address_indexed(&mut addresses, address)
     }
 
     fn set_address_indexed(
@@ -2152,7 +2114,8 @@ mod tests {
     fn get_function_by_addr_returns_correct_function() {
         let mut ctx = Context::new();
         let id = FunctionBody::make_at_addr(&mut ctx, 0x2000, None).id();
-        let f = FunctionBody::from_addr(&ctx, 0x2000).unwrap();
+        let addresses = crate::address_index::AddressIndex::analyze(&ctx);
+        let f = FunctionBody::from_id(&ctx, addresses.function_at(0x2000).unwrap());
         assert_eq!(f.id(), id);
         assert_eq!(f.address(), Some(0x2000));
         assert_eq!(f.name(), "fn_2000");
@@ -2161,7 +2124,8 @@ mod tests {
     #[test]
     fn get_function_by_addr_returns_none_if_missing() {
         let ctx = Context::new();
-        assert!(FunctionBody::from_addr(&ctx, 0xdeadbeef).is_none());
+        let addresses = crate::address_index::AddressIndex::analyze(&ctx);
+        assert!(addresses.function_at(0xdeadbeef).is_none());
     }
 
     #[test]
@@ -2289,11 +2253,10 @@ mod tests {
         assert_eq!(by_name.name(), "myfn");
     }
 
-    /// Registering a function at an address already occupied by a block in a
-    /// different arena must leave the new function rootless. `split_function_at`
-    /// performs the explicit clone-first move when that block is later claimed.
+    /// Split construction lets a rootless function temporarily win an address
+    /// occupied by a block that has not yet been rehomed into its arena.
     #[test]
-    fn set_address_does_not_adopt_foreign_block_as_function_root() {
+    fn indexed_address_registration_keeps_foreign_block_rootless() {
         let mut ctx = Context::new();
 
         // Simulate a branch-target block created at 0x1000 before the function
@@ -2303,15 +2266,26 @@ mod tests {
             BasicBlock::make(&mut ctx, __f)
         }
         .id;
-        ctx.set_address(0x1000, ValueId::BasicBlock(block_id))
+        let mut addresses = crate::address_index::AddressIndex::analyze(&ctx);
+        addresses
+            .register(
+                &mut ctx,
+                0x1000,
+                crate::address_index::AddressTarget::Block(block_id),
+            )
             .unwrap();
 
-        // Registering a function at the same address succeeds, but Path A does
-        // not permit its root/roster to reference the anonymous block's arena.
-        let fn_id = FunctionBody::make_at_addr(&mut ctx, 0x1000, None).id;
+        let fn_id = FunctionBody::make(&mut ctx, "fn_1000".into()).unwrap().id;
+        addresses
+            .register(
+                &mut ctx,
+                0x1000,
+                crate::address_index::AddressTarget::Function(fn_id),
+            )
+            .unwrap();
 
-        // The function wins in the address map.
-        assert!(FunctionBody::from_addr(&ctx, 0x1000).is_some());
+        assert_eq!(addresses.function_at(0x1000), Some(fn_id));
+        assert_eq!(addresses.block_at(0x1000), None);
         assert!(FunctionBody::from_id(&ctx, fn_id).root().is_none());
         assert_ne!(block_id.func, fn_id);
     }

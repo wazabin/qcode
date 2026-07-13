@@ -1920,24 +1920,8 @@ impl<'str, 'ctx> Builder<'str, 'ctx, &'ctx mut Context<'str>> {
     /// Creates a builder positioned at the block for machine `address`, creating
     /// the block (and an anonymous host function if nothing is mapped) if needed.
     pub fn from_context<'m>(ctx: &'m mut Context<'str>, address: u64) -> Builder<'str, 'm> {
-        let block_id = match ctx.get_at_addr(&address) {
-            Some(ValueId::Function(func)) => match FunctionBody::from_id(ctx, func).root() {
-                Some(root) => root.id,
-                None => ctx.get_or_make_block(address, func),
-            },
-            _ => match BasicBlock::from_addr(ctx, address) {
-                Some(block) => block.id,
-                None => {
-                    let func = FunctionBody::make(ctx, Cow::Owned(format!("blk_{address:x}")))
-                        .expect("anon host function")
-                        .id;
-                    ctx.get_or_make_block(address, func)
-                }
-            },
-        };
-        let mut builder = Builder::from_block(BasicBlock::from_id_mut(ctx, block_id));
-        builder.set_address(address);
-        builder
+        let mut addresses = crate::address_index::AddressIndex::analyze(ctx);
+        Self::from_context_indexed(ctx, &mut addresses, address)
     }
 
     /// Indexed construction variant of [`from_context`](Self::from_context).
