@@ -985,7 +985,7 @@ impl<'str> Context<'str> {
     /// `block` must carry a machine address.
     pub fn split_function_at(&mut self, block: BlockId) -> FunctionId {
         use crate::builder::Builder;
-        use crate::value::insn::{Branch, CBranch, TailCall};
+        use crate::value::insn::{Branch, CBranch, Callee, TailCall};
 
         let addr = self
             .block(block)
@@ -1089,7 +1089,7 @@ impl<'str> Context<'str> {
             self.replace_instruction_mnemonic(
                 insn,
                 Mnemonic::TailCall(TailCall {
-                    target: callee,
+                    target: Callee::Real(callee),
                     args: vec![],
                 }),
             );
@@ -2318,7 +2318,7 @@ mod tests {
     use super::*;
     use crate::value::{
         BasicBlock, Function, ValueId,
-        insn::{Binary, Binop, Call, IntBinop, Load, Mnemonic},
+        insn::{Binary, Binop, Call, Callee, IntBinop, Load, Mnemonic},
     };
     use qcode_macro::qcode;
 
@@ -2794,7 +2794,7 @@ mod tests {
         ctx.replace_instruction_mnemonic(
             call_id,
             Mnemonic::Call(Call {
-                target,
+                target: Callee::Real(target),
                 args: vec![],
                 clobbers: vec![],
             }),
@@ -2810,7 +2810,7 @@ mod tests {
                 target: actual,
                 args,
                 ..
-            }) if *actual == target && args.is_empty()
+            }) if *actual == Callee::Real(target) && args.is_empty()
         ));
 
         // Rewriting the indirect call into a direct one records the call edge.
@@ -2868,7 +2868,7 @@ mod tests {
         ctx.replace_instruction_mnemonic(
             call_id,
             Mnemonic::Call(Call {
-                target,
+                target: Callee::Real(target),
                 args: vec![],
                 clobbers: vec![],
             }),
@@ -3226,7 +3226,7 @@ mod tests {
     mod split_function_at {
         use super::*;
         use crate::builder::Builder;
-        use crate::value::insn::{Mnemonic, TailCall};
+        use crate::value::insn::{Callee, Mnemonic, TailCall};
         use crate::value::{BasicBlock, Function, Instruction};
         use std::borrow::Cow;
 
@@ -3327,7 +3327,7 @@ mod tests {
                 .last()
                 .map(|i| i.mnemonic().clone());
             assert!(
-                matches!(term, Some(Mnemonic::TailCall(TailCall { target, .. })) if target == g),
+                matches!(term, Some(Mnemonic::TailCall(TailCall { target, .. })) if target == Callee::Real(g)),
                 "thunk branch must become TailCall(G), got {term:?}",
             );
         }
@@ -3362,7 +3362,7 @@ mod tests {
                 .last()
                 .map(|i| i.mnemonic().clone());
             assert!(
-                matches!(term, Some(Mnemonic::TailCall(TailCall { target, .. })) if target == h),
+                matches!(term, Some(Mnemonic::TailCall(TailCall { target, .. })) if target == Callee::Real(h)),
                 "split tail must stop and tail-call rootless stub H, got {term:?}",
             );
         }
@@ -3436,7 +3436,7 @@ mod tests {
                 .last()
                 .map(|i| i.mnemonic().clone());
             assert!(
-                matches!(term, Some(Mnemonic::TailCall(TailCall { target, .. })) if target == g),
+                matches!(term, Some(Mnemonic::TailCall(TailCall { target, .. })) if target == Callee::Real(g)),
                 "trampoline must tail-call G, got {term:?}",
             );
             // Every successor of entry is intra-F.

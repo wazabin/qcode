@@ -17,7 +17,7 @@ use crate::{
         block::BlockId,
         bytes::BytesRef,
         function::FunctionId,
-        insn::{InstructionRef, Mnemonic},
+        insn::{Callee, InstructionRef, Mnemonic},
         literal::{LiteralId, LiteralRef, SymbolicRef},
         varnode::Varnode,
     },
@@ -337,11 +337,8 @@ fn mnemonic_segments(seg: &mut Seg, func: FunctionId, m: &Mnemonic) {
         }
         Mnemonic::Apply(a) => {
             seg.kw("apply ");
-            seg.push(
-                Function::from_id(seg.ctx, a.target).name().to_string(),
-                TokenKind::Function,
-                Some(Link::Function(a.target)),
-            );
+            let (target, link) = callee_name_link(seg.ctx, a.target);
+            seg.push(target, TokenKind::Function, link);
             seg.punct("(");
             for (i, &arg) in a.args.iter().enumerate() {
                 if i > 0 {
@@ -353,32 +350,27 @@ fn mnemonic_segments(seg: &mut Seg, func: FunctionId, m: &Mnemonic) {
         }
         Mnemonic::Call(c) => {
             seg.kw("call fn ");
-            seg.push(
-                Function::from_id(seg.ctx, c.target).name().to_string(),
-                TokenKind::Function,
-                Some(Link::Function(c.target)),
-            );
+            let (target, link) = callee_name_link(seg.ctx, c.target);
+            seg.push(target, TokenKind::Function, link);
             seg.punct("(");
             for (i, &arg) in c.args.iter().enumerate() {
                 if i > 0 {
                     seg.punct(", ");
                 }
-                seg.push(
-                    call_arg_name(seg.ctx, c.target, i),
-                    TokenKind::BlockParam,
-                    None,
-                );
+                let arg_name = c
+                    .target
+                    .real()
+                    .map(|target| call_arg_name(seg.ctx, target, i))
+                    .unwrap_or_else(|| format!("@arg{i}="));
+                seg.push(arg_name, TokenKind::BlockParam, None);
                 seg.value(arg.qualify(func));
             }
             seg.punct(");");
         }
         Mnemonic::TailCall(tc) => {
             seg.kw("tailcall fn ");
-            seg.push(
-                Function::from_id(seg.ctx, tc.target).name().to_string(),
-                TokenKind::Function,
-                Some(Link::Function(tc.target)),
-            );
+            let (target, link) = callee_name_link(seg.ctx, tc.target);
+            seg.push(target, TokenKind::Function, link);
             seg.punct("(");
             for (i, &arg) in tc.args.iter().enumerate() {
                 if i > 0 {
@@ -507,15 +499,15 @@ fn mnemonic_segments(seg: &mut Seg, func: FunctionId, m: &Mnemonic) {
             seg.punct(");");
         }
         Mnemonic::Map(map) => {
-            let body = Function::from_id(seg.ctx, map.body).name().to_string();
+            let (body, link) = callee_name_link(seg.ctx, map.body);
             if map.captures.is_empty() {
-                seg.push(body, TokenKind::Function, Some(Link::Function(map.body)));
+                seg.push(body, TokenKind::Function, link);
                 seg.op(" <$> ");
                 seg.value(map.src.qualify(func));
                 seg.punct(";");
             } else {
                 seg.punct("(");
-                seg.push(body, TokenKind::Function, Some(Link::Function(map.body)));
+                seg.push(body, TokenKind::Function, link);
                 for &c in &map.captures {
                     seg.punct(" ");
                     seg.value(c.qualify(func));
@@ -526,14 +518,14 @@ fn mnemonic_segments(seg: &mut Seg, func: FunctionId, m: &Mnemonic) {
             }
         }
         Mnemonic::Scan(scan) => {
-            let body = Function::from_id(seg.ctx, scan.body).name().to_string();
+            let (body, link) = callee_name_link(seg.ctx, scan.body);
+            let body = match scan.body {
+                Callee::Real(_) => format!("@{body}"),
+                Callee::Minted(_) => body,
+            };
             if scan.captures.is_empty() {
                 seg.kw("scanl ");
-                seg.push(
-                    format!("@{body}"),
-                    TokenKind::Function,
-                    Some(Link::Function(scan.body)),
-                );
+                seg.push(body, TokenKind::Function, link);
                 seg.punct(" ");
                 seg.value(scan.init.qualify(func));
                 seg.punct(" ");
@@ -542,11 +534,7 @@ fn mnemonic_segments(seg: &mut Seg, func: FunctionId, m: &Mnemonic) {
             } else {
                 seg.kw("scanl ");
                 seg.punct("(");
-                seg.push(
-                    format!("@{body}"),
-                    TokenKind::Function,
-                    Some(Link::Function(scan.body)),
-                );
+                seg.push(body, TokenKind::Function, link);
                 for &c in &scan.captures {
                     seg.punct(" ");
                     seg.value(c.qualify(func));
@@ -629,6 +617,18 @@ fn call_arg_name(ctx: &Context<'_>, target: FunctionId, index: usize) -> String 
     match Function::from_id(ctx, target).input_arg_name(index) {
         Some(name) => format!("@{name}="),
         None => format!("@arg{index}="),
+    }
+}
+
+/// Render a real function symbol or an unresolved pass-local placeholder.
+/// Placeholders deliberately carry no link: they are not installed functions.
+fn callee_name_link(ctx: &Context<'_>, callee: Callee) -> (String, Option<Link>) {
+    match callee {
+        Callee::Real(id) => (
+            Function::from_id(ctx, id).name().to_string(),
+            Some(Link::Function(id)),
+        ),
+        Callee::Minted(slot) => (format!("<minted:{slot}>"), None),
     }
 }
 

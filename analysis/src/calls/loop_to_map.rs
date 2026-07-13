@@ -284,7 +284,7 @@ fn apply<'str>(
         let id = body.push_mnemonic_with_type(
             m,
             Mnemonic::Map(qcode::value::insn::Map {
-                body: body_fn,
+                body: qcode::value::insn::Callee::Real(body_fn),
                 src: src.localize(body.id()),
                 captures: Vec::new(),
             }),

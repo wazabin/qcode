@@ -79,14 +79,28 @@ fn mnemonic_is_pure(ctx: &Context, m: &Mnemonic) -> bool {
         Mnemonic::CallInd(_) | Mnemonic::BranchInd(_) | Mnemonic::PCodeOp(_) => false,
         // A map is pure exactly when its per-element body is pure. The body is a
         // symbol, not an operand, so the generic varnode check below cannot see it.
-        Mnemonic::Map(m) => Function::from_id(ctx, m.body).is_pure(),
+        Mnemonic::Map(m) => m
+            .body
+            .real()
+            .is_some_and(|body| Function::from_id(ctx, body).is_pure()),
         // A scan is pure exactly when its per-element body is pure (same as map).
-        Mnemonic::Scan(m) => Function::from_id(ctx, m.body).is_pure(),
-        Mnemonic::Apply(m) => Function::from_id(ctx, m.target).is_pure(),
+        Mnemonic::Scan(m) => m
+            .body
+            .real()
+            .is_some_and(|body| Function::from_id(ctx, body).is_pure()),
+        Mnemonic::Apply(m) => m
+            .target
+            .real()
+            .is_some_and(|target| Function::from_id(ctx, target).is_pure()),
         // A direct call to a pure function is a deterministic value of its args
         // and clobbers nothing — provided the call site carries no residual
         // clobbers of its own.
-        Mnemonic::Call(c) => c.clobbers.is_empty() && Function::from_id(ctx, c.target).is_pure(),
+        Mnemonic::Call(c) => {
+            c.clobbers.is_empty()
+                && c.target
+                    .real()
+                    .is_some_and(|target| Function::from_id(ctx, target).is_pure())
+        }
         // A store is pure only when it writes the function's *private* shadow space
         // (argpromote's functionalized memory) — that produces no caller-visible
         // effect. A store to REAL memory is an observable side effect and keeps the

@@ -130,8 +130,10 @@ pub(crate) fn address_taken_set(ctx: &Context) -> FxHashSet<FunctionId> {
 pub(crate) fn called_function_set(ctx: &Context) -> FxHashSet<FunctionId> {
     let mut set = FxHashSet::default();
     for insn in ctx.instructions() {
-        if let Mnemonic::Call(c) = insn.mnemonic() {
-            set.insert(c.target);
+        if let Mnemonic::Call(c) = insn.mnemonic()
+            && let Some(target) = c.target.real()
+        {
+            set.insert(target);
         }
     }
     set
@@ -270,7 +272,7 @@ pub(crate) fn append_outputs<S>(
     let call_sites: Vec<InstructionId> = ctx
         .instructions()
         .filter_map(|insn| match insn.mnemonic() {
-            Mnemonic::Call(c) if c.target == fid => Some(insn.id),
+            Mnemonic::Call(c) if c.target.real() == Some(fid) => Some(insn.id),
             _ => None,
         })
         .collect();

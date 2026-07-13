@@ -280,7 +280,7 @@ fn param_access_extent(
 fn call_sites_of(ctx: &Context, callee: FunctionId) -> Vec<InstructionId> {
     ctx.instructions()
         .filter_map(|insn| match insn.mnemonic() {
-            Mnemonic::Call(c) if c.target == callee => Some(insn.id),
+            Mnemonic::Call(c) if c.target.real() == Some(callee) => Some(insn.id),
             _ => None,
         })
         .collect()
@@ -350,7 +350,7 @@ mod tests {
         tc.ctx.replace_instruction_mnemonic(
             call_id,
             Mnemonic::Call(Call {
-                target,
+                target: qcode::value::insn::Callee::Real(target),
                 args: args
                     .into_iter()
                     .map(|arg| arg.localize(call_id.func))

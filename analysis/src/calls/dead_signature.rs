@@ -101,8 +101,10 @@ pub fn dead_signature(ctx: &mut Context) -> bool {
 fn build_call_index(ctx: &Context) -> HashMap<FunctionId, Vec<InstructionId>> {
     let mut index: HashMap<FunctionId, Vec<InstructionId>> = HashMap::default();
     for insn in ctx.instructions() {
-        if let Mnemonic::Call(c) = insn.mnemonic() {
-            index.entry(c.target).or_default().push(insn.id);
+        if let Mnemonic::Call(c) = insn.mnemonic()
+            && let Some(target) = c.target.real()
+        {
+            index.entry(target).or_default().push(insn.id);
         }
     }
     index
@@ -363,7 +365,7 @@ mod tests {
         tc.ctx.replace_instruction_mnemonic(
             call_id,
             Mnemonic::Call(Call {
-                target,
+                target: qcode::value::insn::Callee::Real(target),
                 args: args
                     .into_iter()
                     .map(|arg| arg.localize(call_id.func))

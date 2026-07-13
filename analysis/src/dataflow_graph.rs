@@ -297,24 +297,27 @@ impl<'a, 'ctx> Builder<'a, 'ctx> {
     }
 
     fn add_call_flow(&mut self, call: &Call, caller: FunctionId, sink: usize) {
-        let callee = Function::from_id(self.ctx, call.target);
+        let Some(target) = call.target.real() else {
+            return;
+        };
+        let callee = Function::from_id(self.ctx, target);
         let callee_node = if callee.is_external() {
-            self.node(DfNode::ExternCall(call.target))
+            self.node(DfNode::ExternCall(target))
         } else {
-            self.node(DfNode::Function(call.target))
+            self.node(DfNode::Function(target))
         };
         self.edge(
             callee_node,
             sink,
-            ValueId::Function(call.target),
+            ValueId::Function(target),
             DfEdgeKind::Return,
         );
 
-        if callee.is_external() || self.opts.no_expand.contains(&call.target) {
+        if callee.is_external() || self.opts.no_expand.contains(&target) {
             return;
         }
 
-        let param_indices = self.slice_callee_params(call.target);
+        let param_indices = self.slice_callee_params(target);
         let indices: Vec<usize> = if param_indices.is_empty() {
             (0..call.args.len()).collect()
         } else {

@@ -21,13 +21,14 @@ use crate::{
     types::AggregateField,
     value::{
         BasicBlock, BlockParam, BlockParamId, Function, FunctionId, Instruction, InstructionId,
-        Renameable, Value, ValueId, ValueRef, Varnode, VarnodeId, block::BlockId,
-        insn::IntrinsicId,
+        Renameable, Value, ValueId, ValueRef, Varnode, VarnodeId,
+        block::BlockId,
+        insn::{Callee, IntrinsicId},
     },
 };
 use qcode_parser::ast::{
-    Atom, CastOp, ExprNode, ExtractField, FnDecl, FnKind, GepField, Label, Program, ProgramKind,
-    Statement, StructDecl, StructFieldType, TypedAtom,
+    Atom, Callee as ParsedCallee, CastOp, ExprNode, ExtractField, FnDecl, FnKind, GepField, Label,
+    Program, ProgramKind, Statement, StructDecl, StructFieldType, TypedAtom,
 };
 
 /// Names produced while lowering a program, so callers can recover the ids by the
@@ -550,21 +551,24 @@ impl Lowerer<'_, '_, '_> {
 
             Statement::Call {
                 target,
+                tail,
                 args,
                 targets,
                 ..
             } => {
-                let t = self
-                    .b
-                    .get_or_make_local_function(Cow::Owned(target.clone()));
+                let t = self.call_callee(target);
                 // Arg names are decorative (the callee's parameter names as
                 // printed); only the positional atoms are bound.
                 let argv = args
                     .iter()
                     .map(|(_, atom)| self.atom(atom, None))
                     .collect::<Result<Vec<_>, _>>()?;
-                self.b.push_call_with_args(t, argv);
-                self.add_edge_hints(targets)?;
+                if *tail {
+                    self.b.push_tail_call_with_args(t, argv);
+                } else {
+                    self.b.push_call_with_args(t, argv);
+                    self.add_edge_hints(targets)?;
+                }
             }
 
             Statement::CallInd {
@@ -717,13 +721,9 @@ impl Lowerer<'_, '_, '_> {
             }
 
             ExprNode::Apply { target, args } => {
-                let fid = *self
-                    .symbols
-                    .functions
-                    .get(target)
-                    .ok_or_else(|| format!("apply: unknown function `{target}`"))?;
+                let target = self.existing_callee(target, "apply")?;
                 let argv = self.atoms(args)?;
-                Ok(self.b.push_apply(fid, argv).id())
+                Ok(self.b.push_apply(target, argv).id())
             }
 
             ExprNode::Map {
@@ -731,14 +731,10 @@ impl Lowerer<'_, '_, '_> {
                 src,
                 captures,
             } => {
-                let fid = *self
-                    .symbols
-                    .functions
-                    .get(body)
-                    .ok_or_else(|| format!("map: unknown function `{body}`"))?;
+                let body = self.existing_callee(body, "map")?;
                 let s = self.atom(src, None)?;
                 let caps = self.atoms(captures)?;
-                Ok(self.b.push_map(fid, s, caps).id())
+                Ok(self.b.push_map(body, s, caps).id())
             }
 
             ExprNode::Scan {
@@ -747,15 +743,11 @@ impl Lowerer<'_, '_, '_> {
                 src,
                 captures,
             } => {
-                let fid = *self
-                    .symbols
-                    .functions
-                    .get(body)
-                    .ok_or_else(|| format!("scan: unknown function `{body}`"))?;
+                let body = self.existing_callee(body, "scan")?;
                 let i = self.atom(init, None)?;
                 let s = self.atom(src, None)?;
                 let caps = self.atoms(captures)?;
-                Ok(self.b.push_scan(fid, i, s, caps).id())
+                Ok(self.b.push_scan(body, i, s, caps).id())
             }
 
             ExprNode::Tuple { fields } => {
@@ -1022,6 +1014,28 @@ impl Lowerer<'_, '_, '_> {
         }
     }
 
+    fn call_callee(&mut self, callee: &ParsedCallee) -> Callee {
+        match callee {
+            ParsedCallee::Named(name) => {
+                Callee::Real(self.b.get_or_make_local_function(Cow::Owned(name.clone())))
+            }
+            ParsedCallee::Minted(slot) => Callee::Minted(*slot),
+        }
+    }
+
+    fn existing_callee(&self, callee: &ParsedCallee, operation: &str) -> Result<Callee, String> {
+        match callee {
+            ParsedCallee::Named(name) => self
+                .symbols
+                .functions
+                .get(name)
+                .copied()
+                .map(Callee::Real)
+                .ok_or_else(|| format!("{operation}: unknown function `{name}`")),
+            ParsedCallee::Minted(slot) => Ok(Callee::Minted(*slot)),
+        }
+    }
+
     /// The known byte width of an atom, used to size the other operand's literals.
     fn size_hint(&self, typed: &TypedAtom) -> Option<usize> {
         if let Some(explicit) = typed.size_bytes {
@@ -1040,6 +1054,83 @@ impl Lowerer<'_, '_, '_> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn minted_callees_render_parse_and_lower_in_all_direct_forms() {
+        use crate::value::insn::Mnemonic;
+
+        fn host_block(ctx: &mut Context<'_>, name: &str) -> BlockId {
+            let function = Function::make(ctx, Cow::Owned(name.to_owned())).unwrap().id;
+            let block = BasicBlock::make(ctx, function).id;
+            let mut function = Function::from_id_mut(ctx, function);
+            function.add_block(block);
+            function.set_root(block).unwrap();
+            block
+        }
+
+        let mut rendered_ctx = Context::new();
+        let block = host_block(&mut rendered_ctx, "rendered");
+        let arg = rendered_ctx.get_const(1, 8).id();
+        let rendered_ids = {
+            let mut builder =
+                Builder::from_block(BasicBlock::from_id_mut(&mut rendered_ctx, block));
+            let apply = builder.push_apply(Callee::Minted(1), vec![arg]).id();
+            let map = builder.push_map(Callee::Minted(2), arg, Vec::new()).id();
+            let scan = builder
+                .push_scan(Callee::Minted(3), arg, arg, Vec::new())
+                .id();
+            let call = builder
+                .push_call_with_args(Callee::Minted(4), vec![arg])
+                .id();
+            [apply, map, scan, call].map(|value| match value {
+                ValueId::Instruction(id) => id,
+                _ => unreachable!(),
+            })
+        };
+        let rendered = rendered_ids.map(|id| rendered_ctx.get_insn(id).as_statement().to_string());
+
+        let tail_block = host_block(&mut rendered_ctx, "rendered_tail");
+        let tail_id = {
+            let mut builder =
+                Builder::from_block(BasicBlock::from_id_mut(&mut rendered_ctx, tail_block));
+            let value = builder
+                .push_tail_call_with_args(Callee::Minted(5), vec![arg])
+                .id();
+            let ValueId::Instruction(id) = value else {
+                unreachable!()
+            };
+            id
+        };
+        let tail = rendered_ctx.get_insn(tail_id).as_statement().to_string();
+
+        let mut forms = rendered.into_iter().collect::<Vec<_>>();
+        forms.push(tail);
+        for (index, statement) in forms.iter().enumerate() {
+            let slot = index as u32 + 1;
+            assert!(
+                statement.contains(&format!("<minted:{slot}>")),
+                "renderer must emit the canonical placeholder: {statement}"
+            );
+            let mut lowered = Context::new();
+            let source = format!("fn host:\n<entry>\n{statement}");
+            let symbols = lower_str(&mut lowered, &source).expect("rendered form must lower");
+            let instruction = Function::from_id(&lowered, symbols.function("host"))
+                .root()
+                .unwrap()
+                .iter()
+                .next()
+                .unwrap();
+            let actual = match instruction.mnemonic() {
+                Mnemonic::Apply(value) => value.target,
+                Mnemonic::Map(value) => value.body,
+                Mnemonic::Scan(value) => value.body,
+                Mnemonic::Call(value) => value.target,
+                Mnemonic::TailCall(value) => value.target,
+                other => panic!("unexpected lowered mnemonic: {other:?}"),
+            };
+            assert_eq!(actual, Callee::Minted(slot));
+        }
+    }
 
     #[test]
     fn lowers_fib_lambda_roundtrips() {

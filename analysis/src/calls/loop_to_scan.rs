@@ -333,7 +333,7 @@ fn apply<'str>(
         let id = body.push_mnemonic_with_type(
             mv,
             Mnemonic::Scan(qcode::value::insn::Scan {
-                body: body_fn,
+                body: qcode::value::insn::Callee::Real(body_fn),
                 init: m.seed_val.localize(fid),
                 src: src.localize(fid),
                 captures: Vec::new(),

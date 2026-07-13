@@ -46,7 +46,7 @@ use crate::{
         block_param::BlockParamMutRef,
         function::FunctionId,
         insn::{
-            Apply, Assert, Binary, Binop, Branch, BranchInd, CBranch, Call, CallInd, Carry,
+            Apply, Assert, Binary, Binop, Branch, BranchInd, CBranch, Call, CallInd, Callee, Carry,
             Extract, FloatBinop, FloatToFloat, FloatToInt, Gep, InstructionId, InstructionRef,
             IntBinop, IntToFloat, IntrinsicApp, IntrinsicId, IsFloatNaN, Load, LzCount, Map,
             Mnemonic, PCodeOp, PCodeOpId, PopCount, Range, Return, ReturnValue, SBorrow, SCarry,
@@ -1269,15 +1269,16 @@ impl<'str, 'ctx, Ctx: BuilderBacking<'str>> Builder<'str, 'ctx, Ctx> {
     /// result falls back to `src`'s type.
     pub fn push_map(
         &mut self,
-        body: FunctionId,
+        body: impl Into<Callee>,
         src: ValueId,
         captures: Vec<ValueId>,
     ) -> InstructionRef<'str, '_> {
+        let body = body.into();
         let src_ty = self.type_of(src);
         // `map` preserves the source's sequence kind: an array maps to an array,
         // a list (e.g. `take_while`'s result) maps to a list of the same bound.
         let seq = self.shr().types.seq_of(src_ty);
-        let ret_ty = self.map_body_return_type(body);
+        let ret_ty = body.real().and_then(|body| self.map_body_return_type(body));
         let ty = match (seq, ret_ty) {
             (Some((_, len, is_list)), Some(rt)) => {
                 self.shr().types.get_or_make_seq(rt, len, is_list)
@@ -1307,16 +1308,17 @@ impl<'str, 'ctx, Ctx: BuilderBacking<'str>> Builder<'str, 'ctx, Ctx> {
     /// `src`'s type.
     pub fn push_scan(
         &mut self,
-        body: FunctionId,
+        body: impl Into<Callee>,
         init: ValueId,
         src: ValueId,
         captures: Vec<ValueId>,
     ) -> InstructionRef<'str, '_> {
+        let body = body.into();
         let src_ty = self.type_of(src);
         // Like `map`, a scan preserves the source's sequence kind and takes its
         // element type from the body's return type (the accumulator type).
         let seq = self.shr().types.seq_of(src_ty);
-        let ret_ty = self.map_body_return_type(body);
+        let ret_ty = body.real().and_then(|body| self.map_body_return_type(body));
         let ty = match (seq, ret_ty) {
             (Some((_, len, is_list)), Some(rt)) => {
                 self.shr().types.get_or_make_seq(rt, len, is_list)
@@ -1339,14 +1341,18 @@ impl<'str, 'ctx, Ctx: BuilderBacking<'str>> Builder<'str, 'ctx, Ctx> {
     /// does not terminate the current block.
     pub fn push_apply(
         &mut self,
-        target: FunctionId,
+        target: impl Into<Callee>,
         args: Vec<ValueId>,
     ) -> InstructionRef<'str, '_> {
-        let ty = self.lambda_return_type(target).unwrap_or_else(|| {
-            args.first()
-                .map(|&arg| self.type_of(arg))
-                .unwrap_or_else(|| self.shr().types.get_or_make_int(0))
-        });
+        let target = target.into();
+        let ty = target
+            .real()
+            .and_then(|target| self.lambda_return_type(target))
+            .unwrap_or_else(|| {
+                args.first()
+                    .map(|&arg| self.type_of(arg))
+                    .unwrap_or_else(|| self.shr().types.get_or_make_int(0))
+            });
         self.push_instruction_with_type(
             Mnemonic::Apply(Apply {
                 target,
@@ -1773,15 +1779,16 @@ impl<'str, 'ctx, Ctx: BuilderBacking<'str>> Builder<'str, 'ctx, Ctx> {
         InstructionRef::new(self.read_host(), id)
     }
 
-    pub fn push_call(&mut self, target: FunctionId) -> InstructionRef<'str, '_> {
+    pub fn push_call(&mut self, target: impl Into<Callee>) -> InstructionRef<'str, '_> {
         self.push_call_with_args(target, vec![])
     }
 
     pub fn push_call_with_args(
         &mut self,
-        target: FunctionId,
+        target: impl Into<Callee>,
         args: Vec<ValueId>,
     ) -> InstructionRef<'str, '_> {
+        let target = target.into();
         let id = self
             .push_instruction(
                 Mnemonic::Call(Call {
@@ -1800,15 +1807,16 @@ impl<'str, 'ctx, Ctx: BuilderBacking<'str>> Builder<'str, 'ctx, Ctx> {
     /// no intra-function CFG successor (see [`TailCall`](crate::value::insn::TailCall)).
     /// Unlike [`push_branch`](Self::push_branch), this wires no CFG edge: control
     /// leaves the function.
-    pub fn push_tail_call(&mut self, target: FunctionId) -> InstructionRef<'str, '_> {
+    pub fn push_tail_call(&mut self, target: impl Into<Callee>) -> InstructionRef<'str, '_> {
         self.push_tail_call_with_args(target, vec![])
     }
 
     pub fn push_tail_call_with_args(
         &mut self,
-        target: FunctionId,
+        target: impl Into<Callee>,
         args: Vec<ValueId>,
     ) -> InstructionRef<'str, '_> {
+        let target = target.into();
         let id = self
             .push_instruction(
                 Mnemonic::TailCall(TailCall {

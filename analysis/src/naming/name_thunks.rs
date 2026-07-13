@@ -84,7 +84,7 @@ fn thunk_target(host: HostRef, fun_id: FunctionId) -> Option<FunctionId> {
     let Mnemonic::TailCall(tc) = block.instructions().last()?.mnemonic() else {
         return None;
     };
-    (tc.target != fun_id).then_some(tc.target)
+    tc.target.real().filter(|&target| target != fun_id)
 }
 
 crate::register_function_pass!(NameThunks);

@@ -322,11 +322,11 @@ fn frame_is_captured(host: HostRef, fid: FunctionId, numbering: &Numbering, sp: 
                     return true;
                 }
                 Mnemonic::Call(c) => {
+                    let target = c.target.real();
                     for (j, &arg) in c.args.iter().enumerate() {
                         if is_own_frame(arg.qualify(func))
-                            && !host
-                                .function_ref(c.target)
-                                .param_attr(j)
+                            && !target
+                                .and_then(|target| host.function_ref(target).param_attr(j))
                                 .is_some_and(|a| a.nocapture)
                         {
                             return true;
@@ -450,7 +450,10 @@ impl FrameInfo {
         c: &qcode::value::insn::Call,
     ) -> Provenance {
         use Provenance as P;
-        let callee = host.function_ref(c.target);
+        let Some(target) = c.target.real() else {
+            return P::OPAQUE;
+        };
+        let callee = host.function_ref(target);
         let all_nocapture = c.clobbers.is_empty()
             && (0..c.args.len()).all(|j| callee.param_attr(j).is_some_and(|a| a.nocapture));
         if !all_nocapture {
@@ -1377,7 +1380,7 @@ mod tests {
                 })
             } else {
                 Mnemonic::Call(Call {
-                    target: callee,
+                    target: qcode::value::insn::Callee::Real(callee),
                     args: vec![local.localize(cid.func)],
                     clobbers: vec![],
                 })
@@ -1441,7 +1444,7 @@ mod tests {
             tc.ctx.replace_instruction_mnemonic(
                 call_result,
                 Mnemonic::Call(Call {
-                    target: callee,
+                    target: qcode::value::insn::Callee::Real(callee),
                     args: vec![input.localize(call_result.func)], // g(input): INPUT arg, does not capture the frame
                     clobbers: vec![],
                 }),

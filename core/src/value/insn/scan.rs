@@ -24,9 +24,12 @@
 //! parameter is the carried accumulator (typed as the result element), its second
 //! is the lane element of `src`.
 
-use crate::value::{LocalValueId, function::FunctionId};
+use crate::value::LocalValueId;
 
-use super::mnemonic::{Args, MnemonicKind};
+use super::{
+    Callee,
+    mnemonic::{Args, MnemonicKind},
+};
 use smallvec::SmallVec;
 
 /// A total left-scan `out[i] = acc_i+1` where `acc_i+1 = body(acc_i, src[i],
@@ -37,7 +40,7 @@ pub struct Scan {
     /// The pure per-element fold function, applied at each lane. A symbol, not an
     /// operand — exactly like a direct call's target. Binary in `(accumulator,
     /// element)`.
-    pub body: FunctionId,
+    pub body: Callee,
     /// The initial accumulator value (`acc_0`).
     pub init: LocalValueId,
     /// The array value scanned over.
@@ -68,7 +71,7 @@ mod tests {
         testing::TestContext,
         value::{
             BasicBlock, Function, ValueId,
-            insn::{Mnemonic, mnemonic::MnemonicKind},
+            insn::{Callee, Mnemonic, mnemonic::MnemonicKind},
         },
     };
 
@@ -164,7 +167,7 @@ mod tests {
             Mnemonic::Scan(m) => m,
             other => panic!("expected Scan, got {other:?}"),
         };
-        assert_eq!(m.body, body);
+        assert_eq!(m.body, Callee::Real(body));
         assert_eq!(
             m.args().to_vec(),
             vec![init.strip_func(), src.strip_func(), cap.strip_func()],
@@ -187,7 +190,11 @@ mod tests {
             unreachable!()
         };
         assert_eq!(r.src, new_src.strip_func());
-        assert_eq!(r.body, body, "body symbol is untouched by replace_value");
+        assert_eq!(
+            r.body,
+            Callee::Real(body),
+            "body symbol is untouched by replace_value"
+        );
         assert_eq!(r.init, init.strip_func());
         assert_eq!(r.captures, vec![cap.strip_func()]);
     }

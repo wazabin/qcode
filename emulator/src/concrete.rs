@@ -9,7 +9,7 @@ use qcode::{
         BasicBlock, BlockId, BlockParamId, BlockRef, Function, FunctionId, Instruction,
         LocalValueId, Value, ValueId, ValueRef, Varnode,
         insn::{
-            Branch, BranchInd, CBranch, Call, CallInd, Carry, Extract, InstructionId,
+            Branch, BranchInd, CBranch, Call, CallInd, Callee, Carry, Extract, InstructionId,
             InstructionRef, IntBinop, LzCount, Mnemonic, PopCount, Range, Return, SBorrow, SCarry,
             Scan, Sext, Tuple, Unop, Zext,
         },
@@ -21,6 +21,13 @@ use std::cmp;
 use rustc_hash::{FxHashMap, FxHashSet};
 
 use super::DomainValue;
+
+fn require_real_callee(callee: Callee) -> Result<FunctionId, EmulatorErrorKind> {
+    match callee {
+        Callee::Real(target) => Ok(target),
+        Callee::Minted(slot) => Err(EmulatorErrorKind::UnresolvedMintedCallee(slot)),
+    }
+}
 
 #[derive(Debug, Default, Clone)]
 pub struct EmulatedSpace(FxHashMap<u64, u8>);
@@ -1081,11 +1088,13 @@ impl StandaloneEmulator {
         let Some(mut interceptor) = self.call_interceptor.take() else {
             return Ok(None);
         };
+        let target = require_real_callee(call.target)
+            .map_err(|kind| self.make_error_at(ctx, instruction, kind))?;
 
         let site = CallSite {
             instruction,
             block,
-            target: call.target,
+            target,
             // Operands are stored bare-local; the CallSite is a boundary object,
             // so qualify with the call instruction's own function.
             args: call
@@ -1141,7 +1150,8 @@ impl StandaloneEmulator {
                 if let Some(event) = self.intercept_call(ctx, block_id, insn_id, call)? {
                     return Ok(event);
                 }
-                let target = call.target;
+                let target =
+                    require_real_callee(call.target).map_err(|kind| self.make_error(ctx, kind))?;
                 self.block = Function::from_id(ctx, target)
                     .root()
                     .ok_or_else(|| {
@@ -1160,7 +1170,8 @@ impl StandaloneEmulator {
                 // the callee's `Return` returns directly to *our* caller. Mirror the
                 // old tail-`Branch`-into-entry behavior: jump to the callee root
                 // without pushing a call frame.
-                let target = tc.target;
+                let target =
+                    require_real_callee(tc.target).map_err(|kind| self.make_error(ctx, kind))?;
                 self.block = Function::from_id(ctx, target)
                     .root()
                     .ok_or_else(|| {
@@ -1172,18 +1183,20 @@ impl StandaloneEmulator {
 
             Mnemonic::Apply(apply) => {
                 const APPLY_STEP_BUDGET: usize = 100_000;
+                let target =
+                    require_real_callee(apply.target).map_err(|kind| self.make_error(ctx, kind))?;
                 let args = self
                     .collect_block_args(ctx, id.func, &apply.args)
                     .map_err(|kind| self.make_error(ctx, kind))?;
-                let root = Function::from_id(ctx, apply.target)
+                let root = Function::from_id(ctx, target)
                     .root()
                     .ok_or_else(|| {
-                        self.make_error(ctx, EmulatorErrorKind::EmptyFunctionRoot(apply.target))
+                        self.make_error(ctx, EmulatorErrorKind::EmptyFunctionRoot(target))
                     })?
                     .id;
                 let mut nested = StandaloneEmulator::new(root);
                 nested
-                    .run_pure(ctx, apply.target, &args, APPLY_STEP_BUDGET)
+                    .run_pure(ctx, target, &args, APPLY_STEP_BUDGET)
                     .map_err(|e| self.make_error(ctx, e.kind))?;
                 let ret_value = lambda_return_value(ctx, nested.current_block())
                     .ok_or_else(|| self.make_error(ctx, EmulatorErrorKind::ValueError(0)))?;
@@ -1839,6 +1852,7 @@ impl StandaloneEmulator {
             .ok_or(EmulatorErrorKind::ValueError(0))?;
         let osz = ctx.shared.types.size_of(out_elem);
         let count = src.len() / isz;
+        let body = require_real_callee(scan.body)?;
         if count == 0 {
             self.array_values.insert(insn_id, Vec::new());
             return Ok(());
@@ -1865,9 +1879,9 @@ impl StandaloneEmulator {
             .ok_or(EmulatorErrorKind::ValueError(0))?;
         let mut acc = SizedValue::new(init, osz);
 
-        let root = Function::from_id(ctx, scan.body)
+        let root = Function::from_id(ctx, body)
             .root()
-            .ok_or(EmulatorErrorKind::EmptyFunctionRoot(scan.body))?
+            .ok_or(EmulatorErrorKind::EmptyFunctionRoot(body))?
             .id;
 
         // When the source element is a tuple (the `enumerate` `(index, elem)`
@@ -1906,7 +1920,7 @@ impl StandaloneEmulator {
             body_args.extend(capture_args.iter().cloned());
 
             let mut emu = StandaloneEmulator::new(root);
-            emu.run_map_body(ctx, scan.body, &body_args, SCAN_STEP_BUDGET)
+            emu.run_map_body(ctx, body, &body_args, SCAN_STEP_BUDGET)
                 .map_err(|e| e.kind)?;
             let ret = body_return_value(ctx, emu.current_block())
                 .ok_or(EmulatorErrorKind::ValueError(0))?;
@@ -1946,6 +1960,7 @@ impl StandaloneEmulator {
             .ok_or(EmulatorErrorKind::ValueError(0))?;
         let osz = ctx.shared.types.size_of(out_elem);
         let count = src.len() / isz;
+        let body = require_real_callee(map.body)?;
 
         let capture_args: Vec<BodyArg> = map
             .captures
@@ -1994,12 +2009,12 @@ impl StandaloneEmulator {
             body_args.extend(capture_args.iter().cloned());
 
             let mut emu = StandaloneEmulator::new(
-                Function::from_id(ctx, map.body)
+                Function::from_id(ctx, body)
                     .root()
-                    .ok_or(EmulatorErrorKind::EmptyFunctionRoot(map.body))?
+                    .ok_or(EmulatorErrorKind::EmptyFunctionRoot(body))?
                     .id,
             );
-            emu.run_map_body(ctx, map.body, &body_args, MAP_STEP_BUDGET)
+            emu.run_map_body(ctx, body, &body_args, MAP_STEP_BUDGET)
                 .map_err(|e| e.kind)?;
             let ret = body_return_value(ctx, emu.current_block())
                 .ok_or(EmulatorErrorKind::ValueError(0))?;
@@ -2432,6 +2447,14 @@ mod tests {
     use qcode::space::{Space, SpaceType};
     use qcode_macro::qcode;
     use std::sync::{Arc, Mutex};
+
+    #[test]
+    fn minted_callee_is_not_executable() {
+        assert!(matches!(
+            require_real_callee(Callee::Minted(7)),
+            Err(EmulatorErrorKind::UnresolvedMintedCallee(7))
+        ));
+    }
 
     #[test]
     fn sized_value_masks_to_declared_width() {

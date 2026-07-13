@@ -459,10 +459,11 @@ impl MemForward {
         // This is what lets a functionalized callee that writes only its own
         // private scratch space leave the caller's spilled-pointer cell intact.
         let callee_written_spaces: Option<Vec<SpaceId>> = match &term {
-            Some(Mnemonic::Call(call)) => host
-                .function_ref(call.target)
-                .written_spaces()
-                .map(<[_]>::to_vec),
+            Some(Mnemonic::Call(call)) => call.target.real().and_then(|target| {
+                host.function_ref(target)
+                    .written_spaces()
+                    .map(<[_]>::to_vec)
+            }),
             _ => None,
         };
 
@@ -473,28 +474,39 @@ impl MemForward {
                 call.args.iter().map(|&a| qual(a)).collect(),
                 true,
             ),
-            Some(Mnemonic::Call(call)) => {
-                let callee = host.function_ref(call.target);
-                let regs = match callee.clobbered_regs() {
-                    Some(regs) => CallClobbers::Regs(regs.to_vec()),
-                    None => CallClobbers::AllRegisters,
-                };
-                // An argument flowing into a `readonly` callee param is never
-                // written through, so it does not clobber the RAM cells it may
-                // reach — exclude it from the escaping set. (Only `readonly` is
-                // consulted here; a `readonly` pointer the callee merely reads
-                // cannot invalidate a pinned cell even if it is captured.) The
-                // recorded `clobbers` are writes by definition and always escape.
-                let escaping = call
-                    .args
-                    .iter()
-                    .enumerate()
-                    .filter(|&(j, _)| !callee.param_attr(j).is_some_and(|a| a.readonly))
-                    .map(|(_, &v)| qual(v))
-                    .chain(call.clobbers.iter().map(|&c| qual(c)))
-                    .collect();
-                (regs, escaping, false)
-            }
+            Some(Mnemonic::Call(call)) => match call.target.real() {
+                None => (
+                    CallClobbers::AllRegisters,
+                    call.args
+                        .iter()
+                        .chain(&call.clobbers)
+                        .map(|&v| qual(v))
+                        .collect(),
+                    true,
+                ),
+                Some(target) => {
+                    let callee = host.function_ref(target);
+                    let regs = match callee.clobbered_regs() {
+                        Some(regs) => CallClobbers::Regs(regs.to_vec()),
+                        None => CallClobbers::AllRegisters,
+                    };
+                    // An argument flowing into a `readonly` callee param is never
+                    // written through, so it does not clobber the RAM cells it may
+                    // reach — exclude it from the escaping set. (Only `readonly` is
+                    // consulted here; a `readonly` pointer the callee merely reads
+                    // cannot invalidate a pinned cell even if it is captured.) The
+                    // recorded `clobbers` are writes by definition and always escape.
+                    let escaping = call
+                        .args
+                        .iter()
+                        .enumerate()
+                        .filter(|&(j, _)| !callee.param_attr(j).is_some_and(|a| a.readonly))
+                        .map(|(_, &v)| qual(v))
+                        .chain(call.clobbers.iter().map(|&c| qual(c)))
+                        .collect();
+                    (regs, escaping, false)
+                }
+            },
             _ => return,
         };
 
@@ -1183,7 +1195,7 @@ mod tests {
         tc.ctx.replace_instruction_mnemonic(
             cid,
             Mnemonic::Call(Call {
-                target: callee,
+                target: qcode::value::insn::Callee::Real(callee),
                 args: vec![arg.localize(cid.func)],
                 clobbers: vec![],
             }),

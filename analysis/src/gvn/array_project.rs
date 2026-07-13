@@ -167,7 +167,10 @@ impl ArrayProject {
         // that element and unpack it internally.
         let mut args = vec![element];
         args.extend(map.captures.iter().map(|c| c.qualify(map_id.func)));
-        let Some(result) = inline_pure_body(ctx, map.body, &args, ic.block_id, ic.insn_id) else {
+        let Some(body) = map.body.real() else {
+            return Claim::Pass;
+        };
+        let Some(result) = inline_pure_body(ctx, body, &args, ic.block_id, ic.insn_id) else {
             return Claim::Pass;
         };
 

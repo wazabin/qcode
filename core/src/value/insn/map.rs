@@ -15,9 +15,12 @@
 //! `Range(Map(body, src), k·osz, osz) → body(Range(src, k·isz, isz), captures…)`
 //! recovers one element as an expression without materializing the whole array.
 
-use crate::value::{LocalValueId, function::FunctionId};
+use crate::value::LocalValueId;
 
-use super::mnemonic::{Args, MnemonicKind};
+use super::{
+    Callee,
+    mnemonic::{Args, MnemonicKind},
+};
 use smallvec::SmallVec;
 
 /// A total element-wise map `out[i] = body(src[i], captures…)`. The result is
@@ -26,7 +29,7 @@ use smallvec::SmallVec;
 pub struct Map {
     /// The pure per-element function, applied at each lane. A symbol, not an
     /// operand — exactly like a direct call's target. Unary in the element.
-    pub body: FunctionId,
+    pub body: Callee,
     /// The array value mapped over.
     pub src: LocalValueId,
     /// Loop-invariant values the body closes over (the element is supplied
@@ -54,7 +57,7 @@ mod tests {
         testing::TestContext,
         value::{
             BasicBlock, Function, ValueId,
-            insn::{Mnemonic, mnemonic::MnemonicKind},
+            insn::{Callee, Mnemonic, mnemonic::MnemonicKind},
         },
     };
 
@@ -149,7 +152,7 @@ mod tests {
         };
 
         // `body` is a symbol; `src` + captures are the value operands.
-        assert_eq!(m.body, body);
+        assert_eq!(m.body, Callee::Real(body));
         assert_eq!(
             m.args().to_vec(),
             vec![src.strip_func(), cap.strip_func()],
@@ -174,7 +177,11 @@ mod tests {
             unreachable!()
         };
         assert_eq!(r.src, new_src.strip_func());
-        assert_eq!(r.body, body, "body symbol is untouched by replace_value");
+        assert_eq!(
+            r.body,
+            Callee::Real(body),
+            "body symbol is untouched by replace_value"
+        );
         assert_eq!(r.captures, vec![cap.strip_func()]);
     }
 }

@@ -3,6 +3,46 @@ use crate::value::{LocalBlockId, LocalValueId, function::FunctionId};
 use super::mnemonic::{Args, MnemonicKind};
 use smallvec::{SmallVec, smallvec};
 
+/// A statically named callee. `Real` refers to an installed function; `Minted`
+/// is a pass-local placeholder that must be resolved before execution.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+pub enum Callee {
+    Real(FunctionId),
+    Minted(u32),
+}
+
+impl Callee {
+    pub const fn real(self) -> Option<FunctionId> {
+        match self {
+            Self::Real(id) => Some(id),
+            Self::Minted(_) => None,
+        }
+    }
+
+    pub const fn minted(self) -> Option<u32> {
+        match self {
+            Self::Real(_) => None,
+            Self::Minted(slot) => Some(slot),
+        }
+    }
+
+    /// Require an installed function at an execution-facing boundary.
+    pub fn expect_real(self, operation: &str) -> FunctionId {
+        match self {
+            Self::Real(id) => id,
+            Self::Minted(slot) => {
+                panic!("{operation} requires a real callee; minted placeholder #{slot} escaped")
+            }
+        }
+    }
+}
+
+impl From<FunctionId> for Callee {
+    fn from(id: FunctionId) -> Self {
+        Self::Real(id)
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub struct Branch {
     /// The CFG successor, stored as a bare body-local block index. Strict IR
@@ -50,14 +90,15 @@ impl MnemonicKind for BranchInd {
 /// A tail call: an unconditional transfer of control to another *function's*
 /// entry (a thunk `jmp realfunc`, or a tail `jmp`/`jcc` that the disassembler
 /// resolved to a sibling function). Unlike [`Branch`], whose target is a
-/// [`BlockId`] *within the same function*, a `TailCall` carries a
-/// [`FunctionId`]: it is a function-level terminator with no intra-function CFG
+/// [`BlockId`] *within the same function*, a `TailCall` carries a [`Callee`]:
+/// normally a real [`FunctionId`], or temporarily a pass-local minted
+/// placeholder. It is a function-level terminator with no intra-function CFG
 /// successor. This is the honest encoding of cross-function control flow — the
 /// IR never stores a foreign [`BlockId`]. See the context-split design, ruling
 /// 2 ("strict IR locality").
 #[derive(Debug, Clone, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub struct TailCall {
-    pub target: FunctionId,
+    pub target: Callee,
     /// Values passed to the callee, one per inferred callee input, in order.
     /// Empty on the freshly-lifted IR; populated once the call interface is known.
     pub args: Vec<LocalValueId>,
@@ -79,7 +120,7 @@ impl MnemonicKind for TailCall {
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub struct Apply {
-    pub target: FunctionId,
+    pub target: Callee,
     /// Values passed to the lambda, one per root block param, in order.
     pub args: Vec<LocalValueId>,
 }
@@ -96,7 +137,7 @@ impl MnemonicKind for Apply {
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub struct Call {
-    pub target: FunctionId,
+    pub target: Callee,
     /// Values passed to the callee, one per inferred callee input, in order.
     pub args: Vec<LocalValueId>,
     /// Register / memory locations the call may write or alias (the callee's
@@ -225,8 +266,41 @@ mod tests {
         builder::Builder,
         context::Context,
         testing::TestContext,
-        value::{BasicBlock, Function, Instruction, insn::Mnemonic},
+        value::{
+            BasicBlock, Function, Instruction,
+            insn::{Callee, Mnemonic},
+        },
     };
+
+    #[test]
+    fn minted_callee_is_not_a_call_graph_target_and_renders_explicitly() {
+        let mut ctx = Context::new();
+        let func = Function::make(&mut ctx, "caller".into()).unwrap().id;
+        let id = crate::value::InstructionRef::from_mnemonic(
+            &mut ctx,
+            func,
+            Mnemonic::Call(super::Call {
+                target: Callee::Minted(7),
+                args: vec![],
+                clobbers: vec![],
+            }),
+            0,
+        )
+        .id;
+
+        let insn = Instruction::from_id(&ctx, id);
+        assert_eq!(insn.mnemonic().call_target(), None);
+        assert_eq!(insn.as_statement().to_string(), "call fn <minted:7>();");
+        assert_eq!(Callee::Minted(7).real(), None);
+        assert_eq!(Callee::Minted(7).minted(), Some(7));
+        assert_eq!(Callee::from(func).real(), Some(func));
+    }
+
+    #[test]
+    #[should_panic(expected = "execution requires a real callee; minted placeholder #3 escaped")]
+    fn execution_boundary_rejects_minted_callee() {
+        Callee::Minted(3).expect_real("execution");
+    }
 
     #[test]
     fn tail_call_is_a_function_level_terminator() {
@@ -349,7 +423,7 @@ mod tests {
         tc.ctx.replace_instruction_mnemonic(
             call_id,
             Mnemonic::Call(super::Call {
-                target: callee,
+                target: Callee::Real(callee),
                 args: vec![first.strip_func(), second.strip_func()],
                 clobbers: vec![],
             }),
@@ -389,7 +463,7 @@ mod tests {
         tc.ctx.replace_instruction_mnemonic(
             call_id,
             Mnemonic::Call(super::Call {
-                target: callee,
+                target: Callee::Real(callee),
                 args: vec![arg.strip_func()],
                 clobbers: vec![],
             }),

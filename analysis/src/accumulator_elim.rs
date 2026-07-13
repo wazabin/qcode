@@ -382,7 +382,7 @@ fn transform<'str>(
                 &mut minted,
                 rec,
                 Mnemonic::Apply(Apply {
-                    target: g,
+                    target: qcode::value::insn::Callee::Real(g),
                     args: driver_next.into_iter().map(|a| a.localize(g)).collect(),
                 }),
                 tuple_ty,
@@ -437,7 +437,7 @@ fn transform<'str>(
         &mut host,
         root,
         Mnemonic::Apply(Apply {
-            target: g,
+            target: qcode::value::insn::Callee::Real(g),
             args: driver_init
                 .into_iter()
                 .map(|a| a.localize(root.func))

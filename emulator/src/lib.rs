@@ -69,6 +69,8 @@ pub enum EmulatorErrorKind {
     InvalidBlockAddress(u64),
     /// Called a function that has no root block
     EmptyFunctionRoot(FunctionId),
+    /// A pass-local minted callee escaped its installation barrier.
+    UnresolvedMintedCallee(u32),
     /// `run_until` was given an address with no corresponding block
     UnknownAddress(u64),
     /// Attempted to construct a memory region that would overflow the address space
@@ -107,6 +109,9 @@ impl std::fmt::Display for EmulatorErrorKind {
         match self {
             Self::InvalidBlockAddress(addr) => write!(f, "invalid block address {addr:#x}"),
             Self::EmptyFunctionRoot(func) => write!(f, "function {func:?} has no root block"),
+            Self::UnresolvedMintedCallee(slot) => {
+                write!(f, "minted callee placeholder #{slot} is not executable")
+            }
             Self::UnknownAddress(addr) => write!(f, "unknown address {addr:#x}"),
             Self::AddressOverflow(addr, size) => {
                 write!(f, "address overflow at {addr:#x} with size {size}")

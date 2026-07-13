@@ -87,7 +87,7 @@ pub fn append_caller_arg(
     let call_sites: Vec<InstructionId> = ctx
         .instructions()
         .filter_map(|insn| match insn.mnemonic() {
-            Mnemonic::Call(c) if c.target == fid => Some(insn.id),
+            Mnemonic::Call(c) if c.target.real() == Some(fid) => Some(insn.id),
             _ => None,
         })
         .collect();
@@ -163,7 +163,7 @@ pub fn remove_entry_param(ctx: &mut Context, fid: FunctionId, index: usize) {
     let call_sites: Vec<InstructionId> = ctx
         .instructions()
         .filter_map(|insn| match insn.mnemonic() {
-            Mnemonic::Call(c) if c.target == fid => Some(insn.id),
+            Mnemonic::Call(c) if c.target.real() == Some(fid) => Some(insn.id),
             _ => None,
         })
         .collect();

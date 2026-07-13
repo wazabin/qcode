@@ -57,10 +57,14 @@ fn local_effect(
                     spaces.insert(s.space);
                 }
                 Mnemonic::Call(call) => {
-                    if Function::from_id(ctx, call.target).is_external() {
+                    let Some(target) = call.target.real() else {
+                        unbounded = true;
+                        continue;
+                    };
+                    if Function::from_id(ctx, target).is_external() {
                         unbounded = true;
                     } else {
-                        callees.push(call.target);
+                        callees.push(target);
                     }
                 }
                 // An unresolved indirect transfer leaves to unknown code — an

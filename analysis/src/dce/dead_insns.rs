@@ -117,6 +117,9 @@ fn remove_dead_pure_call_module<'str>(host: &mut Context<'str>, block_id: BlockI
     if !clobbers_empty {
         return false;
     }
+    let Some(target) = target.real() else {
+        return false;
+    };
     if !host.function_ref(target).is_pure() {
         return false;
     }
@@ -165,6 +168,9 @@ fn remove_dead_pure_call_host<'a, 'str>(
     if !clobbers_empty {
         return false;
     }
+    let Some(target) = target.real() else {
+        return false;
+    };
     if !body.function_ref(cx, target).is_pure() {
         return false;
     }

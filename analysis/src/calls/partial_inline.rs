@@ -131,7 +131,7 @@ fn returns_of(ctx: &Context, fid: FunctionId) -> Vec<InstructionId> {
 fn direct_call_sites(ctx: &Context, fid: FunctionId) -> Vec<InstructionId> {
     ctx.instructions()
         .filter_map(|insn| match insn.mnemonic() {
-            Mnemonic::Call(c) if c.target == fid => Some(insn.id),
+            Mnemonic::Call(c) if c.target.real() == Some(fid) => Some(insn.id),
             _ => None,
         })
         .collect()
@@ -402,7 +402,7 @@ mod tests {
         tc.ctx.replace_instruction_mnemonic(
             call_id,
             Mnemonic::Call(Call {
-                target,
+                target: qcode::value::insn::Callee::Real(target),
                 args: args
                     .into_iter()
                     .map(|arg| arg.localize(call_id.func))
@@ -617,7 +617,11 @@ mod tests {
                 _ => None,
             })
             .expect("the caller holds the projected map");
-        assert_eq!(projected.body, body, "same outlined body symbol");
+        assert_eq!(
+            projected.body,
+            qcode::value::insn::Callee::Real(body),
+            "same outlined body symbol"
+        );
         assert_eq!(
             projected.src.qualify(g_cont.func),
             arg,

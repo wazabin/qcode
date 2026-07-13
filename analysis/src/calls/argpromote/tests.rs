@@ -38,7 +38,7 @@ mod tests {
         tc.ctx.replace_instruction_mnemonic(
             call_id,
             Mnemonic::Call(Call {
-                target,
+                target: qcode::value::insn::Callee::Real(target),
                 args: args
                     .into_iter()
                     .map(|arg| arg.localize(call_id.func))

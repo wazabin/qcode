@@ -393,7 +393,11 @@ impl LiveInBlocks {
             match block.iter().last().map(|i| i.mnemonic().clone()) {
                 Some(Mnemonic::CallInd(_)) => call_blocks.push((block_id, CallClobber::All)),
                 Some(Mnemonic::Call(call)) => {
-                    let callee = host.function_ref(call.target);
+                    let Some(target) = call.target.real() else {
+                        call_blocks.push((block_id, CallClobber::All));
+                        continue;
+                    };
+                    let callee = host.function_ref(target);
                     let clobber = match callee.clobbered_regs() {
                         Some(regs) => CallClobber::Regs(regs.to_vec()),
                         // A resolved callee with no recorded set clobbers nothing
@@ -1891,7 +1895,10 @@ impl<'str> Mem2Reg<'_, '_, 'str> {
         match call {
             Mnemonic::CallInd(_) => register_vars().collect(),
             Mnemonic::Call(call) => {
-                let callee = self.read().function_ref(call.target);
+                let Some(target) = call.target.real() else {
+                    return register_vars().collect();
+                };
+                let callee = self.read().function_ref(target);
                 let resolved = callee.is_externally_resolved();
                 let clobbered = callee.clobbered_regs().map(<[VarnodeId]>::to_vec);
                 match clobbered {

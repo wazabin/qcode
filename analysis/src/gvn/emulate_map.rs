@@ -104,7 +104,8 @@ impl EmulateMap {
         }
 
         // Body param sizes: param 0 is the element, the rest are the captures.
-        let root = qcode::value::Function::from_id(ctx, map.body).root()?.id;
+        let body = map.body.real()?;
+        let root = qcode::value::Function::from_id(ctx, body).root()?.id;
         let param_sizes: Vec<usize> = qcode::value::BasicBlock::from_id(ctx, root)
             .params()
             .map(|p| p.size())
@@ -136,7 +137,7 @@ impl EmulateMap {
             args.extend(capture_args.iter().cloned());
 
             let mut emu = StandaloneEmulator::new(root);
-            emu.run_map_body(ctx, map.body, &args, STEP_BUDGET).ok()?;
+            emu.run_map_body(ctx, body, &args, STEP_BUDGET).ok()?;
             let ret = return_field(ctx, emu.current_block(), 0)?;
             let mut lane_bytes = emu.get_value_bytes(ctx, ret)?;
             lane_bytes.resize(osz, 0);
@@ -186,7 +187,8 @@ impl EmulateMap {
 
         // Body param sizes: param 0 is the accumulator, param 1 the element, the
         // rest the captures.
-        let root = qcode::value::Function::from_id(ctx, scan.body).root()?.id;
+        let body = scan.body.real()?;
+        let root = qcode::value::Function::from_id(ctx, body).root()?.id;
         let param_sizes: Vec<usize> = qcode::value::BasicBlock::from_id(ctx, root)
             .params()
             .map(|p| p.size())
@@ -228,7 +230,7 @@ impl EmulateMap {
             args.extend(capture_args.iter().cloned());
 
             let mut emu = StandaloneEmulator::new(root);
-            emu.run_map_body(ctx, scan.body, &args, STEP_BUDGET).ok()?;
+            emu.run_map_body(ctx, body, &args, STEP_BUDGET).ok()?;
             let ret = return_field(ctx, emu.current_block(), 0)?;
             let mut lane_bytes = emu.get_value_bytes(ctx, ret)?;
             lane_bytes.resize(osz, 0);

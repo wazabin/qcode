@@ -1,6 +1,6 @@
 use crate::ast::{
-    Atom, BlockParamDecl, CastOp, ExprNode, ExtractField, FnDecl, FnKind, GepField, Label, Program,
-    ProgramKind, SourcePosition, SourceSpan, Statement, StructDecl, StructFieldDecl,
+    Atom, BlockParamDecl, Callee, CastOp, ExprNode, ExtractField, FnDecl, FnKind, GepField, Label,
+    Program, ProgramKind, SourcePosition, SourceSpan, Statement, StructDecl, StructFieldDecl,
     StructFieldType, TupleField, TypedAtom,
 };
 use pest::Parser;
@@ -449,7 +449,7 @@ fn parse_terminator(pair: Pair<'_, Rule>) -> Result<Statement, ParseError> {
                 Rule::call_direct => {
                     for part in form.into_inner() {
                         match part.as_rule() {
-                            Rule::ident => target = Some(part.as_str().to_owned()),
+                            Rule::ident | Rule::minted_callee => target = Some(parse_callee(part)?),
                             Rule::call_arg => {
                                 let mut inner = part.into_inner();
                                 let name = inner
@@ -477,7 +477,7 @@ fn parse_terminator(pair: Pair<'_, Rule>) -> Result<Statement, ParseError> {
                             .ok_or_else(|| ParseError::new("missing call target content"))?,
                     )?;
                     match label {
-                        Label::Named { name, .. } => target = Some(name),
+                        Label::Named { name, .. } => target = Some(Callee::Named(name)),
                         Label::Address { .. } => {
                             return Err(ParseError::new(
                                 "call with address target is not supported",
@@ -493,8 +493,33 @@ fn parse_terminator(pair: Pair<'_, Rule>) -> Result<Statement, ParseError> {
             };
             Ok(Statement::Call {
                 target: target.ok_or_else(|| ParseError::new("missing call target"))?,
+                tail: false,
                 args,
                 targets,
+                span,
+            })
+        }
+
+        Rule::tailcall_stmt => {
+            let mut inner = specific.into_inner();
+            let target = parse_callee(
+                inner
+                    .next()
+                    .ok_or_else(|| ParseError::new("missing tailcall target"))?,
+            )?;
+            let args = inner
+                .filter(|part| part.as_rule() == Rule::typed_atom)
+                .map(parse_typed_atom)
+                .collect::<Result<Vec<_>, _>>()?
+                .into_iter()
+                .enumerate()
+                .map(|(i, atom)| (format!("arg{i}"), atom))
+                .collect();
+            Ok(Statement::Call {
+                target,
+                tail: true,
+                args,
+                targets: Vec::new(),
                 span,
             })
         }
@@ -672,7 +697,7 @@ fn parse_apply(pair: Pair<'_, Rule>) -> Result<ExprNode, ParseError> {
 
     for part in pair.into_inner() {
         match part.as_rule() {
-            Rule::ident => target = Some(part.as_str().to_owned()),
+            Rule::ident | Rule::minted_callee => target = Some(parse_callee(part)?),
             Rule::typed_atom => args.push(parse_typed_atom(part)?),
             _ => {}
         }
@@ -682,6 +707,23 @@ fn parse_apply(pair: Pair<'_, Rule>) -> Result<ExprNode, ParseError> {
         target: target.ok_or_else(|| ParseError::new("missing apply target"))?,
         args,
     })
+}
+
+fn parse_callee(pair: Pair<'_, Rule>) -> Result<Callee, ParseError> {
+    match pair.as_rule() {
+        Rule::ident => Ok(Callee::Named(pair.as_str().to_owned())),
+        Rule::minted_callee => {
+            let slot = pair
+                .as_str()
+                .strip_prefix("<minted:")
+                .and_then(|text| text.strip_suffix('>'))
+                .ok_or_else(|| ParseError::new("invalid minted callee"))?
+                .parse::<u32>()
+                .map_err(|_| ParseError::new("minted callee slot exceeds u32"))?;
+            Ok(Callee::Minted(slot))
+        }
+        _ => Err(ParseError::new("invalid callee")),
+    }
 }
 
 fn parse_range(pair: Pair<'_, Rule>) -> Result<ExprNode, ParseError> {
@@ -879,7 +921,7 @@ fn parse_intrinsic_call(pair: Pair<'_, Rule>) -> Result<ExprNode, ParseError> {
 
 fn parse_map(pair: Pair<'_, Rule>) -> Result<ExprNode, ParseError> {
     let mut inner = pair.into_inner();
-    // `map_app` holds the body ident and any parenthesized captures.
+    // `map_app` holds the body callee and any parenthesized captures.
     let app = inner
         .next()
         .filter(|p| p.as_rule() == Rule::map_app)
@@ -887,10 +929,8 @@ fn parse_map(pair: Pair<'_, Rule>) -> Result<ExprNode, ParseError> {
     let mut app_parts = app.into_inner();
     let body = app_parts
         .next()
-        .filter(|p| p.as_rule() == Rule::ident)
-        .ok_or_else(|| ParseError::new("missing map body function"))?
-        .as_str()
-        .to_owned();
+        .ok_or_else(|| ParseError::new("missing map body function"))?;
+    let body = parse_callee(body)?;
     let captures = app_parts
         .filter(|p| p.as_rule() == Rule::typed_atom)
         .map(parse_typed_atom)
@@ -917,11 +957,12 @@ fn parse_scan(pair: Pair<'_, Rule>) -> Result<ExprNode, ParseError> {
     let mut app_parts = app.into_inner();
     let body = app_parts
         .next()
-        .filter(|p| p.as_rule() == Rule::scan_body)
-        .ok_or_else(|| ParseError::new("missing scan body function"))?
-        .as_str()
-        .trim_start_matches('@')
-        .to_owned();
+        .ok_or_else(|| ParseError::new("missing scan body function"))?;
+    let body = match body.as_rule() {
+        Rule::scan_body => Callee::Named(body.as_str().trim_start_matches('@').to_owned()),
+        Rule::minted_callee => parse_callee(body)?,
+        _ => return Err(ParseError::new("invalid scan body function")),
+    };
     let captures = app_parts
         .filter(|p| p.as_rule() == Rule::typed_atom)
         .map(parse_typed_atom)
@@ -1231,7 +1272,7 @@ fn source_span(span: pest::Span<'_>) -> SourceSpan {
 #[cfg(test)]
 mod tests {
     use super::parse_program;
-    use crate::ast::{Atom, CastOp, ExprNode, Label, ProgramKind, Statement};
+    use crate::ast::{Atom, Callee, CastOp, ExprNode, Label, ProgramKind, Statement};
 
     fn stmts(program: &str) -> Vec<Statement> {
         match parse_program(program).expect("parse should succeed").kind {
@@ -1328,7 +1369,7 @@ mod tests {
                     },
                 ..
             } => {
-                assert_eq!(body, "inc");
+                assert_eq!(body, &Callee::Named("inc".into()));
                 assert!(captures.is_empty());
                 match &src.atom {
                     Atom::Ssa(name) => assert_eq!(name, "src"),
@@ -1352,7 +1393,7 @@ mod tests {
                     },
                 ..
             } => {
-                assert_eq!(body, "addk");
+                assert_eq!(body, &Callee::Named("addk".into()));
                 assert_eq!(captures.len(), 2);
                 match &src.atom {
                     Atom::Ssa(name) => assert_eq!(name, "src"),
@@ -1754,7 +1795,7 @@ mod tests {
 
         match &statements[0] {
             Statement::Call { target, args, .. } => {
-                assert_eq!(target, "target");
+                assert_eq!(target, &Callee::Named("target".into()));
                 assert!(args.is_empty());
             }
             _ => panic!("expected call statement"),
@@ -1768,7 +1809,7 @@ mod tests {
 
         match &statements[0] {
             Statement::Call { target, args, .. } => {
-                assert_eq!(target, "callee");
+                assert_eq!(target, &Callee::Named("callee".into()));
                 assert_eq!(args.len(), 2);
                 assert_eq!(args[0].0, "@arg0");
                 assert_eq!(args[1].0, "@arg1");
@@ -1786,7 +1827,7 @@ mod tests {
             Statement::Call {
                 target, targets, ..
             } => {
-                assert_eq!(target, "callee");
+                assert_eq!(target, &Callee::Named("callee".into()));
                 assert_eq!(targets.len(), 1);
                 assert!(matches!(&targets[0], Label::Named { name, .. } if name == "resume"));
             }
@@ -2116,7 +2157,7 @@ mod tests {
         assert!(matches!(
             &fns[0].statements[2],
             Statement::Assign { expr: ExprNode::Apply { target, args }, .. }
-                if target == "rec" && args.len() == 1
+                if target == &Callee::Named("rec".into()) && args.len() == 1
         ));
         assert!(matches!(
             &fns[0].statements[3],
@@ -2171,6 +2212,43 @@ mod tests {
         assert!(matches!(
             &stmts[0],
             Statement::Assign { expr: ExprNode::Gep { field: GepField::Name(n), .. }, .. } if n == "field"
+        ));
+    }
+
+    #[test]
+    fn parses_canonical_minted_callees_in_all_direct_forms() {
+        let cases = [
+            ("%x = apply <minted:1>()", 1),
+            ("%x = <minted:2> <$> i64 0", 2),
+            ("%x = scanl <minted:3> i64 0 i64 1", 3),
+            ("call fn <minted:4>()", 4),
+            ("tailcall fn <minted:5>()", 5),
+        ];
+
+        for (source, expected) in cases {
+            let statement = stmts(source).pop().expect("one statement");
+            let callee = match statement {
+                Statement::Assign {
+                    expr: ExprNode::Apply { target, .. },
+                    ..
+                } => target,
+                Statement::Assign {
+                    expr: ExprNode::Map { body, .. },
+                    ..
+                }
+                | Statement::Assign {
+                    expr: ExprNode::Scan { body, .. },
+                    ..
+                } => body,
+                Statement::Call { target, .. } => target,
+                other => panic!("unexpected parse for {source}: {other:?}"),
+            };
+            assert_eq!(callee, Callee::Minted(expected));
+        }
+
+        assert!(matches!(
+            stmts("tailcall fn <minted:9>()").pop(),
+            Some(Statement::Call { tail: true, .. })
         ));
     }
 }

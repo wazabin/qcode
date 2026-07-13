@@ -21,7 +21,7 @@ label           =  { "<" ~ (ident | integer) ~ ">" }
 label_decl      =  { "<" ~ (ident ~ block_param_decl* | integer) ~ ">" }
 block_param_decl = { block_param_name ~ (":" ~ ty)? }
 label_stmt      =  { SOI ~ label ~ EOI }
-terminator      =  { return_stmt | branchind_stmt | callind_stmt | cbranch_stmt | branch_stmt | call_stmt }
+terminator      =  { return_stmt | branchind_stmt | callind_stmt | cbranch_stmt | branch_stmt | tailcall_stmt | call_stmt }
 terminator_stmt =  { SOI ~ terminator ~ EOI }
 branch_stmt     =  { "goto" ~ branch_label }
 branch_label    =  { "<" ~ (ident | integer) ~ branch_arg* ~ ">" }
@@ -35,12 +35,14 @@ branchind_stmt  =  { "goto" ~ "[" ~ typed_atom ~ "]" ~ edge_hint? }
 // this hint.
 edge_hint       =  { "//" ~ "->" ~ label ~ ("," ~ label)* }
 cbranch_stmt    =  { "if" ~ typed_atom ~ "goto" ~ branch_label ~ "else" ~ "goto" ~ branch_label }
-// `call fn name(@p0=arg, …)` is canonical (the printed form). `call <name>`
-// is an accepted arg-less shorthand kept for hand-written IR / older tests.
+// `call fn name(@p0=arg, …)` is canonical (the printed form). A direct callee
+// may instead be an unresolved `<minted:N>` placeholder. `call <name>` is an
+// accepted arg-less shorthand kept for hand-written IR / older tests.
 call_stmt       =  { "call" ~ (call_direct | call_legacy) ~ edge_hint? }
-call_direct     =  { "fn" ~ ident ~ "(" ~ (call_arg ~ ("," ~ call_arg)*)? ~ ")" }
+call_direct     =  { "fn" ~ callee ~ "(" ~ (call_arg ~ ("," ~ call_arg)*)? ~ ")" }
 call_legacy     =  { label }
 call_arg        =  { block_param_name ~ "=" ~ typed_atom }
+tailcall_stmt   =  { "tailcall" ~ "fn" ~ callee ~ "(" ~ (typed_atom ~ ("," ~ typed_atom)*)? ~ ")" }
 callind_stmt    =  { "call" ~ "[" ~ typed_atom ~ "]" ~ callind_args? ~ edge_hint? }
 callind_args    =  { "(" ~ (typed_atom ~ ("," ~ typed_atom)*)? ~ ")" }
 return_stmt     =  { return_at_stmt | return_value_at_stmt | return_value_stmt }
@@ -56,18 +58,19 @@ func_unop       =  { func_unop_op ~ "(" ~ typed_atom ~ ")" }
 func_call       =  { func_ident ~ "(" ~ typed_atom ~ ("," ~ typed_atom)? ~ ")" }
 intrinsic_call  =  { intrinsic_name ~ "(" ~ typed_atom ~ ("," ~ typed_atom)* ~ ")" }
 intrinsic_name  = @{ "$" ~ (ASCII_ALPHA | "_") ~ (ASCII_ALPHANUMERIC | "_")* }
-apply           =  { "apply" ~ ident ~ "(" ~ (typed_atom ~ ("," ~ typed_atom)*)? ~ ")" }
+apply           =  { "apply" ~ callee ~ "(" ~ (typed_atom ~ ("," ~ typed_atom)*)? ~ ")" }
 // `body <$> src` / `(body c0 c1) <$> src` (Haskell `fmap`): a `map` over an
-// array. The body is a function symbol declared elsewhere in the program; the
-// optional parenthesized list supplies loop-invariant captures.
+// array. The body is a named function or `<minted:N>` placeholder; the optional
+// parenthesized list supplies loop-invariant captures.
 map             =  { map_app ~ "<$>" ~ typed_atom }
-map_app         =  { "(" ~ ident ~ typed_atom* ~ ")" | ident }
+map_app         =  { "(" ~ callee ~ typed_atom* ~ ")" | callee }
 // `scanl @body init src` / `scanl (@body c0 c1) init src`: a left-scan over the
-// array `src`. The body is a function symbol (printed with a leading `@`); the
-// optional parenthesized list supplies loop-invariant captures; `init` is the
-// initial accumulator, `src` the scanned array.
+// array `src`. A named body is printed with a leading `@`; a minted body uses
+// `<minted:N>` directly. The optional parenthesized list supplies loop-invariant
+// captures; `init` is the initial accumulator, `src` the scanned array.
 scan            =  { "scanl" ~ scan_app ~ typed_atom ~ typed_atom }
-scan_app        =  { "(" ~ scan_body ~ typed_atom* ~ ")" | scan_body }
+scan_app        =  { "(" ~ scan_callee ~ typed_atom* ~ ")" | scan_callee }
+scan_callee     = _{ scan_body | minted_callee }
 scan_body       = @{ "@" ~ (ASCII_ALPHA | "_") ~ (ASCII_ALPHANUMERIC | "_")* }
 binary          =  { typed_atom ~ op ~ typed_atom }
 // `v[start:end]` — extract bytes `[start, end)` of `v`. `start` defaults to 0
@@ -102,6 +105,8 @@ capture         =  { "{" ~ ident ~ "}" }
 block_param_name = @{ "@" ~ (ASCII_ALPHA | "_") ~ (ASCII_ALPHANUMERIC | "_")* }
 ssa_name        = @{ "%" ~ (ASCII_ALPHA | "_") ~ (ASCII_ALPHANUMERIC | "_")* }
 ident           = @{ (ASCII_ALPHA | "_") ~ (ASCII_ALPHANUMERIC | "_")* }
+callee          = _{ minted_callee | ident }
+minted_callee   = @{ "<minted:" ~ dec_int ~ ">" }
 integer         = @{ hex_int | dec_int }
 hex_int         =  { "0" ~ ("x" | "X") ~ ASCII_HEX_DIGIT+ }
 dec_int         =  { ASCII_DIGIT+ }

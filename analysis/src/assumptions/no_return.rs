@@ -79,7 +79,10 @@ pub fn assume_call_returns(ctx: &mut Context) -> usize {
             };
             let call_site = InstructionId::new(call_block.func, call_site);
             let callee = match ctx.instruction(call_site).mnemonic() {
-                Mnemonic::Call(call) => call.target,
+                Mnemonic::Call(call) => match call.target.real() {
+                    Some(callee) => callee,
+                    None => continue,
+                },
                 _ => continue,
             };
             calls.push((call_block, callee));
@@ -235,7 +238,10 @@ fn is_noreturn_call_block(ctx: &Context, block: BlockId) -> bool {
     };
     // A recorded `FunctionReturns(callee) = false` (assumed or known) marks the
     // callee noreturn; an unrecorded callee defaults to returning.
-    ctx.truth(Proposition::FunctionReturns(call.target))
+    let Some(target) = call.target.real() else {
+        return false;
+    };
+    ctx.truth(Proposition::FunctionReturns(target))
         .is_some_and(|t| !t.value)
 }
 

@@ -132,7 +132,11 @@ fn compute_function_attrs(
                         if mask == 0 {
                             continue;
                         }
-                        match callee_param_attr(ctx, attrs, c.target, j) {
+                        match c
+                            .target
+                            .real()
+                            .and_then(|target| callee_param_attr(ctx, attrs, target, j))
+                        {
                             Some(a) => {
                                 if !a.readonly {
                                     revoke_readonly(&mut result, mask);
@@ -408,7 +412,7 @@ mod tests {
         tc.ctx.replace_instruction_mnemonic(
             cid,
             Mnemonic::Call(Call {
-                target,
+                target: qcode::value::insn::Callee::Real(target),
                 args: args.into_iter().map(|arg| arg.localize(cid.func)).collect(),
                 clobbers: vec![],
             }),

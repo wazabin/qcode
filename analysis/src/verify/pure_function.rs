@@ -66,18 +66,24 @@ fn impurity(ctx: &Context, m: &Mnemonic) -> Option<&'static str> {
         // A map is a deterministic value of its array argument iff its per-element
         // body is itself pure (the body symbol is not an operand, so the generic
         // varnode check below would miss an impure body).
-        Mnemonic::Map(m) => {
-            (!Function::from_id(ctx, m.body).is_pure()).then_some("map with impure body")
-        }
+        Mnemonic::Map(m) => (!m
+            .body
+            .real()
+            .is_some_and(|body| Function::from_id(ctx, body).is_pure()))
+        .then_some("map with impure or minted body"),
         // A scan, like a map, is a deterministic value of its array argument and
         // initial accumulator iff its per-element body is pure (the body symbol is
         // not an operand, so the generic varnode check below would miss it).
-        Mnemonic::Scan(m) => {
-            (!Function::from_id(ctx, m.body).is_pure()).then_some("scan with impure body")
-        }
-        Mnemonic::Apply(m) => {
-            (!Function::from_id(ctx, m.target).is_pure()).then_some("apply with impure target")
-        }
+        Mnemonic::Scan(m) => (!m
+            .body
+            .real()
+            .is_some_and(|body| Function::from_id(ctx, body).is_pure()))
+        .then_some("scan with impure or minted body"),
+        Mnemonic::Apply(m) => (!m
+            .target
+            .real()
+            .is_some_and(|target| Function::from_id(ctx, target).is_pure()))
+        .then_some("apply with impure or minted target"),
         // A pure function reads its inputs only through params: a raw varnode
         // operand is an un-functionalized register/global read.
         _ => m

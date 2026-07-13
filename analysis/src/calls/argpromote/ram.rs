@@ -530,7 +530,12 @@ fn function_makes_blocking_call(ctx: &Context, function_id: FunctionId) -> bool 
             // A direct call is inert iff it clobbers nothing and the callee
             // touches no memory; otherwise its effects would have to bubble
             // through ours.
-            Mnemonic::Call(c) => !c.clobbers.is_empty() || function_accesses_memory(ctx, c.target),
+            Mnemonic::Call(c) => {
+                !c.clobbers.is_empty()
+                    || c.target
+                        .real()
+                        .is_none_or(|target| function_accesses_memory(ctx, target))
+            }
             _ => false,
         })
     })
@@ -688,7 +693,7 @@ fn apply(
 ) -> bool {
     let has_callers = ctx
         .instructions()
-        .any(|insn| matches!(insn.mnemonic(), Mnemonic::Call(c) if c.target == fid));
+        .any(|insn| matches!(insn.mnemonic(), Mnemonic::Call(c) if c.target.real() == Some(fid)));
     if !has_callers {
         return false;
     }
@@ -960,7 +965,7 @@ fn apply_partial(ctx: &mut Context, fid: FunctionId, promoted: &[Promoted]) -> b
     let call_sites: Vec<InstructionId> = ctx
         .instructions()
         .filter_map(|insn| match insn.mnemonic() {
-            Mnemonic::Call(c) if c.target == fid => Some(insn.id),
+            Mnemonic::Call(c) if c.target.real() == Some(fid) => Some(insn.id),
             _ => None,
         })
         .collect();

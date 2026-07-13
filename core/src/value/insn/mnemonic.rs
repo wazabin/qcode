@@ -199,11 +199,11 @@ impl Mnemonic {
     /// known). Used to maintain the reverse call graph.
     pub fn call_target(&self) -> Option<FunctionId> {
         match self {
-            Mnemonic::Call(call) => Some(call.target),
-            Mnemonic::TailCall(tc) => Some(tc.target),
-            Mnemonic::Apply(apply) => Some(apply.target),
-            Mnemonic::Map(map) => Some(map.body),
-            Mnemonic::Scan(scan) => Some(scan.body),
+            Mnemonic::Call(call) => call.target.real(),
+            Mnemonic::TailCall(tc) => tc.target.real(),
+            Mnemonic::Apply(apply) => apply.target.real(),
+            Mnemonic::Map(map) => map.body.real(),
+            Mnemonic::Scan(scan) => scan.body.real(),
             _ => None,
         }
     }

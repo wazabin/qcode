@@ -79,7 +79,7 @@ pub fn verify_pure_reg_call_args(ctx: &Context<'_>) -> Vec<PureRegCallArgsViolat
             let qcode::value::insn::Mnemonic::Call(call) = insn.mnemonic() else {
                 continue;
             };
-            if call.target != callee {
+            if call.target.real() != Some(callee) {
                 continue;
             }
 
@@ -167,7 +167,7 @@ mod tests {
         tc.ctx.replace_instruction_mnemonic(
             call_id,
             Mnemonic::Call(Call {
-                target: callee,
+                target: qcode::value::insn::Callee::Real(callee),
                 args: args
                     .into_iter()
                     .map(|arg| arg.localize(call_id.func))

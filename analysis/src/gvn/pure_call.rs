@@ -71,6 +71,9 @@ impl<'str> ModuleSubPass<'str> for PureCall {
         else {
             return Claim::Pass;
         };
+        let Some(target) = target.real() else {
+            return Claim::Pass;
+        };
         if !Function::from_id(ctx, target).is_pure() {
             return Claim::Pass;
         }
@@ -257,7 +260,7 @@ mod tests {
         tc.ctx.replace_instruction_mnemonic(
             call_id,
             Mnemonic::Call(Call {
-                target: foo,
+                target: qcode::value::insn::Callee::Real(foo),
                 args: vec![a_in.localize(gid), b_arg.localize(gid)],
                 clobbers: vec![],
             }),
@@ -421,7 +424,7 @@ mod tests {
         tc.ctx.replace_instruction_mnemonic(
             call_id,
             Mnemonic::Call(Call {
-                target: dec,
+                target: qcode::value::insn::Callee::Real(dec),
                 args: vec![sp_arg.localize(gid), arr_arg.localize(gid)],
                 clobbers: vec![],
             }),

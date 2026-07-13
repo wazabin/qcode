@@ -41,6 +41,14 @@ pub struct TypedAtom {
     pub span: SourceSpan,
 }
 
+/// A direct function reference in textual QCode.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Callee {
+    Named(String),
+    /// An unresolved pass-local function slot, written `<minted:N>`.
+    Minted(u32),
+}
+
 #[derive(Clone, Debug)]
 pub struct TupleField {
     pub name: Option<String>,
@@ -134,22 +142,23 @@ pub enum ExprNode {
     },
     /// `apply lambda(args...)` — value-level application of a pure lambda.
     Apply {
-        target: String,
+        target: Callee,
         args: Vec<TypedAtom>,
     },
     /// `body <$> src` / `(body c0 c1) <$> src` — an element-wise `map` over the
-    /// array `src`. `body` names a function symbol declared in the same program;
+    /// array `src`. `body` is a named function or an unresolved minted callee;
     /// `captures` are the loop-invariant operands the body closes over.
     Map {
-        body: String,
+        body: Callee,
         src: TypedAtom,
         captures: Vec<TypedAtom>,
     },
     /// `scanl @body init src` / `scanl (@body c0 c1) init src` — a left-scan over
-    /// the array `src`. `body` names a function symbol (stored without the `@`);
-    /// `init` is the initial accumulator; `captures` are loop-invariant operands.
+    /// the array `src`. Named bodies are stored without the `@`; minted bodies
+    /// use their explicit placeholder. `init` is the initial accumulator;
+    /// `captures` are loop-invariant operands.
     Scan {
-        body: String,
+        body: Callee,
         init: TypedAtom,
         src: TypedAtom,
         captures: Vec<TypedAtom>,
@@ -272,7 +281,9 @@ pub enum Statement {
         span: SourceSpan,
     },
     Call {
-        target: String,
+        target: Callee,
+        /// `true` for `tailcall fn ...`, which has no return-edge hint.
+        tail: bool,
         /// Arguments passed to the callee, one per inferred callee input, in
         /// order. The name in each pair is the callee's parameter name as
         /// printed (`@r0`, `@arg1`, …); it is decorative and discarded on

@@ -37,7 +37,10 @@ fn function_makes_unbounded_call(ctx: &Context, function_id: FunctionId) -> bool
             match insn.mnemonic() {
                 Mnemonic::CallInd(_) => return true,
                 Mnemonic::Call(call) => {
-                    let target = Function::from_id(ctx, call.target);
+                    let Some(target_id) = call.target.real() else {
+                        return true;
+                    };
+                    let target = Function::from_id(ctx, target_id);
                     if target.is_external() || target.reads_unbounded_stack() {
                         return true;
                     }

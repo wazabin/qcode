@@ -242,7 +242,7 @@ fn bind_external_return(ctx: &mut Context, fid: FunctionId, ret: VarnodeId) -> b
     let call_sites: Vec<InstructionId> = ctx
         .instructions()
         .filter_map(|insn| match insn.mnemonic() {
-            Mnemonic::Call(c) if c.target == fid => Some(insn.id),
+            Mnemonic::Call(c) if c.target.real() == Some(fid) => Some(insn.id),
             _ => None,
         })
         .collect();
