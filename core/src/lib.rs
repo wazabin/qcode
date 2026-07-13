@@ -29,15 +29,17 @@
 //! | [`ValueId::BasicBlock`]  | A control-flow node / label                   |
 //! | [`ValueId::Function`]    | A lifted or external function                 |
 //!
-//! All values live inside a [`Context`], which acts as an arena. You retrieve
-//! a value by calling [`Context::get_value`], which returns a [`ValueRef`]
-//! that borrows the context for its lifetime.
+//! All values are owned by a [`Context`]. Shared leaves live in its interners;
+//! function-owned instructions, blocks, and parameters live in a
+//! [`FunctionBody`]. IDs are inspected through typed context accessors and
+//! reference constructors, which borrow the context for their lifetime.
 //!
 //! ## Context
 //!
-//! [`Context`] is the single owner of all IR state — spaces, values,
-//! instructions, blocks, and functions. Create one with [`Context::new`] and
-//! pass `&mut` references to the [`Builder`] and analysis passes.
+//! [`Context`] is the module owner: shared spaces and interners, published
+//! function interfaces, and the lockstep function-body registry. Create one
+//! with [`Context::new`] and pass `&mut` references to the [`Builder`] and
+//! module analysis passes.
 //!
 //! ## Builder
 //!
@@ -91,6 +93,11 @@
 //! [`ValueRef`]:                crate::value::ValueRef
 //! [`Varnode`]:                 crate::value::Varnode
 //! [`BasicBlock`]:              crate::value::BasicBlock
+//! [`FunctionBody`]:            crate::value::FunctionBody
+//! [`Literal`]:                 crate::value::literal::Literal
+//! [`Context`]:                 crate::context::Context
+//! [`Context::new`]:            crate::context::Context::new
+//! [`Builder`]:                 crate::builder::Builder
 
 pub mod assumption;
 pub mod builder;

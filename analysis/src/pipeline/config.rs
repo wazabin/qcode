@@ -1334,6 +1334,33 @@ async fn run_function_stage(
     round: usize,
     progress: &mut impl ProgressSink,
 ) -> Result<HashSet<FunctionId>, String> {
+    run_function_stage_with_threads(
+        ctx,
+        env,
+        stage,
+        passes,
+        previous_dirty,
+        restrict,
+        cache,
+        round,
+        progress,
+        resolve_threads(),
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn run_function_stage_with_threads(
+    ctx: &mut Context,
+    env: &PipelineEnv,
+    stage: &Stage,
+    passes: &[Box<dyn DynFunctionPass>],
+    previous_dirty: Option<&HashSet<FunctionId>>,
+    restrict: Option<&HashSet<FunctionId>>,
+    cache: &mut FixpointCache,
+    round: usize,
+    progress: &mut impl FnMut(PipelineProgress),
+    threads: usize,
+) -> Result<HashSet<FunctionId>, String> {
     // Every producer of reattributed blocks (the recursive lifter, and
     // `split_overlapping_functions` during discovery rounds) discharges strict
     // locality at its own tail, so every function reaching this stage is already
@@ -1488,7 +1515,6 @@ async fn run_function_stage(
     // two checked-out bodies, and every function is parallel-eligible. Tiny
     // worklists, `QCODE_THREADS=1`, and wasm fall through to the sequential loop
     // below, byte-for-byte identical.
-    let threads = resolve_threads();
     let parallel_set: HashSet<FunctionId> = if threads > 1 && fun_ids.len() >= PARALLEL_THRESHOLD {
         run_stage_parallel(
             ctx,
@@ -1636,7 +1662,11 @@ fn run_one_function<'str>(
             let outcome = p
                 .run_checked(body, cx, &mut next_minted)
                 .map_err(|e| format!("{}: {e}", p.name()))?;
-            let pass_changed = outcome.changed;
+            // Minting is an observable stage mutation even when a pass forgot to
+            // set its body-change bit. Keep the producer dirty and continue a
+            // requested fixpoint rather than caching it as clean while publishing
+            // new functions at the barrier.
+            let pass_changed = outcome.changed || !outcome.minted.is_empty();
             if outcome.rename.is_some() {
                 agg_rename = outcome.rename;
             }
@@ -1916,6 +1946,164 @@ fn run_stage_parallel(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::{FunctionPass, FunctionPassAdapter};
+    use qcode::{
+        builder::Builder,
+        context::Context,
+        value::{BasicBlock, FunctionBody, FunctionKind},
+    };
+
+    fn run_function_only_pipeline_with_threads(
+        pipeline: &Pipeline,
+        ctx: &mut Context,
+        threads: usize,
+    ) {
+        let env = PipelineEnv::headless(ctx);
+        let mut dirty = Some(HashSet::default());
+        let mut cache = FixpointCache::default();
+        let mut progress = |_| {};
+        for stage in &pipeline.stages {
+            let StagePasses::Function(passes) = &stage.passes else {
+                panic!("test pipeline must contain only function stages");
+            };
+            dirty = Some(
+                run_function_stage_with_threads(
+                    ctx,
+                    &env,
+                    stage,
+                    passes,
+                    dirty.as_ref(),
+                    None,
+                    &mut cache,
+                    0,
+                    &mut progress,
+                    threads,
+                )
+                .expect("function stage runs"),
+            );
+        }
+    }
+
+    fn demangle_then_thunk_context() -> (Context<'static>, FunctionId) {
+        let mut ctx = Context::new();
+        // Registry order matters for the old sequential behavior: publish the
+        // callee's demangle before visiting its later thunk.
+        let callee =
+            FunctionBody::make_at_addr(&mut ctx, 0x1000, Some("_ZN5space3fooEv".to_owned().into()))
+                .id;
+        let _dummy_a = FunctionBody::make_at_addr(&mut ctx, 0x2000, None).id;
+        let _dummy_b = FunctionBody::make_at_addr(&mut ctx, 0x3000, None).id;
+        let thunk = FunctionBody::make_at_addr(&mut ctx, 0x4000, None).id;
+        let block = BasicBlock::make(&mut ctx, thunk).with_address(0x4000).id;
+        Builder::from_block(BasicBlock::from_id_mut(&mut ctx, block)).push_tail_call(callee);
+        FunctionBody::from_id_mut(&mut ctx, thunk)
+            .set_root(block)
+            .unwrap();
+        (ctx, thunk)
+    }
+
+    #[test]
+    fn demangle_barrier_makes_thunk_naming_thread_count_independent() {
+        let pipeline = Pipeline::parse(
+            r#"
+            [[stage]]
+            name = "demangle"
+            scope = "function"
+            passes = ["cpp_demangle"]
+            include_external = true
+
+            [[stage]]
+            name = "name-thunks"
+            scope = "function"
+            passes = ["name_thunks"]
+            include_external = true
+            "#,
+        )
+        .expect("test pipeline parses");
+        let (base, thunk) = demangle_then_thunk_context();
+        assert!(base.functions().count() >= PARALLEL_THRESHOLD);
+        let mut sequential = base.clone();
+        let mut parallel = base;
+
+        run_function_only_pipeline_with_threads(&pipeline, &mut sequential, 1);
+        run_function_only_pipeline_with_threads(&pipeline, &mut parallel, 4);
+
+        let sequential_names: Vec<_> = sequential
+            .functions()
+            .map(|f| f.name().to_owned())
+            .collect();
+        let parallel_names: Vec<_> = parallel.functions().map(|f| f.name().to_owned()).collect();
+        assert_eq!(sequential_names, parallel_names);
+        assert_eq!(
+            FunctionBody::from_id(&sequential, thunk).name(),
+            "thunk_space::foo"
+        );
+    }
+
+    #[derive(Default)]
+    struct MintWithoutChanged;
+
+    impl FunctionPass for MintWithoutChanged {
+        const NAME: &'static str = "test_mint_without_changed";
+
+        fn description(&self) -> &'static str {
+            "Test pass that mints while omitting the body-change bit"
+        }
+
+        fn run<'str>(
+            &self,
+            f: &mut FunctionBody<'str>,
+            _cx: ContextView<'_, 'str>,
+            next_minted: &mut u32,
+        ) -> Result<Outcome<'str>, String> {
+            let mut minted = Vec::new();
+            super::super::mint_function(
+                f,
+                next_minted,
+                &mut minted,
+                "minted".into(),
+                FunctionKind::Machine,
+                false,
+            );
+            Ok(Outcome {
+                changed: false,
+                rename: None,
+                minted,
+            })
+        }
+    }
+
+    #[test]
+    fn minting_counts_as_a_pass_change() {
+        let mut ctx = Context::new();
+        let owner = FunctionBody::make(&mut ctx, "owner".into()).unwrap().id;
+        let env = PipelineEnv::headless(&mut ctx);
+        let passes: Vec<Box<dyn DynFunctionPass>> = vec![Box::new(FunctionPassAdapter::<
+            MintWithoutChanged,
+        >::default())];
+        let mut cache = FixpointCache::default();
+        let mut elapsed = HashMap::default();
+        let outcome = {
+            let (bodies, view) = ctx.split(&env);
+            run_one_function(
+                &passes,
+                &mut bodies[owner],
+                view,
+                &mut cache,
+                &mut elapsed,
+                "mint",
+                "owner",
+                false,
+                |_| {},
+            )
+            .unwrap()
+        };
+
+        assert!(outcome.changed);
+        assert_eq!(outcome.minted.len(), 1);
+        assert!(!cache.is_clean(owner, MintWithoutChanged::NAME));
+        assert_eq!(elapsed[MintWithoutChanged::NAME].2, 1);
+    }
 
     #[test]
     fn default_pipeline_parses() {

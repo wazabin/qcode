@@ -164,7 +164,7 @@ impl ValueId {
     /// (an [`Instruction`] result or a [`BlockParam`]). Shared values (literals,
     /// bytes, varnodes) and functions/blocks return `None` — they have no single
     /// owning function and their per-function use-lists live in each using
-    /// function's [`users`](crate::value::function::FunctionBody::users) map.
+    /// function's reverse-use map (exposed through [`FunctionBody::users_of`]).
     pub fn owning_function(self) -> Option<FunctionId> {
         match self {
             ValueId::Instruction(id) => Some(id.func),
@@ -424,7 +424,7 @@ impl ValueId {
     /// Drop the owning `FunctionId` from the arena arms **without** a locality
     /// check, using the id's *own* embedded func. Unlike [`localize`](Self::localize)
     /// there is no ambient function to assert against: this is for keying a
-    /// per-function body map (e.g. `Function.users`) by a value that already
+    /// per-function body map (e.g. `FunctionBody.users`) by a value that already
     /// carries its own func. Within one body's map every arena key has that
     /// body's func, so stripping it is injective and lookup-stable; shared/module
     /// arms pass through unchanged.

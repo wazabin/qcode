@@ -353,10 +353,11 @@ pub(super) fn resolve_minted_callees(
         }
     }
     for fun_id in std::iter::once(owner).chain(installed.iter().copied()) {
-        let unresolved = FunctionBody::from_id(ctx, fun_id)
-            .blocks()
-            .flat_map(|block| block.iter())
-            .find_map(|insn| insn.mnemonic().minted_callee_slot());
+        // Inspect the whole live instruction arena, not just instructions linked
+        // into rostered blocks. A temporarily detached instruction is still live
+        // pass state and must not carry an unresolved placeholder past the
+        // barrier.
+        let unresolved = ctx.bodies[fun_id].minted_callee_slots().into_iter().next();
         if let Some(slot) = unresolved {
             return Err(format!(
                 "{pass}: function {fun_id:?} references minted callee #{slot}, but only {} were installed",
@@ -380,7 +381,7 @@ mod minted_barrier_tests {
         builder::Builder,
         testing::TestContext,
         value::{
-            BasicBlock,
+            BasicBlock, InstructionRef,
             insn::{Call, Callee, InstructionId, Mnemonic},
         },
     };
@@ -468,6 +469,31 @@ mod minted_barrier_tests {
 
         let err = resolve_minted_callees(&mut tc.ctx, "test", caller, &[callee]).unwrap_err();
         assert!(err.contains("minted callee #1"), "{err}");
+    }
+
+    #[test]
+    fn detached_instruction_cannot_hide_an_unresolved_minted_callee() {
+        let (mut tc, caller, _, callee) = caller_with_minted_call(0);
+        // Born directly into the owner's arena and deliberately never appended
+        // to a block: roster/block iteration cannot see this live instruction.
+        let detached = InstructionRef::from_mnemonic(
+            &mut tc.ctx,
+            caller,
+            Mnemonic::Call(Call {
+                target: Callee::Minted(1),
+                args: Vec::new(),
+                clobbers: Vec::new(),
+            }),
+            0,
+        )
+        .id;
+
+        let err = resolve_minted_callees(&mut tc.ctx, "test", caller, &[callee]).unwrap_err();
+        assert!(err.contains("minted callee #1"), "{err}");
+        let Mnemonic::Call(call) = tc.ctx.get_insn(detached).mnemonic() else {
+            panic!("detached call disappeared");
+        };
+        assert_eq!(call.target, Callee::Minted(1));
     }
 }
 

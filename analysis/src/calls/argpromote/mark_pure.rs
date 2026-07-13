@@ -5,7 +5,8 @@ use qcode::{
 
 use crate::{Pass, PipelineEnv};
 
-/// Assert [`FunctionBody::is_pure`] on every `pure_reg` function whose body has no
+/// Assert [`FunctionRef::is_pure`](qcode::value::FunctionRef::is_pure) on every
+/// `pure_reg` function whose body has no
 /// residual side effect — no memory access, no calls, and no raw register/global
 /// (varnode) reads — so it is a deterministic pure function of its params.
 ///

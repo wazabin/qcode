@@ -3,7 +3,8 @@
 //!
 //! When an `extract(call_result, i)` projects field `i` of a [`Call`] to a
 //! **pure** function (one argpromote has fully functionalized — see
-//! [`FunctionBody::is_pure`]), and that field's value depends only on call arguments
+//! [`FunctionRef::is_pure`](qcode::value::FunctionRef::is_pure)), and that field's
+//! value depends only on call arguments
 //! that are constant literals, the field is computed by emulating the callee and
 //! the `extract` is replaced with the resulting literal. See
 //! `PURE_EMULATION_DESIGN.md`.

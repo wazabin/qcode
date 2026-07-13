@@ -21,7 +21,7 @@ use crate::{
 /// lives in the module registry ([`Module`](Self::Module)) or has been *checked
 /// out* by a pass ([`Checked`](Self::Checked)). Because a checked-out function's
 /// body slot holds an empty body, reads of its arenas must come from the owned
-/// `&Function`, not from `shared`.
+/// `&FunctionBody`, not from `shared`.
 ///
 /// It is `Copy` (it holds only shared references), which is what lets a read ref
 /// hand the same host to every sub-ref it constructs.

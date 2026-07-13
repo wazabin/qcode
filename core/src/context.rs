@@ -1492,6 +1492,11 @@ impl<'str> Context<'str> {
     }
 
     pub fn push_block(&mut self, func: FunctionId, block: BasicBlock<'str>) -> BlockId {
+        assert_eq!(
+            block.parent,
+            Some(func),
+            "block parent must match its function-body arena"
+        );
         let local = self.bodies[func].blocks.push(block);
         let id = BlockId::new(func, local);
         // A block is born owned by the function whose arena stores it.

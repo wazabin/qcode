@@ -144,7 +144,8 @@ impl RegPurityReason {
 
 /// Report whether `fid` is eligible to be functionalized into a register-pure
 /// function (`Ok`) or, if not, the gating reason (`Err`). A function whose
-/// [`FunctionBody::is_pure_reg`] is already set is necessarily `Ok`; this is the
+/// [`FunctionRef::is_pure_reg`](qcode::value::FunctionRef::is_pure_reg) is
+/// already set is necessarily `Ok`; this is the
 /// source of the "why not" shown for the rest.
 ///
 /// Builds the whole-program address-taken and called-function sets on every call.

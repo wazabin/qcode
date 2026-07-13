@@ -420,9 +420,12 @@ mod tests {
             true,
         );
         let ambient = owner_fun.id();
+        let (child, edge);
         {
             let (_, mut host) = host_with_minted(owner_fun, &mut outcome, view, placeholder);
             let root = host.make_block(ambient);
+            child = host.make_block(ambient);
+            edge = host.add_cfg_edge(root, child);
             host.function_mut(ambient).set_root_id(Some(root.local));
             BaseRef::new(host.reborrow(), root)
                 .rename_local("minted_root".into())
@@ -437,8 +440,20 @@ mod tests {
         let (slot, _, mut detached) = minted.into_installed_parts(installed);
         assert_eq!(slot, 0);
         let root = BlockId::new(installed, detached.root_id().unwrap());
+        let child = BlockId::new(installed, child.local);
         assert_eq!(detached.block(root).parent, Some(installed));
+        assert_eq!(detached.block(child).parent, Some(installed));
+        assert_eq!(detached.edge(edge).from, root);
+        assert_eq!(detached.edge(edge).to, child);
         let host = PassBacking::new(&mut detached, view.shr(), view.interfaces());
+        assert_eq!(
+            host.read_host()
+                .block_ref(root)
+                .successors()
+                .map(|(_, successor)| successor)
+                .collect::<Vec<_>>(),
+            [child]
+        );
         assert_eq!(
             host.read_host()
                 .function_ref(installed)
@@ -581,7 +596,7 @@ mod tests {
     }
 
     /// The split's borrow story: hold `&mut bodies[fid]` (and mutate through the
-    /// inherent `Function` verbs) while simultaneously reading the module through
+    /// inherent `FunctionBody` verbs) while simultaneously reading the module through
     /// the bodies-free `ContextView` — interners, interfaces, env. Rust's
     /// disjoint-field borrows prove no aliasing; no `unsafe` anywhere.
     #[test]

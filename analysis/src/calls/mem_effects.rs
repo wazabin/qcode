@@ -4,7 +4,8 @@
 //! [`set_all_written_spaces`] computes, for every non-external function, the
 //! exact set of non-register memory [`SpaceId`]s it may write — directly in its
 //! own body, or transitively through a (direct, resolved) callee. The result is
-//! recorded on the function's [`written_spaces`](qcode::value::FunctionBody::written_spaces)
+//! recorded on the function's
+//! [`written_spaces`](qcode::value::FunctionRef::written_spaces)
 //! signature field.
 //!
 //! The consumer is store-to-load forwarding's call-prune
@@ -81,7 +82,7 @@ fn local_effect(
     (spaces, callees, unbounded)
 }
 
-/// Compute and record [`written_spaces`](qcode::value::FunctionBody::written_spaces)
+/// Compute and record [`written_spaces`](qcode::value::FunctionRef::written_spaces)
 /// for every non-external function as a least fixpoint over the call graph: a
 /// function's write-set is its own stores unioned with every resolved callee's
 /// write-set, becoming unbounded as soon as any (transitive) callee is unbounded.

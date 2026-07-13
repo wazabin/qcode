@@ -169,8 +169,8 @@ impl<'str> FunctionBody<'str> {
     /// Rebind the temporary ambient function ID used while constructing a
     /// detached body to its installed registry ID.
     ///
-    /// Function arenas, operands, CFG edges, roster entries, and use-def data
-    /// are body-local and need no remap. Only live block ownership metadata and
+    /// Function arenas, operands, roster entries, and use-def data are body-local
+    /// and need no remap. Live block ownership, composite CFG edge endpoints, and
     /// function-qualified entries in the local reverse-name table carry the
     /// ambient ID. Real `Callee::Real` targets inside instruction mnemonics are
     /// semantic cross-function references, not ownership metadata, and are
@@ -187,6 +187,15 @@ impl<'str> FunctionBody<'str> {
                 "detached function block has an unexpected ambient owner"
             );
             block.parent = Some(to);
+        }
+        for mut edge in self.edges.iter_mut() {
+            assert_eq!(
+                (edge.from.func, edge.to.func),
+                (from, from),
+                "detached function edge has an unexpected ambient owner"
+            );
+            edge.from.func = to;
+            edge.to.func = to;
         }
         self.names.rebind_function(from, to);
         self.id = to;
@@ -367,6 +376,11 @@ impl<'str> FunctionBody<'str> {
     /// Push a fresh block into this body's arena and onto its ownership roster.
     pub fn push_block(&mut self, block: BasicBlock<'str>) -> BlockId {
         let func = self.id;
+        assert_eq!(
+            block.parent,
+            Some(func),
+            "block parent must match its function-body arena"
+        );
         let local = self.blocks.push(block);
         let id = BlockId::new(func, local);
         self.roster.push(local);
@@ -851,17 +865,17 @@ where
         0
     }
 
-    /// The `address` of the inner `Function`.
+    /// The function interface's entry address.
     pub fn address(&'s self) -> Option<u64> {
         self.interface().address
     }
 
-    /// Whether the inner `Function` is external.
+    /// Whether the function interface marks this function external.
     pub fn is_external(&'s self) -> bool {
         self.interface().is_external
     }
 
-    /// A reference to the signature of the inner `Function`, if any.
+    /// A reference to the function interface's signature, if any.
     pub fn signature(&'s self) -> Option<&'ctx FunctionSignature> {
         self.interface().signature.as_ref()
     }
@@ -1088,7 +1102,7 @@ where
             .is_some_and(|s| s.frame_escapes_to_unbounded)
     }
 
-    /// The name of the inner `Function`.
+    /// The function interface's name.
     pub fn name(&'s self) -> &'ctx str {
         self.interface().name.as_ref()
     }
@@ -1901,6 +1915,20 @@ mod tests {
     fn body_param_access_rejects_colliding_foreign_id() {
         let (ctx, _, b, _, _, _, _, a_param, _) = colliding_body_ids();
         let _ = ctx.bodies[b].block_param(a_param);
+    }
+
+    #[test]
+    #[should_panic(expected = "block parent must match its function-body arena")]
+    fn body_push_block_rejects_foreign_parent() {
+        let (mut ctx, a, b, _, _, _, _, _, _) = colliding_body_ids();
+        ctx.bodies[b].push_block(BasicBlock::detached(a));
+    }
+
+    #[test]
+    #[should_panic(expected = "block parent must match its function-body arena")]
+    fn context_push_block_rejects_foreign_parent() {
+        let (mut ctx, a, b, _, _, _, _, _, _) = colliding_body_ids();
+        ctx.push_block(b, BasicBlock::detached(a));
     }
 
     /// A tail call into another function is a call edge in both directions of the

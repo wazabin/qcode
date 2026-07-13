@@ -1,6 +1,7 @@
 //! Verify the `is_pure` invariant.
 //!
-//! A function flagged [`FunctionBody::is_pure`] is asserted to be a deterministic
+//! A function flagged [`FunctionRef::is_pure`](qcode::value::FunctionRef::is_pure)
+//! is asserted to be a deterministic
 //! pure function of its params — argpromote has functionalized every side-effect
 //! channel. Pure-function emulation in constant propagation relies on this: it
 //! emulates such a callee to harvest constant return values. This rule re-derives

@@ -89,7 +89,8 @@ pub(crate) fn pure_slice<'a, 'str: 'a>(
 }
 
 /// Outline the pure expression that computes `result` into a fresh standalone
-/// function `body(inputs…) -> result`, marked [`is_pure`](FunctionBody::is_pure).
+/// function `body(inputs…) -> result`, marked
+/// [`is_pure`](qcode::value::FunctionRef::is_pure).
 /// Each value in `inputs` becomes a parameter (in order, with the input's
 /// width/type); every instruction on the backward slice is cloned with operands
 /// remapped (inputs→params, clones→clones, literals passed through); the function

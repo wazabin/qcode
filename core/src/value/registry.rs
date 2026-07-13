@@ -37,7 +37,8 @@ use std::collections::BTreeSet;
 ///   to rewrite operands while keeping `users` consistent.
 ///
 /// - **`users` is managed internally.** The reverse use-def map now lives in
-///   each [`FunctionBody`](crate::value::FunctionBody) (function-scoped; see [`FunctionBody::users`](crate::value::FunctionBody::users)). Do not mutate
+///   each [`FunctionBody`](crate::value::FunctionBody) (function-scoped; see
+///   [`FunctionBody::users_of`](crate::value::FunctionBody::users_of)). Do not mutate
 ///   it directly. Read it through
 ///   [`FunctionRef::users_of`](crate::value::FunctionRef::users_of) /
 ///   [`Context::users`](crate::context::Context::users), and remove dead

@@ -400,7 +400,16 @@ scope = "function"
 passes = ["struct_typing"]
 
 [[stage]]
-name = "cleanup"
+name = "demangle"
 scope = "function"
-passes = ["cpp_demangle", "name_thunks"]
+passes = ["cpp_demangle"]
+include_external = true
+
+# Stage barrier: `name_thunks` reads the callee's published interface name, so
+# every demangle rename must be replayed before any thunk derives its name. This
+# also keeps sequential and parallel execution byte-identical.
+[[stage]]
+name = "name-thunks"
+scope = "function"
+passes = ["name_thunks"]
 include_external = true

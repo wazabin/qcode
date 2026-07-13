@@ -179,7 +179,7 @@ impl<'str> BuilderBacking<'str> for &mut Context<'str> {
 }
 
 /// The **function-pass** builder backing (a checked-out body): every method routes
-/// through the owned `Function`'s inherent verbs plus the read-only shared context.
+/// through the owned `FunctionBody`'s inherent verbs plus the read-only shared context.
 /// `bb_shared_mut` is intentionally left as the defaulted panic — a pass-time
 /// builder holds a frozen shared view and cannot mint temp spaces.
 impl<'str> BuilderBacking<'str> for PassBacking<'_, 'str> {
