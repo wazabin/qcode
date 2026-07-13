@@ -97,10 +97,12 @@ pub fn assume_call_returns(ctx: &mut Context) -> usize {
             // block's fall-through edge(s); a `Call` terminator has no other
             // successor, so this only removes the continuation edge.
             qcode::pass_log!(trace, "callee {callee:?} is noreturn, pruning fall-through");
-            let edges: Vec<_> = BasicBlock::from_id(ctx, call_block)
+            let mut edges: Vec<_> = BasicBlock::from_id(ctx, call_block)
                 .successors()
                 .map(|(edge, _)| edge)
                 .collect();
+            edges.sort_unstable();
+            edges.dedup();
             for edge in edges {
                 ctx.remove_cfg_edge(call_block.func, edge);
                 count += 1;

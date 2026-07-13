@@ -274,6 +274,7 @@ impl<'a, 'str> PassBacking<'a, 'str> {
         let EdgeData { from, to } = *self.read_host().edge(func, edge_id);
         self.block_mut(from).edges.remove(&edge_id);
         self.block_mut(to).edges.remove(&edge_id);
+        self.function_mut(func).edges.remove(edge_id);
     }
 
     pub fn replace_all_uses_with(&mut self, old: ValueId, new: ValueId) {
@@ -321,7 +322,7 @@ impl<'a, 'str> PassBacking<'a, 'str> {
                 .instructions
                 .retain(|&local| local != id.localize(block_id.func));
             if is_terminator {
-                let succ: Vec<EdgeId> = {
+                let mut succ: Vec<EdgeId> = {
                     let host = self.read_host();
                     let block = host.block(block_id);
                     block
@@ -331,6 +332,7 @@ impl<'a, 'str> PassBacking<'a, 'str> {
                         .filter(|&e| host.edge(block_id.func, e).from == block_id)
                         .collect()
                 };
+                succ.sort_unstable();
                 for edge_id in succ {
                     self.remove_cfg_edge(block_id.func, edge_id);
                 }
@@ -357,8 +359,7 @@ impl<'a, 'str> PassBacking<'a, 'str> {
 
     pub fn merge_nodes(&mut self, keep: BlockId, remove: BlockId, direct_edge: EdgeId) {
         let func = keep.func;
-        self.block_mut(keep).edges.remove(&direct_edge);
-        self.block_mut(remove).edges.remove(&direct_edge);
+        self.remove_cfg_edge(func, direct_edge);
         let outgoing: Vec<EdgeId> = {
             let host = self.read_host();
             host.block(remove)
@@ -426,13 +427,14 @@ impl<'a, 'str> PassBacking<'a, 'str> {
     }
 
     pub fn delete_block(&mut self, block: BlockId, _function_id: FunctionId) {
-        let edges: Vec<EdgeId> = self
+        let mut edges: Vec<EdgeId> = self
             .read_host()
             .block(block)
             .edges
             .iter()
             .copied()
             .collect();
+        edges.sort_unstable();
         for edge in edges {
             self.remove_cfg_edge(block.func, edge);
         }

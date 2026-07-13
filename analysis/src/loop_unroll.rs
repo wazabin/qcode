@@ -520,12 +520,14 @@ pub(crate) fn replace_terminator_with_branch<'a, 'str>(
     target: BlockId,
     args: Vec<ValueId>,
 ) {
-    let old_successors = cx
+    let mut old_successors = cx
         .read_host(body)
         .block_ref(block)
         .successors()
         .map(|(edge, _)| edge)
         .collect::<Vec<_>>();
+    old_successors.sort_unstable();
+    old_successors.dedup();
     for edge in old_successors {
         body.remove_cfg_edge(edge);
     }
@@ -585,11 +587,13 @@ pub(crate) fn replace_terminator_with_branch_generic<'str>(
     target: BlockId,
     args: Vec<ValueId>,
 ) {
-    let old_successors = host
+    let mut old_successors = host
         .block_ref(block)
         .successors()
         .map(|(edge, _)| edge)
         .collect::<Vec<_>>();
+    old_successors.sort_unstable();
+    old_successors.dedup();
     for edge in old_successors {
         host.remove_cfg_edge(block.func, edge);
     }

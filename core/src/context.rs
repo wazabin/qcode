@@ -814,15 +814,13 @@ impl<'str> Context<'str> {
         edge_id
     }
 
-    /// Removes a CFG edge, unlinking it from both incident blocks' edge sets.
-    ///
-    /// The backing [`EdgeData`] slot in the append-only registry is left in
-    /// place (dangling), consistent with how removed instructions are handled;
-    /// per-block traversal reads the block edge sets, which this updates.
+    /// Removes a CFG edge, unlinking it from both incident blocks' edge sets and
+    /// physically dropping its payload.
     pub fn remove_cfg_edge(&mut self, func: FunctionId, edge_id: EdgeId) {
         let &EdgeData { from, to } = self.edge(func, edge_id);
         BasicBlock::from_id_mut(self, from).remove_edge(edge_id);
         BasicBlock::from_id_mut(self, to).remove_edge(edge_id);
+        self.bodies[func].edges.remove(edge_id);
     }
 
     /// Relocate every block in `olds` into `target`'s own arena. The originals
@@ -922,6 +920,8 @@ impl<'str> Context<'str> {
         for &old in olds {
             incident.extend(self.block(old).edges.iter().map(|&e| (old.func, e)));
         }
+        let mut incident: Vec<_> = incident.into_iter().collect();
+        incident.sort_unstable();
         for (edge_func, edge) in incident {
             let EdgeData { from, to } = *self.edge(edge_func, edge);
             let new_from = block_map.get(&from).copied().unwrap_or(from);
@@ -1196,6 +1196,8 @@ impl<'str> Context<'str> {
                 }
             }
         }
+        let mut stale: Vec<_> = stale.into_iter().collect();
+        stale.sort_unstable();
         for (func, edge) in stale {
             self.remove_cfg_edge(func, edge);
         }
@@ -1843,11 +1845,12 @@ impl<'str> Context<'str> {
             // If this instruction was a terminator instruction in a basic block,
             // remove cfg edges
             if Instruction::from_id(&*self, id).mnemonic().is_terminator() {
-                let mut edges_to_remove = HashSet::default();
+                let mut edges_to_remove = Vec::new();
                 for edge in BasicBlock::from_id(&*self, block_id).successors() {
-                    edges_to_remove.insert(edge.0);
+                    edges_to_remove.push(edge.0);
                 }
-
+                edges_to_remove.sort_unstable();
+                edges_to_remove.dedup();
                 for edge_id in edges_to_remove {
                     self.remove_cfg_edge(block_id.func, edge_id);
                 }
@@ -1964,8 +1967,7 @@ impl<'str> Context<'str> {
     /// Rehome `remove`'s outgoing CFG edges onto `keep` and drop the direct edge.
     pub fn merge_nodes(&mut self, keep: BlockId, remove: BlockId, direct_edge: EdgeId) {
         let func = keep.func;
-        self.block_mut(keep).edges.remove(&direct_edge);
-        self.block_mut(remove).edges.remove(&direct_edge);
+        self.remove_cfg_edge(func, direct_edge);
         let outgoing: Vec<EdgeId> = {
             let host = self.read_host();
             host.block(remove)
@@ -1985,13 +1987,14 @@ impl<'str> Context<'str> {
     /// Remove `block` from its function (unlink edges, remove instructions,
     /// detach params, tombstone).
     pub fn delete_block(&mut self, block: BlockId, _function_id: FunctionId) {
-        let edges: Vec<EdgeId> = self
+        let mut edges: Vec<EdgeId> = self
             .read_host()
             .block(block)
             .edges
             .iter()
             .copied()
             .collect();
+        edges.sort_unstable();
         for edge in edges {
             self.remove_cfg_edge(block.func, edge);
         }
@@ -3037,8 +3040,10 @@ mod tests {
         let f = ctx.anon_function();
         let a = BasicBlock::make(&mut ctx, f).id;
         let b = BasicBlock::make(&mut ctx, f).id;
+        let c = BasicBlock::make(&mut ctx, f).id;
 
         let edge = ctx.add_cfg_edge(a, b);
+        let surviving_edge = ctx.add_cfg_edge(b, c);
         assert_eq!(
             BasicBlock::from_id(&ctx, a)
                 .successors()
@@ -3055,6 +3060,28 @@ mod tests {
         ctx.remove_cfg_edge(a.func, edge);
         assert!(BasicBlock::from_id(&ctx, a).successors().next().is_none());
         assert!(BasicBlock::from_id(&ctx, b).predecessors().next().is_none());
+        assert!(!ctx.bodies[a.func].edges.contains(edge));
+        let surviving = ctx.edge(a.func, surviving_edge);
+        assert_eq!(surviving.from, b, "swap removal must preserve the source");
+        assert_eq!(surviving.to, c, "swap removal must preserve the target");
+        assert_eq!(ctx.bodies[a.func].edges.len(), 1);
+
+        let self_edge = ctx.add_cfg_edge(a, a);
+        ctx.remove_cfg_edge(a.func, self_edge);
+        assert!(!ctx.bodies[a.func].edges.contains(self_edge));
+        assert!(ctx.block(a).edges.is_empty());
+
+        let parallel_a = ctx.add_cfg_edge(a, b);
+        let parallel_b = ctx.add_cfg_edge(a, b);
+        ctx.remove_cfg_edge(a.func, parallel_a);
+        assert!(!ctx.bodies[a.func].edges.contains(parallel_a));
+        assert!(ctx.bodies[a.func].edges.contains(parallel_b));
+        assert_eq!(
+            BasicBlock::from_id(&ctx, a)
+                .successors()
+                .collect::<Vec<_>>(),
+            vec![(parallel_b, b)],
+        );
     }
 
     #[test]
@@ -3246,6 +3273,48 @@ mod tests {
         // The SpaceAddress type round-trips: same id, same size, same space.
         assert_eq!(restored.shared.types.size_of(sa), sa_size);
         assert_eq!(restored.shared.types.space_of(sa), Some(some_space));
+    }
+
+    #[test]
+    fn compact_edge_arena_preserves_ids_across_round_trip() {
+        let mut ctx = Context::new();
+        let function = ctx.anon_function();
+        let a = BasicBlock::make(&mut ctx, function).id;
+        let b = BasicBlock::make(&mut ctx, function).id;
+        let c = BasicBlock::make(&mut ctx, function).id;
+        let d = BasicBlock::make(&mut ctx, function).id;
+        let first = ctx.add_cfg_edge(a, b);
+        let removed = ctx.add_cfg_edge(b, c);
+        let last = ctx.add_cfg_edge(c, d);
+        ctx.remove_cfg_edge(function, removed);
+
+        let physical_order: Vec<_> = ctx.bodies[function]
+            .edges
+            .iter()
+            .map(|edge| edge.id)
+            .collect();
+        assert_eq!(physical_order, vec![first, last]);
+
+        let config = bincode::config::standard();
+        let bytes = bincode::serde::encode_to_vec(&ctx, config).expect("encode");
+        let (mut restored, _): (Context<'static>, usize) =
+            bincode::serde::decode_from_slice(&bytes, config).expect("decode");
+
+        assert!(!restored.bodies[function].edges.contains(removed));
+        assert_eq!(
+            restored.bodies[function]
+                .edges
+                .iter()
+                .map(|edge| edge.id)
+                .collect::<Vec<_>>(),
+            physical_order,
+        );
+        assert_eq!(restored.edge(function, first).to, b);
+        assert_eq!(restored.edge(function, last).from, c);
+
+        let fresh = restored.add_cfg_edge(a, d);
+        assert!(fresh > last);
+        assert_ne!(fresh, removed, "removed edge IDs must never be reused");
     }
 
     #[test]

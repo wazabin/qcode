@@ -358,10 +358,12 @@ fn arm_block(ctx: &mut Context, fun_id: FunctionId, target: LocalTarget) -> Bloc
 /// them before the apply step rebuilds the terminator keeps a re-resolution from
 /// doubling edges.
 fn clear_successors(ctx: &mut Context, from: BlockId) {
-    let edges: Vec<EdgeId> = BasicBlock::from_id(ctx, from)
+    let mut edges: Vec<EdgeId> = BasicBlock::from_id(ctx, from)
         .successors()
         .map(|(edge, _)| edge)
         .collect();
+    edges.sort_unstable();
+    edges.dedup();
     for edge in edges {
         ctx.remove_cfg_edge(from.func, edge);
     }

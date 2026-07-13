@@ -1,4 +1,4 @@
-use jstd::Identifier;
+use jstd::{Identifier, stable_arena::StableArena};
 use rustc_hash::FxHashMap;
 use std::{
     borrow::Cow,
@@ -108,7 +108,7 @@ pub struct FunctionBody<'str> {
 
     /// CFG-edge storage for this function. Keyed by the plain body-local
     /// [`EdgeId`](crate::value::block::EdgeId) (stage 4).
-    pub(crate) edges: Registry<EdgeId, EdgeData>,
+    pub(crate) edges: StableArena<EdgeId, EdgeData>,
 
     /// Addresses of every machine instruction lifted into this function, in
     /// ascending order. Recorded during recursive disassembly and preserved
@@ -160,7 +160,7 @@ pub struct BodyArenaKindStats {
     pub structural_bytes: usize,
 }
 
-/// Aggregate statistics for all four append-only arenas across function bodies.
+/// Aggregate statistics for all four arenas across function bodies.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct BodyArenaStats {
     pub instructions: BodyArenaKindStats,
@@ -182,6 +182,18 @@ impl BodyArenaKindStats {
             dead: issued - live,
             capacity,
             structural_bytes: capacity.saturating_mul(std::mem::size_of::<T>()),
+        }
+    }
+
+    fn stable_arena<Id: jstd::registry::Identifier, T>(arena: &StableArena<Id, T>) -> Self {
+        let issued = arena.issued_len();
+        let live = arena.len();
+        Self {
+            issued,
+            live,
+            dead: issued - live,
+            capacity: arena.capacity(),
+            structural_bytes: arena.structural_bytes(),
         }
     }
 
@@ -224,7 +236,7 @@ impl<'str> FunctionInterface<'str> {
 }
 
 impl<'str> FunctionBody<'str> {
-    /// Reports the current append-only arena footprint and logical liveness.
+    /// Reports the current arena footprint and logical liveness.
     pub fn arena_stats(&self) -> BodyArenaStats {
         let live_instructions = self.insns.iter().filter(|insn| !insn.deleted).count();
         let live_blocks = self.blocks.iter().filter(|block| !block.deleted).count();
@@ -233,13 +245,6 @@ impl<'str> FunctionBody<'str> {
             .iter()
             .filter(|param| param.parent_id().is_some())
             .count();
-
-        // Removed edges retain payloads but are unlinked from block adjacency.
-        // Count the union because each ordinary edge is incident to two blocks.
-        let mut live_edges = rustc_hash::FxHashSet::default();
-        for block in self.blocks.iter().filter(|block| !block.deleted) {
-            live_edges.extend(block.edges.iter().copied());
-        }
 
         BodyArenaStats {
             instructions: BodyArenaKindStats::registry::<Instruction<'str>>(
@@ -254,7 +259,7 @@ impl<'str> FunctionBody<'str> {
                 self.params.len(),
                 live_params,
             ),
-            edges: BodyArenaKindStats::registry::<EdgeData>(self.edges.len(), live_edges.len()),
+            edges: BodyArenaKindStats::stable_arena(&self.edges),
         }
     }
 
@@ -322,7 +327,7 @@ impl<'str> FunctionBody<'str> {
             blocks: Registry::default(),
             roster: Vec::new(),
             params: Registry::default(),
-            edges: Registry::default(),
+            edges: StableArena::default(),
             instruction_addrs: BTreeSet::new(),
             names: crate::context::NameTable::default(),
             users: FxHashMap::default(),
@@ -542,12 +547,13 @@ impl<'str> FunctionBody<'str> {
         edge_id
     }
 
-    /// Remove CFG edge `edge_id`, unlinking it from both incident blocks. The
-    /// backing `EdgeData` slot is left dangling.
+    /// Remove CFG edge `edge_id`, unlinking it from both incident blocks and
+    /// physically dropping its payload.
     pub fn remove_cfg_edge(&mut self, edge_id: EdgeId) {
         let EdgeData { from, to } = *self.edge(edge_id);
         self.block_mut(from).edges.remove(&edge_id);
         self.block_mut(to).edges.remove(&edge_id);
+        self.edges.remove(edge_id);
     }
 
     /// Replace every use of `old` with `new` across this body's instructions and
@@ -598,7 +604,7 @@ impl<'str> FunctionBody<'str> {
                 .instructions
                 .retain(|&local| local != id.localize(block_id.func));
             if is_terminator {
-                let succ: Vec<EdgeId> = {
+                let mut succ: Vec<EdgeId> = {
                     let block = self.block(block_id);
                     block
                         .edges
@@ -607,6 +613,7 @@ impl<'str> FunctionBody<'str> {
                         .filter(|&e| self.edge(e).from == block_id)
                         .collect()
                 };
+                succ.sort_unstable();
                 for edge_id in succ {
                     self.remove_cfg_edge(edge_id);
                 }
@@ -631,8 +638,7 @@ impl<'str> FunctionBody<'str> {
     /// Rehome `remove`'s outgoing CFG edges onto `keep` and drop the direct edge
     /// between them. The caller tombstones `remove`.
     pub fn merge_nodes(&mut self, keep: BlockId, remove: BlockId, direct_edge: EdgeId) {
-        self.block_mut(keep).edges.remove(&direct_edge);
-        self.block_mut(remove).edges.remove(&direct_edge);
+        self.remove_cfg_edge(direct_edge);
         let outgoing: Vec<EdgeId> = {
             let block = self.block(remove);
             block
@@ -698,7 +704,8 @@ impl<'str> FunctionBody<'str> {
     /// instructions, detach its params, and tombstone it.
     pub fn delete_block(&mut self, block: BlockId) {
         assert_eq!(block.func, self.id, "block belongs to another function");
-        let edges: Vec<EdgeId> = self.block(block).edges.iter().copied().collect();
+        let mut edges: Vec<EdgeId> = self.block(block).edges.iter().copied().collect();
+        edges.sort_unstable();
         for edge in edges {
             self.remove_cfg_edge(edge);
         }
@@ -1369,9 +1376,8 @@ where
             .collect()
     }
 
-    /// The composite ids of every CFG edge in this function's edge arena.
-    /// Includes dangling edges (removal leaves the `EdgeData` slot in place),
-    /// matching the previous whole-context `Graph::edges` behavior.
+    /// The IDs of every live CFG edge in this function's edge arena, in dense
+    /// physical order.
     pub fn edge_ids(&'s self) -> Vec<crate::value::block::EdgeId> {
         self.inner().edges.iter().map(|e| e.id).collect()
     }

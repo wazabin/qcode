@@ -412,12 +412,14 @@ fn try_bypass_empty_block_generic<'str>(
 
         // Rehome the `p -> b` edges to `p -> target`, preserving multiplicity
         // (a CBranch with both arms on B contributes two edges).
-        let redirect: Vec<_> = host
+        let mut redirect: Vec<_> = host
             .block_ref(p)
             .successors()
             .filter(|&(_, to)| to == b_id)
             .map(|(e, _)| e)
             .collect();
+        redirect.sort_unstable();
+        redirect.dedup();
         host.replace_instruction_mnemonic(p_term, new_mnemonic);
         for &edge in &redirect {
             host.remove_cfg_edge(p.func, edge);
@@ -816,13 +818,15 @@ fn try_bypass_empty_block_concrete<'a, 'str>(
 
         // Rehome the `p -> b` edges to `p -> target`, preserving multiplicity
         // (a CBranch with both arms on B contributes two edges).
-        let redirect: Vec<_> = cx
+        let mut redirect: Vec<_> = cx
             .read_host(body)
             .block_ref(p)
             .successors()
             .filter(|&(_, to)| to == b_id)
             .map(|(e, _)| e)
             .collect();
+        redirect.sort_unstable();
+        redirect.dedup();
         body.replace_instruction_mnemonic(p_term, new_mnemonic);
         for &edge in &redirect {
             body.remove_cfg_edge(edge);
