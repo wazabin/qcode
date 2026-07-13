@@ -60,6 +60,10 @@ pub enum DiscoveryKind {
 pub struct DiscoveryKey {
     pub target: Address,
     pub kind: DiscoveryKind,
+    /// Source block for edge-bearing discoveries. Two transfers to the same
+    /// target are distinct work items because the lifter must attach both
+    /// source edges after the target exists.
+    pub source_block: Option<Address>,
 }
 
 /// Why this discovery exists. Kept as debugging/UI metadata that records how a
@@ -137,6 +141,7 @@ impl Discovery {
         DiscoveryKey {
             target: self.target,
             kind: self.kind.clone(),
+            source_block: self.source_block,
         }
     }
 
@@ -340,11 +345,13 @@ mod tests {
         let mut q = DiscoveryQueue::default();
         assert!(q.insert(Discovery::block(0x1000, 0x900)));
         assert!(!q.insert(Discovery::block(0x1000, 0x900)));
+        assert!(q.insert(Discovery::block(0x1000, 0x900).from_block_addr(0x910)));
+        assert!(q.insert(Discovery::block(0x1000, 0x900).from_block_addr(0x920)));
         assert!(q.insert(Discovery::block(0x1000, 0xa00)));
         assert!(q.insert(Discovery::function(0x1000)));
 
         let all: Vec<_> = q.iter().collect();
-        assert_eq!(all.len(), 3);
+        assert_eq!(all.len(), 5);
     }
 
     #[test]
@@ -357,6 +364,21 @@ mod tests {
         q.mark_failed(key, "decode");
         assert!(!q.insert(d));
         assert!(q.is_empty());
+    }
+
+    #[test]
+    fn terminal_target_from_one_source_does_not_suppress_another_source() {
+        let mut q = DiscoveryQueue::default();
+        let first = Discovery::block(0x1000, 0x900).from_block_addr(0x910);
+        let second = Discovery::block(0x1000, 0x900).from_block_addr(0x920);
+        let first_key = first.key();
+
+        assert!(q.insert(first));
+        q.drain();
+        q.mark_lifted(first_key);
+
+        assert!(q.insert(second));
+        assert_eq!(q.pending_len(), 1);
     }
 
     #[test]

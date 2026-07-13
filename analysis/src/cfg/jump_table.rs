@@ -25,7 +25,7 @@
 //! addresses "close to" one another to recover the size heuristically.
 
 use qcode::{
-    address_index::AddressIndex,
+    address_index::{AddressIndex, AddressTarget},
     assumption::Proposition,
     builder::Builder,
     context::Context,
@@ -196,10 +196,11 @@ impl HandleJumpTables {
             return Ok(false);
         }
 
-        // The single- and two-target paths below rewrite the terminator itself,
-        // so they always change the IR (and cannot re-trigger: the block no
-        // longer ends in `BranchInd`).
-        let mut changed = !single_branches.is_empty() || !branches.is_empty();
+        // Discoveries are the handoff to the lifter. A target that has not been
+        // lifted yet must not be represented by an empty placeholder block in
+        // this analysis snapshot; leave the indirect terminator intact until a
+        // later round can resolve every target to complete IR.
+        let mut changed = false;
 
         // A table with more than two cases stays an indirect `switch`: we keep
         // the `BranchInd` but connect a real edge to every case body. Because the
@@ -214,11 +215,28 @@ impl HandleJumpTables {
             by_from.entry(e.from).or_default().push(e);
         }
         for (from, edits) in by_from {
+            let from_addr = BasicBlock::from_id(ctx, from).address();
+            for edit in &edits {
+                discover(ctx, fn_entry, from_addr, edit.target);
+            }
+            let Some(resolved): Option<Vec<LocalTarget>> = edits
+                .iter()
+                .map(|edit| classify_existing_target(ctx, addresses, edit.target, fun_id))
+                .collect()
+            else {
+                continue;
+            };
             let mut existing: Vec<Option<u64>> = BasicBlock::from_id(ctx, from)
                 .successors()
                 .map(|(_, succ)| BasicBlock::from_id(ctx, succ).address())
                 .collect();
-            let mut desired: Vec<Option<u64>> = edits.iter().map(|e| Some(e.target)).collect();
+            let mut desired: Vec<Option<u64>> = resolved
+                .iter()
+                .filter_map(|target| match target {
+                    LocalTarget::Local(block) => Some(BasicBlock::from_id(ctx, *block).address()),
+                    LocalTarget::Foreign(_) => None,
+                })
+                .collect();
             existing.sort_unstable();
             desired.sort_unstable();
             if existing == desired {
@@ -229,17 +247,15 @@ impl HandleJumpTables {
             // Clear the block's existing edges first so a re-resolution does not
             // double them.
             clear_successors(ctx, from);
-            let from_addr = BasicBlock::from_id(ctx, from).address();
-            for Edit { target, .. } in edits {
+            for target in resolved {
                 // A cross-function switch target carries no intra-function edge
-                // (strict IR locality); a mid-function landing is split off inside
-                // `resolve_local_target`. The `BranchInd` keeps its indirect form and
-                // the resolution is recorded for disassembly via `discover`.
-                if let LocalTarget::Local(tb) = resolve_local_target(ctx, addresses, target, fun_id)
-                {
+                // (strict IR locality). Foreign mid-function landings remain
+                // discoveries until the clean lifter canonicalizes ownership.
+                // The `BranchInd` keeps its indirect form and the discovery records
+                // the reaching source for the lifter.
+                if let LocalTarget::Local(tb) = target {
                     ctx.add_cfg_edge(from, tb);
                 }
-                discover(ctx, fn_entry, from_addr, target);
             }
         }
 
@@ -247,7 +263,10 @@ impl HandleJumpTables {
         // unconditional jump. Replace `BranchInd` with a direct `Branch`.
         for MakeBranch { from, target } in single_branches {
             let from_addr = BasicBlock::from_id(ctx, from).address();
-            let resolved = resolve_local_target(ctx, addresses, target, fun_id);
+            discover(ctx, fn_entry, from_addr, target);
+            let Some(resolved) = classify_existing_target(ctx, addresses, target, fun_id) else {
+                continue;
+            };
             clear_successors(ctx, from);
             let mut block = BasicBlock::from_id_mut(ctx, from);
             block.pop_insn();
@@ -262,7 +281,7 @@ impl HandleJumpTables {
                     }
                 }
             }
-            discover(ctx, fn_entry, from_addr, target);
+            changed = true;
         }
 
         for MakeCBranch {
@@ -274,15 +293,19 @@ impl HandleJumpTables {
         } in branches
         {
             let from_addr = BasicBlock::from_id(ctx, from).address();
+            discover(ctx, fn_entry, from_addr, true_target);
+            discover(ctx, fn_entry, from_addr, false_target);
+            let (Some(true_target_resolved), Some(false_target_resolved)) = (
+                classify_existing_target(ctx, addresses, true_target, fun_id),
+                classify_existing_target(ctx, addresses, false_target, fun_id),
+            ) else {
+                continue;
+            };
             // Each arm is materialized as an intra-function block: the resolved
             // target, or a trampoline tail-calling a foreign function (strict IR
             // locality — a `CBranch` arm is never a foreign block reference).
-            let true_target_resolved = resolve_local_target(ctx, addresses, true_target, fun_id);
-            let false_target_resolved = resolve_local_target(ctx, addresses, false_target, fun_id);
             let true_block = arm_block(ctx, fun_id, true_target_resolved);
             let false_block = arm_block(ctx, fun_id, false_target_resolved);
-            discover(ctx, fn_entry, from_addr, true_target);
-            discover(ctx, fn_entry, from_addr, false_target);
 
             clear_successors(ctx, from);
             let mut block = BasicBlock::from_id_mut(ctx, from);
@@ -294,6 +317,7 @@ impl HandleJumpTables {
             // `index != false_value` selects the true target, else the false one.
             let cond = builder.push_ne(index, false_value).id();
             builder.push_cbranch(cond, true_block, false_block);
+            changed = true;
         }
 
         if changed {
@@ -303,38 +327,37 @@ impl HandleJumpTables {
     }
 }
 
-/// The strict-local resolution of a jump-table target address (context-split
-/// ruling 2): either an intra-function block to wire an edge/branch to, or a
-/// foreign function the transfer tail-calls into. A target landing mid-another-
-/// function is split into its own function first ([`Context::split_function_at`]);
-/// a target that is (or becomes) another function's entry is foreign. No
-/// cross-function CFG edge is ever created.
+/// Read-only classification of an already-lifted jump-table target. Missing or
+/// incomplete targets, and blocks landing in the middle of another function,
+/// remain discoveries for the clean lifter to materialize/canonicalize. Analysis
+/// never creates placeholder blocks or changes global ownership.
+#[derive(Clone, Copy)]
 enum LocalTarget {
     Local(BlockId),
     Foreign(FunctionId),
 }
 
-fn resolve_local_target(
-    ctx: &mut Context,
-    addresses: &mut AddressIndex,
+fn classify_existing_target(
+    ctx: &Context,
+    addresses: &AddressIndex,
     addr: u64,
     fun_id: FunctionId,
-) -> LocalTarget {
-    let tb = ctx.get_or_make_block_indexed(addresses, addr, fun_id);
-    match BasicBlock::from_id(ctx, tb).parent().map(|f| f.id) {
-        Some(owner) if owner != fun_id => {
-            let is_entry = addresses.function_at(addr) == Some(owner)
-                && FunctionBody::from_id(ctx, owner).root().map(|root| root.id) == Some(tb);
-            let g = if is_entry {
-                owner
-            } else {
-                ctx.split_function_at_indexed(addresses, tb)
-            };
-            LocalTarget::Foreign(g)
+) -> Option<LocalTarget> {
+    match addresses.get(addr)? {
+        AddressTarget::Function(function) if function != fun_id => {
+            Some(LocalTarget::Foreign(function))
         }
-        _ => {
-            FunctionBody::from_id_mut(ctx, fun_id).add_block(tb);
-            LocalTarget::Local(tb)
+        AddressTarget::Function(function) => FunctionBody::from_id(ctx, function)
+            .root()
+            .filter(|root| !root.is_empty())
+            .map(|root| LocalTarget::Local(root.id)),
+        AddressTarget::Block(block) => {
+            let block = BasicBlock::from_id(ctx, block);
+            if block.is_empty() || block.parent().map(|parent| parent.id) != Some(fun_id) {
+                None
+            } else {
+                Some(LocalTarget::Local(block.id))
+            }
         }
     }
 }
@@ -756,6 +779,16 @@ mod tests {
             .add_segment(start, bytes, false, false);
     }
 
+    /// Materialize already-lifted local targets. Jump-table resolution may only
+    /// rewrite the CFG once every target has a non-empty body.
+    fn add_local_targets(ctx: &mut Context, function: FunctionId, targets: &[u64]) {
+        for &target in targets {
+            let block = BasicBlock::make(ctx, function).with_address(target).id;
+            let return_ptr = ctx.get_const(0, 8).id();
+            Builder::from_block(BasicBlock::from_id_mut(ctx, block)).push_return(return_ptr);
+        }
+    }
+
     /// An absolute table: each 8-byte slot holds the target address directly.
     #[test]
     fn resolves_absolute_table() {
@@ -788,6 +821,7 @@ mod tests {
             table.extend_from_slice(&t.to_le_bytes());
         }
         add_rodata(&mut ctx, 0x2000, table);
+        add_local_targets(&mut ctx, fun, &targets);
 
         let changed = HandleJumpTables::resolve_function(&mut ctx, fun).unwrap();
         assert!(changed);
@@ -839,6 +873,7 @@ mod tests {
 
         add_code(&mut ctx, 0x1000, 0x1000);
         add_rodata(&mut ctx, 0x2000, 0x1100u64.to_le_bytes().to_vec());
+        add_local_targets(&mut ctx, fun, &[0x1100]);
 
         let changed = HandleJumpTables::resolve_function(&mut ctx, fun).unwrap();
         assert!(changed);
@@ -892,6 +927,7 @@ mod tests {
             table.extend_from_slice(&off.to_le_bytes());
         }
         add_rodata(&mut ctx, 0x5000, table);
+        add_local_targets(&mut ctx, fun, &[0x3100, 0x3200, 0x3300]);
 
         let changed = HandleJumpTables::resolve_function(&mut ctx, fun).unwrap();
         assert!(changed);
@@ -927,6 +963,58 @@ mod tests {
         let changed = HandleJumpTables::resolve_function(&mut ctx, fun).unwrap();
         assert!(!changed);
         assert_eq!(successor_count(&ctx, disp), 0);
+    }
+
+    #[test]
+    fn missing_target_is_discovered_without_mutating_ir() {
+        let mut ctx = Context::new();
+
+        qcode!(
+            ctx,
+            "
+            varnode i64 A;
+            fn fun:
+            <entry>
+                %idx = load(A:8, &A);
+                %c = %idx < 0x1;
+                if %c goto <disp> else goto <oob>;
+            <disp>
+                %off = %idx * 0x8;
+                %addr = i64 0x2000 + %off;
+                %t = load(ram:8, %addr);
+                goto [%t];
+            <oob>
+                goto <0x9000>;
+            "
+        );
+
+        BasicBlock::from_id_mut(&mut ctx, entry)
+            .set_address(0x1000)
+            .unwrap();
+        FunctionBody::from_id_mut(&mut ctx, fun)
+            .set_root(entry)
+            .unwrap();
+        BasicBlock::from_id_mut(&mut ctx, disp)
+            .set_address(0x1010)
+            .unwrap();
+
+        add_code(&mut ctx, 0x1000, 0x1000);
+        add_rodata(&mut ctx, 0x2000, 0x1100u64.to_le_bytes().to_vec());
+        let blocks_before = ctx.blocks().count();
+
+        let changed = HandleJumpTables::resolve_function(&mut ctx, fun).unwrap();
+
+        assert!(!changed);
+        assert!(matches!(terminator(&ctx, disp), Mnemonic::BranchInd(_)));
+        assert_eq!(successor_count(&ctx, disp), 0);
+        assert_eq!(ctx.blocks().count(), blocks_before);
+        assert_eq!(AddressIndex::analyze(&ctx).get(0x1100), None);
+
+        let discoveries = ctx.discoveries().collect::<Vec<_>>();
+        assert_eq!(discoveries.len(), 1);
+        assert_eq!(discoveries[0].target, 0x1100);
+        assert_eq!(discoveries[0].source_function, Some(0x1000));
+        assert_eq!(discoveries[0].source_block, Some(0x1010));
     }
 
     /// The mnemonic of the last instruction in `block`.
@@ -965,6 +1053,7 @@ mod tests {
 
         add_code(&mut ctx, 0x1000, 0x1000);
         add_rodata(&mut ctx, 0x2000, 0x1100u64.to_le_bytes().to_vec());
+        add_local_targets(&mut ctx, fun, &[0x1100]);
 
         let changed = HandleJumpTables::resolve_function(&mut ctx, fun).unwrap();
         assert!(changed);
@@ -1010,6 +1099,7 @@ mod tests {
             table.extend_from_slice(&t.to_le_bytes());
         }
         add_rodata(&mut ctx, 0x2000, table);
+        add_local_targets(&mut ctx, fun, &targets);
 
         let changed = HandleJumpTables::resolve_function(&mut ctx, fun).unwrap();
         assert!(changed);
@@ -1058,6 +1148,7 @@ mod tests {
             table.extend_from_slice(&t.to_le_bytes());
         }
         add_rodata(&mut ctx, 0x2000, table);
+        add_local_targets(&mut ctx, fun, &targets);
 
         let changed = HandleJumpTables::resolve_function(&mut ctx, fun).unwrap();
         assert!(changed);
@@ -1108,9 +1199,10 @@ mod tests {
         // Pre-connect the dispatch block to its targets, mimicking the edges the
         // lifter materializes in the clean IR before this pass re-runs. The targets
         // live in the dispatch's own function (strict IR locality).
-        let mut addresses = AddressIndex::analyze(&ctx);
+        add_local_targets(&mut ctx, fun, &targets);
+        let addresses = AddressIndex::analyze(&ctx);
         for t in targets {
-            let tb = ctx.get_or_make_block_indexed(&mut addresses, t, fun);
+            let tb = addresses.block_at(t).expect("materialized target");
             ctx.add_cfg_edge(disp, tb);
         }
         assert_eq!(successor_count(&ctx, disp), 2);
@@ -1156,6 +1248,7 @@ mod tests {
         table[5 * 8..6 * 8].copy_from_slice(&0x1100u64.to_le_bytes());
         table[6 * 8..7 * 8].copy_from_slice(&0x1200u64.to_le_bytes());
         add_rodata(&mut ctx, 0x2000, table);
+        add_local_targets(&mut ctx, fun, &[0x1100, 0x1200]);
 
         let changed = HandleJumpTables::resolve_function(&mut ctx, fun).unwrap();
         assert!(changed);
