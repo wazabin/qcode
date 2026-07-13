@@ -890,7 +890,10 @@ impl<'str> Mem2Reg<'_, '_, 'str> {
         let param_id = self
             .body
             .push_block_param(self.cx, BlockParam::new(index, type_id, block_id));
-        self.body.block_mut(block_id).params.push(param_id);
+        self.body
+            .block_mut(block_id)
+            .params
+            .push(param_id.localize(block_id.func));
         self.body.block_param_mut(param_id).set_origin_id(var);
         // Carry a global varnode type override (e.g. the `FS_OFFSET` segment base
         // typed `PtrTo<TEB>` by `windows_teb_seed`) onto the promoted param, so the
@@ -1424,7 +1427,7 @@ impl<'str> Mem2Reg<'_, '_, 'str> {
         // silently discarding the value the wider store carried.
         let mut unpromoted_register_loads: Vec<ValueId> = Vec::new();
         for &block_id in &block_ids {
-            for &insn_id in self.read().block_ref(block_id).instruction_ids() {
+            for insn_id in self.read().block_ref(block_id).instruction_ids() {
                 if let Mnemonic::Load(Load { ptr, .. }) = self.read().insn_ref(insn_id).mnemonic() {
                     let ptr = ptr.qualify(insn_id.func);
                     if vars.contains(&ptr) {

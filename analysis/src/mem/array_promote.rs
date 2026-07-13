@@ -570,7 +570,7 @@ fn apply_generic<'str>(host: &mut PassBacking<'_, 'str>, m: &PromoteMatch) -> bo
             bid.func,
             qcode::value::block_param::BlockParam::new(index, arr_ty, bid),
         );
-        host.block_mut(bid).params.push(pid);
+        host.block_mut(bid).params.push(pid.localize(bid.func));
         ValueId::BlockParam(pid)
     };
     let arr_h = new_param(host, m.header);

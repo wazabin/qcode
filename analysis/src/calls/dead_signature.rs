@@ -36,7 +36,7 @@ use qcode::{
     context::Context,
     types::AggregateField,
     value::{
-        Function, FunctionId, Instruction, ValueId,
+        BlockParamId, Function, FunctionId, Instruction, ValueId,
         insn::{Extract, InstructionId, Mnemonic, Return, Tuple},
     },
 };
@@ -170,7 +170,10 @@ fn trim_dead_args(
     let dead: Vec<usize> = params
         .iter()
         .enumerate()
-        .filter(|(_, p)| ctx.users(**p).is_empty() && !ctx.block_param(**p).protected)
+        .filter(|(_, p)| {
+            let p = BlockParamId::new(root.func, **p);
+            ctx.users(p).is_empty() && !ctx.block_param(p).protected
+        })
         .map(|(i, _)| i)
         .collect();
     if dead.is_empty() {
@@ -228,7 +231,7 @@ fn trim_dead_return_fields(
     let mut live = vec![false; n];
     for &call_id in &call_sites {
         let result = ValueId::Instruction(call_id);
-        for &u in ctx.users(result) {
+        for u in ctx.users(result) {
             match ctx.get_insn(u).mnemonic() {
                 Mnemonic::Extract(e) if e.agg.qualify(u.func) == result => {
                     if let Some(slot) = live.get_mut(e.index) {

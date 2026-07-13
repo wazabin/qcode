@@ -1,7 +1,7 @@
 use qcode::context::Context;
 use qcode::value::{
     BlockId, BlockParamId, FunctionId, LocalValueId, ValueId,
-    insn::{Branch, Mnemonic},
+    insn::{Branch, InstructionId, Mnemonic},
 };
 
 use crate::{ContextView, FunctionBody, FunctionPass, Outcome};
@@ -261,6 +261,10 @@ fn try_bypass_empty_block_generic<'str>(
     function_id: FunctionId,
     b_id: BlockId,
 ) -> bool {
+    if b_id.func != function_id {
+        return false;
+    }
+
     // The entry block dominates everything; deleting it would orphan the body.
     if host.function(function_id).root_id() == Some(b_id) {
         return false;
@@ -272,7 +276,7 @@ fn try_bypass_empty_block_generic<'str>(
         if b.instruction_ids().len() != 1 {
             return false;
         }
-        let term_id = b.instruction_ids()[0];
+        let term_id = InstructionId::new(b_id.func, b.instruction_ids()[0]);
         match host.function(function_id).insn(term_id).mnemonic() {
             Mnemonic::Branch(br) => (term_id, br.target, br.args.clone()),
             _ => return false,
@@ -281,20 +285,25 @@ fn try_bypass_empty_block_generic<'str>(
     // `target` is a body-local index in this function's arena (strict IR
     // locality); a cross-function forward is a `TailCall`, never a `Branch`, so
     // the old `target.func != function_id` guard is now tautological and dropped.
-    let target_full = BlockId::new(function_id, target);
+    let target_full = BlockId::new(b_id.func, target);
     if target_full == b_id {
         return false; // bypassing `goto self` is meaningless and unsound
     }
 
-    let params: Vec<BlockParamId> = host.function(function_id).block(b_id).param_ids().to_vec();
+    let params: Vec<BlockParamId> = host
+        .function(function_id)
+        .block(b_id)
+        .param_ids()
+        .iter()
+        .map(|&p| BlockParamId::new(b_id.func, p))
+        .collect();
 
     // B's params must flow nowhere but B's own terminator. In valid SSA a block
     // param is only visible inside dominated blocks via forwarded args, so this
     // normally holds; bail if it doesn't rather than risk a dangling use.
     for &p in &params {
         if host
-            .function(function_id)
-            .users_of(ValueId::BlockParam(p))
+            .users(ValueId::BlockParam(p))
             .iter()
             .any(|&u| u != term_id)
         {
@@ -321,7 +330,10 @@ fn try_bypass_empty_block_generic<'str>(
 
     // Intra-function only: a predecessor in another function (a tail-call into B)
     // cannot be rewritten by a checked-out pass. Leave such blocks untouched.
-    if preds.iter().any(|p| p.func != function_id) {
+    if preds
+        .iter()
+        .any(|p| p.func != b_id.func || target_full.func != p.func)
+    {
         return false;
     }
 
@@ -330,7 +342,7 @@ fn try_bypass_empty_block_generic<'str>(
     // each arm that targets B.
     for &p in &preds {
         let Some(p_term) = host
-            .function(function_id)
+            .function(p.func)
             .block(p)
             .instruction_ids()
             .last()
@@ -338,21 +350,22 @@ fn try_bypass_empty_block_generic<'str>(
         else {
             return false;
         };
-        match host.function(function_id).insn(p_term).mnemonic() {
+        let p_term = InstructionId::new(p.func, p_term);
+        match host.function(p.func).insn(p_term).mnemonic() {
             Mnemonic::Branch(br) => {
-                if BlockId::new(function_id, br.target) != b_id || br.args.len() != params.len() {
+                if BlockId::new(p.func, br.target) != b_id || br.args.len() != params.len() {
                     return false;
                 }
             }
             Mnemonic::CBranch(cb) => {
                 let mut names_b = false;
-                if BlockId::new(function_id, cb.success_block) == b_id {
+                if BlockId::new(p.func, cb.success_block) == b_id {
                     if cb.success_args.len() != params.len() {
                         return false;
                     }
                     names_b = true;
                 }
-                if BlockId::new(function_id, cb.failure_block) == b_id {
+                if BlockId::new(p.func, cb.failure_block) == b_id {
                     if cb.failure_args.len() != params.len() {
                         return false;
                     }
@@ -370,23 +383,24 @@ fn try_bypass_empty_block_generic<'str>(
     // params with the arguments that predecessor supplied.
     for &p in &preds {
         let p_term = host
-            .function(function_id)
+            .function(p.func)
             .block(p)
             .instruction_ids()
             .last()
             .copied()
             .unwrap();
-        let new_mnemonic = match host.function(function_id).insn(p_term).mnemonic().clone() {
+        let p_term = InstructionId::new(p.func, p_term);
+        let new_mnemonic = match host.function(p.func).insn(p_term).mnemonic().clone() {
             Mnemonic::Branch(br) => Mnemonic::Branch(Branch {
                 target,
                 args: substitute(&b_args, &params, &br.args),
             }),
             Mnemonic::CBranch(mut cb) => {
-                if BlockId::new(function_id, cb.success_block) == b_id {
+                if BlockId::new(p.func, cb.success_block) == b_id {
                     cb.success_args = substitute(&b_args, &params, &cb.success_args);
                     cb.success_block = target;
                 }
-                if BlockId::new(function_id, cb.failure_block) == b_id {
+                if BlockId::new(p.func, cb.failure_block) == b_id {
                     cb.failure_args = substitute(&b_args, &params, &cb.failure_args);
                     cb.failure_block = target;
                 }
@@ -619,6 +633,10 @@ fn try_bypass_empty_block_concrete<'a, 'str>(
     function_id: FunctionId,
     b_id: BlockId,
 ) -> bool {
+    if b_id.func != function_id {
+        return false;
+    }
+
     // The entry block dominates everything; deleting it would orphan the body.
     if body
         .read_host(cx)
@@ -636,7 +654,7 @@ fn try_bypass_empty_block_concrete<'a, 'str>(
         if b.instruction_ids().len() != 1 {
             return false;
         }
-        let term_id = b.instruction_ids()[0];
+        let term_id = InstructionId::new(b_id.func, b.instruction_ids()[0]);
         match body.insn(cx, term_id).mnemonic() {
             Mnemonic::Branch(br) => (term_id, br.target, br.args.clone()),
             _ => return false,
@@ -645,18 +663,26 @@ fn try_bypass_empty_block_concrete<'a, 'str>(
     // `target` is a body-local index in this function's arena (strict IR
     // locality); a cross-function forward is a `TailCall`, never a `Branch`, so
     // the old `target.func != function_id` guard is now tautological and dropped.
-    let target_full = BlockId::new(function_id, target);
+    let target_full = BlockId::new(b_id.func, target);
     if target_full == b_id {
         return false; // bypassing `goto self` is meaningless and unsound
     }
 
-    let params: Vec<BlockParamId> = body.read_host(cx).block(b_id).param_ids().to_vec();
+    let params: Vec<BlockParamId> = body
+        .read_host(cx)
+        .block(b_id)
+        .param_ids()
+        .iter()
+        .map(|&p| BlockParamId::new(b_id.func, p))
+        .collect();
 
     // B's params must flow nowhere but B's own terminator. In valid SSA a block
     // param is only visible inside dominated blocks via forwarded args, so this
     // normally holds; bail if it doesn't rather than risk a dangling use.
     for &p in &params {
         if body
+            .read_host(cx)
+            .function_ref(b_id.func)
             .users_of(ValueId::BlockParam(p))
             .iter()
             .any(|&u| u != term_id)
@@ -684,7 +710,10 @@ fn try_bypass_empty_block_concrete<'a, 'str>(
 
     // Intra-function only: a predecessor in another function (a tail-call into B)
     // cannot be rewritten by a checked-out pass. Leave such blocks untouched.
-    if preds.iter().any(|p| p.func != function_id) {
+    if preds
+        .iter()
+        .any(|p| p.func != b_id.func || target_full.func != p.func)
+    {
         return false;
     }
 
@@ -701,21 +730,22 @@ fn try_bypass_empty_block_concrete<'a, 'str>(
         else {
             return false;
         };
+        let p_term = InstructionId::new(p.func, p_term);
         match body.insn(cx, p_term).mnemonic() {
             Mnemonic::Branch(br) => {
-                if BlockId::new(function_id, br.target) != b_id || br.args.len() != params.len() {
+                if BlockId::new(p.func, br.target) != b_id || br.args.len() != params.len() {
                     return false;
                 }
             }
             Mnemonic::CBranch(cb) => {
                 let mut names_b = false;
-                if BlockId::new(function_id, cb.success_block) == b_id {
+                if BlockId::new(p.func, cb.success_block) == b_id {
                     if cb.success_args.len() != params.len() {
                         return false;
                     }
                     names_b = true;
                 }
-                if BlockId::new(function_id, cb.failure_block) == b_id {
+                if BlockId::new(p.func, cb.failure_block) == b_id {
                     if cb.failure_args.len() != params.len() {
                         return false;
                     }
@@ -739,17 +769,18 @@ fn try_bypass_empty_block_concrete<'a, 'str>(
             .last()
             .copied()
             .unwrap();
+        let p_term = InstructionId::new(p.func, p_term);
         let new_mnemonic = match body.insn(cx, p_term).mnemonic().clone() {
             Mnemonic::Branch(br) => Mnemonic::Branch(Branch {
                 target,
                 args: substitute(&b_args, &params, &br.args),
             }),
             Mnemonic::CBranch(mut cb) => {
-                if BlockId::new(function_id, cb.success_block) == b_id {
+                if BlockId::new(p.func, cb.success_block) == b_id {
                     cb.success_args = substitute(&b_args, &params, &cb.success_args);
                     cb.success_block = target;
                 }
-                if BlockId::new(function_id, cb.failure_block) == b_id {
+                if BlockId::new(p.func, cb.failure_block) == b_id {
                     cb.failure_args = substitute(&b_args, &params, &cb.failure_args);
                     cb.failure_block = target;
                 }
@@ -811,7 +842,7 @@ mod tests {
         context::Context,
         value::{
             BasicBlock, Function, ValueId,
-            insn::{Binary, Mnemonic},
+            insn::{Binary, InstructionId, Mnemonic},
         },
     };
     use qcode_macro::qcode;
@@ -1120,7 +1151,8 @@ mod tests {
 
         let mut seen = rustc_hash::FxHashSet::default();
         for block_id in ctx.block_ids() {
-            for &insn in ctx.block(block_id).instruction_ids() {
+            for &local in ctx.block(block_id).instruction_ids() {
+                let insn = InstructionId::new(block_id.func, local);
                 assert!(
                     seen.insert(insn),
                     "instruction {insn:?} appears in more than one block after simplify_cfg"

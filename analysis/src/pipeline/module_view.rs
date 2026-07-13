@@ -444,6 +444,12 @@ impl<'body, 'str> FunctionBody<'body, 'str> {
     /// [`Function::replace_all_uses_with`].
     pub fn replace_all_uses_with(&mut self, cx: ContextView<'_, 'str>, old: ValueId, new: ValueId) {
         let _ = cx;
+        if let Some(owner) = old.owning_function() {
+            assert_eq!(
+                owner, self.id,
+                "cannot replace uses of a value owned by another function"
+            );
+        }
         self.fun.replace_all_uses_with(old, new)
     }
 
@@ -575,8 +581,16 @@ impl<'body, 'str> FunctionBody<'body, 'str> {
 
     /// This body's instructions that use `value` as an operand. Mirror of
     /// [`Function::users_of`]; body-local, so it needs no `cx`.
-    pub fn users_of(&self, value: ValueId) -> &[InstructionId] {
-        self.fun.users_of(value)
+    pub fn users_of(&self, value: ValueId) -> Vec<InstructionId> {
+        let func = self.id;
+        if value.owning_function().is_some_and(|owner| owner != func) {
+            return Vec::new();
+        }
+        self.fun
+            .users_of(value)
+            .iter()
+            .map(|&local| InstructionId::new(func, local))
+            .collect()
     }
 
     // ---- wrapper-ref constructors -------------------------------------------
@@ -631,6 +645,64 @@ mod tests {
     use qcode::value::insn::Mnemonic;
     use qcode_macro::qcode;
 
+    fn two_functions_with_users(
+        mut ctx: &mut Context<'static>,
+    ) -> (FunctionId, FunctionId, InstructionId) {
+        qcode!(
+            ctx,
+            "
+            fn body_users_a:
+                <a_entry>
+                    %a_def = i64 1 + i64 2;
+                    %a_user = %a_def + i64 3;
+                    return at %a_user;
+
+            fn body_users_b:
+                <b_entry>
+                    %b_def = i64 1 + i64 2;
+                    %b_user = %b_def + i64 3;
+                    return at %b_user;
+            "
+        );
+        let foreign = ctx
+            .function_ref(body_users_a)
+            .root()
+            .unwrap()
+            .instruction_ids()[0];
+        (body_users_a, body_users_b, foreign)
+    }
+
+    #[test]
+    fn function_body_users_of_rejects_foreign_owned_values() {
+        let mut ctx = Context::new();
+        let (_, own_id, foreign) = two_functions_with_users(&mut ctx);
+        let env = dummy_env();
+        let (bodies, _view) = ctx.split(&env);
+        let mut slots = bodies.select_mut(&[own_id]);
+        let (own, _) = slots.split_first_mut().unwrap();
+        let own = FunctionBody::new(own_id, own, Vec::new());
+
+        assert!(own.users_of(ValueId::Instruction(foreign)).is_empty());
+    }
+
+    #[test]
+    #[should_panic(expected = "cannot replace uses of a value owned by another function")]
+    fn function_body_replace_all_uses_rejects_foreign_old_value() {
+        let mut ctx = Context::new();
+        let (_, own_id, foreign) = two_functions_with_users(&mut ctx);
+        let env = dummy_env();
+        let (bodies, view) = ctx.split(&env);
+        let mut slots = bodies.select_mut(&[own_id]);
+        let (own, _) = slots.split_first_mut().unwrap();
+        let mut own = FunctionBody::new(own_id, own, Vec::new());
+
+        own.replace_all_uses_with(
+            view,
+            ValueId::Instruction(foreign),
+            ValueId::Instruction(foreign),
+        );
+    }
+
     /// The split's borrow story: hold `&mut bodies[fid]` (and mutate through the
     /// inherent `Function` verbs) while simultaneously reading the module through
     /// the bodies-free `ContextView` — interners, interfaces, env. Rust's
@@ -666,7 +738,7 @@ mod tests {
                 }),
                 8,
             );
-            let first = own.block(root).instructions[0];
+            let first = InstructionId::new(root.func, own.block(root).instructions[0]);
             own.insert_insn_before(root, first, insn);
             let _ = rest;
         }

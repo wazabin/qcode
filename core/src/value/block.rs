@@ -3,9 +3,9 @@ use crate::{
     error::Result,
     value::{
         Function, Instruction, LocalValueId, Value, ValueId,
-        block_param::{BlockParam, BlockParamId, BlockParamMutRef, BlockParamRef},
+        block_param::{BlockParam, BlockParamId, BlockParamMutRef, BlockParamRef, LocalParamId},
         function::{FunctionId, FunctionMutRef, FunctionRef},
-        insn::{InstructionId, InstructionRef, Mnemonic},
+        insn::{InstructionId, InstructionRef, LocalInsnId, Mnemonic},
         util::{
             base_ref::{BaseRef, HostRef, WithCtx, WithCtxMut, WithHost},
             host_mut::PassBacking,
@@ -68,10 +68,10 @@ pub struct BasicBlock<'str> {
 
     /// Typed parameters declared at block entry (block-argument style).
     /// These are NOT part of `instructions`; use `params()` to iterate them.
-    pub params: Vec<BlockParamId>,
+    pub params: Vec<LocalParamId>,
 
     /// The ids of the instructions in this block
-    pub instructions: Vec<InstructionId>,
+    pub instructions: Vec<LocalInsnId>,
 
     /// The set of edges that this block is incident to, as bare body-local
     /// [`EdgeId`]s (see [`add_cfg_edge`](crate::context::Context::add_cfg_edge)).
@@ -111,14 +111,14 @@ impl<'str> BasicBlock<'str> {
     /// accessor). Routing target for the raw `.instructions` field reads (stage
     /// 6a §11); the field itself becomes private and localizes behind this
     /// accessor at the storage flip.
-    pub fn instruction_ids(&self) -> &[InstructionId] {
+    pub fn instruction_ids(&self) -> &[LocalInsnId] {
         &self.instructions
     }
 
     /// The ids of this block's parameters, in declaration order (raw
     /// `&BasicBlock` accessor). Routing target for the raw `.params` field reads
     /// (stage 6a §11).
-    pub fn param_ids(&self) -> &[BlockParamId] {
+    pub fn param_ids(&self) -> &[LocalParamId] {
         &self.params
     }
 
@@ -232,8 +232,9 @@ impl<'str> BasicBlock<'str> {
             .expect("name was deduplicated");
 
         // Clone parameters verbatim (parent re-pointed at the new block).
-        for old_param_id in &ctx.block(orig).params.clone() {
-            let old_param = ctx.block_param(*old_param_id).clone();
+        for old_param_local in ctx.block(orig).params.clone() {
+            let old_param_id = BlockParamId::new(orig.func, old_param_local);
+            let old_param = ctx.block_param(old_param_id).clone();
             let new_param_id = ctx.push_block_param(
                 target,
                 BlockParam {
@@ -243,7 +244,7 @@ impl<'str> BasicBlock<'str> {
             );
             BasicBlock::from_id_mut(ctx, new_block_id).push_existing_param(new_param_id);
             value_map.insert(
-                ValueId::BlockParam(*old_param_id),
+                ValueId::BlockParam(old_param_id),
                 ValueId::BlockParam(new_param_id),
             );
         }
@@ -251,7 +252,8 @@ impl<'str> BasicBlock<'str> {
         // Clone instructions verbatim, preserving the exact result type and the
         // machine address. Operands are copied as-is; the caller remaps them.
         let orig_insns = ctx.block(orig).instructions.clone();
-        for &old_insn_id in orig_insns.iter() {
+        for old_insn_local in orig_insns {
+            let old_insn_id = InstructionId::new(orig.func, old_insn_local);
             let (mnemonic, type_id, address) = {
                 let insn = Instruction::from_id(&*ctx, old_insn_id);
                 (insn.mnemonic().clone(), insn.type_id(), insn.address())
@@ -288,8 +290,9 @@ impl<'str> BasicBlock<'str> {
             .expect("name was deduplicated");
 
         // Clone parameters
-        for old_param_id in &ctx.block(orig).params.clone() {
-            let old_param = ctx.block_param(*old_param_id).clone();
+        for old_param_local in ctx.block(orig).params.clone() {
+            let old_param_id = BlockParamId::new(orig.func, old_param_local);
+            let old_param = ctx.block_param(old_param_id).clone();
             let new_param_id = ctx.push_block_param(
                 new_block_id.func,
                 BlockParam {
@@ -300,14 +303,15 @@ impl<'str> BasicBlock<'str> {
 
             BasicBlock::from_id_mut(ctx, new_block_id).push_existing_param(new_param_id);
             value_map.insert(
-                ValueId::BlockParam(*old_param_id),
+                ValueId::BlockParam(old_param_id),
                 ValueId::BlockParam(new_param_id),
             );
         }
 
         // Clone instructions
         let orig_insns = ctx.block(orig).instructions.clone();
-        for &old_insn_id in orig_insns.iter() {
+        for old_insn_local in orig_insns {
+            let old_insn_id = InstructionId::new(orig.func, old_insn_local);
             // Extract information from the old instruciton
             let insn_ref = Instruction::from_id(&*ctx, old_insn_id);
             let size = insn_ref.size();
@@ -407,10 +411,11 @@ where
 
     /// Iterates over this block's parameters in declaration order.
     pub fn params(&'s self) -> impl Iterator<Item = BlockParamRef<'str, 'ctx>> + 's {
+        let func = self.id.func;
         self.inner()
             .params
             .iter()
-            .map(|&id| BlockParamRef::new(self.host(), id))
+            .map(move |&local| BlockParamRef::new(self.host(), BlockParamId::new(func, local)))
     }
 
     /// Returns the number of parameters declared on this block.
@@ -423,6 +428,7 @@ where
         let inner = self.inner();
         InstructionIter {
             host: self.host(),
+            func: self.id.func,
             inner: inner.instructions.iter(),
         }
     }
@@ -433,8 +439,13 @@ where
         self.instructions()
     }
 
-    pub fn instruction_ids(&'s self) -> &'ctx [InstructionId] {
-        &self.inner().instructions
+    pub fn instruction_ids(&'s self) -> Vec<InstructionId> {
+        let func = self.id.func;
+        self.inner()
+            .instructions
+            .iter()
+            .map(|&local| InstructionId::new(func, local))
+            .collect()
     }
 
     /// Does this block have any instructions?
@@ -549,7 +560,8 @@ impl<'str, 'ctx> Value<'str, 'ctx> for BlockRef<'str, 'ctx> {
 
 pub struct InstructionIter<'str, 'ctx> {
     host: HostRef<'ctx, 'str>,
-    inner: slice::Iter<'ctx, InstructionId>,
+    func: FunctionId,
+    inner: slice::Iter<'ctx, LocalInsnId>,
 }
 
 impl<'str, 'ctx> Iterator for InstructionIter<'str, 'ctx> {
@@ -558,7 +570,7 @@ impl<'str, 'ctx> Iterator for InstructionIter<'str, 'ctx> {
     fn next(&mut self) -> Option<Self::Item> {
         self.inner
             .next()
-            .map(|id| InstructionRef::new(self.host, *id))
+            .map(|&local| InstructionRef::new(self.host, InstructionId::new(self.func, local)))
     }
 }
 
@@ -694,7 +706,7 @@ macro_rules! impl_block_mut_verbs {
         self.ctx
             .block_mut(self.id)
             .instructions
-            .insert(index, insn_id);
+            .insert(index, insn_id.localize(self.id.func));
     }
 
     /// Inserts an instruction at the given index, shifting later instructions
@@ -814,13 +826,14 @@ impl<'str, 'ctx> BlockMutRef<'str, 'ctx> {
                 protected: false,
             },
         );
-        self.inner_mut().params.push(id);
+        self.inner_mut().params.push(id.localize(block_id.func));
         BlockParamMutRef::from_id(self.ctx, id)
     }
 
     /// Appends an already-created block parameter to the parameters list
     pub fn push_existing_param(&mut self, id: BlockParamId) {
-        self.inner_mut().params.push(id);
+        let func = self.id.func;
+        self.inner_mut().params.push(id.localize(func));
     }
 
     /// Inserts an instruction after the instruction identified by `after_id` in this block.
@@ -830,7 +843,7 @@ impl<'str, 'ctx> BlockMutRef<'str, 'ctx> {
             .inner()
             .instructions
             .iter()
-            .position(|&id| id == after_id)
+            .position(|&local| InstructionId::new(self.id.func, local) == after_id)
             .expect("after_id not found in block");
         self.insert_insn(index + 1, insn_id);
     }
@@ -838,12 +851,14 @@ impl<'str, 'ctx> BlockMutRef<'str, 'ctx> {
     /// Retains only the instructions for which `f` returns true, deleting the
     /// removed instructions.
     pub fn retain_insns(&mut self, mut f: impl FnMut(&InstructionId) -> bool) {
+        let func = self.id.func;
         let mut removed = Vec::new();
-        self.inner_mut().instructions.retain(|id| {
-            if f(id) {
+        self.inner_mut().instructions.retain(|&local| {
+            let id = InstructionId::new(func, local);
+            if f(&id) {
                 true
             } else {
-                removed.push(*id);
+                removed.push(id);
                 false
             }
         });
@@ -866,14 +881,18 @@ impl<'str, 'ctx> BlockMutRef<'str, 'ctx> {
 
     /// Removes the last instruction from this block.
     pub fn pop_insn(&mut self) {
-        if let Some(last_id) = self.inner().instructions.last() {
-            self.ctx.remove_instruction(*last_id);
+        if let Some(&local) = self.inner().instructions.last() {
+            self.ctx
+                .remove_instruction(InstructionId::new(self.id.func, local));
         }
     }
 
     /// Appends a slice of instruction ids to this block.
     pub fn extend_insns(&mut self, insns: &[InstructionId]) {
-        self.inner_mut().instructions.extend_from_slice(insns);
+        let func = self.id.func;
+        self.inner_mut()
+            .instructions
+            .extend(insns.iter().map(|&id| id.localize(func)));
     }
 
     /// Associates this block with `addr` in the context address map.
@@ -1273,7 +1292,11 @@ mod tests {
         );
 
         assert_eq!(orig.instruction_ids().len(), cloned.instruction_ids().len());
-        for (orig_id, clone_id) in orig.instruction_ids().iter().zip(cloned.instruction_ids()) {
+        for (orig_id, clone_id) in orig
+            .instruction_ids()
+            .into_iter()
+            .zip(cloned.instruction_ids())
+        {
             assert_ne!(
                 orig_id, clone_id,
                 "cloned instruction must have a different id"

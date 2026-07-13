@@ -342,7 +342,7 @@ pub(crate) fn seq_result_type(host: HostRef, src: ValueId, body_ret: TypeId) -> 
 fn push_param_into<'str>(host: &mut PassBacking<'_, 'str>, block: BlockId, ty: TypeId) -> ValueId {
     let index = host.read_host().block(block).params.len();
     let pid = host.push_block_param(block.func, BlockParam::new(index, ty, block));
-    host.block_mut(block).params.push(pid);
+    host.block_mut(block).params.push(pid.localize(block.func));
     ValueId::BlockParam(pid)
 }
 

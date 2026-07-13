@@ -584,7 +584,7 @@ mod tests {
         assert!(gvn_function(&mut ctx, f, None));
 
         // No instruction may carry the wrapped positive constant 0xfffffff8.
-        for &id in BasicBlock::from_id(&ctx, entry).instruction_ids() {
+        for id in BasicBlock::from_id(&ctx, entry).instruction_ids() {
             for arg in ctx.get_insn(id).mnemonic().args() {
                 assert_ne!(
                     lit_value(&ctx, arg.qualify(id.func)),
@@ -596,7 +596,7 @@ mod tests {
 
         // The rebuilt value must be `sub(_, 8)`.
         let mut found_sub_by_8 = false;
-        for &id in BasicBlock::from_id(&ctx, entry).instruction_ids() {
+        for id in BasicBlock::from_id(&ctx, entry).instruction_ids() {
             if let Mnemonic::Binop(Binary {
                 op: Binop::Int(IntBinop::Sub),
                 rhs,

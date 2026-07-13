@@ -20,7 +20,11 @@ use qcode::{
     assumption::{PassName, Proposition},
     context::Context,
     pass_scope,
-    value::{BasicBlock, Function, FunctionId, block::BlockId, insn::Mnemonic},
+    value::{
+        BasicBlock, Function, FunctionId,
+        block::BlockId,
+        insn::{InstructionId, Mnemonic},
+    },
 };
 
 /// Callees that, by convention, do not return. Used to classify external stubs
@@ -73,6 +77,7 @@ pub fn assume_call_returns(ctx: &mut Context) -> usize {
             let Some(&call_site) = ctx.block(call_block).instruction_ids().last() else {
                 continue;
             };
+            let call_site = InstructionId::new(call_block.func, call_site);
             let callee = match ctx.instruction(call_site).mnemonic() {
                 Mnemonic::Call(call) => call.target,
                 _ => continue,
@@ -224,6 +229,7 @@ fn is_noreturn_call_block(ctx: &Context, block: BlockId) -> bool {
     let Some(&last) = ctx.block(block).instruction_ids().last() else {
         return false;
     };
+    let last = InstructionId::new(block.func, last);
     let Mnemonic::Call(call) = ctx.instruction(last).mnemonic() else {
         return false;
     };

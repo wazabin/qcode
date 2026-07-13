@@ -529,7 +529,7 @@ impl RegisterBase {
         let host = host.into();
         let mut pointer_uses: Vec<(ValueId, SpaceId, usize)> = Vec::new();
         for block in host.function_ref(fun_id).blocks() {
-            for &iid in block.instruction_ids() {
+            for iid in block.instruction_ids() {
                 match host.insn_ref(iid).mnemonic() {
                     Mnemonic::Load(load) => {
                         pointer_uses.push((load.ptr.qualify(iid.func), load.space, load.size))

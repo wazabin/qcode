@@ -107,13 +107,17 @@ pub trait BuilderBacking<'str> {
     /// Append `id` to the end of `block`, setting its parent.
     fn bb_block_append_insn(&mut self, block: BlockId, id: InstructionId) {
         self.bb_instruction_mut(id).parent = Some(block.local);
-        self.bb_block_mut(block).instructions.push(id);
+        self.bb_block_mut(block)
+            .instructions
+            .push(id.localize(block.func));
     }
     /// Insert `id` at `index` in `block`, shifting later instructions right, and
     /// set its parent.
     fn bb_block_insert_insn_at(&mut self, block: BlockId, index: usize, id: InstructionId) {
         self.bb_instruction_mut(id).parent = Some(block.local);
-        self.bb_block_mut(block).instructions.insert(index, id);
+        self.bb_block_mut(block)
+            .instructions
+            .insert(index, id.localize(block.func));
     }
 }
 
@@ -2457,9 +2461,7 @@ mod tests {
             b.push_bit_negate(val).id
         };
 
-        let ids: Vec<_> = BasicBlock::from_id(&ctx, block_id)
-            .instruction_ids()
-            .to_vec();
+        let ids = BasicBlock::from_id(&ctx, block_id).instruction_ids();
         assert_eq!(ids, [prepended_id, existing_id]);
     }
 
@@ -2490,9 +2492,7 @@ mod tests {
             )
         };
 
-        let ids: Vec<_> = BasicBlock::from_id(&ctx, block_id)
-            .instruction_ids()
-            .to_vec();
+        let ids = BasicBlock::from_id(&ctx, block_id).instruction_ids();
         assert_eq!(ids, [id0, id1, id2, existing_id]);
     }
 
@@ -2518,9 +2518,7 @@ mod tests {
             (b.push_bit_negate(val).id, b.push_bit_negate(val).id)
         };
 
-        let ids: Vec<_> = BasicBlock::from_id(&ctx, block_id)
-            .instruction_ids()
-            .to_vec();
+        let ids = BasicBlock::from_id(&ctx, block_id).instruction_ids();
         assert_eq!(ids, [first_id, inserted0, inserted1, target_id]);
     }
 
@@ -2563,9 +2561,7 @@ mod tests {
             (first, middle, last)
         };
 
-        let ids: Vec<_> = BasicBlock::from_id(&ctx, block_id)
-            .instruction_ids()
-            .to_vec();
+        let ids = BasicBlock::from_id(&ctx, block_id).instruction_ids();
         assert_eq!(ids, [middle_id, first_id, last_id]);
     }
 }

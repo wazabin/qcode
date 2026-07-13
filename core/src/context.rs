@@ -795,7 +795,8 @@ impl<'str> Context<'str> {
         // remap needs the *old* arena (`old.func`) to qualify them before lookup.
         for (&old, &new) in &block_map {
             let insns = self.block(new).instructions.clone();
-            for insn_id in insns {
+            for insn_local in insns {
+                let insn_id = InstructionId::new(new.func, insn_local);
                 let mut mnemonic = self.instruction(insn_id).mnemonic().clone();
                 let mut pairs = Vec::new();
                 for arg in mnemonic.args() {
@@ -1152,7 +1153,7 @@ impl<'str> Context<'str> {
             let args = self.bodies[func].insns[id.local].mnemonic().args();
             let users = &mut self.bodies[func].users;
             for arg in args {
-                users.entry(arg).or_default().push(id);
+                users.entry(arg).or_default().push(id.localize(func));
             }
         }
     }
@@ -1347,7 +1348,11 @@ impl<'str> Context<'str> {
         let local = self.bodies[func].insns.push(insn);
         let id = InstructionId::new(func, local);
         for arg in args {
-            self.bodies[func].users.entry(arg).or_default().push(id);
+            self.bodies[func]
+                .users
+                .entry(arg)
+                .or_default()
+                .push(id.localize(func));
         }
         if let Some(target) = call_target {
             self.shared
@@ -1404,10 +1409,14 @@ impl<'str> Context<'str> {
     /// `value`'s owning function. For an SSA def (instruction/param) that is the
     /// complete user set (all uses are intra-function). For a shared value
     /// (literal/bytes/varnode) there is no single owner, so this returns `&[]`.
-    pub fn users_of(&self, value: ValueId) -> &[InstructionId] {
+    pub fn users_of(&self, value: ValueId) -> Vec<InstructionId> {
         match value.owning_function() {
-            Some(func) => self.bodies[func].users_of(value),
-            None => &[],
+            Some(func) => self.bodies[func]
+                .users_of(value)
+                .iter()
+                .map(|&local| InstructionId::new(func, local))
+                .collect(),
+            None => Vec::new(),
         }
     }
 
@@ -1431,7 +1440,7 @@ impl<'str> Context<'str> {
         }
         for (func, arg) in affected_args {
             if let Some(users) = self.bodies[func].users.get_mut(&arg) {
-                users.retain(|u| !dead.contains(u));
+                users.retain(|&local| !dead.contains(&InstructionId::new(func, local)));
             }
         }
         for target in affected_targets {
@@ -1617,7 +1626,7 @@ impl<'str> Context<'str> {
     /// (literal/bytes/varnode) it is `&[]` — those have no owning function and
     /// their uses are tracked per using-function; use
     /// [`users_across_functions`](Self::users_across_functions) to find them.
-    pub fn users(&self, value: impl Into<ValueId>) -> &[InstructionId] {
+    pub fn users(&self, value: impl Into<ValueId>) -> Vec<InstructionId> {
         self.users_of(value.into())
     }
 
@@ -1627,9 +1636,11 @@ impl<'str> Context<'str> {
     /// hot path (allocates); prefer [`users`](Self::users) for an SSA value.
     pub fn users_across_functions(&self, value: impl Into<ValueId>) -> Vec<InstructionId> {
         let value = value.into();
-        self.functions()
-            .flat_map(|f| f.users_of(value).to_vec())
-            .collect()
+        if value.owning_function().is_some() {
+            self.users_of(value)
+        } else {
+            self.functions().flat_map(|f| f.users_of(value)).collect()
+        }
     }
 
     /// Replace every use of `old` with `new` across all instructions that
@@ -1640,7 +1651,7 @@ impl<'str> Context<'str> {
         if old == new {
             return;
         }
-        let users: Vec<InstructionId> = self.users_of(old).to_vec();
+        let users = self.users_of(old);
         // `old`'s user list lives in its owning function's map; every user we are
         // rewriting is in that same function, so `new`'s new uses are recorded
         // there too. `old` is always an SSA def in practice (audited); a shared
@@ -1662,7 +1673,7 @@ impl<'str> Context<'str> {
                 .users
                 .entry(new)
                 .or_default()
-                .push(user_id);
+                .push(user_id.localize(func));
         }
         self.bodies[func].users.remove(&old);
     }
@@ -1678,7 +1689,7 @@ impl<'str> Context<'str> {
         for arg in old_args {
             let mut remove_arg = false;
             if let Some(users) = self.bodies[func].users.get_mut(&arg) {
-                users.retain(|&user| user != id);
+                users.retain(|&local| local != id.localize(func));
                 remove_arg = users.is_empty();
             }
             if remove_arg {
@@ -1697,7 +1708,11 @@ impl<'str> Context<'str> {
         *Instruction::from_id_mut(self, id).mnemonic_mut() = mnemonic;
 
         for arg in self.instruction(id).mnemonic().args() {
-            self.bodies[func].users.entry(arg).or_default().push(id);
+            self.bodies[func]
+                .users
+                .entry(arg)
+                .or_default()
+                .push(id.localize(func));
         }
         if let Some(target) = self.instruction(id).mnemonic().call_target() {
             self.shared
@@ -1724,7 +1739,9 @@ impl<'str> Context<'str> {
         let name = self.instruction(id).name.clone();
 
         if let Some(block_id) = parent {
-            self.block_mut(block_id).instructions.retain(|&i| i != id);
+            self.block_mut(block_id)
+                .instructions
+                .retain(|&local| local != id.localize(block_id.func));
 
             // If this instruction was a terminator instruction in a basic block,
             // remove cfg edges
@@ -1833,10 +1850,12 @@ impl<'str> Context<'str> {
             .block(block)
             .instructions
             .iter()
-            .position(|&i| i == before)
+            .position(|&local| InstructionId::new(block.func, local) == before)
             .expect("before not in block");
         self.instruction_mut(insn).parent = Some(block.local);
-        self.block_mut(block).instructions.insert(index, insn);
+        self.block_mut(block)
+            .instructions
+            .insert(index, insn.localize(block.func));
     }
 
     /// Mint a fresh empty block into `func`'s arena, parented and rostered.
@@ -1879,11 +1898,23 @@ impl<'str> Context<'str> {
         for edge in edges {
             self.remove_cfg_edge(block.func, edge);
         }
-        let insns: Vec<InstructionId> = self.read_host().block(block).instructions.clone();
+        let insns: Vec<InstructionId> = self
+            .read_host()
+            .block(block)
+            .instructions
+            .iter()
+            .map(|&local| InstructionId::new(block.func, local))
+            .collect();
         for insn in insns {
             self.remove_instruction(insn);
         }
-        let params: Vec<BlockParamId> = self.read_host().block(block).params.clone();
+        let params: Vec<BlockParamId> = self
+            .read_host()
+            .block(block)
+            .params
+            .iter()
+            .map(|&local| BlockParamId::new(block.func, local))
+            .collect();
         for param in params {
             self.function_mut(param.func)
                 .users
@@ -1904,20 +1935,37 @@ impl<'str> Context<'str> {
         edge_ab: EdgeId,
         _function_id: FunctionId,
     ) {
+        assert_eq!(
+            keep.func, other.func,
+            "cannot absorb across function arenas"
+        );
         let branch_args = {
             let host = self.read_host();
             host.block(keep)
                 .instructions
                 .last()
-                .and_then(|&id| match host.instruction(id).mnemonic() {
-                    Mnemonic::Branch(branch) if BlockId::new(keep.func, branch.target) == other => {
-                        Some(branch.args.clone())
+                .and_then(|&local| {
+                    match host
+                        .instruction(InstructionId::new(keep.func, local))
+                        .mnemonic()
+                    {
+                        Mnemonic::Branch(branch)
+                            if BlockId::new(keep.func, branch.target) == other =>
+                        {
+                            Some(branch.args.clone())
+                        }
+                        _ => None,
                     }
-                    _ => None,
                 })
                 .unwrap_or_default()
         };
-        let other_params = self.read_host().block(other).params.clone();
+        let other_params: Vec<_> = self
+            .read_host()
+            .block(other)
+            .params
+            .iter()
+            .map(|&local| BlockParamId::new(other.func, local))
+            .collect();
         if !other_params.is_empty() {
             assert_eq!(
                 other_params.len(),
@@ -1932,8 +1980,9 @@ impl<'str> Context<'str> {
         }
         self.block_mut(keep).instructions.pop();
         let b_insns = std::mem::take(&mut self.block_mut(other).instructions);
-        for &insn_id in &b_insns {
-            self.instruction_mut(insn_id).parent = Some(keep.local);
+        for &local in &b_insns {
+            self.instruction_mut(InstructionId::new(other.func, local))
+                .parent = Some(keep.local);
         }
         self.block_mut(keep).instructions.extend(b_insns);
         self.merge_nodes(keep, other, edge_ab);
@@ -2367,7 +2416,7 @@ mod tests {
                 .map(|b| b.id)
                 .find(|&b| b != entry)
                 .unwrap();
-            let insns = BasicBlock::from_id(ctx, entry).instruction_ids().to_vec();
+            let insns = BasicBlock::from_id(ctx, entry).instruction_ids();
             (fid, entry, bb1, insns[0])
         }
 
@@ -2504,13 +2553,13 @@ mod tests {
             "
         );
         let block_ref = BasicBlock::from_id(&ctx, block);
-        let ids: Vec<_> = block_ref.instruction_ids().to_vec();
+        let ids = block_ref.instruction_ids();
         let load_a = ids[0];
         let original_len = ids.len();
 
         ctx.remove_instruction(load_a);
 
-        let remaining: Vec<_> = BasicBlock::from_id(&ctx, block).instruction_ids().to_vec();
+        let remaining = BasicBlock::from_id(&ctx, block).instruction_ids();
         assert_eq!(remaining.len(), original_len - 1);
         assert!(!remaining.contains(&load_a));
     }
@@ -2614,7 +2663,7 @@ mod tests {
                 return at %b;
             "
         );
-        let ids: Vec<_> = BasicBlock::from_id(&ctx, block).instruction_ids().to_vec();
+        let ids = BasicBlock::from_id(&ctx, block).instruction_ids();
         let load_id = ids[0];
         let add_id = ids[1];
 
@@ -2649,7 +2698,7 @@ mod tests {
                 return at i64 0;
             "
         );
-        let ids: Vec<_> = BasicBlock::from_id(&ctx, block).instruction_ids().to_vec();
+        let ids = BasicBlock::from_id(&ctx, block).instruction_ids();
         let dead_id = ids[1]; // %dead, unused
 
         assert!(
@@ -2713,6 +2762,37 @@ mod tests {
 
         // Rewriting the indirect call into a direct one records the call edge.
         assert_eq!(ctx.shared.values.call_sites_of(target), &[call_id]);
+    }
+
+    #[test]
+    fn users_across_functions_keeps_ssa_users_in_the_owning_function() {
+        let mut ctx = Context::new();
+        qcode!(
+            ctx,
+            "
+            fn f:
+                <f_entry>
+                    %fx = i64 1 + i64 2;
+                    %fuse = %fx + i64 3;
+                    return at %fuse;
+            fn g:
+                <g_entry>
+                    %gx = i64 4 + i64 5;
+                    %guse = %gx + i64 6;
+                    return at %guse;
+            "
+        );
+        let f_ids = BasicBlock::from_id(&ctx, f_entry).instruction_ids();
+        let g_ids = BasicBlock::from_id(&ctx, g_entry).instruction_ids();
+        assert_eq!(
+            f_ids[0].local, g_ids[0].local,
+            "precondition: arena-local ids collide"
+        );
+        assert_eq!(
+            ctx.users_across_functions(ValueId::Instruction(f_ids[0])),
+            vec![f_ids[1]],
+            "an SSA query must not pick up the same local key from another function"
+        );
     }
 
     #[test]

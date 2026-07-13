@@ -9,12 +9,12 @@ use crate::loop_unroll::replace_terminator_with_branch;
 #[cfg(test)]
 use crate::loop_unroll::replace_terminator_with_branch_generic;
 
-/// This host's users of `v` (its owning function's reverse-use list), or `&[]`
+/// This host's users of `v` (its owning function's reverse-use list), or empty
 /// for a shared value with no owning function. Mirrors [`Context::users`].
-fn host_users<'a, 'str>(host: HostRef<'a, 'str>, v: ValueId) -> &'a [InstructionId] {
+fn host_users<'str>(host: HostRef<'_, 'str>, v: ValueId) -> Vec<InstructionId> {
     match v.owning_function() {
-        Some(f) => host.function(f).users_of(v),
-        None => &[],
+        Some(f) => host.function_ref(f).users_of(v),
+        None => Vec::new(),
     }
 }
 
@@ -224,7 +224,8 @@ pub fn remove_unused_no_pred_block_params_generic<'str>(
     let params: Vec<_> = host.read_host().block(block_id).param_ids().to_vec();
     let mut kept = Vec::with_capacity(params.len());
     let mut changed = false;
-    for param in params {
+    for local in params {
+        let param = qcode::value::BlockParamId::new(block_id.func, local);
         if host_users(host.read_host(), ValueId::BlockParam(param)).is_empty()
             && !host.read_host().block_param(param).protected
         {
@@ -232,7 +233,7 @@ pub fn remove_unused_no_pred_block_params_generic<'str>(
             changed = true;
         } else {
             host.block_param_mut(param).index = kept.len();
-            kept.push(param);
+            kept.push(local);
         }
     }
 
@@ -275,7 +276,8 @@ pub fn remove_unused_no_pred_block_params_host<'a, 'str>(
     let params: Vec<_> = body.read_host(cx).block(block_id).param_ids().to_vec();
     let mut kept = Vec::with_capacity(params.len());
     let mut changed = false;
-    for param in params {
+    for local in params {
+        let param = qcode::value::BlockParamId::new(block_id.func, local);
         if host_users(body.read_host(cx), ValueId::BlockParam(param)).is_empty()
             && !body.read_host(cx).block_param(param).protected
         {
@@ -283,7 +285,7 @@ pub fn remove_unused_no_pred_block_params_host<'a, 'str>(
             changed = true;
         } else {
             body.block_param_mut(param).index = kept.len();
-            kept.push(param);
+            kept.push(local);
         }
     }
 
@@ -789,7 +791,8 @@ fn match_dead_loop(host: HostRef, header: BlockId) -> Option<DeadLoop> {
                 return None;
             }
         }
-        for &pid in &host.block(blk).params {
+        for &local in &host.block(blk).params {
+            let pid = qcode::value::BlockParamId::new(blk.func, local);
             if !dl_users_confined(host, ValueId::BlockParam(pid), &region) {
                 return None;
             }
@@ -800,7 +803,8 @@ fn match_dead_loop(host: HostRef, header: BlockId) -> Option<DeadLoop> {
     // starts at a literal and drives the `iv == N` exit test, so the loop always
     // reaches the exit within `2^width` iterations.
     let hparams = host.block(header).params.clone();
-    let counted = hparams.iter().enumerate().any(|(k, &pid)| {
+    let counted = hparams.iter().enumerate().any(|(k, &local)| {
+        let pid = qcode::value::BlockParamId::new(header.func, local);
         let iv = ValueId::BlockParam(pid);
         back_args
             .get(k)

@@ -84,10 +84,10 @@ crate::register_function_pass!(MbaSimplify);
 
 /// This function's instructions that use `v` (which must be a function-scoped
 /// SSA value — instruction or param). Routed through the read host.
-fn users_of<'a>(host: HostRef<'a, '_>, v: ValueId) -> &'a [InstructionId] {
+fn users_of(host: HostRef<'_, '_>, v: ValueId) -> Vec<InstructionId> {
     match v.owning_function() {
-        Some(f) => host.function(f).users_of(v),
-        None => &[],
+        Some(f) => host.function_ref(f).users_of(v),
+        None => Vec::new(),
     }
 }
 

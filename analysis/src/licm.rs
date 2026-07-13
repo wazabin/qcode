@@ -288,7 +288,7 @@ fn emission_order(
     // Iterate blocks/instructions for a deterministic starting order.
     let mut roots: Vec<InstructionId> = Vec::new();
     for &block in loop_nodes {
-        for &id in host.block_ref(block).instruction_ids() {
+        for id in host.block_ref(block).instruction_ids() {
             if invariant.contains(&id) {
                 roots.push(id);
             }

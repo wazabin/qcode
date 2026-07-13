@@ -85,7 +85,7 @@ pub fn project_return(ctx: &Context, fid: FunctionId, field: usize) -> Option<Pr
     for block in Function::from_id(ctx, fid).iter() {
         let bid = block.id;
         blocks.push(bid);
-        for &iid in BasicBlock::from_id(ctx, bid).instruction_ids() {
+        for iid in BasicBlock::from_id(ctx, bid).instruction_ids() {
             insn_block.insert(iid, bid);
         }
     }

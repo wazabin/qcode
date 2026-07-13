@@ -181,7 +181,7 @@ fn run_block<'str>(
     numbering: &Numbering,
 ) -> bool {
     let mut ed = Editor::new();
-    let insns: Vec<InstructionId> = host.read_host().block(block_id).instructions.clone();
+    let insns: Vec<InstructionId> = host.block_ref(block_id).instruction_ids();
 
     for insn_id in insns {
         let (id, size, mnemonic) = {
@@ -535,7 +535,7 @@ fn run_block_c<'str>(
     numbering: &Numbering,
 ) -> bool {
     let mut ed = Editor::new();
-    let insns: Vec<InstructionId> = body.read_host(cx).block(block_id).instructions.clone();
+    let insns: Vec<InstructionId> = body.block_ref(cx, block_id).instruction_ids();
 
     for insn_id in insns {
         let (id, size, mnemonic) = {

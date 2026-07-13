@@ -23,7 +23,7 @@ use std::borrow::Cow;
 use qcode::{
     context::Context,
     value::{
-        BasicBlock, BlockId, Function, FunctionId, ValueId,
+        BasicBlock, BlockId, BlockParamId, Function, FunctionId, ValueId,
         insn::{Call, InstructionId, Mnemonic},
     },
 };
@@ -135,13 +135,14 @@ pub fn remove_entry_param(ctx: &mut Context, fid: FunctionId, index: usize) {
         return;
     }
     let removed = params.remove(index);
+    let removed = BlockParamId::new(root.func, removed);
     ctx.block_param_mut(removed).clear_parent();
 
     // Any inferred per-param attributes are indexed by the old positions; drop
     // them rather than reindex. The `param_attrs` pass re-infers afterward.
     Function::from_id_mut(ctx, fid).clear_param_attrs();
     for (i, &p) in params.iter().enumerate() {
-        ctx.block_param_mut(p).index = i;
+        ctx.block_param_mut(BlockParamId::new(root.func, p)).index = i;
     }
     ctx.block_mut(root).params = params;
 

@@ -138,7 +138,7 @@ pub struct Function<'str> {
     /// [`ValueId::strip_func`]); the value list stays composite
     /// [`InstructionId`]s.
     #[serde(default)]
-    pub(crate) users: FxHashMap<LocalValueId, Vec<InstructionId>>,
+    pub(crate) users: FxHashMap<LocalValueId, Vec<LocalInsnId>>,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -205,7 +205,7 @@ impl<'str> Function<'str> {
 
     /// This function's instructions that use `value` as an operand (see
     /// [`users`](Self::users)). Empty for a value this function never uses.
-    pub fn users_of(&self, value: ValueId) -> &[InstructionId] {
+    pub fn users_of(&self, value: ValueId) -> &[LocalInsnId] {
         self.users
             .get(&value.strip_func())
             .map(Vec::as_slice)
@@ -215,7 +215,7 @@ impl<'str> Function<'str> {
     /// Iterate this function's recorded `(value, users)` reverse-use entries, with
     /// keys in their stored body-local form (qualify via the owning func at the
     /// [`FunctionRef`] wrapper). Read-only; used by the users-map consistency verifier.
-    pub fn user_map_entries(&self) -> impl Iterator<Item = (LocalValueId, &[InstructionId])> {
+    pub fn user_map_entries(&self) -> impl Iterator<Item = (LocalValueId, &[LocalInsnId])> {
         self.users.iter().map(|(v, u)| (*v, u.as_slice()))
     }
 
@@ -296,7 +296,7 @@ impl<'str> Function<'str> {
         let local = self.insns.push(insn);
         let id = InstructionId::new(func, local);
         for arg in args {
-            self.users.entry(arg).or_default().push(id);
+            self.users.entry(arg).or_default().push(id.localize(func));
         }
         id
     }
@@ -357,10 +357,12 @@ impl<'str> Function<'str> {
             .block(block)
             .instructions
             .iter()
-            .position(|&i| i == before)
+            .position(|&local| InstructionId::new(block.func, local) == before)
             .expect("before not in block");
         self.insn_mut(insn).parent = Some(block.local);
-        self.block_mut(block).instructions.insert(index, insn);
+        self.block_mut(block)
+            .instructions
+            .insert(index, insn.localize(block.func));
     }
 
     /// Add a directed CFG edge `from -> to`, stored in this body's edge arena and
@@ -389,12 +391,16 @@ impl<'str> Function<'str> {
         let Some(func) = old.owning_function() else {
             return;
         };
-        let users: Vec<InstructionId> = self.users_of(old).to_vec();
+        let users: Vec<_> = self
+            .users_of(old)
+            .iter()
+            .map(|&local| InstructionId::new(func, local))
+            .collect();
         let old = old.localize(func);
         let new = new.localize(func);
         for user in users {
             self.insn_mut(user).mnemonic_mut().replace_value(old, new);
-            self.users.entry(new).or_default().push(user);
+            self.users.entry(new).or_default().push(user.localize(func));
         }
         self.users.remove(&old);
     }
@@ -413,7 +419,9 @@ impl<'str> Function<'str> {
         };
 
         if let Some(block_id) = parent {
-            self.block_mut(block_id).instructions.retain(|&i| i != id);
+            self.block_mut(block_id)
+                .instructions
+                .retain(|&local| local != id.localize(block_id.func));
             if is_terminator {
                 let succ: Vec<EdgeId> = {
                     let block = self.block(block_id);
@@ -440,7 +448,7 @@ impl<'str> Function<'str> {
         self.insn_mut(id).deleted = true;
         for arg in args {
             if let Some(users) = self.users.get_mut(&arg) {
-                users.retain(|u| *u != id);
+                users.retain(|&local| local != id.localize(id.func));
             }
         }
     }
@@ -469,6 +477,7 @@ impl<'str> Function<'str> {
     /// Replace an instruction's mnemonic in place, keeping the reverse use-map in
     /// sync.
     pub fn replace_instruction_mnemonic(&mut self, id: InstructionId, mnemonic: Mnemonic) {
+        let func = id.func;
         let old_args = self
             .insn(id)
             .mnemonic()
@@ -477,7 +486,7 @@ impl<'str> Function<'str> {
             .collect::<Vec<_>>();
         for arg in old_args {
             let now_empty = if let Some(users) = self.users.get_mut(&arg) {
-                users.retain(|&u| u != id);
+                users.retain(|&local| local != id.localize(func));
                 users.is_empty()
             } else {
                 false
@@ -494,7 +503,7 @@ impl<'str> Function<'str> {
             .into_iter()
             .collect::<Vec<_>>();
         for arg in new_args {
-            self.users.entry(arg).or_default().push(id);
+            self.users.entry(arg).or_default().push(id.localize(func));
         }
     }
 
@@ -510,11 +519,21 @@ impl<'str> Function<'str> {
         for edge in edges {
             self.remove_cfg_edge(block.func, edge);
         }
-        let insns: Vec<InstructionId> = self.block(block).instructions.clone();
+        let insns: Vec<InstructionId> = self
+            .block(block)
+            .instructions
+            .iter()
+            .map(|&local| InstructionId::new(block.func, local))
+            .collect();
         for insn in insns {
             self.remove_instruction(insn);
         }
-        let params: Vec<BlockParamId> = self.block(block).params.clone();
+        let params: Vec<BlockParamId> = self
+            .block(block)
+            .params
+            .iter()
+            .map(|&local| BlockParamId::new(block.func, local))
+            .collect();
         for param in params {
             self.users.remove(&ValueId::BlockParam(param).strip_func());
             self.block_param_mut(param).clear_parent();
@@ -529,18 +548,29 @@ impl<'str> Function<'str> {
     /// instructions, rehome its outgoing edges, and tombstone it. `edge_ab` is the
     /// direct edge `keep -> other`.
     pub fn absorb_block(&mut self, keep: BlockId, other: BlockId, edge_ab: EdgeId) {
+        assert_eq!(
+            keep.func, other.func,
+            "cannot absorb across function arenas"
+        );
         let branch_args = self
             .block(keep)
             .instructions
             .last()
-            .and_then(|&id| match self.insn(id).mnemonic() {
-                Mnemonic::Branch(branch) if BlockId::new(keep.func, branch.target) == other => {
-                    Some(branch.args.clone())
-                }
-                _ => None,
-            })
+            .and_then(
+                |&local| match self.insn(InstructionId::new(keep.func, local)).mnemonic() {
+                    Mnemonic::Branch(branch) if BlockId::new(keep.func, branch.target) == other => {
+                        Some(branch.args.clone())
+                    }
+                    _ => None,
+                },
+            )
             .unwrap_or_default();
-        let other_params = self.block(other).params.clone();
+        let other_params: Vec<_> = self
+            .block(other)
+            .params
+            .iter()
+            .map(|&local| BlockParamId::new(other.func, local))
+            .collect();
         if !other_params.is_empty() {
             assert_eq!(
                 other_params.len(),
@@ -555,8 +585,8 @@ impl<'str> Function<'str> {
         }
         self.block_mut(keep).instructions.pop();
         let b_insns = std::mem::take(&mut self.block_mut(other).instructions);
-        for &insn_id in &b_insns {
-            self.insn_mut(insn_id).parent = Some(keep.local);
+        for &local in &b_insns {
+            self.insn_mut(InstructionId::new(other.func, local)).parent = Some(keep.local);
         }
         self.block_mut(keep).instructions.extend(b_insns);
         self.merge_nodes(keep, other, edge_ab);
@@ -752,17 +782,30 @@ where
     /// This function's instructions that use `value` as an operand. See
     /// [`Function::users_of`]; this is the function-scoped read every pass wants
     /// for an SSA value (all its users are intra-function).
-    pub fn users_of(&'s self, value: ValueId) -> &'ctx [InstructionId] {
-        self.inner().users_of(value)
+    pub fn users_of(&'s self, value: ValueId) -> Vec<InstructionId> {
+        let func = self.id;
+        if value.owning_function().is_some_and(|owner| owner != func) {
+            return Vec::new();
+        }
+        self.inner()
+            .users_of(value)
+            .iter()
+            .map(|&local| InstructionId::new(func, local))
+            .collect()
     }
 
     /// Iterate this function's recorded `(value, users)` reverse-use entries
     /// (see [`Function::user_map_entries`]).
-    pub fn user_map_entries(&'s self) -> impl Iterator<Item = (ValueId, &'ctx [InstructionId])> {
+    pub fn user_map_entries(&'s self) -> impl Iterator<Item = (ValueId, Vec<InstructionId>)> + 's {
         let func = self.id;
-        self.inner()
-            .user_map_entries()
-            .map(move |(v, u)| (v.qualify(func), u))
+        self.inner().user_map_entries().map(move |(v, u)| {
+            (
+                v.qualify(func),
+                u.iter()
+                    .map(|&local| InstructionId::new(func, local))
+                    .collect(),
+            )
+        })
     }
 
     /// Resolve a block/instruction/param `name` within this function's local name
@@ -1562,6 +1605,45 @@ mod tests {
     use qcode_macro::qcode;
 
     use super::*;
+
+    #[test]
+    fn function_ref_users_of_rejects_foreign_owned_values() {
+        let mut ctx = Context::new();
+        qcode!(
+            ctx,
+            "
+            fn users_a:
+                <a_entry>
+                    %a_def = i64 1 + i64 2;
+                    %a_user = %a_def + i64 3;
+                    return at %a_user;
+
+            fn users_b:
+                <b_entry>
+                    %b_def = i64 1 + i64 2;
+                    %b_user = %b_def + i64 3;
+                    return at %b_user;
+            "
+        );
+
+        let a_ids = FunctionRef::from_id(&ctx, users_a)
+            .root()
+            .unwrap()
+            .instruction_ids();
+        let a_def = ValueId::Instruction(a_ids[0]);
+        assert_eq!(
+            FunctionRef::from_id(&ctx, users_a).users_of(a_def),
+            vec![a_ids[1]]
+        );
+        assert!(
+            FunctionRef::from_id(&ctx, users_b)
+                .users_of(a_def)
+                .is_empty()
+        );
+
+        let one = ctx.get_const(1, 8).id();
+        assert!(!FunctionRef::from_id(&ctx, users_b).users_of(one).is_empty());
+    }
 
     /// A tail call into another function is a call edge in both directions of the
     /// graph, even though the IR has no `Call` (strict IR locality: an inter-

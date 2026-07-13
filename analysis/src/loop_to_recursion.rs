@@ -370,7 +370,7 @@ fn push_param<'str>(
 ) -> ValueId {
     let index = host.block_ref(block).num_params();
     let pid = host.push_block_param(block.func, BlockParam::new(index, ty, block));
-    host.block_mut(block).params.push(pid);
+    host.block_mut(block).params.push(pid.localize(block.func));
     ValueId::BlockParam(pid)
 }
 

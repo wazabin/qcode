@@ -52,7 +52,7 @@ use qcode::{
     context::Context,
     value::{
         BasicBlock, BlockId, BlockParamId, Function, FunctionId, InstructionRef, ValueId,
-        insn::{Binary, Binop, IntBinop, Load, Mnemonic},
+        insn::{Binary, Binop, InstructionId, IntBinop, Load, Mnemonic},
     },
 };
 
@@ -105,6 +105,7 @@ fn affine_step(ctx: &Context, v: ValueId, iv: ValueId) -> Option<u64> {
 /// The argument bound to position `k` of `header` by `pred`'s terminator.
 fn incoming_from(ctx: &Context, pred: BlockId, header: BlockId, k: usize) -> Option<ValueId> {
     let &term = ctx.block(pred).instruction_ids().last()?;
+    let term = InstructionId::new(pred.func, term);
     // Terminator targets are body-local indices in the terminator's own arena
     // (`pred.func`); qualify to compare against the full `header` id.
     let q = |t| BlockId::new(pred.func, t);
@@ -245,7 +246,10 @@ fn find_pipelined(
 /// forward the carry's uses to it, drop the param, and record the disjointness
 /// assumption that justifies the re-read.
 fn apply(ctx: &mut Context, fid: FunctionId, p: &Pipelined) {
-    let first = *ctx.block(p.header).instruction_ids().first().unwrap();
+    let first = InstructionId::new(
+        p.header.func,
+        *ctx.block(p.header).instruction_ids().first().unwrap(),
+    );
 
     // iv − step  (same width as the induction variable).
     let iv_ty = ctx.type_of(p.iv);

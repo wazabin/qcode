@@ -190,10 +190,10 @@ pub(crate) fn cbranch_exit<'a, 'str: 'a>(
 /// The instructions using SSA value `v`, read from its owning function through
 /// the host (empty for shared values — literals/varnodes — which the loop
 /// helpers never define).
-pub(crate) fn users_of<'a, 'str: 'a>(host: HostRef<'a, 'str>, v: ValueId) -> &'a [InstructionId] {
+pub(crate) fn users_of<'a, 'str: 'a>(host: HostRef<'a, 'str>, v: ValueId) -> Vec<InstructionId> {
     match v.owning_function() {
-        Some(f) => host.function(f).users_of(v),
-        None => &[],
+        Some(f) => host.function_ref(f).users_of(v),
+        None => Vec::new(),
     }
 }
 

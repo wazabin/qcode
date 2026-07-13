@@ -418,7 +418,7 @@ impl<'str, 'ctx> InstructionMutRef<'str, 'ctx> {
         let func = self.id.func;
         for arg in old_args {
             if let Some(users) = self.ctx.bodies[func].users.get_mut(&arg) {
-                users.retain(|&user| user != self.id);
+                users.retain(|&local| local != self.id.localize(func));
             }
         }
 
@@ -427,7 +427,7 @@ impl<'str, 'ctx> InstructionMutRef<'str, 'ctx> {
                 .users
                 .entry(arg)
                 .or_default()
-                .push(self.id);
+                .push(self.id.localize(func));
         }
 
         self.inner_mut().mnemonic = mnemonic;

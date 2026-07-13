@@ -201,7 +201,7 @@ impl<'a, 'str> PassBacking<'a, 'str> {
                 .users
                 .entry(arg)
                 .or_default()
-                .push(id);
+                .push(id.localize(func));
         }
         if let Some(target) = call_target {
             self.record_call_site(target, id);
@@ -257,10 +257,12 @@ impl<'a, 'str> PassBacking<'a, 'str> {
             .block(block)
             .instructions
             .iter()
-            .position(|&i| i == before)
+            .position(|&local| InstructionId::new(block.func, local) == before)
             .expect("before not in block");
         self.instruction_mut(insn).parent = Some(block.local);
-        self.block_mut(block).instructions.insert(index, insn);
+        self.block_mut(block)
+            .instructions
+            .insert(index, insn.localize(block.func));
     }
 
     // ---- CFG / use-map verbs ------------------------------------------------
@@ -285,7 +287,12 @@ impl<'a, 'str> PassBacking<'a, 'str> {
         let Some(func) = old.owning_function() else {
             return;
         };
-        let users: Vec<InstructionId> = self.function(func).users_of(old).to_vec();
+        let users: Vec<_> = self
+            .function(func)
+            .users_of(old)
+            .iter()
+            .map(|&local| InstructionId::new(func, local))
+            .collect();
         let old = old.localize(func);
         let new = new.localize(func);
         for user in users {
@@ -296,7 +303,7 @@ impl<'a, 'str> PassBacking<'a, 'str> {
                 .users
                 .entry(new)
                 .or_default()
-                .push(user);
+                .push(user.localize(func));
         }
         self.function_mut(func).users.remove(&old);
     }
@@ -314,7 +321,9 @@ impl<'a, 'str> PassBacking<'a, 'str> {
         };
 
         if let Some(block_id) = parent {
-            self.block_mut(block_id).instructions.retain(|&i| i != id);
+            self.block_mut(block_id)
+                .instructions
+                .retain(|&local| local != id.localize(block_id.func));
             if is_terminator {
                 let succ: Vec<EdgeId> = {
                     let host = self.read_host();
@@ -342,7 +351,7 @@ impl<'a, 'str> PassBacking<'a, 'str> {
         self.instruction_mut(id).deleted = true;
         for arg in args {
             if let Some(users) = self.function_mut(id.func).users.get_mut(&arg) {
-                users.retain(|u| *u != id);
+                users.retain(|&local| local != id.localize(id.func));
             }
         }
         if let Some(target) = target {
@@ -378,7 +387,7 @@ impl<'a, 'str> PassBacking<'a, 'str> {
         };
         for arg in old_args {
             let now_empty = if let Some(users) = self.function_mut(func).users.get_mut(&arg) {
-                users.retain(|&u| u != id);
+                users.retain(|&local| local != id.localize(func));
                 users.is_empty()
             } else {
                 false
@@ -400,7 +409,7 @@ impl<'a, 'str> PassBacking<'a, 'str> {
                 .users
                 .entry(arg)
                 .or_default()
-                .push(id);
+                .push(id.localize(func));
         }
         if let Some(target) = new_target {
             self.record_call_site(target, id);
@@ -426,11 +435,23 @@ impl<'a, 'str> PassBacking<'a, 'str> {
         for edge in edges {
             self.remove_cfg_edge(block.func, edge);
         }
-        let insns: Vec<InstructionId> = self.read_host().block(block).instructions.clone();
+        let insns: Vec<InstructionId> = self
+            .read_host()
+            .block(block)
+            .instructions
+            .iter()
+            .map(|&local| InstructionId::new(block.func, local))
+            .collect();
         for insn in insns {
             self.remove_instruction(insn);
         }
-        let params: Vec<BlockParamId> = self.read_host().block(block).params.clone();
+        let params: Vec<BlockParamId> = self
+            .read_host()
+            .block(block)
+            .params
+            .iter()
+            .map(|&local| BlockParamId::new(block.func, local))
+            .collect();
         for param in params {
             self.function_mut(param.func)
                 .users
@@ -450,20 +471,37 @@ impl<'a, 'str> PassBacking<'a, 'str> {
         edge_ab: EdgeId,
         _function_id: FunctionId,
     ) {
+        assert_eq!(
+            keep.func, other.func,
+            "cannot absorb across function arenas"
+        );
         let branch_args = {
             let host = self.read_host();
             host.block(keep)
                 .instructions
                 .last()
-                .and_then(|&id| match host.instruction(id).mnemonic() {
-                    Mnemonic::Branch(branch) if BlockId::new(keep.func, branch.target) == other => {
-                        Some(branch.args.clone())
+                .and_then(|&local| {
+                    match host
+                        .instruction(InstructionId::new(keep.func, local))
+                        .mnemonic()
+                    {
+                        Mnemonic::Branch(branch)
+                            if BlockId::new(keep.func, branch.target) == other =>
+                        {
+                            Some(branch.args.clone())
+                        }
+                        _ => None,
                     }
-                    _ => None,
                 })
                 .unwrap_or_default()
         };
-        let other_params = self.read_host().block(other).params.clone();
+        let other_params: Vec<_> = self
+            .read_host()
+            .block(other)
+            .params
+            .iter()
+            .map(|&local| BlockParamId::new(other.func, local))
+            .collect();
         if !other_params.is_empty() {
             assert_eq!(
                 other_params.len(),
@@ -478,8 +516,9 @@ impl<'a, 'str> PassBacking<'a, 'str> {
         }
         self.block_mut(keep).instructions.pop();
         let b_insns = std::mem::take(&mut self.block_mut(other).instructions);
-        for &insn_id in &b_insns {
-            self.instruction_mut(insn_id).parent = Some(keep.local);
+        for &local in &b_insns {
+            self.instruction_mut(InstructionId::new(other.func, local))
+                .parent = Some(keep.local);
         }
         self.block_mut(keep).instructions.extend(b_insns);
         self.merge_nodes(keep, other, edge_ab);

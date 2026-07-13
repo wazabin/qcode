@@ -653,7 +653,7 @@ fn unread_temp_space_stores<'a, 'str: 'a>(
     let mut candidate_stores: Vec<TempStore> = Vec::new();
 
     for block in &fun {
-        for &insn_id in block.instruction_ids() {
+        for insn_id in block.instruction_ids() {
             match host.insn_ref(insn_id).mnemonic() {
                 Mnemonic::Load(load) if is_temp_space(host.shr(), load.space) => {
                     loads.push((load.space, load.ptr.qualify(insn_id.func), load.size));
@@ -717,7 +717,7 @@ fn unread_frame_local_stores<'a, 'str: 'a>(
     let mut loads: Vec<(ValueId, usize)> = Vec::new();
     let mut stores: Vec<(InstructionId, ValueId, usize)> = Vec::new();
     for block in &fun {
-        for &id in block.instruction_ids() {
+        for id in block.instruction_ids() {
             match host.insn_ref(id).mnemonic() {
                 Mnemonic::Load(load) => loads.push((load.ptr.qualify(id.func), load.size)),
                 Mnemonic::Store(store)
