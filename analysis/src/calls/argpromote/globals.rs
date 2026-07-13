@@ -20,7 +20,7 @@ use qcode::{
     context::Context,
     space::{Space, SpaceId, SpaceType},
     value::{
-        Function, FunctionId, Value, ValueId, ValueRef,
+        FunctionBody, FunctionId, Value, ValueId, ValueRef,
         insn::{Load, Mnemonic, Store},
     },
 };
@@ -44,7 +44,7 @@ pub(super) fn globalize_constants(
     address_taken: &FxHashSet<FunctionId>,
     fid: FunctionId,
 ) -> bool {
-    let f = Function::from_id(ctx, fid);
+    let f = FunctionBody::from_id(ctx, fid);
     if f.is_external() || !f.is_pure_reg() {
         return false;
     }
@@ -60,7 +60,7 @@ pub(super) fn globalize_constants(
     // literal `ValueId` — literals are interned, so one id per (address, width).
     let mut globals: Vec<ValueId> = Vec::new();
     let mut seen: HashSet<ValueId> = HashSet::default();
-    for block in Function::from_id(ctx, fid).iter() {
+    for block in FunctionBody::from_id(ctx, fid).iter() {
         for insn in block.iter() {
             let (space, ptr) = match insn.mnemonic() {
                 Mnemonic::Load(l) => (l.space, l.ptr.qualify(insn.id.func)),
@@ -102,7 +102,7 @@ pub(super) fn globalize_constants(
 
 /// Redirect every real-ram load/store at `addr` in `fid` to dereference `param`.
 fn rewrite_accesses(ctx: &mut Context, fid: FunctionId, addr: ValueId, param: ValueId) {
-    let ids: Vec<_> = Function::from_id(ctx, fid)
+    let ids: Vec<_> = FunctionBody::from_id(ctx, fid)
         .iter()
         .flat_map(|b| b.iter())
         .filter_map(|insn| match insn.mnemonic() {

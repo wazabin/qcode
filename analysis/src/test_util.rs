@@ -45,18 +45,19 @@ pub(crate) fn with_minting<'str, R>(
     fun: FunctionId,
     f: impl for<'a> FnOnce(
         crate::pipeline::ContextView<'a, 'str>,
-        &mut crate::pipeline::FunctionBody<'_, 'str>,
+        &mut crate::pipeline::FunctionBody<'str>,
+        &mut u32,
         &mut Vec<crate::pipeline::Minted<'str>>,
     ) -> R,
 ) -> R {
-    use crate::pipeline::{ContextSplit, FunctionBody, Minted};
+    use crate::pipeline::{ContextSplit, Minted};
     let env = dummy_env();
     let before_targets = ctx.direct_call_targets(fun);
     let (out, minted) = {
         let (bodies, view) = ctx.split(&env);
-        let mut body = FunctionBody::new(&mut bodies[fun]);
+        let mut next_minted = 0;
         let mut minted: Vec<Minted<'str>> = Vec::new();
-        let out = f(view, &mut body, &mut minted);
+        let out = f(view, &mut bodies[fun], &mut next_minted, &mut minted);
         (out, minted)
     };
     crate::pipeline::install_minted_for_test(ctx, fun, &before_targets, minted);

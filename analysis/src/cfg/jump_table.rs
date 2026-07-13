@@ -29,7 +29,7 @@ use qcode::{
     builder::Builder,
     context::Context,
     value::{
-        BasicBlock, BlockMutRef, Function, FunctionId, Value, ValueId, ValueRef,
+        BasicBlock, BlockMutRef, FunctionBody, FunctionId, Value, ValueId, ValueRef,
         block::{BlockId, EdgeId},
         insn::{Binary, Binop, BranchInd, IntBinop, Load, Mnemonic},
         util::base_ref::{WithCtx, WithCtxMut},
@@ -114,7 +114,7 @@ impl HandleJumpTables {
     /// changed. This is the body that ran once per function while the pass was a
     /// `FunctionPass`.
     fn resolve_function(ctx: &mut Context, fun_id: FunctionId) -> Result<bool, String> {
-        let function = Function::from_id(ctx, fun_id);
+        let function = FunctionBody::from_id(ctx, fun_id);
 
         // Nothing resolves in a function with no indirect branch. The vast majority
         // of functions have none, so bail before allocating the block-id vector and
@@ -303,7 +303,7 @@ fn resolve_local_target(ctx: &mut Context, addr: u64, fun_id: FunctionId) -> Loc
     match BasicBlock::from_id(ctx, tb).parent().map(|f| f.id) {
         Some(owner) if owner != fun_id => {
             let is_entry =
-                Function::from_addr(ctx, addr).and_then(|f| f.root().map(|r| r.id)) == Some(tb);
+                FunctionBody::from_addr(ctx, addr).and_then(|f| f.root().map(|r| r.id)) == Some(tb);
             let g = if is_entry {
                 owner
             } else {
@@ -312,7 +312,7 @@ fn resolve_local_target(ctx: &mut Context, addr: u64, fun_id: FunctionId) -> Loc
             LocalTarget::Foreign(g)
         }
         _ => {
-            Function::from_id_mut(ctx, fun_id).add_block(tb);
+            FunctionBody::from_id_mut(ctx, fun_id).add_block(tb);
             LocalTarget::Local(tb)
         }
     }

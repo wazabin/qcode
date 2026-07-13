@@ -206,13 +206,14 @@ fn try_match(host: HostRef, fid: FunctionId) -> Option<ScanMatch> {
 /// seed iota(N-1)))`. The residual loop is left for `dce`.
 fn apply<'str>(
     mv: ContextView<'_, 'str>,
-    body: &mut FunctionBody<'_, 'str>,
+    body: &mut FunctionBody<'str>,
+    next_minted: &mut u32,
     minted: &mut Vec<Minted<'str>>,
     m: &ScanMatch,
 ) -> bool {
     let fid = body.id();
     let (index_ty, i64_ty, name) = {
-        let host = body.read_host(mv);
+        let host = mv.read_host(body);
         (
             host.type_of(m.index),
             host.shr().types.get_or_make_int(8),
@@ -236,7 +237,7 @@ fn apply<'str>(
     let (body_fn, src_kind, src_arr_ty) = match m.elem {
         Some((elem_read, l0_exit)) => {
             let (esz, src_arr_ty) = {
-                let types = &body.read_host(mv).shr().types;
+                let types = &mv.read_host(body).shr().types;
                 (
                     types.size_of(m.elem_ty),
                     types.get_or_make_array(m.elem_ty, n1),
@@ -245,6 +246,7 @@ fn apply<'str>(
             let Some(body_fn) = outline_scan_body(
                 mv,
                 body,
+                next_minted,
                 minted,
                 &name,
                 m.stored_val,
@@ -261,10 +263,11 @@ fn apply<'str>(
             (body_fn, Src::Slice { l0_exit, esz }, src_arr_ty)
         }
         None => {
-            let src_arr_ty = body.read_host(mv).shr().types.get_or_make_array(i64_ty, n1);
+            let src_arr_ty = mv.read_host(body).shr().types.get_or_make_array(i64_ty, n1);
             let Some(body_fn) = outline_scan_body(
                 mv,
                 body,
+                next_minted,
                 minted,
                 &name,
                 m.stored_val,
@@ -286,18 +289,28 @@ fn apply<'str>(
     // not just before the wide store: `array_promote` may have rewritten other
     // exit loads to `at(arr_exit, k)` earlier in the block, and those get
     // redirected to the folded array below — which must therefore dominate them.
-    let Some(anchor) = body.block_ref(mv, m.exit).iter().next().map(|i| i.id) else {
+    let Some(anchor) = mv
+        .read_host(body)
+        .block_ref(m.exit)
+        .iter()
+        .next()
+        .map(|i| i.id)
+    else {
         return false;
     };
     // Pre-existing exit instructions whose `arr_exit` uses are redirected.
-    let preexisting: Vec<InstructionId> = body.block_ref(mv, m.exit).iter().map(|i| i.id).collect();
+    let preexisting: Vec<InstructionId> = mv
+        .read_host(body)
+        .block_ref(m.exit)
+        .iter()
+        .map(|i| i.id)
+        .collect();
 
     // Materialize the scan source. Data-input: the `l0[1..]` byte-slice from
     // element 1 (length `N-1`). Pure generation: `iota(N-1)` typed `[i64; N-1]`.
     let src = match src_kind {
         Src::Slice { l0_exit, esz } => {
             let slice = body.push_mnemonic_with_type(
-                mv,
                 Mnemonic::Range(qcode::value::insn::Range {
                     src: l0_exit.localize(fid),
                     start: esz,
@@ -305,20 +318,19 @@ fn apply<'str>(
                 }),
                 src_arr_ty,
             );
-            body.insert_insn_before(mv, m.exit, anchor, slice);
+            body.insert_insn_before(m.exit, anchor, slice);
             ValueId::Instruction(slice)
         }
         Src::Iota => {
             let n1_const = mv.shr().get_const(n1 as u64, 8);
             let iota = body.push_mnemonic_with_type(
-                mv,
                 Mnemonic::Intrinsic(IntrinsicApp {
                     id: iota_id,
                     args: vec![n1_const.localize(fid)],
                 }),
                 src_arr_ty,
             );
-            body.insert_insn_before(mv, m.exit, anchor, iota);
+            body.insert_insn_before(m.exit, anchor, iota);
             ValueId::Instruction(iota)
         }
     };
@@ -328,10 +340,9 @@ fn apply<'str>(
     // build the node with an explicit type: a sequence of the accumulator
     // (stored-value) type with the source's length/kind.
     let scan = {
-        let body_ret = body.read_host(mv).type_of(m.stored_val);
-        let ty = crate::calls::outline::seq_result_type(body.read_host(mv), src, body_ret);
+        let body_ret = mv.read_host(body).type_of(m.stored_val);
+        let ty = crate::calls::outline::seq_result_type(mv.read_host(body), src, body_ret);
         let id = body.push_mnemonic_with_type(
-            mv,
             Mnemonic::Scan(qcode::value::insn::Scan {
                 body: body_fn,
                 init: m.seed_val.localize(fid),
@@ -340,11 +351,11 @@ fn apply<'str>(
             }),
             ty,
         );
-        body.insert_insn_before(mv, m.exit, anchor, id);
+        body.insert_insn_before(m.exit, anchor, id);
         ValueId::Instruction(id)
     };
     let full = {
-        let mut host = body.host(mv);
+        let mut host = mv.host(body);
         let mut b = Builder::from_block(BaseRef::new(host.reborrow(), m.exit));
         b.set_insert_point_before(anchor);
         let sing = b.push_intrinsic(singleton_id, vec![m.seed_val]).id();
@@ -355,9 +366,9 @@ fn apply<'str>(
     // `at(arr, k)` reads `array_promote` left for exit loads — to the folded
     // array, leaving the loop's own array dead for `dce`.
     for id in preexisting {
-        let mut mn = body.insn_ref(mv, id).mnemonic().clone();
+        let mut mn = mv.read_host(body).insn_ref(id).mnemonic().clone();
         mn.replace_value(m.arr_exit.localize(fid), full.localize(fid));
-        body.replace_instruction_mnemonic(mv, id, mn);
+        body.replace_instruction_mnemonic(id, mn);
     }
 
     // Delete the residual loop when it is now wholly private (mirrors
@@ -372,7 +383,7 @@ fn apply<'str>(
     } else {
         vec![m.header, m.body]
     };
-    let private = is_loop_private(body.read_host(mv), &loop_blocks);
+    let private = is_loop_private(mv.read_host(body), &loop_blocks);
     let defined_in_loop = |host: HostRef, v: ValueId| match v {
         ValueId::BlockParam(_) => param_parent(host, v).is_some_and(|b| loop_blocks.contains(&b)),
         ValueId::Instruction(id) => host
@@ -385,14 +396,15 @@ fn apply<'str>(
     // coalesced) must be re-fed from a preheader-available value: its
     // header-edge incoming directly if loop-invariant, or — when it copies a
     // loop param — that param's own loop-invariant (preheader) incoming.
-    let exit_args: Option<Vec<ValueId>> = body
-        .block_ref(mv, m.exit)
+    let exit_args: Option<Vec<ValueId>> = mv
+        .read_host(body)
+        .block_ref(m.exit)
         .params()
         .map(|p| p.id())
         .collect::<Vec<_>>()
         .into_iter()
         .map(|p| {
-            let rh = body.read_host(mv);
+            let rh = mv.read_host(body);
             let k = param_pos(rh, m.exit, p)?;
             let [v] = incoming(rh, m.exit, k)[..] else {
                 return None;
@@ -415,8 +427,9 @@ fn apply<'str>(
         })
         .collect();
     if private && let Some(exit_args) = exit_args {
-        let preheaders: Vec<BlockId> = body
-            .block_ref(mv, m.header)
+        let preheaders: Vec<BlockId> = mv
+            .read_host(body)
+            .block_ref(m.header)
             .predecessors()
             .map(|(_, p)| p)
             .filter(|p| !loop_blocks.contains(p))
@@ -424,7 +437,7 @@ fn apply<'str>(
         if let [preheader] = preheaders[..] {
             // `delete_private_loop` is still host-generic (a cross-module helper,
             // migrated in its own chunk), so drive it through a scoped host.
-            let mut host = body.host(mv);
+            let mut host = mv.host(body);
             delete_private_loop(&mut host, fid, preheader, &loop_blocks, m.exit, exit_args);
         }
     }
@@ -433,7 +446,6 @@ fn apply<'str>(
 
 impl FunctionPass for LoopToScan {
     const NAME: &'static str = "loop_to_scan";
-    const MINTS: bool = true;
 
     fn description(&self) -> &'static str {
         "Fold the value-carried insert/at fill loop from array_promote into a scanl"
@@ -441,12 +453,13 @@ impl FunctionPass for LoopToScan {
 
     fn run<'str>(
         &self,
-        f: &mut FunctionBody<'_, 'str>,
+        f: &mut FunctionBody<'str>,
         m: ContextView<'_, 'str>,
+        next_minted: &mut u32,
     ) -> Result<Outcome<'str>, String> {
-        if let Some(sm) = try_match(f.read_host(m), f.id()) {
+        if let Some(sm) = try_match(m.read_host(f), f.id()) {
             let mut minted = Vec::new();
-            let changed = apply(m, f, &mut minted, &sm);
+            let changed = apply(m, f, next_minted, &mut minted, &sm);
             return Ok(Outcome {
                 changed,
                 rename: None,
@@ -464,7 +477,7 @@ mod tests {
     use qcode_macro::qcode;
 
     use super::*;
-    use qcode::{context::Context, value::Function};
+    use qcode::{context::Context, value::FunctionBody};
 
     use crate::mem::array_promote::ArrayPromote;
     use crate::test_util::run_function_pass;
@@ -513,12 +526,12 @@ mod tests {
             run_function_pass::<LoopToScan>(&mut ctx, prefix).unwrap(),
             "loop_to_scan should fold the promoted single-array loop"
         );
-        let ir = format!("{}", Function::from_id(&ctx, prefix));
+        let ir = format!("{}", FunctionBody::from_id(&ctx, prefix));
         assert!(
             ir.contains("scanl"),
             "the promoted loop should fold to a scanl over the original array: {ir}"
         );
-        let scan_body = Function::from_id(&ctx, prefix)
+        let scan_body = FunctionBody::from_id(&ctx, prefix)
             .iter()
             .flat_map(|block| block.iter())
             .find_map(|insn| match insn.mnemonic() {
@@ -576,7 +589,7 @@ mod tests {
             !run_function_pass::<LoopToScan>(&mut ctx, prefix).unwrap(),
             "scan v1 must decline the header-carried index shape"
         );
-        let ir = format!("{}", Function::from_id(&ctx, prefix));
+        let ir = format!("{}", FunctionBody::from_id(&ctx, prefix));
         assert!(!ir.contains("scanl"), "declined, not rewritten: {ir}");
     }
 }

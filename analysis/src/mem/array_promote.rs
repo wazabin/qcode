@@ -540,12 +540,8 @@ fn last_insn<'str>(host: &PassBacking<'_, 'str>, block: BlockId) -> InstructionI
 }
 
 /// Concrete version of array_promote core using FunctionBody+ContextView (stage 5b-ii).
-fn apply<'str>(
-    body: &mut FunctionBody<'_, 'str>,
-    cx: ContextView<'_, 'str>,
-    m: &PromoteMatch,
-) -> bool {
-    let mut host = body.host(cx);
+fn apply<'str>(body: &mut FunctionBody<'str>, cx: ContextView<'_, 'str>, m: &PromoteMatch) -> bool {
+    let mut host = cx.host(body);
     apply_generic(&mut host, m)
 }
 
@@ -740,11 +736,12 @@ impl FunctionPass for ArrayPromote {
 
     fn run<'str>(
         &self,
-        f: &mut FunctionBody<'_, 'str>,
+        f: &mut FunctionBody<'str>,
         m: ContextView<'_, 'str>,
+        _next_minted: &mut u32,
     ) -> Result<Outcome<'str>, String> {
         let fid = f.id();
-        match try_match(f.read_host(m), fid) {
+        match try_match(m.read_host(f), fid) {
             Some(matched) => Ok(Outcome::changed(apply(f, m, &matched))),
             None => Ok(Outcome::unchanged()),
         }
@@ -760,7 +757,7 @@ mod tests {
     use super::*;
     use crate::test_util::run_function_pass;
     use qcode::context::Context;
-    use qcode::value::{BasicBlock, Function};
+    use qcode::value::{BasicBlock, FunctionBody};
 
     // A seeded, memory-carried strided fill: `out[0] = seed`, `out[i] =
     // out[i-1] + i` reloading the previous lane. The reload is a *carry* read
@@ -797,7 +794,7 @@ mod tests {
         );
         let changed = run_function_pass::<ArrayPromote>(&mut ctx, fill).unwrap();
         assert!(changed, "the memory-carried fill should be recognized");
-        let ir = format!("{}", Function::from_id(&ctx, fill));
+        let ir = format!("{}", FunctionBody::from_id(&ctx, fill));
         assert!(ir.contains("$at("), "lane load should become at(): {ir}");
         assert!(
             ir.contains("$insert("),
@@ -845,7 +842,7 @@ mod tests {
             "
         );
         let changed = run_function_pass::<ArrayPromote>(&mut ctx, reg_rot).unwrap();
-        let ir = format!("{}", Function::from_id(&ctx, reg_rot));
+        let ir = format!("{}", FunctionBody::from_id(&ctx, reg_rot));
         assert!(
             changed,
             "rotated register-carried fill should promote: {ir}"
@@ -889,7 +886,7 @@ mod tests {
             "
         );
         let changed = run_function_pass::<ArrayPromote>(&mut ctx, reg_split).unwrap();
-        let ir = format!("{}", Function::from_id(&ctx, reg_split));
+        let ir = format!("{}", FunctionBody::from_id(&ctx, reg_split));
         assert!(
             changed,
             "split-shape register-carried fill should promote: {ir}"
@@ -930,7 +927,7 @@ mod tests {
             "
         );
         let changed = run_function_pass::<ArrayPromote>(&mut ctx, generate).unwrap();
-        let ir = format!("{}", Function::from_id(&ctx, generate));
+        let ir = format!("{}", FunctionBody::from_id(&ctx, generate));
         assert!(changed, "a write-only generated fill should promote: {ir}");
         assert!(
             ir.contains("$insert("),
@@ -976,7 +973,7 @@ mod tests {
             "
         );
         let changed = run_function_pass::<ArrayPromote>(&mut ctx, mix).unwrap();
-        let ir = format!("{}", Function::from_id(&ctx, mix));
+        let ir = format!("{}", FunctionBody::from_id(&ctx, mix));
         assert!(changed, "the enveloped byte fill should promote: {ir}");
         assert!(ir.contains("$at("), "lane load becomes at(): {ir}");
         assert!(ir.contains("$insert("), "lane store becomes insert(): {ir}");
@@ -1028,7 +1025,7 @@ mod tests {
             "
         );
         let changed = run_function_pass::<ArrayPromote>(&mut ctx, mix).unwrap();
-        let ir = format!("{}", Function::from_id(&ctx, mix));
+        let ir = format!("{}", FunctionBody::from_id(&ctx, mix));
         assert!(changed, "should promote: {ir}");
         assert!(
             ir.contains("load(ram:24, i64 @base)"),
@@ -1077,7 +1074,7 @@ mod tests {
             "
         );
         let changed = run_function_pass::<ArrayPromote>(&mut ctx, f).unwrap();
-        let ir = format!("{}", Function::from_id(&ctx, f));
+        let ir = format!("{}", FunctionBody::from_id(&ctx, f));
         assert!(changed, "header-carried byte fill should promote: {ir}");
         assert!(ir.contains("$at("), "lane load becomes at(): {ir}");
         assert!(ir.contains("$insert("), "lane store becomes insert(): {ir}");
@@ -1119,7 +1116,7 @@ mod tests {
             "
         );
         let changed = run_function_pass::<ArrayPromote>(&mut ctx, f).unwrap();
-        let ir = format!("{}", Function::from_id(&ctx, f));
+        let ir = format!("{}", FunctionBody::from_id(&ctx, f));
         assert!(
             changed,
             "induction sorting ahead of the base must still promote: {ir}"
@@ -1163,7 +1160,7 @@ mod tests {
             "
         );
         let changed = run_function_pass::<ArrayPromote>(&mut ctx, mix).unwrap();
-        let ir = format!("{}", Function::from_id(&ctx, mix));
+        let ir = format!("{}", FunctionBody::from_id(&ctx, mix));
         assert!(changed, "a partial pre-loop store should not block: {ir}");
         assert!(ir.contains("$insert("), "lane store becomes insert(): {ir}");
     }
@@ -1278,7 +1275,7 @@ mod tests {
             run_function_pass::<ArrayPromote>(&mut ctx, reads_orig).unwrap(),
             "an original-lane read should promote via an original init"
         );
-        let ir = format!("{}", Function::from_id(&ctx, reads_orig));
+        let ir = format!("{}", FunctionBody::from_id(&ctx, reads_orig));
         // Exactly one wide original load, in the preheader, threaded as the carried
         // array — no separate snapshot, no second wide load.
         assert_eq!(
@@ -1325,7 +1322,7 @@ mod tests {
             run_function_pass::<ArrayPromote>(&mut ctx, reads_enum).unwrap(),
             "a seedless indexed map over the original array should promote"
         );
-        let ir = format!("{}", Function::from_id(&ctx, reads_enum));
+        let ir = format!("{}", FunctionBody::from_id(&ctx, reads_enum));
         assert!(
             ir.contains("load(ram:2496"),
             "a whole-region original init load should be inserted: {ir}"
@@ -1375,7 +1372,7 @@ mod tests {
         );
         assert!(run_function_pass::<ArrayPromote>(&mut ctx, shared).unwrap());
         // Count array-typed params reaching the body: exactly one carried array.
-        let body = Function::from_id(&ctx, shared)
+        let body = FunctionBody::from_id(&ctx, shared)
             .iter()
             .find(|b| {
                 b.params()

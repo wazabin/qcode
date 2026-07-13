@@ -5,7 +5,7 @@
 //! GHIDRA's p-code IR. Values however have more variety. On top of GHIDRA's
 //! [`Varnode`] (a named memory location), qcode also has [`Instruction`]
 //! (an SSA value computed by an operation), [`BasicBlock`]
-//! (a control-flow node), [`Function`] and [`Literal`] (a constant value).
+//! (a control-flow node), [`FunctionBody`] and [`Literal`] (a constant value).
 //!
 //! # Core Concepts
 //!

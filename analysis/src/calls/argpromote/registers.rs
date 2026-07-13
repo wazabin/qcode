@@ -3,7 +3,9 @@ use qcode::{
     context::Context,
     space::{SpaceId, SpaceType},
     types::TypeId,
-    value::{BasicBlock, Function, FunctionId, Value, ValueId, Varnode, VarnodeId, insn::Mnemonic},
+    value::{
+        BasicBlock, FunctionBody, FunctionId, Value, ValueId, Varnode, VarnodeId, insn::Mnemonic,
+    },
 };
 
 use rustc_hash::FxHashSet;
@@ -142,7 +144,7 @@ impl RegPurityReason {
 
 /// Report whether `fid` is eligible to be functionalized into a register-pure
 /// function (`Ok`) or, if not, the gating reason (`Err`). A function whose
-/// [`Function::is_pure_reg`] is already set is necessarily `Ok`; this is the
+/// [`FunctionBody::is_pure_reg`] is already set is necessarily `Ok`; this is the
 /// source of the "why not" shown for the rest.
 ///
 /// Builds the whole-program address-taken and called-function sets on every call.
@@ -191,7 +193,7 @@ fn reg_purity_with(
     address_taken: &FxHashSet<FunctionId>,
     called: &FxHashSet<FunctionId>,
 ) -> Result<(), RegPurityReason> {
-    let f = Function::from_id(ctx, fid);
+    let f = FunctionBody::from_id(ctx, fid);
     if f.is_external() {
         return Err(RegPurityReason::External);
     }
@@ -217,7 +219,7 @@ pub(crate) fn scan_register_effects(
 ) -> Result<RegisterEffects, RegPurityReason> {
     let mut loaded: Vec<VarnodeId> = Vec::new();
     let mut stored: Vec<VarnodeId> = Vec::new();
-    for block in Function::from_id(ctx, fid).blocks() {
+    for block in FunctionBody::from_id(ctx, fid).blocks() {
         for insn in block.iter() {
             match insn.mnemonic() {
                 Mnemonic::Load(l) => {
@@ -310,7 +312,7 @@ fn try_promote_registers(
     called: &FxHashSet<FunctionId>,
     fid: FunctionId,
 ) -> bool {
-    let f = Function::from_id(ctx, fid);
+    let f = FunctionBody::from_id(ctx, fid);
     if f.is_external() || f.root().is_none() {
         return false;
     }
@@ -336,7 +338,7 @@ fn try_promote_registers(
     // The body now reads its registers only through by-value params and returns
     // every write through the aggregate write-set: it is a pure value function.
     // `dead_signature` keys on this flag to trim dead params / returned fields.
-    Function::from_id_mut(ctx, fid).set_pure_reg(true);
+    FunctionBody::from_id_mut(ctx, fid).set_pure_reg(true);
     true
 }
 

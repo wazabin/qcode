@@ -11,7 +11,7 @@ use crate::{
     },
 };
 // NOTE (IR-ownership refactor): instruction/block/param/edge *storage* lives in
-// each `Function` (see `Function::insns/blocks/params/edges`), and the function
+// each `FunctionBody` (see `FunctionBody::insns/blocks/params/edges`), and the function
 // bodies/interfaces now live directly on [`Context`](crate::context::Context)
 // (`bodies`/`interfaces`). This registry keeps only the global value arenas
 // (literals, bytes, varnodes) plus the cross-function maps (`call_sites`,
@@ -37,7 +37,7 @@ use std::collections::BTreeSet;
 ///   to rewrite operands while keeping `users` consistent.
 ///
 /// - **`users` is managed internally.** The reverse use-def map now lives in
-///   each [`Function`] (function-scoped; see [`Function::users`]). Do not mutate
+///   each [`FunctionBody`](crate::value::FunctionBody) (function-scoped; see [`FunctionBody::users`](crate::value::FunctionBody::users)). Do not mutate
 ///   it directly. Read it through
 ///   [`FunctionRef::users_of`](crate::value::FunctionRef::users_of) /
 ///   [`Context::users`](crate::context::Context::users), and remove dead

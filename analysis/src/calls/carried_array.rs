@@ -277,7 +277,7 @@ mod tests {
     use super::*;
     use qcode::{
         context::Context,
-        value::{BasicBlock, Function},
+        value::{BasicBlock, FunctionBody},
     };
 
     use crate::mem::array_promote::ArrayPromote;
@@ -399,7 +399,7 @@ mod tests {
                 _ => None,
             })
             .expect("carry insert present");
-        let entry = Function::from_id(&ctx, f).root().unwrap().id;
+        let entry = FunctionBody::from_id(&ctx, f).root().unwrap().id;
         let foreign =
             ValueId::BlockParam(BasicBlock::from_id_mut(&mut ctx, entry).push_param(8).id);
         let mut m = ctx.get_insn(carry).mnemonic().clone();

@@ -21,7 +21,7 @@ use qcode::{
     context::Context,
     space::SpaceId,
     value::{
-        BasicBlock, Function, FunctionId, Instruction, InstructionId, Value, ValueId, Varnode,
+        BasicBlock, FunctionBody, FunctionId, Instruction, InstructionId, Value, ValueId, Varnode,
         VarnodeId, insn::Mnemonic,
     },
 };
@@ -192,7 +192,7 @@ pub fn argpromote_external(ctx: &mut Context, env: &PipelineEnv) -> bool {
 
     let mut changed = false;
     for fid in externals {
-        let raw = Function::from_id(ctx, fid).name().to_string();
+        let raw = FunctionBody::from_id(ctx, fid).name().to_string();
         let sym = raw.split('@').next().unwrap_or(&raw);
         let Some(proto) = cabi::lookup(target, sym) else {
             continue;
@@ -297,7 +297,7 @@ fn bind_external_args(
     default_space: SpaceId,
     ptr_width: usize,
 ) -> bool {
-    Function::from_id_mut(ctx, fid)
+    FunctionBody::from_id_mut(ctx, fid)
         .set_input_arg_names(plan.iter().map(|a| a.name.clone()).collect());
 
     let mut changed = false;

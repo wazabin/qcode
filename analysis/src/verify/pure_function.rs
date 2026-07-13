@@ -1,6 +1,6 @@
 //! Verify the `is_pure` invariant.
 //!
-//! A function flagged [`Function::is_pure`] is asserted to be a deterministic
+//! A function flagged [`FunctionBody::is_pure`] is asserted to be a deterministic
 //! pure function of its params — argpromote has functionalized every side-effect
 //! channel. Pure-function emulation in constant propagation relies on this: it
 //! emulates such a callee to harvest constant return values. This rule re-derives
@@ -11,7 +11,7 @@ use qcode::{
     context::Context,
     space::SpaceType,
     value::{
-        Function, FunctionId, Instruction, LocalValueId,
+        FunctionBody, FunctionId, Instruction, LocalValueId,
         insn::{InstructionId, Mnemonic},
     },
 };
@@ -26,7 +26,7 @@ pub struct PureFunctionViolation {
 
 impl PureFunctionViolation {
     pub fn diagnostic(&self, ctx: &Context<'_>) -> String {
-        let name = Function::from_id(ctx, self.function).name().to_owned();
+        let name = FunctionBody::from_id(ctx, self.function).name().to_owned();
         let insn = Instruction::from_id(ctx, self.insn);
         let addr = insn
             .address()
@@ -69,7 +69,7 @@ fn impurity(ctx: &Context, m: &Mnemonic) -> Option<&'static str> {
         Mnemonic::Map(m) => (!m
             .body
             .real()
-            .is_some_and(|body| Function::from_id(ctx, body).is_pure()))
+            .is_some_and(|body| FunctionBody::from_id(ctx, body).is_pure()))
         .then_some("map with impure or minted body"),
         // A scan, like a map, is a deterministic value of its array argument and
         // initial accumulator iff its per-element body is pure (the body symbol is
@@ -77,12 +77,12 @@ fn impurity(ctx: &Context, m: &Mnemonic) -> Option<&'static str> {
         Mnemonic::Scan(m) => (!m
             .body
             .real()
-            .is_some_and(|body| Function::from_id(ctx, body).is_pure()))
+            .is_some_and(|body| FunctionBody::from_id(ctx, body).is_pure()))
         .then_some("scan with impure or minted body"),
         Mnemonic::Apply(m) => (!m
             .target
             .real()
-            .is_some_and(|target| Function::from_id(ctx, target).is_pure()))
+            .is_some_and(|target| FunctionBody::from_id(ctx, target).is_pure()))
         .then_some("apply with impure or minted target"),
         // A pure function reads its inputs only through params: a raw varnode
         // operand is an un-functionalized register/global read.
@@ -99,10 +99,10 @@ fn impurity(ctx: &Context, m: &Mnemonic) -> Option<&'static str> {
 pub fn verify_pure_functions(ctx: &Context<'_>) -> Vec<PureFunctionViolation> {
     let mut violations = Vec::new();
     for fid in ctx.function_ids() {
-        if !Function::from_id(ctx, fid).is_pure() {
+        if !FunctionBody::from_id(ctx, fid).is_pure() {
             continue;
         }
-        for block in Function::from_id(ctx, fid).iter() {
+        for block in FunctionBody::from_id(ctx, fid).iter() {
             for insn in block.iter() {
                 if let Some(reason) = impurity(ctx, insn.mnemonic()) {
                     violations.push(PureFunctionViolation {
@@ -128,10 +128,10 @@ mod tests {
 
     /// Build a single-block function, mark it `is_pure`, and run `body` to fill it.
     fn pure_flagged_fn(tc: &mut TestContext, body: impl FnOnce(&mut Builder)) -> FunctionId {
-        let fid = Function::make(&mut tc.ctx, "f".into()).unwrap().id;
+        let fid = FunctionBody::make(&mut tc.ctx, "f".into()).unwrap().id;
         let entry = { tc.ctx.get_or_make_block(0x1000, fid) };
         {
-            let mut f = Function::from_id_mut(&mut tc.ctx, fid);
+            let mut f = FunctionBody::from_id_mut(&mut tc.ctx, fid);
             f.set_root(entry).unwrap();
             f.add_block(entry);
         }
@@ -140,7 +140,7 @@ mod tests {
             body(&mut b);
             unsafe { b.dont_finalize() };
         }
-        Function::from_id_mut(&mut tc.ctx, fid).set_is_pure(true);
+        FunctionBody::from_id_mut(&mut tc.ctx, fid).set_is_pure(true);
         fid
     }
 

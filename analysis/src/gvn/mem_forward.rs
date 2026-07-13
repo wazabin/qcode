@@ -217,7 +217,7 @@ impl MemForward {
     /// Concrete pass twin of [`record_store`](Self::record_store).
     pub(super) fn record_store_c<'str>(
         &mut self,
-        body: &mut FunctionBody<'_, 'str>,
+        body: &mut FunctionBody<'str>,
         cx: ContextView<'_, 'str>,
         func: FunctionId,
         store: &Store,
@@ -230,13 +230,13 @@ impl MemForward {
         let end = start + store.size as i64;
 
         self.byte_map.retain(|&(cb, _), _| {
-            cb == base || cross_base_disjoint(body.read_host(cx), aliases, store_ptr, base, cb)
+            cb == base || cross_base_disjoint(cx.read_host(body), aliases, store_ptr, base, cb)
         });
 
         for off in start..end {
             self.byte_map.remove(&(base, off));
         }
-        let covered = ValueRef::from_host(body.read_host(cx), store_src)
+        let covered = ValueRef::from_host(cx.read_host(body), store_src)
             .size()
             .min(store.size);
         for (i, off) in (start..start + covered as i64).enumerate() {
@@ -249,7 +249,7 @@ impl MemForward {
             );
         }
         if covered < store.size {
-            let zero = body.read_host(cx).shr().get_const(0, store.size - covered);
+            let zero = cx.read_host(body).shr().get_const(0, store.size - covered);
             for (i, off) in (start + covered as i64..end).enumerate() {
                 self.byte_map.insert(
                     (base, off),
@@ -266,7 +266,7 @@ impl MemForward {
     #[allow(clippy::too_many_arguments)]
     pub(super) fn try_load_c<'str>(
         &mut self,
-        body: &mut FunctionBody<'_, 'str>,
+        body: &mut FunctionBody<'str>,
         cx: ContextView<'_, 'str>,
         block_id: BlockId,
         insn_id: qcode::value::InstructionId,
@@ -288,7 +288,7 @@ impl MemForward {
             && segments[0].load_off == 0
             && segments[0].size == load_size
             && segments[0].src_off == 0
-            && ValueRef::from_host(body.read_host(cx), segments[0].src).size() == load_size
+            && ValueRef::from_host(cx.read_host(body), segments[0].src).size() == load_size
         {
             segments[0].src
         } else if load_size > 8 {
@@ -302,7 +302,7 @@ impl MemForward {
     /// Concrete pass twin of [`rebuild`](Self::rebuild).
     fn rebuild_c<'str>(
         &self,
-        body: &mut FunctionBody<'_, 'str>,
+        body: &mut FunctionBody<'str>,
         cx: ContextView<'_, 'str>,
         block_id: BlockId,
         insn_id: qcode::value::InstructionId,
@@ -316,7 +316,7 @@ impl MemForward {
                 None => piece,
                 Some(lhs) => {
                     let or = body.push_mnemonic(
-                        cx,
+                        cx.shr(),
                         Mnemonic::Binop(Binary {
                             op: Binop::Int(IntBinop::Or),
                             lhs: lhs.localize(block_id.func),
@@ -324,7 +324,7 @@ impl MemForward {
                         }),
                         load_size,
                     );
-                    body.insert_insn_before(cx, block_id, insn_id, or);
+                    body.insert_insn_before(block_id, insn_id, or);
                     or.into()
                 }
             });
@@ -335,12 +335,12 @@ impl MemForward {
     /// Concrete pass twin of [`rebuild_bytes`](Self::rebuild_bytes).
     fn rebuild_bytes_c<'str>(
         &self,
-        body: &mut FunctionBody<'_, 'str>,
+        body: &mut FunctionBody<'str>,
         cx: ContextView<'_, 'str>,
         segments: &[Segment],
         load_size: usize,
     ) -> Option<ValueId> {
-        let ctx = body.read_host(cx).shr();
+        let ctx = cx.read_host(body).shr();
         let mut buf = vec![0u8; load_size];
         for seg in segments {
             let bytes: Vec<u8> = match seg.src {
@@ -368,19 +368,19 @@ impl MemForward {
     /// Concrete pass twin of [`build_piece`](Self::build_piece).
     fn build_piece_c<'str>(
         &self,
-        body: &mut FunctionBody<'_, 'str>,
+        body: &mut FunctionBody<'str>,
         cx: ContextView<'_, 'str>,
         block_id: BlockId,
         insn_id: qcode::value::InstructionId,
         seg: &Segment,
         load_size: usize,
     ) -> ValueId {
-        let src_size = ValueRef::from_host(body.read_host(cx), seg.src).size();
+        let src_size = ValueRef::from_host(cx.read_host(body), seg.src).size();
         let extracted = if seg.src_off == 0 && src_size == seg.size {
             seg.src
         } else {
             let r = body.push_mnemonic(
-                cx,
+                cx.shr(),
                 Mnemonic::Range(Range {
                     src: seg.src.localize(block_id.func),
                     start: seg.src_off,
@@ -388,7 +388,7 @@ impl MemForward {
                 }),
                 seg.size,
             );
-            body.insert_insn_before(cx, block_id, insn_id, r);
+            body.insert_insn_before(block_id, insn_id, r);
             r.into()
         };
 
@@ -396,26 +396,26 @@ impl MemForward {
             extracted
         } else {
             let z = body.push_mnemonic(
-                cx,
+                cx.shr(),
                 Mnemonic::Zext(Zext {
                     src: extracted.localize(block_id.func),
                     size: load_size,
                 }),
                 load_size,
             );
-            body.insert_insn_before(cx, block_id, insn_id, z);
+            body.insert_insn_before(block_id, insn_id, z);
             z.into()
         };
 
         if seg.load_off == 0 {
             return widened;
         }
-        let shamt = body
-            .read_host(cx)
+        let shamt = cx
+            .read_host(body)
             .shr()
             .get_const((seg.load_off * 8) as u64, load_size);
         let s = body.push_mnemonic(
-            cx,
+            cx.shr(),
             Mnemonic::Binop(Binary {
                 op: Binop::Int(IntBinop::ShiftLeft),
                 lhs: widened.localize(block_id.func),
@@ -423,7 +423,7 @@ impl MemForward {
             }),
             load_size,
         );
-        body.insert_insn_before(cx, block_id, insn_id, s);
+        body.insert_insn_before(block_id, insn_id, s);
         s.into()
     }
 
@@ -780,7 +780,7 @@ impl MemForward {
 mod tests {
     use super::*;
     use qcode::testing::TestContext;
-    use qcode::value::{BasicBlock, Function};
+    use qcode::value::{BasicBlock, FunctionBody};
 
     /// A store of `src` (width = location width) to varnode `vn`.
     fn store_to(tc: &TestContext, func: FunctionId, vn: VarnodeId, src: ValueId) -> Store {
@@ -811,15 +811,14 @@ mod tests {
     fn with_body<R>(
         tc: &mut TestContext,
         fid: qcode::value::FunctionId,
-        f: impl FnOnce(&mut FunctionBody<'_, 'static>, ContextView<'_, 'static>) -> R,
+        f: impl FnOnce(&mut FunctionBody<'static>, ContextView<'_, 'static>) -> R,
     ) -> R {
         use crate::pipeline::ContextSplit;
         let env = crate::test_util::dummy_env();
         let before = tc.ctx.direct_call_targets(fid);
         let out = {
             let (bodies, view) = tc.ctx.split(&env);
-            let mut body = FunctionBody::new(&mut bodies[fid]);
-            f(&mut body, view)
+            f(&mut bodies[fid], view)
         };
         tc.ctx.resync_call_sites(fid, &before);
         out
@@ -958,16 +957,16 @@ mod tests {
         use crate::gvn::affine::precompute_forms;
         use qcode::{
             builder::Builder,
-            value::{BasicBlock, Function},
+            value::{BasicBlock, FunctionBody},
         };
 
         let mut tc = TestContext::new();
         let sp_reg = tc.r0;
-        let fid = Function::make(&mut tc.ctx, "f".into()).unwrap().id;
-        let callee = Function::make(&mut tc.ctx, "callee".into()).unwrap().id;
+        let fid = FunctionBody::make(&mut tc.ctx, "f".into()).unwrap().id;
+        let callee = FunctionBody::make(&mut tc.ctx, "callee".into()).unwrap().id;
         let root = { tc.ctx.get_or_make_block(0x1000, fid) };
         {
-            let mut f = Function::from_id_mut(&mut tc.ctx, fid);
+            let mut f = FunctionBody::from_id_mut(&mut tc.ctx, fid);
             f.set_root(root).unwrap();
             f.add_block(root);
         }
@@ -1116,10 +1115,10 @@ mod tests {
         use qcode::builder::Builder;
 
         let mut tc = TestContext::new();
-        let fun_id = Function::make(&mut tc.ctx, "f".into()).unwrap().id;
+        let fun_id = FunctionBody::make(&mut tc.ctx, "f".into()).unwrap().id;
         let block = { tc.ctx.get_or_make_block(0x1000, fun_id) };
         {
-            let mut f = Function::from_id_mut(&mut tc.ctx, fun_id);
+            let mut f = FunctionBody::from_id_mut(&mut tc.ctx, fun_id);
             f.set_root(block).unwrap();
             f.add_block(block);
         }
@@ -1163,20 +1162,20 @@ mod tests {
 
         let mut tc = TestContext::new();
         let ram = tc.ctx.shared.default_space;
-        let callee = Function::make(&mut tc.ctx, "callee".into()).unwrap().id;
+        let callee = FunctionBody::make(&mut tc.ctx, "callee".into()).unwrap().id;
         // A resolved callee with an empty clobber set, so registers are irrelevant.
-        Function::from_id_mut(&mut tc.ctx, callee).set_clobbered_regs(vec![]);
+        FunctionBody::from_id_mut(&mut tc.ctx, callee).set_clobbered_regs(vec![]);
         if readonly {
-            Function::from_id_mut(&mut tc.ctx, callee).set_param_attrs(vec![ParamAttrs {
+            FunctionBody::from_id_mut(&mut tc.ctx, callee).set_param_attrs(vec![ParamAttrs {
                 readonly: true,
                 nocapture: false,
             }]);
         }
 
-        let fun_id = Function::make(&mut tc.ctx, "f".into()).unwrap().id;
+        let fun_id = FunctionBody::make(&mut tc.ctx, "f".into()).unwrap().id;
         let block = { tc.ctx.get_or_make_block(0x1000, fun_id) };
         {
-            let mut f = Function::from_id_mut(&mut tc.ctx, fun_id);
+            let mut f = FunctionBody::from_id_mut(&mut tc.ctx, fun_id);
             f.set_root(block).unwrap();
             f.add_block(block);
         }
@@ -1261,11 +1260,11 @@ mod tests {
         use qcode::builder::Builder;
 
         let mut tc = TestContext::new();
-        let caller = Function::make(&mut tc.ctx, "caller".into()).unwrap().id;
-        let callee = Function::make(&mut tc.ctx, "callee".into()).unwrap().id;
+        let caller = FunctionBody::make(&mut tc.ctx, "caller".into()).unwrap().id;
+        let callee = FunctionBody::make(&mut tc.ctx, "callee".into()).unwrap().id;
         let block = { tc.ctx.get_or_make_block(0x1000, caller) };
         {
-            let mut f = Function::from_id_mut(&mut tc.ctx, caller);
+            let mut f = FunctionBody::from_id_mut(&mut tc.ctx, caller);
             f.set_root(block).unwrap();
             f.add_block(block);
         }
@@ -1273,7 +1272,7 @@ mod tests {
         // never writes real `ram`.
         let scratch = tc.ctx.make_temp_space();
         let ram = tc.ctx.shared.default_space;
-        Function::from_id_mut(&mut tc.ctx, callee).set_written_spaces(Some(vec![scratch]));
+        FunctionBody::from_id_mut(&mut tc.ctx, callee).set_written_spaces(Some(vec![scratch]));
 
         // The caller block ends in a direct call to `callee`, passing a frame
         // pointer (so a pointer escapes — the no-summary path would drop the cell).

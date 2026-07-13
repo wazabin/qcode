@@ -21,7 +21,7 @@ use qcode::{
     context::Context,
     pass_scope,
     value::{
-        BasicBlock, Function, FunctionId,
+        BasicBlock, FunctionBody, FunctionId,
         block::BlockId,
         insn::{InstructionId, Mnemonic},
     },
@@ -67,7 +67,7 @@ pub fn assume_call_returns(ctx: &mut Context) -> usize {
     let mut count = 0;
 
     for func_id in func_ids {
-        let block_ids: Vec<BlockId> = qcode::value::Function::from_id(ctx, func_id).block_ids();
+        let block_ids: Vec<BlockId> = qcode::value::FunctionBody::from_id(ctx, func_id).block_ids();
 
         // (call_block, callee) to act on after the read-only scan releases its
         // borrow of `ctx`.
@@ -140,7 +140,7 @@ pub fn verify_assumptions(ctx: &mut Context) -> usize {
             qcode::pass_log!(
                 debug,
                 "proved {} {}",
-                Function::from_id(ctx, callee).name(),
+                FunctionBody::from_id(ctx, callee).name(),
                 if returns { "returns" } else { "noreturn" },
             );
         }
@@ -186,7 +186,7 @@ pub fn verify_forced_returns(
 /// External stubs have no body, so they are taken to return unless their name is
 /// in [`NORETURN_NAMES`].
 fn function_returns(ctx: &Context, f: FunctionId) -> bool {
-    let func = Function::from_id(ctx, f);
+    let func = FunctionBody::from_id(ctx, f);
 
     if is_noreturn_name(func.name()) {
         return false;

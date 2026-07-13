@@ -315,7 +315,7 @@ fn try_match_strlen(host: HostRef, fid: FunctionId) -> Option<StrlenMatch> {
 /// `len(take_while(@arr))`, then (when the scan is wholly private) strip the seed
 /// and delete the dead loop.
 fn apply_strlen<'str>(
-    body: &mut FunctionBody<'_, 'str>,
+    body: &mut FunctionBody<'str>,
     cx: ContextView<'_, 'str>,
     fid: FunctionId,
     m: &StrlenMatch,
@@ -323,9 +323,14 @@ fn apply_strlen<'str>(
     // take_while(@arr) then len(...) of it, inserted at the top of the exit block.
     let tw_id = IntrinsicId::from_name("take_while").expect("take_while registered");
     let len_id = IntrinsicId::from_name("len").expect("len registered");
-    let first = body.block_ref(cx, m.exit_block).iter().next().map(|i| i.id);
+    let first = cx
+        .read_host(body)
+        .block_ref(m.exit_block)
+        .iter()
+        .next()
+        .map(|i| i.id);
     let len_val = {
-        let mut host = body.host(cx);
+        let mut host = cx.host(body);
         let mut b = Builder::from_block(BaseRef::new(host.reborrow(), m.exit_block));
         if let Some(at) = first {
             b.set_insert_point_before(at);
@@ -333,7 +338,7 @@ fn apply_strlen<'str>(
         let tw = b.push_intrinsic(tw_id, vec![m.arr]).id();
         b.push_intrinsic(len_id, vec![tw]).id()
     };
-    body.replace_all_uses_with(cx, m.count_param, len_val);
+    body.replace_all_uses_with(m.count_param, len_val);
 
     if m.deletable {
         // The count was the loop's only escape and is now forwarded to `len`, so the
@@ -345,8 +350,8 @@ fn apply_strlen<'str>(
         //      `at`-form scan reads the root array param directly.)
         // `remove_params_from_block` and `delete_private_loop` are still host-generic
         // (cross-module helpers, migrated in their own chunks), so drive them through a
-        // scoped `body.host(cx)`.
-        let mut host = body.host(cx);
+        // scoped `cx.host(body)`.
+        let mut host = cx.host(body);
         let kx = host
             .block_ref(m.exit_block)
             .params()
@@ -376,12 +381,12 @@ fn apply_strlen<'str>(
 
 /// Recognize a bounded NUL-scan in this (pure) function, rewriting its escaping
 /// count to `len(take_while(arr))`. Returns `true` if changed.
-fn recognize_strlen_at<'str>(m: ContextView<'_, 'str>, body: &mut FunctionBody<'_, 'str>) -> bool {
+fn recognize_strlen_at<'str>(m: ContextView<'_, 'str>, body: &mut FunctionBody<'str>) -> bool {
     let fid = body.id();
-    if !body.read_host(m).function_ref(fid).is_pure() {
+    if !m.read_host(body).function_ref(fid).is_pure() {
         return false;
     }
-    let Some(sm) = try_match_strlen(body.read_host(m), fid) else {
+    let Some(sm) = try_match_strlen(m.read_host(body), fid) else {
         return false;
     };
     apply_strlen(body, m, fid, &sm)
@@ -541,29 +546,29 @@ fn try_match_strlen_ptr(host: HostRef, fid: FunctionId) -> Option<StrlenPtrMatch
 /// Rewrite a matched raw-pointer scan: replace its `end - base` difference with
 /// `len(take_while(@base))` over the unbounded string at `@base`.
 fn apply_strlen_ptr<'str>(
-    body: &mut FunctionBody<'_, 'str>,
+    body: &mut FunctionBody<'str>,
     cx: ContextView<'_, 'str>,
     m: &StrlenPtrMatch,
 ) -> bool {
     let tw_id = IntrinsicId::from_name("take_while").expect("take_while registered");
     let len_id = IntrinsicId::from_name("len").expect("len registered");
     let len_val = {
-        let mut host = body.host(cx);
+        let mut host = cx.host(body);
         let mut b = Builder::from_block(BaseRef::new(host.reborrow(), m.diff_block));
         b.set_insert_point_before(m.diff_id);
         let tw = b.push_intrinsic(tw_id, vec![m.base]).id();
         b.push_intrinsic(len_id, vec![tw]).id()
     };
-    body.replace_all_uses_with(cx, ValueId::Instruction(m.diff_id), len_val);
-    body.remove_instruction(cx, m.diff_id);
+    body.replace_all_uses_with(ValueId::Instruction(m.diff_id), len_val);
+    body.remove_instruction(m.diff_id);
     // The scan now produces nothing used outside it; later DCE removes the dead loop.
     true
 }
 
 /// Recognize a raw-pointer NUL-scan in this function, rewriting its `end - base`
 /// length to `len(take_while(base))`. Returns `true` if changed.
-fn recognize_strlen_ptr<'str>(m: ContextView<'_, 'str>, body: &mut FunctionBody<'_, 'str>) -> bool {
-    let Some(sm) = try_match_strlen_ptr(body.read_host(m), body.id()) else {
+fn recognize_strlen_ptr<'str>(m: ContextView<'_, 'str>, body: &mut FunctionBody<'str>) -> bool {
+    let Some(sm) = try_match_strlen_ptr(m.read_host(body), body.id()) else {
         return false;
     };
     apply_strlen_ptr(body, m, &sm)
@@ -579,8 +584,9 @@ impl FunctionPass for Strlen {
     }
     fn run<'str>(
         &self,
-        f: &mut FunctionBody<'_, 'str>,
+        f: &mut FunctionBody<'str>,
         m: ContextView<'_, 'str>,
+        _next_minted: &mut u32,
     ) -> Result<Outcome<'str>, String> {
         // Layer 1 (at-form snapshot) then Layer 2 (raw char*); mutually exclusive
         // on any one function.
@@ -599,7 +605,7 @@ mod tests {
         builder::Builder,
         context::Context,
         testing::TestContext,
-        value::{BasicBlock, Function, Value, insn::Mnemonic},
+        value::{BasicBlock, FunctionBody, Value, insn::Mnemonic},
     };
 
     use crate::test_util::run_function_pass;
@@ -628,13 +634,13 @@ mod tests {
         let shadow = tc.ctx.make_temp_space();
         let ram = tc.ctx.shared.default_space;
 
-        let fid = Function::make(&mut tc.ctx, "copy".into()).unwrap().id;
+        let fid = FunctionBody::make(&mut tc.ctx, "copy".into()).unwrap().id;
         let entry = tc.ctx.get_or_make_block(0x1000, fid);
         let header = tc.ctx.get_or_make_block(0x1010, fid);
         let body = tc.ctx.get_or_make_block(0x1020, fid);
         let exit = tc.ctx.get_or_make_block(0x1030, fid);
         {
-            let mut f = Function::from_id_mut(&mut tc.ctx, fid);
+            let mut f = FunctionBody::from_id_mut(&mut tc.ctx, fid);
             f.set_root(entry).unwrap();
             f.add_block(entry);
             f.add_block(header);
@@ -701,7 +707,7 @@ mod tests {
             b.push_return(dummy);
         }
 
-        Function::from_id_mut(&mut tc.ctx, fid).set_is_pure(true);
+        FunctionBody::from_id_mut(&mut tc.ctx, fid).set_is_pure(true);
         (fid, exit, arr)
     }
     // ===== recognizer (strlen) =============================================
@@ -728,13 +734,13 @@ mod tests {
         let shadow = tc.ctx.make_temp_space();
         let ram = tc.ctx.shared.default_space;
 
-        let fid = Function::make(&mut tc.ctx, "slen".into()).unwrap().id;
+        let fid = FunctionBody::make(&mut tc.ctx, "slen".into()).unwrap().id;
         let entry = tc.ctx.get_or_make_block(0x1000, fid);
         let header = tc.ctx.get_or_make_block(0x1010, fid);
         let body = tc.ctx.get_or_make_block(0x1020, fid);
         let exit = tc.ctx.get_or_make_block(0x1030, fid);
         {
-            let mut f = Function::from_id_mut(&mut tc.ctx, fid);
+            let mut f = FunctionBody::from_id_mut(&mut tc.ctx, fid);
             f.set_root(entry).unwrap();
             f.add_block(entry);
             f.add_block(header);
@@ -795,7 +801,7 @@ mod tests {
             b.push_return(dummy);
         }
 
-        Function::from_id_mut(&mut tc.ctx, fid).set_is_pure(true);
+        FunctionBody::from_id_mut(&mut tc.ctx, fid).set_is_pure(true);
         (fid, exit, arr)
     }
 
@@ -841,10 +847,10 @@ mod tests {
             Some(arr),
             "the escaping count becomes len(take_while(@arr))"
         );
-        assert!(Function::from_id(&tc.ctx, fid).is_pure());
+        assert!(FunctionBody::from_id(&tc.ctx, fid).is_pure());
         // The private scan is deleted: only entry + exit remain.
         assert_eq!(
-            Function::from_id(&tc.ctx, fid).iter().count(),
+            FunctionBody::from_id(&tc.ctx, fid).iter().count(),
             2,
             "the dead scan loop is removed"
         );
@@ -911,13 +917,13 @@ mod tests {
         with_diff: bool,
     ) -> (FunctionId, BlockId, ValueId) {
         let ram = tc.ctx.shared.default_space;
-        let fid = Function::make(&mut tc.ctx, "strlen".into()).unwrap().id;
+        let fid = FunctionBody::make(&mut tc.ctx, "strlen".into()).unwrap().id;
         let entry = tc.ctx.get_or_make_block(0x2000, fid);
         let header = tc.ctx.get_or_make_block(0x2010, fid);
         let body = tc.ctx.get_or_make_block(0x2020, fid);
         let exit = tc.ctx.get_or_make_block(0x2030, fid);
         {
-            let mut f = Function::from_id_mut(&mut tc.ctx, fid);
+            let mut f = FunctionBody::from_id_mut(&mut tc.ctx, fid);
             f.set_root(entry).unwrap();
             f.add_block(entry);
             f.add_block(header);

@@ -8,7 +8,7 @@
 use qcode::{
     context::Context,
     value::{
-        BasicBlock, Function, FunctionId, Instruction, Value, ValueId, ValueRef,
+        BasicBlock, FunctionBody, FunctionId, Instruction, Value, ValueId, ValueRef,
         insn::InstructionId,
     },
 };
@@ -32,7 +32,7 @@ pub struct ArgSizeMismatch {
 
 impl PureRegCallArgsViolation {
     fn to_string_with_ctx(&self, ctx: &Context<'_>) -> String {
-        let callee = Function::from_id(ctx, self.callee).name().to_owned();
+        let callee = FunctionBody::from_id(ctx, self.callee).name().to_owned();
         let call = Instruction::from_id(ctx, self.call);
         let call_addr = call
             .address()
@@ -63,7 +63,7 @@ pub fn verify_pure_reg_call_args(ctx: &Context<'_>) -> Vec<PureRegCallArgsViolat
     let mut violations = Vec::new();
 
     for callee in ctx.function_ids() {
-        let function = Function::from_id(ctx, callee);
+        let function = FunctionBody::from_id(ctx, callee);
         if !function.is_pure_reg() {
             continue;
         }
@@ -130,21 +130,21 @@ mod tests {
         builder::Builder,
         testing::TestContext,
         value::{
-            Function,
+            FunctionBody,
             insn::{Call, Mnemonic},
         },
     };
 
     fn pure_callee_with_params(tc: &mut TestContext, sizes: &[usize]) -> FunctionId {
-        let callee = Function::make(&mut tc.ctx, "callee".into()).unwrap().id;
+        let callee = FunctionBody::make(&mut tc.ctx, "callee".into()).unwrap().id;
         let root = { tc.ctx.get_or_make_block(0x1000, callee) };
-        Function::from_id_mut(&mut tc.ctx, callee)
+        FunctionBody::from_id_mut(&mut tc.ctx, callee)
             .set_root(root)
             .unwrap();
         for &size in sizes {
             BasicBlock::from_id_mut(&mut tc.ctx, root).push_param(size);
         }
-        Function::from_id_mut(&mut tc.ctx, callee).set_pure_reg(true);
+        FunctionBody::from_id_mut(&mut tc.ctx, callee).set_pure_reg(true);
         callee
     }
 
@@ -153,9 +153,9 @@ mod tests {
         callee: FunctionId,
         args: Vec<ValueId>,
     ) -> InstructionId {
-        let caller = Function::make(&mut tc.ctx, "caller".into()).unwrap().id;
+        let caller = FunctionBody::make(&mut tc.ctx, "caller".into()).unwrap().id;
         let block = { tc.ctx.get_or_make_block(0x2000, caller) };
-        Function::from_id_mut(&mut tc.ctx, caller)
+        FunctionBody::from_id_mut(&mut tc.ctx, caller)
             .set_root(block)
             .unwrap();
         let call_id = {
@@ -226,7 +226,7 @@ mod tests {
     fn ignores_non_pure_reg_callees() {
         let mut tc = TestContext::new();
         let callee = pure_callee_with_params(&mut tc, &[8, 4]);
-        Function::from_id_mut(&mut tc.ctx, callee).set_pure_reg(false);
+        FunctionBody::from_id_mut(&mut tc.ctx, callee).set_pure_reg(false);
         let a0 = tc.ctx.get_const(0x11, 8).id();
         caller_calling(&mut tc, callee, vec![a0]);
 

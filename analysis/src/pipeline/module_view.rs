@@ -21,15 +21,10 @@ use std::borrow::Cow;
 use jstd::registry::Registry;
 use qcode::{
     context::{Context, Shared},
-    error::Result,
-    types::TypeId,
     value::{
-        BlockParamRef, BlockRef, Function, FunctionId, FunctionKind, FunctionRef, InstructionRef,
-        ValueId,
-        block::{BasicBlock, BlockId, EdgeId},
-        block_param::{BlockParam, BlockParamId},
+        FunctionBody, FunctionId, FunctionKind,
         function::FunctionInterface,
-        insn::{Callee, Instruction, InstructionId, Mnemonic},
+        insn::Callee,
         util::{base_ref::HostRef, host_mut::PassBacking},
     },
 };
@@ -42,12 +37,12 @@ use super::PipelineEnv;
 /// it is not a reserved registry ID. `ambient` is the owner's installed ID,
 /// borrowed temporarily while building the detached body's checked refs. The
 /// body stores local IR IDs, so installation only rebinds block ownership and
-/// local-name metadata through [`Function::rebind_ambient_id`].
+/// local-name metadata through [`FunctionBody::rebind_ambient_id`].
 pub struct Minted<'str> {
     slot: u32,
     ambient: FunctionId,
     pub interface: FunctionInterface<'str>,
-    pub body: Function<'str>,
+    pub body: FunctionBody<'str>,
 }
 
 impl<'str> Minted<'str> {
@@ -72,7 +67,7 @@ impl<'str> Minted<'str> {
     pub fn into_installed_parts(
         mut self,
         installed: FunctionId,
-    ) -> (u32, FunctionInterface<'str>, Function<'str>) {
+    ) -> (u32, FunctionInterface<'str>, FunctionBody<'str>) {
         self.body.rebind_ambient_id(self.ambient, installed);
         (self.slot, self.interface, self.body)
     }
@@ -83,7 +78,7 @@ impl<'str> Minted<'str> {
 ///
 /// Returned **by value** from [`FunctionPass::run`](super::FunctionPass::run), so
 /// a pass touches no wrapper scratch: `rename` subsumes the old `Effects` buffer
-/// and `minted` subsumes the old `FunctionBody.minted` field. The driver replays
+/// and `minted` subsumes the old analysis wrapper's minted buffer. The driver replays
 /// `rename` and installs `minted` at the post-run barrier in worklist order,
 /// exactly as it drained the wrapper before — the transport changes, the barrier
 /// semantics do not.
@@ -97,7 +92,7 @@ pub struct Outcome<'str> {
     pub rename: Option<Cow<'str, str>>,
     /// Functions this run minted (the loop outliners), installed by the driver at
     /// the barrier. Concatenated across a function's pass fixpoint; entry `k`
-    /// carries slot `k`, because the slot counter lives on [`FunctionBody`].
+    /// carries slot `k`, allocated by the driver's per-owner stage cursor.
     pub minted: Vec<Minted<'str>>,
 }
 
@@ -190,6 +185,26 @@ impl<'ctx, 'str> ContextView<'ctx, 'str> {
     pub fn interfaces(&self) -> &'ctx Registry<FunctionId, FunctionInterface<'str>> {
         self.interfaces
     }
+
+    /// Build the mutation host for a pass's exclusively borrowed body.
+    pub fn host<'body>(self, body: &'body mut FunctionBody<'str>) -> PassBacking<'body, 'str>
+    where
+        'ctx: 'body,
+    {
+        PassBacking::new(body, self.shared, self.interfaces)
+    }
+
+    /// Build the copyable read host for a pass's borrowed body.
+    pub fn read_host<'body>(self, body: &'body FunctionBody<'str>) -> HostRef<'body, 'str>
+    where
+        'ctx: 'body,
+    {
+        HostRef::Checked {
+            fun: body,
+            shared: self.shared,
+            interfaces: self.interfaces,
+        }
+    }
 }
 
 /// The driver-side disjoint borrow of the context-split design (00-overview):
@@ -202,7 +217,7 @@ pub trait ContextSplit<'str> {
         &'a mut self,
         env: &'a PipelineEnv,
     ) -> (
-        &'a mut Registry<FunctionId, Function<'str>>,
+        &'a mut Registry<FunctionId, FunctionBody<'str>>,
         ContextView<'a, 'str>,
     );
 }
@@ -212,7 +227,7 @@ impl<'str> ContextSplit<'str> for Context<'str> {
         &'a mut self,
         env: &'a PipelineEnv,
     ) -> (
-        &'a mut Registry<FunctionId, Function<'str>>,
+        &'a mut Registry<FunctionId, FunctionBody<'str>>,
         ContextView<'a, 'str>,
     ) {
         (
@@ -226,496 +241,100 @@ impl<'str> ContextSplit<'str> for Context<'str> {
     }
 }
 
-/// The pass's own function, borrowed `&mut` in place from the bodies registry so
-/// the pass owns it exclusively, plus its local minted-placeholder counter.
-///
-/// The body is borrowed by the driver's [`split`](ContextSplit::split) and never
-/// leaves the registry; the exclusive `&mut` is what lets parallel workers hold
-/// disjoint `&mut FunctionBody`s over the same frozen [`ContextView`]. The one
-/// global effect a pass legitimately requests — a self-rename — is returned in
-/// [`Outcome::rename`] and applied by the driver at the barrier.
-pub struct FunctionBody<'a, 'str> {
-    /// The function being optimized, borrowed **in place** from the bodies
-    /// registry (its arenas, roster, root, users, names). The body never leaves
-    /// the registry — the `&mut` is what gives the pass exclusive access while the
-    /// frozen [`ContextView`] shares the rest of the module.
-    fun: &'a mut Function<'str>,
-    /// Next placeholder slot. It lives on the checked-out body (not a single
-    /// pass outcome), so slots remain unique and ordered across a stage fixpoint.
-    next_minted: u32,
+/// Mint a detached function for `owner`, advancing the driver-owned stage cursor.
+pub fn mint_function<'str>(
+    owner: &FunctionBody<'str>,
+    next_minted: &mut u32,
+    minted: &mut Vec<Minted<'str>>,
+    name: Cow<'str, str>,
+    kind: FunctionKind,
+    pure: bool,
+) -> Callee {
+    let slot = *next_minted;
+    *next_minted = next_minted
+        .checked_add(1)
+        .expect("more than u32::MAX functions minted by one function stage");
+    let mut interface = FunctionInterface::new(name);
+    interface.kind = kind;
+    if pure {
+        let sig = interface.signature.get_or_insert_default();
+        sig.is_pure = true;
+        sig.pure_reg = true;
+    }
+    minted.push(Minted {
+        slot,
+        ambient: owner.id(),
+        interface,
+        body: FunctionBody::empty_body(owner.id()),
+    });
+    Callee::Minted(slot)
 }
 
-impl<'a, 'str> FunctionBody<'a, 'str> {
-    /// Wrap `fun` borrowed in place from the bodies registry.
-    pub fn new(fun: &'a mut Function<'str>) -> Self {
-        Self {
-            fun,
-            next_minted: 0,
-        }
-    }
-
-    /// This function's id.
-    pub fn id(&self) -> FunctionId {
-        self.fun.id()
-    }
-
-    // `Function` owns a single local arena and therefore indexes parameter IDs
-    // by `.local`. Keep the composite owner check at this checked-out-body
-    // boundary so a foreign ID cannot alias an equal local slot in `self.fun`.
-    fn assert_owns_block_param(&self, id: BlockParamId) {
-        assert_eq!(
-            id.func,
-            self.id(),
-            "block parameter belongs to another function"
-        );
-    }
-
-    /// The borrowed function (read).
-    pub fn function(&self) -> &Function<'str> {
-        &*self.fun
-    }
-
-    /// A [`PassBacking`] mutation host over this body's borrowed function and the
-    /// module's read-only shared context. This is how a `FunctionPass` reads
-    /// (via [`PassBacking::read_host`]) and mutates its function — construct
-    /// block/instruction refs and `Builder`s over it.
-    pub fn host<'b>(&'b mut self, cx: ContextView<'b, 'str>) -> PassBacking<'b, 'str> {
-        PassBacking::new(&mut *self.fun, cx.shr(), cx.interfaces())
-    }
-
-    /// A `Copy` read view over this body's borrowed function and the shared
-    /// context — the recognizer-side twin of [`host`](Self::host) for passes that
-    /// only need to *read* while holding other borrows.
-    pub fn read_host<'b>(&'b self, cx: ContextView<'b, 'str>) -> HostRef<'b, 'str> {
-        HostRef::Checked {
-            fun: &*self.fun,
-            shared: cx.shr(),
-            interfaces: cx.interfaces(),
-        }
-    }
-
-    /// Mint a detached function and return its pass-local callee placeholder.
-    /// This is infallible and allocates no entry in the real function registry.
-    /// Raw names are uniquified only when the driver installs the outcome.
-    pub fn mint_function(
-        &mut self,
-        minted: &mut Vec<Minted<'str>>,
-        name: Cow<'str, str>,
-        kind: FunctionKind,
-        pure: bool,
-    ) -> Callee {
-        let slot = self.next_minted;
-        self.next_minted = self
-            .next_minted
-            .checked_add(1)
-            .expect("more than u32::MAX functions minted by one function run");
-        let mut interface = FunctionInterface::new(name);
-        interface.kind = kind;
-        if pure {
-            let sig = interface.signature.get_or_insert_default();
-            sig.is_pure = true;
-            // Full purity implies register purity — the GUI badge keys off the
-            // latter (mirrors `outline_core` / `make_lambda`).
-            sig.pure_reg = true;
-        }
-        minted.push(Minted {
-            slot,
-            ambient: self.id(),
-            interface,
-            body: Function::empty_body(self.id()),
-        });
-        Callee::Minted(slot)
-    }
-
-    /// Split into a read view of the *own* function and an exclusive
-    /// [`PassBacking`] mutation host over the minted function `callee` (a
-    /// [`mint_function`](Self::mint_function) result held in the `minted` buffer).
-    /// This is how an outliner builds a minted body: it clones expression slices
-    /// out of its own function (read) into the minted one (write), both against the
-    /// same shared context. The read view borrows `&self`; the mutation host
-    /// borrows the disjoint `minted` buffer, so the two coexist.
-    ///
-    /// The owner's real ID is used only as a safe temporary ambient ID for
-    /// checked refs. It never becomes the detached function's callee: callers
-    /// retain and insert the returned [`Callee::Minted`] handle.
-    ///
-    /// Panics if `callee` is real or is not in `minted`.
-    pub fn host_with_minted<'b>(
-        &'b self,
-        minted: &'b mut Vec<Minted<'str>>,
-        cx: ContextView<'b, 'str>,
-        callee: Callee,
-    ) -> (HostRef<'b, 'str>, PassBacking<'b, 'str>) {
-        let own = HostRef::Checked {
-            fun: &*self.fun,
-            shared: cx.shr(),
-            interfaces: cx.interfaces(),
-        };
-        let slot = callee
-            .minted()
-            .expect("host_with_minted requires a minted callee placeholder");
-        let entry = minted
-            .iter_mut()
-            .find(|entry| entry.slot == slot)
-            .expect("host_with_minted: not a function minted this run");
-        assert_eq!(
-            entry.ambient,
-            self.id(),
-            "minted entry belongs to another owner"
-        );
-        (
-            own,
-            PassBacking::new(&mut entry.body, cx.shr(), cx.interfaces()),
-        )
-    }
-}
-
-/// Inherent verb + read-accessor surface (context-split stage 5b-ii).
-///
-/// Every mutation a function pass makes and every read accessor it needs is an
-/// inherent method on the body itself: `body.verb(cx, …)`. The mutation verbs
-/// delegate to the owning [`Function`]'s inherent verbs (supplying the ambient
-/// [`id`](Self::id)); the read accessors route through a [`HostRef`] built from
-/// `self.fun` + `cx`.
-///
-/// Where a [`Function`] verb takes an explicit `func: FunctionId` for the pass's own
-/// function, the inherent method drops that parameter and supplies
-/// [`self.id()`](Self::id) instead — a function pass only ever mints/mutates into
-/// its own body.
-impl<'body, 'str> FunctionBody<'body, 'str> {
-    // ---- births -------------------------------------------------------------
-    //
-    // `push_edge` (`Context::push_edge`) is intentionally NOT mirrored: its
-    // `EdgeData` parameter is `pub(crate)` in `qcode::value::block`, so it cannot
-    // be named from this crate without making `EdgeData` public (a core design
-    // change, out of this commit's additive scope). No pass calls `push_edge`
-    // directly — edges are created through `add_cfg_edge` — so nothing needs it.
-
-    /// Push a fresh instruction into this body's arena (recording operand uses and
-    /// the call-site cache). Mirrors [`Function::push_insn`].
-    pub fn push_insn(
-        &mut self,
-        cx: ContextView<'_, 'str>,
-        insn: Instruction<'str>,
-    ) -> InstructionId {
-        let _ = cx;
-        self.fun.push_insn(insn)
-    }
-
-    /// Push a fresh block into this body's arena and onto its roster. Mirrors
-    /// [`Function::push_block`].
-    pub fn push_block(&mut self, cx: ContextView<'_, 'str>, block: BasicBlock<'str>) -> BlockId {
-        let _ = cx;
-        self.fun.push_block(block)
-    }
-
-    /// Mint a fresh empty block, parented to this body and rostered. Mirrors
-    /// [`Function::make_block`].
-    pub fn make_block(&mut self, cx: ContextView<'_, 'str>) -> BlockId {
-        let _ = cx;
-        self.fun.make_block()
-    }
-
-    /// Push a fresh block parameter into this body's arena. Mirrors
-    /// [`Function::push_block_param`].
-    pub fn push_block_param(
-        &mut self,
-        cx: ContextView<'_, 'str>,
-        param: BlockParam<'str>,
-    ) -> BlockParamId {
-        let _ = cx;
-        self.fun.push_block_param(param)
-    }
-
-    /// Mint an `Int(size)`-typed instruction with `mnemonic`. Mirrors
-    /// [`Function::push_mnemonic`].
-    pub fn push_mnemonic(
-        &mut self,
-        cx: ContextView<'_, 'str>,
-        mnemonic: Mnemonic,
-        size: usize,
-    ) -> InstructionId {
-        self.fun.push_mnemonic(cx.shr(), mnemonic, size)
-    }
-
-    /// Mint an instruction with `mnemonic` and an explicit result `type_id`.
-    /// Mirrors [`Function::push_mnemonic_with_type`].
-    pub fn push_mnemonic_with_type(
-        &mut self,
-        cx: ContextView<'_, 'str>,
-        mnemonic: Mnemonic,
-        type_id: TypeId,
-    ) -> InstructionId {
-        let _ = cx;
-        self.fun.push_mnemonic_with_type(mnemonic, type_id)
-    }
-
-    /// Insert `insn` immediately before `before` in `block`. Mirrors
-    /// [`Function::insert_insn_before`].
-    pub fn insert_insn_before(
-        &mut self,
-        cx: ContextView<'_, 'str>,
-        block: BlockId,
-        before: InstructionId,
-        insn: InstructionId,
-    ) {
-        let _ = cx;
-        self.fun.insert_insn_before(block, before, insn)
-    }
-
-    // ---- CFG / use-map verbs ------------------------------------------------
-
-    /// Add a directed CFG edge `from -> to`. Mirrors [`Function::add_cfg_edge`].
-    pub fn add_cfg_edge(
-        &mut self,
-        cx: ContextView<'_, 'str>,
-        from: BlockId,
-        to: BlockId,
-    ) -> EdgeId {
-        let _ = cx;
-        self.fun.add_cfg_edge(from, to)
-    }
-
-    /// Remove CFG edge `edge_id` from this body. Mirrors
-    /// [`Function::remove_cfg_edge`].
-    pub fn remove_cfg_edge(&mut self, cx: ContextView<'_, 'str>, edge_id: EdgeId) {
-        let _ = cx;
-        self.fun.remove_cfg_edge(edge_id)
-    }
-
-    /// Replace every use of `old` with `new` across this body. Mirrors
-    /// [`Function::replace_all_uses_with`].
-    pub fn replace_all_uses_with(&mut self, cx: ContextView<'_, 'str>, old: ValueId, new: ValueId) {
-        let _ = cx;
-        if let Some(owner) = old.owning_function() {
-            assert_eq!(
-                owner,
-                self.id(),
-                "cannot replace uses of a value owned by another function"
-            );
-        }
-        self.fun.replace_all_uses_with(old, new)
-    }
-
-    /// Remove instruction `id` from this body (unlink edges, tombstone, prune
-    /// uses). Mirrors [`Function::remove_instruction`].
-    pub fn remove_instruction(&mut self, cx: ContextView<'_, 'str>, id: InstructionId) {
-        let _ = cx;
-        self.fun.remove_instruction(id)
-    }
-
-    /// Rehome `remove`'s outgoing edges onto `keep` and drop the direct edge.
-    /// Mirrors [`Function::merge_nodes`].
-    pub fn merge_nodes(
-        &mut self,
-        cx: ContextView<'_, 'str>,
-        keep: BlockId,
-        remove: BlockId,
-        direct_edge: EdgeId,
-    ) {
-        let _ = cx;
-        self.fun.merge_nodes(keep, remove, direct_edge)
-    }
-
-    /// Replace an instruction's mnemonic in place, keeping use/call-site maps in
-    /// sync. Mirrors [`Function::replace_instruction_mnemonic`].
-    pub fn replace_instruction_mnemonic(
-        &mut self,
-        cx: ContextView<'_, 'str>,
-        id: InstructionId,
-        mnemonic: Mnemonic,
-    ) {
-        let _ = cx;
-        self.fun.replace_instruction_mnemonic(id, mnemonic)
-    }
-
-    /// Drop `block` from its owner's roster. Mirrors [`Function::unroster_block`].
-    pub fn unroster_block(&mut self, cx: ContextView<'_, 'str>, block: BlockId) {
-        let _ = cx;
-        self.fun.unroster_block(block)
-    }
-
-    /// Remove `block` from this body (unlink edges, remove insns, detach params,
-    /// tombstone). Mirrors [`Function::delete_block`] with `function_id = self.id()`.
-    pub fn delete_block(&mut self, cx: ContextView<'_, 'str>, block: BlockId) {
-        let _ = cx;
-        self.fun.delete_block(block)
-    }
-
-    /// Absorb `other` into `keep` across the direct edge `edge_ab`. Mirrors
-    /// [`Function::absorb_block`] with `function_id = self.id()`.
-    pub fn absorb_block(
-        &mut self,
-        cx: ContextView<'_, 'str>,
-        keep: BlockId,
-        other: BlockId,
-        edge_ab: EdgeId,
-    ) {
-        let _ = cx;
-        self.fun.absorb_block(keep, other, edge_ab)
-    }
-
-    /// Register `name` for `id` in the owning table (function-local for
-    /// block/insn/param, else global). Mirrors [`Function::register_local_name`].
-    pub fn register_local_name(
-        &mut self,
-        cx: ContextView<'_, 'str>,
-        id: ValueId,
-        name: std::borrow::Cow<'str, str>,
-        old_name: Option<&str>,
-    ) -> Result<()> {
-        self.fun.register_local_name(cx.shr(), id, name, old_name)
-    }
-
-    // ---- mutable arena accessors --------------------------------------------
-    //
-    // These return `&mut` borrows *into this body*, so they cannot be routed
-    // through a freshly built `PassBacking` (the temporary host would be dropped
-    // before the borrow is returned). They delegate straight to the underlying
-    // `Function` arena accessors — behaviour-identical to the `Context` versions,
-    // which resolve to the same `self.fun.<arena>[id.local]` — and take no `cx`.
-
-    /// The instruction `id`, mutably. Mirror of [`Function::insn_mut`].
-    pub fn instruction_mut(&mut self, id: InstructionId) -> &mut Instruction<'str> {
-        self.fun.insn_mut(id)
-    }
-
-    /// The block `id`, mutably. Mirror of [`Function::block_mut`].
-    pub fn block_mut(&mut self, id: BlockId) -> &mut BasicBlock<'str> {
-        self.fun.block_mut(id)
-    }
-
-    /// The block parameter `id`, mutably. Mirror of [`Function::block_param_mut`].
-    pub fn block_param_mut(&mut self, id: BlockParamId) -> &mut BlockParam<'str> {
-        self.assert_owns_block_param(id);
-        self.fun.block_param_mut(id)
-    }
-
-    // ---- read accessors -----------------------------------------------------
-
-    /// The block `id`, routed to this body's arena. Mirror of [`HostRef::block`].
-    pub fn block<'a>(&'a self, cx: ContextView<'a, 'str>, id: BlockId) -> &'a BasicBlock<'str> {
-        self.read_host(cx).block(id)
-    }
-
-    /// The instruction `id`, routed to this body's arena. Mirror of
-    /// [`HostRef::instruction`].
-    pub fn insn<'a>(
-        &'a self,
-        cx: ContextView<'a, 'str>,
-        id: InstructionId,
-    ) -> &'a Instruction<'str> {
-        self.read_host(cx).instruction(id)
-    }
-
-    /// The block parameter `id`, routed to this body's arena. Mirror of
-    /// [`HostRef::block_param`].
-    pub fn block_param<'a>(
-        &'a self,
-        cx: ContextView<'a, 'str>,
-        id: BlockParamId,
-    ) -> &'a BlockParam<'str> {
-        self.assert_owns_block_param(id);
-        self.read_host(cx).block_param(id)
-    }
-
-    // NB: the `edge` read accessor (`HostRef::edge`, returning `&EdgeData`) is
-    // intentionally NOT mirrored — `EdgeData` is `pub(crate)` in core, so it
-    // cannot be named from this crate (see the `push_edge` note above). No pass
-    // reads a raw `&EdgeData`; edge endpoints are reached through the wrapper-ref
-    // surface (`BlockRef::successors`, …).
-
-    /// This body's instructions that use `value` as an operand. Mirror of
-    /// [`Function::users_of`]; body-local, so it needs no `cx`.
-    pub fn users_of(&self, value: ValueId) -> Vec<InstructionId> {
-        let func = self.id();
-        if value.owning_function().is_some_and(|owner| owner != func) {
-            return Vec::new();
-        }
-        self.fun
-            .users_of(value)
-            .iter()
-            .map(|&local| InstructionId::new(func, local))
-            .collect()
-    }
-
-    // ---- wrapper-ref constructors -------------------------------------------
-
-    /// A [`BlockRef`] over `id`, routed to this body. Mirror of
-    /// [`HostRef::block_ref`].
-    pub fn block_ref<'a>(&'a self, cx: ContextView<'a, 'str>, id: BlockId) -> BlockRef<'str, 'a> {
-        self.read_host(cx).block_ref(id)
-    }
-
-    /// An [`InstructionRef`] over `id`, routed to this body. Mirror of
-    /// [`HostRef::insn_ref`].
-    pub fn insn_ref<'a>(
-        &'a self,
-        cx: ContextView<'a, 'str>,
-        id: InstructionId,
-    ) -> InstructionRef<'str, 'a> {
-        self.read_host(cx).insn_ref(id)
-    }
-
-    /// A [`BlockParamRef`] over `id`, routed to this body. Mirror of
-    /// [`HostRef::param_ref`].
-    pub fn param_ref<'a>(
-        &'a self,
-        cx: ContextView<'a, 'str>,
-        id: BlockParamId,
-    ) -> BlockParamRef<'str, 'a> {
-        self.assert_owns_block_param(id);
-        self.read_host(cx).param_ref(id)
-    }
-
-    /// A [`FunctionRef`] over `f` (interface-routed for a foreign function).
-    /// Mirror of [`HostRef::function_ref`].
-    pub fn function_ref<'a>(
-        &'a self,
-        cx: ContextView<'a, 'str>,
-        f: FunctionId,
-    ) -> FunctionRef<'str, 'a> {
-        self.read_host(cx).function_ref(f)
-    }
-
-    /// A [`FunctionRef`] over this body's *own* function. The self-directed twin
-    /// of [`function_ref`](Self::function_ref).
-    pub fn self_ref<'a>(&'a self, cx: ContextView<'a, 'str>) -> FunctionRef<'str, 'a> {
-        self.read_host(cx).function_ref(self.id())
-    }
+/// Read the owner while mutating one of its detached minted bodies.
+pub fn host_with_minted<'body, 'ctx, 'str>(
+    owner: &'body FunctionBody<'str>,
+    minted: &'body mut [Minted<'str>],
+    cx: ContextView<'ctx, 'str>,
+    callee: Callee,
+) -> (HostRef<'body, 'str>, PassBacking<'body, 'str>)
+where
+    'ctx: 'body,
+{
+    let slot = callee
+        .minted()
+        .expect("host_with_minted requires a minted callee placeholder");
+    let entry = minted
+        .iter_mut()
+        .find(|entry| entry.slot == slot)
+        .expect("host_with_minted: not a function minted this run");
+    assert_eq!(
+        entry.ambient,
+        owner.id(),
+        "minted entry belongs to another owner"
+    );
+    (cx.read_host(owner), cx.host(&mut entry.body))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::test_util::dummy_env;
-    use qcode::value::insn::Mnemonic;
+    use qcode::value::{
+        ValueId,
+        block::BlockId,
+        block_param::BlockParamId,
+        insn::{InstructionId, Mnemonic},
+    };
     use qcode_macro::qcode;
 
     #[test]
     fn mint_slots_are_infallible_ordered_and_persist_across_outcomes() {
         let mut ctx = Context::new();
         qcode!(ctx, "fn mint_owner: <entry> return at i64 0;");
-        let installed_second = Function::make(&mut ctx, "installed_second".into())
+        let installed_second = FunctionBody::make(&mut ctx, "installed_second".into())
             .unwrap()
             .id;
         let env = dummy_env();
         let (bodies, view) = ctx.split(&env);
         let mut slots = bodies.select_mut(&[mint_owner]);
         let (owner, _) = slots.split_first_mut().unwrap();
-        let mut owner = FunctionBody::new(owner);
+        let mut next_minted = 0;
 
         // Model two pass outcomes aggregated across one stage fixpoint. The
-        // counter belongs to FunctionBody, so a fresh outcome Vec cannot reset it.
+        // driver-owned cursor is shared even though each pass returns a fresh Vec.
         let mut first_outcome = Vec::new();
-        let first = owner.mint_function(
+        let first = mint_function(
+            owner,
+            &mut next_minted,
             &mut first_outcome,
             "first".into(),
             FunctionKind::Lambda,
             true,
         );
         let mut second_outcome = Vec::new();
-        let second = owner.mint_function(
+        let second = mint_function(
+            owner,
+            &mut next_minted,
             &mut second_outcome,
             "second".into(),
             FunctionKind::Lambda,
@@ -723,6 +342,20 @@ mod tests {
         );
         assert_eq!(first, Callee::Minted(0));
         assert_eq!(second, Callee::Minted(1));
+
+        let mut next_stage = 0;
+        let mut next_stage_outcome = Vec::new();
+        assert_eq!(
+            mint_function(
+                owner,
+                &mut next_stage,
+                &mut next_stage_outcome,
+                "next_stage".into(),
+                FunctionKind::Lambda,
+                true,
+            ),
+            Callee::Minted(0)
+        );
 
         first_outcome.extend(second_outcome);
         assert_eq!(
@@ -740,7 +373,7 @@ mod tests {
         // call back to the owner.
         let ambient = owner.id();
         {
-            let (_, mut host) = owner.host_with_minted(&mut first_outcome, view, first);
+            let (_, mut host) = host_with_minted(owner, &mut first_outcome, view, first);
             let call = host.push_mnemonic(
                 ambient,
                 Mnemonic::Call(qcode::value::insn::Call {
@@ -769,20 +402,26 @@ mod tests {
 
         let mut ctx = Context::new();
         qcode!(ctx, "fn rebind_owner: <owner_block> return at i64 0;");
-        let installed = Function::make(&mut ctx, "installed".into()).unwrap().id;
-        let owner_root = Function::from_id(&ctx, rebind_owner).root().unwrap().id;
+        let installed = FunctionBody::make(&mut ctx, "installed".into()).unwrap().id;
+        let owner_root = FunctionBody::from_id(&ctx, rebind_owner).root().unwrap().id;
 
         let env = dummy_env();
         let (bodies, view) = ctx.split(&env);
         let mut slots = bodies.select_mut(&[rebind_owner]);
         let (owner_fun, _) = slots.split_first_mut().unwrap();
-        let mut owner = FunctionBody::new(owner_fun);
+        let mut next_minted = 0;
         let mut outcome = Vec::new();
-        let placeholder =
-            owner.mint_function(&mut outcome, "detached".into(), FunctionKind::Lambda, true);
-        let ambient = owner.id();
+        let placeholder = mint_function(
+            owner_fun,
+            &mut next_minted,
+            &mut outcome,
+            "detached".into(),
+            FunctionKind::Lambda,
+            true,
+        );
+        let ambient = owner_fun.id();
         {
-            let (_, mut host) = owner.host_with_minted(&mut outcome, view, placeholder);
+            let (_, mut host) = host_with_minted(owner_fun, &mut outcome, view, placeholder);
             let root = host.make_block(ambient);
             host.function_mut(ambient).set_root_id(Some(root.local));
             BaseRef::new(host.reborrow(), root)
@@ -883,7 +522,6 @@ mod tests {
         let (bodies, _view) = ctx.split(&env);
         let mut slots = bodies.select_mut(&[own_id]);
         let (own, _) = slots.split_first_mut().unwrap();
-        let mut own = FunctionBody::new(own);
 
         let _ = own.block_param_mut(foreign);
     }
@@ -894,16 +532,15 @@ mod tests {
         let mut ctx = Context::new();
         let (own_id, foreign, _) = two_functions_with_params(&mut ctx);
         let env = dummy_env();
-        let (bodies, view) = ctx.split(&env);
+        let (bodies, _view) = ctx.split(&env);
         let mut slots = bodies.select_mut(&[own_id]);
         let (own, _) = slots.split_first_mut().unwrap();
-        let own = FunctionBody::new(own);
 
-        let _ = own.block_param(view, foreign);
+        let _ = own.block_param(foreign);
     }
 
     #[test]
-    #[should_panic(expected = "block parameter belongs to another function")]
+    #[should_panic(expected = "foreign function-body read on a checked-out host")]
     fn function_body_param_ref_rejects_foreign_id_with_colliding_local() {
         let mut ctx = Context::new();
         let (own_id, foreign, _) = two_functions_with_params(&mut ctx);
@@ -911,9 +548,8 @@ mod tests {
         let (bodies, view) = ctx.split(&env);
         let mut slots = bodies.select_mut(&[own_id]);
         let (own, _) = slots.split_first_mut().unwrap();
-        let own = FunctionBody::new(own);
 
-        let _ = own.param_ref(view, foreign);
+        let _ = view.read_host(own).param_ref(foreign);
     }
 
     #[test]
@@ -924,7 +560,6 @@ mod tests {
         let (bodies, _view) = ctx.split(&env);
         let mut slots = bodies.select_mut(&[own_id]);
         let (own, _) = slots.split_first_mut().unwrap();
-        let own = FunctionBody::new(own);
 
         assert!(own.users_of(ValueId::Instruction(foreign)).is_empty());
     }
@@ -935,15 +570,13 @@ mod tests {
         let mut ctx = Context::new();
         let (_, own_id, foreign) = two_functions_with_users(&mut ctx);
         let env = dummy_env();
-        let (bodies, view) = ctx.split(&env);
+        let (bodies, _view) = ctx.split(&env);
         let mut slots = bodies.select_mut(&[own_id]);
         let (own, _) = slots.split_first_mut().unwrap();
-        let mut own = FunctionBody::new(own);
 
         own.replace_all_uses_with(
-            view,
             ValueId::Instruction(foreign),
-            ValueId::Instruction(foreign),
+            ValueId::Literal(0usize.into()),
         );
     }
 

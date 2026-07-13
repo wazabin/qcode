@@ -40,13 +40,14 @@ impl FunctionPass for CppDemangle {
     // This pass doesn't need to be, but it's good practice to track changes in case you later add more functionality
     fn run<'str>(
         &self,
-        f: &mut FunctionBody<'_, 'str>,
+        f: &mut FunctionBody<'str>,
         m: ContextView<'_, 'str>,
+        _next_minted: &mut u32,
     ) -> Result<Outcome<'str>, String> {
         // Read the function's own name, decide the demangled form, then buffer
         // the rename.
         let demangled: Option<String> = {
-            let name = f.self_ref(m).name().to_string();
+            let name = m.read_host(f).function_ref(f.id()).name().to_string();
             // ELF symbol-version suffixes (`foo@@GLIBCXX_3.4`, `foo@CXXABI_1.3`)
             // aren't part of the Itanium mangling, and `Symbol::new` rejects them
             // as not well-formed. Strip from the first `@` — a mangled name never
@@ -73,7 +74,7 @@ crate::register_function_pass!(CppDemangle);
 #[cfg(test)]
 mod tests {
     use qcode::context::Context;
-    use qcode::value::{Function, Renameable};
+    use qcode::value::{FunctionBody, Renameable};
     use qcode_macro::qcode;
 
     use super::*;
@@ -94,7 +95,7 @@ mod tests {
 
         run_function_pass::<CppDemangle>(&mut ctx, foo).unwrap();
 
-        assert_eq!(Function::from_id(&ctx, foo).name(), "foo");
+        assert_eq!(FunctionBody::from_id(&ctx, foo).name(), "foo");
     }
 
     #[test]
@@ -113,7 +114,7 @@ mod tests {
         run_function_pass::<CppDemangle>(&mut ctx, _ZN5space3fooEibc).unwrap();
 
         assert_eq!(
-            Function::from_id(&ctx, _ZN5space3fooEibc).name(),
+            FunctionBody::from_id(&ctx, _ZN5space3fooEibc).name(),
             "space::foo"
         );
     }
@@ -133,14 +134,14 @@ mod tests {
                         return at 0x1000;
             "
         );
-        Function::from_id_mut(&mut ctx, placeholder)
+        FunctionBody::from_id_mut(&mut ctx, placeholder)
             .rename("_ZNSsixEj@@GLIBCXX_3.4".into())
             .unwrap();
 
         run_function_pass::<CppDemangle>(&mut ctx, placeholder).unwrap();
 
         assert_eq!(
-            Function::from_id(&ctx, placeholder).name(),
+            FunctionBody::from_id(&ctx, placeholder).name(),
             "std::string::operator[]"
         );
     }

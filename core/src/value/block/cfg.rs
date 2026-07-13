@@ -7,14 +7,14 @@ use jstd::{
 
 use crate::value::{BlockRef, function::FunctionRef, util::base_ref::WithHost};
 
-/// Function-local block index (indexes the owning [`Function`]'s block arena).
+/// Function-local block index (indexes the owning [`FunctionBody`](crate::value::FunctionBody)'s block arena).
 #[derive(Identifier)]
 pub struct LocalBlockId(u32);
 
 crate::composite_id!(BlockId, LocalBlockId);
 
 /// Function-local CFG-edge index. A plain body-local id (stage 4): it indexes
-/// the owning [`Function`]'s edge arena directly and carries **no** function
+/// the owning [`FunctionBody`](crate::value::FunctionBody)'s edge arena directly and carries **no** function
 /// qualifier. Global addressing of an edge is the explicit pair
 /// `(FunctionId, EdgeId)`; every edge is stored in its `from` block's function,
 /// so the owning function is recoverable from either incident block.
@@ -30,7 +30,7 @@ pub struct EdgeData {
 // A plain body-local [`EdgeId`] no longer self-describes its owning function, so
 // the old whole-context `EdgeRef`/`EdgeMutRef` wrappers (which resolved
 // `values.edge(id)` without a function) are gone. Edges are read through
-// `Function::edge(id)` / `HostRef::edge(func, id)` with the owning function named
+// `FunctionBody::edge(id)` / `HostRef::edge(func, id)` with the owning function named
 // explicitly. `EdgeData`'s `from`/`to` are still `BlockId`s, so an edge's
 // endpoints resolve as blocks directly.
 

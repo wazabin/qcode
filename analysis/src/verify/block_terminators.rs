@@ -1,6 +1,6 @@
 //! Verify that every basic block ends in a terminator.
 
-use qcode::{context::Context, value::Function};
+use qcode::{context::Context, value::FunctionBody};
 
 /// Every basic block must end in a terminator (branch / cbranch / return / …).
 /// A block that is empty, or whose last instruction is an ordinary value op, has
@@ -8,7 +8,7 @@ use qcode::{context::Context, value::Function};
 pub fn verify_block_terminators(ctx: &Context) -> Vec<String> {
     let mut out = Vec::new();
     for fid in ctx.function_ids() {
-        for block in Function::from_id(ctx, fid).iter() {
+        for block in FunctionBody::from_id(ctx, fid).iter() {
             match block.iter().last() {
                 None => out.push(format!(
                     "fn {fid:?} block {:?} is empty (no terminator)",

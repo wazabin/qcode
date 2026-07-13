@@ -32,10 +32,10 @@ use std::sync::OnceLock;
 use qcode::{
     context::Context,
     space::Space,
-    value::{Function, FunctionId, RegisterId, Renameable, Varnode, VarnodeId},
+    value::{FunctionBody, FunctionId, RegisterId, Renameable, Varnode, VarnodeId},
 };
 
-use super::{ArchConfig, CallingConvention, ContextSplit, ContextView, FunctionBody, Outcome};
+use super::{ArchConfig, CallingConvention, ContextSplit, ContextView, Outcome};
 use crate::structure::Program;
 use crate::RegisterBase;
 
@@ -142,17 +142,14 @@ pub trait DynFunctionPass: Send + Sync {
     /// bodies registry, so the driver owns the barrier. This is the surface the
     /// parallel driver (and the sequential fixpoint) use to run a pass on a body they
     /// hold `&mut`; the returned [`Outcome`]'s rename replay and the barrier are the
-    /// driver's job, not this method's.
+    /// driver's job, not this method's. `next_minted` is the owner's stage-local
+    /// placeholder cursor and is shared across every pass/fixpoint iteration.
     fn run_checked<'str>(
         &self,
-        body: &mut FunctionBody<'_, 'str>,
+        body: &mut FunctionBody<'str>,
         cx: ContextView<'_, 'str>,
+        next_minted: &mut u32,
     ) -> Result<Outcome<'str>, String>;
-
-    /// Whether this pass may mint functions (see [`FunctionPass::MINTS`]).
-    fn mints(&self) -> bool {
-        false
-    }
 }
 
 /// The parallel-safe function pass trait (Stage 5 of the
@@ -172,14 +169,13 @@ pub trait DynFunctionPass: Send + Sync {
 /// run one straight over a `&mut Context`.
 pub trait FunctionPass: Default {
     const NAME: &'static str;
-    /// Whether this pass may mint new functions via
-    /// [`FunctionBody::mint_function`] (the loop outliners are the only ones).
-    const MINTS: bool = false;
     fn description(&self) -> &'static str;
     fn run<'str>(
         &self,
-        f: &mut FunctionBody<'_, 'str>,
+        f: &mut FunctionBody<'str>,
         cx: ContextView<'_, 'str>,
+        // Driver-owned placeholder cursor, reset once per owner at stage entry.
+        next_minted: &mut u32,
     ) -> Result<Outcome<'str>, String>;
 }
 
@@ -217,13 +213,11 @@ impl<T: FunctionPass + Send + Sync> DynFunctionPass for FunctionPassAdapter<T> {
     }
     fn run_checked<'str>(
         &self,
-        body: &mut FunctionBody<'_, 'str>,
+        body: &mut FunctionBody<'str>,
         cx: ContextView<'_, 'str>,
+        next_minted: &mut u32,
     ) -> Result<Outcome<'str>, String> {
-        FunctionPass::run(&self.inner, body, cx)
-    }
-    fn mints(&self) -> bool {
-        T::MINTS
+        FunctionPass::run(&self.inner, body, cx, next_minted)
     }
     fn run(
         &self,
@@ -237,8 +231,8 @@ impl<T: FunctionPass + Send + Sync> DynFunctionPass for FunctionPassAdapter<T> {
         let before_targets = ctx.direct_call_targets(fun_id);
         let outcome = {
             let (bodies, view) = ctx.split(env);
-            let mut body = FunctionBody::new(&mut bodies[fun_id]);
-            self.run_checked(&mut body, view)?
+            let mut next_minted = 0;
+            self.run_checked(&mut bodies[fun_id], view, &mut next_minted)?
         };
         // Barrier, in the driver's order: install minted callees first (so the
         // owner's new call sites resolve), rebuild its `call_sites` diff, then
@@ -271,16 +265,15 @@ impl<T: FunctionPass + Send + Sync> DynFunctionPass for FunctionPassAdapter<T> {
 pub(crate) fn with_checked_out_body<'str, R>(
     ctx: &mut Context<'str>,
     fid: FunctionId,
-    f: impl FnOnce(&mut FunctionBody<'_, 'str>, ContextView<'_, 'str>) -> R,
+    f: impl FnOnce(&mut FunctionBody<'str>, ContextView<'_, 'str>) -> R,
 ) -> R {
     let env = detached_env();
     let before_targets = ctx.direct_call_targets(fid);
     let out = {
         let (bodies, view) = ctx.split(&env);
-        let mut body = FunctionBody::new(&mut bodies[fid]);
         // These entry points buffer no effects and mint nothing, so the drained
         // scratch is discarded.
-        f(&mut body, view)
+        f(&mut bodies[fid], view)
     };
     ctx.resync_call_sites(fid, &before_targets);
     out
@@ -360,7 +353,7 @@ pub(super) fn resolve_minted_callees(
         }
     }
     for fun_id in std::iter::once(owner).chain(installed.iter().copied()) {
-        let unresolved = Function::from_id(ctx, fun_id)
+        let unresolved = FunctionBody::from_id(ctx, fun_id)
             .blocks()
             .flat_map(|block| block.iter())
             .find_map(|insn| insn.mnemonic().minted_callee_slot());
@@ -394,10 +387,10 @@ mod minted_barrier_tests {
 
     fn caller_with_minted_call(slot: u32) -> (TestContext, FunctionId, InstructionId, FunctionId) {
         let mut tc = TestContext::new();
-        let caller = Function::make(&mut tc.ctx, "caller".into()).unwrap().id;
-        let callee = Function::make(&mut tc.ctx, "callee".into()).unwrap().id;
+        let caller = FunctionBody::make(&mut tc.ctx, "caller".into()).unwrap().id;
+        let callee = FunctionBody::make(&mut tc.ctx, "callee".into()).unwrap().id;
         let block = tc.ctx.get_or_make_block(0x1000, caller);
-        Function::from_id_mut(&mut tc.ctx, caller)
+        FunctionBody::from_id_mut(&mut tc.ctx, caller)
             .set_root(block)
             .unwrap();
         {
@@ -435,9 +428,11 @@ mod minted_barrier_tests {
     #[test]
     fn minted_body_can_reference_a_sibling_slot() {
         let (mut tc, caller, _, first) = caller_with_minted_call(0);
-        let sibling = Function::make(&mut tc.ctx, "sibling".into()).unwrap().id;
+        let sibling = FunctionBody::make(&mut tc.ctx, "sibling".into())
+            .unwrap()
+            .id;
         let block = tc.ctx.get_or_make_block(0x2000, first);
-        Function::from_id_mut(&mut tc.ctx, first)
+        FunctionBody::from_id_mut(&mut tc.ctx, first)
             .set_root(block)
             .unwrap();
         let sibling_call = {
@@ -494,7 +489,7 @@ pub(super) fn replay_rename<'str>(
     // `FunctionMutRef::rename` would — the same global-name-map update.
     if let Some(name) = rename {
         let unique = ctx.get_unique_name(name);
-        Function::from_id_mut(ctx, fun_id)
+        FunctionBody::from_id_mut(ctx, fun_id)
             .rename(unique)
             .map_err(|e| format!("{pass}: self-rename replay failed: {e}"))?;
         changed = true;

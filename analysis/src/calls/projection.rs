@@ -31,7 +31,7 @@ use std::collections::BTreeSet;
 use qcode::{
     context::Context,
     value::{
-        BasicBlock, Function, ValueId,
+        BasicBlock, FunctionBody, ValueId,
         block::BlockId,
         block_param::BlockParamId,
         function::FunctionId,
@@ -82,7 +82,7 @@ pub fn project_return(ctx: &Context, fid: FunctionId, field: usize) -> Option<Pr
     // control-dependence reachability below.
     let mut insn_block: HashMap<InstructionId, BlockId> = HashMap::default();
     let mut blocks: Vec<BlockId> = Vec::new();
-    for block in Function::from_id(ctx, fid).iter() {
+    for block in FunctionBody::from_id(ctx, fid).iter() {
         let bid = block.id;
         blocks.push(bid);
         for iid in BasicBlock::from_id(ctx, bid).instruction_ids() {
@@ -285,7 +285,7 @@ mod tests {
     use qcode::{
         builder::Builder,
         testing::TestContext,
-        value::{BasicBlock, Function, insn::Return},
+        value::{BasicBlock, FunctionBody, insn::Return},
     };
 
     /// Set a return instruction's value channel to `value` (the builder's
@@ -315,10 +315,10 @@ mod tests {
     #[test]
     fn projection_data_dependencies_are_per_field() {
         let mut tc = TestContext::new();
-        let fid = Function::make(&mut tc.ctx, "foo".into()).unwrap().id;
+        let fid = FunctionBody::make(&mut tc.ctx, "foo".into()).unwrap().id;
         let entry = tc.ctx.get_or_make_block(0x1000, fid);
         {
-            let mut f = Function::from_id_mut(&mut tc.ctx, fid);
+            let mut f = FunctionBody::from_id_mut(&mut tc.ctx, fid);
             f.set_root(entry).unwrap();
             f.add_block(entry);
         }
@@ -365,13 +365,13 @@ mod tests {
     #[test]
     fn projection_includes_control_dependence() {
         let mut tc = TestContext::new();
-        let fid = Function::make(&mut tc.ctx, "g".into()).unwrap().id;
+        let fid = FunctionBody::make(&mut tc.ctx, "g".into()).unwrap().id;
         let entry = tc.ctx.get_or_make_block(0x1000, fid);
         let t = tc.ctx.get_or_make_block(0x1100, fid);
         let fb = tc.ctx.get_or_make_block(0x1200, fid);
         let m = tc.ctx.get_or_make_block(0x1300, fid);
         {
-            let mut f = Function::from_id_mut(&mut tc.ctx, fid);
+            let mut f = FunctionBody::from_id_mut(&mut tc.ctx, fid);
             f.set_root(entry).unwrap();
             f.add_block(entry);
             f.add_block(t);
@@ -426,10 +426,10 @@ mod tests {
     #[test]
     fn projection_opaque_on_varnode() {
         let mut tc = TestContext::new();
-        let fid = Function::make(&mut tc.ctx, "h".into()).unwrap().id;
+        let fid = FunctionBody::make(&mut tc.ctx, "h".into()).unwrap().id;
         let entry = tc.ctx.get_or_make_block(0x1000, fid);
         {
-            let mut f = Function::from_id_mut(&mut tc.ctx, fid);
+            let mut f = FunctionBody::from_id_mut(&mut tc.ctx, fid);
             f.set_root(entry).unwrap();
             f.add_block(entry);
         }

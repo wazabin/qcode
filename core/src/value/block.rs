@@ -2,7 +2,7 @@ use crate::{
     context::Context,
     error::Result,
     value::{
-        Function, Instruction, LocalValueId, Value, ValueId,
+        FunctionBody, Instruction, LocalValueId, Value, ValueId,
         block_param::{BlockParam, BlockParamId, BlockParamMutRef, BlockParamRef, LocalParamId},
         function::{FunctionId, FunctionMutRef, FunctionRef},
         insn::{InstructionId, InstructionRef, LocalInsnId, Mnemonic},
@@ -149,7 +149,7 @@ impl<'str> BasicBlock<'str> {
     pub fn from_addr<'ctx>(ctx: &'ctx Context<'str>, addr: u64) -> Option<BlockRef<'str, 'ctx>> {
         ctx.get_at_addr(&addr).and_then(|id| match id {
             ValueId::BasicBlock(block_id) => Some(BasicBlock::from_id(ctx, block_id)),
-            ValueId::Function(function_id) => Function::from_id(ctx, function_id).root(),
+            ValueId::Function(function_id) => FunctionBody::from_id(ctx, function_id).root(),
             _ => None,
         })
     }
@@ -163,7 +163,7 @@ impl<'str> BasicBlock<'str> {
         ctx.get_at_addr(&addr)
             .and_then(|id| match id {
                 ValueId::BasicBlock(block_id) => Some(block_id),
-                ValueId::Function(function_id) => Function::from_id(&*ctx, function_id)
+                ValueId::Function(function_id) => FunctionBody::from_id(&*ctx, function_id)
                     .root()
                     .map(|root| root.id),
                 _ => None,
@@ -777,7 +777,7 @@ impl<'str, 'ctx> BlockMutRef<'str, 'ctx> {
 
     #[allow(unused_mut)]
     pub fn in_function(mut self, fun_id: FunctionId) -> Self {
-        Function::from_id_mut(self.ctx, fun_id).add_block(self.id);
+        FunctionBody::from_id_mut(self.ctx, fun_id).add_block(self.id);
         self
     }
 
@@ -799,7 +799,7 @@ impl<'str, 'ctx> BlockMutRef<'str, 'ctx> {
         self.ctx
             .block(self.id)
             .parent
-            .map(|fid| Function::from_id_mut(self.ctx, fid))
+            .map(|fid| FunctionBody::from_id_mut(self.ctx, fid))
     }
 
     pub fn as_ref(&self) -> BlockRef<'str, '_> {

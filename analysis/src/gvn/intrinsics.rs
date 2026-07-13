@@ -26,7 +26,7 @@ use crate::{ContextView, FunctionBody};
 pub(super) struct Recognize;
 
 /// The function-pass [`SubPassC`] impl (context-split stage 5b-ii): the
-/// recognizer reads through `body.read_host(cx)` and the match rewrites through
+/// recognizer reads through `cx.read_host(body)` and the match rewrites through
 /// `Editor::replace_with_new_insn_c`.
 impl<'str> SubPassC<'str> for Recognize {
     fn init_state(&self) -> Box<dyn Any> {
@@ -39,7 +39,7 @@ impl<'str> SubPassC<'str> for Recognize {
 
     fn on_insn(
         &self,
-        body: &mut FunctionBody<'_, 'str>,
+        body: &mut FunctionBody<'str>,
         cx: ContextView<'_, 'str>,
         _state: &mut dyn Any,
         ic: &InsnCtx,
@@ -53,7 +53,7 @@ impl<'str> SubPassC<'str> for Recognize {
         };
 
         for &id in recognizers_for(root) {
-            if let Some(args) = id.desc().recognize(body.read_host(cx), ic.insn_id) {
+            if let Some(args) = id.desc().recognize(cx.read_host(body), ic.insn_id) {
                 let args = args
                     .into_iter()
                     .map(|a| a.localize(ic.insn_id.func))

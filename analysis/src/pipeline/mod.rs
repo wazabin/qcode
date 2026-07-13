@@ -25,7 +25,10 @@ pub use config::{
     list_user_pipelines_in, load_named_user_pipeline_in,
 };
 pub use lifter::{LiftOutcome, LiftSummary, Lifter, PipelineServices};
-pub use module_view::{ContextSplit, ContextView, FunctionBody, Minted, Outcome};
+pub use module_view::{
+    ContextSplit, ContextView, Minted, Outcome, host_with_minted, mint_function,
+};
+pub use qcode::value::FunctionBody;
 
 /// Install a set of minted functions and resolve the owner's placeholders
 /// (test-only shim over the barrier, so `test_util::with_minting` can exercise

@@ -636,15 +636,15 @@ mod tests {
         use qcode::{
             builder::Builder,
             testing::TestContext,
-            value::{BasicBlock, Function},
+            value::{BasicBlock, FunctionBody},
         };
 
         let mut tc = TestContext::new();
         let sp_reg = tc.r0;
-        let fid = Function::make(&mut tc.ctx, "f".into()).unwrap().id;
+        let fid = FunctionBody::make(&mut tc.ctx, "f".into()).unwrap().id;
         let root = { tc.ctx.get_or_make_block(0x1000, fid) };
         {
-            let mut f = Function::from_id_mut(&mut tc.ctx, fid);
+            let mut f = FunctionBody::from_id_mut(&mut tc.ctx, fid);
             f.set_root(root).unwrap();
             f.add_block(root);
         }
@@ -711,15 +711,15 @@ mod tests {
         use qcode::{
             builder::Builder,
             testing::TestContext,
-            value::{BasicBlock, Function},
+            value::{BasicBlock, FunctionBody},
         };
 
         let mut tc = TestContext::new();
         let sp_reg = tc.r0;
-        let fid = Function::make(&mut tc.ctx, "f".into()).unwrap().id;
+        let fid = FunctionBody::make(&mut tc.ctx, "f".into()).unwrap().id;
         let root = { tc.ctx.get_or_make_block(0x1000, fid) };
         {
-            let mut f = Function::from_id_mut(&mut tc.ctx, fid);
+            let mut f = FunctionBody::from_id_mut(&mut tc.ctx, fid);
             f.set_root(root).unwrap();
             f.add_block(root);
         }
@@ -800,15 +800,15 @@ mod tests {
             assumption::Proposition,
             builder::Builder,
             testing::TestContext,
-            value::{BasicBlock, Function, Value},
+            value::{BasicBlock, FunctionBody, Value},
         };
 
         let mut tc = TestContext::new();
         let sp_reg = tc.r0;
-        let fid = Function::make(&mut tc.ctx, "f".into()).unwrap().id;
+        let fid = FunctionBody::make(&mut tc.ctx, "f".into()).unwrap().id;
         let root = { tc.ctx.get_or_make_block(0x1000, fid) };
         {
-            let mut f = Function::from_id_mut(&mut tc.ctx, fid);
+            let mut f = FunctionBody::from_id_mut(&mut tc.ctx, fid);
             f.set_root(root).unwrap();
             f.add_block(root);
         }
@@ -890,15 +890,15 @@ mod tests {
             assumption::Proposition,
             builder::Builder,
             testing::TestContext,
-            value::{BasicBlock, Function, Value},
+            value::{BasicBlock, FunctionBody, Value},
         };
 
         let mut tc = TestContext::new();
         let sp_reg = tc.r0;
-        let fid = Function::make(&mut tc.ctx, "f".into()).unwrap().id;
+        let fid = FunctionBody::make(&mut tc.ctx, "f".into()).unwrap().id;
         let root = { tc.ctx.get_or_make_block(0x1000, fid) };
         {
-            let mut f = Function::from_id_mut(&mut tc.ctx, fid);
+            let mut f = FunctionBody::from_id_mut(&mut tc.ctx, fid);
             f.set_root(root).unwrap();
             f.add_block(root);
         }
@@ -957,15 +957,15 @@ mod tests {
             assumption::Proposition,
             builder::Builder,
             testing::TestContext,
-            value::{BasicBlock, Function},
+            value::{BasicBlock, FunctionBody},
         };
 
         let mut tc = TestContext::new();
         let sp_reg = tc.r0;
-        let fid = Function::make(&mut tc.ctx, "f".into()).unwrap().id;
+        let fid = FunctionBody::make(&mut tc.ctx, "f".into()).unwrap().id;
         let root = { tc.ctx.get_or_make_block(0x1000, fid) };
         {
-            let mut f = Function::from_id_mut(&mut tc.ctx, fid);
+            let mut f = FunctionBody::from_id_mut(&mut tc.ctx, fid);
             f.set_root(root).unwrap();
             f.add_block(root);
         }
@@ -1030,15 +1030,15 @@ mod tests {
         use qcode::{
             builder::Builder,
             testing::TestContext,
-            value::{BasicBlock, Function},
+            value::{BasicBlock, FunctionBody},
         };
 
         let mut tc = TestContext::new();
         let sp_reg = tc.r0;
-        let fid = Function::make(&mut tc.ctx, "f".into()).unwrap().id;
+        let fid = FunctionBody::make(&mut tc.ctx, "f".into()).unwrap().id;
         let root = { tc.ctx.get_or_make_block(0x1000, fid) };
         {
-            let mut f = Function::from_id_mut(&mut tc.ctx, fid);
+            let mut f = FunctionBody::from_id_mut(&mut tc.ctx, fid);
             f.set_root(root).unwrap();
             f.add_block(root);
         }
@@ -1087,15 +1087,15 @@ mod tests {
             assumption::Proposition,
             builder::Builder,
             testing::TestContext,
-            value::{BasicBlock, Function, Value},
+            value::{BasicBlock, FunctionBody, Value},
         };
 
         let mut tc = TestContext::new();
         let sp_reg = tc.r0;
-        let fid = Function::make(&mut tc.ctx, "f".into()).unwrap().id;
+        let fid = FunctionBody::make(&mut tc.ctx, "f".into()).unwrap().id;
         let root = { tc.ctx.get_or_make_block(0x1000, fid) };
         {
-            let mut f = Function::from_id_mut(&mut tc.ctx, fid);
+            let mut f = FunctionBody::from_id_mut(&mut tc.ctx, fid);
             f.set_root(root).unwrap();
             f.add_block(root);
         }
@@ -1170,15 +1170,15 @@ mod tests {
         use qcode::{
             builder::Builder,
             testing::TestContext,
-            value::{BasicBlock, Function},
+            value::{BasicBlock, FunctionBody},
         };
 
         let mut tc = TestContext::new();
         let sp_reg = tc.r0;
-        let fid = Function::make(&mut tc.ctx, "f".into()).unwrap().id;
+        let fid = FunctionBody::make(&mut tc.ctx, "f".into()).unwrap().id;
         let root = { tc.ctx.get_or_make_block(0x1000, fid) };
         {
-            let mut f = Function::from_id_mut(&mut tc.ctx, fid);
+            let mut f = FunctionBody::from_id_mut(&mut tc.ctx, fid);
             f.set_root(root).unwrap();
             f.add_block(root);
         }
@@ -1221,7 +1221,7 @@ mod tests {
     // === Step 8: nocapture-driven frame-freshness refinements ===============
 
     use qcode::value::insn::{Call, CallInd};
-    use qcode::value::{BasicBlock, Function, ParamAttrs, Value};
+    use qcode::value::{BasicBlock, FunctionBody, ParamAttrs, Value};
 
     /// Make function `name` with an `@SP` root param (origin = `sp_reg`); returns
     /// `(fid, root_block, @SP value)`.
@@ -1231,10 +1231,10 @@ mod tests {
         addr: u64,
         sp_reg: VarnodeId,
     ) -> (FunctionId, BlockId, ValueId) {
-        let fid = Function::make(&mut tc.ctx, name.into()).unwrap().id;
+        let fid = FunctionBody::make(&mut tc.ctx, name.into()).unwrap().id;
         let root = { tc.ctx.get_or_make_block(addr, fid) };
         {
-            let mut f = Function::from_id_mut(&mut tc.ctx, fid);
+            let mut f = FunctionBody::from_id_mut(&mut tc.ctx, fid);
             f.set_root(root).unwrap();
             f.add_block(root);
         }
@@ -1251,8 +1251,8 @@ mod tests {
         name: &'static str,
         attrs: Vec<ParamAttrs>,
     ) -> FunctionId {
-        let fid = Function::make(&mut tc.ctx, name.into()).unwrap().id;
-        Function::from_id_mut(&mut tc.ctx, fid).set_param_attrs(attrs);
+        let fid = FunctionBody::make(&mut tc.ctx, name.into()).unwrap().id;
+        FunctionBody::from_id_mut(&mut tc.ctx, fid).set_param_attrs(attrs);
         fid
     }
 
@@ -1404,7 +1404,7 @@ mod tests {
         );
         assert!(
             !uncaptured_after(
-                |tc, _| Function::make(&mut tc.ctx, "g".into()).unwrap().id,
+                |tc, _| FunctionBody::make(&mut tc.ctx, "g".into()).unwrap().id,
                 false
             ),
             "a frame address into a signatureless callee captures the frame"

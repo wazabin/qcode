@@ -13,7 +13,7 @@ use crate::{
     context::{Context, Shared},
     space::Space,
     value::{
-        BasicBlock, BlockParam, Function, LocalBlockId, LocalValueId, ValueId,
+        BasicBlock, BlockParam, FunctionBody, LocalBlockId, LocalValueId, ValueId,
         block::BlockId,
         bytes::BytesRef,
         function::FunctionId,
@@ -154,7 +154,7 @@ impl<'a, 'str> Seg<'a, 'str> {
                 self.push(r.to_string(), TokenKind::Varnode, link);
             }
             ValueId::Function(fid) => {
-                let name = Function::from_id(self.ctx, fid).name().to_string();
+                let name = FunctionBody::from_id(self.ctx, fid).name().to_string();
                 self.push(
                     format!("<{name}>"),
                     TokenKind::Function,
@@ -614,7 +614,7 @@ fn space_name(ctx: &Context<'_>, space: crate::space::SpaceId) -> String {
 /// The `@name=` / `@arg<i>=` prefix for a direct-call argument. Mirrors
 /// `fmt_call_arg_name`.
 fn call_arg_name(ctx: &Context<'_>, target: FunctionId, index: usize) -> String {
-    match Function::from_id(ctx, target).input_arg_name(index) {
+    match FunctionBody::from_id(ctx, target).input_arg_name(index) {
         Some(name) => format!("@{name}="),
         None => format!("@arg{index}="),
     }
@@ -625,7 +625,7 @@ fn call_arg_name(ctx: &Context<'_>, target: FunctionId, index: usize) -> String 
 fn callee_name_link(ctx: &Context<'_>, callee: Callee) -> (String, Option<Link>) {
     match callee {
         Callee::Real(id) => (
-            Function::from_id(ctx, id).name().to_string(),
+            FunctionBody::from_id(ctx, id).name().to_string(),
             Some(Link::Function(id)),
         ),
         Callee::Minted(slot) => (format!("<minted:{slot}>"), None),
@@ -659,7 +659,7 @@ pub fn literal_atom(ctx: &Context<'_>, id: LiteralId) -> String {
             None => format!("&<0x{:x}>", literal.value),
         },
         Some(SymbolicRef::Function(fid)) => {
-            format!("&<{}>", Function::from_id(ctx, *fid).name())
+            format!("&<{}>", FunctionBody::from_id(ctx, *fid).name())
         }
         Some(SymbolicRef::String(s)) => format!("&{:?}", s),
         None if ctx.shared.types.is_bool(literal.type_id) => {

@@ -1,11 +1,11 @@
 use qcode::{
     context::Context,
-    value::{Function, FunctionId, insn::Mnemonic},
+    value::{FunctionBody, FunctionId, insn::Mnemonic},
 };
 
 use crate::{Pass, PipelineEnv};
 
-/// Assert [`Function::is_pure`] on every `pure_reg` function whose body has no
+/// Assert [`FunctionBody::is_pure`] on every `pure_reg` function whose body has no
 /// residual side effect — no memory access, no calls, and no raw register/global
 /// (varnode) reads — so it is a deterministic pure function of its params.
 ///
@@ -24,12 +24,12 @@ pub fn mark_pure_functions(ctx: &mut Context) -> bool {
     loop {
         let mut round = false;
         for fid in ctx.function_ids() {
-            let f = Function::from_id(ctx, fid);
+            let f = FunctionBody::from_id(ctx, fid);
             if f.is_pure() || !f.is_pure_reg() {
                 continue;
             }
             if body_is_pure(ctx, fid) {
-                Function::from_id_mut(ctx, fid).set_is_pure(true);
+                FunctionBody::from_id_mut(ctx, fid).set_is_pure(true);
                 round = true;
             }
         }
@@ -58,7 +58,7 @@ pub fn mark_pure_functions(ctx: &mut Context) -> bool {
 /// — allowing it would let the dead-pure-call sweep delete the call (when its
 /// return is unused) and drop that store.
 pub(crate) fn body_is_pure(ctx: &Context, fid: FunctionId) -> bool {
-    Function::from_id(ctx, fid).iter().all(|block| {
+    FunctionBody::from_id(ctx, fid).iter().all(|block| {
         block
             .iter()
             .all(|insn| mnemonic_is_pure(ctx, insn.mnemonic()))
@@ -82,16 +82,16 @@ fn mnemonic_is_pure(ctx: &Context, m: &Mnemonic) -> bool {
         Mnemonic::Map(m) => m
             .body
             .real()
-            .is_some_and(|body| Function::from_id(ctx, body).is_pure()),
+            .is_some_and(|body| FunctionBody::from_id(ctx, body).is_pure()),
         // A scan is pure exactly when its per-element body is pure (same as map).
         Mnemonic::Scan(m) => m
             .body
             .real()
-            .is_some_and(|body| Function::from_id(ctx, body).is_pure()),
+            .is_some_and(|body| FunctionBody::from_id(ctx, body).is_pure()),
         Mnemonic::Apply(m) => m
             .target
             .real()
-            .is_some_and(|target| Function::from_id(ctx, target).is_pure()),
+            .is_some_and(|target| FunctionBody::from_id(ctx, target).is_pure()),
         // A direct call to a pure function is a deterministic value of its args
         // and clobbers nothing — provided the call site carries no residual
         // clobbers of its own.
@@ -99,7 +99,7 @@ fn mnemonic_is_pure(ctx: &Context, m: &Mnemonic) -> bool {
             c.clobbers.is_empty()
                 && c.target
                     .real()
-                    .is_some_and(|target| Function::from_id(ctx, target).is_pure())
+                    .is_some_and(|target| FunctionBody::from_id(ctx, target).is_pure())
         }
         // A store is pure only when it writes the function's *private* shadow space
         // (argpromote's functionalized memory) — that produces no caller-visible
@@ -141,7 +141,7 @@ mod tests {
     use qcode::{
         builder::Builder,
         testing::TestContext,
-        value::{BasicBlock, Function, ValueId},
+        value::{BasicBlock, FunctionBody, ValueId},
     };
 
     /// Build a one-block function with a single store through a pointer param,
@@ -152,10 +152,10 @@ mod tests {
         addr: u64,
         to_shadow: bool,
     ) -> FunctionId {
-        let fid = Function::make(&mut tc.ctx, name.into()).unwrap().id;
+        let fid = FunctionBody::make(&mut tc.ctx, name.into()).unwrap().id;
         let root = { tc.ctx.get_or_make_block(addr, fid) };
         {
-            let mut f = Function::from_id_mut(&mut tc.ctx, fid);
+            let mut f = FunctionBody::from_id_mut(&mut tc.ctx, fid);
             f.set_root(root).unwrap();
             f.add_block(root);
         }

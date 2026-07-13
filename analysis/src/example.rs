@@ -14,8 +14,9 @@ impl FunctionPass for ExamplePass {
 
     fn run<'str>(
         &self,
-        f: &mut FunctionBody<'_, 'str>,
+        f: &mut FunctionBody<'str>,
         _m: ContextView<'_, 'str>,
+        _next_minted: &mut u32,
     ) -> Result<Outcome<'str>, String> {
         let _name = _m.interface(f.id()).name.to_string();
 

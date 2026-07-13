@@ -34,7 +34,7 @@ use crate::{ContextView, FunctionBody};
 pub(super) struct Cse;
 
 /// The function-pass [`SubPassC`] impl (context-split stage 5b-ii): reads
-/// route through `body.read_host(cx)`, shallow forwards through `Editor`'s `_c`
+/// route through `cx.read_host(body)`, shallow forwards through `Editor`'s `_c`
 /// methods, and the in-place canonical rebuild runs through `materialize_c` over
 /// `&mut PassBacking`.
 impl<'str> SubPassC<'str> for Cse {
@@ -53,7 +53,7 @@ impl<'str> SubPassC<'str> for Cse {
 
     fn on_block_entry(
         &self,
-        _body: &mut FunctionBody<'_, 'str>,
+        _body: &mut FunctionBody<'str>,
         _cx: ContextView<'_, 'str>,
         state: &mut dyn Any,
         _block_id: qcode::value::block::BlockId,
@@ -70,7 +70,7 @@ impl<'str> SubPassC<'str> for Cse {
 
     fn on_insn(
         &self,
-        body: &mut FunctionBody<'_, 'str>,
+        body: &mut FunctionBody<'str>,
         cx: ContextView<'_, 'str>,
         state: &mut dyn Any,
         ic: &InsnCtx,
@@ -81,7 +81,7 @@ impl<'str> SubPassC<'str> for Cse {
         }
         let state = state.downcast_mut::<Numbering>().expect("cse state");
 
-        let form = arith_form(body.read_host(cx), ic.id, ic.mnemonic, ic.size, state);
+        let form = arith_form(cx.read_host(body), ic.id, ic.mnemonic, ic.size, state);
         state.record_form(ic.id, form.clone());
         let key = key_for(&form, ic.id, ic.mnemonic);
 
@@ -102,7 +102,7 @@ impl<'str> SubPassC<'str> for Cse {
         match key {
             NormalForm::Opaque(_) => state.claim(key, ic.id),
             _ => {
-                let root_ty = body.read_host(cx).type_of(ic.id);
+                let root_ty = cx.read_host(body).type_of(ic.id);
                 let v = materialize_c(
                     body,
                     cx,

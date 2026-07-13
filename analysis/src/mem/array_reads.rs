@@ -215,26 +215,22 @@ fn try_match(host: HostRef, fid: FunctionId) -> Option<ReadsMatch> {
 
 /// Rewrite each matched lane load to `at(arr, word)` and drop the seed store.
 /// Concrete version of array_reads core using FunctionBody+ContextView (stage 5b-ii).
-fn apply<'str>(
-    body: &mut FunctionBody<'_, 'str>,
-    cx: ContextView<'_, 'str>,
-    m: &ReadsMatch,
-) -> bool {
+fn apply<'str>(body: &mut FunctionBody<'str>, cx: ContextView<'_, 'str>, m: &ReadsMatch) -> bool {
     let at_id = IntrinsicId::from_name("at").expect("at registered");
     // The `at(arr, i)` result type is the array's element type. Compute it through
     // the shared type interner's `&self` path (no `shared_mut`, so it holds on a
     // checked-out host); this mirrors `at`'s `result_type`.
-    let arr_ty = stored_type_of(body.read_host(cx), m.arr);
+    let arr_ty = stored_type_of(cx.read_host(body), m.arr);
     let at_ty = arr_ty
         .and_then(|t| cx.shr().types.seq_elem_of(t))
         .or(arr_ty)
         .expect("seeded array value has a type");
     for (load_id, lane) in &m.loads {
-        let block = body.insn_ref(cx, *load_id).parent().map(|b| b.id);
+        let block = cx.read_host(body).insn_ref(*load_id).parent().map(|b| b.id);
         let Some(block) = block else { continue };
         // Materialize the word index (pass builder: const/add only).
         let idx = {
-            let mut host = body.host(cx);
+            let mut host = cx.host(body);
             let mut b = Builder::from_block(BaseRef::new(host.reborrow(), block));
             b.set_insert_point_before(*load_id);
             let idx = build_index(&mut b, lane);
@@ -244,22 +240,17 @@ fn apply<'str>(
         // Build `at(arr, idx)` with the explicit element type and splice it before
         // the load (avoids the Builder's `context_mut` type-mint path).
         let at_val = body.push_mnemonic_with_type(
-            cx,
             Mnemonic::Intrinsic(IntrinsicApp {
                 id: at_id,
                 args: vec![m.arr.localize(load_id.func), idx.localize(load_id.func)],
             }),
             at_ty,
         );
-        body.insert_insn_before(cx, block, *load_id, at_val);
-        body.replace_all_uses_with(
-            cx,
-            ValueId::Instruction(*load_id),
-            ValueId::Instruction(at_val),
-        );
-        body.remove_instruction(cx, *load_id);
+        body.insert_insn_before(block, *load_id, at_val);
+        body.replace_all_uses_with(ValueId::Instruction(*load_id), ValueId::Instruction(at_val));
+        body.remove_instruction(*load_id);
     }
-    body.remove_instruction(cx, m.seed_id);
+    body.remove_instruction(m.seed_id);
     true
 }
 
@@ -299,14 +290,15 @@ impl FunctionPass for ArrayReads {
 
     fn run<'str>(
         &self,
-        f: &mut FunctionBody<'_, 'str>,
+        f: &mut FunctionBody<'str>,
         m: ContextView<'_, 'str>,
+        _next_minted: &mut u32,
     ) -> Result<Outcome<'str>, String> {
         let fid = f.id();
-        if !f.function_ref(m, fid).is_pure() {
+        if !m.read_host(f).function_ref(fid).is_pure() {
             return Ok(Outcome::unchanged());
         }
-        Ok(Outcome::changed(match try_match(f.read_host(m), fid) {
+        Ok(Outcome::changed(match try_match(m.read_host(f), fid) {
             Some(matched) => apply(f, m, &matched),
             None => false,
         }))
@@ -322,7 +314,7 @@ mod tests {
         builder::Builder,
         context::Context,
         testing::TestContext,
-        value::{BasicBlock, Function, Value},
+        value::{BasicBlock, FunctionBody, Value},
     };
 
     use crate::test_util::run_function_pass;
@@ -351,11 +343,11 @@ mod tests {
         };
         let ram = tc.ctx.shared.default_space;
 
-        let fid = Function::make(&mut tc.ctx, "f".into()).unwrap().id;
+        let fid = FunctionBody::make(&mut tc.ctx, "f".into()).unwrap().id;
         // Build the entry block *owned by* `fid` (block.func == fid), so the pass
         // can check the function out cleanly (no reattributed blocks).
         let entry = BasicBlock::make(&mut tc.ctx, fid).id;
-        Function::from_id_mut(&mut tc.ctx, fid)
+        FunctionBody::from_id_mut(&mut tc.ctx, fid)
             .set_root(entry)
             .unwrap();
         let arr_pid = BasicBlock::from_id_mut(&mut tc.ctx, entry).push_param(N).id;
@@ -390,12 +382,12 @@ mod tests {
         b.push_return(ret);
         drop(b);
 
-        Function::from_id_mut(&mut tc.ctx, fid).set_is_pure(true);
+        FunctionBody::from_id_mut(&mut tc.ctx, fid).set_is_pure(true);
         fid
     }
 
     fn temp_load_count(ctx: &Context, fid: FunctionId) -> usize {
-        Function::from_id(ctx, fid)
+        FunctionBody::from_id(ctx, fid)
             .iter()
             .flat_map(|blk| blk.iter())
             .filter(|i| {
@@ -407,7 +399,7 @@ mod tests {
 
     fn at_count(ctx: &Context, fid: FunctionId) -> usize {
         let at_id = IntrinsicId::from_name("at").unwrap();
-        Function::from_id(ctx, fid)
+        FunctionBody::from_id(ctx, fid)
             .iter()
             .flat_map(|blk| blk.iter())
             .filter(|i| matches!(i.mnemonic(), Mnemonic::Intrinsic(a) if a.id == at_id))

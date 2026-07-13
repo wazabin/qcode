@@ -45,8 +45,9 @@ impl FunctionPass for StructTyping {
 
     fn run<'str>(
         &self,
-        f: &mut FunctionBody<'_, 'str>,
+        f: &mut FunctionBody<'str>,
         cx: ContextView<'_, 'str>,
+        _next_minted: &mut u32,
     ) -> Result<Outcome<'str>, String> {
         let fid = f.id();
         Ok(Outcome::changed(struct_typing(f, cx, fid)))
@@ -56,7 +57,7 @@ impl FunctionPass for StructTyping {
 /// Recover struct-field accesses in `fun_id`, mutating the function through
 /// concrete `(body, cx)` (see the module docs). Returns `true` if the IR changed.
 pub fn struct_typing<'a, 'str>(
-    body: &'a mut FunctionBody<'_, 'str>,
+    body: &'a mut FunctionBody<'str>,
     cx: ContextView<'a, 'str>,
     fun_id: FunctionId,
 ) -> bool {
@@ -67,12 +68,13 @@ pub fn struct_typing<'a, 'str>(
     // types (the common case) the whole fixpoint + rename sweep is a guaranteed
     // no-op, so bail before allocating or scanning it twice. Per-function so it
     // stays correct once non-Windows struct recovery lands.
-    if !function_has_struct_types(body.read_host(cx), fun_id) {
+    if !function_has_struct_types(cx.read_host(body), fun_id) {
         return false;
     }
 
-    let insn_ids: Vec<InstructionId> = body
-        .function_ref(cx, fun_id)
+    let insn_ids: Vec<InstructionId> = cx
+        .read_host(body)
+        .function_ref(fun_id)
         .blocks()
         .flat_map(|b| b.instruction_ids().to_vec())
         .collect();
@@ -114,12 +116,13 @@ fn stored_type_of<'str>(host: HostRef<'_, 'str>, id: ValueId) -> Option<TypeId> 
 /// reference (e.g. a `PEB*` value becomes `%peb`), keeping names unique within
 /// the function. Returns `true` if any value was renamed.
 fn rename_struct_values<'a, 'str>(
-    body: &'a mut FunctionBody<'_, 'str>,
+    body: &'a mut FunctionBody<'str>,
     cx: ContextView<'a, 'str>,
     fun_id: FunctionId,
 ) -> bool {
-    let values: Vec<ValueId> = body
-        .function_ref(cx, fun_id)
+    let values: Vec<ValueId> = cx
+        .read_host(body)
+        .function_ref(fun_id)
         .blocks()
         .flat_map(|b| {
             b.params()
@@ -131,18 +134,18 @@ fn rename_struct_values<'a, 'str>(
 
     let mut changed = false;
     for value in values {
-        let Some(base) = stored_type_of(body.read_host(cx), value)
-            .and_then(|t| struct_base_name(body.read_host(cx), t))
+        let Some(base) = stored_type_of(cx.read_host(body), value)
+            .and_then(|t| struct_base_name(cx.read_host(body), t))
         else {
             continue;
         };
-        if let Some(name) = unique_name(body.read_host(cx), fun_id, value, &base) {
+        if let Some(name) = unique_name(cx.read_host(body), fun_id, value, &base) {
             let renamed = match value {
                 ValueId::Instruction(id) => {
-                    BaseRef::new(body.host(cx), id).rename_local(name).is_ok()
+                    BaseRef::new(cx.host(body), id).rename_local(name).is_ok()
                 }
                 ValueId::BlockParam(id) => {
-                    BaseRef::new(body.host(cx), id).rename_local(name).is_ok()
+                    BaseRef::new(cx.host(body), id).rename_local(name).is_ok()
                 }
                 _ => false,
             };
@@ -212,11 +215,11 @@ fn function_has_struct_types(host: HostRef, fun_id: FunctionId) -> bool {
 /// Attempts one typing step on instruction `id`. Returns `true` if it changed
 /// the IR (rewrote an add to a gep, or retyped a load result).
 fn type_instruction<'a, 'str>(
-    body: &'a mut FunctionBody<'_, 'str>,
+    body: &'a mut FunctionBody<'str>,
     cx: ContextView<'a, 'str>,
     id: InstructionId,
 ) -> bool {
-    match body.insn_ref(cx, id).mnemonic().clone() {
+    match cx.read_host(body).insn_ref(id).mnemonic().clone() {
         Mnemonic::Binop(Binary {
             op: Binop::Int(IntBinop::Add),
             lhs,
@@ -225,7 +228,7 @@ fn type_instruction<'a, 'str>(
         // A register read (`load` from the register space) yields the register's
         // own value type — which the TEB seed overrode to `PtrTo<TEB>`. A normal
         // RAM load dereferences a field pointer.
-        Mnemonic::Load(load) if is_register_space(body.read_host(cx), load.space) => {
+        Mnemonic::Load(load) if is_register_space(cx.read_host(body), load.space) => {
             try_type_register_read(body, cx, id, load.ptr.qualify(id.func), load.size)
         }
         Mnemonic::Load(load) => try_type_load(body, cx, id, load.ptr.qualify(id.func), load.size),
@@ -243,13 +246,13 @@ fn is_register_space(host: HostRef, space: SpaceId) -> bool {
 /// seed overrode `FS_OFFSET` to `PtrTo<TEB>`; plain integer registers are left
 /// untouched. Exact-size match only.
 fn try_type_register_read<'a, 'str>(
-    body: &'a mut FunctionBody<'_, 'str>,
+    body: &'a mut FunctionBody<'str>,
     cx: ContextView<'a, 'str>,
     id: InstructionId,
     reg: ValueId,
     size: usize,
 ) -> bool {
-    let Some(reg_ty) = stored_type_of(body.read_host(cx), reg) else {
+    let Some(reg_ty) = stored_type_of(cx.read_host(body), reg) else {
         return false;
     };
     let (is_ptr, reg_size) = {
@@ -259,30 +262,30 @@ fn try_type_register_read<'a, 'str>(
     if !is_ptr || reg_size != size {
         return false;
     }
-    if stored_type_of(body.read_host(cx), ValueId::Instruction(id)) == Some(reg_ty) {
+    if stored_type_of(cx.read_host(body), ValueId::Instruction(id)) == Some(reg_ty) {
         return false;
     }
-    BaseRef::new(body.host(cx), id).set_result_type(reg_ty);
+    BaseRef::new(cx.host(body), id).set_result_type(reg_ty);
     true
 }
 
 /// `int_add(base, const)` with `base : PtrTo<S>` and `const` an exact field
 /// offset of `S` → `gep(base, off)` typed `PtrTo<field.type>`.
 fn try_add_to_gep<'a, 'str>(
-    body: &'a mut FunctionBody<'_, 'str>,
+    body: &'a mut FunctionBody<'str>,
     cx: ContextView<'a, 'str>,
     id: InstructionId,
     lhs: ValueId,
     rhs: ValueId,
 ) -> bool {
     for (base, off_op) in [(lhs, rhs), (rhs, lhs)] {
-        let Some(base_ty) = stored_type_of(body.read_host(cx), base) else {
+        let Some(base_ty) = stored_type_of(cx.read_host(body), base) else {
             continue;
         };
         let Some(pointee) = cx.shr().types.pointee_of(base_ty) else {
             continue;
         };
-        let Some(offset) = const_offset(body.read_host(cx), off_op) else {
+        let Some(offset) = const_offset(cx.read_host(body), off_op) else {
             continue;
         };
         let field_ty = match cx.shr().types.field_by_offset(pointee, offset) {
@@ -292,14 +295,13 @@ fn try_add_to_gep<'a, 'str>(
         let width = cx.shr().types.size_of(base_ty);
         let result_ty = cx.shr().types.get_or_make_struct_pointer(width, field_ty);
         body.replace_instruction_mnemonic(
-            cx,
             id,
             Mnemonic::Gep(Gep {
                 base: base.localize(id.func),
                 offset,
             }),
         );
-        BaseRef::new(body.host(cx), id).set_result_type(result_ty);
+        BaseRef::new(cx.host(body), id).set_result_type(result_ty);
         return true;
     }
     false
@@ -308,13 +310,13 @@ fn try_add_to_gep<'a, 'str>(
 /// `load(ptr)` with `ptr : PtrTo<F>` and `load.size == size_of(F)` → result
 /// retyped to `F`. Exact-size match only; otherwise left as an integer read.
 fn try_type_load<'a, 'str>(
-    body: &'a mut FunctionBody<'_, 'str>,
+    body: &'a mut FunctionBody<'str>,
     cx: ContextView<'a, 'str>,
     id: InstructionId,
     ptr: ValueId,
     size: usize,
 ) -> bool {
-    let Some(ptr_ty) = stored_type_of(body.read_host(cx), ptr) else {
+    let Some(ptr_ty) = stored_type_of(cx.read_host(body), ptr) else {
         return false;
     };
     let Some(field_ty) = cx.shr().types.pointee_of(ptr_ty) else {
@@ -323,10 +325,10 @@ fn try_type_load<'a, 'str>(
     if cx.shr().types.size_of(field_ty) != size {
         return false;
     }
-    if stored_type_of(body.read_host(cx), ValueId::Instruction(id)) == Some(field_ty) {
+    if stored_type_of(cx.read_host(body), ValueId::Instruction(id)) == Some(field_ty) {
         return false;
     }
-    BaseRef::new(body.host(cx), id).set_result_type(field_ty);
+    BaseRef::new(cx.host(body), id).set_result_type(field_ty);
     true
 }
 
@@ -347,7 +349,7 @@ crate::register_function_pass!(StructTyping);
 
 #[cfg(test)]
 mod tests {
-    use qcode::value::{Function, ValueId};
+    use qcode::value::{FunctionBody, ValueId};
     use qcode_macro::qcode;
 
     use super::*;
@@ -356,7 +358,7 @@ mod tests {
 
     /// Collect the `gep` statements of a function in program order.
     fn gep_strings(ctx: &Context, fun: FunctionId) -> Vec<String> {
-        Function::from_id(ctx, fun)
+        FunctionBody::from_id(ctx, fun)
             .blocks()
             .flat_map(|b| {
                 b.iter()
@@ -404,7 +406,7 @@ mod tests {
         );
 
         // The loaded `inner` pointer inherited the `Inner*` field type.
-        let inner_id = Function::from_id(&ctx, f)
+        let inner_id = FunctionBody::from_id(&ctx, f)
             .blocks()
             .flat_map(|b| {
                 b.iter()

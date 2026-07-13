@@ -89,7 +89,7 @@ pub fn constant_fold_function(ctx: &mut Context, func_id: FunctionId) -> bool {
 /// the [`Fold`] sub-pass to a fixpoint over a checked-out `(&mut FunctionBody,
 /// ContextView)` with no threaded mutation host.
 fn constant_fold_body<'str>(
-    body: &mut FunctionBody<'_, 'str>,
+    body: &mut FunctionBody<'str>,
     cx: ContextView<'_, 'str>,
     func_id: FunctionId,
 ) -> bool {
@@ -107,7 +107,7 @@ pub fn narrow_function(ctx: &mut Context, func_id: FunctionId) -> bool {
 /// [`NarrowTrunc`] sub-pass to a fixpoint over a checked-out `(&mut FunctionBody,
 /// ContextView)`.
 fn narrow_body<'str>(
-    body: &mut FunctionBody<'_, 'str>,
+    body: &mut FunctionBody<'str>,
     cx: ContextView<'_, 'str>,
     func_id: FunctionId,
 ) -> bool {
@@ -154,7 +154,7 @@ pub fn gvn_function(ctx: &mut Context, func_id: FunctionId, aliases: Option<&Ali
 /// GVN sub-pass chain over the dominator tree of `func_id` on a checked-out
 /// `(&mut FunctionBody, ContextView)` with no threaded mutation host.
 fn gvn_body<'str>(
-    body: &mut FunctionBody<'_, 'str>,
+    body: &mut FunctionBody<'str>,
     cx: ContextView<'_, 'str>,
     func_id: FunctionId,
     aliases: Option<&AliasResult>,
@@ -177,8 +177,9 @@ impl FunctionPass for ConstFold {
     }
     fn run<'str>(
         &self,
-        f: &mut FunctionBody<'_, 'str>,
+        f: &mut FunctionBody<'str>,
         m: ContextView<'_, 'str>,
+        _next_minted: &mut u32,
     ) -> Result<Outcome<'str>, String> {
         let fun_id = f.id();
         Ok(Outcome::changed(constant_fold_body(f, m, fun_id)))
@@ -197,8 +198,9 @@ impl FunctionPass for Narrow {
     }
     fn run<'str>(
         &self,
-        f: &mut FunctionBody<'_, 'str>,
+        f: &mut FunctionBody<'str>,
         m: ContextView<'_, 'str>,
+        _next_minted: &mut u32,
     ) -> Result<Outcome<'str>, String> {
         let fun_id = f.id();
         Ok(Outcome::changed(narrow_body(f, m, fun_id)))
@@ -236,8 +238,9 @@ impl FunctionPass for Gvn {
     }
     fn run<'str>(
         &self,
-        f: &mut FunctionBody<'_, 'str>,
+        f: &mut FunctionBody<'str>,
         m: ContextView<'_, 'str>,
+        _next_minted: &mut u32,
     ) -> Result<Outcome<'str>, String> {
         let fun_id = f.id();
         // Canonicalize pointer arithmetic *before* building the alias oracle, so it
@@ -245,7 +248,7 @@ impl FunctionPass for Gvn {
         let mut changed = constant_fold_body(f, m, fun_id);
         // Build the oracle over the (now-canonicalized) body, then run the
         // dominator-tree GVN against it.
-        let aliases = build_gvn_aliases(m, f.read_host(m), fun_id);
+        let aliases = build_gvn_aliases(m, m.read_host(f), fun_id);
         changed |= gvn_body(f, m, fun_id, Some(&aliases));
         Ok(Outcome::changed(changed))
     }

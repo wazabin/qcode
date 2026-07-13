@@ -1527,10 +1527,9 @@ async fn run_function_stage(
             let before_targets = ctx.direct_call_targets(fun_id);
             let outcome = {
                 let (bodies, view) = ctx.split(env);
-                let mut body = FunctionBody::new(&mut bodies[fun_id]);
                 run_one_function(
                     passes,
-                    &mut body,
+                    &mut bodies[fun_id],
                     view,
                     cache,
                     &mut elapsed,
@@ -1603,7 +1602,7 @@ async fn run_function_stage(
 #[allow(clippy::too_many_arguments)]
 fn run_one_function<'str>(
     passes: &[Box<dyn DynFunctionPass>],
-    body: &mut FunctionBody<'_, 'str>,
+    body: &mut FunctionBody<'str>,
     cx: ContextView<'_, 'str>,
     cache: &mut FixpointCache,
     elapsed: &mut HashMap<&'static str, (std::time::Duration, usize, usize)>,
@@ -1613,6 +1612,7 @@ fn run_one_function<'str>(
     mut on_pass: impl FnMut(&'static str),
 ) -> Result<Outcome<'str>, String> {
     let fun_id = body.id();
+    let mut next_minted = 0;
     let mut iters = 0;
     let mut function_changed = false;
     // Aggregate the per-pass outcomes across the fixpoint: `rename` last-writer-wins
@@ -1634,7 +1634,7 @@ fn run_one_function<'str>(
             #[cfg(not(target_arch = "wasm32"))]
             let started = std::time::Instant::now();
             let outcome = p
-                .run_checked(body, cx)
+                .run_checked(body, cx, &mut next_minted)
                 .map_err(|e| format!("{}: {e}", p.name()))?;
             let pass_changed = outcome.changed;
             if outcome.rename.is_some() {
@@ -1657,7 +1657,7 @@ fn run_one_function<'str>(
                 // Fingerprint the checked-out body through its own host (it is
                 // absent from `ctx`, so `function_fingerprint` cannot see it).
                 let fp =
-                    fingerprint_display(qcode::value::FunctionRef::new(body.read_host(cx), fun_id));
+                    fingerprint_display(qcode::value::FunctionRef::new(cx.read_host(body), fun_id));
                 if tracer.observe(&tracer_label, iters + 1, p.name(), fp) {
                     log::warn!(
                         target: "pipeline::fixpoint",
@@ -1727,7 +1727,7 @@ struct ParallelEntry<'a, 'str> {
     fun_id: FunctionId,
     name: std::sync::Arc<str>,
     before_targets: Vec<FunctionId>,
-    body: FunctionBody<'a, 'str>,
+    body: &'a mut FunctionBody<'str>,
     outcome: Outcome<'str>,
 }
 
@@ -1796,7 +1796,7 @@ fn run_stage_parallel(
                     fun_id,
                     name,
                     before_targets,
-                    body: FunctionBody::new(slot),
+                    body: slot,
                     outcome: Outcome::default(),
                 },
             )
@@ -1827,7 +1827,7 @@ fn run_stage_parallel(
                             let tx = &tx;
                             let outcome = run_one_function(
                                 passes,
-                                &mut e.body,
+                                e.body,
                                 view,
                                 &mut local_cache,
                                 &mut local_elapsed,

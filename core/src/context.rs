@@ -11,7 +11,7 @@ use crate::{
     space::{Space, SpaceId},
     types::TypeManager,
     value::{
-        BasicBlock, Function, FunctionId, FunctionRef, Instruction, ValueId,
+        BasicBlock, FunctionBody, FunctionId, FunctionRef, Instruction, ValueId,
         block::{BlockId, BlockRef, EdgeData, EdgeId},
         block_param::{BlockParam, BlockParamId},
         insn::{InstructionId, InstructionRef, Mnemonic, PCodeOpId},
@@ -70,7 +70,7 @@ pub struct Context<'str> {
     /// route through here. A checked-out function's body is moved out of its slot
     /// (leaving an empty body); its [`interface`](Self::interfaces) stays put, so
     /// callers always read the real interface.
-    pub bodies: Registry<FunctionId, Function<'str>>,
+    pub bodies: Registry<FunctionId, FunctionBody<'str>>,
 }
 
 #[derive(serde::Deserialize)]
@@ -78,7 +78,7 @@ struct ContextWire<'str> {
     shared: Shared<'str>,
     #[serde(default)]
     interfaces: Registry<FunctionId, crate::value::function::FunctionInterface<'str>>,
-    bodies: Registry<FunctionId, Function<'str>>,
+    bodies: Registry<FunctionId, FunctionBody<'str>>,
 }
 
 impl<'de, 'str> serde::Deserialize<'de> for Context<'str> {
@@ -131,7 +131,7 @@ pub struct Shared<'str> {
     /// Global reverse name map for module-scoped values (functions, varnodes,
     /// spaces, p-code ops, byte blobs), used to keep their name hints unique and
     /// resolve them by name. Block/instruction/param names are **not** here — they
-    /// live in each [`Function`](crate::value::Function)'s own [`NameTable`], so
+    /// live in each [`FunctionBody`](crate::value::FunctionBody)'s own [`NameTable`], so
     /// those namespaces stay independent across functions (see [`NameTable`]).
     pub(crate) name_map: NameTable<'str>,
 
@@ -662,7 +662,7 @@ impl<'str> Context<'str> {
     /// pyqcode API that build a block without an enclosing function).
     pub fn anon_function(&mut self) -> FunctionId {
         let name = self.get_unique_name(std::borrow::Cow::Borrowed("anon"));
-        crate::value::Function::make(self, name)
+        crate::value::FunctionBody::make(self, name)
             .expect("unique anon function name")
             .id
     }
@@ -935,7 +935,7 @@ impl<'str> Context<'str> {
     fn function_registered_at_block(&self, block: BlockId) -> Option<FunctionId> {
         self.block(block)
             .address
-            .and_then(|addr| Function::from_addr(self, addr))
+            .and_then(|addr| FunctionBody::from_addr(self, addr))
             .map(|f| f.id)
     }
 
@@ -1013,9 +1013,9 @@ impl<'str> Context<'str> {
         // may carry a symbol name), else mint a conventional one. A block already
         // stored elsewhere at this address is not adopted; relocation below creates
         // and roots a self-stored clone.
-        let g = match Function::from_addr(self, addr).map(|f| f.id) {
+        let g = match FunctionBody::from_addr(self, addr).map(|f| f.id) {
             Some(existing) => existing,
-            None => Function::make_at_addr(self, addr, None).id,
+            None => FunctionBody::make_at_addr(self, addr, None).id,
         };
 
         // The tail is computed on the pre-split CFG (cross-function edges intact) so
@@ -1175,7 +1175,7 @@ impl<'str> Context<'str> {
     /// Rebuild `func`'s `instruction_addrs` from the machine addresses of the
     /// instructions in its current blocks.
     fn recompute_instruction_addrs(&mut self, func: FunctionId) {
-        let blocks = Function::from_id(self, func).block_ids();
+        let blocks = FunctionBody::from_id(self, func).block_ids();
         let mut addrs = std::collections::BTreeSet::new();
         for b in blocks {
             for insn in BasicBlock::from_id(self, b).instructions() {
@@ -1191,7 +1191,7 @@ impl<'str> Context<'str> {
     /// instructions' operands. Mirrors the per-operand recording in
     /// [`Context::push_insn`](crate::context::Context::push_insn).
     fn rebuild_users(&mut self, func: FunctionId) {
-        let live: Vec<InstructionId> = Function::from_id(self, func).instruction_ids();
+        let live: Vec<InstructionId> = FunctionBody::from_id(self, func).instruction_ids();
         let users = &mut self.bodies[func].users;
         users.clear();
         for id in live {
@@ -1364,12 +1364,12 @@ impl<'str> Context<'str> {
     /// through its checked-out host. After the stage-4 `func`-strip only this
     /// obtain step changes (the caller already holds `&FunctionBody`); the
     /// `.block(id)` call on the result is unchanged.
-    pub fn body(&self, fid: FunctionId) -> &crate::value::Function<'str> {
+    pub fn body(&self, fid: FunctionId) -> &crate::value::FunctionBody<'str> {
         &self.bodies[fid]
     }
 
     /// The function *body* `fid`, mutably (see [`Context::body`]).
-    pub fn body_mut(&mut self, fid: FunctionId) -> &mut crate::value::Function<'str> {
+    pub fn body_mut(&mut self, fid: FunctionId) -> &mut crate::value::FunctionBody<'str> {
         &mut self.bodies[fid]
     }
 
@@ -1456,11 +1456,7 @@ impl<'str> Context<'str> {
     /// (literal/bytes/varnode) there is no single owner, so this returns `&[]`.
     pub fn users_of(&self, value: ValueId) -> Vec<InstructionId> {
         match value.owning_function() {
-            Some(func) => self.bodies[func]
-                .users_of(value)
-                .iter()
-                .map(|&local| InstructionId::new(func, local))
-                .collect(),
+            Some(func) => self.bodies[func].users_of(value),
             None => Vec::new(),
         }
     }
@@ -1529,7 +1525,7 @@ impl<'str> Context<'str> {
     pub fn push_function(
         &mut self,
         interface: crate::value::function::FunctionInterface<'str>,
-        body: Function<'str>,
+        body: FunctionBody<'str>,
     ) -> FunctionId {
         let expected = FunctionId::from(self.bodies.len());
         assert_eq!(
@@ -1842,11 +1838,11 @@ impl<'str> Context<'str> {
         &self.shared
     }
     /// The owning function's storage (read). Alias of [`body`](Self::body).
-    pub fn function(&self, f: FunctionId) -> &Function<'str> {
+    pub fn function(&self, f: FunctionId) -> &FunctionBody<'str> {
         &self.bodies[f]
     }
     /// The owning function's storage (write). Alias of [`body_mut`](Self::body_mut).
-    pub fn function_mut(&mut self, f: FunctionId) -> &mut Function<'str> {
+    pub fn function_mut(&mut self, f: FunctionId) -> &mut FunctionBody<'str> {
         &mut self.bodies[f]
     }
 
@@ -2095,7 +2091,7 @@ impl<'str> Context<'str> {
                 (ValueId::Function(func_id), ValueId::BasicBlock(block_id))
                 | (ValueId::BasicBlock(block_id), ValueId::Function(func_id)) => {
                     if block_id.func == func_id {
-                        Function::from_id_mut(self, func_id).ensure_root(block_id)?;
+                        FunctionBody::from_id_mut(self, func_id).ensure_root(block_id)?;
                     }
                     self.shared
                         .address_map
@@ -2143,7 +2139,7 @@ impl<'str> Context<'str> {
     /// scan would reuse it, and the hint must not skip it). Un-suffixed names are
     /// Attempts to get a value ID by its *global* name (function/varnode/space/
     /// p-code/bytes). Block/instruction/param names are function-scoped and are
-    /// resolved through their owning [`Function`] (see [`NameTable`]); this
+    /// resolved through their owning [`FunctionBody`] (see [`NameTable`]); this
     /// returns `None` for them.
     pub fn get_named(&self, name: &str) -> Option<ValueId> {
         self.shared.name_map.get(name)
@@ -2173,7 +2169,7 @@ impl<'str> Context<'str> {
 /// A name → value reverse map with amortized unique-name minting.
 ///
 /// The context keeps one **global** table for module-scoped values (functions,
-/// varnodes, spaces, p-code ops, byte blobs); each [`Function`](crate::value::Function)
+/// varnodes, spaces, p-code ops, byte blobs); each [`FunctionBody`](crate::value::FunctionBody)
 /// keeps its **own** table for its block/instruction/param names. Keeping those
 /// namespaces independent is a prerequisite for running function passes in
 /// parallel: a worker mints names against its function's table with no global
@@ -2330,7 +2326,7 @@ impl Display for Context<'_> {
 
 pub struct FunctionIter<'str, 'ctx> {
     ctx: &'ctx Context<'str>,
-    inner: registry::Iter<'ctx, FunctionId, Function<'str>>,
+    inner: registry::Iter<'ctx, FunctionId, FunctionBody<'str>>,
 }
 
 impl<'str, 'ctx> Iterator for FunctionIter<'str, 'ctx> {
@@ -2355,14 +2351,14 @@ impl<'str, 'ctx> IntoIterator for &'ctx Context<'str> {
 mod tests {
     use super::*;
     use crate::value::{
-        BasicBlock, Function, ValueId,
+        BasicBlock, FunctionBody, ValueId,
         insn::{Binary, Binop, Call, Callee, IntBinop, Load, Mnemonic},
     };
     use qcode_macro::qcode;
 
     fn make_fn_with_blocks(ctx: &mut Context<'static>, name: &'static str, n: usize) -> FunctionId {
         // The function must exist before its blocks so they are born into its arena.
-        let f = Function::make(ctx, name.into()).unwrap().id;
+        let f = FunctionBody::make(ctx, name.into()).unwrap().id;
         for _ in 0..n {
             BasicBlock::make(ctx, f);
         }
@@ -2373,8 +2369,10 @@ mod tests {
     #[should_panic(expected = "cannot reuse a block stored in another function arena")]
     fn get_or_make_block_rejects_foreign_storage_at_address() {
         let mut ctx = Context::new();
-        let a = Function::make(&mut ctx, "address_owner".into()).unwrap().id;
-        let b = Function::make(&mut ctx, "address_requester".into())
+        let a = FunctionBody::make(&mut ctx, "address_owner".into())
+            .unwrap()
+            .id;
+        let b = FunctionBody::make(&mut ctx, "address_requester".into())
             .unwrap()
             .id;
         BasicBlock::make(&mut ctx, a).with_address(0x1000);
@@ -2386,8 +2384,8 @@ mod tests {
     #[should_panic(expected = "cannot create a block at an address owned by another function")]
     fn get_or_make_block_rejects_foreign_function_address_without_root() {
         let mut ctx = Context::new();
-        Function::make_at_addr(&mut ctx, 0x1000, None);
-        let requester = Function::make(&mut ctx, "address_requester".into())
+        FunctionBody::make_at_addr(&mut ctx, 0x1000, None);
+        let requester = FunctionBody::make(&mut ctx, "address_requester".into())
             .unwrap()
             .id;
 
@@ -2429,7 +2427,7 @@ mod tests {
                     return at 0;
             "
         );
-        let fid = Function::from_name(&ctx, "foo").unwrap().id();
+        let fid = FunctionBody::from_name(&ctx, "foo").unwrap().id();
         let fid = ValueId::as_function(fid).unwrap();
 
         // A structural snapshot read entirely through a `HostRef` — function name,
@@ -2825,7 +2823,7 @@ mod tests {
         // `ptr` is a shared varnode, so query its uses across functions.
         assert_eq!(ctx.users_across_functions(ptr), vec![call_id]);
 
-        let target = Function::make(&mut ctx, "target".into()).unwrap().id;
+        let target = FunctionBody::make(&mut ctx, "target".into()).unwrap().id;
         ctx.replace_instruction_mnemonic(
             call_id,
             Mnemonic::Call(Call {
@@ -2895,7 +2893,7 @@ mod tests {
             "
         );
         let call_id = BasicBlock::from_id(&ctx, block).instruction_ids()[0];
-        let target = Function::make(&mut ctx, "target".into()).unwrap().id;
+        let target = FunctionBody::make(&mut ctx, "target".into()).unwrap().id;
 
         // Indirect calls have no static target, so nothing is recorded yet.
         assert!(ctx.shared.values.call_sites_of(target).is_empty());
@@ -3036,7 +3034,7 @@ mod tests {
     #[test]
     fn truth_map_tracks_four_states_and_conflicts() {
         let mut ctx = Context::new();
-        let callee = Function::make(&mut ctx, "callee".into()).unwrap().id;
+        let callee = FunctionBody::make(&mut ctx, "callee".into()).unwrap().id;
         let prop = Proposition::FunctionReturns(callee);
 
         // First assume wins; same polarity is idempotent; opposite fails.
@@ -3076,7 +3074,7 @@ mod tests {
     #[test]
     fn seeded_facts_are_not_novel() {
         let mut ctx = Context::new();
-        let callee = Function::make(&mut ctx, "exit".into()).unwrap().id;
+        let callee = FunctionBody::make(&mut ctx, "exit".into()).unwrap().id;
         let prop = Proposition::FunctionReturns(callee);
 
         ctx.seed_known(prop, false, PassName("seed"));
@@ -3265,7 +3263,7 @@ mod tests {
         use super::*;
         use crate::builder::Builder;
         use crate::value::insn::{Callee, Mnemonic, TailCall};
-        use crate::value::{BasicBlock, Function, Instruction};
+        use crate::value::{BasicBlock, FunctionBody, Instruction};
         use std::borrow::Cow;
 
         fn block_at(ctx: &mut Context<'static>, func: FunctionId, addr: u64) -> BlockId {
@@ -3302,7 +3300,7 @@ mod tests {
         }
 
         fn block_at_addr(ctx: &Context, func: FunctionId, addr: u64) -> BlockId {
-            Function::from_id(ctx, func)
+            FunctionBody::from_id(ctx, func)
                 .block_ids()
                 .into_iter()
                 .find(|b| ctx.block(*b).address == Some(addr))
@@ -3310,7 +3308,7 @@ mod tests {
         }
 
         fn addrs(ctx: &Context, func: FunctionId) -> Vec<u64> {
-            let mut got: Vec<u64> = Function::from_id(ctx, func)
+            let mut got: Vec<u64> = FunctionBody::from_id(ctx, func)
                 .block_ids()
                 .into_iter()
                 .filter_map(|b| ctx.block(b).address)
@@ -3326,7 +3324,7 @@ mod tests {
         #[test]
         fn splits_absorbed_body_reusing_the_stub() {
             let mut ctx = Context::new();
-            let f = Function::make_at_addr(&mut ctx, 0x1000, Some(Cow::Borrowed("thunk"))).id;
+            let f = FunctionBody::make_at_addr(&mut ctx, 0x1000, Some(Cow::Borrowed("thunk"))).id;
             let b0 = block_at(&mut ctx, f, 0x1000);
             let b1 = block_at(&mut ctx, f, 0x2000);
             let b2 = block_at(&mut ctx, f, 0x2005);
@@ -3334,11 +3332,11 @@ mod tests {
             branch_at(&mut ctx, b1, b2, 0x2000);
             return_at(&mut ctx, b2, 0x2005);
             {
-                let mut func = Function::from_id_mut(&mut ctx, f);
+                let mut func = FunctionBody::from_id_mut(&mut ctx, f);
                 func.set_root(b0).unwrap();
             }
             // A later `call 0x2000` minted the stub.
-            let g = Function::make_at_addr(&mut ctx, 0x2000, Some(Cow::Borrowed("real"))).id;
+            let g = FunctionBody::make_at_addr(&mut ctx, 0x2000, Some(Cow::Borrowed("real"))).id;
 
             let split_g = ctx.split_function_at(b1);
             assert_eq!(
@@ -3352,7 +3350,7 @@ mod tests {
             assert_eq!(ctx.bodies[g].root_id(), Some(g_entry.local));
 
             // Every G block is self-stored.
-            for b in Function::from_id(&ctx, g).block_ids() {
+            for b in FunctionBody::from_id(&ctx, g).block_ids() {
                 assert_eq!(b.func, g);
                 assert_eq!(ctx.block(b).parent, Some(g));
             }
@@ -3373,7 +3371,7 @@ mod tests {
         #[test]
         fn split_stops_at_a_foreign_rootless_stub_address() {
             let mut ctx = Context::new();
-            let f = Function::make_at_addr(&mut ctx, 0x1000, Some(Cow::Borrowed("f"))).id;
+            let f = FunctionBody::make_at_addr(&mut ctx, 0x1000, Some(Cow::Borrowed("f"))).id;
             let entry = block_at(&mut ctx, f, 0x1000);
             let split = block_at(&mut ctx, f, 0x2000);
             let foreign_entry = block_at(&mut ctx, f, 0x3000);
@@ -3382,17 +3380,19 @@ mod tests {
             branch_at(&mut ctx, split, foreign_entry, 0x2000);
             branch_at(&mut ctx, foreign_entry, foreign_body, 0x3000);
             return_at(&mut ctx, foreign_body, 0x3005);
-            Function::from_id_mut(&mut ctx, f).set_root(entry).unwrap();
+            FunctionBody::from_id_mut(&mut ctx, f)
+                .set_root(entry)
+                .unwrap();
 
-            let g = Function::make_at_addr(&mut ctx, 0x2000, Some(Cow::Borrowed("g"))).id;
-            let h = Function::make_at_addr(&mut ctx, 0x3000, Some(Cow::Borrowed("h"))).id;
-            assert!(Function::from_id(&ctx, g).root().is_none());
-            assert!(Function::from_id(&ctx, h).root().is_none());
+            let g = FunctionBody::make_at_addr(&mut ctx, 0x2000, Some(Cow::Borrowed("g"))).id;
+            let h = FunctionBody::make_at_addr(&mut ctx, 0x3000, Some(Cow::Borrowed("h"))).id;
+            assert!(FunctionBody::from_id(&ctx, g).root().is_none());
+            assert!(FunctionBody::from_id(&ctx, h).root().is_none());
 
             assert_eq!(ctx.split_function_at(split), g);
             assert_eq!(addrs(&ctx, g), vec![0x2000]);
             assert_eq!(addrs(&ctx, f), vec![0x1000, 0x3000, 0x3005]);
-            assert!(Function::from_id(&ctx, h).root().is_none());
+            assert!(FunctionBody::from_id(&ctx, h).root().is_none());
 
             let g_entry = block_at_addr(&ctx, g, 0x2000);
             let term = BasicBlock::from_id(&ctx, g_entry)
@@ -3408,7 +3408,7 @@ mod tests {
         #[test]
         fn split_rehomes_block_param_origin_into_destination_arena() {
             let mut ctx = Context::new();
-            let f = Function::make_at_addr(&mut ctx, 0x1000, Some(Cow::Borrowed("f"))).id;
+            let f = FunctionBody::make_at_addr(&mut ctx, 0x1000, Some(Cow::Borrowed("f"))).id;
             let entry = block_at(&mut ctx, f, 0x1000);
             let tail = block_at(&mut ctx, f, 0x2000);
             let param = BasicBlock::from_id_mut(&mut ctx, tail).push_param(8).id;
@@ -3424,7 +3424,9 @@ mod tests {
                 .push_return(ValueId::BlockParam(param))
                 .id;
             Instruction::from_id_mut(&mut ctx, ret).set_address(0x2000);
-            Function::from_id_mut(&mut ctx, f).set_root(entry).unwrap();
+            FunctionBody::from_id_mut(&mut ctx, f)
+                .set_root(entry)
+                .unwrap();
 
             let g = ctx.split_function_at(tail);
             let new_tail = block_at_addr(&ctx, g, 0x2000);
@@ -3438,14 +3440,16 @@ mod tests {
         #[test]
         fn conditional_arm_into_split_block_uses_a_trampoline() {
             let mut ctx = Context::new();
-            let f = Function::make_at_addr(&mut ctx, 0x1000, Some(Cow::Borrowed("f"))).id;
+            let f = FunctionBody::make_at_addr(&mut ctx, 0x1000, Some(Cow::Borrowed("f"))).id;
             let entry = block_at(&mut ctx, f, 0x1000);
             let cont = block_at(&mut ctx, f, 0x1008);
             let tail = block_at(&mut ctx, f, 0x2000);
             cbranch_at(&mut ctx, entry, tail, cont, 0x1000);
             return_at(&mut ctx, cont, 0x1008);
             return_at(&mut ctx, tail, 0x2000);
-            Function::from_id_mut(&mut ctx, f).set_root(entry).unwrap();
+            FunctionBody::from_id_mut(&mut ctx, f)
+                .set_root(entry)
+                .unwrap();
 
             let g = ctx.split_function_at(tail);
 
@@ -3488,19 +3492,21 @@ mod tests {
         #[test]
         fn mints_a_conventional_function_when_no_stub_exists() {
             let mut ctx = Context::new();
-            let f = Function::make_at_addr(&mut ctx, 0x1000, Some(Cow::Borrowed("f"))).id;
+            let f = FunctionBody::make_at_addr(&mut ctx, 0x1000, Some(Cow::Borrowed("f"))).id;
             let entry = block_at(&mut ctx, f, 0x1000);
             let mid = block_at(&mut ctx, f, 0x1008);
             branch_at(&mut ctx, entry, mid, 0x1000);
             return_at(&mut ctx, mid, 0x1008);
-            Function::from_id_mut(&mut ctx, f).set_root(entry).unwrap();
+            FunctionBody::from_id_mut(&mut ctx, f)
+                .set_root(entry)
+                .unwrap();
 
             let g = ctx.split_function_at(mid);
-            assert_eq!(Function::from_id(&ctx, g).name(), "fn_1008");
+            assert_eq!(FunctionBody::from_id(&ctx, g).name(), "fn_1008");
             assert_eq!(addrs(&ctx, f), vec![0x1000]);
             assert_eq!(addrs(&ctx, g), vec![0x1008]);
-            assert_eq!(Function::from_addr(&ctx, 0x1008).map(|f| f.id), Some(g));
-            for b in Function::from_id(&ctx, g).block_ids() {
+            assert_eq!(FunctionBody::from_addr(&ctx, 0x1008).map(|f| f.id), Some(g));
+            for b in FunctionBody::from_id(&ctx, g).block_ids() {
                 assert_eq!(b.func, g);
             }
         }

@@ -53,7 +53,7 @@ use rustc_hash::FxHashMap as HashMap;
 use qcode::{
     context::Context,
     value::{
-        BasicBlock, Function, FunctionId, InstructionRef, ValueId,
+        BasicBlock, FunctionBody, FunctionId, InstructionRef, ValueId,
         insn::{Extract, InstructionId, Mnemonic},
     },
 };
@@ -70,7 +70,7 @@ const MAX_INLINE_INSNS: usize = 10;
 pub fn partial_inline(ctx: &mut Context) -> bool {
     let mut changed = false;
     for fid in ctx.function_ids() {
-        if Function::from_id(ctx, fid).is_pure_reg() && try_partial_inline(ctx, fid) {
+        if FunctionBody::from_id(ctx, fid).is_pure_reg() && try_partial_inline(ctx, fid) {
             changed = true;
         }
     }
@@ -118,7 +118,7 @@ fn is_pure_dataop(m: &Mnemonic) -> bool {
 
 /// Every `Return` terminator in `fid`.
 fn returns_of(ctx: &Context, fid: FunctionId) -> Vec<InstructionId> {
-    Function::from_id(ctx, fid)
+    FunctionBody::from_id(ctx, fid)
         .iter()
         .filter_map(|b| {
             let last = b.iter().last()?;
@@ -206,7 +206,7 @@ struct Inlinable {
 }
 
 fn try_partial_inline(ctx: &mut Context, fid: FunctionId) -> bool {
-    let Some(root) = Function::from_id(ctx, fid).root().map(|b| b.id) else {
+    let Some(root) = FunctionBody::from_id(ctx, fid).root().map(|b| b.id) else {
         return false;
     };
 
@@ -448,8 +448,8 @@ mod tests {
             );
             agg = Some(tc.ctx.type_of(ValueId::Instruction(tuple_id)));
         }
-        Function::from_id_mut(&mut tc.ctx, fid).set_input_regs(inputs);
-        Function::from_id_mut(&mut tc.ctx, fid).set_pure_reg(true);
+        FunctionBody::from_id_mut(&mut tc.ctx, fid).set_input_regs(inputs);
+        FunctionBody::from_id_mut(&mut tc.ctx, fid).set_pure_reg(true);
         agg.unwrap()
     }
 
@@ -550,7 +550,7 @@ mod tests {
     fn projects_returned_map_into_caller() {
         let mut tc = qcode::testing::TestContext::new();
         let (vr0, vr1) = (tc.r0, tc.r1);
-        let body = Function::make(&mut tc.ctx, "foobar".into()).unwrap().id;
+        let body = FunctionBody::make(&mut tc.ctx, "foobar".into()).unwrap().id;
 
         qcode!(
             tc.ctx,

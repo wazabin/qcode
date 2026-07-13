@@ -70,7 +70,7 @@ mod tests {
         builder::Builder,
         testing::TestContext,
         value::{
-            BasicBlock, Function, ValueId,
+            BasicBlock, FunctionBody, ValueId,
             insn::{Callee, Mnemonic, mnemonic::MnemonicKind},
         },
     };
@@ -80,11 +80,11 @@ mod tests {
     #[test]
     fn scan_renders_as_scanl() {
         let mut tc = TestContext::new();
-        let body = Function::make(&mut tc.ctx, "foo".into()).unwrap().id;
-        let host = Function::make(&mut tc.ctx, "host".into()).unwrap().id;
+        let body = FunctionBody::make(&mut tc.ctx, "foo".into()).unwrap().id;
+        let host = FunctionBody::make(&mut tc.ctx, "host".into()).unwrap().id;
         let entry = tc.ctx.get_or_make_block(0x2000, host);
         {
-            let mut f = Function::from_id_mut(&mut tc.ctx, host);
+            let mut f = FunctionBody::from_id_mut(&mut tc.ctx, host);
             f.set_root(entry).unwrap();
             f.add_block(entry);
         }
@@ -135,11 +135,11 @@ mod tests {
     #[test]
     fn scan_builds_with_array_result_and_symbol_body() {
         let mut tc = TestContext::new();
-        let body = Function::make(&mut tc.ctx, "body".into()).unwrap().id;
-        let host = Function::make(&mut tc.ctx, "host".into()).unwrap().id;
+        let body = FunctionBody::make(&mut tc.ctx, "body".into()).unwrap().id;
+        let host = FunctionBody::make(&mut tc.ctx, "host".into()).unwrap().id;
         let entry = tc.ctx.get_or_make_block(0x1000, host);
         {
-            let mut f = Function::from_id_mut(&mut tc.ctx, host);
+            let mut f = FunctionBody::from_id_mut(&mut tc.ctx, host);
             f.set_root(entry).unwrap();
             f.add_block(entry);
         }

@@ -55,7 +55,7 @@ use qcode::{
     space::SpaceId,
     types::TypeId,
     value::{
-        BasicBlock, BlockId, Function, FunctionId, Instruction, ValueId,
+        BasicBlock, BlockId, FunctionBody, FunctionId, Instruction, ValueId,
         insn::{InstructionId, Mnemonic},
     },
 };
@@ -83,12 +83,12 @@ pub use registers::{RegPurityGates, RegPurityReason, argpromote_registers, reg_p
 /// pointer — passed positionally, whether in a register or on the stack — would
 /// otherwise be unfindable, bailing the whole function. The root params are the
 /// real call interface and are in lockstep with `Call.args` (see
-/// [`Function::input_arg_name`]), so a param's index *is* its argument index.
+/// [`FunctionBody::input_arg_name`]), so a param's index *is* its argument index.
 pub(crate) fn arg_index_of(ctx: &Context, fid: FunctionId, name: &str) -> Option<usize> {
-    let len = Function::from_id(ctx, fid)
+    let len = FunctionBody::from_id(ctx, fid)
         .root()
         .map_or(0, |b| b.params().count());
-    (0..len).find(|&i| Function::from_id(ctx, fid).input_arg_name(i).as_deref() == Some(name))
+    (0..len).find(|&i| FunctionBody::from_id(ctx, fid).input_arg_name(i).as_deref() == Some(name))
 }
 
 /// Every function whose address is taken as a value — used as a value anywhere
@@ -179,7 +179,7 @@ pub(crate) fn add_input(
     if let (ValueId::BlockParam(pid), Some(ty)) = (param, type_id) {
         ctx.block_param_mut(pid).type_id = ty;
     }
-    let root = Function::from_id(ctx, fid).root().map(|b| b.id)?;
+    let root = FunctionBody::from_id(ctx, fid).root().map(|b| b.id)?;
     let mut b = Builder::from_block(BasicBlock::from_id_mut(ctx, root));
     b.set_insert_point_to_start();
     let addr = seed_addr(&mut b);
@@ -222,7 +222,7 @@ pub(crate) fn append_outputs<S>(
         .map(|(i, s)| field_names(i, s).len())
         .collect();
 
-    let returns: Vec<InstructionId> = Function::from_id(ctx, fid)
+    let returns: Vec<InstructionId> = FunctionBody::from_id(ctx, fid)
         .iter()
         .filter_map(|b| {
             let last = b.iter().last()?;

@@ -26,7 +26,7 @@ use crate::{ContextView, FunctionBody};
 pub(super) struct MemoryForwarding;
 
 /// The function-pass [`SubPassC`] impl (context-split stage 5b-ii):
-/// reads route through `body.read_host(cx)`, the load forward through `Editor`'s
+/// reads route through `cx.read_host(body)`, the load forward through `Editor`'s
 /// `_c` method, and the [`MemForward`] rebuild/record helpers (`record_store_c`,
 /// `try_load_c`) run over `&mut PassBacking`.
 impl<'str> SubPassC<'str> for MemoryForwarding {
@@ -45,7 +45,7 @@ impl<'str> SubPassC<'str> for MemoryForwarding {
 
     fn on_block_entry(
         &self,
-        body: &mut FunctionBody<'_, 'str>,
+        body: &mut FunctionBody<'str>,
         cx: ContextView<'_, 'str>,
         state: &mut dyn Any,
         block_id: BlockId,
@@ -58,12 +58,12 @@ impl<'str> SubPassC<'str> for MemoryForwarding {
         if is_shared {
             state.clear();
         }
-        state.prune_loop_carried(body.read_host(cx), block_id, tree, aliases, numbering);
+        state.prune_loop_carried(cx.read_host(body), block_id, tree, aliases, numbering);
     }
 
     fn on_insn(
         &self,
-        body: &mut FunctionBody<'_, 'str>,
+        body: &mut FunctionBody<'str>,
         cx: ContextView<'_, 'str>,
         state: &mut dyn Any,
         ic: &InsnCtx,
@@ -102,7 +102,7 @@ impl<'str> SubPassC<'str> for MemoryForwarding {
 
     fn after_block(
         &self,
-        body: &mut FunctionBody<'_, 'str>,
+        body: &mut FunctionBody<'str>,
         cx: ContextView<'_, 'str>,
         state: &mut dyn Any,
         block_id: BlockId,
@@ -110,7 +110,7 @@ impl<'str> SubPassC<'str> for MemoryForwarding {
         _numbering: &Numbering,
     ) {
         let state = state.downcast_mut::<MemForward>().expect("memory state");
-        state.prune_clobbered_by_call(body.read_host(cx), block_id, aliases);
+        state.prune_clobbered_by_call(cx.read_host(body), block_id, aliases);
     }
 }
 

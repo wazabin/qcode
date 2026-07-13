@@ -36,7 +36,7 @@ use qcode::{
     context::Context,
     types::AggregateField,
     value::{
-        BlockParamId, Function, FunctionId, Instruction, ValueId,
+        BlockParamId, FunctionBody, FunctionId, Instruction, ValueId,
         insn::{Extract, InstructionId, Mnemonic, Return, Tuple},
     },
 };
@@ -55,7 +55,7 @@ pub fn dead_signature(ctx: &mut Context) -> bool {
     let mut worklist: Vec<FunctionId> = ctx
         .function_ids()
         .into_iter()
-        .filter(|&f| Function::from_id(ctx, f).is_pure_reg())
+        .filter(|&f| FunctionBody::from_id(ctx, f).is_pure_reg())
         .collect();
 
     // Reverse call-site index, callee → its `Call` instructions, built in one
@@ -70,7 +70,7 @@ pub fn dead_signature(ctx: &mut Context) -> bool {
         if iters > MAX_ITERS {
             break;
         }
-        if !Function::from_id(ctx, fid).is_pure_reg() {
+        if !FunctionBody::from_id(ctx, fid).is_pure_reg() {
             continue;
         }
 
@@ -128,7 +128,7 @@ fn direct_call_sites(
 
 /// Every `Return` terminator in `fid`.
 fn returns_of(ctx: &Context, fid: FunctionId) -> Vec<InstructionId> {
-    Function::from_id(ctx, fid)
+    FunctionBody::from_id(ctx, fid)
         .iter()
         .filter_map(|b| {
             let last = b.iter().last()?;
@@ -139,7 +139,10 @@ fn returns_of(ctx: &Context, fid: FunctionId) -> Vec<InstructionId> {
 
 /// Run per-block DCE across `fid`, removing the instructions a trim made dead.
 fn dce_function(ctx: &mut Context, fid: FunctionId) {
-    let blocks: Vec<_> = Function::from_id(ctx, fid).blocks().map(|b| b.id).collect();
+    let blocks: Vec<_> = FunctionBody::from_id(ctx, fid)
+        .blocks()
+        .map(|b| b.id)
+        .collect();
     for b in blocks {
         crate::remove_dead_insns(ctx, b);
     }
@@ -164,7 +167,7 @@ fn trim_dead_args(
     call_index: &HashMap<FunctionId, Vec<InstructionId>>,
     touched: &mut HashSet<FunctionId>,
 ) -> bool {
-    let Some(root) = Function::from_id(ctx, fid).root().map(|b| b.id) else {
+    let Some(root) = FunctionBody::from_id(ctx, fid).root().map(|b| b.id) else {
         return false;
     };
 
@@ -403,8 +406,8 @@ mod tests {
                 value: Some(ValueId::Instruction(tuple).localize(ret_id.func)),
             }),
         );
-        Function::from_id_mut(&mut tc.ctx, fid).set_input_regs(inputs);
-        Function::from_id_mut(&mut tc.ctx, fid).set_pure_reg(true);
+        FunctionBody::from_id_mut(&mut tc.ctx, fid).set_input_regs(inputs);
+        FunctionBody::from_id_mut(&mut tc.ctx, fid).set_pure_reg(true);
         tc.ctx.stored_type_of(ValueId::Instruction(tuple)).unwrap()
     }
 
@@ -498,7 +501,7 @@ mod tests {
         );
 
         assert_eq!(
-            Function::from_id(&tc.ctx, f).input_regs().unwrap(),
+            FunctionBody::from_id(&tc.ctx, f).input_regs().unwrap(),
             &[vr1],
             "only the read input survives"
         );
@@ -637,7 +640,7 @@ mod tests {
             "
         );
         let _ = (g, entry);
-        Function::from_id_mut(&mut tc.ctx, f).set_input_regs(vec![vr0, vr1]);
+        FunctionBody::from_id_mut(&mut tc.ctx, f).set_input_regs(vec![vr0, vr1]);
         // Deliberately not marked pure_reg.
         let a = tc.ctx.get_const(0x10, 8).id();
         let b = tc.ctx.get_const(0x20, 8).id();

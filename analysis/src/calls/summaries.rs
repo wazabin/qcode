@@ -13,7 +13,7 @@ use qcode::{
     context::Context,
     space::SpaceType,
     value::{
-        BasicBlock, BlockId, BlockParam, Function, FunctionId, LocalValueId, ValueId, Varnode,
+        BasicBlock, BlockId, BlockParam, FunctionBody, FunctionId, LocalValueId, ValueId, Varnode,
         VarnodeId,
         insn::{Binop, IntBinop, Mnemonic},
     },
@@ -28,11 +28,11 @@ use crate::{
 
 /// True when `function_id` makes a call that could read a pointer argument
 /// unboundedly: an indirect call (unknown target), or a direct call to an
-/// external function or one already flagged [`Function::reads_unbounded_stack`].
+/// external function or one already flagged [`FunctionBody::reads_unbounded_stack`].
 /// Such a function may forward a caller-supplied pointer into that read, so it is
 /// itself treated as an unbounded reader.
 fn function_makes_unbounded_call(ctx: &Context, function_id: FunctionId) -> bool {
-    for block in Function::from_id(ctx, function_id).blocks() {
+    for block in FunctionBody::from_id(ctx, function_id).blocks() {
         for insn in block.iter() {
             match insn.mnemonic() {
                 Mnemonic::CallInd(_) => return true,
@@ -40,7 +40,7 @@ fn function_makes_unbounded_call(ctx: &Context, function_id: FunctionId) -> bool
                     let Some(target_id) = call.target.real() else {
                         return true;
                     };
-                    let target = Function::from_id(ctx, target_id);
+                    let target = FunctionBody::from_id(ctx, target_id);
                     if target.is_external() || target.reads_unbounded_stack() {
                         return true;
                     }
@@ -65,7 +65,7 @@ fn function_writes_through_stack_arg(
 ) -> bool {
     let ram = ctx.shared.default_space;
     let frame = FrameCtx::new(ctx, function_id, stack_ptr);
-    for block in Function::from_id(ctx, function_id).blocks() {
+    for block in FunctionBody::from_id(ctx, function_id).blocks() {
         for insn in block.iter() {
             if let Mnemonic::Store(s) = insn.mnemonic()
                 && s.space == ram
@@ -248,11 +248,11 @@ fn block_reg_flow(ctx: &Context, block: BlockId) -> (HashSet<VarnodeId>, HashSet
 /// the function's inferred inputs. Returned sorted by [`VarnodeId`] for a stable
 /// order shared by callers when binding arguments.
 pub fn compute_input_regs(ctx: &Context, function_id: FunctionId) -> Vec<VarnodeId> {
-    let Some(root) = Function::from_id(ctx, function_id).root().map(|b| b.id) else {
+    let Some(root) = FunctionBody::from_id(ctx, function_id).root().map(|b| b.id) else {
         return Vec::new();
     };
 
-    let blocks: Vec<BlockId> = Function::from_id(ctx, function_id)
+    let blocks: Vec<BlockId> = FunctionBody::from_id(ctx, function_id)
         .iter()
         .map(|b| b.id)
         .collect();
@@ -369,7 +369,7 @@ pub fn compute_stack_delta(
     let base = incoming_sp_param(ctx, function_id, stack_ptr).unwrap_or(sp);
     let mut delta: Option<i64> = None;
 
-    for block in Function::from_id(ctx, function_id).iter() {
+    for block in FunctionBody::from_id(ctx, function_id).iter() {
         // Only consider blocks that actually return.
         let returns = matches!(
             block.iter().last().map(|i| i.mnemonic().clone()),
@@ -420,7 +420,7 @@ pub fn set_function_summaries(ctx: &mut Context, function_id: FunctionId, stack_
     // from a conventional prologue/epilogue) does not model a functionalized body
     // and would desync `input_regs` from the arguments `argpromote_registers`
     // already bound at every call site. Leave its signature untouched.
-    if Function::from_id(ctx, function_id).is_pure_reg() {
+    if FunctionBody::from_id(ctx, function_id).is_pure_reg() {
         return;
     }
 
@@ -443,12 +443,12 @@ pub fn set_function_summaries(ctx: &mut Context, function_id: FunctionId, stack_
     // has a dynamic stack access or forwards into an unbounded/indirect/external
     // call. Union with the seeded value so the fact only grows across
     // checkpoint+replay rounds.
-    let reads_unbounded = Function::from_id(ctx, function_id).reads_unbounded_stack()
+    let reads_unbounded = FunctionBody::from_id(ctx, function_id).reads_unbounded_stack()
         || has_dynamic_stack_pointer_deref(ctx, function_id, stack_ptr)
         || function_makes_unbounded_call(ctx, function_id)
         || function_writes_through_stack_arg(ctx, function_id, stack_ptr);
 
-    let mut f = Function::from_id_mut(ctx, function_id);
+    let mut f = FunctionBody::from_id_mut(ctx, function_id);
     // Legacy ABI register list, kept for the conventional (non-pure_reg) summary
     // path; functionalized callees expose their interface via block params.
     #[allow(deprecated)]
@@ -512,7 +512,7 @@ pub fn set_all_call_clobbered_regs(ctx: &mut Context) {
         .collect();
     for id in ids {
         let regs = compute_call_clobbered_regs(ctx, id);
-        Function::from_id_mut(ctx, id).set_clobbered_regs(regs);
+        FunctionBody::from_id_mut(ctx, id).set_clobbered_regs(regs);
     }
 }
 
@@ -523,7 +523,7 @@ mod tests {
     use qcode::{
         builder::Builder,
         testing::TestContext,
-        value::{BasicBlock, Function, FunctionId, Value},
+        value::{BasicBlock, FunctionBody, FunctionId, Value},
     };
 
     /// Build a function rooted at `addr` in `tc`, populated by `f`.
@@ -533,12 +533,12 @@ mod tests {
         addr: u64,
         f: impl FnOnce(&mut Builder<'static, '_>),
     ) -> FunctionId {
-        let fun_id = Function::make(&mut tc.ctx, name.into()).unwrap().id;
+        let fun_id = FunctionBody::make(&mut tc.ctx, name.into()).unwrap().id;
         // Self-stored: the root block is born into `fun_id`'s own arena (no
         // reattributed foreign-arena block), so the checked-out mem2reg path can
         // run on it.
         let block_id = tc.ctx.get_or_make_block(addr, fun_id);
-        Function::from_id_mut(&mut tc.ctx, fun_id)
+        FunctionBody::from_id_mut(&mut tc.ctx, fun_id)
             .set_root(block_id)
             .unwrap();
         let mut builder = Builder::from_context(&mut tc.ctx, addr);
@@ -559,11 +559,11 @@ mod tests {
         sp: VarnodeId,
         f: impl FnOnce(&mut Builder<'static, '_>, ValueId),
     ) -> FunctionId {
-        let fun_id = Function::make(&mut tc.ctx, name.into()).unwrap().id;
+        let fun_id = FunctionBody::make(&mut tc.ctx, name.into()).unwrap().id;
         // Self-stored root block (see `build_fn`), so mem2reg's checked-out path
         // can run on it.
         let block_id = tc.ctx.get_or_make_block(addr, fun_id);
-        Function::from_id_mut(&mut tc.ctx, fun_id)
+        FunctionBody::from_id_mut(&mut tc.ctx, fun_id)
             .set_root(block_id)
             .unwrap();
         let pid = BasicBlock::from_id_mut(&mut tc.ctx, block_id)
@@ -605,7 +605,7 @@ mod tests {
         });
         let root = qcode::value::BlockId::new(fun, tc.ctx.bodies[fun].root_id().unwrap());
         // Orphan the root, as the splitter used to leave it.
-        qcode::value::Function::from_id_mut(&mut tc.ctx, fun).remove_block(root);
+        qcode::value::FunctionBody::from_id_mut(&mut tc.ctx, fun).remove_block(root);
         // Best-effort, and specifically no panic.
         let _ = compute_input_regs(&tc.ctx, fun);
     }
@@ -660,7 +660,7 @@ mod tests {
         });
 
         set_function_summaries(&mut tc.ctx, fun, tc.r3);
-        let f = Function::from_id(&tc.ctx, fun);
+        let f = FunctionBody::from_id(&tc.ctx, fun);
         assert!(f.clobbered_regs().unwrap().contains(&r0));
     }
 
@@ -704,7 +704,7 @@ mod tests {
         let sp = tc.r3;
         let fun = build_callee_with_delta(&mut tc, sp, 0x1000, 8);
         set_function_summaries(&mut tc.ctx, fun, sp);
-        let f = Function::from_id(&tc.ctx, fun);
+        let f = FunctionBody::from_id(&tc.ctx, fun);
         assert_eq!(f.stack_delta(), Some(8));
         assert!(
             !f.clobbered_regs().unwrap().contains(&sp),
@@ -730,7 +730,7 @@ mod tests {
         });
         assert_eq!(compute_stack_delta(&tc.ctx, fun, sp), None);
         set_function_summaries(&mut tc.ctx, fun, sp);
-        let f = Function::from_id(&tc.ctx, fun);
+        let f = FunctionBody::from_id(&tc.ctx, fun);
         assert!(f.stack_delta().is_none());
         assert!(f.clobbered_regs().unwrap().contains(&sp));
     }
@@ -761,7 +761,7 @@ mod tests {
         set_function_summaries(&mut tc.ctx, callee, sp);
 
         assert!(
-            Function::from_id(&tc.ctx, callee).reads_unbounded_stack(),
+            FunctionBody::from_id(&tc.ctx, callee).reads_unbounded_stack(),
             "a computed pointer into this function's own frame remains unbounded"
         );
     }
@@ -781,7 +781,7 @@ mod tests {
         // The only loads in the body are the stack-slot reload, so a plain RAM-load
         // count tracks whether the local was promoted away.
         let ram_load_count = |ctx: &Context, fun: FunctionId| {
-            Function::from_id(ctx, fun)
+            FunctionBody::from_id(ctx, fun)
                 .blocks()
                 .flat_map(|b| b.iter().collect::<Vec<_>>())
                 .filter(|i| matches!(i.mnemonic(), Mnemonic::Load(_)))
@@ -822,7 +822,7 @@ mod tests {
 
         // Flagged: promotion is disabled and the load survives.
         let escaping = build_local_fn(&mut tc, "escaping", 0x2000);
-        Function::from_id_mut(&mut tc.ctx, escaping).set_frame_escapes_to_unbounded(true);
+        FunctionBody::from_id_mut(&mut tc.ctx, escaping).set_frame_escapes_to_unbounded(true);
         promote(&mut tc, escaping);
         assert!(
             ram_load_count(&tc.ctx, escaping) > 0,

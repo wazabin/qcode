@@ -330,17 +330,17 @@ mod tests {
         testing::TestContext,
         types::TypeId,
         value::{
-            BasicBlock, Function, FunctionId, Instruction, Value, ValueId,
+            BasicBlock, FunctionBody, FunctionId, Instruction, Value, ValueId,
             insn::{IntrinsicId, Mnemonic, Return, Store},
         },
     };
 
     /// `body(elem: i8) -> elem + 1`, marked pure. A unary map body.
     fn build_inc_body(tc: &mut TestContext) -> FunctionId {
-        let fid = Function::make(&mut tc.ctx, "inc".into()).unwrap().id;
+        let fid = FunctionBody::make(&mut tc.ctx, "inc".into()).unwrap().id;
         let entry = tc.ctx.get_or_make_block(0x1000, fid);
         {
-            let mut f = Function::from_id_mut(&mut tc.ctx, fid);
+            let mut f = FunctionBody::from_id_mut(&mut tc.ctx, fid);
             f.set_root(entry).unwrap();
             f.add_block(entry);
         }
@@ -364,7 +364,7 @@ mod tests {
                 value: Some(inc.localize(rid.func)),
             }),
         );
-        Function::from_id_mut(&mut tc.ctx, fid).set_is_pure(true);
+        FunctionBody::from_id_mut(&mut tc.ctx, fid).set_is_pure(true);
         fid
     }
 
@@ -374,10 +374,10 @@ mod tests {
         let mut tc = TestContext::new();
         let body = build_inc_body(&mut tc);
 
-        let host = Function::make(&mut tc.ctx, "host".into()).unwrap().id;
+        let host = FunctionBody::make(&mut tc.ctx, "host".into()).unwrap().id;
         let entry = tc.ctx.get_or_make_block(0x5000, host);
         {
-            let mut f = Function::from_id_mut(&mut tc.ctx, host);
+            let mut f = FunctionBody::from_id_mut(&mut tc.ctx, host);
             f.set_root(entry).unwrap();
             f.add_block(entry);
         }
@@ -455,10 +455,10 @@ mod tests {
         let mut tc = TestContext::new();
         let enum_id = IntrinsicId::from_name("enumerate").unwrap();
 
-        let host = Function::make(&mut tc.ctx, "host".into()).unwrap().id;
+        let host = FunctionBody::make(&mut tc.ctx, "host".into()).unwrap().id;
         let entry = tc.ctx.get_or_make_block(0x6000, host);
         {
-            let mut f = Function::from_id_mut(&mut tc.ctx, host);
+            let mut f = FunctionBody::from_id_mut(&mut tc.ctx, host);
             f.set_root(entry).unwrap();
             f.add_block(entry);
         }
@@ -539,10 +539,10 @@ mod tests {
         let mut tc = TestContext::new();
         let concat_id = IntrinsicId::from_name("concat").unwrap();
 
-        let host = Function::make(&mut tc.ctx, "host".into()).unwrap().id;
+        let host = FunctionBody::make(&mut tc.ctx, "host".into()).unwrap().id;
         let entry = tc.ctx.get_or_make_block(0x6800, host);
         {
-            let mut f = Function::from_id_mut(&mut tc.ctx, host);
+            let mut f = FunctionBody::from_id_mut(&mut tc.ctx, host);
             f.set_root(entry).unwrap();
             f.add_block(entry);
         }
@@ -589,10 +589,10 @@ mod tests {
     /// `body(t: (index: i64, elem: i8)) -> t.elem`, marked pure. The unary,
     /// index-aware map body: it takes the `enumerate` tuple and unpacks it.
     fn build_unpack_elem_body(tc: &mut TestContext, tuple_ty: TypeId) -> FunctionId {
-        let fid = Function::make(&mut tc.ctx, "unpack".into()).unwrap().id;
+        let fid = FunctionBody::make(&mut tc.ctx, "unpack".into()).unwrap().id;
         let entry = tc.ctx.get_or_make_block(0x2000, fid);
         {
-            let mut f = Function::from_id_mut(&mut tc.ctx, fid);
+            let mut f = FunctionBody::from_id_mut(&mut tc.ctx, fid);
             f.set_root(entry).unwrap();
             f.add_block(entry);
         }
@@ -622,7 +622,7 @@ mod tests {
                 value: Some(elem.localize(rid.func)),
             }),
         );
-        Function::from_id_mut(&mut tc.ctx, fid).set_is_pure(true);
+        FunctionBody::from_id_mut(&mut tc.ctx, fid).set_is_pure(true);
         fid
     }
 
@@ -634,10 +634,10 @@ mod tests {
         let mut tc = TestContext::new();
         let enum_id = IntrinsicId::from_name("enumerate").unwrap();
 
-        let host = Function::make(&mut tc.ctx, "host".into()).unwrap().id;
+        let host = FunctionBody::make(&mut tc.ctx, "host".into()).unwrap().id;
         let entry = tc.ctx.get_or_make_block(0x7000, host);
         {
-            let mut f = Function::from_id_mut(&mut tc.ctx, host);
+            let mut f = FunctionBody::from_id_mut(&mut tc.ctx, host);
             f.set_root(entry).unwrap();
             f.add_block(entry);
         }

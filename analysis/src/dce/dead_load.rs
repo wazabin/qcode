@@ -1098,52 +1098,53 @@ pub fn remove_dead_load_insns_generic<'str>(
 }
 
 /// Host-generic core of [`remove_dead_load_insns`], routing every read through
-/// `body.read_host(cx)` and every removal through [`body.remove_instruction`],
+/// `cx.read_host(body)` and every removal through [`body.remove_instruction`],
 /// so it operates identically on the whole module (`&mut Context`) or a single
 /// checked-out function ([`crate::pipeline`]'s `FunctionBody`).
 /// This is the concrete version for FunctionBody/ContextView (stage 5b).
 pub fn remove_dead_load_insns_host<'a, 'str>(
-    body: &'a mut FunctionBody<'_, 'str>,
+    body: &'a mut FunctionBody<'str>,
     cx: ContextView<'a, 'str>,
     function_id: FunctionId,
     aliases: Option<&AliasResult>,
     dead_regs: &[ValueId],
 ) -> bool {
-    let block_ids: Vec<BlockId> = body
-        .function_ref(cx, function_id)
+    let block_ids: Vec<BlockId> = cx
+        .read_host(body)
+        .function_ref(function_id)
         .iter()
         .map(|block| block.id)
         .collect();
 
     let mut dead = HashSet::default();
-    dead.extend(unread_temp_space_stores(body.read_host(cx), function_id));
+    dead.extend(unread_temp_space_stores(cx.read_host(body), function_id));
 
     match aliases {
         Some(aliases) => {
             dead.extend(postdominated_dead_register_stores(
-                body.read_host(cx),
+                cx.read_host(body),
                 function_id,
                 aliases,
             ));
             dead.extend(unread_frame_local_stores(
-                body.read_host(cx),
+                cx.read_host(body),
                 function_id,
                 aliases,
             ));
             dead.extend(postdominated_dead_ram_stores(
-                body.read_host(cx),
+                cx.read_host(body),
                 function_id,
                 aliases,
             ));
             let liveness = crate::mem::compute_memory_liveness(
-                body.read_host(cx),
+                cx.read_host(body),
                 function_id,
                 aliases,
                 dead_regs,
             );
             for &block_id in &block_ids {
                 dead.extend(dead_load_insns_seeded(
-                    body.read_host(cx),
+                    cx.read_host(body),
                     block_id,
                     aliases,
                     dead_regs,
@@ -1155,7 +1156,7 @@ pub fn remove_dead_load_insns_host<'a, 'str>(
         None => {
             for &block_id in &block_ids {
                 dead.extend(dead_load_insns(
-                    body.read_host(cx),
+                    cx.read_host(body),
                     block_id,
                     None,
                     dead_regs,
@@ -1166,7 +1167,7 @@ pub fn remove_dead_load_insns_host<'a, 'str>(
 
     let changed = !dead.is_empty();
     for id in &dead {
-        body.remove_instruction(cx, *id);
+        body.remove_instruction(*id);
     }
     changed
 }
@@ -1180,7 +1181,7 @@ mod tests {
         builder::Builder,
         context::Context,
         testing::TestContext,
-        value::{BasicBlock, Function, Value},
+        value::{BasicBlock, FunctionBody, Value},
     };
 
     fn reg_space(ctx: &Context) -> SpaceId {
@@ -1255,7 +1256,7 @@ mod tests {
         let regsp = tc.reg_space;
         let r1 = tc.r1;
 
-        let fid = Function::make(&mut tc.ctx, "f".into()).unwrap().id;
+        let fid = FunctionBody::make(&mut tc.ctx, "f".into()).unwrap().id;
         let block_id = BasicBlock::make(&mut tc.ctx, fid).id;
 
         let offset_ptr = |b: &mut Builder<'static, '_>, base: ValueId, off: i64| {
@@ -1425,7 +1426,7 @@ mod tests {
                     return at %m;
             "
         );
-        let root = Function::from_id(&ctx, host).root().unwrap().id;
+        let root = FunctionBody::from_id(&ctx, host).root().unwrap().id;
         let has_map = BasicBlock::from_id(&ctx, root)
             .iter()
             .any(|i| matches!(i.mnemonic(), Mnemonic::Map(m) if m.body.real() == Some(inc)));
@@ -1494,12 +1495,12 @@ mod tests {
         let mut tc = TestContext::new();
         let (r, reg) = (tc.r0, tc.reg_space);
 
-        let callee = Function::make_external(&mut tc.ctx, 0x9000, Some("ext".into())).id;
+        let callee = FunctionBody::make_external(&mut tc.ctx, 0x9000, Some("ext".into())).id;
         configure_callee(&mut tc.ctx, callee);
 
-        let caller = Function::make(&mut tc.ctx, "caller".into()).unwrap().id;
+        let caller = FunctionBody::make(&mut tc.ctx, "caller".into()).unwrap().id;
         let entry = { tc.ctx.get_or_make_block(0x1000, caller) };
-        Function::from_id_mut(&mut tc.ctx, caller)
+        FunctionBody::from_id_mut(&mut tc.ctx, caller)
             .set_root(entry)
             .unwrap();
         let store_id;
@@ -1519,8 +1520,8 @@ mod tests {
     fn store_before_resolved_call_to_clobbered_reg_is_dead() {
         let (ctx, block, store_id) = store_then_call_fn(|ctx, callee| {
             let r0 = ctx.get_named("r0").unwrap().as_varnode().unwrap();
-            Function::from_id_mut(ctx, callee).set_clobbered_regs(vec![r0]);
-            Function::from_id_mut(ctx, callee).set_externally_resolved(true);
+            FunctionBody::from_id_mut(ctx, callee).set_clobbered_regs(vec![r0]);
+            FunctionBody::from_id_mut(ctx, callee).set_externally_resolved(true);
         });
         let aliases = AliasResult::simple_for_function(
             &ctx,
@@ -1540,7 +1541,7 @@ mod tests {
         let (ctx, block, store_id) = store_then_call_fn(|ctx, callee| {
             let r0 = ctx.get_named("r0").unwrap().as_varnode().unwrap();
             // Clobbers r0 but is *not* marked resolved.
-            Function::from_id_mut(ctx, callee).set_clobbered_regs(vec![r0]);
+            FunctionBody::from_id_mut(ctx, callee).set_clobbered_regs(vec![r0]);
         });
         let aliases = AliasResult::simple_for_function(
             &ctx,
@@ -1590,15 +1591,15 @@ mod tests {
         use qcode::{
             builder::Builder,
             testing::TestContext,
-            value::{BasicBlock, Function},
+            value::{BasicBlock, FunctionBody},
         };
 
         let mut tc = TestContext::new();
         let sp_reg = tc.r0;
-        let fid = Function::make(&mut tc.ctx, "f".into()).unwrap().id;
+        let fid = FunctionBody::make(&mut tc.ctx, "f".into()).unwrap().id;
         let root = { tc.ctx.get_or_make_block(0x1000, fid) };
         {
-            let mut f = Function::from_id_mut(&mut tc.ctx, fid);
+            let mut f = FunctionBody::from_id_mut(&mut tc.ctx, fid);
             f.set_root(root).unwrap();
             f.add_block(root);
         }
@@ -1658,15 +1659,15 @@ mod tests {
         use qcode::{
             builder::Builder,
             testing::TestContext,
-            value::{BasicBlock, Function},
+            value::{BasicBlock, FunctionBody},
         };
 
         let mut tc = TestContext::new();
         let sp_reg = tc.r0;
-        let fid = Function::make(&mut tc.ctx, "f".into()).unwrap().id;
+        let fid = FunctionBody::make(&mut tc.ctx, "f".into()).unwrap().id;
         let root = { tc.ctx.get_or_make_block(0x1000, fid) };
         {
-            let mut f = Function::from_id_mut(&mut tc.ctx, fid);
+            let mut f = FunctionBody::from_id_mut(&mut tc.ctx, fid);
             f.set_root(root).unwrap();
             f.add_block(root);
         }
@@ -1958,7 +1959,7 @@ mod tests {
 
     /// Count `store`s to the default (RAM) space remaining in the whole function.
     fn ram_store_count(ctx: &Context, fid: FunctionId) -> usize {
-        Function::from_id(ctx, fid)
+        FunctionBody::from_id(ctx, fid)
             .iter()
             .flat_map(|b| b.iter().map(|i| i.id).collect::<Vec<_>>())
             .filter(|&id| {
@@ -2170,7 +2171,7 @@ mod tests {
         remove_dead_load_insns(&mut ctx, mix, Some(&aliases), &[]);
         // Only the exit write-back of the carried array survives; the init store and
         // the (forwarded) snapshot load of `@base` are gone.
-        let ir = format!("{}", Function::from_id(&ctx, mix));
+        let ir = format!("{}", FunctionBody::from_id(&ctx, mix));
         assert_eq!(
             ram_store_count(&ctx, mix),
             1,
@@ -2224,11 +2225,12 @@ impl FunctionPass for DeadLoad {
     }
     fn run<'str>(
         &self,
-        f: &mut FunctionBody<'_, 'str>,
+        f: &mut FunctionBody<'str>,
         m: ContextView<'_, 'str>,
+        _next_minted: &mut u32,
     ) -> Result<Outcome<'str>, String> {
         let fid = f.id();
-        let aliases = frame_aware_aliases(m, f.read_host(m), fid);
+        let aliases = frame_aware_aliases(m, m.read_host(f), fid);
         Ok(Outcome::changed(remove_dead_load_insns_host(
             f,
             m,
@@ -2254,12 +2256,13 @@ impl FunctionPass for DeadStore {
     }
     fn run<'str>(
         &self,
-        f: &mut FunctionBody<'_, 'str>,
+        f: &mut FunctionBody<'str>,
         m: ContextView<'_, 'str>,
+        _next_minted: &mut u32,
     ) -> Result<Outcome<'str>, String> {
         let fid = f.id();
         let dead_regs = m.env().cfg.dead_flag_regs.clone();
-        let aliases = frame_aware_aliases(m, f.read_host(m), fid);
+        let aliases = frame_aware_aliases(m, m.read_host(f), fid);
         Ok(Outcome::changed(remove_dead_load_insns_host(
             f,
             m,

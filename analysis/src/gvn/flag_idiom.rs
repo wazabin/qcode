@@ -19,7 +19,7 @@ use crate::{ContextView, FunctionBody};
 pub(super) struct FlagIdiom;
 
 /// The function-pass [`SubPassC`] impl (context-split stage 5b-ii):
-/// `simplify_flag_idiom` reads through `body.read_host(cx)` and the rewrite
+/// `simplify_flag_idiom` reads through `cx.read_host(body)` and the rewrite
 /// materializes through `Editor::replace_with_new_insn_c`.
 impl<'str> SubPassC<'str> for FlagIdiom {
     fn init_state(&self) -> Box<dyn Any> {
@@ -32,7 +32,7 @@ impl<'str> SubPassC<'str> for FlagIdiom {
 
     fn on_insn(
         &self,
-        body: &mut FunctionBody<'_, 'str>,
+        body: &mut FunctionBody<'str>,
         cx: ContextView<'_, 'str>,
         _state: &mut dyn Any,
         ic: &InsnCtx,
@@ -41,7 +41,7 @@ impl<'str> SubPassC<'str> for FlagIdiom {
         if ic.mnemonic.is_terminator() || ic.size == 0 {
             return Claim::Pass;
         }
-        match simplify_flag_idiom(body.read_host(cx), ic.insn_id.func, ic.mnemonic) {
+        match simplify_flag_idiom(cx.read_host(body), ic.insn_id.func, ic.mnemonic) {
             Some(new_mnemonic) => {
                 ed.replace_with_new_insn_c(
                     body,

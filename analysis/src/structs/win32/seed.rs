@@ -151,7 +151,7 @@ crate::register_module_pass!(WindowsTebSeed);
 mod tests {
     use qcode::assumption::{Certainty, Proposition};
     use qcode::context::Context;
-    use qcode::value::{Function, ValueId, insn::Mnemonic};
+    use qcode::value::{FunctionBody, ValueId, insn::Mnemonic};
     use qcode_macro::qcode;
 
     use super::*;
@@ -214,7 +214,7 @@ mod tests {
         run_function_pass::<StructTyping>(&mut ctx, f).unwrap();
 
         // `&fs + 0x30` became the named field access `gep(fs.ProcessEnvironmentBlock)`.
-        let gep = Function::from_id(&ctx, f)
+        let gep = FunctionBody::from_id(&ctx, f)
             .blocks()
             .flat_map(|b| {
                 b.iter()

@@ -105,7 +105,7 @@ impl EmulateMap {
 
         // Body param sizes: param 0 is the element, the rest are the captures.
         let body = map.body.real()?;
-        let root = qcode::value::Function::from_id(ctx, body).root()?.id;
+        let root = qcode::value::FunctionBody::from_id(ctx, body).root()?.id;
         let param_sizes: Vec<usize> = qcode::value::BasicBlock::from_id(ctx, root)
             .params()
             .map(|p| p.size())
@@ -188,7 +188,7 @@ impl EmulateMap {
         // Body param sizes: param 0 is the accumulator, param 1 the element, the
         // rest the captures.
         let body = scan.body.real()?;
-        let root = qcode::value::Function::from_id(ctx, body).root()?.id;
+        let root = qcode::value::FunctionBody::from_id(ctx, body).root()?.id;
         let param_sizes: Vec<usize> = qcode::value::BasicBlock::from_id(ctx, root)
             .params()
             .map(|p| p.size())
@@ -331,7 +331,7 @@ mod tests {
         testing::TestContext,
         types::TypeId,
         value::{
-            BasicBlock, Function, FunctionId, Value, ValueId,
+            BasicBlock, FunctionBody, FunctionId, Value, ValueId,
             block::BlockId,
             insn::{IntrinsicId, Mnemonic, Return},
         },
@@ -360,10 +360,10 @@ mod tests {
 
     /// `body(elem: i8) -> elem + 1`, marked pure — a unary scalar map body.
     fn build_inc_body(tc: &mut TestContext) -> FunctionId {
-        let fid = Function::make(&mut tc.ctx, "inc".into()).unwrap().id;
+        let fid = FunctionBody::make(&mut tc.ctx, "inc".into()).unwrap().id;
         let entry = { tc.ctx.get_or_make_block(0x1000, fid) };
         {
-            let mut f = Function::from_id_mut(&mut tc.ctx, fid);
+            let mut f = FunctionBody::from_id_mut(&mut tc.ctx, fid);
             f.set_root(entry).unwrap();
             f.add_block(entry);
         }
@@ -387,17 +387,17 @@ mod tests {
                 value: Some(inc.localize(rid.func)),
             }),
         );
-        Function::from_id_mut(&mut tc.ctx, fid).set_is_pure(true);
+        FunctionBody::from_id_mut(&mut tc.ctx, fid).set_is_pure(true);
         fid
     }
 
     /// `body(t: (index: i64, elem: i8)) -> elem + (index as i8)`, marked pure —
     /// an index-aware body reading both tuple fields.
     fn build_index_body(tc: &mut TestContext, tuple_ty: TypeId) -> FunctionId {
-        let fid = Function::make(&mut tc.ctx, "addidx".into()).unwrap().id;
+        let fid = FunctionBody::make(&mut tc.ctx, "addidx".into()).unwrap().id;
         let entry = { tc.ctx.get_or_make_block(0x2000, fid) };
         {
-            let mut f = Function::from_id_mut(&mut tc.ctx, fid);
+            let mut f = FunctionBody::from_id_mut(&mut tc.ctx, fid);
             f.set_root(entry).unwrap();
             f.add_block(entry);
         }
@@ -430,7 +430,7 @@ mod tests {
                 value: Some(sum.localize(rid.func)),
             }),
         );
-        Function::from_id_mut(&mut tc.ctx, fid).set_is_pure(true);
+        FunctionBody::from_id_mut(&mut tc.ctx, fid).set_is_pure(true);
         fid
     }
 
@@ -438,7 +438,7 @@ mod tests {
     /// A wide result is a `Bytes` blob; a short array (≤ 8 bytes) is a numeric
     /// `Literal` typed as the array, so both are decoded here.
     fn map_bytes(tc: &TestContext, host: FunctionId) -> Option<Vec<u8>> {
-        let root = Function::from_id(&tc.ctx, host).root()?.id;
+        let root = FunctionBody::from_id(&tc.ctx, host).root()?.id;
         BasicBlock::from_id(&tc.ctx, root).iter().find_map(|i| {
             let Mnemonic::Return(Return { value: Some(v), .. }) = i.mnemonic() else {
                 return None;
@@ -461,10 +461,10 @@ mod tests {
         let mut tc = TestContext::new();
         let body = build_inc_body(&mut tc);
 
-        let host = Function::make(&mut tc.ctx, "host".into()).unwrap().id;
+        let host = FunctionBody::make(&mut tc.ctx, "host".into()).unwrap().id;
         let entry = { tc.ctx.get_or_make_block(0x5000, host) };
         {
-            let mut f = Function::from_id_mut(&mut tc.ctx, host);
+            let mut f = FunctionBody::from_id_mut(&mut tc.ctx, host);
             f.set_root(entry).unwrap();
             f.add_block(entry);
         }
@@ -491,10 +491,10 @@ mod tests {
         let mut tc = TestContext::new();
         let body = build_inc_body(&mut tc);
 
-        let host = Function::make(&mut tc.ctx, "host".into()).unwrap().id;
+        let host = FunctionBody::make(&mut tc.ctx, "host".into()).unwrap().id;
         let entry = { tc.ctx.get_or_make_block(0x7000, host) };
         {
-            let mut f = Function::from_id_mut(&mut tc.ctx, host);
+            let mut f = FunctionBody::from_id_mut(&mut tc.ctx, host);
             f.set_root(entry).unwrap();
             f.add_block(entry);
         }
@@ -532,10 +532,10 @@ mod tests {
         let (tuple_ty, _) = tc.ctx.shared.types.array_of(enum_result_ty).unwrap();
         let body = build_index_body(&mut tc, tuple_ty);
 
-        let host = Function::make(&mut tc.ctx, "host".into()).unwrap().id;
+        let host = FunctionBody::make(&mut tc.ctx, "host".into()).unwrap().id;
         let entry = { tc.ctx.get_or_make_block(0x6000, host) };
         {
-            let mut f = Function::from_id_mut(&mut tc.ctx, host);
+            let mut f = FunctionBody::from_id_mut(&mut tc.ctx, host);
             f.set_root(entry).unwrap();
             f.add_block(entry);
         }
@@ -559,10 +559,12 @@ mod tests {
     /// `body(acc, (index, elem)) -> acc + elem`, marked pure — a running-sum scan
     /// body, binary in `(accumulator, enumerate tuple)`.
     fn build_sum_body(tc: &mut TestContext, tuple_ty: TypeId) -> FunctionId {
-        let fid = Function::make(&mut tc.ctx, "scansum".into()).unwrap().id;
+        let fid = FunctionBody::make(&mut tc.ctx, "scansum".into())
+            .unwrap()
+            .id;
         let entry = { tc.ctx.get_or_make_block(0x7000, fid) };
         {
-            let mut f = Function::from_id_mut(&mut tc.ctx, fid);
+            let mut f = FunctionBody::from_id_mut(&mut tc.ctx, fid);
             f.set_root(entry).unwrap();
             f.add_block(entry);
         }
@@ -591,7 +593,7 @@ mod tests {
                 value: Some(sum.localize(rid.func)),
             }),
         );
-        Function::from_id_mut(&mut tc.ctx, fid).set_is_pure(true);
+        FunctionBody::from_id_mut(&mut tc.ctx, fid).set_is_pure(true);
         fid
     }
 
@@ -608,10 +610,10 @@ mod tests {
         let (tuple_ty, _) = tc.ctx.shared.types.array_of(enum_result_ty).unwrap();
         let body = build_sum_body(&mut tc, tuple_ty);
 
-        let host = Function::make(&mut tc.ctx, "host".into()).unwrap().id;
+        let host = FunctionBody::make(&mut tc.ctx, "host".into()).unwrap().id;
         let entry = { tc.ctx.get_or_make_block(0x8000, host) };
         {
-            let mut f = Function::from_id_mut(&mut tc.ctx, host);
+            let mut f = FunctionBody::from_id_mut(&mut tc.ctx, host);
             f.set_root(entry).unwrap();
             f.add_block(entry);
         }

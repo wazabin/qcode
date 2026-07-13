@@ -3,7 +3,7 @@ use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
 use qcode::{
     context::Context,
     value::{
-        BasicBlock, BlockId, BlockParam, Function, FunctionId, Instruction, ValueId,
+        BasicBlock, BlockId, BlockParam, FunctionBody, FunctionId, Instruction, ValueId,
         insn::{Call, Mnemonic},
     },
 };
@@ -276,7 +276,7 @@ impl<'a, 'ctx> Builder<'a, 'ctx> {
     /// function — never a whole-program store scan. Cross-function value flow is
     /// carried exclusively by call arguments and return values.
     fn add_local_stores(&mut self, ptr: ValueId, fid: FunctionId, sink: usize) {
-        let function = Function::from_id(self.ctx, fid);
+        let function = FunctionBody::from_id(self.ctx, fid);
         let stores: Vec<ValueId> = function
             .blocks()
             .flat_map(|block| block.instructions().collect::<Vec<_>>())
@@ -300,7 +300,7 @@ impl<'a, 'ctx> Builder<'a, 'ctx> {
         let Some(target) = call.target.real() else {
             return;
         };
-        let callee = Function::from_id(self.ctx, target);
+        let callee = FunctionBody::from_id(self.ctx, target);
         let callee_node = if callee.is_external() {
             self.node(DfNode::ExternCall(target))
         } else {
@@ -339,7 +339,7 @@ impl<'a, 'ctx> Builder<'a, 'ctx> {
 
     fn slice_callee_params(&self, fid: FunctionId) -> HashSet<usize> {
         let mut params = HashSet::default();
-        let function = Function::from_id(self.ctx, fid);
+        let function = FunctionBody::from_id(self.ctx, fid);
         let Some(root) = function.root() else {
             return params;
         };
@@ -448,7 +448,7 @@ pub fn value_label(ctx: &Context, value: ValueId) -> String {
                 .map(|t| t.text)
                 .collect()
         }
-        ValueId::Function(id) => Function::from_id(ctx, id).name().to_string(),
+        ValueId::Function(id) => FunctionBody::from_id(ctx, id).name().to_string(),
         ValueId::BasicBlock(id) => BasicBlock::from_id(ctx, id)
             .name()
             .map(|name| format!("<{name}>"))

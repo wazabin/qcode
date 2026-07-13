@@ -24,7 +24,7 @@ use crate::{ContextView, FunctionBody};
 pub(super) struct Fold;
 
 /// The function-pass [`SubPassC`] impl (context-split stage 5b-ii):
-/// `try_fold_insn` reads through `body.read_host(cx)` and the fold forwards
+/// `try_fold_insn` reads through `cx.read_host(body)` and the fold forwards
 /// through `Editor::replace_c`.
 impl<'str> SubPassC<'str> for Fold {
     fn init_state(&self) -> Box<dyn Any> {
@@ -37,7 +37,7 @@ impl<'str> SubPassC<'str> for Fold {
 
     fn on_insn(
         &self,
-        body: &mut FunctionBody<'_, 'str>,
+        body: &mut FunctionBody<'str>,
         cx: ContextView<'_, 'str>,
         _state: &mut dyn Any,
         ic: &InsnCtx,
@@ -46,7 +46,7 @@ impl<'str> SubPassC<'str> for Fold {
         if ic.mnemonic.is_terminator() || ic.size == 0 {
             return Claim::Pass;
         }
-        match try_fold_insn(body.read_host(cx), ic) {
+        match try_fold_insn(cx.read_host(body), ic) {
             Some(folded) => {
                 ed.replace_c(body, cx, ic.insn_id, folded);
                 Claim::Done
@@ -554,7 +554,7 @@ mod tests {
     use crate::AliasResult;
     use crate::gvn::gvn;
     use qcode::value::{
-        BasicBlock, Function,
+        BasicBlock, FunctionBody,
         insn::{Sext, Zext},
     };
     use qcode_macro::qcode;
@@ -674,7 +674,7 @@ mod tests {
 
         // `0x31 + 0x32` must fold to 0x63 — so the address add reads `fs + 0x63`,
         // the canonical `base + const` shape struct typing needs.
-        let addr_rhs = Function::from_id(&ctx, f)
+        let addr_rhs = FunctionBody::from_id(&ctx, f)
             .blocks()
             .flat_map(|b| b.iter().collect::<Vec<_>>())
             .find_map(|i| match i.mnemonic() {
@@ -724,7 +724,7 @@ mod tests {
         gvn_function(&mut ctx, f, Some(&aliases));
 
         // The stored value must be the folded constant 0x30.
-        let stored = Function::from_id(&ctx, f)
+        let stored = FunctionBody::from_id(&ctx, f)
             .blocks()
             .flat_map(|b| b.iter().collect::<Vec<_>>())
             .find_map(|i| match i.mnemonic() {
@@ -774,7 +774,7 @@ mod tests {
         let aliases = AliasResult::simple_for_function(&ctx, ctx.function_ids()[0]);
         gvn_function(&mut ctx, f, Some(&aliases));
 
-        let addr_rhs = Function::from_id(&ctx, f)
+        let addr_rhs = FunctionBody::from_id(&ctx, f)
             .blocks()
             .flat_map(|b| b.iter().collect::<Vec<_>>())
             .find_map(|i| match i.mnemonic() {
@@ -918,7 +918,7 @@ mod tests {
         let aliases = AliasResult::simple_for_function(&ctx, ctx.function_ids()[0]);
         gvn_function(&mut ctx, f, Some(&aliases));
 
-        let stored = Function::from_id(&ctx, f)
+        let stored = FunctionBody::from_id(&ctx, f)
             .blocks()
             .flat_map(|b| b.iter().collect::<Vec<_>>())
             .find_map(|i| match i.mnemonic() {
@@ -956,7 +956,7 @@ mod tests {
         let aliases = AliasResult::simple_for_function(&ctx, ctx.function_ids()[0]);
         gvn_function(&mut ctx, f, Some(&aliases));
 
-        let stored = Function::from_id(&ctx, f)
+        let stored = FunctionBody::from_id(&ctx, f)
             .blocks()
             .flat_map(|b| b.iter().collect::<Vec<_>>())
             .find_map(|i| match i.mnemonic() {
@@ -995,7 +995,7 @@ mod tests {
         let aliases = AliasResult::simple_for_function(&ctx, ctx.function_ids()[0]);
         gvn_function(&mut ctx, f, Some(&aliases));
 
-        let stored = Function::from_id(&ctx, f)
+        let stored = FunctionBody::from_id(&ctx, f)
             .blocks()
             .flat_map(|b| b.iter().collect::<Vec<_>>())
             .find_map(|i| match i.mnemonic() {

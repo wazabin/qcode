@@ -71,7 +71,7 @@ mod tests {
     use qcode::{
         builder::Builder,
         context::Context,
-        value::{BasicBlock, Function},
+        value::{BasicBlock, FunctionBody},
     };
     use std::borrow::Cow;
 
@@ -85,11 +85,11 @@ mod tests {
     #[should_panic(expected = "cannot add a block stored in another function arena")]
     fn rejects_reattributed_block_storage() {
         let mut ctx = Context::new();
-        let f = Function::make_at_addr(&mut ctx, 0x1000, Some(Cow::Borrowed("f"))).id;
-        let g = Function::make_at_addr(&mut ctx, 0x2000, Some(Cow::Borrowed("g"))).id;
+        let f = FunctionBody::make_at_addr(&mut ctx, 0x1000, Some(Cow::Borrowed("f"))).id;
+        let g = FunctionBody::make_at_addr(&mut ctx, 0x2000, Some(Cow::Borrowed("g"))).id;
         // Born in g's arena; attaching it to f is unsupported.
         let block = BasicBlock::make(&mut ctx, g).id;
-        Function::from_id_mut(&mut ctx, f).add_block(block);
+        FunctionBody::from_id_mut(&mut ctx, f).add_block(block);
     }
 
     /// An intra-function `Branch` (target owned by the same function) is clean.
@@ -97,10 +97,12 @@ mod tests {
     fn accepts_intra_function_block_target() {
         let mut ctx = Context::new();
 
-        let f = Function::make_at_addr(&mut ctx, 0x1000, Some(Cow::Borrowed("f"))).id;
+        let f = FunctionBody::make_at_addr(&mut ctx, 0x1000, Some(Cow::Borrowed("f"))).id;
         let entry = BasicBlock::make(&mut ctx, f).with_address(0x1000).id;
         let tail = BasicBlock::make(&mut ctx, f).with_address(0x1008).id;
-        Function::from_id_mut(&mut ctx, f).set_root(entry).unwrap();
+        FunctionBody::from_id_mut(&mut ctx, f)
+            .set_root(entry)
+            .unwrap();
         {
             let zero = ctx.get_const(0, 8).id();
             Builder::from_block(BasicBlock::from_id_mut(&mut ctx, tail)).push_return(zero);

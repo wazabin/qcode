@@ -57,7 +57,7 @@ pub use terminator::{
 pub use unop::{Unary, Unop};
 
 /// Function-local instruction index. Storage detail: indexes the owning
-/// [`Function`](crate::value::Function)'s instruction arena. Pass composite
+/// [`FunctionBody`](crate::value::FunctionBody)'s instruction arena. Pass composite
 /// [`InstructionId`]s around in pass code, not these.
 #[derive(Identifier)]
 pub struct LocalInsnId(u32);

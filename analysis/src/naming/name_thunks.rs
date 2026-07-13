@@ -33,15 +33,16 @@ impl FunctionPass for NameThunks {
 
     fn run<'str>(
         &self,
-        f: &mut FunctionBody<'_, 'str>,
+        f: &mut FunctionBody<'str>,
         m: ContextView<'_, 'str>,
+        _next_minted: &mut u32,
     ) -> Result<Outcome<'str>, String> {
         let fid = f.id();
         // Read-only analysis of the body and the callee's *interface* (its
         // published name, read from the shared context), then buffer the
         // self-rename.
         let new_name: Option<String> = {
-            let hr = f.read_host(m);
+            let hr = m.read_host(f);
             let function = FunctionRef::new(hr, fid);
 
             // Only rename functions still carrying their generated `fn_<addr>`
@@ -95,25 +96,27 @@ mod tests {
     use crate::test_util::run_function_pass;
     use qcode::builder::Builder;
     use qcode::context::Context;
-    use qcode::value::{BasicBlock, Function};
+    use qcode::value::{BasicBlock, FunctionBody};
 
     /// A bodyless callee `name` at 0x2000 to forward to; returns its function id.
     fn make_callee(ctx: &mut Context, name: &str) -> FunctionId {
-        let callee = Function::make_at_addr(ctx, 0x2000, Some(name.to_owned().into())).id;
+        let callee = FunctionBody::make_at_addr(ctx, 0x2000, Some(name.to_owned().into())).id;
         let entry = BasicBlock::make(ctx, callee).with_address(0x2000).id;
         let zero = ctx.get_const(0, 8).id();
         Builder::from_block(BasicBlock::from_id_mut(ctx, entry)).push_return(zero);
-        Function::from_id_mut(ctx, callee).set_root(entry).unwrap();
+        FunctionBody::from_id_mut(ctx, callee)
+            .set_root(entry)
+            .unwrap();
         callee
     }
 
     /// A single-block function at 0x1000 (`name`) whose only instruction tail-calls
     /// `callee` (the strict-local thunk shape). Returns its id.
     fn make_thunk(ctx: &mut Context, name: &str, callee: FunctionId) -> FunctionId {
-        let f = Function::make_at_addr(ctx, 0x1000, Some(name.to_owned().into())).id;
+        let f = FunctionBody::make_at_addr(ctx, 0x1000, Some(name.to_owned().into())).id;
         let block = BasicBlock::make(ctx, f).with_address(0x1000).id;
         Builder::from_block(BasicBlock::from_id_mut(ctx, block)).push_tail_call(callee);
-        Function::from_id_mut(ctx, f).set_root(block).unwrap();
+        FunctionBody::from_id_mut(ctx, f).set_root(block).unwrap();
         f
     }
 
@@ -126,7 +129,7 @@ mod tests {
 
         let changed = run_function_pass::<NameThunks>(&mut ctx, f).unwrap();
         assert!(changed);
-        assert_eq!(Function::from_id(&ctx, f).name(), "thunk_realfunc");
+        assert_eq!(FunctionBody::from_id(&ctx, f).name(), "thunk_realfunc");
     }
 
     /// A function with a real symbol name keeps it.
@@ -138,7 +141,7 @@ mod tests {
 
         let changed = run_function_pass::<NameThunks>(&mut ctx, f).unwrap();
         assert!(!changed);
-        assert_eq!(Function::from_id(&ctx, f).name(), "helper");
+        assert_eq!(FunctionBody::from_id(&ctx, f).name(), "helper");
     }
 
     /// A multi-block function is not a thunk.

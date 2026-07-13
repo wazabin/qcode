@@ -49,7 +49,7 @@ use crate::{ContextView, FunctionBody};
 pub(super) struct NarrowTrunc;
 
 /// The function-pass [`SubPassC`] impl (context-split stage 5b-ii):
-/// eligibility reads through `body.read_host(cx)`, the recursive `narrow_to_c`
+/// eligibility reads through `cx.read_host(body)`, the recursive `narrow_to_c`
 /// rewrite runs over `&mut PassBacking`, and the forward goes through
 /// `Editor::replace_c`.
 impl<'str> SubPassC<'str> for NarrowTrunc {
@@ -63,7 +63,7 @@ impl<'str> SubPassC<'str> for NarrowTrunc {
 
     fn on_insn(
         &self,
-        body: &mut FunctionBody<'_, 'str>,
+        body: &mut FunctionBody<'str>,
         cx: ContextView<'_, 'str>,
         _state: &mut dyn Any,
         ic: &InsnCtx,
@@ -78,7 +78,7 @@ impl<'str> SubPassC<'str> for NarrowTrunc {
             return Claim::Pass;
         };
         let (src, w) = (src.qualify(ic.insn_id.func), *size);
-        if value_size(body.read_host(cx), src) != w && !src_transformable(body.read_host(cx), src) {
+        if value_size(cx.read_host(body), src) != w && !src_transformable(cx.read_host(body), src) {
             return Claim::Pass;
         }
         let mut memo: HashMap<ValueId, ValueId> = HashMap::default();
@@ -144,7 +144,7 @@ fn range_low(src: ValueId, size: usize, func: FunctionId) -> Mnemonic {
 
 /// Concrete pass twin of [`narrow_to`].
 fn narrow_to_c<'str>(
-    body: &mut FunctionBody<'_, 'str>,
+    body: &mut FunctionBody<'str>,
     cx: ContextView<'_, 'str>,
     v: ValueId,
     w: usize,
@@ -152,7 +152,7 @@ fn narrow_to_c<'str>(
     block: BlockId,
     memo: &mut HashMap<ValueId, ValueId>,
 ) -> ValueId {
-    if value_size(body.read_host(cx), v) == w {
+    if value_size(cx.read_host(body), v) == w {
         return v;
     }
     if let Some(&cached) = memo.get(&v) {
@@ -160,7 +160,7 @@ fn narrow_to_c<'str>(
     }
 
     let result = match v {
-        ValueId::Instruction(iid) => match body.read_host(cx).insn_ref(iid).mnemonic().clone() {
+        ValueId::Instruction(iid) => match cx.read_host(body).insn_ref(iid).mnemonic().clone() {
             Mnemonic::Binop(Binary {
                 op: Binop::Int(o),
                 lhs,
@@ -220,9 +220,9 @@ fn narrow_to_c<'str>(
             }
             _ => push_insn_c(body, cx, range_low(v, w, block.func), w, before, block),
         },
-        _ if numeric_const(body.read_host(cx).shr(), v).is_some() => {
-            let folded = numeric_const(body.read_host(cx).shr(), v).unwrap() & low_mask(w);
-            body.read_host(cx).shr().get_const(folded, w)
+        _ if numeric_const(cx.read_host(body).shr(), v).is_some() => {
+            let folded = numeric_const(cx.read_host(body).shr(), v).unwrap() & low_mask(w);
+            cx.read_host(body).shr().get_const(folded, w)
         }
         _ => push_insn_c(body, cx, range_low(v, w, block.func), w, before, block),
     };
@@ -234,7 +234,7 @@ fn narrow_to_c<'str>(
 /// Concrete pass twin of [`narrow_extension`].
 #[allow(clippy::too_many_arguments)]
 fn narrow_extension_c<'str>(
-    body: &mut FunctionBody<'_, 'str>,
+    body: &mut FunctionBody<'str>,
     cx: ContextView<'_, 'str>,
     src: ValueId,
     w: usize,
@@ -243,7 +243,7 @@ fn narrow_extension_c<'str>(
     block: BlockId,
     memo: &mut HashMap<ValueId, ValueId>,
 ) -> ValueId {
-    if value_size(body.read_host(cx), src) >= w {
+    if value_size(cx.read_host(body), src) >= w {
         return narrow_to_c(body, cx, src, w, before, block, memo);
     }
     let m = if sext {
@@ -262,15 +262,15 @@ fn narrow_extension_c<'str>(
 
 /// Concrete pass twin of [`push_insn`].
 fn push_insn_c<'str>(
-    body: &mut FunctionBody<'_, 'str>,
+    body: &mut FunctionBody<'str>,
     cx: ContextView<'_, 'str>,
     mnemonic: Mnemonic,
     size: usize,
     before: InstructionId,
     block: BlockId,
 ) -> ValueId {
-    let id = body.push_mnemonic(cx, mnemonic, size);
-    body.insert_insn_before(cx, block, before, id);
+    let id = body.push_mnemonic(cx.shr(), mnemonic, size);
+    body.insert_insn_before(block, before, id);
     ValueId::Instruction(id)
 }
 
@@ -305,13 +305,13 @@ mod tests {
     use qcode::value::util::base_ref::HostRef;
     use qcode::{
         context::Context,
-        value::{BasicBlock, Function, FunctionId, Instruction, ValueId, insn::Mnemonic},
+        value::{BasicBlock, FunctionBody, FunctionId, Instruction, ValueId, insn::Mnemonic},
     };
     use qcode_emulator::{SizedValue, StandaloneEmulator};
     use qcode_macro::qcode;
 
     fn return_value(ctx: &Context, fun: FunctionId) -> ValueId {
-        let root = Function::from_id(ctx, fun).root().expect("root").id;
+        let root = FunctionBody::from_id(ctx, fun).root().expect("root").id;
         let &term = BasicBlock::from_id(ctx, root)
             .instruction_ids()
             .last()
@@ -323,7 +323,7 @@ mod tests {
     }
 
     fn run(ctx: &Context, fun: FunctionId, a: u64, b: u64) -> Option<u64> {
-        let root = Function::from_id(ctx, fun).root().expect("root").id;
+        let root = FunctionBody::from_id(ctx, fun).root().expect("root").id;
         let ret = return_value(ctx, fun);
         let mut emu = StandaloneEmulator::new(root);
         emu.run_pure(
@@ -484,7 +484,7 @@ mod tests {
         // DCE clears the now-dead sext/mul plumbing — as the real pipeline does
         // between GVN and mba_simplify — so their stale uses don't pin the
         // And/Or results and hide the boolean half of the MBA.
-        let root = Function::from_id(&ctx, mtmul).root().expect("root").id;
+        let root = FunctionBody::from_id(&ctx, mtmul).root().expect("root").id;
         while crate::dce::remove_dead_insns(&mut ctx, root) {}
         // mba_simplify's surface is pass-scoped; run it over a `PassBacking`
         // borrowing the body in place alongside the read-only shared state.

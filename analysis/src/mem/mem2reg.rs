@@ -3,7 +3,7 @@ use qcode::space::SpaceType;
 #[cfg(test)]
 use qcode::value::block::BlockRef;
 use qcode::value::{
-    BlockId, BlockParam, BlockParamId, Function, FunctionId, Value, ValueId, ValueRef, Varnode,
+    BlockId, BlockParam, BlockParamId, FunctionBody, FunctionId, Value, ValueId, ValueRef, Varnode,
     VarnodeId,
     insn::{Branch, CBranch, InstructionId, Load, Mnemonic, Range, Sext, Store, Zext},
     util::base_ref::{BaseRef, HostRef},
@@ -14,7 +14,7 @@ use std::borrow::Cow;
 
 use crate::AliasResult;
 use crate::gvn::affine::{Numbering, precompute_forms};
-use crate::pipeline::{ContextView, FunctionBody, Outcome};
+use crate::pipeline::{ContextView, Outcome};
 use crate::stack::frame::{frame_offset, incoming_sp_param};
 
 /// Returns `true` if any variables were promoted.
@@ -46,7 +46,7 @@ pub fn mem2reg_framed(
 ///
 /// [`with_checked_out_body`]: crate::with_checked_out_body
 pub fn mem2reg_host<'ctx, 'str>(
-    body: &'ctx mut FunctionBody<'_, 'str>,
+    body: &'ctx mut FunctionBody<'str>,
     cx: ContextView<'ctx, 'str>,
     function_id: FunctionId,
     aliases: &AliasResult,
@@ -87,7 +87,7 @@ pub(crate) fn has_dynamic_stack_pointer_deref(
         return false;
     };
     let numbering = precompute_forms(ctx, function_id);
-    for block in Function::from_id(ctx, function_id).blocks() {
+    for block in FunctionBody::from_id(ctx, function_id).blocks() {
         for insn in block.iter() {
             let Some(access) = MemoryAccess::from_mnemonic(insn.mnemonic(), insn.id.func) else {
                 continue;
@@ -646,12 +646,12 @@ fn decide_variable_value(var: ValueId, frames: &[Frame]) -> Option<FrameEntry> {
 }
 
 /// mem2reg over a checked-out [`FunctionBody`] and the shared [`ContextView`]
-/// (context-split stage 5b-ii): reads route through `body.read_host(cx)`,
+/// (context-split stage 5b-ii): reads route through `cx.read_host(body)`,
 /// mutations through the inherent `body.verb(cx, ...)` surface. This is the sole
 /// implementation; the whole-`Context` entry points (`mem2reg` / `mem2reg_framed`)
 /// reach it through a check-out shim.
-struct Mem2Reg<'ctx, 'body, 'str> {
-    body: &'ctx mut FunctionBody<'body, 'str>,
+struct Mem2Reg<'ctx, 'str> {
+    body: &'ctx mut FunctionBody<'str>,
     cx: ContextView<'ctx, 'str>,
     function_id: FunctionId,
     root_id: Option<BlockId>,
@@ -664,16 +664,20 @@ struct Mem2Reg<'ctx, 'body, 'str> {
     sp_param: Option<ValueId>,
 }
 
-impl<'ctx, 'body, 'str> Mem2Reg<'ctx, 'body, 'str> {
+impl<'ctx, 'str> Mem2Reg<'ctx, 'str> {
     fn new(
-        body: &'ctx mut FunctionBody<'body, 'str>,
+        body: &'ctx mut FunctionBody<'str>,
         cx: ContextView<'ctx, 'str>,
         function_id: FunctionId,
         aliases: &'ctx AliasResult,
         sp_param: Option<ValueId>,
     ) -> Self {
-        let root_id = body.function_ref(cx, function_id).root().map(|b| b.id);
-        let numbering = precompute_forms(body.read_host(cx), function_id);
+        let root_id = cx
+            .read_host(body)
+            .function_ref(function_id)
+            .root()
+            .map(|b| b.id);
+        let numbering = precompute_forms(cx.read_host(body), function_id);
         Self {
             body,
             cx,
@@ -688,7 +692,7 @@ impl<'ctx, 'body, 'str> Mem2Reg<'ctx, 'body, 'str> {
     /// A `Copy` read view over this pass's mutation host.
     #[inline]
     fn read(&self) -> HostRef<'_, 'str> {
-        self.body.read_host(self.cx)
+        self.cx.read_host(self.body)
     }
 
     /// The signed byte offset of stack-slot pointer `ptr` from the entry stack
@@ -831,13 +835,13 @@ impl<'ctx, 'body, 'str> Mem2Reg<'ctx, 'body, 'str> {
                 size: load_size,
             })
         };
-        let new_id = self.body.push_mnemonic(self.cx, mnemonic, load_size);
-        self.body.insert_insn_before(self.cx, block, before, new_id);
+        let new_id = self.body.push_mnemonic(self.cx.shr(), mnemonic, load_size);
+        self.body.insert_insn_before(block, before, new_id);
         ValueId::Instruction(new_id)
     }
 }
 
-impl<'str> Mem2Reg<'_, '_, 'str> {
+impl<'str> Mem2Reg<'_, 'str> {
     fn block_param_name_for_var(&self, var: ValueId) -> Option<String> {
         match var {
             ValueId::Varnode(varnode_id) => Varnode::from_id(self.read().shr(), varnode_id)
@@ -893,7 +897,7 @@ impl<'str> Mem2Reg<'_, '_, 'str> {
         let type_id = self.read().shr().types.get_or_make_int(size);
         let param_id = self
             .body
-            .push_block_param(self.cx, BlockParam::new(index, type_id, block_id.local));
+            .push_block_param(BlockParam::new(index, type_id, block_id.local));
         self.body
             .block_mut(block_id)
             .params
@@ -1274,7 +1278,7 @@ impl<'str> Mem2Reg<'_, '_, 'str> {
     }
 }
 
-impl<'str> Mem2Reg<'_, '_, 'str> {
+impl<'str> Mem2Reg<'_, 'str> {
     /// Computes the full argument list for a branch into `target`, by index.
     ///
     /// `mem2reg` runs repeatedly (interleaved with constant-folding), and each run
@@ -1373,7 +1377,7 @@ impl<'str> Mem2Reg<'_, '_, 'str> {
             let vn = Varnode::from_id(self.read().shr(), vn_id);
             (vn.space().id, vn.size())
         };
-        let mut host = self.body.host(self.cx);
+        let mut host = self.cx.host(self.body);
         let mut builder = Builder::from_block(BaseRef::new(host.reborrow(), branch_block));
         builder.set_insert_point_before(branch_insn);
         let id = builder
@@ -1493,7 +1497,7 @@ impl<'str> Mem2Reg<'_, '_, 'str> {
                         continue;
                     }
                 }
-                self.body.remove_instruction(self.cx, insn_id);
+                self.body.remove_instruction(insn_id);
                 changed = true;
             }
         }
@@ -1595,7 +1599,7 @@ impl<'str> Mem2Reg<'_, '_, 'str> {
     }
 }
 
-impl<'str> Mem2Reg<'_, '_, 'str> {
+impl<'str> Mem2Reg<'_, 'str> {
     fn decide_values_start_from(&mut self, block: BlockId, state: &mut RenameState<'_>) {
         // The renamer follows CFG successors. Strict IR locality (context-split
         // ruling 2) guarantees every successor is a block of this function — a
@@ -1700,12 +1704,9 @@ impl<'str> Mem2Reg<'_, '_, 'str> {
                         state.consumed_stores.insert(store_id);
                     }
                     load_value = self.resize_forwarded_load_value(block, insn_id, load_value, size);
-                    self.body.replace_all_uses_with(
-                        self.cx,
-                        ValueId::Instruction(insn_id),
-                        load_value,
-                    );
-                    self.body.remove_instruction(self.cx, insn_id);
+                    self.body
+                        .replace_all_uses_with(ValueId::Instruction(insn_id), load_value);
+                    self.body.remove_instruction(insn_id);
                     state.changed = true;
                 }
 
@@ -1754,7 +1755,6 @@ impl<'str> Mem2Reg<'_, '_, 'str> {
                     // a later DCE/fold pass would delete them and dangle the arg.
                     if existing_success != success_args || existing_failure != failure_args {
                         self.body.replace_instruction_mnemonic(
-                            self.cx,
                             insn_id,
                             Mnemonic::CBranch(CBranch {
                                 condition,
@@ -1804,7 +1804,6 @@ impl<'str> Mem2Reg<'_, '_, 'str> {
                     // values are recorded as uses (see the CBranch note above).
                     if existing != args {
                         self.body.replace_instruction_mnemonic(
-                            self.cx,
                             insn_id,
                             Mnemonic::Branch(Branch {
                                 target,
@@ -1929,7 +1928,7 @@ impl<'str> Mem2Reg<'_, '_, 'str> {
 mod tests {
 
     use jstd::graph::analysis::compute_dominators;
-    use qcode::value::{BasicBlock, Function, Instruction, LocalValueId, insn::Mnemonic};
+    use qcode::value::{BasicBlock, FunctionBody, Instruction, LocalValueId, insn::Mnemonic};
     use qcode_macro::qcode;
 
     use super::*;
@@ -1980,7 +1979,7 @@ mod tests {
         "
         );
 
-        let function = Function::from_id(&ctx, test);
+        let function = FunctionBody::from_id(&ctx, test);
         let dom = compute_dominators(&function, function.root().unwrap().id);
         let frontier = dom.dominator_frontier();
         let aliases = AliasResult::simple_for_function(&ctx, test);
@@ -2076,7 +2075,7 @@ mod tests {
         assert_eq!(exit_block.num_params(), 1, "exit should have 1 block param");
 
         // No loads or stores to A should remain
-        let function = Function::from_id(&ctx, test);
+        let function = FunctionBody::from_id(&ctx, test);
         for block in function.blocks() {
             for insn in block.iter() {
                 assert!(
@@ -2161,7 +2160,7 @@ mod tests {
         mem2reg(&mut ctx, test, &aliases);
 
         // No block params anywhere
-        let function = Function::from_id(&ctx, test);
+        let function = FunctionBody::from_id(&ctx, test);
         for block in function.blocks() {
             assert_eq!(
                 block.num_params(),
@@ -2171,7 +2170,7 @@ mod tests {
         }
 
         // No loads or stores remain
-        for block in Function::from_id(&ctx, test).blocks() {
+        for block in FunctionBody::from_id(&ctx, test).blocks() {
             for insn in block.iter() {
                 assert!(
                     !matches!(insn.mnemonic(), Mnemonic::Load(_) | Mnemonic::Store(_)),
@@ -2231,7 +2230,7 @@ mod tests {
         "
         );
 
-        let function = Function::from_id(&ctx, test);
+        let function = FunctionBody::from_id(&ctx, test);
         let dom = compute_dominators(&function, function.root().unwrap().id);
         let frontier = dom.dominator_frontier();
         let aliases = AliasResult::simple_for_function(&ctx, test);
@@ -2262,12 +2261,12 @@ mod tests {
         use qcode::{builder::Builder, testing::TestContext};
 
         let mut tc = TestContext::new();
-        let fun_id = Function::make(&mut tc.ctx, "callee".into()).unwrap().id;
+        let fun_id = FunctionBody::make(&mut tc.ctx, "callee".into()).unwrap().id;
         let block_id = tc.ctx.get_or_make_block(0x1000, fun_id);
-        Function::from_id_mut(&mut tc.ctx, fun_id)
+        FunctionBody::from_id_mut(&mut tc.ctx, fun_id)
             .set_root(block_id)
             .unwrap();
-        Function::from_id_mut(&mut tc.ctx, fun_id).set_pure_reg(true);
+        FunctionBody::from_id_mut(&mut tc.ctx, fun_id).set_pure_reg(true);
 
         let full_param = BasicBlock::from_id_mut(&mut tc.ctx, block_id)
             .push_param(8)
@@ -2297,7 +2296,7 @@ mod tests {
             1,
             "mem2reg must not turn the sub-register read into a new pure_reg \
              entry param; it is covered by the wider seed store:\n{}",
-            Function::from_id(&tc.ctx, fun_id)
+            FunctionBody::from_id(&tc.ctx, fun_id)
         );
         assert_eq!(params[0].id, full_param);
     }
@@ -2309,9 +2308,9 @@ mod tests {
         use qcode::builder::Builder;
         let sp_reg = tc.r0;
         let ram = tc.ctx.shared.default_space;
-        let fun_id = Function::make(&mut tc.ctx, "f".into()).unwrap().id;
+        let fun_id = FunctionBody::make(&mut tc.ctx, "f".into()).unwrap().id;
         let block = tc.ctx.get_or_make_block(0x1000, fun_id);
-        Function::from_id_mut(&mut tc.ctx, fun_id)
+        FunctionBody::from_id_mut(&mut tc.ctx, fun_id)
             .set_root(block)
             .unwrap();
         let pid = BasicBlock::from_id_mut(&mut tc.ctx, block).push_param(8).id;
@@ -2333,7 +2332,7 @@ mod tests {
     }
 
     fn has_load(ctx: &Context, fun_id: FunctionId) -> bool {
-        Function::from_id(ctx, fun_id)
+        FunctionBody::from_id(ctx, fun_id)
             .blocks()
             .any(|b| b.iter().any(|i| matches!(i.mnemonic(), Mnemonic::Load(_))))
     }
@@ -2354,7 +2353,7 @@ mod tests {
         assert!(
             !has_load(&tc.ctx, fun_id),
             "the reload should be forwarded from the store:\n{}",
-            Function::from_id(&tc.ctx, fun_id)
+            FunctionBody::from_id(&tc.ctx, fun_id)
         );
     }
 
@@ -2385,9 +2384,9 @@ mod tests {
         let mut tc = qcode::testing::TestContext::new();
         let sp_reg = tc.r0;
         let ram = tc.ctx.shared.default_space;
-        let fun_id = Function::make(&mut tc.ctx, "f".into()).unwrap().id;
+        let fun_id = FunctionBody::make(&mut tc.ctx, "f".into()).unwrap().id;
         let block = tc.ctx.get_or_make_block(0x1000, fun_id);
-        Function::from_id_mut(&mut tc.ctx, fun_id)
+        FunctionBody::from_id_mut(&mut tc.ctx, fun_id)
             .set_root(block)
             .unwrap();
         let pid = BasicBlock::from_id_mut(&mut tc.ctx, block).push_param(8).id;
@@ -2411,7 +2410,7 @@ mod tests {
             unsafe { b.dont_finalize() };
         }
 
-        let loads_before = Function::from_id(&tc.ctx, fun_id)
+        let loads_before = FunctionBody::from_id(&tc.ctx, fun_id)
             .blocks()
             .flat_map(|b| b.iter().collect::<Vec<_>>())
             .filter(|i| matches!(i.mnemonic(), Mnemonic::Load(_)))
@@ -2421,7 +2420,7 @@ mod tests {
         let aliases = AliasResult::simple_for_function(&tc.ctx, fun_id);
         mem2reg_framed(&mut tc.ctx, fun_id, &aliases, Some(sp));
 
-        let loads_after = Function::from_id(&tc.ctx, fun_id)
+        let loads_after = FunctionBody::from_id(&tc.ctx, fun_id)
             .blocks()
             .flat_map(|b| b.iter().collect::<Vec<_>>())
             .filter(|i| matches!(i.mnemonic(), Mnemonic::Load(_)))
@@ -2431,7 +2430,7 @@ mod tests {
             loads_after,
             loads_before,
             "the dynamic @SP+reg access must disable promotion of the @SP-8 local:\n{}",
-            Function::from_id(&tc.ctx, fun_id)
+            FunctionBody::from_id(&tc.ctx, fun_id)
         );
     }
 
@@ -2445,9 +2444,9 @@ mod tests {
         let pre_clobber_sink = ValueId::Varnode(tc.r1);
         let post_clobber_sink = ValueId::Varnode(tc.r2);
 
-        let fun_id = Function::make(&mut tc.ctx, "test".into()).unwrap().id;
+        let fun_id = FunctionBody::make(&mut tc.ctx, "test".into()).unwrap().id;
         let block_id = tc.ctx.get_or_make_block(0x1000, fun_id);
-        Function::from_id_mut(&mut tc.ctx, fun_id)
+        FunctionBody::from_id_mut(&mut tc.ctx, fun_id)
             .set_root(block_id)
             .unwrap();
 
@@ -2502,9 +2501,9 @@ mod tests {
         let full_sink = ValueId::Varnode(tc.r1);
         let byte_sink = ValueId::Varnode(tc.r2);
 
-        let fun_id = Function::make(&mut tc.ctx, "test".into()).unwrap().id;
+        let fun_id = FunctionBody::make(&mut tc.ctx, "test".into()).unwrap().id;
         let block_id = tc.ctx.get_or_make_block(0x1000, fun_id);
-        Function::from_id_mut(&mut tc.ctx, fun_id)
+        FunctionBody::from_id_mut(&mut tc.ctx, fun_id)
             .set_root(block_id)
             .unwrap();
 
@@ -2721,9 +2720,9 @@ mod tests {
         let (r0, r1, reg) = (tc.r0, tc.r1, tc.reg_space);
 
         // Callee that writes r0 (and only writes it), so r0 is a clobber.
-        let callee = Function::make(&mut tc.ctx, "callee".into()).unwrap().id;
+        let callee = FunctionBody::make(&mut tc.ctx, "callee".into()).unwrap().id;
         let cbody = tc.ctx.get_or_make_block(0x2000, callee);
-        Function::from_id_mut(&mut tc.ctx, callee)
+        FunctionBody::from_id_mut(&mut tc.ctx, callee)
             .set_root(cbody)
             .unwrap();
         {
@@ -2736,7 +2735,7 @@ mod tests {
         }
         crate::set_all_call_clobbered_regs(&mut tc.ctx);
         assert!(
-            Function::from_id(&tc.ctx, callee)
+            FunctionBody::from_id(&tc.ctx, callee)
                 .clobbered_regs()
                 .unwrap()
                 .contains(&r0),
@@ -2744,13 +2743,13 @@ mod tests {
         );
 
         // Caller: write r0 before the call, read it after.
-        let caller = Function::make(&mut tc.ctx, "caller".into()).unwrap().id;
+        let caller = FunctionBody::make(&mut tc.ctx, "caller".into()).unwrap().id;
         let entry = tc.ctx.get_or_make_block(0x1000, caller);
         let cont = tc.ctx.get_or_make_block(0x1100, caller);
-        Function::from_id_mut(&mut tc.ctx, caller)
+        FunctionBody::from_id_mut(&mut tc.ctx, caller)
             .set_root(entry)
             .unwrap();
-        Function::from_id_mut(&mut tc.ctx, caller).add_block(cont);
+        FunctionBody::from_id_mut(&mut tc.ctx, caller).add_block(cont);
         let post_load;
         {
             let mut b = Builder::from_context(&mut tc.ctx, 0x1000);
@@ -2808,9 +2807,9 @@ mod tests {
         let mut tc = TestContext::new();
         let (r0, r0_byte0, r2, r3, reg) = (tc.r0, tc.r0_byte0, tc.r2, tc.r3, tc.reg_space);
 
-        let f = Function::make(&mut tc.ctx, "f".into()).unwrap().id;
+        let f = FunctionBody::make(&mut tc.ctx, "f".into()).unwrap().id;
         let entry = tc.ctx.get_or_make_block(0x1000, f);
-        Function::from_id_mut(&mut tc.ctx, f)
+        FunctionBody::from_id_mut(&mut tc.ctx, f)
             .set_root(entry)
             .unwrap();
 
@@ -2866,9 +2865,9 @@ mod tests {
         let (r0, r1, reg) = (tc.r0, tc.r1, tc.reg_space);
 
         // Callee that writes (clobbers) r0.
-        let callee = Function::make(&mut tc.ctx, "callee".into()).unwrap().id;
+        let callee = FunctionBody::make(&mut tc.ctx, "callee".into()).unwrap().id;
         let cbody = tc.ctx.get_or_make_block(0x2000, callee);
-        Function::from_id_mut(&mut tc.ctx, callee)
+        FunctionBody::from_id_mut(&mut tc.ctx, callee)
             .set_root(cbody)
             .unwrap();
         {
@@ -2883,13 +2882,13 @@ mod tests {
 
         // Caller: write r0 (dead — never read before the call), call, then read r0
         // after (so r0 is a promoted var) into r1.
-        let caller = Function::make(&mut tc.ctx, "caller".into()).unwrap().id;
+        let caller = FunctionBody::make(&mut tc.ctx, "caller".into()).unwrap().id;
         let entry = tc.ctx.get_or_make_block(0x1000, caller);
         let cont = tc.ctx.get_or_make_block(0x1100, caller);
-        Function::from_id_mut(&mut tc.ctx, caller)
+        FunctionBody::from_id_mut(&mut tc.ctx, caller)
             .set_root(entry)
             .unwrap();
-        Function::from_id_mut(&mut tc.ctx, caller).add_block(cont);
+        FunctionBody::from_id_mut(&mut tc.ctx, caller).add_block(cont);
         let pre_store;
         {
             let mut b = Builder::from_context(&mut tc.ctx, 0x1000);
@@ -2925,9 +2924,9 @@ mod tests {
         let mut tc = TestContext::new();
         let (r0, reg) = (tc.r0, tc.reg_space);
 
-        let callee = Function::make(&mut tc.ctx, "callee".into()).unwrap().id;
+        let callee = FunctionBody::make(&mut tc.ctx, "callee".into()).unwrap().id;
         let cbody = tc.ctx.get_or_make_block(0x2000, callee);
-        Function::from_id_mut(&mut tc.ctx, callee)
+        FunctionBody::from_id_mut(&mut tc.ctx, callee)
             .set_root(cbody)
             .unwrap();
         {
@@ -2940,13 +2939,13 @@ mod tests {
         }
         crate::set_all_call_clobbered_regs(&mut tc.ctx);
 
-        let caller = Function::make(&mut tc.ctx, "caller".into()).unwrap().id;
+        let caller = FunctionBody::make(&mut tc.ctx, "caller".into()).unwrap().id;
         let entry = tc.ctx.get_or_make_block(0x1000, caller);
         let cont = tc.ctx.get_or_make_block(0x1100, caller);
-        Function::from_id_mut(&mut tc.ctx, caller)
+        FunctionBody::from_id_mut(&mut tc.ctx, caller)
             .set_root(entry)
             .unwrap();
-        Function::from_id_mut(&mut tc.ctx, caller).add_block(cont);
+        FunctionBody::from_id_mut(&mut tc.ctx, caller).add_block(cont);
         let pre_store;
         {
             let mut b = Builder::from_context(&mut tc.ctx, 0x1000);
@@ -2981,9 +2980,9 @@ mod tests {
         let mut tc = TestContext::new();
         let (r0, r1, reg) = (tc.r0, tc.r1, tc.reg_space);
 
-        let callee = Function::make(&mut tc.ctx, "callee".into()).unwrap().id;
+        let callee = FunctionBody::make(&mut tc.ctx, "callee".into()).unwrap().id;
         let callee_body = tc.ctx.get_or_make_block(0x2000, callee);
-        Function::from_id_mut(&mut tc.ctx, callee)
+        FunctionBody::from_id_mut(&mut tc.ctx, callee)
             .set_root(callee_body)
             .unwrap();
         {
@@ -2996,14 +2995,14 @@ mod tests {
         }
         crate::set_all_call_clobbered_regs(&mut tc.ctx);
 
-        let caller = Function::make(&mut tc.ctx, "caller".into()).unwrap().id;
+        let caller = FunctionBody::make(&mut tc.ctx, "caller".into()).unwrap().id;
         let entry = tc.ctx.get_or_make_block(0x1000, caller);
         let left = tc.ctx.get_or_make_block(0x1100, caller);
         let left_cont = tc.ctx.get_or_make_block(0x1200, caller);
         let right = tc.ctx.get_or_make_block(0x1300, caller);
         let join = tc.ctx.get_or_make_block(0x1400, caller);
         {
-            let mut f = Function::from_id_mut(&mut tc.ctx, caller);
+            let mut f = FunctionBody::from_id_mut(&mut tc.ctx, caller);
             f.set_root(entry).unwrap();
             f.add_block(left);
             f.add_block(left_cont);
@@ -3259,13 +3258,13 @@ mod tests {
         let mut tc = TestContext::new();
         let (r0, reg) = (tc.r0, tc.reg_space);
 
-        let f = Function::make(&mut tc.ctx, "test".into()).unwrap().id;
+        let f = FunctionBody::make(&mut tc.ctx, "test".into()).unwrap().id;
         let entry = tc.ctx.get_or_make_block(0x1000, f);
         let left = tc.ctx.get_or_make_block(0x1100, f);
         let right = tc.ctx.get_or_make_block(0x1200, f);
         let join = tc.ctx.get_or_make_block(0x1300, f);
         {
-            let mut fr = Function::from_id_mut(&mut tc.ctx, f);
+            let mut fr = FunctionBody::from_id_mut(&mut tc.ctx, f);
             fr.set_root(entry).unwrap();
             fr.add_block(left);
             fr.add_block(right);
@@ -3325,13 +3324,13 @@ mod tests {
         let mut tc = TestContext::new();
         let (r0, r1, r2, reg) = (tc.r0, tc.r1, tc.r2, tc.reg_space);
 
-        let f = Function::make(&mut tc.ctx, "test".into()).unwrap().id;
+        let f = FunctionBody::make(&mut tc.ctx, "test".into()).unwrap().id;
         let entry = tc.ctx.get_or_make_block(0x1000, f);
         let s1 = tc.ctx.get_or_make_block(0x1100, f);
         let s2 = tc.ctx.get_or_make_block(0x1200, f);
         let exit = tc.ctx.get_or_make_block(0x1300, f);
         {
-            let mut fr = Function::from_id_mut(&mut tc.ctx, f);
+            let mut fr = FunctionBody::from_id_mut(&mut tc.ctx, f);
             fr.set_root(entry).unwrap();
             fr.add_block(s1);
             fr.add_block(s2);
@@ -3402,9 +3401,9 @@ mod tests {
         let mut tc = TestContext::new();
         let (r0, r1, reg) = (tc.r0, tc.r1, tc.reg_space); // r0 is 8 bytes wide
 
-        let f = Function::make(&mut tc.ctx, "test".into()).unwrap().id;
+        let f = FunctionBody::make(&mut tc.ctx, "test".into()).unwrap().id;
         let entry = tc.ctx.get_or_make_block(0x1000, f);
-        Function::from_id_mut(&mut tc.ctx, f)
+        FunctionBody::from_id_mut(&mut tc.ctx, f)
             .set_root(entry)
             .unwrap();
 
@@ -3446,12 +3445,12 @@ mod tests {
         let mut tc = TestContext::new();
         let (r0, r1, reg) = (tc.r0, tc.r1, tc.reg_space);
 
-        let f = Function::make(&mut tc.ctx, "test".into()).unwrap().id;
+        let f = FunctionBody::make(&mut tc.ctx, "test".into()).unwrap().id;
         let entry = tc.ctx.get_or_make_block(0x1000, f);
         let other = tc.ctx.get_or_make_block(0x1100, f);
         let join = tc.ctx.get_or_make_block(0x1200, f);
         {
-            let mut fr = Function::from_id_mut(&mut tc.ctx, f);
+            let mut fr = FunctionBody::from_id_mut(&mut tc.ctx, f);
             fr.set_root(entry).unwrap();
             fr.add_block(other);
             fr.add_block(join);
@@ -3512,13 +3511,13 @@ mod tests {
         use qcode::{builder::Builder, testing::TestContext};
 
         let mut tc = TestContext::new();
-        let f = Function::make(&mut tc.ctx, "test".into()).unwrap().id;
+        let f = FunctionBody::make(&mut tc.ctx, "test".into()).unwrap().id;
         let entry = tc.ctx.get_or_make_block(0x1000, f);
         // `orphan` holds the load but is not wired as a CFG successor of `entry`,
         // standing in for a successor the renaming DFS does not visit.
         let orphan = tc.ctx.get_or_make_block(0x1100, f);
         {
-            let mut fr = Function::from_id_mut(&mut tc.ctx, f);
+            let mut fr = FunctionBody::from_id_mut(&mut tc.ctx, f);
             fr.set_root(entry).unwrap();
             fr.add_block(orphan);
         }
@@ -3583,8 +3582,9 @@ impl FunctionPass for Mem2RegPass {
     }
     fn run<'str>(
         &self,
-        f: &mut FunctionBody<'_, 'str>,
+        f: &mut FunctionBody<'str>,
         m: ContextView<'_, 'str>,
+        _next_minted: &mut u32,
     ) -> Result<Outcome<'str>, String> {
         let fun_id = f.id();
         let shared = m.shr();
@@ -3604,7 +3604,7 @@ impl FunctionPass for Mem2RegPass {
         // keys off the module context.
         let sp_reg = shared.registers[&env.cfg.stack_pointer];
         let (aliases, sp_param) = {
-            let host = f.host(m);
+            let host = m.host(f);
             let read = host.read_host();
             let aliases = env.alias_base(shared).for_function(read, fun_id);
             // Resolve `@SP` so canonical `@SP ± N` slots are recognised; `None` when

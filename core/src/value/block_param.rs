@@ -18,7 +18,7 @@ use std::{
     fmt::{Display, Formatter},
 };
 
-/// Function-local block-parameter index (indexes the owning [`Function`]'s
+/// Function-local block-parameter index (indexes the owning [`FunctionBody`](crate::value::FunctionBody)'s
 /// param arena).
 #[derive(Identifier)]
 pub struct LocalParamId(u32);
@@ -388,13 +388,13 @@ mod tests {
     use super::*;
     use crate::{
         context::Context,
-        value::{BasicBlock, Function},
+        value::{BasicBlock, FunctionBody},
     };
 
     #[test]
     fn block_param_storage_is_local_and_refs_qualify_with_param_function() {
         let mut ctx = Context::new();
-        let func = Function::make(&mut ctx, "local_param_storage".into())
+        let func = FunctionBody::make(&mut ctx, "local_param_storage".into())
             .unwrap()
             .id;
         let block_id = BasicBlock::make(&mut ctx, func).id;
@@ -419,8 +419,8 @@ mod tests {
     #[should_panic(expected = "localize: foreign block-param operand")]
     fn block_param_origin_rejects_foreign_function_value() {
         let mut ctx = Context::new();
-        let a = Function::make(&mut ctx, "origin_a".into()).unwrap().id;
-        let b = Function::make(&mut ctx, "origin_b".into()).unwrap().id;
+        let a = FunctionBody::make(&mut ctx, "origin_a".into()).unwrap().id;
+        let b = FunctionBody::make(&mut ctx, "origin_b".into()).unwrap().id;
         let a_block = BasicBlock::make(&mut ctx, a).id;
         let b_block = BasicBlock::make(&mut ctx, b).id;
         let a_param = BasicBlock::from_id_mut(&mut ctx, a_block).push_param(8).id;

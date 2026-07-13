@@ -6,7 +6,7 @@ use qcode::{
     context::Context,
     space::{Space, SpaceId, SpaceType},
     value::{
-        BasicBlock, BlockId, BlockParamId, BlockRef, Function, FunctionId, Instruction,
+        BasicBlock, BlockId, BlockParamId, BlockRef, FunctionBody, FunctionId, Instruction,
         LocalValueId, Value, ValueId, ValueRef, Varnode,
         insn::{
             Branch, BranchInd, CBranch, Call, CallInd, Callee, Carry, Extract, InstructionId,
@@ -1152,7 +1152,7 @@ impl StandaloneEmulator {
                 }
                 let target =
                     require_real_callee(call.target).map_err(|kind| self.make_error(ctx, kind))?;
-                self.block = Function::from_id(ctx, target)
+                self.block = FunctionBody::from_id(ctx, target)
                     .root()
                     .ok_or_else(|| {
                         self.make_error(ctx, EmulatorErrorKind::EmptyFunctionRoot(target))
@@ -1172,7 +1172,7 @@ impl StandaloneEmulator {
                 // without pushing a call frame.
                 let target =
                     require_real_callee(tc.target).map_err(|kind| self.make_error(ctx, kind))?;
-                self.block = Function::from_id(ctx, target)
+                self.block = FunctionBody::from_id(ctx, target)
                     .root()
                     .ok_or_else(|| {
                         self.make_error(ctx, EmulatorErrorKind::EmptyFunctionRoot(target))
@@ -1188,7 +1188,7 @@ impl StandaloneEmulator {
                 let args = self
                     .collect_block_args(ctx, id.func, &apply.args)
                     .map_err(|kind| self.make_error(ctx, kind))?;
-                let root = Function::from_id(ctx, target)
+                let root = FunctionBody::from_id(ctx, target)
                     .root()
                     .ok_or_else(|| {
                         self.make_error(ctx, EmulatorErrorKind::EmptyFunctionRoot(target))
@@ -1478,7 +1478,7 @@ impl StandaloneEmulator {
     /// caller's register state through the calling convention. Params with no
     /// matching register (e.g. promoted stack slots) are left unbound.
     fn seed_entry_params(&mut self, ctx: &Context<'_>, func: FunctionId) {
-        let Some(root) = Function::from_id(ctx, func).root() else {
+        let Some(root) = FunctionBody::from_id(ctx, func).root() else {
             return;
         };
         let root_id = root.id;
@@ -1526,7 +1526,7 @@ impl StandaloneEmulator {
             Mnemonic::Call(call) => call.args.clone(),
             _ => return,
         };
-        let Some(root) = Function::from_id(ctx, target).root() else {
+        let Some(root) = FunctionBody::from_id(ctx, target).root() else {
             return;
         };
         let params: Vec<(BlockParamId, usize)> = BasicBlock::from_id(ctx, root.id)
@@ -1554,7 +1554,7 @@ impl StandaloneEmulator {
     }
 
     pub fn run_function(&mut self, ctx: &Context<'_>, func: FunctionId) -> crate::Result<()> {
-        let root = Function::from_id(ctx, func)
+        let root = FunctionBody::from_id(ctx, func)
             .root()
             .ok_or_else(|| self.make_error(ctx, EmulatorErrorKind::EmptyFunctionRoot(func)))?
             .id;
@@ -1582,7 +1582,7 @@ impl StandaloneEmulator {
                     // A functionalized (`pure_reg`) callee takes its inputs by
                     // value through `Call.args`; a conventional callee reads them
                     // from the register file the calling convention set up.
-                    if Function::from_id(ctx, target).is_pure_reg() {
+                    if FunctionBody::from_id(ctx, target).is_pure_reg() {
                         if let Some(&call_id) = self.call_site_stack.last() {
                             self.bind_entry_params_from_args(ctx, call_id, target);
                         }
@@ -1628,7 +1628,7 @@ impl StandaloneEmulator {
         args: &[SizedValue],
         max_steps: usize,
     ) -> crate::Result<()> {
-        let root = Function::from_id(ctx, func)
+        let root = FunctionBody::from_id(ctx, func)
             .root()
             .ok_or_else(|| self.make_error(ctx, EmulatorErrorKind::EmptyFunctionRoot(func)))?
             .id;
@@ -1879,7 +1879,7 @@ impl StandaloneEmulator {
             .ok_or(EmulatorErrorKind::ValueError(0))?;
         let mut acc = SizedValue::new(init, osz);
 
-        let root = Function::from_id(ctx, body)
+        let root = FunctionBody::from_id(ctx, body)
             .root()
             .ok_or(EmulatorErrorKind::EmptyFunctionRoot(body))?
             .id;
@@ -2009,7 +2009,7 @@ impl StandaloneEmulator {
             body_args.extend(capture_args.iter().cloned());
 
             let mut emu = StandaloneEmulator::new(
-                Function::from_id(ctx, body)
+                FunctionBody::from_id(ctx, body)
                     .root()
                     .ok_or(EmulatorErrorKind::EmptyFunctionRoot(body))?
                     .id,
@@ -2035,7 +2035,7 @@ impl StandaloneEmulator {
         args: &[BodyArg],
         max_steps: usize,
     ) -> crate::Result<()> {
-        let root = Function::from_id(ctx, func)
+        let root = FunctionBody::from_id(ctx, func)
             .root()
             .ok_or_else(|| self.make_error(ctx, EmulatorErrorKind::EmptyFunctionRoot(func)))?
             .id;
@@ -2237,7 +2237,7 @@ impl<'ctx> Emulator<'ctx> {
     }
 
     pub fn from_function(ctx: &'ctx Context<'ctx>, func: FunctionId) -> Self {
-        let entry = Function::from_id(ctx, func)
+        let entry = FunctionBody::from_id(ctx, func)
             .root()
             .expect("Cannot create emulator for function with empty root block")
             .id;
@@ -2519,10 +2519,10 @@ mod tests {
             "
         );
 
-        let dec = qcode::value::Function::from_name(&ctx, "dec")
+        let dec = qcode::value::FunctionBody::from_name(&ctx, "dec")
             .expect("lambda exists")
             .id;
-        let root = qcode::value::Function::from_id(&ctx, dec)
+        let root = qcode::value::FunctionBody::from_id(&ctx, dec)
             .root()
             .expect("lambda has root")
             .id;
@@ -2604,13 +2604,13 @@ mod tests {
     #[test]
     fn enumerate_over_array_is_emulated() {
         use qcode::builder::Builder;
-        use qcode::value::{BasicBlock, Function, ValueId, insn::IntrinsicId};
+        use qcode::value::{BasicBlock, FunctionBody, ValueId, insn::IntrinsicId};
 
         let mut ctx = Context::new();
-        let f = Function::make(&mut ctx, "f".into()).unwrap().id;
+        let f = FunctionBody::make(&mut ctx, "f".into()).unwrap().id;
         let entry = ctx.get_or_make_block(0x1000, f);
         {
-            let mut fm = Function::from_id_mut(&mut ctx, f);
+            let mut fm = FunctionBody::from_id_mut(&mut ctx, f);
             fm.set_root(entry).unwrap();
             fm.add_block(entry);
         }
@@ -2662,15 +2662,15 @@ mod tests {
     fn enumerate_of_unbounded_list_bails_recoverably() {
         use qcode::builder::Builder;
         use qcode::value::{
-            BasicBlock, Function, InstructionRef, ValueId,
+            BasicBlock, FunctionBody, InstructionRef, ValueId,
             insn::{IntrinsicApp, IntrinsicId, Return},
         };
 
         let mut ctx = Context::new();
-        let f = Function::make(&mut ctx, "f".into()).unwrap().id;
+        let f = FunctionBody::make(&mut ctx, "f".into()).unwrap().id;
         let entry = ctx.get_or_make_block(0x1000, f);
         {
-            let mut fm = Function::from_id_mut(&mut ctx, f);
+            let mut fm = FunctionBody::from_id_mut(&mut ctx, f);
             fm.set_root(entry).unwrap();
             fm.add_block(entry);
         }
@@ -2737,7 +2737,7 @@ mod tests {
     fn run_at_over_array_param(n: usize, idx: u64, bound: SizedValue) -> Option<u64> {
         use qcode::builder::Builder;
         use qcode::value::{
-            BasicBlock, Function, ValueId,
+            BasicBlock, FunctionBody, ValueId,
             insn::{IntrinsicId, Return},
         };
 
@@ -2746,10 +2746,10 @@ mod tests {
             let i8 = ctx.shared.types.get_or_make_int(1);
             ctx.shared.types.get_or_make_array(i8, n)
         };
-        let f = Function::make(&mut ctx, "f".into()).unwrap().id;
+        let f = FunctionBody::make(&mut ctx, "f".into()).unwrap().id;
         let entry = ctx.get_or_make_block(0x1000, f);
         {
-            let mut fm = Function::from_id_mut(&mut ctx, f);
+            let mut fm = FunctionBody::from_id_mut(&mut ctx, f);
             fm.set_root(entry).unwrap();
             fm.add_block(entry);
         }

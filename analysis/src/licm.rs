@@ -63,11 +63,12 @@ impl FunctionPass for Licm {
 
     fn run<'str>(
         &self,
-        f: &mut FunctionBody<'_, 'str>,
+        f: &mut FunctionBody<'str>,
         m: ContextView<'_, 'str>,
+        _next_minted: &mut u32,
     ) -> Result<Outcome<'str>, String> {
         let fid = f.id();
-        let aliases = build_aliases(m, f.read_host(m), fid);
+        let aliases = build_aliases(m, m.read_host(f), fid);
         Ok(Outcome::changed(hoist_loop_invariants_with_aliases(
             f,
             m,
@@ -328,35 +329,36 @@ fn emission_order(
 /// instruction is rebuilt in the preheader (before its terminator), its uses are
 /// redirected to the rebuilt copy, and the original is deleted.
 fn hoist_into_preheader<'a, 'str>(
-    body: &'a mut FunctionBody<'_, 'str>,
+    body: &'a mut FunctionBody<'str>,
     cx: ContextView<'a, 'str>,
     preheader: BlockId,
     order: &[InstructionId],
 ) -> bool {
     let mut hoisted = false;
     for &old in order {
-        let old_ref = body.insn_ref(cx, old);
+        let old_ref = cx.read_host(body).insn_ref(old);
         let mnemonic = old_ref.mnemonic().clone();
         let type_id = old_ref.type_id();
-        let new = body.push_mnemonic_with_type(cx, mnemonic, type_id);
+        let new = body.push_mnemonic_with_type(mnemonic, type_id);
 
-        let term = *body
-            .block_ref(cx, preheader)
+        let term = *cx
+            .read_host(body)
+            .block_ref(preheader)
             .instruction_ids()
             .last()
             .expect("preheader must have a terminator");
-        body.insert_insn_before(cx, preheader, term, new);
+        body.insert_insn_before(preheader, term, new);
 
         // Redirect every remaining use (in the loop and beyond) to the hoisted
         // copy. Processing in dependency order means a later invariant operand
         // already points at its hoisted copy when we clone the consumer.
-        body.replace_all_uses_with(cx, ValueId::Instruction(old), ValueId::Instruction(new));
+        body.replace_all_uses_with(ValueId::Instruction(old), ValueId::Instruction(new));
         hoisted = true;
     }
 
     // Delete the now-dead originals from their loop blocks.
     for &old in order {
-        body.remove_instruction(cx, old);
+        body.remove_instruction(old);
     }
     hoisted
 }
@@ -420,12 +422,12 @@ fn build_aliases<'a, 'str: 'a>(
 /// the conservative path where any loop store blocks load hoisting). Reads and
 /// mutates the function through the concrete pass surface.
 fn hoist_loop_invariants_with_aliases<'a, 'str>(
-    body: &'a mut FunctionBody<'_, 'str>,
+    body: &'a mut FunctionBody<'str>,
     cx: ContextView<'a, 'str>,
     fun_id: FunctionId,
     aliases: Option<&AliasResult>,
 ) -> bool {
-    let edges = back_edges(body.read_host(cx), fun_id);
+    let edges = back_edges(cx.read_host(body), fun_id);
     if edges.is_empty() {
         return false;
     }
@@ -434,16 +436,16 @@ fn hoist_loop_invariants_with_aliases<'a, 'str>(
     // changes the CFG, so dominators / loop membership stay valid throughout.
     let mut plans: Vec<(BlockId, Vec<InstructionId>)> = Vec::new();
     for (latch, header) in edges {
-        let loop_nodes = natural_loop(body.read_host(cx), latch, header);
-        let Some(preheader) = loop_preheader(body.read_host(cx), header, &loop_nodes) else {
+        let loop_nodes = natural_loop(cx.read_host(body), latch, header);
+        let Some(preheader) = loop_preheader(cx.read_host(body), header, &loop_nodes) else {
             continue;
         };
-        let mem = loop_memory(body.read_host(cx), &loop_nodes);
-        let invariant = invariant_instructions(body.read_host(cx), &loop_nodes, aliases, &mem);
+        let mem = loop_memory(cx.read_host(body), &loop_nodes);
+        let invariant = invariant_instructions(cx.read_host(body), &loop_nodes, aliases, &mem);
         if invariant.is_empty() {
             continue;
         }
-        let order = emission_order(body.read_host(cx), &loop_nodes, &invariant);
+        let order = emission_order(cx.read_host(body), &loop_nodes, &invariant);
         plans.push((preheader, order));
     }
 

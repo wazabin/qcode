@@ -51,7 +51,7 @@ use qcode::{
     assumption::Proposition,
     context::Context,
     value::{
-        BasicBlock, BlockId, BlockParamId, Function, FunctionId, InstructionRef, ValueId,
+        BasicBlock, BlockId, BlockParamId, FunctionBody, FunctionId, InstructionRef, ValueId,
         insn::{Binary, Binop, InstructionId, IntBinop, Load, Mnemonic},
     },
 };
@@ -130,7 +130,7 @@ fn find_pipelined(
     fid: FunctionId,
     dom: &DominatorTree<BlockId>,
 ) -> Option<Pipelined> {
-    for block in Function::from_id(ctx, fid).iter() {
+    for block in FunctionBody::from_id(ctx, fid).iter() {
         let header = block.id;
 
         // Back-edge predecessors are those `header` dominates; a header with none
@@ -302,12 +302,12 @@ pub(crate) fn depipeline(ctx: &mut Context) -> bool {
     let fids: Vec<FunctionId> = ctx.function_ids();
     let mut changed = false;
     for fid in fids {
-        let Some(root) = Function::from_id(ctx, fid).root().map(|b| b.id) else {
+        let Some(root) = FunctionBody::from_id(ctx, fid).root().map(|b| b.id) else {
             continue;
         };
         // CFG edges are unchanged by param removal, so the dominator tree stays
         // valid across the per-function fixpoint.
-        let dom = compute_dominators(&qcode::value::Function::from_id(ctx, fid), root);
+        let dom = compute_dominators(&qcode::value::FunctionBody::from_id(ctx, fid), root);
         while let Some(p) = find_pipelined(ctx, fid, &dom) {
             apply(ctx, fid, &p);
             changed = true;
@@ -339,12 +339,12 @@ mod tests {
     /// Build the canonical pipelined strcpy loop and return `(fid, header)`.
     fn build_pipelined(tc: &mut TestContext) -> (FunctionId, BlockId) {
         let ram = tc.ctx.shared.default_space;
-        let fid = Function::make(&mut tc.ctx, "strcpy".into()).unwrap().id;
+        let fid = FunctionBody::make(&mut tc.ctx, "strcpy".into()).unwrap().id;
         let entry = tc.ctx.get_or_make_block(0x1000, fid);
         let header = tc.ctx.get_or_make_block(0x1010, fid);
         let exit = tc.ctx.get_or_make_block(0x1020, fid);
         {
-            let mut f = Function::from_id_mut(&mut tc.ctx, fid);
+            let mut f = FunctionBody::from_id_mut(&mut tc.ctx, fid);
             f.set_root(entry).unwrap();
             f.add_block(entry);
             f.add_block(header);
@@ -448,12 +448,14 @@ mod tests {
     fn leaves_inconsistent_prologue_seed_alone() {
         let mut tc = TestContext::new();
         let ram = tc.ctx.shared.default_space;
-        let fid = Function::make(&mut tc.ctx, "notstrcpy".into()).unwrap().id;
+        let fid = FunctionBody::make(&mut tc.ctx, "notstrcpy".into())
+            .unwrap()
+            .id;
         let entry = tc.ctx.get_or_make_block(0x3000, fid);
         let header = tc.ctx.get_or_make_block(0x3010, fid);
         let exit = tc.ctx.get_or_make_block(0x3020, fid);
         {
-            let mut f = Function::from_id_mut(&mut tc.ctx, fid);
+            let mut f = FunctionBody::from_id_mut(&mut tc.ctx, fid);
             f.set_root(entry).unwrap();
             f.add_block(entry);
             f.add_block(header);
@@ -517,12 +519,12 @@ mod tests {
     fn leaves_non_pipelined_loop_alone() {
         let mut tc = TestContext::new();
         let ram = tc.ctx.shared.default_space;
-        let fid = Function::make(&mut tc.ctx, "sum".into()).unwrap().id;
+        let fid = FunctionBody::make(&mut tc.ctx, "sum".into()).unwrap().id;
         let entry = tc.ctx.get_or_make_block(0x2000, fid);
         let header = tc.ctx.get_or_make_block(0x2010, fid);
         let exit = tc.ctx.get_or_make_block(0x2020, fid);
         {
-            let mut f = Function::from_id_mut(&mut tc.ctx, fid);
+            let mut f = FunctionBody::from_id_mut(&mut tc.ctx, fid);
             f.set_root(entry).unwrap();
             f.add_block(entry);
             f.add_block(header);

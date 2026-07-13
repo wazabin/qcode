@@ -67,20 +67,20 @@ pub fn remove_dead_insns_module<'str>(host: &mut Context<'str>, block_id: BlockI
 /// Host-generic core of [`remove_dead_insns`]; see that function.
 /// This is the concrete version for FunctionBody/ContextView (stage 5b).
 pub fn remove_dead_insns_host<'a, 'str>(
-    body: &'a mut FunctionBody<'_, 'str>,
+    body: &'a mut FunctionBody<'str>,
     cx: ContextView<'a, 'str>,
     block_id: BlockId,
 ) -> bool {
     let mut changed = false;
     loop {
-        let dead = dead_insns(body.read_host(cx), block_id);
+        let dead = dead_insns(cx.read_host(body), block_id);
         if dead.is_empty() {
             break;
         }
 
         changed = true;
         for id in &dead {
-            body.remove_instruction(cx, *id);
+            body.remove_instruction(*id);
         }
     }
 
@@ -148,12 +148,13 @@ fn remove_dead_pure_call_module<'str>(host: &mut Context<'str>, block_id: BlockI
 
 /// Host-generic core of [`remove_dead_pure_call`]; see that function.
 fn remove_dead_pure_call_host<'a, 'str>(
-    body: &'a mut FunctionBody<'_, 'str>,
+    body: &'a mut FunctionBody<'str>,
     cx: ContextView<'a, 'str>,
     block_id: BlockId,
 ) -> bool {
-    let Some(term_id) = body
-        .block_ref(cx, block_id)
+    let Some(term_id) = cx
+        .read_host(body)
+        .block_ref(block_id)
         .instruction_ids()
         .last()
         .copied()
@@ -161,7 +162,7 @@ fn remove_dead_pure_call_host<'a, 'str>(
         return false;
     };
 
-    let (clobbers_empty, target) = match body.insn_ref(cx, term_id).mnemonic() {
+    let (clobbers_empty, target) = match cx.read_host(body).insn_ref(term_id).mnemonic() {
         Mnemonic::Call(call) => (call.clobbers.is_empty(), call.target),
         _ => return false,
     };
@@ -171,16 +172,17 @@ fn remove_dead_pure_call_host<'a, 'str>(
     let Some(target) = target.real() else {
         return false;
     };
-    if !body.function_ref(cx, target).is_pure() {
+    if !cx.read_host(body).function_ref(target).is_pure() {
         return false;
     }
-    if !host_users(body.read_host(cx), ValueId::Instruction(term_id)).is_empty() {
+    if !host_users(cx.read_host(body), ValueId::Instruction(term_id)).is_empty() {
         return false;
     }
 
     // A pure call's block has exactly one successor: its fall-through.
-    let successors: Vec<BlockId> = body
-        .block_ref(cx, block_id)
+    let successors: Vec<BlockId> = cx
+        .read_host(body)
+        .block_ref(block_id)
         .successors()
         .map(|(_, b)| b)
         .collect();
@@ -255,11 +257,17 @@ pub fn remove_unused_no_pred_block_params_generic<'str>(
 /// blocks whose predecessor terminators carry positional arguments.
 /// Concrete version for FunctionBody/ContextView (stage 5b).
 pub fn remove_unused_no_pred_block_params_host<'a, 'str>(
-    body: &'a mut FunctionBody<'_, 'str>,
+    body: &'a mut FunctionBody<'str>,
     cx: ContextView<'a, 'str>,
     block_id: BlockId,
 ) -> bool {
-    if body.block_ref(cx, block_id).predecessors().next().is_some() {
+    if cx
+        .read_host(body)
+        .block_ref(block_id)
+        .predecessors()
+        .next()
+        .is_some()
+    {
         return false;
     }
 
@@ -271,21 +279,22 @@ pub fn remove_unused_no_pred_block_params_host<'a, 'str>(
     // this per-function sweep. A function pass must not reach across functions, so
     // leave pure_reg entry params for `dead_signature`; the *local* fallback below
     // would silently drop the param and break the interface alignment.
-    let is_pure_reg_entry = body
-        .block_ref(cx, block_id)
+    let is_pure_reg_entry = cx
+        .read_host(body)
+        .block_ref(block_id)
         .function()
         .is_some_and(|f| f.is_pure_reg() && f.root().map(|b| b.id) == Some(block_id));
     if is_pure_reg_entry {
         return false;
     }
 
-    let params: Vec<_> = body.read_host(cx).block(block_id).param_ids().to_vec();
+    let params: Vec<_> = cx.read_host(body).block(block_id).param_ids().to_vec();
     let mut kept = Vec::with_capacity(params.len());
     let mut changed = false;
     for local in params {
         let param = qcode::value::BlockParamId::new(block_id.func, local);
-        if host_users(body.read_host(cx), ValueId::BlockParam(param)).is_empty()
-            && !body.read_host(cx).block_param(param).protected
+        if host_users(cx.read_host(body), ValueId::BlockParam(param)).is_empty()
+            && !cx.read_host(body).block_param(param).protected
         {
             body.block_param_mut(param).clear_parent();
             changed = true;
@@ -311,7 +320,7 @@ mod tests {
         space::SpaceId,
         testing::TestContext,
         value::{
-            BasicBlock, BlockId, Function, ValueId,
+            BasicBlock, BlockId, FunctionBody, ValueId,
             insn::{Mnemonic, PCodeOpId},
         },
     };
@@ -461,19 +470,19 @@ mod tests {
         pure: bool,
         use_result: bool,
     ) -> (BlockId, BlockId) {
-        let callee = Function::make(ctx, "callee".into()).unwrap().id;
+        let callee = FunctionBody::make(ctx, "callee".into()).unwrap().id;
         let callee_block = { ctx.get_or_make_block(0x4000, callee) };
-        Function::from_id_mut(ctx, callee)
+        FunctionBody::from_id_mut(ctx, callee)
             .set_root(callee_block)
             .unwrap();
-        Function::from_id_mut(ctx, callee).set_is_pure(pure);
+        FunctionBody::from_id_mut(ctx, callee).set_is_pure(pure);
 
         // Both blocks must live in the *same* function: the call's result (defined
         // in the call block) is used by the store in the continuation, and users
         // of an SSA value are intra-function. Store both directly in `caller`.
-        let caller = Function::make(ctx, "caller".into()).unwrap().id;
+        let caller = FunctionBody::make(ctx, "caller".into()).unwrap().id;
         let call_block = ctx.get_or_make_block(0x1000, caller);
-        Function::from_id_mut(ctx, caller)
+        FunctionBody::from_id_mut(ctx, caller)
             .set_root(call_block)
             .unwrap();
 
@@ -851,17 +860,18 @@ fn remove_dead_counted_loop_module<'str>(host: &mut Context<'str>, fun_id: Funct
 
 /// Host-generic core of [`remove_dead_counted_loop`]; see that function.
 fn remove_dead_counted_loop_host<'a, 'str>(
-    body: &'a mut FunctionBody<'_, 'str>,
+    body: &'a mut FunctionBody<'str>,
     cx: ContextView<'a, 'str>,
     fun_id: FunctionId,
 ) -> bool {
-    let headers: Vec<BlockId> = body
-        .function_ref(cx, fun_id)
+    let headers: Vec<BlockId> = cx
+        .read_host(body)
+        .function_ref(fun_id)
         .blocks()
         .map(|b| b.id)
         .collect();
     for header in headers {
-        if let Some(dl) = match_dead_loop(body.read_host(cx), header) {
+        if let Some(dl) = match_dead_loop(cx.read_host(body), header) {
             replace_terminator_with_branch(body, cx, dl.preheader, dl.exit, vec![]);
             return true;
         }
@@ -883,8 +893,9 @@ impl FunctionPass for Dce {
     }
     fn run<'str>(
         &self,
-        f: &mut FunctionBody<'_, 'str>,
+        f: &mut FunctionBody<'str>,
         m: ContextView<'_, 'str>,
+        _next_minted: &mut u32,
     ) -> Result<Outcome<'str>, String> {
         let fun_id = f.id();
         Ok(Outcome::changed(dce_core(f, m, fun_id)))
@@ -895,13 +906,14 @@ impl FunctionPass for Dce {
 /// / dead-instruction sweeps, redundant/dead block-argument elimination, and dead
 /// counted-loop removal.
 fn dce_core<'a, 'str>(
-    body: &'a mut FunctionBody<'_, 'str>,
+    body: &'a mut FunctionBody<'str>,
     cx: ContextView<'a, 'str>,
     fun_id: FunctionId,
 ) -> bool {
-    let root = body.function_ref(cx, fun_id).root().map(|b| b.id);
-    let block_ids: Vec<_> = body
-        .function_ref(cx, fun_id)
+    let root = cx.read_host(body).function_ref(fun_id).root().map(|b| b.id);
+    let block_ids: Vec<_> = cx
+        .read_host(body)
+        .function_ref(fun_id)
         .blocks()
         .map(|b| b.id)
         .collect();

@@ -352,7 +352,7 @@ mod tests {
     use qcode::{
         builder::Builder,
         testing::TestContext,
-        value::{BasicBlock, Function},
+        value::{BasicBlock, FunctionBody},
     };
 
     fn setup_loop(
@@ -363,11 +363,11 @@ mod tests {
         ValueId,
         ValueId,
     ) {
-        let fid = Function::make(&mut tc.ctx, "f".into()).unwrap().id;
+        let fid = FunctionBody::make(&mut tc.ctx, "f".into()).unwrap().id;
         let entry = tc.ctx.get_or_make_block(0x1000, fid);
         let body = tc.ctx.get_or_make_block(0x1010, fid);
         {
-            let mut f = Function::from_id_mut(&mut tc.ctx, fid);
+            let mut f = FunctionBody::from_id_mut(&mut tc.ctx, fid);
             f.set_root(entry).unwrap();
             f.add_block(entry);
             f.add_block(body);

@@ -33,22 +33,22 @@ use crate::gvn::affine::precompute_forms;
 /// Rewrite every fixed `@SP ± N` load/store address in `fid` to a single
 /// root-block representative per offset `N`. Returns whether anything changed.
 pub fn canonicalize_sp_slots_concrete<'a, 'str>(
-    body: &'a mut FunctionBody<'_, 'str>,
+    body: &'a mut FunctionBody<'str>,
     cx: ContextView<'a, 'str>,
     fid: FunctionId,
     sp_reg: VarnodeId,
 ) -> bool {
-    let numbering = precompute_forms(body.read_host(cx), fid);
-    let Some(sp_param) = incoming_sp_param(body.read_host(cx), fid, sp_reg) else {
+    let numbering = precompute_forms(cx.read_host(body), fid);
+    let Some(sp_param) = incoming_sp_param(cx.read_host(body), fid, sp_reg) else {
         return false;
     };
-    let Some(root) = body.function_ref(cx, fid).root().map(|b| b.id) else {
+    let Some(root) = cx.read_host(body).function_ref(fid).root().map(|b| b.id) else {
         return false;
     };
 
     // Each distinct load/store pointer that is `@SP ± N` with a fixed offset.
     let mut ptr_offset: HashMap<ValueId, i64> = HashMap::new();
-    for block in body.function_ref(cx, fid).blocks() {
+    for block in cx.read_host(body).function_ref(fid).blocks() {
         for insn in block.iter() {
             let ptr = match insn.mnemonic() {
                 Mnemonic::Load(load) => load.ptr.qualify(insn.id.func),
@@ -76,7 +76,7 @@ pub fn canonicalize_sp_slots_concrete<'a, 'str>(
     if offsets.contains(&0) {
         repr.insert(0, sp_param);
     }
-    for insn in body.function_ref(cx, fid).root().unwrap().iter() {
+    for insn in cx.read_host(body).function_ref(fid).root().unwrap().iter() {
         let v = ValueId::Instruction(insn.id);
         if let Some((base, off)) = numbering.base_offset(v)
             && base == sp_param
@@ -93,7 +93,7 @@ pub fn canonicalize_sp_slots_concrete<'a, 'str>(
         .filter(|o| !repr.contains_key(o))
         .collect();
     if !missing.is_empty() {
-        let host_borrow = body.host(cx);
+        let host_borrow = cx.host(body);
         let mut b = Builder::from_block(BaseRef::new(host_borrow, root));
         b.set_insert_point_to_start();
         for off in missing {
@@ -114,7 +114,7 @@ pub fn canonicalize_sp_slots_concrete<'a, 'str>(
     for (ptr, off) in ptr_offset {
         let rep = repr[&off];
         if ptr != rep {
-            body.replace_all_uses_with(cx, ptr, rep);
+            body.replace_all_uses_with(ptr, rep);
             changed = true;
         }
     }
@@ -230,8 +230,9 @@ impl FunctionPass for CanonicalizeSpSlots {
     }
     fn run<'str>(
         &self,
-        f: &mut FunctionBody<'_, 'str>,
+        f: &mut FunctionBody<'str>,
         cx: ContextView<'_, 'str>,
+        _next_minted: &mut u32,
     ) -> std::result::Result<Outcome<'str>, String> {
         let sp_reg = cx.shr().registers[&cx.env().cfg.stack_pointer];
         let fid = f.id();
@@ -248,7 +249,7 @@ mod tests {
     use super::*;
     use qcode::{
         testing::TestContext,
-        value::{BasicBlock, Function, Value},
+        value::{BasicBlock, FunctionBody, Value},
     };
 
     /// Two `load(@SP - 8)` in different blocks become one shared pointer after
@@ -258,11 +259,11 @@ mod tests {
         let mut tc = TestContext::new();
         let sp_reg = tc.r0;
         let ram = tc.ctx.shared.default_space;
-        let fid = Function::make(&mut tc.ctx, "f".into()).unwrap().id;
+        let fid = FunctionBody::make(&mut tc.ctx, "f".into()).unwrap().id;
         let root = tc.ctx.get_or_make_block(0x1000, fid);
         let other = tc.ctx.get_or_make_block(0x2000, fid);
         {
-            let mut f = Function::from_id_mut(&mut tc.ctx, fid);
+            let mut f = FunctionBody::from_id_mut(&mut tc.ctx, fid);
             f.set_root(root).unwrap();
             f.add_block(root);
             f.add_block(other);

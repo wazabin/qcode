@@ -71,11 +71,12 @@ impl FunctionPass for MbaSimplify {
 
     fn run<'str>(
         &self,
-        body: &mut FunctionBody<'_, 'str>,
+        body: &mut FunctionBody<'str>,
         m: ContextView<'_, 'str>,
+        _next_minted: &mut u32,
     ) -> Result<Outcome<'str>, String> {
         let fid = body.id();
-        let mut host = body.host(m);
+        let mut host = m.host(body);
         Ok(Outcome::changed(mba_simplify(&mut host, fid)))
     }
 }
@@ -635,7 +636,7 @@ mod tests {
     use qcode::value::insn::Mnemonic;
     use qcode::{
         context::Context,
-        value::{BasicBlock, Function, Instruction},
+        value::{BasicBlock, FunctionBody, Instruction},
     };
     use qcode_emulator::{SizedValue, StandaloneEmulator};
     use qcode_macro::qcode;
@@ -648,7 +649,7 @@ mod tests {
     }
 
     fn return_value(ctx: &Context, fun: FunctionId) -> ValueId {
-        let root = Function::from_id(ctx, fun).root().expect("root").id;
+        let root = FunctionBody::from_id(ctx, fun).root().expect("root").id;
         let &term = BasicBlock::from_id(ctx, root)
             .instruction_ids()
             .last()
@@ -660,7 +661,7 @@ mod tests {
     }
 
     fn run(ctx: &Context, fun: FunctionId, a: u64, b: u64) -> Option<u64> {
-        let root = Function::from_id(ctx, fun).root().expect("root").id;
+        let root = FunctionBody::from_id(ctx, fun).root().expect("root").id;
         let ret = return_value(ctx, fun);
         let mut emu = StandaloneEmulator::new(root);
         emu.run_pure(
@@ -674,7 +675,7 @@ mod tests {
     }
 
     fn insn_total(ctx: &Context, fun: FunctionId) -> usize {
-        Function::from_id(ctx, fun)
+        FunctionBody::from_id(ctx, fun)
             .blocks()
             .map(|b| b.instruction_ids().len())
             .sum()

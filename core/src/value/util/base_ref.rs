@@ -6,7 +6,7 @@ use crate::{
         ValueId,
         block::{BasicBlock, BlockId, EdgeData, EdgeId},
         block_param::{BlockParam, BlockParamId},
-        function::{Function, FunctionId},
+        function::{FunctionBody, FunctionId},
         insn::{Instruction, InstructionId},
     },
 };
@@ -37,7 +37,7 @@ pub enum HostRef<'a, 'str> {
     /// other functions' bodies, which is the parallel-safety contract
     /// (context-split stage 5b-ii Pin B).
     Checked {
-        fun: &'a Function<'str>,
+        fun: &'a FunctionBody<'str>,
         shared: &'a crate::context::Shared<'str>,
         interfaces: &'a jstd::registry::Registry<
             FunctionId,
@@ -76,7 +76,7 @@ impl<'a, 'str> HostRef<'a, 'str> {
     /// registry slot on a module host. A checked-out host holds only its own
     /// body — a foreign-body read through it is the exact coupling the
     /// context-split forbids, and panics.
-    pub fn function(self, f: FunctionId) -> &'a Function<'str> {
+    pub fn function(self, f: FunctionId) -> &'a FunctionBody<'str> {
         match self {
             HostRef::Module(c) => &c.bodies[f],
             HostRef::Checked { fun, .. } if f == fun.id() => fun,
@@ -180,23 +180,26 @@ impl<'a, 'str> HostRef<'a, 'str> {
     /// A [`BlockRef`](crate::value::BlockRef) over `id`, routed to its owning
     /// function's arena through this view. Replaces `BasicBlock::from_id(ctx, id)`.
     pub fn block_ref(self, id: BlockId) -> BaseRef<HostRef<'a, 'str>, BlockId> {
+        let _ = self.block(id);
         BaseRef::new(self, id)
     }
 
     /// An [`InstructionRef`](crate::value::InstructionRef) over `id`, body-routed.
     /// Replaces `Instruction::from_id(ctx, id)`.
     pub fn insn_ref(self, id: InstructionId) -> BaseRef<HostRef<'a, 'str>, InstructionId> {
+        let _ = self.instruction(id);
         BaseRef::new(self, id)
     }
 
     /// A [`BlockParamRef`](crate::value::BlockParamRef) over `id`, body-routed.
     /// Replaces `BlockParam::from_id(ctx, id)`.
     pub fn param_ref(self, id: BlockParamId) -> BaseRef<HostRef<'a, 'str>, BlockParamId> {
+        let _ = self.block_param(id);
         BaseRef::new(self, id)
     }
 
     /// A [`FunctionRef`](crate::value::FunctionRef) over `id`, body-routed.
-    /// Replaces `Function::from_id(ctx, id)`.
+    /// Replaces `FunctionBody::from_id(ctx, id)`.
     pub fn function_ref(self, id: FunctionId) -> BaseRef<HostRef<'a, 'str>, FunctionId> {
         BaseRef::new(self, id)
     }

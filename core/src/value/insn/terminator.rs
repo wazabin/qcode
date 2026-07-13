@@ -267,7 +267,7 @@ mod tests {
         context::Context,
         testing::TestContext,
         value::{
-            BasicBlock, Function, Instruction,
+            BasicBlock, FunctionBody, Instruction,
             insn::{Callee, Mnemonic},
         },
     };
@@ -275,7 +275,7 @@ mod tests {
     #[test]
     fn minted_callee_is_not_a_call_graph_target_and_renders_explicitly() {
         let mut ctx = Context::new();
-        let func = Function::make(&mut ctx, "caller".into()).unwrap().id;
+        let func = FunctionBody::make(&mut ctx, "caller".into()).unwrap().id;
         let id = crate::value::InstructionRef::from_mnemonic(
             &mut ctx,
             func,
@@ -304,10 +304,10 @@ mod tests {
 
     #[test]
     fn tail_call_is_a_function_level_terminator() {
-        use crate::value::{BasicBlock, Function};
+        use crate::value::{BasicBlock, FunctionBody};
 
         let mut ctx = Context::new();
-        let callee = Function::make_at_addr(&mut ctx, 0x2000, None).id;
+        let callee = FunctionBody::make_at_addr(&mut ctx, 0x2000, None).id;
         let block = {
             let f = ctx.anon_function();
             BasicBlock::make(&mut ctx, f).id
@@ -405,8 +405,8 @@ mod tests {
     #[test]
     fn call_display_shows_named_args_with_fallbacks() {
         let mut tc = TestContext::new();
-        let callee = Function::make(&mut tc.ctx, "callee".into()).unwrap().id;
-        Function::from_id_mut(&mut tc.ctx, callee).set_input_regs(vec![tc.r0]);
+        let callee = FunctionBody::make(&mut tc.ctx, "callee".into()).unwrap().id;
+        FunctionBody::from_id_mut(&mut tc.ctx, callee).set_input_regs(vec![tc.r0]);
 
         let block = {
             let __f = tc.ctx.anon_function();
@@ -446,8 +446,8 @@ mod tests {
         let stack_space = tc.ctx.add_space(Space::new(Some("stack"), 1, 4));
         let stack_input = Varnode::make(&mut tc.ctx, 4, 4, stack_space).id;
 
-        let callee = Function::make(&mut tc.ctx, "callee".into()).unwrap().id;
-        Function::from_id_mut(&mut tc.ctx, callee).set_input_regs(vec![stack_input]);
+        let callee = FunctionBody::make(&mut tc.ctx, "callee".into()).unwrap().id;
+        FunctionBody::from_id_mut(&mut tc.ctx, callee).set_input_regs(vec![stack_input]);
 
         let block = {
             let __f = tc.ctx.anon_function();
@@ -524,7 +524,7 @@ mod tests {
             "
         );
 
-        let rec = Function::from_name(&ctx, "rec").expect("lambda exists");
+        let rec = FunctionBody::from_name(&ctx, "rec").expect("lambda exists");
         assert!(rec.is_lambda());
         let entry = rec.root().expect("lambda has root");
         let insns = entry.instruction_ids();

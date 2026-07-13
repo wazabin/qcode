@@ -130,7 +130,7 @@ mod tests {
     use qcode::{
         builder::Builder,
         testing::TestContext,
-        value::{BasicBlock, Function},
+        value::{BasicBlock, FunctionBody},
     };
 
     use crate::gvn::affine::precompute_forms;
@@ -139,10 +139,10 @@ mod tests {
     /// register varnode). Returns `(fid, sp_param, sp_reg)`.
     fn sp_function(tc: &mut TestContext) -> (FunctionId, ValueId, VarnodeId) {
         let sp_reg = tc.r0; // stand-in stack-pointer register varnode
-        let fid = Function::make(&mut tc.ctx, "f".into()).unwrap().id;
+        let fid = FunctionBody::make(&mut tc.ctx, "f".into()).unwrap().id;
         let root = { tc.ctx.get_or_make_block(0x1000, fid) };
         {
-            let mut f = Function::from_id_mut(&mut tc.ctx, fid);
+            let mut f = FunctionBody::from_id_mut(&mut tc.ctx, fid);
             f.set_root(root).unwrap();
             f.add_block(root);
         }
@@ -166,7 +166,7 @@ mod tests {
     fn classifies_local_caller_and_aligned() {
         let mut tc = TestContext::new();
         let (fid, sp, _) = sp_function(&mut tc);
-        let root = Function::from_id(&tc.ctx, fid).root().unwrap().id;
+        let root = FunctionBody::from_id(&tc.ctx, fid).root().unwrap().id;
 
         let (local, caller_arg, ret_slot, aligned_slot, unrelated) = {
             let mut b = Builder::from_block(BasicBlock::from_id_mut(&mut tc.ctx, root));
@@ -225,7 +225,7 @@ mod tests {
     fn classifies_cascaded_realignment_as_local() {
         let mut tc = TestContext::new();
         let (fid, sp, _) = sp_function(&mut tc);
-        let root = Function::from_id(&tc.ctx, fid).root().unwrap().id;
+        let root = FunctionBody::from_id(&tc.ctx, fid).root().unwrap().id;
 
         let slot = {
             let mut b = Builder::from_block(BasicBlock::from_id_mut(&mut tc.ctx, root));
@@ -263,7 +263,7 @@ mod tests {
     fn rejects_realignment_above_entry_sp() {
         let mut tc = TestContext::new();
         let (fid, sp, _) = sp_function(&mut tc);
-        let root = Function::from_id(&tc.ctx, fid).root().unwrap().id;
+        let root = FunctionBody::from_id(&tc.ctx, fid).root().unwrap().id;
 
         let (aligned, slot) = {
             let mut b = Builder::from_block(BasicBlock::from_id_mut(&mut tc.ctx, root));

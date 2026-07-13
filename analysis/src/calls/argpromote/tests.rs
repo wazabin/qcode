@@ -2,7 +2,7 @@
 mod tests {
     use qcode::builder::Builder;
     use qcode::value::{
-        BasicBlock, BlockId, Function, Instruction, LocalValueId, Value, Varnode, VarnodeId,
+        BasicBlock, BlockId, FunctionBody, Instruction, LocalValueId, Value, Varnode, VarnodeId,
         insn::{Binop, Call, InstructionId, IntBinop, Mnemonic},
     };
     use qcode_macro::qcode;
@@ -105,7 +105,7 @@ mod tests {
         let _ = crate::gvn_function(&mut tc.ctx, g, Some(&aliases));
 
         // gvn cannot see into the opaque call result, so the extract must remain.
-        let has_extract = Function::from_id(&tc.ctx, g).iter().any(|b| {
+        let has_extract = FunctionBody::from_id(&tc.ctx, g).iter().any(|b| {
             b.iter()
                 .any(|i| matches!(i.mnemonic(), Mnemonic::Extract(_)))
         });
@@ -141,8 +141,8 @@ mod tests {
         );
         let _ = g;
 
-        Function::from_id_mut(&mut tc.ctx, f).set_input_regs(vec![input]);
-        Function::from_id_mut(&mut tc.ctx, f).set_pure_reg(true);
+        FunctionBody::from_id_mut(&mut tc.ctx, f).set_input_regs(vec![input]);
+        FunctionBody::from_id_mut(&mut tc.ctx, f).set_pure_reg(true);
         let ptr = tc.ctx.get_const(0x4000, 8).id();
         let call_id = set_call(&mut tc, g_call, f, vec![ptr]);
         tc.ctx.add_cfg_edge(g_call, g_cont);
@@ -153,7 +153,7 @@ mod tests {
         );
 
         // The callee now hands the buffer back through Return::value.
-        let returns_value = Function::from_id(&tc.ctx, f).iter().any(|b| {
+        let returns_value = FunctionBody::from_id(&tc.ctx, f).iter().any(|b| {
             b.iter()
                 .last()
                 .is_some_and(|i| matches!(i.mnemonic(), Mnemonic::Return(r) if r.value.is_some()))
@@ -201,7 +201,7 @@ mod tests {
             "
         );
         let _ = g;
-        Function::from_id_mut(&mut tc.ctx, f).set_input_regs(vec![input]);
+        FunctionBody::from_id_mut(&mut tc.ctx, f).set_input_regs(vec![input]);
         // NB: deliberately NOT `set_pure_reg(true)`.
         let ptr = tc.ctx.get_const(0x4000, 8).id();
         set_call(&mut tc, g_call, f, vec![ptr]);
@@ -237,7 +237,7 @@ mod tests {
         );
         let _ = (f_entry, f_cont);
 
-        Function::from_id_mut(&mut tc.ctx, caller).set_pure_reg(true);
+        FunctionBody::from_id_mut(&mut tc.ctx, caller).set_pure_reg(true);
         set_call(&mut tc, f_call, callee, vec![]);
         tc.ctx.add_cfg_edge(f_call, f_cont);
 
@@ -247,17 +247,17 @@ mod tests {
             "call to impure callee blocks purity"
         );
 
-        Function::from_id_mut(&mut tc.ctx, callee).set_is_pure(true);
+        FunctionBody::from_id_mut(&mut tc.ctx, callee).set_is_pure(true);
         assert!(
             body_is_pure(&tc.ctx, caller),
             "a clobber-free call to a pure callee is permitted in a pure body"
         );
 
         // mark_pure flags the caller once the callee is pure, order-independently.
-        Function::from_id_mut(&mut tc.ctx, caller).set_pure_reg(true);
+        FunctionBody::from_id_mut(&mut tc.ctx, caller).set_pure_reg(true);
         mark_pure_functions(&mut tc.ctx);
         assert!(
-            Function::from_id(&tc.ctx, caller).is_pure(),
+            FunctionBody::from_id(&tc.ctx, caller).is_pure(),
             "caller of a pure function should be marked pure"
         );
     }
@@ -288,7 +288,7 @@ mod tests {
             "
         );
         let _ = g;
-        Function::from_id_mut(&mut tc.ctx, f).set_pure_reg(true);
+        FunctionBody::from_id_mut(&mut tc.ctx, f).set_pure_reg(true);
         let call_id = set_call(&mut tc, g_call, f, vec![]);
         tc.ctx.add_cfg_edge(g_call, g_cont);
 
@@ -299,7 +299,7 @@ mod tests {
         );
 
         // f gains a `glob_454df8` param.
-        let pnames: Vec<String> = Function::from_id(&tc.ctx, f)
+        let pnames: Vec<String> = FunctionBody::from_id(&tc.ctx, f)
             .root()
             .unwrap()
             .params()
@@ -311,7 +311,7 @@ mod tests {
         );
 
         // No constant-address real-ram access remains in f's body.
-        let const_access = Function::from_id(&tc.ctx, f)
+        let const_access = FunctionBody::from_id(&tc.ctx, f)
             .iter()
             .flat_map(|b| b.iter())
             .any(|i| match i.mnemonic() {
@@ -353,7 +353,7 @@ mod tests {
                     return at i64 0;
             "
         );
-        Function::from_id_mut(&mut tc.ctx, f).set_pure_reg(true);
+        FunctionBody::from_id_mut(&mut tc.ctx, f).set_pure_reg(true);
 
         // Take f's address: store the function value somewhere in g, so f lands
         // in `address_taken_set`.
@@ -377,7 +377,7 @@ mod tests {
 
     /// Whether `f`'s root has a by-value snapshot param (a promoted read).
     fn has_val_param(ctx: &Context, f: FunctionId) -> bool {
-        Function::from_id(ctx, f).root().is_some_and(|b| {
+        FunctionBody::from_id(ctx, f).root().is_some_and(|b| {
             b.params()
                 .any(|p| p.name().is_some_and(|n| n.contains("_val_")))
         })
@@ -416,8 +416,8 @@ mod tests {
             "
         );
         let _ = g;
-        Function::from_id_mut(&mut tc.ctx, f).set_input_regs(vec![input]);
-        Function::from_id_mut(&mut tc.ctx, f).set_pure_reg(true);
+        FunctionBody::from_id_mut(&mut tc.ctx, f).set_input_regs(vec![input]);
+        FunctionBody::from_id_mut(&mut tc.ctx, f).set_pure_reg(true);
         let ptr = tc.ctx.get_const(0x4000, 8).id();
         set_call(&mut tc, g_call, f, vec![ptr]);
         tc.ctx.add_cfg_edge(g_call, g_cont);
@@ -433,7 +433,7 @@ mod tests {
         // Partial mode never touches shadow: every load/store stays in real ram, so
         // the unmodelled store cannot be collapsed across.
         let ram = tc.ctx.shared.default_space;
-        let all_ram = Function::from_id(&tc.ctx, f).blocks().all(|b| {
+        let all_ram = FunctionBody::from_id(&tc.ctx, f).blocks().all(|b| {
             b.iter().all(|i| match i.mnemonic() {
                 Mnemonic::Load(l) => l.space == ram,
                 Mnemonic::Store(s) => s.space == ram,
@@ -479,8 +479,8 @@ mod tests {
             "
         );
         let _ = g;
-        Function::from_id_mut(&mut tc.ctx, f).set_input_regs(vec![input]);
-        Function::from_id_mut(&mut tc.ctx, f).set_pure_reg(true);
+        FunctionBody::from_id_mut(&mut tc.ctx, f).set_input_regs(vec![input]);
+        FunctionBody::from_id_mut(&mut tc.ctx, f).set_pure_reg(true);
         let ptr = tc.ctx.get_const(0x4000, 8).id();
         let call_id = set_call(&mut tc, g_call, f, vec![ptr]);
         tc.ctx.add_cfg_edge(g_call, g_cont);
@@ -489,7 +489,7 @@ mod tests {
 
         // f gained a `glob_9000` param for the lifted constant address, and no
         // constant-address access remains in its body.
-        let pnames: Vec<String> = Function::from_id(&tc.ctx, f)
+        let pnames: Vec<String> = FunctionBody::from_id(&tc.ctx, f)
             .root()
             .unwrap()
             .params()
@@ -499,7 +499,7 @@ mod tests {
             pnames.iter().any(|n| n == "glob_9000"),
             "glob param added: {pnames:?}"
         );
-        let const_access = Function::from_id(&tc.ctx, f)
+        let const_access = FunctionBody::from_id(&tc.ctx, f)
             .iter()
             .flat_map(|b| b.iter())
             .any(|i| match i.mnemonic() {
@@ -522,7 +522,7 @@ mod tests {
         assert!(passes_addr, "caller passes the global address literal");
 
         // … and replays the functionalized write-set out of the call result.
-        let has_replay = Function::from_id(&tc.ctx, g).iter().any(|b| {
+        let has_replay = FunctionBody::from_id(&tc.ctx, g).iter().any(|b| {
             b.iter().any(
                 |i| matches!(i.mnemonic(), Mnemonic::Extract(e) if e.agg == LocalValueId::Instruction(call_id.local)),
             )
@@ -560,8 +560,8 @@ mod tests {
             "
         );
         let _ = g;
-        Function::from_id_mut(&mut tc.ctx, f).set_input_regs(vec![input]);
-        Function::from_id_mut(&mut tc.ctx, f).set_pure_reg(true);
+        FunctionBody::from_id_mut(&mut tc.ctx, f).set_input_regs(vec![input]);
+        FunctionBody::from_id_mut(&mut tc.ctx, f).set_pure_reg(true);
         let ptr = tc.ctx.get_const(0x4000, 8).id();
         set_call(&mut tc, g_call, f, vec![ptr]);
         tc.ctx.add_cfg_edge(g_call, g_cont);
@@ -603,8 +603,8 @@ mod tests {
             "
         );
         let _ = g;
-        Function::from_id_mut(&mut tc.ctx, f).set_input_regs(vec![input]);
-        Function::from_id_mut(&mut tc.ctx, f).set_pure_reg(true);
+        FunctionBody::from_id_mut(&mut tc.ctx, f).set_input_regs(vec![input]);
+        FunctionBody::from_id_mut(&mut tc.ctx, f).set_pure_reg(true);
         let ptr = tc.ctx.get_const(0x4000, 8).id();
         set_call(&mut tc, g_call, f, vec![ptr]);
         tc.ctx.add_cfg_edge(g_call, g_cont);
@@ -646,8 +646,8 @@ mod tests {
         );
         let _ = g;
 
-        Function::from_id_mut(&mut tc.ctx, f).set_input_regs(vec![input]);
-        Function::from_id_mut(&mut tc.ctx, f).set_pure_reg(true);
+        FunctionBody::from_id_mut(&mut tc.ctx, f).set_input_regs(vec![input]);
+        FunctionBody::from_id_mut(&mut tc.ctx, f).set_pure_reg(true);
         let ptr = tc.ctx.get_const(0x4000, 8).id();
         set_call(&mut tc, g_call, f, vec![ptr]);
         tc.ctx.add_cfg_edge(g_call, g_cont);
@@ -658,7 +658,7 @@ mod tests {
         );
 
         // The callee gains a by-value snapshot param keyed by the offset.
-        let has_val_param = Function::from_id(&tc.ctx, f).root().is_some_and(|b| {
+        let has_val_param = FunctionBody::from_id(&tc.ctx, f).root().is_some_and(|b| {
             b.params()
                 .any(|p| p.name().is_some_and(|n| n.contains("_val_30")))
         });
@@ -723,7 +723,7 @@ mod tests {
             vec![AggregateField::new_at("peb", i32_ty, 0x30)],
         );
         let ptr_ty = tc.ctx.shared.types.get_or_make_struct_pointer(8, s_ty);
-        let root = Function::from_id(&tc.ctx, f).root().unwrap().id;
+        let root = FunctionBody::from_id(&tc.ctx, f).root().unwrap().id;
         let pid = BasicBlock::from_id(&tc.ctx, root)
             .params()
             .next()
@@ -747,8 +747,8 @@ mod tests {
         tc.ctx
             .replace_all_uses_with(ValueId::Instruction(add_id), gep);
 
-        Function::from_id_mut(&mut tc.ctx, f).set_input_regs(vec![input]);
-        Function::from_id_mut(&mut tc.ctx, f).set_pure_reg(true);
+        FunctionBody::from_id_mut(&mut tc.ctx, f).set_input_regs(vec![input]);
+        FunctionBody::from_id_mut(&mut tc.ctx, f).set_pure_reg(true);
         let ptr = tc.ctx.get_const(0x4000, 8).id();
         set_call(&mut tc, g_call, f, vec![ptr]);
         tc.ctx.add_cfg_edge(g_call, g_cont);
@@ -771,7 +771,7 @@ mod tests {
         crate::gvn::gvn_function(&mut tc.ctx, f, Some(&aliases));
 
         let ram = tc.ctx.shared.default_space;
-        let surviving_shadow_load = Function::from_id(&tc.ctx, f).iter().any(|blk| {
+        let surviving_shadow_load = FunctionBody::from_id(&tc.ctx, f).iter().any(|blk| {
             blk.iter()
                 .any(|i| matches!(i.mnemonic(), Mnemonic::Load(l) if l.space != ram))
         });
@@ -793,7 +793,7 @@ mod tests {
                     return at 0x1000;
             "
         );
-        assert!(Function::from_id(&ctx, foo).root().is_some());
+        assert!(FunctionBody::from_id(&ctx, foo).root().is_some());
         // No pointer parameters, no callers: nothing to promote, and no panic.
         assert!(!argpromote(&mut ctx));
     }
@@ -862,8 +862,8 @@ mod tests {
             "
         );
         let _ = g;
-        Function::from_id_mut(&mut tc.ctx, f).set_input_regs(vec![in_p, in_q]);
-        Function::from_id_mut(&mut tc.ctx, f).set_pure_reg(true);
+        FunctionBody::from_id_mut(&mut tc.ctx, f).set_input_regs(vec![in_p, in_q]);
+        FunctionBody::from_id_mut(&mut tc.ctx, f).set_pure_reg(true);
         let a = tc.ctx.get_const(0x4000, 8).id();
         let b = tc.ctx.get_const(0x5000, 8).id();
         let call_id = set_call(&mut tc, g_call, f, vec![a, b]);
@@ -906,8 +906,8 @@ mod tests {
             "
         );
         let _ = g;
-        Function::from_id_mut(&mut tc.ctx, foo).set_input_regs(vec![in_p]);
-        Function::from_id_mut(&mut tc.ctx, foo).set_pure_reg(true);
+        FunctionBody::from_id_mut(&mut tc.ctx, foo).set_input_regs(vec![in_p]);
+        FunctionBody::from_id_mut(&mut tc.ctx, foo).set_pure_reg(true);
         let a = tc.ctx.get_const(0x4000, 8).id();
         let call_id = set_call(&mut tc, g_call, foo, vec![a]);
         tc.ctx.add_cfg_edge(g_call, g_cont);
@@ -945,8 +945,8 @@ mod tests {
             "
         );
         let _ = g;
-        Function::from_id_mut(&mut tc.ctx, foo).set_input_regs(vec![in_p]);
-        Function::from_id_mut(&mut tc.ctx, foo).set_pure_reg(true);
+        FunctionBody::from_id_mut(&mut tc.ctx, foo).set_input_regs(vec![in_p]);
+        FunctionBody::from_id_mut(&mut tc.ctx, foo).set_pure_reg(true);
         let a = tc.ctx.get_const(0x4000, 8).id();
         let call_id = set_call(&mut tc, g_call, foo, vec![a]);
         tc.ctx.add_cfg_edge(g_call, g_cont);
@@ -982,8 +982,8 @@ mod tests {
             "
         );
         let _ = g;
-        Function::from_id_mut(&mut tc.ctx, foo).set_input_regs(vec![in_p]);
-        Function::from_id_mut(&mut tc.ctx, foo).set_pure_reg(true);
+        FunctionBody::from_id_mut(&mut tc.ctx, foo).set_input_regs(vec![in_p]);
+        FunctionBody::from_id_mut(&mut tc.ctx, foo).set_pure_reg(true);
         let a = tc.ctx.get_const(0x4000, 8).id();
         let call_id = set_call(&mut tc, g_call, foo, vec![a]);
         tc.ctx.add_cfg_edge(g_call, g_cont);
@@ -1020,8 +1020,8 @@ mod tests {
             "
         );
         let _ = g;
-        Function::from_id_mut(&mut tc.ctx, foo).set_input_regs(vec![in_p]);
-        Function::from_id_mut(&mut tc.ctx, foo).set_pure_reg(true);
+        FunctionBody::from_id_mut(&mut tc.ctx, foo).set_input_regs(vec![in_p]);
+        FunctionBody::from_id_mut(&mut tc.ctx, foo).set_pure_reg(true);
         let a = tc.ctx.get_const(0x4000, 8).id();
         let call_id = set_call(&mut tc, g_call, foo, vec![a]);
         tc.ctx.add_cfg_edge(g_call, g_cont);
@@ -1061,8 +1061,8 @@ mod tests {
             "
         );
         let _ = g;
-        Function::from_id_mut(&mut tc.ctx, foo).set_input_regs(vec![in_p]);
-        Function::from_id_mut(&mut tc.ctx, foo).set_pure_reg(true);
+        FunctionBody::from_id_mut(&mut tc.ctx, foo).set_input_regs(vec![in_p]);
+        FunctionBody::from_id_mut(&mut tc.ctx, foo).set_pure_reg(true);
         let a = tc.ctx.get_const(0x4000, 8).id();
         let call_id = set_call(&mut tc, g_call, foo, vec![a]);
         tc.ctx.add_cfg_edge(g_call, g_cont);
@@ -1106,8 +1106,8 @@ mod tests {
             "
         );
         let _ = g;
-        Function::from_id_mut(&mut tc.ctx, f1).set_input_regs(vec![in_p]);
-        Function::from_id_mut(&mut tc.ctx, f1).set_pure_reg(true);
+        FunctionBody::from_id_mut(&mut tc.ctx, f1).set_input_regs(vec![in_p]);
+        FunctionBody::from_id_mut(&mut tc.ctx, f1).set_pure_reg(true);
         let a = tc.ctx.get_const(0x4000, 8).id();
         let call_id = set_call(&mut tc, g_call, f1, vec![a]);
         tc.ctx.add_cfg_edge(g_call, g_cont);
@@ -1148,8 +1148,8 @@ mod tests {
         // function whose ABI register list is never filled in, with a one-field
         // register write-set already on `Return::value` (set as the register
         // channel does, since `return at ..` only sets the conventional operand).
-        Function::from_id_mut(&mut tc.ctx, f).set_pure_reg(true);
-        let ret_id = Function::from_id(&tc.ctx, f)
+        FunctionBody::from_id_mut(&mut tc.ctx, f).set_pure_reg(true);
+        let ret_id = FunctionBody::from_id(&tc.ctx, f)
             .iter()
             .find_map(|b| {
                 let last = b.iter().last()?;
@@ -1230,7 +1230,7 @@ mod tests {
         let _ = g;
         // Mark `@RSP` as the incoming stack pointer (origin = the SP register).
         let pid = {
-            let f_ref = Function::from_id(&tc.ctx, f);
+            let f_ref = FunctionBody::from_id(&tc.ctx, f);
             let p = f_ref
                 .root()
                 .unwrap()
@@ -1245,7 +1245,7 @@ mod tests {
         tc.ctx
             .block_param_mut(pid)
             .set_origin_id(ValueId::Varnode(sp_vn).localize(pid.func));
-        Function::from_id_mut(&mut tc.ctx, f).set_pure_reg(true);
+        FunctionBody::from_id_mut(&mut tc.ctx, f).set_pure_reg(true);
 
         let sp_arg = tc.ctx.get_const(0x7000, 8).id();
         let p_arg = tc.ctx.get_const(0x4000, 8).id();
@@ -1309,10 +1309,10 @@ mod tests {
             "
         );
         let _ = g;
-        Function::from_id_mut(&mut tc.ctx, f).set_pure_reg(true);
+        FunctionBody::from_id_mut(&mut tc.ctx, f).set_pure_reg(true);
 
         // Give the return a 1-field register write-set, as the register channel does.
-        let ret_id = Function::from_id(&tc.ctx, f)
+        let ret_id = FunctionBody::from_id(&tc.ctx, f)
             .iter()
             .find_map(|b| {
                 let last = b.iter().last()?;
@@ -1398,8 +1398,8 @@ mod tests {
             "
         );
         let _ = (g, r0, ret_a, ret_b);
-        Function::from_id_mut(&mut tc.ctx, foo).set_input_regs(vec![in_p]);
-        Function::from_id_mut(&mut tc.ctx, foo).set_pure_reg(true);
+        FunctionBody::from_id_mut(&mut tc.ctx, foo).set_input_regs(vec![in_p]);
+        FunctionBody::from_id_mut(&mut tc.ctx, foo).set_pure_reg(true);
         let a = tc.ctx.get_const(0x4000, 8).id();
         let call_id = set_call(&mut tc, g_call, foo, vec![a]);
         tc.ctx.add_cfg_edge(g_call, g_cont);
@@ -1409,7 +1409,7 @@ mod tests {
             "a multi-return function whose write dominates both returns must promote"
         );
         // Both returns now carry a write-set.
-        let returns_with_value = Function::from_id(&tc.ctx, foo)
+        let returns_with_value = FunctionBody::from_id(&tc.ctx, foo)
             .iter()
             .filter(|b| {
                 b.iter().last().is_some_and(
@@ -1457,8 +1457,8 @@ mod tests {
             "
         );
         let _ = (g, r0, wr, skip);
-        Function::from_id_mut(&mut tc.ctx, foo).set_input_regs(vec![in_p]);
-        Function::from_id_mut(&mut tc.ctx, foo).set_pure_reg(true);
+        FunctionBody::from_id_mut(&mut tc.ctx, foo).set_input_regs(vec![in_p]);
+        FunctionBody::from_id_mut(&mut tc.ctx, foo).set_pure_reg(true);
         let a = tc.ctx.get_const(0x4000, 8).id();
         let call_id = set_call(&mut tc, g_call, foo, vec![a]);
         tc.ctx.add_cfg_edge(g_call, g_cont);
@@ -1484,7 +1484,7 @@ mod tests {
     /// The width of the flat register write-set on `fid`'s (first) return: the
     /// field count of the `Tuple` in `Return::value`, or `None` if unset.
     fn register_writeset_len(tc: &qcode::testing::TestContext, fid: FunctionId) -> Option<usize> {
-        let ret = Function::from_id(&tc.ctx, fid).iter().find_map(|b| {
+        let ret = FunctionBody::from_id(&tc.ctx, fid).iter().find_map(|b| {
             let last = b.iter().last()?;
             matches!(last.mnemonic(), Mnemonic::Return(_)).then_some(last.id)
         })?;
@@ -1738,7 +1738,7 @@ mod tests {
         assert!(argpromote_registers(&mut tc.ctx));
 
         // f gained exactly one by-value input param (r0).
-        let root = Function::from_id(&tc.ctx, f).root().unwrap().id;
+        let root = FunctionBody::from_id(&tc.ctx, f).root().unwrap().id;
         assert_eq!(BasicBlock::from_id(&tc.ctx, root).params().count(), 1);
 
         // The call passes that input as one positional argument.
@@ -1772,7 +1772,7 @@ mod tests {
         let _ = (r0, entry, other);
         let eff = scan_register_effects(&tc.ctx, f).expect("written register");
         rewrite_registers(&mut tc.ctx, f, &eff);
-        let with_writeset = Function::from_id(&tc.ctx, f)
+        let with_writeset = FunctionBody::from_id(&tc.ctx, f)
             .iter()
             .filter(|b| {
                 b.iter().last().is_some_and(
@@ -1825,7 +1825,7 @@ mod tests {
         set_call(&mut tc, g_call, f, vec![]);
         tc.ctx.add_cfg_edge(g_call, g_cont);
 
-        let g_root = Function::from_id(&tc.ctx, g).root().unwrap().id;
+        let g_root = FunctionBody::from_id(&tc.ctx, g).root().unwrap().id;
         let run = |ctx: &Context<'_>| -> u64 {
             let mut emu = StandaloneEmulator::new(g_root);
             emu.set_varnode(ctx, r0, 10).unwrap();
@@ -1875,10 +1875,10 @@ mod tests {
         let mut tc = qcode::testing::TestContext::new();
 
         // A clean function: arithmetic over a param, returned through a tuple.
-        let clean = Function::make(&mut tc.ctx, "clean".into()).unwrap().id;
+        let clean = FunctionBody::make(&mut tc.ctx, "clean".into()).unwrap().id;
         let clean_entry = { tc.ctx.get_or_make_block(0x1000, clean) };
         {
-            let mut f = Function::from_id_mut(&mut tc.ctx, clean);
+            let mut f = FunctionBody::from_id_mut(&mut tc.ctx, clean);
             f.set_root(clean_entry).unwrap();
             f.add_block(clean_entry);
         }
@@ -1892,13 +1892,13 @@ mod tests {
             b.push_return(ptr);
             unsafe { b.dont_finalize() };
         }
-        Function::from_id_mut(&mut tc.ctx, clean).set_pure_reg(true);
+        FunctionBody::from_id_mut(&mut tc.ctx, clean).set_pure_reg(true);
 
         // A function that still loads from memory (an untracked value source).
-        let dirty = Function::make(&mut tc.ctx, "dirty".into()).unwrap().id;
+        let dirty = FunctionBody::make(&mut tc.ctx, "dirty".into()).unwrap().id;
         let dirty_entry = { tc.ctx.get_or_make_block(0x3000, dirty) };
         {
-            let mut f = Function::from_id_mut(&mut tc.ctx, dirty);
+            let mut f = FunctionBody::from_id_mut(&mut tc.ctx, dirty);
             f.set_root(dirty_entry).unwrap();
             f.add_block(dirty_entry);
         }
@@ -1912,15 +1912,15 @@ mod tests {
             b.push_return(ptr);
             unsafe { b.dont_finalize() };
         }
-        Function::from_id_mut(&mut tc.ctx, dirty).set_pure_reg(true);
+        FunctionBody::from_id_mut(&mut tc.ctx, dirty).set_pure_reg(true);
 
         assert!(
             mark_pure_functions(&mut tc.ctx),
             "the clean function is newly pure"
         );
-        assert!(Function::from_id(&tc.ctx, clean).is_pure());
+        assert!(FunctionBody::from_id(&tc.ctx, clean).is_pure());
         assert!(
-            !Function::from_id(&tc.ctx, dirty).is_pure(),
+            !FunctionBody::from_id(&tc.ctx, dirty).is_pure(),
             "a function with a residual load must not be marked pure"
         );
 
@@ -1970,8 +1970,8 @@ mod tests {
         );
         let _ = (g, f_head, f_body, f_exit);
 
-        Function::from_id_mut(&mut tc.ctx, f).set_input_regs(vec![input]);
-        Function::from_id_mut(&mut tc.ctx, f).set_pure_reg(true);
+        FunctionBody::from_id_mut(&mut tc.ctx, f).set_input_regs(vec![input]);
+        FunctionBody::from_id_mut(&mut tc.ctx, f).set_pure_reg(true);
         let ptr = tc.ctx.get_const(0x4000, 8).id();
         set_call(&mut tc, g_call, f, vec![ptr]);
         tc.ctx.add_cfg_edge(g_call, g_cont);
@@ -1984,7 +1984,7 @@ mod tests {
         // Step-1 guarantee: no access into the real (default) space remains —
         // every load/store was redirected into the shadow.
         let ram = tc.ctx.shared.default_space;
-        let real_access = Function::from_id(&tc.ctx, f).iter().any(|blk| {
+        let real_access = FunctionBody::from_id(&tc.ctx, f).iter().any(|blk| {
             blk.iter().any(|i| match i.mnemonic() {
                 Mnemonic::Load(l) => l.space == ram,
                 Mnemonic::Store(s) => s.space == ram,
@@ -1997,7 +1997,7 @@ mod tests {
         );
 
         // The callee gains one `Array`-typed by-value snapshot param for the region.
-        let has_array_param = Function::from_id(&tc.ctx, f).root().is_some_and(|b| {
+        let has_array_param = FunctionBody::from_id(&tc.ctx, f).root().is_some_and(|b| {
             b.params()
                 .any(|p| tc.ctx.shared.types.array_of(p.type_id()).is_some())
         });
@@ -2007,7 +2007,7 @@ mod tests {
         );
 
         // The written region rides back out through the return write-set.
-        let returns_value = Function::from_id(&tc.ctx, f).iter().any(|b| {
+        let returns_value = FunctionBody::from_id(&tc.ctx, f).iter().any(|b| {
             b.iter()
                 .last()
                 .is_some_and(|i| matches!(i.mnemonic(), Mnemonic::Return(r) if r.value.is_some()))
@@ -2031,7 +2031,7 @@ mod tests {
             "the region-promoted function should be marked pure"
         );
         assert!(
-            Function::from_id(&tc.ctx, f).is_pure(),
+            FunctionBody::from_id(&tc.ctx, f).is_pure(),
             "f is a deterministic function of its Array input"
         );
 
@@ -2084,8 +2084,8 @@ mod tests {
         );
         let _ = (g, f_head, f_body, f_exit);
 
-        Function::from_id_mut(&mut tc.ctx, f).set_input_regs(vec![input]);
-        Function::from_id_mut(&mut tc.ctx, f).set_pure_reg(true);
+        FunctionBody::from_id_mut(&mut tc.ctx, f).set_input_regs(vec![input]);
+        FunctionBody::from_id_mut(&mut tc.ctx, f).set_pure_reg(true);
         let ptr = tc.ctx.get_const(0x4000, 8).id();
         set_call(&mut tc, g_call, f, vec![ptr]);
         tc.ctx.add_cfg_edge(g_call, g_cont);
@@ -2097,7 +2097,7 @@ mod tests {
 
         // The callee gains one `[i32; 20]` region snapshot param: element width 4
         // (the `*4` stride) and 20 elements (the `[0,20)` index bound).
-        let array = Function::from_id(&tc.ctx, f).root().and_then(|b| {
+        let array = FunctionBody::from_id(&tc.ctx, f).root().and_then(|b| {
             b.params()
                 .find_map(|p| tc.ctx.shared.types.array_of(p.type_id()))
         });
@@ -2111,7 +2111,7 @@ mod tests {
 
         // No real-ram access survives — the strided store is redirected into shadow.
         let ram = tc.ctx.shared.default_space;
-        let real_access = Function::from_id(&tc.ctx, f).iter().any(|blk| {
+        let real_access = FunctionBody::from_id(&tc.ctx, f).iter().any(|blk| {
             blk.iter().any(|i| match i.mnemonic() {
                 Mnemonic::Load(l) => l.space == ram,
                 Mnemonic::Store(s) => s.space == ram,
@@ -2163,8 +2163,8 @@ mod tests {
         );
         let _ = (g, f_loop, f_exit);
 
-        Function::from_id_mut(&mut tc.ctx, f).set_input_regs(vec![input]);
-        Function::from_id_mut(&mut tc.ctx, f).set_pure_reg(true);
+        FunctionBody::from_id_mut(&mut tc.ctx, f).set_input_regs(vec![input]);
+        FunctionBody::from_id_mut(&mut tc.ctx, f).set_pure_reg(true);
         let ptr = tc.ctx.get_const(0x4000, 8).id();
         set_call(&mut tc, g_call, f, vec![ptr]);
         tc.ctx.add_cfg_edge(g_call, g_cont);
@@ -2174,7 +2174,7 @@ mod tests {
             "a single-block self-loop buffer fill should region-promote"
         );
 
-        let has_array_param = Function::from_id(&tc.ctx, f).root().is_some_and(|b| {
+        let has_array_param = FunctionBody::from_id(&tc.ctx, f).root().is_some_and(|b| {
             b.params()
                 .any(|p| tc.ctx.shared.types.array_of(p.type_id()).is_some())
         });
@@ -2227,8 +2227,8 @@ mod tests {
         );
         let _ = (g, f_head, f_body, f_exit);
 
-        Function::from_id_mut(&mut tc.ctx, f).set_input_regs(vec![input]);
-        Function::from_id_mut(&mut tc.ctx, f).set_pure_reg(true);
+        FunctionBody::from_id_mut(&mut tc.ctx, f).set_input_regs(vec![input]);
+        FunctionBody::from_id_mut(&mut tc.ctx, f).set_pure_reg(true);
         let ptr = tc.ctx.get_const(0x4000, 8).id();
         set_call(&mut tc, g_call, f, vec![ptr]);
         tc.ctx.add_cfg_edge(g_call, g_cont);
@@ -2241,7 +2241,7 @@ mod tests {
         // Full shadow path: no real-ram access survives — including the scalar
         // write at offset 0x40, which is redirected into the shadow too.
         let ram = tc.ctx.shared.default_space;
-        let real_access = Function::from_id(&tc.ctx, f).iter().any(|blk| {
+        let real_access = FunctionBody::from_id(&tc.ctx, f).iter().any(|blk| {
             blk.iter().any(|i| match i.mnemonic() {
                 Mnemonic::Load(l) => l.space == ram,
                 Mnemonic::Store(s) => s.space == ram,
@@ -2254,7 +2254,7 @@ mod tests {
         );
 
         // The region still becomes an `Array`-typed by-value snapshot param.
-        let has_array_param = Function::from_id(&tc.ctx, f).root().is_some_and(|b| {
+        let has_array_param = FunctionBody::from_id(&tc.ctx, f).root().is_some_and(|b| {
             b.params()
                 .any(|p| tc.ctx.shared.types.array_of(p.type_id()).is_some())
         });
@@ -2299,8 +2299,8 @@ mod tests {
         );
         let _ = g;
 
-        Function::from_id_mut(&mut tc.ctx, f).set_input_regs(vec![input]);
-        Function::from_id_mut(&mut tc.ctx, f).set_pure_reg(true);
+        FunctionBody::from_id_mut(&mut tc.ctx, f).set_input_regs(vec![input]);
+        FunctionBody::from_id_mut(&mut tc.ctx, f).set_pure_reg(true);
         let ptr = tc.ctx.get_const(0x4000, 8).id();
         let idx = tc.ctx.get_const(0x10, 8).id();
         set_call(&mut tc, g_call, f, vec![ptr, idx]);
@@ -2313,7 +2313,7 @@ mod tests {
         // space. It stays a real-ram load (left for a later round once the index is
         // a constant, or genuinely unpromotable) — never an un-seeded shadow orphan.
         let ram = tc.ctx.shared.default_space;
-        let shadow_load = Function::from_id(&tc.ctx, f).iter().any(|blk| {
+        let shadow_load = FunctionBody::from_id(&tc.ctx, f).iter().any(|blk| {
             blk.iter()
                 .any(|i| matches!(i.mnemonic(), Mnemonic::Load(l) if l.space != ram))
         });
@@ -2323,7 +2323,7 @@ mod tests {
         );
 
         // No `Array` snapshot param was minted for the failed region.
-        let has_array_param = Function::from_id(&tc.ctx, f).root().is_some_and(|b| {
+        let has_array_param = FunctionBody::from_id(&tc.ctx, f).root().is_some_and(|b| {
             b.params()
                 .any(|p| tc.ctx.shared.types.array_of(p.type_id()).is_some())
         });
@@ -2392,7 +2392,7 @@ mod tests {
                 .block_param_mut(inner)
                 .set_origin_id(ValueId::Varnode(sp_reg).localize(inner.func));
         }
-        Function::from_id_mut(&mut tc.ctx, f).set_pure_reg(true);
+        FunctionBody::from_id_mut(&mut tc.ctx, f).set_pure_reg(true);
         let espv = tc.ctx.get_const(0x7000, 8).id();
         let bufp = tc.ctx.get_const(0x9000, 8).id();
         set_call(&mut tc, g_call, f, vec![espv, bufp]);
@@ -2413,7 +2413,7 @@ mod tests {
 
         // The in-loop reload of the buffer pointer is forwarded away: no load of
         // `%slot` survives in the body (the base is now the by-value @bufptr).
-        let slot_reload = Function::from_id(&tc.ctx, f).iter().any(|blk| {
+        let slot_reload = FunctionBody::from_id(&tc.ctx, f).iter().any(|blk| {
             blk.iter().any(|i| {
                 matches!(i.mnemonic(), Mnemonic::Load(l)
                     if l.size == 8 && l.space == tc.ctx.shared.default_space)
@@ -2425,7 +2425,7 @@ mod tests {
         );
 
         // The deref base is now the by-value pointer param directly.
-        let base_is_param = Function::from_id(&tc.ctx, f).iter().any(|b| {
+        let base_is_param = FunctionBody::from_id(&tc.ctx, f).iter().any(|b| {
             b.iter().any(|i| matches!(i.mnemonic(), Mnemonic::Binop(bi)
                 if matches!(bi.op, Binop::Int(IntBinop::Add)) && matches!(bi.lhs, LocalValueId::BlockParam(_))))
         });
@@ -2491,7 +2491,7 @@ mod tests {
                 .block_param_mut(inner)
                 .set_origin_id(ValueId::Varnode(sp_reg).localize(inner.func));
         }
-        Function::from_id_mut(&mut tc.ctx, f).set_pure_reg(true);
+        FunctionBody::from_id_mut(&mut tc.ctx, f).set_pure_reg(true);
         let espv = tc.ctx.get_const(0x7000, 8).id();
         let v0 = tc.ctx.get_const(0x10, 8).id();
         let v4 = tc.ctx.get_const(0x9000, 8).id();
@@ -2506,7 +2506,7 @@ mod tests {
             "region must promote despite the caller-frame seed stores"
         );
         // The buffer region snapshots as an Array param.
-        let has_array_param = Function::from_id(&tc.ctx, f).root().is_some_and(|b| {
+        let has_array_param = FunctionBody::from_id(&tc.ctx, f).root().is_some_and(|b| {
             b.params()
                 .any(|p| tc.ctx.shared.types.array_of(p.type_id()).is_some())
         });
@@ -2526,7 +2526,7 @@ mod tests {
             .unwrap(),
             "the loop should be recognized as a map"
         );
-        let has_map = Function::from_id(&tc.ctx, f)
+        let has_map = FunctionBody::from_id(&tc.ctx, f)
             .iter()
             .any(|b| b.iter().any(|i| matches!(i.mnemonic(), Mnemonic::Map(_))));
         assert!(has_map, "f must contain a map");
@@ -2587,7 +2587,7 @@ mod tests {
                 .block_param_mut(inner)
                 .set_origin_id(ValueId::Varnode(sp_reg).localize(inner.func));
         }
-        Function::from_id_mut(&mut tc.ctx, f).set_pure_reg(true);
+        FunctionBody::from_id_mut(&mut tc.ctx, f).set_pure_reg(true);
         let espv = tc.ctx.get_const(0x7000, 8).id();
         let gpv = tc.ctx.get_const(0x454df8, 8).id();
         let bufp = tc.ctx.get_const(0x9000, 8).id();
@@ -2597,7 +2597,7 @@ mod tests {
         // Without the loaded-pointer assumption the global-slot write blocks the
         // region: it stays on the partial path (no Array param).
         let array_param = |tc: &qcode::testing::TestContext| {
-            Function::from_id(&tc.ctx, f).root().is_some_and(|b| {
+            FunctionBody::from_id(&tc.ctx, f).root().is_some_and(|b| {
                 b.params()
                     .any(|p| tc.ctx.shared.types.array_of(p.type_id()).is_some())
             })
@@ -2676,7 +2676,7 @@ mod tests {
                 .block_param_mut(inner)
                 .set_origin_id(ValueId::Varnode(sp_reg).localize(inner.func));
         }
-        Function::from_id_mut(&mut tc.ctx, f).set_pure_reg(true);
+        FunctionBody::from_id_mut(&mut tc.ctx, f).set_pure_reg(true);
         let espv = tc.ctx.get_const(0x7000, 4).id();
         let gpv = tc.ctx.get_const(0x454df8, 4).id();
         let v0 = tc.ctx.get_const(0x10, 4).id();
@@ -2691,7 +2691,7 @@ mod tests {
             .assume_true(Proposition::LoadedPointerDisjointFromSlot(f));
         argpromote_with_sp(&mut tc.ctx, Some(sp_reg));
 
-        let array_param = Function::from_id(&tc.ctx, f).root().is_some_and(|b| {
+        let array_param = FunctionBody::from_id(&tc.ctx, f).root().is_some_and(|b| {
             b.params()
                 .any(|p| tc.ctx.shared.types.array_of(p.type_id()).is_some())
         });
@@ -2743,8 +2743,8 @@ mod tests {
         );
         let _ = (g, f_head, f_body, f_exit);
 
-        Function::from_id_mut(&mut tc.ctx, f).set_input_regs(vec![input]);
-        Function::from_id_mut(&mut tc.ctx, f).set_pure_reg(true);
+        FunctionBody::from_id_mut(&mut tc.ctx, f).set_input_regs(vec![input]);
+        FunctionBody::from_id_mut(&mut tc.ctx, f).set_pure_reg(true);
         let ptr = tc.ctx.get_const(0x4000, 8).id();
         set_call(&mut tc, g_call, f, vec![ptr]);
         tc.ctx.add_cfg_edge(g_call, g_cont);
@@ -2756,7 +2756,7 @@ mod tests {
             f,
         )
         .unwrap();
-        eprintln!("AFTER ARRAYPROMOTE:\n{}", Function::from_id(&tc.ctx, f));
+        eprintln!("AFTER ARRAYPROMOTE:\n{}", FunctionBody::from_id(&tc.ctx, f));
         assert!(
             crate::test_util::run_function_pass::<crate::calls::loop_to_map::LoopToMap>(
                 &mut tc.ctx,
@@ -2765,10 +2765,10 @@ mod tests {
             .unwrap(),
             "the total-map loop should be recognized"
         );
-        eprintln!("AFTER MAP:\n{}", Function::from_id(&tc.ctx, f));
+        eprintln!("AFTER MAP:\n{}", FunctionBody::from_id(&tc.ctx, f));
 
         // f now contains a `map` whose source is the Array snapshot param.
-        let map_src = Function::from_id(&tc.ctx, f).iter().find_map(|b| {
+        let map_src = FunctionBody::from_id(&tc.ctx, f).iter().find_map(|b| {
             b.iter().find_map(|i| match i.mnemonic() {
                 Mnemonic::Map(m) => Some(m.src),
                 _ => None,
@@ -2785,7 +2785,7 @@ mod tests {
 
         // The returned write-set value is now the map result (the wide shadow
         // reload was forwarded away).
-        let map_val = Function::from_id(&tc.ctx, f)
+        let map_val = FunctionBody::from_id(&tc.ctx, f)
             .iter()
             .find_map(|b| {
                 b.iter().find_map(|i| match i.mnemonic() {
@@ -2794,28 +2794,28 @@ mod tests {
                 })
             })
             .unwrap();
-        let writeset_uses_map = Function::from_id(&tc.ctx, f).iter().any(|b| {
+        let writeset_uses_map = FunctionBody::from_id(&tc.ctx, f).iter().any(|b| {
             b.iter()
                 .any(|i| matches!(i.mnemonic(), Mnemonic::Tuple(t) if t.fields.contains(&map_val)))
         });
         assert!(writeset_uses_map, "write-set value must be the map result");
 
         // The outlined body is a fresh pure function.
-        let has_body = tc
-            .ctx
-            .function_ids()
-            .into_iter()
-            .any(|fid| Function::from_id(&tc.ctx, fid).name().contains("_map_body"));
+        let has_body = tc.ctx.function_ids().into_iter().any(|fid| {
+            FunctionBody::from_id(&tc.ctx, fid)
+                .name()
+                .contains("_map_body")
+        });
         assert!(has_body, "the per-element body was outlined");
 
         // The dead loop is gone: only entry + exit remain, and no shadow access
         // (seed store, RMW, or reload) survives.
         assert_eq!(
-            Function::from_id(&tc.ctx, f).iter().count(),
+            FunctionBody::from_id(&tc.ctx, f).iter().count(),
             2,
             "loop blocks deleted, leaving entry + exit"
         );
-        let any_mem = Function::from_id(&tc.ctx, f).iter().any(|b| {
+        let any_mem = FunctionBody::from_id(&tc.ctx, f).iter().any(|b| {
             b.iter()
                 .any(|i| matches!(i.mnemonic(), Mnemonic::Load(_) | Mnemonic::Store(_)))
         });
@@ -2875,8 +2875,8 @@ mod tests {
         );
         let _ = (g, f_head, f_body, f_exit, f_entry, r);
 
-        Function::from_id_mut(&mut tc.ctx, f).set_input_regs(vec![input]);
-        Function::from_id_mut(&mut tc.ctx, f).set_pure_reg(true);
+        FunctionBody::from_id_mut(&mut tc.ctx, f).set_input_regs(vec![input]);
+        FunctionBody::from_id_mut(&mut tc.ctx, f).set_pure_reg(true);
         let ptr = tc.ctx.get_const(0x4000, 8).id();
         set_call(&mut tc, g_call, f, vec![ptr]);
         tc.ctx.add_cfg_edge(g_call, g_cont);
@@ -2898,7 +2898,7 @@ mod tests {
         );
 
         // f contains a `map` over the Array snapshot for the buffer write-set value.
-        let map_src = Function::from_id(&tc.ctx, f).iter().find_map(|b| {
+        let map_src = FunctionBody::from_id(&tc.ctx, f).iter().find_map(|b| {
             b.iter().find_map(|i| match i.mnemonic() {
                 Mnemonic::Map(m) => Some(m.src),
                 _ => None,
@@ -2918,7 +2918,9 @@ mod tests {
             tc.ctx
                 .function_ids()
                 .into_iter()
-                .any(|fid| Function::from_id(&tc.ctx, fid).name().contains("_map_body")),
+                .any(|fid| FunctionBody::from_id(&tc.ctx, fid)
+                    .name()
+                    .contains("_map_body")),
             "the per-element body was outlined"
         );
 
@@ -2926,10 +2928,10 @@ mod tests {
         // (Contrast `dynamic_index_loop_becomes_map`, where the private loop is
         // deleted down to entry + exit.)
         assert!(
-            Function::from_id(&tc.ctx, f).iter().count() > 2,
+            FunctionBody::from_id(&tc.ctx, f).iter().count() > 2,
             "the residual @acc loop must remain"
         );
-        let has_cbranch = Function::from_id(&tc.ctx, f).iter().any(|b| {
+        let has_cbranch = FunctionBody::from_id(&tc.ctx, f).iter().any(|b| {
             b.iter()
                 .any(|i| matches!(i.mnemonic(), Mnemonic::CBranch(_)))
         });
@@ -2940,7 +2942,7 @@ mod tests {
         // residual loop (which still loads each lane) reads a properly seeded
         // region. (Contrast `dynamic_index_loop_becomes_map`, where the deletable
         // loop is removed and the seed store stripped.)
-        let any_store = Function::from_id(&tc.ctx, f).iter().any(|b| {
+        let any_store = FunctionBody::from_id(&tc.ctx, f).iter().any(|b| {
             b.iter().any(|i| matches!(i.mnemonic(), Mnemonic::Store(s)
                 if matches!(qcode::space::Space::from_id(&tc.ctx, s.space).ty, qcode::space::SpaceType::Temporary)))
         });
@@ -3003,8 +3005,8 @@ mod tests {
         );
         let _ = (g, f_head, f_body, f_exit, f_entry, r);
 
-        Function::from_id_mut(&mut tc.ctx, f).set_input_regs(vec![input]);
-        Function::from_id_mut(&mut tc.ctx, f).set_pure_reg(true);
+        FunctionBody::from_id_mut(&mut tc.ctx, f).set_input_regs(vec![input]);
+        FunctionBody::from_id_mut(&mut tc.ctx, f).set_pure_reg(true);
         let ptr = tc.ctx.get_const(0x4000, 8).id();
         set_call(&mut tc, g_call, f, vec![ptr]);
         tc.ctx.add_cfg_edge(g_call, g_cont);
@@ -3026,19 +3028,19 @@ mod tests {
         );
 
         // A map over the Array snapshot is extracted for the buffer write-set value.
-        let has_map = Function::from_id(&tc.ctx, f)
+        let has_map = FunctionBody::from_id(&tc.ctx, f)
             .iter()
             .any(|b| b.iter().any(|i| matches!(i.mnemonic(), Mnemonic::Map(_))));
         assert!(has_map, "the array channel must be extracted as a map");
 
         // The loop is kept (not deletable — @acc escapes), with its shadow channel
         // left intact so the surviving lane load still reads a seeded region.
-        let has_cbranch = Function::from_id(&tc.ctx, f).iter().any(|b| {
+        let has_cbranch = FunctionBody::from_id(&tc.ctx, f).iter().any(|b| {
             b.iter()
                 .any(|i| matches!(i.mnemonic(), Mnemonic::CBranch(_)))
         });
         assert!(has_cbranch, "the residual @acc loop must remain");
-        let any_store = Function::from_id(&tc.ctx, f).iter().any(|b| {
+        let any_store = FunctionBody::from_id(&tc.ctx, f).iter().any(|b| {
             b.iter().any(|i| matches!(i.mnemonic(), Mnemonic::Store(s)
                 if matches!(qcode::space::Space::from_id(&tc.ctx, s.space).ty, qcode::space::SpaceType::Temporary)))
         });

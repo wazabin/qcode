@@ -65,8 +65,9 @@ impl FunctionPass for RecognizeSimpleLoops {
 
     fn run<'str>(
         &self,
-        f: &mut FunctionBody<'_, 'str>,
+        f: &mut FunctionBody<'str>,
         m: ContextView<'_, 'str>,
+        _next_minted: &mut u32,
     ) -> Result<Outcome<'str>, String> {
         let fid = f.id();
         Ok(Outcome::changed(recognize_simple_loops_host(f, m, fid)))
@@ -84,8 +85,9 @@ impl FunctionPass for UnrollSimpleLoops {
 
     fn run<'str>(
         &self,
-        f: &mut FunctionBody<'_, 'str>,
+        f: &mut FunctionBody<'str>,
         m: ContextView<'_, 'str>,
+        _next_minted: &mut u32,
     ) -> Result<Outcome<'str>, String> {
         let fid = f.id();
         Ok(Outcome::changed(unroll_simple_loops_host(f, m, fid)))
@@ -97,18 +99,18 @@ crate::register_function_pass!(UnrollSimpleLoops);
 /// Concrete `FunctionBody`/`ContextView` version of [`recognize_simple_loops`]
 /// (stage 5b).
 pub fn recognize_simple_loops_host<'a, 'str>(
-    body: &'a mut FunctionBody<'_, 'str>,
+    body: &'a mut FunctionBody<'str>,
     cx: ContextView<'a, 'str>,
     fun_id: FunctionId,
 ) -> bool {
-    let Some(analysis) = LoopAnalysis::compute(body.read_host(cx), fun_id) else {
+    let Some(analysis) = LoopAnalysis::compute(cx.read_host(body), fun_id) else {
         return false;
     };
     let block_ids = analysis.block_ids();
     let recognized = analysis
         .backedges
         .iter()
-        .filter_map(|&edge| recognize_simple_loop(body.read_host(cx), &analysis, edge))
+        .filter_map(|&edge| recognize_simple_loop(cx.read_host(body), &analysis, edge))
         .fold(
             HashMap::<BlockId, Vec<SimpleLoop>>::default(),
             |mut acc, lp| {
@@ -121,9 +123,13 @@ pub fn recognize_simple_loops_host<'a, 'str>(
         .iter()
         .map(|&block| {
             let loop_comment = recognized.get(&block).and_then(|loops| {
-                (loops.len() == 1).then(|| format_loop_comment(body.read_host(cx), &loops[0]))
+                (loops.len() == 1).then(|| format_loop_comment(cx.read_host(body), &loops[0]))
             });
-            let current = body.block_ref(cx, block).comment().map(str::to_owned);
+            let current = cx
+                .read_host(body)
+                .block_ref(block)
+                .comment()
+                .map(str::to_owned);
             (
                 block,
                 merge_loop_comment(current.as_deref(), loop_comment.as_deref()),
@@ -133,11 +139,15 @@ pub fn recognize_simple_loops_host<'a, 'str>(
 
     let mut changed = false;
     for (block, comment) in updates {
-        let current = body.block_ref(cx, block).comment().map(str::to_owned);
+        let current = cx
+            .read_host(body)
+            .block_ref(block)
+            .comment()
+            .map(str::to_owned);
         if current != comment {
             // TODO(5b-ii): `BaseRef::set_comment` is not mirrored on
             // `FunctionBody`; go through a temporary host.
-            let mut host = body.host(cx);
+            let mut host = cx.host(body);
             BaseRef::new(host.reborrow(), block).set_comment(comment);
             changed = true;
         }
@@ -148,11 +158,11 @@ pub fn recognize_simple_loops_host<'a, 'str>(
 /// Concrete `FunctionBody`/`ContextView` version of [`unroll_simple_loops`]
 /// (stage 5b).
 pub fn unroll_simple_loops_host<'a, 'str>(
-    body: &'a mut FunctionBody<'_, 'str>,
+    body: &'a mut FunctionBody<'str>,
     cx: ContextView<'a, 'str>,
     fun_id: FunctionId,
 ) -> bool {
-    let Some(analysis) = LoopAnalysis::compute(body.read_host(cx), fun_id) else {
+    let Some(analysis) = LoopAnalysis::compute(cx.read_host(body), fun_id) else {
         return false;
     };
 
@@ -160,14 +170,14 @@ pub fn unroll_simple_loops_host<'a, 'str>(
         .backedges
         .iter()
         .filter_map(|&edge| {
-            let lp = recognize_simple_loop(body.read_host(cx), &analysis, edge)?;
+            let lp = recognize_simple_loop(cx.read_host(body), &analysis, edge)?;
             (lp.iterations < MAX_UNROLL_ITERATIONS).then_some((edge, lp))
         })
         .collect::<Vec<_>>();
 
     let mut changed = false;
     for (edge, lp) in candidates {
-        let Some(plan) = UnrollPlan::build(body.read_host(cx), &analysis, edge, lp) else {
+        let Some(plan) = UnrollPlan::build(cx.read_host(body), &analysis, edge, lp) else {
             continue;
         };
         if apply_unroll_plan(body, cx, plan) {
@@ -232,7 +242,7 @@ impl UnrollPlan {
 }
 
 fn apply_unroll_plan<'a, 'str>(
-    body: &'a mut FunctionBody<'_, 'str>,
+    body: &'a mut FunctionBody<'str>,
     cx: ContextView<'a, 'str>,
     plan: UnrollPlan,
 ) -> bool {
@@ -242,14 +252,14 @@ fn apply_unroll_plan<'a, 'str>(
     let mut created_blocks = Vec::new();
 
     for iteration in 0..plan.lp.iterations {
-        let mut value_map = header_value_map(body.read_host(cx), plan.lp.header, &carried);
+        let mut value_map = header_value_map(cx.read_host(body), plan.lp.header, &carried);
 
         for (path_index, &old_block) in plan.path.iter().enumerate() {
-            let new_block = body.make_block(cx);
+            let new_block = body.make_block();
             {
                 // TODO(5b-ii): `BaseRef::rename_local` is not mirrored on
                 // `FunctionBody`; go through a temporary host.
-                let mut host = body.host(cx);
+                let mut host = cx.host(body);
                 let _ = BaseRef::new(host.reborrow(), new_block).rename_local(
                     format!(
                         "unroll_{:x}_{iteration}_{path_index}",
@@ -265,25 +275,33 @@ fn apply_unroll_plan<'a, 'str>(
                 replace_terminator_with_branch(body, cx, previous, new_block, Vec::new());
             }
 
-            let old_insns = body.block_ref(cx, old_block).instruction_ids().to_vec();
+            let old_insns = cx
+                .read_host(body)
+                .block_ref(old_block)
+                .instruction_ids()
+                .to_vec();
             let Some((&terminator, body_insns)) = old_insns.split_last() else {
                 return false;
             };
 
             for old_insn in body_insns.iter().copied() {
                 let (type_id, mnemonic) = {
-                    let old_ref = body.insn_ref(cx, old_insn);
+                    let old_ref = cx.read_host(body).insn_ref(old_insn);
                     (
                         old_ref.type_id(),
                         remap_mnemonic(old_ref.mnemonic(), &value_map),
                     )
                 };
-                let new_insn = body.push_mnemonic_with_type(cx, mnemonic, type_id);
-                let insert_at = body.block_ref(cx, new_block).instruction_ids().len();
+                let new_insn = body.push_mnemonic_with_type(mnemonic, type_id);
+                let insert_at = cx
+                    .read_host(body)
+                    .block_ref(new_block)
+                    .instruction_ids()
+                    .len();
                 {
                     // TODO(5b-ii): `BaseRef::insert_insn_at_index` is not mirrored
                     // on `FunctionBody`; go through a temporary host.
-                    let mut host = body.host(cx);
+                    let mut host = cx.host(body);
                     BaseRef::new(host.reborrow(), new_block)
                         .insert_insn_at_index(insert_at, new_insn);
                 }
@@ -296,7 +314,7 @@ fn apply_unroll_plan<'a, 'str>(
             let is_latch = path_index + 1 == plan.path.len();
             if is_latch {
                 let Some(next_carried) = remapped_branch_args_to(
-                    body.read_host(cx),
+                    cx.read_host(body),
                     terminator,
                     plan.lp.header,
                     &value_map,
@@ -317,7 +335,7 @@ fn apply_unroll_plan<'a, 'str>(
     } else {
         remap_values(
             &plan.exit_args,
-            &header_value_map(body.read_host(cx), plan.lp.header, &plan.preheader_args),
+            &header_value_map(cx.read_host(body), plan.lp.header, &plan.preheader_args),
         )
     };
     replace_terminator_with_branch(body, cx, plan.preheader, final_target, preheader_args);
@@ -325,7 +343,7 @@ fn apply_unroll_plan<'a, 'str>(
     if let Some(last_new_block) = previous_new_block {
         let exit_args = remap_values(
             &plan.exit_args,
-            &header_value_map(body.read_host(cx), plan.lp.header, &carried),
+            &header_value_map(cx.read_host(body), plan.lp.header, &carried),
         );
         replace_terminator_with_branch(body, cx, last_new_block, plan.exit, exit_args);
     }
@@ -338,17 +356,18 @@ fn apply_unroll_plan<'a, 'str>(
     // order, each param's value at loop exit (the last latch's args; the initial
     // values when the loop ran zero times). Uses inside the about-to-be-deleted loop
     // blocks are rewritten too, harmlessly.
-    let header_params: Vec<BlockParamId> = body
-        .block_ref(cx, plan.lp.header)
+    let header_params: Vec<BlockParamId> = cx
+        .read_host(body)
+        .block_ref(plan.lp.header)
         .params()
         .map(|param| param.id)
         .collect();
     for (&param, &final_value) in header_params.iter().zip(carried.iter()) {
-        body.replace_all_uses_with(cx, ValueId::BlockParam(param), final_value);
+        body.replace_all_uses_with(ValueId::BlockParam(param), final_value);
     }
 
     for block in plan.loop_nodes {
-        body.delete_block(cx, block);
+        body.delete_block(block);
     }
 
     !created_blocks.is_empty() || plan.lp.iterations == 0
@@ -495,19 +514,20 @@ fn remap_mnemonic(mnemonic: &Mnemonic, value_map: &HashMap<ValueId, ValueId>) ->
 }
 
 pub(crate) fn replace_terminator_with_branch<'a, 'str>(
-    body: &'a mut FunctionBody<'_, 'str>,
+    body: &'a mut FunctionBody<'str>,
     cx: ContextView<'a, 'str>,
     block: BlockId,
     target: BlockId,
     args: Vec<ValueId>,
 ) {
-    let old_successors = body
-        .block_ref(cx, block)
+    let old_successors = cx
+        .read_host(body)
+        .block_ref(block)
         .successors()
         .map(|(edge, _)| edge)
         .collect::<Vec<_>>();
     for edge in old_successors {
-        body.remove_cfg_edge(cx, edge);
+        body.remove_cfg_edge(edge);
     }
 
     // Reuse the existing terminator only if the block actually ends in one. The
@@ -516,12 +536,13 @@ pub(crate) fn replace_terminator_with_branch<'a, 'str>(
     // increment), which must not be clobbered into the branch — doing so destroys
     // that value and, when it is the exit argument, yields a branch that passes
     // itself. In that case append the branch instead.
-    let term_id = body
-        .block_ref(cx, block)
+    let term_id = cx
+        .read_host(body)
+        .block_ref(block)
         .instruction_ids()
         .last()
         .copied()
-        .filter(|&id| body.insn_ref(cx, id).mnemonic().is_terminator());
+        .filter(|&id| cx.read_host(body).insn_ref(id).mnemonic().is_terminator());
     let local_target = target.localize(block.func);
     let args: Vec<_> = args
         .into_iter()
@@ -529,7 +550,6 @@ pub(crate) fn replace_terminator_with_branch<'a, 'str>(
         .collect();
     if let Some(term_id) = term_id {
         body.replace_instruction_mnemonic(
-            cx,
             term_id,
             Mnemonic::Branch(Branch {
                 target: local_target,
@@ -538,22 +558,22 @@ pub(crate) fn replace_terminator_with_branch<'a, 'str>(
         );
     } else {
         let branch = body.push_mnemonic(
-            cx,
+            cx.shr(),
             Mnemonic::Branch(Branch {
                 target: local_target,
                 args,
             }),
             0,
         );
-        let end = body.block_ref(cx, block).instruction_ids().len();
+        let end = cx.read_host(body).block_ref(block).instruction_ids().len();
         {
             // TODO(5b-ii): `BaseRef::insert_insn_at_index` is not mirrored on
             // `FunctionBody`; go through a temporary host.
-            let mut host = body.host(cx);
+            let mut host = cx.host(body);
             BaseRef::new(host.reborrow(), block).insert_insn_at_index(end, branch);
         }
     }
-    body.add_cfg_edge(cx, block, target);
+    body.add_cfg_edge(block, target);
 }
 
 /// `&mut Context` twin of [`replace_terminator_with_branch`], kept for dce's
@@ -957,7 +977,7 @@ fn merge_loop_comment(existing: Option<&str>, loop_comment: Option<&str>) -> Opt
 mod tests {
     use qcode::{
         context::Context,
-        value::{BasicBlock, Function},
+        value::{BasicBlock, FunctionBody},
     };
     use qcode_macro::qcode;
 
@@ -1163,7 +1183,7 @@ mod tests {
 
         assert!(run_function_pass::<UnrollSimpleLoops>(&mut ctx, test).unwrap());
 
-        let blocks = Function::from_id(&ctx, test)
+        let blocks = FunctionBody::from_id(&ctx, test)
             .iter()
             .map(|block| block.id)
             .collect::<Vec<_>>();
@@ -1201,14 +1221,14 @@ mod tests {
 
         assert!(run_function_pass::<UnrollSimpleLoops>(&mut ctx, test).unwrap());
 
-        let blocks = Function::from_id(&ctx, test)
+        let blocks = FunctionBody::from_id(&ctx, test)
             .iter()
             .map(|block| block.id)
             .collect::<Vec<_>>();
         assert!(!blocks.contains(&header));
         assert!(!blocks.contains(&body));
 
-        let stores = Function::from_id(&ctx, test)
+        let stores = FunctionBody::from_id(&ctx, test)
             .iter()
             .flat_map(|block| block.instruction_ids().to_vec())
             .filter(|&insn| {
@@ -1271,7 +1291,7 @@ mod tests {
         // live-out use must be rewritten to the incoming value, never left dangling
         // on the removed exit param.
         let _ = run_function_pass::<crate::cfg::SimplifyCfg>(&mut ctx, test);
-        let defined: rustc_hash::FxHashSet<ValueId> = Function::from_id(&ctx, test)
+        let defined: rustc_hash::FxHashSet<ValueId> = FunctionBody::from_id(&ctx, test)
             .iter()
             .flat_map(|b| {
                 b.params()
@@ -1280,7 +1300,7 @@ mod tests {
                     .collect::<Vec<_>>()
             })
             .collect();
-        for insn in Function::from_id(&ctx, test)
+        for insn in FunctionBody::from_id(&ctx, test)
             .iter()
             .flat_map(|b| b.instruction_ids().to_vec())
         {
@@ -1298,7 +1318,7 @@ mod tests {
     /// Asserts no instruction in `fid` references a value (instruction or block
     /// param) that is not defined anywhere in the function — i.e. no dangling use.
     fn assert_no_dangling(ctx: &Context, fid: FunctionId) {
-        let defined: rustc_hash::FxHashSet<ValueId> = Function::from_id(ctx, fid)
+        let defined: rustc_hash::FxHashSet<ValueId> = FunctionBody::from_id(ctx, fid)
             .iter()
             .flat_map(|b| {
                 b.params()
@@ -1307,7 +1327,7 @@ mod tests {
                     .collect::<Vec<_>>()
             })
             .collect();
-        for insn in Function::from_id(ctx, fid)
+        for insn in FunctionBody::from_id(ctx, fid)
             .iter()
             .flat_map(|b| b.instruction_ids().to_vec())
         {
@@ -1375,7 +1395,7 @@ mod tests {
         );
 
         assert!(!run_function_pass::<UnrollSimpleLoops>(&mut ctx, test).unwrap());
-        let blocks = Function::from_id(&ctx, test)
+        let blocks = FunctionBody::from_id(&ctx, test)
             .iter()
             .map(|block| block.id)
             .collect::<Vec<_>>();

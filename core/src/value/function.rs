@@ -71,14 +71,19 @@ pub struct FunctionInterface<'str> {
 /// [`Context::interfaces`](crate::context::Context::interfaces)
 /// under the same [`FunctionId`].
 #[derive(Clone, serde::Serialize, serde::Deserialize)]
-pub struct Function<'str> {
+pub struct FunctionBody<'str> {
     /// Immutable identity of this body in the lockstep function registries.
+    ///
+    /// This field is deliberately absent from the serialized body wire shape.
+    /// Bodies are serialized and deserialized as part of [`Context`], whose
+    /// custom deserializer restores the registry key here. Standalone body
+    /// deserialization therefore does not establish a usable identity.
     #[serde(skip)]
     id: FunctionId,
 
     /// The entry block (dominates all other blocks in this function).
-    /// Private: read via [`Function::root_id`], write via
-    /// [`Function::set_root_id`] (stage 6a §11).
+    /// Private: read via [`FunctionBody::root_id`], write via
+    /// [`FunctionBody::set_root_id`] (stage 6a §11).
     root: Option<LocalBlockId>,
 
     /// Instruction storage for this function. Function-scoped: the composite
@@ -160,7 +165,7 @@ impl<'str> FunctionInterface<'str> {
     }
 }
 
-impl<'str> Function<'str> {
+impl<'str> FunctionBody<'str> {
     /// Rebind the temporary ambient function ID used while constructing a
     /// detached body to its installed registry ID.
     ///
@@ -237,11 +242,27 @@ impl<'str> Function<'str> {
 
     /// This function's instructions that use `value` as an operand (see
     /// [`users`](Self::users)). Empty for a value this function never uses.
-    pub fn users_of(&self, value: ValueId) -> &[LocalInsnId] {
+    pub(crate) fn local_users_of(&self, value: ValueId) -> &[LocalInsnId] {
         self.users
             .get(&value.strip_func())
             .map(Vec::as_slice)
             .unwrap_or(&[])
+    }
+
+    /// This body's qualified instruction IDs that use `value`. A value owned by
+    /// another function has no users in this body, even if its local index
+    /// collides with one of this body's values.
+    pub fn users_of(&self, value: ValueId) -> Vec<InstructionId> {
+        if value
+            .owning_function()
+            .is_some_and(|owner| owner != self.id)
+        {
+            return Vec::new();
+        }
+        self.local_users_of(value)
+            .iter()
+            .map(|&local| InstructionId::new(self.id, local))
+            .collect()
     }
 
     /// Iterate this function's recorded `(value, users)` reverse-use entries, with
@@ -278,26 +299,38 @@ impl<'str> Function<'str> {
 
     /// The block `id`, by its function-local index (see the note above).
     pub fn block(&self, id: BlockId) -> &BasicBlock<'str> {
+        assert_eq!(id.func, self.id, "block belongs to another function");
         &self.blocks[id.local]
     }
     /// The block `id`, mutably.
     pub fn block_mut(&mut self, id: BlockId) -> &mut BasicBlock<'str> {
+        assert_eq!(id.func, self.id, "block belongs to another function");
         &mut self.blocks[id.local]
     }
     /// The instruction `id`, by its function-local index.
     pub fn insn(&self, id: InstructionId) -> &Instruction<'str> {
+        assert_eq!(id.func, self.id, "instruction belongs to another function");
         &self.insns[id.local]
     }
     /// The instruction `id`, mutably.
     pub fn insn_mut(&mut self, id: InstructionId) -> &mut Instruction<'str> {
+        assert_eq!(id.func, self.id, "instruction belongs to another function");
         &mut self.insns[id.local]
     }
     /// The block parameter `id`, by its function-local index.
     pub fn block_param(&self, id: BlockParamId) -> &BlockParam<'str> {
+        assert_eq!(
+            id.func, self.id,
+            "block parameter belongs to another function"
+        );
         &self.params[id.local]
     }
     /// The block parameter `id`, mutably.
     pub fn block_param_mut(&mut self, id: BlockParamId) -> &mut BlockParam<'str> {
+        assert_eq!(
+            id.func, self.id,
+            "block parameter belongs to another function"
+        );
         &mut self.params[id.local]
     }
     /// The CFG edge `id`, by its function-local index.
@@ -420,11 +453,17 @@ impl<'str> Function<'str> {
         let Some(func) = old.owning_function() else {
             return;
         };
-        let users: Vec<_> = self
-            .users_of(old)
-            .iter()
-            .map(|&local| InstructionId::new(func, local))
-            .collect();
+        assert_eq!(
+            func, self.id,
+            "cannot replace uses of a value owned by another function"
+        );
+        if let Some(new_owner) = new.owning_function() {
+            assert_eq!(
+                new_owner, self.id,
+                "cannot replace uses with a value owned by another function"
+            );
+        }
+        let users = self.users_of(old);
         let old = old.localize(func);
         let new = new.localize(func);
         for user in users {
@@ -696,14 +735,14 @@ impl<'str> Function<'str> {
     ) -> Option<FunctionRef<'str, 'ctx>> {
         ctx.get_named(name)
             .and_then(ValueId::as_function)
-            .map(|id| Function::from_id(ctx, id))
+            .map(|id| FunctionBody::from_id(ctx, id))
     }
 
     /// Gets a reference to a function by address
     pub fn from_addr<'ctx>(ctx: &'ctx Context<'str>, addr: u64) -> Option<FunctionRef<'str, 'ctx>> {
         ctx.get_at_addr(&addr)
             .and_then(ValueId::as_function)
-            .map(|id| Function::from_id(ctx, id))
+            .map(|id| FunctionBody::from_id(ctx, id))
     }
 
     /// Gets a mutable reference to a function by address
@@ -724,7 +763,7 @@ impl<'str> Function<'str> {
         let id = FunctionId::from(ctx.bodies.len());
         let pushed = ctx.push_function(
             FunctionInterface::new(name.clone()),
-            Function::empty_body(id),
+            FunctionBody::empty_body(id),
         );
         debug_assert_eq!(pushed, id);
         ctx.update_name(name, id.into(), None)?;
@@ -757,7 +796,7 @@ impl<'str> Function<'str> {
         let id = FunctionId::from(ctx.bodies.len());
         let pushed = ctx.push_function(
             FunctionInterface::new(name.clone()),
-            Function::empty_body(id),
+            FunctionBody::empty_body(id),
         );
         debug_assert_eq!(pushed, id);
 
@@ -768,7 +807,7 @@ impl<'str> Function<'str> {
             .expect("Function address is not unique")
     }
 
-    /// Like [`Function::make_at_addr`] but marks the result as external.
+    /// Like [`FunctionBody::make_at_addr`] but marks the result as external.
     ///
     /// External functions have no lifted body; the recursive disassembler will
     /// not try to explore them.
@@ -798,7 +837,7 @@ impl<'s, 'ctx: 's, 'str: 'ctx, Ctx> BaseRef<Ctx, FunctionId>
 where
     Self: WithHost<'s, 'ctx, 'str>,
 {
-    fn inner(&'s self) -> &'ctx Function<'str> {
+    fn inner(&'s self) -> &'ctx FunctionBody<'str> {
         self.host().function(self.id)
     }
 
@@ -828,22 +867,18 @@ where
     }
 
     /// This function's instructions that use `value` as an operand. See
-    /// [`Function::users_of`]; this is the function-scoped read every pass wants
+    /// [`FunctionBody::users_of`]; this is the function-scoped read every pass wants
     /// for an SSA value (all its users are intra-function).
     pub fn users_of(&'s self, value: ValueId) -> Vec<InstructionId> {
         let func = self.id;
         if value.owning_function().is_some_and(|owner| owner != func) {
             return Vec::new();
         }
-        self.inner()
-            .users_of(value)
-            .iter()
-            .map(|&local| InstructionId::new(func, local))
-            .collect()
+        self.inner().users_of(value)
     }
 
     /// Iterate this function's recorded `(value, users)` reverse-use entries
-    /// (see [`Function::user_map_entries`]).
+    /// (see [`FunctionBody::user_map_entries`]).
     pub fn user_map_entries(&'s self) -> impl Iterator<Item = (ValueId, Vec<InstructionId>)> + 's {
         let func = self.id;
         self.inner().user_map_entries().map(move |(v, u)| {
@@ -857,7 +892,7 @@ where
     }
 
     /// Resolve a block/instruction/param `name` within this function's local name
-    /// table (see [`Function::names`]). `None` if this function has no such name.
+    /// table (see [`FunctionBody::names`]). `None` if this function has no such name.
     pub fn local_named(&'s self, name: &str) -> Option<ValueId> {
         self.inner().names.get(name)
     }
@@ -1092,7 +1127,7 @@ where
             ctx.shared
                 .values
                 .synthetic_callees_of(self.id)
-                .filter_map(|addr| Function::from_addr(ctx, addr).map(|function| function.id)),
+                .filter_map(|addr| FunctionBody::from_addr(ctx, addr).map(|function| function.id)),
         );
         callees.sort_by_key(|&id| Into::<usize>::into(id));
         callees.dedup();
@@ -1252,7 +1287,7 @@ where
 ///
 /// Returns `None` for a fall-through branch within the same function, a branch
 /// into the middle of another function (not a call), or any non-`Branch`
-/// terminator. Shared by [`Function::callees`] and [`Function::callers`] so both
+/// terminator. Shared by [`FunctionBody::callees`] and [`FunctionBody::callers`] so both
 /// directions of the graph agree on what counts as a tail-call edge.
 fn tail_call_target(ctx: &Context, block: BlockId) -> Option<FunctionId> {
     let block = BasicBlock::from_id(ctx, block);
@@ -1381,7 +1416,7 @@ impl<'str, 'ctx> Renameable<'str, 'ctx> for FunctionMutRef<'str, 'ctx> {
 }
 
 impl<'str, 'ctx> FunctionMutRef<'str, 'ctx> {
-    pub(crate) fn inner_mut(&mut self) -> &mut Function<'str> {
+    pub(crate) fn inner_mut(&mut self) -> &mut FunctionBody<'str> {
         &mut self.ctx.bodies[self.id]
     }
 
@@ -1668,8 +1703,10 @@ mod tests {
 
     fn foreign_block_fixture() -> (Context<'static>, FunctionId, BlockId) {
         let mut ctx = Context::new();
-        let owner = Function::make(&mut ctx, "block_owner".into()).unwrap().id;
-        let destination = Function::make(&mut ctx, "block_destination".into())
+        let owner = FunctionBody::make(&mut ctx, "block_owner".into())
+            .unwrap()
+            .id;
+        let destination = FunctionBody::make(&mut ctx, "block_destination".into())
             .unwrap()
             .id;
         let block = BasicBlock::make(&mut ctx, owner).id;
@@ -1679,24 +1716,32 @@ mod tests {
     #[test]
     fn raw_root_and_roster_are_local_while_refs_qualify_per_function() {
         let mut ctx = Context::new();
-        let a = Function::make(&mut ctx, "local_root_a".into()).unwrap().id;
-        let b = Function::make(&mut ctx, "local_root_b".into()).unwrap().id;
+        let a = FunctionBody::make(&mut ctx, "local_root_a".into())
+            .unwrap()
+            .id;
+        let b = FunctionBody::make(&mut ctx, "local_root_b".into())
+            .unwrap()
+            .id;
         let a_root = BasicBlock::make(&mut ctx, a).id;
         let b_root = BasicBlock::make(&mut ctx, b).id;
         assert_eq!(a_root.local, b_root.local, "arena-local ids should collide");
-        Function::from_id_mut(&mut ctx, a).set_root(a_root).unwrap();
-        Function::from_id_mut(&mut ctx, b).set_root(b_root).unwrap();
+        FunctionBody::from_id_mut(&mut ctx, a)
+            .set_root(a_root)
+            .unwrap();
+        FunctionBody::from_id_mut(&mut ctx, b)
+            .set_root(b_root)
+            .unwrap();
 
         assert_eq!(ctx.bodies[a].root_id(), Some(a_root.local));
         assert_eq!(ctx.bodies[b].root_id(), Some(b_root.local));
         assert_eq!(ctx.bodies[a].roster, vec![a_root.local]);
         assert_eq!(ctx.bodies[b].roster, vec![b_root.local]);
         assert_eq!(
-            Function::from_id(&ctx, a).root().map(|root| root.id),
+            FunctionBody::from_id(&ctx, a).root().map(|root| root.id),
             Some(a_root)
         );
         assert_eq!(
-            Function::from_id(&ctx, b).root().map(|root| root.id),
+            FunctionBody::from_id(&ctx, b).root().map(|root| root.id),
             Some(b_root)
         );
     }
@@ -1705,14 +1750,14 @@ mod tests {
     #[should_panic(expected = "cannot add a block stored in another function arena")]
     fn add_block_rejects_foreign_storage() {
         let (mut ctx, destination, block) = foreign_block_fixture();
-        Function::from_id_mut(&mut ctx, destination).add_block(block);
+        FunctionBody::from_id_mut(&mut ctx, destination).add_block(block);
     }
 
     #[test]
     #[should_panic(expected = "cannot root a function at a block stored in another function arena")]
     fn set_root_rejects_foreign_storage() {
         let (mut ctx, destination, block) = foreign_block_fixture();
-        Function::from_id_mut(&mut ctx, destination)
+        FunctionBody::from_id_mut(&mut ctx, destination)
             .set_root(block)
             .unwrap();
     }
@@ -1721,7 +1766,7 @@ mod tests {
     #[should_panic(expected = "cannot ensure a function root from another function arena")]
     fn ensure_root_rejects_foreign_storage() {
         let (mut ctx, destination, block) = foreign_block_fixture();
-        Function::from_id_mut(&mut ctx, destination)
+        FunctionBody::from_id_mut(&mut ctx, destination)
             .ensure_root(block)
             .unwrap();
     }
@@ -1765,6 +1810,99 @@ mod tests {
         assert!(!FunctionRef::from_id(&ctx, users_b).users_of(one).is_empty());
     }
 
+    fn colliding_body_ids() -> (
+        Context<'static>,
+        FunctionId,
+        FunctionId,
+        BlockId,
+        BlockId,
+        InstructionId,
+        InstructionId,
+        BlockParamId,
+        BlockParamId,
+    ) {
+        let mut ctx = Context::new();
+        qcode!(
+            ctx,
+            "
+            fn raw_a:
+                <a_entry @a:i64>
+                    %a_def = i64 1 + i64 2;
+                    return at %a_def;
+            fn raw_b:
+                <b_entry @b:i64>
+                    %b_def = i64 1 + i64 2;
+                    return at %b_def;
+            "
+        );
+        let a_root = FunctionRef::from_id(&ctx, raw_a).root().unwrap();
+        let b_root = FunctionRef::from_id(&ctx, raw_b).root().unwrap();
+        let a_block = a_root.id;
+        let b_block = b_root.id;
+        let a_insn = a_root.instruction_ids()[0];
+        let b_insn = b_root.instruction_ids()[0];
+        let a_param = a_root.params().next().unwrap().id;
+        let b_param = b_root.params().next().unwrap().id;
+        assert_eq!(a_block.local, b_block.local);
+        assert_eq!(a_insn.local, b_insn.local);
+        assert_eq!(a_param.local, b_param.local);
+        (
+            ctx, raw_a, raw_b, a_block, b_block, a_insn, b_insn, a_param, b_param,
+        )
+    }
+
+    #[test]
+    fn body_users_of_rejects_foreign_owned_values() {
+        let (ctx, a, b, _, _, a_insn, _, _, _) = colliding_body_ids();
+        assert!(
+            ctx.bodies[b]
+                .users_of(ValueId::Instruction(a_insn))
+                .is_empty()
+        );
+        assert!(
+            !ctx.bodies[a]
+                .users_of(ValueId::Instruction(a_insn))
+                .is_empty()
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "cannot replace uses of a value owned by another function")]
+    fn body_replace_uses_rejects_foreign_old() {
+        let (mut ctx, _, b, _, _, a_insn, b_insn, _, _) = colliding_body_ids();
+        ctx.bodies[b]
+            .replace_all_uses_with(ValueId::Instruction(a_insn), ValueId::Instruction(b_insn));
+    }
+
+    #[test]
+    #[should_panic(expected = "cannot replace uses with a value owned by another function")]
+    fn body_replace_uses_rejects_foreign_new() {
+        let (mut ctx, _, b, _, _, a_insn, b_insn, _, _) = colliding_body_ids();
+        ctx.bodies[b]
+            .replace_all_uses_with(ValueId::Instruction(b_insn), ValueId::Instruction(a_insn));
+    }
+
+    #[test]
+    #[should_panic(expected = "block belongs to another function")]
+    fn body_block_access_rejects_colliding_foreign_id() {
+        let (ctx, _, b, a_block, _, _, _, _, _) = colliding_body_ids();
+        let _ = ctx.bodies[b].block(a_block);
+    }
+
+    #[test]
+    #[should_panic(expected = "instruction belongs to another function")]
+    fn body_insn_access_rejects_colliding_foreign_id() {
+        let (ctx, _, b, _, _, a_insn, _, _, _) = colliding_body_ids();
+        let _ = ctx.bodies[b].insn(a_insn);
+    }
+
+    #[test]
+    #[should_panic(expected = "block parameter belongs to another function")]
+    fn body_param_access_rejects_colliding_foreign_id() {
+        let (ctx, _, b, _, _, _, _, a_param, _) = colliding_body_ids();
+        let _ = ctx.bodies[b].block_param(a_param);
+    }
+
     /// A tail call into another function is a call edge in both directions of the
     /// graph, even though the IR has no `Call` (strict IR locality: an inter-
     /// procedural transfer is a `TailCall(FunctionId)`, never a foreign `Branch`).
@@ -1775,38 +1913,38 @@ mod tests {
         let mut ctx = Context::new();
 
         // Callee at 0x2000: a single block that returns.
-        let callee = Function::make_at_addr(&mut ctx, 0x2000, None).id;
+        let callee = FunctionBody::make_at_addr(&mut ctx, 0x2000, None).id;
         let callee_entry = BasicBlock::make(&mut ctx, callee).with_address(0x2000).id;
         let zero = ctx.get_const(0, 8).id();
         Builder::from_block(BasicBlock::from_id_mut(&mut ctx, callee_entry)).push_return(zero);
-        Function::from_id_mut(&mut ctx, callee)
+        FunctionBody::from_id_mut(&mut ctx, callee)
             .set_root(callee_entry)
             .unwrap();
 
         // Thunk at 0x1000: a lone `TailCall` into the callee.
-        let thunk = Function::make_at_addr(&mut ctx, 0x1000, None).id;
+        let thunk = FunctionBody::make_at_addr(&mut ctx, 0x1000, None).id;
         let thunk_entry = BasicBlock::make(&mut ctx, thunk).with_address(0x1000).id;
         Builder::from_block(BasicBlock::from_id_mut(&mut ctx, thunk_entry)).push_tail_call(callee);
-        Function::from_id_mut(&mut ctx, thunk)
+        FunctionBody::from_id_mut(&mut ctx, thunk)
             .set_root(thunk_entry)
             .unwrap();
 
-        assert_eq!(Function::from_id(&ctx, thunk).callees(), vec![callee]);
-        assert_eq!(Function::from_id(&ctx, callee).callers(), vec![thunk]);
+        assert_eq!(FunctionBody::from_id(&ctx, thunk).callees(), vec![callee]);
+        assert_eq!(FunctionBody::from_id(&ctx, callee).callers(), vec![thunk]);
     }
 
     #[test]
     fn make_function_creates_function_with_correct_name_root_address() {
         let mut ctx = Context::new();
-        let f = Function::make(&mut ctx, "main".into()).unwrap();
+        let f = FunctionBody::make(&mut ctx, "main".into()).unwrap();
         assert_eq!(f.name(), "main");
     }
 
     #[test]
     fn get_function_by_name_returns_correct_function() {
         let mut ctx = Context::new();
-        let id = Function::make(&mut ctx, "foo".into()).unwrap().id();
-        let f = Function::from_name(&ctx, "foo").unwrap();
+        let id = FunctionBody::make(&mut ctx, "foo".into()).unwrap().id();
+        let f = FunctionBody::from_name(&ctx, "foo").unwrap();
         assert_eq!(f.id(), id);
         assert_eq!(f.name(), "foo");
     }
@@ -1814,14 +1952,14 @@ mod tests {
     #[test]
     fn get_function_by_name_returns_none_if_not_found() {
         let ctx = Context::new();
-        assert!(Function::from_name(&ctx, "nonexistent").is_none());
+        assert!(FunctionBody::from_name(&ctx, "nonexistent").is_none());
     }
 
     #[test]
     fn get_function_by_addr_returns_correct_function() {
         let mut ctx = Context::new();
-        let id = Function::make_at_addr(&mut ctx, 0x2000, None).id();
-        let f = Function::from_addr(&ctx, 0x2000).unwrap();
+        let id = FunctionBody::make_at_addr(&mut ctx, 0x2000, None).id();
+        let f = FunctionBody::from_addr(&ctx, 0x2000).unwrap();
         assert_eq!(f.id(), id);
         assert_eq!(f.address(), Some(0x2000));
         assert_eq!(f.name(), "fn_2000");
@@ -1830,17 +1968,17 @@ mod tests {
     #[test]
     fn get_function_by_addr_returns_none_if_missing() {
         let ctx = Context::new();
-        assert!(Function::from_addr(&ctx, 0xdeadbeef).is_none());
+        assert!(FunctionBody::from_addr(&ctx, 0xdeadbeef).is_none());
     }
 
     #[test]
     fn add_block_via_function_mut_ref_updates_blocks_list() {
         let mut ctx = Context::new();
-        let baz_id = Function::make(&mut ctx, "baz".into()).unwrap().id;
+        let baz_id = FunctionBody::make(&mut ctx, "baz".into()).unwrap().id;
         let root = BasicBlock::make(&mut ctx, baz_id).id;
         let extra = BasicBlock::make(&mut ctx, baz_id).id;
 
-        let mut baz = Function::from_id_mut(&mut ctx, baz_id);
+        let mut baz = FunctionBody::from_id_mut(&mut ctx, baz_id);
         baz.add_block(root);
         baz.add_block(extra);
 
@@ -1852,9 +1990,9 @@ mod tests {
     #[test]
     fn display_shows_function_name_and_block_contents() {
         let mut ctx = Context::new();
-        Function::make(&mut ctx, "display_test".into()).unwrap();
+        FunctionBody::make(&mut ctx, "display_test".into()).unwrap();
 
-        let f = Function::from_name(&ctx, "display_test").unwrap();
+        let f = FunctionBody::from_name(&ctx, "display_test").unwrap();
 
         let s = f.to_string();
         assert!(s.contains("fn display_test:"));
@@ -1863,14 +2001,14 @@ mod tests {
     #[test]
     fn iter_yields_all_blocks() {
         let mut ctx = Context::new();
-        let f_id = Function::make(&mut ctx, "iter_fn".into()).unwrap().id;
+        let f_id = FunctionBody::make(&mut ctx, "iter_fn".into()).unwrap().id;
         let root = BasicBlock::make(&mut ctx, f_id).id;
         let extra = BasicBlock::make(&mut ctx, f_id).id;
-        let mut f = Function::from_id_mut(&mut ctx, f_id);
+        let mut f = FunctionBody::from_id_mut(&mut ctx, f_id);
         f.add_block(root);
         f.add_block(extra);
 
-        let f = Function::from_name(&ctx, "iter_fn").unwrap();
+        let f = FunctionBody::from_name(&ctx, "iter_fn").unwrap();
         let ids: Vec<_> = f.iter().map(|b| b.id).collect();
         assert!(ids.contains(&root));
         assert!(ids.contains(&extra));
@@ -1879,14 +2017,16 @@ mod tests {
     #[test]
     fn into_iterator_for_function_ref_matches_iter() {
         let mut ctx = Context::new();
-        let f_id = Function::make(&mut ctx, "into_iter_fn".into()).unwrap().id;
+        let f_id = FunctionBody::make(&mut ctx, "into_iter_fn".into())
+            .unwrap()
+            .id;
         let b1 = BasicBlock::make(&mut ctx, f_id).id;
         let b2 = BasicBlock::make(&mut ctx, f_id).id;
-        let mut f = Function::from_id_mut(&mut ctx, f_id);
+        let mut f = FunctionBody::from_id_mut(&mut ctx, f_id);
         f.add_block(b1);
         f.add_block(b2);
 
-        let f = Function::from_name(&ctx, "into_iter_fn").unwrap();
+        let f = FunctionBody::from_name(&ctx, "into_iter_fn").unwrap();
         let mut via_iter: Vec<usize> = f.iter().map(|b| usize::from(b.id.local)).collect();
         let mut via_into: Vec<usize> = (&f).into_iter().map(|b| usize::from(b.id.local)).collect();
         via_iter.sort();
@@ -1906,7 +2046,7 @@ mod tests {
             "
         );
 
-        let f = Function::from_name(&ctx, "simple").unwrap();
+        let f = FunctionBody::from_name(&ctx, "simple").unwrap();
         assert_eq!(f.name(), "simple");
         assert!(f.root().is_some());
         assert_eq!(f.root().unwrap().name().unwrap(), "entry");
@@ -1931,7 +2071,7 @@ mod tests {
             "
         );
 
-        let f = Function::from_name(&ctx, "multiblock").unwrap();
+        let f = FunctionBody::from_name(&ctx, "multiblock").unwrap();
         assert_eq!(f.root().unwrap().name().unwrap(), "bb1");
         let block_names: Vec<_> = f.blocks().filter_map(|b| b.name()).collect();
         assert!(block_names.contains(&"bb1"), "missing bb1");
@@ -1952,7 +2092,7 @@ mod tests {
             "
         );
 
-        let by_name = Function::from_name(&ctx, "myfn").unwrap();
+        let by_name = FunctionBody::from_name(&ctx, "myfn").unwrap();
         assert_eq!(by_name.name(), "myfn");
     }
 
@@ -1975,11 +2115,11 @@ mod tests {
 
         // Registering a function at the same address succeeds, but Path A does
         // not permit its root/roster to reference the anonymous block's arena.
-        let fn_id = Function::make_at_addr(&mut ctx, 0x1000, None).id;
+        let fn_id = FunctionBody::make_at_addr(&mut ctx, 0x1000, None).id;
 
         // The function wins in the address map.
-        assert!(Function::from_addr(&ctx, 0x1000).is_some());
-        assert!(Function::from_id(&ctx, fn_id).root().is_none());
+        assert!(FunctionBody::from_addr(&ctx, 0x1000).is_some());
+        assert!(FunctionBody::from_id(&ctx, fn_id).root().is_none());
         assert_ne!(block_id.func, fn_id);
     }
 }

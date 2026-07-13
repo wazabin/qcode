@@ -29,7 +29,7 @@ use std::fmt::{Debug, Display, Formatter};
 /// SSA is intra-function, so every instruction/block/param/edge handle carries
 /// the owning function plus a function-local index. Unlike the `Identifier`
 /// newtypes these do **not** index a global `Registry` — they route through the
-/// owning [`Function`]'s arena. Derived `Ord` compares `func` then `local`.
+/// owning [`FunctionBody`]'s arena. Derived `Ord` compares `func` then `local`.
 #[macro_export]
 macro_rules! composite_id {
     ($name:ident, $local:ty) => {
@@ -94,7 +94,9 @@ pub use bytes::{
     Bytes, BytesDisplay, BytesId, BytesRef, StringEncoding, decode_string, escape_decoded,
     render_bytes_literal,
 };
-pub use function::{Function, FunctionId, FunctionKind, FunctionMutRef, FunctionRef, ParamAttrs};
+pub use function::{
+    FunctionBody, FunctionId, FunctionKind, FunctionMutRef, FunctionRef, ParamAttrs,
+};
 pub use insn::LocalInsnId;
 pub use insn::{Instruction, InstructionId, InstructionRef};
 pub use literal::{LiteralId, LiteralRef};
@@ -141,7 +143,7 @@ pub enum ValueId {
     BlockParam(BlockParamId),
     /// A named memory location ([`Varnode`]) such as a register or global.
     Varnode(VarnodeId),
-    /// A lifted or external [`Function`].
+    /// A lifted or external [`FunctionBody`].
     Function(FunctionId),
 }
 
@@ -162,7 +164,7 @@ impl ValueId {
     /// (an [`Instruction`] result or a [`BlockParam`]). Shared values (literals,
     /// bytes, varnodes) and functions/blocks return `None` — they have no single
     /// owning function and their per-function use-lists live in each using
-    /// function's [`users`](crate::value::function::Function::users) map.
+    /// function's [`users`](crate::value::function::FunctionBody::users) map.
     pub fn owning_function(self) -> Option<FunctionId> {
         match self {
             ValueId::Instruction(id) => Some(id.func),
@@ -357,7 +359,7 @@ pub enum LocalValueId {
     BlockParam(LocalParamId),
     /// A named memory location ([`Varnode`]) (module id; same as `ValueId`).
     Varnode(VarnodeId),
-    /// A lifted or external [`Function`] (module id; same as `ValueId`).
+    /// A lifted or external [`FunctionBody`] (module id; same as `ValueId`).
     Function(FunctionId),
 }
 
@@ -548,7 +550,7 @@ impl<'str, 'ctx> ValueRef<'str, 'ctx> {
                 ValueRef::BlockParam(BlockParam::from_id(ctx, param_id))
             }
             ValueId::Varnode(var_id) => ValueRef::Varnode(Varnode::from_id(ctx, var_id)),
-            ValueId::Function(fn_id) => ValueRef::Function(Function::from_id(ctx, fn_id)),
+            ValueId::Function(fn_id) => ValueRef::Function(FunctionBody::from_id(ctx, fn_id)),
         }
     }
 

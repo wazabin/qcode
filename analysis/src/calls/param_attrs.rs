@@ -14,7 +14,7 @@
 //! block params by construction (see [`interface`](super::interface)), the
 //! fixpoint edge — "argument `j` flows into callee param `j`" — is a plain index
 //! lookup. External callees contribute their C-prototype attributes (read-only
-//! from `const` pointees) through the same [`Function::param_attr`] channel.
+//! from `const` pointees) through the same [`FunctionBody::param_attr`] channel.
 //!
 //! **`nocapture` has no consumer yet.** Only `readonly` is read today (by
 //! `mem_forward`'s call-kill). `nocapture` is inferred here because the
@@ -26,7 +26,7 @@ use rustc_hash::FxHashMap as HashMap;
 
 use qcode::{
     context::Context,
-    value::{Function, FunctionId, ParamAttrs, ValueId, insn::Mnemonic},
+    value::{FunctionBody, FunctionId, ParamAttrs, ValueId, insn::Mnemonic},
 };
 
 use crate::{Pass, PipelineEnv};
@@ -46,7 +46,7 @@ pub fn infer_param_attrs(ctx: &mut Context) -> bool {
         .function_ids()
         .into_iter()
         .filter_map(|fid| {
-            let f = Function::from_id(ctx, fid);
+            let f = FunctionBody::from_id(ctx, fid);
             if f.is_external() || !f.is_pure_reg() {
                 return None;
             }
@@ -81,13 +81,13 @@ pub fn infer_param_attrs(ctx: &mut Context) -> bool {
     // Commit.
     let mut changed = false;
     for (fid, vec) in attrs {
-        let prev = Function::from_id(ctx, fid)
+        let prev = FunctionBody::from_id(ctx, fid)
             .param_attrs()
             .map(|a| a.to_vec());
         if prev.as_deref() != Some(vec.as_slice()) {
             changed = true;
         }
-        Function::from_id_mut(ctx, fid).set_param_attrs(vec);
+        FunctionBody::from_id_mut(ctx, fid).set_param_attrs(vec);
     }
     changed
 }
@@ -110,7 +110,7 @@ fn compute_function_attrs(
 
     // 2. Sinks: walk every instruction and revoke bits for the params whose
     //    derived values reach a write / capture / escape.
-    for block in Function::from_id(ctx, fid).iter() {
+    for block in FunctionBody::from_id(ctx, fid).iter() {
         for insn in block.iter() {
             let func = insn.id.func;
             match insn.mnemonic() {
@@ -182,7 +182,7 @@ fn compute_function_attrs(
 fn compute_taint(ctx: &Context, fid: FunctionId, n_params: usize) -> HashMap<ValueId, Mask> {
     let mut taint: HashMap<ValueId, Mask> = HashMap::default();
 
-    if let Some(root) = Function::from_id(ctx, fid).root() {
+    if let Some(root) = FunctionBody::from_id(ctx, fid).root() {
         for (i, param) in root.params().enumerate().take(n_params) {
             taint.insert(ValueId::BlockParam(param.id), 1 << i);
         }
@@ -193,7 +193,7 @@ fn compute_taint(ctx: &Context, fid: FunctionId, n_params: usize) -> HashMap<Val
     let mut changed = true;
     while changed {
         changed = false;
-        for block in Function::from_id(ctx, fid).iter() {
+        for block in FunctionBody::from_id(ctx, fid).iter() {
             for insn in block.iter() {
                 if insn.size() == 0 || matches!(insn.mnemonic(), Mnemonic::Load(_)) {
                     continue;
@@ -232,8 +232,8 @@ fn propagate_block_params(
 ) -> bool {
     use qcode::value::BasicBlock;
     let mut changed = false;
-    let root = Function::from_id(ctx, fid).root().map(|b| b.id);
-    for block in Function::from_id(ctx, fid).iter() {
+    let root = FunctionBody::from_id(ctx, fid).root().map(|b| b.id);
+    for block in FunctionBody::from_id(ctx, fid).iter() {
         if Some(block.id) == root {
             continue;
         }
@@ -318,7 +318,7 @@ fn callee_param_attr(
     if let Some(v) = attrs.get(&target) {
         return v.get(j).copied();
     }
-    Function::from_id(ctx, target).param_attr(j)
+    FunctionBody::from_id(ctx, target).param_attr(j)
 }
 
 fn revoke_readonly(result: &mut [ParamAttrs], mask: Mask) {
@@ -369,7 +369,7 @@ mod tests {
         builder::Builder,
         testing::TestContext,
         value::{
-            BasicBlock, Function, Value,
+            BasicBlock, FunctionBody, Value,
             insn::{Call, CallInd},
         },
     };
@@ -384,9 +384,9 @@ mod tests {
         nparams: usize,
         body: impl FnOnce(&mut Builder<'static, '_>, &[ValueId]),
     ) -> FunctionId {
-        let fid = Function::make(&mut tc.ctx, name.into()).unwrap().id;
+        let fid = FunctionBody::make(&mut tc.ctx, name.into()).unwrap().id;
         let block = { tc.ctx.get_or_make_block(addr, fid) };
-        Function::from_id_mut(&mut tc.ctx, fid)
+        FunctionBody::from_id_mut(&mut tc.ctx, fid)
             .set_root(block)
             .unwrap();
         let mut params = Vec::new();
@@ -398,7 +398,7 @@ mod tests {
         body(&mut b, &params);
         unsafe { b.dont_finalize() };
         drop(b);
-        Function::from_id_mut(&mut tc.ctx, fid).set_pure_reg(true);
+        FunctionBody::from_id_mut(&mut tc.ctx, fid).set_pure_reg(true);
         fid
     }
 
@@ -428,7 +428,7 @@ mod tests {
             b.push_store(v, p[0], ram);
         });
         infer_param_attrs(&mut tc.ctx);
-        let a = Function::from_id(&tc.ctx, f).param_attr(0).unwrap();
+        let a = FunctionBody::from_id(&tc.ctx, f).param_attr(0).unwrap();
         assert!(!a.readonly, "a store through the param writes through it");
         assert!(a.nocapture, "the param value itself is never stored");
     }
@@ -443,8 +443,8 @@ mod tests {
             b.push_store(p[1], p[0], ram);
         });
         infer_param_attrs(&mut tc.ctx);
-        let dst = Function::from_id(&tc.ctx, f).param_attr(0).unwrap();
-        let p = Function::from_id(&tc.ctx, f).param_attr(1).unwrap();
+        let dst = FunctionBody::from_id(&tc.ctx, f).param_attr(0).unwrap();
+        let p = FunctionBody::from_id(&tc.ctx, f).param_attr(1).unwrap();
         assert!(!dst.readonly, "dst is a store address");
         assert!(dst.nocapture, "dst is not itself stored");
         assert!(p.readonly, "p is never a store address");
@@ -461,7 +461,7 @@ mod tests {
             b.push_return(x);
         });
         infer_param_attrs(&mut tc.ctx);
-        let a = Function::from_id(&tc.ctx, f).param_attr(0).unwrap();
+        let a = FunctionBody::from_id(&tc.ctx, f).param_attr(0).unwrap();
         assert!(a.readonly && a.nocapture, "a pure read revokes nothing");
     }
 
@@ -484,7 +484,9 @@ mod tests {
         set_call_args(&mut tc, cid, callee, vec![p0]);
 
         infer_param_attrs(&mut tc.ctx);
-        let a = Function::from_id(&tc.ctx, caller).param_attr(0).unwrap();
+        let a = FunctionBody::from_id(&tc.ctx, caller)
+            .param_attr(0)
+            .unwrap();
         assert!(
             a.readonly && a.nocapture,
             "forwarding into a readonly+nocapture param preserves both"
@@ -508,7 +510,9 @@ mod tests {
         set_call_args(&mut tc, cid, callee, vec![p0]);
 
         infer_param_attrs(&mut tc.ctx);
-        let a = Function::from_id(&tc.ctx, caller).param_attr(0).unwrap();
+        let a = FunctionBody::from_id(&tc.ctx, caller)
+            .param_attr(0)
+            .unwrap();
         assert!(
             !a.readonly,
             "forwarding into a non-readonly callee param revokes readonly"
@@ -537,7 +541,7 @@ mod tests {
             }),
         );
         infer_param_attrs(&mut tc.ctx);
-        let a = Function::from_id(&tc.ctx, f).param_attr(0).unwrap();
+        let a = FunctionBody::from_id(&tc.ctx, f).param_attr(0).unwrap();
         assert!(
             !a.readonly && !a.nocapture,
             "an argument escaping through an indirect call revokes both bits"
@@ -547,7 +551,7 @@ mod tests {
     // --- small helpers over the built IR ---
 
     fn call_insn(tc: &TestContext, fid: FunctionId) -> qcode::value::InstructionId {
-        Function::from_id(&tc.ctx, fid)
+        FunctionBody::from_id(&tc.ctx, fid)
             .blocks()
             .flat_map(|b| b.iter().map(|i| i.id).collect::<Vec<_>>())
             .find(|&id| {
@@ -560,7 +564,7 @@ mod tests {
     }
 
     fn root_param(tc: &TestContext, fid: FunctionId, index: usize) -> ValueId {
-        let pid = Function::from_id(&tc.ctx, fid)
+        let pid = FunctionBody::from_id(&tc.ctx, fid)
             .root()
             .unwrap()
             .params()

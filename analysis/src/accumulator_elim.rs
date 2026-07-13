@@ -68,7 +68,6 @@ pub struct AccumulatorElim;
 
 impl FunctionPass for AccumulatorElim {
     const NAME: &'static str = "accumulator_elim";
-    const MINTS: bool = true;
 
     fn description(&self) -> &'static str {
         "Eliminate loop-carried accumulators by returning them as a tuple"
@@ -76,11 +75,12 @@ impl FunctionPass for AccumulatorElim {
 
     fn run<'str>(
         &self,
-        f: &mut FunctionBody<'_, 'str>,
+        f: &mut FunctionBody<'str>,
         m: ContextView<'_, 'str>,
+        next_minted: &mut u32,
     ) -> Result<Outcome<'str>, String> {
         let mut minted = Vec::new();
-        let changed = accumulator_elim(m, f, &mut minted);
+        let changed = accumulator_elim(m, f, next_minted, &mut minted);
         Ok(Outcome {
             changed,
             rename: None,
@@ -93,14 +93,15 @@ register_function_pass!(AccumulatorElim);
 
 pub fn accumulator_elim<'str>(
     m: ContextView<'_, 'str>,
-    body: &mut FunctionBody<'_, 'str>,
+    body: &mut FunctionBody<'str>,
+    next_minted: &mut u32,
     minted: &mut Vec<Minted<'str>>,
 ) -> bool {
     let host = body.id();
-    let Some((model, plan)) = classify(body.read_host(m), host) else {
+    let Some((model, plan)) = classify(m.read_host(body), host) else {
         return false;
     };
-    transform(m, body, minted, &model, &plan);
+    transform(m, body, next_minted, minted, &model, &plan);
     true
 }
 
@@ -280,17 +281,20 @@ struct Plan {
 
 fn transform<'str>(
     m: ContextView<'_, 'str>,
-    body: &mut FunctionBody<'_, 'str>,
+    body: &mut FunctionBody<'str>,
+    next_minted: &mut u32,
     minted_out: &mut Vec<Minted<'str>>,
     model: &crate::loop_to_recursion::LoopModel,
     p: &Plan,
 ) {
     let host_fid = body.id();
-    let base_name = format!("{}_acc", body.read_host(m).function_ref(host_fid).name());
+    let base_name = format!("{}_acc", m.read_host(body).function_ref(host_fid).name());
     // Mint the driver-only recursive lambda (name buffered raw; the driver
     // uniquifies it at the barrier). Keep the placeholder in every reference;
     // the install barrier patches it to the materialized function id.
-    let g = body.mint_function(
+    let g = crate::pipeline::mint_function(
+        body,
+        next_minted,
         minted_out,
         Cow::Owned(base_name.clone()),
         FunctionKind::Lambda,
@@ -299,7 +303,7 @@ fn transform<'str>(
 
     // --- Build the lambda body: read the host expressions, write the minted one.
     let tuple_ty = {
-        let (own, mut minted) = body.host_with_minted(minted_out, m, g);
+        let (own, mut minted) = crate::pipeline::host_with_minted(body, minted_out, m, g);
 
         // Three fresh blocks: header (root, drivers in), base case, recursive case.
         let g_head = minted.make_block(host_fid);
@@ -428,13 +432,13 @@ fn transform<'str>(
 
     // --- Host: seed g and project the original return value out of the tuple.
     let root = model.root;
-    if let Some(term) = block_terminator(body.read_host(m), root) {
-        body.remove_instruction(m, term);
+    if let Some(term) = block_terminator(m.read_host(body), root) {
+        body.remove_instruction(term);
     }
     let driver_init: Vec<ValueId> = p.d_slots.iter().map(|&i| model.init_args[i]).collect();
     // TODO(5b-ii): the seeding below runs on a temporary host because
     // `push_typed`/`clone_self` stay generic for the minted `PassBacking` path.
-    let mut host = body.host(m);
+    let mut host = m.host(body);
     // `apply g(driver_init)` typed explicitly (g uninstalled), then unpack each
     // accumulator field the original return reads.
     let t = push_typed(
@@ -481,7 +485,7 @@ fn transform<'str>(
 
     // The original loop region is now unreachable from the host; delete it.
     for &b in &model.region {
-        body.delete_block(m, b);
+        body.delete_block(b);
     }
 }
 
@@ -676,14 +680,14 @@ fn const_at_size(shared: &qcode::context::Shared, val: ValueId, size: usize) -> 
 mod tests {
     use super::*;
     use qcode::context::Context;
-    use qcode::value::{Function, Instruction};
+    use qcode::value::{FunctionBody, Instruction};
     use qcode_emulator::{SizedValue, StandaloneEmulator};
     use qcode_macro::qcode;
 
     use crate::test_util::run_function_pass;
 
     fn run(ctx: &Context, fun: FunctionId, n: u64) -> Option<u64> {
-        let root = Function::from_id(ctx, fun).root().expect("root").id;
+        let root = FunctionBody::from_id(ctx, fun).root().expect("root").id;
         let term = block_terminator(HostRef::Module(ctx), root)?;
         let ret = match Instruction::from_id(ctx, term).mnemonic() {
             Mnemonic::ReturnValue(r) => r.value.qualify(term.func),
@@ -721,7 +725,7 @@ mod tests {
 
         assert!(run_function_pass::<AccumulatorElim>(&mut ctx, fib_loop).unwrap());
 
-        let g = Function::from_name(&ctx, "fib_loop_acc").expect("accumulator lambda exists");
+        let g = FunctionBody::from_name(&ctx, "fib_loop_acc").expect("accumulator lambda exists");
         assert!(g.is_lambda());
         // Driver-only interface: one parameter instead of three.
         let g_root = g.root().expect("g root");

@@ -12,7 +12,7 @@
 use cabi::{AbiTarget, CFunctionProto, CType};
 use qcode::{
     context::{Context, TargetOs},
-    value::{Function, FunctionId, ParamAttrs, VarnodeId},
+    value::{FunctionBody, FunctionId, ParamAttrs, VarnodeId},
 };
 
 use crate::pipeline::CallingConvention;
@@ -158,12 +158,12 @@ pub fn apply_external_signature(
     if !abi_is_known(abi) {
         return; // no convention for this architecture
     }
-    if !Function::from_id(ctx, fun_id).is_external() {
+    if !FunctionBody::from_id(ctx, fun_id).is_external() {
         return;
     }
     // Import stubs are named like `printf@plt` or `printf@GLIBC_2.2.5`; the C
     // symbol is the part before the first `@`.
-    let raw = Function::from_id(ctx, fun_id).name().to_string();
+    let raw = FunctionBody::from_id(ctx, fun_id).name().to_string();
     let name = raw.split('@').next().unwrap_or(&raw);
     let Some(proto) = cabi::lookup(target, name) else {
         return;
@@ -172,7 +172,7 @@ pub fn apply_external_signature(
         return;
     };
 
-    let mut f = Function::from_id_mut(ctx, fun_id);
+    let mut f = FunctionBody::from_id_mut(ctx, fun_id);
     // Legacy ABI register list, kept for the external/conventional path this
     // function serves (a C prototype); pure_reg callees use block params instead.
     #[allow(deprecated)]
@@ -223,7 +223,7 @@ mod tests {
     use crate::pipeline::GpReg;
     use qcode::{
         testing::TestContext,
-        value::{Function, VarnodeId},
+        value::{FunctionBody, VarnodeId},
     };
 
     /// A toy convention over the TestContext registers: two GP arg registers
@@ -242,7 +242,7 @@ mod tests {
     }
 
     fn external(tc: &mut TestContext, name: &str) -> FunctionId {
-        Function::make_external(&mut tc.ctx, 0x9000, Some(name.to_string().into())).id
+        FunctionBody::make_external(&mut tc.ctx, 0x9000, Some(name.to_string().into())).id
     }
 
     /// The cabi table extracted for this build host (where the libc symbols the
@@ -264,10 +264,10 @@ mod tests {
         let f = external(&mut tc, "memcpy");
         apply_external_signature(&mut tc.ctx, f, &abi, host());
         // Only two GP registers exist in the toy ABI; the third arg is stack.
-        let inputs = Function::from_id(&tc.ctx, f).input_regs().unwrap();
+        let inputs = FunctionBody::from_id(&tc.ctx, f).input_regs().unwrap();
         assert_eq!(inputs, [tc.r0, tc.r1]);
         // memcpy returns void* -> the integer return register.
-        let outputs = Function::from_id(&tc.ctx, f)
+        let outputs = FunctionBody::from_id(&tc.ctx, f)
             .signature()
             .unwrap()
             .outputs
@@ -284,7 +284,7 @@ mod tests {
         let abi = toy_abi(&tc);
         let f = external(&mut tc, "memcpy");
         apply_external_signature(&mut tc.ctx, f, &abi, host());
-        let func = Function::from_id(&tc.ctx, f);
+        let func = FunctionBody::from_id(&tc.ctx, f);
         assert!(
             !func.param_attr(0).unwrap().readonly,
             "dst is written through → not readonly"
@@ -307,7 +307,7 @@ mod tests {
         let abi = toy_abi(&tc);
         let f = external(&mut tc, "pow");
         apply_external_signature(&mut tc.ctx, f, &abi, host());
-        let inputs = Function::from_id(&tc.ctx, f).input_regs().unwrap();
+        let inputs = FunctionBody::from_id(&tc.ctx, f).input_regs().unwrap();
         assert_eq!(inputs, [tc.r2]);
     }
 
@@ -317,7 +317,7 @@ mod tests {
         let abi = toy_abi(&tc);
         let f = external(&mut tc, "definitely_not_a_libc_function_xyz");
         apply_external_signature(&mut tc.ctx, f, &abi, host());
-        assert!(Function::from_id(&tc.ctx, f).signature().is_none());
+        assert!(FunctionBody::from_id(&tc.ctx, f).signature().is_none());
     }
 
     #[test]
@@ -325,6 +325,6 @@ mod tests {
         let mut tc = TestContext::new();
         let f = external(&mut tc, "memcpy");
         apply_external_signature(&mut tc.ctx, f, &CallingConvention::default(), host());
-        assert!(Function::from_id(&tc.ctx, f).signature().is_none());
+        assert!(FunctionBody::from_id(&tc.ctx, f).signature().is_none());
     }
 }

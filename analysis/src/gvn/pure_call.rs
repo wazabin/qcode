@@ -3,7 +3,7 @@
 //!
 //! When an `extract(call_result, i)` projects field `i` of a [`Call`] to a
 //! **pure** function (one argpromote has fully functionalized — see
-//! [`Function::is_pure`]), and that field's value depends only on call arguments
+//! [`FunctionBody::is_pure`]), and that field's value depends only on call arguments
 //! that are constant literals, the field is computed by emulating the callee and
 //! the `extract` is replaced with the resulting literal. See
 //! `PURE_EMULATION_DESIGN.md`.
@@ -19,7 +19,7 @@ use rustc_hash::FxHashSet as HashSet;
 use qcode::{
     context::Context,
     value::{
-        Function, ValueId,
+        FunctionBody, ValueId,
         insn::{Call, Extract, Mnemonic, Tuple},
     },
 };
@@ -74,7 +74,7 @@ impl<'str> ModuleSubPass<'str> for PureCall {
         let Some(target) = target.real() else {
             return Claim::Pass;
         };
-        if !Function::from_id(ctx, target).is_pure() {
+        if !FunctionBody::from_id(ctx, target).is_pure() {
             return Claim::Pass;
         }
 
@@ -100,7 +100,7 @@ impl<'str> ModuleSubPass<'str> for PureCall {
 
         // Build the positional argument vector: literal value, or poison (0) for a
         // symbolic argument the projection has proven irrelevant to this field.
-        let Some(root) = Function::from_id(&*ctx, target)
+        let Some(root) = FunctionBody::from_id(&*ctx, target)
             .root()
             .map(|block| block.id)
         else {
@@ -172,7 +172,7 @@ mod tests {
         builder::Builder,
         testing::TestContext,
         value::{
-            BasicBlock, Function, LocalValueId,
+            BasicBlock, FunctionBody, LocalValueId,
             function::{FunctionId, FunctionSignature},
             insn::{Return, Store},
         },
@@ -180,10 +180,10 @@ mod tests {
 
     /// Build pure `foo(a, b) = (a, b*69 + 42)` and mark it `is_pure`.
     fn build_pure_foo(tc: &mut TestContext) -> FunctionId {
-        let fid = Function::make(&mut tc.ctx, "foo".into()).unwrap().id;
+        let fid = FunctionBody::make(&mut tc.ctx, "foo".into()).unwrap().id;
         let entry = tc.ctx.get_or_make_block(0x1000, fid);
         {
-            let mut f = Function::from_id_mut(&mut tc.ctx, fid);
+            let mut f = FunctionBody::from_id_mut(&mut tc.ctx, fid);
             f.set_root(entry).unwrap();
             f.add_block(entry);
         }
@@ -211,7 +211,7 @@ mod tests {
                 value: Some(tuple.localize(fid)),
             }),
         );
-        Function::from_id_mut(&mut tc.ctx, fid).set_signature(FunctionSignature {
+        FunctionBody::from_id_mut(&mut tc.ctx, fid).set_signature(FunctionSignature {
             pure_reg: true,
             is_pure: true,
             ..Default::default()
@@ -234,11 +234,11 @@ mod tests {
                 .types
                 .get_or_make_aggregate(vec![i64_ty, i64_ty])
         };
-        let gid = Function::make(&mut tc.ctx, "g".into()).unwrap().id;
+        let gid = FunctionBody::make(&mut tc.ctx, "g".into()).unwrap().id;
         let entry = tc.ctx.get_or_make_block(0x4000, gid);
         let cont = tc.ctx.get_or_make_block(0x4100, gid);
         {
-            let mut f = Function::from_id_mut(&mut tc.ctx, gid);
+            let mut f = FunctionBody::from_id_mut(&mut tc.ctx, gid);
             f.set_root(entry).unwrap();
             f.add_block(entry);
             f.add_block(cont);
@@ -340,10 +340,10 @@ mod tests {
             let i8_ty = tc.ctx.shared.types.get_or_make_int(1);
             tc.ctx.shared.types.get_or_make_array(i8_ty, 4)
         };
-        let fid = Function::make(&mut tc.ctx, "dec".into()).unwrap().id;
+        let fid = FunctionBody::make(&mut tc.ctx, "dec".into()).unwrap().id;
         let entry = tc.ctx.get_or_make_block(0x1000, fid);
         {
-            let mut f = Function::from_id_mut(&mut tc.ctx, fid);
+            let mut f = FunctionBody::from_id_mut(&mut tc.ctx, fid);
             f.set_root(entry).unwrap();
             f.add_block(entry);
         }
@@ -380,7 +380,7 @@ mod tests {
                 value: Some(tuple.localize(fid)),
             }),
         );
-        Function::from_id_mut(&mut tc.ctx, fid).set_signature(FunctionSignature {
+        FunctionBody::from_id_mut(&mut tc.ctx, fid).set_signature(FunctionSignature {
             pure_reg: true,
             is_pure: true,
             ..Default::default()
@@ -401,11 +401,11 @@ mod tests {
                 .types
                 .get_or_make_aggregate(vec![i32_ty, i32_ty])
         };
-        let gid = Function::make(&mut tc.ctx, "g".into()).unwrap().id;
+        let gid = FunctionBody::make(&mut tc.ctx, "g".into()).unwrap().id;
         let entry = tc.ctx.get_or_make_block(0x4000, gid);
         let cont = tc.ctx.get_or_make_block(0x4100, gid);
         {
-            let mut f = Function::from_id_mut(&mut tc.ctx, gid);
+            let mut f = FunctionBody::from_id_mut(&mut tc.ctx, gid);
             f.set_root(entry).unwrap();
             f.add_block(entry);
             f.add_block(cont);

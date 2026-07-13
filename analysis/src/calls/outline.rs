@@ -15,7 +15,7 @@ use qcode::{
     context::Context,
     types::TypeId,
     value::{
-        BasicBlock, BlockId, Function, FunctionId, FunctionKind, InstructionRef, LocalValueId,
+        BasicBlock, BlockId, FunctionBody, FunctionId, FunctionKind, InstructionRef, LocalValueId,
         ValueId, VarnodeId,
         block_param::BlockParam,
         insn::{Binary, Binop, Callee, Extract, InstructionId, IntBinop, Mnemonic, Range, Return},
@@ -23,7 +23,7 @@ use qcode::{
     },
 };
 
-use crate::pipeline::{ContextView, FunctionBody, Minted};
+use crate::pipeline::{ContextView, Minted};
 
 /// Whether `m` is a pure value-computing op that may appear inside an outlined
 /// per-element body: arithmetic, casts, bit ops, aggregate projection. Anything
@@ -89,7 +89,7 @@ pub(crate) fn pure_slice<'a, 'str: 'a>(
 }
 
 /// Outline the pure expression that computes `result` into a fresh standalone
-/// function `body(inputs…) -> result`, marked [`is_pure`](Function::is_pure).
+/// function `body(inputs…) -> result`, marked [`is_pure`](FunctionBody::is_pure).
 /// Each value in `inputs` becomes a parameter (in order, with the input's
 /// width/type); every instruction on the backward slice is cloned with operands
 /// remapped (inputs→params, clones→clones, literals passed through); the function
@@ -99,17 +99,19 @@ pub(crate) fn pure_slice<'a, 'str: 'a>(
 /// [`pure_slice`]) — the caller then leaves the loop unrecognized.
 pub(crate) fn outline_expression<'str>(
     m: ContextView<'_, 'str>,
-    body: &mut FunctionBody<'_, 'str>,
+    body: &mut FunctionBody<'str>,
+    next_minted: &mut u32,
     minted_out: &mut Vec<Minted<'str>>,
     name: &str,
     result: ValueId,
     inputs: &[ValueId],
 ) -> Option<Callee> {
-    let slice = pure_slice(body.read_host(m), result, inputs)?;
+    let slice = pure_slice(m.read_host(body), result, inputs)?;
     let inputs = inputs.to_vec();
     outline_core(
         m,
         body,
+        next_minted,
         minted_out,
         name,
         result,
@@ -142,7 +144,8 @@ pub(crate) fn outline_expression<'str>(
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn outline_tupled<'str>(
     m: ContextView<'_, 'str>,
-    body: &mut FunctionBody<'_, 'str>,
+    body: &mut FunctionBody<'str>,
+    next_minted: &mut u32,
     minted_out: &mut Vec<Minted<'str>>,
     name: &str,
     result: ValueId,
@@ -152,10 +155,11 @@ pub(crate) fn outline_tupled<'str>(
 ) -> Option<Callee> {
     let mut inputs = vec![index_input];
     inputs.extend(elem_input);
-    let slice = pure_slice(body.read_host(m), result, &inputs)?;
+    let slice = pure_slice(m.read_host(body), result, &inputs)?;
     outline_core(
         m,
         body,
+        next_minted,
         minted_out,
         name,
         result,
@@ -219,7 +223,8 @@ pub(crate) enum ScanElem {
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn outline_scan_body<'str>(
     m: ContextView<'_, 'str>,
-    body: &mut FunctionBody<'_, 'str>,
+    body: &mut FunctionBody<'str>,
+    next_minted: &mut u32,
     minted_out: &mut Vec<Minted<'str>>,
     name: &str,
     result: ValueId,
@@ -243,10 +248,11 @@ pub(crate) fn outline_scan_body<'str>(
         // the index is not exposed.
         ScanElem::Data(_) => vec![acc_input, elem_input?],
     };
-    let slice = pure_slice(body.read_host(m), result, &inputs)?;
+    let slice = pure_slice(m.read_host(body), result, &inputs)?;
     outline_core(
         m,
         body,
+        next_minted,
         minted_out,
         name,
         result,
@@ -378,16 +384,18 @@ pub(crate) fn substitute_operands(mn: &mut Mnemonic, pairs: &[(LocalValueId, Loc
 }
 
 /// Build a fresh single-block pure function `name` returning `result` by
-/// [minting](FunctionBody::mint_function) it (kind `Machine`, `is_pure`),
+/// [minting](crate::pipeline::mint_function) it (kind `Machine`, `is_pure`),
 /// cloning the pure `slice` (read from `body`'s own function, in definition
 /// order) with operands remapped through the value map that `seed` installs.
 /// `seed` receives a read view of the owning function and the minted mutation
 /// host, creates the root block's parameters (and any unpacking instructions),
 /// and returns the initial input→value map. The returned callee remains a
 /// pass-local placeholder until the install barrier patches its owner sites.
+#[allow(clippy::too_many_arguments)]
 fn outline_core<'str>(
     m: ContextView<'_, 'str>,
-    body: &mut FunctionBody<'_, 'str>,
+    body: &mut FunctionBody<'str>,
+    next_minted: &mut u32,
     minted_out: &mut Vec<Minted<'str>>,
     name: &str,
     result: ValueId,
@@ -401,7 +409,9 @@ fn outline_core<'str>(
     // Fully pure: a deterministic function of its params. `is_pure` (with the
     // implied `pure_reg`) is set by `mint_function`; the GUI purity badge keys
     // off `pure_reg`.
-    let callee = body.mint_function(
+    let callee = crate::pipeline::mint_function(
+        body,
+        next_minted,
         minted_out,
         std::borrow::Cow::Owned(name.to_owned()),
         FunctionKind::Machine,
@@ -412,7 +422,7 @@ fn outline_core<'str>(
     // Read the slice mnemonics/types from the owning function up front, so the
     // minted-host borrow below does not overlap the owner read.
     let cloned: Vec<(InstructionId, Mnemonic, TypeId)> = {
-        let own = body.read_host(m);
+        let own = m.read_host(body);
         slice
             .iter()
             .map(|&iid| {
@@ -424,7 +434,7 @@ fn outline_core<'str>(
     let dummy_ptr = m.shr().get_const(0, 8);
     let ret_ty = m.shr().types.get_or_make_int(1);
 
-    let (own, mut minted) = body.host_with_minted(minted_out, m, callee);
+    let (own, mut minted) = crate::pipeline::host_with_minted(body, minted_out, m, callee);
     // Root block, set as the minted function's entry, named for display (block
     // names are function-scoped, so uniqueness is within the new function).
     let root = minted.make_block(fid);
@@ -486,7 +496,7 @@ pub(crate) fn inline_pure_body(
     block: BlockId,
     at: InstructionId,
 ) -> Option<ValueId> {
-    let root = Function::from_id(ctx, body_fn).root().map(|b| b.id)?;
+    let root = FunctionBody::from_id(ctx, body_fn).root().map(|b| b.id)?;
     let params: Vec<ValueId> = BasicBlock::from_id(ctx, root)
         .params()
         .map(|p| p.id())
@@ -546,10 +556,10 @@ mod tests {
     #[test]
     fn outlines_closed_pure_expression() {
         let mut tc = TestContext::new();
-        let host = Function::make(&mut tc.ctx, "host".into()).unwrap().id;
+        let host = FunctionBody::make(&mut tc.ctx, "host".into()).unwrap().id;
         let entry = tc.ctx.get_or_make_block(0x1000, host);
         {
-            let mut f = Function::from_id_mut(&mut tc.ctx, host);
+            let mut f = FunctionBody::from_id_mut(&mut tc.ctx, host);
             f.set_root(entry).unwrap();
             f.add_block(entry);
         }
@@ -562,16 +572,17 @@ mod tests {
             (idx, elem, result)
         };
 
-        let outlined = crate::test_util::with_minting(&mut tc.ctx, host, |m, body, minted| {
-            outline_expression(m, body, minted, "body", result, &[idx, elem])
-        });
+        let outlined =
+            crate::test_util::with_minting(&mut tc.ctx, host, |m, body, next, minted| {
+                outline_expression(m, body, next, minted, "body", result, &[idx, elem])
+            });
         assert!(outlined.is_some(), "expression is closed over (idx, elem)");
-        let body = Function::from_name(&tc.ctx, "body")
+        let body = FunctionBody::from_name(&tc.ctx, "body")
             .expect("the mint barrier installs the outlined body")
             .id;
 
         // Two params, in input order, with the input widths.
-        let params: Vec<usize> = Function::from_id(&tc.ctx, body)
+        let params: Vec<usize> = FunctionBody::from_id(&tc.ctx, body)
             .root()
             .unwrap()
             .params()
@@ -580,7 +591,7 @@ mod tests {
         assert_eq!(params, vec![8, 1]);
 
         // The body recomputes the expression (a zext and an add) and returns it.
-        let root = Function::from_id(&tc.ctx, body).root().unwrap().id;
+        let root = FunctionBody::from_id(&tc.ctx, body).root().unwrap().id;
         let has_zext = BasicBlock::from_id(&tc.ctx, root)
             .iter()
             .any(|i| matches!(i.mnemonic(), Mnemonic::Zext(_)));
@@ -592,9 +603,9 @@ mod tests {
             .iter()
             .any(|i| matches!(i.mnemonic(), Mnemonic::Return(r) if r.value.is_some()));
         assert!(returns_value, "the outlined body returns the element");
-        assert!(Function::from_id(&tc.ctx, body).is_pure());
+        assert!(FunctionBody::from_id(&tc.ctx, body).is_pure());
         // Full purity implies register purity — the GUI badge keys off the latter.
-        assert!(Function::from_id(&tc.ctx, body).is_pure_reg());
+        assert!(FunctionBody::from_id(&tc.ctx, body).is_pure_reg());
         // The root block carries a real label (not an opaque `<bb_N>` fallback).
         assert!(
             BasicBlock::from_id(&tc.ctx, root).name().is_some(),
@@ -607,10 +618,10 @@ mod tests {
     #[test]
     fn refuses_open_expression_with_load() {
         let mut tc = TestContext::new();
-        let host = Function::make(&mut tc.ctx, "host".into()).unwrap().id;
+        let host = FunctionBody::make(&mut tc.ctx, "host".into()).unwrap().id;
         let entry = tc.ctx.get_or_make_block(0x1000, host);
         {
-            let mut f = Function::from_id_mut(&mut tc.ctx, host);
+            let mut f = FunctionBody::from_id_mut(&mut tc.ctx, host);
             f.set_root(entry).unwrap();
             f.add_block(entry);
         }
@@ -625,8 +636,8 @@ mod tests {
         };
 
         assert!(
-            crate::test_util::with_minting(&mut tc.ctx, host, |m, body, minted| {
-                outline_expression(m, body, minted, "body", result, &[idx])
+            crate::test_util::with_minting(&mut tc.ctx, host, |m, body, next, minted| {
+                outline_expression(m, body, next, minted, "body", result, &[idx])
             })
             .is_none(),
             "an expression reaching a load must not outline"
@@ -638,10 +649,10 @@ mod tests {
     #[test]
     fn outlines_tupled_index_aware_body() {
         let mut tc = TestContext::new();
-        let host = Function::make(&mut tc.ctx, "host".into()).unwrap().id;
+        let host = FunctionBody::make(&mut tc.ctx, "host".into()).unwrap().id;
         let entry = tc.ctx.get_or_make_block(0x1000, host);
         {
-            let mut f = Function::from_id_mut(&mut tc.ctx, host);
+            let mut f = FunctionBody::from_id_mut(&mut tc.ctx, host);
             f.set_root(entry).unwrap();
             f.add_block(entry);
         }
@@ -661,16 +672,27 @@ mod tests {
         let enum_ty = enum_id.desc().result_type(&tc.ctx.shared.types, &[arr_ty]);
         let (tuple_ty, _) = tc.ctx.shared.types.array_of(enum_ty).unwrap();
 
-        let outlined = crate::test_util::with_minting(&mut tc.ctx, host, |m, body, minted| {
-            outline_tupled(m, body, minted, "body", result, idx, Some(elem), tuple_ty)
-        });
+        let outlined =
+            crate::test_util::with_minting(&mut tc.ctx, host, |m, body, next, minted| {
+                outline_tupled(
+                    m,
+                    body,
+                    next,
+                    minted,
+                    "body",
+                    result,
+                    idx,
+                    Some(elem),
+                    tuple_ty,
+                )
+            });
         assert!(outlined.is_some(), "expression is closed over (idx, elem)");
-        let body = Function::from_name(&tc.ctx, "body")
+        let body = FunctionBody::from_name(&tc.ctx, "body")
             .expect("the mint barrier installs the outlined body")
             .id;
 
         // A single param — the tuple — sized to the `(i64, i8)` aggregate.
-        let params: Vec<usize> = Function::from_id(&tc.ctx, body)
+        let params: Vec<usize> = FunctionBody::from_id(&tc.ctx, body)
             .root()
             .unwrap()
             .params()
@@ -679,7 +701,7 @@ mod tests {
         assert_eq!(params, vec![tc.ctx.shared.types.size_of(tuple_ty)]);
 
         // The body unpacks the tuple (two extracts) and recomputes zext + add.
-        let root = Function::from_id(&tc.ctx, body).root().unwrap().id;
+        let root = FunctionBody::from_id(&tc.ctx, body).root().unwrap().id;
         let extracts = BasicBlock::from_id(&tc.ctx, root)
             .iter()
             .filter(|i| matches!(i.mnemonic(), Mnemonic::Extract(_)))
@@ -695,6 +717,6 @@ mod tests {
             .iter()
             .any(|i| matches!(i.mnemonic(), Mnemonic::Binop(_)));
         assert!(has_zext && has_add, "body recomputes zext + add");
-        assert!(Function::from_id(&tc.ctx, body).is_pure());
+        assert!(FunctionBody::from_id(&tc.ctx, body).is_pure());
     }
 }

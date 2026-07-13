@@ -20,7 +20,7 @@ use crate::{
     context::Context,
     types::AggregateField,
     value::{
-        BasicBlock, BlockParam, BlockParamId, Function, FunctionId, Instruction, InstructionId,
+        BasicBlock, BlockParam, BlockParamId, FunctionBody, FunctionId, Instruction, InstructionId,
         Renameable, Value, ValueId, ValueRef, Varnode, VarnodeId,
         block::BlockId,
         insn::{Callee, IntrinsicId},
@@ -177,8 +177,8 @@ fn make_global_varnode(ctx: &mut Context, name: &str, size: usize) -> VarnodeId 
 fn make_function(ctx: &mut Context, fn_decl: &FnDecl) -> Result<FunctionId, String> {
     let name = Cow::Owned(fn_decl.name.clone());
     let f = match fn_decl.kind {
-        FnKind::Machine => Function::make(ctx, name),
-        FnKind::Lambda => Function::make_lambda(ctx, name),
+        FnKind::Machine => FunctionBody::make(ctx, name),
+        FnKind::Lambda => FunctionBody::make_lambda(ctx, name),
     };
     f.map(|r| r.id).map_err(|e| e.to_string())
 }
@@ -230,7 +230,7 @@ fn lower_fn_body(
         .with_name(Cow::Owned(entry.clone()))
         .map_err(|e| e.to_string())?
         .id;
-    Function::from_id_mut(ctx, fid)
+    FunctionBody::from_id_mut(ctx, fid)
         .set_root(entry_id)
         .map_err(|e| e.to_string())?;
     symbols.blocks.insert(entry.clone(), entry_id);
@@ -1060,9 +1060,11 @@ mod tests {
         use crate::value::insn::Mnemonic;
 
         fn host_block(ctx: &mut Context<'_>, name: &str) -> BlockId {
-            let function = Function::make(ctx, Cow::Owned(name.to_owned())).unwrap().id;
+            let function = FunctionBody::make(ctx, Cow::Owned(name.to_owned()))
+                .unwrap()
+                .id;
             let block = BasicBlock::make(ctx, function).id;
-            let mut function = Function::from_id_mut(ctx, function);
+            let mut function = FunctionBody::from_id_mut(ctx, function);
             function.add_block(block);
             function.set_root(block).unwrap();
             block
@@ -1114,7 +1116,7 @@ mod tests {
             let mut lowered = Context::new();
             let source = format!("fn host:\n<entry>\n{statement}");
             let symbols = lower_str(&mut lowered, &source).expect("rendered form must lower");
-            let instruction = Function::from_id(&lowered, symbols.function("host"))
+            let instruction = FunctionBody::from_id(&lowered, symbols.function("host"))
                 .root()
                 .unwrap()
                 .iter()
@@ -1155,7 +1157,7 @@ mod tests {
         .expect("lowers");
 
         let fid = syms.function("fib_loop");
-        let f = Function::from_id(&ctx, fid);
+        let f = FunctionBody::from_id(&ctx, fid);
         assert!(f.is_lambda());
         let text = f.to_string();
         assert!(text.contains("lambda fib_loop"));
@@ -1174,9 +1176,11 @@ mod tests {
 
         let mut ctx = Context::new();
         // A pre-existing function `g` owning a block at 0x2000.
-        let g = Function::make_at_addr(&mut ctx, 0x2000, Some(Cow::Borrowed("g"))).id;
+        let g = FunctionBody::make_at_addr(&mut ctx, 0x2000, Some(Cow::Borrowed("g"))).id;
         let g_blk = BasicBlock::make(&mut ctx, g).with_address(0x2000).id;
-        Function::from_id_mut(&mut ctx, g).set_root(g_blk).unwrap();
+        FunctionBody::from_id_mut(&mut ctx, g)
+            .set_root(g_blk)
+            .unwrap();
 
         // Lowering a function `f` that branches to address 0x2000 must fail: the
         // address resolves to g's block, a foreign target.
@@ -1200,8 +1204,8 @@ mod tests {
         use std::borrow::Cow;
 
         let mut ctx = Context::new();
-        let g = Function::make_at_addr(&mut ctx, 0x2000, Some(Cow::Borrowed("g"))).id;
-        assert!(Function::from_id(&ctx, g).root().is_none());
+        let g = FunctionBody::make_at_addr(&mut ctx, 0x2000, Some(Cow::Borrowed("g"))).id;
+        assert!(FunctionBody::from_id(&ctx, g).root().is_none());
 
         let err = lower_str(
             &mut ctx,

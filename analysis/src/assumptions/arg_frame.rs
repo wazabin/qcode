@@ -28,7 +28,8 @@ use qcode::{
     context::Context,
     pass_scope,
     value::{
-        Function, FunctionId, Instruction, ValueId, VarnodeId, insn::InstructionId, insn::Mnemonic,
+        FunctionBody, FunctionId, Instruction, ValueId, VarnodeId, insn::InstructionId,
+        insn::Mnemonic,
     },
 };
 
@@ -69,7 +70,7 @@ fn eligible(
     sp_reg: VarnodeId,
     taken: &HashSet<FunctionId>,
 ) -> bool {
-    let f = Function::from_id(ctx, fid);
+    let f = FunctionBody::from_id(ctx, fid);
     if f.is_external() || f.root().is_none() {
         return false;
     }
@@ -137,7 +138,7 @@ pub fn verify_args_disjoint_caller_frame(ctx: &mut Context, sp_reg: Option<Varno
             qcode::pass_log!(
                 debug,
                 "proved ArgsDisjointFromCallerFrame({}) = {holds}",
-                Function::from_id(ctx, callee).name(),
+                FunctionBody::from_id(ctx, callee).name(),
             );
         }
     }
@@ -167,7 +168,7 @@ fn args_provably_collide(
     let frame_ext = caller_frame_extent(ctx, callee, callee_sp, &callee_numbering);
     // Root params (in lockstep with `Call.args`); the `@ESP` param index; and the
     // access extent through each param (`None` = not a dereferenced pointer).
-    let params: Vec<ValueId> = Function::from_id(ctx, callee)
+    let params: Vec<ValueId> = FunctionBody::from_id(ctx, callee)
         .root()
         .map(|r| r.params().map(|p| p.id()).collect())
         .unwrap_or_default();
@@ -232,7 +233,7 @@ fn args_provably_collide(
 /// caller-frame slot (`@SP + k`, `k ≥ 0`): the callee's caller-frame footprint.
 fn caller_frame_extent(ctx: &Context, fid: FunctionId, sp: ValueId, numbering: &Numbering) -> i64 {
     let mut ext = 0i64;
-    for block in Function::from_id(ctx, fid).blocks() {
+    for block in FunctionBody::from_id(ctx, fid).blocks() {
         for insn in block.iter() {
             let (ptr, size) = match insn.mnemonic() {
                 Mnemonic::Load(l) => (l.ptr.qualify(insn.id.func), l.size),
@@ -259,7 +260,7 @@ fn param_access_extent(
     numbering: &Numbering,
 ) -> Option<i64> {
     let mut ext: Option<i64> = None;
-    for block in Function::from_id(ctx, fid).blocks() {
+    for block in FunctionBody::from_id(ctx, fid).blocks() {
         for insn in block.iter() {
             let (ptr, size) = match insn.mnemonic() {
                 Mnemonic::Load(l) => (l.ptr.qualify(insn.id.func), l.size),

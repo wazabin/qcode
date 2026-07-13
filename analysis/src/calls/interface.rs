@@ -23,7 +23,7 @@ use std::borrow::Cow;
 use qcode::{
     context::Context,
     value::{
-        BasicBlock, BlockId, BlockParamId, Function, FunctionId, ValueId,
+        BasicBlock, BlockId, BlockParamId, FunctionBody, FunctionId, ValueId,
         insn::{Call, InstructionId, Mnemonic},
     },
 };
@@ -47,12 +47,12 @@ pub fn append_entry_param(
     origin: Option<ValueId>,
     mut build_caller_value: impl FnMut(&mut Context, InstructionId, BlockId) -> ValueId,
 ) -> Option<ValueId> {
-    let root = Function::from_id(ctx, fid).root().map(|b| b.id)?;
+    let root = FunctionBody::from_id(ctx, fid).root().map(|b| b.id)?;
 
     // Changing the parameter list invalidates any inferred per-param attributes,
     // whose vector is indexed by the old positions. Drop them; the `param_attrs`
     // pass re-infers over the rewritten signature.
-    Function::from_id_mut(ctx, fid).clear_param_attrs();
+    FunctionBody::from_id_mut(ctx, fid).clear_param_attrs();
 
     // New root block param, recording its source for mem2reg reuse and naming.
     let pid = BasicBlock::from_id_mut(ctx, root).push_param(size).id;
@@ -126,7 +126,7 @@ pub fn append_caller_arg(
 /// `param[i] ↔ input_regs[i] ↔ arg[i]` alignment holds by construction after
 /// any removal. The caller must ensure the param has no remaining users.
 pub fn remove_entry_param(ctx: &mut Context, fid: FunctionId, index: usize) {
-    let Some(root) = Function::from_id(ctx, fid).root().map(|b| b.id) else {
+    let Some(root) = FunctionBody::from_id(ctx, fid).root().map(|b| b.id) else {
         return;
     };
 
@@ -141,7 +141,7 @@ pub fn remove_entry_param(ctx: &mut Context, fid: FunctionId, index: usize) {
 
     // Any inferred per-param attributes are indexed by the old positions; drop
     // them rather than reindex. The `param_attrs` pass re-infers afterward.
-    Function::from_id_mut(ctx, fid).clear_param_attrs();
+    FunctionBody::from_id_mut(ctx, fid).clear_param_attrs();
     for (i, &p) in params.iter().enumerate() {
         ctx.block_param_mut(BlockParamId::new(root.func, p)).index = i;
     }
@@ -151,12 +151,12 @@ pub fn remove_entry_param(ctx: &mut Context, fid: FunctionId, index: usize) {
     // only acts when `input_regs` is set (conventional functions); for
     // `pure_reg` it is `None` and this is a no-op (see the module docs).
     #[allow(deprecated)]
-    if let Some(inputs) = Function::from_id(ctx, fid).input_regs()
+    if let Some(inputs) = FunctionBody::from_id(ctx, fid).input_regs()
         && index < inputs.len()
     {
         let mut inputs = inputs.to_vec();
         inputs.remove(index);
-        Function::from_id_mut(ctx, fid).set_input_regs(inputs);
+        FunctionBody::from_id_mut(ctx, fid).set_input_regs(inputs);
     }
 
     // Drop the matching positional argument at every direct caller.

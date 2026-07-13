@@ -39,7 +39,7 @@ use crate::{ContextView, FunctionBody};
 pub(super) struct Identities;
 
 /// The function-pass [`SubPassC`] impl (context-split stage 5b-ii):
-/// reads route through `body.read_host(cx)`, the intrinsic/identity rewrites
+/// reads route through `cx.read_host(body)`, the intrinsic/identity rewrites
 /// through `Editor`'s `_c` methods, and the constant-interning
 /// `simplify_bitwise_c`/`simplify_compare_c` helpers run over `&mut PassBacking`.
 impl<'str> SubPassC<'str> for Identities {
@@ -53,7 +53,7 @@ impl<'str> SubPassC<'str> for Identities {
 
     fn on_insn(
         &self,
-        body: &mut FunctionBody<'_, 'str>,
+        body: &mut FunctionBody<'str>,
         cx: ContextView<'_, 'str>,
         _state: &mut dyn Any,
         ic: &InsnCtx,
@@ -69,7 +69,7 @@ impl<'str> SubPassC<'str> for Identities {
                 .iter()
                 .map(|a| a.qualify(ic.insn_id.func))
                 .collect();
-            match id.desc().simplify(body.read_host(cx), id, ic.size, &args) {
+            match id.desc().simplify(cx.read_host(body), id, ic.size, &args) {
                 Some(Simplified::Value(repl)) => {
                     ed.replace_c(body, cx, ic.insn_id, repl);
                     return Claim::Done;
@@ -89,7 +89,7 @@ impl<'str> SubPassC<'str> for Identities {
             }
         }
         if let Some(new_mnemonic) =
-            simplify_identity(body.read_host(cx), ic.insn_id.func, ic.mnemonic)
+            simplify_identity(cx.read_host(body), ic.insn_id.func, ic.mnemonic)
         {
             ed.replace_with_new_insn_c(body, cx, ic.block_id, ic.insn_id, new_mnemonic, ic.size);
             return Claim::Done;
@@ -365,9 +365,9 @@ fn negated_compare(op: IntBinop) -> Option<IntBinop> {
 
 /// Concrete pass twin of [`simplify_bitwise`] over a checked-out
 /// `(&mut FunctionBody, ContextView)` (context-split stage 5b-ii Pin A): reads
-/// route through `body.read_host(cx)`, rewrites through `Editor`'s `_c` methods.
+/// route through `cx.read_host(body)`, rewrites through `Editor`'s `_c` methods.
 fn simplify_bitwise_c<'str>(
-    body: &mut FunctionBody<'_, 'str>,
+    body: &mut FunctionBody<'str>,
     cx: ContextView<'_, 'str>,
     ic: &InsnCtx,
     ed: &mut Editor,
@@ -386,23 +386,23 @@ fn simplify_bitwise_c<'str>(
 
     match op {
         IntBinop::And => {
-            for (outer, inner) in const_operands(body.read_host(cx), lhs, rhs) {
+            for (outer, inner) in const_operands(cx.read_host(body), lhs, rhs) {
                 if outer == 1
-                    && (is_boolean(body.read_host(cx), inner)
-                        || as_zext(body.read_host(cx), inner)
-                            .is_some_and(|(src, _)| is_boolean(body.read_host(cx), src)))
+                    && (is_boolean(cx.read_host(body), inner)
+                        || as_zext(cx.read_host(body), inner)
+                            .is_some_and(|(src, _)| is_boolean(cx.read_host(body), src)))
                 {
                     ed.replace_c(body, cx, ic.insn_id, inner);
                     return true;
                 }
                 if let Some(k) = align_mask_bits(outer, size)
-                    && known_align(body.read_host(cx), inner, ALIGN_DEPTH) >= k
+                    && known_align(cx.read_host(body), inner, ALIGN_DEPTH) >= k
                 {
                     ed.replace_c(body, cx, ic.insn_id, inner);
                     return true;
                 }
-                if let Some((x, c1)) = binop_const(body.read_host(cx), inner, IntBinop::And) {
-                    let folded = body.read_host(cx).shr().get_const((c1 & outer) & all, size);
+                if let Some((x, c1)) = binop_const(cx.read_host(body), inner, IntBinop::And) {
+                    let folded = cx.read_host(body).shr().get_const((c1 & outer) & all, size);
                     ed.replace_with_new_insn_c(
                         body,
                         cx,
@@ -417,9 +417,9 @@ fn simplify_bitwise_c<'str>(
             false
         }
         IntBinop::Xor => {
-            for (outer, inner) in const_operands(body.read_host(cx), lhs, rhs) {
-                if let Some((x, c1)) = binop_const(body.read_host(cx), inner, IntBinop::Xor) {
-                    let folded = body.read_host(cx).shr().get_const((c1 ^ outer) & all, size);
+            for (outer, inner) in const_operands(cx.read_host(body), lhs, rhs) {
+                if let Some((x, c1)) = binop_const(cx.read_host(body), inner, IntBinop::Xor) {
+                    let folded = cx.read_host(body).shr().get_const((c1 ^ outer) & all, size);
                     ed.replace_with_new_insn_c(
                         body,
                         cx,
@@ -436,12 +436,12 @@ fn simplify_bitwise_c<'str>(
                 for (dual_in, dual_out) in
                     [(IntBinop::Or, IntBinop::And), (IntBinop::And, IntBinop::Or)]
                 {
-                    let Some((a, b)) = as_int_binop(body.read_host(cx), inner, dual_in) else {
+                    let Some((a, b)) = as_int_binop(cx.read_host(body), inner, dual_in) else {
                         continue;
                     };
                     let (Some(na), Some(nb)) = (
-                        simplify_not(body.read_host(cx), a, size),
-                        simplify_not(body.read_host(cx), b, size),
+                        simplify_not(cx.read_host(body), a, size),
+                        simplify_not(cx.read_host(body), b, size),
                     ) else {
                         continue;
                     };
@@ -464,7 +464,7 @@ fn simplify_bitwise_c<'str>(
 
 /// Concrete pass twin of [`simplify_compare`] (see [`simplify_bitwise_c`]).
 fn simplify_compare_c<'str>(
-    body: &mut FunctionBody<'_, 'str>,
+    body: &mut FunctionBody<'str>,
     cx: ContextView<'_, 'str>,
     ic: &InsnCtx,
     ed: &mut Editor,
@@ -476,13 +476,13 @@ fn simplify_compare_c<'str>(
             op: Binop::Int(op),
         }) if matches!(op, IntBinop::Equal | IntBinop::NotEqual) => {
             let (lhs, rhs) = (lhs.qualify(ic.insn_id.func), rhs.qualify(ic.insn_id.func));
-            for (c, other) in const_operands(body.read_host(cx), lhs, rhs) {
+            for (c, other) in const_operands(cx.read_host(body), lhs, rhs) {
                 if c != 0 {
                     continue;
                 }
-                if let Some((src, src_size)) = as_zext(body.read_host(cx), other) {
-                    let zero = body.read_host(cx).shr().get_const(0, src_size);
-                    let bool_ty = body.read_host(cx).shr().types.get_or_make_bool();
+                if let Some((src, src_size)) = as_zext(cx.read_host(body), other) {
+                    let zero = cx.read_host(body).shr().get_const(0, src_size);
+                    let bool_ty = cx.read_host(body).shr().types.get_or_make_bool();
                     ed.replace_with_new_insn_typed_c(
                         body,
                         cx,
@@ -493,8 +493,8 @@ fn simplify_compare_c<'str>(
                     );
                     return true;
                 }
-                if is_boolean(body.read_host(cx), other)
-                    && value_size(body.read_host(cx), other) == ic.size
+                if is_boolean(cx.read_host(body), other)
+                    && value_size(cx.read_host(body), other) == ic.size
                 {
                     match op {
                         IntBinop::NotEqual => {
@@ -507,11 +507,11 @@ fn simplify_compare_c<'str>(
                                     lhs: a,
                                     rhs: b,
                                     op: Binop::Int(inner),
-                                }) = body.read_host(cx).insn_ref(id).mnemonic()
+                                }) = cx.read_host(body).insn_ref(id).mnemonic()
                                 && let Some(flipped) = negated_compare(inner)
                             {
                                 let (a, b) = (a.qualify(id.func), b.qualify(id.func));
-                                let bool_ty = body.read_host(cx).shr().types.get_or_make_bool();
+                                let bool_ty = cx.read_host(body).shr().types.get_or_make_bool();
                                 ed.replace_with_new_insn_typed_c(
                                     body,
                                     cx,

@@ -10,7 +10,7 @@ use qcode::{
     space::SpaceId,
     types::TypeId,
     value::{
-        BasicBlock, Function, FunctionId, Value, ValueId, VarnodeId,
+        BasicBlock, FunctionBody, FunctionId, Value, ValueId, VarnodeId,
         insn::{Call, InstructionId, Mnemonic},
     },
 };
@@ -128,7 +128,7 @@ fn callee_first_order(ctx: &Context) -> Vec<FunctionId> {
                 continue;
             }
             stack.push((fid, true));
-            for callee in Function::from_id(ctx, fid).callees() {
+            for callee in FunctionBody::from_id(ctx, fid).callees() {
                 if !visited.contains(&callee) {
                     stack.push((callee, false));
                 }
@@ -204,7 +204,7 @@ fn try_promote(
     sp_reg: Option<VarnodeId>,
     address_taken: &FxHashSet<FunctionId>,
 ) -> bool {
-    let f = Function::from_id(ctx, fid);
+    let f = FunctionBody::from_id(ctx, fid);
     if f.is_external() {
         return false;
     }
@@ -251,7 +251,7 @@ fn try_promote(
     // no write-dominance reasoning: each write slot is seeded as a by-value input, so
     // a path that does not execute the write reloads that seed and replays a no-op —
     // sound on any control flow (see [`apply`]).
-    let returns: Vec<InstructionId> = Function::from_id(ctx, fid)
+    let returns: Vec<InstructionId> = FunctionBody::from_id(ctx, fid)
         .iter()
         .filter_map(|b| {
             let last = b.iter().last()?;
@@ -275,7 +275,7 @@ fn try_promote(
     // a strided `param + idx*scale + const` address (see [`relate_address`]).
     let numbering = precompute_forms(&*ctx, fid);
     let ram = ctx.shared.default_space;
-    let accesses_in: Vec<MemoryAccess> = Function::from_id(ctx, fid)
+    let accesses_in: Vec<MemoryAccess> = FunctionBody::from_id(ctx, fid)
         .iter()
         .flat_map(|b| {
             let bid = b.id;
@@ -355,14 +355,14 @@ fn try_promote(
         qcode::pass_log!(
             debug,
             "argpromote {}: partial (inputs-only) — footprint not fully modelled",
-            Function::from_id(ctx, fid).name(),
+            FunctionBody::from_id(ctx, fid).name(),
         );
         return apply_partial(ctx, fid, &promoted);
     }
     qcode::pass_log!(
         debug,
         "argpromote {}: shadow path — {} promoted deref param(s)",
-        Function::from_id(ctx, fid).name(),
+        FunctionBody::from_id(ctx, fid).name(),
         promoted.len(),
     );
 
@@ -392,7 +392,7 @@ fn all_accesses_modelled(ctx: &Context, fid: FunctionId, promoted: &[Promoted]) 
         .iter()
         .flat_map(|p| p.accesses.iter().copied())
         .collect();
-    Function::from_id(ctx, fid).iter().all(|block| {
+    FunctionBody::from_id(ctx, fid).iter().all(|block| {
         block.iter().all(|insn| {
             let space = match insn.mnemonic() {
                 Mnemonic::Load(l) => l.space,
@@ -523,7 +523,7 @@ fn regions_disjoint(
 
 /// `true` if `function_id` makes any call (direct or indirect).
 fn function_makes_blocking_call(ctx: &Context, function_id: FunctionId) -> bool {
-    Function::from_id(ctx, function_id).blocks().any(|b| {
+    FunctionBody::from_id(ctx, function_id).blocks().any(|b| {
         b.iter().any(|i| match i.mnemonic() {
             // Indirect transfers: target unknown, cannot vet.
             Mnemonic::CallInd(_) => true,
@@ -548,7 +548,7 @@ fn function_makes_blocking_call(ctx: &Context, function_id: FunctionId) -> bool 
 /// dereference, so checking loads alone would let a store-only callee silently
 /// write a promoted address our shadow no longer maintains.
 fn function_accesses_memory(ctx: &Context, function_id: FunctionId) -> bool {
-    Function::from_id(ctx, function_id).blocks().any(|b| {
+    FunctionBody::from_id(ctx, function_id).blocks().any(|b| {
         b.iter()
             .any(|i| matches!(i.mnemonic(), Mnemonic::Load(_) | Mnemonic::Store(_)))
     })
@@ -869,7 +869,7 @@ fn apply(
                      call: callee {} (param '{}')",
                     call.args.len(),
                     arg_idx,
-                    Function::from_id(ctx, fid).name(),
+                    FunctionBody::from_id(ctx, fid).name(),
                     pname,
                 );
                 let caller_base = call.args[arg_idx].qualify(call_id.func);
@@ -972,7 +972,10 @@ fn apply_partial(ctx: &mut Context, fid: FunctionId, promoted: &[Promoted]) -> b
     if call_sites.is_empty() {
         return false;
     }
-    let root = Function::from_id(ctx, fid).root().map(|b| b.id).unwrap();
+    let root = FunctionBody::from_id(ctx, fid)
+        .root()
+        .map(|b| b.id)
+        .unwrap();
     let ram = ctx.shared.default_space;
 
     // Existing root-param names, used to skip read fields already seeded by a
@@ -1064,7 +1067,7 @@ fn apply_partial(ctx: &mut Context, fid: FunctionId, promoted: &[Promoted]) -> b
             Mnemonic::Call(c) => (c.target, c.args, c.clobbers),
             _ => continue,
         };
-        let callee_name = Function::from_id(ctx, fid).name().to_string();
+        let callee_name = FunctionBody::from_id(ctx, fid).name().to_string();
         let caller_name = BasicBlock::from_id(ctx, call_block)
             .function()
             .map(|f| f.name().to_string())

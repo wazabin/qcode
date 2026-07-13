@@ -82,7 +82,6 @@ pub struct LoopToRecursion;
 
 impl FunctionPass for LoopToRecursion {
     const NAME: &'static str = "loop_to_recursion";
-    const MINTS: bool = true;
 
     fn description(&self) -> &'static str {
         "Recover counted loops as recursive lambda applications"
@@ -90,11 +89,12 @@ impl FunctionPass for LoopToRecursion {
 
     fn run<'str>(
         &self,
-        f: &mut FunctionBody<'_, 'str>,
+        f: &mut FunctionBody<'str>,
         m: ContextView<'_, 'str>,
+        next_minted: &mut u32,
     ) -> Result<Outcome<'str>, String> {
         let mut minted = Vec::new();
-        let changed = loop_to_recursion(m, f, &mut minted);
+        let changed = loop_to_recursion(m, f, next_minted, &mut minted);
         Ok(Outcome {
             changed,
             rename: None,
@@ -122,13 +122,14 @@ pub(crate) struct LoopModel {
 
 pub fn loop_to_recursion<'str>(
     m: ContextView<'_, 'str>,
-    body: &mut FunctionBody<'_, 'str>,
+    body: &mut FunctionBody<'str>,
+    next_minted: &mut u32,
     minted: &mut Vec<Minted<'str>>,
 ) -> bool {
-    let Some(model) = recognize_loop(body.read_host(m), body.id()) else {
+    let Some(model) = recognize_loop(m.read_host(body), body.id()) else {
         return false;
     };
-    transform(m, body, minted, &model)
+    transform(m, body, next_minted, minted, &model)
 }
 
 pub(crate) fn recognize_loop<'a, 'str: 'a>(
@@ -211,16 +212,24 @@ pub(crate) fn recognize_loop<'a, 'str: 'a>(
 
 fn transform<'str>(
     m: ContextView<'_, 'str>,
-    body: &mut FunctionBody<'_, 'str>,
+    body: &mut FunctionBody<'str>,
+    next_minted: &mut u32,
     minted_out: &mut Vec<Minted<'str>>,
     model: &LoopModel,
 ) -> bool {
     let host_fid = body.id();
-    let name = format!("{}_rec", body.read_host(m).function_ref(host_fid).name());
+    let name = format!("{}_rec", m.read_host(body).function_ref(host_fid).name());
     // Mint the recursive lambda (name buffered raw; the driver uniquifies it at
     // the barrier). Keep the placeholder in both recursive and host references;
     // the install barrier patches it to the materialized function id.
-    let rec = body.mint_function(minted_out, Cow::Owned(name), FunctionKind::Lambda, true);
+    let rec = crate::pipeline::mint_function(
+        body,
+        next_minted,
+        minted_out,
+        Cow::Owned(name),
+        FunctionKind::Lambda,
+        true,
+    );
 
     // The set of back-edge latch blocks: their `goto head` terminator becomes an
     // `apply rec(next…); return` in the clone, so it is cloned specially.
@@ -233,7 +242,7 @@ fn transform<'str>(
     // TODO(5b-ii): function minting (`host_with_minted`) stays on the host path
     // until the minting chunk lands.
     {
-        let (own, mut minted) = body.host_with_minted(minted_out, m, rec);
+        let (own, mut minted) = crate::pipeline::host_with_minted(body, minted_out, m, rec);
 
         // Pass 1: a fresh block per region block, with its params cloned. Names
         // and the head-as-root are set here so later passes can reference them.
@@ -342,19 +351,19 @@ fn transform<'str>(
     }
 
     // --- Host: the entry seeds the recursion and returns it; delete the region.
-    if let Some(term) = terminator_id(body.read_host(m), model.root) {
-        body.remove_instruction(m, term);
+    if let Some(term) = terminator_id(m.read_host(body), model.root) {
+        body.remove_instruction(term);
     }
     {
         // TODO(5b-ii): `Builder` drives a `BaseRef`, which is not mirrored on
         // `FunctionBody`; go through a temporary host.
-        let mut host = body.host(m);
+        let mut host = m.host(body);
         let mut b = Builder::from_block(BaseRef::new(host.reborrow(), model.root));
         let out = b.push_apply(rec, model.init_args.clone()).id();
         b.push_return_value(out);
     }
     for &blk in &model.region {
-        body.delete_block(m, blk);
+        body.delete_block(blk);
     }
     true
 }
@@ -451,14 +460,14 @@ fn terminator_mnemonic<'a, 'str: 'a>(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use qcode::{context::Context, value::Function};
+    use qcode::{context::Context, value::FunctionBody};
     use qcode_emulator::{SizedValue, StandaloneEmulator};
     use qcode_macro::qcode;
 
     use crate::test_util::run_function_pass;
 
     fn run(ctx: &Context, fun: FunctionId, n: u64) -> Option<u64> {
-        let root = Function::from_id(ctx, fun).root().expect("root").id;
+        let root = FunctionBody::from_id(ctx, fun).root().expect("root").id;
         let ret = match terminator_mnemonic(ctx.into(), root)? {
             Mnemonic::ReturnValue(r) => r.value.qualify(root.func),
             _ => return None,
@@ -496,7 +505,7 @@ mod tests {
         assert!(run_function_pass::<LoopToRecursion>(&mut ctx, fib_loop).unwrap());
 
         // The host entry is now just `apply rec(init); return`.
-        let fib = Function::from_id(&ctx, fib_loop);
+        let fib = FunctionBody::from_id(&ctx, fib_loop);
         let root = fib.root().expect("root");
         let insns = root.instruction_ids();
         assert!(matches!(
@@ -506,7 +515,7 @@ mod tests {
         // The loop blocks were moved out of the host: only the entry remains.
         assert_eq!(fib.blocks().count(), 1);
 
-        let rec = Function::from_name(&ctx, "fib_loop_rec").expect("recursive lambda exists");
+        let rec = FunctionBody::from_name(&ctx, "fib_loop_rec").expect("recursive lambda exists");
         assert!(rec.is_lambda());
         assert!(rec.to_string().contains("apply fib_loop_rec"));
 
@@ -542,7 +551,11 @@ mod tests {
         );
 
         assert!(run_function_pass::<LoopToRecursion>(&mut ctx, fact).unwrap());
-        assert!(Function::from_name(&ctx, "fact_rec").unwrap().is_lambda());
+        assert!(
+            FunctionBody::from_name(&ctx, "fact_rec")
+                .unwrap()
+                .is_lambda()
+        );
 
         assert_eq!(run(&ctx, fact, 5), Some(120));
         assert_eq!(run(&ctx, fact, 0), Some(1));

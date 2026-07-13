@@ -4,7 +4,7 @@ use qcode::{
     context::Context,
     discovery::{Discovery, FunctionDiscoveryReason},
     value::{
-        Function, LiteralRef, ValueId,
+        FunctionBody, LiteralRef, ValueId,
         insn::{Call, CallInd, Mnemonic},
     },
 };
@@ -55,7 +55,7 @@ pub fn discover_libc_main(ctx: &mut Context, env: &PipelineEnv) -> bool {
     // `entry → main` call-graph edge synthetically so the call graph links them.
     // Keyed by address, this is independent of whether we (below) or the symbol
     // table materialize `main`, and it is idempotent across analyze rounds.
-    if let Some(entry_id) = Function::from_addr(ctx, entry).map(|function| function.id) {
+    if let Some(entry_id) = FunctionBody::from_addr(ctx, entry).map(|function| function.id) {
         changed |= ctx.shared.values.add_synthetic_callee(entry_id, main);
     }
 
@@ -63,7 +63,9 @@ pub fn discover_libc_main(ctx: &mut Context, env: &PipelineEnv) -> bool {
     // already exist at `main` (a prior round's discovery) or the name `main` may
     // be taken (e.g. from the symbol table), in which case naming ours `main`
     // would collide on the unique-name invariant.
-    if Function::from_addr(ctx, main).is_none() && Function::from_name(ctx, "main").is_none() {
+    if FunctionBody::from_addr(ctx, main).is_none()
+        && FunctionBody::from_name(ctx, "main").is_none()
+    {
         changed |= ctx.discover(
             Discovery::function(main)
                 .with_function_reason(FunctionDiscoveryReason::CrtMain)
@@ -76,7 +78,7 @@ pub fn discover_libc_main(ctx: &mut Context, env: &PipelineEnv) -> bool {
 }
 
 fn find_libc_main_arg(ctx: &Context<'_>, entry: u64, main_reg: ValueId) -> Option<(u64, u64)> {
-    let function = Function::from_addr(ctx, entry)?;
+    let function = FunctionBody::from_addr(ctx, entry)?;
     let mut last_main = None;
 
     for block in function.blocks() {
@@ -107,7 +109,7 @@ mod tests {
     use qcode::{
         builder::Builder,
         testing::TestContext,
-        value::{BasicBlock, Function},
+        value::{BasicBlock, FunctionBody},
     };
 
     use crate::{ArchConfig, CallingConvention, GpReg};
@@ -116,11 +118,11 @@ mod tests {
     fn discovers_named_main_from_primary_entrypoint_argument() {
         let mut tc = TestContext::new();
         tc.ctx.set_primary_entrypoint(Some(0x1000));
-        let start = Function::make_at_addr(&mut tc.ctx, 0x1000, Some("start".into())).id;
+        let start = FunctionBody::make_at_addr(&mut tc.ctx, 0x1000, Some("start".into())).id;
 
         {
             let block = { tc.ctx.get_or_make_block(0x1000, start) };
-            Function::from_addr_mut(&mut tc.ctx, 0x1000)
+            FunctionBody::from_addr_mut(&mut tc.ctx, 0x1000)
                 .unwrap()
                 .set_root(block)
                 .unwrap();
@@ -156,11 +158,11 @@ mod tests {
     fn records_entry_to_main_call_graph_edge() {
         let mut tc = TestContext::new();
         tc.ctx.set_primary_entrypoint(Some(0x1000));
-        let start = Function::make_at_addr(&mut tc.ctx, 0x1000, Some("start".into())).id;
+        let start = FunctionBody::make_at_addr(&mut tc.ctx, 0x1000, Some("start".into())).id;
 
         {
             let block = { tc.ctx.get_or_make_block(0x1000, start) };
-            Function::from_addr_mut(&mut tc.ctx, 0x1000)
+            FunctionBody::from_addr_mut(&mut tc.ctx, 0x1000)
                 .unwrap()
                 .set_root(block)
                 .unwrap();
@@ -187,7 +189,7 @@ mod tests {
 
         assert!(DiscoverLibcMain.run(&mut tc.ctx, &env).unwrap());
 
-        let entry_id = Function::from_addr(&tc.ctx, 0x1000).unwrap().id;
+        let entry_id = FunctionBody::from_addr(&tc.ctx, 0x1000).unwrap().id;
         // The synthetic edge is keyed by `main`'s address.
         assert!(
             tc.ctx
@@ -198,13 +200,17 @@ mod tests {
         );
 
         // It does not surface as a callee until a function exists at `main`...
-        assert!(Function::from_id(&tc.ctx, entry_id).callees().is_empty());
+        assert!(
+            FunctionBody::from_id(&tc.ctx, entry_id)
+                .callees()
+                .is_empty()
+        );
 
         // ...and once one does, `entry → main` shows up in the call graph.
-        Function::make_at_addr(&mut tc.ctx, 0x2000, Some("main".into()));
-        let main_id = Function::from_addr(&tc.ctx, 0x2000).unwrap().id;
+        FunctionBody::make_at_addr(&mut tc.ctx, 0x2000, Some("main".into()));
+        let main_id = FunctionBody::from_addr(&tc.ctx, 0x2000).unwrap().id;
         assert_eq!(
-            Function::from_id(&tc.ctx, entry_id).callees(),
+            FunctionBody::from_id(&tc.ctx, entry_id).callees(),
             vec![main_id]
         );
 

@@ -18,7 +18,7 @@ use crate::{
     context::Context,
     error::{Error, ErrorTy, Result},
     value::{
-        Function, FunctionId, ValueId,
+        FunctionBody, FunctionId, ValueId,
         block::{BasicBlock, BlockId, EdgeData, EdgeId},
         block_param::{BlockParam, BlockParamId},
         insn::{Instruction, InstructionId, Mnemonic},
@@ -35,7 +35,7 @@ use super::base_ref::HostRef;
 /// *reattributed* blocks — a roster block stored in, or parented to, a different
 /// function. Those functions go through the sequential (module) path.
 pub struct PassBacking<'a, 'str> {
-    pub fun: &'a mut Function<'str>,
+    pub fun: &'a mut FunctionBody<'str>,
     /// The module's shared IR state, **read-only**. A checked-out function pass
     /// reaches shared data (types, literals, spaces, registers) immutably; it
     /// mints types/literals through the interners' `&self` paths, and mints no
@@ -54,7 +54,7 @@ impl<'a, 'str> PassBacking<'a, 'str> {
     /// interface registry. Debug-asserts the function owns only self-stored,
     /// self-parented blocks (no reattribution).
     pub fn new(
-        fun: &'a mut Function<'str>,
+        fun: &'a mut FunctionBody<'str>,
         shared: &'a crate::context::Shared<'str>,
         interfaces: &'a jstd::registry::Registry<
             FunctionId,
@@ -80,7 +80,7 @@ impl<'a, 'str> PassBacking<'a, 'str> {
     /// Wrap `fun` (checked out under `id`) over a whole module `&Context` — the
     /// module/test-scope convenience constructor (narrows to the shared state +
     /// interface registry).
-    pub fn from_ctx(fun: &'a mut Function<'str>, ctx: &'a Context<'str>) -> Self {
+    pub fn from_ctx(fun: &'a mut FunctionBody<'str>, ctx: &'a Context<'str>) -> Self {
         Self::new(fun, &ctx.shared, &ctx.interfaces)
     }
 
@@ -105,7 +105,7 @@ impl<'a, 'str> PassBacking<'a, 'str> {
     // ---- primitives ---------------------------------------------------------
 
     /// The owned function's storage (write). Panics if `f` is not this function.
-    pub fn function_mut(&mut self, f: FunctionId) -> &mut Function<'str> {
+    pub fn function_mut(&mut self, f: FunctionId) -> &mut FunctionBody<'str> {
         assert_eq!(
             f,
             self.fun.id(),
@@ -114,7 +114,7 @@ impl<'a, 'str> PassBacking<'a, 'str> {
         self.fun
     }
     /// The owned function's storage (read).
-    pub fn function(&self, f: FunctionId) -> &Function<'str> {
+    pub fn function(&self, f: FunctionId) -> &FunctionBody<'str> {
         assert_eq!(
             f,
             self.fun.id(),
@@ -285,7 +285,7 @@ impl<'a, 'str> PassBacking<'a, 'str> {
         };
         let users: Vec<_> = self
             .function(func)
-            .users_of(old)
+            .local_users_of(old)
             .iter()
             .map(|&local| InstructionId::new(func, local))
             .collect();

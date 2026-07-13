@@ -380,22 +380,21 @@ pub(super) fn key_for(form: &NormalForm, id: ValueId, mnemonic: &Mnemonic) -> No
 
 /// Concrete pass twin of [`emit`].
 fn emit_c<'str>(
-    body: &mut FunctionBody<'_, 'str>,
-    cx: ContextView<'_, 'str>,
+    body: &mut FunctionBody<'str>,
+    _cx: ContextView<'_, 'str>,
     block: BlockId,
     at: InstructionId,
     mnemonic: Mnemonic,
     ty: qcode::types::TypeId,
 ) -> ValueId {
-    let _ = block; // func = body.id (own function); block.func == body.id here.
-    let new = body.push_mnemonic_with_type(cx, mnemonic, ty);
-    body.insert_insn_before(cx, block, at, new);
+    let new = body.push_mnemonic_with_type(mnemonic, ty);
+    body.insert_insn_before(block, at, new);
     ValueId::Instruction(new)
 }
 
 /// Concrete pass twin of [`build_value`].
 fn build_value_c<'str>(
-    body: &mut FunctionBody<'_, 'str>,
+    body: &mut FunctionBody<'str>,
     cx: ContextView<'_, 'str>,
     block: BlockId,
     at: InstructionId,
@@ -409,7 +408,7 @@ fn build_value_c<'str>(
     } = form
     {
         if terms.is_empty() {
-            return body.read_host(cx).shr().get_const(*constant, *width);
+            return cx.read_host(body).shr().get_const(*constant, *width);
         }
         if terms.len() == 1 && terms[0].1 == 1 && *constant == 0 {
             return terms[0].0;
@@ -420,7 +419,7 @@ fn build_value_c<'str>(
     }
     let int_ty = match form {
         NormalForm::Affine { width, .. } | NormalForm::Mask { width, .. } => {
-            body.read_host(cx).shr().types.get_or_make_int(*width)
+            cx.read_host(body).shr().types.get_or_make_int(*width)
         }
         NormalForm::Opaque(_) => unreachable!("opaque forms are never materialized"),
     };
@@ -433,7 +432,7 @@ fn build_value_c<'str>(
 
 /// Concrete pass twin of [`canonical_mnemonic`].
 fn canonical_mnemonic_c<'str>(
-    body: &mut FunctionBody<'_, 'str>,
+    body: &mut FunctionBody<'str>,
     cx: ContextView<'_, 'str>,
     block: BlockId,
     at: InstructionId,
@@ -450,8 +449,8 @@ fn canonical_mnemonic_c<'str>(
         } => Mnemonic::Binop(Binary {
             op: Binop::Int(*op),
             lhs: term.localize(func),
-            rhs: body
-                .read_host(cx)
+            rhs: cx
+                .read_host(body)
                 .shr()
                 .get_const(*mask, *width)
                 .localize(func),
@@ -505,8 +504,8 @@ fn canonical_mnemonic_c<'str>(
                 return Mnemonic::Binop(Binary {
                     op: Binop::Int(IntBinop::Mul),
                     lhs: last_v.localize(func),
-                    rhs: body
-                        .read_host(cx)
+                    rhs: cx
+                        .read_host(body)
                         .shr()
                         .get_const(last_k, width)
                         .localize(func),
@@ -539,7 +538,7 @@ fn canonical_mnemonic_c<'str>(
 /// Concrete pass twin of [`scaled_value`].
 #[allow(clippy::too_many_arguments)]
 fn scaled_value_c<'str>(
-    body: &mut FunctionBody<'_, 'str>,
+    body: &mut FunctionBody<'str>,
     cx: ContextView<'_, 'str>,
     block: BlockId,
     at: InstructionId,
@@ -561,7 +560,7 @@ fn scaled_value_c<'str>(
 
 /// Concrete pass twin of [`signed_lit`].
 fn signed_lit_c<'str>(
-    body: &mut FunctionBody<'_, 'str>,
+    body: &mut FunctionBody<'str>,
     cx: ContextView<'_, 'str>,
     s: i64,
     width: usize,
@@ -569,14 +568,14 @@ fn signed_lit_c<'str>(
     if s < 0 {
         (
             IntBinop::Sub,
-            body.read_host(cx)
+            cx.read_host(body)
                 .shr()
                 .get_const(s.unsigned_abs() & mask_for(width), width),
         )
     } else {
         (
             IntBinop::Add,
-            body.read_host(cx)
+            cx.read_host(body)
                 .shr()
                 .get_const(s as u64 & mask_for(width), width),
         )
@@ -586,7 +585,7 @@ fn signed_lit_c<'str>(
 /// Concrete pass twin of [`materialize`].
 #[allow(clippy::too_many_arguments)]
 pub(super) fn materialize_c<'str>(
-    body: &mut FunctionBody<'_, 'str>,
+    body: &mut FunctionBody<'str>,
     cx: ContextView<'_, 'str>,
     block: BlockId,
     at: InstructionId,
@@ -602,7 +601,7 @@ pub(super) fn materialize_c<'str>(
     } = key
     {
         if terms.is_empty() {
-            return body.read_host(cx).shr().get_const(*constant, *width);
+            return cx.read_host(body).shr().get_const(*constant, *width);
         }
         if terms.len() == 1 && terms[0].1 == 1 && *constant == 0 {
             return terms[0].0;
@@ -854,16 +853,16 @@ mod spike {
     use qcode::{
         builder::Builder,
         testing::TestContext,
-        value::{BasicBlock, Function, Value},
+        value::{BasicBlock, FunctionBody, Value},
     };
 
     #[test]
     fn sp_relative_identity_holds_but_alignment_reroots() {
         let mut tc = TestContext::new();
-        let fun = Function::make(&mut tc.ctx, "f".into()).unwrap().id;
+        let fun = FunctionBody::make(&mut tc.ctx, "f".into()).unwrap().id;
         let entry = { tc.ctx.get_or_make_block(0x1000, fun) };
         {
-            let mut f = Function::from_id_mut(&mut tc.ctx, fun);
+            let mut f = FunctionBody::from_id_mut(&mut tc.ctx, fun);
             f.set_root(entry).unwrap();
             f.add_block(entry);
         }
@@ -916,10 +915,10 @@ mod spike {
         let mut tc = TestContext::new();
         let ram = tc.ctx.shared.default_space;
         let reg = tc.reg_space;
-        let fun = Function::make(&mut tc.ctx, "f".into()).unwrap().id;
+        let fun = FunctionBody::make(&mut tc.ctx, "f".into()).unwrap().id;
         let entry = { tc.ctx.get_or_make_block(0x1000, fun) };
         {
-            let mut f = Function::from_id_mut(&mut tc.ctx, fun);
+            let mut f = FunctionBody::from_id_mut(&mut tc.ctx, fun);
             f.set_root(entry).unwrap();
             f.add_block(entry);
         }
@@ -968,10 +967,10 @@ mod spike {
     fn gep_decomposes_to_base_plus_offset_like_an_add() {
         use qcode::types::AggregateField;
         let mut tc = TestContext::new();
-        let fun = Function::make(&mut tc.ctx, "f".into()).unwrap().id;
+        let fun = FunctionBody::make(&mut tc.ctx, "f".into()).unwrap().id;
         let entry = { tc.ctx.get_or_make_block(0x1000, fun) };
         {
-            let mut f = Function::from_id_mut(&mut tc.ctx, fun);
+            let mut f = FunctionBody::from_id_mut(&mut tc.ctx, fun);
             f.set_root(entry).unwrap();
             f.add_block(entry);
         }

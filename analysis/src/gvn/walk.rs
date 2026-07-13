@@ -387,11 +387,11 @@ pub(super) fn run_dominator_walk<'str>(
 //
 // These concrete twins drive the *function-pass* GVN chain over a checked-out
 // `(&mut FunctionBody, ContextView)` with no threaded mutation host: reads route
-// through `body.read_host(cx)`, shallow rewrites through the inherent
+// through `cx.read_host(body)`, shallow rewrites through the inherent
 // `body.verb(cx, …)` surface (via `Editor`'s `_c` methods). The large shared
 // mutation helpers (`materialize`, `MemForward::{record_store,try_load}`,
 // `narrow_to`, `simplify_bitwise`/`simplify_compare`) are still reached through a
-// scoped `body.host(cx)` — the same pattern the dce sibling (8cbc4b2) uses for
+// scoped `cx.host(body)` — the same pattern the dce sibling (8cbc4b2) uses for
 // `replace_terminator_with_branch`; they stay generic because the generic path
 // above shares them.
 // ===========================================================================
@@ -402,26 +402,26 @@ impl Editor {
     /// Concrete twin of [`replace`](Self::replace).
     pub(super) fn replace_c<'str>(
         &mut self,
-        body: &mut FunctionBody<'_, 'str>,
-        cx: ContextView<'_, 'str>,
+        body: &mut FunctionBody<'str>,
+        _cx: ContextView<'_, 'str>,
         insn: InstructionId,
         with: ValueId,
     ) {
-        body.replace_all_uses_with(cx, ValueId::Instruction(insn), with);
+        body.replace_all_uses_with(ValueId::Instruction(insn), with);
         self.redundant.insert(insn);
     }
 
     /// Concrete twin of [`replace_with_new_insn`](Self::replace_with_new_insn).
     pub(super) fn replace_with_new_insn_c<'str>(
         &mut self,
-        body: &mut FunctionBody<'_, 'str>,
+        body: &mut FunctionBody<'str>,
         cx: ContextView<'_, 'str>,
         block_id: BlockId,
         at: InstructionId,
         mnemonic: Mnemonic,
         size: usize,
     ) -> InstructionId {
-        let type_id = body.read_host(cx).shr().types.get_or_make_int(size);
+        let type_id = cx.read_host(body).shr().types.get_or_make_int(size);
         self.replace_with_new_insn_typed_c(body, cx, block_id, at, mnemonic, type_id)
     }
 
@@ -429,8 +429,8 @@ impl Editor {
     /// [`replace_with_new_insn_typed`](Self::replace_with_new_insn_typed).
     pub(super) fn replace_with_new_insn_typed_c<'str>(
         &mut self,
-        body: &mut FunctionBody<'_, 'str>,
-        cx: ContextView<'_, 'str>,
+        body: &mut FunctionBody<'str>,
+        _cx: ContextView<'_, 'str>,
         block_id: BlockId,
         at: InstructionId,
         mnemonic: Mnemonic,
@@ -438,18 +438,18 @@ impl Editor {
     ) -> InstructionId {
         // `func = body.id` (own function); `block_id.func == body.id` here, so this
         // is behaviour-identical to the generic `push_mnemonic_with_type(block_id.func, …)`.
-        let new_id = body.push_mnemonic_with_type(cx, mnemonic, type_id);
-        body.insert_insn_before(cx, block_id, at, new_id);
-        body.replace_all_uses_with(cx, ValueId::Instruction(at), ValueId::Instruction(new_id));
+        let new_id = body.push_mnemonic_with_type(mnemonic, type_id);
+        body.insert_insn_before(block_id, at, new_id);
+        body.replace_all_uses_with(ValueId::Instruction(at), ValueId::Instruction(new_id));
         self.redundant.insert(at);
         new_id
     }
 
     /// Concrete twin of [`finish`](Self::finish).
-    fn finish_c<'str>(self, body: &mut FunctionBody<'_, 'str>, cx: ContextView<'_, 'str>) -> bool {
+    fn finish_c<'str>(self, body: &mut FunctionBody<'str>, _cx: ContextView<'_, 'str>) -> bool {
         let changed = !self.redundant.is_empty();
         for insn in self.redundant {
-            body.remove_instruction(cx, insn);
+            body.remove_instruction(insn);
         }
         changed
     }
@@ -473,7 +473,7 @@ pub(super) trait SubPassC<'str> {
     #[allow(clippy::too_many_arguments)]
     fn on_block_entry(
         &self,
-        _body: &mut FunctionBody<'_, 'str>,
+        _body: &mut FunctionBody<'str>,
         _cx: ContextView<'_, 'str>,
         _state: &mut dyn Any,
         _block_id: BlockId,
@@ -487,7 +487,7 @@ pub(super) trait SubPassC<'str> {
     /// See [`SubPass::on_insn`].
     fn on_insn(
         &self,
-        body: &mut FunctionBody<'_, 'str>,
+        body: &mut FunctionBody<'str>,
         cx: ContextView<'_, 'str>,
         state: &mut dyn Any,
         ic: &InsnCtx,
@@ -497,7 +497,7 @@ pub(super) trait SubPassC<'str> {
     /// See [`SubPass::after_block`].
     fn after_block(
         &self,
-        _body: &mut FunctionBody<'_, 'str>,
+        _body: &mut FunctionBody<'str>,
         _cx: ContextView<'_, 'str>,
         _state: &mut dyn Any,
         _block_id: BlockId,
@@ -526,7 +526,7 @@ fn clone_states_c<'str>(
 
 /// Concrete twin of [`run_block`].
 fn run_block_c<'str>(
-    body: &mut FunctionBody<'_, 'str>,
+    body: &mut FunctionBody<'str>,
     cx: ContextView<'_, 'str>,
     block_id: BlockId,
     passes: &[Box<dyn SubPassC<'str>>],
@@ -535,11 +535,11 @@ fn run_block_c<'str>(
     numbering: &Numbering,
 ) -> bool {
     let mut ed = Editor::new();
-    let insns: Vec<InstructionId> = body.block_ref(cx, block_id).instruction_ids();
+    let insns: Vec<InstructionId> = cx.read_host(body).block_ref(block_id).instruction_ids();
 
     for insn_id in insns {
         let (id, size, mnemonic) = {
-            let insn = body.insn_ref(cx, insn_id);
+            let insn = cx.read_host(body).insn_ref(insn_id);
             (insn.id(), insn.size(), insn.mnemonic().clone())
         };
         let ic = InsnCtx {
@@ -565,7 +565,7 @@ fn run_block_c<'str>(
 /// hooks (no dominator tree exists for a lone block), over a checked-out
 /// `(&mut FunctionBody, ContextView)`.
 pub(super) fn run_single_block_c<'str>(
-    body: &mut FunctionBody<'_, 'str>,
+    body: &mut FunctionBody<'str>,
     cx: ContextView<'_, 'str>,
     block_id: BlockId,
     passes: &[Box<dyn SubPassC<'str>>],
@@ -580,13 +580,13 @@ pub(super) fn run_single_block_c<'str>(
 
 /// Concrete single-function-scope twin of the flat fixpoint driver.
 pub(super) fn run_flat_fixpoint_c<'str>(
-    body: &mut FunctionBody<'_, 'str>,
+    body: &mut FunctionBody<'str>,
     cx: ContextView<'_, 'str>,
     func_id: FunctionId,
     passes: &[Box<dyn SubPassC<'str>>],
 ) -> bool {
-    let block_ids: Vec<BlockId> = body
-        .read_host(cx)
+    let block_ids: Vec<BlockId> = cx
+        .read_host(body)
         .function_ref(func_id)
         .iter()
         .map(|block| block.id)
@@ -622,7 +622,7 @@ struct WalkC<'a, 'str> {
 impl<'str> WalkC<'_, 'str> {
     fn rec(
         &mut self,
-        body: &mut FunctionBody<'_, 'str>,
+        body: &mut FunctionBody<'str>,
         cx: ContextView<'_, 'str>,
         block_id: BlockId,
         inherited: &[Box<dyn Any>],
@@ -661,7 +661,7 @@ impl<'str> WalkC<'_, 'str> {
             );
         }
         for &child in self.tree.children_of(block_id) {
-            if body.read_host(cx).block(child).parent == Some(self.owner) {
+            if cx.read_host(body).block(child).parent == Some(self.owner) {
                 self.rec(body, cx, child, &states);
             }
         }
@@ -670,20 +670,20 @@ impl<'str> WalkC<'_, 'str> {
 
 /// Concrete twin of [`run_dominator_walk`].
 pub(super) fn run_dominator_walk_c<'str>(
-    body: &mut FunctionBody<'_, 'str>,
+    body: &mut FunctionBody<'str>,
     cx: ContextView<'_, 'str>,
     func_id: FunctionId,
     passes: &[Box<dyn SubPassC<'str>>],
     aliases: Option<&AliasResult>,
 ) -> bool {
-    let root = match body.read_host(cx).function_ref(func_id).root() {
+    let root = match cx.read_host(body).function_ref(func_id).root() {
         Some(r) => r.id,
         None => return false,
     };
 
-    let root_reachable = reachable_from(body.read_host(cx), root, func_id);
-    let entries: Vec<BlockId> = body
-        .read_host(cx)
+    let root_reachable = reachable_from(cx.read_host(body), root, func_id);
+    let entries: Vec<BlockId> = cx
+        .read_host(body)
         .function_ref(func_id)
         .iter()
         .filter(|block| !root_reachable.contains(&block.id))
@@ -693,7 +693,7 @@ pub(super) fn run_dominator_walk_c<'str>(
 
     let mut seen_count: HashMap<BlockId, u32> = HashMap::default();
     for &entry in std::iter::once(&root).chain(&entries) {
-        for block in reachable_from(body.read_host(cx), entry, func_id) {
+        for block in reachable_from(cx.read_host(body), entry, func_id) {
             *seen_count.entry(block).or_default() += 1;
         }
     }
@@ -702,11 +702,11 @@ pub(super) fn run_dominator_walk_c<'str>(
         .filter_map(|(block, count)| (count > 1).then_some(block))
         .collect();
 
-    let numbering = super::affine::precompute_forms(body.read_host(cx), func_id);
+    let numbering = super::affine::precompute_forms(cx.read_host(body), func_id);
 
     let mut changed = false;
     for entry in std::iter::once(root).chain(entries) {
-        let tree = compute_dominators(&body.read_host(cx).function_ref(entry.func), entry);
+        let tree = compute_dominators(&cx.read_host(body).function_ref(entry.func), entry);
         let mut walk = WalkC {
             passes,
             tree: &tree,
@@ -730,7 +730,7 @@ mod tests {
         builder::Builder,
         context::Context,
         testing::TestContext,
-        value::{BasicBlock, Function, Value, ValueId},
+        value::{BasicBlock, FunctionBody, Value, ValueId},
     };
     use qcode_macro::qcode;
 
@@ -741,7 +741,7 @@ mod tests {
     #[test]
     fn test_register_forwarding_in_orphaned_post_call_block() {
         let mut tc = TestContext::new();
-        let fun_id = Function::make(&mut tc.ctx, "test".into()).unwrap().id;
+        let fun_id = FunctionBody::make(&mut tc.ctx, "test".into()).unwrap().id;
         // Both blocks are born into `fun_id`'s own arena (self-stored,
         // self-parented). The orphan-ness of `post_call` is a *CFG* property — the
         // `call` terminating `entry` grows no edge to it — not a storage one, so
@@ -750,7 +750,7 @@ mod tests {
         let entry = tc.ctx.get_or_make_block(0x1000, fun_id);
         let post_call = tc.ctx.get_or_make_block(0x2000, fun_id);
         {
-            let mut f = Function::from_id_mut(&mut tc.ctx, fun_id);
+            let mut f = FunctionBody::from_id_mut(&mut tc.ctx, fun_id);
             f.set_root(entry).unwrap();
             f.add_block(post_call);
         }

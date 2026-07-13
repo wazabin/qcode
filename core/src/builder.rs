@@ -41,7 +41,7 @@ use crate::{
     space::{SPACE_CONST, Space, SpaceId, SpaceType},
     types::{AggregateField, TypeId},
     value::{
-        Function, Instruction, Renameable, Value, ValueId, ValueRef,
+        FunctionBody, Instruction, Renameable, Value, ValueId, ValueRef,
         block::{BasicBlock, BlockId, EdgeId},
         block_param::BlockParamMutRef,
         function::FunctionId,
@@ -85,7 +85,7 @@ pub trait BuilderBacking<'str> {
     /// instruction/block-param/block reads).
     fn bb_read_host(&self) -> HostRef<'_, 'str>;
     /// The owning function's storage (write).
-    fn bb_function_mut(&mut self, f: FunctionId) -> &mut Function<'str>;
+    fn bb_function_mut(&mut self, f: FunctionId) -> &mut FunctionBody<'str>;
     /// The instruction `id`, routed to its owning function's arena (write).
     fn bb_instruction_mut(&mut self, id: InstructionId) -> &mut Instruction<'str>;
     /// The block `id`, routed to its owning function's arena (write).
@@ -135,7 +135,7 @@ impl<'str> BuilderBacking<'str> for &mut Context<'str> {
     fn bb_read_host(&self) -> HostRef<'_, 'str> {
         HostRef::Module(self)
     }
-    fn bb_function_mut(&mut self, f: FunctionId) -> &mut Function<'str> {
+    fn bb_function_mut(&mut self, f: FunctionId) -> &mut FunctionBody<'str> {
         &mut self.bodies[f]
     }
     fn bb_instruction_mut(&mut self, id: InstructionId) -> &mut Instruction<'str> {
@@ -193,7 +193,7 @@ impl<'str> BuilderBacking<'str> for PassBacking<'_, 'str> {
             interfaces: self.interfaces,
         }
     }
-    fn bb_function_mut(&mut self, f: FunctionId) -> &mut Function<'str> {
+    fn bb_function_mut(&mut self, f: FunctionId) -> &mut FunctionBody<'str> {
         assert_eq!(
             f,
             self.fun.id(),
@@ -1372,7 +1372,7 @@ impl<'str, 'ctx, Ctx: BuilderBacking<'str>> Builder<'str, 'ctx, Ctx> {
         let HostRef::Module(ctx) = self.read_host() else {
             return None;
         };
-        let root = Function::from_id(ctx, body).root()?.id;
+        let root = FunctionBody::from_id(ctx, body).root()?.id;
         BasicBlock::from_id(ctx, root)
             .iter()
             .find_map(|i| match i.mnemonic() {
@@ -1389,7 +1389,7 @@ impl<'str, 'ctx, Ctx: BuilderBacking<'str>> Builder<'str, 'ctx, Ctx> {
         let HostRef::Module(ctx) = self.read_host() else {
             return None;
         };
-        Function::from_id(ctx, body)
+        FunctionBody::from_id(ctx, body)
             .iter()
             .flat_map(|block| block.iter())
             .find_map(|i| match i.mnemonic() {
@@ -1921,14 +1921,14 @@ impl<'str, 'ctx> Builder<'str, 'ctx, &'ctx mut Context<'str>> {
     /// the block (and an anonymous host function if nothing is mapped) if needed.
     pub fn from_context<'m>(ctx: &'m mut Context<'str>, address: u64) -> Builder<'str, 'm> {
         let block_id = match ctx.get_at_addr(&address) {
-            Some(ValueId::Function(func)) => match Function::from_id(ctx, func).root() {
+            Some(ValueId::Function(func)) => match FunctionBody::from_id(ctx, func).root() {
                 Some(root) => root.id,
                 None => ctx.get_or_make_block(address, func),
             },
             _ => match BasicBlock::from_addr(ctx, address) {
                 Some(block) => block.id,
                 None => {
-                    let func = Function::make(ctx, Cow::Owned(format!("blk_{address:x}")))
+                    let func = FunctionBody::make(ctx, Cow::Owned(format!("blk_{address:x}")))
                         .expect("anon host function")
                         .id;
                     ctx.get_or_make_block(address, func)
@@ -1960,11 +1960,11 @@ impl<'str, 'ctx> Builder<'str, 'ctx, &'ctx mut Context<'str>> {
 
     /// Gets or creates a function whose root is the local label block for `name`.
     pub fn get_or_make_local_function(&mut self, name: Cow<'str, str>) -> FunctionId {
-        let existing = Function::from_name(self.context(), &name).map(|f| f.id);
+        let existing = FunctionBody::from_name(self.context(), &name).map(|f| f.id);
         if let Some(fid) = existing {
             fid
         } else {
-            Function::make(self.context_mut(), name)
+            FunctionBody::make(self.context_mut(), name)
                 .expect("Name was checked above")
                 .id
         }
@@ -2017,7 +2017,7 @@ mod tests {
     #[test]
     fn checked_builder_matches_module_builder() {
         use crate::value::{
-            FunctionId, FunctionRef, block::BasicBlock, function::Function,
+            FunctionId, FunctionRef, block::BasicBlock, function::FunctionBody,
             util::host_mut::PassBacking,
         };
 
@@ -2063,8 +2063,8 @@ mod tests {
 
         // ---- (a) module builder ---------------------------------------------
         let mut ctx_a = Context::new();
-        let fid_a = Function::make(&mut ctx_a, "foo".into()).unwrap().id;
-        let entry_a = Function::from_id_mut(&mut ctx_a, fid_a).make_root().id;
+        let fid_a = FunctionBody::make(&mut ctx_a, "foo".into()).unwrap().id;
+        let entry_a = FunctionBody::from_id_mut(&mut ctx_a, fid_a).make_root().id;
         {
             let mut b = Builder::from_block(BasicBlock::from_id_mut(&mut ctx_a, entry_a));
             body(&mut b);
@@ -2077,8 +2077,8 @@ mod tests {
 
         // ---- (b) checked-out builder ----------------------------------------
         let mut ctx_b = Context::new();
-        let fid_b = Function::make(&mut ctx_b, "foo".into()).unwrap().id;
-        let entry_b = Function::from_id_mut(&mut ctx_b, fid_b).make_root().id;
+        let fid_b = FunctionBody::make(&mut ctx_b, "foo".into()).unwrap().id;
+        let entry_b = FunctionBody::from_id_mut(&mut ctx_b, fid_b).make_root().id;
         {
             let mut host =
                 PassBacking::new(&mut ctx_b.bodies[fid_b], &ctx_b.shared, &ctx_b.interfaces);
@@ -2097,14 +2097,14 @@ mod tests {
     /// (e.g. a `take_while` result) yields a `List<U>`, not a fixed array.
     #[test]
     fn map_over_a_list_yields_a_list() {
-        use crate::value::{Function, insn::Return};
+        use crate::value::{FunctionBody, insn::Return};
 
         let mut ctx = Context::new();
         let i8 = ctx.shared.types.get_or_make_int(1);
 
         // body: fn(i8) -> i8 returning its param (so the map result elem is i8).
-        let body = Function::make(&mut ctx, "body".into()).unwrap().id;
-        let broot = Function::from_id_mut(&mut ctx, body).make_root().id;
+        let body = FunctionBody::make(&mut ctx, "body".into()).unwrap().id;
+        let broot = FunctionBody::from_id_mut(&mut ctx, body).make_root().id;
         let bp = BasicBlock::from_id_mut(&mut ctx, broot).push_param(1).id;
         let dummy = ctx.get_const(0, 8).id();
         let ret = InstructionRef::from_mnemonic_with_type(
@@ -2120,8 +2120,8 @@ mod tests {
         BasicBlock::from_id_mut(&mut ctx, broot).push_insn(ret);
 
         // host: a value typed `List<i8>` (bound 4) to map over.
-        let host = Function::make(&mut ctx, "host".into()).unwrap().id;
-        let hentry = Function::from_id_mut(&mut ctx, host).make_root().id;
+        let host = FunctionBody::make(&mut ctx, "host".into()).unwrap().id;
+        let hentry = FunctionBody::from_id_mut(&mut ctx, host).make_root().id;
         let list_ty = ctx.shared.types.get_or_make_list(i8, 4);
         let src_pid = BasicBlock::from_id_mut(&mut ctx, hentry).push_param(4).id;
         ctx.block_param_mut(src_pid).type_id = list_ty;
@@ -2398,8 +2398,8 @@ mod tests {
     #[test]
     fn from_context_materializes_root_in_registered_function_arena() {
         let mut ctx = Context::new();
-        let func = Function::make_at_addr(&mut ctx, 0x2000, None).id;
-        assert!(Function::from_id(&ctx, func).root().is_none());
+        let func = FunctionBody::make_at_addr(&mut ctx, 0x2000, None).id;
+        assert!(FunctionBody::from_id(&ctx, func).root().is_none());
 
         let block = {
             let builder = Builder::from_context(&mut ctx, 0x2000);
@@ -2408,10 +2408,10 @@ mod tests {
 
         assert_eq!(block.func, func);
         assert_eq!(
-            Function::from_id(&ctx, func).root().map(|root| root.id),
+            FunctionBody::from_id(&ctx, func).root().map(|root| root.id),
             Some(block)
         );
-        assert!(Function::from_name(&ctx, "blk_2000").is_none());
+        assert!(FunctionBody::from_name(&ctx, "blk_2000").is_none());
     }
 
     #[test]

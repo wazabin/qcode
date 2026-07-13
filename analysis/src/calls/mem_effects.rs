@@ -4,7 +4,7 @@
 //! [`set_all_written_spaces`] computes, for every non-external function, the
 //! exact set of non-register memory [`SpaceId`]s it may write — directly in its
 //! own body, or transitively through a (direct, resolved) callee. The result is
-//! recorded on the function's [`written_spaces`](qcode::value::Function::written_spaces)
+//! recorded on the function's [`written_spaces`](qcode::value::FunctionBody::written_spaces)
 //! signature field.
 //!
 //! The consumer is store-to-load forwarding's call-prune
@@ -24,7 +24,7 @@ use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
 use qcode::{
     context::Context,
     space::{Space, SpaceId, SpaceType},
-    value::{Function, FunctionId, insn::Mnemonic},
+    value::{FunctionBody, FunctionId, insn::Mnemonic},
 };
 
 /// A function's witnessed memory-write effect: either a bounded set of
@@ -46,7 +46,7 @@ fn local_effect(
     let mut spaces = HashSet::default();
     let mut callees = Vec::new();
     let mut unbounded = false;
-    for block in Function::from_id(ctx, function_id).blocks() {
+    for block in FunctionBody::from_id(ctx, function_id).blocks() {
         for insn in block.iter() {
             match insn.mnemonic() {
                 // Register writes are tracked separately (`clobbered_regs`); only
@@ -61,7 +61,7 @@ fn local_effect(
                         unbounded = true;
                         continue;
                     };
-                    if Function::from_id(ctx, target).is_external() {
+                    if FunctionBody::from_id(ctx, target).is_external() {
                         unbounded = true;
                     } else {
                         callees.push(target);
@@ -81,7 +81,7 @@ fn local_effect(
     (spaces, callees, unbounded)
 }
 
-/// Compute and record [`written_spaces`](qcode::value::Function::written_spaces)
+/// Compute and record [`written_spaces`](qcode::value::FunctionBody::written_spaces)
 /// for every non-external function as a least fixpoint over the call graph: a
 /// function's write-set is its own stores unioned with every resolved callee's
 /// write-set, becoming unbounded as soon as any (transitive) callee is unbounded.
@@ -161,7 +161,7 @@ pub fn set_all_written_spaces(ctx: &mut Context) {
                 Some(v)
             }
         };
-        Function::from_id_mut(ctx, id).set_written_spaces(summary);
+        FunctionBody::from_id_mut(ctx, id).set_written_spaces(summary);
     }
 }
 
@@ -189,7 +189,7 @@ crate::register_module_pass!(SeedWrittenSpaces);
 mod tests {
     use super::*;
     use crate::{AliasResult, constant_fold_function, gvn_function};
-    use qcode::{context::Context, lower::lower_str, value::Function};
+    use qcode::{context::Context, lower::lower_str, value::FunctionBody};
 
     /// The motivating shape, reduced: a buffer pointer is spilled into a frame
     /// slot, the block ends in a `call` to a callee that writes only its own
@@ -272,7 +272,7 @@ fn callee:
             let aliases = AliasResult::simple_for_function(&ctx, caller);
             gvn_function(&mut ctx, caller, Some(&aliases));
         }
-        format!("{}", Function::from_id(&ctx, caller))
+        format!("{}", FunctionBody::from_id(&ctx, caller))
     }
 
     /// Lower the loop shape, seed write-spaces, optionally record
@@ -291,7 +291,7 @@ fn callee:
             let aliases = AliasResult::simple_for_function(&ctx, caller);
             gvn_function(&mut ctx, caller, Some(&aliases));
         }
-        format!("{}", Function::from_id(&ctx, caller))
+        format!("{}", FunctionBody::from_id(&ctx, caller))
     }
 
     /// A function that ends in an unresolved indirect tail-branch (`goto [p]` —
@@ -314,7 +314,7 @@ fn callee:
         let _ = entry;
         set_all_written_spaces(&mut ctx);
         assert!(
-            Function::from_id(&ctx, stub).written_spaces().is_none(),
+            FunctionBody::from_id(&ctx, stub).written_spaces().is_none(),
             "an unresolved indirect tail-branch must have an unbounded write-set"
         );
     }
@@ -326,7 +326,7 @@ fn callee:
         let mut ctx = Context::new();
         let syms = lower_str(&mut ctx, SPILL_CALL_RELOAD).expect("parse");
         set_all_written_spaces(&mut ctx);
-        let callee = Function::from_id(&ctx, syms.functions["callee"]);
+        let callee = FunctionBody::from_id(&ctx, syms.functions["callee"]);
         let spaces = callee
             .written_spaces()
             .expect("callee write-set is bounded");

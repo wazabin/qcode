@@ -2,7 +2,7 @@
 //! mirror `assume_call_returns`/`verify_assumptions` for the
 //! `reads_unbounded_stack` / `frame_escapes_to_unbounded` function flags.
 
-use qcode::{assumption::Proposition, context::Context, pass_scope, value::Function};
+use qcode::{assumption::Proposition, context::Context, pass_scope, value::FunctionBody};
 
 /// Seed the stack-escape facts proven in earlier checkpoint+replay rounds
 /// (now sitting as known [`Proposition`]s on the freshly-cloned IR) back onto
@@ -18,10 +18,10 @@ pub fn seed_stack_facts(ctx: &mut Context) {
         }
         match prop {
             Proposition::UnboundedStackReader(id) => {
-                Function::from_id_mut(ctx, id).set_reads_unbounded_stack(true);
+                FunctionBody::from_id_mut(ctx, id).set_reads_unbounded_stack(true);
             }
             Proposition::FrameEscapingCaller(id) => {
-                Function::from_id_mut(ctx, id).set_frame_escapes_to_unbounded(true);
+                FunctionBody::from_id_mut(ctx, id).set_frame_escapes_to_unbounded(true);
             }
             _ => {}
         }
