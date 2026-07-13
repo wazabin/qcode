@@ -306,7 +306,7 @@ fn transform<'str>(
         let g_head = minted.make_block(g);
         let base = minted.make_block(g);
         let rec = minted.make_block(g);
-        minted.function_mut(g).set_root_id(Some(g_head));
+        minted.function_mut(g).set_root_id(Some(g_head.local));
         let _ = BaseRef::new(minted.reborrow(), base)
             .rename_local(Cow::Owned(format!("{base_name}_base")));
         let _ = BaseRef::new(minted.reborrow(), rec)

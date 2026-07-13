@@ -427,7 +427,7 @@ fn outline_core<'str>(
     // Root block, set as the minted function's entry, named for display (block
     // names are function-scoped, so uniqueness is within the new function).
     let root = minted.make_block(fid);
-    minted.function_mut(fid).set_root_id(Some(root));
+    minted.function_mut(fid).set_root_id(Some(root.local));
     let block_name = format!("{name}_entry");
     let _ = BaseRef::new(minted.reborrow(), root).rename_local(std::borrow::Cow::Owned(block_name));
 

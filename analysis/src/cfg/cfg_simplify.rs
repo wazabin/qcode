@@ -266,7 +266,7 @@ fn try_bypass_empty_block_generic<'str>(
     }
 
     // The entry block dominates everything; deleting it would orphan the body.
-    if host.function(function_id).root_id() == Some(b_id) {
+    if host.function(function_id).root_id() == Some(b_id.local) {
         return false;
     }
 

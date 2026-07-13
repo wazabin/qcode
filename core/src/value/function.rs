@@ -75,29 +75,24 @@ pub struct Function<'str> {
     /// The entry block (dominates all other blocks in this function).
     /// Private: read via [`Function::root_id`], write via
     /// [`Function::set_root_id`] (stage 6a §11).
-    root: Option<BlockId>,
+    root: Option<LocalBlockId>,
 
     /// Instruction storage for this function. Function-scoped: the composite
     /// [`InstructionId`](crate::value::InstructionId) `{ func, local }` indexes
     /// here via `local`. Append-only with tombstones; never compacted.
     pub(crate) insns: Registry<LocalInsnId, Instruction<'str>>,
 
-    /// Basic-block *storage* for this function. A block is born here and keeps
-    /// its `id.func` for the life of the program (its `LocalBlockId` indexes
-    /// this arena). Storage is decoupled from *ownership*: lifting may attribute
-    /// a block to a different function than the one it was born in (see
-    /// `reattribute_blocks`), so a block stored here can be owned elsewhere. Use
-    /// [`FunctionRef::blocks`] (which reads [`roster`](Self::roster)) to iterate
-    /// the blocks this function owns, not this arena directly.
+    /// Basic-block storage for this function. A block is born here and keeps its
+    /// `id.func` for life; Path A makes arena membership and ownership identical.
+    /// Use [`FunctionRef::blocks`] (which reads [`roster`](Self::roster)) to skip
+    /// detached/tombstoned arena entries.
     pub(crate) blocks: Registry<LocalBlockId, BasicBlock<'str>>,
 
-    /// Ownership roster: the composite ids of the blocks this function owns, in
-    /// order. Usually all live in this function's own `blocks` arena, but a
-    /// reattributed block may be stored in another function's arena. Kept in
-    /// sync with each block's `parent` by `add_block`/`remove_block`. Tombstoned
-    /// blocks are filtered out on read.
+    /// Body-local ids of the blocks this function owns, in order. Path A forbids
+    /// cross-arena ownership, so every entry indexes this function's `blocks`
+    /// arena. Kept in sync with each block's `parent`; tombstones are filtered.
     #[serde(default)]
-    pub(crate) roster: Vec<BlockId>,
+    pub(crate) roster: Vec<LocalBlockId>,
 
     /// Block-parameter storage for this function.
     pub(crate) params: Registry<LocalParamId, BlockParam<'str>>,
@@ -219,18 +214,16 @@ impl<'str> Function<'str> {
         self.users.iter().map(|(v, u)| (*v, u.as_slice()))
     }
 
-    /// This function's entry block id, if any (raw `&Function` accessor).
-    /// Routing target for the raw `.root` field reads (stage 6a §11); localizes
-    /// behind this accessor at the storage flip.
-    pub fn root_id(&self) -> Option<BlockId> {
+    /// This function's body-local entry block id, if any (raw accessor).
+    pub fn root_id(&self) -> Option<LocalBlockId> {
         self.root
     }
 
-    /// Sets this function's entry block id directly, without the rostering /
+    /// Sets this function's body-local entry block id directly, without rostering /
     /// address bookkeeping of [`FunctionMutRef::set_root`]. Routing target for
     /// the raw `.root = …` field writes whose callers have already rostered the
     /// block (stage 6a §11).
-    pub fn set_root_id(&mut self, root: Option<BlockId>) {
+    pub fn set_root_id(&mut self, root: Option<LocalBlockId>) {
         self.root = root;
     }
 
@@ -305,7 +298,7 @@ impl<'str> Function<'str> {
     pub fn push_block(&mut self, func: FunctionId, block: BasicBlock<'str>) -> BlockId {
         let local = self.blocks.push(block);
         let id = BlockId::new(func, local);
-        self.roster.push(id);
+        self.roster.push(local);
         id
     }
 
@@ -509,7 +502,13 @@ impl<'str> Function<'str> {
 
     /// Drop `block` from this body's ownership roster.
     pub fn unroster_block(&mut self, block: BlockId) {
-        self.roster.retain(|&b| b != block);
+        assert!(
+            self.block(block)
+                .parent
+                .is_none_or(|owner| owner == block.func),
+            "cannot unroster a block through another function body"
+        );
+        self.roster.retain(|&b| b != block.localize(block.func));
     }
 
     /// Remove `block` from this body: unlink every incident CFG edge, remove its
@@ -1124,19 +1123,19 @@ where
 
     /// The root block of this function, if it exists.
     pub fn root(&'s self) -> Option<BlockRef<'str, 'ctx>> {
-        self.inner().root.map(|id| BlockRef::new(self.host(), id))
+        self.inner()
+            .root
+            .map(|local| BlockRef::new(self.host(), BlockId::new(self.id, local)))
     }
 
     /// An iterator over the (live) blocks belonging to this function.
     pub fn blocks(&'s self) -> impl Iterator<Item = BlockRef<'str, 'ctx>> + 's {
         let ctx = self.host();
-        let func = self.id;
         let mut ids = self.block_ids();
         // Total order: primarily by machine address, but break ties by the
         // function-local index. Address-less blocks (e.g. fallthrough splits,
         // whose `address()` is `None`) must still order deterministically.
         ids.sort_by_key(|&id| (BlockRef::new(ctx, id).address(), id.local));
-        let _ = func;
         ids.into_iter().map(move |id| BlockRef::new(ctx, id))
     }
 
@@ -1144,10 +1143,12 @@ where
     /// in roster order.
     pub fn block_ids(&'s self) -> Vec<BlockId> {
         let host = self.host();
+        let func = self.id;
         self.inner()
             .roster
             .iter()
             .copied()
+            .map(|local| BlockId::new(func, local))
             .filter(|&id| !host.block(id).deleted)
             .collect()
     }
@@ -1364,7 +1365,7 @@ impl<'str, 'ctx> FunctionMutRef<'str, 'ctx> {
             "cannot root a function at a block stored in another function arena"
         );
         self.add_block(id);
-        self.inner_mut().root = Some(id);
+        self.inner_mut().root = Some(id.localize(self.id));
 
         let block_addr = BasicBlock::from_id(&*self.ctx, id).address();
         let self_addr = self.address();
@@ -1403,9 +1404,9 @@ impl<'str, 'ctx> FunctionMutRef<'str, 'ctx> {
             "cannot ensure a function root from another function arena"
         );
         if let Some(root) = self.inner().root {
-            if root != id {
+            if root != id.localize(self.id) {
                 return Err(Error::spanless(ErrorTy::FunctionRootMismatch {
-                    expected: root,
+                    expected: BlockId::new(self.id, root),
                     actual: id,
                 }));
             }
@@ -1582,20 +1583,21 @@ impl<'str, 'ctx> FunctionMutRef<'str, 'ctx> {
             "cannot add a block stored in another function arena"
         );
         let prev = self.ctx.block(id).parent;
+        let local = id.localize(self.id);
         if prev == Some(self.id) {
             // Already owned; ensure the roster lists it exactly once (a freshly
             // `make`d block is auto-rostered, so this is usually a no-op).
-            if !self.inner().roster.contains(&id) {
-                self.inner_mut().roster.push(id);
+            if !self.inner().roster.contains(&local) {
+                self.inner_mut().roster.push(local);
             }
             return;
         }
-        // Re-home: drop from the previous owner's roster, claim it here.
-        if let Some(prev) = prev {
-            self.ctx.bodies[prev].roster.retain(|&b| b != id);
-        }
+        assert!(
+            prev.is_none(),
+            "cannot reassign block ownership across functions"
+        );
         self.ctx.block_mut(id).parent = Some(self.id);
-        self.inner_mut().roster.push(id);
+        self.inner_mut().roster.push(local);
     }
 
     /// Removes `block` from this function: drops it from the ownership roster and
@@ -1626,6 +1628,31 @@ mod tests {
             .id;
         let block = BasicBlock::make(&mut ctx, owner).id;
         (ctx, destination, block)
+    }
+
+    #[test]
+    fn raw_root_and_roster_are_local_while_refs_qualify_per_function() {
+        let mut ctx = Context::new();
+        let a = Function::make(&mut ctx, "local_root_a".into()).unwrap().id;
+        let b = Function::make(&mut ctx, "local_root_b".into()).unwrap().id;
+        let a_root = BasicBlock::make(&mut ctx, a).id;
+        let b_root = BasicBlock::make(&mut ctx, b).id;
+        assert_eq!(a_root.local, b_root.local, "arena-local ids should collide");
+        Function::from_id_mut(&mut ctx, a).set_root(a_root).unwrap();
+        Function::from_id_mut(&mut ctx, b).set_root(b_root).unwrap();
+
+        assert_eq!(ctx.bodies[a].root_id(), Some(a_root.local));
+        assert_eq!(ctx.bodies[b].root_id(), Some(b_root.local));
+        assert_eq!(ctx.bodies[a].roster, vec![a_root.local]);
+        assert_eq!(ctx.bodies[b].roster, vec![b_root.local]);
+        assert_eq!(
+            Function::from_id(&ctx, a).root().map(|root| root.id),
+            Some(a_root)
+        );
+        assert_eq!(
+            Function::from_id(&ctx, b).root().map(|root| root.id),
+            Some(b_root)
+        );
     }
 
     #[test]

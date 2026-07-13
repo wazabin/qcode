@@ -269,7 +269,7 @@ fn transform<'str>(
         }
         minted
             .function_mut(rec)
-            .set_root_id(Some(block_map[&model.head]));
+            .set_root_id(Some(block_map[&model.head].local));
 
         // Pass 2: clone every non-terminator instruction (and the terminator of a
         // non-latch block), remapping block targets now (the map is complete) and

@@ -820,7 +820,7 @@ mod tests {
 
             // Mutate the own body through its inherent verbs, consuming the
             // view-minted literal — the exact pass-shaped usage.
-            let root = own.root_id().expect("root");
+            let root = BlockId::new(f, own.root_id().expect("root"));
             insn_count_before = own.block(root).instructions.len();
             let insn = own.push_mnemonic(
                 f,
@@ -837,7 +837,7 @@ mod tests {
         }
 
         // The split borrow has ended; the whole context is usable again.
-        let root = ctx.bodies[f].root_id().expect("root");
+        let root = BlockId::new(f, ctx.bodies[f].root_id().expect("root"));
         assert_eq!(
             ctx.bodies[f].block(root).instructions.len(),
             insn_count_before + 1

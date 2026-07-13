@@ -63,13 +63,11 @@ impl<'a, 'str> PassBacking<'a, 'str> {
             crate::value::function::FunctionInterface<'str>,
         >,
     ) -> Self {
-        debug_assert!(
-            fun.roster.iter().all(|b| {
+        assert!(
+            fun.roster.iter().all(|&local| {
                 // Stored in this function's own arena, and (if live) parented to it.
-                b.func == id && {
-                    let blk = &fun.blocks[b.local];
-                    blk.deleted || blk.parent == Some(id)
-                }
+                let blk = &fun.blocks[local];
+                blk.deleted || blk.parent == Some(id)
             }),
             "PassBacking requires a function with no reattributed blocks"
         );
@@ -212,7 +210,7 @@ impl<'a, 'str> PassBacking<'a, 'str> {
     pub fn push_block(&mut self, func: FunctionId, block: BasicBlock<'str>) -> BlockId {
         let local = self.function_mut(func).blocks.push(block);
         let id = BlockId::new(func, local);
-        self.function_mut(func).roster.push(id);
+        self.function_mut(func).roster.push(local);
         id
     }
 
@@ -417,11 +415,16 @@ impl<'a, 'str> PassBacking<'a, 'str> {
     }
 
     pub fn unroster_block(&mut self, block: BlockId) {
-        let owner = self.read_host().block(block).parent;
-        if let Some(f) = owner {
-            self.function_mut(f).roster.retain(|&b| b != block);
-        }
-        self.function_mut(block.func).roster.retain(|&b| b != block);
+        debug_assert!(
+            self.read_host()
+                .block(block)
+                .parent
+                .is_none_or(|owner| owner == block.func),
+            "cross-arena block ownership is unsupported"
+        );
+        self.function_mut(block.func)
+            .roster
+            .retain(|&b| b != block.local);
     }
 
     pub fn delete_block(&mut self, block: BlockId, _function_id: FunctionId) {

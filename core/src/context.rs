@@ -898,20 +898,13 @@ impl<'str> Context<'str> {
             }
         }
 
-        // Phase 5: re-point the function root if it was relocated.
-        if let Some(root) = self.bodies[target].root_id()
-            && let Some(&new_root) = block_map.get(&root)
-        {
-            self.bodies[target].set_root_id(Some(new_root));
-        }
-
-        // Phase 6: delete the originals (unlinks their old edges, removes their
+        // Phase 5: delete the originals (unlinks their old edges, removes their
         // instructions from the storing function's use-lists, and tombstones them).
         for &old in olds {
             BasicBlock::from_id_mut(self, old).delete(target);
         }
 
-        // Phase 7: rebuild `target`'s reverse-use map from its live instructions,
+        // Phase 6: rebuild `target`'s reverse-use map from its live instructions,
         // since phase 2 rewrote operands in place. `call_sites` is left untouched:
         // the clones registered their sites when created, and the deletions in phase
         // 6 dropped the originals'.
@@ -1149,7 +1142,7 @@ impl<'str> Context<'str> {
         // is now closed (all cross-function edges stripped, foreign targets rewritten
         // to `TailCall`s), so the relocation's closure assumptions hold.
         let moved = self.rehome_owned_blocks(g, &tail);
-        self.bodies[g].set_root_id(Some(moved[&block]));
+        self.bodies[g].set_root_id(Some(moved[&block].local));
 
         // Rebuild `instruction_addrs` on G and on every function that lost blocks.
         self.recompute_instruction_addrs(g);
@@ -1489,20 +1482,20 @@ impl<'str> Context<'str> {
         let local = self.bodies[func].blocks.push(block);
         let id = BlockId::new(func, local);
         // A block is born owned by the function whose arena stores it.
-        self.bodies[func].roster.push(id);
+        self.bodies[func].roster.push(local);
         id
     }
 
-    /// Removes `id` from its current owner's roster, if present. Storage (the
-    /// arena slot) is untouched. Used by reattribution and block deletion.
+    /// Removes `id` from its storage function's roster. The arena slot is
+    /// untouched; Path A forbids any different ownership function.
     pub fn unroster_block(&mut self, id: BlockId) {
-        let owner = self.bodies[id.func].blocks[id.local].parent;
-        if let Some(f) = owner {
-            self.bodies[f].roster.retain(|&b| b != id);
-        }
-        // Defensive: also drop from the storage function's roster in case
-        // ownership and storage diverged and both listed it.
-        self.bodies[id.func].roster.retain(|&b| b != id);
+        assert!(
+            self.bodies[id.func].blocks[id.local]
+                .parent
+                .is_none_or(|owner| owner == id.func),
+            "cross-arena block ownership is unsupported"
+        );
+        self.bodies[id.func].roster.retain(|&b| b != id.local);
     }
 
     pub fn push_block_param(&mut self, func: FunctionId, param: BlockParam<'str>) -> BlockParamId {
@@ -3318,7 +3311,7 @@ mod tests {
             assert_eq!(addrs(&ctx, f), vec![0x1000]);
             assert_eq!(addrs(&ctx, g), vec![0x2000, 0x2005]);
             let g_entry = block_at_addr(&ctx, g, 0x2000);
-            assert_eq!(ctx.bodies[g].root_id(), Some(g_entry));
+            assert_eq!(ctx.bodies[g].root_id(), Some(g_entry.local));
 
             // Every G block is self-stored.
             for b in Function::from_id(&ctx, g).block_ids() {

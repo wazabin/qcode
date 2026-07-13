@@ -97,7 +97,10 @@ impl<'str> ModuleSubPass<'str> for PureCall {
 
         // Build the positional argument vector: literal value, or poison (0) for a
         // symbolic argument the projection has proven irrelevant to this field.
-        let Some(root) = ctx.bodies[target].root_id() else {
+        let Some(root) = Function::from_id(&*ctx, target)
+            .root()
+            .map(|block| block.id)
+        else {
             return Claim::Pass;
         };
         let param_sizes: Vec<usize> = qcode::value::BasicBlock::from_id(ctx, root)
