@@ -561,8 +561,20 @@ impl<'str> Context<'str> {
     /// The newly created block is named after the address in hex and registered
     /// in the address map.
     pub fn get_or_make_block(&mut self, addr: u64, func: FunctionId) -> BlockId {
+        if let Some(ValueId::Function(owner)) = self.get_at_addr(&addr) {
+            assert_eq!(
+                owner, func,
+                "cannot create a block at an address owned by another function"
+            );
+        }
         match BasicBlock::from_addr(self, addr) {
-            Some(block) => block.id,
+            Some(block) => {
+                assert_eq!(
+                    block.id.func, func,
+                    "cannot reuse a block stored in another function arena"
+                );
+                block.id
+            }
             None => BasicBlock::make(self, func).with_address(addr).id,
         }
     }
@@ -760,9 +772,9 @@ impl<'str> Context<'str> {
         BasicBlock::from_id_mut(self, to).remove_edge(edge_id);
     }
 
-    /// Relocate every block in `olds` — currently owned by `target` but *stored*
-    /// in another function's arena — into `target`'s own arena, so that ownership
-    /// and storage agree (`block.id.func == block.parent`). This is the storage
+    /// Relocate every block in `olds` into `target`'s own arena. The originals
+    /// remain owned by their source functions until deletion; only the clones are
+    /// rostered in `target`, so ownership and storage never diverge. This is the storage
     /// mover [`split_function_at`](Self::split_function_at) uses to make a split-off
     /// tail self-stored.
     ///
@@ -779,7 +791,11 @@ impl<'str> Context<'str> {
     /// reference from a relocated block resolves to another relocated block, an
     /// unmoved block of `target`, or a shared value; a reference into a *third*
     /// function is a bug upstream, and debug builds assert against it.
-    pub fn rehome_owned_blocks(&mut self, target: FunctionId, olds: &[BlockId]) {
+    pub fn rehome_owned_blocks(
+        &mut self,
+        target: FunctionId,
+        olds: &[BlockId],
+    ) -> HashMap<BlockId, BlockId> {
         // Phase 1: structurally clone every block into `target`, accumulating the
         // old -> new value and block maps.
         let mut value_map: HashMap<ValueId, ValueId> = HashMap::default();
@@ -900,18 +916,17 @@ impl<'str> Context<'str> {
         // the clones registered their sites when created, and the deletions in phase
         // 6 dropped the originals'.
         self.rebuild_users(target);
+        block_map
     }
 
-    /// Is `block` the root (entry block) of the function registered at its machine
-    /// address? A function and its entry block share an address; the entry block is
-    /// the one at the function's address. Used as the tail-call boundary in
-    /// [`split_function_at`](Self::split_function_at)'s reach walk.
-    fn is_function_entry(&self, block: BlockId) -> bool {
+    /// The function registered at `block`'s machine address, if any. Registration
+    /// is the entry-boundary signal even while the function is a rootless stub:
+    /// Path A never adopts a foreign-storage block merely because addresses match.
+    fn function_registered_at_block(&self, block: BlockId) -> Option<FunctionId> {
         self.block(block)
             .address
             .and_then(|addr| Function::from_addr(self, addr))
-            .and_then(|f| f.root().map(|r| r.id))
-            == Some(block)
+            .map(|f| f.id)
     }
 
     /// Blocks reachable from `block` along CFG edges, stopping at any *other*
@@ -938,13 +953,8 @@ impl<'str> Context<'str> {
                 // A different function's entry is a tail-call boundary — never
                 // crossed. `g`'s own entry is `block` (already seen), so this stops
                 // only at *foreign* entries.
-                if self.is_function_entry(s)
-                    && self
-                        .block(s)
-                        .address
-                        .and_then(|a| Function::from_addr(self, a))
-                        .map(|f| f.id)
-                        != Some(g)
+                if let Some(entry_func) = self.function_registered_at_block(s)
+                    && entry_func != g
                 {
                     continue;
                 }
@@ -989,10 +999,10 @@ impl<'str> Context<'str> {
             .address
             .expect("split_function_at: block has no machine address");
 
-        // G: reuse an existing function at this address (a call-minted stub, which
-        // may carry a symbol name and may already have adopted `block` as its root),
-        // else mint a conventional one. Minting registers the address, which — when a
-        // block already lives there — adopts it as `G`'s root via `set_address`.
+        // G: reuse an existing function at this address (a call-minted stub that
+        // may carry a symbol name), else mint a conventional one. A block already
+        // stored elsewhere at this address is not adopted; relocation below creates
+        // and roots a self-stored clone.
         let g = match Function::from_addr(self, addr).map(|f| f.id) {
             Some(existing) => existing,
             None => Function::make_at_addr(self, addr, None).id,
@@ -1012,21 +1022,27 @@ impl<'str> Context<'str> {
             }
         }
 
-        // Reassign the tail's ownership to G (storage may still be elsewhere) and
-        // root G at `block`.
-        for &b in &tail {
-            Function::from_id_mut(self, g).add_block(b);
-        }
-        self.bodies[g].set_root_id(Some(block));
+        // Treat the tail as G-owned while computing boundary rewrites, without
+        // ever adopting its foreign-storage blocks into G's roster/root. The
+        // physical move below is the only supported ownership transition.
+        let effective_owner = |ctx: &Context, candidate: BlockId| {
+            if tail_set.contains(&candidate) {
+                Some(g)
+            } else {
+                ctx.block(candidate).parent
+            }
+        };
 
         // Resolve a static terminator target to the foreign function whose *entry* it
         // is, from the perspective of `owner`.
         let foreign_entry =
             |ctx: &Context, target: BlockId, owner: FunctionId| -> Option<FunctionId> {
-                let callee = ctx.block(target).parent?;
-                (callee != owner
-                    && Function::from_id(ctx, callee).root().map(|r| r.id) == Some(target))
-                .then_some(callee)
+                let callee = if target == block {
+                    g
+                } else {
+                    ctx.function_registered_at_block(target)?
+                };
+                (callee != owner).then_some(callee)
             };
 
         // Collect terminator rewrites: (a) any terminator that statically targets
@@ -1038,7 +1054,7 @@ impl<'str> Context<'str> {
         let mut cond_calls: Vec<(InstructionId, BlockId, FunctionId)> = Vec::new();
         let relevant: Vec<BlockId> = self.block_ids();
         for b in relevant {
-            let Some(owner) = self.block(b).parent else {
+            let Some(owner) = effective_owner(self, b) else {
                 continue;
             };
             let Some((term_id, mnemonic)) = BasicBlock::from_id(self, b)
@@ -1118,7 +1134,7 @@ impl<'str> Context<'str> {
         for &b in &tail {
             for edge in self.block(b).edges.iter().copied() {
                 let &EdgeData { from, to } = self.edge(b.func, edge);
-                let cross = self.block(from).parent != self.block(to).parent;
+                let cross = effective_owner(self, from) != effective_owner(self, to);
                 let touches_tail = tail_set.contains(&from) || tail_set.contains(&to);
                 if cross && touches_tail {
                     stale.insert((b.func, edge));
@@ -1132,7 +1148,8 @@ impl<'str> Context<'str> {
         // Storage move: relocate the tail into G's own arena (self-stored). The set
         // is now closed (all cross-function edges stripped, foreign targets rewritten
         // to `TailCall`s), so the relocation's closure assumptions hold.
-        self.rehome_owned_blocks(g, &tail);
+        let moved = self.rehome_owned_blocks(g, &tail);
+        self.bodies[g].set_root_id(Some(moved[&block]));
 
         // Rebuild `instruction_addrs` on G and on every function that lost blocks.
         self.recompute_instruction_addrs(g);
@@ -2052,18 +2069,18 @@ impl<'str> Context<'str> {
     /// [`get_at_addr`](Self::get_at_addr)) may safely `.expect(...)` the result.
     pub(crate) fn set_address(&mut self, addr: u64, id: ValueId) -> crate::error::Result<()> {
         if let Some(existing) = self.shared.address_map.insert(addr, id) {
-            // The only case where duplicates are allowed are for a function and its root block sharing an address
-            // In that case, the function address should be kept.
+            // A function and a block may share an address. The function mapping is
+            // kept; only a self-stored block may also become its root.
 
             match (existing, id) {
-                // A function and its entry block share an address by design.
-                // The function always takes priority in the address map,
-                // regardless of whether the root link has been established yet
-                // (make_at_addr registers the address before calling make_root).
+                // A function and a self-stored entry block may share an address.
+                // A foreign-storage block at the same address is not adopted;
+                // split/rehome code must physically move it first.
                 (ValueId::Function(func_id), ValueId::BasicBlock(block_id))
                 | (ValueId::BasicBlock(block_id), ValueId::Function(func_id)) => {
-                    let mut function = Function::from_id_mut(self, func_id);
-                    function.ensure_root(block_id)?;
+                    if block_id.func == func_id {
+                        Function::from_id_mut(self, func_id).ensure_root(block_id)?;
+                    }
                     self.shared
                         .address_map
                         .insert(addr, ValueId::Function(func_id));
@@ -2319,6 +2336,31 @@ mod tests {
             BasicBlock::make(ctx, f);
         }
         f
+    }
+
+    #[test]
+    #[should_panic(expected = "cannot reuse a block stored in another function arena")]
+    fn get_or_make_block_rejects_foreign_storage_at_address() {
+        let mut ctx = Context::new();
+        let a = Function::make(&mut ctx, "address_owner".into()).unwrap().id;
+        let b = Function::make(&mut ctx, "address_requester".into())
+            .unwrap()
+            .id;
+        BasicBlock::make(&mut ctx, a).with_address(0x1000);
+
+        ctx.get_or_make_block(0x1000, b);
+    }
+
+    #[test]
+    #[should_panic(expected = "cannot create a block at an address owned by another function")]
+    fn get_or_make_block_rejects_foreign_function_address_without_root() {
+        let mut ctx = Context::new();
+        Function::make_at_addr(&mut ctx, 0x1000, None);
+        let requester = Function::make(&mut ctx, "address_requester".into())
+            .unwrap()
+            .id;
+
+        ctx.get_or_make_block(0x1000, requester);
     }
 
     #[test]
@@ -3294,6 +3336,41 @@ mod tests {
             assert!(
                 matches!(term, Some(Mnemonic::TailCall(TailCall { target, .. })) if target == g),
                 "thunk branch must become TailCall(G), got {term:?}",
+            );
+        }
+
+        #[test]
+        fn split_stops_at_a_foreign_rootless_stub_address() {
+            let mut ctx = Context::new();
+            let f = Function::make_at_addr(&mut ctx, 0x1000, Some(Cow::Borrowed("f"))).id;
+            let entry = block_at(&mut ctx, f, 0x1000);
+            let split = block_at(&mut ctx, f, 0x2000);
+            let foreign_entry = block_at(&mut ctx, f, 0x3000);
+            let foreign_body = block_at(&mut ctx, f, 0x3005);
+            branch_at(&mut ctx, entry, split, 0x1000);
+            branch_at(&mut ctx, split, foreign_entry, 0x2000);
+            branch_at(&mut ctx, foreign_entry, foreign_body, 0x3000);
+            return_at(&mut ctx, foreign_body, 0x3005);
+            Function::from_id_mut(&mut ctx, f).set_root(entry).unwrap();
+
+            let g = Function::make_at_addr(&mut ctx, 0x2000, Some(Cow::Borrowed("g"))).id;
+            let h = Function::make_at_addr(&mut ctx, 0x3000, Some(Cow::Borrowed("h"))).id;
+            assert!(Function::from_id(&ctx, g).root().is_none());
+            assert!(Function::from_id(&ctx, h).root().is_none());
+
+            assert_eq!(ctx.split_function_at(split), g);
+            assert_eq!(addrs(&ctx, g), vec![0x2000]);
+            assert_eq!(addrs(&ctx, f), vec![0x1000, 0x3000, 0x3005]);
+            assert!(Function::from_id(&ctx, h).root().is_none());
+
+            let g_entry = block_at_addr(&ctx, g, 0x2000);
+            let term = BasicBlock::from_id(&ctx, g_entry)
+                .instructions()
+                .last()
+                .map(|i| i.mnemonic().clone());
+            assert!(
+                matches!(term, Some(Mnemonic::TailCall(TailCall { target, .. })) if target == h),
+                "split tail must stop and tail-call rootless stub H, got {term:?}",
             );
         }
 

@@ -381,10 +381,7 @@ mod tests {
         body: impl FnOnce(&mut Builder<'static, '_>, &[ValueId]),
     ) -> FunctionId {
         let fid = Function::make(&mut tc.ctx, name.into()).unwrap().id;
-        let block = {
-            let __f = tc.ctx.anon_function();
-            tc.ctx.get_or_make_block(addr, __f)
-        };
+        let block = { tc.ctx.get_or_make_block(addr, fid) };
         Function::from_id_mut(&mut tc.ctx, fid)
             .set_root(block)
             .unwrap();

@@ -1492,10 +1492,7 @@ mod tests {
         configure_callee(&mut tc.ctx, callee);
 
         let caller = Function::make(&mut tc.ctx, "caller".into()).unwrap().id;
-        let entry = {
-            let __f = tc.ctx.anon_function();
-            tc.ctx.get_or_make_block(0x1000, __f)
-        };
+        let entry = { tc.ctx.get_or_make_block(0x1000, caller) };
         Function::from_id_mut(&mut tc.ctx, caller)
             .set_root(entry)
             .unwrap();
@@ -1593,10 +1590,7 @@ mod tests {
         let mut tc = TestContext::new();
         let sp_reg = tc.r0;
         let fid = Function::make(&mut tc.ctx, "f".into()).unwrap().id;
-        let root = {
-            let __f = tc.ctx.anon_function();
-            tc.ctx.get_or_make_block(0x1000, __f)
-        };
+        let root = { tc.ctx.get_or_make_block(0x1000, fid) };
         {
             let mut f = Function::from_id_mut(&mut tc.ctx, fid);
             f.set_root(root).unwrap();
@@ -1664,10 +1658,7 @@ mod tests {
         let mut tc = TestContext::new();
         let sp_reg = tc.r0;
         let fid = Function::make(&mut tc.ctx, "f".into()).unwrap().id;
-        let root = {
-            let __f = tc.ctx.anon_function();
-            tc.ctx.get_or_make_block(0x1000, __f)
-        };
+        let root = { tc.ctx.get_or_make_block(0x1000, fid) };
         {
             let mut f = Function::from_id_mut(&mut tc.ctx, fid);
             f.set_root(root).unwrap();

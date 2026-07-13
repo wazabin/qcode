@@ -861,10 +861,7 @@ mod spike {
     fn sp_relative_identity_holds_but_alignment_reroots() {
         let mut tc = TestContext::new();
         let fun = Function::make(&mut tc.ctx, "f".into()).unwrap().id;
-        let entry = {
-            let __f = tc.ctx.anon_function();
-            tc.ctx.get_or_make_block(0x1000, __f)
-        };
+        let entry = { tc.ctx.get_or_make_block(0x1000, fun) };
         {
             let mut f = Function::from_id_mut(&mut tc.ctx, fun);
             f.set_root(entry).unwrap();
@@ -920,10 +917,7 @@ mod spike {
         let ram = tc.ctx.shared.default_space;
         let reg = tc.reg_space;
         let fun = Function::make(&mut tc.ctx, "f".into()).unwrap().id;
-        let entry = {
-            let __f = tc.ctx.anon_function();
-            tc.ctx.get_or_make_block(0x1000, __f)
-        };
+        let entry = { tc.ctx.get_or_make_block(0x1000, fun) };
         {
             let mut f = Function::from_id_mut(&mut tc.ctx, fun);
             f.set_root(entry).unwrap();
@@ -975,10 +969,7 @@ mod spike {
         use qcode::types::AggregateField;
         let mut tc = TestContext::new();
         let fun = Function::make(&mut tc.ctx, "f".into()).unwrap().id;
-        let entry = {
-            let __f = tc.ctx.anon_function();
-            tc.ctx.get_or_make_block(0x1000, __f)
-        };
+        let entry = { tc.ctx.get_or_make_block(0x1000, fun) };
         {
             let mut f = Function::from_id_mut(&mut tc.ctx, fun);
             f.set_root(entry).unwrap();

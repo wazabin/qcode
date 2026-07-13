@@ -1359,6 +1359,10 @@ impl<'str, 'ctx> FunctionMutRef<'str, 'ctx> {
     /// This will also set the address of the function/block to the address of the root block/function if both addresses are unset.
     /// Panics if the function already has an address that doesn't match the root block's address.
     pub fn set_root(&mut self, id: BlockId) -> Result<()> {
+        assert_eq!(
+            id.func, self.id,
+            "cannot root a function at a block stored in another function arena"
+        );
         self.add_block(id);
         self.inner_mut().root = Some(id);
 
@@ -1394,6 +1398,10 @@ impl<'str, 'ctx> FunctionMutRef<'str, 'ctx> {
     }
 
     pub fn ensure_root(&mut self, id: BlockId) -> Result<()> {
+        assert_eq!(
+            id.func, self.id,
+            "cannot ensure a function root from another function arena"
+        );
         if let Some(root) = self.inner().root {
             if root != id {
                 return Err(Error::spanless(ErrorTy::FunctionRootMismatch {
@@ -1569,6 +1577,10 @@ impl<'str, 'ctx> FunctionMutRef<'str, 'ctx> {
     /// must equal `self.id`. This is now effectively an assertion plus a
     /// `parent` (re)assignment; it no longer moves storage between functions.
     pub fn add_block(&mut self, id: BlockId) {
+        assert_eq!(
+            id.func, self.id,
+            "cannot add a block stored in another function arena"
+        );
         let prev = self.ctx.block(id).parent;
         if prev == Some(self.id) {
             // Already owned; ensure the roster lists it exactly once (a freshly
@@ -1605,6 +1617,41 @@ mod tests {
     use qcode_macro::qcode;
 
     use super::*;
+
+    fn foreign_block_fixture() -> (Context<'static>, FunctionId, BlockId) {
+        let mut ctx = Context::new();
+        let owner = Function::make(&mut ctx, "block_owner".into()).unwrap().id;
+        let destination = Function::make(&mut ctx, "block_destination".into())
+            .unwrap()
+            .id;
+        let block = BasicBlock::make(&mut ctx, owner).id;
+        (ctx, destination, block)
+    }
+
+    #[test]
+    #[should_panic(expected = "cannot add a block stored in another function arena")]
+    fn add_block_rejects_foreign_storage() {
+        let (mut ctx, destination, block) = foreign_block_fixture();
+        Function::from_id_mut(&mut ctx, destination).add_block(block);
+    }
+
+    #[test]
+    #[should_panic(expected = "cannot root a function at a block stored in another function arena")]
+    fn set_root_rejects_foreign_storage() {
+        let (mut ctx, destination, block) = foreign_block_fixture();
+        Function::from_id_mut(&mut ctx, destination)
+            .set_root(block)
+            .unwrap();
+    }
+
+    #[test]
+    #[should_panic(expected = "cannot ensure a function root from another function arena")]
+    fn ensure_root_rejects_foreign_storage() {
+        let (mut ctx, destination, block) = foreign_block_fixture();
+        Function::from_id_mut(&mut ctx, destination)
+            .ensure_root(block)
+            .unwrap();
+    }
 
     #[test]
     fn function_ref_users_of_rejects_foreign_owned_values() {
@@ -1716,18 +1763,11 @@ mod tests {
     #[test]
     fn add_block_via_function_mut_ref_updates_blocks_list() {
         let mut ctx = Context::new();
-        let root = {
-            let __f = ctx.anon_function();
-            BasicBlock::make(&mut ctx, __f)
-        }
-        .id;
-        let extra = {
-            let __f = ctx.anon_function();
-            BasicBlock::make(&mut ctx, __f)
-        }
-        .id;
+        let baz_id = Function::make(&mut ctx, "baz".into()).unwrap().id;
+        let root = BasicBlock::make(&mut ctx, baz_id).id;
+        let extra = BasicBlock::make(&mut ctx, baz_id).id;
 
-        let mut baz = Function::make(&mut ctx, "baz".into()).unwrap();
+        let mut baz = Function::from_id_mut(&mut ctx, baz_id);
         baz.add_block(root);
         baz.add_block(extra);
 
@@ -1747,24 +1787,13 @@ mod tests {
         assert!(s.contains("fn display_test:"));
     }
 
-    /// A BasicBlock may be created at an address before the Function stub for
-    /// that address is registered (e.g. when Sleigh emits a branch target block
-    /// ahead of the function being lifted).  `set_address` must allow this and
-    /// must attribute the block as the function's root.
     #[test]
     fn iter_yields_all_blocks() {
         let mut ctx = Context::new();
-        let root = {
-            let __f = ctx.anon_function();
-            BasicBlock::make(&mut ctx, __f)
-        }
-        .id;
-        let extra = {
-            let __f = ctx.anon_function();
-            BasicBlock::make(&mut ctx, __f)
-        }
-        .id;
-        let mut f = Function::make(&mut ctx, "iter_fn".into()).unwrap();
+        let f_id = Function::make(&mut ctx, "iter_fn".into()).unwrap().id;
+        let root = BasicBlock::make(&mut ctx, f_id).id;
+        let extra = BasicBlock::make(&mut ctx, f_id).id;
+        let mut f = Function::from_id_mut(&mut ctx, f_id);
         f.add_block(root);
         f.add_block(extra);
 
@@ -1777,17 +1806,10 @@ mod tests {
     #[test]
     fn into_iterator_for_function_ref_matches_iter() {
         let mut ctx = Context::new();
-        let b1 = {
-            let __f = ctx.anon_function();
-            BasicBlock::make(&mut ctx, __f)
-        }
-        .id;
-        let b2 = {
-            let __f = ctx.anon_function();
-            BasicBlock::make(&mut ctx, __f)
-        }
-        .id;
-        let mut f = Function::make(&mut ctx, "into_iter_fn".into()).unwrap();
+        let f_id = Function::make(&mut ctx, "into_iter_fn".into()).unwrap().id;
+        let b1 = BasicBlock::make(&mut ctx, f_id).id;
+        let b2 = BasicBlock::make(&mut ctx, f_id).id;
+        let mut f = Function::from_id_mut(&mut ctx, f_id);
         f.add_block(b1);
         f.add_block(b2);
 
@@ -1861,8 +1883,11 @@ mod tests {
         assert_eq!(by_name.name(), "myfn");
     }
 
+    /// Registering a function at an address already occupied by a block in a
+    /// different arena must leave the new function rootless. `split_function_at`
+    /// performs the explicit clone-first move when that block is later claimed.
     #[test]
-    fn set_address_allows_function_at_existing_block_address() {
+    fn set_address_does_not_adopt_foreign_block_as_function_root() {
         let mut ctx = Context::new();
 
         // Simulate a branch-target block created at 0x1000 before the function
@@ -1875,15 +1900,13 @@ mod tests {
         ctx.set_address(0x1000, ValueId::BasicBlock(block_id))
             .unwrap();
 
-        // Registering a function at the same address must succeed.
+        // Registering a function at the same address succeeds, but Path A does
+        // not permit its root/roster to reference the anonymous block's arena.
         let fn_id = Function::make_at_addr(&mut ctx, 0x1000, None).id;
 
         // The function wins in the address map.
         assert!(Function::from_addr(&ctx, 0x1000).is_some());
-        // The pre-existing block becomes the function's root.
-        assert_eq!(
-            Function::from_id(&ctx, fn_id).root().map(|b| b.id),
-            Some(block_id)
-        );
+        assert!(Function::from_id(&ctx, fn_id).root().is_none());
+        assert_ne!(block_id.func, fn_id);
     }
 }

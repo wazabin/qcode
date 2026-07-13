@@ -2585,10 +2585,7 @@ mod tests {
 
         let mut ctx = Context::new();
         let f = Function::make(&mut ctx, "f".into()).unwrap().id;
-        let entry = {
-            let __f = ctx.anon_function();
-            ctx.get_or_make_block(0x1000, __f)
-        };
+        let entry = ctx.get_or_make_block(0x1000, f);
         {
             let mut fm = Function::from_id_mut(&mut ctx, f);
             fm.set_root(entry).unwrap();
@@ -2648,10 +2645,7 @@ mod tests {
 
         let mut ctx = Context::new();
         let f = Function::make(&mut ctx, "f".into()).unwrap().id;
-        let entry = {
-            let __f = ctx.anon_function();
-            ctx.get_or_make_block(0x1000, __f)
-        };
+        let entry = ctx.get_or_make_block(0x1000, f);
         {
             let mut fm = Function::from_id_mut(&mut ctx, f);
             fm.set_root(entry).unwrap();
@@ -2730,10 +2724,7 @@ mod tests {
             ctx.shared.types.get_or_make_array(i8, n)
         };
         let f = Function::make(&mut ctx, "f".into()).unwrap().id;
-        let entry = {
-            let __f = ctx.anon_function();
-            ctx.get_or_make_block(0x1000, __f)
-        };
+        let entry = ctx.get_or_make_block(0x1000, f);
         {
             let mut fm = Function::from_id_mut(&mut ctx, f);
             fm.set_root(entry).unwrap();

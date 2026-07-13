@@ -140,10 +140,7 @@ mod tests {
     fn sp_function(tc: &mut TestContext) -> (FunctionId, ValueId, VarnodeId) {
         let sp_reg = tc.r0; // stand-in stack-pointer register varnode
         let fid = Function::make(&mut tc.ctx, "f".into()).unwrap().id;
-        let root = {
-            let __f = tc.ctx.anon_function();
-            tc.ctx.get_or_make_block(0x1000, __f)
-        };
+        let root = { tc.ctx.get_or_make_block(0x1000, fid) };
         {
             let mut f = Function::from_id_mut(&mut tc.ctx, fid);
             f.set_root(root).unwrap();

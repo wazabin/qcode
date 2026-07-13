@@ -50,10 +50,7 @@ mod tests {
     fn build_fn(f: impl FnOnce(&mut Builder<'static, '_>)) -> (TestContext, FunctionId) {
         let mut tc = TestContext::new();
         let fun_id = Function::make(&mut tc.ctx, "test".into()).unwrap().id;
-        let block_id = {
-            let __f = tc.ctx.anon_function();
-            tc.ctx.get_or_make_block(0x1000, __f)
-        };
+        let block_id = { tc.ctx.get_or_make_block(0x1000, fun_id) };
         Function::from_id_mut(&mut tc.ctx, fun_id)
             .set_root(block_id)
             .unwrap();

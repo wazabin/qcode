@@ -1911,14 +1911,20 @@ impl<'str, 'ctx> Builder<'str, 'ctx, &'ctx mut Context<'str>> {
     /// Creates a builder positioned at the block for machine `address`, creating
     /// the block (and an anonymous host function if nothing is mapped) if needed.
     pub fn from_context<'m>(ctx: &'m mut Context<'str>, address: u64) -> Builder<'str, 'm> {
-        let block_id = match BasicBlock::from_addr(ctx, address) {
-            Some(block) => block.id,
-            None => {
-                let func = Function::make(ctx, Cow::Owned(format!("blk_{address:x}")))
-                    .expect("anon host function")
-                    .id;
-                ctx.get_or_make_block(address, func)
-            }
+        let block_id = match ctx.get_at_addr(&address) {
+            Some(ValueId::Function(func)) => match Function::from_id(ctx, func).root() {
+                Some(root) => root.id,
+                None => ctx.get_or_make_block(address, func),
+            },
+            _ => match BasicBlock::from_addr(ctx, address) {
+                Some(block) => block.id,
+                None => {
+                    let func = Function::make(ctx, Cow::Owned(format!("blk_{address:x}")))
+                        .expect("anon host function")
+                        .id;
+                    ctx.get_or_make_block(address, func)
+                }
+            },
         };
         let mut builder = Builder::from_block(BasicBlock::from_id_mut(ctx, block_id));
         builder.set_address(address);
@@ -2382,6 +2388,25 @@ mod tests {
         let insn = Instruction::from_id(&ctx, not_insn_id);
 
         assert_eq!(insn.address().unwrap(), 0x1000);
+    }
+
+    #[test]
+    fn from_context_materializes_root_in_registered_function_arena() {
+        let mut ctx = Context::new();
+        let func = Function::make_at_addr(&mut ctx, 0x2000, None).id;
+        assert!(Function::from_id(&ctx, func).root().is_none());
+
+        let block = {
+            let builder = Builder::from_context(&mut ctx, 0x2000);
+            builder.current_block()
+        };
+
+        assert_eq!(block.func, func);
+        assert_eq!(
+            Function::from_id(&ctx, func).root().map(|root| root.id),
+            Some(block)
+        );
+        assert!(Function::from_name(&ctx, "blk_2000").is_none());
     }
 
     #[test]

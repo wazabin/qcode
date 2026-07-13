@@ -390,7 +390,23 @@ impl Lowerer<'_, '_, '_> {
                 .get(name)
                 .copied()
                 .ok_or_else(|| format!("unknown block <{name}>"))?,
-            Label::Address { value, .. } => self.b.get_or_make_block(*value),
+            Label::Address { value, .. } => {
+                let current = self.b.current_block().func;
+                let foreign = match self.b.context().get_at_addr(value) {
+                    Some(ValueId::Function(owner)) if owner != current => Some(owner),
+                    _ => BasicBlock::from_addr(self.b.context(), *value)
+                        .map(|block| block.id.func)
+                        .filter(|&owner| owner != current),
+                };
+                if let Some(owner) = foreign {
+                    return Err(format!(
+                        "control-flow target {label:?} resolves to storage owned by {owner:?}, \
+                         but the branch is in {current:?}; cross-function control flow must be a \
+                         call/tail call, not a foreign block target",
+                    ));
+                }
+                self.b.get_or_make_block(*value)
+            }
         };
         // Strict IR locality (context-split ruling 2): a control-flow target must
         // be a block of the *current* function. Named labels resolve through the
@@ -1082,6 +1098,29 @@ mod tests {
             ",
         )
         .expect_err("cross-function address goto must be rejected");
+        assert!(
+            err.contains("cross-function control flow"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn rejects_cross_function_rootless_function_address_branch() {
+        use std::borrow::Cow;
+
+        let mut ctx = Context::new();
+        let g = Function::make_at_addr(&mut ctx, 0x2000, Some(Cow::Borrowed("g"))).id;
+        assert!(Function::from_id(&ctx, g).root().is_none());
+
+        let err = lower_str(
+            &mut ctx,
+            "
+            fn f:
+            <entry>
+                goto <0x2000>;
+            ",
+        )
+        .expect_err("rootless foreign function address goto must be rejected");
         assert!(
             err.contains("cross-function control flow"),
             "unexpected error: {err}"

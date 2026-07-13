@@ -456,10 +456,7 @@ mod tests {
         use_result: bool,
     ) -> (BlockId, BlockId) {
         let callee = Function::make(ctx, "callee".into()).unwrap().id;
-        let callee_block = {
-            let __f = ctx.anon_function();
-            ctx.get_or_make_block(0x4000, __f)
-        };
+        let callee_block = { ctx.get_or_make_block(0x4000, callee) };
         Function::from_id_mut(ctx, callee)
             .set_root(callee_block)
             .unwrap();

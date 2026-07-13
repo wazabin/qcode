@@ -80,22 +80,16 @@ mod tests {
     // `LocalBlockId`, so there is no `BlockId` field to point at another function's
     // block — the axis-2 invariant is discharged by the type, not a runtime check.
 
-    /// A block owned by one function but stored in another's arena (a reattributed
-    /// block) is a self-storage violation.
+    /// Cross-arena block storage is rejected at construction time.
     #[test]
-    fn flags_reattributed_block_storage() {
+    #[should_panic(expected = "cannot add a block stored in another function arena")]
+    fn rejects_reattributed_block_storage() {
         let mut ctx = Context::new();
         let f = Function::make_at_addr(&mut ctx, 0x1000, Some(Cow::Borrowed("f"))).id;
         let g = Function::make_at_addr(&mut ctx, 0x2000, Some(Cow::Borrowed("g"))).id;
-        // Born in g's arena, then reattributed to f: owner=f, storage=g.
+        // Born in g's arena; attaching it to f is unsupported.
         let block = BasicBlock::make(&mut ctx, g).id;
         Function::from_id_mut(&mut ctx, f).add_block(block);
-
-        let diags = verify_intra_function_ssa(&ctx);
-        assert!(
-            diags.iter().any(|d| d.contains("must be self-stored")),
-            "expected a self-storage diagnostic, got {diags:?}"
-        );
     }
 
     /// An intra-function `Branch` (target owned by the same function) is clean.

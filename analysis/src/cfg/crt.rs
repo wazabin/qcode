@@ -116,13 +116,10 @@ mod tests {
     fn discovers_named_main_from_primary_entrypoint_argument() {
         let mut tc = TestContext::new();
         tc.ctx.set_primary_entrypoint(Some(0x1000));
-        Function::make_at_addr(&mut tc.ctx, 0x1000, Some("start".into()));
+        let start = Function::make_at_addr(&mut tc.ctx, 0x1000, Some("start".into())).id;
 
         {
-            let block = {
-                let __f = tc.ctx.anon_function();
-                tc.ctx.get_or_make_block(0x1000, __f)
-            };
+            let block = { tc.ctx.get_or_make_block(0x1000, start) };
             Function::from_addr_mut(&mut tc.ctx, 0x1000)
                 .unwrap()
                 .set_root(block)
@@ -159,13 +156,10 @@ mod tests {
     fn records_entry_to_main_call_graph_edge() {
         let mut tc = TestContext::new();
         tc.ctx.set_primary_entrypoint(Some(0x1000));
-        Function::make_at_addr(&mut tc.ctx, 0x1000, Some("start".into()));
+        let start = Function::make_at_addr(&mut tc.ctx, 0x1000, Some("start".into())).id;
 
         {
-            let block = {
-                let __f = tc.ctx.anon_function();
-                tc.ctx.get_or_make_block(0x1000, __f)
-            };
+            let block = { tc.ctx.get_or_make_block(0x1000, start) };
             Function::from_addr_mut(&mut tc.ctx, 0x1000)
                 .unwrap()
                 .set_root(block)

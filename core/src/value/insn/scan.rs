@@ -79,10 +79,7 @@ mod tests {
         let mut tc = TestContext::new();
         let body = Function::make(&mut tc.ctx, "foo".into()).unwrap().id;
         let host = Function::make(&mut tc.ctx, "host".into()).unwrap().id;
-        let entry = {
-            let __f = tc.ctx.anon_function();
-            tc.ctx.get_or_make_block(0x2000, __f)
-        };
+        let entry = tc.ctx.get_or_make_block(0x2000, host);
         {
             let mut f = Function::from_id_mut(&mut tc.ctx, host);
             f.set_root(entry).unwrap();
@@ -137,10 +134,7 @@ mod tests {
         let mut tc = TestContext::new();
         let body = Function::make(&mut tc.ctx, "body".into()).unwrap().id;
         let host = Function::make(&mut tc.ctx, "host".into()).unwrap().id;
-        let entry = {
-            let __f = tc.ctx.anon_function();
-            tc.ctx.get_or_make_block(0x1000, __f)
-        };
+        let entry = tc.ctx.get_or_make_block(0x1000, host);
         {
             let mut f = Function::from_id_mut(&mut tc.ctx, host);
             f.set_root(entry).unwrap();
