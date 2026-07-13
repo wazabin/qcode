@@ -1,6 +1,7 @@
 use rustc_hash::FxHashMap as HashMap;
 
 use qcode::{
+    address_index::{AddressIndex, AddressTarget},
     context::Context,
     value::{
         BasicBlock, BlockId, Instruction, InstructionId, InstructionRef, ValueId,
@@ -34,6 +35,7 @@ impl ResolvedPath {
     /// replaced with an unconditional branch to the next block in trace order.
     pub fn from_perfect_trace(ctx: &mut Context, trace: &impl Trace) -> Self {
         let addresses = trace.list_addresses();
+        let address_index = AddressIndex::analyze(ctx);
         let mut blocks = Vec::new();
         let mut value_map = HashMap::default();
 
@@ -44,8 +46,7 @@ impl ResolvedPath {
             };
 
             // Find the original block at current address
-            let Some(orig_block_id) = BasicBlock::from_addr(ctx, *current_addr).map(|b| b.id)
-            else {
+            let Some(orig_block_id) = block_at_address(ctx, &address_index, *current_addr) else {
                 eprintln!("[trace] warning: no block at {current_addr:#x}, skipping");
                 continue;
             };
@@ -136,6 +137,18 @@ impl ResolvedPath {
         }
 
         Self { blocks, value_map }
+    }
+}
+
+/// Resolves an address to a block while respecting the index's deliberate rule
+/// that a function wins its collision with its entry block.
+fn block_at_address(ctx: &Context<'_>, addresses: &AddressIndex, address: u64) -> Option<BlockId> {
+    match addresses.get(address)? {
+        AddressTarget::Block(block) => Some(block),
+        AddressTarget::Function(function) => ctx
+            .function(function)
+            .root_id()
+            .map(|local| BlockId::new(function, local)),
     }
 }
 
@@ -254,7 +267,10 @@ fn wire_branch_to_next(ctx: &mut Context, block_id: BlockId, next_block_id: Bloc
 #[cfg(test)]
 mod tests {
     use super::*;
-    use qcode::{context::Context, value::BasicBlock};
+    use qcode::{
+        context::Context,
+        value::{BasicBlock, FunctionBody},
+    };
     use qcode_macro::qcode;
 
     struct SimpleTrace(Vec<u64>);
@@ -262,6 +278,23 @@ mod tests {
         fn list_addresses(&self) -> &[u64] {
             &self.0
         }
+    }
+
+    #[test]
+    fn address_index_function_collision_resolves_to_entry_block() {
+        let mut ctx = Context::new();
+        let function = FunctionBody::make_at_addr(&mut ctx, 0x1000, None).id;
+        let entry = BasicBlock::make(&mut ctx, function).with_address(0x1000).id;
+        FunctionBody::from_id_mut(&mut ctx, function)
+            .set_root(entry)
+            .unwrap();
+
+        let addresses = AddressIndex::analyze(&ctx);
+        assert_eq!(
+            addresses.get(0x1000),
+            Some(AddressTarget::Function(function))
+        );
+        assert_eq!(block_at_address(&ctx, &addresses, 0x1000), Some(entry));
     }
 
     /// Builds a simple context with a conditional branch and returns a trace
@@ -346,7 +379,9 @@ mod tests {
     fn test_success_path_inserts_assert_no_not() {
         let (mut ctx, _, _, _, _) = make_cbranch_ctx();
 
-        let orig_block = BasicBlock::from_addr(&ctx, 0x1000).unwrap();
+        let addresses = AddressIndex::analyze(&ctx);
+        let orig_block =
+            BasicBlock::from_id(&ctx, block_at_address(&ctx, &addresses, 0x1000).unwrap());
         assert!(
             matches!(
                 orig_block.iter().last().unwrap().mnemonic(),
@@ -381,7 +416,9 @@ mod tests {
     fn test_failure_path_inserts_negated_assert() {
         let (mut ctx, _, _, _, _) = make_cbranch_ctx();
 
-        let orig_block = BasicBlock::from_addr(&ctx, 0x1000).unwrap();
+        let addresses = AddressIndex::analyze(&ctx);
+        let orig_block =
+            BasicBlock::from_id(&ctx, block_at_address(&ctx, &addresses, 0x1000).unwrap());
         assert!(
             matches!(
                 orig_block.iter().last().unwrap().mnemonic(),

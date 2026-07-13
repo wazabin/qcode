@@ -1,6 +1,7 @@
 //! Narrow C runtime startup recognizers.
 
 use qcode::{
+    address_index::AddressIndex,
     context::Context,
     discovery::{Discovery, FunctionDiscoveryReason},
     value::{
@@ -44,7 +45,8 @@ pub fn discover_libc_main(ctx: &mut Context, env: &PipelineEnv) -> bool {
         return false;
     };
 
-    let Some((main, source_addr)) = find_libc_main_arg(ctx, entry, main_reg) else {
+    let addresses = AddressIndex::analyze(ctx);
+    let Some((main, source_addr)) = find_libc_main_arg(ctx, &addresses, entry, main_reg) else {
         return false;
     };
 
@@ -55,7 +57,7 @@ pub fn discover_libc_main(ctx: &mut Context, env: &PipelineEnv) -> bool {
     // `entry → main` call-graph edge synthetically so the call graph links them.
     // Keyed by address, this is independent of whether we (below) or the symbol
     // table materialize `main`, and it is idempotent across analyze rounds.
-    if let Some(entry_id) = FunctionBody::from_addr(ctx, entry).map(|function| function.id) {
+    if let Some(entry_id) = addresses.function_at(entry) {
         changed |= ctx.shared.values.add_synthetic_callee(entry_id, main);
     }
 
@@ -63,9 +65,7 @@ pub fn discover_libc_main(ctx: &mut Context, env: &PipelineEnv) -> bool {
     // already exist at `main` (a prior round's discovery) or the name `main` may
     // be taken (e.g. from the symbol table), in which case naming ours `main`
     // would collide on the unique-name invariant.
-    if FunctionBody::from_addr(ctx, main).is_none()
-        && FunctionBody::from_name(ctx, "main").is_none()
-    {
+    if addresses.function_at(main).is_none() && FunctionBody::from_name(ctx, "main").is_none() {
         changed |= ctx.discover(
             Discovery::function(main)
                 .with_function_reason(FunctionDiscoveryReason::CrtMain)
@@ -77,8 +77,13 @@ pub fn discover_libc_main(ctx: &mut Context, env: &PipelineEnv) -> bool {
     changed
 }
 
-fn find_libc_main_arg(ctx: &Context<'_>, entry: u64, main_reg: ValueId) -> Option<(u64, u64)> {
-    let function = FunctionBody::from_addr(ctx, entry)?;
+fn find_libc_main_arg(
+    ctx: &Context<'_>,
+    addresses: &AddressIndex,
+    entry: u64,
+    main_reg: ValueId,
+) -> Option<(u64, u64)> {
+    let function = FunctionBody::from_id(ctx, addresses.function_at(entry)?);
     let mut last_main = None;
 
     for block in function.blocks() {
@@ -122,8 +127,7 @@ mod tests {
 
         {
             let block = { tc.ctx.get_or_make_block(0x1000, start) };
-            FunctionBody::from_addr_mut(&mut tc.ctx, 0x1000)
-                .unwrap()
+            FunctionBody::from_id_mut(&mut tc.ctx, start)
                 .set_root(block)
                 .unwrap();
             let mut builder = Builder::from_block(BasicBlock::from_id_mut(&mut tc.ctx, block));
@@ -162,8 +166,7 @@ mod tests {
 
         {
             let block = { tc.ctx.get_or_make_block(0x1000, start) };
-            FunctionBody::from_addr_mut(&mut tc.ctx, 0x1000)
-                .unwrap()
+            FunctionBody::from_id_mut(&mut tc.ctx, start)
                 .set_root(block)
                 .unwrap();
             let mut builder = Builder::from_block(BasicBlock::from_id_mut(&mut tc.ctx, block));
@@ -189,7 +192,7 @@ mod tests {
 
         assert!(DiscoverLibcMain.run(&mut tc.ctx, &env).unwrap());
 
-        let entry_id = FunctionBody::from_addr(&tc.ctx, 0x1000).unwrap().id;
+        let entry_id = AddressIndex::analyze(&tc.ctx).function_at(0x1000).unwrap();
         // The synthetic edge is keyed by `main`'s address.
         assert!(
             tc.ctx
@@ -207,8 +210,7 @@ mod tests {
         );
 
         // ...and once one does, `entry → main` shows up in the call graph.
-        FunctionBody::make_at_addr(&mut tc.ctx, 0x2000, Some("main".into()));
-        let main_id = FunctionBody::from_addr(&tc.ctx, 0x2000).unwrap().id;
+        let main_id = FunctionBody::make_at_addr(&mut tc.ctx, 0x2000, Some("main".into())).id;
         assert_eq!(
             FunctionBody::from_id(&tc.ctx, entry_id).callees(),
             vec![main_id]

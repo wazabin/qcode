@@ -3,6 +3,7 @@ use crate::{
     Interpreter,
 };
 use qcode::{
+    address_index::{AddressIndex, AddressTarget},
     context::Context,
     space::{Space, SpaceId, SpaceType},
     value::{
@@ -744,6 +745,11 @@ pub struct StandaloneEmulator {
     /// deposit the callee's `Return.value` as that call's result.
     call_site_stack: Vec<InstructionId>,
 
+    /// Disposable address lookup for the immutable module snapshot supplied by
+    /// the caller. The lifetime-free emulator initializes this lazily because
+    /// [`StandaloneEmulator::new`] intentionally takes no `Context`.
+    address_index: Option<AddressIndex>,
+
     pub instruction_hook: Option<InstructionHook>,
     call_interceptor: Option<CallInterceptor>,
 }
@@ -761,9 +767,33 @@ impl StandaloneEmulator {
             idx: 0,
             call_stack: Vec::new(),
             call_site_stack: Vec::new(),
+            address_index: None,
             instruction_hook: None,
             call_interceptor: None,
         }
+    }
+
+    fn with_address_index(entry: BlockId, address_index: AddressIndex) -> Self {
+        let mut emulator = Self::new(entry);
+        emulator.address_index = Some(address_index);
+        emulator
+    }
+
+    fn resolve_block_at(ctx: &Context<'_>, index: &AddressIndex, address: u64) -> Option<BlockId> {
+        match index.get(address) {
+            Some(AddressTarget::Block(block)) => Some(block),
+            Some(AddressTarget::Function(function)) => FunctionBody::from_id(ctx, function)
+                .root()
+                .map(|root| root.id),
+            None => None,
+        }
+    }
+
+    fn block_at(&mut self, ctx: &Context<'_>, address: u64) -> Option<BlockId> {
+        let index = self
+            .address_index
+            .get_or_insert_with(|| AddressIndex::analyze(ctx));
+        Self::resolve_block_at(ctx, index, address)
     }
 
     fn make_error(&self, ctx: &Context<'_>, kind: EmulatorErrorKind) -> EmulatorError {
@@ -804,8 +834,10 @@ impl StandaloneEmulator {
     }
 
     pub fn from_address(ctx: &Context<'_>, addr: u64) -> Self {
-        let entry = BasicBlock::from_addr(ctx, addr).expect("Invalid block address");
-        let mut emulator = Self::new(entry.id);
+        let address_index = AddressIndex::analyze(ctx);
+        let entry = Self::resolve_block_at(ctx, &address_index, addr)
+            .expect("Invalid block or function address");
+        let mut emulator = Self::with_address_index(entry, address_index);
         emulator.memory.configure_spaces(ctx);
         emulator
     }
@@ -1067,11 +1099,9 @@ impl StandaloneEmulator {
     ) -> Result<(), EmulatorErrorKind> {
         let target = match continuation {
             CallContinuation::Block(block) => block,
-            CallContinuation::Address(addr) => {
-                BasicBlock::from_addr(ctx, addr)
-                    .ok_or(EmulatorErrorKind::InvalidBlockAddress(addr))?
-                    .id
-            }
+            CallContinuation::Address(addr) => self
+                .block_at(ctx, addr)
+                .ok_or(EmulatorErrorKind::InvalidBlockAddress(addr))?,
         };
         self.block = target;
         self.idx = 0;
@@ -1243,22 +1273,18 @@ impl StandaloneEmulator {
 
             Mnemonic::BranchInd(BranchInd { ptr }) => {
                 let addr = self.get_value(ctx, ptr.qualify(id.func)).unwrap();
-                let target = BasicBlock::from_addr(ctx, addr)
-                    .ok_or_else(|| {
-                        self.make_error(ctx, EmulatorErrorKind::InvalidBlockAddress(addr))
-                    })?
-                    .id;
+                let target = self.block_at(ctx, addr).ok_or_else(|| {
+                    self.make_error(ctx, EmulatorErrorKind::InvalidBlockAddress(addr))
+                })?;
                 self.block = target;
                 self.idx = 0;
             }
 
             Mnemonic::CallInd(CallInd { ptr, .. }) => {
                 let addr = self.get_value(ctx, ptr.qualify(id.func)).unwrap();
-                let target = BasicBlock::from_addr(ctx, addr)
-                    .ok_or_else(|| {
-                        self.make_error(ctx, EmulatorErrorKind::InvalidBlockAddress(addr))
-                    })?
-                    .id;
+                let target = self.block_at(ctx, addr).ok_or_else(|| {
+                    self.make_error(ctx, EmulatorErrorKind::InvalidBlockAddress(addr))
+                })?;
                 self.block = target;
                 self.idx = 0;
                 self.call_site_stack.push(insn_id);
@@ -1282,11 +1308,9 @@ impl StandaloneEmulator {
                 }
 
                 let addr = self.get_value(ctx, ptr.qualify(id.func)).unwrap();
-                let target = BasicBlock::from_addr(ctx, addr)
-                    .ok_or_else(|| {
-                        self.make_error(ctx, EmulatorErrorKind::InvalidBlockAddress(addr))
-                    })?
-                    .id;
+                let target = self.block_at(ctx, addr).ok_or_else(|| {
+                    self.make_error(ctx, EmulatorErrorKind::InvalidBlockAddress(addr))
+                })?;
                 self.block = target;
                 self.idx = 0;
                 return Ok(StepEvent::Return);
@@ -1455,9 +1479,9 @@ impl StandaloneEmulator {
 
     /// Runs blocks until the current block starts at `addr`.
     pub fn run_until(&mut self, ctx: &Context<'_>, addr: u64) -> crate::Result<()> {
-        let target = BasicBlock::from_addr(ctx, addr)
-            .ok_or_else(|| self.make_error(ctx, EmulatorErrorKind::UnknownAddress(addr)))?
-            .id;
+        let target = self
+            .block_at(ctx, addr)
+            .ok_or_else(|| self.make_error(ctx, EmulatorErrorKind::UnknownAddress(addr)))?;
         while self.block != target {
             self.run_block(ctx)?;
         }
@@ -2206,7 +2230,7 @@ pub struct Emulator<'ctx> {
 
 impl<'ctx> Emulator<'ctx> {
     pub fn new(ctx: &'ctx Context<'ctx>, entry: BlockId) -> Self {
-        let mut inner = StandaloneEmulator::new(entry);
+        let mut inner = StandaloneEmulator::with_address_index(entry, AddressIndex::analyze(ctx));
         inner.memory.configure_spaces(ctx);
         Self { inner, ctx }
     }
@@ -2461,6 +2485,32 @@ mod tests {
         let value = SizedValue::new(0x1234, 1);
         assert_eq!(value.size().unwrap(), 1);
         assert_eq!(value.value().unwrap(), 0x34);
+    }
+
+    #[test]
+    fn from_address_resolves_function_entry_to_root() {
+        let mut ctx = Context::new();
+        let function = FunctionBody::make_at_addr(&mut ctx, 0x1000, None).id;
+        let root = BasicBlock::make(&mut ctx, function).with_address(0x1000).id;
+
+        let emulator = StandaloneEmulator::from_address(&ctx, 0x1000);
+
+        assert_eq!(emulator.current_block(), root);
+        assert!(emulator.address_index.is_some());
+    }
+
+    #[test]
+    fn standalone_address_lookup_builds_one_lazy_snapshot() {
+        let mut ctx = Context::new();
+        let function = ctx.anon_function();
+        let block = BasicBlock::make(&mut ctx, function).with_address(0x2000).id;
+        ctx.block_mut(block).extra_addresses.push(0x2001);
+        let mut emulator = StandaloneEmulator::new(block);
+
+        assert!(emulator.address_index.is_none());
+        assert_eq!(emulator.block_at(&ctx, 0x2001), Some(block));
+        assert!(emulator.address_index.is_some());
+        assert_eq!(emulator.block_at(&ctx, 0x2000), Some(block));
     }
 
     #[test]
