@@ -1557,8 +1557,14 @@ impl<'str> Context<'str> {
             }
         }
         for (func, arg) in affected_args {
-            if let Some(users) = self.bodies[func].users.get_mut(&arg) {
+            let remove_key = if let Some(users) = self.bodies[func].users.get_mut(&arg) {
                 users.retain(|&local| !dead.contains(&InstructionId::new(func, local)));
+                users.is_empty()
+            } else {
+                false
+            };
+            if remove_key {
+                self.bodies[func].users.remove(&arg);
             }
         }
         for target in affected_targets {
@@ -1567,6 +1573,9 @@ impl<'str> Context<'str> {
             }
         }
         for id in ids {
+            self.bodies[id.func]
+                .users
+                .remove(&ValueId::Instruction(id).strip_func());
             self.bodies[id.func].insns.remove(id.local);
         }
     }
@@ -2261,6 +2270,10 @@ pub struct NameTable<'str> {
 }
 
 impl<'str> NameTable<'str> {
+    pub(crate) fn entries(&self) -> impl Iterator<Item = (&str, ValueId)> + '_ {
+        self.map.iter().map(|(name, &value)| (name.as_ref(), value))
+    }
+
     /// Rebind function-qualified values after a detached function body built
     /// under `from` is installed under `to`. Function-local storage itself uses
     /// local IDs; only this reverse lookup metadata carries the ambient owner.

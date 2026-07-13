@@ -6,6 +6,7 @@
 //! corrupts the IR the failure is reported against the exact pass that produced
 //! it, rather than surfacing far downstream as a confusing symptom.
 
+mod arena_integrity;
 mod block_terminators;
 mod bool_typing;
 mod dangling_refs;
@@ -15,6 +16,7 @@ mod pure_function;
 mod pure_reg_call_args;
 mod users_map;
 
+pub use arena_integrity::verify_body_arena_integrity;
 pub use block_terminators::verify_block_terminators;
 pub use bool_typing::verify_bool_typing;
 pub use dangling_refs::verify_no_dangling_refs;
@@ -33,7 +35,10 @@ use crate::{Pass, PipelineEnv};
 /// Run every verifier rule and return all diagnostics as human-readable strings.
 /// An empty result means the IR is well-formed by the checks we have.
 pub fn verify(ctx: &Context<'_>) -> Vec<String> {
-    let mut diagnostics = Vec::new();
+    let mut diagnostics = verify_body_arena_integrity(ctx);
+    if !diagnostics.is_empty() {
+        return diagnostics;
+    }
     diagnostics.extend(verify_block_terminators(ctx));
     diagnostics.extend(verify_no_dangling_refs(ctx));
     diagnostics.extend(verify_intra_function_ssa(ctx));

@@ -100,6 +100,7 @@
 //! [`Builder`]:                 crate::builder::Builder
 
 pub mod address_index;
+mod arena_integrity;
 pub mod assumption;
 pub mod builder;
 pub mod context;
@@ -112,6 +113,8 @@ pub mod pass_scope;
 pub mod space;
 pub mod types;
 pub mod value;
+
+pub use arena_integrity::verify_body_arena_integrity;
 
 #[cfg(any(test, feature = "testing"))]
 pub mod testing;

@@ -123,4 +123,30 @@ mod tests {
         let diags = verify_users_map(&ctx);
         assert!(diags.is_empty(), "{diags:?}");
     }
+
+    #[test]
+    fn direct_operand_mutation_reports_users_disagreement() {
+        let mut ctx = Context::new();
+        qcode!(
+            ctx,
+            "
+            fn f:
+                <entry @a:i64 @replacement:i64>
+                    %b = i64 @a + i64 0x1;
+                    return at i64 %b;
+            "
+        );
+        qcode::value::Instruction::from_id_mut(&mut ctx, b)
+            .mnemonic_mut()
+            .replace_value(
+                ValueId::BlockParam(a).strip_func(),
+                ValueId::BlockParam(replacement).strip_func(),
+            );
+
+        let diagnostics = verify_users_map(&ctx);
+        assert!(
+            diagnostics.iter().any(|d| d.contains("live operands give")),
+            "{diagnostics:#?}"
+        );
+    }
 }

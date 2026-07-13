@@ -350,13 +350,22 @@ impl<'a, 'str> PassBacking<'a, 'str> {
             self.function_mut(id.func).names.forget(n.as_ref());
         }
         for arg in args {
-            if let Some(users) = self.function_mut(id.func).users.get_mut(&arg) {
+            let remove_key = if let Some(users) = self.function_mut(id.func).users.get_mut(&arg) {
                 users.retain(|&local| local != id.localize(id.func));
+                users.is_empty()
+            } else {
+                false
+            };
+            if remove_key {
+                self.function_mut(id.func).users.remove(&arg);
             }
         }
         if let Some(target) = target {
             self.forget_call_site(target, id);
         }
+        self.function_mut(id.func)
+            .users
+            .remove(&ValueId::Instruction(id).strip_func());
         self.function_mut(id.func).insns.remove(id.local);
     }
 

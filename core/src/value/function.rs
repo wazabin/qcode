@@ -623,10 +623,17 @@ impl<'str> FunctionBody<'str> {
             self.names.forget(n.as_ref());
         }
         for arg in args {
-            if let Some(users) = self.users.get_mut(&arg) {
+            let remove_key = if let Some(users) = self.users.get_mut(&arg) {
                 users.retain(|&local| local != id.localize(self.id));
+                users.is_empty()
+            } else {
+                false
+            };
+            if remove_key {
+                self.users.remove(&arg);
             }
         }
+        self.users.remove(&ValueId::Instruction(id).strip_func());
         self.insns.remove(id.local);
     }
 
