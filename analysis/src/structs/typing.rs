@@ -23,9 +23,9 @@ use qcode::{
     space::{Space, SpaceId, SpaceType},
     types::TypeId,
     value::{
-        FunctionId, ValueId,
+        FunctionId, QCodeView, ValueId,
         insn::{Binary, Binop, Gep, InstructionId, IntBinop, Mnemonic},
-        util::base_ref::{BaseRef, HostRef},
+        util::base_ref::BaseRef,
     },
 };
 
@@ -68,12 +68,12 @@ pub fn struct_typing<'a, 'str>(
     // types (the common case) the whole fixpoint + rename sweep is a guaranteed
     // no-op, so bail before allocating or scanning it twice. Per-function so it
     // stays correct once non-Windows struct recovery lands.
-    if !function_has_struct_types(cx.read_host(body), fun_id) {
+    if !function_has_struct_types(cx.body_view(body), fun_id) {
         return false;
     }
 
     let insn_ids: Vec<InstructionId> = cx
-        .read_host(body)
+        .body_view(body)
         .function_ref(fun_id)
         .blocks()
         .flat_map(|b| b.instruction_ids().to_vec())
@@ -104,12 +104,8 @@ pub fn struct_typing<'a, 'str>(
 
 /// The stored [`TypeId`] of `id`, host-routed: a checked-out function's
 /// instruction/param types live in its owned arena, other kinds in shared data.
-fn stored_type_of<'str>(host: HostRef<'_, 'str>, id: ValueId) -> Option<TypeId> {
-    match id {
-        ValueId::Instruction(iid) => Some(host.insn_ref(iid).type_id()),
-        ValueId::BlockParam(pid) => Some(host.param_ref(pid).type_id()),
-        other => host.shr().stored_type_of(other),
-    }
+fn stored_type_of<'a, 'str: 'a>(host: impl QCodeView<'a, 'str>, id: ValueId) -> Option<TypeId> {
+    host.stored_type_of(id)
 }
 
 /// Renames struct-typed SSA values and block parameters after the struct they
@@ -121,7 +117,7 @@ fn rename_struct_values<'a, 'str>(
     fun_id: FunctionId,
 ) -> bool {
     let values: Vec<ValueId> = cx
-        .read_host(body)
+        .body_view(body)
         .function_ref(fun_id)
         .blocks()
         .flat_map(|b| {
@@ -134,12 +130,12 @@ fn rename_struct_values<'a, 'str>(
 
     let mut changed = false;
     for value in values {
-        let Some(base) = stored_type_of(cx.read_host(body), value)
-            .and_then(|t| struct_base_name(cx.read_host(body), t))
+        let Some(base) = stored_type_of(cx.body_view(body), value)
+            .and_then(|t| struct_base_name(cx.body_view(body), t))
         else {
             continue;
         };
-        if let Some(name) = unique_name(cx.read_host(body), fun_id, value, &base) {
+        if let Some(name) = unique_name(cx.body_view(body), fun_id, value, &base) {
             let renamed = match value {
                 ValueId::Instruction(id) => {
                     BaseRef::new(cx.host(body), id).rename_local(name).is_ok()
@@ -158,16 +154,16 @@ fn rename_struct_values<'a, 'str>(
 /// The lowercased struct name a value of type `ty` should be named after: the
 /// pointee's name when `ty` is a struct pointer, or the struct's own name when
 /// `ty` is a struct value. `None` for non-struct types.
-fn struct_base_name(host: HostRef, ty: TypeId) -> Option<String> {
-    let types = &host.shr().types;
+fn struct_base_name<'a, 'str: 'a>(host: impl QCodeView<'a, 'str>, ty: TypeId) -> Option<String> {
+    let types = &host.shared().types;
     let struct_ty = types.pointee_of(ty).unwrap_or(ty);
     types.struct_name_of(struct_ty).map(str::to_lowercase)
 }
 
 /// Picks a unique name for `value` from `base`, `base1`, `base2`, … Returns
 /// `None` if `value` is already named with such a candidate (nothing to do).
-fn unique_name<'str>(
-    host: HostRef,
+fn unique_name<'a, 'str: 'a>(
+    host: impl QCodeView<'a, 'str>,
     fun_id: FunctionId,
     value: ValueId,
     base: &str,
@@ -196,10 +192,13 @@ fn unique_name<'str>(
 /// instruction results, block params, *and* operands, because the seed can live on
 /// an operand varnode (the Windows TEB seed retypes the `FS_OFFSET` register that a
 /// `load(register, reg)` reads) rather than on a value the function defines.
-fn function_has_struct_types(host: HostRef, fun_id: FunctionId) -> bool {
+fn function_has_struct_types<'a, 'str: 'a>(
+    host: impl QCodeView<'a, 'str>,
+    fun_id: FunctionId,
+) -> bool {
     let is_struct_ish = |v: ValueId| {
         stored_type_of(host, v).is_some_and(|t| {
-            let types = &host.shr().types;
+            let types = &host.shared().types;
             types.pointee_of(t).is_some() || types.struct_name_of(t).is_some()
         })
     };
@@ -219,7 +218,7 @@ fn type_instruction<'a, 'str>(
     cx: ContextView<'a, 'str>,
     id: InstructionId,
 ) -> bool {
-    match cx.read_host(body).insn_ref(id).mnemonic().clone() {
+    match cx.body_view(body).insn_ref(id).mnemonic().clone() {
         Mnemonic::Binop(Binary {
             op: Binop::Int(IntBinop::Add),
             lhs,
@@ -228,7 +227,7 @@ fn type_instruction<'a, 'str>(
         // A register read (`load` from the register space) yields the register's
         // own value type — which the TEB seed overrode to `PtrTo<TEB>`. A normal
         // RAM load dereferences a field pointer.
-        Mnemonic::Load(load) if is_register_space(cx.read_host(body), load.space) => {
+        Mnemonic::Load(load) if is_register_space(cx.body_view(body), load.space) => {
             try_type_register_read(body, cx, id, load.ptr.qualify(id.func), load.size)
         }
         Mnemonic::Load(load) => try_type_load(body, cx, id, load.ptr.qualify(id.func), load.size),
@@ -237,8 +236,8 @@ fn type_instruction<'a, 'str>(
 }
 
 /// Whether `space` is the processor register file.
-fn is_register_space(host: HostRef, space: SpaceId) -> bool {
-    matches!(Space::from_id(host.shr(), space).ty, SpaceType::Register)
+fn is_register_space<'a, 'str: 'a>(host: impl QCodeView<'a, 'str>, space: SpaceId) -> bool {
+    matches!(Space::from_id(host.shared(), space).ty, SpaceType::Register)
 }
 
 /// `load(register, reg)` is a register read: its result takes the register's own
@@ -252,7 +251,7 @@ fn try_type_register_read<'a, 'str>(
     reg: ValueId,
     size: usize,
 ) -> bool {
-    let Some(reg_ty) = stored_type_of(cx.read_host(body), reg) else {
+    let Some(reg_ty) = stored_type_of(cx.body_view(body), reg) else {
         return false;
     };
     let (is_ptr, reg_size) = {
@@ -262,7 +261,7 @@ fn try_type_register_read<'a, 'str>(
     if !is_ptr || reg_size != size {
         return false;
     }
-    if stored_type_of(cx.read_host(body), ValueId::Instruction(id)) == Some(reg_ty) {
+    if stored_type_of(cx.body_view(body), ValueId::Instruction(id)) == Some(reg_ty) {
         return false;
     }
     BaseRef::new(cx.host(body), id).set_result_type(reg_ty);
@@ -279,13 +278,13 @@ fn try_add_to_gep<'a, 'str>(
     rhs: ValueId,
 ) -> bool {
     for (base, off_op) in [(lhs, rhs), (rhs, lhs)] {
-        let Some(base_ty) = stored_type_of(cx.read_host(body), base) else {
+        let Some(base_ty) = stored_type_of(cx.body_view(body), base) else {
             continue;
         };
         let Some(pointee) = cx.shr().types.pointee_of(base_ty) else {
             continue;
         };
-        let Some(offset) = const_offset(cx.read_host(body), off_op) else {
+        let Some(offset) = const_offset(cx.body_view(body), off_op) else {
             continue;
         };
         let field_ty = match cx.shr().types.field_by_offset(pointee, offset) {
@@ -316,7 +315,7 @@ fn try_type_load<'a, 'str>(
     ptr: ValueId,
     size: usize,
 ) -> bool {
-    let Some(ptr_ty) = stored_type_of(cx.read_host(body), ptr) else {
+    let Some(ptr_ty) = stored_type_of(cx.body_view(body), ptr) else {
         return false;
     };
     let Some(field_ty) = cx.shr().types.pointee_of(ptr_ty) else {
@@ -325,7 +324,7 @@ fn try_type_load<'a, 'str>(
     if cx.shr().types.size_of(field_ty) != size {
         return false;
     }
-    if stored_type_of(cx.read_host(body), ValueId::Instruction(id)) == Some(field_ty) {
+    if stored_type_of(cx.body_view(body), ValueId::Instruction(id)) == Some(field_ty) {
         return false;
     }
     BaseRef::new(cx.host(body), id).set_result_type(field_ty);
@@ -334,11 +333,11 @@ fn try_type_load<'a, 'str>(
 
 /// The concrete constant value of `op` as a byte offset, or `None` if `op` is
 /// not a plain (non-symbolic) integer literal.
-fn const_offset(host: HostRef, op: ValueId) -> Option<usize> {
+fn const_offset<'a, 'str: 'a>(host: impl QCodeView<'a, 'str>, op: ValueId) -> Option<usize> {
     let ValueId::Literal(lid) = op else {
         return None;
     };
-    let lit = &host.shr().values.literals[lid];
+    let lit = &host.shared().values.literals[lid];
     if lit.symbolic.is_some() {
         return None;
     }

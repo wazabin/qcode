@@ -1116,7 +1116,7 @@ pub fn remove_dead_load_insns_host<'a, 'str>(
     dead_regs: &[ValueId],
 ) -> bool {
     let block_ids: Vec<BlockId> = cx
-        .read_host(body)
+        .body_view(body)
         .function_ref(function_id)
         .iter()
         .map(|block| block.id)

@@ -1,6 +1,6 @@
 use qcode::context::Context;
 use qcode::value::{
-    BlockId, BlockParamId, FunctionId, LocalValueId, ValueId,
+    BlockId, BlockParamId, FunctionId, LocalValueId, QCodeView, ValueId,
     insn::{Branch, InstructionId, Mnemonic},
 };
 
@@ -58,7 +58,7 @@ pub fn simplify_cfg_concrete<'a, 'str>(
 
     loop {
         let mut progress = prune_unreachable_concrete(body, cx, function_id);
-        let blocks = cx.read_host(body).function_ref(function_id).block_ids();
+        let blocks = cx.body_view(body).function_ref(function_id).block_ids();
 
         for block_id in blocks {
             if try_fold_cbranch_concrete(body, cx, block_id)
@@ -449,7 +449,7 @@ fn prune_unreachable_concrete<'a, 'str>(
     function_id: FunctionId,
 ) -> bool {
     let Some(root) = cx
-        .read_host(body)
+        .body_view(body)
         .function_ref(function_id)
         .root()
         .map(|b| b.id)
@@ -465,7 +465,7 @@ fn prune_unreachable_concrete<'a, 'str>(
             continue;
         }
         let succs: Vec<BlockId> = cx
-            .read_host(body)
+            .body_view(body)
             .block_ref(b)
             .successors()
             .map(|(_, s)| s)
@@ -474,7 +474,7 @@ fn prune_unreachable_concrete<'a, 'str>(
     }
 
     let dead: Vec<BlockId> = cx
-        .read_host(body)
+        .body_view(body)
         .function_ref(function_id)
         .block_ids()
         .into_iter()
@@ -508,7 +508,7 @@ fn merge_candidate_concrete<'a, 'str>(
     // Collect at most 2 successors to check the "exactly one" condition.
     // Collecting eagerly releases the immutable borrow before any mutation.
     let a_succs: Vec<_> = cx
-        .read_host(body)
+        .body_view(body)
         .block_ref(a_id)
         .successors()
         .take(2)
@@ -518,13 +518,13 @@ fn merge_candidate_concrete<'a, 'str>(
     if a_succs.len() != 1 || b_id == a_id {
         return None; // more than one successor, or a self-loop
     }
-    if cx.read_host(body).block_ref(b_id).predecessors().count() != 1 {
+    if cx.body_view(body).block_ref(b_id).predecessors().count() != 1 {
         return None;
     }
 
     // A's terminal must be an unconditional Branch to B.
     let a_terminal = cx
-        .read_host(body)
+        .body_view(body)
         .block_ref(a_id)
         .instruction_ids()
         .last()
@@ -532,7 +532,7 @@ fn merge_candidate_concrete<'a, 'str>(
     let is_branch_to_b = a_terminal
         .map(|id| {
             matches!(
-                cx.read_host(body).insn_ref(id).mnemonic(),
+                cx.body_view(body).insn_ref(id).mnemonic(),
                 Mnemonic::Branch(b) if BlockId::new(a_id.func, b.target) == b_id
             )
         })
@@ -546,9 +546,9 @@ fn merge_candidate_concrete<'a, 'str>(
     // CRT stub's tail `jmp` into another routine that mem2reg gave a param,
     // lifted as an intra-function `goto` carrying no args. Leave such edges
     // unmerged rather than absorbing an unsatisfiable param.
-    let b_params = cx.read_host(body).block_ref(b_id).num_params();
+    let b_params = cx.body_view(body).block_ref(b_id).num_params();
     let branch_args = a_terminal
-        .and_then(|id| match cx.read_host(body).insn_ref(id).mnemonic() {
+        .and_then(|id| match cx.body_view(body).insn_ref(id).mnemonic() {
             Mnemonic::Branch(b) => Some(b.args.len()),
             _ => None,
         })
@@ -581,7 +581,7 @@ fn try_merge_block_concrete<'a, 'str>(
     // shared CRT stubs, thunks) — must not be absorbed: `absorb_block` →
     // `unroster_block` mutates the *owner*'s roster, which a checked-out pass may
     // not do. A cross-function successor (thunk/tail-call) is likewise left as-is.
-    if b_id.func != function_id || cx.read_host(body).block(b_id).parent != Some(function_id) {
+    if b_id.func != function_id || cx.body_view(body).block(b_id).parent != Some(function_id) {
         return false;
     }
     body.absorb_block(a_id, b_id, edge_ab);
@@ -600,7 +600,7 @@ fn try_fold_cbranch_concrete<'a, 'str>(
     block_id: BlockId,
 ) -> bool {
     let Some(term_id) = cx
-        .read_host(body)
+        .body_view(body)
         .block_ref(block_id)
         .instruction_ids()
         .last()
@@ -609,7 +609,7 @@ fn try_fold_cbranch_concrete<'a, 'str>(
         return false;
     };
     let (target, args) = {
-        let Mnemonic::CBranch(cb) = cx.read_host(body).insn_ref(term_id).mnemonic() else {
+        let Mnemonic::CBranch(cb) = cx.body_view(body).insn_ref(term_id).mnemonic() else {
             return false;
         };
         if cb.success_block != cb.failure_block || cb.success_args != cb.failure_args {
@@ -623,7 +623,7 @@ fn try_fold_cbranch_concrete<'a, 'str>(
     // first, drop the second. `target` is a body-local index in this arena.
     let target_full = BlockId::new(block_id.func, target);
     let dup_edge = cx
-        .read_host(body)
+        .body_view(body)
         .block_ref(block_id)
         .successors()
         .filter(|&(_, to)| to == target_full)
@@ -665,7 +665,7 @@ fn try_bypass_empty_block_concrete<'a, 'str>(
 
     // The entry block dominates everything; deleting it would orphan the body.
     if cx
-        .read_host(body)
+        .body_view(body)
         .function_ref(function_id)
         .root()
         .map(|r| r.id)
@@ -676,7 +676,7 @@ fn try_bypass_empty_block_concrete<'a, 'str>(
 
     // B must hold exactly one instruction, an unconditional branch.
     let (term_id, target, b_args) = {
-        let b = cx.read_host(body).block(b_id);
+        let b = cx.body_view(body).block(b_id);
         if b.instruction_ids().len() != 1 {
             return false;
         }
@@ -695,7 +695,7 @@ fn try_bypass_empty_block_concrete<'a, 'str>(
     }
 
     let params: Vec<BlockParamId> = cx
-        .read_host(body)
+        .body_view(body)
         .block(b_id)
         .param_ids()
         .iter()
@@ -707,7 +707,7 @@ fn try_bypass_empty_block_concrete<'a, 'str>(
     // normally holds; bail if it doesn't rather than risk a dangling use.
     for &p in &params {
         if cx
-            .read_host(body)
+            .body_view(body)
             .function_ref(b_id.func)
             .users_of(ValueId::BlockParam(p))
             .iter()
@@ -720,7 +720,7 @@ fn try_bypass_empty_block_concrete<'a, 'str>(
     // Distinct predecessors of B.
     let preds: Vec<BlockId> = {
         let mut seen = rustc_hash::FxHashSet::default();
-        cx.read_host(body)
+        cx.body_view(body)
             .block_ref(b_id)
             .predecessors()
             .map(|(_, p)| p)
@@ -749,7 +749,7 @@ fn try_bypass_empty_block_concrete<'a, 'str>(
     // each arm that targets B.
     for &p in &preds {
         let Some(p_term) = cx
-            .read_host(body)
+            .body_view(body)
             .block(p)
             .instruction_ids()
             .last()
@@ -790,7 +790,7 @@ fn try_bypass_empty_block_concrete<'a, 'str>(
     // params with the arguments that predecessor supplied.
     for &p in &preds {
         let p_term = cx
-            .read_host(body)
+            .body_view(body)
             .block(p)
             .instruction_ids()
             .last()
@@ -819,7 +819,7 @@ fn try_bypass_empty_block_concrete<'a, 'str>(
         // Rehome the `p -> b` edges to `p -> target`, preserving multiplicity
         // (a CBranch with both arms on B contributes two edges).
         let mut redirect: Vec<_> = cx
-            .read_host(body)
+            .body_view(body)
             .block_ref(p)
             .successors()
             .filter(|&(_, to)| to == b_id)

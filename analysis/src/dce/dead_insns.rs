@@ -2,7 +2,7 @@ use rustc_hash::FxHashSet as HashSet;
 
 use qcode::{
     context::Context,
-    value::{BlockId, FunctionId, InstructionId, ValueId, insn::Mnemonic, util::base_ref::HostRef},
+    value::{BlockId, FunctionId, InstructionId, ModuleView, QCodeView, ValueId, insn::Mnemonic},
 };
 
 use crate::loop_unroll::replace_terminator_with_branch;
@@ -11,7 +11,7 @@ use crate::loop_unroll::replace_terminator_with_branch_generic;
 
 /// This host's users of `v` (its owning function's reverse-use list), or empty
 /// for a shared value with no owning function. Mirrors [`Context::users`].
-fn host_users<'str>(host: HostRef<'_, 'str>, v: ValueId) -> Vec<InstructionId> {
+fn host_users<'a, 'str: 'a>(host: impl QCodeView<'a, 'str>, v: ValueId) -> Vec<InstructionId> {
     match v.owning_function() {
         Some(f) => host.function_ref(f).users_of(v),
         None => Vec::new(),
@@ -20,10 +20,9 @@ fn host_users<'str>(host: HostRef<'_, 'str>, v: ValueId) -> Vec<InstructionId> {
 
 /// Returns instructions in `block_id` that are pure and have no users.
 pub fn dead_insns<'a, 'str: 'a>(
-    host: impl Into<HostRef<'a, 'str>>,
+    host: impl QCodeView<'a, 'str>,
     block_id: BlockId,
 ) -> HashSet<InstructionId> {
-    let host = host.into();
     let mut dead = HashSet::default();
     let insn_ids: Vec<InstructionId> = host.block_ref(block_id).instruction_ids().to_vec();
     for id in insn_ids {
@@ -49,7 +48,9 @@ pub fn remove_dead_insns(ctx: &mut Context, block_id: BlockId) -> bool {
 pub fn remove_dead_insns_module<'str>(host: &mut Context<'str>, block_id: BlockId) -> bool {
     let mut changed = false;
     loop {
-        let mut dead: Vec<_> = dead_insns(host.read_host(), block_id).into_iter().collect();
+        let mut dead: Vec<_> = dead_insns(ModuleView::new(&*host), block_id)
+            .into_iter()
+            .collect();
         if dead.is_empty() {
             break;
         }
@@ -74,7 +75,7 @@ pub fn remove_dead_insns_host<'a, 'str>(
 ) -> bool {
     let mut changed = false;
     loop {
-        let mut dead: Vec<_> = dead_insns(cx.read_host(body), block_id)
+        let mut dead: Vec<_> = dead_insns(cx.body_view(body), block_id)
             .into_iter()
             .collect();
         if dead.is_empty() {
@@ -127,7 +128,7 @@ fn remove_dead_pure_call_module<'str>(host: &mut Context<'str>, block_id: BlockI
     if !host.function_ref(target).is_pure() {
         return false;
     }
-    if !host_users(host.read_host(), ValueId::Instruction(term_id)).is_empty() {
+    if !host_users(ModuleView::new(&*host), ValueId::Instruction(term_id)).is_empty() {
         return false;
     }
 
@@ -157,7 +158,7 @@ fn remove_dead_pure_call_host<'a, 'str>(
     block_id: BlockId,
 ) -> bool {
     let Some(term_id) = cx
-        .read_host(body)
+        .body_view(body)
         .block_ref(block_id)
         .instruction_ids()
         .last()
@@ -166,7 +167,7 @@ fn remove_dead_pure_call_host<'a, 'str>(
         return false;
     };
 
-    let (clobbers_empty, target) = match cx.read_host(body).insn_ref(term_id).mnemonic() {
+    let (clobbers_empty, target) = match cx.body_view(body).insn_ref(term_id).mnemonic() {
         Mnemonic::Call(call) => (call.clobbers.is_empty(), call.target),
         _ => return false,
     };
@@ -176,16 +177,22 @@ fn remove_dead_pure_call_host<'a, 'str>(
     let Some(target) = target.real() else {
         return false;
     };
-    if !cx.read_host(body).function_ref(target).is_pure() {
+    if !cx
+        .body_view(body)
+        .interface(target)
+        .signature
+        .as_ref()
+        .is_some_and(|signature| signature.is_pure)
+    {
         return false;
     }
-    if !host_users(cx.read_host(body), ValueId::Instruction(term_id)).is_empty() {
+    if !host_users(cx.body_view(body), ValueId::Instruction(term_id)).is_empty() {
         return false;
     }
 
     // A pure call's block has exactly one successor: its fall-through.
     let successors: Vec<BlockId> = cx
-        .read_host(body)
+        .body_view(body)
         .block_ref(block_id)
         .successors()
         .map(|(_, b)| b)
@@ -233,13 +240,13 @@ pub fn remove_unused_no_pred_block_params_generic<'str>(
         return false;
     }
 
-    let params: Vec<_> = host.read_host().block(block_id).param_ids().to_vec();
+    let params: Vec<_> = ModuleView::new(&*host).block(block_id).param_ids().to_vec();
     let mut kept = Vec::with_capacity(params.len());
     let mut changed = false;
     for local in params {
         let param = qcode::value::BlockParamId::new(block_id.func, local);
-        if host_users(host.read_host(), ValueId::BlockParam(param)).is_empty()
-            && !host.read_host().block_param(param).protected
+        if host_users(ModuleView::new(&*host), ValueId::BlockParam(param)).is_empty()
+            && !ModuleView::new(&*host).block_param(param).protected
         {
             host.remove_block_param(param);
             changed = true;
@@ -266,7 +273,7 @@ pub fn remove_unused_no_pred_block_params_host<'a, 'str>(
     block_id: BlockId,
 ) -> bool {
     if cx
-        .read_host(body)
+        .body_view(body)
         .block_ref(block_id)
         .predecessors()
         .next()
@@ -284,7 +291,7 @@ pub fn remove_unused_no_pred_block_params_host<'a, 'str>(
     // leave pure_reg entry params for `dead_signature`; the *local* fallback below
     // would silently drop the param and break the interface alignment.
     let is_pure_reg_entry = cx
-        .read_host(body)
+        .body_view(body)
         .block_ref(block_id)
         .function()
         .is_some_and(|f| f.is_pure_reg() && f.root().map(|b| b.id) == Some(block_id));
@@ -292,13 +299,13 @@ pub fn remove_unused_no_pred_block_params_host<'a, 'str>(
         return false;
     }
 
-    let params: Vec<_> = cx.read_host(body).block(block_id).param_ids().to_vec();
+    let params: Vec<_> = cx.body_view(body).block(block_id).param_ids().to_vec();
     let mut kept = Vec::with_capacity(params.len());
     let mut changed = false;
     for local in params {
         let param = qcode::value::BlockParamId::new(block_id.func, local);
-        if host_users(cx.read_host(body), ValueId::BlockParam(param)).is_empty()
-            && !cx.read_host(body).block_param(param).protected
+        if host_users(cx.body_view(body), ValueId::BlockParam(param)).is_empty()
+            && !cx.body_view(body).block_param(param).protected
         {
             body.remove_block_param(param);
             changed = true;
@@ -376,7 +383,7 @@ mod tests {
         // The top-level add (no users) is dead, but the first add feeds it —
         // after top-level is removed, first add has no users and is then also removed.
         // This test checks the chain case; use dead_insns (single round) for the kept case.
-        let dead = dead_insns(&ctx, block_id);
+        let dead = dead_insns(ModuleView::new(&ctx), block_id);
         let insn_ids: Vec<_> = BasicBlock::from_id(&ctx, block_id)
             .instruction_ids()
             .to_vec();
@@ -447,7 +454,7 @@ mod tests {
                 let op_id: PCodeOpId = b.context_mut().shared.pcode_ops.push(Box::from("syscall"));
                 b.push_pcode_op(op_id, vec![], None, 0);
             });
-            dead_insns(&ctx, block_id)
+            dead_insns(ModuleView::new(&ctx), block_id)
         };
         assert!(dead.is_empty(), "PCodeOp must not be marked dead");
     }
@@ -459,7 +466,7 @@ mod tests {
                 let zero = b.context_mut().get_const(0u64, 8).id();
                 b.push_return(zero);
             });
-            dead_insns(&ctx, block_id)
+            dead_insns(ModuleView::new(&ctx), block_id)
         };
         assert!(dead.is_empty(), "terminator must not be marked dead");
     }
@@ -667,15 +674,15 @@ struct DeadLoop {
 }
 
 /// `c` if `v` is the integer literal `c`, else `None`.
-fn dl_literal(host: HostRef, v: ValueId) -> Option<u64> {
+fn dl_literal<'a, 'str: 'a>(host: impl QCodeView<'a, 'str>, v: ValueId) -> Option<u64> {
     match v {
-        ValueId::Literal(lid) => Some(host.shr().values.literals[lid].value),
+        ValueId::Literal(lid) => Some(host.shared().values.literals[lid].value),
         _ => None,
     }
 }
 
 /// `true` if `v` is `iv + 1` (either operand order).
-fn dl_is_unit_inc(host: HostRef, v: ValueId, iv: ValueId) -> bool {
+fn dl_is_unit_inc<'a, 'str: 'a>(host: impl QCodeView<'a, 'str>, v: ValueId, iv: ValueId) -> bool {
     let ValueId::Instruction(id) = v else {
         return false;
     };
@@ -688,7 +695,11 @@ fn dl_is_unit_inc(host: HostRef, v: ValueId, iv: ValueId) -> bool {
 }
 
 /// `true` if `cond` is `iv == <literal>` (either operand order).
-fn dl_is_eq_const(host: HostRef, cond: ValueId, iv: ValueId) -> bool {
+fn dl_is_eq_const<'a, 'str: 'a>(
+    host: impl QCodeView<'a, 'str>,
+    cond: ValueId,
+    iv: ValueId,
+) -> bool {
     let ValueId::Instruction(id) = cond else {
         return false;
     };
@@ -702,7 +713,7 @@ fn dl_is_eq_const(host: HostRef, cond: ValueId, iv: ValueId) -> bool {
 }
 
 /// Distinct predecessor blocks of `b`.
-fn dl_preds(host: HostRef, b: BlockId) -> Vec<BlockId> {
+fn dl_preds<'a, 'str: 'a>(host: impl QCodeView<'a, 'str>, b: BlockId) -> Vec<BlockId> {
     let mut seen = HashSet::default();
     host.block_ref(b)
         .predecessors()
@@ -712,12 +723,16 @@ fn dl_preds(host: HostRef, b: BlockId) -> Vec<BlockId> {
 }
 
 /// Terminator instruction of `b`, if any.
-fn dl_term(host: HostRef, b: BlockId) -> Option<InstructionId> {
+fn dl_term<'a, 'str: 'a>(host: impl QCodeView<'a, 'str>, b: BlockId) -> Option<InstructionId> {
     host.block_ref(b).instruction_ids().last().copied()
 }
 
 /// `true` if every user of `v` lives in one of `region`'s blocks.
-fn dl_users_confined(host: HostRef, v: ValueId, region: &[BlockId]) -> bool {
+fn dl_users_confined<'a, 'str: 'a>(
+    host: impl QCodeView<'a, 'str>,
+    v: ValueId,
+    region: &[BlockId],
+) -> bool {
     host_users(host, v).iter().all(|&u| {
         qcode::value::InstructionRef::new(host, u)
             .parent()
@@ -736,7 +751,10 @@ fn dl_users_confined(host: HostRef, v: ValueId, region: &[BlockId]) -> bool {
 ///
 /// with region `{H, B}` side-effect-free, the exit edge `H→E` carrying no
 /// arguments, and no value defined in the region used outside it.
-fn match_dead_loop(host: HostRef, header: BlockId) -> Option<DeadLoop> {
+fn match_dead_loop<'a, 'str: 'a>(
+    host: impl QCodeView<'a, 'str>,
+    header: BlockId,
+) -> Option<DeadLoop> {
     let term = dl_term(host, header)?;
     let Mnemonic::CBranch(cb) = host.instruction(term).mnemonic() else {
         return None;
@@ -854,7 +872,7 @@ fn remove_dead_counted_loop(ctx: &mut Context, fun_id: FunctionId) -> bool {
 fn remove_dead_counted_loop_module<'str>(host: &mut Context<'str>, fun_id: FunctionId) -> bool {
     let headers: Vec<BlockId> = host.function_ref(fun_id).blocks().map(|b| b.id).collect();
     for header in headers {
-        if let Some(dl) = match_dead_loop(host.read_host(), header) {
+        if let Some(dl) = match_dead_loop(ModuleView::new(&*host), header) {
             replace_terminator_with_branch_generic(host, dl.preheader, dl.exit, vec![]);
             return true;
         }
@@ -869,13 +887,13 @@ fn remove_dead_counted_loop_host<'a, 'str>(
     fun_id: FunctionId,
 ) -> bool {
     let headers: Vec<BlockId> = cx
-        .read_host(body)
+        .body_view(body)
         .function_ref(fun_id)
         .blocks()
         .map(|b| b.id)
         .collect();
     for header in headers {
-        if let Some(dl) = match_dead_loop(cx.read_host(body), header) {
+        if let Some(dl) = match_dead_loop(cx.body_view(body), header) {
             replace_terminator_with_branch(body, cx, dl.preheader, dl.exit, vec![]);
             return true;
         }
@@ -914,9 +932,9 @@ fn dce_core<'a, 'str>(
     cx: ContextView<'a, 'str>,
     fun_id: FunctionId,
 ) -> bool {
-    let root = cx.read_host(body).function_ref(fun_id).root().map(|b| b.id);
+    let root = cx.body_view(body).function_ref(fun_id).root().map(|b| b.id);
     let block_ids: Vec<_> = cx
-        .read_host(body)
+        .body_view(body)
         .function_ref(fun_id)
         .blocks()
         .map(|b| b.id)
