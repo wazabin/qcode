@@ -37,7 +37,7 @@ use rustc_hash::FxHashMap as HashMap;
 use qcode::{
     builder::Builder,
     value::{
-        FunctionId, FunctionKind, LocalValueId, ValueId, VarnodeId,
+        FunctionId, FunctionKind, LocalValueId, QCodeView, ValueId, VarnodeId,
         block::BlockId,
         block_param::BlockParam,
         insn::{Branch, InstructionId, Mnemonic},
@@ -126,17 +126,16 @@ pub fn loop_to_recursion<'str>(
     next_minted: &mut u32,
     minted: &mut Vec<Minted<'str>>,
 ) -> bool {
-    let Some(model) = recognize_loop(m.read_host(body), body.id()) else {
+    let Some(model) = recognize_loop(m.body_view(body), body.id()) else {
         return false;
     };
     transform(m, body, next_minted, minted, &model)
 }
 
-pub(crate) fn recognize_loop<'a, 'str: 'a>(
-    host: impl Into<qcode::value::util::base_ref::HostRef<'a, 'str>>,
+pub(crate) fn recognize_loop<'ctx, 'str: 'ctx>(
+    host: impl QCodeView<'ctx, 'str>,
     fun_id: FunctionId,
 ) -> Option<LoopModel> {
-    let host = host.into();
     let fun = host.function_ref(fun_id);
     if !fun.is_lambda() {
         return None;
@@ -218,7 +217,7 @@ fn transform<'str>(
     model: &LoopModel,
 ) -> bool {
     let host_fid = body.id();
-    let name = format!("{}_rec", m.read_host(body).function_ref(host_fid).name());
+    let name = format!("{}_rec", m.body_view(body).function_ref(host_fid).name());
     // Mint the recursive lambda (name buffered raw; the driver uniquifies it at
     // the barrier). Keep the placeholder in both recursive and host references;
     // the install barrier patches it to the materialized function id.
@@ -351,7 +350,7 @@ fn transform<'str>(
     }
 
     // --- Host: the entry seeds the recursion and returns it; delete the region.
-    if let Some(term) = terminator_id(m.read_host(body), model.root) {
+    if let Some(term) = terminator_id(m.body_view(body), model.root) {
         body.remove_instruction(term);
     }
     {
@@ -408,8 +407,8 @@ fn remap_block_targets(
 }
 
 /// Blocks reachable from `start` within `fun_id`, following CFG successors.
-fn reachable_from<'a, 'str: 'a>(
-    host: qcode::value::util::base_ref::HostRef<'a, 'str>,
+fn reachable_from<'ctx, 'str: 'ctx>(
+    host: impl QCodeView<'ctx, 'str>,
     fun_id: FunctionId,
     start: BlockId,
 ) -> HashSet<BlockId> {
@@ -432,16 +431,13 @@ fn reachable_from<'a, 'str: 'a>(
     seen
 }
 
-fn block_param_count<'a, 'str: 'a>(
-    host: qcode::value::util::base_ref::HostRef<'a, 'str>,
-    block: BlockId,
-) -> usize {
+fn block_param_count<'ctx, 'str: 'ctx>(host: impl QCodeView<'ctx, 'str>, block: BlockId) -> usize {
     host.block_ref(block).params().count()
 }
 
 /// The id of `block`'s terminator instruction, if it ends in one.
-fn terminator_id<'a, 'str: 'a>(
-    host: qcode::value::util::base_ref::HostRef<'a, 'str>,
+fn terminator_id<'ctx, 'str: 'ctx>(
+    host: impl QCodeView<'ctx, 'str>,
     block: BlockId,
 ) -> Option<InstructionId> {
     let &id = host.block_ref(block).instruction_ids().last()?;
@@ -449,10 +445,10 @@ fn terminator_id<'a, 'str: 'a>(
 }
 
 /// A borrow of `block`'s terminator mnemonic, avoiding a full clone.
-fn terminator_mnemonic<'a, 'str: 'a>(
-    host: qcode::value::util::base_ref::HostRef<'a, 'str>,
+fn terminator_mnemonic<'ctx, 'str: 'ctx>(
+    host: impl QCodeView<'ctx, 'str>,
     block: BlockId,
-) -> Option<&'a Mnemonic> {
+) -> Option<&'ctx Mnemonic> {
     let id = terminator_id(host, block)?;
     Some(host.insn_ref(id).mnemonic())
 }
@@ -468,7 +464,7 @@ mod tests {
 
     fn run(ctx: &Context, fun: FunctionId, n: u64) -> Option<u64> {
         let root = FunctionBody::from_id(ctx, fun).root().expect("root").id;
-        let ret = match terminator_mnemonic(ctx.into(), root)? {
+        let ret = match terminator_mnemonic(qcode::value::ModuleView::new(ctx), root)? {
             Mnemonic::ReturnValue(r) => r.value.qualify(root.func),
             _ => return None,
         };

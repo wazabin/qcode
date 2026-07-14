@@ -270,7 +270,8 @@ fn hoists_load_over_disjoint_store_with_oracle() {
         "
     );
 
-    let aliases = crate::RegisterBase::build(&ctx.shared).for_function(&ctx, f);
+    let aliases = crate::RegisterBase::build(&ctx.shared)
+        .for_function(qcode::value::ModuleView::new(&ctx), f);
     assert!(
         super::hoist_loop_invariants_with_aliases_generic(&mut ctx, f, Some(&aliases)),
         "load of G should hoist: the only loop store targets the disjoint global H"
@@ -308,7 +309,8 @@ fn keeps_load_over_aliasing_store_with_oracle() {
         "
     );
 
-    let aliases = crate::RegisterBase::build(&ctx.shared).for_function(&ctx, f);
+    let aliases = crate::RegisterBase::build(&ctx.shared)
+        .for_function(qcode::value::ModuleView::new(&ctx), f);
     assert!(
         !super::hoist_loop_invariants_with_aliases_generic(&mut ctx, f, Some(&aliases)),
         "load of G must stay: the loop stores into G"

@@ -40,14 +40,15 @@ use std::collections::VecDeque;
 
 use jstd::graph::analysis::compute_dominators;
 use qcode::value::{
-    FunctionId, ValueId,
+    FunctionId, QCodeView, ValueId,
     block::BlockId,
     insn::{InstructionId, Mnemonic},
-    util::base_ref::HostRef,
 };
 
 #[cfg(test)]
 use qcode::context::Context;
+#[cfg(test)]
+use qcode::value::ModuleView;
 
 use crate::{AliasResult, ContextView, FunctionBody, FunctionPass, Outcome};
 
@@ -68,7 +69,7 @@ impl FunctionPass for Licm {
         _next_minted: &mut u32,
     ) -> Result<Outcome<'str>, String> {
         let fid = f.id();
-        let aliases = build_aliases(m, m.read_host(f), fid);
+        let aliases = build_aliases(m, m.body_view(f), fid);
         Ok(Outcome::changed(hoist_loop_invariants_with_aliases(
             f,
             m,
@@ -99,7 +100,10 @@ fn is_pure_expr_op(m: &Mnemonic) -> bool {
 
 /// The back-edges of `fun_id` as `(latch, header)` pairs, where `header`
 /// dominates `latch`.
-fn back_edges(host: HostRef, fun_id: FunctionId) -> Vec<(BlockId, BlockId)> {
+fn back_edges<'ctx, 'str: 'ctx>(
+    host: impl QCodeView<'ctx, 'str>,
+    fun_id: FunctionId,
+) -> Vec<(BlockId, BlockId)> {
     let function = host.function_ref(fun_id);
     let Some(root) = function.root().map(|b| b.id) else {
         return Vec::new();
@@ -126,7 +130,11 @@ fn back_edges(host: HostRef, fun_id: FunctionId) -> Vec<(BlockId, BlockId)> {
 /// Every block in the natural loop of the back-edge `latch -> header`: the
 /// header plus every block that reaches the latch without passing through the
 /// header.
-fn natural_loop(host: HostRef, latch: BlockId, header: BlockId) -> HashSet<BlockId> {
+fn natural_loop<'ctx, 'str: 'ctx>(
+    host: impl QCodeView<'ctx, 'str>,
+    latch: BlockId,
+    header: BlockId,
+) -> HashSet<BlockId> {
     let mut nodes = HashSet::from_iter([header, latch]);
     let mut worklist = VecDeque::from([latch]);
     while let Some(block) = worklist.pop_front() {
@@ -141,8 +149,8 @@ fn natural_loop(host: HostRef, latch: BlockId, header: BlockId) -> HashSet<Block
 
 /// The loop's unique preheader: the single predecessor of `header` that is not
 /// itself in the loop. `None` if there is zero or more than one such block.
-fn loop_preheader(
-    host: HostRef,
+fn loop_preheader<'ctx, 'str: 'ctx>(
+    host: impl QCodeView<'ctx, 'str>,
     header: BlockId,
     loop_nodes: &HashSet<BlockId>,
 ) -> Option<BlockId> {
@@ -156,8 +164,8 @@ fn loop_preheader(
 
 /// Whether the value `v` is loop-invariant given the set of instructions already
 /// known invariant.
-fn value_is_invariant(
-    host: HostRef,
+fn value_is_invariant<'ctx, 'str: 'ctx>(
+    host: impl QCodeView<'ctx, 'str>,
     v: ValueId,
     loop_nodes: &HashSet<BlockId>,
     invariant: &HashSet<InstructionId>,
@@ -192,7 +200,10 @@ struct LoopMemory {
     has_clobber: bool,
 }
 
-fn loop_memory(host: HostRef, loop_nodes: &HashSet<BlockId>) -> LoopMemory {
+fn loop_memory<'ctx, 'str: 'ctx>(
+    host: impl QCodeView<'ctx, 'str>,
+    loop_nodes: &HashSet<BlockId>,
+) -> LoopMemory {
     let mut store_ptrs = Vec::new();
     let mut has_clobber = false;
     for &block in loop_nodes {
@@ -215,8 +226,8 @@ fn loop_memory(host: HostRef, loop_nodes: &HashSet<BlockId>) -> LoopMemory {
 
 /// Whether a loop load through `ptr` keeps its value across every iteration: no
 /// opaque clobber, and no loop store that may-alias `ptr`.
-fn load_is_safe(
-    host: HostRef,
+fn load_is_safe<'ctx, 'str: 'ctx>(
+    host: impl QCodeView<'ctx, 'str>,
     aliases: Option<&AliasResult>,
     ptr: ValueId,
     mem: &LoopMemory,
@@ -234,8 +245,8 @@ fn load_is_safe(
 }
 
 /// Grow the set of loop-invariant instructions to a fixpoint.
-fn invariant_instructions(
-    host: HostRef,
+fn invariant_instructions<'ctx, 'str: 'ctx>(
+    host: impl QCodeView<'ctx, 'str>,
     loop_nodes: &HashSet<BlockId>,
     aliases: Option<&AliasResult>,
     mem: &LoopMemory,
@@ -279,8 +290,8 @@ fn invariant_instructions(
 /// Order `invariant` so every instruction follows the invariant operands it
 /// depends on (post-order over the dependency DAG), giving a placement order
 /// that keeps definitions before uses in the preheader.
-fn emission_order(
-    host: HostRef,
+fn emission_order<'ctx, 'str: 'ctx>(
+    host: impl QCodeView<'ctx, 'str>,
     loop_nodes: &HashSet<BlockId>,
     invariant: &HashSet<InstructionId>,
 ) -> Vec<InstructionId> {
@@ -336,13 +347,13 @@ fn hoist_into_preheader<'a, 'str>(
 ) -> bool {
     let mut hoisted = false;
     for &old in order {
-        let old_ref = cx.read_host(body).insn_ref(old);
+        let old_ref = cx.body_view(body).insn_ref(old);
         let mnemonic = old_ref.mnemonic().clone();
         let type_id = old_ref.type_id();
         let new = body.push_mnemonic_with_type(mnemonic, type_id);
 
         let term = *cx
-            .read_host(body)
+            .body_view(body)
             .block_ref(preheader)
             .instruction_ids()
             .last()
@@ -403,9 +414,9 @@ fn hoist_into_preheader_generic<'str>(
 /// Build the per-function alias oracle the same way [`crate::gvn::Gvn`] does, so
 /// load hoisting sees per-slot stack locations and frame freshness. Returns
 /// `None` when no stack pointer is registered (arch-agnostic test envs).
-fn build_aliases<'a, 'str: 'a>(
+fn build_aliases<'ctx, 'str: 'ctx>(
     m: ContextView<'_, 'str>,
-    host: HostRef<'a, 'str>,
+    host: impl QCodeView<'ctx, 'str>,
     fun_id: FunctionId,
 ) -> Option<AliasResult> {
     let shared = m.shr();
@@ -427,7 +438,7 @@ fn hoist_loop_invariants_with_aliases<'a, 'str>(
     fun_id: FunctionId,
     aliases: Option<&AliasResult>,
 ) -> bool {
-    let edges = back_edges(cx.read_host(body), fun_id);
+    let edges = back_edges(cx.body_view(body), fun_id);
     if edges.is_empty() {
         return false;
     }
@@ -436,16 +447,16 @@ fn hoist_loop_invariants_with_aliases<'a, 'str>(
     // changes the CFG, so dominators / loop membership stay valid throughout.
     let mut plans: Vec<(BlockId, Vec<InstructionId>)> = Vec::new();
     for (latch, header) in edges {
-        let loop_nodes = natural_loop(cx.read_host(body), latch, header);
-        let Some(preheader) = loop_preheader(cx.read_host(body), header, &loop_nodes) else {
+        let loop_nodes = natural_loop(cx.body_view(body), latch, header);
+        let Some(preheader) = loop_preheader(cx.body_view(body), header, &loop_nodes) else {
             continue;
         };
-        let mem = loop_memory(cx.read_host(body), &loop_nodes);
-        let invariant = invariant_instructions(cx.read_host(body), &loop_nodes, aliases, &mem);
+        let mem = loop_memory(cx.body_view(body), &loop_nodes);
+        let invariant = invariant_instructions(cx.body_view(body), &loop_nodes, aliases, &mem);
         if invariant.is_empty() {
             continue;
         }
-        let order = emission_order(cx.read_host(body), &loop_nodes, &invariant);
+        let order = emission_order(cx.body_view(body), &loop_nodes, &invariant);
         plans.push((preheader, order));
     }
 
@@ -466,7 +477,7 @@ fn hoist_loop_invariants_with_aliases_generic<'str>(
     fun_id: FunctionId,
     aliases: Option<&AliasResult>,
 ) -> bool {
-    let edges = back_edges(host.read_host(), fun_id);
+    let edges = back_edges(ModuleView::new(&*host), fun_id);
     if edges.is_empty() {
         return false;
     }
@@ -475,16 +486,16 @@ fn hoist_loop_invariants_with_aliases_generic<'str>(
     // changes the CFG, so dominators / loop membership stay valid throughout.
     let mut plans: Vec<(BlockId, Vec<InstructionId>)> = Vec::new();
     for (latch, header) in edges {
-        let loop_nodes = natural_loop(host.read_host(), latch, header);
-        let Some(preheader) = loop_preheader(host.read_host(), header, &loop_nodes) else {
+        let loop_nodes = natural_loop(ModuleView::new(&*host), latch, header);
+        let Some(preheader) = loop_preheader(ModuleView::new(&*host), header, &loop_nodes) else {
             continue;
         };
-        let mem = loop_memory(host.read_host(), &loop_nodes);
-        let invariant = invariant_instructions(host.read_host(), &loop_nodes, aliases, &mem);
+        let mem = loop_memory(ModuleView::new(&*host), &loop_nodes);
+        let invariant = invariant_instructions(ModuleView::new(&*host), &loop_nodes, aliases, &mem);
         if invariant.is_empty() {
             continue;
         }
-        let order = emission_order(host.read_host(), &loop_nodes, &invariant);
+        let order = emission_order(ModuleView::new(&*host), &loop_nodes, &invariant);
         plans.push((preheader, order));
     }
 

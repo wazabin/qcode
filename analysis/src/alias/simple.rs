@@ -1,13 +1,13 @@
 use rustc_hash::FxHashMap as HashMap;
+use std::marker::PhantomData;
 
 use qcode::{
     context::{Context, Shared},
     space::{SpaceId, SpaceType},
     value::{
-        FunctionId, ValueId, ValueRef, Varnode,
+        FunctionId, QCodeView, ValueId, ValueRef, Varnode,
         insn::{Binop, IntBinop, Mnemonic},
         literal::LiteralRef,
-        util::base_ref::HostRef,
     },
 };
 
@@ -90,8 +90,9 @@ impl UnionFind {
 }
 
 /// Mutable scratch state threaded through the analysis passes.
-struct Analysis<'a, 'str> {
-    host: HostRef<'a, 'str>,
+struct Analysis<'base, 'ctx, 'str, R> {
+    host: R,
+    marker: PhantomData<&'ctx &'str ()>,
 
     /// Maps each tracked value to its equivalence-class root. Seeded from the
     /// shared [`RegisterBase`] (varnode entries), then grown with this function's
@@ -101,7 +102,7 @@ struct Analysis<'a, 'str> {
     /// All varnodes in each address space, sorted by address. Borrowed read-only
     /// from the shared [`RegisterBase`]; it is function-independent so it is built
     /// once and never rebuilt per function.
-    by_space: &'a HashMap<SpaceId, Vec<SizedNode>>,
+    by_space: &'base HashMap<SpaceId, Vec<SizedNode>>,
 
     /// Literal-pointer ranges encountered during pointer resolution; grows as loads/stores are processed.
     literal_ranges: HashMap<SpaceId, Vec<SizedNode>>,
@@ -122,7 +123,7 @@ struct Analysis<'a, 'str> {
     uf: UnionFind,
 }
 
-impl<'a, 'str> Analysis<'a, 'str> {
+impl<'base, 'ctx, 'str: 'ctx, R: QCodeView<'ctx, 'str>> Analysis<'base, 'ctx, 'str, R> {
     fn canonical_root(&mut self, root: NodeId) -> NodeId {
         match root {
             NodeId::Unknown => NodeId::Unknown,
@@ -165,7 +166,7 @@ impl<'a, 'str> Analysis<'a, 'str> {
             return self.canonical_root(root);
         }
 
-        let Some((start, end)) = literal_interval(self.host.shr(), literal, size) else {
+        let Some((start, end)) = literal_interval(self.host.shared(), literal, size) else {
             return NodeId::Unknown;
         };
 
@@ -215,7 +216,7 @@ impl<'a, 'str> Analysis<'a, 'str> {
         match value {
             ValueId::Varnode(id) => {
                 let (varnode_space_id, start, vn_size) = {
-                    let vn = Varnode::from_id(self.host.shr(), id);
+                    let vn = Varnode::from_id(self.host.shared(), id);
                     (vn.space().id, vn.address() as u64, vn.size() as u64)
                 };
                 if varnode_space_id != space {
@@ -253,7 +254,7 @@ impl<'a, 'str> Analysis<'a, 'str> {
                     // mask only lowers the address. Peel to the non-mask operand.
                     Mnemonic::Binop(bin) if matches!(bin.op, Binop::Int(IntBinop::And)) => {
                         match align_peel_target(
-                            self.host.shr(),
+                            self.host.shared(),
                             bin.lhs.qualify(id.func),
                             bin.rhs.qualify(id.func),
                         ) {
@@ -273,13 +274,13 @@ impl<'a, 'str> Analysis<'a, 'str> {
 
                 match action {
                     PeelAction::AddSub(op, lhs, rhs) => {
-                        if ValueRef::from_host(self.host, value).space().map(|s| s.id)
+                        if ValueRef::from_view(self.host, value).space().map(|s| s.id)
                             != Some(space)
                         {
                             return NodeId::Unknown;
                         }
-                        let lhs_space = ValueRef::from_host(self.host, lhs).space().map(|s| s.id);
-                        let rhs_space = ValueRef::from_host(self.host, rhs).space().map(|s| s.id);
+                        let lhs_space = ValueRef::from_view(self.host, lhs).space().map(|s| s.id);
+                        let rhs_space = ValueRef::from_view(self.host, rhs).space().map(|s| s.id);
 
                         if lhs_space == Some(space) && rhs_space != Some(space) {
                             self.resolve_pointer_root(lhs, space, size)
@@ -301,7 +302,7 @@ impl<'a, 'str> Analysis<'a, 'str> {
                     // pointer) or has none (an untyped/scalar carrier); a source in a
                     // *different* space would be an unrelated location.
                     PeelAction::Peel(src) => {
-                        let src_space = ValueRef::from_host(self.host, src).space().map(|s| s.id);
+                        let src_space = ValueRef::from_view(self.host, src).space().map(|s| s.id);
                         if src_space == Some(space) || src_space.is_none() {
                             self.resolve_pointer_root(src, space, size)
                         } else {
@@ -470,9 +471,14 @@ impl RegisterBase {
 
     /// Finish the analysis ("Part B") for the given load/store `pointer_uses`,
     /// resolving each against a private clone of this shared base.
-    fn resolve(&self, host: HostRef, pointer_uses: Vec<(ValueId, SpaceId, usize)>) -> AliasResult {
+    fn resolve<'ctx, 'str: 'ctx>(
+        &self,
+        host: impl QCodeView<'ctx, 'str>,
+        pointer_uses: Vec<(ValueId, SpaceId, usize)>,
+    ) -> AliasResult {
         let mut a = Analysis {
             host,
+            marker: PhantomData,
             value_to_root: self.value_to_root.clone(),
             by_space: &self.by_space,
             literal_ranges: HashMap::default(),
@@ -523,10 +529,9 @@ impl RegisterBase {
     /// repeated for every function. This is the per-function GVN entry point.
     pub fn for_function<'a, 'str: 'a>(
         &self,
-        host: impl Into<HostRef<'a, 'str>>,
+        host: impl QCodeView<'a, 'str>,
         fun_id: FunctionId,
     ) -> AliasResult {
-        let host = host.into();
         let mut pointer_uses: Vec<(ValueId, SpaceId, usize)> = Vec::new();
         for block in host.function_ref(fun_id).blocks() {
             for iid in block.instruction_ids() {
@@ -557,7 +562,8 @@ impl AliasResult {
     /// tests) that lack a shared base to reuse; the per-function GVN pass reuses a
     /// shared base directly via [`RegisterBase::for_function`].
     pub fn simple_for_function(ctx: &Context, function_id: FunctionId) -> Self {
-        RegisterBase::build(&ctx.shared).for_function(ctx, function_id)
+        RegisterBase::build(&ctx.shared)
+            .for_function(qcode::value::ModuleView::new(ctx), function_id)
     }
 }
 
