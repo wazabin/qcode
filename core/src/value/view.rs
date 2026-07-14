@@ -16,7 +16,6 @@ use crate::{
         block_param::{BlockParam, BlockParamId},
         function::FunctionInterface,
         insn::InstructionId,
-        util::base_ref::HostRef,
     },
 };
 
@@ -208,21 +207,6 @@ impl<'ctx, 'str: 'ctx> QCodeView<'ctx, 'str> for BodyView<'ctx, 'str> {
             "BodyView cannot read a foreign function body"
         );
         self.body
-    }
-}
-
-/// Transitional adapter used only while immutable refs still store `HostRef`.
-impl<'ctx, 'str: 'ctx> QCodeView<'ctx, 'str> for HostRef<'ctx, 'str> {
-    fn shared(self) -> &'ctx Shared<'str> {
-        self.shr()
-    }
-
-    fn interface(self, id: FunctionId) -> &'ctx FunctionInterface<'str> {
-        HostRef::interface(self, id)
-    }
-
-    fn function(self, id: FunctionId) -> &'ctx FunctionBody<'str> {
-        HostRef::function(self, id)
     }
 }
 

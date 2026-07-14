@@ -30,7 +30,7 @@ pub struct EdgeData {
 // A plain body-local [`EdgeId`] no longer self-describes its owning function, so
 // the old whole-context `EdgeRef`/`EdgeMutRef` wrappers (which resolved
 // `values.edge(id)` without a function) are gone. Edges are read through
-// `FunctionBody::edge(id)` / `HostRef::edge(func, id)` with the owning function named
+// `FunctionBody::edge(id)` / `QCodeView::edge(func, id)` with the owning function named
 // explicitly. `EdgeData`'s `from`/`to` are still `BlockId`s, so an edge's
 // endpoints resolve as blocks directly.
 
@@ -39,7 +39,7 @@ pub struct EdgeData {
 //
 // The CFG is inherently per-function: its nodes are the function's own blocks.
 // Dominator analysis needs only the successor relation (see jstd's `Cfg`), which
-// [`BlockRef::successors`] already routes through the function's [`HostRef`], so
+// [`BlockRef::successors`] already routes through the function's [`QCodeView`], so
 // it reads a *checked-out* function correctly inside a `FunctionPass`.
 // ---------------------------------------------------------------------------
 

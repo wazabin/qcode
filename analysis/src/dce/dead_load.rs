@@ -551,7 +551,12 @@ fn scan_block_aliased<'a, 'str: 'a>(
                 if call
                     .target
                     .real()
-                    .is_some_and(|target| host.function_ref(target).is_externally_resolved()) =>
+                    .is_some_and(|target| {
+                        host.interface(target)
+                            .signature
+                            .as_ref()
+                            .is_some_and(|signature| signature.externally_resolved)
+                    }) =>
             {
                 let target = call.target.real().unwrap();
                 for iv in call_clobber_intervals(host, target) {

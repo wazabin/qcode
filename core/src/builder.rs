@@ -41,7 +41,8 @@ use crate::{
     space::{SPACE_CONST, Space, SpaceId, SpaceType},
     types::{AggregateField, TypeId},
     value::{
-        FunctionBody, Instruction, Renameable, Value, ValueId, ValueRef,
+        BodyView, FunctionBody, Instruction, ModuleView, QCodeView, Renameable, Value, ValueId,
+        ValueRef,
         block::{BasicBlock, BlockId, EdgeId},
         block_param::BlockParamMutRef,
         function::FunctionId,
@@ -52,10 +53,7 @@ use crate::{
             Mnemonic, PCodeOp, PCodeOpId, PopCount, Range, Return, ReturnValue, SBorrow, SCarry,
             Scan, Sext, Store, TailCall, Tuple, Unary, Unop, Zext,
         },
-        util::{
-            base_ref::{BaseRef, HostRef},
-            host_mut::PassBacking,
-        },
+        util::{base_ref::BaseRef, host_mut::PassBacking},
         varnode::{Varnode, VarnodeId},
     },
 };
@@ -72,6 +70,11 @@ use crate::{
 /// (a pass's own body borrowed in place). Each is a direct impl below.
 #[doc(hidden)]
 pub trait BuilderBacking<'str> {
+    type ReadView<'a>: QCodeView<'a, 'str>
+    where
+        Self: 'a,
+        'str: 'a;
+
     /// The module's shared IR state (read) — types, literals, spaces, registers,
     /// maps.
     fn bb_shr(&self) -> &crate::context::Shared<'str>;
@@ -81,9 +84,12 @@ pub trait BuilderBacking<'str> {
     fn bb_shared_mut(&mut self) -> &mut Context<'str> {
         unimplemented!("temp/varnode minting requires the module Builder (&mut Context)")
     }
-    /// A `Copy` read view for the builder's arena reads (`ValueRef::from_host`,
+    /// A `Copy` read view for the builder's arena reads (`ValueRef::from_view`,
     /// instruction/block-param/block reads).
-    fn bb_read_host(&self) -> HostRef<'_, 'str>;
+    fn bb_view(&self) -> Self::ReadView<'_>;
+    /// Whether the read view may resolve `f`'s body without crossing a
+    /// function-pass ownership boundary.
+    fn bb_can_read_body(&self, f: FunctionId) -> bool;
     /// The owning function's storage (write).
     fn bb_function_mut(&mut self, f: FunctionId) -> &mut FunctionBody<'str>;
     /// The instruction `id`, routed to its owning function's arena (write).
@@ -126,14 +132,23 @@ pub trait BuilderBacking<'str> {
 /// `Builder<&mut Context>`, see [`Builder::make_temp`]). Every method routes
 /// through `Context`'s inherent verbs — the builder no longer needs a host trait.
 impl<'str> BuilderBacking<'str> for &mut Context<'str> {
+    type ReadView<'a>
+        = ModuleView<'a, 'str>
+    where
+        Self: 'a,
+        'str: 'a;
+
     fn bb_shr(&self) -> &crate::context::Shared<'str> {
         &self.shared
     }
     fn bb_shared_mut(&mut self) -> &mut Context<'str> {
         self
     }
-    fn bb_read_host(&self) -> HostRef<'_, 'str> {
-        HostRef::Module(self)
+    fn bb_view(&self) -> Self::ReadView<'_> {
+        ModuleView::new(self)
+    }
+    fn bb_can_read_body(&self, _f: FunctionId) -> bool {
+        true
     }
     fn bb_function_mut(&mut self, f: FunctionId) -> &mut FunctionBody<'str> {
         &mut self.bodies[f]
@@ -183,15 +198,20 @@ impl<'str> BuilderBacking<'str> for &mut Context<'str> {
 /// `bb_shared_mut` is intentionally left as the defaulted panic — a pass-time
 /// builder holds a frozen shared view and cannot mint temp spaces.
 impl<'str> BuilderBacking<'str> for PassBacking<'_, 'str> {
+    type ReadView<'a>
+        = BodyView<'a, 'str>
+    where
+        Self: 'a,
+        'str: 'a;
+
     fn bb_shr(&self) -> &crate::context::Shared<'str> {
         self.shared
     }
-    fn bb_read_host(&self) -> HostRef<'_, 'str> {
-        HostRef::Checked {
-            fun: &*self.fun,
-            shared: self.shared,
-            interfaces: self.interfaces,
-        }
+    fn bb_view(&self) -> Self::ReadView<'_> {
+        self.view()
+    }
+    fn bb_can_read_body(&self, f: FunctionId) -> bool {
+        f == self.fun.id()
     }
     fn bb_function_mut(&mut self, f: FunctionId) -> &mut FunctionBody<'str> {
         assert_eq!(
@@ -268,14 +288,14 @@ macro_rules! cmp_pair {
             &mut self,
             lhs: ValueId,
             rhs: ValueId,
-        ) -> InstructionRef<'str, '_, HostRef<'_, 'str>> {
+        ) -> InstructionRef<'str, '_, Ctx::ReadView<'_>> {
             self.push_binop($op, lhs, rhs, Some(1))
         }
         pub fn $rev(
             &mut self,
             lhs: ValueId,
             rhs: ValueId,
-        ) -> InstructionRef<'str, '_, HostRef<'_, 'str>> {
+        ) -> InstructionRef<'str, '_, Ctx::ReadView<'_>> {
             self.push_binop($op, rhs, lhs, Some(1))
         }
     };
@@ -334,7 +354,7 @@ impl<'str, 'ctx, Ctx: BuilderBacking<'str>> Builder<'str, 'ctx, Ctx> {
     pub fn from_block(block: BaseRef<Ctx, BlockId>) -> Self {
         let is_terminated = block
             .host_ref()
-            .bb_read_host()
+            .bb_view()
             .block_ref(block.id)
             .is_terminated();
         Self {
@@ -350,14 +370,14 @@ impl<'str, 'ctx, Ctx: BuilderBacking<'str>> Builder<'str, 'ctx, Ctx> {
     }
 
     /// A `Copy` read view over the builder's backing, for arena reads. The builder
-    /// reads through the backing's [`HostRef`].
-    pub fn read_host(&self) -> HostRef<'_, 'str> {
-        self.block.host_ref().bb_read_host()
+    /// reads through the backing's static [`QCodeView`].
+    pub fn view(&self) -> Ctx::ReadView<'_> {
+        self.block.host_ref().bb_view()
     }
 
     /// Returns `true` if the current block ends with a terminator instruction.
     pub fn is_terminated(&self) -> bool {
-        self.read_host().block_ref(self.block.id).is_terminated()
+        self.view().block_ref(self.block.id).is_terminated()
     }
 
     /// Sets the current address for instructions added by this builder.
@@ -394,7 +414,7 @@ impl<'str, 'ctx, Ctx: BuilderBacking<'str>> Builder<'str, 'ctx, Ctx> {
     /// Panics if `before_id` is not an instruction in the current block.
     pub fn set_insert_point_before(&mut self, before_id: InstructionId) {
         let index = self
-            .read_host()
+            .view()
             .block_ref(self.block.id)
             .instruction_ids()
             .iter()
@@ -433,7 +453,7 @@ impl<'str, 'ctx, Ctx: BuilderBacking<'str>> Builder<'str, 'ctx, Ctx> {
         &mut self,
         src: ValueId,
         range: std::ops::Range<usize>,
-    ) -> Option<ValueRef<'str, '_, HostRef<'_, 'str>>> {
+    ) -> Option<ValueRef<'str, '_, Ctx::ReadView<'_>>> {
         let value = self.get_value(src);
 
         if range.is_empty() {
@@ -493,7 +513,7 @@ impl<'str, 'ctx, Ctx: BuilderBacking<'str>> Builder<'str, 'ctx, Ctx> {
         src: ValueId,
         start: usize,
         size: usize,
-    ) -> InstructionRef<'str, '_, HostRef<'_, 'str>> {
+    ) -> InstructionRef<'str, '_, Ctx::ReadView<'_>> {
         let space = self.get_value(src).space().map(|s| s.id);
         self.push_instruction_in_space(
             Mnemonic::Range(Range {
@@ -519,7 +539,7 @@ impl<'str, 'ctx, Ctx: BuilderBacking<'str>> Builder<'str, 'ctx, Ctx> {
 
     pub fn switch_to_block(&mut self, block: BlockId) {
         self.block.id = block;
-        self.is_terminated = self.read_host().block_ref(block).is_terminated();
+        self.is_terminated = self.view().block_ref(block).is_terminated();
     }
 
     /// The block the builder is currently appending to.
@@ -528,7 +548,7 @@ impl<'str, 'ctx, Ctx: BuilderBacking<'str>> Builder<'str, 'ctx, Ctx> {
     }
 
     /// Gets the ID of a value in the current namespace
-    pub fn try_get_value(&self, name: &str) -> Option<ValueRef<'str, '_, HostRef<'_, 'str>>> {
+    pub fn try_get_value(&self, name: &str) -> Option<ValueRef<'str, '_, Ctx::ReadView<'_>>> {
         self.namespace.get(name).map(|&id| self.get_value(id))
     }
 
@@ -581,7 +601,7 @@ impl<'str, 'ctx, Ctx: BuilderBacking<'str>> Builder<'str, 'ctx, Ctx> {
         &mut self,
         mnemonic: Mnemonic,
         size: usize,
-    ) -> InstructionRef<'str, '_, HostRef<'_, 'str>> {
+    ) -> InstructionRef<'str, '_, Ctx::ReadView<'_>> {
         let type_id = self.shr().types.get_or_make_int(size);
         self.push_instruction_with_type(mnemonic, type_id)
     }
@@ -597,7 +617,7 @@ impl<'str, 'ctx, Ctx: BuilderBacking<'str>> Builder<'str, 'ctx, Ctx> {
         &mut self,
         mnemonic: Mnemonic,
         type_id: TypeId,
-    ) -> InstructionRef<'str, '_, HostRef<'_, 'str>> {
+    ) -> InstructionRef<'str, '_, Ctx::ReadView<'_>> {
         self.push_instruction_with_type(mnemonic, type_id)
     }
 
@@ -607,7 +627,7 @@ impl<'str, 'ctx, Ctx: BuilderBacking<'str>> Builder<'str, 'ctx, Ctx> {
         mnemonic: Mnemonic,
         size: usize,
         _space: Option<SpaceId>,
-    ) -> InstructionRef<'str, '_, HostRef<'_, 'str>> {
+    ) -> InstructionRef<'str, '_, Ctx::ReadView<'_>> {
         let type_id = self.shr().types.get_or_make_int(size);
         self.push_instruction_with_type(mnemonic, type_id)
     }
@@ -617,9 +637,9 @@ impl<'str, 'ctx, Ctx: BuilderBacking<'str>> Builder<'str, 'ctx, Ctx> {
         &mut self,
         mnemonic: Mnemonic,
         type_id: TypeId,
-    ) -> InstructionRef<'str, '_, HostRef<'_, 'str>> {
+    ) -> InstructionRef<'str, '_, Ctx::ReadView<'_>> {
         if self.is_terminated && self.insert_point.is_none() {
-            let block_address = self.read_host().block_ref(self.block.id).address();
+            let block_address = self.view().block_ref(self.block.id).address();
             if let Some(address) = self.address.or(block_address) {
                 panic!("cannot append instruction to a terminated block at {address:#x}");
             }
@@ -649,14 +669,14 @@ impl<'str, 'ctx, Ctx: BuilderBacking<'str>> Builder<'str, 'ctx, Ctx> {
             }
         }
 
-        InstructionRef::new(self.block.host_ref().bb_read_host(), id)
+        InstructionRef::new(self.block.host_ref().bb_view(), id)
     }
 
-    fn get_value(&self, id: ValueId) -> ValueRef<'str, '_, HostRef<'_, 'str>> {
+    fn get_value(&self, id: ValueId) -> ValueRef<'str, '_, Ctx::ReadView<'_>> {
         // Route through the host's read view so a checked-out builder resolves its
         // own function's SSA values (which live in the owned function, not the
         // shared context) correctly.
-        ValueRef::from_host(self.read_host(), id)
+        ValueRef::from_view(self.view(), id)
     }
 
     /// Localize a qualified operand id for storage in a mnemonic built for this
@@ -677,18 +697,18 @@ impl<'str, 'ctx, Ctx: BuilderBacking<'str>> Builder<'str, 'ctx, Ctx> {
     /// checked-out function's instruction/param types live in the owned arena.
     fn type_of(&mut self, id: ValueId) -> TypeId {
         match id {
-            ValueId::Instruction(iid) => self.read_host().instruction(iid).type_id,
-            ValueId::BlockParam(pid) => self.read_host().block_param(pid).type_id,
-            other => self.read_host().type_of(other),
+            ValueId::Instruction(iid) => self.view().instruction(iid).type_id,
+            ValueId::BlockParam(pid) => self.view().block_param(pid).type_id,
+            other => self.view().type_of(other),
         }
     }
 
     /// The stored type of `id`, host-routed (mirror of [`Context::stored_type_of`]).
     fn stored_type_of(&self, id: ValueId) -> Option<TypeId> {
         match id {
-            ValueId::Instruction(iid) => Some(self.read_host().instruction(iid).type_id),
-            ValueId::BlockParam(pid) => Some(self.read_host().block_param(pid).type_id),
-            other => self.read_host().stored_type_of(other),
+            ValueId::Instruction(iid) => Some(self.view().instruction(iid).type_id),
+            ValueId::BlockParam(pid) => Some(self.view().block_param(pid).type_id),
+            other => self.view().stored_type_of(other),
         }
     }
 
@@ -804,7 +824,7 @@ impl<'str, 'ctx, Ctx: BuilderBacking<'str>> Builder<'str, 'ctx, Ctx> {
         mut src: ValueId,
         size: usize,
         space: SpaceId,
-    ) -> ValueRef<'str, '_, HostRef<'_, 'str>> {
+    ) -> ValueRef<'str, '_, Ctx::ReadView<'_>> {
         if CHECK_LOCAL {
             src = self.ensure_local(src);
         }
@@ -860,7 +880,7 @@ impl<'str, 'ctx, Ctx: BuilderBacking<'str>> Builder<'str, 'ctx, Ctx> {
 
     // --- Unary Ops ---
 
-    fn push_unop(&mut self, op: Unop, src: ValueId) -> InstructionRef<'str, '_, HostRef<'_, 'str>> {
+    fn push_unop(&mut self, op: Unop, src: ValueId) -> InstructionRef<'str, '_, Ctx::ReadView<'_>> {
         assert!(
             !src.is_varnode(),
             "push_unop: varnode operand is not allowed; use ensure_local or &name addressof syntax"
@@ -876,7 +896,7 @@ impl<'str, 'ctx, Ctx: BuilderBacking<'str>> Builder<'str, 'ctx, Ctx> {
     }
 
     /// Logical NOT of a `bool` value, canonically `src == false`.
-    pub fn push_bool_not(&mut self, src: ValueId) -> InstructionRef<'str, '_, HostRef<'_, 'str>> {
+    pub fn push_bool_not(&mut self, src: ValueId) -> InstructionRef<'str, '_, Ctx::ReadView<'_>> {
         debug_assert!(
             self.stored_type_of(src)
                 .is_some_and(|t| self.shr().types.is_bool(t)),
@@ -887,17 +907,17 @@ impl<'str, 'ctx, Ctx: BuilderBacking<'str>> Builder<'str, 'ctx, Ctx> {
     }
 
     /// Creates a bitwise NOT operation on the given value.
-    pub fn push_bit_negate(&mut self, src: ValueId) -> InstructionRef<'str, '_, HostRef<'_, 'str>> {
+    pub fn push_bit_negate(&mut self, src: ValueId) -> InstructionRef<'str, '_, Ctx::ReadView<'_>> {
         self.push_unop(Unop::IntNot, src)
     }
 
     /// Creates a negation operation on the given value.
-    pub fn push_neg(&mut self, src: ValueId) -> InstructionRef<'str, '_, HostRef<'_, 'str>> {
+    pub fn push_neg(&mut self, src: ValueId) -> InstructionRef<'str, '_, Ctx::ReadView<'_>> {
         self.push_unop(Unop::IntNegate, src)
     }
 
     /// Creates a float negation operation on the given value.
-    pub fn push_fneg(&mut self, src: ValueId) -> InstructionRef<'str, '_, HostRef<'_, 'str>> {
+    pub fn push_fneg(&mut self, src: ValueId) -> InstructionRef<'str, '_, Ctx::ReadView<'_>> {
         self.push_unop(Unop::FloatNegate, src)
     }
 
@@ -907,7 +927,7 @@ impl<'str, 'ctx, Ctx: BuilderBacking<'str>> Builder<'str, 'ctx, Ctx> {
         lhs: ValueId,
         rhs: ValueId,
         size: Option<usize>,
-    ) -> InstructionRef<'str, '_, HostRef<'_, 'str>> {
+    ) -> InstructionRef<'str, '_, Ctx::ReadView<'_>> {
         let lhs_size = self.get_value(lhs).size();
         let rhs_size = self.get_value(rhs).size();
         let operand_size = match (
@@ -988,7 +1008,7 @@ impl<'str, 'ctx, Ctx: BuilderBacking<'str>> Builder<'str, 'ctx, Ctx> {
         &mut self,
         lhs: ValueId,
         rhs: ValueId,
-    ) -> InstructionRef<'str, '_, HostRef<'_, 'str>> {
+    ) -> InstructionRef<'str, '_, Ctx::ReadView<'_>> {
         self.push_binop(Binop::Int(IntBinop::Mul), lhs, rhs, None)
     }
 
@@ -996,7 +1016,7 @@ impl<'str, 'ctx, Ctx: BuilderBacking<'str>> Builder<'str, 'ctx, Ctx> {
         &mut self,
         lhs: ValueId,
         rhs: ValueId,
-    ) -> InstructionRef<'str, '_, HostRef<'_, 'str>> {
+    ) -> InstructionRef<'str, '_, Ctx::ReadView<'_>> {
         self.push_binop(Binop::Int(IntBinop::Div), lhs, rhs, None)
     }
 
@@ -1004,7 +1024,7 @@ impl<'str, 'ctx, Ctx: BuilderBacking<'str>> Builder<'str, 'ctx, Ctx> {
         &mut self,
         lhs: ValueId,
         rhs: ValueId,
-    ) -> InstructionRef<'str, '_, HostRef<'_, 'str>> {
+    ) -> InstructionRef<'str, '_, Ctx::ReadView<'_>> {
         self.push_binop(Binop::Int(IntBinop::Sdiv), lhs, rhs, None)
     }
 
@@ -1012,7 +1032,7 @@ impl<'str, 'ctx, Ctx: BuilderBacking<'str>> Builder<'str, 'ctx, Ctx> {
         &mut self,
         lhs: ValueId,
         rhs: ValueId,
-    ) -> InstructionRef<'str, '_, HostRef<'_, 'str>> {
+    ) -> InstructionRef<'str, '_, Ctx::ReadView<'_>> {
         self.push_binop(Binop::Int(IntBinop::Rem), lhs, rhs, None)
     }
 
@@ -1020,7 +1040,7 @@ impl<'str, 'ctx, Ctx: BuilderBacking<'str>> Builder<'str, 'ctx, Ctx> {
         &mut self,
         lhs: ValueId,
         rhs: ValueId,
-    ) -> InstructionRef<'str, '_, HostRef<'_, 'str>> {
+    ) -> InstructionRef<'str, '_, Ctx::ReadView<'_>> {
         self.push_binop(Binop::Int(IntBinop::Srem), lhs, rhs, None)
     }
 
@@ -1028,7 +1048,7 @@ impl<'str, 'ctx, Ctx: BuilderBacking<'str>> Builder<'str, 'ctx, Ctx> {
         &mut self,
         lhs: ValueId,
         rhs: ValueId,
-    ) -> InstructionRef<'str, '_, HostRef<'_, 'str>> {
+    ) -> InstructionRef<'str, '_, Ctx::ReadView<'_>> {
         self.push_binop(Binop::Int(IntBinop::Add), lhs, rhs, None)
     }
 
@@ -1036,7 +1056,7 @@ impl<'str, 'ctx, Ctx: BuilderBacking<'str>> Builder<'str, 'ctx, Ctx> {
         &mut self,
         lhs: ValueId,
         rhs: ValueId,
-    ) -> InstructionRef<'str, '_, HostRef<'_, 'str>> {
+    ) -> InstructionRef<'str, '_, Ctx::ReadView<'_>> {
         self.push_binop(Binop::Int(IntBinop::Sub), lhs, rhs, None)
     }
 
@@ -1046,7 +1066,7 @@ impl<'str, 'ctx, Ctx: BuilderBacking<'str>> Builder<'str, 'ctx, Ctx> {
         &mut self,
         lhs: ValueId,
         rhs: ValueId,
-    ) -> InstructionRef<'str, '_, HostRef<'_, 'str>> {
+    ) -> InstructionRef<'str, '_, Ctx::ReadView<'_>> {
         self.push_binop(Binop::Float(FloatBinop::Div), lhs, rhs, None)
     }
 
@@ -1054,7 +1074,7 @@ impl<'str, 'ctx, Ctx: BuilderBacking<'str>> Builder<'str, 'ctx, Ctx> {
         &mut self,
         lhs: ValueId,
         rhs: ValueId,
-    ) -> InstructionRef<'str, '_, HostRef<'_, 'str>> {
+    ) -> InstructionRef<'str, '_, Ctx::ReadView<'_>> {
         self.push_binop(Binop::Float(FloatBinop::Mul), lhs, rhs, None)
     }
 
@@ -1062,7 +1082,7 @@ impl<'str, 'ctx, Ctx: BuilderBacking<'str>> Builder<'str, 'ctx, Ctx> {
         &mut self,
         lhs: ValueId,
         rhs: ValueId,
-    ) -> InstructionRef<'str, '_, HostRef<'_, 'str>> {
+    ) -> InstructionRef<'str, '_, Ctx::ReadView<'_>> {
         self.push_binop(Binop::Float(FloatBinop::Add), lhs, rhs, None)
     }
 
@@ -1070,7 +1090,7 @@ impl<'str, 'ctx, Ctx: BuilderBacking<'str>> Builder<'str, 'ctx, Ctx> {
         &mut self,
         lhs: ValueId,
         rhs: ValueId,
-    ) -> InstructionRef<'str, '_, HostRef<'_, 'str>> {
+    ) -> InstructionRef<'str, '_, Ctx::ReadView<'_>> {
         self.push_binop(Binop::Float(FloatBinop::Sub), lhs, rhs, None)
     }
 
@@ -1080,7 +1100,7 @@ impl<'str, 'ctx, Ctx: BuilderBacking<'str>> Builder<'str, 'ctx, Ctx> {
         &mut self,
         lhs: ValueId,
         rhs: ValueId,
-    ) -> InstructionRef<'str, '_, HostRef<'_, 'str>> {
+    ) -> InstructionRef<'str, '_, Ctx::ReadView<'_>> {
         self.push_binop(Binop::Int(IntBinop::ShiftLeft), lhs, rhs, None)
     }
 
@@ -1088,7 +1108,7 @@ impl<'str, 'ctx, Ctx: BuilderBacking<'str>> Builder<'str, 'ctx, Ctx> {
         &mut self,
         lhs: ValueId,
         rhs: ValueId,
-    ) -> InstructionRef<'str, '_, HostRef<'_, 'str>> {
+    ) -> InstructionRef<'str, '_, Ctx::ReadView<'_>> {
         self.push_binop(Binop::Int(IntBinop::ShiftRight), lhs, rhs, None)
     }
 
@@ -1096,7 +1116,7 @@ impl<'str, 'ctx, Ctx: BuilderBacking<'str>> Builder<'str, 'ctx, Ctx> {
         &mut self,
         lhs: ValueId,
         rhs: ValueId,
-    ) -> InstructionRef<'str, '_, HostRef<'_, 'str>> {
+    ) -> InstructionRef<'str, '_, Ctx::ReadView<'_>> {
         self.push_binop(Binop::Int(IntBinop::SShiftRight), lhs, rhs, None)
     }
 
@@ -1119,7 +1139,7 @@ impl<'str, 'ctx, Ctx: BuilderBacking<'str>> Builder<'str, 'ctx, Ctx> {
         &mut self,
         lhs: ValueId,
         rhs: ValueId,
-    ) -> InstructionRef<'str, '_, HostRef<'_, 'str>> {
+    ) -> InstructionRef<'str, '_, Ctx::ReadView<'_>> {
         self.push_binop(Binop::Int(IntBinop::Equal), lhs, rhs, Some(1))
     }
 
@@ -1127,7 +1147,7 @@ impl<'str, 'ctx, Ctx: BuilderBacking<'str>> Builder<'str, 'ctx, Ctx> {
         &mut self,
         lhs: ValueId,
         rhs: ValueId,
-    ) -> InstructionRef<'str, '_, HostRef<'_, 'str>> {
+    ) -> InstructionRef<'str, '_, Ctx::ReadView<'_>> {
         self.push_binop(Binop::Int(IntBinop::NotEqual), lhs, rhs, Some(1))
     }
 
@@ -1135,7 +1155,7 @@ impl<'str, 'ctx, Ctx: BuilderBacking<'str>> Builder<'str, 'ctx, Ctx> {
         &mut self,
         lhs: ValueId,
         rhs: ValueId,
-    ) -> InstructionRef<'str, '_, HostRef<'_, 'str>> {
+    ) -> InstructionRef<'str, '_, Ctx::ReadView<'_>> {
         self.push_binop(Binop::Float(FloatBinop::Equal), lhs, rhs, Some(1))
     }
 
@@ -1143,7 +1163,7 @@ impl<'str, 'ctx, Ctx: BuilderBacking<'str>> Builder<'str, 'ctx, Ctx> {
         &mut self,
         lhs: ValueId,
         rhs: ValueId,
-    ) -> InstructionRef<'str, '_, HostRef<'_, 'str>> {
+    ) -> InstructionRef<'str, '_, Ctx::ReadView<'_>> {
         self.push_binop(Binop::Float(FloatBinop::NotEqual), lhs, rhs, Some(1))
     }
 
@@ -1155,7 +1175,7 @@ impl<'str, 'ctx, Ctx: BuilderBacking<'str>> Builder<'str, 'ctx, Ctx> {
         &mut self,
         lhs: ValueId,
         rhs: ValueId,
-    ) -> InstructionRef<'str, '_, HostRef<'_, 'str>> {
+    ) -> InstructionRef<'str, '_, Ctx::ReadView<'_>> {
         debug_assert!(
             self.both_bool(lhs, rhs),
             "push_bool_xor: operands must be bool"
@@ -1168,7 +1188,7 @@ impl<'str, 'ctx, Ctx: BuilderBacking<'str>> Builder<'str, 'ctx, Ctx> {
         &mut self,
         lhs: ValueId,
         rhs: ValueId,
-    ) -> InstructionRef<'str, '_, HostRef<'_, 'str>> {
+    ) -> InstructionRef<'str, '_, Ctx::ReadView<'_>> {
         debug_assert!(
             self.both_bool(lhs, rhs),
             "push_bool_and: operands must be bool"
@@ -1181,7 +1201,7 @@ impl<'str, 'ctx, Ctx: BuilderBacking<'str>> Builder<'str, 'ctx, Ctx> {
         &mut self,
         lhs: ValueId,
         rhs: ValueId,
-    ) -> InstructionRef<'str, '_, HostRef<'_, 'str>> {
+    ) -> InstructionRef<'str, '_, Ctx::ReadView<'_>> {
         debug_assert!(
             self.both_bool(lhs, rhs),
             "push_bool_or: operands must be bool"
@@ -1202,7 +1222,7 @@ impl<'str, 'ctx, Ctx: BuilderBacking<'str>> Builder<'str, 'ctx, Ctx> {
         &mut self,
         lhs: ValueId,
         rhs: ValueId,
-    ) -> InstructionRef<'str, '_, HostRef<'_, 'str>> {
+    ) -> InstructionRef<'str, '_, Ctx::ReadView<'_>> {
         self.push_binop(Binop::Int(IntBinop::Xor), lhs, rhs, None)
     }
 
@@ -1210,7 +1230,7 @@ impl<'str, 'ctx, Ctx: BuilderBacking<'str>> Builder<'str, 'ctx, Ctx> {
         &mut self,
         lhs: ValueId,
         rhs: ValueId,
-    ) -> InstructionRef<'str, '_, HostRef<'_, 'str>> {
+    ) -> InstructionRef<'str, '_, Ctx::ReadView<'_>> {
         self.push_binop(Binop::Int(IntBinop::Or), lhs, rhs, None)
     }
 
@@ -1218,13 +1238,13 @@ impl<'str, 'ctx, Ctx: BuilderBacking<'str>> Builder<'str, 'ctx, Ctx> {
         &mut self,
         lhs: ValueId,
         rhs: ValueId,
-    ) -> InstructionRef<'str, '_, HostRef<'_, 'str>> {
+    ) -> InstructionRef<'str, '_, Ctx::ReadView<'_>> {
         self.push_binop(Binop::Int(IntBinop::And), lhs, rhs, None)
     }
 
     // --- Extensions & Conversions ---
 
-    pub fn push_is_nan(&mut self, src: ValueId) -> InstructionRef<'str, '_, HostRef<'_, 'str>> {
+    pub fn push_is_nan(&mut self, src: ValueId) -> InstructionRef<'str, '_, Ctx::ReadView<'_>> {
         assert!(
             !src.is_varnode(),
             "push_is_nan: varnode operand not allowed"
@@ -1232,23 +1252,23 @@ impl<'str, 'ctx, Ctx: BuilderBacking<'str>> Builder<'str, 'ctx, Ctx> {
         self.push_instruction(Mnemonic::IsFloatNaN(IsFloatNaN { src: self.loc(src) }), 1)
     }
 
-    pub fn push_abs(&mut self, src: ValueId) -> InstructionRef<'str, '_, HostRef<'_, 'str>> {
+    pub fn push_abs(&mut self, src: ValueId) -> InstructionRef<'str, '_, Ctx::ReadView<'_>> {
         self.push_unop(Unop::FloatAbs, src)
     }
 
-    pub fn push_sqrt(&mut self, src: ValueId) -> InstructionRef<'str, '_, HostRef<'_, 'str>> {
+    pub fn push_sqrt(&mut self, src: ValueId) -> InstructionRef<'str, '_, Ctx::ReadView<'_>> {
         self.push_unop(Unop::FloatSqrt, src)
     }
 
-    pub fn push_floor(&mut self, src: ValueId) -> InstructionRef<'str, '_, HostRef<'_, 'str>> {
+    pub fn push_floor(&mut self, src: ValueId) -> InstructionRef<'str, '_, Ctx::ReadView<'_>> {
         self.push_unop(Unop::FloatFloor, src)
     }
 
-    pub fn push_ceil(&mut self, src: ValueId) -> InstructionRef<'str, '_, HostRef<'_, 'str>> {
+    pub fn push_ceil(&mut self, src: ValueId) -> InstructionRef<'str, '_, Ctx::ReadView<'_>> {
         self.push_unop(Unop::FloatCeil, src)
     }
 
-    pub fn push_round(&mut self, src: ValueId) -> InstructionRef<'str, '_, HostRef<'_, 'str>> {
+    pub fn push_round(&mut self, src: ValueId) -> InstructionRef<'str, '_, Ctx::ReadView<'_>> {
         self.push_unop(Unop::FloatRound, src)
     }
 
@@ -1256,7 +1276,7 @@ impl<'str, 'ctx, Ctx: BuilderBacking<'str>> Builder<'str, 'ctx, Ctx> {
         &mut self,
         src: ValueId,
         size: usize,
-    ) -> InstructionRef<'str, '_, HostRef<'_, 'str>> {
+    ) -> InstructionRef<'str, '_, Ctx::ReadView<'_>> {
         assert!(
             !src.is_varnode(),
             "push_int_to_float: varnode operand not allowed"
@@ -1274,7 +1294,7 @@ impl<'str, 'ctx, Ctx: BuilderBacking<'str>> Builder<'str, 'ctx, Ctx> {
         &mut self,
         src: ValueId,
         size: usize,
-    ) -> InstructionRef<'str, '_, HostRef<'_, 'str>> {
+    ) -> InstructionRef<'str, '_, Ctx::ReadView<'_>> {
         assert!(
             !src.is_varnode(),
             "push_float_to_float: varnode operand not allowed"
@@ -1292,7 +1312,7 @@ impl<'str, 'ctx, Ctx: BuilderBacking<'str>> Builder<'str, 'ctx, Ctx> {
         &mut self,
         src: ValueId,
         size: usize,
-    ) -> InstructionRef<'str, '_, HostRef<'_, 'str>> {
+    ) -> InstructionRef<'str, '_, Ctx::ReadView<'_>> {
         assert!(!src.is_varnode(), "push_trunc: varnode operand not allowed");
         self.push_instruction(
             Mnemonic::FloatToInt(FloatToInt {
@@ -1307,7 +1327,7 @@ impl<'str, 'ctx, Ctx: BuilderBacking<'str>> Builder<'str, 'ctx, Ctx> {
         &mut self,
         src: ValueId,
         size: usize,
-    ) -> InstructionRef<'str, '_, HostRef<'_, 'str>> {
+    ) -> InstructionRef<'str, '_, Ctx::ReadView<'_>> {
         assert!(!src.is_varnode(), "push_zext: varnode operand not allowed");
         self.push_instruction(
             Mnemonic::Zext(Zext {
@@ -1322,7 +1342,7 @@ impl<'str, 'ctx, Ctx: BuilderBacking<'str>> Builder<'str, 'ctx, Ctx> {
         &mut self,
         src: ValueId,
         size: usize,
-    ) -> InstructionRef<'str, '_, HostRef<'_, 'str>> {
+    ) -> InstructionRef<'str, '_, Ctx::ReadView<'_>> {
         assert!(!src.is_varnode(), "push_sext: varnode operand not allowed");
         self.push_instruction(
             Mnemonic::Sext(Sext {
@@ -1340,7 +1360,7 @@ impl<'str, 'ctx, Ctx: BuilderBacking<'str>> Builder<'str, 'ctx, Ctx> {
     pub fn push_tuple(
         &mut self,
         fields: Vec<ValueId>,
-    ) -> InstructionRef<'str, '_, HostRef<'_, 'str>> {
+    ) -> InstructionRef<'str, '_, Ctx::ReadView<'_>> {
         let named_fields = fields
             .into_iter()
             .enumerate()
@@ -1353,7 +1373,7 @@ impl<'str, 'ctx, Ctx: BuilderBacking<'str>> Builder<'str, 'ctx, Ctx> {
     pub fn push_named_tuple(
         &mut self,
         fields: Vec<(String, ValueId)>,
-    ) -> InstructionRef<'str, '_, HostRef<'_, 'str>> {
+    ) -> InstructionRef<'str, '_, Ctx::ReadView<'_>> {
         let field_types: Vec<TypeId> = fields.iter().map(|(_, f)| self.type_of(*f)).collect();
         let aggregate_fields = fields
             .iter()
@@ -1379,7 +1399,7 @@ impl<'str, 'ctx, Ctx: BuilderBacking<'str>> Builder<'str, 'ctx, Ctx> {
         &mut self,
         agg: ValueId,
         index: usize,
-    ) -> InstructionRef<'str, '_, HostRef<'_, 'str>> {
+    ) -> InstructionRef<'str, '_, Ctx::ReadView<'_>> {
         let agg_ty = self.type_of(agg);
         let ty = self
             .shr()
@@ -1412,7 +1432,7 @@ impl<'str, 'ctx, Ctx: BuilderBacking<'str>> Builder<'str, 'ctx, Ctx> {
         body: impl Into<Callee>,
         src: ValueId,
         captures: Vec<ValueId>,
-    ) -> InstructionRef<'str, '_, HostRef<'_, 'str>> {
+    ) -> InstructionRef<'str, '_, Ctx::ReadView<'_>> {
         let body = body.into();
         let src_ty = self.type_of(src);
         // `map` preserves the source's sequence kind: an array maps to an array,
@@ -1452,7 +1472,7 @@ impl<'str, 'ctx, Ctx: BuilderBacking<'str>> Builder<'str, 'ctx, Ctx> {
         init: ValueId,
         src: ValueId,
         captures: Vec<ValueId>,
-    ) -> InstructionRef<'str, '_, HostRef<'_, 'str>> {
+    ) -> InstructionRef<'str, '_, Ctx::ReadView<'_>> {
         let body = body.into();
         let src_ty = self.type_of(src);
         // Like `map`, a scan preserves the source's sequence kind and takes its
@@ -1483,7 +1503,7 @@ impl<'str, 'ctx, Ctx: BuilderBacking<'str>> Builder<'str, 'ctx, Ctx> {
         &mut self,
         target: impl Into<Callee>,
         args: Vec<ValueId>,
-    ) -> InstructionRef<'str, '_, HostRef<'_, 'str>> {
+    ) -> InstructionRef<'str, '_, Ctx::ReadView<'_>> {
         let target = target.into();
         let ty = target
             .real()
@@ -1507,11 +1527,12 @@ impl<'str, 'ctx, Ctx: BuilderBacking<'str>> Builder<'str, 'ctx, Ctx> {
     fn map_body_return_type(&self, body: FunctionId) -> Option<TypeId> {
         // A checked-out builder has no access to other function bodies, so no
         // return type is recoverable through this path.
-        let HostRef::Module(ctx) = self.read_host() else {
+        if !self.block.host_ref().bb_can_read_body(body) {
             return None;
-        };
-        let root = FunctionBody::from_id(ctx, body).root()?.id;
-        BasicBlock::from_id(ctx, root)
+        }
+        let view = self.view();
+        let root = view.function_ref(body).root()?.id;
+        view.block_ref(root)
             .iter()
             .find_map(|i| match i.mnemonic() {
                 Mnemonic::Return(r) => r
@@ -1524,10 +1545,11 @@ impl<'str, 'ctx, Ctx: BuilderBacking<'str>> Builder<'str, 'ctx, Ctx> {
     /// The type of the first value returned by a lambda body.
     fn lambda_return_type(&self, body: FunctionId) -> Option<TypeId> {
         // See `map_body_return_type` on the checked-out fallback.
-        let HostRef::Module(ctx) = self.read_host() else {
+        if !self.block.host_ref().bb_can_read_body(body) {
             return None;
-        };
-        FunctionBody::from_id(ctx, body)
+        }
+        self.view()
+            .function_ref(body)
             .iter()
             .flat_map(|block| block.iter())
             .find_map(|i| match i.mnemonic() {
@@ -1545,7 +1567,7 @@ impl<'str, 'ctx, Ctx: BuilderBacking<'str>> Builder<'str, 'ctx, Ctx> {
         &mut self,
         base: ValueId,
         offset: usize,
-    ) -> InstructionRef<'str, '_, HostRef<'_, 'str>> {
+    ) -> InstructionRef<'str, '_, Ctx::ReadView<'_>> {
         let base_ty = self.type_of(base);
         let types = &self.shr().types;
         let ptr_width = types.size_of(base_ty);
@@ -1576,7 +1598,7 @@ impl<'str, 'ctx, Ctx: BuilderBacking<'str>> Builder<'str, 'ctx, Ctx> {
         &mut self,
         base: ValueId,
         name: &str,
-    ) -> InstructionRef<'str, '_, HostRef<'_, 'str>> {
+    ) -> InstructionRef<'str, '_, Ctx::ReadView<'_>> {
         let base_ty = self.type_of(base);
         let types = &self.shr().types;
         let pointee = types
@@ -1594,7 +1616,7 @@ impl<'str, 'ctx, Ctx: BuilderBacking<'str>> Builder<'str, 'ctx, Ctx> {
         &mut self,
         src: ValueId,
         size: usize,
-    ) -> InstructionRef<'str, '_, HostRef<'_, 'str>> {
+    ) -> InstructionRef<'str, '_, Ctx::ReadView<'_>> {
         assert!(
             !src.is_varnode(),
             "push_popcount: varnode operand not allowed"
@@ -1606,7 +1628,7 @@ impl<'str, 'ctx, Ctx: BuilderBacking<'str>> Builder<'str, 'ctx, Ctx> {
         &mut self,
         src: ValueId,
         size: usize,
-    ) -> InstructionRef<'str, '_, HostRef<'_, 'str>> {
+    ) -> InstructionRef<'str, '_, Ctx::ReadView<'_>> {
         assert!(
             !src.is_varnode(),
             "push_lzcount: varnode operand not allowed"
@@ -1618,7 +1640,7 @@ impl<'str, 'ctx, Ctx: BuilderBacking<'str>> Builder<'str, 'ctx, Ctx> {
         &mut self,
         lhs: ValueId,
         rhs: ValueId,
-    ) -> InstructionRef<'str, '_, HostRef<'_, 'str>> {
+    ) -> InstructionRef<'str, '_, Ctx::ReadView<'_>> {
         assert!(
             !lhs.is_varnode() && !rhs.is_varnode(),
             "push_carry: varnode operand not allowed"
@@ -1636,7 +1658,7 @@ impl<'str, 'ctx, Ctx: BuilderBacking<'str>> Builder<'str, 'ctx, Ctx> {
         &mut self,
         lhs: ValueId,
         rhs: ValueId,
-    ) -> InstructionRef<'str, '_, HostRef<'_, 'str>> {
+    ) -> InstructionRef<'str, '_, Ctx::ReadView<'_>> {
         assert!(
             !lhs.is_varnode() && !rhs.is_varnode(),
             "push_scarry: varnode operand not allowed"
@@ -1654,7 +1676,7 @@ impl<'str, 'ctx, Ctx: BuilderBacking<'str>> Builder<'str, 'ctx, Ctx> {
         &mut self,
         lhs: ValueId,
         rhs: ValueId,
-    ) -> InstructionRef<'str, '_, HostRef<'_, 'str>> {
+    ) -> InstructionRef<'str, '_, Ctx::ReadView<'_>> {
         assert!(
             !lhs.is_varnode() && !rhs.is_varnode(),
             "push_sborrow: varnode operand not allowed"
@@ -1674,7 +1696,7 @@ impl<'str, 'ctx, Ctx: BuilderBacking<'str>> Builder<'str, 'ctx, Ctx> {
         args: Vec<ValueId>,
         dst: Option<ValueId>,
         size: usize,
-    ) -> InstructionRef<'str, '_, HostRef<'_, 'str>> {
+    ) -> InstructionRef<'str, '_, Ctx::ReadView<'_>> {
         let args = args
             .into_iter()
             .map(|arg| self.ensure_local(arg))
@@ -1702,7 +1724,7 @@ impl<'str, 'ctx, Ctx: BuilderBacking<'str>> Builder<'str, 'ctx, Ctx> {
         &mut self,
         id: IntrinsicId,
         args: Vec<ValueId>,
-    ) -> InstructionRef<'str, '_, HostRef<'_, 'str>> {
+    ) -> InstructionRef<'str, '_, Ctx::ReadView<'_>> {
         let desc = id.desc();
         assert_eq!(
             args.len(),
@@ -1744,7 +1766,7 @@ impl<'str, 'ctx, Ctx: BuilderBacking<'str>> Builder<'str, 'ctx, Ctx> {
         &mut self,
         src: ValueId,
         dst: VarnodeId,
-    ) -> InstructionRef<'str, '_, HostRef<'_, 'str>> {
+    ) -> InstructionRef<'str, '_, Ctx::ReadView<'_>> {
         let node = Varnode::from_id(self.shr(), dst);
         let size = node.size();
         let space = node.space().id;
@@ -1791,7 +1813,7 @@ impl<'str, 'ctx, Ctx: BuilderBacking<'str>> Builder<'str, 'ctx, Ctx> {
                 first_id.get_or_insert(id);
             }
 
-            InstructionRef::new(self.read_host(), first_id.unwrap())
+            InstructionRef::new(self.view(), first_id.unwrap())
         } else {
             let src = self.ensure_local(src);
             // If dst is a varnode, we need to emit a store from src to dst
@@ -1822,7 +1844,7 @@ impl<'str, 'ctx, Ctx: BuilderBacking<'str>> Builder<'str, 'ctx, Ctx> {
                     .expect("This name was deduplicated");
             }
 
-            InstructionRef::new(self.read_host(), id)
+            InstructionRef::new(self.view(), id)
         }
     }
 
@@ -1832,7 +1854,7 @@ impl<'str, 'ctx, Ctx: BuilderBacking<'str>> Builder<'str, 'ctx, Ctx> {
         src: ValueId,
         ptr: ValueId,
         space: SpaceId,
-    ) -> InstructionRef<'str, '_, HostRef<'_, 'str>> {
+    ) -> InstructionRef<'str, '_, Ctx::ReadView<'_>> {
         let src = self.ensure_local(src);
         let size = self.get_value(src).size();
 
@@ -1873,7 +1895,7 @@ impl<'str, 'ctx, Ctx: BuilderBacking<'str>> Builder<'str, 'ctx, Ctx> {
     ///
     /// Terminates this block with an unconditional jump to the given target block.
     /// The builder is now safe to drop without panicking, and the block is properly terminated.
-    pub fn push_branch(&mut self, target: BlockId) -> InstructionRef<'str, '_, HostRef<'_, 'str>> {
+    pub fn push_branch(&mut self, target: BlockId) -> InstructionRef<'str, '_, Ctx::ReadView<'_>> {
         self.push_branch_with_args(target, vec![])
     }
 
@@ -1882,7 +1904,7 @@ impl<'str, 'ctx, Ctx: BuilderBacking<'str>> Builder<'str, 'ctx, Ctx> {
         &mut self,
         target: BlockId,
         args: Vec<ValueId>,
-    ) -> InstructionRef<'str, '_, HostRef<'_, 'str>> {
+    ) -> InstructionRef<'str, '_, Ctx::ReadView<'_>> {
         let current = self.block.id;
         self.block.host_mut().bb_add_cfg_edge(current, target);
         let target = target.localize(current.func);
@@ -1896,7 +1918,7 @@ impl<'str, 'ctx, Ctx: BuilderBacking<'str>> Builder<'str, 'ctx, Ctx> {
             )
             .id;
         self.is_terminated = true;
-        InstructionRef::new(self.read_host(), id)
+        InstructionRef::new(self.view(), id)
     }
 
     pub fn push_cbranch(
@@ -1904,7 +1926,7 @@ impl<'str, 'ctx, Ctx: BuilderBacking<'str>> Builder<'str, 'ctx, Ctx> {
         condition: ValueId,
         target: BlockId,
         fallthrough: BlockId,
-    ) -> InstructionRef<'str, '_, HostRef<'_, 'str>> {
+    ) -> InstructionRef<'str, '_, Ctx::ReadView<'_>> {
         self.push_cbranch_with_args(condition, target, vec![], fallthrough, vec![])
     }
 
@@ -1916,7 +1938,7 @@ impl<'str, 'ctx, Ctx: BuilderBacking<'str>> Builder<'str, 'ctx, Ctx> {
         target_args: Vec<ValueId>,
         fallthrough: BlockId,
         fallthrough_args: Vec<ValueId>,
-    ) -> InstructionRef<'str, '_, HostRef<'_, 'str>> {
+    ) -> InstructionRef<'str, '_, Ctx::ReadView<'_>> {
         assert!(
             !condition.is_varnode(),
             "push_cbranch: varnode condition not allowed; load the value first"
@@ -1939,21 +1961,21 @@ impl<'str, 'ctx, Ctx: BuilderBacking<'str>> Builder<'str, 'ctx, Ctx> {
             )
             .id;
         self.is_terminated = true;
-        InstructionRef::new(self.read_host(), id)
+        InstructionRef::new(self.view(), id)
     }
 
-    pub fn push_branchind(&mut self, ptr: ValueId) -> InstructionRef<'str, '_, HostRef<'_, 'str>> {
+    pub fn push_branchind(&mut self, ptr: ValueId) -> InstructionRef<'str, '_, Ctx::ReadView<'_>> {
         let id = self
             .push_instruction(Mnemonic::BranchInd(BranchInd { ptr: self.loc(ptr) }), 0)
             .id;
         self.is_terminated = true;
-        InstructionRef::new(self.read_host(), id)
+        InstructionRef::new(self.view(), id)
     }
 
     pub fn push_call(
         &mut self,
         target: impl Into<Callee>,
-    ) -> InstructionRef<'str, '_, HostRef<'_, 'str>> {
+    ) -> InstructionRef<'str, '_, Ctx::ReadView<'_>> {
         self.push_call_with_args(target, vec![])
     }
 
@@ -1961,7 +1983,7 @@ impl<'str, 'ctx, Ctx: BuilderBacking<'str>> Builder<'str, 'ctx, Ctx> {
         &mut self,
         target: impl Into<Callee>,
         args: Vec<ValueId>,
-    ) -> InstructionRef<'str, '_, HostRef<'_, 'str>> {
+    ) -> InstructionRef<'str, '_, Ctx::ReadView<'_>> {
         let target = target.into();
         let id = self
             .push_instruction(
@@ -1974,7 +1996,7 @@ impl<'str, 'ctx, Ctx: BuilderBacking<'str>> Builder<'str, 'ctx, Ctx> {
             )
             .id;
         self.is_terminated = true;
-        InstructionRef::new(self.read_host(), id)
+        InstructionRef::new(self.view(), id)
     }
 
     /// Tail call to another function's entry — a function-level terminator with
@@ -1984,7 +2006,7 @@ impl<'str, 'ctx, Ctx: BuilderBacking<'str>> Builder<'str, 'ctx, Ctx> {
     pub fn push_tail_call(
         &mut self,
         target: impl Into<Callee>,
-    ) -> InstructionRef<'str, '_, HostRef<'_, 'str>> {
+    ) -> InstructionRef<'str, '_, Ctx::ReadView<'_>> {
         self.push_tail_call_with_args(target, vec![])
     }
 
@@ -1992,7 +2014,7 @@ impl<'str, 'ctx, Ctx: BuilderBacking<'str>> Builder<'str, 'ctx, Ctx> {
         &mut self,
         target: impl Into<Callee>,
         args: Vec<ValueId>,
-    ) -> InstructionRef<'str, '_, HostRef<'_, 'str>> {
+    ) -> InstructionRef<'str, '_, Ctx::ReadView<'_>> {
         let target = target.into();
         let id = self
             .push_instruction(
@@ -2004,10 +2026,10 @@ impl<'str, 'ctx, Ctx: BuilderBacking<'str>> Builder<'str, 'ctx, Ctx> {
             )
             .id;
         self.is_terminated = true;
-        InstructionRef::new(self.read_host(), id)
+        InstructionRef::new(self.view(), id)
     }
 
-    pub fn push_call_ind(&mut self, ptr: ValueId) -> InstructionRef<'str, '_, HostRef<'_, 'str>> {
+    pub fn push_call_ind(&mut self, ptr: ValueId) -> InstructionRef<'str, '_, Ctx::ReadView<'_>> {
         self.push_call_ind_with_args(ptr, vec![])
     }
 
@@ -2015,7 +2037,7 @@ impl<'str, 'ctx, Ctx: BuilderBacking<'str>> Builder<'str, 'ctx, Ctx> {
         &mut self,
         ptr: ValueId,
         args: Vec<ValueId>,
-    ) -> InstructionRef<'str, '_, HostRef<'_, 'str>> {
+    ) -> InstructionRef<'str, '_, Ctx::ReadView<'_>> {
         let id = self
             .push_instruction(
                 Mnemonic::CallInd(CallInd {
@@ -2026,10 +2048,10 @@ impl<'str, 'ctx, Ctx: BuilderBacking<'str>> Builder<'str, 'ctx, Ctx> {
             )
             .id;
         self.is_terminated = true;
-        InstructionRef::new(self.read_host(), id)
+        InstructionRef::new(self.view(), id)
     }
 
-    pub fn push_return(&mut self, ptr: ValueId) -> InstructionRef<'str, '_, HostRef<'_, 'str>> {
+    pub fn push_return(&mut self, ptr: ValueId) -> InstructionRef<'str, '_, Ctx::ReadView<'_>> {
         self.push_return_at(None, ptr)
     }
 
@@ -2037,7 +2059,7 @@ impl<'str, 'ctx, Ctx: BuilderBacking<'str>> Builder<'str, 'ctx, Ctx> {
         &mut self,
         value: ValueId,
         ptr: ValueId,
-    ) -> InstructionRef<'str, '_, HostRef<'_, 'str>> {
+    ) -> InstructionRef<'str, '_, Ctx::ReadView<'_>> {
         self.push_return_at(Some(value), ptr)
     }
 
@@ -2045,7 +2067,7 @@ impl<'str, 'ctx, Ctx: BuilderBacking<'str>> Builder<'str, 'ctx, Ctx> {
         &mut self,
         value: Option<ValueId>,
         ptr: ValueId,
-    ) -> InstructionRef<'str, '_, HostRef<'_, 'str>> {
+    ) -> InstructionRef<'str, '_, Ctx::ReadView<'_>> {
         let id = self
             .push_instruction(
                 Mnemonic::Return(Return {
@@ -2056,13 +2078,13 @@ impl<'str, 'ctx, Ctx: BuilderBacking<'str>> Builder<'str, 'ctx, Ctx> {
             )
             .id;
         self.is_terminated = true;
-        InstructionRef::new(self.read_host(), id)
+        InstructionRef::new(self.view(), id)
     }
 
     pub fn push_return_value(
         &mut self,
         value: ValueId,
-    ) -> InstructionRef<'str, '_, HostRef<'_, 'str>> {
+    ) -> InstructionRef<'str, '_, Ctx::ReadView<'_>> {
         let id = self
             .push_instruction(
                 Mnemonic::ReturnValue(ReturnValue {
@@ -2072,7 +2094,7 @@ impl<'str, 'ctx, Ctx: BuilderBacking<'str>> Builder<'str, 'ctx, Ctx> {
             )
             .id;
         self.is_terminated = true;
-        InstructionRef::new(self.read_host(), id)
+        InstructionRef::new(self.view(), id)
     }
 
     // --- Assert ---
@@ -2081,7 +2103,7 @@ impl<'str, 'ctx, Ctx: BuilderBacking<'str>> Builder<'str, 'ctx, Ctx> {
     pub fn push_assert(
         &mut self,
         condition: ValueId,
-    ) -> InstructionRef<'str, '_, HostRef<'_, 'str>> {
+    ) -> InstructionRef<'str, '_, Ctx::ReadView<'_>> {
         self.push_instruction(
             Mnemonic::Assert(Assert {
                 condition: self.loc(condition),
@@ -2233,7 +2255,7 @@ mod tests {
     fn checked_builder_matches_module_builder() {
         use crate::value::{
             FunctionId, FunctionRef, block::BasicBlock, function::FunctionBody,
-            util::host_mut::PassBacking,
+        util::host_mut::PassBacking,
         };
 
         // The same body over any host: consts and a couple of binops (exercising

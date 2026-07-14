@@ -1,6 +1,6 @@
-//! The exclusive *mutation* host for a function pass ([`PassBacking`]).
+//! The exclusive mutation backing for a function pass ([`PassBacking`]).
 //!
-//! [`HostRef`](super::base_ref::HostRef) gives the read layer a `Copy` view that
+//! [`BodyView`] gives the read layer a `Copy` static provider that
 //! routes arena reads to the pass's own function. [`PassBacking`] is its mutable
 //! sibling: a single function's arenas borrowed `&mut` in place from
 //! `Context.bodies[id]` for exclusive mutation by one worker (the driver's
@@ -19,14 +19,12 @@ use crate::{
     error::{Error, ErrorTy, Result},
     value::{
         BlockParamRef, BlockRef, BodyView, FunctionBody, FunctionId, FunctionRef, InstructionRef,
-        ValueId,
+        QCodeView, ValueId,
         block::{BasicBlock, BlockId, EdgeData, EdgeId},
         block_param::{BlockParam, BlockParamId},
         insn::{Instruction, InstructionId, Mnemonic},
     },
 };
-
-use super::base_ref::HostRef;
 
 /// A single function borrowed `&mut` in place from `Context.bodies[id]` for
 /// exclusive mutation (its interface stays in `Context.interfaces[id]`,
@@ -100,7 +98,7 @@ impl<'a, 'str> PassBacking<'a, 'str> {
 /// The verb + read surface of a checked-out function pass, delegating to the
 /// owned `FunctionBody`'s inherent verbs and `self.shared`. The module-scope twin of
 /// each verb is an inherent method on [`Context`](crate::context::Context); the
-/// primitives below (`function{,_mut}`/`shared`/`read_host`, and the no-op
+/// primitives below (`function{,_mut}`/`shared`/`view`, and the no-op
 /// call-site cache) are the checked-out specializations.
 impl<'a, 'str> PassBacking<'a, 'str> {
     // ---- primitives ---------------------------------------------------------
@@ -129,15 +127,6 @@ impl<'a, 'str> PassBacking<'a, 'str> {
     pub fn shr(&self) -> &crate::context::Shared<'str> {
         self.shared
     }
-    /// A `Copy` read view over this host, for the mutation refs' read methods.
-    pub fn read_host(&self) -> HostRef<'_, 'str> {
-        HostRef::Checked {
-            fun: &*self.fun,
-            shared: self.shared,
-            interfaces: self.interfaces,
-        }
-    }
-
     /// The static immutable provider for shared reads over this pass body.
     pub fn view(&self) -> BodyView<'_, 'str> {
         BodyView::new(&*self.fun, self.shared, self.interfaces)
@@ -150,20 +139,20 @@ impl<'a, 'str> PassBacking<'a, 'str> {
     // ---- function-scoped read wrappers --------------------------------------
 
     /// A read [`BlockRef`](crate::value::BlockRef) over `id`, body-routed.
-    pub fn block_ref(&self, id: BlockId) -> BlockRef<'str, '_, HostRef<'_, 'str>> {
-        self.read_host().block_ref(id)
+    pub fn block_ref(&self, id: BlockId) -> BlockRef<'str, '_, BodyView<'_, 'str>> {
+        self.view().block_ref(id)
     }
     /// A read [`InstructionRef`](crate::value::InstructionRef) over `id`.
-    pub fn insn_ref(&self, id: InstructionId) -> InstructionRef<'str, '_, HostRef<'_, 'str>> {
-        self.read_host().insn_ref(id)
+    pub fn insn_ref(&self, id: InstructionId) -> InstructionRef<'str, '_, BodyView<'_, 'str>> {
+        self.view().insn_ref(id)
     }
     /// A read [`BlockParamRef`](crate::value::BlockParamRef) over `id`.
-    pub fn param_ref(&self, id: BlockParamId) -> BlockParamRef<'str, '_, HostRef<'_, 'str>> {
-        self.read_host().param_ref(id)
+    pub fn param_ref(&self, id: BlockParamId) -> BlockParamRef<'str, '_, BodyView<'_, 'str>> {
+        self.view().param_ref(id)
     }
     /// A read [`FunctionRef`](crate::value::FunctionRef) over `id`.
-    pub fn function_ref(&self, id: FunctionId) -> FunctionRef<'str, '_, HostRef<'_, 'str>> {
-        self.read_host().function_ref(id)
+    pub fn function_ref(&self, id: FunctionId) -> FunctionRef<'str, '_, BodyView<'_, 'str>> {
+        self.view().function_ref(id)
     }
 
     // ---- derived arena accessors --------------------------------------------
@@ -253,7 +242,7 @@ impl<'a, 'str> PassBacking<'a, 'str> {
         insn: InstructionId,
     ) {
         let index = self
-            .read_host()
+            .view()
             .block(block)
             .instructions
             .iter()
@@ -275,7 +264,7 @@ impl<'a, 'str> PassBacking<'a, 'str> {
     }
 
     pub fn remove_cfg_edge(&mut self, func: FunctionId, edge_id: EdgeId) {
-        let EdgeData { from, to } = *self.read_host().edge(func, edge_id);
+        let EdgeData { from, to } = *self.view().edge(func, edge_id);
         self.block_mut(from).edges.remove(&edge_id);
         self.block_mut(to).edges.remove(&edge_id);
         self.function_mut(func).edges.remove(edge_id);
@@ -311,7 +300,7 @@ impl<'a, 'str> PassBacking<'a, 'str> {
 
     pub fn remove_instruction(&mut self, id: InstructionId) {
         let (parent, name, is_terminator, args, target) = {
-            let insn = self.read_host().instruction(id);
+            let insn = self.view().instruction(id);
             (
                 insn.parent.map(|l| BlockId::new(id.func, l)),
                 insn.name.clone(),
@@ -327,7 +316,7 @@ impl<'a, 'str> PassBacking<'a, 'str> {
                 .retain(|&local| local != id.localize(block_id.func));
             if is_terminator {
                 let mut succ: Vec<EdgeId> = {
-                    let host = self.read_host();
+                    let host = self.view();
                     let block = host.block(block_id);
                     block
                         .edges
@@ -369,7 +358,7 @@ impl<'a, 'str> PassBacking<'a, 'str> {
     pub fn rehome_outgoing_edges(&mut self, keep: BlockId, remove: BlockId) {
         let func = keep.func;
         let outgoing: Vec<EdgeId> = {
-            let host = self.read_host();
+            let host = self.view();
             host.block(remove)
                 .edges
                 .iter()
@@ -387,7 +376,7 @@ impl<'a, 'str> PassBacking<'a, 'str> {
     pub fn replace_instruction_mnemonic(&mut self, id: InstructionId, mnemonic: Mnemonic) {
         let func = id.func;
         let (old_args, old_target) = {
-            let m = self.read_host().instruction(id).mnemonic();
+            let m = self.view().instruction(id).mnemonic();
             (m.args().into_iter().collect::<Vec<_>>(), m.call_target())
         };
         for arg in old_args {
@@ -406,7 +395,7 @@ impl<'a, 'str> PassBacking<'a, 'str> {
         }
         *self.instruction_mut(id).mnemonic_mut() = mnemonic;
         let (new_args, new_target) = {
-            let m = self.read_host().instruction(id).mnemonic();
+            let m = self.view().instruction(id).mnemonic();
             (m.args().into_iter().collect::<Vec<_>>(), m.call_target())
         };
         for arg in new_args {
@@ -423,7 +412,7 @@ impl<'a, 'str> PassBacking<'a, 'str> {
 
     pub fn unroster_block(&mut self, block: BlockId) {
         debug_assert!(
-            self.read_host()
+            self.view()
                 .block(block)
                 .parent
                 .is_none_or(|owner| owner == block.func),
@@ -435,19 +424,13 @@ impl<'a, 'str> PassBacking<'a, 'str> {
     }
 
     pub fn delete_block(&mut self, block: BlockId, _function_id: FunctionId) {
-        let mut edges: Vec<EdgeId> = self
-            .read_host()
-            .block(block)
-            .edges
-            .iter()
-            .copied()
-            .collect();
+        let mut edges: Vec<EdgeId> = self.view().block(block).edges.iter().copied().collect();
         edges.sort_unstable();
         for edge in edges {
             self.remove_cfg_edge(block.func, edge);
         }
         let insns: Vec<InstructionId> = self
-            .read_host()
+            .view()
             .block(block)
             .instructions
             .iter()
@@ -457,7 +440,7 @@ impl<'a, 'str> PassBacking<'a, 'str> {
             self.remove_instruction(insn);
         }
         let params: Vec<BlockParamId> = self
-            .read_host()
+            .view()
             .block(block)
             .params
             .iter()
@@ -466,11 +449,7 @@ impl<'a, 'str> PassBacking<'a, 'str> {
         for param in params {
             self.remove_block_param(param);
         }
-        let name = self
-            .read_host()
-            .block(block)
-            .local_name()
-            .map(str::to_owned);
+        let name = self.view().block(block).local_name().map(str::to_owned);
         self.unroster_block(block);
         if self.function_mut(block.func).root_id() == Some(block.local) {
             self.function_mut(block.func).set_root_id(None);
@@ -493,7 +472,7 @@ impl<'a, 'str> PassBacking<'a, 'str> {
             "cannot absorb across function arenas"
         );
         let (branch_id, branch_args) = {
-            let host = self.read_host();
+            let host = self.view();
             host.block(keep)
                 .instructions
                 .last()
@@ -513,7 +492,7 @@ impl<'a, 'str> PassBacking<'a, 'str> {
                 .expect("absorbed block must be reached by keep's terminal branch")
         };
         let other_params: Vec<_> = self
-            .read_host()
+            .view()
             .block(other)
             .params
             .iter()
@@ -541,7 +520,7 @@ impl<'a, 'str> PassBacking<'a, 'str> {
         self.block_mut(keep).instructions.extend(b_insns);
         self.rehome_outgoing_edges(keep, other);
         let (b_addr, b_extra, b_name) = {
-            let b = self.read_host().block(other);
+            let b = self.view().block(other);
             (
                 b.address,
                 b.extra_addresses.clone(),

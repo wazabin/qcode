@@ -11,7 +11,7 @@ use crate::{
         BlockId, BlockRef, FunctionId, FunctionRef, LocalBlockId, ModuleView, QCodeView, Value,
         ValueId,
         util::{
-            base_ref::{BaseRef, HostRef, WithCtx, WithCtxMut, WithHost},
+            base_ref::{BaseRef, WithCtx, WithCtxMut},
             named::{Named, Renameable, update_context_name},
         },
     },
@@ -249,7 +249,7 @@ macro_rules! impl_insn_mut_verbs {
     /// Panics on an incompatible same-nonzero-size change, exactly like
     /// [`InstructionMutRef::set_type`].
     pub fn set_result_type(&mut self, new_type: TypeId) {
-        let current = self.ctx.read_host().instruction(self.id).type_id;
+        let current = self.ctx.view().instruction(self.id).type_id;
         let (current_size, new_size) = {
             let types = &self.ctx.shr().types;
             (types.size_of(current), types.size_of(new_type))
@@ -267,7 +267,7 @@ macro_rules! impl_insn_mut_verbs {
     pub fn rename_local(&mut self, name: Cow<'str, str>) -> Result<()> {
         let old_name = self
             .ctx
-            .read_host()
+            .view()
             .instruction(self.id)
             .name
             .as_deref()
@@ -370,12 +370,6 @@ impl<'s, 'ctx: 's, 'str: 'ctx> WithCtx<'s, 'ctx, 'str> for InstructionRef<'str, 
         // `host().shr()`; only whole-module walks (callees/callers) reach here,
         // and those panic on a checked-out host by design (context-split Pin B).
         self.view.context()
-    }
-}
-
-impl<'s, 'ctx: 's, 'str: 'ctx> WithHost<'s, 'ctx, 'str> for InstructionRef<'str, 'ctx> {
-    fn host(&'s self) -> HostRef<'ctx, 'str> {
-        HostRef::Module(self.view.context())
     }
 }
 
@@ -518,12 +512,6 @@ impl<'s, 'ctx: 's, 'str: 'ctx> WithCtx<'s, 's, 'str> for InstructionMutRef<'str,
 impl<'s, 'ctx: 's, 'str: 'ctx> WithCtxMut<'s, 'str> for InstructionMutRef<'str, 'ctx> {
     fn ctx_mut(&'s mut self) -> &'s mut Context<'str> {
         self.ctx
-    }
-}
-
-impl<'s, 'ctx: 's, 'str: 'ctx> WithHost<'s, 's, 'str> for InstructionMutRef<'str, 'ctx> {
-    fn host(&'s self) -> HostRef<'s, 'str> {
-        HostRef::Module(self.ctx)
     }
 }
 

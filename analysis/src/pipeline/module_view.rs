@@ -22,10 +22,8 @@ use jstd::registry::Registry;
 use qcode::{
     context::{Context, Shared},
     value::{
-        BodyView, FunctionBody, FunctionId, FunctionKind,
-        function::FunctionInterface,
-        insn::Callee,
-        util::{base_ref::HostRef, host_mut::PassBacking},
+        BodyView, FunctionBody, FunctionId, FunctionKind, function::FunctionInterface,
+        insn::Callee, util::host_mut::PassBacking,
     },
 };
 
@@ -181,7 +179,7 @@ impl<'ctx, 'str> ContextView<'ctx, 'str> {
         self.shared
     }
 
-    /// The whole interface registry (for building a [`PassBacking`]/[`HostRef`]).
+    /// The whole interface registry (for building a [`PassBacking`]/[`BodyView`]).
     pub fn interfaces(&self) -> &'ctx Registry<FunctionId, FunctionInterface<'str>> {
         self.interfaces
     }
@@ -192,18 +190,6 @@ impl<'ctx, 'str> ContextView<'ctx, 'str> {
         'ctx: 'body,
     {
         PassBacking::new(body, self.shared, self.interfaces)
-    }
-
-    /// Build the copyable read host for a pass's borrowed body.
-    pub fn read_host<'body>(self, body: &'body FunctionBody<'str>) -> HostRef<'body, 'str>
-    where
-        'ctx: 'body,
-    {
-        HostRef::Checked {
-            fun: body,
-            shared: self.shared,
-            interfaces: self.interfaces,
-        }
     }
 
     /// Build the static read view for a pass's borrowed body.
@@ -308,7 +294,7 @@ mod tests {
     use super::*;
     use crate::test_util::dummy_env;
     use qcode::value::{
-        ValueId,
+        QCodeView, ValueId,
         block::BlockId,
         block_param::BlockParamId,
         insn::{InstructionId, Mnemonic},
@@ -392,7 +378,7 @@ mod tests {
                 0,
             );
             assert!(matches!(
-                host.read_host().instruction(call).mnemonic(),
+                host.view().instruction(call).mnemonic(),
                 Mnemonic::Call(call) if call.target == Callee::Minted(1)
             ));
         }
@@ -455,7 +441,7 @@ mod tests {
         assert_eq!(detached.edge(edge).to, child);
         let host = PassBacking::new(&mut detached, view.shr(), view.interfaces());
         assert_eq!(
-            host.read_host()
+            host.view()
                 .block_ref(root)
                 .successors()
                 .map(|(_, successor)| successor)
@@ -463,7 +449,7 @@ mod tests {
             [child]
         );
         assert_eq!(
-            host.read_host()
+            host.view()
                 .function_ref(installed)
                 .local_named("minted_root"),
             Some(ValueId::BasicBlock(root))
@@ -563,7 +549,7 @@ mod tests {
     }
 
     #[test]
-    #[should_panic(expected = "foreign function-body read on a checked-out host")]
+    #[should_panic(expected = "BodyView cannot read a foreign function body")]
     fn function_body_param_ref_rejects_foreign_id_with_colliding_local() {
         let mut ctx = Context::new();
         let (own_id, foreign, _) = two_functions_with_params(&mut ctx);
@@ -572,7 +558,7 @@ mod tests {
         let mut slots = bodies.select_mut(&[own_id]);
         let (own, _) = slots.split_first_mut().unwrap();
 
-        let _ = view.read_host(own).param_ref(foreign);
+        let _ = view.body_view(own).param_ref(foreign);
     }
 
     #[test]

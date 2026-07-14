@@ -7,9 +7,9 @@ use crate::{
         function::{FunctionId, FunctionMutRef, FunctionRef},
         insn::{InstructionId, InstructionRef, LocalInsnId, Mnemonic},
         util::{
-            base_ref::{BaseRef, HostRef, WithCtx, WithCtxMut, WithHost},
-            host_mut::PassBacking,
+            base_ref::{BaseRef, WithCtx, WithCtxMut},
             named::{Named, Renameable, update_context_name},
+        host_mut::PassBacking,
         },
     },
 };
@@ -342,7 +342,7 @@ where
 
     /// Iterates over outgoing `(edge_id, successor_block_id)` pairs.
     ///
-    /// Routed through [`HostRef`] (this block's incident edge set and each edge's
+    /// Routed through its [`QCodeView`] (this block's incident edge set and each edge's
     /// endpoints) rather than the `jstd` graph traits, so it reads correctly when
     /// the owning function is checked out. On the module path it yields exactly
     /// what `Node::children` did: the same incident-edge set, filtered to edges
@@ -527,12 +527,6 @@ impl<'s, 'ctx: 's, 'str: 'ctx> WithCtx<'s, 'ctx, 'str> for BlockRef<'str, 'ctx> 
     }
 }
 
-impl<'s, 'ctx: 's, 'str: 'ctx> WithHost<'s, 'ctx, 'str> for BlockRef<'str, 'ctx> {
-    fn host(&'s self) -> HostRef<'ctx, 'str> {
-        HostRef::Module(self.view.context())
-    }
-}
-
 impl<'str: 'ctx, 'ctx, R> Named for BlockRef<'str, 'ctx, R>
 where
     R: QCodeView<'ctx, 'str>,
@@ -615,9 +609,9 @@ impl<'s, 'ctx: 's, 'str: 'ctx> WithCtxMut<'s, 'str> for BlockMutRef<'str, 'ctx> 
 }
 
 // Read access over a mutation host: shared reads via the host's shared context,
-// the read view via its `HostRef`. Two concrete backings — `&mut Context`
+// the read view via its static provider. Two concrete backings — `&mut Context`
 // (module) and `PassBacking` (checked-out function pass) — each routing through
-// the backing's inherent `shared`/`read_host`.
+// the backing's inherent `shared`/`view`.
 impl<'s, 'str> WithCtx<'s, 's, 'str> for BaseRef<&mut Context<'str>, BlockId>
 where
     'str: 's,
@@ -634,23 +628,6 @@ where
         // A checked-out pass backing carries no `&Context`; shared-only reads go
         // through the host's `shr()`. Nothing on the pass path reaches this.
         panic!("whole-context read on a checked-out mutation ref: module-scope only")
-    }
-}
-
-impl<'s, 'str> WithHost<'s, 's, 'str> for BaseRef<&mut Context<'str>, BlockId>
-where
-    'str: 's,
-{
-    fn host(&'s self) -> HostRef<'s, 'str> {
-        self.ctx.read_host()
-    }
-}
-impl<'s, 'a, 'str> WithHost<'s, 's, 'str> for BaseRef<PassBacking<'a, 'str>, BlockId>
-where
-    'str: 's,
-{
-    fn host(&'s self) -> HostRef<'s, 'str> {
-        self.ctx.read_host()
     }
 }
 
@@ -713,7 +690,7 @@ macro_rules! impl_block_mut_verbs {
     pub fn rename_local(&mut self, name: Cow<'str, str>) -> crate::error::Result<()> {
         let old_name = self
             .ctx
-            .read_host()
+            .view()
             .block(self.id)
             .name
             .as_deref()

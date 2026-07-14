@@ -6,9 +6,9 @@ use crate::{
         LocalBlockId, LocalValueId, ModuleView, QCodeView, Value, ValueId,
         block::{BlockId, BlockRef},
         util::{
-            base_ref::{BaseRef, HostRef, WithCtx, WithCtxMut, WithHost},
-            host_mut::PassBacking,
+            base_ref::{BaseRef, WithCtx, WithCtxMut},
             named::{Named, Renameable, update_context_name},
+        host_mut::PassBacking,
         },
     },
 };
@@ -259,12 +259,6 @@ impl<'s, 'ctx: 's, 'str: 'ctx> WithCtx<'s, 'ctx, 'str> for BlockParamRef<'str, '
     }
 }
 
-impl<'s, 'ctx: 's, 'str: 'ctx> WithHost<'s, 'ctx, 'str> for BlockParamRef<'str, 'ctx> {
-    fn host(&'s self) -> HostRef<'ctx, 'str> {
-        HostRef::Module(self.view.context())
-    }
-}
-
 impl<'str: 'ctx, 'ctx, R> Named for BlockParamRef<'str, 'ctx, R>
 where
     R: QCodeView<'ctx, 'str>,
@@ -345,7 +339,7 @@ macro_rules! impl_param_mut_verbs {
     pub fn rename_local(&mut self, name: Cow<'str, str>) -> Result<()> {
         let old_name = self
             .ctx
-            .read_host()
+            .view()
             .block_param(self.id)
             .name
             .as_deref()
@@ -365,12 +359,6 @@ impl_param_mut_verbs!(<'a, 'str> PassBacking<'a, 'str>);
 impl<'s, 'ctx: 's, 'str: 'ctx> WithCtx<'s, 's, 'str> for BlockParamMutRef<'str, 'ctx> {
     fn ctx(&'s self) -> &'s Context<'str> {
         self.ctx
-    }
-}
-
-impl<'s, 'ctx: 's, 'str: 'ctx> WithHost<'s, 's, 'str> for BlockParamMutRef<'str, 'ctx> {
-    fn host(&'s self) -> HostRef<'s, 'str> {
-        HostRef::Module(self.ctx)
     }
 }
 

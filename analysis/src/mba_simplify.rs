@@ -48,7 +48,7 @@ use qcode::value::{
     BodyView, FunctionId, FunctionRef, InstructionRef, QCodeView, Value, ValueId, ValueRef,
     block::BlockId,
     insn::{Binary, Binop, InstructionId, IntBinop, Mnemonic, Unary, Unop},
-    util::host_mut::PassBacking,
+        util::host_mut::PassBacking,
 };
 
 use rumba_core::{

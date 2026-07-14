@@ -406,7 +406,7 @@ fn outline_core<'str>(
     slice: &[InstructionId],
     seed: impl for<'a> FnOnce(
         BodyView<'a, 'str>,
-        &mut qcode::value::util::host_mut::PassBacking<'a, 'str>,
+    &mut qcode::value::util::host_mut::PassBacking<'a, 'str>,
         BlockId,
     ) -> HashMap<ValueId, ValueId>,
 ) -> Option<Callee> {

@@ -265,7 +265,7 @@ fn build_index<'str, 'ctx, Ctx: BuilderBacking<'str>>(
         LaneIdx::Const(w) => b.shr().get_const(w as u64, 8),
         LaneIdx::Strided(idx, 0) => idx,
         LaneIdx::Strided(idx, od) => {
-            let ty = b.read_host().type_of(idx);
+            let ty = b.view().type_of(idx);
             let width = b.shr().types.size_of(ty);
             let mask = if width >= 8 {
                 u64::MAX

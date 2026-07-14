@@ -21,7 +21,7 @@ use crate::{
         block_param::{BlockParam, BlockParamId, LocalParamId},
         insn::{LocalInsnId, Mnemonic},
         util::{
-            base_ref::{BaseRef, HostRef, WithCtx, WithCtxMut, WithHost},
+            base_ref::{BaseRef, WithCtx, WithCtxMut},
             named::{Named, Renameable, update_context_name},
         },
     },
@@ -391,7 +391,7 @@ impl<'str> FunctionBody<'str> {
     // `func`-strip mechanical — after it, `id` *is* the local index and these
     // bodies are unchanged. These return raw `&`/`&mut` arena values; for the
     // wrapper-ref surface (`successors()`, `name()`, …) use the `*_ref`
-    // constructors on [`HostRef`] or a [`FunctionRef`].
+    // constructors on a [`QCodeView`] or a [`FunctionRef`].
 
     /// The block `id`, by its function-local index (see the note above).
     pub fn block(&self, id: BlockId) -> &BasicBlock<'str> {
@@ -473,8 +473,8 @@ impl<'str> FunctionBody<'str> {
     // 6). Each verb operates directly on this body's own arenas, reading shared
     // data (types for minting) through an explicit `&Context` where needed. These
     // are the algorithm bodies formerly living on the checked-out mutation path
-    // (`value::util::host_mut`), ported here with the routing indirection dropped:
-    // `self.function_mut(f)` collapses to `self`, `self.read_host()` to `self`'s
+    // (`value::util::pass_backing`), ported here with the routing indirection dropped:
+    // `self.function_mut(f)` collapses to `self`, `self.view()` to `self`'s
     // own arena accessors. The owning [`FunctionId`] comes from [`id`](Self::id).
 
     /// Push a fresh instruction into this body's arena, recording each operand's
@@ -1393,12 +1393,6 @@ impl<'s, 'ctx: 's, 'str: 'ctx> WithCtx<'s, 'ctx, 'str> for FunctionRef<'str, 'ct
     }
 }
 
-impl<'s, 'ctx: 's, 'str: 'ctx> WithHost<'s, 'ctx, 'str> for FunctionRef<'str, 'ctx> {
-    fn host(&'s self) -> HostRef<'ctx, 'str> {
-        HostRef::Module(self.view.context())
-    }
-}
-
 impl<'str: 'ctx, 'ctx, R> Named for FunctionRef<'str, 'ctx, R>
 where
     R: QCodeView<'ctx, 'str>,
@@ -1470,12 +1464,6 @@ impl<'s, 'ctx: 's, 'str: 'ctx> WithCtx<'s, 's, 'str> for FunctionMutRef<'str, 'c
 impl<'s, 'ctx: 's, 'str: 'ctx> WithCtxMut<'s, 'str> for FunctionMutRef<'str, 'ctx> {
     fn ctx_mut(&'s mut self) -> &'s mut Context<'str> {
         self.ctx
-    }
-}
-
-impl<'s, 'ctx: 's, 'str: 'ctx> WithHost<'s, 's, 'str> for FunctionMutRef<'str, 'ctx> {
-    fn host(&'s self) -> HostRef<'s, 'str> {
-        HostRef::Module(self.ctx)
     }
 }
 

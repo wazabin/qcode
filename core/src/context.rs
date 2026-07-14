@@ -11,13 +11,13 @@ use crate::{
     space::{Space, SpaceId},
     types::TypeManager,
     value::{
-        BasicBlock, BlockParamRef, FunctionBody, FunctionId, FunctionRef, Instruction, ValueId,
+        BasicBlock, BlockParamRef, FunctionBody, FunctionId, FunctionRef, Instruction, ModuleView,
+        QCodeView, ValueId,
         block::{BlockId, BlockRef, EdgeData, EdgeId},
         block_param::{BlockParam, BlockParamId},
         insn::{InstructionId, InstructionRef, Mnemonic, PCodeOpId},
         literal::{LiteralId, LiteralRef},
         registry::ValueRegistry,
-        util::base_ref::HostRef,
         varnode::{Varnode, VarnodeId, VarnodeRef, register::RegisterId},
     },
 };
@@ -1651,7 +1651,7 @@ impl<'str> Context<'str> {
     /// Like [`get_bytes`](Self::get_bytes) but stamps the blob with an explicit
     /// array/sequence [`TypeId`] instead of the default `Array(i8, len)`. Mints
     /// through the `&self` append path (no post-hoc `type_id` write), so a
-    /// checked-out function pass reading through a [`HostRef`] can materialize a
+    /// checked-out function pass reading through a [`BodyView`] can materialize a
     /// typed constant array without mutable access to the shared registry.
     pub fn get_typed_bytes(
         &self,
@@ -1855,15 +1855,15 @@ impl<'str> Context<'str> {
     // `function{,_mut}` alias the existing `body{,_mut}`.
 
     /// A `Copy` read view over the whole module (for the mutation refs' reads).
-    pub fn read_host(&self) -> HostRef<'_, 'str> {
-        HostRef::Module(self)
+    pub fn view(&self) -> ModuleView<'_, 'str> {
+        ModuleView::new(self)
     }
     /// The module's shared data (read) — returns `self`.
     pub fn shared(&self) -> &Context<'str> {
         self
     }
     /// The module's shared IR state ([`Shared`]) — the module-path twin of
-    /// [`HostRef::shr`]/[`PassBacking::shr`], so a `&mut Context` module walker and
+    /// [`ModuleView::shared`]/[`PassBacking::shr`], so a `&mut Context` module walker and
     /// a checked-out pass spell shared-data reads identically (context-split
     /// stage 5b-ii item #1).
     pub fn shr(&self) -> &Shared<'str> {
@@ -1879,20 +1879,20 @@ impl<'str> Context<'str> {
     }
 
     /// A read [`BlockRef`](crate::value::BlockRef) over `id`, module-routed.
-    pub fn block_ref(&self, id: BlockId) -> BlockRef<'str, '_, HostRef<'_, 'str>> {
-        self.read_host().block_ref(id)
+    pub fn block_ref(&self, id: BlockId) -> BlockRef<'str, '_, ModuleView<'_, 'str>> {
+        self.view().block_ref(id)
     }
     /// A read [`InstructionRef`] over `id`, module-routed.
-    pub fn insn_ref(&self, id: InstructionId) -> InstructionRef<'str, '_, HostRef<'_, 'str>> {
-        self.read_host().insn_ref(id)
+    pub fn insn_ref(&self, id: InstructionId) -> InstructionRef<'str, '_, ModuleView<'_, 'str>> {
+        self.view().insn_ref(id)
     }
     /// A read [`BlockParamRef`](crate::value::BlockParamRef) over `id`.
-    pub fn param_ref(&self, id: BlockParamId) -> BlockParamRef<'str, '_, HostRef<'_, 'str>> {
-        self.read_host().param_ref(id)
+    pub fn param_ref(&self, id: BlockParamId) -> BlockParamRef<'str, '_, ModuleView<'_, 'str>> {
+        self.view().param_ref(id)
     }
     /// A read [`FunctionRef`] over `id`, module-routed.
-    pub fn function_ref(&self, id: FunctionId) -> FunctionRef<'str, '_, HostRef<'_, 'str>> {
-        self.read_host().function_ref(id)
+    pub fn function_ref(&self, id: FunctionId) -> FunctionRef<'str, '_, ModuleView<'_, 'str>> {
+        self.view().function_ref(id)
     }
 
     /// Mint an `Int(size)`-typed instruction with `mnemonic` into `func`'s arena.
@@ -1925,7 +1925,7 @@ impl<'str> Context<'str> {
         insn: InstructionId,
     ) {
         let index = self
-            .read_host()
+            .view()
             .block(block)
             .instructions
             .iter()
@@ -1948,7 +1948,7 @@ impl<'str> Context<'str> {
     pub fn rehome_outgoing_edges(&mut self, keep: BlockId, remove: BlockId) {
         let func = keep.func;
         let outgoing: Vec<EdgeId> = {
-            let host = self.read_host();
+            let host = self.view();
             host.block(remove)
                 .edges
                 .iter()
@@ -1965,19 +1965,13 @@ impl<'str> Context<'str> {
 
     /// Remove `block` from its function, including its arena payload.
     pub fn delete_block(&mut self, block: BlockId, _function_id: FunctionId) {
-        let mut edges: Vec<EdgeId> = self
-            .read_host()
-            .block(block)
-            .edges
-            .iter()
-            .copied()
-            .collect();
+        let mut edges: Vec<EdgeId> = self.view().block(block).edges.iter().copied().collect();
         edges.sort_unstable();
         for edge in edges {
             self.remove_cfg_edge(block.func, edge);
         }
         let insns: Vec<InstructionId> = self
-            .read_host()
+            .view()
             .block(block)
             .instructions
             .iter()
@@ -1987,7 +1981,7 @@ impl<'str> Context<'str> {
             self.remove_instruction(insn);
         }
         let params: Vec<BlockParamId> = self
-            .read_host()
+            .view()
             .block(block)
             .params
             .iter()
@@ -2020,7 +2014,7 @@ impl<'str> Context<'str> {
             "cannot absorb across function arenas"
         );
         let (branch_id, branch_args) = {
-            let host = self.read_host();
+            let host = self.view();
             host.block(keep)
                 .instructions
                 .last()
@@ -2040,7 +2034,7 @@ impl<'str> Context<'str> {
                 .expect("absorbed block must be reached by keep's terminal branch")
         };
         let other_params: Vec<_> = self
-            .read_host()
+            .view()
             .block(other)
             .params
             .iter()
@@ -2068,7 +2062,7 @@ impl<'str> Context<'str> {
         self.block_mut(keep).instructions.extend(b_insns);
         self.rehome_outgoing_edges(keep, other);
         let (b_addr, b_extra, b_name) = {
-            let b = self.read_host().block(other);
+            let b = self.view().block(other);
             (
                 b.address,
                 b.extra_addresses.clone(),
@@ -2430,8 +2424,8 @@ mod tests {
     }
 
     #[test]
-    fn checked_host_reads_match_module_reads() {
-        use crate::value::{FunctionId, FunctionRef, util::base_ref::HostRef};
+    fn body_view_reads_match_module_reads() {
+        use crate::value::{BodyView, FunctionId, FunctionRef, ModuleView, QCodeView};
 
         let mut ctx = Context::new();
         qcode!(
@@ -2449,20 +2443,20 @@ mod tests {
         let fid = FunctionBody::from_name(&ctx, "foo").unwrap().id();
         let fid = ValueId::as_function(fid).unwrap();
 
-        // A structural snapshot read entirely through a `HostRef` — function name,
+        // A structural snapshot read entirely through a `QCodeView` — function name,
         // and per (address-then-index ordered) block: name, successor block names,
         // instruction opcodes, and param count. Both hosts route through the same
         // ref code, so equal snapshots prove the `Checked` routing.
         type Snap = (String, Vec<(String, Vec<String>, Vec<String>, usize)>);
-        fn snapshot(host: HostRef, fid: FunctionId) -> Snap {
-            let f = FunctionRef::new(host, fid);
+        fn snapshot<'a, 'str: 'a>(view: impl QCodeView<'a, 'str>, fid: FunctionId) -> Snap {
+            let f = FunctionRef::new(view, fid);
             let blocks = f
                 .blocks()
                 .map(|b| {
                     let name = b.name().unwrap_or("?").to_string();
                     let mut succ: Vec<String> = b
                         .successors()
-                        .map(|(_, s)| BlockRef::new(host, s).name().unwrap_or("?").to_string())
+                        .map(|(_, s)| BlockRef::new(view, s).name().unwrap_or("?").to_string())
                         .collect();
                     succ.sort();
                     let ops: Vec<String> =
@@ -2473,25 +2467,21 @@ mod tests {
             (f.name().to_string(), blocks)
         }
 
-        let module_snap = snapshot(HostRef::Module(&ctx), fid);
+        let module_snap = snapshot(ModuleView::new(&ctx), fid);
         assert!(!module_snap.1.is_empty(), "sanity: foo has blocks");
 
-        // A `Checked` host over the body borrowed in place must read identically to
+        // A `BodyView` over the body borrowed in place must read identically to
         // the module path — both route through the same ref code.
-        let checked = HostRef::Checked {
-            fun: &ctx.bodies[fid],
-            shared: &ctx.shared,
-            interfaces: &ctx.interfaces,
-        };
+        let checked = BodyView::new(&ctx.bodies[fid], &ctx.shared, &ctx.interfaces);
         let checked_snap = snapshot(checked, fid);
         assert_eq!(
             module_snap, checked_snap,
-            "reads through a Checked host must match the module reads"
+            "reads through BodyView must match the module reads"
         );
     }
 
     #[test]
-    fn checked_host_mut_matches_module_mut() {
+    fn pass_backing_mut_matches_module_mut() {
         use crate::value::{
             BlockParam, FunctionId, FunctionRef, InstructionId, Renameable,
             block::BlockId,

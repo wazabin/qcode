@@ -539,13 +539,6 @@ impl<'str, 'ctx> ValueRef<'str, 'ctx> {
     }
 }
 
-impl<'str: 'ctx, 'ctx> ValueRef<'str, 'ctx, crate::value::util::base_ref::HostRef<'ctx, 'str>> {
-    /// Transitional constructor for callers not yet migrated to a static view.
-    pub fn from_host(host: crate::value::util::base_ref::HostRef<'ctx, 'str>, id: ValueId) -> Self {
-        Self::from_view(host, id)
-    }
-}
-
 impl<'str: 'ctx, 'ctx, R> ValueRef<'str, 'ctx, R>
 where
     R: QCodeView<'ctx, 'str>,
@@ -598,8 +591,8 @@ where
         //
         // Shared-leaf refs (literal, bytes, varnode) carry only a `&Shared`, so
         // they render through the `&Shared` token path; the arena-cluster refs
-        // route their `HostRef` back to the whole `&Context` (context-split
-        // stage 5b-ii item #1).
+        // route reads through their static `QCodeView` provider (context-split
+        // Pin B).
         let tokens = match self {
             ValueRef::Literal(r) => insn::segment::value_tokens_shared(r.ctx, self.id()),
             ValueRef::Bytes(r) => insn::segment::value_tokens_shared(r.ctx, self.id()),
