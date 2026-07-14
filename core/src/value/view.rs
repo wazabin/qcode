@@ -252,7 +252,7 @@ mod tests {
         context::Context,
         space::{LocalMemorySpaceId, MemorySpaceId},
         value::{
-            BasicBlock, FunctionBody, Temp, TempSpace, ValueId, ValueRef,
+            BasicBlock, FunctionBody, LocalValueId, Temp, TempSpace, ValueId, ValueRef,
             insn::{InstructionRef, Load, Mnemonic, Unary, Unop},
         },
     };
@@ -367,6 +367,34 @@ mod tests {
         assert_eq!(view.temp_space_ref(space).name(), Some("local"));
         assert_eq!(view.temp_ref(temp).address(), 0x30);
         assert_eq!(view.temp_ref(temp).space().id, space);
+    }
+
+    #[test]
+    fn temporary_names_are_body_local_and_qualified_at_lookup() {
+        let mut ctx = Context::new();
+        let first = FunctionBody::make(&mut ctx, "first".into()).unwrap().id;
+        let second = FunctionBody::make(&mut ctx, "second".into()).unwrap().id;
+        let first_space = ctx.bodies[first].push_temp_space(TempSpace::new(None, 1, 8));
+        let second_space = ctx.bodies[second].push_temp_space(TempSpace::new(None, 1, 8));
+        let first_temp = ctx.bodies[first]
+            .push_temp(Temp::new(0x20, 4, first_space.local).with_name("scratch".into()));
+        let second_temp = ctx.bodies[second]
+            .push_temp(Temp::new(0x20, 4, second_space.local).with_name("scratch".into()));
+
+        assert_eq!(first_temp.local, second_temp.local);
+        assert_eq!(
+            ctx.bodies[first].names.get("scratch"),
+            Some(LocalValueId::Temp(first_temp.local))
+        );
+        assert_eq!(
+            FunctionBody::from_id(&ctx, first).local_named("scratch"),
+            Some(ValueId::Temp(first_temp))
+        );
+        assert_eq!(
+            FunctionBody::from_id(&ctx, second).local_named("scratch"),
+            Some(ValueId::Temp(second_temp))
+        );
+        assert_eq!(ctx.get_named("scratch"), None);
     }
 
     #[test]

@@ -8,7 +8,7 @@ use rustc_hash::{FxHashMap, FxHashSet};
 
 use crate::{
     context::Context,
-    value::{BlockId, BlockParamId, InstructionId, LocalValueId, ValueId, insn::Mnemonic},
+    value::{BlockId, BlockParamId, InstructionId, LocalValueId, insn::Mnemonic},
 };
 
 /// Validate the ownership and cross-reference invariants of every function
@@ -273,10 +273,10 @@ pub fn verify_body_arena_integrity(ctx: &Context<'_>) -> Vec<String> {
 
         for (name, value) in body.names.entries() {
             let live = match value {
-                ValueId::BasicBlock(id) => id.func == fid && live_blocks.contains(&id.local),
-                ValueId::Instruction(id) => id.func == fid && live_insns.contains(&id.local),
-                ValueId::BlockParam(id) => id.func == fid && live_params.contains(&id.local),
-                ValueId::Temp(id) => id.func == fid && usize::from(id.local) < body.temps.len(),
+                LocalValueId::BasicBlock(id) => live_blocks.contains(&id),
+                LocalValueId::Instruction(id) => live_insns.contains(&id),
+                LocalValueId::BlockParam(id) => live_params.contains(&id),
+                LocalValueId::Temp(id) => usize::from(id) < body.temps.len(),
                 _ => false,
             };
             if !live {
@@ -337,7 +337,7 @@ mod tests {
     use qcode_macro::qcode;
 
     use super::*;
-    use crate::value::{BasicBlock, FunctionBody, LocalTempSpaceId, Temp};
+    use crate::value::{BasicBlock, FunctionBody, LocalTempSpaceId, Temp, ValueId};
 
     fn fixture() -> Context<'static> {
         let mut ctx = Context::new();
@@ -538,7 +538,7 @@ mod tests {
             .names
             .register(
                 Cow::Borrowed("stale"),
-                ValueId::BasicBlock(dead_block),
+                ValueId::BasicBlock(dead_block).localize(f),
                 None,
             )
             .expect("register corruption fixture");

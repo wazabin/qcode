@@ -8,7 +8,7 @@ use std::{borrow::Cow, fmt::Display, marker::PhantomData};
 
 use jstd::Identifier;
 
-use crate::value::{ModuleView, QCodeView, Value, ValueId};
+use crate::value::{ModuleView, QCodeView, Value, ValueId, util::named::Named};
 
 /// Function-local temporary-space index.
 #[derive(Identifier)]
@@ -59,6 +59,13 @@ impl<'str> Temp<'str> {
             size,
             space,
         }
+    }
+
+    /// Attaches the function-local name registered when this temporary is
+    /// inserted into its owning body.
+    pub fn with_name(mut self, name: Cow<'str, str>) -> Self {
+        self.name = Some(name);
+        self
     }
 }
 
@@ -176,6 +183,15 @@ where
         } else {
             write!(f, "[{}]:{} {}", self.space(), self.size(), self.address())
         }
+    }
+}
+
+impl<'str: 'ctx, 'ctx, R> Named for TempRef<'str, 'ctx, R>
+where
+    R: QCodeView<'ctx, 'str>,
+{
+    fn name(&self) -> Option<&str> {
+        TempRef::name(*self)
     }
 }
 

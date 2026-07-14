@@ -11,7 +11,7 @@ pub trait Named {
 }
 
 /// Attempts to set the name in the reverse name table that owns `id`'s kind
-/// (function-local for block/instruction/param, global otherwise).
+/// (function-local for block/instruction/param/Temp, global otherwise).
 pub fn update_context_name<'str>(
     id: ValueId,
     ctx: &mut Context<'str>,

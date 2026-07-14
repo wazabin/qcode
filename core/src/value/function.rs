@@ -123,14 +123,15 @@ pub struct FunctionBody<'str> {
     /// raw disassembly view can be reconstructed regardless of CFG changes.
     pub instruction_addrs: BTreeSet<u64>,
 
-    /// Function-local name table for this function's block, instruction, and
-    /// block-param names (ruling 1 of the parallel-passes plan). Keeping these
-    /// out of the global [`name_map`](crate::context::Context) lets two functions
-    /// name values independently — a prerequisite for parallel function passes.
+    /// Function-local name table for this function's block, instruction,
+    /// block-param, and Temp names (ruling 1 of the parallel-passes plan).
+    /// Keeping these out of the global [`name_map`](crate::context::Context)
+    /// lets two functions name values independently — a prerequisite for
+    /// parallel function passes.
     /// A value's own `name` field is the source of truth for rendering; this only
     /// enforces uniqueness and resolves names within the function.
     #[serde(default)]
-    pub(crate) names: crate::context::NameTable<'str>,
+    pub(crate) names: crate::context::NameTable<'str, LocalValueId>,
 
     /// Reverse use-def map, scoped to this function: for each [`ValueId`] the
     /// list of *this function's* instructions that use it as an operand. By the
@@ -293,7 +294,6 @@ impl<'str> FunctionBody<'str> {
             edge.from.func = to;
             edge.to.func = to;
         }
-        self.names.rebind_function(from, to);
         self.id = to;
     }
 
@@ -466,7 +466,20 @@ impl<'str> FunctionBody<'str> {
             usize::from(temp.space) < self.temp_spaces.len(),
             "temporary references a missing local space"
         );
-        TempId::new(self.id, self.temps.push(temp))
+        let name = temp.name.clone();
+        if let Some(name) = &name {
+            assert!(
+                !self.names.contains(name),
+                "temporary name {name:?} is already registered in this function"
+            );
+        }
+        let local = self.temps.push(temp);
+        if let Some(name) = name {
+            self.names
+                .register(name, LocalValueId::Temp(local), None)
+                .expect("temporary name was checked before insertion");
+        }
+        TempId::new(self.id, local)
     }
 
     /// Resolves a qualified temporary-space ID against this body.
@@ -894,7 +907,7 @@ impl<'str> FunctionBody<'str> {
         old_name: Option<&str>,
     ) -> Result<()> {
         let existing = match id.name_scope_function() {
-            Some(_) => self.names.get(&name),
+            Some(_) => self.names.get(&name).map(|id| id.qualify(self.id)),
             None => shared.get_named(&name),
         };
         if let Some(existing) = existing {
@@ -905,7 +918,7 @@ impl<'str> FunctionBody<'str> {
             };
         }
         match id.name_scope_function() {
-            Some(_) => self.names.register(name, id, old_name),
+            Some(_) => self.names.register(name, id.localize(self.id), old_name),
             None => {
                 unimplemented!(
                     "a function body cannot register a global name (shared is read-only)"
@@ -1103,10 +1116,10 @@ where
         })
     }
 
-    /// Resolve a block/instruction/param `name` within this function's local name
+    /// Resolve a block/instruction/param/Temp `name` within this function's local name
     /// table (see [`FunctionBody::names`]). `None` if this function has no such name.
     pub fn local_named(&'s self, name: &str) -> Option<ValueId> {
-        self.inner().names.get(name)
+        self.inner().names.get(name).map(|id| id.qualify(self.id))
     }
 
     /// Whether this function's full register effect is captured by its call

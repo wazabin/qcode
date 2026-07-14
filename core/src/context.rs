@@ -130,7 +130,7 @@ pub struct Shared<'str> {
 
     /// Global reverse name map for module-scoped values (functions, varnodes,
     /// spaces, p-code ops, byte blobs), used to keep their name hints unique and
-    /// resolve them by name. Block/instruction/param names are **not** here — they
+    /// resolve them by name. Block/instruction/param/Temp names are **not** here — they
     /// live in each [`FunctionBody`](crate::value::FunctionBody)'s own [`NameTable`], so
     /// those namespaces stay independent across functions (see [`NameTable`]).
     pub(crate) name_map: NameTable<'str>,
@@ -2093,7 +2093,7 @@ impl<'str> Context<'str> {
     }
 
     /// Register `name` for `id` in the table that owns its kind (function-local
-    /// for block/insn/param, global otherwise).
+    /// for block/insn/param/Temp, global otherwise).
     pub fn register_local_name(
         &mut self,
         id: ValueId,
@@ -2101,7 +2101,11 @@ impl<'str> Context<'str> {
         old_name: Option<&str>,
     ) -> Result<()> {
         let existing = match id.name_scope_function() {
-            Some(func) => self.function(func).names.get(&name),
+            Some(func) => self
+                .function(func)
+                .names
+                .get(&name)
+                .map(|id| id.qualify(func)),
             None => self.get_named(&name),
         };
         if let Some(existing) = existing {
@@ -2112,7 +2116,10 @@ impl<'str> Context<'str> {
             };
         }
         match id.name_scope_function() {
-            Some(func) => self.function_mut(func).names.register(name, id, old_name),
+            Some(func) => self
+                .function_mut(func)
+                .names
+                .register(name, id.localize(func), old_name),
             None => self.update_name(name, id, old_name),
         }
     }
@@ -2133,7 +2140,7 @@ impl<'str> Context<'str> {
     }
 
     /// Changes the name of a value, in the name table that owns its kind
-    /// (function-local for block/instruction/param, global otherwise).
+    /// (function-local for block/instruction/param/Temp, global otherwise).
     pub fn update_name(
         &mut self,
         name: Cow<'str, str>,
@@ -2141,18 +2148,20 @@ impl<'str> Context<'str> {
         old_name: Option<&str>,
     ) -> Result<()> {
         match id.name_scope_function() {
-            Some(func) => self.bodies[func].names.register(name, id, old_name),
+            Some(func) => self.bodies[func]
+                .names
+                .register(name, id.localize(func), old_name),
             None => self.shared.name_map.register(name, id, old_name),
         }
     }
 
     /// Resolve `name` in the table that owns `id`'s kind (function-local for
-    /// block/instruction/param, global otherwise). Used by the rename path to
+    /// block/instruction/param/Temp, global otherwise). Used by the rename path to
     /// check for a conflict in the correct namespace, and by passes that mint a
     /// unique name for a known SSA value.
     pub fn get_named_in_scope(&self, id: ValueId, name: &str) -> Option<ValueId> {
         match id.name_scope_function() {
-            Some(func) => self.bodies[func].names.get(name),
+            Some(func) => self.bodies[func].names.get(name).map(|id| id.qualify(func)),
             None => self.shared.name_map.get(name),
         }
     }
@@ -2162,7 +2171,7 @@ impl<'str> Context<'str> {
     /// so the freed suffix is reconsidered on the next call (a naive first-free
     /// scan would reuse it, and the hint must not skip it). Un-suffixed names are
     /// Attempts to get a value ID by its *global* name (function/varnode/space/
-    /// p-code/bytes). Block/instruction/param names are function-scoped and are
+    /// p-code/bytes). Block/instruction/param/Temp names are function-scoped and are
     /// resolved through their owning [`FunctionBody`] (see [`NameTable`]); this
     /// returns `None` for them.
     pub fn get_named(&self, name: &str) -> Option<ValueId> {
@@ -2170,7 +2179,7 @@ impl<'str> Context<'str> {
     }
 
     /// Gets a unique **global** name (functions, varnodes, spaces, …), appending
-    /// a numeric suffix until free. For a block/instruction/param name, use
+    /// a numeric suffix until free. For a block/instruction/param/Temp name, use
     /// [`get_unique_name_in`](Self::get_unique_name_in) so uniqueness is checked
     /// against the owning function's table.
     pub fn get_unique_name(&mut self, name: Cow<'str, str>) -> Cow<'str, str> {
@@ -2178,7 +2187,7 @@ impl<'str> Context<'str> {
     }
 
     /// Gets a unique name within `func`'s function-local name table (for block,
-    /// instruction, and block-param names). Two functions may thus reuse the same
+    /// instruction, block-param, and Temp names). Two functions may thus reuse the same
     /// name independently.
     pub fn get_unique_name_in(&mut self, func: FunctionId, name: Cow<'str, str>) -> Cow<'str, str> {
         self.bodies[func].names.unique(name)
@@ -2189,16 +2198,16 @@ impl<'str> Context<'str> {
 ///
 /// The context keeps one **global** table for module-scoped values (functions,
 /// varnodes, spaces, p-code ops, byte blobs); each [`FunctionBody`](crate::value::FunctionBody)
-/// keeps its **own** table for its block/instruction/param names. Keeping those
+/// keeps its **own** table for its block/instruction/param/Temp names. Keeping those
 /// namespaces independent is a prerequisite for running function passes in
 /// parallel: a worker mints names against its function's table with no global
 /// lock and no cross-function collisions. Two functions may each name a block
 /// `loop` — they render correctly because a value's own `name` field is the
 /// source of truth; this table only enforces uniqueness and resolves by name.
-#[derive(Clone, Default, serde::Serialize, serde::Deserialize)]
-pub struct NameTable<'str> {
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
+pub struct NameTable<'str, Id = ValueId> {
     /// name → the value that holds it.
-    map: HashMap<Cow<'str, str>, ValueId>,
+    map: HashMap<Cow<'str, str>, Id>,
     /// Per-base "next suffix to try" lower-bound hints for [`unique`](Self::unique),
     /// so probing resumes instead of rescanning from `0`. A derived cache: rides
     /// through `clone` but is not serialized (see [`Context::get_unique_name`]).
@@ -2206,33 +2215,22 @@ pub struct NameTable<'str> {
     suffix_hint: HashMap<String, u32>,
 }
 
-impl<'str> NameTable<'str> {
-    pub(crate) fn entries(&self) -> impl Iterator<Item = (&str, ValueId)> + '_ {
+impl<Id> Default for NameTable<'_, Id> {
+    fn default() -> Self {
+        Self {
+            map: HashMap::default(),
+            suffix_hint: HashMap::default(),
+        }
+    }
+}
+
+impl<'str, Id: Copy + Eq> NameTable<'str, Id> {
+    pub(crate) fn entries(&self) -> impl Iterator<Item = (&str, Id)> + '_ {
         self.map.iter().map(|(name, &value)| (name.as_ref(), value))
     }
 
-    /// Rebind function-qualified values after a detached function body built
-    /// under `from` is installed under `to`. Function-local storage itself uses
-    /// local IDs; only this reverse lookup metadata carries the ambient owner.
-    pub(crate) fn rebind_function(&mut self, from: FunctionId, to: FunctionId) {
-        for value in self.map.values_mut() {
-            *value = match *value {
-                ValueId::Instruction(id) if id.func == from => {
-                    ValueId::Instruction(InstructionId::new(to, id.local))
-                }
-                ValueId::BasicBlock(id) if id.func == from => {
-                    ValueId::BasicBlock(BlockId::new(to, id.local))
-                }
-                ValueId::BlockParam(id) if id.func == from => {
-                    ValueId::BlockParam(BlockParamId::new(to, id.local))
-                }
-                other => other,
-            };
-        }
-    }
-
     /// The value currently holding `name`, if any.
-    pub fn get(&self, name: &str) -> Option<ValueId> {
+    pub fn get(&self, name: &str) -> Option<Id> {
         self.map.get(name).copied()
     }
 
@@ -2244,12 +2242,7 @@ impl<'str> NameTable<'str> {
     /// Register `name` for `id`, forgetting `old_name` first. Errors if `name`
     /// is already taken (callers pre-check via [`get`](Self::get), so this only
     /// fires defensively).
-    pub fn register(
-        &mut self,
-        name: Cow<'str, str>,
-        id: ValueId,
-        old_name: Option<&str>,
-    ) -> Result<()> {
+    pub fn register(&mut self, name: Cow<'str, str>, id: Id, old_name: Option<&str>) -> Result<()> {
         if let Some(old_name) = old_name {
             self.forget(old_name);
         }

@@ -534,7 +534,11 @@ impl<'a, 'str> PassBacking<'a, 'str> {
         old_name: Option<&str>,
     ) -> Result<()> {
         let existing = match id.name_scope_function() {
-            Some(func) => self.function(func).names.get(&name),
+            Some(func) => self
+                .function(func)
+                .names
+                .get(&name)
+                .map(|id| id.qualify(func)),
             None => self.shr().get_named(&name),
         };
         if let Some(existing) = existing {
@@ -545,7 +549,10 @@ impl<'a, 'str> PassBacking<'a, 'str> {
             };
         }
         match id.name_scope_function() {
-            Some(func) => self.function_mut(func).names.register(name, id, old_name),
+            Some(func) => self
+                .function_mut(func)
+                .names
+                .register(name, id.localize(func), old_name),
             None => {
                 unimplemented!("a checked-out host has read-only shared access (mints via &self)")
             }

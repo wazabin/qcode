@@ -96,7 +96,7 @@ pub trait BuilderBacking<'str> {
     fn bb_instruction_mut(&mut self, id: InstructionId) -> &mut Instruction<'str>;
     /// The block `id`, routed to its owning function's arena (write).
     fn bb_block_mut(&mut self, id: BlockId) -> &mut BasicBlock<'str>;
-    /// Register a function-local (block/instruction/param) or global name.
+    /// Register a function-local (block/instruction/param/Temp) or global name.
     fn bb_register_local_name(
         &mut self,
         id: ValueId,
@@ -167,7 +167,10 @@ impl<'str> BuilderBacking<'str> for &mut Context<'str> {
     ) -> crate::error::Result<()> {
         use crate::error::{Error, ErrorTy};
         let existing = match id.name_scope_function() {
-            Some(func) => self.bodies[func].names.get(&name),
+            Some(func) => self.bodies[func]
+                .names
+                .get(&name)
+                .map(|id| id.qualify(func)),
             None => self.get_named(&name),
         };
         if let Some(existing) = existing {
@@ -178,7 +181,9 @@ impl<'str> BuilderBacking<'str> for &mut Context<'str> {
             };
         }
         match id.name_scope_function() {
-            Some(func) => self.bodies[func].names.register(name, id, old),
+            Some(func) => self.bodies[func]
+                .names
+                .register(name, id.localize(func), old),
             None => self.update_name(name, id, old),
         }
     }

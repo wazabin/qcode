@@ -34,8 +34,8 @@ use super::PipelineEnv;
 /// `slot` is the pass-local [`Callee::Minted`] index used by the owner's IR;
 /// it is not a reserved registry ID. `ambient` is the owner's installed ID,
 /// borrowed temporarily while building the detached body's checked refs. The
-/// body stores local IR IDs, so installation only rebinds block ownership and
-/// local-name metadata through [`FunctionBody::rebind_ambient_id`].
+/// body stores local IR IDs, so installation only rebinds block ownership
+/// through [`FunctionBody::rebind_ambient_id`].
 pub struct Minted<'str> {
     slot: u32,
     ambient: FunctionId,
