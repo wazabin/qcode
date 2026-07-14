@@ -3,6 +3,7 @@
 //! backs them, and the clobbered-register computation.
 
 mod argpromote;
+mod call_graph;
 mod carried_array;
 mod clobbered;
 mod dead_signature;
@@ -23,6 +24,7 @@ pub use argpromote::{
     RegPurityGates, RegPurityReason, argpromote, argpromote_registers, mark_pure_functions,
     reg_purity,
 };
+pub use call_graph::{CallEdge, CallEdgeId, CallGraph, CallKind, CallTarget};
 pub use clobbered::{compute_clobbered_regs, set_clobbered_regs};
 pub use dead_signature::dead_signature;
 pub use interface::{append_caller_arg, append_entry_param, remove_entry_param};

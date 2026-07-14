@@ -10,10 +10,11 @@ pub mod stack;
 
 pub mod calls;
 pub use calls::{
-    append_caller_arg, append_entry_param, argpromote, argpromote_registers,
-    compute_call_clobbered_regs, compute_clobbered_regs, compute_input_regs, compute_stack_delta,
-    learn_stack_facts, remove_entry_param, seed_stack_facts, set_all_call_clobbered_regs,
-    set_all_function_summaries, set_all_written_spaces, set_clobbered_regs, set_function_summaries,
+    CallEdge, CallEdgeId, CallGraph, CallKind, CallTarget, append_caller_arg, append_entry_param,
+    argpromote, argpromote_registers, compute_call_clobbered_regs, compute_clobbered_regs,
+    compute_input_regs, compute_stack_delta, learn_stack_facts, remove_entry_param,
+    seed_stack_facts, set_all_call_clobbered_regs, set_all_function_summaries,
+    set_all_written_spaces, set_clobbered_regs, set_function_summaries,
 };
 
 pub mod cfg;
