@@ -19,11 +19,10 @@ use super::affine::Numbering;
 
 use qcode::context::Context;
 use qcode::value::{
-    ValueId,
+    ModuleView, QCodeView, ValueId,
     block::BlockId,
     function::FunctionId,
     insn::{InstructionId, Mnemonic},
-    util::base_ref::HostRef,
 };
 
 /// What a sub-pass did with an instruction.
@@ -278,7 +277,7 @@ impl<'str> Walk<'_, 'str> {
             // function's own walk. Keyed on ownership (`parent`), not storage
             // (`id.func`), so a reattributed own block (owner == walked function,
             // stored elsewhere) is still descended into.
-            if host.read_host().block(child).parent == Some(self.owner) {
+            if ModuleView::new(&*host).block(child).parent == Some(self.owner) {
                 self.rec(host, child, &states);
             }
         }
@@ -289,8 +288,8 @@ impl<'str> Walk<'_, 'str> {
 /// **confined to `owner`'s own blocks**: a cross-function successor edge is not
 /// crossed, so the reachable set — and every walk seeded from it — stays inside
 /// the function being optimized.
-fn reachable_from<'str>(
-    host: HostRef<'_, 'str>,
+fn reachable_from<'ctx, 'str: 'ctx>(
+    host: impl QCodeView<'ctx, 'str>,
     entry: BlockId,
     owner: FunctionId,
 ) -> HashSet<BlockId> {
@@ -336,7 +335,7 @@ pub(super) fn run_dominator_walk<'str>(
         None => return false,
     };
 
-    let root_reachable = reachable_from(host.read_host(), root, func_id);
+    let root_reachable = reachable_from(ModuleView::new(&*host), root, func_id);
     let entries: Vec<BlockId> = host
         .function_ref(func_id)
         .iter()
@@ -347,7 +346,7 @@ pub(super) fn run_dominator_walk<'str>(
 
     let mut seen_count: HashMap<BlockId, u32> = HashMap::default();
     for &entry in std::iter::once(&root).chain(&entries) {
-        for block in reachable_from(host.read_host(), entry, func_id) {
+        for block in reachable_from(ModuleView::new(&*host), entry, func_id) {
             *seen_count.entry(block).or_default() += 1;
         }
     }
@@ -358,7 +357,7 @@ pub(super) fn run_dominator_walk<'str>(
 
     // Function-wide affine views, computed once and shared read-only with every
     // entry's walk (a value's arithmetic view is dominance-independent).
-    let numbering = super::affine::precompute_forms(host.read_host(), func_id);
+    let numbering = super::affine::precompute_forms(ModuleView::new(&*host), func_id);
 
     let mut changed = false;
     for entry in std::iter::once(root).chain(entries) {
@@ -389,7 +388,7 @@ pub(super) fn run_dominator_walk<'str>(
 //
 // These concrete twins drive the *function-pass* GVN chain over a checked-out
 // `(&mut FunctionBody, ContextView)` with no threaded mutation host: reads route
-// through `cx.read_host(body)`, shallow rewrites through the inherent
+// through `cx.body_view(body)`, shallow rewrites through the inherent
 // `body.verb(cx, …)` surface (via `Editor`'s `_c` methods). The large shared
 // mutation helpers (`materialize`, `MemForward::{record_store,try_load}`,
 // `narrow_to`, `simplify_bitwise`/`simplify_compare`) are still reached through a
@@ -423,7 +422,7 @@ impl Editor {
         mnemonic: Mnemonic,
         size: usize,
     ) -> InstructionId {
-        let type_id = cx.read_host(body).shr().types.get_or_make_int(size);
+        let type_id = cx.body_view(body).shared().types.get_or_make_int(size);
         self.replace_with_new_insn_typed_c(body, cx, block_id, at, mnemonic, type_id)
     }
 
@@ -539,11 +538,11 @@ fn run_block_c<'str>(
     numbering: &Numbering,
 ) -> bool {
     let mut ed = Editor::new();
-    let insns: Vec<InstructionId> = cx.read_host(body).block_ref(block_id).instruction_ids();
+    let insns: Vec<InstructionId> = cx.body_view(body).block_ref(block_id).instruction_ids();
 
     for insn_id in insns {
         let (id, size, mnemonic) = {
-            let insn = cx.read_host(body).insn_ref(insn_id);
+            let insn = cx.body_view(body).insn_ref(insn_id);
             (insn.id(), insn.size(), insn.mnemonic().clone())
         };
         let ic = InsnCtx {
@@ -590,7 +589,7 @@ pub(super) fn run_flat_fixpoint_c<'str>(
     passes: &[Box<dyn SubPassC<'str>>],
 ) -> bool {
     let block_ids: Vec<BlockId> = cx
-        .read_host(body)
+        .body_view(body)
         .function_ref(func_id)
         .iter()
         .map(|block| block.id)
@@ -665,7 +664,7 @@ impl<'str> WalkC<'_, 'str> {
             );
         }
         for &child in self.tree.children_of(block_id) {
-            if cx.read_host(body).block(child).parent == Some(self.owner) {
+            if cx.body_view(body).block(child).parent == Some(self.owner) {
                 self.rec(body, cx, child, &states);
             }
         }
@@ -680,14 +679,14 @@ pub(super) fn run_dominator_walk_c<'str>(
     passes: &[Box<dyn SubPassC<'str>>],
     aliases: Option<&AliasResult>,
 ) -> bool {
-    let root = match cx.read_host(body).function_ref(func_id).root() {
+    let root = match cx.body_view(body).function_ref(func_id).root() {
         Some(r) => r.id,
         None => return false,
     };
 
-    let root_reachable = reachable_from(cx.read_host(body), root, func_id);
+    let root_reachable = reachable_from(cx.body_view(body), root, func_id);
     let entries: Vec<BlockId> = cx
-        .read_host(body)
+        .body_view(body)
         .function_ref(func_id)
         .iter()
         .filter(|block| !root_reachable.contains(&block.id))
@@ -697,7 +696,7 @@ pub(super) fn run_dominator_walk_c<'str>(
 
     let mut seen_count: HashMap<BlockId, u32> = HashMap::default();
     for &entry in std::iter::once(&root).chain(&entries) {
-        for block in reachable_from(cx.read_host(body), entry, func_id) {
+        for block in reachable_from(cx.body_view(body), entry, func_id) {
             *seen_count.entry(block).or_default() += 1;
         }
     }
@@ -706,11 +705,11 @@ pub(super) fn run_dominator_walk_c<'str>(
         .filter_map(|(block, count)| (count > 1).then_some(block))
         .collect();
 
-    let numbering = super::affine::precompute_forms(cx.read_host(body), func_id);
+    let numbering = super::affine::precompute_forms(cx.body_view(body), func_id);
 
     let mut changed = false;
     for entry in std::iter::once(root).chain(entries) {
-        let tree = compute_dominators(&cx.read_host(body).function_ref(entry.func), entry);
+        let tree = compute_dominators(&cx.body_view(body).function_ref(entry.func), entry);
         let mut walk = WalkC {
             passes,
             tree: &tree,
