@@ -23,7 +23,7 @@
 
 use qcode::{
     builder::{Builder, BuilderBacking},
-    space::{Space, SpaceId, SpaceType},
+    space::{LocalMemorySpaceId, Space, SpaceId, SpaceType},
     types::TypeId,
     value::{
         FunctionId, QCodeView, ValueId,
@@ -93,8 +93,14 @@ fn try_match<'a, 'str: 'a>(host: impl QCodeView<'a, 'str>, fid: FunctionId) -> O
     }
 
     // Collect every access in an argpromote shadow (`Temporary`) space.
-    let is_temp =
-        |sp: SpaceId| matches!(Space::from_id(host.shared(), sp).ty, SpaceType::Temporary);
+    let is_temp = |sp: LocalMemorySpaceId| match sp {
+        LocalMemorySpaceId::Shared(sp) => {
+            matches!(Space::from_id(host.shared(), sp).ty, SpaceType::Temporary)
+        }
+        // This pass still records its candidate region as a shared `SpaceId`.
+        // Body-local regions are left for the later consumer-migration commit.
+        LocalMemorySpaceId::Temp(_) => false,
+    };
     let mut accesses: Vec<Acc> = Vec::new();
     for block in host.function_ref(fid).iter() {
         for insn in block.iter() {
@@ -103,14 +109,14 @@ fn try_match<'a, 'str: 'a>(host: impl QCodeView<'a, 'str>, fid: FunctionId) -> O
                     id: insn.id,
                     ptr: l.ptr.qualify(insn.id.func),
                     size: l.size,
-                    space: l.space,
+                    space: l.space.expect_shared(),
                     stored: None,
                 }),
                 Mnemonic::Store(s) if is_temp(s.space) => accesses.push(Acc {
                     id: insn.id,
                     ptr: s.ptr.qualify(insn.id.func),
                     size: s.size,
-                    space: s.space,
+                    space: s.space.expect_shared(),
                     stored: Some(s.src.qualify(insn.id.func)),
                 }),
                 _ => {}
@@ -393,7 +399,7 @@ mod tests {
             .flat_map(|blk| blk.iter())
             .filter(|i| {
                 matches!(i.mnemonic(), Mnemonic::Load(l)
-                    if matches!(Space::from_id(ctx, l.space).ty, SpaceType::Temporary))
+                    if l.space.shared().is_some_and(|space| matches!(Space::from_id(ctx, space).ty, SpaceType::Temporary)))
             })
             .count()
     }

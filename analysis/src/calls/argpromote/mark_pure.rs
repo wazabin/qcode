@@ -1,5 +1,6 @@
 use qcode::{
     context::Context,
+    space::{LocalMemorySpaceId, Space, SpaceType},
     value::{FunctionBody, FunctionId, insn::Mnemonic},
 };
 
@@ -67,16 +68,19 @@ pub(crate) fn body_is_pure(ctx: &Context, fid: FunctionId) -> bool {
 }
 
 fn mnemonic_is_pure(ctx: &Context, m: &Mnemonic) -> bool {
+    let is_temp = |space| match space {
+        LocalMemorySpaceId::Shared(space) => {
+            matches!(Space::from_id(ctx, space).ty, SpaceType::Temporary)
+        }
+        LocalMemorySpaceId::Temp(_) => true,
+    };
     match m {
         // A load from a temporary (shadow) space is private to the function —
         // argpromote seeds it from inputs — so it is a deterministic value of the
         // params, not an untracked source. A dynamic-index region loop leaves such
         // loads permanently (they cannot be forwarded away like constant-offset
         // ones), so exempting them is what lets a region-promoted function be pure.
-        Mnemonic::Load(l) => matches!(
-            qcode::space::Space::from_id(ctx, l.space).ty,
-            qcode::space::SpaceType::Temporary
-        ),
+        Mnemonic::Load(l) => is_temp(l.space),
         Mnemonic::CallInd(_) | Mnemonic::BranchInd(_) | Mnemonic::PCodeOp(_) => false,
         // A map is pure exactly when its per-element body is pure. The body is a
         // symbol, not an operand, so the generic varnode check below cannot see it.
@@ -108,10 +112,7 @@ fn mnemonic_is_pure(ctx: &Context, m: &Mnemonic) -> bool {
         // function impure: marking it pure would let the dead-pure-call sweep
         // (`dce::remove_dead_pure_call`) delete the call when its return is unused,
         // dropping that store. Symmetric with the `Load` arm above.
-        Mnemonic::Store(s) => matches!(
-            qcode::space::Space::from_id(ctx, s.space).ty,
-            qcode::space::SpaceType::Temporary
-        ),
+        Mnemonic::Store(s) => is_temp(s.space),
         // Every other op is a value computation or structured control flow; it is
         // pure as long as it reads no raw varnode (un-promoted register/global).
         _ => m

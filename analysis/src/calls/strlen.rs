@@ -19,7 +19,7 @@ use rustc_hash::FxHashSet as HashSet;
 
 use qcode::{
     builder::Builder,
-    space::{Space, SpaceId, SpaceType},
+    space::{LocalMemorySpaceId, Space, SpaceType},
     value::{
         BlockId, FunctionId, QCodeView, ValueId,
         insn::{
@@ -33,8 +33,13 @@ use crate::loop_info::{delete_private_loop, incoming, is_increment, literal, use
 use crate::pipeline::{ContextView, FunctionBody, Outcome};
 use crate::{FunctionPass, register_function_pass};
 
-fn is_temp<'a, 'str: 'a>(host: impl QCodeView<'a, 'str>, s: SpaceId) -> bool {
-    matches!(Space::from_id(host.shared(), s).ty, SpaceType::Temporary)
+fn is_temp<'a, 'str: 'a>(host: impl QCodeView<'a, 'str>, s: LocalMemorySpaceId) -> bool {
+    match s {
+        LocalMemorySpaceId::Shared(s) => {
+            matches!(Space::from_id(host.shared(), s).ty, SpaceType::Temporary)
+        }
+        LocalMemorySpaceId::Temp(_) => true,
+    }
 }
 
 // ===========================================================================

@@ -94,6 +94,7 @@ where
                         .types
                         .get_or_make_int(shared.values.varnodes[id].size_bytes())
                 }),
+            ValueId::Temp(id) => shared.types.get_or_make_int(self.temp(id).size),
             ValueId::BasicBlock(_) | ValueId::Function(_) => shared.types.get_or_make_int(0),
         }
     }
@@ -106,6 +107,7 @@ where
             ValueId::Instruction(id) => Some(self.instruction(id).type_id),
             ValueId::BlockParam(id) => Some(self.block_param(id).type_id),
             ValueId::Varnode(id) => shared.values.varnode_types.get(&id).copied(),
+            ValueId::Temp(_) => None,
             ValueId::BasicBlock(_) | ValueId::Function(_) => None,
         }
     }
@@ -248,7 +250,11 @@ mod tests {
     use crate::{
         builder::Builder,
         context::Context,
-        value::{BasicBlock, FunctionBody, Temp, TempSpace, ValueId, ValueRef},
+        space::{LocalMemorySpaceId, MemorySpaceId},
+        value::{
+            BasicBlock, FunctionBody, Temp, TempSpace, ValueId, ValueRef,
+            insn::{InstructionRef, Load, Mnemonic, Unary, Unop},
+        },
     };
 
     use super::*;
@@ -361,5 +367,60 @@ mod tests {
         assert_eq!(view.temp_space_ref(space).name(), Some("local"));
         assert_eq!(view.temp_ref(temp).address(), 0x30);
         assert_eq!(view.temp_ref(temp).space().id, space);
+    }
+
+    #[test]
+    fn temporary_values_and_spaces_render_and_preserve_qualified_provenance() {
+        let mut ctx = Context::new();
+        let function = FunctionBody::make(&mut ctx, "temporary_ir".into())
+            .unwrap()
+            .id;
+        let space = ctx.bodies[function].push_temp_space(TempSpace::new(Some("scratch"), 1, 8));
+        let temp = ctx.bodies[function].push_temp(Temp::new(0x20, 8, space.local));
+        ctx.bodies[function].temps[temp.local].label = Some(9);
+
+        let pointer_type = ctx
+            .shared
+            .types
+            .get_or_make_space_address(8, MemorySpaceId::Temp(space));
+        let pointer = InstructionRef::from_mnemonic_with_type(
+            &mut ctx,
+            function,
+            Mnemonic::Unop(Unary {
+                op: Unop::IntNot,
+                src: ValueId::Temp(temp).localize(function),
+            }),
+            pointer_type,
+        )
+        .id;
+        let load_type = ctx.shared.types.get_or_make_int(4);
+        let load = InstructionRef::from_mnemonic_with_type(
+            &mut ctx,
+            function,
+            Mnemonic::Load(Load {
+                space: LocalMemorySpaceId::Temp(space.local),
+                ptr: ValueId::Instruction(pointer).localize(function),
+                size: 4,
+            }),
+            load_type,
+        )
+        .id;
+
+        let view = ModuleView::new(&ctx);
+        assert_eq!(
+            view.insn_ref(pointer).memory_space(),
+            Some(MemorySpaceId::Temp(space))
+        );
+        assert_eq!(
+            view.shared()
+                .types
+                .size_of(view.type_of(ValueId::Temp(temp))),
+            8
+        );
+        assert_eq!(view.temp_ref(temp).to_string(), "v9");
+        assert_eq!(
+            view.insn_ref(load).as_statement().to_string(),
+            "i32 %tmp1 = load(scratch:4, i64 %tmp0);"
+        );
     }
 }

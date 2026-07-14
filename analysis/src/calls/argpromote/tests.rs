@@ -2944,7 +2944,7 @@ mod tests {
         // loop is removed and the seed store stripped.)
         let any_store = FunctionBody::from_id(&tc.ctx, f).iter().any(|b| {
             b.iter().any(|i| matches!(i.mnemonic(), Mnemonic::Store(s)
-                if matches!(qcode::space::Space::from_id(&tc.ctx, s.space).ty, qcode::space::SpaceType::Temporary)))
+                if s.space.shared().is_some_and(|space| matches!(qcode::space::Space::from_id(&tc.ctx, space).ty, qcode::space::SpaceType::Temporary))))
         });
         assert!(any_store, "the kept loop's shadow stores must remain");
 
@@ -3042,7 +3042,7 @@ mod tests {
         assert!(has_cbranch, "the residual @acc loop must remain");
         let any_store = FunctionBody::from_id(&tc.ctx, f).iter().any(|b| {
             b.iter().any(|i| matches!(i.mnemonic(), Mnemonic::Store(s)
-                if matches!(qcode::space::Space::from_id(&tc.ctx, s.space).ty, qcode::space::SpaceType::Temporary)))
+                if s.space.shared().is_some_and(|space| matches!(qcode::space::Space::from_id(&tc.ctx, space).ty, qcode::space::SpaceType::Temporary))))
         });
         assert!(any_store, "the kept loop's shadow stores must remain");
 

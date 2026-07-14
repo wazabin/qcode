@@ -186,6 +186,7 @@ pub fn verify_body_arena_integrity(ctx: &Context<'_>) -> Vec<String> {
                     LocalValueId::Instruction(id) => !live_insns.contains(&id),
                     LocalValueId::BlockParam(id) => !live_params.contains(&id),
                     LocalValueId::BasicBlock(id) => !live_blocks.contains(&id),
+                    LocalValueId::Temp(id) => usize::from(id) >= body.temps.len(),
                     _ => false,
                 };
                 if missing {
@@ -275,6 +276,7 @@ pub fn verify_body_arena_integrity(ctx: &Context<'_>) -> Vec<String> {
                 ValueId::BasicBlock(id) => id.func == fid && live_blocks.contains(&id.local),
                 ValueId::Instruction(id) => id.func == fid && live_insns.contains(&id.local),
                 ValueId::BlockParam(id) => id.func == fid && live_params.contains(&id.local),
+                ValueId::Temp(id) => id.func == fid && usize::from(id.local) < body.temps.len(),
                 _ => false,
             };
             if !live {
@@ -289,6 +291,7 @@ pub fn verify_body_arena_integrity(ctx: &Context<'_>) -> Vec<String> {
                 LocalValueId::Instruction(id) => live_insns.contains(&id),
                 LocalValueId::BlockParam(id) => live_params.contains(&id),
                 LocalValueId::BasicBlock(id) => live_blocks.contains(&id),
+                LocalValueId::Temp(id) => usize::from(id) < body.temps.len(),
                 _ => true,
             };
             if !key_live {

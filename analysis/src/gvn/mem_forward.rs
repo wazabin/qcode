@@ -179,7 +179,12 @@ impl MemForward {
         aliases: Option<&AliasResult>,
         numbering: &Numbering,
     ) {
-        let (base, start) = locate(load.ptr.qualify(func), load.space, aliases, numbering);
+        let (base, start) = locate(
+            load.ptr.qualify(func),
+            load.space.expect_shared(),
+            aliases,
+            numbering,
+        );
         for (i, off) in (start..start + load.size as i64).enumerate() {
             self.byte_map.insert(
                 (base, off),
@@ -230,7 +235,7 @@ impl MemForward {
     ) {
         let store_ptr = store.ptr.qualify(func);
         let store_src = store.src.qualify(func);
-        let (base, start) = locate(store_ptr, store.space, aliases, numbering);
+        let (base, start) = locate(store_ptr, store.space.expect_shared(), aliases, numbering);
         let end = start + store.size as i64;
 
         self.byte_map.retain(|&(cb, _), _| {
@@ -283,7 +288,7 @@ impl MemForward {
     ) -> Option<ValueId> {
         let (base, start) = locate(
             load.ptr.qualify(insn_id.func),
-            load.space,
+            load.space.expect_shared(),
             aliases,
             numbering,
         );
@@ -652,7 +657,12 @@ impl MemForward {
         let Mnemonic::Load(load) = host.insn_ref(id).mnemonic().clone() else {
             return None;
         };
-        let (base, start) = locate(load.ptr.qualify(id.func), load.space, aliases, numbering);
+        let (base, start) = locate(
+            load.ptr.qualify(id.func),
+            load.space.expect_shared(),
+            aliases,
+            numbering,
+        );
         let segs = self.segments(base, start, start + load.size as i64)?;
         let [seg] = segs.as_slice() else { return None };
         (seg.load_off == 0
@@ -769,8 +779,14 @@ impl MemForward {
             .iter()
             .map(|store| {
                 let store_ptr = store.ptr.qualify(block_id.func);
-                let (sb, s) =
-                    self.resolve_loaded_ptr(host, store_ptr, store.space, aliases, numbering, peel);
+                let (sb, s) = self.resolve_loaded_ptr(
+                    host,
+                    store_ptr,
+                    store.space.expect_shared(),
+                    aliases,
+                    numbering,
+                    peel,
+                );
                 let rep = match sb {
                     Base::Symbolic(_, bv) => bv,
                     Base::Pinned(_) => store_ptr,
@@ -809,7 +825,7 @@ mod tests {
     fn store_to(tc: &TestContext, func: FunctionId, vn: VarnodeId, src: ValueId) -> Store {
         let v = Varnode::from_id(&tc.ctx, vn);
         Store {
-            space: v.space().id,
+            space: v.space().id.into(),
             ptr: ValueId::Varnode(vn).localize(func),
             src: src.localize(func),
             size: v.size(),
@@ -819,7 +835,7 @@ mod tests {
     fn load_of(tc: &TestContext, func: FunctionId, vn: VarnodeId) -> Load {
         let v = Varnode::from_id(&tc.ctx, vn);
         Load {
-            space: v.space().id,
+            space: v.space().id.into(),
             ptr: ValueId::Varnode(vn).localize(func),
             size: v.size(),
         }
@@ -1008,7 +1024,7 @@ mod tests {
             let aligned = b.push_bit_and(s, neg8).id();
             let slot = b.push_sub(aligned, c78).id();
             let store = Store {
-                space: ram,
+                space: ram.into(),
                 ptr: slot.localize(root.func),
                 src: val.localize(root.func),
                 size: 8,
@@ -1070,7 +1086,7 @@ mod tests {
         let fid = tc.ctx.anon_function();
         // Hand-built 4-byte store of a 2-byte value (src width < store size).
         let store = Store {
-            space,
+            space: space.into(),
             ptr: ValueId::Varnode(tc.r0_lo32).localize(fid),
             src: narrow.localize(fid),
             size: 4,

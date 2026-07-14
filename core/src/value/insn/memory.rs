@@ -1,11 +1,11 @@
-use crate::{space::SpaceId, value::LocalValueId};
+use crate::{space::LocalMemorySpaceId, value::LocalValueId};
 
 use super::mnemonic::{Args, MnemonicKind};
 use smallvec::smallvec;
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub struct Load {
-    pub space: SpaceId,
+    pub space: LocalMemorySpaceId,
     pub ptr: LocalValueId,
     pub size: usize,
 }
@@ -22,7 +22,7 @@ impl MnemonicKind for Load {
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub struct Store {
-    pub space: SpaceId,
+    pub space: LocalMemorySpaceId,
     pub ptr: LocalValueId,
     pub src: LocalValueId,
     pub size: usize,
@@ -126,7 +126,7 @@ mod tests {
     #[test]
     fn test_matching_load() {
         let store = Store {
-            space: SpaceId::from(0),
+            space: crate::space::SpaceId::from(0).into(),
             ptr: LocalValueId::Varnode(VarnodeId::from(1)),
             src: LocalValueId::Literal(LiteralId::from(2)),
             size: 4,

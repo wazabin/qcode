@@ -52,10 +52,14 @@ fn local_effect(
             match insn.mnemonic() {
                 // Register writes are tracked separately (`clobbered_regs`); only
                 // memory spaces matter to the forwarding prune.
-                Mnemonic::Store(s)
-                    if !matches!(Space::from_id(ctx, s.space).ty, SpaceType::Register) =>
-                {
-                    spaces.insert(s.space);
+                Mnemonic::Store(s) => {
+                    // Function-local temporary writes never escape into the
+                    // published interprocedural shared-space summary.
+                    if let Some(space) = s.space.shared()
+                        && !matches!(Space::from_id(ctx, space).ty, SpaceType::Register)
+                    {
+                        spaces.insert(space);
+                    }
                 }
                 Mnemonic::Call(call) => {
                     let Some(target) = call.target.real() else {

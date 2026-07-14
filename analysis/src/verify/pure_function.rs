@@ -10,7 +10,7 @@
 
 use qcode::{
     context::Context,
-    space::SpaceType,
+    space::{LocalMemorySpaceId, SpaceType},
     value::{
         FunctionBody, FunctionId, Instruction, LocalValueId,
         insn::{InstructionId, Mnemonic},
@@ -43,11 +43,14 @@ impl PureFunctionViolation {
 /// Whether `space` is a builder/argpromote scratch space (a temporary). A
 /// load/store there is private to the function — seeded from inputs or written
 /// earlier in the body — so it is not a caller-visible effect.
-fn is_temp_space(ctx: &Context, space: qcode::space::SpaceId) -> bool {
-    matches!(
-        qcode::space::Space::from_id(ctx, space).ty,
-        SpaceType::Temporary
-    )
+fn is_temp_space(ctx: &Context, space: LocalMemorySpaceId) -> bool {
+    match space {
+        LocalMemorySpaceId::Shared(space) => matches!(
+            qcode::space::Space::from_id(ctx, space).ty,
+            SpaceType::Temporary
+        ),
+        LocalMemorySpaceId::Temp(_) => true,
+    }
 }
 
 /// The residual side effect a mnemonic carries, or `None` if it is pure.

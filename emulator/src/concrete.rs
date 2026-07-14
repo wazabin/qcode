@@ -1375,7 +1375,7 @@ impl StandaloneEmulator {
                     .get_value(ctx, ptr)
                     .ok_or_else(|| self.make_error(ctx, EmulatorErrorKind::ValueError(0)))?;
                 let buf = self
-                    .read_memory(ctx, space, addr, size)
+                    .read_memory(ctx, space.expect_shared(), addr, size)
                     .map_err(|kind| self.make_error(ctx, kind))?;
                 self.array_values.insert(insn_id, buf);
                 self.idx += 1;
@@ -1396,7 +1396,7 @@ impl StandaloneEmulator {
                 let addr = self
                     .get_value(ctx, ptr)
                     .ok_or_else(|| self.make_error(ctx, EmulatorErrorKind::ValueError(0)))?;
-                self.write_memory(ctx, space, addr, &buf)
+                self.write_memory(ctx, space.expect_shared(), addr, &buf)
                     .map_err(|kind| self.make_error(ctx, kind))?;
                 self.idx += 1;
             }
@@ -2209,6 +2209,7 @@ impl<'ctx> Interpreter for TempInterpreter<'_, 'ctx> {
                 .copied()
                 .ok_or(EmulatorErrorKind::ValueError(0)),
             ValueRef::Varnode(varnode) => Ok(SizedValue::new(varnode.address() as u64, 8)),
+            ValueRef::Temp(temp) => Ok(SizedValue::new(temp.address() as u64, 8)),
             ValueRef::BasicBlock(_) => panic!("Cannot get value of a block"),
             ValueRef::BlockParam(param) => self
                 .block_param_values
@@ -2449,6 +2450,7 @@ impl<'ctx> Interpreter for Emulator<'ctx> {
                 .copied()
                 .ok_or(EmulatorErrorKind::ValueError(0)),
             ValueRef::Varnode(varnode) => Ok(SizedValue::new(varnode.address() as u64, 8)),
+            ValueRef::Temp(temp) => Ok(SizedValue::new(temp.address() as u64, 8)),
             ValueRef::BasicBlock(_) => panic!("Cannot get value of a block"),
             ValueRef::BlockParam(param) => self
                 .inner

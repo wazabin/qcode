@@ -161,6 +161,11 @@ where
                 self.push(format!("i{} ", r.size() * 8), TokenKind::Type, None);
                 self.push(r.to_string(), TokenKind::Varnode, link);
             }
+            ValueId::Temp(id) => {
+                let r = self.view.temp_ref(id);
+                self.push(format!("i{} ", r.size() * 8), TokenKind::Type, None);
+                self.push(r.to_string(), TokenKind::Varnode, link);
+            }
             ValueId::Function(fid) => {
                 let name = self.view.interface(fid).name.to_string();
                 self.push(
@@ -318,11 +323,7 @@ fn mnemonic_segments<'ctx, 'str: 'ctx>(
         Mnemonic::Load(l) => {
             seg.kw("load");
             seg.punct("(");
-            seg.push(
-                space_name(seg.view.shared(), l.space),
-                TokenKind::Space,
-                None,
-            );
+            seg.push(space_name(seg.view, func, l.space), TokenKind::Space, None);
             seg.punct(":");
             seg.push(l.size.to_string(), TokenKind::Type, None);
             seg.punct(", ");
@@ -332,11 +333,7 @@ fn mnemonic_segments<'ctx, 'str: 'ctx>(
         Mnemonic::Store(s) => {
             seg.kw("store");
             seg.punct("(");
-            seg.push(
-                space_name(seg.view.shared(), s.space),
-                TokenKind::Space,
-                None,
-            );
+            seg.push(space_name(seg.view, func, s.space), TokenKind::Space, None);
             seg.punct(":");
             seg.push(s.size.to_string(), TokenKind::Type, None);
             seg.punct(", ");
@@ -651,11 +648,24 @@ fn binary_call<'ctx, 'str: 'ctx>(
 
 /// The space name as printed by `load`/`store`'s `fmt`: the named space, or a
 /// `space: <id>` fallback for an unnamed space.
-fn space_name(shared: &Shared<'_>, space: crate::space::SpaceId) -> String {
-    let space_ref = Space::from_id(shared, space);
-    match space_ref.name.as_deref() {
-        Some(name) => name.to_string(),
-        None => format!("space: {space}"),
+fn space_name<'ctx, 'str: 'ctx>(
+    view: impl QCodeView<'ctx, 'str>,
+    func: FunctionId,
+    space: crate::space::LocalMemorySpaceId,
+) -> String {
+    match space.qualify(func) {
+        crate::space::MemorySpaceId::Shared(space) => {
+            let space_ref = Space::from_id(view.shared(), space);
+            match space_ref.name.as_deref() {
+                Some(name) => name.to_string(),
+                None => format!("space: {space}"),
+            }
+        }
+        crate::space::MemorySpaceId::Temp(space) => view
+            .temp_space_ref(space)
+            .name()
+            .map(str::to_owned)
+            .unwrap_or_else(|| format!("temp{}", usize::from(space.local))),
     }
 }
 
@@ -751,6 +761,15 @@ where
         }
         ValueId::Varnode(id) => {
             let value = Varnode::from_id(shared, id);
+            out.push(Token::new(
+                format!("i{} ", value.size() * 8),
+                TokenKind::Type,
+                None,
+            ));
+            out.push(Token::new(value.to_string(), TokenKind::Varnode, link));
+        }
+        ValueId::Temp(id) => {
+            let value = view.temp_ref(id);
             out.push(Token::new(
                 format!("i{} ", value.size() * 8),
                 TokenKind::Type,

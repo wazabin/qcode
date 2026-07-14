@@ -31,11 +31,38 @@ impl LocalMemorySpaceId {
             Self::Temp(local) => MemorySpaceId::Temp(TempSpaceId::new(function, local)),
         }
     }
+
+    /// Returns the shared space while producers still use only module storage.
+    pub const fn shared(self) -> Option<SpaceId> {
+        match self {
+            Self::Shared(id) => Some(id),
+            Self::Temp(_) => None,
+        }
+    }
+
+    /// Shared-only compatibility adapter for consumers migrated in later
+    /// plan-10 commits.
+    pub fn expect_shared(self) -> SpaceId {
+        self.shared()
+            .expect("body-local temporary space reached a shared-only consumer")
+    }
 }
 
 impl From<SpaceId> for LocalMemorySpaceId {
     fn from(id: SpaceId) -> Self {
         Self::Shared(id)
+    }
+}
+
+impl PartialEq<SpaceId> for LocalMemorySpaceId {
+    fn eq(&self, other: &SpaceId) -> bool {
+        self.shared() == Some(*other)
+    }
+}
+
+impl PartialEq<LocalMemorySpaceId> for SpaceId {
+    fn eq(&self, other: &LocalMemorySpaceId) -> bool {
+        other == self
     }
 }
 
@@ -58,6 +85,13 @@ impl MemorySpaceId {
         match self {
             Self::Shared(_) => None,
             Self::Temp(id) => Some(id.func),
+        }
+    }
+
+    pub const fn shared(self) -> Option<SpaceId> {
+        match self {
+            Self::Shared(id) => Some(id),
+            Self::Temp(_) => None,
         }
     }
 }

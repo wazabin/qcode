@@ -4,11 +4,11 @@
 //! [`Varnode`](crate::value::Varnode) storage. Body storage uses the local IDs;
 //! immutable module/API boundaries use the function-qualified IDs.
 
-use std::{borrow::Cow, marker::PhantomData};
+use std::{borrow::Cow, fmt::Display, marker::PhantomData};
 
 use jstd::Identifier;
 
-use crate::value::{ModuleView, QCodeView};
+use crate::value::{ModuleView, QCodeView, Value, ValueId};
 
 /// Function-local temporary-space index.
 #[derive(Identifier)]
@@ -101,11 +101,20 @@ where
     }
 }
 
+impl<'str: 'ctx, 'ctx, R> Display for TempSpaceRef<'str, 'ctx, R>
+where
+    R: QCodeView<'ctx, 'str>,
+{
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.name().unwrap_or("temp"))
+    }
+}
+
 /// Immutable temporary-value reference over any [`QCodeView`] provider.
 #[derive(Clone, Copy)]
 pub struct TempRef<'str, 'ctx, R = ModuleView<'ctx, 'str>> {
     pub id: TempId,
-    view: R,
+    pub(in crate::value) view: R,
     marker: PhantomData<&'ctx &'str ()>,
 }
 
@@ -148,5 +157,37 @@ where
             self.view,
             TempSpaceId::new(self.id.func, self.inner().space),
         )
+    }
+
+    pub fn memory_space(self) -> crate::space::MemorySpaceId {
+        crate::space::MemorySpaceId::Temp(self.space().id)
+    }
+}
+
+impl<'str: 'ctx, 'ctx, R> Display for TempRef<'str, 'ctx, R>
+where
+    R: QCodeView<'ctx, 'str>,
+{
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        if let Some(name) = self.name() {
+            f.write_str(name)
+        } else if let Some(label) = self.label() {
+            write!(f, "v{label}")
+        } else {
+            write!(f, "[{}]:{} {}", self.space(), self.size(), self.address())
+        }
+    }
+}
+
+impl<'str: 'ctx, 'ctx, R> Value<'str, 'ctx> for TempRef<'str, 'ctx, R>
+where
+    R: QCodeView<'ctx, 'str>,
+{
+    fn id(&self) -> ValueId {
+        ValueId::Temp(self.id)
+    }
+
+    fn size(&self) -> usize {
+        TempRef::size(*self)
     }
 }

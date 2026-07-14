@@ -320,7 +320,7 @@ pub trait Interpreter {
             // ===== Memory operations =====
             &Mnemonic::Load(Load { space, ptr, size }) => {
                 let addr = self.get_value(ptr.qualify(func))?;
-                Some(self.memory().read(space, addr, size)?)
+                Some(self.memory().read(space.expect_shared(), addr, size)?)
             }
 
             &Mnemonic::Store(Store {
@@ -331,7 +331,8 @@ pub trait Interpreter {
             }) => {
                 let addr = self.get_value(ptr.qualify(func))?;
                 let value = self.get_value(src.qualify(func))?;
-                self.memory().write(space, addr, size, value)?;
+                self.memory()
+                    .write(space.expect_shared(), addr, size, value)?;
                 None
             }
 

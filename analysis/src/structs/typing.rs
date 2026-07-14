@@ -20,7 +20,7 @@
 use std::borrow::Cow;
 
 use qcode::{
-    space::{Space, SpaceId, SpaceType},
+    space::{LocalMemorySpaceId, Space, SpaceType},
     types::TypeId,
     value::{
         FunctionId, QCodeView, ValueId,
@@ -236,8 +236,13 @@ fn type_instruction<'a, 'str>(
 }
 
 /// Whether `space` is the processor register file.
-fn is_register_space<'a, 'str: 'a>(host: impl QCodeView<'a, 'str>, space: SpaceId) -> bool {
-    matches!(Space::from_id(host.shared(), space).ty, SpaceType::Register)
+fn is_register_space<'a, 'str: 'a>(
+    host: impl QCodeView<'a, 'str>,
+    space: LocalMemorySpaceId,
+) -> bool {
+    space
+        .shared()
+        .is_some_and(|space| matches!(Space::from_id(host.shared(), space).ty, SpaceType::Register))
 }
 
 /// `load(register, reg)` is a register read: its result takes the register's own

@@ -18,7 +18,7 @@ use rustc_hash::FxHashSet as HashSet;
 
 use qcode::{
     context::Context,
-    space::{Space, SpaceId, SpaceType},
+    space::{LocalMemorySpaceId, Space, SpaceType},
     value::{
         FunctionBody, FunctionId, Value, ValueId, ValueRef,
         insn::{Load, Mnemonic, Store},
@@ -32,8 +32,10 @@ use super::append_entry_param;
 /// A writable global lives in real RAM. ROM/register/temporary addresses are left
 /// alone: temporary is argpromote's own shadow, registers are varnodes (never a
 /// constant deref), and ROM is read-only data outside this pass's remit.
-fn is_real_ram(ctx: &Context, space: SpaceId) -> bool {
-    matches!(Space::from_id(ctx, space).ty, SpaceType::Ram)
+fn is_real_ram(ctx: &Context, space: LocalMemorySpaceId) -> bool {
+    space
+        .shared()
+        .is_some_and(|space| matches!(Space::from_id(ctx, space).ty, SpaceType::Ram))
 }
 
 /// Lift every constant real-ram load/store address in `fid` into a parameter,

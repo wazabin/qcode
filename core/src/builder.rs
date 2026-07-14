@@ -869,7 +869,7 @@ impl<'str, 'ctx, Ctx: BuilderBacking<'str>> Builder<'str, 'ctx, Ctx> {
             self.push_instruction(
                 Mnemonic::Load(Load {
                     ptr: self.loc(src),
-                    space,
+                    space: space.into(),
                     size,
                 }),
                 size,
@@ -1797,7 +1797,7 @@ impl<'str, 'ctx, Ctx: BuilderBacking<'str>> Builder<'str, 'ctx, Ctx> {
                         Mnemonic::Store(Store {
                             src: self.loc(src_lane),
                             ptr: self.loc(dst_lane),
-                            space,
+                            space: space.into(),
                             size: lane_size,
                         }),
                         0,
@@ -1822,7 +1822,7 @@ impl<'str, 'ctx, Ctx: BuilderBacking<'str>> Builder<'str, 'ctx, Ctx> {
                     Mnemonic::Store(Store {
                         src: self.loc(src),
                         ptr: self.loc(dst.into()),
-                        space,
+                        space: space.into(),
                         size,
                     }),
                     0,
@@ -1882,7 +1882,7 @@ impl<'str, 'ctx, Ctx: BuilderBacking<'str>> Builder<'str, 'ctx, Ctx> {
             Mnemonic::Store(Store {
                 src: self.loc(src),
                 ptr: self.loc(ptr),
-                space,
+                space: space.into(),
                 size,
             }),
             0,

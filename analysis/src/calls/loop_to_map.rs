@@ -150,8 +150,9 @@ fn try_match<'a, 'str: 'a>(host: impl QCodeView<'a, 'str>, fid: FunctionId) -> O
         .iter()
         .find_map(|i| match i.mnemonic() {
             Mnemonic::Store(s)
-                if matches!(Space::from_id(host.shared(), s.space).ty, SpaceType::Ram)
-                    && s.src.qualify(i.id.func) == arr_exit =>
+                if s.space.shared().is_some_and(|space| {
+                    matches!(Space::from_id(host.shared(), space).ty, SpaceType::Ram)
+                }) && s.src.qualify(i.id.func) == arr_exit =>
             {
                 Some(i.id)
             }

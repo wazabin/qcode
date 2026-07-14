@@ -29,7 +29,7 @@ pub fn verify_pointer_spaces(ctx: &Context) -> Vec<String> {
             )),
             Some(_) => {}
             None => {
-                seen.insert(ptr, space);
+                seen.insert(ptr, space.expect_shared());
             }
         }
     }

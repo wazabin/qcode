@@ -5,7 +5,7 @@
 use crate::{
     context::Context,
     error::Result,
-    space::{Space, SpaceId, SpaceRef, SpaceType},
+    space::{MemorySpaceId, Space, SpaceId, SpaceRef, SpaceType},
     types::TypeId,
     value::{
         BlockId, BlockRef, FunctionId, FunctionRef, LocalBlockId, ModuleView, QCodeView, Value,
@@ -210,7 +210,14 @@ where
             .shared()
             .types
             .space_of(self.inner().type_id)
+            .and_then(MemorySpaceId::shared)
             .map(|id| Space::from_id(self.view.shared(), id))
+    }
+
+    /// Qualified address-space provenance, including body-local temporary
+    /// spaces that cannot be represented by [`SpaceRef`].
+    pub fn memory_space(&'s self) -> Option<MemorySpaceId> {
+        self.view.shared().types.space_of(self.inner().type_id)
     }
 
     /// The opcode for this instruction

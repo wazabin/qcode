@@ -887,8 +887,8 @@ fn apply(
         for &acc in &p.accesses {
             let mut m = ctx.get_insn(acc).mnemonic().clone();
             match &mut m {
-                Mnemonic::Load(l) => l.space = shadow,
-                Mnemonic::Store(s) => s.space = shadow,
+                Mnemonic::Load(l) => l.space = shadow.into(),
+                Mnemonic::Store(s) => s.space = shadow.into(),
                 _ => {}
             }
             ctx.replace_instruction_mnemonic(acc, m);

@@ -68,7 +68,7 @@ struct Pipelined {
     carry: BlockParamId,
     iv: ValueId,
     step: u64,
-    space: qcode::space::SpaceId,
+    space: qcode::space::LocalMemorySpaceId,
     size: usize,
 }
 

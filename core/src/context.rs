@@ -294,6 +294,7 @@ impl<'str> Shared<'str> {
             ValueId::Instruction(_)
             | ValueId::BlockParam(_)
             | ValueId::BasicBlock(_)
+            | ValueId::Temp(_)
             | ValueId::Function(_) => None,
         }
     }
@@ -1683,6 +1684,10 @@ impl<'str> Context<'str> {
                 let size = self.shared.values.varnodes[vid].size_bytes();
                 self.shared.types.get_or_make_int(size)
             }
+            ValueId::Temp(id) => self
+                .shared
+                .types
+                .get_or_make_int(self.bodies[id.func].temps[id.local].size),
             // Exhaustive on purpose: a new ValueId variant must decide its type
             // here rather than silently inheriting the zero-width fallback.
             ValueId::BasicBlock(_) | ValueId::Function(_) => self.shared.types.get_or_make_int(0),
@@ -1701,6 +1706,7 @@ impl<'str> Context<'str> {
             ValueId::Instruction(iid) => Some(self.instruction(iid).type_id),
             ValueId::BlockParam(pid) => Some(self.block_param(pid).type_id),
             ValueId::Varnode(vid) => self.shared.values.varnode_types.get(&vid).copied(),
+            ValueId::Temp(_) => None,
             ValueId::BasicBlock(_) | ValueId::Function(_) => None,
         }
     }
@@ -2895,7 +2901,7 @@ mod tests {
         ctx.replace_instruction_mnemonic(
             load_id,
             Mnemonic::Load(Load {
-                space: ctx.shared.default_space,
+                space: ctx.shared.default_space.into(),
                 ptr: new_ptr.localize(load_id.func),
                 size: 8,
             }),
@@ -3202,7 +3208,10 @@ mod tests {
         }
         // The SpaceAddress type round-trips: same id, same size, same space.
         assert_eq!(restored.shared.types.size_of(sa), sa_size);
-        assert_eq!(restored.shared.types.space_of(sa), Some(some_space));
+        assert_eq!(
+            restored.shared.types.space_of(sa),
+            Some(crate::space::MemorySpaceId::Shared(some_space))
+        );
     }
 
     #[test]

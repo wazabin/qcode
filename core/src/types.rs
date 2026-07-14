@@ -29,7 +29,7 @@ use std::sync::{RwLock, RwLockReadGuard, RwLockWriteGuard};
 use rustc_hash::FxHashMap as HashMap;
 
 use crate::{
-    space::SpaceId,
+    space::MemorySpaceId,
     value::insn::{Binop, IntBinop},
 };
 
@@ -55,7 +55,7 @@ pub trait Type: Send + Sync {
     fn size(&self) -> usize;
 
     /// The memory space this type lives in, if it is a pointer type.
-    fn space(&self) -> Option<SpaceId> {
+    fn space(&self) -> Option<MemorySpaceId> {
         None
     }
 
@@ -125,7 +125,7 @@ pub enum TypeRepr {
     Bool,
     SpaceAddress {
         size: usize,
-        space: SpaceId,
+        space: MemorySpaceId,
     },
     /// A fixed, ordered group of named field types — the functional-IR
     /// representation of a tuple. Used by `argpromote` to return
@@ -270,7 +270,7 @@ impl Type for BoolType {
 #[derive(Clone)]
 pub struct SpaceAddress {
     size: usize,
-    space: SpaceId,
+    space: MemorySpaceId,
 }
 
 impl Type for SpaceAddress {
@@ -278,7 +278,7 @@ impl Type for SpaceAddress {
         self.size
     }
 
-    fn space(&self) -> Option<SpaceId> {
+    fn space(&self) -> Option<MemorySpaceId> {
         Some(self.space)
     }
 
@@ -486,7 +486,7 @@ struct TypeManagerInner {
     /// The interned `bool` type, once created.
     bool_id: Option<TypeId>,
     /// Fast lookup: (size, space) → SpaceAddress TypeId.
-    space_address: HashMap<(usize, SpaceId), TypeId>,
+    space_address: HashMap<(usize, MemorySpaceId), TypeId>,
     /// Fast lookup: named field-type list → Aggregate TypeId.
     aggregate_by_fields: HashMap<Vec<AggregateField>, TypeId>,
     /// Nominal lookup: struct name → StructType TypeId.
@@ -560,7 +560,7 @@ impl TypeManagerInner {
 
     /// Returns the [`TypeId`] for a [`SpaceAddress`] of the given byte width
     /// pointing into `space`, creating it if it does not yet exist.
-    pub fn get_or_make_space_address(&mut self, size: usize, space: SpaceId) -> TypeId {
+    pub fn get_or_make_space_address(&mut self, size: usize, space: MemorySpaceId) -> TypeId {
         if let Some(&id) = self.space_address.get(&(size, space)) {
             return id;
         }
@@ -775,7 +775,7 @@ impl TypeManagerInner {
 
     /// Returns the memory space associated with `id`, if any. Non-`None` only for
     /// [`SpaceAddress`]/[`StructPointer`] pointer types.
-    pub fn space_of(&self, id: TypeId) -> Option<SpaceId> {
+    pub fn space_of(&self, id: TypeId) -> Option<MemorySpaceId> {
         self.get(id).space()
     }
 
@@ -880,7 +880,12 @@ impl TypeManager {
         }
         self.write().get_or_make_bool()
     }
-    pub fn get_or_make_space_address(&self, size: usize, space: SpaceId) -> TypeId {
+    pub fn get_or_make_space_address(
+        &self,
+        size: usize,
+        space: impl Into<MemorySpaceId>,
+    ) -> TypeId {
+        let space = space.into();
         if let Some(&id) = self.read().space_address.get(&(size, space)) {
             return id;
         }
@@ -964,7 +969,7 @@ impl TypeManager {
     pub fn size_of(&self, id: TypeId) -> usize {
         self.read().size_of(id)
     }
-    pub fn space_of(&self, id: TypeId) -> Option<SpaceId> {
+    pub fn space_of(&self, id: TypeId) -> Option<MemorySpaceId> {
         self.read().space_of(id)
     }
     pub fn pointee_of(&self, id: TypeId) -> Option<TypeId> {

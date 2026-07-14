@@ -26,7 +26,7 @@ use rustc_hash::FxHashSet as HashSet;
 
 use qcode::{
     builder::{Builder, BuilderBacking},
-    space::{Space, SpaceId, SpaceType},
+    space::{LocalMemorySpaceId, Space, SpaceId, SpaceType},
     types::TypeId,
     value::{
         BlockId, FunctionId, QCodeView, ValueId,
@@ -108,11 +108,13 @@ fn try_match<'a, 'str: 'a>(
         space: SpaceId,
         stored: Option<ValueId>,
     }
-    let is_ram = |sp: SpaceId| {
-        matches!(
-            Space::from_id(host.shared(), sp).ty,
-            SpaceType::Ram | SpaceType::Temporary
-        )
+    let is_ram = |sp: LocalMemorySpaceId| {
+        sp.shared().is_some_and(|sp| {
+            matches!(
+                Space::from_id(host.shared(), sp).ty,
+                SpaceType::Ram | SpaceType::Temporary
+            )
+        })
     };
     let mut accesses: Vec<Acc> = Vec::new();
     for block in host.function_ref(fid).iter() {
@@ -124,7 +126,7 @@ fn try_match<'a, 'str: 'a>(
                     block: bid,
                     ptr: l.ptr.qualify(insn.id.func),
                     size: l.size,
-                    space: l.space,
+                    space: l.space.expect_shared(),
                     stored: None,
                 }),
                 Mnemonic::Store(s) if is_ram(s.space) => accesses.push(Acc {
@@ -132,7 +134,7 @@ fn try_match<'a, 'str: 'a>(
                     block: bid,
                     ptr: s.ptr.qualify(insn.id.func),
                     size: s.size,
-                    space: s.space,
+                    space: s.space.expect_shared(),
                     stored: Some(s.src.qualify(insn.id.func)),
                 }),
                 _ => {}
@@ -595,7 +597,7 @@ fn apply_generic<'str>(host: &mut PassBacking<'_, 'str>, m: &PromoteMatch) -> bo
             m.preheader,
             term_id,
             Mnemonic::Load(Load {
-                space: m.region_space,
+                space: m.region_space.into(),
                 ptr: dst.localize(m.preheader.func),
                 size: arr_sz,
             }),

@@ -536,12 +536,16 @@ impl RegisterBase {
         for block in host.function_ref(fun_id).blocks() {
             for iid in block.instruction_ids() {
                 match host.insn_ref(iid).mnemonic() {
-                    Mnemonic::Load(load) => {
-                        pointer_uses.push((load.ptr.qualify(iid.func), load.space, load.size))
-                    }
-                    Mnemonic::Store(store) => {
-                        pointer_uses.push((store.ptr.qualify(iid.func), store.space, store.size))
-                    }
+                    Mnemonic::Load(load) => pointer_uses.push((
+                        load.ptr.qualify(iid.func),
+                        load.space.expect_shared(),
+                        load.size,
+                    )),
+                    Mnemonic::Store(store) => pointer_uses.push((
+                        store.ptr.qualify(iid.func),
+                        store.space.expect_shared(),
+                        store.size,
+                    )),
                     _ => {}
                 }
             }

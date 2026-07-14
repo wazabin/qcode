@@ -151,6 +151,8 @@ pub enum ValueId {
     BlockParam(BlockParamId),
     /// A named memory location ([`Varnode`]) such as a register or global.
     Varnode(VarnodeId),
+    /// A function-local temporary memory value.
+    Temp(TempId),
     /// A lifted or external [`FunctionBody`].
     Function(FunctionId),
 }
@@ -164,6 +166,7 @@ impl ValueId {
             ValueId::BasicBlock(_) => "BasicBlock",
             ValueId::BlockParam(_) => "BlockParam",
             ValueId::Varnode(_) => "Varnode",
+            ValueId::Temp(_) => "Temp",
             ValueId::Function(_) => "Function",
         }
     }
@@ -177,6 +180,7 @@ impl ValueId {
         match self {
             ValueId::Instruction(id) => Some(id.func),
             ValueId::BlockParam(id) => Some(id.func),
+            ValueId::Temp(id) => Some(id.func),
             _ => None,
         }
     }
@@ -192,6 +196,7 @@ impl ValueId {
             ValueId::Instruction(id) => Some(id.func),
             ValueId::BlockParam(id) => Some(id.func),
             ValueId::BasicBlock(id) => Some(id.func),
+            ValueId::Temp(id) => Some(id.func),
             _ => None,
         }
     }
@@ -248,6 +253,14 @@ impl ValueId {
         }
     }
 
+    pub fn as_temp(self) -> Option<TempId> {
+        if let ValueId::Temp(id) = self {
+            Some(id)
+        } else {
+            None
+        }
+    }
+
     pub fn as_function(self) -> Option<FunctionId> {
         if let ValueId::Function(id) = self {
             Some(id)
@@ -293,6 +306,12 @@ impl From<VarnodeId> for ValueId {
     }
 }
 
+impl From<TempId> for ValueId {
+    fn from(id: TempId) -> Self {
+        ValueId::Temp(id)
+    }
+}
+
 impl From<FunctionId> for ValueId {
     fn from(id: FunctionId) -> Self {
         ValueId::Function(id)
@@ -319,6 +338,7 @@ impl ValueId {
             ValueId::BlockParam(id) => {
                 (6, usize::from(id.func) as u32, usize::from(id.local) as u32)
             }
+            ValueId::Temp(id) => (7, usize::from(id.func) as u32, usize::from(id.local) as u32),
         }
     }
 }
@@ -333,6 +353,7 @@ impl Display for ValueId {
             ValueId::Instruction(id) => write!(f, "Instruction({id})"),
             ValueId::BasicBlock(id) => write!(f, "BasicBlock({id})"),
             ValueId::BlockParam(id) => write!(f, "BlockParam({id})"),
+            ValueId::Temp(id) => write!(f, "Temp({id})"),
         }
     }
 }
@@ -367,6 +388,8 @@ pub enum LocalValueId {
     BlockParam(LocalParamId),
     /// A named memory location ([`Varnode`]) (module id; same as `ValueId`).
     Varnode(VarnodeId),
+    /// A body-owned temporary value — bare body-local index.
+    Temp(LocalTempId),
     /// A lifted or external [`FunctionBody`] (module id; same as `ValueId`).
     Function(FunctionId),
 }
@@ -386,6 +409,7 @@ impl LocalValueId {
             }
             LocalValueId::BasicBlock(local) => ValueId::BasicBlock(BlockId::new(func, local)),
             LocalValueId::BlockParam(local) => ValueId::BlockParam(BlockParamId::new(func, local)),
+            LocalValueId::Temp(local) => ValueId::Temp(TempId::new(func, local)),
         }
     }
 }
@@ -426,6 +450,7 @@ impl ValueId {
                 );
                 LocalValueId::BlockParam(id.local)
             }
+            ValueId::Temp(id) => LocalValueId::Temp(id.localize(func)),
         }
     }
 
@@ -445,6 +470,7 @@ impl ValueId {
             ValueId::Instruction(id) => LocalValueId::Instruction(id.local),
             ValueId::BasicBlock(id) => LocalValueId::BasicBlock(id.local),
             ValueId::BlockParam(id) => LocalValueId::BlockParam(id.local),
+            ValueId::Temp(id) => LocalValueId::Temp(id.local),
         }
     }
 }
@@ -474,6 +500,7 @@ pub enum ValueRef<'str, 'ctx, R = ModuleView<'ctx, 'str>> {
     BasicBlock(BlockRef<'str, 'ctx, R>),
     BlockParam(BlockParamRef<'str, 'ctx, R>),
     Varnode(VarnodeRef<'str, 'ctx>),
+    Temp(TempRef<'str, 'ctx, R>),
     Function(FunctionRef<'str, 'ctx, R>),
 }
 
@@ -486,6 +513,7 @@ impl<R> Debug for ValueRef<'_, '_, R> {
             ValueRef::BasicBlock(_) => f.write_str("BasicBlock"),
             ValueRef::BlockParam(_) => f.write_str("BlockParam"),
             ValueRef::Varnode(_) => f.write_str("Varnode"),
+            ValueRef::Temp(_) => f.write_str("Temp"),
             ValueRef::Function(_) => f.write_str("Function"),
         }
     }
@@ -527,6 +555,12 @@ impl<'str, 'ctx, R> From<VarnodeRef<'str, 'ctx>> for ValueRef<'str, 'ctx, R> {
     }
 }
 
+impl<'str, 'ctx, R> From<TempRef<'str, 'ctx, R>> for ValueRef<'str, 'ctx, R> {
+    fn from(temp_ref: TempRef<'str, 'ctx, R>) -> Self {
+        ValueRef::Temp(temp_ref)
+    }
+}
+
 impl<'str, 'ctx, R> From<FunctionRef<'str, 'ctx, R>> for ValueRef<'str, 'ctx, R> {
     fn from(fn_ref: FunctionRef<'str, 'ctx, R>) -> Self {
         ValueRef::Function(fn_ref)
@@ -552,6 +586,7 @@ where
             ValueId::Literal(id) => ValueRef::Literal(LiteralRef::from_id(view.shared(), id)),
             ValueId::Bytes(id) => ValueRef::Bytes(BytesRef::from_id(view.shared(), id)),
             ValueId::Varnode(id) => ValueRef::Varnode(Varnode::from_id(view.shared(), id)),
+            ValueId::Temp(id) => ValueRef::Temp(TempRef::new(view, id)),
             ValueId::Instruction(id) => ValueRef::Instruction(InstructionRef::new(view, id)),
             ValueId::BasicBlock(id) => ValueRef::BasicBlock(BlockRef::new(view, id)),
             ValueId::BlockParam(id) => ValueRef::BlockParam(BlockParamRef::new(view, id)),
@@ -567,6 +602,7 @@ where
             ValueRef::BasicBlock(r) => r,
             ValueRef::BlockParam(r) => r,
             ValueRef::Varnode(r) => r,
+            ValueRef::Temp(r) => r,
             ValueRef::Function(r) => r,
         }
     }
@@ -575,6 +611,23 @@ where
         match self {
             ValueRef::Varnode(v) => Some(v.space()),
             ValueRef::Instruction(i) => i.space(),
+            ValueRef::Temp(_) => None,
+            ValueRef::Literal(_)
+            | ValueRef::Bytes(_)
+            | ValueRef::BasicBlock(_)
+            | ValueRef::BlockParam(_)
+            | ValueRef::Function(_) => None,
+        }
+    }
+
+    /// Qualified memory-space provenance. Unlike [`space`](Self::space), this
+    /// represents body-local temporary spaces without pretending they are
+    /// shared [`Space`] values.
+    pub fn memory_space(&self) -> Option<crate::space::MemorySpaceId> {
+        match self {
+            ValueRef::Varnode(v) => Some(crate::space::MemorySpaceId::Shared(v.space().id)),
+            ValueRef::Instruction(i) => i.memory_space(),
+            ValueRef::Temp(t) => Some(t.memory_space()),
             ValueRef::Literal(_)
             | ValueRef::Bytes(_)
             | ValueRef::BasicBlock(_)
@@ -601,6 +654,7 @@ where
             ValueRef::Literal(r) => insn::segment::value_tokens_shared(r.ctx, self.id()),
             ValueRef::Bytes(r) => insn::segment::value_tokens_shared(r.ctx, self.id()),
             ValueRef::Varnode(r) => insn::segment::value_tokens_shared(r.ctx, self.id()),
+            ValueRef::Temp(r) => insn::segment::value_tokens_view(r.view, self.id()),
             ValueRef::Instruction(r) => insn::segment::value_tokens_view(r.view, self.id()),
             ValueRef::BasicBlock(r) => insn::segment::value_tokens_view(r.view, self.id()),
             ValueRef::BlockParam(r) => insn::segment::value_tokens_view(r.view, self.id()),
@@ -638,10 +692,11 @@ mod local_value_id_tests {
         let func = FunctionId::from(7usize);
         let other = FunctionId::from(3usize);
 
-        let arena: [ValueId; 3] = [
+        let arena: [ValueId; 4] = [
             ValueId::Instruction(InstructionId::new(func, LocalInsnId::from(2usize))),
             ValueId::BasicBlock(BlockId::new(func, LocalBlockId::from(5usize))),
             ValueId::BlockParam(BlockParamId::new(func, LocalParamId::from(1usize))),
+            ValueId::Temp(TempId::new(func, LocalTempId::from(4usize))),
         ];
         for id in arena {
             assert_eq!(id.localize(func).qualify(func), id, "{id:?}");
@@ -671,5 +726,15 @@ mod local_value_id_tests {
         let foreign = FunctionId::from(9usize);
         let id = ValueId::Instruction(InstructionId::new(foreign, LocalInsnId::from(0usize)));
         let _ = id.localize(func);
+    }
+
+    #[test]
+    #[should_panic(expected = "TempId::localize: foreign id")]
+    #[cfg(debug_assertions)]
+    fn localize_rejects_foreign_temporary_id() {
+        let owner = FunctionId::from(7usize);
+        let foreign = FunctionId::from(9usize);
+        let id = ValueId::Temp(TempId::new(foreign, LocalTempId::from(0usize)));
+        let _ = id.localize(owner);
     }
 }
