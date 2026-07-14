@@ -228,19 +228,15 @@ impl<T: FunctionPass + Send + Sync> DynFunctionPass for FunctionPassAdapter<T> {
         // Split the context: borrow the target body `&mut` in place and run the
         // pass over the frozen module view; the view is bodies-free, so it cannot
         // alias the borrowed body.
-        let before_targets = ctx.direct_call_targets(fun_id);
         let outcome = {
             let (bodies, view) = ctx.split(env);
             let mut next_minted = 0;
             self.run_checked(&mut bodies[fun_id], view, &mut next_minted)?
         };
-        // Barrier, in the driver's order: install minted callees first (so the
-        // owner's new call sites resolve), rebuild its `call_sites` diff, then
-        // apply the returned self-rename. The body was mutated in place — nothing
-        // to reinstall.
+        // Barrier, in the driver's order: install and resolve minted callees,
+        // then apply the returned self-rename. The body was mutated in place.
         let installed = install_minted(ctx, T::NAME, outcome.minted)?;
         let patched = resolve_minted_callees(ctx, T::NAME, fun_id, &installed)?;
-        ctx.resync_call_sites(fun_id, &before_targets);
         replay_rename(ctx, T::NAME, fun_id, outcome.rename)?;
         Ok(outcome.changed || patched)
     }
@@ -248,7 +244,7 @@ impl<T: FunctionPass + Send + Sync> DynFunctionPass for FunctionPassAdapter<T> {
 
 /// Run `f` over a `(&mut FunctionBody, ContextView)` for `fid` — the body borrowed
 /// `&mut` in place via [`split`](ContextSplit::split) — then drop the split borrow
-/// and resync the body's call sites: the run + barrier protocol of
+/// and finish the split-borrow barrier: the run protocol of
 /// [`FunctionPassAdapter::run`], minus minting.
 ///
 /// This is the bridge the whole-`Context` optimization entry points
@@ -268,15 +264,12 @@ pub(crate) fn with_checked_out_body<'str, R>(
     f: impl FnOnce(&mut FunctionBody<'str>, ContextView<'_, 'str>) -> R,
 ) -> R {
     let env = detached_env();
-    let before_targets = ctx.direct_call_targets(fid);
-    let out = {
+    {
         let (bodies, view) = ctx.split(&env);
         // These entry points buffer no effects and mint nothing, so the drained
         // scratch is discarded.
         f(&mut bodies[fid], view)
-    };
-    ctx.resync_call_sites(fid, &before_targets);
-    out
+    }
 }
 
 /// A throwaway [`PipelineEnv`] for [`with_checked_out_body`]: the concrete
@@ -300,8 +293,7 @@ fn detached_env() -> PipelineEnv {
 /// rebind the body's ambient ownership metadata to it, uniquify the buffered raw
 /// name, append interface and body together, and register the name.
 /// Returns the installed ids so the driver can mark them dirty for downstream
-/// `only_dirty` stages. Must run *before* the owning function's
-/// `resync_call_sites`, so its new call sites resolve against real callees.
+/// `only_dirty` stages.
 pub(super) fn install_minted<'str>(
     ctx: &mut Context<'str>,
     pass: &str,
@@ -335,9 +327,8 @@ pub(super) fn install_minted<'str>(
 /// have been installed at the barrier. `installed[k]` is the real function for
 /// `Callee::Minted(k)`; both vectors are produced in deterministic mint order.
 ///
-/// This must run after [`install_minted`] and before `resync_call_sites`: the
-/// reverse call graph only records installed [`FunctionId`] targets, never
-/// pass-local slots. Returns whether any owner or installed body was patched.
+/// This must run after [`install_minted`]. Returns whether any owner or installed
+/// body was patched.
 pub(super) fn resolve_minted_callees(
     ctx: &mut Context<'_>,
     pass: &str,
@@ -365,12 +356,6 @@ pub(super) fn resolve_minted_callees(
             ));
         }
     }
-    // Newly appended bodies have no prior reverse-call-graph entries. Publish
-    // their now-real direct callees after every sibling/self slot is resolved.
-    for &minted_id in installed {
-        ctx.resync_call_sites(minted_id, &[]);
-    }
-
     Ok(changed)
 }
 

@@ -52,7 +52,6 @@ pub(crate) fn with_minting<'str, R>(
 ) -> R {
     use crate::pipeline::{ContextSplit, Minted};
     let env = dummy_env();
-    let before_targets = ctx.direct_call_targets(fun);
     let (out, minted) = {
         let (bodies, view) = ctx.split(&env);
         let mut next_minted = 0;
@@ -60,6 +59,6 @@ pub(crate) fn with_minting<'str, R>(
         let out = f(view, &mut bodies[fun], &mut next_minted, &mut minted);
         (out, minted)
     };
-    crate::pipeline::install_minted_for_test(ctx, fun, &before_targets, minted);
+    crate::pipeline::install_minted_for_test(ctx, fun, minted);
     out
 }

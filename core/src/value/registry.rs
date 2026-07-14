@@ -4,7 +4,6 @@ use crate::{
     value::{
         bytes::{Bytes, BytesId},
         function::FunctionId,
-        insn::InstructionId,
         interner::{Interner, LiteralInterner},
         literal::{Literal, LiteralId},
         varnode::{Varnode, VarnodeId},
@@ -14,8 +13,8 @@ use crate::{
 // each `FunctionBody` (see `FunctionBody::insns/blocks/params/edges`), and the function
 // bodies/interfaces now live directly on [`Context`](crate::context::Context)
 // (`bodies`/`interfaces`). This registry keeps only the global value arenas
-// (literals, bytes, varnodes) plus the cross-function maps (`call_sites`,
-// `synthetic_callees`, truths). The composite-id routing accessors that consult
+// (literals, bytes, varnodes) plus semantic cross-function data
+// (`synthetic_callees`, truths). The composite-id routing accessors that consult
 // the function bodies moved onto `Context` in the context-split reshape.
 use jstd::registry::Registry;
 use rustc_hash::FxHashMap as HashMap;
@@ -88,22 +87,13 @@ pub struct ValueRegistry<'str> {
     #[serde(default, skip)]
     pub(crate) known_contradictions: Vec<KnownContradiction>,
 
-    /// Reverse call graph: for each callee [`FunctionId`], the direct-call sites
-    /// (instructions) that target it. Kept in sync alongside `users` by
-    /// [`Context::push_insn`](crate::context::Context::push_insn),
-    /// [`Context::remove_instructions`](crate::context::Context::remove_instructions), and
-    /// [`Context::replace_instruction_mnemonic`](crate::context::Context::replace_instruction_mnemonic).
-    /// Indirect calls have no static target and are not recorded here.
-    #[serde(default)]
-    pub(crate) call_sites: HashMap<FunctionId, Vec<InstructionId>>,
-
     /// Synthetic forward call-graph edges that are not backed by a direct `Call`
     /// instruction: `caller FunctionId → set of callee entry addresses`. Used for
     /// relationships a pass recovers but the IR can't express as a direct call —
     /// e.g. `entry → main`, where `main` is passed to `__libc_start_main` as a
     /// pointer argument rather than called. Keyed by address so the edge resolves
     /// once a function exists at the callee, independent of when it materializes.
-    /// Merged into [`FunctionRef::callees`](crate::value::FunctionRef::callees).
+    /// Consumed by the analysis-owned derived call graph.
     #[serde(default)]
     pub(crate) synthetic_callees: HashMap<FunctionId, BTreeSet<u64>>,
 }
@@ -128,14 +118,6 @@ impl<'str> ValueRegistry<'str> {
     /// for plain integer constants.
     pub fn push_literal(&self, literal: Literal) -> LiteralId {
         self.literals.push_literal(literal)
-    }
-
-    /// Returns the direct-call sites (instructions) targeting `callee`.
-    pub fn call_sites_of(&self, callee: FunctionId) -> &[InstructionId] {
-        self.call_sites
-            .get(&callee)
-            .map(Vec::as_slice)
-            .unwrap_or(&[])
     }
 
     /// Records a synthetic forward call-graph edge `caller → callee_addr` (see

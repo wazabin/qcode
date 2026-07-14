@@ -1553,10 +1553,7 @@ fn run_function_stage_with_threads(
             // Split the context: borrow this function's body `&mut` in place from
             // the bodies registry and run its whole pass fixpoint on it over the
             // frozen module view; then drop the split borrow and do the barrier work
-            // (install minted callees, rebuild `call_sites`, replay buffered
-            // effects). The snapshot of outgoing call targets is taken before the
-            // split so `resync_call_sites` can diff it afterwards.
-            let before_targets = ctx.direct_call_targets(fun_id);
+            // (install minted callees and replay the buffered rename).
             let outcome = {
                 let (bodies, view) = ctx.split(env);
                 run_one_function(
@@ -1580,11 +1577,8 @@ fn run_function_stage_with_threads(
                     },
                 )?
             };
-            // Install minted callees before the owner's call sites resync, so the
-            // new calls resolve against real functions.
             let installed = install_minted(ctx, &stage.name, outcome.minted)?;
             let patched = resolve_minted_callees(ctx, &stage.name, fun_id, &installed)?;
-            ctx.resync_call_sites(fun_id, &before_targets);
             replay_rename(ctx, &stage.name, fun_id, outcome.rename)?;
             // Minted functions are new work for downstream `only_dirty` stages.
             dirty.extend(installed);
@@ -1749,20 +1743,17 @@ fn resolve_threads() -> usize {
     }
 }
 
-/// Per-function driver metadata snapshotted before the split borrow: the id, the
-/// display name, and the pre-run call-target set (for the barrier `call_sites`
-/// diff).
-type FnMeta = (FunctionId, std::sync::Arc<str>, Vec<FunctionId>);
+/// Per-function driver metadata snapshotted before the split borrow: the id and
+/// display name.
+type FnMeta = (FunctionId, std::sync::Arc<str>);
 
 /// One worklist function on its way through a parallel stage: its identity, the
-/// pre-run call-target snapshot (for the barrier `call_sites` diff), the body a
-/// worker mutates (borrowed `&mut` in place from the bodies registry), and the
-/// [`Outcome`] the worker produced (changed / rename / minted).
+/// body a worker mutates (borrowed `&mut` in place from the bodies registry), and
+/// the [`Outcome`] the worker produced (changed / rename / minted).
 struct ParallelEntry<'a, 'str> {
     index: usize,
     fun_id: FunctionId,
     name: std::sync::Arc<str>,
-    before_targets: Vec<FunctionId>,
     body: &'a mut FunctionBody<'str>,
     outcome: Outcome<'str>,
 }
@@ -1799,14 +1790,12 @@ fn run_stage_parallel(
     threads: usize,
     progress: &mut impl FnMut(PipelineProgress),
 ) -> Result<(), String> {
-    // 1. Snapshot per-function driver metadata that needs `&ctx` — the display
-    //    name and the pre-run call-target set (for the barrier `call_sites` diff)
-    //    before the split borrow freezes the context.
+    // 1. Snapshot per-function display names before the split borrow freezes the
+    //    context.
     let mut metas: Vec<FnMeta> = Vec::with_capacity(fun_ids.len());
     for &fun_id in fun_ids {
         let name: std::sync::Arc<str> = FunctionRef::from_id(ctx, fun_id).name().into();
-        let before_targets = ctx.direct_call_targets(fun_id);
-        metas.push((fun_id, name, before_targets));
+        metas.push((fun_id, name));
     }
 
     let chunk_size = fun_ids.len().div_ceil(threads).max(1);
@@ -1826,16 +1815,13 @@ fn run_stage_parallel(
             .into_iter()
             .zip(slots)
             .enumerate()
-            .map(
-                |(index, ((fun_id, name, before_targets), slot))| ParallelEntry {
-                    index,
-                    fun_id,
-                    name,
-                    before_targets,
-                    body: slot,
-                    outcome: Outcome::default(),
-                },
-            )
+            .map(|(index, ((fun_id, name), slot))| ParallelEntry {
+                index,
+                fun_id,
+                name,
+                body: slot,
+                outcome: Outcome::default(),
+            })
             .collect();
 
         // Contiguous, worklist-ordered chunks — deterministic assignment. Run
@@ -1925,18 +1911,16 @@ fn run_stage_parallel(
         // in worklist order, for the barrier below.
         entries
             .into_iter()
-            .map(|e| (e.fun_id, e.before_targets, e.outcome))
+            .map(|e| (e.fun_id, e.outcome))
             .collect::<Vec<_>>()
     };
 
-    // 6. Barrier (master, worklist order): install minted callees before the
-    //    owner's call sites resync, rebuild `call_sites`, apply the returned
-    //    self-rename, and record dirtiness. The bodies were mutated in place, so
-    //    there is nothing to reinstall.
-    for (fun_id, before_targets, outcome) in results {
+    // 6. Barrier (master, worklist order): install and resolve minted callees,
+    //    apply the returned self-rename, and record dirtiness. The bodies were
+    //    mutated in place, so there is nothing to reinstall.
+    for (fun_id, outcome) in results {
         let installed = install_minted(ctx, &stage.name, outcome.minted)?;
         let patched = resolve_minted_callees(ctx, &stage.name, fun_id, &installed)?;
-        ctx.resync_call_sites(fun_id, &before_targets);
         replay_rename(ctx, &stage.name, fun_id, outcome.rename)?;
         dirty.extend(installed);
         // Opt-in `QCODE_VERIFY` check once the split borrow has ended. A no-op

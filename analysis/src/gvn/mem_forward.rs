@@ -815,12 +815,10 @@ mod tests {
     ) -> R {
         use crate::pipeline::ContextSplit;
         let env = crate::test_util::dummy_env();
-        let before = tc.ctx.direct_call_targets(fid);
         let out = {
             let (bodies, view) = tc.ctx.split(&env);
             f(&mut bodies[fid], view)
         };
-        tc.ctx.resync_call_sites(fid, &before);
         out
     }
 

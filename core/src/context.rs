@@ -758,45 +758,6 @@ impl<'str> Context<'str> {
         self.functions()
     }
 
-    /// The distinct direct-call *targets* of `fun_id`'s live instructions — a cheap
-    /// snapshot taken before a function-pass run so
-    /// [`resync_call_sites`](Self::resync_call_sites) can rebuild the `call_sites`
-    /// cache afterwards (ruling 6 of the parallel-passes plan).
-    pub fn direct_call_targets(&self, fun_id: FunctionId) -> Vec<FunctionId> {
-        let mut targets: Vec<FunctionId> = FunctionRef::from_id(self, fun_id)
-            .blocks()
-            .flat_map(|b| b.instructions())
-            .filter_map(|i| i.mnemonic().call_target())
-            .collect();
-        targets.sort_unstable();
-        targets.dedup();
-        targets
-    }
-
-    /// Rebuild the global `call_sites` cache for `fun_id` after a pass has (possibly)
-    /// rewritten its outgoing calls. `before_targets` is the pre-run snapshot from
-    /// [`direct_call_targets`](Self::direct_call_targets), taken before the pass ran;
-    /// the pass's run must have completed first. For every callee that `fun_id` called
-    /// before or calls now, its site list is stripped of `fun_id`'s entries and
-    /// repopulated from the function's current instructions — a pure diff of derivable
-    /// data, so the cache ends identical regardless of barrier order (ruling 6).
-    pub fn resync_call_sites(&mut self, fun_id: FunctionId, before_targets: &[FunctionId]) {
-        let after: Vec<(FunctionId, InstructionId)> = FunctionRef::from_id(self, fun_id)
-            .blocks()
-            .flat_map(|b| b.instructions())
-            .filter_map(|i| i.mnemonic().call_target().map(|t| (t, i.id)))
-            .collect();
-        let mut affected: Vec<FunctionId> = before_targets.to_vec();
-        affected.extend(after.iter().map(|(t, _)| *t));
-        affected.sort_unstable();
-        affected.dedup();
-        for target in affected {
-            let sites = self.shared.values.call_sites.entry(target).or_default();
-            sites.retain(|site| site.func != fun_id);
-            sites.extend(after.iter().filter(|(t, _)| *t == target).map(|(_, s)| *s));
-        }
-    }
-
     pub fn varnodes(&self) -> impl Iterator<Item = VarnodeRef<'str, '_>> + '_ {
         self.shared.varnodes()
     }
@@ -961,9 +922,7 @@ impl<'str> Context<'str> {
         }
 
         // Phase 6: rebuild `target`'s reverse-use map from its live instructions,
-        // since phase 2 rewrote operands in place. `call_sites` is left untouched:
-        // the clones registered their sites when created, and the deletions in phase
-        // 6 dropped the originals'.
+        // since phase 2 rewrote operands in place.
         self.rebuild_users(target);
         addresses.refresh(self);
         block_map
@@ -1440,7 +1399,7 @@ impl<'str> Context<'str> {
     // `Context`). Each reads/writes `self.bodies[id.func]`. -----
 
     /// Appends an instruction to `func`'s body and records all its operands in the
-    /// `users` map (and the `call_sites` cache for a direct call).
+    /// `users` map.
     ///
     /// # Immutability invariant
     ///
@@ -1450,7 +1409,6 @@ impl<'str> Context<'str> {
     /// instead.
     pub fn push_insn(&mut self, func: FunctionId, insn: Instruction<'str>) -> InstructionId {
         let args = insn.mnemonic().args();
-        let call_target = insn.mnemonic().call_target();
         let local = self.bodies[func].insns.push(insn);
         let id = InstructionId::new(func, local);
         for arg in args {
@@ -1459,14 +1417,6 @@ impl<'str> Context<'str> {
                 .entry(arg)
                 .or_default()
                 .push(id.localize(func));
-        }
-        if let Some(target) = call_target {
-            self.shared
-                .values
-                .call_sites
-                .entry(target)
-                .or_default()
-                .push(id);
         }
         id
     }
@@ -1548,7 +1498,7 @@ impl<'str> Context<'str> {
     }
 
     /// Physically removes a set of instructions after pruning their operands
-    /// from reverse-use maps and their direct-call entries from `call_sites`.
+    /// from reverse-use maps.
     /// Call after removing them from their parent blocks and unlinking any CFG
     /// edges owned by terminators.
     pub fn remove_instructions(&mut self, dead: &HashSet<InstructionId>) {
@@ -1556,7 +1506,6 @@ impl<'str> Context<'str> {
         ids.sort_unstable();
         let mut affected_args: HashSet<(FunctionId, crate::value::LocalValueId)> =
             HashSet::default();
-        let mut affected_targets: HashSet<FunctionId> = HashSet::default();
         for &id in &ids {
             assert!(
                 self.contains_instruction(id),
@@ -1564,9 +1513,6 @@ impl<'str> Context<'str> {
             );
             let mnemonic = self.bodies[id.func].insns[id.local].mnemonic();
             affected_args.extend(mnemonic.args().into_iter().map(|arg| (id.func, arg)));
-            if let Some(target) = mnemonic.call_target() {
-                affected_targets.insert(target);
-            }
         }
         for (func, arg) in affected_args {
             let remove_key = if let Some(users) = self.bodies[func].users.get_mut(&arg) {
@@ -1577,11 +1523,6 @@ impl<'str> Context<'str> {
             };
             if remove_key {
                 self.bodies[func].users.remove(&arg);
-            }
-        }
-        for target in affected_targets {
-            if let Some(sites) = self.shared.values.call_sites.get_mut(&target) {
-                sites.retain(|s| !dead.contains(s));
             }
         }
         for id in ids {
@@ -1850,14 +1791,6 @@ impl<'str> Context<'str> {
             }
         }
 
-        // Drop this instruction's old call edge (if it was a direct call) before
-        // overwriting the mnemonic; the new one's edge is recorded below.
-        if let Some(target) = self.instruction(id).mnemonic().call_target()
-            && let Some(sites) = self.shared.values.call_sites.get_mut(&target)
-        {
-            sites.retain(|&site| site != id);
-        }
-
         *Instruction::from_id_mut(self, id).mnemonic_mut() = mnemonic;
 
         for arg in self.instruction(id).mnemonic().args() {
@@ -1866,14 +1799,6 @@ impl<'str> Context<'str> {
                 .entry(arg)
                 .or_default()
                 .push(id.localize(func));
-        }
-        if let Some(target) = self.instruction(id).mnemonic().call_target() {
-            self.shared
-                .values
-                .call_sites
-                .entry(target)
-                .or_default()
-                .push(id);
         }
     }
 
@@ -2933,9 +2858,6 @@ mod tests {
                 ..
             }) if *actual == Callee::Real(target) && args.is_empty()
         ));
-
-        // Rewriting the indirect call into a direct one records the call edge.
-        assert_eq!(ctx.shared.values.call_sites_of(target), &[call_id]);
     }
 
     #[test]
@@ -2967,38 +2889,6 @@ mod tests {
             vec![f_ids[1]],
             "an SSA query must not pick up the same local key from another function"
         );
-    }
-
-    #[test]
-    fn call_sites_track_direct_calls_through_replace_and_remove() {
-        let mut ctx = Context::new();
-        qcode!(
-            ctx,
-            "
-            varnode i64 ptr;
-            <block>
-                call [ptr];
-            "
-        );
-        let call_id = BasicBlock::from_id(&ctx, block).instruction_ids()[0];
-        let target = FunctionBody::make(&mut ctx, "target".into()).unwrap().id;
-
-        // Indirect calls have no static target, so nothing is recorded yet.
-        assert!(ctx.shared.values.call_sites_of(target).is_empty());
-
-        ctx.replace_instruction_mnemonic(
-            call_id,
-            Mnemonic::Call(Call {
-                target: Callee::Real(target),
-                args: vec![],
-                clobbers: vec![],
-            }),
-        );
-        assert_eq!(ctx.shared.values.call_sites_of(target), &[call_id]);
-
-        // Removing the instruction prunes its call edge.
-        ctx.remove_instruction(call_id);
-        assert!(ctx.shared.values.call_sites_of(target).is_empty());
     }
 
     #[test]

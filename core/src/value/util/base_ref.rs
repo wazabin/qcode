@@ -47,9 +47,9 @@ pub enum HostRef<'a, 'str> {
 }
 
 impl<'a, 'str> HostRef<'a, 'str> {
-    /// The whole `&Context`, for **module-scope-only** reads (cross-function
-    /// body walks such as `FunctionRef::callees`/`callers`). Panics on a
-    /// checked-out host, which by design carries no `&Context`.
+    /// The whole `&Context`, for **module-scope-only** reads such as rendering
+    /// qualified values. Panics on a checked-out host, which by design carries
+    /// no `&Context`.
     pub fn module_ctx(self) -> &'a Context<'str> {
         match self {
             HostRef::Module(c) => c,

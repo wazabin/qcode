@@ -38,12 +38,10 @@ pub use qcode::value::FunctionBody;
 pub(crate) fn install_minted_for_test<'str>(
     ctx: &mut qcode::context::Context<'str>,
     owner: qcode::value::FunctionId,
-    before_targets: &[qcode::value::FunctionId],
     minted: Vec<Minted<'str>>,
 ) {
     let installed = pass::install_minted(ctx, "test", minted).expect("minted install");
     pass::resolve_minted_callees(ctx, "test", owner, &installed).expect("minted callee resolution");
-    ctx.resync_call_sites(owner, before_targets);
 }
 pub(crate) use pass::with_checked_out_body;
 pub use pass::{

@@ -18,7 +18,7 @@ use crate::{
         block::EdgeData,
         block::cfg::{EdgeId, LocalBlockId},
         block_param::{BlockParam, BlockParamId, LocalParamId},
-        insn::{Branch, LocalInsnId, Mnemonic},
+        insn::{LocalInsnId, Mnemonic},
         util::{
             base_ref::{BaseRef, HostRef, WithCtx, WithCtxMut, WithHost},
             named::{Named, Renameable, update_context_name},
@@ -474,13 +474,10 @@ impl<'str> FunctionBody<'str> {
     // are the algorithm bodies formerly living on the checked-out mutation path
     // (`value::util::host_mut`), ported here with the routing indirection dropped:
     // `self.function_mut(f)` collapses to `self`, `self.read_host()` to `self`'s
-    // own arena accessors, and the global call-site cache maintenance is omitted
-    // (the driver rebuilds `call_sites` by diffing at each barrier, exactly as the
-    // checked-out path did). The owning [`FunctionId`] comes from [`id`](Self::id).
+    // own arena accessors. The owning [`FunctionId`] comes from [`id`](Self::id).
 
     /// Push a fresh instruction into this body's arena, recording each operand's
-    /// use in the reverse-use map. (No call-site maintenance — see the module
-    /// note.)
+    /// use in the reverse-use map.
     pub fn push_insn(&mut self, insn: Instruction<'str>) -> InstructionId {
         let func = self.id;
         let args: Vec<LocalValueId> = insn.mnemonic().args().into_iter().collect();
@@ -1265,52 +1262,6 @@ where
         self.inner().instruction_addrs.iter().copied()
     }
 
-    /// The functions this function directly calls, deduplicated and ordered by
-    /// id. Derived from the IR on demand — like [`BlockRef::successors`] reading
-    /// the CFG — so it always reflects the current instructions. Indirect calls
-    /// have no static target and are not included.
-    ///
-    /// A tail jump into another function's entry — the `Branch` a thunk or
-    /// tail-call emits instead of a [`Call`](Mnemonic::Call) — is also a call
-    /// edge and is included; see [`tail_call_target`].
-    pub fn callees(&'s self) -> Vec<FunctionId> {
-        let ctx = self.ctx();
-        let addresses = crate::address_index::AddressIndex::analyze(ctx);
-        let mut callees = self
-            .blocks()
-            .flat_map(|block| {
-                block
-                    .instructions()
-                    .filter_map(|insn| insn.mnemonic().call_target())
-                    .chain(tail_call_target(ctx, block.id))
-                    .collect::<Vec<_>>()
-            })
-            .collect::<Vec<_>>();
-        // Synthetic edges (e.g. `entry → main`) recovered by a pass but not
-        // backed by a direct call. Keyed by address; included once a function
-        // exists at that address.
-        callees.extend(
-            ctx.shared
-                .values
-                .synthetic_callees_of(self.id)
-                .filter_map(|addr| addresses.function_at(addr)),
-        );
-        callees.sort_by_key(|&id| Into::<usize>::into(id));
-        callees.dedup();
-        callees
-    }
-
-    /// Whether this function contains at least one indirect call — a
-    /// [`CallInd`](Mnemonic::CallInd) through a computed function pointer that
-    /// analysis could not resolve to a static [`Call`](Mnemonic::Call) target.
-    pub fn has_indirect_call(&'s self) -> bool {
-        self.blocks().any(|block| {
-            block
-                .instructions()
-                .any(|insn| matches!(insn.mnemonic(), Mnemonic::CallInd(_)))
-        })
-    }
-
     /// Whether this function contains at least one [`Map`](Mnemonic::Map)
     /// instruction — a lane-wise array map operation. Surfaced as an advanced
     /// filter in the function list.
@@ -1331,44 +1282,6 @@ where
                 .instructions()
                 .any(|insn| matches!(insn.mnemonic(), Mnemonic::Scan(_)))
         })
-    }
-
-    /// The functions that directly call this one, deduplicated and ordered by
-    /// id. Reads the reverse call graph maintained alongside the use-def map and
-    /// resolves each call site to its enclosing function. Counterpart of
-    /// [`callees`](Self::callees).
-    pub fn callers(&'s self) -> Vec<FunctionId> {
-        let ctx = self.ctx();
-        let mut callers = ctx
-            .shared
-            .values
-            .call_sites_of(self.id)
-            .iter()
-            .filter_map(|&site| {
-                Instruction::from_id(ctx, site)
-                    .block()
-                    .and_then(|block| block.function())
-                    .map(|function| function.id)
-            })
-            .collect::<Vec<_>>();
-
-        // Tail-call/thunk callers reach us through a `Branch` into our entry
-        // rather than a recorded call site, so they are absent from the reverse
-        // call-graph map. Recover them from the entry block's CFG predecessors:
-        // any predecessor in another function whose terminator tail-jumps here.
-        if let Some(root) = self.root() {
-            for (_edge, pred_id) in root.predecessors() {
-                if tail_call_target(ctx, pred_id) == Some(self.id)
-                    && let Some(caller) = BasicBlock::from_id(ctx, pred_id).function()
-                {
-                    callers.push(caller.id);
-                }
-            }
-        }
-
-        callers.sort_by_key(|&id| Into::<usize>::into(id));
-        callers.dedup();
-        callers
     }
 
     /// The root block of this function, if it exists.
@@ -1440,27 +1353,6 @@ where
         }
         Ok(())
     }
-}
-
-/// If `block`'s terminator is an unconditional `Branch` into the *entry* of a
-/// *different* function, return that function — the call-graph edge a thunk or
-/// tail call produces (`jmp realfunc`) instead of a [`Call`](Mnemonic::Call).
-///
-/// Returns `None` for a fall-through branch within the same function, a branch
-/// into the middle of another function (not a call), or any non-`Branch`
-/// terminator. Shared by [`FunctionBody::callees`] and [`FunctionBody::callers`] so both
-/// directions of the graph agree on what counts as a tail-call edge.
-fn tail_call_target(ctx: &Context, block: BlockId) -> Option<FunctionId> {
-    let block = BasicBlock::from_id(ctx, block);
-    let Mnemonic::Branch(Branch { target, .. }) = block.instructions().last()?.mnemonic() else {
-        return None;
-    };
-    let caller = block.function()?.id;
-    // The target is a bare body-local index in this block's own arena.
-    let target = BlockId::new(block.id.func, *target);
-    let callee = BasicBlock::from_id(ctx, target).function()?;
-    let enters_at_entry = callee.root().map(|root| root.id) == Some(target);
-    (enters_at_entry && callee.id != caller).then_some(callee.id)
 }
 
 pub type FunctionRef<'str, 'ctx> = BaseRef<HostRef<'ctx, 'str>, FunctionId>;
@@ -2084,36 +1976,6 @@ mod tests {
     fn context_push_block_rejects_foreign_parent() {
         let (mut ctx, a, b, _, _, _, _, _, _) = colliding_body_ids();
         ctx.push_block(b, BasicBlock::detached(a));
-    }
-
-    /// A tail call into another function is a call edge in both directions of the
-    /// graph, even though the IR has no `Call` (strict IR locality: an inter-
-    /// procedural transfer is a `TailCall(FunctionId)`, never a foreign `Branch`).
-    #[test]
-    fn tail_call_is_a_call_edge() {
-        use crate::builder::Builder;
-
-        let mut ctx = Context::new();
-
-        // Callee at 0x2000: a single block that returns.
-        let callee = FunctionBody::make_at_addr(&mut ctx, 0x2000, None).id;
-        let callee_entry = BasicBlock::make(&mut ctx, callee).with_address(0x2000).id;
-        let zero = ctx.get_const(0, 8).id();
-        Builder::from_block(BasicBlock::from_id_mut(&mut ctx, callee_entry)).push_return(zero);
-        FunctionBody::from_id_mut(&mut ctx, callee)
-            .set_root(callee_entry)
-            .unwrap();
-
-        // Thunk at 0x1000: a lone `TailCall` into the callee.
-        let thunk = FunctionBody::make_at_addr(&mut ctx, 0x1000, None).id;
-        let thunk_entry = BasicBlock::make(&mut ctx, thunk).with_address(0x1000).id;
-        Builder::from_block(BasicBlock::from_id_mut(&mut ctx, thunk_entry)).push_tail_call(callee);
-        FunctionBody::from_id_mut(&mut ctx, thunk)
-            .set_root(thunk_entry)
-            .unwrap();
-
-        assert_eq!(FunctionBody::from_id(&ctx, thunk).callees(), vec![callee]);
-        assert_eq!(FunctionBody::from_id(&ctx, callee).callers(), vec![thunk]);
     }
 
     #[test]
