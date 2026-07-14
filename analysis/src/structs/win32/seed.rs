@@ -198,9 +198,9 @@ mod tests {
         qcode!(
             ctx,
             "
+            varnode i32 fs;
             fn f:
                 <entry>
-                    varnode i32 fs;
                     %peb_slot = &fs + i32 0x30;
                     return at i32 0;
             "

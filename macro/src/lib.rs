@@ -51,6 +51,7 @@ struct Names {
     blocks: Vec<String>,
     ssa: Vec<String>,
     varnodes: Vec<String>,
+    temps: Vec<String>,
     block_params: Vec<String>,
     externals: Vec<String>,
 }
@@ -76,6 +77,7 @@ fn compile(expr: &Expr, source: &str) -> syn::Result<proc_macro2::TokenStream> {
         .chain(&names.blocks)
         .chain(&names.ssa)
         .chain(&names.varnodes)
+        .chain(&names.temps)
         .chain(&names.block_params)
         .map(String::as_str)
         .collect();
@@ -117,6 +119,7 @@ fn compile(expr: &Expr, source: &str) -> syn::Result<proc_macro2::TokenStream> {
     let block_binds = bind(quote!(BlockId), quote!(block), &names.blocks);
     let ssa_binds = bind(quote!(InstructionId), quote!(ssa), &names.ssa);
     let varnode_binds = bind(quote!(VarnodeId), quote!(varnode), &names.varnodes);
+    let temp_binds = bind(quote!(TempId), quote!(temp), &names.temps);
     let param_binds = bind(
         quote!(BlockParamId),
         quote!(block_param),
@@ -137,6 +140,7 @@ fn compile(expr: &Expr, source: &str) -> syn::Result<proc_macro2::TokenStream> {
         #(#block_binds)*
         #(#ssa_binds)*
         #(#varnode_binds)*
+        #(#temp_binds)*
         #(#param_binds)*
         let _ = &__qcode_syms;
     })
@@ -158,9 +162,16 @@ fn resolve_crate(name: &str) -> syn::Result<proc_macro2::TokenStream> {
 
 fn collect_program(program: &Program, names: &mut Names) {
     match &program.kind {
-        ProgramKind::Statements(stmts) => collect_statements(stmts, names),
+        ProgramKind::Statements(stmts) => {
+            let split = stmts
+                .iter()
+                .position(|stmt| !matches!(stmt.inner(), Statement::LocalDecl { .. }))
+                .unwrap_or(stmts.len());
+            collect_statements(&stmts[..split], names, false);
+            collect_statements(&stmts[split..], names, true);
+        }
         ProgramKind::Functions { varnodes, fns } => {
-            collect_statements(varnodes, names);
+            collect_statements(varnodes, names, false);
             for fn_decl in fns {
                 collect_fn(fn_decl, names);
             }
@@ -170,18 +181,24 @@ fn collect_program(program: &Program, names: &mut Names) {
 
 fn collect_fn(fn_decl: &FnDecl, names: &mut Names) {
     push_unique(&mut names.functions, &fn_decl.name);
-    collect_statements(&fn_decl.statements, names);
+    collect_statements(&fn_decl.statements, names, true);
 }
 
-fn collect_statements(stmts: &[Statement], names: &mut Names) {
+fn collect_statements(stmts: &[Statement], names: &mut Names, local_temps: bool) {
     for stmt in stmts {
-        collect_statement(stmt.inner(), names);
+        collect_statement(stmt.inner(), names, local_temps);
     }
 }
 
-fn collect_statement(stmt: &Statement, names: &mut Names) {
+fn collect_statement(stmt: &Statement, names: &mut Names, local_temps: bool) {
     match stmt {
-        Statement::LocalDecl { name, .. } => push_unique(&mut names.varnodes, name),
+        Statement::LocalDecl { name, .. } => {
+            if local_temps {
+                push_unique(&mut names.temps, name);
+            } else {
+                push_unique(&mut names.varnodes, name);
+            }
+        }
         Statement::Assign { name, expr, .. } => {
             push_unique(&mut names.ssa, name);
             collect_expr(expr, names);
@@ -233,7 +250,7 @@ fn collect_statement(stmt: &Statement, names: &mut Names) {
         }
         Statement::ReturnValue { value, .. } => collect_atom(value, names),
         Statement::Assert { condition, .. } => collect_atom(condition, names),
-        Statement::Commented { inner, .. } => collect_statement(inner, names),
+        Statement::Commented { inner, .. } => collect_statement(inner, names, local_temps),
     }
 }
 

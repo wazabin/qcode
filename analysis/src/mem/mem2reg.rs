@@ -1947,7 +1947,9 @@ impl<'str> Mem2Reg<'_, 'str> {
 mod tests {
 
     use jstd::graph::analysis::compute_dominators;
-    use qcode::value::{BasicBlock, FunctionBody, Instruction, LocalValueId, insn::Mnemonic};
+    use qcode::value::{
+        BasicBlock, FunctionBody, Instruction, LocalValueId, TempRef, insn::Mnemonic,
+    };
     use qcode_macro::qcode;
 
     use super::*;
@@ -3558,16 +3560,20 @@ mod tests {
             let mut b = Builder::from_block(BasicBlock::from_id_mut(&mut tc.ctx, entry));
             let temp = b.make_temp(4);
             let val = b.context_mut().get_const(7u64, 4).id();
-            let space = Varnode::from_id(b.context(), temp).space().id;
-            b.push_store(val, ValueId::Varnode(temp), space);
+            let space = qcode::space::LocalMemorySpaceId::Temp(
+                TempRef::new(b.view(), temp).space().id.localize(f),
+            );
+            b.push_store(val, ValueId::Temp(temp), space);
             let ret = b.context_mut().get_const(0u64, 4).id();
             b.push_return(ret);
             temp
         };
         let load_id = {
             let mut b = Builder::from_block(BasicBlock::from_id_mut(&mut tc.ctx, orphan));
-            let space = Varnode::from_id(b.context(), temp).space().id;
-            let load = b.push_load::<false>(ValueId::Varnode(temp), 4, space).id();
+            let space = qcode::space::LocalMemorySpaceId::Temp(
+                TempRef::new(b.view(), temp).space().id.localize(f),
+            );
+            let load = b.push_load::<false>(ValueId::Temp(temp), 4, space).id();
             let ret = b.context_mut().get_const(0u64, 4).id();
             b.push_return(ret);
             load
@@ -3590,7 +3596,7 @@ mod tests {
         let entry_has_store = BasicBlock::from_id(&tc.ctx, entry).iter().any(|insn| {
             matches!(
                 insn.mnemonic(),
-                Mnemonic::Store(Store { ptr, .. }) if *ptr == LocalValueId::Varnode(temp)
+                Mnemonic::Store(Store { ptr, .. }) if *ptr == LocalValueId::Temp(temp.local)
             )
         });
         assert!(

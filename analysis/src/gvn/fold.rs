@@ -670,9 +670,9 @@ mod tests {
         qcode!(
             ctx,
             "
+            varnode i32 fs;
             fn f:
                 <entry>
-                    varnode i32 fs;
                     %c = i32 0x31 + i32 0x32;
                     %addr = &fs + %c;
                     %v = load(fs:4, %addr);
@@ -766,10 +766,10 @@ mod tests {
         qcode!(
             ctx,
             "
+            varnode i32 fs;
+            varnode i32 slot;
             fn f:
                 <entry>
-                    varnode i32 fs;
-                    varnode i32 slot;
                     store(slot:4, &slot <- i32 0x1f1e1d2c);
                     store(slot:1, &slot <- i8 0x30);
                     %lo = load(slot:1, &slot);

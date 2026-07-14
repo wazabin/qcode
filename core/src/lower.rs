@@ -22,7 +22,7 @@ use crate::{
     types::AggregateField,
     value::{
         BasicBlock, BlockParam, BlockParamId, FunctionBody, FunctionId, Instruction, InstructionId,
-        Renameable, Value, ValueId, ValueRef, Varnode, VarnodeId,
+        Renameable, TempId, TempRef, Value, ValueId, ValueRef, Varnode, VarnodeId,
         block::BlockId,
         insn::{Callee, IntrinsicId},
     },
@@ -41,6 +41,7 @@ pub struct Symbols {
     pub blocks: HashMap<String, BlockId>,
     pub ssa: HashMap<String, InstructionId>,
     pub varnodes: HashMap<String, VarnodeId>,
+    pub temps: HashMap<String, TempId>,
     pub block_params: HashMap<String, BlockParamId>,
 }
 
@@ -56,6 +57,9 @@ impl Symbols {
     }
     pub fn varnode(&self, name: &str) -> VarnodeId {
         self.varnodes[name]
+    }
+    pub fn temp(&self, name: &str) -> TempId {
+        self.temps[name]
     }
     pub fn block_param(&self, name: &str) -> BlockParamId {
         self.block_params[name]
@@ -145,6 +149,7 @@ pub fn lower_program_with_externals(
 #[derive(Clone, Copy)]
 enum Local {
     Varnode(VarnodeId),
+    Temp(TempId),
     Instruction(InstructionId),
     BlockParam(BlockParamId),
 }
@@ -153,6 +158,7 @@ impl Local {
     fn value_id(self) -> ValueId {
         match self {
             Local::Varnode(id) => id.into(),
+            Local::Temp(id) => id.into(),
             Local::Instruction(id) => id.into(),
             Local::BlockParam(id) => id.into(),
         }
@@ -480,8 +486,8 @@ impl Lowerer<'_, '_, '_> {
                 let id = self
                     .b
                     .make_named_temp(Cow::Owned(name.clone()), *size_bytes);
-                self.locals.insert(name.clone(), Local::Varnode(id));
-                self.symbols.varnodes.insert(name.clone(), id);
+                self.locals.insert(name.clone(), Local::Temp(id));
+                self.symbols.temps.insert(name.clone(), id);
             }
 
             Statement::Assign {
@@ -973,20 +979,31 @@ impl Lowerer<'_, '_, '_> {
                     .get(name)
                     .copied()
                     .ok_or_else(|| format!("unknown varnode `{name}` in addressof"))?;
-                let Local::Varnode(vid) = local else {
-                    return Err(format!("`&{name}`: addressof applies only to varnodes"));
+                let (addr_size, value) = match local {
+                    Local::Varnode(vid) => (
+                        Varnode::from_id(self.b.context(), vid).space().addr_size,
+                        vid.into(),
+                    ),
+                    Local::Temp(id) => (
+                        TempRef::new(self.b.view(), id).space().addr_size(),
+                        id.into(),
+                    ),
+                    _ => {
+                        return Err(format!(
+                            "`&{name}`: addressof applies only to memory values"
+                        ));
+                    }
                 };
                 // `&v` yields an address: its width is the space's pointer width,
                 // not `v`'s value width.
-                if let Some(expected) = typed.size_bytes {
-                    let addr_size = Varnode::from_id(self.b.context(), vid).space().addr_size;
-                    if addr_size != expected {
-                        return Err(format!(
-                            "qcode size mismatch for `&{name}`: expected {expected} bytes, got {addr_size}"
-                        ));
-                    }
+                if let Some(expected) = typed.size_bytes
+                    && addr_size != expected
+                {
+                    return Err(format!(
+                        "qcode size mismatch for `&{name}`: expected {expected} bytes, got {addr_size}"
+                    ));
                 }
-                Ok(local.value_id())
+                Ok(value)
             }
             Atom::Int(value) => {
                 let size = typed.size_bytes.or(size_hint).unwrap_or(8);
@@ -1037,9 +1054,9 @@ impl Lowerer<'_, '_, '_> {
                 .get(name)
                 .copied()
                 .ok_or_else(|| format!("unknown varnode `{name}`"))?;
-            let Local::Varnode(_) = local else {
+            if !matches!(local, Local::Varnode(_) | Local::Temp(_)) {
                 return Err(format!("`{name}` is not a varnode"));
-            };
+            }
             Ok(local.value_id())
         } else {
             self.atom(typed, None)

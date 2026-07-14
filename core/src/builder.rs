@@ -41,8 +41,8 @@ use crate::{
     space::{LocalMemorySpaceId, SPACE_CONST, Space, SpaceId, SpaceType},
     types::{AggregateField, TypeId},
     value::{
-        BodyView, FunctionBody, Instruction, ModuleView, QCodeView, Renameable, TempSpace, Value,
-        ValueId, ValueRef,
+        BodyView, FunctionBody, Instruction, ModuleView, QCodeView, Renameable, Temp, TempId,
+        TempSpace, Value, ValueId, ValueRef,
         block::{BasicBlock, BlockId, EdgeId},
         block_param::BlockParamMutRef,
         function::FunctionId,
@@ -54,9 +54,12 @@ use crate::{
             Scan, Sext, Store, TailCall, Tuple, Unary, Unop, Zext,
         },
         util::{base_ref::BaseRef, pass_backing::PassBacking},
-        varnode::{Varnode, VarnodeId},
+        varnode::Varnode,
     },
 };
+
+#[cfg(test)]
+use crate::value::TempRef;
 
 /// The IR mutation surface the [`Builder`] needs, named with a `bb_` prefix so a
 /// backing type exposes it without method-name ambiguity.
@@ -306,52 +309,55 @@ macro_rules! cmp_pair {
     };
 }
 
-/// Temp-space minting is a **module-Builder-only** capability (context-split
-/// Option A): a fresh temporary address space is a `&mut Shared` push, so only
-/// the Builder instantiated over `&mut Context` (the lifter / lowering / emulator
-/// construction path) can mint one. A parallel-safe function-pass Builder holds a
-/// frozen shared view and therefore cannot — and, per the audit, never needs to
-/// (every temp-minting call site is on the `&mut Context` path). Restricting
-/// these to the concrete instantiation makes that boundary a compile-time fact
-/// instead of a runtime `unimplemented!()` on the checked-out host.
-impl<'str, 'ctx> Builder<'str, 'ctx, &'ctx mut Context<'str>> {
-    pub fn make_temp(&mut self, size: usize) -> VarnodeId {
-        let space = self.context_mut().make_temp_space();
-        Varnode::make(self.context_mut(), 0, size, space).id
-    }
-
-    /// Creates a new temporary value with the given name and size.
-    /// This value is a memory value so does not need to follow any SSA rules.
-    /// The name is deduplicated with a numeric suffix if already taken in the context.
-    pub fn make_named_temp(&mut self, name: Cow<'str, str>, size: usize) -> VarnodeId {
-        let space = self.context_mut().make_temp_space();
-        let id = Varnode::make(self.context_mut(), 0, size, space).id;
-        let unique_name = self.context_mut().get_unique_name(name);
-        Varnode::from_id_mut(self.context_mut(), id)
-            .rename(unique_name.clone())
-            .expect("This name was deduplicated");
-        self.context_mut().shared.spaces[space].name = Some(unique_name.as_ref().into());
-        id
-    }
-
-    /// Creates a new temporary value identified by an integer `label`, used to
-    /// derive its display name (`v{label}`) lazily.
-    ///
-    /// Unlike [`make_named_temp`](Self::make_named_temp), this does not allocate a
-    /// name `String`, probe for a unique name, or insert into the context's name
-    /// map — so it stays off the per-instruction hot path. The temporary's
-    /// identity is its [`VarnodeId`]; callers that need distinct temporaries are
-    /// responsible for using distinct varnodes (the emitter keys them by
-    /// `(size, local)`), so no name-uniqueness check is needed.
-    pub fn make_temp_labeled(&mut self, label: u32, size: usize) -> VarnodeId {
-        let space = self.context_mut().make_temp_space();
-        let id = Varnode::make(self.context_mut(), 0, size, space).id;
-        Varnode::from_id_mut(self.context_mut(), id).set_label(label);
-        id
-    }
-}
-
 impl<'str, 'ctx, Ctx: BuilderBacking<'str>> Builder<'str, 'ctx, Ctx> {
+    fn fresh_temp_space(&mut self, name: Option<&str>) -> crate::value::TempSpaceId {
+        let (word_size, addr_size) = {
+            let default = self.shr().space(self.shr().default_space);
+            (default.word_size, default.addr_size)
+        };
+        let func = self.block.id.func;
+        self.block
+            .host_mut()
+            .bb_function_mut(func)
+            .push_temp_space(TempSpace::new(name, word_size, addr_size))
+    }
+
+    /// Creates an anonymous body-local temporary memory value.
+    pub fn make_temp(&mut self, size: usize) -> TempId {
+        let space = self.fresh_temp_space(None);
+        self.block
+            .host_mut()
+            .bb_function_mut(space.func)
+            .push_temp(Temp::new(0, size, space.local))
+    }
+
+    /// Creates a named body-local temporary memory value.
+    pub fn make_named_temp(&mut self, name: Cow<'str, str>, size: usize) -> TempId {
+        let func = self.block.id.func;
+        let unique = self
+            .block
+            .host_mut()
+            .bb_function_mut(func)
+            .names
+            .unique(name);
+        let space = self.fresh_temp_space(Some(unique.as_ref()));
+        self.block
+            .host_mut()
+            .bb_function_mut(func)
+            .push_temp(Temp::new(0, size, space.local).with_name(unique))
+    }
+
+    /// Creates a body-local temporary identified by a SLEIGH local label.
+    pub fn make_temp_labeled(&mut self, label: u32, size: usize) -> TempId {
+        let space = self.fresh_temp_space(None);
+        let mut temp = Temp::new(0, size, space.local);
+        temp.label = Some(label);
+        self.block
+            .host_mut()
+            .bb_function_mut(space.func)
+            .push_temp(temp)
+    }
+
     /// Creates a builder positioned at `block`.
     ///
     /// The block is borrowed mutably for the lifetime `'ctx`. New instructions
@@ -483,6 +489,20 @@ impl<'str, 'ctx, Ctx: BuilderBacking<'str>> Builder<'str, 'ctx, Ctx> {
                 let id = Varnode::make(self.context_mut(), base, range.len(), space).id;
 
                 Varnode::from_id(self.shr(), id).into()
+            }
+
+            ValueRef::Temp(temp_ref) => {
+                if range.end > temp_ref.size() {
+                    return None;
+                }
+                let func = self.block.id.func;
+                let temp = Temp::new(
+                    temp_ref.address() + range.start as i64,
+                    range.len(),
+                    temp_ref.space().id.localize(func),
+                );
+                let id = self.block.host_mut().bb_function_mut(func).push_temp(temp);
+                self.get_value(id.into())
             }
 
             ValueRef::Instruction(insn) => {
@@ -807,9 +827,9 @@ impl<'str, 'ctx, Ctx: BuilderBacking<'str>> Builder<'str, 'ctx, Ctx> {
         LocalMemorySpaceId::Temp(id.local)
     }
 
-    /// Ensures an operand is not a varnode.
-    /// If the operand is a varnode, emits a load from the varnode into a new temporary local, and returns the temp.
-    /// If the operand is already a local, returns it as-is.
+    /// Ensures an operand is not a memory value.
+    /// If the operand is a shared varnode or body-local temporary, emits a load
+    /// and returns its SSA result. Other values are already directly usable.
     pub fn ensure_local(&mut self, src: ValueId) -> ValueId {
         let value = self.get_value(src);
 
@@ -836,6 +856,31 @@ impl<'str, 'ctx, Ctx: BuilderBacking<'str>> Builder<'str, 'ctx, Ctx> {
                 };
 
                 id
+            }
+
+            ValueRef::Temp(temp) => {
+                let func = self.block.id.func;
+                let size = temp.size();
+                let space = LocalMemorySpaceId::Temp(temp.space().id.localize(func));
+                let name = temp.name().map(str::to_owned);
+                let id = self
+                    .push_load::<false>(src, size, space)
+                    .id()
+                    .as_instruction()
+                    .expect("non-constant temporary load creates an instruction");
+
+                if let Some(name) = name {
+                    let unique = self
+                        .block
+                        .host_mut()
+                        .bb_function_mut(func)
+                        .names
+                        .unique(Cow::Owned(name.to_lowercase()));
+                    self.rename_insn(id, unique)
+                        .expect("temporary load name was deduplicated");
+                }
+
+                id.into()
             }
 
             _ => src,
@@ -1796,11 +1841,22 @@ impl<'str, 'ctx, Ctx: BuilderBacking<'str>> Builder<'str, 'ctx, Ctx> {
     pub fn push_copy(
         &mut self,
         src: ValueId,
-        dst: VarnodeId,
+        dst: impl Into<ValueId>,
     ) -> InstructionRef<'str, '_, Ctx::ReadView<'_>> {
-        let node = Varnode::from_id(self.shr(), dst);
-        let size = node.size();
-        let space = node.space().id;
+        let dst = dst.into();
+        let (size, space, name) = match self.get_value(dst) {
+            ValueRef::Varnode(node) => (
+                node.size(),
+                LocalMemorySpaceId::Shared(node.space().id),
+                node.name().map(str::to_owned),
+            ),
+            ValueRef::Temp(temp) => (
+                temp.size(),
+                LocalMemorySpaceId::Temp(temp.space().id.localize(self.block.id.func)),
+                temp.name().map(str::to_owned),
+            ),
+            _ => panic!("copy destination must be a varnode or body-local temporary"),
+        };
 
         const LANE_SIZE: usize = 8;
 
@@ -1819,7 +1875,7 @@ impl<'str, 'ctx, Ctx: BuilderBacking<'str>> Builder<'str, 'ctx, Ctx> {
                 let src_lane = self.ensure_local(src_lane);
 
                 let dst_lane = self
-                    .get_range(dst.into(), offset..offset + lane_size)
+                    .get_range(dst, offset..offset + lane_size)
                     .expect("lane range in bounds")
                     .id();
 
@@ -1828,15 +1884,15 @@ impl<'str, 'ctx, Ctx: BuilderBacking<'str>> Builder<'str, 'ctx, Ctx> {
                         Mnemonic::Store(Store {
                             src: self.loc(src_lane),
                             ptr: self.loc(dst_lane),
-                            space: space.into(),
+                            space,
                             size: lane_size,
                         }),
                         0,
-                        Some(space),
+                        space.shared(),
                     )
                     .id;
 
-                if let Some(name) = Varnode::from_id(self.shr(), dst).name() {
+                if let Some(name) = &name {
                     let name = Cow::Owned(format!("{}_lane{lane}", name.to_lowercase()));
                     let _ = self.rename_insn(id, name);
                 }
@@ -1852,17 +1908,17 @@ impl<'str, 'ctx, Ctx: BuilderBacking<'str>> Builder<'str, 'ctx, Ctx> {
                 .push_instruction_in_space(
                     Mnemonic::Store(Store {
                         src: self.loc(src),
-                        ptr: self.loc(dst.into()),
-                        space: space.into(),
+                        ptr: self.loc(dst),
+                        space,
                         size,
                     }),
                     0,
-                    Some(space),
+                    space.shared(),
                 )
                 .id;
 
             // Add a name hint for the store instruction for easier debugging
-            if let Some(name) = Varnode::from_id(self.shr(), dst).name() {
+            if let Some(name) = &name {
                 let lowered = name.to_lowercase();
                 let func = self.block.id.func;
                 let name = self
@@ -2559,8 +2615,14 @@ mod tests {
         let other_value = builder.make_named_temp("dup".into(), 4);
         builder.finalize(0x1000);
 
-        assert_eq!(Varnode::from_id(&ctx, value).name(), Some("dup"));
-        assert_eq!(Varnode::from_id(&ctx, other_value).name(), Some("dup_1"));
+        assert_eq!(
+            TempRef::new(ModuleView::new(&ctx), value).name(),
+            Some("dup")
+        );
+        assert_eq!(
+            TempRef::new(ModuleView::new(&ctx), other_value).name(),
+            Some("dup_1")
+        );
     }
 
     #[test]
@@ -2581,12 +2643,10 @@ mod tests {
         };
 
         assert_ne!(first, second);
-        let first = Varnode::from_id(&ctx, first);
-        let second = Varnode::from_id(&ctx, second);
+        let first = TempRef::new(ModuleView::new(&ctx), first);
+        let second = TempRef::new(ModuleView::new(&ctx), second);
         assert_eq!((first.label(), second.label()), (Some(7), Some(7)));
         assert_ne!(first.space().id, second.space().id);
-        assert!(matches!(first.space().ty, SpaceType::Temporary));
-        assert!(matches!(second.space().ty, SpaceType::Temporary));
     }
 
     #[test]

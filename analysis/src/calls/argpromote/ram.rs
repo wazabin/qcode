@@ -329,12 +329,12 @@ fn try_promote(
     // unmodelled re-dereference is one whose address is loaded at runtime, which is
     // itself an uncaptured access this check already rejects).
     //
-    // When the footprint isn't fully captured we fall back to *inputs-only* partial
-    // promotion (see [`apply_partial`]) — seed each read snapshot into REAL ram,
-    // leave every load/store in place, surface no write-set. The seed is a
-    // no-op-equivalent, so it is sound regardless of aliasing; a downstream forwarder
-    // may then collapse a loaded pointer into a clean by-value param a later
-    // fully-modelled round can shadow-promote.
+    // When the footprint isn't fully captured we may fall back to *inputs-only*
+    // partial promotion (see [`apply_partial`]), but only for read-only memory.
+    // Seeding a snapshot into real RAM in a function that also stores is not
+    // sufficient: a downstream forwarder can replace the later load with the
+    // entry snapshot across an unmodelled aliasing write. Without a proof that
+    // every store is disjoint, leave the function unchanged.
     //
     // We additionally require every write to be **caller-resolvable** (an own-frame
     // local — dead on exit — or a constant `promoted-param + offset`). Then each
@@ -346,6 +346,14 @@ fn try_promote(
         || !all_writes_resolvable(ctx, fid, &promoted, sp_reg)
         || !regions_disjoint(ctx, fid, &promoted, sp_reg)
     {
+        if accesses_in.iter().any(|access| access.is_store) {
+            qcode::pass_log!(
+                debug,
+                "argpromote {}: bail — partial promotion with stores may forward across aliases",
+                FunctionBody::from_id(ctx, fid).name(),
+            );
+            return false;
+        }
         qcode::pass_log!(
             debug,
             "argpromote {}: partial (inputs-only) — footprint not fully modelled",
@@ -939,18 +947,18 @@ fn seed_addr(b: &mut Builder<'_, '_>, base: ValueId, base_size: usize, offset: i
 /// is not fully modelled (a leaked address, or some real-ram access this pass
 /// cannot redirect). It is **inputs-only**: for every promoted deref param it adds
 /// a by-value snapshot param per *read* field and seeds it into **real ram** at
-/// entry (`store(snap → base+offset, ram)`), leaving every load and store in place.
+/// entry (`store(snap → base+offset, ram)`), leaving every load in place.
 /// It redirects no access into shadow, surfaces **no write-set**, and marks nothing
-/// pure — so it is sound even though the function has memory accesses this pass
-/// cannot model: the seed merely re-writes the value the caller loaded from that
-/// same slot (a no-op-equivalent), and nothing is moved to shadow, so there is no
-/// forwarder-collapse exposure.
+/// pure. This path is restricted to functions with no real-RAM stores: otherwise
+/// a downstream forwarder could collapse a load to its entry snapshot across an
+/// unmodelled aliasing write.
 ///
 /// Its purpose is **deep-deref discovery**. Exposing a read such as `load(param + k)`
 /// as a by-value parameter lets a downstream forwarder fold the matching load to it,
 /// turning a pointer *loaded* from `param + k` (i.e. `*(param + k)`) into a clean
 /// by-value pointer param that a later fully-modelled round can shadow-promote.
-/// Writes are deliberately left in place — correct, just not functionalized here.
+/// A function with any store must either take the fully-modelled shadow path or
+/// remain unchanged.
 ///
 /// Idempotent: a read whose snapshot param already exists (matched by name) is
 /// skipped, so re-visiting an already-partially-promoted function adds nothing and

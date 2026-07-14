@@ -384,15 +384,14 @@ mod tests {
     }
 
     #[test]
-    fn unmodelable_access_falls_back_to_partial() {
+    fn unmodelable_store_bails_instead_of_partial_forwarding() {
         // When a real-memory access cannot be captured in the shadow — here a store
         // through an address *loaded from memory* (a multi-level deref the model
         // can't recompute) — the shadow path is unsound (a later store→load forward
-        // could collapse a read across the unmodelled store). Instead of bailing,
-        // we fall back to *partial* promotion: the clean `@p+0` / `@p+0x30` reads
-        // are exposed as by-value snapshot params seeded into REAL ram, and nothing
-        // is redirected into shadow — so the unmodelled store is left untouched and
-        // there is no forwarder-collapse exposure.
+        // could collapse a read across the unmodelled store). Partial snapshot
+        // promotion is also unsafe: a downstream forwarder could
+        // replace the clean read with its entry snapshot across the unmodelled
+        // aliasing store. The RAM channel must leave the function unchanged.
         let mut tc = qcode::testing::TestContext::new();
         let input = stack_input(&mut tc, 4, 8);
         qcode!(
@@ -422,16 +421,12 @@ mod tests {
         set_call(&mut tc, g_call, f, vec![ptr]);
         tc.ctx.add_cfg_edge(g_call, g_cont);
 
+        assert!(!argpromote(&mut tc.ctx));
         assert!(
-            argpromote(&mut tc.ctx),
-            "an unmodelable access must fall back to partial promotion, not bail"
+            !has_val_param(&tc.ctx, f),
+            "a function with an unmodelled store must not gain entry snapshots"
         );
-        assert!(
-            has_val_param(&tc.ctx, f),
-            "the clean reads should be exposed as by-value snapshot params"
-        );
-        // Partial mode never touches shadow: every load/store stays in real ram, so
-        // the unmodelled store cannot be collapsed across.
+        // Bailing leaves every load/store in real RAM.
         let ram = tc.ctx.shared.default_space;
         let all_ram = FunctionBody::from_id(&tc.ctx, f).blocks().all(|b| {
             b.iter().all(|i| match i.mnemonic() {
@@ -442,12 +437,7 @@ mod tests {
         });
         assert!(
             all_ram,
-            "partial mode must not redirect any access into shadow"
-        );
-        // Idempotent: the snapshots already exist, so a re-visit adds nothing.
-        assert!(
-            !argpromote(&mut tc.ctx),
-            "re-running partial promotion must be a no-op (idempotence)"
+            "the bailout must not redirect any access into shadow"
         );
     }
 

@@ -250,16 +250,18 @@ impl<'str, 'ctx> Renameable<'str, 'ctx> for VarnodeMutRef<'str, 'ctx> {
 mod tests {
     use qcode_macro::qcode;
 
-    use super::*;
-    use crate::context::Context;
+    use crate::{
+        context::Context,
+        value::{ModuleView, TempRef},
+    };
 
     #[test]
-    fn varnode_name() {
+    fn body_local_temp_name() {
         let mut ctx = Context::new();
         qcode!(ctx, "<block> varnode i64 ptr; goto <0x1001>;");
 
-        let varnode = Varnode::from_id(&ctx, ptr);
-        assert_eq!(varnode.name(), Some("ptr"));
-        assert_eq!(varnode.space().name.as_deref(), Some("ptr"));
+        let temp = TempRef::new(ModuleView::new(&ctx), ptr);
+        assert_eq!(temp.name(), Some("ptr"));
+        assert_eq!(temp.space().name(), Some("ptr"));
     }
 }
