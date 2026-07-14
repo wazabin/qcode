@@ -3,7 +3,7 @@
 use crate::{
     context::{Context, Shared},
     value::{
-        ValueId,
+        BlockParamRef, BlockRef, FunctionRef, InstructionRef, ValueId,
         block::{BasicBlock, BlockId, EdgeData, EdgeId},
         block_param::{BlockParam, BlockParamId},
         function::{FunctionBody, FunctionId},
@@ -194,29 +194,29 @@ impl<'a, 'str> HostRef<'a, 'str> {
 impl<'a, 'str> HostRef<'a, 'str> {
     /// A [`BlockRef`](crate::value::BlockRef) over `id`, routed to its owning
     /// function's arena through this view. Replaces `BasicBlock::from_id(ctx, id)`.
-    pub fn block_ref(self, id: BlockId) -> BaseRef<HostRef<'a, 'str>, BlockId> {
+    pub fn block_ref(self, id: BlockId) -> BlockRef<'str, 'a, Self> {
         let _ = self.block(id);
-        BaseRef::new(self, id)
+        BlockRef::new(self, id)
     }
 
     /// An [`InstructionRef`](crate::value::InstructionRef) over `id`, body-routed.
     /// Replaces `Instruction::from_id(ctx, id)`.
-    pub fn insn_ref(self, id: InstructionId) -> BaseRef<HostRef<'a, 'str>, InstructionId> {
+    pub fn insn_ref(self, id: InstructionId) -> InstructionRef<'str, 'a, Self> {
         let _ = self.instruction(id);
-        BaseRef::new(self, id)
+        InstructionRef::new(self, id)
     }
 
     /// A [`BlockParamRef`](crate::value::BlockParamRef) over `id`, body-routed.
     /// Replaces `BlockParam::from_id(ctx, id)`.
-    pub fn param_ref(self, id: BlockParamId) -> BaseRef<HostRef<'a, 'str>, BlockParamId> {
+    pub fn param_ref(self, id: BlockParamId) -> BlockParamRef<'str, 'a, Self> {
         let _ = self.block_param(id);
-        BaseRef::new(self, id)
+        BlockParamRef::new(self, id)
     }
 
     /// A [`FunctionRef`](crate::value::FunctionRef) over `id`, body-routed.
     /// Replaces `FunctionBody::from_id(ctx, id)`.
-    pub fn function_ref(self, id: FunctionId) -> BaseRef<HostRef<'a, 'str>, FunctionId> {
-        BaseRef::new(self, id)
+    pub fn function_ref(self, id: FunctionId) -> FunctionRef<'str, 'a, Self> {
+        FunctionRef::new(self, id)
     }
 }
 

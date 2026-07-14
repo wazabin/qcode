@@ -8,7 +8,7 @@
 
 use crate::{
     context::Context,
-    value::{LocalValueId, function::FunctionId},
+    value::{LocalValueId, QCodeView, function::FunctionId},
 };
 
 use super::mnemonic::{Args, MnemonicKind};
@@ -44,6 +44,15 @@ impl Extract {
     pub fn field_name<'a>(&self, ctx: &'a Context<'_>, func: FunctionId) -> Option<&'a str> {
         let agg_ty = ctx.stored_type_of(self.agg.qualify(func))?;
         ctx.shared.types.field_name(agg_ty, self.index)
+    }
+
+    pub fn field_name_view<'ctx, 'str: 'ctx>(
+        &self,
+        view: impl QCodeView<'ctx, 'str>,
+        func: FunctionId,
+    ) -> Option<&'ctx str> {
+        let agg_ty = view.stored_type_of(self.agg.qualify(func))?;
+        view.shared().types.field_name(agg_ty, self.index)
     }
 }
 
@@ -81,6 +90,19 @@ impl Gep {
         let base_ty = ctx.stored_type_of(self.base.qualify(func))?;
         let pointee = ctx.shared.types.pointee_of(base_ty)?;
         ctx.shared
+            .types
+            .field_by_offset(pointee, self.offset)
+            .map(|(_, field)| field.name.as_str())
+    }
+
+    pub fn field_name_view<'ctx, 'str: 'ctx>(
+        &self,
+        view: impl QCodeView<'ctx, 'str>,
+        func: FunctionId,
+    ) -> Option<&'ctx str> {
+        let base_ty = view.stored_type_of(self.base.qualify(func))?;
+        let pointee = view.shared().types.pointee_of(base_ty)?;
+        view.shared()
             .types
             .field_by_offset(pointee, self.offset)
             .map(|(_, field)| field.name.as_str())

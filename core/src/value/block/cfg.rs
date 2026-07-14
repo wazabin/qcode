@@ -5,7 +5,7 @@ use jstd::{
     graph::{Cfg, FxBuildHasher},
 };
 
-use crate::value::{BlockRef, function::FunctionRef, util::base_ref::WithHost};
+use crate::value::{BlockRef, QCodeView, function::FunctionRef};
 
 /// Function-local block index (indexes the owning [`FunctionBody`](crate::value::FunctionBody)'s block arena).
 #[derive(Identifier)]
@@ -43,7 +43,10 @@ pub struct EdgeData {
 // it reads a *checked-out* function correctly inside a `FunctionPass`.
 // ---------------------------------------------------------------------------
 
-impl<'str, 'ctx> Cfg for FunctionRef<'str, 'ctx> {
+impl<'str: 'ctx, 'ctx, R> Cfg for FunctionRef<'str, 'ctx, R>
+where
+    R: QCodeView<'ctx, 'str>,
+{
     type NodeId = BlockId;
 
     // Fixed-seed hasher (not std's `RandomState`), so a block's incident-edge set
@@ -53,7 +56,7 @@ impl<'str, 'ctx> Cfg for FunctionRef<'str, 'ctx> {
     type Hasher = FxBuildHasher;
 
     fn successors(&self, b: BlockId) -> impl Iterator<Item = BlockId> + '_ {
-        let succs: Vec<BlockId> = BlockRef::new(self.host(), b)
+        let succs: Vec<BlockId> = BlockRef::new(self.view, b)
             .successors()
             .map(|(_, s)| s)
             .collect();

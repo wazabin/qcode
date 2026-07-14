@@ -10,12 +10,13 @@ use crate::{
     context::{Context, Shared},
     types::TypeId,
     value::{
-        BasicBlock, BlockId, FunctionBody, FunctionId, Instruction, ValueId,
+        BasicBlock, BlockId, BlockParamRef, BlockRef, FunctionBody, FunctionId, FunctionRef,
+        Instruction, InstructionRef, ValueId,
         block::{EdgeData, EdgeId},
         block_param::{BlockParam, BlockParamId},
         function::FunctionInterface,
         insn::InstructionId,
-        util::base_ref::{BaseRef, HostRef},
+        util::base_ref::HostRef,
     },
 };
 
@@ -93,36 +94,36 @@ where
         }
     }
 
-    fn block_ref(self, id: BlockId) -> BaseRef<Self, BlockId>
+    fn block_ref(self, id: BlockId) -> BlockRef<'str, 'ctx, Self>
     where
         Self: Sized,
     {
         let _ = self.block(id);
-        BaseRef::new(self, id)
+        BlockRef::new(self, id)
     }
 
-    fn insn_ref(self, id: InstructionId) -> BaseRef<Self, InstructionId>
+    fn insn_ref(self, id: InstructionId) -> InstructionRef<'str, 'ctx, Self>
     where
         Self: Sized,
     {
         let _ = self.instruction(id);
-        BaseRef::new(self, id)
+        InstructionRef::new(self, id)
     }
 
-    fn param_ref(self, id: BlockParamId) -> BaseRef<Self, BlockParamId>
+    fn param_ref(self, id: BlockParamId) -> BlockParamRef<'str, 'ctx, Self>
     where
         Self: Sized,
     {
         let _ = self.block_param(id);
-        BaseRef::new(self, id)
+        BlockParamRef::new(self, id)
     }
 
-    fn function_ref(self, id: FunctionId) -> BaseRef<Self, FunctionId>
+    fn function_ref(self, id: FunctionId) -> FunctionRef<'str, 'ctx, Self>
     where
         Self: Sized,
     {
         let _ = self.function(id);
-        BaseRef::new(self, id)
+        FunctionRef::new(self, id)
     }
 }
 
@@ -230,7 +231,7 @@ mod tests {
     use crate::{
         builder::Builder,
         context::Context,
-        value::{BasicBlock, FunctionBody, ValueId},
+        value::{BasicBlock, FunctionBody, ValueId, ValueRef},
     };
 
     use super::*;
@@ -258,6 +259,25 @@ mod tests {
             body.type_of(ValueId::Instruction(insn))
         );
         assert_eq!(module.insn_ref(insn).id, body.insn_ref(insn).id);
+        assert_eq!(
+            module.insn_ref(insn).as_statement().to_string(),
+            body.insn_ref(insn).as_statement().to_string()
+        );
+        assert_eq!(
+            module
+                .function_ref(function)
+                .iter()
+                .map(|block| block.id)
+                .collect::<Vec<_>>(),
+            body.function_ref(function)
+                .iter()
+                .map(|block| block.id)
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(
+            ValueRef::from_view(module, ValueId::Instruction(insn)).to_string(),
+            ValueRef::from_view(body, ValueId::Instruction(insn)).to_string()
+        );
     }
 
     #[test]

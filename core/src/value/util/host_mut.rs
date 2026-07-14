@@ -18,7 +18,7 @@ use crate::{
     context::Context,
     error::{Error, ErrorTy, Result},
     value::{
-        FunctionBody, FunctionId, ValueId,
+        BlockParamRef, BlockRef, FunctionBody, FunctionId, FunctionRef, InstructionRef, ValueId,
         block::{BasicBlock, BlockId, EdgeData, EdgeId},
         block_param::{BlockParam, BlockParamId},
         insn::{Instruction, InstructionId, Mnemonic},
@@ -144,28 +144,19 @@ impl<'a, 'str> PassBacking<'a, 'str> {
     // ---- function-scoped read wrappers --------------------------------------
 
     /// A read [`BlockRef`](crate::value::BlockRef) over `id`, body-routed.
-    pub fn block_ref(&self, id: BlockId) -> super::base_ref::BaseRef<HostRef<'_, 'str>, BlockId> {
+    pub fn block_ref(&self, id: BlockId) -> BlockRef<'str, '_, HostRef<'_, 'str>> {
         self.read_host().block_ref(id)
     }
     /// A read [`InstructionRef`](crate::value::InstructionRef) over `id`.
-    pub fn insn_ref(
-        &self,
-        id: InstructionId,
-    ) -> super::base_ref::BaseRef<HostRef<'_, 'str>, InstructionId> {
+    pub fn insn_ref(&self, id: InstructionId) -> InstructionRef<'str, '_, HostRef<'_, 'str>> {
         self.read_host().insn_ref(id)
     }
     /// A read [`BlockParamRef`](crate::value::BlockParamRef) over `id`.
-    pub fn param_ref(
-        &self,
-        id: BlockParamId,
-    ) -> super::base_ref::BaseRef<HostRef<'_, 'str>, BlockParamId> {
+    pub fn param_ref(&self, id: BlockParamId) -> BlockParamRef<'str, '_, HostRef<'_, 'str>> {
         self.read_host().param_ref(id)
     }
     /// A read [`FunctionRef`](crate::value::FunctionRef) over `id`.
-    pub fn function_ref(
-        &self,
-        id: FunctionId,
-    ) -> super::base_ref::BaseRef<HostRef<'_, 'str>, FunctionId> {
+    pub fn function_ref(&self, id: FunctionId) -> FunctionRef<'str, '_, HostRef<'_, 'str>> {
         self.read_host().function_ref(id)
     }
 

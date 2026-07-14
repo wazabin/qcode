@@ -13,7 +13,7 @@ use crate::{
     context::{Context, Shared},
     space::Space,
     value::{
-        BasicBlock, BlockParam, FunctionBody, LocalBlockId, LocalValueId, ValueId,
+        BasicBlock, FunctionBody, LocalBlockId, LocalValueId, QCodeView, ValueId,
         block::BlockId,
         bytes::BytesRef,
         function::FunctionId,
@@ -87,12 +87,16 @@ impl Token {
 }
 
 /// Accumulator with terse push helpers, kept private to this module.
-struct Seg<'a, 'str> {
-    ctx: &'a Context<'str>,
+struct Seg<'ctx, 'str, R> {
+    view: R,
     out: Vec<Token>,
+    marker: std::marker::PhantomData<&'ctx &'str ()>,
 }
 
-impl<'a, 'str> Seg<'a, 'str> {
+impl<'ctx, 'str: 'ctx, R> Seg<'ctx, 'str, R>
+where
+    R: QCodeView<'ctx, 'str>,
+{
     fn push(&mut self, text: impl Into<String>, kind: TokenKind, link: Option<Link>) {
         self.out.push(Token::new(text, kind, link));
     }
@@ -113,7 +117,7 @@ impl<'a, 'str> Seg<'a, 'str> {
     /// `write!(f, "{} ", type_name)` in `ValueRef`'s `Display`.
     fn ty(&mut self, type_id: crate::types::TypeId) {
         self.push(
-            format!("{} ", self.ctx.shared.types.type_name(type_id)),
+            format!("{} ", self.view.shared().types.type_name(type_id)),
             TokenKind::Type,
             None,
         );
@@ -126,35 +130,39 @@ impl<'a, 'str> Seg<'a, 'str> {
         let link = Some(Link::Value(id));
         match id {
             ValueId::Instruction(iid) => {
-                let r = InstructionRef::from_id(self.ctx, iid);
+                let r = self.view.insn_ref(iid);
                 self.ty(r.type_id());
-                self.push(instruction_atom(self.ctx, iid), TokenKind::Variable, link);
+                self.push(instruction_atom(self.view, iid), TokenKind::Variable, link);
             }
             ValueId::BlockParam(pid) => {
-                let r = BlockParam::from_id(self.ctx, pid);
+                let r = self.view.param_ref(pid);
                 self.ty(r.type_id());
-                self.push(block_param_atom(self.ctx, pid), TokenKind::BlockParam, link);
+                self.push(
+                    block_param_atom(self.view, pid),
+                    TokenKind::BlockParam,
+                    link,
+                );
             }
             ValueId::Literal(lid) => {
-                let r = LiteralRef::from_id(self.ctx, lid);
+                let r = LiteralRef::from_id(self.view.shared(), lid);
                 self.ty(r.type_id());
                 // The literal *atom* is rendered from the whole `&Context`, so a
                 // symbolic block/function literal resolves its target name (a
                 // `&Shared`-backed `LiteralRef` cannot — context-split 5b-ii #1).
-                self.push(literal_atom(self.ctx, lid), TokenKind::Literal, link);
+                self.push(literal_atom_view(self.view, lid), TokenKind::Literal, link);
             }
             ValueId::Bytes(bid) => {
-                let r = BytesRef::from_id(self.ctx, bid);
+                let r = BytesRef::from_id(self.view.shared(), bid);
                 self.ty(r.type_id());
                 self.push(r.to_string(), TokenKind::Bytes, link);
             }
             ValueId::Varnode(vid) => {
-                let r = Varnode::from_id(self.ctx, vid);
+                let r = Varnode::from_id(self.view.shared(), vid);
                 self.push(format!("i{} ", r.size() * 8), TokenKind::Type, None);
                 self.push(r.to_string(), TokenKind::Varnode, link);
             }
             ValueId::Function(fid) => {
-                let name = FunctionBody::from_id(self.ctx, fid).name().to_string();
+                let name = self.view.interface(fid).name.to_string();
                 self.push(
                     format!("<{name}>"),
                     TokenKind::Function,
@@ -165,7 +173,7 @@ impl<'a, 'str> Seg<'a, 'str> {
                 // A block used as a value renders via the block's own `Display`
                 // (never `ValueRef`'s, which routes back here — that would recurse).
                 self.push(
-                    BasicBlock::from_id(self.ctx, bid).to_string(),
+                    self.view.block_ref(bid).to_string(),
                     TokenKind::Label,
                     Some(Link::Block(bid)),
                 );
@@ -180,7 +188,7 @@ impl<'a, 'str> Seg<'a, 'str> {
         match id {
             ValueId::Instruction(iid) => {
                 self.push(
-                    instruction_atom(self.ctx, iid),
+                    instruction_atom(self.view, iid),
                     TokenKind::Variable,
                     Some(Link::Value(id)),
                 );
@@ -195,7 +203,7 @@ impl<'a, 'str> Seg<'a, 'str> {
     /// same arena), used to recover the full [`BlockId`].
     fn branch_target(&mut self, func: FunctionId, target: LocalBlockId, args: &[LocalValueId]) {
         let target = BlockId::new(func, target);
-        let block = BasicBlock::from_id(self.ctx, target);
+        let block = self.view.block_ref(target);
         let name = block.name().unwrap_or("unnamed");
         self.push(
             format!("<{name}"),
@@ -219,16 +227,22 @@ impl<'a, 'str> Seg<'a, 'str> {
 }
 
 /// The bare atom for an instruction result: `%name` or `%tmp<id>`.
-fn instruction_atom(ctx: &Context<'_>, id: crate::value::InstructionId) -> String {
-    match ctx.instruction(id).name.as_deref() {
+fn instruction_atom<'ctx, 'str: 'ctx>(
+    view: impl QCodeView<'ctx, 'str>,
+    id: crate::value::InstructionId,
+) -> String {
+    match view.instruction(id).name.as_deref() {
         Some(name) => format!("%{name}"),
         None => format!("%tmp{:x}", usize::from(id.local)),
     }
 }
 
 /// The bare atom for a block parameter: `@name` or `@param<id>`.
-fn block_param_atom(ctx: &Context<'_>, id: crate::value::BlockParamId) -> String {
-    let r = BlockParam::from_id(ctx, id);
+fn block_param_atom<'ctx, 'str: 'ctx>(
+    view: impl QCodeView<'ctx, 'str>,
+    id: crate::value::BlockParamId,
+) -> String {
+    let r = view.param_ref(id);
     match r.name() {
         Some(name) => format!("@{name}"),
         None => format!("@param{:x}", usize::from(id.local)),
@@ -237,11 +251,15 @@ fn block_param_atom(ctx: &Context<'_>, id: crate::value::BlockParamId) -> String
 
 /// Render an instruction as colored, linkable tokens. Concatenating the tokens'
 /// text equals the instruction's `Display` (`as_statement()`) output.
-pub fn instruction_segments(insn: &InstructionRef<'_, '_>) -> Vec<Token> {
-    let ctx = insn.ctx.module_ctx();
+pub fn instruction_segments<'ctx, 'str: 'ctx, R>(insn: &InstructionRef<'str, 'ctx, R>) -> Vec<Token>
+where
+    R: QCodeView<'ctx, 'str>,
+{
+    let view = insn.view;
     let mut seg = Seg {
-        ctx,
+        view,
         out: Vec::new(),
+        marker: std::marker::PhantomData,
     };
 
     // LHS: `<ty> %name = ` (mirrors `InstructionStatement` + `InstructionRef`'s
@@ -249,7 +267,7 @@ pub fn instruction_segments(insn: &InstructionRef<'_, '_>) -> Vec<Token> {
     if insn.size() != 0 {
         seg.ty(insn.type_id());
         seg.push(
-            instruction_atom(ctx, insn.id),
+            instruction_atom(view, insn.id),
             TokenKind::Variable,
             Some(Link::Value(ValueId::Instruction(insn.id))),
         );
@@ -264,8 +282,8 @@ pub fn instruction_segments(insn: &InstructionRef<'_, '_>) -> Vec<Token> {
     seg.out
 }
 
-fn tuple_with_type(
-    seg: &mut Seg,
+fn tuple_with_type<'ctx, 'str: 'ctx>(
+    seg: &mut Seg<'ctx, 'str, impl QCodeView<'ctx, 'str>>,
     func: FunctionId,
     t: &crate::value::insn::Tuple,
     type_id: crate::types::TypeId,
@@ -277,8 +295,8 @@ fn tuple_with_type(
             seg.punct(", ");
         }
         let name = seg
-            .ctx
-            .shared
+            .view
+            .shared()
             .types
             .field_name(type_id, i)
             .map(str::to_owned)
@@ -290,13 +308,21 @@ fn tuple_with_type(
     seg.punct(");");
 }
 
-fn mnemonic_segments(seg: &mut Seg, func: FunctionId, m: &Mnemonic) {
+fn mnemonic_segments<'ctx, 'str: 'ctx>(
+    seg: &mut Seg<'ctx, 'str, impl QCodeView<'ctx, 'str>>,
+    func: FunctionId,
+    m: &Mnemonic,
+) {
     use crate::value::insn::Unop;
     match m {
         Mnemonic::Load(l) => {
             seg.kw("load");
             seg.punct("(");
-            seg.push(space_name(seg.ctx, l.space), TokenKind::Space, None);
+            seg.push(
+                space_name(seg.view.shared(), l.space),
+                TokenKind::Space,
+                None,
+            );
             seg.punct(":");
             seg.push(l.size.to_string(), TokenKind::Type, None);
             seg.punct(", ");
@@ -306,7 +332,11 @@ fn mnemonic_segments(seg: &mut Seg, func: FunctionId, m: &Mnemonic) {
         Mnemonic::Store(s) => {
             seg.kw("store");
             seg.punct("(");
-            seg.push(space_name(seg.ctx, s.space), TokenKind::Space, None);
+            seg.push(
+                space_name(seg.view.shared(), s.space),
+                TokenKind::Space,
+                None,
+            );
             seg.punct(":");
             seg.push(s.size.to_string(), TokenKind::Type, None);
             seg.punct(", ");
@@ -337,7 +367,7 @@ fn mnemonic_segments(seg: &mut Seg, func: FunctionId, m: &Mnemonic) {
         }
         Mnemonic::Apply(a) => {
             seg.kw("apply ");
-            let (target, link) = callee_name_link(seg.ctx, a.target);
+            let (target, link) = callee_name_link(seg.view, a.target);
             seg.push(target, TokenKind::Function, link);
             seg.punct("(");
             for (i, &arg) in a.args.iter().enumerate() {
@@ -350,7 +380,7 @@ fn mnemonic_segments(seg: &mut Seg, func: FunctionId, m: &Mnemonic) {
         }
         Mnemonic::Call(c) => {
             seg.kw("call fn ");
-            let (target, link) = callee_name_link(seg.ctx, c.target);
+            let (target, link) = callee_name_link(seg.view, c.target);
             seg.push(target, TokenKind::Function, link);
             seg.punct("(");
             for (i, &arg) in c.args.iter().enumerate() {
@@ -360,7 +390,7 @@ fn mnemonic_segments(seg: &mut Seg, func: FunctionId, m: &Mnemonic) {
                 let arg_name = c
                     .target
                     .real()
-                    .map(|target| call_arg_name(seg.ctx, target, i))
+                    .map(|target| call_arg_name(seg.view, target, i))
                     .unwrap_or_else(|| format!("@arg{i}="));
                 seg.push(arg_name, TokenKind::BlockParam, None);
                 seg.value(arg.qualify(func));
@@ -369,7 +399,7 @@ fn mnemonic_segments(seg: &mut Seg, func: FunctionId, m: &Mnemonic) {
         }
         Mnemonic::TailCall(tc) => {
             seg.kw("tailcall fn ");
-            let (target, link) = callee_name_link(seg.ctx, tc.target);
+            let (target, link) = callee_name_link(seg.view, tc.target);
             seg.push(target, TokenKind::Function, link);
             seg.punct("(");
             for (i, &arg) in tc.args.iter().enumerate() {
@@ -479,7 +509,7 @@ fn mnemonic_segments(seg: &mut Seg, func: FunctionId, m: &Mnemonic) {
             seg.punct("(");
             seg.bare_value(e.agg.qualify(func));
             let name = e
-                .field_name(seg.ctx, func)
+                .field_name_view(seg.view, func)
                 .map(str::to_owned)
                 .unwrap_or_else(|| format!("field{}", e.index + 1));
             seg.push(format!(".{name}"), TokenKind::Field, None);
@@ -489,7 +519,7 @@ fn mnemonic_segments(seg: &mut Seg, func: FunctionId, m: &Mnemonic) {
             seg.kw("gep");
             seg.punct("(");
             seg.bare_value(g.base.qualify(func));
-            match g.field_name(seg.ctx, func) {
+            match g.field_name_view(seg.view, func) {
                 Some(name) => seg.push(format!(".{name}"), TokenKind::Field, None),
                 None => {
                     seg.op(" + ");
@@ -499,7 +529,7 @@ fn mnemonic_segments(seg: &mut Seg, func: FunctionId, m: &Mnemonic) {
             seg.punct(");");
         }
         Mnemonic::Map(map) => {
-            let (body, link) = callee_name_link(seg.ctx, map.body);
+            let (body, link) = callee_name_link(seg.view, map.body);
             if map.captures.is_empty() {
                 seg.push(body, TokenKind::Function, link);
                 seg.op(" <$> ");
@@ -518,7 +548,7 @@ fn mnemonic_segments(seg: &mut Seg, func: FunctionId, m: &Mnemonic) {
             }
         }
         Mnemonic::Scan(scan) => {
-            let (body, link) = callee_name_link(seg.ctx, scan.body);
+            let (body, link) = callee_name_link(seg.view, scan.body);
             let body = match scan.body {
                 Callee::Real(_) => format!("@{body}"),
                 Callee::Minted(_) => body,
@@ -547,7 +577,7 @@ fn mnemonic_segments(seg: &mut Seg, func: FunctionId, m: &Mnemonic) {
             }
         }
         Mnemonic::PCodeOp(p) => {
-            let op = seg.ctx.shared.pcode_ops[p.id].to_string();
+            let op = seg.view.shared().pcode_ops[p.id].to_string();
             if let Some(dst) = p.dst {
                 seg.value(dst.qualify(func));
                 seg.op(" = ");
@@ -576,7 +606,14 @@ fn mnemonic_segments(seg: &mut Seg, func: FunctionId, m: &Mnemonic) {
     }
 }
 
-fn cast(seg: &mut Seg, func: FunctionId, kw: &str, prefix: char, size: usize, src: LocalValueId) {
+fn cast<'ctx, 'str: 'ctx>(
+    seg: &mut Seg<'ctx, 'str, impl QCodeView<'ctx, 'str>>,
+    func: FunctionId,
+    kw: &str,
+    prefix: char,
+    size: usize,
+    src: LocalValueId,
+) {
     seg.kw(kw);
     seg.punct("(");
     seg.push(format!("{prefix}{}", size * 8), TokenKind::Type, None);
@@ -585,14 +622,25 @@ fn cast(seg: &mut Seg, func: FunctionId, kw: &str, prefix: char, size: usize, sr
     seg.punct(");");
 }
 
-fn unary_call(seg: &mut Seg, func: FunctionId, kw: &str, src: LocalValueId) {
+fn unary_call<'ctx, 'str: 'ctx>(
+    seg: &mut Seg<'ctx, 'str, impl QCodeView<'ctx, 'str>>,
+    func: FunctionId,
+    kw: &str,
+    src: LocalValueId,
+) {
     seg.kw(kw);
     seg.punct("(");
     seg.value(src.qualify(func));
     seg.punct(");");
 }
 
-fn binary_call(seg: &mut Seg, func: FunctionId, kw: &str, lhs: LocalValueId, rhs: LocalValueId) {
+fn binary_call<'ctx, 'str: 'ctx>(
+    seg: &mut Seg<'ctx, 'str, impl QCodeView<'ctx, 'str>>,
+    func: FunctionId,
+    kw: &str,
+    lhs: LocalValueId,
+    rhs: LocalValueId,
+) {
     seg.kw(kw);
     seg.punct("(");
     seg.value(lhs.qualify(func));
@@ -603,8 +651,8 @@ fn binary_call(seg: &mut Seg, func: FunctionId, kw: &str, lhs: LocalValueId, rhs
 
 /// The space name as printed by `load`/`store`'s `fmt`: the named space, or a
 /// `space: <id>` fallback for an unnamed space.
-fn space_name(ctx: &Context<'_>, space: crate::space::SpaceId) -> String {
-    let space_ref = Space::from_id(ctx, space);
+fn space_name(shared: &Shared<'_>, space: crate::space::SpaceId) -> String {
+    let space_ref = Space::from_id(shared, space);
     match space_ref.name.as_deref() {
         Some(name) => name.to_string(),
         None => format!("space: {space}"),
@@ -613,8 +661,12 @@ fn space_name(ctx: &Context<'_>, space: crate::space::SpaceId) -> String {
 
 /// The `@name=` / `@arg<i>=` prefix for a direct-call argument. Mirrors
 /// `fmt_call_arg_name`.
-fn call_arg_name(ctx: &Context<'_>, target: FunctionId, index: usize) -> String {
-    match FunctionBody::from_id(ctx, target).input_arg_name(index) {
+fn call_arg_name<'ctx, 'str: 'ctx>(
+    view: impl QCodeView<'ctx, 'str>,
+    target: FunctionId,
+    index: usize,
+) -> String {
+    match view.function_ref(target).input_arg_name(index) {
         Some(name) => format!("@{name}="),
         None => format!("@arg{index}="),
     }
@@ -622,10 +674,13 @@ fn call_arg_name(ctx: &Context<'_>, target: FunctionId, index: usize) -> String 
 
 /// Render a real function symbol or an unresolved pass-local placeholder.
 /// Placeholders deliberately carry no link: they are not installed functions.
-fn callee_name_link(ctx: &Context<'_>, callee: Callee) -> (String, Option<Link>) {
+fn callee_name_link<'ctx, 'str: 'ctx>(
+    view: impl QCodeView<'ctx, 'str>,
+    callee: Callee,
+) -> (String, Option<Link>) {
     match callee {
         Callee::Real(id) => (
-            FunctionBody::from_id(ctx, id).name().to_string(),
+            view.interface(id).name.to_string(),
             Some(Link::Function(id)),
         ),
         Callee::Minted(slot) => (format!("<minted:{slot}>"), None),
@@ -637,11 +692,84 @@ fn callee_name_link(ctx: &Context<'_>, callee: Callee) -> (String, Option<Link>)
 /// by writing these.
 pub fn value_tokens(ctx: &Context<'_>, id: ValueId) -> Vec<Token> {
     let mut seg = Seg {
-        ctx,
+        view: crate::value::ModuleView::new(ctx),
         out: Vec::new(),
+        marker: std::marker::PhantomData,
     };
     seg.value(id);
     seg.out
+}
+
+/// Provider-generic value rendering used by immutable arena-cluster refs.
+pub fn value_tokens_view<'ctx, 'str: 'ctx, R>(view: R, id: ValueId) -> Vec<Token>
+where
+    R: QCodeView<'ctx, 'str>,
+{
+    let link = Some(Link::Value(id));
+    let shared = view.shared();
+    let mut out = Vec::new();
+    let mut typed = |type_id, text: String, kind| {
+        out.push(Token::new(
+            format!("{} ", shared.types.type_name(type_id)),
+            TokenKind::Type,
+            None,
+        ));
+        out.push(Token::new(text, kind, link));
+    };
+
+    match id {
+        ValueId::Instruction(iid) => {
+            let insn = view.instruction(iid);
+            let atom = insn.name.as_deref().map_or_else(
+                || {
+                    let local: usize = iid.local.into();
+                    format!("%tmp{local:x}")
+                },
+                |name| format!("%{name}"),
+            );
+            typed(insn.type_id, atom, TokenKind::Variable);
+        }
+        ValueId::BlockParam(pid) => {
+            let param = view.block_param(pid);
+            let atom = param.name.as_deref().map_or_else(
+                || {
+                    let local: usize = pid.local.into();
+                    format!("@param{local:x}")
+                },
+                |name| format!("@{name}"),
+            );
+            typed(param.type_id, atom, TokenKind::BlockParam);
+        }
+        ValueId::Literal(lid) => {
+            let literal = &shared.values.literals[lid];
+            let atom = literal_atom_view(view, lid);
+            typed(literal.type_id, atom, TokenKind::Literal);
+        }
+        ValueId::Bytes(id) => {
+            let value = BytesRef::from_id(shared, id);
+            typed(value.type_id(), value.to_string(), TokenKind::Bytes);
+        }
+        ValueId::Varnode(id) => {
+            let value = Varnode::from_id(shared, id);
+            out.push(Token::new(
+                format!("i{} ", value.size() * 8),
+                TokenKind::Type,
+                None,
+            ));
+            out.push(Token::new(value.to_string(), TokenKind::Varnode, link));
+        }
+        ValueId::Function(id) => out.push(Token::new(
+            format!("<{}>", view.interface(id).name),
+            TokenKind::Function,
+            Some(Link::Function(id)),
+        )),
+        ValueId::BasicBlock(id) => out.push(Token::new(
+            view.block_ref(id).to_string(),
+            TokenKind::Label,
+            Some(Link::Block(id)),
+        )),
+    }
+    out
 }
 
 /// The rendered *atom* (no `<ty>` prefix) of the literal `id`, resolved against
@@ -663,6 +791,23 @@ pub fn literal_atom(ctx: &Context<'_>, id: LiteralId) -> String {
         }
         Some(SymbolicRef::String(s)) => format!("&{:?}", s),
         None if ctx.shared.types.is_bool(literal.type_id) => {
+            (if literal.value != 0 { "true" } else { "false" }).to_string()
+        }
+        None => format!("0x{:x}", literal.value),
+    }
+}
+
+fn literal_atom_view<'ctx, 'str: 'ctx>(view: impl QCodeView<'ctx, 'str>, id: LiteralId) -> String {
+    let shared = view.shared();
+    let literal = &shared.values.literals[id];
+    match &literal.symbolic {
+        Some(SymbolicRef::Block(id)) => view.block_ref(*id).name().map_or_else(
+            || format!("&<0x{:x}>", literal.value),
+            |name| format!("&<{name}>"),
+        ),
+        Some(SymbolicRef::Function(id)) => format!("&<{}>", view.interface(*id).name),
+        Some(SymbolicRef::String(value)) => format!("&{value:?}"),
+        None if shared.types.is_bool(literal.type_id) => {
             (if literal.value != 0 { "true" } else { "false" }).to_string()
         }
         None => format!("0x{:x}", literal.value),

@@ -463,17 +463,17 @@ pub trait Value<'str, 'ctx>: Display {
 /// `ValueRef` is the runtime-typed counterpart to [`ValueId`]. It is
 /// produced by [`Context::get_value`] and borrows the context for `'ctx`.
 /// Use pattern matching to downcast to a concrete reference type.
-pub enum ValueRef<'str, 'ctx> {
+pub enum ValueRef<'str, 'ctx, R = ModuleView<'ctx, 'str>> {
     Literal(LiteralRef<'str, 'ctx>),
     Bytes(BytesRef<'str, 'ctx>),
-    Instruction(InstructionRef<'str, 'ctx>),
-    BasicBlock(BlockRef<'str, 'ctx>),
-    BlockParam(BlockParamRef<'str, 'ctx>),
+    Instruction(InstructionRef<'str, 'ctx, R>),
+    BasicBlock(BlockRef<'str, 'ctx, R>),
+    BlockParam(BlockParamRef<'str, 'ctx, R>),
     Varnode(VarnodeRef<'str, 'ctx>),
-    Function(FunctionRef<'str, 'ctx>),
+    Function(FunctionRef<'str, 'ctx, R>),
 }
 
-impl Debug for ValueRef<'_, '_> {
+impl<R> Debug for ValueRef<'_, '_, R> {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         match self {
             ValueRef::Literal(_) => f.write_str("Literal"),
@@ -487,102 +487,90 @@ impl Debug for ValueRef<'_, '_> {
     }
 }
 
-impl<'str, 'ctx> From<LiteralRef<'str, 'ctx>> for ValueRef<'str, 'ctx> {
+impl<'str, 'ctx, R> From<LiteralRef<'str, 'ctx>> for ValueRef<'str, 'ctx, R> {
     fn from(lit_ref: LiteralRef<'str, 'ctx>) -> Self {
         ValueRef::Literal(lit_ref)
     }
 }
 
-impl<'str, 'ctx> From<BytesRef<'str, 'ctx>> for ValueRef<'str, 'ctx> {
+impl<'str, 'ctx, R> From<BytesRef<'str, 'ctx>> for ValueRef<'str, 'ctx, R> {
     fn from(bytes_ref: BytesRef<'str, 'ctx>) -> Self {
         ValueRef::Bytes(bytes_ref)
     }
 }
 
-impl<'str, 'ctx> From<InstructionRef<'str, 'ctx>> for ValueRef<'str, 'ctx> {
-    fn from(insn_ref: InstructionRef<'str, 'ctx>) -> Self {
+impl<'str, 'ctx, R> From<InstructionRef<'str, 'ctx, R>> for ValueRef<'str, 'ctx, R> {
+    fn from(insn_ref: InstructionRef<'str, 'ctx, R>) -> Self {
         ValueRef::Instruction(insn_ref)
     }
 }
 
-impl<'str, 'ctx> From<BlockRef<'str, 'ctx>> for ValueRef<'str, 'ctx> {
-    fn from(bb_ref: BlockRef<'str, 'ctx>) -> Self {
+impl<'str, 'ctx, R> From<BlockRef<'str, 'ctx, R>> for ValueRef<'str, 'ctx, R> {
+    fn from(bb_ref: BlockRef<'str, 'ctx, R>) -> Self {
         ValueRef::BasicBlock(bb_ref)
     }
 }
 
-impl<'str, 'ctx> From<BlockParamRef<'str, 'ctx>> for ValueRef<'str, 'ctx> {
-    fn from(param_ref: BlockParamRef<'str, 'ctx>) -> Self {
+impl<'str, 'ctx, R> From<BlockParamRef<'str, 'ctx, R>> for ValueRef<'str, 'ctx, R> {
+    fn from(param_ref: BlockParamRef<'str, 'ctx, R>) -> Self {
         ValueRef::BlockParam(param_ref)
     }
 }
 
-impl<'str, 'ctx> From<VarnodeRef<'str, 'ctx>> for ValueRef<'str, 'ctx> {
+impl<'str, 'ctx, R> From<VarnodeRef<'str, 'ctx>> for ValueRef<'str, 'ctx, R> {
     fn from(var_ref: VarnodeRef<'str, 'ctx>) -> Self {
         ValueRef::Varnode(var_ref)
     }
 }
 
-impl<'str, 'ctx> From<FunctionRef<'str, 'ctx>> for ValueRef<'str, 'ctx> {
-    fn from(fn_ref: FunctionRef<'str, 'ctx>) -> Self {
+impl<'str, 'ctx, R> From<FunctionRef<'str, 'ctx, R>> for ValueRef<'str, 'ctx, R> {
+    fn from(fn_ref: FunctionRef<'str, 'ctx, R>) -> Self {
         ValueRef::Function(fn_ref)
     }
 }
 
 impl<'str, 'ctx> ValueRef<'str, 'ctx> {
-    fn inner(&self) -> &dyn Value<'str, 'ctx> {
-        match self {
-            ValueRef::Literal(lit_ref) => lit_ref,
-            ValueRef::Bytes(bytes_ref) => bytes_ref,
-            ValueRef::Instruction(insn_ref) => insn_ref,
-            ValueRef::BasicBlock(bb_ref) => bb_ref,
-            ValueRef::BlockParam(param_ref) => param_ref,
-            ValueRef::Varnode(var_ref) => var_ref,
-            ValueRef::Function(fn_ref) => fn_ref,
-        }
-    }
-
     pub fn new(id: ValueId, ctx: &'ctx Context<'str>) -> Self {
-        match id {
-            ValueId::Literal(lit_id) => ValueRef::Literal(LiteralRef::from_id(ctx, lit_id)),
-            ValueId::Bytes(bytes_id) => ValueRef::Bytes(BytesRef::from_id(ctx, bytes_id)),
-            ValueId::Instruction(insn_id) => {
-                ValueRef::Instruction(InstructionRef::from_id(ctx, insn_id))
-            }
-            ValueId::BasicBlock(bb_id) => ValueRef::BasicBlock(BasicBlock::from_id(ctx, bb_id)),
-            ValueId::BlockParam(param_id) => {
-                ValueRef::BlockParam(BlockParam::from_id(ctx, param_id))
-            }
-            ValueId::Varnode(var_id) => ValueRef::Varnode(Varnode::from_id(ctx, var_id)),
-            ValueId::Function(fn_id) => ValueRef::Function(FunctionBody::from_id(ctx, fn_id)),
-        }
+        ValueRef::from_view(ModuleView::new(ctx), id)
     }
 
     pub fn from_id(ctx: &'ctx Context<'str>, id: ValueId) -> Self {
         Self::new(id, ctx)
     }
+}
 
-    /// Build a value ref over a [`HostRef`], so arena-cluster values (instruction,
-    /// block, param, function) route to a checked-out function while shared leaves
-    /// (literal, bytes, varnode) come from the module. Used by the generic builder,
-    /// whose operands may be a checked-out function's own SSA values.
+impl<'str: 'ctx, 'ctx> ValueRef<'str, 'ctx, crate::value::util::base_ref::HostRef<'ctx, 'str>> {
+    /// Transitional constructor for callers not yet migrated to a static view.
     pub fn from_host(host: crate::value::util::base_ref::HostRef<'ctx, 'str>, id: ValueId) -> Self {
-        use crate::value::{
-            block::BlockRef, block_param::BlockParamRef, function::FunctionRef,
-            insn::InstructionRef,
-        };
+        Self::from_view(host, id)
+    }
+}
+
+impl<'str: 'ctx, 'ctx, R> ValueRef<'str, 'ctx, R>
+where
+    R: QCodeView<'ctx, 'str>,
+{
+    pub fn from_view(view: R, id: ValueId) -> Self {
         match id {
-            ValueId::Literal(lit_id) => ValueRef::Literal(LiteralRef::from_id(host.shr(), lit_id)),
-            ValueId::Bytes(bytes_id) => ValueRef::Bytes(BytesRef::from_id(host.shr(), bytes_id)),
-            ValueId::Varnode(var_id) => ValueRef::Varnode(Varnode::from_id(host.shr(), var_id)),
-            ValueId::Instruction(insn_id) => {
-                ValueRef::Instruction(InstructionRef::new(host, insn_id))
-            }
-            ValueId::BasicBlock(bb_id) => ValueRef::BasicBlock(BlockRef::new(host, bb_id)),
-            ValueId::BlockParam(param_id) => {
-                ValueRef::BlockParam(BlockParamRef::new(host, param_id))
-            }
-            ValueId::Function(fn_id) => ValueRef::Function(FunctionRef::new(host, fn_id)),
+            ValueId::Literal(id) => ValueRef::Literal(LiteralRef::from_id(view.shared(), id)),
+            ValueId::Bytes(id) => ValueRef::Bytes(BytesRef::from_id(view.shared(), id)),
+            ValueId::Varnode(id) => ValueRef::Varnode(Varnode::from_id(view.shared(), id)),
+            ValueId::Instruction(id) => ValueRef::Instruction(InstructionRef::new(view, id)),
+            ValueId::BasicBlock(id) => ValueRef::BasicBlock(BlockRef::new(view, id)),
+            ValueId::BlockParam(id) => ValueRef::BlockParam(BlockParamRef::new(view, id)),
+            ValueId::Function(id) => ValueRef::Function(FunctionRef::new(view, id)),
+        }
+    }
+
+    fn inner(&self) -> &dyn Value<'str, 'ctx> {
+        match self {
+            ValueRef::Literal(r) => r,
+            ValueRef::Bytes(r) => r,
+            ValueRef::Instruction(r) => r,
+            ValueRef::BasicBlock(r) => r,
+            ValueRef::BlockParam(r) => r,
+            ValueRef::Varnode(r) => r,
+            ValueRef::Function(r) => r,
         }
     }
 
@@ -599,7 +587,10 @@ impl<'str, 'ctx> ValueRef<'str, 'ctx> {
     }
 }
 
-impl Display for ValueRef<'_, '_> {
+impl<'str: 'ctx, 'ctx, R> Display for ValueRef<'str, 'ctx, R>
+where
+    R: QCodeView<'ctx, 'str>,
+{
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         // A value operand's rendering — `<ty> <atom>` uniformly, bare for value
         // references with no scalar type — is defined once, as tokens, in the
@@ -613,10 +604,10 @@ impl Display for ValueRef<'_, '_> {
             ValueRef::Literal(r) => insn::segment::value_tokens_shared(r.ctx, self.id()),
             ValueRef::Bytes(r) => insn::segment::value_tokens_shared(r.ctx, self.id()),
             ValueRef::Varnode(r) => insn::segment::value_tokens_shared(r.ctx, self.id()),
-            ValueRef::Instruction(r) => insn::segment::value_tokens(r.ctx.module_ctx(), self.id()),
-            ValueRef::BasicBlock(r) => insn::segment::value_tokens(r.ctx.module_ctx(), self.id()),
-            ValueRef::BlockParam(r) => insn::segment::value_tokens(r.ctx.module_ctx(), self.id()),
-            ValueRef::Function(r) => insn::segment::value_tokens(r.ctx.module_ctx(), self.id()),
+            ValueRef::Instruction(r) => insn::segment::value_tokens_view(r.view, self.id()),
+            ValueRef::BasicBlock(r) => insn::segment::value_tokens_view(r.view, self.id()),
+            ValueRef::BlockParam(r) => insn::segment::value_tokens_view(r.view, self.id()),
+            ValueRef::Function(r) => insn::segment::value_tokens_view(r.view, self.id()),
         };
         for token in tokens {
             write!(f, "{}", token.text)?;
@@ -625,7 +616,10 @@ impl Display for ValueRef<'_, '_> {
     }
 }
 
-impl<'str, 'ctx> Value<'str, 'ctx> for ValueRef<'str, 'ctx> {
+impl<'str: 'ctx, 'ctx, R> Value<'str, 'ctx> for ValueRef<'str, 'ctx, R>
+where
+    R: QCodeView<'ctx, 'str>,
+{
     fn id(&self) -> ValueId {
         self.inner().id()
     }

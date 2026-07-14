@@ -4,6 +4,7 @@ use std::{
     borrow::Cow,
     collections::BTreeSet,
     fmt::{Display, Formatter},
+    marker::PhantomData,
 };
 
 mod signature;
@@ -13,8 +14,8 @@ use crate::{
     context::Context,
     error::{Error, ErrorTy, Result},
     value::{
-        BasicBlock, BlockId, BlockRef, Instruction, InstructionId, LocalValueId, Value, ValueId,
-        Varnode, VarnodeId,
+        BasicBlock, BlockId, BlockRef, Instruction, InstructionId, LocalValueId, ModuleView,
+        QCodeView, Value, ValueId, Varnode, VarnodeId,
         block::EdgeData,
         block::cfg::{EdgeId, LocalBlockId},
         block_param::{BlockParam, BlockParamId, LocalParamId},
@@ -866,7 +867,7 @@ impl<'str> FunctionBody<'str> {
 
     /// Gets a reference to a function from its ID
     pub fn from_id<'ctx>(ctx: &'ctx Context<'str>, id: FunctionId) -> FunctionRef<'str, 'ctx> {
-        FunctionRef::new(HostRef::Module(ctx), id)
+        FunctionRef::new(ModuleView::new(ctx), id)
     }
 
     /// Gets a mutable reference to a function from its ID
@@ -995,18 +996,18 @@ impl<'str> FunctionBody<'str> {
     }
 }
 
-impl<'s, 'ctx: 's, 'str: 'ctx, Ctx> BaseRef<Ctx, FunctionId>
+impl<'s, 'ctx: 's, 'str: 'ctx, R> FunctionRef<'str, 'ctx, R>
 where
-    Self: WithHost<'s, 'ctx, 'str>,
+    R: QCodeView<'ctx, 'str>,
 {
     fn inner(&'s self) -> &'ctx FunctionBody<'str> {
-        self.host().function(self.id)
+        self.view.function(self.id)
     }
 
     /// This function's published interface (never checked out; always read from
     /// the shared registry).
     fn interface(&'s self) -> &'ctx FunctionInterface<'str> {
-        self.host().interface(self.id)
+        self.view.interface(self.id)
     }
 
     fn size(&self) -> usize {
@@ -1201,7 +1202,7 @@ where
         // name (conventional functions, never `pure_reg`).
         #[allow(deprecated)]
         let input = self.input_regs()?.get(index).copied()?;
-        let vn = Varnode::from_id(self.host().shr(), input);
+        let vn = Varnode::from_id(self.view.shared(), input);
         if let Some(name) = vn.name() {
             return Some(name.to_owned());
         }
@@ -1285,21 +1286,21 @@ where
     }
 
     /// The root block of this function, if it exists.
-    pub fn root(&'s self) -> Option<BlockRef<'str, 'ctx>> {
+    pub fn root(&'s self) -> Option<BlockRef<'str, 'ctx, R>> {
         self.inner()
             .root
-            .map(|local| BlockRef::new(self.host(), BlockId::new(self.id, local)))
+            .map(|local| BlockRef::new(self.view, BlockId::new(self.id, local)))
     }
 
     /// An iterator over the (live) blocks belonging to this function.
-    pub fn blocks(&'s self) -> impl Iterator<Item = BlockRef<'str, 'ctx>> + 's {
-        let ctx = self.host();
+    pub fn blocks(&'s self) -> impl Iterator<Item = BlockRef<'str, 'ctx, R>> + 's {
+        let view = self.view;
         let mut ids = self.block_ids();
         // Total order: primarily by machine address, but break ties by the
         // function-local index. Address-less blocks (e.g. fallthrough splits,
         // whose `address()` is `None`) must still order deterministically.
-        ids.sort_by_key(|&id| (BlockRef::new(ctx, id).address(), id.local));
-        ids.into_iter().map(move |id| BlockRef::new(ctx, id))
+        ids.sort_by_key(|&id| (BlockRef::new(view, id).address(), id.local));
+        ids.into_iter().map(move |id| BlockRef::new(view, id))
     }
 
     /// The composite ids of this function's live blocks, in roster order.
@@ -1332,10 +1333,11 @@ where
 
     /// Iterates over the (live) blocks in this function in arena order (i.e. not
     /// sorted by address, unlike [`blocks`](Self::blocks)).
-    pub fn iter(&'s self) -> BlockIter<'str, 'ctx> {
+    pub fn iter(&'s self) -> BlockIter<'str, 'ctx, R> {
         BlockIter {
-            host: self.host(),
+            view: self.view,
             inner: self.block_ids().into_iter(),
+            marker: PhantomData,
         }
     }
 
@@ -1355,61 +1357,102 @@ where
     }
 }
 
-pub type FunctionRef<'str, 'ctx> = BaseRef<HostRef<'ctx, 'str>, FunctionId>;
+#[derive(Clone, Copy)]
+pub struct FunctionRef<'str, 'ctx, R = ModuleView<'ctx, 'str>> {
+    pub id: FunctionId,
+    pub(in crate::value) view: R,
+    marker: PhantomData<&'ctx &'str ()>,
+}
+
+impl<'str, 'ctx, R> FunctionRef<'str, 'ctx, R> {
+    pub fn new(view: R, id: FunctionId) -> Self {
+        Self {
+            id,
+            view,
+            marker: PhantomData,
+        }
+    }
+
+    pub fn id(&self) -> ValueId {
+        self.id.into()
+    }
+}
+
+impl<'str, 'ctx> FunctionRef<'str, 'ctx> {
+    pub fn from_id(ctx: &'ctx Context<'str>, id: FunctionId) -> Self {
+        Self::new(ModuleView::new(ctx), id)
+    }
+}
 
 impl<'s, 'ctx: 's, 'str: 'ctx> WithCtx<'s, 'ctx, 'str> for FunctionRef<'str, 'ctx> {
     fn ctx(&'s self) -> &'ctx Context<'str> {
         // Module-scope-only escape hatch: shared-only reads go through
         // `host().shr()`; only whole-module walks (callees/callers) reach here,
         // and those panic on a checked-out host by design (context-split Pin B).
-        self.ctx.module_ctx()
+        self.view.context()
     }
 }
 
 impl<'s, 'ctx: 's, 'str: 'ctx> WithHost<'s, 'ctx, 'str> for FunctionRef<'str, 'ctx> {
     fn host(&'s self) -> HostRef<'ctx, 'str> {
-        self.ctx
+        HostRef::Module(self.view.context())
     }
 }
 
-impl Named for FunctionRef<'_, '_> {
+impl<'str: 'ctx, 'ctx, R> Named for FunctionRef<'str, 'ctx, R>
+where
+    R: QCodeView<'ctx, 'str>,
+{
     fn name(&self) -> Option<&str> {
-        Some(self.ctx.interface(self.id).name.as_ref())
+        Some(self.view.interface(self.id).name.as_ref())
     }
 }
 
-impl Display for FunctionRef<'_, '_> {
+impl<'str: 'ctx, 'ctx, R> Display for FunctionRef<'str, 'ctx, R>
+where
+    R: QCodeView<'ctx, 'str>,
+{
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
-        self.fmt(f)
+        FunctionRef::fmt(self, f)
     }
 }
 
-impl<'str, 'ctx> Value<'str, 'ctx> for FunctionRef<'str, 'ctx> {
+impl<'str: 'ctx, 'ctx, R> Value<'str, 'ctx> for FunctionRef<'str, 'ctx, R>
+where
+    R: QCodeView<'ctx, 'str>,
+{
     fn id(&self) -> ValueId {
         self.id()
     }
 
     fn size(&self) -> usize {
-        self.size()
+        FunctionRef::size(self)
     }
 }
 
-pub struct BlockIter<'str, 'ctx> {
-    host: HostRef<'ctx, 'str>,
+pub struct BlockIter<'str, 'ctx, R = ModuleView<'ctx, 'str>> {
+    view: R,
     inner: std::vec::IntoIter<BlockId>,
+    marker: PhantomData<&'ctx &'str ()>,
 }
 
-impl<'str, 'ctx> Iterator for BlockIter<'str, 'ctx> {
-    type Item = BlockRef<'str, 'ctx>;
+impl<'str: 'ctx, 'ctx, R> Iterator for BlockIter<'str, 'ctx, R>
+where
+    R: QCodeView<'ctx, 'str>,
+{
+    type Item = BlockRef<'str, 'ctx, R>;
 
     fn next(&mut self) -> Option<Self::Item> {
-        self.inner.next().map(|id| BlockRef::new(self.host, id))
+        self.inner.next().map(|id| BlockRef::new(self.view, id))
     }
 }
 
-impl<'str, 'ctx> IntoIterator for &FunctionRef<'str, 'ctx> {
-    type Item = BlockRef<'str, 'ctx>;
-    type IntoIter = BlockIter<'str, 'ctx>;
+impl<'str: 'ctx, 'ctx, R> IntoIterator for &FunctionRef<'str, 'ctx, R>
+where
+    R: QCodeView<'ctx, 'str>,
+{
+    type Item = BlockRef<'str, 'ctx, R>;
+    type IntoIter = BlockIter<'str, 'ctx, R>;
 
     fn into_iter(self) -> Self::IntoIter {
         self.iter()
@@ -1438,7 +1481,7 @@ impl<'s, 'ctx: 's, 'str: 'ctx> WithHost<'s, 's, 'str> for FunctionMutRef<'str, '
 
 impl Display for FunctionMutRef<'_, '_> {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
-        self.fmt(f)
+        self.as_ref().fmt(f)
     }
 }
 
@@ -1448,7 +1491,7 @@ impl<'ctx, 'str> Value<'str, 'ctx> for FunctionMutRef<'str, 'ctx> {
     }
 
     fn size(&self) -> usize {
-        self.size()
+        self.as_ref().size()
     }
 }
 
@@ -1469,6 +1512,34 @@ impl<'str, 'ctx> Renameable<'str, 'ctx> for FunctionMutRef<'str, 'ctx> {
 }
 
 impl<'str, 'ctx> FunctionMutRef<'str, 'ctx> {
+    pub fn as_ref(&self) -> FunctionRef<'str, '_> {
+        FunctionRef::new(ModuleView::new(self.ctx), self.id)
+    }
+
+    fn inner(&self) -> &FunctionBody<'str> {
+        self.ctx.function(self.id)
+    }
+
+    fn interface(&self) -> &FunctionInterface<'str> {
+        &self.ctx.interfaces[self.id]
+    }
+
+    fn address(&self) -> Option<u64> {
+        self.interface().address
+    }
+
+    pub fn name(&self) -> &str {
+        self.interface().name.as_ref()
+    }
+
+    pub fn blocks(&self) -> impl Iterator<Item = BlockRef<'str, '_>> {
+        self.as_ref().blocks().collect::<Vec<_>>().into_iter()
+    }
+
+    pub fn root(&self) -> Option<BlockRef<'str, '_>> {
+        self.as_ref().root()
+    }
+
     pub(crate) fn inner_mut(&mut self) -> &mut FunctionBody<'str> {
         &mut self.ctx.bodies[self.id]
     }

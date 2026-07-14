@@ -264,10 +264,18 @@ pub struct Builder<'str, 'ctx, Ctx: BuilderBacking<'str> = &'ctx mut Context<'st
 /// Generates a canonical comparison method and its "greater-than" mirror (operands swapped).
 macro_rules! cmp_pair {
     ($fwd:ident, $rev:ident, $op:expr) => {
-        pub fn $fwd(&mut self, lhs: ValueId, rhs: ValueId) -> InstructionRef<'str, '_> {
+        pub fn $fwd(
+            &mut self,
+            lhs: ValueId,
+            rhs: ValueId,
+        ) -> InstructionRef<'str, '_, HostRef<'_, 'str>> {
             self.push_binop($op, lhs, rhs, Some(1))
         }
-        pub fn $rev(&mut self, lhs: ValueId, rhs: ValueId) -> InstructionRef<'str, '_> {
+        pub fn $rev(
+            &mut self,
+            lhs: ValueId,
+            rhs: ValueId,
+        ) -> InstructionRef<'str, '_, HostRef<'_, 'str>> {
             self.push_binop($op, rhs, lhs, Some(1))
         }
     };
@@ -425,7 +433,7 @@ impl<'str, 'ctx, Ctx: BuilderBacking<'str>> Builder<'str, 'ctx, Ctx> {
         &mut self,
         src: ValueId,
         range: std::ops::Range<usize>,
-    ) -> Option<ValueRef<'str, '_>> {
+    ) -> Option<ValueRef<'str, '_, HostRef<'_, 'str>>> {
         let value = self.get_value(src);
 
         if range.is_empty() {
@@ -485,7 +493,7 @@ impl<'str, 'ctx, Ctx: BuilderBacking<'str>> Builder<'str, 'ctx, Ctx> {
         src: ValueId,
         start: usize,
         size: usize,
-    ) -> InstructionRef<'str, '_> {
+    ) -> InstructionRef<'str, '_, HostRef<'_, 'str>> {
         let space = self.get_value(src).space().map(|s| s.id);
         self.push_instruction_in_space(
             Mnemonic::Range(Range {
@@ -520,7 +528,7 @@ impl<'str, 'ctx, Ctx: BuilderBacking<'str>> Builder<'str, 'ctx, Ctx> {
     }
 
     /// Gets the ID of a value in the current namespace
-    pub fn try_get_value(&self, name: &str) -> Option<ValueRef<'str, '_>> {
+    pub fn try_get_value(&self, name: &str) -> Option<ValueRef<'str, '_, HostRef<'_, 'str>>> {
         self.namespace.get(name).map(|&id| self.get_value(id))
     }
 
@@ -569,7 +577,11 @@ impl<'str, 'ctx, Ctx: BuilderBacking<'str>> Builder<'str, 'ctx, Ctx> {
     ///
     /// Panics if the block is already terminated (ends with a branch/call/return).
     #[track_caller]
-    fn push_instruction(&mut self, mnemonic: Mnemonic, size: usize) -> InstructionRef<'str, '_> {
+    fn push_instruction(
+        &mut self,
+        mnemonic: Mnemonic,
+        size: usize,
+    ) -> InstructionRef<'str, '_, HostRef<'_, 'str>> {
         let type_id = self.shr().types.get_or_make_int(size);
         self.push_instruction_with_type(mnemonic, type_id)
     }
@@ -585,7 +597,7 @@ impl<'str, 'ctx, Ctx: BuilderBacking<'str>> Builder<'str, 'ctx, Ctx> {
         &mut self,
         mnemonic: Mnemonic,
         type_id: TypeId,
-    ) -> InstructionRef<'str, '_> {
+    ) -> InstructionRef<'str, '_, HostRef<'_, 'str>> {
         self.push_instruction_with_type(mnemonic, type_id)
     }
 
@@ -595,7 +607,7 @@ impl<'str, 'ctx, Ctx: BuilderBacking<'str>> Builder<'str, 'ctx, Ctx> {
         mnemonic: Mnemonic,
         size: usize,
         _space: Option<SpaceId>,
-    ) -> InstructionRef<'str, '_> {
+    ) -> InstructionRef<'str, '_, HostRef<'_, 'str>> {
         let type_id = self.shr().types.get_or_make_int(size);
         self.push_instruction_with_type(mnemonic, type_id)
     }
@@ -605,7 +617,7 @@ impl<'str, 'ctx, Ctx: BuilderBacking<'str>> Builder<'str, 'ctx, Ctx> {
         &mut self,
         mnemonic: Mnemonic,
         type_id: TypeId,
-    ) -> InstructionRef<'str, '_> {
+    ) -> InstructionRef<'str, '_, HostRef<'_, 'str>> {
         if self.is_terminated && self.insert_point.is_none() {
             let block_address = self.read_host().block_ref(self.block.id).address();
             if let Some(address) = self.address.or(block_address) {
@@ -640,7 +652,7 @@ impl<'str, 'ctx, Ctx: BuilderBacking<'str>> Builder<'str, 'ctx, Ctx> {
         InstructionRef::new(self.block.host_ref().bb_read_host(), id)
     }
 
-    fn get_value(&self, id: ValueId) -> ValueRef<'str, '_> {
+    fn get_value(&self, id: ValueId) -> ValueRef<'str, '_, HostRef<'_, 'str>> {
         // Route through the host's read view so a checked-out builder resolves its
         // own function's SSA values (which live in the owned function, not the
         // shared context) correctly.
@@ -792,7 +804,7 @@ impl<'str, 'ctx, Ctx: BuilderBacking<'str>> Builder<'str, 'ctx, Ctx> {
         mut src: ValueId,
         size: usize,
         space: SpaceId,
-    ) -> ValueRef<'str, '_> {
+    ) -> ValueRef<'str, '_, HostRef<'_, 'str>> {
         if CHECK_LOCAL {
             src = self.ensure_local(src);
         }
@@ -848,7 +860,7 @@ impl<'str, 'ctx, Ctx: BuilderBacking<'str>> Builder<'str, 'ctx, Ctx> {
 
     // --- Unary Ops ---
 
-    fn push_unop(&mut self, op: Unop, src: ValueId) -> InstructionRef<'str, '_> {
+    fn push_unop(&mut self, op: Unop, src: ValueId) -> InstructionRef<'str, '_, HostRef<'_, 'str>> {
         assert!(
             !src.is_varnode(),
             "push_unop: varnode operand is not allowed; use ensure_local or &name addressof syntax"
@@ -864,7 +876,7 @@ impl<'str, 'ctx, Ctx: BuilderBacking<'str>> Builder<'str, 'ctx, Ctx> {
     }
 
     /// Logical NOT of a `bool` value, canonically `src == false`.
-    pub fn push_bool_not(&mut self, src: ValueId) -> InstructionRef<'str, '_> {
+    pub fn push_bool_not(&mut self, src: ValueId) -> InstructionRef<'str, '_, HostRef<'_, 'str>> {
         debug_assert!(
             self.stored_type_of(src)
                 .is_some_and(|t| self.shr().types.is_bool(t)),
@@ -875,17 +887,17 @@ impl<'str, 'ctx, Ctx: BuilderBacking<'str>> Builder<'str, 'ctx, Ctx> {
     }
 
     /// Creates a bitwise NOT operation on the given value.
-    pub fn push_bit_negate(&mut self, src: ValueId) -> InstructionRef<'str, '_> {
+    pub fn push_bit_negate(&mut self, src: ValueId) -> InstructionRef<'str, '_, HostRef<'_, 'str>> {
         self.push_unop(Unop::IntNot, src)
     }
 
     /// Creates a negation operation on the given value.
-    pub fn push_neg(&mut self, src: ValueId) -> InstructionRef<'str, '_> {
+    pub fn push_neg(&mut self, src: ValueId) -> InstructionRef<'str, '_, HostRef<'_, 'str>> {
         self.push_unop(Unop::IntNegate, src)
     }
 
     /// Creates a float negation operation on the given value.
-    pub fn push_fneg(&mut self, src: ValueId) -> InstructionRef<'str, '_> {
+    pub fn push_fneg(&mut self, src: ValueId) -> InstructionRef<'str, '_, HostRef<'_, 'str>> {
         self.push_unop(Unop::FloatNegate, src)
     }
 
@@ -895,7 +907,7 @@ impl<'str, 'ctx, Ctx: BuilderBacking<'str>> Builder<'str, 'ctx, Ctx> {
         lhs: ValueId,
         rhs: ValueId,
         size: Option<usize>,
-    ) -> InstructionRef<'str, '_> {
+    ) -> InstructionRef<'str, '_, HostRef<'_, 'str>> {
         let lhs_size = self.get_value(lhs).size();
         let rhs_size = self.get_value(rhs).size();
         let operand_size = match (
@@ -972,63 +984,119 @@ impl<'str, 'ctx, Ctx: BuilderBacking<'str>> Builder<'str, 'ctx, Ctx> {
 
     // --- Arithmetic ---
 
-    pub fn push_mul(&mut self, lhs: ValueId, rhs: ValueId) -> InstructionRef<'str, '_> {
+    pub fn push_mul(
+        &mut self,
+        lhs: ValueId,
+        rhs: ValueId,
+    ) -> InstructionRef<'str, '_, HostRef<'_, 'str>> {
         self.push_binop(Binop::Int(IntBinop::Mul), lhs, rhs, None)
     }
 
-    pub fn push_div(&mut self, lhs: ValueId, rhs: ValueId) -> InstructionRef<'str, '_> {
+    pub fn push_div(
+        &mut self,
+        lhs: ValueId,
+        rhs: ValueId,
+    ) -> InstructionRef<'str, '_, HostRef<'_, 'str>> {
         self.push_binop(Binop::Int(IntBinop::Div), lhs, rhs, None)
     }
 
-    pub fn push_sdiv(&mut self, lhs: ValueId, rhs: ValueId) -> InstructionRef<'str, '_> {
+    pub fn push_sdiv(
+        &mut self,
+        lhs: ValueId,
+        rhs: ValueId,
+    ) -> InstructionRef<'str, '_, HostRef<'_, 'str>> {
         self.push_binop(Binop::Int(IntBinop::Sdiv), lhs, rhs, None)
     }
 
-    pub fn push_mod(&mut self, lhs: ValueId, rhs: ValueId) -> InstructionRef<'str, '_> {
+    pub fn push_mod(
+        &mut self,
+        lhs: ValueId,
+        rhs: ValueId,
+    ) -> InstructionRef<'str, '_, HostRef<'_, 'str>> {
         self.push_binop(Binop::Int(IntBinop::Rem), lhs, rhs, None)
     }
 
-    pub fn push_smod(&mut self, lhs: ValueId, rhs: ValueId) -> InstructionRef<'str, '_> {
+    pub fn push_smod(
+        &mut self,
+        lhs: ValueId,
+        rhs: ValueId,
+    ) -> InstructionRef<'str, '_, HostRef<'_, 'str>> {
         self.push_binop(Binop::Int(IntBinop::Srem), lhs, rhs, None)
     }
 
-    pub fn push_add(&mut self, lhs: ValueId, rhs: ValueId) -> InstructionRef<'str, '_> {
+    pub fn push_add(
+        &mut self,
+        lhs: ValueId,
+        rhs: ValueId,
+    ) -> InstructionRef<'str, '_, HostRef<'_, 'str>> {
         self.push_binop(Binop::Int(IntBinop::Add), lhs, rhs, None)
     }
 
-    pub fn push_sub(&mut self, lhs: ValueId, rhs: ValueId) -> InstructionRef<'str, '_> {
+    pub fn push_sub(
+        &mut self,
+        lhs: ValueId,
+        rhs: ValueId,
+    ) -> InstructionRef<'str, '_, HostRef<'_, 'str>> {
         self.push_binop(Binop::Int(IntBinop::Sub), lhs, rhs, None)
     }
 
     // --- Float Arithmetic ---
 
-    pub fn push_fdiv(&mut self, lhs: ValueId, rhs: ValueId) -> InstructionRef<'str, '_> {
+    pub fn push_fdiv(
+        &mut self,
+        lhs: ValueId,
+        rhs: ValueId,
+    ) -> InstructionRef<'str, '_, HostRef<'_, 'str>> {
         self.push_binop(Binop::Float(FloatBinop::Div), lhs, rhs, None)
     }
 
-    pub fn push_fmul(&mut self, lhs: ValueId, rhs: ValueId) -> InstructionRef<'str, '_> {
+    pub fn push_fmul(
+        &mut self,
+        lhs: ValueId,
+        rhs: ValueId,
+    ) -> InstructionRef<'str, '_, HostRef<'_, 'str>> {
         self.push_binop(Binop::Float(FloatBinop::Mul), lhs, rhs, None)
     }
 
-    pub fn push_fadd(&mut self, lhs: ValueId, rhs: ValueId) -> InstructionRef<'str, '_> {
+    pub fn push_fadd(
+        &mut self,
+        lhs: ValueId,
+        rhs: ValueId,
+    ) -> InstructionRef<'str, '_, HostRef<'_, 'str>> {
         self.push_binop(Binop::Float(FloatBinop::Add), lhs, rhs, None)
     }
 
-    pub fn push_fsub(&mut self, lhs: ValueId, rhs: ValueId) -> InstructionRef<'str, '_> {
+    pub fn push_fsub(
+        &mut self,
+        lhs: ValueId,
+        rhs: ValueId,
+    ) -> InstructionRef<'str, '_, HostRef<'_, 'str>> {
         self.push_binop(Binop::Float(FloatBinop::Sub), lhs, rhs, None)
     }
 
     // --- Shifts ---
 
-    pub fn push_shl(&mut self, lhs: ValueId, rhs: ValueId) -> InstructionRef<'str, '_> {
+    pub fn push_shl(
+        &mut self,
+        lhs: ValueId,
+        rhs: ValueId,
+    ) -> InstructionRef<'str, '_, HostRef<'_, 'str>> {
         self.push_binop(Binop::Int(IntBinop::ShiftLeft), lhs, rhs, None)
     }
 
-    pub fn push_shr(&mut self, lhs: ValueId, rhs: ValueId) -> InstructionRef<'str, '_> {
+    pub fn push_shr(
+        &mut self,
+        lhs: ValueId,
+        rhs: ValueId,
+    ) -> InstructionRef<'str, '_, HostRef<'_, 'str>> {
         self.push_binop(Binop::Int(IntBinop::ShiftRight), lhs, rhs, None)
     }
 
-    pub fn push_sshr(&mut self, lhs: ValueId, rhs: ValueId) -> InstructionRef<'str, '_> {
+    pub fn push_sshr(
+        &mut self,
+        lhs: ValueId,
+        rhs: ValueId,
+    ) -> InstructionRef<'str, '_, HostRef<'_, 'str>> {
         self.push_binop(Binop::Int(IntBinop::SShiftRight), lhs, rhs, None)
     }
 
@@ -1047,19 +1115,35 @@ impl<'str, 'ctx, Ctx: BuilderBacking<'str>> Builder<'str, 'ctx, Ctx> {
 
     // --- Integer Equality ---
 
-    pub fn push_eq(&mut self, lhs: ValueId, rhs: ValueId) -> InstructionRef<'str, '_> {
+    pub fn push_eq(
+        &mut self,
+        lhs: ValueId,
+        rhs: ValueId,
+    ) -> InstructionRef<'str, '_, HostRef<'_, 'str>> {
         self.push_binop(Binop::Int(IntBinop::Equal), lhs, rhs, Some(1))
     }
 
-    pub fn push_ne(&mut self, lhs: ValueId, rhs: ValueId) -> InstructionRef<'str, '_> {
+    pub fn push_ne(
+        &mut self,
+        lhs: ValueId,
+        rhs: ValueId,
+    ) -> InstructionRef<'str, '_, HostRef<'_, 'str>> {
         self.push_binop(Binop::Int(IntBinop::NotEqual), lhs, rhs, Some(1))
     }
 
-    pub fn push_feq(&mut self, lhs: ValueId, rhs: ValueId) -> InstructionRef<'str, '_> {
+    pub fn push_feq(
+        &mut self,
+        lhs: ValueId,
+        rhs: ValueId,
+    ) -> InstructionRef<'str, '_, HostRef<'_, 'str>> {
         self.push_binop(Binop::Float(FloatBinop::Equal), lhs, rhs, Some(1))
     }
 
-    pub fn push_fne(&mut self, lhs: ValueId, rhs: ValueId) -> InstructionRef<'str, '_> {
+    pub fn push_fne(
+        &mut self,
+        lhs: ValueId,
+        rhs: ValueId,
+    ) -> InstructionRef<'str, '_, HostRef<'_, 'str>> {
         self.push_binop(Binop::Float(FloatBinop::NotEqual), lhs, rhs, Some(1))
     }
 
@@ -1067,7 +1151,11 @@ impl<'str, 'ctx, Ctx: BuilderBacking<'str>> Builder<'str, 'ctx, Ctx> {
 
     /// Logical XOR of two `bool` operands — a bitwise `Xor` over `bool`, which
     /// yields `bool` (exact on the `{0,1}` domain).
-    pub fn push_bool_xor(&mut self, lhs: ValueId, rhs: ValueId) -> InstructionRef<'str, '_> {
+    pub fn push_bool_xor(
+        &mut self,
+        lhs: ValueId,
+        rhs: ValueId,
+    ) -> InstructionRef<'str, '_, HostRef<'_, 'str>> {
         debug_assert!(
             self.both_bool(lhs, rhs),
             "push_bool_xor: operands must be bool"
@@ -1076,7 +1164,11 @@ impl<'str, 'ctx, Ctx: BuilderBacking<'str>> Builder<'str, 'ctx, Ctx> {
     }
 
     /// Logical AND of two `bool` operands (bitwise `And` over `bool`).
-    pub fn push_bool_and(&mut self, lhs: ValueId, rhs: ValueId) -> InstructionRef<'str, '_> {
+    pub fn push_bool_and(
+        &mut self,
+        lhs: ValueId,
+        rhs: ValueId,
+    ) -> InstructionRef<'str, '_, HostRef<'_, 'str>> {
         debug_assert!(
             self.both_bool(lhs, rhs),
             "push_bool_and: operands must be bool"
@@ -1085,7 +1177,11 @@ impl<'str, 'ctx, Ctx: BuilderBacking<'str>> Builder<'str, 'ctx, Ctx> {
     }
 
     /// Logical OR of two `bool` operands (bitwise `Or` over `bool`).
-    pub fn push_bool_or(&mut self, lhs: ValueId, rhs: ValueId) -> InstructionRef<'str, '_> {
+    pub fn push_bool_or(
+        &mut self,
+        lhs: ValueId,
+        rhs: ValueId,
+    ) -> InstructionRef<'str, '_, HostRef<'_, 'str>> {
         debug_assert!(
             self.both_bool(lhs, rhs),
             "push_bool_or: operands must be bool"
@@ -1102,21 +1198,33 @@ impl<'str, 'ctx, Ctx: BuilderBacking<'str>> Builder<'str, 'ctx, Ctx> {
         is_bool(lhs) && is_bool(rhs)
     }
 
-    pub fn push_bit_xor(&mut self, lhs: ValueId, rhs: ValueId) -> InstructionRef<'str, '_> {
+    pub fn push_bit_xor(
+        &mut self,
+        lhs: ValueId,
+        rhs: ValueId,
+    ) -> InstructionRef<'str, '_, HostRef<'_, 'str>> {
         self.push_binop(Binop::Int(IntBinop::Xor), lhs, rhs, None)
     }
 
-    pub fn push_bit_or(&mut self, lhs: ValueId, rhs: ValueId) -> InstructionRef<'str, '_> {
+    pub fn push_bit_or(
+        &mut self,
+        lhs: ValueId,
+        rhs: ValueId,
+    ) -> InstructionRef<'str, '_, HostRef<'_, 'str>> {
         self.push_binop(Binop::Int(IntBinop::Or), lhs, rhs, None)
     }
 
-    pub fn push_bit_and(&mut self, lhs: ValueId, rhs: ValueId) -> InstructionRef<'str, '_> {
+    pub fn push_bit_and(
+        &mut self,
+        lhs: ValueId,
+        rhs: ValueId,
+    ) -> InstructionRef<'str, '_, HostRef<'_, 'str>> {
         self.push_binop(Binop::Int(IntBinop::And), lhs, rhs, None)
     }
 
     // --- Extensions & Conversions ---
 
-    pub fn push_is_nan(&mut self, src: ValueId) -> InstructionRef<'str, '_> {
+    pub fn push_is_nan(&mut self, src: ValueId) -> InstructionRef<'str, '_, HostRef<'_, 'str>> {
         assert!(
             !src.is_varnode(),
             "push_is_nan: varnode operand not allowed"
@@ -1124,27 +1232,31 @@ impl<'str, 'ctx, Ctx: BuilderBacking<'str>> Builder<'str, 'ctx, Ctx> {
         self.push_instruction(Mnemonic::IsFloatNaN(IsFloatNaN { src: self.loc(src) }), 1)
     }
 
-    pub fn push_abs(&mut self, src: ValueId) -> InstructionRef<'str, '_> {
+    pub fn push_abs(&mut self, src: ValueId) -> InstructionRef<'str, '_, HostRef<'_, 'str>> {
         self.push_unop(Unop::FloatAbs, src)
     }
 
-    pub fn push_sqrt(&mut self, src: ValueId) -> InstructionRef<'str, '_> {
+    pub fn push_sqrt(&mut self, src: ValueId) -> InstructionRef<'str, '_, HostRef<'_, 'str>> {
         self.push_unop(Unop::FloatSqrt, src)
     }
 
-    pub fn push_floor(&mut self, src: ValueId) -> InstructionRef<'str, '_> {
+    pub fn push_floor(&mut self, src: ValueId) -> InstructionRef<'str, '_, HostRef<'_, 'str>> {
         self.push_unop(Unop::FloatFloor, src)
     }
 
-    pub fn push_ceil(&mut self, src: ValueId) -> InstructionRef<'str, '_> {
+    pub fn push_ceil(&mut self, src: ValueId) -> InstructionRef<'str, '_, HostRef<'_, 'str>> {
         self.push_unop(Unop::FloatCeil, src)
     }
 
-    pub fn push_round(&mut self, src: ValueId) -> InstructionRef<'str, '_> {
+    pub fn push_round(&mut self, src: ValueId) -> InstructionRef<'str, '_, HostRef<'_, 'str>> {
         self.push_unop(Unop::FloatRound, src)
     }
 
-    pub fn push_int_to_float(&mut self, src: ValueId, size: usize) -> InstructionRef<'str, '_> {
+    pub fn push_int_to_float(
+        &mut self,
+        src: ValueId,
+        size: usize,
+    ) -> InstructionRef<'str, '_, HostRef<'_, 'str>> {
         assert!(
             !src.is_varnode(),
             "push_int_to_float: varnode operand not allowed"
@@ -1158,7 +1270,11 @@ impl<'str, 'ctx, Ctx: BuilderBacking<'str>> Builder<'str, 'ctx, Ctx> {
         )
     }
 
-    pub fn push_float_to_float(&mut self, src: ValueId, size: usize) -> InstructionRef<'str, '_> {
+    pub fn push_float_to_float(
+        &mut self,
+        src: ValueId,
+        size: usize,
+    ) -> InstructionRef<'str, '_, HostRef<'_, 'str>> {
         assert!(
             !src.is_varnode(),
             "push_float_to_float: varnode operand not allowed"
@@ -1172,7 +1288,11 @@ impl<'str, 'ctx, Ctx: BuilderBacking<'str>> Builder<'str, 'ctx, Ctx> {
         )
     }
 
-    pub fn push_trunc(&mut self, src: ValueId, size: usize) -> InstructionRef<'str, '_> {
+    pub fn push_trunc(
+        &mut self,
+        src: ValueId,
+        size: usize,
+    ) -> InstructionRef<'str, '_, HostRef<'_, 'str>> {
         assert!(!src.is_varnode(), "push_trunc: varnode operand not allowed");
         self.push_instruction(
             Mnemonic::FloatToInt(FloatToInt {
@@ -1183,7 +1303,11 @@ impl<'str, 'ctx, Ctx: BuilderBacking<'str>> Builder<'str, 'ctx, Ctx> {
         )
     }
 
-    pub fn push_zext(&mut self, src: ValueId, size: usize) -> InstructionRef<'str, '_> {
+    pub fn push_zext(
+        &mut self,
+        src: ValueId,
+        size: usize,
+    ) -> InstructionRef<'str, '_, HostRef<'_, 'str>> {
         assert!(!src.is_varnode(), "push_zext: varnode operand not allowed");
         self.push_instruction(
             Mnemonic::Zext(Zext {
@@ -1194,7 +1318,11 @@ impl<'str, 'ctx, Ctx: BuilderBacking<'str>> Builder<'str, 'ctx, Ctx> {
         )
     }
 
-    pub fn push_sext(&mut self, src: ValueId, size: usize) -> InstructionRef<'str, '_> {
+    pub fn push_sext(
+        &mut self,
+        src: ValueId,
+        size: usize,
+    ) -> InstructionRef<'str, '_, HostRef<'_, 'str>> {
         assert!(!src.is_varnode(), "push_sext: varnode operand not allowed");
         self.push_instruction(
             Mnemonic::Sext(Sext {
@@ -1209,7 +1337,10 @@ impl<'str, 'ctx, Ctx: BuilderBacking<'str>> Builder<'str, 'ctx, Ctx> {
     /// (`field1`, `field2`, ...). The result type is the
     /// [`Aggregate`](crate::types::TypeRepr::Aggregate) of the named fields'
     /// types.
-    pub fn push_tuple(&mut self, fields: Vec<ValueId>) -> InstructionRef<'str, '_> {
+    pub fn push_tuple(
+        &mut self,
+        fields: Vec<ValueId>,
+    ) -> InstructionRef<'str, '_, HostRef<'_, 'str>> {
         let named_fields = fields
             .into_iter()
             .enumerate()
@@ -1219,7 +1350,10 @@ impl<'str, 'ctx, Ctx: BuilderBacking<'str>> Builder<'str, 'ctx, Ctx> {
     }
 
     /// Builds an aggregate value from ordered named fields.
-    pub fn push_named_tuple(&mut self, fields: Vec<(String, ValueId)>) -> InstructionRef<'str, '_> {
+    pub fn push_named_tuple(
+        &mut self,
+        fields: Vec<(String, ValueId)>,
+    ) -> InstructionRef<'str, '_, HostRef<'_, 'str>> {
         let field_types: Vec<TypeId> = fields.iter().map(|(_, f)| self.type_of(*f)).collect();
         let aggregate_fields = fields
             .iter()
@@ -1241,7 +1375,11 @@ impl<'str, 'ctx, Ctx: BuilderBacking<'str>> Builder<'str, 'ctx, Ctx> {
 
     /// Projects field `index` out of the aggregate value `agg`. The result type
     /// is that field's type. Panics if `agg` is not an aggregate with that field.
-    pub fn push_extract(&mut self, agg: ValueId, index: usize) -> InstructionRef<'str, '_> {
+    pub fn push_extract(
+        &mut self,
+        agg: ValueId,
+        index: usize,
+    ) -> InstructionRef<'str, '_, HostRef<'_, 'str>> {
         let agg_ty = self.type_of(agg);
         let ty = self
             .shr()
@@ -1274,7 +1412,7 @@ impl<'str, 'ctx, Ctx: BuilderBacking<'str>> Builder<'str, 'ctx, Ctx> {
         body: impl Into<Callee>,
         src: ValueId,
         captures: Vec<ValueId>,
-    ) -> InstructionRef<'str, '_> {
+    ) -> InstructionRef<'str, '_, HostRef<'_, 'str>> {
         let body = body.into();
         let src_ty = self.type_of(src);
         // `map` preserves the source's sequence kind: an array maps to an array,
@@ -1314,7 +1452,7 @@ impl<'str, 'ctx, Ctx: BuilderBacking<'str>> Builder<'str, 'ctx, Ctx> {
         init: ValueId,
         src: ValueId,
         captures: Vec<ValueId>,
-    ) -> InstructionRef<'str, '_> {
+    ) -> InstructionRef<'str, '_, HostRef<'_, 'str>> {
         let body = body.into();
         let src_ty = self.type_of(src);
         // Like `map`, a scan preserves the source's sequence kind and takes its
@@ -1345,7 +1483,7 @@ impl<'str, 'ctx, Ctx: BuilderBacking<'str>> Builder<'str, 'ctx, Ctx> {
         &mut self,
         target: impl Into<Callee>,
         args: Vec<ValueId>,
-    ) -> InstructionRef<'str, '_> {
+    ) -> InstructionRef<'str, '_, HostRef<'_, 'str>> {
         let target = target.into();
         let ty = target
             .real()
@@ -1403,7 +1541,11 @@ impl<'str, 'ctx, Ctx: BuilderBacking<'str>> Builder<'str, 'ctx, Ctx> {
     /// [`StructPointer`](crate::types::TypeRepr::StructPointer) type whose
     /// pointee has a field at exactly `offset`. The result type is a pointer
     /// (same width as `base`) to that field's type. Panics otherwise.
-    pub fn push_gep(&mut self, base: ValueId, offset: usize) -> InstructionRef<'str, '_> {
+    pub fn push_gep(
+        &mut self,
+        base: ValueId,
+        offset: usize,
+    ) -> InstructionRef<'str, '_, HostRef<'_, 'str>> {
         let base_ty = self.type_of(base);
         let types = &self.shr().types;
         let ptr_width = types.size_of(base_ty);
@@ -1430,7 +1572,11 @@ impl<'str, 'ctx, Ctx: BuilderBacking<'str>> Builder<'str, 'ctx, Ctx> {
     /// Like [`push_gep`](Builder::push_gep) but selects the field by name,
     /// resolving it to a byte offset via the pointee struct of `base`. Panics if
     /// `base` is not a struct pointer or has no field of that name.
-    pub fn push_gep_field(&mut self, base: ValueId, name: &str) -> InstructionRef<'str, '_> {
+    pub fn push_gep_field(
+        &mut self,
+        base: ValueId,
+        name: &str,
+    ) -> InstructionRef<'str, '_, HostRef<'_, 'str>> {
         let base_ty = self.type_of(base);
         let types = &self.shr().types;
         let pointee = types
@@ -1444,7 +1590,11 @@ impl<'str, 'ctx, Ctx: BuilderBacking<'str>> Builder<'str, 'ctx, Ctx> {
         self.push_gep(base, offset)
     }
 
-    pub fn push_popcount(&mut self, src: ValueId, size: usize) -> InstructionRef<'str, '_> {
+    pub fn push_popcount(
+        &mut self,
+        src: ValueId,
+        size: usize,
+    ) -> InstructionRef<'str, '_, HostRef<'_, 'str>> {
         assert!(
             !src.is_varnode(),
             "push_popcount: varnode operand not allowed"
@@ -1452,7 +1602,11 @@ impl<'str, 'ctx, Ctx: BuilderBacking<'str>> Builder<'str, 'ctx, Ctx> {
         self.push_instruction(Mnemonic::PopCount(PopCount { src: self.loc(src) }), size)
     }
 
-    pub fn push_lzcount(&mut self, src: ValueId, size: usize) -> InstructionRef<'str, '_> {
+    pub fn push_lzcount(
+        &mut self,
+        src: ValueId,
+        size: usize,
+    ) -> InstructionRef<'str, '_, HostRef<'_, 'str>> {
         assert!(
             !src.is_varnode(),
             "push_lzcount: varnode operand not allowed"
@@ -1460,7 +1614,11 @@ impl<'str, 'ctx, Ctx: BuilderBacking<'str>> Builder<'str, 'ctx, Ctx> {
         self.push_instruction(Mnemonic::LzCount(LzCount { src: self.loc(src) }), size)
     }
 
-    pub fn push_carry(&mut self, lhs: ValueId, rhs: ValueId) -> InstructionRef<'str, '_> {
+    pub fn push_carry(
+        &mut self,
+        lhs: ValueId,
+        rhs: ValueId,
+    ) -> InstructionRef<'str, '_, HostRef<'_, 'str>> {
         assert!(
             !lhs.is_varnode() && !rhs.is_varnode(),
             "push_carry: varnode operand not allowed"
@@ -1474,7 +1632,11 @@ impl<'str, 'ctx, Ctx: BuilderBacking<'str>> Builder<'str, 'ctx, Ctx> {
         )
     }
 
-    pub fn push_scarry(&mut self, lhs: ValueId, rhs: ValueId) -> InstructionRef<'str, '_> {
+    pub fn push_scarry(
+        &mut self,
+        lhs: ValueId,
+        rhs: ValueId,
+    ) -> InstructionRef<'str, '_, HostRef<'_, 'str>> {
         assert!(
             !lhs.is_varnode() && !rhs.is_varnode(),
             "push_scarry: varnode operand not allowed"
@@ -1488,7 +1650,11 @@ impl<'str, 'ctx, Ctx: BuilderBacking<'str>> Builder<'str, 'ctx, Ctx> {
         )
     }
 
-    pub fn push_sborrow(&mut self, lhs: ValueId, rhs: ValueId) -> InstructionRef<'str, '_> {
+    pub fn push_sborrow(
+        &mut self,
+        lhs: ValueId,
+        rhs: ValueId,
+    ) -> InstructionRef<'str, '_, HostRef<'_, 'str>> {
         assert!(
             !lhs.is_varnode() && !rhs.is_varnode(),
             "push_sborrow: varnode operand not allowed"
@@ -1508,7 +1674,7 @@ impl<'str, 'ctx, Ctx: BuilderBacking<'str>> Builder<'str, 'ctx, Ctx> {
         args: Vec<ValueId>,
         dst: Option<ValueId>,
         size: usize,
-    ) -> InstructionRef<'str, '_> {
+    ) -> InstructionRef<'str, '_, HostRef<'_, 'str>> {
         let args = args
             .into_iter()
             .map(|arg| self.ensure_local(arg))
@@ -1536,7 +1702,7 @@ impl<'str, 'ctx, Ctx: BuilderBacking<'str>> Builder<'str, 'ctx, Ctx> {
         &mut self,
         id: IntrinsicId,
         args: Vec<ValueId>,
-    ) -> InstructionRef<'str, '_> {
+    ) -> InstructionRef<'str, '_, HostRef<'_, 'str>> {
         let desc = id.desc();
         assert_eq!(
             args.len(),
@@ -1574,7 +1740,11 @@ impl<'str, 'ctx, Ctx: BuilderBacking<'str>> Builder<'str, 'ctx, Ctx> {
     /// If `dst` is a varnode, we aren't allowed to write to it, this is a store operation
     /// If `src` is a varnode, we need to read from it first, then write to dst
     /// For values wider than 64 bits (e.g. XMM/YMM/ZMM registers), emits one store per 64-bit lane.
-    pub fn push_copy(&mut self, src: ValueId, dst: VarnodeId) -> InstructionRef<'str, '_> {
+    pub fn push_copy(
+        &mut self,
+        src: ValueId,
+        dst: VarnodeId,
+    ) -> InstructionRef<'str, '_, HostRef<'_, 'str>> {
         let node = Varnode::from_id(self.shr(), dst);
         let size = node.size();
         let space = node.space().id;
@@ -1662,7 +1832,7 @@ impl<'str, 'ctx, Ctx: BuilderBacking<'str>> Builder<'str, 'ctx, Ctx> {
         src: ValueId,
         ptr: ValueId,
         space: SpaceId,
-    ) -> InstructionRef<'str, '_> {
+    ) -> InstructionRef<'str, '_, HostRef<'_, 'str>> {
         let src = self.ensure_local(src);
         let size = self.get_value(src).size();
 
@@ -1703,7 +1873,7 @@ impl<'str, 'ctx, Ctx: BuilderBacking<'str>> Builder<'str, 'ctx, Ctx> {
     ///
     /// Terminates this block with an unconditional jump to the given target block.
     /// The builder is now safe to drop without panicking, and the block is properly terminated.
-    pub fn push_branch(&mut self, target: BlockId) -> InstructionRef<'str, '_> {
+    pub fn push_branch(&mut self, target: BlockId) -> InstructionRef<'str, '_, HostRef<'_, 'str>> {
         self.push_branch_with_args(target, vec![])
     }
 
@@ -1712,7 +1882,7 @@ impl<'str, 'ctx, Ctx: BuilderBacking<'str>> Builder<'str, 'ctx, Ctx> {
         &mut self,
         target: BlockId,
         args: Vec<ValueId>,
-    ) -> InstructionRef<'str, '_> {
+    ) -> InstructionRef<'str, '_, HostRef<'_, 'str>> {
         let current = self.block.id;
         self.block.host_mut().bb_add_cfg_edge(current, target);
         let target = target.localize(current.func);
@@ -1734,7 +1904,7 @@ impl<'str, 'ctx, Ctx: BuilderBacking<'str>> Builder<'str, 'ctx, Ctx> {
         condition: ValueId,
         target: BlockId,
         fallthrough: BlockId,
-    ) -> InstructionRef<'str, '_> {
+    ) -> InstructionRef<'str, '_, HostRef<'_, 'str>> {
         self.push_cbranch_with_args(condition, target, vec![], fallthrough, vec![])
     }
 
@@ -1746,7 +1916,7 @@ impl<'str, 'ctx, Ctx: BuilderBacking<'str>> Builder<'str, 'ctx, Ctx> {
         target_args: Vec<ValueId>,
         fallthrough: BlockId,
         fallthrough_args: Vec<ValueId>,
-    ) -> InstructionRef<'str, '_> {
+    ) -> InstructionRef<'str, '_, HostRef<'_, 'str>> {
         assert!(
             !condition.is_varnode(),
             "push_cbranch: varnode condition not allowed; load the value first"
@@ -1772,7 +1942,7 @@ impl<'str, 'ctx, Ctx: BuilderBacking<'str>> Builder<'str, 'ctx, Ctx> {
         InstructionRef::new(self.read_host(), id)
     }
 
-    pub fn push_branchind(&mut self, ptr: ValueId) -> InstructionRef<'str, '_> {
+    pub fn push_branchind(&mut self, ptr: ValueId) -> InstructionRef<'str, '_, HostRef<'_, 'str>> {
         let id = self
             .push_instruction(Mnemonic::BranchInd(BranchInd { ptr: self.loc(ptr) }), 0)
             .id;
@@ -1780,7 +1950,10 @@ impl<'str, 'ctx, Ctx: BuilderBacking<'str>> Builder<'str, 'ctx, Ctx> {
         InstructionRef::new(self.read_host(), id)
     }
 
-    pub fn push_call(&mut self, target: impl Into<Callee>) -> InstructionRef<'str, '_> {
+    pub fn push_call(
+        &mut self,
+        target: impl Into<Callee>,
+    ) -> InstructionRef<'str, '_, HostRef<'_, 'str>> {
         self.push_call_with_args(target, vec![])
     }
 
@@ -1788,7 +1961,7 @@ impl<'str, 'ctx, Ctx: BuilderBacking<'str>> Builder<'str, 'ctx, Ctx> {
         &mut self,
         target: impl Into<Callee>,
         args: Vec<ValueId>,
-    ) -> InstructionRef<'str, '_> {
+    ) -> InstructionRef<'str, '_, HostRef<'_, 'str>> {
         let target = target.into();
         let id = self
             .push_instruction(
@@ -1808,7 +1981,10 @@ impl<'str, 'ctx, Ctx: BuilderBacking<'str>> Builder<'str, 'ctx, Ctx> {
     /// no intra-function CFG successor (see [`TailCall`](crate::value::insn::TailCall)).
     /// Unlike [`push_branch`](Self::push_branch), this wires no CFG edge: control
     /// leaves the function.
-    pub fn push_tail_call(&mut self, target: impl Into<Callee>) -> InstructionRef<'str, '_> {
+    pub fn push_tail_call(
+        &mut self,
+        target: impl Into<Callee>,
+    ) -> InstructionRef<'str, '_, HostRef<'_, 'str>> {
         self.push_tail_call_with_args(target, vec![])
     }
 
@@ -1816,7 +1992,7 @@ impl<'str, 'ctx, Ctx: BuilderBacking<'str>> Builder<'str, 'ctx, Ctx> {
         &mut self,
         target: impl Into<Callee>,
         args: Vec<ValueId>,
-    ) -> InstructionRef<'str, '_> {
+    ) -> InstructionRef<'str, '_, HostRef<'_, 'str>> {
         let target = target.into();
         let id = self
             .push_instruction(
@@ -1831,7 +2007,7 @@ impl<'str, 'ctx, Ctx: BuilderBacking<'str>> Builder<'str, 'ctx, Ctx> {
         InstructionRef::new(self.read_host(), id)
     }
 
-    pub fn push_call_ind(&mut self, ptr: ValueId) -> InstructionRef<'str, '_> {
+    pub fn push_call_ind(&mut self, ptr: ValueId) -> InstructionRef<'str, '_, HostRef<'_, 'str>> {
         self.push_call_ind_with_args(ptr, vec![])
     }
 
@@ -1839,7 +2015,7 @@ impl<'str, 'ctx, Ctx: BuilderBacking<'str>> Builder<'str, 'ctx, Ctx> {
         &mut self,
         ptr: ValueId,
         args: Vec<ValueId>,
-    ) -> InstructionRef<'str, '_> {
+    ) -> InstructionRef<'str, '_, HostRef<'_, 'str>> {
         let id = self
             .push_instruction(
                 Mnemonic::CallInd(CallInd {
@@ -1853,7 +2029,7 @@ impl<'str, 'ctx, Ctx: BuilderBacking<'str>> Builder<'str, 'ctx, Ctx> {
         InstructionRef::new(self.read_host(), id)
     }
 
-    pub fn push_return(&mut self, ptr: ValueId) -> InstructionRef<'str, '_> {
+    pub fn push_return(&mut self, ptr: ValueId) -> InstructionRef<'str, '_, HostRef<'_, 'str>> {
         self.push_return_at(None, ptr)
     }
 
@@ -1861,11 +2037,15 @@ impl<'str, 'ctx, Ctx: BuilderBacking<'str>> Builder<'str, 'ctx, Ctx> {
         &mut self,
         value: ValueId,
         ptr: ValueId,
-    ) -> InstructionRef<'str, '_> {
+    ) -> InstructionRef<'str, '_, HostRef<'_, 'str>> {
         self.push_return_at(Some(value), ptr)
     }
 
-    fn push_return_at(&mut self, value: Option<ValueId>, ptr: ValueId) -> InstructionRef<'str, '_> {
+    fn push_return_at(
+        &mut self,
+        value: Option<ValueId>,
+        ptr: ValueId,
+    ) -> InstructionRef<'str, '_, HostRef<'_, 'str>> {
         let id = self
             .push_instruction(
                 Mnemonic::Return(Return {
@@ -1879,7 +2059,10 @@ impl<'str, 'ctx, Ctx: BuilderBacking<'str>> Builder<'str, 'ctx, Ctx> {
         InstructionRef::new(self.read_host(), id)
     }
 
-    pub fn push_return_value(&mut self, value: ValueId) -> InstructionRef<'str, '_> {
+    pub fn push_return_value(
+        &mut self,
+        value: ValueId,
+    ) -> InstructionRef<'str, '_, HostRef<'_, 'str>> {
         let id = self
             .push_instruction(
                 Mnemonic::ReturnValue(ReturnValue {
@@ -1895,7 +2078,10 @@ impl<'str, 'ctx, Ctx: BuilderBacking<'str>> Builder<'str, 'ctx, Ctx> {
     // --- Assert ---
 
     /// Asserts that a condition holds at this point in execution
-    pub fn push_assert(&mut self, condition: ValueId) -> InstructionRef<'str, '_> {
+    pub fn push_assert(
+        &mut self,
+        condition: ValueId,
+    ) -> InstructionRef<'str, '_, HostRef<'_, 'str>> {
         self.push_instruction(
             Mnemonic::Assert(Assert {
                 condition: self.loc(condition),

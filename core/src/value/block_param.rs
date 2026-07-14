@@ -3,7 +3,7 @@ use crate::{
     error::Result,
     types::TypeId,
     value::{
-        LocalBlockId, LocalValueId, Value, ValueId,
+        LocalBlockId, LocalValueId, ModuleView, QCodeView, Value, ValueId,
         block::{BlockId, BlockRef},
         util::{
             base_ref::{BaseRef, HostRef, WithCtx, WithCtxMut, WithHost},
@@ -16,6 +16,7 @@ use jstd::Identifier;
 use std::{
     borrow::Cow,
     fmt::{Display, Formatter},
+    marker::PhantomData,
 };
 
 /// Function-local block-parameter index (indexes the owning [`FunctionBody`](crate::value::FunctionBody)'s
@@ -108,7 +109,7 @@ impl<'str> BlockParam<'str> {
     }
 
     pub fn from_id<'ctx>(ctx: &'ctx Context<'str>, id: BlockParamId) -> BlockParamRef<'str, 'ctx> {
-        BlockParamRef::new(HostRef::Module(ctx), id)
+        BlockParamRef::new(ModuleView::new(ctx), id)
     }
 
     pub fn from_id_mut<'ctx>(
@@ -145,12 +146,12 @@ impl<'str> BlockParam<'str> {
 }
 
 // Shared read-only methods available on both BlockParamRef and BlockParamMutRef
-impl<'s, 'ctx: 's, 'str: 'ctx, Ctx> BaseRef<Ctx, BlockParamId>
+impl<'s, 'ctx: 's, 'str: 'ctx, R> BlockParamRef<'str, 'ctx, R>
 where
-    Self: WithHost<'s, 'ctx, 'str>,
+    R: QCodeView<'ctx, 'str>,
 {
     fn inner(&'s self) -> &'ctx BlockParam<'str> {
-        self.host().block_param(self.id)
+        self.view.block_param(self.id)
     }
 
     /// Position of this parameter in the owning block's param list.
@@ -165,14 +166,14 @@ where
 
     /// Size of this parameter's value in bytes.
     pub fn size(&'s self) -> usize {
-        self.host().shr().types.size_of(self.inner().type_id)
+        self.view.shared().types.size_of(self.inner().type_id)
     }
 
     /// The block this parameter belongs to, if any.
-    pub fn parent(&'s self) -> Option<BlockRef<'str, 'ctx>> {
+    pub fn parent(&'s self) -> Option<BlockRef<'str, 'ctx, R>> {
         self.inner()
             .parent
-            .map(|local| BlockRef::new(self.host(), BlockId::new(self.id.func, local)))
+            .map(|local| BlockRef::new(self.view, BlockId::new(self.id.func, local)))
     }
 
     pub fn name(&'s self) -> Option<&'ctx str> {
@@ -190,7 +191,7 @@ where
         // Surface a richer-than-integer type (e.g. a seeded `TEB*` segment base)
         // as a `Type ` prefix. Plain `Int` params stay bare `@name` so the many
         // existing signature assertions (`<f @ESP @EDI>`) are unaffected.
-        let types = &self.host().shr().types;
+        let types = &self.view.shared().types;
         let ty = types.type_name(self.type_id());
         if types.pointee_of(self.type_id()).is_some()
             || types.struct_name_of(self.type_id()).is_some()
@@ -212,7 +213,7 @@ where
     /// params (no parser syntax) and unnamed/untyped params fall back to the
     /// operand rendering.
     pub(crate) fn fmt_decl(&'s self, f: &mut Formatter<'_>) -> std::fmt::Result {
-        let types = &self.host().shr().types;
+        let types = &self.view.shared().types;
         let tid = self.type_id();
         let is_scalar = types.pointee_of(tid).is_none() && types.struct_name_of(tid).is_none();
         match (self.name(), is_scalar && self.size() > 0) {
@@ -222,42 +223,76 @@ where
     }
 }
 
-pub type BlockParamRef<'str, 'ctx> = BaseRef<HostRef<'ctx, 'str>, BlockParamId>;
+#[derive(Clone, Copy)]
+pub struct BlockParamRef<'str, 'ctx, R = ModuleView<'ctx, 'str>> {
+    pub id: BlockParamId,
+    pub(in crate::value) view: R,
+    marker: PhantomData<&'ctx &'str ()>,
+}
+
+impl<'str, 'ctx, R> BlockParamRef<'str, 'ctx, R> {
+    pub fn new(view: R, id: BlockParamId) -> Self {
+        Self {
+            id,
+            view,
+            marker: PhantomData,
+        }
+    }
+
+    pub fn id(&self) -> ValueId {
+        self.id.into()
+    }
+}
+
+impl<'str, 'ctx> BlockParamRef<'str, 'ctx> {
+    pub fn from_id(ctx: &'ctx Context<'str>, id: BlockParamId) -> Self {
+        Self::new(ModuleView::new(ctx), id)
+    }
+}
 
 impl<'s, 'ctx: 's, 'str: 'ctx> WithCtx<'s, 'ctx, 'str> for BlockParamRef<'str, 'ctx> {
     fn ctx(&'s self) -> &'ctx Context<'str> {
         // Module-scope-only escape hatch: shared-only reads go through
         // `host().shr()`; only whole-module walks (callees/callers) reach here,
         // and those panic on a checked-out host by design (context-split Pin B).
-        self.ctx.module_ctx()
+        self.view.context()
     }
 }
 
 impl<'s, 'ctx: 's, 'str: 'ctx> WithHost<'s, 'ctx, 'str> for BlockParamRef<'str, 'ctx> {
     fn host(&'s self) -> HostRef<'ctx, 'str> {
-        self.ctx
+        HostRef::Module(self.view.context())
     }
 }
 
-impl Named for BlockParamRef<'_, '_> {
+impl<'str: 'ctx, 'ctx, R> Named for BlockParamRef<'str, 'ctx, R>
+where
+    R: QCodeView<'ctx, 'str>,
+{
     fn name(&self) -> Option<&str> {
-        self.ctx.block_param(self.id).name.as_deref()
+        self.view.block_param(self.id).name.as_deref()
     }
 }
 
-impl Display for BlockParamRef<'_, '_> {
+impl<'str: 'ctx, 'ctx, R> Display for BlockParamRef<'str, 'ctx, R>
+where
+    R: QCodeView<'ctx, 'str>,
+{
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
-        self.fmt(f)
+        BlockParamRef::fmt(self, f)
     }
 }
 
-impl<'str, 'ctx> Value<'str, 'ctx> for BlockParamRef<'str, 'ctx> {
+impl<'str: 'ctx, 'ctx, R> Value<'str, 'ctx> for BlockParamRef<'str, 'ctx, R>
+where
+    R: QCodeView<'ctx, 'str>,
+{
     fn id(&self) -> ValueId {
         self.id()
     }
 
     fn size(&self) -> usize {
-        self.size()
+        BlockParamRef::size(self)
     }
 }
 
@@ -288,7 +323,7 @@ impl<'str, 'ctx> BlockParamMutRef<'str, 'ctx> {
     }
 
     pub fn as_ref(&self) -> BlockParamRef<'str, '_> {
-        BlockParamRef::new(HostRef::Module(self.ctx), self.id)
+        BlockParamRef::new(ModuleView::new(self.ctx), self.id)
     }
 }
 
@@ -353,7 +388,7 @@ impl Named for BlockParamMutRef<'_, '_> {
 
 impl Display for BlockParamMutRef<'_, '_> {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
-        self.fmt(f)
+        self.as_ref().fmt(f)
     }
 }
 
@@ -363,7 +398,7 @@ impl<'str, 'ctx> Value<'str, 'ctx> for BlockParamMutRef<'str, 'ctx> {
     }
 
     fn size(&self) -> usize {
-        self.size()
+        self.as_ref().size()
     }
 }
 

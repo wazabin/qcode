@@ -11,13 +11,13 @@ use crate::{
     space::{Space, SpaceId},
     types::TypeManager,
     value::{
-        BasicBlock, FunctionBody, FunctionId, FunctionRef, Instruction, ValueId,
+        BasicBlock, BlockParamRef, FunctionBody, FunctionId, FunctionRef, Instruction, ValueId,
         block::{BlockId, BlockRef, EdgeData, EdgeId},
         block_param::{BlockParam, BlockParamId},
         insn::{InstructionId, InstructionRef, Mnemonic, PCodeOpId},
         literal::{LiteralId, LiteralRef},
         registry::ValueRegistry,
-        util::base_ref::{BaseRef, HostRef},
+        util::base_ref::HostRef,
         varnode::{Varnode, VarnodeId, VarnodeRef, register::RegisterId},
     },
 };
@@ -1879,19 +1879,19 @@ impl<'str> Context<'str> {
     }
 
     /// A read [`BlockRef`](crate::value::BlockRef) over `id`, module-routed.
-    pub fn block_ref(&self, id: BlockId) -> BaseRef<HostRef<'_, 'str>, BlockId> {
+    pub fn block_ref(&self, id: BlockId) -> BlockRef<'str, '_, HostRef<'_, 'str>> {
         self.read_host().block_ref(id)
     }
     /// A read [`InstructionRef`] over `id`, module-routed.
-    pub fn insn_ref(&self, id: InstructionId) -> BaseRef<HostRef<'_, 'str>, InstructionId> {
+    pub fn insn_ref(&self, id: InstructionId) -> InstructionRef<'str, '_, HostRef<'_, 'str>> {
         self.read_host().insn_ref(id)
     }
     /// A read [`BlockParamRef`](crate::value::BlockParamRef) over `id`.
-    pub fn param_ref(&self, id: BlockParamId) -> BaseRef<HostRef<'_, 'str>, BlockParamId> {
+    pub fn param_ref(&self, id: BlockParamId) -> BlockParamRef<'str, '_, HostRef<'_, 'str>> {
         self.read_host().param_ref(id)
     }
     /// A read [`FunctionRef`] over `id`, module-routed.
-    pub fn function_ref(&self, id: FunctionId) -> BaseRef<HostRef<'_, 'str>, FunctionId> {
+    pub fn function_ref(&self, id: FunctionId) -> FunctionRef<'str, '_, HostRef<'_, 'str>> {
         self.read_host().function_ref(id)
     }
 
@@ -2431,11 +2431,7 @@ mod tests {
 
     #[test]
     fn checked_host_reads_match_module_reads() {
-        use crate::value::{
-            FunctionId, FunctionRef,
-            block::BlockId,
-            util::base_ref::{BaseRef, HostRef},
-        };
+        use crate::value::{FunctionId, FunctionRef, util::base_ref::HostRef};
 
         let mut ctx = Context::new();
         qcode!(
@@ -2466,12 +2462,7 @@ mod tests {
                     let name = b.name().unwrap_or("?").to_string();
                     let mut succ: Vec<String> = b
                         .successors()
-                        .map(|(_, s)| {
-                            BaseRef::<HostRef, BlockId>::new(host, s)
-                                .name()
-                                .unwrap_or("?")
-                                .to_string()
-                        })
+                        .map(|(_, s)| BlockRef::new(host, s).name().unwrap_or("?").to_string())
                         .collect();
                     succ.sort();
                     let ops: Vec<String> =

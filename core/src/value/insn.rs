@@ -8,7 +8,8 @@ use crate::{
     space::{Space, SpaceId, SpaceRef, SpaceType},
     types::TypeId,
     value::{
-        BlockId, BlockRef, FunctionId, FunctionRef, LocalBlockId, Value, ValueId,
+        BlockId, BlockRef, FunctionId, FunctionRef, LocalBlockId, ModuleView, QCodeView, Value,
+        ValueId,
         util::{
             base_ref::{BaseRef, HostRef, WithCtx, WithCtxMut, WithHost},
             named::{Named, Renameable, update_context_name},
@@ -19,6 +20,7 @@ use jstd::Identifier;
 use std::{
     borrow::Cow,
     fmt::{Display, Formatter},
+    marker::PhantomData,
 };
 
 mod aggregate;
@@ -121,7 +123,7 @@ impl<'str> Instruction<'str> {
         ctx: &'ctx Context<'str>,
         id: InstructionId,
     ) -> InstructionRef<'str, 'ctx> {
-        InstructionRef::new(HostRef::Module(ctx), id)
+        InstructionRef::new(ModuleView::new(ctx), id)
     }
 
     pub fn from_id_mut<'ctx>(
@@ -132,12 +134,12 @@ impl<'str> Instruction<'str> {
     }
 }
 
-impl<'s, 'ctx: 's, 'str: 'ctx, Ctx> BaseRef<Ctx, InstructionId>
+impl<'s, 'ctx: 's, 'str: 'ctx, R> InstructionRef<'str, 'ctx, R>
 where
-    Self: WithHost<'s, 'ctx, 'str>,
+    R: QCodeView<'ctx, 'str>,
 {
     fn inner(&'s self) -> &'ctx Instruction<'str> {
-        self.host().instruction(self.id)
+        self.view.instruction(self.id)
     }
 
     /// The name of this instruction's output value
@@ -152,22 +154,22 @@ where
 
     /// The size in bytes of the instruction's output value
     pub fn size(&'s self) -> usize {
-        self.host().shr().types.size_of(self.inner().type_id)
+        self.view.shared().types.size_of(self.inner().type_id)
     }
 
     /// The basic block that this instruction belongs to, if any.
-    pub fn parent(&'s self) -> Option<BlockRef<'str, 'ctx>> {
+    pub fn parent(&'s self) -> Option<BlockRef<'str, 'ctx, R>> {
         self.inner()
             .parent
-            .map(|local| BlockRef::new(self.host(), BlockId::new(self.id.func, local)))
+            .map(|local| BlockRef::new(self.view, BlockId::new(self.id.func, local)))
     }
 
-    pub fn block(&'s self) -> Option<BlockRef<'str, 'ctx>> {
+    pub fn block(&'s self) -> Option<BlockRef<'str, 'ctx, R>> {
         self.parent()
     }
 
     /// The function that this instruction belongs to, if any.
-    pub fn function(&'s self) -> Option<FunctionRef<'str, 'ctx>> {
+    pub fn function(&'s self) -> Option<FunctionRef<'str, 'ctx, R>> {
         self.parent().and_then(|block| block.parent())
     }
 
@@ -204,11 +206,11 @@ where
     /// Returns `Some` only for instructions whose result type is a pointer to a
     /// known memory space (e.g. [`StackAddress`](crate::types::StackAddress)).
     pub fn space(&'s self) -> Option<SpaceRef<'ctx>> {
-        self.host()
-            .shr()
+        self.view
+            .shared()
             .types
             .space_of(self.inner().type_id)
-            .map(|id| Space::from_id(self.host().shr(), id))
+            .map(|id| Space::from_id(self.view.shared(), id))
     }
 
     /// The opcode for this instruction
@@ -222,7 +224,7 @@ where
     }
 
     fn fmt(&'s self, f: &mut Formatter<'_>) -> std::fmt::Result {
-        let ty = self.host().shr().types.type_name(self.type_id());
+        let ty = self.view.shared().types.type_name(self.type_id());
 
         if let Some(name) = self.name() {
             write!(f, "{ty} %{name}")
@@ -282,9 +284,37 @@ macro_rules! impl_insn_mut_verbs {
 impl_insn_mut_verbs!(<'c, 'str> &'c mut Context<'str>);
 impl_insn_mut_verbs!(<'a, 'str> crate::value::util::host_mut::PassBacking<'a, 'str>);
 
-pub type InstructionRef<'str, 'ctx> = BaseRef<HostRef<'ctx, 'str>, InstructionId>;
+#[derive(Clone, Copy)]
+pub struct InstructionRef<'str, 'ctx, R = ModuleView<'ctx, 'str>> {
+    pub id: InstructionId,
+    pub(in crate::value) view: R,
+    marker: PhantomData<&'ctx &'str ()>,
+}
+
+impl<'str, 'ctx, R> InstructionRef<'str, 'ctx, R> {
+    pub fn new(view: R, id: InstructionId) -> Self {
+        Self {
+            id,
+            view,
+            marker: PhantomData,
+        }
+    }
+
+    pub fn id(&self) -> ValueId {
+        self.id.into()
+    }
+
+    /// Format this instruction as a string, with the mnemonic and operands.
+    pub fn as_statement(&self) -> InstructionStatement<'_, 'str, 'ctx, R> {
+        InstructionStatement(self)
+    }
+}
 
 impl<'str, 'ctx> InstructionRef<'str, 'ctx> {
+    pub fn from_id(ctx: &'ctx Context<'str>, id: InstructionId) -> Self {
+        Self::new(ModuleView::new(ctx), id)
+    }
+
     /// Creates an instruction with a plain `Int(size)` result type, born into
     /// `func`'s instruction arena. The result is detached (`parent == None`)
     /// until a block appends it.
@@ -297,7 +327,7 @@ impl<'str, 'ctx> InstructionRef<'str, 'ctx> {
         let type_id = ctx.shared.types.get_or_make_int(size);
         let insn = Instruction::new(type_id, mnemonic);
         let id = ctx.push_insn(func, insn);
-        InstructionRef::new(HostRef::Module(ctx), id)
+        InstructionRef::new(ModuleView::new(ctx), id)
     }
 
     /// Creates an instruction with an explicit [`TypeId`], born into `func`.
@@ -313,7 +343,7 @@ impl<'str, 'ctx> InstructionRef<'str, 'ctx> {
     ) -> Self {
         let insn = Instruction::new(type_id, mnemonic);
         let id = ctx.push_insn(func, insn);
-        InstructionRef::new(HostRef::Module(ctx), id)
+        InstructionRef::new(ModuleView::new(ctx), id)
     }
 
     /// Creates an instruction, deriving the result type from an optional space tag.
@@ -330,12 +360,7 @@ impl<'str, 'ctx> InstructionRef<'str, 'ctx> {
         let type_id = ctx.shared.types.get_or_make_int(size);
         let insn = Instruction::new(type_id, mnemonic);
         let id = ctx.push_insn(func, insn);
-        InstructionRef::new(HostRef::Module(ctx), id)
-    }
-
-    /// Format this instruction as a string, with the mnemonic and operands
-    pub fn as_statement(&self) -> InstructionStatement<'_> {
-        InstructionStatement(self)
+        InstructionRef::new(ModuleView::new(ctx), id)
     }
 }
 
@@ -344,41 +369,58 @@ impl<'s, 'ctx: 's, 'str: 'ctx> WithCtx<'s, 'ctx, 'str> for InstructionRef<'str, 
         // Module-scope-only escape hatch: shared-only reads go through
         // `host().shr()`; only whole-module walks (callees/callers) reach here,
         // and those panic on a checked-out host by design (context-split Pin B).
-        self.ctx.module_ctx()
+        self.view.context()
     }
 }
 
 impl<'s, 'ctx: 's, 'str: 'ctx> WithHost<'s, 'ctx, 'str> for InstructionRef<'str, 'ctx> {
     fn host(&'s self) -> HostRef<'ctx, 'str> {
-        self.ctx
+        HostRef::Module(self.view.context())
     }
 }
 
-impl Named for InstructionRef<'_, '_> {
+impl<'str: 'ctx, 'ctx, R> Named for InstructionRef<'str, 'ctx, R>
+where
+    R: QCodeView<'ctx, 'str>,
+{
     fn name(&self) -> Option<&str> {
-        self.ctx.instruction(self.id).name.as_deref()
+        self.view.instruction(self.id).name.as_deref()
     }
 }
 
-impl Display for InstructionRef<'_, '_> {
+impl<'str: 'ctx, 'ctx, R> Display for InstructionRef<'str, 'ctx, R>
+where
+    R: QCodeView<'ctx, 'str>,
+{
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
-        self.fmt(f)
+        InstructionRef::fmt(self, f)
     }
 }
 
-impl<'str, 'ctx> Value<'str, 'ctx> for InstructionRef<'str, 'ctx> {
+impl<'str: 'ctx, 'ctx, R> Value<'str, 'ctx> for InstructionRef<'str, 'ctx, R>
+where
+    R: QCodeView<'ctx, 'str>,
+{
     fn id(&self) -> ValueId {
         self.id()
     }
 
     fn size(&self) -> usize {
-        self.size()
+        InstructionRef::size(self)
     }
 }
 
 pub type InstructionMutRef<'str, 'ctx> = BaseRef<&'ctx mut Context<'str>, InstructionId>;
 
 impl<'str, 'ctx> InstructionMutRef<'str, 'ctx> {
+    pub fn as_ref(&self) -> InstructionRef<'str, '_> {
+        InstructionRef::new(ModuleView::new(self.ctx), self.id)
+    }
+
+    fn inner(&self) -> &Instruction<'str> {
+        self.ctx.instruction(self.id)
+    }
+
     pub fn inner_mut(&mut self) -> &mut Instruction<'str> {
         self.ctx.instruction_mut(self.id)
     }
@@ -493,7 +535,7 @@ impl Named for InstructionMutRef<'_, '_> {
 
 impl Display for InstructionMutRef<'_, '_> {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
-        self.fmt(f)
+        self.as_ref().fmt(f)
     }
 }
 
@@ -503,7 +545,7 @@ impl<'str, 'ctx> Value<'str, 'ctx> for InstructionMutRef<'str, 'ctx> {
     }
 
     fn size(&self) -> usize {
-        self.size()
+        self.as_ref().size()
     }
 }
 
@@ -518,9 +560,14 @@ impl<'str, 'ctx> Renameable<'str, 'ctx> for InstructionMutRef<'str, 'ctx> {
 }
 
 /// A formattable wrapper around an instruction reference, which formats the instruction as a string with its mnemonic and operands.
-pub struct InstructionStatement<'a>(&'a InstructionRef<'a, 'a>);
+pub struct InstructionStatement<'a, 'str, 'ctx, R = ModuleView<'ctx, 'str>>(
+    &'a InstructionRef<'str, 'ctx, R>,
+);
 
-impl Display for InstructionStatement<'_> {
+impl<'str: 'ctx, 'ctx, R> Display for InstructionStatement<'_, 'str, 'ctx, R>
+where
+    R: QCodeView<'ctx, 'str>,
+{
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         // The statement's rendering (result binding + mnemonic) is defined once,
         // as tokens, in `segment`; the `Display` form is those tokens joined.
