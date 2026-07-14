@@ -1687,7 +1687,7 @@ fn run_one_function<'str>(
                 // Fingerprint the checked-out body through its own host (it is
                 // absent from `ctx`, so `function_fingerprint` cannot see it).
                 let fp =
-                    fingerprint_display(qcode::value::FunctionRef::new(cx.read_host(body), fun_id));
+                    fingerprint_display(qcode::value::FunctionRef::new(cx.body_view(body), fun_id));
                 if tracer.observe(&tracer_label, iters + 1, p.name(), fp) {
                     log::warn!(
                         target: "pipeline::fixpoint",

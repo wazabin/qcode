@@ -165,7 +165,7 @@ fn gvn_body<'str>(
 // ----- passes ----------------------------------------------------------------
 
 use crate::{ContextView, FunctionBody, FunctionPass, Outcome};
-use qcode::value::util::base_ref::HostRef;
+use qcode::value::QCodeView;
 
 #[derive(Default)]
 pub struct ConstFold;
@@ -215,9 +215,9 @@ crate::register_function_pass!(Narrow);
 /// function's pointers, then supplies the stack pointer so the oracle applies
 /// frame freshness (a function's own locals never alias an incoming pointer). The
 /// stack pointer is `None` in arch-agnostic envs, leaving frame freshness inert.
-fn build_gvn_aliases<'a, 'str: 'a>(
+fn build_gvn_aliases<'ctx, 'str: 'ctx>(
     m: ContextView<'_, 'str>,
-    host: HostRef<'a, 'str>,
+    host: impl QCodeView<'ctx, 'str>,
     fun_id: FunctionId,
 ) -> AliasResult {
     let shared = m.shr();
@@ -248,7 +248,7 @@ impl FunctionPass for Gvn {
         let mut changed = constant_fold_body(f, m, fun_id);
         // Build the oracle over the (now-canonicalized) body, then run the
         // dominator-tree GVN against it.
-        let aliases = build_gvn_aliases(m, m.read_host(f), fun_id);
+        let aliases = build_gvn_aliases(m, m.body_view(f), fun_id);
         changed |= gvn_body(f, m, fun_id, Some(&aliases));
         Ok(Outcome::changed(changed))
     }

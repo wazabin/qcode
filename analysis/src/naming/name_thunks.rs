@@ -17,7 +17,7 @@
 
 use std::borrow::Cow;
 
-use qcode::value::{FunctionId, FunctionRef, insn::Mnemonic, util::base_ref::HostRef};
+use qcode::value::{FunctionId, FunctionRef, QCodeView, insn::Mnemonic};
 
 use crate::{ContextView, FunctionBody, FunctionPass, Outcome};
 
@@ -42,7 +42,7 @@ impl FunctionPass for NameThunks {
         // published name, read from the shared context), then buffer the
         // self-rename.
         let new_name: Option<String> = {
-            let hr = m.read_host(f);
+            let hr = m.body_view(f);
             let function = FunctionRef::new(hr, fid);
 
             // Only rename functions still carrying their generated `fn_<addr>`
@@ -51,7 +51,7 @@ impl FunctionPass for NameThunks {
                 Some(addr) if function.name() == format!("fn_{addr:x}") => {
                     // A thunk is a lone block jumping to another function.
                     thunk_target(hr, fid).map(|callee_id| {
-                        let callee = FunctionRef::new(hr, callee_id).name();
+                        let callee = &hr.interface(callee_id).name;
                         format!("thunk_{callee}")
                     })
                 }
@@ -73,7 +73,10 @@ impl FunctionPass for NameThunks {
 /// function, return that callee. Otherwise `None`. (Strict IR locality: a tail
 /// jump into another function is a function-level `TailCall`, never a foreign
 /// `Branch`.)
-fn thunk_target(host: HostRef, fun_id: FunctionId) -> Option<FunctionId> {
+fn thunk_target<'ctx, 'str: 'ctx>(
+    host: impl QCodeView<'ctx, 'str>,
+    fun_id: FunctionId,
+) -> Option<FunctionId> {
     let function = FunctionRef::new(host, fun_id);
 
     let mut blocks = function.blocks();

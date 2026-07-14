@@ -6,9 +6,8 @@ use qcode::{
     context::Context,
     space::{Space, SpaceId, SpaceType},
     value::{
-        BlockId, FunctionId, ValueId, Varnode,
+        BlockId, FunctionId, ModuleView, QCodeView, ValueId, Varnode,
         insn::{InstructionId, Mnemonic},
-        util::base_ref::HostRef,
     },
 };
 
@@ -55,14 +54,22 @@ pub(crate) fn is_reg_space<'a, 'str: 'a>(
 /// The byte intervals a resolved external `target` clobbers (its recorded
 /// caller-saved register set), as kills for the backward scan. Empty for a
 /// callee with no recorded clobber set.
-fn call_clobber_intervals(host: HostRef, target: FunctionId) -> Vec<KilledInterval> {
-    let Some(clobbered) = host.function_ref(target).clobbered_regs() else {
+fn call_clobber_intervals<'a, 'str: 'a>(
+    host: impl QCodeView<'a, 'str>,
+    target: FunctionId,
+) -> Vec<KilledInterval> {
+    let Some(clobbered) = host
+        .interface(target)
+        .signature
+        .as_ref()
+        .and_then(|signature| signature.clobbered.as_deref())
+    else {
         return Vec::new();
     };
     clobbered
         .iter()
         .map(|&vn| {
-            let v = Varnode::from_id(host.shr(), vn);
+            let v = Varnode::from_id(host.shared(), vn);
             let start = v.address() as u64;
             KilledInterval {
                 space: v.space().id,
@@ -77,11 +84,15 @@ fn call_clobber_intervals(host: HostRef, target: FunctionId) -> Vec<KilledInterv
 /// the clobbering write satisfies it (the load reads the call's output). Only a
 /// register-varnode load is matched; any other live location is left in place
 /// (conservative — the store before it stays live).
-fn killed_covers_loc(host: HostRef, iv: KilledInterval, l: &LiveLoc) -> bool {
+fn killed_covers_loc<'a, 'str: 'a>(
+    host: impl QCodeView<'a, 'str>,
+    iv: KilledInterval,
+    l: &LiveLoc,
+) -> bool {
     let ValueId::Varnode(vn) = l.ptr else {
         return false;
     };
-    let v = Varnode::from_id(host.shr(), vn);
+    let v = Varnode::from_id(host.shared(), vn);
     if v.space().id != iv.space {
         return false;
     }
@@ -116,7 +127,7 @@ pub(crate) fn is_tracked_space<'a, 'str: 'a>(
 /// base at offset 0. Mirrors `gvn::affine::base_offset` but is self-contained
 /// (no `Numbering`) and used only for disjointness, where over-conservatism is
 /// always safe.
-fn base_plus_offset(host: HostRef, ptr: ValueId) -> (ValueId, i64) {
+fn base_plus_offset<'a, 'str: 'a>(host: impl QCodeView<'a, 'str>, ptr: ValueId) -> (ValueId, i64) {
     use qcode::value::insn::{Binop, IntBinop};
     let mut cur = ptr;
     let mut acc = 0i64;
@@ -137,7 +148,7 @@ fn base_plus_offset(host: HostRef, ptr: ValueId) -> (ValueId, i64) {
         };
         let (op, lhs, rhs) = (b.op, b.lhs.qualify(id.func), b.rhs.qualify(id.func));
         let lit = |v: ValueId| match v {
-            ValueId::Literal(lid) => Some(host.shr().values.literals[lid].value as i64),
+            ValueId::Literal(lid) => Some(host.shared().values.literals[lid].value as i64),
             _ => None,
         };
         match op {
@@ -178,18 +189,18 @@ enum AddrBase {
 
 /// Decompose `ptr` into `(base, byte_offset)`, folding a literal base into an
 /// `Absolute` anchor so `0x1000` and `p + 4` are each described precisely.
-fn addr_key(host: HostRef, ptr: ValueId) -> (AddrBase, i64) {
+fn addr_key<'a, 'str: 'a>(host: impl QCodeView<'a, 'str>, ptr: ValueId) -> (AddrBase, i64) {
     if let ValueId::Literal(lid) = ptr {
         return (
             AddrBase::Absolute,
-            host.shr().values.literals[lid].value as i64,
+            host.shared().values.literals[lid].value as i64,
         );
     }
     let (base, off) = base_plus_offset(host, ptr);
     match base {
         ValueId::Literal(lid) => (
             AddrBase::Absolute,
-            host.shr().values.literals[lid].value as i64 + off,
+            host.shared().values.literals[lid].value as i64 + off,
         ),
         other => (AddrBase::Sym(other), off),
     }
@@ -199,8 +210,8 @@ fn addr_key(host: HostRef, ptr: ValueId) -> (AddrBase, i64) {
 /// not overlap any `load` at `load_ptr`/`load_size`: they share a comparable base
 /// (both absolute, or the same symbolic base) and their byte ranges are disjoint.
 /// Incomparable bases conservatively count as a possible overlap (not disjoint).
-fn disjoint_access(
-    host: HostRef,
+fn disjoint_access<'a, 'str: 'a>(
+    host: impl QCodeView<'a, 'str>,
     store_ptr: ValueId,
     store_size: usize,
     load_ptr: ValueId,
@@ -211,10 +222,10 @@ fn disjoint_access(
     sb == lb && !intervals_overlap((so, so + store_size as i64), (lo, lo + load_size as i64))
 }
 
-fn ptr_offset(host: HostRef, ptr: ValueId) -> Option<i64> {
+fn ptr_offset<'a, 'str: 'a>(host: impl QCodeView<'a, 'str>, ptr: ValueId) -> Option<i64> {
     match ptr {
-        ValueId::Varnode(id) => Some(Varnode::from_id(host.shr(), id).address()),
-        ValueId::Literal(lid) => Some(host.shr().values.literals[lid].value as i64),
+        ValueId::Varnode(id) => Some(Varnode::from_id(host.shared(), id).address()),
+        ValueId::Literal(lid) => Some(host.shared().values.literals[lid].value as i64),
         _ => None,
     }
 }
@@ -332,12 +343,11 @@ fn remove_overlap(set: &mut Vec<(i64, i64)>, range: (i64, i64)) {
 /// live-out value is never observable — any store to them with no subsequent
 /// read in the block is unconditionally dead, even without a covering later store.
 pub fn dead_load_insns<'a, 'str: 'a>(
-    host: impl Into<HostRef<'a, 'str>>,
+    host: impl QCodeView<'a, 'str>,
     block_id: BlockId,
     aliases: Option<&AliasResult>,
     dead_regs: &[ValueId],
 ) -> HashSet<InstructionId> {
-    let host = host.into();
     let insns: Vec<InstructionId> = host.block_ref(block_id).instruction_ids().to_vec();
     let mut dead = block_dead_loads(host, block_id);
 
@@ -354,14 +364,14 @@ pub fn dead_load_insns<'a, 'str: 'a>(
         for &id in insns.iter().rev() {
             match host.insn_ref(id).mnemonic() {
                 Mnemonic::Load(load)
-                    if is_reg_space(host.shr(), load.space) && !dead.contains(&id) =>
+                    if is_reg_space(host.shared(), load.space) && !dead.contains(&id) =>
                 {
                     if let Some(offset) = ptr_offset(host, load.ptr.qualify(id.func)) {
                         let range = (offset, offset + load.size as i64);
                         live.push(range);
                     }
                 }
-                Mnemonic::Store(store) if is_reg_space(host.shr(), store.space) => {
+                Mnemonic::Store(store) if is_reg_space(host.shared(), store.space) => {
                     if let Some(offset) = ptr_offset(host, store.ptr.qualify(id.func)) {
                         let range = (offset, offset + store.size as i64);
                         let is_dead_reg = dead_regs.contains(&store.ptr.qualify(id.func));
@@ -384,7 +394,10 @@ pub fn dead_load_insns<'a, 'str: 'a>(
 }
 
 /// Loads in `block_id` whose result has no users (dead in any address space).
-fn block_dead_loads(host: HostRef, block_id: BlockId) -> HashSet<InstructionId> {
+fn block_dead_loads<'a, 'str: 'a>(
+    host: impl QCodeView<'a, 'str>,
+    block_id: BlockId,
+) -> HashSet<InstructionId> {
     let mut dead = HashSet::default();
     let insns = host.block_ref(block_id).instruction_ids().to_vec();
     for id in insns {
@@ -439,8 +452,8 @@ fn punch_killed(killed: &mut Vec<KilledInterval>, iv: KilledInterval) {
 /// `live` tracks [`LiveLoc`]s of loads not yet satisfied; `killed` tracks
 /// [`KilledInterval`]s of locations overwritten by a covering store before any
 /// read.
-fn scan_block_aliased(
-    host: HostRef,
+fn scan_block_aliased<'a, 'str: 'a>(
+    host: impl QCodeView<'a, 'str>,
     block_id: BlockId,
     aliases: &AliasResult,
     dead_regs: &[ValueId],
@@ -508,7 +521,7 @@ fn scan_block_aliased(
                 let is_killed = ptr_iv.is_some_and(|iv| fully_covered_iv(&killed, iv))
                     || rel_fully_covered(&rel_killed, store.space, sb, rel_range);
                 let is_dead_reg = dead_regs.contains(&ptr)
-                    || (regs_dead_at_exit && is_reg_space(host.shr(), store.space));
+                    || (regs_dead_at_exit && is_reg_space(host.shared(), store.space));
                 if no_live_reader && (is_killed || is_dead_reg) {
                     dead.insert(id);
                 } else {
@@ -557,7 +570,7 @@ fn scan_block_aliased(
             // stack-pointer decrement (see call_summary::decrement_stack_pointer)
             // alive so the callee's entry stack pointer is seeded correctly.
             Mnemonic::Call(_) | Mnemonic::CallInd(_) => {
-                killed.retain(|k| !is_reg_space(host.shr(), k.space));
+                killed.retain(|k| !is_reg_space(host.shared(), k.space));
                 // The callee may read any memory it can reach (pointer args,
                 // globals), so drop every relative overwrite at the barrier.
                 rel_killed.clear();
@@ -572,14 +585,13 @@ fn scan_block_aliased(
 /// liveness fixpoint. Given the live-out / killed-out seeds (from successors),
 /// returns this block's `(live_in, killed_in)`.
 pub(crate) fn block_transfer<'a, 'str: 'a>(
-    host: impl Into<HostRef<'a, 'str>>,
+    host: impl QCodeView<'a, 'str>,
     block_id: BlockId,
     aliases: &AliasResult,
     dead_regs: &[ValueId],
     live_seed: &[LiveLoc],
     killed_seed: &[KilledInterval],
 ) -> (LiveSet, KilledSet) {
-    let host = host.into();
     let mut dead = block_dead_loads(host, block_id);
     scan_block_aliased(
         host,
@@ -596,14 +608,13 @@ pub(crate) fn block_transfer<'a, 'str: 'a>(
 /// live-out / killed-out sets so stores dead across basic-block boundaries are
 /// detected.
 pub(crate) fn dead_load_insns_seeded<'a, 'str: 'a>(
-    host: impl Into<HostRef<'a, 'str>>,
+    host: impl QCodeView<'a, 'str>,
     block_id: BlockId,
     aliases: &AliasResult,
     dead_regs: &[ValueId],
     live_seed: &[LiveLoc],
     killed_seed: &[KilledInterval],
 ) -> HashSet<InstructionId> {
-    let host = host.into();
     let mut dead = block_dead_loads(host, block_id);
     scan_block_aliased(
         host,
@@ -624,7 +635,7 @@ pub fn remove_dead_load_insns_block(
     aliases: Option<&AliasResult>,
     dead_regs: &[ValueId],
 ) {
-    let mut dead: Vec<_> = dead_load_insns(&*ctx, block_id, aliases, dead_regs)
+    let mut dead: Vec<_> = dead_load_insns(ModuleView::new(&*ctx), block_id, aliases, dead_regs)
         .into_iter()
         .collect();
     if dead.is_empty() {
@@ -653,10 +664,9 @@ type TempStore = (InstructionId, SpaceId, ValueId, usize);
 /// the same base is still loaded. A load on an *incomparable* base conservatively
 /// keeps the store.
 fn unread_temp_space_stores<'a, 'str: 'a>(
-    host: impl Into<HostRef<'a, 'str>>,
+    host: impl QCodeView<'a, 'str>,
     function_id: FunctionId,
 ) -> HashSet<InstructionId> {
-    let host = host.into();
     let fun = host.function_ref(function_id);
     let mut loads: Vec<TempLoad> = Vec::new();
     let mut candidate_stores: Vec<TempStore> = Vec::new();
@@ -664,10 +674,10 @@ fn unread_temp_space_stores<'a, 'str: 'a>(
     for block in &fun {
         for insn_id in block.instruction_ids() {
             match host.insn_ref(insn_id).mnemonic() {
-                Mnemonic::Load(load) if is_temp_space(host.shr(), load.space) => {
+                Mnemonic::Load(load) if is_temp_space(host.shared(), load.space) => {
                     loads.push((load.space, load.ptr.qualify(insn_id.func), load.size));
                 }
-                Mnemonic::Store(store) if is_temp_space(host.shr(), store.space) => {
+                Mnemonic::Store(store) if is_temp_space(host.shared(), store.space) => {
                     candidate_stores.push((
                         insn_id,
                         store.space,
@@ -708,11 +718,10 @@ fn unread_temp_space_stores<'a, 'str: 'a>(
 /// conservatively treats as reading every slot, so such a store is kept. Run to a
 /// fixpoint, a chain of slots that only hold each other's addresses collapses.
 fn unread_frame_local_stores<'a, 'str: 'a>(
-    host: impl Into<HostRef<'a, 'str>>,
+    host: impl QCodeView<'a, 'str>,
     function_id: FunctionId,
     aliases: &AliasResult,
 ) -> HashSet<InstructionId> {
-    let host = host.into();
     let fun = host.function_ref(function_id);
     if fun.iter().flat_map(|block| block.iter()).any(|insn| {
         matches!(
@@ -764,8 +773,8 @@ struct RegisterStore {
 /// function. This complements the killed-set dataflow for loop shapes where an
 /// exit-block overwrite postdominates the entry store but is not propagated as a
 /// must-kill through the loop backedge.
-fn postdominated_dead_register_stores(
-    host: HostRef,
+fn postdominated_dead_register_stores<'a, 'str: 'a>(
+    host: impl QCodeView<'a, 'str>,
     function_id: FunctionId,
     aliases: &AliasResult,
 ) -> HashSet<InstructionId> {
@@ -802,7 +811,7 @@ fn postdominated_dead_register_stores(
         let insns = host.block_ref(*block).instruction_ids().to_vec();
         for id in insns {
             match host.insn_ref(id).mnemonic() {
-                Mnemonic::Store(store) if is_reg_space(host.shr(), store.space) => {
+                Mnemonic::Store(store) if is_reg_space(host.shared(), store.space) => {
                     stores.push(RegisterStore {
                         id,
                         block: *block,
@@ -810,7 +819,7 @@ fn postdominated_dead_register_stores(
                         space: store.space,
                     });
                 }
-                Mnemonic::Load(load) if is_reg_space(host.shr(), load.space) => {
+                Mnemonic::Load(load) if is_reg_space(host.shared(), load.space) => {
                     loads.push((load.ptr.qualify(id.func), load.space));
                 }
                 _ => {}
@@ -845,8 +854,8 @@ fn postdominated_dead_register_stores(
 /// candidate's. Offset-precise (unlike the class-based [`AliasResult::covers`]), so a
 /// whole-region write-back at `base` covers an earlier same-base `base + k` field
 /// store even when neither has an alias interval.
-fn ram_covers(
-    host: HostRef,
+fn ram_covers<'a, 'str: 'a>(
+    host: impl QCodeView<'a, 'str>,
     cand_ptr: ValueId,
     cand_size: usize,
     killer_ptr: ValueId,
@@ -871,7 +880,10 @@ struct RamAccess {
 
 /// Blocks reachable from `start` by following ≥1 CFG edge (so `start` itself is
 /// included only when it lies on a cycle).
-fn forward_reachable(host: HostRef, start: BlockId) -> HashSet<BlockId> {
+fn forward_reachable<'a, 'str: 'a>(
+    host: impl QCodeView<'a, 'str>,
+    start: BlockId,
+) -> HashSet<BlockId> {
     let mut seen: HashSet<BlockId> = HashSet::default();
     let mut stack: Vec<BlockId> = host.block_ref(start).successors().map(|(_, s)| s).collect();
     while let Some(b) = stack.pop() {
@@ -905,8 +917,8 @@ fn forward_reachable(host: HostRef, start: BlockId) -> HashSet<BlockId> {
 /// through a pointer argument, which no explicit load models — array_promote's own
 /// precondition. `return` needs no special case: an exit block has no postdominating
 /// killer, so a store reaching it stays live.
-fn postdominated_dead_ram_stores(
-    host: HostRef,
+fn postdominated_dead_ram_stores<'a, 'str: 'a>(
+    host: impl QCodeView<'a, 'str>,
     function_id: FunctionId,
     aliases: &AliasResult,
 ) -> HashSet<InstructionId> {
@@ -927,7 +939,7 @@ fn postdominated_dead_ram_stores(
         return HashSet::default();
     }
 
-    let ram = host.shr().default_space;
+    let ram = host.shared().default_space;
     let node_set: HashSet<BlockId> = blocks.iter().copied().collect();
     let exit_set: HashSet<BlockId> = blocks
         .iter()
@@ -1048,36 +1060,25 @@ pub fn remove_dead_load_insns_generic<'str>(
         .iter()
         .map(|block| block.id)
         .collect();
+    let view = ModuleView::new(&*host);
 
     let mut dead = HashSet::default();
-    dead.extend(unread_temp_space_stores(host.read_host(), function_id));
+    dead.extend(unread_temp_space_stores(view, function_id));
 
     match aliases {
         Some(aliases) => {
             dead.extend(postdominated_dead_register_stores(
-                host.read_host(),
+                view,
                 function_id,
                 aliases,
             ));
-            dead.extend(unread_frame_local_stores(
-                host.read_host(),
-                function_id,
-                aliases,
-            ));
-            dead.extend(postdominated_dead_ram_stores(
-                host.read_host(),
-                function_id,
-                aliases,
-            ));
-            let liveness = crate::mem::compute_memory_liveness(
-                host.read_host(),
-                function_id,
-                aliases,
-                dead_regs,
-            );
+            dead.extend(unread_frame_local_stores(view, function_id, aliases));
+            dead.extend(postdominated_dead_ram_stores(view, function_id, aliases));
+            let liveness =
+                crate::mem::compute_memory_liveness(view, function_id, aliases, dead_regs);
             for &block_id in &block_ids {
                 dead.extend(dead_load_insns_seeded(
-                    host.read_host(),
+                    view,
                     block_id,
                     aliases,
                     dead_regs,
@@ -1088,7 +1089,7 @@ pub fn remove_dead_load_insns_generic<'str>(
         }
         None => {
             for &block_id in &block_ids {
-                dead.extend(dead_load_insns(host.read_host(), block_id, None, dead_regs));
+                dead.extend(dead_load_insns(view, block_id, None, dead_regs));
             }
         }
     }
@@ -1103,7 +1104,7 @@ pub fn remove_dead_load_insns_generic<'str>(
 }
 
 /// Host-generic core of [`remove_dead_load_insns`], routing every read through
-/// `cx.read_host(body)` and every removal through [`body.remove_instruction`],
+/// `cx.body_view(body)` and every removal through [`body.remove_instruction`],
 /// so it operates identically on the whole module (`&mut Context`) or a single
 /// checked-out function ([`crate::pipeline`]'s `FunctionBody`).
 /// This is the concrete version for FunctionBody/ContextView (stage 5b).
@@ -1122,34 +1123,34 @@ pub fn remove_dead_load_insns_host<'a, 'str>(
         .collect();
 
     let mut dead = HashSet::default();
-    dead.extend(unread_temp_space_stores(cx.read_host(body), function_id));
+    dead.extend(unread_temp_space_stores(cx.body_view(body), function_id));
 
     match aliases {
         Some(aliases) => {
             dead.extend(postdominated_dead_register_stores(
-                cx.read_host(body),
+                cx.body_view(body),
                 function_id,
                 aliases,
             ));
             dead.extend(unread_frame_local_stores(
-                cx.read_host(body),
+                cx.body_view(body),
                 function_id,
                 aliases,
             ));
             dead.extend(postdominated_dead_ram_stores(
-                cx.read_host(body),
+                cx.body_view(body),
                 function_id,
                 aliases,
             ));
             let liveness = crate::mem::compute_memory_liveness(
-                cx.read_host(body),
+                cx.body_view(body),
                 function_id,
                 aliases,
                 dead_regs,
             );
             for &block_id in &block_ids {
                 dead.extend(dead_load_insns_seeded(
-                    cx.read_host(body),
+                    cx.body_view(body),
                     block_id,
                     aliases,
                     dead_regs,
@@ -1161,7 +1162,7 @@ pub fn remove_dead_load_insns_host<'a, 'str>(
         None => {
             for &block_id in &block_ids {
                 dead.extend(dead_load_insns(
-                    cx.read_host(body),
+                    cx.body_view(body),
                     block_id,
                     None,
                     dead_regs,
@@ -1219,7 +1220,7 @@ mod tests {
             b.push_load::<false>(rax_ptr, 8, space);
         });
 
-        let dead = dead_load_insns(&ctx, block_id, None, &[]);
+        let dead = dead_load_insns(ModuleView::new(&ctx), block_id, None, &[]);
         assert!(!dead.is_empty(), "dead load should be detected");
     }
 
@@ -1234,7 +1235,7 @@ mod tests {
             b.push_add(loaded_id, one);
         });
 
-        let dead = dead_load_insns(&ctx, block_id, None, &[]);
+        let dead = dead_load_insns(ModuleView::new(&ctx), block_id, None, &[]);
         let load_ids: Vec<_> = BasicBlock::from_id(&ctx, block_id)
             .instruction_ids()
             .iter()
@@ -1308,7 +1309,7 @@ mod tests {
         // store base+0 (4 bytes), load base+8 (4 bytes): disjoint => dead.
         let (mut ctx, fid, store_id) = argpromote_shadow_fn(0, 8);
         assert!(
-            unread_temp_space_stores(&ctx, fid).contains(&store_id),
+            unread_temp_space_stores(ModuleView::new(&ctx), fid).contains(&store_id),
             "temp-space store to base+0 is dead when only base+8 is read"
         );
         let aliases = AliasResult::simple_for_function(&ctx, fid);
@@ -1330,7 +1331,7 @@ mod tests {
         // store base+0 (4 bytes), load base+2 (4 bytes): ranges overlap => live.
         let (ctx, fid, store_id) = argpromote_shadow_fn(0, 2);
         assert!(
-            !unread_temp_space_stores(&ctx, fid).contains(&store_id),
+            !unread_temp_space_stores(ModuleView::new(&ctx), fid).contains(&store_id),
             "temp-space store must be kept when an overlapping offset is read"
         );
     }
@@ -1404,7 +1405,7 @@ mod tests {
         );
         let block_id = block;
         let aliases = AliasResult::simple_for_function(&ctx, ctx.function_ids()[0]);
-        let dead = dead_load_insns(&ctx, block_id, Some(&aliases), &[]);
+        let dead = dead_load_insns(ModuleView::new(&ctx), block_id, Some(&aliases), &[]);
         let stores = ram_stores(&ctx, block_id);
         let which: Vec<bool> = stores.iter().map(|s| dead.contains(s)).collect();
         // Each earlier writer is overwritten before any read (the intervening
@@ -1455,7 +1456,7 @@ mod tests {
     fn ram_stores_covered_by_wide_store_are_dead() {
         let (ctx, block_id) = array_build_block(false);
         let aliases = AliasResult::simple_for_function(&ctx, ctx.function_ids()[0]);
-        let dead = dead_load_insns(&ctx, block_id, Some(&aliases), &[]);
+        let dead = dead_load_insns(ModuleView::new(&ctx), block_id, Some(&aliases), &[]);
 
         let stores = ram_stores(&ctx, block_id);
         assert_eq!(stores.len(), 4, "three narrow stores + one covering store");
@@ -1476,7 +1477,7 @@ mod tests {
     fn ram_store_kept_only_for_read_offset() {
         let (ctx, block_id) = array_build_block(true);
         let aliases = AliasResult::simple_for_function(&ctx, ctx.function_ids()[0]);
-        let dead = dead_load_insns(&ctx, block_id, Some(&aliases), &[]);
+        let dead = dead_load_insns(ModuleView::new(&ctx), block_id, Some(&aliases), &[]);
 
         // Stores in program order: base+0, base+4, base+8, [read's reg store], cover.
         let stores = ram_stores(&ctx, block_id);
@@ -1534,7 +1535,7 @@ mod tests {
             &ctx,
             BasicBlock::from_id(&ctx, block).function().unwrap().id,
         );
-        let dead = dead_load_insns(&ctx, block, Some(&aliases), &[]);
+        let dead = dead_load_insns(ModuleView::new(&ctx), block, Some(&aliases), &[]);
         assert!(
             dead.contains(&store_id),
             "store to a clobbered register before a resolved call is dead"
@@ -1554,7 +1555,7 @@ mod tests {
             &ctx,
             BasicBlock::from_id(&ctx, block).function().unwrap().id,
         );
-        let dead = dead_load_insns(&ctx, block, Some(&aliases), &[]);
+        let dead = dead_load_insns(ModuleView::new(&ctx), block, Some(&aliases), &[]);
         assert!(
             !dead.contains(&store_id),
             "store before an unresolved call must be kept (the callee may read it)"
@@ -1576,7 +1577,7 @@ mod tests {
         );
         let block_id = block;
 
-        let dead = dead_load_insns(&ctx, block_id, None, &[]);
+        let dead = dead_load_insns(ModuleView::new(&ctx), block_id, None, &[]);
         let store_ids: Vec<_> = BasicBlock::from_id(&ctx, block_id)
             .instruction_ids()
             .iter()
@@ -1642,7 +1643,7 @@ mod tests {
 
         // Without frame freshness the global load pins the redundant store.
         let plain = crate::AliasResult::simple_for_function(&tc.ctx, fid);
-        let dead_plain = dead_load_insns(&tc.ctx, root, Some(&plain), &[]);
+        let dead_plain = dead_load_insns(ModuleView::new(&tc.ctx), root, Some(&plain), &[]);
         assert!(
             !dead_plain.contains(&s1),
             "without stack/global disjointness the global load pins S1"
@@ -1654,7 +1655,7 @@ mod tests {
             fid,
             Some(sp_reg),
         );
-        let dead = dead_load_insns(&tc.ctx, root, Some(&r), &[]);
+        let dead = dead_load_insns(ModuleView::new(&tc.ctx), root, Some(&r), &[]);
         assert!(dead.contains(&s1), "the redundant first store is dead");
         assert!(!dead.contains(&s2), "the surviving last store is kept");
     }
@@ -1712,7 +1713,7 @@ mod tests {
             fid,
             Some(sp_reg),
         );
-        let dead = unread_frame_local_stores(&tc.ctx, fid, &r);
+        let dead = unread_frame_local_stores(ModuleView::new(&tc.ctx), fid, &r);
 
         assert!(
             dead.contains(&s_local),
@@ -1743,7 +1744,7 @@ mod tests {
         );
         let block_id = block;
 
-        let dead = dead_load_insns(&ctx, block_id, None, &[]);
+        let dead = dead_load_insns(ModuleView::new(&ctx), block_id, None, &[]);
 
         let store_ids: Vec<_> = BasicBlock::from_id(&ctx, block_id)
             .instruction_ids()
@@ -1782,7 +1783,7 @@ mod tests {
             b.push_add(loaded_id, zero);
         });
 
-        let dead = dead_load_insns(&ctx, block_id, None, &[]);
+        let dead = dead_load_insns(ModuleView::new(&ctx), block_id, None, &[]);
         let store_ids: Vec<_> = BasicBlock::from_id(&ctx, block_id)
             .instruction_ids()
             .iter()
@@ -1811,7 +1812,7 @@ mod tests {
         let block_id = block;
 
         let aliases = crate::AliasResult::simple_for_function(&ctx, ctx.function_ids()[0]);
-        let dead = dead_load_insns(&ctx, block_id, Some(&aliases), &[]);
+        let dead = dead_load_insns(ModuleView::new(&ctx), block_id, Some(&aliases), &[]);
         let store_ids: Vec<_> = BasicBlock::from_id(&ctx, block_id)
             .instruction_ids()
             .iter()
@@ -1843,7 +1844,7 @@ mod tests {
         let block_id = block;
 
         let aliases = crate::AliasResult::simple_for_function(&ctx, ctx.function_ids()[0]);
-        let dead = dead_load_insns(&ctx, block_id, Some(&aliases), &[]);
+        let dead = dead_load_insns(ModuleView::new(&ctx), block_id, Some(&aliases), &[]);
         let store_a_ids: Vec<_> = BasicBlock::from_id(&ctx, block_id)
             .instruction_ids()
             .iter()
@@ -1888,7 +1889,7 @@ mod tests {
         });
 
         let aliases = crate::AliasResult::simple_for_function(&ctx, ctx.function_ids()[0]);
-        let dead = dead_load_insns(&ctx, block_id, Some(&aliases), &[]);
+        let dead = dead_load_insns(ModuleView::new(&ctx), block_id, Some(&aliases), &[]);
 
         let store_ids: Vec<_> = BasicBlock::from_id(&ctx, block_id)
             .instruction_ids()
@@ -2237,7 +2238,7 @@ impl FunctionPass for DeadLoad {
         _next_minted: &mut u32,
     ) -> Result<Outcome<'str>, String> {
         let fid = f.id();
-        let aliases = frame_aware_aliases(m, m.read_host(f), fid);
+        let aliases = frame_aware_aliases(m, m.body_view(f), fid);
         Ok(Outcome::changed(remove_dead_load_insns_host(
             f,
             m,
@@ -2269,7 +2270,7 @@ impl FunctionPass for DeadStore {
     ) -> Result<Outcome<'str>, String> {
         let fid = f.id();
         let dead_regs = m.env().cfg.dead_flag_regs.clone();
-        let aliases = frame_aware_aliases(m, m.read_host(f), fid);
+        let aliases = frame_aware_aliases(m, m.body_view(f), fid);
         Ok(Outcome::changed(remove_dead_load_insns_host(
             f,
             m,
@@ -2290,7 +2291,7 @@ crate::register_function_pass!(DeadStore);
 /// from the [`ContextView`].
 fn frame_aware_aliases<'a, 'str: 'a>(
     m: ContextView<'_, 'str>,
-    host: HostRef<'a, 'str>,
+    host: impl QCodeView<'a, 'str>,
     fun_id: FunctionId,
 ) -> AliasResult {
     let shared = m.shr();

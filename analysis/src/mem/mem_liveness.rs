@@ -21,7 +21,7 @@
 
 use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
 
-use qcode::value::{BlockId, FunctionId, ValueId, util::base_ref::HostRef};
+use qcode::value::{BlockId, FunctionId, QCodeView, ValueId};
 
 use crate::AliasResult;
 use crate::dce::dead_load::{
@@ -44,7 +44,7 @@ impl MemLiveness {
     }
 }
 
-fn successors(host: HostRef, block: BlockId) -> Vec<BlockId> {
+fn successors<'ctx, 'str: 'ctx>(host: impl QCodeView<'ctx, 'str>, block: BlockId) -> Vec<BlockId> {
     host.block_ref(block)
         .successors()
         .map(|(_, succ)| succ)
@@ -84,9 +84,13 @@ fn intersect_killed(succs: &[BlockId], killed_in: &HashMap<BlockId, KilledSet>) 
 
 /// Restrict liveness facts to register/temp spaces; RAM/global stores are never
 /// propagated across blocks (they may be observed outside the function).
-fn retain_tracked(host: HostRef, live: &mut LiveSet, killed: &mut KilledSet) {
-    live.retain(|l| is_tracked_space(host.shr(), l.space));
-    killed.retain(|k| is_tracked_space(host.shr(), k.space));
+fn retain_tracked<'ctx, 'str: 'ctx>(
+    host: impl QCodeView<'ctx, 'str>,
+    live: &mut LiveSet,
+    killed: &mut KilledSet,
+) {
+    live.retain(|l| is_tracked_space(host.shared(), l.space));
+    killed.retain(|k| is_tracked_space(host.shared(), k.space));
 }
 
 fn live_changed(old: &LiveSet, new: &LiveSet) -> bool {
@@ -102,13 +106,12 @@ fn killed_changed(old: &KilledSet, new: &KilledSet) -> bool {
 }
 
 /// Run the backward memory-liveness dataflow over `function_id`.
-pub fn compute_memory_liveness<'a, 'str: 'a>(
-    host: impl Into<HostRef<'a, 'str>>,
+pub fn compute_memory_liveness<'ctx, 'str: 'ctx>(
+    host: impl QCodeView<'ctx, 'str>,
     function_id: FunctionId,
     aliases: &AliasResult,
     dead_regs: &[ValueId],
 ) -> MemLiveness {
-    let host = host.into();
     let blocks: Vec<BlockId> = host
         .function_ref(function_id)
         .iter()
@@ -187,7 +190,7 @@ mod tests {
     use qcode::{
         context::Context,
         value::{
-            BasicBlock,
+            BasicBlock, ModuleView,
             insn::{InstructionId, Mnemonic},
         },
     };
@@ -212,9 +215,9 @@ mod tests {
         aliases: &AliasResult,
         dead_regs: &[ValueId],
     ) -> HashSet<InstructionId> {
-        let liveness = compute_memory_liveness(ctx, function, aliases, dead_regs);
+        let liveness = compute_memory_liveness(ModuleView::new(ctx), function, aliases, dead_regs);
         dead_load_insns_seeded(
-            ctx,
+            ModuleView::new(ctx),
             block,
             aliases,
             dead_regs,

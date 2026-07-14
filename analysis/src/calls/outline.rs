@@ -15,11 +15,11 @@ use qcode::{
     context::Context,
     types::TypeId,
     value::{
-        BasicBlock, BlockId, FunctionBody, FunctionId, FunctionKind, InstructionRef, LocalValueId,
-        QCodeView, ValueId, VarnodeId,
+        BasicBlock, BlockId, BodyView, FunctionBody, FunctionId, FunctionKind, InstructionRef,
+        LocalValueId, QCodeView, ValueId, VarnodeId,
         block_param::BlockParam,
         insn::{Binary, Binop, Callee, Extract, InstructionId, IntBinop, Mnemonic, Range, Return},
-        util::{base_ref::BaseRef, base_ref::HostRef, host_mut::PassBacking},
+        util::{base_ref::BaseRef, host_mut::PassBacking},
     },
 };
 
@@ -173,7 +173,7 @@ pub(crate) fn outline_tupled<'str>(
             for (field, input) in fields {
                 let Some(input) = input else { continue };
                 let fty = own
-                    .shr()
+                    .shared()
                     .types
                     .field_type(tuple_ty, field)
                     .expect("enumerate tuple field");
@@ -286,7 +286,7 @@ pub(crate) fn outline_scan_body<'str>(
                 // Data mode returned above.
                 ScanElem::Data(_) => unreachable!("data mode handled above"),
             };
-            let types = &own.shr().types;
+            let types = &own.shared().types;
             // Narrow `i64` index → loop index width.
             let isz = types.size_of(index_ty);
             if isz < types.size_of(fty) {
@@ -309,7 +309,7 @@ pub(crate) fn outline_scan_body<'str>(
                 } else {
                     (1u64 << (isz * 8)) - 1
                 };
-                let c = own.shr().get_const((index_start as u64) & mask, isz);
+                let c = own.shared().get_const((index_start as u64) & mask, isz);
                 let add = push_insn_into(
                     minted,
                     root,
@@ -350,7 +350,7 @@ pub(crate) fn seq_result_type<'a, 'str: 'a>(
 /// Push a fresh param typed `ty` onto `block` in the minted host (host-routed
 /// mirror of `BasicBlock::push_param` + the `type_id` write). Returns its value.
 fn push_param_into<'str>(host: &mut PassBacking<'_, 'str>, block: BlockId, ty: TypeId) -> ValueId {
-    let index = host.read_host().block(block).params.len();
+    let index = host.view().block(block).params.len();
     let pid = host.push_block_param(block.func, BlockParam::new(index, ty, block.local));
     host.block_mut(block).params.push(pid.localize(block.func));
     ValueId::BlockParam(pid)
@@ -405,7 +405,7 @@ fn outline_core<'str>(
     result: ValueId,
     slice: &[InstructionId],
     seed: impl for<'a> FnOnce(
-        HostRef<'a, 'str>,
+        BodyView<'a, 'str>,
         &mut qcode::value::util::host_mut::PassBacking<'a, 'str>,
         BlockId,
     ) -> HashMap<ValueId, ValueId>,
@@ -426,7 +426,7 @@ fn outline_core<'str>(
     // Read the slice mnemonics/types from the owning function up front, so the
     // minted-host borrow below does not overlap the owner read.
     let cloned: Vec<(InstructionId, Mnemonic, TypeId)> = {
-        let own = m.read_host(body);
+        let own = m.body_view(body);
         slice
             .iter()
             .map(|&iid| {

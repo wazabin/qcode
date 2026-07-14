@@ -284,7 +284,7 @@ pub fn host_with_minted<'body, 'ctx, 'str>(
     minted: &'body mut [Minted<'str>],
     cx: ContextView<'ctx, 'str>,
     callee: Callee,
-) -> (HostRef<'body, 'str>, PassBacking<'body, 'str>)
+) -> (BodyView<'body, 'str>, PassBacking<'body, 'str>)
 where
     'ctx: 'body,
 {
@@ -300,7 +300,7 @@ where
         owner.id(),
         "minted entry belongs to another owner"
     );
-    (cx.read_host(owner), cx.host(&mut entry.body))
+    (cx.body_view(owner), cx.host(&mut entry.body))
 }
 
 #[cfg(test)]

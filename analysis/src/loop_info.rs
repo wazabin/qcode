@@ -246,7 +246,7 @@ pub(crate) fn delete_private_loop<'str>(
     exit: BlockId,
     exit_args: Vec<ValueId>,
 ) {
-    if let Some(term_id) = BlockRef::new(host.read_host(), preheader)
+    if let Some(term_id) = BlockRef::new(host.view(), preheader)
         .iter()
         .last()
         .map(|t| t.id)
