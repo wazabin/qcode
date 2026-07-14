@@ -8,7 +8,7 @@ use crate::{
         util::{
             base_ref::{BaseRef, WithCtx, WithCtxMut},
             named::{Named, Renameable, update_context_name},
-        host_mut::PassBacking,
+            pass_backing::PassBacking,
         },
     },
 };

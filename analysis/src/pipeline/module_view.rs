@@ -23,7 +23,7 @@ use qcode::{
     context::{Context, Shared},
     value::{
         BodyView, FunctionBody, FunctionId, FunctionKind, function::FunctionInterface,
-        insn::Callee, util::host_mut::PassBacking,
+        insn::Callee, util::pass_backing::PassBacking,
     },
 };
 

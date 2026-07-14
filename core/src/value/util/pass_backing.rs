@@ -131,11 +131,6 @@ impl<'a, 'str> PassBacking<'a, 'str> {
     pub fn view(&self) -> BodyView<'_, 'str> {
         BodyView::new(&*self.fun, self.shared, self.interfaces)
     }
-    /// A pass body never touches the global call-site cache; the driver
-    /// rebuilds it by diffing outgoing calls at the barrier.
-    fn record_call_site(&mut self, _target: FunctionId, _site: InstructionId) {}
-    fn forget_call_site(&mut self, _target: FunctionId, _site: InstructionId) {}
-
     // ---- function-scoped read wrappers --------------------------------------
 
     /// A read [`BlockRef`](crate::value::BlockRef) over `id`, body-routed.
@@ -182,7 +177,6 @@ impl<'a, 'str> PassBacking<'a, 'str> {
 
     pub fn push_insn(&mut self, func: FunctionId, insn: Instruction<'str>) -> InstructionId {
         let args: Vec<crate::value::LocalValueId> = insn.mnemonic().args().into_iter().collect();
-        let call_target = insn.mnemonic().call_target();
         let local = self.function_mut(func).insns.push(insn);
         let id = InstructionId::new(func, local);
         for arg in args {
@@ -191,9 +185,6 @@ impl<'a, 'str> PassBacking<'a, 'str> {
                 .entry(arg)
                 .or_default()
                 .push(id.localize(func));
-        }
-        if let Some(target) = call_target {
-            self.record_call_site(target, id);
         }
         id
     }
@@ -299,14 +290,13 @@ impl<'a, 'str> PassBacking<'a, 'str> {
     }
 
     pub fn remove_instruction(&mut self, id: InstructionId) {
-        let (parent, name, is_terminator, args, target) = {
+        let (parent, name, is_terminator, args) = {
             let insn = self.view().instruction(id);
             (
                 insn.parent.map(|l| BlockId::new(id.func, l)),
                 insn.name.clone(),
                 insn.mnemonic().is_terminator(),
                 insn.mnemonic().args().into_iter().collect::<Vec<_>>(),
-                insn.mnemonic().call_target(),
             )
         };
 
@@ -346,9 +336,6 @@ impl<'a, 'str> PassBacking<'a, 'str> {
                 self.function_mut(id.func).users.remove(&arg);
             }
         }
-        if let Some(target) = target {
-            self.forget_call_site(target, id);
-        }
         self.function_mut(id.func)
             .users
             .remove(&ValueId::Instruction(id).strip_func());
@@ -375,9 +362,9 @@ impl<'a, 'str> PassBacking<'a, 'str> {
 
     pub fn replace_instruction_mnemonic(&mut self, id: InstructionId, mnemonic: Mnemonic) {
         let func = id.func;
-        let (old_args, old_target) = {
+        let old_args = {
             let m = self.view().instruction(id).mnemonic();
-            (m.args().into_iter().collect::<Vec<_>>(), m.call_target())
+            m.args().into_iter().collect::<Vec<_>>()
         };
         for arg in old_args {
             let now_empty = if let Some(users) = self.function_mut(func).users.get_mut(&arg) {
@@ -390,13 +377,10 @@ impl<'a, 'str> PassBacking<'a, 'str> {
                 self.function_mut(func).users.remove(&arg);
             }
         }
-        if let Some(target) = old_target {
-            self.forget_call_site(target, id);
-        }
         *self.instruction_mut(id).mnemonic_mut() = mnemonic;
-        let (new_args, new_target) = {
+        let new_args = {
             let m = self.view().instruction(id).mnemonic();
-            (m.args().into_iter().collect::<Vec<_>>(), m.call_target())
+            m.args().into_iter().collect::<Vec<_>>()
         };
         for arg in new_args {
             self.function_mut(func)
@@ -404,9 +388,6 @@ impl<'a, 'str> PassBacking<'a, 'str> {
                 .entry(arg)
                 .or_default()
                 .push(id.localize(func));
-        }
-        if let Some(target) = new_target {
-            self.record_call_site(target, id);
         }
     }
 

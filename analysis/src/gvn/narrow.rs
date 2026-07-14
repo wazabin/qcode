@@ -489,7 +489,7 @@ mod tests {
         // mba_simplify's surface is pass-scoped; run it over a `PassBacking`
         // borrowing the body in place alongside the read-only shared state.
         let mba_changed = {
-        let mut host = qcode::value::util::host_mut::PassBacking::new(
+            let mut host = qcode::value::util::pass_backing::PassBacking::new(
                 &mut ctx.bodies[mtmul],
                 &ctx.shared,
                 &ctx.interfaces,

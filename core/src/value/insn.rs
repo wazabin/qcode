@@ -282,7 +282,7 @@ macro_rules! impl_insn_mut_verbs {
 }
 
 impl_insn_mut_verbs!(<'c, 'str> &'c mut Context<'str>);
-impl_insn_mut_verbs!(<'a, 'str> crate::value::util::host_mut::PassBacking<'a, 'str>);
+impl_insn_mut_verbs!(<'a, 'str> crate::value::util::pass_backing::PassBacking<'a, 'str>);
 
 #[derive(Clone, Copy)]
 pub struct InstructionRef<'str, 'ctx, R = ModuleView<'ctx, 'str>> {

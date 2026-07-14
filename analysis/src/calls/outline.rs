@@ -19,7 +19,7 @@ use qcode::{
         LocalValueId, QCodeView, ValueId, VarnodeId,
         block_param::BlockParam,
         insn::{Binary, Binop, Callee, Extract, InstructionId, IntBinop, Mnemonic, Range, Return},
-        util::{base_ref::BaseRef, host_mut::PassBacking},
+        util::{base_ref::BaseRef, pass_backing::PassBacking},
     },
 };
 
@@ -406,7 +406,7 @@ fn outline_core<'str>(
     slice: &[InstructionId],
     seed: impl for<'a> FnOnce(
         BodyView<'a, 'str>,
-    &mut qcode::value::util::host_mut::PassBacking<'a, 'str>,
+        &mut qcode::value::util::pass_backing::PassBacking<'a, 'str>,
         BlockId,
     ) -> HashMap<ValueId, ValueId>,
 ) -> Option<Callee> {

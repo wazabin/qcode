@@ -53,7 +53,7 @@ use crate::{
             Mnemonic, PCodeOp, PCodeOpId, PopCount, Range, Return, ReturnValue, SBorrow, SCarry,
             Scan, Sext, Store, TailCall, Tuple, Unary, Unop, Zext,
         },
-        util::{base_ref::BaseRef, host_mut::PassBacking},
+        util::{base_ref::BaseRef, pass_backing::PassBacking},
         varnode::{Varnode, VarnodeId},
     },
 };
@@ -2255,7 +2255,7 @@ mod tests {
     fn checked_builder_matches_module_builder() {
         use crate::value::{
             FunctionId, FunctionRef, block::BasicBlock, function::FunctionBody,
-        util::host_mut::PassBacking,
+            util::pass_backing::PassBacking,
         };
 
         // The same body over any host: consts and a couple of binops (exercising

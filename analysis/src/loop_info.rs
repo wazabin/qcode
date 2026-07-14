@@ -23,7 +23,7 @@ use qcode::{
     value::{
         BlockId, BlockRef, FunctionId, FunctionRef, InstructionRef, ModuleView, QCodeView, ValueId,
         insn::{Binary, Binop, Branch, CBranch, InstructionId, IntBinop, Mnemonic},
-        util::host_mut::PassBacking,
+        util::pass_backing::PassBacking,
     },
 };
 

@@ -257,7 +257,7 @@ impl<T: FunctionPass + Send + Sync> DynFunctionPass for FunctionPassAdapter<T> {
 /// no reattributed blocks — which, post the driver's `split_overlapping_functions`
 /// normalization, every production function is.
 ///
-/// [`PassBacking`]: qcode::value::util::host_mut::PassBacking
+/// [`PassBacking`]: qcode::value::util::pass_backing::PassBacking
 pub(crate) fn with_checked_out_body<'str, R>(
     ctx: &mut Context<'str>,
     fid: FunctionId,

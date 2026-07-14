@@ -32,7 +32,7 @@ use qcode::{
     value::{
         BlockId, BlockParamId, FunctionId, LocalValueId, ModuleView, QCodeView, ValueId,
         insn::{Branch, CBranch, Mnemonic},
-        util::host_mut::PassBacking,
+        util::pass_backing::PassBacking,
     },
 };
 

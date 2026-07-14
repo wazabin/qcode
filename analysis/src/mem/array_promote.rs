@@ -31,7 +31,7 @@ use qcode::{
     value::{
         BlockId, FunctionId, QCodeView, ValueId,
         insn::{Branch, CBranch, InstructionId, IntrinsicApp, IntrinsicId, Load, Mnemonic},
-        util::{base_ref::BaseRef, host_mut::PassBacking},
+        util::{base_ref::BaseRef, pass_backing::PassBacking},
     },
 };
 

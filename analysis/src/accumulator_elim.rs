@@ -52,7 +52,7 @@ use qcode::{
         block::BlockId,
         block_param::{BlockParam, BlockParamId},
         insn::{Apply, CBranch, Extract, Mnemonic},
-        util::{base_ref::BaseRef, host_mut::PassBacking},
+        util::{base_ref::BaseRef, pass_backing::PassBacking},
     },
 };
 

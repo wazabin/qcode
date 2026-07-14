@@ -2486,7 +2486,7 @@ mod tests {
             BlockParam, FunctionId, FunctionRef, InstructionId, Renameable,
             block::BlockId,
             block_param::BlockParamId,
-            util::{base_ref::BaseRef, host_mut::PassBacking},
+            util::{base_ref::BaseRef, pass_backing::PassBacking},
         };
 
         fn build(mut ctx: &mut Context<'static>) -> (FunctionId, BlockId, BlockId, InstructionId) {
