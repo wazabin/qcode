@@ -45,10 +45,10 @@
 use rustc_hash::FxHashMap as HashMap;
 
 use qcode::value::{
-    FunctionId, FunctionRef, InstructionRef, Value, ValueId, ValueRef,
+    BodyView, FunctionId, FunctionRef, InstructionRef, QCodeView, Value, ValueId, ValueRef,
     block::BlockId,
     insn::{Binary, Binop, InstructionId, IntBinop, Mnemonic, Unary, Unop},
-    util::{base_ref::HostRef, host_mut::PassBacking},
+    util::host_mut::PassBacking,
 };
 
 use rumba_core::{
@@ -85,7 +85,7 @@ crate::register_function_pass!(MbaSimplify);
 
 /// This function's instructions that use `v` (which must be a function-scoped
 /// SSA value — instruction or param). Routed through the read host.
-fn users_of(host: HostRef<'_, '_>, v: ValueId) -> Vec<InstructionId> {
+fn users_of(host: BodyView<'_, '_>, v: ValueId) -> Vec<InstructionId> {
     match v.owning_function() {
         Some(f) => host.function_ref(f).users_of(v),
         None => Vec::new(),
@@ -96,10 +96,10 @@ fn users_of(host: HostRef<'_, '_>, v: ValueId) -> Vec<InstructionId> {
 const MAX_WIDTH_BYTES: usize = 8;
 
 pub fn mba_simplify<'str>(host: &mut PassBacking<'_, 'str>, fun: FunctionId) -> bool {
-    let roots: Vec<InstructionId> = FunctionRef::new(host.read_host(), fun)
+    let roots: Vec<InstructionId> = FunctionRef::new(host.view(), fun)
         .blocks()
         .flat_map(|b| b.instruction_ids().to_vec())
-        .filter(|&iid| is_root(host.read_host(), iid))
+        .filter(|&iid| is_root(host.view(), iid))
         .collect();
 
     let mut changed = false;
@@ -111,7 +111,7 @@ pub fn mba_simplify<'str>(host: &mut PassBacking<'_, 'str>, fun: FunctionId) -> 
 
 /// A *maximal* MBA instruction: one that is live and is not a single-use
 /// operand of another same-width MBA instruction (which would subsume it).
-fn is_root(host: HostRef, iid: InstructionId) -> bool {
+fn is_root(host: BodyView<'_, '_>, iid: InstructionId) -> bool {
     if !is_mba_insn(host, iid) {
         return false;
     }
@@ -129,7 +129,7 @@ fn is_root(host: HostRef, iid: InstructionId) -> bool {
 }
 
 fn try_simplify_root<'str>(host: &mut PassBacking<'_, 'str>, root: InstructionId) -> bool {
-    let size = insn_size(host.read_host(), root);
+    let size = insn_size(host.view(), root);
     if size == 0 || size > MAX_WIDTH_BYTES {
         return false;
     }
@@ -140,7 +140,7 @@ fn try_simplify_root<'str>(host: &mut PassBacking<'_, 'str>, root: InstructionId
     //    this is a genuine MBA: a *mix* of arithmetic and boolean ops, and more
     //    than a lone instruction.
     let mut c = Classify {
-        host: host.read_host(),
+        host: host.view(),
         region: size,
         has_arith: false,
         has_bool: false,
@@ -155,7 +155,7 @@ fn try_simplify_root<'str>(host: &mut PassBacking<'_, 'str>, root: InstructionId
     // 2. Build the rumba `Expr` (immutable borrow, scoped so `host` is free after).
     let (raw, leaves) = {
         let mut ex = Extract {
-            host: host.read_host(),
+            host: host.view(),
             region: size,
             mask,
             leaves: Vec::new(),
@@ -178,7 +178,7 @@ fn try_simplify_root<'str>(host: &mut PassBacking<'_, 'str>, root: InstructionId
     if cost(&pretty, mask) >= region_cost {
         return false;
     }
-    let block = InstructionRef::new(host.read_host(), root)
+    let block = InstructionRef::new(host.view(), root)
         .parent()
         .expect("a root instruction lives in a block")
         .id;
@@ -207,7 +207,7 @@ fn simplify_mba_checked(raw: Expr, n: u8) -> Option<Expr> {
 // --- qcode subgraph -> rumba Expr ------------------------------------------
 
 struct Extract<'a, 'str> {
-    host: HostRef<'a, 'str>,
+    host: BodyView<'a, 'str>,
     /// Region width in bytes; nodes of other widths are taken as opaque leaves.
     region: usize,
     mask: u64,
@@ -287,7 +287,7 @@ enum OpClass {
 /// and instruction count — so a non-MBA region is rejected before any rumba
 /// `Expr` is allocated.
 struct Classify<'a, 'str> {
-    host: HostRef<'a, 'str>,
+    host: BodyView<'a, 'str>,
     region: usize,
     has_arith: bool,
     has_bool: bool,
@@ -529,10 +529,10 @@ fn push_insn<'str>(
 
 /// Remove `iid` and any operand subtree that becomes userless once it is gone.
 fn prune_dead<'str>(host: &mut PassBacking<'_, 'str>, iid: InstructionId) {
-    if !users_of(host.read_host(), ValueId::Instruction(iid)).is_empty() {
+    if !users_of(host.view(), ValueId::Instruction(iid)).is_empty() {
         return;
     }
-    let operands = InstructionRef::new(host.read_host(), iid)
+    let operands = InstructionRef::new(host.view(), iid)
         .operands()
         .into_iter()
         .collect::<Vec<_>>();
@@ -556,7 +556,7 @@ fn int_op(op: &Binop) -> Option<IntBinop> {
 /// An MBA child of `v` to inline (instruction, same width, modelable op, used
 /// only here), or `None` if `v` should be an opaque leaf. Callers handle
 /// constants before reaching this.
-fn inlinable_child(host: HostRef, region: usize, v: ValueId) -> Option<InstructionId> {
+fn inlinable_child(host: BodyView<'_, '_>, region: usize, v: ValueId) -> Option<InstructionId> {
     if let ValueId::Instruction(iid) = v
         && value_size(host, v) == region
         && is_mba_insn(host, iid)
@@ -568,7 +568,7 @@ fn inlinable_child(host: HostRef, region: usize, v: ValueId) -> Option<Instructi
 }
 
 /// The MBA half an instruction's operator belongs to (`None` if not modelable).
-fn mba_class(host: HostRef, iid: InstructionId) -> Option<OpClass> {
+fn mba_class(host: BodyView<'_, '_>, iid: InstructionId) -> Option<OpClass> {
     match InstructionRef::new(host, iid).mnemonic() {
         Mnemonic::Binop(b) => match int_op(&b.op)? {
             IntBinop::Add | IntBinop::Sub | IntBinop::Mul | IntBinop::ShiftLeft => {
@@ -588,7 +588,7 @@ fn mba_class(host: HostRef, iid: InstructionId) -> Option<OpClass> {
 
 /// Is `iid` an integer op this pass can model? `shl` qualifies only with a
 /// constant shift below the operand width (so it is exactly `x * 2^c`).
-fn is_mba_insn(host: HostRef, iid: InstructionId) -> bool {
+fn is_mba_insn(host: BodyView<'_, '_>, iid: InstructionId) -> bool {
     match InstructionRef::new(host, iid).mnemonic() {
         Mnemonic::Binop(b) => match b.op {
             Binop::Int(o) => match o {
@@ -612,9 +612,9 @@ fn is_mba_insn(host: HostRef, iid: InstructionId) -> bool {
 }
 
 /// The constant value of `v`, if it is a plain (non-symbolic) integer literal.
-fn numeric_const(host: HostRef, v: ValueId) -> Option<u64> {
+fn numeric_const(host: BodyView<'_, '_>, v: ValueId) -> Option<u64> {
     if let ValueId::Literal(id) = v {
-        let lit = &host.shr().values.literals[id];
+        let lit = &host.shared().values.literals[id];
         if lit.symbolic.is_none() {
             return Some(lit.value);
         }
@@ -622,12 +622,12 @@ fn numeric_const(host: HostRef, v: ValueId) -> Option<u64> {
     None
 }
 
-fn insn_size(host: HostRef, iid: InstructionId) -> usize {
+fn insn_size(host: BodyView<'_, '_>, iid: InstructionId) -> usize {
     InstructionRef::new(host, iid).size()
 }
 
-fn value_size(host: HostRef, v: ValueId) -> usize {
-    ValueRef::from_host(host, v).size()
+fn value_size(host: BodyView<'_, '_>, v: ValueId) -> usize {
+    ValueRef::from_view(host, v).size()
 }
 
 #[cfg(test)]

@@ -3,10 +3,10 @@ use qcode::space::SpaceType;
 #[cfg(test)]
 use qcode::value::block::BlockRef;
 use qcode::value::{
-    BlockId, BlockParam, BlockParamId, FunctionBody, FunctionId, Value, ValueId, ValueRef, Varnode,
-    VarnodeId,
+    BlockId, BlockParam, BlockParamId, BodyView, FunctionBody, FunctionId, QCodeView, Value,
+    ValueId, ValueRef, Varnode, VarnodeId,
     insn::{Branch, CBranch, InstructionId, Load, Mnemonic, Range, Sext, Store, Zext},
-    util::base_ref::{BaseRef, HostRef},
+    util::base_ref::BaseRef,
 };
 use qcode::{builder::Builder, context::Context};
 use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
@@ -103,25 +103,32 @@ pub(crate) fn has_dynamic_stack_pointer_deref(
     false
 }
 
-fn register_varnode(host: HostRef, value: ValueId) -> Option<VarnodeId> {
+fn register_varnode<'a, 'str: 'a>(
+    host: impl QCodeView<'a, 'str>,
+    value: ValueId,
+) -> Option<VarnodeId> {
     let ValueId::Varnode(vn_id) = value else {
         return None;
     };
     matches!(
-        Varnode::from_id(host.shr(), vn_id).space().ty,
+        Varnode::from_id(host.shared(), vn_id).space().ty,
         SpaceType::Register
     )
     .then_some(vn_id)
 }
 
-fn wider_register_store_contains(host: HostRef, store: ValueId, var: ValueId) -> bool {
+fn wider_register_store_contains<'a, 'str: 'a>(
+    host: impl QCodeView<'a, 'str>,
+    store: ValueId,
+    var: ValueId,
+) -> bool {
     let (Some(store), Some(var)) = (register_varnode(host, store), register_varnode(host, var))
     else {
         return false;
     };
     let (store, var) = (
-        Varnode::from_id(host.shr(), store),
-        Varnode::from_id(host.shr(), var),
+        Varnode::from_id(host.shared(), store),
+        Varnode::from_id(host.shared(), var),
     );
     if store.space().id != var.space().id || store.size() <= var.size() {
         return false;
@@ -141,14 +148,18 @@ fn wider_register_store_contains(host: HostRef, store: ValueId, var: ValueId) ->
 /// already applies when forwarding. A containment at a non-zero offset (e.g.
 /// `AH`) would need a shift, which this pass does not synthesize, so it is
 /// excluded here and left to the GVN memory pass.
-fn register_store_low_aligned_contains(host: HostRef, store: ValueId, var: ValueId) -> bool {
+fn register_store_low_aligned_contains<'a, 'str: 'a>(
+    host: impl QCodeView<'a, 'str>,
+    store: ValueId,
+    var: ValueId,
+) -> bool {
     let (Some(store), Some(var)) = (register_varnode(host, store), register_varnode(host, var))
     else {
         return false;
     };
     let (store, var) = (
-        Varnode::from_id(host.shr(), store),
-        Varnode::from_id(host.shr(), var),
+        Varnode::from_id(host.shared(), store),
+        Varnode::from_id(host.shared(), var),
     );
     store.space().id == var.space().id
         && store.size() > var.size()
@@ -164,8 +175,8 @@ fn register_store_low_aligned_contains(host: HostRef, store: ValueId, var: Value
 /// are reported as may-alias even though their bytes don't overlap. That only ever
 /// *over*-clobbers — it forces an extra reload / preserves an extra store — and can
 /// never yield wrong SSA, so the imprecision is intentional and safe.
-fn register_clobber_index(
-    host: HostRef,
+fn register_clobber_index<'a, 'str: 'a>(
+    host: impl QCodeView<'a, 'str>,
     function_id: FunctionId,
     vars: &HashSet<ValueId>,
     aliases: &AliasResult,
@@ -362,8 +373,7 @@ struct LiveInBlocks {
 }
 
 impl LiveInBlocks {
-    fn new<'a, 'str: 'a>(host: impl Into<HostRef<'a, 'str>>, function_id: FunctionId) -> Self {
-        let host = host.into();
+    fn new<'a, 'str: 'a>(host: impl QCodeView<'a, 'str>, function_id: FunctionId) -> Self {
         let mut store_blocks: HashMap<ValueId, HashSet<BlockId>> = HashMap::default();
         let mut upward_exposed: HashMap<ValueId, HashSet<BlockId>> = HashMap::default();
         let mut call_blocks = Vec::new();
@@ -398,13 +408,16 @@ impl LiveInBlocks {
                         call_blocks.push((block_id, CallClobber::All));
                         continue;
                     };
-                    let callee = host.function_ref(target);
-                    let clobber = match callee.clobbered_regs() {
+                    let interface = host.interface(target);
+                    let signature = interface.signature.as_ref();
+                    let clobber = match signature.and_then(|s| s.clobbered.as_deref()) {
                         Some(regs) => CallClobber::Regs(regs.to_vec()),
                         // A resolved callee with no recorded set clobbers nothing
                         // (exact, empty set); an unresolved one is unknown, so
                         // conservatively clobbers all.
-                        None if callee.is_externally_resolved() => CallClobber::Regs(Vec::new()),
+                        None if signature.is_some_and(|s| s.externally_resolved) => {
+                            CallClobber::Regs(Vec::new())
+                        }
                         None => CallClobber::All,
                     };
                     call_blocks.push((block_id, clobber));
@@ -431,11 +444,10 @@ impl LiveInBlocks {
     /// rescan that made phi insertion O(vars × instructions).
     fn store_def_blocks<'a, 'str: 'a>(
         &self,
-        host: impl Into<HostRef<'a, 'str>>,
+        host: impl QCodeView<'a, 'str>,
         var: ValueId,
         sliced: &HashSet<ValueId>,
     ) -> HashSet<BlockId> {
-        let host = host.into();
         if sliced.contains(&var) {
             self.sliced_seeds(host, var).0
         } else {
@@ -446,12 +458,11 @@ impl LiveInBlocks {
     /// Memoized live-in block set for `var`.
     fn get<'a, 'str: 'a>(
         &mut self,
-        host: impl Into<HostRef<'a, 'str>>,
+        host: impl QCodeView<'a, 'str>,
         var: ValueId,
         sliced: &HashSet<ValueId>,
         aliases: &AliasResult,
     ) -> HashSet<BlockId> {
-        let host = host.into();
         if let Some(cached) = self.memo.get(&var) {
             return cached.clone();
         }
@@ -460,9 +471,9 @@ impl LiveInBlocks {
         live_in
     }
 
-    fn compute(
+    fn compute<'a, 'str: 'a>(
         &self,
-        host: HostRef,
+        host: impl QCodeView<'a, 'str>,
         var: ValueId,
         sliced: &HashSet<ValueId>,
         aliases: &AliasResult,
@@ -511,7 +522,11 @@ impl LiveInBlocks {
     /// that low-alignedly covers it counts as a definition (and suppresses a
     /// later load's upward exposure within the block), which the exact-pointer
     /// sweep cannot see.
-    fn sliced_seeds(&self, host: HostRef, var: ValueId) -> (HashSet<BlockId>, HashSet<BlockId>) {
+    fn sliced_seeds<'a, 'str: 'a>(
+        &self,
+        host: impl QCodeView<'a, 'str>,
+        var: ValueId,
+    ) -> (HashSet<BlockId>, HashSet<BlockId>) {
         let mut defined = HashSet::default();
         let mut upward_exposed = HashSet::default();
         for block in host.function_ref(self.function_id).blocks() {
@@ -647,7 +662,7 @@ fn decide_variable_value(var: ValueId, frames: &[Frame]) -> Option<FrameEntry> {
 }
 
 /// mem2reg over a checked-out [`FunctionBody`] and the shared [`ContextView`]
-/// (context-split stage 5b-ii): reads route through `cx.read_host(body)`,
+/// (context-split stage 5b-ii): reads route through `cx.body_view(body)`,
 /// mutations through the inherent `body.verb(cx, ...)` surface. This is the sole
 /// implementation; the whole-`Context` entry points (`mem2reg` / `mem2reg_framed`)
 /// reach it through a check-out shim.
@@ -674,11 +689,11 @@ impl<'ctx, 'str> Mem2Reg<'ctx, 'str> {
         sp_param: Option<ValueId>,
     ) -> Self {
         let root_id = cx
-            .read_host(body)
+            .body_view(body)
             .function_ref(function_id)
             .root()
             .map(|b| b.id);
-        let numbering = precompute_forms(cx.read_host(body), function_id);
+        let numbering = precompute_forms(cx.body_view(body), function_id);
         Self {
             body,
             cx,
@@ -692,8 +707,8 @@ impl<'ctx, 'str> Mem2Reg<'ctx, 'str> {
 
     /// A `Copy` read view over this pass's mutation host.
     #[inline]
-    fn read(&self) -> HostRef<'_, 'str> {
-        self.cx.read_host(self.body)
+    fn read(&self) -> BodyView<'_, 'str> {
+        self.cx.body_view(self.body)
     }
 
     /// The signed byte offset of stack-slot pointer `ptr` from the entry stack
@@ -701,7 +716,7 @@ impl<'ctx, 'str> Mem2Reg<'ctx, 'str> {
     /// stack-pointer param or `ptr` is not an `@SP ± N` slot.
     fn slot_offset(&self, ptr: ValueId) -> Option<i64> {
         let sp = self.sp_param?;
-        frame_offset(self.read().shr(), &self.numbering, sp, ptr)
+        frame_offset(self.read().shared(), &self.numbering, sp, ptr)
     }
 
     /// Whether `ptr` is `@SP`-derived but *not* a fixed slot offset — a
@@ -786,15 +801,15 @@ impl<'ctx, 'str> Mem2Reg<'ctx, 'str> {
         value: ValueId,
         load_size: usize,
     ) -> ValueId {
-        let value_size = ValueRef::from_host(self.read(), value).size();
+        let value_size = ValueRef::from_view(self.read(), value).size();
         if value_size == load_size {
             return value;
         }
 
         if let ValueId::Literal(id) = value {
-            let literal = self.read().shr().values.literals[id].clone();
+            let literal = self.read().shared().values.literals[id].clone();
             if literal.symbolic.is_none() {
-                return self.read().shr().get_const(literal.value, load_size);
+                return self.read().shared().get_const(literal.value, load_size);
             }
         }
 
@@ -818,7 +833,7 @@ impl<'ctx, 'str> Mem2Reg<'ctx, 'str> {
                 _ => None,
             };
             if let Some(src) = src
-                && ValueRef::from_host(self.read(), src).size() == load_size
+                && ValueRef::from_view(self.read(), src).size() == load_size
             {
                 return src;
             }
@@ -845,7 +860,7 @@ impl<'ctx, 'str> Mem2Reg<'ctx, 'str> {
 impl<'str> Mem2Reg<'_, 'str> {
     fn block_param_name_for_var(&self, var: ValueId) -> Option<String> {
         match var {
-            ValueId::Varnode(varnode_id) => Varnode::from_id(self.read().shr(), varnode_id)
+            ValueId::Varnode(varnode_id) => Varnode::from_id(self.read().shared(), varnode_id)
                 .name()
                 .map(|n| n.to_owned()),
             _ => self.slot_offset(var).map(|off| format!("stack_{off:x}")),
@@ -895,7 +910,7 @@ impl<'str> Mem2Reg<'_, 'str> {
         // Host-routed mirror of `BasicBlock::push_param(size)`: mint an
         // `Int(size)`-typed param and append it to the block's param list.
         let index = self.read().block(block_id).param_ids().len();
-        let type_id = self.read().shr().types.get_or_make_int(size);
+        let type_id = self.read().shared().types.get_or_make_int(size);
         let param_id = self
             .body
             .push_block_param(BlockParam::new(index, type_id, block_id.local));
@@ -912,7 +927,7 @@ impl<'str> Mem2Reg<'_, 'str> {
         // the default `Int(size)`. Width matches by construction (the override is
         // installed with the varnode's own width).
         if let ValueId::Varnode(_) = var
-            && let Some(ty) = self.read().shr().stored_type_of(var)
+            && let Some(ty) = self.read().shared().stored_type_of(var)
         {
             self.body.block_param_mut(param_id).type_id = ty;
         }
@@ -969,21 +984,21 @@ impl<'str> Mem2Reg<'_, 'str> {
                 // emulator zero-fills the wider store too), so a literal source
                 // stays promotable; a non-literal width mismatch still disqualifies.
                 if let MemoryAccessKind::Store { src } = access.kind
-                    && ValueRef::from_host(self.read(), src).size() != access.size
+                    && ValueRef::from_view(self.read(), src).size() != access.size
                     && !matches!(src, ValueId::Literal(_))
                 {
                     mixed_width.insert(access.ptr);
                 }
 
                 if let ValueId::Varnode(vn_id) = access.ptr {
-                    if access.size != Varnode::from_id(self.read().shr(), vn_id).size() {
+                    if access.size != Varnode::from_id(self.read().shared(), vn_id).size() {
                         mixed_width.insert(access.ptr);
                     }
                     if access.is_store() {
                         stored.insert(access.ptr);
                         *store_counts.entry(access.ptr).or_insert(0) += 1;
                         if matches!(
-                            Varnode::from_id(self.read().shr(), vn_id).space().ty,
+                            Varnode::from_id(self.read().shared(), vn_id).space().ty,
                             SpaceType::Register
                         ) {
                             register_stores.insert(access.ptr);
@@ -1025,7 +1040,7 @@ impl<'str> Mem2Reg<'_, 'str> {
         for &var in stored.union(&loaded) {
             if let ValueId::Varnode(vn_id) = var
                 && matches!(
-                    Varnode::from_id(self.read().shr(), vn_id).space().ty,
+                    Varnode::from_id(self.read().shared(), vn_id).space().ty,
                     SpaceType::Register
                 )
             {
@@ -1184,7 +1199,7 @@ impl<'str> Mem2Reg<'_, 'str> {
             // (consistent) access size recorded during collection.
             let size = match var {
                 ValueId::Varnode(varnode_id) => {
-                    Varnode::from_id(self.read().shr(), varnode_id).size()
+                    Varnode::from_id(self.read().shared(), varnode_id).size()
                 }
                 _ => match sizes.get(&var) {
                     Some(&size) => size,
@@ -1375,7 +1390,7 @@ impl<'str> Mem2Reg<'_, 'str> {
         vn_id: VarnodeId,
     ) -> ValueId {
         let (space, size) = {
-            let vn = Varnode::from_id(self.read().shr(), vn_id);
+            let vn = Varnode::from_id(self.read().shared(), vn_id);
             (vn.space().id, vn.size())
         };
         let mut host = self.cx.host(self.body);
@@ -1482,7 +1497,7 @@ impl<'str> Mem2Reg<'_, 'str> {
                 // the conservative frame analysis did not flag) are safe to remove.
                 // Stack-slot literals keep the unconditional removal.
                 let guarded = if let ValueId::Varnode(vn_id) = ptr {
-                    match Varnode::from_id(self.read().shr(), vn_id).space().ty {
+                    match Varnode::from_id(self.read().shared(), vn_id).space().ty {
                         SpaceType::Register => true,
                         SpaceType::Temporary => vars_with_surviving_loads.contains(&ptr),
                         _ => false,
@@ -1898,9 +1913,12 @@ impl<'str> Mem2Reg<'_, 'str> {
                 let Some(target) = call.target.real() else {
                     return register_vars().collect();
                 };
-                let callee = self.read().function_ref(target);
-                let resolved = callee.is_externally_resolved();
-                let clobbered = callee.clobbered_regs().map(<[VarnodeId]>::to_vec);
+                let interface = self.read().interface(target);
+                let signature = interface.signature.as_ref();
+                let resolved = signature.is_some_and(|s| s.externally_resolved);
+                let clobbered = signature
+                    .and_then(|s| s.clobbered.as_deref())
+                    .map(<[VarnodeId]>::to_vec);
                 match clobbered {
                     // A resolved callee with no recorded set clobbers nothing; an
                     // unresolved one is unknown, so conservatively clobbers all.
@@ -1985,9 +2003,15 @@ mod tests {
         let frontier = dom.dominator_frontier();
         let aliases = AliasResult::simple_for_function(&ctx, test);
         let sliced = HashSet::default();
-        let mut cache = LiveInBlocks::new(&ctx, test);
-        let live_in = cache.get(&ctx, A.into(), &sliced, &aliases);
-        let store_blocks = cache.store_def_blocks(&ctx, A.into(), &sliced);
+        let mut cache = LiveInBlocks::new(qcode::value::ModuleView::new(&ctx), test);
+        let live_in = cache.get(
+            qcode::value::ModuleView::new(&ctx),
+            A.into(),
+            &sliced,
+            &aliases,
+        );
+        let store_blocks =
+            cache.store_def_blocks(qcode::value::ModuleView::new(&ctx), A.into(), &sliced);
 
         let result = find_phi_insert_positions(frontier, &live_in, &store_blocks);
 
@@ -2131,7 +2155,8 @@ mod tests {
         ]);
 
         let sliced = HashSet::default();
-        let store_blocks = LiveInBlocks::new(&ctx, test).store_def_blocks(&ctx, A.into(), &sliced);
+        let store_blocks = LiveInBlocks::new(qcode::value::ModuleView::new(&ctx), test)
+            .store_def_blocks(qcode::value::ModuleView::new(&ctx), A.into(), &sliced);
         let result = find_phi_insert_positions(&frontier, &live_in, &store_blocks);
 
         assert_eq!(result, HashSet::from_iter([loop_header]));
@@ -2236,9 +2261,15 @@ mod tests {
         let frontier = dom.dominator_frontier();
         let aliases = AliasResult::simple_for_function(&ctx, test);
         let sliced = HashSet::default();
-        let mut cache = LiveInBlocks::new(&ctx, test);
-        let live_in = cache.get(&ctx, A.into(), &sliced, &aliases);
-        let store_blocks = cache.store_def_blocks(&ctx, A.into(), &sliced);
+        let mut cache = LiveInBlocks::new(qcode::value::ModuleView::new(&ctx), test);
+        let live_in = cache.get(
+            qcode::value::ModuleView::new(&ctx),
+            A.into(),
+            &sliced,
+            &aliases,
+        );
+        let store_blocks =
+            cache.store_def_blocks(qcode::value::ModuleView::new(&ctx), A.into(), &sliced);
 
         let result = find_phi_insert_positions(frontier, &live_in, &store_blocks);
 
@@ -3605,8 +3636,7 @@ impl FunctionPass for Mem2RegPass {
         // keys off the module context.
         let sp_reg = shared.registers[&env.cfg.stack_pointer];
         let (aliases, sp_param) = {
-            let host = m.host(f);
-            let read = host.read_host();
+            let read = m.body_view(f);
             let aliases = env.alias_base(shared).for_function(read, fun_id);
             // Resolve `@SP` so canonical `@SP ± N` slots are recognised; `None` when
             // the function has no incoming stack-pointer param (legacy literal path).
