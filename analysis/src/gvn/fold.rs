@@ -1,10 +1,10 @@
 //! Constant-folding sub-pass: arithmetic on literals and algebraic identities.
 
 use qcode::value::{
-    FunctionId, Value, ValueId, ValueRef,
+    FunctionId, QCodeView, Value, ValueId, ValueRef,
     insn::{Binary, Binop, IntBinop, Mnemonic, Unop},
     literal::LiteralRef,
-    util::base_ref::{AsShared, HostRef},
+    util::base_ref::AsShared,
 };
 
 use std::any::Any;
@@ -13,18 +13,20 @@ use super::walk::{Claim, Editor, InsnCtx, SubPassC};
 
 #[cfg(test)]
 use qcode::context::Context;
+#[cfg(test)]
+use qcode::value::ModuleView;
 
 use crate::{ContextView, FunctionBody};
 
 /// Fold constant arithmetic and algebraic identities into interned literals.
 ///
-/// Fully host-routed: every read goes through a [`HostRef`] (so a checked-out
-/// function's own SSA values resolve) and every literal/type it mints goes
-/// through the interners' `&self` paths on the shared context.
+/// Every body read goes through the selected function's static view and every
+/// literal/type it mints goes through the interners' `&self` paths on shared
+/// storage.
 pub(super) struct Fold;
 
 /// The function-pass [`SubPassC`] impl (context-split stage 5b-ii):
-/// `try_fold_insn` reads through `cx.read_host(body)` and the fold forwards
+/// `try_fold_insn` reads through `cx.body_view(body)` and the fold forwards
 /// through `Editor::replace_c`.
 impl<'str> SubPassC<'str> for Fold {
     fn init_state(&self) -> Box<dyn Any> {
@@ -46,7 +48,7 @@ impl<'str> SubPassC<'str> for Fold {
         if ic.mnemonic.is_terminator() || ic.size == 0 {
             return Claim::Pass;
         }
-        match try_fold_insn(cx.read_host(body), ic) {
+        match try_fold_insn(cx.body_view(body), ic) {
             Some(folded) => {
                 ed.replace_c(body, cx, ic.insn_id, folded);
                 Claim::Done
@@ -60,27 +62,30 @@ impl<'str> SubPassC<'str> for Fold {
 // Constant folding
 // ---------------------------------------------------------------------------
 
-fn get_const<'a, 'str>(host: HostRef<'a, 'str>, v: ValueId) -> Option<LiteralRef<'str, 'a>> {
-    match ValueRef::from_host(host, v) {
+fn get_const<'ctx, 'str: 'ctx>(
+    host: impl QCodeView<'ctx, 'str>,
+    v: ValueId,
+) -> Option<LiteralRef<'str, 'ctx>> {
+    match ValueRef::from_view(host, v) {
         ValueRef::Literal(c) => Some(c),
         _ => None,
     }
 }
 
-fn is_symbolic_literal(host: HostRef, v: ValueId) -> bool {
+fn is_symbolic_literal<'ctx, 'str: 'ctx>(host: impl QCodeView<'ctx, 'str>, v: ValueId) -> bool {
     let ValueId::Literal(id) = v else {
         return false;
     };
-    host.shr().values.literals[id].symbolic.is_some()
+    host.shared().values.literals[id].symbolic.is_some()
 }
 
 /// `get_const`, but refusing Block/Function/String symbolic literals: those are
 /// not numeric constants and folding them would discard the symbolic annotation.
 /// StackAddress-typed literals have symbolic=None and are foldable.
-fn get_numeric_const<'a, 'str>(
-    host: HostRef<'a, 'str>,
+fn get_numeric_const<'ctx, 'str: 'ctx>(
+    host: impl QCodeView<'ctx, 'str>,
     v: ValueId,
-) -> Option<LiteralRef<'str, 'a>> {
+) -> Option<LiteralRef<'str, 'ctx>> {
     if is_symbolic_literal(host, v) {
         return None;
     }
@@ -97,7 +102,7 @@ pub(super) fn constant_folding(
     // Test-only: the test mnemonics hold shared literal operands, which carry no
     // function, so any func qualifies them unchanged.
     constant_folding_with_location(
-        HostRef::from(&*ctx),
+        ModuleView::new(&*ctx),
         FunctionId::from(0usize),
         m,
         output_size,
@@ -105,8 +110,8 @@ pub(super) fn constant_folding(
     )
 }
 
-fn constant_folding_with_location(
-    host: HostRef,
+fn constant_folding_with_location<'ctx, 'str: 'ctx>(
+    host: impl QCodeView<'ctx, 'str>,
     func: FunctionId,
     m: &Mnemonic,
     output_size: usize,
@@ -209,13 +214,13 @@ fn constant_folding_with_location(
             };
 
             // Preserve the semantic type (e.g. StackAddress) through folding.
-            let out_type = host.shr().types.binop_result(lhs_type, op, rhs_type);
-            let out_type = if host.shr().types.size_of(out_type) == output_size {
+            let out_type = host.shared().types.binop_result(lhs_type, op, rhs_type);
+            let out_type = if host.shared().types.size_of(out_type) == output_size {
                 out_type
             } else {
-                host.shr().types.get_or_make_int(output_size)
+                host.shared().types.get_or_make_int(output_size)
             };
-            Some(host.shr().get_typed_const(value, out_type))
+            Some(host.shared().get_typed_const(value, out_type))
         }
 
         Mnemonic::Unop(unop) => {
@@ -234,12 +239,12 @@ fn constant_folding_with_location(
                 }
             };
 
-            Some(host.shr().get_const(value & mask, size))
+            Some(host.shared().get_const(value & mask, size))
         }
 
         Mnemonic::Zext(zext) => {
             let src = get_numeric_const(host, zext.src.qualify(func))?;
-            Some(host.shr().get_const(src.value(), zext.size))
+            Some(host.shared().get_const(src.value(), zext.size))
         }
 
         Mnemonic::Sext(sext) => {
@@ -253,7 +258,7 @@ fn constant_folding_with_location(
                 (((src.value() << (64 - src_bits)) as i64) >> (64 - src_bits)) as u64
             };
             Some(
-                host.shr()
+                host.shared()
                     .get_const(extended & all_ones(sext.size), sext.size),
             )
         }
@@ -263,7 +268,7 @@ fn constant_folding_with_location(
             // constant. The source may be a numeric literal (e.g. EDI = low 4
             // bytes of a wide RDI literal) or an opaque byte blob.
             if let Some(bid) = range.src.qualify(func).as_bytes() {
-                let data = &host.shr().values.bytes[bid].data;
+                let data = &host.shared().values.bytes[bid].data;
                 let start = range.start;
                 let end = start.checked_add(range.size)?;
                 let slice = data.get(start..end)?;
@@ -272,15 +277,15 @@ fn constant_folding_with_location(
                     // numeric pipeline as an ordinary literal.
                     let mut buf = [0u8; 8];
                     buf[..slice.len()].copy_from_slice(slice);
-                    return Some(host.shr().get_const(u64::from_le_bytes(buf), range.size));
+                    return Some(host.shared().get_const(u64::from_le_bytes(buf), range.size));
                 }
                 // Still wider than a u64: a narrower byte blob.
-                return Some(host.shr().get_bytes(slice.to_vec()));
+                return Some(host.shared().get_bytes(slice.to_vec()));
             }
             let src = get_numeric_const(host, range.src.qualify(func))?;
             let shifted = src.value().overflowing_shr(range.start as u32 * 8).0;
             Some(
-                host.shr()
+                host.shared()
                     .get_const(shifted & all_ones(range.size), range.size),
             )
         }
@@ -294,7 +299,7 @@ fn constant_folding_with_location(
                 operands.push((u128::from(c.value()), c.size()));
             }
             let value = intr.id.desc().eval(&operands, output_size)?;
-            Some(host.shr().get_const(value as u64, output_size))
+            Some(host.shared().get_const(value as u64, output_size))
         }
 
         _ => None,
@@ -340,7 +345,10 @@ pub(super) fn const_value<'a, 'str: 'a>(src: impl AsShared<'a, 'str>, v: ValueId
     Some(LiteralRef::from_id(shared, id).value())
 }
 
-fn try_fold_insn(host: HostRef, ic: &InsnCtx) -> Option<ValueId> {
+fn try_fold_insn<'ctx, 'str: 'ctx>(
+    host: impl QCodeView<'ctx, 'str>,
+    ic: &InsnCtx,
+) -> Option<ValueId> {
     let func = ic.insn_id.func;
     constant_folding_with_location(host, func, ic.mnemonic, ic.size, Some(ic))
         .or_else(|| algebraic_identity(host, func, ic.mnemonic, ic.size))
@@ -348,8 +356,8 @@ fn try_fold_insn(host: HostRef, ic: &InsnCtx) -> Option<ValueId> {
 }
 
 /// The size in bytes of `v`'s output.
-fn value_size(host: HostRef, v: ValueId) -> usize {
-    ValueRef::from_host(host, v).size()
+fn value_size<'ctx, 'str: 'ctx>(host: impl QCodeView<'ctx, 'str>, v: ValueId) -> usize {
+    ValueRef::from_view(host, v).size()
 }
 
 /// Width-preserving casts and extracts that collapse to an existing value.
@@ -359,7 +367,11 @@ fn value_size(host: HostRef, v: ValueId) -> usize {
 /// * `zext(iN, v)` where `v` is already `N` bytes wide → `v`
 /// * `v[0:N]` (i.e. `Range { start: 0, size: N }`) where `v` is `N` bytes → `v`
 /// * `zext(_, v)[0:N]` where `v` is `N` bytes → `v` (e.g. `zext(i32, i1 v)[0:1]`)
-pub(super) fn cast_identity(host: HostRef, func: FunctionId, m: &Mnemonic) -> Option<ValueId> {
+pub(super) fn cast_identity<'ctx, 'str: 'ctx>(
+    host: impl QCodeView<'ctx, 'str>,
+    func: FunctionId,
+    m: &Mnemonic,
+) -> Option<ValueId> {
     match m {
         Mnemonic::Zext(zext) => {
             let src = zext.src.qualify(func);
@@ -387,8 +399,8 @@ pub(super) fn cast_identity(host: HostRef, func: FunctionId, m: &Mnemonic) -> Op
     }
 }
 
-fn log_mixed_width_binop(
-    host: HostRef,
+fn log_mixed_width_binop<'ctx, 'str: 'ctx>(
+    host: impl QCodeView<'ctx, 'str>,
     location: Option<&InsnCtx>,
     lhs: ValueId,
     rhs: ValueId,
@@ -407,10 +419,10 @@ fn log_mixed_width_binop(
     );
 }
 
-fn value_detail(host: HostRef, value: ValueId) -> String {
+fn value_detail<'ctx, 'str: 'ctx>(host: impl QCodeView<'ctx, 'str>, value: ValueId) -> String {
     match value {
         ValueId::Literal(_) => {
-            let ValueRef::Literal(lit) = ValueRef::from_host(host, value) else {
+            let ValueRef::Literal(lit) = ValueRef::from_view(host, value) else {
                 unreachable!();
             };
             format!(
@@ -437,13 +449,16 @@ fn value_detail(host: HostRef, value: ValueId) -> String {
             )
         }
         _ => {
-            let value_ref = ValueRef::from_host(host, value);
+            let value_ref = ValueRef::from_view(host, value);
             format!("{value:?} value=`{value_ref}` size={}", value_ref.size())
         }
     }
 }
 
-fn fold_location(host: HostRef, location: Option<&InsnCtx>) -> String {
+fn fold_location<'ctx, 'str: 'ctx>(
+    host: impl QCodeView<'ctx, 'str>,
+    location: Option<&InsnCtx>,
+) -> String {
     let Some(ic) = location else {
         return "unknown instruction".to_string();
     };
@@ -462,8 +477,8 @@ fn fold_location(host: HostRef, location: Option<&InsnCtx>) -> String {
 /// both operands to be constant: idempotent, self-inverse, identity-element and
 /// annihilator laws. Returns the value the instruction collapses to (an existing
 /// operand or an interned constant) when a law applies.
-pub(super) fn algebraic_identity(
-    host: HostRef,
+pub(super) fn algebraic_identity<'ctx, 'str: 'ctx>(
+    host: impl QCodeView<'ctx, 'str>,
     func: FunctionId,
     m: &Mnemonic,
     output_size: usize,
@@ -483,14 +498,14 @@ pub(super) fn algebraic_identity(
             IntBinop::And | IntBinop::Or => return Some(lhs),
             // x ^ x = 0 ; x - x = 0
             IntBinop::Xor | IntBinop::Sub => {
-                return Some(host.shr().get_const(0, output_size));
+                return Some(host.shared().get_const(0, output_size));
             }
             _ => {}
         }
     }
 
-    let l = const_value(host.shr(), lhs);
-    let r = const_value(host.shr(), rhs);
+    let l = const_value(host.shared(), lhs);
+    let r = const_value(host.shared(), rhs);
 
     match op {
         // x + 0 = x ; 0 + x = x ; x - 0 = x  (Sub is not commutative)
@@ -517,7 +532,7 @@ pub(super) fn algebraic_identity(
         // x * 0 = 0 ; x * 1 = x
         IntBinop::Mul => {
             if l == Some(0) || r == Some(0) {
-                return Some(host.shr().get_const(0, output_size));
+                return Some(host.shared().get_const(0, output_size));
             }
             if r == Some(1) {
                 return Some(lhs);
@@ -529,7 +544,7 @@ pub(super) fn algebraic_identity(
         // x & 0 = 0 ; x & ~0 = x
         IntBinop::And => {
             if l == Some(0) || r == Some(0) {
-                return Some(host.shr().get_const(0, output_size));
+                return Some(host.shared().get_const(0, output_size));
             }
             if r == Some(all_ones(output_size)) {
                 return Some(lhs);
