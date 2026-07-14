@@ -164,7 +164,7 @@ fn args_provably_collide(
     let Some(callee_sp) = incoming_sp_param(ctx, callee, sp_reg) else {
         return false;
     };
-    let callee_numbering = precompute_forms(ctx, callee);
+    let callee_numbering = precompute_forms(qcode::value::ModuleView::new(ctx), callee);
     // The callee's own caller-frame footprint, `[0, frame_ext)` from its `@ESP`.
     let frame_ext = caller_frame_extent(ctx, callee, callee_sp, &callee_numbering);
     // Root params (in lockstep with `Call.args`); the `@ESP` param index; and the
@@ -194,7 +194,12 @@ fn args_provably_collide(
             continue;
         };
         let frame = cache.entry(caller).or_insert_with(|| {
-            incoming_sp_param(ctx, caller, sp_reg).map(|sp| (sp, precompute_forms(ctx, caller)))
+            incoming_sp_param(ctx, caller, sp_reg).map(|sp| {
+                (
+                    sp,
+                    precompute_forms(qcode::value::ModuleView::new(ctx), caller),
+                )
+            })
         });
         // No caller `@SP`: can't place the callee frame in caller offsets — no proof.
         let Some((caller_sp, numbering)) = frame else {

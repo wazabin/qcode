@@ -1000,7 +1000,7 @@ mod tests {
             fid,
             Some(sp_reg),
         );
-        let nb = precompute_forms(&tc.ctx, fid);
+        let nb = precompute_forms(qcode::value::ModuleView::new(&tc.ctx), fid);
 
         let mut mf = MemForward::default();
         with_body(&mut tc, fid, |body, cx| {

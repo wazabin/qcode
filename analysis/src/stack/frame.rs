@@ -184,7 +184,7 @@ mod tests {
             (local, caller_arg, ret_slot, aligned_slot, unrelated)
         };
 
-        let nb = precompute_forms(&tc.ctx, fid);
+        let nb = precompute_forms(qcode::value::ModuleView::new(&tc.ctx), fid);
         let class = |v| frame_class(&tc.ctx, &nb, sp, v);
 
         // The canonical slot key agrees across representations and is `None`
@@ -245,7 +245,7 @@ mod tests {
             slot
         };
 
-        let nb = precompute_forms(&tc.ctx, fid);
+        let nb = precompute_forms(qcode::value::ModuleView::new(&tc.ctx), fid);
         // A cascaded base has no stable `@SP`-relative offset…
         assert_eq!(frame_offset(&tc.ctx, &nb, sp, slot), None);
         // …but is still classified as an own-frame local.
@@ -278,7 +278,7 @@ mod tests {
             (aligned, slot)
         };
 
-        let nb = precompute_forms(&tc.ctx, fid);
+        let nb = precompute_forms(qcode::value::ModuleView::new(&tc.ctx), fid);
         assert_eq!(
             frame_class(&tc.ctx, &nb, sp, aligned),
             None,

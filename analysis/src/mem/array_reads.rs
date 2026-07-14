@@ -26,9 +26,9 @@ use qcode::{
     space::{Space, SpaceId, SpaceType},
     types::TypeId,
     value::{
-        FunctionId, ValueId,
+        FunctionId, QCodeView, ValueId,
         insn::{InstructionId, IntrinsicApp, IntrinsicId, Mnemonic},
-        util::base_ref::{BaseRef, HostRef},
+        util::base_ref::BaseRef,
     },
 };
 
@@ -41,14 +41,14 @@ pub struct ArrayReads;
 
 /// Host-routed mirror of [`qcode::context::Context::stored_type_of`]: reads the
 /// checked-out function's owned arena for instruction/param results.
-fn stored_type_of(host: HostRef, id: ValueId) -> Option<TypeId> {
+fn stored_type_of<'a, 'str: 'a>(host: impl QCodeView<'a, 'str>, id: ValueId) -> Option<TypeId> {
     match id {
         // Instruction/param results live in the (possibly checked-out) function
         // arena, so route them through the host.
         ValueId::Instruction(iid) => Some(host.insn_ref(iid).type_id()),
         ValueId::BlockParam(pid) => Some(host.block_param(pid).type_id),
         // Everything else is shared data; the Context method reads it directly.
-        other => host.shr().stored_type_of(other),
+        other => host.shared().stored_type_of(other),
     }
 }
 
@@ -79,7 +79,7 @@ struct Acc {
     stored: Option<ValueId>,
 }
 
-fn try_match(host: HostRef, fid: FunctionId) -> Option<ReadsMatch> {
+fn try_match<'a, 'str: 'a>(host: impl QCodeView<'a, 'str>, fid: FunctionId) -> Option<ReadsMatch> {
     // v1 conservatism (mirrors `array_promote`): no calls/indirect control flow.
     for block in host.function_ref(fid).iter() {
         for insn in block.iter() {
@@ -93,7 +93,8 @@ fn try_match(host: HostRef, fid: FunctionId) -> Option<ReadsMatch> {
     }
 
     // Collect every access in an argpromote shadow (`Temporary`) space.
-    let is_temp = |sp: SpaceId| matches!(Space::from_id(host.shr(), sp).ty, SpaceType::Temporary);
+    let is_temp =
+        |sp: SpaceId| matches!(Space::from_id(host.shared(), sp).ty, SpaceType::Temporary);
     let mut accesses: Vec<Acc> = Vec::new();
     for block in host.function_ref(fid).iter() {
         for insn in block.iter() {
@@ -130,7 +131,7 @@ fn try_match(host: HostRef, fid: FunctionId) -> Option<ReadsMatch> {
         a.stored.is_some_and(|src| {
             is_root(src)
                 && stored_type_of(host, src)
-                    .and_then(|t| host.shr().types.array_of(t))
+                    .and_then(|t| host.shared().types.array_of(t))
                     .is_some()
         }) && is_root(a.ptr)
     })?;
@@ -138,8 +139,8 @@ fn try_match(host: HostRef, fid: FunctionId) -> Option<ReadsMatch> {
     let base = seed.ptr;
     let region_space = seed.space;
     let seed_id = seed.id;
-    let (elem_ty, count) = host.shr().types.array_of(stored_type_of(host, arr)?)?;
-    let esz = host.shr().types.size_of(elem_ty);
+    let (elem_ty, count) = host.shared().types.array_of(stored_type_of(host, arr)?)?;
+    let esz = host.shared().types.size_of(elem_ty);
     if esz == 0 || count == 0 || seed.size != count * esz {
         return None;
     }
@@ -220,13 +221,13 @@ fn apply<'str>(body: &mut FunctionBody<'str>, cx: ContextView<'_, 'str>, m: &Rea
     // The `at(arr, i)` result type is the array's element type. Compute it through
     // the shared type interner's `&self` path (no `shared_mut`, so it holds on a
     // checked-out host); this mirrors `at`'s `result_type`.
-    let arr_ty = stored_type_of(cx.read_host(body), m.arr);
+    let arr_ty = stored_type_of(cx.body_view(body), m.arr);
     let at_ty = arr_ty
         .and_then(|t| cx.shr().types.seq_elem_of(t))
         .or(arr_ty)
         .expect("seeded array value has a type");
     for (load_id, lane) in &m.loads {
-        let block = cx.read_host(body).insn_ref(*load_id).parent().map(|b| b.id);
+        let block = cx.body_view(body).insn_ref(*load_id).parent().map(|b| b.id);
         let Some(block) = block else { continue };
         // Materialize the word index (pass builder: const/add only).
         let idx = {
@@ -295,10 +296,10 @@ impl FunctionPass for ArrayReads {
         _next_minted: &mut u32,
     ) -> Result<Outcome<'str>, String> {
         let fid = f.id();
-        if !m.read_host(f).function_ref(fid).is_pure() {
+        if !m.body_view(f).function_ref(fid).is_pure() {
             return Ok(Outcome::unchanged());
         }
-        Ok(Outcome::changed(match try_match(m.read_host(f), fid) {
+        Ok(Outcome::changed(match try_match(m.body_view(f), fid) {
             Some(matched) => apply(f, m, &matched),
             None => false,
         }))

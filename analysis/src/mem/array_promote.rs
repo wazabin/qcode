@@ -29,12 +29,9 @@ use qcode::{
     space::{Space, SpaceId, SpaceType},
     types::TypeId,
     value::{
-        BlockId, FunctionId, ValueId,
+        BlockId, FunctionId, QCodeView, ValueId,
         insn::{Branch, CBranch, InstructionId, IntrinsicApp, IntrinsicId, Load, Mnemonic},
-        util::{
-            base_ref::{BaseRef, HostRef},
-            host_mut::PassBacking,
-        },
+        util::{base_ref::BaseRef, host_mut::PassBacking},
     },
 };
 
@@ -85,7 +82,10 @@ struct Seed {
 }
 
 /// Recognize the in-place array-fill loop in `fid`.
-fn try_match(host: HostRef, fid: FunctionId) -> Option<PromoteMatch> {
+fn try_match<'a, 'str: 'a>(
+    host: impl QCodeView<'a, 'str>,
+    fid: FunctionId,
+) -> Option<PromoteMatch> {
     // Reject anything with a call: another routine could observe/mutate the region.
     for block in host.function_ref(fid).iter() {
         for insn in block.iter() {
@@ -110,7 +110,7 @@ fn try_match(host: HostRef, fid: FunctionId) -> Option<PromoteMatch> {
     }
     let is_ram = |sp: SpaceId| {
         matches!(
-            Space::from_id(host.shr(), sp).ty,
+            Space::from_id(host.shared(), sp).ty,
             SpaceType::Ram | SpaceType::Temporary
         )
     };
@@ -197,7 +197,7 @@ fn try_match(host: HostRef, fid: FunctionId) -> Option<PromoteMatch> {
         return None;
     }
     // v1 works in bytes, so require a byte-addressed region.
-    if Space::from_id(host.shr(), region_space).word_size != 1 {
+    if Space::from_id(host.shared(), region_space).word_size != 1 {
         return None;
     }
     let in_region = |a: &Acc| a.space == region_space;
@@ -741,7 +741,7 @@ impl FunctionPass for ArrayPromote {
         _next_minted: &mut u32,
     ) -> Result<Outcome<'str>, String> {
         let fid = f.id();
-        match try_match(m.read_host(f), fid) {
+        match try_match(m.body_view(f), fid) {
             Some(matched) => Ok(Outcome::changed(apply(f, m, &matched))),
             None => Ok(Outcome::unchanged()),
         }

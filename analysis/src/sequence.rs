@@ -412,7 +412,8 @@ mod tests {
             b.push_cbranch_with_args(cond, body, vec![ni], body, vec![ni]);
         }
 
-        let numbering = crate::gvn::affine::precompute_forms(&tc.ctx, fid);
+        let numbering =
+            crate::gvn::affine::precompute_forms(qcode::value::ModuleView::new(&tc.ctx), fid);
         let regions = collect_regions_for_base(&tc.ctx, &numbering, base, &[access]);
         assert_eq!(regions.rejected_accesses, Vec::<InstructionId>::new());
         assert_eq!(regions.regions.len(), 1);
@@ -463,7 +464,8 @@ mod tests {
             ]
         };
 
-        let numbering = crate::gvn::affine::precompute_forms(&tc.ctx, fid);
+        let numbering =
+            crate::gvn::affine::precompute_forms(qcode::value::ModuleView::new(&tc.ctx), fid);
         let regions = collect_regions_for_base(&tc.ctx, &numbering, base, &accesses);
         assert_eq!(regions.regions.len(), 2);
         assert_eq!(regions.regions[0].region.byte_range(), (0, 8));
@@ -505,7 +507,8 @@ mod tests {
             ]
         };
 
-        let numbering = crate::gvn::affine::precompute_forms(&tc.ctx, fid);
+        let numbering =
+            crate::gvn::affine::precompute_forms(qcode::value::ModuleView::new(&tc.ctx), fid);
         let regions = collect_regions_for_base(&tc.ctx, &numbering, base, &accesses);
         assert!(regions.regions.is_empty());
         assert_eq!(regions.rejected_accesses.len(), 2);

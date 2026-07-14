@@ -86,7 +86,7 @@ pub(crate) fn has_dynamic_stack_pointer_deref(
     let Some(sp) = incoming_sp_param(ctx, function_id, stack_ptr) else {
         return false;
     };
-    let numbering = precompute_forms(ctx, function_id);
+    let numbering = precompute_forms(qcode::value::ModuleView::new(ctx), function_id);
     for block in FunctionBody::from_id(ctx, function_id).blocks() {
         for insn in block.iter() {
             let Some(access) = MemoryAccess::from_mnemonic(insn.mnemonic(), insn.id.func) else {

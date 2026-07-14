@@ -37,7 +37,7 @@ impl OwnFrame {
         let sp_param = sp_reg.and_then(|r| incoming_sp_param(ctx, fid, r));
         Self {
             sp_param,
-            numbering: precompute_forms(ctx, fid),
+            numbering: precompute_forms(qcode::value::ModuleView::new(ctx), fid),
         }
     }
 
@@ -274,7 +274,7 @@ fn try_promote(
     // The affine view of every value, and the function's full real-ram load/store
     // list — both shared across all params so the per-param decomposition can peel
     // a strided `param + idx*scale + const` address (see [`relate_address`]).
-    let numbering = precompute_forms(&*ctx, fid);
+    let numbering = precompute_forms(qcode::value::ModuleView::new(&*ctx), fid);
     let ram = ctx.shared.default_space;
     let accesses_in: Vec<MemoryAccess> = FunctionBody::from_id(ctx, fid)
         .iter()
@@ -419,7 +419,7 @@ fn all_writes_resolvable(
     sp_reg: Option<VarnodeId>,
 ) -> bool {
     let own_frame = OwnFrame::new(ctx, fid, sp_reg);
-    let numbering = precompute_forms(ctx, fid);
+    let numbering = precompute_forms(qcode::value::ModuleView::new(ctx), fid);
     let is_param = |v: ValueId| promoted.iter().any(|p| p.param == v);
     promoted.iter().all(|p| {
         p.write_targets.iter().all(|&(addr, _)| {
@@ -496,7 +496,7 @@ fn regions_disjoint(
         .truth(Proposition::LoadedPointerDisjointFromSlot(fid))
         .is_some_and(|t| t.value);
     let own_frame = OwnFrame::new(ctx, fid, sp_reg);
-    let numbering = precompute_forms(ctx, fid);
+    let numbering = precompute_forms(qcode::value::ModuleView::new(ctx), fid);
     promoted.iter().all(|p| {
         p.write_targets.iter().all(|&(addr, wsize)| {
             if own_frame.is_local(ctx, addr)
@@ -719,7 +719,7 @@ fn apply(
     // value and replays a no-op — sound on any control flow, no dominance needed.
     // `(base_param, base_size, offset, size)`.
     let own_frame = OwnFrame::new(ctx, fid, sp_reg);
-    let numbering = precompute_forms(&*ctx, fid);
+    let numbering = precompute_forms(qcode::value::ModuleView::new(&*ctx), fid);
     // `(base_param, base_size, signed offset, size)`. A negative offset (`base - k`,
     // e.g. an own-frame slot when there is no stack-pointer to recognise it) is
     // encoded two's-complement into the address const, so `base + offset` wraps to

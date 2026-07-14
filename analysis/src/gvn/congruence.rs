@@ -219,7 +219,10 @@ mod tests {
             .blocks()
             .map(|b| b.id)
             .collect();
-        Congruence::new(precompute_forms_for_blocks(ctx, &blocks))
+        Congruence::new(precompute_forms_for_blocks(
+            qcode::value::ModuleView::new(ctx),
+            &blocks,
+        ))
     }
 
     /// `a + b` and `b + a` are congruent (commutative arithmetic, flattened

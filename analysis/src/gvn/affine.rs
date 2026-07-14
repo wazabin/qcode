@@ -29,11 +29,10 @@
 use rustc_hash::FxHashMap as HashMap;
 
 use qcode::value::{
-    ValueId,
+    QCodeView, ValueId,
     block::BlockId,
     function::FunctionId,
     insn::{Binary, Binop, InstructionId, IntBinop, Mnemonic, Unary, Unop},
-    util::base_ref::HostRef,
 };
 
 use super::cse::{normalize, value_id_key};
@@ -142,8 +141,8 @@ fn scale_terms(terms: &[(ValueId, u64)], k: u64, m: u64) -> Vec<(ValueId, u64)> 
 
 /// The arithmetic view of an operand: its stored affine form, a constant, or an
 /// opaque leaf `1·v`. Mask/opaque values are treated as opaque leaves.
-fn affine_view(
-    host: HostRef,
+fn affine_view<'a, 'str: 'a>(
+    host: impl QCodeView<'a, 'str>,
     v: ValueId,
     width: usize,
     state: &Numbering,
@@ -157,7 +156,7 @@ fn affine_view(
     {
         return (*constant, terms.clone());
     }
-    if let Some(c) = const_value(host.shr(), v) {
+    if let Some(c) = const_value(host.shared(), v) {
         return (c & mask_for(width), vec![]);
     }
     (0, vec![(v, 1)])
@@ -187,8 +186,8 @@ fn is_self_leaf(form: &NormalForm, id: ValueId) -> bool {
 
 /// Compute the arithmetic view of the value `id` produced by `mnemonic`. Returns
 /// an `Affine`/`Mask` form for covered ops, else the opaque leaf `1·id`.
-pub(super) fn arith_form(
-    host: HostRef,
+pub(super) fn arith_form<'a, 'str: 'a>(
+    host: impl QCodeView<'a, 'str>,
     id: ValueId,
     mnemonic: &Mnemonic,
     width: usize,
@@ -230,9 +229,9 @@ pub(super) fn arith_form(
             }
             IntBinop::Mul => {
                 // Affine only when exactly one side is a constant scale.
-                if let Some(k) = const_value(host.shr(), rhs.qualify(func)) {
+                if let Some(k) = const_value(host.shared(), rhs.qualify(func)) {
                     scale_affine(host, lhs.qualify(func), k & m, width, state)
-                } else if let Some(k) = const_value(host.shr(), lhs.qualify(func)) {
+                } else if let Some(k) = const_value(host.shared(), lhs.qualify(func)) {
                     scale_affine(host, rhs.qualify(func), k & m, width, state)
                 } else {
                     leaf(id, width)
@@ -240,7 +239,7 @@ pub(super) fn arith_form(
             }
             IntBinop::ShiftLeft => {
                 // x << s  ==  x * 2^s  (constant amount, in range).
-                match const_value(host.shr(), rhs.qualify(func)) {
+                match const_value(host.shared(), rhs.qualify(func)) {
                     Some(s) if s < (width as u64 * 8) && s < 64 => {
                         scale_affine(host, lhs.qualify(func), (1u64 << s) & m, width, state)
                     }
@@ -248,9 +247,9 @@ pub(super) fn arith_form(
                 }
             }
             IntBinop::And | IntBinop::Or | IntBinop::Xor => {
-                if let Some(k) = const_value(host.shr(), rhs.qualify(func)) {
+                if let Some(k) = const_value(host.shared(), rhs.qualify(func)) {
                     mask_form(lhs.qualify(func), *op, k & m, width, state)
-                } else if let Some(k) = const_value(host.shr(), lhs.qualify(func)) {
+                } else if let Some(k) = const_value(host.shared(), lhs.qualify(func)) {
                     mask_form(rhs.qualify(func), *op, k & m, width, state)
                 } else {
                     leaf(id, width)
@@ -282,7 +281,13 @@ pub(super) fn arith_form(
     }
 }
 
-fn scale_affine(host: HostRef, v: ValueId, k: u64, width: usize, state: &Numbering) -> NormalForm {
+fn scale_affine<'a, 'str: 'a>(
+    host: impl QCodeView<'a, 'str>,
+    v: ValueId,
+    k: u64,
+    width: usize,
+    state: &Numbering,
+) -> NormalForm {
     let m = mask_for(width);
     let (c, t) = affine_view(host, v, width, state);
     NormalForm::Affine {
@@ -408,7 +413,7 @@ fn build_value_c<'str>(
     } = form
     {
         if terms.is_empty() {
-            return cx.read_host(body).shr().get_const(*constant, *width);
+            return cx.shr().get_const(*constant, *width);
         }
         if terms.len() == 1 && terms[0].1 == 1 && *constant == 0 {
             return terms[0].0;
@@ -419,7 +424,7 @@ fn build_value_c<'str>(
     }
     let int_ty = match form {
         NormalForm::Affine { width, .. } | NormalForm::Mask { width, .. } => {
-            cx.read_host(body).shr().types.get_or_make_int(*width)
+            cx.shr().types.get_or_make_int(*width)
         }
         NormalForm::Opaque(_) => unreachable!("opaque forms are never materialized"),
     };
@@ -449,11 +454,7 @@ fn canonical_mnemonic_c<'str>(
         } => Mnemonic::Binop(Binary {
             op: Binop::Int(*op),
             lhs: term.localize(func),
-            rhs: cx
-                .read_host(body)
-                .shr()
-                .get_const(*mask, *width)
-                .localize(func),
+            rhs: cx.shr().get_const(*mask, *width).localize(func),
         }),
         NormalForm::Affine {
             width,
@@ -504,11 +505,7 @@ fn canonical_mnemonic_c<'str>(
                 return Mnemonic::Binop(Binary {
                     op: Binop::Int(IntBinop::Mul),
                     lhs: last_v.localize(func),
-                    rhs: cx
-                        .read_host(body)
-                        .shr()
-                        .get_const(last_k, width)
-                        .localize(func),
+                    rhs: cx.shr().get_const(last_k, width).localize(func),
                 });
             }
 
@@ -560,7 +557,7 @@ fn scaled_value_c<'str>(
 
 /// Concrete pass twin of [`signed_lit`].
 fn signed_lit_c<'str>(
-    body: &mut FunctionBody<'str>,
+    _body: &mut FunctionBody<'str>,
     cx: ContextView<'_, 'str>,
     s: i64,
     width: usize,
@@ -568,16 +565,13 @@ fn signed_lit_c<'str>(
     if s < 0 {
         (
             IntBinop::Sub,
-            cx.read_host(body)
-                .shr()
+            cx.shr()
                 .get_const(s.unsigned_abs() & mask_for(width), width),
         )
     } else {
         (
             IntBinop::Add,
-            cx.read_host(body)
-                .shr()
-                .get_const(s as u64 & mask_for(width), width),
+            cx.shr().get_const(s as u64 & mask_for(width), width),
         )
     }
 }
@@ -601,7 +595,7 @@ pub(super) fn materialize_c<'str>(
     } = key
     {
         if terms.is_empty() {
-            return cx.read_host(body).shr().get_const(*constant, *width);
+            return cx.shr().get_const(*constant, *width);
         }
         if terms.len() == 1 && terms[0].1 == 1 && *constant == 0 {
             return terms[0].0;
@@ -777,10 +771,9 @@ impl Numbering {
 /// dominator walk reaches the pointer's definition (see memory forwarding). Only
 /// `forms` is populated; `leaders` stay empty (they are dominance-sensitive).
 pub(crate) fn precompute_forms<'a, 'str: 'a>(
-    host: impl Into<HostRef<'a, 'str>>,
+    host: impl QCodeView<'a, 'str>,
     func_id: FunctionId,
 ) -> Numbering {
-    let host = host.into();
     let mut numbering = Numbering::default();
     let ids: Vec<ValueId> = host
         .function_ref(func_id)
@@ -803,10 +796,9 @@ pub(crate) fn precompute_forms<'a, 'str: 'a>(
 /// whole function. Operand recursion follows the SSA graph regardless of block,
 /// so passing a function's full block list is equivalent to `precompute_forms`.
 pub(crate) fn precompute_forms_for_blocks<'a, 'str: 'a>(
-    host: impl Into<HostRef<'a, 'str>>,
+    host: impl QCodeView<'a, 'str>,
     blocks: &[BlockId],
 ) -> Numbering {
-    let host = host.into();
     let mut numbering = Numbering::default();
     let ids: Vec<ValueId> = blocks
         .iter()
@@ -827,7 +819,11 @@ pub(crate) fn precompute_forms_for_blocks<'a, 'str: 'a>(
 /// Memoize the affine form of `v`, recursing into operands first so that nested
 /// pointer arithmetic (e.g. `(p + 4) - 4`) fully decomposes. A placeholder leaf
 /// is inserted before recursing to break any operand cycle.
-fn ensure_form(host: HostRef, v: ValueId, numbering: &mut Numbering) {
+fn ensure_form<'a, 'str: 'a>(
+    host: impl QCodeView<'a, 'str>,
+    v: ValueId,
+    numbering: &mut Numbering,
+) {
     if numbering.forms.contains_key(&v) {
         return;
     }
@@ -887,7 +883,7 @@ mod spike {
             (s1, s2, threaded, aligned, al)
         };
 
-        let nb = precompute_forms(&tc.ctx, fun);
+        let nb = precompute_forms(qcode::value::ModuleView::new(&tc.ctx), fun);
 
         // VERDICT 1 — plain slots get stable `(@SP, offset)` identity, the same for
         // every independent occurrence, with no `@stack_base` literal and no
@@ -941,7 +937,7 @@ mod spike {
             (fixed, indexed, aligned_slot, unrelated)
         };
 
-        let nb = precompute_forms(&tc.ctx, fun);
+        let nb = precompute_forms(qcode::value::ModuleView::new(&tc.ctx), fun);
 
         assert!(nb.affine_mentions(fixed, sp), "@SP - 8 is built on @SP");
         assert!(nb.affine_mentions(indexed, sp), "@SP + reg is built on @SP");
@@ -995,7 +991,7 @@ mod spike {
             (gep, add)
         };
 
-        let nb = precompute_forms(&tc.ctx, fun);
+        let nb = precompute_forms(qcode::value::ModuleView::new(&tc.ctx), fun);
 
         // Both decompose to the same affine base+offset, so memory forwarding
         // treats them as the same cell.

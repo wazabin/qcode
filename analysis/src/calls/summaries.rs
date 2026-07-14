@@ -97,7 +97,7 @@ impl FrameCtx {
         let base =
             incoming_sp_param(ctx, function_id, stack_ptr).unwrap_or(ValueId::Varnode(stack_ptr));
         Self {
-            numbering: precompute_forms(ctx, function_id),
+            numbering: precompute_forms(qcode::value::ModuleView::new(ctx), function_id),
             base,
             ptr_width: Varnode::from_id(ctx, stack_ptr).size(),
         }
@@ -362,7 +362,7 @@ pub fn compute_stack_delta(
     stack_ptr: VarnodeId,
 ) -> Option<i64> {
     let sp = ValueId::Varnode(stack_ptr);
-    let numbering = precompute_forms(ctx, function_id);
+    let numbering = precompute_forms(qcode::value::ModuleView::new(ctx), function_id);
     // The entry stack-pointer base offsets are measured from: the functionalized
     // `@SP` param when present, else the bare stack-pointer varnode (a
     // non-functionalized body roots its RSP arithmetic at the register itself).
