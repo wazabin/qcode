@@ -719,7 +719,11 @@ impl Lowerer<'_, '_, '_> {
                 ptr,
             } => {
                 let p = self.ptr_atom(ptr)?;
-                let space = self.b.context_mut().get_or_make_named_space(space);
+                let space = if let Some(name) = space.strip_prefix('$') {
+                    self.b.get_or_make_local_temp_space(name)
+                } else {
+                    self.b.context_mut().get_or_make_named_space(space).into()
+                };
                 Ok(self.b.push_load::<false>(p, *size_bytes, space).id())
             }
 
@@ -731,7 +735,11 @@ impl Lowerer<'_, '_, '_> {
             } => {
                 let p = self.ptr_atom(ptr)?;
                 let s = self.atom(src, Some(*size_bytes))?;
-                let space = self.b.context_mut().get_or_make_named_space(space);
+                let space = if let Some(name) = space.strip_prefix('$') {
+                    self.b.get_or_make_local_temp_space(name)
+                } else {
+                    self.b.context_mut().get_or_make_named_space(space).into()
+                };
                 Ok(self.b.push_store(s, p, space).id())
             }
 

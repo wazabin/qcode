@@ -661,11 +661,13 @@ fn space_name<'ctx, 'str: 'ctx>(
                 None => format!("space: {space}"),
             }
         }
-        crate::space::MemorySpaceId::Temp(space) => view
-            .temp_space_ref(space)
-            .name()
-            .map(str::to_owned)
-            .unwrap_or_else(|| format!("temp{}", usize::from(space.local))),
+        // `$tempN` is an explicit body-local space token. The numeric local ID
+        // makes the canonical print stable even when a display name is absent,
+        // duplicated, or not a qcode identifier; lowering recreates one local
+        // space per token in first-use order.
+        crate::space::MemorySpaceId::Temp(space) => {
+            format!("$temp{}", usize::from(space.local))
+        }
     }
 }
 

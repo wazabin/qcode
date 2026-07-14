@@ -41,8 +41,8 @@ use crate::{
     space::{LocalMemorySpaceId, SPACE_CONST, Space, SpaceId, SpaceType},
     types::{AggregateField, TypeId},
     value::{
-        BodyView, FunctionBody, Instruction, ModuleView, QCodeView, Renameable, Value, ValueId,
-        ValueRef,
+        BodyView, FunctionBody, Instruction, ModuleView, QCodeView, Renameable, TempSpace, Value,
+        ValueId, ValueRef,
         block::{BasicBlock, BlockId, EdgeId},
         block_param::BlockParamMutRef,
         function::FunctionId,
@@ -785,6 +785,26 @@ impl<'str, 'ctx, Ctx: BuilderBacking<'str>> Builder<'str, 'ctx, Ctx> {
             .set_name(Some(unique_name));
         self.local_labels.insert(name, id);
         id
+    }
+
+    /// Resolve a canonical textual `$tempN` token to one body-local temporary
+    /// space, creating it on first use. This is a lowering compatibility seam;
+    /// analysis and lifter producers append their spaces directly to the body.
+    pub fn get_or_make_local_temp_space(&mut self, name: &str) -> LocalMemorySpaceId {
+        let func = self.block.id.func;
+        let (word_size, addr_size) = {
+            let default = self.shr().space(self.shr().default_space);
+            (default.word_size, default.addr_size)
+        };
+        let body = self.block.host_mut().bb_function_mut(func);
+        for index in 0..body.temp_spaces.len() {
+            let local = crate::value::LocalTempSpaceId::from(index);
+            if body.temp_spaces[local].name.as_deref() == Some(name) {
+                return LocalMemorySpaceId::Temp(local);
+            }
+        }
+        let id = body.push_temp_space(TempSpace::new(Some(name), word_size, addr_size));
+        LocalMemorySpaceId::Temp(id.local)
     }
 
     /// Ensures an operand is not a varnode.

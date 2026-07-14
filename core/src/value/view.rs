@@ -448,7 +448,7 @@ mod tests {
         assert_eq!(view.temp_ref(temp).to_string(), "v9");
         assert_eq!(
             view.insn_ref(load).as_statement().to_string(),
-            "i32 %tmp1 = load(scratch:4, i64 %tmp0);"
+            "i32 %tmp1 = load($temp0:4, i64 %tmp0);"
         );
     }
 }

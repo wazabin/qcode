@@ -84,7 +84,9 @@ memory          =  { load | store }
 // (`space:bytes`): `load(ram:4, ptr)` reads, `store(ram:4, ptr <- value)` writes.
 load            =  { "load" ~ "(" ~ mem_loc ~ "," ~ typed_atom ~ ")" }
 store           =  { "store" ~ "(" ~ mem_loc ~ "," ~ typed_atom ~ "<-" ~ typed_atom ~ ")" }
-mem_loc         =  { ident ~ ":" ~ integer }
+mem_loc         =  { mem_space ~ ":" ~ integer }
+mem_space       = @{ temp_space | ident }
+temp_space      =  { "$temp" ~ dec_int }
 cast            =  { cast_op ~ "(" ~ ty ~ "," ~ typed_atom ~ ")" }
 extract         =  { "extract" ~ "(" ~ (named_extract | indexed_extract) ~ ")" }
 named_extract   =  { typed_atom ~ "." ~ ident }

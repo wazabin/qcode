@@ -1,6 +1,6 @@
 use qcode::{
     context::Context,
-    space::SpaceId,
+    space::MemorySpaceId,
     value::{
         BlockId, FunctionId, InstructionId, ValueId, Varnode,
         insn::{
@@ -84,7 +84,7 @@ pub enum EmulatorErrorKind {
     /// Attempted to access a register that is not present in the context
     UnknownRegister(RegisterId),
     /// Attempted to read from a memory space that has not been initialised
-    UnknownSpace(SpaceId),
+    UnknownSpace(MemorySpaceId),
     /// Encountered an architecture-specific p-code operation without an emulator implementation
     UnsupportedPCodeOp(Box<str>),
     /// An intrinsic's evaluator could not produce a result (e.g. a trap or
@@ -225,7 +225,7 @@ pub trait DomainMemory {
     /// The size of the value must be less than or equal to the size of the region being read from.
     fn read(
         &self,
-        space: SpaceId,
+        space: MemorySpaceId,
         addr: Self::V,
         size: usize,
     ) -> std::result::Result<Self::V, EmulatorErrorKind>;
@@ -234,7 +234,7 @@ pub trait DomainMemory {
     /// The size of the value must be less than or equal to the size of the region being written to.
     fn write(
         &mut self,
-        space: SpaceId,
+        space: MemorySpaceId,
         addr: Self::V,
         size: usize,
         data: Self::V,
@@ -261,7 +261,7 @@ pub trait Interpreter {
         let space = varnode.space().id;
         let addr = Self::V::from_u64(varnode.address() as u64);
         let size = varnode.size();
-        self.memory().read(space, addr, size)
+        self.memory().read(space.into(), addr, size)
     }
 
     /// Writes a value to a varnode in the emulated memory space.
@@ -274,7 +274,7 @@ pub trait Interpreter {
         let space = varnode.space().id;
         let addr = Self::V::from_u64(varnode.address() as u64);
         let size = varnode.size();
-        self.memory().write(space, addr, size, value)?;
+        self.memory().write(space.into(), addr, size, value)?;
         Ok(())
     }
 
@@ -320,7 +320,7 @@ pub trait Interpreter {
             // ===== Memory operations =====
             &Mnemonic::Load(Load { space, ptr, size }) => {
                 let addr = self.get_value(ptr.qualify(func))?;
-                Some(self.memory().read(space.expect_shared(), addr, size)?)
+                Some(self.memory().read(space.qualify(func), addr, size)?)
             }
 
             &Mnemonic::Store(Store {
@@ -332,7 +332,7 @@ pub trait Interpreter {
                 let addr = self.get_value(ptr.qualify(func))?;
                 let value = self.get_value(src.qualify(func))?;
                 self.memory()
-                    .write(space.expect_shared(), addr, size, value)?;
+                    .write(space.qualify(func), addr, size, value)?;
                 None
             }
 

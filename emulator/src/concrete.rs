@@ -5,7 +5,7 @@ use crate::{
 use qcode::{
     address_index::{AddressIndex, AddressTarget},
     context::Context,
-    space::{Space, SpaceId, SpaceType},
+    space::{MemorySpaceId, Space, SpaceId, SpaceType},
     value::{
         BasicBlock, BlockId, BlockParamId, BlockRef, FunctionBody, FunctionId, Instruction,
         LocalValueId, Value, ValueId, ValueRef, Varnode,
@@ -43,6 +43,12 @@ impl EmulatedSpace {
 
     pub fn read(&self, addr: u64, size: usize) -> Result<Vec<u8>, EmulatorErrorKind> {
         (0..size).map(|i| self.read_byte(addr + i as u64)).collect()
+    }
+
+    pub fn read_zero_filled(&self, addr: u64, size: usize) -> Vec<u8> {
+        (0..size)
+            .map(|i| self.0.get(&(addr + i as u64)).copied().unwrap_or(0))
+            .collect()
     }
 
     pub fn write_byte(&mut self, addr: u64, value: u8) {
@@ -128,8 +134,8 @@ impl<'space> EmulatedSpaceRegion<'space> {
 
 #[derive(Debug, Default, Clone)]
 pub struct EmulatedMemory {
-    spaces: FxHashMap<SpaceId, EmulatedSpace>,
-    zero_filled_spaces: FxHashSet<SpaceId>,
+    spaces: FxHashMap<MemorySpaceId, EmulatedSpace>,
+    zero_filled_spaces: FxHashSet<MemorySpaceId>,
     /// Space count the zero-fill set was last built for. Spaces are append-only
     /// and their type is fixed at creation, so an unchanged count means the set
     /// is still valid — this keeps the per-step call O(1) instead of rescanning.
@@ -137,6 +143,10 @@ pub struct EmulatedMemory {
 }
 
 impl EmulatedMemory {
+    fn is_zero_filled(&self, space: MemorySpaceId) -> bool {
+        matches!(space, MemorySpaceId::Temp(_)) || self.zero_filled_spaces.contains(&space)
+    }
+
     fn configure_spaces(&mut self, ctx: &Context<'_>) {
         let space_count = ctx.space_count();
         if self.configured_space_count == Some(space_count) {
@@ -149,7 +159,7 @@ impl EmulatedMemory {
                 Space::from_id(ctx, id).ty,
                 SpaceType::Register | SpaceType::Temporary
             ) {
-                self.zero_filled_spaces.insert(id);
+                self.zero_filled_spaces.insert(id.into());
             }
         }
         self.configured_space_count = Some(space_count);
@@ -157,14 +167,16 @@ impl EmulatedMemory {
 
     fn read_raw(
         &self,
-        space: SpaceId,
+        space: MemorySpaceId,
         addr: u64,
         size: usize,
     ) -> Result<Vec<u8>, EmulatorErrorKind> {
-        self.spaces
-            .get(&space)
-            .ok_or(EmulatorErrorKind::UnknownSpace(space))?
-            .read(addr, size)
+        match self.spaces.get(&space) {
+            Some(value) if self.is_zero_filled(space) => Ok(value.read_zero_filled(addr, size)),
+            Some(value) => value.read(addr, size),
+            None if self.is_zero_filled(space) => Ok(vec![0; size]),
+            None => Err(EmulatorErrorKind::UnknownSpace(space)),
+        }
     }
 }
 
@@ -659,17 +671,16 @@ impl DomainMemory for EmulatedMemory {
 
     fn read(
         &self,
-        space: SpaceId,
+        space: MemorySpaceId,
         addr: Self::V,
         size: usize,
     ) -> Result<Self::V, EmulatorErrorKind> {
         let addr = addr.value()?;
+        let zero_filled = self.is_zero_filled(space);
         let bits = match self.spaces.get(&space) {
-            Some(s) if self.zero_filled_spaces.contains(&space) => {
-                s.read_u128_zero_filled(addr, size as u64)
-            }
+            Some(s) if zero_filled => s.read_u128_zero_filled(addr, size as u64),
             Some(s) => s.read_u128(addr, size as u64)?,
-            None if self.zero_filled_spaces.contains(&space) => 0,
+            None if zero_filled => 0,
             None => return Err(EmulatorErrorKind::UnknownSpace(space)),
         };
         Ok(SizedValue::from_bits(bits, size))
@@ -677,7 +688,7 @@ impl DomainMemory for EmulatedMemory {
 
     fn write(
         &mut self,
-        space: SpaceId,
+        space: MemorySpaceId,
         addr: Self::V,
         size: usize,
         value: Self::V,
@@ -863,7 +874,7 @@ impl StandaloneEmulator {
         let addr = varnode.address() as u64;
         let size = varnode.size();
         self.memory.write(
-            space,
+            space.into(),
             SizedValue::from_u64(addr),
             size,
             SizedValue::from_bits(value, size),
@@ -881,7 +892,7 @@ impl StandaloneEmulator {
         let addr = varnode.address() as u64;
         let size = varnode.size();
         self.memory
-            .read(space, SizedValue::from_u64(addr), size)
+            .read(space.into(), SizedValue::from_u64(addr), size)
             .ok()
             .map(|v| v.as_bits())
     }
@@ -911,7 +922,7 @@ impl StandaloneEmulator {
             buf[..chunk.len()].copy_from_slice(chunk);
             let value = u64::from_le_bytes(buf);
             self.memory.write(
-                space,
+                space.into(),
                 SizedValue::from_u64(addr),
                 chunk.len(),
                 SizedValue::new(value, chunk.len()),
@@ -976,7 +987,9 @@ impl StandaloneEmulator {
         let space = varnode.space().id;
         let addr = varnode.address() as u64;
         let size = varnode.size();
-        self.memory.read_raw(space, addr, size).unwrap_or_default()
+        self.memory
+            .read_raw(space.into(), addr, size)
+            .unwrap_or_default()
     }
 
     pub fn read_varnode_by_name_bytes(&mut self, ctx: &Context<'_>, name: &str) -> Option<Vec<u8>> {
@@ -1028,23 +1041,23 @@ impl StandaloneEmulator {
     pub fn read_memory(
         &mut self,
         ctx: &Context<'_>,
-        space: SpaceId,
+        space: impl Into<MemorySpaceId>,
         addr: u64,
         size: usize,
     ) -> Result<Vec<u8>, EmulatorErrorKind> {
         self.memory.configure_spaces(ctx);
-        self.memory.read_raw(space, addr, size)
+        self.memory.read_raw(space.into(), addr, size)
     }
 
     pub fn write_memory(
         &mut self,
         ctx: &Context<'_>,
-        space: SpaceId,
+        space: impl Into<MemorySpaceId>,
         addr: u64,
         value: &[u8],
     ) -> Result<(), EmulatorErrorKind> {
         self.memory.configure_spaces(ctx);
-        let space = self.memory.spaces.entry(space).or_default();
+        let space = self.memory.spaces.entry(space.into()).or_default();
         space.reserve(value.len());
         for (i, byte) in value.iter().enumerate() {
             space.write_byte(addr + i as u64, *byte);
@@ -1375,7 +1388,7 @@ impl StandaloneEmulator {
                     .get_value(ctx, ptr)
                     .ok_or_else(|| self.make_error(ctx, EmulatorErrorKind::ValueError(0)))?;
                 let buf = self
-                    .read_memory(ctx, space.expect_shared(), addr, size)
+                    .read_memory(ctx, space.qualify(id.func), addr, size)
                     .map_err(|kind| self.make_error(ctx, kind))?;
                 self.array_values.insert(insn_id, buf);
                 self.idx += 1;
@@ -1396,7 +1409,7 @@ impl StandaloneEmulator {
                 let addr = self
                     .get_value(ctx, ptr)
                     .ok_or_else(|| self.make_error(ctx, EmulatorErrorKind::ValueError(0)))?;
-                self.write_memory(ctx, space.expect_shared(), addr, &buf)
+                self.write_memory(ctx, space.qualify(id.func), addr, &buf)
                     .map_err(|kind| self.make_error(ctx, kind))?;
                 self.idx += 1;
             }
@@ -2282,10 +2295,14 @@ impl<'ctx> Emulator<'ctx> {
 
     /// Debugging method to view a value at a given address
     pub fn inspect_memory(&mut self, space: SpaceId, addr: u64, size: usize) -> Option<Vec<u8>> {
-        self.inner.memory.spaces.get_mut(&space).and_then(|s| {
-            let region = s.get_mut_region(addr, size).ok()?;
-            region.read_bytes(addr, size).ok()
-        })
+        self.inner
+            .memory
+            .spaces
+            .get_mut(&MemorySpaceId::Shared(space))
+            .and_then(|s| {
+                let region = s.get_mut_region(addr, size).ok()?;
+                region.read_bytes(addr, size).ok()
+            })
     }
 
     /// Sets the value of a varnode
@@ -2363,7 +2380,7 @@ impl<'ctx> Emulator<'ctx> {
             (vn.space().id, vn.address() as u64)
         };
         let base = base_addr + (lane as u64) * 8;
-        let space = self.inner.memory.spaces.entry(space_id).or_default();
+        let space = self.inner.memory.spaces.entry(space_id.into()).or_default();
         for i in 0..8u64 {
             space.write_byte(base + i, (value >> (i * 8)) as u8);
         }
@@ -2377,7 +2394,7 @@ impl<'ctx> Emulator<'ctx> {
             (vn.space().id, vn.address() as u64)
         };
         let base = base_addr + (lane as u64) * 8;
-        let space = self.inner.memory.spaces.entry(space_id).or_default();
+        let space = self.inner.memory.spaces.entry(space_id.into()).or_default();
         (0..8u64).fold(0u64, |acc, i| {
             acc | u64::from(space.read_byte(base + i).unwrap_or(0)) << (i * 8)
         })
@@ -3123,7 +3140,7 @@ mod tests {
         for space in [register, temporary] {
             assert_eq!(
                 memory
-                    .read(space, SizedValue::from_u64(0x1000), 4)
+                    .read(space.into(), SizedValue::from_u64(0x1000), 4)
                     .unwrap()
                     .value()
                     .unwrap(),
@@ -3133,23 +3150,34 @@ mod tests {
 
         memory
             .write(
-                ctx.shared.default_space,
+                ctx.shared.default_space.into(),
                 SizedValue::from_u64(0x1000),
                 1,
                 SizedValue::new(0xaa, 1),
             )
             .unwrap();
         assert!(matches!(
-            memory.read(ctx.shared.default_space, SizedValue::from_u64(0x1001), 1),
+            memory.read(
+                ctx.shared.default_space.into(),
+                SizedValue::from_u64(0x1001),
+                1
+            ),
             Err(EmulatorErrorKind::MemoryReadError(0x1001))
         ));
     }
 
     #[test]
     fn temporary_spaces_with_the_same_address_are_isolated() {
+        use qcode::value::TempSpace;
+
         let mut ctx = Context::new();
-        let first = ctx.make_temp_space();
-        let second = ctx.make_temp_space();
+        let first_fn = FunctionBody::make(&mut ctx, "first".into()).unwrap().id;
+        let second_fn = FunctionBody::make(&mut ctx, "second".into()).unwrap().id;
+        let first = ctx.bodies[first_fn].push_temp_space(TempSpace::new(None, 1, 8));
+        let second = ctx.bodies[second_fn].push_temp_space(TempSpace::new(None, 1, 8));
+        assert_eq!(first.local, second.local, "fixture must collide local IDs");
+        let first = MemorySpaceId::Temp(first);
+        let second = MemorySpaceId::Temp(second);
         let mut memory = EmulatedMemory::default();
         memory.configure_spaces(&ctx);
 
@@ -3167,6 +3195,62 @@ mod tests {
         );
         assert_eq!(
             memory.read(second, address, 1).unwrap().value().unwrap(),
+            0x55
+        );
+    }
+
+    #[test]
+    fn interpreter_qualifies_colliding_local_spaces_by_function() {
+        use qcode::{builder::Builder, value::TempSpace};
+
+        fn make_writer(
+            ctx: &mut Context<'static>,
+            name: &'static str,
+            byte: u64,
+        ) -> (FunctionId, qcode::value::TempSpaceId) {
+            let fid = FunctionBody::make(ctx, name.into()).unwrap().id;
+            let root = BasicBlock::make(ctx, fid).id;
+            FunctionBody::from_id_mut(ctx, fid).set_root(root).unwrap();
+            let space = ctx.bodies[fid].push_temp_space(TempSpace::new(None, 1, 8));
+            let mut b = Builder::from_block(BasicBlock::from_id_mut(ctx, root));
+            let ptr = b.context_mut().get_const(0x20, 8).id();
+            let value = b.context_mut().get_const(byte, 1).id();
+            b.push_store(
+                value,
+                ptr,
+                qcode::space::LocalMemorySpaceId::Temp(space.local),
+            );
+            b.push_return(ptr);
+            (fid, space)
+        }
+
+        let mut ctx = Context::new();
+        let (first, first_space) = make_writer(&mut ctx, "first", 0xaa);
+        let (second, second_space) = make_writer(&mut ctx, "second", 0x55);
+        assert_eq!(first_space.local, second_space.local);
+
+        let root = FunctionBody::from_id(&ctx, first).root().unwrap().id;
+        let mut emulator = StandaloneEmulator::new(root);
+        emulator.run_function(&ctx, first).unwrap();
+        emulator.run_function(&ctx, second).unwrap();
+
+        let address = SizedValue::from_u64(0x20);
+        assert_eq!(
+            emulator
+                .memory
+                .read(MemorySpaceId::Temp(first_space), address, 1)
+                .unwrap()
+                .value()
+                .unwrap(),
+            0xaa
+        );
+        assert_eq!(
+            emulator
+                .memory
+                .read(MemorySpaceId::Temp(second_space), address, 1)
+                .unwrap()
+                .value()
+                .unwrap(),
             0x55
         );
     }

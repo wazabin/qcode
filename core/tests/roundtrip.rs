@@ -177,6 +177,20 @@ fn roundtrip_load_store() {
 }
 
 #[test]
+fn roundtrip_body_local_temp_space() {
+    roundtrips(
+        "
+        fn f:
+        <b @p:i64 @v:i32>
+            %l = load($temp0:4, @p);
+            store($temp0:4, @p <- @v);
+            return %l;
+        ",
+        "store($temp0:4, i64 @p <- i32 @v)",
+    );
+}
+
+#[test]
 fn roundtrip_tuple_extract() {
     roundtrips(
         "

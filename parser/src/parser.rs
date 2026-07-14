@@ -1068,7 +1068,7 @@ fn parse_mem_loc(pair: Pair<'_, Rule>) -> Result<(String, usize), ParseError> {
     let mut bytes = None;
     for part in pair.into_inner() {
         match part.as_rule() {
-            Rule::ident => name = Some(part.as_str().to_owned()),
+            Rule::mem_space => name = Some(part.as_str().to_owned()),
             Rule::integer => bytes = Some(parse_integer(part.as_str())? as usize),
             _ => {}
         }
