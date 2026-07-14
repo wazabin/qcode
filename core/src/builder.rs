@@ -2266,35 +2266,6 @@ impl<'str, 'ctx> Builder<'str, 'ctx, &'ctx mut Context<'str>> {
         id
     }
 
-    /// Indexed construction variant of
-    /// [`get_or_make_block`](Self::get_or_make_block).
-    pub fn get_or_make_block_indexed(
-        &mut self,
-        addresses: &mut crate::address_index::AddressIndex,
-        addr: u64,
-    ) -> BlockId {
-        let function = self.block.id.func;
-        let id = self
-            .context_mut()
-            .get_or_make_block_indexed(addresses, addr, function);
-        if BasicBlock::from_id(self.context(), id).parent().is_none() {
-            self.ensure_created_block_in_function(id);
-        }
-        id
-    }
-
-    /// Gets or creates a function whose root is the local label block for `name`.
-    pub fn get_or_make_local_function(&mut self, name: Cow<'str, str>) -> FunctionId {
-        let existing = FunctionBody::from_name(self.context(), &name).map(|f| f.id);
-        if let Some(fid) = existing {
-            fid
-        } else {
-            FunctionBody::make(self.context_mut(), name)
-                .expect("Name was checked above")
-                .id
-        }
-    }
-
     /// Declares a new parameter on the current block. Returns a mutable reference
     /// whose `ValueId` can be used as an operand.
     pub fn push_param(&mut self, size: usize) -> BlockParamMutRef<'str, '_> {

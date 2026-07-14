@@ -130,6 +130,9 @@ pub fn lower_program_with_externals(
                 symbols.functions.insert(fn_decl.name.clone(), fid);
             }
             for fn_decl in fns {
+                prepare_named_callees(ctx, &fn_decl.statements, &mut symbols);
+            }
+            for fn_decl in fns {
                 let fid = symbols.functions[&fn_decl.name];
                 lower_fn_body(
                     ctx,
@@ -224,6 +227,29 @@ fn collect_block_param_names(statements: &[Statement]) -> HashMap<String, Vec<St
     out
 }
 
+fn prepare_named_callees(ctx: &mut Context, statements: &[Statement], symbols: &mut Symbols) {
+    for statement in statements {
+        let Statement::Call {
+            target: ParsedCallee::Named(name),
+            ..
+        } = statement.inner()
+        else {
+            continue;
+        };
+        if symbols.functions.contains_key(name) {
+            continue;
+        }
+        let id = FunctionBody::from_name(ctx, name)
+            .map(|function| function.id)
+            .unwrap_or_else(|| {
+                FunctionBody::make(ctx, Cow::Owned(name.clone()))
+                    .expect("callee name absence was checked")
+                    .id
+            });
+        symbols.functions.insert(name.clone(), id);
+    }
+}
+
 fn lower_fn_body(
     ctx: &mut Context,
     addresses: &mut AddressIndex,
@@ -262,9 +288,17 @@ fn lower_fn_body(
     let mut block_ids: HashMap<String, BlockId> = HashMap::new();
     block_ids.insert(entry.clone(), entry_id);
     create_blocks_and_params(ctx, statements, Some(fid), &entry, &mut block_ids, symbols);
+    let address_blocks = prepare_address_blocks(ctx, addresses, statements, fid)?;
 
     lower_body(
-        ctx, addresses, statements, &entry, &block_ids, globals, symbols, externals,
+        ctx,
+        statements,
+        &entry,
+        &block_ids,
+        &address_blocks,
+        globals,
+        symbols,
+        externals,
     )
 }
 
@@ -306,15 +340,81 @@ fn lower_statement_block(
     };
     let entry = entry.clone();
 
+    prepare_named_callees(ctx, body, symbols);
+
     let mut block_ids: HashMap<String, BlockId> = HashMap::new();
     // A bare-block program (no `fn`) still forms one CFG, so all its blocks must
     // live in a single function; mint one anonymous host up front.
     let host = ctx.anon_function();
     create_blocks_and_params(ctx, body, Some(host), "", &mut block_ids, symbols);
+    let address_blocks = prepare_address_blocks(ctx, addresses, body, host)?;
 
     lower_body(
-        ctx, addresses, body, &entry, &block_ids, globals, symbols, externals,
+        ctx,
+        body,
+        &entry,
+        &block_ids,
+        &address_blocks,
+        globals,
+        symbols,
+        externals,
     )
+}
+
+fn prepare_address_blocks(
+    ctx: &mut Context,
+    addresses: &mut AddressIndex,
+    statements: &[Statement],
+    function: FunctionId,
+) -> Result<HashMap<u64, BlockId>, String> {
+    let mut values = Vec::new();
+    let mut push = |label: &Label| {
+        if let Label::Address { value, .. } = label {
+            values.push(*value);
+        }
+    };
+    for statement in statements {
+        match statement.inner() {
+            Statement::LabelDecl { label, .. } | Statement::Branch { target: label, .. } => {
+                push(label)
+            }
+            Statement::BranchInd { targets, .. }
+            | Statement::Call { targets, .. }
+            | Statement::CallInd { targets, .. } => targets.iter().for_each(&mut push),
+            Statement::CBranch {
+                target,
+                fallthrough,
+                ..
+            } => {
+                push(target);
+                push(fallthrough);
+            }
+            _ => {}
+        }
+    }
+    values.sort_unstable();
+    values.dedup();
+
+    let mut blocks = HashMap::new();
+    for value in values {
+        let foreign = match addresses.get(value) {
+            Some(AddressTarget::Function(owner)) if owner != function => Some(owner),
+            Some(AddressTarget::Block(block)) if block.func != function => Some(block.func),
+            _ => None,
+        };
+        if let Some(owner) = foreign {
+            return Err(format!(
+                "control-flow target <{value:#x}> resolves to storage owned by {owner:?}, \
+                 but the branch is in {function:?}; cross-function control flow must be a \
+                 call/tail call, not a foreign block target"
+            ));
+        }
+        blocks.insert(
+            value,
+            ctx.get_or_make_block_indexed(addresses, value, function),
+        );
+    }
+    Ok(blocks)
 }
 
 /// Pre-creates all named blocks (except `skip_entry`, already made) and their
@@ -363,10 +463,10 @@ fn create_blocks_and_params(
 #[allow(clippy::too_many_arguments)] // Explicit construction index stays operation-scoped.
 fn lower_body(
     ctx: &mut Context,
-    addresses: &mut AddressIndex,
     statements: &[Statement],
     entry: &str,
     block_ids: &HashMap<String, BlockId>,
+    address_blocks: &HashMap<u64, BlockId>,
     globals: &HashMap<String, Local>,
     symbols: &mut Symbols,
     externals: &HashMap<String, ValueId>,
@@ -391,9 +491,9 @@ fn lower_body(
     let mut b = Builder::from_block(BasicBlock::from_id_mut(ctx, entry_id));
     let mut lw = Lowerer {
         b: &mut b,
-        addresses,
         locals: &mut locals,
         block_ids,
+        address_blocks,
         block_param_names: &block_param_names,
         symbols,
         externals,
@@ -406,9 +506,9 @@ fn lower_body(
 
 struct Lowerer<'a, 'str, 'ctx> {
     b: &'a mut Builder<'str, 'ctx>,
-    addresses: &'a mut AddressIndex,
     locals: &'a mut HashMap<String, Local>,
     block_ids: &'a HashMap<String, BlockId>,
+    address_blocks: &'a HashMap<u64, BlockId>,
     block_param_names: &'a HashMap<String, Vec<String>>,
     symbols: &'a mut Symbols,
     externals: &'a HashMap<String, ValueId>,
@@ -422,22 +522,11 @@ impl Lowerer<'_, '_, '_> {
                 .get(name)
                 .copied()
                 .ok_or_else(|| format!("unknown block <{name}>"))?,
-            Label::Address { value, .. } => {
-                let current = self.b.current_block().func;
-                let foreign = match self.addresses.get(*value) {
-                    Some(AddressTarget::Function(owner)) if owner != current => Some(owner),
-                    Some(AddressTarget::Block(block)) if block.func != current => Some(block.func),
-                    _ => None,
-                };
-                if let Some(owner) = foreign {
-                    return Err(format!(
-                        "control-flow target {label:?} resolves to storage owned by {owner:?}, \
-                         but the branch is in {current:?}; cross-function control flow must be a \
-                         call/tail call, not a foreign block target",
-                    ));
-                }
-                self.b.get_or_make_block_indexed(self.addresses, *value)
-            }
+            Label::Address { value, .. } => self
+                .address_blocks
+                .get(value)
+                .copied()
+                .ok_or_else(|| format!("unprepared address block <{value:#x}>"))?,
         };
         // Strict IR locality (context-split ruling 2): a control-flow target must
         // be a block of the *current* function. Named labels resolve through the
@@ -541,7 +630,7 @@ impl Lowerer<'_, '_, '_> {
                 label: Label::Address { value, .. },
                 ..
             } => {
-                let blk = self.b.get_or_make_block_indexed(self.addresses, *value);
+                let blk = self.address_blocks[value];
                 self.b.switch_to_block(blk);
             }
 
@@ -1065,9 +1154,7 @@ impl Lowerer<'_, '_, '_> {
 
     fn call_callee(&mut self, callee: &ParsedCallee) -> Callee {
         match callee {
-            ParsedCallee::Named(name) => {
-                Callee::Real(self.b.get_or_make_local_function(Cow::Owned(name.clone())))
-            }
+            ParsedCallee::Named(name) => Callee::Real(self.symbols.functions[name]),
             ParsedCallee::Minted(slot) => Callee::Minted(*slot),
         }
     }
