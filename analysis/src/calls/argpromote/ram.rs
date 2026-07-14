@@ -7,10 +7,10 @@ use qcode::{
     assumption::Proposition,
     builder::Builder,
     context::Context,
-    space::SpaceId,
+    space::LocalMemorySpaceId,
     types::TypeId,
     value::{
-        BasicBlock, FunctionBody, FunctionId, Value, ValueId, VarnodeId,
+        BasicBlock, FunctionBody, FunctionId, TempSpace, Value, ValueId, VarnodeId,
         insn::{Call, InstructionId, Mnemonic},
     },
 };
@@ -76,13 +76,6 @@ pub fn argpromote(ctx: &mut Context) -> bool {
 /// frame locals are destroyed at return, so the caller can never observe writes to
 /// them (they are dead on exit). The redirected shadow store is left to DCE.
 pub fn argpromote_with_sp(ctx: &mut Context, sp_reg: Option<VarnodeId>) -> bool {
-    // One shadow space shared by *every* promoted function and every promoted
-    // pointer within it. The shadow is only a tag for alias analysis and a key for
-    // store-to-load forwarding; functions execute independently, so sharing one
-    // SpaceId across them is sound. Using a single space (rather than one per
-    // `apply`) keeps a function's snapshot seed and its redirected body accesses in
-    // the *same* space, so the seed store forwards into the body's loads.
-    let shadow = ctx.make_temp_space();
     let mut changed = false;
     // Both channels gate every function on being address-taken; build that set once
     // (O(instructions)) instead of rescanning the whole program per function. It
@@ -101,7 +94,7 @@ pub fn argpromote_with_sp(ctx: &mut Context, sp_reg: Option<VarnodeId>) -> bool 
         if super::globals::globalize_constants(ctx, &address_taken, fid) {
             changed = true;
         }
-        if try_promote(ctx, fid, shadow, sp_reg, &address_taken) {
+        if try_promote(ctx, fid, sp_reg, &address_taken) {
             changed = true;
         }
     }
@@ -202,7 +195,6 @@ struct ParamInfo {
 fn try_promote(
     ctx: &mut Context,
     fid: FunctionId,
-    shadow: SpaceId,
     sp_reg: Option<VarnodeId>,
     address_taken: &FxHashSet<FunctionId>,
 ) -> bool {
@@ -380,7 +372,7 @@ fn try_promote(
         return false;
     }
 
-    apply(ctx, fid, promoted, shadow, sp_reg)
+    apply(ctx, fid, promoted, sp_reg)
 }
 
 /// Whether every real-memory (default-space) load/store in `fid` is captured by
@@ -690,7 +682,6 @@ fn apply(
     ctx: &mut Context,
     fid: FunctionId,
     mut promoted: Vec<Promoted>,
-    shadow: SpaceId,
     sp_reg: Option<VarnodeId>,
 ) -> bool {
     let call_sites = crate::calls::fresh_direct_call_sites(ctx, fid);
@@ -699,10 +690,14 @@ fn apply(
     }
 
     let ram = ctx.shared.default_space;
-    // `shadow` is the module-wide argpromote shadow space (see `argpromote`): equal
-    // addresses collide here, so aliasing among the pointers stays correct without
-    // any anti-alias gate, and a function's snapshot seed shares the space of its
-    // redirected body accesses so the seed forwards into them.
+    let default = ctx.shared.space(ram);
+    let (word_size, addr_size) = (default.word_size, default.addr_size);
+    let shadow =
+        ctx.bodies[fid].push_temp_space(TempSpace::new(Some("argpromote"), word_size, addr_size));
+    let shadow = LocalMemorySpaceId::Temp(shadow.local);
+    // Every promoted pointer in this function shares one body-local shadow.
+    // Equal addresses therefore collide for aliasing, while another function's
+    // same-address shadow remains isolated by construction.
 
     // Deterministic order shared by the callee (param creation) and the callers
     // (snapshot argument order).
@@ -887,8 +882,8 @@ fn apply(
         for &acc in &p.accesses {
             let mut m = ctx.get_insn(acc).mnemonic().clone();
             match &mut m {
-                Mnemonic::Load(l) => l.space = shadow.into(),
-                Mnemonic::Store(s) => s.space = shadow.into(),
+                Mnemonic::Load(l) => l.space = shadow,
+                Mnemonic::Store(s) => s.space = shadow,
                 _ => {}
             }
             ctx.replace_instruction_mnemonic(acc, m);

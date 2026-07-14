@@ -52,7 +52,7 @@
 use qcode::{
     builder::Builder,
     context::Context,
-    space::SpaceId,
+    space::LocalMemorySpaceId,
     types::TypeId,
     value::{
         BasicBlock, BlockId, FunctionBody, FunctionId, Instruction, ValueId,
@@ -173,10 +173,11 @@ pub(crate) fn add_input(
     name: Option<String>,
     origin: Option<ValueId>,
     type_id: Option<TypeId>,
-    seed_space: SpaceId,
+    seed_space: impl Into<LocalMemorySpaceId>,
     seed_addr: impl FnOnce(&mut Builder) -> ValueId,
     caller_value: impl FnMut(&mut Context, InstructionId, BlockId) -> ValueId,
 ) -> Option<ValueId> {
+    let seed_space = seed_space.into();
     let param = append_entry_param(ctx, fid, size, name, origin, caller_value)?;
     if let (ValueId::BlockParam(pid), Some(ty)) = (param, type_id) {
         ctx.block_param_mut(pid).type_id = ty;

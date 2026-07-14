@@ -194,7 +194,13 @@ crate::register_module_pass!(SeedWrittenSpaces);
 mod tests {
     use super::*;
     use crate::{AliasResult, constant_fold_function, gvn_function};
-    use qcode::{context::Context, lower::lower_str, value::FunctionBody};
+    use qcode::{
+        builder::Builder,
+        context::Context,
+        lower::lower_str,
+        testing::TestContext,
+        value::{BasicBlock, FunctionBody, TempSpace, ValueId},
+    };
 
     /// The motivating shape, reduced: a buffer pointer is spilled into a frame
     /// slot, the block ends in a `call` to a callee that writes only its own
@@ -338,6 +344,37 @@ fn callee:
         assert!(
             !spaces.contains(&ctx.shared.default_space),
             "callee writes only scratch, never the default ram space"
+        );
+    }
+
+    #[test]
+    fn body_local_scratch_is_not_published() {
+        let mut tc = TestContext::new();
+        let fid = FunctionBody::make(&mut tc.ctx, "local_scratch".into())
+            .unwrap()
+            .id;
+        let block = BasicBlock::make(&mut tc.ctx, fid).id;
+        FunctionBody::from_id_mut(&mut tc.ctx, fid)
+            .set_root(block)
+            .unwrap();
+        let scratch = tc.ctx.bodies[fid].push_temp_space(TempSpace::new(Some("scratch"), 1, 8));
+        let ptr = ValueId::BlockParam(BasicBlock::from_id_mut(&mut tc.ctx, block).push_param(8).id);
+        {
+            let mut b = Builder::from_block(BasicBlock::from_id_mut(&mut tc.ctx, block));
+            let value = b.context_mut().get_const(1, 1).id();
+            b.push_store(
+                value,
+                ptr,
+                qcode::space::LocalMemorySpaceId::Temp(scratch.local),
+            );
+            b.push_return(value);
+        }
+
+        set_all_written_spaces(&mut tc.ctx);
+        assert_eq!(
+            FunctionBody::from_id(&tc.ctx, fid).written_spaces(),
+            Some(&[][..]),
+            "body-local scratch must not escape into a shared-space summary"
         );
     }
 

@@ -3,7 +3,7 @@ use std::marker::PhantomData;
 
 use qcode::{
     context::{Context, Shared},
-    space::{SpaceId, SpaceType},
+    space::{LocalMemorySpaceId, SpaceId, SpaceType},
     value::{
         FunctionId, QCodeView, ValueId, ValueRef, Varnode,
         insn::{Binop, IntBinop, Mnemonic},
@@ -105,7 +105,7 @@ struct Analysis<'base, 'ctx, 'str, R> {
     by_space: &'base HashMap<SpaceId, Vec<SizedNode>>,
 
     /// Literal-pointer ranges encountered during pointer resolution; grows as loads/stores are processed.
-    literal_ranges: HashMap<SpaceId, Vec<SizedNode>>,
+    literal_ranges: HashMap<LocalMemorySpaceId, Vec<SizedNode>>,
 
     /// The canonical root assigned to each distinct literal pointer on its first
     /// sight, plus the widest access size scanned for it so far, so repeated uses
@@ -118,7 +118,7 @@ struct Analysis<'base, 'ctx, 'str, R> {
 
     /// Exact `(space, byte_start, byte_end)` for pointer values whose location
     /// was resolved to a concrete varnode or literal address.
-    value_to_interval: HashMap<ValueId, (SpaceId, u64, u64)>,
+    value_to_interval: HashMap<ValueId, (LocalMemorySpaceId, u64, u64)>,
 
     uf: UnionFind,
 }
@@ -154,7 +154,12 @@ impl<'base, 'ctx, 'str: 'ctx, R: QCodeView<'ctx, 'str>> Analysis<'base, 'ctx, 's
 
     /// Assigns a union-find root to `literal` as a pointer into `space`, merging it
     /// with any varnode or previously-seen literal range whose address interval overlaps.
-    fn assign_literal_root(&mut self, literal: ValueId, space: SpaceId, size: usize) -> NodeId {
+    fn assign_literal_root(
+        &mut self,
+        literal: ValueId,
+        space: LocalMemorySpaceId,
+        size: usize,
+    ) -> NodeId {
         // A literal seen before at this size (or wider) was already merged with
         // every overlapping varnode and range; its class is stable modulo later
         // joins, which `canonical_root` reflects. Short-circuit the full rescan.
@@ -176,7 +181,7 @@ impl<'base, 'ctx, 'str: 'ctx, R: QCodeView<'ctx, 'str>> Analysis<'base, 'ctx, 's
         // Merge with any varnode whose range overlaps this literal's interval.
         // We call self.uf.find_mut directly (rather than self.canonical_root) so
         // the borrow checker can see that self.by_space and self.uf are disjoint fields.
-        if let Some(varnodes) = self.by_space.get(&space) {
+        if let Some(varnodes) = space.shared().and_then(|space| self.by_space.get(&space)) {
             for varnode in varnodes.iter().copied() {
                 if overlaps(start, end, varnode.start, varnode.end) {
                     let varnode_root = self.uf.find_mut(varnode.root);
@@ -212,7 +217,12 @@ impl<'base, 'ctx, 'str: 'ctx, R: QCodeView<'ctx, 'str>> Analysis<'base, 'ctx, 's
     /// * Literal pointers call `assign_literal_root` to track address ranges.
     /// * Add/Sub instructions peel off the non-pointer operand and recurse on the
     ///   pointer-typed side; anything else is unresolvable.
-    fn resolve_pointer_root(&mut self, value: ValueId, space: SpaceId, size: usize) -> NodeId {
+    fn resolve_pointer_root(
+        &mut self,
+        value: ValueId,
+        space: LocalMemorySpaceId,
+        size: usize,
+    ) -> NodeId {
         match value {
             ValueId::Varnode(id) => {
                 let (varnode_space_id, start, vn_size) = {
@@ -274,19 +284,21 @@ impl<'base, 'ctx, 'str: 'ctx, R: QCodeView<'ctx, 'str>> Analysis<'base, 'ctx, 's
 
                 match action {
                     PeelAction::AddSub(op, lhs, rhs) => {
-                        if ValueRef::from_view(self.host, value).space().map(|s| s.id)
-                            != Some(space)
+                        let qualified_space = space.qualify(id.func);
+                        if ValueRef::from_view(self.host, value).memory_space()
+                            != Some(qualified_space)
                         {
                             return NodeId::Unknown;
                         }
-                        let lhs_space = ValueRef::from_view(self.host, lhs).space().map(|s| s.id);
-                        let rhs_space = ValueRef::from_view(self.host, rhs).space().map(|s| s.id);
+                        let lhs_space = ValueRef::from_view(self.host, lhs).memory_space();
+                        let rhs_space = ValueRef::from_view(self.host, rhs).memory_space();
 
-                        if lhs_space == Some(space) && rhs_space != Some(space) {
+                        if lhs_space == Some(qualified_space) && rhs_space != Some(qualified_space)
+                        {
                             self.resolve_pointer_root(lhs, space, size)
                         } else if matches!(op, Binop::Int(IntBinop::Add))
-                            && rhs_space == Some(space)
-                            && lhs_space != Some(space)
+                            && rhs_space == Some(qualified_space)
+                            && lhs_space != Some(qualified_space)
                         {
                             self.resolve_pointer_root(rhs, space, size)
                         } else if lhs_space.is_none() && rhs_space.is_none() {
@@ -302,8 +314,9 @@ impl<'base, 'ctx, 'str: 'ctx, R: QCodeView<'ctx, 'str>> Analysis<'base, 'ctx, 's
                     // pointer) or has none (an untyped/scalar carrier); a source in a
                     // *different* space would be an unrelated location.
                     PeelAction::Peel(src) => {
-                        let src_space = ValueRef::from_view(self.host, src).space().map(|s| s.id);
-                        if src_space == Some(space) || src_space.is_none() {
+                        let qualified_space = space.qualify(id.func);
+                        let src_space = ValueRef::from_view(self.host, src).memory_space();
+                        if src_space == Some(qualified_space) || src_space.is_none() {
                             self.resolve_pointer_root(src, space, size)
                         } else {
                             NodeId::Unknown
@@ -474,7 +487,7 @@ impl RegisterBase {
     fn resolve<'ctx, 'str: 'ctx>(
         &self,
         host: impl QCodeView<'ctx, 'str>,
-        pointer_uses: Vec<(ValueId, SpaceId, usize)>,
+        pointer_uses: Vec<(ValueId, LocalMemorySpaceId, usize)>,
     ) -> AliasResult {
         let mut a = Analysis {
             host,
@@ -489,7 +502,7 @@ impl RegisterBase {
 
         // pointer_spaces guards the invariant that a given pointer value always
         // refers to the same address space across all uses.
-        let mut pointer_spaces: HashMap<ValueId, SpaceId> = HashMap::default();
+        let mut pointer_spaces: HashMap<ValueId, LocalMemorySpaceId> = HashMap::default();
 
         for (ptr, space, size) in pointer_uses {
             if let Some(existing_space) = pointer_spaces.insert(ptr, space)
@@ -532,20 +545,16 @@ impl RegisterBase {
         host: impl QCodeView<'a, 'str>,
         fun_id: FunctionId,
     ) -> AliasResult {
-        let mut pointer_uses: Vec<(ValueId, SpaceId, usize)> = Vec::new();
+        let mut pointer_uses: Vec<(ValueId, LocalMemorySpaceId, usize)> = Vec::new();
         for block in host.function_ref(fun_id).blocks() {
             for iid in block.instruction_ids() {
                 match host.insn_ref(iid).mnemonic() {
-                    Mnemonic::Load(load) => pointer_uses.push((
-                        load.ptr.qualify(iid.func),
-                        load.space.expect_shared(),
-                        load.size,
-                    )),
-                    Mnemonic::Store(store) => pointer_uses.push((
-                        store.ptr.qualify(iid.func),
-                        store.space.expect_shared(),
-                        store.size,
-                    )),
+                    Mnemonic::Load(load) => {
+                        pointer_uses.push((load.ptr.qualify(iid.func), load.space, load.size))
+                    }
+                    Mnemonic::Store(store) => {
+                        pointer_uses.push((store.ptr.qualify(iid.func), store.space, store.size))
+                    }
                     _ => {}
                 }
             }

@@ -38,7 +38,7 @@ use rustc_hash::FxHashMap as HashMap;
 
 use crate::{
     context::Context,
-    space::{SPACE_CONST, Space, SpaceId, SpaceType},
+    space::{LocalMemorySpaceId, SPACE_CONST, Space, SpaceId, SpaceType},
     types::{AggregateField, TypeId},
     value::{
         BodyView, FunctionBody, Instruction, ModuleView, QCodeView, Renameable, Value, ValueId,
@@ -572,13 +572,18 @@ impl<'str, 'ctx, Ctx: BuilderBacking<'str>> Builder<'str, 'ctx, Ctx> {
     /// Retype an instruction's result as a pointer into `space` (host-routed
     /// mirror of [`InstructionMutRef::set_space`]): the type mint is shared, the
     /// `type_id` write goes to the owning function's arena.
-    fn set_insn_space(&mut self, id: InstructionId, space: SpaceId) {
-        if matches!(Space::from_id(self.shr(), space).ty, SpaceType::Register) {
+    fn set_insn_space(&mut self, id: InstructionId, space: LocalMemorySpaceId) {
+        if space.shared().is_some_and(|space| {
+            matches!(Space::from_id(self.shr(), space).ty, SpaceType::Register)
+        }) {
             return;
         }
         let cur_type = self.block.host_mut().bb_instruction_mut(id).type_id;
         let size = self.shr().types.size_of(cur_type);
-        let type_id = self.shr().types.get_or_make_space_address(size, space);
+        let type_id = self
+            .shr()
+            .types
+            .get_or_make_space_address(size, space.qualify(id.func));
         self.block.host_mut().bb_instruction_mut(id).type_id = type_id;
     }
 
@@ -828,8 +833,9 @@ impl<'str, 'ctx, Ctx: BuilderBacking<'str>> Builder<'str, 'ctx, Ctx> {
         &mut self,
         mut src: ValueId,
         size: usize,
-        space: SpaceId,
+        space: impl Into<LocalMemorySpaceId>,
     ) -> ValueRef<'str, '_, Ctx::ReadView<'_>> {
+        let space = space.into();
         if CHECK_LOCAL {
             src = self.ensure_local(src);
         }
@@ -874,7 +880,7 @@ impl<'str, 'ctx, Ctx: BuilderBacking<'str>> Builder<'str, 'ctx, Ctx> {
             self.push_instruction(
                 Mnemonic::Load(Load {
                     ptr: self.loc(src),
-                    space: space.into(),
+                    space,
                     size,
                 }),
                 size,
@@ -1858,8 +1864,9 @@ impl<'str, 'ctx, Ctx: BuilderBacking<'str>> Builder<'str, 'ctx, Ctx> {
         &mut self,
         src: ValueId,
         ptr: ValueId,
-        space: SpaceId,
+        space: impl Into<LocalMemorySpaceId>,
     ) -> InstructionRef<'str, '_, Ctx::ReadView<'_>> {
+        let space = space.into();
         let src = self.ensure_local(src);
         let size = self.get_value(src).size();
 
@@ -1887,7 +1894,7 @@ impl<'str, 'ctx, Ctx: BuilderBacking<'str>> Builder<'str, 'ctx, Ctx> {
             Mnemonic::Store(Store {
                 src: self.loc(src),
                 ptr: self.loc(ptr),
-                space: space.into(),
+                space,
                 size,
             }),
             0,

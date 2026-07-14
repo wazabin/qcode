@@ -4,7 +4,7 @@ use crate::{AliasResult, ContextView, FunctionBody, Outcome};
 use jstd::graph::analysis::{compute_dominators, compute_postdominators};
 use qcode::{
     context::Context,
-    space::{LocalMemorySpaceId, Space, SpaceId, SpaceType},
+    space::{LocalMemorySpaceId, Space, SpaceType},
     value::{
         BlockId, FunctionId, ModuleView, QCodeView, ValueId, Varnode,
         insn::{InstructionId, Mnemonic},
@@ -20,20 +20,20 @@ use qcode::{
 pub(crate) struct LiveLoc {
     pub ptr: ValueId,
     pub size: usize,
-    pub space: SpaceId,
+    pub space: LocalMemorySpaceId,
 }
 
 /// A byte interval `[start, end)` overwritten by a covering store before any
 /// read.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub(crate) struct KilledInterval {
-    pub space: SpaceId,
+    pub space: LocalMemorySpaceId,
     pub start: u64,
     pub end: u64,
 }
 
 impl KilledInterval {
-    fn from_alias(iv: (SpaceId, u64, u64)) -> Self {
+    fn from_alias(iv: (LocalMemorySpaceId, u64, u64)) -> Self {
         let (space, start, end) = iv;
         Self { space, start, end }
     }
@@ -75,7 +75,7 @@ fn call_clobber_intervals<'a, 'str: 'a>(
             let v = Varnode::from_id(host.shared(), vn);
             let start = v.address() as u64;
             KilledInterval {
-                space: v.space().id,
+                space: v.space().id.into(),
                 start,
                 end: start + v.size() as u64,
             }
@@ -275,14 +275,19 @@ fn fully_covered(set: &[(i64, i64)], range: (i64, i64)) -> bool {
 /// block* must-covers the victim, so the victim is overwritten before any exit.
 #[derive(Clone, Copy)]
 struct RelKill {
-    space: SpaceId,
+    space: LocalMemorySpaceId,
     base: AddrBase,
     start: i64,
     end: i64,
 }
 
 /// True when the kills sharing `(space, base)` fully cover `range`.
-fn rel_fully_covered(kills: &[RelKill], space: SpaceId, base: AddrBase, range: (i64, i64)) -> bool {
+fn rel_fully_covered(
+    kills: &[RelKill],
+    space: LocalMemorySpaceId,
+    base: AddrBase,
+    range: (i64, i64),
+) -> bool {
     let set: Vec<(i64, i64)> = kills
         .iter()
         .filter(|k| k.space == space && k.base == base)
@@ -296,7 +301,12 @@ fn rel_fully_covered(kills: &[RelKill], space: SpaceId, base: AddrBase, range: (
 /// different — hence incomparable — base in the same space cannot be proven
 /// disjoint from the read and is dropped (mirrors the absolute path dropping
 /// same-space kills on an unknown read location).
-fn rel_punch_on_load(kills: &mut Vec<RelKill>, space: SpaceId, base: AddrBase, range: (i64, i64)) {
+fn rel_punch_on_load(
+    kills: &mut Vec<RelKill>,
+    space: LocalMemorySpaceId,
+    base: AddrBase,
+    range: (i64, i64),
+) {
     let mut next = Vec::with_capacity(kills.len());
     for k in kills.drain(..) {
         if k.space != space {
@@ -502,16 +512,11 @@ fn scan_block_aliased<'a, 'str: 'a>(
                 // Relative path: a read of `base + off` clears any same-base
                 // overwrite it overlaps, and any incomparable same-space kill.
                 let (lb, lo) = addr_key(host, load_ptr);
-                rel_punch_on_load(
-                    &mut rel_killed,
-                    load.space.expect_shared(),
-                    lb,
-                    (lo, lo + load.size as i64),
-                );
+                rel_punch_on_load(&mut rel_killed, load.space, lb, (lo, lo + load.size as i64));
                 live.push(LiveLoc {
                     ptr: load_ptr,
                     size: load.size,
-                    space: load.space.expect_shared(),
+                    space: load.space,
                 });
             }
             Mnemonic::Store(store) => {
@@ -533,7 +538,7 @@ fn scan_block_aliased<'a, 'str: 'a>(
                 let (sb, so) = addr_key(host, ptr);
                 let rel_range = (so, so + store.size as i64);
                 let is_killed = ptr_iv.is_some_and(|iv| fully_covered_iv(&killed, iv))
-                    || rel_fully_covered(&rel_killed, store.space.expect_shared(), sb, rel_range);
+                    || rel_fully_covered(&rel_killed, store.space, sb, rel_range);
                 let is_dead_reg = dead_regs.contains(&ptr)
                     || (regs_dead_at_exit && is_reg_space(host.shared(), store.space));
                 if no_live_reader && (is_killed || is_dead_reg) {
@@ -546,7 +551,7 @@ fn scan_block_aliased<'a, 'str: 'a>(
                         killed.push(iv);
                     }
                     rel_killed.push(RelKill {
-                        space: store.space.expect_shared(),
+                        space: store.space,
                         base: sb,
                         start: rel_range.0,
                         end: rel_range.1,
@@ -664,9 +669,9 @@ pub fn remove_dead_load_insns_block(
 }
 
 /// A temp-space load: the space it reads, its pointer, and byte size.
-type TempLoad = (SpaceId, ValueId, usize);
+type TempLoad = (LocalMemorySpaceId, ValueId, usize);
 /// A candidate temp-space store: its instruction, space, pointer, and byte size.
-type TempStore = (InstructionId, SpaceId, ValueId, usize);
+type TempStore = (InstructionId, LocalMemorySpaceId, ValueId, usize);
 
 /// Returns stores to temp/mysave spaces (not Register, not default RAM) from
 /// which no load ever reads within `function_id`. These stores are dead because
@@ -691,16 +696,12 @@ fn unread_temp_space_stores<'a, 'str: 'a>(
         for insn_id in block.instruction_ids() {
             match host.insn_ref(insn_id).mnemonic() {
                 Mnemonic::Load(load) if is_temp_space(host.shared(), load.space) => {
-                    loads.push((
-                        load.space.expect_shared(),
-                        load.ptr.qualify(insn_id.func),
-                        load.size,
-                    ));
+                    loads.push((load.space, load.ptr.qualify(insn_id.func), load.size));
                 }
                 Mnemonic::Store(store) if is_temp_space(host.shared(), store.space) => {
                     candidate_stores.push((
                         insn_id,
-                        store.space.expect_shared(),
+                        store.space,
                         store.ptr.qualify(insn_id.func),
                         store.size,
                     ));
@@ -785,7 +786,7 @@ struct RegisterStore {
     id: InstructionId,
     block: BlockId,
     ptr: ValueId,
-    space: SpaceId,
+    space: LocalMemorySpaceId,
 }
 
 /// Finds register stores that are overwritten by a covering store in a
@@ -836,7 +837,7 @@ fn postdominated_dead_register_stores<'a, 'str: 'a>(
                         id,
                         block: *block,
                         ptr: store.ptr.qualify(id.func),
-                        space: store.space.expect_shared(),
+                        space: store.space,
                     });
                 }
                 Mnemonic::Load(load) if is_reg_space(host.shared(), load.space) => {
@@ -1208,6 +1209,7 @@ mod tests {
     use qcode::{
         builder::Builder,
         context::Context,
+        space::SpaceId,
         testing::TestContext,
         value::{BasicBlock, FunctionBody, Value},
     };

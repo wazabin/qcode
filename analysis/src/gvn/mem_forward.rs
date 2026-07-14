@@ -35,7 +35,7 @@ use crate::{AliasResult, ContextView, FunctionBody};
 use qcode::context::Context;
 use qcode::{
     assumption::Proposition,
-    space::{Space, SpaceId, SpaceType},
+    space::{LocalMemorySpaceId, Space, SpaceId, SpaceType},
     value::{
         FunctionId, LocalValueId, QCodeView, Value, ValueId, ValueRef, Varnode, VarnodeId,
         block::BlockId,
@@ -77,14 +77,14 @@ enum CallClobbers {
 enum Base {
     /// A pointer the oracle pins to a concrete interval. All pinned pointers in
     /// a space share this base; the map offset is the absolute byte address.
-    Pinned(SpaceId),
+    Pinned(LocalMemorySpaceId),
     /// A pointer with no pinned interval, identified by its affine base value.
     /// The map offset is the signed affine constant relative to that base.
-    Symbolic(SpaceId, ValueId),
+    Symbolic(LocalMemorySpaceId, ValueId),
 }
 
 impl Base {
-    fn space(self) -> SpaceId {
+    fn space(self) -> LocalMemorySpaceId {
         match self {
             Base::Pinned(s) | Base::Symbolic(s, _) => s,
         }
@@ -95,7 +95,7 @@ impl Base {
 /// the signed byte offset of its first byte within that base.
 fn locate(
     ptr: ValueId,
-    space: SpaceId,
+    space: LocalMemorySpaceId,
     aliases: Option<&AliasResult>,
     numbering: &Numbering,
 ) -> (Base, i64) {
@@ -179,12 +179,7 @@ impl MemForward {
         aliases: Option<&AliasResult>,
         numbering: &Numbering,
     ) {
-        let (base, start) = locate(
-            load.ptr.qualify(func),
-            load.space.expect_shared(),
-            aliases,
-            numbering,
-        );
+        let (base, start) = locate(load.ptr.qualify(func), load.space, aliases, numbering);
         for (i, off) in (start..start + load.size as i64).enumerate() {
             self.byte_map.insert(
                 (base, off),
@@ -235,7 +230,7 @@ impl MemForward {
     ) {
         let store_ptr = store.ptr.qualify(func);
         let store_src = store.src.qualify(func);
-        let (base, start) = locate(store_ptr, store.space.expect_shared(), aliases, numbering);
+        let (base, start) = locate(store_ptr, store.space, aliases, numbering);
         let end = start + store.size as i64;
 
         self.byte_map.retain(|&(cb, _), _| {
@@ -288,7 +283,7 @@ impl MemForward {
     ) -> Option<ValueId> {
         let (base, start) = locate(
             load.ptr.qualify(insn_id.func),
-            load.space.expect_shared(),
+            load.space,
             aliases,
             numbering,
         );
@@ -546,7 +541,7 @@ impl MemForward {
                 // escape as possibly reaching every pinned RAM cell.
                 None => !escaping.is_empty(),
             };
-        let pinned_ram_clobbered = |space: SpaceId, off: i64| {
+        let pinned_ram_clobbered = |space: LocalMemorySpaceId, off: i64| {
             if symbolic_escape {
                 return true;
             }
@@ -557,7 +552,11 @@ impl MemForward {
             })
         };
 
-        let is_reg = |space| matches!(Space::from_id(host.shared(), space).ty, SpaceType::Register);
+        let is_reg = |space: LocalMemorySpaceId| {
+            space.shared().is_some_and(|space| {
+                matches!(Space::from_id(host.shared(), space).ty, SpaceType::Register)
+            })
+        };
 
         // PROTOTYPE (realigned-frame): frame freshness extended from stores to
         // calls. A symbolic RAM cell whose base is an own-frame local the callee
@@ -579,15 +578,22 @@ impl MemForward {
         self.byte_map.retain(|&(base, off), _| {
             let space = base.space();
             if !is_reg(space) {
+                // A body-local scratch space is owned by the caller. No callee,
+                // including an unresolved indirect one, can name or mutate it.
+                if space.shared().is_none() {
+                    return true;
+                }
                 // A direct callee with a witnessed write-set that excludes this
                 // space cannot touch the cell no matter what escapes into it, so
                 // keep it. This is a per-callee memory summary, sound and needing
                 // no frame reasoning: a `pure_reg` callee writing only its private
                 // scratch space leaves the caller's real-`ram` cells intact.
-                if let Some(ws) = &callee_written_spaces
-                    && !ws.contains(&space)
-                {
-                    return true;
+                if let Some(ws) = &callee_written_spaces {
+                    match space.shared() {
+                        Some(space) if !ws.contains(&space) => return true,
+                        Some(_) => {}
+                        None => unreachable!("local spaces returned above"),
+                    }
                 }
                 // RAM: a call may write through any symbolic pointer (no memory
                 // summary exists), so drop symbolic RAM cells — except an own-frame
@@ -657,12 +663,7 @@ impl MemForward {
         let Mnemonic::Load(load) = host.insn_ref(id).mnemonic().clone() else {
             return None;
         };
-        let (base, start) = locate(
-            load.ptr.qualify(id.func),
-            load.space.expect_shared(),
-            aliases,
-            numbering,
-        );
+        let (base, start) = locate(load.ptr.qualify(id.func), load.space, aliases, numbering);
         let segs = self.segments(base, start, start + load.size as i64)?;
         let [seg] = segs.as_slice() else { return None };
         (seg.load_off == 0
@@ -686,7 +687,7 @@ impl MemForward {
         &self,
         host: impl QCodeView<'ctx, 'str>,
         ptr: ValueId,
-        space: SpaceId,
+        space: LocalMemorySpaceId,
         aliases: Option<&AliasResult>,
         numbering: &Numbering,
         peel: bool,
@@ -779,14 +780,8 @@ impl MemForward {
             .iter()
             .map(|store| {
                 let store_ptr = store.ptr.qualify(block_id.func);
-                let (sb, s) = self.resolve_loaded_ptr(
-                    host,
-                    store_ptr,
-                    store.space.expect_shared(),
-                    aliases,
-                    numbering,
-                    peel,
-                );
+                let (sb, s) =
+                    self.resolve_loaded_ptr(host, store_ptr, store.space, aliases, numbering, peel);
                 let rep = match sb {
                     Base::Symbolic(_, bv) => bv,
                     Base::Pinned(_) => store_ptr,
@@ -819,7 +814,7 @@ impl MemForward {
 mod tests {
     use super::*;
     use qcode::testing::TestContext;
-    use qcode::value::{BasicBlock, FunctionBody};
+    use qcode::value::{BasicBlock, FunctionBody, TempSpace};
 
     /// A store of `src` (width = location width) to varnode `vn`.
     fn store_to(tc: &TestContext, func: FunctionId, vn: VarnodeId, src: ValueId) -> Store {
@@ -874,7 +869,7 @@ mod tests {
             let v = Varnode::from_id(&tc.ctx, vn);
             let start = v.address() as u64;
             let end = start + v.size() as u64;
-            value_to_interval.insert(ValueId::Varnode(vn), (v.space().id, start, end));
+            value_to_interval.insert(ValueId::Varnode(vn), (v.space().id.into(), start, end));
             // One class per starting address: overlapping sub-registers alias.
             value_to_root.insert(
                 ValueId::Varnode(vn),
@@ -968,7 +963,10 @@ mod tests {
 
         // Simulate a call clobbering only r0 by retaining via the same predicate.
         let regs = [tc.r0_lo32];
-        let is_reg = |sp| matches!(Space::from_id(&tc.ctx, sp).ty, SpaceType::Register);
+        let is_reg = |sp: LocalMemorySpaceId| {
+            sp.shared()
+                .is_some_and(|sp| matches!(Space::from_id(&tc.ctx, sp).ty, SpaceType::Register))
+        };
         mf.byte_map.retain(|&(b, off), _| {
             let sp = b.space();
             if !is_reg(sp) {
@@ -1047,7 +1045,7 @@ mod tests {
         });
         // A plain caller-frame `@SP - 4` cell, for contrast: its base is the `@SP`
         // param (classified CallerFrame), so it is not own-frame-private.
-        let caller_slot = Base::Symbolic(ram, sp);
+        let caller_slot = Base::Symbolic(ram.into(), sp);
         mf.byte_map.insert(
             (caller_slot, -4),
             Cell {
@@ -1056,7 +1054,7 @@ mod tests {
             },
         );
 
-        let realigned = Base::Symbolic(ram, aligned);
+        let realigned = Base::Symbolic(ram.into(), aligned);
         assert!(
             mf.byte_map.contains_key(&(realigned, -0x78)),
             "spill recorded at the realigned own-frame base"
@@ -1167,8 +1165,8 @@ mod tests {
         }
 
         let ram = tc.ctx.shared.default_space;
-        let symbolic = Base::Symbolic(ram, ValueId::Varnode(tc.r1));
-        let pinned = Base::Pinned(ram);
+        let symbolic = Base::Symbolic(ram.into(), ValueId::Varnode(tc.r1));
+        let pinned = Base::Pinned(ram.into());
         let src = ValueId::Varnode(tc.r2);
 
         let mut mf = MemForward::default();
@@ -1239,7 +1237,7 @@ mod tests {
 
         let mut value_to_interval = HashMap::default();
         if pin_arg {
-            value_to_interval.insert(arg, (ram, 0x40u64, 0x48u64));
+            value_to_interval.insert(arg, (ram.into(), 0x40u64, 0x48u64));
         }
         let aliases = AliasResult {
             value_to_root: HashMap::default(),
@@ -1247,7 +1245,7 @@ mod tests {
             frame: None,
         };
 
-        let pinned = Base::Pinned(ram);
+        let pinned = Base::Pinned(ram.into());
         let src = ValueId::Varnode(tc.r2);
         let mut mf = MemForward::default();
         mf.byte_map.insert((pinned, 0x40), Cell { src, src_off: 0 });
@@ -1313,6 +1311,9 @@ mod tests {
         // never writes real `ram`.
         let scratch = tc.ctx.make_temp_space();
         let ram = tc.ctx.shared.default_space;
+        let caller_scratch =
+            tc.ctx.bodies[caller].push_temp_space(TempSpace::new(Some("caller-scratch"), 1, 8));
+        let caller_scratch = LocalMemorySpaceId::Temp(caller_scratch.local);
         FunctionBody::from_id_mut(&mut tc.ctx, callee).set_written_spaces(Some(vec![scratch]));
 
         // The caller block ends in a direct call to `callee`, passing a frame
@@ -1323,14 +1324,17 @@ mod tests {
             unsafe { b.dont_finalize() };
         }
 
-        let ram_cell = Base::Symbolic(ram, ValueId::Varnode(tc.r1));
-        let scratch_cell = Base::Symbolic(scratch, ValueId::Varnode(tc.r2));
+        let ram_cell = Base::Symbolic(ram.into(), ValueId::Varnode(tc.r1));
+        let scratch_cell = Base::Symbolic(scratch.into(), ValueId::Varnode(tc.r2));
+        let caller_scratch_cell = Base::Symbolic(caller_scratch, ValueId::Varnode(tc.r2));
         let src = ValueId::Varnode(tc.r2);
 
         let mut mf = MemForward::default();
         mf.byte_map.insert((ram_cell, 0), Cell { src, src_off: 0 });
         mf.byte_map
             .insert((scratch_cell, 0), Cell { src, src_off: 0 });
+        mf.byte_map
+            .insert((caller_scratch_cell, 0), Cell { src, src_off: 0 });
 
         mf.prune_clobbered_by_call(qcode::value::ModuleView::new(&tc.ctx), block, None);
 
@@ -1341,6 +1345,10 @@ mod tests {
         assert!(
             !mf.byte_map.contains_key(&(scratch_cell, 0)),
             "a cell in a space the callee does write is still dropped"
+        );
+        assert!(
+            mf.byte_map.contains_key(&(caller_scratch_cell, 0)),
+            "a callee cannot clobber its caller's body-local scratch"
         );
     }
 }

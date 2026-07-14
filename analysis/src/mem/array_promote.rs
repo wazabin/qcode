@@ -26,10 +26,10 @@ use rustc_hash::FxHashSet as HashSet;
 
 use qcode::{
     builder::{Builder, BuilderBacking},
-    space::{LocalMemorySpaceId, Space, SpaceId, SpaceType},
+    space::{LocalMemorySpaceId, Space, SpaceType},
     types::TypeId,
     value::{
-        BlockId, FunctionId, QCodeView, ValueId,
+        BlockId, FunctionId, QCodeView, TempSpaceId, ValueId,
         insn::{Branch, CBranch, InstructionId, IntrinsicApp, IntrinsicId, Load, Mnemonic},
         util::{base_ref::BaseRef, pass_backing::PassBacking},
     },
@@ -61,7 +61,7 @@ struct PromoteMatch {
     /// Pre-loop element-0 seed store; `None` for a seedless indexed fill.
     seed: Option<Seed>,
     /// The RAM/Temporary space the region lives in (word size 1).
-    region_space: SpaceId,
+    region_space: LocalMemorySpaceId,
     /// The one strided lane store, writing element `index + store_delta`.
     lane_store_id: InstructionId,
     stored_val: ValueId,
@@ -105,16 +105,15 @@ fn try_match<'a, 'str: 'a>(
         block: BlockId,
         ptr: ValueId,
         size: usize,
-        space: SpaceId,
+        space: LocalMemorySpaceId,
         stored: Option<ValueId>,
     }
-    let is_ram = |sp: LocalMemorySpaceId| {
-        sp.shared().is_some_and(|sp| {
-            matches!(
-                Space::from_id(host.shared(), sp).ty,
-                SpaceType::Ram | SpaceType::Temporary
-            )
-        })
+    let is_ram = |sp: LocalMemorySpaceId| match sp {
+        LocalMemorySpaceId::Shared(sp) => matches!(
+            Space::from_id(host.shared(), sp).ty,
+            SpaceType::Ram | SpaceType::Temporary
+        ),
+        LocalMemorySpaceId::Temp(_) => true,
     };
     let mut accesses: Vec<Acc> = Vec::new();
     for block in host.function_ref(fid).iter() {
@@ -126,7 +125,7 @@ fn try_match<'a, 'str: 'a>(
                     block: bid,
                     ptr: l.ptr.qualify(insn.id.func),
                     size: l.size,
-                    space: l.space.expect_shared(),
+                    space: l.space,
                     stored: None,
                 }),
                 Mnemonic::Store(s) if is_ram(s.space) => accesses.push(Acc {
@@ -134,7 +133,7 @@ fn try_match<'a, 'str: 'a>(
                     block: bid,
                     ptr: s.ptr.qualify(insn.id.func),
                     size: s.size,
-                    space: s.space.expect_shared(),
+                    space: s.space,
                     stored: Some(s.src.qualify(insn.id.func)),
                 }),
                 _ => {}
@@ -157,7 +156,7 @@ fn try_match<'a, 'str: 'a>(
         c_lane: i64,
         body: BlockId,
         esz: usize,
-        space: SpaceId,
+        space: LocalMemorySpaceId,
     }
     let mut lane: Option<Lane> = None;
     for a in &accesses {
@@ -199,7 +198,13 @@ fn try_match<'a, 'str: 'a>(
         return None;
     }
     // v1 works in bytes, so require a byte-addressed region.
-    if Space::from_id(host.shared(), region_space).word_size != 1 {
+    let word_size = match region_space {
+        LocalMemorySpaceId::Shared(space) => Space::from_id(host.shared(), space).word_size,
+        LocalMemorySpaceId::Temp(local) => host
+            .temp_space_ref(TempSpaceId::new(fid, local))
+            .word_size(),
+    };
+    if word_size != 1 {
         return None;
     }
     let in_region = |a: &Acc| a.space == region_space;
@@ -597,7 +602,7 @@ fn apply_generic<'str>(host: &mut PassBacking<'_, 'str>, m: &PromoteMatch) -> bo
             m.preheader,
             term_id,
             Mnemonic::Load(Load {
-                space: m.region_space.into(),
+                space: m.region_space,
                 ptr: dst.localize(m.preheader.func),
                 size: arr_sz,
             }),

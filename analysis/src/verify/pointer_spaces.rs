@@ -4,7 +4,7 @@ use std::collections::HashMap;
 
 use qcode::{
     context::Context,
-    space::SpaceId,
+    space::MemorySpaceId,
     value::{ValueId, insn::Mnemonic},
 };
 
@@ -15,7 +15,7 @@ use qcode::{
 /// the runtime assertion in `alias::simple`, surfaced here so `verify_after` pins it
 /// to the pass that produced it rather than to whichever pass next runs alias.
 pub fn verify_pointer_spaces(ctx: &Context) -> Vec<String> {
-    let mut seen: HashMap<ValueId, SpaceId> = HashMap::new();
+    let mut seen: HashMap<ValueId, MemorySpaceId> = HashMap::new();
     let mut out = Vec::new();
     for insn in ctx.instructions() {
         let (ptr, space) = match insn.mnemonic() {
@@ -23,13 +23,14 @@ pub fn verify_pointer_spaces(ctx: &Context) -> Vec<String> {
             Mnemonic::Store(s) => (s.ptr.qualify(insn.id.func), s.space),
             _ => continue,
         };
+        let space = space.qualify(insn.id.func);
         match seen.get(&ptr) {
             Some(&prev) if prev != space => out.push(format!(
                 "pointer {ptr:?} used in multiple spaces ({prev:?} vs {space:?})"
             )),
             Some(_) => {}
             None => {
-                seen.insert(ptr, space.expect_shared());
+                seen.insert(ptr, space);
             }
         }
     }

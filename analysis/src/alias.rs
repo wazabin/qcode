@@ -4,7 +4,7 @@ use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
 
 use qcode::{
     assumption::Proposition,
-    space::SpaceId,
+    space::LocalMemorySpaceId,
     value::{
         BlockId, FunctionId, QCodeView, ValueId, ValueRef, VarnodeId,
         insn::{Binop, IntBinop, Mnemonic},
@@ -74,7 +74,7 @@ pub struct AliasResult {
     /// Exact byte intervals for pointer values whose location could be
     /// statically resolved: `(space_id, byte_start, byte_end)`.
     /// Populated by location-aware analyses (e.g. `simple`); empty otherwise.
-    pub(crate) value_to_interval: HashMap<ValueId, (SpaceId, u64, u64)>,
+    pub(crate) value_to_interval: HashMap<ValueId, (LocalMemorySpaceId, u64, u64)>,
     /// Frame-freshness context, when populated (see [`AliasResult::provably_disjoint`]).
     pub(crate) frame: Option<FrameInfo>,
 }
@@ -89,7 +89,7 @@ impl AliasResult {
     /// The exact byte interval `(space, start, end)` of `a`, when a
     /// location-aware analysis (e.g. [`AliasResult::simple`]) could statically
     /// resolve it. Returns `None` for values with no precise location.
-    pub fn interval(&self, a: ValueId) -> Option<(SpaceId, u64, u64)> {
+    pub fn interval(&self, a: ValueId) -> Option<(LocalMemorySpaceId, u64, u64)> {
         self.value_to_interval.get(&a).copied()
     }
 
@@ -596,11 +596,11 @@ mod tests {
         let sb = ctx.add_space(space_b);
 
         let value_to_interval = HashMap::from_iter([
-            (value(0), (sa, 0, 8)),
-            (value(1), (sa, 0, 4)),
-            (value(2), (sa, 4, 8)),
-            (value(3), (sa, 0, 8)),
-            (value(4), (sb, 0, 8)),
+            (value(0), (sa.into(), 0, 8)),
+            (value(1), (sa.into(), 0, 4)),
+            (value(2), (sa.into(), 4, 8)),
+            (value(3), (sa.into(), 0, 8)),
+            (value(4), (sb.into(), 0, 8)),
         ]);
         AliasResult {
             value_to_root: HashMap::default(),

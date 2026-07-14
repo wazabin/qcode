@@ -23,7 +23,7 @@
 
 use qcode::{
     builder::{Builder, BuilderBacking},
-    space::{LocalMemorySpaceId, Space, SpaceId, SpaceType},
+    space::{LocalMemorySpaceId, Space, SpaceType},
     types::TypeId,
     value::{
         FunctionId, QCodeView, ValueId,
@@ -75,7 +75,7 @@ struct Acc {
     id: InstructionId,
     ptr: ValueId,
     size: usize,
-    space: SpaceId,
+    space: LocalMemorySpaceId,
     stored: Option<ValueId>,
 }
 
@@ -97,9 +97,7 @@ fn try_match<'a, 'str: 'a>(host: impl QCodeView<'a, 'str>, fid: FunctionId) -> O
         LocalMemorySpaceId::Shared(sp) => {
             matches!(Space::from_id(host.shared(), sp).ty, SpaceType::Temporary)
         }
-        // This pass still records its candidate region as a shared `SpaceId`.
-        // Body-local regions are left for the later consumer-migration commit.
-        LocalMemorySpaceId::Temp(_) => false,
+        LocalMemorySpaceId::Temp(_) => true,
     };
     let mut accesses: Vec<Acc> = Vec::new();
     for block in host.function_ref(fid).iter() {
@@ -109,14 +107,14 @@ fn try_match<'a, 'str: 'a>(host: impl QCodeView<'a, 'str>, fid: FunctionId) -> O
                     id: insn.id,
                     ptr: l.ptr.qualify(insn.id.func),
                     size: l.size,
-                    space: l.space.expect_shared(),
+                    space: l.space,
                     stored: None,
                 }),
                 Mnemonic::Store(s) if is_temp(s.space) => accesses.push(Acc {
                     id: insn.id,
                     ptr: s.ptr.qualify(insn.id.func),
                     size: s.size,
-                    space: s.space.expect_shared(),
+                    space: s.space,
                     stored: Some(s.src.qualify(insn.id.func)),
                 }),
                 _ => {}
