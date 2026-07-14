@@ -1,9 +1,8 @@
 //! Flag-idiom sub-pass: collapse x86 signed-compare flag chains.
 
 use qcode::value::{
-    FunctionId, ValueId,
+    FunctionId, QCodeView, ValueId,
     insn::{Binary, Binop, IntBinop, Mnemonic},
-    util::base_ref::HostRef,
 };
 
 use super::fold::const_value;
@@ -19,7 +18,7 @@ use crate::{ContextView, FunctionBody};
 pub(super) struct FlagIdiom;
 
 /// The function-pass [`SubPassC`] impl (context-split stage 5b-ii):
-/// `simplify_flag_idiom` reads through `cx.read_host(body)` and the rewrite
+/// `simplify_flag_idiom` reads through `cx.body_view(body)` and the rewrite
 /// materializes through `Editor::replace_with_new_insn_c`.
 impl<'str> SubPassC<'str> for FlagIdiom {
     fn init_state(&self) -> Box<dyn Any> {
@@ -41,7 +40,7 @@ impl<'str> SubPassC<'str> for FlagIdiom {
         if ic.mnemonic.is_terminator() || ic.size == 0 {
             return Claim::Pass;
         }
-        match simplify_flag_idiom(cx.read_host(body), ic.insn_id.func, ic.mnemonic) {
+        match simplify_flag_idiom(cx.body_view(body), ic.insn_id.func, ic.mnemonic) {
             Some(new_mnemonic) => {
                 ed.replace_with_new_insn_c(
                     body,
@@ -59,7 +58,11 @@ impl<'str> SubPassC<'str> for FlagIdiom {
 }
 
 /// If `v` is defined by an `IntBinop::want` binop, return its `(lhs, rhs)`.
-fn as_int_binop(host: HostRef, v: ValueId, want: IntBinop) -> Option<(ValueId, ValueId)> {
+fn as_int_binop<'a, 'str: 'a>(
+    host: impl QCodeView<'a, 'str>,
+    v: ValueId,
+    want: IntBinop,
+) -> Option<(ValueId, ValueId)> {
     let ValueId::Instruction(id) = v else {
         return None;
     };
@@ -74,7 +77,10 @@ fn as_int_binop(host: HostRef, v: ValueId, want: IntBinop) -> Option<(ValueId, V
 }
 
 /// If `v` is defined by an `sborrow`, return its `(lhs, rhs)`.
-fn as_sborrow(host: HostRef, v: ValueId) -> Option<(ValueId, ValueId)> {
+fn as_sborrow<'a, 'str: 'a>(
+    host: impl QCodeView<'a, 'str>,
+    v: ValueId,
+) -> Option<(ValueId, ValueId)> {
     let ValueId::Instruction(id) = v else {
         return None;
     };
@@ -95,8 +101,8 @@ fn as_sborrow(host: HostRef, v: ValueId) -> Option<(ValueId, ValueId)> {
 /// ```
 /// Returns the rewritten `SLess(a, b)` mnemonic. The original `sborrow`/`sub`/
 /// `slt` instructions are left for DCE to remove once their last use is gone.
-pub(super) fn simplify_flag_idiom(
-    host: HostRef,
+pub(super) fn simplify_flag_idiom<'a, 'str: 'a>(
+    host: impl QCodeView<'a, 'str>,
     func: FunctionId,
     m: &Mnemonic,
 ) -> Option<Mnemonic> {
@@ -115,7 +121,7 @@ pub(super) fn simplify_flag_idiom(
     let resolve = |sborrow_side: ValueId, slt_side: ValueId| -> Option<(ValueId, ValueId)> {
         let (a, b) = as_sborrow(host, sborrow_side)?;
         let (sub_v, zero) = as_int_binop(host, slt_side, IntBinop::SLess)?;
-        if const_value(host.shr(), zero) != Some(0) {
+        if const_value(host.shared(), zero) != Some(0) {
             return None;
         }
         let (sa, sb) = as_int_binop(host, sub_v, IntBinop::Sub)?;

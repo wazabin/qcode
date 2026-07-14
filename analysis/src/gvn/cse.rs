@@ -14,7 +14,7 @@
 //! key/emit split, and idempotence argument.
 
 use qcode::value::{
-    LocalValueId, ValueId,
+    LocalValueId, QCodeView, ValueId,
     insn::{Binop, FloatBinop, IntBinop, Mnemonic},
 };
 
@@ -29,12 +29,12 @@ use qcode::context::Context;
 use crate::{ContextView, FunctionBody};
 
 /// CSE numbers pure values down a whole dominator tree. Fully backing-routed (the
-/// value-numbering reads through a [`HostRef`](qcode::value::util::base_ref::HostRef)
-/// and rebuilds canonical forms through the body's inherent verbs), so it runs on the function-pass path.
+/// value-numbering reads through `BodyView` and rebuilds canonical forms through
+/// the body's inherent verbs), so it runs on the function-pass path.
 pub(super) struct Cse;
 
 /// The function-pass [`SubPassC`] impl (context-split stage 5b-ii): reads
-/// route through `cx.read_host(body)`, shallow forwards through `Editor`'s `_c`
+/// route through `cx.body_view(body)`, shallow forwards through `Editor`'s `_c`
 /// methods, and the in-place canonical rebuild runs through `materialize_c` over
 /// `&mut PassBacking`.
 impl<'str> SubPassC<'str> for Cse {
@@ -81,7 +81,7 @@ impl<'str> SubPassC<'str> for Cse {
         }
         let state = state.downcast_mut::<Numbering>().expect("cse state");
 
-        let form = arith_form(cx.read_host(body), ic.id, ic.mnemonic, ic.size, state);
+        let form = arith_form(cx.body_view(body), ic.id, ic.mnemonic, ic.size, state);
         state.record_form(ic.id, form.clone());
         let key = key_for(&form, ic.id, ic.mnemonic);
 
@@ -102,7 +102,7 @@ impl<'str> SubPassC<'str> for Cse {
         match key {
             NormalForm::Opaque(_) => state.claim(key, ic.id),
             _ => {
-                let root_ty = cx.read_host(body).type_of(ic.id);
+                let root_ty = cx.body_view(body).type_of(ic.id);
                 let v = materialize_c(
                     body,
                     cx,
