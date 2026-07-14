@@ -37,10 +37,9 @@ use qcode::{
     assumption::Proposition,
     space::{Space, SpaceId, SpaceType},
     value::{
-        FunctionId, LocalValueId, Value, ValueId, ValueRef, Varnode, VarnodeId,
+        FunctionId, LocalValueId, QCodeView, Value, ValueId, ValueRef, Varnode, VarnodeId,
         block::BlockId,
         insn::{Binary, Binop, IntBinop, Load, Mnemonic, Range, Store, Zext},
-        util::base_ref::HostRef,
     },
 };
 
@@ -114,7 +113,12 @@ fn locate(
 /// info (isolated values) or an `Unknown` class is **not** proof: such pairs
 /// are treated as possibly-aliasing, so a forwarded cell is dropped on any
 /// doubt.
-fn proven_disjoint(host: HostRef, aliases: Option<&AliasResult>, a: ValueId, b: ValueId) -> bool {
+fn proven_disjoint<'ctx, 'str: 'ctx>(
+    host: impl QCodeView<'ctx, 'str>,
+    aliases: Option<&AliasResult>,
+    a: ValueId,
+    b: ValueId,
+) -> bool {
     let Some(aliases) = aliases else { return false };
     // Frame freshness: an own-frame local and an incoming pointer never alias.
     if aliases.provably_disjoint(host, a, b) {
@@ -130,8 +134,8 @@ fn proven_disjoint(host: HostRef, aliases: Option<&AliasResult>, a: ValueId, b: 
 /// (whose pointer value is `ptr`), i.e. the cell can be kept across the access.
 /// Only meaningful when `cb != base`. Conservative: returns `false` (not
 /// disjoint) whenever disjointness cannot be proven.
-fn cross_base_disjoint(
-    host: HostRef,
+fn cross_base_disjoint<'ctx, 'str: 'ctx>(
+    host: impl QCodeView<'ctx, 'str>,
     aliases: Option<&AliasResult>,
     ptr: ValueId,
     base: Base,
@@ -230,13 +234,13 @@ impl MemForward {
         let end = start + store.size as i64;
 
         self.byte_map.retain(|&(cb, _), _| {
-            cb == base || cross_base_disjoint(cx.read_host(body), aliases, store_ptr, base, cb)
+            cb == base || cross_base_disjoint(cx.body_view(body), aliases, store_ptr, base, cb)
         });
 
         for off in start..end {
             self.byte_map.remove(&(base, off));
         }
-        let covered = ValueRef::from_host(cx.read_host(body), store_src)
+        let covered = ValueRef::from_view(cx.body_view(body), store_src)
             .size()
             .min(store.size);
         for (i, off) in (start..start + covered as i64).enumerate() {
@@ -249,7 +253,10 @@ impl MemForward {
             );
         }
         if covered < store.size {
-            let zero = cx.read_host(body).shr().get_const(0, store.size - covered);
+            let zero = cx
+                .body_view(body)
+                .shared()
+                .get_const(0, store.size - covered);
             for (i, off) in (start + covered as i64..end).enumerate() {
                 self.byte_map.insert(
                     (base, off),
@@ -288,7 +295,7 @@ impl MemForward {
             && segments[0].load_off == 0
             && segments[0].size == load_size
             && segments[0].src_off == 0
-            && ValueRef::from_host(cx.read_host(body), segments[0].src).size() == load_size
+            && ValueRef::from_view(cx.body_view(body), segments[0].src).size() == load_size
         {
             segments[0].src
         } else if load_size > 8 {
@@ -340,7 +347,7 @@ impl MemForward {
         segments: &[Segment],
         load_size: usize,
     ) -> Option<ValueId> {
-        let ctx = cx.read_host(body).shr();
+        let ctx = cx.body_view(body).shared();
         let mut buf = vec![0u8; load_size];
         for seg in segments {
             let bytes: Vec<u8> = match seg.src {
@@ -375,7 +382,7 @@ impl MemForward {
         seg: &Segment,
         load_size: usize,
     ) -> ValueId {
-        let src_size = ValueRef::from_host(cx.read_host(body), seg.src).size();
+        let src_size = ValueRef::from_view(cx.body_view(body), seg.src).size();
         let extracted = if seg.src_off == 0 && src_size == seg.size {
             seg.src
         } else {
@@ -411,8 +418,8 @@ impl MemForward {
             return widened;
         }
         let shamt = cx
-            .read_host(body)
-            .shr()
+            .body_view(body)
+            .shared()
             .get_const((seg.load_off * 8) as u64, load_size);
         let s = body.push_mnemonic(
             cx.shr(),
@@ -429,9 +436,9 @@ impl MemForward {
 
     /// Drop everything the call terminating `block_id` (if any) may clobber, so
     /// no forwarded register value survives across it. Non-call blocks are no-ops.
-    pub(super) fn prune_clobbered_by_call(
+    pub(super) fn prune_clobbered_by_call<'ctx, 'str: 'ctx>(
         &mut self,
-        host: HostRef,
+        host: impl QCodeView<'ctx, 'str>,
         block_id: BlockId,
         aliases: Option<&AliasResult>,
     ) {
@@ -460,8 +467,10 @@ impl MemForward {
         // private scratch space leave the caller's spilled-pointer cell intact.
         let callee_written_spaces: Option<Vec<SpaceId>> = match &term {
             Some(Mnemonic::Call(call)) => call.target.real().and_then(|target| {
-                host.function_ref(target)
-                    .written_spaces()
+                host.interface(target)
+                    .signature
+                    .as_ref()
+                    .and_then(|s| s.written_spaces.as_deref())
                     .map(<[_]>::to_vec)
             }),
             _ => None,
@@ -485,8 +494,12 @@ impl MemForward {
                     true,
                 ),
                 Some(target) => {
-                    let callee = host.function_ref(target);
-                    let regs = match callee.clobbered_regs() {
+                    let callee = host.interface(target);
+                    let regs = match callee
+                        .signature
+                        .as_ref()
+                        .and_then(|s| s.clobbered.as_deref())
+                    {
                         Some(regs) => CallClobbers::Regs(regs.to_vec()),
                         None => CallClobbers::AllRegisters,
                     };
@@ -500,7 +513,14 @@ impl MemForward {
                         .args
                         .iter()
                         .enumerate()
-                        .filter(|&(j, _)| !callee.param_attr(j).is_some_and(|a| a.readonly))
+                        .filter(|&(j, _)| {
+                            !callee
+                                .signature
+                                .as_ref()
+                                .and_then(|s| s.param_attrs.as_ref())
+                                .and_then(|attrs| attrs.get(j))
+                                .is_some_and(|a| a.readonly)
+                        })
                         .map(|(_, &v)| qual(v))
                         .chain(call.clobbers.iter().map(|&c| qual(c)))
                         .collect();
@@ -532,7 +552,7 @@ impl MemForward {
             })
         };
 
-        let is_reg = |space| matches!(Space::from_id(host.shr(), space).ty, SpaceType::Register);
+        let is_reg = |space| matches!(Space::from_id(host.shared(), space).ty, SpaceType::Register);
 
         // PROTOTYPE (realigned-frame): frame freshness extended from stores to
         // calls. A symbolic RAM cell whose base is an own-frame local the callee
@@ -579,7 +599,7 @@ impl MemForward {
                 Base::Pinned(_) => match &clobbers {
                     CallClobbers::AllRegisters => false,
                     CallClobbers::Regs(regs) => !regs.iter().any(|&r| {
-                        let vn = Varnode::from_id(host.shr(), r);
+                        let vn = Varnode::from_id(host.shared(), r);
                         vn.space().id == space
                             && vn.address() <= off
                             && off < vn.address() + vn.size() as i64
@@ -601,12 +621,15 @@ impl MemForward {
     /// a slot is disjoint from that slot — no self-referential `*pp == &pp`), the
     /// same assumption the alias oracle's spilled-reload rules use. Off → the
     /// conservative opaque-pointer prune.
-    pub(super) fn loaded_ptr_peeling(host: HostRef, block_id: BlockId) -> bool {
+    pub(super) fn loaded_ptr_peeling<'ctx, 'str: 'ctx>(
+        host: impl QCodeView<'ctx, 'str>,
+        block_id: BlockId,
+    ) -> bool {
         host.block_ref(block_id)
             .function()
             .map(|f| f.id)
             .is_some_and(|fid| {
-                host.shr()
+                host.shared()
                     .truth(Proposition::LoadedPointerDisjointFromSlot(fid))
                     .is_some_and(|t| t.value)
             })
@@ -616,9 +639,9 @@ impl MemForward {
     /// by a single source value of the same width (an *exact* reload), return that
     /// value. This is the same single-segment cover [`try_load`] forwards on, used
     /// here to peel a spilled-pointer reload before disjointness testing.
-    fn reload_forwards_to(
+    fn reload_forwards_to<'ctx, 'str: 'ctx>(
         &self,
-        host: HostRef,
+        host: impl QCodeView<'ctx, 'str>,
         v: ValueId,
         aliases: Option<&AliasResult>,
         numbering: &Numbering,
@@ -635,7 +658,7 @@ impl MemForward {
         (seg.load_off == 0
             && seg.size == load.size
             && seg.src_off == 0
-            && ValueRef::from_host(host, seg.src).size() == load.size)
+            && ValueRef::from_view(host, seg.src).size() == load.size)
             .then_some(seg.src)
     }
 
@@ -649,9 +672,9 @@ impl MemForward {
     /// what breaks the chicken-and-egg where the buffer-fill stores (through the
     /// not-yet-forwarded reload) would otherwise drop the very spill cell the
     /// reload needs to forward.
-    fn resolve_loaded_ptr(
+    fn resolve_loaded_ptr<'ctx, 'str: 'ctx>(
         &self,
-        host: HostRef,
+        host: impl QCodeView<'ctx, 'str>,
         ptr: ValueId,
         space: SpaceId,
         aliases: Option<&AliasResult>,
@@ -679,9 +702,9 @@ impl MemForward {
 
     /// At a loop header, drop forwarded values a store inside the loop may
     /// overwrite on a later iteration. Non-headers are left untouched.
-    pub(super) fn prune_loop_carried(
+    pub(super) fn prune_loop_carried<'ctx, 'str: 'ctx>(
         &mut self,
-        host: HostRef,
+        host: impl QCodeView<'ctx, 'str>,
         block_id: BlockId,
         tree: &DominatorTree<BlockId>,
         aliases: Option<&AliasResult>,
@@ -996,7 +1019,7 @@ mod tests {
         };
 
         let aliases = AliasResult::simple_for_function(&tc.ctx, fid).with_frame_freshness(
-            &tc.ctx,
+            qcode::value::ModuleView::new(&tc.ctx),
             fid,
             Some(sp_reg),
         );
@@ -1023,7 +1046,7 @@ mod tests {
             "spill recorded at the realigned own-frame base"
         );
 
-        mf.prune_clobbered_by_call((&tc.ctx).into(), root, Some(&aliases));
+        mf.prune_clobbered_by_call(qcode::value::ModuleView::new(&tc.ctx), root, Some(&aliases));
 
         assert!(
             mf.byte_map.contains_key(&(realigned, -0x78)),
@@ -1136,7 +1159,7 @@ mod tests {
         mf.byte_map.insert((symbolic, 0), Cell { src, src_off: 0 });
         mf.byte_map.insert((pinned, 0x40), Cell { src, src_off: 0 });
 
-        mf.prune_clobbered_by_call((&tc.ctx).into(), block, None);
+        mf.prune_clobbered_by_call(qcode::value::ModuleView::new(&tc.ctx), block, None);
 
         assert!(
             !mf.byte_map.contains_key(&(symbolic, 0)),
@@ -1212,7 +1235,11 @@ mod tests {
         let src = ValueId::Varnode(tc.r2);
         let mut mf = MemForward::default();
         mf.byte_map.insert((pinned, 0x40), Cell { src, src_off: 0 });
-        mf.prune_clobbered_by_call((&tc.ctx).into(), block, Some(&aliases));
+        mf.prune_clobbered_by_call(
+            qcode::value::ModuleView::new(&tc.ctx),
+            block,
+            Some(&aliases),
+        );
         mf.byte_map.contains_key(&(pinned, 0x40))
     }
 
@@ -1289,7 +1316,7 @@ mod tests {
         mf.byte_map
             .insert((scratch_cell, 0), Cell { src, src_off: 0 });
 
-        mf.prune_clobbered_by_call((&tc.ctx).into(), block, None);
+        mf.prune_clobbered_by_call(qcode::value::ModuleView::new(&tc.ctx), block, None);
 
         assert!(
             mf.byte_map.contains_key(&(ram_cell, 0)),

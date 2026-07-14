@@ -52,7 +52,7 @@ fn separate_varnodes_do_not_alias() {
 
     let result = AliasResult::simple_for_function(&ctx, ctx.function_ids()[0]);
     assert!(
-        !result.may_alias(&ctx, A.into(), B.into()),
+        !result.may_alias(qcode::value::ModuleView::new(&ctx), A.into(), B.into()),
         "distinct non-overlapping varnodes in the same space must not alias"
     );
 }
@@ -77,7 +77,7 @@ fn complex_operations_in_same_space_become_may_alias() {
 
     let result = AliasResult::simple_for_function(&ctx, ctx.function_ids()[0]);
     assert!(
-        result.may_alias(&ctx, ptr.into(), A.into()),
+        result.may_alias(qcode::value::ModuleView::new(&ctx), ptr.into(), A.into()),
         "IR-derived pointer expressions should conservatively become may-alias"
     );
 }
@@ -102,7 +102,7 @@ fn complex_operations_in_other_space_do_not_alias() {
 
     let result = AliasResult::simple_for_function(&ctx, ctx.function_ids()[0]);
     assert!(
-        !result.may_alias(&ctx, ptr.into(), B.into()),
+        !result.may_alias(qcode::value::ModuleView::new(&ctx), ptr.into(), B.into()),
         "IR-derived pointer expressions in other spaces should not become may-alias"
     );
 }
@@ -121,7 +121,11 @@ fn overlapping_registers_alias() {
     let fid = ctx.anon_function();
     let result = AliasResult::simple_for_function(&ctx, fid);
     assert!(
-        result.may_alias(&ctx, r0.into(), r0_lo32.into()),
+        result.may_alias(
+            qcode::value::ModuleView::new(&ctx),
+            r0.into(),
+            r0_lo32.into()
+        ),
         "overlapping registers in the same space must alias"
     );
 }
@@ -183,7 +187,7 @@ fn pointer_literals_are_tracked() {
         "pointer literals used for memory accesses should appear in alias analysis"
     );
     assert!(
-        result.may_alias(&ctx, literal_ptr, r0.into()),
+        result.may_alias(qcode::value::ModuleView::new(&ctx), literal_ptr, r0.into()),
         "literal register address should alias the overlapping register varnode"
     );
 }
@@ -268,9 +272,12 @@ fn repeated_literal_uses_share_one_range_entry() {
     let l2 = l2.unwrap();
     let result = AliasResult::simple_for_function(&ctx, ctx.function_ids()[0]);
 
-    assert!(result.may_alias(&ctx, l1, a.into()), "l1 overlaps A");
     assert!(
-        result.may_alias(&ctx, l1, l2),
+        result.may_alias(qcode::value::ModuleView::new(&ctx), l1, a.into()),
+        "l1 overlaps A"
+    );
+    assert!(
+        result.may_alias(qcode::value::ModuleView::new(&ctx), l1, l2),
         "a later overlapping literal still merges with the deduped one"
     );
     assert_eq!(
@@ -303,7 +310,7 @@ fn same_literal_wider_second_use_still_merges() {
     let result = AliasResult::simple_for_function(&ctx, ctx.function_ids()[0]);
 
     assert!(
-        result.may_alias(&ctx, lit, a.into()),
+        result.may_alias(qcode::value::ModuleView::new(&ctx), lit, a.into()),
         "the wider second use of the literal overlaps A and must merge with it"
     );
     assert_eq!(
@@ -336,9 +343,9 @@ fn literal_straddles_two_disjoint_varnode_classes_joins_them() {
     let literal_ptr = literal_ptr.unwrap();
     let result = AliasResult::simple_for_function(&ctx, ctx.function_ids()[0]);
 
-    assert!(result.may_alias(&ctx, literal_ptr, a.into()));
-    assert!(result.may_alias(&ctx, literal_ptr, b.into()));
-    assert!(result.may_alias(&ctx, a.into(), b.into()));
+    assert!(result.may_alias(qcode::value::ModuleView::new(&ctx), literal_ptr, a.into()));
+    assert!(result.may_alias(qcode::value::ModuleView::new(&ctx), literal_ptr, b.into()));
+    assert!(result.may_alias(qcode::value::ModuleView::new(&ctx), a.into(), b.into()));
 }
 
 #[test]
@@ -361,7 +368,11 @@ fn two_literal_pointers_same_addr_alias_without_varnode() {
     });
 
     let result = AliasResult::simple_for_function(&ctx, ctx.function_ids()[0]);
-    assert!(result.may_alias(&ctx, lit1.unwrap(), lit2.unwrap()));
+    assert!(result.may_alias(
+        qcode::value::ModuleView::new(&ctx),
+        lit1.unwrap(),
+        lit2.unwrap()
+    ));
 }
 
 #[test]
@@ -381,7 +392,11 @@ fn two_literal_pointers_overlapping_ranges_alias() {
     });
 
     let result = AliasResult::simple_for_function(&ctx, ctx.function_ids()[0]);
-    assert!(result.may_alias(&ctx, lit1.unwrap(), lit2.unwrap()));
+    assert!(result.may_alias(
+        qcode::value::ModuleView::new(&ctx),
+        lit1.unwrap(),
+        lit2.unwrap()
+    ));
 }
 
 #[test]
@@ -407,7 +422,7 @@ fn two_literal_pointers_different_spaces_do_not_alias() {
     drop(builder);
 
     let result = AliasResult::simple_for_function(&ctx, ctx.function_ids()[0]);
-    assert!(!result.may_alias(&ctx, lit1, lit2));
+    assert!(!result.may_alias(qcode::value::ModuleView::new(&ctx), lit1, lit2));
 }
 
 #[test]
@@ -465,7 +480,7 @@ fn odd_pointer_arithmetic_degrades_to_unknown() {
 
     assert_eq!(result.alias_class(r.into()), Some(NodeId::Unknown));
     assert!(
-        result.may_alias(&ctx, r.into(), vn_a.into()),
+        result.may_alias(qcode::value::ModuleView::new(&ctx), r.into(), vn_a.into()),
         "an Unknown pointer conservatively may-aliases the operand varnode"
     );
 }
@@ -488,7 +503,11 @@ fn unresolvable_load_ptr_becomes_unknown_and_aliases_everything() {
 
     let result = AliasResult::simple_for_function(&ctx, ctx.function_ids()[0]);
     assert_eq!(result.alias_class(ptr1.into()), Some(NodeId::Unknown));
-    assert!(result.may_alias(&ctx, ptr1.into(), ptr2.into()));
+    assert!(result.may_alias(
+        qcode::value::ModuleView::new(&ctx),
+        ptr1.into(),
+        ptr2.into()
+    ));
 }
 
 #[test]
@@ -512,7 +531,11 @@ fn unresolvable_load_ptr_in_register_space_does_not_alias_registers() {
     let alias_class = result.alias_class(ptr.into());
     assert!(matches!(alias_class, Some(NodeId::Unknown)));
     assert!(
-        !result.may_alias(&test_ctx.ctx, ptr.into(), r0.into()),
+        !result.may_alias(
+            qcode::value::ModuleView::new(&test_ctx.ctx),
+            ptr.into(),
+            r0.into()
+        ),
         "register-space built pointers must not alias register varnodes"
     );
 }
@@ -538,7 +561,7 @@ fn store_then_load_invalidation_is_conservative_for_unknown_ptr() {
     );
 
     let aliases = AliasResult::simple_for_function(&ctx, ctx.function_ids()[0]);
-    assert!(aliases.may_alias(&ctx, A.into(), ptr.into()));
+    assert!(aliases.may_alias(qcode::value::ModuleView::new(&ctx), A.into(), ptr.into()));
 
     let mut block = BasicBlock::from_id_mut(&mut ctx, block);
     assert!(block.instruction_ids().contains(&after));
@@ -574,7 +597,11 @@ fn literal_with_high_bit_set_aliases_overlapping_literals() {
     });
 
     let result = AliasResult::simple_for_function(&ctx, ctx.function_ids()[0]);
-    assert!(result.may_alias(&ctx, lit1.unwrap(), lit2.unwrap()));
+    assert!(result.may_alias(
+        qcode::value::ModuleView::new(&ctx),
+        lit1.unwrap(),
+        lit2.unwrap()
+    ));
 }
 
 #[test]
@@ -596,7 +623,11 @@ fn literal_with_upper_junk_bits_is_masked_to_size() {
     });
 
     let result = AliasResult::simple_for_function(&ctx, ctx.function_ids()[0]);
-    assert!(result.may_alias(&ctx, literal_ptr.unwrap(), a.unwrap().into()));
+    assert!(result.may_alias(
+        qcode::value::ModuleView::new(&ctx),
+        literal_ptr.unwrap(),
+        a.unwrap().into()
+    ));
 }
 
 #[test]
@@ -631,11 +662,11 @@ fn untracked_value_may_alias_conservatively() {
         "precondition: q is genuinely untracked"
     );
     assert!(
-        result.may_alias(&ctx, q, p),
+        result.may_alias(qcode::value::ModuleView::new(&ctx), q, p),
         "an untracked value must answer may-alias, not no-alias"
     );
     assert!(
-        !result.may_alias(&ctx, p, p2),
+        !result.may_alias(qcode::value::ModuleView::new(&ctx), p, p2),
         "tracked non-overlapping literals still answer no-alias"
     );
 }
@@ -655,6 +686,10 @@ fn many_overlapping_subregisters_still_join_in_one_class() {
     let first = varnodes[0];
 
     for &varnode in &varnodes[1..] {
-        assert!(result.may_alias(&ctx, first.into(), varnode.into()));
+        assert!(result.may_alias(
+            qcode::value::ModuleView::new(&ctx),
+            first.into(),
+            varnode.into()
+        ));
     }
 }

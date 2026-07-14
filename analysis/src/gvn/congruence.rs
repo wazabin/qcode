@@ -17,7 +17,7 @@
 
 use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
 
-use qcode::value::{ValueId, insn::Mnemonic, util::base_ref::HostRef};
+use qcode::value::{QCodeView, ValueId, insn::Mnemonic};
 
 use super::affine::{NormalForm, Numbering};
 use super::cse::is_commutative;
@@ -70,7 +70,11 @@ impl Congruence {
     }
 
     /// The structural id of `v`. Equal ids ⟺ provably the same value.
-    pub(crate) fn id(&mut self, host: HostRef<'_, '_>, v: impl Into<ValueId>) -> SymId {
+    pub(crate) fn id<'ctx, 'str: 'ctx>(
+        &mut self,
+        host: impl QCodeView<'ctx, 'str>,
+        v: impl Into<ValueId>,
+    ) -> SymId {
         let v = v.into();
         if let Some(&s) = self.memo.get(&v) {
             return s;
@@ -87,13 +91,12 @@ impl Congruence {
 
     /// Whether `a` and `b` are structurally congruent. Test-only helper.
     #[cfg(test)]
-    pub(crate) fn congruent<'a, 'str: 'a>(
+    pub(crate) fn congruent<'ctx, 'str: 'ctx>(
         &mut self,
-        host: impl Into<HostRef<'a, 'str>>,
+        host: impl QCodeView<'ctx, 'str>,
         a: impl Into<ValueId>,
         b: impl Into<ValueId>,
     ) -> bool {
-        let host = host.into();
         let (a, b) = (a.into(), b.into());
         a == b || self.id(host, a) == self.id(host, b)
     }
@@ -108,7 +111,7 @@ impl Congruence {
         id
     }
 
-    fn compute(&mut self, host: HostRef<'_, '_>, v: ValueId) -> SymId {
+    fn compute<'ctx, 'str: 'ctx>(&mut self, host: impl QCodeView<'ctx, 'str>, v: ValueId) -> SymId {
         // Affine values flatten arithmetic structure (and unify reassociations).
         // A self-leaf (`1·v + 0`) means the op did not decompose — fall through
         // to op/leaf classification.
@@ -211,7 +214,7 @@ mod tests {
     use super::super::affine::precompute_forms_for_blocks;
     use super::*;
     use qcode::context::Context;
-    use qcode::value::{BlockId, FunctionId, FunctionRef};
+    use qcode::value::{BlockId, FunctionId, FunctionRef, ModuleView};
     use qcode_macro::qcode;
 
     fn engine(ctx: &Context, f: FunctionId) -> Congruence {
@@ -247,8 +250,8 @@ mod tests {
             "
         );
         let mut e = engine(&ctx, f);
-        assert!(e.congruent(&ctx, ab, ba), "a+b ≡ b+a");
-        assert!(!e.congruent(&ctx, sub1, sub2), "a-b ≢ b-a");
+        assert!(e.congruent(ModuleView::new(&ctx), ab, ba), "a+b ≡ b+a");
+        assert!(!e.congruent(ModuleView::new(&ctx), sub1, sub2), "a-b ≢ b-a");
     }
 
     /// A recomputed pure expression over the *same* leaves unifies even though
@@ -272,7 +275,10 @@ mod tests {
         );
         let mut e = engine(&ctx, f);
         assert_ne!(ab1, ab2, "distinct instructions");
-        assert!(e.congruent(&ctx, ab1, ab2), "recomputed a+b unifies");
+        assert!(
+            e.congruent(ModuleView::new(&ctx), ab1, ab2),
+            "recomputed a+b unifies"
+        );
     }
 
     /// Two distinct loads of the same address are NOT congruent: a load is an
@@ -295,7 +301,7 @@ mod tests {
         let mut e = engine(&ctx, f);
         assert_ne!(c1, c2);
         assert!(
-            !e.congruent(&ctx, c1, c2),
+            !e.congruent(ModuleView::new(&ctx), c1, c2),
             "two loads of &A are not congruent"
         );
     }
@@ -321,8 +327,14 @@ mod tests {
             "
         );
         let mut e = engine(&ctx, f);
-        assert!(e.congruent(&ctx, za1, za2), "zext(a) recomputed unifies");
-        assert!(!e.congruent(&ctx, za1, zb), "zext(a) ≢ zext(b)");
+        assert!(
+            e.congruent(ModuleView::new(&ctx), za1, za2),
+            "zext(a) recomputed unifies"
+        );
+        assert!(
+            !e.congruent(ModuleView::new(&ctx), za1, zb),
+            "zext(a) ≢ zext(b)"
+        );
     }
 
     /// Memory edge case: identical *arithmetic over distinct loads* of the same
@@ -347,9 +359,9 @@ mod tests {
             "
         );
         let mut e = engine(&ctx, f);
-        assert!(e.congruent(&ctx, p1, p1), "reflexive");
+        assert!(e.congruent(ModuleView::new(&ctx), p1, p1), "reflexive");
         assert!(
-            !e.congruent(&ctx, p1, p2),
+            !e.congruent(ModuleView::new(&ctx), p1, p2),
             "c1+1 ≢ c2+1 (distinct load leaves)"
         );
     }
@@ -374,7 +386,10 @@ mod tests {
         );
         let mut e = engine(&ctx, f);
         assert_ne!(p1, p2);
-        assert!(e.congruent(&ctx, p1, p2), "c+1 over one load unifies");
+        assert!(
+            e.congruent(ModuleView::new(&ctx), p1, p2),
+            "c+1 over one load unifies"
+        );
     }
 
     /// Variable `mul` is commutative and congruent under swap; the congruence
@@ -401,7 +416,10 @@ mod tests {
             "
         );
         let mut e = engine(&ctx, f);
-        assert!(e.congruent(&ctx, m1, m2), "a*b ≡ b*a");
-        assert!(e.congruent(&ctx, e1, e2), "(a*b)+c ≡ c+(b*a)");
+        assert!(e.congruent(ModuleView::new(&ctx), m1, m2), "a*b ≡ b*a");
+        assert!(
+            e.congruent(ModuleView::new(&ctx), e1, e2),
+            "(a*b)+c ≡ c+(b*a)"
+        );
     }
 }

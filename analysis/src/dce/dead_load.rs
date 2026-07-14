@@ -1650,7 +1650,7 @@ mod tests {
 
         // With frame freshness, stack ⊥ global, so S1 is correctly dead.
         let r = crate::AliasResult::simple_for_function(&tc.ctx, fid).with_frame_freshness(
-            &tc.ctx,
+            qcode::value::ModuleView::new(&tc.ctx),
             fid,
             Some(sp_reg),
         );
@@ -1708,7 +1708,7 @@ mod tests {
         let (s_local, s_caller, s_read) = (stores[0], stores[1], stores[2]);
 
         let r = crate::AliasResult::simple_for_function(&tc.ctx, fid).with_frame_freshness(
-            &tc.ctx,
+            qcode::value::ModuleView::new(&tc.ctx),
             fid,
             Some(sp_reg),
         );

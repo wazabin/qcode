@@ -20,13 +20,12 @@ use super::walk::{Claim, Editor, InsnCtx, SubPassC};
 use crate::{ContextView, FunctionBody};
 
 /// Memory forwarding reasons across a whole function (loop-header pruning,
-/// post-call clobbers). Fully backing-routed — every read goes through a
-/// [`HostRef`](qcode::value::util::base_ref::HostRef) and every rebuild through
-/// the body's inherent verbs — so it runs on the function-pass path.
+/// post-call clobbers). Every read goes through the selected function's static
+/// view and every rebuild through the body's inherent verbs.
 pub(super) struct MemoryForwarding;
 
 /// The function-pass [`SubPassC`] impl (context-split stage 5b-ii):
-/// reads route through `cx.read_host(body)`, the load forward through `Editor`'s
+/// reads route through `cx.body_view(body)`, the load forward through `Editor`'s
 /// `_c` method, and the [`MemForward`] rebuild/record helpers (`record_store_c`,
 /// `try_load_c`) run over `&mut PassBacking`.
 impl<'str> SubPassC<'str> for MemoryForwarding {
@@ -58,7 +57,7 @@ impl<'str> SubPassC<'str> for MemoryForwarding {
         if is_shared {
             state.clear();
         }
-        state.prune_loop_carried(cx.read_host(body), block_id, tree, aliases, numbering);
+        state.prune_loop_carried(cx.body_view(body), block_id, tree, aliases, numbering);
     }
 
     fn on_insn(
@@ -110,7 +109,7 @@ impl<'str> SubPassC<'str> for MemoryForwarding {
         _numbering: &Numbering,
     ) {
         let state = state.downcast_mut::<MemForward>().expect("memory state");
-        state.prune_clobbered_by_call(cx.read_host(body), block_id, aliases);
+        state.prune_clobbered_by_call(cx.body_view(body), block_id, aliases);
     }
 }
 

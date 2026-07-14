@@ -2405,7 +2405,7 @@ mod tests {
         tc.ctx
             .assume_true(Proposition::LoadedPointerDisjointFromSlot(f));
         let aliases = crate::AliasResult::simple_for_function(&tc.ctx, f).with_frame_freshness(
-            &tc.ctx,
+            qcode::value::ModuleView::new(&tc.ctx),
             f,
             Some(sp_reg),
         );

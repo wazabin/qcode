@@ -267,7 +267,8 @@ impl<'a, 'ctx> Builder<'a, 'ctx> {
         {
             return sa == sb && la < hb && lb < ha;
         }
-        self.alias.may_alias(self.ctx, ptr, other)
+        self.alias
+            .may_alias(qcode::value::ModuleView::new(self.ctx), ptr, other)
     }
 
     /// Memory flow for a load, scoped to the load's own function. Functions are

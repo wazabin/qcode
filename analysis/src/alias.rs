@@ -6,9 +6,8 @@ use qcode::{
     assumption::Proposition,
     space::SpaceId,
     value::{
-        BlockId, FunctionId, ValueId, ValueRef, VarnodeId,
+        BlockId, FunctionId, QCodeView, ValueId, ValueRef, VarnodeId,
         insn::{Binop, IntBinop, Mnemonic},
-        util::base_ref::HostRef,
     },
 };
 
@@ -153,19 +152,18 @@ impl AliasResult {
     /// (an untracked value carries no no-alias guarantee, so it must answer
     /// may-alias). Only the earlier layers — the different-space
     /// short-circuit and [`Self::provably_disjoint`] — can return `false`.
-    pub fn may_alias<'a, 'str: 'a>(
+    pub fn may_alias<'ctx, 'str: 'ctx>(
         &self,
-        host: impl Into<HostRef<'a, 'str>>,
+        host: impl QCodeView<'ctx, 'str>,
         a: ValueId,
         b: ValueId,
     ) -> bool {
-        let host = host.into();
         // If a and b don't share the same address space they can't alias.
         // Note this deliberately overrides `NodeId::Unknown` below: aliasing
         // means "same storage location", and values in different spaces can
         // never occupy the same location, however unknown their class is.
-        let a_space = ValueRef::from_host(host, a).space().map(|s| s.id);
-        let b_space = ValueRef::from_host(host, b).space().map(|s| s.id);
+        let a_space = ValueRef::from_view(host, a).space().map(|s| s.id);
+        let b_space = ValueRef::from_view(host, b).space().map(|s| s.id);
         if let (Some(sa), Some(sb)) = (a_space, b_space)
             && sa != sb
         {
@@ -213,16 +211,15 @@ impl AliasResult {
     ///
     /// Inert (`false`) unless the result was built with
     /// [`AliasResult::with_frame_freshness`].
-    pub fn provably_disjoint<'a, 'str: 'a>(
+    pub fn provably_disjoint<'ctx, 'str: 'ctx>(
         &self,
-        host: impl Into<HostRef<'a, 'str>>,
+        host: impl QCodeView<'ctx, 'str>,
         a: ValueId,
         b: ValueId,
     ) -> bool {
         let Some(frame) = &self.frame else {
             return false;
         };
-        let host = host.into();
         let pa = frame.provenance(host, a);
         let pb = frame.provenance(host, b);
         frame.disjoint_by_provenance(pa, pb) || frame.disjoint_by_provenance(pb, pa)
@@ -240,13 +237,12 @@ impl AliasResult {
     /// stack-pointer register varnode `sp_reg` (resolved from the arch config). A
     /// no-op when `sp_reg` is `None` or the function has no incoming `@SP` param,
     /// leaving [`AliasResult::provably_disjoint`] inert.
-    pub fn with_frame_freshness<'a, 'str: 'a>(
+    pub fn with_frame_freshness<'ctx, 'str: 'ctx>(
         mut self,
-        host: impl Into<HostRef<'a, 'str>>,
+        host: impl QCodeView<'ctx, 'str>,
         fid: FunctionId,
         sp_reg: Option<VarnodeId>,
     ) -> Self {
-        let host = host.into();
         let Some(sp_reg) = sp_reg else {
             return self;
         };
@@ -258,7 +254,7 @@ impl AliasResult {
         for block in host.function_ref(fid).blocks() {
             for insn in block.iter() {
                 let v = ValueId::Instruction(insn.id);
-                if let Some(FrameClass::Local) = frame_class(host.shr(), &numbering, sp, v) {
+                if let Some(FrameClass::Local) = frame_class(host.shared(), &numbering, sp, v) {
                     own_frame_locals.insert(v);
                 }
             }
@@ -268,11 +264,11 @@ impl AliasResult {
         // (a pass sets assumptions before building the oracle). A test that flips
         // an assumption after building must rebuild the result.
         let caller_frame_assumed = host
-            .shr()
+            .shared()
             .truth(Proposition::ArgsDisjointFromCallerFrame(fid))
             .is_some_and(|t| t.value);
         let loaded_ptr_assumed = host
-            .shr()
+            .shared()
             .truth(Proposition::LoadedPointerDisjointFromSlot(fid))
             .is_some_and(|t| t.value);
         let frame_uncaptured = !frame_is_captured(host, fid, &numbering, sp);
@@ -307,10 +303,15 @@ impl AliasResult {
 /// loaded through, offset, or *returned* is not captured: a return hands the
 /// address back as a call *result* in the caller (classified via
 /// [`FrameInfo::classify`]'s call arm), never into this function's memory.
-fn frame_is_captured(host: HostRef, fid: FunctionId, numbering: &Numbering, sp: ValueId) -> bool {
+fn frame_is_captured<'ctx, 'str: 'ctx>(
+    host: impl QCodeView<'ctx, 'str>,
+    fid: FunctionId,
+    numbering: &Numbering,
+    sp: ValueId,
+) -> bool {
     let is_own_frame = |v: ValueId| {
         matches!(
-            frame_class(host.shr(), numbering, sp, v),
+            frame_class(host.shared(), numbering, sp, v),
             Some(FrameClass::Local)
         )
     };
@@ -357,7 +358,11 @@ impl FrameInfo {
     /// Provenance of `v`, memoized. A peel cycle contributes nothing: the
     /// in-progress value is seeded with the empty set before recursing, then
     /// overwritten with the final classification.
-    fn provenance(&self, host: HostRef, v: ValueId) -> Provenance {
+    fn provenance<'ctx, 'str: 'ctx>(
+        &self,
+        host: impl QCodeView<'ctx, 'str>,
+        v: ValueId,
+    ) -> Provenance {
         if let Some(&p) = self.provenance.borrow().get(&v) {
             return p;
         }
@@ -371,11 +376,15 @@ impl FrameInfo {
 
     /// The uncached classification of `v` — the union over its peel tree (see
     /// [`Provenance`]).
-    fn classify(&self, host: HostRef, v: ValueId) -> Provenance {
+    fn classify<'ctx, 'str: 'ctx>(
+        &self,
+        host: impl QCodeView<'ctx, 'str>,
+        v: ValueId,
+    ) -> Provenance {
         use Provenance as P;
         // Stack provenance first: `@SP ± k`, realigned frames, and the bare `@SP`
         // param (offset 0 → caller frame).
-        if let Some(fc) = frame_class(host.shr(), &self.numbering, self.sp_param, v) {
+        if let Some(fc) = frame_class(host.shared(), &self.numbering, self.sp_param, v) {
             return match fc {
                 FrameClass::Local => P::OWN_FRAME,
                 FrameClass::CallerFrame => P::CALLER_FRAME,
@@ -444,9 +453,9 @@ impl FrameInfo {
     /// a `nocapture` param, then handed back), the union carries `OWN_FRAME`, so
     /// the result is *not* a subset of rule A's `INPUT|LOADED|GLOBAL_STATIC` mask
     /// and stays correctly non-disjoint from the frame.
-    fn classify_call_result(
+    fn classify_call_result<'ctx, 'str: 'ctx>(
         &self,
-        host: HostRef,
+        host: impl QCodeView<'ctx, 'str>,
         func: FunctionId,
         c: &qcode::value::insn::Call,
     ) -> Provenance {
@@ -472,7 +481,12 @@ impl FrameInfo {
     /// non-pointer). Both are *offsets*, not sources of the pointer, so they must
     /// not poison the result — matching the old peel, which contributed nothing
     /// for such operands.
-    fn peel_addsub(&self, host: HostRef, lhs: ValueId, rhs: ValueId) -> Provenance {
+    fn peel_addsub<'ctx, 'str: 'ctx>(
+        &self,
+        host: impl QCodeView<'ctx, 'str>,
+        lhs: ValueId,
+        rhs: ValueId,
+    ) -> Provenance {
         use Provenance as P;
         let mut acc = P::default();
         for operand in [lhs, rhs] {
@@ -669,39 +683,39 @@ mod tests {
         };
 
         let r = AliasResult::simple_for_function(&tc.ctx, fid).with_frame_freshness(
-            &tc.ctx,
+            qcode::value::ModuleView::new(&tc.ctx),
             fid,
             Some(sp_reg),
         );
 
         assert!(
-            r.provably_disjoint(&tc.ctx, local, arg),
+            r.provably_disjoint(qcode::value::ModuleView::new(&tc.ctx), local, arg),
             "local ⊥ incoming arg"
         );
         assert!(
-            r.provably_disjoint(&tc.ctx, arg, local),
+            r.provably_disjoint(qcode::value::ModuleView::new(&tc.ctx), arg, local),
             "rule is symmetric"
         );
         assert!(
-            r.provably_disjoint(&tc.ctx, local, arg_plus),
+            r.provably_disjoint(qcode::value::ModuleView::new(&tc.ctx), local, arg_plus),
             "local ⊥ a pointer offset from the incoming arg"
         );
         assert!(
-            !r.provably_disjoint(&tc.ctx, local, local),
+            !r.provably_disjoint(qcode::value::ModuleView::new(&tc.ctx), local, local),
             "a local is not disjoint from itself"
         );
         assert!(
-            !r.provably_disjoint(&tc.ctx, local, sp),
+            !r.provably_disjoint(qcode::value::ModuleView::new(&tc.ctx), local, sp),
             "@SP is a frame pointer, not an incoming data pointer"
         );
         assert!(
-            !r.provably_disjoint(&tc.ctx, local, caller_arg),
+            !r.provably_disjoint(qcode::value::ModuleView::new(&tc.ctx), local, caller_arg),
             "a caller-frame stack arg shares the @SP base (handled by offset disjointness)"
         );
 
         // Inert without the frame-freshness context.
         let plain = AliasResult::simple_for_function(&tc.ctx, fid);
-        assert!(!plain.provably_disjoint(&tc.ctx, local, arg));
+        assert!(!plain.provably_disjoint(qcode::value::ModuleView::new(&tc.ctx), local, arg));
     }
 
     /// Stack-vs-global rule: an `@SP`-rooted stack slot is disjoint from a static
@@ -749,47 +763,47 @@ mod tests {
             .set_origin_id(glob_addr.localize(glob_pid.func));
 
         let r = AliasResult::simple_for_function(&tc.ctx, fid).with_frame_freshness(
-            &tc.ctx,
+            qcode::value::ModuleView::new(&tc.ctx),
             fid,
             Some(sp_reg),
         );
 
         assert!(
-            r.provably_disjoint(&tc.ctx, local, glob),
+            r.provably_disjoint(qcode::value::ModuleView::new(&tc.ctx), local, glob),
             "stack local ⊥ globalized-global param"
         );
         assert!(
-            r.provably_disjoint(&tc.ctx, glob, local),
+            r.provably_disjoint(qcode::value::ModuleView::new(&tc.ctx), glob, local),
             "rule is symmetric"
         );
         assert!(
-            r.provably_disjoint(&tc.ctx, local, lit_addr),
+            r.provably_disjoint(qcode::value::ModuleView::new(&tc.ctx), local, lit_addr),
             "stack local ⊥ a bare literal global address"
         );
         assert!(
-            r.provably_disjoint(&tc.ctx, local, glob_plus),
+            r.provably_disjoint(qcode::value::ModuleView::new(&tc.ctx), local, glob_plus),
             "stack local ⊥ a pointer offset from a globalized global"
         );
         assert!(
-            r.provably_disjoint(&tc.ctx, caller_arg, lit_addr),
+            r.provably_disjoint(qcode::value::ModuleView::new(&tc.ctx), caller_arg, lit_addr),
             "a caller-frame slot is also stack-rooted, so ⊥ a global"
         );
         assert!(
-            !r.provably_disjoint(&tc.ctx, lit_addr, glob),
+            !r.provably_disjoint(qcode::value::ModuleView::new(&tc.ctx), lit_addr, glob),
             "two globals are not shown disjoint by this rule"
         );
         assert!(
-            !r.provably_disjoint(&tc.ctx, local, caller_arg),
+            !r.provably_disjoint(qcode::value::ModuleView::new(&tc.ctx), local, caller_arg),
             "two stack pointers are not shown disjoint by this rule"
         );
         assert!(
-            !r.may_alias(&tc.ctx, local, glob),
+            !r.may_alias(qcode::value::ModuleView::new(&tc.ctx), local, glob),
             "may_alias reflects the disjointness"
         );
 
         // Inert without the frame-freshness context.
         let plain = AliasResult::simple_for_function(&tc.ctx, fid);
-        assert!(!plain.provably_disjoint(&tc.ctx, local, lit_addr));
+        assert!(!plain.provably_disjoint(qcode::value::ModuleView::new(&tc.ctx), local, lit_addr));
     }
 
     /// Rule 1c: a globalized-global slot `@glob` is disjoint from a pointer *loaded
@@ -843,14 +857,14 @@ mod tests {
             .set_origin_id(glob_addr.localize(glob_pid.func));
 
         let r = AliasResult::simple_for_function(&tc.ctx, fid).with_frame_freshness(
-            &tc.ctx,
+            qcode::value::ModuleView::new(&tc.ctx),
             fid,
             Some(sp_reg),
         );
 
         // Without the assumption, the reload-through store is opaque.
         assert!(
-            !r.provably_disjoint(&tc.ctx, glob, store_addr),
+            !r.provably_disjoint(qcode::value::ModuleView::new(&tc.ctx), glob, store_addr),
             "no disjointness without LoadedPointerDisjointFromSlot"
         );
 
@@ -859,24 +873,24 @@ mod tests {
         tc.ctx
             .assume_true(Proposition::LoadedPointerDisjointFromSlot(fid));
         let r = AliasResult::simple_for_function(&tc.ctx, fid).with_frame_freshness(
-            &tc.ctx,
+            qcode::value::ModuleView::new(&tc.ctx),
             fid,
             Some(sp_reg),
         );
         assert!(
-            r.provably_disjoint(&tc.ctx, glob, store_addr),
+            r.provably_disjoint(qcode::value::ModuleView::new(&tc.ctx), glob, store_addr),
             "@glob ⊥ a store through load(@glob) under the assumption"
         );
         assert!(
-            r.provably_disjoint(&tc.ctx, store_addr, glob),
+            r.provably_disjoint(qcode::value::ModuleView::new(&tc.ctx), store_addr, glob),
             "rule is symmetric"
         );
         assert!(
-            r.provably_disjoint(&tc.ctx, snap_addr, glob),
+            r.provably_disjoint(qcode::value::ModuleView::new(&tc.ctx), snap_addr, glob),
             "the materialized snapshot of *@glob is also a pointer from the slot"
         );
         assert!(
-            !r.provably_disjoint(&tc.ctx, glob, glob),
+            !r.provably_disjoint(qcode::value::ModuleView::new(&tc.ctx), glob, glob),
             "a slot is never disjoint from itself (the loaded-pointer path needs a real load)"
         );
     }
@@ -925,12 +939,12 @@ mod tests {
         tc.ctx
             .assume_true(Proposition::ArgsDisjointFromCallerFrame(fid));
         let r = AliasResult::simple_for_function(&tc.ctx, fid).with_frame_freshness(
-            &tc.ctx,
+            qcode::value::ModuleView::new(&tc.ctx),
             fid,
             Some(sp_reg),
         );
         assert!(
-            !r.provably_disjoint(&tc.ctx, addr, sp),
+            !r.provably_disjoint(qcode::value::ModuleView::new(&tc.ctx), addr, sp),
             "the spilled reload is opaque without LoadedPointerDisjointFromSlot"
         );
 
@@ -938,15 +952,18 @@ mod tests {
         tc.ctx
             .assume_true(Proposition::LoadedPointerDisjointFromSlot(fid));
         let r = AliasResult::simple_for_function(&tc.ctx, fid).with_frame_freshness(
-            &tc.ctx,
+            qcode::value::ModuleView::new(&tc.ctx),
             fid,
             Some(sp_reg),
         );
         assert!(
-            r.provably_disjoint(&tc.ctx, addr, sp),
+            r.provably_disjoint(qcode::value::ModuleView::new(&tc.ctx), addr, sp),
             "load(@SP+4) + 4 ⊥ @SP under both assumptions"
         );
-        assert!(r.provably_disjoint(&tc.ctx, sp, addr), "rule is symmetric");
+        assert!(
+            r.provably_disjoint(qcode::value::ModuleView::new(&tc.ctx), sp, addr),
+            "rule is symmetric"
+        );
     }
 
     /// Caller-frame rule: a caller-frame slot (`@SP + 8`) is disjoint from an
@@ -988,14 +1005,14 @@ mod tests {
         };
 
         let r = AliasResult::simple_for_function(&tc.ctx, fid).with_frame_freshness(
-            &tc.ctx,
+            qcode::value::ModuleView::new(&tc.ctx),
             fid,
             Some(sp_reg),
         );
 
         // Without the assumption, a caller-frame slot may alias an incoming pointer.
         assert!(
-            !r.provably_disjoint(&tc.ctx, caller_arg, arg),
+            !r.provably_disjoint(qcode::value::ModuleView::new(&tc.ctx), caller_arg, arg),
             "caller-frame slot is not statically disjoint from an incoming pointer"
         );
 
@@ -1003,21 +1020,21 @@ mod tests {
         tc.ctx
             .assume_true(Proposition::ArgsDisjointFromCallerFrame(fid));
         let r = AliasResult::simple_for_function(&tc.ctx, fid).with_frame_freshness(
-            &tc.ctx,
+            qcode::value::ModuleView::new(&tc.ctx),
             fid,
             Some(sp_reg),
         );
 
         assert!(
-            r.provably_disjoint(&tc.ctx, caller_arg, arg),
+            r.provably_disjoint(qcode::value::ModuleView::new(&tc.ctx), caller_arg, arg),
             "under the assumption, @SP+8 ⊥ incoming pointer"
         );
         assert!(
-            r.provably_disjoint(&tc.ctx, arg_plus, caller_arg),
+            r.provably_disjoint(qcode::value::ModuleView::new(&tc.ctx), arg_plus, caller_arg),
             "symmetric, and applies to an offset from the incoming pointer"
         );
         assert!(
-            !r.provably_disjoint(&tc.ctx, caller_arg, sp),
+            !r.provably_disjoint(qcode::value::ModuleView::new(&tc.ctx), caller_arg, sp),
             "@SP is a frame pointer, not an incoming data pointer"
         );
     }
@@ -1063,17 +1080,17 @@ mod tests {
         };
 
         let r = AliasResult::simple_for_function(&tc.ctx, fid).with_frame_freshness(
-            &tc.ctx,
+            qcode::value::ModuleView::new(&tc.ctx),
             fid,
             Some(sp_reg),
         );
 
         assert!(
-            !r.provably_disjoint(&tc.ctx, local, mix),
+            !r.provably_disjoint(qcode::value::ModuleView::new(&tc.ctx), local, mix),
             "a mixed input/stack pointer is not a pure incoming pointer"
         );
         assert!(
-            r.provably_disjoint(&tc.ctx, local, arg_plus),
+            r.provably_disjoint(qcode::value::ModuleView::new(&tc.ctx), local, arg_plus),
             "arg + const is still a pure incoming pointer (not over-tightened)"
         );
     }
@@ -1127,26 +1144,26 @@ mod tests {
         // caller pointer or loaded value can name a slot of its frame. The
         // caller-frame slot, by contrast, still needs the assumed rule 2 below.
         let r = AliasResult::simple_for_function(&tc.ctx, fid).with_frame_freshness(
-            &tc.ctx,
+            qcode::value::ModuleView::new(&tc.ctx),
             fid,
             Some(sp_reg),
         );
         assert!(
-            r.provably_disjoint(&tc.ctx, local, mix),
+            r.provably_disjoint(qcode::value::ModuleView::new(&tc.ctx), local, mix),
             "own-frame ⊥ input|loaded when the frame is uncaptured (Refinement A)"
         );
-        assert!(!r.provably_disjoint(&tc.ctx, caller_arg, mix));
+        assert!(!r.provably_disjoint(qcode::value::ModuleView::new(&tc.ctx), caller_arg, mix));
 
         // Only the caller-frame assumption: still opaque (the load is not admitted).
         tc.ctx
             .assume_true(Proposition::ArgsDisjointFromCallerFrame(fid));
         let r = AliasResult::simple_for_function(&tc.ctx, fid).with_frame_freshness(
-            &tc.ctx,
+            qcode::value::ModuleView::new(&tc.ctx),
             fid,
             Some(sp_reg),
         );
         assert!(
-            !r.provably_disjoint(&tc.ctx, caller_arg, mix),
+            !r.provably_disjoint(qcode::value::ModuleView::new(&tc.ctx), caller_arg, mix),
             "the loaded operand is not admitted without LoadedPointerDisjointFromSlot"
         );
 
@@ -1154,12 +1171,12 @@ mod tests {
         tc.ctx
             .assume_true(Proposition::LoadedPointerDisjointFromSlot(fid));
         let r = AliasResult::simple_for_function(&tc.ctx, fid).with_frame_freshness(
-            &tc.ctx,
+            qcode::value::ModuleView::new(&tc.ctx),
             fid,
             Some(sp_reg),
         );
         assert!(
-            r.provably_disjoint(&tc.ctx, caller_arg, mix),
+            r.provably_disjoint(qcode::value::ModuleView::new(&tc.ctx), caller_arg, mix),
             "@SP+8 ⊥ arg + load(p) under both assumptions"
         );
     }
@@ -1205,13 +1222,13 @@ mod tests {
         };
 
         let r = AliasResult::simple_for_function(&tc.ctx, fid).with_frame_freshness(
-            &tc.ctx,
+            qcode::value::ModuleView::new(&tc.ctx),
             fid,
             Some(sp_reg),
         );
-        assert!(r.provably_disjoint(&tc.ctx, local, deep));
+        assert!(r.provably_disjoint(qcode::value::ModuleView::new(&tc.ctx), local, deep));
         let after_first = r.frame.as_ref().unwrap().provenance.borrow().len();
-        assert!(r.provably_disjoint(&tc.ctx, local, deep));
+        assert!(r.provably_disjoint(qcode::value::ModuleView::new(&tc.ctx), local, deep));
         let after_second = r.frame.as_ref().unwrap().provenance.borrow().len();
         assert_eq!(
             after_first, after_second,
@@ -1289,7 +1306,7 @@ mod tests {
         };
 
         let r = AliasResult::simple_for_function(&tc.ctx, fid).with_frame_freshness(
-            &tc.ctx,
+            qcode::value::ModuleView::new(&tc.ctx),
             fid,
             Some(sp_reg),
         );
@@ -1298,10 +1315,13 @@ mod tests {
             "nothing captures the frame"
         );
         assert!(
-            r.provably_disjoint(&tc.ctx, local, loaded),
+            r.provably_disjoint(qcode::value::ModuleView::new(&tc.ctx), local, loaded),
             "own-frame local ⊥ a loaded pointer when the frame is uncaptured"
         );
-        assert!(r.provably_disjoint(&tc.ctx, loaded, local), "symmetric");
+        assert!(
+            r.provably_disjoint(qcode::value::ModuleView::new(&tc.ctx), loaded, local),
+            "symmetric"
+        );
     }
 
     /// A frame address written to memory captures it, so Refinement A goes inert:
@@ -1327,7 +1347,7 @@ mod tests {
         };
 
         let r = AliasResult::simple_for_function(&tc.ctx, fid).with_frame_freshness(
-            &tc.ctx,
+            qcode::value::ModuleView::new(&tc.ctx),
             fid,
             Some(sp_reg),
         );
@@ -1336,7 +1356,7 @@ mod tests {
             "storing the frame address captures the frame"
         );
         assert!(
-            !r.provably_disjoint(&tc.ctx, local, loaded),
+            !r.provably_disjoint(qcode::value::ModuleView::new(&tc.ctx), local, loaded),
             "Refinement A is inert once the frame is captured"
         );
     }
@@ -1388,7 +1408,7 @@ mod tests {
             };
             tc.ctx.replace_instruction_mnemonic(cid, mn);
             let r = AliasResult::simple_for_function(&tc.ctx, fid).with_frame_freshness(
-                &tc.ctx,
+                qcode::value::ModuleView::new(&tc.ctx),
                 fid,
                 Some(sp_reg),
             );
@@ -1451,7 +1471,7 @@ mod tests {
                 }),
             );
             let r = AliasResult::simple_for_function(&tc.ctx, fid).with_frame_freshness(
-                &tc.ctx,
+                qcode::value::ModuleView::new(&tc.ctx),
                 fid,
                 Some(sp_reg),
             );
@@ -1459,7 +1479,11 @@ mod tests {
                 r.frame.as_ref().unwrap().frame_uncaptured,
                 "an INPUT arg does not capture the frame"
             );
-            r.provably_disjoint(&tc.ctx, local, ValueId::Instruction(call_result))
+            r.provably_disjoint(
+                qcode::value::ModuleView::new(&tc.ctx),
+                local,
+                ValueId::Instruction(call_result),
+            )
         }
 
         assert!(
@@ -1510,12 +1534,12 @@ mod tests {
         // Without the assumptions, rule 2 is inert and rule 1b cannot fire (mixed
         // is not a pure global).
         let plain = AliasResult::simple_for_function(&tc.ctx, fid).with_frame_freshness(
-            &tc.ctx,
+            qcode::value::ModuleView::new(&tc.ctx),
             fid,
             Some(sp_reg),
         );
         assert!(
-            !plain.provably_disjoint(&tc.ctx, caller_slot, mixed),
+            !plain.provably_disjoint(qcode::value::ModuleView::new(&tc.ctx), caller_slot, mixed),
             "no caller-frame disjointness without the assumptions"
         );
 
@@ -1524,12 +1548,12 @@ mod tests {
         tc.ctx
             .assume_true(Proposition::LoadedPointerDisjointFromSlot(fid));
         let r = AliasResult::simple_for_function(&tc.ctx, fid).with_frame_freshness(
-            &tc.ctx,
+            qcode::value::ModuleView::new(&tc.ctx),
             fid,
             Some(sp_reg),
         );
         assert!(
-            r.provably_disjoint(&tc.ctx, caller_slot, mixed),
+            r.provably_disjoint(qcode::value::ModuleView::new(&tc.ctx), caller_slot, mixed),
             "caller-frame slot ⊥ INPUT|GLOBAL_STATIC under the assumptions (widened mask)"
         );
     }
