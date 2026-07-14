@@ -114,6 +114,9 @@ pub mod literal;
 pub mod registry;
 pub mod util;
 pub mod varnode;
+pub mod view;
+
+pub use view::{BodyView, ModuleView, QCodeView};
 
 /// A type-erased handle to any IR value stored in a [`Context`].
 ///
