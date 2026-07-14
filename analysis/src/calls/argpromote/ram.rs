@@ -34,7 +34,8 @@ struct OwnFrame {
 
 impl OwnFrame {
     fn new(ctx: &Context, fid: FunctionId, sp_reg: Option<VarnodeId>) -> Self {
-        let sp_param = sp_reg.and_then(|r| incoming_sp_param(ctx, fid, r));
+        let sp_param =
+            sp_reg.and_then(|r| incoming_sp_param(qcode::value::ModuleView::new(ctx), fid, r));
         Self {
             sp_param,
             numbering: precompute_forms(qcode::value::ModuleView::new(ctx), fid),

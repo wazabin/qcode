@@ -75,7 +75,7 @@ fn eligible(
     if taken.contains(&fid) {
         return false;
     }
-    incoming_sp_param(ctx, fid, sp_reg).is_some()
+    incoming_sp_param(qcode::value::ModuleView::new(ctx), fid, sp_reg).is_some()
 }
 
 /// *Make* pass — assume [`Proposition::ArgsDisjointFromCallerFrame`] for every
@@ -161,7 +161,8 @@ fn args_provably_collide(
     sp_reg: VarnodeId,
     cache: &mut HashMap<FunctionId, Option<(ValueId, Numbering)>>,
 ) -> bool {
-    let Some(callee_sp) = incoming_sp_param(ctx, callee, sp_reg) else {
+    let Some(callee_sp) = incoming_sp_param(qcode::value::ModuleView::new(ctx), callee, sp_reg)
+    else {
         return false;
     };
     let callee_numbering = precompute_forms(qcode::value::ModuleView::new(ctx), callee);
@@ -194,7 +195,7 @@ fn args_provably_collide(
             continue;
         };
         let frame = cache.entry(caller).or_insert_with(|| {
-            incoming_sp_param(ctx, caller, sp_reg).map(|sp| {
+            incoming_sp_param(qcode::value::ModuleView::new(ctx), caller, sp_reg).map(|sp| {
                 (
                     sp,
                     precompute_forms(qcode::value::ModuleView::new(ctx), caller),

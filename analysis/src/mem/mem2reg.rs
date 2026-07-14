@@ -83,7 +83,8 @@ pub(crate) fn has_dynamic_stack_pointer_deref(
     function_id: FunctionId,
     stack_ptr: VarnodeId,
 ) -> bool {
-    let Some(sp) = incoming_sp_param(ctx, function_id, stack_ptr) else {
+    let Some(sp) = incoming_sp_param(qcode::value::ModuleView::new(ctx), function_id, stack_ptr)
+    else {
         return false;
     };
     let numbering = precompute_forms(qcode::value::ModuleView::new(ctx), function_id);

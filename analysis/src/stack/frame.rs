@@ -13,10 +13,7 @@
 //! agnostic replacement for matching `StackAddress` literals directly, and the
 //! foundation for the frame-freshness alias rule.
 
-use qcode::value::{
-    FunctionId, FunctionRef, ValueId, VarnodeId,
-    util::base_ref::{AsShared, HostRef},
-};
+use qcode::value::{FunctionId, FunctionRef, ValueId, VarnodeId, util::base_ref::AsShared};
 
 use crate::gvn::affine::Numbering;
 
@@ -39,11 +36,11 @@ pub(crate) enum FrameClass {
 /// `origin` is the stack-pointer register `sp_reg`. `None` if the function has no
 /// such param (e.g. it never touched the stack, or registers were not promoted).
 pub(crate) fn incoming_sp_param<'a, 'str: 'a>(
-    host: impl Into<HostRef<'a, 'str>>,
+    host: impl qcode::value::QCodeView<'a, 'str>,
     fid: FunctionId,
     sp_reg: VarnodeId,
 ) -> Option<ValueId> {
-    FunctionRef::new(host.into(), fid)
+    FunctionRef::new(host, fid)
         .root()?
         .params()
         .find(|p| p.origin() == Some(ValueId::Varnode(sp_reg)))
@@ -157,9 +154,15 @@ mod tests {
     fn incoming_sp_param_found_by_origin() {
         let mut tc = TestContext::new();
         let (fid, sp, sp_reg) = sp_function(&mut tc);
-        assert_eq!(incoming_sp_param(&tc.ctx, fid, sp_reg), Some(sp));
+        assert_eq!(
+            incoming_sp_param(qcode::value::ModuleView::new(&tc.ctx), fid, sp_reg),
+            Some(sp)
+        );
         // A different register is not the SP param.
-        assert_eq!(incoming_sp_param(&tc.ctx, fid, tc.r1), None);
+        assert_eq!(
+            incoming_sp_param(qcode::value::ModuleView::new(&tc.ctx), fid, tc.r1),
+            None
+        );
     }
 
     #[test]

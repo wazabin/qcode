@@ -21,7 +21,9 @@ use std::collections::{BTreeSet, HashMap};
 use qcode::{
     builder::Builder,
     context::Context,
-    value::{FunctionId, ValueId, Varnode, VarnodeId, insn::Mnemonic, util::base_ref::BaseRef},
+    value::{
+        FunctionId, QCodeView, ValueId, Varnode, VarnodeId, insn::Mnemonic, util::base_ref::BaseRef,
+    },
 };
 
 use super::frame::incoming_sp_param;
@@ -38,17 +40,17 @@ pub fn canonicalize_sp_slots_concrete<'a, 'str>(
     fid: FunctionId,
     sp_reg: VarnodeId,
 ) -> bool {
-    let numbering = precompute_forms(cx.read_host(body), fid);
-    let Some(sp_param) = incoming_sp_param(cx.read_host(body), fid, sp_reg) else {
+    let numbering = precompute_forms(cx.body_view(body), fid);
+    let Some(sp_param) = incoming_sp_param(cx.body_view(body), fid, sp_reg) else {
         return false;
     };
-    let Some(root) = cx.read_host(body).function_ref(fid).root().map(|b| b.id) else {
+    let Some(root) = cx.body_view(body).function_ref(fid).root().map(|b| b.id) else {
         return false;
     };
 
     // Each distinct load/store pointer that is `@SP ± N` with a fixed offset.
     let mut ptr_offset: HashMap<ValueId, i64> = HashMap::new();
-    for block in cx.read_host(body).function_ref(fid).blocks() {
+    for block in cx.body_view(body).function_ref(fid).blocks() {
         for insn in block.iter() {
             let ptr = match insn.mnemonic() {
                 Mnemonic::Load(load) => load.ptr.qualify(insn.id.func),
@@ -76,7 +78,7 @@ pub fn canonicalize_sp_slots_concrete<'a, 'str>(
     if offsets.contains(&0) {
         repr.insert(0, sp_param);
     }
-    for insn in cx.read_host(body).function_ref(fid).root().unwrap().iter() {
+    for insn in cx.body_view(body).function_ref(fid).root().unwrap().iter() {
         let v = ValueId::Instruction(insn.id);
         if let Some((base, off)) = numbering.base_offset(v)
             && base == sp_param
@@ -129,8 +131,9 @@ pub fn canonicalize_sp_slots<'str>(
     fid: FunctionId,
     sp_reg: VarnodeId,
 ) -> bool {
-    let numbering = precompute_forms(host.read_host(), fid);
-    let Some(sp_param) = incoming_sp_param(host.read_host(), fid, sp_reg) else {
+    let view = qcode::value::ModuleView::new(&*host);
+    let numbering = precompute_forms(view, fid);
+    let Some(sp_param) = incoming_sp_param(view, fid, sp_reg) else {
         return false;
     };
     let Some(root) = host.function_ref(fid).root().map(|b| b.id) else {

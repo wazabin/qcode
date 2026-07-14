@@ -94,8 +94,8 @@ struct FrameCtx {
 
 impl FrameCtx {
     fn new(ctx: &Context, function_id: FunctionId, stack_ptr: VarnodeId) -> Self {
-        let base =
-            incoming_sp_param(ctx, function_id, stack_ptr).unwrap_or(ValueId::Varnode(stack_ptr));
+        let base = incoming_sp_param(qcode::value::ModuleView::new(ctx), function_id, stack_ptr)
+            .unwrap_or(ValueId::Varnode(stack_ptr));
         Self {
             numbering: precompute_forms(qcode::value::ModuleView::new(ctx), function_id),
             base,
@@ -366,7 +366,8 @@ pub fn compute_stack_delta(
     // The entry stack-pointer base offsets are measured from: the functionalized
     // `@SP` param when present, else the bare stack-pointer varnode (a
     // non-functionalized body roots its RSP arithmetic at the register itself).
-    let base = incoming_sp_param(ctx, function_id, stack_ptr).unwrap_or(sp);
+    let base =
+        incoming_sp_param(qcode::value::ModuleView::new(ctx), function_id, stack_ptr).unwrap_or(sp);
     let mut delta: Option<i64> = None;
 
     for block in FunctionBody::from_id(ctx, function_id).iter() {
@@ -786,7 +787,8 @@ mod tests {
         };
 
         let promote = |tc: &mut TestContext, fun: FunctionId| {
-            let sp_param = incoming_sp_param(&tc.ctx, fun, sp).unwrap();
+            let sp_param =
+                incoming_sp_param(qcode::value::ModuleView::new(&tc.ctx), fun, sp).unwrap();
             canonicalize_sp_slots(&mut tc.ctx, fun, sp);
             let aliases = AliasResult::simple_for_function(&tc.ctx, fun);
             mem2reg_framed(&mut tc.ctx, fun, &aliases, Some(sp_param));
