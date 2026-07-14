@@ -21,11 +21,11 @@ use qcode::{
     builder::Builder,
     space::{Space, SpaceId, SpaceType},
     value::{
-        BlockId, FunctionId, ValueId,
+        BlockId, FunctionId, QCodeView, ValueId,
         insn::{
             Binop, Branch, CBranch, InstructionId, IntBinop, IntrinsicApp, IntrinsicId, Mnemonic,
         },
-        util::{base_ref::BaseRef, base_ref::HostRef},
+        util::base_ref::BaseRef,
     },
 };
 
@@ -33,8 +33,8 @@ use crate::loop_info::{delete_private_loop, incoming, is_increment, literal, use
 use crate::pipeline::{ContextView, FunctionBody, Outcome};
 use crate::{FunctionPass, register_function_pass};
 
-fn is_temp(host: HostRef, s: SpaceId) -> bool {
-    matches!(Space::from_id(host.shr(), s).ty, SpaceType::Temporary)
+fn is_temp<'a, 'str: 'a>(host: impl QCodeView<'a, 'str>, s: SpaceId) -> bool {
+    matches!(Space::from_id(host.shared(), s).ty, SpaceType::Temporary)
 }
 
 // ===========================================================================
@@ -86,7 +86,11 @@ struct StrlenMatch {
 /// (`Some(false)`), or not a zero-test of `elem` at all (`None`). Handles the bare
 /// byte used as a predicate, `elem != 0` / `elem == 0` (either operand order), and
 /// the `bool`-migration negation wrapper `sub == false` / `sub != false`.
-fn nonzero_polarity(host: HostRef, cond: ValueId, elem: ValueId) -> Option<bool> {
+fn nonzero_polarity<'a, 'str: 'a>(
+    host: impl QCodeView<'a, 'str>,
+    cond: ValueId,
+    elem: ValueId,
+) -> Option<bool> {
     if cond == elem {
         return Some(true); // the raw byte as a bool: true ⟺ nonzero
     }
@@ -95,7 +99,7 @@ fn nonzero_polarity(host: HostRef, cond: ValueId, elem: ValueId) -> Option<bool>
     };
     let is_bool = |v: ValueId| {
         host.stored_type_of(v)
-            .is_some_and(|t| host.shr().types.is_bool(t))
+            .is_some_and(|t| host.shared().types.is_bool(t))
     };
     let bool_const = |v: ValueId| {
         (is_bool(v) && matches!(v, ValueId::Literal(_)))
@@ -133,7 +137,10 @@ fn nonzero_polarity(host: HostRef, cond: ValueId, elem: ValueId) -> Option<bool>
 }
 
 /// Match a bounded NUL-scan in `fid`, or `None` for any other shape.
-fn try_match_strlen(host: HostRef, fid: FunctionId) -> Option<StrlenMatch> {
+fn try_match_strlen<'a, 'str: 'a>(
+    host: impl QCodeView<'a, 'str>,
+    fid: FunctionId,
+) -> Option<StrlenMatch> {
     let at_id = IntrinsicId::from_name("at")?;
     let insert_id = IntrinsicId::from_name("insert")?;
     let root_params: Vec<ValueId> = host
@@ -162,8 +169,8 @@ fn try_match_strlen(host: HostRef, fid: FunctionId) -> Option<StrlenMatch> {
             }
             let byte_array = host
                 .stored_type_of(args[0].qualify(func))
-                .and_then(|t| host.shr().types.array_of(t))
-                .is_some_and(|(elem, _)| host.shr().types.size_of(elem) == 1);
+                .and_then(|t| host.shared().types.array_of(t))
+                .is_some_and(|(elem, _)| host.shared().types.size_of(elem) == 1);
             if !byte_array {
                 continue;
             }
@@ -324,7 +331,7 @@ fn apply_strlen<'str>(
     let tw_id = IntrinsicId::from_name("take_while").expect("take_while registered");
     let len_id = IntrinsicId::from_name("len").expect("len registered");
     let first = cx
-        .read_host(body)
+        .body_view(body)
         .block_ref(m.exit_block)
         .iter()
         .next()
@@ -383,10 +390,10 @@ fn apply_strlen<'str>(
 /// count to `len(take_while(arr))`. Returns `true` if changed.
 fn recognize_strlen_at<'str>(m: ContextView<'_, 'str>, body: &mut FunctionBody<'str>) -> bool {
     let fid = body.id();
-    if !m.read_host(body).function_ref(fid).is_pure() {
+    if !m.body_view(body).function_ref(fid).is_pure() {
         return false;
     }
-    let Some(sm) = try_match_strlen(m.read_host(body), fid) else {
+    let Some(sm) = try_match_strlen(m.body_view(body), fid) else {
         return false;
     };
     apply_strlen(body, m, fid, &sm)
@@ -427,7 +434,10 @@ struct StrlenPtrMatch {
 }
 
 /// Match a raw-pointer NUL-scan in `fid`, or `None` for any other shape.
-fn try_match_strlen_ptr(host: HostRef, fid: FunctionId) -> Option<StrlenPtrMatch> {
+fn try_match_strlen_ptr<'a, 'str: 'a>(
+    host: impl QCodeView<'a, 'str>,
+    fid: FunctionId,
+) -> Option<StrlenPtrMatch> {
     for block in host.function_ref(fid).iter() {
         let header = block.id;
         let params: Vec<ValueId> = host.block_ref(header).params().map(|p| p.id()).collect();
@@ -568,7 +578,7 @@ fn apply_strlen_ptr<'str>(
 /// Recognize a raw-pointer NUL-scan in this function, rewriting its `end - base`
 /// length to `len(take_while(base))`. Returns `true` if changed.
 fn recognize_strlen_ptr<'str>(m: ContextView<'_, 'str>, body: &mut FunctionBody<'str>) -> bool {
-    let Some(sm) = try_match_strlen_ptr(m.read_host(body), body.id()) else {
+    let Some(sm) = try_match_strlen_ptr(m.body_view(body), body.id()) else {
         return false;
     };
     apply_strlen_ptr(body, m, &sm)
