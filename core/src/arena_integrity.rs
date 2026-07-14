@@ -1,4 +1,4 @@
-//! Structural validation for function-owned stable arenas.
+//! Structural validation for function-owned arenas.
 //!
 //! This scanner lives in core so it can inspect malformed private arena state
 //! without exposing storage internals as public API. It never indexes an ID
@@ -12,7 +12,7 @@ use crate::{
 };
 
 /// Validate the ownership and cross-reference invariants of every function
-/// body's block, instruction, parameter, and CFG-edge arenas.
+/// body's block, instruction, parameter, CFG-edge, and temporary arenas.
 ///
 /// Diagnostics from this function describe potentially unsafe structural
 /// corruption. Callers should not run higher-level traversals until it returns
@@ -26,6 +26,16 @@ pub fn verify_body_arena_integrity(ctx: &Context<'_>) -> Vec<String> {
         let live_insns: FxHashSet<_> = body.insns.iter().map(|insn| insn.id).collect();
         let live_params: FxHashSet<_> = body.params.iter().map(|param| param.id).collect();
         let live_edges: FxHashSet<_> = body.edges.iter().map(|edge| edge.id).collect();
+
+        for temp in body.temps.iter() {
+            if usize::from(temp.space) >= body.temp_spaces.len() {
+                out.push(format!(
+                    "function {fid:?}: temporary {:?} references missing temporary space {:?}",
+                    crate::value::TempId::new(fid, temp.id),
+                    crate::value::TempSpaceId::new(fid, temp.space)
+                ));
+            }
+        }
 
         let mut roster_count = FxHashMap::default();
         for &local in &body.roster {
@@ -324,7 +334,7 @@ mod tests {
     use qcode_macro::qcode;
 
     use super::*;
-    use crate::value::{BasicBlock, FunctionBody};
+    use crate::value::{BasicBlock, FunctionBody, LocalTempSpaceId, Temp};
 
     fn fixture() -> Context<'static> {
         let mut ctx = Context::new();
@@ -542,5 +552,16 @@ mod tests {
 
         assert_has(&ctx, "local name \"stale\"");
         assert_has(&ctx, "users map contains removed key");
+    }
+
+    #[test]
+    fn reports_temporary_with_missing_local_space() {
+        let mut ctx = fixture();
+        let f = ctx.function_ids()[0];
+        ctx.bodies[f]
+            .temps
+            .push(Temp::new(0, 8, LocalTempSpaceId::from(7)));
+
+        assert_has(&ctx, "references missing temporary space");
     }
 }

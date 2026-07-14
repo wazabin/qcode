@@ -1,4 +1,4 @@
-use jstd::{Identifier, stable_arena::StableArena};
+use jstd::{Identifier, registry::Registry, stable_arena::StableArena};
 use rustc_hash::FxHashMap;
 use std::{
     borrow::Cow,
@@ -15,7 +15,7 @@ use crate::{
     error::{Error, ErrorTy, Result},
     value::{
         BasicBlock, BlockId, BlockRef, Instruction, InstructionId, LocalValueId, ModuleView,
-        QCodeView, Value, ValueId, Varnode, VarnodeId,
+        QCodeView, Temp, TempId, TempSpace, TempSpaceId, Value, ValueId, Varnode, VarnodeId,
         block::EdgeData,
         block::cfg::{EdgeId, LocalBlockId},
         block_param::{BlockParam, BlockParamId, LocalParamId},
@@ -108,6 +108,14 @@ pub struct FunctionBody<'str> {
     /// CFG-edge storage for this function. Keyed by the plain body-local
     /// [`EdgeId`](crate::value::block::EdgeId) (stage 4).
     pub(crate) edges: StableArena<EdgeId, EdgeData>,
+
+    /// Append-only function-local temporary-space storage. Producers migrate
+    /// here in later plan-10 commits; the arena is intentionally empty until
+    /// then.
+    pub(crate) temp_spaces: Registry<crate::value::LocalTempSpaceId, TempSpace>,
+
+    /// Append-only function-local temporary-value storage.
+    pub(crate) temps: Registry<crate::value::LocalTempId, Temp<'str>>,
 
     /// Addresses of every machine instruction lifted into this function, in
     /// ascending order. Recorded during recursive disassembly and preserved
@@ -318,6 +326,8 @@ impl<'str> FunctionBody<'str> {
             roster: Vec::new(),
             params: StableArena::default(),
             edges: StableArena::default(),
+            temp_spaces: Registry::default(),
+            temps: Registry::default(),
             instruction_addrs: BTreeSet::new(),
             names: crate::context::NameTable::default(),
             users: FxHashMap::default(),
@@ -443,6 +453,45 @@ impl<'str> FunctionBody<'str> {
     /// Whether `id` currently names a live block-parameter payload in this body.
     pub fn contains_block_param(&self, id: BlockParamId) -> bool {
         id.func == self.id && self.params.contains(id.local)
+    }
+
+    /// Appends a body-local temporary space and returns its qualified ID.
+    pub fn push_temp_space(&mut self, space: TempSpace) -> TempSpaceId {
+        TempSpaceId::new(self.id, self.temp_spaces.push(space))
+    }
+
+    /// Appends a body-local temporary value and returns its qualified ID.
+    pub fn push_temp(&mut self, temp: Temp<'str>) -> TempId {
+        assert!(
+            usize::from(temp.space) < self.temp_spaces.len(),
+            "temporary references a missing local space"
+        );
+        TempId::new(self.id, self.temps.push(temp))
+    }
+
+    /// Resolves a qualified temporary-space ID against this body.
+    pub fn temp_space(&self, id: TempSpaceId) -> &TempSpace {
+        assert_eq!(
+            id.func, self.id,
+            "temporary space belongs to another function"
+        );
+        &self.temp_spaces[id.local]
+    }
+
+    /// Whether `id` names a temporary space in this body.
+    pub fn contains_temp_space(&self, id: TempSpaceId) -> bool {
+        id.func == self.id && usize::from(id.local) < self.temp_spaces.len()
+    }
+
+    /// Resolves a qualified temporary-value ID against this body.
+    pub fn temp(&self, id: TempId) -> &Temp<'str> {
+        assert_eq!(id.func, self.id, "temporary belongs to another function");
+        &self.temps[id.local]
+    }
+
+    /// Whether `id` names a temporary value in this body.
+    pub fn contains_temp(&self, id: TempId) -> bool {
+        id.func == self.id && usize::from(id.local) < self.temps.len()
     }
 
     /// Physically removes a block parameter and its local bookkeeping.

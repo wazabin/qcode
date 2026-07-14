@@ -11,7 +11,8 @@ use crate::{
     types::TypeId,
     value::{
         BasicBlock, BlockId, BlockParamRef, BlockRef, FunctionBody, FunctionId, FunctionRef,
-        Instruction, InstructionRef, ValueId,
+        Instruction, InstructionRef, Temp, TempId, TempRef, TempSpace, TempSpaceId, TempSpaceRef,
+        ValueId,
         block::{EdgeData, EdgeId},
         block_param::{BlockParam, BlockParamId},
         function::FunctionInterface,
@@ -58,6 +59,22 @@ where
 
     fn edge(self, function: FunctionId, id: EdgeId) -> &'ctx EdgeData {
         &self.function(function).edges[id]
+    }
+
+    fn temp_space(self, id: TempSpaceId) -> &'ctx TempSpace {
+        &self.function(id.func).temp_spaces[id.local]
+    }
+
+    fn contains_temp_space(self, id: TempSpaceId) -> bool {
+        usize::from(id.local) < self.function(id.func).temp_spaces.len()
+    }
+
+    fn temp(self, id: TempId) -> &'ctx Temp<'str> {
+        &self.function(id.func).temps[id.local]
+    }
+
+    fn contains_temp(self, id: TempId) -> bool {
+        usize::from(id.local) < self.function(id.func).temps.len()
     }
 
     fn type_of(self, id: ValueId) -> TypeId {
@@ -123,6 +140,22 @@ where
     {
         let _ = self.function(id);
         FunctionRef::new(self, id)
+    }
+
+    fn temp_space_ref(self, id: TempSpaceId) -> TempSpaceRef<'str, 'ctx, Self>
+    where
+        Self: Sized,
+    {
+        let _ = self.temp_space(id);
+        TempSpaceRef::new(self, id)
+    }
+
+    fn temp_ref(self, id: TempId) -> TempRef<'str, 'ctx, Self>
+    where
+        Self: Sized,
+    {
+        let _ = self.temp(id);
+        TempRef::new(self, id)
     }
 }
 
@@ -215,7 +248,7 @@ mod tests {
     use crate::{
         builder::Builder,
         context::Context,
-        value::{BasicBlock, FunctionBody, ValueId, ValueRef},
+        value::{BasicBlock, FunctionBody, Temp, TempSpace, ValueId, ValueRef},
     };
 
     use super::*;
@@ -284,5 +317,49 @@ mod tests {
         let view = BodyView::new(&ctx.bodies[own], &ctx.shared, &ctx.interfaces);
 
         assert!(std::panic::catch_unwind(|| view.block(block)).is_err());
+    }
+
+    #[test]
+    fn temporary_ids_are_qualified_by_their_body() {
+        let mut ctx = Context::new();
+        let first = FunctionBody::make(&mut ctx, "first".into()).unwrap().id;
+        let second = FunctionBody::make(&mut ctx, "second".into()).unwrap().id;
+
+        let first_space = ctx.bodies[first].push_temp_space(TempSpace::new(None, 1, 8));
+        let second_space = ctx.bodies[second].push_temp_space(TempSpace::new(None, 1, 8));
+        assert_eq!(first_space.local, second_space.local);
+        assert_ne!(first_space, second_space);
+
+        let first_temp = ctx.bodies[first].push_temp(Temp::new(0x20, 4, first_space.local));
+        let second_temp = ctx.bodies[second].push_temp(Temp::new(0x20, 4, second_space.local));
+        assert_eq!(first_temp.local, second_temp.local);
+        assert_ne!(first_temp, second_temp);
+
+        let module = ModuleView::new(&ctx);
+        assert_eq!(module.temp_ref(first_temp).space().id, first_space);
+        assert_eq!(module.temp_ref(second_temp).space().id, second_space);
+
+        let body = BodyView::new(&ctx.bodies[first], &ctx.shared, &ctx.interfaces);
+        assert_eq!(body.temp_ref(first_temp).size(), 4);
+        assert!(std::panic::catch_unwind(|| body.temp(second_temp)).is_err());
+        assert!(std::panic::catch_unwind(|| body.temp_space(second_space)).is_err());
+    }
+
+    #[test]
+    fn temporary_arena_ids_survive_context_round_trip() {
+        let mut ctx = Context::new();
+        let function = FunctionBody::make(&mut ctx, "roundtrip".into()).unwrap().id;
+        let space = ctx.bodies[function].push_temp_space(TempSpace::new(Some("local"), 1, 8));
+        let temp = ctx.bodies[function].push_temp(Temp::new(0x30, 2, space.local));
+
+        let bytes = bincode::serde::encode_to_vec(&ctx, bincode::config::standard()).unwrap();
+        let (restored, consumed): (Context<'static>, _) =
+            bincode::serde::decode_from_slice(&bytes, bincode::config::standard()).unwrap();
+        assert_eq!(consumed, bytes.len());
+
+        let view = ModuleView::new(&restored);
+        assert_eq!(view.temp_space_ref(space).name(), Some("local"));
+        assert_eq!(view.temp_ref(temp).address(), 0x30);
+        assert_eq!(view.temp_ref(temp).space().id, space);
     }
 }

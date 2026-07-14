@@ -11,11 +11,62 @@ use std::fmt::Display;
 use jstd::{Identifier, registry::Identified};
 use serde::{Deserialize, Serialize};
 
-use crate::value::util::base_ref::AsShared;
+use crate::value::{FunctionId, LocalTempSpaceId, TempSpaceId, util::base_ref::AsShared};
 
 /// A stable, context-unique identifier for a [`Space`].
 #[derive(Identifier)]
 pub struct SpaceId(usize);
+
+/// A memory-space handle stored inside one function body.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum LocalMemorySpaceId {
+    Shared(SpaceId),
+    Temp(LocalTempSpaceId),
+}
+
+impl LocalMemorySpaceId {
+    pub const fn qualify(self, function: FunctionId) -> MemorySpaceId {
+        match self {
+            Self::Shared(id) => MemorySpaceId::Shared(id),
+            Self::Temp(local) => MemorySpaceId::Temp(TempSpaceId::new(function, local)),
+        }
+    }
+}
+
+impl From<SpaceId> for LocalMemorySpaceId {
+    fn from(id: SpaceId) -> Self {
+        Self::Shared(id)
+    }
+}
+
+/// A module/API memory-space handle. Local temporary spaces retain their owner.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum MemorySpaceId {
+    Shared(SpaceId),
+    Temp(TempSpaceId),
+}
+
+impl MemorySpaceId {
+    pub fn localize(self, function: FunctionId) -> LocalMemorySpaceId {
+        match self {
+            Self::Shared(id) => LocalMemorySpaceId::Shared(id),
+            Self::Temp(id) => LocalMemorySpaceId::Temp(id.localize(function)),
+        }
+    }
+
+    pub const fn owning_function(self) -> Option<FunctionId> {
+        match self {
+            Self::Shared(_) => None,
+            Self::Temp(id) => Some(id.func),
+        }
+    }
+}
+
+impl From<SpaceId> for MemorySpaceId {
+    fn from(id: SpaceId) -> Self {
+        Self::Shared(id)
+    }
+}
 
 /// The const space is used for constant values such as immediate values
 pub const SPACE_CONST: SpaceId = SpaceId(0);
@@ -84,5 +135,42 @@ impl Display for Space {
         } else {
             write!(f, "space")
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn temporary_memory_space_qualification_preserves_owner() {
+        let function = FunctionId::from(3);
+        let local = LocalTempSpaceId::from(4);
+        let qualified = LocalMemorySpaceId::Temp(local).qualify(function);
+
+        assert_eq!(
+            qualified,
+            MemorySpaceId::Temp(TempSpaceId::new(function, local))
+        );
+        assert_eq!(qualified.owning_function(), Some(function));
+        assert_eq!(
+            qualified.localize(function),
+            LocalMemorySpaceId::Temp(local)
+        );
+        assert_eq!(
+            MemorySpaceId::Shared(SpaceId::from(2)).owning_function(),
+            None
+        );
+    }
+
+    #[test]
+    #[cfg(debug_assertions)]
+    #[should_panic(expected = "TempSpaceId::localize: foreign id")]
+    fn temporary_memory_space_rejects_foreign_localization() {
+        MemorySpaceId::Temp(TempSpaceId::new(
+            FunctionId::from(1),
+            LocalTempSpaceId::from(0),
+        ))
+        .localize(FunctionId::from(2));
     }
 }

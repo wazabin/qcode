@@ -101,6 +101,9 @@ pub use function::{
 pub use insn::LocalInsnId;
 pub use insn::{Instruction, InstructionId, InstructionRef};
 pub use literal::{LiteralId, LiteralRef};
+pub use temp::{
+    LocalTempId, LocalTempSpaceId, Temp, TempId, TempRef, TempSpace, TempSpaceId, TempSpaceRef,
+};
 pub use util::named::{Named, Renameable};
 pub use varnode::{Varnode, VarnodeId, VarnodeRef, register::Register, register::RegisterId};
 
@@ -112,6 +115,7 @@ pub mod insn;
 pub mod interner;
 pub mod literal;
 pub mod registry;
+pub mod temp;
 pub mod util;
 pub mod varnode;
 pub mod view;
