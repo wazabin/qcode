@@ -191,7 +191,7 @@ fn register_structs(ctx: &mut Context, structs: &[StructDecl]) {
 
 fn make_global_varnode(ctx: &mut Context, name: &str, size: usize) -> VarnodeId {
     let unique = ctx.get_unique_name(Cow::Owned(name.to_owned()));
-    let space = ctx.make_named_temp_space(unique.clone());
+    let space = ctx.get_or_make_named_space(unique.as_ref());
     let id = Varnode::make(ctx, 0, size, space).id;
     let _ = Varnode::from_id_mut(ctx, id).rename(unique);
     id

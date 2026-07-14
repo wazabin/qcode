@@ -23,7 +23,7 @@
 
 use qcode::{
     builder::{Builder, BuilderBacking},
-    space::{LocalMemorySpaceId, Space, SpaceType},
+    space::LocalMemorySpaceId,
     types::TypeId,
     value::{
         FunctionId, QCodeView, ValueId,
@@ -94,9 +94,7 @@ fn try_match<'a, 'str: 'a>(host: impl QCodeView<'a, 'str>, fid: FunctionId) -> O
 
     // Collect every access in an argpromote shadow (`Temporary`) space.
     let is_temp = |sp: LocalMemorySpaceId| match sp {
-        LocalMemorySpaceId::Shared(sp) => {
-            matches!(Space::from_id(host.shared(), sp).ty, SpaceType::Temporary)
-        }
+        LocalMemorySpaceId::Shared(_) => false,
         LocalMemorySpaceId::Temp(_) => true,
     };
     let mut accesses: Vec<Acc> = Vec::new();
@@ -341,14 +339,18 @@ mod tests {
         const N: usize = 8;
         let i8 = tc.ctx.shared.types.get_or_make_int(1);
         let arr_ty = tc.ctx.shared.types.get_or_make_array(i8, N);
-        let space = if ram_region {
-            tc.ctx.shared.default_space
-        } else {
-            tc.ctx.make_temp_space()
-        };
         let ram = tc.ctx.shared.default_space;
 
         let fid = FunctionBody::make(&mut tc.ctx, "f".into()).unwrap().id;
+        let space = if ram_region {
+            LocalMemorySpaceId::Shared(ram)
+        } else {
+            LocalMemorySpaceId::Temp(
+                tc.ctx.bodies[fid]
+                    .push_temp_space(qcode::value::TempSpace::new(Some("shadow"), 1, 8))
+                    .local,
+            )
+        };
         // Build the entry block *owned by* `fid` (block.func == fid), so the pass
         // can check the function out cleanly (no reattributed blocks).
         let entry = BasicBlock::make(&mut tc.ctx, fid).id;
@@ -397,7 +399,7 @@ mod tests {
             .flat_map(|blk| blk.iter())
             .filter(|i| {
                 matches!(i.mnemonic(), Mnemonic::Load(l)
-                    if l.space.shared().is_some_and(|space| matches!(Space::from_id(ctx, space).ty, SpaceType::Temporary)))
+                    if matches!(l.space, LocalMemorySpaceId::Temp(_)))
             })
             .count()
     }

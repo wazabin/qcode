@@ -155,10 +155,7 @@ impl EmulatedMemory {
         self.zero_filled_spaces.clear();
         for index in 0..space_count {
             let id = SpaceId::from(index);
-            if matches!(
-                Space::from_id(ctx, id).ty,
-                SpaceType::Register | SpaceType::Temporary
-            ) {
+            if matches!(Space::from_id(ctx, id).ty, SpaceType::Register) {
                 self.zero_filled_spaces.insert(id.into());
             }
         }
@@ -2488,6 +2485,7 @@ mod tests {
     use super::*;
     use qcode::context::Context;
     use qcode::space::{Space, SpaceType};
+    use qcode::value::TempSpace;
     use qcode_macro::qcode;
     use std::sync::{Arc, Mutex};
 
@@ -3128,19 +3126,24 @@ mod tests {
     }
 
     #[test]
-    fn configured_register_and_temporary_spaces_zero_fill_missing_bytes() {
+    fn configured_register_and_body_temporary_spaces_zero_fill_missing_bytes() {
         let mut ctx = Context::new();
         let mut register = Space::new(Some("register"), 1, 8);
         register.ty = SpaceType::Register;
         let register = ctx.add_space(register);
-        let temporary = ctx.make_temp_space();
+        let function = ctx.anon_function();
+        let temporary = MemorySpaceId::Temp(ctx.bodies[function].push_temp_space(TempSpace::new(
+            Some("scratch"),
+            1,
+            8,
+        )));
         let mut memory = EmulatedMemory::default();
         memory.configure_spaces(&ctx);
 
-        for space in [register, temporary] {
+        for space in [register.into(), temporary] {
             assert_eq!(
                 memory
-                    .read(space.into(), SizedValue::from_u64(0x1000), 4)
+                    .read(space, SizedValue::from_u64(0x1000), 4)
                     .unwrap()
                     .value()
                     .unwrap(),
@@ -3425,6 +3428,8 @@ mod tests {
         );
 
         let mut emu = Emulator::from_function(&ctx, function);
+        emu.set_varnode(A, 0).unwrap();
+        emu.set_varnode(B, 0).unwrap();
         emu.run_function(function).unwrap();
 
         assert!(emu.call_stack().is_empty());

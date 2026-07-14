@@ -1,6 +1,6 @@
 use qcode::{
     context::Context,
-    space::{LocalMemorySpaceId, Space, SpaceType},
+    space::LocalMemorySpaceId,
     value::{FunctionBody, FunctionId, insn::Mnemonic},
 };
 
@@ -69,9 +69,7 @@ pub(crate) fn body_is_pure(ctx: &Context, fid: FunctionId) -> bool {
 
 fn mnemonic_is_pure(ctx: &Context, m: &Mnemonic) -> bool {
     let is_temp = |space| match space {
-        LocalMemorySpaceId::Shared(space) => {
-            matches!(Space::from_id(ctx, space).ty, SpaceType::Temporary)
-        }
+        LocalMemorySpaceId::Shared(_) => false,
         LocalMemorySpaceId::Temp(_) => true,
     };
     match m {
@@ -164,9 +162,14 @@ mod tests {
         let p_pid = BasicBlock::from_id_mut(&mut tc.ctx, root).push_param(4).id;
         let p = ValueId::BlockParam(p_pid);
         let space = if to_shadow {
-            tc.ctx.make_temp_space()
+            let space = tc.ctx.bodies[fid].push_temp_space(qcode::value::TempSpace::new(
+                Some("shadow"),
+                1,
+                8,
+            ));
+            LocalMemorySpaceId::Temp(space.local)
         } else {
-            tc.ctx.shared.default_space
+            LocalMemorySpaceId::Shared(tc.ctx.shared.default_space)
         };
         let mut b = Builder::from_block(BasicBlock::from_id_mut(&mut tc.ctx, root));
         let v = b.context_mut().get_const(0x1234, 4).id();

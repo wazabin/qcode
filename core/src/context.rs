@@ -339,30 +339,13 @@ impl<'str> Context<'str> {
         if let Some(id) = self.try_get_space(name) {
             return id;
         }
-        // Named temp spaces (e.g. the per-varnode spaces minted by
-        // `make_named_temp_space`) carry a name but are not in `named_spaces`, so
-        // scan the registry by name before minting a fresh one. This keeps a
-        // canonical `load(V0:4, V0)` bound to the same space as varnode `V0`.
-        if let Some(found) = self
-            .shared
-            .spaces
-            .iter()
-            .find(|s| s.name.as_deref() == Some(name))
-            .map(|s| s.id)
-        {
-            return found;
+        let default_id = self.shared.default_space;
+        if self.shared.spaces[default_id].name.as_deref() == Some(name) {
+            return default_id;
         }
         let default = &self.shared.spaces[self.shared.default_space];
         let space = Space::new(Some(name), default.word_size, default.addr_size);
         self.add_space(space)
-    }
-
-    /// Creates a new temporary address space and returns its ID.
-    pub fn make_temp_space(&mut self) -> SpaceId {
-        let default_space = &self.shared.spaces[self.shared.default_space];
-        let mut space = Space::new(None, default_space.word_size, default_space.addr_size);
-        space.ty = crate::space::SpaceType::Temporary;
-        self.shared.spaces.push(space)
     }
 
     /// Adds a space to the context, registering its name, and returns its ID.
@@ -420,18 +403,6 @@ impl<'str> Context<'str> {
     /// Replaces the spaces registry wholesale. Intended for initialization from a pre-built spec.
     pub fn load_spaces(&mut self, spaces: registry::Registry<SpaceId, Space>) {
         self.shared.spaces = spaces;
-    }
-
-    /// Creates a new named temporary address space and returns its ID.
-    pub fn make_named_temp_space(&mut self, name: impl Into<Box<str>>) -> SpaceId {
-        let default_space = &self.shared.spaces[self.shared.default_space];
-        let (word_size, addr_size) = (default_space.word_size, default_space.addr_size);
-        self.shared.spaces.push(Space {
-            name: Some(name.into()),
-            word_size,
-            addr_size,
-            ty: crate::space::SpaceType::Temporary,
-        })
     }
 
     /// Read `n` bytes of initialized binary memory at virtual address `addr`,
@@ -3180,7 +3151,7 @@ mod tests {
         );
 
         // A SpaceAddress type exercises the custom TypeManager serialization.
-        let some_space = ctx.make_named_temp_space("scratch");
+        let some_space = ctx.get_or_make_named_space("scratch");
         let sa = ctx.shared.types.get_or_make_space_address(8, some_space);
         let sa_size = ctx.shared.types.size_of(sa);
 

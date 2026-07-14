@@ -32,7 +32,7 @@ use std::sync::OnceLock;
 use qcode::{
     context::Context,
     space::Space,
-    value::{FunctionBody, FunctionId, RegisterId, Renameable, Varnode, VarnodeId},
+    value::{FunctionBody, FunctionId, RegisterId, Renameable, VarnodeId},
 };
 
 use super::{ArchConfig, CallingConvention, ContextSplit, ContextView, Outcome};
@@ -46,7 +46,7 @@ pub struct PipelineEnv {
     pub cfg: ArchConfig,
     /// The stack-pointer *varnode* (`cfg.stack_pointer` resolved through
     /// `ctx.shared.registers`), cached so passes don't re-resolve it each call.
-    pub sp_varnode: VarnodeId,
+    pub sp_varnode: Option<VarnodeId>,
     /// Function-independent register/varnode alias base, built once on first use and
     /// shared by reference across the per-function GVN/LICM/DCE/mem2reg runs (see
     /// [`PipelineEnv::alias_base`]). A `OnceLock` (not `RefCell`) so `&PipelineEnv`
@@ -65,31 +65,28 @@ impl PipelineEnv {
 
     /// Build an env for running arch-agnostic passes on hand-written IR (CLI and
     /// other tools), where there is no machine architecture to resolve. The
-    /// stack pointer is a throwaway varnode and the ABI is empty, so passes that
-    /// genuinely need register/ABI/stack information must not use this env —
-    /// arch-agnostic transforms (e.g. `loop_to_recursion`, `gvn`, `dce`) are fine.
-    pub fn headless(ctx: &mut Context) -> Self {
-        let space = ctx.make_temp_space();
-        let bitness = (Space::from_id(&*ctx, ctx.shared.default_space).addr_size * 8) as u8;
-        let sp_varnode = Varnode::make(ctx, 0, (bitness / 8) as usize, space).id;
+    /// stack pointer is absent and the ABI is empty, so architecture-dependent
+    /// passes are inert while arch-agnostic transforms still run normally.
+    pub fn headless(ctx: &Context) -> Self {
+        let bitness = (Space::from_id(ctx, ctx.shared.default_space).addr_size * 8) as u8;
         let cfg = ArchConfig {
-            // Unused by arch-agnostic passes; the real SP is `sp_varnode` above.
+            // Unused by arch-agnostic passes; `sp_varnode` is explicitly absent.
             stack_pointer: RegisterId::from(0usize),
             dead_flag_regs: Vec::new(),
             abi: CallingConvention::default(),
             os: ctx.target_os(),
             bitness,
         };
-        Self::from_parts(cfg, sp_varnode)
+        Self::from_parts(cfg, None)
     }
 
     /// Build an env from already-resolved parts, without consulting a `ctx`. Used by
     /// unit tests that construct a throwaway env for arch-agnostic passes; prefer
     /// [`PipelineEnv::new`] in production.
-    pub(crate) fn from_parts(cfg: ArchConfig, sp_varnode: VarnodeId) -> Self {
+    pub(crate) fn from_parts(cfg: ArchConfig, sp_varnode: impl Into<Option<VarnodeId>>) -> Self {
         Self {
             cfg,
-            sp_varnode,
+            sp_varnode: sp_varnode.into(),
             alias_base: OnceLock::new(),
         }
     }
@@ -104,11 +101,9 @@ impl PipelineEnv {
     /// lift time and does not grow during the optimization passes that consult the
     /// oracle, so the base built on first use stays valid for the whole run. (The
     /// old code rebuilt it whenever `ctx.varnode_count()` changed; instrumentation
-    /// showed that rebuild never fired across the entire test suite.) Any varnodes a
-    /// pass mints mid-run live in fresh temporary spaces that are disjoint from the
-    /// register file and are resolved per-function in "Part B", not by this shared
-    /// base — so a stale count would still be sound, but the `debug_assert` below
-    /// catches an unexpected mid-run mint loudly rather than silently.
+    /// showed that rebuild never fired across the entire test suite.) Body-local
+    /// temporaries do not change the shared varnode set; the `debug_assert` below
+    /// catches an unexpected module-varnode mint loudly rather than silently.
     pub fn alias_base(&self, shared: &qcode::context::Shared) -> &RegisterBase {
         let base = self.alias_base.get_or_init(|| RegisterBase::build(shared));
         debug_assert_eq!(
@@ -750,6 +745,19 @@ mod tests {
     fn pipeline_env_is_sync() {
         fn assert_sync<T: Sync>() {}
         assert_sync::<PipelineEnv>();
+    }
+
+    #[test]
+    fn headless_env_does_not_invent_architecture_state() {
+        let ctx = Context::new();
+        let spaces = ctx.space_count();
+        let varnodes = ctx.varnode_count();
+
+        let env = PipelineEnv::headless(&ctx);
+
+        assert_eq!(env.sp_varnode, None);
+        assert_eq!(ctx.space_count(), spaces);
+        assert_eq!(ctx.varnode_count(), varnodes);
     }
 
     #[test]

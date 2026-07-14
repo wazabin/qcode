@@ -10,7 +10,7 @@
 
 use qcode::{
     context::Context,
-    space::{LocalMemorySpaceId, SpaceType},
+    space::LocalMemorySpaceId,
     value::{
         FunctionBody, FunctionId, Instruction, LocalValueId,
         insn::{InstructionId, Mnemonic},
@@ -43,12 +43,9 @@ impl PureFunctionViolation {
 /// Whether `space` is a builder/argpromote scratch space (a temporary). A
 /// load/store there is private to the function — seeded from inputs or written
 /// earlier in the body — so it is not a caller-visible effect.
-fn is_temp_space(ctx: &Context, space: LocalMemorySpaceId) -> bool {
+fn is_temp_space(_ctx: &Context, space: LocalMemorySpaceId) -> bool {
     match space {
-        LocalMemorySpaceId::Shared(space) => matches!(
-            qcode::space::Space::from_id(ctx, space).ty,
-            SpaceType::Temporary
-        ),
+        LocalMemorySpaceId::Shared(_) => false,
         LocalMemorySpaceId::Temp(_) => true,
     }
 }

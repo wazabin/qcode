@@ -2933,8 +2933,10 @@ mod tests {
         // region. (Contrast `dynamic_index_loop_becomes_map`, where the deletable
         // loop is removed and the seed store stripped.)
         let any_store = FunctionBody::from_id(&tc.ctx, f).iter().any(|b| {
-            b.iter().any(|i| matches!(i.mnemonic(), Mnemonic::Store(s)
-                if s.space.shared().is_some_and(|space| matches!(qcode::space::Space::from_id(&tc.ctx, space).ty, qcode::space::SpaceType::Temporary))))
+            b.iter().any(|i| {
+                matches!(i.mnemonic(), Mnemonic::Store(s)
+                if matches!(s.space, qcode::space::LocalMemorySpaceId::Temp(_)))
+            })
         });
         assert!(any_store, "the kept loop's shadow stores must remain");
 
@@ -3031,8 +3033,10 @@ mod tests {
         });
         assert!(has_cbranch, "the residual @acc loop must remain");
         let any_store = FunctionBody::from_id(&tc.ctx, f).iter().any(|b| {
-            b.iter().any(|i| matches!(i.mnemonic(), Mnemonic::Store(s)
-                if s.space.shared().is_some_and(|space| matches!(qcode::space::Space::from_id(&tc.ctx, space).ty, qcode::space::SpaceType::Temporary))))
+            b.iter().any(|i| {
+                matches!(i.mnemonic(), Mnemonic::Store(s)
+                if matches!(s.space, qcode::space::LocalMemorySpaceId::Temp(_)))
+            })
         });
         assert!(any_store, "the kept loop's shadow stores must remain");
 

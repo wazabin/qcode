@@ -305,7 +305,7 @@ impl Pass for AssumeArgFrame {
         "Assume each function's incoming pointer args are disjoint from its caller-frame slots"
     }
     fn run(&self, ctx: &mut Context, env: &PipelineEnv) -> Result<bool, String> {
-        assume_args_disjoint_caller_frame(ctx, Some(env.sp_varnode));
+        assume_args_disjoint_caller_frame(ctx, env.sp_varnode);
         Ok(false)
     }
 }

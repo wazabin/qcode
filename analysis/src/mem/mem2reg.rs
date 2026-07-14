@@ -1497,11 +1497,10 @@ impl<'str> Mem2Reg<'_, 'str> {
                 // the conservative frame analysis did not flag) are safe to remove.
                 // Stack-slot literals keep the unconditional removal.
                 let guarded = if let ValueId::Varnode(vn_id) = ptr {
-                    match Varnode::from_id(self.read().shared(), vn_id).space().ty {
-                        SpaceType::Register => true,
-                        SpaceType::Temporary => vars_with_surviving_loads.contains(&ptr),
-                        _ => false,
-                    }
+                    matches!(
+                        Varnode::from_id(self.read().shared(), vn_id).space().ty,
+                        SpaceType::Register
+                    )
                 } else {
                     false
                 };

@@ -1309,12 +1309,14 @@ mod tests {
         }
         // The callee's witnessed write-set is exactly its own scratch space — it
         // never writes real `ram`.
-        let scratch = tc.ctx.make_temp_space();
         let ram = tc.ctx.shared.default_space;
+        tc.ctx.bodies[callee].push_temp_space(TempSpace::new(Some("callee-scratch"), 1, 8));
         let caller_scratch =
             tc.ctx.bodies[caller].push_temp_space(TempSpace::new(Some("caller-scratch"), 1, 8));
         let caller_scratch = LocalMemorySpaceId::Temp(caller_scratch.local);
-        FunctionBody::from_id_mut(&mut tc.ctx, callee).set_written_spaces(Some(vec![scratch]));
+        // Body-local scratch is private to the callee and therefore absent from
+        // the module-visible write summary.
+        FunctionBody::from_id_mut(&mut tc.ctx, callee).set_written_spaces(Some(vec![]));
 
         // The caller block ends in a direct call to `callee`, passing a frame
         // pointer (so a pointer escapes — the no-summary path would drop the cell).
@@ -1325,14 +1327,11 @@ mod tests {
         }
 
         let ram_cell = Base::Symbolic(ram.into(), ValueId::Varnode(tc.r1));
-        let scratch_cell = Base::Symbolic(scratch.into(), ValueId::Varnode(tc.r2));
         let caller_scratch_cell = Base::Symbolic(caller_scratch, ValueId::Varnode(tc.r2));
         let src = ValueId::Varnode(tc.r2);
 
         let mut mf = MemForward::default();
         mf.byte_map.insert((ram_cell, 0), Cell { src, src_off: 0 });
-        mf.byte_map
-            .insert((scratch_cell, 0), Cell { src, src_off: 0 });
         mf.byte_map
             .insert((caller_scratch_cell, 0), Cell { src, src_off: 0 });
 
@@ -1341,10 +1340,6 @@ mod tests {
         assert!(
             mf.byte_map.contains_key(&(ram_cell, 0)),
             "a RAM cell survives a call to a callee that writes only scratch"
-        );
-        assert!(
-            !mf.byte_map.contains_key(&(scratch_cell, 0)),
-            "a cell in a space the callee does write is still dropped"
         );
         assert!(
             mf.byte_map.contains_key(&(caller_scratch_cell, 0)),

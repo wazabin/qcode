@@ -170,7 +170,9 @@ pub fn argpromote_external(ctx: &mut Context, env: &PipelineEnv) -> bool {
     let target = AbiTarget::new(platform, env.cfg.bitness);
     let ptr_width = (env.cfg.bitness / 8).max(1) as usize;
     let stack_only = env.cfg.bitness == 32;
-    let sp = env.sp_varnode;
+    let Some(sp) = env.sp_varnode else {
+        return false;
+    };
     let sp_space = Varnode::from_id(&*ctx, sp).space().id;
     let default_space = ctx.shared.default_space;
 

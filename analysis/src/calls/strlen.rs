@@ -19,7 +19,7 @@ use rustc_hash::FxHashSet as HashSet;
 
 use qcode::{
     builder::Builder,
-    space::{LocalMemorySpaceId, Space, SpaceType},
+    space::LocalMemorySpaceId,
     value::{
         BlockId, FunctionId, QCodeView, ValueId,
         insn::{
@@ -33,11 +33,9 @@ use crate::loop_info::{delete_private_loop, incoming, is_increment, literal, use
 use crate::pipeline::{ContextView, FunctionBody, Outcome};
 use crate::{FunctionPass, register_function_pass};
 
-fn is_temp<'a, 'str: 'a>(host: impl QCodeView<'a, 'str>, s: LocalMemorySpaceId) -> bool {
+fn is_temp<'a, 'str: 'a>(_host: impl QCodeView<'a, 'str>, s: LocalMemorySpaceId) -> bool {
     match s {
-        LocalMemorySpaceId::Shared(s) => {
-            matches!(Space::from_id(host.shared(), s).ty, SpaceType::Temporary)
-        }
+        LocalMemorySpaceId::Shared(_) => false,
         LocalMemorySpaceId::Temp(_) => true,
     }
 }
@@ -646,10 +644,14 @@ mod tests {
         const N: usize = 4;
         let i8 = tc.ctx.shared.types.get_or_make_int(1);
         let arr_ty = tc.ctx.shared.types.get_or_make_array(i8, N);
-        let shadow = tc.ctx.make_temp_space();
         let ram = tc.ctx.shared.default_space;
 
         let fid = FunctionBody::make(&mut tc.ctx, "copy".into()).unwrap().id;
+        let shadow = LocalMemorySpaceId::Temp(
+            tc.ctx.bodies[fid]
+                .push_temp_space(qcode::value::TempSpace::new(Some("shadow"), 1, 8))
+                .local,
+        );
         let entry = tc.ctx.get_or_make_block(0x1000, fid);
         let header = tc.ctx.get_or_make_block(0x1010, fid);
         let body = tc.ctx.get_or_make_block(0x1020, fid);
@@ -746,10 +748,14 @@ mod tests {
         const N: usize = 8;
         let i8 = tc.ctx.shared.types.get_or_make_int(1);
         let arr_ty = tc.ctx.shared.types.get_or_make_array(i8, N);
-        let shadow = tc.ctx.make_temp_space();
         let ram = tc.ctx.shared.default_space;
 
         let fid = FunctionBody::make(&mut tc.ctx, "slen".into()).unwrap().id;
+        let shadow = LocalMemorySpaceId::Temp(
+            tc.ctx.bodies[fid]
+                .push_temp_space(qcode::value::TempSpace::new(Some("shadow"), 1, 8))
+                .local,
+        );
         let entry = tc.ctx.get_or_make_block(0x1000, fid);
         let header = tc.ctx.get_or_make_block(0x1010, fid);
         let body = tc.ctx.get_or_make_block(0x1020, fid);

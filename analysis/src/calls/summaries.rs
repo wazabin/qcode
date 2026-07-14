@@ -843,7 +843,10 @@ impl Pass for Summaries {
         "Infer each function's input/clobber/saved summary and stack delta"
     }
     fn run(&self, ctx: &mut Context, env: &PipelineEnv) -> Result<bool, String> {
-        set_all_function_summaries(ctx, env.sp_varnode);
+        let Some(stack_ptr) = env.sp_varnode else {
+            return Ok(false);
+        };
+        set_all_function_summaries(ctx, stack_ptr);
         Ok(false)
     }
 }

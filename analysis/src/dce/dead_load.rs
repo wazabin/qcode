@@ -1282,11 +1282,15 @@ mod tests {
     ) -> (Context<'static>, FunctionId, InstructionId) {
         use qcode::builder::Builder;
         let mut tc = TestContext::new();
-        let shadow = tc.ctx.make_temp_space();
         let regsp = tc.reg_space;
         let r1 = tc.r1;
 
         let fid = FunctionBody::make(&mut tc.ctx, "f".into()).unwrap().id;
+        let shadow = LocalMemorySpaceId::Temp(
+            tc.ctx.bodies[fid]
+                .push_temp_space(qcode::value::TempSpace::new(Some("shadow"), 1, 8))
+                .local,
+        );
         let block_id = BasicBlock::make(&mut tc.ctx, fid).id;
 
         let offset_ptr = |b: &mut Builder<'static, '_>, base: ValueId, off: i64| {

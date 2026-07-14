@@ -109,10 +109,9 @@ fn try_match<'a, 'str: 'a>(
         stored: Option<ValueId>,
     }
     let is_ram = |sp: LocalMemorySpaceId| match sp {
-        LocalMemorySpaceId::Shared(sp) => matches!(
-            Space::from_id(host.shared(), sp).ty,
-            SpaceType::Ram | SpaceType::Temporary
-        ),
+        LocalMemorySpaceId::Shared(sp) => {
+            matches!(Space::from_id(host.shared(), sp).ty, SpaceType::Ram)
+        }
         LocalMemorySpaceId::Temp(_) => true,
     };
     let mut accesses: Vec<Acc> = Vec::new();

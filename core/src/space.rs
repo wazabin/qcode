@@ -107,8 +107,6 @@ pub enum SpaceType {
     Rom,
     /// Processor registers
     Register,
-    /// Builder-created local storage for intermediate values
-    Temporary,
 }
 
 pub type SpaceRef<'ctx> = Identified<SpaceId, &'ctx Space>;
