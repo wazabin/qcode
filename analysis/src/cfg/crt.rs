@@ -204,15 +204,15 @@ mod tests {
 
         // It does not surface as a callee until a function exists at `main`...
         assert!(
-            FunctionBody::from_id(&tc.ctx, entry_id)
-                .callees()
+            crate::CallGraph::analyze(&tc.ctx)
+                .callees(entry_id)
                 .is_empty()
         );
 
         // ...and once one does, `entry → main` shows up in the call graph.
         let main_id = FunctionBody::make_at_addr(&mut tc.ctx, 0x2000, Some("main".into())).id;
         assert_eq!(
-            FunctionBody::from_id(&tc.ctx, entry_id).callees(),
+            crate::CallGraph::analyze(&tc.ctx).callees(entry_id),
             vec![main_id]
         );
 

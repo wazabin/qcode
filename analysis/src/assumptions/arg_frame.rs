@@ -27,14 +27,12 @@ use qcode::{
     assumption::{Certainty, Proposition},
     context::Context,
     pass_scope,
-    value::{
-        FunctionBody, FunctionId, Instruction, ValueId, VarnodeId, insn::InstructionId,
-        insn::Mnemonic,
-    },
+    value::{FunctionBody, FunctionId, Instruction, ValueId, VarnodeId, insn::Mnemonic},
 };
 
 use crate::gvn::affine::{Numbering, precompute_forms};
 use crate::stack::frame::{FrameClass, frame_class, frame_offset, incoming_sp_param};
+use crate::{CallGraph, calls::direct_call_sites};
 
 /// Every function whose address is used as a value (and so may be reached by an
 /// indirect call this pass cannot see). Computed in one pass over all
@@ -127,12 +125,14 @@ pub fn verify_args_disjoint_caller_frame(ctx: &mut Context, sp_reg: Option<Varno
     // Cache each caller's `(@SP param, affine numbering)` — `None` if it has no
     // incoming `@SP` param (it touched no stack, so it cannot pass a stack address).
     let mut cache: HashMap<FunctionId, Option<(ValueId, Numbering)>> = HashMap::new();
+    let graph = CallGraph::analyze(ctx);
     let mut novel = 0;
     for callee in assumed {
         // Default to holding: the assumption is refuted only by a *provable*
         // collision (a resolved interval overlap). An unresolvable caller/offset
         // is not proof of a collision, so it leaves the assumption standing.
-        let holds = sp_reg.is_none_or(|sp| !args_provably_collide(ctx, callee, sp, &mut cache));
+        let holds =
+            sp_reg.is_none_or(|sp| !args_provably_collide(ctx, &graph, callee, sp, &mut cache));
         if ctx.set_known(Proposition::ArgsDisjointFromCallerFrame(callee), holds) {
             novel += 1;
             qcode::pass_log!(
@@ -156,6 +156,7 @@ pub fn verify_args_disjoint_caller_frame(ctx: &mut Context, sp_reg: Option<Varno
 /// argument slots unless we can show otherwise.
 fn args_provably_collide(
     ctx: &Context,
+    graph: &CallGraph,
     callee: FunctionId,
     sp_reg: VarnodeId,
     cache: &mut HashMap<FunctionId, Option<(ValueId, Numbering)>>,
@@ -180,7 +181,7 @@ fn args_provably_collide(
         .map(|&p| param_access_extent(ctx, callee, p, &callee_numbering))
         .collect();
 
-    for call_id in call_sites_of(ctx, callee) {
+    for call_id in direct_call_sites(ctx, graph, callee) {
         let Mnemonic::Call(c) = ctx.get_insn(call_id).mnemonic().clone() else {
             continue;
         };
@@ -275,16 +276,6 @@ fn param_access_extent(
         }
     }
     ext
-}
-
-/// Every direct call site targeting `callee`, across the whole module.
-fn call_sites_of(ctx: &Context, callee: FunctionId) -> Vec<InstructionId> {
-    ctx.instructions()
-        .filter_map(|insn| match insn.mnemonic() {
-            Mnemonic::Call(c) if c.target.real() == Some(callee) => Some(insn.id),
-            _ => None,
-        })
-        .collect()
 }
 
 // ----- pass -----------------------------------------------------------------

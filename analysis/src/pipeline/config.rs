@@ -873,8 +873,8 @@ fn function_body_hash(ctx: &Context, fun_id: FunctionId) -> u64 {
 /// signature, or purity can change what its callers' `gvn`/`dce` do (pure-call
 /// emulation and dead-pure-call removal both read the callee), so a settled caller
 /// must be reprocessed.
-fn invalidate_callers(ctx: &Context, cache: &mut FixpointCache, fun_id: FunctionId) {
-    for caller in FunctionRef::from_id(ctx, fun_id).callers() {
+fn invalidate_callers(graph: &crate::CallGraph, cache: &mut FixpointCache, fun_id: FunctionId) {
+    for caller in graph.callers(fun_id) {
         cache.mark_dirty(caller);
     }
 }
@@ -939,7 +939,12 @@ fn run_module_stage_incremental(
                     }
                     if inner.run(ctx, fun_id, env)? {
                         cache.mark_dirty(fun_id);
-                        invalidate_callers(ctx, &mut cache, fun_id);
+                        // `inner` may have introduced a new incoming edge to a
+                        // function processed later in this pass. Rebuild after
+                        // every changing adapter rather than updating a hidden
+                        // graph incrementally.
+                        let graph = crate::CallGraph::analyze(ctx);
+                        invalidate_callers(&graph, &mut cache, fun_id);
                         any = true;
                     } else {
                         cache.mark_clean(fun_id, p.name());
@@ -961,15 +966,16 @@ fn run_module_stage_incremental(
                     .collect();
                 let pc = p.run(ctx, env).map_err(|e| format!("{}: {e}", p.name()))?;
                 if pc {
+                    let graph = crate::CallGraph::analyze(ctx);
                     for (f, old) in before {
                         if function_body_hash(ctx, f) != old {
                             cache.mark_dirty(f);
-                            invalidate_callers(ctx, &mut cache, f);
+                            invalidate_callers(&graph, &mut cache, f);
                         }
                     }
                     let now_pure = pure_function_set(ctx);
                     for &f in now_pure.difference(&known_pure) {
-                        invalidate_callers(ctx, &mut cache, f);
+                        invalidate_callers(&graph, &mut cache, f);
                     }
                     known_pure = now_pure;
                 }

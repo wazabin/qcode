@@ -92,7 +92,8 @@ pub fn argpromote_with_sp(ctx: &mut Context, sp_reg: Option<VarnodeId>) -> bool 
     // callee (see [`function_makes_blocking_call`]), and that callee must already
     // be promoted — its own loads gone — for the caller to qualify. One visit per
     // function (no fixpoint), so an already-promoted body is never re-promoted.
-    for fid in callee_first_order(ctx) {
+    let order = callee_first_order(ctx, &crate::CallGraph::analyze(ctx));
+    for fid in order {
         // Lift constant-address (global) accesses into params first, so the freshly
         // param-relative derefs are visible to `try_promote`'s footprint scan in the
         // same visit.
@@ -110,7 +111,7 @@ pub fn argpromote_with_sp(ctx: &mut Context, sp_reg: Option<VarnodeId>) -> bool 
 /// once. Recursion and cycles are handled by the visited set: a function in a
 /// cycle is emitted once, which is fine — recursion is out of scope for purity, so
 /// such a caller simply fails the blocking-call gate.
-fn callee_first_order(ctx: &Context) -> Vec<FunctionId> {
+fn callee_first_order(ctx: &Context, graph: &crate::CallGraph) -> Vec<FunctionId> {
     let mut visited = HashSet::new();
     let mut order = Vec::new();
     for root in ctx.function_ids() {
@@ -128,7 +129,7 @@ fn callee_first_order(ctx: &Context) -> Vec<FunctionId> {
                 continue;
             }
             stack.push((fid, true));
-            for callee in FunctionBody::from_id(ctx, fid).callees() {
+            for callee in graph.callees(fid) {
                 if !visited.contains(&callee) {
                     stack.push((callee, false));
                 }
@@ -691,10 +692,8 @@ fn apply(
     shadow: SpaceId,
     sp_reg: Option<VarnodeId>,
 ) -> bool {
-    let has_callers = ctx
-        .instructions()
-        .any(|insn| matches!(insn.mnemonic(), Mnemonic::Call(c) if c.target.real() == Some(fid)));
-    if !has_callers {
+    let call_sites = crate::calls::fresh_direct_call_sites(ctx, fid);
+    if call_sites.is_empty() {
         return false;
     }
 
@@ -962,13 +961,7 @@ fn seed_addr(b: &mut Builder<'_, '_>, base: ValueId, base_size: usize, offset: i
 /// the `mark-pure` `repeat_until = no_change` loop settles. Returns `true` only if a
 /// new snapshot was added.
 fn apply_partial(ctx: &mut Context, fid: FunctionId, promoted: &[Promoted]) -> bool {
-    let call_sites: Vec<InstructionId> = ctx
-        .instructions()
-        .filter_map(|insn| match insn.mnemonic() {
-            Mnemonic::Call(c) if c.target.real() == Some(fid) => Some(insn.id),
-            _ => None,
-        })
-        .collect();
+    let call_sites = crate::calls::fresh_direct_call_sites(ctx, fid);
     if call_sites.is_empty() {
         return false;
     }

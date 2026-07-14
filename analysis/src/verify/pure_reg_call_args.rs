@@ -13,6 +13,8 @@ use qcode::{
     },
 };
 
+use crate::{CallGraph, calls::direct_call_sites};
+
 /// A direct call to a `pure_reg` function does not match the callee's root params.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PureRegCallArgsViolation {
@@ -61,6 +63,7 @@ impl PureRegCallArgsViolation {
 /// Return every direct-call interface violation for `pure_reg` functions.
 pub fn verify_pure_reg_call_args(ctx: &Context<'_>) -> Vec<PureRegCallArgsViolation> {
     let mut violations = Vec::new();
+    let graph = CallGraph::analyze(ctx);
 
     for callee in ctx.function_ids() {
         let function = FunctionBody::from_id(ctx, callee);
@@ -75,13 +78,11 @@ pub fn verify_pure_reg_call_args(ctx: &Context<'_>) -> Vec<PureRegCallArgsViolat
             .map(|param| param.size())
             .collect();
 
-        for insn in ctx.instructions() {
+        for call_id in direct_call_sites(ctx, &graph, callee) {
+            let insn = ctx.get_insn(call_id);
             let qcode::value::insn::Mnemonic::Call(call) = insn.mnemonic() else {
-                continue;
+                unreachable!("direct_call_sites returned a non-Call instruction");
             };
-            if call.target.real() != Some(callee) {
-                continue;
-            }
 
             let size_mismatch = if call.args.len() == param_sizes.len() {
                 first_size_mismatch(ctx, &insn.operands(), &param_sizes)
@@ -92,7 +93,7 @@ pub fn verify_pure_reg_call_args(ctx: &Context<'_>) -> Vec<PureRegCallArgsViolat
             if call.args.len() != param_sizes.len() || size_mismatch.is_some() {
                 violations.push(PureRegCallArgsViolation {
                     callee,
-                    call: insn.id,
+                    call: call_id,
                     expected_args: param_sizes.len(),
                     actual_args: call.args.len(),
                     size_mismatch,

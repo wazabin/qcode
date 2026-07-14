@@ -21,8 +21,8 @@ use qcode::{
     context::Context,
     space::SpaceId,
     value::{
-        BasicBlock, FunctionBody, FunctionId, Instruction, InstructionId, Value, ValueId, Varnode,
-        VarnodeId, insn::Mnemonic,
+        BasicBlock, FunctionBody, FunctionId, Instruction, Value, ValueId, Varnode, VarnodeId,
+        insn::Mnemonic,
     },
 };
 
@@ -179,12 +179,14 @@ pub fn argpromote_external(ctx: &mut Context, env: &PipelineEnv) -> bool {
     // target is the external. Filtering on the direct call-site index (an O(1) map
     // lookup) skips the `cabi::lookup` and the whole-program instruction scan for
     // every imported-but-unreferenced symbol — the bulk of an import table.
+    let graph = crate::CallGraph::analyze(ctx);
     let externals: Vec<FunctionId> = ctx
         .functions()
         .filter(|f| f.is_external())
         .map(|f| f.id)
-        .filter(|&id| !ctx.shared.values.call_sites_of(id).is_empty())
+        .filter(|&id| !crate::calls::direct_call_sites(ctx, &graph, id).is_empty())
         .collect();
+    drop(graph);
 
     if externals.is_empty() {
         return false;
@@ -239,13 +241,7 @@ fn bind_external_return(ctx: &mut Context, fid: FunctionId, ret: VarnodeId) -> b
     let size = Varnode::from_id(&*ctx, ret).size();
     let int_ty = ctx.shared.types.get_or_make_int(size);
 
-    let call_sites: Vec<InstructionId> = ctx
-        .instructions()
-        .filter_map(|insn| match insn.mnemonic() {
-            Mnemonic::Call(c) if c.target.real() == Some(fid) => Some(insn.id),
-            _ => None,
-        })
-        .collect();
+    let call_sites = crate::calls::fresh_direct_call_sites(ctx, fid);
 
     let mut changed = false;
     for call_id in call_sites {

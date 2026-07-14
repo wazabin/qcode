@@ -2,6 +2,14 @@
 //! registers, stack delta), call-argument binding, the stack-fact learning that
 //! backs them, and the clobbered-register computation.
 
+use qcode::{
+    context::Context,
+    value::{
+        FunctionId,
+        insn::{InstructionId, Mnemonic},
+    },
+};
+
 mod argpromote;
 mod call_graph;
 mod carried_array;
@@ -38,3 +46,30 @@ pub use summaries::{
     compute_call_clobbered_regs, compute_input_regs, compute_stack_delta,
     set_all_call_clobbered_regs, set_all_function_summaries, set_function_summaries,
 };
+
+/// Incoming sites backed specifically by a real [`Mnemonic::Call`]. The graph's
+/// public `call_sites` query also includes direct-like `Apply`/`Map`/`Scan` and
+/// `TailCall` sites; interface-rewrite consumers must not treat those encodings
+/// as positional `Call.args`.
+pub(crate) fn direct_call_sites(
+    ctx: &Context<'_>,
+    graph: &CallGraph,
+    callee: FunctionId,
+) -> Vec<InstructionId> {
+    graph
+        .call_sites(callee)
+        .into_iter()
+        .filter(|&site| {
+            matches!(
+                ctx.get_insn(site).mnemonic(),
+                Mnemonic::Call(call) if call.target.real() == Some(callee)
+            )
+        })
+        .collect()
+}
+
+/// Build a fresh graph, extract real direct-call sites, then drop the snapshot
+/// before the caller mutates IR.
+pub(crate) fn fresh_direct_call_sites(ctx: &Context<'_>, callee: FunctionId) -> Vec<InstructionId> {
+    direct_call_sites(ctx, &CallGraph::analyze(ctx), callee)
+}

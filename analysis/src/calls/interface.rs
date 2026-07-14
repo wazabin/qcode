@@ -84,13 +84,7 @@ pub fn append_caller_arg(
     fid: FunctionId,
     mut build: impl FnMut(&mut Context, InstructionId, BlockId) -> Option<ValueId>,
 ) -> bool {
-    let call_sites: Vec<InstructionId> = ctx
-        .instructions()
-        .filter_map(|insn| match insn.mnemonic() {
-            Mnemonic::Call(c) if c.target.real() == Some(fid) => Some(insn.id),
-            _ => None,
-        })
-        .collect();
+    let call_sites = super::fresh_direct_call_sites(ctx, fid);
     let mut changed = false;
     for call_id in call_sites {
         let Some(block) = ctx.get_insn(call_id).parent().map(|b| b.id) else {
@@ -130,6 +124,10 @@ pub fn remove_entry_param(ctx: &mut Context, fid: FunctionId, index: usize) {
         return;
     };
 
+    // Snapshot caller IDs before the first structural mutation, then drop the
+    // graph. The relationship itself is unchanged by this lockstep rewrite.
+    let call_sites = super::fresh_direct_call_sites(ctx, fid);
+
     // Drop the root param at `index`, reindexing the survivors.
     let mut params = ctx.block(root).params.clone();
     if index >= params.len() {
@@ -160,13 +158,6 @@ pub fn remove_entry_param(ctx: &mut Context, fid: FunctionId, index: usize) {
     }
 
     // Drop the matching positional argument at every direct caller.
-    let call_sites: Vec<InstructionId> = ctx
-        .instructions()
-        .filter_map(|insn| match insn.mnemonic() {
-            Mnemonic::Call(c) if c.target.real() == Some(fid) => Some(insn.id),
-            _ => None,
-        })
-        .collect();
     for call_id in call_sites {
         let Mnemonic::Call(call) = ctx.get_insn(call_id).mnemonic().clone() else {
             continue;

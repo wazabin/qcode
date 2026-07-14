@@ -128,15 +128,17 @@ pub(crate) fn address_taken_set(ctx: &Context) -> FxHashSet<FunctionId> {
 /// interface but never adds or removes a direct `Call.target` edge, so the set of
 /// called functions is invariant while the loop runs.
 pub(crate) fn called_function_set(ctx: &Context) -> FxHashSet<FunctionId> {
-    let mut set = FxHashSet::default();
-    for insn in ctx.instructions() {
-        if let Mnemonic::Call(c) = insn.mnemonic()
-            && let Some(target) = c.target.real()
-        {
-            set.insert(target);
-        }
-    }
-    set
+    let graph = crate::CallGraph::analyze(ctx);
+    graph
+        .edges()
+        .filter_map(|(_, edge)| {
+            let site = edge.site?;
+            let Mnemonic::Call(call) = ctx.get_insn(site).mnemonic() else {
+                return None;
+            };
+            call.target.real()
+        })
+        .collect()
 }
 
 // ===========================================================================
@@ -269,13 +271,7 @@ pub(crate) fn append_outputs<S>(
         return;
     };
 
-    let call_sites: Vec<InstructionId> = ctx
-        .instructions()
-        .filter_map(|insn| match insn.mnemonic() {
-            Mnemonic::Call(c) if c.target.real() == Some(fid) => Some(insn.id),
-            _ => None,
-        })
-        .collect();
+    let call_sites = super::fresh_direct_call_sites(ctx, fid);
     for call_id in call_sites {
         // The call now yields the write-set aggregate. Resize when appending: the
         // register channel may have already typed it to its (smaller) positional

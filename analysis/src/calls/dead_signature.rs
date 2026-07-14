@@ -41,7 +41,7 @@ use qcode::{
     },
 };
 
-use crate::{Pass, PipelineEnv, remove_entry_param};
+use crate::{CallGraph, Pass, PipelineEnv, remove_entry_param};
 
 /// Bound on worklist iterations: each *changing* iteration strictly removes at
 /// least one param or returned field (a quantity bounded by the module), so this
@@ -99,12 +99,12 @@ pub fn dead_signature(ctx: &mut Context) -> bool {
 /// scan over every instruction, replacing the per-callee rescan the trims used
 /// to do (which made the worklist `O(functions × total_instructions)`).
 fn build_call_index(ctx: &Context) -> HashMap<FunctionId, Vec<InstructionId>> {
+    let graph = CallGraph::analyze(ctx);
     let mut index: HashMap<FunctionId, Vec<InstructionId>> = HashMap::default();
-    for insn in ctx.instructions() {
-        if let Mnemonic::Call(c) = insn.mnemonic()
-            && let Some(target) = c.target.real()
-        {
-            index.entry(target).or_default().push(insn.id);
+    for callee in ctx.function_ids() {
+        let sites = super::direct_call_sites(ctx, &graph, callee);
+        if !sites.is_empty() {
+            index.insert(callee, sites);
         }
     }
     index

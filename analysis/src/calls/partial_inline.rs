@@ -127,16 +127,6 @@ fn returns_of(ctx: &Context, fid: FunctionId) -> Vec<InstructionId> {
         .collect()
 }
 
-/// Direct call sites (`Call` instructions) whose target is `fid`.
-fn direct_call_sites(ctx: &Context, fid: FunctionId) -> Vec<InstructionId> {
-    ctx.instructions()
-        .filter_map(|insn| match insn.mnemonic() {
-            Mnemonic::Call(c) if c.target.real() == Some(fid) => Some(insn.id),
-            _ => None,
-        })
-        .collect()
-}
-
 /// The write-set `Tuple`'s field values at `ret_id`, or `None` if the return
 /// carries no `Tuple` value.
 fn return_tuple_fields(ctx: &Context, ret_id: InstructionId) -> Option<Vec<ValueId>> {
@@ -210,7 +200,7 @@ fn try_partial_inline(ctx: &mut Context, fid: FunctionId) -> bool {
         return false;
     };
 
-    let call_sites = direct_call_sites(ctx, fid);
+    let call_sites = super::fresh_direct_call_sites(ctx, fid);
     if call_sites.is_empty() {
         return false;
     }
