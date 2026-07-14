@@ -15,7 +15,7 @@ use crate::register_intrinsic;
 use crate::types::{TypeId, TypeManager};
 use crate::value::ValueId;
 use crate::value::insn::{Intrinsic, IntrinsicId, Mnemonic, Simplified};
-use crate::value::util::base_ref::HostRef;
+use crate::value::{BodyView, QCodeView};
 
 /// `at` — read a sequence lane at a dynamic index.
 struct At;
@@ -27,12 +27,12 @@ enum IdxRel {
     Unknown,
 }
 
-fn index_rel(host: HostRef, a: ValueId, b: ValueId) -> IdxRel {
+fn index_rel(view: BodyView<'_, '_>, a: ValueId, b: ValueId) -> IdxRel {
     if a == b {
         return IdxRel::Equal;
     }
     if let (ValueId::Literal(x), ValueId::Literal(y)) = (a, b) {
-        return if host.shr().values.literals[x].value == host.shr().values.literals[y].value {
+        return if view.shared().values.literals[x].value == view.shared().values.literals[y].value {
             IdxRel::Equal
         } else {
             IdxRel::Distinct
@@ -64,7 +64,7 @@ impl Intrinsic for At {
 
     fn simplify(
         &self,
-        host: HostRef,
+        view: BodyView<'_, '_>,
         _id: IntrinsicId,
         out_size: usize,
         args: &[ValueId],
@@ -72,7 +72,7 @@ impl Intrinsic for At {
         let &[arr, index] = args else {
             return None;
         };
-        simplify_at(host, out_size, arr, index)
+        simplify_at(view, out_size, arr, index)
     }
 }
 
@@ -82,21 +82,26 @@ impl Intrinsic for At {
 /// re-issued `at` would be materialized verbatim (e.g. `at(concat(singleton(v),
 /// scan), 0)` narrows to `at(singleton(v), 0)` but stops there instead of folding
 /// to `v`), leaving the seed read un-concretized and its array live.
-fn simplify_at(host: HostRef, out_size: usize, arr: ValueId, index: ValueId) -> Option<Simplified> {
+fn simplify_at(
+    view: BodyView<'_, '_>,
+    out_size: usize,
+    arr: ValueId,
+    index: ValueId,
+) -> Option<Simplified> {
     {
         // Read straight out of a constant `Bytes` array at a constant index.
         if let (ValueId::Bytes(bid), ValueId::Literal(ilit)) = (arr, index) {
-            let arr_ty = host.shr().values.bytes[bid].type_id;
-            if let Some((elem, count)) = host.shr().types.array_of(arr_ty) {
-                let esz = host.shr().types.size_of(elem);
-                let i = host.shr().values.literals[ilit].value as usize;
+            let arr_ty = view.shared().values.bytes[bid].type_id;
+            if let Some((elem, count)) = view.shared().types.array_of(arr_ty) {
+                let esz = view.shared().types.size_of(elem);
+                let i = view.shared().values.literals[ilit].value as usize;
                 if i < count {
                     let off = i * esz;
-                    let data = &host.shr().values.bytes[bid].data;
+                    let data = &view.shared().values.bytes[bid].data;
                     let mut buf = [0u8; 8];
                     buf[..esz].copy_from_slice(&data[off..off + esz]);
                     let v = u64::from_le_bytes(buf);
-                    return Some(Simplified::Value(host.shr().get_const(v, out_size)));
+                    return Some(Simplified::Value(view.shared().get_const(v, out_size)));
                 }
             }
         }
@@ -105,7 +110,7 @@ fn simplify_at(host: HostRef, out_size: usize, arr: ValueId, index: ValueId) -> 
         let ValueId::Instruction(iid) = arr else {
             return None;
         };
-        let Mnemonic::Intrinsic(app) = host.instruction(iid).mnemonic() else {
+        let Mnemonic::Intrinsic(app) = view.instruction(iid).mnemonic() else {
             return None;
         };
         let name = app.id.name();
@@ -116,10 +121,10 @@ fn simplify_at(host: HostRef, out_size: usize, arr: ValueId, index: ValueId) -> 
             // `at(insert(a, i, v), j)`.
             "insert" => {
                 let (base, ins_idx, val) = (args[0], args[1], args[2]);
-                match index_rel(host, ins_idx, index) {
+                match index_rel(view, ins_idx, index) {
                     IdxRel::Equal => Some(Simplified::Value(val)),
                     // Re-issue the read against the underlying array.
-                    IdxRel::Distinct => Some(forward(host, out_size, base, index)),
+                    IdxRel::Distinct => Some(forward(view, out_size, base, index)),
                     IdxRel::Unknown => None,
                 }
             }
@@ -133,14 +138,14 @@ fn simplify_at(host: HostRef, out_size: usize, arr: ValueId, index: ValueId) -> 
                 let ValueId::Literal(jlit) = index else {
                     return None;
                 };
-                let j = host.shr().values.literals[jlit].value;
-                let a_ty = host.type_of(a);
-                let (_, len_a) = host.shr().types.array_of(a_ty)?;
+                let j = view.shared().values.literals[jlit].value;
+                let a_ty = view.type_of(a);
+                let (_, len_a) = view.shared().types.array_of(a_ty)?;
                 if j < len_a as u64 {
-                    Some(forward(host, out_size, a, index))
+                    Some(forward(view, out_size, a, index))
                 } else {
-                    let shifted = host.shr().get_const(j - len_a as u64, 8);
-                    Some(forward(host, out_size, b, shifted))
+                    let shifted = view.shared().get_const(j - len_a as u64, 8);
+                    Some(forward(view, out_size, b, shifted))
                 }
             }
             _ => None,
@@ -152,8 +157,8 @@ fn simplify_at(host: HostRef, out_size: usize, arr: ValueId, index: ValueId) -> 
 /// re-issued `at` expression when no further constructor forwarding applies. So
 /// a chain like `at(concat(singleton(v), s), 0)` collapses all the way to `v`
 /// rather than stalling at `at(singleton(v), 0)`.
-fn forward(host: HostRef, out_size: usize, base: ValueId, index: ValueId) -> Simplified {
-    simplify_at(host, out_size, base, index).unwrap_or_else(|| {
+fn forward(view: BodyView<'_, '_>, out_size: usize, base: ValueId, index: ValueId) -> Simplified {
+    simplify_at(view, out_size, base, index).unwrap_or_else(|| {
         Simplified::Expression(Mnemonic::Intrinsic(crate::value::insn::IntrinsicApp {
             id: IntrinsicId::from_name("at").unwrap(),
             // The expression's operands are all in `base`/`index`'s own body; strip
@@ -171,7 +176,14 @@ mod tests {
     use crate::builder::Builder;
     use crate::context::Context;
     use crate::value::insn::IntrinsicId;
-    use crate::value::{BasicBlock, LocalValueId, ValueId};
+    use crate::value::{BasicBlock, BodyView, FunctionId, LocalValueId, ValueId};
+
+    fn body_view<'ctx, 'str: 'ctx>(
+        ctx: &'ctx Context<'str>,
+        function: FunctionId,
+    ) -> BodyView<'ctx, 'str> {
+        BodyView::new(&ctx.bodies[function], &ctx.shared, &ctx.interfaces)
+    }
 
     fn at_id() -> IntrinsicId {
         IntrinsicId::from_name("at").unwrap()
@@ -208,7 +220,7 @@ mod tests {
         };
         match at_id()
             .desc()
-            .simplify((&ctx).into(), at_id(), 4, &[ins, i])
+            .simplify(body_view(&ctx, blk.func), at_id(), 4, &[ins, i])
         {
             Some(Simplified::Value(got)) => assert_eq!(got, v),
             other => panic!("expected v, got {other:?}"),
@@ -238,7 +250,7 @@ mod tests {
         };
         match at_id()
             .desc()
-            .simplify((&ctx).into(), at_id(), 4, &[ins, j])
+            .simplify(body_view(&ctx, blk.func), at_id(), 4, &[ins, j])
         {
             Some(Simplified::Expression(Mnemonic::Intrinsic(app))) => {
                 assert_eq!(app.id.name(), "at");
@@ -268,7 +280,7 @@ mod tests {
         let idx = ctx.get_const(0, 8).id();
         match at_id()
             .desc()
-            .simplify((&ctx).into(), at_id(), 4, &[sing, idx])
+            .simplify(body_view(&ctx, blk.func), at_id(), 4, &[sing, idx])
         {
             Some(Simplified::Value(got)) => assert_eq!(got, v),
             other => panic!("expected v, got {other:?}"),
@@ -304,7 +316,7 @@ mod tests {
         let j0 = ctx.get_const(0, 8).id();
         match at_id()
             .desc()
-            .simplify((&ctx).into(), at_id(), 4, &[cat, j0])
+            .simplify(body_view(&ctx, blk.func), at_id(), 4, &[cat, j0])
         {
             Some(Simplified::Expression(Mnemonic::Intrinsic(app))) => {
                 assert_eq!(app.id.name(), "at");
@@ -319,7 +331,7 @@ mod tests {
         let j2 = ctx.get_const(2, 8).id();
         match at_id()
             .desc()
-            .simplify((&ctx).into(), at_id(), 4, &[cat, j2])
+            .simplify(body_view(&ctx, blk.func), at_id(), 4, &[cat, j2])
         {
             Some(Simplified::Expression(Mnemonic::Intrinsic(app))) => {
                 assert_eq!(app.id.name(), "at");
@@ -336,6 +348,7 @@ mod tests {
     #[test]
     fn at_reads_constant_bytes() {
         let mut ctx = Context::new();
+        let function = ctx.anon_function();
         let i32 = ctx.shared.types.get_or_make_int(4);
         let arr_ty = ctx.shared.types.get_or_make_array(i32, 3);
         let mut data = Vec::new();
@@ -349,7 +362,7 @@ mod tests {
         let idx = ctx.get_const(2, 8).id();
         match at_id()
             .desc()
-            .simplify((&ctx).into(), at_id(), 4, &[bid, idx])
+            .simplify(body_view(&ctx, function), at_id(), 4, &[bid, idx])
         {
             Some(Simplified::Value(ValueId::Literal(l))) => {
                 assert_eq!(ctx.shared.values.literals[l].value, 0x33);

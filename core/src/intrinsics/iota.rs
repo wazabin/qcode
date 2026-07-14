@@ -16,7 +16,7 @@ use crate::register_intrinsic;
 use crate::types::{TypeId, TypeManager};
 use crate::value::ValueId;
 use crate::value::insn::{Intrinsic, IntrinsicId, Simplified};
-use crate::value::util::base_ref::HostRef;
+use crate::value::{BodyView, QCodeView};
 
 /// `iota` — the index driver array `[0, 1, …, n-1]` of `i64` elements.
 struct Iota;
@@ -46,7 +46,7 @@ impl Intrinsic for Iota {
 
     fn simplify(
         &self,
-        host: HostRef,
+        view: BodyView<'_, '_>,
         _id: IntrinsicId,
         _out_size: usize,
         args: &[ValueId],
@@ -59,7 +59,7 @@ impl Intrinsic for Iota {
         let ValueId::Literal(lid) = n_val else {
             return None;
         };
-        let ctx = host.shr();
+        let ctx = view.shared();
         let n = ctx.values.literals[lid].value as usize;
 
         let i64_ty = ctx.types.get_or_make_int(8);
@@ -111,12 +111,16 @@ mod tests {
     /// A constant `n` folds `iota(n)` to a `Bytes` array `[i64; n]` = `0,1,…,n-1`.
     #[test]
     fn iota_of_const_folds_to_bytes_array() {
-        let ctx = Context::new();
+        let mut ctx = Context::new();
+        let function = ctx.anon_function();
         let n = ctx.get_const(3, 8).id();
         let id = IntrinsicId::from_name("iota").unwrap();
-        let Some(Simplified::Value(ValueId::Bytes(bid))) =
-            id.desc().simplify((&ctx).into(), id, 24, &[n])
-        else {
+        let Some(Simplified::Value(ValueId::Bytes(bid))) = id.desc().simplify(
+            BodyView::new(&ctx.bodies[function], &ctx.shared, &ctx.interfaces),
+            id,
+            24,
+            &[n],
+        ) else {
             panic!("iota(3) should fold to a Bytes array");
         };
         let bytes = &ctx.shared.values.bytes[bid];
@@ -142,7 +146,12 @@ mod tests {
         let id = IntrinsicId::from_name("iota").unwrap();
         assert!(
             id.desc()
-                .simplify((&ctx).into(), id, 8, &[ValueId::BlockParam(p)])
+                .simplify(
+                    BodyView::new(&ctx.bodies[blk.func], &ctx.shared, &ctx.interfaces),
+                    id,
+                    8,
+                    &[ValueId::BlockParam(p)],
+                )
                 .is_none()
         );
     }

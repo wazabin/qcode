@@ -29,7 +29,7 @@ use super::binop::IntBinop;
 use super::mnemonic::{Args, MnemonicKind};
 use crate::{
     types::{TypeId, TypeManager},
-    value::{InstructionId, LocalValueId, ValueId, ValueRef, util::base_ref::HostRef},
+    value::{BodyView, InstructionId, LocalValueId, QCodeView, ValueId, ValueRef},
 };
 use smallvec::SmallVec;
 
@@ -112,11 +112,11 @@ pub trait Intrinsic: Sync {
     }
 
     /// Recognize the raw-IR idiom rooted at `at`, returning the intrinsic's
-    /// operands when the instruction matches. Reads the IR through a [`HostRef`]
-    /// (so a checked-out function's own SSA values resolve) and mints any derived
-    /// operand literals through the shared interner (e.g. a rotate amount
+    /// operands when the instruction matches. Reads the IR through a
+    /// [`BodyView`] and mints any derived operand literals through the shared
+    /// interner (e.g. a rotate amount
     /// recovered as the `log2` of a strength-reduced multiplier).
-    fn recognize(&self, _host: HostRef, _at: InstructionId) -> Option<Vec<ValueId>> {
+    fn recognize(&self, _view: BodyView<'_, '_>, _at: InstructionId) -> Option<Vec<ValueId>> {
         None
     }
 
@@ -124,10 +124,10 @@ pub trait Intrinsic: Sync {
     /// `rol(x, 0) → x` or `rol(a, c) → rol(a, c mod bits)`. Receives the
     /// applied [`IntrinsicId`] (so a shared simplifier can branch on `rol` vs
     /// `ror`), the result byte width, and the operands. Reads through a
-    /// [`HostRef`] and mints replacement literals through the shared interner.
+    /// [`BodyView`] and mints replacement literals through the shared interner.
     fn simplify(
         &self,
-        _host: HostRef,
+        _view: BodyView<'_, '_>,
         _id: IntrinsicId,
         _out_size: usize,
         _args: &[ValueId],
@@ -264,13 +264,16 @@ pub(crate) fn mask_for(bytes: usize) -> u128 {
 }
 
 /// The non-symbolic constant value of `v`, or `None`.
-pub(crate) fn const_u64(host: HostRef, v: ValueId) -> Option<u64> {
-    match ValueRef::from_host(host, v) {
+pub(crate) fn const_u64<'ctx, 'str: 'ctx>(
+    view: impl QCodeView<'ctx, 'str>,
+    v: ValueId,
+) -> Option<u64> {
+    match ValueRef::from_view(view, v) {
         ValueRef::Literal(lit) => {
             let ValueId::Literal(id) = v else {
                 return None;
             };
-            if host.shr().values.literals[id].symbolic.is_some() {
+            if view.shared().values.literals[id].symbolic.is_some() {
                 return None;
             }
             Some(lit.value())
@@ -280,8 +283,8 @@ pub(crate) fn const_u64(host: HostRef, v: ValueId) -> Option<u64> {
 }
 
 /// If `v` is defined by an `IntBinop::want`, return its `(lhs, rhs)`.
-pub(crate) fn as_int_binop(
-    host: HostRef,
+pub(crate) fn as_int_binop<'ctx, 'str: 'ctx>(
+    view: impl QCodeView<'ctx, 'str>,
     v: ValueId,
     want: IntBinop,
 ) -> Option<(ValueId, ValueId)> {
@@ -289,7 +292,7 @@ pub(crate) fn as_int_binop(
     let ValueId::Instruction(id) = v else {
         return None;
     };
-    match host.instruction(id).mnemonic() {
+    match view.instruction(id).mnemonic() {
         Mnemonic::Binop(Binary {
             lhs,
             rhs,

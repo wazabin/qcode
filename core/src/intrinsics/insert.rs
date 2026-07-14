@@ -15,7 +15,7 @@ use crate::register_intrinsic;
 use crate::types::{TypeId, TypeManager};
 use crate::value::ValueId;
 use crate::value::insn::{Intrinsic, IntrinsicId, Simplified};
-use crate::value::util::base_ref::HostRef;
+use crate::value::{BodyView, QCodeView};
 
 /// `insert` — functional single-lane array update.
 struct Insert;
@@ -42,7 +42,7 @@ impl Intrinsic for Insert {
 
     fn simplify(
         &self,
-        host: HostRef,
+        view: BodyView<'_, '_>,
         _id: IntrinsicId,
         _out_size: usize,
         args: &[ValueId],
@@ -57,7 +57,7 @@ impl Intrinsic for Insert {
         else {
             return None;
         };
-        let ctx = host.shr();
+        let ctx = view.shared();
         let arr_ty = ctx.values.bytes[bid].type_id;
         let (elem, count) = ctx.types.array_of(arr_ty)?;
         let esz = ctx.types.size_of(elem);
@@ -102,6 +102,7 @@ mod tests {
     #[test]
     fn insert_into_const_bytes_folds() {
         let mut ctx = Context::new();
+        let function = ctx.anon_function();
         let i32 = ctx.shared.types.get_or_make_int(4);
         let arr_ty = ctx.shared.types.get_or_make_array(i32, 3);
         let bid = ctx.get_bytes(vec![0; 12]).id();
@@ -111,9 +112,12 @@ mod tests {
         let i = ctx.get_const(1, 8).id();
         let v = ctx.get_const(0xaa, 4).id();
         let id = IntrinsicId::from_name("insert").unwrap();
-        let Some(Simplified::Value(ValueId::Bytes(nb))) =
-            id.desc().simplify((&ctx).into(), id, 12, &[bid, i, v])
-        else {
+        let Some(Simplified::Value(ValueId::Bytes(nb))) = id.desc().simplify(
+            BodyView::new(&ctx.bodies[function], &ctx.shared, &ctx.interfaces),
+            id,
+            12,
+            &[bid, i, v],
+        ) else {
             panic!("insert into const Bytes should fold");
         };
         assert_eq!(&ctx.shared.values.bytes[nb].data[4..8], &[0xaa, 0, 0, 0]);

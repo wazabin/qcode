@@ -69,7 +69,7 @@ impl<'str> SubPassC<'str> for Identities {
                 .iter()
                 .map(|a| a.qualify(ic.insn_id.func))
                 .collect();
-            match id.desc().simplify(cx.read_host(body), id, ic.size, &args) {
+            match id.desc().simplify(cx.body_view(body), id, ic.size, &args) {
                 Some(Simplified::Value(repl)) => {
                     ed.replace_c(body, cx, ic.insn_id, repl);
                     return Claim::Done;

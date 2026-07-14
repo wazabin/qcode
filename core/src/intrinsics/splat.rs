@@ -15,7 +15,7 @@ use crate::register_intrinsic;
 use crate::types::{TypeId, TypeManager};
 use crate::value::ValueId;
 use crate::value::insn::{Intrinsic, IntrinsicId, Simplified};
-use crate::value::util::base_ref::HostRef;
+use crate::value::{BodyView, QCodeView};
 
 /// Lane count at or below which a constant `splat` folds to a `Bytes` literal.
 /// Above it the array stays a symbolic `$splat` so dumps remain readable.
@@ -48,7 +48,7 @@ impl Intrinsic for Splat {
 
     fn simplify(
         &self,
-        host: HostRef,
+        view: BodyView<'_, '_>,
         _id: IntrinsicId,
         _out_size: usize,
         args: &[ValueId],
@@ -61,7 +61,7 @@ impl Intrinsic for Splat {
         let (ValueId::Literal(vlid), ValueId::Literal(clid)) = (val, count) else {
             return None;
         };
-        let ctx = host.shr();
+        let ctx = view.shared();
         let n = ctx.values.literals[clid].value as usize;
         if n == 0 || n > SPLAT_LITERAL_MAX {
             return None;
