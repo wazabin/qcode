@@ -33,23 +33,22 @@ use std::any::Any;
 use rustc_hash::FxHashMap as HashMap;
 
 use qcode::value::{
-    FunctionId, Value, ValueId, ValueRef,
+    FunctionId, QCodeView, Value, ValueId, ValueRef,
     block::BlockId,
     insn::{Binary, Binop, InstructionId, IntBinop, Mnemonic, Range, Sext, Unary, Unop, Zext},
-    util::base_ref::HostRef,
 };
 
 use super::walk::{Claim, Editor, InsnCtx, SubPassC};
 
 use crate::{ContextView, FunctionBody};
 
-/// Fully host-routed: reads resolve through a [`HostRef`], the narrow values it
-/// materializes are pushed into the (possibly checked-out) function's own arena,
-/// and constants are minted through the shared interners.
+/// Reads resolve through the selected function's static view, narrow values are
+/// pushed into that body's arena, and constants are minted through shared
+/// interners.
 pub(super) struct NarrowTrunc;
 
 /// The function-pass [`SubPassC`] impl (context-split stage 5b-ii):
-/// eligibility reads through `cx.read_host(body)`, the recursive `narrow_to_c`
+/// eligibility reads through `cx.body_view(body)`, the recursive `narrow_to_c`
 /// rewrite runs over `&mut PassBacking`, and the forward goes through
 /// `Editor::replace_c`.
 impl<'str> SubPassC<'str> for NarrowTrunc {
@@ -78,7 +77,7 @@ impl<'str> SubPassC<'str> for NarrowTrunc {
             return Claim::Pass;
         };
         let (src, w) = (src.qualify(ic.insn_id.func), *size);
-        if value_size(cx.read_host(body), src) != w && !src_transformable(cx.read_host(body), src) {
+        if value_size(cx.body_view(body), src) != w && !src_transformable(cx.body_view(body), src) {
             return Claim::Pass;
         }
         let mut memo: HashMap<ValueId, ValueId> = HashMap::default();
@@ -92,8 +91,8 @@ impl<'str> SubPassC<'str> for NarrowTrunc {
 }
 
 /// Will [`narrow_to`] push through `v` rather than just wrap it in a `Range`?
-fn src_transformable(host: HostRef, v: ValueId) -> bool {
-    if numeric_const(host.shr(), v).is_some() {
+fn src_transformable<'ctx, 'str: 'ctx>(host: impl QCodeView<'ctx, 'str>, v: ValueId) -> bool {
+    if numeric_const(host.shared(), v).is_some() {
         return true;
     }
     let ValueId::Instruction(iid) = v else {
@@ -152,7 +151,7 @@ fn narrow_to_c<'str>(
     block: BlockId,
     memo: &mut HashMap<ValueId, ValueId>,
 ) -> ValueId {
-    if value_size(cx.read_host(body), v) == w {
+    if value_size(cx.body_view(body), v) == w {
         return v;
     }
     if let Some(&cached) = memo.get(&v) {
@@ -160,7 +159,7 @@ fn narrow_to_c<'str>(
     }
 
     let result = match v {
-        ValueId::Instruction(iid) => match cx.read_host(body).insn_ref(iid).mnemonic().clone() {
+        ValueId::Instruction(iid) => match cx.body_view(body).insn_ref(iid).mnemonic().clone() {
             Mnemonic::Binop(Binary {
                 op: Binop::Int(o),
                 lhs,
@@ -220,9 +219,9 @@ fn narrow_to_c<'str>(
             }
             _ => push_insn_c(body, cx, range_low(v, w, block.func), w, before, block),
         },
-        _ if numeric_const(cx.read_host(body).shr(), v).is_some() => {
-            let folded = numeric_const(cx.read_host(body).shr(), v).unwrap() & low_mask(w);
-            cx.read_host(body).shr().get_const(folded, w)
+        _ if numeric_const(cx.body_view(body).shared(), v).is_some() => {
+            let folded = numeric_const(cx.body_view(body).shared(), v).unwrap() & low_mask(w);
+            cx.body_view(body).shared().get_const(folded, w)
         }
         _ => push_insn_c(body, cx, range_low(v, w, block.func), w, before, block),
     };
@@ -243,7 +242,7 @@ fn narrow_extension_c<'str>(
     block: BlockId,
     memo: &mut HashMap<ValueId, ValueId>,
 ) -> ValueId {
-    if value_size(cx.read_host(body), src) >= w {
+    if value_size(cx.body_view(body), src) >= w {
         return narrow_to_c(body, cx, src, w, before, block, memo);
     }
     let m = if sext {
@@ -293,8 +292,8 @@ fn numeric_const(shared: &qcode::context::Shared, v: ValueId) -> Option<u64> {
     None
 }
 
-fn value_size(host: HostRef, v: ValueId) -> usize {
-    ValueRef::from_host(host, v).size()
+fn value_size<'ctx, 'str: 'ctx>(host: impl QCodeView<'ctx, 'str>, v: ValueId) -> usize {
+    ValueRef::from_view(host, v).size()
 }
 
 #[cfg(test)]
@@ -302,10 +301,11 @@ mod tests {
     use super::value_size;
     use crate::gvn::narrow_function;
     use crate::mba_simplify::mba_simplify;
-    use qcode::value::util::base_ref::HostRef;
     use qcode::{
         context::Context,
-        value::{BasicBlock, FunctionBody, FunctionId, Instruction, ValueId, insn::Mnemonic},
+        value::{
+            BasicBlock, FunctionBody, FunctionId, Instruction, ModuleView, ValueId, insn::Mnemonic,
+        },
     };
     use qcode_emulator::{SizedValue, StandaloneEmulator};
     use qcode_macro::qcode;
@@ -384,7 +384,7 @@ mod tests {
             })
         ));
         assert_eq!(
-            value_size(HostRef::from(&ctx), return_value(&ctx, widemul)),
+            value_size(ModuleView::new(&ctx), return_value(&ctx, widemul)),
             4
         );
         assert_eq!(sample(&ctx, widemul), before);
@@ -407,7 +407,7 @@ mod tests {
         );
         let before = sample(&ctx, z);
         assert!(narrow_function(&mut ctx, z));
-        assert_eq!(value_size(HostRef::from(&ctx), return_value(&ctx, z)), 4);
+        assert_eq!(value_size(ModuleView::new(&ctx), return_value(&ctx, z)), 4);
         assert!(!matches!(return_def(&ctx, z), Mnemonic::Range(_)));
         assert_eq!(sample(&ctx, z), before);
     }
