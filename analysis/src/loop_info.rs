@@ -21,7 +21,7 @@ use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
 use qcode::{
     context::Context,
     value::{
-        BlockId, BlockRef, FunctionId, FunctionRef, ModuleView, QCodeView, ValueId,
+        BlockId, BlockRef, FunctionId, FunctionRef, InstructionRef, ModuleView, QCodeView, ValueId,
         insn::{Binary, Binop, Branch, CBranch, InstructionId, IntBinop, Mnemonic},
         util::host_mut::PassBacking,
     },
@@ -194,6 +194,21 @@ pub(crate) fn users_of<'a, 'str: 'a>(
     match v.owning_function() {
         Some(f) => host.function_ref(f).users_of(v),
         None => Vec::new(),
+    }
+}
+
+/// `true` when `v` is defined by a parameter or instruction in `blocks`.
+pub(crate) fn value_defined_in<'a, 'str: 'a>(
+    host: impl QCodeView<'a, 'str>,
+    blocks: &[BlockId],
+    v: ValueId,
+) -> bool {
+    match v {
+        ValueId::BlockParam(_) => param_parent(host, v).is_some_and(|b| blocks.contains(&b)),
+        ValueId::Instruction(id) => InstructionRef::new(host, id)
+            .parent()
+            .is_some_and(|b| blocks.contains(&b.id)),
+        _ => false,
     }
 }
 

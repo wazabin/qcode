@@ -16,7 +16,7 @@ use qcode::{
     types::TypeId,
     value::{
         BasicBlock, BlockId, FunctionBody, FunctionId, FunctionKind, InstructionRef, LocalValueId,
-        ValueId, VarnodeId,
+        QCodeView, ValueId, VarnodeId,
         block_param::BlockParam,
         insn::{Binary, Binop, Callee, Extract, InstructionId, IntBinop, Mnemonic, Range, Return},
         util::{base_ref::BaseRef, base_ref::HostRef, host_mut::PassBacking},
@@ -49,11 +49,10 @@ fn is_pure_expr_op(m: &Mnemonic) -> bool {
 /// varnode, a function ref, or an impure op. A value in `inputs` is a leaf (it
 /// becomes a parameter); a literal is a leaf (referenced directly).
 pub(crate) fn pure_slice<'a, 'str: 'a>(
-    host: impl Into<HostRef<'a, 'str>>,
+    host: impl QCodeView<'a, 'str>,
     result: ValueId,
     inputs: &[ValueId],
 ) -> Option<Vec<InstructionId>> {
-    let host = host.into();
     let is_input = |v: ValueId| inputs.contains(&v);
     let mut order: Vec<InstructionId> = Vec::new();
     let mut seen: HashMap<ValueId, ()> = HashMap::default();
@@ -107,7 +106,7 @@ pub(crate) fn outline_expression<'str>(
     result: ValueId,
     inputs: &[ValueId],
 ) -> Option<Callee> {
-    let slice = pure_slice(m.read_host(body), result, inputs)?;
+    let slice = pure_slice(m.body_view(body), result, inputs)?;
     let inputs = inputs.to_vec();
     outline_core(
         m,
@@ -156,7 +155,7 @@ pub(crate) fn outline_tupled<'str>(
 ) -> Option<Callee> {
     let mut inputs = vec![index_input];
     inputs.extend(elem_input);
-    let slice = pure_slice(m.read_host(body), result, &inputs)?;
+    let slice = pure_slice(m.body_view(body), result, &inputs)?;
     outline_core(
         m,
         body,
@@ -249,7 +248,7 @@ pub(crate) fn outline_scan_body<'str>(
         // the index is not exposed.
         ScanElem::Data(_) => vec![acc_input, elem_input?],
     };
-    let slice = pure_slice(m.read_host(body), result, &inputs)?;
+    let slice = pure_slice(m.body_view(body), result, &inputs)?;
     outline_core(
         m,
         body,
@@ -336,10 +335,14 @@ pub(crate) fn outline_scan_body<'str>(
 /// reading the body function's return type, but a *minted* body is not yet
 /// installed in the registry, so it cannot be queried there and the node would
 /// otherwise receive the wrong fallback type.
-pub(crate) fn seq_result_type(host: HostRef, src: ValueId, body_ret: TypeId) -> TypeId {
+pub(crate) fn seq_result_type<'a, 'str: 'a>(
+    host: impl QCodeView<'a, 'str>,
+    src: ValueId,
+    body_ret: TypeId,
+) -> TypeId {
     let src_ty = host.type_of(src);
-    match host.shr().types.seq_of(src_ty) {
-        Some((_, len, is_list)) => host.shr().types.get_or_make_seq(body_ret, len, is_list),
+    match host.shared().types.seq_of(src_ty) {
+        Some((_, len, is_list)) => host.shared().types.get_or_make_seq(body_ret, len, is_list),
         None => src_ty,
     }
 }

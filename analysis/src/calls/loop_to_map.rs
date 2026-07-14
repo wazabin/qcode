@@ -13,17 +13,17 @@ use qcode::{
     builder::Builder,
     space::{Space, SpaceType},
     value::{
-        BlockId, FunctionId, ValueId,
+        BlockId, FunctionId, QCodeView, ValueId,
         insn::{InstructionId, IntrinsicId, Mnemonic},
-        util::{base_ref::BaseRef, base_ref::HostRef},
+        util::base_ref::BaseRef,
     },
 };
 
 use super::carried_array::{CarriedArray, classify_body_reads, exit_view, find_carried_array};
 use super::outline::{outline_expression, outline_tupled, pure_slice};
 use crate::loop_info::{
-    cbranch_exit, delete_private_loop, incoming, is_loop_private, param_parent, param_pos,
-    recognize_loops, users_of,
+    cbranch_exit, delete_private_loop, incoming, is_loop_private, param_pos, recognize_loops,
+    users_of, value_defined_in,
 };
 use crate::pipeline::{ContextView, FunctionBody, Minted, Outcome};
 use crate::{FunctionPass, register_function_pass};
@@ -89,7 +89,7 @@ struct MapMatch {
 
 /// Match the canonical total-map loop in `fid` on the shared carried-array form,
 /// or `None` for any other shape (the function is then left untouched).
-fn try_match(host: HostRef, fid: FunctionId) -> Option<MapMatch> {
+fn try_match<'a, 'str: 'a>(host: impl QCodeView<'a, 'str>, fid: FunctionId) -> Option<MapMatch> {
     // A map is a carried array with no lane-0 accumulator seed (a seed is the scan
     // shape, `loop_to_scan`'s pattern — the two are mutually exclusive here) and a
     // real initial array to range over.
@@ -150,7 +150,7 @@ fn try_match(host: HostRef, fid: FunctionId) -> Option<MapMatch> {
         .iter()
         .find_map(|i| match i.mnemonic() {
             Mnemonic::Store(s)
-                if matches!(Space::from_id(host.shr(), s.space).ty, SpaceType::Ram)
+                if matches!(Space::from_id(host.shared(), s.space).ty, SpaceType::Ram)
                     && s.src.qualify(i.id.func) == arr_exit =>
             {
                 Some(i.id)
@@ -174,8 +174,8 @@ fn try_match(host: HostRef, fid: FunctionId) -> Option<MapMatch> {
 
 /// Does the per-element body actually read the loop index? `enumerate` is only
 /// worth inserting when it does; a value-only body maps directly over the array.
-fn body_uses_index(
-    host: HostRef,
+fn body_uses_index<'a, 'str: 'a>(
+    host: impl QCodeView<'a, 'str>,
     stored_val: ValueId,
     index: ValueId,
     elem_read: Option<ValueId>,
@@ -213,15 +213,15 @@ fn apply<'str>(
     let fid = body.id();
     let enum_id = IntrinsicId::from_name("enumerate").expect("enumerate registered");
     let (name, uses_index, tuple_ty) = {
-        let host = m.read_host(body);
+        let host = m.body_view(body);
         let name = format!("{}_map_body", host.function_ref(fid).name());
         let uses_index = body_uses_index(host, mm.ca.stored_val, mm.ca.index, mm.elem_read);
         // The enumerate element type is needed before outlining (an index-aware
         // body unpacks the `(index, elem)` tuple); resolve it while only reading.
         let tuple_ty = if uses_index {
             let arr_ty = host.type_of(mm.init_arr);
-            let enum_ty = enum_id.desc().result_type(&host.shr().types, &[arr_ty]);
-            match host.shr().types.array_of(enum_ty) {
+            let enum_ty = enum_id.desc().result_type(&host.shared().types, &[arr_ty]);
+            match host.shared().types.array_of(enum_ty) {
                 Some((tuple_ty, _)) => Some(tuple_ty),
                 None => return false,
             }
@@ -271,7 +271,7 @@ fn apply<'str>(
     // Build `map(body, enumerate(arr0))` (index-aware) or `map(body, arr0)`
     // (value-only) ahead of the consumer, then forward the exit view to it.
     let anchor = mm.store_id.or_else(|| {
-        m.read_host(body)
+        m.body_view(body)
             .block_ref(mm.exit)
             .iter()
             .next()
@@ -293,8 +293,8 @@ fn apply<'str>(
     // function, so `push_map`'s "read the body's return type" cannot see it — the
     // element type is the loop's stored value.
     let map_val = {
-        let body_ret = m.read_host(body).type_of(mm.ca.stored_val);
-        let ty = crate::calls::outline::seq_result_type(m.read_host(body), src, body_ret);
+        let body_ret = m.body_view(body).type_of(mm.ca.stored_val);
+        let ty = crate::calls::outline::seq_result_type(m.body_view(body), src, body_ret);
         let id = body.push_mnemonic_with_type(
             Mnemonic::Map(qcode::value::insn::Map {
                 body: body_fn,
@@ -321,16 +321,16 @@ fn apply<'str>(
     // is a distinct exit param (the uncollapsed case) it has no in-loop uses and
     // this is exactly `replace_all_uses_with`.
     let loop_blocks = [mm.ca.header, mm.ca.body];
-    let exit_users: Vec<InstructionId> = users_of(m.read_host(body), mm.arr_exit).to_vec();
+    let exit_users: Vec<InstructionId> = users_of(m.body_view(body), mm.arr_exit).to_vec();
     for id in exit_users {
-        if m.read_host(body)
+        if m.body_view(body)
             .insn_ref(id)
             .parent()
             .is_some_and(|b| loop_blocks.contains(&b.id))
         {
             continue;
         }
-        let mut mn = m.read_host(body).insn_ref(id).mnemonic().clone();
+        let mut mn = m.body_view(body).insn_ref(id).mnemonic().clone();
         mn.replace_value(mm.arr_exit.localize(id.func), map_val.localize(id.func));
         body.replace_instruction_mnemonic(id, mn);
     }
@@ -342,33 +342,25 @@ fn apply<'str>(
     // rewrite would wrongly see that escaping use and keep the loop — and nothing
     // later deletes it: a self-carried loop's own guard and back-edge keep the index
     // and array live through the CFG, so no ordinary dce can collect the cycle.
-    let deletable = is_loop_private(m.read_host(body), &loop_blocks);
+    let deletable = is_loop_private(m.body_view(body), &loop_blocks);
 
     // Delete the residual loop when wholly private (mirrors `loop_to_scan::apply`):
     // reroute the single preheader straight to the exit, re-feeding each exit param
     // from a preheader-available value, then delete the loop blocks.
-    let defined_in_loop = |host: HostRef, v: ValueId| match v {
-        ValueId::BlockParam(_) => param_parent(host, v).is_some_and(|b| loop_blocks.contains(&b)),
-        ValueId::Instruction(id) => host
-            .insn_ref(id)
-            .parent()
-            .is_some_and(|b| loop_blocks.contains(&b.id)),
-        _ => false,
-    };
     let exit_args: Option<Vec<ValueId>> = m
-        .read_host(body)
+        .body_view(body)
         .block_ref(mm.exit)
         .params()
         .map(|p| p.id())
         .collect::<Vec<_>>()
         .into_iter()
         .map(|p| {
-            let rh = m.read_host(body);
+            let rh = m.body_view(body);
             let k = param_pos(rh, mm.exit, p)?;
             let [v] = incoming(rh, mm.exit, k)[..] else {
                 return None;
             };
-            if !defined_in_loop(rh, v) {
+            if !value_defined_in(rh, &loop_blocks, v) {
                 return Some(v);
             }
             if !matches!(v, ValueId::BlockParam(_)) {
@@ -377,7 +369,7 @@ fn apply<'str>(
             let kv = param_pos(rh, mm.ca.header, v)?;
             let init: Vec<ValueId> = incoming(rh, mm.ca.header, kv)
                 .into_iter()
-                .filter(|&w| !defined_in_loop(rh, w))
+                .filter(|&w| !value_defined_in(rh, &loop_blocks, w))
                 .collect();
             match init[..] {
                 [w] => Some(w),
@@ -387,7 +379,7 @@ fn apply<'str>(
         .collect();
     if deletable && let Some(exit_args) = exit_args {
         let preheaders: Vec<BlockId> = m
-            .read_host(body)
+            .body_view(body)
             .block_ref(mm.ca.header)
             .predecessors()
             .map(|(_, p)| p)
@@ -414,10 +406,10 @@ pub(crate) fn recognize_total_map<'str>(
     minted: &mut Vec<Minted<'str>>,
 ) -> bool {
     let fid = body.id();
-    if !m.read_host(body).function_ref(fid).is_pure() {
+    if !m.body_view(body).function_ref(fid).is_pure() {
         return false;
     }
-    let Some(mm) = try_match(m.read_host(body), fid) else {
+    let Some(mm) = try_match(m.body_view(body), fid) else {
         return false;
     };
     apply(m, body, next_minted, minted, &mm)

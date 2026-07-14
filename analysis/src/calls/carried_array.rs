@@ -14,9 +14,8 @@
 use qcode::{
     types::TypeId,
     value::{
-        BlockId, BlockRef, FunctionId, FunctionRef, InstructionRef, ValueId,
+        BlockId, BlockRef, FunctionId, FunctionRef, InstructionRef, QCodeView, ValueId,
         insn::{InstructionId, IntrinsicApp, IntrinsicId, Mnemonic},
-        util::base_ref::HostRef,
     },
 };
 
@@ -54,10 +53,9 @@ pub(crate) struct CarriedArray {
 /// Find the unique carried array in `fid`. Returns None when there is no
 /// carried array OR more than one (not the canonical shape).
 pub(crate) fn find_carried_array<'a, 'str: 'a>(
-    host: impl Into<HostRef<'a, 'str>>,
+    host: impl QCodeView<'a, 'str>,
     fid: FunctionId,
 ) -> Option<CarriedArray> {
-    let host = host.into();
     let insert_id = IntrinsicId::from_name("insert")?;
 
     let mut found: Option<CarriedArray> = None;
@@ -69,7 +67,7 @@ pub(crate) fn find_carried_array<'a, 'str: 'a>(
             .collect();
         for arr_h in params {
             let arr_ty = host.type_of(arr_h);
-            let Some((elem_ty, count)) = host.shr().types.array_of(arr_ty) else {
+            let Some((elem_ty, count)) = host.shared().types.array_of(arr_ty) else {
                 continue;
             };
             if count == 0 {
@@ -212,10 +210,9 @@ pub(crate) struct BodyReads {
 /// Classify the body's `at(arr_b, ·)` reads on the single carried array.
 /// `None` if any `at(arr_b, ·)` has an unrecognized index, or a class repeats.
 pub(crate) fn classify_body_reads<'a, 'str: 'a>(
-    host: impl Into<HostRef<'a, 'str>>,
+    host: impl QCodeView<'a, 'str>,
     ca: &CarriedArray,
 ) -> Option<BodyReads> {
-    let host = host.into();
     let at_id = IntrinsicId::from_name("at")?;
     let arr_b_ats: Vec<(InstructionId, ValueId)> = BlockRef::new(host, ca.body)
         .iter()
@@ -229,7 +226,7 @@ pub(crate) fn classify_body_reads<'a, 'str: 'a>(
         })
         .collect();
     let idx_ty = host.type_of(ca.index);
-    let idx_width = host.shr().types.size_of(idx_ty);
+    let idx_width = host.shared().types.size_of(idx_ty);
     let mut prev = None;
     let mut own = None;
     for (id, e_idx) in arr_b_ats {
@@ -254,11 +251,10 @@ pub(crate) fn classify_body_reads<'a, 'str: 'a>(
 /// param copying `arr_h` on the header→exit edge, or `arr_h` itself when gvn
 /// coalesced the pass-through.
 pub(crate) fn exit_view<'a, 'str: 'a>(
-    host: impl Into<HostRef<'a, 'str>>,
+    host: impl QCodeView<'a, 'str>,
     ca: &CarriedArray,
     exit: BlockId,
 ) -> ValueId {
-    let host = host.into();
     let exit_params: Vec<ValueId> = BlockRef::new(host, exit).params().map(|p| p.id()).collect();
     for p in exit_params {
         if let Some(kp) = param_pos(host, exit, p)
@@ -320,10 +316,11 @@ mod tests {
             run_function_pass::<ArrayPromote>(&mut ctx, prefix).unwrap(),
             "array_promote should promote the prefix sum"
         );
-        let ca = find_carried_array(&ctx, prefix).expect("carried array found");
+        let view = qcode::value::ModuleView::new(&ctx);
+        let ca = find_carried_array(view, prefix).expect("carried array found");
         assert!(ca.seed.is_some(), "prefix sum is the seeded scan shape");
         assert!(ca.init.is_none());
-        let reads = classify_body_reads(&ctx, &ca).expect("body reads classify");
+        let reads = classify_body_reads(view, &ca).expect("body reads classify");
         assert!(reads.prev.is_some(), "carry read at(arr, j-1)");
         assert!(reads.own.is_some(), "own-lane read at(arr, j)");
     }
@@ -366,14 +363,15 @@ mod tests {
     fn header_carried_index_accepted() {
         let mut ctx = Context::new();
         let f = promote_header_carried_fill(&mut ctx);
-        let ca = find_carried_array(&ctx, f).expect("header-carried index accepted");
+        let view = qcode::value::ModuleView::new(&ctx);
+        let ca = find_carried_array(view, f).expect("header-carried index accepted");
         assert_ne!(ca.header, ca.body, "split shape");
         assert_eq!(
             param_parent(qcode::value::ModuleView::new(&ctx), ca.index),
             Some(ca.header),
             "the index is the header induction param itself"
         );
-        let reads = classify_body_reads(&ctx, &ca).expect("body reads classify");
+        let reads = classify_body_reads(view, &ca).expect("body reads classify");
         assert!(reads.prev.is_none(), "no accumulator carry read");
         assert!(reads.own.is_some(), "own-lane read at(arr, i)");
     }
@@ -385,7 +383,8 @@ mod tests {
     fn foreign_block_index_rejected() {
         let mut ctx = Context::new();
         let f = promote_header_carried_fill(&mut ctx);
-        let ca = find_carried_array(&ctx, f).expect("promoted shape matches");
+        let ca = find_carried_array(qcode::value::ModuleView::new(&ctx), f)
+            .expect("promoted shape matches");
         // Rewrite the carry insert's index to a fresh param of the entry block.
         let insert_id = IntrinsicId::from_name("insert").unwrap();
         let carry = BasicBlock::from_id(&ctx, ca.body)
@@ -409,7 +408,7 @@ mod tests {
         args[1] = foreign.localize(carry.func);
         ctx.replace_instruction_mnemonic(carry, m);
         assert!(
-            find_carried_array(&ctx, f).is_none(),
+            find_carried_array(qcode::value::ModuleView::new(&ctx), f).is_none(),
             "a foreign-block index param must not match"
         );
     }
@@ -443,7 +442,8 @@ mod tests {
             "
         );
         assert!(run_function_pass::<ArrayPromote>(&mut ctx, reg_rot).unwrap());
-        let ca = find_carried_array(&ctx, reg_rot).expect("rotated carry matches");
+        let ca = find_carried_array(qcode::value::ModuleView::new(&ctx), reg_rot)
+            .expect("rotated carry matches");
         assert_eq!(ca.header, ca.body, "rotated: the body is its own header");
         assert_eq!(
             param_parent(qcode::value::ModuleView::new(&ctx), ca.index),

@@ -38,9 +38,9 @@
 use qcode::{
     builder::Builder,
     value::{
-        BlockId, FunctionId, ValueId,
+        BlockId, FunctionId, QCodeView, ValueId,
         insn::{InstructionId, IntrinsicApp, IntrinsicId, Mnemonic},
-        util::{base_ref::BaseRef, base_ref::HostRef},
+        util::base_ref::BaseRef,
     },
 };
 
@@ -48,7 +48,7 @@ use super::carried_array::{classify_body_reads, exit_view, find_carried_array};
 use super::outline::{ScanElem, outline_scan_body};
 use crate::loop_info::{
     cbranch_exit, delete_private_loop, incoming, is_increment, is_loop_private, literal,
-    param_parent, param_pos,
+    param_parent, param_pos, value_defined_in,
 };
 use crate::pipeline::{ContextView, FunctionBody, Minted, Outcome};
 use crate::{FunctionPass, register_function_pass};
@@ -93,7 +93,7 @@ struct ScanMatch {
 }
 
 /// Recognize the `insert`/`at` fill loop in `fid`.
-fn try_match(host: HostRef, fid: FunctionId) -> Option<ScanMatch> {
+fn try_match<'a, 'str: 'a>(host: impl QCodeView<'a, 'str>, fid: FunctionId) -> Option<ScanMatch> {
     // Anchor on the shared carried-array matcher, then narrow to the scan shape:
     // a lane-0 accumulator seed insert must exist (`ca.seed`).
     let ca = find_carried_array(host, fid)?;
@@ -213,10 +213,10 @@ fn apply<'str>(
 ) -> bool {
     let fid = body.id();
     let (index_ty, i64_ty, name) = {
-        let host = mv.read_host(body);
+        let host = mv.body_view(body);
         (
             host.type_of(m.index),
-            host.shr().types.get_or_make_int(8),
+            host.shared().types.get_or_make_int(8),
             format!("{}_scan_body", host.function_ref(fid).name()),
         )
     };
@@ -237,7 +237,7 @@ fn apply<'str>(
     let (body_fn, src_kind, src_arr_ty) = match m.elem {
         Some((elem_read, l0_exit)) => {
             let (esz, src_arr_ty) = {
-                let types = &mv.read_host(body).shr().types;
+                let types = &mv.body_view(body).shared().types;
                 (
                     types.size_of(m.elem_ty),
                     types.get_or_make_array(m.elem_ty, n1),
@@ -263,7 +263,11 @@ fn apply<'str>(
             (body_fn, Src::Slice { l0_exit, esz }, src_arr_ty)
         }
         None => {
-            let src_arr_ty = mv.read_host(body).shr().types.get_or_make_array(i64_ty, n1);
+            let src_arr_ty = mv
+                .body_view(body)
+                .shared()
+                .types
+                .get_or_make_array(i64_ty, n1);
             let Some(body_fn) = outline_scan_body(
                 mv,
                 body,
@@ -290,7 +294,7 @@ fn apply<'str>(
     // exit loads to `at(arr_exit, k)` earlier in the block, and those get
     // redirected to the folded array below — which must therefore dominate them.
     let Some(anchor) = mv
-        .read_host(body)
+        .body_view(body)
         .block_ref(m.exit)
         .iter()
         .next()
@@ -300,7 +304,7 @@ fn apply<'str>(
     };
     // Pre-existing exit instructions whose `arr_exit` uses are redirected.
     let preexisting: Vec<InstructionId> = mv
-        .read_host(body)
+        .body_view(body)
         .block_ref(m.exit)
         .iter()
         .map(|i| i.id)
@@ -340,8 +344,8 @@ fn apply<'str>(
     // build the node with an explicit type: a sequence of the accumulator
     // (stored-value) type with the source's length/kind.
     let scan = {
-        let body_ret = mv.read_host(body).type_of(m.stored_val);
-        let ty = crate::calls::outline::seq_result_type(mv.read_host(body), src, body_ret);
+        let body_ret = mv.body_view(body).type_of(m.stored_val);
+        let ty = crate::calls::outline::seq_result_type(mv.body_view(body), src, body_ret);
         let id = body.push_mnemonic_with_type(
             Mnemonic::Scan(qcode::value::insn::Scan {
                 body: body_fn,
@@ -366,7 +370,7 @@ fn apply<'str>(
     // `at(arr, k)` reads `array_promote` left for exit loads — to the folded
     // array, leaving the loop's own array dead for `dce`.
     for id in preexisting {
-        let mut mn = mv.read_host(body).insn_ref(id).mnemonic().clone();
+        let mut mn = mv.body_view(body).insn_ref(id).mnemonic().clone();
         mn.replace_value(m.arr_exit.localize(fid), full.localize(fid));
         body.replace_instruction_mnemonic(id, mn);
     }
@@ -383,33 +387,25 @@ fn apply<'str>(
     } else {
         vec![m.header, m.body]
     };
-    let private = is_loop_private(mv.read_host(body), &loop_blocks);
-    let defined_in_loop = |host: HostRef, v: ValueId| match v {
-        ValueId::BlockParam(_) => param_parent(host, v).is_some_and(|b| loop_blocks.contains(&b)),
-        ValueId::Instruction(id) => host
-            .insn_ref(id)
-            .parent()
-            .is_some_and(|b| loop_blocks.contains(&b.id)),
-        _ => false,
-    };
+    let private = is_loop_private(mv.body_view(body), &loop_blocks);
     // Each exit param (a now-dead array pass-through the later gvn would have
     // coalesced) must be re-fed from a preheader-available value: its
     // header-edge incoming directly if loop-invariant, or — when it copies a
     // loop param — that param's own loop-invariant (preheader) incoming.
     let exit_args: Option<Vec<ValueId>> = mv
-        .read_host(body)
+        .body_view(body)
         .block_ref(m.exit)
         .params()
         .map(|p| p.id())
         .collect::<Vec<_>>()
         .into_iter()
         .map(|p| {
-            let rh = mv.read_host(body);
+            let rh = mv.body_view(body);
             let k = param_pos(rh, m.exit, p)?;
             let [v] = incoming(rh, m.exit, k)[..] else {
                 return None;
             };
-            if !defined_in_loop(rh, v) {
+            if !value_defined_in(rh, &loop_blocks, v) {
                 return Some(v);
             }
             if !matches!(v, ValueId::BlockParam(_)) {
@@ -418,7 +414,7 @@ fn apply<'str>(
             let kv = param_pos(rh, m.header, v)?;
             let init: Vec<ValueId> = incoming(rh, m.header, kv)
                 .into_iter()
-                .filter(|&w| !defined_in_loop(rh, w))
+                .filter(|&w| !value_defined_in(rh, &loop_blocks, w))
                 .collect();
             match init[..] {
                 [w] => Some(w),
@@ -428,7 +424,7 @@ fn apply<'str>(
         .collect();
     if private && let Some(exit_args) = exit_args {
         let preheaders: Vec<BlockId> = mv
-            .read_host(body)
+            .body_view(body)
             .block_ref(m.header)
             .predecessors()
             .map(|(_, p)| p)
@@ -457,7 +453,7 @@ impl FunctionPass for LoopToScan {
         m: ContextView<'_, 'str>,
         next_minted: &mut u32,
     ) -> Result<Outcome<'str>, String> {
-        if let Some(sm) = try_match(m.read_host(f), f.id()) {
+        if let Some(sm) = try_match(m.body_view(f), f.id()) {
             let mut minted = Vec::new();
             let changed = apply(m, f, next_minted, &mut minted, &sm);
             return Ok(Outcome {
