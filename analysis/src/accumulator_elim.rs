@@ -48,16 +48,16 @@ use qcode::{
     builder::Builder,
     types::TypeId,
     value::{
-        FunctionId, FunctionKind, ValueId,
+        FunctionId, FunctionKind, QCodeView, ValueId,
         block::BlockId,
         block_param::{BlockParam, BlockParamId},
         insn::{Apply, CBranch, Extract, Mnemonic},
-        util::{
-            base_ref::{BaseRef, HostRef},
-            host_mut::PassBacking,
-        },
+        util::{base_ref::BaseRef, host_mut::PassBacking},
     },
 };
+
+#[cfg(test)]
+use qcode::value::ModuleView;
 
 use crate::loop_to_recursion::{recognize_loop, substitute_operands};
 use crate::pipeline::{ContextView, FunctionBody, Minted, Outcome};
@@ -98,7 +98,7 @@ pub fn accumulator_elim<'str>(
     minted: &mut Vec<Minted<'str>>,
 ) -> bool {
     let host = body.id();
-    let Some((model, plan)) = classify(m.read_host(body), host) else {
+    let Some((model, plan)) = classify(m.body_view(body), host) else {
         return false;
     };
     transform(m, body, next_minted, minted, &model, &plan);
@@ -108,8 +108,8 @@ pub fn accumulator_elim<'str>(
 /// Recognize the accumulator-elimination shape in `host` and, if it fires, return
 /// the loop model and the rewrite plan. Reads only — the mutation is
 /// [`transform`]'s.
-fn classify(
-    host: HostRef,
+fn classify<'ctx, 'str: 'ctx>(
+    host: impl QCodeView<'ctx, 'str>,
     host_fid: FunctionId,
 ) -> Option<(crate::loop_to_recursion::LoopModel, Plan)> {
     let ctx = host;
@@ -288,7 +288,7 @@ fn transform<'str>(
     p: &Plan,
 ) {
     let host_fid = body.id();
-    let base_name = format!("{}_acc", m.read_host(body).function_ref(host_fid).name());
+    let base_name = format!("{}_acc", m.body_view(body).function_ref(host_fid).name());
     // Mint the driver-only recursive lambda (name buffered raw; the driver
     // uniquifies it at the barrier). Keep the placeholder in every reference;
     // the install barrier patches it to the materialized function id.
@@ -432,7 +432,7 @@ fn transform<'str>(
 
     // --- Host: seed g and project the original return value out of the tuple.
     let root = model.root;
-    if let Some(term) = block_terminator(m.read_host(body), root) {
+    if let Some(term) = block_terminator(m.body_view(body), root) {
         body.remove_instruction(term);
     }
     let driver_init: Vec<ValueId> = p.d_slots.iter().map(|&i| model.init_args[i]).collect();
@@ -512,8 +512,8 @@ fn push_typed<'str>(
 
 /// Head-param slot indices that `val` transitively reads, resolving block-param
 /// references (latch/exit params) through `bindings`.
-fn head_param_deps(
-    host: HostRef,
+fn head_param_deps<'ctx, 'str: 'ctx>(
+    host: impl QCodeView<'ctx, 'str>,
     val: ValueId,
     bindings: &HashMap<BlockParamId, ValueId>,
     head_index: &HashMap<BlockParamId, usize>,
@@ -524,8 +524,8 @@ fn head_param_deps(
     out
 }
 
-fn collect_deps(
-    host: HostRef,
+fn collect_deps<'ctx, 'str: 'ctx>(
+    host: impl QCodeView<'ctx, 'str>,
     val: ValueId,
     bindings: &HashMap<BlockParamId, ValueId>,
     head_index: &HashMap<BlockParamId, usize>,
@@ -556,8 +556,8 @@ fn collect_deps(
 /// Rebuild the expression DAG rooted at `val` (read from `read`, the *host*
 /// function) into `target` (a block of the *minted* lambda `write`), substituting
 /// seeded leaves via `subst` and resolving block-param references via `bindings`.
-fn clone_cross<'str>(
-    read: HostRef<'_, 'str>,
+fn clone_cross<'ctx, 'str: 'ctx>(
+    read: impl QCodeView<'ctx, 'str>,
     write: &mut PassBacking<'_, 'str>,
     val: ValueId,
     subst: &mut HashMap<ValueId, ValueId>,
@@ -639,7 +639,10 @@ fn clone_self<'str>(
     result
 }
 
-fn header_cbranch(host: HostRef, header: BlockId) -> Option<CBranch> {
+fn header_cbranch<'ctx, 'str: 'ctx>(
+    host: impl QCodeView<'ctx, 'str>,
+    header: BlockId,
+) -> Option<CBranch> {
     let term = block_terminator(host, header)?;
     match host.insn_ref(term).mnemonic() {
         Mnemonic::CBranch(cbranch) => Some(cbranch.clone()),
@@ -647,7 +650,10 @@ fn header_cbranch(host: HostRef, header: BlockId) -> Option<CBranch> {
     }
 }
 
-fn block_return_value(host: HostRef, block: BlockId) -> Option<ValueId> {
+fn block_return_value<'ctx, 'str: 'ctx>(
+    host: impl QCodeView<'ctx, 'str>,
+    block: BlockId,
+) -> Option<ValueId> {
     let term = block_terminator(host, block)?;
     match host.insn_ref(term).mnemonic() {
         Mnemonic::ReturnValue(rv) => Some(rv.value.qualify(term.func)),
@@ -655,13 +661,16 @@ fn block_return_value(host: HostRef, block: BlockId) -> Option<ValueId> {
     }
 }
 
-fn block_terminator(host: HostRef, block: BlockId) -> Option<qcode::value::insn::InstructionId> {
+fn block_terminator<'ctx, 'str: 'ctx>(
+    host: impl QCodeView<'ctx, 'str>,
+    block: BlockId,
+) -> Option<qcode::value::insn::InstructionId> {
     let &id = host.block_ref(block).instruction_ids().last()?;
     host.insn_ref(id).is_terminator().then_some(id)
 }
 
-fn is_const_literal(host: HostRef, val: ValueId) -> bool {
-    matches!(val, ValueId::Literal(id) if host.shr().values.literals[id].symbolic.is_none())
+fn is_const_literal<'ctx, 'str: 'ctx>(host: impl QCodeView<'ctx, 'str>, val: ValueId) -> bool {
+    matches!(val, ValueId::Literal(id) if host.shared().values.literals[id].symbolic.is_none())
 }
 
 /// Reinterprets a constant literal at `size` bytes, so a base-case accumulator
@@ -688,7 +697,7 @@ mod tests {
 
     fn run(ctx: &Context, fun: FunctionId, n: u64) -> Option<u64> {
         let root = FunctionBody::from_id(ctx, fun).root().expect("root").id;
-        let term = block_terminator(HostRef::Module(ctx), root)?;
+        let term = block_terminator(ModuleView::new(ctx), root)?;
         let ret = match Instruction::from_id(ctx, term).mnemonic() {
             Mnemonic::ReturnValue(r) => r.value.qualify(term.func),
             _ => return None,

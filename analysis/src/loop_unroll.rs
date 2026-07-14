@@ -15,10 +15,10 @@ use std::collections::VecDeque;
 
 use jstd::graph::analysis::{DominatorTree, compute_dominators, compute_postdominators};
 use qcode::value::{
-    BlockParamId, FunctionId, ValueId,
+    BlockParamId, FunctionId, QCodeView, ValueId,
     block::BlockId,
     insn::{Binary, Binop, Branch, CBranch, InstructionId, IntBinop, Mnemonic},
-    util::base_ref::{BaseRef, HostRef},
+    util::base_ref::BaseRef,
 };
 
 use crate::{ContextView, FunctionBody, FunctionPass, Outcome};
@@ -103,14 +103,14 @@ pub fn recognize_simple_loops_host<'a, 'str>(
     cx: ContextView<'a, 'str>,
     fun_id: FunctionId,
 ) -> bool {
-    let Some(analysis) = LoopAnalysis::compute(cx.read_host(body), fun_id) else {
+    let Some(analysis) = LoopAnalysis::compute(cx.body_view(body), fun_id) else {
         return false;
     };
     let block_ids = analysis.block_ids();
     let recognized = analysis
         .backedges
         .iter()
-        .filter_map(|&edge| recognize_simple_loop(cx.read_host(body), &analysis, edge))
+        .filter_map(|&edge| recognize_simple_loop(cx.body_view(body), &analysis, edge))
         .fold(
             HashMap::<BlockId, Vec<SimpleLoop>>::default(),
             |mut acc, lp| {
@@ -123,10 +123,10 @@ pub fn recognize_simple_loops_host<'a, 'str>(
         .iter()
         .map(|&block| {
             let loop_comment = recognized.get(&block).and_then(|loops| {
-                (loops.len() == 1).then(|| format_loop_comment(cx.read_host(body), &loops[0]))
+                (loops.len() == 1).then(|| format_loop_comment(cx.body_view(body), &loops[0]))
             });
             let current = cx
-                .read_host(body)
+                .body_view(body)
                 .block_ref(block)
                 .comment()
                 .map(str::to_owned);
@@ -140,7 +140,7 @@ pub fn recognize_simple_loops_host<'a, 'str>(
     let mut changed = false;
     for (block, comment) in updates {
         let current = cx
-            .read_host(body)
+            .body_view(body)
             .block_ref(block)
             .comment()
             .map(str::to_owned);
@@ -162,7 +162,7 @@ pub fn unroll_simple_loops_host<'a, 'str>(
     cx: ContextView<'a, 'str>,
     fun_id: FunctionId,
 ) -> bool {
-    let Some(analysis) = LoopAnalysis::compute(cx.read_host(body), fun_id) else {
+    let Some(analysis) = LoopAnalysis::compute(cx.body_view(body), fun_id) else {
         return false;
     };
 
@@ -170,14 +170,14 @@ pub fn unroll_simple_loops_host<'a, 'str>(
         .backedges
         .iter()
         .filter_map(|&edge| {
-            let lp = recognize_simple_loop(cx.read_host(body), &analysis, edge)?;
+            let lp = recognize_simple_loop(cx.body_view(body), &analysis, edge)?;
             (lp.iterations < MAX_UNROLL_ITERATIONS).then_some((edge, lp))
         })
         .collect::<Vec<_>>();
 
     let mut changed = false;
     for (edge, lp) in candidates {
-        let Some(plan) = UnrollPlan::build(cx.read_host(body), &analysis, edge, lp) else {
+        let Some(plan) = UnrollPlan::build(cx.body_view(body), &analysis, edge, lp) else {
             continue;
         };
         if apply_unroll_plan(body, cx, plan) {
@@ -199,8 +199,8 @@ struct UnrollPlan {
 }
 
 impl UnrollPlan {
-    fn build(
-        host: HostRef,
+    fn build<'ctx, 'str: 'ctx>(
+        host: impl QCodeView<'ctx, 'str>,
         analysis: &LoopAnalysis,
         edge: BackEdge,
         lp: SimpleLoop,
@@ -252,7 +252,7 @@ fn apply_unroll_plan<'a, 'str>(
     let mut created_blocks = Vec::new();
 
     for iteration in 0..plan.lp.iterations {
-        let mut value_map = header_value_map(cx.read_host(body), plan.lp.header, &carried);
+        let mut value_map = header_value_map(cx.body_view(body), plan.lp.header, &carried);
 
         for (path_index, &old_block) in plan.path.iter().enumerate() {
             let new_block = body.make_block();
@@ -276,7 +276,7 @@ fn apply_unroll_plan<'a, 'str>(
             }
 
             let old_insns = cx
-                .read_host(body)
+                .body_view(body)
                 .block_ref(old_block)
                 .instruction_ids()
                 .to_vec();
@@ -286,7 +286,7 @@ fn apply_unroll_plan<'a, 'str>(
 
             for old_insn in body_insns.iter().copied() {
                 let (type_id, mnemonic) = {
-                    let old_ref = cx.read_host(body).insn_ref(old_insn);
+                    let old_ref = cx.body_view(body).insn_ref(old_insn);
                     (
                         old_ref.type_id(),
                         remap_mnemonic(old_ref.mnemonic(), &value_map),
@@ -294,7 +294,7 @@ fn apply_unroll_plan<'a, 'str>(
                 };
                 let new_insn = body.push_mnemonic_with_type(mnemonic, type_id);
                 let insert_at = cx
-                    .read_host(body)
+                    .body_view(body)
                     .block_ref(new_block)
                     .instruction_ids()
                     .len();
@@ -314,7 +314,7 @@ fn apply_unroll_plan<'a, 'str>(
             let is_latch = path_index + 1 == plan.path.len();
             if is_latch {
                 let Some(next_carried) = remapped_branch_args_to(
-                    cx.read_host(body),
+                    cx.body_view(body),
                     terminator,
                     plan.lp.header,
                     &value_map,
@@ -335,7 +335,7 @@ fn apply_unroll_plan<'a, 'str>(
     } else {
         remap_values(
             &plan.exit_args,
-            &header_value_map(cx.read_host(body), plan.lp.header, &plan.preheader_args),
+            &header_value_map(cx.body_view(body), plan.lp.header, &plan.preheader_args),
         )
     };
     replace_terminator_with_branch(body, cx, plan.preheader, final_target, preheader_args);
@@ -343,7 +343,7 @@ fn apply_unroll_plan<'a, 'str>(
     if let Some(last_new_block) = previous_new_block {
         let exit_args = remap_values(
             &plan.exit_args,
-            &header_value_map(cx.read_host(body), plan.lp.header, &carried),
+            &header_value_map(cx.body_view(body), plan.lp.header, &carried),
         );
         replace_terminator_with_branch(body, cx, last_new_block, plan.exit, exit_args);
     }
@@ -357,7 +357,7 @@ fn apply_unroll_plan<'a, 'str>(
     // values when the loop ran zero times). Uses inside the about-to-be-deleted loop
     // blocks are rewritten too, harmlessly.
     let header_params: Vec<BlockParamId> = cx
-        .read_host(body)
+        .body_view(body)
         .block_ref(plan.lp.header)
         .params()
         .map(|param| param.id)
@@ -373,8 +373,8 @@ fn apply_unroll_plan<'a, 'str>(
     !created_blocks.is_empty() || plan.lp.iterations == 0
 }
 
-fn loop_preheader(
-    host: HostRef,
+fn loop_preheader<'ctx, 'str: 'ctx>(
+    host: impl QCodeView<'ctx, 'str>,
     header: BlockId,
     loop_nodes: &HashSet<BlockId>,
 ) -> Option<BlockId> {
@@ -386,7 +386,11 @@ fn loop_preheader(
     preheaders.next().is_none().then_some(preheader)
 }
 
-fn branch_args_to(host: HostRef, block: BlockId, target: BlockId) -> Option<Vec<ValueId>> {
+fn branch_args_to<'ctx, 'str: 'ctx>(
+    host: impl QCodeView<'ctx, 'str>,
+    block: BlockId,
+    target: BlockId,
+) -> Option<Vec<ValueId>> {
     let term_id = *host.block_ref(block).instruction_ids().last()?;
     let Mnemonic::Branch(Branch {
         target: branch_target,
@@ -430,8 +434,8 @@ fn header_exit(
     }
 }
 
-fn linear_loop_path(
-    host: HostRef,
+fn linear_loop_path<'ctx, 'str: 'ctx>(
+    host: impl QCodeView<'ctx, 'str>,
     body: BlockId,
     latch: BlockId,
     loop_nodes: &HashSet<BlockId>,
@@ -461,8 +465,8 @@ fn linear_loop_path(
     }
 }
 
-fn header_value_map(
-    host: HostRef,
+fn header_value_map<'ctx, 'str: 'ctx>(
+    host: impl QCodeView<'ctx, 'str>,
     header: BlockId,
     values: &[ValueId],
 ) -> HashMap<ValueId, ValueId> {
@@ -473,8 +477,8 @@ fn header_value_map(
         .collect()
 }
 
-fn remapped_branch_args_to(
-    host: HostRef,
+fn remapped_branch_args_to<'ctx, 'str: 'ctx>(
+    host: impl QCodeView<'ctx, 'str>,
     terminator: InstructionId,
     target: BlockId,
     value_map: &HashMap<ValueId, ValueId>,
@@ -521,7 +525,7 @@ pub(crate) fn replace_terminator_with_branch<'a, 'str>(
     args: Vec<ValueId>,
 ) {
     let mut old_successors = cx
-        .read_host(body)
+        .body_view(body)
         .block_ref(block)
         .successors()
         .map(|(edge, _)| edge)
@@ -539,12 +543,12 @@ pub(crate) fn replace_terminator_with_branch<'a, 'str>(
     // that value and, when it is the exit argument, yields a branch that passes
     // itself. In that case append the branch instead.
     let term_id = cx
-        .read_host(body)
+        .body_view(body)
         .block_ref(block)
         .instruction_ids()
         .last()
         .copied()
-        .filter(|&id| cx.read_host(body).insn_ref(id).mnemonic().is_terminator());
+        .filter(|&id| cx.body_view(body).insn_ref(id).mnemonic().is_terminator());
     let local_target = target.localize(block.func);
     let args: Vec<_> = args
         .into_iter()
@@ -567,7 +571,7 @@ pub(crate) fn replace_terminator_with_branch<'a, 'str>(
             }),
             0,
         );
-        let end = cx.read_host(body).block_ref(block).instruction_ids().len();
+        let end = cx.body_view(body).block_ref(block).instruction_ids().len();
         {
             // TODO(5b-ii): `BaseRef::insert_insn_at_index` is not mirrored on
             // `FunctionBody`; go through a temporary host.
@@ -639,7 +643,10 @@ pub(crate) fn replace_terminator_with_branch_generic<'str>(
 }
 
 impl LoopAnalysis {
-    fn compute(host: HostRef, fun_id: FunctionId) -> Option<Self> {
+    fn compute<'ctx, 'str: 'ctx>(
+        host: impl QCodeView<'ctx, 'str>,
+        fun_id: FunctionId,
+    ) -> Option<Self> {
         let function = host.function_ref(fun_id);
         let root = function.root()?.id;
         let block_ids = function.iter().map(|block| block.id).collect::<Vec<_>>();
@@ -694,8 +701,8 @@ impl SimpleLoop {
     }
 }
 
-fn recognize_simple_loop(
-    host: HostRef,
+fn recognize_simple_loop<'ctx, 'str: 'ctx>(
+    host: impl QCodeView<'ctx, 'str>,
     analysis: &LoopAnalysis,
     edge: BackEdge,
 ) -> Option<SimpleLoop> {
@@ -749,7 +756,10 @@ fn recognize_simple_loop(
     })
 }
 
-fn natural_loop(host: HostRef, edge: BackEdge) -> HashSet<BlockId> {
+fn natural_loop<'ctx, 'str: 'ctx>(
+    host: impl QCodeView<'ctx, 'str>,
+    edge: BackEdge,
+) -> HashSet<BlockId> {
     let mut nodes = HashSet::from_iter([edge.header, edge.latch]);
     let mut worklist = VecDeque::from([edge.latch]);
 
@@ -764,7 +774,10 @@ fn natural_loop(host: HostRef, edge: BackEdge) -> HashSet<BlockId> {
     nodes
 }
 
-fn header_cbranch(host: HostRef, header: BlockId) -> Option<CBranch> {
+fn header_cbranch<'ctx, 'str: 'ctx>(
+    host: impl QCodeView<'ctx, 'str>,
+    header: BlockId,
+) -> Option<CBranch> {
     let block = host.block_ref(header);
     let term_id = *block.instruction_ids().last()?;
     match host.insn_ref(term_id).mnemonic() {
@@ -773,7 +786,10 @@ fn header_cbranch(host: HostRef, header: BlockId) -> Option<CBranch> {
     }
 }
 
-fn condition_bound(host: HostRef, condition: ValueId) -> Option<(BlockParamId, u64, bool)> {
+fn condition_bound<'ctx, 'str: 'ctx>(
+    host: impl QCodeView<'ctx, 'str>,
+    condition: ValueId,
+) -> Option<(BlockParamId, u64, bool)> {
     let ValueId::Instruction(condition_id) = condition else {
         return None;
     };
@@ -792,8 +808,8 @@ fn condition_bound(host: HostRef, condition: ValueId) -> Option<(BlockParamId, u
     Some((induction, bound, signed))
 }
 
-fn first_body_block(
-    host: HostRef,
+fn first_body_block<'ctx, 'str: 'ctx>(
+    host: impl QCodeView<'ctx, 'str>,
     analysis: &LoopAnalysis,
     loop_nodes: &HashSet<BlockId>,
     edge: BackEdge,
@@ -838,8 +854,8 @@ fn first_body_block(
     Some(body)
 }
 
-fn loop_initial_value(
-    host: HostRef,
+fn loop_initial_value<'ctx, 'str: 'ctx>(
+    host: impl QCodeView<'ctx, 'str>,
     header: BlockId,
     loop_nodes: &HashSet<BlockId>,
     param_index: usize,
@@ -863,7 +879,12 @@ fn loop_initial_value(
     numeric_const(host, args.get(param_index)?.qualify(preheader.func))
 }
 
-fn can_reach(host: HostRef, from: BlockId, to: BlockId, allowed: &HashSet<BlockId>) -> bool {
+fn can_reach<'ctx, 'str: 'ctx>(
+    host: impl QCodeView<'ctx, 'str>,
+    from: BlockId,
+    to: BlockId,
+    allowed: &HashSet<BlockId>,
+) -> bool {
     let mut seen = HashSet::default();
     let mut worklist = VecDeque::from([from]);
 
@@ -884,8 +905,8 @@ fn can_reach(host: HostRef, from: BlockId, to: BlockId, allowed: &HashSet<BlockI
     false
 }
 
-fn latch_step(
-    host: HostRef,
+fn latch_step<'ctx, 'str: 'ctx>(
+    host: impl QCodeView<'ctx, 'str>,
     body: BlockId,
     header: BlockId,
     param_index: usize,
@@ -906,7 +927,11 @@ fn latch_step(
     induction_increment(host, args.get(param_index)?.qualify(body.func), induction)
 }
 
-fn induction_increment(host: HostRef, value: ValueId, induction: BlockParamId) -> Option<u64> {
+fn induction_increment<'ctx, 'str: 'ctx>(
+    host: impl QCodeView<'ctx, 'str>,
+    value: ValueId,
+    induction: BlockParamId,
+) -> Option<u64> {
     let ValueId::Instruction(id) = value else {
         return None;
     };
@@ -930,13 +955,16 @@ fn induction_increment(host: HostRef, value: ValueId, induction: BlockParamId) -
     }
 }
 
-fn numeric_const(host: HostRef, value: ValueId) -> Option<u64> {
+fn numeric_const<'ctx, 'str: 'ctx>(
+    host: impl QCodeView<'ctx, 'str>,
+    value: ValueId,
+) -> Option<u64> {
     let id = value.as_literal()?;
-    let literal = &host.shr().values.literals[id];
+    let literal = &host.shared().values.literals[id];
     if literal.symbolic.is_some() {
         return None;
     }
-    let size = host.shr().types.size_of(literal.type_id);
+    let size = host.shared().types.size_of(literal.type_id);
     Some(if size >= 8 {
         literal.value
     } else {
@@ -944,7 +972,10 @@ fn numeric_const(host: HostRef, value: ValueId) -> Option<u64> {
     })
 }
 
-fn format_loop_comment(host: HostRef, lp: &SimpleLoop) -> String {
+fn format_loop_comment<'ctx, 'str: 'ctx>(
+    host: impl QCodeView<'ctx, 'str>,
+    lp: &SimpleLoop,
+) -> String {
     let induction = host.param_ref(lp.induction);
     let body = host
         .block_ref(lp.body)
@@ -1283,7 +1314,7 @@ mod tests {
             .collect();
         assert!(!preds.is_empty(), "exit must still be reachable");
         for pred in preds {
-            let args = branch_args_to((&ctx).into(), pred, exit);
+            let args = branch_args_to(qcode::value::ModuleView::new(&ctx), pred, exit);
             assert!(
                 args.is_some_and(|a| a.len() == exit_params),
                 "pred {pred:?} must pass an arg for the live-out exit param"
