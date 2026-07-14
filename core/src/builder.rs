@@ -2532,6 +2532,32 @@ mod tests {
     }
 
     #[test]
+    fn same_label_temps_in_different_functions_are_isolated() {
+        let mut ctx = Context::new();
+
+        let first = {
+            let mut builder = Builder::from_context(&mut ctx, 0x1000);
+            let temp = builder.make_temp_labeled(7, 4);
+            builder.finalize(0x1000);
+            temp
+        };
+        let second = {
+            let mut builder = Builder::from_context(&mut ctx, 0x2000);
+            let temp = builder.make_temp_labeled(7, 4);
+            builder.finalize(0x2000);
+            temp
+        };
+
+        assert_ne!(first, second);
+        let first = Varnode::from_id(&ctx, first);
+        let second = Varnode::from_id(&ctx, second);
+        assert_eq!((first.label(), second.label()), (Some(7), Some(7)));
+        assert_ne!(first.space().id, second.space().id);
+        assert!(matches!(first.space().ty, SpaceType::Temporary));
+        assert!(matches!(second.space().ty, SpaceType::Temporary));
+    }
+
+    #[test]
     fn qcode_local_decl_creates_named_temp() {
         let mut ctx = Context::new();
 

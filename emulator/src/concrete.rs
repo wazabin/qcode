@@ -3144,6 +3144,32 @@ mod tests {
     }
 
     #[test]
+    fn temporary_spaces_with_the_same_address_are_isolated() {
+        let mut ctx = Context::new();
+        let first = ctx.make_temp_space();
+        let second = ctx.make_temp_space();
+        let mut memory = EmulatedMemory::default();
+        memory.configure_spaces(&ctx);
+
+        let address = SizedValue::from_u64(0x20);
+        memory
+            .write(first, address, 1, SizedValue::new(0xaa, 1))
+            .unwrap();
+        memory
+            .write(second, address, 1, SizedValue::new(0x55, 1))
+            .unwrap();
+
+        assert_eq!(
+            memory.read(first, address, 1).unwrap().value().unwrap(),
+            0xaa
+        );
+        assert_eq!(
+            memory.read(second, address, 1).unwrap().value().unwrap(),
+            0x55
+        );
+    }
+
+    #[test]
     fn sized_value_byte_swap_preserves_width() {
         let value = SizedValue::new(0x1234, 2).byte_swap().unwrap();
         assert_eq!(value.value().unwrap(), 0x3412);
