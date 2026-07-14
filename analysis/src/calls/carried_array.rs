@@ -369,7 +369,7 @@ mod tests {
         let ca = find_carried_array(&ctx, f).expect("header-carried index accepted");
         assert_ne!(ca.header, ca.body, "split shape");
         assert_eq!(
-            param_parent(&ctx, ca.index),
+            param_parent(qcode::value::ModuleView::new(&ctx), ca.index),
             Some(ca.header),
             "the index is the header induction param itself"
         );
@@ -445,6 +445,9 @@ mod tests {
         assert!(run_function_pass::<ArrayPromote>(&mut ctx, reg_rot).unwrap());
         let ca = find_carried_array(&ctx, reg_rot).expect("rotated carry matches");
         assert_eq!(ca.header, ca.body, "rotated: the body is its own header");
-        assert_eq!(param_parent(&ctx, ca.index), Some(ca.body));
+        assert_eq!(
+            param_parent(qcode::value::ModuleView::new(&ctx), ca.index),
+            Some(ca.body)
+        );
     }
 }

@@ -18,7 +18,8 @@ use crate::{
     context::Context,
     error::{Error, ErrorTy, Result},
     value::{
-        BlockParamRef, BlockRef, FunctionBody, FunctionId, FunctionRef, InstructionRef, ValueId,
+        BlockParamRef, BlockRef, BodyView, FunctionBody, FunctionId, FunctionRef, InstructionRef,
+        ValueId,
         block::{BasicBlock, BlockId, EdgeData, EdgeId},
         block_param::{BlockParam, BlockParamId},
         insn::{Instruction, InstructionId, Mnemonic},
@@ -135,6 +136,11 @@ impl<'a, 'str> PassBacking<'a, 'str> {
             shared: self.shared,
             interfaces: self.interfaces,
         }
+    }
+
+    /// The static immutable provider for shared reads over this pass body.
+    pub fn view(&self) -> BodyView<'_, 'str> {
+        BodyView::new(&*self.fun, self.shared, self.interfaces)
     }
     /// A pass body never touches the global call-site cache; the driver
     /// rebuilds it by diffing outgoing calls at the barrier.

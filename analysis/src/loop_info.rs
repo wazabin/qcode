@@ -21,9 +21,9 @@ use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
 use qcode::{
     context::Context,
     value::{
-        BlockId, BlockRef, FunctionId, FunctionRef, ValueId,
+        BlockId, BlockRef, FunctionId, FunctionRef, ModuleView, QCodeView, ValueId,
         insn::{Binary, Binop, Branch, CBranch, InstructionId, IntBinop, Mnemonic},
-        util::{base_ref::HostRef, host_mut::PassBacking},
+        util::host_mut::PassBacking,
     },
 };
 
@@ -32,21 +32,19 @@ use qcode::{
 // ===========================================================================
 
 /// `c` if `v` is the integer literal `c`, else `None`.
-pub(crate) fn literal<'a, 'str: 'a>(host: impl Into<HostRef<'a, 'str>>, v: ValueId) -> Option<u64> {
-    let host = host.into();
+pub(crate) fn literal<'a, 'str: 'a>(host: impl QCodeView<'a, 'str>, v: ValueId) -> Option<u64> {
     match v {
-        ValueId::Literal(lid) => Some(host.shr().values.literals[lid].value),
+        ValueId::Literal(lid) => Some(host.shared().values.literals[lid].value),
         _ => None,
     }
 }
 
 /// `true` if `v` is `idx + 1` (either operand order) — a unit step of `idx`.
 pub(crate) fn is_increment<'a, 'str: 'a>(
-    host: impl Into<HostRef<'a, 'str>>,
+    host: impl QCodeView<'a, 'str>,
     v: ValueId,
     idx: ValueId,
 ) -> bool {
-    let host = host.into();
     let ValueId::Instruction(id) = v else {
         return false;
     };
@@ -62,12 +60,11 @@ pub(crate) fn is_increment<'a, 'str: 'a>(
 /// `true` if `v` is `idx - 1`, expressed either as `idx - 1` or as `idx + (-1)`
 /// (the wrapping representation `array_promote` emits for a back-index).
 pub(crate) fn is_decrement<'a, 'str: 'a>(
-    host: impl Into<HostRef<'a, 'str>>,
+    host: impl QCodeView<'a, 'str>,
     v: ValueId,
     idx: ValueId,
     idx_width: usize,
 ) -> bool {
-    let host = host.into();
     let ValueId::Instruction(id) = v else {
         return false;
     };
@@ -92,36 +89,34 @@ pub(crate) fn is_decrement<'a, 'str: 'a>(
 
 /// Index of block-param `p` within `block`'s parameter list.
 pub(crate) fn param_pos<'a, 'str: 'a>(
-    host: impl Into<HostRef<'a, 'str>>,
+    host: impl QCodeView<'a, 'str>,
     block: BlockId,
     p: ValueId,
 ) -> Option<usize> {
-    BlockRef::new(host.into(), block)
+    BlockRef::new(host, block)
         .params()
         .position(|q| q.id() == p)
 }
 
 /// Parent block of a block-param value (`None` if `v` is not a block param).
 pub(crate) fn param_parent<'a, 'str: 'a>(
-    host: impl Into<HostRef<'a, 'str>>,
+    host: impl QCodeView<'a, 'str>,
     v: ValueId,
 ) -> Option<BlockId> {
     let ValueId::BlockParam(pid) = v else {
         return None;
     };
-    host.into()
-        .block_param(pid)
+    host.block_param(pid)
         .parent_id()
         .map(|local| BlockId::new(pid.func, local))
 }
 
 /// Values feeding block-param index `k` of `block` from every predecessor edge.
 pub(crate) fn incoming<'a, 'str: 'a>(
-    host: impl Into<HostRef<'a, 'str>>,
+    host: impl QCodeView<'a, 'str>,
     block: BlockId,
     k: usize,
 ) -> Vec<ValueId> {
-    let host = host.into();
     let mut out = Vec::new();
     let preds: Vec<BlockId> = BlockRef::new(host, block)
         .predecessors()
@@ -159,10 +154,9 @@ pub(crate) fn incoming<'a, 'str: 'a>(
 /// (loop-body side) is the other. `None` if the header does not end in a
 /// `CBranch`, or neither/both successors are header predecessors.
 pub(crate) fn cbranch_exit<'a, 'str: 'a>(
-    host: impl Into<HostRef<'a, 'str>>,
+    host: impl QCodeView<'a, 'str>,
     header: BlockId,
 ) -> Option<(BlockId, BlockId)> {
-    let host = host.into();
     let hterm = BlockRef::new(host, header).iter().last()?;
     let Mnemonic::CBranch(CBranch {
         success_block: sb,
@@ -193,7 +187,10 @@ pub(crate) fn cbranch_exit<'a, 'str: 'a>(
 /// The instructions using SSA value `v`, read from its owning function through
 /// the host (empty for shared values — literals/varnodes — which the loop
 /// helpers never define).
-pub(crate) fn users_of<'a, 'str: 'a>(host: HostRef<'a, 'str>, v: ValueId) -> Vec<InstructionId> {
+pub(crate) fn users_of<'a, 'str: 'a>(
+    host: impl QCodeView<'a, 'str>,
+    v: ValueId,
+) -> Vec<InstructionId> {
     match v.owning_function() {
         Some(f) => host.function_ref(f).users_of(v),
         None => Vec::new(),
@@ -205,10 +202,9 @@ pub(crate) fn users_of<'a, 'str: 'a>(host: HostRef<'a, 'str>, v: ValueId) -> Vec
 /// observable outside it once its escaping values have been rerouted, so it can
 /// be deleted.
 pub(crate) fn is_loop_private<'a, 'str: 'a>(
-    host: impl Into<HostRef<'a, 'str>>,
+    host: impl QCodeView<'a, 'str>,
     blocks: &[BlockId],
 ) -> bool {
-    let host = host.into();
     let in_loop = |v: ValueId| {
         users_of(host, v).iter().all(|&u| {
             qcode::value::InstructionRef::new(host, u)
@@ -292,10 +288,9 @@ impl Uf {
 /// name the same loop-invariant base iff they map to the same root. A class with
 /// zero or several roots is omitted (ambiguous → not resolvable).
 pub fn value_roots<'a, 'str: 'a>(
-    host: impl Into<HostRef<'a, 'str>>,
+    host: impl QCodeView<'a, 'str>,
     fid: FunctionId,
 ) -> HashMap<ValueId, ValueId> {
-    let host = host.into();
     let mut uf = Uf::default();
     // A representative is only ever stored as a parent *value*, never a key, so
     // track membership explicitly rather than relying on `parent.keys()`.
@@ -367,10 +362,9 @@ pub struct Induction {
 
 /// Recognize every canonical counted loop in `fid`.
 pub fn recognize_loops<'a, 'str: 'a>(
-    host: impl Into<HostRef<'a, 'str>>,
+    host: impl QCodeView<'a, 'str>,
     fid: FunctionId,
 ) -> Vec<NaturalLoop> {
-    let host = host.into();
     let function = FunctionRef::new(host, fid);
     let Some(root) = function.root().map(|b| b.id) else {
         return Vec::new();
@@ -398,7 +392,11 @@ pub fn recognize_loops<'a, 'str: 'a>(
 
 /// Build the [`NaturalLoop`] for a back-edge `latch -> header`, or `None` if it is
 /// not the canonical single-body counted shape.
-fn build_loop(host: HostRef, latch: BlockId, header: BlockId) -> Option<NaturalLoop> {
+fn build_loop<'a, 'str: 'a>(
+    host: impl QCodeView<'a, 'str>,
+    latch: BlockId,
+    header: BlockId,
+) -> Option<NaturalLoop> {
     // The natural loop: header + every block reaching the latch without going
     // *through* the header. In the rotated self-loop (`latch == header`) that is
     // just the header itself — the walk must not step back into the header's own
@@ -474,7 +472,11 @@ fn build_loop(host: HostRef, latch: BlockId, header: BlockId) -> Option<NaturalL
 }
 
 /// `true` if `block`'s terminator is `goto target` (an unconditional branch).
-fn ends_with_goto(host: HostRef, block: BlockId, target: BlockId) -> bool {
+fn ends_with_goto<'a, 'str: 'a>(
+    host: impl QCodeView<'a, 'str>,
+    block: BlockId,
+    target: BlockId,
+) -> bool {
     matches!(
         BlockRef::new(host, block).iter().last().map(|t| t.mnemonic()),
         Some(Mnemonic::Branch(b)) if BlockId::new(block.func, b.target) == target
@@ -491,7 +493,9 @@ impl NaturalLoop {
             | ValueId::Varnode(_)
             | ValueId::Function(_)
             | ValueId::BasicBlock(_) => true,
-            ValueId::BlockParam(_) => param_parent(ctx, v).is_none_or(|b| !self.nodes.contains(&b)),
+            ValueId::BlockParam(_) => {
+                param_parent(ModuleView::new(ctx), v).is_none_or(|b| !self.nodes.contains(&b))
+            }
             ValueId::Instruction(i) => ctx
                 .get_insn(i)
                 .parent()
@@ -519,10 +523,9 @@ impl NaturalLoop {
     /// The trip bound `N` comes from the header guard.
     pub fn unit_induction<'a, 'str: 'a>(
         &self,
-        host: impl Into<HostRef<'a, 'str>>,
+        host: impl QCodeView<'a, 'str>,
         var: ValueId,
     ) -> Option<Induction> {
-        let host = host.into();
         let parent = param_parent(host, var)?;
         // Resolve the feed set (init + increment), the value the guard compares,
         // and whether it compares the plain index or the incremented one.
@@ -575,7 +578,11 @@ impl NaturalLoop {
     /// The trip bound `N` from the header guard `key <cmp> N`. Accepts the two
     /// canonical polarities: `key == N` exiting the loop on true, or `key < N`
     /// (unsigned/signed) continuing on true.
-    fn guard_bound(&self, host: HostRef, key: ValueId) -> Option<i64> {
+    fn guard_bound<'a, 'str: 'a>(
+        &self,
+        host: impl QCodeView<'a, 'str>,
+        key: ValueId,
+    ) -> Option<i64> {
         let hterm = BlockRef::new(host, self.header).iter().last()?;
         let Mnemonic::CBranch(cb) = hterm.mnemonic() else {
             return None;
@@ -645,12 +652,13 @@ mod tests {
                 return at i64 0x0;
             "
         );
-        let loops = recognize_loops(&ctx, f);
+        let body_view = qcode::value::BodyView::new(&ctx.bodies[f], &ctx.shared, &ctx.interfaces);
+        let loops = recognize_loops(body_view, f);
         assert_eq!(loops.len(), 1, "one loop recognized");
         let l = &loops[0];
         assert!(!l.rotated, "distinct guard header is the split shape");
         let ind = l
-            .unit_induction(&ctx, param(&ctx, l.body, "j"))
+            .unit_induction(body_view, param(&ctx, l.body, "j"))
             .expect("j is a unit induction var");
         assert_eq!((ind.start, ind.count), (0, 10));
     }
@@ -676,12 +684,12 @@ mod tests {
                 return at i64 0x0;
             "
         );
-        let loops = recognize_loops(&ctx, g);
+        let loops = recognize_loops(ModuleView::new(&ctx), g);
         assert_eq!(loops.len(), 1, "one loop recognized");
         let l = &loops[0];
         assert!(l.rotated, "self-looping guard block is the rotated shape");
         let ind = l
-            .unit_induction(&ctx, param(&ctx, l.body, "i"))
+            .unit_induction(ModuleView::new(&ctx), param(&ctx, l.body, "i"))
             .expect("i is a unit induction var");
         assert_eq!((ind.start, ind.count), (1, 10));
     }
@@ -712,13 +720,13 @@ mod tests {
                 return at i64 0x0;
             "
         );
-        let loops = recognize_loops(&ctx, f);
+        let loops = recognize_loops(ModuleView::new(&ctx), f);
         assert_eq!(loops.len(), 1, "one loop recognized");
         let l = &loops[0];
         assert!(!l.rotated, "distinct guard header is the split shape");
         // The induction is the header param, referenced directly by the body.
         let ind = l
-            .unit_induction(&ctx, param(&ctx, l.header, "i"))
+            .unit_induction(ModuleView::new(&ctx), param(&ctx, l.header, "i"))
             .expect("header param `i` is a unit induction var used in the body");
         assert_eq!((ind.start, ind.count), (0, 10));
     }

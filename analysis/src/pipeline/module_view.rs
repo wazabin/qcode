@@ -22,7 +22,7 @@ use jstd::registry::Registry;
 use qcode::{
     context::{Context, Shared},
     value::{
-        FunctionBody, FunctionId, FunctionKind,
+        BodyView, FunctionBody, FunctionId, FunctionKind,
         function::FunctionInterface,
         insn::Callee,
         util::{base_ref::HostRef, host_mut::PassBacking},
@@ -204,6 +204,14 @@ impl<'ctx, 'str> ContextView<'ctx, 'str> {
             shared: self.shared,
             interfaces: self.interfaces,
         }
+    }
+
+    /// Build the static read view for a pass's borrowed body.
+    pub fn body_view<'body>(self, body: &'body FunctionBody<'str>) -> BodyView<'body, 'str>
+    where
+        'ctx: 'body,
+    {
+        BodyView::new(body, self.shared, self.interfaces)
     }
 }
 
