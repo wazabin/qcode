@@ -237,50 +237,30 @@ impl<T: FunctionPass + Send + Sync> DynFunctionPass for FunctionPassAdapter<T> {
     }
 }
 
-/// Run `f` over a `(&mut FunctionBody, ContextView)` for `fid` — the body borrowed
-/// `&mut` in place via [`split`](ContextSplit::split) — then drop the split borrow
-/// and finish the split-borrow barrier: the run protocol of
-/// [`FunctionPassAdapter::run`], minus minting.
+/// Run `f` over a `(&mut FunctionBody, ContextView)` for `fid`, borrowing the
+/// body `&mut` in place via [`split`](ContextSplit::split).
 ///
 /// This is the bridge the whole-`Context` optimization entry points
 /// (`gvn_function`, `constant_fold_function`, `narrow_function`, `mem2reg`,
 /// `mem2reg_framed`) use to reach the concrete function-pass core: their callers
 /// hold a `&mut Context` but neither a [`FunctionBody`] nor a [`PipelineEnv`], and
-/// they supply their own alias oracle, so the [`ContextView`]'s env is a
-/// throwaway the cores never read. Because the concrete [`PassBacking`] path
+/// they supply their own alias oracle, so the [`ContextView`]'s headless env is
+/// not consulted by the cores. Because the concrete [`PassBacking`] path
 /// debug-asserts the body is self-stored, every caller must feed a function with
 /// no reattributed blocks — which, post the driver's `split_overlapping_functions`
 /// normalization, every production function is.
 ///
 /// [`PassBacking`]: qcode::value::util::pass_backing::PassBacking
-pub(crate) fn with_checked_out_body<'str, R>(
+pub(crate) fn with_body_mut<'str, R>(
     ctx: &mut Context<'str>,
     fid: FunctionId,
     f: impl FnOnce(&mut FunctionBody<'str>, ContextView<'_, 'str>) -> R,
 ) -> R {
-    let env = detached_env();
+    let env = PipelineEnv::headless(ctx);
     {
         let (bodies, view) = ctx.split(&env);
-        // These entry points buffer no effects and mint nothing, so the drained
-        // scratch is discarded.
         f(&mut bodies[fid], view)
     }
-}
-
-/// A throwaway [`PipelineEnv`] for [`with_checked_out_body`]: the concrete
-/// optimization cores never consult `env()`, so its stack pointer / ABI are
-/// placeholders.
-fn detached_env() -> PipelineEnv {
-    PipelineEnv::from_parts(
-        ArchConfig {
-            stack_pointer: RegisterId::from(0usize),
-            dead_flag_regs: Vec::new(),
-            abi: CallingConvention::default(),
-            os: qcode::context::TargetOs::Unknown,
-            bitness: 64,
-        },
-        VarnodeId::from(0usize),
-    )
 }
 
 /// Append a pass's detached minted functions to the real function registries at

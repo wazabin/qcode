@@ -43,7 +43,7 @@ pub(crate) fn install_minted_for_test<'str>(
     let installed = pass::install_minted(ctx, "test", minted).expect("minted install");
     pass::resolve_minted_callees(ctx, "test", owner, &installed).expect("minted callee resolution");
 }
-pub(crate) use pass::with_checked_out_body;
+pub(crate) use pass::with_body_mut;
 pub use pass::{
     DecompilePass, DynDecompilePass, DynFunctionPass, DynPass, FunctionPass, FunctionPassAdapter,
     Pass, PassRegistration,

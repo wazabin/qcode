@@ -6,7 +6,7 @@
 //! add it to the tuple in [`gvn_passes`] (order matters: earlier members see
 //! the instruction first).
 
-use crate::{AliasResult, with_checked_out_body};
+use crate::{AliasResult, with_body_mut};
 
 use qcode::{
     context::Context,
@@ -138,7 +138,7 @@ fn gvn_passes<'str>() -> Vec<Box<dyn SubPass<'str>>> {
 /// Folding only — no CSE or load/store forwarding. Returns `true` if anything
 /// changed.
 pub fn constant_fold_function(ctx: &mut Context, func_id: FunctionId) -> bool {
-    with_checked_out_body(ctx, func_id, |body, cx| {
+    with_body_mut(ctx, func_id, |body, cx| {
         constant_fold_body(body, cx, func_id)
     })
 }
@@ -158,7 +158,7 @@ fn constant_fold_body<'str>(
 /// fixpoint. Standalone composition of the [`NarrowTrunc`] sub-pass — the same
 /// shape as [`constant_fold_function`]. Returns `true` if anything changed.
 pub fn narrow_function(ctx: &mut Context, func_id: FunctionId) -> bool {
-    with_checked_out_body(ctx, func_id, |body, cx| narrow_body(body, cx, func_id))
+    with_body_mut(ctx, func_id, |body, cx| narrow_body(body, cx, func_id))
 }
 
 /// Body-local core of [`narrow_function`]: runs the
@@ -189,7 +189,7 @@ pub fn gvn(block: &mut BlockMutRef, aliases: Option<&AliasResult>) {
     // function to borrow and run the body-local single-block core against.
     let func_id = block_id.func;
     let ctx = block.ctx_mut();
-    let _ = with_checked_out_body(ctx, func_id, |body, cx| {
+    let _ = with_body_mut(ctx, func_id, |body, cx| {
         run_single_block(body, cx, block_id, &gvn_passes(), aliases)
     });
 }
@@ -203,7 +203,7 @@ pub fn gvn(block: &mut BlockMutRef, aliases: Option<&AliasResult>) {
 /// single-block pass.
 /// Returns `true` if anything changed.
 pub fn gvn_function(ctx: &mut Context, func_id: FunctionId, aliases: Option<&AliasResult>) -> bool {
-    with_checked_out_body(ctx, func_id, |body, cx| {
+    with_body_mut(ctx, func_id, |body, cx| {
         gvn_body(body, cx, func_id, aliases)
     })
 }

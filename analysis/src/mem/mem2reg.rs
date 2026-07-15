@@ -34,16 +34,16 @@ pub fn mem2reg_framed(
     // Bridge onto the concrete function-pass core: check the function out and run
     // `mem2reg_host` over `(&mut FunctionBody, ContextView)`. Callers pass their
     // own alias oracle, so the view's env is unread.
-    crate::with_checked_out_body(ctx, function_id, |body, cx| {
+    crate::with_body_mut(ctx, function_id, |body, cx| {
         mem2reg_host(body, cx, function_id, aliases, sp_param)
     })
 }
 
 /// Concrete core of [`mem2reg_framed`] using FunctionBody+ContextView (stage 5b).
 /// The single mem2reg implementation, shared by the `Mem2reg` function pass and
-/// the whole-`Context` entry points (via [`with_checked_out_body`]).
+/// the whole-`Context` entry points (via [`with_body_mut`]).
 ///
-/// [`with_checked_out_body`]: crate::with_checked_out_body
+/// [`with_body_mut`]: crate::with_body_mut
 pub fn mem2reg_host<'ctx, 'str>(
     body: &'ctx mut FunctionBody<'str>,
     cx: ContextView<'ctx, 'str>,

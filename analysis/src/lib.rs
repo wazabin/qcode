@@ -85,7 +85,7 @@ pub mod lift;
 pub use lift::{discover_addresses_in_binary, lift_new_addresses};
 
 pub mod pipeline;
-pub(crate) use pipeline::with_checked_out_body;
+pub(crate) use pipeline::with_body_mut;
 pub use pipeline::{
     ArchConfig, CallingConvention, ContextSplit, ContextView, DEFAULT_PIPELINE_TOML, DecompilePass,
     DynDecompilePass,
