@@ -788,7 +788,13 @@ impl<'str> Context<'str> {
             from.func, to.func,
             "cross-function CFG edge {from:?} -> {to:?} (strict IR locality, ruling 2)"
         );
-        let edge_id = self.push_edge(from.func, EdgeData { from, to });
+        let edge_id = self.push_edge(
+            from.func,
+            EdgeData {
+                from: from.local,
+                to: to.local,
+            },
+        );
         BasicBlock::from_id_mut(self, from).add_edge(edge_id);
         BasicBlock::from_id_mut(self, to).add_edge(edge_id);
         edge_id
@@ -798,8 +804,8 @@ impl<'str> Context<'str> {
     /// physically dropping its payload.
     pub fn remove_cfg_edge(&mut self, func: FunctionId, edge_id: EdgeId) {
         let &EdgeData { from, to } = self.edge(func, edge_id);
-        BasicBlock::from_id_mut(self, from).remove_edge(edge_id);
-        BasicBlock::from_id_mut(self, to).remove_edge(edge_id);
+        BasicBlock::from_id_mut(self, BlockId::new(func, from)).remove_edge(edge_id);
+        BasicBlock::from_id_mut(self, BlockId::new(func, to)).remove_edge(edge_id);
         self.bodies[func].edges.remove(edge_id);
     }
 
@@ -987,6 +993,8 @@ impl<'str> Context<'str> {
         incident.sort_unstable();
         for (edge_func, edge) in incident {
             let EdgeData { from, to } = *self.edge(edge_func, edge);
+            let from = BlockId::new(edge_func, from);
+            let to = BlockId::new(edge_func, to);
             let new_from = block_map.get(&from).copied().unwrap_or(from);
             let new_to = block_map.get(&to).copied().unwrap_or(to);
             self.add_cfg_edge(new_from, new_to);
@@ -1249,6 +1257,8 @@ impl<'str> Context<'str> {
         for &b in &tail {
             for edge in self.block(b).edges.iter().copied() {
                 let &EdgeData { from, to } = self.edge(b.func, edge);
+                let from = BlockId::new(b.func, from);
+                let to = BlockId::new(b.func, to);
                 let cross = effective_owner(self, from) != effective_owner(self, to);
                 let touches_tail = tail_set.contains(&from) || tail_set.contains(&to);
                 if cross && touches_tail {
@@ -2053,11 +2063,11 @@ impl<'str> Context<'str> {
                 .edges
                 .iter()
                 .copied()
-                .filter(|&e| host.edge(func, e).from == remove)
+                .filter(|&e| host.edge(func, e).from == remove.local)
                 .collect()
         };
         for eid in outgoing {
-            self.function_mut(func).edges[eid].from = keep;
+            self.function_mut(func).edges[eid].from = keep.local;
             self.block_mut(keep).edges.insert(eid);
             self.block_mut(remove).edges.remove(&eid);
         }
@@ -3187,8 +3197,14 @@ mod tests {
         assert!(BasicBlock::from_id(&ctx, b).predecessors().next().is_none());
         assert!(!ctx.bodies[a.func].edges.contains(edge));
         let surviving = ctx.edge(a.func, surviving_edge);
-        assert_eq!(surviving.from, b, "swap removal must preserve the source");
-        assert_eq!(surviving.to, c, "swap removal must preserve the target");
+        assert_eq!(
+            surviving.from, b.local,
+            "swap removal must preserve the source"
+        );
+        assert_eq!(
+            surviving.to, c.local,
+            "swap removal must preserve the target"
+        );
         assert_eq!(ctx.bodies[a.func].edges.len(), 1);
 
         let self_edge = ctx.add_cfg_edge(a, a);
@@ -3437,8 +3453,8 @@ mod tests {
                 .collect::<Vec<_>>(),
             physical_order,
         );
-        assert_eq!(restored.edge(function, first).to, b);
-        assert_eq!(restored.edge(function, last).from, c);
+        assert_eq!(restored.edge(function, first).to, b.local);
+        assert_eq!(restored.edge(function, last).from, c.local);
 
         let fresh = restored.add_cfg_edge(a, d);
         assert!(fresh > last);

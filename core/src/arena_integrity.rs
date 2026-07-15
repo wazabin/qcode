@@ -159,7 +159,7 @@ pub fn verify_body_arena_integrity(ctx: &Context<'_>) -> Vec<String> {
                     continue;
                 }
                 let edge = &body.edges[edge_id];
-                if edge.from != block_id && edge.to != block_id {
+                if edge.from != block_id.local && edge.to != block_id.local {
                     out.push(format!(
                         "block {block_id:?} lists non-incident CFG edge {edge_id:?} ({:?} -> {:?})",
                         edge.from, edge.to
@@ -287,15 +287,10 @@ pub fn verify_body_arena_integrity(ctx: &Context<'_>) -> Vec<String> {
         for edge_entry in body.edges.iter() {
             let edge_id = edge_entry.id;
             let edge = &*edge_entry;
-            if edge.from.func != fid || edge.to.func != fid {
-                out.push(format!(
-                    "function {fid:?}: edge {edge_id:?} crosses function arenas ({:?} -> {:?})",
-                    edge.from, edge.to
-                ));
-                continue;
-            }
-            let from_live = live_blocks.contains(&edge.from.local);
-            let to_live = live_blocks.contains(&edge.to.local);
+            // Edge endpoints are bare `LocalBlockId`s stored in this body's arena
+            // (stage 1); there is no cross-arena state left to probe.
+            let from_live = live_blocks.contains(&edge.from);
+            let to_live = live_blocks.contains(&edge.to);
             if !from_live || !to_live {
                 out.push(format!(
                     "function {fid:?}: edge {edge_id:?} has removed endpoint ({:?} -> {:?})",
@@ -303,13 +298,13 @@ pub fn verify_body_arena_integrity(ctx: &Context<'_>) -> Vec<String> {
                 ));
                 continue;
             }
-            if !body.blocks[edge.from.local].edges.contains(&edge_id) {
+            if !body.blocks[edge.from].edges.contains(&edge_id) {
                 out.push(format!(
                     "edge {edge_id:?} is missing from source block {:?}",
                     edge.from
                 ));
             }
-            if !body.blocks[edge.to.local].edges.contains(&edge_id) {
+            if !body.blocks[edge.to].edges.contains(&edge_id) {
                 out.push(format!(
                     "edge {edge_id:?} is missing from target block {:?}",
                     edge.to
@@ -526,7 +521,7 @@ mod tests {
         let f = ctx.function_ids()[0];
         let entry = FunctionBody::from_id(&ctx, f).root().expect("root").id;
         let edge = *ctx.block(entry).edges.iter().next().expect("edge");
-        let target = ctx.edge(f, edge).to;
+        let target = BlockId::new(f, ctx.edge(f, edge).to);
         ctx.block_mut(target).edges.remove(&edge);
 
         assert_has(&ctx, "missing from target block");
@@ -547,20 +542,9 @@ mod tests {
         assert_has(&ctx, "references removed CFG edge");
     }
 
-    #[test]
-    fn reports_cross_function_edge_endpoint() {
-        let mut ctx = fixture();
-        let f = ctx.function_ids()[0];
-        let entry = FunctionBody::from_id(&ctx, f).root().expect("root").id;
-        let edge = *ctx.block(entry).edges.iter().next().expect("edge");
-        let g = FunctionBody::make(&mut ctx, Cow::Borrowed("g"))
-            .expect("function")
-            .id;
-        let foreign = BasicBlock::make(&mut ctx, g).id;
-        ctx.bodies[f].edges[edge].to = foreign;
-
-        assert_has(&ctx, "crosses function arenas");
-    }
+    // A cross-function edge endpoint is unrepresentable since stage 1: edge
+    // endpoints are bare `LocalBlockId`s carrying no function qualifier, so the
+    // old `reports_cross_function_edge_endpoint` probe and fixture are gone.
 
     #[test]
     fn reports_branch_targeting_removed_block() {
@@ -568,7 +552,7 @@ mod tests {
         let f = ctx.function_ids()[0];
         let entry = FunctionBody::from_id(&ctx, f).root().expect("root").id;
         let edge = *ctx.block(entry).edges.iter().next().expect("edge");
-        let target = ctx.edge(f, edge).to;
+        let target = BlockId::new(f, ctx.edge(f, edge).to);
         ctx.delete_block(target);
 
         assert_has(&ctx, "targets removed block");

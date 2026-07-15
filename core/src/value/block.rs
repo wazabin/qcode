@@ -352,7 +352,7 @@ where
         let id = self.id;
         self.inner().edges.iter().copied().filter_map(move |edge| {
             let e = view.edge(id.func, edge);
-            (e.from == id).then_some((edge, e.to))
+            (e.from == id.local).then_some((edge, BlockId::new(id.func, e.to)))
         })
     }
 
@@ -363,7 +363,7 @@ where
         let id = self.id;
         self.inner().edges.iter().copied().filter_map(move |edge| {
             let e = view.edge(id.func, edge);
-            (e.to == id).then_some((edge, e.from))
+            (e.to == id.local).then_some((edge, BlockId::new(id.func, e.from)))
         })
     }
 

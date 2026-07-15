@@ -23,16 +23,18 @@ pub struct EdgeId(u32);
 
 #[derive(Debug, Default, Clone, serde::Serialize, serde::Deserialize)]
 pub struct EdgeData {
-    pub from: BlockId,
-    pub to: BlockId,
+    pub from: LocalBlockId,
+    pub to: LocalBlockId,
 }
 
 // A plain body-local [`EdgeId`] no longer self-describes its owning function, so
 // the old whole-context `EdgeRef`/`EdgeMutRef` wrappers (which resolved
 // `values.edge(id)` without a function) are gone. Edges are read through
 // `FunctionBody::edge(id)` / `QCodeView::edge(func, id)` with the owning function named
-// explicitly. `EdgeData`'s `from`/`to` are still `BlockId`s, so an edge's
-// endpoints resolve as blocks directly.
+// explicitly. Strict locality (context-split ruling 2) guarantees both endpoints
+// live in the edge's own function, so `from`/`to` are bare `LocalBlockId`s;
+// qualify with the owning function (which every reader names) to get a composite
+// `BlockId`.
 
 // ---------------------------------------------------------------------------
 // A CFG rooted at a single function.

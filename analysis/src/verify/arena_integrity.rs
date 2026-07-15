@@ -10,7 +10,7 @@ pub fn verify_body_arena_integrity(ctx: &Context<'_>) -> Vec<String> {
 mod tests {
     use qcode::{
         context::Context,
-        value::{BasicBlock, FunctionBody},
+        value::{BasicBlock, BlockId, FunctionBody},
     };
     use qcode_macro::qcode;
 
@@ -29,7 +29,7 @@ mod tests {
         );
         let entry = FunctionBody::from_id(&ctx, f).root().expect("root").id;
         let edge = *ctx.block(entry).edges.iter().next().expect("edge");
-        let target = ctx.edge(f, edge).to;
+        let target = BlockId::new(f, ctx.edge(f, edge).to);
         BasicBlock::from_id_mut(&mut ctx, target).delete();
 
         let diagnostics = crate::verify::verify(&ctx);

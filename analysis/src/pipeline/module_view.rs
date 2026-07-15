@@ -437,8 +437,8 @@ mod tests {
         let child = BlockId::new(installed, child.local);
         assert_eq!(detached.block(root).parent, Some(installed));
         assert_eq!(detached.block(child).parent, Some(installed));
-        assert_eq!(detached.edge(edge).from, root);
-        assert_eq!(detached.edge(edge).to, child);
+        assert_eq!(detached.edge(edge).from, root.local);
+        assert_eq!(detached.edge(edge).to, child.local);
         let host = BodyMut::new(&mut detached, view.shr(), view.interfaces());
         assert_eq!(
             host.view()

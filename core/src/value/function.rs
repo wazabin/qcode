@@ -277,9 +277,10 @@ impl<'str> FunctionBody<'str> {
     /// detached body to its installed registry ID.
     ///
     /// Function arenas, operands, roster entries, and use-def data are body-local
-    /// and need no remap. Live block ownership, composite CFG edge endpoints, and
-    /// function-qualified entries in the local reverse-name table carry the
-    /// ambient ID. Real `Callee::Real` targets inside instruction mnemonics are
+    /// and need no remap. Live block ownership and function-qualified entries in
+    /// the local reverse-name table carry the ambient ID (CFG edge endpoints are
+    /// now bare body-local ids and need no rewrite). Real `Callee::Real` targets
+    /// inside instruction mnemonics are
     /// semantic cross-function references, not ownership metadata, and are
     /// deliberately left untouched.
     pub fn rebind_ambient_id(&mut self, from: FunctionId, to: FunctionId) {
@@ -295,15 +296,8 @@ impl<'str> FunctionBody<'str> {
             );
             block.parent = Some(to);
         }
-        for mut edge in self.edges.iter_mut() {
-            assert_eq!(
-                (edge.from.func, edge.to.func),
-                (from, from),
-                "detached function edge has an unexpected ambient owner"
-            );
-            edge.from.func = to;
-            edge.to.func = to;
-        }
+        // CFG edge endpoints are now bare `LocalBlockId`s (stage 1): they carry no
+        // function qualifier, so there is nothing per-edge to rewrite.
         self.id = to;
     }
 
@@ -704,7 +698,10 @@ impl<'str> FunctionBody<'str> {
     /// Add a directed CFG edge `from -> to`, stored in this body's edge arena and
     /// linked into both incident blocks' edge sets.
     pub fn add_cfg_edge(&mut self, from: BlockId, to: BlockId) -> EdgeId {
-        let edge_id = self.edges.push(EdgeData { from, to });
+        let edge_id = self.edges.push(EdgeData {
+            from: from.local,
+            to: to.local,
+        });
         self.block_mut(from).edges.insert(edge_id);
         self.block_mut(to).edges.insert(edge_id);
         edge_id
@@ -714,8 +711,13 @@ impl<'str> FunctionBody<'str> {
     /// physically dropping its payload.
     pub fn remove_cfg_edge(&mut self, edge_id: EdgeId) {
         let EdgeData { from, to } = *self.edge(edge_id);
-        self.block_mut(from).edges.remove(&edge_id);
-        self.block_mut(to).edges.remove(&edge_id);
+        let func = self.id;
+        self.block_mut(BlockId::new(func, from))
+            .edges
+            .remove(&edge_id);
+        self.block_mut(BlockId::new(func, to))
+            .edges
+            .remove(&edge_id);
         self.edges.remove(edge_id);
     }
 
@@ -774,7 +776,7 @@ impl<'str> FunctionBody<'str> {
                         .edges
                         .iter()
                         .copied()
-                        .filter(|&e| self.edge(e).from == block_id)
+                        .filter(|&e| self.edge(e).from == block_id.local)
                         .collect()
                 };
                 succ.sort_unstable();
@@ -811,11 +813,11 @@ impl<'str> FunctionBody<'str> {
                 .edges
                 .iter()
                 .copied()
-                .filter(|&e| self.edge(e).from == remove)
+                .filter(|&e| self.edge(e).from == remove.local)
                 .collect()
         };
         for eid in outgoing {
-            self.edges[eid].from = keep;
+            self.edges[eid].from = keep.local;
             self.block_mut(keep).edges.insert(eid);
             self.block_mut(remove).edges.remove(&eid);
         }
