@@ -300,7 +300,7 @@ passes = ["gvn", "dead_store", "dce"]
 [[stage]]
 name = "mark-pure"
 scope = "module"
-passes = ["mark_pure", "module(gvn)", "concretize", "module(dce)", "module(dead_store)", "assume_arg_frame", "argpromote"]
+passes = ["mark_pure", "module(gvn)", "emulate_map", "concretize", "module(dce)", "module(dead_store)", "assume_arg_frame", "argpromote"]
 repeat_until = "no_change"
 
 # Promote bounded memory regions in pure functions to first-class array values so
@@ -340,7 +340,7 @@ passes = ["loop_to_scan", "loop_to_map", "strlen"]
 [[stage]]
 name = "loop-fold-project"
 scope = "module"
-passes = ["concretize"]
+passes = ["emulate_map", "concretize"]
 
 # Infer per-parameter `readonly` / `nocapture` pointer attributes bottom-up over
 # the now-functionalized (`pure_reg`) functions, whose positional arguments align

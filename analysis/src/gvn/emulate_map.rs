@@ -29,50 +29,54 @@ use qcode_emulator::{BodyArg, SizedValue, StandaloneEmulator};
 use crate::calls::return_field;
 
 use super::fold::const_value;
-use std::any::Any;
-
-use super::walk::{Claim, Editor, InsnCtx, ModuleSubPass};
+use super::{ModuleInsn, module_instruction_snapshot};
 
 /// Upper bound on emulated instructions per lane. Map bodies are loop-free pure
 /// expressions, so this only guards against a degenerate body.
 const STEP_BUDGET: usize = 100_000;
 
 /// Replace `body <$> b"…"` / `body <$> enumerate(b"…")` with the emulated
-/// constant `Bytes` array. Reads the pure *body callee*'s IR, so it runs only on
-/// the module host (dispatched by the [`concretize`](super::concretize) pass).
+/// constant `Bytes` array. One invocation performs one frozen whole-module
+/// sweep; pipeline configuration owns the fixpoint.
+#[derive(Default)]
 pub(super) struct EmulateMap;
 
-impl<'str> ModuleSubPass<'str> for EmulateMap {
-    fn init_state(&self) -> Box<dyn Any> {
-        Box::new(())
-    }
-
-    fn clone_state(&self, _state: &dyn Any) -> Box<dyn Any> {
-        Box::new(())
-    }
-
-    fn on_insn(
-        &self,
-        host: &mut Context<'str>,
-        _state: &mut dyn Any,
-        ic: &InsnCtx,
-        ed: &mut Editor,
-    ) -> Claim {
-        let ctx: &mut Context = host;
+impl EmulateMap {
+    fn rewrite(&self, ctx: &mut Context, ic: &ModuleInsn) -> bool {
         let folded = match ic.mnemonic.clone() {
             Mnemonic::Map(map) => self.emulate(ctx, ic, &map),
             Mnemonic::Scan(scan) => self.emulate_scan(ctx, ic, &scan),
-            _ => return Claim::Pass,
+            _ => return false,
         };
         match folded {
             Some(bytes) => {
-                ed.replace(ctx, ic.insn_id, bytes);
-                Claim::Done
+                ctx.replace_all_uses_with(ValueId::Instruction(ic.insn_id), bytes);
+                ctx.remove_instruction(ic.insn_id);
+                true
             }
-            None => Claim::Pass,
+            None => false,
         }
     }
 }
+
+impl crate::Pass for EmulateMap {
+    const NAME: &'static str = "emulate_map";
+
+    fn description(&self) -> &'static str {
+        "Emulate maps and scans over fully-known arrays"
+    }
+
+    fn run(&self, ctx: &mut Context, _env: &crate::PipelineEnv) -> Result<bool, String> {
+        let snapshot = module_instruction_snapshot(ctx);
+        let mut changed = false;
+        for ic in &snapshot {
+            changed |= self.rewrite(ctx, ic);
+        }
+        Ok(changed)
+    }
+}
+
+crate::register_module_pass!(EmulateMap);
 
 /// How each lane's element is fed to the body.
 enum Lane {
@@ -84,7 +88,7 @@ enum Lane {
 }
 
 impl EmulateMap {
-    fn emulate(&self, ctx: &mut Context, ic: &InsnCtx, map: &Map) -> Option<ValueId> {
+    fn emulate(&self, ctx: &mut Context, ic: &ModuleInsn, map: &Map) -> Option<ValueId> {
         // The source must be a fully-known constant: `b"…"` or `enumerate(b"…")`.
         let (data, lane) = const_source(ctx, map.src.qualify(ic.insn_id.func))?;
         let esz = match lane {
@@ -167,7 +171,7 @@ impl EmulateMap {
     /// into the result array. The body is **binary** — `acc` is param 0, the lane
     /// element param 1 — so the per-lane args prepend `acc` to the element. Returns
     /// `None` unless the source, the captures, and `init` are all constant.
-    fn emulate_scan(&self, ctx: &mut Context, ic: &InsnCtx, scan: &Scan) -> Option<ValueId> {
+    fn emulate_scan(&self, ctx: &mut Context, ic: &ModuleInsn, scan: &Scan) -> Option<ValueId> {
         let (data, lane) = const_source(ctx, scan.src.qualify(ic.insn_id.func))?;
         let esz = match lane {
             Lane::Scalar { esz } | Lane::Enumerate { esz, .. } => esz,
@@ -336,6 +340,11 @@ mod tests {
         },
     };
 
+    fn run_emulate_map(tc: &mut TestContext) {
+        let env = crate::PipelineEnv::headless(&tc.ctx);
+        crate::Pass::run(&super::EmulateMap, &mut tc.ctx, &env).unwrap();
+    }
+
     /// Terminate `entry` with `return value` (the builder only offers a bare
     /// `push_return(ptr)`; map results flow through a value-carrying return).
     fn return_value(tc: &mut TestContext, entry: BlockId, value: ValueId) {
@@ -474,7 +483,7 @@ mod tests {
         };
         return_value(&mut tc, entry, map_val);
 
-        super::super::concretize::concretize_function(&mut tc.ctx, host);
+        run_emulate_map(&mut tc);
 
         assert_eq!(
             map_bytes(&tc, host),
@@ -508,7 +517,7 @@ mod tests {
         };
         return_value(&mut tc, entry, map_val);
 
-        super::super::concretize::concretize_function(&mut tc.ctx, host);
+        run_emulate_map(&mut tc);
 
         assert_eq!(
             map_bytes(&tc, host),
@@ -546,7 +555,7 @@ mod tests {
         };
         return_value(&mut tc, entry, map_val);
 
-        super::super::concretize::concretize_function(&mut tc.ctx, host);
+        run_emulate_map(&mut tc);
 
         assert_eq!(
             map_bytes(&tc, host),
@@ -625,7 +634,7 @@ mod tests {
         };
         return_value(&mut tc, entry, scan_val);
 
-        super::super::concretize::concretize_function(&mut tc.ctx, host);
+        run_emulate_map(&mut tc);
 
         assert_eq!(
             map_bytes(&tc, host),

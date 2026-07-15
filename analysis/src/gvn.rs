@@ -10,7 +10,13 @@ use crate::{AliasResult, with_checked_out_body};
 
 use qcode::{
     context::Context,
-    value::{block::BlockMutRef, function::FunctionId, util::base_ref::WithCtxMut},
+    value::{
+        ValueId,
+        block::BlockMutRef,
+        function::FunctionId,
+        insn::{InstructionId, Mnemonic},
+        util::base_ref::WithCtxMut,
+    },
 };
 
 pub(crate) mod affine;
@@ -37,6 +43,45 @@ use intrinsics::Recognize;
 use memory::MemoryForwarding;
 use narrow::NarrowTrunc;
 use walk::{SubPassC, run_dominator_walk_c, run_flat_fixpoint_c, run_single_block_c};
+
+/// Frozen instruction context for one deterministic module-pass sweep.
+///
+/// Unlike the GVN walker context, this carries no aliases, numbering, or
+/// inherited state. Cross-body module passes snapshot the existing instruction
+/// stream once; instructions they create are intentionally left for the next
+/// pipeline fixpoint iteration.
+struct ModuleInsn {
+    insn_id: InstructionId,
+    id: ValueId,
+    mnemonic: Mnemonic,
+}
+
+/// Snapshot every instruction in eligible functions in function-roster,
+/// block-roster, and program order. This is traversal only, not another walker:
+/// the independent module passes own all recognition and mutation.
+fn module_instruction_snapshot(ctx: &Context) -> Vec<ModuleInsn> {
+    let fun_ids: Vec<FunctionId> = ctx
+        .functions()
+        .filter(|f| !f.is_external())
+        .filter(|f| !ctx.is_function_ignored(f.address()))
+        .map(|f| f.id)
+        .collect();
+
+    let mut snapshot = Vec::new();
+    for fun_id in fun_ids {
+        for block_id in FunctionBody::from_id(ctx, fun_id).block_ids() {
+            for insn_id in qcode::value::BasicBlock::from_id(ctx, block_id).instruction_ids() {
+                let insn = ctx.insn_ref(insn_id);
+                snapshot.push(ModuleInsn {
+                    insn_id,
+                    id: ValueId::Instruction(insn_id),
+                    mnemonic: insn.mnemonic().clone(),
+                });
+            }
+        }
+    }
+    snapshot
+}
 
 /// The full GVN sub-pass chain. Order is load-bearing: memory forwarding must
 /// see loads/stores first, folding must run before idiom recognition (so shift

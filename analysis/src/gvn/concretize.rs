@@ -19,7 +19,6 @@
 use qcode::{context::Context, value::function::FunctionId};
 
 use super::array_project::ArrayProject;
-use super::emulate_map::EmulateMap;
 use super::pure_call::PureCall;
 use super::walk::{ModuleSubPass, run_dominator_walk};
 
@@ -30,11 +29,7 @@ use crate::{Pass, PipelineEnv};
 /// three read pure callee bodies, so they run only on the module `&mut Context`
 /// walker ([`ModuleSubPass`]).
 fn concretize_passes<'str>() -> Vec<Box<dyn ModuleSubPass<'str>>> {
-    vec![
-        Box::new(EmulateMap),
-        Box::new(ArrayProject),
-        Box::new(PureCall),
-    ]
+    vec![Box::new(ArrayProject), Box::new(PureCall)]
 }
 
 /// Run the three body-reading sub-passes over `fun_id` to a local fixpoint.
