@@ -505,6 +505,58 @@ impl<'str> FunctionBody<'str> {
         id.func == self.id() && self.params.contains(id.local)
     }
 
+    /// The result type of a **body-local** operand, resolved without a registry
+    /// identity. The shared arms (`Literal`/`Bytes`/`Varnode`/`Function`) route
+    /// through `shared`; the arena arms (`Instruction`/`BlockParam`/`Temp`/
+    /// `BasicBlock`) index this body's own arenas by their bare local index. This
+    /// is the id-less twin of [`QCodeView::type_of`] — usable on a detached body.
+    pub fn local_type_of(
+        &self,
+        shared: &crate::context::Shared<'str>,
+        id: crate::value::LocalValueId,
+    ) -> crate::types::TypeId {
+        use crate::value::LocalValueId;
+        match id {
+            LocalValueId::Literal(id) => shared.values.literals[id].type_id,
+            LocalValueId::Bytes(id) => shared.values.bytes[id].type_id,
+            LocalValueId::Instruction(local) => self.insns[local].type_id,
+            LocalValueId::BlockParam(local) => self.params[local].type_id,
+            LocalValueId::Varnode(id) => shared
+                .values
+                .varnode_types
+                .get(&id)
+                .copied()
+                .unwrap_or_else(|| {
+                    shared
+                        .types
+                        .get_or_make_int(shared.values.varnodes[id].size_bytes())
+                }),
+            LocalValueId::Temp(local) => shared.types.get_or_make_int(self.temps[local].size),
+            LocalValueId::BasicBlock(_) | LocalValueId::Function(_) => {
+                shared.types.get_or_make_int(0)
+            }
+        }
+    }
+
+    /// The stored type of a **body-local** operand, or `None` where the operand
+    /// carries no stored type (untyped varnode, temp, block, function). The
+    /// id-less twin of [`QCodeView::stored_type_of`].
+    pub fn local_stored_type_of(
+        &self,
+        shared: &crate::context::Shared<'str>,
+        id: crate::value::LocalValueId,
+    ) -> Option<crate::types::TypeId> {
+        use crate::value::LocalValueId;
+        match id {
+            LocalValueId::Literal(id) => Some(shared.values.literals[id].type_id),
+            LocalValueId::Bytes(id) => Some(shared.values.bytes[id].type_id),
+            LocalValueId::Instruction(local) => Some(self.insns[local].type_id),
+            LocalValueId::BlockParam(local) => Some(self.params[local].type_id),
+            LocalValueId::Varnode(id) => shared.values.varnode_types.get(&id).copied(),
+            LocalValueId::Temp(_) | LocalValueId::BasicBlock(_) | LocalValueId::Function(_) => None,
+        }
+    }
+
     /// Appends a body-local temporary space and returns its qualified ID.
     pub fn push_temp_space(&mut self, space: TempSpace) -> TempSpaceId {
         TempSpaceId::new(self.id(), self.temp_spaces.push(space))
@@ -622,10 +674,16 @@ impl<'str> FunctionBody<'str> {
     /// this body's own id.
     pub fn push_block(&mut self, block: BasicBlock<'str>) -> BlockId {
         let func = self.id();
+        BlockId::new(func, self.push_block_local(block))
+    }
+
+    /// Push a fresh block into this body's arena and roster, returning its
+    /// **body-local** id. The id-less twin of [`push_block`](Self::push_block),
+    /// usable on a detached (uninstalled) body.
+    pub fn push_block_local(&mut self, block: BasicBlock<'str>) -> LocalBlockId {
         let local = self.blocks.push(block);
-        let id = BlockId::new(func, local);
         self.roster.push(local);
-        id
+        local
     }
 
     /// Mint a fresh empty block, owned by this function (arena membership) and
