@@ -1058,78 +1058,19 @@ fn postdominated_dead_ram_stores<'a, 'str: 'a>(
 /// stores that are dead *across* basic-block boundaries — overwritten before
 /// being read on every path, or written to a `dead_reg` and never read — are
 /// removed. Without `aliases` each block is treated independently.
-/// TODO(5b-ii): Takes Context; migrate to FunctionBody/ContextView when public API stabilizes.
 pub fn remove_dead_load_insns(
     ctx: &mut Context,
     function_id: FunctionId,
     aliases: Option<&AliasResult>,
     dead_regs: &[ValueId],
 ) -> bool {
-    remove_dead_load_insns_generic(ctx, function_id, aliases, dead_regs)
+    crate::with_body_mut(ctx, function_id, |body, cx| {
+        remove_dead_load_insns_body(body, cx, function_id, aliases, dead_regs)
+    })
 }
 
-/// Generic host-based core of [`remove_dead_load_insns`].
-/// TODO(5b-ii): For backwards compatibility; prefer concrete version for new code.
-pub fn remove_dead_load_insns_generic<'str>(
-    host: &mut Context<'str>,
-    function_id: FunctionId,
-    aliases: Option<&AliasResult>,
-    dead_regs: &[ValueId],
-) -> bool {
-    let block_ids: Vec<BlockId> = host
-        .function_ref(function_id)
-        .iter()
-        .map(|block| block.id)
-        .collect();
-    let view = ModuleView::new(&*host);
-
-    let mut dead = HashSet::default();
-    dead.extend(unread_temp_space_stores(view, function_id));
-
-    match aliases {
-        Some(aliases) => {
-            dead.extend(postdominated_dead_register_stores(
-                view,
-                function_id,
-                aliases,
-            ));
-            dead.extend(unread_frame_local_stores(view, function_id, aliases));
-            dead.extend(postdominated_dead_ram_stores(view, function_id, aliases));
-            let liveness =
-                crate::mem::compute_memory_liveness(view, function_id, aliases, dead_regs);
-            for &block_id in &block_ids {
-                dead.extend(dead_load_insns_seeded(
-                    view,
-                    block_id,
-                    aliases,
-                    dead_regs,
-                    liveness.live_out(block_id),
-                    liveness.killed_out(block_id),
-                ));
-            }
-        }
-        None => {
-            for &block_id in &block_ids {
-                dead.extend(dead_load_insns(view, block_id, None, dead_regs));
-            }
-        }
-    }
-
-    let changed = !dead.is_empty();
-    let mut dead: Vec<_> = dead.into_iter().collect();
-    dead.sort_unstable();
-    for id in dead {
-        host.remove_instruction(id);
-    }
-    changed
-}
-
-/// Host-generic core of [`remove_dead_load_insns`], routing every read through
-/// `cx.body_view(body)` and every removal through [`body.remove_instruction`],
-/// so it operates identically on the whole module (`&mut Context`) or a single
-/// checked-out function ([`crate::pipeline`]'s `FunctionBody`).
-/// This is the concrete version for FunctionBody/ContextView (stage 5b).
-pub fn remove_dead_load_insns_host<'a, 'str>(
+/// Body-local core of [`remove_dead_load_insns`].
+pub fn remove_dead_load_insns_body<'a, 'str>(
     body: &'a mut FunctionBody<'str>,
     cx: ContextView<'a, 'str>,
     function_id: FunctionId,
@@ -2248,7 +2189,7 @@ impl FunctionPass for DeadLoad {
     ) -> Result<Outcome<'str>, String> {
         let fid = f.id();
         let aliases = frame_aware_aliases(m, m.body_view(f), fid);
-        Ok(Outcome::changed(remove_dead_load_insns_host(
+        Ok(Outcome::changed(remove_dead_load_insns_body(
             f,
             m,
             fid,
@@ -2261,7 +2202,7 @@ impl FunctionPass for DeadLoad {
 crate::register_function_pass!(DeadLoad);
 
 /// Lives here (not in the orphaned `dead_store.rs`) because it shares
-/// [`remove_dead_load_insns_host`] with [`DeadLoad`]; the only difference is that
+/// [`remove_dead_load_insns_body`] with [`DeadLoad`]; the only difference is that
 /// it also treats the architecture's flag registers as dead.
 #[derive(Default)]
 pub struct DeadStore;
@@ -2280,7 +2221,7 @@ impl FunctionPass for DeadStore {
         let fid = f.id();
         let dead_regs = m.env().cfg.dead_flag_regs.clone();
         let aliases = frame_aware_aliases(m, m.body_view(f), fid);
-        Ok(Outcome::changed(remove_dead_load_insns_host(
+        Ok(Outcome::changed(remove_dead_load_insns_body(
             f,
             m,
             fid,
@@ -2296,8 +2237,8 @@ crate::register_function_pass!(DeadStore);
 /// [`crate::gvn::Gvn`] does), so the dead-store/dead-load scans get the
 /// stack-vs-global and own-frame disjointness rules. Falls back to an inert frame
 /// when no stack-pointer register is registered. Reads the function through the
-/// checked-out `host`; the module-wide alias base and stack-pointer register come
-/// from the [`ContextView`].
+/// selected body view; the module-wide alias base and stack-pointer register
+/// come from the [`ContextView`].
 fn frame_aware_aliases<'a, 'str: 'a>(
     m: ContextView<'_, 'str>,
     host: impl QCodeView<'a, 'str>,
