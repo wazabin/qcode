@@ -71,14 +71,18 @@ pub struct FunctionInterface<'str> {
 /// under the same [`FunctionId`].
 #[derive(Clone, serde::Serialize, serde::Deserialize)]
 pub struct FunctionBody<'str> {
-    /// Immutable identity of this body in the lockstep function registries.
+    /// Immutable identity of this body in the lockstep function registries, or
+    /// `None` while the body is *detached* (freshly minted by a pass, not yet
+    /// installed under a registry key).
     ///
     /// This field is deliberately absent from the serialized body wire shape.
     /// Bodies are serialized and deserialized as part of [`Context`], whose
     /// custom deserializer restores the registry key here. Standalone body
-    /// deserialization therefore does not establish a usable identity.
+    /// deserialization therefore does not establish a usable identity. A detached
+    /// body is never serialized (bodies are installed at the mint barrier before
+    /// any save), so the `None` state never reaches the wire.
     #[serde(skip)]
-    id: FunctionId,
+    id: Option<FunctionId>,
 
     /// The entry block (dominates all other blocks in this function).
     /// Private: read via [`FunctionBody::root_id`], write via
@@ -273,22 +277,31 @@ impl<'str> FunctionBody<'str> {
         self.users.shrink_to_fit();
     }
 
-    /// Rebind the temporary ambient function ID used while constructing a
-    /// detached body to its installed registry ID.
+    /// Rebind a minted body from the temporary ambient function ID it was built
+    /// under to its installed registry ID, at the mint install barrier.
     ///
     /// Function arenas, operands, roster entries, and use-def data are body-local
-    /// and need no remap. Function-qualified entries in the local reverse-name
-    /// table carry the ambient ID. Block ownership is now derived from the storing
-    /// arena and CFG edge endpoints are bare body-local ids, so neither needs a
-    /// rewrite. Real `Callee::Real` targets inside instruction mnemonics are
-    /// semantic cross-function references, not ownership metadata, and are
-    /// deliberately left untouched.
-    pub fn rebind_ambient_id(&mut self, from: FunctionId, to: FunctionId) {
-        assert_eq!(self.id, from, "detached body has an unexpected ambient id");
-        if from == to {
-            return;
-        }
-        self.id = to;
+    /// and need no remap. Block ownership is now derived from the storing arena and
+    /// CFG edge endpoints are bare body-local ids, so neither needs a rewrite. Real
+    /// `Callee::Real` targets inside instruction mnemonics are semantic
+    /// cross-function references, not ownership metadata, and are deliberately left
+    /// untouched. (Stage 4 switches minting to [`detached`](Self::detached) +
+    /// [`install_id`](Self::install_id) and retires this method.)
+    pub fn reinstall_id(&mut self, from: FunctionId, to: FunctionId) {
+        assert_eq!(
+            self.id,
+            Some(from),
+            "detached body has an unexpected ambient id"
+        );
+        self.id = Some(to);
+    }
+
+    /// Install a registry ID onto a freshly [`detached`](Self::detached) body at
+    /// the mint barrier. Panics if the body already carries an id.
+    /// (Stage 4 wiring; no callers until minting switches to `detached()`.)
+    pub fn install_id(&mut self, id: FunctionId) {
+        assert!(self.id.is_none(), "body already installed");
+        self.id = Some(id);
     }
 
     /// Resolve one pass-local callee slot throughout this detached or installed
@@ -309,11 +322,13 @@ impl<'str> FunctionBody<'str> {
             .collect()
     }
 
-    /// An empty function *body*: no root, empty arenas. The interface lives
-    /// separately in [`Context::interfaces`](crate::context::Context::interfaces).
-    pub fn empty_body(id: FunctionId) -> Self {
+    /// An empty function *body* carrying the identity `id`. Used for bodies
+    /// installed under a known registry key at creation
+    /// ([`make`](Self::make)-family constructors) and — until stage 4 — for a
+    /// pass-minted body built under its owner's ambient id.
+    pub fn empty_with_id(id: FunctionId) -> Self {
         Self {
-            id,
+            id: Some(id),
             root: None,
             insns: StableArena::default(),
             blocks: StableArena::default(),
@@ -328,8 +343,39 @@ impl<'str> FunctionBody<'str> {
         }
     }
 
-    /// This body's immutable function identity.
-    pub const fn id(&self) -> FunctionId {
+    /// An empty *detached* function body: no root, empty arenas, and **no**
+    /// registry identity yet ([`id`](Self::id) panics until
+    /// [`install_id`](Self::install_id) runs at the mint barrier). The interface
+    /// lives separately in
+    /// [`Context::interfaces`](crate::context::Context::interfaces).
+    /// (Stage 4 switches minting onto this; no callers yet.)
+    pub fn detached() -> Self {
+        Self {
+            id: None,
+            root: None,
+            insns: StableArena::default(),
+            blocks: StableArena::default(),
+            roster: Vec::new(),
+            params: StableArena::default(),
+            edges: StableArena::default(),
+            temp_spaces: Registry::default(),
+            temps: Registry::default(),
+            instruction_addrs: BTreeSet::new(),
+            names: crate::context::NameTable::default(),
+            users: FxHashMap::default(),
+        }
+    }
+
+    /// This body's immutable function identity. Panics on a detached body (one
+    /// minted but not yet installed) — the loud, release-active tripwire against
+    /// laundering an owner ID through an uninstalled body.
+    pub fn id(&self) -> FunctionId {
+        self.id.expect("detached body: no registry id yet")
+    }
+
+    /// This body's registry identity, or `None` while detached. The honest
+    /// accessor for the install barrier and verifiers.
+    pub fn try_id(&self) -> Option<FunctionId> {
         self.id
     }
 
@@ -337,7 +383,7 @@ impl<'str> FunctionBody<'str> {
     /// deserialization. Serialized function bodies remain wire-compatible with
     /// sessions written before the identity became intrinsic.
     pub(crate) fn rehydrate_id(&mut self, id: FunctionId) {
-        self.id = id;
+        self.id = Some(id);
     }
 
     /// This function's instructions that use `value` as an operand (see
@@ -355,13 +401,13 @@ impl<'str> FunctionBody<'str> {
     pub fn users_of(&self, value: ValueId) -> Vec<InstructionId> {
         if value
             .owning_function()
-            .is_some_and(|owner| owner != self.id)
+            .is_some_and(|owner| owner != self.id())
         {
             return Vec::new();
         }
         self.local_users_of(value)
             .iter()
-            .map(|&local| InstructionId::new(self.id, local))
+            .map(|&local| InstructionId::new(self.id(), local))
             .collect()
     }
 
@@ -399,38 +445,47 @@ impl<'str> FunctionBody<'str> {
 
     /// The block `id`, by its function-local index (see the note above).
     pub fn block(&self, id: BlockId) -> &BasicBlock<'str> {
-        assert_eq!(id.func, self.id, "block belongs to another function");
+        assert_eq!(id.func, self.id(), "block belongs to another function");
         &self.blocks[id.local]
     }
     /// The block `id`, mutably.
     pub fn block_mut(&mut self, id: BlockId) -> &mut BasicBlock<'str> {
-        assert_eq!(id.func, self.id, "block belongs to another function");
+        assert_eq!(id.func, self.id(), "block belongs to another function");
         &mut self.blocks[id.local]
     }
 
     /// Whether `id` currently names a live block payload in this body.
     pub fn contains_block(&self, id: BlockId) -> bool {
-        id.func == self.id && self.blocks.contains(id.local)
+        id.func == self.id() && self.blocks.contains(id.local)
     }
     /// The instruction `id`, by its function-local index.
     pub fn insn(&self, id: InstructionId) -> &Instruction<'str> {
-        assert_eq!(id.func, self.id, "instruction belongs to another function");
+        assert_eq!(
+            id.func,
+            self.id(),
+            "instruction belongs to another function"
+        );
         &self.insns[id.local]
     }
     /// The instruction `id`, mutably.
     pub fn insn_mut(&mut self, id: InstructionId) -> &mut Instruction<'str> {
-        assert_eq!(id.func, self.id, "instruction belongs to another function");
+        assert_eq!(
+            id.func,
+            self.id(),
+            "instruction belongs to another function"
+        );
         &mut self.insns[id.local]
     }
 
     /// Whether `id` currently names a live instruction payload in this body.
     pub fn contains_instruction(&self, id: InstructionId) -> bool {
-        id.func == self.id && self.insns.contains(id.local)
+        id.func == self.id() && self.insns.contains(id.local)
     }
     /// The block parameter `id`, by its function-local index.
     pub fn block_param(&self, id: BlockParamId) -> &BlockParam<'str> {
         assert_eq!(
-            id.func, self.id,
+            id.func,
+            self.id(),
             "block parameter belongs to another function"
         );
         &self.params[id.local]
@@ -438,7 +493,8 @@ impl<'str> FunctionBody<'str> {
     /// The block parameter `id`, mutably.
     pub fn block_param_mut(&mut self, id: BlockParamId) -> &mut BlockParam<'str> {
         assert_eq!(
-            id.func, self.id,
+            id.func,
+            self.id(),
             "block parameter belongs to another function"
         );
         &mut self.params[id.local]
@@ -446,12 +502,12 @@ impl<'str> FunctionBody<'str> {
 
     /// Whether `id` currently names a live block-parameter payload in this body.
     pub fn contains_block_param(&self, id: BlockParamId) -> bool {
-        id.func == self.id && self.params.contains(id.local)
+        id.func == self.id() && self.params.contains(id.local)
     }
 
     /// Appends a body-local temporary space and returns its qualified ID.
     pub fn push_temp_space(&mut self, space: TempSpace) -> TempSpaceId {
-        TempSpaceId::new(self.id, self.temp_spaces.push(space))
+        TempSpaceId::new(self.id(), self.temp_spaces.push(space))
     }
 
     /// Appends a body-local temporary value and returns its qualified ID.
@@ -473,20 +529,21 @@ impl<'str> FunctionBody<'str> {
                 .register(name, LocalValueId::Temp(local), None)
                 .expect("temporary name was checked before insertion");
         }
-        TempId::new(self.id, local)
+        TempId::new(self.id(), local)
     }
 
     /// Resolves a qualified temporary-space ID against this body.
     #[track_caller]
     pub fn temp_space(&self, id: TempSpaceId) -> &TempSpace {
         assert_eq!(
-            id.func, self.id,
+            id.func,
+            self.id(),
             "temporary space belongs to another function"
         );
         debug_assert!(
             self.contains_temp_space(id),
             "missing temporary space {id:?} in function {:?} (arena length {})",
-            self.id,
+            self.id(),
             self.temp_spaces.len()
         );
         &self.temp_spaces[id.local]
@@ -494,17 +551,17 @@ impl<'str> FunctionBody<'str> {
 
     /// Whether `id` names a temporary space in this body.
     pub fn contains_temp_space(&self, id: TempSpaceId) -> bool {
-        id.func == self.id && usize::from(id.local) < self.temp_spaces.len()
+        id.func == self.id() && usize::from(id.local) < self.temp_spaces.len()
     }
 
     /// Resolves a qualified temporary-value ID against this body.
     #[track_caller]
     pub fn temp(&self, id: TempId) -> &Temp<'str> {
-        assert_eq!(id.func, self.id, "temporary belongs to another function");
+        assert_eq!(id.func, self.id(), "temporary belongs to another function");
         debug_assert!(
             self.contains_temp(id),
             "missing temporary {id:?} in function {:?} (arena length {})",
-            self.id,
+            self.id(),
             self.temps.len()
         );
         &self.temps[id.local]
@@ -512,7 +569,7 @@ impl<'str> FunctionBody<'str> {
 
     /// Whether `id` names a temporary value in this body.
     pub fn contains_temp(&self, id: TempId) -> bool {
-        id.func == self.id && usize::from(id.local) < self.temps.len()
+        id.func == self.id() && usize::from(id.local) < self.temps.len()
     }
 
     /// Physically removes a block parameter and its local bookkeeping.
@@ -550,7 +607,7 @@ impl<'str> FunctionBody<'str> {
     /// Push a fresh instruction into this body's arena, recording each operand's
     /// use in the reverse-use map.
     pub fn push_insn(&mut self, insn: Instruction<'str>) -> InstructionId {
-        let func = self.id;
+        let func = self.id();
         let args: Vec<LocalValueId> = insn.mnemonic().args().into_iter().collect();
         let local = self.insns.push(insn);
         let id = InstructionId::new(func, local);
@@ -564,7 +621,7 @@ impl<'str> FunctionBody<'str> {
     /// Ownership is derived from the storing arena: the returned id's `func` is
     /// this body's own id.
     pub fn push_block(&mut self, block: BasicBlock<'str>) -> BlockId {
-        let func = self.id;
+        let func = self.id();
         let local = self.blocks.push(block);
         let id = BlockId::new(func, local);
         self.roster.push(local);
@@ -580,7 +637,7 @@ impl<'str> FunctionBody<'str> {
     /// Push a fresh block parameter into this body's arena.
     pub fn push_block_param(&mut self, param: BlockParam<'str>) -> BlockParamId {
         let local = self.params.push(param);
-        BlockParamId::new(self.id, local)
+        BlockParamId::new(self.id(), local)
     }
 
     /// Mint an `Int(size)`-typed instruction with `mnemonic` (the type is minted
@@ -699,7 +756,7 @@ impl<'str> FunctionBody<'str> {
     /// physically dropping its payload.
     pub fn remove_cfg_edge(&mut self, edge_id: EdgeId) {
         let EdgeData { from, to } = *self.edge(edge_id);
-        let func = self.id;
+        let func = self.id();
         self.block_mut(BlockId::new(func, from))
             .edges
             .remove(&edge_id);
@@ -719,12 +776,14 @@ impl<'str> FunctionBody<'str> {
             return;
         };
         assert_eq!(
-            func, self.id,
+            func,
+            self.id(),
             "cannot replace uses of a value owned by another function"
         );
         if let Some(new_owner) = new.owning_function() {
             assert_eq!(
-                new_owner, self.id,
+                new_owner,
+                self.id(),
                 "cannot replace uses with a value owned by another function"
             );
         }
@@ -742,11 +801,16 @@ impl<'str> FunctionBody<'str> {
     /// terminator, clear its name, prune its operand use-lists, and physically
     /// drop its payload.
     pub fn remove_instruction(&mut self, id: InstructionId) {
-        assert_eq!(id.func, self.id, "instruction belongs to another function");
+        assert_eq!(
+            id.func,
+            self.id(),
+            "instruction belongs to another function"
+        );
+        let func = self.id();
         let (parent, name, is_terminator, args) = {
             let insn = self.insn(id);
             (
-                insn.parent.map(|l| BlockId::new(self.id, l)),
+                insn.parent.map(|l| BlockId::new(self.id(), l)),
                 insn.name.clone(),
                 insn.mnemonic().is_terminator(),
                 insn.mnemonic().args().into_iter().collect::<Vec<_>>(),
@@ -779,7 +843,7 @@ impl<'str> FunctionBody<'str> {
         }
         for arg in args {
             let remove_key = if let Some(users) = self.users.get_mut(&arg) {
-                users.retain(|&local| local != id.localize(self.id));
+                users.retain(|&local| local != id.localize(func));
                 users.is_empty()
             } else {
                 false
@@ -814,8 +878,12 @@ impl<'str> FunctionBody<'str> {
     /// Replace an instruction's mnemonic in place, keeping the reverse use-map in
     /// sync.
     pub fn replace_instruction_mnemonic(&mut self, id: InstructionId, mnemonic: Mnemonic) {
-        assert_eq!(id.func, self.id, "instruction belongs to another function");
-        let func = self.id;
+        assert_eq!(
+            id.func,
+            self.id(),
+            "instruction belongs to another function"
+        );
+        let func = self.id();
         let old_args = self
             .insn(id)
             .mnemonic()
@@ -854,7 +922,7 @@ impl<'str> FunctionBody<'str> {
     /// Remove `block` from this body: unlink every incident CFG edge, remove its
     /// instructions and params, clear ownership metadata, then drop its payload.
     pub fn delete_block(&mut self, block: BlockId) {
-        assert_eq!(block.func, self.id, "block belongs to another function");
+        assert_eq!(block.func, self.id(), "block belongs to another function");
         let mut edges: Vec<EdgeId> = self.block(block).edges.iter().copied().collect();
         edges.sort_unstable();
         for edge in edges {
@@ -864,7 +932,7 @@ impl<'str> FunctionBody<'str> {
             .block(block)
             .instructions
             .iter()
-            .map(|&local| InstructionId::new(self.id, local))
+            .map(|&local| InstructionId::new(self.id(), local))
             .collect();
         for insn in insns {
             self.remove_instruction(insn);
@@ -873,7 +941,7 @@ impl<'str> FunctionBody<'str> {
             .block(block)
             .params
             .iter()
-            .map(|&local| BlockParamId::new(self.id, local))
+            .map(|&local| BlockParamId::new(self.id(), local))
             .collect();
         for param in params {
             self.remove_block_param(param);
@@ -973,7 +1041,7 @@ impl<'str> FunctionBody<'str> {
         old_name: Option<&str>,
     ) -> Result<()> {
         let existing = match id.name_scope_function() {
-            Some(_) => self.names.get(&name).map(|id| id.qualify(self.id)),
+            Some(_) => self.names.get(&name).map(|id| id.qualify(self.id())),
             None => shared.get_named(&name),
         };
         if let Some(existing) = existing {
@@ -984,7 +1052,7 @@ impl<'str> FunctionBody<'str> {
             };
         }
         match id.name_scope_function() {
-            Some(_) => self.names.register(name, id.localize(self.id), old_name),
+            Some(_) => self.names.register(name, id.localize(self.id()), old_name),
             None => {
                 unimplemented!(
                     "a function body cannot register a global name (shared is read-only)"
@@ -1024,7 +1092,7 @@ impl<'str> FunctionBody<'str> {
         let id = FunctionId::from(ctx.bodies.len());
         let pushed = ctx.push_function(
             FunctionInterface::new(name.clone()),
-            FunctionBody::empty_body(id),
+            FunctionBody::empty_with_id(id),
         );
         debug_assert_eq!(pushed, id);
         ctx.update_name(name, id.into(), None)?;
@@ -1064,7 +1132,7 @@ impl<'str> FunctionBody<'str> {
         let id = FunctionId::from(ctx.bodies.len());
         let pushed = ctx.push_function(
             FunctionInterface::new(name.clone()),
-            FunctionBody::empty_body(id),
+            FunctionBody::empty_with_id(id),
         );
         debug_assert_eq!(pushed, id);
 

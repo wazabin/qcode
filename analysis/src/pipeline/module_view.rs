@@ -34,8 +34,8 @@ use super::PipelineEnv;
 /// `slot` is the pass-local [`Callee::Minted`] index used by the owner's IR;
 /// it is not a reserved registry ID. `ambient` is the owner's installed ID,
 /// borrowed temporarily while building the detached body's checked refs. The
-/// body stores local IR IDs, so installation only rebinds block ownership
-/// through [`FunctionBody::rebind_ambient_id`].
+/// body stores local IR IDs, so installation only rebinds the body identity
+/// through [`FunctionBody::reinstall_id`].
 pub struct Minted<'str> {
     slot: u32,
     ambient: FunctionId,
@@ -66,7 +66,7 @@ impl<'str> Minted<'str> {
         mut self,
         installed: FunctionId,
     ) -> (u32, FunctionInterface<'str>, FunctionBody<'str>) {
-        self.body.rebind_ambient_id(self.ambient, installed);
+        self.body.reinstall_id(self.ambient, installed);
         (self.slot, self.interface, self.body)
     }
 }
@@ -259,7 +259,7 @@ pub fn mint_function<'str>(
         slot,
         ambient: owner.id(),
         interface,
-        body: FunctionBody::empty_body(owner.id()),
+        body: FunctionBody::empty_with_id(owner.id()),
     });
     Callee::Minted(slot)
 }
