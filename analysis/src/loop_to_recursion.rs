@@ -35,11 +35,12 @@ use std::collections::HashSet;
 use rustc_hash::FxHashMap as HashMap;
 
 use qcode::value::{
-    FunctionId, FunctionKind, LocalValueId, QCodeView, ValueId, VarnodeId,
+    FunctionId, FunctionKind, LocalBlockId, LocalInsnId, LocalValueId, QCodeView, ValueId,
+    VarnodeId,
     block::BlockId,
     block_param::BlockParam,
     insn::{Branch, InstructionId, Mnemonic},
-    util::{base_ref::BaseRef, body_mut::BodyMut},
+    util::detached::DetachedMut,
 };
 
 use crate::pipeline::{ContextView, FunctionBody, Minted, Outcome};
@@ -211,6 +212,9 @@ fn transform<'str>(
 ) -> bool {
     let host_fid = body.id();
     let name = format!("{}_rec", m.body_view(body).function_ref(host_fid).name());
+    // Mark the mint boundary so an aborted outline (a function-scoped back-edge
+    // arg missing from the value map) can drop the partially built minted body.
+    let mint_mark = minted_out.len();
     // Mint the recursive lambda (name buffered raw; the driver uniquifies it at
     // the barrier). Keep the placeholder in both recursive and host references;
     // the install barrier patches it to the materialized function id.
@@ -231,21 +235,21 @@ fn transform<'str>(
     //     host blocks into another function — that would leave `rec` owning
     //     host-stored blocks, which the checked-out invariant forbids — so the
     //     region is reproduced, and the host copy deleted below).
-    // TODO(5b-ii): function minting (`host_with_minted`) stays on the host path
-    // until the minting chunk lands.
+    // The minted lambda is built entirely through the body-local `DetachedMut`
+    // surface: owner values (read from `own`) are keyed into `value_map`, whose
+    // *values* are the minted body's local ids — no owner id ever enters the clone.
     {
         let (own, mut minted) = crate::pipeline::host_with_minted(body, minted_out, m, rec);
 
         // Pass 1: a fresh block per region block, with its params cloned. Names
         // and the head-as-root are set here so later passes can reference them.
-        let mut block_map: HashMap<BlockId, BlockId> = HashMap::default();
-        let mut value_map: HashMap<ValueId, ValueId> = HashMap::default();
+        let mut block_map: HashMap<BlockId, LocalBlockId> = HashMap::default();
+        let mut value_map: HashMap<ValueId, LocalValueId> = HashMap::default();
         for &ob in &model.region {
             let nb = minted.make_block();
             block_map.insert(ob, nb);
             if let Some(name) = own.block_ref(ob).name() {
-                let _ =
-                    BaseRef::new(minted.reborrow(), nb).rename_local(Cow::Owned(name.to_owned()));
+                let _ = minted.rename_block(nb, Cow::Owned(name.to_owned()));
             }
             let params: Vec<(
                 qcode::value::block_param::BlockParamId,
@@ -266,14 +270,12 @@ fn transform<'str>(
                 value_map.insert(ValueId::BlockParam(pid), np);
             }
         }
-        minted
-            .function_mut(host_fid)
-            .set_root_id(Some(block_map[&model.head].local));
+        minted.set_root(block_map[&model.head]);
 
         // Pass 2: clone every non-terminator instruction (and the terminator of a
         // non-latch block), remapping block targets now (the map is complete) and
         // recording the value map so operands are remapped once all defs exist.
-        let mut cloned: Vec<InstructionId> = Vec::new();
+        let mut cloned: Vec<LocalInsnId> = Vec::new();
         for &ob in &model.region {
             let nb = block_map[&ob];
             let insns: Vec<InstructionId> = own.block_ref(ob).iter().map(|i| i.id).collect();
@@ -286,10 +288,10 @@ fn transform<'str>(
                 let r = own.insn_ref(iid);
                 let mut mn = r.mnemonic().clone();
                 let ty = r.type_id();
-                remap_block_targets(&mut mn, ob.func, nb.func, &block_map);
+                remap_block_targets(&mut mn, ob.func, &block_map);
                 let new_id = minted.push_mnemonic_with_type(mn, ty);
-                BaseRef::new(minted.reborrow(), nb).push_insn(new_id);
-                value_map.insert(ValueId::Instruction(iid), ValueId::Instruction(new_id));
+                minted.append_insn(nb, new_id);
+                value_map.insert(ValueId::Instruction(iid), LocalValueId::Instruction(new_id));
                 cloned.push(new_id);
             }
         }
@@ -297,17 +299,17 @@ fn transform<'str>(
         // Pass 3: remap value operands of the cloned instructions (region params
         // and defs), and add CFG edges for the cloned (non-latch) terminators.
         for &new_id in &cloned {
-            let mut mn = minted.insn_ref(new_id).mnemonic().clone();
+            let mut mn = minted.mnemonic(new_id).clone();
             let pairs: Vec<_> = mn
                 .args()
                 .into_iter()
                 .filter_map(|a| {
                     // The clone still holds the source body's bare-local operands, so
-                    // qualify with the host function for the map lookup and store the
-                    // replacement local to the minted lambda's arena.
-                    value_map
-                        .get(&a.qualify(host_fid))
-                        .map(|&n| (a, n.localize(new_id.func)))
+                    // qualify with the host function for the map lookup; the mapped
+                    // value is already a local id in the minted lambda's arena.
+                    // Function-agnostic operands (literals/…) are absent from the map
+                    // and stay valid verbatim.
+                    value_map.get(&a.qualify(host_fid)).map(|&n| (a, n))
                 })
                 .collect();
             if !pairs.is_empty() {
@@ -332,13 +334,25 @@ fn transform<'str>(
         // Pass 4: each latch's `goto head` becomes `%r = apply rec(next…); return %r`.
         for (pred, next_args) in &model.back_edges {
             let nb = block_map[pred];
-            let args: Vec<ValueId> = next_args
-                .iter()
-                .map(|a| value_map.get(a).copied().unwrap_or(*a))
-                .collect();
+            // The back-edge args are region defs/params (in the map) or constants
+            // (function-agnostic); a function-scoped arg absent from the map means
+            // the recognizer over-reached — abort the outline (never launder an
+            // owner id into the minted body).
+            let mut args: Vec<LocalValueId> = Vec::with_capacity(next_args.len());
+            for a in next_args {
+                let Some(local) = value_map
+                    .get(a)
+                    .copied()
+                    .or_else(|| a.as_function_agnostic())
+                else {
+                    minted_out.truncate(mint_mark);
+                    return false;
+                };
+                args.push(local);
+            }
             let mut b = minted.builder(nb);
-            let out = b.push_apply(rec, args).id();
-            b.push_return_value(out);
+            let out = LocalValueId::Instruction(b.push_apply_local(rec, args));
+            b.push_return_value_local(out);
         }
     }
 
@@ -363,30 +377,28 @@ fn transform<'str>(
 /// Push a cloned param typed `ty` onto `block`, returning its value (host-routed
 /// `BasicBlock::push_param` + the `type_id` write).
 fn push_param<'str>(
-    host: &mut BodyMut<'_, 'str>,
-    block: BlockId,
+    minted: &mut DetachedMut<'_, 'str>,
+    block: LocalBlockId,
     ty: qcode::types::TypeId,
-) -> ValueId {
-    let index = host.block_ref(block).num_params();
-    let pid = host.push_block_param(BlockParam::new(index, ty, block.local));
-    host.block_mut(block).params.push(pid.localize(block.func));
-    ValueId::BlockParam(pid)
+) -> LocalValueId {
+    let index = minted.block(block).param_ids().len();
+    let pid = minted.push_block_param(block, BlockParam::new(index, ty, block));
+    LocalValueId::BlockParam(pid)
 }
 
 /// Rewrite the block targets of a cloned terminator through `block_map` (value
 /// operands are remapped separately, once every region def is cloned). Targets are
 /// bare body-local indices: a freshly cloned terminator still holds its source
 /// block's local target (`old_func`-relative), so qualify with `old_func` for the
-/// lookup and re-localize the mapped clone against its new arena `new_func`.
+/// lookup; the mapped clone is already a local id in the minted lambda's arena.
 fn remap_block_targets(
     mn: &mut Mnemonic,
     old_func: qcode::value::FunctionId,
-    new_func: qcode::value::FunctionId,
-    block_map: &HashMap<BlockId, BlockId>,
+    block_map: &HashMap<BlockId, LocalBlockId>,
 ) {
     let remap = |b: &mut qcode::value::LocalBlockId| {
         if let Some(&nb) = block_map.get(&BlockId::new(old_func, *b)) {
-            *b = nb.localize(new_func);
+            *b = nb;
         }
     };
     match mn {

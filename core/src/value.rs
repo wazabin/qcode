@@ -473,6 +473,26 @@ impl ValueId {
             ValueId::Temp(id) => LocalValueId::Temp(id.local),
         }
     }
+
+    /// Localize this id **only if it is function-agnostic** — a shared/module arm
+    /// (`Literal`/`Bytes`/`Varnode`/`Function`) that carries no owning function and
+    /// so needs no ambient body to convert. Returns `None` for the function-scoped
+    /// arena arms (`Instruction`/`BasicBlock`/`BlockParam`/`Temp`), which cannot be
+    /// dropped into a *different* body's local space without misrouting. This is the
+    /// safe localizer for a value that may legitimately be a constant flowing into a
+    /// minted body but must otherwise be remapped through a value map.
+    pub fn as_function_agnostic(self) -> Option<LocalValueId> {
+        match self {
+            ValueId::Literal(id) => Some(LocalValueId::Literal(id)),
+            ValueId::Bytes(id) => Some(LocalValueId::Bytes(id)),
+            ValueId::Varnode(id) => Some(LocalValueId::Varnode(id)),
+            ValueId::Function(id) => Some(LocalValueId::Function(id)),
+            ValueId::Instruction(_)
+            | ValueId::BasicBlock(_)
+            | ValueId::BlockParam(_)
+            | ValueId::Temp(_) => None,
+        }
+    }
 }
 
 /// Trait implemented by all typed value reference types.

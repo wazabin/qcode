@@ -22,8 +22,10 @@ use jstd::registry::Registry;
 use qcode::{
     context::{Context, Shared},
     value::{
-        BodyView, FunctionBody, FunctionId, FunctionKind, function::FunctionInterface,
-        insn::Callee, util::body_mut::BodyMut,
+        BodyView, FunctionBody, FunctionId, FunctionKind,
+        function::FunctionInterface,
+        insn::Callee,
+        util::{body_mut::BodyMut, detached::DetachedMut},
     },
 };
 
@@ -32,13 +34,12 @@ use super::PipelineEnv;
 /// A detached function minted by a pass this run.
 ///
 /// `slot` is the pass-local [`Callee::Minted`] index used by the owner's IR;
-/// it is not a reserved registry ID. `ambient` is the owner's installed ID,
-/// borrowed temporarily while building the detached body's checked refs. The
-/// body stores local IR IDs, so installation only rebinds the body identity
-/// through [`FunctionBody::reinstall_id`].
+/// it is not a reserved registry ID. The body is built fully *detached* (no
+/// registry identity — [`FunctionBody::detached`]), storing only body-local IR
+/// IDs, so no owner ID can leak into it; installation simply stamps the identity
+/// through [`FunctionBody::install_id`].
 pub struct Minted<'str> {
     slot: u32,
-    ambient: FunctionId,
     pub interface: FunctionInterface<'str>,
     pub body: FunctionBody<'str>,
 }
@@ -54,19 +55,14 @@ impl<'str> Minted<'str> {
         self.slot
     }
 
-    /// The real owner ID temporarily used to qualify checked refs while this
-    /// detached body is being built.
-    pub const fn ambient_id(&self) -> FunctionId {
-        self.ambient
-    }
-
     /// Consume this detached function for installation under `installed`.
-    /// No IR-local IDs are remapped; only ambient ownership metadata is rebound.
+    /// No IR-local IDs are remapped; the detached body simply acquires its
+    /// registry identity.
     pub fn into_installed_parts(
         mut self,
         installed: FunctionId,
     ) -> (u32, FunctionInterface<'str>, FunctionBody<'str>) {
-        self.body.reinstall_id(self.ambient, installed);
+        self.body.install_id(installed);
         (self.slot, self.interface, self.body)
     }
 }
@@ -337,22 +333,23 @@ pub fn mint_function<'str>(
         sig.is_pure = true;
         sig.pure_reg = true;
     }
+    let _ = owner;
     minted.push(Minted {
         slot,
-        ambient: owner.id(),
         interface,
-        body: FunctionBody::empty_with_id(owner.id()),
+        body: FunctionBody::detached(),
     });
     Callee::Minted(slot)
 }
 
-/// Read the owner while mutating one of its detached minted bodies.
+/// Read the owner while mutating one of its detached minted bodies through the
+/// body-local [`DetachedMut`] surface.
 pub fn host_with_minted<'body, 'ctx, 'str>(
     owner: &'body FunctionBody<'str>,
     minted: &'body mut [Minted<'str>],
     cx: ContextView<'ctx, 'str>,
     callee: Callee,
-) -> (BodyView<'body, 'str>, BodyMut<'body, 'str>)
+) -> (BodyView<'body, 'str>, DetachedMut<'body, 'str>)
 where
     'ctx: 'body,
 {
@@ -363,12 +360,10 @@ where
         .iter_mut()
         .find(|entry| entry.slot == slot)
         .expect("host_with_minted: not a function minted this run");
-    assert_eq!(
-        entry.ambient,
-        owner.id(),
-        "minted entry belongs to another owner"
-    );
-    (cx.body_view(owner), cx.host(&mut entry.body))
+    (
+        cx.body_view(owner),
+        DetachedMut::new(&mut entry.body, cx.shr(), cx.interfaces()),
+    )
 }
 
 #[cfg(test)]
@@ -438,26 +433,22 @@ mod tests {
             first_outcome.iter().map(Minted::slot).collect::<Vec<_>>(),
             [0, 1]
         );
-        assert!(
-            first_outcome
-                .iter()
-                .all(|entry| entry.ambient_id() == mint_owner)
-        );
 
         // A minted-to-minted call retains the placeholder and cannot silently
         // become a real call back to the owner.
         {
             let (_, mut host) = host_with_minted(owner, &mut first_outcome, view, first);
-            let call = host.push_mnemonic(
+            let ty = view.shr().types.get_or_make_int(0);
+            let call = host.push_mnemonic_with_type(
                 Mnemonic::Call(qcode::value::insn::Call {
                     target: second,
                     args: Vec::new(),
                     clobbers: Vec::new(),
                 }),
-                0,
+                ty,
             );
             assert!(matches!(
-                host.view().instruction(call).mnemonic(),
+                host.mnemonic(call),
                 Mnemonic::Call(call) if call.target == Callee::Minted(1)
             ));
         }
@@ -469,14 +460,16 @@ mod tests {
         );
     }
 
+    /// A minted body is built fully detached (no registry identity) through the
+    /// body-local [`DetachedMut`] surface; installation stamps the identity and the
+    /// stored local ids qualify against it. The former "colliding-local" ambient
+    /// test is obsolete: an owner id can no longer enter a minted body — there is
+    /// no ambient qualifier in scope, and `id()` panics before install.
     #[test]
-    fn minted_body_rebinds_only_ambient_metadata_with_colliding_locals() {
-        use qcode::value::util::base_ref::BaseRef;
-
+    fn minted_body_is_detached_then_installs_local_ids() {
         let mut ctx = Context::new();
         qcode!(ctx, "fn rebind_owner: <owner_block> return at i64 0;");
         let installed = FunctionBody::make(&mut ctx, "installed".into()).unwrap().id;
-        let owner_root = FunctionBody::from_id(&ctx, rebind_owner).root().unwrap().id;
 
         let env = dummy_env();
         let (bodies, view) = ctx.split(&env);
@@ -492,49 +485,43 @@ mod tests {
             FunctionKind::Lambda,
             true,
         );
-        let ambient = owner_fun.id();
-        let (child, edge);
+        let (root, child, edge);
         {
             let (_, mut host) = host_with_minted(owner_fun, &mut outcome, view, placeholder);
-            let root = host.make_block();
+            // (a) The body has no registry identity while detached.
+            assert_eq!(host.body.try_id(), None);
+            root = host.make_block();
             child = host.make_block();
             edge = host.add_cfg_edge(root, child);
-            host.function_mut(ambient).set_root_id(Some(root.local));
-            BaseRef::new(host.reborrow(), root)
-                .rename_local("minted_root".into())
-                .unwrap();
-            assert_eq!(
-                root.local, owner_root.local,
-                "local IDs intentionally collide"
-            );
+            host.set_root(root);
+            host.rename_block(root, "minted_root".into()).unwrap();
         }
 
+        // (b) Installation stamps the identity; the local ids resolve against it.
         let minted = outcome.pop().unwrap();
         let (slot, _, mut detached) = minted.into_installed_parts(installed);
         assert_eq!(slot, 0);
-        let root = BlockId::new(installed, detached.root_id().unwrap());
-        let child = BlockId::new(installed, child.local);
-        // Ownership is derived from the storing arena (`id.func`).
-        assert_eq!(root.func, installed);
-        assert_eq!(child.func, installed);
-        assert_eq!(detached.edge(edge).from, root.local);
-        assert_eq!(detached.edge(edge).to, child.local);
+        assert_eq!(detached.try_id(), Some(installed));
+        assert_eq!(detached.root_id(), Some(root));
+        assert_eq!(detached.edge(edge).from, root);
+        assert_eq!(detached.edge(edge).to, child);
+        let root_q = BlockId::new(installed, root);
+        let child_q = BlockId::new(installed, child);
         let host = BodyMut::new(&mut detached, view.shr(), view.interfaces());
         assert_eq!(
             host.view()
-                .block_ref(root)
+                .block_ref(root_q)
                 .successors()
                 .map(|(_, successor)| successor)
                 .collect::<Vec<_>>(),
-            [child]
+            [child_q]
         );
         assert_eq!(
             host.view()
                 .function_ref(installed)
                 .local_named("minted_root"),
-            Some(ValueId::BasicBlock(root))
+            Some(ValueId::BasicBlock(root_q))
         );
-        assert_ne!(root, owner_root);
     }
 
     fn two_functions_with_users(

@@ -16,10 +16,10 @@ use qcode::{
     types::TypeId,
     value::{
         BasicBlock, BlockId, BodyView, FunctionBody, FunctionId, FunctionKind, InstructionRef,
-        LocalValueId, QCodeView, ValueId, VarnodeId,
+        LocalBlockId, LocalValueId, QCodeView, ValueId, VarnodeId,
         block_param::BlockParam,
         insn::{Binary, Binop, Callee, Extract, InstructionId, IntBinop, Mnemonic, Range, Return},
-        util::{base_ref::BaseRef, body_mut::BodyMut},
+        util::detached::DetachedMut,
     },
 };
 
@@ -118,7 +118,7 @@ pub(crate) fn outline_expression<'str>(
         &slice,
         move |own, minted, root| {
             // Parameters, in input order, typed as the host inputs.
-            let mut value_map: HashMap<ValueId, ValueId> = HashMap::default();
+            let mut value_map: HashMap<ValueId, LocalValueId> = HashMap::default();
             for inp in inputs {
                 let ty = own.type_of(inp);
                 let pid = push_param_into(minted, root, ty);
@@ -165,7 +165,7 @@ pub(crate) fn outline_tupled<'str>(
         result,
         &slice,
         move |own, minted, root| {
-            let mut value_map: HashMap<ValueId, ValueId> = HashMap::default();
+            let mut value_map: HashMap<ValueId, LocalValueId> = HashMap::default();
             let tuple = push_param_into(minted, root, tuple_ty);
             // index = t.0, elem = t.1 — the extracts the body unpacks. `elem` is only
             // extracted when the body actually consumes the lane element.
@@ -181,7 +181,7 @@ pub(crate) fn outline_tupled<'str>(
                     minted,
                     root,
                     Mnemonic::Extract(Extract {
-                        agg: tuple.localize(root.func),
+                        agg: tuple,
                         index: field,
                     }),
                     fty,
@@ -258,7 +258,7 @@ pub(crate) fn outline_scan_body<'str>(
         result,
         &slice,
         move |own, minted, root| {
-            let mut value_map: HashMap<ValueId, ValueId> = HashMap::default();
+            let mut value_map: HashMap<ValueId, LocalValueId> = HashMap::default();
             // Param 0: the accumulator.
             let apid = push_param_into(minted, root, acc_ty);
             value_map.insert(acc_input, apid);
@@ -280,7 +280,7 @@ pub(crate) fn outline_scan_body<'str>(
             }
             // `idx` is the raw index driver value before narrow/shift: in scalar mode
             // the param itself (the `iota` lane), directly.
-            let (mut idx, fty): (ValueId, TypeId) = match elem {
+            let (mut idx, fty): (LocalValueId, TypeId) = match elem {
                 // Scalar: the param is the index driver value directly.
                 ScanElem::Scalar(elem_ty) => (param, elem_ty),
                 // Data mode returned above.
@@ -294,7 +294,7 @@ pub(crate) fn outline_scan_body<'str>(
                     minted,
                     root,
                     Mnemonic::Range(Range {
-                        src: idx.localize(root.func),
+                        src: idx,
                         start: 0,
                         size: isz,
                     }),
@@ -314,8 +314,8 @@ pub(crate) fn outline_scan_body<'str>(
                     minted,
                     root,
                     Mnemonic::Binop(Binary {
-                        lhs: idx.localize(root.func),
-                        rhs: c.localize(root.func),
+                        lhs: idx,
+                        rhs: c.strip_func(),
                         op: Binop::Int(IntBinop::Add),
                     }),
                     index_ty,
@@ -347,27 +347,29 @@ pub(crate) fn seq_result_type<'a, 'str: 'a>(
     }
 }
 
-/// Push a fresh param typed `ty` onto `block` in the minted host (host-routed
-/// mirror of `BasicBlock::push_param` + the `type_id` write). Returns its value.
-fn push_param_into<'str>(host: &mut BodyMut<'_, 'str>, block: BlockId, ty: TypeId) -> ValueId {
-    let index = host.view().block(block).params.len();
-    let pid = host.push_block_param(BlockParam::new(index, ty, block.local));
-    host.block_mut(block).params.push(pid.localize(block.func));
-    ValueId::BlockParam(pid)
+/// Push a fresh param typed `ty` onto `block` in the detached minted body,
+/// returning its body-local value.
+fn push_param_into<'str>(
+    minted: &mut DetachedMut<'_, 'str>,
+    block: LocalBlockId,
+    ty: TypeId,
+) -> LocalValueId {
+    let index = minted.block(block).param_ids().len();
+    let pid = minted.push_block_param(block, BlockParam::new(index, ty, block));
+    LocalValueId::BlockParam(pid)
 }
 
-/// Mint an instruction with an explicit result type into the minted host and
-/// append it to `block` (host-routed mirror of `InstructionRef::from_mnemonic_with_type`
-/// + `push_insn`). Returns its value.
+/// Mint an instruction with an explicit result type into the detached minted body
+/// and append it to `block`, returning its body-local value.
 fn push_insn_into<'str>(
-    host: &mut BodyMut<'_, 'str>,
-    block: BlockId,
+    minted: &mut DetachedMut<'_, 'str>,
+    block: LocalBlockId,
     mnemonic: Mnemonic,
     ty: TypeId,
-) -> ValueId {
-    let id = host.push_mnemonic_with_type(mnemonic, ty);
-    BaseRef::new(host.reborrow(), block).push_insn(id);
-    ValueId::Instruction(id)
+) -> LocalValueId {
+    let id = minted.push_mnemonic_with_type(mnemonic, ty);
+    minted.append_insn(block, id);
+    LocalValueId::Instruction(id)
 }
 
 /// Simultaneously substitute `pairs` (`old → new`) in `mn`'s operands. Plain
@@ -406,13 +408,14 @@ fn outline_core<'str>(
     slice: &[InstructionId],
     seed: impl for<'a> FnOnce(
         BodyView<'a, 'str>,
-        &mut qcode::value::util::body_mut::BodyMut<'a, 'str>,
-        BlockId,
-    ) -> HashMap<ValueId, ValueId>,
+        &mut DetachedMut<'a, 'str>,
+        LocalBlockId,
+    ) -> HashMap<ValueId, LocalValueId>,
 ) -> Option<Callee> {
     // Fully pure: a deterministic function of its params. `is_pure` (with the
     // implied `pure_reg`) is set by `mint_function`; the GUI purity badge keys
     // off `pure_reg`.
+    let mint_mark = minted_out.len();
     let callee = crate::pipeline::mint_function(
         body,
         next_minted,
@@ -421,7 +424,6 @@ fn outline_core<'str>(
         FunctionKind::Machine,
         /*pure*/ true,
     );
-    let fid = body.id();
 
     // Read the slice mnemonics/types from the owning function up front, so the
     // minted-host borrow below does not overlap the owner read.
@@ -442,45 +444,75 @@ fn outline_core<'str>(
     // Root block, set as the minted function's entry, named for display (block
     // names are function-scoped, so uniqueness is within the new function).
     let root = minted.make_block();
-    minted.function_mut(fid).set_root_id(Some(root.local));
+    minted.set_root(root);
     let block_name = format!("{name}_entry");
-    let _ = BaseRef::new(minted.reborrow(), root).rename_local(std::borrow::Cow::Owned(block_name));
+    let _ = minted.rename_block(root, std::borrow::Cow::Owned(block_name));
 
-    // Params / unpacking, installed by the caller; seeds the input→value map.
+    // Params / unpacking, installed by the caller; seeds the input→value map (owner
+    // input `ValueId` → minted body-local `LocalValueId`).
     let mut value_map = seed(own, &mut minted, root);
 
     // Clone the slice in definition order, remapping operands through the map.
     // The clone's operands are the *source* function's locals (qualify with
-    // `iid.func` for the map lookup); the replacements live in the minted
-    // function's arena (localize against `fid`). `pure_slice` guarantees every
-    // non-literal operand is in the map, so no source-local id survives.
+    // `iid.func` for the map lookup); the replacements are already body-local ids
+    // in the minted arena. `pure_slice` guarantees every function-scoped operand is
+    // in the map; a function-agnostic operand (literal/…) is left verbatim, and a
+    // missing function-scoped operand aborts the outline (the recognizer is a
+    // heuristic — never launder a source-local id into the minted body).
     for (iid, mut mn, ty) in cloned {
-        let pairs: Vec<(LocalValueId, LocalValueId)> = mn
-            .args()
-            .iter()
-            .filter_map(|&a| {
-                value_map
-                    .get(&a.qualify(iid.func))
-                    .map(|&n| (a, n.localize(fid)))
-            })
-            .collect();
+        let mut pairs: Vec<(LocalValueId, LocalValueId)> = Vec::new();
+        for &a in mn.args().iter() {
+            match value_map.get(&a.qualify(iid.func)).copied() {
+                Some(n) => pairs.push((a, n)),
+                None => {
+                    if is_function_scoped_local(a) {
+                        minted_out.truncate(mint_mark);
+                        return None;
+                    }
+                }
+            }
+        }
         substitute_operands(&mut mn, &pairs);
         let new = push_insn_into(&mut minted, root, mn, ty);
         value_map.insert(ValueId::Instruction(iid), new);
     }
 
     // Return the element value. `ptr` is the (irrelevant) return-address slot.
-    let ret_val = value_map.get(&result).copied().unwrap_or(result);
+    // `result` is normally a mapped slice value; it may legitimately be a literal
+    // (a constant-valued body), handled directly. A missing function-scoped result
+    // aborts the outline.
+    let ret_val = match value_map.get(&result).copied() {
+        Some(v) => v,
+        None => match result.as_function_agnostic() {
+            Some(v) => v,
+            None => {
+                minted_out.truncate(mint_mark);
+                return None;
+            }
+        },
+    };
     push_insn_into(
         &mut minted,
         root,
         Mnemonic::Return(Return {
-            ptr: dummy_ptr.localize(fid),
-            value: Some(ret_val.localize(fid)),
+            ptr: dummy_ptr.strip_func(),
+            value: Some(ret_val),
         }),
         ret_ty,
     );
     Some(callee)
+}
+
+/// Whether a body-local operand is function-scoped (an arena arm), i.e. it must be
+/// remapped through the value map rather than passed through verbatim.
+fn is_function_scoped_local(a: LocalValueId) -> bool {
+    matches!(
+        a,
+        LocalValueId::Instruction(_)
+            | LocalValueId::BasicBlock(_)
+            | LocalValueId::BlockParam(_)
+            | LocalValueId::Temp(_)
+    )
 }
 
 /// Inline the pure straight-line body of `body_fn` (a single-block function
@@ -520,7 +552,14 @@ pub(crate) fn inline_pure_body(
         let m = ctx.get_insn(iid).mnemonic().clone();
         if let Mnemonic::Return(r) = &m {
             let v = r.value?.qualify(iid.func);
-            return Some(value_map.get(&v).copied().unwrap_or(v));
+            return match value_map.get(&v).copied() {
+                Some(mapped) => Some(mapped),
+                // `v` may be a constant the body returns directly (function-agnostic,
+                // valid in any arena); a function-scoped `body_fn` value absent from
+                // the map must not leak into the caller — abort the inline.
+                None if v.as_function_agnostic().is_some() => Some(v),
+                None => None,
+            };
         }
         let ty = ctx.get_insn(iid).type_id();
         let mut nm = m;

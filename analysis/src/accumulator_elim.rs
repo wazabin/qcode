@@ -47,11 +47,11 @@ use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
 use qcode::{
     types::TypeId,
     value::{
-        FunctionId, FunctionKind, QCodeView, ValueId,
+        FunctionId, FunctionKind, LocalBlockId, LocalValueId, QCodeView, ValueId,
         block::BlockId,
         block_param::{BlockParam, BlockParamId},
         insn::{Apply, CBranch, Extract, Mnemonic},
-        util::{base_ref::BaseRef, body_mut::BodyMut},
+        util::{base_ref::BaseRef, body_mut::BodyMut, detached::DetachedMut},
     },
 };
 
@@ -96,8 +96,7 @@ pub fn accumulator_elim<'str>(
     let Some((model, plan)) = classify(m.body_view(body), host) else {
         return false;
     };
-    transform(m, body, next_minted, minted, &model, &plan);
-    true
+    transform(m, body, next_minted, minted, &model, &plan)
 }
 
 /// Recognize the accumulator-elimination shape in `host` and, if it fires, return
@@ -281,9 +280,11 @@ fn transform<'str>(
     minted_out: &mut Vec<Minted<'str>>,
     model: &crate::loop_to_recursion::LoopModel,
     p: &Plan,
-) {
+) -> bool {
     let host_fid = body.id();
     let base_name = format!("{}_acc", m.body_view(body).function_ref(host_fid).name());
+    // Mark the mint boundary so an aborted lambda build drops the partial body.
+    let mint_mark = minted_out.len();
     // Mint the driver-only recursive lambda (name buffered raw; the driver
     // uniquifies it at the barrier). Keep the placeholder in every reference;
     // the install barrier patches it to the materialized function id.
@@ -297,45 +298,45 @@ fn transform<'str>(
     );
 
     // --- Build the lambda body: read the host expressions, write the minted one.
-    let tuple_ty = {
+    // The whole build bails to `None` if a clone hits an owner value it cannot
+    // localize (the recognizer is a heuristic); on bail the partial mint is dropped.
+    let built: Option<TypeId> = 'build: {
         let (own, mut minted) = crate::pipeline::host_with_minted(body, minted_out, m, g);
 
         // Three fresh blocks: header (root, drivers in), base case, recursive case.
         let g_head = minted.make_block();
         let base = minted.make_block();
         let rec = minted.make_block();
-        minted
-            .function_mut(host_fid)
-            .set_root_id(Some(g_head.local));
-        let _ = BaseRef::new(minted.reborrow(), base)
-            .rename_local(Cow::Owned(format!("{base_name}_base")));
-        let _ = BaseRef::new(minted.reborrow(), rec)
-            .rename_local(Cow::Owned(format!("{base_name}_rec")));
+        minted.set_root(g_head);
+        let _ = minted.rename_block(base, Cow::Owned(format!("{base_name}_base")));
+        let _ = minted.rename_block(rec, Cow::Owned(format!("{base_name}_rec")));
 
         // g's parameters: the drivers only. Map each driver header-param to its new
         // counterpart so cloned `cond`/`stepD` expressions read g's params.
-        let mut driver_subst: HashMap<ValueId, ValueId> = HashMap::default();
+        let mut driver_subst: HashMap<ValueId, LocalValueId> = HashMap::default();
         for &i in &p.d_slots {
             let ty = minted.shr().types.get_or_make_int(p.head_sizes[i]);
-            let pid = push_param(&mut minted, g_head, ty);
+            let pid = push_param_local(&mut minted, g_head, ty);
             driver_subst.insert(ValueId::BlockParam(p.head_params[i]), pid);
         }
 
         // Header: recompute the loop condition over g's drivers, then branch.
-        let cond = clone_cross(
+        let Some(cond) = clone_cross(
             own,
             &mut minted,
             p.cbranch.condition.qualify(model.head.func),
             &mut driver_subst,
             &p.body_bindings,
             g_head,
-        );
+        ) else {
+            break 'build None;
+        };
         {
             let mut b = minted.builder(g_head);
             if p.cond_true_is_exit {
-                b.push_cbranch(cond, base, rec);
+                b.push_cbranch_local(cond, base, rec);
             } else {
-                b.push_cbranch(cond, rec, base);
+                b.push_cbranch_local(cond, rec, base);
             }
         }
 
@@ -343,86 +344,90 @@ fn transform<'str>(
         // the recursion's return type — reused for the (minted, uninstalled)
         // `apply g` nodes below and in the host, which `push_apply` cannot type.
         let tuple_ty = {
-            let base_fields: Vec<ValueId> = p
+            let base_fields: Vec<LocalValueId> = p
                 .a_slots
                 .iter()
-                .map(|&i| const_at_size(minted.shr(), model.init_args[i], p.head_sizes[i]))
+                .map(|&i| {
+                    const_at_size(minted.shr(), model.init_args[i], p.head_sizes[i]).strip_func()
+                })
                 .collect();
-            let mut b = minted.builder(base);
-            let tuple = b.push_tuple(base_fields);
-            let ty = tuple.type_id();
-            let tuple = tuple.id();
-            b.push_return_value(tuple);
-            ty
+            let tuple = {
+                let mut b = minted.builder(base);
+                let t = b.push_tuple_local(base_fields);
+                b.push_return_value_local(LocalValueId::Instruction(t));
+                t
+            };
+            minted.type_of(LocalValueId::Instruction(tuple))
         };
 
         // Recursive case: recurse on the drivers' next values, unpack the deeper
         // accumulators, apply the accumulator update, return the new tuple.
         {
             // stepD: driver-next values (read only drivers).
-            let driver_next: Vec<ValueId> = p
-                .d_slots
-                .iter()
-                .map(|&i| {
-                    clone_cross(
-                        own,
-                        &mut minted,
-                        p.next_args[i],
-                        &mut driver_subst,
-                        &p.body_bindings,
-                        rec,
-                    )
-                })
-                .collect();
+            let mut driver_next: Vec<LocalValueId> = Vec::with_capacity(p.d_slots.len());
+            for &i in &p.d_slots {
+                let Some(v) = clone_cross(
+                    own,
+                    &mut minted,
+                    p.next_args[i],
+                    &mut driver_subst,
+                    &p.body_bindings,
+                    rec,
+                ) else {
+                    break 'build None;
+                };
+                driver_next.push(v);
+            }
 
             // `apply g(driver_next)` — g is the minted (uninstalled) lambda, so
             // type the node explicitly with the tuple type; the extracts then read
             // that type off the arena.
-            let deep = push_typed(
+            let deep = push_typed_local(
                 &mut minted,
                 rec,
                 Mnemonic::Apply(Apply {
                     target: g,
-                    args: driver_next
-                        .into_iter()
-                        .map(|a| a.localize(host_fid))
-                        .collect(),
+                    args: driver_next,
                 }),
                 tuple_ty,
             );
-            let acc_vals: Vec<ValueId> = {
+            let acc_vals: Vec<LocalValueId> = {
                 let mut b = minted.builder(rec);
                 (0..p.a_slots.len())
-                    .map(|pos| b.push_extract(deep, pos).id())
+                    .map(|pos| LocalValueId::Instruction(b.push_extract_local(deep, pos)))
                     .collect()
             };
 
             // stepA: accumulator-next, reading the unpacked accumulators.
-            let mut acc_subst: HashMap<ValueId, ValueId> = HashMap::default();
+            let mut acc_subst: HashMap<ValueId, LocalValueId> = HashMap::default();
             for (pos, &i) in p.a_slots.iter().enumerate() {
                 acc_subst.insert(ValueId::BlockParam(p.head_params[i]), acc_vals[pos]);
             }
-            let new_acc: Vec<ValueId> = p
-                .a_slots
-                .iter()
-                .map(|&i| {
-                    clone_cross(
-                        own,
-                        &mut minted,
-                        p.next_args[i],
-                        &mut acc_subst,
-                        &p.body_bindings,
-                        rec,
-                    )
-                })
-                .collect();
+            let mut new_acc: Vec<LocalValueId> = Vec::with_capacity(p.a_slots.len());
+            for &i in &p.a_slots {
+                let Some(v) = clone_cross(
+                    own,
+                    &mut minted,
+                    p.next_args[i],
+                    &mut acc_subst,
+                    &p.body_bindings,
+                    rec,
+                ) else {
+                    break 'build None;
+                };
+                new_acc.push(v);
+            }
 
             let mut b = minted.builder(rec);
-            let tuple = b.push_tuple(new_acc).id();
-            b.push_return_value(tuple);
+            let tuple = b.push_tuple_local(new_acc);
+            b.push_return_value_local(LocalValueId::Instruction(tuple));
         }
 
-        tuple_ty
+        Some(tuple_ty)
+    };
+    let Some(tuple_ty) = built else {
+        minted_out.truncate(mint_mark);
+        return false;
     };
 
     // --- Host: seed g and project the original return value out of the tuple.
@@ -482,18 +487,23 @@ fn transform<'str>(
     for &b in &model.region {
         body.delete_block(b);
     }
+    true
 }
 
-/// Push a driver param typed `ty` onto `block` in the minted host, returning its
-/// value (host-routed `BasicBlock::push_param` + the `type_id` write).
-fn push_param<'str>(host: &mut BodyMut<'_, 'str>, block: BlockId, ty: TypeId) -> ValueId {
-    let index = host.block_ref(block).num_params();
-    let pid = host.push_block_param(BlockParam::new(index, ty, block.local));
-    host.block_mut(block).params.push(pid.localize(block.func));
-    ValueId::BlockParam(pid)
+/// Push a driver param typed `ty` onto `block` in the detached minted body,
+/// returning its body-local value.
+fn push_param_local<'str>(
+    minted: &mut DetachedMut<'_, 'str>,
+    block: LocalBlockId,
+    ty: TypeId,
+) -> LocalValueId {
+    let index = minted.block(block).param_ids().len();
+    let pid = minted.push_block_param(block, BlockParam::new(index, ty, block));
+    LocalValueId::BlockParam(pid)
 }
 
-/// Mint an instruction with an explicit result type and append it to `block`.
+/// Mint an instruction with an explicit result type and append it to `block` on
+/// the host (composite) mutation path.
 fn push_typed<'str>(
     host: &mut BodyMut<'_, 'str>,
     block: BlockId,
@@ -503,6 +513,19 @@ fn push_typed<'str>(
     let id = host.push_mnemonic_with_type(mnemonic, ty);
     BaseRef::new(host.reborrow(), block).push_insn(id);
     ValueId::Instruction(id)
+}
+
+/// Mint an instruction with an explicit result type and append it to `block` in
+/// the detached minted body, returning its body-local value.
+fn push_typed_local<'str>(
+    minted: &mut DetachedMut<'_, 'str>,
+    block: LocalBlockId,
+    mnemonic: Mnemonic,
+    ty: TypeId,
+) -> LocalValueId {
+    let id = minted.push_mnemonic_with_type(mnemonic, ty);
+    minted.append_insn(block, id);
+    LocalValueId::Instruction(id)
 }
 
 /// Head-param slot indices that `val` transitively reads, resolving block-param
@@ -553,19 +576,21 @@ fn collect_deps<'ctx, 'str: 'ctx>(
 /// seeded leaves via `subst` and resolving block-param references via `bindings`.
 fn clone_cross<'ctx, 'str: 'ctx>(
     read: impl QCodeView<'ctx, 'str>,
-    write: &mut BodyMut<'_, 'str>,
+    write: &mut DetachedMut<'_, 'str>,
     val: ValueId,
-    subst: &mut HashMap<ValueId, ValueId>,
+    subst: &mut HashMap<ValueId, LocalValueId>,
     bindings: &HashMap<BlockParamId, ValueId>,
-    target: BlockId,
-) -> ValueId {
+    target: LocalBlockId,
+) -> Option<LocalValueId> {
     if let Some(&v) = subst.get(&val) {
-        return v;
+        return Some(v);
     }
     let result = match val {
         ValueId::BlockParam(p) => match bindings.get(&p) {
-            Some(&bound) => clone_cross(read, write, bound, subst, bindings, target),
-            None => val,
+            Some(&bound) => clone_cross(read, write, bound, subst, bindings, target)?,
+            // An owner param neither seeded nor bound cannot be localized into the
+            // minted body — abort (the recognizer over-reached).
+            None => return None,
         },
         ValueId::Instruction(id) => {
             let (mnemonic, type_id) = {
@@ -573,24 +598,23 @@ fn clone_cross<'ctx, 'str: 'ctx>(
                 (r.mnemonic().clone(), r.type_id())
             };
             let mut remapped = mnemonic.clone();
-            let pairs: Vec<_> = mnemonic
-                .args()
-                .into_iter()
-                .filter_map(|op| {
-                    // The operand is bare-local in the *read* function's arena; the
-                    // rebuilt value lives in the minted function's arena.
-                    let q = op.qualify(id.func);
-                    let new_op = clone_cross(read, write, q, subst, bindings, target);
-                    (new_op != q).then(|| (op, new_op.localize(target.func)))
-                })
-                .collect();
+            // The clone lives in the minted arena, so *every* operand is rebuilt to a
+            // minted-local id (a constant maps to itself).
+            let mut pairs: Vec<(LocalValueId, LocalValueId)> = Vec::new();
+            for op in mnemonic.args() {
+                let q = op.qualify(id.func);
+                let new_op = clone_cross(read, write, q, subst, bindings, target)?;
+                pairs.push((op, new_op));
+            }
             substitute_operands(&mut remapped, &pairs);
-            push_typed(write, target, remapped, type_id)
+            push_typed_local(write, target, remapped, type_id)
         }
-        _ => val,
+        // A constant / module value flows into the minted body verbatim; a stray
+        // function-scoped value (block/temp) cannot and aborts the clone.
+        other => other.as_function_agnostic()?,
     };
     subst.insert(val, result);
-    result
+    Some(result)
 }
 
 /// Like [`clone_cross`] but source and target are the *same* (host) function;

@@ -277,28 +277,8 @@ impl<'str> FunctionBody<'str> {
         self.users.shrink_to_fit();
     }
 
-    /// Rebind a minted body from the temporary ambient function ID it was built
-    /// under to its installed registry ID, at the mint install barrier.
-    ///
-    /// Function arenas, operands, roster entries, and use-def data are body-local
-    /// and need no remap. Block ownership is now derived from the storing arena and
-    /// CFG edge endpoints are bare body-local ids, so neither needs a rewrite. Real
-    /// `Callee::Real` targets inside instruction mnemonics are semantic
-    /// cross-function references, not ownership metadata, and are deliberately left
-    /// untouched. (Stage 4 switches minting to [`detached`](Self::detached) +
-    /// [`install_id`](Self::install_id) and retires this method.)
-    pub fn reinstall_id(&mut self, from: FunctionId, to: FunctionId) {
-        assert_eq!(
-            self.id,
-            Some(from),
-            "detached body has an unexpected ambient id"
-        );
-        self.id = Some(to);
-    }
-
     /// Install a registry ID onto a freshly [`detached`](Self::detached) body at
     /// the mint barrier. Panics if the body already carries an id.
-    /// (Stage 4 wiring; no callers until minting switches to `detached()`.)
     pub fn install_id(&mut self, id: FunctionId) {
         assert!(self.id.is_none(), "body already installed");
         self.id = Some(id);
@@ -324,8 +304,8 @@ impl<'str> FunctionBody<'str> {
 
     /// An empty function *body* carrying the identity `id`. Used for bodies
     /// installed under a known registry key at creation
-    /// ([`make`](Self::make)-family constructors) and — until stage 4 — for a
-    /// pass-minted body built under its owner's ambient id.
+    /// ([`make`](Self::make)-family constructors). Pass-minted bodies instead use
+    /// [`detached`](Self::detached) + [`install_id`](Self::install_id).
     pub fn empty_with_id(id: FunctionId) -> Self {
         Self {
             id: Some(id),
@@ -347,8 +327,9 @@ impl<'str> FunctionBody<'str> {
     /// registry identity yet ([`id`](Self::id) panics until
     /// [`install_id`](Self::install_id) runs at the mint barrier). The interface
     /// lives separately in
-    /// [`Context::interfaces`](crate::context::Context::interfaces).
-    /// (Stage 4 switches minting onto this; no callers yet.)
+    /// [`Context::interfaces`](crate::context::Context::interfaces). This is how a
+    /// pass mints a function; the id is stamped by
+    /// [`install_id`](Self::install_id) at the mint barrier.
     pub fn detached() -> Self {
         Self {
             id: None,
@@ -659,14 +640,19 @@ impl<'str> FunctionBody<'str> {
     /// Push a fresh instruction into this body's arena, recording each operand's
     /// use in the reverse-use map.
     pub fn push_insn(&mut self, insn: Instruction<'str>) -> InstructionId {
-        let func = self.id();
+        InstructionId::new(self.id(), self.push_insn_local(insn))
+    }
+
+    /// Push a fresh instruction into this body's arena, recording each operand's
+    /// use in the reverse-use map, and return its **body-local** id. The id-less
+    /// twin of [`push_insn`](Self::push_insn), usable on a detached body.
+    pub fn push_insn_local(&mut self, insn: Instruction<'str>) -> LocalInsnId {
         let args: Vec<LocalValueId> = insn.mnemonic().args().into_iter().collect();
         let local = self.insns.push(insn);
-        let id = InstructionId::new(func, local);
         for arg in args {
-            self.users.entry(arg).or_default().push(id.localize(func));
+            self.users.entry(arg).or_default().push(local);
         }
-        id
+        local
     }
 
     /// Push a fresh block into this body's arena and onto its ownership roster.
@@ -692,10 +678,49 @@ impl<'str> FunctionBody<'str> {
         self.push_block(BasicBlock::detached())
     }
 
+    /// Mint a fresh empty block, returning its **body-local** id. The id-less twin
+    /// of [`make_block`](Self::make_block), usable on a detached body.
+    pub fn make_block_local(&mut self) -> LocalBlockId {
+        self.push_block_local(BasicBlock::detached())
+    }
+
+    /// This body's block `block`, by its function-local index (id-free read,
+    /// usable on a detached body).
+    pub fn block_local(&self, block: LocalBlockId) -> &BasicBlock<'str> {
+        &self.blocks[block]
+    }
+
+    /// This body's instruction mnemonic, by its function-local index (id-free
+    /// read, usable on a detached body).
+    pub fn mnemonic_local(&self, insn: LocalInsnId) -> &Mnemonic {
+        self.insns[insn].mnemonic()
+    }
+
     /// Push a fresh block parameter into this body's arena.
     pub fn push_block_param(&mut self, param: BlockParam<'str>) -> BlockParamId {
         let local = self.params.push(param);
         BlockParamId::new(self.id(), local)
+    }
+
+    /// Push a fresh block parameter into this body's arena and wire it into
+    /// `block`'s parameter list, returning its **body-local** id. The id-less twin
+    /// of [`push_block_param`](Self::push_block_param), usable on a detached body.
+    pub fn push_block_param_local(
+        &mut self,
+        block: LocalBlockId,
+        param: BlockParam<'str>,
+    ) -> LocalParamId {
+        let local = self.params.push(param);
+        self.blocks[block].params.push(local);
+        local
+    }
+
+    /// Append an already-created instruction to the end of `block`, setting its
+    /// parent (id-free; the mutation twin of [`BaseRef::push_insn`], usable on a
+    /// detached body).
+    pub fn append_insn_local(&mut self, block: LocalBlockId, insn: LocalInsnId) {
+        self.insns[insn].parent = Some(block);
+        self.blocks[block].instructions.push(insn);
     }
 
     /// Mint an `Int(size)`-typed instruction with `mnemonic` (the type is minted
@@ -719,6 +744,17 @@ impl<'str> FunctionBody<'str> {
     ) -> InstructionId {
         let insn = Instruction::new(type_id, mnemonic);
         self.push_insn(insn)
+    }
+
+    /// Mint an instruction with `mnemonic` and an explicit result `type_id`,
+    /// returning its **body-local** id. The id-less twin of
+    /// [`push_mnemonic_with_type`](Self::push_mnemonic_with_type).
+    pub fn push_mnemonic_with_type_local(
+        &mut self,
+        mnemonic: Mnemonic,
+        type_id: crate::types::TypeId,
+    ) -> LocalInsnId {
+        self.push_insn_local(Instruction::new(type_id, mnemonic))
     }
 
     /// Insert `insn` immediately before `before` in `block`. Panics if `before`
@@ -799,12 +835,15 @@ impl<'str> FunctionBody<'str> {
     /// Add a directed CFG edge `from -> to`, stored in this body's edge arena and
     /// linked into both incident blocks' edge sets.
     pub fn add_cfg_edge(&mut self, from: BlockId, to: BlockId) -> EdgeId {
-        let edge_id = self.edges.push(EdgeData {
-            from: from.local,
-            to: to.local,
-        });
-        self.block_mut(from).edges.insert(edge_id);
-        self.block_mut(to).edges.insert(edge_id);
+        self.add_cfg_edge_local(from.local, to.local)
+    }
+
+    /// Add a directed CFG edge `from -> to` over **body-local** block ids (id-free;
+    /// the twin of [`add_cfg_edge`](Self::add_cfg_edge), usable on a detached body).
+    pub fn add_cfg_edge_local(&mut self, from: LocalBlockId, to: LocalBlockId) -> EdgeId {
+        let edge_id = self.edges.push(EdgeData { from, to });
+        self.blocks[from].edges.insert(edge_id);
+        self.blocks[to].edges.insert(edge_id);
         edge_id
     }
 
@@ -939,16 +978,22 @@ impl<'str> FunctionBody<'str> {
             self.id(),
             "instruction belongs to another function"
         );
-        let func = self.id();
-        let old_args = self
-            .insn(id)
+        self.replace_instruction_mnemonic_local(id.local, mnemonic);
+    }
+
+    /// Replace an instruction's mnemonic in place, keeping the reverse use-map in
+    /// sync, over a **body-local** instruction id (id-free; the twin of
+    /// [`replace_instruction_mnemonic`](Self::replace_instruction_mnemonic),
+    /// usable on a detached body).
+    pub fn replace_instruction_mnemonic_local(&mut self, id: LocalInsnId, mnemonic: Mnemonic) {
+        let old_args = self.insns[id]
             .mnemonic()
             .args()
             .into_iter()
             .collect::<Vec<_>>();
         for arg in old_args {
             let now_empty = if let Some(users) = self.users.get_mut(&arg) {
-                users.retain(|&local| local != id.localize(func));
+                users.retain(|&local| local != id);
                 users.is_empty()
             } else {
                 false
@@ -957,16 +1002,36 @@ impl<'str> FunctionBody<'str> {
                 self.users.remove(&arg);
             }
         }
-        *self.insn_mut(id).mnemonic_mut() = mnemonic;
-        let new_args = self
-            .insn(id)
+        *self.insns[id].mnemonic_mut() = mnemonic;
+        let new_args = self.insns[id]
             .mnemonic()
             .args()
             .into_iter()
             .collect::<Vec<_>>();
         for arg in new_args {
-            self.users.entry(arg).or_default().push(id.localize(func));
+            self.users.entry(arg).or_default().push(id);
         }
+    }
+
+    /// Set `block`'s name and register it in this body's local name table, over a
+    /// **body-local** block id (id-free; the twin of
+    /// [`BaseRef::rename_local`](crate::value::util::base_ref::BaseRef::rename_local)
+    /// restricted to the id-free local parts, usable on a detached body). Errors
+    /// only on a duplicate name.
+    pub fn rename_block_local(&mut self, block: LocalBlockId, name: Cow<'str, str>) -> Result<()> {
+        let target = LocalValueId::BasicBlock(block);
+        if let Some(existing) = self.names.get(&name) {
+            return if existing == target {
+                Ok(())
+            } else {
+                Err(Error::spanless(ErrorTy::DuplicateName(name.to_string())))
+            };
+        }
+        let old_name = self.blocks[block].local_name().map(str::to_owned);
+        self.names
+            .register(name.clone(), target, old_name.as_deref())?;
+        self.blocks[block].set_name(Some(name));
+        Ok(())
     }
 
     /// Drop `block` from this body's ownership roster. Ownership is derived from
