@@ -617,7 +617,7 @@ where
     'str: 's,
 {
     fn ctx(&'s self) -> &'s Context<'str> {
-        self.ctx.shared()
+        self.ctx
     }
 }
 impl<'s, 'a, 'str> WithCtx<'s, 's, 'str> for BaseRef<BodyMut<'a, 'str>, BlockId>

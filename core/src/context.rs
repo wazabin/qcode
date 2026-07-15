@@ -1950,10 +1950,6 @@ impl<'str> Context<'str> {
     pub fn view(&self) -> ModuleView<'_, 'str> {
         ModuleView::new(self)
     }
-    /// The module's shared data (read) — returns `self`.
-    pub fn shared(&self) -> &Context<'str> {
-        self
-    }
     /// The module's shared IR state ([`Shared`]) — the module-path twin of
     /// [`ModuleView::shared`]/[`BodyMut::shr`], so a `&mut Context` module walker and
     /// a checked-out pass spell shared-data reads identically (context-split
