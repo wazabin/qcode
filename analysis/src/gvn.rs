@@ -55,6 +55,7 @@ struct ModuleInsn {
     block_id: qcode::value::block::BlockId,
     insn_id: InstructionId,
     id: ValueId,
+    size: usize,
     mnemonic: Mnemonic,
 }
 
@@ -90,6 +91,7 @@ fn module_insn(ctx: &Context, insn_id: InstructionId) -> ModuleInsn {
             .id,
         insn_id,
         id: ValueId::Instruction(insn_id),
+        size: insn.size(),
         mnemonic: insn.mnemonic().clone(),
     }
 }

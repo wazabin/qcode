@@ -29,10 +29,7 @@ use qcode_emulator::{SizedValue, StandaloneEmulator};
 
 use crate::calls::{project_return, return_field};
 
-use super::fold::const_value;
-use std::any::Any;
-
-use super::walk::{Claim, Editor, InsnCtx, ModuleSubPass};
+use super::{ModuleInsn, fold::const_value, module_insn, module_instruction_snapshot};
 
 /// Upper bound on emulated instructions per harvested field. Pure functions are
 /// loop-free (an argpromote invariant), so this only guards against a function
@@ -40,43 +37,29 @@ use super::walk::{Claim, Editor, InsnCtx, ModuleSubPass};
 const STEP_BUDGET: usize = 100_000;
 
 /// Replace `extract` of a constant pure-call field with the emulated literal.
-/// Reads the pure *callee*'s body directly, so it runs only on the module host
-/// (dispatched by the [`concretize`](super::concretize) module pass).
+/// One invocation performs one frozen module sweep; pipeline configuration owns
+/// the whole-program fixpoint.
+#[derive(Default)]
 pub(super) struct PureCall;
 
-impl<'str> ModuleSubPass<'str> for PureCall {
-    fn init_state(&self) -> Box<dyn Any> {
-        Box::new(())
-    }
-
-    fn clone_state(&self, _state: &dyn Any) -> Box<dyn Any> {
-        Box::new(())
-    }
-
-    fn on_insn(
-        &self,
-        host: &mut Context<'str>,
-        _state: &mut dyn Any,
-        ic: &InsnCtx,
-        ed: &mut Editor,
-    ) -> Claim {
-        let ctx: &mut Context = host;
-        let Mnemonic::Extract(Extract { agg, index }) = *ic.mnemonic else {
-            return Claim::Pass;
+impl PureCall {
+    fn rewrite(&self, ctx: &mut Context, ic: &ModuleInsn) -> bool {
+        let Mnemonic::Extract(Extract { agg, index }) = ic.mnemonic.clone() else {
+            return false;
         };
         let ValueId::Instruction(call_id) = agg.qualify(ic.insn_id.func) else {
-            return Claim::Pass;
+            return false;
         };
         // The aggregate must be a direct call to a fully pure function.
         let Mnemonic::Call(Call { target, args, .. }) = ctx.get_insn(call_id).mnemonic().clone()
         else {
-            return Claim::Pass;
+            return false;
         };
         let Some(target) = target.real() else {
-            return Claim::Pass;
+            return false;
         };
         if !FunctionBody::from_id(ctx, target).is_pure() {
-            return Claim::Pass;
+            return false;
         }
 
         // Pre-filter: at least one literal argument (otherwise nothing folds and
@@ -88,15 +71,15 @@ impl<'str> ModuleSubPass<'str> for PureCall {
             .map(|(i, _)| i)
             .collect();
         if literal_indices.is_empty() {
-            return Claim::Pass;
+            return false;
         }
 
         // The field must depend only on literal arguments.
         let Some(proj) = project_return(ctx, target, index) else {
-            return Claim::Pass;
+            return false;
         };
         if !proj.is_constant_over(&literal_indices) {
-            return Claim::Pass;
+            return false;
         }
 
         // Build the positional argument vector: literal value, or poison (0) for a
@@ -105,14 +88,14 @@ impl<'str> ModuleSubPass<'str> for PureCall {
             .root()
             .map(|block| block.id)
         else {
-            return Claim::Pass;
+            return false;
         };
         let param_sizes: Vec<usize> = qcode::value::BasicBlock::from_id(ctx, root)
             .params()
             .map(|p| p.size())
             .collect();
         if param_sizes.len() != args.len() {
-            return Claim::Pass;
+            return false;
         }
         let arg_values: Vec<SizedValue> = args
             .iter()
@@ -134,14 +117,35 @@ impl<'str> ModuleSubPass<'str> for PureCall {
                 debug,
                 "pure-call emulation failed after static gates: target {target:?}, field {index}"
             );
-            return Claim::Pass;
+            return false;
         };
 
         let lit = ctx.get_const(value, ic.size).id();
-        ed.replace(ctx, ic.insn_id, lit);
-        Claim::Done
+        ctx.replace_all_uses_with(ValueId::Instruction(ic.insn_id), lit);
+        ctx.remove_instruction(ic.insn_id);
+        true
     }
 }
+
+impl crate::Pass for PureCall {
+    const NAME: &'static str = "pure_call";
+
+    fn description(&self) -> &'static str {
+        "Emulate constant fields returned by pure calls"
+    }
+
+    fn run(&self, ctx: &mut Context, _env: &crate::PipelineEnv) -> Result<bool, String> {
+        let snapshot = module_instruction_snapshot(ctx);
+        let mut changed = false;
+        for insn_id in snapshot {
+            let ic = module_insn(ctx, insn_id);
+            changed |= self.rewrite(ctx, &ic);
+        }
+        Ok(changed)
+    }
+}
+
+crate::register_module_pass!(PureCall);
 
 /// Run pure function `target` on `arg_values` and read field `index` of the
 /// returned aggregate at the reached return. `None` on any emulation fault, step
@@ -177,6 +181,11 @@ mod tests {
             insn::{Return, Store},
         },
     };
+
+    fn run_pure_call(tc: &mut TestContext) {
+        let env = crate::PipelineEnv::headless(&tc.ctx);
+        while crate::Pass::run(&PureCall, &mut tc.ctx, &env).unwrap() {}
+    }
 
     /// Build pure `foo(a, b) = (a, b*69 + 42)` and mark it `is_pure`.
     fn build_pure_foo(tc: &mut TestContext) -> FunctionId {
@@ -314,10 +323,10 @@ mod tests {
     fn harvests_constant_field_from_partial_const_call() {
         let mut tc = TestContext::new();
         let foo = build_pure_foo(&mut tc);
-        let (g, cont) = build_caller(&mut tc, foo, Some(7));
+        let (_g, cont) = build_caller(&mut tc, foo, Some(7));
         let r1 = ValueId::Varnode(tc.r1);
 
-        super::super::concretize::concretize_function(&mut tc.ctx, g);
+        run_pure_call(&mut tc);
 
         assert_eq!(
             stored_const(&tc, cont, r1),
@@ -451,10 +460,10 @@ mod tests {
     fn folds_array_param_field_from_all_literal_call() {
         let mut tc = TestContext::new();
         let dec = build_pure_decoder(&mut tc);
-        let (g, cont) = build_decoder_caller(&mut tc, dec);
+        let (_g, cont) = build_decoder_caller(&mut tc, dec);
         let r1 = ValueId::Varnode(tc.r1);
 
-        super::super::concretize::concretize_function(&mut tc.ctx, g);
+        run_pure_call(&mut tc);
 
         assert_eq!(
             stored_const(&tc, cont, r1),
@@ -474,9 +483,9 @@ mod tests {
     fn no_harvest_without_literal_arg() {
         let mut tc = TestContext::new();
         let foo = build_pure_foo(&mut tc);
-        let (g, cont) = build_caller(&mut tc, foo, None);
+        let (_g, cont) = build_caller(&mut tc, foo, None);
 
-        super::super::concretize::concretize_function(&mut tc.ctx, g);
+        run_pure_call(&mut tc);
 
         assert_eq!(
             extract_count(&tc, cont),
