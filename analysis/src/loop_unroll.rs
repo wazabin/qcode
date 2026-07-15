@@ -582,66 +582,6 @@ pub(crate) fn replace_terminator_with_branch<'a, 'str>(
     body.add_cfg_edge(block, target);
 }
 
-/// `&mut Context` twin of [`replace_terminator_with_branch`], kept for dce's
-/// `#[cfg(test)]` module-path twins.
-#[cfg(test)]
-pub(crate) fn replace_terminator_with_branch_generic<'str>(
-    host: &mut qcode::context::Context<'str>,
-    block: BlockId,
-    target: BlockId,
-    args: Vec<ValueId>,
-) {
-    let mut old_successors = host
-        .block_ref(block)
-        .successors()
-        .map(|(edge, _)| edge)
-        .collect::<Vec<_>>();
-    old_successors.sort_unstable();
-    old_successors.dedup();
-    for edge in old_successors {
-        host.remove_cfg_edge(block.func, edge);
-    }
-
-    // Reuse the existing terminator only if the block actually ends in one. The
-    // freshly-created unrolled blocks hold only copied *body* instructions (no
-    // terminator yet); their last instruction is a real value (e.g. the induction
-    // increment), which must not be clobbered into the branch — doing so destroys
-    // that value and, when it is the exit argument, yields a branch that passes
-    // itself. In that case append the branch instead.
-    let term_id = host
-        .block_ref(block)
-        .instruction_ids()
-        .last()
-        .copied()
-        .filter(|&id| host.insn_ref(id).mnemonic().is_terminator());
-    let local_target = target.localize(block.func);
-    let args: Vec<_> = args
-        .into_iter()
-        .map(|arg| arg.localize(block.func))
-        .collect();
-    if let Some(term_id) = term_id {
-        host.replace_instruction_mnemonic(
-            term_id,
-            Mnemonic::Branch(Branch {
-                target: local_target,
-                args,
-            }),
-        );
-    } else {
-        let branch = host.push_mnemonic(
-            block.func,
-            Mnemonic::Branch(Branch {
-                target: local_target,
-                args,
-            }),
-            0,
-        );
-        let end = host.block_ref(block).instruction_ids().len();
-        BaseRef::new(&mut *host, block).insert_insn_at_index(end, branch);
-    }
-    host.add_cfg_edge(block, target);
-}
-
 impl LoopAnalysis {
     fn compute<'ctx, 'str: 'ctx>(
         host: impl QCodeView<'ctx, 'str>,

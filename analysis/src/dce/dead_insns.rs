@@ -1,13 +1,13 @@
 use rustc_hash::FxHashSet as HashSet;
 
+#[cfg(test)]
+use qcode::value::ModuleView;
 use qcode::{
     context::Context,
-    value::{BlockId, FunctionId, InstructionId, ModuleView, QCodeView, ValueId, insn::Mnemonic},
+    value::{BlockId, FunctionId, InstructionId, QCodeView, ValueId, insn::Mnemonic},
 };
 
 use crate::loop_unroll::replace_terminator_with_branch;
-#[cfg(test)]
-use crate::loop_unroll::replace_terminator_with_branch_generic;
 
 /// This host's users of `v` (its owning function's reverse-use list), or empty
 /// for a shared value with no owning function. Mirrors [`Context::users`].
@@ -38,37 +38,14 @@ pub fn dead_insns<'a, 'str: 'a>(
 
 /// Removes dead pure instructions from `block_id` iteratively until fixed point,
 /// updating the users reverse map after each round.
-/// TODO(5b-ii): Takes Context; migrate to FunctionBody/ContextView when public API stabilizes.
 pub fn remove_dead_insns(ctx: &mut Context, block_id: BlockId) -> bool {
-    remove_dead_insns_module(ctx, block_id)
+    crate::with_body_mut(ctx, block_id.func, |body, cx| {
+        remove_dead_insns_body(body, cx, block_id)
+    })
 }
 
-/// Generic host-based version of [`remove_dead_insns`]; see that function.
-/// TODO(5b-ii): For backwards compatibility; prefer concrete version for new code.
-pub fn remove_dead_insns_module<'str>(host: &mut Context<'str>, block_id: BlockId) -> bool {
-    let mut changed = false;
-    loop {
-        let mut dead: Vec<_> = dead_insns(ModuleView::new(&*host), block_id)
-            .into_iter()
-            .collect();
-        if dead.is_empty() {
-            break;
-        }
-
-        dead.sort_unstable();
-        changed = true;
-        for id in dead {
-            host.remove_instruction(id);
-        }
-    }
-
-    let params_changed = remove_unused_no_pred_block_params_generic(host, block_id);
-    changed || params_changed
-}
-
-/// Host-generic core of [`remove_dead_insns`]; see that function.
-/// This is the concrete version for FunctionBody/ContextView (stage 5b).
-pub fn remove_dead_insns_host<'a, 'str>(
+/// Body-local core of [`remove_dead_insns`].
+pub fn remove_dead_insns_body<'a, 'str>(
     body: &'a mut FunctionBody<'str>,
     cx: ContextView<'a, 'str>,
     block_id: BlockId,
@@ -89,7 +66,7 @@ pub fn remove_dead_insns_host<'a, 'str>(
         }
     }
 
-    let params_changed = remove_unused_no_pred_block_params_host(body, cx, block_id);
+    let params_changed = remove_unused_no_pred_block_params(body, cx, block_id);
     changed || params_changed
 }
 
@@ -105,54 +82,13 @@ pub fn remove_dead_insns_host<'a, 'str>(
 /// arguments.
 #[cfg(test)]
 pub fn remove_dead_pure_call(ctx: &mut Context, block_id: BlockId) -> bool {
-    remove_dead_pure_call_module(ctx, block_id)
+    crate::with_body_mut(ctx, block_id.func, |body, cx| {
+        remove_dead_pure_call_body(body, cx, block_id)
+    })
 }
 
-/// Generic version of remove_dead_pure_call for test use.
-#[cfg(test)]
-fn remove_dead_pure_call_module<'str>(host: &mut Context<'str>, block_id: BlockId) -> bool {
-    let Some(term_id) = host.block_ref(block_id).instruction_ids().last().copied() else {
-        return false;
-    };
-
-    let (clobbers_empty, target) = match host.insn_ref(term_id).mnemonic() {
-        Mnemonic::Call(call) => (call.clobbers.is_empty(), call.target),
-        _ => return false,
-    };
-    if !clobbers_empty {
-        return false;
-    }
-    let Some(target) = target.real() else {
-        return false;
-    };
-    if !host.function_ref(target).is_pure() {
-        return false;
-    }
-    if !host_users(ModuleView::new(&*host), ValueId::Instruction(term_id)).is_empty() {
-        return false;
-    }
-
-    // A pure call's block has exactly one successor: its fall-through.
-    let successors: Vec<BlockId> = host
-        .block_ref(block_id)
-        .successors()
-        .map(|(_, b)| b)
-        .collect();
-    debug_assert_eq!(
-        successors.len(),
-        1,
-        "pure call block must have a single fall-through successor"
-    );
-    let Some(&fallthrough) = successors.first() else {
-        return false;
-    };
-
-    replace_terminator_with_branch_generic(host, block_id, fallthrough, vec![]);
-    true
-}
-
-/// Host-generic core of [`remove_dead_pure_call`]; see that function.
-fn remove_dead_pure_call_host<'a, 'str>(
+/// Body-local core of [`remove_dead_pure_call`].
+fn remove_dead_pure_call_body<'a, 'str>(
     body: &'a mut FunctionBody<'str>,
     cx: ContextView<'a, 'str>,
     block_id: BlockId,
@@ -214,60 +150,7 @@ fn remove_dead_pure_call_host<'a, 'str>(
 /// control-flow edges. This covers function-entry params introduced for
 /// load-before-store registers that later become dead, without touching join
 /// blocks whose predecessor terminators carry positional arguments.
-/// The `&mut Context` version.
-/// TODO(5b-ii): For backwards compatibility; prefer concrete version for new code.
-pub fn remove_unused_no_pred_block_params_generic<'str>(
-    host: &mut Context<'str>,
-    block_id: BlockId,
-) -> bool {
-    if host.block_ref(block_id).predecessors().next().is_some() {
-        return false;
-    }
-
-    // A `pure_reg` function's entry params are its canonical interface, aligned
-    // index-for-index with `input_regs` and every caller's `Call.args`. Removing
-    // one is an interprocedural change that must drop the param, its `input_regs`
-    // entry, and the matching argument at every caller in lockstep — that is the
-    // job of the `dead_signature` module pass (via `remove_entry_param`), not of
-    // this per-function sweep. A function pass must not reach across functions, so
-    // leave pure_reg entry params for `dead_signature`; the *local* fallback below
-    // would silently drop the param and break the interface alignment.
-    let is_pure_reg_entry = host
-        .block_ref(block_id)
-        .function()
-        .is_some_and(|f| f.is_pure_reg() && f.root().map(|b| b.id) == Some(block_id));
-    if is_pure_reg_entry {
-        return false;
-    }
-
-    let params: Vec<_> = ModuleView::new(&*host).block(block_id).param_ids().to_vec();
-    let mut kept = Vec::with_capacity(params.len());
-    let mut changed = false;
-    for local in params {
-        let param = qcode::value::BlockParamId::new(block_id.func, local);
-        if host_users(ModuleView::new(&*host), ValueId::BlockParam(param)).is_empty()
-            && !ModuleView::new(&*host).block_param(param).protected
-        {
-            host.remove_block_param(param);
-            changed = true;
-        } else {
-            host.block_param_mut(param).index = kept.len();
-            kept.push(local);
-        }
-    }
-
-    if changed {
-        host.block_mut(block_id).params = kept;
-    }
-    changed
-}
-
-/// Removes block params that have no users when the block has no incoming
-/// control-flow edges. This covers function-entry params introduced for
-/// load-before-store registers that later become dead, without touching join
-/// blocks whose predecessor terminators carry positional arguments.
-/// Concrete version for FunctionBody/ContextView (stage 5b).
-pub fn remove_unused_no_pred_block_params_host<'a, 'str>(
+fn remove_unused_no_pred_block_params<'a, 'str>(
     body: &'a mut FunctionBody<'str>,
     cx: ContextView<'a, 'str>,
     block_id: BlockId,
@@ -867,24 +750,13 @@ fn match_dead_loop<'a, 'str: 'a>(
 /// dead loop can only be recognized by reasoning over the whole cyclic region.
 #[cfg(test)]
 fn remove_dead_counted_loop(ctx: &mut Context, fun_id: FunctionId) -> bool {
-    remove_dead_counted_loop_module(ctx, fun_id)
+    crate::with_body_mut(ctx, fun_id, |body, cx| {
+        remove_dead_counted_loop_body(body, cx, fun_id)
+    })
 }
 
-/// Generic version of remove_dead_counted_loop for test use.
-#[cfg(test)]
-fn remove_dead_counted_loop_module<'str>(host: &mut Context<'str>, fun_id: FunctionId) -> bool {
-    let headers: Vec<BlockId> = host.function_ref(fun_id).blocks().map(|b| b.id).collect();
-    for header in headers {
-        if let Some(dl) = match_dead_loop(ModuleView::new(&*host), header) {
-            replace_terminator_with_branch_generic(host, dl.preheader, dl.exit, vec![]);
-            return true;
-        }
-    }
-    false
-}
-
-/// Host-generic core of [`remove_dead_counted_loop`]; see that function.
-fn remove_dead_counted_loop_host<'a, 'str>(
+/// Body-local core of [`remove_dead_counted_loop`].
+fn remove_dead_counted_loop_body<'a, 'str>(
     body: &'a mut FunctionBody<'str>,
     cx: ContextView<'a, 'str>,
     fun_id: FunctionId,
@@ -927,7 +799,7 @@ impl FunctionPass for Dce {
     }
 }
 
-/// Host-generic core of the [`Dce`] pass: the fixpoint over per-block dead-pure-call
+/// Body-local core of the [`Dce`] pass: the fixpoint over per-block dead-pure-call
 /// / dead-instruction sweeps, redundant/dead block-argument elimination, and dead
 /// counted-loop removal.
 fn dce_core<'a, 'str>(
@@ -951,12 +823,12 @@ fn dce_core<'a, 'str>(
     loop {
         let mut round = false;
         for &block_id in &block_ids {
-            round |= remove_dead_pure_call_host(body, cx, block_id);
-            round |= remove_dead_insns_host(body, cx, block_id);
+            round |= remove_dead_pure_call_body(body, cx, block_id);
+            round |= remove_dead_insns_body(body, cx, block_id);
         }
         round |= super::remove_dead_block_args_host(body, cx, &block_ids, root);
         round |= super::remove_dead_block_params_host(body, cx, &block_ids, root);
-        round |= remove_dead_counted_loop_host(body, cx, fun_id);
+        round |= remove_dead_counted_loop_body(body, cx, fun_id);
         if !round {
             break;
         }
