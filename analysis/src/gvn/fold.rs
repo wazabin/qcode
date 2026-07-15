@@ -25,9 +25,9 @@ use crate::{ContextView, FunctionBody};
 /// storage.
 pub(super) struct Fold;
 
-/// The function-pass [`SubPass`] impl (context-split stage 5b-ii):
+/// The function-pass [`SubPass`] impl (body-local):
 /// `try_fold_insn` reads through `cx.body_view(body)` and the fold forwards
-/// through `Editor::replace_c`.
+/// through `Editor::replace`.
 impl<'str> SubPass<'str> for Fold {
     fn init_state(&self) -> Box<dyn Any> {
         Box::new(())
@@ -50,7 +50,7 @@ impl<'str> SubPass<'str> for Fold {
         }
         match try_fold_insn(cx.body_view(body), ic) {
             Some(folded) => {
-                ed.replace_c(body, cx, ic.insn_id, folded);
+                ed.replace(body, cx, ic.insn_id, folded);
                 Claim::Done
             }
             None => Claim::Pass,

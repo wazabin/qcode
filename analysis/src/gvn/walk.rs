@@ -90,15 +90,15 @@ fn reachable_from<'ctx, 'str: 'ctx>(
 // The body-local walker drives the function-pass GVN chain over a checked-out
 // `(&mut FunctionBody, ContextView)` with no threaded mutation host: reads route
 // through `cx.body_view(body)`, shallow rewrites through the inherent
-// `body.verb(cx, …)` surface (via `Editor`'s `_c` methods). The large shared
+// `body.verb(cx, …)` surface (via `Editor` methods). The large shared
 // mutation helpers are reached through the same body-local mutation boundary.
 // ===========================================================================
 
 use crate::{ContextView, FunctionBody};
 
 impl Editor {
-    /// Concrete twin of [`replace`](Self::replace).
-    pub(super) fn replace_c<'str>(
+    /// Forward all uses and mark the old instruction redundant.
+    pub(super) fn replace<'str>(
         &mut self,
         body: &mut FunctionBody<'str>,
         _cx: ContextView<'_, 'str>,
@@ -109,8 +109,8 @@ impl Editor {
         self.redundant.insert(insn);
     }
 
-    /// Concrete twin of [`replace_with_new_insn`](Self::replace_with_new_insn).
-    pub(super) fn replace_with_new_insn_c<'str>(
+    /// Insert a replacement instruction with an integer result type.
+    pub(super) fn replace_with_new_insn<'str>(
         &mut self,
         body: &mut FunctionBody<'str>,
         cx: ContextView<'_, 'str>,
@@ -120,12 +120,11 @@ impl Editor {
         size: usize,
     ) -> InstructionId {
         let type_id = cx.body_view(body).shared().types.get_or_make_int(size);
-        self.replace_with_new_insn_typed_c(body, cx, block_id, at, mnemonic, type_id)
+        self.replace_with_new_insn_typed(body, cx, block_id, at, mnemonic, type_id)
     }
 
-    /// Concrete twin of
-    /// [`replace_with_new_insn_typed`](Self::replace_with_new_insn_typed).
-    pub(super) fn replace_with_new_insn_typed_c<'str>(
+    /// Insert a replacement instruction with an explicit result type.
+    pub(super) fn replace_with_new_insn_typed<'str>(
         &mut self,
         body: &mut FunctionBody<'str>,
         _cx: ContextView<'_, 'str>,
@@ -143,8 +142,8 @@ impl Editor {
         new_id
     }
 
-    /// Concrete twin of [`finish`](Self::finish).
-    fn finish_c<'str>(self, body: &mut FunctionBody<'str>, _cx: ContextView<'_, 'str>) -> bool {
+    /// Remove every instruction made redundant during the block walk.
+    fn finish<'str>(self, body: &mut FunctionBody<'str>, _cx: ContextView<'_, 'str>) -> bool {
         let changed = !self.redundant.is_empty();
         let mut redundant: Vec<_> = self.redundant.into_iter().collect();
         redundant.sort_unstable();
@@ -257,7 +256,7 @@ fn run_block<'str>(
         }
     }
 
-    ed.finish_c(body, cx)
+    ed.finish(body, cx)
 }
 
 /// Run the sub-passes over a single block with fresh state and no block-boundary

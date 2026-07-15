@@ -215,11 +215,11 @@ impl MemForward {
     }
 
     // -----------------------------------------------------------------------
-    // Concrete pass twins over (&mut FunctionBody, ContextView) — 5b-ii Pin A.
+    // Body-local forwarding helpers.
     // -----------------------------------------------------------------------
 
-    /// Concrete pass twin of [`record_store`](Self::record_store).
-    pub(super) fn record_store_c<'str>(
+    /// Record the bytes written by a store.
+    pub(super) fn record_store<'str>(
         &mut self,
         body: &mut FunctionBody<'str>,
         cx: ContextView<'_, 'str>,
@@ -269,9 +269,9 @@ impl MemForward {
         }
     }
 
-    /// Concrete pass twin of [`try_load`](Self::try_load).
+    /// Rebuild a load when every requested byte is known.
     #[allow(clippy::too_many_arguments)]
-    pub(super) fn try_load_c<'str>(
+    pub(super) fn try_load<'str>(
         &mut self,
         body: &mut FunctionBody<'str>,
         cx: ContextView<'_, 'str>,
@@ -299,15 +299,15 @@ impl MemForward {
         {
             segments[0].src
         } else if load_size > 8 {
-            self.rebuild_bytes_c(body, cx, &segments, load_size)?
+            self.rebuild_bytes(body, cx, &segments, load_size)?
         } else {
-            self.rebuild_c(body, cx, block_id, insn_id, &segments, load_size)
+            self.rebuild(body, cx, block_id, insn_id, &segments, load_size)
         };
         Some(value)
     }
 
-    /// Concrete pass twin of [`rebuild`](Self::rebuild).
-    fn rebuild_c<'str>(
+    /// Rebuild a scalar load from known segments.
+    fn rebuild<'str>(
         &self,
         body: &mut FunctionBody<'str>,
         cx: ContextView<'_, 'str>,
@@ -318,7 +318,7 @@ impl MemForward {
     ) -> ValueId {
         let mut acc: Option<ValueId> = None;
         for seg in segments {
-            let piece = self.build_piece_c(body, cx, block_id, insn_id, seg, load_size);
+            let piece = self.build_piece(body, cx, block_id, insn_id, seg, load_size);
             acc = Some(match acc {
                 None => piece,
                 Some(lhs) => {
@@ -339,8 +339,8 @@ impl MemForward {
         acc.expect("a fully-covered load has at least one segment")
     }
 
-    /// Concrete pass twin of [`rebuild_bytes`](Self::rebuild_bytes).
-    fn rebuild_bytes_c<'str>(
+    /// Rebuild a wide constant load as a byte value.
+    fn rebuild_bytes<'str>(
         &self,
         body: &mut FunctionBody<'str>,
         cx: ContextView<'_, 'str>,
@@ -372,8 +372,8 @@ impl MemForward {
         Some(ctx.get_bytes(buf))
     }
 
-    /// Concrete pass twin of [`build_piece`](Self::build_piece).
-    fn build_piece_c<'str>(
+    /// Materialize one segment of a reconstructed scalar load.
+    fn build_piece<'str>(
         &self,
         body: &mut FunctionBody<'str>,
         cx: ContextView<'_, 'str>,
@@ -838,7 +838,7 @@ mod tests {
 
     /// Borrow `fid`'s body in place and run `f` against its
     /// `(&mut FunctionBody, ContextView)` — the only surface
-    /// [`MemForward::record_store_c`]/[`MemForward::try_load_c`] speak now that the
+    /// [`MemForward::record_store`]/[`MemForward::try_load`] speak now that the
     /// `&mut Context` module twins are gone. The `MemForward` state under test is
     /// owned by the caller (captured by `f`), so it outlives the borrow and can be
     /// inspected afterwards.
@@ -931,8 +931,8 @@ mod tests {
         let nb = Numbering::default();
         let mut mf = MemForward::default();
         with_body(&mut tc, fid, |body, cx| {
-            mf.record_store_c(body, cx, fid, &wide_store, Some(&aliases), &nb);
-            mf.record_store_c(body, cx, fid, &byte_store, Some(&aliases), &nb);
+            mf.record_store(body, cx, fid, &wide_store, Some(&aliases), &nb);
+            mf.record_store(body, cx, fid, &byte_store, Some(&aliases), &nb);
         });
 
         assert_eq!(mf.byte_map[&(base, start)].src, byte, "byte 0 overwritten");
@@ -1038,7 +1038,7 @@ mod tests {
 
         let mut mf = MemForward::default();
         with_body(&mut tc, fid, |body, cx| {
-            mf.record_store_c(body, cx, root.func, &slot_store, Some(&aliases), &nb);
+            mf.record_store(body, cx, root.func, &slot_store, Some(&aliases), &nb);
         });
         // A plain caller-frame `@SP - 4` cell, for contrast: its base is the `@SP`
         // param (classified CallerFrame), so it is not own-frame-private.
@@ -1090,7 +1090,7 @@ mod tests {
         let start = start as i64;
         let mut mf = MemForward::default();
         with_body(&mut tc, fid, |body, cx| {
-            mf.record_store_c(body, cx, fid, &store, Some(&aliases), &Numbering::default());
+            mf.record_store(body, cx, fid, &store, Some(&aliases), &Numbering::default());
         });
 
         assert_eq!(mf.byte_map.len(), 4, "all four written bytes are defined");
@@ -1132,8 +1132,8 @@ mod tests {
         let dummy = qcode::value::InstructionId::default();
         let mut mf = MemForward::default();
         let forwarded = with_body(&mut tc, block_id.func, |body, cx| {
-            mf.record_store_c(body, cx, block_id.func, &store, Some(&aliases), &nb);
-            mf.try_load_c(body, cx, block_id, dummy, &load, Some(&aliases), &nb)
+            mf.record_store(body, cx, block_id.func, &store, Some(&aliases), &nb);
+            mf.try_load(body, cx, block_id, dummy, &load, Some(&aliases), &nb)
         })
         .expect("exact forward");
         assert_eq!(forwarded, src);

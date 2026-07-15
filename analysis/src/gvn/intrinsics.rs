@@ -24,9 +24,9 @@ use crate::{ContextView, FunctionBody};
 /// through the shared interner.
 pub(super) struct Recognize;
 
-/// The function-pass [`SubPass`] impl (context-split stage 5b-ii): the
+/// The function-pass [`SubPass`] impl (body-local): the
 /// recognizer reads through `cx.body_view(body)` and the match rewrites through
-/// `Editor::replace_with_new_insn_c`.
+/// `Editor::replace_with_new_insn`.
 impl<'str> SubPass<'str> for Recognize {
     fn init_state(&self) -> Box<dyn Any> {
         Box::new(())
@@ -57,7 +57,7 @@ impl<'str> SubPass<'str> for Recognize {
                     .into_iter()
                     .map(|a| a.localize(ic.insn_id.func))
                     .collect();
-                ed.replace_with_new_insn_c(
+                ed.replace_with_new_insn(
                     body,
                     cx,
                     ic.block_id,

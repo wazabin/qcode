@@ -20,7 +20,7 @@ use qcode::value::{
 
 use std::any::Any;
 
-use super::affine::{NormalForm, Numbering, arith_form, key_for, materialize_c};
+use super::affine::{NormalForm, Numbering, arith_form, key_for, materialize};
 use super::walk::{Claim, Editor, InsnCtx, SubPass};
 
 #[cfg(test)]
@@ -33,10 +33,10 @@ use crate::{ContextView, FunctionBody};
 /// the body's inherent verbs), so it runs on the function-pass path.
 pub(super) struct Cse;
 
-/// The function-pass [`SubPass`] impl (context-split stage 5b-ii): reads
-/// route through `cx.body_view(body)`, shallow forwards through `Editor`'s `_c`
-/// methods, and the in-place canonical rebuild runs through `materialize_c` over
-/// `&mut PassBacking`.
+/// The function-pass [`SubPass`] impl (body-local): reads route through
+/// `cx.body_view(body)`, shallow forwards through `Editor` methods, and the
+/// in-place canonical rebuild runs through `materialize` on the checked-out
+/// body.
 impl<'str> SubPass<'str> for Cse {
     fn init_state(&self) -> Box<dyn Any> {
         Box::new(Numbering::default())
@@ -94,7 +94,7 @@ impl<'str> SubPass<'str> for Cse {
 
         if let Some(leader) = state.lookup(&key) {
             if leader != ic.id {
-                ed.replace_c(body, cx, ic.insn_id, leader);
+                ed.replace(body, cx, ic.insn_id, leader);
             }
             return Claim::Done;
         }
@@ -103,7 +103,7 @@ impl<'str> SubPass<'str> for Cse {
             NormalForm::Opaque(_) => state.claim(key, ic.id),
             _ => {
                 let root_ty = cx.body_view(body).type_of(ic.id);
-                let v = materialize_c(
+                let v = materialize(
                     body,
                     cx,
                     ic.block_id,
@@ -114,7 +114,7 @@ impl<'str> SubPass<'str> for Cse {
                     state,
                 );
                 if v != ic.id {
-                    ed.replace_c(body, cx, ic.insn_id, v);
+                    ed.replace(body, cx, ic.insn_id, v);
                 }
             }
         }

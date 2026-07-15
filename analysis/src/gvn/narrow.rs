@@ -47,10 +47,10 @@ use crate::{ContextView, FunctionBody};
 /// interners.
 pub(super) struct NarrowTrunc;
 
-/// The function-pass [`SubPass`] impl (context-split stage 5b-ii):
-/// eligibility reads through `cx.body_view(body)`, the recursive `narrow_to_c`
-/// rewrite runs over `&mut PassBacking`, and the forward goes through
-/// `Editor::replace_c`.
+/// The function-pass [`SubPass`] impl (body-local):
+/// eligibility reads through `cx.body_view(body)`, the recursive `narrow_to`
+/// rewrite mutates the checked-out body, and the forward goes through
+/// [`Editor::replace`].
 impl<'str> SubPass<'str> for NarrowTrunc {
     fn init_state(&self) -> Box<dyn Any> {
         Box::new(())
@@ -81,11 +81,11 @@ impl<'str> SubPass<'str> for NarrowTrunc {
             return Claim::Pass;
         }
         let mut memo: HashMap<ValueId, ValueId> = HashMap::default();
-        let narrowed = narrow_to_c(body, cx, src, w, ic.insn_id, ic.block_id, &mut memo);
+        let narrowed = narrow_to(body, cx, src, w, ic.insn_id, ic.block_id, &mut memo);
         if narrowed == ic.id {
             return Claim::Pass;
         }
-        ed.replace_c(body, cx, ic.insn_id, narrowed);
+        ed.replace(body, cx, ic.insn_id, narrowed);
         Claim::Done
     }
 }
@@ -138,11 +138,11 @@ fn range_low(src: ValueId, size: usize, func: FunctionId) -> Mnemonic {
 }
 
 // ---------------------------------------------------------------------------
-// Concrete pass twins over (&mut FunctionBody, ContextView) — 5b-ii Pin A step 2.
+// Body-local narrowing helpers.
 // ---------------------------------------------------------------------------
 
-/// Concrete pass twin of [`narrow_to`].
-fn narrow_to_c<'str>(
+/// Recursively narrow a value to `w` bytes.
+fn narrow_to<'str>(
     body: &mut FunctionBody<'str>,
     cx: ContextView<'_, 'str>,
     v: ValueId,
@@ -165,9 +165,9 @@ fn narrow_to_c<'str>(
                 lhs,
                 rhs,
             }) if distributive(o) => {
-                let l = narrow_to_c(body, cx, lhs.qualify(iid.func), w, before, block, memo);
-                let rr = narrow_to_c(body, cx, rhs.qualify(iid.func), w, before, block, memo);
-                push_insn_c(
+                let l = narrow_to(body, cx, lhs.qualify(iid.func), w, before, block, memo);
+                let rr = narrow_to(body, cx, rhs.qualify(iid.func), w, before, block, memo);
+                push_insn(
                     body,
                     cx,
                     Mnemonic::Binop(Binary {
@@ -181,8 +181,8 @@ fn narrow_to_c<'str>(
                 )
             }
             Mnemonic::Unop(Unary { op, src }) if matches!(op, Unop::IntNot | Unop::IntNegate) => {
-                let s = narrow_to_c(body, cx, src.qualify(iid.func), w, before, block, memo);
-                push_insn_c(
+                let s = narrow_to(body, cx, src.qualify(iid.func), w, before, block, memo);
+                push_insn(
                     body,
                     cx,
                     Mnemonic::Unop(Unary {
@@ -194,7 +194,7 @@ fn narrow_to_c<'str>(
                     block,
                 )
             }
-            Mnemonic::Sext(Sext { src, .. }) => narrow_extension_c(
+            Mnemonic::Sext(Sext { src, .. }) => narrow_extension(
                 body,
                 cx,
                 src.qualify(iid.func),
@@ -204,7 +204,7 @@ fn narrow_to_c<'str>(
                 block,
                 memo,
             ),
-            Mnemonic::Zext(Zext { src, .. }) => narrow_extension_c(
+            Mnemonic::Zext(Zext { src, .. }) => narrow_extension(
                 body,
                 cx,
                 src.qualify(iid.func),
@@ -215,24 +215,24 @@ fn narrow_to_c<'str>(
                 memo,
             ),
             Mnemonic::Range(Range { src, start: 0, .. }) => {
-                narrow_to_c(body, cx, src.qualify(iid.func), w, before, block, memo)
+                narrow_to(body, cx, src.qualify(iid.func), w, before, block, memo)
             }
-            _ => push_insn_c(body, cx, range_low(v, w, block.func), w, before, block),
+            _ => push_insn(body, cx, range_low(v, w, block.func), w, before, block),
         },
         _ if numeric_const(cx.body_view(body).shared(), v).is_some() => {
             let folded = numeric_const(cx.body_view(body).shared(), v).unwrap() & low_mask(w);
             cx.body_view(body).shared().get_const(folded, w)
         }
-        _ => push_insn_c(body, cx, range_low(v, w, block.func), w, before, block),
+        _ => push_insn(body, cx, range_low(v, w, block.func), w, before, block),
     };
 
     memo.insert(v, result);
     result
 }
 
-/// Concrete pass twin of [`narrow_extension`].
+/// Narrow through a sign or zero extension.
 #[allow(clippy::too_many_arguments)]
-fn narrow_extension_c<'str>(
+fn narrow_extension<'str>(
     body: &mut FunctionBody<'str>,
     cx: ContextView<'_, 'str>,
     src: ValueId,
@@ -243,7 +243,7 @@ fn narrow_extension_c<'str>(
     memo: &mut HashMap<ValueId, ValueId>,
 ) -> ValueId {
     if value_size(cx.body_view(body), src) >= w {
-        return narrow_to_c(body, cx, src, w, before, block, memo);
+        return narrow_to(body, cx, src, w, before, block, memo);
     }
     let m = if sext {
         Mnemonic::Sext(Sext {
@@ -256,11 +256,11 @@ fn narrow_extension_c<'str>(
             size: w,
         })
     };
-    push_insn_c(body, cx, m, w, before, block)
+    push_insn(body, cx, m, w, before, block)
 }
 
-/// Concrete pass twin of [`push_insn`].
-fn push_insn_c<'str>(
+/// Insert a narrowed instruction before `before`.
+fn push_insn<'str>(
     body: &mut FunctionBody<'str>,
     cx: ContextView<'_, 'str>,
     mnemonic: Mnemonic,

@@ -36,10 +36,10 @@ use crate::{ContextView, FunctionBody};
 /// and every folded constant is minted through the shared interner.
 pub(super) struct Identities;
 
-/// The function-pass [`SubPass`] impl (context-split stage 5b-ii):
+/// The function-pass [`SubPass`] impl (body-local):
 /// reads route through `cx.body_view(body)`, the intrinsic/identity rewrites
-/// through `Editor`'s `_c` methods, and the constant-interning
-/// `simplify_bitwise_c`/`simplify_compare_c` helpers run over `&mut PassBacking`.
+/// through `Editor` methods, and the constant-interning identity helpers mutate
+/// the checked-out body.
 impl<'str> SubPass<'str> for Identities {
     fn init_state(&self) -> Box<dyn Any> {
         Box::new(())
@@ -69,18 +69,11 @@ impl<'str> SubPass<'str> for Identities {
                 .collect();
             match id.desc().simplify(cx.body_view(body), id, ic.size, &args) {
                 Some(Simplified::Value(repl)) => {
-                    ed.replace_c(body, cx, ic.insn_id, repl);
+                    ed.replace(body, cx, ic.insn_id, repl);
                     return Claim::Done;
                 }
                 Some(Simplified::Expression(mnemonic)) => {
-                    ed.replace_with_new_insn_c(
-                        body,
-                        cx,
-                        ic.block_id,
-                        ic.insn_id,
-                        mnemonic,
-                        ic.size,
-                    );
+                    ed.replace_with_new_insn(body, cx, ic.block_id, ic.insn_id, mnemonic, ic.size);
                     return Claim::Done;
                 }
                 None => {}
@@ -89,13 +82,13 @@ impl<'str> SubPass<'str> for Identities {
         if let Some(new_mnemonic) =
             simplify_identity(cx.body_view(body), ic.insn_id.func, ic.mnemonic)
         {
-            ed.replace_with_new_insn_c(body, cx, ic.block_id, ic.insn_id, new_mnemonic, ic.size);
+            ed.replace_with_new_insn(body, cx, ic.block_id, ic.insn_id, new_mnemonic, ic.size);
             return Claim::Done;
         }
-        if simplify_bitwise_c(body, cx, ic, ed) {
+        if simplify_bitwise(body, cx, ic, ed) {
             return Claim::Done;
         }
-        if simplify_compare_c(body, cx, ic, ed) {
+        if simplify_compare(body, cx, ic, ed) {
             return Claim::Done;
         }
         Claim::Pass
@@ -387,10 +380,8 @@ fn negated_compare(op: IntBinop) -> Option<IntBinop> {
     }
 }
 
-/// Concrete pass twin of [`simplify_bitwise`] over a checked-out
-/// `(&mut FunctionBody, ContextView)` (context-split stage 5b-ii Pin A): reads
-/// route through `cx.body_view(body)`, rewrites through `Editor`'s `_c` methods.
-fn simplify_bitwise_c<'str>(
+/// Simplify body-local bitwise identities.
+fn simplify_bitwise<'str>(
     body: &mut FunctionBody<'str>,
     cx: ContextView<'_, 'str>,
     ic: &InsnCtx,
@@ -416,13 +407,13 @@ fn simplify_bitwise_c<'str>(
                         || as_zext(cx.body_view(body), inner)
                             .is_some_and(|(src, _)| is_boolean(cx.body_view(body), src)))
                 {
-                    ed.replace_c(body, cx, ic.insn_id, inner);
+                    ed.replace(body, cx, ic.insn_id, inner);
                     return true;
                 }
                 if let Some(k) = align_mask_bits(outer, size)
                     && known_align(cx.body_view(body), inner, ALIGN_DEPTH) >= k
                 {
-                    ed.replace_c(body, cx, ic.insn_id, inner);
+                    ed.replace(body, cx, ic.insn_id, inner);
                     return true;
                 }
                 if let Some((x, c1)) = binop_const(cx.body_view(body), inner, IntBinop::And) {
@@ -430,7 +421,7 @@ fn simplify_bitwise_c<'str>(
                         .body_view(body)
                         .shared()
                         .get_const((c1 & outer) & all, size);
-                    ed.replace_with_new_insn_c(
+                    ed.replace_with_new_insn(
                         body,
                         cx,
                         ic.block_id,
@@ -450,7 +441,7 @@ fn simplify_bitwise_c<'str>(
                         .body_view(body)
                         .shared()
                         .get_const((c1 ^ outer) & all, size);
-                    ed.replace_with_new_insn_c(
+                    ed.replace_with_new_insn(
                         body,
                         cx,
                         ic.block_id,
@@ -475,7 +466,7 @@ fn simplify_bitwise_c<'str>(
                     ) else {
                         continue;
                     };
-                    ed.replace_with_new_insn_c(
+                    ed.replace_with_new_insn(
                         body,
                         cx,
                         ic.block_id,
@@ -492,8 +483,8 @@ fn simplify_bitwise_c<'str>(
     }
 }
 
-/// Concrete pass twin of [`simplify_compare`] (see [`simplify_bitwise_c`]).
-fn simplify_compare_c<'str>(
+/// Simplify body-local comparison identities.
+fn simplify_compare<'str>(
     body: &mut FunctionBody<'str>,
     cx: ContextView<'_, 'str>,
     ic: &InsnCtx,
@@ -513,7 +504,7 @@ fn simplify_compare_c<'str>(
                 if let Some((src, src_size)) = as_zext(cx.body_view(body), other) {
                     let zero = cx.body_view(body).shared().get_const(0, src_size);
                     let bool_ty = cx.body_view(body).shared().types.get_or_make_bool();
-                    ed.replace_with_new_insn_typed_c(
+                    ed.replace_with_new_insn_typed(
                         body,
                         cx,
                         ic.block_id,
@@ -528,7 +519,7 @@ fn simplify_compare_c<'str>(
                 {
                     match op {
                         IntBinop::NotEqual => {
-                            ed.replace_c(body, cx, ic.insn_id, other);
+                            ed.replace(body, cx, ic.insn_id, other);
                             return true;
                         }
                         IntBinop::Equal => {
@@ -542,7 +533,7 @@ fn simplify_compare_c<'str>(
                             {
                                 let (a, b) = (a.qualify(id.func), b.qualify(id.func));
                                 let bool_ty = cx.body_view(body).shared().types.get_or_make_bool();
-                                ed.replace_with_new_insn_typed_c(
+                                ed.replace_with_new_insn_typed(
                                     body,
                                     cx,
                                     ic.block_id,

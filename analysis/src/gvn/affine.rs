@@ -378,13 +378,11 @@ pub(super) fn key_for(form: &NormalForm, id: ValueId, mnemonic: &Mnemonic) -> No
 // ---------------------------------------------------------------------------
 
 // ---------------------------------------------------------------------------
-// Concrete pass twins over (&mut FunctionBody, ContextView) — 5b-ii Pin A step 2.
-// Mirror the generic materialize family; the pass path (cse's SubPass) drives
-// `materialize_c`, the module path keeps the generic `materialize`.
+// Body-local affine materialization used by CSE.
 // ---------------------------------------------------------------------------
 
-/// Concrete pass twin of [`emit`].
-fn emit_c<'str>(
+/// Insert one materialized affine instruction.
+fn emit<'str>(
     body: &mut FunctionBody<'str>,
     _cx: ContextView<'_, 'str>,
     block: BlockId,
@@ -397,8 +395,8 @@ fn emit_c<'str>(
     ValueId::Instruction(new)
 }
 
-/// Concrete pass twin of [`build_value`].
-fn build_value_c<'str>(
+/// Materialize or reuse a value for a normal form.
+fn build_value<'str>(
     body: &mut FunctionBody<'str>,
     cx: ContextView<'_, 'str>,
     block: BlockId,
@@ -428,15 +426,15 @@ fn build_value_c<'str>(
         }
         NormalForm::Opaque(_) => unreachable!("opaque forms are never materialized"),
     };
-    let m = canonical_mnemonic_c(body, cx, block, at, form, state);
-    let vid = emit_c(body, cx, block, at, m, int_ty);
+    let m = canonical_mnemonic(body, cx, block, at, form, state);
+    let vid = emit(body, cx, block, at, m, int_ty);
     state.leaders.insert(form.clone(), vid);
     state.forms.insert(vid, form.clone());
     vid
 }
 
-/// Concrete pass twin of [`canonical_mnemonic`].
-fn canonical_mnemonic_c<'str>(
+/// Build the canonical instruction for a normal form.
+fn canonical_mnemonic<'str>(
     body: &mut FunctionBody<'str>,
     cx: ContextView<'_, 'str>,
     block: BlockId,
@@ -470,8 +468,8 @@ fn canonical_mnemonic_c<'str>(
                     constant: 0,
                     terms: terms.clone(),
                 };
-                let pv = build_value_c(body, cx, block, at, &prefix, state);
-                let (op, lit) = signed_lit_c(body, cx, signed(constant, width), width);
+                let pv = build_value(body, cx, block, at, &prefix, state);
+                let (op, lit) = signed_lit(body, cx, signed(constant, width), width);
                 return Mnemonic::Binop(Binary {
                     op: Binop::Int(op),
                     lhs: pv.localize(func),
@@ -514,14 +512,14 @@ fn canonical_mnemonic_c<'str>(
                 constant: 0,
                 terms: prefix_terms,
             };
-            let pv = build_value_c(body, cx, block, at, &prefix, state);
+            let pv = build_value(body, cx, block, at, &prefix, state);
             let s = signed(last_k, width);
             let (op, mag) = if s < 0 {
                 (IntBinop::Sub, s.unsigned_abs() & mask_for(width))
             } else {
                 (IntBinop::Add, last_k)
             };
-            let tv = scaled_value_c(body, cx, block, at, last_v, mag, width, state);
+            let tv = scaled_value(body, cx, block, at, last_v, mag, width, state);
             Mnemonic::Binop(Binary {
                 op: Binop::Int(op),
                 lhs: pv.localize(func),
@@ -532,9 +530,9 @@ fn canonical_mnemonic_c<'str>(
     }
 }
 
-/// Concrete pass twin of [`scaled_value`].
+/// Materialize a scaled affine term.
 #[allow(clippy::too_many_arguments)]
-fn scaled_value_c<'str>(
+fn scaled_value<'str>(
     body: &mut FunctionBody<'str>,
     cx: ContextView<'_, 'str>,
     block: BlockId,
@@ -552,11 +550,11 @@ fn scaled_value_c<'str>(
         constant: 0,
         terms: vec![(term, mag)],
     };
-    build_value_c(body, cx, block, at, &form, state)
+    build_value(body, cx, block, at, &form, state)
 }
 
-/// Concrete pass twin of [`signed_lit`].
-fn signed_lit_c<'str>(
+/// Encode a signed constant as an operation and unsigned literal.
+fn signed_lit<'str>(
     _body: &mut FunctionBody<'str>,
     cx: ContextView<'_, 'str>,
     s: i64,
@@ -576,9 +574,9 @@ fn signed_lit_c<'str>(
     }
 }
 
-/// Concrete pass twin of [`materialize`].
+/// Materialize a replacement for the root affine expression.
 #[allow(clippy::too_many_arguments)]
-pub(super) fn materialize_c<'str>(
+pub(super) fn materialize<'str>(
     body: &mut FunctionBody<'str>,
     cx: ContextView<'_, 'str>,
     block: BlockId,
@@ -604,13 +602,13 @@ pub(super) fn materialize_c<'str>(
     if let Some(&leader) = state.leaders.get(key) {
         return leader;
     }
-    let m = canonical_mnemonic_c(body, cx, block, at, key, state);
+    let m = canonical_mnemonic(body, cx, block, at, key, state);
     if &m == at_mnemonic {
         let vid = ValueId::Instruction(at);
         state.leaders.insert(key.clone(), vid);
         return vid;
     }
-    let vid = emit_c(body, cx, block, at, m, root_ty);
+    let vid = emit(body, cx, block, at, m, root_ty);
     state.leaders.insert(key.clone(), vid);
     state.forms.insert(vid, key.clone());
     vid

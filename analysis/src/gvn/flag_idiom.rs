@@ -17,9 +17,9 @@ use crate::{ContextView, FunctionBody};
 /// dead flag math falls to DCE. It runs on the checked-out function-pass path (own-function reads only).
 pub(super) struct FlagIdiom;
 
-/// The function-pass [`SubPass`] impl (context-split stage 5b-ii):
+/// The function-pass [`SubPass`] impl (body-local):
 /// `simplify_flag_idiom` reads through `cx.body_view(body)` and the rewrite
-/// materializes through `Editor::replace_with_new_insn_c`.
+/// materializes through `Editor::replace_with_new_insn`.
 impl<'str> SubPass<'str> for FlagIdiom {
     fn init_state(&self) -> Box<dyn Any> {
         Box::new(())
@@ -42,14 +42,7 @@ impl<'str> SubPass<'str> for FlagIdiom {
         }
         match simplify_flag_idiom(cx.body_view(body), ic.insn_id.func, ic.mnemonic) {
             Some(new_mnemonic) => {
-                ed.replace_with_new_insn_c(
-                    body,
-                    cx,
-                    ic.block_id,
-                    ic.insn_id,
-                    new_mnemonic,
-                    ic.size,
-                );
+                ed.replace_with_new_insn(body, cx, ic.block_id, ic.insn_id, new_mnemonic, ic.size);
                 Claim::Done
             }
             None => Claim::Pass,

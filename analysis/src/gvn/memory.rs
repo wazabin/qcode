@@ -24,10 +24,9 @@ use crate::{ContextView, FunctionBody};
 /// view and every rebuild through the body's inherent verbs.
 pub(super) struct MemoryForwarding;
 
-/// The function-pass [`SubPass`] impl (context-split stage 5b-ii):
-/// reads route through `cx.body_view(body)`, the load forward through `Editor`'s
-/// `_c` method, and the [`MemForward`] rebuild/record helpers (`record_store_c`,
-/// `try_load_c`) run over `&mut PassBacking`.
+/// The function-pass [`SubPass`] impl (body-local): reads route through
+/// `cx.body_view(body)`, forwards through [`Editor::replace`], and the
+/// [`MemForward`] rebuild/record helpers mutate the checked-out body.
 impl<'str> SubPass<'str> for MemoryForwarding {
     fn init_state(&self) -> Box<dyn Any> {
         Box::new(MemForward::default())
@@ -71,11 +70,11 @@ impl<'str> SubPass<'str> for MemoryForwarding {
         let state = state.downcast_mut::<MemForward>().expect("memory state");
         match ic.mnemonic {
             Mnemonic::Store(store) => {
-                state.record_store_c(body, cx, ic.insn_id.func, store, ic.aliases, ic.numbering);
+                state.record_store(body, cx, ic.insn_id.func, store, ic.aliases, ic.numbering);
                 Claim::Done
             }
             Mnemonic::Load(load) => {
-                let forwarded = state.try_load_c(
+                let forwarded = state.try_load(
                     body,
                     cx,
                     ic.block_id,
@@ -86,7 +85,7 @@ impl<'str> SubPass<'str> for MemoryForwarding {
                 );
                 match forwarded {
                     Some(value) => {
-                        ed.replace_c(body, cx, ic.insn_id, value);
+                        ed.replace(body, cx, ic.insn_id, value);
                         state.define_load(ic.insn_id.func, load, value, ic.aliases, ic.numbering);
                     }
                     None => {
